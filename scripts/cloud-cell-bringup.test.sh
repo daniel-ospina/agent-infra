@@ -34,6 +34,34 @@
 #   * NON-VACUITY: a clean run still exits 0 and still prints CELL READY, and a token that is
 #     present is genuinely deleted (a suite that never had the file would pass for the wrong reason).
 #
+# #2100 (the capture extension), added here because the two mechanisms meet in `--check`:
+#   * the PROVIDER PROBE reads the provider, not the extension layer — a noisy layer (the measured
+#     banner-only shape: `[tortoise-capture] …`, no answer) must NOT turn a healthy provider into
+#     `FATAL: provider probe failed`. The stub `pi` reproduces that shape, and the probe's OWN
+#     two-check contract is what is pinned: the ISOLATED probe (`--no-extensions`) owns the provider
+#     verdict and runs first, then a LAYER-loaded lane-shaped turn (twice) proves the layer can
+#     answer. So the noisy case must (i) report no provider failure, (ii) NAME the layer and say the
+#     provider is healthy, (iii) not claim CELL READY, and (iv) a broken key must still be blamed on
+#     the provider. Dropping or reordering either check turns one of those red (the cases prove the
+#     fixture emits no LANE_READY with the layer loaded and DOES answer in isolation, so none can
+#     pass vacuously);
+#   * the ANSWER IS READ FROM THE WHOLE STREAM — the measured defect was `pi -p … 2>&1 | tail -3`,
+#     so a regression that re-narrows either probe to its last lines must go red. The `trailing`
+#     fixture answers FIRST and then prints three banner lines (the noisy layer writing AFTER the
+#     answer), so its answer is outside any 3-line tail: re-applying `| tail -3` to the isolated
+#     probe reads as a provider failure and re-applying it to the layer probe blames a HEALTHY layer
+#     for swallowing the turn (both verified red against the mutated script).
+#   * the DENY IS CELL-BOUND, not ship-list-bound — `pi-bootstrap/tests/test-cell-install.sh` run 2b
+#     removes both denied rows from a COPY of manifest.json and proves the install half still
+#     removes, and the verify half still refuses, a copy left on the cell;
+#   * a cell that CARRIES `tortoise-capture` fails the installer's read-back at the named (b) call
+#     (`capture extension present on a cell: …`) and `--check` SURFACES that line — it used to
+#     discard the verify output entirely, so the reason the box kept re-breaking itself appeared
+#     nowhere in the log. The run then repairs the cell (that IS the fix: the deny removes it), and
+#     the evidence asserted here is the named line plus the extension's absence — never a claim of
+#     readiness over a failed read-back;
+#   * with the extension ABSENT and the provider healthy, `--check` reports NO provider failure.
+#
 # Hermetic: temp HOME/state/token path, stubbed toolchain, no network, and GH_TOKEN_FILE keeps it
 # away from the REAL /tmp/.gh-tok. Run:  bash scripts/cloud-cell-bringup.test.sh
 # ⚠️ `--check` now also provisions the operational layer (#1723) from the checkout this script
@@ -78,7 +106,73 @@ printf '#!/bin/sh\nmkdir -p node_modules\necho x > node_modules/.package-lock.js
 # `git --version` is parsed for a version; `git -C <repo> rev-parse --short HEAD` is echoed into the
 # "repo present" line. `git -C <repo> config …` output is ignored.
 printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *) echo abc1234;; esac\n' > "$STUB/git"
-printf '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "0.85.1"; else echo "LANE_READY"; fi\n' > "$STUB/pi"
+# The probe stub also has to be able to reproduce the MEASURED #2100 shape: a layer that emits banner
+# lines and NEVER reaches the model, so the output carries no answer at all. It only answers when the
+# probe asks for a provider with extensions DISABLED (`--no-extensions`). That is what makes the
+# two-check contract testable: the provider verdict comes from the ISOLATED probe, and the LAYER turn
+# goes red on this fixture — so the run must FAIL naming the layer, and must NOT report a provider
+# failure. `broken` models the other attribution: the provider itself rejects the key in EVERY mode,
+# so the run dies on the 401 arm. `instruction` prints the INSTRUCTION ITSELF (the vacuous-pass shape
+# an extractor that accepted any matching line would take for an answer). `verbose` answers with the
+# instruction embedded in a sentence — a REAL answer, which the extractor must accept (`-xF` narrows
+# the refusal to a byte-identical line; a `-vF` version wrongly drops this one). `trailing` answers
+# FIRST and then prints three banner lines, which is the shape that `| tail -3` mis-read as the
+# answer. `PI_STUB_LOG`, when
+# set, records one line per model call, so a case can prove how many calls actually ran.
+cat > "$STUB/pi" <<'STUB'
+#!/bin/sh
+[ "$1" = "--version" ] && { echo "0.85.1"; exit 0; }
+[ -n "${PI_STUB_LOG:-}" ] && echo call >> "$PI_STUB_LOG"
+has_ne=0
+for a in "$@"; do [ "$a" = "--no-extensions" ] && has_ne=1; done
+if [ "${PI_STUB_MODE:-normal}" = broken ]; then
+  printf '{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}\n'
+  exit 0
+fi
+if [ "${PI_STUB_MODE:-normal}" = instruction ]; then
+  printf 'Reply with exactly: LANE_READY\n'
+  exit 0
+fi
+if [ "${PI_STUB_MODE:-normal}" = verbose ]; then
+  printf 'Sure — the model replied: Reply with exactly: LANE_READY\n'
+  exit 0
+fi
+if [ "${PI_STUB_MODE:-normal}" = trailing ]; then
+  # The MEASURED shape of the original defect, mirrored: the answer is IN the stream and the last
+  # three lines are a noisy layer's banner written AFTER it. `pi -p … | tail -3` read those three
+  # lines as the answer, so the answer that had arrived was discarded. Emitted in BOTH modes
+  # (isolated and layer-loaded) on purpose: whichever probe re-acquires a `| tail -3` loses its
+  # answer here, so neither half can regress unnoticed.
+  printf 'LANE_READY\n'
+  printf '[tortoise-capture] install probe recorded (harness=pi)\n'
+  printf '[tortoise-capture] spool flush (session_start): filed 0, deferred 2, skipped 320 (320 waiting on backoff)\n'
+  printf '[tortoise-capture] spool close: 0 filed this turn\n'
+  exit 0
+fi
+if [ "${PI_STUB_MODE:-normal}" = slowlayer ] && [ "$has_ne" -eq 0 ]; then
+  # What `timeout` leaves behind when it kills the child: no output, exit 124.
+  exit 124
+fi
+if [ "${PI_STUB_MODE:-normal}" = mixedlayer ] && [ "$has_ne" -eq 0 ]; then
+  # A MIX: attempt 1 completes with banner-only output, attempt 2 is killed at 120 s. The run must
+  # NOT claim "timed out on both attempts" (it would discard attempt 1's banner evidence) and must
+  # NOT accuse an extension of a completed call.
+  _c=0
+  [ -f "${PI_STUB_COUNT:-/dev/null}" ] && _c="$(cat "${PI_STUB_COUNT:-/dev/null}" 2>/dev/null || echo 0)"
+  _c=$((_c + 1)); [ -f "${PI_STUB_COUNT:-/dev/null}" ] && printf '%s\n' "$_c" > "${PI_STUB_COUNT:-/dev/null}"
+  if [ "$_c" -eq 1 ]; then
+    printf '[tortoise-capture] install probe recorded (harness=pi)\n'
+    exit 0
+  fi
+  exit 124
+fi
+if [ "${PI_STUB_MODE:-normal}" = noisy ] && [ "$has_ne" -eq 0 ]; then
+  printf '[tortoise-capture] install probe recorded (harness=pi)\n'
+  printf '[tortoise-capture] spool flush (session_start): filed 0, deferred 2, skipped 320 (320 waiting on backoff)\n'
+  exit 0
+fi
+echo LANE_READY
+STUB
 # check_provider wraps the probe in `timeout 120 pi …`; GNU timeout is not on every dev box (macOS
 # has none), so it is stubbed here rather than assumed.
 printf '#!/bin/sh\nshift\nexec "$@"\n' > "$STUB/timeout"
@@ -103,6 +197,13 @@ export SYSTEMCTL="$STUB/systemctl"
 # the fixture a cell instead of a Mac (the bring-up forwards both seams to scripts/scheduled-jobs.sh).
 export PORTABLE_PLATFORM=linux
 printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *show*) echo 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
+# The installer's closing parity gate reads the crontab population as a THIRD scheduler surface, and
+# `crontab` is not installed on every host (measured: absent on a stock macOS dev box, rc=127). An
+# unreadable surface is correctly a FAILURE, so without this shim every case that expects a clean run
+# fails with `verdict=UNMEASURABLE` for a reason that has nothing to do with what it asserts. An empty
+# crontab (`-l` → rc=1, "no crontab for this user") is a REAL measurement; any other verb is refused so
+# this suite can never install a real cron entry on the machine running it.
+printf '#!/bin/sh\ncase "$1" in\n  -l) exit 1 ;;\n  *) echo "crontab shim: refusing %s" "$*" >&2; exit 2 ;;\nesac\n' > "$STUB/crontab"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`
                      # invocation and fails closed, blocking the suite from running at all.
@@ -156,9 +257,29 @@ esac
 # ── 2) NON-VACUITY: the clean path still works, and really deletes a present token ───────────────
 say_case "clean run (must NOT be broken by the cleanup)"
 printf '%s\n' "$TOK_BODY" > "$TOK"
-br ok normal --check
+# The probe count is part of the contract: a healthy box makes TWO model calls — the isolated
+# PROVIDER verdict and one layer-loaded turn — and the layer check must NOT be retried when it
+# answers. A regression that re-runs the layer probe (or drops either one) shows up here.
+PI_CALLS="$T/pi-calls.log"; : > "$PI_CALLS"
+PI_STUB_LOG="$PI_CALLS" br ok normal --check
+[ "$(grep -c . "$PI_CALLS")" -eq 2 ] && ok "a healthy run makes exactly 2 model calls (isolated verdict + one layer turn)" \
+  || bad "a healthy run made $(grep -c . "$PI_CALLS") model calls, expected 2 (isolated provider verdict + one layer-loaded turn, no retry on success)"
 [ "$BR_RC" -eq 0 ] && ok "bring-up still exits 0 on a clean run" \
                    || bad "clean run FAILED (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"the extension layer answers a lane-shaped turn"*) ok "the layer-loaded turn is measured and reported (the detector is live on a healthy box)" ;;
+  *) bad "a clean run never reports the layer-loaded turn — the layer detector is inert: $BR_OUT" ;;
+esac
+# ... and it must be measured AFTER the layer is provisioned. The first `--check` on a cell installs
+# it, and a layer probe that ran before that install would measure an EMPTY extension set and certify
+# a layer it never saw (the false PASS this PR exists to remove).
+install_ln="$(printf '%s\n' "$BR_OUT" | grep -n 'installing it from' | head -1 | cut -d: -f1)"
+layer_ln="$(printf '%s\n' "$BR_OUT" | grep -n 'the extension layer answers a lane-shaped turn' | head -1 | cut -d: -f1)"
+if [ -n "$install_ln" ] && [ -n "$layer_ln" ] && [ "$layer_ln" -gt "$install_ln" ]; then
+  ok "the layer is measured AFTER it is installed (line $layer_ln > install line $install_ln)"
+else
+  bad "the layer turn is measured BEFORE the layer is installed (install line='$install_ln', layer line='$layer_ln') — a first bring-up would certify a layer it has not installed yet"
+fi
 case "$BR_OUT" in
   *"CELL READY"*) ok "a clean run still reaches CELL READY" ;;
   *) bad "a clean run no longer reaches CELL READY — output: $BR_OUT" ;;
@@ -230,6 +351,222 @@ case "$BR_OUT" in
 esac
 [ ! -e "$TOK" ] && ok "the token is removed on the second run too" \
                 || bad "token file SURVIVED the second clean run"
+
+# ── 2c) a NOISY layer cannot turn a healthy provider into a provider failure (#2100) ─────────────
+# Measured 2026-10-19 (#2100 — one box unusable while two ran lanes, the extension present on all
+# three): the affected cell's `tortoise-capture` consumed the turn and every turn ended with
+# banner-only output (259-262 B). The provider probe read `… | tail -3` of `pi -p` with the whole
+# extension layer loaded, so those banner lines BECAME the answer and a healthy box was refused with
+# `FATAL: provider probe failed` (`pi` returned LANE_READY once the extension was gone).
+# The contract now: the PROVIDER verdict comes from the ISOLATED probe first (nothing in the layer
+# can answer for it), and the layer-loaded turn is measured separately, twice. So a noisy layer
+# cannot produce a provider failure — and it cannot certify the cell either, because a layer that
+# produces no answer in two attempts IS a cell that cannot run a lane.
+say_case "a noisy extension layer cannot produce a provider failure (#2100)"
+# NON-VACUITY first: the fixture really is the measured shape — asked WITH the layer, it emits banner
+# lines and no answer, which is exactly what used to be read as "the provider is broken".
+probe_out="$(PATH="$STUB:$PATH" PI_STUB_MODE=noisy "$STUB/pi" -p --no-session \
+              'Reply with exactly: LANE_READY' 2>&1)"
+case "$probe_out" in
+  *LANE_READY*) bad "the noisy fixture still answers — this case would pass for the wrong reason" ;;
+  *) ok "the fixture reproduces the measured shape: banner-only output, no provider answer" ;;
+esac
+# ... and the OTHER half: the same fixture DOES answer when the probe isolates, which is what makes
+# the verdict "the layer, not the provider" (and not "everything is broken").
+probe_iso="$(PATH="$STUB:$PATH" PI_STUB_MODE=noisy "$STUB/pi" -p --no-session --no-extensions \
+              'Reply with exactly: LANE_READY' 2>&1)"
+case "$probe_iso" in
+  *LANE_READY*) ok "the same fixture answers with extensions disabled — the layer is the culprit, provably" ;;
+  *) bad "the fixture does not answer even in isolation — the attribution below would be vacuous" ;;
+esac
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=noisy br ok normal --check
+case "$BR_OUT" in
+  *"provider probe failed"*) bad "a NOISY layer turned a healthy provider into a provider failure — the probe is not isolated: $BR_OUT" ;;
+  *) ok "the probe reports NO provider failure while the layer emits banner lines" ;;
+esac
+# The detector must be LIVE, not merely absent: the isolated probe proved the provider healthy, so the
+# run has to NAME the layer and state that the provider is not the problem.
+case "$BR_OUT" in
+  *"the PROVIDER is healthy"*) ok "the failure states the provider is healthy (the layer is the culprit)" ;;
+  *) bad "the layer swallowed the turn and the failure does not name the attribution: $BR_OUT" ;;
+esac
+[ "$BR_RC" -ne 0 ] && ok "the run FAILS on a layer that produces no answer (rc=$BR_RC)" \
+                   || bad "the run reported success over a layer that cannot complete a turn"
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CELL READY was claimed over a box whose turns produce no answer — the mirror false PASS" ;;
+  *) ok "no readiness banner is claimed over a layer that cannot complete a turn" ;;
+esac
+
+# ── 2c1) the INSTRUCTION cannot satisfy either probe: no vacuous pass on the prompt text ─────────
+# The instruction itself contains the token, so output that prints that line would answer the probe
+# with no model call. The extractor refuses a byte-identical instruction line, so both probes read
+# "no answer" and the run fails as a provider failure. DECLARED LIMIT (pinned by 2c1b, not asserted
+# away): the refusal is exact-line only — any OTHER line carrying the token counts, so a wrapper that
+# echoes the prompt inside a longer line would still answer for the model. Widening the refusal to
+# close that re-opens the false negative 2c1b pins.
+say_case "the instruction printed back cannot pass the probe (#2100)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=instruction br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "the run FAILS when the only 'answer' is the instruction printed back" \
+                   || bad "printing the instruction back satisfied the probe — vacuous pass"
+case "$BR_OUT" in
+  *"provider probe failed"*) ok "the printed-back instruction is reported as NO provider answer" ;;
+  *) bad "the printed-back instruction was not classified as a missing answer: $BR_OUT" ;;
+esac
+
+# ── 2c1b) a VERBOSE answer still counts: the echo guard must stay narrow ─────────────────────────
+# The mirror of 2c1. `grep -vF 'Reply with exactly'` (the first cut of the guard) discarded ANY line
+# containing the phrase, so a model that wrapped the token in the instruction — a correct answer —
+# read as "no answer" and a healthy box died with `FATAL: provider probe failed`. Only a
+# BYTE-IDENTICAL line is refused now; this case goes red if the guard is ever widened back.
+say_case "a verbose answer is still an answer (#2100)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=verbose br ok normal --check
+case "$BR_OUT" in
+  *"provider probe failed"*) bad "a verbose-but-correct answer was read as no answer — the echo guard is too wide: $BR_OUT" ;;
+  *) ok "a verbose answer (token wrapped in the instruction) is accepted" ;;
+esac
+[ "$BR_RC" -eq 0 ] && ok "the run still reaches a clean verdict on a verbose answer" \
+                   || bad "the run FAILED on a verbose answer (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"CELL READY"*) ok "a verbose answer still reaches CELL READY" ;;
+  *) bad "a verbose answer never reaches CELL READY — output: $BR_OUT" ;;
+esac
+
+# ── 2c1c) a KILLED layer probe is not blamed on an extension (#2100 review) ─────────────────────
+# `timeout` kills the child at 120s and reports 124. The provider already answered in isolation, so
+# the key is good and the call is what failed: reporting "find the extension and remove it" would
+# send an operator to delete a healthy extension over a network flap — the same mis-attribution the
+# provider-side arms exist to prevent.
+say_case "a timed-out layer probe names the CALL, not an extension (#2100)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=slowlayer br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "the run FAILS when the layer probe is killed on both attempts (rc=$BR_RC)" \
+                   || bad "the run passed while the layer probe never completed"
+case "$BR_OUT" in
+  *"TIMED OUT after 120s"*) ok "the failure names the TIMEOUT (exit 124)" ;;
+  *) bad "the timeout is not named — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"Find the extension"*) bad "a killed probe was blamed on an extension — the operator would delete a healthy one" ;;
+  *) ok "the failure does not accuse an extension" ;;
+esac
+
+# ── 2c1d) a MIXED layer outcome must report both attempts, not claim a double timeout ──────────
+# The reviewer's case: attempt 1 completes (banner-only, exit 0), attempt 2 is killed (124). Saying
+# "timed out on both attempts" would be false about attempt 1 AND discard the banner it produced —
+# the mis-attribution this PR exists to remove, mirrored.
+say_case "a mixed layer outcome reports BOTH attempts, not a baseline-wide claim (#2100)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+: > "$T/mixed-attempts.cnt"
+PI_STUB_COUNT="$T/mixed-attempts.cnt" PI_STUB_MODE=mixedlayer br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "the run FAILS on a mixed layer outcome (rc=$BR_RC)" \
+                   || bad "the run passed while the layer never answered"
+case "$BR_OUT" in
+  *"on BOTH attempts"*) bad "a mixed outcome was reported as a double timeout — the completed attempt's evidence was discarded: $BR_OUT" ;;
+  *) ok "the failure does not claim a double timeout" ;;
+esac
+case "$BR_OUT" in
+  *"exits 0,124"*) ok "the per-attempt exits are reported (0,124)" ;;
+  *) bad "the per-attempt exits are not reported — the evidence is lost: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"[attempt 1 exit 0]"*) ok "the completed attempt's own output is kept in the failure" ;;
+  *) bad "the completed attempt's evidence is missing from the failure: $BR_OUT" ;;
+esac
+
+# ── 2c1e) the answer is read from the WHOLE stream, never from its last lines (#2100 review) ─────
+# The measured defect was `pi -p … 2>&1 | tail -3`: whatever printed LAST became the answer. The
+# two-probe split fixed the ATTRIBUTION, but nothing pinned the extractor's second half — every
+# other fixture puts the answer on the LAST line (or omits it entirely), so re-adding `| tail -3`
+# to either probe left this suite fully green while the answer sat above the window. The `trailing`
+# fixture is the measured shape: the answer FIRST, then three banner lines a noisy layer wrote
+# after it. It answers in BOTH modes, so a `tail` regression on the isolated probe reads as a
+# provider failure and one on the layer probe blames a HEALTHY layer for swallowing the turn.
+say_case "the answer is read from the WHOLE stream, not its last lines (#2100 review)"
+# NON-VACUITY: the answer really is outside a 3-line tail of this fixture's output — a case whose
+# answer happened to sit in the last three lines could not discriminate a `tail` regression at all.
+trail_out="$(PATH="$STUB:$PATH" PI_STUB_MODE=trailing "$STUB/pi" -p --no-session \
+              'Reply with exactly: LANE_READY' 2>&1)"
+case "$trail_out" in
+  *LANE_READY*) ok "the trailing fixture DOES answer — this case would pass for the wrong reason otherwise" ;;
+  *) bad "the trailing fixture never answers, so the assertions below are vacuous" ;;
+esac
+case "$(printf '%s\n' "$trail_out" | grep -v '^[[:space:]]*$' | tail -3)" in
+  *LANE_READY*) bad "the answer is still inside the last 3 lines — this fixture cannot discriminate a 3-line-tail regression" ;;
+  *) ok "the answer sits ABOVE the last three lines (a 3-line tail window cannot see it)" ;;
+esac
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=trailing br ok normal --check
+case "$BR_OUT" in
+  *"provider probe failed"*) bad "a trailing banner after the answer became a PROVIDER failure — the probe still reads only the last lines: $BR_OUT" ;;
+  *) ok "the isolated provider probe finds the answer with banner lines printed after it" ;;
+esac
+case "$BR_OUT" in
+  *"provider call works (pi returned LANE_READY)"*) ok "the provider verdict is positive on a trailing-banner answer" ;;
+  *) bad "the provider verdict was not positive although the answer was in the stream: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"produced no answer in two attempts"*)
+    bad "a HEALTHY layer was blamed for swallowing the turn — the layer probe discarded the answer above its last lines: $BR_OUT" ;;
+  *) ok "a trailing banner does not make a HEALTHY layer look like it swallowed the turn" ;;
+esac
+[ "$BR_RC" -eq 0 ] && ok "the run still exits 0 on an answer followed by banner lines (rc=$BR_RC)" \
+                   || bad "a healthy box FAILED on an answer followed by banner lines (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"CELL READY"*) ok "a trailing-banner run still reaches CELL READY" ;;
+  *) bad "a trailing-banner run never reaches CELL READY — output: $BR_OUT" ;;
+esac
+
+# ── 2c2) a BROKEN provider is still blamed on the provider, whatever the layer does ──────────────
+# The two-probe contract must not turn a genuinely dead key into a layer finding. With the provider
+# rejecting in EVERY mode (isolated included), the 401 arm is authoritative — this is the case that
+# goes red if the isolated probe is ever demoted behind the layer probe or skipped.
+say_case "a rejecting provider is still a provider failure, layer or no layer (#2100)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=broken br ok normal --check
+case "$BR_OUT" in
+  *"provider key REJECTED (401)"*) ok "the run blames the PROVIDER when the key is rejected in every mode" ;;
+  *) bad "a rejecting provider was not reported as a provider failure — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"the PROVIDER is healthy"*) bad "a dead key was mis-attributed to the extension layer" ;;
+  *) ok "no layer attribution is emitted when the provider is the culprit" ;;
+esac
+[ "$BR_RC" -ne 0 ] && ok "the run FAILS on a rejecting provider" \
+                   || bad "the run reported success over a rejecting provider"
+
+# ── 2d) a cell that CARRIES the capture extension: the read-back fails, and --check NAMES it ────
+# This is the provisioning half of #2100. The extension is still in the manifest ship-list, so a
+# bare bringup re-ships it; the deny in cell-install.sh is what keeps it off the cell, and its
+# `--verify` half must REFUSE a cell that carries it. `--check` used to DISCARD the verify output
+# (`out` was overwritten by the install) — so the operator saw "the cell does not carry a current
+# layer" and never the artifact that was wrong, while the next bringup put the extension back.
+# The line below is the whole diagnosis, and it is asserted on its EXACT wording.
+say_case "a cell carrying tortoise-capture fails the read-back, and --check names it (#2100)"
+CAPTURE_LINE='capture extension present on a cell: it blocks session_start and corrupts the provider probe'
+mkdir -p "$T/home/.pi/agent/extensions/tortoise-capture"
+echo '// hand-pushed by the test' > "$T/home/.pi/agent/extensions/tortoise-capture/index.ts"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+case "$BR_OUT" in
+  *"$CAPTURE_LINE"*) ok "--check surfaces the (b) failure verbatim: $CAPTURE_LINE" ;;
+  *) bad "--check never names the capture extension — the read-back's refusal is still swallowed: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"provider probe failed"*) bad "the run blamed the PROVIDER — the extension's banner corrupted the probe again" ;;
+  *) ok "the failure is attributable to the extension (b), not to the provider probe" ;;
+esac
+[ ! -e "$T/home/.pi/agent/extensions/tortoise-capture" ] \
+  && ok "the run REMOVED the extension (the deny repairs a cell that carries it, instead of certifying it)" \
+  || bad "the capture extension SURVIVED the bringup — it would block every lane turn again"
+[ "$BR_RC" -eq 0 ] && ok "readiness is reported only AFTER the read-back refused and the repair removed it" \
+                   || bad "the run failed after the repair (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"CELL READY"*) ok "the repaired cell reaches CELL READY" ;;
+  *) bad "the repaired cell never reaches CELL READY — output: $BR_OUT" ;;
+esac
 
 # ── 3) an abort BEFORE check_gh is reached — the window the pre-fix code left open ───────────────
 # The removal used to live INSIDE check_gh, and there was no trap, so a failure in check_tools or

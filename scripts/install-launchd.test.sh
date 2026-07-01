@@ -448,24 +448,32 @@ if [ "$GATED_VISIBLE1" = 1 ] && [ "$GATED_INSTALLED1" -eq 0 ]; then
 else
     ok "gated jobs resolved consistently with what this host has (visible checkout=$GATED_VISIBLE1, installed=$GATED_INSTALLED1 of $GATED_TEMPLATES1)"
 fi
+# The ALWAYS-installable set is pinned BY NAME (below) and the total is DERIVED, because the
+# {{TORTOISE_REPO}}-gated half varies with the host (install-launchd.sh resolves a checkout from the
+# environment AND from disk, so a bare CI checkout installs fewer than a dev box). Main pinned the
+# gated count at 3; #2048 retires `com.tortoise.worktree-reaper` and `com.eldato.pi-cache-reap` into
+# the consolidated pass and DELETES both templates, so the gated inventory here is 2.
 _always1=0
 for _j in $ALWAYS_JOBS1; do
     case "$OUT_FRESH1" in *"$_j: installed + loaded"*) _always1=$((_always1 + 1)) ;; esac  # the printed shape is "<label>: installed + loaded"
 done
 assert_eq "$_always1" "8" "all 8 always-installable jobs installed + loaded (pinned BY NAME, so the set cannot silently shrink)"
 assert_eq "$BOOTSTRAP_COUNT1" "$((_always1 + GATED_INSTALLED1))" "bootstraps == what this host can actually resolve (8 always + $GATED_INSTALLED1 of $GATED_TEMPLATES1 gated) — a pinned total would be red on the other surface"
-# #1949 (re-based onto #2048): name the two gated JOBS on the INDEPENDENT observation, so an ambient
+# #1949 (rebased onto #2006; re-keyed after review): name the gated JOBS, so an ambient
 # `TORTOISE_REPO` fails with its cause instead of being absorbed by the derived count above.
 # ⛔ The guard must be `GATED_VISIBLE1` (derived from the FILESYSTEM), never `GATED_INSTALLED1`:
-# `GATED_INSTALLED1` is itself incremented when the output contains `"<job>: installed + loaded"`, so
-# guarding on it is TAUTOLOGICAL — `GATED_INSTALLED1 == 0` already implies the needle is absent and the
-# assertions could never go red. Worse, the exact surface they exist to catch — an ambient
-# `TORTOISE_REPO` resolving a checkout that NO disk candidate explains (`GATED_VISIBLE1 == 0` while
-# `GATED_INSTALLED1 > 0`) — is the one where a count assertion ABSORBS the leak. Keyed on the
-# independent observation, that case now reds HERE.
+# `GATED_INSTALLED1` is itself incremented when `$OUT1` contains `"<job>: installed + loaded"`, so
+# guarding these assertions on it is TAUTOLOGICAL — `GATED_INSTALLED1 == 0` already implies the needle
+# is absent, and the assertions could never go red. Worse, the exact surface they exist to catch — an
+# ambient `TORTOISE_REPO` resolving a checkout that NO disk candidate explains (`GATED_VISIBLE1 == 0`
+# while `GATED_INSTALLED1 > 0`) — is the one where the count assertion above ABSORBS the leak. Keyed on
+# the independent observation, that case now reds HERE. (`run_installer` also unsets `TORTOISE_REPO`
+# per run since #1987, so the leak is currently unreachable — this pin guards that unset's removal.)
 if [ "$GATED_VISIBLE1" -eq 0 ]; then
+    # Named individually: these are the two gated templates this branch still ships (#2048 deleted
+    # `com.tortoise.worktree-reaper`, so it is no longer a job whose leak could be observed).
     assert_not_contains "$OUT_FRESH1" "branch-reaper: installed" "the {{TORTOISE_REPO}}-gated branch-reaper is SKIPPED although no checkout is visible (ambient TORTOISE_REPO must not leak in)"
-    assert_not_contains "$OUT_FRESH1" "worktree-hygiene: installed" "the {{TORTOISE_REPO}}-gated worktree-hygiene job is SKIPPED although no checkout is visible (ambient TORTOISE_REPO must not leak in)"
+    assert_not_contains "$OUT_FRESH1" "worktree-hygiene: installed" "the {{TORTOISE_REPO}}-gated worktree-hygiene is SKIPPED although no checkout is visible (ambient TORTOISE_REPO must not leak in)"
 fi
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"

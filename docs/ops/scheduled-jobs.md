@@ -85,6 +85,7 @@ caught the 34 undeclared components on the first run:
 | `PAYLOAD-DRIFT` | the installed artifact is not what the declaration renders — a **second** `ExecStart=`, a second trigger, an added `Environment=`, a replaced program, a missing unit | FAIL |
 | `NO-JOBS` | the surface was readable and carried **zero** in-scope jobs | FAIL |
 | `STALE-REGISTER` | the unmanaged register names a job that is no longer live | FAIL |
+| `RETIRING` | a register entry whose label `templates/launchd/RETIRED` declares retired **and** which is still live here — the removal simply has not run yet | note (counted) |
 | `NO-REASON` | an unmanaged entry carries no reason | FAIL |
 | `CONFLICT` | a job is both declared and registered as unmanaged — or two mechanisms clock the same job (a crontab line running the declared script) | FAIL |
 | `UNMANAGED` | live, not declared, registered **with a reason** | ok, counted |
@@ -94,10 +95,40 @@ caught the 34 undeclared components on the first run:
 from "I looked at nothing". The same rule applies to the declaration (zero records is a failure) and
 to a readable-but-empty surface (`NO-JOBS`).
 
+⛔ **A MISSING TOOL IS NOT AN UNREADABLE SURFACE.** `crontab` is not installed on every host
+(measured: absent on a stock macOS dev box, `crontab -l` → 127), and classifying that with the genuine
+read failures made `install` end `rc=1` through its own closing gate — so `pi-bootstrap/setup.sh`
+reported *"this Mac has NO disk-reaper schedule"* over units it had just installed, on every sync.
+When the client is absent the library reads the **daemon's spool** (`/var/spool/cron/crontabs/$USER`,
+`/var/spool/cron/$USER`, `/var/at/tabs/$USER`), because a daemon reads the spool without the client and
+an entry can therefore exist where the client does not; a spool file that exists but cannot be read is
+still exit 3. Only when there is no spool entry is the surface an empty, **counted** one — and the gate
+says so in its `measured cron:` line (`cron_tool=absent` in the reader's `#meta`), so "no cron client"
+never silently stands in for "no cron entries".
+
 `--static` (the CI mode) touches no scheduler: it validates the declaration and **renders every
 record for every platform it declares** — a systemd unit + timer and a launchd plist — refusing an
 unresolved placeholder, an empty `ExecStart`, or a malformed plist. That is what makes "one
 declaration rendered for both platforms" true rather than claimed.
+
+⛔ **"Unresolved placeholder" means any `@`-word that survives rendering, not only `{{`.** A `args=`
+word beginning with `@` is a machine-state placeholder by construction (`@home @path @state @repos
+@tortoise @installed`) and is resolved per word; a token no resolver knows is a declaration **error**,
+because rendering it verbatim puts an argument no program can use into the job's argv. The check looks
+for `{{` **and** for `@`-words, and an email inside an env *value* is content, not a placeholder.
+
+⛔ **`@repos` IS READ FROM THE BOX AND GIT-VALIDATED — it is never defaulted.** It renders the repo
+list the reaper's venv and worktree classes scan, from `$SJ_REPOS`, else `$SJ_TORTOISE_REPO,
+$TORTOISE_REPO, $REPO, $WORKDIR, $AGENT_INFRA_PATH`, keeping an entry **only when `git -C` answers for
+it**, `:`-separated. The old default was `$HOME/Documents/GitHub/tortoise` — macOS-shaped — and a
+**non-empty wrong value is worse than an empty one**: `scripts/disk-reaper.sh` consults its own
+candidate chain only when `DISK_REAPER_REPOS` is *empty*, so a phantom path left `REPOS` empty and both
+per-worktree classes took their `FAIL-CLOSED — no repo to scan` arm (rc 3) on every pass while
+`install`/`status`/the gate all read green. An empty resolution stays **empty** (the reaper's own chain
+then runs on `REPO`/`TORTOISE_REPO`/`WORKDIR`/`AGENT_INFRA_PATH`) and is announced at render time.
+A rendered `args=` must also be **parseable by the program it names**: `--repo` takes a value, so it may
+never be the last word (measured: `args=@tortoise --repo` rendered `--repo` with nothing after it, and
+`--static` blessed it).
 
 ### The unmanaged register
 
@@ -106,6 +137,16 @@ exit from `UNDECLARED`: `<label|unit base>|<reason>`. It is a **work list, not a
 whose job is gone is `STALE-REGISTER`, and an entry that duplicates a declared record is `CONFLICT`.
 Every entry names who actually installs it, so the register shrinks as those jobs are templated or
 retired.
+
+**One stated exemption, and it is exactly as wide as the retirement manifest.** A label listed in
+[`templates/launchd/RETIRED`](../../templates/launchd/RETIRED) is a job the fleet is *removing* —
+`install-launchd.sh:retire_pass` boots it out and deletes its plist on the next run. Such an entry
+whose job is gone is **green** (counted as `retired=`), because "the job disappeared" is the one thing
+that entry asks for; and such an entry whose job is **still live** is reported as `RETIRING`, because a
+duplicate clock is real until the removal runs. Without this, the two retired per-class reapers made
+the gate fail forever on the Mac it was built for — `install` exited 1 over the two jobs it had just
+retired in the same run, and `pi-bootstrap/setup.sh` then reported *"this Mac has NO disk-reaper
+schedule"* over an installed one. Every **other** entry that outlives its job is still `STALE-REGISTER`.
 
 ## The command
 
@@ -129,9 +170,13 @@ bash scripts/scheduled-jobs.sh parity                  # the gate
   `pass_drift=CHANGED since install` for a stale install.
 - **⛔ A non-zero exit or an absent unit is a FAILURE, never OK.** `status` exits 1 for `ABSENT`,
   `INERT` or a non-zero `last_exit`, 3 when the scheduler cannot be measured, 0 only when every
-  declared job is installed, loaded and clean. Rendered systemd units carry **no**
-  `SuccessExitStatus`: the retired unit's `SuccessExitStatus=0 4 5` made a pass that failed a class
-  read as success to `systemctl status`.
+  declared job is installed, loaded and clean. A systemd unit carries **no** `SuccessExitStatus`
+  unless the record DECLARES one (`success_exit_codes=`, #2071): the retired unit's
+  `SuccessExitStatus=0 4 5` made a pass that failed a class read as success to `systemctl status`, and
+  the one record that does declare a set (`eldato-disk-reaper` → `0 6`) accepts exactly one non-zero
+  code, the routine "a delegate DEFERRED the pass" — 3 (fail-closed), 4 (a removal FAILED) and 5 (over
+  bound) all stay RED. Which non-zero exits mean "the pass did its job" is a per-record decision, so
+  it lives in the declaration and is re-rendered by the parity gate like every other field.
 - **Arming is visible (#1678).** The shipped stance renders the report-only flag into the artifact;
   `--apply` renders the armed flag; `status` reads the arming off the **installed** artifact, never
   from the flags the invocation was given.
@@ -167,6 +212,7 @@ refusal — a pin that is silently ignored is the defect the refusal exists to p
 
 17 live jobs on the Mac are in the unmanaged register with a reason: role-agent jobs installed by
 another deployer, tortoise-repo schedules that repo owns, and the two per-class reapers retired into
-the consolidated pass. `install-launchd.sh` removes the retired ones on its next run, and the register
-entry then becomes `STALE-REGISTER` until it is deleted — the register is designed to shrink, and the
-gate refuses to let it lie.
+the consolidated pass. `install-launchd.sh` removes the retired ones on its next run; those two entries
+stay green (they are the retirement notice — see the exemption above) and every other entry is
+`STALE-REGISTER` the moment its job is gone — the register is designed to shrink, and the gate refuses
+to let it lie.

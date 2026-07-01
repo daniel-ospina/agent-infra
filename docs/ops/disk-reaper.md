@@ -139,34 +139,31 @@ runs on:
 | Linux cell | `eldato-disk-reaper.{service,timer}` in the unit dir | `cloud-cell-bringup.sh --check` (which passes `--apply`) | hourly, `Persistent=true` |
 | macOS | `~/Library/LaunchAgents/com.eldato.disk-reaper.plist` | `pi-bootstrap/setup.sh` on Darwin | hourly, `StartInterval=3600`, `RunAtLoad` |
 
-**Arming.** The repo's general rule (#1678, owner ruling 2026-10-11) is that deletion tools ship
-report-only and arming is a separate, dated, reversible owner step. This feature was explicitly
-instructed to run unattended on the cell, so the installed artifact carries `--apply`; the arming is
-visible in the installed file itself, never implied by an environment default.
+**Arming.** The repo's general rule (#1678, owner ruling 2026-10-11) is that
+deletion tools ship dry-run (report-only) and arming is a separate, dated, reversible owner step. The
+declaration therefore ships `arming=report-only`, and an install with no arming flag is report-only.
+This feature was explicitly instructed to run **unattended on the cell**, so
+`cloud-cell-bringup.sh --check` passes `--apply`; the arming is rendered INTO the artifact
+(`ExecStart=… --apply`, or `--apply` in the plist's `ProgramArguments`), never hidden in an
+environment default — so "is this job armed" is answered by reading the installed file
+(`scheduled-jobs.sh status` prints `armed=apply|dry-run`, read off that file).
 
-⛔ **`--dry-run` is a PREVIEW, never a disarm — and this doc once said it was.** `--dry-run` renders
-and prints what would be installed and writes nothing, so an operator who followed that sentence to
-disarm a cell's hourly deletion pass got exit 0 and an unchanged, still-armed unit. On a deletion tool
-that is the worst kind of false PASS.
+⛔ **A PREVIEW IS NOT A DISARM — and this doc used to say it was.** It claimed "re-run the installer
+with `--dry-run` to install a report-only unit". `scheduled-jobs.sh install --preview` renders and
+prints what it would write and writes **nothing** (T8 asserts an `install --preview` against a FRESH
+unit dir leaves it empty and enables nothing), so an operator following that sentence to disarm a
+cell's hourly deletion pass got exit 0 and an unchanged, still-armed unit. On a deletion tool that is
+the worst kind of false PASS. **Disarm with the verb that actually rewrites the artifact:**
 
-The two operations are distinct and both are announced by the installer:
+```
+bash scripts/scheduled-jobs.sh install --report-only --only eldato-disk-reaper
+```
 
-| intent | command | what it does |
-|---|---|---|
-| preview | `scheduled-jobs.sh install --dry-run` | renders and prints; writes, enables and disarms nothing |
-| **disarm** | `scheduled-jobs.sh install --report-only` | re-renders the installed artifact WITHOUT `--apply` and names the change (`armed: apply → report-only`) |
-| disarm by hand | `systemctl disable --now eldato-disk-reaper.timer` | the scheduler's own switch; record it on the cell |
-| arm | `scheduled-jobs.sh install --apply` | re-renders with `--apply` and names the change |
-
-The installed artifact is the decision of record (#1678): a later `install` with no arming flag keeps
-whatever the artifact says, and `scheduled-jobs.sh status` prints the installed stance (`armed=`).
-
-**Exit 6 is the one green non-zero code, and it is declared per job.** A delegate DEFERRED the pass —
-it ran, declined to act and claimed nothing (another pass holds the lock, a live tool holds a cache).
-That is the routine state of a busy cell (#2036), so the disk-reaper's rendered unit declares
-`SuccessExitStatus=0 6`; 3 (could not do the work), 4 (a removal failed / lock held) and 5 (work
-remains) stay RED. No other declared job gets the line — a deferral is disk-reaper's contract, and a
-blanket `SuccessExitStatus` is how a real failure becomes green (agent-infra#2071).
+That flips the mode flag in the installed unit/plist (announced as `⛔ ARMING CHANGED …`), and a
+later no-flag install **adopts the stance already on the box** rather than quietly re-arming it. A
+stance change is reversible in one copy and one command, and it leaves the artifact as the record.
+(`--preview` writes nothing and disarms nothing; `install` is idempotent, and a second run with
+unchanged bytes changes nothing but `daemon-reload`.)
 
 Both run **the same entry point with the same flags** (`disk-reaper.sh` + one mode flag). The only
 other platform difference is the *binary-resolution seam*: a launchd-spawned `bash` cannot read a
@@ -316,7 +313,7 @@ floor (#1852) — both out of scope here.
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 226 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 239 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |

@@ -142,6 +142,22 @@ without a human in the loop:
 - **Self-healing:** a PR whose reviewer reports real findings is routed to a *fixer*, fixed,
   and re-reviewed — rather than being left red forever (this is the bug that stranded ~15
   PRs before it was fixed; see §7).
+- **A capacity pool, not only an isolation boundary.** The five machines are not five independent
+  single-host harnesses that happen to share a repo; they are **one pool of capacity** over one
+  queue. So a per-machine capacity decision must never become a fleet-wide one: when a box refuses
+  an item because *it* is full, the item stays **eligible on every other box**. That is the
+  requirement this document calls **R8** (agent-infra#1909), and it is not automatic — the refusal
+  used to hold the cross-box issue claim for 90 minutes while the chain waited for a PR no agent
+  could open, so one load spike made the issue ineligible on all five boxes at once. Measured
+  2026-10-17: the Mac refused at load 98-180 (correctly) while cell-2 sat at 0.29 load with 14.5 GB
+  free and cell-3 at 0.04 load, and **47 P0/P1 issues went untouched with ~20 vCPU idle on the same
+  account**; the gap was filled by hand with six manually-created dispatch lanes. The transfer
+  mechanism is in §7.2d — and it is deliberately **not** built on load average: the signal is the
+  worker gate's own refusal, whatever it bound on (that gate binds on **load or disk**; the
+  lanes/swap/memory terms belong to the controller's separate gate, which refuses before any claim is
+  taken), because load is a
+  symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), and a
+  capacity gate a caller can skip is not a gate (agent-infra#1884).
 
 It deliberately does **not** use the `task` sub-agent tool. Workers are separate `pi -p`
 processes in tmux sessions, so a killed worker cannot take the controller down with it.
@@ -995,7 +1011,7 @@ READ state beside it, and `EMPTY` is the only form that means "no work":
 === <date> load=2 lanes=0 backlog=0 queue=UNREADABLE(3m) ===     ← BLIND: the last pool read FAILED
 === <date> load=2 lanes=0 backlog=0 queue=PARTIAL(P0-blocker)(3m) ===  ← a SUBSET, not a pool
 === <date> load=2 lanes=0 backlog=0 queue=EMPTY(12s) ===          ← read successfully, genuinely empty
-[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
+[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 0 peer-held (ledger skip), 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
 ```
 
 The age is part of the token on purpose: a value frozen by a refresh that stopped writing cannot pass
@@ -1005,14 +1021,20 @@ as a fresh reading. `UNKNOWN` means no pass has EVER recorded a read — it is n
 to read `[dispatch] backlog empty queue=READ(223)` — the pool was read (223 candidates) and the
 backlog was empty, and nothing said which step ate the 223. That contradiction idled all three cloud
 cells for hours. The dispatch line is now a DECOMPOSITION, and its parts reconcile with the pool
-(`listed = queued + peer-owned + landed + unjudged + blacklisted + already-dispatched + not-reached`):
+(`listed = queued + peer-owned + landed + unjudged + blacklisted + already-dispatched + peer-held(skipped) + not-reached`):
 
 ```text
-[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
+[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 0 peer-held (ledger skip), 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
 [dispatch] 223 candidates -> 0 queued, … , 154 not reached (limit) -> 2 dispatched | held: … ← `held:` names the gate when one blocks
 [dispatch] DRAIN STALLED — no PR merged in 359m while 52 un-owned remain. The issue path stays CLOSED
            (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.
 ```
+
+⛔ **`peer-held (ledger skip)` IS NOT `not reached (limit)`** (review finding P2-1). A candidate a recent
+pass recorded as held by a peer is walked past at no network cost, and it used to be counted NOWHERE — so
+it inflated the DERIVED `not_reached` part, the one an operator reads as "raise `LIMIT`", printed beside a
+`limit=` at its real value. On a four-box fleet with a fresh collision ledger that is the ordinary case,
+not an edge case. A record written before the key existed simply omits the part (no invented zero).
 
 `unjudged` is the one to read first: it means the pre-flight could not JUDGE, which is not "no work".
 `UNRECORDED` (no `state/refresh-funnel` yet) is never rendered as an empty funnel.
@@ -1278,7 +1300,8 @@ looked healthy while producing nothing. This is the §6.5 opening requirement's 
 NOTICE, DECIDE and ACT on a schedule that does not depend on the controller being healthy"* applied
 to the cell, and the doctor is the something.
 
-**Implementation: `cloud-cell-doctor.sh`**, launched as tmux session `cell-doctor` by
+**Implementation: `cloud-cell-doctor.sh`**, launched as tmux session `cell-doctor` (the
+`$DOCTOR_SESSION` default — a fixed name, not derived from `$SESSION`) by
 `cloud-cell-supervisor.sh start` (removed by `stop`; `.desired` in `state/roles/` records the
 intent so a `stop` is not undone by the next pass). **A `stop` always WINS over an in-flight
 `start`**: `stop` bumps a generation counter (`state/roles/.stop-generation`) as its first action,
@@ -1298,7 +1321,7 @@ its own `state/roles/<role>.state` last-pass record:
 | `merge` | 300 s | land PRs that already have a **clean attestation at THIS head** by EXECUTING `scripts/admin-merge.sh` — the standard rail, never a re-implementation |
 | `hygiene` | 3600 s | `uv cache prune` (not `cache clean`), worktree-root caches, and the **shipped** `pi-reap-worktrees.sh` (dry-run unless `HYGIENE_WORKTREES=apply`, or `auto` + the box is under disk pressure) |
 | `loop` | 10 s tick | the timer; every role also runs once immediately on start |
-| `status` | — | the liveness table; the stale bounds account for every role that runs BETWEEN two passes of the same role (the roles run in sequence in one loop), so a busy-but-healthy cell is not reported STALE; **exit 1** when a started cell has a role that never ran, went stale, or whose LAST pass failed (`rc≠0` — a failed controller restart, a cannot-verify read). One clean pass clears it, so a transient failure reads as one failing pass, not as a dead cell. A loop younger than `DOCTOR_GRACE_S` (300 s) — or a role whose FIRST pass is still running (`state/roles/.<role>.running`, what `run_role_pass` writes, bounded by `ALL_PASSES_S` so a killed loop's leftover cannot hide a dead role for ever) — prints `WAITING` instead — its first doctor pass samples every lane, so `start && status` must not call a healthy cell dead; a cell with no loop-age record is judged immediately (fail-closed) |
+| `status` | — | the liveness table; the stale bounds account for every role that runs BETWEEN two passes of the same role (the roles run in sequence in one loop), so a busy-but-healthy cell is not reported STALE; **exit 1** when a started cell has a role that never ran, went stale, or whose LAST pass failed (`rc≠0` — a failed controller restart, a cannot-verify read), or whose record carries **no readable `rc`** at all (`FAILED  the record holds no readable rc` — a truncated or hand-edited state file; an unreadable verdict is cannot-verify, never a clean pass). One clean pass clears it, so a transient failure reads as one failing pass, not as a dead cell. A loop younger than `DOCTOR_GRACE_S` (300 s) — or a role whose FIRST pass is still running (`state/roles/.<role>.running`, what `run_role_pass` writes, bounded by `ALL_PASSES_S` so a killed loop's leftover cannot hide a dead role for ever) — prints `WAITING` instead — its first doctor pass samples every lane, so `start && status` must not call a healthy cell dead; a cell with no loop-age record is judged immediately (fail-closed) |
 
 **The reap decision is the safety core**, and it is the §6.5.1 rules applied to the fleet
 namespace: a session is a candidate only if its log has not grown for `REAP_MIN_S` (**2700 s**, above
@@ -1308,7 +1331,9 @@ long model call is not a wedge. The whole read has an **overall** budget (`REAP_
 a per-call bound would let the total grow with the fleet — and each `tmux`/`ps`/`gh` call is
 separately bounded (`READ_CALL_TIMEOUT` for tmux/ps, `MERGE_READ_TIMEOUT` for the queue listing;
 without `timeout(1)` the bound is enforced by the shell itself, so its absence cannot silently
-re-open an unbounded read). A pass that spends the budget STOPS at the lane it reached and
+re-open an unbounded read, and a configured bound of `0` is REFUSED at startup because `timeout 0`
+runs the command with *no* timeout at all — a bound that silently removes itself under the name of a
+bound). A pass that spends the budget STOPS at the lane it reached and
 records `rc=3 cannot-verify`; it never acts on a partial read and never reports the lanes it did not
 reach as quiet (§6.5.2, and the 800-failed-passes measurement there). Three exclusions are hard: a session with an **attached client**, a
 session whose ancestry reaches a **human terminal**, and a session with **no log** are reported and
@@ -1578,7 +1603,8 @@ reap. The decisions that are not obvious:
   refused issue is then not written to `dispatched.txt` and not put in `.batch`, so it stays in
   `candidates.txt` and is re-attempted next cycle — no blacklist for the reaper to undo, and no
   worktree, lane or chain spawned for work another box owns. **Re-leased by `chain-merge.sh` on
-  every exit path** (clean merge, failed merge, and the 90-minute "no PR appeared" timeout) through
+  every exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
+  §7.2d — a capacity refusal, where it exits at once rather than waiting) through
   a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
   which is sized (`CLAIM_ISSUE_TTL`, default 3 h) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
@@ -1833,6 +1859,114 @@ provisioning verdict: the fleet's shared gh backoff for GitHub's secondary (conc
 agent-infra#1910, and a refresh whose resolved tool directory is behind `origin/main` still says so
 only through its own existing refusals (issue #1931's directions 1 and 3, which this change does not
 touch). A pass that cannot read the pool now says `queue=UNREADABLE` while it refuses.
+
+### 7.2d A capacity refusal consumed the item's turn — FIXED in agent-infra#1909
+
+**The defect.** R1 (a box dispatches only when it has capacity) worked exactly as designed on
+2026-10-17 and that is why the queue stalled: the Mac refused at load 98→180 while cell-2 sat at
+0.29 load with 14.5 GB free and cell-3 at 0.04. Nothing turned a refusal into "another box may take
+this", because the refusal's consequences were invisible and **long-lived**:
+
+1. `lane.sh`'s gate refused, so no agent ran and no PR could ever appear.
+2. `chain-merge.sh` then waited its full **90 minutes** for that PR — holding `refs/claims/issue-<N>`
+   the whole time, because releasing it is its EXIT trap's job.
+3. Every peer's `claim_issue_preflight` reads a live claim as **COLLISION**, so ONE box's capacity
+   decision made the issue ineligible on **all five** boxes for 90 minutes (up to `CLAIM_ISSUE_TTL`,
+   3 h, if the chain were killed). That is the `parked-*` failure R8 forbids, arrived at by a
+   different route: the item's turn was consumed by a machine that did no work.
+4. Nothing stopped the refusing box from re-winning the claim next cycle and being refused again —
+   starving the peers it had just yielded to.
+
+**The mechanism**, three parts and no new network traffic (it rides the claim the refusal was
+already holding):
+
+| part | where | what it does |
+|---|---|---|
+| the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<load\|disk>` | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
+| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 77 disk) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares. ⛔ **the cap is STRICTLY shorter than that window, and that is load-bearing:** this box may not re-dispatch before `until`, so every legitimately-arriving chain has `epoch <= CHAIN_START - win`; a slack equal to `win` would then admit the single second `epoch == CHAIN_START - win` — an EARLIER dispatch's record ending a LIVE lane's wait — so the effective slack is `min(CAPACITY_REFUSAL_GRACE_SECS, win - 1)`. **Required relation: `CAPACITY_REFUSAL_GRACE_SECS < CAPACITY_YIELD_SECS`** (the shipped defaults satisfy it, 60 < 900, and the clamp holds the bound for every other pairing); re-read this line before tuning either knob |
+| the **stand-down** | `orch-loop.sh`'s `capacity_yield_live()` reads field 2 and the dispatch loop `continue`s before the claim | releasing the claim makes the issue *eligible* on a peer; it does not make the peer *win* the CAS. While the yield is live this box leaves the issue **unconsumed** (no `dispatched.txt` row, no claim ref), so it stays a candidate here *and* free for every peer; when the yield expires the ordinary path resumes |
+
+**Decisions worth not re-litigating.**
+
+- **The signal is the gate's own refusal, not load average.** Whatever actually bound is named
+  (`load` or `disk` — opposite remedies), and the transfer is driven by the refusal event. Load is a
+  symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is also
+  why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
+  can carry: the WORKER gate binds on **load or disk** only (`spawn-gate.sh`), so those are the only
+  two values field 3 can ever hold; the lanes/swap/memory terms belong to the CONTROLLER's own gate,
+  which refuses *before* any claim is taken and therefore writes no record at all (§1 above).
+- **The yield is gate-independent, deliberately.** `load` clears when the box quietens and `disk`
+  never does, but both produce the same `CAPACITY_YIELD_SECS` stand-down: the field names the remedy
+  for whoever reads the record, and it must not shorten the transfer window (a disk refusal is not
+  evidence that a peer is free *now*). Residual, named rather than hidden: a box whose disk is full
+  re-attempts each candidate once the yield expires, because the controller's gate has no disk term
+  to stop it earlier — bounded by the yield (900 s), not parked for ever.
+- **The controller-level gate needs nothing.** It refuses *before* any claim is taken, so nothing is
+  held and nothing consumes the item's turn; the transfer machinery exists only for the worker-level
+  refusal, where an issue has already been claimed and a chain is waiting for it.
+- **Every reader fails OPEN — and the two readers do NOT check the same thing.** A missing, empty,
+  garbled, non-numeric or wrong-shaped record is **not** a refusal in either reader: treating one as
+  a refusal would suppress dispatch, which is the fleet-wide idleness R8 removes, re-introduced by a
+  corrupt byte. Past that, each consumes the fields it needs and no others:
+  - `chain-merge.sh` uses **field 1** (numeric, and inside this dispatch's window: `epoch` at or after
+    this chain's start minus the ordering slack, and not older than the record's own yield window).
+    It reports **field 3** as the exit code (75 load / 77 disk) and maps an unrecognised value to
+    `load`, because the refusal itself is already proven by field 1 and refusing to end the wait over
+    one corrupt byte is the behaviour this section forbids. It never reads field 2: an incoherent
+    yield window must not make a proven refusal unreadable.
+  - `orch-loop.sh`'s `capacity_yield_live()` uses **fields 1 and 2 together**, and only a COHERENT pair
+    (`epoch < until`, `until` in the future) is a yield; an incoherent one is not, because it would
+    park the item.
+- **`CAPACITY_YIELD_SECS` (default 900) is clamped to 1..86400 and `0` is REFUSED**, not honoured:
+  a zero-length yield would silently restore the defect while looking configured.
+- **A rejected record is now VISIBLE.** `chain-merge.sh` logs, once per run, when a record is present
+  but not admitted as this dispatch's. Before that it was indistinguishable from a lane that had
+  simply not opened its PR yet — a discarded refusal cost the whole 90-minute wait and read as an
+  ordinary timeout.
+- **A YIELDED backlog no longer reads as stillness — and it now says so through the FUNNEL.** A
+  cycle in which every candidate sits inside its yield window leaves `.batch` empty. The pre-#2040
+  sentence then printed `backlog empty queue=READ(3)` and the cycle stayed that way for as long as the
+  yield (up to 24 h at the clamp) — self-contradictory on the one line an operator reads to answer "is
+  there work?". ⛔ #2040 later proved that SENTENCE itself was the defect (`backlog empty
+  queue=READ(223)` while 223 candidates had been read and every one filtered away), so resolving this
+  branch against it does **not** resurrect the claim: the yield count rides the funnel that replaced it
+  (`dispatch_funnel`'s `yields=<n>`, in words: "this is NOT \"the fleet has nothing to do\""). The note
+  is **additive** — measured by the loop, never one of the refresh's reconciled buckets — so a yielded
+  backlog is visible on the no-dispatch line AND a yields note can never make an unreconciled funnel
+  read as summed. With no yields the line is byte-for-byte the #2040 shape, so nothing that parses it
+  changes.
+
+`capacity-transfer.test.sh` drives the shipped `lane.sh` and `chain-merge.sh` and extracts
+`capacity_yield_live()`, `dispatch_funnel()` and `cap_refusal_gate()` from the live scripts, with a
+**local bare repo** as the shared origin so the released claim is a real fenced push.
+
+⛔ **THE TWO MEASUREMENTS ARE NOT THE SAME RUN, AND THEY DO NOT HAVE THE SAME TOTAL** — quote them
+per side, never as one:
+
+| tree | `bash scripts/orchestrator-harness/capacity-transfer.test.sh` |
+|---|---|
+| **this suite's own tree** (post-fix) — `52 / 0` at the round-2 boundary fix; the same tree reported `46 / 0` at `b9f7633f`/`dcc24feb`, before §2b3's 6 sites existed | `passed: 52   failed: 0` — all 52 assertion sites |
+| **the pre-change scripts** (`origin/main`'s `lane.sh`/`chain-merge.sh`/`orch-loop.sh`/`claims.sh` beside the new suite) | `passed: 10   failed: 28` — **38** sites reached |
+
+The 14-site gap is two extraction-gated blocks that skip LOUDLY when the function they drive does
+not exist: §3's **9** behavioural checks (`capacity_yield_live()` is absent from the pre-change
+controller) and §2b3's **5** boundary checks (`cap_refusal_gate()` is absent from the pre-change
+chain; the section's own "present" check is reached there and reds).
+**52 is therefore unreachable on the pre-change tree and 38 is unreachable on this one** — a
+pre-change run that reports 52, or a post-change run that reports 38, is measuring the wrong tree.
+The pre-change passes are the checks that assert a refusal *didn't* happen and the ones pinning
+behaviour this change leaves alone (§1 x3, §2 x3, §5 x4; e.g. "no `yields=` with no yields"). Per
+section, pre-change → post-change: §1 10 → 10, §2 15 → 20, §3 1 → 10, §4 5 → 5, §5 7 → 7, so only
+the two extraction-gated blocks move. The suite's `pi`/`gh`/`df` stubs are
+**exported bash functions**, not files on PATH: both tested scripts re-prepend absolute dirs
+(`/opt/homebrew/bin:/usr/local/bin`), so a PATH stub loses to the machine's real binary — measured on
+the writing runner, where `/usr/local/bin/pi` beat the stub, and on any macOS deployment box, where
+`/opt/homebrew/bin/gh` would have made `gh pr list` a real authenticated call from a suite that
+promises no network. Residuals, named rather than hidden: the
+review/fix path's load refusal (`merge-one.sh` returning 75) is re-dispatched by the sweep and is
+**not** transferred, because it is work on an existing PR rather than an un-owned queue item; and
+the stand-down is per **issue**, so a box at capacity still holds no view of *which* peer is idle —
+peers take refused work by the ordinary severity-ordered pool, not by being told to.
 
 ### 7.2f PRs before issues — the dispatch ORDER, and ownership as a LIVE fact (owner ruling, 2026-10-18)
 
@@ -2200,7 +2334,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `repo-authority.sh` | **the per-repo merge contract** (agent-infra#1764): reads THIS repo's required status checks and derives whether the review gate applies to it, so the controller no longer enforces tortoise's check names on every repo. Fail-closed — an unreadable or unrepresentable set refuses. Sourced by `orch-loop.sh` and `merge-one.sh` |
 | `spawn-gate.sh` | the load and disk gate (`disk_free_mb`/`disk_ok` `:193-231`, `can_spawn` `:269`) plus the ONE `run_agent()` (`:305`) used by `lane.sh` and `fix-one.sh`, so a `lane`/`fix` worker started by hand is gated exactly like one the controller spawned. ⛔ Not every spawn goes through it: `merge-one.sh` defines its own `run_agent` (`:74`, called `:461`) for the reviewer, and `cloud-cell-bringup.sh:278` invokes `pi -p` with no gate at all (`agent-infra#1720`). Both residuals are asserted **by name** in `spawn-gate.test.sh:125-140`, whose census is an EQUALITY over `scripts/` — so a new ungated invoker fails the suite instead of arriving unannounced, within that census's three declared limits (`spawn-gate.test.sh:98-106`) |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
-| `lane.sh` | the implementation worker (prompt template included) |
+| `lane.sh` | the implementation worker (prompt template included). Since agent-infra#2148 it hard-requires `reviewer-preflight.sh`, prints the reviewer requirement once **before** any work, and splices the reviewer step into the generated brief — the requirement is no longer discovered by being refused at the rail |
+| `reviewer-preflight.sh` | the reviewer requirement, disclosed up front (agent-infra#2148): `reviewer_preflight_line` / `reviewer_brief_section` for the three audiences (`self` = the lane lands through the rail; `harness` = a worker that pushes code while `merge-one.sh` mints the attestation; `reviewer` = merge-one.sh's own reviewer session, which posts the verdict comment and must not push, record or merge — no brief section, by design). The `self` line also names the override for a launcher that exports no `KIND` ("if your brief says you have no `task` tool, that overrides this") — the content-repo copy of `lane.sh` is in that state today (tortoise#8432). Sourced by `lane.sh`; also `--line`/`--brief`. Its wording is drift-pinned against the pi side (`extensions/shared/reviewer-preflight.ts`) and carried by `templates/LANE-BRIEF.md` |
 | `chain-merge.sh` | waits for the lane's PR, then runs the merge chain |
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` |
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
@@ -2217,8 +2352,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Also the agent-infra#1729 pass budget: a blocked pool HEAD does not consume the window, the collision ledger defers (never drops) a held candidate, and ONLY a COLLISION is recorded — a DEGRADED answer never is. Not part of the loop |
 | `refresh-quota.test.sh` | the per-pass API **spend** contract (agent-infra#2022 / #1736 follow-up): the board cache is enabled under the TOOL's own seam (`COLLISION_PREFLIGHT_BOARD_CACHE`, not the legacy no-op name the tool treats as a caller-named-cache attack), so one pass rebuilds the board once instead of once per candidate; a pass that can only afford SOME of its window judges those completely, queues work and NAMES the stop; a pass that can afford none refuses TRANSIENTLY — after the `dispatched.txt` reaper has run — rather than reporting an empty backlog. Charges a modeled core budget from a stub `gh`, so it needs no network. A CI shard |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
-| `cloud-cell-doctor.sh` | the cell's scheduled roles — `reap` / `doctor` / `merge` / `hygiene` / `status` (§6.5.7). Launched as tmux `cell-doctor` by `cloud-cell-supervisor.sh start`; `merge` EXECUTES `scripts/admin-merge.sh` and never re-implements it |
+| `cloud-cell-doctor.sh` | the cell's scheduled roles — `reap` / `doctor` / `merge` / `hygiene` / `status` (§6.5.7). Launched as tmux `cell-doctor` (`$DOCTOR_SESSION`) by `cloud-cell-supervisor.sh start`; `merge` EXECUTES `scripts/admin-merge.sh` and never re-implements it |
 | `cloud-cell-doctor.test.sh` | #1989: drives the shipped doctor and the supervisor's role verbs against stubbed tmux/ps/rail — a lane whose child is still writing is NOT reaped, an attached/human-tty lane is NOT touched, the rail is gated on a clean attestation at the head, a refusal is recorded and not retried at the same head, and `status` FAILS a started cell whose roles never ran. A CI shard |
+| `cloud-cell-doctor.hardening.test.sh` | #1989, the HARDENING half (a separate suite, not a fork of the one above): every read the doctor acts on must be classified, so an unreadable session list / client list / ancestry walk / pane read / log mtime / process table / open-PR read / review record is cannot-verify rather than an answer, while a benign non-answer (a fresh box with no server, a lane that ended between reads) is not; an action that did not take (a refused or unverifiable kill, cpu that went DOWN) is never a reap; the rail's rc classifier is a PREDICATE (`124..127`, any `128+N`); and a REHEARSAL IS NOT A VERDICT — `--dry-run` keeps the worse of (stored verdict, its own) and says in the record that it was a rehearsal, on every role. A CI shard |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 | `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
 | `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |

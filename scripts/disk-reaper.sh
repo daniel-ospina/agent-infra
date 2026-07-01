@@ -660,8 +660,11 @@ resolve_repos() {
     [ -n "$list" ] || list="$(printf '%s\n' "${DISK_REAPER_REPOS:-}" | tr ':' '\n')"
     if [ -z "$list" ]; then
         # The documented candidates: the fleet exports some of these (the cell supervisor exports
-        # REPO; a laptop shell exports TORTOISE_REPO/AGENT_INFRA_PATH).
-        list="$(printf '%s\n' "${REPO:-}" "${TORTOISE_REPO:-}" "${AGENT_INFRA_PATH:-}")"
+        # REPO; a laptop shell exports TORTOISE_REPO/AGENT_INFRA_PATH; a cell's clone root is WORKDIR).
+        # ⛔ WORKDIR IS HERE BECAUSE THE RENDERER LEAVES THE LIST EMPTY RATHER THAN INVENTING ONE
+        # (#2058 review): `@repos` resolves to nothing when no candidate is a repository, and this is
+        # the chain that must then get its chance — an empty list on a cell is not an empty box.
+        list="$(printf '%s\n' "${REPO:-}" "${TORTOISE_REPO:-}" "${WORKDIR:-}" "${AGENT_INFRA_PATH:-}")"
     fi
     while IFS= read -r r; do
         [ -n "$r" ] || continue

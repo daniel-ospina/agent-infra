@@ -139,8 +139,14 @@ mkrendered_iv() {
     lbl="$(HOME="$T/home" SJ_DECLARATION="${DCL:-$D}" bash -c '. "$0/lib/scheduled-jobs.sh" && sj_label "$1"' "$HERE" "$id")"
     # ONLY the StartInterval integer — a blanket `<integer>` rewrite also hits Nice=10, which made the
     # fixture differ in two properties and drift for the wrong reason.
+    # ⛔ THE REPLACEMENT CARRIES NO BACKSLASH. `"<\/integer>"` in an awk REPLACEMENT is not an escape
+    # for `/` (only a regex literal needs that), and mawk — the awk on the ubuntu runner and on any box
+    # with mawk — writes the backslash into the plist: measured, the fixture's own artifact became
+    # `900<\/integer>` and the gate reported PAYLOAD-DRIFT on the UNMODIFIED baseline, so P21/P28's
+    # "the baseline is green" control failed for a reason that had nothing to do with the property it
+    # exists to prove. BSD awk drops the backslash, which is why this only showed on some hosts.
     awk -v secs="$secs" '
-        /<key>StartInterval<\/key>/ { print; getline; sub(/<integer>[0-9]*<\/integer>/, "<integer>" secs "<\/integer>"); print; next }
+        /<key>StartInterval<\/key>/ { print; getline; sub(/<integer>[0-9]*<\/integer>/, "<integer>" secs "</integer>"); print; next }
         { print }' "$dir/$lbl.plist" >"$dir/.iv"
     mv "$dir/.iv" "$dir/$lbl.plist"
 }
@@ -173,18 +179,25 @@ D
 
 gate_mac() { # gate_mac <decl> [args...]
     local d="$1"; shift
+    # ⛔ THE RETIREMENT MANIFEST IS PINNED PER CASE. Left to its default it is the REPO's own
+    # `templates/launchd/RETIRED`, so whether a register entry is exempt would depend on the repo's
+    # current content instead of on the property under test. The default here is a manifest that does
+    # not exist — no exemptions, the fail-closed direction — and P29 supplies a real one.
     HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=darwin \
     SJ_DECLARATION="$d" SJ_UNMANAGED_REGISTER="${REG:-$T/none.register}" \
+    SJ_RETIRED_MANIFEST="${SJ_RETIRED_MANIFEST:-$T/no-retired-manifest}" \
     SJ_FARM="$T/farm" SJ_LAUNCHD_DIR="${AGENTS:-$T/agents}" SJ_LAUNCHCTL="${SJ_LAUNCHCTL_OVERRIDE:-$T/bin/launchctl}" \
     LC_STATE="$T/loaded" LC_LOG="$T/lc.log" LC_LIST_RC="${LC_LIST_RC:-0}" LD_DISABLED="${LD_DISABLED:-/dev/null}" SJ_NAMESPACES="com.eldato.,com.tortoise." \
+    CRON_RC="${CRON_RC:-0}" SJ_CRON_SPOOLS="${SJ_CRON_SPOOLS:-}" \
     bash "$GATE" "$@"
 }
 gate_lin() { # gate_lin <decl> [args...]
     local d="$1"; shift
     HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux \
     SJ_DECLARATION="$d" SJ_UNMANAGED_REGISTER="${REG:-$T/none.register}" \
+    SJ_RETIRED_MANIFEST="${SJ_RETIRED_MANIFEST:-$T/no-retired-manifest}" \
     SJ_FARM="$T/farm" SJ_SYSTEMD_UNIT_DIR="${UNITS:-$T/units}" SJ_SYSTEMCTL="${SJ_SYSTEMCTL_OVERRIDE:-$T/bin/systemctl}" \
-    SC_STATE="$T/active" SC_LOG="$T/sc.log" CRON_RC="${CRON_RC:-0}" SJ_NAMESPACES="com.eldato.,com.tortoise." \
+    SC_STATE="$T/active" SC_LOG="$T/sc.log" CRON_RC="${CRON_RC:-0}" SJ_CRON_SPOOLS="${SJ_CRON_SPOOLS:-}" SJ_NAMESPACES="com.eldato.,com.tortoise." \
     bash "$GATE" "$@"
 }
 
@@ -479,6 +492,20 @@ OUT="$(CRON_RC=2 gate_lin "$D" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "P18 'crontab -l' failing exits 3 (an unreadable crontab is not an empty one)"
 OUT="$(CRON_RC=1 gate_lin "$D" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "P18 …but rc 1 ('no crontab for this user') IS an empty, measured surface"
+# ⛔ AN ABSENT CLIENT IS NOT AN UNREADABLE CRONTAB (#2058 review, BLOCKING). A missing `crontab` binary
+# makes the shell report 127, and that landed in the "unreadable" arm: `install` then turned its own
+# closing verdict=UNMEASURABLE into rc=1 and `pi-bootstrap/setup.sh` told the owner this Mac had NO
+# disk-reaper schedule over units it had just installed (measured: absent on a stock macOS dev box).
+OUT="$(CRON_RC=127 gate_lin "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P18 an ABSENT 'crontab' binary (rc=127) is a measured, counted surface — not UNMEASURABLE"
+assert_contains "$OUT" "CLIENT IS ABSENT" "P18 …and the classification is ANNOUNCED (a missing client is not the same fact as an empty crontab)"
+# …and it does not WAVE THE SPOOL THROUGH while doing so: the cron daemon reads its spool directly, so a
+# fleet entry can exist on a host whose client is gone. The library reads the spool in that case.
+mkdir -p "$T/spool"
+printf '*/5 * * * * %s/eldato-rogue.sh --x\n' "$T/farm" >"$T/spool/$(id -un)"
+OUT="$(SJ_CRON_SPOOLS="$T/spool" CRON_RC=127 gate_lin "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P18 an ABSENT client still measures the daemon spool (a fleet cron line cannot hide behind a missing binary)"
+assert_contains "$OUT" "UNDECLARED cron:" "P18 …and the spool's undeclared line is reported"
 
 echo "── P19 the declaration's own malformed shapes ──"
 BAD="$T/bad-orphan"
@@ -670,13 +697,129 @@ assert_eq "$RC" "1" "P26 …while a Weekday calendar against a daily record is S
 assert_contains "$OUT" "SCHEDULE-DRIFT" "P26 …named as drift (the calendar READER is exercised)"
 
 echo "── P27 a declared arg placeholder is resolved, and an unresolved one is a failure ──"
-DP="$T/decl-ph"; sed 's/^  managed=.*/  managed=yes\n  extra_args=--repo @tortoise --scope local/' "$D" >"$DP"
+# ⛔ THE FIXTURE USED `extra_args=`, A KEY NO PARSER READS. `sj_field` matches the key `args` exactly and
+# `SJ_KEYS` lists `args`, not `extra_args` — so the placeholder never entered the input and the
+# assertion below passed for the trivial reason that nothing resolved nothing. It would have passed,
+# unchanged, against a renderer with no placeholder support at all: a vacuous test of the property in
+# its own label (#2058 review, P2).
+DP="$T/decl-ph"; sed 's/^  managed=.*/  managed=yes\n  args=--repo @tortoise --scope local/' "$D" >"$DP"
 fresh_lin
 HOME="$T/home" SJ_DECLARATION="$DP" SJ_FARM="$T/farm" SJ_STATE_DIR="$T/home/.pi/agent/state" SJ_REPOS="$T/farm" \
     TORTOISE_REPO="$T/farm" \
     bash -c '. "$0/lib/scheduled-jobs.sh" && sj_render_systemd "$1" "$2" system' "$HERE" alpha "$T/units2" >/dev/null 2>&1
 assert_absent "$(cat "$T/units2/eldato-alpha.service" 2>/dev/null)" '@tortoise' \
     "P27 an arg placeholder does not survive into the artifact as a literal"
+# The unit quotes each argv WORD, so a resolved placeholder sits in its own word beside its flag — which
+# is also the proof that resolution is per word and did not mangle the neighbours.
+assert_contains "$(cat "$T/units2/eldato-alpha.service" 2>/dev/null)" '"--repo" "/' \
+    "P27 …the placeholder RESOLVED to a path (a renderer with no placeholder support cannot produce this)"
+assert_contains "$(cat "$T/units2/eldato-alpha.service" 2>/dev/null)" '"--scope" "local"' \
+    "P27 …and the neighbouring words keep their argv boundaries"
+# …and the same record on the DARWIN side, because that is the artifact the review measured.
+DR="$T/render-ph"; mkdir -p "$DR"
+HOME="$T/home" SJ_DECLARATION="$DP" SJ_FARM="$T/farm" SJ_LAUNCHER="$T/farm/launcher.py" \
+    SJ_STATE_DIR="$T/home/.pi/agent/state" SJ_REPOS="$T/farm" TORTOISE_REPO="$T/farm" \
+    bash -c '. "$0/lib/scheduled-jobs.sh" && sj_render_launchd "$1" "$2"' "$HERE" alpha "$DR/com.eldato.alpha.plist" >/dev/null 2>&1
+assert_absent "$(cat "$DR/com.eldato.alpha.plist" 2>/dev/null)" '<string>@tortoise</string>' \
+    "P27 a placeholder is resolved in the PLIST's ProgramArguments too (the measured defect)"
+# ⛔ A TOKEN NO RESOLVER KNOWS IS A DECLARATION DEFECT, not a literal in the argv. `@worktree-hygiene-mode`
+# was claimed in a record's args with no resolver behind it, so `<string>@worktree-hygiene-mode</string>`
+# was rendered into ProgramArguments and `--static` published `verdict=OK` over it.
+DUN="$T/decl-unresolved"; sed 's/^  managed=.*/  managed=yes\n  args=@worktree-hygiene-mode @tortoise --repo/' "$D" >"$DUN"
+OUT="$(gate_mac "$DUN" --static 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P27 an arg token with NO resolver FAILS the static half (was: verdict=OK)"
+assert_contains "$OUT" "not a placeholder any renderer resolves" "P27 …naming the token and the vocabulary"
+# The render-level guard, called directly: it is what makes the static half see ANY surviving `@`-word,
+# including one a future record invents and that validation has not been taught about yet.
+printf '        <string>--repo</string>\n        <string>@tortoise</string>\n' >"$T/ph.plist"
+OUT="$(HOME="$T/home" SJ_DECLARATION="$D" bash -c '. "$0/lib/scheduled-jobs.sh" && sj_unresolved_placeholders "$1"' "$HERE" "$T/ph.plist" 2>&1)"
+assert_contains "$OUT" '@tortoise' "P27 the render-level placeholder scan SEES a surviving @-word"
+printf '        <string>Environment=ALERT_MAIL</string>\n        <string>ops@eldato.example</string>\n' >"$T/ph2.plist"
+OUT="$(HOME="$T/home" SJ_DECLARATION="$D" bash -c '. "$0/lib/scheduled-jobs.sh" && sj_unresolved_placeholders "$1"' "$HERE" "$T/ph2.plist" 2>&1)"
+assert_eq "$OUT" "" "P27 …and an EMAIL in an env value is content, not a placeholder (no false block)"
+
+echo "── P30 @repos is READ FROM THE BOX and git-validated — never a macOS-shaped default ──"
+# ⛔ THE MEASURED #2058 DEFECT (BLOCKING). `@repos` fell back to `$HOME/Documents/GitHub/tortoise`, which
+# does not exist on a Linux cell (cells clone to $WORKDIR), and a NON-EMPTY wrong value is worse than an
+# empty one: `scripts/disk-reaper.sh:resolve_repos` consults its own candidate chain ONLY when
+# `DISK_REAPER_REPOS` is empty, so the phantom path was dropped by git, `REPOS` ended empty and BOTH the
+# venv and worktree classes took their `FAIL-CLOSED — no repo to scan` arm every pass — the two classes
+# that exist to stop a cell at 97% used — while install/status/parity stayed green. `@repos` is now the
+# retired installer's candidate list, each entry kept only when git answers for it, and an empty result
+# stays EMPTY (so the reaper's own chain runs) and is announced.
+git init -q "$T/repo-a" >/dev/null 2>&1 || true
+git init -q "$T/repo-b" >/dev/null 2>&1 || true
+mkdir -p "$T/cell-home" "$T/notarepo"        # a HOME with no Documents/, and a dir that is not a repo
+# ⛔ THE LIBRARY IS COPIED OUTSIDE ANY CHECKOUT FOR THIS SECTION. The resolver also offers the checkout it
+# was loaded from, and a test that runs inside one would therefore never reach the "no repository on this
+# box" branch — the FARMED shape (`~/.pi/agent` is not a repository) is the case that needs covering.
+mkdir -p "$T/farm/lib"; cp "$HERE/lib/"*.sh "$T/farm/lib/"
+res() { # res <assignment...> — the resolver, called directly (the review's own settle command)
+    env -u SJ_REPOS -u SJ_TORTOISE_REPO -u TORTOISE_REPO -u REPO -u WORKDIR -u AGENT_INFRA_PATH \
+        HOME="$T/cell-home" "$@" \
+        bash -c '. "$0/lib/scheduled-jobs.sh" >/dev/null 2>&1; sj_resolve_repos' "$T/farm" 2>/dev/null
+}
+assert_eq "$(res FOO=1)" "" "P30 with no candidate on the box, @repos resolves to EMPTY (not a made-up path)"
+assert_absent "$(res FOO=1)" 'Documents/GitHub/tortoise' "P30 …and never to the macOS-shaped default"
+assert_eq "$(res WORKDIR="$T/repo-a")" "$T/repo-a" "P30 a WORKDIR that IS a repository resolves to it (the cell's own clone)"
+assert_eq "$(res SJ_REPOS="$T/repo-a:$T/notarepo:$T/repo-b")" "$T/repo-a:$T/repo-b" \
+    "P30 a candidate that is NOT a repository is DROPPED, in order (a phantom path fails closed every pass)"
+# …and the property at the level that matters: the ARTIFACT the pass will run from. SJ_FARM points at the
+# real scripts so the record resolves; the LIBRARY is the copy outside the checkout, so `@repos` has no
+# checkout to fall back to and the box's own clone is the only candidate.
+DREAL="$HERE/../config/scheduled-jobs.declaration"
+mkdir -p "$T/units-real"
+OUT_R="$(env -u REPO -u AGENT_INFRA_PATH -u TORTOISE_REPO -u SJ_TORTOISE_REPO -u SJ_REPOS \
+    HOME="$T/cell-home" SJ_DECLARATION="$DREAL" SJ_FARM="$HERE" WORKDIR="$T/repo-a" \
+    bash -c '. "$0/lib/scheduled-jobs.sh" >/dev/null 2>&1 && sj_render_systemd eldato-disk-reaper "$1" system' \
+    "$T/farm" "$T/units-real" 2>&1)"
+assert_contains "$(cat "$T/units-real/eldato-disk-reaper.service" 2>/dev/null)" \
+    "Environment=DISK_REAPER_REPOS=$T/repo-a" "P30 the rendered unit exports the repo the box actually has"
+rm -rf "$T/units-real"; mkdir -p "$T/units-real"
+OUT_R="$(env -u WORKDIR -u REPO -u TORTOISE_REPO -u SJ_TORTOISE_REPO -u SJ_REPOS -u AGENT_INFRA_PATH \
+    HOME="$T/cell-home" SJ_DECLARATION="$DREAL" SJ_FARM="$HERE" \
+    bash -c '. "$0/lib/scheduled-jobs.sh" >/dev/null 2>&1 && sj_render_systemd eldato-disk-reaper "$1" system' \
+    "$T/farm" "$T/units-real" 2>&1)"
+assert_eq "$(grep -E '^Environment=DISK_REAPER_REPOS=' "$T/units-real/eldato-disk-reaper.service" 2>/dev/null)" \
+    'Environment=DISK_REAPER_REPOS=' "P30 with nothing resolvable the unit exports an EMPTY list (the reaper wins its own fallback)"
+assert_absent "$(cat "$T/units-real/eldato-disk-reaper.service" 2>/dev/null)" 'Documents/GitHub/tortoise' \
+    "P30 …never a path that cannot exist on the box (measured: both classes fail closed every hour)"
+assert_contains "$OUT_R" '@repos resolved to NOTHING' \
+    "P30 …and the empty resolution is ANNOUNCED at render time, not installed silently"
+
+
+echo "── P29 a RETIRED label's register entry is not STALE — its job is supposed to be gone ──"
+# ⛔ THE MEASURED #2058 DEFECT. `config/scheduled-jobs.unmanaged` registers two labels whose retirement
+# `templates/launchd/RETIRED` declares; `install-launchd.sh` boots them out and deletes their plists, and
+# then the register entry — whose whole purpose is "this is about to vanish" — was judged STALE-REGISTER
+# forever. `install` on the Mac therefore ended `verdict=FAIL failures=2` over jobs it had just retired
+# in the same run, and `pi-bootstrap/setup.sh` reported "this Mac has NO disk-reaper schedule" over an
+# installed one. The gate can only go red forever, which is the class this register exists to avoid.
+: >"$T/retired.manifest"
+printf 'com.eldato.gone-retired\n' >"$T/retired.manifest"
+fresh_mac
+mkrendered "$T/agents" alpha
+echo com.eldato.alpha >"$T/loaded"
+REG="$T/reg-retired"; printf 'com.eldato.gone-retired|RETIRED into com.eldato.alpha — templates/launchd/RETIRED lists it, and the installer removes it on its next run\n' >"$REG"
+OUT="$(SJ_RETIRED_MANIFEST="$T/retired.manifest" gate_mac "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P29 a register entry for a job the retirement manifest declares retired is GREEN when it is gone"
+assert_absent "$OUT" "STALE-REGISTER com.eldato.gone-retired" "P29 …never reported STALE"
+assert_contains "$OUT" "retired com.eldato.gone-retired" "P29 …and the exemption is REPORTED, never silent"
+assert_contains "$OUT" "retired=1" "P29 …and counted in the measurement line"
+# CONTROL 1 — the exemption is exactly as wide as the manifest. An entry that merely outlived its job
+# is still STALE, so the register cannot accumulate dead lines under cover of "retired".
+REG="$T/reg-stale2"; printf 'com.eldato.gone-other|not in any retirement manifest\n' >"$REG"
+OUT="$(SJ_RETIRED_MANIFEST="$T/retired.manifest" gate_mac "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "P29 an entry ABSENT from the retirement manifest is still STALE-REGISTER"
+assert_contains "$OUT" "STALE-REGISTER com.eldato.gone-other" "P29 …and named STALE"
+REG="$T/reg-retired"
+# CONTROL 2 — a retired label that is STILL LIVE is a duplicate clock, and a note about it, not silence.
+mkplist "$T/agents" com.eldato.gone-retired 3600
+printf 'com.eldato.alpha\ncom.eldato.gone-retired\n' >"$T/loaded"
+OUT="$(SJ_RETIRED_MANIFEST="$T/retired.manifest" gate_mac "$D" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "P29 a retired-but-STILL-LIVE job is not an UNDECLARED failure (the register explains it)"
+assert_contains "$OUT" "RETIRING com.eldato.gone-retired" "P29 …it is announced as RETIRING, so the duplicate pass is never silent"
+REG="$T/none.register"
 
 echo "── P28 a DISABLED launchd job is INERT — macOS has this state and the gate never read it ──"
 # `launchctl disable` is the Mac's equivalent of `systemctl disable`, and it was unenforced: a loaded,

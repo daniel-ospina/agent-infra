@@ -63,16 +63,7 @@ SJ_PLATFORMS="linux darwin"
 # Keys a record may carry. ⛔ An UNKNOWN key is an error, not a comment: a misspelled `platfroms=`
 # would otherwise render a Linux-only job and report parity clean, which is the silent-default class
 # this whole feature exists to remove.
-# `success_exit` (#2071) is a PER-JOB systemd directive: the one place a non-zero exit may be green, and
-# it is declared rather than blanket (see the renderer). An unknown key is an ERROR, so this list is
-# also what keeps a typo from being a silently ignored line.
-SJ_KEYS="platforms schedule script runner args arming managed owner label unit description env success_exit"
-# ⛔ `success_exit` IS A SYSTEMD DIRECTIVE AND HAS NO LAUNCHD COUNTERPART. launchd has no
-# "this non-zero status is fine" clause — it reports the status, and `scheduled-jobs.sh status` reads it
-# back — so the systemd renderer emits the line and the launchd renderer emits nothing. That asymmetry
-# is documented rather than enforced, because the same RECORD must be renderable for both platforms
-# (eldato-disk-reaper is declared for linux,darwin) and refusing the record would make the declaration
-# unable to describe the job at all.
+SJ_KEYS="platforms schedule script runner args arming managed owner label unit description env success_exit_codes"
 
 # ── parsing ───────────────────────────────────────────────────────────────────────────────────
 sj_ids() {
@@ -173,17 +164,86 @@ sj_resolve_script() { # sj_resolve_script <id>
     return 1
 }
 
-# sj_script_dir <id> → the ABSOLUTE directory the job's script resolves into, physically canonicalised.
-# This is what `@scriptdir` renders to, so a delegate pin (`CACHE_REAPER=@scriptdir/pi-cache-reap.sh`)
-# names the INSTALLED copy beside the entry point — never a `$HOME` copy that happens to be older
-# (agent-infra#2071: a cell's unit ran a stale farmed policy while the freshly-installed one was never
-# consulted). `cd … && pwd` rather than `dirname` alone: a symlinked farm would otherwise render a pin
-# that disagrees with the ExecStart path, and the parity gate compares those artifacts byte for byte.
-sj_script_dir() { # sj_script_dir <id>
-    local p
-    p="$(sj_resolve_script "$1")" || return 1
-    [ -n "$p" ] && [ -f "$p" ] || return 1
-    ( cd "$(dirname "$p")" 2>/dev/null && pwd ) || return 1
+# sj_installed_dir — the directory the installed copy of a record's script lives in. This is the only
+# defensible value for a delegate pin (#2071): `$HOME/.pi/agent/scripts` is the FARM, and a unit whose
+# HOME happens to hold an older farmed copy silently runs THAT policy instead of the one installed
+# beside the unit (measured on pi-cell-3: the worktree class failed with "not a git repository"
+# against a stale copy while the freshly-installed one was never consulted).
+sj_installed_dir() { # sj_installed_dir <id>
+    local s
+    s="$(sj_resolve_script "$1")" || return 1
+    dirname "$s"
+}
+
+# ── refuse to render an artifact that cannot run ────────────────────────────────────────────
+# PORTED from the retired `scripts/install-disk-reaper-timer.sh` (#2071), whose checks #2048 would
+# otherwise drop with the file. The installer's own transient-scratch refusal (in `sd_install`) covers
+# the measured 127-forever case; these are the four remaining ways a PERFECTLY INSTALLED artifact
+# reclaims nothing, each measured:
+#   * a RELATIVE entry point — systemd resolves an `ExecStart=` argument against the UNIT's working
+#     directory, so a relative one is a permanent 127 that `[ -f ]` cannot see from this cwd.
+#   * WHITESPACE in a rendered value — systemd SPLITS unquoted `Environment=`/`ExecStart=` values, so
+#     `HOME="…/bg/my home"` renders a unit that cannot run. Refused, never escaped.
+#   * a NON-NUMERIC `*_DAYS`/`*_SECONDS`/`*_MB`/`*_TIMEOUT` — baked into a PERSISTENT artifact: measured
+#     with `DISK_REAPER_WT_AGED_DAYS="7 days"`, the old installer exited 0 and systemd kept `7` and
+#     dropped `days`; a non-numeric value makes the delegate exit 2 on every pass.
+#   * an UNWRITABLE state dir — the job runs as THIS user, so every pass would fail closed (exit 3) on an
+#     artifact that installed cleanly. Under a preview the probe is READ-ONLY: a preview must not create
+#     what it only describes.
+# The BACKSLASH check the retired installer also carried is deliberately NOT ported: it existed because
+# that installer rendered through `sed`, where a backslash is an escape. This renderer passes values as
+# `printf` ARGUMENTS, so no value is reinterpreted and the defect is absent by construction.
+sj_is_absolute_path() { case "${1:-}" in /*) return 0 ;; *) return 1 ;; esac; }
+
+# sj_refuse_unrenderable <id> <dry_run:0|1> — 0 renderable; 1 refused, every reason on stderr.
+sj_refuse_unrenderable() { # sj_refuse_unrenderable <id> <dry_run>
+    local id="$1" dry="${2:-0}" script state repos k v p
+    script="$(sj_resolve_script "$id" 2>/dev/null || true)"
+    state="${SJ_STATE_DIR:-$HOME/.pi/agent/state}"
+    repos="${SJ_REPOS:-${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}"
+    for p in "$script" "$HOME" "$state"; do
+        sj_is_absolute_path "$p" || {
+            printf '%s: REFUSING to render %s — "%s" is not an absolute path, and the scheduler resolves ExecStart against the unit'"'"'s own working directory, so the pass would exit 127 every tick\n' "${0##*/}" "$id" "$p" >&2
+            return 1
+        }
+    done
+    [ -n "$script" ] && [ -f "$script" ] && [ -r "$script" ] || {
+        printf '%s: REFUSING to render %s — its script does not resolve to a readable file (%s)\n' "${0##*/}" "$id" "${script:-unresolved}" >&2
+        return 1
+    }
+    # `@installed` must resolve for the same reason `ExecStart` does: an unresolved placeholder renders
+    # the literal token into a delegate pin, and the delegate then fails every pass.
+    SJ_RENDER_INSTALLED_DIR="$(sj_installed_dir "$id" 2>/dev/null || true)"
+    while IFS= read -r k; do
+        [ -n "$k" ] || continue
+        v="${k#*=}"; k="${k%%=*}"
+        v="$(sj_render_value "$v" "$id")"
+        case "$v" in
+            *[[:space:]]*) printf '%s: REFUSING to render %s — %s contains whitespace, and the scheduler splits the rendered value on it: %s\n' "${0##*/}" "$id" "$k" "$v" >&2; return 1 ;;
+        esac
+        case "$k" in
+            *_DAYS|*_SECONDS|*_SECS|*_MB|*_TIMEOUT)
+                case "$v" in ''|*[!0-9]*) printf '%s: REFUSING to render %s — %s=%s is not a whole number, and it is baked into a PERSISTENT artifact (agent-infra#2071)\n' "${0##*/}" "$id" "$k" "$v" >&2; return 1 ;; esac ;;
+        esac
+        # A pinned DELEGATE that does not exist makes its class fail closed (exit 3) on every pass, on an
+        # artifact that installs cleanly: name it NOW rather than after the fact.
+        case "$v" in
+            *.sh) [ -f "$v" ] || printf '%s: warning: %s: %s is pinned to %s, which is missing — that class will fail closed (exit 3, red) on every pass\n' "${0##*/}" "$id" "$k" "$v" >&2 ;;
+        esac
+    done <<EOF
+$(sj_envs "$id")
+EOF
+    if [ "$dry" = 1 ]; then
+        if [ -e "$state" ] && [ ! -w "$state" ]; then
+            printf '%s: REFUSING to render %s — state dir %s exists and is not writable by %s, so every pass would fail closed (exit 3)\n' "${0##*/}" "$id" "$state" "$(id -un)" >&2
+            return 1
+        fi
+        [ -e "$state" ] || printf 'preview: %s: would create the state dir %s\n' "$id" "$state" >&2
+    elif ! mkdir -p "$state" 2>/dev/null || [ ! -w "$state" ]; then
+        printf '%s: REFUSING to render %s — state dir %s is not writable by %s, so every pass would fail closed (exit 3)\n' "${0##*/}" "$id" "$state" "$(id -un)" >&2
+        return 1
+    fi
+    return 0
 }
 
 # ── validation ──────────────────────────────────────────────────────────────────────────────
@@ -245,6 +305,29 @@ EOF
         case "$v" in yes|no|'') ;; *) echo "error: job '$id' has 'managed=$v' (want yes|no)"; rc=1 ;; esac
         v="$(sj_field "$id" arming)"
         case "$v" in ''|report-only|armed) ;; *) echo "error: job '$id' has an unknown arming '$v' (want report-only|armed)"; rc=1 ;; esac
+        # ⛔ AN ARGUMENT TOKEN THAT LOOKS LIKE A PLACEHOLDER MUST BE ONE THE RESOLVER KNOWS. `@`-prefixed
+        # argv words are machine-state placeholders by construction (a flag never starts with `@`), and a
+        # token with no resolver is rendered VERBATIM into the artifact: measured, an `args` token
+        # naming the worktree-hygiene MODE produced `<string>@worktree-hygiene-mode</string>` in
+        # ProgramArguments, which no program can use and which nothing caught — the static half only
+        # looked for `{{`.
+        for a in $(sj_field "$id" args); do
+            case "$a" in
+                @*) case " ${SJ_PLACEHOLDERS:-@home @path @state @repos @tortoise @installed} " in
+                        *" $a "*) ;;
+                        *) echo "error: job '$id' has args token '$a', which is not a placeholder any renderer resolves (known: ${SJ_PLACEHOLDERS:-@home @path @state @repos @tortoise @installed}) — it would be rendered VERBATIM into the artifact"; rc=1 ;;
+                    esac ;;
+            esac
+        done
+        # ⛔ AN ACCEPTED EXIT-CODE LIST IS A POLICY ABOUT FAILURE, SO IT IS NEVER FREE TEXT. A
+        # non-numeric token would render a directive systemd ignores — and the unit would then be read as
+        # accepting a code it does not, or vice versa. Only whole numbers, and never a leading zero.
+        v="$(sj_field "$id" success_exit_codes)"
+        if [ -n "$v" ]; then
+            for s in $v; do
+                case "$s" in ''|*[!0-9]*|0?*) echo "error: job '$id' has success_exit_codes='$v' — '$s' is not a whole exit code"; rc=1 ;; esac
+            done
+        fi
         s="$(sj_field "$id" schedule)"
         case "$s" in
             hourly|daily|weekly) ;;
@@ -331,7 +414,12 @@ sj_argv() { # sj_argv <id> <linux|darwin> [report-only|armed|""]
     esac
     # Fixed arguments, split on spaces. A record needing a quoted space in an argument would need a
     # richer format, and none does — say so here rather than silently mangling one.
-    for a in $args; do printf '%s\n' "$a"; done
+    # ⛔ A PLACEHOLDER IN `args` IS RESOLVED LIKE EVERY OTHER ONE (#2048 review, P2). It was not: the
+    # resolver was applied to PATH/HOME and to env VALUES only, so `args=--repo @tortoise` rendered
+    # `ProgramArguments = [--repo, @tortoise]` on Darwin — a token no program can use — while the
+    # declaration's own header promised those tokens "are rendered from machine state at install
+    # time". Resolving per WORD (not per string) keeps the word boundaries the argv depends on.
+    for a in $args; do printf '%s\n' "$(sj_render_value "$a" "$id")"; done
     # ⛔ ARMING IS RENDERED INTO THE ARTIFACT (#1678). An empty `arming` means "this job takes no mode
     # flag"; `report-only` and `armed` are the two stances, and the flag they produce is readable from
     # the installed unit/plist without asking the installer what it was told.
@@ -344,12 +432,10 @@ sj_argv() { # sj_argv <id> <linux|darwin> [report-only|armed|""]
 }
 
 sj_render_systemd() { # sj_render_systemd <id> <destdir> <system|user> [arming-override]
-    local id="$1" dir="$2" scope="${3:-system}" arm="${4:-}" unit argv a k v desc exec_line="" _sjr="" _sx=""
+    local id="$1" dir="$2" scope="${3:-system}" arm="${4:-}" unit argv a k v desc exec_line=""
     unit="$(sj_unit "$id")"
     arm="${arm:-$(sj_field "$id" arming)}"
     argv="$(sj_argv "$id" linux "$arm")" || return 1
-    # `@scriptdir` for the env pins: the SAME directory ExecStart uses (agent-infra#2071).
-    _sjr="$(sj_script_dir "$id" || true)"
     desc="$(sj_field "$id" description)"; [ -n "$desc" ] || desc="$id"
     mkdir -p "$dir" || return 1
 
@@ -371,27 +457,27 @@ sj_render_systemd() { # sj_render_systemd <id> <destdir> <system|user> [arming-o
         # half-way through writing the unit, so the platform is resolved by ONE helper.
         printf 'Environment=PATH=%s\n' "$(sj_job_path "$(sj_render_platform)")"
         printf 'Environment=SJ_JOB=%s\n' "$id"
-        SJ_RENDER_SCRIPT_DIR="${_sjr:-}"
         while IFS= read -r k; do
             [ -n "$k" ] || continue
             v="${k#*=}"; k="${k%%=*}"
-            printf 'Environment=%s=%s\n' "$k" "$(sj_render_value "$v")"
+            printf 'Environment=%s=%s\n' "$k" "$(sj_render_value "$v" "$id")"
         done <<EOF
 $(sj_envs "$id")
 EOF
+        # ⛔ AN ACCEPTED NON-ZERO CODE IS A DECISION ABOUT WHAT "FAILED" MEANS, so it is DECLARED, not
+        # hardcoded here and not left to the artifact's default. #2071's measured case: a busy cell's uv
+        # class defers routinely (code 6 = ran, declined, claimed nothing), and leaving 6 red made the
+        # hourly job red forever, which teaches the operator to ignore `systemctl --failed`. 3/4/5 stay
+        # red — the set is the record's, and the parity gate re-renders and compares it.
+        v="$(sj_field "$id" success_exit_codes)"
+        [ -n "$v" ] && printf 'SuccessExitStatus=%s\n' "$v"
         # Never compete with a lane for CPU or I/O: a background sweep, not a deadline.
         printf 'Nice=10\n'
         printf 'IOSchedulingClass=idle\n'
-        # ⛔ SuccessExitStatus IS DECLARED PER JOB, NEVER BLANKET. The retired disk-reaper unit carried
-        # `SuccessExitStatus=0 4 5`, which made a pass that failed a class (4) or found un-reclaimed work
-        # (5) read as SUCCESS to `systemctl status` — a false PASS in the scheduler's own vocabulary, and
-        # measured: an estate carried a "succeeding" hourly reaper on cells at 94-96% used (#2071). It
-        # moved to `0 6` for that one job, because 6 is disk-reaper's DEFERRAL (it ran, declined and
-        # claimed nothing — the routine state of a busy cell, #2036) while 3/4/5 stay red. A job that
-        # declares nothing gets no line at all: a deferral is disk-reaper's contract, and a blanket
-        # directive is exactly how a real failure becomes green.
-        _sx="$(sj_field "$id" success_exit)"
-        [ -n "$_sx" ] && printf 'SuccessExitStatus=%s\n' "$_sx"
+        # ⛔ NO SuccessExitStatus. The retired unit carried `SuccessExitStatus=0 4 5`, which made a
+        # pass that failed a class (4) or found un-reclaimed work (5) read as SUCCESS to `systemctl
+        # status` — a false PASS in the scheduler's own vocabulary. Requirement of #2048: a non-zero
+        # exit is a FAILURE, so the status is left alone and `scheduled-jobs.sh status` reports it.
         printf 'TimeoutStartSec=3600\n'
         while IFS= read -r a; do
             exec_line="${exec_line}${exec_line:+ }$(sj_sysd_quote "$a")"
@@ -429,11 +515,10 @@ sj_timer_lines() { # sj_timer_lines <id>
 }
 
 sj_render_launchd() { # sj_render_launchd <id> <destfile> [arming-override]
-    local id="$1" dest="$2" arm="${3:-}" label argv a k v secs s _sjr=""
+    local id="$1" dest="$2" arm="${3:-}" label argv a k v secs s
     label="$(sj_label "$id")"; [ -n "$label" ] || return 1
     arm="${arm:-$(sj_field "$id" arming)}"
     argv="$(sj_argv "$id" darwin "$arm")" || return 1
-    _sjr="$(sj_script_dir "$id" || true)"
     {
         printf '<?xml version="1.0" encoding="UTF-8"?>\n'
         printf '<!-- RENDERED from config/scheduled-jobs.declaration by scripts/scheduled-jobs.sh — do not edit.\n'
@@ -451,11 +536,10 @@ EOF
         printf '        <key>PATH</key>\n        <string>%s</string>\n' "$(sj_xml "$(sj_job_path darwin)")"
         printf '        <key>HOME</key>\n        <string>%s</string>\n' "$(sj_xml "$HOME")"
         printf '        <key>SJ_JOB</key>\n        <string>%s</string>\n' "$(sj_xml "$id")"
-        SJ_RENDER_SCRIPT_DIR="${_sjr:-}"
         while IFS= read -r k; do
             [ -n "$k" ] || continue
             v="${k#*=}"; k="${k%%=*}"
-            k="$(sj_render_value "$k")"; v="$(sj_render_value "$v")"
+            k="$(sj_render_value "$k" "$id")"; v="$(sj_render_value "$v" "$id")"
             printf '        <key>%s</key>\n        <string>%s</string>\n' "$(sj_xml "$k")" "$(sj_xml "$v")"
         done <<EOF
 $(sj_envs "$id")
@@ -519,154 +603,80 @@ sj_job_path() { # sj_job_path <platform>
 # ── machine-state placeholders ──────────────────────────────────────────────────────────────
 # ONE resolver, used by both renderers, so the state dir a cell's unit exports and the one a Mac's
 # plist exports cannot drift.
-sj_render_value() { # sj_render_value <string>
-    local v="$1"
+# The placeholder vocabulary the resolver knows. ONE list, used by `sj_render_value` below and by
+# `sj_validate`, so a token cannot be accepted by validation and left unresolved by rendering (or the
+# other way round).
+SJ_PLACEHOLDERS="@home @path @state @repos @tortoise @installed"
+
+# ⛔ THE REPO LIST IS READ FROM THE BOX AND GIT-VALIDATED THERE — it is never DEFAULTED to a path that
+# only one platform has (#2058 review, BLOCKING). `@repos` used to fall back to
+# `$HOME/Documents/GitHub/tortoise`, a macOS-shaped path, and a NON-EMPTY wrong value is worse than an
+# empty one: `scripts/disk-reaper.sh:resolve_repos` consults its own candidate chain ONLY when
+# `DISK_REAPER_REPOS` is empty, so a phantom path that git rejects left `REPOS` empty and BOTH the venv
+# and worktree classes took their `FAIL-CLOSED — no repo to scan` arm (rc 3) on every pass — the two
+# classes that exist to stop a cell at 97% used — while install/status/parity all read green.
+# The candidates are the ones the retired `install-disk-reaper-timer.sh` resolved at install time, each
+# kept only when git answers for it (a candidate that is not a repository fails closed every hour,
+# which is how an alarm becomes wallpaper). An empty result resolves to EMPTY on purpose: that leaves
+# `DISK_REAPER_REPOS` unset-equivalent so the reaper's own candidate chain runs, and it is announced
+# rather than installed as a phantom.
+sj_resolve_repos() { # sj_resolve_repos -> the git-validated repo list, `:`-separated (may be empty)
+    local r out="" seen=" " list
+    list="${SJ_REPOS:-}"
+    if [ -z "$list" ]; then
+        list="$(printf '%s\n' "${SJ_TORTOISE_REPO:-}" "${TORTOISE_REPO:-}" "${REPO:-}" \
+                               "${WORKDIR:-}" "${AGENT_INFRA_PATH:-}" "${SJ_REPO_ROOT:-}")"
+    fi
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        case "$seen" in *" $r "*) continue ;; esac
+        seen="$seen$r "
+        git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
+        out="${out}${out:+:}$r"
+    done <<EOF
+$(printf '%s\n' "$list" | tr ':' '\n')
+EOF
+    printf '%s' "$out"
+}
+
+# Rendered text that still carries a placeholder is NOT an artifact — it is an unresolved template. The
+# static half of the gate used to look for `{{` only, so `@tortoise` sailed through and `--static` (the
+# documented CI mode) published `verdict=OK` over an argv no program can run.
+sj_unresolved_placeholders() { # sj_unresolved_placeholders <file> -> offending lines on stdout
+    local f="$1"
+    [ -f "$f" ] || return 1
+    # ⛔ THE `@` PATTERN REQUIRES THE TOKEN TO *START* A WORD, and that is what keeps it honest: an argv
+    # word beginning with `@` is a placeholder by construction (no flag starts with `@`), while an email
+    # in an env VALUE is content (`ops@eldato.com` does not start with `@`, so it is untouched). Any
+    # `@`-word that survives rendering is a template, not an artifact — the static half used to look for
+    # `{{` alone, so `@tortoise` rendered into ProgramArguments and `--static` (the documented CI mode)
+    # published `verdict=OK` over an argv no program can run.
+    grep -nE -- "(^|[[:space:]\"'=<>])@[A-Za-z][A-Za-z0-9._-]*([[:space:]\"'<>]|$)|\{\{" "$f"
+}
+
+sj_render_value() { # sj_render_value <string> [id]
+    local v="$1" inst repos
     v="${v//@home/$HOME}"
     v="${v//@path/$(sj_job_path "$(sj_render_platform)")}"
     v="${v//@state/${SJ_STATE_DIR:-$HOME/.pi/agent/state}}"
-    v="${v//@repos/${SJ_REPOS:-${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}}"
+    # ⛔ @repos RESOLVES TO A VALIDATED LIST OR TO NOTHING — never to a default path (#2058 review,
+    # BLOCKING). See `sj_resolve_repos`: a non-empty phantom disables the reaper's own fallback chain and
+    # fails its two per-worktree classes closed on every pass.
+    case "$v" in
+        *'@repos'*)
+            repos="$(sj_resolve_repos)"
+            if [ -z "$repos" ]; then
+                printf '%s\n' "warning: @repos resolved to NOTHING — no candidate is a git repository on this box (tried: \$SJ_REPOS, \$SJ_TORTOISE_REPO, \$TORTOISE_REPO, \$REPO, \$WORKDIR, \$AGENT_INFRA_PATH). The scheduled pass's venv and worktree classes will FAIL CLOSED (rc 3) until one is supplied (DISK_REAPER_REPOS=/path/to/repo)." >&2
+            fi
+            v="${v//@repos/$repos}" ;;
+    esac
     v="${v//@tortoise/${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}"
-    # `@scriptdir` — the directory the job's OWN script resolves into. A delegate must be pinned to the
-    # INSTALLED copy, never left to `$HOME`: agent-infra#2071 measured a cell whose unit found an older
-    # farmed copy through `$HOME` and ran THAT policy while the freshly-installed one was never consulted.
-    # The renderer sets SJ_RENDER_SCRIPT_DIR from `sj_resolve_script` before walking the env list, so the
-    # value is the same one the ExecStart line uses and cannot drift from it.
-    v="${v//@scriptdir/${SJ_RENDER_SCRIPT_DIR:-}}"
+    # @installed — the directory holding the installed copy of THIS record's script (#2071).
+    case "$v" in *'@installed'*)
+        inst="${2:+$(sj_installed_dir "$2" 2>/dev/null)}"
+        v="${v//@installed/$inst}" ;;
+    esac
     printf '%s' "$v"
-}
-
-# ── refuse to render an artifact that cannot run ────────────────────────────────────────────
-# PORTED from `scripts/install-disk-reaper-timer.sh`, which #2048 replaces with this declaration +
-# renderer. The checks are not optional decoration: each one answers a MEASURED defect in which the
-# scheduler showed a job as installed and healthy while it reclaimed nothing (agent-infra#2032/#2071).
-#   * a unit whose ExecStart points into a `mktemp -d` directory — every pass exits 127 (command not
-#     found) while `systemctl list-timers` keeps the job scheduled: measured on pi-cell-2 (94% used) and
-#     pi-cell-3 (96% used, 1.4G free). The installer is the ONLY component that can see the path is
-#     transient, so it must refuse rather than write it.
-#   * a RELATIVE path — systemd resolves an ExecStart argument against the UNIT's working directory, so
-#     a relative one is a permanent 127 that `[ -f ]` cannot detect from the installer's own cwd.
-#   * whitespace in a rendered value — systemd SPLITS unquoted `Environment=`/`ExecStart=` values, so
-#     `HOME="…/bg/my home"` renders a unit that cannot run. Refused, never escaped.
-#   * a non-numeric `*_DAYS`/`*_SECONDS`/`*_MB`/`*_TIMEOUT` — baked into a PERSISTENT artifact: measured
-#     with `DISK_REAPER_WT_AGED_DAYS="7 days"`, the installer exited 0 and systemd kept `7` and dropped
-#     `days`; a non-numeric value makes the delegate exit 2 on every pass, which is a red unit every
-#     hour until someone hand-edits the unit.
-#   * an unwritable state dir — the job runs as THIS user, so every pass would fail closed on an
-#     artifact that installed cleanly.
-# The BACKSLASH check the retired installer also carried is deliberately NOT ported: it existed because
-# that installer rendered through `sed -e "s|{{X}}|$v|g"`, where a backslash is an escape. This renderer
-# uses `printf` with the value as an ARGUMENT, so no value is reinterpreted and the defect is absent by
-# construction rather than by a guard.
-sj_is_absolute_path() { case "${1:-}" in /*) return 0 ;; *) return 1 ;; esac; }
-
-# A `mktemp -d` name (`tmp.` + random suffix) is transient BY CONSTRUCTION. Testing for "/tmp" would
-# refuse a legitimate cell whose HOME really is /tmp/cell-home, so the test is the mktemp SHAPE.
-sj_is_transient_scratch() { # sj_is_transient_scratch <path>
-    local p="${1:-}" t t2
-    [ -n "$p" ] || return 1
-    # macOS sets TMPDIR with a TRAILING SLASH, so `mktemp -d "$TMPDIR/tmp.X"` yields a DOUBLE slash; a
-    # naive prefix test then misses the very path it exists to refuse. Collapse, then compare components.
-    p="$(printf '%s' "$p" | tr -s '/')"
-    case "$p" in
-        /tmp/tmp.?*|/var/tmp/tmp.?*|/private/tmp/tmp.?*|/private/var/tmp/tmp.?*) return 0 ;;
-        # macOS's own temp root is /var/folders/<a>/<b>/T/ — not /tmp — and must be named explicitly.
-        /var/folders/*/*/T/tmp.?*|/private/var/folders/*/*/T/tmp.?*) return 0 ;;
-    esac
-    for t in "${TMPDIR:-}"; do
-        [ -n "$t" ] || continue
-        t="$(printf '%s' "$t" | tr -s '/')"; t="${t%/}"
-        [ -n "$t" ] || continue
-        case "$t" in /var/*) t2="/private$t" ;; *) t2="$t" ;; esac
-        case "$p" in "$t"/tmp.?*|"$t2"/tmp.?*|"/private$t"/tmp.?*) return 0 ;; esac
-    done
-    return 1
-}
-
-# A genuine scheduler directory. An override that names one of these is pointing at the REAL thing, so it
-# must not inherit the scratch-friendly bypass the test seam gets.
-sj_is_real_scheduler_dir() {
-    case "$(printf '%s' "${1:-}" | tr -s '/')" in
-        /etc/systemd*|/usr/lib/systemd*|/lib/systemd*|/run/systemd*) return 0 ;;
-        "$HOME"/Library/LaunchAgents*|/Library/LaunchAgents*|/Library/LaunchDaemons*|/System/Library/LaunchDaemons*) return 0 ;;
-    esac
-    return 1
-}
-
-# sj_refuse_unrenderable <id> <dry_run:0|1> — 0 renderable; 1 refused, with every reason on stderr.
-sj_refuse_unrenderable() { # sj_refuse_unrenderable <id> <dry_run>
-    local id="$1" dry="${2:-0}" p script state repos k v bad="" d override=""
-    # ⛔ `@scriptdir` RESOLVES HERE TOO. The renderers set this seam before walking the env list; if the
-    # refusal walks the same list without it, every `@scriptdir/...` value expands to `/...` and the guard
-    # validates a string the artifact will never carry (a delegate check that cannot fire).
-    SJ_RENDER_SCRIPT_DIR="$(sj_script_dir "$id" 2>/dev/null || true)"
-    script="$(sj_resolve_script "$id" 2>/dev/null || true)"
-    state="${SJ_STATE_DIR:-$HOME/.pi/agent/state}"
-    repos="${SJ_REPOS:-${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}"
-    # ── always enforced ────────────────────────────────────────────────────────────────────────
-    for p in "$script" "$HOME" "$state"; do
-        sj_is_absolute_path "$p" || {
-            printf 'error: %s: REFUSING to render — "%s" is not an absolute path, and the scheduler resolves ExecStart against the unit'"'"'s own working directory, so the pass would exit 127 every tick\n' "$id" "$p" >&2
-            return 1
-        }
-    done
-    [ -n "$script" ] && [ -f "$script" ] && [ -r "$script" ] || {
-        printf 'error: %s: REFUSING to render — its script does not resolve to a readable file (%s)\n' "$id" "${script:-unresolved}" >&2
-        return 1
-    }
-    # The scratch heuristic is skipped ONLY for a scratch override, and only for the heuristic: a
-    # scratch unit/label dir is the documented TEST seam, but it must never be a licence to render from
-    # a directory that will be gone before the first tick.
-    case "$(sj_render_platform)" in
-        darwin) override="${SJ_LAUNCHD_DIR:-}" ;;
-        *)      override="${SJ_SYSTEMD_UNIT_DIR:-}" ;;
-    esac
-    if [ -n "$override" ] && ! sj_is_real_scheduler_dir "$override"; then
-        : # a scratch override: the heuristic below does not apply
-    else
-        sj_is_transient_scratch "$script" && bad="script=$script"
-        sj_is_transient_scratch "$HOME"   && bad="${bad:+$bad; }HOME=$HOME"
-        sj_is_transient_scratch "$state"  && bad="${bad:+$bad; }state=$state"
-    fi
-    if [ -n "$bad" ]; then
-        printf 'error: %s: REFUSING a render from transient scratch space: %s\n' "$id" "$bad" >&2
-        printf '       The artifact would point at a directory that is deleted before the first tick, so every\n       pass exits 127 while the scheduler still shows the job as scheduled — an inert enforcer created\n       by the installer itself (agent-infra#2032, measured on pi-cell-2/-3).\n' >&2
-        return 1
-    fi
-    # ── values that would render an artifact that cannot run ──────────────────────────────────
-    while IFS= read -r k; do
-        [ -n "$k" ] || continue
-        v="${k#*=}"; k="${k%%=*}"
-        v="$(sj_render_value "$v")"
-        case "$v" in
-            *[[:space:]]*) printf 'error: %s: REFUSING to render — %s contains whitespace, and the scheduler splits the rendered value on it: %s\n' "$id" "$k" "$v" >&2; return 1 ;;
-        esac
-        case "$k" in
-            *_DAYS|*_SECONDS|*_MB|*_TIMEOUT|*_SECS)
-                case "$v" in ''|*[!0-9]*) printf 'error: %s: REFUSING to render — %s=%s is not a whole number, and it is baked into a PERSISTENT artifact (agent-infra#2071)\n' "$id" "$k" "$v" >&2; return 1 ;; esac ;;
-        esac
-        # A pinned DELEGATE that does not exist makes its class fail closed (exit 3) on every pass, on
-        # an artifact that installed cleanly: name it at install time, not after the fact.
-        case "$v" in
-            *.sh) [ -f "$v" ] || printf 'warning: %s: %s pins %s, which is missing — that class will fail closed (exit 3, red) on every pass\n' "$id" "$k" "$v" >&2 ;;
-        esac
-    done <<EOF
-$(sj_envs "$id")
-EOF
-    # ── the state dir the job must be able to write ──────────────────────────────────────────
-    # ⛔ A PREVIEW MUST NOT CREATE IT. This probe runs before any dry-run branch, so an unconditional
-    # `mkdir -p` made the documented preview write to the filesystem (and refuse on a path it was only
-    # meant to describe).
-    if [ "$dry" = 1 ]; then
-        if [ -e "$state" ] && [ ! -w "$state" ]; then
-            printf 'error: %s: REFUSING — state dir %s exists and is not writable by %s, so every pass would fail closed (exit 3)\n' "$id" "$state" "$(id -un)" >&2
-            return 1
-        fi
-        [ -e "$state" ] || printf 'preview: %s: would create the state dir %s\n' "$id" "$state" >&2
-    elif ! mkdir -p "$state" 2>/dev/null || [ ! -w "$state" ]; then
-        printf 'error: %s: REFUSING — state dir %s is not writable by %s, so every pass would fail closed (exit 3)\n' "$id" "$state" "$(id -un)" >&2
-        return 1
-    fi
-    return 0
 }
 
 # ── the live scheduler surface ──────────────────────────────────────────────────────────────
@@ -895,15 +905,44 @@ sj_live_systemd() { # prints: <unit-base>|<installed>|<active>|<cadence>|<svc ye
 
 # crontab is a third scheduler that exists on both platforms. Entries in the FLEET's namespace are in
 # scope; a personal entry is counted and excluded (the criterion is stated, not assumed).
+# ⛔ AN ABSENT `crontab` CLIENT IS NOT AN UNREADABLE SURFACE (#2058 review, BLOCKING). The binary is
+# not installed on every host (measured: absent on a stock macOS dev box, `crontab -l` → rc 127), and
+# rc 127 was classified with the genuine read failures — so `scheduled-jobs.sh install` ended by calling
+# its own closing gate, the gate returned UNMEASURABLE (3), `install` turned that into `rc=1` and
+# `cloud-cell-bringup.sh`/`pi-bootstrap/setup.sh` died on a host whose units were installed correctly.
+# A missing client is NOT proof of an empty population either — the cron DAEMON reads its spool directly,
+# so an entry can exist where the client does not. So: read the spool, and only when there is no spool
+# entry for this user is the surface an empty, COUNTED one (announced through `#meta` as
+# `cron_tool=absent`, and by the gate, so the gap is never silent).
+sj_cron_spool_read() { # sj_cron_spool_read -> this user's spool file; 1 when it exists and cannot be read
+    local u spool f
+    u="$(id -un 2>/dev/null || printf '%s' "${USER:-}")"
+    for spool in ${SJ_CRON_SPOOLS:-/var/spool/cron/crontabs /var/spool/cron /var/at/tabs}; do
+        [ -d "$spool" ] || continue
+        f="$spool/$u"
+        [ -e "$f" ] || continue
+        [ -r "$f" ] || {
+            echo "sj_cron_spool_read: a crontab for '$u' exists at $f but is not readable — the population cannot be measured" >&2
+            return 1
+        }
+        cat "$f" 2>/dev/null
+        return 0
+    done
+    return 0
+}
+
 sj_live_cron() { # prints: <line> for in-scope entries, then #meta
-    local out n=0 excluded=0 line rc=0
+    local out n=0 excluded=0 line rc=0 cron_tool=yes
     # ⛔ rc=1 from `crontab -l` means NO CRONTAB FOR THIS USER — an empty surface, which is a real
-    # measurement. Any OTHER failure means the surface could not be read, and "I read nothing" must
-    # never be published as "nothing is scheduled" (the `|| true` here did exactly that).
+    # measurement. rc=127 means the CLIENT IS NOT INSTALLED: read the daemon's spool instead of calling
+    # the population unreadable (see `sj_cron_spool_read`). Any OTHER failure means the surface could not
+    # be read, and "I read nothing" must never be published as "nothing is scheduled" (the `|| true`
+    # here did exactly that).
     out="$(crontab -l 2>/dev/null)"; rc=$?
     case "$rc" in
         0) ;;
         1) out="" ;;
+        127) cron_tool=absent; out="$(sj_cron_spool_read)" || return 1 ;;
         *) echo "sj_live_cron: 'crontab -l' failed (rc=$rc) — the crontab population is UNREADABLE" >&2; return 1 ;;
     esac
     while IFS= read -r line; do
@@ -917,7 +956,7 @@ sj_live_cron() { # prints: <line> for in-scope entries, then #meta
     done <<EOF
 $out
 EOF
-    printf '#meta|cron=%s|excluded=%s\n' "$n" "$excluded"
+    printf '#meta|cron=%s|excluded=%s|cron_tool=%s\n' "$n" "$excluded" "$cron_tool"
     return 0
 }
 
@@ -959,4 +998,47 @@ sj_unmanaged_names() {
         case "$line" in ''|\#*) continue ;; esac
         printf '%s\n' "${line%%|*}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
     done <"$reg"
+}
+
+# ── the RETIREMENT manifest ─────────────────────────────────────────────────────────────────
+# `templates/launchd/RETIRED` is the fleet's own record that a label's job is being REMOVED:
+# `install-launchd.sh:retire_pass` boots it out and deletes its plist on the next run. A label can
+# therefore be true in two places at once — live in the register (`config/scheduled-jobs.unmanaged`,
+# "this exists and this repo does not manage it") and gone from the host — and the gate judged only the
+# second fact, so a completed retirement turned the register entry into a permanent `STALE-REGISTER`:
+# measured, `install` on the Mac it was built for ended `verdict=FAIL failures=2` over two jobs it had
+# just retired on purpose, and `pi-bootstrap/setup.sh` then told the owner "this Mac has NO disk-reaper
+# schedule" about a box where the reaper HAD been installed.
+#
+# ⛔ THIS IS NOT AN AMNESTY, and the width of the exemption is the point: it covers ONLY the label a
+# retirement manifest names. Every other register entry that outlives its job is still STALE-REGISTER,
+# and a RETIRED label that is STILL LIVE is still reported (it is a duplicate clock, and its removal
+# simply has not run yet). A missing manifest means "nothing is declared retired", which fails CLOSED
+# (entries stay STALE) rather than silently exempting everything.
+sj_retired_manifest() {
+    printf '%s\n' "${SJ_RETIRED_MANIFEST:-$SJ_REPO_ROOT/templates/launchd/RETIRED}"
+}
+
+sj_retired_labels() {
+    local m line
+    m="$(sj_retired_manifest)"
+    [ -f "$m" ] || return 0
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        printf '%s\n' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+    done <"$m"
+}
+
+sj_is_retired() { # sj_is_retired <label> -> 0 when the fleet's own manifest declares it retired
+    local want="$1" l
+    [ -n "$want" ] || return 1
+    # Capture, then grep a here-string — never `sj_retired_labels | grep -q`: under `pipefail` the
+    # producer takes SIGPIPE at grep's first match and the pipeline can report failure (#864, the same
+    # shape install-launchd.sh records for its own is_retired).
+    while IFS= read -r l; do
+        [ "$l" = "$want" ] && return 0
+    done <<EOF
+$(sj_retired_labels)
+EOF
+    return 1
 }

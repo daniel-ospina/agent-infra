@@ -108,6 +108,25 @@ printf 'NFSHomeDirectory: /Users/a-real-user\n'
 DSCL
 chmod +x "$T/bin/dscl"
 
+# ── the THIRD scheduler, made DETERMINISTIC on every host (#2071) ──────────────────────────────
+# `install` ends with the parity gate, and the gate reads the crontab population as a third surface.
+# `crontab` is NOT installed on every host (measured: absent on a stock macOS dev box, rc=127), and an
+# unreadable surface is correctly a FAILURE — so without a shim this suite's whole install path fails
+# with `verdict=UNMEASURABLE` on any box that lacks the binary, and the suites above (S1/S3/S6) go red
+# for a reason that has nothing to do with what they assert. An empty crontab is a real measurement here;
+# the cron arm of the gate has its own coverage in check-scheduled-parity.test.sh.
+cat >"$T/bin/crontab" <<'CRON'
+#!/usr/bin/env bash
+# `crontab -l` with no crontab for this user: rc=1 is "no crontab", which the library reads as an
+# EMPTY surface (not an unreadable one). Any other invocation is refused loudly so a test cannot
+# silently install a real cron entry.
+case "${1:-}" in
+  -l) exit 1 ;;
+  *)  echo "crontab shim: refusing '$*' — this suite installs no real cron entries" >&2; exit 2 ;;
+esac
+CRON
+chmod +x "$T/bin/crontab"
+
 # The fake owner installer for the `managed=no` record: writes the artifact the way its real owner
 # would, so the closing parity gate has something true to compare against.
 cat >"$T/owners/owner-fixture.sh" <<'OWN'
@@ -380,6 +399,86 @@ assert_contains "$OUT" "INCOMPLETE" "S9b …and says so instead of claiming 'uni
 assert_absent "$OUT" "uninstalled alpha" "S9b …never printing the success line it did not earn"
 run_mac uninstall >/dev/null 2>&1
 
+# ── S9c: the `disable --now` warning is REAL — the program that prints it must define it ──
+# ⛔ MEASURED #2058 DEFECT. `uninstall` announced a failed systemd `disable --now` through `warn`, which
+# exists only in check-scheduled-parity.sh — a DIFFERENT process. On the Linux arm the line was
+# `bash: line 657: warn: command not found`, so at the one moment a disarm did not disarm the operator
+# read a shell error, and the branch round 2 added ("a failed disable is announced; the read-back
+# decides") announced nothing. This case is RED against that head: `no shell error` and `did not
+# confirm` cannot both hold while `warn` is undefined, and the run_lin uninstall path had no coverage
+# at all — every existing uninstall assertion was `run_mac`.
+mkdir -p "$T/bin-nodisable"
+for b in crontab dscl; do [ -f "$T/bin/$b" ] && cp "$T/bin/$b" "$T/bin-nodisable/"; done
+cat >"$T/bin-nodisable/systemctl" <<'SCND'
+#!/usr/bin/env bash
+# The same shim as above, EXCEPT `disable` FAILS the way a real one does when it cannot disarm (a
+# read-only unit dir, a unit systemd does not have). Nothing here disarms the artifact: removing it is
+# the read-back's job, which is exactly what makes this case test the read-back and not the shim.
+printf '%s\n' "$*" >>"${SC_LOG:-/dev/null}"
+state="${SC_STATE:-/nonexistent}"
+case "${1:-}" in
+  is-active)  grep -qxF "$2" "$state" 2>/dev/null && { echo active; exit 0; }; echo inactive; exit 3 ;;
+  is-enabled) echo enabled; exit 0 ;;
+  show)       echo "${SC_EXIT:-0}"; exit 0 ;;
+  disable)    exit 1 ;;
+  enable|start|restart|daemon-reload|stop) exit 0 ;;
+  --version)  echo "systemd 255"; exit 0 ;;
+esac
+exit 0
+SCND
+chmod +x "$T/bin-nodisable/systemctl"
+run_lin install >/dev/null 2>&1
+assert_file "$T/units/eldato-alpha.timer" "S9c (fixture) the unit is installed before the disarm attempt"
+OUT="$(HOME="$T/home" PATH="$T/bin-nodisable:$PATH" PORTABLE_PLATFORM=linux \
+       SJ_DECLARATION="$DECL" SJ_UNMANAGED_REGISTER="$T/none.register" SJ_FARM="$T/farm" \
+       SJ_STATE_DIR="$T/state-lin" SJ_OWNER_DIR="$T/owners" \
+       SJ_SYSTEMD_UNIT_DIR="$T/units" SJ_SYSTEMCTL="$T/bin-nodisable/systemctl" \
+       SC_STATE="$T/active" SC_LOG="$T/sc.log" bash "$INST" uninstall --only alpha 2>&1)"; RC=$?
+assert_absent "$OUT" "command not found" "S9c a failed 'disable --now' never prints a shell error (warn is DEFINED here)"
+assert_contains "$OUT" "did not confirm" "S9c …it announces that the disable did not confirm"
+assert_eq "$RC" "0" "S9c the READ-BACK decides: the artifacts were removed, so the disarm is real (rc 0)"
+assert_contains "$OUT" "uninstalled alpha" "S9c …and only then is 'uninstalled' claimed"
+run_lin install >/dev/null 2>&1
+
+# ── S14: `install` can be GREEN on the Mac it targets — a retired register entry is not STALE ──
+# ⛔ THE MEASURED #2058 DEFECT, end to end. Two labels are registered in `config/scheduled-jobs.unmanaged`
+# AND declared retired in `templates/launchd/RETIRED`; the darwin install delegates to
+# install-launchd.sh, whose retire_pass deletes their plists, and the closing parity gate then reported
+# `STALE-REGISTER` for both — so `install` exited 1 on the Mac, and `pi-bootstrap/setup.sh` told the
+# owner "this Mac has NO disk-reaper schedule" over a box where the reaper HAD been installed, on every
+# auto-sync, until a human hand-edited the register. This case uses the REPO's own two labels and the
+# REPO's own manifest (it does not pin SJ_RETIRED_MANIFEST), so it fails if either the gate's exemption
+# or the manifest resolution regresses.
+REG_REAL="$T/reg-real-retired"
+printf '%s\n' \
+  'com.eldato.pi-cache-reap|RETIRED into com.eldato.disk-reaper (the `uv` class) — templates/launchd/RETIRED lists it, and install-launchd.sh boots it out and removes the plist on its next run.' \
+  'com.tortoise.worktree-reaper|RETIRED into com.eldato.disk-reaper (the `worktree` class) — same retirement path as above.' \
+  >"$REG_REAL"
+fresh_all
+mac_install_with_register() { # mac_install_with_register <register>
+    HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=darwin \
+    SJ_DECLARATION="$DECL" SJ_UNMANAGED_REGISTER="$1" SJ_FARM="$T/farm" \
+    SJ_STATE_DIR="$T/state-mac" SJ_OWNER_DIR="$T/owners" \
+    SJ_LAUNCHD_DIR="$T/agents" SJ_LAUNCHCTL="$T/bin/launchctl" \
+    SJ_LAUNCHD_DOMAIN="gui/999" ELDATO_ALLOW_TEST_HOME=1 \
+    LC_STATE="$T/loaded" LC_LOG="$T/lc.log" OWNER_MARKER="$T/owner-ran-mac" \
+    bash "$INST" install 2>&1
+}
+OUT="$(mac_install_with_register "$REG_REAL")"; RC=$?
+assert_eq "$RC" "0" "S14 a darwin install is GREEN with the repo's RETIRED labels registered and gone"
+assert_absent "$OUT" "STALE-REGISTER" "S14 …no STALE-REGISTER over the two jobs it just retired"
+assert_contains "$OUT" "verdict=OK" "S14 …the closing parity gate agrees"
+assert_file "$T/agents/com.eldato.alpha.plist" "S14 …and the schedule really was installed"
+# CONTROL: the exemption is exactly as wide as the manifest — a register line that is NOT retired is
+# still STALE, so this fix cannot be mistaken for "the register stopped being judged".
+REG_CTL="$T/reg-ctl"; cp "$REG_REAL" "$REG_CTL"
+printf 'com.eldato.never-retired|registered, no live job, and no retirement declares it\n' >>"$REG_CTL"
+OUT="$(mac_install_with_register "$REG_CTL")"; RC=$?
+assert_eq "$RC" "1" "S14 …while a register entry that is NOT retired still FAILS the install"
+assert_contains "$OUT" "STALE-REGISTER com.eldato.never-retired" "S14 …named STALE"
+fresh_all
+run_lin install >/dev/null 2>&1; run_mac install >/dev/null 2>&1
+
 # ── S13: a Darwin render must not put a shim dir on the job's PATH (#427, #2048 review) ──
 # `~/.pi/agent/shims/gh` symlinks into ~/Documents, which TCC denies to a launchd-spawned process: the
 # job resolves gh, gets EPERM and fails closed every hour. install-launchd.sh already strips `*/shims`;
@@ -433,11 +532,19 @@ N=0
 for f in $COMPONENTS; do
     N=$((N + 1))
     base="$(basename "$f")"
-    if grep -q 'lib/portable.sh' "$f"; then ok "S10 $base loads the portability shim"
-    else bad "S10 $base does NOT load the portability shim"; fi
+    # ⛔ EXECUTED CODE ONLY, exactly like the GNU-spelling sweep below (#2058 review, P2). This arm used
+    # to grep the WHOLE FILE for the string `lib/portable.sh`, which every migrated component carries twice
+    # as text that does nothing: `# shellcheck source=lib/portable.sh` (a comment) and the candidate path
+    # strings. Deleting the real `. "$_PORTABLE_LIB"` — the #2046 regression this arm exists to catch,
+    # where the component starts and every bounded call returns 127 — still read GREEN.
+    code="$(grep -v '^[[:space:]]*#' "$f")"
+    if grep -qE '^[[:space:]]*\.[[:space:]]+"?\$_PORTABLE_LIB' <<<"$code"; then
+        ok "S10 $base loads the portability shim (a SOURCE line, not a comment mentioning it)"
+    else
+        bad "S10 $base does NOT source the portability shim in executed code"
+    fi
     # EXECUTED code only: a comment that names `date -d` explains HISTORY (that is how the defect was
     # recorded) and must not be read as a call site.
-    code="$(grep -v '^[[:space:]]*#' "$f")"
     for pat in 'stat -c' 'stat -f' 'date -d' 'date -r' 'date -v'; do
         if grep -qF -- "$pat" <<<"$code"; then bad "S10 $base still carries GNU/BSD-only '$pat' in executed code"; else ok "S10 $base carries no '$pat'"; fi
     done
@@ -448,8 +555,51 @@ for f in $COMPONENTS; do
         bad "S10 $base calls a bare 'nproc' (GNU-only)"
     else ok "S10 $base has no bare 'nproc'"; fi
 done
+# ⛔ THE ASSERTION MUST BE ABLE TO SAY NO. A pattern can be satisfied by the file it is meant to
+# reject, and this one WAS: the probe below is a component whose only mention of the shim is a comment
+# and a candidate path string — the exact shape of a file whose real `. "$_PORTABLE_LIB"` was deleted.
+# Asserting the probe stays RED is what makes the arm above discriminating rather than decorative.
+printf '%s\n' '#!/usr/bin/env bash' \
+    '# shellcheck source=lib/portable.sh' \
+    '_portable_self_dir="$(cd "$(dirname "$0")" && pwd)"' \
+    '_PORTABLE_LIB="$_portable_self_dir/lib/portable.sh"' >"$T/neg-shim.sh"
+neg_code="$(grep -v '^[[:space:]]*#' "$T/neg-shim.sh")"
+if grep -qE '^[[:space:]]*\.[[:space:]]+"?\$_PORTABLE_LIB' <<<"$neg_code"; then
+    bad "S10 the shim assertion is VACUOUS — a file that only NAMES lib/portable.sh passes it"
+else
+    ok "S10 …and the shim assertion REJECTS a file that merely mentions lib/portable.sh"
+fi
 [ "$N" -ge 8 ] && ok "S10 the population is non-empty and derived from the declaration ($N components)" \
                 || bad "S10 the component population collapsed to $N — the check would be vacuous"
+
+echo "── S15 a declared args= is an argv the PROGRAM IT NAMES can parse (#2058 review, P2) ──"
+# ⛔ `--static` (the documented CI mode) renders every record and checked only for unresolved placeholders
+# and plist well-formedness, so a MALFORMED argv was blessed as `verdict=OK`. The measured case:
+# `worktree-hygiene` declared `args=@tortoise --repo`, and `scripts/worktree-hygiene-sweep.sh` parses
+# `--repo) REPO="$2"; shift 2` — so the rendered argv was `[<repo>, --repo]`: the repo as a stray
+# positional and the flag with nothing after it. Nothing asserted a rendered argv is parseable.
+# The flags that TAKE A VALUE (from the consumers' own parse loops): none may end an argv.
+VALUEFLAGS=" --repo --scope --aged-days --engine --backup-dir --state-dir --script "
+DANGLING=""
+for id in $(cd "$ROOT" && SJ_DECLARATION="$REAL_DECL" bash -c '. scripts/lib/scheduled-jobs.sh >/dev/null 2>&1; sj_ids'); do
+    a="$(cd "$ROOT" && SJ_DECLARATION="$REAL_DECL" bash -c '. scripts/lib/scheduled-jobs.sh >/dev/null 2>&1; sj_field '"$id"' args')"
+    [ -n "$a" ] || continue
+    last="${a##* }"
+    case "$VALUEFLAGS" in *" $last "*) DANGLING="$DANGLING $id($last)" ;; esac
+done
+if [ -z "$DANGLING" ]; then ok "S15 no record's args= ENDS with a flag that takes a value";
+else bad "S15 a record's args= ends with a value-taking flag, so the flag renders valueless:$DANGLING"; fi
+# …and the same property read off the ARTIFACT, where it is actually consumed. The value after `--repo`
+# must be the resolved repo path; the pre-fix declaration put `--repo` LAST, so this read nothing.
+SD="$T/render-decl"; mkdir -p "$SD"
+TORTOISE_REPO="$T/farm" HOME="$T/home" SJ_DECLARATION="$REAL_DECL" SJ_FARM="$T/farm" \
+    bash -c '. "$0/lib/scheduled-jobs.sh" >/dev/null 2>&1 && sj_render_launchd worktree-hygiene "$1"' \
+    "$HERE" "$SD/com.tortoise.worktree-hygiene.plist" >/dev/null 2>&1
+WH_PL="$SD/com.tortoise.worktree-hygiene.plist"
+assert_file "$WH_PL" "S15 the real worktree-hygiene record renders a plist"
+PAIR="$(awk '/<string>--repo<\/string>/{ getline; sub(/^[ \t]*<string>/, ""); sub(/<\/string>[ \t]*$/, ""); print; exit }' "$WH_PL" 2>/dev/null)"
+assert_eq "$PAIR" "$T/farm" "S15 …where the word AFTER --repo is its VALUE (a flag with no value is an unusable argv)"
+
 
 echo "── S11 the verbs reach the LIVE domain only from the real home (#446) ──"
 # The temp-HOME guard was applied to `install` and to nothing else: `stop|restart|uninstall` reached the
@@ -498,7 +648,7 @@ assert_contains "$OUT" "pass_changed=1" "S12 …and the job is RELOADED rather t
 OUT="$(run_lin install --apply 2>&1)"
 assert_contains "$OUT" "arming NOT applied" "S12 --apply says which delegated records it cannot arm"
 
-echo "── S15 the unit's exit-code stance and delegate pins come from the DECLARATION (#2071) ──"
+echo "── S17 the unit's exit-code stance and delegate pins come from the DECLARATION (#2071) ──"
 # The retired unit carried `SuccessExitStatus=0 4 5`, which made a pass that FAILED a class (4) and one
 # that found un-reclaimed work (5) read as SUCCESS to `systemctl status` — measured: an estate carried a
 # "succeeding" hourly reaper on cells at 94-96% used. #2071 moved it to `0 6` (6 = a delegate DEFERRED,
@@ -515,31 +665,31 @@ real_lin() { # real_lin <args...>
 }
 real_lin install --only eldato-disk-reaper >/dev/null 2>&1
 REAL_UNIT="$REAL_UNITS/eldato-disk-reaper.service"
-assert_file "$REAL_UNIT" "S15 the real declaration renders the disk-reaper unit"
+assert_file "$REAL_UNIT" "S17 the real declaration renders the disk-reaper unit"
 UNIT_TXT="$(cat "$REAL_UNIT" 2>/dev/null || true)"
-assert_contains "$UNIT_TXT" "SuccessExitStatus=0 6" "S15 the unit declares exit 6 as the ONE green non-zero code"
-assert_absent "$UNIT_TXT" "SuccessExitStatus=0 4 5" "S15 …and the masked form (0 4 5) is gone (#2071's measured false PASS)"
+assert_contains "$UNIT_TXT" "SuccessExitStatus=0 6" "S17 the unit declares exit 6 as the ONE green non-zero code"
+assert_absent "$UNIT_TXT" "SuccessExitStatus=0 4 5" "S17 …and the masked form (0 4 5) is gone (#2071's measured false PASS)"
 case "$UNIT_TXT" in
-    *"SuccessExitStatus=0 5 6"*) bad "S15 exit 5 is NOT green: in an apply pass it means work remains (#2071 refuses #2036's literal proposal)" ;;
-    *) ok "S15 exit 5 is not whitelisted (work that remains stays RED)" ;;
+    *"SuccessExitStatus=0 5 6"*) bad "S17 exit 5 is NOT green: in an apply pass it means work remains (#2071 refuses #2036's literal proposal)" ;;
+    *) ok "S17 exit 5 is not whitelisted (work that remains stays RED)" ;;
 esac
 # ⛔ DECLARED PER JOB, NOT BLANKET. A second job with no `success_exit` must render NO line at all, so a
 # future edit cannot turn the directive into a repo-wide "non-zero is fine".
 BARE_DECL="$T/s13/bare.declaration"
-sed '/success_exit=/d' "$REAL_DECL" >"$BARE_DECL"
+sed '/success_exit_codes=/d' "$REAL_DECL" >"$BARE_DECL"
 BARE_UNITS="$T/s13/bare-units"; mkdir -p "$BARE_UNITS"
 HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$BARE_DECL" \
   SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s13/state" SJ_REPOS="$ROOT" \
   SJ_SYSTEMD_UNIT_DIR="$BARE_UNITS" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s13/active2" \
   bash "$INST" --no-parity install --only eldato-disk-reaper >/dev/null 2>&1
 assert_absent "$(cat "$BARE_UNITS/eldato-disk-reaper.service" 2>/dev/null || true)" "SuccessExitStatus" \
-  "S15 with the key absent the renderer emits NO SuccessExitStatus (declaration-scoped, never a blanket)"
+  "S17 with the key absent the renderer emits NO SuccessExitStatus (declaration-scoped, never a blanket)"
 # ── the delegate pins: the INSTALLED copy, never $HOME ────────────────────────────────────────
 assert_contains "$UNIT_TXT" "CACHE_REAPER=$ROOT/scripts/pi-cache-reap.sh" \
-  "S15 CACHE_REAPER is pinned to the script's own directory, not to \$HOME (a stale farmed copy ran instead, #2071)"
-assert_contains "$UNIT_TXT" "VENV_REAPER=$ROOT/scripts/reap-lane-venvs.sh" "S15 …VENV_REAPER likewise"
-assert_contains "$UNIT_TXT" "WORKTREE_REAPER=$ROOT/scripts/pi-reap-worktrees.sh" "S15 …WORKTREE_REAPER likewise"
-assert_absent "$UNIT_TXT" "@scriptdir" "S15 the placeholder is RESOLVED in the artifact (an unresolved @scriptdir is a 127 every tick)"
+  "S17 CACHE_REAPER is pinned to the script's own directory, not to \$HOME (a stale farmed copy ran instead, #2071)"
+assert_contains "$UNIT_TXT" "VENV_REAPER=$ROOT/scripts/reap-lane-venvs.sh" "S17 …VENV_REAPER likewise"
+assert_contains "$UNIT_TXT" "WORKTREE_REAPER=$ROOT/scripts/pi-reap-worktrees.sh" "S17 …WORKTREE_REAPER likewise"
+assert_absent "$UNIT_TXT" "@installed" "S17 the placeholder is RESOLVED in the artifact (an unresolved @installed is a 127 every tick)"
 # launchd has no way to whitelist an exit status, so the plist must NOT claim the stance it cannot keep.
 # Rendered DIRECTLY through the shared renderer: the assertion is about the ARTIFACT, and driving the
 # whole darwin install here would couple it to launchd lifecycle state the assertion does not need.
@@ -554,13 +704,13 @@ RLD
 chmod +x "$T/s15-render-ld.sh"
 LD_PLIST="$T/s15/com.eldato.disk-reaper.plist"; mkdir -p "$T/s15"
 out="$("$T/s15-render-ld.sh" "$ROOT" "$REAL_DECL" "$ROOT/scripts" "$ROOT" "$T/s15/state" "$LD_PLIST" 2>&1)"; rc=$?
-assert_eq "$rc" "0" "S15 the darwin artifact renders (rc=0)"
+assert_eq "$rc" "0" "S17 the darwin artifact renders (rc=0)"
 LD_TXT="$(cat "$LD_PLIST" 2>/dev/null || true)"
-assert_contains "$LD_TXT" "<key>CACHE_REAPER</key>" "S15 the darwin artifact carries the same delegate pins"
-assert_contains "$LD_TXT" "$ROOT/scripts/pi-cache-reap.sh" "S15 …resolved to the script's own directory"
-assert_absent "$LD_TXT" "SuccessExitStatus" "S15 …but no SuccessExitStatus (launchd cannot whitelist a status; the claim is not silently carried)"
+assert_contains "$LD_TXT" "<key>CACHE_REAPER</key>" "S17 the darwin artifact carries the same delegate pins"
+assert_contains "$LD_TXT" "$ROOT/scripts/pi-cache-reap.sh" "S17 …resolved to the script's own directory"
+assert_absent "$LD_TXT" "SuccessExitStatus" "S17 …but no SuccessExitStatus (launchd cannot whitelist a status; the claim is not silently carried)"
 
-echo "── S16 an artifact that CANNOT RUN is refused before anything is written (#2032/#2071) ──"
+echo "── S18 an artifact that CANNOT RUN is refused before anything is written (#2032/#2071) ──"
 # Each case answers a MEASURED defect where the scheduler showed the job as installed and healthy while it
 # reclaimed nothing. The refusal is the installer's, and it must fire BEFORE any write.
 refuse_run() { # refuse_run <label> <expected-substring> <env-assignments...>
@@ -572,10 +722,10 @@ refuse_run() { # refuse_run <label> <expected-substring> <env-assignments...>
             SJ_DECLARATION="$REAL_DECL" SJ_FARM="$ROOT/scripts" \
             SJ_SYSTEMD_UNIT_DIR="$dir/units" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$dir/active" \
             "$@" bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
-    [ "$rc" -ne 0 ] && ok "S16 $label is REFUSED (rc=$rc)" || bad "S16 $label installed (rc=0) — an artifact that cannot run was written"
-    assert_contains "$out" "$want" "S16 …and the refusal names the reason ($label)"
+    [ "$rc" -ne 0 ] && ok "S18 $label is REFUSED (rc=$rc)" || bad "S18 $label installed (rc=0) — an artifact that cannot run was written"
+    assert_contains "$out" "$want" "S18 …and the refusal names the reason ($label)"
     assert_eq "$(ls -A "$dir/units" 2>/dev/null | wc -l | tr -d ' ')" "0" \
-        "S16 …and NOTHING was written for $label"
+        "S18 …and NOTHING was written for $label"
 }
 # (a) a RELATIVE script path: systemd resolves ExecStart against the UNIT's cwd, so it is a permanent 127
 #     that the installer's own cwd cannot see.
@@ -588,20 +738,32 @@ out="$(cd "$T/s14" && HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux
        SJ_DECLARATION="$REAL_DECL" SJ_FARM="relfarm" SJ_STATE_DIR="$T/s14/st" SJ_REPOS="$ROOT" \
        SJ_SYSTEMD_UNIT_DIR="$T/s14/relunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/relact" \
        bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && ok "S16 a RELATIVE farm makes the entry point relative, and it is REFUSED (rc=$rc)" \
-    || bad "S16 a relative entry point was accepted — systemd would exit 127 every tick"
-assert_contains "$out" "not an absolute path" "S16 …naming the non-absolute path and its consequence"
-# (b) whitespace in a rendered value: systemd splits unquoted Environment= values.
-refuse_run "a value carrying whitespace" "contains whitespace" SJ_REPOS="/tmp/a repo"
+[ "$rc" -ne 0 ] && ok "S18 a RELATIVE farm makes the entry point relative, and it is REFUSED (rc=$rc)" \
+    || bad "S18 a relative entry point was accepted — systemd would exit 127 every tick"
+assert_contains "$out" "not an absolute path" "S18 …naming the non-absolute path and its consequence"
+# (b) whitespace in a rendered value: systemd splits unquoted Environment= values. Declared in the
+# RECORD rather than passed through the environment: `sj_resolve_repos` legitimately DROPS an unusable
+# repo list, so an env-based probe would be testing that validation, not the renderer.
+SPACE_DECL="$T/s14/space.decl"
+sed 's|^  env DISK_REAPER_WT_AGED_DAYS=7|  env DISK_REAPER_TOUCHED="a b"|' "$REAL_DECL" >"$SPACE_DECL"
+out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$SPACE_DECL" \
+       SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s14/spacest" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$T/s14/spaceunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/spaceact" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S18 a declared value carrying whitespace is REFUSED (rc=$rc)" \
+    || bad "S18 a whitespace-carrying value rendered into a persistent unit"
+assert_contains "$out" "contains whitespace" "S18 …and the refusal names the value"
+assert_eq "$(ls -A "$T/s14/spaceunits" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "S18 …and NOTHING was written"
 # (c) a non-numeric *_DAYS: baked into a PERSISTENT artifact (measured: systemd keeps '7', drops 'days').
 WS_DECL="$T/s14/aged.decl"; sed "s|^  env DISK_REAPER_WT_AGED_DAYS=7|  env DISK_REAPER_WT_AGED_DAYS=abc|" "$REAL_DECL" >"$WS_DECL"
 out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$WS_DECL" \
        SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s14/st2" SJ_REPOS="$ROOT" \
        SJ_SYSTEMD_UNIT_DIR="$T/s14/agedunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/agedact" \
        bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && ok "S16 a non-numeric *_DAYS is REFUSED (rc=$rc) — it would be baked into the unit" \
-    || bad "S16 'DISK_REAPER_WT_AGED_DAYS=7 days' rendered into a persistent unit"
-assert_contains "$out" "not a whole number" "S16 …and says which value and why"
+[ "$rc" -ne 0 ] && ok "S18 a non-numeric *_DAYS is REFUSED (rc=$rc) — it would be baked into the unit" \
+    || bad "S18 'DISK_REAPER_WT_AGED_DAYS=7 days' rendered into a persistent unit"
+assert_contains "$out" "not a whole number" "S18 …and says which value and why"
 # `DISK_REAPER_WT_AGED_DAYS="7 days"` trips the WHITESPACE arm instead (checked first) — the other half of
 # the same measured defect, where systemd kept `7` and dropped `days` and still exited 0.
 SP_DECL="$T/s14/aged-sp.decl"; sed "s|^  env DISK_REAPER_WT_AGED_DAYS=7|  env DISK_REAPER_WT_AGED_DAYS=7 days|" "$REAL_DECL" >"$SP_DECL"
@@ -609,37 +771,35 @@ out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION
        SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s14/st2b" SJ_REPOS="$ROOT" \
        SJ_SYSTEMD_UNIT_DIR="$T/s14/agedunits2" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/agedact2" \
        bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && ok "S16 'DISK_REAPER_WT_AGED_DAYS=7 days' is REFUSED (whitespace arm)" \
-    || bad "S16 a two-token AGED_DAYS value rendered into a persistent unit"
+[ "$rc" -ne 0 ] && ok "S18 'DISK_REAPER_WT_AGED_DAYS=7 days' is REFUSED (whitespace arm)" \
+    || bad "S18 a two-token AGED_DAYS value rendered into a persistent unit"
 # (d) a TRANSIENT SCRATCH target: the artifact would point into a mktemp dir that is gone before the first
 #     tick, so every pass exits 127 while the scheduler still shows the job as scheduled (measured on
-#     pi-cell-2 at 94% and pi-cell-3 at 96% used). Driven straight at the guard, because `choose_systemd`
-#     answers first on a system target and would refuse for an unrelated reason.
+#     pi-cell-2 at 94% and pi-cell-3 at 96% used). Driven through the REAL install path: without a unit-dir
+#     override the installer takes the SYSTEM target, which is the shape the defect was measured in.
 SCRATCH_HOME="$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXX")"
 mkdir -p "$SCRATCH_HOME/.pi/agent/scripts"
-cat >"$T/s14/refuse-probe.sh" <<'RP'
-#!/usr/bin/env bash
-set -uo pipefail
-cd "$1" || exit 1
-export SJ_DECLARATION="$2" SJ_FARM="$3"
-. scripts/lib/scheduled-jobs.sh
-sj_refuse_unrenderable eldato-disk-reaper "${4:-0}"
-RP
-chmod +x "$T/s14/refuse-probe.sh"
-# A REAL launchd dir (the HOME default) → the scratch heuristic applies. The #446 home guard is not in
-# this path: the probe calls the renderer's refusal directly, which is the arm under test.
-out="$(HOME="$SCRATCH_HOME" SJ_STATE_DIR="$SCRATCH_HOME/.pi/agent/state" SJ_REPOS="$ROOT" \
-       PORTABLE_PLATFORM=darwin "$T/s14/refuse-probe.sh" "$ROOT" "$REAL_DECL" "$ROOT/scripts" 1 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && ok "S16 a transient-scratch HOME pointing at a REAL launchd dir is REFUSED (rc=$rc)" \
-    || bad "S16 an artifact was rendered from a mktemp HOME — the 127-forever shape"
-assert_contains "$out" "transient scratch" "S16 …and the refusal names the transient path"
-# …and a SCRATCH dir override (the documented test seam) bypasses ONLY the heuristic: the same env is
-# accepted, which is what every other fixture in this suite relies on.
-out="$(HOME="$SCRATCH_HOME" SJ_STATE_DIR="$SCRATCH_HOME/.pi/agent/state" SJ_REPOS="$ROOT" \
-       PLATFORM=linux PORTABLE_PLATFORM=linux SJ_SYSTEMD_UNIT_DIR="$T/s14/scratchunits" \
-       "$T/s14/refuse-probe.sh" "$ROOT" "$REAL_DECL" "$ROOT/scripts" 1 2>&1)"; rc=$?
-[ "$rc" -eq 0 ] && ok "S16 a scratch UNIT DIR is the test seam — the bypass is scoped to the heuristic" \
-    || bad "S16 the scratch unit-dir seam stopped working (rc=$rc): $(printf '%.200s' "$out")"
+cp "$ROOT/scripts/disk-reaper.sh" "$SCRATCH_HOME/.pi/agent/scripts/"
+: >"$T/s14/calls.log"
+out="$(HOME="$SCRATCH_HOME" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$SCRATCH_HOME/.pi/agent/scripts" SJ_STATE_DIR="$SCRATCH_HOME/.pi/agent/state" \
+       SJ_REPOS="$ROOT" SJ_SUDO="true" SJ_SYSTEMCTL="$T/bin/systemctl" SYSTEMCTL_CALLS="$T/s14/calls.log" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S18 a SYSTEM install from a transient-scratch HOME is REFUSED (rc=$rc)" \
+    || bad "S18 a unit was rendered from a mktemp HOME — the 127-forever shape"
+assert_contains "$out" "transient scratch" "S18 …and the refusal names the transient path"
+assert_absent "$(cat "$T/s14/calls.log" 2>/dev/null || true)" "enable" \
+    "S18 …and nothing is ENABLED for a unit that could never run"
+# …and the explicit unit-dir override (the documented test seam, used by every fixture in this suite) is
+# NOT blocked by it: the bypass is scoped to the heuristic, not to the whole guard.
+SCRATCH_FARM="$T/s14/scratch-farm"; mkdir -p "$SCRATCH_FARM"; cp "$ROOT/scripts/disk-reaper.sh" "$SCRATCH_FARM/"
+out="$(HOME="$SCRATCH_HOME" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$SCRATCH_FARM" SJ_STATE_DIR="$SCRATCH_HOME/.pi/agent/state" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$T/s14/scratchunits" SJ_SYSTEMCTL="$T/bin/systemctl" \
+       SC_STATE="$T/s14/scratchact" SYSTEMCTL_CALLS="$T/s14/calls2.log" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "S18 an explicit unit-dir override still installs (the seam is not a false block)" \
+    || bad "S18 the documented override stopped installing (rc=$rc): $(printf '%.200s' "$out")"
 rm -rf "$SCRATCH_HOME"
 # (e) an UNWRITABLE state dir: the job runs as this user, so every pass would fail closed on an artifact
 #     that installed cleanly. And under --dry-run the probe must NOT create it.
@@ -648,16 +808,16 @@ out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION
        SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s14/ro-state/state" SJ_REPOS="$ROOT" \
        SJ_SYSTEMD_UNIT_DIR="$T/s14/rounits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/act5" \
        bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && ok "S16 an unwritable state dir is REFUSED (rc=$rc)" || bad "S16 an unwritable state dir installed cleanly"
-assert_contains "$out" "not writable" "S16 …naming the directory and the user"
+[ "$rc" -ne 0 ] && ok "S18 an unwritable state dir is REFUSED (rc=$rc)" || bad "S18 an unwritable state dir installed cleanly"
+assert_contains "$out" "not writable" "S18 …naming the directory and the user"
 chmod 700 "$T/s14/ro-state"
 MISSING_STATE="$T/s14/would-create/state"
 out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
        SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$MISSING_STATE" SJ_REPOS="$ROOT" \
        SJ_SYSTEMD_UNIT_DIR="$T/s14/pvunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/act6" \
        bash "$INST" --no-parity install --only eldato-disk-reaper --dry-run 2>&1)"; rc=$?
-[ ! -e "$MISSING_STATE" ] && ok "S16 a PREVIEW does not create the state dir it only describes" \
-    || bad "S16 --dry-run created $MISSING_STATE (a preview must write nothing)"
+[ ! -e "$MISSING_STATE" ] && ok "S18 a PREVIEW does not create the state dir it only describes" \
+    || bad "S18 --dry-run created $MISSING_STATE (a preview must write nothing)"
 # (f) a pinned DELEGATE that does not exist: its class would fail closed (exit 3) every pass, on an
 #     artifact that installed cleanly — so it is named at install time.
 HALF_FARM="$T/s14/half-farm"; mkdir -p "$HALF_FARM"
@@ -666,8 +826,8 @@ out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION
        SJ_FARM="$HALF_FARM" SJ_STATE_DIR="$T/s14/halfstate" SJ_REPOS="$ROOT" \
        SJ_SYSTEMD_UNIT_DIR="$T/s14/halfunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/act7" \
        bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
-assert_contains "$out" "which is missing" "S16 a pinned delegate that is absent is NAMED at install time (it would fail closed every pass)"
-assert_contains "$out" "pi-cache-reap.sh" "S16 …and the warning names the delegate"
+assert_contains "$out" "which is missing" "S18 a pinned delegate that is absent is NAMED at install time (it would fail closed every pass)"
+assert_contains "$out" "pi-cache-reap.sh" "S18 …and the warning names the delegate"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

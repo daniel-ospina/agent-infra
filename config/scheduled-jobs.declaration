@@ -27,7 +27,11 @@
 #                                  job starts an interpreter that CAN and hands it the script. On Linux
 #                                  the same record renders as a plain bash ExecStart — the seam is data,
 #                                  not a second implementation.
-#   args=<fixed arguments>         spaces are preserved; quoted in both renderings
+#   args=<fixed arguments>         spaces are preserved; quoted in both renderings. A word that starts
+#                                  with `@` is a MACHINE-STATE PLACEHOLDER and is resolved per word by
+#                                  the one resolver (`@home @path @state @repos @tortoise @installed`);
+#                                  a token no resolver knows is a validation ERROR, because rendering it
+#                                  verbatim puts an unusable argument in the job's argv.
 #   arming=report-only|armed       the SHIPPED stance (#1678). `install --apply` arms for one run and
 #                                  the flag lands INSIDE the rendered artifact, never in a default.
 #   managed=yes|no                 yes: scripts/scheduled-jobs.sh renders + installs it.
@@ -37,8 +41,13 @@
 #   label=<launchd label>          REQUIRED when darwin is in platforms.
 #   unit=<systemd unit base>       default: the id.
 #   description=<one line>
-# #   env KEY=VALUE                  repeatable. `@home @path @state @repos @tortoise` are rendered from
-#                                  machine state at install time.
+#   success_exit_codes=<n> [<n>…]  systemd `SuccessExitStatus`. Which NON-ZERO exits mean "the pass did
+#                                  its job" is a per-record decision (#2071), so it lives here, not in a
+#                                  renderer. Omit it and the scheduler's default applies: any non-zero
+#                                  exit is a failure.
+# #   env KEY=VALUE                  repeatable. `@home @path @state @repos @tortoise @installed` are
+#                                  rendered from machine state at install time (`@installed` = the
+#                                  directory this record's own script was installed into, for pins).
 #
 # ── WHAT WAS RETIRED INTO THIS DECLARATION ─────────────────────────────────────────────────────
 # The consolidated pass replaced FOUR per-class triggers on the Mac with one (templates/launchd/
@@ -59,6 +68,14 @@ job eldato-disk-reaper
   owner=scheduled-jobs.sh
   label=com.eldato.disk-reaper
   unit=eldato-disk-reaper
+  # ⛔ WHICH NON-ZERO EXITS ARE *SUCCESS* IS A DECISION, SO IT IS DECLARED HERE (#2071).
+  # `0` = a fully clean pass. `6` = a DELEGATE DEFERRED the pass: it ran, declined to act and claimed
+  # nothing (another cache pass holds the lock; a live tool holds the uv cache). That is the routine
+  # state of a busy cell, and leaving it red reddens the unit every hour until the operator learns to
+  # ignore `systemctl --failed` — the inert-enforcer shape this unit exists to remove.
+  # 3 (fail-closed), 4 (a removal FAILED) and 5 (over bound) are deliberately NOT accepted: they mean
+  # the work did not get done, and `disk-reaper.test.sh` T16 asserts each of them is absent.
+  success_exit_codes=0 6
   # The worktree owner must ask GitHub which PRs are open before it may delete anything. A busy cell
   # shares one account with every other box, so this sits above the harness shim's backoff window; if
   # it still cannot answer, the class FAILS CLOSED (an open-PR checkout is never guessed at).
@@ -66,28 +83,20 @@ job eldato-disk-reaper
   env DISK_REAPER_REPOS=@repos
   env DISK_REAPER_WT_AGED_DAYS=7
   env REAP_WT_GH_TIMEOUT=300
+  # ⛔ THE DELEGATES ARE PINNED TO THE INSTALLED DIRECTORY, not left to `$HOME` (#2071). The pass
+  # prefers `$HOME/.pi/agent/scripts`, so a unit whose HOME happened to hold an OLDER farmed copy ran
+  # that policy instead of the one installed beside it — measured on pi-cell-3, where the worktree
+  # class failed with "not a git repository" against a stale copy while the freshly-installed one was
+  # never consulted. A pin is authoritative and fails CLOSED if it is gone, which is what a deletion
+  # tool wants. `@installed` resolves to the directory this record's own script was installed into.
+  env CACHE_REAPER=@installed/pi-cache-reap.sh
+  env VENV_REAPER=@installed/reap-lane-venvs.sh
+  env WORKTREE_REAPER=@installed/pi-reap-worktrees.sh
   # Measured budgets, not inherited defaults: at the 300s default a pass over 454 worktrees spent the
   # whole budget classifying and reported DEFERRED=432 (#1095); the 20s gh timeout killed the probe
   # (rc=124, fail-closed) on a loaded box; 2048MB is the per-cache bound the uv class enforces.
   env REAP_WT_BUDGET_SECONDS=1800
   env CACHE_REAP_MAX_MB=2048
-  # ⛔ THE DELEGATES ARE PINNED TO THE INSTALLED COPY, never left to $HOME (agent-infra#2071).
-  # `find_delegate` prefers $HOME/.pi/agent/scripts, so a unit whose HOME happened to carry an OLDER
-  # farmed copy silently ran THAT policy while the freshly-installed one beside this unit was never
-  # consulted — measured on pi-cell-3, where the worktree class failed with "not a git repository:
-  # /tmp/cell-t3" against the stale copy. `@scriptdir` is the directory the job's own entry point
-  # resolves into, so the pin and ExecStart can never disagree.
-  env CACHE_REAPER=@scriptdir/pi-cache-reap.sh
-  env VENV_REAPER=@scriptdir/reap-lane-venvs.sh
-  env WORKTREE_REAPER=@scriptdir/pi-reap-worktrees.sh
-  # ⛔ 6 IS THE ONE GREEN NON-ZERO CODE, AND IT IS DECLARED HERE RATHER THAN ON EVERY UNIT. A delegate
-  # DEFERRED the pass: it ran, declined to act and claimed nothing (another pass holds the lock, a live
-  # tool holds a cache — #2036's routine state of a busy cell), so an hourly red would teach the
-  # operator to ignore `systemctl --failed`. 3 (could not do the work), 4 (a removal failed, or another
-  # pass holds the lock) and 5 (work remains) stay RED: the retired unit listed `0 4 5`, which made a
-  # pass that FAILED a class, and one that found un-reclaimed work, read as success to `systemctl
-  # status` — and an estate carried a "succeeding" hourly reaper on cells at 94-96% used (#2071).
-  success_exit=0 6
 
 # ── declared, owned by install-launchd.sh (managed=no) ─────────────────────────────────────────
 # These are the harness jobs that already exist as templates/launchd/*.plist. They are declared so the
@@ -187,8 +196,15 @@ job worktree-hygiene
   owner=install-launchd.sh
   label=com.tortoise.worktree-hygiene
   # the mode reaches this job as an ARGV FLAG rendered by install-launchd.sh
-  # ({{WORKTREE_HYGIENE_MODE}} = --dry-run|--apply), not as an env var: nothing reads one.
-  args=@worktree-hygiene-mode @tortoise --repo
+  # ({{WORKTREE_HYGIENE_MODE}} = --dry-run|--apply), not as an env var: nothing reads one. It is NOT a
+  # token of this record's `args`: `@worktree-hygiene-mode` has no resolver here, and claiming it in the
+  # declaration made `sj_render_launchd` emit `<string>@worktree-hygiene-mode</string>` into
+  # ProgramArguments — an argument no program can use, published as `verdict=OK` by `--static`.
+  # ⛔ THE FLAG COMES FIRST AND ITS VALUE FOLLOWS IT (#2058 review, P2): `scripts/worktree-hygiene-sweep.sh`
+  # parses `--repo) REPO="$2"; shift 2`, so `args=@tortoise --repo` rendered the argv
+  # `[<repo>, --repo]` — `--repo` with no value — and `--static` blessed it, because nothing asserted a
+  # rendered argv is parseable by the program it names. The sibling record below gets it right.
+  args=--repo @tortoise
 
 job ci-runner-gate
   description=ci runner gate probe

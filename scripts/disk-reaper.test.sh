@@ -730,6 +730,26 @@ assert_contains "$(cat "$T/t16/calls.log")" "enable" \
     "T16 positive control: a real install DOES enable the timer"
 rm -rf "$SCRATCH"
 
+# A unit that only reports WORK PENDING, a FAILED removal or a MISCONFIGURATION must not read green,
+# and a delegate's stated REFUSAL must. The template's SuccessExitStatus is the thing that decides
+# that, so assert on the rendered bytes.
+# Directive-level, not literal-string: strip comments, take only `SuccessExitStatus=` lines, and require
+# the token set to be EXACTLY {0, 6}. A substring grep would pass on `0 4 5`, miss `0 4`, and false-fail
+# on a comment that quotes the old value.
+SES_LINES="$(grep -h '^SuccessExitStatus=' "$T/t16/units/eldato-disk-reaper.service" | sed 's/^[^=]*=//')"
+assert_eq "$(printf '%s\n' "$SES_LINES" | grep -c .)" "1" \
+    "T16 the unit declares exactly one SuccessExitStatus directive"
+SES_TOKENS="$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep . | sort -n | tr '\n' ' ')"
+assert_eq "$SES_TOKENS" "0 6 " \
+    "T16 the accepted set is EXACTLY {0, 6}: a fully-clean pass, and a delegate's refusal"
+assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep -c '^0$')" "1" \
+    "T16 only a fully-clean pass (0) is unconditionally success"
+assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep -c '^6$')" "1" \
+    "T16 a uv-class DEFERRAL (6) is accepted, so a busy cell does not go red hourly (#2036)"
+for masked in 3 4 5; do
+    assert_absent "$SES_LINES" "$masked" \
+        "T16 exit $masked is NOT masked as success (3 fail-closed, 4 removal failed, 5 over bound)"
+done
 # ── T19: a USER-scope timer without lingering is reported, not silently inert (#2071) ───────────
 # Ported with the installer. A `--user` timer only ticks while that user has a session, so on a box with
 # lingering off the hourly pass stops when the session ends — and nothing in the artifact says so. The
