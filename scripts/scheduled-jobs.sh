@@ -266,6 +266,10 @@ sd_last_exit() { # sd_last_exit <unit> -> <n> | never | unknown
 sd_install() { # sd_install <id>
     local id="$1" unit tmpd changed=0 pass_changed=0 reason=none sha insha
     unit="$(sj_unit "$id")"
+    # ⛔ REFUSE BEFORE RENDERING (agent-infra#2032/#2071): a transient, relative, whitespace-carrying or
+    # unwritable target renders a unit the scheduler shows as installed while it reclaims nothing.
+    # Nothing is written before this returns, and under `--dry-run` the state-dir probe is read-only.
+    sj_refuse_unrenderable "$id" "$PREVIEW" || return 1
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/sj-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     announce_arm_change "$id" "$UNIT_DIR/$(sj_unit "$id").service"
     sj_render_systemd "$id" "$tmpd" "$SD_SCOPE" "$(effective_arm "$id" "$UNIT_DIR/$(sj_unit "$id").service")" \
@@ -372,6 +376,9 @@ ld_last_exit() { # ld_last_exit <label> -> <n> | never | unknown
 
 ld_install() { # ld_install <id>
     local id="$1" label tmp dest changed=0 pass_changed=0 reason=none sha insha
+    # Same refusal on the launchd path: a plist pointing into a deleted mktemp dir is a job launchd
+    # shows as loaded while it never runs its pass.
+    sj_refuse_unrenderable "$id" "$PREVIEW" || return 1
     label="$(sj_label "$id")"
     [ -n "$label" ] || { err "$id: declared for darwin with no label"; return 1; }
     dest="$LD_DIR/$label.plist"

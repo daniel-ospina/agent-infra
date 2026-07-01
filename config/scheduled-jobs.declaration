@@ -71,6 +71,23 @@ job eldato-disk-reaper
   # (rc=124, fail-closed) on a loaded box; 2048MB is the per-cache bound the uv class enforces.
   env REAP_WT_BUDGET_SECONDS=1800
   env CACHE_REAP_MAX_MB=2048
+  # ⛔ THE DELEGATES ARE PINNED TO THE INSTALLED COPY, never left to $HOME (agent-infra#2071).
+  # `find_delegate` prefers $HOME/.pi/agent/scripts, so a unit whose HOME happened to carry an OLDER
+  # farmed copy silently ran THAT policy while the freshly-installed one beside this unit was never
+  # consulted — measured on pi-cell-3, where the worktree class failed with "not a git repository:
+  # /tmp/cell-t3" against the stale copy. `@scriptdir` is the directory the job's own entry point
+  # resolves into, so the pin and ExecStart can never disagree.
+  env CACHE_REAPER=@scriptdir/pi-cache-reap.sh
+  env VENV_REAPER=@scriptdir/reap-lane-venvs.sh
+  env WORKTREE_REAPER=@scriptdir/pi-reap-worktrees.sh
+  # ⛔ 6 IS THE ONE GREEN NON-ZERO CODE, AND IT IS DECLARED HERE RATHER THAN ON EVERY UNIT. A delegate
+  # DEFERRED the pass: it ran, declined to act and claimed nothing (another pass holds the lock, a live
+  # tool holds a cache — #2036's routine state of a busy cell), so an hourly red would teach the
+  # operator to ignore `systemctl --failed`. 3 (could not do the work), 4 (a removal failed, or another
+  # pass holds the lock) and 5 (work remains) stay RED: the retired unit listed `0 4 5`, which made a
+  # pass that FAILED a class, and one that found un-reclaimed work, read as success to `systemctl
+  # status` — and an estate carried a "succeeding" hourly reaper on cells at 94-96% used (#2071).
+  success_exit=0 6
 
 # ── declared, owned by install-launchd.sh (managed=no) ─────────────────────────────────────────
 # These are the harness jobs that already exist as templates/launchd/*.plist. They are declared so the

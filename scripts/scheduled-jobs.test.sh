@@ -498,6 +498,177 @@ assert_contains "$OUT" "pass_changed=1" "S12 …and the job is RELOADED rather t
 OUT="$(run_lin install --apply 2>&1)"
 assert_contains "$OUT" "arming NOT applied" "S12 --apply says which delegated records it cannot arm"
 
+echo "── S15 the unit's exit-code stance and delegate pins come from the DECLARATION (#2071) ──"
+# The retired unit carried `SuccessExitStatus=0 4 5`, which made a pass that FAILED a class (4) and one
+# that found un-reclaimed work (5) read as SUCCESS to `systemctl status` — measured: an estate carried a
+# "succeeding" hourly reaper on cells at 94-96% used. #2071 moved it to `0 6` (6 = a delegate DEFERRED,
+# the routine state of a busy cell, #2036). #2048 replaces that installer, so the SAME stance has to be
+# assertable on the artifact THIS installer renders — otherwise the merge silently drops the fix.
+REAL_DECL="$ROOT/config/scheduled-jobs.declaration"
+REAL_UNITS="$T/s13/units"; rm -rf "$T/s13"; mkdir -p "$REAL_UNITS"
+real_lin() { # real_lin <args...>
+    HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux \
+    SJ_DECLARATION="$REAL_DECL" SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s13/state" \
+    SJ_REPOS="$ROOT" SJ_SYSTEMD_UNIT_DIR="$REAL_UNITS" SJ_SYSTEMCTL="$T/bin/systemctl" \
+    SC_STATE="$T/s13/active" SJ_BOOTSTRAP_OK=1 SJ_OWNER_DIR="$T/owners" \
+    bash "$INST" --no-parity "$@"
+}
+real_lin install --only eldato-disk-reaper >/dev/null 2>&1
+REAL_UNIT="$REAL_UNITS/eldato-disk-reaper.service"
+assert_file "$REAL_UNIT" "S15 the real declaration renders the disk-reaper unit"
+UNIT_TXT="$(cat "$REAL_UNIT" 2>/dev/null || true)"
+assert_contains "$UNIT_TXT" "SuccessExitStatus=0 6" "S15 the unit declares exit 6 as the ONE green non-zero code"
+assert_absent "$UNIT_TXT" "SuccessExitStatus=0 4 5" "S15 …and the masked form (0 4 5) is gone (#2071's measured false PASS)"
+case "$UNIT_TXT" in
+    *"SuccessExitStatus=0 5 6"*) bad "S15 exit 5 is NOT green: in an apply pass it means work remains (#2071 refuses #2036's literal proposal)" ;;
+    *) ok "S15 exit 5 is not whitelisted (work that remains stays RED)" ;;
+esac
+# ⛔ DECLARED PER JOB, NOT BLANKET. A second job with no `success_exit` must render NO line at all, so a
+# future edit cannot turn the directive into a repo-wide "non-zero is fine".
+BARE_DECL="$T/s13/bare.declaration"
+sed '/success_exit=/d' "$REAL_DECL" >"$BARE_DECL"
+BARE_UNITS="$T/s13/bare-units"; mkdir -p "$BARE_UNITS"
+HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$BARE_DECL" \
+  SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s13/state" SJ_REPOS="$ROOT" \
+  SJ_SYSTEMD_UNIT_DIR="$BARE_UNITS" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s13/active2" \
+  bash "$INST" --no-parity install --only eldato-disk-reaper >/dev/null 2>&1
+assert_absent "$(cat "$BARE_UNITS/eldato-disk-reaper.service" 2>/dev/null || true)" "SuccessExitStatus" \
+  "S15 with the key absent the renderer emits NO SuccessExitStatus (declaration-scoped, never a blanket)"
+# ── the delegate pins: the INSTALLED copy, never $HOME ────────────────────────────────────────
+assert_contains "$UNIT_TXT" "CACHE_REAPER=$ROOT/scripts/pi-cache-reap.sh" \
+  "S15 CACHE_REAPER is pinned to the script's own directory, not to \$HOME (a stale farmed copy ran instead, #2071)"
+assert_contains "$UNIT_TXT" "VENV_REAPER=$ROOT/scripts/reap-lane-venvs.sh" "S15 …VENV_REAPER likewise"
+assert_contains "$UNIT_TXT" "WORKTREE_REAPER=$ROOT/scripts/pi-reap-worktrees.sh" "S15 …WORKTREE_REAPER likewise"
+assert_absent "$UNIT_TXT" "@scriptdir" "S15 the placeholder is RESOLVED in the artifact (an unresolved @scriptdir is a 127 every tick)"
+# launchd has no way to whitelist an exit status, so the plist must NOT claim the stance it cannot keep.
+# Rendered DIRECTLY through the shared renderer: the assertion is about the ARTIFACT, and driving the
+# whole darwin install here would couple it to launchd lifecycle state the assertion does not need.
+cat >"$T/s15-render-ld.sh" <<'RLD'
+#!/usr/bin/env bash
+set -uo pipefail
+cd "$1" || exit 1
+export SJ_DECLARATION="$2" SJ_FARM="$3" PLATFORM=darwin PORTABLE_PLATFORM=darwin SJ_REPOS="$4" SJ_STATE_DIR="$5"
+. scripts/lib/scheduled-jobs.sh
+sj_render_launchd eldato-disk-reaper "$6"
+RLD
+chmod +x "$T/s15-render-ld.sh"
+LD_PLIST="$T/s15/com.eldato.disk-reaper.plist"; mkdir -p "$T/s15"
+out="$("$T/s15-render-ld.sh" "$ROOT" "$REAL_DECL" "$ROOT/scripts" "$ROOT" "$T/s15/state" "$LD_PLIST" 2>&1)"; rc=$?
+assert_eq "$rc" "0" "S15 the darwin artifact renders (rc=0)"
+LD_TXT="$(cat "$LD_PLIST" 2>/dev/null || true)"
+assert_contains "$LD_TXT" "<key>CACHE_REAPER</key>" "S15 the darwin artifact carries the same delegate pins"
+assert_contains "$LD_TXT" "$ROOT/scripts/pi-cache-reap.sh" "S15 …resolved to the script's own directory"
+assert_absent "$LD_TXT" "SuccessExitStatus" "S15 …but no SuccessExitStatus (launchd cannot whitelist a status; the claim is not silently carried)"
+
+echo "── S16 an artifact that CANNOT RUN is refused before anything is written (#2032/#2071) ──"
+# Each case answers a MEASURED defect where the scheduler showed the job as installed and healthy while it
+# reclaimed nothing. The refusal is the installer's, and it must fire BEFORE any write.
+refuse_run() { # refuse_run <label> <expected-substring> <env-assignments...>
+    local label="$1" want="$2"; shift 2
+    local dir="$T/s14/$(printf '%s' "$label" | tr -c 'a-zA-Z0-9' '-')"
+    rm -rf "$dir"; mkdir -p "$dir"
+    local out rc
+    out="$(env HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux \
+            SJ_DECLARATION="$REAL_DECL" SJ_FARM="$ROOT/scripts" \
+            SJ_SYSTEMD_UNIT_DIR="$dir/units" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$dir/active" \
+            "$@" bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] && ok "S16 $label is REFUSED (rc=$rc)" || bad "S16 $label installed (rc=0) — an artifact that cannot run was written"
+    assert_contains "$out" "$want" "S16 …and the refusal names the reason ($label)"
+    assert_eq "$(ls -A "$dir/units" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+        "S16 …and NOTHING was written for $label"
+}
+# (a) a RELATIVE script path: systemd resolves ExecStart against the UNIT's cwd, so it is a permanent 127
+#     that the installer's own cwd cannot see.
+mkdir -p "$T/s14/relfarm"; printf '#!/bin/bash\nexit 0\n' >"$T/s14/relfarm/r.sh"; chmod +x "$T/s14/relfarm/r.sh"
+# ⛔ The reachable arm is a RELATIVE FARM. A `script=./r.sh` joined onto an absolute farm resolves to an
+# absolute path and renders fine; what renders a 127 is an operator (or a cell) whose farm is relative —
+# the resolved entry point is then relative, and systemd resolves it against the UNIT's own cwd.
+mkdir -p "$T/s14/relfarm"; printf '#!/bin/bash\nexit 0\n' >"$T/s14/relfarm/disk-reaper.sh"; chmod +x "$T/s14/relfarm/disk-reaper.sh"
+out="$(cd "$T/s14" && HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux \
+       SJ_DECLARATION="$REAL_DECL" SJ_FARM="relfarm" SJ_STATE_DIR="$T/s14/st" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$T/s14/relunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/relact" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S16 a RELATIVE farm makes the entry point relative, and it is REFUSED (rc=$rc)" \
+    || bad "S16 a relative entry point was accepted — systemd would exit 127 every tick"
+assert_contains "$out" "not an absolute path" "S16 …naming the non-absolute path and its consequence"
+# (b) whitespace in a rendered value: systemd splits unquoted Environment= values.
+refuse_run "a value carrying whitespace" "contains whitespace" SJ_REPOS="/tmp/a repo"
+# (c) a non-numeric *_DAYS: baked into a PERSISTENT artifact (measured: systemd keeps '7', drops 'days').
+WS_DECL="$T/s14/aged.decl"; sed "s|^  env DISK_REAPER_WT_AGED_DAYS=7|  env DISK_REAPER_WT_AGED_DAYS=abc|" "$REAL_DECL" >"$WS_DECL"
+out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$WS_DECL" \
+       SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s14/st2" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$T/s14/agedunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/agedact" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S16 a non-numeric *_DAYS is REFUSED (rc=$rc) — it would be baked into the unit" \
+    || bad "S16 'DISK_REAPER_WT_AGED_DAYS=7 days' rendered into a persistent unit"
+assert_contains "$out" "not a whole number" "S16 …and says which value and why"
+# `DISK_REAPER_WT_AGED_DAYS="7 days"` trips the WHITESPACE arm instead (checked first) — the other half of
+# the same measured defect, where systemd kept `7` and dropped `days` and still exited 0.
+SP_DECL="$T/s14/aged-sp.decl"; sed "s|^  env DISK_REAPER_WT_AGED_DAYS=7|  env DISK_REAPER_WT_AGED_DAYS=7 days|" "$REAL_DECL" >"$SP_DECL"
+out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$SP_DECL" \
+       SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s14/st2b" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$T/s14/agedunits2" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/agedact2" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S16 'DISK_REAPER_WT_AGED_DAYS=7 days' is REFUSED (whitespace arm)" \
+    || bad "S16 a two-token AGED_DAYS value rendered into a persistent unit"
+# (d) a TRANSIENT SCRATCH target: the artifact would point into a mktemp dir that is gone before the first
+#     tick, so every pass exits 127 while the scheduler still shows the job as scheduled (measured on
+#     pi-cell-2 at 94% and pi-cell-3 at 96% used). Driven straight at the guard, because `choose_systemd`
+#     answers first on a system target and would refuse for an unrelated reason.
+SCRATCH_HOME="$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXX")"
+mkdir -p "$SCRATCH_HOME/.pi/agent/scripts"
+cat >"$T/s14/refuse-probe.sh" <<'RP'
+#!/usr/bin/env bash
+set -uo pipefail
+cd "$1" || exit 1
+export SJ_DECLARATION="$2" SJ_FARM="$3"
+. scripts/lib/scheduled-jobs.sh
+sj_refuse_unrenderable eldato-disk-reaper "${4:-0}"
+RP
+chmod +x "$T/s14/refuse-probe.sh"
+# A REAL launchd dir (the HOME default) → the scratch heuristic applies. The #446 home guard is not in
+# this path: the probe calls the renderer's refusal directly, which is the arm under test.
+out="$(HOME="$SCRATCH_HOME" SJ_STATE_DIR="$SCRATCH_HOME/.pi/agent/state" SJ_REPOS="$ROOT" \
+       PORTABLE_PLATFORM=darwin "$T/s14/refuse-probe.sh" "$ROOT" "$REAL_DECL" "$ROOT/scripts" 1 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S16 a transient-scratch HOME pointing at a REAL launchd dir is REFUSED (rc=$rc)" \
+    || bad "S16 an artifact was rendered from a mktemp HOME — the 127-forever shape"
+assert_contains "$out" "transient scratch" "S16 …and the refusal names the transient path"
+# …and a SCRATCH dir override (the documented test seam) bypasses ONLY the heuristic: the same env is
+# accepted, which is what every other fixture in this suite relies on.
+out="$(HOME="$SCRATCH_HOME" SJ_STATE_DIR="$SCRATCH_HOME/.pi/agent/state" SJ_REPOS="$ROOT" \
+       PLATFORM=linux PORTABLE_PLATFORM=linux SJ_SYSTEMD_UNIT_DIR="$T/s14/scratchunits" \
+       "$T/s14/refuse-probe.sh" "$ROOT" "$REAL_DECL" "$ROOT/scripts" 1 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "S16 a scratch UNIT DIR is the test seam — the bypass is scoped to the heuristic" \
+    || bad "S16 the scratch unit-dir seam stopped working (rc=$rc): $(printf '%.200s' "$out")"
+rm -rf "$SCRATCH_HOME"
+# (e) an UNWRITABLE state dir: the job runs as this user, so every pass would fail closed on an artifact
+#     that installed cleanly. And under --dry-run the probe must NOT create it.
+mkdir -p "$T/s14/ro-state"; chmod 500 "$T/s14/ro-state"
+out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s14/ro-state/state" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$T/s14/rounits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/act5" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S16 an unwritable state dir is REFUSED (rc=$rc)" || bad "S16 an unwritable state dir installed cleanly"
+assert_contains "$out" "not writable" "S16 …naming the directory and the user"
+chmod 700 "$T/s14/ro-state"
+MISSING_STATE="$T/s14/would-create/state"
+out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$MISSING_STATE" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$T/s14/pvunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/act6" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper --dry-run 2>&1)"; rc=$?
+[ ! -e "$MISSING_STATE" ] && ok "S16 a PREVIEW does not create the state dir it only describes" \
+    || bad "S16 --dry-run created $MISSING_STATE (a preview must write nothing)"
+# (f) a pinned DELEGATE that does not exist: its class would fail closed (exit 3) every pass, on an
+#     artifact that installed cleanly — so it is named at install time.
+HALF_FARM="$T/s14/half-farm"; mkdir -p "$HALF_FARM"
+cp "$ROOT/scripts/disk-reaper.sh" "$HALF_FARM/"
+out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$HALF_FARM" SJ_STATE_DIR="$T/s14/halfstate" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$T/s14/halfunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/act7" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+assert_contains "$out" "which is missing" "S16 a pinned delegate that is absent is NAMED at install time (it would fail closed every pass)"
+assert_contains "$out" "pi-cache-reap.sh" "S16 …and the warning names the delegate"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then echo "ALL PASS ($PASS assertions)"; exit 0; fi

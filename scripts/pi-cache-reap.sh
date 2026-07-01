@@ -193,10 +193,13 @@ fi
 # a tool run that starts mid-pass, STOPS the eviction and rides that cache's verdict as a STOPPING
 # note — exit 3 if the cache is still over its bound, exit 0 with the note if the pass had already
 # brought it under and verified the reclaim) · 4 did not run (another pass holds the lock) ·
-# 5 a cache is OVER its bound and nothing was done about it (dry-run — the shipped stance).
+# 5 a cache is OVER its bound and nothing was done about it (dry-run — the shipped stance) ·
+# 7 DEFERRED: a live `uv`/`npm`/`pip` holds the cache, so the entries it keeps cannot be known — the
+# pass ran, declined to act, and claims NOTHING (#2036). Distinct from 3 on purpose: 3 is "I could not
+# do the work" and must stay loud; 7 is the routine busy-box outcome and is not a failure of anything.
 # ⚠️ NOT the sibling reapers' vocabulary: pi-reap-worktrees.sh uses 4 for "a removal FAILED"
-# and 3 for "lock held". Here 4 is a benign skip and 3 is always fail-closed; a fleet reader
-# must not apply the other mapping.
+# and 3 for "lock held". Here 4 is a benign skip, 7 is a benign deferral, and 3 is always fail-closed;
+# a fleet reader must not apply the other mapping.
 # ── usage end ──
 
 set -uo pipefail
@@ -251,8 +254,61 @@ fail_closed() {
     say "pi-cache-reap: FAIL-CLOSED — $*"
 }
 
+# ⛔ A DEFERRAL IS NOT A FAILURE, AND IT IS NOT A PASS EITHER (#2036). The one benign non-zero
+# outcome: the pass RAN, DECLINED to act, and claims nothing — a live `uv`/`npm`/`pip` holds the cache
+# so the entries it keeps cannot be known. That is the routine state of a busy box (measured: most
+# hours on a live cell), so it must not be exit 3: the scheduled unit maps 3 to "broken" and an alarm
+# that fires hourly on a healthy box is one nobody reads. It must not be exit 0 either — 0 is read by
+# the callers as "the bound was cleared", and nothing was bounded. Hence its own code, `7`, which
+# `disk-reaper.sh` maps to its own 6 = "a delegate DEFERRED the pass" (green unit, `ok=0` record).
+# Counted separately from FAILS so a real breakage on another cache still wins the pass's exit.
+DEFERRED=0
+# The total entries this pass actually UNLINKED. Needed because a deferral and a partial eviction can
+# co-occur: the act-point re-probe can stop the pass at a LATER entry after earlier ones were already
+# removed, so "nothing was acted on" would be a false record on the line an audit greps.
+ACTED=0
+# MB reclaimed by the SAFE HALF (a prune that shrank a cache) — reported with the deferral summary so
+# "this pass did act" is a number, not a claim.
+PRUNED_MB=0
+deferred() {
+    DEFERRED=$((DEFERRED + 1))
+    say "pi-cache-reap: DEFERRED — $*"
+}
+
 now_epoch() { date +%s 2>/dev/null; }
 is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
+
+# canon_lstart <lstart> — a comparison key that does not depend on DATE-FIELD ORDER.
+# `ps -o lstart=` prints `<Wday> <A> <B> <HH:MM:SS> <YYYY>` where <A>/<B> are the month and the day
+# in an order that follows the caller's locale: en_GB gives `Sun 18 Oct …`, C gives `Sun Oct 18 …`.
+# Sorting that pair makes the two spellings compare EQUAL, so a formatting difference can never be
+# mistaken for a recycled pid (which would let a live owner's lock be broken).
+canon_lstart() {
+    local w a b raw="$1"
+    # ⛔ `set -f` AROUND THE SPLIT. The argument is read from `$LOCK_DIR/lstart`, a file on disk, so an
+    # unquoted `set -- $1` would PATHNAME-EXPAND any glob metacharacter in it against the caller's cwd:
+    # the canonical key would then differ from the stored one, the holder would read as RECYCLED, and
+    # this pass would either skip (below the stale bound) or BREAK A LIVE OWNER'S LOCK (above it) — the
+    # double-pass the lock exists to prevent. `ps` never prints a metacharacter, so this is hardening,
+    # but the value is attacker-adjacent by construction (it comes from a file).
+    # `$-` is restored rather than assumed: `set +f` unconditionally would RE-ENABLE globbing for a
+    # caller that had deliberately disabled it.
+    local had_f=0; case "$-$" in *f*) had_f=1 ;; esac
+    set -f
+    set -- $1
+    [ "$had_f" = 1 ] || set +f
+    # ⛔ THE FALLBACK MUST RETURN THE INPUT, not its first word. It used to print `${1:-}` AFTER the
+    # split, so two different short stamps canonicalized to the same key — a false EQUAL, i.e. a
+    # recycled pid read as a live holder (the pass then skips instead of breaking the lock; fail-safe,
+    # but it is not what the line says).
+    [ $# -ge 3 ] || { printf '%s' "$raw"; return 0; }
+    w="$1"; a="$2"; b="$3"
+    if [ "$a" \< "$b" ] || [ "$a" = "$b" ]; then printf '%s %s %s' "$w" "$a" "$b"
+    else printf '%s %s %s' "$w" "$b" "$a"; fi
+    shift 3
+    [ $# -gt 0 ] && printf ' %s' "$*"
+    return 0
+}
 
 cleanup() {
     [ -n "$TMPLIST" ] && rm -f "$TMPLIST"
@@ -308,8 +364,12 @@ tool_of() {
 # prune_cache <class> <dir> — the SAFE half: ask the owning tool to drop entries
 # nothing references. Never fatal: a tool that is absent, or that fails, only
 # means the cache is still over its bound, which the caller checks anyway.
-# rc 0 = pruned · 1 = the tool is not available · 2 = the tool ran and failed.
-# The three are LOGGED SEPARATELY: "prune=none" used to conflate "uv is not on this
+# rc 0 = pruned · 1 = the tool is not available (pip: by design — it has no unused-entry prune;
+# uv/npm: not on this job's PATH) · 2 = the tool RAN AND FAILED (a fault: permission, ENOSPC, a
+# read-only mount) · 3 = CONTENDED (the tool's own lock is held by another process — `uv cache prune`
+# waits UV_LOCK_TIMEOUT and then exits non-zero; a busy box, NOT a fault, and it DEFERS rather than
+# failing closed). `npm cache verify` takes no cache lock at all, so npm never returns 3.
+# The outcomes are LOGGED SEPARATELY: "prune=none" used to conflate "uv is not on this
 # job's PATH" with "pip has no safe half", and the first of those silently skips the
 # safe half and goes straight to entry removal.
 # The tool is pointed at THE DIRECTORY THIS PASS MEASURED (UV_CACHE_DIR / --cache),
@@ -346,6 +406,23 @@ prune_cache() {
     esac
     if [ "$rc" -ne 0 ]; then
         plog "pi-cache-reap:   prune($class) failed (rc=$rc): ${out:-no output}"
+        # ⛔ CONTENTION IS NOT A FAULT — and it is the DOMINANT rc-2 on a busy box. `uv cache prune`
+        # waits `UV_LOCK_TIMEOUT` for the cache lock that a live `uv` ALREADY HOLDS, then exits
+        # non-zero. Measured (uv 0.12.5): "Cache is currently in-use, waiting for other uv processes
+        # to finish" then "error: Timeout (1s) when waiting for lock on …", rc=2. Reporting that as
+        # `pruned=failed` made the deferral gate red the unit on exactly the routine busy-cell case it
+        # exists to keep green — the alarm-fatigue defect, inverted.
+        # ⛔ MATCH THE LOCK TIMEOUT SPECIFICALLY, AND ONLY WHEN IT IS THE ONLY ERROR. `out` is combined
+        # stdout+stderr for the whole run, so a permission/ENOSPC/read-only failure that merely
+        # CO-OCCURRED with a held lock would ride along with the wait notice and be graded benign. A
+        # contended run prints the wait notice and ONE `error:` line (the timeout); anything else has a
+        # second error and stays a fault.
+        # ⚠️ `npm cache verify` takes NO cache lock at all (cacache's verify is lock-free), so there is
+        # no npm contention to detect and none is claimed here.
+        errs="$(printf '%s\n' "$out" | grep -c '^error:' || true)"
+        case "$out" in
+            *"when waiting for lock"*|*"is another uv process running"*) [ "${errs:-0}" -le 1 ] && return 3 ;;
+        esac
         return 2
     fi
     return 0
@@ -474,7 +551,18 @@ mtime_of() {
 # and every caller reads 4 as silence (#1987 review).
 lstart_of() {
     local l
-    l="$("${PS_BIN:-ps}" -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" || return 1
+    # ⛔ LC_ALL=C IS LOAD-BEARING, NOT TIDINESS. `ps -o lstart=` prints a DATE STRING whose field
+    # order follows the caller's locale: en_GB yields `Sun 18 Oct 17:41:03 2026`, C/POSIX yields
+    # `Sun Oct 18 17:41:03 2026`. The lock stores the holder's lstart and a later pass compares it
+    # to ITS OWN `ps` output, so when the writer and the reader disagree — which is the norm, since
+    # launchd runs with a minimal environment while an interactive shell carries en_GB — the two
+    # strings NEVER match and every live lock is read as a RECYCLED pid. Measured on this box:
+    #   lock owner pid 83079 is a RECYCLED pid (start time 'Sun Oct 18 16:59:31 2026' != 'Sun 18 Oct 16:59:31 2026')
+    # The consequence is not cosmetic: with the age under the stale bound the pass SILENTLY SKIPS
+    # (exit 4, "did not run") — the reaper that grows caches while reporting nothing — and once the
+    # lock ages past the bound the same false verdict permits BREAKING A LIVE OWNER'S LOCK, which is
+    # the double-pass this lock exists to prevent. Pin the locale so both sides are comparable.
+    l="$(LC_ALL=C "${PS_BIN:-ps}" -o lstart= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" || return 1
     [ -n "${l:-}" ] || return 1
     printf '%s' "$l"
 }
@@ -654,7 +742,7 @@ guard_target() {
 reap_target() {
     local class="$1" dir="$2" before_kb before_free_kb now_kb new_kb after_kb after_free_kb
     local pruned=none evicted=0 kb e cur_free holders dir_holders held_entries="" keep_entries=""
-    local no_gain_stop=0 no_gain=0 any_gain=0 hard_stop=0 last_free="" claimed_kb gained_kb credited_kb min_gain_kb stop_note=""
+    local no_gain_stop=0 no_gain=0 any_gain=0 hard_stop=0 live_stop=0 last_free="" claimed_kb gained_kb credited_kb min_gain_kb stop_note=""
     local dev_rc share_rc fresh_holders free_str parent mnt_rc resolved declared_dir
 
     case "$dir" in
@@ -713,10 +801,18 @@ reap_target() {
     case $? in
         0) pruned=ok ;;
         2) pruned=failed ;;
+        3) pruned=contended ;;
         *) pruned=unavailable ;;
     esac
     now_kb="$(kb_of "$dir")" \
         || { fail_closed "$class: cannot measure $dir after the prune — the shrink cannot be verified"; return 0; }
+    # ⛔ THE SAFE HALF IS AN ACTOR TOO. `uv cache prune` and `npm cache verify` DELETE entries; if the
+    # cache shrank, this pass deleted things — even when the escalation never ran because a live holder
+    # appeared. Counting only escalation evictions made the deferral summary say "nothing was acted on"
+    # about a pass that had just reclaimed megabytes (measured: 8 MB pruned away, summary said nothing).
+    if [ -n "${before_kb:-}" ] && [ "$now_kb" -lt "$before_kb" ]; then
+        ACTED=$((ACTED + 1)); PRUNED_MB=$(( PRUNED_MB + (before_kb - now_kb) / 1024 ))
+    fi
 
     # ⛔ No pre-pass free-space reading means NO WAY TO PROVE THE RECLAIM, so escalating is
     # deleting on a claim that cannot be checked (and the no-gain brake, keyed on that same
@@ -732,7 +828,20 @@ reap_target() {
         holders="$(ps_matches tool "$class" "$dir")" \
             || { fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and the ps probe could not answer — NOT escalating an unproven cache"; return 0; }
         if [ -n "$holders" ]; then
-            fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
+            # A live tool holding the cache is a DEFERRAL, not a fault (#2036): nothing was deleted,
+            # nothing is claimed, and on a busy cell this is most hours. It used to be fail_closed
+            # (exit 3), which made a healthy cell's scheduled unit red every hour.
+            # ⛔ A DEFERRAL IS NOT A LICENCE TO SWALLOW A BROKEN SAFE HALF. `pruned=failed` means the prune
+            # RAN AND FAILED (`prune_cache` returns 2 only after invoking the tool) — that is a fault of
+            # its own, and calling the pass "merely busy" would print a green hourly run over a cache that
+            # cannot be bounded. `pruned=unavailable` does NOT mean that: it is pip-by-design (pip has no
+            # unused-entry prune, `prune_cache` returns 1) and uv/npm-with-no-binary, so it is named in the
+            # deferral rather than escalated. (`pruned=ok`, the normal case, defers silently in that respect.)
+            if [ "$pruned" = failed ]; then
+                fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB, a live $class process holds it AND the safe half FAILED (prune=failed) — the cache is not merely busy, it cannot be bounded; process(es): ${holders:-?}"
+                return 0
+            fi
+            deferred "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; prune=$pruned, nothing EVICTED by the escalation (the safe half may have pruned); process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
             return 0
         fi
         read_mount_table || MOUNTS_RC=2   # read once per cache; rc 2 => every entry is refused
@@ -764,6 +873,7 @@ reap_target() {
             ps_snapshot || { fail_closed "$class: the ps probe could not answer immediately before removing $e — NOT deleting an unproven entry"; hard_stop=1; break; }
             if [ -n "$(ps_matches tool "$class" "$dir" || true)" ]; then
                 stop_note=" (STOPPING: a $class process started during this pass — stopped before $e, the entries it holds cannot be known)"
+                live_stop=1
                 break
             fi
             fresh_holders="$(ps_matches dir "$class" "$dir" || true)"
@@ -802,7 +912,7 @@ reap_target() {
                 break
             fi
             if remove_entry "$e"; then
-                evicted=$((evicted + 1))
+                evicted=$((evicted + 1)); ACTED=$((ACTED + 1))
                 # Re-measure the WHOLE cache, not the entry: an entry can be a directory
                 # holding more than `du` charged to its own top level (block rounding).
                 # ⛔ NO FULL-CACHE `du` PER EVICTION. Re-walking the whole cache after every
@@ -875,6 +985,16 @@ reap_target() {
     if [ "$after_kb" -gt "$MAX_KB" ]; then
         free_str="could not be read"
         [ -n "${after_free_kb:-}" ] && free_str="$(mb_str "$after_free_kb")"
+        # ⛔ A STOP CAUSED BY A LIVE TOOL IS A DEFERRAL, NOT A FAILURE (#2036). The cache is still over
+        # bound because a live `uv`/`npm`/`pip` started holding it mid-pass — nothing was deleted by
+        # our choice, nothing is claimed, and the next pass (or the next quiet minute) will act. Every
+        # OTHER stop underneath this line (a mount table that cannot be read, an unmeasurable entry, a
+        # re-measure that failed, a df that stopped answering) means the pass could not do its job and
+        # stays fail-closed. That distinction is why 7 exists and why 3 was not simply made green.
+        if [ "$live_stop" -eq 1 ] && [ "$pruned" != failed ]; then
+            deferred "$class: $dir is $(mb_str "$before_kb") -> $(mb_str "$after_kb") — still over the ${MAX_MB}MB bound because a live $class process started holding it mid-pass (prune=$pruned evicted=$evicted); nothing claimed${held_entries:+ — PRESERVED because a live process names them: $held_entries}${stop_note}"
+            return 0
+        fi
         fail_closed "$class: $dir was $(mb_str "$before_kb") -> $(mb_str "$after_kb") after evicting every removable entry it could try (prune=$pruned evicted=$evicted) — still over the ${MAX_MB}MB bound; free $(mb_str "${before_free_kb:-0}") -> $free_str${held_entries:+ — PRESERVED because a live process names them: $held_entries}${keep_entries:+ — preserved: $keep_entries}${stop_note}"
         return 0
     fi
@@ -999,8 +1119,12 @@ lock_acquire() {
         # exists to prevent). Only an unverifiable owner is subject to the age bound.
         if is_pos_int "$owner" && kill -0 "$owner" 2>/dev/null; then
             held_lstart="$(cat "$LOCK_DIR/lstart" 2>/dev/null || printf '')"
-            now_lstart=" $(lstart_of "$owner" 2>/dev/null || printf '')"; now_lstart="${now_lstart# }"
-            if [ -n "$held_lstart" ] && [ -n "$now_lstart" ] && [ "$held_lstart" != "$now_lstart" ]; then
+            now_lstart="$(lstart_of "$owner" 2>/dev/null || printf '')"
+            # Compare CANONICAL forms. lstart_of pins LC_ALL=C, so this is belt-and-braces for a lock
+            # written by a build that did not — a raw string compare there read every live holder as
+            # RECYCLED and either skipped the pass (age < bound) or broke a live owner's lock.
+            if [ -n "$held_lstart" ] && [ -n "$now_lstart" ] && \
+               [ "$(canon_lstart "$held_lstart")" != "$(canon_lstart "$now_lstart")" ]; then
                 plog "pi-cache-reap: lock owner pid $owner is a RECYCLED pid (start time '$now_lstart' != '$held_lstart') — treating the lock as stale"
             else
                 say "pi-cache-reap: another pass is running (pid $owner, ${age}s) — this one does not run ($ISSUE_REF)"
@@ -1209,6 +1333,20 @@ cap_log
 if [ "$FAILS" -gt 0 ]; then
     say "pi-cache-reap: FAILED — $FAILS cache(s) could not be bounded or verified this pass (exit 3)"
     exit 3
+fi
+# ORDER IS LOAD-BEARING: a real breakage (3) outranks a deferral (7), and a deferral outranks the
+# dry-run over-bound report (5) — a dry run never escalates, so it never defers either.
+if [ "$DEFERRED" -gt 0 ]; then
+    # ⛔ SAY WHAT ACTUALLY HAPPENED. A mid-pass live-tool stop can come AFTER entries were evicted
+    # (the re-probe fires at the next entry), so the summary must not claim a clean sweep it did not
+    # make — and must not claim "nothing was acted on" either. On a deletion tool the summary is the
+    # line a postmortem greps; a per-cache line is not a substitute for an accurate total.
+    if [ "$ACTED" -gt 0 ]; then
+        say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED because a live tool held them; this pass DID act (${PRUNED_MB}MB pruned by the safe half, and/or escalation evictions) and the BOUND IS NOT CLAIMED (exit 7: a deferral, not a failure)"
+    else
+        say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED to a later pass because a live tool held them; nothing was acted on and NOTHING IS CLAIMED (exit 7: a deferral, not a failure)"
+    fi
+    exit 7
 fi
 # ⛔ THE PASS-END LINE MUST NOT CLAIM A BOUND THE PASS DID NOT ENFORCE. On the shipped dry-run
 # stance an over-bound cache used to print "every present cache bounded and verified" and exit 0

@@ -869,6 +869,36 @@ rc=$?
 rm -f "$SK/skills/linked-skill"
 
 # -------------------------------------------------------------------------
+# (l) the `activation:` line for the argv-level gh shim (docs/ops/ACTIVATION-MATRIX.md row 1).
+# This line is REPORT-ONLY by design (it must not redden --verify before the farm actually ships
+# the shim), and that is exactly why it has to be pinned HERE: a report-only line cannot fail
+# anything, so flipping its `AGENT_GH_SHIM=0` test or reordering its branches would silently
+# restore the defect the first review round found — "PRESENT … (armed)" printed on a box where
+# the extension injects nothing. The three states below are the ones that change the verdict.
+hdr "the gh-shim activation line is truthful in all three states"
+SHIMSTUB="$TMP/shimstub"
+mkdir -p "$SHIMSTUB"
+printf '#!/bin/bash\nexit 0\n' > "$SHIMSTUB/gh"
+chmod +x "$SHIMSTUB/gh"
+
+out="$(AGENT_GH_SHIM_DIR="$SHIMSTUB" bash -c 'unset AGENT_GH_SHIM; CELL_HOME="$1" INFRA_ROOT="$2" PATH="$3:$PATH" bash "$4" --verify' _ "$CELL_HOME" "$ROOT" "$FAKEBIN" "$INSTALLER" 2>&1)"
+grep -q "activation: gh shim PRESENT at $SHIMSTUB" <<<"$out" && ! grep -q DISARMED <<<"$out" \
+  && [ "$(grep -c 'activation:' <<<"$out")" -eq 1 ] \
+  && ok "a resolvable shim with no kill switch reports PRESENT … armed (one line)" \
+  || fail "a resolvable shim did not report PRESENT+armed, or reported more than one activation line"
+
+out="$(AGENT_GH_SHIM_DIR="$SHIMSTUB" AGENT_GH_SHIM=0 bash -c 'CELL_HOME="$1" INFRA_ROOT="$2" PATH="$3:$PATH" bash "$4" --verify' _ "$CELL_HOME" "$ROOT" "$FAKEBIN" "$INSTALLER" 2>&1)"
+grep -q 'activation: gh shim PRESENT' <<<"$out" && grep -q DISARMED <<<"$out" \
+  && ! grep -q 'guard armed' <<<"$out" \
+  && ok "AGENT_GH_SHIM=0 reports PRESENT but DISARMED — never 'armed'" \
+  || fail "the kill switch still reported the shim as armed (the exact false green round 1 found)"
+
+out="$(AGENT_GH_SHIM_DIR= bash -c 'unset AGENT_GH_SHIM; CELL_HOME="$1" INFRA_ROOT="$2" PATH="$3:$PATH" bash "$4" --verify' _ "$CELL_HOME" "$ROOT" "$FAKEBIN" "$INSTALLER" 2>&1)"
+grep -q 'activation: gh shim ABSENT' <<<"$out" && ! grep -q 'shim PRESENT' <<<"$out" \
+  && ok "no resolvable shim reports ABSENT, and the installed layer is not named armed" \
+  || fail "an unresolvable shim was reported as present"
+
+# -------------------------------------------------------------------------
 hdr "syntax"
 bash -n "$INSTALLER" && ok "cell-install.sh parses (bash -n)" || fail "cell-install.sh has a syntax error"
 

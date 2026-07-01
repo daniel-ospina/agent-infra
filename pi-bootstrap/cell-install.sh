@@ -975,6 +975,51 @@ verify_layer() {
     fail "lib/diff-normalize.py is missing or empty — record-review.sh resolves it as its own sibling and degrades to the raw pre-#1362 digest"
   fi
 
+  # ── the argv-level gh shim (docs/ops/ACTIVATION-MATRIX.md, row 1) ────────────
+  # The shim (`scripts/gh-shim/gh`) is the only layer a shell TOKEN SPLICE cannot defeat (`--ad""min`,
+  # `$'--admin'`) — a discarded PATH entry still defeats it, which is the shim's own declared limit —
+  # and it is the one component that is DEPLOYED-but-not-ACTIVE: this installer copies the
+  # operational layer, and nothing in it places the shim where `review-enforcer` resolves it — so a
+  # cell reports a green layer while the gate falls back to string scanning (`#984 argv-level gh shim not found`).
+  #
+  # The two candidates below are the extension's OWN list (`resolveGhShimDir`), in its order, so this
+  # report cannot drift from what the gate will actually do. ⛔ `$DEST/shims` is NOT a third
+  # candidate even though the extension materialises there: `resolveGhShimDir` never READS it, so a
+  # neutral link with no resolvable source is a link the gate ignores — which is exactly the
+  # false comfort this line exists to break (measured on this laptop: `~/.pi/agent/shims/gh` is a
+  # healthy-looking symlink while the extension resolves null, because its source candidate,
+  # `~/.pi/agent/scripts/gh-shim`, is absent and the only working source is an env var the launchd
+  # controller does not receive).
+  #
+  # REPORT-ONLY, deliberately: `fail` here would make every cell running today RED (none carries
+  # `scripts/gh-shim`) and `cloud-cell-bringup.sh --check` would refuse `CELL READY` — the right
+  # verdict, but only once the farm actually delivers the shim. Until then the honest line is the
+  # report: a reader must never see `LAYER VERIFIED` and infer that the merge gate is armed.
+  local shim_state="absent" shim_at="" shim_cand
+  for shim_cand in "${AGENT_GH_SHIM_DIR:-}" "$DEST/scripts/gh-shim"; do
+    [ -n "$shim_cand" ] || continue
+    if [ -f "$shim_cand/gh" ] && [ -x "$shim_cand/gh" ]; then
+      shim_state="present"
+      shim_at="$shim_cand"
+      break
+    fi
+  done
+  if [ "$shim_state" = present ] && [ "${AGENT_GH_SHIM:-}" = 0 ]; then
+    # ⛔ RESUMING THE SHIM IS NOT ARMING IT. `withGhShim` returns null when AGENT_GH_SHIM=0 and
+    # `ghShimWillEnforce` requires the same variable not to be 0, so a box with an executable shim
+    # and this kill switch in its env injects nothing and enforces nothing. Reporting "armed" there
+    # would invert the purpose of this block (a green line a reader trusts more than `LAYER VERIFIED`).
+    say "activation: gh shim PRESENT at $shim_at but DISARMED — AGENT_GH_SHIM=0, so the review-enforcer injects nothing and the string scanner is the only layer the GATE itself has (#984). A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2."
+  elif [ "$shim_state" = present ]; then
+    say "activation: gh shim PRESENT at $shim_at (argv-level admin-merge guard armed)"
+  else
+    local stale=""
+    if [ -e "$DEST/shims/gh" ] || [ -L "$DEST/shims/gh" ]; then
+      stale=" ⛔ $DEST/shims/gh exists but it is never a resolution CANDIDATE: it is a mirror the extension writes from a RESOLVED source and then injects (materializeGhShim → withGhShim), so with no resolvable source it is never armed — do not read it as armed."
+    fi
+    say "activation: gh shim ABSENT — looked at \${AGENT_GH_SHIM_DIR:-} and $DEST/scripts/gh-shim; the review-enforcer then runs the string scanner only (#984), which is all the GATE itself has. A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2.$stale"
+  fi
+
   local entries
   entries="$(read_manifest_entries)" || { fail "the extension ship-list could not be re-read from manifest.json"; return 0; }
   if [ "$(printf '%s\n' "$entries" | grep -c . || true)" -lt "$MIN_SHIP_LIST" ]; then
