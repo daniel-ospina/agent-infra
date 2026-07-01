@@ -139,8 +139,14 @@ mkrendered_iv() {
     lbl="$(HOME="$T/home" SJ_DECLARATION="${DCL:-$D}" bash -c '. "$0/lib/scheduled-jobs.sh" && sj_label "$1"' "$HERE" "$id")"
     # ONLY the StartInterval integer — a blanket `<integer>` rewrite also hits Nice=10, which made the
     # fixture differ in two properties and drift for the wrong reason.
+    # ⛔ THE REPLACEMENT CARRIES NO BACKSLASH. `"<\/integer>"` in an awk REPLACEMENT is not an escape
+    # for `/` (only a regex literal needs that), and mawk — the awk on the ubuntu runner and on any box
+    # with mawk — writes the backslash into the plist: measured, the fixture's own artifact became
+    # `900<\/integer>` and the gate reported PAYLOAD-DRIFT on the UNMODIFIED baseline, so P21/P28's
+    # "the baseline is green" control failed for a reason that had nothing to do with the property it
+    # exists to prove. BSD awk drops the backslash, which is why this only showed on some hosts.
     awk -v secs="$secs" '
-        /<key>StartInterval<\/key>/ { print; getline; sub(/<integer>[0-9]*<\/integer>/, "<integer>" secs "<\/integer>"); print; next }
+        /<key>StartInterval<\/key>/ { print; getline; sub(/<integer>[0-9]*<\/integer>/, "<integer>" secs "</integer>"); print; next }
         { print }' "$dir/$lbl.plist" >"$dir/.iv"
     mv "$dir/.iv" "$dir/$lbl.plist"
 }
@@ -177,6 +183,7 @@ gate_mac() { # gate_mac <decl> [args...]
     SJ_DECLARATION="$d" SJ_UNMANAGED_REGISTER="${REG:-$T/none.register}" \
     SJ_FARM="$T/farm" SJ_LAUNCHD_DIR="${AGENTS:-$T/agents}" SJ_LAUNCHCTL="${SJ_LAUNCHCTL_OVERRIDE:-$T/bin/launchctl}" \
     LC_STATE="$T/loaded" LC_LOG="$T/lc.log" LC_LIST_RC="${LC_LIST_RC:-0}" LD_DISABLED="${LD_DISABLED:-/dev/null}" SJ_NAMESPACES="com.eldato.,com.tortoise." \
+    CRON_RC="${CRON_RC:-0}" \
     bash "$GATE" "$@"
 }
 gate_lin() { # gate_lin <decl> [args...]

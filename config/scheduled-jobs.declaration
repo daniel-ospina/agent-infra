@@ -37,8 +37,13 @@
 #   label=<launchd label>          REQUIRED when darwin is in platforms.
 #   unit=<systemd unit base>       default: the id.
 #   description=<one line>
-# #   env KEY=VALUE                  repeatable. `@home @path @state @repos @tortoise` are rendered from
-#                                  machine state at install time.
+#   success_exit_codes=<n> [<n>…]  systemd `SuccessExitStatus`. Which NON-ZERO exits mean "the pass did
+#                                  its job" is a per-record decision (#2071), so it lives here, not in a
+#                                  renderer. Omit it and the scheduler's default applies: any non-zero
+#                                  exit is a failure.
+# #   env KEY=VALUE                  repeatable. `@home @path @state @repos @tortoise @installed` are
+#                                  rendered from machine state at install time (`@installed` = the
+#                                  directory this record's own script was installed into, for pins).
 #
 # ── WHAT WAS RETIRED INTO THIS DECLARATION ─────────────────────────────────────────────────────
 # The consolidated pass replaced FOUR per-class triggers on the Mac with one (templates/launchd/
@@ -59,6 +64,14 @@ job eldato-disk-reaper
   owner=scheduled-jobs.sh
   label=com.eldato.disk-reaper
   unit=eldato-disk-reaper
+  # ⛔ WHICH NON-ZERO EXITS ARE *SUCCESS* IS A DECISION, SO IT IS DECLARED HERE (#2071).
+  # `0` = a fully clean pass. `6` = a DELEGATE DEFERRED the pass: it ran, declined to act and claimed
+  # nothing (another cache pass holds the lock; a live tool holds the uv cache). That is the routine
+  # state of a busy cell, and leaving it red reddens the unit every hour until the operator learns to
+  # ignore `systemctl --failed` — the inert-enforcer shape this unit exists to remove.
+  # 3 (fail-closed), 4 (a removal FAILED) and 5 (over bound) are deliberately NOT accepted: they mean
+  # the work did not get done, and `disk-reaper.test.sh` T16 asserts each of them is absent.
+  success_exit_codes=0 6
   # The worktree owner must ask GitHub which PRs are open before it may delete anything. A busy cell
   # shares one account with every other box, so this sits above the harness shim's backoff window; if
   # it still cannot answer, the class FAILS CLOSED (an open-PR checkout is never guessed at).
@@ -66,6 +79,15 @@ job eldato-disk-reaper
   env DISK_REAPER_REPOS=@repos
   env DISK_REAPER_WT_AGED_DAYS=7
   env REAP_WT_GH_TIMEOUT=300
+  # ⛔ THE DELEGATES ARE PINNED TO THE INSTALLED DIRECTORY, not left to `$HOME` (#2071). The pass
+  # prefers `$HOME/.pi/agent/scripts`, so a unit whose HOME happened to hold an OLDER farmed copy ran
+  # that policy instead of the one installed beside it — measured on pi-cell-3, where the worktree
+  # class failed with "not a git repository" against a stale copy while the freshly-installed one was
+  # never consulted. A pin is authoritative and fails CLOSED if it is gone, which is what a deletion
+  # tool wants. `@installed` resolves to the directory this record's own script was installed into.
+  env CACHE_REAPER=@installed/pi-cache-reap.sh
+  env VENV_REAPER=@installed/reap-lane-venvs.sh
+  env WORKTREE_REAPER=@installed/pi-reap-worktrees.sh
   # Measured budgets, not inherited defaults: at the 300s default a pass over 454 worktrees spent the
   # whole budget classifying and reported DEFERRED=432 (#1095); the 20s gh timeout killed the probe
   # (rc=124, fail-closed) on a loaded box; 2048MB is the per-cache bound the uv class enforces.

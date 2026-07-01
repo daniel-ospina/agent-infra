@@ -108,6 +108,25 @@ printf 'NFSHomeDirectory: /Users/a-real-user\n'
 DSCL
 chmod +x "$T/bin/dscl"
 
+# ── the THIRD scheduler, made DETERMINISTIC on every host (#2071) ──────────────────────────────
+# `install` ends with the parity gate, and the gate reads the crontab population as a third surface.
+# `crontab` is NOT installed on every host (measured: absent on a stock macOS dev box, rc=127), and an
+# unreadable surface is correctly a FAILURE — so without a shim this suite's whole install path fails
+# with `verdict=UNMEASURABLE` on any box that lacks the binary, and the suites above (S1/S3/S6) go red
+# for a reason that has nothing to do with what they assert. An empty crontab is a real measurement here;
+# the cron arm of the gate has its own coverage in check-scheduled-parity.test.sh.
+cat >"$T/bin/crontab" <<'CRON'
+#!/usr/bin/env bash
+# `crontab -l` with no crontab for this user: rc=1 is "no crontab", which the library reads as an
+# EMPTY surface (not an unreadable one). Any other invocation is refused loudly so a test cannot
+# silently install a real cron entry.
+case "${1:-}" in
+  -l) exit 1 ;;
+  *)  echo "crontab shim: refusing '$*' — this suite installs no real cron entries" >&2; exit 2 ;;
+esac
+CRON
+chmod +x "$T/bin/crontab"
+
 # The fake owner installer for the `managed=no` record: writes the artifact the way its real owner
 # would, so the closing parity gate has something true to compare against.
 cat >"$T/owners/owner-fixture.sh" <<'OWN'

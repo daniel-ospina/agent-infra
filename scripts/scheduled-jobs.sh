@@ -60,6 +60,9 @@
 #   SJ_LAUNCHER        the macOS TCC launcher (default the farmed pi-reap-worktrees-launchd.py)
 #   SJ_OWNER_DIR       where a `managed=no` owner installer is resolved (default this repo's scripts/)
 #   SJ_SYSTEMD_UNIT_DIR / SJ_SYSTEMCTL       systemd surface + tool (tests: a temp dir + a shim)
+#   SJ_SUDO            the sudo probe for a SYSTEM-scope install (default `sudo -n`; tests: `true`)
+#   SJ_EXTRA_SCOPES    colon-separated EXTRA unit dirs that `uninstall` REPORTS but does not touch
+#                      (tests: a decoy scope; production sets nothing)
 #   SJ_LAUNCHD_DIR / SJ_LAUNCHCTL / SJ_LAUNCHD_DOMAIN   launchd surface + tool + domain
 #   ELDATO_ALLOW_TEST_HOME   permit launchd management when $HOME is not the real home (#446; tests ONLY)
 set -uo pipefail
@@ -243,9 +246,48 @@ choose_systemd() {
         SD_SCOPE=system; UNIT_DIR=/etc/systemd/system; SC="${SJ_SYSTEMCTL:-sudo -n systemctl}"; return 0
     fi
     if systemctl --user show-environment >/dev/null 2>&1; then
-        SD_SCOPE=user; UNIT_DIR="$HOME/.config/systemd/user"; SC="systemctl --user"; return 0
+        # ⛔ THE PROBE IS BARE, THE TOOL IS PINNED. Reachability is asked of the plain `systemctl`
+        # (that is what decides whether a user manager answers at all), but every MUTATING call must use
+        # the operator's pinned tool — dropping it here made `SJ_SYSTEMCTL` honoured for a system-scope
+        # install and silently ignored for a user-scope one, so a test double (and any unusual cell) saw
+        # no calls at all and the scope was lost.
+        SD_SCOPE=user; UNIT_DIR="$HOME/.config/systemd/user"; SC="${SJ_SYSTEMCTL:-systemctl} --user"; return 0
     fi
     return 1
+}
+
+# ⛔ A SYSTEM UNIT RENDERED FROM SCRATCH SPACE IS A JOB THAT CAN NEVER RUN (#2071, measured
+# 2026-10-18 on pi-cell-2/3). A harness ran the installer with HOME=/tmp/tmp.XXXX/bg/home and no unit-dir
+# override, so the policy took the SYSTEM target and wrote
+# `ExecStart=/bin/bash /tmp/tmp.XXXX/bg/home/.pi/agent/scripts/disk-reaper.sh --apply` into
+# /etc/systemd/system. The mktemp dir was deleted before the first tick, so every hourly pass exited 127
+# forever, while `systemctl list-timers` kept the job looking scheduled and healthy and the disks sat at
+# 94–96%. The installer is the ONLY component that can see the path is transient by construction.
+is_transient_scratch() { # is_transient_scratch <path> — true if any ancestor is a mktemp -d scratch dir
+    local p="$1" base
+    [ -n "$p" ] || return 1
+    while [ -n "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do
+        base="$(basename "$p" 2>/dev/null)"
+        # `mktemp -d "$TMPDIR/tmp.XXXXXXXXXX"` → `tmp.` + 10 random characters.
+        case "$base" in
+            tmp.??????????) case "$(dirname "$p")" in
+                    /tmp|/var/tmp|/private/tmp|/private/var/tmp|*/T|/var/folders) return 0 ;;
+                esac ;;
+        esac
+        p="$(dirname "$p" 2>/dev/null)"
+    done
+    return 1
+}
+
+# ⛔ A USER TIMER ON A BOX WITHOUT LINGERING IS A TIMER THAT STOPS AT LOGOUT. `systemctl --user` runs a
+# per-session manager, so a cell nobody stays logged into needs `loginctl enable-linger`; installing the
+# unit and reporting success would be a schedule that silently stops (the class of false PASS this
+# feature exists to remove).
+sd_linger_ok() {
+    local ans
+    command -v loginctl >/dev/null 2>&1 || return 1
+    ans="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"
+    [ "$ans" = yes ]
 }
 
 sd_last_exit() { # sd_last_exit <unit> -> <n> | never | unknown
@@ -266,6 +308,22 @@ sd_last_exit() { # sd_last_exit <unit> -> <n> | never | unknown
 sd_install() { # sd_install <id>
     local id="$1" unit tmpd changed=0 pass_changed=0 reason=none sha insha
     unit="$(sj_unit "$id")"
+    # ⛔ THE TRANSIENT-SCRATCH REFUSAL COMES FIRST, before anything is rendered or written (#2071).
+    # A system unit outlives the shell that installed it, so a path under a mktemp dir is a job that
+    # will exit 127 on every tick while `list-timers` reports it healthy. Refusing is the only honest
+    # answer; the explicit unit-dir override is the documented way to install from scratch space.
+    if [ "$SD_SCOPE" = system ]; then
+        local _s
+        _s="$(sj_resolve_script "$id" 2>/dev/null || true)"
+        if is_transient_scratch "${_s:-$HOME}" || is_transient_scratch "$HOME"; then
+            err "REFUSING to install $id as a SYSTEM unit from transient scratch space:"
+            err "       HOME=$HOME  script=${_s:-unresolved}"
+            err "       That directory is deleted before the first tick, so every pass would exit 127 while"
+            err "       the timer still reads as scheduled. Install from a durable location, or pass an"
+            err "       explicit unit dir (SJ_SYSTEMD_UNIT_DIR) if you really mean a scratch target."
+            return 1
+        fi
+    fi
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/sj-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     announce_arm_change "$id" "$UNIT_DIR/$(sj_unit "$id").service"
     sj_render_systemd "$id" "$tmpd" "$SD_SCOPE" "$(effective_arm "$id" "$UNIT_DIR/$(sj_unit "$id").service")" \
@@ -302,6 +360,15 @@ sd_install() { # sd_install <id>
     fi
     rm -rf "$tmpd"
     $SC daemon-reload >/dev/null 2>&1 || { err "$id: daemon-reload failed"; return 1; }
+    # The files are on disk and the manager has re-read them — MEASURED, not assumed. Only now can the
+    # linger question be answered, and a user-scope timer that cannot survive a logout must not report
+    # success (#2071).
+    if [ "$SD_SCOPE" = user ] && ! sd_linger_ok; then
+        err "$id: the unit is installed in $UNIT_DIR but this user has NO lingering, so the user manager"
+        err "       (and this timer) stops at logout — the job would never fire on a box nobody stays"
+        err "       logged into. Fix: sudo loginctl enable-linger $(id -un)"
+        return 1
+    fi
     $SC enable --now "$unit.timer" >/dev/null 2>&1 || { err "$id: could not enable/start $unit.timer"; return 1; }
     [ "$changed" = 1 ] && reason=unit-changed
     [ "$pass_changed" = 1 ] && [ "$reason" = none ] && reason=pass-changed
@@ -686,6 +753,25 @@ do_uninstall() {
         # The stamp line goes with the job: a stamp for an absent job would report pass_drift=in-sync.
         grep -v "^job=$id " "$STAMP" >"$STAMP.tmp.$$" 2>/dev/null && mv -f "$STAMP.tmp.$$" "$STAMP" 2>/dev/null || true
         say "uninstalled $id"
+        # ⛔ A DIFFERENT SCOPE HOLDING THE SAME UNIT IS A NOTE, NOT A FAILURE (#2071). Scanning
+        # /etc/systemd/system unconditionally made this verb return 1 on every host that legitimately
+        # carries a system-scope install — a false block on the only way to remove the user one. But
+        # silence is not the answer either: a second ARMED timer is a second hourly deletion pass, so it
+        # is named. `SJ_EXTRA_SCOPES` (colon-separated) is the documented seam for a scope this run did
+        # not resolve; the two real scopes are always inspected.
+        if [ "$PLATFORM" = linux ]; then
+            local _sc _scopes
+            # A COLON-SEPARATED list, like every other path list in this repo (never space-split: a
+            # directory with a space in it would silently become two scopes that do not exist).
+            _scopes="$(printf '%s\n' /etc/systemd/system "$HOME/.config/systemd/user"; printf '%s' "${SJ_EXTRA_SCOPES:-}" | tr ':' '\n')"
+            while IFS= read -r _sc; do
+                [ -n "$_sc" ] || continue
+                [ "$_sc" = "$UNIT_DIR" ] && continue
+                if [ -f "$_sc/$unit.timer" ] || [ -f "$_sc/$unit.service" ]; then
+                    say "note: $id is ALSO installed in $_sc — a second armed copy this verb did not touch"
+                fi
+            done <<<"$_scopes"
+        fi
     done
     return "$rc"
 }

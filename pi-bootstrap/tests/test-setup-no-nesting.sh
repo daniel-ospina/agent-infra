@@ -480,7 +480,8 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh script:fleet-cost-report.sh
+script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh script:disk-reaper.sh
+script:fleet-cost-report.sh
 script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
 script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees.sh
@@ -507,6 +508,13 @@ foreign:cmux_dispatch.py"
 # same renderer resolves it as the macOS TCC launcher (`SJ_LAUNCHER`, scheduled-jobs.sh:60) and pins it
 # into the job's ProgramArguments, so a farm that delivers the renderer without the launcher renders a
 # job that cannot start.
+#
+# `script:disk-reaper.sh` REJOINED with #2071, verified against the CODE (not against this pin):
+# `cloud-cell-supervisor.sh:2164` now RESOLVES the pass — a candidate loop over $DISK_REAPER,
+# $HOME/.pi/agent/scripts/disk-reaper.sh and the sibling copy — so the supervisor can print
+# `DISK REAPER NOT INSTALLED` instead of staying silent about an unbounded box. `fleet_srcs` delivers
+# `disk-reaper.sh`, so the producer IS delivered: the entry belongs in the pin, and a farm that dropped
+# it would leave the supervisor unable to name the missing pass.
 
 # An array's entries, one per line. An ABSENT array (`lane_root_srcs`, until #1553) yields nothing:
 # it is the population floor and the pin that refuse an emptied delivery set, never this reader.

@@ -33,7 +33,10 @@ fi
 # --extra parity`, per AGENTS.md), `uv` writes `.venv` INSIDE the worktree, and the fleet runs one
 # worktree per lane — so every lane materialises its own env and NOTHING removes it. MEASURED on
 # lane-1 (2026-10-17): 5 lane venvs = 7.3 GB deduplicated on a 32 GB disk, one of them 5.8 GB because
-# its lane installed a broader extra set. That is why that box holds ~4 lanes rather than 6.
+# its lane installed a broader extra set. ⛔ THAT DEAD RESIDUE IS WHY THE BOX RAN OUT OF *DISK*; it is not
+# why the box held ~4 lanes — RAM (~0.9 GB/lane) sets the lane count, and N LIVE lanes need N x ~1.1 GB
+# whatever the reaper does. Removing dead residue returns disk headroom the live lanes need; it cannot
+# raise the per-lane ceiling (see docs/ops/disk-reaper.md, "What this does NOT do", #2159).
 #
 # TWO HALVES, because a venv has two ways of outliving its lane:
 #   * REAP ON EXIT (`--worktree PATH`) — the lane RUNNER calls this from its own teardown. It KNOWS
@@ -85,6 +88,46 @@ fi
 #   * `df` delta across the pass: what the FILESYSTEM actually got back. This is the reclamation.
 # Both are printed. Nothing here claims the `du` figure was freed.
 #
+# CAPACITY, AND A STATED FLOOR (the acceptance test on #1932, from the review of PR #1949): "a box can
+# run N lanes without free disk falling below a stated floor — N measured, floor asserted, both printed
+# by the reaper". So every pass that COMPLETES prints ONE capacity line — and a FAIL-CLOSED abort
+# (exit 3, any probe or enumeration failure) prints NONE, deliberately: an estate the pass could not
+# measure must not be summarised, because any floor verdict on it would be a claim about a walk that
+# never ran (review of PR #1949, P3 — the sentence here and in the policy doc used to promise the line
+# on every pass, which the abort paths contradicted):
+#   * `lanes_live=K`   MEASURED: how many lane ENVS this pass KEPT because a live holder was found.
+#                      ⛔ It is a count of retained envs, NOT of worktrees (review of PR #1949): a live
+#                      worktree with no `.venv` yet produces no row at all (classify() returns early),
+#                      so it is not counted even though it is about to `uv sync` ~1.85 GB of real,
+#                      non-shared disk (measured: two lanes consumed 3.7 GB). Read K as "envs still on
+#                      disk because someone is using them", never as "lanes on this box".
+#   * `lane_venv_max=M` MEASURED: the LARGEST lane env this pass saw. The headroom below uses the
+#                      worst case, never the mean — a byte budget built on the average env is the same
+#                      error as a `du` figure built on the assumption that hardlinked blocks are free.
+#                      ⛔ Its representative is only as good as the sample: a PARTIALLY-synced env (a
+#                      `uv sync` in progress — the case `venv_newest_mtime` explicitly expects) is
+#                      small, and dividing by it over-states headroom by orders of magnitude. The
+#                      divisor is printed on the line so a reader can reject the quotient; it is an
+#                      input, not a verdict.
+#   * `free_after=F`   MEASURED: filesystem free space after the pass.
+#   * `floor=L`        STATED: `REAP_VENV_FREE_FLOOR_MB` (default 2048 = one measured lane env, so the
+#                      box can always start another lane).
+#   * `floor_ok=`      ASSERTED: `yes` | `no` | `unknown`. `unknown` is NEVER READ AS SATISFIED — a `df`
+#                      that cannot answer must never read as "enough", so the line says so and names
+#                      why. It does NOT change the exit code: an unmeasurable `df` is not evidence of a
+#                      BREACH (that is the `no` verdict, which exits 5). Do not read the pass's rc as a
+#                      floor verdict — read `floor_ok`.
+#   * `lanes_headroom=N` DERIVED: how many MORE lane envs fit before free space reaches the floor,
+#                      i.e. `(free_after - floor) / lane_venv_max`, floored at 0. `?` when either input
+#                      is unknown — never a fabricated number.
+# A pass that ends BELOW the floor exits 5. ⛔ THAT CODE IS PROPAGATED (#2156): `disk-reaper.sh`'s
+# `worst_rc()` used to DROP a delegate 5 (`0|5) printf '%s' "$cur"`), so this class line read
+# `rc=0 verdict=ok` and only `detail=reap-lane-venvs.sh exited 5` survived — a false PASS exactly at the
+# condition the floor exists to make visible. It now KEEPS the 5 and ranks it fail-closed in an apply
+# pass, so a breach surfaces as a red pass (`rc=3`) with `verdict_venv=fail-closed`. Reclaiming is not the remedy
+# for a breach and the reaper does not pretend otherwise: it will not delete a live lane's env to get
+# back above the floor, so the line NAMES the breach rather than hiding it behind a green summary.
+#
 # ⛔ THE `uv` DOWNLOAD CACHE IS NEVER TOUCHED. A venv hardlinks into it; removing the cache does not
 # free the space it appears to (the links keep the blocks alive), and it forces every subsequent
 # `uv sync` to write a full copy instead of a shared one. That is the measured regression that created
@@ -111,13 +154,22 @@ fi
 #   --min-age S     GC age floor in seconds (default 1800)
 #
 # Env seams (tests use them; operators rarely should):
+#   REAP_VENV_FREE_FLOOR_MB  stated free-disk floor for the capacity line (default 2048)
 #   PS_BIN LSOF_BIN TMUX_BIN GIT_BIN RM_BIN DU_BIN DF_BIN
-#   REAP_VENV_DRY_RUN REAP_VENV_MIN_AGE_SECONDS REAP_VENV_NOW_EPOCH REAP_VENV_LOG
+#   REAP_VENV_DRY_RUN REAP_VENV_MIN_AGE_SECONDS REAP_VENV_FREE_FLOOR_MB REAP_VENV_NOW_EPOCH
+#   REAP_VENV_LOG
+#   ⛔ REAP_VENV_MIN_AGE_SECONDS is VALIDATED before use (#2158): a non-numeric value is refused with
+#   exit 2 and nothing removed, rather than making the age comparison error out and fall through to
+#   reaping every holder-free env regardless of age. (The sibling FREE FLOOR is validated the same way,
+#   at the point it is read — see `is_pos_int "$REAP_VENV_FREE_FLOOR_MB"`.)
 #   REAP_VENV_PS_TIMEOUT REAP_VENV_CWD_TIMEOUT REAP_VENV_TMUX_TIMEOUT REAP_VENV_GIT_TIMEOUT
 #   REAP_VENV_REMOVE_TIMEOUT REAP_VENV_ALLOW_DEGRADED_CWD REAP_VENV_PROC_ROOT
 #
 # Exit codes: 0 pass completed (removals or none), 2 usage, 3 fail-closed abort (nothing removed),
-#             4 pass completed but at least one removal FAILED.
+#             4 pass completed but at least one removal FAILED,
+#             5 pass completed but free space is BELOW REAP_VENV_FREE_FLOOR_MB (`over-bound`). Surface it:
+#               `disk-reaper.sh` KEEPS a delegate 5 and ranks it fail-closed in an apply pass, so the
+#               condition the floor exists to report is never written down as `ok` (#2156).
 
 set -uo pipefail
 
@@ -135,6 +187,9 @@ DF_BIN="${DF_BIN:-df}"
 
 REAP_VENV_DRY_RUN="${REAP_VENV_DRY_RUN:-1}"
 REAP_VENV_MIN_AGE_SECONDS="${REAP_VENV_MIN_AGE_SECONDS:-1800}"
+# The stated free-disk floor (MB) the capacity line asserts against. 2048 = one MEASURED lane env
+# (~1.85 GB of real, non-shared disk per lane), so "above the floor" means "one more lane still fits".
+REAP_VENV_FREE_FLOOR_MB="${REAP_VENV_FREE_FLOOR_MB:-2048}"
 REAP_VENV_PS_TIMEOUT="${REAP_VENV_PS_TIMEOUT:-25}"
 REAP_VENV_CWD_TIMEOUT="${REAP_VENV_CWD_TIMEOUT:-20}"
 REAP_VENV_TMUX_TIMEOUT="${REAP_VENV_TMUX_TIMEOUT:-15}"
@@ -173,10 +228,26 @@ RECHECK_KEPT=0
 FAILED=0
 DU_KB=0
 DF_BEFORE=""
+# Capacity inputs, all of them MEASURED (see CAPACITY in the header): the live-lane count, the largest
+# lane env seen, and the verdict of the stated free-disk floor. `?`/empty means "could not read", never
+# "zero" or "fine".
+LANES_LIVE=0
+LANE_VENV_KB_MAX=0
+CAPACITY_FLOOR_OK="unknown"
+# The floor ACTUALLY asserted by the pass (validated, defaulted). The audit row must carry this, not the
+# raw environment value: with `REAP_VENV_FREE_FLOOR_MB=abc` the comparison uses 2048 and an operator
+# grepping the incident line must not read `abc`.
+CAPACITY_FLOOR_MB=""
 ABORTED=0
 SELF_CWD_CANON=""
 MAIN_CANON=""
 
+# ⛔ THE HEREDOC BELOW IS UNQUOTED (<<EOF) ON PURPOSE — $SCRIPT_NAME must expand in it — and that makes
+# a BACKTICK IN THE HELP TEXT COMMAND SUBSTITUTION, not markup (review of PR #1949): an unescaped
+# `disk-reaper.sh` made --help print "note that  does not currently propagate that code" with the word
+# gone, and would have EXECUTED a `disk-reaper.sh` found on PATH instead of naming it. Every backtick
+# inside the heredoc is escaped, and the suite pins both the rendered word and that --help executes
+# nothing.
 usage() {
     cat <<EOF
 $SCRIPT_NAME — reclaim a lane's .venv when the lane is provably gone ($ISSUE_REF)
@@ -195,6 +266,14 @@ A venv is removed ONLY when no live holder can be found: no tmux pane inside the
 whose cwd is inside it, no process whose command line names it. The reaper's own ancestry is excluded.
 Fail-closed: an unreadable ps/tmux/cwd probe removes NOTHING (exit 3). The uv download cache is never
 touched — a venv hardlinks into it, and deleting it re-spends the space (see the header).
+
+Every pass that COMPLETES prints a capacity line — lanes_live (measured), lane_venv_max (measured),
+free_after, the STATED floor REAP_VENV_FREE_FLOOR_MB (default 2048), the floor_ok verdict
+(yes|no|unknown) and lanes_headroom (how many more lane envs fit above the floor). Below the floor is
+exit 5, and \`disk-reaper.sh\` KEEPS that code and ranks it fail-closed in an apply pass (#2156), so a
+breach is a red pass with \`verdict_venv=fail-closed\` — never \`ok\`.
+A FAIL-CLOSED abort (exit 3) prints NO capacity line: an estate it could not measure is never
+summarised, so it reports no floor verdict at all.
 EOF
 }
 
@@ -248,6 +327,30 @@ scratch_dir() {
 }
 cleanup() {
     local w
+    # ⛔ OWNER GUARD (#1932, found while re-running this suite under load): `cleanup` is an EXIT trap, and
+    # the watchdog subshell forked by `run_bounded` INHERITED it on the bash the flake was measured on; a
+    # child that ran it deleted the PARENT's scratch dir (`rm -rf "$SCRATCH"`) while the parent was still
+    # reading the probe it had just written: `ps probe unavailable` / `reports no worktrees at all`, exit
+    # 3, on a healthy box, at random (~1 run in 3 here). `$$` is the same in a subshell; `$BASHPID` is
+    # not, so BASHPID is the exact owner test. `trap - EXIT` in the watchdog is the other half.
+    #
+    # ⛔ BASH 3.2 (#1949 review): `BASHPID` is bash >= 4.0. `/bin/bash` on macOS is 3.2.57 and this
+    # reaper is invoked PATH-resolved (`bash "$reaper"`, spawn-gate.sh), so on a PATH without a newer
+    # bash an unguarded `$BASHPID` is an UNBOUND VARIABLE under `set -u` — and an unbound expansion in an
+    # EXIT trap ABORTS THE REST OF THE TRAP (measured: the watchdog kill loop and the scratch removal
+    # below would never run, leaking a scratch dir per pass). So test only what can be POSITIVELY known:
+    # skip when BASHPID EXISTS and differs from `$$`. With no BASHPID the pre-#1932 behaviour is
+    # restored, which is what a 3.2 box had before and leaks nothing new — a child that cannot be
+    # identified must not be assumed to be one.
+    #
+    # ⛔ THE GUARD IS INERT ON 3.2 BY CONSTRUCTION, AND THAT IS WHY EVERY DESTRUCTIVE SUBSHELL ALSO
+    # CLEARS THE TRAP (review of PR #1949): where BASHPID does not exist, no child can be identified and
+    # this test cannot fire — so the guard CANNOT be the fix on the very bash that has the problem. The
+    # load-bearing half is `trap - EXIT` inside the subshells whose exit must not run this function (the
+    # watchdog at run_bounded(), and the removal subshell in remove_one()); this guard is the redundant
+    # second half on bash >= 4. Removing the trap resets nothing on a bash that never ran an inherited
+    # EXIT trap anyway — it is the only line that covers 3.2.
+    if [ -n "${BASHPID:-}" ] && [ "$BASHPID" != "$$" ]; then return 0; fi
     for w in $WATCHDOGS; do kill -TERM "$w" 2>/dev/null; done
     WATCHDOGS=""
     [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"
@@ -287,6 +390,9 @@ run_bounded() {
             # so the self-tree cannot identify it, and MEASURED (cell-2) it was reported as a live lane's
             # cwd, refusing every exit-mode reap. The watchdog needs no cwd; it must not have one here.
             cd / 2>/dev/null || true
+            # ⛔ The parent's EXIT trap (`cleanup`) MUST NOT run here — this subshell exits after EVERY
+            # probe (run_bounded TERMs it), and cleanup deletes the parent's scratch dir. See cleanup().
+            trap - EXIT
             trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
             sleep "$secs" &
             s=$!
@@ -375,6 +481,16 @@ argv_witness_for() {
     local canon="$1" base="${1##*/}" tok d pid line
     [ -n "$canon" ] && [ -s "$PS_TABLE" ] || return 1
     # Exact path-boundary match first (the common case: an absolute path in argv).
+    #
+    # ⛔ EVERY OCCURRENCE IS TESTED, NOT JUST THE FIRST (review of PR #1949, P1). The matcher used to
+    # stop at `index(line, needle)` — the FIRST occurrence — and a `ps` line that named a string-prefix
+    # SIBLING before the real path dropped the whole line: `/repo/lane-x-review/copy.py` earlier on the
+    # line made `hits()` see the needle inside `lane-x-review`, read `-` at the boundary, return 0, and
+    # the live holder became invisible. `--apply` then deleted a LIVE lane's env — the exact inversion
+    # the three-witness design exists to prevent — and any multi-worktree `ps` line (a hygiene sweep,
+    # `for wt in $(git worktree list …)`) is enough to trigger it whenever one lane's path is a prefix
+    # of another's. The canonicalized-token arm below cannot rescue it (it only examines tokens ending
+    # in `/$base`), so the boundary check has to be right HERE.
     while IFS= read -r line; do
         pid="${line%% *}"
         [ -n "$pid" ] || continue
@@ -382,11 +498,18 @@ argv_witness_for() {
         printf 'pid=%s argv=%s\n' "$pid" "$(printf '%s' "$line" | cut -c1-140)"
         return 0
     done <<<"$(awk -v a="$canon" '
-        function hits(line, needle,   i, c) {
-            i = index(line, needle)
-            if (i == 0) return 0
-            c = substr(line, i + length(needle), 1)
-            return (c == "" || c == "/" || c == " " || c == "\t")
+        # 1 when ANY occurrence of `needle` on the line ends at a real path boundary. On a miss the
+        # scan advances one character past the occurrence START (not past the occurrence end), so
+        # overlapping and back-to-back occurrences are all examined.
+        function hits(line, needle,   i, c, rest, n) {
+            n = length(needle)
+            rest = line
+            while ((i = index(rest, needle)) > 0) {
+                c = substr(rest, i + n, 1)
+                if (c == "" || c == "/" || c == " " || c == "\t") return 1
+                rest = substr(rest, i + 1)
+            }
+            return 0
         }
         { if (hits($0, a)) print $0 }' "$PS_TABLE" 2>/dev/null)"
     # Then the canonicalized-token arm: a symlinked or relative spelling of the same path. Only lines
@@ -647,7 +770,13 @@ remove_one() {
         return 2
     fi
     out="$(bound_file rmout)" || { say "SKIP $canon/.venv — no scratch dir"; return 1; }
-    if ( cd "$canon" 2>/dev/null && [ "$(pwd -P)" = "$canon" ] && run_bounded "$REAP_VENV_REMOVE_TIMEOUT" "$out" "$RM_BIN" -rf -- .venv ); then
+    # ⛔ THE REMOVAL SUBSHELL MUST NOT INHERIT THE EXIT TRAP EITHER (review of PR #1949): `cleanup`
+    # deletes the SHARED `$SCRATCH`, and on a bash that runs an inherited EXIT trap in a subshell (3.2 —
+    # exactly the bash where cleanup()'s BASHPID guard cannot fire) that would delete the parent's
+    # scratch dir MID-PASS: `$out` vanishes, so every removal AFTER the first reads
+    # `REMOVE-FAILED ... rc=1` and the pass exits 4 reporting a reap that failed. `trap - EXIT` here is
+    # the half that covers 3.2; the BASHPID guard in cleanup() is the redundant half on bash >= 4.
+    if ( trap - EXIT; cd "$canon" 2>/dev/null && [ "$(pwd -P)" = "$canon" ] && run_bounded "$REAP_VENV_REMOVE_TIMEOUT" "$out" "$RM_BIN" -rf -- .venv ); then
         rc=0
     else
         rc=$?
@@ -685,6 +814,35 @@ parse_args() {
         APPLY=0; [ "$REAP_VENV_DRY" = "0" ] && APPLY=1
     else
         APPLY=0; [ "${REAP_VENV_DRY_RUN:-1}" = "0" ] && APPLY=1
+    fi
+    # ⛔ THE AGE FLOOR IS VALIDATED BEFORE IT IS EVER COMPARED (#2158). `--min-age` was checked at
+    # parse time and the ENV form was not, so `REAP_VENV_MIN_AGE_SECONDS=30m` (any typo) made the
+    # `[ "$age" -lt "$REAP_VENV_MIN_AGE_SECONDS" ]` test ERROR, take the else branch under
+    # `set -uo pipefail` (no `-e`), and fall straight through to reaping: the floor that covers the
+    # window between `git worktree add` and the first process binding to the new lane was silently
+    # DISABLED, in the direction that destroys a live lane's env. It failed OPEN.
+    # The fix is the check `--min-age` ALREADY applied at parse time, moved to the final value (env or
+    # argv) so no path into this script can skip it. EXIT 2 — a misconfiguration the OPERATOR can fix —
+    # never 3: a delegate's 3 is the pass's fail-closed code (a RED unit), and a typo must not be able
+    # to reach any code whose meaning is other than "this is wrong, fix it". Nothing is removed: this
+    # runs before any probe or sweep.
+    if ! is_pos_int "${REAP_VENV_MIN_AGE_SECONDS:-}"; then
+        echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='${REAP_VENV_MIN_AGE_SECONDS:-}' is not a whole number of seconds (set it from the environment or --min-age; default 1800). Nothing removed (exit 2)." >&2
+        log "FAIL-CLOSED abort: invalid age floor '${REAP_VENV_MIN_AGE_SECONDS:-}'"
+        exit 2
+    fi
+    # ✅ AND BOUNDED, not just all-digits (#2158 residual). `is_pos_int` accepts any digit string, but
+    # `[ -lt ]` parses with strtoimax: a value above 2^63-1 makes the COMPARISON ITSELF error and take
+    # the else branch — the same fail-open, one size class up (measured: 99999999999999999999 passes
+    # `is_pos_int`, then `[` prints "integer expression expected" and control falls through to REAP).
+    # Leading zeros are harmless to `[` (base 10), so they are stripped before the length test rather
+    # than refused. Nine digits is 31 years: no real floor can exceed it.
+    floor_norm="${REAP_VENV_MIN_AGE_SECONDS#"${REAP_VENV_MIN_AGE_SECONDS%%[!0]*}"}"
+    [ -n "$floor_norm" ] || floor_norm=0
+    if [ "${#floor_norm}" -gt 9 ]; then
+        echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='$REAP_VENV_MIN_AGE_SECONDS' is out of range — at most 9 digits (~31 years). Nothing removed (exit 2)." >&2
+        log "FAIL-CLOSED abort: out-of-range age floor '$REAP_VENV_MIN_AGE_SECONDS'"
+        exit 2
     fi
     return 0
 }
@@ -731,6 +889,10 @@ report_row() {
     [ -n "$evidence" ] && printf '       evidence: %s\n' "$evidence"
     log "$(printf '%s\t%s\t%s\t%s\t%s' "$verdict" "$reason" "$evidence" "${kb:-}" "$path")"
     FOUND=$((FOUND + 1))
+    case "$reason" in live-*) LANES_LIVE=$((LANES_LIVE + 1)) ;; esac
+    # The per-lane figure the headroom below divides by: the LARGEST env this pass saw, so the answer
+    # is "how many lanes fit if they are all this expensive" rather than an average that under-budgets.
+    is_pos_int "${kb:-}" && [ "$kb" -gt "$LANE_VENV_KB_MAX" ] && LANE_VENV_KB_MAX="$kb"
     if [ "$verdict" = reap ]; then
         REAPABLE=$((REAPABLE + 1))
         is_pos_int "$kb" && DU_KB=$((DU_KB + kb))
@@ -809,6 +971,41 @@ run_exit() {
     return 0
 }
 
+# ── capacity: how many more lanes this box can take (the stated floor, asserted) ───────────
+# Called with the post-pass free reading so the capacity line and the reclamation line cannot disagree
+# about the same filesystem. Sets CAPACITY_FLOOR_OK for the exit code; prints every input it used, so a
+# reader can re-do the division rather than trust it (#1932 acceptance: "N measured, floor asserted,
+# both printed").
+report_capacity() { # report_capacity <free_kb_after>
+    local free_kb="${1:-}" floor="$REAP_VENV_FREE_FLOOR_MB" free_mb="" per_lane_mb="" headroom="?"
+    local floor_ok="unknown" why=""
+    if ! is_pos_int "$floor"; then
+        why="REAP_VENV_FREE_FLOOR_MB='$REAP_VENV_FREE_FLOOR_MB' is not a positive integer — asserting the default 2048MB instead"
+        floor=2048
+    fi
+    if is_pos_int "${free_kb:-}"; then
+        free_mb=$((free_kb / 1024))
+        if [ "$free_mb" -lt "$floor" ]; then floor_ok="no"; else floor_ok="yes"; fi
+    else
+        why="${why:+$why; }df cannot read free space on ${REPO:-${WORKTREE:-$PWD}} — free space is UNKNOWN, so the floor is NOT claimed satisfied"
+    fi
+    if [ "${LANE_VENV_KB_MAX:-0}" -gt 0 ]; then
+        per_lane_mb=$((LANE_VENV_KB_MAX / 1024))
+        [ "$per_lane_mb" -ge 1 ] || per_lane_mb=1
+        if is_pos_int "${free_mb:-}"; then
+            headroom=0
+            [ "$free_mb" -gt "$floor" ] && headroom=$(( (free_mb - floor) / per_lane_mb ))
+        fi
+    fi
+    say "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
+    [ -n "$why" ] && say "[$SCRIPT_NAME] capacity: $why"
+    log "$(printf 'capacity\tlanes_live=%s\tper_lane_mb=%s\tfree_after_mb=%s\tfloor_mb=%s\tfloor_ok=%s\tlanes_headroom=%s' \
+        "$LANES_LIVE" "${per_lane_mb:-}" "${free_mb:-}" "$floor" "$floor_ok" "$headroom")"
+    CAPACITY_FLOOR_OK="$floor_ok"
+    CAPACITY_FLOOR_MB="$floor"
+    return 0
+}
+
 main() {
     local mode_label df_after freed_kb reclaimed_mb
     parse_args "$@"
@@ -847,9 +1044,26 @@ main() {
     # The two numbers answer different questions — see the header. `du` is what the venvs occupy
     # (over-counting blocks shared with the uv cache); `df` is what the filesystem actually got back.
     say "[$SCRIPT_NAME] reclaimed_du=$((DU_KB / 1024))MB reclaimed_df=${reclaimed_mb}MB (du over-counts hardlinked uv-cache blocks; df is the real figure)"
+    report_capacity "${df_after:-}"
     [ "$APPLY" = 1 ] || say "[$SCRIPT_NAME] DRY-RUN — nothing was removed (pass --apply or REAP_VENV_DRY_RUN=0)"
 
+    # Severity order matches disk-reaper.sh's own INTENT (3 abort > 4 removal failed > 5 over-bound),
+    # so the fleet entry point's worst-code rule keeps the most severe verdict instead of this pass
+    # inventing a second ordering. (disk-reaper.sh now KEEPS a delegate 5 and ranks it fail-closed in
+    # an apply pass — the gap this ordering was written for is closed, #2156.)
+    #
+    # ⛔ THE BREACH IS NAMED AND LOGGED BEFORE THE LADDER, NOT INSIDE THE `exit 5` ARM (review of PR
+    # #1949): when a removal ALSO failed, exit 4 preempts exit 5, and the old placement meant the
+    # `over-bound` audit row was never written — so the one pass shape where the floor is breached AND
+    # the pass is already degraded was the one shape with no audit record of the breach. A breach an
+    # operator cannot find because a removal failed first is a silent breach. The EXIT CODE order is
+    # unchanged (4 still wins); only the record's survival is fixed.
+    if [ "$CAPACITY_FLOOR_OK" = "no" ]; then
+        say "[$SCRIPT_NAME] ⛔ free space is BELOW the stated floor: a lane starting now can fill the disk. Refusing nothing — a live lane's env is never deleted to make room (exit 5, or exit 4 if a removal also failed — a failed removal outranks a breach)"
+        log "over-bound\tfree_below_floor_mb=${CAPACITY_FLOOR_MB:-$REAP_VENV_FREE_FLOOR_MB}"
+    fi
     [ "$FAILED" -gt 0 ] && exit 4
+    [ "$CAPACITY_FLOOR_OK" = "no" ] && exit 5
     exit 0
 }
 

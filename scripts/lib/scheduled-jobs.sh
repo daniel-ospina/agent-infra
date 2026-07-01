@@ -63,7 +63,7 @@ SJ_PLATFORMS="linux darwin"
 # Keys a record may carry. ⛔ An UNKNOWN key is an error, not a comment: a misspelled `platfroms=`
 # would otherwise render a Linux-only job and report parity clean, which is the silent-default class
 # this whole feature exists to remove.
-SJ_KEYS="platforms schedule script runner args arming managed owner label unit description env"
+SJ_KEYS="platforms schedule script runner args arming managed owner label unit description env success_exit_codes"
 
 # ── parsing ───────────────────────────────────────────────────────────────────────────────────
 sj_ids() {
@@ -164,6 +164,17 @@ sj_resolve_script() { # sj_resolve_script <id>
     return 1
 }
 
+# sj_installed_dir — the directory the installed copy of a record's script lives in. This is the only
+# defensible value for a delegate pin (#2071): `$HOME/.pi/agent/scripts` is the FARM, and a unit whose
+# HOME happens to hold an older farmed copy silently runs THAT policy instead of the one installed
+# beside the unit (measured on pi-cell-3: the worktree class failed with "not a git repository"
+# against a stale copy while the freshly-installed one was never consulted).
+sj_installed_dir() { # sj_installed_dir <id>
+    local s
+    s="$(sj_resolve_script "$1")" || return 1
+    dirname "$s"
+}
+
 # ── validation ──────────────────────────────────────────────────────────────────────────────
 # Every defect is reported, then the exit status is non-zero: a caller never installs half a set.
 sj_validate() {
@@ -223,6 +234,15 @@ EOF
         case "$v" in yes|no|'') ;; *) echo "error: job '$id' has 'managed=$v' (want yes|no)"; rc=1 ;; esac
         v="$(sj_field "$id" arming)"
         case "$v" in ''|report-only|armed) ;; *) echo "error: job '$id' has an unknown arming '$v' (want report-only|armed)"; rc=1 ;; esac
+        # ⛔ AN ACCEPTED EXIT-CODE LIST IS A POLICY ABOUT FAILURE, SO IT IS NEVER FREE TEXT. A
+        # non-numeric token would render a directive systemd ignores — and the unit would then be read as
+        # accepting a code it does not, or vice versa. Only whole numbers, and never a leading zero.
+        v="$(sj_field "$id" success_exit_codes)"
+        if [ -n "$v" ]; then
+            for s in $v; do
+                case "$s" in ''|*[!0-9]*|0?*) echo "error: job '$id' has success_exit_codes='$v' — '$s' is not a whole exit code"; rc=1 ;; esac
+            done
+        fi
         s="$(sj_field "$id" schedule)"
         case "$s" in
             hourly|daily|weekly) ;;
@@ -350,10 +370,17 @@ sj_render_systemd() { # sj_render_systemd <id> <destdir> <system|user> [arming-o
         while IFS= read -r k; do
             [ -n "$k" ] || continue
             v="${k#*=}"; k="${k%%=*}"
-            printf 'Environment=%s=%s\n' "$k" "$(sj_render_value "$v")"
+            printf 'Environment=%s=%s\n' "$k" "$(sj_render_value "$v" "$id")"
         done <<EOF
 $(sj_envs "$id")
 EOF
+        # ⛔ AN ACCEPTED NON-ZERO CODE IS A DECISION ABOUT WHAT "FAILED" MEANS, so it is DECLARED, not
+        # hardcoded here and not left to the artifact's default. #2071's measured case: a busy cell's uv
+        # class defers routinely (code 6 = ran, declined, claimed nothing), and leaving 6 red made the
+        # hourly job red forever, which teaches the operator to ignore `systemctl --failed`. 3/4/5 stay
+        # red — the set is the record's, and the parity gate re-renders and compares it.
+        v="$(sj_field "$id" success_exit_codes)"
+        [ -n "$v" ] && printf 'SuccessExitStatus=%s\n' "$v"
         # Never compete with a lane for CPU or I/O: a background sweep, not a deadline.
         printf 'Nice=10\n'
         printf 'IOSchedulingClass=idle\n'
@@ -422,7 +449,7 @@ EOF
         while IFS= read -r k; do
             [ -n "$k" ] || continue
             v="${k#*=}"; k="${k%%=*}"
-            k="$(sj_render_value "$k")"; v="$(sj_render_value "$v")"
+            k="$(sj_render_value "$k" "$id")"; v="$(sj_render_value "$v" "$id")"
             printf '        <key>%s</key>\n        <string>%s</string>\n' "$(sj_xml "$k")" "$(sj_xml "$v")"
         done <<EOF
 $(sj_envs "$id")
@@ -486,13 +513,18 @@ sj_job_path() { # sj_job_path <platform>
 # ── machine-state placeholders ──────────────────────────────────────────────────────────────
 # ONE resolver, used by both renderers, so the state dir a cell's unit exports and the one a Mac's
 # plist exports cannot drift.
-sj_render_value() { # sj_render_value <string>
-    local v="$1"
+sj_render_value() { # sj_render_value <string> [id]
+    local v="$1" inst
     v="${v//@home/$HOME}"
     v="${v//@path/$(sj_job_path "$(sj_render_platform)")}"
     v="${v//@state/${SJ_STATE_DIR:-$HOME/.pi/agent/state}}"
     v="${v//@repos/${SJ_REPOS:-${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}}"
     v="${v//@tortoise/${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}"
+    # @installed — the directory holding the installed copy of THIS record's script (#2071).
+    case "$v" in *'@installed'*)
+        inst="${2:+$(sj_installed_dir "$2" 2>/dev/null)}"
+        v="${v//@installed/$inst}" ;;
+    esac
     printf '%s' "$v"
 }
 

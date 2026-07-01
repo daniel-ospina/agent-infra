@@ -129,9 +129,13 @@ bash scripts/scheduled-jobs.sh parity                  # the gate
   `pass_drift=CHANGED since install` for a stale install.
 - **⛔ A non-zero exit or an absent unit is a FAILURE, never OK.** `status` exits 1 for `ABSENT`,
   `INERT` or a non-zero `last_exit`, 3 when the scheduler cannot be measured, 0 only when every
-  declared job is installed, loaded and clean. Rendered systemd units carry **no**
-  `SuccessExitStatus`: the retired unit's `SuccessExitStatus=0 4 5` made a pass that failed a class
-  read as success to `systemctl status`.
+  declared job is installed, loaded and clean. A systemd unit carries **no** `SuccessExitStatus`
+  unless the record DECLARES one (`success_exit_codes=`, #2071): the retired unit's
+  `SuccessExitStatus=0 4 5` made a pass that failed a class read as success to `systemctl status`, and
+  the one record that does declare a set (`eldato-disk-reaper` → `0 6`) accepts exactly one non-zero
+  code, the routine "a delegate DEFERRED the pass" — 3 (fail-closed), 4 (a removal FAILED) and 5 (over
+  bound) all stay RED. Which non-zero exits mean "the pass did its job" is a per-record decision, so
+  it lives in the declaration and is re-rendered by the parity gate like every other field.
 - **Arming is visible (#1678).** The shipped stance renders the report-only flag into the artifact;
   `--apply` renders the armed flag; `status` reads the arming off the **installed** artifact, never
   from the flags the invocation was given.
