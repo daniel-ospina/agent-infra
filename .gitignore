@@ -1,28 +1,2 @@
-node_modules/
-dist/
-*.log
-.DS_Store
 __pycache__/
-*.py[cod]
-.pytest_cache/
-.coverage
-
-# worktrees (parallel agent isolation)
-.worktrees/
-
-# hub hygiene (#338): transient e2e artifacts + husky runtime —
-# these kept the M4 hub gate permanently active from the hub cwd
-# rift-debug e2e nested clone (temp-dir origin)
-clone/
-# transient e2e markers (tmp/e2e-*)
-tmp/
-# husky v9 runtime dir (mirrors tortoise .gitignore)
-.husky/_/
-
-# drift-check test fixtures — the version pin is test state, never committed
-# (tests/drift/run.sh writes it; consumers commit their own real pins)
-tests/fixtures/drift/*/.agent-infra-version
-
-# #254 — oracle drift-lock runtime timestamp (dev-machine cron state)
-.last-oracle-run
-scripts/heartbeats/
+.cache/
