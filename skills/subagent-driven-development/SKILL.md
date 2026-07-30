@@ -9,7 +9,7 @@ allowed-tools: read write edit bash web_search web_fetch todo_write task grep fi
 <!-- Changes: WebSearch→web_search, WebFetch→web_fetch, TodoWrite→todo_write, Task→task, AskUserQuestion→ask directly, context7 unavailable, Supabase MCP→migration-safe/supabase CLI -->
 
 
-> **Source:** Canonical copy at `skills/subagent-driven-development/SKILL.md``.
+> **Source:** Canonical copy at `skills/subagent-driven-development/SKILL.md`.
 
 # Subagent-Driven Development
 

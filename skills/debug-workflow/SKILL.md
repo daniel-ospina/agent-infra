@@ -144,10 +144,10 @@ If you catch yourself thinking:
 
 ## References
 
-- `operations/skills/issue-workflow/SKILL.md` — Entry-point router
-- `operations/skills/task-workflow/SKILL.md` — Lightweight pipeline (simple bugs)
-- `operations/skills/project-workflow/SKILL.md` — Proportional pipeline (medium/complex bugs)
-- `operations/skills/verification-before-completion/SKILL.md` — Verify fix worked
+- `../issue-workflow/SKILL.md` — Entry-point router
+- `../task-workflow/SKILL.md` — Lightweight pipeline (simple bugs)
+- `../project-workflow/SKILL.md` — Proportional pipeline (medium/complex bugs)
+- `../verification-before-completion/SKILL.md` — Verify fix worked
 - `docs/teams/organisation-design-team/data/ONTOLOGY.md` — Pipeline stages
 
 ---

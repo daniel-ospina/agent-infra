@@ -33,7 +33,7 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Source:** Canonical copy at `skills/find-bugs/SKILL.md``.
+> **Source:** Canonical copy at `skills/find-bugs/SKILL.md`.
 
 ## Mode Detection
 

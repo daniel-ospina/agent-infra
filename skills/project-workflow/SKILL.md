@@ -52,7 +52,7 @@ Routes a project (standard/complex issue) through the 6-stage pipeline at propor
 
 ## Pipeline
 
-> Sub-skills live under `operations/skills/planning/shared/`. Directory scaffolding exists; individual skills are built by epic #5872.
+> Sub-skills live under `../planning/shared/`. Directory scaffolding exists; individual skills are built by epic #5872.
 
 1. **Align** — Inherited from parent Epic. Only runs if standalone.
 2. **Research** — `shared/research/SKILL.md` — Targeted research (appends to epic brief if exists)

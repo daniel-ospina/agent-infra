@@ -6,7 +6,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
-> **Source:** Canonical copy at `skills/execution-intent/SKILL.md``.
+> **Source:** Canonical copy at `skills/execution-intent/SKILL.md`.
 
 # Execution Intent
 

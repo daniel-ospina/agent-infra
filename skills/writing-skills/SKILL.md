@@ -78,7 +78,7 @@ grep -c 'Continue following the workflow' SKILL.md  # must be >= 1
 
 ### Bounded Skill (single file)
 One SKILL.md, no subdirectory. Self-contained. Used for pipeline stages and focused tasks.
-- Example: `shared-verify` at `operations/skills/planning/shared/verify/SKILL.md`
+- Example: `shared-verify` at `../planning/shared/verify/SKILL.md`
 - When to use: the skill does one thing, no multi-step workflow
 
 
@@ -94,7 +94,7 @@ One SKILL.md, no subdirectory. Self-contained. Used for pipeline stages and focu
 
 ### Workflow Skill (index + workflow/)
 A SKILL.md index that describes the pipeline, plus `workflow/*.md` files with step-by-step instructions.
-- Example: `commit-workflow` at `operations/skills/commit-workflow/SKILL.md` + 5 workflow files
+- Example: `commit-workflow` at `../commit-workflow/SKILL.md` + 5 workflow files
 - When to use: the skill has multiple sequential steps, each with its own gates
 
 ### Reference Skill (this one)
@@ -121,7 +121,7 @@ Single SKILL.md, no workflow. Documents conventions or patterns consumed by othe
 Pi loads skills from paths in `~/.pi/agent/settings.json` under `skills: [...]`. The canonical path is `$AGENT_INFRA_PATH/skills`. Pi scans this directory recursively for `SKILL.md` files.
 
 ### Naming Collisions
-If two sources have a skill with the same name, the project version wins. Pi logs a warning. To check for collisions: `rg '^name:' operations/skills/*/SKILL.md | sort | uniq -d`
+If two sources have a skill with the same name, the project version wins. Pi logs a warning. To check for collisions: `rg '^name:' skills/*/SKILL.md | sort | uniq -d`
 
 ### Available Tools
 The `allowed-tools` field maps to Pi tool names: `read write edit bash grep find web_search web_fetch todo_write task`. Do NOT use Claude-specific names like `WebSearch`, `WebFetch`, `Skill`.

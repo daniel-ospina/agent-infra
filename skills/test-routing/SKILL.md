@@ -72,19 +72,19 @@ Accessibility=high   → + full accessibility audit
 
 | Skill | File | Status | Domains |
 |-------|------|--------|---------|
-| test-writing | `operations/skills/test-writing/SKILL.md` | existing | code (unit, includes PBT guidance) |
-| test-design | `operations/skills/test-design/SKILL.md` | existing | code (planning, includes PBT guidance) |
-| test-review | `operations/skills/test-review/SKILL.md` | existing | code (quality) |
-| test-integration | `operations/skills/test-integration/SKILL.md` | new (#6065) | code (integration) |
-| test-e2e | `operations/skills/test-e2e/SKILL.md` | new (#6066) | code (e2e) |
+| test-writing | `../test-writing/SKILL.md` | existing | code (unit, includes PBT guidance) |
+| test-design | `../test-design/SKILL.md` | existing | code (planning, includes PBT guidance) |
+| test-review | `../test-review/SKILL.md` | existing | code (quality) |
+| test-integration | `../test-integration/SKILL.md` | new (#6065) | code (integration) |
+| test-e2e | `../test-e2e/SKILL.md` | new (#6066) | code (e2e) |
 | check-coverage-pruning | `scripts/check-coverage-pruning.cjs` | new (#6461) | code (coverage) |
 | check-arch | `scripts/cron-quality-gates.sh arch` | new (#6463) | code (architecture) |
 | check-mutation | `scripts/cron-quality-gates.sh mutation` | new (#6460) | code (mutation) |
-| ux-verification | `operations/skills/ux-verification/SKILL.md` | new (#6067) | ux |
-| content-verification | `operations/skills/content-verification/SKILL.md` | new (#6114) | content |
-| config-validation | `operations/skills/config-validation/SKILL.md` | new (#6115) | config |
-| research-verification | `operations/skills/research-verification/SKILL.md` | new (#6116) | research |
-| ux-path-auditor | `operations/skills/ux-path-auditor/SKILL.md` | existing | ux (full audit) |
+| ux-verification | `../ux-verification/SKILL.md` | new (#6067) | ux |
+| content-verification | `../content-verification/SKILL.md` | new (#6114) | content |
+| config-validation | `../config-validation/SKILL.md` | new (#6115) | config |
+| research-verification | `../research-verification/SKILL.md` | new (#6116) | research |
+| ux-path-auditor | `../ux-path-auditor/SKILL.md` | existing | ux (full audit) |
 
 ## Process
 

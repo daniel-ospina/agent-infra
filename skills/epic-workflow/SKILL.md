@@ -48,7 +48,7 @@ Routes an epic through the full 6-stage fractal planning pipeline. Each stage in
 
 ## Pipeline
 
-> Sub-skills live under `operations/skills/planning/shared/`. Directory scaffolding exists; individual skills are built by epic #5872.
+> Sub-skills live under `../planning/shared/`. Directory scaffolding exists; individual skills are built by epic #5872.
 
 1. **Align** — `shared/align/SKILL.md` — Strategic go/no-go gate (full adversarial + Eisenhower)
 2. **Research** — `shared/research/SKILL.md` — Research wrapper (full research brief)

@@ -49,7 +49,7 @@ git diff --name-only origin/main...HEAD
 | `supabase/migrations/*.sql` | `check-migration-drift` | Schema consistency |
 | `supabase/functions/**` | `check-edge-schema` | Edge function schemas |
 | `supabase/functions/**` | `check-edge-function-selects` | Query patterns |
-| `operations/skills/**` | `check-skill-lint` | Skill file conventions |
+| `skills/**` | `check-skill-lint` | Skill file conventions |
 | `docs/**` | `check-wiki-lint` | Wiki formatting |
 | `src/**` (i18n) | `check-i18n-coverage` | Translation coverage |
 | `*.test.*` changes | `check-test-regression` | Test flakiness |

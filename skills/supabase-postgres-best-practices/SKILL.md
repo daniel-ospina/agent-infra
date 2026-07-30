@@ -12,7 +12,7 @@ metadata:
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
-> **Source:** Canonical copy at `skills/supabase-postgres-best-practices/SKILL.md``.
+> **Source:** Canonical copy at `skills/supabase-postgres-best-practices/SKILL.md`.
 
 # Supabase Postgres Best Practices
 

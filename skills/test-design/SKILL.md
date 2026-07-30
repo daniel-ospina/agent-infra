@@ -7,7 +7,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
-<!-- pi-adapted from operations/skills/test-design/SKILL.md -->
+<!-- ported from the primary repo -->
 # Test Design — Integration Surface Mapping
 
 > **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.

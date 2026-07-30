@@ -116,7 +116,7 @@ Phase 8: Finalize + post plan
 
 > **Micro tier:** Runs all 4 diamond phases (1 sub-agent each) + a single full-diamond-verify gate at the end. Prevents solving the wrong problem the wrong way, even for small changes.
 
-> **Skill-domain + shared-code override:** Micro-tier issues touching `operations/skills/`, `.agents/skills/`, `operations/pi-config/`, `src/lib/`, `src/hooks/`, `src/services/`, `supabase/migrations/`, or `src/types/` (excluding `_deprecated/`) are upgraded to Standard.
+> **Skill-domain + shared-code override:** Micro-tier issues touching `skills/`, `.agents/skills/`, `operations/pi-config/`, `src/lib/`, `src/hooks/`, `src/services/`, `supabase/migrations/`, or `src/types/` (excluding `_deprecated/`) are upgraded to Standard.
 
 ---
 
@@ -396,7 +396,7 @@ case "$TIER" in
   *) TIER_SKIP=1 ;;
 esac
 if [ "${TIER_SKIP:-0}" != "1" ]; then
-  UPGRADE_PATHS=$(printf '%s' "$ISSUE_BODY" | grep -oE '(^|[[:space:]([])(operations/skills/|\.agents/skills/|operations/pi-config/|src/lib/|src/hooks/|src/services/|supabase/migrations/|src/types/)[^[:space:],)]*' | grep -v '_deprecated/' || true)
+  UPGRADE_PATHS=$(printf '%s' "$ISSUE_BODY" | grep -oE '(^|[[:space:]([])(skills/|\.agents/skills/|operations/pi-config/|src/lib/|src/hooks/|src/services/|supabase/migrations/|src/types/)[^[:space:],)]*' | grep -v '_deprecated/' || true)
   if [ -n "$UPGRADE_PATHS" ]; then
     echo "🔧 Shared infrastructure change detected — upgrading from Micro to Standard"
     echo "   Matched paths: $UPGRADE_PATHS"

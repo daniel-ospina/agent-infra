@@ -264,7 +264,7 @@ Skill files, ontology files, templates, and extension code are critical agent pi
 
 **Detection:**
 ```bash
-INFRA_FILES=$(gh pr diff <PR_NUMBER> --name-only | grep -E 'operations/skills/.*SKILL\.md|operations/skills/.*workflow/.*\.md|docs/teams/organisation-design-team/data/ONTOLOGY\.md|docs/teams/organisation-design-team/data/controlled_vocabulary\.md|docs/_template\.md|operations/subjects/.*\.yaml|operations/pi-config/extensions/.*|\.mcp\.json')
+INFRA_FILES=$(gh pr diff <PR_NUMBER> --name-only | grep -E 'skills/.*SKILL\.md|skills/.*workflow/.*\.md|docs/teams/organisation-design-team/data/ONTOLOGY\.md|docs/teams/organisation-design-team/data/controlled_vocabulary\.md|docs/_template\.md|operations/subjects/.*\.yaml|operations/pi-config/extensions/.*|\.mcp\.json')
 ```
 
 **If no infrastructure files detected:** `INFRA_RISK=""` — skip infrastructure reviewers.
@@ -278,7 +278,7 @@ INFRA_FILES=$(gh pr diff <PR_NUMBER> --name-only | grep -E 'operations/skills/.*
 | **Infrastructure-high** | New Workflow skill, ONTOLOGY.md § change, extension code, _template.md change, subjects/*.yaml change | 3 reviewers (all) |
 
 **Classification heuristic:**
-- PR diff adds a new file matching `operations/skills/**/SKILL.md` → read the skill to determine if Workflow (high) or Bounded/Modular (medium)
+- PR diff adds a new file matching `skills/**/SKILL.md` → read the skill to determine if Workflow (high) or Bounded/Modular (medium)
 - PR diff modifies `ONTOLOGY.md` with changes to numbered sections (\u00a7) → high
 - PR diff modifies extension code (`operations/pi-config/extensions/`) → high
 - PR diff modifies `docs/_template.md` or `operations/subjects/` → high

@@ -154,10 +154,10 @@ After dispatching, the workflow skill handles all phase transitions. Do NOT paus
 
 ## References
 
-- `operations/skills/epic-workflow/SKILL.md`
-- `operations/skills/project-workflow/SKILL.md`
-- `operations/skills/task-workflow/SKILL.md`
-- `operations/skills/issue-creation/SKILL.md`
+- `../epic-workflow/SKILL.md`
+- `../project-workflow/SKILL.md`
+- `../task-workflow/SKILL.md`
+- `../issue-creation/SKILL.md`
 - `docs/teams/organisation-design-team/data/ONTOLOGY.md`
 
 ---

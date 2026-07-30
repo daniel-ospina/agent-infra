@@ -172,10 +172,10 @@ git diff --cached --name-only | grep -q '^supabase/migrations/' && HAS_COLUMN_DR
 
 Validates that every skill listed in the dangerous-ops manifest is present in the AGENTS.md protocol table. Prevents skills from being added without registering them in the enforcement table.
 
-**Condition:** Only when **staged files** include changes under `operations/skills/`, `operations/enforcement/`, or `AGENTS.md`.
+**Condition:** Only when **staged files** include changes under `skills/`, `enforcement/`, or `AGENTS.md`.
 
 ```bash
-git diff --cached --name-only | grep -qE '^(operations/skills/|operations/enforcement/|AGENTS\.md)' && HAS_SKILL_CHANGES=true || HAS_SKILL_CHANGES=false
+git diff --cached --name-only | grep -qE '^(skills/|enforcement/|AGENTS\.md)' && HAS_SKILL_CHANGES=true || HAS_SKILL_CHANGES=false
 ```
 
 - If `HAS_SKILL_CHANGES=true`:

@@ -117,7 +117,7 @@ You are the Configuration Security specialist for a codebase audit.
 
 Follow the methodology from the insecure-defaults skill:
 - Read .agents/skills/insecure-defaults/SKILL.md
-- Read `../insecure-defaults/references/examples.md
+- Read `../insecure-defaults/references/examples.md`
 
 Scope: [FILE LIST — config files, env handling, SSR functions, edge functions]
 

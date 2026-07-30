@@ -33,7 +33,7 @@ steps:
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
- from operations/skills/planning/plan-review/SKILL.md -->
+ from the primary repo -->
 > **Canonical:** `.agents/skills/plan-review/SKILL.md` — both Claude and Pi read from here.
 >
 > **Unified v2.2.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, proportional parallel reviewers (2-4), convergence-gated (cap proportional to risk: 3 for Medium, 5 for Medium-High, 8 for High). Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
