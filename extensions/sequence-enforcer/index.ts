@@ -167,7 +167,7 @@ function loadSteps(skillPath: string): Step[] | null {
 
   try {
     // ponytail: execFileSync bypasses shell — absPath via argv, no injection vector
-    const json = execFileSync("python3", [
+    const json = execFileSync(process.env.AGENT_PYTHON3 || "python3", [
       "-c",
       [
         "import sys, os, json",
