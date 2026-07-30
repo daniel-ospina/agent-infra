@@ -8,7 +8,20 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, appendFileSync } fr
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 
-const DOCS_DIR = process.env.AGENT_DOCS_ROOT || "/Users/home/eldato/docs";
+const DOCS_DIR = process.env.AGENT_DOCS_ROOT;
+
+const WARNED_MISSING_DOCS_DIR = { value: false };
+
+function isDocsReady(): boolean {
+  if (!DOCS_DIR) {
+    if (!WARNED_MISSING_DOCS_DIR.value) {
+      console.warn("[writeback] AGENT_DOCS_ROOT not set — writeback disabled");
+      WARNED_MISSING_DOCS_DIR.value = true;
+    }
+    return false;
+  }
+  return true;
+}
 
 interface WriteBackContract {
   trigger: string;
@@ -54,6 +67,11 @@ export function executeWriteBack(
   contracts: WriteBackContract[],
 ): { executed: string[]; pending: string[]; errors: string[] } {
   const result = { executed: [] as string[], pending: [] as string[], errors: [] as string[] };
+
+  if (!isDocsReady()) {
+    result.errors.push("AGENT_DOCS_ROOT not set — writeback disabled");
+    return result;
+  }
 
   for (const contract of contracts) {
     if (!evaluateCondition(contract.condition, manifest)) continue;

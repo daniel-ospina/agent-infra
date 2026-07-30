@@ -1,4 +1,4 @@
-// See also: ~/.claude/settings.json PreToolUse hook for Claude Code equivalent.
+// See also: pi settings.json PreToolUse hook for Claude Code equivalent.
 // This extension is the authoritative definition.
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";

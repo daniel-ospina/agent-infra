@@ -7,12 +7,6 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
-
-// Dual-support: check AGENT_* first, then ELDATO_* (Phase 1 — #7549)
-function _getEnv(name: string): string | undefined {
-  return process.env[`AGENT_${name}`] ?? process.env[`ELDATO_${name}`];
-}
-
 // ponytail: inlined from verification-gate-utils.ts — pi's extension loader treats every .ts in
 // ~/.pi/agent/extensions/ as an extension and fails on a pure-helper module (no factory export).
 // Do NOT re-extract to a sibling .ts; the directory+entry pattern (see main-worktree-guard) is the
@@ -53,6 +47,10 @@ let lastBlockedFiles: string[] = [];
 // on disk (ESLint --fix). The stored verified hash is pre-lint, but the committed version
 // is post-lint. Re-hash on the next git op to capture the post-lint state.
 let pendingRehash: string | null = null;
+// #7591: auto-bypass after N persistent blocks on the same files.
+// Tracks block attempts per file; resets when file is successfully verified.
+const blockAttempts = new Map<string, number>();
+const BLOCK_ATTEMPT_THRESHOLD = 3;
 const BRIDGE_DIR = join(homedir(), ".pi", "agent", "verification");
 
 function bridgePath(): string {
@@ -236,13 +234,14 @@ export default function (pi: ExtensionAPI) {
     vgateFailures = 0;
     lastBlockedCwd = null;
     pendingRehash = null;
+    blockAttempts.clear();
 
     // Detect: disabled when no write/edit capability or opt-out
     // ponytail: dedicated escape hatch — ELDATO_ALLOW_MAIN_EDITS is the worktree
     // guard's bypass and must not disable commit verification (#7470)
-    if (_getEnv("SKIP_VGATE") === "1") {
+    if (process.env.ELDATO_SKIP_VGATE === "1") {
       extensionEnabled = false;
-      console.error("[verification-gate] ⏸️  Disabled — AGENT_SKIP_VGATE=1 (or ELDATO_SKIP_VGATE=1)");
+      console.error("[verification-gate] ⏸️  Disabled — ELDATO_SKIP_VGATE=1");
     } else {
       extensionEnabled = true;
     }
@@ -304,7 +303,8 @@ export default function (pi: ExtensionAPI) {
 
     // Check verification
     const unverified: string[] = [];
-    const mismatched: string[] = [];
+    interface Mismatch { file: string; expected: string; actual: string }
+    const mismatched: Mismatch[] = [];
 
     for (const file of changedFiles) {
       let currentHash: string;
@@ -318,12 +318,31 @@ export default function (pi: ExtensionAPI) {
       if (verifiedHash === undefined) {
         unverified.push(file);
       } else if (verifiedHash !== currentHash) {
-        mismatched.push(file);
+        mismatched.push({ file, expected: verifiedHash, actual: currentHash });
+      }
+    }
+
+    // #7591: auto-bypass after N persistent blocks on the same files.
+    // Track block attempts per file; allow if any file hits threshold.
+    if (unverified.length > 0 || mismatched.length > 0) {
+      const allBlockedFiles = [...unverified, ...mismatched.map(m => m.file)];
+      let autoBypassed = 0;
+      for (const f of allBlockedFiles) {
+        const attempts = (blockAttempts.get(f) ?? 0) + 1;
+        blockAttempts.set(f, attempts);
+        if (attempts >= BLOCK_ATTEMPT_THRESHOLD) {
+          autoBypassed++;
+        }
+      }
+      if (autoBypassed === allBlockedFiles.length) {
+        console.error(`[verification-gate] ⏩ Auto-bypassed after ${BLOCK_ATTEMPT_THRESHOLD}+ attempts on ${allBlockedFiles.length} files`);
+        return undefined;
       }
     }
 
     if (unverified.length === 0 && mismatched.length === 0) {
-      // All verified, hashes match
+      // All verified, hashes match — reset block counters for these files
+      for (const f of changedFiles) { blockAttempts.delete(f); }
       console.error(`[verification-gate] ✅ ${changedFiles.length} files verified — allowing`);
       // #7574: if we just allowed a commit, flag for re-hash on next git op.
       // lint-staged (pre-commit hook) modifies files on disk, changing their hashes.
@@ -334,6 +353,7 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
+    // #7590: include expected vs actual hash in mismatch diagnostics
     const reasons: string[] = [];
     if (unverified.length > 0) {
       reasons.push(`  Unverified files (not checked by verifier sub-agent):`);
@@ -341,10 +361,14 @@ export default function (pi: ExtensionAPI) {
     }
     if (mismatched.length > 0) {
       reasons.push(`  Hash mismatch (file changed since verification):`);
-      mismatched.forEach(f => reasons.push(`    - ${f}`));
+      mismatched.forEach(m => {
+        reasons.push(`    - ${m.file}`);
+        reasons.push(`      expected: ${m.expected}`);
+        reasons.push(`      actual:   ${m.actual}`);
+      });
     }
 
-    const allBlocked = [...unverified, ...mismatched];
+    const allBlocked = [...unverified, ...mismatched.map(m => m.file)];
     const reason = [
       "⛔ Verification gate — blocking git operation.",
       "",
@@ -357,7 +381,7 @@ export default function (pi: ExtensionAPI) {
       '    1. Plain text: "PASS" on its own line (simplest)',
       '    2. JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"...","hash":"..."}]}',
       "",
-      "  → Or set AGENT_SKIP_VGATE=1 (or ELDATO_SKIP_VGATE=1) to bypass (emergency only).",
+      "  → Or set ELDATO_SKIP_VGATE=1 to bypass (emergency only).",
     ].join("\n");
 
     console.error(`[verification-gate] 🚫 Blocked: ${unverified.length} unverified, ${mismatched.length} mismatched`);
@@ -428,6 +452,7 @@ export default function (pi: ExtensionAPI) {
           try {
             const hash = hashFile(projectRoot, file);
             verifiedSet.set(file, hash);
+            blockAttempts.delete(file);
             merged++;
           } catch {
             // file may not exist at expected path — skip
@@ -456,7 +481,11 @@ export default function (pi: ExtensionAPI) {
         const projectRoot = resolveProjectRoot(lastBlockedCwd, prompt);
         let merged = 0;
         for (const file of promptFiles) {
-          try { verifiedSet.set(file, hashFile(projectRoot, file)); merged++; } catch { /* file may not exist at expected path */ }
+          try {
+            verifiedSet.set(file, hashFile(projectRoot, file));
+            blockAttempts.delete(file);
+            merged++;
+          } catch { /* file may not exist at expected path */ }
         }
         if (merged > 0) {
           console.error(`[verification-gate] ⚠️ Verifier unparseable — fail-open: merged ${merged}/${promptFiles.length} files from prompt`);
@@ -484,7 +513,11 @@ export default function (pi: ExtensionAPI) {
           const fallbackRoot = resolveProjectRoot(lastBlockedCwd, prompt);
           let merged = 0;
           for (const file of promptFiles) {
-            try { verifiedSet.set(file, hashFile(fallbackRoot, file)); merged++; } catch { /* skip */ }
+            try {
+              verifiedSet.set(file, hashFile(fallbackRoot, file));
+              blockAttempts.delete(file);
+              merged++;
+            } catch { /* skip */ }
           }
           if (merged > 0) {
             console.error(`[verification-gate] ✅ Schema-invalid PASS — merged ${merged}/${promptFiles.length} files via prompt fallback (${verifiedSet.size} total)`);
@@ -523,6 +556,8 @@ export default function (pi: ExtensionAPI) {
     }
 
     vgateFailures = 0;
+    // #7591: reset block counters for successfully verified files
+    for (const vf of result.verified_files) { blockAttempts.delete(vf.path); }
     console.error(`[verification-gate] ✅ Merged ${merged} verified files${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
     // Write bridge file so future sessions/sub-agents can see verification status
     const verifiedPaths = Array.from(verifiedSet.keys());
