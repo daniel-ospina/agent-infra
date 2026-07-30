@@ -1,0 +1,54 @@
+name: CI
+# agent-infra: pi extension & script validation
+# Budget: PR-only (shared Actions budget under daniel-ospina account)
+
+on:
+  pull_request:
+
+jobs:
+  script-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Node.js scripts
+        run: |
+          errors=0
+          for f in scripts/*.{cjs,mjs,js} bin/*.js; do
+            [ -f "$f" ] || continue
+            echo "Checking $f..."
+            node --check "$f" || errors=$((errors+1))
+          done
+          if [ $errors -gt 0 ]; then
+            echo "❌ $errors script(s) failed validation"
+            exit 1
+          fi
+          echo "✅ All scripts validated"
+
+  skill-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate skill YAML frontmatter
+        run: |
+          errors=0
+          for skill in skills/*/; do
+            [ -d "$skill" ] || continue
+            name=$(basename "$skill")
+            skillfile="$skill/SKILL.md"
+            [ -f "$skillfile" ] || {
+              echo "❌ $name: missing SKILL.md"
+              errors=$((errors+1))
+              continue
+            }
+            head -1 "$skillfile" | grep -q "^---$" || {
+              echo "❌ $name: missing YAML frontmatter"
+              errors=$((errors+1))
+              continue
+            }
+            echo "✅ $name"
+          done
+          if [ $errors -gt 0 ]; then
+            echo "❌ $errors skill(s) failed validation"
+            exit 1
+          fi
+          echo "✅ All skills validated"
