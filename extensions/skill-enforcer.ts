@@ -65,7 +65,7 @@ function _isBypassEnv(): boolean {
   return process.env.SKILL_ENFORCER_DISABLED === "1" || _getEnv("ALLOW_MAIN_EDITS") === "1";
 }
 // Parameterized skill file prefix (Phase 1 default: operations/skills/)
-const SKILLS_PREFIX = process.env.AGENT_SKILLS_PREFIX ?? "operations/skills/";
+const SKILLS_PREFIX = _getEnv("SKILLS_PREFIX") ?? "operations/skills/";
 
 const __skillRegistry = new Map<string, { name: string; loaded: boolean; error?: string; loadedAt: number }>();
 function register(name: string, error?: string): void { __skillRegistry.set(name, { name, loaded: !error, error, loadedAt: Date.now() }); }

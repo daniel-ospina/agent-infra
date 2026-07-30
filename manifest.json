@@ -20,6 +20,7 @@
     },
     "skills/": { "kind": "symlink", "essential": true },
     "scripts/": { "kind": "symlink", "essential": true },
-    "templates/": { "kind": "copy", "essential": true }
+    "templates/": { "kind": "copy", "essential": true },
+    "bin/": { "kind": "script", "essential": true }
   }
 }
