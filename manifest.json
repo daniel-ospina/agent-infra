@@ -1,7 +1,23 @@
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "files": {
-    "extensions/": { "kind": "symlink", "essential": true },
+    "extensions/": {
+      "kind": "symlink",
+      "essential": true,
+      "entries": [
+        "skill-enforcer.ts",
+        "verification-gate/",
+        "builtin-tools/",
+        "mcp-client/",
+        "skill-registry.ts",
+        "review-enforcer/",
+        "loop-enforcer/",
+        "sequence-enforcer/",
+        "main-worktree-guard/",
+        "audit-logger.ts",
+        "shared/"
+      ]
+    },
     "skills/": { "kind": "symlink", "essential": true },
     "scripts/": { "kind": "symlink", "essential": true },
     "templates/": { "kind": "copy", "essential": true }
