@@ -8,8 +8,8 @@ version: 2.0.0
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
-<!-- pi-adapted from operations/skills/human-input-framework/SKILL.md -->
-> **Sync note:** Local copy at `~/.claude/skills/human-input-framework/SKILL.md`. Repo copy at `operations/skills/human-input-framework/SKILL.md`. Keep in sync.
+<!-- ported from the primary repo -->
+> **Source:** Canonical copy at `skills/human-input-framework/SKILL.md`.
 
 # Human Input Decision Framework
 
@@ -167,9 +167,9 @@ Skills that consume this taxonomy MUST inline:
 This ensures cross-session resilience — a skill invoked in a fresh session must work without loading this framework skill first.
 
 When updating the taxonomy here, update all consuming skills:
-- `~/.claude/skills/brainstorming/SKILL.md`
-- `~/.claude/skills/executing-plans/SKILL.md`
-- `~/.claude/skills/issue-scoping/SKILL.md`
+- `agent-infra/skills/brainstorming/SKILL.md`
+- `agent-infra/skills/executing-plans/SKILL.md`
+- `agent-infra/skills/issue-scoping/SKILL.md`
 - `~/.pi/agent/skills/brainstorming/SKILL.md` (Pi symlink)
 - `~/.pi/agent/skills/executing-plans/SKILL.md` (Pi symlink)
 - `~/.pi/agent/skills/issue-scoping/SKILL.md` (Pi symlink)

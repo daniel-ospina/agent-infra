@@ -170,8 +170,8 @@ function loadSteps(skillPath: string): Step[] | null {
     const json = execFileSync("python3", [
       "-c",
       [
-        "import sys, json",
-        "sys.path.insert(0, 'operations/tools')",
+        "import sys, os, json",
+        `sys.path.insert(0, os.environ.get('AGENT_TOOLS_PATH') or os.path.join(os.environ.get('AGENT_INFRA_PATH', ''), '..', 'operations', 'tools'))`,
         "from skill_declaration import extract_steps_from_skill",
         "steps = extract_steps_from_skill(sys.argv[1])",
         "print(json.dumps([{k: v for k, v in s.__dict__.items() if not k.startswith('_')} for s in (steps or [])]))",

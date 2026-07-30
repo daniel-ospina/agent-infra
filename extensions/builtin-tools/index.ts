@@ -18,19 +18,34 @@ import { register } from "../shared/health.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/** Resolve the Perplexity API key from env or MCP server's .env file */
+/** Resolve the Perplexity API key from env or a configurable .env file */
 export function getPerplexityKey(): string | undefined {
   // Check environment first
   if (process.env.PERPLEXITY_API_KEY) return process.env.PERPLEXITY_API_KEY;
 
-  // Try reading from MCP server .env
-  try {
-    const envPath = resolve(process.cwd(), "operations/mcp-server/.env");
-    const envContent = readFileSync(envPath, "utf-8");
-    const match = envContent.match(/PERPLEXITY_API_KEY=(.+)/);
-    if (match) return match[1].trim();
-  } catch {
-    // .env file not found or unreadable
+  // Try AGENT_MCP_ENV_PATH for an explicit .env path
+  const envPath = process.env.AGENT_MCP_ENV_PATH;
+  if (envPath) {
+    try {
+      const envContent = readFileSync(envPath, "utf-8");
+      const match = envContent.match(/PERPLEXITY_API_KEY=(.+)/);
+      if (match) return match[1].trim();
+    } catch {
+      // .env file not found or unreadable
+    }
+  }
+
+  // Fall back to $AGENT_INFRA_PATH/../.env
+  const infraPath = process.env.AGENT_INFRA_PATH;
+  if (infraPath) {
+    try {
+      const fallbackPath = resolve(infraPath, "..", ".env");
+      const envContent = readFileSync(fallbackPath, "utf-8");
+      const match = envContent.match(/PERPLEXITY_API_KEY=(.+)/);
+      if (match) return match[1].trim();
+    } catch {
+      // .env file not found or unreadable
+    }
   }
 
   return undefined;
@@ -130,7 +145,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text",
-              text: "PERPLEXITY_API_KEY not set. Set it in your environment or in operations/mcp-server/.env",
+              text: "PERPLEXITY_API_KEY not set. Set it via PERPLEXITY_API_KEY env var, AGENT_MCP_ENV_PATH (path to .env file), or $AGENT_INFRA_PATH/../.env",
             },
           ],
         };
