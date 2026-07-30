@@ -6,7 +6,7 @@ allowed-tools: read, write, bash, find, grep
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
-> **Sync note:** Local copy at `~/.claude/skills/supply-chain-risk-auditor/SKILL.md`. Repo copy at `operations/skills/supply-chain-risk-auditor/SKILL.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/supply-chain-risk-auditor/SKILL.md``.
 
 # Supply Chain Risk Auditor
 

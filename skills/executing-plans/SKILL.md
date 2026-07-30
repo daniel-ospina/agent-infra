@@ -52,7 +52,7 @@ steps:
 **Human approval gate:** presents output for user review. Pipeline advances after approval.
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Sync note:** Local copy at `~/.pi/agent/skills/executing-plans/SKILL.md`. Repo copy at `operations/skills/executing-plans/SKILL.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/executing-plans/SKILL.md``.
 >
 v5.0.0 — stripped NVIDIA/MCP tool calls. Restored batched execution flow. Added dirty-state guard and research context injection. All sub-agents use Pi `task` tool with isolated context.
 

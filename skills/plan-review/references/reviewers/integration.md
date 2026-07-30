@@ -1,4 +1,4 @@
-> **Sync note:** Local copy at `~/.claude/skills/plan-review/references/reviewers/integration.md`. Repo copy at `operations/skills/plan-review/references/reviewers/integration.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/plan-review/references/reviewers/integration.md``.
 
 # Integration Reviewer (Claude path) — Prompt Template
 

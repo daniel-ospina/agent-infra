@@ -1,4 +1,4 @@
-> **Sync note:** Local copy at `~/.claude/skills/plan-review/references/reviewers/efficiency.md`. Repo copy at `operations/skills/plan-review/references/reviewers/efficiency.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/plan-review/references/reviewers/efficiency.md``.
 
 # Claude Efficiency Reviewer (fallback) — Prompt Template
 

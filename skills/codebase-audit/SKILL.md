@@ -33,7 +33,7 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Sync note:** Local copy at `.agents/skills/codebase-audit/SKILL.md`. Repo copy at `operations/skills/codebase-audit/SKILL.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/codebase-audit/SKILL.md`.
 
 # Codebase Audit
 
@@ -82,10 +82,10 @@ You are the Security specialist for a codebase audit.
 
 Follow the methodology from the security-review skill:
 - Read .agents/skills/security-review/SKILL.md for the overall approach
-- Read operations/skills/security-review/languages/javascript.md for JS/TS patterns
-- Read operations/skills/security-review/languages/typescript.md for TS-specific patterns
-- Read operations/skills/security-review/references/supabase-rls.md for Supabase patterns
-- Read operations/skills/security-review/references/cloudflare-pages.md for SSR patterns
+- Read `../security-review/languages/javascript.md` for JS/TS patterns
+- Read `../security-review/languages/typescript.md` for TS-specific patterns
+- Read `../security-review/references/supabase-rls.md` for Supabase patterns
+- Read `../security-review/references/cloudflare-pages.md` for SSR patterns
 - Consult other reference files as needed based on what you find
 
 Scope: [FILE LIST — app code, SSR functions, edge functions]
@@ -117,7 +117,7 @@ You are the Configuration Security specialist for a codebase audit.
 
 Follow the methodology from the insecure-defaults skill:
 - Read .agents/skills/insecure-defaults/SKILL.md
-- Read operations/skills/insecure-defaults/references/examples.md
+- Read `../insecure-defaults/references/examples.md
 
 Scope: [FILE LIST — config files, env handling, SSR functions, edge functions]
 

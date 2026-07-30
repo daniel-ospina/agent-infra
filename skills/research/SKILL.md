@@ -26,7 +26,7 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 
 # Research
 
-> **Sync note:** This is the live local copy (`~/.claude/skills/research/SKILL.md`). The repository copy lives at `operations/skills/research/SKILL.md`. If you edit this file, update the repo copy too (and vice versa).
+> **Source:** Canonical copy at `skills/research/SKILL.md`.
 
 ## Purpose
 

@@ -6,7 +6,7 @@ domain: operations
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
-> **Sync note:** Local copy at `~/.claude/skills/using-git-worktrees/SKILL.md`. Repo copy at `operations/skills/using-git-worktrees/SKILL.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/using-git-worktrees/SKILL.md`.
 
 > **Fork note:** Local override of `superpowers:using-git-worktrees` v5.0.0. Changes: (1) Integration section updated — no longer REQUIRED by executing-plans (now CONDITIONAL). See #908. (2) Added Step 0: Detect Main Repo Root — all path logic is anchored to `$MAIN_REPO` (resolved via `git rev-parse --git-common-dir`) so nested worktrees never get created when the skill runs from inside an existing agent worktree.
 

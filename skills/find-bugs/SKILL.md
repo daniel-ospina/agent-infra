@@ -33,7 +33,7 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Sync note:** Local copy at `~/.claude/skills/find-bugs/SKILL.md`. Repo copy at `operations/skills/find-bugs/SKILL.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/find-bugs/SKILL.md``.
 
 ## Mode Detection
 

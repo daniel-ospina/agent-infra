@@ -1,4 +1,4 @@
-> **Sync note:** Local copy at `~/.claude/skills/plan-review/references/reviewers/structural-pattern.md`. Repo copy at `operations/skills/plan-review/references/reviewers/structural-pattern.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/plan-review/references/reviewers/structural-pattern.md``.
 
 # Claude Structural Pattern Reviewer — Prompt Template
 

@@ -1,4 +1,4 @@
-> **Sync note:** Local copy at `~/.claude/skills/code-review/references/fixer-loop.md`. Repo copy at `operations/skills/code-review/references/fixer-loop.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/code-review/references/fixer-loop.md``.
 
 # Fixer Loop — Reference
 

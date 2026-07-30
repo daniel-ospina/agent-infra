@@ -7,7 +7,7 @@ license: LICENSE
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
-> **Sync note:** Local copy at `~/.claude/skills/security-review/SKILL.md`. Repo copy at `operations/skills/security-review/SKILL.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/security-review/SKILL.md``.
 
 <!--
 Reference material based on OWASP Cheat Sheet Series (CC BY-SA 4.0)

@@ -6,7 +6,7 @@ allowed-tools: read, grep, find, bash
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
-> **Sync note:** Local copy at `~/.claude/skills/insecure-defaults/SKILL.md`. Repo copy at `operations/skills/insecure-defaults/SKILL.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/insecure-defaults/SKILL.md`.
 
 # Insecure Defaults Detection
 

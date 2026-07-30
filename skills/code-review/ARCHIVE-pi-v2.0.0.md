@@ -1,4 +1,4 @@
-> **ARCHIVED — DO NOT USE.** This file is a snapshot of the Pi-adapted `code-review` skill (v2.0.0) preserved for historical reference. It was the active version at `operations/skills/code-review/SKILL.md` prior to reconciliation on 2026-05-24. After reconciliation, `operations/skills/code-review/SKILL.md` tracks the Claude Code canonical at `~/.claude/skills/code-review/SKILL.md` (v1.8.0, NVIDIA-aware).
+> **ARCHIVED — DO NOT USE.** This file is a snapshot of the Pi-adapted `code-review` skill (v2.0.0) preserved for historical reference. The canonical skill lives at `skills/code-review/SKILL.md` (v1.8.0, NVIDIA-aware).
 >
 > **Why preserved:** This Pi v2.0.0 fork has unique content not in canonical (Standard-Tier Review flag, False Positives to Ignore list, simplified fixer loop, consolidated 4-reviewer architecture). If the Pi runtime is ever re-activated, this file can serve as the starting point for re-forking from canonical via a documented transformation (strip NVIDIA/MCP refs, replace with native equivalents).
 >
@@ -13,7 +13,7 @@ version: 2.0.0
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 
-> **Sync note:** Local copy at `~/.pi/agent/skills/code-review/SKILL.md`. Repo copy at `operations/skills/code-review/SKILL.md`. Keep in sync.
+> **Source:** Canonical copy at `skills/code-review/SKILL.md`.
 >
 > **Fork note:** v2.0.0 — stripped NVIDIA/MCP tool calls. Consolidated 5 reviewers into 4 (merged CLAUDE.md + code comments into Guidance Compliance). Confidence scoring via isolated Pi `task` sub-agents. Simplified fixer loop (direct sub-agent, 3 cycles max). Restored `--standard-tier` flag. Kept Research Resolution Gate and Supabase logging.
 
