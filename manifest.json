@@ -1,0 +1,9 @@
+{
+  "version": "0.1.0",
+  "files": {
+    "extensions/": { "kind": "symlink", "essential": true },
+    "skills/": { "kind": "symlink", "essential": true },
+    "scripts/": { "kind": "symlink", "essential": true },
+    "templates/": { "kind": "copy", "essential": true }
+  }
+}
