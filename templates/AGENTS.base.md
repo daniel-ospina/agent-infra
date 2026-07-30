@@ -140,6 +140,33 @@ Use Pi's `task` tool for all sub-agent work. Sub-agents have isolated context �
 
 <!-- REPO-SPECIFIC: Add tool-specific exceptions here (e.g., design_reviewer for Claude Opus) -->
 
+## Batch Implementation & Parallel Dispatch
+
+**Never ask "sequential or parallel?" — always plan the optimal parallelization yourself.** The default is maximum parallelism. The user started the session to get work done, not to manage a task queue.
+
+### Decomposition maps parallelism
+
+When decomposing work (epic or multi-issue batch), explicitly map what can run in parallel:
+- Scope/plan multiple independent issues simultaneously via sub-agents
+- Run one issue end-to-end while scoping others in parallel
+- Launch an issue as soon as its blocker is done — don't wait for the full batch
+
+### Maximize sub-agent utilization
+
+- While waiting for a human gate (UX approval, design review) → dispatch sub-agents for other independent work
+- Non-blocking research, scoping, or implementation on unrelated issues runs in background
+- The controller (you) handles human interaction; sub-agents handle everything else
+
+### Dependency-aware launch
+
+The `**Depends on:**` field in any child issue body (or the `Depends on` column in `epic-decompose` output) is the parallelism map — if no dependency is listed, the issue is safe for parallel dispatch.
+When issue B depends on issue A's scoping/plan but not its implementation:
+1. Launch issue A's scoping + issues C, D, E scoping in parallel
+2. As soon as issue A's scoping returns → immediately launch issue B
+3. Don't wait for C/D/E to finish — B's blocker is gone, B starts now
+
+Implement issues directly inline where practical. Group related micro-issues into a single batch PR. For cross-session epic batches, use `epic-executor/SKILL.md`.
+
 ---
 
 ## Data Access Transparency
@@ -168,13 +195,66 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
 - **Never use `git add -A`** — always stage specific files.
 - **Prefer the `edit` tool over `write`** for targeted changes to existing files.
 
+## Tool Quality & Retirement
+
+- **Two-strikes rule:** If any pipeline tool or script requires >1 manual-fix cycle per use, file a retirement issue. Don't accumulate patches.
+
 ---
+
+## Documentation Filing Protocol
+
+Before recording any information, find the correct home first:
+
+1. **Behavioral rule for agents?** → in this file (`AGENTS.md`)
+2. **Does a `docs/` file already cover this topic?** → Check your docs index and update that file
+3. **New concept with no existing doc?** → Prefer extending an existing `docs/` file over creating a new one. If a new file is genuinely needed, register it in your docs index
+4. **Raw coding gotcha** (trips you up mid-code, no natural docs home)? → One concise line in `MEMORY.md`
+
+<!-- REPO-SPECIFIC: Add your doc routing rules (e.g., "For topic-to-file routing, see docs/00_index.md") -->
+
+### Entity Annotation
+
+When writing or updating any doc in `docs/`, auto-populate entity metadata from session context:
+
+- `aboutSubjects` — from session team context, `ownedBy` in frontmatter, team detected from file path
+- `aboutObjects` — from governing agreement, parent epic reference, repo name
+- If ambiguous, ask: "This doc references entity X — is that correct?"
+- Never leave entity fields empty when context is available
+
+<!-- REPO-SPECIFIC: Reference your ontology doc for entity types and predicates (e.g., ONTOLOGY.md §1.1 for types, §2.2 for predicates) -->
 
 ## Memory Hygiene
 
 - `MEMORY.md` must stay under 150 lines.
 - `MEMORY.md` = raw coding gotchas only (things that bite mid-code). Not an implementation log, not a docs index.
 - Format: `[category]: [what broke] → [root cause] → [the fix]`
+
+## Memory Contracts
+
+After key triggers, write back to the correct target. **Verifier-triggered, not agent-triggered.** Append, never rewrite. Contradictions escalate via `⚠️ CONTRADICTION:` prefix. Cross-domain: explicit only.
+
+Format: `[category]: [what broke] → [root cause] → [the fix]`
+
+<!-- REPO-SPECIFIC: Add your repo's triggers/targets here.
+| Trigger | Target |
+|---------|--------|
+| Task complete (code gotcha) | `MEMORY.md` (cap 150 lines) |
+| Task complete (no gotcha) | Plan doc `## Learnings` |
+| Bug fixed | `docs/teams/<team>/<domain>/gotchas.md` + `MEMORY.md` |
+| Session complete | Your session postmortem + `MEMORY.md` for friction patterns |
+-->
+
+<!-- REPO-SPECIFIC: Add human-gated vs agent-autonomous filing rules here -->
+
+## Key Differences from Claude Code
+
+| Claude Code | Pi |
+|---|---|
+| Agent tool / Skill tool | `task` tool for sub-agents, skills loaded from files |
+| `model: sonnet/opus` frontmatter | Ignored — Pi uses its own model selection |
+| `allowed-tools` with granular Bash | Use Pi's tool names: `read write edit bash grep find web_search web_fetch todo_write task` |
+| MCP servers via `.mcp.json` | MCP tools available via mcp-client extension |
+| `superpowers:skill-name` references | Use skill name directly (e.g., `commit-workflow`) |
 
 ---
 
