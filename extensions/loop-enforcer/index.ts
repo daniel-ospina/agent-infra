@@ -72,6 +72,21 @@ export function shouldResumeLoop(
   return false;
 }
 
+// ── Env helpers (Phase 1 — #7549): dual-support AGENT_* and ELDATO_* ─
+function _getEnv(key: string): string | undefined {
+  return process.env[`AGENT_${key}`] ?? process.env[`ELDATO_${key}`];
+}
+
+function _setEnv(key: string, value: string): void {
+  process.env[`AGENT_${key}`] = value;
+  process.env[`ELDATO_${key}`] = value;
+}
+
+function _deleteEnv(key: string): void {
+  delete process.env[`AGENT_${key}`];
+  delete process.env[`ELDATO_${key}`];
+}
+
 // ── Paths ──────────────────────────────────────────────────────────
 const COST_LOG = join(homedir(), ".pi", "cost-log.jsonl");
 const SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");

@@ -1,0 +1,13 @@
+# dangerous-ops.txt — manifest for skill-enforcer gate enforcement
+# Format: skillName # pattern # mode # optional_message
+# mode: hard (blocks until skill read) | nudge (reminds, escalates to block after threshold)
+
+commit-workflow # git commit|git push|git merge|gh pr create|gh pr merge|git stash pop|git checkout -- # hard # Use commit-workflow/SKILL.md for all git operations. Pre-flight checks, PR creation, code-review gate, and auto-merge.
+
+supabase # supabase|migration|RLS|apply_migration_safe|pg_ # hard # Use supabase/SKILL.md for all Supabase operations. Unsafe migrations can cause data loss.
+
+how-to-use-tortoise # tortoise_create_point|tortoise_create_operator|tortoise_mitigate_operator|tortoise_delete_point|tortoise_invalidate|tortoise_supersede|tortoise_annotate_operator # hard # Use how-to-use-tortoise/SKILL.md for all Tortoise graph writes. Wrong edges can corrupt EP propagation.
+
+commit-workflow # gh pr review|gh pr approve # hard # Use commit-workflow/SKILL.md for PR review operations.
+
+how-to-use-tortoise # tortoise_ # nudge # Use how-to-use-tortoise/SKILL.md for Tortoise graph operations.
