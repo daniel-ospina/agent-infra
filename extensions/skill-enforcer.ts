@@ -71,7 +71,7 @@ const __skillRegistry = new Map<string, { name: string; loaded: boolean; error?:
 function register(name: string, error?: string): void { __skillRegistry.set(name, { name, loaded: !error, error, loadedAt: Date.now() }); }
 
 // Load dangerous-ops manifest (#5558) — fixed: was double "operations/" (#7549)
-const MANIFEST_PATH = resolve(__dirname, "..", "..", "..", "operations", "enforcement", "dangerous-ops.txt");
+const MANIFEST_PATH = resolve(__dirname, "..", "enforcement", "dangerous-ops.txt");
 
 interface ManifestEntry {
   patterns: RegExp[];
@@ -166,7 +166,6 @@ export default function (pi: ExtensionAPI) {
     const nudges: Nudge[] = [
       { keywords: /worktree|git\s+worktree/i, skill: "using-git-worktrees", file: `${sp}using-git-worktrees/SKILL.md`, hint: "Creating worktrees?" },
       { keywords: /migration|RLS\b|supabase|apply_migration/i, skill: "supabase", file: `${sp}supabase/SKILL.md`, hint: "Supabase schema changes?" },
-      { keywords: /tortoise|graph\s+write|create_point|mitigate/i, skill: "how-to-use-tortoise", file: `${sp}how-to-use-tortoise/SKILL.md`, hint: "Tortoise graph writes?" },
       { keywords: /\bcommit\b|\bpush\b|\bmerge\b|PR\b|pull\s+request/i, skill: "commit-workflow", file: `${sp}commit-workflow/SKILL.md`, hint: "Committing or merging?" },
       { keywords: /issue\s+create|github\s+issue/i, skill: "issue-creation", file: `${sp}issue-creation/SKILL.md`, hint: "Creating a GitHub issue?" },
     ];
