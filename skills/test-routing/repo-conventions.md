@@ -1,6 +1,6 @@
 # Repo Conventions — test-routing
 
-> Customize this file for your repo. See `eldato-conventions.md` for a reference example.
+> ⚠️ `eldato-conventions.md` is **El Dato-specific** and does NOT apply here. Customize this file for YOUR repo using the sections below. The eldato file is a reference example only.
 
 ## Pipeline Integration
 - **Skill names:** [your pipeline skill names and entry points]

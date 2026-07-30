@@ -1,3 +1,5 @@
+> ⚠️ **El Dato-specific.** This file only applies to the El Dato repo. When deploying this skill to another repo, create a `repo-conventions.md` file instead. See `repo-conventions.md` for the template.
+
 # Eldato Conventions — test-routing
 
 Maps universal patterns in `SKILL.md` to concrete eldato tooling.
