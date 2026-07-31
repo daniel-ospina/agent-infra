@@ -26,6 +26,7 @@ const EXTENSIONS_SRC = path.join(AGENT_INFRA_PATH, 'extensions');
 const SKILLS_SRC = path.join(AGENT_INFRA_PATH, 'skills');
 const SCRIPTS_SRC = path.join(AGENT_INFRA_PATH, 'scripts');
 const TEMPLATES_SRC = path.join(AGENT_INFRA_PATH, 'templates');
+const CI_SRC = path.join(TEMPLATES_SRC, '.github', 'workflows');
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -90,6 +91,20 @@ function readlinkSafe(p) {
     if (e.code !== 'ENOENT') throw e;
   }
   return null;
+}
+
+/** Detect repo stack from filesystem hints. */
+function detectStack(targetDir) {
+  if (fs.existsSync(path.join(targetDir, 'pyproject.toml')) ||
+      fs.existsSync(path.join(targetDir, 'setup.py')) ||
+      fs.existsSync(path.join(targetDir, 'setup.cfg'))) return 'python';
+  if (fs.existsSync(path.join(targetDir, 'package.json'))) return 'node';
+  return 'docs';
+}
+
+/** Map detected stack to the expected CI template filename. */
+function ciTemplateForStack(stack) {
+  return { python: 'python-ci.yml', node: 'node-ci.yml', docs: 'docs-ci.yml' }[stack];
 }
 
 /** Resolve a symlink target relative to the link's directory. */
@@ -211,6 +226,9 @@ function cmdInit(targetDir) {
       copyDir(huskySrc, huskyDest);
       console.log(`   ✅ .husky/`);
     }
+
+    // CI workflow symlinks (detected stack only)
+    _initCISymlinks(manifest, targetDir);
   }
 
   // ── Write .agent-infra-version ──
@@ -317,6 +335,9 @@ function cmdUpdate() {
     } else {
       console.log(`   ⏭️  .husky/ (preserved)`);
     }
+
+    // CI workflow symlinks (detected stack only)
+    changes += _updateCISymlinks(manifest, targetDir);
   }
 
   // ── .agent-infra-version ──
@@ -510,6 +531,9 @@ function cmdCheck(targetDir) {
         console.log(`   ✅ .husky/`);
       }
     }
+
+    // CI workflow symlinks (detected stack only)
+    ok += _checkCISymlinks(manifest, targetDir, issues);
   }
 
   // ── Check .agent-infra-version ──
@@ -541,6 +565,130 @@ function cmdCheck(targetDir) {
     }
     process.exit(1);
   }
+}
+
+// ─── CI Workflow Helpers ────────────────────────────────────────────────────
+
+/** _initCISymlinks — create CI symlinks for the detected stack.
+ *  Called from cmdInit() inside the templates/ block. */
+function _initCISymlinks(manifest, targetDir) {
+  const ciManifest = manifest.files['templates/.github/workflows/'];
+  if (!ciManifest || ciManifest.kind !== 'symlink' || !Array.isArray(ciManifest.entries)) return;
+
+  const stack = detectStack(targetDir);
+  const expectedFile = ciTemplateForStack(stack);
+  const ciDest = path.join(targetDir, '.github', 'workflows');
+  ensureDir(ciDest);
+
+  for (const entry of ciManifest.entries) {
+    if (entry !== expectedFile) continue;
+    const src = path.join(CI_SRC, entry);
+    const dest = path.join(ciDest, entry);
+    if (!fs.existsSync(src)) {
+      console.log(`\n🔧 CI Workflows:\n   ⚠️  Source missing: ${entry}`);
+      return;
+    }
+    if (resolveLink(dest) === null && fs.existsSync(dest)) {
+      console.log(`\n🔧 CI Workflows:\n   ⚠️  ${entry} exists as local file — skipping (diverged repo)`);
+      return;
+    }
+    // Use relative symlink so CI runners can resolve within the same checkout
+    const relativeSrc = path.relative(path.dirname(dest), src);
+    removeIfExists(dest);
+    fs.symlinkSync(relativeSrc, dest);
+    console.log(`\n🔧 CI Workflows:\n   ✅ ${entry} → ${relativeSrc} (${stack} stack)`);
+  }
+}
+
+/** _updateCISymlinks — refresh CI symlinks for the detected stack.
+ *  Called from cmdUpdate() inside the templates/ block.
+ *  Returns the number of changes made. */
+function _updateCISymlinks(manifest, targetDir) {
+  const ciManifest = manifest.files['templates/.github/workflows/'];
+  if (!ciManifest || ciManifest.kind !== 'symlink' || !Array.isArray(ciManifest.entries)) return 0;
+
+  let changes = 0;
+  const stack = detectStack(targetDir);
+  const expectedFile = ciTemplateForStack(stack);
+  const ciDest = path.join(targetDir, '.github', 'workflows');
+  ensureDir(ciDest);
+
+  for (const entry of ciManifest.entries) {
+    if (entry !== expectedFile) continue;
+    const src = path.join(CI_SRC, entry);
+    const dest = path.join(ciDest, entry);
+    if (!fs.existsSync(src)) {
+      console.log(`   ⚠️  CI template missing: ${entry}`);
+      continue;
+    }
+    const current = resolveLink(dest);
+    if (current === null && fs.existsSync(dest)) {
+      // Local file — diverged repo, don't overwrite
+      console.log(`   ⚠️  ${entry} is a local file (diverged) — skipping`);
+      continue;
+    }
+    if (current !== src) {
+      const relativeSrc = path.relative(path.dirname(dest), src);
+      removeIfExists(dest);
+      fs.symlinkSync(relativeSrc, dest);
+      console.log(`   🔄 ${entry} → ${relativeSrc}`);
+      changes++;
+    }
+  }
+  return changes;
+}
+
+/** _checkCISymlinks — validate CI symlinks for the detected stack.
+ *  Called from cmdCheck() inside the templates/ block.
+ *  NOTE: Pushes to issues[] and increments ok directly (by reference). */
+function _checkCISymlinks(manifest, targetDir, issues) {
+  const ciManifest = manifest.files['templates/.github/workflows/'];
+  if (!ciManifest || ciManifest.kind !== 'symlink' || !Array.isArray(ciManifest.entries)) return 0;
+
+  const repoName = path.basename(targetDir);
+  const skipRepos = ['eldato-outreach'];
+  const ciDest = path.join(targetDir, '.github', 'workflows');
+  let ok = 0;
+
+  if (skipRepos.includes(repoName)) {
+    console.log(`\n🔧 CI Workflows:\n   ⏭️  ${repoName} — uses external CI (skipped)`);
+    return 0;
+  }
+
+  console.log('\n🔧 CI Workflows:');
+  const stack = detectStack(targetDir);
+  const expectedFile = ciTemplateForStack(stack);
+
+  for (const entry of ciManifest.entries) {
+    if (entry !== expectedFile) continue;
+    const src = path.join(CI_SRC, entry);
+    const dest = path.join(ciDest, entry);
+
+    if (!fs.existsSync(src)) {
+      issues.push({ type: 'ci', entry, reason: 'source template missing from agent-infra' });
+      console.log(`   ❌ ${entry} — source template missing`);
+    } else if (!fs.existsSync(dest)) {
+      issues.push({ type: 'ci', entry, reason: 'missing — run agent-infra init' });
+      console.log(`   ❌ ${entry} — missing`);
+    } else {
+      const linkTarget = readlinkSafe(dest);
+      if (linkTarget === null) {
+        issues.push({ type: 'ci', entry, reason: 'local file (not symlinked) — run agent-infra update to restore' });
+        console.log(`   ⚠️  ${entry} — local file (not symlinked)`);
+      } else {
+        const resolved = path.resolve(path.dirname(dest), linkTarget);
+        if (resolved !== src) {
+          issues.push({ type: 'ci', entry, reason: `stale symlink: points to ${resolved}, expected ${src}` });
+          console.log(`   ⚠️  ${entry} — stale (→ ${linkTarget})`);
+        } else {
+          ok++;
+          console.log(`   ✅ ${entry} (${stack} stack)`);
+        }
+      }
+    }
+  }
+
+  return ok;
 }
 
 // ─── CLI entry ──────────────────────────────────────────────────────────────

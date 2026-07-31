@@ -1,0 +1,74 @@
+name: Python CI
+# Reusable workflow — Python CI (pytest, ruff, mypy)
+# Source: agent-infra/templates/.github/workflows/python-ci.yml
+# Called via: uses: daniel-ospina/agent-infra/.github/workflows/python-ci.yml@main
+# Symlinked from repos for `agent-infra check` drift detection.
+# Budget: PR-only (shared Actions budget under daniel-ospina account)
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        type: string
+        default: '3.11'
+      test-command:
+        type: string
+        default: 'python -m pytest tests/ -x --timeout=30 -q'
+      lint-command:
+        type: string
+        default: 'ruff check .'
+      typecheck-command:
+        type: string
+        default: ''
+      install-extras:
+        type: string
+        default: '.'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - run: pip install -e "${{ inputs.install-extras }}"
+      - run: pip install pytest pytest-timeout
+      - run: ${{ inputs.test-command }}
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - run: pip install ruff
+      - run: ${{ inputs.lint-command }}
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - run: pip install -e "${{ inputs.install-extras }}"
+      - run: pip install mypy
+      - name: Set typecheck target
+        run: |
+          if [ -n "${{ inputs.typecheck-command }}" ]; then
+            echo "TYPECHECK_CMD=${{ inputs.typecheck-command }}" >> $GITHUB_ENV
+          else
+            PKG=$(python3 -c "
+            import os
+            for d in sorted(os.listdir('.')):
+              if d.startswith('.') or d in ('tests','test','docs','scripts','dist','build','node_modules'):
+                continue
+              if os.path.isdir(d) and os.path.isfile(os.path.join(d,'__init__.py')):
+                print(d)
+                break
+            " 2>/dev/null)
+            echo "TYPECHECK_CMD=mypy ${PKG:-.} --ignore-missing-imports --check-untyped-defs" >> $GITHUB_ENV
+          fi
+      - run: ${{ env.TYPECHECK_CMD }}

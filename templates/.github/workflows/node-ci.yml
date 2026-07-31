@@ -1,0 +1,74 @@
+name: Node.js CI
+# Reusable workflow — Node.js CI (script validate, skill lint, typecheck, lint)
+# Source: agent-infra/templates/.github/workflows/node-ci.yml
+# Called via: uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
+# Symlinked from repos for `agent-infra check` drift detection.
+# Budget: PR-only (shared Actions budget under daniel-ospina account)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '22'
+
+jobs:
+  script-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Node.js scripts
+        run: |
+          errors=0
+          for f in scripts/*.{cjs,mjs,js} bin/*.js; do
+            [ -f "$f" ] || continue
+            echo "Checking $f..."
+            node --check "$f" || errors=$((errors+1))
+          done
+          if [ $errors -gt 0 ]; then
+            echo "❌ $errors script(s) failed validation"
+            exit 1
+          fi
+          echo "✅ All scripts validated"
+
+  skill-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate skill YAML frontmatter
+        run: |
+          if [ -f scripts/check-skill-lint.mjs ]; then
+            node scripts/check-skill-lint.mjs
+          else
+            echo "⚠️  scripts/check-skill-lint.mjs not found — skipping"
+          fi
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: TypeScript type check
+        run: |
+          if [ -f tsconfig.json ]; then
+            npx tsc --noEmit
+          else
+            echo "⚠️  No tsconfig.json — skipping typecheck"
+          fi
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: ESLint
+        run: |
+          if [ -f eslint.config.mjs ] || [ -f eslint.config.js ] || [ -f .eslintrc.js ] || [ -f .eslintrc.json ]; then
+            npx eslint .
+          else
+            echo "⚠️  No ESLint config found — skipping lint"
+          fi

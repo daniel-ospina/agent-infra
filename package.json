@@ -1,0 +1,13 @@
+{
+  "name": "agent-infra",
+  "version": "0.1.0",
+  "description": "Agent infrastructure bootstrap CLI — pi extensions, skills, scripts, CI templates",
+  "private": true,
+  "type": "commonjs",
+  "bin": {
+    "agent-infra": "./bin/agent-infra.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

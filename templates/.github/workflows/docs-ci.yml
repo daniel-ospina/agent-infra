@@ -1,0 +1,45 @@
+name: Docs CI
+# Reusable workflow — Documentation CI (markdownlint, lychee link check, frontmatter)
+# Source: agent-infra/templates/.github/workflows/docs-ci.yml
+# Called via: uses: daniel-ospina/agent-infra/.github/workflows/docs-ci.yml@main
+# Symlinked from repos for `agent-infra check` drift detection.
+# Budget: PR-only (shared Actions budget under daniel-ospina account)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '22'
+
+jobs:
+  markdownlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - run: npx markdownlint-cli '**/*.md' --ignore node_modules --ignore .git
+
+  link-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress './**/*.md'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  frontmatter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate doc frontmatter
+        run: |
+          if [ -f scripts/check-doc-affiliation.cjs ]; then
+            node scripts/check-doc-affiliation.cjs --all
+          else
+            echo "⚠️  scripts/check-doc-affiliation.cjs not found — skipping"
+          fi

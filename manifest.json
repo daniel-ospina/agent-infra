@@ -21,6 +21,15 @@
     "skills/": { "kind": "symlink", "essential": true },
     "scripts/": { "kind": "symlink", "essential": true },
     "templates/": { "kind": "copy", "essential": true },
-    "bin/": { "kind": "script", "essential": true }
+    "bin/": { "kind": "script", "essential": true },
+    "templates/.github/workflows/": {
+      "kind": "symlink",
+      "essential": false,
+      "entries": [
+        "python-ci.yml",
+        "node-ci.yml",
+        "docs-ci.yml"
+      ]
+    }
   }
 }
