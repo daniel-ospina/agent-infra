@@ -1,11 +1,16 @@
-name: CI
-# Documentation CI — markdownlint, lychee link check, frontmatter validation
-# Deployed as symlink from agent-infra/templates/.github/workflows/
-# To customize: rm this symlink and replace with a local file.
-# Budget: PR-only
+name: Docs CI
+# Reusable workflow — Documentation CI (markdownlint, lychee link check, frontmatter)
+# Source: agent-infra/templates/.github/workflows/docs-ci.yml
+# Called via: uses: daniel-ospina/agent-infra/.github/workflows/docs-ci.yml@main
+# Symlinked from repos for `agent-infra check` drift detection.
+# Budget: PR-only (shared Actions budget under daniel-ospina account)
 
 on:
-  pull_request:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '22'
 
 jobs:
   markdownlint:
@@ -14,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ inputs.node-version }}
       - run: npx markdownlint-cli '**/*.md' --ignore node_modules --ignore .git
 
   link-check:

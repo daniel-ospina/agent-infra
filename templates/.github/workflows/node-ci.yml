@@ -1,11 +1,16 @@
-name: CI
-# Node.js CI — script validate, skill lint, typecheck, lint
-# Deployed as symlink from agent-infra/templates/.github/workflows/
-# To customize: rm this symlink and replace with a local file.
-# Budget: PR-only
+name: Node.js CI
+# Reusable workflow — Node.js CI (script validate, skill lint, typecheck, lint)
+# Source: agent-infra/templates/.github/workflows/node-ci.yml
+# Called via: uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
+# Symlinked from repos for `agent-infra check` drift detection.
+# Budget: PR-only (shared Actions budget under daniel-ospina account)
 
 on:
-  pull_request:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '22'
 
 jobs:
   script-validate:
@@ -44,7 +49,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ inputs.node-version }}
       - name: TypeScript type check
         run: |
           if [ -f tsconfig.json ]; then
@@ -59,7 +64,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ inputs.node-version }}
       - name: ESLint
         run: |
           if [ -f eslint.config.mjs ] || [ -f eslint.config.js ] || [ -f .eslintrc.js ] || [ -f .eslintrc.json ]; then

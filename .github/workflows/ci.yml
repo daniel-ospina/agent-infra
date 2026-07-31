@@ -1,0 +1,11 @@
+name: CI
+# Thin caller — delegates to reusable workflow in agent-infra
+# Budget: PR-only (shared Actions budget under daniel-ospina account)
+
+on:
+  pull_request:
+
+jobs:
+  ci:
+    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
+    secrets: inherit

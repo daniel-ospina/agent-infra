@@ -6,7 +6,7 @@ type: engineering
 domain: capability
 doc_status: draft
 created: 2026-07-30
-updated: 2026-07-30
+updated: 2026-07-30 (hybrid: reusable workflows + symlinks)
 aboutSubjects: agent-infra
 aboutObjects: CI-templates
 ownedBy: organisation-design-team
@@ -17,7 +17,7 @@ governingAgreement: eldato#7535
 
 > **Epic:** [#7535](https://github.com/lil-lawyer/eldato/issues/7535) — Agent process infrastructure for epistemic repos
 > **Phase:** 3 (replaces ad-hoc CI)
-> **Design Direction (LOCKED):** CI templates live in `agent-infra/templates/.github/workflows/`, deployed via **symlinks** (same pattern as extensions and skills). Repos that need custom CI replace the symlink with a local file. `agent-infra check` warns on divergence.
+> **Design Direction (LOCKED):** Hybrid approach — CI execution via **GitHub reusable workflows** (`on: workflow_call`) hosted in `agent-infra/.github/workflows/`, called by thin `ci.yml` callers in each repo. Templates live in `agent-infra/templates/.github/workflows/` and are **symlinked** into each repo for `agent-infra check` drift detection (same pattern as extensions and skills). Local dev/check uses symlinks; CI execution uses reusable workflows.
 
 ---
 
@@ -56,18 +56,59 @@ The root cause isn't duplication (only ~60 lines total across 2 repos testing en
 
 ## Solution Design
 
-### Deployment Pattern: SYMLINK
+### Hybrid Architecture: Reusable Workflows + Symlinks
 
-CI templates are deployed as symlinks — same mechanism as extensions and skills:
+Two mechanisms serve two different purposes:
 
-| Manifest Entry | Source | Destination | Kind |
-|---------------|--------|-------------|------|
-| `extensions/` | `agent-infra/extensions/` | `~/.pi/agent/extensions/` | symlink |
-| `skills/` | `agent-infra/skills/` | `~/.pi/agent/skills/` | symlink |
-| `scripts/` | `agent-infra/scripts/` | `<repo>/scripts/` | symlink |
-| **`templates/.github/workflows/`** | **`agent-infra/templates/.github/workflows/`** | **`<repo>/.github/workflows/`** | **symlink** |
+| Purpose | Mechanism | Files |
+|---------|-----------|-------|
+| **CI execution** (GitHub Actions) | Reusable workflows (`on: workflow_call`) | `agent-infra/.github/workflows/*.yml` |
+| **Local drift detection** (`agent-infra check`) | Symlinks | `<repo>/.github/workflows/<stack>-ci.yml` → `agent-infra/templates/.github/workflows/` |
 
-**Key property:** Updates to `agent-infra/templates/.github/workflows/python-ci.yml` propagate to ALL Python repos automatically on next CI run. No manual sync. `agent-infra update` refreshes broken symlinks.
+**How it works:**
+
+1. **Reusable workflows** live at `agent-infra/.github/workflows/python-ci.yml`, `node-ci.yml`, `docs-ci.yml` — exposed via `on: workflow_call` with per-stack inputs.
+2. Each consumer repo has a **thin `ci.yml` caller**:
+   ```yaml
+   # tortoise/.github/workflows/ci.yml
+   on: pull_request:
+   jobs:
+     ci:
+       uses: daniel-ospina/agent-infra/.github/workflows/python-ci.yml@main
+       with:
+         python-version: '3.11'
+       secrets: inherit
+   ```
+3. Each consumer repo ALSO has a **symlink** from `<stack>-ci.yml` → `agent-infra/templates/.github/workflows/<stack>-ci.yml` for `agent-infra check` drift detection.
+4. The reusable workflows in `agent-infra/.github/workflows/` are themselves symlinked to `templates/.github/workflows/` — a single source of truth.
+
+**Key properties:**
+- Template updates to `agent-infra/templates/.github/workflows/` propagate to reusable workflows immediately (same file via symlink).
+- Consumer repos pull the reusable workflow at CI runtime — no stale copy problem.
+- `agent-infra check` still uses the symlinks for local drift detection.
+- `agent-infra update` refreshes broken symlinks.
+
+**File layout:**
+```
+agent-infra/
+├── templates/.github/workflows/    ← Source of truth (reusable workflow definitions)
+│   ├── python-ci.yml
+│   ├── node-ci.yml
+│   └── docs-ci.yml
+├── .github/workflows/              ← Reusable workflows (symlinked to templates)
+│   ├── python-ci.yml → ../../templates/.github/workflows/python-ci.yml
+│   ├── node-ci.yml → ../../templates/.github/workflows/node-ci.yml
+│   ├── docs-ci.yml → ../../templates/.github/workflows/docs-ci.yml
+│   └── ci.yml                      ← Thin caller for agent-infra's own CI
+
+tortoise/.github/workflows/
+├── ci.yml                          ← Thin caller: uses: agent-infra/.github/workflows/python-ci.yml@main
+└── python-ci.yml → ../../../agent-infra/templates/.github/workflows/python-ci.yml  (symlink for check)
+
+premise-labs/.github/workflows/
+├── ci.yml                          ← Thin caller: uses: agent-infra/.github/workflows/docs-ci.yml@main
+└── docs-ci.yml → ../../../../agent-infra/templates/.github/workflows/docs-ci.yml    (symlink for check)
+```
 
 ### Divergence Model
 
@@ -85,15 +126,18 @@ cp $AGENT_INFRA_PATH/templates/.github/workflows/python-ci.yml .github/workflows
 ⚠️  python-ci.yml — local file (not symlinked). Run `agent-infra update` to restore.
 ```
 
-### Why Symlinks, Not Copies
+### Why Hybrid
 
-| Criterion | Copy-once (previous) | Symlink (current) |
-|-----------|---------------------|-------------------|
-| Template updates propagate | ❌ Manual `check` warns only | ✅ Automatic — same file |
-| Repos fork on customization | ✅ Edit local copy | ✅ Replace symlink with local file |
-| Matches extensions/skills pattern | ❌ Different mechanism | ✅ Same mechanism |
-| `agent-infra update` behavior | Preserve local (never overwrite) | Refresh symlink |
-| Divergence detection | Content comparison (fragile) | `lstat` check (reliable) |
+| Criterion | Pure Symlinks (v1) | Hybrid (current) |
+|-----------|-------------------|-------------------|
+| Template updates propagate | ✅ Automatic on CI run (same file) | ✅ Automatic — reusable workflow always fetches `@main` |
+| Works on CI runners (cross-repo) | ❌ Dangling symlinks — agent-infra not cloned | ✅ Reusable workflow resolved by GitHub Actions |
+| Local drift detection | ✅ `agent-infra check` via `lstat` | ✅ Same |
+| Repos fork on customization | ✅ Replace symlink with local file | ✅ Replace thin caller + fork template |
+| Matches extensions/skills pattern | ✅ Same mechanism | ✅ Same mechanism for checking |
+| `agent-infra update` behavior | Refresh symlink | Refresh symlink + template stays source of truth |
+| Divergence detection | `lstat` check (reliable) | `lstat` check (reliable) |
+| Input parameterization | ❌ Hardcoded in template | ✅ `workflow_call` inputs per repo |
 
 ### Template Structure
 
@@ -209,195 +253,23 @@ Check categories:
 
 ## Implementation Plan
 
-### Step 1: Create CI templates in agent-infra
+### Step 1: Convert templates to reusable workflows
 
-**Files to create:**
+Convert the 3 templates in `agent-infra/templates/.github/workflows/` to use `on: workflow_call` with input parameters. These become the source of truth for both reusable workflow execution and symlinked drift detection.
+
+**Files to convert:**
 
 ```
 agent-infra/templates/.github/
 └── workflows/
-    ├── README.md
-    ├── python-ci.yml
-    ├── node-ci.yml
-    └── docs-ci.yml
+    ├── python-ci.yml    ← on: workflow_call (was: on: pull_request)
+    ├── node-ci.yml      ← on: workflow_call
+    └── docs-ci.yml      ← on: workflow_call
 ```
 
-**`python-ci.yml`:**
-```yaml
-name: CI
-# Python CI — pytest, ruff, mypy
-# Deployed as symlink from agent-infra/templates/.github/workflows/
-# To customize: rm this symlink and replace with a local file.
-# Budget: PR-only
+See actual template files for current content — they define `workflow_call` inputs for `python-version`, `test-command`, `lint-command`, `typecheck-command`, `install-extras`, and `node-version`.
 
-on:
-  pull_request:
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install -e "."
-      - run: pip install pytest pytest-timeout
-      - run: python -m pytest tests/ -x --timeout=30 -q
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install ruff
-      - run: ruff check .
-
-  typecheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install -e "."
-      - run: pip install mypy
-      - name: Detect package
-        run: |
-          PKG=$(python3 -c "
-          import os
-          # Find first top-level package dir with __init__.py
-          for d in sorted(os.listdir('.')):
-            if d.startswith('.') or d in ('tests','test','docs','scripts','dist','build','node_modules'):
-              continue
-            if os.path.isdir(d) and os.path.isfile(os.path.join(d,'__init__.py')):
-              print(d)
-              break
-          " 2>/dev/null)
-          echo "MYPY_TARGET=${PKG:-.}" >> $GITHUB_ENV
-      - run: mypy $MYPY_TARGET --ignore-missing-imports --check-untyped-defs
-```
-
-**`node-ci.yml`:**
-```yaml
-name: CI
-# Node.js CI — script validate, skill lint, typecheck, lint
-# Deployed as symlink from agent-infra/templates/.github/workflows/
-# To customize: rm this symlink and replace with a local file.
-# Budget: PR-only
-
-on:
-  pull_request:
-
-jobs:
-  script-validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Validate Node.js scripts
-        run: |
-          errors=0
-          for f in scripts/*.{cjs,mjs,js} bin/*.js; do
-            [ -f "$f" ] || continue
-            echo "Checking $f..."
-            node --check "$f" || errors=$((errors+1))
-          done
-          if [ $errors -gt 0 ]; then
-            echo "❌ $errors script(s) failed validation"
-            exit 1
-          fi
-          echo "✅ All scripts validated"
-
-  skill-lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Validate skill YAML frontmatter
-        run: |
-          if [ -f scripts/check-skill-lint.mjs ]; then
-            node scripts/check-skill-lint.mjs
-          else
-            echo "⚠️  scripts/check-skill-lint.mjs not found — skipping"
-          fi
-
-  typecheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: TypeScript type check
-        run: |
-          if [ -f tsconfig.json ]; then
-            npx tsc --noEmit
-          else
-            echo "⚠️  No tsconfig.json — skipping typecheck"
-          fi
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: ESLint
-        run: |
-          if [ -f eslint.config.mjs ] || [ -f eslint.config.js ] || [ -f .eslintrc.js ] || [ -f .eslintrc.json ]; then
-            npx eslint .
-          else
-            echo "⚠️  No ESLint config found — skipping lint"
-          fi
-```
-
-**`docs-ci.yml`:**
-```yaml
-name: CI
-# Documentation CI — markdownlint, lychee link check, frontmatter validation
-# Deployed as symlink from agent-infra/templates/.github/workflows/
-# To customize: rm this symlink and replace with a local file.
-# Budget: PR-only
-
-on:
-  pull_request:
-
-jobs:
-  markdownlint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: npx markdownlint-cli '**/*.md' --ignore node_modules --ignore .git
-
-  link-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: lycheeverse/lychee-action@v2
-        with:
-          args: --no-progress './**/*.md'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  frontmatter:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Validate doc frontmatter
-        run: |
-          if [ -f scripts/check-doc-affiliation.cjs ]; then
-            node scripts/check-doc-affiliation.cjs --all
-          else
-            echo "⚠️  scripts/check-doc-affiliation.cjs not found — skipping"
-          fi
-```
-
-### Step 2: Update manifest.json
+### (Reference) Update manifest.json
 
 Add `templates/.github/workflows/` section with `kind: symlink`:
 
@@ -427,7 +299,18 @@ Add `templates/.github/workflows/` section with `kind: symlink`:
 }
 ```
 
-### Step 3: Update agent-infra.js
+### Step 2: Expose reusable workflows in agent-infra/.github/workflows/
+
+Symlink from `agent-infra/.github/workflows/` to `templates/.github/workflows/` so GitHub Actions can resolve `uses: daniel-ospina/agent-infra/.github/workflows/*@main`:
+
+```bash
+cd agent-infra/.github/workflows/
+ln -s ../../templates/.github/workflows/python-ci.yml python-ci.yml
+ln -s ../../templates/.github/workflows/docs-ci.yml docs-ci.yml
+# node-ci.yml already symlinked
+```
+
+### (Reference) Update agent-infra.js
 
 Add symlink handling for CI workflows in `cmdInit`, `cmdUpdate`, `cmdCheck`.
 
@@ -554,45 +437,43 @@ if (ciManifest && ciManifest.kind === 'symlink' && Array.isArray(ciManifest.entr
 }
 ```
 
-### Step 4: Replace tortoise CI with symlink
+### Step 4: Create thin callers + symlinks in consumer repos
 
-```bash
-rm /Users/home/tortoise/.github/workflows/ci.yml
-ln -s ../../../agent-infra/templates/.github/workflows/python-ci.yml \
-  /Users/home/tortoise/.github/workflows/python-ci.yml
+**tortoise:** Create `ci.yml` (thin caller) + keep `python-ci.yml` symlink:
+```yaml
+# tortoise/.github/workflows/ci.yml
+on: pull_request:
+jobs:
+  ci:
+    uses: daniel-ospina/agent-infra/.github/workflows/python-ci.yml@main
+    with:
+      python-version: '3.11'
+    secrets: inherit
 ```
 
-tortoise's pyproject.toml already has `[tool.ruff]` and `[tool.mypy]` config. The template's auto-detection finds the `tortoise/` package dir.
-
-### Step 5: Replace agent-infra CI with symlink
-
-```bash
-rm /Users/home/agent-infra/.github/workflows/ci.yml
-ln -s ../../templates/.github/workflows/node-ci.yml \
-  /Users/home/agent-infra/.github/workflows/node-ci.yml
+**agent-infra:** Create `ci.yml` (thin caller) + keep `node-ci.yml` symlink:
+```yaml
+# agent-infra/.github/workflows/ci.yml
+on: pull_request:
+jobs:
+  ci:
+    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
+    secrets: inherit
 ```
 
-**Self-referential — relative within same repo:** agent-infra's own CI becomes template-driven. The relative symlink `../../templates/.github/workflows/node-ci.yml` resolves correctly within the checkout on any machine (including CI runners).
-
-### Step 6: Deploy CI to premise-labs
-
-```bash
-mkdir -p /Users/home/eldato/eldato-epistemic/premise-labs/.github/workflows/
-ln -s ../../../../../agent-infra/templates/.github/workflows/docs-ci.yml \
-  /Users/home/eldato/eldato-epistemic/premise-labs/.github/workflows/docs-ci.yml
+**premise-labs:** Replace `ci.yml` with thin caller + create `docs-ci.yml` symlink:
+```yaml
+# premise-labs/.github/workflows/ci.yml
+on: pull_request:
+jobs:
+  ci:
+    uses: daniel-ospina/agent-infra/.github/workflows/docs-ci.yml@main
+    secrets: inherit
 ```
 
-### Step 7: Test
+### Step 5: Commit and push
 
-```bash
-agent-infra check /Users/home/tortoise       # ✅ python-ci.yml
-agent-infra check /Users/home/agent-infra    # ✅ node-ci.yml (self-referential)
-agent-infra check /Users/home/eldato/eldato-epistemic/premise-labs  # ✅ docs-ci.yml
-```
-
-### Step 8: Commit and push
-
-All changes in a single commit across all 3 repos + agent-infra.
+All changes across all 3 repos + agent-infra, committed and pushed to their respective feature branches.
 
 ---
 
@@ -605,7 +486,7 @@ All changes in a single commit across all 3 repos + agent-infra.
 | **Billing pause kills CI** | Medium | Templates are authoring work — zero runtime dependency. `agent-infra check` works offline. |
 | **Repos fork and never re-align** | Medium | `agent-infra check` warns. `agent-infra update` only restores if local file was deleted first (won't destroy local changes). |
 | **Self-referencing symlink (agent-infra)** — relative vs absolute | Low | Relative symlink `../../templates/.github/workflows/node-ci.yml` resolves correctly within checkout on any machine. Tested locally + CI-ready. |
-| **Cross-repo symlinks (tortoise, premise-labs)** — dangling on CI runners | Medium | Accepted limitation. Symlinks resolve locally for `agent-infra check`. On CI runners, GitHub Actions only clones the target repo — agent-infra is not available. Future: add agent-infra checkout step to templates or convert to copy-on-sync. |
+| **Cross-repo symlinks (tortoise, premise-labs)** — dangling on CI runners | N/A | **Resolved.** Symlinks are used ONLY for local `agent-infra check` drift detection. Actual CI execution goes through reusable workflows (`uses: daniel-ospina/agent-infra/.github/workflows/*@main`), which GitHub Actions resolves independently. |
 
 ---
 
@@ -613,13 +494,16 @@ All changes in a single commit across all 3 repos + agent-infra.
 
 | Touch Point | Type | Covered By | Status |
 |-------------|------|------------|--------|
-| `agent-infra/templates/.github/workflows/` | Template source | Step 1 (create templates) | ✅ |
-| `agent-infra/manifest.json` | Config | Step 2 (add symlink entries) | ✅ |
-| `agent-infra/bin/agent-infra.js` | Bootstrap code | Step 3 (init/update/check) | ✅ |
-| `tortoise/.github/workflows/python-ci.yml` | Symlink target | Step 4 | ✅ |
-| `agent-infra/.github/workflows/node-ci.yml` | Symlink target | Step 5 (self-referencing) | ✅ |
-| `premise-labs/.github/workflows/docs-ci.yml` | Symlink target | Step 6 (greenfield) | ✅ |
-| `agent-infra check` | Drift detection | Step 7 (test) | ✅ |
+| `agent-infra/templates/.github/workflows/` | Reusable workflow source | Step 1 (convert to workflow_call) | ✅ |
+| `agent-infra/.github/workflows/python-ci.yml` | Reusable workflow (symlink to templates) | Step 2 (create symlinks) | ✅ |
+| `agent-infra/.github/workflows/node-ci.yml` | Reusable workflow (symlink to templates) | Already existed | ✅ |
+| `agent-infra/.github/workflows/docs-ci.yml` | Reusable workflow (symlink to templates) | Step 2 (create symlinks) | ✅ |
+| `agent-infra/.github/workflows/ci.yml` | Thin caller (agent-infra self-CI) | Step 4 | ✅ |
+| `tortoise/.github/workflows/ci.yml` | Thin caller | Step 4 | ✅ |
+| `tortoise/.github/workflows/python-ci.yml` | Symlink for check | Already existed | ✅ |
+| `premise-labs/.github/workflows/ci.yml` | Thin caller | Step 4 | ✅ |
+| `premise-labs/.github/workflows/docs-ci.yml` | Symlink for check | Step 4 | ✅ |
+| `agent-infra check` | Drift detection | Step 5 (test) | ✅ |
 | GitHub Actions billing | Cost | Assumed available | ⚠️ |
 
 ---
@@ -628,7 +512,7 @@ All changes in a single commit across all 3 repos + agent-infra.
 
 | Alternative | Why Rejected |
 |-------------|-------------|
-| **Reusable workflows** (`uses: org/repo/.github/workflows/ci.yml@v1`) | Requires public/internal repo; couples all repos to single version; doesn't match agent-infra pattern (symlinks). |
+| **Pure symlinks only** (original design) | Cross-repo symlinks are dangling on CI runners — agent-infra is not cloned. Reusable workflows solve this by having GitHub Actions resolve the workflow at runtime. |
 | **Copy-once-preserve-local** (original design) | Template fixes never propagate; requires content-comparison drift detection (fragile); different mechanism than extensions/skills. |
 | **Single parameterized template** with `workflow_call` inputs | Over-engineered for 3 stacks with ~30 lines each. |
 | **Monorepo CI** | Doesn't match the repo structure — repos are independent with different stacks. |
