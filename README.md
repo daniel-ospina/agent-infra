@@ -1,6 +1,6 @@
 # agent-infra
 
-Centralized agent infrastructure for Premise Labs repos. Extensions, skills, and scripts used by `tortoise`, `premise-labs`, and `eldato`.
+Centralized agent infrastructure for Premise Labs repos. Extensions, skills, and scripts used by `tortoise`, `premise-labs`, and `eldato` (El Dato main app).
 
 ## Structure
 
@@ -28,7 +28,11 @@ npx agent-infra init
 
 Update agent-infra, then run `agent-infra update` in each product repo. Pre-commit hook blocks commits if version is stale.
 
-## Syncing to product repos
-Run `./sync-all` to propagate changes to all repos.
-Run `./sync tortoise` to sync a single repo.
+To propagate changes to all repos:
+```bash
+./sync-all              # all repos
+./sync tortoise         # single repo
+./sync premise-labs     # single repo
+./sync eldato           # single repo
+```
 Each repo's pre-commit hook warns if it's behind.
