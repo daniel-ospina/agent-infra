@@ -437,16 +437,27 @@ export default function (pi: ExtensionAPI) {
         // Extract file list and project root from the prompt
         // Format: "[VGATE] verify files: path1 path2. Classification: ... Project root: /path"
         const fileMatch = prompt.match(/verify files:\s*(.+?)(?=\.\s+Classification:|\.\s+Project root:|$)/);
-        const promptFiles = fileMatch
-          ? fileMatch[1].split(/\s+/).filter(f => f.includes('.'))
-          : [];
+        const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
+        // Expand directory paths: if a path ends with / or doesn't contain a dot,
+        // treat it as a directory and include all staged files under that directory.
+        const promptFiles = new Set<string>();
+        for (const f of rawFiles) {
+          const isDir = f.endsWith('/') || !f.includes('.');
+          if (isDir && lastBlockedFiles.length > 0) {
+            for (const blocked of lastBlockedFiles) {
+              if (blocked.startsWith(f)) promptFiles.add(blocked);
+            }
+          } else {
+            promptFiles.add(f);
+          }
+        }
         const projectRoot = resolveProjectRoot(lastBlockedCwd, prompt);
 
         // #5673: filter to only files in the blocked diff (not full repo scan)
         const blockedSet = new Set(lastBlockedFiles);
         const filteredPromptFiles = lastBlockedFiles.length > 0
-          ? promptFiles.filter(f => blockedSet.has(f))
-          : promptFiles;
+          ? [...promptFiles].filter(f => blockedSet.has(f))
+          : [...promptFiles];
         let merged = 0;
         for (const file of filteredPromptFiles) {
           try {
@@ -458,12 +469,12 @@ export default function (pi: ExtensionAPI) {
             // file may not exist at expected path — skip
           }
         }
-        const skipped = promptFiles.length - filteredPromptFiles.length;
+        const skipped = promptFiles.size - filteredPromptFiles.length;
         if (merged > 0) {
-          console.error(`[verification-gate] ✅ Plain-text PASS — merged ${merged}/${promptFiles.length} files from prompt${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
+          console.error(`[verification-gate] ✅ Plain-text PASS — merged ${merged}/${promptFiles.size} files from prompt${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
           writeBridge(resolveProjectRoot(lastBlockedCwd, prompt), Array.from(verifiedSet.keys()));
         } else {
-          console.error(`[verification-gate] ⚠️ Plain-text PASS but could not hash any files (${promptFiles.length} in prompt)`);
+          console.error(`[verification-gate] ⚠️ Plain-text PASS but could not hash any files (${promptFiles.size} in prompt)`);
         }
         lastBlockedCwd = null; // consume: avoid stale cwd shadowing a later manual verifier dispatch (#5607)
         return undefined;
@@ -474,10 +485,19 @@ export default function (pi: ExtensionAPI) {
       // and mark them as verified anyway. Better to allow the commit than
       // block on a model JSON-compliance issue (#5724).
       const fileMatch = prompt.match(/verify files:\s*(.+?)(?=\.\s+Classification:|\.\s+Project root:|$)/);
-      const promptFiles = fileMatch
-        ? fileMatch[1].split(/\s+/).filter(f => f.includes('.'))
-        : [];
-      if (promptFiles.length > 0) {
+      const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
+      const promptFiles = new Set<string>();
+      for (const f of rawFiles) {
+        const isDir = f.endsWith('/') || !f.includes('.');
+        if (isDir && lastBlockedFiles.length > 0) {
+          for (const blocked of lastBlockedFiles) {
+            if (blocked.startsWith(f)) promptFiles.add(blocked);
+          }
+        } else {
+          promptFiles.add(f);
+        }
+      }
+      if (promptFiles.size > 0) {
         const projectRoot = resolveProjectRoot(lastBlockedCwd, prompt);
         let merged = 0;
         for (const file of promptFiles) {
@@ -488,7 +508,7 @@ export default function (pi: ExtensionAPI) {
           } catch { /* file may not exist at expected path */ }
         }
         if (merged > 0) {
-          console.error(`[verification-gate] ⚠️ Verifier unparseable — fail-open: merged ${merged}/${promptFiles.length} files from prompt`);
+          console.error(`[verification-gate] ⚠️ Verifier unparseable — fail-open: merged ${merged}/${promptFiles.size} files from prompt`);
           writeBridge(resolveProjectRoot(lastBlockedCwd, prompt), Array.from(verifiedSet.keys()));
           vgateFailures = 0;
           lastBlockedCwd = null;
@@ -506,10 +526,19 @@ export default function (pi: ExtensionAPI) {
       // Verifier sub-agents often return {"status":"PASS"} without the full schema.
       if ((result as any).status === "PASS") {
         const fileMatch = prompt.match(/verify files:\s*(.+?)(?=\.\s+Classification:|\.\s+Project root:|$)/);
-        const promptFiles = fileMatch
-          ? fileMatch[1].split(/\s+/).filter((f: string) => f.includes('.'))
-          : [];
-        if (promptFiles.length > 0) {
+        const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
+        const promptFiles = new Set<string>();
+        for (const f of rawFiles) {
+          const isDir = f.endsWith('/') || !f.includes('.');
+          if (isDir && lastBlockedFiles.length > 0) {
+            for (const blocked of lastBlockedFiles) {
+              if (blocked.startsWith(f)) promptFiles.add(blocked);
+            }
+          } else {
+            promptFiles.add(f);
+          }
+        }
+        if (promptFiles.size > 0) {
           const fallbackRoot = resolveProjectRoot(lastBlockedCwd, prompt);
           let merged = 0;
           for (const file of promptFiles) {
@@ -520,7 +549,7 @@ export default function (pi: ExtensionAPI) {
             } catch { /* skip */ }
           }
           if (merged > 0) {
-            console.error(`[verification-gate] ✅ Schema-invalid PASS — merged ${merged}/${promptFiles.length} files via prompt fallback (${verifiedSet.size} total)`);
+            console.error(`[verification-gate] ✅ Schema-invalid PASS — merged ${merged}/${promptFiles.size} files via prompt fallback (${verifiedSet.size} total)`);
             const verifiedPaths = Array.from(verifiedSet.keys());
             writeBridge(fallbackRoot, verifiedPaths);
             vgateFailures = 0;
