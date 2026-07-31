@@ -1,0 +1,54 @@
+name: CI
+# Python CI — pytest, ruff, mypy
+# Deployed as symlink from agent-infra/templates/.github/workflows/
+# To customize: rm this symlink and replace with a local file.
+# Budget: PR-only
+
+on:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -e "."
+      - run: pip install pytest pytest-timeout
+      - run: python -m pytest tests/ -x --timeout=30 -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install ruff
+      - run: ruff check .
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -e "."
+      - run: pip install mypy
+      - name: Detect package
+        run: |
+          PKG=$(python3 -c "
+          import os
+          # Find first top-level package dir with __init__.py
+          for d in sorted(os.listdir('.')):
+            if d.startswith('.') or d in ('tests','test','docs','scripts','dist','build','node_modules'):
+              continue
+            if os.path.isdir(d) and os.path.isfile(os.path.join(d,'__init__.py')):
+              print(d)
+              break
+          " 2>/dev/null)
+          echo "MYPY_TARGET=${PKG:-.}" >> $GITHUB_ENV
+      - run: mypy $MYPY_TARGET --ignore-missing-imports --check-untyped-defs

@@ -1,0 +1,40 @@
+name: CI
+# Documentation CI — markdownlint, lychee link check, frontmatter validation
+# Deployed as symlink from agent-infra/templates/.github/workflows/
+# To customize: rm this symlink and replace with a local file.
+# Budget: PR-only
+
+on:
+  pull_request:
+
+jobs:
+  markdownlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npx markdownlint-cli '**/*.md' --ignore node_modules --ignore .git
+
+  link-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress './**/*.md'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  frontmatter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate doc frontmatter
+        run: |
+          if [ -f scripts/check-doc-affiliation.cjs ]; then
+            node scripts/check-doc-affiliation.cjs --all
+          else
+            echo "⚠️  scripts/check-doc-affiliation.cjs not found — skipping"
+          fi
