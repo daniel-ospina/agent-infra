@@ -135,6 +135,14 @@ function loadManifest() {
 function cmdInit(targetDir) {
   targetDir = path.resolve(targetDir);
 
+  // ── Prerequisite: warn if AGENT_INFRA_PATH not explicitly set ──
+  if (!process.env.AGENT_INFRA_PATH) {
+    console.warn('⚠️  AGENT_INFRA_PATH is not set in your environment.');
+    console.warn('   Add to your shell profile (~/.zshrc): export AGENT_INFRA_PATH=/path/to/agent-infra');
+    console.warn('   Falling back to auto-detected path: ' + AGENT_INFRA_PATH);
+    console.warn('');
+  }
+
   if (!fs.existsSync(targetDir)) {
     console.error(`❌ Target directory does not exist: ${targetDir}`);
     process.exit(1);

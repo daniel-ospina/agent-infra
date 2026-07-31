@@ -14,10 +14,31 @@ agent-infra/
 └── bin/           → agent-infra CLI
 ```
 
-## Bootstrap a repo
+## Prerequisites
+
+**`AGENT_INFRA_PATH` must be set** before using any agent-infra tooling. The auto-sync extension, pre-commit hook, and bootstrap CLI all depend on it.
+
+Add this to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.):
 
 ```bash
 export AGENT_INFRA_PATH=/path/to/agent-infra
+```
+
+Verify it's set:
+```bash
+echo $AGENT_INFRA_PATH
+```
+
+## Bootstrap a repo
+
+```bash
+# 1. Link the CLI (from the agent-infra directory)
+cd $AGENT_INFRA_PATH && npm link
+
+# 2. Ensure AGENT_INFRA_PATH is set (see Prerequisites above)
+export AGENT_INFRA_PATH=/path/to/agent-infra
+
+# 3. Run init from the target repo
 cd <target-repo>
 npx agent-infra init
 ```

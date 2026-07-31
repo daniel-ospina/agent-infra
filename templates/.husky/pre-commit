@@ -37,4 +37,7 @@ check_version() {
 
 check_version
 
-npx lint-staged
+# Only run lint-staged if this is a Node.js project (has package.json)
+if [ -f package.json ] && command -v npx >/dev/null 2>&1; then
+  npx lint-staged
+fi
