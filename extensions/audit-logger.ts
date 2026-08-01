@@ -1,7 +1,7 @@
 // audit-logger.ts — logs every tool call to ~/.pi/agent/audit/audit.jsonl (#5561)
 // Enables post-hoc verification: was SKILL.md read before the corresponding operation?
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";

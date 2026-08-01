@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { symlinkSync, readdirSync, existsSync, mkdirSync, unlinkSync, lstatSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";

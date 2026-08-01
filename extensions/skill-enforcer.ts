@@ -1,8 +1,8 @@
 // skill-enforcer.ts — blocks git/MCP ops unless relevant skill was read.
 // AGENTS.md §Skill Reading Protocol enforcement.
 
-import type { ExtensionAPI, ToolCallEventResult } from "@mariozechner/pi-coding-agent";
-import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";

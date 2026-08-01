@@ -3,9 +3,9 @@
 // 3 modes: warn (log) | gate (block destructive) | strict (block all non-expected).
 // Kill switch: /tmp/agent-state-machine.kill or AGENT_STATE_MACHINE env var.
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
-import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";

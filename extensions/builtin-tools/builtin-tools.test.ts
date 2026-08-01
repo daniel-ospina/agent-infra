@@ -6,7 +6,7 @@
  *
  * Run: npx tsx operations/pi-config/extensions/builtin-tools/builtin-tools.test.ts
  *
- * NOTE: Requires mocks at node_modules/@mariozechner/pi-coding-agent and
+ * NOTE: Requires mocks at node_modules/@earendil-works/pi-coding-agent and
  * node_modules/typebox. Created by CI setup or manually.
  */
 

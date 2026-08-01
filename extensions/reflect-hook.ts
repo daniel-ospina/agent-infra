@@ -3,7 +3,7 @@
 // Auto-skip: reflect.py --auto suppresses routine sessions (≤1 PR, 0 friction).
 // Non-blocking: subprocess detached, session closes regardless of exit code.
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn, execSync } from "node:child_process";
 import { writeFileSync, mkdtempSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";

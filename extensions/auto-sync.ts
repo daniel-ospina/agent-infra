@@ -2,7 +2,7 @@
 // Checks .agent-infra-version against $AGENT_INFRA_PATH/manifest.json.
 // Warns if behind; silent if current. Does NOT auto-apply changes.
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
