@@ -147,19 +147,25 @@ agent-infra/skills/test-writing/SKILL.md  ←→ same inode, same bytes →  eld
 
 ### Creating a Shared Skill
 
+**Option A — Directory symlink (preferred, used by 91/95 skills):**
 1. **Create in agent-infra:** Write `agent-infra/skills/<name>/SKILL.md` following all conventions above.
-2. **Hard-link into consumers:**
+2. **Symlink directory into consumer:**
+   ```bash
+   # In each consuming repo:
+   rm -rf operations/skills/<name>
+   ln -s /path/to/agent-infra/skills/<name> operations/skills/<name>
+   ```
+3. **Commit:** Changes committed to agent-infra take effect immediately in consumers (git can't track behind symlinks).
+
+**Option B — Real directory with hard-linked files (used by ~4 skills):**
+1. **Create in agent-infra:** Same as above.
+2. **Hard-link into consumer:**
    ```bash
    # In each consuming repo:
    mkdir -p operations/skills/<name>
-   ln agent-infra/skills/<name>/SKILL.md operations/skills/<name>/SKILL.md
+   ln -f agent-infra/skills/<name>/SKILL.md operations/skills/<name>/SKILL.md
    ```
-3. **Verify:** Both paths must share the same inode:
-   ```bash
-   ls -li agent-infra/skills/<name>/SKILL.md operations/skills/<name>/SKILL.md
-   # Inode numbers must match
-   ```
-4. **Commit both repos:** The skill content is identical (same bytes), but both repos need to track the file.
+3. **Commit both repos:** Hard links share the same inode — both gits track the identical file.
 
 ### Creating a Product-Specific Skill
 

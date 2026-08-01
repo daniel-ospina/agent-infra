@@ -367,8 +367,13 @@ for FILE in $(echo "$STAGED" | grep -E '\.(test|spec|e2e)\.(ts|tsx)$|\.pg$|\.py$
   # Skip deleted files
   git diff --cached --diff-filter=D -- "$FILE" | grep -q . && continue
   
-  ABS_PATH=$(realpath "$FILE")
-  HASH_FILE="$HOME/.pi/agent/test-review/$(echo -n "$ABS_PATH" | sha256sum | cut -d' ' -f1).json"
+  ABS_PATH=$(realpath "$FILE" 2>/dev/null || readlink -f "$FILE" 2>/dev/null || echo "$FILE")
+  if command -v sha256sum >/dev/null 2>&1; then
+    FILE_HASH=$(echo -n "$ABS_PATH" | sha256sum | cut -d' ' -f1)
+  else
+    FILE_HASH=$(echo -n "$ABS_PATH" | shasum -a 256 | cut -d' ' -f1)
+  fi
+  HASH_FILE="$HOME/.pi/agent/test-review/${FILE_HASH}.json"
   
   if [ ! -f "$HASH_FILE" ]; then
     echo "⛔ BLOCKED: test-review never completed for $FILE"
