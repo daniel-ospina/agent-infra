@@ -53,7 +53,7 @@ function restorePersistedReads(): void {
         restored++;
       }
     }
-    if (restored > 0) console.error(`[skill-enforcer] 📂 Restored ${restored} skill reads from previous session`);
+    if (restored > 0) console.log(`[skill-enforcer] 📂 Restored ${restored} skill reads from previous session`);
   } catch { /* best-effort */ }
 }
 
@@ -135,7 +135,7 @@ function logNudgeEvent(type: "fired" | "complied" | "bypassed" | "blocked", skil
     bypassCount: count,
     timestamp: new Date().toISOString(),
   });
-  console.error(`[skill-enforcer] 📊 ${event}`);
+  console.log(`[skill-enforcer] 📊 ${event}`);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -146,7 +146,7 @@ export default function (pi: ExtensionAPI) {
     pendingNudges.length = 0;
     // ponytail: AGENT_ALLOW_MAIN_EDITS / ELDATO_ALLOW_MAIN_EDITS also bypasses skill-enforcer (not just worktree-guard), #7470 / #7549
     if (_isBypassEnv()) {
-      console.error(`[skill-enforcer] ⏸️  Disabled`);
+      console.log(`[skill-enforcer] ⏸️  Disabled`);
     }
   });
 
@@ -187,7 +187,7 @@ export default function (pi: ExtensionAPI) {
       const file = `${SKILLS_PREFIX}${skillName}/SKILL.md`;
       if (canon.includes(file) || canon === file) {
         readFiles.add(file);
-        console.error(`[skill-enforcer] 📖 ${skillName} read (manifest)`);
+        console.log(`[skill-enforcer] 📖 ${skillName} read (manifest)`);
         persistReadFiles();
       }
     }
@@ -197,7 +197,7 @@ export default function (pi: ExtensionAPI) {
         const file = `${SKILLS_PREFIX}${name}/SKILL.md`;
         if (canon.includes(file) || canon === file) {
           readFiles.add(file);
-          console.error(`[skill-enforcer] 📖 ${name} read (prereq)`);
+          console.log(`[skill-enforcer] 📖 ${name} read (prereq)`);
           persistReadFiles();
         }
       }
@@ -225,7 +225,7 @@ export default function (pi: ExtensionAPI) {
         if (satisfied) continue;
         const input = (event.input as Record<string, unknown>) ?? {};
         if (input.confirm === `prereq:${skillName}`) {
-          console.error(`[skill-enforcer] 🔓 Prerequisite bypassed: ${skillName}`);
+          console.log(`[skill-enforcer] 🔓 Prerequisite bypassed: ${skillName}`);
           return undefined;
         }
         const reason = [
@@ -233,7 +233,7 @@ export default function (pi: ExtensionAPI) {
           `  (${prereq.requiredAny.join("/")}) was read this session.`,
           `  → Re-invoke with confirm="prereq:${skillName}" to bypass.`,
         ].join("\n");
-        console.error(`[skill-enforcer] 🚫 Prerequisite block: ${skillName} → ${toolName}`);
+        console.log(`[skill-enforcer] 🚫 Prerequisite block: ${skillName} → ${toolName}`);
         return { block: true, reason };
       }
       return undefined;
@@ -260,7 +260,7 @@ export default function (pi: ExtensionAPI) {
                 `  Verify: check logs for "[skill-enforcer] 📖 ${skillName} read (manifest)"`,
                 `  → Or SKILL_ENFORCER_DISABLED=1 to bypass.`,
               ].filter(Boolean).join("\n");
-              console.error(`[skill-enforcer] 🚫 Blocked MCP ${mcpTool} (manifest: ${skillName})`);
+              console.log(`[skill-enforcer] 🚫 Blocked MCP ${mcpTool} (manifest: ${skillName})`);
               return { block: true, reason };
             }
           }
@@ -287,7 +287,7 @@ export default function (pi: ExtensionAPI) {
               `  Verify: check logs for "[skill-enforcer] 📖 ${skillName} read (manifest)"`,
               `  → Or SKILL_ENFORCER_DISABLED=1 to bypass.`,
             ].filter(Boolean).join("\n");
-            console.error(`[skill-enforcer] 🚫 Blocked ${skillName} (manifest)`);
+            console.log(`[skill-enforcer] 🚫 Blocked ${skillName} (manifest)`);
             return { block: true, reason };
           }
         }
@@ -326,7 +326,7 @@ export default function (pi: ExtensionAPI) {
             // Agent confirmed — allow, log bypass (no nudge needed — agent chose this path)
             bypassCounts.set(skillName, (bypassCounts.get(skillName) ?? 0) + 1);
             logNudgeEvent("bypassed", skillName, toolName, bypassCounts.get(skillName)!);
-            console.error(`[skill-enforcer] 🔓 Nudge bypassed: ${skillName} (count: ${bypassCounts.get(skillName)})`);
+            console.log(`[skill-enforcer] 🔓 Nudge bypassed: ${skillName} (count: ${bypassCounts.get(skillName)})`);
             return undefined;
           }
 
@@ -335,7 +335,7 @@ export default function (pi: ExtensionAPI) {
           if (count <= NUDGE_REMINDER_MAX) {
             // Level 1: tool-result injection — allow the tool, nudge injected in tool_result handler
             logNudgeEvent("fired", skillName, toolName, count);
-            console.error(`[skill-enforcer] 💡 Nudge reminder: ${skillName} (count: ${count})`);
+            console.log(`[skill-enforcer] 💡 Nudge reminder: ${skillName} (count: ${count})`);
             return undefined; // pass through, nudge comes later
           }
 
@@ -348,7 +348,7 @@ export default function (pi: ExtensionAPI) {
               `  → Or read ${SKILLS_PREFIX}${skillName}/SKILL.md`,
             ].join("\n");
             logNudgeEvent("fired", skillName, toolName, count);
-            console.error(`[skill-enforcer] 🛑 Nudge confirmation: ${skillName} (count: ${count + 1})`);
+            console.log(`[skill-enforcer] 🛑 Nudge confirmation: ${skillName} (count: ${count + 1})`);
             return { block: true, reason };
           }
 
@@ -360,7 +360,7 @@ export default function (pi: ExtensionAPI) {
           ].join("\n");
           bypassCounts.set(skillName, count + 1);
           logNudgeEvent("blocked", skillName, toolName, count + 1);
-          console.error(`[skill-enforcer] 🚫 Hard block: ${skillName} (count: ${count + 1})`);
+          console.log(`[skill-enforcer] 🚫 Hard block: ${skillName} (count: ${count + 1})`);
           return { block: true, reason };
         }
       }
@@ -417,7 +417,7 @@ export default function (pi: ExtensionAPI) {
             event.content = [...event.content, nudgeBlock];
             bypassCounts.set(skillName, count + 1);
             logNudgeEvent("complied", skillName, toolName, count + 1);
-            console.error(`[skill-enforcer] 💬 Nudge injected: ${skillName} (count: ${count + 1})`);
+            console.log(`[skill-enforcer] 💬 Nudge injected: ${skillName} (count: ${count + 1})`);
           }
           return undefined;
         }
@@ -434,6 +434,6 @@ export default function (pi: ExtensionAPI) {
   // #5672: suppress startup banner in print mode (task sub-agent output)
   if (process.env.PI_MODE !== 'print') {
     const totalGates = Object.keys(MANIFEST).length;
-    console.error(`[skill-enforcer] ✅ Loaded — enforcing ${totalGates} skill gates from manifest`);
+    console.log(`[skill-enforcer] ✅ Loaded — enforcing ${totalGates} skill gates from manifest`);
   }
 }

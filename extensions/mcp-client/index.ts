@@ -147,13 +147,13 @@ class McpServerManager {
       const raw = await readFile(mcpJsonPath, "utf-8");
       config = JSON.parse(raw);
     } catch {
-      console.error(`[mcp-client] Could not read ${mcpJsonPath}, skipping MCP`);
+      console.log(`[mcp-client] Could not read ${mcpJsonPath}, skipping MCP`);
       return;
     }
 
     const servers = config.mcpServers;
     if (!servers) {
-      console.error("[mcp-client] No mcpServers in .mcp.json");
+      console.log("[mcp-client] No mcpServers in .mcp.json");
       return;
     }
 
@@ -165,7 +165,7 @@ class McpServerManager {
 
     if (allowedServers) {
       const skipped = Object.keys(servers).filter(s => !allowedServers.has(s));
-      console.error(`[mcp-client] PI_MCP_SERVERS set → loading ${serverEntries.length} of ${Object.keys(servers).length} servers (skipped: ${skipped.join(", ")})`);
+      console.log(`[mcp-client] PI_MCP_SERVERS set → loading ${serverEntries.length} of ${Object.keys(servers).length} servers (skipped: ${skipped.join(", ")})`);
     }
 
     const CONNECTION_TIMEOUT_MS = 15000;
@@ -176,7 +176,7 @@ class McpServerManager {
       serverEntries.map(async ([serverName, serverConfig]) => {
         const startTime = Date.now();
         await this.connectServer(serverName, serverConfig, CONNECTION_TIMEOUT_MS);
-        console.error(`[mcp-client] Connected to '${serverName}' (${Date.now() - startTime}ms)`);
+        console.log(`[mcp-client] Connected to '${serverName}' (${Date.now() - startTime}ms)`);
         return serverName;
       })
     );
@@ -187,14 +187,14 @@ class McpServerManager {
       if (result.status === "rejected") {
         // Use the server name from the input array at the same index
         const serverName = serverEntries[i]?.[0] ?? "unknown";
-        console.error(
+        console.log(
           `[mcp-client] Failed to connect to MCP server '${serverName}': ${result.reason?.message ?? result.reason}`
         );
       } else {
         succeeded++;
       }
     }
-    console.error(`[mcp-client] Connected to ${succeeded}/${serverEntries.length} servers`);
+    console.log(`[mcp-client] Connected to ${succeeded}/${serverEntries.length} servers`);
   }
 
   private async connectServer(
@@ -259,7 +259,7 @@ class McpServerManager {
           const safeName = toolName.replace(/\./g, "_");
 
           if (existingTools.has(safeName)) {
-            console.error(`[mcp-client] Skipped duplicate tool: ${safeName}`);
+            console.log(`[mcp-client] Skipped duplicate tool: ${safeName}`);
             continue;
           }
 
@@ -285,14 +285,14 @@ class McpServerManager {
               params: Record<string, unknown>
             ) {
               const startMs = Date.now();
-              console.error(`[mcp-client] → ${serverName}/${tool.name}`);
+              console.log(`[mcp-client] → ${serverName}/${tool.name}`);
               try {
                 const result = await client.callTool({
                   name: tool.name,
                   arguments: params,
                 }, undefined, { timeout: 3_600_000 });
 
-                console.error(`[mcp-client] ← ${serverName}/${tool.name} (${Date.now() - startMs}ms)`);
+                console.log(`[mcp-client] ← ${serverName}/${tool.name} (${Date.now() - startMs}ms)`);
                 const textContent = result.content
                   .filter((c: any) => c.type === "text")
                   .map((c: any) => c.text)
@@ -326,13 +326,13 @@ class McpServerManager {
             },
           });
 
-          console.error(`[mcp-client] Registered tool: ${safeName}`);
+          console.log(`[mcp-client] Registered tool: ${safeName}`);
         }
-        console.error(
+        console.log(
           `[mcp-client] Registered ${tools.length} tools from '${serverName}'`
         );
       } catch (err: any) {
-        console.error(
+        console.log(
           `[mcp-client] Failed to list tools from '${serverName}': ${err.message}`
         );
       }
@@ -343,7 +343,7 @@ class McpServerManager {
     for (const { client, serverName } of this.connections) {
       try {
         await client.close();
-        console.error(`[mcp-client] Disconnected from '${serverName}'`);
+        console.log(`[mcp-client] Disconnected from '${serverName}'`);
       } catch {
         // Best effort
       }
@@ -367,6 +367,6 @@ export default async function (pi: ExtensionAPI) {
 
   // #5672: suppress startup banner in print mode (task sub-agent output)
   if (process.env.PI_MODE !== 'print') {
-    console.error(`[mcp-client] MCP client extension loaded`);
+    console.log(`[mcp-client] MCP client extension loaded`);
   }
 }

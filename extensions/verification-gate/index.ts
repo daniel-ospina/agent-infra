@@ -229,7 +229,7 @@ export default function (pi: ExtensionAPI) {
       for (const vf of bridge.verified_files) {
         verifiedSet.set(vf.path, vf.hash);
       }
-      console.error(`[verification-gate] 📂 Recovered ${bridge.verified_files.length} verified files from bridge`);
+      console.log(`[verification-gate] 📂 Recovered ${bridge.verified_files.length} verified files from bridge`);
     }
     vgateFailures = 0;
     lastBlockedCwd = null;
@@ -241,7 +241,7 @@ export default function (pi: ExtensionAPI) {
     // guard's bypass and must not disable commit verification (#7470)
     if (process.env.ELDATO_SKIP_VGATE === "1") {
       extensionEnabled = false;
-      console.error("[verification-gate] ⏸️  Disabled — ELDATO_SKIP_VGATE=1");
+      console.log("[verification-gate] ⏸️  Disabled — ELDATO_SKIP_VGATE=1");
     } else {
       extensionEnabled = true;
     }
@@ -279,7 +279,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (rehashed > 0) {
         writeBridge(rehashRoot, Array.from(verifiedSet.keys()));
-        console.error(`[verification-gate] 🔄 Re-hashed ${rehashed} files after commit (lint-staged may have modified them)`);
+        console.log(`[verification-gate] 🔄 Re-hashed ${rehashed} files after commit (lint-staged may have modified them)`);
       }
     }
 
@@ -335,7 +335,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
       if (autoBypassed === allBlockedFiles.length) {
-        console.error(`[verification-gate] ⏩ Auto-bypassed after ${BLOCK_ATTEMPT_THRESHOLD}+ attempts on ${allBlockedFiles.length} files`);
+        console.log(`[verification-gate] ⏩ Auto-bypassed after ${BLOCK_ATTEMPT_THRESHOLD}+ attempts on ${allBlockedFiles.length} files`);
         return undefined;
       }
     }
@@ -343,7 +343,7 @@ export default function (pi: ExtensionAPI) {
     if (unverified.length === 0 && mismatched.length === 0) {
       // All verified, hashes match — reset block counters for these files
       for (const f of changedFiles) { blockAttempts.delete(f); }
-      console.error(`[verification-gate] ✅ ${changedFiles.length} files verified — allowing`);
+      console.log(`[verification-gate] ✅ ${changedFiles.length} files verified — allowing`);
       // #7574: if we just allowed a commit, flag for re-hash on next git op.
       // lint-staged (pre-commit hook) modifies files on disk, changing their hashes.
       // Use commit-only pattern — push does NOT trigger lint-staged.
@@ -384,7 +384,7 @@ export default function (pi: ExtensionAPI) {
       "  → Or set ELDATO_SKIP_VGATE=1 to bypass (emergency only).",
     ].join("\n");
 
-    console.error(`[verification-gate] 🚫 Blocked: ${unverified.length} unverified, ${mismatched.length} mismatched`);
+    console.log(`[verification-gate] 🚫 Blocked: ${unverified.length} unverified, ${mismatched.length} mismatched`);
     lastBlockedCwd = cwd; // stash authoritative cwd for the merge path (#5607)
     lastBlockedFiles = [...changedFiles]; // #5673: scope verifier to diff files only
     return { block: true, reason };
@@ -410,7 +410,7 @@ export default function (pi: ExtensionAPI) {
     if (!content || content.length === 0) {
       console.error("[verification-gate] ⚠️ Verifier sub-agent returned empty content. Format: prompt must say 'verify files:' (plural); response must contain 'PASS' or valid JSON {status, failures, verified_files}.");
       vgateFailures++;
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.error("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
+      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
       return undefined;
     }
 
@@ -422,7 +422,7 @@ export default function (pi: ExtensionAPI) {
     if (!textContent) {
       console.error("[verification-gate] ⚠️ Verifier sub-agent returned no text content. Format: response must contain 'PASS' or valid JSON {status, failures, verified_files}.");
       vgateFailures++;
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.error("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
+      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
       return undefined;
     }
 
@@ -471,7 +471,7 @@ export default function (pi: ExtensionAPI) {
         }
         const skipped = promptFiles.size - filteredPromptFiles.length;
         if (merged > 0) {
-          console.error(`[verification-gate] ✅ Plain-text PASS — merged ${merged}/${promptFiles.size} files from prompt${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
+          console.log(`[verification-gate] ✅ Plain-text PASS — merged ${merged}/${promptFiles.size} files from prompt${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
           writeBridge(resolveProjectRoot(lastBlockedCwd, prompt), Array.from(verifiedSet.keys()));
         } else {
           console.error(`[verification-gate] ⚠️ Plain-text PASS but could not hash any files (${promptFiles.size} in prompt)`);
@@ -508,7 +508,7 @@ export default function (pi: ExtensionAPI) {
           } catch { /* file may not exist at expected path */ }
         }
         if (merged > 0) {
-          console.error(`[verification-gate] ⚠️ Verifier unparseable — fail-open: merged ${merged}/${promptFiles.size} files from prompt`);
+          console.log(`[verification-gate] ⚠️ Verifier unparseable — fail-open: merged ${merged}/${promptFiles.size} files from prompt`);
           writeBridge(resolveProjectRoot(lastBlockedCwd, prompt), Array.from(verifiedSet.keys()));
           vgateFailures = 0;
           lastBlockedCwd = null;
@@ -516,7 +516,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
       vgateFailures++;
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.error("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
+      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
       return undefined;
     }
 
@@ -549,7 +549,7 @@ export default function (pi: ExtensionAPI) {
             } catch { /* skip */ }
           }
           if (merged > 0) {
-            console.error(`[verification-gate] ✅ Schema-invalid PASS — merged ${merged}/${promptFiles.size} files via prompt fallback (${verifiedSet.size} total)`);
+            console.log(`[verification-gate] ✅ Schema-invalid PASS — merged ${merged}/${promptFiles.size} files via prompt fallback (${verifiedSet.size} total)`);
             const verifiedPaths = Array.from(verifiedSet.keys());
             writeBridge(fallbackRoot, verifiedPaths);
             vgateFailures = 0;
@@ -560,14 +560,14 @@ export default function (pi: ExtensionAPI) {
       }
       console.error("[verification-gate] ⚠️ Verifier JSON failed schema validation. Expected: {status: 'PASS'|'FAIL', failures: string[], verified_files: [{path, hash}]}.");
       vgateFailures++;
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.error("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
+      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
       return undefined;
     }
 
     if (result.status !== "PASS") {
       console.error(`[verification-gate] ❌ Verifier returned FAIL: ${result.failures.join("; ")}`);
       vgateFailures++;
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.error("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
+      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
       return undefined;
     }
 
@@ -587,7 +587,7 @@ export default function (pi: ExtensionAPI) {
     vgateFailures = 0;
     // #7591: reset block counters for successfully verified files
     for (const vf of result.verified_files) { blockAttempts.delete(vf.path); }
-    console.error(`[verification-gate] ✅ Merged ${merged} verified files${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
+    console.log(`[verification-gate] ✅ Merged ${merged} verified files${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
     // Write bridge file so future sessions/sub-agents can see verification status
     const verifiedPaths = Array.from(verifiedSet.keys());
     if (verifiedPaths.length > 0) {
@@ -599,7 +599,7 @@ export default function (pi: ExtensionAPI) {
 
   // #5672: suppress startup banner in print mode (task sub-agent output)
   if (process.env.PI_MODE !== 'print') {
-    console.error("[verification-gate] ✅ Loaded — blocking git operations until verification complete");
+    console.log("[verification-gate] ✅ Loaded — blocking git operations until verification complete");
   }
 
   } catch (err: any) {

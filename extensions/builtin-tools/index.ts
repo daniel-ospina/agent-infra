@@ -156,7 +156,7 @@ export default function (pi: ExtensionAPI) {
       // ── Deep Research Gate ────────────────────────────────────────
       const GATED_MODELS = ["sonar-deep-research", "sonar-reasoning-pro"];
       if (GATED_MODELS.includes(model)) {
-        console.error(
+        console.log(
           `[perplexity] 🚫 DEEP RESEARCH BLOCKED — model=${model} query="${params.query.slice(0, 80)}..."`
         );
         return {
@@ -176,7 +176,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Cost logging ──────────────────────────────────────────────
-      console.error(
+      console.log(
         `[perplexity] 🔍 model=${model} query="${params.query.slice(0, 80)}..."`
       );
 
@@ -217,7 +217,7 @@ export default function (pi: ExtensionAPI) {
         // Log token usage if available
         const usage = data.usage;
         if (usage) {
-          console.error(
+          console.log(
             `[perplexity] ✅ model=${model} prompt_tokens=${usage.prompt_tokens ?? 0} completion_tokens=${usage.completion_tokens ?? 0}`
           );
         }
@@ -514,7 +514,7 @@ export default function (pi: ExtensionAPI) {
           maxDelayMs: 16000,
           circuitBreaker: taskCircuitBreaker,
           onRetry: (attempt, delayMs) => {
-            console.error(`[task] retry ${attempt}/${3} — waiting ${delayMs}ms`);
+            console.log(`[task] retry ${attempt}/${3} — waiting ${delayMs}ms`);
           },
         },
       );
@@ -548,6 +548,6 @@ export default function (pi: ExtensionAPI) {
 
   // #5672: suppress startup banner in print mode (task sub-agent output)
   if (process.env.PI_MODE !== 'print') {
-    console.error("[builtin-tools] Registered: web_search, web_fetch, todo_write, task");
+    console.log("[builtin-tools] Registered: web_search, web_fetch, todo_write, task");
   }
 }

@@ -20,7 +20,7 @@ let Type: any = null;
 try {
   Type = createRequire(import.meta.url)("@sinclair/typebox").Type;
 } catch {
-  console.error("[loop-enforcer] ⚠️ @sinclair/typebox not available — /loop command disabled (hooks still active)");
+  console.log("[loop-enforcer] ⚠️ @sinclair/typebox not available — /loop command disabled (hooks still active)");
 }
 import {
   readFileSync, writeFileSync, existsSync, statSync, unlinkSync,
@@ -595,7 +595,7 @@ function getLastAssistantText(ctx: {
 
 export default function (pi: ExtensionAPI) {
   if (process.env.LOOP_ENFORCER_DISABLED === "1") {
-    if (process.env.PI_MODE !== 'print') console.error("[loop-enforcer] ⏭️  Disabled");
+    if (process.env.PI_MODE !== 'print') console.log("[loop-enforcer] ⏭️  Disabled");
     return;
   }
 
@@ -620,7 +620,7 @@ export default function (pi: ExtensionAPI) {
   try {
     loadPatterns();
   } catch {
-    console.error("[loop-enforcer] ⚠️ Failed to load patterns.json");
+    console.log("[loop-enforcer] ⚠️ Failed to load patterns.json");
   }
 
   // ── Cron scheduler (P1: 1-minute granularity, no external crontab) ──

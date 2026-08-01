@@ -61,7 +61,7 @@ function writeBridgeState() {
     writeFileSync(tmp, payload);
     renameSync(tmp, BRIDGE_FILE);
   } catch (e) {
-    console.error("[sequence-enforcer] bridge write failed:", (e as Error).message);
+    console.log("[sequence-enforcer] bridge write failed:", (e as Error).message);
   }
 }
 
@@ -112,12 +112,12 @@ function resetSequenceTimeout() {
   sequenceTimeout = setTimeout(() => {
     const top = topSkill();
     if (top) {
-      console.error(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
+      console.log(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
       // ponytail: pop only the stale skill, preserve parent (#7276)
       skillStack.pop();
       const parent = topSkill();
       if (parent) {
-        console.error(`[sequence-enforcer] ↩ Restored parent: ${parent.path} (step ${parent.stepIndex}/${parent.steps.length})`);
+        console.log(`[sequence-enforcer] ↩ Restored parent: ${parent.path} (step ${parent.stepIndex}/${parent.steps.length})`);
         writeBridgeState();
       } else {
         clearBridgeState();
@@ -221,7 +221,7 @@ function announceGate(step: Step): void {
   if (gate === "auto" || !gate) return;
   const guid = gateGuidance(step);
   if (!guid) return;
-  console.error(`[sequence-enforcer] 🔒 Gate: ${gate} — ${guid.replace(/\n→ /g, ' | ')}`);
+  console.log(`[sequence-enforcer] 🔒 Gate: ${gate} — ${guid.replace(/\n→ /g, ' | ')}`);
 }
 
 function getExpectedToolsForStep(step: Step): { allow: string[]; block: RegExp[] } {
@@ -249,7 +249,7 @@ function validateToolCall(
   toolName: string, command: string, step: Step, mode: Mode,
 ): { block: boolean; reason?: string } {
   if (mode === "warn") {
-    console.error(
+    console.log(
       `[sequence-enforcer] ⚠️ warn: ${toolName} | step="${step.name}" gate="${step.gate || "none"}"`,
     );
     return { block: false };
@@ -311,14 +311,14 @@ export default function (pi: ExtensionAPI) {
     try {
       if (existsSync(KILL_SWITCH_FILE)) {
         unlinkSync(KILL_SWITCH_FILE);
-        console.error("[sequence-enforcer] 🧹 Cleared stale kill switch from previous session");
+        console.log("[sequence-enforcer] 🧹 Cleared stale kill switch from previous session");
       }
     } catch { /* best-effort */ }
     if (isKillSwitchActive()) {
-      console.error("[sequence-enforcer] ⏸️  Kill switch active — all enforcement bypassed");
+      console.log("[sequence-enforcer] ⏸️  Kill switch active — all enforcement bypassed");
     } else {
       auditLog({ ts: new Date().toISOString(), event: "startup", mode: resolveMode() });
-  console.error(`[sequence-enforcer] ✅ Loaded — mode: ${resolveMode()}`);
+  console.log(`[sequence-enforcer] ✅ Loaded — mode: ${resolveMode()}`);
     }
   });
 
@@ -341,20 +341,20 @@ export default function (pi: ExtensionAPI) {
       if (next < top.steps.length) {
         top.stepIndex = next;
         top.stepStartedAt = Date.now();
-        console.error(
+        console.log(
           `[sequence-enforcer] ⏩ Advanced past human_review → step ${next}/${top.steps.length}: ${top.steps[next]!.name}`,
         );
         announceGate(top.steps[next]!);
         writeBridgeState();
       } else {
-        console.error(
+        console.log(
           `[sequence-enforcer] ✅ All ${top.steps.length} steps completed`,
         );
         // ponytail: pop completed skill, restore parent (#7265)
         skillStack.pop();
         const parent = topSkill();
         if (parent) {
-          console.error(`[sequence-enforcer] ↩ Restored parent: ${parent.path}`);
+          console.log(`[sequence-enforcer] ↩ Restored parent: ${parent.path}`);
           writeBridgeState();
         } else {
           clearBridgeState();
@@ -387,19 +387,19 @@ export default function (pi: ExtensionAPI) {
         top.stepIndex += advanced;
         // If all steps are now completed (past last step):
         if (top.stepIndex >= top.steps.length) {
-          console.error(
+          console.log(
             `[sequence-enforcer] ⏩ Auto-advanced ${advanced} step(s) → completed "${top.path}"`,
           );
           skillStack.pop();
           const parent = topSkill();
           if (parent) {
-            console.error(`[sequence-enforcer] ↩ Restored parent: ${parent.path}`);
+            console.log(`[sequence-enforcer] ↩ Restored parent: ${parent.path}`);
             writeBridgeState();
           } else {
             clearBridgeState();
           }
         } else {
-          console.error(
+          console.log(
             `[sequence-enforcer] ⏩ Auto-advanced ${advanced} step(s) → now at step ${top.stepIndex}/${top.steps.length}: ${top.steps[top.stepIndex]!.name}`,
           );
           announceGate(top.steps[top.stepIndex]!);
@@ -424,14 +424,14 @@ export default function (pi: ExtensionAPI) {
       } catch { return true; } // if git fails, assume worktree (safer: let pipeline run)
     })();
     if (!inWorktree) {
-      console.error(`[sequence-enforcer] 📖 Read ${path} (main checkout — pipeline not activated)`);
+      console.log(`[sequence-enforcer] 📖 Read ${path} (main checkout — pipeline not activated)`);
       writeBridgeState();
       return undefined;
     }
 
     // Push new skill onto stack (replace if top was completed & popped above)
     skillStack.push({ path, steps, stepIndex: 0, stepStartedAt: Date.now(), reviewers: new Map() });
-    console.error(
+    console.log(
       `[sequence-enforcer] 📖 Activated: ${path} (${steps.length} steps: ${steps.map(s => s.name).join(" → ")})`,
     );
     if (steps.length > 0) announceGate(steps[0]!);
@@ -463,7 +463,7 @@ export default function (pi: ExtensionAPI) {
       const trail = top.steps
         .map((s, i) => i === top.stepIndex ? `[${s.name}]` : s.name)
         .join(" → ");
-      console.error(`[sequence-enforcer] 🚫 Blocked ${toolName}: ${result.reason}`);
+      console.log(`[sequence-enforcer] 🚫 Blocked ${toolName}: ${result.reason}`);
       auditLog({ ts: new Date().toISOString(), event: "blocked", skill: top.path, step: step.name, tool: toolName, mode, reason: result.reason });
       const guidance = gateGuidance(step);
       return {
@@ -521,13 +521,13 @@ export default function (pi: ExtensionAPI) {
         if (next < targetSkill.steps.length) {
           targetSkill.stepIndex = next;
           targetSkill.stepStartedAt = Date.now();
-          console.error(
+          console.log(
             `[sequence-enforcer] ⏩ Step ${next}/${targetSkill.steps.length}: ${targetSkill.steps[next]!.name}`,
           );
           announceGate(targetSkill.steps[next]!);
           writeBridgeState();
         } else {
-          console.error(
+          console.log(
             `[sequence-enforcer] ✅ All ${targetSkill.steps.length} steps completed`,
           );
           // ponytail: pop completed skill, restore parent (#7265)
@@ -539,7 +539,7 @@ export default function (pi: ExtensionAPI) {
           }
           const parent = topSkill();
           if (parent) {
-            console.error(`[sequence-enforcer] ↩ Restored parent: ${parent.path} (step ${parent.stepIndex}/${parent.steps.length})`);
+            console.log(`[sequence-enforcer] ↩ Restored parent: ${parent.path} (step ${parent.stepIndex}/${parent.steps.length})`);
             writeBridgeState();
           } else {
             clearBridgeState();
@@ -554,9 +554,9 @@ export default function (pi: ExtensionAPI) {
   // #5672: suppress banner in print mode (task sub-agent output)
   if (process.env.PI_MODE !== "print") {
     if (isKillSwitchActive()) {
-      console.error("[sequence-enforcer] ⏸️  Loaded — kill switch active, all enforcement bypassed");
+      console.log("[sequence-enforcer] ⏸️  Loaded — kill switch active, all enforcement bypassed");
     } else {
-      console.error(`[sequence-enforcer] ✅ Loaded — mode: ${resolveMode()} — enforcing step sequences`);
+      console.log(`[sequence-enforcer] ✅ Loaded — mode: ${resolveMode()} — enforcing step sequences`);
     }
   }
 }

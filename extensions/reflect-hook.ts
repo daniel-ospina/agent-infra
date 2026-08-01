@@ -34,7 +34,7 @@ export default function (pi: ExtensionAPI) {
       const sessionText = lines.join("\n\n");
 
       if (!sessionText) {
-        console.error("[reflect-hook] Skipped — empty session");
+        console.log("[reflect-hook] Skipped — empty session");
         return;
       }
 
@@ -47,7 +47,7 @@ export default function (pi: ExtensionAPI) {
           timeout: 3000,
         }).trim();
       } catch {
-        console.error("[reflect-hook] Skipped — not in a git repo");
+        console.log("[reflect-hook] Skipped — not in a git repo");
         return;
       }
 
@@ -106,7 +106,7 @@ export default function (pi: ExtensionAPI) {
       });
       child.unref();
 
-      console.error(
+      console.log(
         `[reflect-hook] Fired reflect.py (${prs.size} PRs, ${sessionText.length} chars)`,
       );
 

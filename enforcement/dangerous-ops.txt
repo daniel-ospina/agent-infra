@@ -2,7 +2,9 @@
 # Format: skillName # pattern # mode # optional_message
 # mode: hard (blocks until skill read) | nudge (reminds, escalates to block after threshold)
 
-commit-workflow # git commit|git push|git merge|gh pr create|gh pr merge|git stash pop|git checkout -- # hard # Use commit-workflow/SKILL.md for all git operations. Pre-flight checks, PR creation, code-review gate, and auto-merge.
+commit-workflow # git commit|git push|git merge|git add|gh pr create|gh pr merge|git stash pop|git checkout -- # hard # Use commit-workflow/SKILL.md for all git operations. Pre-flight checks, PR creation, code-review gate, and auto-merge.
+
+using-git-worktrees # git worktree add|git worktree remove # hard # Raw worktree operations forbidden. Prevents regressions and merge collisions with parallel agents. Use using-git-worktrees/SKILL.md first. Remember good>easy — follow the workflow.
 
 supabase # supabase|migration|RLS|apply_migration_safe|pg_ # hard # Use supabase/SKILL.md for all Supabase operations. Unsafe migrations can cause data loss.
 

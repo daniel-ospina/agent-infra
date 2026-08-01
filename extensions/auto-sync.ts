@@ -44,7 +44,7 @@ export default function (pi: ExtensionAPI) {
     if (pinned !== current) {
       // #5672: suppress in print mode (task sub-agent output)
       if (process.env.PI_MODE !== 'print') {
-        console.error(
+        console.log(
           `[auto-sync] ⚠️  agent-infra v${current} available (you're on v${pinned}). ` +
           `Run \`agent-infra update\`.`
         );

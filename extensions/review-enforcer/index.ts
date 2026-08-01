@@ -50,7 +50,7 @@ export default function (pi: ExtensionAPI) {
       // (these have no effect — tier is read from marker file, skip gate from escape hatch)
       const complexityVar = process.env.AGENT_ISSUE_COMPLEXITY || process.env.ELDATO_ISSUE_COMPLEXITY;
       if (complexityVar) {
-        console.error(
+        console.log(
           "⚠️  REVIEW-ENFORCER: ISSUE_COMPLEXITY detected in parent shell " +
           `— this has no effect. Tier is read from ${ISSUE_COMPLEXITY_FILE} marker file. ` +
           "Unset this env var to clear the stale state."
@@ -59,12 +59,12 @@ export default function (pi: ExtensionAPI) {
 
       if (_skipReviewGate()) {
         extensionEnabled = false;
-        console.error(
+        console.log(
           "⚠️  REVIEW GATES DISABLED — all quality checks bypassed.",
           "To re-enable, unset AGENT_SKIP_REVIEW_GATE (or ELDATO_SKIP_REVIEW_GATE) and restart."
         );
         // bypass log
-        console.error(
+        console.log(
           JSON.stringify({
             event: "gate_bypass",
             reason: "escape_hatch",
@@ -83,7 +83,7 @@ export default function (pi: ExtensionAPI) {
       try {
         if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
           fs.unlinkSync(ISSUE_COMPLEXITY_FILE);
-          console.error(`[review-enforcer] 🧹 Cleared ${ISSUE_COMPLEXITY_FILE} marker on shutdown`);
+          console.log(`[review-enforcer] 🧹 Cleared ${ISSUE_COMPLEXITY_FILE} marker on shutdown`);
         }
       } catch (_err) { /* best-effort cleanup */ }
     });
@@ -97,7 +97,7 @@ export default function (pi: ExtensionAPI) {
       if (!isGitOp(command)) return undefined;
 
       if (dispatchCount > 0) {
-        console.error(
+        console.log(
           `[review-enforcer] ✅ ${dispatchCount} reviewer dispatch(es) — allowing git op`
         );
         return undefined;
@@ -112,14 +112,14 @@ export default function (pi: ExtensionAPI) {
         }
       } catch (_err) { /* best-effort */ }
       if (tier === "micro") {
-        console.error(
+        console.log(
           "[review-enforcer] ⚠️  No reviewers dispatched — micro tier allows bypass. " +
           "Dispatch a reviewer sub-agent for non-trivial changes."
         );
         return undefined;
       }
 
-      console.error("[review-enforcer] 🚫 Blocked — no reviewers dispatched");
+      console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched");
       return { block: true, reason: BLOCK_MESSAGE };
     });
 
@@ -129,7 +129,7 @@ export default function (pi: ExtensionAPI) {
       if (!extensionEnabled) return undefined;
 
       dispatchCount++;
-      console.error(
+      console.log(
         `[review-enforcer] 📊 Reviewer dispatch counted (total: ${dispatchCount})`
       );
       return undefined;
@@ -137,9 +137,9 @@ export default function (pi: ExtensionAPI) {
 
     // ── startup banner ────────────────────────────
     if (process.env.PI_MODE !== "print") {
-      console.error("[review-enforcer] ✅ Loaded — binary review dispatch enforcement active");
+      console.log("[review-enforcer] ✅ Loaded — binary review dispatch enforcement active");
     }
   } catch (err: any) {
-    console.error("[review-enforcer] ❌ Failed to load:", err.message);
+    console.log("[review-enforcer] ❌ Failed to load:", err.message);
   }
 }
