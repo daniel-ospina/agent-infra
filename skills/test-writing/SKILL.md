@@ -130,20 +130,30 @@ Before writing implementation code, verify the test against this checklist. **Al
 
 **On failure:** Revise the test until all checks pass. Do not proceed to Green phase with a failing checklist. For PBT: verify the failure is a real bug before changing production code.
 
-### Step 3.5 — Test Review (Research + Review + Fix Loop)
+### Step 3.5 — Test Review (Mandatory Synchronous Gate)
 
-After the 7-point self-check passes, invoke `test-review` for an independent review with fresh eyes. The self-check is the writer reviewing their own work; `test-review` brings an external perspective.
+**⛔ MANDATORY GATE — blocks Green phase until clean.** After the 7-point self-check passes, dispatch `test-review` as a `task` sub-agent for independent review. The self-check is the writer reviewing their own work; `test-review` brings an external perspective with 4 parallel reviewers checking correctness, coverage, surface alignment, and journey alignment.
 
+**Dispatch (multi-file, single invocation):**
 ```
-test-review <test-file> --surface-map "<surface map from plan>" [--journey-map "<journey map from plan>"]
+task(prompt='test-review: <file1> <file2> ... --caller test-writing \n\nSURFACE MAP: <surface map from plan doc>\nJOURNEY MAP: <journey map from plan doc>\n\nTEST FILE 1: <full content>\nTEST FILE 2: <full content>\n...')
 ```
 
-`test-review` runs:
-1. **Phase 0 — Research Intake:** Proactively researches HOW to test the specific surfaces in play (concurrency patterns, RLS testing, time injection, etc.)
-2. **Phase 1 — Review:** 3 parallel fresh sub-agents check correctness, coverage, surface alignment, and journey alignment
-3. **Phase 2-4 — Fix + Re-review Loop:** Apply issues, re-dispatch fresh reviewers, loop until clean or 3-cycle cap
+All changed test files from this implementation batch are dispatched in a SINGLE task sub-agent invocation. Limit 5 files per dispatch (context window). test-review runs its full protocol (Phases 0-5) and returns per-file results.
 
-**Gate:** `test-review` must return clean before proceeding to Green phase. If capped (3 cycles, issues remain), surface the remaining issues and decide: fix now or note for code-review.
+**Cap protocol (test-review's 10-cycle cap, not 3):**
+- CAPPED + only P1/P2 issues → **WARN** — proceed to Green phase. Document remaining issues.
+- CAPPED + any P0 issue → **escalate to human gate.** Do NOT proceed. Present issues for decision.
+- CLEAN (all 4 reviewers return NO ISSUES FOUND) → proceed to Green phase.
+
+**Wrong-layer P0 escalation:** If Reviewer #2 flags "SQL business logic tested with TS mocks (should be pgTAP)":
+1. Escalate to implementer with pgTAP guidance: file path convention (`supabase/tests/`), assertion patterns, link to test-writing pgTAP-specific checks (#8-10)
+2. Implementer writes pgTAP test → re-run test-review for that surface only
+3. Max 2 re-review attempts. Still P0 after 2 → human gate.
+
+**Sub-agent failure:** If `task` sub-agent crashes or times out → retry 2x with exponential backoff (1s, 2s). Still failing → escalate to human.
+
+**Surface map pre-check:** If no surface map exists for these test files AND files touch DB/API/auth boundaries → WARN "no surface map — test-review runs without layer assignment context."
 
 ### Step 4 — Green Phase (Run Test, Verify It Fails)
 
@@ -188,6 +198,21 @@ After green, clean up:
 - Simplify logic
 
 Re-run tests after each refactor. Keep the cycle tight — refactor only what was just implemented.
+
+**Post-refactor re-hash:** After refactoring, re-hash all test files touched in this cycle. Write per-file hash to `~/.pi/agent/test-review/<sha256-of-absolute-test-file-path>.json`:
+
+```json
+{
+  "status": "CLEAN" | "CAPPED",
+  "test_file_path": "/absolute/path/to/test.test.ts",
+  "source_file_paths": ["/absolute/path/to/source.ts"],
+  "composite_hash": "<sha256>",
+  "timestamp": "<ISO8601>",
+  "capped_issues": [{"severity": "P0|P1|P2", "dimension": "...", "description": "..."}]
+}
+```
+
+Hash schema is defined here in test-writing (single source of truth). Include `PASS` on its own line in console output for VGATE compatibility.
 
 ### Step 8 — Report
 

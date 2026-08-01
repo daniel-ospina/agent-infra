@@ -338,3 +338,75 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 - If staged files change after verification, hashes won't match — re-verify
 - The gate extracts file paths from the prompt, not the response — make sure paths are correct
 - `AGENT_SKIP_VGATE=1` at session start disables this gate entirely (`AGENT_ALLOW_MAIN_EDITS=1` no longer does — #7470)
+
+---
+
+### Test-Review Hash Backstop Gate
+
+**Purpose:** Ensure every test file has passed test-review before commit. Complements VGATE (which verifies file content quality) by verifying test correctness. Catches any code path that bypassed the test-writing → test-review mandatory gate.
+
+**When:** Standard+Complex tier commits where staged files include `.ts`, `.tsx`, `.py`, `.sql`, `.js`, or `.jsx`.
+
+**Skip:** Micro tier commits, or commits with no matching file extensions.
+
+**Mechanism:**
+
+```bash
+# Skip for micro tier
+ISSUE_BODY=$(gh issue view <N> --json body -q '.body')
+IS_COMPLEXITY_MICRO=$(echo "$ISSUE_BODY" | grep -q 'complexity:micro' && echo true || echo false)
+[ "$IS_COMPLEXITY_MICRO" = "true" ] && exit 0
+
+# Check for testable files
+STAGED=$(git diff --cached --name-only)
+HAS_TESTABLE=$(echo "$STAGED" | grep -qE '\.(ts|tsx|py|sql|js|jsx)$' && echo true || echo false)
+[ "$HAS_TESTABLE" != "true" ] && exit 0
+
+# Check each test file for test-review hash
+for FILE in $(echo "$STAGED" | grep -E '\.(test|spec|e2e)\.(ts|tsx)$|\.pg$|\.py$'); do
+  # Skip deleted files
+  git diff --cached --diff-filter=D -- "$FILE" | grep -q . && continue
+  
+  ABS_PATH=$(realpath "$FILE")
+  HASH_FILE="$HOME/.pi/agent/test-review/$(echo -n "$ABS_PATH" | sha256sum | cut -d' ' -f1).json"
+  
+  if [ ! -f "$HASH_FILE" ]; then
+    echo "⛔ BLOCKED: test-review never completed for $FILE"
+    echo "   Run test-writing → test-review before committing."
+    exit 1
+  fi
+  
+  STATUS=$(python3 -c "import json; print(json.load(open('$HASH_FILE'))['status'])" 2>/dev/null || echo "ABSENT")
+  
+  case "$STATUS" in
+    CLEAN)
+      echo "✅ $FILE — test-review: CLEAN"
+      ;;
+    CAPPED)
+      ISSUES=$(python3 -c "import json; d=json.load(open('$HASH_FILE')); print('; '.join(i['description'][:80] for i in d.get('capped_issues',[])))" 2>/dev/null || echo "unknown")
+      echo "⚠️ $FILE — test-review: CAPPED ($ISSUES)"
+      ;;
+    *)
+      echo "⛔ BLOCKED: invalid hash status '$STATUS' for $FILE"
+      exit 1
+      ;;
+  esac
+done
+
+# TTL cleanup: remove hashes older than 30 days
+find "$HOME/.pi/agent/test-review/" -name '*.json' -mtime +30 -delete 2>/dev/null || true
+
+# Orphan cleanup: remove hashes where test file no longer exists
+for HF in "$HOME/.pi/agent/test-review/"*.json; do
+  [ ! -f "$HF" ] && continue
+  FP=$(python3 -c "import json; print(json.load(open('$HF')).get('test_file_path',''))" 2>/dev/null || true)
+  [ -n "$FP" ] && [ ! -f "$FP" ] && rm -f "$HF"
+done
+```
+
+**Tri-state verdict:**
+- **ABSENT** (no hash file) → **BLOCK** — test-review was never completed
+- **CAPPED** (hash exists, status=CAPPED) → **WARN** — proceed with documented issues
+- **CLEAN** (hash exists, status=CLEAN) → proceed
+
+**Post-commit cleanup:** After successful commit, delete consumed hash files for CLEAN-status files in this commit.
