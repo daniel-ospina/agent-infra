@@ -1,0 +1,90 @@
+name: founder-portrait
+version: '1.0'
+description: Daniel Ospina in environment — founder thought leadership portraiture
+byline: true
+prompt_prefix: 'Editorial portrait. Use reference image as ABSOLUTE source of truth
+  for facial identity.
+
+
+  COMPOSITION: Subject on RIGHT third of frame. Subject''s ENTIRE head and shoulders
+  fully visible within frame — no cropping of face or hair. Large empty negative space
+  on LEFT — plain wall, window area, or open table space with no important elements.
+  This space is for text overlay. Some empty space at bottom. Subject roughly right
+  40%, left 60% empty.
+
+
+  Expression: comfortable, at ease. Like he''s listening to someone across the table
+  tell an interesting story. Slight natural warmth in the face — not smiling, not
+  tense, not posed. Just relaxed and present. Mouth naturally closed or very subtly
+  upturned. No tension in jaw or forehead.
+
+
+  Eyes: CRITICAL — IRIS MUST BE VERY DARK BROWN, ALMOST BLACK. This is non-negotiable.
+  The reference images show near-black irises — COPY THAT EXACT COLOR. No brown, no
+  dark brown, no medium brown — VERY DARK BROWN / NEARLY BLACK. Only the catchlight
+  reveals the iris is brown, not pure black. The iris should absorb light, not reflect
+  it. Single small catchlight in the UPPER HALF of each eye — one pinpoint window
+  reflection above pupil, never centered, never multiple catchlights. Sclera (white)
+  must be natural off-white with subtle blood vessels — NOT bright white, NOT glowing.
+  Iris texture should be barely visible — dark eyes have subtle texture, not prominent.
+  Eyelashes slightly clumped, natural. Gaze soft and slightly off-camera — alive but
+  not piercing. NO light-colored irises. NO hazel. NO grey. NO green. NO blue. VERY
+  DARK BROWN. ALMOST BLACK.
+
+
+  Skin: natural photo-quality skin. Pores and texture visible but subtle — not clinical,
+  not hyper-detailed. Like a good iPhone photo, not a dermatology closeup. Some areas
+  slightly softer. Real skin, not rendered skin.
+
+
+  BACKGROUND REALISM CRITICAL: The cafe must feel like a real place, not a staged
+  set. Uneven lighting — brighter near windows, darker in corners. Mix of light temperatures
+  — warm bulbs in back, daylight from windows. Some chairs slightly pulled out, a
+  tablecloth not perfectly straight, a poster slightly crooked on the wall. Real imperfections
+  of a working cafe. NOT a showroom. NOT perfectly arranged. NOT uniformly lit. Background
+  people if any should be in natural poses, not all facing the same way. Depth falloff:
+  things further away are softer and darker (iPhone portrait, not lens bokeh).
+
+
+  Lighting on subject: face lit by window from left/front — brighter. Background ambient
+  room light — dimmer, warmer. Different exposures for foreground and background.
+
+
+  Camera: iPhone photo. JPEG quality, slightly warm. Not HDR. Not clinical.
+
+  '
+prompt_suffix: 'NO plastic skin. NO AI glow. NO studio lighting. NO perfect background.
+
+  NO uniform lighting. NO centered composition. NO facial distortion.
+
+  NO tense expression. NO staring eyes. NO cropping face. NO demon eyes. NO light-colored
+  irises. NO blue eyes. NO green eyes. NO hazel eyes. NO grey eyes. NO medium brown
+  eyes. ONLY very dark brown/nearly black irises.
+
+  NO uncanny valley. NO glowing lightbulbs. NO lens flare. NO HDR.
+
+  NO golden hour glow. NO CGI. NO 3D render. NO game engine.
+
+  Camera: 35mm lens, DSLR, subtle film grain, ISO 400, natural bokeh.'
+reference_images:
+- https://res.cloudinary.com/djzwqixjt/image/upload/eldato/carousels/references/character-sheet.png
+- https://res.cloudinary.com/djzwqixjt/image/upload/eldato/carousels/references/canonical-face-reference.jpg
+- https://res.cloudinary.com/djzwqixjt/image/upload/eldato/carousels/references/canonical-portrait-reference.jpg
+quality_checks:
+  auto_reject:
+  - face_integrity
+  - depth_of_field
+  warn:
+  - background_realism
+  - lighting
+  - skin_texture
+scrim:
+  type: heavy-purple
+model_preference:
+  primary: google/gemini-3.1-flash-image-preview
+  fallback: black-forest-labs/flux-2-klein
+image_config:
+  aspect_ratio: '1:1'
+  image_size: 2K
+_cloudinary_note: '# reference_images must be Cloudinary URLs — OpenRouter rejects
+  base64 as too large.'

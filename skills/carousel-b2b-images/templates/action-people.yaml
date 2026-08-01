@@ -1,0 +1,34 @@
+name: action-people
+version: "1.0"
+description: "Crowds, events, social gatherings — no faces"
+byline: false
+prompt_prefix: |
+  Candid event photography. Natural crowd energy, unposed moments.
+  Varied faces. Natural expressions. Motion where appropriate.
+
+prompt_suffix: |
+  Photorealistic. Varied faces (not identical clones). Natural expressions.
+  No frozen poses. People in natural conversation/interaction.
+  Negative: NO visible text, NO words, NO labels, NO letters rendered into the image. identical faces, uncanny expressions, all facing camera,
+  perfectly arranged crowd, studio lighting.
+
+reference_images: []
+
+quality_checks:
+  auto_reject:
+    - face_count_sanity
+    - no_uncanny_expressions
+  warn:
+    - depth_of_field
+    - lighting_consistency
+
+scrim:
+  type: medium-purple
+
+model_preference:
+  primary: google/gemini-3.1-flash-image-preview
+  fallback: black-forest-labs/flux-2-klein
+
+image_config:
+  aspect_ratio: "1:1"
+  image_size: "2K"

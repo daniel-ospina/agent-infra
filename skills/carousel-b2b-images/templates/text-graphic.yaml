@@ -1,0 +1,29 @@
+name: text-graphic
+version: "1.0"
+description: "Quotes, statistics, typography-first slides — no image needed"
+byline: false
+prompt_prefix: |
+  Clean, minimal background for text overlay. Soft gradient or solid color.
+  Large empty zones for typography. No distracting elements.
+
+prompt_suffix: |
+  Abstract, gradient, or solid color background. Texture optional but subtle.
+  No objects, no people, no faces.
+
+reference_images: []
+
+quality_checks:
+  auto_reject:
+    - text_zone_cleanliness
+  warn: []
+
+scrim:
+  type: none
+
+model_preference:
+  primary: google/gemini-3.1-flash-image-preview
+  fallback: black-forest-labs/flux-2-klein
+
+image_config:
+  aspect_ratio: "1:1"
+  image_size: "2K"

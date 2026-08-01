@@ -1,0 +1,34 @@
+name: food-product
+version: "1.0"
+description: "Plated dishes, cocktails, food photography — no faces"
+byline: false
+prompt_prefix: |
+  Professional food photography. Soft natural window light from left.
+  Shallow depth of field focusing on the dish. Rich, accurate colors.
+  No faces, no people. The food IS the subject.
+
+prompt_suffix: |
+  Photorealistic, editorial food photography quality. No AI artifacts.
+  Natural textures on food surfaces. Steam/moisture where appropriate.
+  Negative: NO visible text, NO words, NO labels, NO letters rendered into the image. plastic food, fake colors, unnatural shine, floating elements.
+
+reference_images: []
+
+quality_checks:
+  auto_reject:
+    - depth_of_field
+    - subject_clarity
+  warn:
+    - color_fidelity
+    - ai_artifacts
+
+scrim:
+  type: light-purple
+
+model_preference:
+  primary: google/gemini-3.1-flash-image-preview
+  fallback: black-forest-labs/flux-2-klein
+
+image_config:
+  aspect_ratio: "1:1"
+  image_size: "2K"

@@ -1,0 +1,75 @@
+name: concept-image
+version: '1.0'
+description: Images that help make an argument — the image IS the rhetorical point
+byline: false
+prompt_prefix: 'Editorial concept photography. The image should make the viewer think
+  "ah, I see what you mean" before reading the text. NOT decorative — it carries rhetorical
+  weight.
+
+
+  COMPOSITION: Subject/action fills 60-70% of frame. Text zone above or below the
+  concept. Rule of thirds. Negative space where text overlays.
+
+
+  STYLE: Photorealistic. Shot on 35mm lens, DSLR photography. The moment should feel
+  captured, not staged. Real light, real environment, real textures. NOT stock-photo.
+  NOT CGI. NOT 3D render.
+
+
+  LIGHTING: Natural daylight or overcast. Soft window light or practical interior
+  lighting. AVOID golden hour (reads as AI-generated), AVOID dramatic HDR, AVOID glowing
+  lightbulbs, AVOID lens flare. Realistic shadows. Light should feel like a real space,
+  not a movie set.
+
+
+  TEXTURE: High-detail textures. Visible surface detail — wood grain, paint texture,
+  fabric weave. Slight imperfections: minor scuffs on furniture, a slightly uneven
+  tablecloth, natural wear on door handles. NOT sterile. NOT perfectly clean. NOT
+  showroom.
+
+
+  COLOUR: Muted tones, earthy palette, natural colour grading. NOT vibrant. NOT saturated.
+  Real-world colour balance.
+
+
+  CAMERA: 35mm lens, DSLR or mirrorless. Subtle film grain. ISO 400-800. Not clinical.
+  Not HDR. The kind of photo a real photographer takes.
+
+
+  UPPER IMAGE TONE: The top 20% of the image should be medium-to-dark toned. AVOID
+  bright white walls, pale sky, or light-colored surfaces in the upper portion.
+
+
+  BACKGROUND REALISM: The location must feel like a real place. Uneven lighting —
+  brighter near light sources, darker in corners. Mix of light temperatures — warm
+  bulbs inside, cooler ambient outside. Real imperfections: slightly worn paint, a
+  crooked sign, a plant that needs watering. Depth falloff: things further away are
+  softer and darker.'
+prompt_suffix: 'NO visible text. NO words. NO labels. NO letters rendered into the
+  image.
+
+  NO golden hour. NO cinematic glow. NO lens flare. NO HDR look. NO enhanced saturation.
+
+  NO glowing lightbulbs. NO visible light sources. NO magical lighting.
+
+  NO CGI. NO 3D render. NO game engine. NO plastic surfaces. NO studio lighting.
+
+  NO stock photography look. NO corporate blandness. NO fake smiles.
+
+  NO perfect surfaces. NO sterile environments.'
+reference_images: []
+quality_checks:
+  auto_reject:
+  - composition_balance
+  - no_ai_hallucination
+  warn:
+  - lighting_consistency
+  - background_realism
+scrim:
+  type: max-purple
+model_preference:
+  primary: google/gemini-3.1-flash-image-preview
+  fallback: black-forest-labs/flux-2-klein
+image_config:
+  aspect_ratio: '1:1'
+  image_size: 2K

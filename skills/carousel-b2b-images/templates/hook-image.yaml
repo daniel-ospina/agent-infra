@@ -1,0 +1,62 @@
+name: hook-image
+version: '1.0'
+description: Attention-grabbing opening visuals — pure curiosity bait, makes you stop
+  scrolling
+byline: false
+prompt_prefix: 'High-impact attention photography. This image exists to STOP THE SCROLL.
+  It creates a question that the text answers. Pure curiosity bait.
+
+
+  CONCEPT: The image creates tension, anticipation, or surprise. The viewer should
+  think "what happens next?" or "what is that?" in the first 1.5 seconds. The text
+  resolves the question.
+
+
+  COMPOSITION: Subject fills 80-90% of frame. Text overlays minimally or not at all
+  — the image carries the first moment of attention alone. Subject can be centered
+  or dramatically off-axis. Breaking composition rules is encouraged if it creates
+  impact.
+
+
+  STYLE: High contrast, high impact. Can be abstract, surreal, hyper-real, or cinematic.
+  The key is VISUAL NOVELTY — something the viewer has not seen 50 times today. Raw
+  and arresting beats beautiful and forgettable.
+
+
+  UPPER IMAGE TONE: The top 20% of the image should be medium-to-dark toned. AVOID
+  bright white or pale areas in the upper portion.
+
+
+  LIGHTING: Dramatic. Strong shadows, backlight, or high-key. The lighting should
+  match the tension — harsh for urgency, soft for anticipation, weird for curiosity.
+  No flat ambient lighting.
+
+
+  CAMERA: Could be slow-motion capture, macro, wide-angle distortion, or any technique
+  that amplifies the emotional hook. Not clinical. Not safe.
+
+  '
+prompt_suffix: 'Negative: NO visible text, NO words, NO labels, NO letters rendered
+  into the image. boring compositions, flat lighting, generic stock photography,
+
+  corporate aesthetic, safe choices, text in image, watermarks,
+
+  anything that looks like it belongs in a PowerPoint presentation.
+
+  '
+reference_images: []
+quality_checks:
+  auto_reject:
+  - no_ai_hallucination
+  - composition_balance
+  warn:
+  - lighting_consistency
+  - background_realism
+scrim:
+  type: max-purple
+model_preference:
+  primary: google/gemini-3.1-flash-image-preview
+  fallback: black-forest-labs/flux-2-klein
+image_config:
+  aspect_ratio: '1:1'
+  image_size: 2K

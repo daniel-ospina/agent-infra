@@ -297,3 +297,71 @@ gh issue create   --title "Post-deploy smoke test failure: <journey> on <date>" 
 
 If any BLOCK-level issues: report the errors, then **still proceed to Step 3.8** (worktree teardown must always run, see `05-cleanup.md`). Halt before Step 4 — do not continue to documentation update.
 If only WARN-level issues: continue to Step 3.8 and beyond.
+
+
+## Step 3.8 — Post-Deploy Clickthrough Verification
+
+**Skip if** the PR contains only config/docs/skill-file/type-def changes with no runtime code (same skip conditions as Step 3.75).
+
+**Purpose:** Verify that deployed changes actually work for a real user by running **agent-executed clickthrough protocols** — the agent reads the Tortoise graph for relevant journeys, then walks the app with common sense (finding buttons by text, filling forms by label, verifying outcomes visually). This is the **user-outcome verification gate** above the infrastructure-level verification in Steps 3.6-3.7.
+
+**Gate type:** WARN-ONLY. The deploy is already done. This verification detects problems and auto-files issues but never blocks the pipeline.
+
+### Detection
+
+```bash
+RUNTIME_FILES=$(gh pr diff <PR_NUMBER> --name-only | grep -E '\.(tsx|ts)$' | grep -v '\.test\.' | grep -v '\.d\.ts')
+if [ -z "$RUNTIME_FILES" ]; then
+  echo "⏭️ No runtime code changed — skipping clickthrough verification"
+  SKIP_CLICKTHROUGH=true
+fi
+```
+
+Also skip if `AGENT_SKIP_CLICKTHROUGH=1` is set.
+
+### Execution
+
+Invoke the `post-deploy-verify` skill, which:
+1. Detects deploy surface (web/desktop/infra) via `scripts/detect-deploy-surface.sh`
+2. Dispatches the appropriate agent-executed protocol:
+   - **web** → `web-clickthrough/SKILL.md` — agent + Playwright MCP: common-sense navigation
+   - **desktop** → `desktop-clickthrough/SKILL.md` — agent + cliclick + CDP (macOS only)
+   - **infra** → `infra-verify/SKILL.md` — script validation (no UI to click through)
+3. Collects results, auto-files GitHub issues for failures
+
+```
+Read and follow skills/post-deploy-verify/SKILL.md.
+Pass: PR_NUMBER, REPO_ROOT, DEPLOY_URL (if web), APP_PATH (if desktop)
+```
+
+### Result Handling
+
+**On all pass:**
+```
+✅ Post-deploy clickthrough: all surfaces passed
+```
+
+**On failure:**
+```
+⚠️ Post-deploy clickthrough: 1/2 surfaces failed
+   web: Journey "Primera Visita" — Step 4 FAILED (QR modal did not appear)
+   → auto-filed issue #N
+```
+Failures auto-file issues labeled `bug` with title prefix `clickthrough-failure:`.
+
+**On skip** (no surfaces, user declined desktop, no Playwright):
+```
+⏭️ Post-deploy clickthrough: no verification run
+```
+
+### Failure Modes
+
+| Failure | Handling |
+|---------|----------|
+| `post-deploy-verify` skill not found | Warn, skip, proceed |
+| `detect-deploy-surface.sh` missing | Warn, skip, proceed |
+| Sub-agent crash/timeout | Log as error, proceed |
+| Playwright MCP not available (web) | Skip web with "Playwright MCP not available" |
+| cliclick not installed (desktop) | Skip desktop with install instructions |
+
+**Always proceed** to `05-cleanup.md` after Step 3.8 (pass, fail, or skip).
