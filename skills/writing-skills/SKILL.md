@@ -126,6 +126,60 @@ If two sources have a skill with the same name, the project version wins. Pi log
 ### Available Tools
 The `allowed-tools` field maps to Pi tool names: `read write edit bash grep find web_search web_fetch todo_write task`. Do NOT use Claude-specific names like `WebSearch`, `WebFetch`, `Skill`.
 
+## Cross-Repo Hard-Link Pattern
+
+### Canonical Home
+
+**agent-infra** is the canonical home for ALL skills used by >=2 repos. The `~/.pi/agent/skills/` symlink points here — this is what Pi reads at runtime.
+
+Consuming repos (eldato, tortoise, premise-labs) hard-link skill files from agent-infra into their `operations/skills/` directory. Hard links share the same inode — editing either path edits the same bytes. Both gits track the identical file.
+
+```
+agent-infra/skills/test-writing/SKILL.md  ←→ same inode, same bytes →  eldato/operations/skills/test-writing/SKILL.md
+```
+
+### Classification Rule
+
+| Skill type | Where it lives | Examples |
+|------------|---------------|----------|
+| **Shared infrastructure** (used by >=2 repos) | agent-infra, hard-linked into consumers | test-writing, test-review, commit-workflow, task-workflow, issue-workflow, executing-plans, plan-review, code-review, writing-plans, issue-creation, issue-scoping |
+| **Product-specific** (references repo-specific paths, APIs, or brands) | In the product repo only (not in agent-infra) | android-deploy (DMer), carousel-b2b-* (eldato), local-app-testing (DMer) |
+
+### Creating a Shared Skill
+
+1. **Create in agent-infra:** Write `agent-infra/skills/<name>/SKILL.md` following all conventions above.
+2. **Hard-link into consumers:**
+   ```bash
+   # In each consuming repo:
+   mkdir -p operations/skills/<name>
+   ln agent-infra/skills/<name>/SKILL.md operations/skills/<name>/SKILL.md
+   ```
+3. **Verify:** Both paths must share the same inode:
+   ```bash
+   ls -li agent-infra/skills/<name>/SKILL.md operations/skills/<name>/SKILL.md
+   # Inode numbers must match
+   ```
+4. **Commit both repos:** The skill content is identical (same bytes), but both repos need to track the file.
+
+### Creating a Product-Specific Skill
+
+Create directly in the product repo's `operations/skills/<name>/SKILL.md`. No hard link needed. Do NOT create in agent-infra.
+
+### Auditing
+
+Check for divergence or missing hard links:
+```bash
+# Find skills in eldato that aren't hard-linked to agent-infra
+for d in operations/skills/*/; do
+  name=$(basename $d)
+  if [ -f "$d/SKILL.md" ] && [ -f "/Users/home/agent-infra/skills/$name/SKILL.md" ]; then
+    inode1=$(ls -i "$d/SKILL.md" | cut -d' ' -f1)
+    inode2=$(ls -i "/Users/home/agent-infra/skills/$name/SKILL.md" | cut -d' ' -f1)
+    [ "$inode1" != "$inode2" ] && echo "NOT HARD-LINKED: $name"
+  fi
+done
+```
+
 ## Quick Checklist
 
 Before committing a new skill, verify:
@@ -138,6 +192,8 @@ Before committing a new skill, verify:
 - [ ] `domain` is a canonical domain
 - [ ] Structure matches the skill type (Bounded/Workflow/reference)
 - [ ] No duplicate name with existing skills
+- [ ] **Cross-repo:** Shared skill? → created in agent-infra, hard-linked into consuming repos. Product-specific? → created in product repo only.
+- [ ] **Hard-link verified:** `ls -li` shows same inode for both paths
 - [ ] References `skill-sync` for version control after creation
 - [ ] ONTOLOGY reference present (if applicable)
 
