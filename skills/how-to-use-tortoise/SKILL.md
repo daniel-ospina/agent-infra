@@ -24,6 +24,7 @@ Safe graph write operations for the Tortoise probabilistic inference graph.
 - Orphaned NAND edges with no cleanup
 - Superseded operators with active edges still propagating
 - Label-based content instead of structural claims
+- Criteria with no provenance — untethered from the customer needs they serve
 
 ## Edge Types
 
@@ -69,6 +70,28 @@ When a claim faces challenge, you have two tools. They address different things:
 | T2 | Secondary Source | Analysis, interpretation of primary sources |
 | T3 | Tertiary Source | Synthesis, summaries, encyclopedias |
 | T4 | Speculative | Hypothetical, unverified claims |
+
+## Decision Provenance: Tracing Criteria to Customer Needs
+
+A decision's criteria shouldn't float. They should trace back to who needs them and why.
+
+```
+Customer Segment → Use Case → Requirement → Criterion → Argument → Option
+```
+
+Each link is an IMPL connection: "this use case implies this requirement," "this requirement implies this criterion." The chain is auditable in both directions:
+
+- **Downward:** Agent asks "which customer segment does this criterion come from?" → traverse IMPL up
+- **Upward:** Agent asks "which decisions does this requirement drive?" → traverse IMPL down through criteria to arguments
+
+**Example:** C1 (provider cannot read content) doesn't come from thin air. It comes from:
+
+- `Customer segment: "Privacy-conscious enterprise teams"`
+- `→ IMPL → Use case: "Legal audit of vendor data access"`
+- `→ IMPL → Requirement: "Provider must not read customer content"`
+- `→ composedOf → Criterion: C1`
+
+An agent auditing an ADR can walk the full chain: understand not just what was decided, but why the criteria exist, who they serve, and whether the decision holds up if those customer needs change.
 
 ## Supersession
 
