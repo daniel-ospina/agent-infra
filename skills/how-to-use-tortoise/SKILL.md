@@ -42,6 +42,24 @@ Mitigations reduce claim confidence. Range: **0.10–0.50**.
 
 Never use <0.10 (negligible) or >0.50 (would invert the claim — use NAND instead).
 
+## Two Dimensions of Critique: Truth vs Weight
+
+When a claim faces challenge, you have two tools. They address different things:
+
+| | NAND | mitigatedBy |
+|---|------|-------------|
+| **What it says** | "This claim is FALSE" | "This claim is TRUE but matters LESS than it seems" |
+| **Dimension** | Correctness | Relevance |
+| **Effect on EP** | Contradiction propagates through graph | Confidence reduction on the edge |
+| **Applies to** | The argument Point directly | The operator (IMPL connection) between argument and what it supports |
+
+**Example:** "A1: Provider cannot read content" supports Option A via IMPL.
+
+- **NAND:** "Metadata reveals topics, so the provider CAN infer some content." → This says A1 is categorically wrong. NAND the A1 point.
+- **mitigatedBy (0.20):** "Metadata is lossy, like email subjects — visible but not the full content." → This says A1 is true, but the privacy claim is weaker than it sounds. Mitigate the IMPL operator.
+
+**Rule of thumb:** If you're saying the argument is wrong → NAND. If you're saying it's overstated → mitigatedBy.
+
 ## SourceKind Taxonomy
 
 | Tier | Label | Description |
@@ -85,3 +103,49 @@ When superseding a point:
 
 ---
 > After writing, verify with tortoise-verify-chain to ensure graph integrity.
+
+# Searching the Graph
+
+Tortoise supports two search modes for different use cases.
+
+## Two Search Modes
+
+| Mode | Tool | What It Does | When to Use |
+|------|------|-------------|-------------|
+| **Full-scan** | `tortoise_query` (context only, no query) | Returns ALL Points in a subgraph | Graph review, finding weak spots, integrity checks, duplicate detection |
+| **Best-match** | `tortoise_search` (with query string) | Returns top-N Points ranked by RRF fusion | Agent context retrieval, entity resolution, "what does the graph believe about X?" |
+
+**Key rule:** Full-scan mode **never filters by confidence** — low-confidence points are exactly what reviewers need to see. Best-match mode annotates confidence but defaults to no filter.
+
+## Which Tool to Use
+
+| Tool | Use When |
+|------|----------|
+| `tortoise_search` | You have a text query and want ranked, relevant results. Returns RRF-fused results from FTS + vector + structural indexes with full EP breakdown. |
+| `tortoise_query` | You want to filter by kind/context without text search. Use `text` param for hybrid search. Supports `order_by` (relevance/confidence) and `min_confidence`. |
+| `tortoise_suggest_entry_points` | You need to resolve an entity name from natural language (e.g., "what entities relate to pricing?"). Uses hybrid search for semantic matching. |
+
+## EP Breakdown Fields
+
+Every search result includes an `ep` object with:
+
+| Field | Meaning | Range |
+|-------|---------|-------|
+| `confidence_mean` | EP Beta posterior mean — how confident the graph is | 0.0–1.0 |
+| `evidence.impl_count` | Number of IMPL (supporting) edges | 0+ |
+| `evidence.nand_count` | Number of NAND (contradicting) edges | 0+ |
+| `evidence.total` | Total edge count (impl + nand) | 0+ |
+| `contention` | Ratio of NAND to total — how disputed the claim is | 0.0–1.0 |
+
+**Interpreting confidence:**
+- 0.50 mean + low total evidence (total < 5) = **uncertainty** — not enough data yet
+- 0.50 mean + high total evidence (total > 10) + high contention (> 0.3) = **disagreement** — strong opposing views
+- 0.85 mean + high total evidence = **settled** — strong supporting evidence
+
+## Ordering and Filtering
+
+- `order_by="relevance"` (default): Results ranked by RRF fusion score — best semantic + keyword match
+- `order_by="confidence"`: Results sorted by EP confidence_mean descending — highest-confidence claims first
+- `min_confidence=0.5`: Only return Points with confidence_mean ≥ 0.5 (default: 0.0 = no filter)
+
+**When to filter by confidence:** Use when you need settled claims for decision-making. Do NOT use when reviewing the graph for weak spots — you need to see low-confidence points to identify what needs verification.
