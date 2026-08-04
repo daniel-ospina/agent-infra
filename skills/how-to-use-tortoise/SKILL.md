@@ -79,7 +79,7 @@ A decision's criteria shouldn't float. They should trace back to who needs them 
 [domain concepts from expansion packs] → Criterion → Argument → Option
 ```
 
-Each link is an IMPL connection. The specific pointKinds in the chain depend on the expansion packs loaded — product-strategy packs provide customer segments and use cases, PM packs provide requirements, core provides decisions and options. Load the packs, check their registered kinds and relations, and wire the chain accordingly.
+Each link is an IMPL connection. The specific pointKinds in the chain depend on the expansion packs loaded. Load the packs, check their registered kinds and relations, and wire the chain accordingly.
 
 The chain is auditable in both directions:
 - **Downward:** "which customer need does this criterion serve?" → traverse IMPL up
