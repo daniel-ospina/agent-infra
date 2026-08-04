@@ -73,23 +73,17 @@ When a claim faces challenge, you have two tools. They address different things:
 
 ## Decision Provenance: Tracing Criteria to Customer Needs
 
-A decision's criteria shouldn't float. They should trace back to who needs them and why.
+A decision's criteria shouldn't float. They should trace back to who needs them and why. The chain flows from customer-facing needs down to architecture choices:
 
 ```
-Customer Segment → Use Case → Requirement → Criterion → Argument → Option
+[domain concepts from expansion packs] → Criterion → Argument → Option
 ```
 
-Each link is an IMPL connection: "this use case implies this requirement," "this requirement implies this criterion." The chain is auditable in both directions:
+Each link is an IMPL connection. The specific pointKinds in the chain depend on the expansion packs loaded — product-strategy packs provide customer segments and use cases, PM packs provide requirements, core provides decisions and options. Load the packs, check their registered kinds and relations, and wire the chain accordingly.
 
-- **Downward:** Agent asks "which customer segment does this criterion come from?" → traverse IMPL up
-- **Upward:** Agent asks "which decisions does this requirement drive?" → traverse IMPL down through criteria to arguments
-
-**Example:** C1 (provider cannot read content) doesn't come from thin air. It comes from:
-
-- `Customer segment: "Privacy-conscious enterprise teams"`
-- `→ IMPL → Use case: "Legal audit of vendor data access"`
-- `→ IMPL → Requirement: "Provider must not read customer content"`
-- `→ composedOf → Criterion: C1`
+The chain is auditable in both directions:
+- **Downward:** "which customer need does this criterion serve?" → traverse IMPL up
+- **Upward:** "which decisions does this requirement drive?" → traverse IMPL down
 
 An agent auditing an ADR can walk the full chain: understand not just what was decided, but why the criteria exist, who they serve, and whether the decision holds up if those customer needs change.
 
