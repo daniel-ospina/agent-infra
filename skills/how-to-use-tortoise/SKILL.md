@@ -4,8 +4,8 @@ description: Create points, operators, mitigations, NANDs, supersede, delete, an
 domain: capability
 type: Workflow
 status: live
-tags: [tortoise, graph, epistemology, knowledge-graph, operations, search, entity-type, pack, decision-comparison, context-discovery]
-summary: "Safe Tortoise graph write operations — teaches edge semantics (IMPL vs NAND), mitigation ranges, supersession cleanup, sourceKind taxonomy, annotation rules, decision comparison workflow, context discovery, DB URI reality, and ID fragmentation."
+tags: [tortoise, graph, epistemology, knowledge-graph, operations, search, entity-type, pack, decision-comparison, discovery]
+summary: "Safe Tortoise graph write operations — teaches edge semantics (IMPL vs NAND), mitigation ranges, supersession cleanup, sourceKind taxonomy, annotation rules, decision comparison workflow, structural discovery, DB URI reality, and ID fragmentation."
 created: 2026-07-14
 updated: 2026-08-05
 allowed-tools: read write edit bash grep find
@@ -167,13 +167,9 @@ The most common high-value agent operation: comparing options against weighted c
 
 **Key insight:** EP propagates belief from evidence through operators to options. More IMPL → higher confidence. More NAND → lower confidence. Mitigated operators → dampened influence.
 
-## Context Convention
+## Anchors Convention
 
-Decision comparisons use their own context to isolate EP propagation:
-
-```python
-ctx = "licensing-decision-compare"  # scoped — won't pollute other decisions
-```
+Decision comparisons use explicit anchor lists to scope EP propagation. Collect all option IDs into a list and pass them to `compute_confidence(anchors=...)`.
 
 ## Code Pattern
 
@@ -198,14 +194,14 @@ findings = {
     "finding:2": "Enterprises ban AGPL internally",
 }
 
-# 4. Create all points
+# 4. Create all points — no context param needed (namespace is pointKind-based)
 all_points = {**criteria, **options, **findings}
 point_ids = {}
 for pid, content in all_points.items():
     kind = "criterion" if pid.startswith("crit:") else (
         "option" if pid.startswith("opt:") else "evidence"
     )
-    p = sdk.create_point(kind, content, context=ctx)
+    p = sdk.create_point(kind, content)
     point_ids[pid] = p["id"]
 
 # 5. Wire edges (findings/criteria → options)
@@ -218,10 +214,11 @@ edges = [
     ("finding:2", "NAND", "opt:agpl"),
 ]
 for src, op_type, tgt in edges:
-    sdk.create_operator(op_type, point_ids[src], [point_ids[tgt]], context=ctx)
+    sdk.create_operator(op_type, point_ids[src], [point_ids[tgt]])
 
-# 6. Compute confidence
-result = sdk.compute_confidence(context=ctx)
+# 6. Compute confidence via anchors (options are the anchor set)
+option_ids = [point_ids[pid] for pid in options]
+result = sdk.compute_confidence(anchors=option_ids, max_hops=2, direction="incoming")
 confs = result.get("confidences", {})
 
 # 7. Rank options
@@ -258,12 +255,12 @@ Generic decision comparison tool. Will accept criteria/options/findings as struc
 
 ## Decision Comparison Checklist
 
-- [ ] Context scoped to this decision (e.g., `"pricing-decision-compare"`)
+- [ ] Option IDs collected in an anchors list for `compute_confidence(anchors=...)`
 - [ ] Criteria points created with kind=`"criterion"`
 - [ ] Option points created with kind=`"option"`
 - [ ] Evidence/finding points created with kind=`"evidence"`
 - [ ] Each edge wired: finding/criterion → option via IMPL (support) or NAND (oppose)
-- [ ] `compute_confidence(context=ctx)` called after all edges
+- [ ] `compute_confidence(anchors=[option_ids], max_hops=2, direction="incoming")` called after all edges
 - [ ] Options ranked by `confidence_mean` descending
 - [ ] ✅ CORRECT: NAND on operator when option opposes criterion
 - [ ] ❌ WRONG: NAND on option/criterion points themselves — they ARE options/criteria
@@ -278,7 +275,7 @@ Tortoise supports two search modes for different use cases.
 
 | Mode | Tool | What It Does | When to Use |
 |------|------|-------------|-------------|
-| **Full-scan** | `tortoise_query` (context only, no query) | Returns ALL Points in a subgraph | Graph review, finding weak spots, integrity checks, duplicate detection |
+| **Full-scan** | `tortoise_query` (kind only, no query) | Returns ALL Points of a given pointKind | Graph review, finding weak spots, integrity checks, duplicate detection |
 | **Best-match** | `tortoise_search` (with query string) | Returns top-N Points ranked by RRF fusion | Agent context retrieval, entity resolution, "what does the graph believe about X?" |
 
 **Key rule:** Full-scan mode **never filters by confidence** — low-confidence points are exactly what reviewers need to see. Best-match mode annotates confidence but defaults to no filter.
@@ -288,7 +285,7 @@ Tortoise supports two search modes for different use cases.
 | Tool | Use When |
 |------|----------|
 | `tortoise_search` | You have a text query and want ranked, relevant results. Returns RRF-fused results from FTS + vector + structural indexes with full EP breakdown. |
-| `tortoise_query` | You want to filter by kind/context without text search. Use `text` param for hybrid search. Supports `order_by` (relevance/confidence) and `min_confidence`. |
+| `tortoise_query` | You want to filter by kind without text search. Use `text` param for hybrid search. Supports `order_by` (relevance/confidence) and `min_confidence`. |
 | `tortoise_suggest_entry_points` | You need to resolve an entity name from natural language (e.g., "what entities relate to pricing?"). Uses hybrid search for semantic matching. |
 
 ## EP Breakdown Fields
@@ -350,7 +347,7 @@ Hybrid search degrades gracefully when indexes are unavailable:
 | **Structural** | Always available | N/A — uses native property filters |
 | **TF-IDF** | Last resort (in-memory) | Only triggered if all FalkorDB strategies fail |
 
-A 500ms timeout caps all strategies. If all FalkorDB strategies fail, the system falls back to in-memory TF-IDF for Point queries. For Event/Subject queries without FTS indexes, only structural (kind/context) filtering is available.
+A 500ms timeout caps all strategies. If all FalkorDB strategies fail, the system falls back to in-memory TF-IDF for Point queries. For Event/Subject queries without FTS indexes, only structural (kind) filtering is available.
 
 ## Creating Relationships with Semantic Labels
 
@@ -372,55 +369,46 @@ sdk.set_point_baseline(op["id"], alpha=10, beta=1)  # strong support
 
 ---
 
-# Context Discovery
+# Discovery
 
-Contexts scope points into subgraphs. Finding what contexts exist is necessary before searching or filing decisions.
+Points are organized by `pointKind` (structural type) and source provenance (`extractedFrom` edges). Use these APIs to discover what's in the graph before searching or filing decisions.
 
-## Listing Contexts
+## Listing PointKinds
 
-**Preferred (when available):**
 ```python
-sdk.list_contexts()
-# or via MCP: tortoise_list_contexts()
+sdk.list_pointkinds()
+# or via MCP: tortoise_list_pointkinds()
 ```
 
-> The MCP server currently does not expose `list_contexts` — it will land with the generic `decide.py` tooling (Issue #43). Use the fallback until then.
+Returns `[{pointKind, count}, ...]` ordered by count DESC — what structural types actually EXIST in the graph.
 
-**Fallback (raw Cypher):**
+## Listing Sources
+
 ```python
-result = sdk._proj.graph.query(
-    "MATCH (n:Point) WHERE n.context IS NOT NULL "
-    "RETURN n.context, count(*) as c ORDER BY c DESC"
-)
-for row in result.result_set:
-    print(f"  {row[0]}: {row[1]} points")
+sdk.list_sources()
+# or via MCP: tortoise_list_sources()
 ```
 
-**Typical output:**
+Returns sources grouped by `sourceKind` with point counts — where data came FROM.
+
+## Pack Registry
+
+Packs declare what KINDS and RELATIONS can exist:
+
+```python
+# What edge types are registered across all installed packs?
+sdk.list_relations()  # returns fromKind/toKind/mechanism triplets
+
+# What kinds does a pack declare (including subclass/equivalence expansion)?
+sdk.expand_kind("WorkItem")  # returns ["dev:issue", "pm:task", ...]
 ```
-  licensing-decision-compare: 52 points
-  licensing-decision: 86 points
-  pricing-decision-compare: 18 points
-  sdk: 5482 points (default context for operator-only edges)
-```
-
-## Naming Convention
-
-Contexts are **free-form strings** today — no enforced convention. Common patterns observed:
-
-| Pattern | Example | Used For |
-|---------|---------|----------|
-| `<domain>-decision` | `licensing-decision` | Single-decision filings |
-| `<domain>-decision-compare` | `licensing-decision-compare` | Multi-option comparisons with EP |
-| `<domain>` | `sdk`, `endometriosis` | Domain-scoped knowledge bases |
-
-> Issue #49 tracks enforcing a context naming convention. Until resolved, follow the existing patterns in the graph (run the fallback query to discover what's used).
 
 ## Discovery Checklist
 
-- [ ] Ran `list_contexts` or fallback Cypher before creating new points
-- [ ] Matched the naming pattern of existing related contexts
-- [ ] Used a new, unique context for a new decision comparison (don't pollute existing contexts)
+- [ ] Ran `list_pointkinds()` before creating new points — know what structural types exist
+- [ ] Ran `list_sources()` if the data has provenance — know where existing data came from
+- [ ] Used pack-registered kinds for new points (check `list_relations()` / `expand_kind()`) 
+- [ ] For decision comparisons: collected option IDs in an anchors list for `compute_confidence(anchors=...)`
 
 ---
 
@@ -439,7 +427,7 @@ Before any graph operation, confirm you're on the right database:
 
 ```python
 # Via SDK
-sdk.taxonomy()  # or tortoise_status() — returns point counts, contexts, graph name
+sdk.taxonomy()  # or tortoise_status() — returns point counts, pointKinds, graph name
 ```
 
 Or via MCP:
