@@ -4,10 +4,10 @@ description: Create points, operators, mitigations, NANDs, supersede, delete, an
 domain: capability
 type: Workflow
 status: live
-tags: [tortoise, graph, epistemology, knowledge-graph, operations]
-summary: "Safe Tortoise graph write operations — teaches edge semantics (IMPL vs NAND), mitigation ranges, supersession cleanup, sourceKind taxonomy, and annotation rules."
+tags: [tortoise, graph, epistemology, knowledge-graph, operations, search, entity-type, pack, decision-comparison, context-discovery]
+summary: "Safe Tortoise graph write operations — teaches edge semantics (IMPL vs NAND), mitigation ranges, supersession cleanup, sourceKind taxonomy, annotation rules, decision comparison workflow, context discovery, DB URI reality, and ID fragmentation."
 created: 2026-07-14
-updated: 2026-07-31
+updated: 2026-08-05
 allowed-tools: read write edit bash grep find
 ---
 
@@ -43,7 +43,7 @@ Mitigations reduce claim confidence. Range: **0.10–0.50**.
 
 Never use <0.10 (negligible) or >0.50 (would invert the claim — use NAND instead).
 
-## Two Dimensions of Critique: Truth vs Weight
+## The Critical Semantic: Truth vs Weight
 
 When a claim faces challenge, you have two tools. They address different things:
 
@@ -54,12 +54,40 @@ When a claim faces challenge, you have two tools. They address different things:
 | **Effect on EP** | Contradiction propagates through graph | Confidence reduction on the edge |
 | **Applies to** | The argument Point directly | The operator (IMPL connection) between argument and what it supports |
 
-**Example:** "A1: Provider cannot read content" supports Option A via IMPL.
+**The golden rule:** Relevance lives on the OPERATOR, truth lives on the POINT.
+
+- An option IS an option (it's true that it's a candidate); a criterion IS a criterion — **never NAND an option or criterion for being a bad fit.** A bad fit is a relevance problem, not a truth problem.
+- If a FINDING is factually untrue → NAND the finding Point directly (truth attack).
+- If a finding is TRUE but IRRELEVANT to the option/criterion → NAND/IMPL the OPERATOR between them, or mitigate the operator (relevance attack, range 0.10–0.50).
+- If an OPTION doesn't satisfy a CRITERION well → NAND the IMPL OPERATOR between them, or mitigate it — never NAND the option or criterion points themselves.
+
+### Worked Example: Option ↔ Criterion
+
+**Setup:** "Option:AGPLv3-dual-license" should score well on "Criterion:adoption" (OSI-approved status). Finding says "AGPLv3 is OSI-approved."
+
+| Scenario | What you do | Why |
+|----------|-------------|-----|
+| "Finding:agpl-osi" says AGPLv3 is OSI-approved (TRUE) | Create IMPL from finding → option:agplv3-dual | Truth + relevance both correct |
+| "Finding:agpl-enterprise-risk" says enterprises ban AGPL (TRUE) | Create NAND from finding → option:agplv3-dual | True fact that COUNTERS the option — NAND on the OPERATOR (finding opposes option), not on the option point itself |
+| "Finding:bsl-osi-gap" says BSL is OSI-approved (FALSE — it's not) | NAND the finding Point directly | The finding is factually wrong — truth attack on the Point |
+| Option:agplv3-dual doesn't fit Criterion:stack-compat well (Apache 2.0 compat question) | NAND the operator between criterion and option, or mitigate it at 0.30 | The option and criterion are both true; the RELATIONSHIP is weak — relevance attack on the operator |
+
+### Quick Decision Tree
+
+```
+Challenge received:
+├─ Claim is FACTUALLY WRONG? → NAND the Point directly (truth attack)
+├─ Claim is TRUE but OVERSTATED? → mitigate_operator on the edge (relevance attack, 0.10–0.50)
+├─ Claim is TRUE but IRRELEVANT to what it's connected to? → NAND the operator (relevance attack)
+└─ Option is a BAD FIT for a criterion? → NAND/mitigate the operator between them, never the option or criterion points
+```
+
+**Original example (argument↔option):** "A1: Provider cannot read content" supports Option A via IMPL.
 
 - **NAND:** "Metadata reveals topics, so the provider CAN infer some content." → This says A1 is categorically wrong. NAND the A1 point.
 - **mitigatedBy (0.20):** "Metadata is lossy, like email subjects — visible but not the full content." → This says A1 is true, but the privacy claim is weaker than it sounds. Mitigate the IMPL operator.
 
-**Rule of thumb:** If you're saying the argument is wrong → NAND. If you're saying it's overstated → mitigatedBy.
+**Rule of thumb:** If you're saying the argument is wrong → NAND. If you're saying it's overstated or irrelevant → mitigatedBy or NAND the operator.
 
 ## SourceKind Taxonomy
 
@@ -114,12 +142,133 @@ When superseding a point:
 - [ ] Have I read the target point's current edges?
 - [ ] Am I using the correct edge type (IMPL vs NAND)?
 - [ ] If mitigation: is the value in 0.10–0.50 range?
-- [ ] If NAND: have I checked for existing IMPL edges?
+- [ ] If NAND: am I attacking truth (NAND the Point) or relevance (NAND/mitigate the Operator)?
+- [ ] Am I about to NAND an option or criterion? STOP — options and criteria are true by definition. Attack the operator instead.
 - [ ] If superseding: will I call supersede_point (not manually move edges)?
 - [ ] Are my annotations sentence-case rationales, not labels?
 
 ---
 > After writing, verify with tortoise-verify-chain to ensure graph integrity.
+
+# Decision Comparison Workflow
+
+The most common high-value agent operation: comparing options against weighted criteria using evidence, then ranking them by EP belief propagation.
+
+## Pattern
+
+```
+1. Define criteria (evaluation dimensions)
+2. Define options (candidates)
+3. Gather findings (evidence points — research, observations, data)
+4. Wire findings/criteria → options via IMPL (supports) or NAND (opposes)
+5. Run compute_confidence
+6. Read per-option confidence, ranked highest → lowest
+```
+
+**Key insight:** EP propagates belief from evidence through operators to options. More IMPL → higher confidence. More NAND → lower confidence. Mitigated operators → dampened influence.
+
+## Context Convention
+
+Decision comparisons use their own context to isolate EP propagation:
+
+```python
+ctx = "licensing-decision-compare"  # scoped — won't pollute other decisions
+```
+
+## Code Pattern
+
+```python
+from tortoise.sdk import TortoiseSDK
+
+sdk = TortoiseSDK()
+
+# 1. Criteria — evaluation dimensions (pointKind: "criterion")
+criteria = {
+    "crit:adoption": "OSI-approved / recognizable open source status",
+    "crit:enterprise": "Enterprise procurement acceptability",
+}
+# 2. Options — candidates (pointKind: "option")
+options = {
+    "opt:agpl": "AGPLv3 license",
+    "opt:mit": "MIT license",
+}
+# 3. Findings — evidence (pointKind: "evidence")
+findings = {
+    "finding:1": "AGPL is OSI-approved",
+    "finding:2": "Enterprises ban AGPL internally",
+}
+
+# 4. Create all points
+all_points = {**criteria, **options, **findings}
+point_ids = {}
+for pid, content in all_points.items():
+    kind = "criterion" if pid.startswith("crit:") else (
+        "option" if pid.startswith("opt:") else "evidence"
+    )
+    p = sdk.create_point(kind, content, context=ctx)
+    point_ids[pid] = p["id"]
+
+# 5. Wire edges (findings/criteria → options)
+edges = [
+    # Criterion supports option
+    ("crit:adoption", "IMPL", "opt:agpl"),
+    # Finding supports option
+    ("finding:1", "IMPL", "opt:agpl"),
+    # Finding opposes option
+    ("finding:2", "NAND", "opt:agpl"),
+]
+for src, op_type, tgt in edges:
+    sdk.create_operator(op_type, point_ids[src], [point_ids[tgt]], context=ctx)
+
+# 6. Compute confidence
+result = sdk.compute_confidence(context=ctx)
+confs = result.get("confidences", {})
+
+# 7. Rank options
+ranked = sorted(
+    [(pid, confs.get(point_ids[pid], {}).get("mean", 0))
+     for pid in options],
+    key=lambda x: x[1], reverse=True
+)
+for pid, confidence in ranked:
+    print(f"  {pid}: {confidence:.4f}")
+```
+
+## Link-Before-Create Rule
+
+Before creating a new evidence point, search whether it already exists:
+- Use `tortoise_search` with the evidence claim as query
+- Use `create_point` with `dedup=True` (idempotent — returns existing if content matches)
+- This prevents duplicate evidence points that fragment EP propagation
+
+## Worked Examples
+
+### `graph-scripts/file_pricing_decision.py`
+Compares Pro/Team pricing options ($29/$49/$79) using criteria (competitor positioning, conversion rate, ARPU) and findings (devtool sweetspot, OSS conversion rates). Wires IMPL to chosen options, NAND to rejected ones. EP computes per-option confidence.
+
+### `graph-scripts/decide_licensing.py`
+Compares 3 license options (AGPLv3-dual, BSL+AGPL, SSPL) using 7 criteria and 20+ findings. Full pattern: criteria → options → findings → edges → compute_confidence → ranked output. Run as:
+
+```bash
+TORTOISE_DB_URI=docker://:@localhost:16379/tortoise python3 graph-scripts/decide_licensing.py
+```
+
+### `graph-scripts/decide.py` (future — Issue #43)
+Generic decision comparison tool. Will accept criteria/options/findings as structured input and automate the create→wire→compute→rank pipeline. Until it lands, follow the pattern above manually.
+
+## Decision Comparison Checklist
+
+- [ ] Context scoped to this decision (e.g., `"pricing-decision-compare"`)
+- [ ] Criteria points created with kind=`"criterion"`
+- [ ] Option points created with kind=`"option"`
+- [ ] Evidence/finding points created with kind=`"evidence"`
+- [ ] Each edge wired: finding/criterion → option via IMPL (support) or NAND (oppose)
+- [ ] `compute_confidence(context=ctx)` called after all edges
+- [ ] Options ranked by `confidence_mean` descending
+- [ ] ✅ CORRECT: NAND on operator when option opposes criterion
+- [ ] ❌ WRONG: NAND on option/criterion points themselves — they ARE options/criteria
+
+---
 
 # Searching the Graph
 
@@ -166,3 +315,177 @@ Every search result includes an `ep` object with:
 - `min_confidence=0.5`: Only return Points with confidence_mean ≥ 0.5 (default: 0.0 = no filter)
 
 **When to filter by confidence:** Use when you need settled claims for decision-making. Do NOT use when reviewing the graph for weak spots — you need to see low-confidence points to identify what needs verification.
+
+## Entity Types
+
+`tortoise_search` and `tortoise_query` support cross-entity search via `entity_type`:
+
+| entity_type | Searches | ID Field | Kind Field | FTS Index |
+|------------|----------|----------|------------|-----------|
+| `point` (default) | Point nodes | `id` | `pointKind` | `Point` |
+| `event` | Event nodes | `eventId` | `eventKind` | `Event` |
+| `subject` | Subject nodes | `id` | `subjectKind` | `Subject` |
+
+Non-Point entities skip EP annotation (no confidence breakdown in results).
+
+## Pack-Aware Search
+
+Kind values are expanded through pack registries before queries execute. When you search for a kind like `WorkItem`, the system automatically includes:
+
+- **subclassOf**: Subclasses registered in packs (e.g., `dev:issue`, `pm:task`)
+- **equivalentTo**: Bidirectional equivalents (e.g., `dev:issue` ↔ `pm:task`)
+
+This means `tortoise_search(query="auth bug", kind="WorkItem")` matches both dev and PM work items automatically. No manual kind expansion needed.
+
+Pack relations are queryable via `list_relations()`, which returns declared edge schemas with fromKind/toKind/mechanism triplets across all installed packs.
+
+## Degradation Behavior
+
+Hybrid search degrades gracefully when indexes are unavailable:
+
+| Strategy | When Available | Degradation |
+|----------|---------------|-------------|
+| **FTS** | FalkorDB fulltext index exists | Skipped silently if index missing |
+| **Vector** | Embedding model + vector index | Falls back to brute-force Euclidean distance; skips if no embeddings |
+| **Structural** | Always available | N/A — uses native property filters |
+| **TF-IDF** | Last resort (in-memory) | Only triggered if all FalkorDB strategies fail |
+
+A 500ms timeout caps all strategies. If all FalkorDB strategies fail, the system falls back to in-memory TF-IDF for Point queries. For Event/Subject queries without FTS indexes, only structural (kind/context) filtering is available.
+
+## Creating Relationships with Semantic Labels
+
+When connecting Points with operators, use the `label` parameter to add domain context:
+
+| Semantic Type | Mechanism | Direction | When to Use |
+|--------------|-----------|-----------|-------------|
+| **hasPart** | IMPL | Bidirectional (parts↔whole) | Composition — "Epic hasPart Issue", "Product hasPart Feature" |
+| **addresses** | IMPL | Unidirectional (A→B) | "Feature addresses Need", "Task implements Feature" |
+| **opposes** | NAND | Unidirectional (A→B) | "Feature competesWith Competitor", "Issue blocks Issue" |
+
+**Strength:** Set via `set_point_baseline(operator_id, alpha, beta)`. High alpha = strong support. High beta = strong contradiction.
+
+```python
+# Create a relationship with semantic context
+op = sdk.create_operator("IMPL", feature_id, [need_id], label="addresses")
+sdk.set_point_baseline(op["id"], alpha=10, beta=1)  # strong support
+```
+
+---
+
+# Context Discovery
+
+Contexts scope points into subgraphs. Finding what contexts exist is necessary before searching or filing decisions.
+
+## Listing Contexts
+
+**Preferred (when available):**
+```python
+sdk.list_contexts()
+# or via MCP: tortoise_list_contexts()
+```
+
+> The MCP server currently does not expose `list_contexts` — it will land with the generic `decide.py` tooling (Issue #43). Use the fallback until then.
+
+**Fallback (raw Cypher):**
+```python
+result = sdk._proj.graph.query(
+    "MATCH (n:Point) WHERE n.context IS NOT NULL "
+    "RETURN n.context, count(*) as c ORDER BY c DESC"
+)
+for row in result.result_set:
+    print(f"  {row[0]}: {row[1]} points")
+```
+
+**Typical output:**
+```
+  licensing-decision-compare: 52 points
+  licensing-decision: 86 points
+  pricing-decision-compare: 18 points
+  sdk: 5482 points (default context for operator-only edges)
+```
+
+## Naming Convention
+
+Contexts are **free-form strings** today — no enforced convention. Common patterns observed:
+
+| Pattern | Example | Used For |
+|---------|---------|----------|
+| `<domain>-decision` | `licensing-decision` | Single-decision filings |
+| `<domain>-decision-compare` | `licensing-decision-compare` | Multi-option comparisons with EP |
+| `<domain>` | `sdk`, `endometriosis` | Domain-scoped knowledge bases |
+
+> Issue #49 tracks enforcing a context naming convention. Until resolved, follow the existing patterns in the graph (run the fallback query to discover what's used).
+
+## Discovery Checklist
+
+- [ ] Ran `list_contexts` or fallback Cypher before creating new points
+- [ ] Matched the naming pattern of existing related contexts
+- [ ] Used a new, unique context for a new decision comparison (don't pollute existing contexts)
+
+---
+
+# DB URI Reality
+
+**The MCP server and the repo default use different FalkorDB ports. Using the wrong port silently reads a different (near-empty) graph.**
+
+| Source | Default URI | What's There |
+|--------|------------|--------------|
+| **MCP server** | `docker://:@localhost:16379/tortoise` | The real graph (5482+ points) — `falkordb-personal` |
+| **Repo default** | `docker://:@localhost:6379/tortoise` | A different graph (~86 points) — `falkordb` |
+
+## Always Verify First
+
+Before any graph operation, confirm you're on the right database:
+
+```python
+# Via SDK
+sdk.taxonomy()  # or tortoise_status() — returns point counts, contexts, graph name
+```
+
+Or via MCP:
+```
+tortoise_summarize_structure  # returns {gateN_*, total} — should be ~5482+ on real graph
+```
+
+## Common Failure Mode
+
+```
+Agent: "Let me search for licensing evidence..."
+       (queries port 6379 by default → finds 0 points)
+Agent: "The graph has no licensing data. I'll create evidence from scratch."
+       (files 20+ duplicate points on the wrong graph)
+```
+
+**Fix:** Always set `TORTOISE_DB_URI` explicitly or use the MCP tools (which already point at 16379).
+
+```bash
+export TORTOISE_DB_URI=docker://:@localhost:16379/tortoise
+```
+
+---
+
+# ID Fragmentation
+
+**Point IDs are NOT uniformly ULIDs. Don't assume the ID format.**
+
+| Format | Example | Origin |
+|--------|---------|--------|
+| **ULID** (canonical) | `01JR8KZ5V7X2M3N4P6Q8R9T0W1` | `create_point` with ULID generation |
+| **19fc-hash** | `19fc8a3b4c5d6e7f8a9b0c1d2e3f4a5b` | Early creation path |
+| **Numeric** | `42`, `1337` | Legacy/bulk-imported points |
+| **Prefixed** | `letta-abc123`, `op-xyz789`, `ARCH_001`, `SVBP_002` | Legacy systems, specific graph-scripts |
+
+## What This Means
+
+- **Always use the returned `id` property** — never construct or guess an ID
+- **Store IDs, not derive them** — if you need to reference a point later, save its `id` from the response
+- **Search by content, not ID** — `dedup=True` and `tortoise_search` handle resolution; you don't need to know the format
+
+## Related Issues
+
+- **#44 (FIXED):** `traverse` used to leak internal FalkorDB node IDs instead of public Point IDs. Fixed — traverse now returns the canonical `id` property.
+- **#52 (DONE):** Audit script validates ID format consistency across the graph and ULID validation in `create_point`.
+
+---
+
+> Continue following the workflow as mandated by this skill. Do not skip steps.
