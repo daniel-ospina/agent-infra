@@ -36,6 +36,8 @@ interface McpServerConfig {
   // URL transport (SSE/streamable HTTP)
   url?: string;
   headers?: Record<string, string>;
+  // Connection timeout override (ms). Defaults to 15000 if unset.
+  timeoutMs?: number;
 }
 
 interface McpJson {
@@ -168,14 +170,16 @@ class McpServerManager {
       console.log(`[mcp-client] PI_MCP_SERVERS set → loading ${serverEntries.length} of ${Object.keys(servers).length} servers (skipped: ${skipped.join(", ")})`);
     }
 
-    const CONNECTION_TIMEOUT_MS = 15000;
+    const DEFAULT_CONNECTION_TIMEOUT_MS = 15000;
 
     // Connect to all servers in parallel with per-server timeout.
+    // Each server can override via timeoutMs in .mcp.json (e.g. tortoise needs ~30s for warm-up).
     // Track server names alongside results so error logs identify which server failed.
     const results = await Promise.allSettled(
       serverEntries.map(async ([serverName, serverConfig]) => {
         const startTime = Date.now();
-        await this.connectServer(serverName, serverConfig, CONNECTION_TIMEOUT_MS);
+        const timeoutMs = serverConfig.timeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS;
+        await this.connectServer(serverName, serverConfig, timeoutMs);
         console.log(`[mcp-client] Connected to '${serverName}' (${Date.now() - startTime}ms)`);
         return serverName;
       })
