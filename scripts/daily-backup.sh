@@ -22,9 +22,14 @@ BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
 CONTAINER="${CONTAINER:-falkordb-personal}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 KEEP="${1:-14}"
-# If second arg is --keep N, parse it
+# If first arg is --keep, shift and read N
 if [ "$KEEP" = "--keep" ]; then
     KEEP="${2:-14}"
+fi
+# Validate KEEP is a positive integer (P1: non-numeric would eval to 1)
+if ! [[ "$KEEP" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --keep value must be a positive integer, got '$KEEP'" >&2
+    exit 1
 fi
 
 # ── Ensure backup directories exist ──────────────────────────────
@@ -49,6 +54,12 @@ for i in $(seq 1 30); do
     fi
     sleep 2
 done
+
+# P1(a): Fatal if BGSAVE did not complete within the timeout loop
+if [ "${BGSAVE_STATUS:-1}" != "0" ]; then
+    echo "ERROR: BGSAVE did not complete after 30 attempts (60s timeout)" >&2
+    exit 1
+fi
 
 # ── Step 2: Query graph metadata (point counts) ───────────────────
 echo "[$(date '+%H:%M:%S')] Querying graph point counts..."
@@ -119,10 +130,20 @@ echo "[$(date '+%H:%M:%S')] Pruning backups (keep=$KEEP)..."
 prune_dir() {
     local dir="$1"
     if [ ! -d "$dir" ]; then return; fi
-    ls -1dt "$dir"/*/ 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do
-        echo "  Removing: $old"
-        rm -rf "$old"
-    done
+    # P1(b): nullglob + pre-check avoids crash on empty dirs under pipefail
+    local nullglob_was_set
+    if shopt -q nullglob 2>/dev/null; then nullglob_was_set=1; fi
+    shopt -s nullglob 2>/dev/null || true
+    local matches=("$dir"/*/)
+    if [ ${#matches[@]} -gt 0 ]; then
+        ls -1dt "${matches[@]}" 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do
+            echo "  Removing: $old"
+            rm -rf "$old"
+        done
+    fi
+    if [ -z "${nullglob_was_set:-}" ]; then
+        shopt -u nullglob 2>/dev/null || true
+    fi
 }
 
 prune_dir "$BACKUP_ROOT"

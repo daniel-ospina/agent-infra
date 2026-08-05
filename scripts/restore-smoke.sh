@@ -35,6 +35,10 @@ cleanup() {
     if [ -n "${SMOKE_VOLUME:-}" ]; then
         docker volume rm "$SMOKE_VOLUME" 2>/dev/null || true
     fi
+    # P2: cleanup the temp dir used for RDB
+    if [ -n "${SMOKE_TMPDIR:-}" ] && [ -d "$SMOKE_TMPDIR" ]; then
+        rm -rf "$SMOKE_TMPDIR"
+    fi
     exit $exit_code
 }
 trap cleanup EXIT
@@ -141,9 +145,14 @@ if [ "$TOTAL_POINTS" -le 0 ]; then
     exit 1
 fi
 
-# Compare with manifest if available
+# Compare with manifest if available — try jq first, python3 as fallback (P2)
 if [ -f "$BACKUP_DIR/manifest.json" ]; then
-    MANIFEST_TOTAL=$(python3 -c "import json; d=json.load(open('$BACKUP_DIR/manifest.json')); print(d.get('total_points', 0))" 2>/dev/null || echo "?")
+    MANIFEST_TOTAL="?"
+    if command -v jq &>/dev/null; then
+        MANIFEST_TOTAL=$(jq -r '.total_points // 0' "$BACKUP_DIR/manifest.json" 2>/dev/null || echo "?")
+    elif command -v python3 &>/dev/null; then
+        MANIFEST_TOTAL=$(python3 -c "import json; d=json.load(open('$BACKUP_DIR/manifest.json')); print(d.get('total_points', 0))" 2>/dev/null || echo "?")
+    fi
     echo "  Manifest expected: $MANIFEST_TOTAL points"
     if [ "$MANIFEST_TOTAL" != "?" ] && [ "$TOTAL_POINTS" -lt "$MANIFEST_TOTAL" ]; then
         echo -e "${YELLOW}WARNING${NC}: Restored points ($TOTAL_POINTS) < manifest ($MANIFEST_TOTAL)"

@@ -217,17 +217,17 @@ for props in operators:
         # Create edges from operator → source and operator → target
         edge_type = "hasPart" if op_type not in ("IMPL", "NAND", "ALTERNATIVE_TO") else op_type
 
-        # Edge to source (idx=0)
+        # Edge to source (idx=0) — MERGE to avoid duplicates on re-run
         target_g.query(
             f"MATCH (o:Point {{id: $oid}}), (s:Point {{id: $sid}}) "
-            f"CREATE (o)-[:{edge_type} {{idx: 0}}]->(s)",
+            f"MERGE (o)-[:{edge_type} {{idx: 0}}]->(s)",
             params={"oid": pid, "sid": source_id},
         )
 
-        # Edge to target (idx=1)
+        # Edge to target (idx=1) — MERGE to avoid duplicates on re-run
         target_g.query(
             f"MATCH (o:Point {{id: $oid}}), (t:Point {{id: $tid}}) "
-            f"CREATE (o)-[:{edge_type} {{idx: 1}}]->(t)",
+            f"MERGE (o)-[:{edge_type} {{idx: 1}}]->(t)",
             params={"oid": pid, "tid": target_id},
         )
         written_ops += 1
@@ -284,4 +284,8 @@ total_elapsed = time.time() - t0
 
 print(f"\n{'=' * 70}")
 print(f"Done in {total_elapsed:.1f}s total")
+if errors_stmt > 0 or errors_ops > 0:
+    print(f"ERRORS: {errors_stmt} statement write errors, {errors_ops} operator write errors")
+    print(f"{'=' * 70}")
+    sys.exit(1)
 print(f"{'=' * 70}")
