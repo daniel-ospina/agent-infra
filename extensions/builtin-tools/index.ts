@@ -490,13 +490,17 @@ export default function (pi: ExtensionAPI) {
       const subAgentEnv: Record<string, string | undefined> = {
   ...process.env,
   PI_SKIP_VERSION_CHECK: "1",
-  // Skip extensions sub-agents never need (one-shot, no git/slack/loops/vision)
+  // Skip extensions sub-agents never need (one-shot, no git/slack/loops/vision).
+  // Gate overrides: sub-agents can't dispatch `task` to satisfy verification-gate
+  // or review-enforcer → deadlock → 480s hang. Parent session enforces gates centrally.
   SKILL_ENFORCER_DISABLED: "1",
   LOOP_ENFORCER_DISABLED: "1",
   SLACK_BRIDGE_DISABLE: "1",
   VISION_INTERCEPTOR_DISABLED: "1",
   ELDATO_ALLOW_MAIN_EDITS: "1",  // dual-support: also set AGENT_ variant (#7549)
   AGENT_ALLOW_MAIN_EDITS: "1",
+  ELDATO_SKIP_VGATE: "1",        // sub-agents lack `task` tool; parent enforces gates
+  AGENT_SKIP_REVIEW_GATE: "1",   // sub-agents lack `task` tool; parent enforces gates
 };
       if (params.mcp_servers) {
         subAgentEnv.PI_MCP_SERVERS = params.mcp_servers;
