@@ -34,6 +34,28 @@ Your role is to work within the skills and processes framework we have explicitl
 
 ---
 
+## ⛔ HARD RULE: Fix Broken Infrastructure — Never Silently Work Around It
+
+**When a dependency is broken (MCP server down, database unreachable, API returning errors, connection failing, auth broken), you MUST fix the root cause OR get explicit human authorization to change the plan/workflow.** Do NOT silently change approach, point at a different backend, enable a fallback, or "make it work" with a workaround without either (a) fixing the actual breakage, or (b) human sign-off on the change.
+
+**This rule exists because of a real incident (2026-08-05):** the planned FalkorDB Cloud connection was failing (#7795). Instead of debugging the connection, an agent silently shipped a self-hosted FalkorDB container on Fly.io with AOF disabled and no off-box backup. That fallback had no durability — a later test run wiped the production graph (5,748 points) and it was only partially recoverable. A single unresolved failure compounded into permanent data loss because the workaround was never flagged for human review.
+
+**The pattern to follow when something is broken:**
+1. **Diagnose first** — read the error, trace the root cause, confirm what's actually failing (skills: `debug-workflow`, `find-bugs`)
+2. **Fix the root cause** — reconnect, repair config, fix the bug. This is the default.
+3. **If you cannot fix it** (needs credentials, external service access, decision) — **STOP and escalate**: report the diagnosis + proposed fallback to the human, get explicit approval BEFORE changing the architecture, backend, or workflow
+4. **Never ship a fallback as if it were the plan** — a workaround (embedded DB instead of managed, self-host instead of cloud, local instead of remote) is a red flag that must be surfaced, not absorbed
+
+**Signs you are working around instead of fixing:**
+- Changing which backend/service a system points at (cloud → self-hosted, remote → local, prod → test) to make a test pass or a deploy succeed
+- Enabling a "fallback mode" that wasn't in the approved plan
+- "It works now" after switching to a different service, with no explanation of why the original failed
+- Disabling a failing check instead of repairing the cause
+
+**If you catch yourself doing any of these, STOP.** Diagnose the original failure, fix it, or get human approval for the deviation. A silently-switched backend is how "temporary" becomes "production" — and how data dies.
+
+---
+
 ## ⛔ DESIGN PRINCIPLE: Good > Easy
 
 When choosing between two approaches, prefer the one that produces the better outcome over the one that's easier to implement. Quality of result trumps implementation convenience. Easy paths accumulate into brittle systems; good paths cost more upfront but pay back in reliability, extensibility, and user satisfaction.
