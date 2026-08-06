@@ -5,15 +5,21 @@ browser + Terminal. Your models, agents, extensions, and skills all come from
 here — the only thing you add by hand are your API keys (for security, keys are
 never stored in this repo).
 
-## Step 1 — Get this repo onto the new Mac (no git required)
+## Step 1 — Clone the repo (needed for auto-sync)
 
-1. On the new Mac, open Safari/Chrome and go to:
-   `https://github.com/daniel-ospina/agent-infra`
-2. Click the green **Code** button → **Download ZIP**
-3. Open Downloads, double-click the ZIP to unzip
-4. Drag the **`agent-infra`** folder into your home folder
-   (home = the folder with Desktop/Documents inside; press Cmd+Shift+H in Finder)
-   Result should be: `~/agent-infra`
+> Use `git clone` (one command), not the ZIP download — auto-sync needs the
+> repo to be a git clone so it can pull updates automatically.
+
+1. On the new Mac, open **Terminal** (Cmd+Space, type "Terminal", Enter)
+2. Paste this and press Enter:
+
+```bash
+git clone https://github.com/daniel-ospina/agent-infra.git ~/agent-infra
+```
+
+   (The repo is private — GitHub will ask you to sign in in your browser the
+   first time. After that it's cached.)
+3. Result should be: `~/agent-infra`
 
 ## Step 2 — Run the one-time setup
 
@@ -27,27 +33,36 @@ cd ~/agent-infra/pi-bootstrap && ./setup.sh
 It copies your models, agents, extensions, rules, and skills into
 `~/.pi/agent`. Run it again anytime to refresh.
 
-## Step 3 — Add your API keys (one-time, ~5 min)
+## Step 3 — Transfer your keys (one-time, ~5 min)
 
-1. Start pi: type `pi` in Terminal and press Enter
-2. Type `/login` and add keys for each provider you use:
-   - **DeepSeek** → platform.deepseek.com (API keys page)
-   - **OpenRouter** → openrouter.ai/keys
-   - **Z.ai** → z.ai console (used by GLM-5.2)
-   - **Anthropic** → console.anthropic.com (settings → API keys)
-3. Type `/model` (or Ctrl+L) and pick `deepseek-v4-flash` (or any model)
-4. Send a message — if you get an answer, you're live ✅
+The main Mac has a file on its Desktop called **`pi-keys.env`** with ALL your
+API keys. Transfer it (AirDrop works — it's tiny).
 
-> Tip: keep the keys in a password manager (e.g. iCloud Keychain) so you don't
-> have to dig them out of dashboards again.
+1. On the new Mac: AirDrop **`pi-keys.env`** to yourself, then move it into
+   your **home folder** (Cmd+Shift+H)
+2. Run the setup (Step 2) — it will find the file and wire it into your shell
+   automatically. Keys are active in new Terminal windows.
+3. No `/login` needed for API-key providers. (For subscriptions like Anthropic
+   Claude Pro, use `/login` in pi.)
+4. **After confirming pi works: delete `pi-keys.env`** (or store it in a
+   password manager) — it contains your secrets.
+
+> Tip: if you ever lose the file, every key is re-generatable from each
+> provider's dashboard (DeepSeek, OpenRouter, Z.ai, Anthropic, Moonshot, Qwen).
 
 ## Step 4 — What pi should do here
 
 Read `HANDOFF.md` (in this same folder) — it's the instructions for this
 machine's pi instance.
 
-## Keeping in sync
+## Keeping in sync (automatic!)
 
-- Skills/agents/extensions update: re-download this repo's ZIP (or run
-  `git pull` if you know git) and run `./setup.sh` again.
-- Your chat history does **not** sync — that's per-machine by design.
+- **Auto-sync is ON by default** (`AGENT_SYNC_MODE=auto`). Every time you
+  start pi, it checks GitHub and if the main Mac published updates, it pulls
+  them and refreshes this machine's config. Nothing to do.
+- Manual refresh anytime: `cd ~/agent-infra && ./sync.sh`
+- **What syncs:** skills, extensions, agents, models, settings, rules.
+- **What never syncs (by design):** your API keys and chat history — those
+  stay per-machine.
+- On the main Mac, "publishing" just means committing work to agent-infra
+  (the agent does this) — the new Mac picks it up at its next pi start.

@@ -31,11 +31,17 @@
 
 ## Working with the main machine
 
-- This repo (`agent-infra`) is the shared channel between the two machines:
-  commit shared changes here, pull/refresh on the other.
-- Shared state that is NOT in git (chat sessions, auth keys, local services
-  like the slack bridge) is machine-local. Ask the user before assuming the
-  other machine sees it.
+- **Auto-sync (Level 1) is enabled:** at every session start this machine
+  fetches agent-infra and, if behind, runs `sync.sh` (git pull --ff-only +
+  refresh config into `~/.pi/agent`). You are kept current automatically.
+- Manual refresh: `cd ~/agent-infra && ./sync.sh` (safe: pulls only, never pushes).
+- If a pull fails (local changes/divergence), auto-sync prints a warning and
+  stops — resolve via `git -C ~/agent-infra status` before it will sync again.
+- **Never push to agent-infra** from here unless the user asks — this machine
+  is a consumer; the main machine publishes.
+- **Secrets never sync:** auth.json, `~/.pi/keys.env` (if present), and env
+  vars stay machine-local. If a provider errors with auth issues, re-check
+  `~/pi-keys.env` is sourced (new terminal) or re-run `/login`.
 
 ## Your responsibilities
 
