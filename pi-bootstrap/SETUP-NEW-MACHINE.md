@@ -19,16 +19,21 @@ git clone https://github.com/daniel-ospina/agent-infra.git ~/agent-infra
 
    (The repo is private — GitHub will ask you to sign in in your browser the
    first time. After that it's cached.)
-3. Result should be: `~/agent-infra`
+
+> **Using GitHub Desktop instead?** Clone it from GitHub Desktop — it can go
+> anywhere (e.g. `~/Documents/GitHub/agent-infra`). The setup script detects
+> its own location, so any folder works. Just note where it is for Step 2.
 
 ## Step 2 — Run the one-time setup
 
 1. Open **Terminal** (Cmd+Space, type "Terminal", Enter)
-2. Paste this and press Enter:
+2. Replace `<repo-path>` below with where the repo is, then paste and press Enter:
 
 ```bash
-cd ~/agent-infra/pi-bootstrap && ./setup.sh
+cd <repo-path>/pi-bootstrap && ./setup.sh
 ```
+
+   (Example: `cd ~/Documents/GitHub/agent-infra/pi-bootstrap && ./setup.sh`)
 
 It copies your models, agents, extensions, rules, and skills into
 `~/.pi/agent`. Run it again anytime to refresh.

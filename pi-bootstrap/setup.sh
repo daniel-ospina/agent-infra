@@ -7,6 +7,7 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)/pi-config"
+INFRA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$HOME/.pi/agent"
 
 mkdir -p "$DEST"
@@ -111,7 +112,7 @@ fi
 # Wire shell profile (idempotent): auto-sync env + optional keys file
 ZSHRC="$HOME/.zshrc"
 [ -f "$ZSHRC" ] || touch "$ZSHRC"
-grep -q "AGENT_INFRA_PATH" "$ZSHRC" 2>/dev/null || printf '\nexport AGENT_INFRA_PATH="$HOME/agent-infra"\n' >> "$ZSHRC"
+grep -q "AGENT_INFRA_PATH" "$ZSHRC" 2>/dev/null || printf '\nexport AGENT_INFRA_PATH="%s"\n' "$INFRA_ROOT" >> "$ZSHRC"
 grep -q "AGENT_SYNC_MODE" "$ZSHRC" 2>/dev/null || printf 'export AGENT_SYNC_MODE=auto\n' >> "$ZSHRC"
 if [ -f "$HOME/pi-keys.env" ]; then
   chmod 600 "$HOME/pi-keys.env"
