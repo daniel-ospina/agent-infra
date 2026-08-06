@@ -414,12 +414,15 @@ sdk.expand_kind("WorkItem")  # returns ["dev:issue", "pm:task", ...]
 
 # DB URI Reality
 
-**The MCP server and the repo default use different FalkorDB ports. Using the wrong port silently reads a different (near-empty) graph.**
+**The DB target is explicit, never accidental.** The whole system — MCP server, SDK, graph-scripts — resolves its target from `TORTOISE_DB_URI`. The **hosted FalkorDB Cloud instance is the system-wide DB of record** (production). Local dev containers (`falkordb-personal` on 16379, `falkordb` on 6379) exist only as optional dev targets; neither is the default anymore.
 
-| Source | Default URI | What's There |
-|--------|------------|--------------|
-| **MCP server** | `docker://:@localhost:16379/tortoise` | The real graph (5482+ points) — `falkordb-personal` |
-| **Repo default** | `docker://:@localhost:6379/tortoise` | A different graph (~86 points) — `falkordb` |
+| Source | URI resolution | Behavior when unset |
+|--------|----------------|---------------------|
+| **MCP server** | `${TORTOISE_DB_URI}` env substitution from `.mcp.json`, then repo-root `.env` loader | Fails loud on startup (exit 1) — never silently connects to an empty embedded graph (`TORTOISE_ALLOW_EMBEDDED=1` is the test-only escape hatch) |
+| **SDK / graph-scripts** | `os.environ["TORTOISE_DB_URI"]` (or `FalkorProjection.from_uri`) | Embedded redislite (dev/test only) |
+| **Hosted API (Fly)** | `FALKORDB_CLOUD_URI` secret → `TORTOISE_DB_URI` via entrypoint.sh | Refuses to start on Fly |
+
+Supported URI schemes: `docker://` (local), `redis://` / `rediss://` (FalkorDB Cloud).
 
 ## Always Verify First
 
@@ -432,23 +435,31 @@ sdk.taxonomy()  # or tortoise_status() — returns point counts, pointKinds, gra
 
 Or via MCP:
 ```
-tortoise_summarize_structure  # returns {gateN_*, total} — should be ~5482+ on real graph
+tortoise_summarize_structure  # returns {gateN_*, total}; zero total on an empty/wrong graph
 ```
 
 ## Common Failure Mode
 
 ```
 Agent: "Let me search for licensing evidence..."
-       (queries port 6379 by default → finds 0 points)
+       (TORTOISE_DB_URI unset → MCP server refused to start, or a script fell back
+        to embedded/empty redislite)
 Agent: "The graph has no licensing data. I'll create evidence from scratch."
        (files 20+ duplicate points on the wrong graph)
 ```
 
-**Fix:** Always set `TORTOISE_DB_URI` explicitly or use the MCP tools (which already point at 16379).
+**Fix:** set `TORTOISE_DB_URI` in the repo-root `.env` (gitignored — never commit credentials). Copy the value of the `FALKORDB_CLOUD_URI` secret (GitHub Actions → FalkorDB Cloud console).
 
 ```bash
-export TORTOISE_DB_URI=docker://:@localhost:16379/tortoise
+# .env (repo root, gitignored)
+TORTOISE_DB_URI=redis://default:<password>@<host>:<port>/tortoise
 ```
+
+Restart the MCP server after changing `.env` — the connection is resolved once at startup.
+
+## SDK Props Convention
+
+`create_point(kind, content, **props)` takes **flattened** kwargs. Direct SDK callers may pass a nested `props={"k": v}` dict (mirroring the MCP tool signature) — the SDK now flattens it automatically (#218). A dict-valued `props` property is illegal in FalkorDB ("Property values can only be of primitive types"), so the flatten is the single place handling both conventions.
 
 ---
 
