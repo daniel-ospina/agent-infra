@@ -415,6 +415,37 @@ plan_modified_per_cycle: <json array of booleans>
   Confirmation bias makes same-context re-review unreliable.
   Always use `task` for fresh sessions.
 
+### Phase 4.5 — Qwen Final Gate (Two-Tier Review)
+
+After Phase 4 converges clean (Flash reviewers are done), dispatch ONE Qwen3.8-Max reviewer as a final quality gate. Qwen is a stronger reasoner — it catches what cheaper reviewers miss. It runs ONCE, only after Flash has converged.
+
+**Model:** `qwen3.8-max` (via Token Plan or configured provider).
+
+**Dispatch:**
+```
+task(model="qwen3.8-max", prompt=<same prompt as Phase 1, single reviewer>)
+```
+
+**Prompt:** Same as Phase 1 reviewers — Qwen just applies stronger reasoning to the same review dimensions. No prompt engineering needed.
+
+**Qwen findings are surfaced as `[QWEN-GATE]` severity tags:**
+
+| Qwen Issue | Action |
+|---|---|
+| `[QWEN-GATE] P0` | Structural flaw missed by Flash — fix required, re-run Qwen once |
+| `[QWEN-GATE] P1` | Important gap — fix required, re-run Qwen once |
+| `[QWEN-GATE] P2` | Improvement — note in plan, do NOT re-run |
+| `[QWEN-GATE] P3/P4` | Nit/suggestion — note, do NOT re-run |
+
+**Re-dispatch rule:** If Qwen finds P0 or P1 → fix → re-dispatch Qwen once. Max 2 Qwen cycles. On 2nd failure → surface to human as `[QWEN-GATE]` with "Qwen final gate could not converge."
+
+**Gate passes:** Qwen returns CLEAN or only P2+ issues.
+
+**Log:**
+```
+🔍 Qwen final gate: clean | N issues found (P0: X, P1: Y) — resolved in M cycles
+```
+
 ### Phase 5 — Final Verification
 
 After plan is clean (Phase 4 says clean), dispatch ONE verification sub-agent via Pi `task` that re-reviews the final plan (same N reviewers as the review cycles, proportional to plan risk). Same prompts as Phase 1, concatenated.

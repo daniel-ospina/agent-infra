@@ -111,11 +111,20 @@ digraph process {
 
 ## Model Selection
 
-Use the same model as the current session for ALL sub-agents — implementers, spec reviewers, and code quality reviewers alike. The current session's model is already configured with valid credentials and is capable of every task in this workflow.
+**Implementer + per-task reviewers (spec + code quality):** Use the same model as the current session. The session model is already configured with valid credentials and is capable of every task in this workflow. Do NOT specify a different model for sub-agents unless the user explicitly instructs you to do so.
 
-Do NOT specify a different model for sub-agents unless the user explicitly instructs you to do so. Specifying a model that lacks configured credentials will cause sub-agents to fail with authentication errors.
+**Final code reviewer (after all tasks):** Dispatch with `model="qwen3.8-max"`. This is the two-tier review pattern — Flash handles per-task reviews, Qwen3.8-Max serves as the senior gatekeeper for the final pass across the entire implementation. Qwen catches what cheaper per-task reviewers miss.
 
-If the sub-agent dispatch mechanism accepts a `model` parameter, omit it to use the session default.
+```
+# Per-task reviews — session model (Flash)
+task(prompt=spec_reviewer_prompt)
+task(prompt=code_quality_reviewer_prompt)
+
+# Final review — Qwen gate
+task(prompt=final_code_reviewer_prompt, model="qwen3.8-max")
+```
+
+If the sub-agent dispatch mechanism accepts a `model` parameter, omit it for per-task reviews to use the session default. Pass `model="qwen3.8-max"` only for the final code reviewer.
 
 ## Handling Implementer Status
 

@@ -656,6 +656,49 @@ Same agent, independently dispatched. Controller merges if both choose same appr
 
 ---
 
+## Phase 5.6 — Qwen Coherence Check (Two-Tier Review)
+
+After solution-verify converges clean (both diamond verification gates passed with Flash reviewers), dispatch ONE Qwen3.8-Max reviewer to check **cross-diamond coherence**. Qwen checks that the problem definition and solution approach are consistent, nothing was lost between diamonds, and the scoping output is complete.
+
+**Model:** `qwen3.8-max` (via Token Plan or configured provider).
+
+**Dispatch:**
+```
+task(model="qwen3.8-max", prompt=<coherence check prompt>)
+```
+
+**Prompt:**
+```
+You are a senior reviewer checking cross-diamond coherence of a scoping session. Both diamonds passed verification individually — your job is to check they HANG TOGETHER.
+
+CONFIRMED PROBLEM: <from Phase 2>
+SOLUTION APPROACH: <from Phase 5>
+ORIGINAL ISSUE: <issue body>
+
+CHECK:
+1. Does the solution actually address the confirmed problem? Or did it drift back to the original issue framing?
+2. Were any problem-dimensions discovered in Phase 1 but dropped by Phase 5?
+3. Are edge cases from problem-diverge handled in the solution?
+4. Is there a SIMPLER approach that would achieve the same outcome? (Devil's advocate)
+5. What is the weakest assumption in this scoping?
+
+Output ISSUE blocks or NO ISSUES FOUND.
+```
+
+**Qwen findings surfaced as `[QWEN-GATE]`:**
+
+| Qwen Issue | Action |
+|---|---|
+| `[QWEN-GATE] P0` | Problem-solution mismatch — fix required, re-run Qwen once |
+| `[QWEN-GATE] P1` | Important gap — fix required, re-run Qwen once |
+| `[QWEN-GATE] P2` | Improvement — note, do NOT re-run |
+
+**Re-dispatch:** Max 2 cycles. On 2nd failure → surface in scoping comment as `[QWEN-GATE]` with "Qwen coherence check could not converge."
+
+**Applies to:** Standard + Complex tiers only. Micro tier skips (single full-diamond-verify is sufficient).
+
+---
+
 ## Phase 6 — Wiring Check
 
 After plan draft (Phase 5) and solution-verify (Phase 5.5): verify ALL connections needed to deliver value are covered.

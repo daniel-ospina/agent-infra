@@ -896,6 +896,31 @@ When the fixer loop exits with remaining issues (stall/cap/fail), the **orchestr
 
 **Pause only when:** a taxonomy-matching decision arises (human input taxonomy). Everything else proceeds unattended.
 
+### Step 6.6 — Qwen Final Gate (Two-Tier Review)
+
+After the fixer loop converges clean (all Flash-based review cycles done), dispatch ONE Qwen3.8-Max reviewer as a final quality gate. Qwen is a stronger reasoner — it catches what the cheaper review agents miss.
+
+**Model:** `qwen3.8-max` (via Token Plan or configured provider).
+
+**Dispatch:**
+```
+task(model="qwen3.8-max", prompt=<same Agent #1 guidance-compliance + Agent #2 bug-scan prompts, single reviewer>)
+```
+
+**Prompt:** Same review dimensions as Steps 4-5 agents — Qwen just applies stronger reasoning. No prompt engineering needed.
+
+**Qwen findings surfaced as `[QWEN-GATE]` severity:**
+
+| Qwen Issue | Action |
+|---|---|
+| `[QWEN-GATE] P0` | Structural flaw missed by Flash — fix required, re-run Qwen once |
+| `[QWEN-GATE] P1` | Important gap — fix required, re-run Qwen once |
+| `[QWEN-GATE] P2` | Improvement — note in PR comment, do NOT re-run |
+
+**Re-dispatch:** Max 2 Qwen cycles. On 2nd failure → surface in PR comment as `[QWEN-GATE]` with "Qwen final gate could not converge."
+
+**Gate passes:** Qwen returns CLEAN or only P2+. Proceed to Step 7.
+
 ### Step 7 — Eligibility Re-check
 
 Dispatch a sub-agent to re-check eligibility (same as Step 1).
