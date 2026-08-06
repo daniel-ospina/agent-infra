@@ -2,6 +2,23 @@
 // Epics #6944/#6948. Hooks tool_call, validates against YAML step declarations.
 // 3 modes: warn (log) | gate (block destructive) | strict (block all non-expected).
 // Kill switch: /tmp/agent-state-machine.kill or AGENT_STATE_MACHINE env var.
+//
+// ── WHY THIS EXISTS (READ BEFORE DISABLING) ──
+// Workflow enforcement is the CORE of our agent system, not a hindrance.
+// Every skill defines a step sequence (scope → plan → implement → verify with
+// gates). Agents that skip steps introduced real bugs that human time had to
+// fix. This enforcer exists to make skipping impossible — it is INTENTIONAL.
+//
+// It is designed to apply to BOTH top-level agents AND nested sub-agents.
+// Sub-agents dispatched via task() inherit the same enforcement because they
+// do the same work and are held to the same standard. Do NOT disable this for
+// sub-agents to "fix" timeouts — that removes workflow enforcement and lets
+// lazy agents bypass gates. Fix the root cause instead (gate-advance logic,
+// timeout mismatches, untimed git calls).
+//
+// If a sub-agent appears stuck at a verifier gate, the bug is in gate
+// advancement or the silence threshold vs provider timeout — not the
+// enforcement itself.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
