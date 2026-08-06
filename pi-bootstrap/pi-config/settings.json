@@ -1,0 +1,12 @@
+{
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-v4-flash",
+  "defaultThinkingLevel": "high",
+  "theme": "dark",
+  "httpIdleTimeoutMs": 600000,
+  "retry": {
+    "provider": {
+      "timeoutMs": 600000
+    }
+  }
+}

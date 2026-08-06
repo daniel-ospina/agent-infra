@@ -1,0 +1,20 @@
+version: 1
+repos:
+  - name: shared
+    path: operations/skills/shared
+    priority: baseline
+  - name: eldato-epistemic
+    path: ../eldato-epistemic/skills
+    remote: https://github.com/daniel-ospina/eldato-epistemic
+    priority: product
+  - name: eldato-outreach
+    path: ../eldato-outreach/skills
+    remote: https://github.com/daniel-ospina/eldato-outreach
+    priority: product
+  - name: dmer
+    path: ../dmer/skills
+    remote: https://github.com/daniel-ospina/dmer
+    priority: product
+  - name: eldato
+    path: operations/skills
+    priority: product
