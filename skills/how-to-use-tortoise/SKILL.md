@@ -418,7 +418,7 @@ sdk.expand_kind("WorkItem")  # returns ["dev:issue", "pm:task", ...]
 
 | Source | URI resolution | Behavior when unset |
 |--------|----------------|---------------------|
-| **MCP server (local)** | `TORTOISE_DB_URI` in `.mcp.json` — defaults to local `docker://:@localhost:16379/tortoise`; a repo-root `.env` can override | Fails loud on startup (exit 1) — never silently connects to an empty embedded graph (`TORTOISE_ALLOW_EMBEDDED=1` is the test-only escape hatch) |
+| **MCP server (local)** | `TORTOISE_DB_URI` in `.mcp.json` — defaults to local `docker://:@localhost:16379/tortoise`; a repo-root `.env` only fills keys `.mcp.json` does **not** set (useful for SDK scripts / direct launches — `.mcp.json` env always wins for the MCP server) | Fails loud on startup (exit 1) — never silently connects to an empty embedded graph (`TORTOISE_ALLOW_EMBEDDED=1` is the test-only escape hatch) |
 | **SDK / graph-scripts** | `os.environ["TORTOISE_DB_URI"]` (or `FalkorProjection.from_uri`) | Embedded redislite (dev/test only) |
 | **Hosted API (Fly)** | `FALKORDB_CLOUD_URI` secret → `TORTOISE_DB_URI` via entrypoint.sh | Refuses to start on Fly |
 
