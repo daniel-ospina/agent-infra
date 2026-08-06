@@ -449,8 +449,8 @@ export default function (pi: ExtensionAPI) {
     // worktree's top/.git is a separate file — they differ. In main they match.
     const inWorktree = (() => {
       try {
-        const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf-8" }).trim();
-        const common = resolve(execFileSync("git", ["rev-parse", "--git-common-dir"], { encoding: "utf-8" }).trim());
+        const top = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf-8", timeout: 5000 }).trim();
+        const common = resolve(execFileSync("git", ["rev-parse", "--git-common-dir"], { encoding: "utf-8", timeout: 5000 }).trim());
         return `${top}/.git` !== common;
       } catch { return true; } // if git fails, assume worktree (safer: let pipeline run)
     })();
@@ -503,10 +503,16 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
-    // Track verifier dispatches: count task/subagent calls for verifier gate
-    if (step.gate === "verifier" && (toolName === "task" || toolName === "subagent")) {
-      const current = top.reviewers.get(top.stepIndex) || 0;
-      top.reviewers.set(top.stepIndex, current + 1);
+    // Track verifier dispatches: count task/subagent calls for verifier gate.
+    // Must use findVerifierGateOwner() — not top — because a sub-skill read
+    // by a sub-agent sits above the verifier gate on the stack. top's step
+    // would be auto-gated, causing the dispatch to never be counted (#66).
+    if (toolName === "task" || toolName === "subagent") {
+      const gateOwner = findVerifierGateOwner();
+      if (gateOwner) {
+        const current = gateOwner.reviewers.get(gateOwner.stepIndex) || 0;
+        gateOwner.reviewers.set(gateOwner.stepIndex, current + 1);
+      }
     }
 
     auditLog({ ts: new Date().toISOString(), event: "allowed", skill: top.path, step: step.name, tool: toolName, mode });
