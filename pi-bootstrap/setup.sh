@@ -31,6 +31,19 @@ cp -R "$SRC/agents"           "$DEST/agents"
 cp -R "$SRC/extensions"       "$DEST/extensions"
 cp -R "$SRC/behavior-control" "$DEST/behavior-control"
 
+# Install extension dependencies (needs internet on first run)
+if command -v npm >/dev/null 2>&1; then
+  for ext in "$DEST"/extensions/*/; do
+    if [ -f "$ext/package.json" ]; then
+      ( cd "$ext" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1 \
+        && echo "    deps installed: $(basename "$ext")" ) \
+        || echo "    warning: could not npm install $(basename "$ext")"
+    fi
+  done
+else
+  echo "    warning: npm not found - extension deps skipped (mcp-client/builtin-tools/loop-enforcer may not load)"
+fi
+
 # Small config / rules files
 cp "$SRC/skills-repos.yaml"          "$DEST/skills-repos.yaml"
 cp "$SRC/coding-rules.md"            "$DEST/coding-rules.md"
