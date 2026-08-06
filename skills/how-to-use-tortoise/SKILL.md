@@ -414,15 +414,15 @@ sdk.expand_kind("WorkItem")  # returns ["dev:issue", "pm:task", ...]
 
 # DB URI Reality
 
-**The DB target is explicit, never accidental.** The whole system — MCP server, SDK, graph-scripts — resolves its target from `TORTOISE_DB_URI`. The **hosted FalkorDB Cloud instance is the system-wide DB of record** (production). Local dev containers (`falkordb-personal` on 16379, `falkordb` on 6379) exist only as optional dev targets; neither is the default anymore.
+**The DB target is explicit, never accidental, and local stays local.** A self-hosted/local instance is intentionally local — local tooling (MCP server, SDK, graph-scripts) targets the local FalkorDB, never a remote cloud DB. The **hosted version** is a separate product: the Fly API resolves `FALKORDB_CLOUD_URI` → `TORTOISE_DB_URI` via entrypoint.sh and refuses to start without it; clients reach it over HTTP with API keys.
 
 | Source | URI resolution | Behavior when unset |
 |--------|----------------|---------------------|
-| **MCP server** | `${TORTOISE_DB_URI}` env substitution from `.mcp.json`, then repo-root `.env` loader | Fails loud on startup (exit 1) — never silently connects to an empty embedded graph (`TORTOISE_ALLOW_EMBEDDED=1` is the test-only escape hatch) |
+| **MCP server (local)** | `TORTOISE_DB_URI` in `.mcp.json` — defaults to local `docker://:@localhost:16379/tortoise`; a repo-root `.env` can override | Fails loud on startup (exit 1) — never silently connects to an empty embedded graph (`TORTOISE_ALLOW_EMBEDDED=1` is the test-only escape hatch) |
 | **SDK / graph-scripts** | `os.environ["TORTOISE_DB_URI"]` (or `FalkorProjection.from_uri`) | Embedded redislite (dev/test only) |
 | **Hosted API (Fly)** | `FALKORDB_CLOUD_URI` secret → `TORTOISE_DB_URI` via entrypoint.sh | Refuses to start on Fly |
 
-Supported URI schemes: `docker://` (local), `redis://` / `rediss://` (FalkorDB Cloud).
+Supported URI schemes: `docker://` (local), `redis://` / `rediss://` (accepted so the hosted API can consume cloud connection strings).
 
 ## Always Verify First
 
@@ -448,14 +448,14 @@ Agent: "The graph has no licensing data. I'll create evidence from scratch."
        (files 20+ duplicate points on the wrong graph)
 ```
 
-**Fix:** set `TORTOISE_DB_URI` in the repo-root `.env` (gitignored — never commit credentials). Copy the value of the `FALKORDB_CLOUD_URI` secret (GitHub Actions → FalkorDB Cloud console).
+**Fix:** point local tooling at the local FalkorDB. The default in `.mcp.json` is `docker://:@localhost:16379/tortoise` (the designated local container); override in the repo-root `.env` (gitignored — never commit credentials) if your local target differs.
 
 ```bash
-# .env (repo root, gitignored)
-TORTOISE_DB_URI=redis://default:<password>@<host>:<port>/tortoise
+# .env (repo root, gitignored) — LOCAL target only
+TORTOISE_DB_URI=docker://:@localhost:16379/tortoise
 ```
 
-Restart the MCP server after changing `.env` — the connection is resolved once at startup.
+Restart the MCP server after changing the URI — the connection is resolved once at startup. Do **not** point local tooling at the hosted (cloud) instance.
 
 ## SDK Props Convention
 
