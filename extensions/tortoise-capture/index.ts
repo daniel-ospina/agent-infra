@@ -135,6 +135,7 @@ function deriveStoryArch(
 }
 
 // deriveSummary kept as backward-compat alias for #125 tests
+// @deprecated — use deriveStoryArch (bullet recap) instead. #167
 function deriveSummary(
   conversation: Array<{ role: "user" | "assistant"; content: string }>,
 ): string {
@@ -163,7 +164,11 @@ function buildMarkdown(
     `roles: "${[...new Set(conversation.map((m) => m.role))].join(",")}"`,
     `message_count: "${conversation.length}"`,
     `topics: "${topics.join(", ")}"`,
-    `summary: "${summary.replace(/"/g, '\"')}"`,
+    // #167 P1 fix: story-arch summary is a newline-separated bullet list.
+    // YAML double-quoted scalars fold line breaks to spaces (YAML 1.2 §7.3.1),
+    // destroying the bullet structure on parse. Use a literal block scalar
+    // (`|-`, strip chomping) to preserve newlines exactly.
+    ...(summary ? [`summary: |-`, ...summary.split("\n").map((l) => `  ${l}`)] : [`summary: ""`]),
     `sourcePath: "${sourcePath.replace(/"/g, '\"')}"`,
     "---",
     "",

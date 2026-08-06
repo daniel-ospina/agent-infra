@@ -49,7 +49,9 @@ function buildMarkdown(
     `roles: "${[...new Set(conversation.map((m) => m.role))].join(",")}"`,
     `message_count: "${conversation.length}"`,
     `topics: "${topics.join(", ")}"`,
-    `summary: "${summary.replace(/"/g, '\"')}"`,
+    // #167 P1 fix: literal block scalar preserves bullet newlines (YAML 1.2 §7.3.1).
+    // `|-` strips the trailing newline so round-trip is byte-exact.
+    ...(summary ? [`summary: |-`, ...summary.split("\n").map((l) => `  ${l}`)] : [`summary: ""`]),
     `sourcePath: "${sourcePath.replace(/"/g, '\"')}"`,
     "---",
     "",
@@ -376,9 +378,36 @@ describe("#125/#167 deriveTopics/deriveStoryArch", () => {
       title: "T", date: "2026-08-05", sessionId: "s1",
     }, { topics: ["Licensing"], summary: "- Discussed Licensing", sourcePath: "/tmp/test.md" });
     expect(md).toMatch(/topics: "Licensing"/);
-    expect(md).toMatch(/summary: "- Discussed Licensing"/);
+    // #167 P1: summary is a YAML literal block scalar (preserves bullets)
+    expect(md).toMatch(/summary: \|/);
+    expect(md).toMatch(/^  - Discussed Licensing$/m);
     expect(md).toMatch(/sourcePath: "\/tmp\/test\.md"/);
     expect(md).toMatch(/documentKind: "transcript"/);
+  });
+
+  test("story-arch summary round-trips through YAML parse preserving bullets (#167 P1)", () => {
+    const conv = [
+      { role: "user" as const, content: "Compare licensing options" },
+      { role: "assistant" as const, content: "ok" },
+      { role: "user" as const, content: "Decide AGPLv3" },
+      { role: "assistant" as const, content: "done" },
+    ];
+    const arch = deriveStoryArch(conv);
+    expect(arch).toContain("\n"); // multi-bullet story arch
+    const md = buildMarkdown(conv, {
+      title: "T", date: "2026-08-05", sessionId: "s1",
+    }, { summary: arch });
+    // Extract frontmatter between --- delimiters and parse with YAML
+    const m = md.match(/^---\n([\s\S]*?)\n---/);
+    expect(m).not.toBeNull();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { createRequire } = require("module");
+    // Test file is hardlinked into agent-infra; anchor require to eldato repo
+    // where js-yaml is a dependency.
+    const eldatoRequire = createRequire(require.resolve("/Users/home/eldato/package.json"));
+    const yaml = eldatoRequire("js-yaml");
+    const parsed = yaml.load(m![1]) as Record<string, unknown>;
+    expect(parsed.summary).toBe(arch); // bullets preserved exactly (no line-fold)
   });
 
   test("buildMarkdown includes empty sourcePath when not provided", () => {
