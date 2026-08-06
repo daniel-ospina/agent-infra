@@ -376,7 +376,7 @@ export default function (pi: ExtensionAPI) {
       let stderr = "";
       let lastHeartbeat = Date.now();
       let settled = false;
-      const HEARTBEAT_TIMEOUT_MS = 480_000;
+      const HEARTBEAT_TIMEOUT_MS = 660_000;
       const FIRST_OUTPUT_TIMEOUT_MS = 60_000;
       let hasOutput = false;
 

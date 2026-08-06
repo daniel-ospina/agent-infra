@@ -17,10 +17,25 @@ function getProjectRoot(): string {
 function buildRegistry(): Record<string, string> {
   const cachePath = join(homedir(), ".pi", "agent", "skills-registry.json");
   try {
+    // Resolve the script path — try project root first, then ~/eldato fallback.
+    // Sub-agents with cwd outside the project would otherwise resolve a
+    // non-existent path and waste 5s on the execSync timeout (#68).
     const root = getProjectRoot();
-    execSync(`python3 "${root}/operations/tools/skill_registry.py" --no-cache`, {
-      encoding: "utf-8", timeout: 5000, stdio: "pipe"
-    });
+    let scriptPath = resolve(root, "operations/tools/skill_registry.py");
+    if (!existsSync(scriptPath)) {
+      const fallbackPath = resolve(homedir(), "eldato", "operations/tools/skill_registry.py");
+      if (existsSync(fallbackPath)) {
+        scriptPath = fallbackPath;
+      } else {
+        // Neither path exists — skip the call, fall through to cache
+        scriptPath = null;
+      }
+    }
+    if (scriptPath) {
+      execSync(`python3 "${scriptPath}" --no-cache`, {
+        encoding: "utf-8", timeout: 5000, stdio: "pipe"
+      });
+    }
   } catch {}
   if (existsSync(cachePath)) {
     try { return JSON.parse(readFileSync(cachePath, "utf-8")); } catch {}
