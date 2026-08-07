@@ -332,10 +332,25 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
+			// #36: Ensure sub-agent PATH includes common python3 locations
+			// so MCP servers using bare `python3` resolve.
+			const PATH_EXTRA_DIRS = [
+				"/opt/homebrew/bin",
+				"/usr/local/bin",
+				"/home/linuxbrew/.linuxbrew/bin",
+			];
+			const inheritedPath = process.env.PATH ?? "";
+			const extraDirs = PATH_EXTRA_DIRS.filter(
+				(d) => !inheritedPath.split(":").includes(d)
+			);
+			const augmentedPath = extraDirs.length > 0
+				? [...extraDirs, inheritedPath].join(":")
+				: inheritedPath;
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				env: { ...process.env, PATH: augmentedPath },
 			});
 
 			// Heartbeat: prevent silence timeout during long tool calls (review dispatches, batch reads).

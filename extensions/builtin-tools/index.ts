@@ -487,8 +487,27 @@ export default function (pi: ExtensionAPI) {
       const model = params.model ?? "deepseek-v4-flash";
       const provider = model.startsWith("claude") ? "anthropic" : "deepseek";
 
+      // #36: Ensure sub-agent PATH includes common python3 locations.
+      // The parent pi process (running under cmux) may have a truncated PATH that
+      // drops /opt/homebrew/bin and /usr/local/bin. Sub-agents inherit process.env
+      // faithfully but that doesn't help if the parent's PATH was already truncated.
+      // Prepend known locations so MCP servers using bare `python3` resolve.
+      const PATH_EXTRA_DIRS = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+      ];
+      const inheritedPath = process.env.PATH ?? "";
+      const extraDirs = PATH_EXTRA_DIRS.filter(
+        (d) => !inheritedPath.split(":").includes(d)
+      );
+      const augmentedPath = extraDirs.length > 0
+        ? [...extraDirs, inheritedPath].join(":")
+        : inheritedPath;
+
       const subAgentEnv: Record<string, string | undefined> = {
   ...process.env,
+  PATH: augmentedPath,
   PI_SKIP_VERSION_CHECK: "1",
   // Skip extensions sub-agents never need (one-shot, no git/slack/loops/vision).
   // Gate overrides: sub-agents can't dispatch `task` to satisfy verification-gate
