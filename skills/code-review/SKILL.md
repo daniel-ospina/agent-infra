@@ -391,39 +391,44 @@ if [ -n "$ISSUE_NUMBER" ]; then
 fi
 ```
 
-If ratings not found in issue body, check the plan doc or scoping comment. Default to empty (no conditional reviewers dispatched).
+Ratings are OPTIONAL — they scale review DEPTH, not trigger. The PRIMARY trigger is the
+PR diff surface (step 2): a surface match ALONE dispatches the domain reviewer at default
+(medium) depth. If ratings not found in issue body, check the plan doc or scoping comment.
 
-**2. Detect file surfaces from PR diff:**
+**2. Detect file surfaces from PR diff (surface = PRIMARY trigger, generalized beyond TS):**
 
 ```bash
-# Check for .tsx files (UX surface)
-TSX_TOUCHED=$(gh pr diff <PR_NUMBER> --name-only | grep -qE '\.tsx$' && echo "true" || echo "false")
+FILES_CHANGED=$(gh pr diff <PR_NUMBER> --name-only)
 
-# Check for services/lib/api files (Architecture surface)
-ARCH_FILES_TOUCHED=$(gh pr diff <PR_NUMBER> --name-only | grep -qE '(services/|lib/|api/)' && echo "true" || echo "false")
+# UI surface (UX review) — TS/JS/React AND Python/web/markup
+UI_TOUCHED=$(echo "$FILES_CHANGED" | grep -qE '\.(tsx|jsx|vue|svelte|html|htm|css|scss|less)$|(components/|pages/|screens/|templates/)' && echo "true" || echo "false")
 
-# Check for migrations/types files (Ontology surface)
-MIGRATIONS_TOUCHED=$(gh pr diff <PR_NUMBER> --name-only | grep -qE '(supabase/migrations/|types/)' && echo "true" || echo "false")
+# Architecture surface — services/lib/api AND framework dirs (Python: tortoise/, src/, app/)
+ARCH_TOUCHED=$(echo "$FILES_CHANGED" | grep -qE '(services/|lib/|api/|src/|app/|tortoise/|core/)' && echo "true" || echo "false")
+
+# Data/Ontology surface — migrations, schema, types, data-model, projection
+DATA_TOUCHED=$(echo "$FILES_CHANGED" | grep -qE '(supabase/migrations/|migrations/|schema|types/|models/|projection/|ontology)' && echo "true" || echo "false")
+
+# Config surface — config files, manifests, env templates
+CONFIG_TOUCHED=$(echo "$FILES_CHANGED" | grep -qE '\.(yaml|yml|toml)$|(\.mcp\.json|fly\.toml|docker-compose|\.env\.example|config\.)' && echo "true" || echo "false")
 ```
 
-**3. Dispatch matrix (applied in Step 4):**
+**3. Dispatch matrix (applied in Step 4) — surface triggers, rating scales depth:**
 
-| Condition | Reviewers Dispatched |
-|-----------|---------------------|
-| UX_RATING = medium + TSX_TOUCHED = true | ux-consistency + ux-coverage |
-| UX_RATING = high + TSX_TOUCHED = true | ux-consistency + ux-coverage + ux-realism |
-| ARCH_RATING = medium + ARCH_FILES_TOUCHED = true | integration + architectural-soundness |
-| ARCH_RATING = high + ARCH_FILES_TOUCHED = true | integration + architectural-soundness + contract-completeness |
-| ONTOLOGY_RATING = medium + MIGRATIONS_TOUCHED = true | schema-correctness |
-| ONTOLOGY_RATING = high + MIGRATIONS_TOUCHED = true | schema-correctness + ontology-alignment |
+| Surface | Default (no rating) | `medium` rating | `high` rating |
+|---------|--------------------|-----------------|---------------|
+| `UI_TOUCHED` | ux-consistency + ux-coverage | same | + ux-realism |
+| `ARCH_TOUCHED` | integration + architectural-soundness | same | + contract-completeness |
+| `DATA_TOUCHED` | schema-correctness | same | + ontology-alignment |
+| `CONFIG_TOUCHED` | config review (`config-validation`) | — | — |
 
 Store all variables for Step 4 dispatch.
 
 ---
 
-### Step 4 — Parallel Review (5-8 agents, proportional to complexity ratings)
+### Step 4 — Parallel Review (6-10 agents, surface-matched, ratings scale depth)
 
-Launch **6 always-on agents** (Guidance, Bug-Shallow, Bug-Deep, History, PR Comments, Security) plus **up to 3 conditional domain agents** (UX, Architecture, Data) in parallel via Pi `task`. Conditional agents activate based on complexity ratings extracted in Step 3.6. Each receives the PR diff, CLAUDE.md paths, affected files, and research context (if any). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
+Launch **6 always-on agents** (Guidance, Bug-Shallow, Bug-Deep, History, PR Comments, Security) plus **up to 4 surface-matched domain agents** (UX, Architecture, Data, Config) in parallel via Pi `task`. Domain agents trigger on the PR diff surface (Step 3.6); complexity ratings, when present, scale depth inside each reviewer. Each receives the PR diff, CLAUDE.md paths, affected files, and research context (if any). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
 
 **Dispatch logic:**
 ```bash
@@ -431,13 +436,14 @@ Launch **6 always-on agents** (Guidance, Bug-Shallow, Bug-Deep, History, PR Comm
 # Always-on: 6 agents (Agent #2 split into shallow + deep — #2a and #2b; Security is #11)
 AGENTS="Agent #1 (Guidance), Agent #2a (Bug Scan - Shallow), Agent #2b (Bug Scan - Deep), Agent #3 (History), Agent #4 (PR Comments), Agent #11 (Security)"
 
-# Conditional dispatch (domain-aware — requires both rating AND surface match from Step 3.6)
-{ [ "$UX_RATING" = "medium" ] || [ "$UX_RATING" = "high" ]; } && [ "$TSX_TOUCHED" = "true" ] && AGENTS="$AGENTS, Agent #5 (UX — epic reviewers)"
-{ [ "$ARCH_RATING" = "medium" ] || [ "$ARCH_RATING" = "high" ]; } && [ "$ARCH_FILES_TOUCHED" = "true" ] && AGENTS="$AGENTS, Agent #6 (Architecture — epic reviewers)"
-{ [ "$ONTOLOGY_RATING" = "medium" ] || [ "$ONTOLOGY_RATING" = "high" ]; } && [ "$MIGRATIONS_TOUCHED" = "true" ] && AGENTS="$AGENTS, Agent #7 (Data+Schema — epic reviewers)"
+# Surface-first dispatch (domain reviewers fire on the DIFF — ratings scale depth inside the agents)
+[ "$UI_TOUCHED" = "true" ] && AGENTS="$AGENTS, Agent #5 (UX — epic reviewers)"
+[ "$ARCH_TOUCHED" = "true" ] && AGENTS="$AGENTS, Agent #6 (Architecture — epic reviewers)"
+[ "$DATA_TOUCHED" = "true" ] && AGENTS="$AGENTS, Agent #7 (Data+Schema — epic reviewers)"
+[ "$CONFIG_TOUCHED" = "true" ] && AGENTS="$AGENTS, Agent #12 (Config)"
 
 if [ -z "$UX_RATING$ARCH_RATING$ONTOLOGY_RATING" ]; then
-  echo "[code-review] No complexity ratings found — running safety-net agents only"
+  echo "[code-review] No complexity ratings in issue — surface-matched domain reviewers still dispatch (default depth); ratings scale depth when present"
 fi
 
 # Infrastructure dispatch (runs alongside regular reviewers when INFRA_RISK is set from Step 0.8)
@@ -564,10 +570,10 @@ ISSUE:
   suggestion: <fix>
 If no high-confidence findings: NO ISSUES FOUND
 
-**Agent #5 — UX Reviewer** (conditional: UX_RATING >= medium + TSX_TOUCHED = true):
+**Agent #5 — UX Reviewer** (surface: `UI_TOUCHED` — ratings scale depth):
 
 Dispatch to epic reviewers via Pi `task` sub-agents using the dispatch matrix from Step 3.6:
-- `UX_RATING = medium` → `ux-consistency` + `ux-coverage`
+- rating absent (default) or `medium` → `ux-consistency` + `ux-coverage`
 - `UX_RATING = high` → above + `ux-realism`
 
 **Adaptation prefix** — inject before each reviewer's standard prompt:
@@ -582,12 +588,12 @@ PR DIFF:
 
 For each dispatched reviewer, aggregate findings into standard `ISSUE:` blocks or `NO ISSUES FOUND`. Use `check_type` matching the reviewer: `ux-consistency`, `ux-coverage`, or `ux-realism`.
 
-If TSX_TOUCHED = false, skip (no UX surface to review).
+If UI_TOUCHED = false, skip (no UI surface to review).
 
-**Agent #6 — Architecture Reviewer** (conditional: ARCH_RATING >= medium + ARCH_FILES_TOUCHED = true):
+**Agent #6 — Architecture Reviewer** (surface: `ARCH_TOUCHED` — ratings scale depth):
 
 Dispatch to epic reviewers via Pi `task` sub-agents using the dispatch matrix from Step 3.6:
-- `ARCH_RATING = medium` → `integration` + `architectural-soundness`
+- rating absent (default) or `medium` → `integration` + `architectural-soundness`
 - `ARCH_RATING = high` → above + `contract-completeness`
 
 **Adaptation prefix** — inject before each reviewer's standard prompt:
@@ -602,12 +608,12 @@ PR DIFF:
 
 For each dispatched reviewer, aggregate findings into standard `ISSUE:` blocks or `NO ISSUES FOUND`. Use `check_type` matching the reviewer: `integration`, `architectural-soundness`, or `contract-completeness`.
 
-If ARCH_FILES_TOUCHED = false, skip (no architecture surface to review).
+If ARCH_TOUCHED = false, skip (no architecture surface to review).
 
-**Agent #7 — Data + Schema Reviewer** (conditional: ONTOLOGY_RATING >= medium + MIGRATIONS_TOUCHED = true):
+**Agent #7 — Data + Schema Reviewer** (surface: `DATA_TOUCHED` — ratings scale depth):
 
 Dispatch to epic reviewers via Pi `task` sub-agents using the dispatch matrix from Step 3.6:
-- `ONTOLOGY_RATING = medium` → `schema-correctness`
+- rating absent (default) or `medium` → `schema-correctness`
 - `ONTOLOGY_RATING = high` → above + `ontology-alignment`
 
 **Adaptation prefix** — inject before each reviewer's standard prompt:
@@ -622,7 +628,27 @@ PR DIFF:
 
 For each dispatched reviewer, aggregate findings into standard `ISSUE:` blocks or `NO ISSUES FOUND`. Use `check_type` matching the reviewer: `schema-correctness` or `ontology-alignment`.
 
-If MIGRATIONS_TOUCHED = false, skip (no ontology surface to review).
+If DATA_TOUCHED = false, skip (no data/ontology surface to review).
+
+**Agent #12 — Config Reviewer** (surface: `CONFIG_TOUCHED`):
+```
+You are the config reviewer for this PR. Apply the config-validation skill discipline
+(read /Users/home/agent-infra/skills/config-validation/SKILL.md if available):
+1. Config changes are validated by the mapped check script for their file type
+   (migrations → check-migration-*, skills → check-skill-lint, etc.).
+2. Verify: env var names match what the code actually reads; no secrets in configs
+   (placeholders only); default values are safe (fail-closed, not fail-open);
+   config is internally consistent (e.g. .env.example vs .mcp.json vs defaults).
+3. Report only concrete, actionable issues.
+```
+For each issue return:
+ISSUE:
+  check_type: config-validity|config-consistency|secret-leak|insecure-default
+  severity: P0|P1|P2
+  location: <file path>:<line>
+  description: <what's wrong>
+  suggestion: <what to fix>
+If no issues: NO ISSUES FOUND
 
 
 **Agent #8 — Skill Infrastructure Reviewer** (conditional: INFRA_RISK is set — dispatched for ALL infra risk levels):
@@ -1033,7 +1059,7 @@ curl -s -o /dev/null -X POST \
 true
 ```
 
-**Check types:** `CLAUDE.md-adherence`, `comment-compliance`, `bug`, `historical-context`, `pr-comment-history`, `security`, `sql-test-gap`, `content-generation-gap`, `gate-warning`, `continuity-directive`, `frontmatter`, `broken-reference`, `sequence-correctness`, `handover-contract`, `gate-placement`, `orchestrator-dependency`, `io-contract`, `review-gate-integration`, `standalone-invocability`, `cross-skill-assumption`, `vocabulary-conflict`, `ontology-drift`, `downstream-impact`, `template-validity`, `subject-registry`, `runtime-safety`, `error-handling`, `silent-failure`, `config-validity`, `ux-consistency`, `ux-coverage`, `ux-realism`, `integration`, `architectural-soundness`, `contract-completeness`, `schema-correctness`, `ontology-alignment`, `e2e-coverage`, `e2e-reproducibility`
+**Check types:** `CLAUDE.md-adherence`, `comment-compliance`, `bug`, `historical-context`, `pr-comment-history`, `security`, `sql-test-gap`, `content-generation-gap`, `gate-warning`, `continuity-directive`, `frontmatter`, `broken-reference`, `sequence-correctness`, `handover-contract`, `gate-placement`, `orchestrator-dependency`, `io-contract`, `review-gate-integration`, `standalone-invocability`, `cross-skill-assumption`, `vocabulary-conflict`, `ontology-drift`, `downstream-impact`, `template-validity`, `subject-registry`, `runtime-safety`, `error-handling`, `silent-failure`, `config-validity`, `ux-consistency`, `ux-coverage`, `ux-realism`, `integration`, `architectural-soundness`, `contract-completeness`, `schema-correctness`, `ontology-alignment`, `e2e-coverage`, `e2e-reproducibility`, `config-consistency`, `secret-leak`, `insecure-default`
 **Severity:** `high` (90-100), `medium` (70-89), `low` (50-69)
 
 ## Standard-Tier Review (`--standard-tier`)

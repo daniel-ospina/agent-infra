@@ -5,7 +5,7 @@
 
 ### Step 3.6 — Complexity Ratings Extraction (P0-3)
 
-Before dispatching code-review agents, extract domain complexity ratings from the linked issue. These determine which conditional agents (Agents #5-#8) to dispatch.
+Before dispatching code-review agents, extract domain complexity ratings from the linked issue (optional — they scale review DEPTH). PR diff surface (detected per code-review Step 3.6) determines which domain agents (#5 UX, #6 Arch, #7 Data, #12 Config) dispatch.
 
 ```bash
 ISSUE_NUMBER=$(gh pr view <PR_NUMBER> --json closingIssuesReferences --jq '.closingIssuesReferences[0].number')
@@ -54,7 +54,7 @@ LOOP:
     → Continue LOOP
 ```
 
-**Complex tier (and default when TIER is unknown):** Run the full 6-agent review + domain/infra reviewers (Agents #5-#11, per `code-review` Step 3.6/0.8):
+**Complex tier (and default when TIER is unknown):** Run the full 6-agent review + domain/infra/config reviewers (Agents #5-#12, per `code-review` Step 3.6/0.8):
 
 ```
 iteration = 0

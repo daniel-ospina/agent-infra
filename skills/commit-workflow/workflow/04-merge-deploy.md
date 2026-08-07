@@ -11,7 +11,7 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    findings only, research-before-report). Domain reviewers as applicable: infrastructure
    (skills/extensions/.mcp.json/ontology) → Skill Infrastructure / Ontology & Templates /
    Extension Safety; UX → ux-verification; config/research/docs → proportional review.
-   Dispatch per `code-review` Step 0.8 (infra detection) + Step 3.6 (complexity + surface matrix)
+   Dispatch per `code-review` Step 0.8 (infra detection) + Step 3.6 (surface-first dispatch; ratings scale depth)
    and `test-routing` (domain-aware verification). P2s are noted, not blockers.
 2. **Pre-flight passed** — tests/typecheck per the risk tier in `01-preflight.md`; for PRs
    touching runtime code, the affected test suites are green (regression check — no regressions).
