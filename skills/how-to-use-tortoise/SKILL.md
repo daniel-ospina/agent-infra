@@ -351,19 +351,23 @@ A 500ms timeout caps all strategies. If all FalkorDB strategies fail, the system
 
 ## Creating Relationships with Semantic Labels
 
-When connecting Points with operators, use the `label` parameter to add domain context:
+When connecting Points with operators, use the `label` parameter to add domain context. **Direction is an explicit flag, not derived from the label** (ONTOLOGY v3.1 §3.1, §8 — #189):
 
-| Semantic Type | Mechanism | Direction | When to Use |
-|--------------|-----------|-----------|-------------|
-| **hasPart** | IMPL | Bidirectional (parts↔whole) | Composition — "Epic hasPart Issue", "Product hasPart Feature" |
-| **addresses** | IMPL | Unidirectional (A→B) | "Feature addresses Need", "Task implements Feature" |
-| **opposes** | NAND | Unidirectional (A→B) | "Feature competesWith Competitor", "Issue blocks Issue" |
+| Semantic Type | Mechanism | Typical Direction | When to Use |
+|--------------|-----------|-------------------|-------------|
+| **hasPart** | IMPL | bidirectional (parts↔whole) | Composition — "Epic hasPart Issue", "Product hasPart Feature" |
+| **addresses** | IMPL | unidirectional (A→B) | "Feature addresses Need", "Task implements Feature" |
+| **opposes** | NAND | unidirectional (A→B) | "Feature competesWith Competitor", "Issue blocks Issue" |
+
+**Direction is explicit, not label-derived.** `create_operator(..., direction="bidirectional"|"unidirectional")` controls EP back-propagation: `bidirectional` (default) propagates both ways; `unidirectional` is source→target only. The `label` carries domain semantics only — EP reads `direction`, never the label. NAND defaults to bidirectional but also supports unidirectional.
+
+**Backward compatibility:** existing operators without a `direction` property default to bidirectional in EP (with a warning log). Run `graph-scripts/migrate_direction.py` to backfill `direction` on existing operators per their old semantics (NAND / hasPart / part-of → bidirectional; other IMPL → unidirectional).
 
 **Strength:** Set via `set_point_baseline(operator_id, alpha, beta)`. High alpha = strong support. High beta = strong contradiction.
 
 ```python
-# Create a relationship with semantic context
-op = sdk.create_operator("IMPL", feature_id, [need_id], label="addresses")
+# Create a relationship with semantic context + explicit direction
+op = sdk.create_operator("IMPL", feature_id, [need_id], label="addresses", direction="unidirectional")
 sdk.set_point_baseline(op["id"], alpha=10, beta=1)  # strong support
 ```
 
