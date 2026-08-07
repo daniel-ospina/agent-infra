@@ -7,7 +7,7 @@ status: live
 tags: [pipeline, project, planning, fractal, orchestrator]
 summary: "Workflow skill that routes a project through the 6-stage pipeline at proportional depth."
 created: 2026-07-07
-updated: 2026-07-07
+updated: 2026-08-08
 steps:
   - name: inherit_align
     type: skill
@@ -40,15 +40,43 @@ steps:
 **Human approval gate:** presents output for user review. Pipeline advances after approval.
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-**Human approval gate:** presents output for user review. Pipeline advances after approval.
-**Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
-
-**Human approval gate:** presents output for user review. Pipeline advances after approval.
-**Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
-
 # Project Workflow
 
 Routes a project (standard/complex issue) through the 6-stage pipeline at proportional depth. Sub-skills are the same as epic-workflow — the Workflow determines the depth.
+
+## Branch Isolation (runs BEFORE Phase 1)
+
+> ⛔ **Every issue gets its own branch.** This prevents the 2026-08-06 incident where #74's work committed onto #73's branch.
+
+Before any work begins, verify branch isolation:
+
+```bash
+ISSUE_NUMBER="<N>"              # from the issue being worked
+SLUG="<kebab-slug>"             # brief slug from issue title
+EXPECTED_BRANCH="feat/${ISSUE_NUMBER}-${SLUG}"
+CURRENT=$(git branch --show-current)
+
+[ "$CURRENT" = "$EXPECTED_BRANCH" ] && exit 0   # already on correct branch
+
+if [ "$CURRENT" = "main" ] || [ "$CURRENT" = "master" ]; then
+  git checkout -b "$EXPECTED_BRANCH"
+  exit 0
+fi
+
+# Detached HEAD? ABORT — no branch to verify
+if [ -z "$CURRENT" ]; then
+  echo "⛔ ABORT: Detached HEAD. Checkout main first: git checkout main && git checkout -b $EXPECTED_BRANCH"
+  exit 1
+fi
+
+# ABORT: on a DIFFERENT issue's branch (boundary match prevents #76 matching #760)
+if ! echo "$CURRENT" | grep -qE "(^|/)$ISSUE_NUMBER(-|\$)"; then
+  echo "⛔ ABORT: On branch $CURRENT (different issue). Switch to main first, then create $EXPECTED_BRANCH."
+  exit 1
+fi
+```
+
+> When dispatching parallel subagents, each must get its own worktree — see `skills/issue-workflow/SKILL.md` Branch+Worktree Isolation section for the full pattern.
 
 ## Pipeline
 

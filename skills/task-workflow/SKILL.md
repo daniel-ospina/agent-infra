@@ -7,7 +7,7 @@ status: live
 tags: [pipeline, task, planning, fractal, orchestrator, lightweight]
 summary: "Workflow skill for micro-issues — all 6 pipeline stages applied inline with no sub-skill dispatch."
 created: 2026-07-07
-updated: 2026-07-07
+updated: 2026-08-08
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 1.0.0
 ---
@@ -17,6 +17,40 @@ version: 1.0.0
 # Task Workflow
 
 Routes a task (micro issue) through all 6 pipeline stages. Lightweight — the agent applies the phase discipline inline. No Bounded sub-skill dispatch. No separate workflow files.
+
+## Branch Isolation (runs BEFORE Phase 1)
+
+> ⛔ **Every issue gets its own branch.** This prevents the 2026-08-06 incident where #74's work committed onto #73's branch.
+
+Before any work begins, verify branch isolation:
+
+```bash
+ISSUE_NUMBER="<N>"              # from the issue being worked
+SLUG="<kebab-slug>"             # brief slug from issue title
+EXPECTED_BRANCH="feat/${ISSUE_NUMBER}-${SLUG}"
+CURRENT=$(git branch --show-current)
+
+[ "$CURRENT" = "$EXPECTED_BRANCH" ] && exit 0   # already on correct branch
+
+if [ "$CURRENT" = "main" ] || [ "$CURRENT" = "master" ]; then
+  git checkout -b "$EXPECTED_BRANCH"
+  exit 0
+fi
+
+# Detached HEAD? ABORT — no branch to verify
+if [ -z "$CURRENT" ]; then
+  echo "⛔ ABORT: Detached HEAD. Checkout main first: git checkout main && git checkout -b $EXPECTED_BRANCH"
+  exit 1
+fi
+
+# ABORT: on a DIFFERENT issue's branch (boundary match prevents #76 matching #760)
+if ! echo "$CURRENT" | grep -qE "(^|/)$ISSUE_NUMBER(-|\$)"; then
+  echo "⛔ ABORT: On branch $CURRENT (different issue). Switch to main first, then create $EXPECTED_BRANCH."
+  exit 1
+fi
+```
+
+> When dispatching parallel subagents, each must get its own worktree — see `skills/issue-workflow/SKILL.md` Branch+Worktree Isolation section for the full pattern.
 
 ## Pipeline (all phases, lightweight — no orchestrator workflow files)
 

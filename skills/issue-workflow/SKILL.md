@@ -7,7 +7,7 @@ status: live
 tags: [pipeline, issue, routing, fractal, orchestrator, entry-point]
 summary: "Fractal entry-point router — detects Level and dispatches to epic-workflow, project-workflow, or task-workflow."
 created: 2026-07-07
-updated: 2026-07-07
+updated: 2026-08-08
 steps:
   - name: classify_ask
     type: skill
@@ -118,17 +118,62 @@ gh issue edit $ISSUE --add-label implemented
 gh issue edit $ISSUE --remove-label implementing || true
 ```
 
-## Worktree Isolation
+## Branch + Worktree Isolation
 
-Verify worktree isolation before file edits. Each workflow skill manages its own worktree internally, but the entry point checks:
+> ⛔ **This gate runs BEFORE any work on the issue.** Every issue gets its own branch. Every parallel subagent gets its own worktree. This prevents the 2026-08-06 incident where parallel agents collided in the shared main checkout and #74's work landed on #73's branch (PR #75 contained both).
+
+### 1. Branch Gate (runs first — before edits or dispatch)
 
 ```bash
-TOPDIR=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
-GIT_COMMON=$(git rev-parse --git-common-dir)
-[ "$GIT_COMMON" != "$TOPDIR/.git" ] && echo "✅ Worktree" && exit 0
-[ "${AGENT_ALLOW_MAIN_EDITS:-}" = "1" ] && echo "ℹ️ Main (override)" && exit 0
-echo "⛔ Main checkout — invoke using-git-worktrees or set AGENT_ALLOW_MAIN_EDITS=1" && exit 1
+ISSUE_NUMBER="76"              # extract from the issue being worked
+SLUG="branch-isolation"        # brief kebab-case slug from the issue title
+EXPECTED_BRANCH="feat/${ISSUE_NUMBER}-${SLUG}"
+CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
+
+# Already on the correct branch — proceed
+[ "$CURRENT_BRANCH" = "$EXPECTED_BRANCH" ] && echo "✅ On correct branch: $CURRENT_BRANCH" && exit 0
+
+# On main — create the dedicated branch
+if [ "$CURRENT_BRANCH" = "main" ] || [ "$CURRENT_BRANCH" = "master" ]; then
+  git checkout -b "$EXPECTED_BRANCH"
+  echo "✅ Created and switched to: $EXPECTED_BRANCH"
+  exit 0
+fi
+
+# Detached HEAD? ABORT — no branch to verify
+if [ -z "$CURRENT_BRANCH" ]; then
+  echo "⛔ ABORT: Detached HEAD. Checkout main first: git checkout main && git checkout -b $EXPECTED_BRANCH"
+  exit 1
+fi
+
+# ABORT: on a DIFFERENT issue's branch (boundary match prevents #76 matching #760)
+if ! echo "$CURRENT_BRANCH" | grep -qE "(^|/)$ISSUE_NUMBER(-|\$)"; then
+  echo "⛔ ABORT: You are on branch \"$CURRENT_BRANCH\" which belongs to a DIFFERENT issue."
+  echo "   This is how #74's work committed onto #73's branch (incident 2026-08-06)."
+  echo "   → Stash or commit your changes on $CURRENT_BRANCH first."
+  echo "   → Then: git checkout main && git checkout -b $EXPECTED_BRANCH"
+  exit 1
+fi
+
+# Branch contains this issue number — proceed (already on a matching branch with different slug)
+echo "✅ On matching branch: $CURRENT_BRANCH"
 ```
+
+### 2. Worktree Gate (runs for parallel subagent dispatch)
+
+When dispatching multiple subagents that write to the same repo, each subagent MUST get its own worktree. The dispatcher creates them and passes the path via `cwd` — never dispatch two subagents to the same checkout.
+
+```bash
+# Dispatcher creates an isolated worktree for each subagent:
+WORKTREE_PATH=".worktrees/subagent-${SUBAGENT_ID}"
+git worktree add --detach "$WORKTREE_PATH" HEAD
+
+# Then dispatch the subagent with cwd = $WORKTREE_PATH
+# After the subagent completes, clean up:
+git worktree remove --force "$WORKTREE_PATH"
+```
+
+> **Orchestrator rule:** Parallel subagents → each gets `git worktree add` + unique `cwd`. Never reuse the same checkout. See `skills/using-git-worktrees/SKILL.md` for symlink setup and `skills/parallel-orchestrator/SKILL.md` for dispatch patterns.
 
 <HARD-GATE>
 Do NOT write code, edit files, or form an implementation plan until the correct workflow skill has been invoked and its Align stage is complete.
