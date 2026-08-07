@@ -1,11 +1,13 @@
-// reflect-hook.ts — wires reflect.py to session end (#6547)
-// Fires AAR postmortem generator on session shutdown (quit only).
-// Auto-skip: reflect.py --auto suppresses routine sessions (≤1 PR, 0 friction).
-// Non-blocking: subprocess detached, session closes regardless of exit code.
+// reflect-hook.ts — wires session reflection to the hosted Tortoise API (#102)
+// Fires on session shutdown (quit only).
+// NEW SOR: posts the session to hosted Tortoise POST /v1/sessions (episodic Points)
+// when TORTOISE_API_KEY is set — the eldato-era operations/memory/reflect.py AAR
+// postmortem path is the legacy fallback (eldato checkout or REFLECT_PY).
+// Non-blocking: subprocess/fetch detached, session closes regardless.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn, execSync } from "node:child_process";
-import { writeFileSync, mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdtempSync, rmSync, mkdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -38,25 +40,56 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Resolve project root
-      let projectRoot: string;
+      // ── Capture path (#102): hosted Tortoise API is the NEW SOR ──
+      // POST /v1/sessions (tortoise/hosted_api.py) ingests the conversation as
+      // episodic Points. Env: TORTOISE_API_KEY (tt_... from tortoise.premiselabs.co),
+      // TORTOISE_BASE_URL (default https://tortoise.premiselabs.co).
+      const apiKey = process.env.TORTOISE_API_KEY || "";
+      const baseUrl = (process.env.TORTOISE_BASE_URL || "https://tortoise.premiselabs.co").replace(/\/+$/, "");
+      const conversation = lines.map((line) => {
+        const m = line.match(/^\[(user|assistant)\]: ([\s\S]*)$/);
+        return m ? { role: m[1] === "assistant" ? "assistant" : "user", content: m[2].slice(0, 5000) } : null;
+      }).filter(Boolean) as Array<{ role: string; content: string }>;
+
+      if (apiKey && conversation.length > 0) {
+        try {
+          const res = await fetch(`${baseUrl}/v1/sessions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+            body: JSON.stringify({ conversation, metadata: { agent: "pi" } }),
+          });
+          if (!res.ok) {
+            console.error(`[reflect-hook] tortoise /v1/sessions → HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
+          } else {
+            console.log(`[reflect-hook] Captured session to hosted Tortoise (${conversation.length} turns)`);
+          }
+          return; // hosted path done — no legacy spawn
+        } catch (err: any) {
+          console.error(`[reflect-hook] tortoise session capture failed: ${err.message}`);
+          return;
+        }
+      }
+
+      // ── Legacy path: eldato repo operations/memory/reflect.py (AAR postmortem) ──
+      // Only fires when run from an eldato checkout (or REFLECT_PY is set).
+      let reflectScript: string;
       try {
-        projectRoot = execSync("git rev-parse --show-toplevel", {
+        const projectRoot = execSync("git rev-parse --show-toplevel", {
           encoding: "utf-8",
           cwd: ctx.cwd,
           timeout: 3000,
         }).trim();
+        reflectScript = process.env.REFLECT_PY
+          || join(projectRoot, "operations", "memory", "reflect.py");
       } catch {
         console.log("[reflect-hook] Skipped — not in a git repo");
         return;
       }
 
-      const reflectScript = join(
-        projectRoot,
-        "operations",
-        "memory",
-        "reflect.py",
-      );
+      if (!existsSync(reflectScript)) {
+        console.log("[reflect-hook] reflect.py not found (needs eldato checkout or REFLECT_PY). Session capture is superseded by hosted Tortoise POST /v1/sessions (set TORTOISE_API_KEY). See issue #102.");
+        return;
+      }
 
       // Extract PR numbers from session text
       const prPattern =

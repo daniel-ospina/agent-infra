@@ -89,16 +89,18 @@ Who owns this work.
 
 1. Inherit from parent epic (`**Team:** <slug>` in the epic's issue body)
 2. Environment: `AGENT_SESSION_TEAM` / `AGENT_SESSION_ROLE`
-3. Subjects registry: `operations/subjects/*.yaml`
-4. Escalation: if unresolved → `**Team:** unknown` (triggers escalation comment)
+3. Org data SOR: swarm Supabase SOR (teams/roles tables) via `node scripts/swarm-org.mjs resolve-role <slug>` or `list-teams` (requires `SUPABASE_URL_ORG_DATA` + `SUPABASE_SERVICE_ROLE_KEY_ORG_DATA`; derived YAML mirror: swarm repo `operations/subjects/*.yaml`)
+4. Escalation: if unresolved or SOR unreachable → `**Team:** unknown` (triggers escalation comment)
 
 ### Apply Labels
 
 ```bash
-node scripts/subjects-labels.cjs --issue $ISSUE_NUMBER || echo "[issue-creation] labeling failed (non-blocking)" >&2
+node scripts/swarm-org.mjs list-teams | grep -q "\"slug\": \"$TEAM\"" && \
+  gh issue edit $ISSUE_NUMBER --add-label "team:$TEAM" || \
+  echo "[issue-creation] team:$TEAM label skipped — verify team exists in swarm SOR" >&2
 ```
 
-Fail-open — labeling never blocks creation.
+Fail-open — labeling never blocks creation. (The eldato-era `scripts/subjects-labels.cjs` was never vendored into agent-infra and is superseded by the swarm Supabase SOR — see #102.)
 
 ---
 
@@ -211,7 +213,8 @@ If this issue needs investigation before implementation, note what to research. 
 
 ```bash
 gh issue edit $ISSUE_NUMBER --add-label "complexity:<tier>"
-node scripts/subjects-labels.cjs --issue $ISSUE_NUMBER || true
+# Team label — resolve team from swarm SOR (see §Section 2), then:
+gh issue edit $ISSUE_NUMBER --add-label "team:$TEAM" || true
 ```
 
 ---

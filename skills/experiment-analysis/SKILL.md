@@ -9,7 +9,7 @@ version: 1.0.0
 
 # Experiment Analysis
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 Analyzes A/B/n experiment results with explicit accounting for mid-experiment fixes, data quality, and issue/PR timelines. Produces a structured report at `docs/experiments/<key>_analysis.md` and updates the experiment tracker.
 
@@ -49,7 +49,7 @@ Read the experiment design from available sources:
    WHERE e.experiment_key = '<key>';
    ```
 
-2. **Fallback — docs:** Read `docs/teams/eldato-app-team/growth/experiment_layer.md` for the experiment's design notes.
+2. **Fallback — docs:** Read `docs/teams/eldato-app-team/domains (S1)/growth/experiment_layer.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`) for the experiment's design notes.
 
 3. **Fallback — experiment doc:** If a plan doc exists at `docs/plans/*<key>*`, read it.
 
@@ -461,7 +461,7 @@ Or: NO ISSUES FOUND
 
 ### Phase 8 — Integration
 
-1. **Update experiment tracker** (`docs/teams/eldato-app-team/product/experiments.md`):
+1. **Update experiment tracker** (`docs/teams/eldato-app-team/domains (S1)/product/experiments.md`, eldato repo):
    - Move to Completed section. Fill Results, Learnings, Next Action. Link report.
 
 2. **Post summary on analysis issue:**
@@ -473,7 +473,7 @@ Or: NO ISSUES FOUND
    **Data quality:** <clean window summary>"
    ```
 
-3. **Update `docs/teams/eldato-app-team/growth/experiment_layer.md`** if experiment changes layer behavior.
+3. **Update `docs/teams/eldato-app-team/domains (S1)/growth/experiment_layer.md`** (eldato repo) if experiment changes layer behavior.
 
 4. **Checkpoint** for cross-session learning.
 

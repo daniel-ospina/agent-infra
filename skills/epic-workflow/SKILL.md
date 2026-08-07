@@ -58,26 +58,26 @@ Routes an epic through the full 6-stage fractal planning pipeline. Each stage in
 5. **Decompose** — `shared/decompose/SKILL.md` — MECE-first + wiring + verification issues. Uses `issue-creation` skill for child issue generation.
 6. **Verify** — `shared/verify/SKILL.md` — Pre + post-deploy verification
 
-**Reflect** — `operations/memory/reflect.py` runs automatically at session end via `reflect-hook.ts`. Cross-cutting: fires at epic completion, project close, and session quit. Produces AAR postmortem + classified friction events. See ONTOLOGY.md §2.6 (Reflect action).
+**Reflect** — session-end reflection is captured by `extensions/reflect-hook.ts` (this repo): it posts the session to the hosted Tortoise API (`POST /v1/sessions`, requires `TORTOISE_API_KEY`) and falls back to the legacy `operations/memory/reflect.py` in the eldato repo when configured. Cross-cutting: fires at session quit. Produces episodic session Points + (legacy) AAR postmortems + classified friction events. See `tortoise/docs/ONTOLOGY.md` (v3.1) §3.2 (Event → Point), §5 (Event kinds `sessionCaptured`).
 
 ## Human Gates
 
 ### Approval Routing
 
-When a human gate fires, the agent MUST invoke the approval router to surface the request:
+When a human gate fires, the agent MUST invoke the approval router to surface the request. The approval router lives in the **swarm** repo (`operations/coordination/approval.py` — same API: `request_approval` / `review_approval` / `pending_approvals`):
 
 ```bash
-# For human bypass (default for epic gates):
-APPROVAL_NO_NOTIFY=0 python3 -c "
+# For human bypass (default for epic gates) — run from a swarm checkout:
+cd ~/Documents/GitHub/swarm && APPROVAL_NO_NOTIFY=0 python3 -c "
 from operations.coordination.approval import request_approval
 request_approval('product-strategist', artifact='<doc-name>.md', context='<stage> approval for epic <name>', requires_human=True)
 print('Approval request created — osascript dialog fired')
 "
 ```
 
-This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to `operations/coordination/approvals.json` and must be checked manually.
+This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to `operations/coordination/approvals.json` (swarm repo) and must be checked manually.
 
-**Response mechanism:** The human clicks "Open" or "Dismiss" on the dialog. The agent monitors `pending_approvals('human')` to detect the response. See `operations/coordination/approval.py` for the full API.
+**Response mechanism:** The human clicks "Open" or "Dismiss" on the dialog. The agent monitors `pending_approvals('human')` to detect the response. See `operations/coordination/approval.py` (swarm repo) for the full API.
 
 **Role-based escalation** (for non-epic gates): use without `requires_human=True` to route through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human).
 

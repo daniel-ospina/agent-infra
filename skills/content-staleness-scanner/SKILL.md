@@ -15,7 +15,7 @@ Proactively detects stale `category_content` pages that qualify for a `content-r
 
 **Use this skill when:** You want to know which pages are stale across the whole site, or when preparing a batch refresh sprint.
 
-**Design reference:** `docs/teams/organisation-design-team/capability/2026-02-18-content-skill-system-design.md`
+**Design reference:** `docs/teams/organisation-design-team/domains (S1)/capability/2026-02-18-content-skill-system-design.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`)
 
 ## Staleness Triggers
 

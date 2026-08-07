@@ -33,12 +33,12 @@ Business model landscape. Market trends. Build vs buy dynamics. What is the mark
 **Before scanning the environment, query the epistemic graph for existing vision Points.** This surfaces prior vision claims, assumptions about the environment, and competitor claims already logged — preventing redundant research and anchoring the scan in accumulated knowledge.
 
 ```bash
-python3 operations/memory/tortoise_client.py query-visions --context "<vision-domain>"
+node scripts/tortoise-memory.mjs query-visions --point-kind vision
 ```
 
 Also query for related claims:
 ```bash
-python3 operations/memory/tortoise_client.py query-prior-research --domain "<domain>"
+node scripts/tortoise-memory.mjs query-prior-research --domain "<domain>"
 ```
 
 **Interpretation:**
@@ -150,9 +150,8 @@ If no issues: NO ISSUES FOUND
 **After the AI review passes clean, log the vision's key claims to the memory system.** This ensures subsequent vision cycles, strategy work, and identity checks can reference the worldview established.
 
 ```bash
-python3 operations/memory/tortoise_client.py write-points \
+node scripts/tortoise-memory.mjs write-points \
   --kind vision \
-  --context "<vision-domain>" \
   --points-json '[
     {"content": "<H1 claim>", "authoredBy": "define-vision-skill", "confidence": 0.7},
     {"content": "<H2 transition>", "authoredBy": "define-vision-skill", "confidence": 0.5},

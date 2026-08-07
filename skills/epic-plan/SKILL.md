@@ -49,7 +49,7 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 > ⚠️ **This file is authoritative.** All 8 sub-steps and their review gates are defined inline below — there are no separate `workflow/` files.
 

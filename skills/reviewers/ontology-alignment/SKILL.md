@@ -20,8 +20,7 @@ Dispatched by the fractal planning pipeline during the **Data Model** substep wh
 ## Inputs Required
 
 - **Full epic doc** — all sections (terminology drift spans sections)
-- **Canonical controlled vocabulary:** `docs/teams/organisation-design-team/data/controlled_vocabulary.md`
-- **Canonical ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md`
+- **Canonical ontology + controlled vocabulary:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d`. The controlled vocabulary is §5 (Core Kind Vocabulary) of the same file.
 
 ## Checks to Run
 

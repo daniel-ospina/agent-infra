@@ -120,7 +120,7 @@ Before implementing any Supabase feature, find the relevant documentation. Use t
 
 Do NOT use `apply_migration` to change a local database schema — it writes a migration history entry on every call, which means you can't iterate, and `supabase db diff` / `supabase db pull` will produce empty or conflicting diffs. If you use it, you'll be stuck with whatever SQL you passed on the first try.
 
-**For production migrations,** use `apply_migration_safe` from the `migration-safe` MCP server — never the built-in `apply_migration`. The built-in writes a runtime timestamp (not the filename timestamp) to `schema_migrations`, creating a duplicate tracking row when CI later runs `supabase db push`. Root cause of issue #1830. Full conventions: `docs/teams/organisation-design-team/operations/migration_conventions.md`.
+**For production migrations,** use `apply_migration_safe` from the `migration-safe` MCP server — never the built-in `apply_migration`. The built-in writes a runtime timestamp (not the filename timestamp) to `schema_migrations`, creating a duplicate tracking row when CI later runs `supabase db push`. Root cause of issue #1830. Full conventions: `docs/teams/organisation-design-team/domains (S1)/operations/migration_conventions.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`).
 
 ### ⚠️ Git Stash + Auto-PR Migration Conflict
 

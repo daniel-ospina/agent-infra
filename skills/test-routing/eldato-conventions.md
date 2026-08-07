@@ -15,7 +15,7 @@ Maps universal patterns in `SKILL.md` to concrete eldato tooling.
 | "your code test tool" | Vitest |
 | "your e2e tool" | Playwright |
 | "your DB tool" | Supabase |
-| "your component library" | `docs/teams/eldato-app-team/ux/component_catalog.md` |
+| "your component library" | `docs/teams/eldato-app-team/domains (S1)/ux/component_catalog.md` (eldato repo) |
 
 ## Deferred Domains
 - content → `content-strategy-agent` (#6053)

@@ -101,15 +101,13 @@ export function writeSession(s: ActiveSession, file = SESSION_FILE): void {
   renameSync(tmp, file);
 }
 
-/** Walk up from cwd; return the first dir with AGENTS.md AND operations/subjects/. */
+/** Walk up from cwd; return the first dir with AGENTS.md. (The old
+ * operations/subjects/ marker was eldato-era and is superseded — see #102.) */
 export function findRepoRoot(cwd: string): string | null {
   let dir = cwd;
   for (let i = 0; i < 32; i++) {
     try {
-      if (
-        existsSync(join(dir, "AGENTS.md")) &&
-        existsSync(join(dir, "operations", "subjects"))
-      ) {
+      if (existsSync(join(dir, "AGENTS.md"))) {
         return dir;
       }
     } catch {

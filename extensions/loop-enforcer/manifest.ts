@@ -139,7 +139,8 @@ export function abortLoop(
 }
 
 // ── Pause / Block / Resume ─────────────────────────────────────
-// ponytail: three status transitions added per ONTOLOGY.md §3.2 workflow statuses.
+// ponytail: three status transitions added per tortoise/docs/ONTOLOGY.md §2
+// (Procedural layer: status is a derived projection of the event stream).
 // Paused = positive state (suspended, will resume). Blocked = negative state (needs intervention).
 
 export function pauseLoop(slug: string, reason: string, loopsDir = LOOPS_DIR): boolean {

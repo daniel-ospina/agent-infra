@@ -1,6 +1,6 @@
 /**
  * Self-check: chunker.test.ts
- * Run: npx tsx operations/pi-config/extensions/slack-bridge/chunker.test.ts
+ * Run: npx tsx extensions/slack-bridge/chunker.test.ts
  *
  * Matches test conventions:
  * assert-based, process.exit(1) on failure.

@@ -12,18 +12,18 @@ tags: [operations, team-setup, checklist]
 
 Checklist of every surface that must be touched when creating a new team. Follow in order — each step is a hard gate. Skipping a step silently breaks issue labeling, escalation routing, or document classification.
 
-**Canonical source of truth:** Supabase (`org-data` repo, `teams` table). All other surfaces are derived.
+**Canonical source of truth:** Supabase SOR in the **swarm** repo (`supabase/` migrations, `teams` table — `SUPABASE_URL_ORG_DATA` / `SUPABASE_SERVICE_ROLE_KEY_ORG_DATA`). All other surfaces are derived.
 
 ## Registration Surfaces
 
 ### 1. Supabase — teams table (CANONICAL)
 
-Insert into `org-data.supabase`:
+Insert into the swarm org-data Supabase:
 
 ```sql
 INSERT INTO teams (org_id, name, slug, description)
 VALUES (
-  (SELECT id FROM organizations WHERE slug = 'eldato'),
+  (SELECT id FROM organizations WHERE slug = 'premise-labs'),
   '<Team Name>',
   '<team-slug>',
   '<one-line description>'
@@ -32,7 +32,12 @@ VALUES (
 
 Then run the migration:
 ```bash
-cd org-data && supabase db push
+cd ~/Documents/GitHub/swarm && supabase db push
+```
+
+Verify via the agent-infra helper (needs the same env vars):
+```bash
+node scripts/swarm-org.mjs list-teams
 ```
 
 ### 2. Repo Setup
@@ -69,17 +74,14 @@ Use the common README template:
 See [docs/00_index.md](docs/00_index.md) for architecture and operations.
 
 ## Related Repositories
-- [eldato](https://github.com/daniel-ospina/eldato) — Main El Dato app + canonical ontology
-- [tortoise](https://github.com/daniel-ospina/tortoise) — Tortoise knowledge graph engine
+- [eldato](https://github.com/daniel-ospina/eldato) — Main El Dato app + canonical product docs
+- [tortoise](https://github.com/daniel-ospina/tortoise) — Tortoise knowledge graph engine + canonical ontology (`docs/ONTOLOGY.md`)
+- [swarm](https://github.com/daniel-ospina/swarm) — Org data Supabase SOR (`supabase/`, `connectors/supabase_org.py`) + coordination
 - [eldato-outreach](https://github.com/daniel-ospina/eldato-outreach) — B2B WhatsApp outreach
 - [dmer](https://github.com/daniel-ospina/dmer) — Instagram DM daemon
-- [org-data](https://github.com/daniel-ospina/org-data) — Organisation design + multi-tenant data
 ```
 
-If the team lives in the main `eldato` repo, create domain folders at the repo root:
-```bash
-mkdir -p docs/teams/<team-slug>/{capability,data,engineering,finance-accounting,growth,legal,operations,product,ux}
-```
+If the team lives in the main `eldato` repo, create domain folders at `docs/teams/<team-slug>/domains (S1)/<domain>/` (the eldato `docs/teams/` layout):
 
 ### 3. Main docs/00_index.md
 
@@ -100,13 +102,13 @@ gh api /orgs/daniel-ospina/teams -f name='<team-slug>' -f privacy='closed'
 gh api /orgs/daniel-ospina/teams/<team-slug>/repos/daniel-ospina/<team-repo> -X PUT
 ```
 
-### 6. Classification Manifest
+### 6. Classification Manifest (eldato repo)
 
-Add a `batch_N_<team-slug>:` section to `docs/teams/_classification-manifest.yaml` for any epics, research briefs, or plans the team already has. Update `summary.team_distribution` and `summary.total_files_classified` counters.
+Add a `batch_N_<team-slug>:` section to `docs/teams/_classification-manifest.yaml` in the **eldato** repo for any epics, research briefs, or plans the team already has. Update `summary.team_distribution` and `summary.total_files_classified` counters.
 
-### 7. Actor File (if using operations/actors)
+### 7. Actor File (swarm repo — if using operations/actors)
 
-Create `operations/actors/<team-slug>.yaml`:
+Create `operations/actors/<team-slug>.yaml` in the **swarm** repo:
 
 ```yaml
 # <Team Name>
@@ -118,25 +120,26 @@ team:
   escalation: human
 ```
 
-### 8. Subject File (legacy — YAML backup)
+### 8. Subject File (superseded — swarm Supabase SOR)
 
-Create `operations/subjects/<team-slug>.yaml` as a YAML backup of the Supabase record. This is a derived copy, not the source of truth.
+The eldato-era `operations/subjects/<team-slug>.yaml` YAML backup is **superseded** by the swarm Supabase SOR (`teams`/`roles` tables, migrations 00003-00005). The swarm repo keeps derived YAML mirrors at `operations/subjects/` for local reads — update those if you work from a swarm checkout, but the Supabase rows are canonical.
 
-### 9. Label System
+### 9. Label System (superseded)
 
-In `scripts/subjects-labels.cjs`, add the team to `TEAM_DEFAULT_DOMAINS` and update the test fixture and test count.
+`scripts/subjects-labels.cjs` was never vendored into agent-infra and is **superseded** by the swarm SOR (see #102). Team labels resolve from the `teams` table via `node scripts/swarm-org.mjs list-teams`.
 
 ## Verification
 
 ```bash
-# Verify Supabase record exists
-cd org-data && supabase db query "SELECT * FROM teams WHERE slug = '<team-slug>'"
+# Verify Supabase record exists (swarm SOR)
+cd ~/Documents/GitHub/swarm && supabase db query "SELECT * FROM teams WHERE slug = '<team-slug>'"
+
+# Verify via agent-infra helper
+node scripts/swarm-org.mjs resolve-role <team-slug>
+node scripts/swarm-org.mjs list-teams
 
 # Verify GitHub label
 gh label list --search "team:<team-slug>"
-
-# Verify subjects load
-node scripts/subjects-labels.test.cjs
 ```
 
 ## Common Mistakes
@@ -144,7 +147,7 @@ node scripts/subjects-labels.test.cjs
 | Symptom | Missed Surface |
 |---------|---------------|
 | Issues can't be tagged `team:X` | GitHub label (step 4) |
-| `subjects-labels` returns `unknown` for team | Supabase record (step 1) or TEAM_DEFAULT_DOMAINS (step 9) |
+| Team slug not found by `swarm-org.mjs` | Supabase record (step 1) |
 | Team docs not in classification system | Manifest batch (step 6) |
 | Domain folders missing | Repo setup (step 2) |
 | Cross-repo links missing | README template (step 2) |

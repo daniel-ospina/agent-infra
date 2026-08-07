@@ -106,7 +106,7 @@ git commit -m "feat: add specific feature"
 - Exact commands with expected output
 - Reference relevant skills with @ syntax
 - DRY, YAGNI, TDD, frequent commits
-- **New docs files in closed directories** must include a task step: "Register `<filename>` in `docs/teams/organisation-design-team/operations/00_index.md`" and run `npm run check:docs` to verify. Open directories are exempt. See `CLAUDE.md → Index enforcement at merge time`.
+- **New docs files in closed directories** must include a task step: "Register `<filename>` in `docs/teams/organisation-design-team/domains (S1)/operations/00_index.md`" (eldato repo) and run `npm run check:docs` to verify. Open directories are exempt. See `CLAUDE.md → Index enforcement at merge time`.
 - **SQL functions implementing business logic** require a SQL-level test step — not just mocked TypeScript tests. The test step must use `npm run test:db` (pgTAP) or `execute_sql` via Supabase MCP.
 
 ## Common Mistakes

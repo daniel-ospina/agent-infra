@@ -4,7 +4,7 @@
  * Covers: JSON extraction, schema validation, git operation detection,
  * project root resolution, and regression tests for known bugs.
  *
- * Run: npx tsx operations/pi-config/extensions/verification-gate.test.ts
+ * Run: npx tsx extensions/verification-gate.test.ts
  */
 
 import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles } from "./index.js";

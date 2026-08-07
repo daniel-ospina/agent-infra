@@ -67,11 +67,13 @@ Loop until NO ISSUES FOUND or convergence (fingerprint-stall; safety cap: 10 cyc
 
 Before firing any web searches, check two sources for existing testing knowledge:
 
-**1. Markdown knowledge base (`docs/teams/organisation-design-team/operations/testing-patterns.md`):**
+**1. Markdown knowledge base (`docs/teams/organisation-design-team/domains (S1)/operations/testing-patterns.md`, eldato repo):**
+
+> Run this phase from an eldato repo checkout, or fetch the file: `gh api repos/daniel-ospina/eldato/contents/docs/teams/organisation-design-team/domains%20(S1)/operations/testing-patterns.md --jq .content | base64 -d`.
 
 ```bash
 # Does the file exist?
-[ -f docs/teams/organisation-design-team/operations/testing-patterns.md ] && echo "found" || echo "missing"
+[ -f docs/teams/organisation-design-team/domains (S1)/operations/testing-patterns.md ] && echo "found" || echo "missing"
 ```
 
 If found, read it. For each surface type in the Integration Surface Map, check if a pattern exists in the corresponding section. A pattern is "fresh" if its entry has a `Last researched:` date within the last 6 months.
@@ -87,7 +89,7 @@ For each surface type:
 
 Search FalkorDB for existing testing knowledge about the surface type via Tortoise query.
 
-If Tortoise returns matching knowledge not in the markdown knowledge base: use it, and also backfill it to `docs/teams/organisation-design-team/operations/testing-patterns.md`.
+If Tortoise returns matching knowledge not in the markdown knowledge base: use it, and also backfill it to `docs/teams/organisation-design-team/domains (S1)/operations/testing-patterns.md` (eldato repo).
 
 #### Phase 0b — Web Search (only for missing/stale patterns)
 
@@ -109,7 +111,7 @@ For each surface type NOT covered by Phase 0a, fire 1-2 targeted `web_search` qu
 
 After research completes, file findings to BOTH locations so future cycles skip the query:
 
-**1. Append to `docs/teams/organisation-design-team/operations/testing-patterns.md`:**
+**1. Append to `docs/teams/organisation-design-team/domains (S1)/operations/testing-patterns.md` (eldato repo):**
 
 ```markdown
 ### <Surface Type>

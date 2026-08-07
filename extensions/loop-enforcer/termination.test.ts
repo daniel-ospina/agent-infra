@@ -1,6 +1,6 @@
 /**
  * Self-check: termination.test.ts
- * Run: npx tsx operations/pi-config/extensions/loop-enforcer/termination.test.ts
+ * Run: npx tsx extensions/loop-enforcer/termination.test.ts
  */
 
 import { evaluateTermination, type CycleData } from "./termination.ts";

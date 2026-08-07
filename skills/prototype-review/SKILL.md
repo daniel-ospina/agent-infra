@@ -87,7 +87,7 @@ Then evaluate against these dimensions:
 
 1. COMPONENT REUSE:
    - Does the diff introduce new components when existing ones would work?
-   - Check docs/teams/eldato-app-team/ux/component_catalog.md for available components
+   - Check docs/teams/eldato-app-team/domains (S1)/ux/component_catalog.md (eldato repo) for available components
    - Does it use raw divs/buttons where shadcn/ui components exist?
    - Example: "<button> → should be <Button variant> from components/ui/"
 

@@ -1,5 +1,5 @@
 "use strict";
-// operations/pi-config/extensions/slack-bridge/chunker.ts
+// extensions/slack-bridge/chunker.ts
 // Split text into Slack-friendly chunks (<= MAX chars each, prefix included)
 // without breaking code fences. Multi-chunk output is prefixed "(part N/M)".
 Object.defineProperty(exports, "__esModule", { value: true });

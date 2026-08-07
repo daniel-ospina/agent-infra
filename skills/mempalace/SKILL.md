@@ -1,6 +1,6 @@
 ---
 name: mempalace
-description: "DEPRECATED — MemPalace has been removed (S10 licensing cleanup, 2026-07-17). All memory operations now route through Tortoise/FalkorDB per Epic #5199. See docs/epics/2026-07-14-memory-system/04-plan.md for the new memory system."
+description: "DEPRECATED — MemPalace has been removed (S10 licensing cleanup, 2026-07-17). All memory operations now route through Tortoise (hosted API / FalkorDB). See the memory-system plan (eldato repo docs/epics/2026-07-14-memory-system/04-plan.md) for the new memory system."
 allowed-tools: read, bash, grep, find, mempalace_status, mempalace_search, mempalace_diary_read, mempalace_diary_write, mempalace_add_drawer, mempalace_update_drawer, mempalace_get_drawer, mempalace_list_drawers, mempalace_delete_drawer, mempalace_check_duplicate, mempalace_checkpoint, mempalace_mine, mempalace_init, mempalace_sync, mempalace_kg_query, mempalace_kg_add, mempalace_kg_invalidate, mempalace_kg_timeline, mempalace_kg_stats, mempalace_list_wings, mempalace_list_rooms, mempalace_get_taxonomy, mempalace_get_aaak_spec, mempalace_traverse, mempalace_find_tunnels, mempalace_create_tunnel, mempalace_list_tunnels, mempalace_delete_tunnel, mempalace_list_hallways, mempalace_delete_hallway, mempalace_follow_tunnels, mempalace_graph_stats, mempalace_hook_settings, mempalace_memories_filed_away, mempalace_reconnect, mempalace_instructions, mempalace_delete_by_source
 version: 1.0.0
 ---
@@ -13,9 +13,9 @@ version: 1.0.0
 
 The new memory system is **Tortoise + FalkorDB** — a Docker-based knowledge graph with JSONL event sourcing. See:
 
-- **Plan:** `docs/epics/2026-07-14-memory-system/04-plan.md`
+- **Plan:** eldato repo `docs/epics/2026-07-14-memory-system/04-plan.md` (fetch: `gh api repos/daniel-ospina/eldato/contents/docs/epics/2026-07-14-memory-system/04-plan.md --jq .content | base64 -d`)
 - **Architecture:** Tortoise Python package (CLI + Python API) → FalkorDB (Docker, port 6379)
-- **Session reflection:** `operations/memory/reflect.py` → JSONL event log → Tortoise projection → FalkorDB
+- **Session reflection:** `reflect.py` (eldato repo `operations/memory/reflect.py`, legacy) → JSONL event log → Tortoise projection → FalkorDB; the NEW path is hosted Tortoise `POST /v1/sessions` via `extensions/reflect-hook.ts` (agent-infra)
 
 ## What to do instead
 
@@ -23,7 +23,7 @@ The new memory system is **Tortoise + FalkorDB** — a Docker-based knowledge gr
 |---|---|
 | `mempalace_search` | Tortoise FalkorDB Cypher queries |
 | `mempalace_kg_add` | `tortoise projection` via JSONL events |
-| `mempalace_diary_write` | reflect.py → JSONL Event log |
+| `mempalace_diary_write` | hosted Tortoise `POST /v1/sessions` (via reflect-hook) / legacy eldato reflect.py → JSONL Event log |
 | `mempalace_status` | `tortoise status` (per-ontology node counts) |
 | `mempalace_wake-up` | Tortoise cross-ontology query |
 | `mempalace_checkpoint` | `tortoise checkpoint` (Phase B) |

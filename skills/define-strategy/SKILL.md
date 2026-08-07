@@ -52,12 +52,12 @@ Produces the Strategy artifact and Roadmap. Takes the S4 vision as input. Execut
 **Before starting gap analysis, query the epistemic graph for prior strategy claims.** This surfaces assumptions, constraints, and decisions from previous strategy cycles — preventing drift and enabling cumulative reasoning.
 
 ```bash
-python3 operations/memory/tortoise_client.py query-strategies
+node scripts/tortoise-memory.mjs query-strategies
 ```
 
 Also query for relevant decisions and assumptions:
 ```bash
-python3 operations/memory/tortoise_client.py query-prior-research --domain "<strategy-domain>"
+node scripts/tortoise-memory.mjs query-prior-research --domain "<strategy-domain>"
 ```
 
 **Interpretation:**
@@ -70,9 +70,8 @@ python3 operations/memory/tortoise_client.py query-prior-research --domain "<str
 **After the Roadmap step completes, log the strategy's key claims to the epistemic graph.** This ensures subsequent strategy cycles and related skills (vision, identity) can reference the decisions made.
 
 ```bash
-python3 operations/memory/tortoise_client.py write-points \
+node scripts/tortoise-memory.mjs write-points \
   --kind strategy \
-  --context "<strategy-context>" \
   --points-json '[
     {"content": "<key decision 1>", "authoredBy": "define-strategy-skill", "confidence": 0.8},
     {"content": "<key constraint 2>", "authoredBy": "define-strategy-skill", "confidence": 0.9},

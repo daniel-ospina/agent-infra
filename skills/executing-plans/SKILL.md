@@ -60,7 +60,7 @@ v5.0.0 — stripped NVIDIA/MCP tool calls. Restored batched execution flow. Adde
 
 ## Overview
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 Load plan, review critically, execute tasks in batches, report progress between batches (informational — not blocking), pause only when taxonomy-matching decisions arise. Verification runs after each batch via isolated sub-agents. Fall back to the controller on failures.
 

@@ -61,7 +61,7 @@ The broken pipeline produces issues that prescribe solutions before understandin
 
 ## Step 1 — Gather
 
-Read friction data:
+Read friction data (run from an eldato repo checkout — reflect.py writes these under `docs/teams/<team>/operations/`, see eldato `operations/memory/reflect.py`):
 
 ```bash
 ls -t docs/teams/*/operations/*postmortem* | head -1

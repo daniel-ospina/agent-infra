@@ -18,7 +18,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 
 # Issue Scoping
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 Multi-phase planning for **existing** GitHub issues. Uses the **double diamond** design framework with integrated verification:
 1. **problem-diverge** — explore alternative problem definitions, root causes, dependencies
@@ -116,7 +116,7 @@ Phase 8: Finalize + post plan
 
 > **Micro tier:** Runs all 4 diamond phases (1 sub-agent each) + a single full-diamond-verify gate at the end. Prevents solving the wrong problem the wrong way, even for small changes.
 
-> **Skill-domain + shared-code override:** Micro-tier issues touching `skills/`, `operations/pi-config/`, `src/lib/`, `src/hooks/`, `src/services/`, `supabase/migrations/`, or `src/types/` (excluding `_deprecated/`) are upgraded to Standard.
+> **Skill-domain + shared-code override:** Micro-tier issues touching `skills/`, `extensions/` (agent-infra) / `operations/pi-config/` (consumer repos), `src/lib/`, `src/hooks/`, `src/services/`, `supabase/migrations/`, or `src/types/` (excluding `_deprecated/`) are upgraded to Standard.
 
 ---
 
@@ -396,7 +396,7 @@ case "$TIER" in
   *) TIER_SKIP=1 ;;
 esac
 if [ "${TIER_SKIP:-0}" != "1" ]; then
-  UPGRADE_PATHS=$(printf '%s' "$ISSUE_BODY" | grep -oE '(^|[[:space:]([])(skills/|operations/pi-config/|src/lib/|src/hooks/|src/services/|supabase/migrations/|src/types/)[^[:space:],)]*' | grep -v '_deprecated/' || true)
+  UPGRADE_PATHS=$(printf '%s' "$ISSUE_BODY" | grep -oE '(^|[[:space:]([])(skills/|extensions/|operations/pi-config/|src/lib/|src/hooks/|src/services/|supabase/migrations/|src/types/)[^[:space:],)]*' | grep -v '_deprecated/' || true)
   if [ -n "$UPGRADE_PATHS" ]; then
     echo "🔧 Shared infrastructure change detected — upgrading from Micro to Standard"
     echo "   Matched paths: $UPGRADE_PATHS"

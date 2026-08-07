@@ -10,7 +10,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 <!-- ported from the primary repo -->
 # Test Design — Integration Surface Mapping
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 ## Overview
 

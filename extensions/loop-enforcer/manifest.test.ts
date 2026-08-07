@@ -2,7 +2,7 @@
  * manifest.test.ts — self-check for manifest.ts abortLoop/abortAllLoops/buildEndSummary.
  * 
  * Uses the REAL writeManifest/readManifest from manifest.ts (no replica drift).
- * Run: npx tsx operations/pi-config/extensions/loop-enforcer/manifest.test.ts
+ * Run: npx tsx extensions/loop-enforcer/manifest.test.ts
  */
 
 import { readManifest, writeManifest, abortLoop, abortAllLoops, buildEndSummary, pauseLoop, blockLoop, resumeLoop, Manifest } from "./manifest.js";

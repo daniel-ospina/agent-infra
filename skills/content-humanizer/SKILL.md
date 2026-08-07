@@ -11,7 +11,7 @@ domain: growth
 
 Adapted from `blader/humanizer` v2.8.0 (MIT license). Strips AI writing patterns from El Dato content drafts while preserving our Voice DNA, partner mentions, deal embeds, and disclosure compliance. Runs as a sub-skill — invoked by orchestrators and writers, not directly by users.
 
-**Voice DNA:** `docs/teams/eldato-app-team/product/voice_dna.md` — the single source of truth for El Dato's editorial voice. This skill reads §4 (Calibration Sample) as permanent voice calibration.
+**Voice DNA:** `docs/teams/eldato-app-team/domains (S1)/product/voice_dna.md` — the single source of truth for El Dato's editorial voice. This skill reads §4 (Calibration Sample) as permanent voice calibration. *(Lives in the **eldato** repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`.)*
 
 ---
 
@@ -30,7 +30,7 @@ The draft → audit → final loop and the deliverable are defined under Process
 
 ## Calibration (Permanent)
 
-This skill always calibrates against El Dato's Voice DNA. Read `docs/teams/eldato-app-team/product/voice_dna.md` §4 before humanizing. The calibration sample demonstrates:
+This skill always calibrates against El Dato's Voice DNA. Read `docs/teams/eldato-app-team/domains (S1)/product/voice_dna.md` §4 (eldato repo) before humanizing. The calibration sample demonstrates:
 
 - Short, punchy sentences mixed with longer flowing ones
 - Specific locations (Constituyentes, Calle 12)
@@ -214,7 +214,7 @@ Look for **clusters** of tells, not isolated ones.
 
 ## Process and Output
 
-1. **Read the calibration sample** from `docs/teams/eldato-app-team/product/voice_dna.md` §4 — internalize the voice.
+1. **Read the calibration sample** from `docs/teams/eldato-app-team/domains (S1)/product/voice_dna.md` §4 — internalize the voice.
 2. **Read the input draft carefully** — identify every instance of the 33 patterns above.
 3. **Write a draft rewrite.** Check that it: reads naturally aloud, varies sentence length, prefers specific details and simple constructions (is/are/has), keeps the appropriate register, matches our Voice DNA.
 4. **Audit:** ask "What makes this still obviously AI generated?" List remaining tells.
@@ -251,7 +251,7 @@ The same structure as input, with all text fields humanized. Facts, embeds, anno
 
 - `blader/humanizer` v2.8.0 — https://github.com/blader/humanizer (MIT license)
 - Wikipedia: Signs of AI writing — https://en.wikipedia.org/wiki/Wikipedia:Signs_of_AI_writing
-- El Dato Voice DNA — `docs/teams/eldato-app-team/product/voice_dna.md`
-- El Dato Brand Messaging — `docs/teams/eldato-app-team/growth/brand-messaging.md`
+- El Dato Voice DNA — `docs/teams/eldato-app-team/domains (S1)/product/voice_dna.md`
+- El Dato Brand Messaging — `docs/teams/eldato-app-team/domains (S1)/growth/brand-messaging.md`
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

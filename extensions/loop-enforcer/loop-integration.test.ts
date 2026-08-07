@@ -4,7 +4,7 @@
  * Tests goal spec, manifest persistence, and session affinity
  * by exercising the actual module functions against temp directories.
  *
- * Run: npx tsx operations/pi-config/extensions/loop-enforcer/loop-integration.test.ts
+ * Run: npx tsx extensions/loop-enforcer/loop-integration.test.ts
  */
 
 import { ok, equal } from "node:assert/strict";

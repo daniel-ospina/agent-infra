@@ -20,7 +20,7 @@ Dispatched by the fractal planning pipeline during the **Data Model** substep wh
 ## Inputs Required
 
 - **Data Model section** of the epic doc — proposed tables, columns, relationships, constraints
-- **Canonical entity model:** `docs/teams/eldato-app-team/data/ONTOLOGY_SPEC_v4.0.md`
+- **Canonical entity model:** `docs/teams/eldato-app-team/domains (S1)/data/ONTOLOGY_SPEC_v4.0.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`)
 - **Current DB schema:** query `information_schema.columns` via Supabase or read `src/integrations/supabase/types.ts`
 
 ## Checks to Run

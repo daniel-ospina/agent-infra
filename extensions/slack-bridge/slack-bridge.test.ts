@@ -1,6 +1,6 @@
 /**
  * Self-check: slack-bridge.test.ts
- * Run: npx tsx operations/pi-config/extensions/slack-bridge/slack-bridge.test.ts
+ * Run: npx tsx extensions/slack-bridge/slack-bridge.test.ts
  *
  * Uses assert-based self-check with mock Bridge HTTP server + stub ExtensionAPI.
  * Convention: process.exit(1) on failure.
@@ -165,13 +165,9 @@ try {
   // No markers → null
   assert(findRepoRoot(repoDir) === null, "findRepoRoot: empty dir → null");
 
-  // AGENTS.md only → null
+  // AGENTS.md only → found (the operations/subjects marker is eldato-era, #102)
   writeFileSync(join(repoDir, "AGENTS.md"), "");
-  assert(findRepoRoot(repoDir) === null, "findRepoRoot: AGENTS.md only → null");
-
-  // Add operations/subjects → found
-  mkdirSync(join(repoDir, "operations", "subjects"), { recursive: true });
-  assert(findRepoRoot(repoDir) === repoDir, "findRepoRoot: markers present → root");
+  assert(findRepoRoot(repoDir) === repoDir, "findRepoRoot: AGENTS.md → root");
 
   // Nested cwd
   const nested = join(repoDir, "src", "deep");

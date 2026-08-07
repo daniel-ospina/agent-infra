@@ -1,6 +1,6 @@
 /**
  * retry.test.ts — unit tests for shared/retry.ts
- * Run: npx tsx operations/pi-config/extensions/shared/retry.test.ts
+ * Run: npx tsx extensions/shared/retry.test.ts
  */
 
 import { retry, createCircuitBreaker, circuitAllows, circuitRecordSuccess, circuitRecordFailure, CircuitBreaker } from "./retry.js";

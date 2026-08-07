@@ -22,7 +22,7 @@ Dispatched by the fractal planning pipeline during the **Architecture** substep 
 
 - **Architecture section** of the epic doc — proposed system design, component interactions
 - **Parent epic doc** (if this is a child epic) — for architectural alignment
-- **Existing architecture docs:** ADRs in `docs/teams/*/decisions/`, system design docs
+- **Existing architecture docs:** ADRs in `docs/teams/*/decisions/` (eldato repo layout), system design docs
 - **Data Model section** of the epic — for cross-referencing architectural implications
 
 ## Checks to Run

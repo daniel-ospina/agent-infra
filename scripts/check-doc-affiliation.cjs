@@ -4,6 +4,12 @@
 // Modes: --files <list> | --changed | --all
 // Options: --repo <path> [--subjects-dir <dir>] [--docs-dir <dir>]
 //
+// Note (#102): team slugs were previously validated against an eldato-era
+// `operations/subjects/` tree in the same repo. The canonical source is now
+// swarm's Supabase SOR (teams table) — pass --subjects-dir pointing at a swarm
+// checkout (or its derived YAML mirrors in swarm/operations/subjects), or omit
+// it to run leniently. See scripts/swarm-org.mjs for SOR queries.
+//
 // Default required fields: title, type, domain, doc_status, subjects.team, created
 // Valid values for type/domain/doc_status are configurable via .doc-conventions.json
 // in the repo root, or via sensible defaults.
@@ -81,7 +87,9 @@ Modes (required, one of):
 
 Options:
   --repo <path>        Repo root (default: $REPO_PATH or cwd)
-  --subjects-dir <dir> Subjects directory for team slug validation (default: <repo>/operations/subjects)
+  --subjects-dir <dir> Subjects dir for team slug validation (default: <repo>/operations/subjects)
+                      NOTE: eldato-era tree — pass a swarm checkout path (swarm/operations/subjects)
+                      or run without it (lenient). Canonical: swarm Supabase SOR (see scripts/swarm-org.mjs).
   --docs-dir <dir>     Docs directory (default: <repo>/docs)
   --help, -h           Print this help
 
