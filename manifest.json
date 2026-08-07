@@ -17,7 +17,17 @@
         "audit-logger.ts",
         "reflect-hook.ts",
         "shared/",
-        "auto-sync.ts"
+        "auto-sync.ts",
+        "carousel-designer.ts",
+        "cmux-session.ts",
+        "custom-provider-openrouter/",
+        "design-reviewer.ts",
+        "health-check/",
+        "slack-bridge/",
+        "subagent/",
+        "tortoise-capture/",
+        "vision-interceptor/",
+        "vision-interceptor.json"
       ]
     },
     "skills/": {
