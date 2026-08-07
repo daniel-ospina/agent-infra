@@ -4,7 +4,7 @@
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { realpathSync, existsSync } from "node:fs";
-import { classifyGitCommand, isWorktreeCwd } from "./classify-git.mjs";
+import { classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -100,6 +100,53 @@ check("main checkout file", `${MAIN}/extensions/main-worktree-guard/index.ts`, "
 check("AGENTS.md", `${MAIN}/AGENTS.md`, "BLOCK (main checkout)");
 check("/tmp file", "/tmp/foo.md", "ALLOW (outside project)");
 check("~/.pi extension", "/Users/home/.pi/agent/extensions/x.ts", "ALLOW (outside project)");
+
+// ── Push-delete branch extraction (#73) ────────────────────────────────────
+function expectBranches(command, expectedArray) {
+  const got = extractPushDeleteBranch(command);
+  const gotStr = got ? JSON.stringify(got) : "null";
+  const expectedStr = expectedArray ? JSON.stringify(expectedArray) : "null";
+  const ok = gotStr === expectedStr;
+  console.log(`${ok ? "✅" : "❌"} extract-branches "${command.slice(0,45)}...": ${gotStr}${ok ? "" : ` (expected ${expectedStr})`}`);
+  ok ? pass++ : fail++;
+}
+expectBranches("git push origin --delete feat/x", ["feat/x"]);
+expectBranches("git push --delete feat/x", ["feat/x"]);
+expectBranches("git push origin --delete refs/heads/feat/x", ["feat/x"]);
+expectBranches("git push --delete chore/old-branch origin", ["chore/old-branch"]);
+expectBranches('git push origin --delete "feat/x"', ["feat/x"]);
+expectBranches("git push origin --delete 'feat/x'", ["feat/x"]);
+expectBranches("git push origin :feat/x", ["feat/x"]);
+expectBranches("git push origin :refs/heads/feat/x", ["feat/x"]);
+expectBranches("git push origin --delete feat/x; git push origin --delete feat/y", ["feat/x", "feat/y"]);
+expectBranches("git push origin main", null);
+expectBranches("git push", null);
+expectBranches("", null);
+
+// ── Push-delete classification (#73) — old-style colon syntax ─────────────
+expect("push-delete colon", "git push origin :feat/x", "block:push-delete");
+expect("push-delete colon refs", "git push origin :refs/heads/feat/x", "block:push-delete");
+expect("push-delete mixed", "git push origin --delete a :b", "block:push-delete");
+
+// ── Worktree branch listing (#73) ─────────────────────────────────────────
+const wtBranches = getWorktreeBranches();
+console.log(`\nworktree branches: ${wtBranches.size > 0 ? [...wtBranches.keys()].join(", ") : "(none)"}`);
+console.log(`getWorktreeBranches returned Map (expect true): ${wtBranches instanceof Map}`);
+wtBranches instanceof Map ? pass++ : fail++;
+
+// ── Branch-in-main-checkout detection (#73) ────────────────────────────────
+const mainBranch = execSync("git branch --show-current", { encoding: "utf-8" }).trim();
+const mainCheck = isBranchInMainCheckout(mainBranch);
+console.log(`\nisBranchInMainCheckout("${mainBranch}") = ${mainCheck} (expect true)`);
+mainCheck === true ? pass++ : fail++;
+const fakeCheck = isBranchInMainCheckout("definitely-not-a-real-branch-xyz");
+console.log(`isBranchInMainCheckout("definitely-not-a-real-branch-xyz") = ${fakeCheck} (expect false)`);
+fakeCheck === false ? pass++ : fail++;
+
+// ── Main checkout branch detection (#73) ───────────────────────────────────
+const mainCO = getMainCheckoutBranch();
+console.log(`\ngetMainCheckoutBranch() = ${mainCO} (expect "${mainBranch}")`);
+mainCO === mainBranch ? pass++ : fail++;
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

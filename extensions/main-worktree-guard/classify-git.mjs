@@ -22,7 +22,7 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "pull", re: /\bgit\s+pull\b/ },
   { name: "branch-force-delete", re: /\bgit\s+branch\s+-\w*D\b/ },
   { name: "force-push", re: /\bgit\s+push\b[^;&|]*(-f|--force)\b/ },
-  { name: "push-delete", re: /\bgit\s+push\b[^;&|]*--delete\b/ },
+  { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
   { name: "force-checkout", re: /\bgit\s+(checkout|switch)\s+(-f|--force)\b/ },
   { name: "checkout-discard-all", re: /\bgit\s+(checkout|switch)\s+-{0,2}\s*\.(\s|$|[;&|])/ },
   // Bare-ref or -b branch switch: `git checkout main`, `git checkout -b feat/x`,
@@ -64,5 +64,92 @@ export function isWorktreeCwd(cwd) {
     return gitDir.includes("/worktrees/") || gitDir.endsWith("/worktrees");
   } catch {
     return false; // not a git repo — treat as main (safe default: block)
+  }
+}
+
+/**
+ * Extract the branch name from `git push [remote] --delete <branch>`.
+ * Handles both short names ("feat/x") and full refs ("refs/heads/feat/x").
+ * @param {string} command
+ * @returns {string|null} branch name (short form) or null
+ */
+export function extractPushDeleteBranch(command) {
+  const c = String(command ?? "").trim();
+  // Match both --delete <branch> (preferred) and :branch (old-style).
+  // Branch names: alphanumeric + / - _ . only (no ; & |)
+  const re = /\bgit\s+push\b[^;&|]*(?:--delete\s+([^\s;&|]+)|:([^\s;&|]+)(?!\S))/g;
+  const branches = [];
+  let m;
+  while ((m = re.exec(c)) !== null) {
+    const raw = (m[1] || m[2]).replace(/^["']|["']$/g, ""); // strip quotes
+    branches.push(raw.replace(/^refs\/heads\//, ""));
+  }
+  return branches.length > 0 ? branches : null;
+}
+
+/**
+ * Get a map of branch ref → worktree paths (from git worktree list --porcelain).
+ * Works from any checkout (main or worktree).
+ * @returns {Map<string, string[]>} key: "refs/heads/<name>", value: [worktree paths]
+ */
+export function getWorktreeBranches() {
+  const branches = new Map();
+  try {
+    const out = execSync("git worktree list --porcelain", {
+      encoding: "utf-8", timeout: 5000,
+    });
+    let currentPath = null;
+    for (const line of out.split("\n")) {
+      if (line.startsWith("worktree ")) {
+        currentPath = line.slice("worktree ".length);
+      } else if (line.startsWith("branch ") && currentPath) {
+        const branch = line.slice("branch ".length);
+        if (!branches.has(branch)) branches.set(branch, []);
+        branches.get(branch).push(currentPath);
+      }
+    }
+  } catch {
+    // If git worktree list fails, return empty map (safe default)
+  }
+  return branches;
+}
+
+/**
+ * Check if a branch is checked out in the MAIN checkout (not a worktree).
+ * @param {string} branch - branch short name (e.g. "feat/x")
+ * @returns {boolean}
+ */
+export function isBranchInMainCheckout(branch) {
+  try {
+    const currentBranch = execSync("git branch --show-current", {
+      encoding: "utf-8", timeout: 5000,
+    }).trim();
+    return currentBranch === branch;
+  } catch {
+    // Fail-safe: if we can't verify, assume checked out (block)
+    return true;
+  }
+}
+
+/**
+ * Get the branch checked out in the MAIN checkout (not a worktree).
+ * Returns null if in a worktree, detached HEAD, or git unavailable.
+ * @returns {string|null}
+ */
+export function getMainCheckoutBranch() {
+  try {
+    const gitDir = execSync("git rev-parse --git-dir", {
+      encoding: "utf-8", timeout: 5000,
+    }).trim();
+    // If git-dir resolves into worktrees/, we're in a worktree — the main
+    // checkout is a separate entity, so return null.
+    if (gitDir.includes("/worktrees/") || gitDir.endsWith("/worktrees")) {
+      return null;
+    }
+    return execSync("git branch --show-current", {
+      encoding: "utf-8", timeout: 5000,
+    }).trim() || null;
+  } catch {
+    return null;
   }
 }

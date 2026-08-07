@@ -20,6 +20,12 @@ Git worktrees create isolated workspaces sharing the same repository, allowing w
 
 **Announce at start:** "I'm using the using-git-worktrees skill to set up an isolated workspace."
 
+## Shared Checkout Policy
+
+The main checkout is a **SHARED HUB** that stays on `main`. Feature work happens ONLY in worktrees. Only the branch owner — or after verifying no active checkout (`git worktree list`) — deletes a branch. This is the hub discipline from the [multi-agent git coordination research](docs/research/2026-08-07-multi-agent-git-coordination.md) (Layer 2).
+
+> **Never** start feature work in the main checkout. **Never** delete a branch without checking `git worktree list` for active checkouts.
+
 ## Step 0: Detect Main Repo Root
 
 **Always run this first.** When called from inside an agent worktree, `$PWD` and `git rev-parse --show-toplevel` return the worktree's path, not the main repo. All directory checks and worktree creation must use `$MAIN_REPO` as the base to prevent nested worktrees.

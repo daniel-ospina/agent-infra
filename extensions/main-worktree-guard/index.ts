@@ -28,8 +28,14 @@ import { realpathSync, existsSync } from "node:fs";
 // while write/edit protection stays fully enforced.
 let classifyGitCommand: (cmd: string) => string = () => "allow";
 let isWorktreeCwd: (cwd: string) => boolean = () => true;
+let extractPushDeleteBranch: (cmd: string) => string[] | null = () => null;
+let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
+let isBranchInMainCheckout: (branch: string) => boolean = () => false;
+let getMainCheckoutBranch: () => string | null = () => null;
 try {
-  ({ classifyGitCommand, isWorktreeCwd } = await import("./classify-git.mjs"));
+  ({ classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch,
+     getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch } =
+    await import("./classify-git.mjs"));
 } catch (e) {
   console.warn("[main-worktree-guard] ⚠️ classify-git.mjs failed to load — bash git guard DISABLED:", String(e));
 }
@@ -94,12 +100,53 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    // ── bash: block destructive git in the MAIN checkout (worktrees safe) ──
+    // ── bash: block destructive git ──
     if (isBash) {
       const command = (event.input as { command?: string }).command ?? "";
       const verdict = classifyGitCommand(command);
       if (verdict.startsWith("block:")) {
-        // Is this session in the main checkout or a worktree?
+        // ── Coordinated branch deletion (#73): push --delete checked everywhere ──
+        if (verdict === "block:push-delete") {
+          const branchNames = extractPushDeleteBranch(command);
+          if (branchNames && branchNames.length > 0) {
+            const worktreeBranches = getWorktreeBranches();
+            const blockedBranches: string[] = [];
+            for (const branchName of branchNames) {
+              const branchRef = `refs/heads/${branchName}`;
+              const checkedOutPaths = [...(worktreeBranches.get(branchRef) || [])];
+              if (isBranchInMainCheckout(branchName)) {
+                const mainTopLevel = _mainTopLevel();
+                const mainLabel = mainTopLevel || "main checkout";
+                if (!checkedOutPaths.includes(mainLabel)) {
+                  checkedOutPaths.push(mainLabel);
+                }
+              }
+              if (checkedOutPaths.length > 0) {
+                blockedBranches.push(
+                  `"${branchName}" — checked out in: ${checkedOutPaths.join(", ")}`
+                );
+              }
+            }
+            if (blockedBranches.length > 0) {
+              return {
+                block: true,
+                reason: [
+                  `⛔ Cannot delete — the following branches are currently checked out:`,
+                  ...blockedBranches.map((b: string) => `   • ${b}`),
+                  "",
+                  "   Why: deleting a remote branch while another session has it",
+                  "   checked out destroys that session's upstream (incident 2026-08-06).",
+                  "   → Switch those worktrees/main to another branch first, then retry.",
+                  "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
+                ].join("\n"),
+              };
+            }
+          }
+          // All branches safe to delete — allow
+          return undefined;
+        }
+
+        // ── Other destructive commands: only block in main checkout ──
         let inWorktree = true;
         try {
           inWorktree = isWorktreeCwd(resolve(process.cwd()));
@@ -179,5 +226,53 @@ export default function (pi: ExtensionAPI) {
   // #5672: suppress startup banner in print mode (task sub-agent output)
   if (process.env.PI_MODE !== 'print') {
     console.log("[main-worktree-guard] ✅ Loaded — blocking write/edit + destructive git in main checkout");
+  }
+
+  // ── Session-start hub discipline check (#73) ──
+  // In the main checkout: warn if on a non-main branch or dirty working tree.
+  // Non-blocking — the write/edit guard still protects; this is a discipline prompt.
+  if (!_isAgentInfraRepo() && !_isAllowMainEdits()) {
+    try {
+      const inWorktree = isWorktreeCwd(resolve(process.cwd()));
+      if (!inWorktree) {
+        const currentBranch = getMainCheckoutBranch();
+        const porcelain = execSync("git status --porcelain", {
+          encoding: "utf-8", timeout: 5000,
+        }).trim();
+
+        const onNonMain = currentBranch &&
+          currentBranch !== "main" && currentBranch !== "master";
+        const dirty = porcelain.length > 0;
+
+        if (onNonMain || dirty) {
+          const issues: string[] = [];
+          if (onNonMain) issues.push(`on branch "${currentBranch}" (not main/master)`);
+          if (dirty) issues.push("working tree is dirty (uncommitted changes or untracked files)");
+
+          const lines = [
+            "",
+            "╔══════════════════════════════════════════════════════════════════╗",
+            "║  ⚠️  MAIN CHECKOUT — HUB DISCIPLINE WARNING                      ║",
+            "╠══════════════════════════════════════════════════════════════════╣",
+          ];
+          for (const issue of issues) {
+            lines.push(`║  ${issue.padEnd(62)}║`);
+          }
+          lines.push(
+            "║                                                                  ║",
+            "║  The main checkout is a shared hub — parallel agents may collide. ║",
+            "║  Feature work should happen in isolated worktrees.                ║",
+            "║  → Invoke the using-git-worktrees skill to create one.            ║",
+            "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning.         ║",
+            "╚══════════════════════════════════════════════════════════════════╝",
+            "",
+          );
+          console.warn(lines.join("\n"));
+        }
+      }
+    } catch (e) {
+      // Degrade silently — this is a non-blocking discipline check
+      console.warn("[main-worktree-guard] ⚠️ Hub discipline check failed:", String(e));
+    }
   }
 }
