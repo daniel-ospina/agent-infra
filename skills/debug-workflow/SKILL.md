@@ -64,15 +64,16 @@ Classify bug complexity and route through `issue-workflow`:
 # Create a bug issue
 gh issue create --title "Bug: <symptom>" --label "bug,complexity:<tier>" --body "..."
 
-# Route through issue-workflow — it detects Level and dispatches
-# issue-workflow → task-workflow (simple) or project-workflow (medium/complex)
+# Route through issue-workflow — it detects Level + complexity and dispatches
+# issue-workflow → task-workflow (micro) or task-workflow-standard (Level:task, standard/complex)
+#                 or project-workflow (Level:project, standard/complex)
 ```
 
 | Bug complexity | Tier | Pipeline | Gates |
 |---------------|------|----------|-------|
 | Simple — 1 file, obvious from stack trace | `complexity:micro` | `task-workflow` (inline) | Typecheck + targeted test |
-| Medium — 2-5 files, unclear cause | `complexity:standard` | `project-workflow` | AI review + test-review, 3-5 queries |
-| Complex — multi-component, unknown pattern | `complexity:complex` | `project-workflow` | Full research + AI review + test-review |
+| Medium — 2-5 files, unclear cause | `complexity:standard` | `task-workflow-standard` (Level:task, single deliverable) or `project-workflow` (Level:project / needs decomposition) | AI review + test-review, 3-5 queries |
+| Complex — multi-component, unknown pattern | `complexity:complex` | `task-workflow-standard` (Level:task, single deliverable) or `project-workflow` (Level:project / needs decomposition) | Full research + AI review + test-review |
 
 **O/I/T for every bug issue:**
 - **Objective:** Identify and fix root cause of `<symptom>`
@@ -146,7 +147,8 @@ If you catch yourself thinking:
 
 - `../issue-workflow/SKILL.md` — Entry-point router
 - `../task-workflow/SKILL.md` — Lightweight pipeline (simple bugs)
-- `../project-workflow/SKILL.md` — Proportional pipeline (medium/complex bugs)
+- `../task-workflow-standard/SKILL.md` — Gated pipeline (standard/complex tasks)
+- `../project-workflow/SKILL.md` — Proportional pipeline (medium/complex bugs, project level)
 - `../verification-before-completion/SKILL.md` — Verify fix worked
 - `docs/teams/organisation-design-team/data/ONTOLOGY.md` — Pipeline stages
 

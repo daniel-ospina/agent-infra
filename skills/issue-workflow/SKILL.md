@@ -5,9 +5,9 @@ domain: capability
 type: Workflow
 status: live
 tags: [pipeline, issue, routing, fractal, orchestrator, entry-point]
-summary: "Fractal entry-point router — detects Level and dispatches to epic-workflow, project-workflow, or task-workflow."
+summary: "Fractal entry-point router — detects Level + complexity and dispatches to epic-workflow, project-workflow, task-workflow (micro), or task-workflow-standard (gated)."
 created: 2026-07-07
-updated: 2026-08-08
+updated: 2026-08-07
 steps:
   - name: classify_ask
     type: skill
@@ -54,9 +54,11 @@ ISSUE IN (#N)
       ▼
 issue-workflow (entry-point router)
       │
-      ├── Level: epic  ──────▶ epic-workflow (6 stages, full depth)
-      ├── Level: project ────▶ project-workflow (6 stages, proportional)
-      └── Level: task   ─────▶ task-workflow (6 stages, inline)
+      ├── Level: epic  ──────────────▶ epic-workflow (6 stages, full depth)
+      ├── Level: project ────────────▶ project-workflow (6 stages, proportional)
+      └── Level: task ────────────────▶ complexity:micro ───────────▶ task-workflow (6 stages, inline)
+                                     └── complexity:standard/complex ─▶ task-workflow-standard
+                                         (or unknown — fail-closed)      (gated: verifier gates at scope + plan)
 ```
 
 ## Level Detection
@@ -75,17 +77,28 @@ if [ -z "$LEVEL" ]; then
 fi
 ```
 
+> **Fallback is a heuristic only.** Issues created via `issue-creation` always carry explicit `**Level:**` + `complexity:<tier>` fields — the explicit `Level:` field always wins. The fallback above is for legacy/unfielded issues: `complexity:micro` → task, `complexity:standard|complex` → project.
+
 **Align Inheritance:** If the issue has a parent Epic (`**Epic:** docs/epics/...`), the parent's Align Decision covers this issue. Check before dispatching.
 
 **O/I/T Validation:** Verify the issue has Objective/Indicator/Target fields. If missing and no parent to inherit from, warn — consider running `issue-creation` first.
 
 ## Dispatch
 
-| Level | Dispatches to | Depth |
-|-------|--------------|-------|
-| `epic` | `epic-workflow` | Full: 6 stages, all review gates, 3 human gates |
-| `project` | `project-workflow` | Proportional: shared sub-skills, reduced depth |
-| `task` | `task-workflow` | Inline: all 6 stages, no sub-skill dispatch |
+| Level | Complexity | Dispatches to | Depth |
+|-------|-----------|--------------|-------|
+| `epic` | any | `epic-workflow` | Full: 6 stages, all review gates, 3 human gates |
+| `project` | any | `project-workflow` | Proportional: shared sub-skills, reduced depth |
+| `task` | `micro` (or all-low) | `task-workflow` | Inline: all 6 stages, no sub-skill dispatch |
+| `task` | `standard` \| `complex` (or missing/unknown) | `task-workflow-standard` | Gated: 2 parallel verifiers at scope AND plan before implementation |
+
+**Task complexity routing rules:**
+
+- `Level: task` + `complexity:micro` → `task-workflow` (the micro pipeline).
+- `Level: task` + `complexity:standard` or `complexity:complex` → `task-workflow-standard` — **never** the micro pipeline. This is the fix for #97: all task-level issues used to run micro, skipping the verifier gates standard/complex tasks need.
+- `Level: task` with **missing/unknown complexity** → fail-closed to `task-workflow-standard` (gated is safer than skipping gates). The agent validates complexity during Scope — `issue-scoping` may downgrade to micro if the work is trivial.
+
+**Reconciliation with project-workflow:** a standard/complex issue that is `Level: task` stays in `task-workflow-standard` while it remains a single atomic deliverable (no decomposition). If Scope reveals the task needs **MECE decomposition into child issues, wiring, or E2E** → escalate to `project-workflow` instead. Conversely, issues declared `Level: project` always go to `project-workflow`. The Level-detection fallback below (standard/complex → project) is a heuristic for issues missing fractal fields — an explicit `Level:` field always wins.
 
 ## Label Lifecycle
 
@@ -188,6 +201,7 @@ After dispatching, the workflow skill handles all phase transitions. Do NOT paus
 | Thought | Reality |
 |---|---|
 | "I know what Level this is — I'll skip detection" | Wrong Level = wrong pipeline = missing gates. |
+| "Level: task always means the micro pipeline" | Task dispatch depends on complexity: `micro` → task-workflow, `standard/complex` → task-workflow-standard (gated). |
 | "complexity:micro means I can skip the pipeline" | Task-workflow still runs all 6 stages inline. |
 | "This issue has no fractal fields — I'll just start coding" | No fields → run issue-creation first, then route. |
 
@@ -202,6 +216,7 @@ After dispatching, the workflow skill handles all phase transitions. Do NOT paus
 - `../epic-workflow/SKILL.md`
 - `../project-workflow/SKILL.md`
 - `../task-workflow/SKILL.md`
+- `../task-workflow-standard/SKILL.md`
 - `../issue-creation/SKILL.md`
 - `docs/teams/organisation-design-team/data/ONTOLOGY.md`
 

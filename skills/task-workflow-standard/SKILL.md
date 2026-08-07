@@ -7,7 +7,7 @@ status: live
 tags: [pipeline, task, planning, fractal, orchestrator, standard, complex]
 summary: "Workflow skill for standard+complex tasks — scope → plan → implement → verify with verifier gates at each design stage."
 created: 2026-07-30
-updated: 2026-07-30
+updated: 2026-08-07
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 1.0.0
 ---
@@ -18,7 +18,7 @@ version: 1.0.0
 
 Routes a standard or complex task through the full 6-stage pipeline with verifier gates at scope and plan. Implementation is mechanically blocked until design is verified.
 
-> Routed via `Level: task` + `complexity:standard` or `complexity:complex` in issue-creation fractal fields.
+> Dispatched by `issue-workflow` for `Level: task` issues with `complexity:standard` or `complexity:complex` (or missing/unknown complexity — fail-closed). See `issue-workflow/SKILL.md` dispatch table.
 
 ## Pipeline
 
@@ -89,6 +89,20 @@ When the agent first reads this skill, the sequence-enforcer shows:
 ```
 
 This ensures the agent knows what's coming before hitting the gate.
+
+## Relationship to project-workflow
+
+Both this skill and `project-workflow` gate standard/complex work — the difference is **Level**:
+
+| | `task-workflow-standard` | `project-workflow` |
+|---|---|---|
+| Level | `task` | `project` |
+| Deliverable | Single atomic deliverable | Multi-deliverable, decomposes into child issues |
+| Scope/plan gates | 2 parallel verifiers (scope + plan) | Human approval + shared sub-skills, MECE decompose, wiring |
+
+**Escalation rule:** if Scope (via `issue-scoping`) reveals the task actually needs **MECE decomposition into child issues, wiring, or E2E** → escalate to `project-workflow` instead. A task-level standard/complex issue stays here while it remains one deliverable.
+
+> Note: issues created without fractal fields fall back by complexity — `complexity:standard|complex` → Level `project` → `project-workflow`. An explicit `Level: task` field is what routes to this skill.
 
 ## Key Principles
 
