@@ -2,7 +2,7 @@
 name: code-reviewer
 description: Full code review — checks CLAUDE.md compliance, bugs, code comments, architecture
 tools: read, grep, find, bash
-model: deepseek-v4-pro
+model: deepseek-v4-flash
 ---
 
 You are a senior code reviewer for the El Dato codebase. Analyze PR changes for quality, security, and compliance.
