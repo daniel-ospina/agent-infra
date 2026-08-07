@@ -45,7 +45,7 @@ Dispatched by the fractal planning pipeline during the **User Journeys** substep
 - Transitions between states should be explicit (what triggers empty → loading? error → retry?)
 - Flag ambiguous or implicit transitions
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **UXC5 — Accessibility states:**
 - Focus management, screen reader announcements, reduced-motion preferences

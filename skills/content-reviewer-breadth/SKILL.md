@@ -111,7 +111,7 @@ WHERE d.status = 'LIVE'
 - Check that at least 1–2 appear in the draft as non-partner mentions
 - Fix: suggest adding the highest-rated local gem (fewest reviews / highest stars) as a brief non-partner mention
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **BR6 — Comparison table coverage**
 - If a comparison table exists, check it includes the highest-discount partners in the top rows

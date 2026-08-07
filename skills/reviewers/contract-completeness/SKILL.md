@@ -54,7 +54,7 @@ Dispatched by the fractal planning pipeline during the **Interfaces** substep wh
 - Input/output field whose required/optional status is unclear
 - Flag with "is this required or optional?"
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **CC7 — Missing rate limit / quota info:**
 - Interface that likely has rate limits but doesn't specify them

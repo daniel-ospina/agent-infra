@@ -47,7 +47,7 @@ Dispatched by the fractal planning pipeline during the **Coherence Review** phas
 - A substep builds on an assumption from an earlier substep that was marked as tentative or unresolved
 - Flag the assumption chain with confidence levels
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **CSD5 — Redundant specification:**
 - Same detail specified in multiple substeps — creates maintenance burden if one copy drifts

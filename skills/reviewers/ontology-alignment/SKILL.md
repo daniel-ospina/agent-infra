@@ -47,7 +47,7 @@ Dispatched by the fractal planning pipeline during the **Data Model** substep wh
 - E.g., "Order" meaning purchase in one section and sort-order in another
 - Flag with both meanings and locations
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **OA5 — Verb/noun inconsistency:**
 - Actions described with inconsistent verbs (e.g., "remove" vs "delete" vs "archive" for the same operation)

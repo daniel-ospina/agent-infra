@@ -49,7 +49,7 @@ Dispatched by the fractal planning pipeline during the **Detailed E2E** substep 
 - Test step relies on timing, random data, or system state that may vary between runs
 - Flag with "what makes this deterministic?"
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **E2R6 — Cleanup not specified:**
 - Test creates data but doesn't specify cleanup — may pollute subsequent runs

@@ -5,14 +5,19 @@
 Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
 
 1. **Appropriate review clean** — the review matched to the ISSUE CONTENT + PR diff surface
-   returned 0 P0 and 0 P1 (fixer loop converged; Qwen final gate clean when applicable). The review
+   returned 0 P0, 0 P1, and 0 P2 — all findings with confidence ≥ 50 resolved (fixer loop converged;
+   Qwen final gate clean when applicable). The review
    is domain-dispatched, not one-size. ALWAYS-ON reviewers: bug scan (shallow+deep), guidance
    compliance, history, prior-PR comments, and SECURITY (security-review skill — HIGH-confidence
    findings only, research-before-report). Domain reviewers as applicable: infrastructure
    (skills/extensions/.mcp.json/ontology) → Skill Infrastructure / Ontology & Templates /
    Extension Safety; UX → ux-verification; config/research/docs → proportional review.
    Dispatch per `code-review` Step 0.8 (infra detection) + Step 3.6 (surface-first dispatch; ratings scale depth)
-   and `test-routing` (domain-aware verification). P2s are noted, not blockers.
+   and `test-routing` (domain-aware verification). P2s are BLOCKERS — every finding with
+   confidence ≥ 50 (any severity) must be resolved before merge (aligns with the code-review
+   fixer loop exit: zero issues with confidence ≥ 50). Low-confidence items (< 50, scored false
+   positives) do not block. (Confidence scores are produced by code-review Step 5 — isolated
+   sub-agent scoring on a 0-100 scale; < 50 = false positives, filtered at Step 6.)
 2. **Pre-flight passed** — tests/typecheck per the risk tier in `01-preflight.md`; for PRs
    touching runtime code, the affected test suites are green (regression check — no regressions).
 3. **Verification gate passed** — the [VGATE] sub-agent verified all staged files (matching hashes).

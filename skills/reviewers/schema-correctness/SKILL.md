@@ -53,7 +53,7 @@ Dispatched by the fractal planning pipeline during the **Data Model** substep wh
 - New table doesn't follow the project's soft-delete convention (if one exists — check existing tables)
 - Flag with convention reference
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **SC7 — Naming convention drift:**
 - Column or table name diverges from codebase convention (snake_case, singular table names, etc.)

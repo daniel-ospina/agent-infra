@@ -53,7 +53,7 @@ Dispatched by the fractal planning pipeline during the **Architecture** substep 
 - Are concurrency issues considered?
 - Are empty/null states handled?
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **INT5 — Error propagation:**
 - How do errors propagate across component boundaries? Is there a consistent error-handling strategy?
