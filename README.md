@@ -47,9 +47,28 @@ npx agent-infra init
 
 ## Syncing
 
-Update agent-infra, then run `agent-infra update` in each product repo. Pre-commit hook blocks commits if version is stale.
+Two directions, two tools — don't mix them up.
 
-## Syncing to product repos
-Run `./sync-all` to propagate changes to all repos.
-Run `./sync tortoise` to sync a single repo.
-Each repo's pre-commit hook warns if it's behind.
+**Pull** — update this machine's copy of agent-infra and refresh the pi config:
+
+```bash
+cd $AGENT_INFRA_PATH && ./sync.sh
+```
+
+**Propagate** — push agent-infra changes into product repos (refreshes symlinks, copies missing templates, bumps the version pin):
+
+```bash
+./sync-all            # every repo linked to agent-infra
+./sync tortoise       # a single repo
+./sync --list         # list linked repos without changing anything
+```
+
+A repo counts as **linked** when it contains a `.agent-infra-version` file (written by `agent-infra init` / `agent-infra update`). Linked repos are discovered under `$AGENT_INFRA_REPOS_ROOT` (default `~/Documents/GitHub`); point that env var elsewhere to include repos outside the default location.
+
+Per-repo equivalent (what `sync` runs under the hood):
+
+```bash
+cd <target-repo> && npx agent-infra update
+```
+
+Each repo's pre-commit hook (copied from `templates/.husky/`) **blocks** commits when `.agent-infra-version` is behind — run `agent-infra update` or `./sync <repo>` to fix.
