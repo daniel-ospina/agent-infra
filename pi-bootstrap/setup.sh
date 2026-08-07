@@ -2,13 +2,29 @@
 # ============================================================
 # pi bootstrap — install this machine's pi configuration
 # Run once on a new Mac:  ./setup.sh
-# Safe to run twice. Never deletes anything outside ~/.pi/agent.
+# Safe to run repeatedly: every re-run refreshes the ACTIVE ~/.pi/agent files
+# in place (content-merge), so repo updates flow to the live install and local
+# extras survive. Never deletes anything outside ~/.pi/agent.
 # ============================================================
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")" && pwd)/pi-config"
 INFRA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$HOME/.pi/agent"
+
+# Resolve a path to an absolute, symlink-free form. Used to decide whether a
+# destination symlink still points into THIS repo (realpath equality) instead
+# of grepping the raw link target for a path substring — clone path agnostic.
+# Prints "" (and exits 0) when the path cannot be resolved.
+resolve_path() {
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$1" 2>/dev/null || echo ""
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || echo ""
+  else
+    echo ""
+  fi
+}
 
 mkdir -p "$DEST"
 
@@ -61,23 +77,45 @@ merge_settings
 merge_models
 [ -f "$SRC/models-store.json" ] && cp "$SRC/models-store.json" "$DEST/models-store.json"
 
-# Folders (merge; overwrite same-named files)
-cp -R "$SRC/agents"           "$DEST/agents"
-cp -R "$SRC/behavior-control" "$DEST/behavior-control"
+# Folders (content-merge; overwrite same-named files). The "SRC/. DEST/" form
+# copies CONTENTS into the existing destination — plain `cp -R SRC DEST` on BSD
+# NESTS (dest/agents/agents) when DEST already exists, so re-runs would never
+# update the active top-level files.
+mkdir -p "$DEST/agents"
+cp -R "$SRC/agents/."           "$DEST/agents/"
+mkdir -p "$DEST/behavior-control"
+cp -R "$SRC/behavior-control/." "$DEST/behavior-control/"
 
-# Extensions: if the farm already symlinks into this repo, keep the symlinks
-# (updates flow through git pull — no copy needed). Otherwise materialize copies.
+# Extensions: if the farm already symlinks into THIS repo, keep the symlinks
+# (updates flow through git pull — no copy needed). Otherwise materialize a
+# real copy. Links are compared by resolved target (realpath) against
+# $INFRA_ROOT/extensions/$base, so any clone path is recognized. Stale or
+# foreign links (broken, or pointing at a different checkout) are replaced
+# with fresh materialized copies.
 mkdir -p "$DEST/extensions"
 copied=0; kept=0
 for e in "$SRC"/extensions/*; do
   base="$(basename "$e")"
-  if [ -L "$DEST/extensions/$base" ] && readlink "$DEST/extensions/$base" | grep -q "/agent-infra/extensions"; then
-    kept=$((kept+1))
-  else
-    cp -R "$e" "$DEST/extensions/$base" && copied=$((copied+1))
+  dest="$DEST/extensions/$base"
+  if [ -L "$dest" ]; then
+    dest_resolved="$(resolve_path "$dest")"
+    repo_resolved="$(resolve_path "$INFRA_ROOT/extensions/$base")"
+    if [ -n "$dest_resolved" ] && [ -n "$repo_resolved" ] && [ "$dest_resolved" = "$repo_resolved" ]; then
+      kept=$((kept+1))
+      continue
+    fi
+    echo "    replacing stale/foreign symlink: $base"
+    rm -f "$dest"
   fi
+  if [ -f "$e" ]; then
+    cp "$e" "$dest"
+  else
+    mkdir -p "$dest"
+    cp -R "$e/." "$dest/"
+  fi
+  copied=$((copied+1))
 done
-echo "    extensions: $copied refreshed, $kept agent-infra farm symlinks kept"
+echo "    extensions: $copied refreshed, $kept farm symlinks kept"
 
 # Install extension dependencies (needs internet on first run)
 if command -v npm >/dev/null 2>&1; then
@@ -97,15 +135,26 @@ cp "$SRC/skills-repos.yaml"          "$DEST/skills-repos.yaml"
 cp "$SRC/coding-rules.md"            "$DEST/coding-rules.md"
 cp "$SRC/response-rules-reminder.md" "$DEST/response-rules-reminder.md"
 
-# Skills: keep a symlink farm if it already points into this repo (updates via
+# Skills: keep a symlink farm if it already points into THIS repo (updates via
 # git pull); otherwise materialize a real folder copy so paths never matter.
-if [ -L "$DEST/skills" ] && readlink "$DEST/skills" | grep -q "/agent-infra/skills"; then
-  echo "    skills farm already symlinks into agent-infra - keeping (updates via git pull)"
-elif [ -d "$DEST/skills" ] && [ ! -L "$DEST/skills" ]; then
-  cp -R "$(dirname "$SRC")/../skills/." "$DEST/skills"
+if [ -L "$DEST/skills" ]; then
+  skills_resolved="$(resolve_path "$DEST/skills")"
+  repo_skills_resolved="$(resolve_path "$INFRA_ROOT/skills")"
+  if [ -n "$skills_resolved" ] && [ -n "$repo_skills_resolved" ] && [ "$skills_resolved" = "$repo_skills_resolved" ]; then
+    echo "    skills farm already symlinks into this repo - keeping (updates via git pull)"
+  else
+    echo "    replacing stale/foreign skills symlink with a real folder"
+    rm -f "$DEST/skills"
+    mkdir -p "$DEST/skills"
+    cp -R "$INFRA_ROOT/skills/." "$DEST/skills"
+    echo "    skills copied ($(ls "$DEST/skills" | wc -l | tr -d ' ') items)"
+  fi
+elif [ -d "$DEST/skills" ]; then
+  cp -R "$INFRA_ROOT/skills/." "$DEST/skills"
   echo "    skills refreshed (local extras preserved)"
 else
-  cp -R "$(dirname "$SRC")/../skills" "$DEST/skills"
+  mkdir -p "$DEST/skills"
+  cp -R "$INFRA_ROOT/skills/." "$DEST/skills"
   echo "    skills copied ($(ls "$DEST/skills" | wc -l | tr -d ' ') items)"
 fi
 
