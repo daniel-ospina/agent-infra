@@ -39,7 +39,7 @@ steps:
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 **AI review gate (merge):** merge proceeds when the review APPROPRIATE TO THE ISSUE
-CONTENT is clean (0 P0, 0 P1) AND pre-flight tests passed (per `01-preflight.md` risk tier —
+CONTENT is clean (0 P0, 0 P1, 0 P2 — all findings with confidence ≥ 50 resolved) AND pre-flight tests passed (per `01-preflight.md` risk tier —
 regression check for code PRs) AND the verification gate verified the staged files. The review
 is surface-dispatched from the PR diff (issue complexity ratings scale review depth, per
 `code-review` Step 0.8 infra detection + Step 3.6 surface matrix, and `test-routing` domain dispatch):

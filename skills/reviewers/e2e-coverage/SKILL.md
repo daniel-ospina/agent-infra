@@ -51,7 +51,7 @@ Dispatched by the fractal planning pipeline during the **Detailed E2E** substep 
 - Scenario involving multiple roles interacting (identified in User Journeys) has no E2E test
 - Flag with the scenario and involved roles
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **E2E6 — Performance/load scenario:**
 - No E2E test for behavior under load, concurrent access, or slow network (if relevant)

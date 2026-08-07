@@ -50,7 +50,7 @@ Dispatched by the fractal planning pipeline during the **Workflows** substep whe
 - Workflow describes interactions that break at realistic data volumes (e.g., "scroll through all items" with 10,000 items)
 - Flag with suggested mitigation (pagination, search, filter)
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **UXR6 — Device constraint:**
 - Interaction that's impractical on target devices (e.g., drag-and-drop on mobile, hover on touch)

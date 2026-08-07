@@ -47,7 +47,7 @@ Dispatched by the fractal planning pipeline during the **Coherence Review** phas
 - Epic chooses a technology when a better alternative exists (stdlib, existing dependency, native platform feature)
 - Flag with "why X when Y already does this?"
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **IO5 — Sequencing optimization:**
 - Substeps or implementation phases could be reordered for faster value delivery or risk reduction

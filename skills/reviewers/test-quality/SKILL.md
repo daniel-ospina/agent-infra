@@ -66,7 +66,7 @@ Dispatched by:
 - Flag with the specific anti-pattern found
 - Note: checks for KNOWN patterns — does not claim to predict future breakage
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **TQ6 — Test-data quality:**
 - Hardcoded test data that masks edge cases (e.g., always using "test@example.com", always using same IDs)

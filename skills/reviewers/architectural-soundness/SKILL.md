@@ -53,7 +53,7 @@ Dispatched by the fractal planning pipeline during the **Architecture** substep 
 - Architecture hand-waves a critical component ("a queue", "a cache", "a message bus") without specifying which technology or why
 - Flag the unspecified component
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **AS6 — Technology choice without rationale:**
 - Specific technology named without explaining why it's the right choice for this context

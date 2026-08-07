@@ -62,7 +62,7 @@ Provide a code review for the given pull request.
 
 ## Auto-Continue Protocol
 
-**After review completes clean (0 P0, 0 P1), auto-merge if applicable and proceed immediately. Do NOT pause to ask "shall I merge?" or "review complete — proceed?"**
+**After review completes clean (0 P0, 0 P1, 0 P2 — all findings with confidence ≥ 50 resolved), auto-merge if applicable and proceed immediately. Do NOT pause to ask "shall I merge?" or "review complete — proceed?"**
 
 **Self-Healing:** When review finds issues, the fixer loop (Steps 6-6.5) handles all severity levels with confidence scoring, convergence detection, and escalation. Do NOT apply separate fixing logic — use the existing fixer loop. See Steps 6-6.5 for the full self-healing workflow.
 
@@ -289,10 +289,12 @@ INFRA_FILES=$(gh pr diff <PR_NUMBER> --name-only | grep -E 'skills/.*SKILL\.md|s
 Store `INFRA_RISK=low|medium|high` for use in Step 4 dispatch.
 
 
-### Step 0.9 — Cross-PR Overlap Detection (ADVISORY, never blocks)
+### Step 0.9 — Cross-PR Overlap Detection (advisory notice, not a severity-gated finding)
 
 Detect open PRs touching the same files as the current PR to surface merge-risk early.
-This is an advisory P2 warning only — it never blocks, gates, or pauses the workflow.
+This is an advisory notice — NOT a severity-gated finding. The P2-blocking merge gate
+applies to CODE findings; overlap is a coordination signal and never blocks, gates, or
+pauses the workflow (conflicts are resolved at merge time).
 
 ```bash
 # Get changed files in this PR
@@ -332,7 +334,8 @@ ISSUE:
 ```
 
 **This step never blocks.** The review proceeds regardless of overlap count.
-Do not pause, gate, or escalate on cross-pr-overlap findings.
+Do not pause, gate, or escalate on cross-pr-overlap findings. (The `advisory: true` flag
+on the ISSUE template keeps overlap findings outside the P0/P1/P2 severity-gated merge policy.)
 
 
 ### Step 1 — Eligibility Check
@@ -963,11 +966,11 @@ task(model="qwen3.8-max", prompt=<same Agent #1 guidance-compliance + Agent #2 b
 |---|---|
 | `[QWEN-GATE] P0` | Structural flaw missed by Flash — fix required, re-run Qwen once |
 | `[QWEN-GATE] P1` | Important gap — fix required, re-run Qwen once |
-| `[QWEN-GATE] P2` | Improvement — note in PR comment, do NOT re-run |
+| `[QWEN-GATE] P2` | Real improvement — fix required, re-run Qwen once (P2s block the merge gate) |
 
 **Re-dispatch:** Max 2 Qwen cycles. On 2nd failure → surface in PR comment as `[QWEN-GATE]` with "Qwen final gate could not converge."
 
-**Gate passes:** Qwen returns CLEAN or only P2+. Proceed to Step 7.
+**Gate passes:** Qwen returns CLEAN (no P0/P1/P2 findings). Proceed to Step 7.
 
 ### Step 7 — Eligibility Re-check
 

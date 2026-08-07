@@ -133,7 +133,7 @@ Good examples:
 Flag if fewer than 3 such details exist in the body.
 Fix: suggest inserting one from Partner Profiles or the local knowledge section of the research brief.
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **DPT5 — At least one tip not found in SERP top 5**
 

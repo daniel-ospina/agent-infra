@@ -44,7 +44,7 @@ Dispatched by the fractal planning pipeline during the **User Journeys** substep
 - Same role has different capabilities in different journeys (e.g., role X can delete in journey A but only archive in journey B)
 - Flag with role + both permissions
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **UXN5 — Pattern drift from codebase:**
 - Journey describes a UX pattern that differs from existing patterns in the live app (check codebase for precedent)

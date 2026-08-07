@@ -51,7 +51,7 @@ Dispatched by the fractal planning pipeline during the **Coherence Review** phas
 - Epic depends on another team, system, or external service — no risk assessment
 - Flag with the dependency
 
-### P2 — Nice to Have
+### P2 — Should Fix (blocks merge)
 
 **RC6 — Risk probability/impact not estimated:**
 - Risk listed without likelihood or severity assessment
