@@ -14,7 +14,13 @@ import re
 import sys
 from pathlib import Path
 
-TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
+# Scan the repo we were run FROM, not the repo the script file lives in.
+# .resolve() follows the scripts/ symlink (manifest.json kind: symlink) that
+# product repos use, so __file__ would resolve into agent-infra/scripts →
+# agent-infra/tests (nonexistent) → scans nothing → CI false-pass.
+# Like every sibling check, this script is invoked from the repo root, so
+# cwd-based resolution is correct whether or not scripts/ is a symlink.
+TESTS_DIR = Path.cwd() / "tests"
 PRODUCTION_PORTS = {"6379", "6380", "16379"}
 
 # Patterns
