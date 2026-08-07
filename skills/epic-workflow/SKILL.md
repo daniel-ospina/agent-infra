@@ -58,7 +58,7 @@ Routes an epic through the full 6-stage fractal planning pipeline. Each stage in
 5. **Decompose** — `shared/decompose/SKILL.md` — MECE-first + wiring + verification issues. Uses `issue-creation` skill for child issue generation.
 6. **Verify** — `shared/verify/SKILL.md` — Pre + post-deploy verification
 
-**Reflect** — `operations/memory/reflect.py` runs automatically at session end via `reflect-hook.ts`. Cross-cutting: fires at epic completion, project close, and session quit. Produces AAR postmortem + classified friction events. See ONTOLOGY.md §2.6 (Reflect action).
+**Reflect** — session capture runs at session quit via `reflect-hook.ts`: writes a durable local JSONL record (~/.tortoise/session-events/) and POSTs to the hosted tortoise `/v1/sessions` endpoint when `TORTOISE_API_KEY` is set (AAR postmortem + friction data). Cross-cutting: fires at epic completion, project close, and session quit.
 
 ## Human Gates
 
