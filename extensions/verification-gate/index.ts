@@ -22,6 +22,30 @@ export function resolveProjectRoot(blockedCwd: string | null, prompt: string): s
   return resolveGitRoot(process.cwd());
 }
 
+// ── Compound key helpers (#37) ───────────────────────
+// Hash records are keyed on (worktree root + relative path), not just filename,
+// to prevent cross-worktree collision: two worktrees in the same repo both
+// contain "tortoise/sdk.py" → distinct entries. Uses "::" as a separator
+// (illegal in macOS/Linux paths).
+
+const COMPOUND_SEP = "::";
+
+function compoundKey(worktreeRoot: string, relativePath: string): string {
+  return `${worktreeRoot}${COMPOUND_SEP}${relativePath}`;
+}
+
+function parseCompoundKey(key: string): { root: string; path: string } | null {
+  const sepIdx = key.indexOf(COMPOUND_SEP);
+  if (sepIdx === -1) return null;
+  return { root: key.substring(0, sepIdx), path: key.substring(sepIdx + 2) };
+}
+
+// Normalize worktree root for stable compound keys. macOS /var → /private/var
+// symlinks must not produce different keys for the same directory.
+function normalizeWorktreeRoot(root: string): string {
+  try { return realpathSync(root); } catch { return root; }
+}
+
 // ── Types ────────────────────────────────────────────
 
 interface VerifiedFile {
@@ -66,7 +90,16 @@ function writeBridge(projectRoot: string, files: string[]): void {
     const verifiedFiles: VerifiedFile[] = [];
     for (const f of files) {
       try {
-        verifiedFiles.push({ path: f, hash: hashFile(projectRoot, f) });
+        // #37: compound keys encode worktree root — extract root + relative
+        // path for hashing. Legacy plain-path entries use projectRoot as-is.
+        // Bridge stores REPO-RELATIVE path (e2e contract #38): the compound
+        // form is internal to the registry, not persisted.
+        const parsed = parseCompoundKey(f);
+        if (parsed) {
+          verifiedFiles.push({ path: parsed.path, hash: hashFile(parsed.root, parsed.path) });
+        } else {
+          verifiedFiles.push({ path: f, hash: hashFile(projectRoot, f) });
+        }
       } catch {
         // #7595: one unhashable path (wrong root, deleted file) must not abort
         // the whole bridge write — before, a single failure silently left the
@@ -195,7 +228,9 @@ export function normalizeRegistryPath(projectRoot: string, filePath: string): st
 }
 
 // Merge a verifier PASS's verified_files into the registry.
-// - #7595: every key is normalized to repo-relative.
+// - #37: every key is a compound key (worktree-root::repo-relative), preventing
+//   cross-worktree hash contamination.
+// - #7595: every path is normalized to repo-relative before compounding.
 // - #38/#7595: re-verification of an already-known path ALWAYS updates its
 //   hash — the verifier is the authority. A stale lastBlockedFiles list (the
 //   previous block in the session may have covered different files) must not
@@ -209,19 +244,21 @@ export function mergeVerifiedFiles(
   projectRoot: string,
   lastBlockedFiles: string[]
 ): { merged: number; skipped: number } {
-  const blockedSet = new Set(lastBlockedFiles);
+  const normRoot = normalizeWorktreeRoot(projectRoot);
+  const blockedSet = new Set(lastBlockedFiles.map(f => compoundKey(normRoot, f)));
   let merged = 0;
   let skipped = 0;
   for (const vf of verifiedFiles) {
     const relPath = normalizeRegistryPath(projectRoot, vf.path);
-    const known = verifiedSet.has(relPath);
-    const inBlockedDiff = lastBlockedFiles.length === 0 || blockedSet.has(relPath);
+    const key = compoundKey(normRoot, relPath);
+    const known = verifiedSet.has(key);
+    const inBlockedDiff = lastBlockedFiles.length === 0 || blockedSet.has(key);
     if (!known && !inBlockedDiff) {
       skipped++;
       continue;
     }
-    verifiedSet.set(relPath, vf.hash);
-    blockAttempts.delete(relPath);
+    verifiedSet.set(key, vf.hash);
+    blockAttempts.delete(key);
     merged++;
   }
   return { merged, skipped };
@@ -292,9 +329,15 @@ export default function (pi: ExtensionAPI) {
     const bridge = readBridge();
     if (bridge && bridge.status === "PASS") {
       for (const vf of bridge.verified_files) {
-        verifiedSet.set(vf.path, vf.hash);
+        // #37: only recover compound-keyed entries (worktree-root::relative-path).
+        // Legacy plain-path entries are skipped — without a worktree root they
+        // cannot be matched against the current session, and blindly loading
+        // them would risk cross-worktree hash contamination.
+        if (vf.path.includes(COMPOUND_SEP)) {
+          verifiedSet.set(vf.path, vf.hash);
+        }
       }
-      console.log(`[verification-gate] 📂 Recovered ${bridge.verified_files.length} verified files from bridge`);
+      console.log(`[verification-gate] 📂 Recovered ${verifiedSet.size} verified files from bridge`);
     }
     vgateFailures = 0;
     lastBlockedCwd = null;
@@ -326,6 +369,14 @@ export default function (pi: ExtensionAPI) {
     if (!isToolCallEventType("bash", event)) return undefined;
     if (!extensionEnabled) return undefined;
 
+    // #37: per-command bypass — read ELDATO_SKIP_VGATE at hook time,
+    // not only at session load. Allows mid-session emergency bypass
+    // when a stale-hash block strikes.
+    if (process.env.ELDATO_SKIP_VGATE === "1") {
+      console.log("[verification-gate] ⏩ Bypassed — ELDATO_SKIP_VGATE=1 (per-command)");
+      return undefined;
+    }
+
     const command = String(event.input.command ?? "");
     if (!isGitOp(command)) return undefined;
 
@@ -335,10 +386,14 @@ export default function (pi: ExtensionAPI) {
     if (pendingRehash !== null) {
       const rehashRoot = pendingRehash;
       pendingRehash = null;
+      const normRehashRoot = normalizeWorktreeRoot(rehashRoot);
       let rehashed = 0;
-      for (const [path] of verifiedSet) {
+      for (const [key] of verifiedSet) {
+        // #37: only re-hash entries belonging to this worktree.
+        const parsed = parseCompoundKey(key);
+        if (!parsed || parsed.root !== normRehashRoot) continue;
         try {
-          verifiedSet.set(path, hashFile(rehashRoot, path));
+          verifiedSet.set(key, hashFile(parsed.root, parsed.path));
           rehashed++;
         } catch { /* file may have been deleted */ }
       }
@@ -366,6 +421,9 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
+    // #37: normalize worktree root for stable compound keys.
+    const worktreeRoot = normalizeWorktreeRoot(cwd);
+
     // Check verification
     const unverified: string[] = [];
     interface Mismatch { file: string; expected: string; actual: string }
@@ -379,7 +437,8 @@ export default function (pi: ExtensionAPI) {
         // File doesn't exist (deleted) — skip verification
         continue;
       }
-      const verifiedHash = verifiedSet.get(file);
+      const key = compoundKey(worktreeRoot, file);
+      const verifiedHash = verifiedSet.get(key);
       if (verifiedHash === undefined) {
         unverified.push(file);
       } else if (verifiedHash !== currentHash) {
@@ -393,8 +452,9 @@ export default function (pi: ExtensionAPI) {
       const allBlockedFiles = [...unverified, ...mismatched.map(m => m.file)];
       let autoBypassed = 0;
       for (const f of allBlockedFiles) {
-        const attempts = (blockAttempts.get(f) ?? 0) + 1;
-        blockAttempts.set(f, attempts);
+        const key = compoundKey(worktreeRoot, f);
+        const attempts = (blockAttempts.get(key) ?? 0) + 1;
+        blockAttempts.set(key, attempts);
         if (attempts >= BLOCK_ATTEMPT_THRESHOLD) {
           autoBypassed++;
         }
@@ -407,7 +467,7 @@ export default function (pi: ExtensionAPI) {
 
     if (unverified.length === 0 && mismatched.length === 0) {
       // All verified, hashes match — reset block counters for these files
-      for (const f of changedFiles) { blockAttempts.delete(f); }
+      for (const f of changedFiles) { blockAttempts.delete(compoundKey(worktreeRoot, f)); }
       console.log(`[verification-gate] ✅ ${changedFiles.length} files verified — allowing`);
       // #7574: if we just allowed a commit, flag for re-hash on next git op.
       // lint-staged (pre-commit hook) modifies files on disk, changing their hashes.
@@ -517,8 +577,10 @@ export default function (pi: ExtensionAPI) {
           }
         }
         const projectRoot = resolveProjectRoot(lastBlockedCwd, prompt);
+        const normRoot = normalizeWorktreeRoot(projectRoot);
 
         // #5673: filter to only files in the blocked diff (not full repo scan)
+        // #37: use compound keys for comparison.
         const blockedSet = new Set(lastBlockedFiles);
         const filteredPromptFiles = lastBlockedFiles.length > 0
           ? [...promptFiles].filter(f => blockedSet.has(normalizeRegistryPath(projectRoot, f)))
@@ -527,9 +589,10 @@ export default function (pi: ExtensionAPI) {
         for (const file of filteredPromptFiles) {
           try {
             const relPath = normalizeRegistryPath(projectRoot, file);
+            const key = compoundKey(normRoot, relPath);
             const hash = hashFile(projectRoot, file);
-            verifiedSet.set(relPath, hash);
-            blockAttempts.delete(relPath);
+            verifiedSet.set(key, hash);
+            blockAttempts.delete(key);
             merged++;
           } catch {
             // file may not exist at expected path — skip
@@ -565,12 +628,14 @@ export default function (pi: ExtensionAPI) {
       }
       if (promptFiles.size > 0) {
         const projectRoot = resolveProjectRoot(lastBlockedCwd, prompt);
+        const normRoot = normalizeWorktreeRoot(projectRoot);
         let merged = 0;
         for (const file of promptFiles) {
           try {
             const relPath = normalizeRegistryPath(projectRoot, file);
-            verifiedSet.set(relPath, hashFile(projectRoot, file));
-            blockAttempts.delete(relPath);
+            const key = compoundKey(normRoot, relPath);
+            verifiedSet.set(key, hashFile(projectRoot, file));
+            blockAttempts.delete(key);
             merged++;
           } catch { /* file may not exist at expected path */ }
         }
@@ -607,12 +672,14 @@ export default function (pi: ExtensionAPI) {
         }
         if (promptFiles.size > 0) {
           const fallbackRoot = resolveProjectRoot(lastBlockedCwd, prompt);
+          const normFallbackRoot = normalizeWorktreeRoot(fallbackRoot);
           let merged = 0;
           for (const file of promptFiles) {
             try {
               const relPath = normalizeRegistryPath(fallbackRoot, file);
-              verifiedSet.set(relPath, hashFile(fallbackRoot, file));
-              blockAttempts.delete(relPath);
+              const key = compoundKey(normFallbackRoot, relPath);
+              verifiedSet.set(key, hashFile(fallbackRoot, file));
+              blockAttempts.delete(key);
               merged++;
             } catch { /* skip */ }
           }

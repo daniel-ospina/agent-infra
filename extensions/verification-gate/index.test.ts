@@ -369,11 +369,12 @@ test("returns original when path is the root itself", () => {
   equal(normalizeRegistryPath(p, p), p);
 });
 
-// ── mergeVerifiedFiles (#7595 / #38) ─────────────────
+// ── mergeVerifiedFiles (#7595 / #38 / #37) ─────────────────
 
 section("mergeVerifiedFiles — registry merge on PASS");
 
-test("merges absolute-path response under relative key (#38 root cause)", () => {
+test("merges absolute-path response under compound key (#37/#38)", () => {
+  // #37: keys are now compound (worktree-root::repo-relative), not plain paths.
   const vs = new Map<string, string>();
   const ba = new Map<string, number>();
   const { merged, skipped } = mergeVerifiedFiles(
@@ -384,14 +385,16 @@ test("merges absolute-path response under relative key (#38 root cause)", () => 
   );
   equal(merged, 1);
   equal(skipped, 0);
-  equal(vs.get("src/a.ts"), "H2", "must be stored under the relative key the block check uses");
+  equal(vs.get("/proj::src/a.ts"), "H2", "must be stored under compound (worktree-root::repo-relative) key");
   equal(vs.has("/proj/src/a.ts"), false, "absolute key must not be stored");
+  equal(vs.has("src/a.ts"), false, "plain relative key must not be stored");
 });
 
 test("re-verification of known path always updates even when not in last blocked diff (#38)", () => {
   // lastBlockedFiles is stale: it references a previous block on different files.
   // The known path must STILL be updated — the verifier is the authority.
-  const vs = new Map<string, string>([["src/a.ts", "H1"]]);
+  // #37: keys are compound.
+  const vs = new Map<string, string>([["/proj::src/a.ts", "H1"]]);
   const ba = new Map<string, number>();
   const { merged, skipped } = mergeVerifiedFiles(
     vs, ba,
@@ -401,7 +404,7 @@ test("re-verification of known path always updates even when not in last blocked
   );
   equal(merged, 1, "known path must merge despite stale filter");
   equal(skipped, 0);
-  equal(vs.get("src/a.ts"), "H2");
+  equal(vs.get("/proj::src/a.ts"), "H2");
 });
 
 test("new path outside blocked diff is skipped (#5673 preserved)", () => {
@@ -415,7 +418,7 @@ test("new path outside blocked diff is skipped (#5673 preserved)", () => {
   );
   equal(merged, 0);
   equal(skipped, 1, "unrelated new file must not be marked verified");
-  equal(vs.has("src/new.ts"), false);
+  equal(vs.has("/proj::src/new.ts"), false);
 });
 
 test("new path inside blocked diff merges", () => {
@@ -429,7 +432,7 @@ test("new path inside blocked diff merges", () => {
   );
   equal(merged, 1);
   equal(skipped, 0);
-  equal(vs.get("src/new.ts"), "H");
+  equal(vs.get("/proj::src/new.ts"), "H");
 });
 
 test("empty lastBlockedFiles merges everything", () => {
@@ -447,9 +450,109 @@ test("empty lastBlockedFiles merges everything", () => {
 
 test("resets block-attempt counters for merged files", () => {
   const vs = new Map<string, string>();
-  const ba = new Map<string, number>([["src/a.ts", 2]]);
+  const ba = new Map<string, number>([["/proj::src/a.ts", 2]]);
   mergeVerifiedFiles(vs, ba, [{ path: "src/a.ts", hash: "H" }], "/proj", ["src/a.ts"]);
-  equal(ba.has("src/a.ts"), false);
+  equal(ba.has("/proj::src/a.ts"), false);
+});
+
+// ── mergeVerifiedFiles — cross-worktree isolation (#37) ──
+
+section("mergeVerifiedFiles — cross-worktree isolation (#37)");
+
+test("same-named files in different worktrees get distinct records", () => {
+  // Two worktrees in the same repo both have "tortoise/sdk.py".
+  // Compound keys prevent cross-worktree hash contamination.
+  const vs = new Map<string, string>();
+  const ba = new Map<string, number>();
+
+  // Worktree A verifies its sdk.py
+  const resA = mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "tortoise/sdk.py", hash: "hashA" }],
+    "/worktrees/wt-A",
+    ["tortoise/sdk.py"]
+  );
+  equal(resA.merged, 1);
+
+  // Worktree B verifies its sdk.py
+  const resB = mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "tortoise/sdk.py", hash: "hashB" }],
+    "/worktrees/wt-B",
+    ["tortoise/sdk.py"]
+  );
+  equal(resB.merged, 1);
+
+  // Both records exist independently
+  equal(vs.get("/worktrees/wt-A::tortoise/sdk.py"), "hashA", "worktree A record intact");
+  equal(vs.get("/worktrees/wt-B::tortoise/sdk.py"), "hashB", "worktree B record intact");
+  equal(vs.size, 2, "two distinct records, not one overwriting the other");
+});
+
+test("re-verification in one worktree does not affect files in another", () => {
+  const vs = new Map<string, string>([
+    ["/wt-A::src/a.ts", "hashA1"],
+    ["/wt-B::src/a.ts", "hashB1"],
+  ]);
+  const ba = new Map<string, number>();
+
+  // Re-verify wt-A's a.ts
+  mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "src/a.ts", hash: "hashA2" }],
+    "/wt-A",
+    ["src/a.ts"]
+  );
+
+  // wt-A updated, wt-B untouched
+  equal(vs.get("/wt-A::src/a.ts"), "hashA2", "wt-A updated");
+  equal(vs.get("/wt-B::src/a.ts"), "hashB1", "wt-B untouched");
+});
+
+// ── mergeVerifiedFiles — VGATE PASS overwrite (#37) ──
+
+section("mergeVerifiedFiles — VGATE PASS overwrite (#37)");
+
+test("VGATE PASS with hash H1 then H2 → expected becomes H2", () => {
+  // The verifier is the authority. A fresh PASS must overwrite the
+  // expected hash unconditionally.
+  const vs = new Map<string, string>();
+  const ba = new Map<string, number>();
+
+  // First verification — records H1
+  mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "src/a.ts", hash: "H1" }],
+    "/proj",
+    ["src/a.ts"]
+  );
+  equal(vs.get("/proj::src/a.ts"), "H1");
+
+  // Second verification (e.g., after a fix) — records H2, overwrites H1
+  mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "src/a.ts", hash: "H2" }],
+    "/proj",
+    ["src/a.ts"]
+  );
+  equal(vs.get("/proj::src/a.ts"), "H2", "verifier's latest hash must overwrite previous");
+});
+
+test("VGATE PASS overwrites even when path not in lastBlockedFiles", () => {
+  // Regression: if the blocked diff shifted between cycles, a known
+  // path must still be updated on re-verification.
+  const vs = new Map<string, string>([["/proj::src/a.ts", "H1"]]);
+  const ba = new Map<string, number>();
+
+  const { merged, skipped } = mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "src/a.ts", hash: "H2" }],
+    "/proj",
+    [] // empty blocked list — but path is known, so must still merge
+  );
+  equal(merged, 1, "known path must merge even with empty lastBlockedFiles");
+  equal(skipped, 0);
+  equal(vs.get("/proj::src/a.ts"), "H2");
 });
 
 // ── Results ───────────────────────────────────────────
