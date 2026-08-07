@@ -1,0 +1,84 @@
+name: CI on main
+# Post-merge safety net (issue #86): catches "PR A + PR B together break main"
+# that per-PR review cannot see. Runs after every push to main.
+#
+# Hard gates (fail on error): extension tests + script validation — deterministic
+# and green today. Skill lint runs warn-only: pre-existing duplicate-key
+# false-positives (steps: lists) would otherwise permanently red main; fixing
+# those is tracked separately.
+#
+# On failure, a GitHub issue is auto-filed (no human gate — the AI review gate
+# already guards merges; this is the post-merge backstop).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  extension-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run extension tests
+        run: |
+          failures=0
+          for t in extensions/*/test*.mjs; do
+            [ -f "$t" ] || continue
+            echo "== $t =="
+            node "$t" || failures=$((failures+1))
+          done
+          if [ $failures -gt 0 ]; then
+            echo "❌ $failures extension test file(s) failed"
+            exit 1
+          fi
+          echo "✅ All extension tests passed"
+
+  script-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Node.js scripts
+        run: |
+          errors=0
+          for f in scripts/*.{cjs,mjs,js} bin/*.js; do
+            [ -f "$f" ] || continue
+            node --check "$f" || errors=$((errors+1))
+          done
+          if [ $errors -gt 0 ]; then
+            echo "❌ $errors script(s) failed validation"
+            exit 1
+          fi
+          echo "✅ All scripts validated"
+
+  skill-lint-warn:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Skill lint (warn-only — pre-existing duplicate-key false positives)
+        run: |
+          node scripts/check-skill-lint.mjs --skills-dir skills 2>&1 || true
+          echo "⚠️  skill lint issues are non-blocking (pre-existing); track cleanup separately"
+          exit 0
+
+  auto-file-on-failure:
+    runs-on: ubuntu-latest
+    needs: [extension-tests, script-validate]
+    if: failure()
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `main broken by merge (${context.sha.slice(0,7)})`,
+              body: `Post-merge CI failed on main at ${context.sha}.\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['bug'],
+            });
