@@ -57,6 +57,27 @@ PY
     echo "    models.json copied (python3 not found - plain copy)"
   fi
 }
+merge_mcp() {
+  # Base MCP config (#104): install templates/.mcp.base.json → ~/.pi/agent/.mcp.json
+  # so every pi session gets MCP servers even in repos without a local .mcp.json.
+  # Source wins per server key; local extra servers survive re-syncs.
+  [ -f "$INFRA_ROOT/templates/.mcp.base.json" ] || { echo "    .mcp.base.json missing - skipping MCP config"; return 0; }
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$INFRA_ROOT/templates/.mcp.base.json" "$DEST/.mcp.json" << 'PY'
+import json, os, sys
+src = json.load(open(sys.argv[1]))
+dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
+src_servers = src.get("mcpServers", {})
+dst_servers = dst.get("mcpServers", {})
+merged = {**dst, **src, "mcpServers": {**dst_servers, **src_servers}}
+json.dump(merged, open(sys.argv[2], "w"), indent=2)
+print("    .mcp.json merged (base servers win; local extras preserved)")
+PY
+  else
+    cp "$INFRA_ROOT/templates/.mcp.base.json" "$DEST/.mcp.json"
+    echo "    .mcp.json copied (python3 not found - plain copy)"
+  fi
+}
 merge_settings() {
   # Source wins for keys it defines; target keeps local extras (skills,
   # packages, env, ...) so per-machine bits survive re-syncs.
@@ -104,6 +125,7 @@ PY
     echo "    models-store.json copied (python3 not found - plain copy)"
   fi
 }
+merge_mcp
 merge_settings
 merge_models
 merge_models_store
@@ -202,6 +224,31 @@ else
   echo "    note: ~/pi-keys.env not found - keys must be added via /login or shell env"
 fi
 echo "    shell profile wired: AGENT_INFRA_PATH + AGENT_SYNC_MODE"
+
+# MCP base config needs TORTOISE_HOME for the local tortoise MCP server.
+# Detect a checkout in standard locations (sibling of the agent-infra clone
+# first, then common layouts) and wire it into the shell profile when the var
+# is unset and not already present (idempotent, mirrors AGENT_INFRA_PATH).
+TORTOISE_HOME_SET=0
+if [ -n "${TORTOISE_HOME:-}" ]; then
+  TORTOISE_HOME_SET=1
+elif grep -q "^export TORTOISE_HOME=" "$ZSHRC" 2>/dev/null; then
+  TORTOISE_HOME_SET=1
+else
+  for cand in "$INFRA_ROOT/../tortoise" "$HOME/Documents/GitHub/tortoise" "$HOME/Documents/tortoise" "$HOME/tortoise"; do
+    if [ -f "$cand/tortoise/mcp_server.py" ] && [ -x "$cand/.venv/bin/python3" ]; then
+      printf 'export TORTOISE_HOME="%s"\n' "$(cd "$cand" && pwd)" >> "$ZSHRC"
+      echo "    TORTOISE_HOME wired into .zshrc: $(cd "$cand" && pwd)"
+      TORTOISE_HOME_SET=1
+      break
+    fi
+  done
+fi
+if [ "$TORTOISE_HOME_SET" -eq 1 ]; then
+  echo "    MCP: tortoise will use TORTOISE_HOME for its local MCP server"
+else
+  echo "    note: TORTOISE_HOME not set and no tortoise checkout found — tortoise MCP server unavailable until set"
+fi
 
 echo ""
 echo "Done! Next steps:"

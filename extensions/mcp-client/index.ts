@@ -22,8 +22,11 @@ import { Type, type TSchema } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { execSync } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -97,13 +100,127 @@ interface McpConnection {
 
 // ── MCP Server Manager ──────────────────────────────────────────────
 
-/** Expand ${VAR} patterns in header values from environment */
-function expandEnvVars(obj: Record<string, string>): Record<string, string> {
+/**
+ * Expand ${VAR} and ${VAR:-default} patterns in env-dependent values.
+ *
+ * Plain ${VAR} → process.env[VAR] (empty string when unset).
+ * ${VAR:-default} → process.env[VAR] when set+non-empty, else `default`;
+ * the default is expanded recursively, so nested expressions like
+ * ${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise} work.
+ *
+ * #104: the `:-` form was previously unsupported — a literal
+ * "TORTOISE_HOME:-/Users/home/tortoise" was looked up as one key and
+ * resolved to "" whenever TORTOISE_HOME was unset, silently breaking the
+ * base config's tortoise cwd/PYTHONPATH. Regex replacement cannot parse
+ * nested braces, so a small scanner tracks ${ ... } depth explicitly.
+ */
+export function expandEnvVars(obj: Record<string, string>): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(obj)) {
-    result[key] = value.replace(/\$\{([^}]+)\}/g, (_, name) => process.env[name] ?? "");
+    result[key] = expandExpr(value);
   }
   return result;
+}
+
+/** Expand ${...} (optionally with a nested default) in one string. */
+function expandExpr(str: string): string {
+  let out = "";
+  let i = 0;
+  while (i < str.length) {
+    const start = str.indexOf("${", i);
+    if (start === -1) {
+      out += str.slice(i);
+      break;
+    }
+    out += str.slice(i, start);
+
+    // Find the matching close brace, respecting nested ${ ... } pairs.
+    let depth = 1;
+    let j = start + 2;
+    while (j < str.length && depth > 0) {
+      if (str.startsWith("${", j)) {
+        depth++;
+        j += 2;
+      } else if (str[j] === "}") {
+        depth--;
+        j++;
+      } else {
+        j++;
+      }
+    }
+    if (depth > 0) {
+      // Unterminated — emit the remainder verbatim.
+      out += str.slice(start);
+      break;
+    }
+
+    const expr = str.slice(start + 2, j - 1);
+    const [name, ...rest] = expr.split(":-");
+    const direct = process.env[name.trim()];
+    if (direct !== undefined && direct !== "") {
+      out += direct;
+    } else {
+      const def = rest.join(":-");
+      out += def ? expandExpr(def) : "";
+    }
+    i = j;
+  }
+  return out;
+}
+
+/**
+ * Resolve the .mcp.json path for the current session (#104).
+ *
+ * Resolution order:
+ *  1. Walk UP from `startDir` (default process.cwd()), stopping at the git
+ *     top-level when one is resolvable (same `git rev-parse --show-toplevel`
+ *     logic as reflect-hook / main-worktree-guard). Non-git directories walk
+ *     to the filesystem root. First `.mcp.json` found wins — this lets a
+ *     per-repo config override the base config.
+ *  2. Fallback: `~/.pi/agent/.mcp.json` (the bootstrapped base config
+ *     installed by pi-bootstrap/setup.sh from templates/.mcp.base.json).
+ *  3. null → no config anywhere; the caller logs a clear zero-servers message.
+ *
+ * Exported (named) for unit tests; the default export stays the extension hook.
+ */
+export function resolveMcpJsonPath(startDir: string = process.cwd()): string | null {
+  let topLevel: string | null = null;
+  try {
+    // realpath the git output once so the walk-up stop comparison below is
+    // symlink-robust (worktrees / symlinked checkouts may resolve differently).
+    topLevel = realpathSync(
+      execSync("git rev-parse --show-toplevel", {
+        cwd: startDir,
+        encoding: "utf-8",
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "ignore"], // silence git stderr for non-repos
+      }).trim()
+    );
+  } catch {
+    topLevel = null; // not in a git repo (or git unavailable) — walk to fs root
+  }
+
+  let dir = resolve(startDir);
+  while (true) {
+    const candidate = join(dir, ".mcp.json");
+    if (existsSync(candidate)) return candidate;
+    if (topLevel) {
+      let realDir: string | null = null;
+      try {
+        realDir = realpathSync(dir);
+      } catch {
+        realDir = null;
+      }
+      if (realDir === topLevel) break;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break; // hit filesystem root
+    dir = parent;
+  }
+
+  // Fallback: bootstrapped base config.
+  const homeFallback = join(homedir(), ".pi", "agent", ".mcp.json");
+  return existsSync(homeFallback) ? homeFallback : null;
 }
 
 /** Connect to a single MCP server with a timeout. Cleans up on failure to avoid orphan processes. */
@@ -387,7 +504,22 @@ class McpServerManager {
 
 export default async function (pi: ExtensionAPI) {
   const manager = new McpServerManager();
-  const mcpJsonPath = resolve(process.cwd(), ".mcp.json");
+
+  // #104: resolve .mcp.json with an upward search (cwd → git top-level) and
+  // a ~/.pi/agent/.mcp.json fallback, instead of cwd-only. Log the search
+  // path at warn level so a zero-server session is diagnosable at a glance.
+  const searchedDir = process.cwd();
+  const mcpJsonPath = resolveMcpJsonPath(searchedDir);
+  if (mcpJsonPath) {
+    console.log(
+      `[mcp-client] Resolved .mcp.json: ${mcpJsonPath} (searched up from ${searchedDir} incl. ~/.pi/agent fallback)`
+    );
+  } else {
+    console.log(
+      `[mcp-client] WARN: no .mcp.json found (searched up from ${searchedDir}, then ~/.pi/agent/.mcp.json) — running with ZERO MCP servers. Run pi-bootstrap/setup.sh to install the base config, or add a per-repo .mcp.json.`
+    );
+    return;
+  }
 
   await manager.connectAll(mcpJsonPath);
   await manager.registerTools(pi);

@@ -42,9 +42,9 @@
         "-m",
         "tortoise.mcp_server"
       ],
-      "cwd": "${TORTOISE_HOME:-/Users/home/tortoise}",
+      "cwd": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
       "env": {
-        "PYTHONPATH": "${TORTOISE_HOME:-/Users/home/tortoise}",
+        "PYTHONPATH": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
         "TORTOISE_DB_URI": "docker://:@localhost:16379/tortoise"
       }
     }
