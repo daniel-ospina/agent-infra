@@ -41,13 +41,13 @@ steps:
 **AI review gate (merge):** merge proceeds when the review APPROPRIATE TO THE ISSUE
 CONTENT is clean (0 P0, 0 P1) AND pre-flight tests passed (per `01-preflight.md` risk tier —
 regression check for code PRs) AND the verification gate verified the staged files. The review
-is domain-dispatched from the issue's complexity ratings + the PR diff surface (per `code-review`
-Step 0.8 infra detection + Step 3.6 domain matrix, and `test-routing` domain dispatch):
+is surface-dispatched from the PR diff (issue complexity ratings scale review depth, per
+`code-review` Step 0.8 infra detection + Step 3.6 surface matrix, and `test-routing` domain dispatch):
 always-on: bug scan (shallow+deep), guidance compliance, history, prior-PR comments, and SECURITY
 (security-review skill discipline — HIGH-confidence findings only, research-before-report);
 plus domain reviewers as applicable: skills/extensions/.mcp.json/ontology → Skill Infrastructure /
-Ontology & Templates / Extension Safety; UX → ux-verification; config/research/docs → proportional
-config/doc review. No human approval required for technical merges.
+Ontology & Templates / Extension Safety; UX → ux-consistency/ux-coverage/ux-realism (code-review) + ux-verification (test-routing); config → Agent #12 config review;
+research/docs → proportional review. No human approval required for technical merges.
 **Human escalation (only):** P0 findings requiring an architectural or security decision
 (irreversible ops, data loss, security breach) — and only after the code-review fixer loop
 escalation is exhausted (per the `code-review` skill, Step 6.5 Orchestrator Escalation).
