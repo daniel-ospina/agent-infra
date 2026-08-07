@@ -64,8 +64,8 @@ ${reviewSection}
 ## Build Commands
 \`\`\`bash
 cd ${carouselDir}
-node ../../../operations/skills/carousel-b2b-design/scripts/build_carousel.cjs --script script.yaml --images selected-images.yaml --css-map css-map.json --output carousel.html
-node ../../../operations/skills/carousel-b2b-design/scripts/render.cjs --input carousel.html --output slides/
+node ../../skills/carousel-b2b-design/scripts/build_carousel.cjs --script script.yaml --images selected-images.yaml --css-map css-map.json --output carousel.html
+node ../../skills/carousel-b2b-design/scripts/render.cjs --input carousel.html --output slides/
 \`\`\`
 
 ## LOOP RULE (MANDATORY — DO NOT VIOLATE)
