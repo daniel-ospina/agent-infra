@@ -52,6 +52,30 @@ export function getPerplexityKey(): string | undefined {
 }
 
 /** Strip HTML tags and extract readable text */
+// #36: Ensure sub-agent PATH includes common python3 locations.
+// The parent pi process (running under cmux) may have a truncated PATH that
+// drops /opt/homebrew/bin and /usr/local/bin. Sub-agents inherit process.env
+// faithfully but that doesn't help if the parent's PATH was already truncated.
+// Prepend known locations so MCP servers using bare `python3` resolve.
+export const PATH_EXTRA_DIRS = [
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/home/linuxbrew/.linuxbrew/bin",
+];
+
+export function augmentPath(inheritedPath: string): string {
+  const extraDirs = PATH_EXTRA_DIRS.filter(
+    (d) => !inheritedPath.split(":").includes(d)
+  );
+  return extraDirs.length > 0
+    ? [...extraDirs, inheritedPath].join(":")
+    : inheritedPath;
+}
+
+export function getSubAgentPath(): string {
+  return augmentPath(process.env.PATH ?? "");
+}
+
 export function stripHtml(html: string): string {
   return html
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
@@ -488,22 +512,7 @@ export default function (pi: ExtensionAPI) {
       const provider = model.startsWith("claude") ? "anthropic" : "deepseek";
 
       // #36: Ensure sub-agent PATH includes common python3 locations.
-      // The parent pi process (running under cmux) may have a truncated PATH that
-      // drops /opt/homebrew/bin and /usr/local/bin. Sub-agents inherit process.env
-      // faithfully but that doesn't help if the parent's PATH was already truncated.
-      // Prepend known locations so MCP servers using bare `python3` resolve.
-      const PATH_EXTRA_DIRS = [
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-        "/home/linuxbrew/.linuxbrew/bin",
-      ];
-      const inheritedPath = process.env.PATH ?? "";
-      const extraDirs = PATH_EXTRA_DIRS.filter(
-        (d) => !inheritedPath.split(":").includes(d)
-      );
-      const augmentedPath = extraDirs.length > 0
-        ? [...extraDirs, inheritedPath].join(":")
-        : inheritedPath;
+      const augmentedPath = getSubAgentPath();
 
       const subAgentEnv: Record<string, string | undefined> = {
   ...process.env,

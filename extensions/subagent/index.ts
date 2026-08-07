@@ -334,18 +334,7 @@ async function runSingleAgent(
 			const invocation = getPiInvocation(args);
 			// #36: Ensure sub-agent PATH includes common python3 locations
 			// so MCP servers using bare `python3` resolve.
-			const PATH_EXTRA_DIRS = [
-				"/opt/homebrew/bin",
-				"/usr/local/bin",
-				"/home/linuxbrew/.linuxbrew/bin",
-			];
-			const inheritedPath = process.env.PATH ?? "";
-			const extraDirs = PATH_EXTRA_DIRS.filter(
-				(d) => !inheritedPath.split(":").includes(d)
-			);
-			const augmentedPath = extraDirs.length > 0
-				? [...extraDirs, inheritedPath].join(":")
-				: inheritedPath;
+			const augmentedPath = getSubAgentPath();
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				shell: false,
