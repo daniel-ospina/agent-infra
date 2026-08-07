@@ -2,6 +2,7 @@
 name: commit-workflow
 description: MANDATORY before any git commit, push, or merge. Runs pre-flight (typecheck, tests, pgTAP), creates PR, code-review gate, auto-merge. Skipping bypasses ALL quality gates.
 domain: engineering
+version: 1.1.0
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 steps:
   - name: preflight_checks
@@ -25,7 +26,7 @@ steps:
     produces: [review_approved]
   - name: merge_and_deploy
     type: skill
-    gate: human_approval
+    gate: verifier
     requires: [code_review_gate]
     produces: [merged]
   - name: cleanup
@@ -37,7 +38,19 @@ steps:
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
-**Human approval gate:** presents output for user review. Pipeline advances after approval.
+**AI review gate (merge):** merge proceeds when the review APPROPRIATE TO THE ISSUE
+CONTENT is clean (0 P0, 0 P1) AND pre-flight tests passed (per `01-preflight.md` risk tier —
+regression check for code PRs) AND the verification gate verified the staged files. The review
+is domain-dispatched from the issue's complexity ratings + the PR diff surface (per `code-review`
+Step 0.8 infra detection + Step 3.6 domain matrix, and `test-routing` domain dispatch):
+always-on: bug scan (shallow+deep), guidance compliance, history, prior-PR comments, and SECURITY
+(security-review skill discipline — HIGH-confidence findings only, research-before-report);
+plus domain reviewers as applicable: skills/extensions/.mcp.json/ontology → Skill Infrastructure /
+Ontology & Templates / Extension Safety; UX → ux-verification; config/research/docs → proportional
+config/doc review. No human approval required for technical merges.
+**Human escalation (only):** P0 findings requiring an architectural or security decision
+(irreversible ops, data loss, security breach) — and only after the code-review fixer loop
+escalation is exhausted (per the `code-review` skill, Step 6.5 Orchestrator Escalation).
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
 

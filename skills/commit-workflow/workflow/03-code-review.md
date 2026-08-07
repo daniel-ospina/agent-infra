@@ -24,13 +24,13 @@ fi
 : ${ONTOLOGY_RATING:=""}
 ```
 
-Pass these ratings to code-review Step 4 dispatch logic. When all empty, only the 4 safety-net agents run.
+Pass these ratings to code-review Step 4 dispatch logic. When all empty, the 6 always-on agents (Guidance, Bug-Shallow, Bug-Deep, History, PR Comments, Security) still run.
 
 ## Step 2 — Code-Review Gate
 
 **Micro tier: skip entirely.** Pre-flight checks (typecheck, tests) are the safety net. Proceed directly to Step 3 (`04-merge-deploy.md`).
 
-**Standard tier:** Invoke `code-review` with the full 5-agent review + NVIDIA pattern scan (Agent #6):
+**Standard tier:** Invoke `code-review` with the 6-agent review (guidance, bug scan, security):
 
 The Standard tier fix-loop follows the same structure as Complex. Specifically:
 
@@ -39,8 +39,8 @@ iteration = 0
 
 LOOP:
   Use the Skill tool to invoke `code-review`:
-  - First pass (iteration = 0): args = `<PR_NUMBER> --nvidia-review`
-  - Subsequent passes (iteration ≥ 1): args = `<PR_NUMBER> --nvidia-review --re-review`
+  - First pass (iteration = 0): args = `<PR_NUMBER>`
+  - Subsequent passes (iteration ≥ 1): args = `<PR_NUMBER> --re-review`
 
   If NO issues (confidence ≥ 50):
     → Promote draft to ready-for-review:
@@ -54,15 +54,15 @@ LOOP:
     → Continue LOOP
 ```
 
-**Complex tier (and default when TIER is unknown):** Run the full 5-agent review + NVIDIA pattern scan (Agent #6):
+**Complex tier (and default when TIER is unknown):** Run the full 6-agent review + domain/infra reviewers (Agents #5-#11, per `code-review` Step 3.6/0.8):
 
 ```
 iteration = 0
 
 LOOP:
   Use the Skill tool to invoke `code-review`:
-  - First pass (iteration = 0): args = `<PR_NUMBER> --nvidia-review`
-  - Subsequent passes (iteration ≥ 1): args = `<PR_NUMBER> --nvidia-review --re-review`
+  - First pass (iteration = 0): args = `<PR_NUMBER>`
+  - Subsequent passes (iteration ≥ 1): args = `<PR_NUMBER> --re-review`
   (The hook fires on `gh pr merge` only — fix-loop iterations require this explicit Skill tool invocation.)
 
   If NO issues (confidence ≥ 50):
