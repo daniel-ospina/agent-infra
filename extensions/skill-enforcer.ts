@@ -378,9 +378,9 @@ export default function (pi: ExtensionAPI) {
   // read-tracking for them lives here instead.
   const PREREQUISITES: Record<string, { requiredAny: string[]; blockTools: string[]; trackFiles?: string[] }> = {
     "issue-workflow": {
-      requiredAny: ["project-workflow", "task-workflow", "epic-workflow"],
+      requiredAny: ["project-workflow", "task-workflow", "task-workflow-standard", "epic-workflow"],
       blockTools: ["write", "edit"],
-      trackFiles: ["project-workflow", "task-workflow", "epic-workflow"],
+      trackFiles: ["project-workflow", "task-workflow", "task-workflow-standard", "epic-workflow"],
     },
     "writing-plans": {
       requiredAny: ["issue-scoping"],

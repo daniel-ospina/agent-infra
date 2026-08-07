@@ -7,7 +7,7 @@ status: live
 tags: [pipeline, issue, routing, fractal, orchestrator, entry-point]
 summary: "Fractal entry-point router — detects Level + complexity and dispatches to epic-workflow, project-workflow, task-workflow (micro), or task-workflow-standard (gated)."
 created: 2026-07-07
-updated: 2026-08-07
+updated: 2026-08-08
 steps:
   - name: classify_ask
     type: skill

@@ -1,12 +1,12 @@
 ---
 name: debug-workflow
-description: Pipeline-gated debugging workflow. Classifies bug complexity, routes through issue-workflow to task-workflow or project-workflow, then applies systematic root-cause methodology. Use when encountering any bug, test failure, or unexpected behavior.
+description: Pipeline-gated debugging workflow. Classifies bug complexity, routes through issue-workflow to task-workflow (micro), task-workflow-standard or project-workflow (standard/complex), then applies systematic root-cause methodology. Use when encountering any bug, test failure, or unexpected behavior.
 domain: engineering
 type: Workflow
 status: live
 tags: [pipeline, debugging, root-cause, workflow]
 created: 2026-07-07
-updated: 2026-07-07
+updated: 2026-08-08
 steps:
   - name: classify_and_route
     type: skill

@@ -7,7 +7,7 @@ status: live
 tags: [pipeline, task, planning, fractal, orchestrator, lightweight]
 summary: "Workflow skill for micro-issues — all 6 pipeline stages applied inline with no sub-skill dispatch. Canonical micro pipeline (task-workflow-micro merged here)."
 created: 2026-07-07
-updated: 2026-08-07
+updated: 2026-08-08
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 1.1.0
 ---
