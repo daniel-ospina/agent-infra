@@ -50,7 +50,7 @@ fi
 
 # --- checks 1 + 2: every pi-config entry is a symlink into extensions/ -------
 for e in "$SRC"/*; do
-  [ -e "$e" ] || continue   # empty dir guard (bash glob)
+  [ -e "$e" ] || [ -L "$e" ] || continue   # skip empty glob only, NOT broken links (P2 #95-review)
   base="$(basename "$e")"
 
   if [ ! -L "$e" ]; then
