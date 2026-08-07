@@ -29,7 +29,7 @@ You will receive these parameters when invoked. Apply the defaults when a parame
 | `depth` | number | `4` | Max navigation depth from each entry point |
 | `output_dir` | string | `docs/ux-qa/` | Directory path to write `path-map.json` |
 
-The `output_dir` is always an absolute path or relative to the repo root `/Users/home/eldato/`. Write `path-map.json` directly into it.
+The `output_dir` is always an absolute path or relative to the repo root. Write `path-map.json` directly into it.
 
 ---
 

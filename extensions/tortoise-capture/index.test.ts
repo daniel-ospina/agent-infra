@@ -404,7 +404,7 @@ describe("#125/#167 deriveTopics/deriveStoryArch", () => {
     const { createRequire } = require("module");
     // Test file is hardlinked into agent-infra; anchor require to eldato repo
     // where js-yaml is a dependency.
-    const eldatoRequire = createRequire(require.resolve("/Users/home/eldato/package.json"));
+    const eldatoRequire = createRequire(require.resolve("/home/user/eldato/package.json"));
     const yaml = eldatoRequire("js-yaml");
     const parsed = yaml.load(m![1]) as Record<string, unknown>;
     expect(parsed.summary).toBe(arch); // bullets preserved exactly (no line-fold)

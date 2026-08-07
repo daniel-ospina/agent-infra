@@ -27,7 +27,7 @@ You will receive these parameters when invoked:
 | `audit_report` | string | yes | Absolute or repo-relative path to `audit-report.json` produced by `ux-path-auditor` |
 | `output_dir` | string | yes | Directory path to write `ux-issues.json` and `tech-issues.json` |
 
-The `output_dir` is always an absolute path or relative to the repo root `/Users/home/eldato/`. The output directory is pre-created by the `ux-qa` orchestrator. If running standalone, create it: `mkdir -p {output_dir}`.
+The `output_dir` is always an absolute path or relative to the repo root. The output directory is pre-created by the `ux-qa` orchestrator. If running standalone, create it: `mkdir -p {output_dir}`.
 
 ---
 

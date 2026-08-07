@@ -5,7 +5,7 @@
 # What it does:
 #   1. Triggers BGSAVE on falkordb-personal
 #   2. Copies RDB snapshot + graph metadata to timestamped backup dir
-#   3. Copies to off-box location (/Users/home/eldato/backups/tortoise/)
+#   3. Copies to off-box location (/home/user/eldato/backups/tortoise/)
 #   4. Prunes old backups (keep N=14)
 #   5. Writes manifest.json with point counts per graph
 #
