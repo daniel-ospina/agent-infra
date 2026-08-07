@@ -39,12 +39,14 @@ EOF
 
 ISSUE_BODY=""
 EPIC_PATH=""
+HAS_ISSUE_BODY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --issue-body)
       [[ $# -ge 2 ]] || { echo "Error: --issue-body requires a value" >&2; exit 2; }
       ISSUE_BODY="$2"
+      HAS_ISSUE_BODY=1
       shift 2
       ;;
     --epic-path)
@@ -64,7 +66,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$ISSUE_BODY" ]] || { echo "Error: --issue-body is required" >&2; exit 2; }
+[[ "$HAS_ISSUE_BODY" -eq 1 ]] || { echo "Error: --issue-body is required" >&2; exit 2; }
+# A MISSING --issue-body flag is a caller bug (exit 2); an EMPTY value is a
+# body-less issue → treated as "no field" (empty output, exit 0), symmetric
+# with empty --epic-path (code-review passes --issue-body "" for body-less
+# issues).
 
 resolve_research_field() {
   # `**Research:** <path or "none">` — single-line convention (issue-creation).
