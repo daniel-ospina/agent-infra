@@ -16,6 +16,8 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+// #36: shared sub-agent PATH augmentation (python3 resolution for MCP servers)
+import { getSubAgentPath } from "../builtin-tools/index.js";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -332,10 +334,14 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
+			// #36: Ensure sub-agent PATH includes common python3 locations
+			// so MCP servers using bare `python3` resolve.
+			const augmentedPath = getSubAgentPath();
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				env: { ...process.env, PATH: augmentedPath },
 			});
 
 			// Heartbeat: prevent silence timeout during long tool calls (review dispatches, batch reads).

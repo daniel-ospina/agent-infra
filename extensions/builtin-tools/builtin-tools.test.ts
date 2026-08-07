@@ -10,7 +10,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS } from "./index.js";
 import { ok, equal } from "node:assert/strict";
 import { readFileSync, renameSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -179,6 +179,35 @@ section("Banner suppression (#5526, #5672 regression)");
 test("startup banner suppressed in print mode", () => {
   ok(source.includes("PI_MODE !== 'print'"), "banner suppression for print mode should exist (#5526 #5672)");
 });
+
+// ── PATH augmentation (#36) ───────────────────────────
+
+section("augmentPath — sub-agent PATH augmentation (#36)");
+
+test("prepends missing python3 dirs to empty PATH", () => {
+  const out = augmentPath("");
+  for (const d of PATH_EXTRA_DIRS) {
+    ok(out.includes(d), `PATH must include ${d}, got: ${out}`);
+  }
+});
+
+test("does not duplicate dirs already present", () => {
+  const withHomebrew = augmentPath("/opt/homebrew/bin:/usr/bin:/bin");
+  const count = withHomebrew.split(":").filter((p) => p === "/opt/homebrew/bin").length;
+  equal(count, 1, "homebrew dir must appear exactly once");
+});
+
+test("no-op when all dirs present", () => {
+  const full = PATH_EXTRA_DIRS.join(":") + ":/usr/bin:/bin";
+  equal(augmentPath(full), full, "must not modify when all dirs present");
+});
+
+test("keeps existing PATH entries and prepends extras", () => {
+  const out = augmentPath("/usr/bin:/bin");
+  ok(out.endsWith("/usr/bin:/bin"), "existing entries must be preserved");
+  ok(out.startsWith(PATH_EXTRA_DIRS[0]), "extras must be prepended (priority)");
+});
+
 
 // ── Results ───────────────────────────────────────────
 

@@ -125,8 +125,14 @@ async function connectWithTimeout(
   try {
     await Promise.race([connect, timeout]);
   } catch (err) {
-    // Clean up to avoid orphan processes (esp. for stdio transports that spawn child processes)
-    try { await client.close(); } catch { /* best effort */ }
+    // #36: Clean up to avoid orphan processes. Add a 3s timeout to client.close()
+    // so a hung transport teardown doesn't block the connection failure path.
+    try {
+      await Promise.race([
+        client.close(),
+        new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+      ]);
+    } catch { /* best effort */ }
     throw err;
   } finally {
     if (timer) clearTimeout(timer);
@@ -191,8 +197,14 @@ class McpServerManager {
       if (result.status === "rejected") {
         // Use the server name from the input array at the same index
         const serverName = serverEntries[i]?.[0] ?? "unknown";
+        const errMsg = result.reason?.message ?? String(result.reason);
         console.log(
-          `[mcp-client] Failed to connect to MCP server '${serverName}': ${result.reason?.message ?? result.reason}`
+          `[mcp-client] Failed to connect to MCP server '${serverName}': ${errMsg}`
+        );
+        // #36: Fail-fast — MCP unavailable, continuing without it.
+        // Sub-agents already work without MCP; hanging at exit wastes ~8min.
+        console.log(
+          `[mcp-client] MCP server '${serverName}' unavailable — continuing without it`
         );
       } else {
         succeeded++;
@@ -347,12 +359,24 @@ class McpServerManager {
   }
 
   async disconnectAll(): Promise<void> {
+    // #36: Each client.close() gets a 5s timeout to prevent hanging the
+    // process exit when MCP servers never connected (e.g., python3 ENOENT).
+    const DISCONNECT_TIMEOUT_MS = 5000;
     for (const { client, serverName } of this.connections) {
       try {
-        await client.close();
+        const closeOp = client.close();
+        const timeout = new Promise<void>((resolve) =>
+          setTimeout(() => {
+            console.log(
+              `[mcp-client] Disconnect from '${serverName}' timed out after ${DISCONNECT_TIMEOUT_MS}ms — forcing`
+            );
+            resolve();
+          }, DISCONNECT_TIMEOUT_MS)
+        );
+        await Promise.race([closeOp, timeout]);
         console.log(`[mcp-client] Disconnected from '${serverName}'`);
       } catch {
-        // Best effort
+        // Best effort — never block process exit
       }
     }
     this.connections = [];
