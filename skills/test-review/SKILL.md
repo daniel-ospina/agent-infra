@@ -73,7 +73,7 @@ Before firing any web searches, check two sources for existing testing knowledge
 
 ```bash
 # Does the file exist?
-[ -f docs/teams/organisation-design-team/domains (S1)/operations/testing-patterns.md ] && echo "found" || echo "missing"
+[ -f "docs/teams/organisation-design-team/domains (S1)/operations/testing-patterns.md" ] && echo "found" || echo "missing"
 ```
 
 If found, read it. For each surface type in the Integration Surface Map, check if a pattern exists in the corresponding section. A pattern is "fresh" if its entry has a `Last researched:` date within the last 6 months.

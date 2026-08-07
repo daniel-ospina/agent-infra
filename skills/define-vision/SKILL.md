@@ -33,6 +33,7 @@ Business model landscape. Market trends. Build vs buy dynamics. What is the mark
 **Before scanning the environment, query the epistemic graph for existing vision Points.** This surfaces prior vision claims, assumptions about the environment, and competitor claims already logged — preventing redundant research and anchoring the scan in accumulated knowledge.
 
 ```bash
+# From the agent-infra checkout (scripts/ lives there — symlinked into consumers):
 node scripts/tortoise-memory.mjs query-visions --point-kind vision
 ```
 

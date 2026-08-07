@@ -52,6 +52,7 @@ Produces the Strategy artifact and Roadmap. Takes the S4 vision as input. Execut
 **Before starting gap analysis, query the epistemic graph for prior strategy claims.** This surfaces assumptions, constraints, and decisions from previous strategy cycles — preventing drift and enabling cumulative reasoning.
 
 ```bash
+# From the agent-infra checkout (scripts/ lives there — symlinked into consumers):
 node scripts/tortoise-memory.mjs query-strategies
 ```
 
