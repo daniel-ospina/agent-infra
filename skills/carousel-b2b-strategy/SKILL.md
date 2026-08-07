@@ -447,11 +447,11 @@ To dispatch Opus for carousel design, provide full context — the 2-3x quality 
 3. Design direction (words describing aesthetic)
 4. Reference carousel images (from `docs/carousels/approved/` catalog)
 5. Brand brief: pin icon + "eldato" on every slide, purple/yellow colors, Outfit/Inter fonts
-6. Safe zones: `tokens.json` (from `operations/skills/carousel-b2b-design/scripts/tokens.json` — contains 155px horizontal safe margin, canvas dimensions, typography limits)
+6. Safe zones: `tokens.json` (from `skills/carousel-b2b-design/scripts/tokens.json` — contains 155px horizontal safe margin, canvas dimensions, typography limits)
 
 Opus generates complete `carousel.html`. Then:
 ```bash
-node operations/skills/carousel-b2b-design/scripts/render.cjs --input carousel.html --output slides/ --preview carousel-preview.html
+node skills/carousel-b2b-design/scripts/render.cjs --input carousel.html --output slides/ --preview carousel-preview.html
 ```
 
 <HARD-GATE id="copy-immutability">
