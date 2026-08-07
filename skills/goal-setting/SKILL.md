@@ -8,7 +8,7 @@ domain: capability
 
 # Goal-Setting Skill
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 ## Overview
 
@@ -45,10 +45,10 @@ Before creating a loop, run this verification:
 
 0. **Who is this for?** — select team and optionally role:
    - Use `--for <role-slug>` flag (e.g., `--for content-strategist`)
-   - Team is resolved from the role via `operations/subjects/*.yaml`
+   - Team is resolved from the role via swarm's Supabase SOR (roles/teams tables — see `node scripts/swarm-org.mjs resolve-role <slug>`; requires `SUPABASE_URL_ORG_DATA` + `SUPABASE_SERVICE_ROLE_KEY_ORG_DATA` from the swarm repo README)
    - Role inherits escalation chain: role → reports_to → team.escalation → parent team
    - If no role specified: attribute to team directly
-   - If unattributed: flag `goals_unverified` — ad-hoc work with no owner
+   - If unattributed or SOR unreachable: flag `goals_unverified` — ad-hoc work with no owner
 1. **Restate the objective** — agent restates what it understood
 2. **Challenge the indicators** — agent asks: "What could go wrong? Is there a way to satisfy every indicator without achieving the objective?"
 3. **Confirm loop type** — is `completion` appropriate? Would `cron`/`trigger`/`continuous` fit better?
@@ -141,9 +141,9 @@ The verifier reads all fields and checks output against them.
 
 ## See Also
 
-- `docs/teams/organisation-design-team/capability/2026-06-28-loop-enforcer.md` — full system architecture
-- `docs/teams/organisation-design-team/capability/2026-06-28-loop-enforcer-research.md` — research backing
-- `operations/pi-config/extensions/loop-enforcer/` — extension code
+- **Org data SOR:** swarm's Supabase SOR (teams/products/roles tables, migrations 00003-00005) — `node scripts/swarm-org.mjs resolve-role <slug>`; derived YAML mirror in the swarm repo (`operations/subjects/*.yaml`)
+- **Loop-enforcer architecture docs** (eldato repo): `docs/teams/organisation-design-team/domains (S1)/capability/2026-06-28-loop-enforcer.md` + `...-loop-enforcer-research.md` — fetch: `gh api repos/daniel-ospina/eldato/contents/<path>`
+- `extensions/loop-enforcer/` — extension code (this repo)
 - Hermes `/goal` command (goals.py:79-97) — cross-reference for harmonization
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

@@ -10,10 +10,10 @@ This is the entry point for every `strategy-to-pitch-components` invocation. It 
 
 ## 1. Read All Inputs
 
-Before any mode decision, read:
+Before any mode decision, read (strategy/product docs live in the eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`):
 
-- `docs/teams/eldato-app-team/product/strategy.md` — §2 (customer/market), §3 (JTBD), §4 (competition), §5 (value prop), §6 (differentiators), §7 (pitch derivation map)
-- `docs/teams/eldato-app-team/product/philosophy.md` — identity/ethos for tone grounding
+- `docs/teams/eldato-app-team/domains (S1)/product/strategy.md` — §2 (customer/market), §3 (JTBD), §4 (competition), §5 (value prop), §6 (differentiators), §7 (pitch derivation map)
+- `docs/teams/eldato-app-team/domains (S1)/product/philosophy.md` — identity/ethos for tone grounding
 - `docs/09_strategy/sales-research-brief.md` — if exists from prior run
 - Existing pitch components TypeScript file at `eldato-outreach: src/lib/pitch-components/pitch-components.ts` (if exists)
 - Existing manifest at `eldato-outreach: src/lib/pitch-components/pitch-components-manifest.json` (if exists)

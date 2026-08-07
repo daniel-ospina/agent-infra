@@ -80,7 +80,7 @@ If the request is vague, ask ONE clarifying question maximum. Default to medium 
 
 **Parse scope flags from user input.** The `/research` command accepts:
 
-**Ontology reference:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy. Entity class #19 (ResearchBrief) and #20 (Brief) define research outputs. **Routing flag:**
+**Ontology reference:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d`. Entity kinds `ResearchBrief`/`Brief` (Document kinds) define research outputs. **Routing flag:**
 - `--domain=<slug>` — routes output to a documentation domain wiki. Canonical.
 
 | --domain flag | Wiki path | Auto-bootstrap? | Notes |
@@ -118,12 +118,15 @@ Other `--team` values belong to the #4930 2-axis scope system and are orthogonal
 **Query the epistemic graph for prior knowledge about the research topic BEFORE scanning the codebase or web.** This surfaces claims, decisions, and hypotheses we already logged — avoiding redundant research and building on accumulated knowledge.
 
 ```bash
-python3 operations/memory/tortoise_client.py query-prior-research --domain "<topic-or-domain>"
+# From the agent-infra checkout. Hosted Tortoise API — env: TORTOISE_API_KEY
+# (tt_... from tortoise.premiselabs.co), TORTOISE_BASE_URL (default https://tortoise.premiselabs.co).
+# No key → prints {"error":"tortoise_unavailable"} and exits 0 (skip step).
+node scripts/tortoise-memory.mjs query-prior-research --domain "<topic-or-domain>"
 ```
 
 **Interpretation:**
 - **Results found:** Summarize prior claims. Use them to refine the research scope — what was already established? What gaps remain? What assumptions were made previously?
-- **"tortoise unavailable":** Tortoise SDK not on PYTHONPATH (negation-game-explorations/tortoise/). Skip this step — memory system is offline. Proceed with fresh research.
+- **"tortoise unavailable":** `TORTOISE_API_KEY` missing or API unreachable — memory system offline. Skip this step — proceed with fresh research.
 - **Zero results:** First research on this topic. Note "no prior epistemic claims found" and proceed.
 
 **Preserve provenance:** When citing prior claims in the research output, reference the Point ID and authoredBy field so the reader can trace the claim's origin.
@@ -226,9 +229,10 @@ $1/mo for 200 queries. Independent index — cross-source fact-checking.
 
 **Semantic Scholar** — academic paper search (200M+ papers):
 ```
-API: https://api.semanticscholar.org/graph/v1/paper/search?query=<topic>
+API: https://api.semanticscholar.org/graph/v1/paper/search?query=<topic>&limit=10
+curl -s "https://api.semanticscholar.org/graph/v1/paper/search?query=<topic>&limit=10"
 ```
-Default: keyless operation (100 req/5min unauthenticated). With `SEMANTIC_SCHOLAR_API_KEY` (see #5070): premium tier with higher rate limits. Client at `operations/tools/research/semantic_scholar_client.py` — invoke via `bash python3 operations/tools/research/semantic_scholar_client.py --query "..." --limit 10`. Activate when research needs peer-reviewed sources (architecture decisions, methodology questions, claims requiring academic backing). English-only — humanities and non-English papers underrepresented. Independent source category for confidence-tier classification (§5a). Graceful degradation: if API unavailable or rate-limited → skip with note "Semantic Scholar unavailable — academic sources not included."
+Default: keyless operation (100 req/5min unauthenticated). With `SEMANTIC_SCHOLAR_API_KEY` (see #5070): premium tier with higher rate limits. The legacy wrapper lives in the **eldato** repo at `operations/tools/research/semantic_scholar_client.py` (run from an eldato checkout: `python3 operations/tools/research/semantic_scholar_client.py --query "..." --limit 10`). Activate when research needs peer-reviewed sources (architecture decisions, methodology questions, claims requiring academic backing). English-only — humanities and non-English papers underrepresented. Independent source category for confidence-tier classification (§5a). Graceful degradation: if API unavailable or rate-limited → skip with note "Semantic Scholar unavailable — academic sources not included."
 
 Skip if the topic is conceptual, strategic, or not tied to a specific library.
 
@@ -239,9 +243,10 @@ Skip if the topic is conceptual, strategic, or not tied to a specific library.
 
 **OpenAlex** — academic works search (318M+ works, free and open):
 ```
-API: https://api.openalex.org/works?search=<topic>
+API: https://api.openalex.org/works?search=<topic>&per-page=10
+curl -s "https://api.openalex.org/works?search=<topic>&per-page=10"
 ```
-Requires `OPENALEX_API_KEY` (set in `.env.local`) for polite pool access. Max 10 req/s, respects `Retry-After` headers. Client at `operations/tools/research/openalex_client.py` — invoke via `bash python3 operations/tools/research/openalex_client.py --query "..." --limit 10`. Provides citation counts, publication year, venue, and open access status. Ideal for filtering and scoring candidate papers by academic impact. Graceful degradation: if API unavailable → skip with note "OpenAlex unavailable — academic metadata not included."
+Requires `OPENALEX_API_KEY` (set in `.env.local`) for polite pool access. Max 10 req/s, respects `Retry-After` headers. The legacy wrapper lives in the **eldato** repo at `operations/tools/research/openalex_client.py` (run from an eldato checkout: `python3 operations/tools/research/openalex_client.py --query "..." --limit 10`). Provides citation counts, publication year, venue, and open access status. Ideal for filtering and scoring candidate papers by academic impact. Graceful degradation: if API unavailable → skip with note "OpenAlex unavailable — academic metadata not included."
 
 ### Paper Discovery Flow (Multi-Source)
 
@@ -251,18 +256,17 @@ When research requires academic paper discovery, use this 4-stage pipeline:
 Use Exa (semantic/embeddings), Brave (independent index), and Perplexity (synthesis) to surface candidate papers and topics. Dispatch all three in parallel. Prefer free sources first (OpenAlex → Semantic Scholar → Exa → Brave) to manage costs. Exa free tier: 20K queries. Brave: $1/mo for 200 queries.
 
 #### Stage 2: Filter
-Use OpenAlex + Semantic Scholar to confirm relevance via metadata. Scoring rubric: citations > 10, year >= 2023, open access preferred. Use `normalize.py` for uniform result format across sources:
-```bash
-python3 operations/tools/research/normalize.py
-```
-Deduplicates by DOI (exact) then title (fuzzy, difflib ratio >= 0.85).
+Use OpenAlex + Semantic Scholar to confirm relevance via metadata. Scoring rubric: citations > 10, year >= 2023, open access preferred. Normalize/dedupe results in synthesis: dedupe by DOI (exact), then title (fuzzy, difflib ratio >= 0.85). The legacy normalize helper lives in the **eldato** repo (`operations/tools/research/normalize.py` — run from an eldato checkout).
 
 #### Stage 3: Deep Dive
 
 Use Unpaywall for legal open access retrieval of top-N candidates by DOI:
 
 ```bash
-python3 operations/tools/research/unpaywall_client.py --doi "10.xxx"
+# Unpaywall API is public and keyless (email required):
+curl -s "https://api.unpaywall.org/v2/<doi>?email=<your-email>"
+# Legacy wrapper: eldato repo operations/tools/research/unpaywall_client.py
+#   python3 operations/tools/research/unpaywall_client.py --doi "10.xxx"  (run from an eldato checkout)
 ```
 
 **Unpaywall** (OurResearch, nonprofit) — 56M+ open access articles from 50K publishers. Free, no API key. Returns OA status, PDF links, and repository locations. Legal — harvested from university repositories and publisher open content.
@@ -273,10 +277,14 @@ python3 operations/tools/research/unpaywall_client.py --doi "10.xxx"
 
 #### Stage 4: Claim Verification — DebateCV
 Extract claims from PaperResult metadata (title + abstract). File claims in wiki/ for evidence. Run DebateCV for adversarial verification:
+
 ```bash
-python3 operations/tools/research/debatecv.py --claim "<extracted claim>" --domain <04_platform>
+# Legacy DebateCV lives in the eldato repo (run from an eldato checkout):
+#   python3 operations/tools/research/debatecv.py --claim "<extracted claim>" --domain <04_platform>
+# (pass directory-form domain, e.g. 04_platform, not semantic slug)
 ```
-DebateCV uses wiki evidence for pro/con debate with moderator. Note: pass directory-form domain (`04_platform`), not semantic slug (`platform`).
+
+> **Superseded:** the fresh-session Research Verifier (Step 5.5) and the adversarial queries in Step 3 cover claim verification without the eldato dependency — prefer those. DebateCV is optional when working from an eldato checkout.
 
 ### Step 5 — Synthesize
 
@@ -329,11 +337,10 @@ Keep it concise. The goal is actionable insight, not an exhaustive report.
 **After synthesis, log key claims to the memory system so future research builds on accumulated knowledge.** At minimum, write one claim per Medium+ confidence tier. Low-confidence and speculative claims are optional — they carry a hypothesis tag and should only be written if they represent a useful direction.
 
 ```bash
-# Write individual claims
-python3 operations/memory/tortoise_client.py write-claim \
+# From the agent-infra checkout (hosted Tortoise API — see Step 1.7 for env):
+node scripts/tortoise-memory.mjs write-claim \
   --content "<claim text>" \
   --kind "statement" \
-  --context "<domain>" \
   --authored-by "research-skill" \
   --confidence <0.0-1.0>
 ```
@@ -389,10 +396,11 @@ ISSUE:
 For research that surfaces academic papers, optionally run DebateCV on key claims before the synthesis review:
 
 ```bash
-python3 operations/tools/research/debatecv.py --claim "<claim>" --domain <04_platform>
+# Legacy DebateCV — eldato repo (run from an eldato checkout):
+#   python3 operations/tools/research/debatecv.py --claim "<claim>" --domain <04_platform>
 ```
 
-DebateCV (`operations/tools/research/debatecv.py`) is an adversarial claim verifier using wiki evidence. Pro/con debater pattern with moderator. Claims should be extracted from PaperResult metadata (title + abstract) and filed in the domain wiki before running. See §Paper Discovery Flow Stage 4 above.
+DebateCV (`operations/tools/research/debatecv.py`, eldato repo) is an adversarial claim verifier using wiki evidence. Pro/con debater pattern with moderator. Claims should be extracted from PaperResult metadata (title + abstract) and filed in the domain wiki before running. See §Paper Discovery Flow Stage 4 above. **Prefer the fresh-session Research Verifier (Step 5.5) — it needs no eldato checkout.**
 
 
 ### Step 5c — Graph-Enhanced Synthesis (LightRAG)
@@ -400,7 +408,9 @@ DebateCV (`operations/tools/research/debatecv.py`) is an adversarial claim verif
 For complex multi-document synthesis (5+ source documents, multi-hop questions), use LightRAG for entity-connected graph synthesis:
 
 ```bash
-python3 operations/tools/research/lightrag_synthesize.py --docs docs/<domain>/wiki/ --query "what patterns emerge across sources" --mode hybrid
+# Legacy wrapper — eldato repo (run from an eldato checkout, requires DEEPSEEK_API_KEY):
+#   python3 operations/tools/research/lightrag_synthesize.py --docs docs/<domain>/wiki/ --query "what patterns emerge across sources" --mode hybrid
+# Fresh install (any repo): pip install lightrag-hku
 ```
 
 **LightRAG** (HKUDS, MIT license) builds a knowledge graph across documents and retrieves via hybrid mode (vector + graph). ~$0.002/query with DeepSeek. Requires `DEEPSEEK_API_KEY` set in env.

@@ -264,8 +264,10 @@ Skill files, ontology files, templates, and extension code are critical agent pi
 
 **Detection:**
 ```bash
-INFRA_FILES=$(gh pr diff <PR_NUMBER> --name-only | grep -E 'skills/.*SKILL\.md|skills/.*workflow/.*\.md|docs/teams/organisation-design-team/data/ONTOLOGY\.md|docs/teams/organisation-design-team/data/controlled_vocabulary\.md|docs/_template\.md|operations/subjects/.*\.yaml|operations/pi-config/extensions/.*|\.mcp\.json')
+INFRA_FILES=$(gh pr diff <PR_NUMBER> --name-only | grep -E 'skills/.*SKILL\.md|skills/.*workflow/.*\.md|templates/.*|extensions/.*\.ts|scripts/.*\.(cjs|mjs|js|sh|py)|\.mcp\.json')
 ```
+
+> **Ontology note:** the canonical ontology now lives in the tortoise repo (`tortoise/docs/ONTOLOGY.md`, v3.1) and org data lives in swarm's Supabase SOR — neither is in this repo's PR diff. Ontology changes are reviewed via tortoise-repo PRs; agent-infra skill PRs get ontology review when they touch `skills/.*SKILL\.md` (vocabulary drift in skill text).
 
 **If no infrastructure files detected:** `INFRA_RISK=""` — skip infrastructure reviewers.
 
@@ -274,16 +276,15 @@ INFRA_FILES=$(gh pr diff <PR_NUMBER> --name-only | grep -E 'skills/.*SKILL\.md|s
 | Risk | Examples | Reviewers |
 |------|----------|-----------|
 | **Infrastructure-low** | Typo fix in SKILL.md description, comment update, minor wording change | 1 reviewer (Skill Infrastructure) |
-| **Infrastructure-medium** | New Bounded skill, workflow file change, ontology update, controlled_vocabulary.md change, .mcp.json change | 2 reviewers (Skill Infrastructure + Ontology & Templates) |
-| **Infrastructure-high** | New Workflow skill, ONTOLOGY.md § change, extension code, _template.md change, subjects/*.yaml change | 3 reviewers (all) |
+| **Infrastructure-medium** | New Bounded skill, workflow file change, ontology-touching skill change, .mcp.json change | 2 reviewers (Skill Infrastructure + Ontology & Templates) |
+| **Infrastructure-high** | New Workflow skill, ONTOLOGY.md § change (tortoise repo), extension code, _template.md change | 3 reviewers (all) |
 
 **Classification heuristic:**
 - PR diff adds a new file matching `skills/**/SKILL.md` → read the skill to determine if Workflow (high) or Bounded/Modular (medium)
-- PR diff modifies `ONTOLOGY.md` with changes to numbered sections (\u00a7) → high
-- PR diff modifies extension code (`operations/pi-config/extensions/`) → high
-- PR diff modifies `docs/_template.md` or `operations/subjects/` → high
+- PR diff modifies ontology-touching lines in `skills/**/SKILL.md` (entity/term drift) → high
+- PR diff modifies extension code (`extensions/`) → high
+- PR diff modifies `templates/` → high
 - PR diff modifies `.mcp.json` → medium
-- PR diff modifies `controlled_vocabulary.md` → medium
 - Other infra file changes → read the diff to classify; default to medium if uncertain
 
 Store `INFRA_RISK=low|medium|high` for use in Step 4 dispatch.
@@ -707,7 +708,7 @@ If no issues: NO ISSUES FOUND
 
 **Agent #9 — Ontology & Template Reviewer** (conditional: INFRA_RISK ∈ {medium, high}):
 ```
-You are reviewing a PR that changes ontology files, templates, or subject registries. These define the canonical vocabulary and document structure for the entire project.
+You are reviewing a PR that changes skill infrastructure, templates, or extension code. These define the canonical vocabulary and agent pipeline for the project. The canonical ontology lives in the tortoise repo (`tortoise/docs/ONTOLOGY.md`, v3.1 — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d`, §5 = controlled vocabulary) and org data (teams/roles) lives in swarm's Supabase SOR. Neither is in this PR's diff — compare skill text against the fetched ontology.
 
 PR DIFF: <full diff>
 INFRA_FILES: <list of infrastructure files from Step 0.8>
@@ -715,9 +716,9 @@ INFRA_FILES: <list of infrastructure files from Step 0.8>
 CHECK:
 
 1. VOCABULARY CONSISTENCY:
-   - Does the change introduce terms that conflict with existing ONTOLOGY.md definitions?
-   - Does the change use canonical entity names from controlled_vocabulary.md?
-   - New term without ONTOLOGY.md registration → P1
+   - Does the change introduce terms that conflict with tortoise/docs/ONTOLOGY.md definitions?
+   - Does the change use canonical entity names from the ontology's §5 controlled vocabulary?
+   - New term without ontology registration → P1
 
 2. ONTOLOGY DRIFT:
    - Does the change alter the meaning of an existing concept without updating downstream references?
@@ -729,14 +730,13 @@ CHECK:
    - Are those references now stale?
    - Stale downstream reference → P1
 
-4. TEMPLATE VALIDITY (for _template.md changes):
+4. TEMPLATE VALIDITY (for templates/ changes):
    - Are all required frontmatter fields still present?
    - Does the template match the filing workflow spec?
    - Missing required field → P0
 
-5. SUBJECT REGISTRY (for subjects/*.yaml changes):
-   - Are team slugs valid (match controlled vocabulary)?
-   - Are role definitions consistent with ONTOLOGY.md?
+5. ORG-DATA CONSISTENCY (team/role slugs in skill text):
+   - Team/role slugs should match swarm's Supabase SOR (teams/roles tables) — verify via `node scripts/swarm-org.mjs list-teams` / `resolve-role <slug>`
    - Invalid slug → P1
 
 For each issue found, return:

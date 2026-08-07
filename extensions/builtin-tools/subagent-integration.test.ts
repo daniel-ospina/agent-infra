@@ -5,7 +5,7 @@
  * and kills them after a short window. Verifies extension loading behavior
  * and env var propagation without waiting for full LLM response.
  *
- * Run: npx tsx operations/pi-config/extensions/builtin-tools/subagent-integration.test.ts
+ * Run: npx tsx extensions/builtin-tools/subagent-integration.test.ts
  */
 
 import { spawn } from "node:child_process";

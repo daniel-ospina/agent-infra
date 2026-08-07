@@ -25,7 +25,7 @@ The Team Strategist merges S3+S4+S5 into one role. Runs a cycle that produces an
 ### Phase 0 — Product Roadmap Progress Check
 
 Before the visioning cycle, assess execution reality. Read the Product Roadmap at:
-`docs/teams/organisation-design-team/management/change (S3)/organisation-design-team-strategy.md`
+`docs/teams/organisation-design-team/management/change (S3)/organisation-design-team-roadmap.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path>`)
 
 **Check each item:**
 - H1 items: on track? blocked? behind?
@@ -101,7 +101,7 @@ If issues found: flags to the Strategist directive for mid-cycle adjustment.
 
 ## Role Registration
 
-Register in `operations/subjects/organisation-design-team.yaml`:
+Register in the swarm Supabase SOR (`roles` table) — derived YAML mirror in the swarm repo at `operations/subjects/organisation-design-team.yaml` (update it when working from a swarm checkout):
 
 ```yaml
 roles:

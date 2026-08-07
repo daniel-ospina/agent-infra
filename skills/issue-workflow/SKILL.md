@@ -45,7 +45,7 @@ steps:
 
 Entry-point router for the fractal planning pipeline. Detects the issue's Level from its fractal fields and dispatches to the correct workflow skill.
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 ## Routing
 
@@ -219,7 +219,7 @@ After dispatching, the workflow skill handles all phase transitions. Do NOT paus
 - `../task-workflow/SKILL.md`
 - `../task-workflow-standard/SKILL.md`
 - `../issue-creation/SKILL.md`
-- `docs/teams/organisation-design-team/data/ONTOLOGY.md`
+- `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d`
 
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

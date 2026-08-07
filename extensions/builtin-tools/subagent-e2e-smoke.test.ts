@@ -4,7 +4,7 @@
  * Spawns "pi -p --no-session" with a real task, waits for completion,
  * verifies correct output. Gated on DEEPSEEK_API_KEY (needs LLM API key).
  *
- * Run: npx tsx operations/pi-config/extensions/builtin-tools/subagent-e2e-smoke.test.ts
+ * Run: npx tsx extensions/builtin-tools/subagent-e2e-smoke.test.ts
  */
 
 import { spawn } from "node:child_process";

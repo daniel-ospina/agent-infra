@@ -3,7 +3,7 @@
 # Eldato Conventions — ux-verification
 
 ## References
-- **Component catalog:** `docs/teams/eldato-app-team/ux/component_catalog.md`
+- **Component catalog:** `docs/teams/eldato-app-team/domains (S1)/ux/component_catalog.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`)
 - **Design tokens:** `text-primary`, `bg-card` (semantic, not hardcoded colors)
 
 ## Full Audit (UX=high)

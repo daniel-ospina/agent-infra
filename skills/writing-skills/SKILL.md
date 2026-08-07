@@ -16,7 +16,7 @@ updated: 2026-07-07
 
 Reference for creating skills that follow project conventions. All 99 project skills follow these rules — this document encodes them as process.
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 ## Frontmatter Schema
 

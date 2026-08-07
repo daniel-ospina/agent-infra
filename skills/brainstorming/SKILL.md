@@ -26,7 +26,7 @@ fi
 
 # Brainstorming Ideas Into Designs
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 ## Overview
 
@@ -76,7 +76,7 @@ You MUST create a task for each of these items and complete them in order:
 1. **Explore project context** — check files, docs, recent commits
 2. **Ask clarifying questions** — one at a time, understand purpose/constraints/success criteria
 3. **Propose 2-3 approaches** — with trade-offs and your recommendation
-   **Component reuse check:** Before designing new UI elements, quickly scan `docs/teams/eldato-app-team/ux/component_catalog.md` — it documents 35 shadcn/ui primitives and 80+ custom components already in the codebase. Prefer existing over new; a duplicate component is waste.
+   **Component reuse check:** Before designing new UI elements, quickly scan `docs/teams/eldato-app-team/domains (S1)/ux/component_catalog.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`) — it documents 35 shadcn/ui primitives and 80+ custom components already in the codebase. Prefer existing over new; a duplicate component is waste.
 4. **Classify decisions** — do any decisions match the taxonomy?
 5. **Present design** — scaled to complexity (see Gating Rules below)
 6. **Write design doc** — first run the Pre-flight: Worktree Check below, then save to `docs/plans/YYYY-MM-DD-<topic>-design.md` and commit

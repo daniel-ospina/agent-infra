@@ -6,7 +6,7 @@
 
 Announce at start: "I'm using the strategy-builder skill. Pi uses DeepSeek v4 Pro by default. For complex reasoning, dispatch sub-agents via the task tool."
 
-Design doc: `docs/teams/eldato-outreach-team/growth/2026-03-14-strategy-framework-design.md`
+Design doc: `docs/teams/eldato-outreach-team/domains (S1)/growth/2026-03-14-strategy-framework-design.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`)
 
 ---
 
@@ -43,14 +43,14 @@ If mixed (some sections populated, others empty), ask:
 
 ## Artifacts
 
-All output is written to disk at phase boundaries. Conversation history is secondary to files.
+All output is written to disk at phase boundaries. Conversation history is secondary to files. *(Artifact paths below use the eldato repo layout — `docs/teams/eldato-app-team/domains (S1)/...`. Fetch existing docs: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`.)*
 
 | Artifact | Path | Purpose |
 |---|---|---|
-| Philosophy | `docs/teams/eldato-app-team/product/philosophy.md` | Identity/ethos (VSM System 5) |
-| Strategy | `docs/teams/eldato-app-team/product/strategy.md` | Comprehensive GTM strategy (VSM System 4) |
-| Experiments | `docs/teams/eldato-app-team/product/experiments.md` | Experiment tracker |
-| Earned Secrets | `docs/teams/eldato-app-team/product/earned_secrets.md` | Field insights + field notes |
+| Philosophy | `docs/teams/eldato-app-team/domains (S1)/product/philosophy.md` | Identity/ethos (VSM System 5) |
+| Strategy | `docs/teams/eldato-app-team/domains (S1)/product/strategy.md` | Comprehensive GTM strategy (VSM System 4) |
+| Experiments | `docs/teams/eldato-app-team/domains (S1)/product/experiments.md` | Experiment tracker |
+| Earned Secrets | `docs/teams/eldato-app-team/domains (S1)/product/earned_secrets.md` | Field insights + field notes |
 | Research Dump | `docs/09_strategy/research/YYYY-MM-DD-<mode>.md` | Raw research preservation |
 
 Ensure `docs/09_strategy/research/` exists at start: `mkdir -p docs/09_strategy/research`

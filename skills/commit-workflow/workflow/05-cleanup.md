@@ -29,7 +29,7 @@ If not in a worktree: skip silently.
 
 After merge, update relevant documentation (scope: only what actually changed):
 
-1. Read `docs/teams/organisation-design-team/operations/00_index.md` to identify applicable documentation areas
+1. Read `docs/teams/organisation-design-team/domains (S1)/operations/00_index.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`) to identify applicable documentation areas
 2. Check the linked GitHub issue for explicit doc update notes
 3. Update as appropriate:
    - `MEMORY.md` — if architectural decisions, key files, or patterns changed

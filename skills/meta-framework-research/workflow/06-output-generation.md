@@ -9,7 +9,7 @@ Read `research/04-synthesis-map.yaml` and `research/05-gaps.md`.
 If synthesis was split (research/04-ontology-tree.md exists), read that too.
 
 ### 6.2 Determine Output Path
-`docs/teams/<team>/<domain>/meta-framework.md`
+`docs/teams/<team>/domains (S1)/<domain>/meta-framework.md` (eldato repo layout — the destination repo's docs/teams tree; fetch existing: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`)
 
 Create parent directories if needed.
 

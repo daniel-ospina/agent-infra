@@ -247,7 +247,7 @@ When writing or updating any doc in `docs/`, auto-populate entity metadata from 
 - If ambiguous, ask: "This doc references entity X — is that correct?"
 - Never leave entity fields empty when context is available
 
-<!-- REPO-SPECIFIC: Reference your ontology doc for entity types and predicates (e.g., ONTOLOGY.md §1.1 for types, §2.2 for predicates) -->
+<!-- REPO-SPECIFIC: Reference your ontology doc for entity types and predicates. Canonical ontology: tortoise repo `docs/ONTOLOGY.md` (v3.1) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§1.1 types, §2.2 predicates). In repos that keep a docs/teams tree (eldato layout), reference `docs/teams/<team>/domains (S1)/<domain>/ONTOLOGY.md` if present. -->
 
 ## Memory Hygiene
 
@@ -266,7 +266,7 @@ Format: `[category]: [what broke] → [root cause] → [the fix]`
 |---------|--------|
 | Task complete (code gotcha) | `MEMORY.md` (cap 150 lines) |
 | Task complete (no gotcha) | Plan doc `## Learnings` |
-| Bug fixed | `docs/teams/<team>/<domain>/gotchas.md` + `MEMORY.md` |
+| Bug fixed | `docs/teams/<team>/domains (S1)/<domain>/gotchas.md` (eldato layout) + `MEMORY.md` |
 | Session complete | Your session postmortem + `MEMORY.md` for friction patterns |
 -->
 

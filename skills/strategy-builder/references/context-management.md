@@ -36,11 +36,11 @@ When ending a session:
 
 ```
 Continue strategy-builder in [mode] mode.
-Read ALL artifacts:
-- docs/teams/eldato-app-team/product/strategy.md
-- docs/teams/eldato-app-team/product/philosophy.md
-- docs/teams/eldato-app-team/product/experiments.md
-- docs/teams/eldato-app-team/product/earned_secrets.md
+Read ALL artifacts (strategy/product docs live in the eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`):
+- docs/teams/eldato-app-team/domains (S1)/product/strategy.md
+- docs/teams/eldato-app-team/domains (S1)/product/philosophy.md
+- docs/teams/eldato-app-team/domains (S1)/product/experiments.md
+- docs/teams/eldato-app-team/domains (S1)/product/earned_secrets.md
 - docs/09_strategy/research/YYYY-MM-DD-full-build.md (latest research dump)
 Resume from Phase [N]. Previous session completed through Phase [N-1].
 [Any specific context]

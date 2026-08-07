@@ -4,7 +4,7 @@
  * Covers: HTML stripping, Perplexity key resolution, timeout constants,
  * regression tests for known bugs (#5838, #5526, #5954, #5955).
  *
- * Run: npx tsx operations/pi-config/extensions/builtin-tools/builtin-tools.test.ts
+ * Run: npx tsx extensions/builtin-tools/builtin-tools.test.ts
  *
  * NOTE: Requires mocks at node_modules/@earendil-works/pi-coding-agent and
  * node_modules/typebox. Created by CI setup or manually.

@@ -63,7 +63,7 @@ Single source of truth: `.agents/skills/carousel-b2b-design/scripts/tokens.json`
 ### Safe Zones (1080×1080 square canvas)
 
 **Canonical source:** `tokens.json` → `safeZones` key. Values below are the authoritative reference.
-Also documented in `docs/teams/organisation-design-team/capability/2026-06-21-instagram-format-research.md` for context.
+Also documented in `docs/teams/organisation-design-team/domains (S1)/capability/2026-06-21-instagram-format-research.md` (eldato repo) for context.
 
 | Zone | X Range | Y Range | Reason |
 |------|---------|---------|--------|
@@ -220,7 +220,7 @@ Return gate results to `carousel-b2b-strategy`. Pass/fail with specific issues. 
 - Integration: wired into `carousel-b2b-strategy` at Steps 3.6 (Gate 1) and 6.5 (Gate 2) via #4403. Original skill scaffolding: #4304.
 - Design tokens: `.agents/skills/carousel-b2b-design/scripts/tokens.json`
 - Build script: `.agents/skills/carousel-b2b-design/scripts/build_carousel.cjs`
-- Instagram format research: `docs/teams/organisation-design-team/capability/2026-06-21-instagram-format-research.md`
+- Instagram format research: `docs/teams/organisation-design-team/domains (S1)/capability/2026-06-21-instagram-format-research.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`)
 - Epic research: `docs/epics/2026-06-21-frontend-design-upgrade-research.md`
 - Layout composer: #4291 (implements slide templates per these rules)
 - Visual hierarchy linter (#4292): `.agents/skills/carousel-b2b-design/scripts/linter.mjs` (Gate 2 automated checks)

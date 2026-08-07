@@ -1,6 +1,6 @@
 /**
  * session-affinity.test.ts — unit tests for loop-enforcer session routing functions.
- * Run: npx tsx operations/pi-config/extensions/loop-enforcer/session-affinity.test.ts
+ * Run: npx tsx extensions/loop-enforcer/session-affinity.test.ts
  */
 
 import { shouldResumeLoop, readSessionContext } from "./index.js";

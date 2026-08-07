@@ -11,7 +11,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 
 ## Research Discipline
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 This skill follows the [research-protocol](../reference/research-protocol/SKILL.md). Tier 3 integration (protocol sits beside — existing adversarial review protocol stays; protocol adds domain detection + Estuarine Mapping).
 

@@ -1310,7 +1310,9 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
       _setEnv("SESSION_TEAM", startTeam);
       if (startRole && startRole !== "role") _setEnv("SESSION_ROLE", startRole);
     } else {
-      // ponytail: detect team from CWD (docs/teams/<team>/) as fallback
+      // ponytail: detect team from CWD (docs/teams/<team>/) as fallback — the
+      // eldato repo keeps docs/teams/<team>/domains (S1)/<domain>/; SESSION_TEAM
+      // is normally set by the session context, so this is a best-effort fallback.
       const cwd = ctx.cwd || process.cwd();
       const teamsMatch = cwd.match(/docs\/teams\/([^/]+)/);
       if (teamsMatch) _setEnv("SESSION_TEAM", teamsMatch[1]);

@@ -48,8 +48,10 @@ gh auth status >/dev/null 2>&1 || { echo "❌ gh not authenticated. Run: gh auth
 # 3. Playwright (needed for rendering)
 npx playwright --version >/dev/null 2>&1 || { echo "❌ Playwright not found."; echo "   Run: npx playwright install chromium"; exit 1; }
 
-# 4. Fonts (needed for brand typography)
-[ -f operations/pi-config/skills/carousel-b2b-design/scripts/fonts/outfit.ttf ] || { echo "❌ Fonts missing."; echo "   Run: git pull origin main"; exit 1; }
+# 4. Fonts (needed for brand typography) — present either in this repo (skills/) or linked (operations/pi-config/skills/)
+if [ ! -f skills/carousel-b2b-design/scripts/fonts/outfit.ttf ] && [ ! -f operations/pi-config/skills/carousel-b2b-design/scripts/fonts/outfit.ttf ]; then
+  echo "❌ Fonts missing."; echo "   Run: git pull origin main"; exit 1;
+fi
 
 # 5. Node.js
 type node >/dev/null 2>&1 || { echo "❌ Node.js not found."; echo "   Install Node.js ≥20: https://nodejs.org"; exit 1; }
@@ -67,7 +69,7 @@ node -e "require('yaml')" >/dev/null 2>&1 || { echo "❌ 'yaml' npm package not 
 **Common fixes for Klara's machine:**
 - No Homebrew → install gh directly from https://github.com/cli/cli/releases/latest
 - No Node.js → install via nvm (works without sudo): `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash`
-- Skills not showing → symlink missing: see `operations/pi-config/README.md` Step 7
+- Skills not showing → symlink missing: in consumer repos skills link to `operations/pi-config/skills/` (see `scripts/link-skills.sh`); in agent-infra they live in `skills/` directly
 - Running from main checkout → create a worktree or set `ELDATO_ALLOW_MAIN_EDITS=1`
 
 If ALL checks pass, proceed with the carousel. Otherwise, surface the first failure with its fix.
@@ -679,8 +681,8 @@ The orchestrator edits files directly or dispatches focused sub-agents. This mir
 
 - [Creative Brief Template](reference/creative-brief-template.md)
 - [Voice Profiles](reference/voice-profiles.md)
-- [Epic Doc](../../../docs/teams/organisation-design-team/capability/2026-06-16-carousel-skill.md)
-- [Research Brief](../../../docs/teams/organisation-design-team/capability/2026-06-16-carousel-skill-research.md)
+- [Epic Doc](../../../docs/teams/organisation-design-team/domains (S1)/capability/2026-06-16-carousel-skill.md) — eldato repo (fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`)
+- [Research Brief](../../../docs/teams/organisation-design-team/domains (S1)/capability/2026-06-16-carousel-skill-research.md) — eldato repo (fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`)
 
 - [Instagram Auth Reference](reference/instagram-auth.md)
 ---

@@ -92,9 +92,9 @@ When ending a session mid-pipeline:
 
 ```
 Continue strategy-to-pitch-components in [Full Build / Incremental] mode.
-Read ALL artifacts:
-- docs/teams/eldato-app-team/product/strategy.md
-- docs/teams/eldato-app-team/product/philosophy.md
+Read ALL artifacts (strategy/product docs live in the eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`):
+- docs/teams/eldato-app-team/domains (S1)/product/strategy.md
+- docs/teams/eldato-app-team/domains (S1)/product/philosophy.md
 - docs/09_strategy/sales-research-brief.md
 - docs/09_strategy/research/YYYY-MM-DD-pitch-components.md (latest research dump)
 - eldato-outreach: src/lib/pitch-components/pitch-components.ts (if exists)

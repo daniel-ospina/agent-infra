@@ -49,7 +49,7 @@ steps:
 
 Pipeline-gated debugging — classifies bug complexity and routes through issue-workflow.
 
-> **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
+> **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
 ## Pipeline Integration
 
@@ -151,7 +151,7 @@ If you catch yourself thinking:
 - `../task-workflow-standard/SKILL.md` — Gated pipeline (standard/complex tasks)
 - `../project-workflow/SKILL.md` — Proportional pipeline (medium/complex bugs, project level)
 - `../verification-before-completion/SKILL.md` — Verify fix worked
-- `docs/teams/organisation-design-team/data/ONTOLOGY.md` — Pipeline stages
+- `tortoise/docs/ONTOLOGY.md` (v3.1) — pipeline stages / workflow statuses (§2 Procedural layer, §3.2)
 
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

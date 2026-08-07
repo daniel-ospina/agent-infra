@@ -5,42 +5,47 @@
  * O/I/T fields in manifest: objective, indicators[], target_ambition.
  * Parent/child loop decomposition with V-level inheritance.
  */
-import { writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { execFileSync } from "node:child_process";
 
 const LOOPS_DIR = join(homedir(), ".pi", "agent", "loops");
-const SUBJECTS_DIR = join(process.cwd(), "operations", "subjects");
 
-function resolveSubject(slug: string): { team: string; role?: string } | null {
-  if (!existsSync(SUBJECTS_DIR)) return null;
-  
-  const files = readdirSync(SUBJECTS_DIR).filter(f => f.endsWith('.yaml'));
-  
-  for (const file of files) {
-    try {
-      const content = readFileSync(join(SUBJECTS_DIR, file), 'utf-8');
-      
-      // Check if slug is a team slug
-      const teamMatch = content.match(/^team:\s*\n\s+slug:\s+(\S+)/m);
-      const teamSlug = teamMatch ? teamMatch[1] : null;
-      
-      if (teamSlug === slug) {
-        return { team: teamSlug };
-      }
-      
-      // Check if slug is a role within this team
-      const rolePattern = new RegExp(`^\\s{2}${slug}:`, 'm');
-      if (rolePattern.test(content) && teamSlug) {
-        return { team: teamSlug, role: slug };
-      }
-    } catch {
-      // ponytail: skip unparseable files
-      continue;
+/**
+ * Resolve a subject (team or role slug) from the swarm Supabase SOR via the
+ * agent-infra helper scripts/swarm-org.mjs (issue #102 — supersedes the dead
+ * eldato-era operations/subjects/*.yaml tree).
+ * Env: SUPABASE_URL_ORG_DATA + SUPABASE_SERVICE_ROLE_KEY_ORG_DATA (swarm repo).
+ * Degrades gracefully: returns null when the helper is missing or creds unset.
+ */
+function resolveSubject(slug: string): { team: string | null; role?: string } | null {
+  try {
+    const script = join(process.cwd(), "scripts", "swarm-org.mjs");
+    if (!existsSync(script)) {
+      console.warn(`[loop-enforcer] ⚠️ scripts/swarm-org.mjs not found in cwd — run from the agent-infra checkout to resolve "--for" subjects (swarm Supabase SOR).`);
+      return null;
     }
+    const out = execFileSync(
+      "node", [script, "resolve-role", slug],
+      { encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    const parsed = JSON.parse(out);
+    if (!parsed.found) {
+      // Fall back: treat slug as a team slug
+      const teams = execFileSync(
+        "node", [script, "list-teams"],
+        { encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] },
+      );
+      const rows = JSON.parse(teams).teams || [];
+      if (rows.some((t: { slug: string }) => t.slug === slug)) return { team: slug };
+      return null;
+    }
+    return { team: parsed.team || null, role: parsed.role };
+  } catch (e: any) {
+    console.warn(`[loop-enforcer] ⚠️ Subject resolution failed (${e?.message || e}) — --for flag has no effect.`);
+    return null;
   }
-  
-  return null;
 }
 
 
@@ -131,7 +136,7 @@ export function buildGoalSpec(args: string): GoalSpec {
   const forSlug = forMatch ? forMatch[1] : undefined;
   const resolved = forSlug ? resolveSubject(forSlug) : null;
   if (forSlug && !resolved) {
-    console.warn(`[loop-enforcer] ⚠️ Subject "${forSlug}" not found in operations/subjects/ — --for flag has no effect.`);
+    console.warn(`[loop-enforcer] ⚠️ Subject "${forSlug}" not found in swarm Supabase SOR — --for flag has no effect.`);
   }
   const team = resolved?.team;
   const role = resolved?.role;
