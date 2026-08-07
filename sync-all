@@ -1,0 +1,11 @@
+#!/bin/bash
+# sync-all — propagate agent-infra updates into every linked product repo.
+#
+# Thin wrapper around `./sync --all` (single source of truth lives in `sync`).
+# A repo is "linked" when it contains .agent-infra-version; linked repos are
+# discovered under $AGENT_INFRA_REPOS_ROOT (default ~/Documents/GitHub).
+#
+# NOTE: this PROPAGATES agent-infra INTO product repos (modifies files there).
+# To PULL the latest agent-infra onto this machine instead, run ./sync.sh.
+set -euo pipefail
+exec "$(dirname "$0")/sync" --all "$@"

@@ -1,0 +1,127 @@
+#!/bin/bash
+# sync — propagate agent-infra updates into product repos.
+#
+# Usage:
+#   ./sync <repo>      Propagate agent-infra updates into one linked repo
+#   ./sync --all       Propagate into every linked repo (what sync-all runs)
+#   ./sync --list      List linked repos and their version status (read-only)
+#
+# A repo is "linked" when it contains a `.agent-infra-version` file (written by
+# `agent-infra init` / `agent-infra update`). For each linked repo this runs
+# `agent-infra update` from inside it, which refreshes symlinks, copies missing
+# templates (AGENTS.md, .mcp.json, .husky/), and bumps the version pin.
+#
+# Repos are resolved under $AGENT_INFRA_REPOS_ROOT (default ~/Documents/GitHub);
+# override the env var to include repos outside the default location.
+#
+# NOTE: this PROPAGATES agent-infra INTO product repos (modifies files there).
+# To PULL the latest agent-infra onto this machine instead, run ./sync.sh.
+set -euo pipefail
+
+AGENT_INFRA_PATH="${AGENT_INFRA_PATH:-$(cd "$(dirname "$0")" && pwd)}"
+REPOS_ROOT="${AGENT_INFRA_REPOS_ROOT:-$HOME/Documents/GitHub}"
+CLI="$AGENT_INFRA_PATH/bin/agent-infra.js"
+export AGENT_INFRA_PATH
+
+command -v node >/dev/null 2>&1 || { echo "❌ node not found — required to run $CLI" >&2; exit 1; }
+
+failures=0
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./sync <repo>      Propagate agent-infra updates into one linked repo
+  ./sync --all       Propagate into every linked repo (same as ./sync-all)
+  ./sync --list      List linked repos and their version status (read-only)
+
+A repo is "linked" when it contains .agent-infra-version (written by
+`agent-infra init` / `agent-infra update`). Repos are resolved under
+$AGENT_INFRA_REPOS_ROOT (default ~/Documents/GitHub).
+
+To pull the latest agent-infra onto this machine instead: ./sync.sh
+EOF
+}
+
+die() { echo "❌ $*" >&2; exit 1; }
+
+# Print one dir per linked repo (contains .agent-infra-version), sorted.
+discover_linked() {
+  find "$REPOS_ROOT" -maxdepth 2 -mindepth 2 -type f -name .agent-infra-version -exec dirname {} \; | sort -u
+}
+
+# Resolve a repo name to an absolute path, erroring if missing/unlinked.
+resolve_repo() {
+  local name="$1" dir="$REPOS_ROOT/$1"
+  [ -d "$dir" ] || die "no such repo: $dir (is AGENT_INFRA_REPOS_ROOT correct?)"
+  [ -f "$dir/.agent-infra-version" ] || die "$name is not linked to agent-infra — run: cd $dir && npx agent-infra init"
+  printf '%s\n' "$dir"
+}
+
+# Run agent-infra update inside one repo; report failure without aborting the run.
+sync_one() {
+  local dir="$1" name
+  name="$(basename "$dir")"
+  echo ""
+  echo "── $name"
+  if (cd "$dir" && node "$CLI" update); then
+    echo "   ✅ $name synced"
+  else
+    echo "   ⚠️  $name failed — see output above" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+list_linked() {
+  local dir version current found=0 status
+  [ -d "$REPOS_ROOT" ] || die "REPOS_ROOT not found: $REPOS_ROOT"
+  current="$(node -e "console.log(require('$AGENT_INFRA_PATH/manifest.json').version)")"
+  echo "Linked repos under $REPOS_ROOT (agent-infra v$current):"
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    found=1
+    version="$(cat "$dir/.agent-infra-version" | tr -d '[:space:]')"
+    if [ "$version" = "$current" ]; then
+      status="✓ current"
+    else
+      status="⚠️  pinned $version → needs sync"
+    fi
+    printf '   %-22s %s\n' "$(basename "$dir")" "$status"
+  done < <(discover_linked)
+  [ "$found" = "1" ] || echo "   (none)"
+}
+
+# --help anywhere in the args wins (never run a sync by accident)
+for arg in "$@"; do
+  case "$arg" in --help|-h) usage; exit 0 ;; esac
+done
+
+case "${1:-}" in
+  --help|-h) usage ;;
+  --list)    list_linked ;;
+  --all)
+    [ $# -eq 1 ] || die "--all takes no additional arguments (got: $*)"
+    [ -d "$REPOS_ROOT" ] || die "REPOS_ROOT not found: $REPOS_ROOT"
+    found=0
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      found=1
+      sync_one "$dir"
+    done < <(discover_linked)
+    [ "$found" = "1" ] || echo "No linked repos found under $REPOS_ROOT."
+    ;;
+  "")
+    usage
+    exit 1
+    ;;
+  *)
+    dir="$(resolve_repo "$1")" || exit 1
+    sync_one "$dir"
+    ;;
+esac
+
+if [ "$failures" -gt 0 ]; then
+  echo ""
+  echo "⚠️  $failures repo(s) failed — see output above." >&2
+  exit 1
+fi
+exit 0
