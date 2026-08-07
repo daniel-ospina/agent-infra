@@ -82,6 +82,41 @@ check_no_nesting() {
   fi
 }
 
+# Assert every materialized extension under $1 matches extensions/ byte-for-byte
+# (single source of truth, issue #95). Entries named after $2... are skipped
+# (they are farm symlinks in this run, not materialized copies). Test files are
+# never shipped (pi-config wires only real extensions).
+check_content_matches() {
+  local dest_ext="$1" label="$2" base e s
+  shift 2
+  for e in "$ROOT"/extensions/*; do
+    [ -e "$e" ] || continue
+    base="$(basename "$e")"
+    case "$base" in
+      *.test.ts) continue ;;
+    esac
+    for s in "$@"; do
+      [ "$s" = "$base" ] && continue 2
+    done
+    [ -e "$dest_ext/$base" ] || { fail "$label: installed $base missing"; continue; }
+    if diff -rq "$e" "$dest_ext/$base" >/dev/null 2>&1; then
+      echo "ok: $label installed $base == extensions/$base"
+    else
+      fail "$label: installed $base differs from extensions/$base (stale copy!)"
+    fi
+  done
+}
+
+# Assert the #36/#101 fixes are present in the INSTALLED code (the exact drift
+# issue #95 caught: fresh machines shipping pre-fix extensions).
+check_fix_markers() {
+  local ext="$1" label="$2"
+  grep -q "getSubAgentPath" "$ext/subagent/index.ts" \
+    || fail "$label: installed subagent missing getSubAgentPath (#101 fix not shipped)"
+  grep -q "#36" "$ext/builtin-tools/index.ts" \
+    || fail "$label: installed builtin-tools missing #36 PATH augmentation"
+}
+
 run_setup() {
   echo "---- setup.sh run (HOME=$HOME_DIR) ----" >> "$RUNS_LOG"
   bash "$CLONE/pi-bootstrap/setup.sh" >> "$RUNS_LOG" 2>&1
@@ -122,6 +157,8 @@ fi
   || fail "shared link target changed (now: $(readlink "$DEST/extensions/shared" 2>/dev/null))"
 grep -q "farm symlinks kept" "$RUNS_LOG" \
   || fail "run 1 did not report kept farm links"
+check_content_matches "$DEST/extensions" "run1" mcp-client shared
+check_fix_markers "$DEST/extensions" "run1"
 
 # --- run 2: re-run must refresh the ACTIVE files --------------------------
 # (a) a dest mutation must be overwritten by the source (content-merge);
@@ -206,6 +243,33 @@ else
 fi
 [ -d "$DEST/skills" ] && [ -n "$(ls -A "$DEST/skills" | head -1)" ] \
   || fail "replaced skills folder is empty"
+
+# --- run 5: completely fresh extensions install (no pre-existing farm) --------
+# The exact issue #95 acceptance: a machine with NO prior state must receive the
+# CURRENT extension code, as real materialized copies (not links to a clone).
+echo "== run 5: fresh extensions install, zero pre-existing links"
+rm -rf "$DEST/extensions"
+run_setup
+
+links_found="$(find "$DEST/extensions" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$links_found" -eq 0 ]; then
+  echo "ok: fresh install materialized real copies (no symlinks)"
+else
+  fail "fresh install left $links_found symlink(s) in $DEST/extensions"
+fi
+check_content_matches "$DEST/extensions" "run5"
+check_fix_markers "$DEST/extensions" "run5"
+check_no_nesting "$DEST" "dest-after-run5"
+
+# --- run 6: stale materialized copies self-heal on re-run ---------------------
+# A previously-bootstrapped machine has real copies (possibly stale). Re-running
+# setup.sh must refresh them to CURRENT extensions/ content.
+echo "== run 6: stale DEST copies refreshed to current extensions/ content"
+echo "# stale mutation" >> "$DEST/extensions/subagent/index.ts"
+echo "# stale mutation" >> "$DEST/extensions/builtin-tools/index.ts"
+run_setup
+check_content_matches "$DEST/extensions" "run6"
+check_fix_markers "$DEST/extensions" "run6"
 
 # --- done -----------------------------------------------------------------
 if [ "$FAILURES" -gt 0 ]; then

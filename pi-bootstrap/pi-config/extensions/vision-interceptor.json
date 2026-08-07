@@ -1,4 +1,1 @@
-{
-  "provider": "openrouter",
-  "comment": "Forced to openrouter (cheaper gpt-4o vision vs Anthropic's claude-sonnet-4-5). Was 'auto' — detected ANTHROPIC_API_KEY and burned credits."
-}
+../../../extensions/vision-interceptor.json
