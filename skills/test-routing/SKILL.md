@@ -41,7 +41,7 @@ The canonical registry of verification domains and their destinations. New sub-s
 | Domain | Detection | Destinations (this epic) | Destinations (deferred) |
 |--------|----------|--------------------------|------------------------|
 | **code** | Surface map has DB/API/state surfaces | test-writing (unit), test-integration, test-e2e, check:coverage-pruning, check:arch:changed, check:mutation | — |
-| **content** | Issue has content/editorial/deal labels | content-verification → content-strategy-agent | — |
+| **content** | Issue has content/editorial/deal labels | content-verification → content-reviewer-breadth + content-reviewer-depth (parallel) → content-fact-checker-writing | — |
 | **config** | Changes to config files, env vars, CI | config-validation → scripts/check-* | — |
 | **research** | Issue is research/investigation | research-verification → research skill adversarial review | — |
 | **ux** | UI changes, new components, style changes | ux-verification | ux-path-auditor (existing, for UX=high) |

@@ -36,10 +36,11 @@ Invoked by `test-routing` when domain=content is detected. Also the Content-doma
 | Input | Source | Notes |
 |-------|--------|-------|
 | Draft content | Writer skill output | intro, body, FAQs, meta fields (page_type-specific) |
-| Research brief | Content research (fact-checked) | Verified claims, ✓/~/✗ tags |
+| Research brief | Content research (fact-checked) | Verified claims, ✓/~/✗ tags (breadth/depth source; deal mode uses the Deal Research Brief with confidence tags) |
+| Deal Research Brief | deal-content-writer Step 0.5 (deal mode only) | specialty_facts, practical_tips, confidence tags — source for breadth B-D1–B-D4 / depth D-D1–D-D3 |
+| deal_id | Orchestrator (deal mode only) | resolves the deal DB record — used ONLY by fact-checker D1–D5 |
 | page_type | Orchestrator | `editorial` \| `guide` \| `deal` \| `refresh` |
 | Language | Orchestrator | es/en — determines audience consistency checks |
-| Deal DB record | (deal mode only) | value_mechanism, access_conditions, business.name, category |
 
 ## Process
 
@@ -52,7 +53,7 @@ Domain: content
 page_type: editorial | guide | deal | refresh
 ```
 
-Gather the draft content, research brief, page_type, and language. If page_type = `deal`, note that reviewers run deal-mode checks (breadth B-D1–B-D4, depth D-D1–D-D3, fact-checker D1–D5) against the deal DB record.
+Gather the draft content, research brief, page_type, and language. If page_type = `deal`, run deal-mode checks: breadth B-D1–B-D4 and depth D-D1–D-D3 read the **Deal Research Brief** (specialty_facts, practical_tips, confidence tags) — they do NOT need a DB audit; only fact-checker D1–D5 reads the **deal DB record** (value_mechanism, access_conditions, business.name, category).
 
 ### Step 2 — Fan-Out Breadth + Depth Reviewers (Parallel)
 
@@ -113,7 +114,7 @@ Fact-check is itself a gate — run its refinement loop until 0 issues or the 10
 
 **Invoked by:** `test-routing` (domain=content), `research-verification` (content-pipeline research deferral), `issue-creation` (Content verification trigger)
 **Dispatches to:** `content-reviewer-breadth`, `content-reviewer-depth` (parallel), `content-fact-checker-writing`
-**Consumed by:** `code-review` (verification gate check)
+**Consumed by:** verification-gate checks in `test-routing` (Content domain dispatch) and `research-verification` / `issue-creation` references.
 
 ## What Fails If You Skip
 
