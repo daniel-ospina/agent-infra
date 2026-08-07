@@ -473,7 +473,7 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(
         Type.String({
           description:
-            "Model to use (default: deepseek-v4-flash). Use 'deepseek-v4-pro' or 'claude-sonnet' only when the task genuinely needs deeper reasoning.",
+            "Model to use (default: deepseek-v4-flash).",
         })
       ),
       mcp_servers: Type.Optional(
