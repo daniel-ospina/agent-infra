@@ -224,7 +224,10 @@ class McpServerManager {
       );
     } else if (config.command) {
       // Stdio transport (local process)
-      const env = { ...process.env, ...(config.env ?? {}) };
+      // Expand ${VAR} placeholders in config.env (same as headers above) so
+      // servers like @houtini/gemini-mcp receive real values, not literal
+      // "${VAR}" strings (e.g. GEMINI_API_KEY). See tortoise issue #240.
+      const env = { ...process.env, ...(config.env ? expandEnvVars(config.env) : {}) };
       transport = new StdioClientTransport({
         command: config.command,
         args: config.args ?? [],
