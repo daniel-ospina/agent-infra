@@ -68,7 +68,7 @@ A repo counts as **linked** when it contains a `.agent-infra-version` file (writ
 Per-repo equivalent (what `sync` runs under the hood):
 
 ```bash
-cd <target-repo> && npx agent-infra update
+cd <target-repo> && node "$AGENT_INFRA_PATH/bin/agent-infra.js" update
 ```
 
 Each repo's pre-commit hook (copied from `templates/.husky/`) **blocks** commits when `.agent-infra-version` is behind — run `agent-infra update` or `./sync <repo>` to fix.
