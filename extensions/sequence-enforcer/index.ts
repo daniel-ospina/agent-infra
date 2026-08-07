@@ -184,6 +184,14 @@ function loadSteps(skillPath: string): Step[] | null {
 
   try {
     // ponytail: execFileSync bypasses shell — absPath via argv, no injection vector
+    //
+    // skill_declaration.py is an eldato-era tool that was never vendored into
+    // agent-infra (extension extracted in #7549 without its Python dep). Rather
+    // than fail-closed on the phantom module, the bridge tries it first (in case
+    // a repo vendors operations/tools/), then falls back to parsing the `steps:`
+    // list from the SKILL.md frontmatter directly — same Step schema, no missing
+    // module dependency. This eliminates the boot-time ModuleNotFoundError
+    // noise in sub-agent stderr (#489 class).
     const json = execFileSync(process.env.AGENT_PYTHON3 || "python3", [
       "-c",
       [
@@ -194,23 +202,65 @@ function loadSteps(skillPath: string): Step[] | null {
         "        os.environ.get('PYTHONPATH',''),",
         "        os.path.join(os.environ.get('AGENT_INFRA_PATH',''), '..', 'operations', 'tools'),",
         "        os.path.join(os.environ.get('HOME',''), 'eldato', 'operations', 'tools'),",
-        "        os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), '..', '..', '..', 'operations', 'tools'),",
         "    ]",
         "    for c in candidates:",
         "        for part in c.split(os.pathsep):",
         "            if part and os.path.isfile(os.path.join(part, 'skill_declaration.py')):",
         "                return part",
         "    return ''",
-        "_tools = _find_tools_dir()",
-        "if _tools: sys.path.insert(0, _tools)",
-        "from skill_declaration import extract_steps_from_skill",
-        "steps = extract_steps_from_skill(sys.argv[1])",
-        "print(json.dumps([{k: v for k, v in s.__dict__.items() if not k.startswith('_')} for s in (steps or [])]))",
+        "def _try_module(path):",
+        "    _tools = _find_tools_dir()",
+        "    if _tools: sys.path.insert(0, _tools)",
+        "    try:",
+        "        from skill_declaration import extract_steps_from_skill",
+        "        steps = extract_steps_from_skill(path)",
+        "        return [{k: v for k, v in s.__dict__.items() if not k.startswith('_')} for s in (steps or [])]",
+        "    except ImportError:",
+        "        return None  # module not vendored — fall back to frontmatter parse",
+        "def _try_frontmatter(path):",
+        "    import re",
+        "    try:",
+        "        import yaml",
+        "    except ImportError:",
+        "        return []",
+        "    try:",
+        "        text = open(path, encoding='utf-8').read()",
+        "    except OSError:",
+        "        return []",
+        "    m = re.match(r'\\A---\\n(.*?)\\n---', text, re.DOTALL)",
+        "    if not m:",
+        "        return []",
+        "    try:",
+        "        fm = yaml.safe_load(m.group(1)) or {}",
+        "    except yaml.YAMLError:",
+        "        return []",
+        "    steps = fm.get('steps') or []",
+        "    if not isinstance(steps, list):",
+        "        return []",
+        "    out = []",
+        "    for s in steps:",
+        "        if not isinstance(s, dict):",
+        "            continue",
+        "        out.append({",
+        "            'name': s.get('name', ''),",
+        "            'type': s.get('type', 'skill'),",
+        "            'skill': s.get('skill', ''),",
+        "            'requires': s.get('requires', []) or [],",
+        "            'produces': s.get('produces', []) or [],",
+        "            'gate': s.get('gate', 'auto'),",
+        "            'retry': s.get('retry', 1),",
+        "            'timeout_seconds': s.get('timeout_seconds', 0),",
+        "        })",
+        "    return out",
+        "_steps = _try_module(sys.argv[1])",
+        "if _steps is None:",
+        "    _steps = _try_frontmatter(sys.argv[1])",
+        "print(json.dumps(_steps))",
       ].join("\n"),
       absPath,
     ], {
       encoding: "utf-8",
-      timeout: 5000,  // ponytail: 5s for cold Python import (skill_declaration + pyyaml)
+      timeout: 5000,  // ponytail: 5s for cold Python import (yaml)
     }).trim();
     const steps: Step[] = JSON.parse(json);
     stepCache.set(skillPath, steps.length > 0 ? steps : null);
