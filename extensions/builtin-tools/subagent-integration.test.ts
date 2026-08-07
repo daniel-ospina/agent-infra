@@ -26,7 +26,7 @@ function section(name: string) { console.log(`\n${name}:`); }
 // Spawn pi, capture stderr for startupWindowMs, then kill
 function spawnAndCapture(env: Record<string, string>, startupWindowMs = 20_000): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = spawn("pi", ["-p", "--provider", "deepseek", "--model", "deepseek-v4-pro", "--no-session", "echo ok"], {
+    const proc = spawn("pi", ["-p", "--provider", "deepseek", "--model", "deepseek-v4-flash", "--no-session", "echo ok"], {
       cwd: process.cwd(),
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],

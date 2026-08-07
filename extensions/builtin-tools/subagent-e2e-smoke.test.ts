@@ -77,7 +77,7 @@ section("Full-dispatch E2E");
 tests.push(test("sub-agent computes SHA-256 and returns correct hash", async () => {
   const prompt = `Read ${TEST_FILE}, compute SHA-256, return JSON: {"hash":"<hex>"}. ONLY the JSON.`;
   const { stdout, code } = await spawnPi(
-    ["-p", "--provider", "deepseek", "--model", "deepseek-v4-pro", "--no-session", prompt],
+    ["-p", "--provider", "deepseek", "--model", "deepseek-v4-flash", "--no-session", prompt],
     SKIP_ENV,
   );
   ok(code === 0 || code === null, `exit: ${code}`);
