@@ -41,7 +41,7 @@ The canonical registry of verification domains and their destinations. New sub-s
 | Domain | Detection | Destinations (this epic) | Destinations (deferred) |
 |--------|----------|--------------------------|------------------------|
 | **code** | Surface map has DB/API/state surfaces | test-writing (unit), test-integration, test-e2e, check:coverage-pruning, check:arch:changed, check:mutation | — |
-| **content** | Issue has content/editorial/deal labels | content-verification → content-strategy-agent | — |
+| **content** | Issue has content/editorial/deal labels | content-verification → content-reviewer-breadth + content-reviewer-depth (parallel) → content-fact-checker-writing | — |
 | **config** | Changes to config files, env vars, CI | config-validation → scripts/check-* | — |
 | **research** | Issue is research/investigation | research-verification → research skill adversarial review | — |
 | **ux** | UI changes, new components, style changes | ux-verification | ux-path-auditor (existing, for UX=high) |
@@ -75,15 +75,15 @@ Accessibility=high   → + full accessibility audit
 | test-writing | `../test-writing/SKILL.md` | existing | code (unit, includes PBT guidance) |
 | test-design | `../test-design/SKILL.md` | existing | code (planning, includes PBT guidance) |
 | test-review | `../test-review/SKILL.md` | existing | code (quality) |
-| test-integration | `../test-integration/SKILL.md` | new (#6065) | code (integration) |
-| test-e2e | `../test-e2e/SKILL.md` | new (#6066) | code (e2e) |
+| test-integration | `../test-integration/SKILL.md` | existing | code (integration) |
+| test-e2e | `../test-e2e/SKILL.md` | existing | code (e2e) |
 | check-coverage-pruning | `scripts/check-coverage-pruning.cjs` | new (#6461) | code (coverage) |
 | check-arch | `scripts/cron-quality-gates.sh arch` | new (#6463) | code (architecture) |
 | check-mutation | `scripts/cron-quality-gates.sh mutation` | new (#6460) | code (mutation) |
-| ux-verification | `../ux-verification/SKILL.md` | new (#6067) | ux |
-| content-verification | `../content-verification/SKILL.md` | new (#6114) | content |
-| config-validation | `../config-validation/SKILL.md` | new (#6115) | config |
-| research-verification | `../research-verification/SKILL.md` | new (#6116) | research |
+| ux-verification | `../ux-verification/SKILL.md` | existing | ux |
+| content-verification | `../content-verification/SKILL.md` | existing | content |
+| config-validation | `../config-validation/SKILL.md` | existing | config |
+| research-verification | `../research-verification/SKILL.md` | existing | research |
 | ux-path-auditor | `../ux-path-auditor/SKILL.md` | existing | ux (full audit) |
 
 ## Process
