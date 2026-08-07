@@ -1,10 +1,10 @@
 // Regression tests for main-worktree-guard (path scoping #5582 + destructive-git
 // bash guard, incident 2026-08-06).
-// Run: node extensions/main-worktree-guard/test.mjs  (from agent-infra root)
+// Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { realpathSync, existsSync } from "node:fs";
-import { classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch } from "./classify-git.mjs";
+import { classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -51,14 +51,21 @@ expect("non-git", "python3 test.py", "allow-non-git");
 expect("empty", "", "allow");
 
 // ── Worktree detection ─────────────────────────────────────────────────────
-const MAIN = resolve(execSync("git rev-parse --show-toplevel", { encoding: "utf-8" }).trim());
-console.log(`\nworktree detection from main checkout (expect false): ${isWorktreeCwd(MAIN)}`);
+// MAIN = the REAL main checkout (first entry of `git worktree list`), so the
+// suite behaves identically when run from the main checkout or a worktree.
+const MAIN = resolve(
+  execSync("git worktree list --porcelain", { encoding: "utf-8" })
+    .split("\n")[0].replace(/^worktree\s+/, "")
+);
+const RUN_IS_MAIN = resolve(execSync("git rev-parse --show-toplevel", { encoding: "utf-8" }).trim()) === MAIN;
+console.log(`\nmain checkout: ${MAIN} (run from main: ${RUN_IS_MAIN})`);
+console.log(`worktree detection from main checkout (expect false): ${isWorktreeCwd(MAIN)}`);
 isWorktreeCwd(MAIN) === false ? pass++ : fail++;
 
 let wtPath = null;
 try {
-  execSync(`git worktree add --detach -f "${MAIN}/.worktrees/_guard_test_tmp" HEAD 2>&1`, { encoding: "utf-8" });
-  wtPath = `${MAIN}/.worktrees/_guard_test_tmp`;
+  execSync(`git worktree add --detach -f "${PROJECT_CWD}/.worktrees/_guard_test_tmp" HEAD 2>&1`, { encoding: "utf-8" });
+  wtPath = `${PROJECT_CWD}/.worktrees/_guard_test_tmp`;
   const wtDetect = isWorktreeCwd(wtPath);
   console.log(`worktree detection from worktree (expect true): ${wtDetect}`);
   wtDetect === true ? pass++ : fail++;
@@ -71,10 +78,12 @@ try {
 }
 
 // ── Path scoping (existing #5582 logic, mirrored) ─────────────────────────
-function guardDecision(targetPath) {
+// sessionCwd mirrors the pi extension-host cwd (the project root the guard
+// protects). Passed explicitly so the suite works from any checkout.
+function guardDecision(targetPath, sessionCwd = PROJECT_CWD) {
   let mainTopLevel;
   try {
-    mainTopLevel = resolve(execSync("git rev-parse --show-toplevel", { encoding: "utf-8", cwd: resolve(PROJECT_CWD), timeout: 5000 }).trim());
+    mainTopLevel = resolve(execSync("git rev-parse --show-toplevel", { encoding: "utf-8", cwd: resolve(sessionCwd), timeout: 5000 }).trim());
   } catch { return "BLOCK (Git unavailable)"; }
   const resolvedTarget = resolve(PROJECT_CWD, targetPath ?? "");
   const insideProject = resolvedTarget === mainTopLevel || resolvedTarget.startsWith(mainTopLevel + "/");
@@ -90,16 +99,54 @@ function guardDecision(targetPath) {
   if (topLevel === mainTopLevel) return "BLOCK (main checkout)";
   return "ALLOW (worktree)";
 }
-function check(name, path, expectedContains) {
-  const got = guardDecision(path);
+function check(name, path, expectedContains, sessionCwd) {
+  const got = guardDecision(path, sessionCwd);
   const ok = got.includes(expectedContains);
   console.log(`${ok ? "✅" : "❌"} ${name}: ${got}`);
   ok ? pass++ : fail++;
 }
-check("main checkout file", `${MAIN}/extensions/main-worktree-guard/index.ts`, "BLOCK (main checkout)");
-check("AGENTS.md", `${MAIN}/AGENTS.md`, "BLOCK (main checkout)");
-check("/tmp file", "/tmp/foo.md", "ALLOW (outside project)");
-check("~/.pi extension", "/Users/home/.pi/agent/extensions/x.ts", "ALLOW (outside project)");
+check("main checkout file", `${MAIN}/extensions/main-worktree-guard/index.ts`, "BLOCK (main checkout)", MAIN);
+check("AGENTS.md", `${MAIN}/AGENTS.md`, "BLOCK (main checkout)", MAIN);
+check("/tmp file", "/tmp/foo.md", "ALLOW (outside project)", MAIN);
+check("~/.pi extension", "/Users/home/.pi/agent/extensions/x.ts", "ALLOW (outside project)", MAIN);
+// Session rooted in a worktree: main-checkout paths are outside its project → allowed.
+// Only meaningful when the suite itself runs from a worktree.
+if (!RUN_IS_MAIN) {
+  check("main file, worktree session", `${MAIN}/AGENTS.md`, "ALLOW (outside project)", PROJECT_CWD);
+}
+
+// ── Infra-repo detection (#99) ─────────────────────────────────────────────
+// The test runs inside an agent-infra checkout (worktree root), so MAIN is an
+// infra repo: fingerprint alone must detect it, and env vars must never disable
+// detection (fingerprint is the safety net when the env var is unset/mismatched).
+const INFRA_ROOT = MAIN;
+const noEnv = {};
+const envPathMatch = { AGENT_INFRA_PATH: INFRA_ROOT };
+const envRootMatch = { AGENT_INFRA_ROOT: INFRA_ROOT };
+const envPointsElsewhere = { AGENT_INFRA_PATH: "/nonexistent/other-repo" };
+function expectBool(name, got, expected) {
+  const ok = got === expected;
+  console.log(`${ok ? "✅" : "❌"} ${name}: ${got}${ok ? "" : ` (expected ${expected})`}`);
+  ok ? pass++ : fail++;
+}
+expectBool("infra root, no env (fingerprint)", isAgentInfraRepo(INFRA_ROOT, noEnv), true);
+expectBool("infra root, AGENT_INFRA_PATH match", isAgentInfraRepo(INFRA_ROOT, envPathMatch), true);
+expectBool("infra root, AGENT_INFRA_ROOT match (legacy)", isAgentInfraRepo(INFRA_ROOT, envRootMatch), true);
+expectBool("infra root, env points elsewhere (fingerprint wins)", isAgentInfraRepo(INFRA_ROOT, envPointsElsewhere), true);
+let tmpRepo = null;
+try {
+  tmpRepo = execSync("mktemp -d", { encoding: "utf-8" }).trim();
+  execSync("git init -q", { cwd: tmpRepo, stdio: "ignore" });
+  expectBool("plain git repo, no env", isAgentInfraRepo(tmpRepo, noEnv), false);
+  expectBool("plain git repo, env points at infra", isAgentInfraRepo(tmpRepo, envPathMatch), false);
+} catch (e) {
+  console.log(`⏭️  non-infra repo case skipped (could not provision: ${String(e.message).slice(0, 60)})`);
+} finally {
+  if (tmpRepo) {
+    try { execSync(`rm -rf "${tmpRepo}"`, { stdio: "ignore" }); } catch {}
+  }
+}
+expectBool("non-git cwd, no env", isAgentInfraRepo("/nonexistent/dir", noEnv), false);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
 function expectBranches(command, expectedArray) {
@@ -135,18 +182,23 @@ console.log(`getWorktreeBranches returned Map (expect true): ${wtBranches instan
 wtBranches instanceof Map ? pass++ : fail++;
 
 // ── Branch-in-main-checkout detection (#73) ────────────────────────────────
-const mainBranch = execSync("git branch --show-current", { encoding: "utf-8" }).trim();
-const mainCheck = isBranchInMainCheckout(mainBranch);
-console.log(`\nisBranchInMainCheckout("${mainBranch}") = ${mainCheck} (expect true)`);
+// isBranchInMainCheckout is cwd-relative (it answers "is <branch> checked out
+// in this checkout") — assert its happy path against the run cwd's own branch.
+const cwdBranch = execSync("git branch --show-current", { encoding: "utf-8" }).trim();
+const mainCheck = isBranchInMainCheckout(cwdBranch);
+console.log(`\nisBranchInMainCheckout("${cwdBranch}") = ${mainCheck} (expect true)`);
 mainCheck === true ? pass++ : fail++;
 const fakeCheck = isBranchInMainCheckout("definitely-not-a-real-branch-xyz");
 console.log(`isBranchInMainCheckout("definitely-not-a-real-branch-xyz") = ${fakeCheck} (expect false)`);
 fakeCheck === false ? pass++ : fail++;
 
 // ── Main checkout branch detection (#73) ───────────────────────────────────
+// getMainCheckoutBranch() is cwd-relative too: from the main checkout it
+// returns the main branch; from a worktree it returns null (documented).
+const expectedMainCO = RUN_IS_MAIN ? cwdBranch : null;
 const mainCO = getMainCheckoutBranch();
-console.log(`\ngetMainCheckoutBranch() = ${mainCO} (expect "${mainBranch}")`);
-mainCO === mainBranch ? pass++ : fail++;
+console.log(`\ngetMainCheckoutBranch() = ${mainCO} (expect "${expectedMainCO}")`);
+mainCO === expectedMainCO ? pass++ : fail++;
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

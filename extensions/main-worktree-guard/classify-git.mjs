@@ -2,6 +2,8 @@
 // Pure JS so both index.ts (via jiti) and test.mjs can import the SAME rules.
 
 import { execSync } from "node:child_process";
+import { resolve, join } from "node:path";
+import { existsSync } from "node:fs";
 
 //
 // Purpose: in the SHARED main checkout, branch-state-changing git operations
@@ -152,4 +154,44 @@ export function getMainCheckoutBranch() {
   } catch {
     return null;
   }
+}
+
+/**
+ * Is `cwd` inside the agent-infra repo itself (the infrastructure repo)?
+ * The guard skips enforcement for agent-infra because it is a small infra repo
+ * whose main checkout is where infra fixes land (#99).
+ *
+ * Detection order — no single source of truth, no env var required:
+ *   1. Env exact-match: canonical `AGENT_INFRA_PATH` (exported to ~/.zshrc by
+ *      pi-bootstrap/setup.sh), then legacy `AGENT_INFRA_ROOT` — the resolved git
+ *      toplevel must equal the resolved env value.
+ *   2. Repo fingerprint (always active): `manifest.json` + `pi-bootstrap/setup.sh`
+ *      present at the git toplevel — unique to agent-infra checkouts, so it also
+ *      works in sub-agents / fresh shells where the env var is unset.
+ *
+ * @param {string} [cwd]  git cwd (default process.cwd())
+ * @param {object} [env]  environment to read (default process.env)
+ * @returns {boolean}
+ */
+export function isAgentInfraRepo(cwd = process.cwd(), env = process.env) {
+  let topLevel;
+  try {
+    topLevel = resolve(
+      execSync("git rev-parse --show-toplevel", {
+        encoding: "utf-8", cwd, timeout: 5000,
+      }).trim()
+    );
+  } catch {
+    return false; // not in a git repo (or git unavailable) — never agent-infra
+  }
+  // 1) Exact env-var match (canonical AGENT_INFRA_PATH first, legacy ROOT second)
+  for (const name of ["AGENT_INFRA_PATH", "AGENT_INFRA_ROOT"]) {
+    const root = env[name];
+    if (root && resolve(topLevel) === resolve(String(root))) return true;
+  }
+  // 2) Repo fingerprint: manifest.json + pi-bootstrap/setup.sh at the toplevel
+  return (
+    existsSync(join(topLevel, "manifest.json")) &&
+    existsSync(join(topLevel, "pi-bootstrap", "setup.sh"))
+  );
 }

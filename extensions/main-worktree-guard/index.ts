@@ -32,9 +32,15 @@ let extractPushDeleteBranch: (cmd: string) => string[] | null = () => null;
 let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
 let getMainCheckoutBranch: () => string | null = () => null;
+// Infra-repo detection lives in classify-git.mjs so test.mjs exercises the SAME
+// logic (#99): AGENT_INFRA_PATH/AGENT_INFRA_ROOT exact match, falling back to a
+// repo fingerprint (manifest.json + pi-bootstrap/setup.sh). Default false keeps
+// the fail-safe contract — agent-infra detection never silently disables guard.
+let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) => boolean = () => false;
 try {
   ({ classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch,
-     getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch } =
+     getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch,
+     isAgentInfraRepo } =
     await import("./classify-git.mjs"));
 } catch (e) {
   console.warn("[main-worktree-guard] ⚠️ classify-git.mjs failed to load — bash git guard DISABLED:", String(e));
@@ -47,19 +53,9 @@ function _getEnv(name: string): string | undefined {
 function _isAllowMainEdits(): boolean {
   return _getEnv("ALLOW_MAIN_EDITS") === "1";
 }
-// Detect if running inside agent-infra's own repo (skip worktree enforcement)
-function _isAgentInfraRepo(): boolean {
-  const root = process.env.AGENT_INFRA_ROOT;
-  if (!root) return false;
-  try {
-    const topLevel = execSync("git rev-parse --show-toplevel", {
-      encoding: "utf-8", cwd: process.cwd(), timeout: 5000,
-    }).trim();
-    return resolve(topLevel) === resolve(root);
-  } catch {
-    return false;
-  }
-}
+// Detect if running inside agent-infra's own repo (skip worktree enforcement).
+// Implemented in classify-git.mjs (#99): env-var match (AGENT_INFRA_PATH /
+// AGENT_INFRA_ROOT) with repo-fingerprint fallback — no magic env var needed.
 
 function _mainTopLevel(): string | null {
   try {
@@ -93,7 +89,7 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    if (_isAgentInfraRepo()) {
+    if (isAgentInfraRepo()) {
       return undefined; // agent-infra is a small infra repo — no worktree needed
     }
     if (_isAllowMainEdits()) {
@@ -231,7 +227,7 @@ export default function (pi: ExtensionAPI) {
   // ── Session-start hub discipline check (#73) ──
   // In the main checkout: warn if on a non-main branch or dirty working tree.
   // Non-blocking — the write/edit guard still protects; this is a discipline prompt.
-  if (!_isAgentInfraRepo() && !_isAllowMainEdits()) {
+  if (!isAgentInfraRepo() && !_isAllowMainEdits()) {
     try {
       const inWorktree = isWorktreeCwd(resolve(process.cwd()));
       if (!inWorktree) {
