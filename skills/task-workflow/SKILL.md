@@ -1,20 +1,20 @@
 ---
 name: task-workflow
-description: Lightweight fractal pipeline for tasks (micro issues). Routes through all 6 stages inline — no Bounded skill dispatch. Agent applies the phase discipline directly.
+description: Lightweight fractal pipeline for micro tasks (complexity:micro). Routes through all 6 stages inline — no Bounded skill dispatch. Agent applies the phase discipline directly. Standard/complex tasks route to task-workflow-standard.
 type: Workflow
 domain: capability
 status: live
 tags: [pipeline, task, planning, fractal, orchestrator, lightweight]
-summary: "Workflow skill for micro-issues — all 6 pipeline stages applied inline with no sub-skill dispatch."
+summary: "Workflow skill for micro-issues — all 6 pipeline stages applied inline with no sub-skill dispatch. Canonical micro pipeline (task-workflow-micro merged here)."
 created: 2026-07-07
 updated: 2026-08-08
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
-version: 1.0.0
+version: 1.1.0
 ---
 
 > ⛔ **This skill MUST be read in full — not skimmed.** Lightweight ≠ skipped. All phases must be followed.
 
-# Task Workflow
+# Task Workflow (Micro)
 
 Routes a task (micro issue) through all 6 pipeline stages. Lightweight — the agent applies the phase discipline inline. No Bounded sub-skill dispatch. No separate workflow files.
 
@@ -54,7 +54,7 @@ fi
 
 ## Pipeline (all phases, lightweight — no orchestrator workflow files)
 
-> Routed via `Level: task` in issue-creation fractal fields. Applies when `complexity:micro`.
+> Routed via `Level: task` + `complexity:micro` in issue-creation fractal fields (see `issue-workflow` dispatch). Standard/complex tasks route to `task-workflow-standard` — this skill is the **micro pipeline only**.
 
 1. **Align** — Inherited from parent Epic/Project. Only required if standalone.
 2. **Research** — Quick codebase check: read affected files, existing patterns.
@@ -96,5 +96,6 @@ Before claiming a task done, the Verify phase MUST pass:
 - [ ] **Typecheck passes** (0 errors)
 - [ ] **All tests pass** (0 failures)
 - [ ] **Existing tests still pass** (no regressions)
+- [ ] **Modified DB trigger/function/RLS?** → run existing pgTAP tests for that function (`npm run test:db`). Check `supabase/tests/` for matching pgTAP files. If no pgTAP tests exist for the modified function → WARN (file follow-up issue for pgTAP coverage).
 
 If any check fails, the task is NOT done. Return to Implement phase.
