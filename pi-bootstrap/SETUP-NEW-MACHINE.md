@@ -35,7 +35,7 @@ cd <repo-path>/pi-bootstrap && ./setup.sh
 
    (Example: `cd ~/Documents/GitHub/agent-infra/pi-bootstrap && ./setup.sh`)
 
-It copies your models, agents, extensions, rules, and skills into
+It copies your models, agents, extensions, rules, skills, and **MCP config** into
 `~/.pi/agent`. Run it again anytime to refresh.
 
 ## Step 3 — Transfer your keys (one-time, ~5 min)
@@ -66,7 +66,19 @@ machine's pi instance.
   start pi, it checks GitHub and if the main Mac published updates, it pulls
   them and refreshes this machine's config. Nothing to do.
 - Manual refresh anytime: `cd ~/agent-infra && ./sync.sh`
-- **What syncs:** skills, extensions, agents, models, settings, rules.
+- **What syncs:** skills, extensions, agents, models, settings, rules, and the
+  base MCP config (`templates/.mcp.base.json` → `~/.pi/agent/.mcp.json`).
+- **MCP servers:** pi loads MCP servers from the first `.mcp.json` found walking
+  up from your working directory to the repo's git top-level, falling back to
+  `~/.pi/agent/.mcp.json` (the base config). A repo-local `.mcp.json` overrides
+  the base config for that repo. Base servers: exa, brave-search,
+  playwright-browser, gemini, tortoise.
+- **Tortoise MCP server:** the base config runs the local `tortoise.mcp_server`
+  stdio server. It needs `TORTOISE_HOME` pointing at your tortoise checkout
+  (setup.sh auto-wires it if the checkout is in a standard location, e.g.
+  `~/Documents/GitHub/tortoise` next to this clone) and a local FalkorDB on
+  `localhost:16379` for its DB target. If either is missing, the server
+  fails fast and pi continues without it (no crash).
 - **What never syncs (by design):** your API keys and chat history — those
   stay per-machine.
 - On the main Mac, "publishing" just means committing work to agent-infra
