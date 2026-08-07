@@ -7,8 +7,8 @@
  * Catches:
  *   - unquoted `: ` in description  → "Nested mappings not allowed"
  *   - missing/empty frontmatter     → body parsed as YAML → alias errors
- *   - duplicate top-level keys      → "Map keys must be unique"
- *   - name != directory name mismatch
+ *   - duplicate keys in one mapping → "Map keys must be unique"
+ *   - name != directory name mismatch (shared-<dir> routing wrappers allowed)
  *
  * Usage:
  *   node scripts/check-skill-lint.mjs --repo /path/to/repo
@@ -85,6 +85,8 @@ Skills directory resolution order:
   3. $REPO_PATH/operations/skills
   4. ./operations/skills (cwd)
   5. .agents/skills (cwd fallback for pi setups)
+  6. <--repo>/skills        (agent-infra canonical tree)
+  7. ./skills (cwd fallback — agent-infra canonical tree)
 
 Exit codes:
   0  clean
@@ -100,20 +102,23 @@ function resolveSkillsDir(args) {
 
   // If repo is set, try repo/operations/skills
   if (args.repo) {
-    const candidate = join(args.repo, 'operations', 'skills');
-    if (existsSync(candidate)) return candidate;
-    // Fallback: .agents/skills (pi-style)
-    const altCandidate = join(args.repo, '.agents', 'skills');
-    if (existsSync(altCandidate)) return altCandidate;
+    for (const candidate of [
+      join(args.repo, 'operations', 'skills'),
+      join(args.repo, '.agents', 'skills'),
+      join(args.repo, 'skills'), // agent-infra canonical tree
+    ]) {
+      if (existsSync(candidate)) return candidate;
+    }
   }
 
-  // Try cwd/operations/skills
-  const cwdCandidate = join(cwd, 'operations', 'skills');
-  if (existsSync(cwdCandidate)) return cwdCandidate;
-
-  // Try cwd/.agents/skills
-  const cwdAltCandidate = join(cwd, '.agents', 'skills');
-  if (existsSync(cwdAltCandidate)) return cwdAltCandidate;
+  // Try cwd-relative candidates in the same order
+  for (const candidate of [
+    join(cwd, 'operations', 'skills'),
+    join(cwd, '.agents', 'skills'),
+    join(cwd, 'skills'), // agent-infra canonical tree
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
 
   return null;
 }
@@ -161,14 +166,40 @@ function parseFrontmatter(content) {
 }
 
 function findDuplicateKeys(yaml) {
-  const seen = new Set();
+  // Flags duplicate keys within the SAME mapping. YAML allows the same key
+  // name at different nesting levels (a false positive of the naive version)
+  // and repeated keys across list elements (each `- ` opens a fresh mapping).
+  // Strategy: track an indentation-aware generation counter. Every list
+  // element bumps the generation; keys nested deeper than the most recent
+  // list element belong to the new generation, so repeats across elements
+  // are NOT flagged. A repeat at the same indent within one generation is a
+  // real duplicate (e.g. js-yaml's "duplicated mapping key").
+  let gen = 0;
+  let activeListIndent = -1;
+  const seen = new Map(); // `indent:gen` -> Set<key>
   const dups = [];
   for (const line of yaml.split('\n')) {
-    const m = line.match(/^\s*([A-Za-z0-9_-]+)\s*:/);
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('---') || trimmed.startsWith('...')) continue;
+    const indent = line.match(/^[ \t]*/)[0].replace(/\t/g, '  ').length;
+
+    // List element: starts a fresh mapping for everything nested under it
+    if (/^-\s/.test(trimmed)) {
+      gen += 1;
+      activeListIndent = indent;
+      continue;
+    }
+
+    const m = line.match(/^(\s*)([A-Za-z0-9_-]+)\s*:/);
     if (!m) continue;
-    const key = m[1];
-    if (seen.has(key)) dups.push(key);
-    else seen.add(key);
+    const key = m[2];
+    // Keys deeper than the most recent list element belong to that element
+    // (new generation). Keys at or above it belong to the pre-list block.
+    const effectiveGen = indent > activeListIndent ? gen : gen - (activeListIndent >= 0 ? 1 : 0);
+    const id = `${indent}:${effectiveGen}`;
+    if (!seen.has(id)) seen.set(id, new Set());
+    if (seen.get(id).has(key)) dups.push(`'${key}' (indent ${indent})`);
+    else seen.get(id).add(key);
   }
   return [...new Set(dups)];
 }
@@ -183,7 +214,7 @@ function main() {
 
   if (!SKILLS_DIR || !existsSync(SKILLS_DIR)) {
     console.log(`ℹ  No skills directory found — nothing to lint.`);
-    console.log('   Tried: --skills-dir, --repo/operations/skills, ./operations/skills, ./.agents/skills');
+    console.log('   Tried: --skills-dir, --repo/operations/skills, --repo/.agents/skills, --repo/skills, ./operations/skills, ./.agents/skills, ./skills');
     process.exit(0);
   }
 
@@ -211,7 +242,10 @@ function main() {
     for (const field of REQUIRED) {
       if (!(field in fm.data)) issues.push(`[P0] frontmatter: missing required field '${field}'\n  ${rel}`);
     }
-    if (fm.data.name && fm.data.name !== dirName) {
+    if (fm.data.name && fm.data.name !== dirName && fm.data.name !== `shared-${dirName}`) {
+      // `shared-<dir>` is the routing-wrapper convention (writing-skills.md:
+      // "shared-verify at ../planning/shared/verify/SKILL.md"). Anything else
+      // is a copy-paste name mismatch.
       issues.push(`[P0] name: frontmatter name '${fm.data.name}' != directory '${dirName}'\n  ${rel}`);
     }
     if ('description' in fm.data && String(fm.data.description).trim() === '') {
