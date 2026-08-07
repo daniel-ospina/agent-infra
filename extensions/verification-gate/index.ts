@@ -1,9 +1,9 @@
 import type { ExtensionAPI, ToolCallEvent, ToolCallEventResult, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
@@ -16,7 +16,10 @@ export function resolveProjectRoot(blockedCwd: string | null, prompt: string): s
   // ponytail: \S+ eats sentence punctuation — strip trailing dots so
   // "Project root: /path/to/repo." doesn't resolve to a nonexistent dir (#7470)
   const rootMatch = prompt.match(/Project root:\s*(\S+)/);
-  return resolve(rootMatch ? rootMatch[1].replace(/\.+$/, "") : process.cwd());
+  if (rootMatch) return resolve(rootMatch[1].replace(/\.+$/, ""));
+  // #7595: prefer the git root of cwd over raw cwd — repo-relative hashing and
+  // bridge writes are anchored at the git root; a bare cwd base silently breaks them.
+  return resolveGitRoot(process.cwd());
 }
 
 // ── Types ────────────────────────────────────────────
@@ -60,12 +63,23 @@ function bridgePath(): string {
 function writeBridge(projectRoot: string, files: string[]): void {
   try {
     mkdirSync(BRIDGE_DIR, { recursive: true });
+    const verifiedFiles: VerifiedFile[] = [];
+    for (const f of files) {
+      try {
+        verifiedFiles.push({ path: f, hash: hashFile(projectRoot, f) });
+      } catch {
+        // #7595: one unhashable path (wrong root, deleted file) must not abort
+        // the whole bridge write — before, a single failure silently left the
+        // bridge stale and the next session recovered obsolete hashes.
+      }
+    }
+    if (verifiedFiles.length === 0) {
+      console.error("[verification-gate] bridge write skipped — no files could be hashed");
+      return;
+    }
     const payload = {
       status: "PASS",
-      verified_files: files.map(f => {
-        const absPath = resolve(projectRoot, f);
-        return { path: f, hash: hashFile(projectRoot, f) };
-      }),
+      verified_files: verifiedFiles,
       timestamp: new Date().toISOString(),
     };
     writeFileSync(bridgePath(), JSON.stringify(payload));
@@ -160,6 +174,57 @@ function hashFile(projectRoot: string, filePath: string): string {
   const absPath = resolve(projectRoot, filePath);
   const content = readFileSync(absPath);
   return createHash("sha256").update(content).digest("hex");
+}
+
+// #7595: verifier sub-agents may return absolute paths (e.g.
+// "/Users/x/repo/src/a.ts") or root-relative forms ("./src/a.ts") while
+// git diff yields repo-relative paths ("src/a.ts"). Registry keys must be
+// repo-relative or the block check never matches and every commit is blocked
+// as "unverified" despite fresh PASS responses. Normalize before keying.
+export function normalizeRegistryPath(projectRoot: string, filePath: string): string {
+  const abs = resolve(projectRoot, filePath);
+  // realpath both sides: macOS /var → /private/var (symlink) and other
+  // symlinked roots must not produce ../ keys that never match git's
+  // realpath'd toplevel. Fall back to lexical paths when a path is gone.
+  let realRoot = projectRoot;
+  let realAbs = abs;
+  try { realRoot = realpathSync(projectRoot); } catch { /* keep lexical */ }
+  try { realAbs = realpathSync(abs); } catch { /* keep lexical */ }
+  const rel = relative(realRoot, realAbs);
+  return rel === "" ? filePath : rel;
+}
+
+// Merge a verifier PASS's verified_files into the registry.
+// - #7595: every key is normalized to repo-relative.
+// - #38/#7595: re-verification of an already-known path ALWAYS updates its
+//   hash — the verifier is the authority. A stale lastBlockedFiles list (the
+//   previous block in the session may have covered different files) must not
+//   drop the update.
+// - #5673: brand-new paths are still scoped to the blocked diff, so a
+//   full-repo-scan response can't mark arbitrary files as verified.
+export function mergeVerifiedFiles(
+  verifiedSet: Map<string, string>,
+  blockAttempts: Map<string, number>,
+  verifiedFiles: VerifiedFile[],
+  projectRoot: string,
+  lastBlockedFiles: string[]
+): { merged: number; skipped: number } {
+  const blockedSet = new Set(lastBlockedFiles);
+  let merged = 0;
+  let skipped = 0;
+  for (const vf of verifiedFiles) {
+    const relPath = normalizeRegistryPath(projectRoot, vf.path);
+    const known = verifiedSet.has(relPath);
+    const inBlockedDiff = lastBlockedFiles.length === 0 || blockedSet.has(relPath);
+    if (!known && !inBlockedDiff) {
+      skipped++;
+      continue;
+    }
+    verifiedSet.set(relPath, vf.hash);
+    blockAttempts.delete(relPath);
+    merged++;
+  }
+  return { merged, skipped };
 }
 
 // ── JSON extraction ───────────────────────────────────
@@ -456,14 +521,15 @@ export default function (pi: ExtensionAPI) {
         // #5673: filter to only files in the blocked diff (not full repo scan)
         const blockedSet = new Set(lastBlockedFiles);
         const filteredPromptFiles = lastBlockedFiles.length > 0
-          ? [...promptFiles].filter(f => blockedSet.has(f))
+          ? [...promptFiles].filter(f => blockedSet.has(normalizeRegistryPath(projectRoot, f)))
           : [...promptFiles];
         let merged = 0;
         for (const file of filteredPromptFiles) {
           try {
+            const relPath = normalizeRegistryPath(projectRoot, file);
             const hash = hashFile(projectRoot, file);
-            verifiedSet.set(file, hash);
-            blockAttempts.delete(file);
+            verifiedSet.set(relPath, hash);
+            blockAttempts.delete(relPath);
             merged++;
           } catch {
             // file may not exist at expected path — skip
@@ -502,8 +568,9 @@ export default function (pi: ExtensionAPI) {
         let merged = 0;
         for (const file of promptFiles) {
           try {
-            verifiedSet.set(file, hashFile(projectRoot, file));
-            blockAttempts.delete(file);
+            const relPath = normalizeRegistryPath(projectRoot, file);
+            verifiedSet.set(relPath, hashFile(projectRoot, file));
+            blockAttempts.delete(relPath);
             merged++;
           } catch { /* file may not exist at expected path */ }
         }
@@ -543,8 +610,9 @@ export default function (pi: ExtensionAPI) {
           let merged = 0;
           for (const file of promptFiles) {
             try {
-              verifiedSet.set(file, hashFile(fallbackRoot, file));
-              blockAttempts.delete(file);
+              const relPath = normalizeRegistryPath(fallbackRoot, file);
+              verifiedSet.set(relPath, hashFile(fallbackRoot, file));
+              blockAttempts.delete(relPath);
               merged++;
             } catch { /* skip */ }
           }
@@ -571,27 +639,17 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    // #5673: filter to only files in the blocked diff, not full repo scan
-    const blockedSet = new Set(lastBlockedFiles);
-    let merged = 0;
-    let skipped = 0;
-    for (const vf of result.verified_files) {
-      if (lastBlockedFiles.length > 0 && !blockedSet.has(vf.path)) {
-        skipped++;
-        continue;
-      }
-      verifiedSet.set(vf.path, vf.hash);
-      merged++;
-    }
+    // #5673/#7595: merge verifier files into the registry. Keys are normalized
+    // to repo-relative; known paths always update (re-verification is authoritative).
+    const projectRoot = resolveProjectRoot(lastBlockedCwd, prompt);
+    const { merged, skipped } = mergeVerifiedFiles(verifiedSet, blockAttempts, result.verified_files, projectRoot, lastBlockedFiles);
 
     vgateFailures = 0;
-    // #7591: reset block counters for successfully verified files
-    for (const vf of result.verified_files) { blockAttempts.delete(vf.path); }
     console.log(`[verification-gate] ✅ Merged ${merged} verified files${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
     // Write bridge file so future sessions/sub-agents can see verification status
     const verifiedPaths = Array.from(verifiedSet.keys());
     if (verifiedPaths.length > 0) {
-      writeBridge(resolveProjectRoot(lastBlockedCwd, prompt), verifiedPaths);
+      writeBridge(projectRoot, verifiedPaths);
     }
     lastBlockedCwd = null; // consume on successful merge
     return undefined;

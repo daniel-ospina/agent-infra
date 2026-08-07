@@ -7,7 +7,7 @@
  * Run: npx tsx operations/pi-config/extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, extractCdPath } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles } from "./index.js";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 
 let passed = 0;
@@ -340,6 +340,116 @@ test("exported functions are callable (#5527 regression)", () => {
   isGitOp("git commit -m test");
   isGitCommit("git commit -m test");
   ok(true, "all exports callable without errors");
+});
+
+// ── normalizeRegistryPath (#7595) ────────────────────
+
+section("normalizeRegistryPath — path-key normalization (#7595)");
+
+test("normalizes absolute path to repo-relative", () => {
+  equal(normalizeRegistryPath("/proj", "/proj/src/a.ts"), "src/a.ts");
+});
+
+test("keeps already-relative path unchanged", () => {
+  equal(normalizeRegistryPath("/proj", "src/a.ts"), "src/a.ts");
+});
+
+test("strips ./ prefix", () => {
+  equal(normalizeRegistryPath("/proj", "./src/a.ts"), "src/a.ts");
+});
+
+test("handles nested roots without prefix stripping", () => {
+  // project root itself has a prefix: /home/user/repo vs /home/user — must not strip "user/repo"
+  equal(normalizeRegistryPath("/home/user/repo", "/home/user/repo/app/x.ts"), "app/x.ts");
+  equal(normalizeRegistryPath("/home/user/repo", "/home/user/other.ts"), "../other.ts");
+});
+
+test("returns original when path is the root itself", () => {
+  const p = "/proj";
+  equal(normalizeRegistryPath(p, p), p);
+});
+
+// ── mergeVerifiedFiles (#7595 / #38) ─────────────────
+
+section("mergeVerifiedFiles — registry merge on PASS");
+
+test("merges absolute-path response under relative key (#38 root cause)", () => {
+  const vs = new Map<string, string>();
+  const ba = new Map<string, number>();
+  const { merged, skipped } = mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "/proj/src/a.ts", hash: "H2" }],
+    "/proj",
+    ["src/a.ts"]
+  );
+  equal(merged, 1);
+  equal(skipped, 0);
+  equal(vs.get("src/a.ts"), "H2", "must be stored under the relative key the block check uses");
+  equal(vs.has("/proj/src/a.ts"), false, "absolute key must not be stored");
+});
+
+test("re-verification of known path always updates even when not in last blocked diff (#38)", () => {
+  // lastBlockedFiles is stale: it references a previous block on different files.
+  // The known path must STILL be updated — the verifier is the authority.
+  const vs = new Map<string, string>([["src/a.ts", "H1"]]);
+  const ba = new Map<string, number>();
+  const { merged, skipped } = mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "/proj/src/a.ts", hash: "H2" }],
+    "/proj",
+    ["other/file.ts"] // stale blocked list — does NOT contain a.ts
+  );
+  equal(merged, 1, "known path must merge despite stale filter");
+  equal(skipped, 0);
+  equal(vs.get("src/a.ts"), "H2");
+});
+
+test("new path outside blocked diff is skipped (#5673 preserved)", () => {
+  const vs = new Map<string, string>();
+  const ba = new Map<string, number>();
+  const { merged, skipped } = mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "src/new.ts", hash: "H" }],
+    "/proj",
+    ["src/a.ts"]
+  );
+  equal(merged, 0);
+  equal(skipped, 1, "unrelated new file must not be marked verified");
+  equal(vs.has("src/new.ts"), false);
+});
+
+test("new path inside blocked diff merges", () => {
+  const vs = new Map<string, string>();
+  const ba = new Map<string, number>();
+  const { merged, skipped } = mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "/proj/src/new.ts", hash: "H" }],
+    "/proj",
+    ["src/new.ts"]
+  );
+  equal(merged, 1);
+  equal(skipped, 0);
+  equal(vs.get("src/new.ts"), "H");
+});
+
+test("empty lastBlockedFiles merges everything", () => {
+  const vs = new Map<string, string>();
+  const ba = new Map<string, number>();
+  const { merged, skipped } = mergeVerifiedFiles(
+    vs, ba,
+    [{ path: "a.ts", hash: "H1" }, { path: "b.ts", hash: "H2" }],
+    "/proj",
+    []
+  );
+  equal(merged, 2);
+  equal(skipped, 0);
+});
+
+test("resets block-attempt counters for merged files", () => {
+  const vs = new Map<string, string>();
+  const ba = new Map<string, number>([["src/a.ts", 2]]);
+  mergeVerifiedFiles(vs, ba, [{ path: "src/a.ts", hash: "H" }], "/proj", ["src/a.ts"]);
+  equal(ba.has("src/a.ts"), false);
 });
 
 // ── Results ───────────────────────────────────────────
