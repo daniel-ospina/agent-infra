@@ -9,7 +9,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 
 # Content Staleness Scanner
 
-> **Sync note:** Local copy at `~/.claude/skills/content-staleness-scanner/SKILL.md`. Repo copy at `operations/skills/content-staleness-scanner/SKILL.md`. Keep in sync.
+> **Sync note:** Canonical copy at `agent-infra/skills/content-staleness-scanner/SKILL.md`. Product repos hard-link into `operations/skills/content-staleness-scanner/SKILL.md`; Pi reads via `~/.pi/agent/skills`. Edit the agent-infra copy only.
 
 Proactively detects stale `category_content` pages that qualify for a `content-refresh` run. This skill is the automated counterpart to the manual staleness check embedded in `content-strategy-agent` — run it on a schedule or on-demand to surface the full refresh queue rather than checking a single page.
 

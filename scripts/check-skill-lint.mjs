@@ -8,6 +8,7 @@
  *   - unquoted `: ` in description  → "Nested mappings not allowed"
  *   - missing/empty frontmatter     → body parsed as YAML → alias errors
  *   - duplicate keys in one mapping → "Map keys must be unique"
+ *   - Bounded/Workflow/Routing missing allowed-tools → writing-skills schema violation
  *   - name != directory name mismatch (shared-<dir> routing wrappers allowed)
  *
  * Usage:
@@ -250,6 +251,13 @@ function main() {
     }
     if ('description' in fm.data && String(fm.data.description).trim() === '') {
       issues.push(`[P0] description: empty\n  ${rel}`);
+    }
+
+    // writing-skills frontmatter schema: allowed-tools is required for
+    // Bounded/Workflow skills (Routing is the shared-router variant used by
+    // planning/shared). reference and typeless skills are exempt.
+    if (fm.data.type && ['Bounded', 'Workflow', 'Routing'].includes(fm.data.type) && !('allowed-tools' in fm.data)) {
+      issues.push(`[P0] allowed-tools: type '${fm.data.type}' requires allowed-tools (writing-skills frontmatter schema)\n  ${rel}`);
     }
     for (const key of findDuplicateKeys(fm.yaml)) {
       issues.push(`[P0] duplicate-key: '${key}' appears more than once\n  ${rel}`);

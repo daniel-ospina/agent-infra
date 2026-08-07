@@ -9,7 +9,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 
 # Content Reviewer — Depth & Relevance
 
-> **Sync note:** Local copy at `~/.claude/skills/content-reviewer-depth/SKILL.md`. Repo copy at `operations/skills/content-reviewer-depth/SKILL.md`. Keep in sync.
+> **Sync note:** Canonical copy at `agent-infra/skills/content-reviewer-depth/SKILL.md`. Product repos hard-link into `operations/skills/content-reviewer-depth/SKILL.md`; Pi reads via `~/.pi/agent/skills`. Edit the agent-infra copy only.
 
 Review content for two qualities:
 1. **Local depth** — tips and facts that generic travel blogs wouldn't have

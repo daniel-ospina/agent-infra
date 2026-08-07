@@ -5,6 +5,7 @@ type: Workflow
 domain: capability
 status: live
 tags: [pipeline, epic, planning, fractal, orchestrator]
+allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 summary: "Top-level Workflow skill that routes an epic through all 6 pipeline stages at full depth."
 created: 2026-07-07
 updated: 2026-07-07
@@ -48,7 +49,7 @@ Routes an epic through the full 6-stage fractal planning pipeline. Each stage in
 
 ## Pipeline
 
-> Sub-skills live under `../planning/shared/`. Directory scaffolding exists; individual skills are built by epic #5872.
+> Sub-skills live under `../planning/shared/`. The shared routing stubs exist and dispatch to the underlying skills (e.g. `shared/plan` routes epics to `epic-plan`).
 
 1. **Align** — `shared/align/SKILL.md` — Strategic go/no-go gate (full adversarial + Eisenhower)
 2. **Research** — `shared/research/SKILL.md` — Research wrapper (full research brief)
@@ -105,7 +106,7 @@ This checkpoint runs at the start of every stage (2-6). The agent must explicitl
 
 After Scope approval (Human Gate #1) and before Plan (Stage 4): invoke `ux-design-review` skill when `UX_RATING ≥ medium`. This gate classifies UX decisions, presents structured options, and records user choices. It does NOT block — it surfaces and records.
 
-> **ponytail:** wired inline until `shared/plan/SKILL.md` is built (#5872). Extract to sub-skill when scaffolding is complete.
+> **ponytail:** wired inline. `shared/plan/SKILL.md` exists — it routes epics to `epic-plan` and keeps project planning inline in `project-workflow`.
 
 ## Entity Mapping
 

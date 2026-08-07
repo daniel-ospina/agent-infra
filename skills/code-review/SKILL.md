@@ -39,7 +39,7 @@ steps:
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
 
-> **Canonical:** `.agents/skills/code-review/SKILL.md` — both Claude and Pi read from here.
+> **Canonical:** `agent-infra/skills/code-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
 > **Unified v3.2.0** — agent-neutral. Consolidates Claude (v1.8.0) and Pi (v2.0.0) versions. Test coverage Step 0, 5-agent review (Agent #2 split into shallow + deep), convergence-gated fixer loop, `--standard-tier` flag, Supabase error logging, merge-dedup step. Uses agent-neutral sub-agent dispatch.
 

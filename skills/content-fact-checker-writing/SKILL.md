@@ -9,7 +9,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 
 # Content Fact Checker — Writing
 
-> **Sync note:** Local copy at `~/.claude/skills/content-fact-checker-writing/SKILL.md`. Repo copy at `operations/skills/content-fact-checker-writing/SKILL.md`. Keep in sync.
+> **Sync note:** Canonical copy at `agent-infra/skills/content-fact-checker-writing/SKILL.md`. Product repos hard-link into `operations/skills/content-fact-checker-writing/SKILL.md`; Pi reads via `~/.pi/agent/skills`. Edit the agent-infra copy only.
 
 Cross-check the written content against the verified source to catch invented facts, hallucinated details, or claims that drifted during writing or revision cycles.
 

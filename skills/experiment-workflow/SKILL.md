@@ -5,6 +5,7 @@ domain: capability
 type: Workflow
 status: live
 tags: [pipeline, experiment, scientific-method, pre-registration]
+allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 
 > ⛔ **This skill MUST be read in full — not skimmed.**
@@ -78,3 +79,5 @@ Reused: 4 skills. Forked: 2 skills. New: 3 skills.
 
 - Design: `tortoise/docs/experiment-workflow-design.md`
 - Epic: `tortoise/docs/experiment-workflow-epic.md`
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

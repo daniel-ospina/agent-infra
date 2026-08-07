@@ -12,7 +12,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 **Human approval gate:** presents output for user review. Pipeline advances after approval.
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Canonical:** `.agents/skills/issue-scoping/SKILL.md` — both Claude and Pi read from here.
+> **Canonical:** `agent-infra/skills/issue-scoping/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
 > **v5.1.0 — Double Diamond with Integrated Verification Gates.** Each diamond now has a verification gate (2 parallel verifiers + controller tiebreaker) before proceeding. Micro tier gets a single gate after both diamonds. See #7498.
 
@@ -116,7 +116,7 @@ Phase 8: Finalize + post plan
 
 > **Micro tier:** Runs all 4 diamond phases (1 sub-agent each) + a single full-diamond-verify gate at the end. Prevents solving the wrong problem the wrong way, even for small changes.
 
-> **Skill-domain + shared-code override:** Micro-tier issues touching `skills/`, `.agents/skills/`, `operations/pi-config/`, `src/lib/`, `src/hooks/`, `src/services/`, `supabase/migrations/`, or `src/types/` (excluding `_deprecated/`) are upgraded to Standard.
+> **Skill-domain + shared-code override:** Micro-tier issues touching `skills/`, `operations/pi-config/`, `src/lib/`, `src/hooks/`, `src/services/`, `supabase/migrations/`, or `src/types/` (excluding `_deprecated/`) are upgraded to Standard.
 
 ---
 
@@ -396,7 +396,7 @@ case "$TIER" in
   *) TIER_SKIP=1 ;;
 esac
 if [ "${TIER_SKIP:-0}" != "1" ]; then
-  UPGRADE_PATHS=$(printf '%s' "$ISSUE_BODY" | grep -oE '(^|[[:space:]([])(skills/|\.agents/skills/|operations/pi-config/|src/lib/|src/hooks/|src/services/|supabase/migrations/|src/types/)[^[:space:],)]*' | grep -v '_deprecated/' || true)
+  UPGRADE_PATHS=$(printf '%s' "$ISSUE_BODY" | grep -oE '(^|[[:space:]([])(skills/|operations/pi-config/|src/lib/|src/hooks/|src/services/|supabase/migrations/|src/types/)[^[:space:],)]*' | grep -v '_deprecated/' || true)
   if [ -n "$UPGRADE_PATHS" ]; then
     echo "🔧 Shared infrastructure change detected — upgrading from Micro to Standard"
     echo "   Matched paths: $UPGRADE_PATHS"
@@ -832,3 +832,5 @@ Pause for human approval if: confidence < 50, P0 issues remain after review, wir
 - **Rejected alternatives are documented.** Every approach not chosen has a rationale for when it WOULD have been better.
 - **Wiring gaps block completion.** Hard gate — all touch points must be covered.
 - **Review is fresh-context.** Every review cycle dispatches new `task` sub-agents.
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.
