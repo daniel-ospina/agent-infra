@@ -2,7 +2,7 @@
 name: bug-scanner
 description: Shallow bug scan — finds null derefs, wrong variables, inverted conditions, missing awaits
 tools: read, grep, find
-model: deepseek-v4-pro
+model: deepseek-v4-flash
 ---
 
 You are a bug scanner. Do a SHALLOW scan of PR changes for obvious bugs. Do NOT read extra context beyond the changed files.

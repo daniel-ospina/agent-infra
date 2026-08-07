@@ -473,7 +473,7 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(
         Type.String({
           description:
-            "Model to use (default: deepseek-v4-pro). Use 'claude-sonnet' for complex reasoning.",
+            "Model to use (default: deepseek-v4-flash). Use 'deepseek-v4-pro' or 'claude-sonnet' only when the task genuinely needs deeper reasoning.",
         })
       ),
       mcp_servers: Type.Optional(
@@ -484,7 +484,7 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params) {
-      const model = params.model ?? "deepseek-v4-pro";
+      const model = params.model ?? "deepseek-v4-flash";
       const provider = model.startsWith("claude") ? "anthropic" : "deepseek";
 
       const subAgentEnv: Record<string, string | undefined> = {
