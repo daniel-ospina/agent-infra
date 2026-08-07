@@ -336,6 +336,9 @@ ISSUE:
 **This step never blocks.** The review proceeds regardless of overlap count.
 Do not pause, gate, or escalate on cross-pr-overlap findings. (The `advisory: true` flag
 on the ISSUE template keeps overlap findings outside the P0/P1/P2 severity-gated merge policy.)
+The overlap signal feeds commit-workflow merge condition 5 (`04-merge-deploy.md`): when overlap
+is detected, the merge step refreshes the branch against main and re-runs the affected regression
+tests before merging — the safety net for cross-PR breakage without blocking on the signal itself.
 
 
 ### Step 1 — Eligibility Check
