@@ -14,7 +14,13 @@ import re
 import sys
 from pathlib import Path
 
-TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
+# Scan the repo we were run FROM, not the repo the script file lives in.
+# .resolve() follows the scripts/ symlink (manifest.json kind: symlink) that
+# product repos use, so __file__ would resolve into agent-infra/scripts →
+# agent-infra/tests (nonexistent) → scans nothing → CI false-pass.
+# Like every sibling check, this script is invoked from the repo root, so
+# cwd-based resolution is correct whether or not scripts/ is a symlink.
+TESTS_DIR = Path.cwd() / "tests"
 PRODUCTION_PORTS = {"6379", "6380", "16379"}
 
 # Patterns
@@ -42,10 +48,17 @@ def check_file(path: Path) -> list[str]:
 
 
 def main() -> int:
+    if not TESTS_DIR.is_dir():
+        # Never report a zero-scan pass silently — the symlink bug this check
+        # guards against produced exactly that. Make the no-op explicit.
+        print(f"⚠  No tests/ directory at {TESTS_DIR} — nothing to check.")
+        return 0
     issues = []
+    scanned = 0
     for path in sorted(TESTS_DIR.glob("*.py")):
         if path.name == "conftest.py":
             continue
+        scanned += 1
         issues.extend(check_file(path))
     if issues:
         print("⛔ Test isolation violations found:")
@@ -54,7 +67,7 @@ def main() -> int:
         print("\nFix: point tests at an isolated graph (test_<name>) "
               "or set ALLOW_DESTRUCTIVE_TESTS=1 explicitly.")
         return 1
-    print("✅ No test isolation violations.")
+    print(f"✅ No test isolation violations in {scanned} files under {TESTS_DIR}.")
     return 0
 
 
