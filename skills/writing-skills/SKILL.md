@@ -178,9 +178,9 @@ Check for divergence or missing hard links:
 # Find skills in eldato that aren't hard-linked to agent-infra
 for d in operations/skills/*/; do
   name=$(basename $d)
-  if [ -f "$d/SKILL.md" ] && [ -f "/Users/home/agent-infra/skills/$name/SKILL.md" ]; then
+  if [ -f "$d/SKILL.md" ] && [ -f "$AGENT_INFRA_PATH/skills/$name/SKILL.md" ]; then
     inode1=$(ls -i "$d/SKILL.md" | cut -d' ' -f1)
-    inode2=$(ls -i "/Users/home/agent-infra/skills/$name/SKILL.md" | cut -d' ' -f1)
+    inode2=$(ls -i "$AGENT_INFRA_PATH/skills/$name/SKILL.md" | cut -d' ' -f1)
     [ "$inode1" != "$inode2" ] && echo "NOT HARD-LINKED: $name"
   fi
 done

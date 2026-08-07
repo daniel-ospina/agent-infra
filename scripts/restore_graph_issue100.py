@@ -2,7 +2,7 @@
 """Issue #100: Restore wiped 16379/tortoise graph from fragment DB.
 
 Reads from: redislite fragment at /tmp/tortoise_restore_src.db (copy of
-    /Users/home/eldato/negation-game-explorations/tortoise/tortoise.db)
+    /home/user/eldato/tortoise.db)
 Writes to: docker FalkorDB localhost:16379, graph `tortoise_restored_20260805`
 
 Fragment stats: 2,312 statements + 1,991 operators = 4,303 total points.

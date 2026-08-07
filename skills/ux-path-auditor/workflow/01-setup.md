@@ -11,7 +11,7 @@ You will receive these parameters when invoked. Apply defaults when absent:
 | `path_map` | string | yes | Absolute or repo-relative path to `path-map.json` produced by `ux-path-mapper` |
 | `output_dir` | string | yes | Directory path to write `audit-report.json` |
 
-The `output_dir` is always an absolute path or repo-relative to `/Users/home/eldato/`. Pre-created by the `ux-qa` orchestrator. If standalone, create it manually: `mkdir -p {output_dir}`.
+The `output_dir` is always an absolute path or repo-relative to the repo root. Pre-created by the `ux-qa` orchestrator. If standalone, create it manually: `mkdir -p {output_dir}`.
 
 ## App Reference
 

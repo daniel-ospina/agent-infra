@@ -109,7 +109,7 @@ interface McpConnection {
  * ${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise} work.
  *
  * #104: the `:-` form was previously unsupported — a literal
- * "TORTOISE_HOME:-/Users/home/tortoise" was looked up as one key and
+ * "TORTOISE_HOME:-/home/user/tortoise" was looked up as one key and
  * resolved to "" whenever TORTOISE_HOME was unset, silently breaking the
  * base config's tortoise cwd/PYTHONPATH. Regex replacement cannot parse
  * nested braces, so a small scanner tracks ${ ... } depth explicitly.

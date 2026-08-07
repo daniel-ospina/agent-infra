@@ -108,7 +108,7 @@ function check(name, path, expectedContains, sessionCwd) {
 check("main checkout file", `${MAIN}/extensions/main-worktree-guard/index.ts`, "BLOCK (main checkout)", MAIN);
 check("AGENTS.md", `${MAIN}/AGENTS.md`, "BLOCK (main checkout)", MAIN);
 check("/tmp file", "/tmp/foo.md", "ALLOW (outside project)", MAIN);
-check("~/.pi extension", "/Users/home/.pi/agent/extensions/x.ts", "ALLOW (outside project)", MAIN);
+check("~/.pi extension", "/home/user/.pi/agent/extensions/x.ts", "ALLOW (outside project)", MAIN);
 // Session rooted in a worktree: main-checkout paths are outside its project → allowed.
 // Only meaningful when the suite itself runs from a worktree.
 if (!RUN_IS_MAIN) {
