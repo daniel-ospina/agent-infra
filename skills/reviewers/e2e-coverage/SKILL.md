@@ -10,7 +10,7 @@ allowed-tools: read bash grep find web_search web_fetch todo_write task
 
 > **Skill type:** Modular — independently invocable, reusable across Workflows.
 > **Continuity:** none — fresh session per invocation, no state carried between calls.
-> **Boundary:** Checks E2E TEST scenarios map to journeys. For journey-level role/state coverage, see `reviewer/ux-coverage`.
+> **Boundary:** Checks E2E TEST scenarios map to journeys. For journey-level role/state coverage, see `reviewers/ux-coverage`.
 
 Maps every high-level scenario from the epic's User Journeys to detailed E2E test cases. Ensures no journey is left untested, every critical path has coverage, and edge cases identified in earlier substeps are reflected in the E2E descriptions.
 

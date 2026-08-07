@@ -6,7 +6,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
-> **Sync note:** Local copy at `~/.claude/skills/ux-path-mapper/SKILL.md`. Repo copy at `operations/skills/ux-path-mapper/SKILL.md`. Keep in sync.
+> **Sync note:** Canonical copy at `agent-infra/skills/ux-path-mapper/SKILL.md`. Product repos hard-link into `operations/skills/ux-path-mapper/SKILL.md`; Pi reads via `~/.pi/agent/skills`. Edit the agent-infra copy only.
 
 # UX Path Mapper
 

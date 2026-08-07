@@ -1,37 +1,35 @@
 ---
 name: skill-sync
-description: "Use after creating, editing, or deleting any skill in .agents/skills/. Commits skill changes to the repo for version control and disaster recovery."
+description: "Use after creating, editing, or deleting any skill in agent-infra/skills/. Commits skill changes to the repo for version control and disaster recovery."
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
-version: 2.1.0
+version: 2.2.0
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 # Skill Sync
 
-## Overview
+## Architecture
 
-Single-mirror architecture. `.agents/skills/` is the canonical skill directory — both Claude Code and Pi read from here. The repo copy is the single source of truth.
+**Canonical home: `agent-infra/skills/`** — the git-tracked source of truth for all shared skills (see `writing-skills` → Cross-Repo Hard-Link Pattern). There is no separate canonical directory and no `.agents/skills/` mirror.
 
 ```
-.agents/skills/          ← Canonical (git-tracked)
-  code-review/SKILL.md   ← Both agents read this file
-  issue-scoping/SKILL.md
-  ...
-
-.claude/skills/          ← Per-skill symlinks → ../.agents/skills/
-~/.pi/agent/skills/      ← Per-skill symlinks → .agents/skills/ (Pi loads from settings)
+agent-infra/skills/<name>/SKILL.md   ← Canonical (git-tracked, single source of truth)
+       │
+       ├── ~/.pi/agent/skills/<name>/  ← Where Pi reads at runtime (per-skill mirror/symlink)
+       └── <consumer>/operations/skills/<name>/SKILL.md  ← Hard-link or directory symlink
+                                                          (eldato, tortoise, premise-labs)
 ```
 
-There is one source of truth: `.agents/skills/`. Both agent symlinks point there.
+- **Pi reads from `~/.pi/agent/skills/`** (configured in `~/.pi/agent/settings.json`). Per `writing-skills` this is a symlink to `$AGENT_INFRA_PATH/skills`; on synced machines (see `pi-bootstrap/HANDOFF.md`) it is a folder copy refreshed by `sync.sh`. Either way, the canonical bytes live in agent-infra.
+- **Consuming repos** (eldato, tortoise, premise-labs) hard-link skill files from agent-infra into their `operations/skills/` directory — see `scripts/link-skills.sh` and `scripts/check-skill-links.sh` in agent-infra. Hard links share the same inode: editing either path edits the same bytes.
+- **No `~/.claude/skills`, no `.agents/skills`.** Both are legacy/removed — do not sync to them, do not document them as live paths.
 
-**When creating a new skill:** create it in `.agents/skills/<name>/SKILL.md` only. Symlinks pick it up automatically.
-
-**Legacy mirrors** (`.agents/skills/`, `.agents/skills/`) are deprecated — do not edit them.
+**When creating a new skill:** create it in `agent-infra/skills/<name>/SKILL.md` following `writing-skills` conventions, then commit via this skill. Product-specific skills (repo-specific paths/APIs/brands) are created directly in the product repo's `operations/skills/<name>/SKILL.md` — do NOT create those in agent-infra.
 
 ## When to Use
 
-**Automatically after ANY skill modification in `.agents/skills/`:**
+**Automatically after ANY skill modification in `agent-infra/skills/`:**
 - Creating a new skill
 - Editing an existing skill
 - Deleting a skill
@@ -79,13 +77,13 @@ Changes that cannot affect agent behavior:
 ### Step 1 — Commit Changes
 
 ```bash
-cd /path/to/repo
+cd /path/to/agent-infra
 
 # Stage all skill changes
-git add .agents/skills/
+git add skills/
 
 # Commit
-git commit -m "chore(skills): sync .agents/skills/ to repo
+git commit -m "chore(skills): sync skills/
 
 - <skill-name>: <change summary>"
 ```
@@ -98,23 +96,30 @@ git push origin main
 
 ## Creating a New Skill
 
-Create the skill in `.agents/skills/<name>/SKILL.md`, then:
+Create the skill in `agent-infra/skills/<name>/SKILL.md` (following `writing-skills` conventions), then:
 
 ```bash
-# Both agents already read from .agents/skills/ — no symlink needed.
-# Just commit the new skill.
-cd /path/to/repo
-git add .agents/skills/<name>/
+# Canonical copy is committed to agent-infra. Consumers pick it up via
+# link-skills.sh (hard-link) or their own sync mechanism.
+cd /path/to/agent-infra
+git add skills/<name>/
 git commit -m "feat(skills): add <name> skill"
 git push origin main
 ```
 
+Then, if a consumer repo needs the skill now:
+```bash
+cd /path/to/<consumer>   # e.g. eldato
+bash /path/to/agent-infra/scripts/link-skills.sh --dry-run   # review first
+bash /path/to/agent-infra/scripts/link-skills.sh
+```
+
 ## Rules
 
-- **`.agents/skills/` is the single source of truth.** Both agents read from it.
-- **No separate mirrors.** `.agents/skills/` and `.agents/skills/` are legacy — do not sync to them.
+- **`agent-infra/skills/` is the single source of truth.** Pi reads it (via `~/.pi/agent/skills/`), consumers read it (via hard links into `operations/skills/`).
+- **No legacy mirrors.** `.agents/skills/` and `~/.claude/skills/` are removed — never sync to them.
 - **Trivial changes only.** Direct commit, no PR — for typo/dead-link/formatting fixes. Non-trivial changes MUST route through `issue-workflow` (see Proportionality Gate above).
 - **One sync per edit session.** If you edit multiple skills, one sync at the end.
-- **No content changes during sync.** Fix in `.agents/skills/` first, then sync.
+- **No content changes during sync.** Fix in `agent-infra/skills/` first, then sync.
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

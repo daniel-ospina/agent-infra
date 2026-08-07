@@ -9,7 +9,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 
 # Content Reviewer — Breadth
 
-> **Sync note:** Local copy at `~/.claude/skills/content-reviewer-breadth/SKILL.md`. Repo copy at `operations/skills/content-reviewer-breadth/SKILL.md`. Keep in sync.
+> **Sync note:** Canonical copy at `agent-infra/skills/content-reviewer-breadth/SKILL.md`. Product repos hard-link into `operations/skills/content-reviewer-breadth/SKILL.md`; Pi reads via `~/.pi/agent/skills`. Edit the agent-infra copy only.
 
 Verify the draft covers all essential dimensions from the research brief. Writers sometimes drop neighborhoods, cuisines, or partners in the interest of flow. This reviewer catches those gaps before they reach publish.
 

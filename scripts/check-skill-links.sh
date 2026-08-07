@@ -10,6 +10,39 @@ set -euo pipefail
 
 AGENT_INFRA_SKILLS="${AGENT_INFRA_PATH:-$HOME/agent-infra}/skills"
 ELDATO_SKILLS="$(cd "$(dirname "$0")/.." && pwd)/operations/skills"
+
+# ── Guards ──────────────────────────────────────────────────────────────────
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# 1. Must be a git repository (worktree-safe)
+if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "❌ $REPO_ROOT is not a git repository. Run this script from a consumer repo (e.g. eldato)." >&2
+  exit 1
+fi
+
+# 2. Must be a consumer repo — agent-infra has no operations/skills (it is the canonical source)
+if [ ! -d "$ELDATO_SKILLS" ]; then
+  echo "❌ $ELDATO_SKILLS does not exist." >&2
+  echo "   This script checks agent-infra skill links in a CONSUMER repo (eldato, tortoise, premise-labs)." >&2
+  echo "   It must NOT be run from agent-infra — that repo has no operations/ directory." >&2
+  exit 1
+fi
+
+# 3. Agent-infra source must exist
+if [ ! -d "$AGENT_INFRA_SKILLS" ]; then
+  echo "❌ agent-infra skills dir not found: $AGENT_INFRA_SKILLS (set AGENT_INFRA_PATH)." >&2
+  exit 1
+fi
+
+# 4. Repo check via git remote — abort if origin points at agent-infra
+REMOTE_URL="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+case "$REMOTE_URL" in
+  *agent-infra*)
+    echo "❌ origin remote is '$REMOTE_URL' — this is agent-infra, not a consumer repo. Aborting." >&2
+    exit 1
+    ;;
+esac
+
 ISSUES=0
 
 echo "=== Skill Link Integrity Check ==="

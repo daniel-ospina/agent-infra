@@ -5,6 +5,7 @@ type: Workflow
 domain: capability
 status: live
 tags: [pipeline, project, planning, fractal, orchestrator]
+allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 summary: "Workflow skill that routes a project through the 6-stage pipeline at proportional depth."
 created: 2026-07-07
 updated: 2026-08-08
@@ -80,7 +81,7 @@ fi
 
 ## Pipeline
 
-> Sub-skills live under `../planning/shared/`. Directory scaffolding exists; individual skills are built by epic #5872.
+> Sub-skills live under `../planning/shared/`. The shared routing stubs exist and dispatch to the underlying skills (e.g. `shared/plan` routes epics to `epic-plan`).
 
 1. **Align** — Inherited from parent Epic. Only runs if standalone.
 2. **Research** — `shared/research/SKILL.md` — Targeted research (appends to epic brief if exists)
@@ -100,7 +101,7 @@ Same 3-gate pattern as epic, but proportional — faster review cycles:
 
 After Scope approval and before Plan (Stage 4): invoke `ux-design-review` skill when `UX_RATING ≥ medium`. Proportional — lighter review than epic-level.
 
-> **ponytail:** wired inline until `shared/plan/SKILL.md` is built (#5872). Extract to sub-skill when scaffolding is complete.
+> **ponytail:** wired inline. `shared/plan/SKILL.md` exists — it routes epics to `epic-plan` and keeps project planning inline here.
 
 ## Align Inheritance
 

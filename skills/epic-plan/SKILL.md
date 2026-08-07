@@ -51,7 +51,7 @@ steps:
 
 > **Ontology:** `docs/teams/organisation-design-team/data/ONTOLOGY.md` — canonical entity classes, work vocabulary, domain taxonomy.
 
-> ⚠️ **This file is an index.** The actual workflow for each sub-step is in the files below.
+> ⚠️ **This file is authoritative.** All 8 sub-steps and their review gates are defined inline below — there are no separate `workflow/` files.
 
 # Epic Planning (Modular)
 
@@ -115,11 +115,11 @@ API contracts, event schemas, type definitions. Contract-first design — define
 Fully fleshed-out test cases aligned with high-level E2E tests from `epic-scope`. Each test case is detailed enough to be implemented as an automated test.
 
 **Review gate:** 3 parallel reviewers dispatched:
-- `reviewer/e2e-coverage` — do detailed tests cover all high-level scenarios?
-- `reviewer/e2e-reproducibility` — can each test be executed (concrete setup, verifiable assertions)?
-- `reviewer/test-quality` — do tests verify user-visible outcomes (not just implementation details)? Are negative cases covered? Are known brittleness anti-patterns present?
+- `reviewers/e2e-coverage` — do detailed tests cover all high-level scenarios?
+- `reviewers/e2e-reproducibility` — can each test be executed (concrete setup, verifiable assertions)?
+- `reviewers/test-quality` — do tests verify user-visible outcomes (not just implementation details)? Are negative cases covered? Are known brittleness anti-patterns present?
 
-> **Workflow note:** `workflow/07-detailed-e2e.md` (TBD) will codify the 3-reviewer dispatch. Until then, the reviewer list above is authoritative.
+The reviewer list above is authoritative for the 3-reviewer dispatch.
 
 ### 8. Coherence Review + Risk Analysis
 Cross-substep drift detection. Risk identification with mitigation strategies. Improvement opportunities.
@@ -135,17 +135,6 @@ Every sub-step review follows the same pattern:
 3. If issues: fix, re-dispatch (convergence-gated; safety cap: 10 cycles per sub-step)
 4. If clean: proceed to next sub-step
 5. If convergence at safety cap (10 cycles): log remaining issues, proceed with warning
-
-## Sub-Step Files
-
-- [ ] `workflow/01-user-journeys.md`
-- [ ] `workflow/02-workflows.md`
-- [ ] `workflow/03-prototype.md`
-- [ ] `workflow/04-data-model.md`
-- [ ] `workflow/05-architecture.md`
-- [ ] `workflow/06-interfaces.md`
-- [ ] `workflow/07-detailed-e2e.md`
-- [ ] `workflow/08-coherence-review.md`
 
 ## What Fails If You Skip
 

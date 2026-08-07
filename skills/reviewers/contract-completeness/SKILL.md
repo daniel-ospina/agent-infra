@@ -10,7 +10,7 @@ allowed-tools: read bash grep find web_search web_fetch todo_write task
 
 > **Skill type:** Modular — independently invocable, reusable across Workflows.
 > **Continuity:** none — fresh session per invocation, no state carried between calls.
-> **Boundary:** Checks individual interface CONTRACTS (inputs, outputs, types). For system-level integration surface identification, see `reviewer/integration`.
+> **Boundary:** Checks individual interface CONTRACTS (inputs, outputs, types). For system-level integration surface identification, see `reviewers/integration`.
 
 Checks every interface defined in the epic's Interfaces section for completeness: all inputs specified with types, all outputs (including error states) defined, and all edge cases covered. An incomplete contract causes downstream implementation ambiguity.
 

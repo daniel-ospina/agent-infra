@@ -5,6 +5,7 @@ domain: engineering
 type: Workflow
 status: live
 tags: [pipeline, debugging, root-cause, workflow]
+allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 created: 2026-07-07
 updated: 2026-08-08
 steps:

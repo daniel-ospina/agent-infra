@@ -10,7 +10,7 @@ allowed-tools: read bash grep find web_search web_fetch todo_write task
 
 > **Skill type:** Modular — independently invocable, reusable across Workflows.
 > **Continuity:** none — fresh session per invocation, no state carried between calls.
-> **Boundary:** Checks risk completeness across ALL dimensions (technical, UX, data, timeline, dependency). For architecture-specific risks (SPOF, ADR contradictions), see `reviewer/architectural-soundness`.
+> **Boundary:** Checks risk completeness across ALL dimensions (technical, UX, data, timeline, dependency). For architecture-specific risks (SPOF, ADR contradictions), see `reviewers/architectural-soundness`.
 
 Audits the epic for unidentified risks across technical, UX, data, timeline, and dependency dimensions. Also verifies that every identified risk has a concrete mitigation strategy, not just a hand-wave acknowledgment.
 

@@ -10,7 +10,7 @@ allowed-tools: read bash grep find web_search web_fetch todo_write task
 
 > **Skill type:** Modular — independently invocable, reusable across Workflows.
 > **Continuity:** none — fresh session per invocation, no state carried between calls.
-> **Boundary:** Checks architecture-specific alignment (ADR contradictions, SPOF, technology choices). For cross-dimensional risk completeness, see `reviewer/risk-completeness`.
+> **Boundary:** Checks architecture-specific alignment (ADR contradictions, SPOF, technology choices). For cross-dimensional risk completeness, see `reviewers/risk-completeness`.
 
 Checks that the epic's proposed architecture aligns with the parent epic's architecture (if nested), respects existing system boundaries, and doesn't silently diverge from established design decisions. Reuses the epic-alignment review dimension from `plan-review/references/reviewers/architectural-soundness.md`.
 

@@ -81,7 +81,7 @@ Launch all 5 agents simultaneously using the subagent tool. Each agent receives:
 You are the Security specialist for a codebase audit.
 
 Follow the methodology from the security-review skill:
-- Read .agents/skills/security-review/SKILL.md for the overall approach
+- Read `../security-review/SKILL.md` for the overall approach
 - Read `../security-review/languages/javascript.md` for JS/TS patterns
 - Read `../security-review/languages/typescript.md` for TS-specific patterns
 - Read `../security-review/references/supabase-rls.md` for Supabase patterns
@@ -100,7 +100,7 @@ Use the standardized finding format.
 You are the Bug Hunting specialist for a codebase audit.
 
 Follow the methodology from the find-bugs skill:
-- Read .agents/skills/find-bugs/SKILL.md
+- Read `../find-bugs/SKILL.md`
 - Use full-codebase mode (skip Phase 1 git diff, use provided file list)
 - Apply Phases 2-5: attack surface mapping, security checklist, verification, coverage audit
 
@@ -116,7 +116,7 @@ Use the standardized finding format.
 You are the Configuration Security specialist for a codebase audit.
 
 Follow the methodology from the insecure-defaults skill:
-- Read .agents/skills/insecure-defaults/SKILL.md
+- Read `../insecure-defaults/SKILL.md`
 - Read `../insecure-defaults/references/examples.md`
 
 Scope: [FILE LIST — config files, env handling, SSR functions, edge functions]
@@ -131,7 +131,7 @@ Use the standardized finding format.
 You are the Supply Chain specialist for a codebase audit.
 
 Follow the methodology from the supply-chain-risk-auditor skill:
-- Read .agents/skills/supply-chain-risk-auditor/SKILL.md
+- Read `../supply-chain-risk-auditor/SKILL.md`
 - Read package.json and package-lock.json for dependency list
 - Use gh CLI to query GitHub metadata for each direct dependency
 
@@ -146,7 +146,7 @@ Use the standardized finding format.
 You are the Database specialist for a codebase audit.
 
 Follow the methodology from the supabase-postgres-best-practices skill:
-- Read .agents/skills/supabase-postgres-best-practices/SKILL.md
+- Read `../supabase-postgres-best-practices/SKILL.md`
 - Consult references/ files for specific rules as needed
 
 Scope: [FILE LIST — migrations, edge functions, any file using supabase client]
