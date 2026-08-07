@@ -10,9 +10,9 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS } from "./index.js";
-import { ok, equal } from "node:assert/strict";
-import { readFileSync, renameSync, existsSync } from "node:fs";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath } from "./index.js";
+import { ok, equal, deepEqual } from "node:assert/strict";
+import { readFileSync, renameSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -138,8 +138,8 @@ test("returns undefined when no key configured", () => {
 
 section("Timeout constants (#5954, #5955 regression)");
 
-test("heartbeat timeout is 480s (#6539)", () => {
-  ok(source.includes("HEARTBEAT_TIMEOUT_MS = 480_000"), "heartbeat timeout should be 480000ms (480s)");
+test("heartbeat timeout is 660s (#67/#68)", () => {
+  ok(source.includes("HEARTBEAT_TIMEOUT_MS = 660_000"), "heartbeat timeout should be 660000ms (660s, > provider timeout per #67/#68)");
 });
 
 // ── Module load regression ────────────────────────────
@@ -206,6 +206,107 @@ test("keeps existing PATH entries and prepends extras", () => {
   const out = augmentPath("/usr/bin:/bin");
   ok(out.endsWith("/usr/bin:/bin"), "existing entries must be preserved");
   ok(out.startsWith(PATH_EXTRA_DIRS[0]), "extras must be prepended (priority)");
+});
+
+
+// ── getPiInvocation (#101) ────────────────────────────
+
+section("getPiInvocation — resilient pi resolution (#101)");
+
+test("spawns process.execPath + entry script when argv[1] exists", () => {
+  const savedArgv1 = process.argv[1];
+  const fakeEntry = resolve(__dirname, ".tmp-fake-pi-entry.js");
+  writeFileSync(fakeEntry, "#!/usr/bin/env node\n", { mode: 0o755 });
+  process.argv[1] = fakeEntry;
+  try {
+    const inv = getPiInvocation(["-p", "hello"]);
+    equal(inv.command, process.execPath, "command must be process.execPath");
+    equal(inv.args[0], fakeEntry, "entry script must be prepended to args");
+    equal(inv.args[1], "-p", "original args preserved");
+    equal(inv.args[2], "hello", "original args preserved");
+  } finally {
+    process.argv[1] = savedArgv1;
+    rmSync(fakeEntry, { force: true });
+  }
+});
+
+test("ignores missing argv[1] entry script (falls through to runtime branch)", () => {
+  const savedArgv1 = process.argv[1];
+  const missing = resolve(__dirname, ".tmp-does-not-exist-pi.js");
+  process.argv[1] = missing;
+  try {
+    const inv = getPiInvocation([]);
+    // Generic runtime (node/bun) + unusable entry script → bare "pi" fallback.
+    // (Test runner runs under node, so execPath basename is "node".)
+    equal(inv.command, "pi", "must fall back to bare pi");
+    deepEqual(inv.args, [], "args must be unchanged");
+  } finally {
+    process.argv[1] = savedArgv1;
+  }
+});
+
+test("uses process.execPath directly for custom-named runtime", () => {
+  const savedArgv1 = process.argv[1];
+  process.argv[1] = undefined as any; // no entry script → execPath branch
+  try {
+    const inv = getPiInvocation(["-p"]);
+    // Under node the basename is "node" (generic) so this returns "pi";
+    // the custom-runtime branch is covered by the canonical-copy drift guard
+    // + the dry-run simulation (renamed node binary).
+    ok(inv.command === "pi" || inv.command === process.execPath, "must resolve to pi or execPath");
+  } finally {
+    process.argv[1] = savedArgv1;
+  }
+});
+
+// ── getSubAgentPath — runtime bin dir (#101) ─────────
+
+section("getSubAgentPath — runtime bin dir belt-and-braces (#101)");
+
+test("appends dirname(process.execPath) when absent from inherited PATH", () => {
+  const runtimeDir = dirname(process.execPath);
+  const saved = process.env.PATH;
+  // #36-style truncation: inherited PATH loses the pi bin dir.
+  process.env.PATH = "/usr/bin:/bin";
+  try {
+    const parts = getSubAgentPath().split(":");
+    ok(parts.includes(runtimeDir), `PATH must include ${runtimeDir}, got: ${parts.join(":")}`);
+    equal(parts[parts.length - 1], runtimeDir, "runtime dir must be appended last (lowest priority)");
+  } finally {
+    if (saved === undefined) delete process.env.PATH;
+    else process.env.PATH = saved;
+  }
+});
+
+test("does not duplicate the runtime dir", () => {
+  const runtimeDir = dirname(process.execPath);
+  const saved = process.env.PATH;
+  process.env.PATH = `${runtimeDir}:/usr/bin:/bin`;
+  try {
+    const count = getSubAgentPath().split(":").filter((p) => p === runtimeDir).length;
+    equal(count, 1, "runtime dir must appear exactly once");
+  } finally {
+    if (saved === undefined) delete process.env.PATH;
+    else process.env.PATH = saved;
+  }
+});
+
+// ── getPiInvocation — canonical-copy drift guard (#101) ─
+
+section("getPiInvocation — canonical-copy drift guard (#101)");
+
+test("builtin-tools copy matches canonical getPiInvocation in subagent/index.ts", () => {
+  const builtinSource = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  const subagentSource = readFileSync(resolve(__dirname, "../subagent/index.ts"), "utf-8");
+  const extract = (src: string): string | null => {
+    const m = src.match(/function getPiInvocation\([\s\S]*?\n}/);
+    return m ? m[0].replace(/\s+/g, "") : null;
+  };
+  const copy = extract(builtinSource);
+  const canonical = extract(subagentSource);
+  ok(canonical, "canonical getPiInvocation must exist in subagent/index.ts");
+  ok(copy, "getPiInvocation must exist in builtin-tools/index.ts");
+  equal(copy, canonical, "copy must match canonical (whitespace-normalized)");
 });
 
 

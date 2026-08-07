@@ -11,8 +11,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { readFileSync } from "node:fs";
+import * as fs from "node:fs";
 import { spawn } from "node:child_process";
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
+import * as path from "node:path";
 import { retry, createCircuitBreaker } from "../shared/retry.js";
 import { register } from "../shared/health.js";
 
@@ -73,7 +75,47 @@ export function augmentPath(inheritedPath: string): string {
 }
 
 export function getSubAgentPath(): string {
-  return augmentPath(process.env.PATH ?? "");
+  const augmented = augmentPath(process.env.PATH ?? "");
+  // #101: belt-and-braces — also expose the pi runtime bin dir so bare `pi`
+  // (or anything else in the pi-node install) still resolves when the inherited
+  // PATH lost it under #36 truncation. Appended as a low-priority fallback.
+  const runtimeBinDir = getRuntimeBinDir();
+  if (runtimeBinDir && !augmented.split(":").includes(runtimeBinDir)) {
+    return `${augmented}:${runtimeBinDir}`;
+  }
+  return augmented;
+}
+
+/** Absolute bin dir of the running runtime (e.g. the pi-node install), if any. */
+export function getRuntimeBinDir(): string | undefined {
+  const dir = dirname(process.execPath);
+  return dir && dir !== "." ? dir : undefined;
+}
+
+/**
+ * Resolve the pi executable the resilient way — spawn `process.execPath` +
+ * resolved entry script so a truncated PATH can't cause `spawn pi ENOENT`.
+ * Canonical copy: extensions/subagent/index.ts getPiInvocation() (~line 276).
+ * Keep in sync — guarded by builtin-tools.test.ts "getPiInvocation matches
+ * canonical copy" drift test.
+ * Fallbacks (identical to canonical):
+ *   - no usable entry script + generic runtime (node/bun) → bare "pi" (PATH)
+ *   - custom-named runtime (e.g. bun-compiled binary) → process.execPath
+ */
+export function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	const currentScript = process.argv[1];
+	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
+	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
+		return { command: process.execPath, args: [currentScript, ...args] };
+	}
+
+	const execName = path.basename(process.execPath).toLowerCase();
+	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
+	if (!isGenericRuntime) {
+		return { command: process.execPath, args };
+	}
+
+	return { command: "pi", args };
 }
 
 export function stripHtml(html: string): string {
@@ -389,7 +431,10 @@ export default function (pi: ExtensionAPI) {
    */
   function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[]): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
     return new Promise((resolve) => {
-      const proc = spawn("pi", args, {
+      // #101: spawn via process.execPath + resolved entry script (same as the
+      // subagent tool) so a truncated PATH can't cause a non-retryable ENOENT.
+      const invocation = getPiInvocation(args);
+      const proc = spawn(invocation.command, invocation.args, {
         cwd: process.cwd(),
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
