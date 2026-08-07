@@ -48,7 +48,7 @@ Before building HTML, run the pre-render quality gate. This gate **BLOCKS render
 **Token hygiene:** Verify the canonical build script is tokenized:
 
 ```bash
-grep -q "var(--purple)" .agents/skills/carousel-b2b-design/scripts/build_carousel.cjs || {
+grep -q "var(--purple)" skills/carousel-b2b-design/scripts/build_carousel.cjs || {
   echo "❌ build_carousel.cjs is not tokenized. Use the canonical version."
   exit 1
 }
@@ -74,7 +74,7 @@ Validate `script.yaml` and `selected-images.yaml` against schemas. Fail fast on 
 **⚠️ CRITICAL: Always use the canonical build script.** Never write ad-hoc HTML generation code for carousel rendering.
 
 ```bash
-node .agents/skills/carousel-b2b-design/scripts/build_carousel.cjs \
+node skills/carousel-b2b-design/scripts/build_carousel.cjs \
   --script docs/carousels/<slug>/script.yaml \
   --images docs/carousels/<slug>/selected-images.yaml \
   --output docs/carousels/<slug>/carousel.html
@@ -168,7 +168,7 @@ Cycle reporting: "Cycle 1: 4 issues → Cycle 2: 1 → Clean ✓"
 >
 > **Linter pass (mandatory post-render):** After checklist passes, run the visual hierarchy linter:
 > ```bash
-> node .agents/skills/carousel-b2b-design/scripts/linter.mjs docs/carousels/<slug>/carousel.html
+> node skills/carousel-b2b-design/scripts/linter.mjs docs/carousels/<slug>/carousel.html
 > ```
 > This checks contrast ratios (≥4.5:1 WCAG AA), safe zone positions, typography scale, and raw hex values. (Yellow area check removed per #4429 — carousel-designer handles visual judgment.)
 > Linter P0 failures (contrast, safe zones) block delivery. P1/P2 are warnings.

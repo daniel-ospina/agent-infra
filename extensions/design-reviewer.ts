@@ -19,9 +19,9 @@ interface PromptComponents {
 }
 
 function loadPromptComponents(carouselDir: string): PromptComponents {
-  const skillPath = resolve(PROJECT_ROOT, ".agents/skills/carousel-designer/SKILL.md");
-  const briefPath = resolve(PROJECT_ROOT, ".agents/skills/carousel-b2b-design/reference/SAFE_ZONE_BRIEF.md");
-  const tokensPath = resolve(PROJECT_ROOT, ".agents/skills/carousel-b2b-design/scripts/tokens.json");
+  const skillPath = resolve(PROJECT_ROOT, "skills/carousel-designer/SKILL.md");
+  const briefPath = resolve(PROJECT_ROOT, "skills/carousel-b2b-design/reference/SAFE_ZONE_BRIEF.md");
+  const tokensPath = resolve(PROJECT_ROOT, "skills/carousel-b2b-design/scripts/tokens.json");
 
   const skill = existsSync(skillPath) ? readFileSync(skillPath, "utf8") : "";
   const brief = existsSync(briefPath) ? readFileSync(briefPath, "utf8") : "";
