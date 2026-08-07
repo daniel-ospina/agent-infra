@@ -60,7 +60,7 @@ type node >/dev/null 2>&1 || { echo "❌ Node.js not found."; echo "   Install N
 [ -d node_modules/playwright ] || { echo "❌ npm dependencies not installed."; echo "   Run: npm install"; exit 1; }
 
 # 7. Template seed script (build_carousel.cjs provides valid HTML structure for carousel_designer to refine)
-[ -f .agents/skills/carousel-b2b-design/scripts/build_carousel.cjs ] || echo "⚠️ build_carousel.cjs not found — template seed unavailable. carousel_designer can still generate from scratch.";
+[ -f skills/carousel-b2b-design/scripts/build_carousel.cjs ] || echo "⚠️ build_carousel.cjs not found — template seed unavailable. carousel_designer can still generate from scratch.";
 
 # 8. yaml npm package (needed for status.yaml read/write)
 node -e "require('yaml')" >/dev/null 2>&1 || { echo "❌ 'yaml' npm package not found."; echo "   Run: npm install yaml"; exit 1; }
@@ -533,8 +533,8 @@ After design renders PNGs, run post-render QA:
 task --prompt "Run art-director Gate 2 (post-render) for carousel at docs/carousels/<slug>/.
 The design skill has rendered PNGs to docs/carousels/<slug>/slides/.
 Run:
-1. linter.mjs: node .agents/skills/carousel-b2b-design/scripts/linter.mjs docs/carousels/<slug>/carousel.html
-2. Visual regression: npx playwright test .agents/skills/carousel-b2b-design/scripts/visual-regression.spec.ts (if baselines exist)
+1. linter.mjs: node skills/carousel-b2b-design/scripts/linter.mjs docs/carousels/<slug>/carousel.html
+2. Visual regression: npx playwright test skills/carousel-b2b-design/scripts/visual-regression.spec.ts (if baselines exist)
 3. carousel-designer: read_image on each slide PNG, critique against tokens.json (brand, typography, contrast, safe zones, composition, rendering)
 4. Image-script cross-reference: every needs_image slide has an image in selected-images.yaml
 Aggregate results. Return pass/fail with specific issues."

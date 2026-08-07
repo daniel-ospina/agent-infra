@@ -22,11 +22,11 @@ name: Carousel Visual Regression
 on:
   pull_request:
     paths:
-      - '.agents/skills/carousel-b2b-design/scripts/build_carousel.cjs'
-      - '.agents/skills/carousel-b2b-design/scripts/render.cjs'
-      - '.agents/skills/carousel-b2b-design/scripts/visual-regression.spec.ts'
-      - '.agents/skills/carousel-b2b-design/scripts/visual-regression-fixture.html'
-      - '.agents/skills/carousel-b2b-design/scripts/visual-regression.spec.ts-snapshots/**'
+      - 'skills/carousel-b2b-design/scripts/build_carousel.cjs'
+      - 'skills/carousel-b2b-design/scripts/render.cjs'
+      - 'skills/carousel-b2b-design/scripts/visual-regression.spec.ts'
+      - 'skills/carousel-b2b-design/scripts/visual-regression-fixture.html'
+      - 'skills/carousel-b2b-design/scripts/visual-regression.spec.ts-snapshots/**'
       - 'playwright.config.ts'
 
 jobs:

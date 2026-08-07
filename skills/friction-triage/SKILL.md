@@ -61,11 +61,16 @@ The broken pipeline produces issues that prescribe solutions before understandin
 
 ## Step 1 — Gather
 
-Read friction data (run from an eldato repo checkout — reflect.py writes these under `docs/teams/<team>/operations/`, see eldato `operations/memory/reflect.py`):
+Read friction data. The current writer is `extensions/reflect-hook.ts` — session data lands in `~/.tortoise/session-events/<date>.jsonl` (and hosted tortoise `/v1/sessions` once `TORTOISE_API_KEY` is set). Legacy eldato checkouts also write under `docs/teams/<team>/operations/`:
 
 ```bash
-ls -t docs/teams/*/operations/*postmortem* | head -1
-cat docs/teams/organisation-design-team/operations/friction_events.jsonl
+# Current source (reflect-hook):
+ls -t ~/.tortoise/session-events/*.jsonl 2>/dev/null | head -1
+cat "$(ls -t ~/.tortoise/session-events/*.jsonl 2>/dev/null | head -1)" 2>/dev/null
+
+# Legacy eldato source (if a checkout exists):
+ls -t docs/teams/*/operations/*postmortem* 2>/dev/null | head -1
+cat docs/teams/organisation-design-team/operations/friction_events.jsonl 2>/dev/null
 ```
 
 Extract: friction types, frequencies, timestamps, double-loop flags.

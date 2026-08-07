@@ -18,7 +18,7 @@ These are the interface that `layout-composer` (#4291) and `visual-hierarchy-lin
 
 ### Tokens
 
-Single source of truth: `.agents/skills/carousel-b2b-design/scripts/tokens.json`
+Single source of truth: `skills/carousel-b2b-design/scripts/tokens.json`
 
 <!-- Canonical values in tokens.json — update both if tokens change. Inline copy below is a convenience fallback. -->
 ```json
@@ -122,7 +122,7 @@ Run before `carousel-b2b-design` renders. Checks:
 # Forbidden: #5B3B8C, #F2C94C, etc. (except in :root block definition)
 node -e "
 const fs = require('fs');
-const css = fs.readFileSync('.agents/skills/carousel-b2b-design/scripts/build_carousel.cjs','utf8');
+const css = fs.readFileSync('skills/carousel-b2b-design/scripts/build_carousel.cjs','utf8');
 
 // Extract CSS from template literal: const CSS = (fontFace) => \`...CSS...\`;
 const cssMatch = css.match(/const CSS\\s*=\\s*\\([^)]*\\)\\s*=>\\s*\`([\\s\\S]*?)\`;/);
@@ -135,7 +135,7 @@ if (!extractedCSS.trim()) {
 // Load tokens with fallback — tokens.json may not exist yet (created by #4291)
 let tokens;
 try {
-  tokens = require('.agents/skills/carousel-b2b-design/scripts/tokens.json');
+  tokens = require('skills/carousel-b2b-design/scripts/tokens.json');
 } catch (e) {
   tokens = { purple: '#5B3B8C', purpleDeep: '#3F2766', purpleD2: '#34204F',
              yellow: '#F2C94C', white: '#FFFFFF', cream: '#EFE9DC', muted: '#C9BBE0' };
@@ -184,13 +184,13 @@ After render completes, run three QA checks:
 
 **1. Linter (static CSS analysis):**
 ```bash
-node .agents/skills/carousel-b2b-design/scripts/linter.mjs docs/carousels/<slug>/carousel.html
+node skills/carousel-b2b-design/scripts/linter.mjs docs/carousels/<slug>/carousel.html
 ```
 Checks: contrast ratios, safe zone positions, typography scale, emphasis color area, raw hex values.
 
 **2. Visual regression (pixel diff):**
 ```bash
-npx playwright test .agents/skills/carousel-b2b-design/scripts/visual-regression.spec.ts
+npx playwright test skills/carousel-b2b-design/scripts/visual-regression.spec.ts
 ```
 Compares rendered PNGs against baseline templates. Catches CSS regressions and rendering drift.
 
@@ -218,12 +218,12 @@ Return gate results to `carousel-b2b-strategy`. Pass/fail with specific issues. 
 ## Reference
 
 - Integration: wired into `carousel-b2b-strategy` at Steps 3.6 (Gate 1) and 6.5 (Gate 2) via #4403. Original skill scaffolding: #4304.
-- Design tokens: `.agents/skills/carousel-b2b-design/scripts/tokens.json`
-- Build script: `.agents/skills/carousel-b2b-design/scripts/build_carousel.cjs`
+- Design tokens: `skills/carousel-b2b-design/scripts/tokens.json`
+- Build script: `skills/carousel-b2b-design/scripts/build_carousel.cjs`
 - Instagram format research: `docs/teams/organisation-design-team/domains (S1)/capability/2026-06-21-instagram-format-research.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`)
 - Epic research: `docs/epics/2026-06-21-frontend-design-upgrade-research.md`
 - Layout composer: #4291 (implements slide templates per these rules)
-- Visual hierarchy linter (#4292): `.agents/skills/carousel-b2b-design/scripts/linter.mjs` (Gate 2 automated checks)
+- Visual hierarchy linter (#4292): `skills/carousel-b2b-design/scripts/linter.mjs` (Gate 2 automated checks)
 - Visual regression: #4296 (rendering consistency baselines)
 - Design reviewer: #4401 (AI visual design critique, Gate 2)
 ---

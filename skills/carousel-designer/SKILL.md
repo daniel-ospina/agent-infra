@@ -19,7 +19,7 @@ Evaluates rendered carousel slide images against approved copy, design direction
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `carousel_dir` | Yes | Path to `docs/carousels/<slug>/` containing rendered PNGs, script.yaml, carousel.html |
-| `token_path` | No | Path to tokens.json. Default: `.agents/skills/carousel-b2b-design/scripts/tokens.json` |
+| `token_path` | No | Path to tokens.json. Default: `skills/carousel-b2b-design/scripts/tokens.json` |
 | `design_direction` | Yes | User's words describing aesthetic (e.g., "editorial, clean, purple family, yellow accent") |
 
 Additional inputs read from carousel directory:

@@ -558,7 +558,7 @@ ISSUE:
 **Agent #11 — Security Review** (always-on):
 ```
 You are the security reviewer for this PR. Apply the security-review skill discipline:
-1. Read /Users/home/agent-infra/skills/security-review/SKILL.md IN FULL first.
+1. Read the security-review skill IN FULL first (resolve via $AGENT_INFRA_PATH/skills/security-review/SKILL.md or skills/security-review/SKILL.md relative to the agent-infra checkout).
 2. RESEARCH before reporting: trace where the changed code's inputs come from, check for
    validation/sanitization elsewhere, check config/middleware, note framework protections.
 3. Report ONLY HIGH-CONFIDENCE findings: a clear vulnerable pattern WITH attacker-controlled
@@ -640,7 +640,7 @@ If DATA_TOUCHED = false, skip (no data/ontology surface to review).
 **Agent #12 — Config Reviewer** (surface: `CONFIG_TOUCHED`):
 ```
 You are the config reviewer for this PR. Apply the config-validation skill discipline
-(read /Users/home/agent-infra/skills/config-validation/SKILL.md if available):
+(read skills/config-validation/SKILL.md if available):
 1. Config changes are validated by the mapped check script for their file type
    (migrations → check-migration-*, skills → check-skill-lint, etc.).
 2. Verify: env var names match what the code actually reads; no secrets in configs
