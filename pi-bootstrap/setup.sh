@@ -15,7 +15,7 @@ mkdir -p "$DEST"
 echo "==> Copying config into $DEST"
 
 # Back up any existing settings/models (so nothing is lost)
-for f in settings.json models.json; do
+for f in settings.json models.json models-store.json; do
   if [ -f "$DEST/$f" ] && [ ! -f "$DEST/$f.bak-bootstrap" ]; then
     cp "$DEST/$f" "$DEST/$f.bak-bootstrap"
     echo "    backed up existing $f"
@@ -57,9 +57,40 @@ PY
     echo "    settings.json copied (python3 not found - plain copy)"
   fi
 }
+merge_models_store() {
+  # Merge provider blocks: source wins per-provider; local providers survive.
+  # Within a provider, keep the entry with the newer checkedAt (pi's runtime
+  # catalog refreshes must survive a sync; a freshly-regenerated snapshot still
+  # pushes updates). No-op if the snapshot doesn't ship models-store.json.
+  [ -f "$SRC/models-store.json" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$SRC/models-store.json" "$DEST/models-store.json" << 'PY'
+import json, os, sys
+src = json.load(open(sys.argv[1]))
+dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
+merged = {**dst, **src}
+for provider, src_entry in src.items():
+    dst_entry = dst.get(provider)
+    if not isinstance(src_entry, dict) or not isinstance(dst_entry, dict):
+        continue
+    src_ts = src_entry.get("checkedAt")
+    dst_ts = dst_entry.get("checkedAt")
+    dst_newer = isinstance(dst_ts, (int, float)) and (
+        not isinstance(src_ts, (int, float)) or dst_ts > src_ts
+    )
+    if dst_newer:
+        merged[provider] = dst_entry
+json.dump(merged, open(sys.argv[2], "w"), indent=2)
+print("    models-store.json merged (runtime catalog state preserved)")
+PY
+  else
+    cp "$SRC/models-store.json" "$DEST/models-store.json"
+    echo "    models-store.json copied (python3 not found - plain copy)"
+  fi
+}
 merge_settings
 merge_models
-[ -f "$SRC/models-store.json" ] && cp "$SRC/models-store.json" "$DEST/models-store.json"
+merge_models_store
 
 # Folders (merge; overwrite same-named files)
 cp -R "$SRC/agents"           "$DEST/agents"
