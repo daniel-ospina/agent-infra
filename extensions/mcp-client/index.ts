@@ -361,7 +361,9 @@ class McpServerManager {
         command: config.command,
         args: config.args ?? [],
         env,
-        cwd: config.cwd,
+        // cwd may contain ${VAR} placeholders (e.g. TORTOISE_HOME in the base
+        // config) — expand like env/headers, or the spawn fails with ENOENT.
+        cwd: config.cwd ? expandEnvVars({ cwd: config.cwd }).cwd : undefined,
       });
     } else {
       throw new Error(

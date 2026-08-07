@@ -83,17 +83,28 @@ await test("nearest .mcp.json wins (subdir beats git top-level)", () => {
 await test("does not escape the git top-level (no stray parent pickup)", () => {
   const repo = tempDir("mcp-resolve-bound-");
   gitInit(repo);
-  // Put a decoy ABOVE the git top-level: it must NOT win.
-  const parent = join(repo, "..");
-  const decoy = join(parent, ".mcp.json");
-  const hadDecoy = existsSync(decoy);
-  if (!hadDecoy) writeJson(parent, ".mcp.json", { mcpServers: { decoy: {} } });
-  const sub = join(repo, "deep");
-  mkdirSync(sub, { recursive: true });
+  // Isolate HOME so a real ~/.pi/agent/.mcp.json (installed by setup.sh) can
+  // never leak into this test — the walk must terminate at the git top-level.
+  const fakeHome = tempDir("mcp-resolve-home-");
+  const prevHome = process.env.HOME;
+  process.env.HOME = fakeHome;
+  try {
+    // Put a decoy ABOVE the git top-level: it must NOT win.
+    const parent = join(repo, "..");
+    const decoy = join(parent, ".mcp.json");
+    const hadDecoy = existsSync(decoy);
+    if (!hadDecoy) writeJson(parent, ".mcp.json", { mcpServers: { decoy: {} } });
+    const sub = join(repo, "deep");
+    mkdirSync(sub, { recursive: true });
 
-  const found = resolveMcpJsonPath(sub);
-  ok(found === null || found.startsWith(repo), `resolved outside repo: ${found}`);
-  if (!hadDecoy) rmSync(decoy, { force: true });
+    const found = resolveMcpJsonPath(sub);
+    // in-repo config (if any) OR nothing — never the decoy, never ~/.pi fallback
+    ok(found === null || found.startsWith(repo), `resolved outside repo: ${found}`);
+    if (!hadDecoy) rmSync(decoy, { force: true });
+  } finally {
+    process.env.HOME = prevHome;
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
 });
 
 section("resolveMcpJsonPath — ~/.pi/agent fallback");
