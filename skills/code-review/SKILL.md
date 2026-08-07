@@ -423,13 +423,13 @@ Store all variables for Step 4 dispatch.
 
 ### Step 4 — Parallel Review (5-8 agents, proportional to complexity ratings)
 
-Launch **5 always-on agents** (Guidance, Bug-Shallow, Bug-Deep, History, PR Comments) plus **up to 3 conditional domain agents** (UX, Architecture, Data) in parallel via Pi `task`. Conditional agents activate based on complexity ratings extracted in Step 3.6. Each receives the PR diff, CLAUDE.md paths, affected files, and research context (if any). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
+Launch **6 always-on agents** (Guidance, Bug-Shallow, Bug-Deep, History, PR Comments, Security) plus **up to 3 conditional domain agents** (UX, Architecture, Data) in parallel via Pi `task`. Conditional agents activate based on complexity ratings extracted in Step 3.6. Each receives the PR diff, CLAUDE.md paths, affected files, and research context (if any). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
 
 **Dispatch logic:**
 ```bash
 # Always dispatch
-# Always-on: 5 agents (Agent #2 split into shallow + deep — #2a and #2b)
-AGENTS="Agent #1 (Guidance), Agent #2a (Bug Scan - Shallow), Agent #2b (Bug Scan - Deep), Agent #3 (History), Agent #4 (PR Comments)"
+# Always-on: 6 agents (Agent #2 split into shallow + deep — #2a and #2b; Security is #11)
+AGENTS="Agent #1 (Guidance), Agent #2a (Bug Scan - Shallow), Agent #2b (Bug Scan - Deep), Agent #3 (History), Agent #4 (PR Comments), Agent #11 (Security)"
 
 # Conditional dispatch (domain-aware — requires both rating AND surface match from Step 3.6)
 { [ "$UX_RATING" = "medium" ] || [ "$UX_RATING" = "high" ]; } && [ "$TSX_TOUCHED" = "true" ] && AGENTS="$AGENTS, Agent #5 (UX — epic reviewers)"
@@ -541,6 +541,28 @@ ISSUE:
   description: <repeated issue from PR #N>
   suggestion: <what to fix>
 ```
+
+**Agent #11 — Security Review** (always-on):
+```
+You are the security reviewer for this PR. Apply the security-review skill discipline:
+1. Read /Users/home/agent-infra/skills/security-review/SKILL.md IN FULL first.
+2. RESEARCH before reporting: trace where the changed code's inputs come from, check for
+   validation/sanitization elsewhere, check config/middleware, note framework protections.
+3. Report ONLY HIGH-CONFIDENCE findings: a clear vulnerable pattern WITH attacker-controlled
+   input. MEDIUM confidence → "Needs verification" note. LOW/theoretical → do not report.
+4. Do NOT flag: test files, dead/commented code, documentation strings, server-controlled
+   config values, code requiring prior auth (note the auth requirement instead), or
+   pre-existing issues not touched by this PR.
+5. Focus areas for this PR: the diff (git show main...HEAD or gh pr diff <N>).
+```
+For each issue return:
+ISSUE:
+  check_type: security
+  severity: P0|P1|P2
+  location: <file path>:<line>
+  description: <vulnerability, why exploitable, attacker-controlled input path>
+  suggestion: <fix>
+If no high-confidence findings: NO ISSUES FOUND
 
 **Agent #5 — UX Reviewer** (conditional: UX_RATING >= medium + TSX_TOUCHED = true):
 
@@ -1011,7 +1033,7 @@ curl -s -o /dev/null -X POST \
 true
 ```
 
-**Check types:** `CLAUDE.md-adherence`, `comment-compliance`, `bug`, `historical-context`, `pr-comment-history`, `sql-test-gap`, `content-generation-gap`, `gate-warning`, `continuity-directive`, `frontmatter`, `broken-reference`, `sequence-correctness`, `handover-contract`, `gate-placement`, `orchestrator-dependency`, `io-contract`, `review-gate-integration`, `standalone-invocability`, `cross-skill-assumption`, `vocabulary-conflict`, `ontology-drift`, `downstream-impact`, `template-validity`, `subject-registry`, `runtime-safety`, `error-handling`, `silent-failure`, `config-validity`, `ux-consistency`, `ux-coverage`, `ux-realism`, `integration`, `architectural-soundness`, `contract-completeness`, `schema-correctness`, `ontology-alignment`, `e2e-coverage`, `e2e-reproducibility`
+**Check types:** `CLAUDE.md-adherence`, `comment-compliance`, `bug`, `historical-context`, `pr-comment-history`, `security`, `sql-test-gap`, `content-generation-gap`, `gate-warning`, `continuity-directive`, `frontmatter`, `broken-reference`, `sequence-correctness`, `handover-contract`, `gate-placement`, `orchestrator-dependency`, `io-contract`, `review-gate-integration`, `standalone-invocability`, `cross-skill-assumption`, `vocabulary-conflict`, `ontology-drift`, `downstream-impact`, `template-validity`, `subject-registry`, `runtime-safety`, `error-handling`, `silent-failure`, `config-validity`, `ux-consistency`, `ux-coverage`, `ux-realism`, `integration`, `architectural-soundness`, `contract-completeness`, `schema-correctness`, `ontology-alignment`, `e2e-coverage`, `e2e-reproducibility`
 **Severity:** `high` (90-100), `medium` (70-89), `low` (50-69)
 
 ## Standard-Tier Review (`--standard-tier`)

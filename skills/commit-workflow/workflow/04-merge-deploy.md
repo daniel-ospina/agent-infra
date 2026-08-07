@@ -1,5 +1,31 @@
 > **Step 4/5** | ← requires: `03-code-review.md` | → next: `05-cleanup.md`
 
+# Merge Gate — AI Review (no human approval)
+
+Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
+
+1. **Appropriate review clean** — the review matched to the ISSUE CONTENT + PR diff surface
+   returned 0 P0 and 0 P1 (fixer loop converged; Qwen final gate clean when applicable). The review
+   is domain-dispatched, not one-size. ALWAYS-ON reviewers: bug scan (shallow+deep), guidance
+   compliance, history, prior-PR comments, and SECURITY (security-review skill — HIGH-confidence
+   findings only, research-before-report). Domain reviewers as applicable: infrastructure
+   (skills/extensions/.mcp.json/ontology) → Skill Infrastructure / Ontology & Templates /
+   Extension Safety; UX → ux-verification; config/research/docs → proportional review.
+   Dispatch per `code-review` Step 0.8 (infra detection) + Step 3.6 (complexity + surface matrix)
+   and `test-routing` (domain-aware verification). P2s are noted, not blockers.
+2. **Pre-flight passed** — tests/typecheck per the risk tier in `01-preflight.md`; for PRs
+   touching runtime code, the affected test suites are green (regression check — no regressions).
+3. **Verification gate passed** — the [VGATE] sub-agent verified all staged files (matching hashes).
+4. **PR mergeable** — GitHub reports MERGEABLE (no conflicts).
+
+**Human escalation (only for):** P0 findings requiring an architectural or security decision —
+irreversible operations, data loss, security breach — and only after the code-review fixer loop
+escalation (per the `code-review` skill, Step 6.5 Orchestrator Escalation) is exhausted.
+Everything else proceeds unattended and auto-merges per the code-review Auto-Continue protocol.
+
+Post-merge verification below (deploys, smoke tests, clickthrough) remains **warn-only**:
+it detects problems and auto-files issues, never blocks.
+
 
 ## Step 3.6 — Deploy Edge Functions
 
