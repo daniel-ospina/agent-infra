@@ -45,22 +45,33 @@ git diff --name-only origin/main...HEAD
 
 | File Pattern | Check Script | What It Validates |
 |---|---|---|
-| `supabase/migrations/*.sql` | `check-migration-order` | Timestamp ordering |
-| `supabase/migrations/*.sql` | `check-migration-drift` | Schema consistency |
-| `supabase/functions/**` | `check-edge-schema` | Edge function schemas |
-| `supabase/functions/**` | `check-edge-function-selects` | Query patterns |
-| `skills/**` | `check-skill-lint` | Skill file conventions |
-| `docs/**` | `check-wiki-lint` | Wiki formatting |
-| `src/**` (i18n) | `check-i18n-coverage` | Translation coverage |
-| `*.test.*` changes | `check-test-regression` | Test flakiness |
+| `supabase/migrations/*.sql` | `check-migration-order.cjs` | Timestamp ordering |
+| `supabase/migrations/*.sql` | `check-migration-drift` *[planned — not yet ported]* | Schema consistency |
+| `supabase/functions/**` | `check-edge-schema` *[planned — not yet ported]* | Edge function schemas |
+| `supabase/functions/**` | `check-edge-function-selects` *[planned — not yet ported]* | Query patterns |
+| `skills/**` | `check-skill-lint.mjs` | Skill file conventions |
+| `docs/**` | `check-wiki-lint` *[planned — not yet ported]* | Wiki formatting |
+| `src/**` (i18n) | `check-i18n-coverage` *[planned — not yet ported]* | Translation coverage |
+| `*.test.*` changes | `check-test-regression.cjs` | Test flakiness |
+
+> *[planned]* rows are tracked in the test-routing Skill Registry (Status `new (#NNNN)`) and are **not** yet in `scripts/` — running them reports missing-non-blocking per graceful degradation below. Do NOT remove them from the map when they land; port the script into `scripts/` (canonical tree) and drop the marker.
 
 ### Step 3 — Run Applicable Scripts
 
 ```bash
 # ponytail: run each applicable check, collect results
 for script in <applicable-scripts>; do
-  bash "scripts/$script" 2>&1
+  if [ -f "scripts/$script" ]; then
+    case "$script" in
+      *.mjs|*.cjs|*.js) node "scripts/$script" 2>&1 ;;   # Node gates
+      *.sh)             bash "scripts/$script" 2>&1 ;;  # shell gates
+      *)                bash "scripts/$script" 2>&1 ;;  # extensionless → legacy bash
+    esac
+  else
+    echo "⚠️  MISSING: scripts/$script not found — check not run (see Step 2 planned rows)"
+  fi
   echo "EXIT:$?"  # capture exit code
+  echo ""
 done
 ```
 
@@ -83,7 +94,7 @@ done
 **Action:** Fix check-skill-lint failure before merge.
 ```
 
-**Graceful degradation:** If a script is missing or errors, report the error, don't crash. Missing checks are not blocking.
+**Graceful degradation:** If a script is missing or errors, report the error, don't crash. Missing checks are not blocking — but they must be SEEN (a silently skipped gate is a no-op). Scripts marked *[planned]* in Step 2 are expected to be missing until ported.
 
 ## Pipeline Handoff
 
