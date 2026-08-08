@@ -1,8 +1,19 @@
 // tortoise-capture.test.ts — behavioral smoke tests (#7423)
 // Verifies conversation extraction and markdown generation (pure functions).
 // Integration surface (spawn) verified via manual ingest smoke test.
+// #312 delta 2: hosted-cloud capture helpers are imported from the real module
+// (vitest resolves TS natively now) and exercised with a mocked global fetch.
 
-import { describe, test, expect } from "vitest";
+import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  cloudConfig,
+  isCloudEnabled,
+  writeCloudFallback,
+  captureToHosted,
+} from "./index";
 
 // Replicate the pure functions inline (cannot import .ts extension in vitest with jiti)
 function extractText(content: unknown): string | null {
@@ -418,5 +429,149 @@ describe("#125/#167 deriveTopics/deriveStoryArch", () => {
       title: "T", date: "2026-08-05", sessionId: "s1",
     });
     expect(md).toContain('sourcePath: ""');
+  });
+});
+
+// #312 delta 2 — hosted-cloud capture path (real module, mocked fetch)
+
+describe("#312 cloudConfig/isCloudEnabled", () => {
+  beforeEach(() => {
+    delete process.env.TORTOISE_API_KEY;
+    delete process.env.TORTOISE_API_URL;
+  });
+
+  test("cloud unset/false → NOT enabled (local ingest path unchanged)", () => {
+    expect(isCloudEnabled({ autoCapture: true })).toBe(false);
+    expect(isCloudEnabled({ autoCapture: true, cloud: false })).toBe(false);
+    // even with a key, cloud must be explicitly true to switch paths
+    expect(isCloudEnabled({ autoCapture: true, cloud: false, apiKey: "tt_x" })).toBe(false);
+  });
+
+  test("cloud:true requires an api key", () => {
+    expect(isCloudEnabled({ autoCapture: true, cloud: true })).toBe(false);
+    expect(isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "" })).toBe(false);
+    expect(isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "  " })).toBe(false);
+    expect(isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "tt_x" })).toBe(true);
+  });
+
+  test("apiKey is trimmed before the emptiness check", () => {
+    expect(isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "  tt_x  " })).toBe(true);
+    expect(cloudConfig({ autoCapture: true, apiKey: "  tt_x  " }).apiKey).toBe("tt_x");
+  });
+
+  test("apiUrl defaults to premiselabs and strips trailing slashes", () => {
+    expect(cloudConfig({ autoCapture: true }).apiUrl).toBe("https://api.premiselabs.co");
+    expect(cloudConfig({ autoCapture: true, apiUrl: "https://example.com/" }).apiUrl).toBe("https://example.com");
+    expect(cloudConfig({ autoCapture: true, apiUrl: "https://example.com///" }).apiUrl).toBe("https://example.com");
+  });
+
+  test("env vars (TORTOISE_API_KEY / TORTOISE_API_URL) win over file config — mirrors reflect-hook", () => {
+    const fromFile = cloudConfig({ autoCapture: true, apiUrl: "https://file.example.com", apiKey: "tt_file" });
+    expect(fromFile.apiKey).toBe("tt_file");
+    expect(fromFile.apiUrl).toBe("https://file.example.com");
+
+    process.env.TORTOISE_API_KEY = "tt_env";
+    process.env.TORTOISE_API_URL = "https://env.example.com/";
+    try {
+      const fromEnv = cloudConfig({ autoCapture: true, apiUrl: "https://file.example.com", apiKey: "tt_file" });
+      expect(fromEnv.apiKey).toBe("tt_env");
+      expect(fromEnv.apiUrl).toBe("https://env.example.com");
+      expect(isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "tt_file" })).toBe(true);
+    } finally {
+      delete process.env.TORTOISE_API_KEY;
+      delete process.env.TORTOISE_API_URL;
+    }
+  });
+});
+
+describe("#312 captureToHosted", () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  test("POSTs {session_id, conversation, metadata} to {apiUrl}/v1/sessions with Bearer auth", async () => {
+    const fetchMock = vi.fn(async (url: unknown, init: RequestInit) => {
+      expect(url).toBe("https://api.premiselabs.co/v1/sessions");
+      expect((init.headers as Record<string, string>).Authorization).toBe("Bearer tt_test");
+      expect((init.headers as Record<string, string>)["Content-Type"]).toBe("application/json");
+      const body = JSON.parse(String(init.body));
+      expect(body.session_id).toBe("sess-1");
+      expect(body.conversation).toEqual([{ role: "user", content: "hello" }]);
+      expect(body.metadata.source).toBe("pi-agent-end");
+      return { ok: true, status: 200 } as Response;
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await captureToHosted(
+      "https://api.premiselabs.co",
+      "tt_test",
+      {
+        session_id: "sess-1",
+        conversation: [{ role: "user", content: "hello" }],
+        metadata: { source: "pi-agent-end", capturedAt: new Date().toISOString() },
+      },
+      "/tmp/record.jsonl",
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("Captured session sess-1"));
+  });
+
+  test("logs HTTP error detail and does not throw on non-2xx", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      ({ ok: false, status: 500, json: async () => ({ detail: "boom" }) }) as unknown as Response,
+    );
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(
+      captureToHosted("https://x.example", "tt_test", { session_id: "s", conversation: [], metadata: {} }, "/tmp/r.jsonl"),
+    ).resolves.toBeUndefined();
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("HTTP 500"));
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("boom"));
+  });
+
+  test("logs network failure and does not throw", async () => {
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("ECONNREFUSED");
+    });
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(
+      captureToHosted("https://x.example", "tt_test", { session_id: "s", conversation: [], metadata: {} }, "/tmp/r.jsonl"),
+    ).resolves.toBeUndefined();
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("ECONNREFUSED"));
+  });
+});
+
+describe("#312 writeCloudFallback (JSONL durable record before network attempt)", () => {
+  test("appends one JSON object per session to the fallback dir", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tc-fallback-"));
+    process.env.TORTOISE_FALLBACK_DIR = dir;
+    vi.resetModules();
+    const mod = await import("./index");
+    try {
+      const record = { session_id: "s1", conversation: [{ role: "user", content: "hi" }] };
+      const filePath = mod.writeCloudFallback(record);
+      expect(filePath.startsWith(dir)).toBe(true);
+      const lines = readFileSync(filePath, "utf-8").trim().split("\n");
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0])).toEqual(record);
+
+      // second write appends (JSONL), never overwrites
+      mod.writeCloudFallback({ session_id: "s2" });
+      expect(readFileSync(filePath, "utf-8").trim().split("\n")).toHaveLength(2);
+    } finally {
+      delete process.env.TORTOISE_FALLBACK_DIR;
+      vi.resetModules();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
