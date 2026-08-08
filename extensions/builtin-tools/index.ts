@@ -445,7 +445,14 @@ export default function (pi: ExtensionAPI) {
       let stderr = "";
       let lastHeartbeat = Date.now();
       let settled = false;
-      const HEARTBEAT_TIMEOUT_MS = 660_000;
+      // #489 class: pi in print mode BUFFERS output — a sub-agent doing long
+      // consecutive tool calls (bash → read → edit) emits nothing to stdout
+      // until the final turn message. The old 660s threshold (set to exceed
+      // the provider timeout per #67/#68) killed productive implementation
+      // agents mid-work. Default raised to 30 min; overridable via env.
+      // Clamped ≥ 60s: negative/zero/NaN/Infinity env values can't disable
+      // the kill path or kill productive agents instantly (#489).
+      const HEARTBEAT_TIMEOUT_MS = Math.max(60_000, Number(process.env.TASK_HEARTBEAT_TIMEOUT_MS) || 1_800_000);
       const FIRST_OUTPUT_TIMEOUT_MS = 60_000;
       let hasOutput = false;
 

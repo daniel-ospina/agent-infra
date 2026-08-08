@@ -138,8 +138,8 @@ test("returns undefined when no key configured", () => {
 
 section("Timeout constants (#5954, #5955 regression)");
 
-test("heartbeat timeout is 660s (#67/#68)", () => {
-  ok(source.includes("HEARTBEAT_TIMEOUT_MS = 660_000"), "heartbeat timeout should be 660000ms (660s, > provider timeout per #67/#68)");
+test("heartbeat timeout default is 30 min, env-overridable (#489)", () => {
+  ok(source.includes("Math.max(60_000, Number(process.env.TASK_HEARTBEAT_TIMEOUT_MS) || 1_800_000)"), "heartbeat timeout should default to 30 min (1_800_000ms), be env-overridable, and clamp ≥60s — raised from 660s because pi print-mode buffers output, so long tool-call sequences looked like silence and killed productive sub-agents (#489)");
 });
 
 // ── Module load regression ────────────────────────────
