@@ -3,6 +3,29 @@
 // Agent never manually calls anything. Non-blocking, fire-and-forget.
 //
 // Arch: DEC-006 (graph): JSONL event log + FalkorDB. Markdown docs in ~/.tortoise/docs/.
+//
+// #312 delta 2 — hosted-cloud capture path (mirrors reflect-hook): when
+// `cloud: true` AND an API key is present, agent_end sessions are POSTed to
+// {apiUrl}/v1/sessions instead of running `python -m tortoise.ingest` locally.
+// The local-file path is unchanged (byte-identical) when cloud is unset/false.
+// A durable JSONL record (~/.tortoise/session-events/) is written BEFORE the
+// network attempt so a teardown mid-fetch never loses data silently.
+//
+// Idempotency contract (server: POST /v1/sessions): full re-send under the
+// same session_id is upsert-idempotent — turn points are keyed
+// {session_id}_t{i} with MERGE, extracted claims dedup by content-hash
+// (tortoise hosted_api capture_session). This extension re-sends the FULL
+// conversation per agent_end (O(n²) transfer for long sessions is a known
+// limitation to revisit before flipping cloud on as a default).
+//
+// Retention: the JSONL fallback is a MANUAL-recovery record — nothing auto-
+// syncs it; it grows unbounded. Prune as needed; it mirrors ~/.tortoise/docs/.
+//
+// Config (env vars override ~/.pi/agent/tortoise-config.json):
+//   autoCapture        — enable capture at all (default false)
+//   cloud              — true = hosted capture (requires apiKey; default false)
+//   apiKey             — Bearer key (tt_...) for hosted capture (or TORTOISE_API_KEY)
+//   apiUrl             — hosted API base (or TORTOISE_API_URL; default https://api.premiselabs.co)
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
@@ -22,6 +45,12 @@ interface TortoiseConfig {
   tortoiseSrcDir?: string;
   /** Model spec for point extraction. Default: "mock:TortoiseM0" */
   pointModel?: string;
+  /** #312: hosted-cloud capture. When true AND apiKey is set, sessions POST to {apiUrl}/v1/sessions instead of local python ingest. */
+  cloud?: boolean;
+  /** #312: hosted API base URL. Default: https://api.premiselabs.co */
+  apiUrl?: string;
+  /** #312: Bearer key (tt_...) required to enable hosted capture. */
+  apiKey?: string;
 }
 
 function expandTilde(p: string): string {
@@ -214,6 +243,94 @@ function countMessageBlocks(filePath: string): number {
     return matches ? matches.length : 0;
   } catch {
     return 0;
+  }
+}
+
+// ── Hosted-cloud capture (#312, mirrors reflect-hook) ────
+
+const DEFAULT_API_URL = "https://api.premiselabs.co";
+/** #312 scope v3: the /v1/sessions sync endpoint needs more than reflect-hook's 10s. */
+const CLOUD_TIMEOUT_MS = 30_000;
+/** Durable JSONL event log written before every network attempt (data never lost). */
+const CLOUD_FALLBACK_DIR =
+  process.env.TORTOISE_FALLBACK_DIR || join(homedir(), ".tortoise", "session-events");
+
+/** Resolve hosted API base + key — env wins, file falls back, apiUrl defaults (mirrors reflect-hook). */
+export function cloudConfig(config: TortoiseConfig): { apiUrl: string; apiKey: string } {
+  const apiKey = (process.env.TORTOISE_API_KEY || config.apiKey || "").trim();
+  const apiUrl =
+    (process.env.TORTOISE_API_URL || config.apiUrl || "").replace(/\/+$/, "") ||
+    DEFAULT_API_URL;
+  return { apiUrl, apiKey };
+}
+
+/** Cloud mode is active only when explicitly enabled AND a key exists. */
+export function isCloudEnabled(config: TortoiseConfig): boolean {
+  return config.cloud === true && cloudConfig(config).apiKey.length > 0;
+}
+
+/** Append a durable JSONL record (shaped like the /v1/sessions payload) BEFORE the network attempt. */
+export function writeCloudFallback(record: Record<string, unknown>): string {
+  mkdirSync(CLOUD_FALLBACK_DIR, { recursive: true });
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const filePath = join(CLOUD_FALLBACK_DIR, `${dateStr}.jsonl`);
+  appendFileSync(filePath, JSON.stringify(record) + "\n", "utf-8");
+  return filePath;
+}
+
+/** POST session to hosted /v1/sessions. Never throws; honest success/error logging. */
+export async function captureToHosted(
+  apiUrl: string,
+  apiKey: string,
+  payload: Record<string, unknown>,
+  localRecordPath: string,
+): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CLOUD_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${apiUrl}/v1/sessions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (res.ok) {
+      console.log(
+        `[tortoise-capture] Captured session ${payload.session_id} (${(payload.conversation as unknown[]).length} turns) → hosted tortoise (${apiUrl}); local record kept at ${localRecordPath}`,
+      );
+      return;
+    }
+    let detail = `HTTP ${res.status}`;
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      if (body.detail) detail += ` — ${JSON.stringify(body.detail)}`;
+    } catch {
+      // non-JSON error body — status is enough
+    }
+    throw new Error(detail);
+  } catch (err: unknown) {
+    // #312 review P2: surface the real cause (undici wraps network failures in
+    // err.cause) and name timeouts explicitly instead of "This operation was
+    // aborted". The JSONL record is a manual-recovery artifact — nothing auto-
+    // syncs it, so say what it actually is.
+    let reason: string;
+    if (err instanceof Error && err.name === "AbortError") {
+      reason = "timed out after 30s";
+    } else if (err instanceof Error && err.cause instanceof Error) {
+      reason = err.cause.message;
+    } else if (err instanceof Error) {
+      reason = err.message;
+    } else {
+      reason = String(err);
+    }
+    console.error(
+      `[tortoise-capture] Hosted capture FAILED (${reason}) — a manual-recovery JSONL record was kept at ${localRecordPath}`, 
+    );
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -430,13 +547,35 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
       // Update tracking state
       state.lastMessageCount = conversation.length;
 
-      // #125 metadata-only capture: frontmatter enrichment + metadata ingest.
-      // runClassify removed — tortoise.doc_classify does not exist (was a
-      // silent failure on every capture). Topics/summary are TS heuristics.
-      runFrontmatter(filePath, config);
+      if (isCloudEnabled(config)) {
+        // #312: hosted-cloud path — REPLACES local python ingest. Durable JSONL
+        // record is written BEFORE the network attempt (data never lost); the
+        // POST is fire-and-forget with a bounded 30s timeout, never awaited so
+        // the capture lock releases immediately for active sessions.
+        const { apiUrl, apiKey } = cloudConfig(config);
+        const payload = {
+          session_id: sessionId,
+          conversation,
+          metadata: {
+            source: "pi-agent-end",
+            topics: deriveTopics(conversation),
+            summary: deriveStoryArch(conversation),
+            messageCount: conversation.length,
+            sourcePath: filePath,
+            capturedAt: new Date().toISOString(),
+          },
+        };
+        const localRecordPath = writeCloudFallback(payload);
+        void captureToHosted(apiUrl, apiKey, payload, localRecordPath);
+      } else {
+        // #125 metadata-only capture: frontmatter enrichment + metadata ingest.
+        // runClassify removed — tortoise.doc_classify does not exist (was a
+        // silent failure on every capture). Topics/summary are TS heuristics.
+        runFrontmatter(filePath, config);
 
-      // Fire-and-forget metadata-only ingest into FalkorDB (#125)
-      runIngest(filePath, config, "--capture-metadata");
+        // Fire-and-forget metadata-only ingest into FalkorDB (#125)
+        runIngest(filePath, config, "--capture-metadata");
+      }
     } catch (err: unknown) {
       console.error("[tortoise-capture] capture failed:", err);
     } finally {
@@ -444,7 +583,18 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
     }
   });
 
-  console.log("[tortoise-capture] enabled — auto-capturing conversations to ~/.tortoise/docs/");
+  if (isCloudEnabled(config)) {
+    const { apiUrl } = cloudConfig(config);
+    console.log(
+      `[tortoise-capture] enabled — cloud capture ON: sessions POST to ${apiUrl}/v1/sessions (local python ingest replaced)`,
+    );
+  } else if (config.cloud === true) {
+    console.warn(
+      `[tortoise-capture] cloud: true but no apiKey/TORTOISE_API_KEY — falling back to local ingest (set apiKey in ${configPath()})`,
+    );
+  } else {
+    console.log("[tortoise-capture] enabled — auto-capturing conversations to ~/.tortoise/docs/");
+  }
 }
 
 // ── Extraction pipeline helpers ──────────────────────────
