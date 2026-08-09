@@ -11,6 +11,16 @@
 // A durable JSONL record (~/.tortoise/session-events/) is written BEFORE the
 // network attempt so a teardown mid-fetch never loses data silently.
 //
+// Idempotency contract (server: POST /v1/sessions): full re-send under the
+// same session_id is upsert-idempotent — turn points are keyed
+// {session_id}_t{i} with MERGE, extracted claims dedup by content-hash
+// (tortoise hosted_api capture_session). This extension re-sends the FULL
+// conversation per agent_end (O(n²) transfer for long sessions is a known
+// limitation to revisit before flipping cloud on as a default).
+//
+// Retention: the JSONL fallback is a MANUAL-recovery record — nothing auto-
+// syncs it; it grows unbounded. Prune as needed; it mirrors ~/.tortoise/docs/.
+//
 // Config (env vars override ~/.pi/agent/tortoise-config.json):
 //   autoCapture        — enable capture at all (default false)
 //   cloud              — true = hosted capture (requires apiKey; default false)
@@ -302,9 +312,22 @@ export async function captureToHosted(
     }
     throw new Error(detail);
   } catch (err: unknown) {
-    const reason = err instanceof Error ? err.message : String(err);
+    // #312 review P2: surface the real cause (undici wraps network failures in
+    // err.cause) and name timeouts explicitly instead of "This operation was
+    // aborted". The JSONL record is a manual-recovery artifact — nothing auto-
+    // syncs it, so say what it actually is.
+    let reason: string;
+    if (err instanceof Error && err.name === "AbortError") {
+      reason = "timed out after 30s";
+    } else if (err instanceof Error && err.cause instanceof Error) {
+      reason = err.cause.message;
+    } else if (err instanceof Error) {
+      reason = err.message;
+    } else {
+      reason = String(err);
+    }
     console.error(
-      `[tortoise-capture] Hosted capture FAILED (${reason}) — session saved to ${localRecordPath} for later sync`,
+      `[tortoise-capture] Hosted capture FAILED (${reason}) — a manual-recovery JSONL record was kept at ${localRecordPath}`, 
     );
   } finally {
     clearTimeout(timer);

@@ -575,3 +575,40 @@ describe("#312 writeCloudFallback (JSONL durable record before network attempt)"
     }
   });
 });
+
+describe("#312 captureToHosted error-path coverage (review P2)", () => {
+  test("names a 30s timeout explicitly (AbortError), no throw", async () => {
+    globalThis.fetch = vi.fn(async () => {
+      throw Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+    });
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    await expect(
+      captureToHosted("https://x.example", "tt_test", { session_id: "s", conversation: [], metadata: {} }, "/tmp/r.jsonl"),
+    ).resolves.toBeUndefined();
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("timed out after 30s"));
+  });
+
+  test("surfaces the wrapped cause (undici err.cause), not bare 'fetch failed'", async () => {
+    globalThis.fetch = vi.fn(async () => {
+      const cause = new Error("connect ECONNREFUSED 127.0.0.1:443");
+      throw Object.assign(new Error("fetch failed"), { cause });
+    });
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    await expect(
+      captureToHosted("https://x.example", "tt_test", { session_id: "s", conversation: [], metadata: {} }, "/tmp/r.jsonl"),
+    ).resolves.toBeUndefined();
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("ECONNREFUSED"));
+    expect(err).not.toHaveBeenCalledWith(expect.stringContaining("for later sync"));
+  });
+
+  test("non-JSON error body degrades to status code, no throw", async () => {
+    globalThis.fetch = vi.fn(async () =>
+      ({ ok: false, status: 502, json: async () => { throw new SyntaxError("bad json"); } }) as unknown as Response,
+    );
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    await expect(
+      captureToHosted("https://x.example", "tt_test", { session_id: "s", conversation: [], metadata: {} }, "/tmp/r.jsonl"),
+    ).resolves.toBeUndefined();
+    expect(err).toHaveBeenCalledWith(expect.stringContaining("HTTP 502"));
+  });
+});
