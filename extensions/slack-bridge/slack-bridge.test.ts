@@ -171,7 +171,12 @@ class MockSlack {
   port: number;
   server: Server;
   requests: { url: string; headers: any; form: URLSearchParams; body: string }[] = [];
-  respond: (req: any, form: URLSearchParams) => any = () => ({ ok: true, ts: "123.456" });
+  respond: (req: any, form: URLSearchParams) => any = (req2: any, form2: URLSearchParams) => {
+    if (req2.url === "/conversations.replies") {
+      return { ok: true, messages: [{ ts: form2.get("ts"), text: "root" }] };
+    }
+    return { ok: true, ts: "123.456" };
+  };
   status = 200;
 
   constructor() {
@@ -770,11 +775,12 @@ try {
     const blocks = JSON.parse(posted[0].form.get("blocks")!);
     assert(blocks.some((b: any) => b.type === "actions"), "scan: posted message has action buttons");
 
-    // Dedup: unchanged file → nothing new posted
+    // Dedup: unchanged file → nothing new POSTED (reply-polling is expected)
     slack.requests = [];
     const r2 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
     assert(r2.posted === 0 && r2.updated === 0, "scan: dedup — no re-post");
-    assert(slack.requests.length === 0, "scan: dedup — no API calls");
+    const posts = slack.requests.filter((r) => r.url === "/chat.postMessage");
+    assert(posts.length === 0, "scan: dedup — no postMessage API calls");
 
     // Verdict transition: review_approval() wrote approved → mirrored to thread
     writeApprovals([
@@ -793,6 +799,66 @@ try {
     const state = JSON.parse(readFileSync(stateFile, "utf-8"));
     assert(state["apr-111"]?.status === "approved", "scan: dedup state persisted");
     assert(state["apr-222"]?.status === "pending", "scan: role-chain request tracked without posting");
+  } finally {
+    __setApprovalStateFile(null);
+    __setSlackApiUrl(null);
+    await slack.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── Approval conversation loop (#1402) ──
+{
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const slack = new MockSlack();
+  __setSlackApiUrl(`http://localhost:${slack.port}`);
+  const dir = tmpDir();
+  const stateFile = join(dir, "seen.json");
+  __setApprovalStateFile(stateFile);
+  const approvalsFile = join(dir, "approvals.json");
+  const writeApprovals = (arr: any[]) => writeFileSync(approvalsFile, JSON.stringify(arr, null, 2));
+  const base = [
+    { id: "apr-1", from_role: "product-implementer", artifact: "epic-scope.md",
+      context: "SCOPE approval for epic 195", status: "pending", reviewer: "human",
+      created_at: "2026-08-10T00:00:00Z" },
+  ];
+  try {
+    // Human gate posts to Slack; state records ts for the thread.
+    writeApprovals(base);
+    const r1 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r1.posted === 1, `conversation: gate posted (got ${r1.posted})`);
+
+    // Agent follow-up with parent → posted INTO the parent thread.
+    writeApprovals([...base, {
+      id: "apr-2", from_role: "product-implementer", artifact: "epic-scope.md",
+      context: "RE: apr-1 — answer to your question: schema change is additive",
+      status: "pending", reviewer: "human", parent: "apr-1",
+      created_at: "2026-08-10T00:01:00Z",
+    }]);
+    const r2 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r2.posted === 1, `conversation: follow-up posted (got ${r2.posted})`);
+    const posts = slack.requests.filter((r) => r.url === "/chat.postMessage");
+    const followUp = posts.find((r) => r.form.get("blocks")?.includes("apr-2"));
+    assert(followUp?.form.get("thread_ts") === "123.456",
+      "conversation: follow-up replies in the parent thread");
+
+    // Human replies in the thread → mirrored into approvals.json.
+    slack.respond = (req: any, form: URLSearchParams) => {
+      if (req.url === "/conversations.replies") {
+        return { ok: true, messages: [
+          { ts: form.get("ts"), text: "root" },
+          { user: "U123", ts: "999.001", text: "Why are you changing the schema?" },
+        ]};
+      }
+      return { ok: true, ts: "123.456" };
+    };
+    await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    const after = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+    const withThread = after.find((a: any) => a.id === "apr-1");
+    assert(withThread?.thread?.length === 1, "conversation: human reply mirrored");
+    assert(withThread.thread[0].text === "Why are you changing the schema?",
+      "conversation: reply text preserved");
+    assert(withThread.thread[0].author === "U123", "conversation: reply author preserved");
   } finally {
     __setApprovalStateFile(null);
     __setSlackApiUrl(null);

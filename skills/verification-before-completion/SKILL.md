@@ -246,10 +246,10 @@ When a human gate fires — proof adjudication: FAILURES that block the "done" c
 
 ```bash
 # Role-based escalation (non-epic gates):
-APPROVAL_NO_NOTIFY=0 python3 -c "
+python3 -c "
 from operations.coordination.approval import request_approval
 request_approval('product-implementer', artifact='<verify-evidence>.md', context='<task> proof gate for issue <N>')
-print('Approval request created — osascript dialog fired')
+print('Approval request created')
 "
 ```
 
