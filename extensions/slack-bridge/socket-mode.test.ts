@@ -29,6 +29,7 @@ import {
   ackEnvelope,
   processBlockAction,
   writeVerdictToApprovalsFile,
+  updateResolvedMessage,
   type SocketModeState,
 } from "./socket-mode.js";
 
@@ -587,7 +588,148 @@ async function startConnected(opts: {
   await wsServer.kill();
 }
 
-// ── Test 13 (implicit): existing 102 tests stay green ──
+// ── Test 13: click with channel+container → chat.update settles the message ──
+{
+  const api = new MockOpenAPI(); // responds {ok:true} to any path — chat.update included
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-150a", from_role: "product-implementer", status: "pending", reviewer: "human" },
+  ]);
+  const seenFile = join(dir, "seen.json");
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  const state: SocketModeState = {
+    ws: null, reconnectTimer: null, consecutiveFails: 0, wantRunning: false,
+    approvalsFile, stateFile: seenFile, appToken: "xapp-test", apiUrl: `http://localhost:${api.port}`,
+  };
+  processBlockAction({
+    type: "block_actions",
+    user: { id: "U150", username: "carol" },
+    actions: [{ action_id: "approval_accept", block_id: "approval_apr-150a", value: "accept:apr-150a", type: "button" }],
+    channel: { id: "C150" },
+    container: { message_ts: "1712345678.000150" },
+  }, state);
+  const got = await waitFor(() => api.requests.some((r) => r.url === "/chat.update"), 2000);
+  assert(got, "chat.update: called after button click");
+  const upd = api.requests.find((r) => r.url === "/chat.update");
+  assert(upd?.headers.authorization === "Bearer xoxb-test", "chat.update: bot token auth");
+  const form = new URLSearchParams(upd?.body ?? "");
+  assert(form.get("channel") === "C150", "chat.update: channel from payload.channel.id");
+  assert(form.get("ts") === "1712345678.000150", "chat.update: ts from payload.container.message_ts");
+  const blocks = JSON.parse(form.get("blocks") ?? "[]");
+  assert(blocks.length === 2, "chat.update: section + context blocks (no actions)");
+  assert(blocks[0]?.type === "section" && (blocks[0]?.text?.text ?? "").includes("✅ *Approved*"),
+    "chat.update: section shows Approved verdict");
+  assert((blocks[0]?.text?.text ?? "").includes("by carol"), "chat.update: reviewer (username) named");
+  assert(/· \d{4}-\d{2}-\d{2}T/.test(blocks[0]?.text?.text ?? ""), "chat.update: UTC ISO timestamp");
+  assert(blocks[1]?.type === "context" && (blocks[1]?.elements?.[0]?.text ?? "").includes("resolved via button"),
+    "chat.update: context line says via button");
+  assert((blocks[1]?.elements?.[0]?.text ?? "").includes("apr-150a"), "chat.update: context carries approval id");
+  assert(!blocks.some((b: any) => b.type === "actions"), "chat.update: no action buttons remain");
+  // chat.update must never affect the verdict write
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].status === "approved", "chat.update: verdict still written");
+  delete process.env.SLACK_BOT_TOKEN;
+  await api.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 14: payload without channel/container → no chat.update, verdict unaffected ──
+{
+  const api = new MockOpenAPI();
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-150b", from_role: "product-implementer", status: "pending", reviewer: "human" },
+  ]);
+  const seenFile = join(dir, "seen.json");
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  const state: SocketModeState = {
+    ws: null, reconnectTimer: null, consecutiveFails: 0, wantRunning: false,
+    approvalsFile, stateFile: seenFile, appToken: "xapp-test", apiUrl: `http://localhost:${api.port}`,
+  };
+  processBlockAction({
+    type: "block_actions",
+    user: { id: "U150", username: "carol" },
+    actions: [{ action_id: "approval_reject", block_id: "approval_apr-150b", value: "reject:apr-150b", type: "button" }],
+    // no channel, no container — helper must no-op silently
+  }, state);
+  await sleep(150);
+  assert(!api.requests.some((r) => r.url === "/chat.update"), "missing channel/ts: zero chat.update calls");
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].status === "rejected", "missing channel/ts: verdict still written");
+  delete process.env.SLACK_BOT_TOKEN;
+  await api.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 15: already-resolved click (dedup) still settles the UI ──
+{
+  const api = new MockOpenAPI();
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-150c", from_role: "product-implementer", status: "approved", reviewer: "human" },
+  ]);
+  const seenFile = join(dir, "seen.json");
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  const state: SocketModeState = {
+    ws: null, reconnectTimer: null, consecutiveFails: 0, wantRunning: false,
+    approvalsFile, stateFile: seenFile, appToken: "xapp-test", apiUrl: `http://localhost:${api.port}`,
+  };
+  processBlockAction({
+    type: "block_actions",
+    user: { id: "U150", username: "carol" },
+    actions: [{ action_id: "approval_accept", block_id: "approval_apr-150c", value: "accept:apr-150c", type: "button" }],
+    channel: { id: "C150" },
+    container: { message_ts: "1712345678.000150" },
+  }, state);
+  const got = await waitFor(() => api.requests.some((r) => r.url === "/chat.update"), 2000);
+  assert(got, "dedup click: chat.update still fired (stale message settles)");
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].status === "approved", "dedup click: approvals.json untouched (no double write)");
+  delete process.env.SLACK_BOT_TOKEN;
+  await api.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 16: updateResolvedMessage direct contract ──
+{
+  const api = new MockOpenAPI();
+  // No token → false, zero HTTP
+  delete process.env.SLACK_BOT_TOKEN;
+  const noTok = await updateResolvedMessage({ channel: "C1", ts: "1.2", verdict: "approved", apiUrl: `http://localhost:${api.port}` });
+  assert(noTok === false, "update: no SLACK_BOT_TOKEN → false");
+  await sleep(100);
+  assert(!api.requests.some((r) => r.url === "/chat.update"), "update: no token → zero HTTP calls");
+  // Missing ts → false silently, zero HTTP
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  const noTs = await updateResolvedMessage({ channel: "C1", verdict: "approved", apiUrl: `http://localhost:${api.port}` });
+  assert(noTs === false, "update: missing ts → false");
+  await sleep(100);
+  assert(!api.requests.some((r) => r.url === "/chat.update"), "update: missing ts → zero HTTP calls");
+  // Rejected verdict: text + reviewerId as mention + file source
+  const ok = await updateResolvedMessage({
+    channel: "C1", ts: "1.2", verdict: "rejected", reviewerId: "U150", approvalId: "apr-x",
+    source: "file", apiUrl: `http://localhost:${api.port}`,
+  });
+  assert(ok === true, "update: success → true");
+  const upd = api.requests.find((r) => r.url === "/chat.update");
+  const form = new URLSearchParams(upd?.body ?? "");
+  const blocks = JSON.parse(form.get("blocks") ?? "[]");
+  assert(blocks[0]?.text?.text.includes("❌ *Rejected*"), "update: rejected verdict text");
+  assert(blocks[0]?.text?.text.includes("<@U150>"), "update: reviewerId rendered as mention");
+  assert(blocks[1]?.elements?.[0]?.text.includes("resolved via file"), "update: source=file in context");
+  // Empty apiUrl falls through to SLACK_API_URL env (#149 contract)
+  const api2 = new MockOpenAPI();
+  process.env.SLACK_API_URL = `http://localhost:${api2.port}`;
+  const fall = await updateResolvedMessage({ channel: "C2", ts: "2.3", verdict: "approved", apiUrl: "" });
+  assert(fall === true, "update: empty apiUrl falls through to SLACK_API_URL env");
+  assert(api2.requests.some((r) => r.url === "/chat.update"), "update: env target received chat.update");
+  delete process.env.SLACK_API_URL;
+  delete process.env.SLACK_BOT_TOKEN;
+  await api2.kill();
+  await api.kill();
+}
+
+// ── Test 17 (implicit): existing 102 tests stay green ──
 // Covered by running slack-bridge.test.ts separately with no SLACK_APP_TOKEN.
 
 console.log(`\nsocket-mode.test.ts: ${passed} passed, ${failed} failed`);

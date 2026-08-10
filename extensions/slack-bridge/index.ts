@@ -29,6 +29,7 @@ import {
   isSocketModeEnabled,
   startSocketModeReceiver,
   stopSocketModeReceiver,
+  updateResolvedMessage,
   type SocketModeState,
 } from "./socket-mode.ts";
 
@@ -610,6 +611,21 @@ export async function scanApprovals(opts?: {
     } else if (prev.status === "pending" && status !== "pending") {
       // Decision written by review_approval() — mirror to the thread.
       const res = await postApprovalUpdate(req, prev, token);
+      // #150: settle the ORIGINAL message too — replace the Accept/Reject
+      // buttons with a resolution banner (the thread reply alone left the
+      // buttons live forever). Fire-and-forget: failures are logged inside
+      // the helper and never affect the verdict/dedup state; legacy
+      // {status}-only seen entries without channel/ts no-op silently.
+      void updateResolvedMessage({
+        channel: prev.channel,
+        ts: prev.ts,
+        verdict: status,
+        // "human" is the gate marker, not a reviewer — don't name it.
+        reviewerName: req.reviewer && req.reviewer !== "human" ? req.reviewer : undefined,
+        approvalId: req.id,
+        source: "file",
+        apiUrl: getSlackApiUrl(),
+      }).catch(() => {});
       if (res.ok) {
         state[req.id] = { ...prev, status };
         result.updated++;

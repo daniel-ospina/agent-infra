@@ -81,6 +81,16 @@ function assert(condition: boolean, label: string): void {
   else { failed++; console.error(`❌ FAIL: ${label}`); }
 }
 
+/** Poll cond() until true or timeout (fire-and-forget HTTP needs a tick). */
+async function waitFor(cond: () => boolean, ms = 3000): Promise<boolean> {
+  const start = Date.now();
+  for (;;) {
+    if (cond()) return true;
+    if (Date.now() - start > ms) return false;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
 function tmpDir(): string {
   const d = join(tmpdir(), "slack-bridge-test-" + randomUUID().slice(0, 8));
   mkdirSync(d, { recursive: true });
@@ -784,6 +794,76 @@ try {
     assert(state["apr-111"]?.status === "approved", "scan: dedup state persisted");
     assert(state["apr-222"]?.status === "pending", "scan: role-chain request tracked without posting");
   } finally {
+    __setApprovalStateFile(null);
+    __setSlackApiUrl(null);
+    await slack.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── Approval forwarding: resolved-message updates (#150) ──
+{
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const slack = new MockSlack();
+  __setSlackApiUrl(`http://localhost:${slack.port}`);
+  const dir = tmpDir();
+  const stateFile = join(dir, "seen.json");
+  __setApprovalStateFile(stateFile);
+  const approvalsFile = join(dir, "approvals.json");
+  const writeApprovals = (arr: any[]) => writeFileSync(approvalsFile, JSON.stringify(arr, null, 2));
+  // updateResolvedMessage reads SLACK_BOT_TOKEN from env (shared helper contract)
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  try {
+    // 1) Forwarder post → seen entry stores channel + ts alongside status
+    writeApprovals([
+      { id: "apr-150", from_role: "product-strategist", artifact: "150.md", status: "pending", reviewer: "human", created_at: "2026-08-10T00:00:00Z" },
+    ]);
+    const r1 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r1.posted === 1, "#150: request posted");
+    const seen = JSON.parse(readFileSync(stateFile, "utf-8"));
+    assert(seen["apr-150"]?.status === "pending", "#150: seen entry stores status");
+    assert(seen["apr-150"]?.channel === "#approvals", "#150: seen entry stores channel (from post)");
+    assert(seen["apr-150"]?.ts === "123.456", "#150: seen entry stores ts (from post response)");
+
+    // 2) Mirror verdict → chat.update replaces the ORIGINAL message blocks
+    writeApprovals([
+      { id: "apr-150", from_role: "product-strategist", artifact: "150.md", status: "approved", reviewer: "human", feedback: "LGTM", created_at: "2026-08-10T00:00:00Z" },
+    ]);
+    const r2 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r2.updated === 1, "#150: verdict mirrored to thread");
+    const updFound = await waitFor(() => slack.requests.some((r) => r.url === "/chat.update"), 2000);
+    assert(updFound, "#150: mirror path calls chat.update");
+    const upd = slack.requests.find((r) => r.url === "/chat.update")!;
+    assert(upd.form.get("channel") === "#approvals", "#150: chat.update channel from seen entry");
+    assert(upd.form.get("ts") === "123.456", "#150: chat.update ts from seen entry");
+    const blocks = JSON.parse(upd.form.get("blocks")!);
+    assert(blocks.some((b: any) => b.type === "section" && (b.text?.text ?? "").includes("Approved")),
+      "#150: chat.update section shows Approved");
+    assert(!blocks.some((b: any) => b.type === "actions"), "#150: chat.update has no action buttons");
+    assert(blocks.some((b: any) => b.type === "context" && (b.elements?.[0]?.text ?? "").includes("resolved via file")),
+      "#150: chat.update context says via file");
+    assert(upd.headers.authorization === "Bearer xoxb-test", "#150: chat.update uses SLACK_BOT_TOKEN");
+
+    // 3) Legacy {status}-only seen entries read tolerantly: no crash, no
+    //    chat.update (no stored ts), thread reply still posted
+    slack.requests = [];
+    writeApprovals([
+      { id: "apr-legacy", from_role: "product-implementer", artifact: "l.md", status: "pending", reviewer: "human", created_at: "2026-08-10T00:00:00Z" },
+    ]);
+    const r3 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r3.posted === 1, "#150: legacy-entry post works");
+    const seen2 = JSON.parse(readFileSync(stateFile, "utf-8"));
+    delete seen2["apr-legacy"].ts;
+    delete seen2["apr-legacy"].channel; // downgrade to the legacy {status}-only shape
+    writeFileSync(stateFile, JSON.stringify(seen2, null, 2));
+    writeApprovals([
+      { id: "apr-legacy", from_role: "product-implementer", artifact: "l.md", status: "rejected", reviewer: "human", feedback: "nope", created_at: "2026-08-10T00:00:00Z" },
+    ]);
+    const r4 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r4.updated === 1, "#150: legacy entry still mirrors (thread reply)");
+    assert(!slack.requests.some((r) => r.url === "/chat.update"), "#150: no chat.update without stored ts");
+  } finally {
+    delete process.env.SLACK_BOT_TOKEN;
     __setApprovalStateFile(null);
     __setSlackApiUrl(null);
     await slack.kill();

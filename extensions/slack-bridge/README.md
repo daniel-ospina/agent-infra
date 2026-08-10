@@ -84,7 +84,9 @@ and:
    they resolve in-process.
 2. **Mirrors verdicts**: when swarm's `review_approval()` writes
    `approved`/`rejected` (with optional `feedback`), the extension posts the
-   decision as a reply in the original Slack thread.
+   decision as a reply in the original Slack thread and replaces the
+   original message's buttons with a resolution banner (see
+   *Resolved-message updates* below).
 3. **Deduplicates** via `~/.pi/agent/slack-approval-seen.json` (survives
    `/reload`), so a request is posted exactly once.
 
@@ -120,11 +122,34 @@ backoff (1s base, 60s cap); the receiver stops cleanly on `session_shutdown`
 and never crashes the pi session. Without `SLACK_APP_TOKEN`: zero behavior
 change — `handleApprovalCallback()` remains the (superseded) direct-call stub.
 
+### Resolved-message updates (agent-infra #150)
+
+Once a verdict lands — via the ✅ Accept / ❌ Reject button (Socket Mode) **or**
+via a `review_approval()` file write — the extension calls `chat.update` on
+**the original approval message**, replacing the action buttons with a
+resolution banner so the channel shows pending vs resolved instead of leaving
+buttons live forever:
+
+```
+✅ *Approved* by <reviewer> · <UTC ISO time>
+Approval apr-… resolved via button
+```
+
+(`❌ *Rejected* …` for rejections; `via file` when the verdict came from
+`approvals.json`.) The feedback thread reply is still posted as before — the
+message update just makes the resolution visible in the channel itself.
+
+Updates are fire-and-forget and best-effort: a `chat.update` failure is logged
+and never affects the verdict write, the dedup state, or the poller. They use
+the same `SLACK_BOT_TOKEN` as approval forwarding and the original message's
+channel/ts stored in `slack-approval-seen.json` (legacy `{status}`-only
+entries without ts are tolerated — the update is skipped for those).
+
 ## Tests
 
 ```bash
-npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 102 asserts (self-check)
-npx tsx extensions/slack-bridge/socket-mode.test.ts    # 64 asserts (Socket Mode receiver, mock WS server)
+npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 117 asserts (self-check)
+npx tsx extensions/slack-bridge/socket-mode.test.ts    # 92 asserts (Socket Mode receiver, mock WS server)
 npx tsx extensions/slack-bridge/chunker.test.ts        # 21 asserts
 ```
 

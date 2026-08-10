@@ -11,7 +11,11 @@
 //      file-polling path (scanApprovals in index.ts) uses — atomic tmp+rename —
 //      and records who clicked (payload.user.id) as the reviewer,
 //   5. updates the dedup seen-file (slack-approval-seen.json) so the poller
-//      doesn't double-post, whichever path fires first.
+//      doesn't double-post, whichever path fires first,
+//   6. settles the original Slack message via chat.update (#150): the
+//      Accept/Reject buttons are replaced with a resolution banner so the
+//      channel shows pending vs resolved (shared with the file-polling path
+//      through updateResolvedMessage).
 //
 // Self-contained on purpose (#146 design decision): the ~15–30 lines of
 // overlap with index.ts (seen-file read/write, findApprovalsFile, HTTPS POST
@@ -142,6 +146,125 @@ export function callAppsConnectionsOpen(
     );
     req.on("error", (e) => resolve({ ok: false, error: e.message }));
     req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.end();
+  });
+}
+
+// ── chat.update — resolved-message UI settle (#150) ────
+// Shared by BOTH resolution paths: the Socket Mode click path
+// (processBlockAction below, source="button") and the file-polling mirror
+// path (scanApprovals in index.ts, source="file"). Replaces the original
+// message's Accept/Reject action buttons with a resolution banner so the
+// channel shows pending vs resolved instead of leaving buttons live forever.
+// Fire-and-forget: never throws, never affects verdict writes — any failure
+// returns false with a console.warn.
+
+export function updateResolvedMessage(opts: {
+  channel?: string;
+  ts?: string;
+  verdict: string;
+  reviewerName?: string;
+  reviewerId?: string;
+  approvalId?: string;
+  /** How the verdict landed — shown in the context line (button vs file). */
+  source?: "button" | "file";
+  apiUrl?: string;
+}): Promise<boolean> {
+  const token = (process.env.SLACK_BOT_TOKEN ?? "").trim();
+  if (!token) {
+    console.warn("[slack-bridge] Cannot update resolved message — SLACK_BOT_TOKEN unset");
+    return Promise.resolve(false);
+  }
+  if (!opts.channel || !opts.ts) {
+    // Not an error: legacy seen entries / payloads without container info
+    // legitimately lack ts — debug level only, return false silently.
+    console.debug("[slack-bridge] updateResolvedMessage skipped — channel/ts missing");
+    return Promise.resolve(false);
+  }
+  const approved = opts.verdict === "approved";
+  const reviewer = opts.reviewerName || (opts.reviewerId ? `<@${opts.reviewerId}>` : "");
+  const head = approved ? "✅ *Approved*" : "❌ *Rejected*";
+  const text = `${head}${reviewer ? ` by ${reviewer}` : ""} · ${new Date().toISOString()}`;
+  const via = opts.source === "file" ? "file" : "button";
+  const blocks: any[] = [
+    { type: "section", text: { type: "mrkdwn", text } },
+    {
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: opts.approvalId
+            ? `Approval ${opts.approvalId} resolved via ${via}`
+            : `Resolved via ${via}`,
+        },
+      ],
+    },
+  ];
+  // `||` not `??`: an explicit empty string must fall through to the
+  // env/default — same contract as callAppsConnectionsOpen (#149).
+  const base = (opts.apiUrl || process.env.SLACK_API_URL || SLACK_API_URL_DEFAULT).replace(/\/+$/, "");
+  let url: URL;
+  try {
+    url = new URL(`${base}/chat.update`);
+  } catch (e: any) {
+    console.warn(`[slack-bridge] chat.update bad API URL: ${e?.message ?? e}`);
+    return Promise.resolve(false);
+  }
+  const payload = new URLSearchParams({
+    channel: opts.channel,
+    ts: opts.ts,
+    text,
+    blocks: JSON.stringify(blocks),
+  }).toString();
+  const doRequest = url.protocol === "https:" ? httpsRequest : httpRequest;
+  return new Promise((resolve) => {
+    const req = doRequest(
+      {
+        hostname: url.hostname,
+        port: url.port ? parseInt(url.port) : url.protocol === "https:" ? 443 : 80,
+        path: url.pathname,
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Length": String(Buffer.byteLength(payload)),
+        },
+        timeout: OPEN_TIMEOUT_MS,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c: Buffer) => (data += c.toString()));
+        res.on("end", () => {
+          try {
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              const parsed = JSON.parse(data);
+              if (parsed && parsed.ok) {
+                resolve(true);
+              } else {
+                console.warn(`[slack-bridge] chat.update failed: ${parsed?.error ?? "ok:false"}`);
+                resolve(false);
+              }
+            } else {
+              console.warn(`[slack-bridge] chat.update HTTP ${res.statusCode}: ${data.slice(0, 200)}`);
+              resolve(false);
+            }
+          } catch (e: any) {
+            console.warn(`[slack-bridge] chat.update bad JSON: ${e?.message ?? e}`);
+            resolve(false);
+          }
+        });
+        res.on("error", (e) => {
+          console.warn(`[slack-bridge] chat.update response error: ${e.message}`);
+          resolve(false);
+        });
+      },
+    );
+    req.on("error", (e) => {
+      console.warn(`[slack-bridge] chat.update request error: ${e.message}`);
+      resolve(false);
+    });
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.write(payload);
     req.end();
   });
 }
@@ -284,12 +407,31 @@ export function processBlockAction(payload: any, state: SocketModeState): void {
     const user = payload?.user ?? {};
     const reviewer = typeof user.id === "string" ? user.id : "unknown"; // who clicked
     const reviewerName = typeof user.username === "string" ? user.username : reviewer;
+    // #150: where the buttons live — settle the original message once a
+    // verdict exists. Real block_actions payloads carry channel.id + the
+    // container's message_ts; without them updateResolvedMessage no-ops.
+    const channel = payload?.channel?.id;
+    const ts = payload?.container?.message_ts;
 
     const written = writeVerdictToApprovalsFile(approvalId, verdict, reviewer, state.approvalsFile);
     if (written) {
       markVerdictInSeenFile(approvalId, verdict, state);
       console.log(`[slack-bridge] 🔘 verdict via button: ${approvalId} ${verdict} by @${reviewerName}`);
     }
+    // #150: fire-and-forget UI settle — replace the Accept/Reject buttons with
+    // the resolution banner. Runs on BOTH paths (fresh verdict AND the
+    // already-resolved/dedup path) so stale messages converge; chat.update
+    // failures never affect the verdict write above.
+    void updateResolvedMessage({
+      channel,
+      ts,
+      verdict,
+      reviewerName,
+      reviewerId: reviewer,
+      approvalId,
+      source: "button",
+      apiUrl: state.apiUrl,
+    }).catch(() => {});
     state.onVerdict?.(approvalId, verdict, reviewer);
   } catch (e: any) {
     console.error(`[slack-bridge] ❌ processBlockAction failed: ${e?.message ?? e}`);
