@@ -92,10 +92,31 @@ fi
 
 ## Human Gates (if standalone)
 
-Same 3-gate pattern as epic, but proportional — faster review cycles:
-1. After Scope
-2. After Planning coherence
-3. After Decomposition
+Same 2-gate pattern as epic, but proportional — faster review cycles:
+
+### Approval Routing
+
+When a human gate fires, the agent MUST invoke the approval router to surface the request:
+
+```bash
+# Role-based escalation (non-epic gates):
+APPROVAL_NO_NOTIFY=0 python3 -c "
+from operations.coordination.approval import request_approval
+request_approval('product-implementer', artifact='<doc-name>.md', context='<stage> approval for project <name>')
+print('Approval request created — osascript dialog fired')
+"
+```
+
+This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to `operations/coordination/approvals.json` and must be checked manually.
+
+**Response mechanism:** The human clicks "Open" or "Dismiss" on the dialog. The agent monitors `pending_approvals('human')` to detect the response. See `operations/coordination/approval.py` for the full API.
+
+**Role-based escalation** (for non-epic gates): use without `requires_human=True` to route through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human).
+
+1. After Scope — docs committed, GitHub URL presented
+2. After Planning coherence — docs committed, GitHub URL presented
+
+> **Decomposition gate** is now an AI review gate (not human) — same review+fix loop pattern as other stages.
 
 ### UX Design Gate (between Scope and Plan)
 

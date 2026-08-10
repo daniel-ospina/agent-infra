@@ -4,6 +4,9 @@
  *
  * Uses assert-based self-check with mock Bridge HTTP server + stub ExtensionAPI.
  * Convention: process.exit(1) on failure.
+ *
+ * Note: the local package.json sets "type": "module" — the file uses
+ * top-level await, which requires ESM (agent-infra #40 harness fix).
  */
 
 import { createServer, type Server } from "node:http";
@@ -32,9 +35,38 @@ import {
   __setBridgeUrl,
 } from "./index.js";
 
-// Resolve project root regardless of cwd — the test may be run from any directory
+// Resolve project root regardless of cwd — the test may be run from any directory.
+// agent-infra has no AGENTS.md / operations/subjects (moved to swarm, #102), so
+// findRepoRoot returns null here; fall back to the repo dir itself and resolve
+// subjects fixtures from the swarm repo (read-only reference).
 const TEST_FILE_DIR = dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = findRepoRoot(TEST_FILE_DIR) ?? join(TEST_FILE_DIR, "..", "..", "..", "..", "..");
+const PROJECT_ROOT = findRepoRoot(TEST_FILE_DIR) ?? join(TEST_FILE_DIR, "..", "..");
+
+/** Subjects YAML source: repo-local first, then the sibling swarm repo. */
+function resolveSubjectsDir(): string | null {
+  for (const dir of [
+    join(PROJECT_ROOT, "operations", "subjects"),
+    join(PROJECT_ROOT, "..", "swarm", "operations", "subjects"),
+  ]) {
+    try {
+      if (readdirSync(dir).some((f) => f.endsWith(".yaml") || f.endsWith(".yml"))) return dir;
+    } catch {
+      // keep looking
+    }
+  }
+  return null;
+}
+
+// ── Environment hygiene ─────────────────────────────
+// Ambient SLACK_* env (SLACK_BRIDGE_DISABLE=1, SLACK_BOT_TOKEN, …) must not
+// leak into enablement decisions — each block sets exactly what it needs.
+for (const k of [
+  "SLACK_BRIDGE_DISABLE", "SLACK_BRIDGE_THREAD_TS", "SLACK_BRIDGE_TEAM", "SLACK_BRIDGE_ROLE",
+  "SLACK_BOT_TOKEN", "SLACK_CHANNEL", "SLACK_APPROVAL_CHANNEL", "SLACK_APPROVAL_DISABLE",
+  "SLACK_APPROVAL_FILE", "SLACK_APPROVAL_POLL_MS", "SLACK_API_URL", "CMUX_WORKSPACE_ID",
+]) {
+  delete process.env[k];
+}
 
 // Dynamic import for the factory (default export)
 const { default: slackBridge } = await import("./index.js");
@@ -124,6 +156,35 @@ class MockBridge {
   clear() { this.requests = []; this.handler = null; this._hang = false; this._resetMidBody = false; this._closeEarly = false; }
 }
 
+// ── Mock Slack Web API server (form-encoded, like the real API) ──
+class MockSlack {
+  port: number;
+  server: Server;
+  requests: { url: string; headers: any; form: URLSearchParams; body: string }[] = [];
+  respond: (req: any, form: URLSearchParams) => any = () => ({ ok: true, ts: "123.456" });
+  status = 200;
+
+  constructor() {
+    this.server = createServer((req, res) => {
+      let data = "";
+      req.on("data", (c: Buffer) => (data += c.toString()));
+      req.on("end", () => {
+        const form = new URLSearchParams(data);
+        this.requests.push({ url: req.url!, headers: req.headers, form, body: data });
+        res.writeHead(this.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(this.respond(req, form)));
+      });
+    });
+    this.server.listen(0);
+    const addr = this.server.address() as any;
+    this.port = addr.port;
+  }
+
+  kill() {
+    return new Promise<void>((resolve) => this.server.close(() => resolve()));
+  }
+}
+
 // ── Tests ───────────────────────────────────────────
 
 // ── readSession / writeSession ──
@@ -184,12 +245,19 @@ try {
   // Empty dir
   assert(parseSubjects(subjectsDir).length === 0, "parseSubjects: empty dir → []");
 
-  // Valid subjects file (copy from real repo)
-  const srcSubjects = join(PROJECT_ROOT, "operations", "subjects");
-  const realFiles = ["eldato-app-team.yaml", "organisation-design-team.yaml"];
-  for (const f of realFiles) {
-    const content = readFileSync(join(srcSubjects, f), "utf-8");
-    writeFileSync(join(subjectsDir, f), content);
+  // Valid subjects file (copy from the canonical source: swarm, #102)
+  const subjectsSrc = resolveSubjectsDir();
+  if (subjectsSrc) {
+    const realFiles = ["eldato-app-team.yaml", "organisation-design-team.yaml"];
+    for (const f of realFiles) {
+      if (!existsSync(join(subjectsSrc, f))) continue;
+      const content = readFileSync(join(subjectsSrc, f), "utf-8");
+      writeFileSync(join(subjectsDir, f), content);
+    }
+  } else {
+    // No canonical source — fixture with the same 2-space indent shape
+    writeFileSync(join(subjectsDir, "eldato-app-team.yaml"), `team:\n  slug: eldato-app-team\n  name: El Dato App Team\n  leads_to: organisation-design-team\n`);
+    writeFileSync(join(subjectsDir, "organisation-design-team.yaml"), `team:\n  slug: organisation-design-team\n  name: Organisation Design Team\n  leads_to: null\nroles:\n  product-strategist:\n    held_by: pi\n    kind: vsm\n  product-implementer:\n    held_by: pi\n    kind: vsm\n`);
   }
   // Add _schema.md (should be skipped)
   writeFileSync(join(subjectsDir, "_schema.md"), "# schema");
@@ -431,7 +499,7 @@ try {
 
 // ── selectTeamStdin: function contract test ──────────
 {
-  const testSubjectsDir = join(PROJECT_ROOT, "operations", "subjects");
+  const testSubjectsDir = resolveSubjectsDir() ?? "";
   const teams = parseSubjects(testSubjectsDir);
 
   if (teams.length > 0) {
@@ -513,6 +581,253 @@ try {
     process.env.SLACK_BRIDGE_THREAD_TS = origThreadTs;
     process.env.SLACK_BRIDGE_TEAM = origBridgeTeam;
     mockB.server.close();
+  }
+}
+
+// ── Approval forwarding: enablement config ────────────
+{
+  const { slackApprovalConfig, approvalStatusLine, initApprovalForwarding } = await import("./index.js");
+  // Slow poll + no approvals file: a started poller must not fire or post.
+  process.env.SLACK_APPROVAL_POLL_MS = "60000";
+  const noFile = join(tmpDir(), "does-not-exist.json");
+  process.env.SLACK_APPROVAL_FILE = noFile;
+  try {
+    delete process.env.SLACK_BOT_TOKEN;
+    delete process.env.SLACK_CHANNEL;
+    delete process.env.SLACK_APPROVAL_CHANNEL;
+    delete process.env.SLACK_APPROVAL_DISABLE;
+
+    let cfg = slackApprovalConfig();
+    assert(cfg.token === null, "config: no token → null");
+    assert(cfg.channel === "", "config: no channel → empty");
+    assert(cfg.disabled === false, "config: not disabled by default");
+    assert(approvalStatusLine().includes("missing SLACK_BOT_TOKEN"), "status: mentions missing token");
+    assert(initApprovalForwarding().enabled === false, "init: off without token");
+
+    process.env.SLACK_BOT_TOKEN = "xoxb-test";
+    cfg = slackApprovalConfig();
+    assert(cfg.token === "xoxb-test", "config: token read from env");
+    assert(approvalStatusLine().includes("missing SLACK_APPROVAL_CHANNEL"), "status: mentions missing channel");
+    assert(initApprovalForwarding().enabled === false, "init: off without channel");
+
+    process.env.SLACK_CHANNEL = "#general";
+    cfg = slackApprovalConfig();
+    assert(cfg.channel === "#general", "config: SLACK_CHANNEL fallback");
+    assert(approvalStatusLine().includes("#general"), "status: enabled line names channel");
+    assert(initApprovalForwarding().enabled === true, "init: on with token + channel");
+
+    process.env.SLACK_APPROVAL_CHANNEL = "#approvals";
+    cfg = slackApprovalConfig();
+    assert(cfg.channel === "#approvals", "config: SLACK_APPROVAL_CHANNEL wins over SLACK_CHANNEL");
+
+    process.env.SLACK_APPROVAL_DISABLE = "1";
+    assert(approvalStatusLine().includes("SLACK_APPROVAL_DISABLE=1"), "status: kill switch mentioned");
+    assert(initApprovalForwarding().enabled === false, "init: kill switch overrides token+channel");
+  } finally {
+    delete process.env.SLACK_BOT_TOKEN;
+    delete process.env.SLACK_CHANNEL;
+    delete process.env.SLACK_APPROVAL_CHANNEL;
+    delete process.env.SLACK_APPROVAL_DISABLE;
+    delete process.env.SLACK_APPROVAL_POLL_MS;
+    delete process.env.SLACK_APPROVAL_FILE;
+  }
+}
+
+// ── Approval forwarding: message blocks ───────────────
+{
+  const { buildApprovalBlocks } = await import("./index.js");
+  const blocks = buildApprovalBlocks({
+    id: "apr-abc123",
+    from_role: "product-implementer",
+    artifact: "plan.md",
+    context: "Stage 2 approval",
+    reviewer: "human",
+    created_at: "2026-08-10T00:00:00Z",
+  });
+  assert(blocks.length >= 3, "blocks: header + detail + actions + context");
+  assert(blocks[0].type === "section" && blocks[0].text.text.includes("product-implementer"), "blocks: header section");
+  const actions = blocks.find((b: any) => b.type === "actions");
+  assert(!!actions, "blocks: actions block present");
+  assert(actions!.block_id === "approval_apr-abc123", "blocks: block_id carries approval id");
+  const vals = actions!.elements.map((e: any) => e.value);
+  assert(vals.includes("accept:apr-abc123") && vals.includes("reject:apr-abc123"), "blocks: accept/reject values");
+  const acceptBtn = actions!.elements.find((e: any) => e.value.startsWith("accept"));
+  assert(acceptBtn!.style === "primary", "blocks: accept is primary");
+  const rejectBtn = actions!.elements.find((e: any) => e.value.startsWith("reject"));
+  assert(rejectBtn!.style === "danger", "blocks: reject is danger");
+}
+
+// ── Approval forwarding: Slack Web API POST (mock) ────
+{
+  const { slackApiPost, postApprovalRequest, __setSlackApiUrl } = await import("./index.js");
+  const slack = new MockSlack();
+  __setSlackApiUrl(`http://localhost:${slack.port}`);
+  try {
+    // slackApiPost: form body + bearer auth
+    const res = await slackApiPost("chat.postMessage", { channel: "#approvals", text: "hi" }, "xoxb-test");
+    assert(res.ok === true, "slackApiPost: success");
+    assert(slack.requests.length === 1, "slackApiPost: one request");
+    assert(slack.requests[0].url === "/chat.postMessage", "slackApiPost: correct path");
+    assert(slack.requests[0].headers.authorization === "Bearer xoxb-test", "slackApiPost: bearer auth");
+    assert(slack.requests[0].form.get("text") === "hi", "slackApiPost: form-encoded body");
+
+    // postApprovalRequest: full message with blocks
+    const post = await postApprovalRequest(
+      { id: "apr-1", from_role: "product-strategist", artifact: "03-scope.md" },
+      "xoxb-test",
+      "#approvals",
+    );
+    assert(post.ok === true && post.ts === "123.456", "postApprovalRequest: ok + ts");
+    const req = slack.requests[slack.requests.length - 1];
+    assert(req.form.get("channel") === "#approvals", "postApprovalRequest: channel");
+    const blocks = JSON.parse(req.form.get("blocks")!);
+    assert(blocks.some((b: any) => b.type === "actions"), "postApprovalRequest: blocks with actions");
+
+    // Slack API error → ok:false with error, no throw
+    slack.respond = () => ({ ok: false, error: "invalid_auth" });
+    const bad = await postApprovalRequest({ id: "apr-2", from_role: "x" }, "xoxb-bad", "#approvals");
+    assert(bad.ok === false && bad.error === "invalid_auth", "postApprovalRequest: surfaces API error");
+
+    // HTTP error → ok:false with message, no throw
+    slack.respond = () => ({ error: "boom" });
+    slack.status = 500;
+    const httpBad = await postApprovalRequest({ id: "apr-3", from_role: "x" }, "xoxb-test", "#approvals");
+    assert(httpBad.ok === false && httpBad.error!.includes("500"), "postApprovalRequest: HTTP 500 → error");
+  } finally {
+    __setSlackApiUrl(null);
+    await slack.kill();
+  }
+}
+
+// ── Approval forwarding: approvals.json discovery ─────
+{
+  const { findApprovalsFile } = await import("./index.js");
+  const dir = tmpDir();
+  try {
+    assert(findApprovalsFile(dir) === null, "findApprovalsFile: none → null");
+
+    const nested = join(dir, "swarm", "operations", "coordination");
+    mkdirSync(nested, { recursive: true });
+    const f = join(nested, "approvals.json");
+    writeFileSync(f, "[]");
+    assert(findApprovalsFile(dir) === f, "findApprovalsFile: finds <dir>/swarm/operations/coordination/approvals.json");
+
+    const direct = join(dir, "operations", "coordination");
+    mkdirSync(direct, { recursive: true });
+    const f2 = join(direct, "approvals.json");
+    writeFileSync(f2, "[]");
+    assert(findApprovalsFile(dir) === f2, "findApprovalsFile: repo-local path wins over swarm sibling");
+
+    const envFile = join(dir, "custom.json");
+    writeFileSync(envFile, "[]");
+    const prev = process.env.SLACK_APPROVAL_FILE;
+    process.env.SLACK_APPROVAL_FILE = envFile;
+    assert(findApprovalsFile(dir) === envFile, "findApprovalsFile: SLACK_APPROVAL_FILE override");
+    if (prev === undefined) delete process.env.SLACK_APPROVAL_FILE;
+    else process.env.SLACK_APPROVAL_FILE = prev;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── Approval forwarding: scanApprovals end-to-end ─────
+{
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const slack = new MockSlack();
+  __setSlackApiUrl(`http://localhost:${slack.port}`);
+  const dir = tmpDir();
+  const stateFile = join(dir, "seen.json");
+  __setApprovalStateFile(stateFile);
+  const approvalsFile = join(dir, "approvals.json");
+  const writeApprovals = (arr: any[]) => writeFileSync(approvalsFile, JSON.stringify(arr, null, 2));
+  const baseReqs = [
+    { id: "apr-222", from_role: "product-implementer", artifact: "plan.md", status: "pending", reviewer: "product-strategist", created_at: "2026-08-10T00:00:00Z" },
+    { id: "apr-333", from_role: "someone", artifact: "x.md", status: "approved", reviewer: "human", created_at: "2026-08-10T00:00:00Z" },
+  ];
+  try {
+    // First scan: 1 human-pending → 1 post; role-chain + terminal → skipped
+    writeApprovals([
+      { id: "apr-111", from_role: "product-strategist", artifact: "03-scope.md", context: "Scope approval", status: "pending", reviewer: "human", created_at: "2026-08-10T00:00:00Z" },
+      ...baseReqs,
+    ]);
+    const r1 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r1.posted === 1, `scan: posts exactly 1 human-pending (got ${r1.posted})`);
+    assert(r1.failed === 0, "scan: no failures");
+    const posted = slack.requests.filter((r) => r.url === "/chat.postMessage");
+    assert(posted.length === 1, "scan: exactly 1 chat.postMessage");
+    assert(posted[0].form.get("channel") === "#approvals", "scan: correct channel");
+    assert(posted[0].form.get("text")!.includes("03-scope.md"), "scan: text mentions artifact");
+    const blocks = JSON.parse(posted[0].form.get("blocks")!);
+    assert(blocks.some((b: any) => b.type === "actions"), "scan: posted message has action buttons");
+
+    // Dedup: unchanged file → nothing new posted
+    slack.requests = [];
+    const r2 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r2.posted === 0 && r2.updated === 0, "scan: dedup — no re-post");
+    assert(slack.requests.length === 0, "scan: dedup — no API calls");
+
+    // Verdict transition: review_approval() wrote approved → mirrored to thread
+    writeApprovals([
+      { id: "apr-111", from_role: "product-strategist", artifact: "03-scope.md", context: "Scope approval", status: "approved", reviewer: "human", feedback: "Looks good", created_at: "2026-08-10T00:00:00Z" },
+      ...baseReqs,
+    ]);
+    const r3 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r3.updated === 1, `scan: mirrors verdict (got ${r3.updated})`);
+    const updates = slack.requests.filter((r) => r.url === "/chat.postMessage");
+    assert(updates.length === 1, "scan: one update message");
+    assert(updates[0].form.get("thread_ts") === "123.456", "scan: update replies in original thread");
+    assert(updates[0].form.get("text")!.includes("Approved"), "scan: update says Approved");
+    assert(updates[0].form.get("text")!.includes("Looks good"), "scan: update includes feedback");
+
+    // State persisted across scans (reload-safe)
+    const state = JSON.parse(readFileSync(stateFile, "utf-8"));
+    assert(state["apr-111"]?.status === "approved", "scan: dedup state persisted");
+    assert(state["apr-222"]?.status === "pending", "scan: role-chain request tracked without posting");
+  } finally {
+    __setApprovalStateFile(null);
+    __setSlackApiUrl(null);
+    await slack.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── Factory: explicit enablement logging (#40) ────────
+{
+  const handlers = new Map<string, Function[]>();
+  const stubPi: any = {
+    on(name: string, fn: Function) {
+      if (!handlers.has(name)) handlers.set(name, []);
+      handlers.get(name)!.push(fn);
+    },
+  };
+  const logs: string[] = [];
+  const origLog = console.log;
+  console.log = (...args: any[]) => { logs.push(args.join(" ")); };
+  try {
+    // Kill switch on: no bridge hooks, but the reason is explicit and the
+    // approval status line is still emitted.
+    process.env.SLACK_BRIDGE_DISABLE = "1";
+    delete process.env.SLACK_BOT_TOKEN;
+    delete process.env.SLACK_CHANNEL;
+    delete process.env.SLACK_APPROVAL_CHANNEL;
+    slackBridge(stubPi);
+    assert(!handlers.has("session_start"), "factory(disabled): no session_start hook");
+    assert(logs.some((l) => l.includes("SLACK_BRIDGE_DISABLE=1")), "factory(disabled): explicit kill-switch reason logged");
+    assert(logs.some((l) => l.includes("missing SLACK_BOT_TOKEN")), "factory(disabled): approval status logged");
+
+    // Kill switch off: hooks registered, loaded banner printed.
+    handlers.clear();
+    delete process.env.SLACK_BRIDGE_DISABLE;
+    slackBridge(stubPi);
+    assert(handlers.has("session_start") && handlers.has("agent_end") && handlers.has("session_shutdown"),
+      "factory(enabled): hooks registered");
+    assert(logs.some((l) => l.includes("✅ Loaded")), "factory(enabled): loaded banner");
+  } finally {
+    console.log = origLog;
+    delete process.env.SLACK_BRIDGE_DISABLE;
+    delete process.env.SLACK_BOT_TOKEN;
+    delete process.env.SLACK_CHANNEL;
+    delete process.env.SLACK_APPROVAL_CHANNEL;
   }
 }
 

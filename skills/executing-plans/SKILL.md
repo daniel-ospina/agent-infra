@@ -602,6 +602,29 @@ If not in a worktree: skip silently.
 - **REQUIRED SUB-SKILL:** Use `commit-workflow`
 - Follow that skill's full sequence: commit → draft PR → code-review gate → auto-merge → doc update
 
+## Human Gates
+
+The `commit` step (Step 6 handoff) is a `human_approval` gate in this skill's frontmatter, and the checkpoint stops below ("When to Stop and Ask") are its checkpoint gates — every stop surfaces a request for human input.
+
+### Approval Routing
+
+When a human gate fires, the agent MUST invoke the approval router to surface the request:
+
+```bash
+# Role-based escalation (non-epic gates):
+APPROVAL_NO_NOTIFY=0 python3 -c "
+from operations.coordination.approval import request_approval
+request_approval('product-implementer', artifact='<plan-doc>.md', context='<checkpoint> approval for issue <N>')
+print('Approval request created — osascript dialog fired')
+"
+```
+
+This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to `operations/coordination/approvals.json` and must be checked manually.
+
+**Response mechanism:** The human clicks "Open" or "Dismiss" on the dialog. The agent monitors `pending_approvals('human')` to detect the response. See `operations/coordination/approval.py` for the full API.
+
+**Role-based escalation** (for non-epic gates): use without `requires_human=True` to route through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human).
+
 ## When to Stop and Ask
 
 **STOP executing ONLY when:**

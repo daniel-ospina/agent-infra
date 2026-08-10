@@ -1,0 +1,31 @@
+# agent-infra shared .gitignore template (#61 item 7)
+# Copy into consumer repos; extend per language as needed.
+
+# Node
+node_modules/
+dist/
+*.log
+npm-debug.log*
+
+# Python bytecode + tooling
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Env / secrets
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

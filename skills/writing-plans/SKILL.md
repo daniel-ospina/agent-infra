@@ -83,6 +83,29 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 | `workflow/04` | Plan doc header missing research-path comment. Task structure not TDD. Micro/Standard/Complex tier path not selected. No bite-sized steps. |
 | `workflow/05` | Plan-review gate skipped entirely — plan ships with no quality check. No review cycles, no reviewer feedback. `planned` label not applied. Execution mode not selected — handoff fails. |
 
+## Plan Review Gate — Human Approval
+
+The plan-review gate (`workflow/05-review-handoff.md`) runs the `plan-review` skill loop; its human point fires when the loop exits `capped` or `stalled`. A capped/stalled plan-review result is NOT clean — the plan must not proceed to Execution Handoff until the user fixes the remaining issues or explicitly approves the plan as-is.
+
+### Approval Routing
+
+When a human gate fires, the agent MUST invoke the approval router to surface the request:
+
+```bash
+# Role-based escalation (non-epic gates):
+APPROVAL_NO_NOTIFY=0 python3 -c "
+from operations.coordination.approval import request_approval
+request_approval('product-implementer', artifact='<plan-doc>.md', context='plan-review <status> approval for plan <name>')
+print('Approval request created — osascript dialog fired')
+"
+```
+
+This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to `operations/coordination/approvals.json` and must be checked manually.
+
+**Response mechanism:** The human clicks "Open" or "Dismiss" on the dialog. The agent monitors `pending_approvals('human')` to detect the response. See `operations/coordination/approval.py` for the full API.
+
+**Role-based escalation** (for non-epic gates): use without `requires_human=True` to route through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human).
+
 ## Task Template Fields
 
 Every task in a Standard or Complex plan MUST include these header fields before the step list:
