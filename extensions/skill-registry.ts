@@ -17,16 +17,24 @@ function getProjectRoot(): string {
 function buildRegistry(): Record<string, string> {
   const cachePath = join(homedir(), ".pi", "agent", "skills-registry.json");
   try {
-    // Resolve the script path — try project root first, then ~/eldato fallback.
+    // Resolve the script path — try project root first, then AGENT_INFRA_PATH fallback.
     // Sub-agents with cwd outside the project would otherwise resolve a
     // non-existent path and waste 5s on the execSync timeout (#68).
     const root = getProjectRoot();
     let scriptPath = resolve(root, "operations/tools/skill_registry.py");
     if (!existsSync(scriptPath)) {
-      const fallbackPath = resolve(homedir(), "eldato", "operations/tools/skill_registry.py");
-      if (existsSync(fallbackPath)) {
-        scriptPath = fallbackPath;
+      // #46 de-branded fallback: AGENT_INFRA_PATH replaces the old hardcoded default.
+      const infrRoot = process.env.AGENT_INFRA_PATH;
+      if (infrRoot) {
+        const fallbackPath = resolve(infrRoot, "operations/tools/skill_registry.py");
+        if (existsSync(fallbackPath)) {
+          scriptPath = fallbackPath;
+        } else {
+          console.warn(`skill-registry: skill_registry.py not found under ${fallbackPath} — falling back to cache`);
+          scriptPath = null;
+        }
       } else {
+        console.warn("skill-registry: skill_registry.py not found in project root and AGENT_INFRA_PATH is unset — falling back to cache");
         // Neither path exists — skip the call, fall through to cache
         scriptPath = null;
       }

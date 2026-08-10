@@ -602,10 +602,19 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
 function runFrontmatter(filePath: string, config: TortoiseConfig): void {
   const tortoiseDir = getTortoiseDir(config);
   if (!tortoiseDir) return;
-  // ponytail: deriveScript path — relative to tortoiseSrcDir if configured, else default
-  const deriveScript = config.tortoiseSrcDir
-    ? join(expandTilde(config.tortoiseSrcDir), "..", "operations", "memory", "derive_frontmatter.py")
-    : join(homedir(), "eldato", "operations", "memory", "derive_frontmatter.py");
+  // ponytail: deriveScript path — relative to tortoiseSrcDir if configured, else
+  // relative to AGENT_INFRA_PATH (#46: legacy repo fallback removed). If neither
+  // resolves, warn once and skip frontmatter enrichment gracefully (no crash).
+  let deriveScript: string | null = null;
+  if (config.tortoiseSrcDir) {
+    deriveScript = join(expandTilde(config.tortoiseSrcDir), "..", "operations", "memory", "derive_frontmatter.py");
+  } else if (process.env.AGENT_INFRA_PATH) {
+    deriveScript = join(process.env.AGENT_INFRA_PATH, "operations", "memory", "derive_frontmatter.py");
+  }
+  if (!deriveScript) {
+    console.warn("[tortoise-capture] derive_frontmatter.py unavailable — set tortoiseSrcDir in ~/.pi/agent/tortoise-config.json or AGENT_INFRA_PATH; skipping frontmatter enrichment");
+    return;
+  }
   const child = spawnPython([deriveScript, filePath], { cwd: tortoiseDir, env: buildPythonEnv(tortoiseDir) });
   if (child && child.pid) {
     if (!acquirePidLock("frontmatter", child.pid)) { child.kill(); return; }
