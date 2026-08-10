@@ -15,8 +15,8 @@ Templates:
 ## pipeline-compliance.yml — pipeline compliance gate
 
 Deterministic (no-LLM) CI gate: verifies a PR followed the agent pipeline
-before merge — scoping, plan, and code-review **evidence** — instead of
-reviewing code quality. Backed by
+before merge — scoping, plan, code-review, and test-coverage **evidence** —
+instead of reviewing code quality. Backed by
 [`scripts/check-pipeline-compliance.sh`](../../scripts/check-pipeline-compliance.sh).
 
 ### What it checks
@@ -29,15 +29,19 @@ For a PR it checks, in order (all failures printed, not just the first):
 | b | Scoping comment | Linked issue has a comment with the `<!-- issue-scoping:` marker | issue-scoping |
 | c | Code-review evidence | PR body or any PR commit message references review dispatch (`code-review`, `reviewer`, `[review]`, `VGATE`, `review recorded`, `review-enforcer`) | code-review |
 | d | Plan doc | PR adds/modifies `docs/plans/*.md`, **or** scoping comment contains a `Wiring` section (wiring-check table) | writing-plans, issue-scoping |
+| e | Test coverage evidence | PR touching runtime code (`extensions/**/*.ts` excl. `*.test.ts`, `extensions/**/*.js`, `bin/*.js`) must have new/updated `*.test.ts` / `*.test.js` in the diff **or** test-run markers in PR body/commits (`tests green`, `N passed`, `N/N`, `VGATE PASS`, `test suite`, `pytest`, `npm test`, `vitest`) | code-review (Step 0), test-writing |
 
 ### Tier × check matrix
 
-| Issue label | a. Linked issue | b. Scoping | c. Review evidence | d. Plan doc |
-|-------------|:---:|:---:|:---:|:---:|
-| `complexity:micro` | ✅ required | ⏭️ skipped | ⏭️ skipped | ⏭️ skipped |
-| `complexity:standard` | ✅ required | ✅ required | ✅ required | ✅ required |
-| `complexity:complex` | ✅ required | ✅ required | ✅ required | ✅ required |
-| (no complexity label) | ✅ required | ✅ required | ✅ required | ⏭️ skipped |
+| Issue label | a. Linked issue | b. Scoping | c. Review evidence | d. Plan doc | e. Test coverage |
+|-------------|:---:|:---:|:---:|:---:|:---:|
+| `complexity:micro` | ✅ required | ⏭️ skipped | ⏭️ skipped | ⏭️ skipped | ⏭️ skipped |
+| `complexity:standard` | ✅ required | ✅ required | ✅ required | ✅ required | ✅ required |
+| `complexity:complex` | ✅ required | ✅ required | ✅ required | ✅ required | ✅ required |
+| (no complexity label) | ✅ required | ✅ required | ✅ required | ⏭️ skipped | ✅ required |
+
+Check **e** only applies when the PR diff touches runtime code; PRs whose
+changed files are only docs/skills/templates/config (no runtime code) skip it.
 
 Exit codes: `0` compliant · `1` blocked · `2` usage/script error.
 
@@ -71,12 +75,10 @@ jobs:
 ```
 
 The script is auto-fetched from agent-infra when absent (override the source
-with a `PIPELINE_COMPLIANCE_SCRIPT_URL` repo variable). For agent-infra
-itself, symlink the template like the other CI files:
-
-```sh
-ln -s ../../templates/.github/workflows/pipeline-compliance.yml .github/workflows/pipeline-compliance.yml
-```
+with a `PIPELINE_COMPLIANCE_SCRIPT_URL` repo variable). Agent-infra itself
+dogfoods the gate: `.github/workflows/pipeline-compliance.yml` is an adapted
+copy (check context `pipeline-compliance`, required on main via branch
+protection) that runs the in-repo script directly.
 
 ### Branch protection (recommended)
 
