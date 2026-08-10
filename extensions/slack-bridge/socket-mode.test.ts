@@ -29,6 +29,8 @@ import {
   ackEnvelope,
   processBlockAction,
   writeVerdictToApprovalsFile,
+  writeFeedbackToApprovalsFile,
+  findApprovalIdByThreadTs,
   updateResolvedMessage,
   type SocketModeState,
 } from "./socket-mode.js";
@@ -310,11 +312,44 @@ function pendingApprovalsFile(dir: string, entries: any[]): string {
   return file;
 }
 
+/** A seen-file (dedup registry) mapping approval id → {status, ts, channel}.
+ * This is the approval-message registry #156 reads (ts → id reverse lookup). */
+function seenFileWith(dir: string, entries: Record<string, any>): string {
+  const file = join(dir, "seen.json");
+  writeFileSync(file, JSON.stringify(entries, null, 2), "utf-8");
+  return file;
+}
+
+/** A realistic Socket Mode events_api envelope (event_callback → message).
+ * Defaults: a human reply (U123) in thread 1712345678.000100 of channel C789.
+ * eventOverrides spread into the event — pass {bot_id}, {subtype}, … */
+function eventsEnvelope(envelopeId: string, eventOverrides: any = {}): string {
+  return JSON.stringify({
+    envelope_id: envelopeId,
+    type: "events_api",
+    accepts_response_payload: false,
+    payload: {
+      type: "event_callback",
+      event: {
+        type: "message",
+        channel: "C789",
+        user: "U123",
+        text: "please adjust the scope wording",
+        ts: "1712345678.000200",
+        thread_ts: "1712345678.000100",
+        team: "T456",
+        ...eventOverrides,
+      },
+    },
+  });
+}
+
 /** Start the receiver against the mock API + WS servers, wait for connect. */
 async function startConnected(opts: {
   approvalsFile?: string | null;
   stateFile?: string | null;
   onVerdict?: (id: string, verdict: string, reviewer: string) => void;
+  onFeedback?: (id: string, text: string, reviewer: string) => void;
 } = {}): Promise<{ state: SocketModeState; api: MockOpenAPI; wsServer: MockWSServer }> {
   const api = new MockOpenAPI();
   const wsServer = new MockWSServer();
@@ -325,6 +360,7 @@ async function startConnected(opts: {
     approvalsFile: opts.approvalsFile ?? null,
     stateFile: opts.stateFile ?? null,
     onVerdict: opts.onVerdict,
+    onFeedback: opts.onFeedback,
   });
   const connected = await waitFor(() => wsServer.connections > 0, 4000);
   assert(connected, "startConnected: WS connection established");
@@ -731,6 +767,296 @@ async function startConnected(opts: {
 
 // ── Test 17 (implicit): existing 102 tests stay green ──
 // Covered by running slack-bridge.test.ts separately with no SLACK_APP_TOKEN.
+
+// ── Test 18: events_api reply under a known approval ts → feedback write (i) ──
+{
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-fb1", from_role: "product-implementer", status: "pending", reviewer: "human" },
+  ]);
+  const seenFile = seenFileWith(dir, {
+    "apr-fb1": { status: "pending", ts: "1712345678.000100", channel: "C789" },
+  });
+  const { state, wsServer } = await startConnected({ approvalsFile, stateFile: seenFile });
+  wsServer.clearClientMessages();
+  wsServer.sendText(eventsEnvelope("env-evt-1"));
+  const done = await waitFor(() => {
+    const a = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+    return a[0]?.status === "changes_requested";
+  }, 2000);
+  assert(done, "events: reply under known approval ts → status changes_requested");
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].feedback === "please adjust the scope wording", "events: feedback = reply text (as-is)");
+  assert(approvals[0].reviewer === "U123", "events: reviewer = event.user");
+  assert(/^\d{4}-\d{2}-\d{2}T/.test(approvals[0].feedback_at ?? ""), "events: feedback_at = ISO now");
+  const acked = await waitFor(() => wsServer.clientMessages.length >= 1, 2000);
+  assert(acked, "events: envelope ACKed");
+  assert(JSON.parse(wsServer.clientMessages[0] ?? "{}").envelope_id === "env-evt-1", "events: correct envelope_id echoed");
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 19: reply in unknown thread → no write, no crash (ii) ──
+{
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-fb2", from_role: "product-implementer", status: "pending", reviewer: "human" },
+  ]);
+  const seenFile = seenFileWith(dir, {
+    "apr-fb2": { status: "pending", ts: "1712345678.000100", channel: "C789" },
+  });
+  const { state, wsServer } = await startConnected({ approvalsFile, stateFile: seenFile });
+  wsServer.clearClientMessages();
+  wsServer.sendText(eventsEnvelope("env-evt-2", { thread_ts: "1712345678.000999" }));
+  const acked = await waitFor(() => wsServer.clientMessages.length >= 1, 2000);
+  assert(acked, "events: unknown thread envelope still ACKed");
+  await sleep(300); // give any (wrong) write time to land
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].status === "pending", "events: unknown thread → no status change");
+  assert(approvals[0].feedback === undefined && approvals[0].feedback_at === undefined,
+    "events: unknown thread → no feedback written");
+  assert(state.ws !== null, "events: unknown thread → receiver still alive (no crash)");
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 19b: registry reverse lookup tolerance (legacy/corrupt/missing) ──
+{
+  const dir = tmpDir();
+  const seen = seenFileWith(dir, {
+    "apr-legacy": { status: "pending" }, // no ts — must never match
+    "apr-live": { status: "pending", ts: "100.001", channel: "C1" },
+  });
+  assert(findApprovalIdByThreadTs("100.001", seen) === "apr-live", "registry: ts → id reverse lookup");
+  assert(findApprovalIdByThreadTs("9.9", seen) === null, "registry: unknown ts → null");
+  assert(findApprovalIdByThreadTs("100.001", join(dir, "missing.json")) === null, "registry: missing seen-file → null");
+  writeFileSync(seen, "{corrupt json");
+  assert(findApprovalIdByThreadTs("100.001", seen) === null, "registry: corrupt seen-file → null");
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 20: message with bot_id → ignored (iii) ──
+{
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-fb3", from_role: "product-implementer", status: "pending", reviewer: "human" },
+  ]);
+  const seenFile = seenFileWith(dir, {
+    "apr-fb3": { status: "pending", ts: "1712345678.000100", channel: "C789" },
+  });
+  const { state, wsServer } = await startConnected({ approvalsFile, stateFile: seenFile });
+  wsServer.sendText(eventsEnvelope("env-evt-3", { bot_id: "B123", user: undefined }));
+  await sleep(300);
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].status === "pending", "events: bot_id message → ignored (no self-trigger)");
+  assert(approvals[0].feedback === undefined, "events: bot_id message → no feedback");
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 21: message with subtype (message_changed) → ignored (iv) ──
+{
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-fb4", from_role: "product-implementer", status: "pending", reviewer: "human" },
+  ]);
+  const seenFile = seenFileWith(dir, {
+    "apr-fb4": { status: "pending", ts: "1712345678.000100", channel: "C789" },
+  });
+  const { state, wsServer } = await startConnected({ approvalsFile, stateFile: seenFile });
+  wsServer.sendText(eventsEnvelope("env-evt-4", { subtype: "message_changed", message: { text: "edited" } }));
+  await sleep(300);
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].status === "pending", "events: subtype message → ignored");
+  assert(approvals[0].feedback === undefined, "events: subtype message → no feedback");
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 22: two replies before pickup → feedback appended (v) ──
+{
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-fb5", from_role: "product-implementer", status: "pending", reviewer: "human" },
+  ]);
+  const seenFile = seenFileWith(dir, {
+    "apr-fb5": { status: "pending", ts: "1712345678.000100", channel: "C789" },
+  });
+  const { state, wsServer } = await startConnected({ approvalsFile, stateFile: seenFile });
+  wsServer.sendText(eventsEnvelope("env-evt-5a", { ts: "1712345678.000201", text: "first note" }));
+  const first = await waitFor(() => {
+    const a = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+    return a[0]?.feedback === "first note";
+  }, 2000);
+  assert(first, "events: first reply lands as feedback");
+  wsServer.sendText(eventsEnvelope("env-evt-5b", { ts: "1712345678.000202", user: "U456", text: "second note" }));
+  const appended = await waitFor(() => {
+    const a = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+    return a[0]?.feedback === "first note\nsecond note";
+  }, 2000);
+  assert(appended, "events: second reply appended newline-separated");
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].status === "changes_requested", "events: still changes_requested after appends");
+  assert(approvals[0].reviewer === "U456", "events: reviewer = last replier");
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 23: reply after verdict landed (approved) → ignored (vi) ──
+{
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-fb6", from_role: "product-implementer", status: "approved", reviewer: "U000", feedback: "done" },
+  ]);
+  const seenFile = seenFileWith(dir, {
+    "apr-fb6": { status: "approved", ts: "1712345678.000100", channel: "C789" },
+  });
+  const { state, wsServer } = await startConnected({ approvalsFile, stateFile: seenFile });
+  wsServer.sendText(eventsEnvelope("env-evt-6"));
+  await sleep(300); // give any (wrong) write time to land
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].status === "approved", "events: reply after verdict → approval untouched");
+  assert(approvals[0].feedback === "done" && approvals[0].feedback_at === undefined,
+    "events: reply after verdict → no feedback write (not resurrected)");
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 24: onFeedback hook fires with (id, text, reviewer) (vii) ──
+{
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-fb7", from_role: "product-implementer", status: "pending", reviewer: "human" },
+  ]);
+  const seenFile = seenFileWith(dir, {
+    "apr-fb7": { status: "pending", ts: "1712345678.000100", channel: "C789" },
+  });
+  const feedbacks: any[] = [];
+  const { state, wsServer } = await startConnected({
+    approvalsFile,
+    stateFile: seenFile,
+    onFeedback: (id, text, reviewer) => feedbacks.push({ id, text, reviewer }),
+  });
+  wsServer.sendText(eventsEnvelope("env-evt-7", { text: "one more thing" }));
+  const done = await waitFor(() => feedbacks.length >= 1, 2000);
+  assert(done, "events: onFeedback hook fired");
+  assert(feedbacks[0]?.id === "apr-fb7" && feedbacks[0]?.text === "one more thing" && feedbacks[0]?.reviewer === "U123",
+    "events: hook payload (id, text, reviewer) correct");
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 25: feedback write settles the message to the 📝 banner (i) ──
+// chat.update carries the quoted + truncated feedback, no actions blocks.
+{
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-fb8", from_role: "product-implementer", status: "pending", reviewer: "human" },
+  ]);
+  const seenFile = seenFileWith(dir, {
+    "apr-fb8": { status: "pending", ts: "1712345678.000100", channel: "C789" },
+  });
+  const { state, api, wsServer } = await startConnected({ approvalsFile, stateFile: seenFile });
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  // 350 chars — must be truncated to ~300 inside the blockquote
+  const long = "x".repeat(350);
+  wsServer.sendText(eventsEnvelope("env-evt-8", { text: long }));
+  const got = await waitFor(() => api.requests.some((r) => r.url === "/chat.update"), 2000);
+  assert(got, "feedback-settle: chat.update fired after feedback write");
+  const upd = api.requests.find((r) => r.url === "/chat.update")!;
+  assert(upd.headers.authorization === "Bearer xoxb-test", "feedback-settle: bot token auth");
+  const form = new URLSearchParams(upd.body);
+  assert(form.get("channel") === "C789", "feedback-settle: channel from seen entry");
+  assert(form.get("ts") === "1712345678.000100", "feedback-settle: ts from seen entry");
+  const blocks = JSON.parse(form.get("blocks") ?? "[]");
+  const section = blocks.find((b: any) => b.type === "section")?.text?.text ?? "";
+  assert(section.includes("📝 *Changes requested* by <@U123>"),
+    "feedback-settle: 📝 Changes requested by reviewer mention");
+  assert(section.includes(`> ${long.slice(0, 300)}…`), "feedback-settle: feedback quoted + truncated to ~300 chars");
+  assert(!section.includes("x".repeat(301)), "feedback-settle: text beyond 300 chars dropped");
+  assert(section.split("\n")[1]?.startsWith("> "), "feedback-settle: feedback blockquoted");
+  assert(blocks.some((b: any) => b.type === "context" && (b.elements?.[0]?.text ?? "").includes("Reply again to add more feedback")),
+    "feedback-settle: context explains re-reply");
+  assert(!blocks.some((b: any) => b.type === "actions"), "feedback-settle: NO action buttons (mid-revision)");
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].status === "changes_requested" && approvals[0].feedback === long,
+    "feedback-settle: feedback write unaffected by the settle");
+  delete process.env.SLACK_BOT_TOKEN;
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+  await api.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 26: seen entry without channel/ts → no chat.update, feedback still written (ii) ──
+{
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-fb9", from_role: "product-implementer", status: "pending", reviewer: "human" },
+  ]);
+  // legacy seen shape: ts present (needed for the thread match) but NO channel
+  const seenFile = seenFileWith(dir, {
+    "apr-fb9": { status: "pending", ts: "1712345678.000100" },
+  });
+  const { state, api, wsServer } = await startConnected({ approvalsFile, stateFile: seenFile });
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  api.requests = [];
+  wsServer.sendText(eventsEnvelope("env-evt-9", { text: "legacy settle skip" }));
+  const done = await waitFor(() => {
+    const a = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+    return a[0]?.status === "changes_requested";
+  }, 2000);
+  assert(done, "feedback-skip: feedback still written when seen entry lacks channel");
+  await sleep(250); // give any (wrong) chat.update time to land
+  assert(!api.requests.some((r) => r.url === "/chat.update"),
+    "feedback-skip: zero chat.update calls without channel (silent skip)");
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].feedback === "legacy settle skip", "feedback-skip: feedback text intact");
+  delete process.env.SLACK_BOT_TOKEN;
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+  await api.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── Test 27: cap-exceeded entry → ⛔ escalation settle banner (iii) ──
+{
+  const dir = tmpDir();
+  const approvalsFile = pendingApprovalsFile(dir, [
+    { id: "apr-fb10", from_role: "product-implementer", status: "pending", reviewer: "human", revision: 16 },
+  ]);
+  const seenFile = seenFileWith(dir, {
+    "apr-fb10": { status: "pending", ts: "1712345678.000100", channel: "C789" },
+  });
+  const { state, api, wsServer } = await startConnected({ approvalsFile, stateFile: seenFile });
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  wsServer.sendText(eventsEnvelope("env-evt-10", { text: "still need fixes" }));
+  const got = await waitFor(() => api.requests.some((r) => r.url === "/chat.update"), 2000);
+  assert(got, "cap-settle: chat.update fired after feedback write");
+  const upd = api.requests.find((r) => r.url === "/chat.update")!;
+  const blocks = JSON.parse(new URLSearchParams(upd.body).get("blocks") ?? "[]");
+  assert(blocks.some((b: any) => b.type === "section" && (b.text?.text ?? "").includes("⛔ *Escalated — revision cap (15) exceeded*")),
+    "cap-settle: ⛔ escalation banner replaces the 📝 banner");
+  assert(blocks.some((b: any) => b.type === "context" && (b.elements?.[0]?.text ?? "").includes("Human conversation needed")),
+    "cap-settle: context says human conversation needed");
+  assert(!blocks.some((b: any) => b.type === "actions"), "cap-settle: no buttons");
+  assert(!blocks.some((b: any) => (b.text?.text ?? "").includes("📝")), "cap-settle: no 📝 changes-requested banner");
+  const approvals = JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  assert(approvals[0].status === "changes_requested" && approvals[0].revision === 16,
+    "cap-settle: feedback write unaffected by the escalation settle");
+  delete process.env.SLACK_BOT_TOKEN;
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+  await api.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
 
 console.log(`\nsocket-mode.test.ts: ${passed} passed, ${failed} failed`);
 if (failed > 0) {

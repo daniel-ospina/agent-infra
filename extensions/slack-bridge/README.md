@@ -165,14 +165,56 @@ posted `ts` per approval, which is what maps a `thread_ts` back to its
 approval id). No @mention required — plain replies work.
 
 This is the **receiver half** of epic *approval feedback loop* (#155): turning
-replies into `changes_requested` feedback here, settling the Slack message to
-the 📝 banner (#157) and the requester loop (swarm #1681) are separate follow-ups.
+replies into `changes_requested` feedback here and settling the Slack message
+(see *Conversation state model* below); the requester loop that revises and
+re-requests is swarm #1681.
+
+### Conversation state model (agent-infra #157)
+
+The approval message in the channel now tracks the conversation state — every
+step settles the visible message via `chat.update` so buttons only appear on
+the live request:
+
+```
+open (v1, 🔔 + buttons)
+   │  human replies in thread → feedback written to approvals.json
+   ▼
+📝 *Changes requested* (buttons removed — mid-revision)
+   │  requester revises + re-requests (swarm #1681 increments `revision`)
+   ▼
+🔁 Approval v2 … v15 (fresh message, buttons back)
+   │  the previous revision's message settles to ↻ *Superseded by v<n>*
+   │
+   ├─ verdict lands → ✅ *Approved* / ❌ *Rejected* (resolved-message update)
+   │
+   └─ revision > 15 (REVISION_CAP) or status "escalated" →
+        ⛔ *Escalated — revision cap (15) exceeded* (no buttons, settled once)
+```
+
+Specifically:
+
+- **Feedback settle**: after a thread reply flips an approval to
+  `changes_requested`, the message is settled to the 📝 banner with the
+  (truncated, blockquoted) feedback; Accept/Reject buttons are removed — the
+  request is mid-revision, no verdict clicks. Settling is fire-and-forget:
+  missing channel/ts in the seen entry or a missing `SLACK_BOT_TOKEN` skips
+  silently and never affects the feedback write.
+- **Revision re-posts**: when a re-request carries `revision >= 2` (absent or
+  1 = v1), the forwarder posts a fresh `🔁 *Approval v<n>*` message with
+  buttons and supersedes the previous revision's message (↻ banner, no
+  buttons). The seen entry stores the new ts + revision, so a same-revision
+  rescan never re-posts.
+- **Cap-exceeded / escalated**: an entry with `revision > 15` (or
+  `status: "escalated"`) settles the last posted message to the ⛔ escalation
+  banner exactly once (the seen entry flips to `escalated` as the once-marker)
+  and never gets buttons again. A late thread reply under it also settles to
+  the ⛔ banner instead of 📝.
 
 ## Tests
 
 ```bash
-npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 123 asserts (self-check)
-npx tsx extensions/slack-bridge/socket-mode.test.ts    # 125 asserts (Socket Mode receiver, mock WS server)
+npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 152 asserts (self-check)
+npx tsx extensions/slack-bridge/socket-mode.test.ts    # 148 asserts (Socket Mode receiver, mock WS server)
 npx tsx extensions/slack-bridge/chunker.test.ts        # 21 asserts
 ```
 
