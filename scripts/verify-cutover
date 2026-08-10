@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""verify-cutover — asserted control-plane cutover gate (#669 plan Task 10).
+
+Asserts the post-flip invariant the #765 writer/reader inventory exists to
+guarantee: **the FalkorDB control-plane registry is empty** (registry node
+count == 0) and no mutations happen while the gate runs.
+
+The registry (control_plane graph) is retired at the single-deploy flip
+(#771): teams / team_memberships / api_keys / invitations live in Supabase
+and every registry writer is migrated or disabled (plan Task 8, #765). This
+script is the runnable assertion — #771 wires it into the pre-deploy CI
+gate.
+
+Usage:
+    TORTOISE_DB_URI=bolt://... TORTOISE_CONTROL_PLANE=supabase ./scripts/verify-cutover
+    # or with an embedded/local DB:
+    TORTOISE_DB_PATH=/data/tortoise.db ./scripts/verify-cutover
+
+Exit codes:
+    0  — registry empty, gate passes
+    1  — assertion failed (nodes found / control plane not Supabase)
+    2  — could not run (missing env, DB unreachable) — NOT a pass
+
+This script is READ-ONLY: it only counts nodes. It never writes, never
+creates, never deletes — "no mutations" is asserted by construction plus the
+#765 Supabase-mode test spy (every migrated writer asserts zero registry
+queries in Supabase mode).
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+def _fail(msg: str, code: int = 1) -> int:
+    print(f"verify-cutover: FAIL — {msg}", file=sys.stderr)
+    return code
+
+
+def main() -> int:
+    # 1) Control plane must be Supabase-backed (a registry-backed deployment
+    #    has no cutover to verify).
+    mode = os.environ.get("TORTOISE_CONTROL_PLANE", "").strip().lower()
+    supabase_url = os.environ.get("SUPABASE_URL", "")
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get(
+        "SUPABASE_SERVICE_KEY", "")
+    if mode == "registry":
+        return _fail(
+            "TORTOISE_CONTROL_PLANE=registry — nothing to verify "
+            "(selfhost stays registry-backed by design).")
+    if mode == "supabase" and not (supabase_url and service_key):
+        return _fail(
+            "TORTOISE_CONTROL_PLANE=supabase but SUPABASE_URL / service key "
+            "are missing (fail-closed: a Supabase-only deployment must not "
+            "silently pass on an empty registry check).")
+    if not mode and not (supabase_url and service_key):
+        return _fail(
+            "not in Supabase mode (no TORTOISE_CONTROL_PLANE and no "
+            "Supabase creds) — nothing to verify.")
+
+    # 2) Open the registry graph and count nodes.
+    db_uri = os.environ.get("TORTOISE_DB_URI", "")
+    db_path = os.environ.get("TORTOISE_DB_PATH", "")
+    try:
+        from tortoise.sdk import TortoiseSDK
+    except Exception as e:  # pragma: no cover — env problem, not a pass
+        return _fail(f"could not import TortoiseSDK: {e}", code=2)
+    try:
+        if db_uri:
+            sdk = TortoiseSDK()  # TORTOISE_DB_URI is read from env
+        elif db_path:
+            sdk = TortoiseSDK(db_path=db_path)
+        else:
+            return _fail(
+                "neither TORTOISE_DB_URI nor TORTOISE_DB_PATH is set — "
+                "cannot open the registry graph.", code=2)
+        reg = sdk._get_registry()
+        rows = reg.query("MATCH (n) RETURN count(n)").result_set
+        count = int(rows[0][0]) if rows else 0
+        sdk.close()
+    except Exception as e:  # pragma: no cover
+        return _fail(f"registry query failed ({e}) — DB unreachable", code=2)
+
+    # 3) The assertion (plan Task 10 step 1 / Task 8 acceptance).
+    if count != 0:
+        return _fail(
+            f"registry_control_plane has {count} node(s) — every registry "
+            "writer must be migrated or disabled before the flip "
+            "(plan Task 8 writer inventory, #765).")
+    print(
+        "verify-cutover: PASS — registry_control_plane node count == 0, "
+        "control plane is Supabase-backed, no mutations performed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
