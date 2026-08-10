@@ -608,22 +608,22 @@ The `commit` step (Step 6 handoff) is a `human_approval` gate in this skill's fr
 
 ### Approval Routing
 
-When a human gate fires, the agent MUST invoke the approval router to surface the request:
+When a gate fires, the agent MUST invoke the approval router to surface the request:
 
 ```bash
-# Role-based escalation (non-epic gates):
-APPROVAL_NO_NOTIFY=0 python3 -c "
+# Role-based escalation (routine gates — routes to the reports_to role, NO human dialog):
+python3 -c "
 from operations.coordination.approval import request_approval
-request_approval('product-implementer', artifact='<plan-doc>.md', context='<checkpoint> approval for issue <N>')
-print('Approval request created — osascript dialog fired')
+request_approval('product-implementer', artifact='<plan-doc>.md', context='<checkpoint> approval for issue <N>', requires_human=False)
+print('Approval request created — routed to product-strategist')
 "
 ```
 
-This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to `operations/coordination/approvals.json` and must be checked manually.
+Routine gates do NOT pop a human dialog: with `requires_human=False` (the default) the request routes through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human), so the reviewer is the requester's `reports_to` role (a pi role — e.g. product-strategist for product-implementer). The request is logged to `operations/coordination/approvals.json` and that role approves via `review_approval()`. Do NOT set `APPROVAL_NO_NOTIFY=0` — it overrides the daemon kill-switch.
 
-**Response mechanism:** The human clicks "Open" or "Dismiss" on the dialog. The agent monitors `pending_approvals('human')` to detect the response. See `operations/coordination/approval.py` for the full API.
+Use `requires_human=True` ONLY for genuine human gates (epics, P0): that routes to 'human' and pops an osascript dialog (rate-limited to 1 per 30 min per artifact; suppressed when `APPROVAL_NO_NOTIFY=1`, e.g. headless/daemon context). If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to `operations/coordination/approvals.json` and must be checked manually.
 
-**Role-based escalation** (for non-epic gates): use without `requires_human=True` to route through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human).
+**Response mechanism:** The reviewer approves via `review_approval()`. The agent monitors `pending_approvals('<reviewer>')` — for routine product-implementer gates that is `pending_approvals('product-strategist')`; only human-routed requests (`requires_human=True`) surface a dialog the human clicks "Open" or "Dismiss". See `operations/coordination/approval.py` for the full API.
 
 ## When to Stop and Ask
 
