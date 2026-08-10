@@ -76,6 +76,22 @@ Shared `json-scan.ts` seam also closes out #135's class permanently.
 
 ## Next actions
 1. ✅ #43 → tortoise#857
-2. Close 48 fixed/stale issues with evidence comments (pending approval)
-3. Update #61 scope to remaining items only; link #51→#41, #6→#45, #137→#92
-4. Start Wave 1
+2. ✅ Closed 48 fixed/stale issues with evidence comments (2026-08-10)
+3. ✅ Updated #61 scope; links recorded (#51→#41, #6→#45, #137→#92)
+4. ✅ Waves 1–4 executed same-day
+
+## Execution record (all merged 2026-08-10)
+| PR | Wave | Issues closed |
+|---|---|---|
+| #139 | 1 + priority | #133 #135 #46 #47 #45 #6 #92 #138 |
+| #140 | 2 | #134 #137 |
+| #141 | 3 | #65 #60 #41 #51 |
+| #142 | 4 + #61 completion | #40 #48 #61 |
+
+**End state: 65 open → 0 open** (48 closed as fixed/stale, 1 transferred, 16 shipped).
+Model routing per user directive: scope+plan by pro/Qwen-class for complex (#137),
+all implementation by deepseek-v4-flash. Qwen unreachable via task provider
+(deepseek-only endpoint) — deepseek-v4-pro substituted for the #137 plan.
+
+Known residuals (not blocking): slack-bridge button-callback receiver needs
+Socket Mode (#40 follow-up, user-side env setup); PRs #136/#130 still in review.
