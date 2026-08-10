@@ -7,6 +7,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpat
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
+import { appendJsonl } from "../shared/audit-log.js";
 // ponytail: inlined from verification-gate-utils.ts — pi's extension loader treats every .ts in
 // ~/.pi/agent/extensions/ as an extension and fails on a pure-helper module (no factory export).
 // Do NOT re-extract to a sibling .ts; the directory+entry pattern (see main-worktree-guard) is the
@@ -350,6 +351,7 @@ export default function (pi: ExtensionAPI) {
     if (process.env.ELDATO_SKIP_VGATE === "1") {
       extensionEnabled = false;
       console.log("[verification-gate] ⏸️  Disabled — ELDATO_SKIP_VGATE=1");
+      appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "escape_hatch", session_cwd: process.cwd() }); // #60: durable audit record (fail-safe)
     } else {
       extensionEnabled = true;
     }
@@ -374,6 +376,7 @@ export default function (pi: ExtensionAPI) {
     // when a stale-hash block strikes.
     if (process.env.ELDATO_SKIP_VGATE === "1") {
       console.log("[verification-gate] ⏩ Bypassed — ELDATO_SKIP_VGATE=1 (per-command)");
+      appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "per_command_escape_hatch", session_cwd: process.cwd() }); // #60: durable audit record (fail-safe)
       return undefined;
     }
 

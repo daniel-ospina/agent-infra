@@ -4,6 +4,7 @@ import { execSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import { resolve as resolvePath } from "path";
+import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
 
 // Dual-support: check AGENT_* first, then ELDATO_* (Phase 1 — #7549)
 function _getEnv(name: string): string | undefined {
@@ -196,6 +197,52 @@ export function evaluateMergeGate(
   };
 }
 
+// ── Durable audit trail (#60) ─────────────────────────
+// Every gate bypass and review-dispatch event is appended to
+// ~/.pi/agent/audit/gate-events.jsonl (see shared/audit-log.ts). Fail-safe:
+// appendJsonl never throws, so auditing can never alter a gate decision.
+// Optional `file` override exists for tests (temp log path).
+
+export function logGateEvent(
+  event: GateEventName,
+  extra: Record<string, unknown> = {},
+  file?: string
+): void {
+  appendJsonl(
+    { event, extension: "review-enforcer", ...extra, session_cwd: process.cwd() },
+    file
+  );
+}
+
+// Short tag for merge_gate_block entries — mirrors evaluateMergeGate's
+// block branches (no review record / non-clean verdict / head advanced).
+export function mergeGateBlockReason(record: ReviewRecord | null): string {
+  if (!record) return "no_review_record";
+  if (record.verdict !== "clean" && record.verdict !== "clean-micro") return "verdict_not_clean";
+  return "head_advanced";
+}
+
+// Record the merge-gate decision: block → merge_gate_block with a short
+// reason; allow AND fail-open (allow-with-warning) → merge_gate_pass
+// (fail-open marked via reason "failopen" so the audit trail shows the merge
+// was allowed without head verification).
+export function logMergeGateDecision(
+  pr: number,
+  result: MergeGateResult,
+  record: ReviewRecord | null,
+  file?: string
+): void {
+  if (result.status === "block") {
+    logGateEvent("merge_gate_block", { pr, reason: mergeGateBlockReason(record) }, file);
+  } else {
+    logGateEvent(
+      "merge_gate_pass",
+      { pr, ...(result.status === "failopen" ? { reason: "failopen" } : {}) },
+      file
+    );
+  }
+}
+
 // ── Block message ─────────────────────────────────────
 
 const BLOCK_MESSAGE = [
@@ -235,6 +282,9 @@ export default function (pi: ExtensionAPI) {
           "⚠️  REVIEW GATES DISABLED — all quality checks bypassed.",
           "To re-enable, unset AGENT_SKIP_REVIEW_GATE (or ELDATO_SKIP_REVIEW_GATE) and restart."
         );
+        // #60: durable audit record — the console.log JSON below stays, this
+        // ADDS the persistent trail (append-only JSONL, fail-safe).
+        logGateEvent("gate_bypass", { reason: "escape_hatch" });
         // bypass log — machine-readable JSON. Only emit in interactive mode:
         // in print mode (sub-agents) this bare JSON would land on stderr and
         // contaminate tool-result content, breaking downstream JSON parsers.
@@ -285,8 +335,10 @@ export default function (pi: ExtensionAPI) {
         const result = evaluateMergeGate(prNumber, record, currentHead, ctx);
         if (result.status === "block") {
           console.log("[review-enforcer] 🚫 Merge registry gate blocked merge");
+          logMergeGateDecision(prNumber, result, record); // #60: durable audit record
           return { block: true, reason: result.reason };
         }
+        logMergeGateDecision(prNumber, result, record); // #60: durable audit record (pass or fail-open)
         console.log(result.status === "failopen" ? result.warning : result.message);
         return undefined;
       }
@@ -327,6 +379,9 @@ export default function (pi: ExtensionAPI) {
       console.log(
         `[review-enforcer] 📊 Reviewer dispatch counted (total: ${dispatchCount})`
       );
+      // #60: durable per-event record — the running total is stamped on each
+      // entry so the dispatch count is reconstructible from the audit log.
+      logGateEvent("review_dispatch", { dispatch_count: dispatchCount });
       return undefined;
     });
 
