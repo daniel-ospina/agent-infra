@@ -145,11 +145,34 @@ the same `SLACK_BOT_TOKEN` as approval forwarding and the original message's
 channel/ts stored in `slack-approval-seen.json` (legacy `{status}`-only
 entries without ts are tolerated — the update is skipped for those).
 
+### Feedback replies (agent-infra #156)
+
+A message posted as a **thread reply under an approval message** is captured
+by the Socket Mode receiver as feedback: the approval entry in `approvals.json`
+flips to `status: "changes_requested"` with the reply text as `feedback`, plus
+the replier (`reviewer`) and a `feedback_at` stamp. Multiple replies arriving
+before the requester picks them up are appended newline-separated. Bot posts
+(`bot_id`), edits/joins (`subtype`), replies in unrelated threads, and replies
+under already-resolved approvals are all ignored — the receiver never
+self-triggers and never resurrects a landed verdict.
+
+**Setup:** the Slack app must subscribe to `message.channels` events
+(**Event Subscriptions → Subscribe to bot events → `message.channels`**) with
+Socket Mode enabled — the receiver then handles the `events_api` envelopes
+alongside `block_actions`. No new token or env var: it reuses `SLACK_APP_TOKEN`
+and the same seen-file registry (`slack-approval-seen.json` already stores the
+posted `ts` per approval, which is what maps a `thread_ts` back to its
+approval id). No @mention required — plain replies work.
+
+This is the **receiver half** of epic *approval feedback loop* (#155): turning
+replies into `changes_requested` feedback here, settling the Slack message to
+the 📝 banner (#157) and the requester loop (swarm #1681) are separate follow-ups.
+
 ## Tests
 
 ```bash
-npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 117 asserts (self-check)
-npx tsx extensions/slack-bridge/socket-mode.test.ts    # 92 asserts (Socket Mode receiver, mock WS server)
+npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 123 asserts (self-check)
+npx tsx extensions/slack-bridge/socket-mode.test.ts    # 125 asserts (Socket Mode receiver, mock WS server)
 npx tsx extensions/slack-bridge/chunker.test.ts        # 21 asserts
 ```
 
