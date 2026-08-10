@@ -79,7 +79,8 @@ Complexity: <from epic scope ratings>
 Each issue must include:
 - **Epic contract reference** — link to the epic plan section it implements
 - **Test alignment** — reference the E2E test cases it should satisfy
-- **Research alignment** — reference relevant research from the epic research brief
+- **Test-design reference** — link the epic's integration-surface map (from the test-design issue created before Plan) and name the surfaces this work unit touches
+- **Verification checklist** — derived from the surface map: one row per surface this issue touches, with the assigned test layer and expected verification (e.g., SQL logic → pgTAP cases, external API → contract tests, auth boundary → integration tests, UI flow → e2e). Format: `Verification: see test-design #N — tests [T1, T4, T7]` plus the surface→test-layer checklist. No child issue ships without its checklist.
 
 ### Step 4 — Per-Issue Review Gate
 
@@ -92,6 +93,7 @@ Review this issue for:
 2. TEST ALIGNMENT: Does it reference the correct E2E test cases?
 3. RESEARCH ALIGNMENT: Does it incorporate relevant research findings?
 4. DEPENDENCY CORRECTNESS: Are dependencies accurate and complete?
+5. VERIFICATION CHECKLIST: Does the issue body reference the epic's test-design surface map and include a verification checklist derived from it (surface → test layer → expected verification)? Are any surfaces this issue touches missing from the checklist?
 
 Return: NO ISSUES FOUND | ISSUES: <list>
 ```
@@ -148,6 +150,7 @@ The per-issue and MECE gates described above are the review mechanism. No additi
 | Skip | Consequence |
 |------|-------------|
 | Per-issue review | Issues drift from epic contract — implementation produces features the epic didn't specify |
+| Verification checklist derivation | Child issues implement surfaces with no assigned tests — integration bugs surface only at capstone time, when they're most expensive to fix |
 | MECE verification | Overlapping issues → merge conflicts, duplicated work. Missing issues → feature gaps discovered during implementation |
 | Dependency ordering | Issues blocked waiting for unstarted dependencies — pipeline stalls |
 
@@ -156,6 +159,6 @@ The per-issue and MECE gates described above are the review mechanism. No additi
 **Called by:** `epic-plan` (after coherence review passes)
 **Hands off to:** `epic-verify` (final pipeline gate)
 **Calls:** `issue-creation` (for each child issue)
-**References:** `parallel-orchestrator` (review gate dispatch)
+**References:** `test-design` (epic integration-surface map), `parallel-orchestrator` (review gate dispatch)
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

@@ -1,0 +1,82 @@
+name: Pipeline Compliance
+# Deterministic (no-LLM) CI gate — verifies a PR followed the agent pipeline
+# (issue-scoping → plan → code-review) before merge. Runs the
+# scripts/check-pipeline-compliance.sh gate. Independent job: no `needs`,
+# runs alongside other CI and reports its own check status.
+#
+# WIRING OPTION 1 — copy into a consumer repo (self-contained):
+#   Copy this file to <repo>/.github/workflows/pipeline-compliance.yml AND
+#   scripts/check-pipeline-compliance.sh from agent-infra. The `pull_request`
+#   trigger below then runs the gate on every PR with zero extra config —
+#   repo and PR number are taken from the github context, not hardcoded.
+#
+# WIRING OPTION 2 — reuse from agent-infra (no copy, script auto-fetched):
+#   In the consumer repo create a thin workflow:
+#     name: Pipeline Compliance
+#     on:
+#       pull_request:
+#     permissions:
+#       contents: read
+#       issues: read
+#       pull-requests: read
+#     jobs:
+#       pipeline-compliance:
+#         uses: daniel-ospina/agent-infra/.github/workflows/pipeline-compliance.yml@main
+#         with:
+#           pr-number: ${{ github.event.pull_request.number }}
+#   The script is fetched from agent-infra when not present in the repo
+#   (override the source with the PIPELINE_COMPLIANCE_SCRIPT_URL env or a
+#   repo variable of the same name).
+#
+# BRANCH PROTECTION: require the "Pipeline Compliance" check on main — this
+# is what actually blocks merges. Without a required check the gate only
+# reports.
+#
+# EMERGENCY OVERRIDE: pass `skip: true` (or set PIPELINE_COMPLIANCE_SKIP=1 in
+# the consumer workflow env). The script prints a loud warning and exits 0.
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        type: string
+        required: false
+        description: 'PR number to gate (required when called via workflow_call).'
+      repo:
+        type: string
+        required: false
+        description: 'owner/repo to check against. Defaults to github.repository.'
+      skip:
+        type: boolean
+        required: false
+        default: false
+        description: 'Emergency override — skip the gate with a loud warning.'
+  pull_request:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  pipeline-compliance:
+    name: Pipeline compliance gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run pipeline compliance gate
+        env:
+          GH_REPO: ${{ inputs.repo || github.repository }}
+          PR_NUMBER: ${{ inputs.pr-number || github.event.pull_request.number }}
+          PIPELINE_COMPLIANCE_SKIP: ${{ inputs.skip && '1' || '0' }}
+          PIPELINE_COMPLIANCE_SCRIPT_URL: ${{ vars.PIPELINE_COMPLIANCE_SCRIPT_URL || 'https://raw.githubusercontent.com/daniel-ospina/agent-infra/main/scripts/check-pipeline-compliance.sh' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/check-pipeline-compliance.sh ]; then
+            echo "::group::Fetching check-pipeline-compliance.sh from agent-infra"
+            mkdir -p scripts
+            curl -fsSL --retry 3 "$PIPELINE_COMPLIANCE_SCRIPT_URL" -o scripts/check-pipeline-compliance.sh
+            echo "::endgroup::"
+          fi
+          bash scripts/check-pipeline-compliance.sh

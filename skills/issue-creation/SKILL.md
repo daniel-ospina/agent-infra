@@ -149,6 +149,7 @@ Pull context from the parent epic or project. Be thorough — missing context ca
 3. Link the epic: `**Epic:** docs/epics/.../plan.md`
 4. Link relevant research: `**Research:** docs/epics/.../research-brief.md` (or "none")
 5. Note what this issue inherits vs what's new
+6. Pull the epic's test-design surface map (epics run the Test-Design Gate before Plan — issue number recorded in the plan doc). Name the surfaces this issue touches and derive the `### Verification Checklist` section from them. If no test-design exists (grandfathered epic or standalone), write "none — no epic test-design" and skip the surface map derivation.
 
 ### If Standalone
 
@@ -166,6 +167,7 @@ Before creating the issue, verify nothing was forgotten from the parent. This ca
 - [ ] **Dependencies** — any sibling issues this must wait for? (check parent's decomposition section)
 - [ ] **Phase** — which migration phase or priority order does this belong to?
 - [ ] **Research** — does the parent have a research brief with findings relevant here?
+- [ ] **Test-design** — does this issue's verification checklist derive from the epic's integration-surface map, covering every surface this issue touches?
 
 ### Research
 If this issue needs investigation before implementation, note what to research. For standard+complex issues, this feeds into `issue-scoping` Phase 1.5 (external research). For micro issues, skip.
@@ -195,6 +197,14 @@ If this issue needs investigation before implementation, note what to research. 
 
 ### Research Needed
 <what to investigate before implementation, or "None — scope is clear">
+
+### Verification Checklist
+Derived from the epic's test-design surface map — one row per surface this issue touches:
+| Surface | Test Layer | Expected Verification |
+|---------|-----------|----------------------|
+| <integration surface> | <unit|pgTAP|contract|integration|e2e|ux> | <what must pass> |
+
+(Standalone or grandfathered epic: "none — no epic test-design")
 
 ### Complexity (domain-aware)
 | Domain | Rating | Rationale |

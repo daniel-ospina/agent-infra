@@ -8,7 +8,7 @@ tags: [pipeline, epic, planning, fractal, orchestrator]
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 summary: "Top-level Workflow skill that routes an epic through all 6 pipeline stages at full depth."
 created: 2026-07-07
-updated: 2026-07-07
+updated: 2026-08-10
 steps:
   - name: align
     type: skill
@@ -57,6 +57,8 @@ Routes an epic through the full 6-stage fractal planning pipeline. Each stage in
 4. **Plan** — `shared/plan/SKILL.md` — 8 planning substeps with full review gates
 5. **Decompose** — `shared/decompose/SKILL.md` — MECE-first + wiring + verification issues. Uses `issue-creation` skill for child issue generation.
 6. **Verify** — `shared/verify/SKILL.md` — Pre + post-deploy verification
+
+> **Hooks:** Test-Design Gate fires between Scope and Plan; Capstone Verification Gate fires between Decompose and Verify. Both are mandatory stage hooks — see Gates below.
 
 **Reflect** — session capture runs at session quit via `reflect-hook.ts`: writes a durable local JSONL record (~/.tortoise/session-events/) and POSTs to the hosted tortoise `/v1/sessions` endpoint when `TORTOISE_API_KEY` is set (AAR postmortem + friction data). Cross-cutting: fires at epic completion, project close, and session quit.
 
@@ -107,6 +109,30 @@ This checkpoint runs at the start of every stage (2-6). The agent must explicitl
 After Scope approval (Human Gate #1) and before Plan (Stage 4): invoke `ux-design-review` skill when `UX_RATING ≥ medium`. This gate classifies UX decisions, presents structured options, and records user choices. It does NOT block — it surfaces and records.
 
 > **ponytail:** wired inline. `shared/plan/SKILL.md` exists — it routes epics to `epic-plan` and keeps project planning inline in `project-workflow`.
+
+### Test-Design Gate (between Scope and Plan)
+
+**Trigger:** After Scope approval (Human Gate #1), before Plan (Stage 4). Fires alongside the UX Design Gate — both run before planning starts.
+
+**Action — Create test-design issue:**
+
+1. Dispatch the `test-design` skill to produce the epic's integration-surface map: every integration surface, the test layer assigned per surface (unit / pgTAP / contract / integration / e2e / ux), and failure modes per surface. Scope's Customer Value Map is the input — each scoped capability maps to at least one surface.
+2. File the result as a child issue via `issue-creation`: `test-design: <epic> integration-surface map` (O/I/T, affiliation, complexity). The issue body must contain the FULL surface map so every downstream child issue can reference it.
+3. Record the issue number in the epic plan doc.
+
+**Gate:** Plan must NOT start until the test-design issue exists and its surface map covers every scoped capability. The map is the contract between scope and implementation — without it, child issues can't carry verification checklists (see `epic-decompose`).
+
+### Capstone Verification Gate (between Decompose and Verify)
+
+**Trigger:** After Decompose (Stage 5) generates all child issues, before Verify (Stage 6) and before the epic can be marked complete.
+
+**Action — Create capstone verification issue:**
+
+1. Create one final child issue via `issue-creation`: `capstone: clickthrough verification for <epic>`.
+2. The capstone is a final end-to-end clickthrough gate per the `post-deploy-verify` pattern: detect the deploy surface from the epic's PRs, walk the epic's high-level E2E test cases (from scope) as a real user, verify logs + database state, capture screenshots.
+3. Its verification checklist = the epic's high-level E2E tests + the integration surfaces from the test-design map (each surface verified through its assigned test layer).
+
+**Gate:** The capstone must PASS before the epic is marked complete — no epic completion without a passing capstone clickthrough. Its result feeds the Verify stage's Verification Proof; a failing or missing capstone blocks Verify from concluding.
 
 ## Entity Mapping
 
