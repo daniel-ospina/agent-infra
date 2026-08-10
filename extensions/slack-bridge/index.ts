@@ -30,6 +30,9 @@ import {
   startSocketModeReceiver,
   stopSocketModeReceiver,
   updateResolvedMessage,
+  settleEscalatedMessage, // #157: ⛔ revision-cap banner (forwarder settle)
+  settleSupersededMessage, // #157: ↻ banner when a new revision supersedes
+  REVISION_CAP, // #157: shared cap — matches the epic decision
   type SocketModeState,
 } from "./socket-mode.ts";
 
@@ -354,6 +357,7 @@ interface ApprovalRequest {
   status?: string;
   reviewer?: string;
   feedback?: string;
+  revision?: number; // #157: swarm #1681 increments on re-request; absent/1 = v1
   created_at?: string;
   parent?: string;
   thread?: Array<{ author?: string; text?: string; ts?: string }>;
@@ -425,9 +429,17 @@ export function slackApiPost(
   });
 }
 
-/** Slack message blocks for an approval request — Accept/Reject actions. */
+/** Slack message blocks for an approval request — Accept/Reject actions.
+ * #157: revision >= 2 (a re-request) titles the section
+ * `🔁 *Approval v<revision>* — <artifact>`; v1 keeps the original 🔔 header.
+ * Buttons are unchanged in both cases. */
 export function buildApprovalBlocks(req: ApprovalRequest): any[] {
-  const header = `🔔 *Approval requested*\n*From:* ${req.from_role || "unknown"}\n*Reviewer:* ${req.reviewer || "human"}`;
+  const revision = typeof req.revision === "number" && req.revision >= 2 ? req.revision : 1;
+  const title =
+    revision >= 2
+      ? `🔁 *Approval v${revision}* — ${req.artifact || req.from_role || "request"}`
+      : `🔔 *Approval requested*`;
+  const header = `${title}\n*From:* ${req.from_role || "unknown"}\n*Reviewer:* ${req.reviewer || "human"}`;
   const detail = [
     req.artifact ? `*Artifact:* ${req.artifact}` : null,
     req.context ? `*Context:* ${req.context}` : null,
@@ -459,9 +471,13 @@ export async function postApprovalRequest(
   threadTs?: string,
 ): Promise<{ ok: boolean; ts?: string; error?: string }> {
   try {
+    const revision = typeof req.revision === "number" && req.revision >= 2 ? req.revision : 1;
     const body: Record<string, string> = {
       channel,
-      text: `🔔 Approval needed — ${req.from_role}${req.artifact ? ` (${req.artifact})` : ""}`,
+      text:
+        revision >= 2
+          ? `🔁 Approval v${revision} — ${req.artifact ?? req.from_role}`
+          : `🔔 Approval needed — ${req.from_role}${req.artifact ? ` (${req.artifact})` : ""}`,
       blocks: JSON.stringify(buildApprovalBlocks(req)),
     };
     if (threadTs) body.thread_ts = threadTs;  // #1402 conversation: reply in the parent thread
@@ -535,6 +551,8 @@ interface ApprovalStateEntry {
   status: string;
   ts?: string;
   channel?: string;
+  revision?: number; // #157: last posted revision (repost dedup)
+  parent_ts?: string; // #1402: parent thread when posted as a follow-up
 }
 type ApprovalState = Record<string, ApprovalStateEntry>;
 
@@ -585,7 +603,10 @@ async function postApprovalUpdate(
 /**
  * Scan approvals.json and forward new human-gated approvals to Slack.
  * Also mirrors verdict transitions (pending → approved/rejected) written by
- * swarm's review_approval() back into the original Slack thread.
+ * swarm's review_approval() back into the original Slack thread, and handles
+ * the #157 conversation loop: revision >= 2 re-requests post a fresh
+ * v<revision> message (superseding the previous one), and entries past the
+ * revision cap (or escalated) settle to the ⛔ banner once — never buttons.
  * Returns counts; never throws.
  */
 export async function scanApprovals(opts?: {
@@ -616,6 +637,26 @@ export async function scanApprovals(opts?: {
     if (!req || typeof req.id !== "string") continue;
     const prev = state[req.id];
     const status = req.status ?? "pending";
+    // #157: swarm #1681 increments `revision` on each re-request; absent/1 = v1.
+    const revision = typeof req.revision === "number" && req.revision >= 1 ? req.revision : 1;
+
+    // #157 cap-exceeded: revision past the cap or explicitly escalated — the
+    // approval is beyond the conversation loop. Settle the last posted message
+    // to the ⛔ banner (ONCE — the seen entry's status "escalated" is the
+    // marker) and never post buttons for it again.
+    if (revision > REVISION_CAP || status === "escalated") {
+      if (prev && prev.status !== "escalated") {
+        if (prev.ts && prev.channel) {
+          // Fire-and-forget: failures warn-log inside the helper and never
+          // affect the dedup state; legacy entries without channel/ts skip.
+          void settleEscalatedMessage({ channel: prev.channel, ts: prev.ts, apiUrl: getSlackApiUrl() }).catch(() => {});
+        }
+        state[req.id] = { ...prev, status: "escalated" };
+      } else if (!prev) {
+        state[req.id] = { status: "escalated" };
+      }
+      continue;
+    }
 
     // #1402 conversation: agent follow-up (parent set) → post INTO the parent
     // thread so the human sees the agent's answer in context.
@@ -624,7 +665,7 @@ export async function scanApprovals(opts?: {
       if (parentState?.ts && !prev) {
         const res = await postApprovalRequest(req, token, channel, 5000, parentState.ts);
         if (res.ok) {
-          state[req.id] = { status, ts: res.ts, channel, parent_ts: parentState.ts };
+          state[req.id] = { status, ts: res.ts, channel, parent_ts: parentState.ts, revision };
           result.posted++;
         } else {
           result.failed++;
@@ -632,6 +673,33 @@ export async function scanApprovals(opts?: {
         }
         continue;
       }
+    }
+
+    // #157 revision awareness: a re-request (revision >= 2) posts a fresh
+    // message titled "Approval v<revision>" (buttons unchanged) and, when the
+    // seen-file holds the previous revision's message, supersedes it with the
+    // ↻ banner (no buttons) so the channel shows the live version. Dedup: the
+    // seen entry records the posted revision — a same-revision rescan never
+    // re-posts.
+    if (
+      revision >= 2 &&
+      status === "pending" &&
+      (!req.reviewer || req.reviewer === "human") &&
+      prev &&
+      prev.revision !== revision
+    ) {
+      const res = await postApprovalRequest(req, token, channel);
+      if (res.ok) {
+        if (prev.ts && prev.channel) {
+          void settleSupersededMessage({ channel: prev.channel, ts: prev.ts, revision, apiUrl: getSlackApiUrl() }).catch(() => {});
+        }
+        state[req.id] = { ...prev, status, ts: res.ts, channel, revision };
+        result.posted++;
+      } else {
+        result.failed++;
+        console.error(`[slack-bridge] approval ${req.id}: v${revision} re-post failed — ${res.error}`);
+      }
+      continue;
     }
 
     // #1402 conversation: mirror human thread replies into approvals.json so
@@ -663,18 +731,19 @@ export async function scanApprovals(opts?: {
     if (!prev) {
       // New request: forward only human gates (reviewer == "human"; swarm
       // sets this for requires_human=True). Role-chain approvals resolve
-      // in-process and don't need Slack.
+      // in-process and don't need Slack. (#157: the revision-aware title is
+      // applied inside buildApprovalBlocks for any v2+ first-time post.)
       if (status === "pending" && (!req.reviewer || req.reviewer === "human")) {
         const res = await postApprovalRequest(req, token, channel);
         if (res.ok) {
-          state[req.id] = { status, ts: res.ts, channel };
+          state[req.id] = { status, ts: res.ts, channel, revision };
           result.posted++;
         } else {
           result.failed++;
           console.error(`[slack-bridge] approval ${req.id}: Slack post failed — ${res.error}`);
         }
       } else {
-        state[req.id] = { status }; // seen, not Slack-bound (role-chain/terminal)
+        state[req.id] = { status, revision }; // seen, not Slack-bound (role-chain/terminal)
       }
     } else if (prev.status === "pending" && status !== "pending") {
       // Decision written by review_approval() — mirror to the thread.

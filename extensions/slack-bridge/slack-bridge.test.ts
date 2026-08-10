@@ -937,6 +937,154 @@ try {
   }
 }
 
+// ── Approval revision awareness (#157): v2 re-post + supersede (iv) ──
+{
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const slack = new MockSlack();
+  __setSlackApiUrl(`http://localhost:${slack.port}`);
+  const dir = tmpDir();
+  const stateFile = join(dir, "seen.json");
+  __setApprovalStateFile(stateFile);
+  const approvalsFile = join(dir, "approvals.json");
+  const writeApprovals = (arr: any[]) => writeFileSync(approvalsFile, JSON.stringify(arr, null, 2));
+  // updateResolvedMessage / settle* helpers read SLACK_BOT_TOKEN from env
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  try {
+    // v1 was posted by an earlier scan — the seen entry carries its channel/ts/revision.
+    writeFileSync(stateFile, JSON.stringify({
+      "apr-157a": { status: "pending", ts: "100.001", channel: "#approvals", revision: 1 },
+    }, null, 2));
+    writeApprovals([
+      { id: "apr-157a", from_role: "product-strategist", artifact: "03-scope.md",
+        context: "Scope re-request after feedback", status: "pending", reviewer: "human",
+        revision: 2, created_at: "2026-08-10T00:00:00Z" },
+    ]);
+    const r1 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r1.posted === 1, `revision: v2 re-posted (got ${r1.posted})`);
+    const posts = slack.requests.filter((r) => r.url === "/chat.postMessage");
+    assert(posts.length === 1, "revision: exactly 1 chat.postMessage");
+    const blocks = JSON.parse(posts[0].form.get("blocks")!);
+    const title = blocks.find((b: any) => b.type === "section")?.text?.text ?? "";
+    assert(title.includes("🔁 *Approval v2* — 03-scope.md"), "revision: title reads Approval v2 — artifact");
+    assert(posts[0].form.get("text")!.includes("Approval v2"), "revision: fallback text mentions v2");
+    assert(blocks.some((b: any) => b.type === "actions"), "revision: v2 message keeps Accept/Reject buttons");
+    // the v1 message is superseded via chat.update (no buttons)
+    const supFound = await waitFor(() => slack.requests.some((r) => r.url === "/chat.update"), 2000);
+    assert(supFound, "revision: chat.update fired on the previous message");
+    const sup = slack.requests.find((r) => r.url === "/chat.update")!;
+    assert(sup.form.get("channel") === "#approvals" && sup.form.get("ts") === "100.001",
+      "revision: supersede targets the previous revision's message");
+    const supBlocks = JSON.parse(sup.form.get("blocks")!);
+    assert(supBlocks.some((b: any) => b.type === "section" && (b.text?.text ?? "").includes("↻ *Superseded by v2*")),
+      "revision: ↻ Superseded by v2 banner");
+    assert(!supBlocks.some((b: any) => b.type === "actions"), "revision: superseded banner has no buttons");
+    // the seen entry now points at the v2 message
+    const seen = JSON.parse(readFileSync(stateFile, "utf-8"));
+    assert(seen["apr-157a"]?.ts === "123.456" && seen["apr-157a"]?.revision === 2,
+      "revision: seen entry stores the new ts + revision");
+    // dedup: same-revision rescan → no re-post
+    slack.requests = [];
+    const r2 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r2.posted === 0, "revision: no re-post on same-revision rescan");
+    assert(!slack.requests.some((r) => r.url === "/chat.postMessage"), "revision: dedup — no second post");
+  } finally {
+    delete process.env.SLACK_BOT_TOKEN;
+    __setApprovalStateFile(null);
+    __setSlackApiUrl(null);
+    await slack.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── Approval revision cap (#157): revision > 15 → ⛔ escalated, once (v) ──
+{
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const slack = new MockSlack();
+  __setSlackApiUrl(`http://localhost:${slack.port}`);
+  const dir = tmpDir();
+  const stateFile = join(dir, "seen.json");
+  __setApprovalStateFile(stateFile);
+  const approvalsFile = join(dir, "approvals.json");
+  const writeApprovals = (arr: any[]) => writeFileSync(approvalsFile, JSON.stringify(arr, null, 2));
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  try {
+    // v15 was the last posted revision.
+    writeFileSync(stateFile, JSON.stringify({
+      "apr-157b": { status: "pending", ts: "200.001", channel: "#approvals", revision: 15 },
+    }, null, 2));
+    writeApprovals([
+      { id: "apr-157b", from_role: "product-strategist", artifact: "16.md",
+        status: "pending", reviewer: "human", revision: 16, created_at: "2026-08-10T00:00:00Z" },
+    ]);
+    const r1 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r1.posted === 0, "cap: no new message posted for cap-exceeded entry");
+    assert(!slack.requests.some((r) => r.url === "/chat.postMessage"), "cap: zero chat.postMessage calls");
+    const escFound = await waitFor(() => slack.requests.some((r) => r.url === "/chat.update"), 2000);
+    assert(escFound, "cap: chat.update settles the last message to the ⛔ banner");
+    const esc = slack.requests.find((r) => r.url === "/chat.update")!;
+    assert(esc.form.get("channel") === "#approvals" && esc.form.get("ts") === "200.001",
+      "cap: settles the last posted revision's message");
+    const escBlocks = JSON.parse(esc.form.get("blocks")!);
+    assert(escBlocks.some((b: any) => b.type === "section" && (b.text?.text ?? "").includes("⛔ *Escalated — revision cap (15) exceeded*")),
+      "cap: ⛔ escalation banner text");
+    assert(escBlocks.some((b: any) => b.type === "context" && (b.elements?.[0]?.text ?? "").includes("Human conversation needed — reply in thread or re-dispatch manually")),
+      "cap: context line");
+    assert(!escBlocks.some((b: any) => b.type === "actions"), "cap: no buttons on the escalated message");
+    const seen = JSON.parse(readFileSync(stateFile, "utf-8"));
+    assert(seen["apr-157b"]?.status === "escalated", "cap: seen entry marked escalated (once marker)");
+    // once: a second scan settles nothing new
+    slack.requests = [];
+    const r2 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r2.posted === 0 && r2.updated === 0, "cap: second scan does nothing");
+    assert(!slack.requests.some((r) => r.url === "/chat.update"), "cap: escalation settled exactly once");
+  } finally {
+    delete process.env.SLACK_BOT_TOKEN;
+    __setApprovalStateFile(null);
+    __setSlackApiUrl(null);
+    await slack.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── Legacy approvals without revision: exactly as before (vi) ──
+{
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const slack = new MockSlack();
+  __setSlackApiUrl(`http://localhost:${slack.port}`);
+  const dir = tmpDir();
+  const stateFile = join(dir, "seen.json");
+  __setApprovalStateFile(stateFile);
+  const approvalsFile = join(dir, "approvals.json");
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  try {
+    // No revision field → v1 semantics: 🔔 title, buttons, no supersede/escalate.
+    writeFileSync(approvalsFile, JSON.stringify([
+      { id: "apr-157c", from_role: "product-strategist", artifact: "legacy.md",
+        status: "pending", reviewer: "human", created_at: "2026-08-10T00:00:00Z" },
+    ], null, 2));
+    const r1 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r1.posted === 1, `legacy: plain pending posts exactly once (got ${r1.posted})`);
+    const posts = slack.requests.filter((r) => r.url === "/chat.postMessage");
+    assert(posts.length === 1, "legacy: exactly 1 chat.postMessage");
+    const blocks = JSON.parse(posts[0].form.get("blocks")!);
+    const title = blocks.find((b: any) => b.type === "section")?.text?.text ?? "";
+    assert(title.includes("🔔 *Approval requested*"), "legacy: 🔔 title unchanged without revision");
+    assert(!title.includes("Approval v"), "legacy: no v-prefix without revision");
+    assert(blocks.some((b: any) => b.type === "actions"), "legacy: buttons present");
+    assert(!slack.requests.some((r) => r.url === "/chat.update"),
+      "legacy: no supersede/escalate settle on a fresh v1 post");
+    const seen = JSON.parse(readFileSync(stateFile, "utf-8"));
+    assert(seen["apr-157c"]?.status === "pending" && seen["apr-157c"]?.ts === "123.456",
+      "legacy: seen entry records status + ts as before");
+  } finally {
+    delete process.env.SLACK_BOT_TOKEN;
+    __setApprovalStateFile(null);
+    __setSlackApiUrl(null);
+    await slack.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ── Factory: explicit enablement logging (#40) ────────
 {
   const handlers = new Map<string, Function[]>();
