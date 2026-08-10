@@ -6,6 +6,8 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
+> **Canonical:** `agent-infra/skills/google-slides/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`. Paths below are agent-infra-relative (`skills/...`); in consumer repos resolve via `$SKILLS_PREFIX` (default `operations/skills/`).
+
 # Google Slides Presentation Skill
 
 Creates branded Google Slides presentations for El Dato — pitch decks, strategy docs, internal reports, partner presentations. Automates slide generation from structured input with brand token application, typography enforcement, and visual design critique.
@@ -163,7 +165,7 @@ Generates slide thumbnails for review. Use LARGE (1600px) for vision-model criti
 
 ## Brand Tokens
 
-From `operations/skills/carousel-b2b-design/scripts/tokens.json`:
+From `skills/carousel-b2b-design/scripts/tokens.json` (canonical agent-infra path; consumer repos resolve via `$SKILLS_PREFIX`):
 
 | Token | Value | Usage |
 |-------|-------|-------|
@@ -232,8 +234,14 @@ Use `read_image` with `purpose="design-critique"` and Opus-class model.
 ## Pre-Flight Checks
 
 ```bash
-# 1. Brand tokens must exist
-[ -f operations/skills/carousel-b2b-design/scripts/tokens.json ] || { echo "tokens.json missing"; exit 1; }
+# 1. Brand tokens must exist — warn-and-continue: SKILL.md carries the full
+#    token table inline, so a missing file degrades to inline tokens, not a hard stop.
+TOKENS_JSON="${SKILLS_PREFIX:-operations/skills/}carousel-b2b-design/scripts/tokens.json"
+# Fall back to agent-infra canonical layout
+[ -f "$TOKENS_JSON" ] || TOKENS_JSON="skills/carousel-b2b-design/scripts/tokens.json"
+if [ ! -f "$TOKENS_JSON" ]; then
+  echo "⚠️ tokens.json not found (checked $TOKENS_JSON) — continuing with inline brand tokens from SKILL.md"
+fi
 
 # 2. Composio Google Slides connection verified active
 # Account: aprestointernal@gmail.com (active since 2026-06-27)
@@ -242,7 +250,7 @@ Use `read_image` with `purpose="design-critique"` and Opus-class model.
 ## File Structure
 
 ```
-operations/skills/google-slides/
+skills/google-slides/            # Canonical in agent-infra; consumers hard-link this dir
 ├── SKILL.md              # This file
 ├── brand-adapter.md      # Brand token → Google Slides mapping
 └── templates/            # Slide-type markdown templates
@@ -257,7 +265,7 @@ operations/skills/google-slides/
 ## Dependencies
 
 - **Composio:** Google Slides (active, aprestointernal@gmail.com)
-- **Brand tokens:** `operations/skills/carousel-b2b-design/scripts/tokens.json`
+- **Brand tokens:** `skills/carousel-b2b-design/scripts/tokens.json` (canonical; consumer repos resolve via `$SKILLS_PREFIX`)
 - **Cloudinary:** Image uploads (optional, storyboarding only)
 - **OpenRouter:** Image generation (optional, storyboarding only)
 - **Vision model:** Opus-class via `read_image` (design critique)

@@ -1,10 +1,22 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// DECISION (#45): KEEP this extension in agent-infra as canonical, with a
+// graceful no-op when ELDATO_ROOT is unset. Rationale: agent-infra is the
+// single canonical source synced to all machines; moving to eldato-local would
+// create fork risk. The eldato-specificity is handled by env-gating — the tool
+// registers cleanly on any machine but returns a clear message instead of
+// resolving eldato-only skill dirs against an arbitrary cwd.
+// ─────────────────────────────────────────────────────────────────────────────
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
-const PROJECT_ROOT = process.env.ELDATO_ROOT || process.cwd();
+const ELDATO_ROOT = (process.env.ELDATO_ROOT || "").trim();
+const HAS_ELDATO = ELDATO_ROOT.length > 0;
+const PROJECT_ROOT = ELDATO_ROOT || process.cwd();
+const NOOP_MESSAGE =
+  "carousel-designer requires ELDATO_ROOT (eldato carousel pipeline not available on this machine)";
 
 function loadPromptComponents(carouselDir: string) {
   const skillPath = resolve(PROJECT_ROOT, "skills/carousel-designer/SKILL.md");
@@ -100,6 +112,27 @@ PRESERVE existing intentional design (yellow subtitles, font sizes, etc.). Only 
 }
 
 export default function (pi: ExtensionAPI) {
+  // ── No-op mode: ELDATO_ROOT unset — register cleanly, do nothing ──
+  if (!HAS_ELDATO) {
+    pi.registerTool({
+      name: "carousel_designer",
+      label: "Design Reviewer",
+      description: "Launch a Claude Opus design review loop for carousel slides. No-op: " + NOOP_MESSAGE,
+      parameters: Type.Object({
+        carousel_dir: Type.String({ description: "Path to carousel directory (e.g. docs/carousels/archetype-1-tematico/)" }),
+        design_direction: Type.Optional(Type.String({ description: "Design aesthetic description" })),
+        slides: Type.Optional(Type.String({ description: "Comma-separated slide numbers to review" })),
+      }),
+      async execute() {
+        return { content: [{ type: "text", text: NOOP_MESSAGE }], details: {} };
+      },
+    });
+    pi.on("session_start", async (_event, ctx) => {
+      ctx.ui.notify("carousel-designer: ELDATO_ROOT not set — tool registered as no-op", "info");
+    });
+    return;
+  }
+
   // ── Hook: block ::before + inset:0 in css-map.json ──
   pi.on("tool_call", async (event, _ctx) => {
     if (event.toolName !== "write" && event.toolName !== "edit") return undefined;

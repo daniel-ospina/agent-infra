@@ -53,26 +53,127 @@ You output ONLY valid JSON:
 CRITICAL: Default to CLEAN. The agent already self-reviewed. Your job is to catch OBVIOUS misses, not to imagine failures.
 Do not include any text outside the JSON.`;
 
-export function extractJson(text: string): VerdictOutput | null {
-  // Level 0: raw JSON.parse
-  try { return JSON.parse(text.trim()) as VerdictOutput; } catch { /* fallthrough */ }
-  
-  // Level 1: last ```json fence
-  const fences = text.match(/```json\s*([\s\S]*?)```/g);
-  if (fences) {
-    try { return JSON.parse(fences[fences.length - 1].replace(/```json\s*|\s*```/g, "").trim()); } catch { /* fallthrough */ }
-  }
-  
-  // Level 2: try each { position as potential JSON start (handles nested objects)
-  const lastClose = text.lastIndexOf("}");
-  if (lastClose !== -1) {
-    // Try from earliest { to latest }
-    let pos = -1;
-    while ((pos = text.indexOf("{", pos + 1)) !== -1 && pos < lastClose) {
-      try { return JSON.parse(text.slice(pos, lastClose + 1)); } catch { /* fallthrough */ }
+/**
+ * Schema gate: true when obj matches the VerdictOutput contract — the fields
+ * the loop-enforcer consumes (verdict / issues / issues_found) plus the
+ * evidence block the verifier prompt mandates. Rejects parseable-but-wrong
+ * JSON, e.g. trailing {"event":"gate_bypass",...} noise on the stderr tail
+ * (#135).
+ */
+export function isVerdictOutput(obj: any): obj is VerdictOutput {
+  if (!obj || typeof obj !== "object") return false;
+  if (obj.verdict !== "CLEAN" && obj.verdict !== "NEEDS_FIX") return false;
+  if (typeof obj.issues_found !== "number") return false;
+  if (!Array.isArray(obj.issues)) return false;
+  const ev = obj.evidence;
+  if (!ev || typeof ev !== "object") return false;
+  if (!Array.isArray(ev.files_reviewed)) return false;
+  if (!Array.isArray(ev.tests_ran)) return false;
+  if (typeof ev.git_diff_checked !== "boolean") return false;
+  return true;
+}
+
+/**
+ * Backward string-aware scan for the matching open brace of a candidate
+ * closed at `closeIdx`. Tracks string state ("…") and escaped quotes so
+ * braces inside string values never anchor a slice. Returns -1 when no
+ * balanced open brace exists (unbalanced prose → caller skips, never aborts).
+ * #135: the old lastIndexOf("{")…lastIndexOf("}") pair was string-blind and
+ * grabbed the innermost object (or the appended stderr noise object).
+ * Same scanner as verification-gate's findMatchingOpenBrace (#132 fix).
+ */
+function findMatchingOpenBrace(text: string, closeIdx: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let i = closeIdx; i >= 0; i--) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '"' && !isEscaped(text, i)) {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      // Enter string state only on a real (un-escaped) quote — the backslash
+      // parity check handles odd-count literal quotes inside values (P2).
+      if (!isEscaped(text, i)) inString = true;
+    } else if (ch === "}") {
+      depth++;
+    } else if (ch === "{") {
+      depth--;
+      if (depth === 0) return i;
     }
   }
-  
+  return -1;
+}
+
+/** True when the char at `idx` is escaped by an ODD run of backslashes. */
+function isEscaped(text: string, idx: number): boolean {
+  let bs = 0;
+  for (let i = idx - 1; i >= 0 && text[i] === "\\"; i--) bs++;
+  return bs % 2 === 1;
+}
+
+/**
+ * Enumerate parseable JSON candidates from text, newest-first (reverse
+ * scan, string-aware). Returns every balanced brace-matched slice that
+ * JSON.parse accepts — schema gating happens in extractJson.
+ * On a parse failure we advance past the CLOSE brace (not the open one) so
+ * inner balanced candidates inside an unparseable outer slice are still
+ * enumerated (P2: lazy-model `{result: {...}}` outer keys).
+ * NOTE: identical to verification-gate's extractJsonCandidates — both
+ * consumers now exist, so these pure functions belong in
+ * extensions/shared/json-scan.ts (rule of two, #135 follow-up).
+ */
+function extractJsonCandidates(text: string): unknown[] {
+  const candidates: unknown[] = [];
+  let idx = text.length - 1;
+  while (idx >= 0) {
+    const close = text.lastIndexOf("}", idx);
+    if (close === -1) break;
+    const open = findMatchingOpenBrace(text, close);
+    if (open !== -1) {
+      const slice = text.slice(open, close + 1);
+      try {
+        candidates.push(JSON.parse(slice));
+        idx = open - 1;
+      } catch {
+        // unparseable candidate — skip its CLOSE and retry inner candidates
+        idx = close - 1;
+      }
+    } else {
+      idx = close - 1;
+    }
+  }
+  return candidates;
+}
+
+export function extractJson(text: string): VerdictOutput | null {
+  // Level 0: raw JSON.parse — gated: only schema-valid verdicts are returned.
+  try {
+    const parsed = JSON.parse(text.trim()) as VerdictOutput;
+    if (isVerdictOutput(parsed)) return parsed;
+  } catch { /* fallthrough */ }
+
+  // Level 1: ```json fences — latest-first; a schema-invalid last fence
+  // falls through to candidate enumeration (a valid earlier fence still wins).
+  const fences = text.match(/```json\s*([\s\S]*?)```/g);
+  if (fences) {
+    for (let i = fences.length - 1; i >= 0; i--) {
+      try {
+        const parsed = JSON.parse(fences[i].replace(/```json\s*|\s*```/g, "").trim()) as VerdictOutput;
+        if (isVerdictOutput(parsed)) return parsed;
+      } catch { /* continue scanning earlier fences */ }
+    }
+  }
+
+  // Level 2: brace-matched reverse candidate scan — newest-first; the first
+  // schema-valid candidate wins. Trailing stderr noise (e.g. review-enforcer's
+  // gate_bypass object) is schema-invalid and skipped. #135.
+  for (const candidate of extractJsonCandidates(text)) {
+    if (isVerdictOutput(candidate)) return candidate;
+  }
+
   return null;
 }
 

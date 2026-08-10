@@ -305,8 +305,10 @@ async function describeWithOpenRouter(
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
-      "HTTP-Referer": "https://eldato.com.mx",
-      "X-Title": "El Dato Vision Interceptor",
+      // #47 de-branded: attribution headers are env-configurable with neutral
+      // defaults (OPENROUTER_HTTP_REFERER / OPENROUTER_APP_TITLE).
+      "HTTP-Referer": process.env.OPENROUTER_HTTP_REFERER || "https://github.com/daniel-ospina/agent-infra",
+      "X-Title": process.env.OPENROUTER_APP_TITLE || "agent-infra",
     },
     body: JSON.stringify({
       model,

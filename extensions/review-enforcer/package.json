@@ -1,4 +1,5 @@
 {
   "name": "review-enforcer",
-  "private": true
+  "private": true,
+  "type": "module"
 }
