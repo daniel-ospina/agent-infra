@@ -63,14 +63,19 @@ export default function (pi: ExtensionAPI) {
           "⚠️  REVIEW GATES DISABLED — all quality checks bypassed.",
           "To re-enable, unset AGENT_SKIP_REVIEW_GATE (or ELDATO_SKIP_REVIEW_GATE) and restart."
         );
-        // bypass log
-        console.log(
-          JSON.stringify({
-            event: "gate_bypass",
-            reason: "escape_hatch",
-            timestamp: new Date().toISOString(),
-          })
-        );
+        // bypass log — machine-readable JSON. Only emit in interactive mode:
+        // in print mode (sub-agents) this bare JSON would land on stderr and
+        // contaminate tool-result content, breaking downstream JSON parsers.
+        // Same guard as the startup banner below. #133
+        if (process.env.PI_MODE !== "print") {
+          console.log(
+            JSON.stringify({
+              event: "gate_bypass",
+              reason: "escape_hatch",
+              timestamp: new Date().toISOString(),
+            })
+          );
+        }
       } else {
         extensionEnabled = true;
       }
