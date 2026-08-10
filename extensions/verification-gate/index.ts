@@ -277,21 +277,18 @@ export function mergeVerifiedFiles(
 function findMatchingOpenBrace(text: string, closeIdx: number): number {
   let depth = 0;
   let inString = false;
-  let escaped = false;
   for (let i = closeIdx; i >= 0; i--) {
     const ch = text[i];
     if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (ch === "\\") {
-        escaped = true;
-      } else if (ch === '"') {
+      if (ch === '"' && !isEscaped(text, i)) {
         inString = false;
       }
       continue;
     }
     if (ch === '"') {
-      inString = true;
+      // Enter string state only on a real (un-escaped) quote — the backslash
+      // parity check handles odd-count literal quotes inside values (P2).
+      if (!isEscaped(text, i)) inString = true;
     } else if (ch === "}") {
       depth++;
     } else if (ch === "{") {
@@ -302,10 +299,23 @@ function findMatchingOpenBrace(text: string, closeIdx: number): number {
   return -1;
 }
 
+/** True when the char at `idx` is escaped by an ODD run of backslashes. */
+function isEscaped(text: string, idx: number): boolean {
+  let bs = 0;
+  for (let i = idx - 1; i >= 0 && text[i] === "\\"; i--) bs++;
+  return bs % 2 === 1;
+}
+
 /**
  * Enumerate parseable JSON candidates from text, newest-first (reverse
  * scan, string-aware). Returns every balanced brace-matched slice that
  * JSON.parse accepts — schema gating happens in extractJson.
+ * On a parse failure we advance past the CLOSE brace (not the open one) so
+ * inner balanced candidates inside an unparseable outer slice are still
+ * enumerated (P2: lazy-model `{result: {...}}` outer keys).
+ * Extraction seam: loop-enforcer shares this bug class (#135); move these
+ * pure functions to extensions/shared/json-scan.ts when a second consumer
+ * exists (rule of two).
  */
 function extractJsonCandidates(text: string): unknown[] {
   const candidates: unknown[] = [];
@@ -318,10 +328,11 @@ function extractJsonCandidates(text: string): unknown[] {
       const slice = text.slice(open, close + 1);
       try {
         candidates.push(JSON.parse(slice));
+        idx = open - 1;
       } catch {
-        // unparseable candidate — skip, never abort
+        // unparseable candidate — skip its CLOSE and retry inner candidates
+        idx = close - 1;
       }
-      idx = open - 1;
     } else {
       idx = close - 1;
     }
@@ -633,8 +644,14 @@ export default function (pi: ExtensionAPI) {
       // STRUCTURAL detection: word-boundary line/❌ heuristics (so FAILED /
       // Failure / Failing prose never match) + a brace-anchored JSON probe
       // covering lazy spellings {status: FAIL} / {'status':'FAIL'}.
-      const hasFail = /(?:^|\n)\s*FAIL(?:\b|:|—)/i.test(textContent)
+      // P2: also covers list-marker lines (- FAIL:, * FAIL:), inline verdict
+      // labels (Result: FAIL, Verdict: FAIL), and past-tense FAILED on line/
+      // ❌ anchors (still excludes "Failure"/"Failing" prose via \b).
+      const hasFail = /(?:^|\n)\s*(?:[-*•]|\d+\.)?\s*FAIL(?:\b|:|—)/i.test(textContent)
         || /❌.*FAIL(?:\b|:|—)/i.test(textContent)
+        || /(?:^|\n)\s*(?:result|verdict|status|outcome)\s*[:=]\s*FAIL(?:\b|:|—)/i.test(textContent)
+        || /(?:^|\n)\s*(?:[-*•]|\d+\.)?\s*FAILED(?:\b|:|—)/i.test(textContent)
+        || /❌.*FAILED(?:\b|:|—)/i.test(textContent)
         || /\{\s*['"]?status['"]?\s*:\s*['"]?FAIL['"]?/i.test(textContent);
       if (hasFail) {
         console.error("[verification-gate] ❌ Verifier FAILED (unparseable verdict): keep blocking, no merge");
@@ -742,9 +759,11 @@ export default function (pi: ExtensionAPI) {
     // returns only schema-valid results or null, so !isValidResult(result) is
     // unreachable here. Schema-invalid PASS previously fell through to the
     // prompt-file merge; that path is now reached via the null path (plain-text
-    // fallback → fail-open prompt-merge), which is behaviorally equivalent:
-    // same prompt merge, same reset-if-merged>0, same lastBlockedCwd consume.
-    // Schema-invalid FAIL intent is handled deliberately by A.3b (blocks).
+    // fallback → fail-open prompt-merge). Equivalent for the pure-JSON case
+    // (same prompt merge, same reset-if-merged>0, same lastBlockedCwd consume);
+    // a MIXED shape (line-start PASS + schema-invalid JSON) now additionally
+    // diff-scopes via the #5673 filter — stricter, intended. Schema-invalid
+    // FAIL intent is handled deliberately by A.3b (blocks).
 
     if (result.status !== "PASS") {
       console.error(`[verification-gate] ❌ Verifier returned FAIL: ${result.failures.join("; ")}`);
@@ -775,7 +794,7 @@ export default function (pi: ExtensionAPI) {
         writeBridge(projectRoot, verifiedPaths);
       }
     } else {
-      console.warn(`[verification-gate] ⚠️ PASS but merged 0 files${skipped > 0 ? ` (${skipped} skipped as not in diff)` : ' (empty verified_files)'} — failure streak NOT reset (#132)`);
+      console.error(`[verification-gate] ⚠️ PASS but merged 0 files${skipped > 0 ? ` (${skipped} skipped as not in diff)` : ' (empty verified_files)'} — failure streak NOT reset (#132)`);
     }
     lastBlockedCwd = null; // consume on successful merge
     return undefined;

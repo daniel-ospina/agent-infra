@@ -144,6 +144,27 @@ test("escaped quotes and backslash parity inside strings never corrupt candidate
   equal(result!.status, "PASS");
 });
 
+test("odd-count literal quote inside a failure string + trailing noise → verdict still extracted", () => {
+  // A failure message containing a SINGLE unescaped quote (odd count) must not
+  // flip the backward walk's string state and lose the verdict (P2).
+  const verdict = { status: "PASS", failures: ["line \"x"], verified_files: [{ path: "a.ts", hash: "h1" }] };
+  const input = JSON.stringify(verdict) + '\n{"event":"gate_bypass","reason":"escape_hatch"}';
+  const result = extractJson(input);
+  ok(result !== null, "odd-count literal quote must not break extraction");
+  equal(result!.status, "PASS");
+  equal(result!.verified_files[0].path, "a.ts");
+});
+
+test("lazy outer key {result: {...}} → inner valid verdict still enumerated", () => {
+  // Unparseable outer slice (unquoted key) must not skip the inner valid
+  // candidate — advance past the close brace on parse failure (P2).
+  const inner = JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: "foo.ts", hash: "abc" }] });
+  const result = extractJson('{result: ' + inner + '} trailing');
+  ok(result !== null, "inner verdict inside lazy outer object must be found");
+  equal(result!.status, "PASS");
+  equal(result!.verified_files[0].path, "foo.ts");
+});
+
 test("unbalanced trailing prose is skipped, not fatal", () => {
   const input = '{"status":"PASS","failures":[],"verified_files":[]}\n\nAnd then: { just prose';
   const result = extractJson(input);
