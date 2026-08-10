@@ -95,3 +95,19 @@ all implementation by deepseek-v4-flash. Qwen unreachable via task provider
 
 Known residuals (not blocking): slack-bridge button-callback receiver needs
 Socket Mode (#40 follow-up, user-side env setup); PRs #136/#130 still in review.
+
+## Second pass (2026-08-10, full issue workflow)
+Residual gaps closed via proper issues (#143-146): scoping comments with
+markers → implementation → verification → review → PR → merge.
+- #143 (micro, direct): branches pruned, leftovers filed, gh rate-limit runbook
+- #144: compliance gate check (e) test-coverage evidence
+- #145: gate wired into agent-infra CI + **branch protection on main**
+  (`pipeline-compliance` required) — PR #147 passed its own gate, PR #148 was
+  the first merge enforced by protection
+- #146: Socket Mode receiver (plan-first via pro model, flash implementation,
+  187 tests green) — approval buttons now resolve verdicts
+- tortoise product doc re-homed → tortoise#870; PRs #136/#130 merged/closed
+  via commit-workflow pass (#130 superseded by 87cc3e0)
+
+**User-side remaining:** `SLACK_APPROVAL_CHANNEL` (notifications) and optional
+`SLACK_APP_TOKEN` xapp- (button callbacks).
