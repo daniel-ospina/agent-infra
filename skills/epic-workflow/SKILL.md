@@ -70,10 +70,10 @@ When a human gate fires, the agent MUST invoke the approval router to surface th
 
 ```bash
 # For human bypass (default for epic gates):
-APPROVAL_NO_NOTIFY=0 python3 -c "
+python3 -c "
 from operations.coordination.approval import request_approval
 request_approval('product-strategist', artifact='<doc-name>.md', context='<stage> approval for epic <name>', requires_human=True)
-print('Approval request created — osascript dialog fired')
+print('Approval request created')
 "
 ```
 
