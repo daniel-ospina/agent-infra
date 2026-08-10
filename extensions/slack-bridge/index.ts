@@ -355,6 +355,8 @@ interface ApprovalRequest {
   reviewer?: string;
   feedback?: string;
   created_at?: string;
+  parent?: string;
+  thread?: Array<{ author?: string; text?: string; ts?: string }>;
 }
 
 const SLACK_API_URL_DEFAULT = "https://slack.com/api";
@@ -454,22 +456,45 @@ export async function postApprovalRequest(
   token: string,
   channel: string,
   timeoutMs = 5000,
+  threadTs?: string,
 ): Promise<{ ok: boolean; ts?: string; error?: string }> {
   try {
-    const res = await slackApiPost(
-      "chat.postMessage",
-      {
-        channel,
-        text: `🔔 Approval needed — ${req.from_role}${req.artifact ? ` (${req.artifact})` : ""}`,
-        blocks: JSON.stringify(buildApprovalBlocks(req)),
-      },
-      token,
-      timeoutMs,
-    );
+    const body: Record<string, string> = {
+      channel,
+      text: `🔔 Approval needed — ${req.from_role}${req.artifact ? ` (${req.artifact})` : ""}`,
+      blocks: JSON.stringify(buildApprovalBlocks(req)),
+    };
+    if (threadTs) body.thread_ts = threadTs;  // #1402 conversation: reply in the parent thread
+    const res = await slackApiPost("chat.postMessage", body, token, timeoutMs);
     if (res && res.ok) return { ok: true, ts: res.ts };
     return { ok: false, error: res?.error ?? "unknown" };
   } catch (e: any) {
     return { ok: false, error: e.message };
+  }
+}
+
+/** Fetch thread replies for a posted approval (conversation loop, #1402). */
+export async function fetchThreadReplies(
+  channel: string,
+  ts: string,
+  token: string,
+  timeoutMs = 5000,
+): Promise<Array<{ author?: string; text?: string; ts?: string }>> {
+  try {
+    const res = await slackApiPost(
+      "conversations.replies",
+      { channel, ts, limit: "20" },
+      token,
+      timeoutMs,
+    );
+    if (!res || !res.ok) return [];
+    const messages: Array<{ user?: string; text?: string; ts?: string }> = res.messages ?? [];
+    // Drop the parent message itself (ts === thread root); keep human replies.
+    return messages
+      .filter((m) => m.ts !== ts && typeof m.text === "string")
+      .map((m) => ({ author: m.user ?? "?", text: m.text ?? "", ts: m.ts ?? "" }));
+  } catch {
+    return [];
   }
 }
 
@@ -591,6 +616,49 @@ export async function scanApprovals(opts?: {
     if (!req || typeof req.id !== "string") continue;
     const prev = state[req.id];
     const status = req.status ?? "pending";
+
+    // #1402 conversation: agent follow-up (parent set) → post INTO the parent
+    // thread so the human sees the agent's answer in context.
+    if (req.parent && status === "pending" && (!req.reviewer || req.reviewer === "human")) {
+      const parentState = state[req.parent];
+      if (parentState?.ts && !prev) {
+        const res = await postApprovalRequest(req, token, channel, 5000, parentState.ts);
+        if (res.ok) {
+          state[req.id] = { status, ts: res.ts, channel, parent_ts: parentState.ts };
+          result.posted++;
+        } else {
+          result.failed++;
+          console.error(`[slack-bridge] approval ${req.id}: thread reply failed — ${res.error}`);
+        }
+        continue;
+      }
+    }
+
+    // #1402 conversation: mirror human thread replies into approvals.json so
+    // the requesting agent can read feedback and respond.
+    if (prev?.ts && prev.channel && status === "pending") {
+      const replies = await fetchThreadReplies(prev.channel, prev.ts, token);
+      if (replies.length) {
+        const known = new Set((req.thread ?? []).map((t) => t.ts));
+        const fresh = replies.filter((r) => r.ts && !known.has(r.ts));
+        if (fresh.length) {
+          try {
+            const file = opts?.file ?? findApprovalsFile();
+            if (file) {
+              const all = JSON.parse(readFileSync(file, "utf-8"));
+              const idx = all.findIndex((a: any) => a.id === req.id);
+              if (idx >= 0) {
+                all[idx].thread = [...(all[idx].thread ?? []), ...fresh];
+                writeFileSync(file, JSON.stringify(all, null, 2));
+              }
+            }
+            console.log(`[slack-bridge] approval ${req.id}: ${fresh.length} new human reply/replies mirrored to approvals.json`);
+          } catch (e: any) {
+            console.warn(`[slack-bridge] reply mirror failed: ${e?.message ?? e}`);
+          }
+        }
+      }
+    }
 
     if (!prev) {
       // New request: forward only human gates (reviewer == "human"; swarm
