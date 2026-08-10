@@ -191,13 +191,211 @@ async function main() {
     git(repo, "commit -m c4");
   });
 
+  section("#132 — stderr noise, FAIL accounting, reset guard, auto-bypass");
+
+  // Isolation pattern (per scenario): git reset clears staged files from prior
+  // blocked scenarios AND pendingRehash; session_start resets vgateFailures /
+  // blockAttempts so each scenario is self-contained.
+
+  test("scenario 5 (#132 repro): PASS verdict + gate_bypass noise unblocks the commit", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileA.txt"), "v5\n");
+    git(repo, "add fileA.txt");
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c5'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first");
+    const verdict = JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repo, "fileA.txt"), hash: sha("v5\n") }] });
+    const noise = '\n⚠️  REVIEW GATES DISABLED — all quality checks bypassed...\n' +
+      '{"event":"gate_bypass","reason":"escape_hatch","timestamp":"2026-08-09T22:48:04.139Z"}';
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: fileA.txt. Classification: UI. Project root: ${repo}` },
+      content: [{ type: "text", text: verdict + noise }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c5'", cwd: repo },
+    });
+    equal(res, undefined, "commit must be ALLOWED after PASS+noise (O/I/T indicator 1)");
+    git(repo, "commit -m c5");
+  });
+
+  test("scenario 6 (#132): 3× noise-only dispatches never disable the gate", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileB.txt"), "b1\n");
+    git(repo, "add fileB.txt");
+    const prompt = `[VGATE] verify files: fileB.txt. Classification: UI. Project root: ${repo}`;
+    const noise = '{"event":"gate_bypass","reason":"escape_hatch"}';
+    // Block first (sets lastBlockedFiles/lastBlockedCwd), then 3 noise dispatches.
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c6'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first");
+    for (let i = 0; i < 3; i++) {
+      await fire("tool_result", { toolName: "task", input: { prompt }, content: [{ type: "text", text: noise }] });
+    }
+    // Noise-only fails open (#5724): the prompt files merge, the commit is
+    // ALLOWED, and the gate is NOT disabled (a disabled gate would also allow
+    // a NEW unverified file — prove it stays active with fileB2).
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c6'", cwd: repo },
+    });
+    equal(res, undefined, "noise-only dispatch fails open: commit allowed, gate not disabled");
+    git(repo, "commit -m c6");
+    writeFileSync(join(repo, "fileB2.txt"), "b2\n");
+    git(repo, "add fileB2.txt");
+    const res2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c6b'", cwd: repo },
+    });
+    ok(res2 && res2.block === true, "gate must still be ACTIVE after 3 noise dispatches (new file still blocked)");
+    await fire("session_start", {});
+  });
+
+  test("scenario 7 (#132): 3× FAIL verdicts never disable the gate", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileC.txt"), "c1\n");
+    git(repo, "add fileC.txt");
+    const prompt = `[VGATE] verify files: fileC.txt. Classification: UI. Project root: ${repo}`;
+    for (let i = 0; i < 3; i++) {
+      await fire("tool_result", {
+        toolName: "task", input: { prompt },
+        content: [{ type: "text", text: JSON.stringify({ status: "FAIL", failures: ["lint"], verified_files: [] }) }],
+      });
+    }
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c7'", cwd: repo },
+    });
+    ok(res && res.block === true, "gate must still be active after 3 FAIL verdicts");
+    await fire("session_start", {});
+  });
+
+  test("scenario 8 (#132): zero-merge PASS does not mask dispatch failures", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileD.txt"), "d1\n");
+    git(repo, "add fileD.txt");
+    const prompt = `[VGATE] verify files: fileD.txt. Classification: UI. Project root: ${repo}`;
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: [] });
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: [] });
+    await fire("tool_result", {
+      toolName: "task", input: { prompt },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repo, "somewhere-else.txt"), hash: "deadbeef" }] }) }],
+    });
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: [] });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c8'", cwd: repo },
+    });
+    equal(res, undefined, "gate must DISABLE after 3 real failures despite interleaved zero-merge PASS");
+    await fire("session_start", {});
+  });
+
+  test("scenario 9 (#132 A.3b): schema-incomplete FAIL JSON keeps commit blocked, gate never disables", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileE.txt"), "e1\n");
+    git(repo, "add fileE.txt");
+    const prompt = `[VGATE] verify files: fileE.txt. Classification: UI. Project root: ${repo}`;
+    for (let i = 0; i < 3; i++) {
+      await fire("tool_result", {
+        toolName: "task", input: { prompt },
+        content: [{ type: "text", text: JSON.stringify({ status: "FAIL", failures: ["lint error"] }) }],
+      });
+    }
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c9'", cwd: repo },
+    });
+    ok(res && res.block === true, "schema-incomplete FAIL must block — never fail open, never disable");
+    await fire("session_start", {});
+  });
+
+  test("scenario 10 (#132 A.3b): plain-text FAIL line blocks instead of failing open", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileF.txt"), "f1\n");
+    git(repo, "add fileF.txt");
+    const prompt = `[VGATE] verify files: fileF.txt. Classification: UI. Project root: ${repo}`;
+    await fire("tool_result", {
+      toolName: "task", input: { prompt },
+      content: [{ type: "text", text: "❌ FAIL: tests broken" }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c10'", cwd: repo },
+    });
+    ok(res && res.block === true, "plain-text FAIL must block (was fail-open before #132)");
+    await fire("session_start", {});
+  });
+
+  test("scenario 11 (#132): plain-text PASS + noise merges via prompt files, gate stays active", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileG.txt"), "g1\n");
+    git(repo, "add fileG.txt");
+    const prompt = `[VGATE] verify files: fileG.txt. Classification: UI. Project root: ${repo}`;
+    // Block FIRST so lastBlockedFiles/lastBlockedCwd are set for this flow (same
+    // pattern as scenario 5) — the plain-text merge is diff-scoped (#5673).
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c11'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first");
+    await fire("tool_result", {
+      toolName: "task", input: { prompt },
+      content: [{ type: "text", text: "PASS\n{\"event\":\"gate_bypass\",\"reason\":\"escape_hatch\"}" }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c11'", cwd: repo },
+    });
+    equal(res, undefined, "plain-text PASS + noise must merge prompt files and allow the commit");
+    await fire("session_start", {});
+  });
+
+  test("scenario 12 (#132 O/I/T): BLOCK_ATTEMPT_THRESHOLD auto-bypass unchanged — 3rd attempt allowed", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileH.txt"), "h1\n");
+    git(repo, "add fileH.txt");
+    for (let i = 0; i < 3; i++) {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'c12'", cwd: repo },
+      });
+      if (i < 2) ok(res && res.block === true, `attempt ${i + 1} must block`);
+      else equal(res, undefined, `attempt ${i + 1} must auto-bypass (BLOCK_ATTEMPT_THRESHOLD)`);
+    }
+    await fire("session_start", {});
+  });
+
   test("bridge file stores repo-relative keys (survives session restart)", () => {
     const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
     ok(existsSync(bridgePath), "bridge file must exist after PASS merges");
     const bridge = JSON.parse(readFileSync(bridgePath, "utf-8"));
     equal(bridge.status, "PASS");
     const paths = bridge.verified_files.map((vf: any) => vf.path);
-    ok(paths.includes("fileA.txt"), `bridge keys must be repo-relative, got: ${JSON.stringify(paths)}`);
+    // The bridge holds the MOST RECENT merge — after the #132 scenarios that is
+    // scenario 11's plain-text-PASS merge of fileG.txt (fileA.txt was merged in
+    // scenarios 2-5 and overwritten). Repo-relative keying is the contract.
+    ok(paths.includes("fileG.txt"), `bridge keys must be repo-relative, got: ${JSON.stringify(paths)}`);
     ok(!paths.some((p: string) => p.startsWith("/")), "bridge must not contain absolute keys");
   });
 } // main: plugin loaded; tests run sequentially via runAll()

@@ -266,40 +266,108 @@ export function mergeVerifiedFiles(
 
 // ── JSON extraction ───────────────────────────────────
 
+/**
+ * Backward string-aware scan for the matching open brace of a candidate
+ * closed at `closeIdx`. Tracks string state ("…") and escaped quotes so
+ * braces inside string values never anchor a slice. Returns -1 when no
+ * balanced open brace exists (unbalanced prose → caller skips, never aborts).
+ * #132: the old lastIndexOf("{")…lastIndexOf("}") pair was string-blind and
+ * grabbed the innermost object (or the appended stderr noise object).
+ */
+function findMatchingOpenBrace(text: string, closeIdx: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = closeIdx; i >= 0; i--) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "}") {
+      depth++;
+    } else if (ch === "{") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Enumerate parseable JSON candidates from text, newest-first (reverse
+ * scan, string-aware). Returns every balanced brace-matched slice that
+ * JSON.parse accepts — schema gating happens in extractJson.
+ */
+function extractJsonCandidates(text: string): unknown[] {
+  const candidates: unknown[] = [];
+  let idx = text.length - 1;
+  while (idx >= 0) {
+    const close = text.lastIndexOf("}", idx);
+    if (close === -1) break;
+    const open = findMatchingOpenBrace(text, close);
+    if (open !== -1) {
+      const slice = text.slice(open, close + 1);
+      try {
+        candidates.push(JSON.parse(slice));
+      } catch {
+        // unparseable candidate — skip, never abort
+      }
+      idx = open - 1;
+    } else {
+      idx = close - 1;
+    }
+  }
+  return candidates;
+}
+
 export function extractJson(text: string): VerificationResult | null {
-  // Step 1: raw JSON.parse
+  // Step 1: raw JSON.parse — gated: only schema-valid results are returned.
   try {
-    const trimmed = text.trim();
-    return JSON.parse(trimmed) as VerificationResult;
+    const parsed = JSON.parse(text.trim()) as VerificationResult;
+    if (isValidResult(parsed)) return parsed;
   } catch {
     // continue
   }
 
-  // Step 2: last ```json fence
+  // Step 2: last ```json fence — gated; a schema-invalid last fence falls
+  // through to candidate enumeration (a valid earlier fence still wins).
   const fenceMatch = text.match(/```json\s*([\s\S]*?)```/g);
   if (fenceMatch) {
-    try {
-      return JSON.parse(fenceMatch[fenceMatch.length - 1].replace(/```json\s*|\s*```/g, "").trim());
-    } catch {
-      // continue
+    for (let i = fenceMatch.length - 1; i >= 0; i--) {
+      try {
+        const parsed = JSON.parse(fenceMatch[i].replace(/```json\s*|\s*```/g, "").trim()) as VerificationResult;
+        if (isValidResult(parsed)) return parsed;
+      } catch {
+        // continue scanning earlier fences
+      }
     }
   }
 
-  // Step 3: last { to } pair
-  const lastOpen = text.lastIndexOf("{");
-  const lastClose = text.lastIndexOf("}");
-  if (lastOpen !== -1 && lastClose !== -1 && lastClose > lastOpen) {
-    try {
-      return JSON.parse(text.slice(lastOpen, lastClose + 1));
-    } catch {
-      // fall through
-    }
+  // Step 3: brace-matched reverse candidate scan — newest-first; the LAST
+  // schema-valid candidate wins (the model emits the verdict last, and the
+  // appended stderr noise is schema-invalid so it is skipped). #132.
+  for (const candidate of extractJsonCandidates(text)) {
+    if (isValidResult(candidate)) return candidate;
   }
 
   return null;
 }
 
 // ── Schema validation ─────────────────────────────────
+
+// Placeholder values the block message's format template shows as examples
+// ("path":"...","hash":"...") — a literal-LLM response echoing them would
+// register a never-matching hash and block commits forever (#132).
+const PLACEHOLDER_VALUES = new Set(["", "...", "__placeholder__"]);
 
 export function isValidResult(obj: any): obj is VerificationResult {
   if (!obj || typeof obj !== "object") return false;
@@ -311,7 +379,9 @@ export function isValidResult(obj: any): obj is VerificationResult {
       typeof f === "object" &&
       f !== null &&
       typeof f.path === "string" &&
-      typeof f.hash === "string"
+      !PLACEHOLDER_VALUES.has(f.path) &&
+      typeof f.hash === "string" &&
+      !PLACEHOLDER_VALUES.has(f.hash)
   );
 }
 
@@ -555,10 +625,26 @@ export default function (pi: ExtensionAPI) {
 
     // Plain-text fallback (Pi task sub-agents often return markdown, not JSON)
     if (!result) {
+      // #132 A.3b: an explicit FAIL judgment (schema-incomplete JSON FAIL or
+      // plain-text FAIL) must block, never fail open — "don't commit" is not
+      // a JSON-compliance issue. Not a dispatch failure either: keep blocking,
+      // log, do NOT increment vgateFailures and do NOT merge. Consume stale
+      // block state like every terminal path (#5607).
+      // STRUCTURAL detection: word-boundary line/❌ heuristics (so FAILED /
+      // Failure / Failing prose never match) + a brace-anchored JSON probe
+      // covering lazy spellings {status: FAIL} / {'status':'FAIL'}.
+      const hasFail = /(?:^|\n)\s*FAIL(?:\b|:|—)/i.test(textContent)
+        || /❌.*FAIL(?:\b|:|—)/i.test(textContent)
+        || /\{\s*['"]?status['"]?\s*:\s*['"]?FAIL['"]?/i.test(textContent);
+      if (hasFail) {
+        console.error("[verification-gate] ❌ Verifier FAILED (unparseable verdict): keep blocking, no merge");
+        lastBlockedCwd = null;   // consume stale block state (#5607)
+        lastBlockedFiles = [];
+        return undefined;
+      }
       const hasPass = /(?:^|\n)\s*PASS/i.test(textContent) || /✅.*PASS/i.test(textContent);
-      const hasFail = /(?:^|\n)\s*FAIL/i.test(textContent) || /❌.*FAIL/i.test(textContent);
 
-      if (hasPass && !hasFail) {
+      if (hasPass) {
         // Extract file list and project root from the prompt
         // Format: "[VGATE] verify files: path1 path2. Classification: ... Project root: /path"
         const fileMatch = prompt.match(/verify files:\s*(.+?)(?=\.\s+Classification:|\.\s+Project root:|$)/);
@@ -652,57 +738,23 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    if (!isValidResult(result)) {
-      // ponytail: if status is PASS but schema incomplete (missing verified_files),
-      // fall through to plain-text fallback — extract files from prompt and hash them.
-      // Verifier sub-agents often return {"status":"PASS"} without the full schema.
-      if ((result as any).status === "PASS") {
-        const fileMatch = prompt.match(/verify files:\s*(.+?)(?=\.\s+Classification:|\.\s+Project root:|$)/);
-        const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
-        const promptFiles = new Set<string>();
-        for (const f of rawFiles) {
-          const isDir = f.endsWith('/') || !f.includes('.');
-          if (isDir && lastBlockedFiles.length > 0) {
-            for (const blocked of lastBlockedFiles) {
-              if (blocked.startsWith(f)) promptFiles.add(blocked);
-            }
-          } else {
-            promptFiles.add(f);
-          }
-        }
-        if (promptFiles.size > 0) {
-          const fallbackRoot = resolveProjectRoot(lastBlockedCwd, prompt);
-          const normFallbackRoot = normalizeWorktreeRoot(fallbackRoot);
-          let merged = 0;
-          for (const file of promptFiles) {
-            try {
-              const relPath = normalizeRegistryPath(fallbackRoot, file);
-              const key = compoundKey(normFallbackRoot, relPath);
-              verifiedSet.set(key, hashFile(fallbackRoot, file));
-              blockAttempts.delete(key);
-              merged++;
-            } catch { /* skip */ }
-          }
-          if (merged > 0) {
-            console.log(`[verification-gate] ✅ Schema-invalid PASS — merged ${merged}/${promptFiles.size} files via prompt fallback (${verifiedSet.size} total)`);
-            const verifiedPaths = Array.from(verifiedSet.keys());
-            writeBridge(fallbackRoot, verifiedPaths);
-            vgateFailures = 0;
-            lastBlockedCwd = null;
-            return undefined;
-          }
-        }
-      }
-      console.error("[verification-gate] ⚠️ Verifier JSON failed schema validation. Expected: {status: 'PASS'|'FAIL', failures: string[], verified_files: [{path, hash}]}.");
-      vgateFailures++;
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
-      return undefined;
-    }
+    // #132 A.4: the schema-invalid branch is REMOVED — extractJson (A.1) now
+    // returns only schema-valid results or null, so !isValidResult(result) is
+    // unreachable here. Schema-invalid PASS previously fell through to the
+    // prompt-file merge; that path is now reached via the null path (plain-text
+    // fallback → fail-open prompt-merge), which is behaviorally equivalent:
+    // same prompt merge, same reset-if-merged>0, same lastBlockedCwd consume.
+    // Schema-invalid FAIL intent is handled deliberately by A.3b (blocks).
 
     if (result.status !== "PASS") {
       console.error(`[verification-gate] ❌ Verifier returned FAIL: ${result.failures.join("; ")}`);
-      vgateFailures++;
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
+      // #132: a FAIL is a SUCCESSFUL dispatch — the verifier ran and judged the
+      // files unready. Keep blocking (nothing to merge) but do NOT count it as a
+      // dispatch failure: 3 legitimate FAIL verdicts must not silently disable the
+      // gate. No reset either — a FAIL proves nothing about dispatch health.
+      // Consume stale block state like every terminal path (#5607).
+      lastBlockedCwd = null;
+      lastBlockedFiles = [];
       return undefined;
     }
 
@@ -711,12 +763,19 @@ export default function (pi: ExtensionAPI) {
     const projectRoot = resolveProjectRoot(lastBlockedCwd, prompt);
     const { merged, skipped } = mergeVerifiedFiles(verifiedSet, blockAttempts, result.verified_files, projectRoot, lastBlockedFiles);
 
-    vgateFailures = 0;
-    console.log(`[verification-gate] ✅ Merged ${merged} verified files${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
-    // Write bridge file so future sessions/sub-agents can see verification status
-    const verifiedPaths = Array.from(verifiedSet.keys());
-    if (verifiedPaths.length > 0) {
-      writeBridge(projectRoot, verifiedPaths);
+    // #132 A.5: only a merge proves dispatch health. A zero-merge PASS (all files
+    // skipped as not-in-diff, or empty verified_files) must NOT reset the failure
+    // streak — it would mask a broken verifier. Precedent: index.ts:642/686.
+    if (merged > 0) {
+      vgateFailures = 0;
+      console.log(`[verification-gate] ✅ Merged ${merged} verified files${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
+      // Write bridge file so future sessions/sub-agents can see verification status
+      const verifiedPaths = Array.from(verifiedSet.keys());
+      if (verifiedPaths.length > 0) {
+        writeBridge(projectRoot, verifiedPaths);
+      }
+    } else {
+      console.warn(`[verification-gate] ⚠️ PASS but merged 0 files${skipped > 0 ? ` (${skipped} skipped as not in diff)` : ' (empty verified_files)'} — failure streak NOT reset (#132)`);
     }
     lastBlockedCwd = null; // consume on successful merge
     return undefined;

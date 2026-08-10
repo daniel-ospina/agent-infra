@@ -80,6 +80,119 @@ test("extracts from last { to } pair", () => {
   equal(result!.status, "PASS");
 });
 
+section("extractJson — stderr noise regression (#132)");
+
+test("verdict JSON + trailing gate_bypass noise → returns the verdict (not the noise)", () => {
+  const verdict = { status: "PASS", failures: [], verified_files: [{ path: "website/index.html", hash: "69c98952..." }] };
+  const noise = '⚠️  REVIEW GATES DISABLED — all quality checks bypassed...\n' +
+    '{"event":"gate_bypass","reason":"escape_hatch","timestamp":"2026-08-09T22:48:04.139Z"}';
+  const result = extractJson(JSON.stringify(verdict) + "\n" + noise);
+  ok(result !== null, "must extract the verdict, not return null");
+  equal(result!.status, "PASS");
+  equal(result!.verified_files[0].path, "website/index.html");
+});
+
+test("FAIL verdict + noise → FAIL verdict", () => {
+  const verdict = { status: "FAIL", failures: ["lint error"], verified_files: [] };
+  const noise = '{"event":"gate_bypass","reason":"escape_hatch"}';
+  const result = extractJson(JSON.stringify(verdict) + "\n" + noise);
+  ok(result !== null);
+  equal(result!.status, "FAIL");
+  equal(result!.failures[0], "lint error");
+});
+
+test("noise-only content → null", () => {
+  equal(extractJson('{"event":"gate_bypass","reason":"escape_hatch"}'), null);
+});
+
+test("innermost-fragment regression: non-empty verified_files parses (no fence, no noise)", () => {
+  const input = 'Here is the result: {"status":"PASS","failures":[],"verified_files":[{"path":"foo.ts","hash":"abc"}]} and some trailing text';
+  const result = extractJson(input);
+  ok(result !== null, "the trailing nested object must not anchor the slice");
+  equal(result!.status, "PASS");
+  equal(result!.verified_files.length, 1);
+});
+
+test("multiple fences: last fence schema-invalid → earlier valid fence wins", () => {
+  const input = '```json\n{"status":"PASS","failures":[],"verified_files":[]}\n```\nthen\n```json\n{"event":"gate_bypass"}\n```';
+  const result = extractJson(input);
+  ok(result !== null);
+  equal(result!.status, "PASS");
+});
+
+test("braces inside string values never anchor a candidate", () => {
+  const verdict = { status: "PASS", failures: [], verified_files: [{ path: "src/a/{b}/c.ts", hash: "h1" }] };
+  const input = 'Result: ' + JSON.stringify(verdict) + ' done';
+  const result = extractJson(input);
+  ok(result !== null, "must still extract despite { inside path string");
+  equal(result!.verified_files[0].path, "src/a/{b}/c.ts");
+});
+
+test("} inside a string value never anchors a candidate", () => {
+  const verdict = { status: "PASS", failures: [], verified_files: [{ path: "src/a}b/c.ts", hash: "h1" }] };
+  const input = 'Result: ' + JSON.stringify(verdict) + ' done';
+  const result = extractJson(input);
+  ok(result !== null, "must still extract despite } inside path string");
+  equal(result!.verified_files[0].path, "src/a}b/c.ts");
+});
+
+test("escaped quotes and backslash parity inside strings never corrupt candidates", () => {
+  const verdict = { status: "PASS", failures: ["line \"quoted\" and \\\\ backslash"], verified_files: [{ path: "a.ts", hash: "h1" }] };
+  const input = JSON.stringify(verdict) + '\ntrailing {"event":"x"}';
+  const result = extractJson(input);
+  ok(result !== null, "escaped-quote/backslash content must not mis-anchor");
+  equal(result!.status, "PASS");
+});
+
+test("unbalanced trailing prose is skipped, not fatal", () => {
+  const input = '{"status":"PASS","failures":[],"verified_files":[]}\n\nAnd then: { just prose';
+  const result = extractJson(input);
+  ok(result !== null);
+  equal(result!.status, "PASS");
+});
+
+test("trailing prose with } only (no balanced pair) → verdict still wins", () => {
+  const verdict = { status: "PASS", failures: [], verified_files: [] };
+  const result = extractJson(JSON.stringify(verdict) + "\ndone }");
+  ok(result !== null);
+  equal(result!.status, "PASS");
+});
+
+test("placeholder path/hash (…) → null", () => {
+  equal(extractJson('{"status":"PASS","failures":[],"verified_files":[{"path":"...","hash":"..."}]}'), null);
+});
+
+test("placeholder __placeholder__ / empty values → null", () => {
+  equal(extractJson('{"status":"PASS","failures":[],"verified_files":[{"path":"__placeholder__","hash":""}]}'), null);
+});
+
+test("empty verified_files stays valid even with trailing noise", () => {
+  const input = '{"status":"PASS","failures":[],"verified_files":[]} trailing noise {"event":"x"}';
+  const result = extractJson(input);
+  ok(result !== null, "empty verified_files must remain a valid result");
+  equal(result!.status, "PASS");
+});
+
+test("schema-incomplete FAIL (missing verified_files) → null (A.3b routes it at handler)", () => {
+  equal(extractJson('{"status":"FAIL","failures":["lint error"]}'), null);
+});
+
+test("schema-incomplete PASS (missing arrays) → null (A.4 equivalence input)", () => {
+  equal(extractJson('{"status":"PASS"}'), null);
+});
+
+test("plain-text PASS line + trailing noise → null (A.3b plain-text merge path)", () => {
+  equal(extractJson('PASS\n{"event":"gate_bypass","reason":"escape_hatch"}'), null);
+});
+
+test("verdict + placeholder echo AFTER verdict → verdict wins (reverse scan skip-and-continue)", () => {
+  const verdict = { status: "PASS", failures: [], verified_files: [{ path: "foo.ts", hash: "abc" }] };
+  const echo = '{"status":"PASS","failures":[],"verified_files":[{"path":"...","hash":"..."}]}';
+  const result = extractJson(JSON.stringify(verdict) + "\n" + echo);
+  ok(result !== null, "placeholder echo must be skipped, real verdict wins");
+  equal(result!.verified_files[0].path, "foo.ts");
+});
+
 section("extractJson — invalid input");
 
 test("returns null for empty string", () => {
@@ -154,6 +267,24 @@ test("rejects verified_files with invalid entry", () => {
 
 test("rejects verified_files entry with wrong types", () => {
   equal(isValidResult({ status: "PASS", failures: [], verified_files: [{ path: 123, hash: 456 }] }), false);
+});
+
+section("isValidResult — placeholder rejection (#132)");
+
+test("rejects '...' path", () => {
+  equal(isValidResult({ status: "PASS", failures: [], verified_files: [{ path: "...", hash: "abc" }] }), false);
+});
+test("rejects '...' hash", () => {
+  equal(isValidResult({ status: "PASS", failures: [], verified_files: [{ path: "a.ts", hash: "..." }] }), false);
+});
+test("rejects empty hash", () => {
+  equal(isValidResult({ status: "PASS", failures: [], verified_files: [{ path: "a.ts", hash: "" }] }), false);
+});
+test("rejects __placeholder__ path", () => {
+  equal(isValidResult({ status: "PASS", failures: [], verified_files: [{ path: "__placeholder__", hash: "abc" }] }), false);
+});
+test("empty verified_files remains valid", () => {
+  ok(isValidResult({ status: "PASS", failures: [], verified_files: [] }));
 });
 
 // ── isGitOp ──────────────────────────────────────────
