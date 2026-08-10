@@ -94,7 +94,9 @@ export function callAppsConnectionsOpen(
   apiUrl?: string,
 ): Promise<{ ok: boolean; url?: string; error?: string }> {
   return new Promise((resolve) => {
-    const base = (apiUrl ?? process.env.SLACK_API_URL ?? SLACK_API_URL_DEFAULT).replace(/\/+$/, "");
+    // `||` not `??`: an explicit empty string (state.apiUrl default) must fall
+    // through to the env/default — caught by live test 2026-08-10 (#146).
+    const base = (apiUrl || process.env.SLACK_API_URL || SLACK_API_URL_DEFAULT).replace(/\/+$/, "");
     let url: URL;
     try {
       url = new URL(`${base}/apps.connections.open`);
