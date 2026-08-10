@@ -1,0 +1,7 @@
+{
+  "name": "slack-bridge-extension",
+  "version": "1.0.0",
+  "description": "Pi Slack bridge extension — session routing (Bridge daemon) + approval notification forwarding (Slack Web API)",
+  "private": true,
+  "type": "module"
+}

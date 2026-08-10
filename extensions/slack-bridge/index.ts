@@ -1,5 +1,8 @@
-// Pi Slack Bridge extension — output routing (Phase 2).
-// Registers session_start, agent_end, session_shutdown hooks.
+// Pi Slack Bridge extension — output routing (Phase 2) + approval forwarding (#40).
+// Registers session_start, agent_end, session_shutdown hooks (Bridge daemon
+// routing). Approval forwarding polls the swarm approvals.json and posts to
+// Slack via the Web API — independent of the Bridge daemon, gated on
+// SLACK_BOT_TOKEN + SLACK_APPROVAL_CHANNEL / SLACK_CHANNEL.
 // Fire-and-forget for all external calls — never blocks the agent loop.
 // Gracefully degrades when the Bridge daemon (localhost:4200) is unreachable.
 //
@@ -8,6 +11,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { request as httpRequest, createServer as httpCreateServer, type Server } from "node:http";
+import { request as httpsRequest } from "node:https";
 import {
   existsSync,
   readFileSync,
@@ -17,9 +21,10 @@ import {
   renameSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
+import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { chunk } from "./chunker.js";
+import { chunk } from "./chunker.ts";
 
 // ── Types ────────────────────────────────────────────
 
@@ -312,6 +317,356 @@ export async function flushCycleBuffer(): Promise<void> {
   }).catch(() => {});
 }
 
+// ── Approval forwarding (agent-infra #40) ──────────────────
+// Independent capability, separate from Bridge-daemon session routing:
+// polls the swarm approvals.json (operations/coordination/approvals.json —
+// the contract written by swarm's operations/coordination/approval.py,
+// cross-repo read-only reference) and posts new human-gated approval
+// requests to Slack via the Web API (chat.postMessage) using SLACK_BOT_TOKEN.
+//
+// Runs even when SLACK_BRIDGE_DISABLE=1 — it has its own kill switch
+// (SLACK_APPROVAL_DISABLE=1) and its own enablement conditions (token +
+// channel). Every enablement decision is logged explicitly at startup.
+//
+// Response path: Accept/Reject buttons are attached to the message, but
+// interactive callbacks need a receiver pi can't host here (Slack Socket Mode
+// or a public HTTPS endpoint) — see handleApprovalCallback() TODO #40-follow-up.
+// Until then, decisions flow back through the file: swarm's review_approval()
+// writes the verdict to approvals.json and scanApprovals() mirrors it into
+// the Slack thread.
+
+interface ApprovalRequest {
+  id: string;
+  from_role: string;
+  artifact?: string;
+  context?: string;
+  status?: string;
+  reviewer?: string;
+  feedback?: string;
+  created_at?: string;
+}
+
+const SLACK_API_URL_DEFAULT = "https://slack.com/api";
+let _slackApiUrlOverride: string | null = null;
+/** Export for testing: point the Web API at a mock server. */
+export function __setSlackApiUrl(url: string | null): void {
+  _slackApiUrlOverride = url;
+}
+function getSlackApiUrl(): string {
+  return _slackApiUrlOverride ?? process.env.SLACK_API_URL ?? SLACK_API_URL_DEFAULT;
+}
+
+/** Resolved approval-forwarding config. Exported for tests. */
+export function slackApprovalConfig(): { token: string | null; channel: string; disabled: boolean } {
+  const token = (process.env.SLACK_BOT_TOKEN ?? "").trim();
+  const channel = (process.env.SLACK_APPROVAL_CHANNEL || process.env.SLACK_CHANNEL || "").trim();
+  return { token: token || null, channel, disabled: process.env.SLACK_APPROVAL_DISABLE === "1" };
+}
+
+/** Shared POST to the Slack Web API (form-encoded, like curl -F). */
+export function slackApiPost(
+  method: string,
+  body: Record<string, string>,
+  token: string,
+  timeoutMs = 5000,
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const base = getSlackApiUrl().replace(/\/+$/, "");
+    const url = new URL(`${base}/${method}`);
+    const payload = new URLSearchParams(body).toString();
+    const doRequest = url.protocol === "https:" ? httpsRequest : httpRequest;
+    const req = doRequest(
+      {
+        hostname: url.hostname,
+        port: url.port ? parseInt(url.port) : url.protocol === "https:" ? 443 : 80,
+        path: url.pathname,
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Length": String(Buffer.byteLength(payload)),
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c: Buffer) => (data += c.toString()));
+        res.on("end", () => {
+          try {
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              resolve(JSON.parse(data));
+            } else {
+              reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+            }
+          } catch (e) {
+            reject(e);
+          }
+        });
+        res.on("error", reject);
+      },
+    );
+    req.on("error", reject);
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.write(payload);
+    req.end();
+  });
+}
+
+/** Slack message blocks for an approval request — Accept/Reject actions. */
+export function buildApprovalBlocks(req: ApprovalRequest): any[] {
+  const header = `🔔 *Approval requested*\n*From:* ${req.from_role || "unknown"}\n*Reviewer:* ${req.reviewer || "human"}`;
+  const detail = [
+    req.artifact ? `*Artifact:* ${req.artifact}` : null,
+    req.context ? `*Context:* ${req.context}` : null,
+    req.created_at ? `*When:* ${req.created_at}` : null,
+  ].filter(Boolean).join("\n");
+  const blocks: any[] = [{ type: "section", text: { type: "mrkdwn", text: header } }];
+  if (detail) blocks.push({ type: "section", text: { type: "mrkdwn", text: detail } });
+  blocks.push({
+    type: "actions",
+    block_id: `approval_${req.id}`,
+    elements: [
+      { type: "button", text: { type: "plain_text", text: "✅ Accept" }, style: "primary", action_id: "approval_accept", value: `accept:${req.id}` },
+      { type: "button", text: { type: "plain_text", text: "❌ Reject" }, style: "danger", action_id: "approval_reject", value: `reject:${req.id}` },
+    ],
+  });
+  blocks.push({
+    type: "context",
+    elements: [{ type: "mrkdwn", text: "_Interactive callbacks need a receiver (see README). Until then, respond via `review_approval()` in the repo — the thread updates automatically._" }],
+  });
+  return blocks;
+}
+
+/** Post an approval request to Slack. Never throws — returns outcome. */
+export async function postApprovalRequest(
+  req: ApprovalRequest,
+  token: string,
+  channel: string,
+  timeoutMs = 5000,
+): Promise<{ ok: boolean; ts?: string; error?: string }> {
+  try {
+    const res = await slackApiPost(
+      "chat.postMessage",
+      {
+        channel,
+        text: `🔔 Approval needed — ${req.from_role}${req.artifact ? ` (${req.artifact})` : ""}`,
+        blocks: JSON.stringify(buildApprovalBlocks(req)),
+      },
+      token,
+      timeoutMs,
+    );
+    if (res && res.ok) return { ok: true, ts: res.ts };
+    return { ok: false, error: res?.error ?? "unknown" };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** Locate approvals.json: SLACK_APPROVAL_FILE, else walk up from cwd looking
+ * for <dir>/operations/coordination/approvals.json and
+ * <dir>/swarm/operations/coordination/approvals.json (covers the swarm repo
+ * as a sibling of any workspace). */
+export function findApprovalsFile(cwd = process.cwd()): string | null {
+  const explicit = process.env.SLACK_APPROVAL_FILE;
+  if (explicit) return existsSync(explicit) ? explicit : null;
+  let dir = cwd;
+  for (let i = 0; i < 8; i++) {
+    for (const candidate of [
+      join(dir, "operations", "coordination", "approvals.json"),
+      join(dir, "swarm", "operations", "coordination", "approvals.json"),
+    ]) {
+      if (existsSync(candidate)) return candidate;
+    }
+    const parent = join(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+// ── Dedup state (survives /reload) ──
+const APPROVAL_STATE_FILE_DEFAULT = join(homedir(), ".pi", "agent", "slack-approval-seen.json");
+let _approvalStateFile: string | null = null;
+/** Export for testing: redirect the dedup state file. */
+export function __setApprovalStateFile(file: string | null): void {
+  _approvalStateFile = file;
+}
+function approvalStateFile(): string {
+  return _approvalStateFile ?? APPROVAL_STATE_FILE_DEFAULT;
+}
+
+interface ApprovalStateEntry {
+  status: string;
+  ts?: string;
+  channel?: string;
+}
+type ApprovalState = Record<string, ApprovalStateEntry>;
+
+function loadApprovalState(): ApprovalState {
+  try {
+    const f = approvalStateFile();
+    if (!existsSync(f)) return {};
+    const parsed = JSON.parse(readFileSync(f, "utf-8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveApprovalState(state: ApprovalState): void {
+  try {
+    const f = approvalStateFile();
+    mkdirSync(dirname(f), { recursive: true });
+    const tmp = f + ".tmp";
+    writeFileSync(tmp, JSON.stringify(state, null, 2), "utf-8");
+    renameSync(tmp, f);
+  } catch {
+    // state file is best-effort — a lost state could re-post (dedup trade-off)
+  }
+}
+
+/** Mirror a decision back into the original thread. */
+async function postApprovalUpdate(
+  req: ApprovalRequest,
+  prev: ApprovalStateEntry,
+  token: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const verdict = req.status === "approved" ? "✅ *Approved*" : "❌ *Rejected*";
+  const feedback = req.feedback ? `\n*Feedback:* ${req.feedback}` : "";
+  const body: Record<string, string> = {
+    channel: prev.channel ?? slackApprovalConfig().channel,
+    text: `${verdict} — ${req.from_role}${req.artifact ? ` (${req.artifact})` : ""}${feedback}`,
+  };
+  if (prev.ts) body.thread_ts = prev.ts;
+  try {
+    const res = await slackApiPost("chat.postMessage", body, token);
+    return res && res.ok ? { ok: true } : { ok: false, error: res?.error ?? "unknown" };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
+ * Scan approvals.json and forward new human-gated approvals to Slack.
+ * Also mirrors verdict transitions (pending → approved/rejected) written by
+ * swarm's review_approval() back into the original Slack thread.
+ * Returns counts; never throws.
+ */
+export async function scanApprovals(opts?: {
+  file?: string;
+  token?: string;
+  channel?: string;
+}): Promise<{ posted: number; updated: number; failed: number }> {
+  const result = { posted: 0, updated: 0, failed: 0 };
+  const { token: cfgToken, channel: cfgChannel, disabled } = slackApprovalConfig();
+  const token = opts?.token ?? cfgToken;
+  const channel = opts?.channel ?? cfgChannel;
+  if (disabled || !token || !channel) return result;
+
+  const file = opts?.file ?? findApprovalsFile();
+  if (!file) return result;
+
+  let approvals: ApprovalRequest[];
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf-8"));
+    if (!Array.isArray(parsed)) return result;
+    approvals = parsed;
+  } catch {
+    return result; // missing/transient — retry next poll
+  }
+
+  const state = loadApprovalState();
+  for (const req of approvals) {
+    if (!req || typeof req.id !== "string") continue;
+    const prev = state[req.id];
+    const status = req.status ?? "pending";
+
+    if (!prev) {
+      // New request: forward only human gates (reviewer == "human"; swarm
+      // sets this for requires_human=True). Role-chain approvals resolve
+      // in-process and don't need Slack.
+      if (status === "pending" && (!req.reviewer || req.reviewer === "human")) {
+        const res = await postApprovalRequest(req, token, channel);
+        if (res.ok) {
+          state[req.id] = { status, ts: res.ts, channel };
+          result.posted++;
+        } else {
+          result.failed++;
+          console.error(`[slack-bridge] approval ${req.id}: Slack post failed — ${res.error}`);
+        }
+      } else {
+        state[req.id] = { status }; // seen, not Slack-bound (role-chain/terminal)
+      }
+    } else if (prev.status === "pending" && status !== "pending") {
+      // Decision written by review_approval() — mirror to the thread.
+      const res = await postApprovalUpdate(req, prev, token);
+      if (res.ok) {
+        state[req.id] = { ...prev, status };
+        result.updated++;
+      } else {
+        result.failed++;
+        console.error(`[slack-bridge] approval ${req.id}: update failed — ${res.error}`);
+      }
+    } else if (prev.status !== status) {
+      state[req.id] = { ...prev, status };
+    }
+  }
+  saveApprovalState(state);
+  return result;
+}
+
+/**
+ * Interactive callback receiver — STUB (agent-infra #40 follow-up).
+ * Accept/Reject buttons in Slack fire a POST to a receiver; pi can't host one
+ * without either Slack Socket Mode (SLACK_APP_SOCKET_TOKEN + a ws client) or
+ * a public HTTPS endpoint Slack can reach. Neither is available in this
+ * environment, so button clicks are currently inert. Decisions flow through
+ * approvals.json instead (see scanApprovals). Wire a real receiver here when
+ * the infrastructure exists.
+ */
+export async function handleApprovalCallback(payload: any): Promise<{ ok: boolean; note?: string }> {
+  const action = payload?.actions?.[0];
+  if (!action) return { ok: false, note: "no action in payload" };
+  return {
+    ok: false,
+    note: `callback receiver not implemented (action=${action.action_id}); decisions flow via approvals.json — see TODO #40-follow-up`,
+  };
+}
+
+/** One-line enablement status for the startup log. */
+export function approvalStatusLine(): string {
+  const { token, channel, disabled } = slackApprovalConfig();
+  if (disabled) {
+    return "[slack-bridge] ⏭️  Approval forwarding disabled — SLACK_APPROVAL_DISABLE=1 (kill switch)";
+  }
+  if (!token) {
+    return "[slack-bridge] ⏭️  Approval forwarding off — missing SLACK_BOT_TOKEN (set it in .env)";
+  }
+  if (!channel) {
+    return "[slack-bridge] ⏭️  Approval forwarding off — missing SLACK_APPROVAL_CHANNEL / SLACK_CHANNEL (set one in .env)";
+  }
+  return `[slack-bridge] ✅ Approval forwarding → ${channel}`;
+}
+
+/** Start the approvals poller (unref'd — never holds the process open). */
+export function startApprovalPoller(
+  intervalMs = parseInt(process.env.SLACK_APPROVAL_POLL_MS ?? "5000", 10) || 5000,
+): NodeJS.Timeout {
+  const timer = setInterval(() => {
+    void scanApprovals().catch(() => {});
+  }, intervalMs);
+  timer.unref();
+  return timer;
+}
+
+/** Idempotent init: log status; start the poller only when fully configured. */
+export function initApprovalForwarding(): { enabled: boolean; timer: NodeJS.Timeout | null } {
+  console.log(approvalStatusLine());
+  const { token, channel, disabled } = slackApprovalConfig();
+  if (disabled || !token || !channel) return { enabled: false, timer: null };
+  return { enabled: true, timer: startApprovalPoller() };
+}
+
 // ── Extension factory ────────────────────────────────
 
 // ponytail: inline HTTP server (matching Bridge's http.ts pattern).
@@ -371,7 +726,6 @@ function renameCmuxWorkspace(name: string): void {
   const wsId = process.env.CMUX_WORKSPACE_ID;
   if (!wsId) return;
   const cmux = process.env.CMUX_PI_CMUX_BIN || "cmux";
-  const { spawn } = require("node:child_process");
   const safe = name.replace(/"/g, "");
   spawn(cmux, ["workspace", "rename", "--workspace", wsId, safe], {
     timeout: 3000,
@@ -483,11 +837,39 @@ export function selectTeamStdin(teams: Team[]): Promise<string | null> {
 
 
 export default function slackBridge(pi: ExtensionAPI): void {
+  // Enablement diagnostics (agent-infra #40): the kill switch is explicit and
+  // the log says why. Bridge routing and approval forwarding are independent:
+  // SLACK_BRIDGE_DISABLE gates session routing only; approval forwarding has
+  // its own conditions (see initApprovalForwarding below).
   if (process.env.SLACK_BRIDGE_DISABLE === "1") {
-    console.log("[slack-bridge] ⏭️  Disabled");
-    return;
+    console.log("[slack-bridge] ⏭️  Disabled — SLACK_BRIDGE_DISABLE=1 (kill switch). Unset it to enable Slack session routing.");
+  } else {
+    try {
+      registerBridgeHooks(pi);
+      // #5672: suppress startup banner in print mode (task sub-agent output)
+      if (process.env.PI_MODE !== 'print') {
+        console.log("[slack-bridge] ✅ Loaded");
+      }
+    } catch (err: any) {
+      console.error("[slack-bridge] ❌ Failed to load:", err.message);
+    }
   }
 
+  // Approval forwarding — independent of bridge routing. Logs its own status
+  // line; starts the poller only when SLACK_BOT_TOKEN + a channel are set.
+  // Skipped in print mode (task sub-agents: one-shot, no Slack — matches the
+  // SLACK_BRIDGE_DISABLE=1 convention in builtin-tools).
+  if (process.env.PI_MODE !== 'print') {
+    initApprovalForwarding();
+  }
+}
+
+/**
+ * Bridge-daemon session routing: session_start / agent_end / session_shutdown
+ * hooks + periodic auto-reconnect. Registered only when the bridge kill
+ * switch (SLACK_BRIDGE_DISABLE=1) is NOT set.
+ */
+function registerBridgeHooks(pi: ExtensionAPI): void {
   try {
     // ── session_start ──────────────────────────────────
     pi.on("session_start", async (event: any, ctx: any) => {
@@ -534,9 +916,6 @@ export default function slackBridge(pi: ExtensionAPI): void {
           return;
         }
 
-        const repoRoot = findRepoRoot(ctx.cwd);
-        if (!repoRoot) return;
-
         let team: string | null = null;
         let role: string | null = null;
 
@@ -544,7 +923,11 @@ export default function slackBridge(pi: ExtensionAPI): void {
           team = process.env.SLACK_BRIDGE_TEAM!;
           role = process.env.SLACK_BRIDGE_ROLE ?? null;
         } else {
-          // Team selection — TUI if available, raw-stdin for cmux, null team otherwise
+          // Team selection needs the repo's subjects dir — for Slack-spawned
+          // sessions (SLACK_BRIDGE_THREAD_TS) the repo root is NOT required:
+          // they bind to an existing thread with the team from env (#40).
+          const repoRoot = findRepoRoot(ctx.cwd);
+          if (!repoRoot) return;
           if (ctx.hasUI) {
             const teams = parseSubjects(join(repoRoot, "operations", "subjects"));
             if (teams.length === 0) {
@@ -765,11 +1148,6 @@ export default function slackBridge(pi: ExtensionAPI): void {
       finally { reconnecting = false; }
     }, RECONNECT_MS);
     reconnectTimer.unref();
-
-    // #5672: suppress startup banner in print mode (task sub-agent output)
-    if (process.env.PI_MODE !== 'print') {
-      console.log("[slack-bridge] ✅ Loaded");
-    }
   } catch (err: any) {
     console.error("[slack-bridge] ❌ Failed to load:", err.message);
   }
