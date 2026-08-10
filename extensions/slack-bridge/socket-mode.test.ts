@@ -368,6 +368,18 @@ async function startConnected(opts: {
   const bad = await callAppsConnectionsOpen("xapp-test", `http://localhost:${api.port}`);
   assert(bad.ok === false, "open: api error → ok:false");
   assert(bad.error === "missing_scope", "open: api error surfaced");
+
+  // Regression (live bug 2026-08-10, #146): empty-string apiUrl must fall
+  // through to SLACK_API_URL env / default. `??` kept "" and produced
+  // "Invalid URL" reconnect loops when the extension passed its default "".
+  const api2 = new MockOpenAPI();
+  api2.setUrl("ws://wss-primary.slack.com/link/?ticket=fallthrough");
+  process.env.SLACK_API_URL = `http://localhost:${api2.port}`;
+  const fall = await callAppsConnectionsOpen("xapp-test", "");
+  assert(fall.ok === true, "open: empty apiUrl falls through to SLACK_API_URL env");
+  assert(api2.requests.length === 1, "open: env target received the request");
+  delete process.env.SLACK_API_URL;
+  await api2.kill();
   await api.kill();
 }
 
