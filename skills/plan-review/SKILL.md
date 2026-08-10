@@ -1,7 +1,7 @@
 ---
 name: plan-review
 description: Review-fix cycle for implementation plans. Sits between writing-plans and executing-plans. Launches proportional parallel reviewers, merges issues, fixes with research, and loops until clean or convergence. Invoked by writing-plans after saving the plan doc.
-version: 2.2.0
+version: 2.3.0
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 steps:
   - name: dispatch_reviewers
@@ -36,7 +36,7 @@ steps:
  from the primary repo -->
 > **Canonical:** `agent-infra/skills/plan-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
-> **Unified v2.2.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, proportional parallel reviewers (2-4), convergence-gated (cap proportional to risk: 3 for Medium, 5 for Medium-High, 8 for High). Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
+> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers (2-4), convergence-gated (cap proportional to risk: 3 for Medium, 5 for Medium-High, 8 for High). Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
 
 # Plan Review
 
@@ -114,7 +114,7 @@ Launch the proportional reviewer count (N) from the Review Cycles table **in par
 
 ---
 
-**Reviewer #1 — Structural & Efficiency** (merged, all 5 dimensions):
+**Reviewer #1 — Structural & Efficiency** (merged, all 6 dimensions):
 
 ```
 You are reviewing an implementation plan for structural correctness and efficiency. Your job is to find issues — NOT to fix them.
@@ -153,10 +153,15 @@ CHECK THESE DIMENSIONS:
    - Are there redundant verification steps?
    - Is complexity proportional to the tier?
 
+6. GOOD > EASY (design quality — always checked):
+   - Does any design decision choose the EASY path over the GOOD one? Easy paths accumulate into brittle systems; good paths cost more upfront but pay back in reliability, extensibility, and user satisfaction.
+   - Flag decisions that optimize for implementation convenience over outcome quality: shortcuts on error handling, schema changes that skip migrations, duplicated logic instead of a shared abstraction, hardcoded config instead of proper configuration, quick hacks over maintainable patterns.
+   - Each GOOD > EASY flag MUST name the Good alternative AND its cost (effort, time, risk). If you cannot name the Good alternative, it is a preference — omit it.
+
 For each issue, return EXACTLY:
 ISSUE:
   severity: P0|P1|P2
-  dimension: spec-coverage|step-coherence|epic-alignment|parallelizability|plan-quality
+  dimension: spec-coverage|step-coherence|epic-alignment|parallelizability|plan-quality|good-easy
   location: [Task N, Step M] or [Header section name]
   description: <what's wrong>
   suggestion: <what to fix>
@@ -303,7 +308,7 @@ If no gaps: NO ISSUES FOUND
 
 1. Parse all `ISSUE:` blocks from reviewer outputs
 2. Dedup: same location + similar description → keep higher severity
-3. Sort: P0 > P1 > P2, then structural > integration > UX > failure
+3. Sort: P0 > P1 > P2, then structural > integration > UX > failure > good-easy
 4. If zero issues → plan is clean, proceed to Phase 5
 
 ### Phase 2.5 — Confidence Scoring (NEW — CPI-7)
@@ -327,7 +332,7 @@ Return ONLY the number.
 
 1. Parse all `ISSUE:` blocks from reviewer outputs
 2. Dedup: same location + similar description → keep higher severity
-3. Sort: P0 > P1 > P2, then structural > integration > UX > failure
+3. Sort: P0 > P1 > P2, then structural > integration > UX > failure > good-easy
 4. If zero issues → plan is clean, proceed to Phase 5
 
 ### Phase 3 — Fix (1 Agent with Research)
@@ -345,6 +350,9 @@ RULES:
 2. SURGICAL EDITS: change only what the issue requires. Do not improve surrounding text.
 3. PRESERVE STRUCTURE: keep task numbering, step format, header structure intact.
 4. LOG CHANGES: for each fix, note what changed and why. Include whether research was performed and what sources were consulted.
+5. GOOD > EASY RESOLUTION (MANDATORY): For every `good-easy` flag, EITHER fix the plan to the Good alternative OR record an explicit deferral in the plan doc:
+   `Deferred: <easy path chosen> — Good alternative: <name> — Cost: <effort/time/risk> — Rationale: <why deferred — time-box, external constraint, dependency>`
+   A deferral without a named Good alternative + cost + rationale is not a deferral — it is an unresolved flag. Keep it open and surface it to the human.
 
 Return the COMPLETE updated plan doc, followed by:
 
@@ -465,7 +473,7 @@ Append a summary line to the plan comment when double-gate runs:
 On exit, append to the bottom of the plan doc:
 
 ```markdown
-<!-- plan-review: cycles=N, status=clean|capped|stalled, version=2.2.0 -->
+<!-- plan-review: cycles=N, status=clean|capped|stalled, version=2.3.0 -->
 ```
 
 **Clean exit:** Return control to writing-plans for Execution Handoff. **Do NOT pause or ask the user for confirmation.** The review cycle IS the quality gate — if it passed, proceed immediately.
