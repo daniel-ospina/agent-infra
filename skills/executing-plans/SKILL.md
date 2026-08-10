@@ -621,9 +621,19 @@ print('Approval request created — routed to product-strategist')
 
 Routine gates do NOT pop a human dialog: with `requires_human=False` (the default) the request routes through the VSM hierarchy (product-implementer → product-strategist → team-strategist → human), so the reviewer is the requester's `reports_to` role (a pi role — e.g. product-strategist for product-implementer). The request is logged to `operations/coordination/approvals.json` and that role approves via `review_approval()`. Do NOT set `APPROVAL_NO_NOTIFY=0` — it overrides the daemon kill-switch.
 
-Use `requires_human=True` ONLY for genuine human gates (epics, P0): that routes to 'human' and pops an osascript dialog (rate-limited to 1 per 30 min per artifact; suppressed when `APPROVAL_NO_NOTIFY=1`, e.g. headless/daemon context). If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to `operations/coordination/approvals.json` and must be checked manually.
+Use `requires_human=True` for genuine human gates (epics, P0): that routes to 'human'. **Human gates are NEVER rate-limited and NEVER auto-approved** (#1402). With Slack forwarding configured (SLACK_BOT_TOKEN + SLACK_APPROVAL_CHANNEL in `~/.swarm.env`), the request is posted to Slack by the slack-bridge — the human answers there. Without Slack, the request is logged to `operations/coordination/approvals.json` and an osascript notification fires (suppressed by `APPROVAL_NO_NOTIFY=1`).
 
-**Response mechanism:** The reviewer approves via `review_approval()`. The agent monitors `pending_approvals('<reviewer>')` — for routine product-implementer gates that is `pending_approvals('product-strategist')`; only human-routed requests (`requires_human=True`) surface a dialog the human clicks "Open" or "Dismiss". See `operations/coordination/approval.py` for the full API.
+**Conversation protocol (#1402) — approvals are a back-and-forth, not a one-shot:**
+1. After `request_approval(...)`, monitor feedback: `python3 -c "from operations.coordination.approval import approval_feedback; print(approval_feedback('<req_id>'))"` — human replies in the Slack thread are mirrored into `approvals.json` (`thread` entries) by the slack-bridge within ~5s.
+2. If the human asks a question or gives feedback, **answer it** — post your response as a follow-up request in the SAME thread:
+   ```python
+   request_approval('product-implementer', artifact='<same-artifact>',
+                    context='RE: <original_req_id> — <your answer to the human>',
+                    requires_human=True, parent='<original_req_id>')
+   ```
+   The slack-bridge posts follow-ups with `parent` into the parent's Slack thread, so the human sees your answer in context.
+3. Continue monitoring until the request resolves: `pending_approvals('human')` shrinks when the human accepts/rejects (Socket Mode buttons or `review_approval()`).
+4. **Approved** → proceed with the gate. **Denied/feedback** → revise per the feedback and re-request (new request, same thread via `parent`). Never silently proceed past a denied gate, and never spam: a NEW request per revision is correct — dedupe only collapses identical pending requests.
 
 ## When to Stop and Ask
 
