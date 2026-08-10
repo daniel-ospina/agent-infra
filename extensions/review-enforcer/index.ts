@@ -1,6 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { execSync } from "child_process";
 import * as fs from "fs";
+import * as os from "os";
+import { resolve as resolvePath } from "path";
 
 // Dual-support: check AGENT_* first, then ELDATO_* (Phase 1 — #7549)
 function _getEnv(name: string): string | undefined {
@@ -22,6 +25,175 @@ const GH_PR_PATTERN = /(^|\s)gh\s+pr\s+(create|merge)(?=\s|$)/;
 
 function isGitOp(command: string): boolean {
   return GIT_COMMIT_PATTERN.test(command) || GH_PR_PATTERN.test(command);
+}
+
+// ── Merge registry gate (#138) ────────────────────────
+// The gate must verify PRs in ANY repo. A previous prototype resolved the repo
+// from the pi process cwd, so `gh pr merge <n>` for a PR in repo B — run from a
+// session whose cwd is repo A — failed with "Could not resolve to a
+// PullRequest with the number of N". Repo context is therefore resolved in
+// priority order from the merge command itself, then the review record, with
+// the pi cwd as a fail-open fallback (never block on an unresolvable repo).
+
+export interface ReviewRecord {
+  pr: number;
+  head_sha: string;
+  verdict: string;
+  reviewed_at?: string;
+  repo?: string; // owner/name — written by record-review.sh (optional, older records lack it)
+}
+
+export interface RepoContext {
+  repo?: string; // owner/name → passed as --repo to the gate's own gh calls
+  cwd?: string; // resolved cd path → passed as cwd to the gate's own gh calls
+  source: "flag" | "env" | "cd" | "record" | "fallback";
+}
+
+// Extract the PR number from `gh pr merge <n>` (matches GH_PR_PATTERN verbs).
+export function extractPrNumber(command: string): number | null {
+  const m = command.match(/gh\s+pr\s+merge\s+(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// Priority 1: explicit --repo owner/name (or -R, or --repo=owner/name) flag.
+export function extractRepoFlag(command: string): string | null {
+  const m = command.match(/(?:--repo|-R)(?:=|\s+)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
+  return m ? m[1] : null;
+}
+
+// Priority 2: GH_REPO=owner/name env assignment prefix in the command.
+export function extractGhRepoEnv(command: string): string | null {
+  const m = command.match(/(?:^|\s)GH_REPO=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
+  return m ? m[1] : null;
+}
+
+// Priority 3: `cd <path> &&/; ...` prefix. Equivalent to verification-gate's
+// extractCdPath (pi's bash tool keeps process.cwd() unchanged even when the
+// shell script starts with "cd /worktree &&"), but takes the LAST cd in a
+// chain (`cd /a && cd /b && gh ...` → /b), since that is the effective cwd
+// when the gh command runs. Handles cd "path", cd 'path', unquoted, and ; chains.
+export function extractCdPath(command: string): string | null {
+  const re = /(?:^|\s)cd\s+(['"]?)([^;&|]+?)\1\s*(?:&&|;)/g;
+  let m: RegExpExecArray | null;
+  let last: RegExpExecArray | null = null;
+  while ((m = re.exec(command)) !== null) {
+    last = m;
+  }
+  return last ? resolvePath(last[2]) : null;
+}
+
+export function resolveRepoContext(command: string, record: ReviewRecord | null): RepoContext {
+  const flag = extractRepoFlag(command);
+  if (flag) return { repo: flag, source: "flag" };
+  const env = extractGhRepoEnv(command);
+  if (env) return { repo: env, source: "env" };
+  const cdPath = extractCdPath(command);
+  if (cdPath) return { cwd: cdPath, source: "cd" };
+  if (record?.repo) return { repo: record.repo, source: "record" };
+  return { source: "fallback" };
+}
+
+// Review records live at ~/.pi/agent/reviews/<PR>.json (written by record-review.sh).
+export function reviewsDir(): string {
+  return resolvePath(os.homedir(), ".pi", "agent", "reviews");
+}
+
+export function readReviewRecord(pr: number): ReviewRecord | null {
+  try {
+    const raw = fs.readFileSync(resolvePath(reviewsDir(), `${pr}.json`), "utf8");
+    const rec = JSON.parse(raw) as ReviewRecord;
+    if (!rec || typeof rec.head_sha !== "string" || typeof rec.verdict !== "string") return null;
+    return rec;
+  } catch {
+    return null; // missing or corrupt record → treated as "no review"
+  }
+}
+
+// Current PR head via the gate's own gh call, using the resolved repo context
+// (cwd for `cd ... &&` prefixes, --repo flag for explicit owner/name). Returns
+// null on ANY failure (network, bad repo, gh missing) — the fail-open signal.
+export function getPrHeadSha(pr: number, ctx: RepoContext): string | null {
+  try {
+    const repoArg = ctx.repo ? ` --repo ${ctx.repo}` : "";
+    const out = execSync(`gh pr view ${pr} --json headRefOid --jq .headRefOid${repoArg}`, {
+      encoding: "utf-8",
+      cwd: ctx.cwd,
+      timeout: 15000,
+    });
+    const sha = out.trim();
+    return sha || null;
+  } catch {
+    return null;
+  }
+}
+
+export type MergeGateResult =
+  | { status: "block"; reason: string }
+  | { status: "failopen"; warning: string }
+  | { status: "allow"; message: string };
+
+// Pure gate decision — separated from I/O so it is unit-testable.
+export function evaluateMergeGate(
+  pr: number,
+  record: ReviewRecord | null,
+  currentHead: string | null,
+  ctx: RepoContext
+): MergeGateResult {
+  if (!record) {
+    return {
+      status: "block",
+      reason: [
+        "✅ Review enforcement (merge registry) gate is working correctly.",
+        `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
+        "   → Run the code-review skill, then record the verdict:",
+        "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+        "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
+      ].join("\n"),
+    };
+  }
+  if (record.verdict !== "clean" && record.verdict !== "clean-micro") {
+    return {
+      status: "block",
+      reason: [
+        `❌ Review record for PR #${pr} has verdict "${record.verdict}" — only "clean" or "clean-micro" unlocks a merge.`,
+        "   → Re-run the code-review skill on the current head and re-record: record-review.sh <PR> <head_sha> clean [owner/repo]",
+      ].join("\n"),
+    };
+  }
+  if (currentHead === null) {
+    // Fail-open with a loud warning: transient gh errors (network etc.) or an
+    // unresolvable repo must never strand a cross-repo merge — blocking is
+    // exactly the bug #138 fixes. Tell the user how to make it resolvable.
+    const advice =
+      ctx.source === "fallback"
+        ? "The repo could not be resolved (fell back to the pi process cwd). If this PR is in " +
+          "another repo, re-record with repo info — record-review.sh <PR> <head_sha> clean owner/repo — " +
+          "or pass --repo owner/repo to gh pr merge."
+        : "If this persists, re-record with repo info — record-review.sh <PR> <head_sha> clean owner/repo — " +
+          "or pass --repo owner/repo to gh pr merge.";
+    return {
+      status: "failopen",
+      warning:
+        `⚠️  [review-enforcer] Could not verify head of PR #${pr} via gh (repo context: ${ctx.source}). ` +
+        `Allowing merge WITHOUT head verification. ${advice}`,
+    };
+  }
+  if (record.head_sha !== currentHead) {
+    return {
+      status: "block",
+      reason: [
+        `❌ PR #${pr} head has advanced since the review was recorded.`,
+        `   Recorded: ${record.head_sha.slice(0, 12)}   Current: ${currentHead.slice(0, 12)}`,
+        "   → The branch moved — re-review the new head and re-record: record-review.sh <PR> <head_sha> clean [owner/repo]",
+      ].join("\n"),
+    };
+  }
+  return {
+    status: "allow",
+    message:
+      `[review-enforcer] ✅ Merge registry gate passed for PR #${pr} ` +
+      `(clean review, head ${currentHead.slice(0, 12)} matches) — allowing merge`,
+  };
 }
 
 // ── Block message ─────────────────────────────────────
@@ -100,6 +272,24 @@ export default function (pi: ExtensionAPI) {
 
       const command = String(event.input.command ?? "");
       if (!isGitOp(command)) return undefined;
+
+      // #138: merge registry gate runs FIRST for `gh pr merge` commands.
+      // A recorded clean review (registry record) IS the evidence — merges do
+      // NOT also require dispatchCount > 0. That gate stays for git
+      // commit/push and gh pr create, below.
+      const prNumber = extractPrNumber(command);
+      if (prNumber !== null) {
+        const record = readReviewRecord(prNumber);
+        const ctx = resolveRepoContext(command, record);
+        const currentHead = getPrHeadSha(prNumber, ctx);
+        const result = evaluateMergeGate(prNumber, record, currentHead, ctx);
+        if (result.status === "block") {
+          console.log("[review-enforcer] 🚫 Merge registry gate blocked merge");
+          return { block: true, reason: result.reason };
+        }
+        console.log(result.status === "failopen" ? result.warning : result.message);
+        return undefined;
+      }
 
       if (dispatchCount > 0) {
         console.log(
