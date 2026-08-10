@@ -652,7 +652,12 @@ export default function (pi: ExtensionAPI) {
         || /(?:^|\n)\s*(?:result|verdict|status|outcome)\s*[:=]\s*FAIL(?:\b|:|—)/i.test(textContent)
         || /(?:^|\n)\s*(?:[-*•]|\d+\.)?\s*FAILED(?:\b|:|—)/i.test(textContent)
         || /❌.*FAILED(?:\b|:|—)/i.test(textContent)
-        || /\{\s*['"]?status['"]?\s*:\s*['"]?FAIL['"]?/i.test(textContent);
+        || /\{\s*['"]?status['"]?\s*:\s*['"]?FAIL['"]?/i.test(textContent)
+        // Order-independent: status in ANY key position ({"failures":[...],"status":"FAIL"}).
+        // Tradeoff (re-review P2): unanchored, so a PASS response QUOTING a prior
+        // status:FAIL in prose would block — accepted: FAIL-quoting PASS prose is
+        // rarer than the fail-open danger of status-second FAIL verdicts.
+        || /(?:^|[^\w])['"]?status['"]?\s*[:=]\s*['"]?FAIL['"]?/i.test(textContent);
       if (hasFail) {
         console.error("[verification-gate] ❌ Verifier FAILED (unparseable verdict): keep blocking, no merge");
         lastBlockedCwd = null;   // consume stale block state (#5607)

@@ -198,6 +198,10 @@ test("schema-incomplete FAIL (missing verified_files) → null (A.3b routes it a
   equal(extractJson('{"status":"FAIL","failures":["lint error"]}'), null);
 });
 
+test("schema-incomplete FAIL with status in second key position → null (A.3b order-independent probe)", () => {
+  equal(extractJson('{"failures":["lint error"],"status":"FAIL"}'), null);
+});
+
 test("schema-incomplete PASS (missing arrays) → null (A.4 equivalence input)", () => {
   equal(extractJson('{"status":"PASS"}'), null);
 });
