@@ -21,7 +21,7 @@ import {
   renameSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { chunk } from "./chunker.ts";
@@ -32,6 +32,7 @@ import {
   updateResolvedMessage,
   settleEscalatedMessage, // #157: ⛔ revision-cap banner (forwarder settle)
   settleSupersededMessage, // #157: ↻ banner when a new revision supersedes
+  settleRedraftEscalatedMessage, // #158: ⏱ banner when the 24h TTL expires (dead-session recovery)
   REVISION_CAP, // #157: shared cap — matches the epic decision
   type SocketModeState,
 } from "./socket-mode.ts";
@@ -361,6 +362,15 @@ interface ApprovalRequest {
   created_at?: string;
   parent?: string;
   thread?: Array<{ author?: string; text?: string; ts?: string }>;
+  // #158 dead-session recovery contract (swarm #1681 records repo/cwd and the
+  // requester heartbeat):
+  feedback_at?: string; // #156: when the changes_requested feedback landed
+  last_polled_at?: string; // requester heartbeat when it reads feedback; absent = stale
+  repo?: string; // owning repo (owner/name) — forward-compat, swarm #1681
+  cwd?: string; // requesting session's cwd — forward-compat, unused by the sweep
+  escalated_at?: string; // #158: TTL once-fire marker (ISO)
+  escalated_issue?: number; // #158: filed GitHub issue number
+  escalated_reason?: string; // #158: "no_repo" when expired without repo info
 }
 
 const SLACK_API_URL_DEFAULT = "https://slack.com/api";
@@ -832,6 +842,351 @@ export function initApprovalForwarding(): { enabled: boolean; timer: NodeJS.Time
   return { enabled: true, timer: startApprovalPoller() };
 }
 
+// ── Dead-session recovery (agent-infra #158) ─────────
+// Two mechanisms, both firing at session_start (no background timers):
+//  1. STARTUP SWEEP — stale changes_requested entries (feedback_at > 1h AND
+//     last_polled_at absent/ > 1h) are surfaced as ONE consolidated notify
+//     (ctx.ui.notify, console.log fallback) so a resumed session redrafts
+//     instead of losing feedback. Repo filtering is forward-compatible with
+//     swarm #1681 (which records repo/cwd on entries): entries with repo info
+//     surface only when the repo matches the current repo (derived from
+//     `git config --get remote.origin.url` of ctx.cwd); entries WITHOUT repo
+//     info are surfaced tagged "(any repo)" rather than hidden.
+//  2. TTL ESCALATION (24h, same pass) — still-unpicked entries older than
+//     24h: with entry.repo → file a GitHub issue via `gh api` REST and settle
+//     the Slack message to the ⏱ "Escalated to issue" banner (issue link, no
+//     buttons); without entry.repo → NEVER guess repos: settle to the ⏱
+//     "Expired" banner + warn-log. escalated_at is the once-fire marker;
+//     every failure warn-logs WITHOUT writing escalated_at (retry on the
+//     next session start) and never throws into session_start.
+
+const REDRAFT_SURFACE_MS = 60 * 60 * 1000; // 1h — surface stale redrafts
+const REDRAFT_ESCALATE_MS = 24 * 60 * 60 * 1000; // 24h — TTL escalation
+const GIT_REMOTE_TIMEOUT_MS = 2000; // spec: git config lookup, 2s cap
+const GH_API_TIMEOUT_MS = 15000; // gh api call cap
+
+// ── Seams (tests) ──
+// __setGhIssueFileImpl replaces the gh shell-out entirely (tests must never
+// shell out); __setCurrentRepoOverride pins the derived current repo
+// (undefined = derive from git, null = no-repo-info).
+let _ghIssueFileImpl: ((opts: { repo: string; title: string; body: string }) => { number: number }) | null = null;
+let _currentRepoOverride: string | null | undefined = undefined;
+
+/** Export for testing: override the gh issue-filing implementation. */
+export function __setGhIssueFileImpl(
+  fn: ((opts: { repo: string; title: string; body: string }) => { number: number }) | null,
+): void {
+  _ghIssueFileImpl = fn;
+}
+
+/** Export for testing: pin the derived current repo (undefined = derive). */
+export function __setCurrentRepoOverride(repo: string | null | undefined): void {
+  _currentRepoOverride = repo;
+}
+
+/** Parse owner/name from a git remote URL or bare "owner/name" (case-folded,
+ * trailing .git tolerated). Returns null when unrecognizable. */
+export function normalizeRepoName(raw: string | null | undefined): string | null {
+  const s = (raw ?? "").trim();
+  if (!s) return null;
+  // Bare owner/name, optionally with .git
+  let m = s.match(/^([\w.-]+)\/([\w.-]+?)(?:\.git)?$/);
+  if (m) return `${m[1].toLowerCase()}/${m[2].toLowerCase()}`;
+  // URLs: https://github.com/owner/name[.git], git@github.com:owner/name[.git],
+  // ssh://git@github.com/owner/name[.git]
+  m = s.match(/github\.com[:/]([\w.-]+)\/([\w.-]+?)(?:\.git)?(?:[/?#].*)?$/);
+  if (m) return `${m[1].toLowerCase()}/${m[2].toLowerCase()}`;
+  return null;
+}
+
+/** Derive the current repo owner/name from the git remote origin URL of cwd.
+ * Failure (no git, no remote, timeout) → null = no-repo-info. */
+export function deriveCurrentRepo(cwd: string): string | null {
+  try {
+    const out = execSync("git config --get remote.origin.url", {
+      cwd,
+      timeout: GIT_REMOTE_TIMEOUT_MS,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return normalizeRepoName(out.trim());
+  } catch {
+    return null; // no git / no remote / timeout — treat as no-repo-info
+  }
+}
+
+function parseIsoMs(iso: string | null | undefined): number | null {
+  if (!iso || typeof iso !== "string") return null;
+  const t = new Date(iso).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+/** Re-read ONE approval from disk (fresh state — the double-fire guard must
+ * see concurrent writes). Returns null on missing/unparseable. */
+function readApprovalById(file: string, id: string): ApprovalRequest | null {
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf-8"));
+    if (!Array.isArray(parsed)) return null;
+    return parsed.find((a: any) => a && a.id === id) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Patch ONE approvals.json entry, atomic tmp+rename. Returns true on write. */
+function patchApprovalsEntry(file: string, id: string, patch: Record<string, unknown>): boolean {
+  try {
+    const all = JSON.parse(readFileSync(file, "utf-8"));
+    if (!Array.isArray(all)) return false;
+    const idx = all.findIndex((a: any) => a && a.id === id);
+    if (idx < 0) return false;
+    all[idx] = { ...all[idx], ...patch };
+    const tmp = file + ".tmp";
+    writeFileSync(tmp, JSON.stringify(all, null, 2), "utf-8");
+    renameSync(tmp, file);
+    return true;
+  } catch (e: any) {
+    console.warn(`[slack-bridge] #158: failed to write escalation state for ${id}: ${e?.message ?? e}`);
+    return false;
+  }
+}
+
+/** GitHub issue body: feedback text, reviewer, original approval context
+ * (id, created_at) + the mandated auto-escalation note. */
+function buildEscalationBody(req: ApprovalRequest): string {
+  const feedback = (req.feedback ?? "(no feedback text)").trim();
+  const lines = [
+    "## Redraft requested",
+    "",
+    `Approval **${req.id}** (${req.artifact ?? "unknown artifact"}) received changes-requested feedback that no session has picked up within 24h.`,
+    "",
+    `- **Reviewer:** ${req.reviewer ?? "unknown"}`,
+    `- **Requested by:** ${req.from_role ?? "unknown"}`,
+    `- **Approval id:** ${req.id}`,
+    `- **Created:** ${req.created_at ?? "unknown"}`,
+    "",
+    "**Feedback:**",
+    "> " + feedback.split("\n").join("\n> "),
+    "",
+    "_Auto-escalated after 24h without pickup (agent-infra #158)_",
+  ];
+  return lines.join("\n");
+}
+
+/** File a GitHub issue via `gh api` REST. Never throws — success returns
+ * { number }, every failure (missing gh, network, API error, bad repo)
+ * warn-logs and returns null so the caller skips escalated_at (retry next
+ * session start). Overridable via __setGhIssueFileImpl — tests never shell
+ * out. The payload goes over stdin (--input -) so arbitrary feedback text
+ * needs no shell quoting; the repo is re-validated before interpolation. */
+function fileGhIssue(opts: { repo: string; title: string; body: string }): { number: number } | null {
+  if (_ghIssueFileImpl) {
+    try {
+      return _ghIssueFileImpl(opts);
+    } catch (e: any) {
+      console.warn(`[slack-bridge] #158: gh issue filing failed for ${opts.repo}: ${e?.message ?? e}`);
+      return null;
+    }
+  }
+  const repo = normalizeRepoName(opts.repo);
+  if (!repo) {
+    console.warn(`[slack-bridge] #158: refusing to file issue — unrecognized repo "${opts.repo}"`);
+    return null;
+  }
+  try {
+    const payload = JSON.stringify({ title: opts.title, body: opts.body });
+    const out = execSync(`gh api repos/${repo}/issues --method POST --input -`, {
+      input: payload,
+      timeout: GH_API_TIMEOUT_MS,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const parsed = JSON.parse(out);
+    const number = typeof parsed?.number === "number" ? parsed.number : null;
+    if (number === null) {
+      console.warn(`[slack-bridge] #158: gh api response missing issue number for ${repo}`);
+      return null;
+    }
+    return { number };
+  } catch (e: any) {
+    console.warn(`[slack-bridge] #158: gh issue filing failed for ${repo}: ${e?.message ?? e}`);
+    return null;
+  }
+}
+
+export interface RedraftSweepResult {
+  /** Entries surfaced in the consolidated notify. */
+  surfaced: number;
+  /** Entries escalated (issue filed or expired) in this pass. */
+  escalated: number;
+  /** Escalation attempts that failed (no escalated_at written — retry next start). */
+  failures: number;
+  /** The notify text (null when silent). */
+  notifyText: string | null;
+}
+
+/** Dead-session recovery sweep (agent-infra #158) — runs at session_start
+ * only, no timers. Surfaces stale changes_requested redrafts (feedback_at
+ * > 1h AND last_polled_at absent/ > 1h) as ONE consolidated notify, and
+ * escalates 24h-stale unpicked ones (gh issue when entry.repo exists; ⏱
+ * Expired settle + warn when it doesn't). escalated_at is the once-fire
+ * marker. Never throws; all failures warn-log and retry next session start.
+ * `now`/`notify`/`currentRepo` are injectable for tests. */
+export async function sweepStaleRedrafts(opts?: {
+  file?: string;
+  cwd?: string;
+  now?: number;
+  notify?: (msg: string) => void;
+  currentRepo?: string | null;
+}): Promise<RedraftSweepResult> {
+  const result: RedraftSweepResult = { surfaced: 0, escalated: 0, failures: 0, notifyText: null };
+  const cwd = opts?.cwd ?? process.cwd();
+  const file = opts?.file ?? findApprovalsFile(cwd);
+  if (!file) return result; // no approvals.json here — silent
+  const now = opts?.now ?? Date.now();
+
+  let approvals: ApprovalRequest[];
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf-8"));
+    if (!Array.isArray(parsed)) return result;
+    approvals = parsed;
+  } catch {
+    return result; // missing/transient — retry next session start
+  }
+
+  const currentRepo =
+    opts?.currentRepo !== undefined
+      ? normalizeRepoName(opts.currentRepo)
+      : _currentRepoOverride !== undefined
+        ? normalizeRepoName(_currentRepoOverride)
+        : deriveCurrentRepo(cwd);
+
+  // Shared staleness rule (both mechanisms): status changes_requested AND
+  // feedback_at older than the surface window AND (last_polled_at absent OR
+  // older than the surface window — a fresh poll means a live requester).
+  const stale = approvals.filter((req) => {
+    if (!req || typeof req.id !== "string") return false;
+    if (req.status !== "changes_requested") return false;
+    const fb = parseIsoMs(req.feedback_at);
+    if (fb === null || now - fb < REDRAFT_SURFACE_MS) return false;
+    const lp = parseIsoMs(req.last_polled_at);
+    if (lp !== null && now - lp < REDRAFT_SURFACE_MS) return false;
+    return true;
+  });
+
+  // ── TTL escalation (24h) — runs first so the notify only lists entries
+  // that still await pickup (escalated ones get the ⏱ banner instead).
+  const ttl = stale.filter((req) => {
+    const fb = parseIsoMs(req.feedback_at)!;
+    if (now - fb < REDRAFT_ESCALATE_MS) return false;
+    if (req.escalated_at) return false; // once-fire — never double-escalate
+    return true;
+  });
+
+  const state = loadApprovalState();
+  for (const req of ttl) {
+    // Re-read per entry: the escalated_at guard must see the latest state
+    // (a concurrent sweep may have escalated in between).
+    const fresh = readApprovalById(file, req.id);
+    if (!fresh || fresh.escalated_at) continue;
+    const seen = state[req.id];
+    const repo = normalizeRepoName(fresh.repo);
+
+    if (repo) {
+      // a) Repo recorded → file a GitHub issue in THAT repo (never the
+      //    current one — entry attribution wins), settle the Slack message
+      //    to the ⏱ escalated banner with the issue link.
+      const issue = fileGhIssue({
+        repo,
+        title: `Redraft requested: ${fresh.artifact ?? fresh.id}`,
+        body: buildEscalationBody(fresh),
+      });
+      if (!issue) {
+        result.failures++; // warn-logged inside fileGhIssue; escalated_at NOT written
+        continue;
+      }
+      if (seen?.ts && seen.channel) {
+        void settleRedraftEscalatedMessage({
+          channel: seen.channel,
+          ts: seen.ts,
+          issueUrl: `https://github.com/${repo}/issues/${issue.number}`,
+          apiUrl: getSlackApiUrl(),
+        }).catch(() => {});
+      }
+      if (patchApprovalsEntry(file, fresh.id, {
+        escalated_at: new Date(now).toISOString(),
+        escalated_issue: issue.number,
+      })) {
+        result.escalated++;
+      } else {
+        result.failures++;
+      }
+      console.log(`[slack-bridge] #158: ${fresh.id} escalated → https://github.com/${repo}/issues/${issue.number}`);
+    } else {
+      // b) No repo recorded → never guess: expire the Slack message, warn,
+      //    write escalated_at + escalated_reason.
+      if (seen?.ts && seen.channel) {
+        void settleRedraftEscalatedMessage({
+          channel: seen.channel,
+          ts: seen.ts,
+          apiUrl: getSlackApiUrl(),
+        }).catch(() => {});
+      }
+      console.warn(`[slack-bridge] #158: ${fresh.id} expired — no repo recorded; re-request the approval`);
+      if (patchApprovalsEntry(file, fresh.id, {
+        escalated_at: new Date(now).toISOString(),
+        escalated_reason: "no_repo",
+      })) {
+        result.escalated++;
+      } else {
+        result.failures++;
+      }
+    }
+  }
+
+  // ── Surface pass — entries still awaiting pickup (1h–24h stale, not
+  // escalated). Repo filter: entries WITH repo info surface only when the
+  // repo matches the current repo; entries WITHOUT repo info — or when the
+  // current repo is unknown (cannot filter) — surface tagged "(any repo)".
+  const awaiting = stale.filter((req) => {
+    if (req.escalated_at) return false;
+    const fb = parseIsoMs(req.feedback_at)!;
+    if (now - fb >= REDRAFT_ESCALATE_MS) return false; // 24h+ — escalated (or warn-logged failure) this pass
+    return true;
+  });
+
+  if (awaiting.length > 0) {
+    const shown: string[] = [];
+    for (const req of awaiting) {
+      const repo = normalizeRepoName(req.repo);
+      const detail = `${req.id} (${req.artifact ?? "unknown"}) — feedback from ${req.reviewer ?? "unknown"}`;
+      if (repo && currentRepo) {
+        if (repo !== currentRepo) continue; // another repo's redraft — not ours
+        shown.push(detail);
+      } else {
+        shown.push(`${detail} (any repo)`); // no repo info, or repo unknown here
+      }
+    }
+    if (shown.length > 0) {
+      const text = [
+        `[slack-bridge] #158: ${shown.length} approval(s) await redraft:`,
+        shown.join("; "),
+        "Resume the loop or they auto-escalate after 24h",
+      ].join("\n");
+      result.notifyText = text;
+      result.surfaced = shown.length;
+      const notify = opts?.notify ?? ((m: string) => console.log(m));
+      try {
+        notify(text);
+      } catch {
+        // notify must never throw into session_start
+      }
+    }
+  }
+
+  return result;
+}
+
 // ── Extension factory ────────────────────────────────
 
 // ponytail: inline HTTP server (matching Bridge's http.ts pattern).
@@ -1015,6 +1370,8 @@ export default function slackBridge(pi: ExtensionAPI): void {
       // SLACK_APP_TOKEN (xapp-...) is set; skipped in print mode (task
       // sub-agents, like approval forwarding) and when the bridge kill switch
       // is set (deliberate full-Slack-off, matches the factory test contract).
+      // #158: the dead-session recovery startup sweep rides the same
+      // session_start wiring (approval capability, same disable conditions).
       // Without the token the receiver never starts — zero behavior change.
       if (process.env.PI_MODE !== 'print') {
         registerSocketModeHooks(pi);
@@ -1043,15 +1400,32 @@ export default function slackBridge(pi: ExtensionAPI): void {
 }
 
 /**
- * Socket Mode receiver lifecycle (#146): session_start starts the receiver
- * when SLACK_APP_TOKEN is set; session_shutdown stops it cleanly. Registered
- * alongside bridge routing (never in print mode, never when the bridge kill
- * switch is set). Module-level socketState keeps this reload-resilient:
- * shutdown on reload stops the old connection, start opens a fresh one.
+ * Socket Mode receiver lifecycle (#146) + dead-session recovery sweep (#158):
+ * session_start starts the receiver when SLACK_APP_TOKEN is set, and always
+ * runs the redraft sweep (surface stale changes_requested feedback + 24h TTL
+ * escalation) so feedback is never lost when the requesting session died.
+ * session_shutdown stops the receiver cleanly. Registered alongside bridge
+ * routing (never in print mode, never when the bridge kill switch is set).
+ * Module-level socketState keeps this reload-resilient: shutdown on reload
+ * stops the old connection, start opens a fresh one.
  */
 function registerSocketModeHooks(pi: ExtensionAPI): void {
-  pi.on("session_start", async (_event: any, _ctx: any) => {
+  pi.on("session_start", async (_event: any, ctx: any) => {
     try {
+      // #158 dead-session recovery — runs on EVERY session_start (startup,
+      // reload, fork, ...) per contract, no timers. Same disable conditions
+      // as the surrounding approval wiring: SLACK_BRIDGE_DISABLE (also
+      // registration-level) and SLACK_APPROVAL_DISABLE (kill switch for the
+      // whole approval capability); print mode is registration-level.
+      if (process.env.SLACK_BRIDGE_DISABLE !== "1" && process.env.SLACK_APPROVAL_DISABLE !== "1") {
+        await sweepStaleRedrafts({
+          cwd: typeof ctx?.cwd === "string" ? ctx.cwd : undefined,
+          notify: (msg: string) => {
+            if (ctx?.ui?.notify) ctx.ui.notify(msg, "warning");
+            else console.log(msg);
+          },
+        }).catch(() => {}); // sweep never throws — belt and braces
+      }
       if (!isSocketModeEnabled()) return; // env-gated: no token → never starts
       if (socketState?.wantRunning) return; // already running (reload-resilient)
       console.log("[slack-bridge] 🔌 Socket Mode starting...");

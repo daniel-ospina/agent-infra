@@ -189,6 +189,17 @@ open (v1, 🔔 + buttons)
    │
    └─ revision > 15 (REVISION_CAP) or status "escalated" →
         ⛔ *Escalated — revision cap (15) exceeded* (no buttons, settled once)
+
+…and if the requesting session dies (agent-infra #158):
+
+```
+📝 *Changes requested* (buttons removed)
+   │  nobody picks up the feedback (requester died; last_polled_at absent/stale)
+   ▼
+⏱ after 24h → *Escalated to issue* (gh issue filed in entry.repo, link shown)
+   │  or, no repo recorded → ⏱ *Expired* — no repo recorded; re-request
+   │  (session_start sweep — see Dead-session recovery below)
+```
 ```
 
 Specifically:
@@ -210,10 +221,61 @@ Specifically:
   and never gets buttons again. A late thread reply under it also settles to
   the ⛔ banner instead of 📝.
 
+### Dead-session recovery (agent-infra #158)
+
+If the requesting session dies, `changes_requested` feedback has a recovery
+path: on every `session_start` the extension runs a **startup sweep** (no
+background timers) with two mechanisms:
+
+1. **Startup sweep (1h)** — entries with `status: "changes_requested"` whose
+   `feedback_at` is older than 1h **and** whose `last_polled_at` is absent or
+   older than 1h are surfaced as **one consolidated notify** (via
+   `ctx.ui.notify`, `console.log` fallback):
+
+   ```
+   [slack-bridge] #158: 2 approval(s) await redraft:
+   apr-123 (plan.md) — feedback from product-strategist; apr-456 (03-scope.md) — feedback from human (any repo)
+   Resume the loop or they auto-escalate after 24h
+   ```
+
+   Repo filtering is forward-compatible with swarm #1681 (which will record
+   `repo`/`cwd` on entries): an entry with repo info surfaces only when its
+   repo matches the **current repo** (derived from
+   `git config --get remote.origin.url` of `ctx.cwd`, 2s timeout; failure =
+   no-repo-info); an entry **without** repo info is surfaced tagged
+   `(any repo)` rather than hidden. Zero matches → silent.
+
+2. **TTL escalation (24h, same pass)** — entries still unpicked after 24h
+   (same `last_polled_at` rule) and without `escalated_at`:
+
+   - `repo` present → files a GitHub issue via `gh api` REST
+     (`POST repos/<repo>/issues`, title `Redraft requested: <artifact>`, body
+     with the feedback text, reviewer, approval id/created_at, and the note
+     `Auto-escalated after 24h without pickup (agent-infra #158)`), then
+     settles the Slack message to the ⏱ banner:
+     `⏱ *Escalated to issue* — no session picked up this redraft within 24h`
+     with the issue link (no buttons). The entry gains `escalated_at` (ISO)
+     and `escalated_issue` (number), written atomic tmp+rename.
+   - `repo` absent → **never guesses repos**: settles the message to
+     `⏱ *Expired* — no repo recorded; re-request the approval`, warn-logs,
+     and writes `escalated_at` + `escalated_reason: "no_repo"`.
+   - `escalated_at` present → always skipped (no double-fire). Every failure
+     (gh missing, network, API error) warn-logs **without** writing
+     `escalated_at`, so it retries on the next session start; the sweep never
+     throws into `session_start`.
+
+**Contract notes** (swarm #1681): `last_polled_at` is written by the
+requester when it reads the feedback; until then, absent = treated as stale.
+The sweep fires at `session_start` only — no timers. It runs with the same
+disable conditions as the approval wiring: `SLACK_BRIDGE_DISABLE=1`,
+`SLACK_APPROVAL_DISABLE=1`, and print mode (task sub-agents). The ⏱ settle
+banners use the same `SLACK_BOT_TOKEN` + seen-file channel/ts as the other
+settles; missing token or channel/ts skips silently (fire-and-forget).
+
 ## Tests
 
 ```bash
-npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 152 asserts (self-check)
+npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 206 asserts (self-check)
 npx tsx extensions/slack-bridge/socket-mode.test.ts    # 148 asserts (Socket Mode receiver, mock WS server)
 npx tsx extensions/slack-bridge/chunker.test.ts        # 21 asserts
 ```

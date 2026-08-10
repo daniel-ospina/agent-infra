@@ -1085,6 +1085,269 @@ try {
   }
 }
 
+// ── Dead-session recovery (#158): startup sweep + TTL escalation ──
+// (i) stale surfaced with id/artifact/reviewer; (ii) fresh silent;
+// (iii) repo filtering; (iv) TTL with repo → gh issue + ⏱ banner;
+// (v) TTL without repo → expired settle, no gh; (vi) escalated_at skip;
+// (vii) gh failure → no escalated_at, retried next sweep.
+// The gh call is mocked via __setGhIssueFileImpl — tests never shell out.
+{
+  const { sweepStaleRedrafts, __setSlackApiUrl, __setApprovalStateFile, __setGhIssueFileImpl, __setCurrentRepoOverride } = await import("./index.js");
+  const slack = new MockSlack();
+  __setSlackApiUrl(`http://localhost:${slack.port}`);
+  const dir = tmpDir();
+  const stateFile = join(dir, "seen.json");
+  __setApprovalStateFile(stateFile);
+  const approvalsFile = join(dir, "approvals.json");
+  const writeApprovals = (arr: any[]) => writeFileSync(approvalsFile, JSON.stringify(arr, null, 2));
+  const readApprovals = () => JSON.parse(readFileSync(approvalsFile, "utf-8"));
+  const HOUR = 3600_000;
+  const now = Date.now();
+  const iso = (msAgo: number) => new Date(now - msAgo).toISOString();
+  const captures: string[] = [];
+  const notify = (m: string) => { captures.push(m); };
+  // settle helpers read SLACK_BOT_TOKEN from env (shared helper contract)
+  process.env.SLACK_BOT_TOKEN = "xoxb-test";
+  try {
+    // (i) 2h-old changes_requested → surfaced with id/artifact/reviewer
+    writeApprovals([
+      { id: "apr-sweep-1", from_role: "product-implementer", artifact: "plan.md",
+        status: "changes_requested", reviewer: "product-strategist", feedback: "Rework the schema section",
+        feedback_at: iso(2 * HOUR) },
+    ]);
+    const r1 = await sweepStaleRedrafts({ file: approvalsFile, cwd: dir, now, notify });
+    assert(r1.surfaced === 1, `#158(i): stale entry surfaced (got ${r1.surfaced})`);
+    assert(r1.escalated === 0, "#158(i): 2h-old entry is not escalated");
+    const text1 = captures[captures.length - 1] ?? "";
+    assert(text1.includes("apr-sweep-1"), "#158(i): notify mentions the id");
+    assert(text1.includes("plan.md"), "#158(i): notify mentions the artifact");
+    assert(text1.includes("product-strategist"), "#158(i): notify mentions the reviewer");
+    assert(text1.includes("await redraft"), "#158(i): notify says await redraft");
+    assert(text1.includes("auto-escalate after 24h"), "#158(i): notify mentions the 24h auto-escalate");
+
+    // (ii) fresh (10min) → silent
+    captures.length = 0;
+    writeApprovals([
+      { id: "apr-sweep-2", from_role: "product-implementer", artifact: "plan.md",
+        status: "changes_requested", reviewer: "product-strategist", feedback: "Rework",
+        feedback_at: iso(10 * 60 * 1000) },
+    ]);
+    const r2 = await sweepStaleRedrafts({ file: approvalsFile, cwd: dir, now, notify });
+    assert(r2.surfaced === 0, `#158(ii): fresh entry silent (got ${r2.surfaced})`);
+    assert(captures.length === 0, "#158(ii): no notify for fresh entry");
+
+    // (iii) repo filtering: repo != current → hidden; == current → shown;
+    // no repo → shown tagged "(any repo)"
+    captures.length = 0;
+    __setCurrentRepoOverride("owner-a/repo-a");
+    writeApprovals([
+      { id: "apr-other", from_role: "product-implementer", artifact: "other.md",
+        status: "changes_requested", reviewer: "strat", feedback: "x", feedback_at: iso(2 * HOUR),
+        repo: "other-owner/other-repo" },
+      { id: "apr-ours", from_role: "product-implementer", artifact: "ours.md",
+        status: "changes_requested", reviewer: "strat", feedback: "x", feedback_at: iso(2 * HOUR),
+        repo: "owner-a/repo-a" },
+      { id: "apr-norepo", from_role: "product-implementer", artifact: "norepo.md",
+        status: "changes_requested", reviewer: "strat", feedback: "x", feedback_at: iso(2 * HOUR) },
+    ]);
+    const r3 = await sweepStaleRedrafts({ file: approvalsFile, cwd: dir, now, notify });
+    assert(r3.surfaced === 2, `#158(iii): only matching + no-repo surfaced (got ${r3.surfaced})`);
+    const text3 = captures[captures.length - 1] ?? "";
+    assert(!text3.includes("apr-other"), "#158(iii): other-repo entry hidden");
+    assert(text3.includes("apr-ours"), "#158(iii): matching-repo entry shown");
+    assert(text3.includes("apr-norepo"), "#158(iii): no-repo entry shown");
+    assert(text3.includes("(any repo)"), "#158(iii): no-repo entry tagged (any repo)");
+    assert(!text3.includes("apr-ours (any repo)"), "#158(iii): matching-repo entry NOT tagged (any repo)");
+    __setCurrentRepoOverride(undefined);
+
+    // (iv) 25h-old + repo → gh seam called with title/body, entry gains
+    // escalated_at + escalated_issue, message settled to the ⏱ banner
+    slack.requests = [];
+    captures.length = 0;
+    writeFileSync(stateFile, JSON.stringify({
+      "apr-ttl-1": { status: "changes_requested", ts: "100.001", channel: "#approvals" },
+    }, null, 2));
+    writeApprovals([
+      { id: "apr-ttl-1", from_role: "product-implementer", artifact: "plan.md",
+        status: "changes_requested", reviewer: "product-strategist",
+        feedback: "Rework the schema section", created_at: iso(30 * HOUR),
+        feedback_at: iso(25 * HOUR), repo: "owner-a/repo-a" },
+    ]);
+    let issueCall: any = null;
+    __setGhIssueFileImpl((o) => { issueCall = o; return { number: 42 }; });
+    const r4 = await sweepStaleRedrafts({ file: approvalsFile, cwd: dir, now, notify });
+    assert(issueCall !== null, "#158(iv): gh seam called for repo entry");
+    assert(issueCall.repo === "owner-a/repo-a", "#158(iv): issue filed in the entry's repo");
+    assert(issueCall.title === "Redraft requested: plan.md", "#158(iv): issue title");
+    assert(issueCall.body.includes("Rework the schema section"), "#158(iv): issue body has the feedback");
+    assert(issueCall.body.includes("product-strategist"), "#158(iv): issue body names the reviewer");
+    assert(issueCall.body.includes("apr-ttl-1"), "#158(iv): issue body has the approval id");
+    assert(issueCall.body.includes("Auto-escalated after 24h without pickup (agent-infra #158)"), "#158(iv): issue body has the auto-escalation note");
+    assert(r4.escalated === 1, `#158(iv): escalation counted (got ${r4.escalated})`);
+    assert(r4.surfaced === 0, "#158(iv): escalated entry not in the notify");
+    const after4 = readApprovals().find((a: any) => a.id === "apr-ttl-1");
+    assert(typeof after4?.escalated_at === "string", "#158(iv): escalated_at written");
+    assert(after4?.escalated_issue === 42, "#158(iv): escalated_issue written");
+    const upd4 = await waitFor(() => slack.requests.some((r: any) => r.url === "/chat.update"), 2000);
+    assert(upd4, "#158(iv): chat.update settles the message");
+    const upd4b = slack.requests.find((r: any) => r.url === "/chat.update")!;
+    const blocks4 = JSON.parse(upd4b.form.get("blocks")!);
+    assert(JSON.stringify(blocks4).includes("⏱ *Escalated to issue* — no session picked up this redraft within 24h"), "#158(iv): ⏱ escalated banner");
+    assert(JSON.stringify(blocks4).includes("https://github.com/owner-a/repo-a/issues/42"), "#158(iv): banner links the filed issue");
+    assert(!blocks4.some((b: any) => b.type === "actions"), "#158(iv): no buttons on the escalated banner");
+    // no double-fire: a second sweep never re-files
+    slack.requests = [];
+    issueCall = null;
+    __setGhIssueFileImpl((o) => { issueCall = o; return { number: 43 }; });
+    const r4b = await sweepStaleRedrafts({ file: approvalsFile, cwd: dir, now, notify });
+    assert(issueCall === null, "#158(iv): escalated entry never re-files");
+    assert(r4b.escalated === 0 && r4b.surfaced === 0, "#158(iv): second sweep fully quiet");
+    __setGhIssueFileImpl(null);
+
+    // (v) 25h-old, NO repo → no gh call, ⏱ Expired settle, escalated_reason
+    slack.requests = [];
+    writeFileSync(stateFile, JSON.stringify({
+      "apr-ttl-2": { status: "changes_requested", ts: "100.002", channel: "#approvals" },
+    }, null, 2));
+    writeApprovals([
+      { id: "apr-ttl-2", from_role: "product-implementer", artifact: "old.md",
+        status: "changes_requested", reviewer: "product-strategist", feedback: "Rework",
+        feedback_at: iso(25 * HOUR) },
+    ]);
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...a: any[]) => { warns.push(a.join(" ")); };
+    let issueCalls = 0;
+    __setGhIssueFileImpl(() => { issueCalls++; return { number: 1 }; });
+    try {
+      const r5 = await sweepStaleRedrafts({ file: approvalsFile, cwd: dir, now, notify });
+      assert(issueCalls === 0, "#158(v): no gh call without repo");
+      assert(r5.escalated === 1, `#158(v): expired escalation counted (got ${r5.escalated})`);
+      assert(r5.failures === 0, "#158(v): no failures");
+    } finally {
+      console.warn = origWarn;
+    }
+    const upd5 = await waitFor(() => slack.requests.some((r: any) => r.url === "/chat.update"), 2000);
+    assert(upd5, "#158(v): expired settle fires chat.update");
+    const blocks5 = JSON.parse(slack.requests.find((r: any) => r.url === "/chat.update")!.form.get("blocks")!);
+    assert(JSON.stringify(blocks5).includes("⏱ *Expired* — no repo recorded; re-request the approval"), "#158(v): ⏱ expired banner");
+    assert(!blocks5.some((b: any) => b.type === "actions"), "#158(v): no buttons on the expired banner");
+    assert(warns.some((w) => w.includes("no repo")), "#158(v): warn-log for no-repo expiry");
+    const after5 = readApprovals().find((a: any) => a.id === "apr-ttl-2");
+    assert(typeof after5?.escalated_at === "string", "#158(v): expired entry gets escalated_at");
+    assert(after5?.escalated_reason === "no_repo", "#158(v): escalated_reason = no_repo");
+    __setGhIssueFileImpl(null);
+
+    // (vi) escalated_at already set → skipped entirely
+    slack.requests = [];
+    writeApprovals([
+      { id: "apr-ttl-3", from_role: "product-implementer", artifact: "done.md",
+        status: "changes_requested", reviewer: "strat", feedback: "x",
+        feedback_at: iso(25 * HOUR), repo: "owner-a/repo-a",
+        escalated_at: iso(10 * HOUR), escalated_issue: 7 },
+    ]);
+    let calls6 = 0;
+    __setGhIssueFileImpl(() => { calls6++; return { number: 9 }; });
+    const r6 = await sweepStaleRedrafts({ file: approvalsFile, cwd: dir, now, notify });
+    assert(calls6 === 0, "#158(vi): escalated_at entry never re-files");
+    assert(r6.escalated === 0 && r6.surfaced === 0, "#158(vi): escalated_at entry fully skipped");
+    assert(!slack.requests.some((r: any) => r.url === "/chat.update"), "#158(vi): no settle for escalated_at entry");
+    const after6 = readApprovals().find((a: any) => a.id === "apr-ttl-3");
+    assert(after6?.escalated_issue === 7, "#158(vi): escalated entry untouched");
+    __setGhIssueFileImpl(null);
+
+    // (vii) gh failure → no escalated_at written (retry on next session start)
+    slack.requests = [];
+    writeApprovals([
+      { id: "apr-ttl-4", from_role: "product-implementer", artifact: "flaky.md",
+        status: "changes_requested", reviewer: "strat", feedback: "x",
+        feedback_at: iso(25 * HOUR), repo: "owner-a/repo-a" },
+    ]);
+    const warns7: string[] = [];
+    const origWarn7 = console.warn;
+    console.warn = (...a: any[]) => { warns7.push(a.join(" ")); };
+    __setGhIssueFileImpl(() => { throw new Error("gh rate limited"); });
+    let r7: any;
+    try {
+      r7 = await sweepStaleRedrafts({ file: approvalsFile, cwd: dir, now, notify });
+    } finally {
+      console.warn = origWarn7;
+    }
+    const after7 = readApprovals().find((a: any) => a.id === "apr-ttl-4");
+    assert(after7?.escalated_at === undefined, "#158(vii): gh failure → no escalated_at");
+    assert(after7?.escalated_issue === undefined, "#158(vii): gh failure → no escalated_issue");
+    assert(r7.failures === 1, `#158(vii): failure counted (got ${r7.failures})`);
+    assert(warns7.some((w) => w.includes("gh rate limited")), "#158(vii): failure warn-logged");
+    assert(!slack.requests.some((r: any) => r.url === "/chat.update"), "#158(vii): no settle on gh failure");
+    // next session start: gh healthy again → retried, escalated once
+    slack.requests = [];
+    __setGhIssueFileImpl(() => ({ number: 55 }));
+    const r7b = await sweepStaleRedrafts({ file: approvalsFile, cwd: dir, now, notify });
+    const after7b = readApprovals().find((a: any) => a.id === "apr-ttl-4");
+    assert(typeof after7b?.escalated_at === "string" && after7b?.escalated_issue === 55,
+      "#158(vii): retried and escalated on next sweep");
+    assert(r7b.escalated === 1, `#158(vii): retry escalation counted (got ${r7b.escalated})`);
+    __setGhIssueFileImpl(null);
+  } finally {
+    delete process.env.SLACK_BOT_TOKEN;
+    __setApprovalStateFile(null);
+    __setSlackApiUrl(null);
+    __setGhIssueFileImpl(null);
+    __setCurrentRepoOverride(undefined);
+    await slack.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── #158 wiring: session_start runs the sweep (notify via ctx.ui) ──
+{
+  const handlers = new Map<string, Function[]>();
+  const stubPi: any = {
+    on(name: string, fn: Function) {
+      if (!handlers.has(name)) handlers.set(name, []);
+      handlers.get(name)!.push(fn);
+    },
+  };
+  const uiNotes: string[] = [];
+  const dir = tmpDir();
+  const approvalsFile = join(dir, "approvals.json");
+  const HOUR = 3600_000;
+  writeFileSync(approvalsFile, JSON.stringify([
+    { id: "apr-wire-1", from_role: "product-implementer", artifact: "wire.md",
+      status: "changes_requested", reviewer: "product-strategist", feedback: "fix it",
+      feedback_at: new Date(Date.now() - 2 * HOUR).toISOString() },
+  ], null, 2));
+  const prevMode = process.env.PI_MODE;
+  const prevApprovalFile = process.env.SLACK_APPROVAL_FILE;
+  const prevApprovalDisable = process.env.SLACK_APPROVAL_DISABLE;
+  delete process.env.PI_MODE; // not print — hooks + sweep registered
+  process.env.SLACK_APPROVAL_FILE = approvalsFile;
+  delete process.env.SLACK_APPROVAL_DISABLE;
+  try {
+    slackBridge(stubPi);
+    const sstarts = handlers.get("session_start") ?? [];
+    assert(sstarts.length >= 1, "#158(wiring): session_start hooks registered");
+    const ctx: any = {
+      cwd: dir,
+      hasUI: true,
+      ui: { notify: (m: string) => uiNotes.push(m) },
+    };
+    // reason "ping" (not startup/reload/fork) → bridge routing no-ops; the
+    // sweep lives in the approval-wiring hook and still runs.
+    for (const h of sstarts) await h({ reason: "ping" }, ctx);
+    assert(uiNotes.some((m) => m.includes("apr-wire-1") && m.includes("wire.md")),
+      "#158(wiring): session_start surfaces the stale redraft via ctx.ui.notify");
+  } finally {
+    if (prevMode === undefined) delete process.env.PI_MODE;
+    else process.env.PI_MODE = prevMode;
+    if (prevApprovalFile === undefined) delete process.env.SLACK_APPROVAL_FILE;
+    else process.env.SLACK_APPROVAL_FILE = prevApprovalFile;
+    if (prevApprovalDisable === undefined) delete process.env.SLACK_APPROVAL_DISABLE;
+    else process.env.SLACK_APPROVAL_DISABLE = prevApprovalDisable;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ── Factory: explicit enablement logging (#40) ────────
 {
   const handlers = new Map<string, Function[]>();
