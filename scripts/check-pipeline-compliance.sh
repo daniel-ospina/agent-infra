@@ -19,10 +19,18 @@
 #                          OR the scoping comment contains a `Wiring` section
 #                          (wiring-check table, produced by writing-plans /
 #                          issue-scoping)
+#   e. TEST-COVERAGE EVID — PRs touching runtime code (extensions/**/*.ts
+#                          excluding *.test.ts, plus extensions/**/*.js and
+#                          bin/*.js) must show EITHER new/updated test files
+#                          (*.test.ts / *.test.js, any path) in the diff OR
+#                          test-run markers in PR body/commits (tests green,
+#                          N passed, N/N ratio, VGATE PASS, test suite,
+#                          pytest, npm test, vitest)
 #
 # Tier exemptions (deterministic, from issue labels):
-#   complexity:micro          → checks b–d skipped (a still required)
-#   no complexity:standard/…  → check d skipped (b, c still required)
+#   complexity:micro          → checks b–e skipped (a still required)
+#   no complexity:standard/…  → check d skipped (b, c, e still required)
+#   docs/skills/templates/config-only PR (no runtime code) → e skipped
 #
 # Every failure names the missing artifact AND the skill that produces it.
 # ALL failures are printed (not just the first). Exit codes:
@@ -155,6 +163,11 @@ run_checks() {
   local issue_number="" plan_file="" wiring_found="no"
   local is_micro=false is_stdcomplex=false
   local tier="unspecified"
+  local files_plain="" runtime_file="" test_evidence=""
+
+  # Plain filenames (status stripped) from the files fetch — shared by the
+  # plan-doc (d) and test-coverage (e) checks.
+  files_plain="$(printf '%s\n' "$FILES" | awk -F '\t' 'NF >= 2 { print $2 }' || true)"
 
   echo "=== Pipeline Compliance Gate ==="
   echo "PR:   $GH_REPO#$PR_NUMBER"
@@ -169,7 +182,7 @@ run_checks() {
     echo "      Missing: issue reference in PR body."
     echo "      Invoke:  issue-scoping — run it, then reference the issue when opening the PR."
     echo ""
-    echo "ℹ️  Checks b–d skipped: no linked issue to check against."
+    echo "ℹ️  Checks b–e skipped: no linked issue to check against."
     echo ""
     return "$FAILURES"
   fi
@@ -182,7 +195,7 @@ run_checks() {
 
   # b. SCOPING COMMENT — `<!-- issue-scoping:` marker on the issue.
   if [[ "$is_micro" == "true" ]]; then
-    echo "ℹ️  [b–d] Skipped: issue #$issue_number is complexity:micro (micro-tier exemption)."
+    echo "ℹ️  [b–e] Skipped: issue #$issue_number is complexity:micro (micro-tier exemption)."
     echo ""
   else
     if printf '%s' "$SCOPING_COMMENT" | grep -q '<!-- issue-scoping:'; then
@@ -205,7 +218,7 @@ run_checks() {
 
     # d. PLAN DOC — standard/complex only.
     if [[ "$is_stdcomplex" == "true" ]]; then
-      plan_file="$(printf '%s\n' "$FILES" | grep -E '^docs/plans/.*\.md$' | head -1 || true)"
+      plan_file="$(printf '%s\n' "$files_plain" | grep -E '^docs/plans/.*\.md$' | head -1 || true)"
       if printf '%s' "$SCOPING_COMMENT" | grep -qi 'wiring'; then wiring_found="yes"; fi
       if [[ -n "$plan_file" ]]; then
         pass d "plan doc in PR ($plan_file)"
@@ -218,6 +231,29 @@ run_checks() {
       fi
     else
       echo "ℹ️  [d] Skipped: issue #$issue_number has no complexity:standard/complex label — plan doc not required."
+    fi
+
+    # e. TEST-COVERAGE EVIDENCE — code-review Step 0. PRs touching runtime
+    # code (extensions/**/*.ts excluding *.test.ts, plus extensions/**/*.js
+    # and bin/*.js) must show EITHER test file changes in the diff
+    # (*.test.ts / *.test.js added or modified, any path) OR explicit
+    # test-run markers in the PR body / commit messages. PRs whose diff is
+    # only docs/skills/templates/config (no runtime code) are exempt.
+    runtime_file="$(printf '%s\n' "$files_plain" | grep -E '^(extensions/.*\.(ts|js)|bin/.*\.js)$' | grep -vE '\.test\.(ts|js)$' | head -1 || true)"
+    if [[ -z "$runtime_file" ]]; then
+      echo "ℹ️  [e] Skipped: no runtime code changes (extensions/**/*.ts|js, bin/*.js) in this PR."
+    else
+      test_evidence="$(printf '%s\n' "$FILES" | awk -F '\t' '$1 == "added" || $1 == "modified" { print $2 }' | grep -E '\.test\.(ts|js)$' | head -1 || true)"
+      if [[ -n "$test_evidence" ]]; then
+        pass e "test coverage evidence: test file change in diff ($test_evidence)"
+      elif printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS" | grep -qiE 'tests[[:space:]]+green|[0-9]+[[:space:]]+passed|[0-9]+/[0-9]+|VGATE[[:space:]]+PASS|test[[:space:]]+suite|pytest|npm[[:space:]]+test|vitest'; then
+        pass e "test coverage evidence: test-run markers in PR body/commits"
+      else
+        fail e "no test coverage evidence — this PR changes runtime code ($runtime_file) but shows no sign that tests were run."
+        echo "      Accepts: new/updated *.test.ts / *.test.js files in the diff, or markers in PR body/commits (tests green, N passed, N/N, VGATE PASS, test suite, pytest, npm test, vitest)."
+        echo "      Missing: test run evidence for the changed runtime code."
+        echo "      Invoke:  code-review (Step 0 — test coverage) — run the tests and record evidence in a commit message / the PR body; test-writing adds the missing tests."
+      fi
     fi
     echo ""
   fi
@@ -232,7 +268,7 @@ summarize() {
     echo "   Fix the items above, then re-run. Each failure names the missing artifact and the skill that produces it."
     return 1
   fi
-  echo "✅ PIPELINE COMPLIANCE: PASS — scoping/review/plan evidence present."
+  echo "✅ PIPELINE COMPLIANCE: PASS — scoping/review/plan/test evidence present."
   return 0
 }
 
@@ -246,8 +282,9 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → search for '<!-- issue-scoping:' marker"
   echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
   echo "  d. PLAN DOC          gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → docs/plans/*.md change, or 'Wiring' in scoping comment (complexity:standard/complex only)"
+  echo "  e. TEST-COVERAGE EVID gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → runtime code changes (extensions/**/*.ts excl. *.test.ts, extensions/**/*.js, bin/*.js) need test files in the diff or test-run markers in PR body/commits"
   echo ""
-  echo "Exemptions: complexity:micro label skips b–d; no standard/complex label skips d."
+  echo "Exemptions: complexity:micro label skips b–e; no standard/complex label skips d; docs/skills/templates/config-only PRs (no runtime code) skip e."
   echo "Exit: 0 (compliant, simulated)."
   echo "For failure-path simulation: PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1"
   exit 0
@@ -255,7 +292,7 @@ fi
 
 # ── Failure simulation (offline test of failure output paths) ───────────────
 if [[ "$FAIL_ALL" == "1" ]]; then
-  # Pass 1: no linked issue → a fails, b–d skipped.
+  # Pass 1: no linked issue → a fails, b–e skipped.
   echo "== SIMULATION: all-failures pass 1 of 2 (no linked issue) =="
   PR_BODY=""; LABELS=""; SCOPING_COMMENT=""; COMMIT_MSGS=""; FILES=""
   FAILURES=0
@@ -263,10 +300,12 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   summarize || true
 
   # Pass 2: standard/complex issue, all evidence missing → a passes (keyword
-  # parser exercised), b/c/d fail.
+  # parser exercised), b/c/d/e fail. FILES includes a runtime-code change so
+  # check e runs (and fails) rather than being skipped.
   echo ""
   echo "== SIMULATION: all-failures pass 2 of 2 (standard/complex issue, no evidence) =="
-  PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""; COMMIT_MSGS=""; FILES=""
+  PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""; COMMIT_MSGS=""
+  FILES=$'added\textensions/example/sample.ts'
   FAILURES=0
   run_checks || true
   summarize || true
@@ -276,7 +315,7 @@ fi
 # ── Live run ────────────────────────────────────────────────────────────────
 PR_BODY="$(fetch_json "pulls/$PR_NUMBER" '.body // ""')"
 
-# Resolve the linked issue (needed before the b–d fetches can run).
+# Resolve the linked issue (needed before the b–e fetches can run).
 LIVE_ISSUE="$(extract_issue "$PR_BODY")"
 LABELS=""
 SCOPING_COMMENT=""
@@ -285,7 +324,9 @@ if [[ -n "$LIVE_ISSUE" ]]; then
   SCOPING_COMMENT="$(fetch_json "issues/$LIVE_ISSUE/comments" '.[].body' 1)"
 fi
 COMMIT_MSGS="$(fetch_json "pulls/$PR_NUMBER/commits" '.[].commit.message' 1)"
-FILES="$(fetch_json "pulls/$PR_NUMBER/files" '.[].filename' 1)"
+# Files fetched as "status<TAB>filename" — check e needs the status to count
+# only added/modified test files as evidence; checks d/e derive plain names.
+FILES="$(fetch_json "pulls/$PR_NUMBER/files" '.[] | "\(.status)\t\(.filename)"' 1)"
 
 run_checks || true
 summarize

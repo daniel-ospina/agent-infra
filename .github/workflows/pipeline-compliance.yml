@@ -1,0 +1,63 @@
+name: Pipeline Compliance
+# Deterministic (no-LLM) CI gate — verifies a PR followed the agent pipeline
+# (issue-scoping → plan → code-review) before merge. Runs the
+# scripts/check-pipeline-compliance.sh gate. Independent job: no `needs`,
+# runs alongside other CI and reports its own check status.
+#
+# DOGFOOD COPY — agent-infra runs its own gate (issue #145). Adapted from
+# templates/.github/workflows/pipeline-compliance.yml for THIS repo:
+#   * Job name is `pipeline-compliance` — main branch protection requires
+#     EXACTLY this check context. Keep the name stable: renaming the job
+#     silently disables the required check.
+#   * `pull_request` trigger scoped to PRs targeting main (where branch
+#     protection applies). `workflow_call` is kept so consumer repos can
+#     reuse this file directly (thin caller + `uses: ...@main`).
+#   * The script lives IN this repo (scripts/check-pipeline-compliance.sh):
+#     the gate runs the checked-out copy, so a PR's script changes are
+#     tested by the gate itself. No auto-fetch — a missing script is a hard
+#     error, not a reason to fetch the main-branch copy.
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        type: string
+        required: false
+        description: 'PR number to gate (required when called via workflow_call).'
+      repo:
+        type: string
+        required: false
+        description: 'owner/repo to check against. Defaults to github.repository.'
+      skip:
+        type: boolean
+        required: false
+        default: false
+        description: 'Emergency override — skip the gate with a loud warning.'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  pipeline-compliance:
+    name: pipeline-compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run pipeline compliance gate
+        env:
+          GH_REPO: ${{ inputs.repo || github.repository }}
+          PR_NUMBER: ${{ inputs.pr-number || github.event.pull_request.number }}
+          PIPELINE_COMPLIANCE_SKIP: ${{ inputs.skip && '1' || '0' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/check-pipeline-compliance.sh ]; then
+            echo "❌ scripts/check-pipeline-compliance.sh missing from checkout — agent-infra owns this gate; refusing to fetch." >&2
+            exit 2
+          fi
+          bash scripts/check-pipeline-compliance.sh
