@@ -513,7 +513,13 @@ export default function (pi: ExtensionAPI) {
         const stderrClean = cleanStderr(stderr.trim()).slice(-4000);
         const errInfo = stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "";
         if (code === 0 && stdout.trim()) {
-          doResolve({ content: [{ type: "text", text: stdout.trim() + errInfo }], details: { model, provider } });
+          // #134: clean exit → content carries stdout ONLY. The stderr tail is
+          // transport noise (startup banners, MCP connect, gate-bypass events)
+          // that contaminates structured task output for JSON-parsing consumers
+          // (#132 bug class). It moves to `details.stderr` for diagnostics.
+          const details: Record<string, unknown> = { model, provider };
+          if (stderrClean) details.stderr = stderrClean;
+          doResolve({ content: [{ type: "text", text: stdout.trim() }], details });
         } else {
           const output = stdout.trim();
           const text = output || stderr.trim() || `Sub-agent exited with code ${code}`;

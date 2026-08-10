@@ -13,11 +13,14 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 // #36: shared sub-agent PATH augmentation (python3 resolution for MCP servers)
 import { getSubAgentPath } from "../builtin-tools/index.js";
+// #137: recursive process-tree kill for abort/timeout (orphan MCP reaping)
+import { treeKill } from "../shared/tree-kill.js";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -148,7 +151,7 @@ interface UsageStats {
 	turns: number;
 }
 
-interface SingleResult {
+export interface SingleResult {
 	agent: string;
 	agentSource: "user" | "project" | "unknown";
 	task: string;
@@ -160,6 +163,8 @@ interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
+	/** #137: directory where this result was cached (see getCacheDir). */
+	cachePath?: string;
 }
 
 interface SubagentDetails {
@@ -181,15 +186,96 @@ function getFinalOutput(messages: Message[]): string {
 	return "";
 }
 
-function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+export function isFailedResult(result: SingleResult): boolean {
+	return (
+		result.exitCode !== 0 ||
+		result.stopReason === "error" ||
+		result.stopReason === "aborted" ||
+		// #137: per-task timeout is a failure — the worker was killed, not done.
+		result.stopReason === "timeout"
+	);
 }
 
-function getResultOutput(result: SingleResult): string {
-	if (isFailedResult(result)) {
-		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+export function getResultOutput(result: SingleResult): string {
+	if (!isFailedResult(result)) {
+		return getFinalOutput(result.messages) || "(no output)";
 	}
-	return getFinalOutput(result.messages) || "(no output)";
+	// #137: abort/timeout results — surface the worker's own output over the
+	// generic interrupt message so a completed/partial result is never masked
+	// (an Escape after completion must not hide the finished worker's work).
+	if (
+		result.stopReason === "aborted" ||
+		result.stopReason === "timeout" ||
+		result.stopReason === "completed_before_abort"
+	) {
+		const output = getFinalOutput(result.messages);
+		if (output) return output;
+	}
+	return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+}
+
+// ── #137 abort/timeout decision functions (pure, unit-tested) ──────────
+
+/**
+ * #137 F3: the abort handler is a no-op when the process already exited
+ * (`proc.exitCode !== null`). Prevents an Escape arriving after worker
+ * completion from killing anything or marking the run as aborted.
+ */
+export function shouldAbortBeNoop(procExitCode: number | null, wasAborted: boolean): boolean {
+	return wasAborted && procExitCode !== null;
+}
+
+/**
+ * #137 F4: an abort only counts as such when the process did NOT exit
+ * cleanly. exitCode 0 (clean exit — abort arrived after completion) is
+ * never an abort; null (signal-killed) or non-zero is. Replaces the old
+ * unconditional `throw new Error("Subagent was aborted")`.
+ */
+export function shouldThrowOnAbort(procExitCode: number | null, wasAborted: boolean): boolean {
+	return wasAborted && procExitCode !== 0;
+}
+
+/** #137 F1: per-task timeout, env-overridable. 0/negative/NaN → disabled. */
+export const DEFAULT_TASK_TIMEOUT_MS = 1_800_000;
+
+export function getTaskTimeoutMs(raw: string | undefined = process.env.SUBAGENT_TASK_TIMEOUT_MS): number {
+	if (raw === undefined || raw.trim() === "") return DEFAULT_TASK_TIMEOUT_MS;
+	const n = Number(raw);
+	// 0, negative, or non-numeric → disabled (backward compat; garbage env
+	// input must never kill productive agents instantly).
+	if (!Number.isFinite(n) || n <= 0) return 0;
+	return n;
+}
+
+// ── #137 F6: result caching to disk (defense in depth) ──────────────────
+
+/**
+ * Cache directory for a dispatch: `~/.pi/agent/task-results/<sha256>` where
+ * the digest is over `agent|task|timestamp`. Collision-tolerant (the
+ * timestamp makes dispatches unique).
+ */
+export function getCacheDir(agent: string, task: string, timestamp: number = Date.now()): string {
+	const digest = createHash("sha256").update(`${agent}|${task}|${timestamp}`).digest("hex");
+	return path.join(os.homedir(), ".pi", "agent", "task-results", digest);
+}
+
+/**
+ * Fire-and-forget result cache write — never on the critical path, never
+ * rejects the caller. The orchestrator (an LLM) can read `result.json` to
+ * recover a completed worker's output after an abort/timeout.
+ */
+export function cacheResult(dir: string, result: SingleResult): void {
+	try {
+		const filePath = path.join(dir, "result.json");
+		fs.promises
+			.mkdir(dir, { recursive: true })
+			.then(() => fs.promises.writeFile(filePath, JSON.stringify(result, null, 2), "utf-8"))
+			.catch(() => {
+				// Fire-and-forget: caching must never fail the dispatch.
+			});
+	} catch {
+		// Sync construction errors — ignore.
+	}
 }
 
 function truncateParallelOutput(output: string): string {
@@ -248,7 +334,7 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 	return { dir: tmpDir, filePath };
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
+export function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
 	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
@@ -266,7 +352,7 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
-async function runSingleAgent(
+export async function runSingleAgent(
 	defaultCwd: string,
 	agents: AgentConfig[],
 	agentName: string,
@@ -312,6 +398,9 @@ async function runSingleAgent(
 		step,
 	};
 
+	// #137 F6: every completed dispatch (success/failure/timeout/abort) is
+	// cached to disk so the orchestrator can recover the worker's output.
+	const cacheDir = getCacheDir(agentName, task);
 	const emitUpdate = () => {
 		if (onUpdate) {
 			onUpdate({
@@ -331,15 +420,21 @@ async function runSingleAgent(
 
 		args.push(`Task: ${task}`);
 		let wasAborted = false;
+		let timedOut = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
 			// #36: Ensure sub-agent PATH includes common python3 locations
 			// so MCP servers using bare `python3` resolve.
 			const augmentedPath = getSubAgentPath();
+			// #137 F8: detached spawn gives the sub-agent its own process group,
+			// so treeKill can signal it (and its MCP server children) without
+			// ever signalling the orchestrator. Opt out via SUBAGENT_DETACHED=0.
+			const detached = process.env.SUBAGENT_DETACHED !== "0";
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				shell: false,
+				detached,
 				stdio: ["ignore", "pipe", "pipe"],
 				env: { ...process.env, PATH: augmentedPath },
 			});
@@ -354,6 +449,40 @@ async function runSingleAgent(
 					emitUpdate();
 				}
 			}, HEARTBEAT_MS);
+
+			// #137 F1: per-task hard cap for hung workers. When it fires the
+			// process tree is killed (SIGTERM → 5s → SIGKILL) and the result is
+			// returned with stopReason "timeout". 0 disables (backward compat).
+			const taskTimeoutMs = getTaskTimeoutMs();
+			let taskTimeout: NodeJS.Timeout | undefined;
+			if (taskTimeoutMs > 0) {
+				taskTimeout = setTimeout(() => {
+					if (wasAborted) return; // abort already in progress — it owns the kill
+					if (proc.exitCode !== null || proc.killed) return; // already exited
+					timedOut = true;
+					killTree("SIGTERM");
+				}, taskTimeoutMs);
+			}
+
+			// #137 F8: recursive process-group kill — children (MCP servers)
+			// die before the sub-agent itself, so aborted sessions leave no
+			// orphans. SIGKILL fallback after 5s mirrors the old kill sequence.
+			const killTree = (signal: NodeJS.Signals) => {
+				const pid = proc.pid;
+				if (pid !== undefined) {
+					treeKill(pid, signal);
+				} else {
+					proc.kill(signal);
+				}
+				const sigkillTimer = setTimeout(() => {
+					if (proc.exitCode === null && !proc.killed) {
+						if (pid !== undefined) treeKill(pid, "SIGKILL");
+						else proc.kill("SIGKILL");
+					}
+				}, 5000);
+				sigkillTimer.unref?.();
+				proc.once("close", () => clearTimeout(sigkillTimer));
+			};
 
 			let buffer = "";
 
@@ -407,21 +536,44 @@ async function runSingleAgent(
 
 			proc.on("close", (code) => {
 				clearInterval(heartbeat);
+				if (taskTimeout) clearTimeout(taskTimeout);
 				if (buffer.trim()) processLine(buffer);
+				// #137: settle stopReason from the RAW close code — null (killed by
+				// signal) is distinct from 0 (clean exit); resolve() below collapses
+				// null → 0 for the exitCode field.
+				if (timedOut) {
+					currentResult.stopReason = "timeout";
+				} else if (wasAborted) {
+					if (shouldThrowOnAbort(code, wasAborted)) {
+						currentResult.stopReason = "aborted";
+						currentResult.errorMessage = `Subagent was aborted (user-initiated). Result cache: ${cacheDir}`;
+					} else {
+						// Abort arrived after the worker exited cleanly — the result
+						// is valid and must not be discarded (F4).
+						currentResult.stopReason = "completed_before_abort";
+					}
+				}
+				// F2: one final update after close so the core's streaming display
+				// receives a terminal state instead of an endless spinner.
+				emitUpdate();
 				resolve(code ?? 0);
 			});
 
 			proc.on("error", () => {
+				clearInterval(heartbeat);
+				if (taskTimeout) clearTimeout(taskTimeout);
 				resolve(1);
 			});
 
 			if (signal) {
+				// #137 F3: abort is a no-op when the process already exited or a
+				// timeout already killed it. F4: after close we return a result
+				// record instead of throwing, so completed work is never lost.
 				const killProc = () => {
+					if (timedOut) return;
+					if (shouldAbortBeNoop(proc.exitCode, wasAborted)) return;
 					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
+					killTree("SIGTERM");
 				};
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
@@ -429,7 +581,10 @@ async function runSingleAgent(
 		});
 
 		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		currentResult.cachePath = cacheDir;
+		// F6: persist the result (success, failure, timeout, or abort) before
+		// returning — the orchestrator can recover it from disk if needed.
+		cacheResult(cacheDir, currentResult);
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -569,17 +724,37 @@ export default function (pi: ExtensionAPI) {
 							}
 						: undefined;
 
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-					);
+					// #137 F5: runSingleAgent never throws on abort, but network/OS
+					// failures can still surface — convert to a failed result and
+					// keep the chain's previously accumulated steps.
+					let result: SingleResult;
+					try {
+						result = await runSingleAgent(
+							ctx.cwd,
+							agents,
+							step.agent,
+							taskWithContext,
+							step.cwd,
+							i + 1,
+							signal,
+							chainUpdate,
+							makeDetails("chain"),
+						);
+					} catch (err) {
+						const message = err instanceof Error ? err.message : String(err);
+						result = {
+							agent: step.agent,
+							agentSource: "unknown",
+							task: taskWithContext,
+							exitCode: 1,
+							messages: [],
+							stderr: message,
+							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+							stopReason: "error",
+							errorMessage: message,
+							step: i + 1,
+						};
+					}
 					results.push(result);
 
 					const isError = isFailedResult(result);
@@ -641,23 +816,41 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t: (typeof params.tasks)[number], index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-					);
+					// #137 F5: never let one task's throw drop the batch — synthesize
+					// an error result and keep every other task's outcome.
+					let result: SingleResult;
+					try {
+						result = await runSingleAgent(
+							ctx.cwd,
+							agents,
+							t.agent,
+							t.task,
+							t.cwd,
+							undefined,
+							signal,
+							// Per-task update callback
+							(partial) => {
+								if (partial.details?.results[0]) {
+									allResults[index] = partial.details.results[0];
+									emitParallelUpdate();
+								}
+							},
+							makeDetails("parallel"),
+						);
+					} catch (err) {
+						const message = err instanceof Error ? err.message : String(err);
+						result = {
+							agent: t.agent,
+							agentSource: "unknown",
+							task: t.task,
+							exitCode: 1,
+							messages: [],
+							stderr: message,
+							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+							stopReason: "error",
+							errorMessage: message,
+						};
+					}
 					allResults[index] = result;
 					emitParallelUpdate();
 					return result;
@@ -683,17 +876,34 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
-				const result = await runSingleAgent(
-					ctx.cwd,
-					agents,
-					params.agent,
-					params.task,
-					params.cwd,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-				);
+				let result: SingleResult;
+				try {
+					result = await runSingleAgent(
+						ctx.cwd,
+						agents,
+						params.agent,
+						params.task,
+						params.cwd,
+						undefined,
+						signal,
+						onUpdate,
+						makeDetails("single"),
+					);
+				} catch (err) {
+					// #137 F5: never throw — surface as a failed result.
+					const message = err instanceof Error ? err.message : String(err);
+					result = {
+						agent: params.agent,
+						agentSource: "unknown",
+						task: params.task,
+						exitCode: 1,
+						messages: [],
+						stderr: message,
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+						stopReason: "error",
+						errorMessage: message,
+					};
+				}
 				const isError = isFailedResult(result);
 				if (isError) {
 					const errorMsg = getResultOutput(result);
