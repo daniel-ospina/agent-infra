@@ -1,6 +1,8 @@
+> **Canonical:** `agent-infra/skills/google-slides/brand-adapter.md` — consumers hard-link into `operations/skills`. Token path below is agent-infra-relative; in consumer repos resolve via `$SKILLS_PREFIX` (default `operations/skills/`).
+
 # Brand Token Adapter for Google Slides
 
-Maps El Dato brand tokens (`operations/skills/carousel-b2b-design/scripts/tokens.json`) to Google Slides theming via Composio `BATCH_UPDATE` operations.
+Maps El Dato brand tokens (`skills/carousel-b2b-design/scripts/tokens.json` — canonical agent-infra path) to Google Slides theming via Composio `BATCH_UPDATE` operations.
 
 ## Color Mapping
 
