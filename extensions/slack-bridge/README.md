@@ -25,6 +25,7 @@ Zero runtime dependencies beyond Node stdlib.
 | `SLACK_BRIDGE_THREAD_TS` / `SLACK_BRIDGE_TEAM` / `SLACK_BRIDGE_ROLE` | Slack-spawned sessions: bind to an existing thread with a fixed team/role. | routing |
 | `SLACK_ESCALATION_CHANNEL` | `[loop-enforcer]` escalation posts go to this channel instead of the session thread. | routing |
 | `SLACK_BOT_TOKEN` | Bot token (`xoxb-…`) with `chat:write` scope. **Also used by approval forwarding.** | routing (via daemon), **approval** |
+| `SLACK_APP_TOKEN` | App-level token (`xapp-…`) with `connections:write` scope. Enables the Socket Mode receiver for approval button callbacks (agent-infra #146). | approval buttons |
 | `SLACK_APPROVAL_CHANNEL` | Channel for approval notifications (e.g. `#approvals`). | approval |
 | `SLACK_CHANNEL` | Fallback channel if `SLACK_APPROVAL_CHANNEL` is unset. | approval |
 | `SLACK_APPROVAL_DISABLE=1` | Kill switch for approval forwarding. | — |
@@ -92,24 +93,38 @@ working directory, the first of `<dir>/operations/coordination/approvals.json`
 or `<dir>/swarm/operations/coordination/approvals.json` wins — this covers
 running pi from any workspace while the approvals live in the swarm repo.
 
-### Interactive buttons — current limitation (TODO #40-follow-up)
+### Interactive buttons — Socket Mode receiver (agent-infra #146)
 
-The Accept/Reject buttons are attached to the message, but **button clicks are
-currently inert**: handling interactivity requires a receiver pi cannot host
-in this environment — either Slack **Socket Mode**
-(`SLACK_APP_SOCKET_TOKEN` + a websocket client) or a **public HTTPS endpoint**
-Slack can POST interactivity payloads to. The wiring point is
-`handleApprovalCallback()` in `index.ts` (stubbed with a clear TODO).
+When `SLACK_APP_TOKEN` (an `xapp-...` token) is set, the extension connects to
+Slack via **Socket Mode** (WebSocket) and receives the interactive
+`block_actions` payloads — the ✅ Accept / ❌ Reject button clicks from approval
+messages. The receiver is env-gated: **without the token it never starts** and
+behavior is identical to before (verdicts flow via `approvals.json` polling).
 
-Until a receiver exists, decisions flow through the file: the human approves
-via the existing channel (e.g. the agent runs `review_approval(req_id, …)`,
-or the osascript dialog in the swarm router), and the extension mirrors the
-verdict into the Slack thread automatically.
+**Setup:**
+1. Go to https://api.slack.com/apps → your app → **Socket Mode** → toggle **Enable Socket Mode**
+2. **Basic Information** → **App-Level Tokens** → generate one with `connections:write` scope
+3. Export: `export SLACK_APP_TOKEN=xapp-...`
+
+The receiver handles the full Socket Mode protocol: opens a WebSocket via
+`apps.connections.open` (fresh URL on every reconnect — Slack rotates them),
+ACKs every envelope within the ~3s deadline, parses `block_actions`, and
+writes verdicts through the same `approvals.json` contract the file-polling
+path uses, recording who clicked (`payload.user.id`) as the reviewer.
+Deduplication is guaranteed via `~/.pi/agent/slack-approval-seen.json`:
+if a verdict arrives via both button click and file write, only one update is
+posted to the Slack thread.
+
+Connection drops and API errors are logged and retried with exponential
+backoff (1s base, 60s cap); the receiver stops cleanly on `session_shutdown`
+and never crashes the pi session. Without `SLACK_APP_TOKEN`: zero behavior
+change — `handleApprovalCallback()` remains the (superseded) direct-call stub.
 
 ## Tests
 
 ```bash
 npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 102 asserts (self-check)
+npx tsx extensions/slack-bridge/socket-mode.test.ts    # 64 asserts (Socket Mode receiver, mock WS server)
 npx tsx extensions/slack-bridge/chunker.test.ts        # 21 asserts
 ```
 
