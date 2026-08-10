@@ -265,6 +265,31 @@ function getAllowedServers(): Set<string> | undefined {
 
 class McpServerManager {
   private connections: McpConnection[] = [];
+  // #92: serverName → stdio child pid, captured at connect time (the SDK's
+  // `pid` getter returns null as soon as close() starts, so it can't be read
+  // later). Used to force-kill orphaned transports when disconnectAll times
+  // out or pi exits without a clean session shutdown.
+  private transportPids = new Map<string, number>();
+
+  constructor() {
+    // #92: last-resort synchronous sweep — if the process exits without
+    // session_shutdown, force-kill any still-tracked stdio children so they
+    // can't outlive pi. 'exit' handlers can't await, so this is a direct
+    // SIGKILL; on normal exits disconnectAll clears the map first.
+    process.on("exit", () => {
+      for (const [serverName, pid] of this.transportPids) {
+        try {
+          process.kill(pid, 0); // existence probe — throws if already gone
+          process.kill(pid, "SIGKILL");
+          console.log(
+            `[mcp-client] killed orphaned transport for '${serverName}' (pid ${pid}) on process exit`
+          );
+        } catch {
+          /* already gone */
+        }
+      }
+    });
+  }
 
   async connectAll(mcpJsonPath: string): Promise<void> {
     let config: McpJson;
@@ -374,6 +399,15 @@ class McpServerManager {
     // Connect with timeout
     await connectWithTimeout(name, client, transport, timeoutMs);
 
+    // #92: remember the stdio child pid for the orphan-kill path. Must be
+    // captured here, right after connect: the SDK's pid getter reads the
+    // private _process field, which is cleared as soon as close() begins.
+    // URL-based transports spawn no child process.
+    if (transport instanceof StdioClientTransport) {
+      const pid = transport.pid;
+      if (pid !== null) this.transportPids.set(name, pid);
+    }
+
     this.connections.push({ client, serverName: name });
   }
 
@@ -482,10 +516,12 @@ class McpServerManager {
     // process exit when MCP servers never connected (e.g., python3 ENOENT).
     const DISCONNECT_TIMEOUT_MS = 5000;
     for (const { client, serverName } of this.connections) {
+      let timedOut = false;
       try {
         const closeOp = client.close();
         const timeout = new Promise<void>((resolve) =>
           setTimeout(() => {
+            timedOut = true;
             console.log(
               `[mcp-client] Disconnect from '${serverName}' timed out after ${DISCONNECT_TIMEOUT_MS}ms — forcing`
             );
@@ -493,12 +529,61 @@ class McpServerManager {
           }, DISCONNECT_TIMEOUT_MS)
         );
         await Promise.race([closeOp, timeout]);
+        if (timedOut) {
+          // #92: the race above resolved, but the hung transport child is
+          // still around — kill it so no orphan MCP process outlives pi.
+          await this.killOrphanedTransport(serverName);
+        }
         console.log(`[mcp-client] Disconnected from '${serverName}'`);
       } catch {
         // Best effort — never block process exit
       }
     }
+    this.transportPids.clear();
     this.connections = [];
+  }
+
+  /**
+   * #92: Force-kill the stdio child process of a transport whose close()
+   * hung. SIGTERM first, a 2s grace period, then SIGKILL if still alive.
+   * Every step is guarded — the child may already have exited (e.g. the SDK
+   * finished killing it after the race resolved), and kill() on a dead pid
+   * throws ESRCH.
+   */
+  private async killOrphanedTransport(serverName: string): Promise<void> {
+    const pid = this.transportPids.get(serverName);
+    if (pid === undefined) return; // URL transport or no child tracked
+    const GRACE_MS = 2000;
+
+    const isAlive = (): boolean => {
+      try {
+        process.kill(pid, 0); // existence probe, no signal sent
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    if (!isAlive()) return; // already exited — nothing to kill
+
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      return; // exited between the probe and the kill
+    }
+
+    await new Promise<void>((resolve) => setTimeout(resolve, GRACE_MS));
+
+    if (isAlive()) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        return; // exited during the grace period
+      }
+    }
+    console.log(
+      `[mcp-client] killed orphaned transport for '${serverName}' (pid ${pid})`
+    );
   }
 }
 
