@@ -25,6 +25,12 @@ import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { chunk } from "./chunker.ts";
+import {
+  isSocketModeEnabled,
+  startSocketModeReceiver,
+  stopSocketModeReceiver,
+  type SocketModeState,
+} from "./socket-mode.ts";
 
 // ── Types ────────────────────────────────────────────
 
@@ -71,6 +77,10 @@ let lastAttempt = 0;
 let consecutiveFails = 0;
 let selectInProgress = false;
 let httpServer: Server | null = null;
+// Socket Mode receiver state (#146) — module-level (not a factory closure) so
+// it survives /reload: session_shutdown stops the old receiver, session_start
+// starts a fresh one, and re-registration can't orphan a running connection.
+let socketState: SocketModeState | null = null;
 let lastPostedMessageIdx = -1; // ponytail: dedup index for loop-enforcer output
 const CYCLE_BUFFER_FLUSH = 3; // ponytail: batch N cycles before posting summary
 const cycleBuffer: { slug: string; cycles: number; text: string }[] = [];
@@ -328,12 +338,12 @@ export async function flushCycleBuffer(): Promise<void> {
 // (SLACK_APPROVAL_DISABLE=1) and its own enablement conditions (token +
 // channel). Every enablement decision is logged explicitly at startup.
 //
-// Response path: Accept/Reject buttons are attached to the message, but
-// interactive callbacks need a receiver pi can't host here (Slack Socket Mode
-// or a public HTTPS endpoint) — see handleApprovalCallback() TODO #40-follow-up.
-// Until then, decisions flow back through the file: swarm's review_approval()
-// writes the verdict to approvals.json and scanApprovals() mirrors it into
-// the Slack thread.
+// Response path: Accept/Reject button clicks are handled by the Socket Mode
+// receiver (socket-mode.ts, agent-infra #146) when SLACK_APP_TOKEN is set —
+// the verdict lands in approvals.json and scanApprovals() mirrors it into the
+// thread. Without the token, decisions flow back through the file: swarm's
+// review_approval() writes the verdict to approvals.json and scanApprovals()
+// mirrors it into the Slack thread.
 
 interface ApprovalRequest {
   id: string;
@@ -616,20 +626,22 @@ export async function scanApprovals(opts?: {
 }
 
 /**
- * Interactive callback receiver — STUB (agent-infra #40 follow-up).
- * Accept/Reject buttons in Slack fire a POST to a receiver; pi can't host one
- * without either Slack Socket Mode (SLACK_APP_SOCKET_TOKEN + a ws client) or
- * a public HTTPS endpoint Slack can reach. Neither is available in this
- * environment, so button clicks are currently inert. Decisions flow through
- * approvals.json instead (see scanApprovals). Wire a real receiver here when
- * the infrastructure exists.
+ * Interactive callback receiver — superseded (agent-infra #146).
+ * Button clicks are now handled by the Socket Mode receiver in
+ * socket-mode.ts: when SLACK_APP_TOKEN (xapp-...) is set, block_actions
+ * payloads arrive over WebSocket and verdicts flow into approvals.json
+ * through the same contract scanApprovals reads. This stub remains exported
+ * for code paths that call it directly (tests, legacy callers) and always
+ * reports the superseded status instead of silently pretending to handle
+ * callbacks. The file-polling path (review_approval) is untouched and works
+ * with or without Socket Mode.
  */
 export async function handleApprovalCallback(payload: any): Promise<{ ok: boolean; note?: string }> {
   const action = payload?.actions?.[0];
   if (!action) return { ok: false, note: "no action in payload" };
   return {
     ok: false,
-    note: `callback receiver not implemented (action=${action.action_id}); decisions flow via approvals.json — see TODO #40-follow-up`,
+    note: `handleApprovalCallback is superseded by the Socket Mode receiver (#146); action=${action.action_id} — use Socket Mode instead`,
   };
 }
 
@@ -846,6 +858,19 @@ export default function slackBridge(pi: ExtensionAPI): void {
   } else {
     try {
       registerBridgeHooks(pi);
+      // Socket Mode receiver for approval button callbacks (#146) — runs when
+      // SLACK_APP_TOKEN (xapp-...) is set; skipped in print mode (task
+      // sub-agents, like approval forwarding) and when the bridge kill switch
+      // is set (deliberate full-Slack-off, matches the factory test contract).
+      // Without the token the receiver never starts — zero behavior change.
+      if (process.env.PI_MODE !== 'print') {
+        registerSocketModeHooks(pi);
+        console.log(
+          isSocketModeEnabled()
+            ? "[slack-bridge] 🔌 Socket Mode enabled — approval buttons active (SLACK_APP_TOKEN)"
+            : "[slack-bridge] 🔌 Socket Mode off — set SLACK_APP_TOKEN (xapp-...) to enable button callbacks",
+        );
+      }
       // #5672: suppress startup banner in print mode (task sub-agent output)
       if (process.env.PI_MODE !== 'print') {
         console.log("[slack-bridge] ✅ Loaded");
@@ -862,6 +887,37 @@ export default function slackBridge(pi: ExtensionAPI): void {
   if (process.env.PI_MODE !== 'print') {
     initApprovalForwarding();
   }
+}
+
+/**
+ * Socket Mode receiver lifecycle (#146): session_start starts the receiver
+ * when SLACK_APP_TOKEN is set; session_shutdown stops it cleanly. Registered
+ * alongside bridge routing (never in print mode, never when the bridge kill
+ * switch is set). Module-level socketState keeps this reload-resilient:
+ * shutdown on reload stops the old connection, start opens a fresh one.
+ */
+function registerSocketModeHooks(pi: ExtensionAPI): void {
+  pi.on("session_start", async (_event: any, _ctx: any) => {
+    try {
+      if (!isSocketModeEnabled()) return; // env-gated: no token → never starts
+      if (socketState?.wantRunning) return; // already running (reload-resilient)
+      console.log("[slack-bridge] 🔌 Socket Mode starting...");
+      socketState = startSocketModeReceiver();
+    } catch {
+      // Extension must never throw
+    }
+  });
+
+  pi.on("session_shutdown", async (_event: any, _ctx: any) => {
+    try {
+      if (socketState) {
+        stopSocketModeReceiver(socketState);
+        socketState = null;
+      }
+    } catch {
+      // Extension must never throw
+    }
+  });
 }
 
 /**
