@@ -365,6 +365,48 @@ export function settleEscalatedMessage(opts: {
   });
 }
 
+/** #158: settle a changes_requested message to the ⏱ redraft-escalation
+ * banner when the 24h TTL expired without pickup (dead-session recovery).
+ * issueUrl present → "Escalated to issue" (with link to the filed GitHub
+ * issue); absent → "Expired" (no repo recorded — re-request manually).
+ * No buttons. Same fire-and-forget / silent-skip contract as the other
+ * settle helpers. */
+export function settleRedraftEscalatedMessage(opts: {
+  channel?: string;
+  ts?: string;
+  issueUrl?: string;
+  apiUrl?: string;
+}): Promise<boolean> {
+  const token = (process.env.SLACK_BOT_TOKEN ?? "").trim();
+  if (!token) {
+    console.warn("[slack-bridge] Cannot settle redraft-escalated message — SLACK_BOT_TOKEN unset");
+    return Promise.resolve(false);
+  }
+  if (!opts.channel || !opts.ts) {
+    console.debug("[slack-bridge] settleRedraftEscalatedMessage skipped — channel/ts missing");
+    return Promise.resolve(false);
+  }
+  const escalated = Boolean(opts.issueUrl);
+  const head = escalated
+    ? "⏱ *Escalated to issue* — no session picked up this redraft within 24h"
+    : "⏱ *Expired* — no repo recorded; re-request the approval";
+  const blocks: any[] = [{ type: "section", text: { type: "mrkdwn", text: head } }];
+  if (opts.issueUrl) {
+    blocks.push({
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `Redraft issue: <${opts.issueUrl}>` }],
+    });
+  }
+  return postChatUpdate({
+    channel: opts.channel,
+    ts: opts.ts,
+    text: head,
+    blocks,
+    token,
+    apiUrl: opts.apiUrl,
+  });
+}
+
 /** #157: settle the previous revision's message to the ↻ superseded banner
  * when a re-request (v<revision>) is posted. No buttons — the new message
  * carries the live Accept/Reject actions. Same fire-and-forget contract. */
