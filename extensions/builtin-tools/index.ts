@@ -869,6 +869,12 @@ export default function (pi: ExtensionAPI) {
   // or review-enforcer → deadlock → 480s hang. Parent session enforces gates centrally.
   SKILL_ENFORCER_DISABLED: "1",
   LOOP_ENFORCER_DISABLED: "1",
+  // #172: declare print mode so extension startup diagnostics stay silent in
+  // sub-agents — extensions gate banners / approval forwarding / socket
+  // receivers on `PI_MODE !== 'print'`, but pi itself never sets PI_MODE (only
+  // swarm_daemon does). Without this, every task sub-agent emitted
+  // "⏭️ Disabled — SLACK_BRIDGE_DISABLE=1" + approval lines (22× observed).
+  PI_MODE: "print",
   SLACK_BRIDGE_DISABLE: "1",
   VISION_INTERCEPTOR_DISABLED: "1",
   ELDATO_ALLOW_MAIN_EDITS: "1",  // dual-support: also set AGENT_ variant (#7549)

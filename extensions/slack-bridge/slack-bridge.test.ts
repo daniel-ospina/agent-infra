@@ -65,6 +65,7 @@ for (const k of [
   "SLACK_BRIDGE_DISABLE", "SLACK_BRIDGE_THREAD_TS", "SLACK_BRIDGE_TEAM", "SLACK_BRIDGE_ROLE",
   "SLACK_BOT_TOKEN", "SLACK_CHANNEL", "SLACK_APPROVAL_CHANNEL", "SLACK_APPROVAL_DISABLE",
   "SLACK_APPROVAL_FILE", "SLACK_APPROVAL_POLL_MS", "SLACK_API_URL", "SLACK_APP_TOKEN", "CMUX_WORKSPACE_ID",
+  "PI_MODE", // #172: print-mode guards must be deterministic in tests
 ]) {
   delete process.env[k];
 }
@@ -211,11 +212,11 @@ try {
   // missing file
   assert(readSession(sessionFile) === null, "readSession: missing file → null");
 
-  // valid session
-  writeSession({ session_id: "s1", thread_ts: "t1", bridge_url: "http://x", team: "t", role: "r" }, sessionFile);
+  // valid session (real Slack thread_ts — 10-digit epoch + 6-digit micro, #172)
+  writeSession({ session_id: "s1", thread_ts: "1718000000.123456", bridge_url: "http://x", team: "t", role: "r" }, sessionFile);
   const s1 = readSession(sessionFile);
   assert(s1?.session_id === "s1", "readSession: session_id");
-  assert(s1?.thread_ts === "t1", "readSession: thread_ts");
+  assert(s1?.thread_ts === "1718000000.123456", "readSession: thread_ts");
   assert(s1?.team === "t", "readSession: team preserved");
   assert(s1?.role === "r", "readSession: role preserved");
 
@@ -229,10 +230,39 @@ try {
 
   // first-run: missing intermediate directories
   const deepFile = join(sessionDir, "sub", "deep", "session.json");
-  writeSession({ session_id: "deep", thread_ts: "d1", bridge_url: "x", team: null, role: null }, deepFile);
+  writeSession({ session_id: "deep", thread_ts: "1718000001.654321", bridge_url: "x", team: null, role: null }, deepFile);
   assert(existsSync(deepFile), "writeSession: creates intermediate dirs");
 } finally {
   rmSync(sessionDir, { recursive: true, force: true });
+}
+
+// ── #172: stale-session non-adoption ──
+{
+  const staleDir = tmpDir();
+  const staleFile = join(staleDir, "session.json");
+  try {
+    // Exact test residue observed on this machine (MockBridge default response:
+    // thread_ts "1234.5678", channel "#test") — must NOT be adopted.
+    writeFileSync(staleFile, JSON.stringify({
+      active_session: { session_id: "bridge-spawned-sid", thread_ts: "1234.5678", channel: "#test", team: "organisation-design-team", role: null },
+    }));
+    assert(readSession(staleFile) === null, "#172: readSession rejects implausible thread_ts (test residue '1234.5678')");
+
+    // Other non-timestamp junk is also rejected.
+    writeFileSync(staleFile, JSON.stringify({
+      active_session: { session_id: "s", thread_ts: "not-a-ts", channel: "#x", team: null, role: null },
+    }));
+    assert(readSession(staleFile) === null, "#172: readSession rejects non-timestamp thread_ts");
+
+    // A real Slack ts is still adopted (validate-don't-clear).
+    writeFileSync(staleFile, JSON.stringify({
+      active_session: { session_id: "s-real", thread_ts: "1718000000.123456", channel: "#general", team: "t", role: null },
+    }));
+    const sReal = readSession(staleFile);
+    assert(sReal?.session_id === "s-real", "#172: readSession adopts a real Slack thread_ts");
+  } finally {
+    rmSync(staleDir, { recursive: true, force: true });
+  }
 }
 
 // ── findRepoRoot ──
@@ -432,6 +462,63 @@ try {
   assert(handlers.has("session_shutdown"), "factory: session_shutdown registered");
 }
 
+// ── #172: print-mode silence (kill-switch + registration gates) ──
+{
+  const handlersP = new Map<string, Function[]>();
+  const stubPiP: any = {
+    on(name: string, fn: Function) {
+      if (!handlersP.has(name)) handlersP.set(name, []);
+      handlersP.get(name)!.push(fn);
+    },
+  };
+  const logs: string[] = [];
+  const origLog = console.log;
+  const origErr = console.error;
+  const prevMode = process.env.PI_MODE;
+  const prevDisable = process.env.SLACK_BRIDGE_DISABLE;
+  console.log = (...a: any[]) => logs.push(a.join(" "));
+  console.error = (...a: any[]) => logs.push(a.join(" "));
+  try {
+    // Task sub-agent: print mode + SLACK_BRIDGE_DISABLE=1 (builtin-tools sets
+    // both) → zero [slack-bridge] startup lines, no hooks.
+    process.env.PI_MODE = "print";
+    process.env.SLACK_BRIDGE_DISABLE = "1";
+    slackBridge(stubPiP);
+    assert(!handlersP.has("session_start"), "#172(print+disable): no session_start hook");
+    const sbLines = logs.filter((l) => l.includes("[slack-bridge]"));
+    assert(sbLines.length === 0,
+      `#172(print+disable): zero [slack-bridge] startup output (got ${sbLines.length}: ${sbLines.join(" | ") || "none"})`);
+
+    // Headless pi -p without the kill switch: also zero output and — with no
+    // Slack/cmux env — zero hooks (registration-level eligibility gate).
+    handlersP.clear();
+    logs.length = 0;
+    delete process.env.SLACK_BRIDGE_DISABLE;
+    slackBridge(stubPiP);
+    assert(!handlersP.has("session_start"), "#172(print,no-env): no bridge hooks registered");
+    const sbLines2 = logs.filter((l) => l.includes("[slack-bridge]"));
+    assert(sbLines2.length === 0,
+      `#172(print,no-env): zero [slack-bridge] output (got ${sbLines2.length})`);
+
+    // Print + Slack-spawned (SLACK_BRIDGE_THREAD_TS): hooks MUST register — the
+    // legitimate headless bridge flow keeps working.
+    handlersP.clear();
+    logs.length = 0;
+    process.env.SLACK_BRIDGE_THREAD_TS = "1718000000.123456";
+    process.env.SLACK_BRIDGE_TEAM = "organisation-design-team";
+    slackBridge(stubPiP);
+    assert(handlersP.has("session_start") && handlersP.has("session_shutdown"),
+      "#172(print+thread): bridge hooks still register for Slack-spawned sessions");
+  } finally {
+    console.log = origLog;
+    console.error = origErr;
+    if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    if (prevDisable === undefined) delete process.env.SLACK_BRIDGE_DISABLE; else process.env.SLACK_BRIDGE_DISABLE = prevDisable;
+    delete process.env.SLACK_BRIDGE_THREAD_TS;
+    delete process.env.SLACK_BRIDGE_TEAM;
+  }
+}
+
 // ── Integration: hook behavior ───────────────────────
 {
   const mock = new MockBridge();
@@ -512,6 +599,57 @@ try {
   mock.server.close();
 }
 
+// ── #172: print-mode shutdown guard — no final:true, no retry noise ──
+{
+  const mockP = new MockBridge();
+  const handlersP = new Map<string, Function[]>();
+  const stubPiP: any = {
+    on(name: string, fn: Function) {
+      if (!handlersP.has(name)) handlersP.set(name, []);
+      handlersP.get(name)!.push(fn);
+    },
+  };
+  const errs: string[] = [];
+  const origErr = console.error;
+  const prevMode = process.env.PI_MODE;
+  console.error = (...a: any[]) => errs.push(a.join(" "));
+  try {
+    delete process.env.PI_MODE; // register hooks as a normal process
+    slackBridge(stubPiP);
+    const shutdown = handlersP.get("session_shutdown")![0];
+
+    // Establish an active session (module state), then shut down with an
+    // ineligible print ctx → the guard must skip final:true entirely.
+    const bindOk = await bindSession(
+      { ui: { notify() {}, setStatus() {} } },
+      "print-shutdown-sid", null, null, { skipHealth: true },
+    );
+    assert(bindOk, "#172(shutdown): pre-bind succeeded");
+    mockP.requests = [];
+
+    process.env.PI_MODE = "print";
+    await shutdown({}, { mode: "print" }); // headless: no hasUI, no thread env
+    await new Promise((r) => setTimeout(r, 100));
+    const finals = mockP.requests.filter((r) => r.body?.final === true);
+    assert(finals.length === 0, "#172(shutdown): no final:true from ineligible print process");
+    assert(!errs.some((e) => e.includes("final:true failed")),
+      "#172(shutdown): no 'final:true failed after 3 retries' error");
+
+    // Restore interactive and shut down cleanly → resets module state, and
+    // proves an eligible process still sends final:true.
+    delete process.env.PI_MODE;
+    mockP.requests = [];
+    await shutdown({}, { hasUI: true, mode: "tui" });
+    await new Promise((r) => setTimeout(r, 100));
+    const finals2 = mockP.requests.filter((r) => r.body?.final === true);
+    assert(finals2.length >= 1, "#172(shutdown): eligible process still sends final:true");
+  } finally {
+    console.error = origErr;
+    if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    mockP.server.close();
+  }
+}
+
 
 // ── selectTeamStdin: function contract test ──────────
 {
@@ -550,6 +688,36 @@ try {
   } finally {
     bridgeForNull.server.close();
   }
+}
+
+// ── #172: offline notify debounce (at most once per session) ──
+{
+  const notifies: string[] = [];
+  const debounceCtx: any = {
+    ui: { notify: (m: string, t: string) => notifies.push(`${m} (${t})`), setStatus() {} },
+  };
+  // Dead bridge — nothing listens on localhost:1 → connection refused.
+  __setBridgeUrl("http://localhost:1");
+  const ok1 = await bindSession(debounceCtx, "debounce-1", null, null);
+  assert(ok1 === false, "#172(debounce): dead bridge → bind fails");
+  const ok2 = await bindSession(debounceCtx, "debounce-2", null, null);
+  assert(ok2 === false, "#172(debounce): second bind fails too");
+  assert(notifies.length === 1,
+    `#172(debounce): offline warned at most once across 2 failures (got ${notifies.length}: ${notifies.join(" | ") || "none"})`);
+
+  // Successful bind re-arms the debounce (daemon recovered).
+  const mockD = new MockBridge();
+  const ok3 = await bindSession(debounceCtx, "debounce-3", null, null);
+  assert(ok3 === true, "#172(debounce): healthy bind succeeds");
+
+  // Daemon down again → a fresh warning is allowed (once).
+  __setBridgeUrl("http://localhost:1");
+  const ok4 = await bindSession(debounceCtx, "debounce-4", null, null);
+  assert(ok4 === false, "#172(debounce): daemon down again");
+  assert(notifies.length === 2,
+    `#172(debounce): warned again after recovery (got ${notifies.length})`);
+  mockD.server.close();
+  __setBridgeUrl(null);
 }
 
 // ── session_start: bridge-spawned (SLACK_BRIDGE_THREAD_TS) ──
@@ -597,6 +765,52 @@ try {
     process.env.SLACK_BRIDGE_THREAD_TS = origThreadTs;
     process.env.SLACK_BRIDGE_TEAM = origBridgeTeam;
     mockB.server.close();
+  }
+}
+
+// ── #172: SLACK_BRIDGE_THREAD_TS wins over file adoption ──
+{
+  const mockT = new MockBridge();
+  const handlersT = new Map<string, Function[]>();
+  const ctxT: any = {
+    hasUI: false,
+    cwd: PROJECT_ROOT,
+    sessionManager: { getSessionId: () => "spawn-sid" },
+    ui: { notify: () => {}, setStatus: () => {} },
+  };
+  const piT: any = {
+    on(name: string, fn: Function) {
+      if (!handlersT.has(name)) handlersT.set(name, []);
+      handlersT.get(name)!.push(fn);
+    },
+  };
+  const realFile = join(homedir(), ".pi", "agent", "slack-session.json");
+  const prevThreadTs = process.env.SLACK_BRIDGE_THREAD_TS;
+  const prevTeam = process.env.SLACK_BRIDGE_TEAM;
+  try {
+    // Valid-format stale session in the real file — must NOT hijack the env bind.
+    mkdirSync(dirname(realFile), { recursive: true });
+    writeFileSync(realFile, JSON.stringify({
+      active_session: { session_id: "stale-real", thread_ts: "1718000000.123456", channel: "#general", team: "old-team", role: null },
+    }));
+    process.env.SLACK_BRIDGE_THREAD_TS = "1718000099.123456";
+    process.env.SLACK_BRIDGE_TEAM = "organisation-design-team";
+    delete process.env.PI_MODE;
+    slackBridge(piT);
+    const sstartT = handlersT.get("session_start")![0];
+    await sstartT({ reason: "startup" }, ctxT);
+    await new Promise((r) => setTimeout(r, 200));
+    const reqsT = mockT.requests.filter((r) => r.url === "/session");
+    assert(reqsT.length >= 1, "#172(precedence): POSTed /session");
+    if (reqsT.length > 0) {
+      assert(reqsT[0].body.thread_ts === "1718000099.123456",
+        `#172(precedence): binds env thread, not the stale file's (got ${reqsT[0].body.thread_ts})`);
+    }
+  } finally {
+    rmSync(realFile, { force: true });
+    if (prevThreadTs === undefined) delete process.env.SLACK_BRIDGE_THREAD_TS; else process.env.SLACK_BRIDGE_THREAD_TS = prevThreadTs;
+    if (prevTeam === undefined) delete process.env.SLACK_BRIDGE_TEAM; else process.env.SLACK_BRIDGE_TEAM = prevTeam;
+    mockT.server.close();
   }
 }
 
