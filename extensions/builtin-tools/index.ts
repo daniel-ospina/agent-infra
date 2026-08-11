@@ -7,9 +7,18 @@
  *   - todo_write  — Task tracking (replaces TodoWrite)
  *   - task        — Sub-agent dispatcher (replaces Agent/Task tool)
  *
- * Task-tool reliability tiers (#152/#153):
- *   - Tier 1: first-output timeout (60s) — no output ever → retryable undefined
- *   - Tier 2: heartbeat silence (30 min, TASK_HEARTBEAT_TIMEOUT_MS) → partial results
+ * Task-tool reliability tiers (#152/#153/#176):
+ *   - Tier 1: first-output timeout (60s) — no output ever AND no life-sign
+ *     markers (ready/turn/tool) → retryable undefined
+ *   - Tier 2: state-aware silence detection (30 min, TASK_HEARTBEAT_TIMEOUT_MS)
+ *     over alive signals, not just output bytes (#176): the task-heartbeat
+ *     extension (TASK_HEARTBEAT=1) emits [task-heartbeat] markers on stderr
+ *     (tool start/end, turn start/end, 30s ticks carrying in-flight state +
+ *     stream age). The kill fires only on genuine silence — no in-flight tool,
+ *     no active turn with fresh stream activity, no output — with bounded
+ *     backstops: stream-stall (20 min), tool-stall (6h; min(L,T) preflight),
+ *     first-message (300s). Markers never contaminate results (filtered at
+ *     ingestion). Absent the emitter → exact legacy byte-silence behavior.
  *   - Tier 3: exit watchdog (120s, TASK_EXIT_GRACE_MS) — both stdio streams EOF
  *     but process alive → SIGTERM→SIGKILL. Fixes #153 (session finished, pi
  *     process hangs on exit — event loop won't drain).
@@ -25,6 +34,7 @@ import { spawn } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import { randomBytes } from "node:crypto";
 import { retry, createCircuitBreaker } from "../shared/retry.js";
 import { register } from "../shared/health.js";
 import { treeKill } from "../shared/tree-kill.js";
@@ -386,6 +396,418 @@ export function shouldFallback(d: FallbackDecision): boolean {
   return connectionErrorDetected(d.result);
 }
 
+// ── Sub-agent heartbeat: alive signals, not output bytes (#176) ────────
+//
+// The tier-2 silence detector used to equate "alive" with "recent output
+// bytes". Pi in print mode buffers stdout until the final turn, so a sub-agent
+// mid tool-call / model-turn emits zero bytes and gets killed mid-work
+// (recurrence of #129). The task tool injects TASK_HEARTBEAT=1; the
+// task-heartbeat extension (extensions/task-heartbeat.ts) emits life-sign
+// markers on stderr, parsed here into first-class alive state:
+//
+//   - tool call in flight / model turn active → silence kill suppressed while
+//     markers are fresh (stateFresh window = max(2×T, 2×tick interval))
+//   - markers stale/absent → exact legacy byte-silence behavior
+//
+// Kill clauses (precedence: tool-stall → stream-stall → silence →
+// first-message):
+//   tool-stall ........ in-flight tool older than TASK_TOOL_STALL_MS (6h;
+//                       min(L, T) when turnActive=false — preflight-stuck)
+//   stream-stall ...... no tools, stream idle > TASK_STREAM_STALL_MS (20 min)
+//                       — also bounds between-turn wedges with flowing ticks
+//   silence ........... no bytes/markers for HEARTBEAT_TIMEOUT_MS unless
+//                       stateFresh && turnActive && (tools > 0 || stream fresh)
+//   first-message ..... turn active but no message/tool events for
+//                       TASK_FIRST_MESSAGE_MS (300s) — fast #5926 detection
+//
+// Kills fired while no REAL output ever arrived resolve `undefined`
+// (retryable) so retry/backoff/circuit-breaker stay live for the #5926 class.
+// Marker format is drift-guarded against extensions/task-heartbeat.ts by E14
+// in builtin-tools.test.ts (prefix + clamp constants + full round-trip).
+
+export const HEARTBEAT_MARKER_PREFIX = "[task-heartbeat]";
+
+/** Tick-interval clamp bounds — MUST match the child copy in
+ * extensions/task-heartbeat.ts (drift test E14). */
+export const HEARTBEAT_INTERVAL_MIN_MS = 5_000;
+export const HEARTBEAT_INTERVAL_MAX_MS = 300_000;
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+export const DEFAULT_STREAM_STALL_MS = 1_200_000;
+export const DEFAULT_TOOL_STALL_MS = 21_600_000;
+export const DEFAULT_FIRST_MESSAGE_MS = 300_000;
+
+/** Clamp a raw interval into [5s, 300s]; non-finite/≤0 → default. Identical
+ * to the child-side clamp in extensions/task-heartbeat.ts (drift test E14). */
+export function clampHeartbeatIntervalMs(raw: number): number {
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_HEARTBEAT_INTERVAL_MS;
+  return Math.min(HEARTBEAT_INTERVAL_MAX_MS, Math.max(HEARTBEAT_INTERVAL_MIN_MS, raw));
+}
+
+/** Tick interval from TASK_HEARTBEAT_INTERVAL_MS (default 30s). Used by the
+ * parent ONLY for the stateFresh window (the child owns its own timer). */
+export function getHeartbeatIntervalMs(): number {
+  return clampHeartbeatIntervalMs(Number(process.env.TASK_HEARTBEAT_INTERVAL_MS));
+}
+
+/** Stall-bound getters: clamp ≥ 60s — a sub-60s bound could kill productive
+ * agents between two ticks. */
+export function getStreamStallMs(): number {
+  return Math.max(60_000, Number(process.env.TASK_STREAM_STALL_MS) || DEFAULT_STREAM_STALL_MS);
+}
+export function getToolStallMs(): number {
+  return Math.max(60_000, Number(process.env.TASK_TOOL_STALL_MS) || DEFAULT_TOOL_STALL_MS);
+}
+export function getFirstMessageMs(): number {
+  return Math.max(60_000, Number(process.env.TASK_FIRST_MESSAGE_MS) || DEFAULT_FIRST_MESSAGE_MS);
+}
+
+/** Opt-in total dispatch cap (#176 code-review): honest markers exempt working
+ * agents from every per-clause bound, so an adversarial/pathological loop
+ * (drip-streamed tokens, endless cheap tool calls) is otherwise unbounded.
+ * Default 0 = OFF — the issue's core semantics ("never kill a working agent").
+ * TASK_MAX_DISPATCH_MS > 0 adds a wall-clock cap markers cannot reset. */
+export const DEFAULT_MAX_DISPATCH_MS = 0;
+export function getTaskMaxDispatchMs(): number {
+  const raw = Number(process.env.TASK_MAX_DISPATCH_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_MAX_DISPATCH_MS;
+  return Math.max(60_000, raw);
+}
+
+/** Alive state parsed from [task-heartbeat] markers. Ticks overwrite the
+ * per-event fields (self-healing if an event marker was lost). */
+export interface HeartbeatState {
+  toolsInFlight: number;
+  turnActive: boolean;
+  streamAgeMs: number;
+  toolAgeMaxMs: number;
+  turnSawMessage: boolean;
+  turnSawTool: boolean;
+  /** Latched on first tool_start/turn_start — proves work started (tier-1). */
+  everSawWork: boolean;
+  /** Latched on ready — proves the emitter initialized (tier-1 slow-start). */
+  sawReady: boolean;
+  /** 0 = no marker ever received (stateFresh false → legacy behavior). */
+  lastMarkerAt: number;
+}
+
+export function createHeartbeatState(): HeartbeatState {
+  return {
+    toolsInFlight: 0,
+    turnActive: false,
+    streamAgeMs: 0,
+    toolAgeMaxMs: 0,
+    turnSawMessage: false,
+    turnSawTool: false,
+    everSawWork: false,
+    sawReady: false,
+    lastMarkerAt: 0,
+  };
+}
+
+const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
+
+/** Kinds that make a prefix line a marker. Foreign lines that merely START
+ * with the prefix (e.g. a sub-agent grepping this repo's source, a test log)
+ * are preserved as ordinary stderr by returning false (code-review fix). */
+export const KNOWN_MARKER_KINDS = new Set([
+  "ready", "tool_start", "tool_end", "turn_start", "turn_end", "tick",
+]);
+
+/**
+ * Parse one COMPLETE stderr line into heartbeat state. Returns true only for
+ * KNOWN-kind markers — callers discard those (never enter the stderr
+ * accumulator, never set hasOutput). Everything else (including foreign
+ * prefix lines) returns false and keeps legacy byte effects.
+ *
+ * expectedNonce (code-review fix): markers carry a per-dispatch nonce
+ * (TASK_HEARTBEAT_NONCE) generated by the parent. When expectedNonce is
+ * provided, a marker must carry a matching nonce — MCP servers inherit the
+ * child's fd 2 (MCP SDK stdio default stderr:"inherit") and could otherwise
+ * forge life signs. Undefined expectedNonce = unauthenticated parse (tests).
+ */
+export function parseHeartbeatLine(
+  line: string,
+  state: HeartbeatState,
+  now: number,
+  expectedNonce?: string,
+): boolean {
+  const stripped = line.replace(ANSI_RE, "").trim();
+  if (!stripped.startsWith(HEARTBEAT_MARKER_PREFIX)) return false;
+  const rest = stripped.slice(HEARTBEAT_MARKER_PREFIX.length).trim();
+  const kind = rest.split(/\s+/)[0];
+  if (!KNOWN_MARKER_KINDS.has(kind)) return false;
+  if (expectedNonce !== undefined) {
+    const nm = rest.match(/(?:^|\s)nonce=([A-Za-z0-9_-]+)/);
+    if (!nm || nm[1] !== expectedNonce) return false;
+  }
+  state.lastMarkerAt = now;
+  switch (kind) {
+    case "ready":
+      state.sawReady = true;
+      break;
+    case "tool_start":
+      state.toolsInFlight += 1;
+      state.everSawWork = true;
+      break;
+    case "tool_end":
+      state.toolsInFlight = Math.max(0, state.toolsInFlight - 1);
+      break;
+    case "turn_start":
+      state.turnActive = true;
+      state.everSawWork = true;
+      state.turnSawMessage = false;
+      state.turnSawTool = false;
+      break;
+    case "turn_end":
+      state.turnActive = false;
+      // Mirror the child's outstanding-tools clear on turn_end (pi guarantees
+      // all tools finalize before turn_end). Prevents a stale event counter
+      // after a lost tool_end from causing a false tool-stall kill (code-
+      // review fix).
+      state.toolsInFlight = 0;
+      break;
+    case "tick": {
+      for (const m of rest.matchAll(/([a-z_]+)=(\d+)/g)) {
+        const v = Number(m[2]);
+        // Overflow guard: arbitrarily long digit strings parse to Infinity and
+        // would fire a stall clause instantly (code-review fix).
+        if (!Number.isFinite(v)) continue;
+        switch (m[1]) {
+          case "tools": state.toolsInFlight = v; break;
+          case "turn": state.turnActive = v === 1; break;
+          case "stream_age_ms": state.streamAgeMs = v; break;
+          case "tool_age_max_ms": state.toolAgeMaxMs = v; break;
+          case "saw_msg": state.turnSawMessage = v === 1; break;
+          case "saw_tool": state.turnSawTool = v === 1; break;
+        }
+      }
+      break;
+    }
+    default:
+      break; // unreachable — KNOWN_MARKER_KINDS checked above
+  }
+  return true;
+}
+
+/** Line-buffer residue flush rule (overflow / close / kill-composition):
+ * residue starting with the marker prefix (a possibly-truncated marker) is
+ * discarded; everything else is preserved as ordinary stderr. */
+export function flushHeartbeatResidue(
+  residue: string,
+): { flush: string; wasMarker: boolean } {
+  const wasMarker = residue
+    .replace(ANSI_RE, "")
+    .trimStart()
+    .startsWith(HEARTBEAT_MARKER_PREFIX);
+  return { flush: wasMarker ? "" : residue, wasMarker };
+}
+
+/** Bounded residual line buffer for marker ingestion (few KB). */
+export const HEARTBEAT_LINE_BUF_MAX = 4_096;
+
+export interface HeartbeatIngestContext {
+  state: HeartbeatState;
+  lineBuf: string;
+  /** Per-dispatch nonce markers must carry (undefined = unauthenticated). */
+  expectedNonce?: string;
+  /** Append non-marker stderr text to the capped accumulator. */
+  appendStderr: (text: string) => void;
+  /** Called on ANY byte arrival (marker or not) — the life-sign clock. */
+  onLifeSign: () => void;
+  /** Called when REAL (non-marker) bytes arrive. */
+  onRealOutput: () => void;
+}
+
+/**
+ * Ingest one raw stderr chunk through the marker pipeline (#176): line-buffer
+ * → complete lines parsed as markers (discarded) or appended as ordinary
+ * stderr → bounded overflow (marker-prefixed residue discarded). Mutates
+ * ctx.lineBuf. Markers never reach the accumulator and never trigger
+ * onRealOutput — guarantee 6 + hasOutput semantics.
+ */
+export function ingestHeartbeatChunk(
+  chunk: string,
+  ctx: HeartbeatIngestContext,
+  now: number = Date.now(),
+): void {
+  ctx.onLifeSign();
+  ctx.lineBuf += chunk;
+  let nl: number;
+  while ((nl = ctx.lineBuf.indexOf("\n")) >= 0) {
+    let line = ctx.lineBuf.slice(0, nl);
+    ctx.lineBuf = ctx.lineBuf.slice(nl + 1);
+    // Code-review fix: an unterminated foreign stderr fragment followed by a
+    // marker merges into one line — split it so the head survives as real
+    // stderr and the marker part is parsed/discarded (guarantee 6).
+    // ANSI-decorated markers are pure markers — parseHeartbeatLine strips the
+    // decoration, so they must NOT split into a fake "head" (that would flip
+    // hasOutput and leak escape garbage into the accumulator).
+    const isDecoratedMarker =
+      !line.startsWith(HEARTBEAT_MARKER_PREFIX) &&
+      line.replace(ANSI_RE, "").trimStart().startsWith(HEARTBEAT_MARKER_PREFIX);
+    if (!isDecoratedMarker) {
+      const prefixIdx = line.indexOf(HEARTBEAT_MARKER_PREFIX);
+      if (prefixIdx > 0) {
+        ctx.appendStderr(line.slice(0, prefixIdx));
+        ctx.onRealOutput();
+        line = line.slice(prefixIdx);
+      }
+    }
+    if (!parseHeartbeatLine(line, ctx.state, now, ctx.expectedNonce)) {
+      ctx.appendStderr(line + "\n");
+      ctx.onRealOutput();
+    }
+  }
+  if (ctx.lineBuf.length > HEARTBEAT_LINE_BUF_MAX) {
+    const { flush } = flushHeartbeatResidue(ctx.lineBuf);
+    if (flush) {
+      ctx.appendStderr(flush);
+      ctx.onRealOutput();
+    }
+    ctx.lineBuf = "";
+  }
+}
+
+/** Flush the residual line buffer (close / kill-composition / overflow):
+ * non-marker residue is appended to the accumulator, marker-prefixed residue
+ * discarded. Returns the flushed (non-marker) text, "" if none. */
+export function flushHeartbeatLineBuf(ctx: HeartbeatIngestContext): string {
+  if (!ctx.lineBuf) return "";
+  const { flush } = flushHeartbeatResidue(ctx.lineBuf);
+  if (flush) {
+    ctx.appendStderr(flush);
+    ctx.onRealOutput();
+  }
+  ctx.lineBuf = "";
+  return flush;
+}
+
+export type HeartbeatKillReason =
+  | "zero-output"
+  | "silence-threshold"
+  | "stream-stall"
+  | "tool-stall"
+  | "first-message-stall"
+  | "max-dispatch";
+
+export interface HeartbeatKillDecision {
+  kill: boolean;
+  reason?: HeartbeatKillReason;
+  /** Kill resolves `undefined` (retryable) instead of a defined result —
+   * true iff the kill fired and no REAL output ever arrived (#5926 retry
+   * preservation). */
+  resolveUndefined: boolean;
+}
+
+export interface HeartbeatDecisionInput {
+  now: number;
+  startedAt: number;
+  /** Last life sign of ANY kind (real output bytes or marker). */
+  lastLifeSignAt: number;
+  /** Real (non-marker) output ever arrived. */
+  hasOutput: boolean;
+  state: HeartbeatState;
+  heartbeatTimeoutMs: number; // T
+  firstOutputTimeoutMs: number; // tier-1 (60s)
+  streamStallMs: number; // S
+  toolStallMs: number; // L
+  firstMessageMs: number; // M
+  intervalMs: number; // clamped tick interval
+  /** 0 = off; >0 = wall-clock cap markers cannot reset (code-review fix). */
+  maxDispatchMs: number;
+}
+
+/**
+ * The idle detector (#176): tier-1 + the four kill clauses. Precedence
+ * (pinned, E10): tool-stall → stream-stall → silence → first-message.
+ * Every clause is bounded; with no markers at all the decision degrades to
+ * exact legacy behavior (tier-1 + byte-silence at T).
+ */
+export function heartbeatKillDecision(
+  i: HeartbeatDecisionInput,
+): HeartbeatKillDecision {
+  const kill = (reason: HeartbeatKillReason): HeartbeatKillDecision => ({
+    kill: true,
+    reason,
+    resolveUndefined: !i.hasOutput,
+  });
+
+  // Tier-1 — first-output timeout: process-level startup hang (no real output,
+  // no work marker, no ready marker).
+  if (
+    !i.hasOutput &&
+    i.now - i.startedAt > i.firstOutputTimeoutMs &&
+    !i.state.everSawWork &&
+    !i.state.sawReady
+  ) {
+    return kill("zero-output");
+  }
+
+  const st = i.state;
+  const markerAge = st.lastMarkerAt > 0 ? i.now - st.lastMarkerAt : 0;
+  const stateFresh =
+    st.lastMarkerAt > 0 &&
+    markerAge <= Math.max(2 * i.heartbeatTimeoutMs, 2 * i.intervalMs);
+  // Effective ages include time since the last marker (code-review fix): when
+  // ticks stop (wedged child), the frozen streamAgeMs/toolAgeMaxMs keep
+  // growing, so a wedge is caught at its stall bound instead of waiting out
+  // the full stateFresh window. Healthy ticking children: markerAge ≤ ~one
+  // interval — negligible against minute-scale bounds.
+  const effStreamAge = st.streamAgeMs + markerAge;
+  const effToolAge = st.toolAgeMaxMs + markerAge;
+
+  // 1. tool-stall — desynced-counter / absurd-hang bound. Preflight-stuck
+  //    children (turnActive=false) get the tighter min(L, T) ceiling.
+  if (stateFresh && st.toolsInFlight > 0) {
+    const bound = st.turnActive
+      ? i.toolStallMs
+      : Math.min(i.toolStallMs, i.heartbeatTimeoutMs);
+    if (effToolAge > bound) return kill("tool-stall");
+  }
+
+  // 2. stream-stall — no tools, stream idle beyond S. No turnActive
+  //    requirement: also bounds between-turn wedges with flowing ticks.
+  if (stateFresh && st.toolsInFlight === 0 && effStreamAge > i.streamStallMs) {
+    return kill("stream-stall");
+  }
+
+  // 3. silence — the legacy byte-silence detector, exempted while a turn is
+  //    active with an in-flight tool or fresh stream activity.
+  const silenceMs = i.now - i.lastLifeSignAt;
+  const exempt =
+    stateFresh &&
+    st.turnActive &&
+    (st.toolsInFlight > 0 || effStreamAge <= i.streamStallMs);
+  if (silenceMs > i.heartbeatTimeoutMs && !exempt) {
+    return kill("silence-threshold");
+  }
+
+  // 4. first-message — turn running but no message/tool activity ever within
+  //    M (hung provider request, #5926 class). Retryable when no real output.
+  //    Note: with the emitter loaded, ready/turn_start latch before any
+  //    provider call, so the 60s tier-1 no longer covers hung first requests
+  //    — this clause is their detector now (settled scope trade-off).
+  if (
+    stateFresh &&
+    st.turnActive &&
+    !st.turnSawMessage &&
+    !st.turnSawTool &&
+    effStreamAge > i.firstMessageMs
+  ) {
+    return kill("first-message-stall");
+  }
+
+  // 5. max-dispatch — opt-in total wall-clock cap (code-review fix): honest
+  //    markers exempt working agents from every per-clause bound, so without
+  //    this a drip-stream/tool-looping child would be unbounded. OFF by
+  //    default (issue semantics: never kill a working agent).
+  if (i.maxDispatchMs > 0 && i.now - i.startedAt > i.maxDispatchMs) {
+    return kill("max-dispatch");
+  }
+
+  return { kill: false, resolveUndefined: false };
+}
+
 export function stripHtml(html: string): string {
   return html
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
@@ -699,6 +1121,14 @@ export default function (pi: ExtensionAPI) {
    */
   function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[]): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
     return new Promise((resolve) => {
+      // #176 code-review: per-dispatch marker nonce — the child echoes it in
+      // every [task-heartbeat] marker; markers without it are foreign (MCP
+      // servers inherit the child's fd 2) and fall back to ordinary stderr.
+      const hbEnabled = subAgentEnv.TASK_HEARTBEAT === "1";
+      const hbNonce = hbEnabled ? randomBytes(6).toString("hex") : "";
+      const spawnEnv = hbEnabled
+        ? { ...subAgentEnv, TASK_HEARTBEAT_NONCE: hbNonce }
+        : subAgentEnv;
       // #101: spawn via process.execPath + resolved entry script (same as the
       // subagent tool) so a truncated PATH can't cause a non-retryable ENOENT.
       const invocation = getPiInvocation(args);
@@ -706,7 +1136,7 @@ export default function (pi: ExtensionAPI) {
         cwd: process.cwd(),
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
-        env: subAgentEnv,
+        env: spawnEnv,
       });
 
       let stdout = "";
@@ -740,15 +1170,35 @@ export default function (pi: ExtensionAPI) {
       };
       const cleanStderr = (s: string) => s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
 
+      // #176: state-aware heartbeat — alive state parsed from [task-heartbeat]
+      // markers (emitted by the task-heartbeat extension, TASK_HEARTBEAT=1).
+      // Markers are filtered at DATA ARRIVAL (ingestHeartbeatChunk): they
+      // never enter the capped stderr accumulator, so no result path can ever
+      // contain marker text and a truncated marker can never flip hasOutput.
+      // Non-marker stderr bytes keep all legacy effects (hasOutput,
+      // lastHeartbeat).
+      const hbCtx: HeartbeatIngestContext = {
+        state: createHeartbeatState(),
+        lineBuf: "",
+        expectedNonce: hbEnabled ? hbNonce : undefined,
+        appendStderr: (text: string) => {
+          stderr = appendCap(stderr, text, 1_000_000);
+        },
+        onLifeSign: () => {
+          lastHeartbeat = Date.now();
+        },
+        onRealOutput: () => {
+          hasOutput = true;
+        },
+      };
+
       proc.stdout.on("data", (data: Buffer) => {
         stdout = appendCap(stdout, data.toString(), 1_000_000);
         lastHeartbeat = Date.now();
         hasOutput = true;
       });
       proc.stderr.on("data", (data: Buffer) => {
-        stderr = appendCap(stderr, data.toString(), 1_000_000);
-        lastHeartbeat = Date.now();
-        hasOutput = true;
+        ingestHeartbeatChunk(data.toString(), hbCtx);
       });
 
       const doResolve = (value: { content: any[]; details: Record<string, unknown> } | undefined) => {
@@ -759,36 +1209,73 @@ export default function (pi: ExtensionAPI) {
       };
 
       const startedAt = Date.now();
+      // #176: stall bounds resolved once per dispatch (parent-side env).
+      const hbThresholds = {
+        heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,
+        firstOutputTimeoutMs: FIRST_OUTPUT_TIMEOUT_MS,
+        streamStallMs: getStreamStallMs(),
+        toolStallMs: getToolStallMs(),
+        firstMessageMs: getFirstMessageMs(),
+        intervalMs: getHeartbeatIntervalMs(),
+        maxDispatchMs: getTaskMaxDispatchMs(),
+      };
       const heartbeat = setInterval(() => {
-        const elapsed = Date.now() - startedAt;
+        const now = Date.now();
+        // Flush residue BEFORE deciding so a kill result sees everything so
+        // far (non-marker residue preserved — kill-result fidelity; marker
+        // residue discarded).
+        flushHeartbeatLineBuf(hbCtx);
+        // Tier 1 + tier 2 (#176): one idle detector — tier-1 first-output
+        // (startup hangs, retryable), then tool-stall → stream-stall →
+        // silence → first-message over the parsed alive state.
+        const decision = heartbeatKillDecision({
+          now,
+          startedAt,
+          lastLifeSignAt: lastHeartbeat,
+          hasOutput,
+          state: hbCtx.state,
+          ...hbThresholds,
+        });
+        if (!decision.kill) return;
+        clearInterval(heartbeat);
+        proc.kill("SIGTERM");
+        const sigkillTimer = setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000);
+        proc.once("close", () => clearTimeout(sigkillTimer));
 
-        // Tier 1 — First-output timeout: return undefined to trigger retry (#5926)
-        if (!hasOutput && elapsed > FIRST_OUTPUT_TIMEOUT_MS) {
-          clearInterval(heartbeat);
-          proc.kill("SIGTERM");
-          const sigkillTimer = setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000);
-          proc.once("close", () => clearTimeout(sigkillTimer));
-          console.error(`[task] sub-agent produced no output in ${FIRST_OUTPUT_TIMEOUT_MS / 1000}s — retryable`);
+        // Retryable kills (#5926 class): no REAL output ever arrived →
+        // resolve undefined so the retry wrapper re-spawns and the circuit
+        // breaker counts the failure.
+        if (decision.resolveUndefined) {
+          if (decision.reason === "zero-output") {
+            console.error(`[task] sub-agent produced no output in ${FIRST_OUTPUT_TIMEOUT_MS / 1000}s — retryable`);
+          } else {
+            console.error(`[task] sub-agent killed (${decision.reason}) with no real output — retryable`);
+          }
           doResolve(undefined);
           return;
         }
 
-        // Tier 2 — Silence threshold: partial output exists, return it
-        if (Date.now() - lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
-          clearInterval(heartbeat);
-          const lastOutput = stdout.slice(-500);
-          proc.kill("SIGTERM");
-          const sigkillTimer = setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000);
-          proc.once("close", () => clearTimeout(sigkillTimer));
-          doResolve({
-            content: [{ type: "text", text: `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${lastOutput}` }],
-            details: { model, provider, killed: true, reason: "silence-threshold", heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
-          });
-        }
+        const lastOutput = stdout.slice(-500);
+        const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}`;
+        const headlines: Record<string, string> = {
+          "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+          "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+          "tool-stall": `⚠️ Sub-agent tool call exceeded its bound (tool age ${Math.round(hbCtx.state.toolAgeMaxMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+          "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.firstMessageMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+          "max-dispatch": `⚠️ Sub-agent exceeded the total dispatch cap (${Math.round(hbThresholds.maxDispatchMs / 1000)}s, TASK_MAX_DISPATCH_MS). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        };
+        doResolve({
+          content: [{ type: "text", text: `${headlines[decision.reason ?? "silence-threshold"]}\n\n${aliveSummary}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${lastOutput}` }],
+          details: { model, provider, killed: true, reason: decision.reason, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
+        });
       }, 10_000);
 
       proc.on("close", (code: number) => {
         clearInterval(heartbeat);
+        // #176: flush the line-buffer residue before composing the result —
+        // non-marker tail preserved, truncated-marker tail discarded.
+        flushHeartbeatLineBuf(hbCtx);
         const stderrClean = cleanStderr(stderr.trim()).slice(-4000);
         const errInfo = stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "";
         if (code === 0 && stdout.trim()) {
@@ -875,6 +1362,10 @@ export default function (pi: ExtensionAPI) {
   // swarm_daemon does). Without this, every task sub-agent emitted
   // "⏭️ Disabled — SLACK_BRIDGE_DISABLE=1" + approval lines (22× observed).
   PI_MODE: "print",
+  // #176: activate the task-heartbeat life-sign emitter in the sub-agent
+  // (state-aware silence detection). Opt out with TASK_HEARTBEAT_DISABLE=1 —
+  // checked BEFORE setting so it also flows to the child via the env spread.
+  ...(process.env.TASK_HEARTBEAT_DISABLE !== "1" ? { TASK_HEARTBEAT: "1" } : {}),
   SLACK_BRIDGE_DISABLE: "1",
   VISION_INTERCEPTOR_DISABLED: "1",
   ELDATO_ALLOW_MAIN_EDITS: "1",  // dual-support: also set AGENT_ variant (#7549)

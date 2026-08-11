@@ -10,16 +10,25 @@
 import { spawn } from "node:child_process";
 import { ok, equal } from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
+
+/** Per-case skip sentinel (#176 plan rev 4): thrown by a test's precheck,
+ * caught by the wrapper — counted as skipped, NEVER as passed or failed. */
+class SkipError extends Error {}
 
 function test(name: string, fn: () => Promise<void>) {
   return async () => {
     try { await fn(); passed++; console.log(`  ✅ ${name}`); }
-    catch (err: any) { failed++; console.log(`  ❌ ${name}: ${err.message}`); }
+    catch (err: any) {
+      if (err instanceof SkipError) { skipped++; console.log(`  ⏭️  ${name}: ${err.message}`); }
+      else { failed++; console.log(`  ❌ ${name}: ${err.message}`); }
+    }
   };
 }
 
@@ -86,10 +95,50 @@ tests.push(test("sub-agent computes SHA-256 and returns correct hash", async () 
   equal(r.hash, EXPECTED_HASH, `hash mismatch: got ${r.hash}, expected ${EXPECTED_HASH}`);
 }));
 
+// #176 E4: a long-running tool call with ZERO output must no longer be killed
+// at the silence threshold. Discriminating: old code byte-silence-kills the
+// sub-agent mid-sleep ("silence threshold" partial result) or zero-output
+// retries ×3 ("failed after 3 attempts"); new code exempts the dispatch via
+// stateFresh + turnActive + toolsInFlight from [task-heartbeat] markers.
+tests.push(test("E4 (#176): 70s silent tool call survives the 60s silence threshold", async () => {
+  // Per-case precheck: the child pi loads the emitter from the LIVE farm —
+  // skip (never pass/fail) on unwired machines so the SHA-256 case above
+  // still runs there.
+  const liveEmitter = join(homedir(), ".pi", "agent", "extensions", "task-heartbeat.ts");
+  if (!existsSync(liveEmitter)) {
+    throw new SkipError(`live farm lacks the emitter (${liveEmitter}) — run T5 wiring`);
+  }
+  const marker = `SURVIVED_176_${randomUUID().slice(0, 8)}`;
+  const prompt =
+    `Use the task tool to dispatch a sub-agent. The sub-agent prompt must be exactly: ` +
+    `'First run this exact bash command: sleep 70. After it completes, reply with exactly: ${marker} (nothing else).' ` +
+    `When the task tool returns, output the sub-agent's reply verbatim.`;
+  // PI_MCP_SERVERS=none → mcp-client allowlist matches nothing → zero MCP
+  // connections in parent/child (deterministic fast startup; cold MCP connects
+  // were observed to push session_start past the 60s tier-1 window, burning
+  // retry attempts and wall-clock). 420s budget covers parent startup/TTFT +
+  // dispatch + child startup/TTFT + sleep 70 + relay even on slow providers.
+  const { stdout, stderr, code } = await spawnPi(
+    ["-p", "--provider", "deepseek", "--model", "deepseek-v4-flash", "--no-session", prompt],
+    { ...SKIP_ENV, TASK_HEARTBEAT_TIMEOUT_MS: "60000", PI_MCP_SERVERS: "none" },
+    420_000,
+  );
+  ok(code === 0 || code === null, `exit: ${code}`);
+  // Old-code false-pass paths — none may appear:
+  ok(!stdout.includes("silence threshold"), `old-code silence kill fired: ${stdout.slice(0, 400)}`);
+  ok(!stdout.includes("failed after 3 attempts"), `old-code zero-output retries fired: ${stdout.slice(0, 400)}`);
+  ok(!stdout.includes("circuit breaker open"), `circuit breaker opened: ${stdout.slice(0, 400)}`);
+  ok(!stderr.includes("silence threshold"), "silence kill visible on stderr");
+  // The sub-agent must have completed the sleep and answered:
+  ok(stdout.includes(marker), `sub-agent answer missing — killed mid-work? stdout: ${stdout.slice(0, 400)}`);
+  // Guarantee 6: no marker text leaks into results:
+  ok(!stdout.includes("[task-heartbeat]"), "marker leaked into parent result");
+}));
+
 async function run() {
   for (const t of tests) await t();
   rmSync(TEST_DIR, { recursive: true, force: true });
-  console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
+  console.log(`\n=== Results: ${passed} passed, ${failed} failed, ${skipped} skipped ===`);
   if (failed > 0) { console.log("❌ SOME TESTS FAILED"); process.exit(1); }
   console.log("✅ ALL TESTS PASSED");
 }
