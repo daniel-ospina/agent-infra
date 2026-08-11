@@ -676,9 +676,12 @@ export async function scanApprovals(opts?: {
     if (req.parent && status === "pending" && (!req.reviewer || req.reviewer === "human")) {
       const parentState = state[req.parent];
       if (parentState?.ts && !prev) {
-        const res = await postApprovalRequest(req, token, reqChannel, 5000, parentState.ts);
+        // P2 (#1402 rollout): the thread lives in the PARENT's channel — a
+        // follow-up created from a different repo must reply there.
+        const parentChannel = parentState.channel || reqChannel;
+        const res = await postApprovalRequest(req, token, parentChannel, 5000, parentState.ts);
         if (res.ok) {
-          state[req.id] = { status, ts: res.ts, channel, parent_ts: parentState.ts, revision };
+          state[req.id] = { status, ts: res.ts, channel: parentChannel, parent_ts: parentState.ts, revision };
           result.posted++;
         } else {
           result.failed++;
@@ -706,7 +709,7 @@ export async function scanApprovals(opts?: {
         if (prev.ts && prev.channel) {
           void settleSupersededMessage({ channel: prev.channel, ts: prev.ts, revision, apiUrl: getSlackApiUrl() }).catch(() => {});
         }
-        state[req.id] = { ...prev, status, ts: res.ts, channel, revision };
+        state[req.id] = { ...prev, status, ts: res.ts, channel: reqChannel, revision };
         result.posted++;
       } else {
         result.failed++;
@@ -749,7 +752,7 @@ export async function scanApprovals(opts?: {
       if (status === "pending" && (!req.reviewer || req.reviewer === "human")) {
         const res = await postApprovalRequest(req, token, reqChannel);
         if (res.ok) {
-          state[req.id] = { status, ts: res.ts, channel, revision };
+          state[req.id] = { status, ts: res.ts, channel: reqChannel, revision };
           result.posted++;
         } else {
           result.failed++;

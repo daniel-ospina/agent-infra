@@ -840,6 +840,23 @@ try {
       .find((r) => r.form.get("blocks")?.includes("apr-chan"));
     assert(chanPost?.form.get("channel") === "#approvals-tortoise",
       "channel routing: request channel used");
+    // P1: state records the ACTUAL posting channel (not the config one) so
+    // reply-mirroring and verdict posts target the per-repo channel.
+    const stateAfter = JSON.parse(readFileSync(stateFile, "utf-8"));
+    assert(stateAfter["apr-chan"]?.channel === "#approvals-tortoise",
+      "channel routing: state records reqChannel");
+    // P2: a follow-up from a DIFFERENT repo replies into the PARENT's channel.
+    writeApprovals([...base, {
+      id: "apr-3", from_role: "product-implementer", artifact: "x.md",
+      context: "RE: apr-1 — answer", status: "pending", reviewer: "human",
+      channel: "#approvals-other", parent: "apr-1", created_at: "2026-08-10T00:03:00Z",
+    }]);
+    const r3 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r3.posted === 1, `follow-up posted (got ${r3.posted})`);
+    const followUp3 = slack.requests.filter((r) => r.url === "/chat.postMessage")
+      .find((r) => r.form.get("blocks")?.includes("apr-3"));
+    assert(followUp3?.form.get("channel") === "#approvals",
+      "follow-up replies in the PARENT channel (config #approvals for apr-1)");
 
     // Agent follow-up with parent → posted INTO the parent thread.
     writeApprovals([...base, {
