@@ -217,3 +217,39 @@ bases").
 **Verdict: YES — enable strict up-to-date on fleet repos.** Merge queue is the
 high-throughput alternative; overkill at fleet volumes. HIGH confidence
 (OpenSSF recommendation + GitHub docs + throughput analysis).
+
+---
+
+## Research Round 3 (2026-08-11) — adversarial confirmation verdict
+
+Fresh-session adversarial verifier (empirical testing in throwaway repos +
+fleet probe): **all four practices confirmed good**, with 3 gaps folded into
+the scope:
+
+1. **L1 VERIFIED clean** — issue-workflow Branch Gate confirmed fetch-less
+   outlier; both internal precedents verified verbatim; textbook against
+   Atlassian/asam/Azure/GitHub guidance.
+2. **L2 envelope VERIFIED mechanically** — ff-pull on clean tree: post-merge
+   hook does NOT fire on ff (tested); dirty tree → abort, edits preserved;
+   untracked-file collision → abort, file preserved (fail-closed). Fleet
+   probe: zero hooks, zero sparse-checkout, zero submodules, origin/HEAD=main
+   everywhere. **P1 folded:** main-worktree-guard interaction — the guard
+   intercepts bash-tool git in main checkouts; L2 runs extension-level
+   (bypass by construction). Carve-out documented with ratified precedent
+   (auto-sync.ts) + observability (per-pull log line) + kill-switch.
+3. **L3 VERIFIED** — gpgsign bypass is process-scoped, harmless today (fleet
+   has gpgsign unset), needed where set (headless pinentry hangs); squash-
+   merge fleet means re-signed/unsigned rebased commits carry no post-merge
+   integrity value. No weakening.
+4. **Decision 2 upheld with mandatory recovery** — small-team friction
+   critique rebutted (agents pay zero rebase cost; L3 automates it; OpenSSF
+   recommendation), BUT the residual ladder case (merge lands between rebase
+   and merge) had no recovery path anywhere in commit-workflow → L3 stale-
+   merge recovery step added (fetch → rebase → checks → push
+   --force-with-lease → retry) as a MANDATORY companion to strict mode.
+   Monitor-and-downgrade escape hatch recorded.
+5. **P2 folded** — unsaved editor buffers are undetectable from git
+   (watcher-hazard class): accept-and-document per repo, per-repo warn mode
+   available.
+
+**Final verdict: PROCEED — practices confirmed good with the folded guards.**

@@ -1,6 +1,7 @@
 # Issue #178 — Agent git freshness: never work from stale checkouts
 
-Status: SCOPE — awaiting human approval gate
+Status: PLAN — scope approved (research round 3 adversarial confirmation: all
+practices verified good; 2×P1 + 1×P2 gaps folded)
 Branch: feat/178-git-freshness (cut from origin/main — dogfooding L1)
 Date: 2026-08-11
 Level: project | Complexity: standard | Team: agent-infra
@@ -93,14 +94,35 @@ verified in-repo:
 - On default branch + clean tree + no MERGE_HEAD/REBASE_HEAD + no index.lock + no dev-server guard hit → `git pull --ff-only` (AGENT_REPO_FRESHNESS_MODE=auto, default) or warn (warn mode). Git re-checks dirtiness at pull time — final arbiter.
 - On feature branch → report-only: "base is N commits behind origin/<default>".
 - Exclusions: agent-infra repo (auto-sync.ts owns it — no double-pull), submodules present (report-only), worktrees whose checked-out branch is the default branch of ANOTHER worktree (skip pull, report).
+- **main-worktree-guard interaction (adversarial-review fold, P1):** the fleet's
+  guard blocks pull/merge/rebase issued via the **bash tool** in main checkouts
+  (incident 2026-08-06). L2 runs as extension-level code, which the guard does
+  not intercept — a deliberate, documented carve-out, ratified by precedent:
+  auto-sync.ts has always done extension-level main-checkout ff-pulls
+  (agent-infra). The carve-out is safe BECAUSE the envelope is strictly
+  narrower than any bash command (deterministic ff-only pull, all guards
+  pre-checked), observable (logs `[repo-freshness] auto-pull <repo> <old>→<new>`
+  on every pull), and reversible (`AGENT_REPO_FRESHNESS_DISABLED=1`). Recorded
+  at the Scope gate; E6 covers it.
+- **Unsaved editor buffers (adversarial-review fold, P2):** undetectable from
+  git (same class as the watcher hazard) — accept-and-document per repo; repos
+  with a live editor session on main can be set to warn mode individually.
 - Wired: manifest entry + pi-config symlink + targeted live-farm symlink (drift gate green); tests against real throwaway git repos (auto-sync.test.ts pattern).
 
-**L3 — pre-PR freshness (skills/commit-workflow/workflow/01-preflight.md + 04-merge-deploy.md):**
+**L3 — pre-PR freshness + merge-time recovery (skills/commit-workflow/
+workflow/01-preflight.md + 04-merge-deploy.md):**
 - After branch detection / before PR creation: `git fetch origin "$DEFAULT_BRANCH" --quiet`; compute behind-count of branch vs origin/<default>.
 - Behind > 0 + clean tree → `git -c commit.gpgsign=false pull --rebase origin "$DEFAULT_BRANCH"`; re-run typecheck/tests after rebase (existing preflight machinery).
 - Behind > 0 + dirty tree → WARN with explicit instructions (no autostash — conflict-unsafe per research).
 - Behind = 0 → silent.
-- Source-assertion test pinning the step.
+- **Stale-merge recovery (adversarial-review fold, P1):** with strict
+  up-to-date protection, a merge can land between L3's rebase and
+  `gh pr merge` — today the workflow has NO recovery path (only
+  `git push -u origin <branch>` exists). Add to 04-merge-deploy.md: if merge
+  is blocked as stale → fetch, `git -c commit.gpgsign=false rebase
+  origin/<default>`, re-run typecheck/tests, `git push --force-with-lease`,
+  retry merge (bounded retries, then escalate).
+- Source-assertion test pinning both steps.
 
 **L0 — machine guard:** `git config --global pull.ff only` (documented in the plan; one-time fleet config, verified idempotent).
 
@@ -110,6 +132,13 @@ verified in-repo:
 - E2 (L2): real repo fixtures per state — behind+clean → ff-pulled; behind+dirty → no-op+warn; feature branch → report-only; MERGE_HEAD present → no-op; index.lock present → no-op; divergence → guidance, no pull.
 - E3 (L3): behind+clean → rebased onto origin tip; behind+dirty → warned, untouched; gpgsign flag present in the command.
 - E4 (fleet): drift audit script run post-rollout — 0 repos silently behind origin.
+- E5 (L3 recovery): merge blocked as stale → fetch + rebase + checks + `push
+  --force-with-lease` + retry merge path exists in 04-merge-deploy.md
+  (source-asserted).
+- E6 (L2 guard carve-out): repo-freshness respects its own envelope in a
+  guarded-checkout fixture (guard semantics = bash-tool interception; L2's
+  extension-level carve-out verified against the envelope list, agent-infra
+  excluded).
 
 ### In scope / out of scope
 
@@ -129,8 +158,11 @@ cmux-side surface refresh behavior.
    verification; agents cannot act on warnings.
 2. **Server-side backstop: YES** — enable "Require branches to be up to date
    before merging" on fleet repos (OpenSSF recommendation; low-throughput
-   fleet pays negligible ladder friction). Applied during rollout as an
-   operational step (admin action, not code).
+   fleet pays negligible ladder friction). Adversarial-review condition
+   folded: strict mode converts rare silent regressions into rare hard merge
+   blocks, so the L3 stale-merge recovery step (above) is MANDATORY with this
+   decision. Applied during rollout as an operational step (admin action,
+   not code); monitor-and-downgrade if friction observed.
 
 ### Complexity (domain-aware)
 
