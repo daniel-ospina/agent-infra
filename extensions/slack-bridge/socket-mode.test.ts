@@ -32,6 +32,7 @@ import {
   writeFeedbackToApprovalsFile,
   findApprovalIdByThreadTs,
   updateResolvedMessage,
+  repoNameFromUrl, // #2492: duplicated discovery parsing — regression-guarded
   type SocketModeState,
 } from "./socket-mode.js";
 
@@ -50,6 +51,15 @@ let failed = 0;
 function assert(condition: boolean, label: string): void {
   if (condition) passed++;
   else { failed++; console.error(`❌ FAIL: ${label}`); }
+}
+
+// #2492: the duplicated repoNameFromUrl must stay in sync with swarm's
+// _detect_repo parsing (trailing-slash rstripped, .git dropped).
+{
+  assert(repoNameFromUrl("https://github.com/owner/tortoise.git") === "tortoise", "repoNameFromUrl: https + .git");
+  assert(repoNameFromUrl("https://github.com/owner/tortoise/") === "tortoise", "repoNameFromUrl: trailing slash parity with swarm _detect_repo");
+  assert(repoNameFromUrl("git@github.com:owner/swarm.git") === "swarm", "repoNameFromUrl: scp-like URL");
+  assert(repoNameFromUrl("") === null, "repoNameFromUrl: empty → null");
 }
 
 function tmpDir(): string {

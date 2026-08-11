@@ -21,6 +21,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { execSync } from "node:child_process";
 
 import {
   readSession,
@@ -742,6 +743,81 @@ try {
     else process.env.SLACK_APPROVAL_FILE = prev;
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── Approval forwarding: per-repo store discovery (#2492) ─────
+{
+  const { repoNameFromUrl, deriveRepoName, approvalsStorePath, findApprovalsFile } = await import("./index.js");
+
+  // repoNameFromUrl — mirrors swarm _detect_repo parsing (last segment, .git stripped)
+  assert(repoNameFromUrl("https://github.com/daniel-ospina/tortoise.git") === "tortoise", "repoNameFromUrl: https + .git → bare name");
+  assert(repoNameFromUrl("git@github.com:daniel-ospina/swarm.git") === "swarm", "repoNameFromUrl: scp-like URL → bare name");
+  assert(repoNameFromUrl("ssh://git@github.com/daniel-ospina/dmeer.git") === "dmeer", "repoNameFromUrl: ssh:// URL → bare name");
+  assert(repoNameFromUrl("https://github.com/owner/name") === "name", "repoNameFromUrl: no .git suffix");
+  assert(repoNameFromUrl("https://github.com/owner/name/") === "name", "repoNameFromUrl: trailing slash parity with swarm _detect_repo");
+  assert(repoNameFromUrl("") === null, "repoNameFromUrl: empty → null");
+  assert(repoNameFromUrl(null) === null, "repoNameFromUrl: null → null");
+  assert(repoNameFromUrl("   ") === null, "repoNameFromUrl: whitespace → null");
+
+  // approvalsStorePath — per-repo store outside any git tree (home overridable)
+  assert(approvalsStorePath("tortoise", "/tmp/fake-home") === join("/tmp/fake-home", ".swarm", "approvals", "tortoise.json"), "approvalsStorePath: per-repo path");
+  assert(approvalsStorePath("unknown", "/tmp/fake-home") === join("/tmp/fake-home", ".swarm", "approvals", "unknown.json"), "approvalsStorePath: unknown fallback");
+
+  // deriveRepoName + findApprovalsFile against a REAL temp git repo
+  const gitDir = tmpDir();
+  const homeDir = tmpDir();
+  try {
+    execSync("git init -q", { cwd: gitDir, stdio: "ignore" });
+    // fresh git repo with NO origin remote → null (a real state)
+    assert(deriveRepoName(gitDir) === null, "deriveRepoName: git repo without origin remote → null");
+    execSync("git remote add origin https://github.com/daniel-ospina/tortoise.git", { cwd: gitDir, stdio: "ignore" });
+    assert(deriveRepoName(gitDir) === "tortoise", "deriveRepoName: git origin URL → bare name");
+    assert(deriveRepoName(join(tmpdir(), "definitely-not-a-repo-" + randomUUID().slice(0, 8))) === null, "deriveRepoName: no git → null");
+
+    // SLACK_APPROVAL_FILE set but missing → null (short-circuits discovery)
+    const prevEnv0 = process.env.SLACK_APPROVAL_FILE;
+    process.env.SLACK_APPROVAL_FILE = join(homeDir, "missing.json");
+    try {
+      assert(findApprovalsFile(gitDir) === null, "findApprovalsFile: SLACK_APPROVAL_FILE missing file → null");
+    } finally {
+      if (prevEnv0 === undefined) delete process.env.SLACK_APPROVAL_FILE;
+      else process.env.SLACK_APPROVAL_FILE = prevEnv0;
+    }
+
+    mkdirSync(join(homeDir, ".swarm", "approvals"), { recursive: true });
+    const perRepo = join(homeDir, ".swarm", "approvals", "tortoise.json");
+    writeFileSync(perRepo, "[]");
+    const prevHome = process.env.HOME;
+    process.env.HOME = homeDir;
+    try {
+      assert(findApprovalsFile(gitDir) === perRepo, "findApprovalsFile: per-repo store wins (git cwd)");
+
+      // SLACK_APPROVAL_FILE still beats the per-repo store
+      const envFile = join(homeDir, "custom.json");
+      writeFileSync(envFile, "[]");
+      const prevEnv = process.env.SLACK_APPROVAL_FILE;
+      process.env.SLACK_APPROVAL_FILE = envFile;
+      try {
+        assert(findApprovalsFile(gitDir) === envFile, "findApprovalsFile: SLACK_APPROVAL_FILE beats per-repo store");
+      } finally {
+        if (prevEnv === undefined) delete process.env.SLACK_APPROVAL_FILE;
+        else process.env.SLACK_APPROVAL_FILE = prevEnv;
+      }
+
+      // Per-repo store absent → legacy walk-up fallback still works
+      const legacy = join(gitDir, "operations", "coordination", "approvals.json");
+      mkdirSync(dirname(legacy), { recursive: true });
+      writeFileSync(legacy, "[]");
+      rmSync(perRepo, { force: true });
+      assert(findApprovalsFile(gitDir) === legacy, "findApprovalsFile: walk-up fallback when per-repo store absent");
+    } finally {
+      if (prevHome === undefined) delete process.env.HOME;
+      else process.env.HOME = prevHome;
+    }
+  } finally {
+    rmSync(gitDir, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
   }
 }
 

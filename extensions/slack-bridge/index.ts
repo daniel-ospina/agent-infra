@@ -1,8 +1,9 @@
 // Pi Slack Bridge extension — output routing (Phase 2) + approval forwarding (#40).
 // Registers session_start, agent_end, session_shutdown hooks (Bridge daemon
-// routing). Approval forwarding polls the swarm approvals.json and posts to
-// Slack via the Web API — independent of the Bridge daemon, gated on
-// SLACK_BOT_TOKEN + SLACK_APPROVAL_CHANNEL / SLACK_CHANNEL.
+// routing). Approval forwarding polls the per-repo approvals store
+// (~/.swarm/approvals/<repo>.json, #2492) and posts to Slack via the Web API
+// — independent of the Bridge daemon, gated on SLACK_BOT_TOKEN +
+// SLACK_APPROVAL_CHANNEL / SLACK_CHANNEL.
 // Fire-and-forget for all external calls — never blocks the agent loop.
 // Gracefully degrades when the Bridge daemon (localhost:4200) is unreachable.
 //
@@ -19,6 +20,7 @@ import {
   writeFileSync,
   mkdirSync,
   renameSync,
+  chmodSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
 import { spawn, execSync } from "node:child_process";
@@ -525,13 +527,58 @@ export async function fetchThreadReplies(
   }
 }
 
-/** Locate approvals.json: SLACK_APPROVAL_FILE, else walk up from cwd looking
- * for <dir>/operations/coordination/approvals.json and
- * <dir>/swarm/operations/coordination/approvals.json (covers the swarm repo
- * as a sibling of any workspace). */
+/** Extract the bare repo name from a git remote URL (#2492). Same parsing
+ * as swarm's `_detect_repo` (which rstrips `/` before taking the last path
+ * segment, then drops a trailing `.git`). Returns null when empty. */
+export function repoNameFromUrl(url: string | null | undefined): string | null {
+  const s = (url ?? "").trim().replace(/\/+$/, "");
+  if (!s) return null;
+  const name = s.split("/").pop() ?? "";
+  const clean = name.endsWith(".git") ? name.slice(0, -4) : name;
+  return clean || null;
+}
+
+/** Derive the current repo NAME from the git origin remote of cwd (#2492).
+ * Same contract as swarm's `_detect_repo`: `git remote get-url origin`, then
+ * the last URL segment. Failure (no git, no remote, timeout, bad cwd) → null
+ * = no repo context. */
+export function deriveRepoName(cwd: string): string | null {
+  try {
+    const out = execSync("git remote get-url origin", {
+      cwd,
+      timeout: GIT_REMOTE_TIMEOUT_MS,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return repoNameFromUrl(out.trim());
+  } catch {
+    return null; // no git / no remote / timeout / bad cwd
+  }
+}
+
+/** Per-repo approval store path: ~/.swarm/approvals/<repo>.json — OUTSIDE any
+ * git tree (#2492). `home` is overridable for tests (defaults to os.homedir,
+ * which honors $HOME at call time). */
+export function approvalsStorePath(repo: string, home = homedir()): string {
+  return join(home, ".swarm", "approvals", `${repo}.json`);
+}
+
+/** Locate approvals.json: SLACK_APPROVAL_FILE, else the per-repo store
+ * ~/.swarm/approvals/<repo>.json (repo derived from the git origin remote of
+ * cwd — #2492), else walk up from cwd looking for
+ * <dir>/operations/coordination/approvals.json and
+ * <dir>/swarm/operations/coordination/approvals.json (legacy fallback —
+ * pre-#2492 checkouts / no git context). */
 export function findApprovalsFile(cwd = process.cwd()): string | null {
   const explicit = process.env.SLACK_APPROVAL_FILE;
   if (explicit) return existsSync(explicit) ? explicit : null;
+  // #2492: per-repo store wins — the store lives OUTSIDE any git tree.
+  const repo = deriveRepoName(cwd);
+  if (repo) {
+    const perRepo = approvalsStorePath(repo);
+    if (existsSync(perRepo)) return perRepo;
+  }
+  // Legacy walk-up (final fallback).
   let dir = cwd;
   for (let i = 0; i < 8; i++) {
     for (const candidate of [
@@ -948,7 +995,10 @@ function patchApprovalsEntry(file: string, id: string, patch: Record<string, unk
     if (idx < 0) return false;
     all[idx] = { ...all[idx], ...patch };
     const tmp = file + ".tmp";
-    writeFileSync(tmp, JSON.stringify(all, null, 2), "utf-8");
+    // #2492 review: keep the store 0600 — the tmp inode must not downgrade
+    // the per-repo store to umask-default (0644) on rename.
+    writeFileSync(tmp, JSON.stringify(all, null, 2), { mode: 0o600, encoding: "utf-8" });
+    chmodSync(tmp, 0o600);
     renameSync(tmp, file);
     return true;
   } catch (e: any) {

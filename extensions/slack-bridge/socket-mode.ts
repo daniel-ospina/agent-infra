@@ -38,7 +38,8 @@
 
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -488,13 +489,48 @@ export function updateResolvedMessage(opts: {
 
 // ── Verdict write contract (approvals.json) ──────────
 // Same file + format scanApprovals() reads (the swarm review_approval()
-// contract). Duplicated discovery from index.ts (SLACK_APPROVAL_FILE override,
-// else walk up: <dir>/operations/coordination/approvals.json or
-// <dir>/swarm/operations/coordination/approvals.json).
+// contract). Duplicated discovery from index.ts (#2492): SLACK_APPROVAL_FILE
+// override, else the per-repo store ~/.swarm/approvals/<repo>.json (repo from
+// the git origin remote of cwd), else walk up:
+// <dir>/operations/coordination/approvals.json or
+// <dir>/swarm/operations/coordination/approvals.json.
+
+/** Extract the bare repo name from a git remote URL (#2492). Same parsing as
+ * swarm's `_detect_repo` (which rstrips `/` before taking the last path
+ * segment, then drops a trailing `.git`). Exported for tests. */
+export function repoNameFromUrl(url: string | null | undefined): string | null {
+  const s = (url ?? "").trim().replace(/\/+$/, "");
+  if (!s) return null;
+  const name = s.split("/").pop() ?? "";
+  const clean = name.endsWith(".git") ? name.slice(0, -4) : name;
+  return clean || null;
+}
+
+/** Derive the current repo NAME from the git origin remote of cwd (#2492). */
+function deriveRepoName(cwd: string): string | null {
+  try {
+    const out = execSync("git remote get-url origin", {
+      cwd,
+      timeout: 2000,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return repoNameFromUrl(out.trim());
+  } catch {
+    return null;
+  }
+}
 
 function findApprovalsFile(cwd = process.cwd()): string | null {
   const explicit = process.env.SLACK_APPROVAL_FILE;
   if (explicit) return existsSync(explicit) ? explicit : null;
+  // #2492: per-repo store wins — the store lives OUTSIDE any git tree.
+  const repo = deriveRepoName(cwd);
+  if (repo) {
+    const perRepo = join(homedir(), ".swarm", "approvals", `${repo}.json`);
+    if (existsSync(perRepo)) return perRepo;
+  }
+  // Legacy walk-up (final fallback).
   let dir = cwd;
   for (let i = 0; i < 8; i++) {
     for (const candidate of [
@@ -544,7 +580,10 @@ function readApprovalsFile(
  * half-written by scanApprovals. Throws on IO failure (callers catch). */
 function writeApprovalsFile(file: string, approvals: ApprovalRequest[]): void {
   const tmp = file + ".tmp";
-  writeFileSync(tmp, JSON.stringify(approvals, null, 2), "utf-8");
+  // #2492 review: keep the store 0600 — the tmp inode must not downgrade
+  // the per-repo store to umask-default (0644) on rename.
+  writeFileSync(tmp, JSON.stringify(approvals, null, 2), { mode: 0o600, encoding: "utf-8" });
+  chmodSync(tmp, 0o600);
   renameSync(tmp, file);
 }
 
