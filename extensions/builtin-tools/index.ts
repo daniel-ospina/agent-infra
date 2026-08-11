@@ -6,6 +6,15 @@
  *   - web_fetch   — Fetch and extract page content (replaces WebFetch)
  *   - todo_write  — Task tracking (replaces TodoWrite)
  *   - task        — Sub-agent dispatcher (replaces Agent/Task tool)
+ *
+ * Task-tool reliability tiers (#152/#153):
+ *   - Tier 1: first-output timeout (60s) — no output ever → retryable undefined
+ *   - Tier 2: heartbeat silence (30 min, TASK_HEARTBEAT_TIMEOUT_MS) → partial results
+ *   - Tier 3: exit watchdog (120s, TASK_EXIT_GRACE_MS) — both stdio streams EOF
+ *     but process alive → SIGTERM→SIGKILL. Fixes #153 (session finished, pi
+ *     process hangs on exit — event loop won't drain).
+ *   - Provider fallback: qwen connection-error storm (#152) → one retry on
+ *     TASK_FALLBACK_MODEL (default deepseek-v4-pro; TASK_FALLBACK_DISABLE=1 off).
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,6 +27,7 @@ import * as path from "node:path";
 import { homedir } from "node:os";
 import { retry, createCircuitBreaker } from "../shared/retry.js";
 import { register } from "../shared/health.js";
+import { treeKill } from "../shared/tree-kill.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -225,6 +235,155 @@ export function resolveProviderModel(
 
   // Unknown model → passthrough (no provider); caller falls back to legacy.
   return { model: raw };
+}
+
+// ── Sub-agent reliability: exit watchdog + provider fallback (#152/#153) ──
+//
+// Two failure modes on the aliyuncs qwen compatible-mode endpoint:
+//   - #152 connection error: mid-stream death → 3 retries fail with
+//     "Connection error." → session ends. Agent-infra fix: when a qwen
+//     sub-agent dies with connection-error signatures, retry the dispatch
+//     ONCE on the fallback model (default deepseek-v4-pro).
+//   - #153 silent stall: session finishes (stopReason "stop"), session file
+//     flushed, but the pi process hangs on exit (event loop won't drain —
+//     MCP disconnect leak / slack-bridge retry exhaustion). Agent-infra fix:
+//     tier-3 exit watchdog — when both stdio streams have ended but the
+//     process hasn't exited within the grace period, kill it so the parent
+//     gets the already-captured output instead of waiting out the 30-min
+//     heartbeat window.
+//
+// Env overrides: TASK_EXIT_GRACE_MS (default 120_000), TASK_FALLBACK_MODEL
+// (default "deepseek-v4-pro"), TASK_FALLBACK_DISABLE=1 (turn fallback off).
+
+/** Default grace period between stdio EOF and forced kill (#153). */
+export const DEFAULT_EXIT_GRACE_MS = 120_000;
+
+/** Resolve the exit-watchdog grace from TASK_EXIT_GRACE_MS (default 120s).
+ * Clamped ≥ 1000ms — a grace below 1s could kill a process that merely
+ * flushes its final buffers between stream EOF and exit. */
+export function getExitGraceMs(): number {
+  const raw = Number(process.env.TASK_EXIT_GRACE_MS);
+  return Math.max(1_000, Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_EXIT_GRACE_MS);
+}
+
+/** Minimal stream surface the watchdog needs (tests inject EventEmitter fakes). */
+interface StreamLike {
+  on(event: string, listener: (...args: any[]) => void): void;
+}
+
+export interface ExitWatchdog {
+  /** Cancel pending timers (call on process close / settle). */
+  disarm(): void;
+}
+
+/**
+ * Tier-3 exit watchdog (#153): arm a kill timer when BOTH stdio streams have
+ * ended (EOF) but the process is still alive after `graceMs` — a session that
+ * finished writing but whose event loop won't drain. SIGTERM via treeKill
+ * (reaps orphaned MCP servers too), then SIGKILL after 5s if still alive.
+ *
+ * `kill` is injectable for tests; default walks the process tree with
+ * shared/tree-kill.ts (same pattern as the subagent extension #137).
+ */
+export function armExitWatchdog(opts: {
+  pid: number;
+  stdout: StreamLike;
+  stderr: StreamLike;
+  graceMs: number;
+  kill?: (signal: NodeJS.Signals) => void;
+  log?: (msg: string) => void;
+}): ExitWatchdog {
+  const killFn = opts.kill ?? ((signal: NodeJS.Signals) => treeKill(opts.pid, signal));
+  const logFn = opts.log ?? ((msg: string) => console.error(`[task] ${msg}`));
+  let stdoutEnded = false;
+  let stderrEnded = false;
+  let timer: NodeJS.Timeout | null = null;
+  let sigkillTimer: NodeJS.Timeout | null = null;
+  let disarmed = false;
+
+  const clearTimers = () => {
+    if (timer) clearTimeout(timer);
+    if (sigkillTimer) clearTimeout(sigkillTimer);
+    timer = null;
+    sigkillTimer = null;
+  };
+
+  const check = () => {
+    if (disarmed || timer) return;
+    if (!(stdoutEnded && stderrEnded)) return;
+    timer = setTimeout(() => {
+      // Both streams closed; process still alive → hung on exit. Kill it.
+      logFn(`sub-agent (pid ${opts.pid}) hung on exit for ${opts.graceMs / 1000}s after stdio EOF — killing`);
+      killFn("SIGTERM");
+      sigkillTimer = setTimeout(() => killFn("SIGKILL"), 5000);
+    }, opts.graceMs);
+  };
+
+  opts.stdout.on("end", () => { stdoutEnded = true; check(); });
+  opts.stderr.on("end", () => { stderrEnded = true; check(); });
+
+  return {
+    disarm: () => {
+      disarmed = true;
+      clearTimers();
+    },
+  };
+}
+
+/** Default fallback model for #152 connection-error storms. */
+export const DEFAULT_FALLBACK_MODEL = "deepseek-v4-pro";
+
+/** Resolve the fallback model from TASK_FALLBACK_MODEL (default deepseek-v4-pro). */
+export function getFallbackModel(): string {
+  return process.env.TASK_FALLBACK_MODEL || DEFAULT_FALLBACK_MODEL;
+}
+
+/** The task-tool result shape connectionErrorDetected inspects. */
+export interface TaskResultLike {
+  content?: Array<{ type?: string; text?: string }>;
+  details?: Record<string, unknown>;
+}
+
+/**
+ * Detect a provider connection-error death (#152): stopReason error /
+ * "Connection error" / "terminated" in the stderr channel or (with a non-zero
+ * exit) in the output tail. Clean exits whose output merely MENTIONS the
+ * phrase (e.g. research content) are NOT connection failures — guarded by the
+ * exit-code requirement so a successful dispatch can't trigger a fallback.
+ */
+export function connectionErrorDetected(result: TaskResultLike | undefined | null): boolean {
+  if (!result) return false;
+  const output = (result.content ?? [])
+    .map((c) => (typeof c.text === "string" ? c.text : ""))
+    .join("\n");
+  const stderr = typeof result.details?.stderr === "string" ? result.details.stderr : "";
+  const exitCode = typeof result.details?.exitCode === "number" ? result.details.exitCode : null;
+  const sigInStderr = /(connection error|stopReason[: ]*"?error"?|terminated)/i.test(stderr);
+  if (sigInStderr) return true;
+  const sigInOutput = /(connection error|stopReason[: ]*"?error"?|terminated)/i.test(output);
+  return sigInOutput && exitCode !== 0;
+}
+
+export interface FallbackDecision {
+  provider?: string;
+  result: TaskResultLike | undefined | null;
+  fallbackDisabled: boolean;
+  isFallbackAttempt: boolean;
+}
+
+/**
+ * Should the dispatch be retried once on the fallback model (#152)? All must
+ * hold: fallback enabled (not TASK_FALLBACK_DISABLE), not already a fallback
+ * dispatch (max 1 fallback — never fallback-loop the fallback), provider is a
+ * qwen variant (only qwen exhibits the #152 storm), and the result carries a
+ * connection-error signature.
+ */
+export function shouldFallback(d: FallbackDecision): boolean {
+  if (d.fallbackDisabled) return false;
+  if (d.isFallbackAttempt) return false;
+  const provider = (d.provider ?? "").toLowerCase();
+  if (!provider.startsWith("qwen")) return false;
+  return connectionErrorDetected(d.result);
 }
 
 export function stripHtml(html: string): string {
@@ -554,6 +713,16 @@ export default function (pi: ExtensionAPI) {
       let stderr = "";
       let lastHeartbeat = Date.now();
       let settled = false;
+      // #153: tier-3 exit watchdog — both stdio streams EOF but the process
+      // is still alive → hung on exit (event loop won't drain). Kill after
+      // TASK_EXIT_GRACE_MS (default 120s) so the parent gets the already-
+      // captured output instead of waiting out the 30-min heartbeat window.
+      const exitWatchdog = armExitWatchdog({
+        pid: proc.pid ?? 0,
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+        graceMs: getExitGraceMs(),
+      });
       // #489 class: pi in print mode BUFFERS output — a sub-agent doing long
       // consecutive tool calls (bash → read → edit) emits nothing to stdout
       // until the final turn message. The old 660s threshold (set to exceed
@@ -585,6 +754,7 @@ export default function (pi: ExtensionAPI) {
       const doResolve = (value: { content: any[]; details: Record<string, unknown> } | undefined) => {
         if (settled) return;
         settled = true;
+        exitWatchdog.disarm();
         resolve(value);
       };
 
@@ -639,6 +809,7 @@ export default function (pi: ExtensionAPI) {
 
       proc.on("error", (err: Error) => {
         clearInterval(heartbeat);
+        exitWatchdog.disarm();
         // Spawn errors (pi not found, etc.) are NOT retryable — return the error
         doResolve({ content: [{ type: "text", text: `Sub-agent failed: ${err.message}\n\n--- stderr ---\n${cleanStderr(stderr).slice(-4000)}` }], details: { model, provider, isError: true } });
       });
@@ -713,18 +884,68 @@ export default function (pi: ExtensionAPI) {
 
       // Retry on zero-output failures (model/network hang) with backoff + circuit breaker.
       // Does NOT retry when sub-agent produces partial output — those go to the caller.
-      const result = await retry(
-        () => spawnSubAgent(model, provider, subAgentEnv, args),
-        {
-          maxAttempts: 3,
-          baseDelayMs: 1000,
-          maxDelayMs: 16000,
-          circuitBreaker: taskCircuitBreaker,
-          onRetry: (attempt, delayMs) => {
-            console.log(`[task] retry ${attempt}/${3} — waiting ${delayMs}ms`);
-          },
+      const retryOptions = {
+        maxAttempts: 3,
+        baseDelayMs: 1000,
+        maxDelayMs: 16000,
+        circuitBreaker: taskCircuitBreaker,
+        onRetry: (attempt: number, delayMs: number) => {
+          console.log(`[task] retry ${attempt}/${3} — waiting ${delayMs}ms`);
         },
+      };
+      let result = await retry(
+        () => spawnSubAgent(model, provider, subAgentEnv, args),
+        retryOptions,
       );
+
+      // #152: provider auto-fallback — the retry wrapper only re-runs on
+      // zero-output; a connection-error death returns a DEFINED result
+      // (non-zero exit + error text) so it exits as "success". Detect that
+      // signature on a qwen provider and dispatch ONCE on the fallback model
+      // (TASK_FALLBACK_MODEL, default deepseek-v4-pro). Max 1 fallback — the
+      // fallback dispatch's own result is never re-checked, so no loop.
+      const fallbackDisabled = process.env.TASK_FALLBACK_DISABLE === "1";
+      const fallbackModel = getFallbackModel();
+      if (
+        !fallbackDisabled &&
+        result.status === "success" &&
+        result.value &&
+        shouldFallback({
+          provider,
+          result: result.value,
+          fallbackDisabled,
+          isFallbackAttempt: false,
+        })
+      ) {
+        // Resolve the fallback provider from the fallback model (#154 rules).
+        const fbResolved = resolveProviderModel(fallbackModel);
+        const fallbackProvider = fbResolved.provider ?? "deepseek";
+        const primaryValue = result.value;
+        console.log(`[builtin-tools] provider fallback: ${provider} → ${fallbackModel} after connection error`);
+        const fbArgs = ["-p", "--provider", fallbackProvider, "--model", fallbackModel, "--no-session", params.prompt];
+        const fbResult = await retry(
+          () => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, fbArgs),
+          retryOptions,
+        );
+        if (fbResult.status === "success" && fbResult.value) {
+          result = fbResult;
+        } else {
+          // Fallback also failed — keep the original connection-error result,
+          // annotated so the caller can see the fallback was attempted.
+          result = {
+            ...result,
+            value: {
+              ...primaryValue,
+              details: {
+                ...(primaryValue.details ?? {}),
+                fallbackFrom: provider,
+                fallbackTo: fallbackModel,
+                fallbackStatus: fbResult.status,
+              },
+            },
+          };
+        }
+      }
 
       if (result.status === "circuit_open") {
         return {
