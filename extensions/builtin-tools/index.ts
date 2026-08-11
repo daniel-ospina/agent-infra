@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import { spawn } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import * as path from "node:path";
+import { homedir } from "node:os";
 import { retry, createCircuitBreaker } from "../shared/retry.js";
 import { register } from "../shared/health.js";
 
@@ -116,6 +117,114 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 	}
 
 	return { command: "pi", args };
+}
+
+// ── Sub-agent model resolution (#154) ───────────────────────────────
+//
+// The task tool historically defaulted the provider (`claude*` → anthropic,
+// everything else → deepseek), so `task(model="qwen3.8-max")` spawned
+// `pi -p --provider deepseek --model qwen3.8-max` and the deepseek endpoint
+// rejected the model. #154 adds model-driven provider resolution:
+//
+//   - "provider/model" (e.g. "qwen/qwen3.8-max") → split on the FIRST slash
+//     and use both parts (model ids may themselves contain slashes).
+//   - bare model id (e.g. "qwen3.8-max") → look it up across configured
+//     providers in ~/.pi/agent/models.json and use its provider.
+//   - unknown model / no registry → passthrough with no provider; the caller
+//     keeps the legacy default-provider behavior so nothing regresses.
+//
+// A model id present under MULTIPLE providers (qwen3.8-max lives under both
+// "qwen" and "qwen-tp") is ambiguous for pi's own resolver too (pi rejects
+// ambiguous bare ids), so we pick deterministically: prefer the provider whose
+// name equals the model's family prefix ("qwen3.8-max" → "qwen"), else the
+// first provider in registry order.
+
+export interface ModelRegistry {
+  providers?: Record<string, { models?: Array<{ id: string }> }>;
+}
+
+export interface ProviderModelResolution {
+  provider?: string;
+  model: string;
+}
+
+/** Path to the user's models.json — mirrors pi's own config resolution
+ * (PI_CODING_AGENT_DIR override, else ~/.pi/agent/models.json). */
+export function getModelsJsonPath(): string {
+  const envDir = process.env.PI_CODING_AGENT_DIR;
+  return envDir
+    ? resolve(envDir, "models.json")
+    : resolve(homedir(), ".pi", "agent", "models.json");
+}
+
+/** Load the configured providers/models registry. Returns {} on missing or
+ * unparseable files — callers fall back to legacy behavior. */
+export function loadModelRegistry(): ModelRegistry {
+  try {
+    const modelsPath = getModelsJsonPath();
+    if (!fs.existsSync(modelsPath)) return {};
+    const data = JSON.parse(fs.readFileSync(modelsPath, "utf-8")) as {
+      providers?: ModelRegistry["providers"];
+    } | null;
+    if (data && typeof data.providers === "object" && data.providers !== null) {
+      return { providers: data.providers };
+    }
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Resolve the provider for a task-tool model param.
+ *
+ * Pure function (registry injectable for tests). Returns:
+ *   - "provider/model"        → { provider, model } (first slash only)
+ *   - bare known model id     → { provider, model } (via registry)
+ *   - ambiguous id            → deterministic winner (family-prefix, else first)
+ *   - unknown / empty/undefined → { model } with NO provider — passthrough,
+ *                                caller keeps legacy default-provider behavior
+ */
+export function resolveProviderModel(
+  modelParam: string | undefined | null,
+  registry: ModelRegistry = loadModelRegistry(),
+): ProviderModelResolution {
+  const raw = modelParam ?? "";
+  const param = raw.trim();
+  if (!param) return { model: raw };
+
+  // Explicit "provider/model" — only the FIRST slash splits.
+  const slash = param.indexOf("/");
+  if (slash > 0 && slash < param.length - 1) {
+    const provider = param.slice(0, slash).trim();
+    const model = param.slice(slash + 1).trim();
+    if (provider && model) return { provider, model };
+  }
+
+  // Bare model id → find its provider(s) across configured providers.
+  const providers = registry?.providers ?? {};
+  const matches: string[] = [];
+  for (const [name, p] of Object.entries(providers)) {
+    if (
+      Array.isArray(p?.models) &&
+      p.models.some((m) => m && m.id === param)
+    ) {
+      matches.push(name);
+    }
+  }
+
+  if (matches.length === 1) return { provider: matches[0], model: param };
+
+  if (matches.length > 1) {
+    // Ambiguous: prefer the provider whose name equals the model's family
+    // prefix ("qwen3.8-max" → "qwen" over "qwen-tp"); else first in order.
+    const prefix = (param.match(/^[A-Za-z]+/) ?? [""])[0].toLowerCase();
+    const familyMatch = matches.find((name) => name.toLowerCase() === prefix);
+    return { provider: familyMatch ?? matches[0], model: param };
+  }
+
+  // Unknown model → passthrough (no provider); caller falls back to legacy.
+  return { model: raw };
 }
 
 export function stripHtml(html: string): string {
@@ -555,7 +664,7 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(
         Type.String({
           description:
-            "Model to use (default: deepseek-v4-flash).",
+            "Model to use (default: deepseek-v4-flash). Accepts 'provider/model' (e.g. 'qwen/qwen3.8-max' → provider qwen) or a bare model id resolved against ~/.pi/agent/models.json (e.g. 'qwen3.8-max' → qwen, 'deepseek-v4-flash' → deepseek). Unknown models fall back to the default provider.",
         })
       ),
       mcp_servers: Type.Optional(
@@ -566,8 +675,16 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params) {
-      const model = params.model ?? "deepseek-v4-flash";
-      const provider = model.startsWith("claude") ? "anthropic" : "deepseek";
+      const modelParam = params.model ?? "deepseek-v4-flash";
+      // #154: resolve provider from the model param — "provider/model" splits
+      // explicitly; bare model ids are looked up across configured providers
+      // (~/.pi/agent/models.json). Unresolvable models keep the legacy
+      // claude→anthropic / else→deepseek default so nothing regresses.
+      const resolved = resolveProviderModel(modelParam);
+      const model = resolved.model || modelParam;
+      const provider =
+        resolved.provider ??
+        (model.startsWith("claude") ? "anthropic" : "deepseek");
 
       // #36: Ensure sub-agent PATH includes common python3 locations.
       const augmentedPath = getSubAgentPath();

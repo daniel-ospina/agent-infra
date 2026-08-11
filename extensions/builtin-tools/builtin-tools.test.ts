@@ -2,7 +2,8 @@
  * builtin-tools.test.ts — unit tests for builtin-tools/index.ts
  *
  * Covers: HTML stripping, Perplexity key resolution, timeout constants,
- * regression tests for known bugs (#5838, #5526, #5954, #5955).
+ * provider/model resolution (#154), regression tests for known bugs
+ * (#5838, #5526, #5954, #5955).
  *
  * Run: npx tsx extensions/builtin-tools/builtin-tools.test.ts
  *
@@ -10,9 +11,10 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath } from "./index.js";
+import type { ModelRegistry } from "./index.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
-import { readFileSync, renameSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -289,6 +291,139 @@ test("does not duplicate the runtime dir", () => {
     if (saved === undefined) delete process.env.PATH;
     else process.env.PATH = saved;
   }
+});
+
+// ── resolveProviderModel — provider/model routing (#154) ─
+
+section("resolveProviderModel — provider/model routing (#154)");
+
+// Fixture mirroring the real models.json shape: qwen3.8-max is ambiguous
+// (lives under both "qwen" and "qwen-tp"), deepseek-v4-flash is unique.
+const fixtureRegistry: ModelRegistry = {
+  providers: {
+    deepseek: {
+      models: [{ id: "deepseek-v4-pro" }, { id: "deepseek-v4-flash" }],
+    },
+    qwen: {
+      models: [{ id: "qwen3.8-max" }, { id: "qwen3.7-max" }],
+    },
+    "qwen-tp": {
+      models: [{ id: "qwen3.8-max" }, { id: "deepseek-v4-flash-0731" }],
+    },
+    zai: { models: [{ id: "glm-5.2" }] },
+  },
+};
+
+test('"qwen/qwen3.8-max" splits into provider qwen + model qwen3.8-max', () => {
+  deepEqual(resolveProviderModel("qwen/qwen3.8-max", fixtureRegistry), {
+    provider: "qwen",
+    model: "qwen3.8-max",
+  });
+});
+
+test('bare "deepseek-v4-flash" resolves via registry to provider deepseek', () => {
+  deepEqual(resolveProviderModel("deepseek-v4-flash", fixtureRegistry), {
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+  });
+});
+
+test('"provider/with/slashes" splits only on the first slash', () => {
+  deepEqual(resolveProviderModel("provider/with/slashes", fixtureRegistry), {
+    provider: "provider",
+    model: "with/slashes",
+  });
+});
+
+test("ambiguous id prefers family-prefix provider (qwen3.8-max → qwen over qwen-tp)", () => {
+  deepEqual(resolveProviderModel("qwen3.8-max", fixtureRegistry), {
+    provider: "qwen",
+    model: "qwen3.8-max",
+  });
+});
+
+test("unknown bare model passes through with NO provider (legacy fallback in caller)", () => {
+  deepEqual(resolveProviderModel("totally-unknown-model", fixtureRegistry), {
+    model: "totally-unknown-model",
+  });
+});
+
+test("empty/undefined model param passes through with no provider", () => {
+  deepEqual(resolveProviderModel("", fixtureRegistry), { model: "" });
+  deepEqual(resolveProviderModel(undefined, fixtureRegistry), { model: "" });
+});
+
+test("task tool keeps legacy default provider for unresolvable models (#154)", () => {
+  ok(
+    source.includes("resolved.provider ??") &&
+      source.includes("startsWith(\"claude\") ? \"anthropic\" : \"deepseek\""),
+    "unresolvable models must keep the legacy claude→anthropic / else→deepseek default",
+  );
+  ok(source.includes("\"-p\", \"--provider\", provider, \"--model\", model"), "args must still pass --provider/--model explicitly");
+});
+
+// ── loadModelRegistry / getModelsJsonPath (#154) ──────
+
+section("loadModelRegistry — models.json loading (#154)");
+
+test("loadModelRegistry reads models.json from PI_CODING_AGENT_DIR override", () => {
+  const tmpDir = resolve(__dirname, ".tmp-models-registry");
+  mkdirSync(tmpDir, { recursive: true });
+  writeFileSync(
+    resolve(tmpDir, "models.json"),
+    JSON.stringify({
+      providers: {
+        qwen: { models: [{ id: "qwen3.8-max" }] },
+        "qwen-tp": { models: [{ id: "qwen3.8-max" }] },
+      },
+    }),
+  );
+  const saved = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = tmpDir;
+  try {
+    equal(getModelsJsonPath(), resolve(tmpDir, "models.json"));
+    const reg = loadModelRegistry();
+    ok(reg.providers?.qwen, "qwen provider should be loaded");
+    ok(reg.providers?.["qwen-tp"], "qwen-tp provider should be loaded");
+    // End-to-end through the resolver with the loaded registry.
+    deepEqual(resolveProviderModel("qwen3.8-max", reg), {
+      provider: "qwen",
+      model: "qwen3.8-max",
+    });
+  } finally {
+    if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = saved;
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("loadModelRegistry returns empty registry when models.json missing", () => {
+  const tmpDir = resolve(__dirname, ".tmp-models-registry-empty");
+  mkdirSync(tmpDir, { recursive: true });
+  const saved = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = tmpDir;
+  try {
+    deepEqual(loadModelRegistry(), {});
+    deepEqual(resolveProviderModel("qwen3.8-max"), { model: "qwen3.8-max" });
+  } finally {
+    if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = saved;
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("real registry (if present) routes bare qwen3.8-max to provider qwen", () => {
+  if (!existsSync(getModelsJsonPath())) {
+    console.log("  ⏭️ no models.json on this machine — skipping real-registry check");
+    return;
+  }
+  const reg = loadModelRegistry();
+  const qwenHas = reg.providers?.qwen?.models?.some((m) => m.id === "qwen3.8-max");
+  if (!qwenHas) {
+    console.log("  ⏭️ qwen3.8-max not under a 'qwen' provider in real registry — skipping");
+    return;
+  }
+  equal(resolveProviderModel("qwen3.8-max", reg).provider, "qwen");
 });
 
 // ── getPiInvocation — canonical-copy drift guard (#101) ─
