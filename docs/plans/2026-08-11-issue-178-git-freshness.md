@@ -297,11 +297,11 @@ damaged (research-verified envelope).
   - agent-infra → FLIP strict false→true, keep existing pipeline-compliance
     context (exists and runs).
   - tortoise → no-op (already strict, 9 contexts).
-  - DMeer → CREATE strict + currently-green job contexts from the verified
-    inventory (audit, build, Bundle daemon, TypeScript check, Unit tests,
-    E2E — LocalStore data layer); any context RED on main tip at rollout is
-    EXCLUDED and recorded as deferred (E2E was failing at verification time
-    — go/no-go input).
+  - DMeer → CREATE strict + the GREEN SUBSET of the verified job-context
+    inventory = audit, build, Bundle daemon, TypeScript check, Unit tests;
+    E2E — LocalStore data layer was RED on main tip at verification time →
+    EXCLUDED and recorded as deferred (go/no-go rule: any context red on
+    main tip at rollout is deferred, never required).
   - premise-labs → DEFER creation (CI 3/4 red at verification time:
     python-lint/markdownlint/python-tests/link-check — creating protection
     would deadlock all merges until fixed; L1/L2/L3 still cover it).
