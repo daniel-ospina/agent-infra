@@ -291,16 +291,29 @@ damaged (research-verified envelope).
 **Intent:** Fleet-wide safety net + verification at zero drift.
 **Acceptance:**
 - `git config --global pull.ff only` set (idempotent).
-- GitHub "require branches to be up to date before merging" per verified
-  state (plan-review folds): agent-infra → FLIP strict false→true, keep
-  existing pipeline-compliance context; tortoise → no-op (already strict);
-  DMeer / premise-labs / swarm → CREATE protection with strict + the repo's
-  real CI check context(s) (workflow-name contexts verified to exist);
-  autocast-project → EXCLUDED from protection rollout (remote is
-  connormcmk/autocast-project — no admin access; still covered by L1/L2/L3
-  + drift audit). Verify post-apply via branches/main/protection (assert
-  strict==true, contexts non-empty). Monitor-and-downgrade escape hatch
-  recorded.
+- GitHub "require branches up to date before merging" per LIVE EVIDENCE
+  (plan-review cycle 2 P1 fold — contexts are JOB names, verified via
+  commits/{sha}/check-runs on default-branch tips + PR heads):
+  - agent-infra → FLIP strict false→true, keep existing pipeline-compliance
+    context (exists and runs).
+  - tortoise → no-op (already strict, 9 contexts).
+  - DMeer → CREATE strict + currently-green job contexts from the verified
+    inventory (audit, build, Bundle daemon, TypeScript check, Unit tests,
+    E2E — LocalStore data layer); any context RED on main tip at rollout is
+    EXCLUDED and recorded as deferred (E2E was failing at verification time
+    — go/no-go input).
+  - premise-labs → DEFER creation (CI 3/4 red at verification time:
+    python-lint/markdownlint/python-tests/link-check — creating protection
+    would deadlock all merges until fixed; L1/L2/L3 still cover it).
+  - swarm → DO NOT create (workflows produce ZERO check runs — archived
+    upstream dependency; a required context would be phantom and block every
+    merge forever; revisit when CI is restored).
+  - autocast-project → EXCLUDED (remote connormcmk/autocast-project — no
+    admin access; still covered by L1/L2/L3 + drift audit).
+  Post-apply verification: assert strict==true AND that each required context
+  actually appears (and passes) on a fresh PR head — contexts-array-non-empty
+  alone is vacuous (API stores arbitrary names). Monitor-and-downgrade
+  escape hatch recorded.
 - Fleet drift audit (fetch all + behind-count) over the known fleet dirs
   (agent-infra, tortoise, DMeer, premise-labs, swarm, autocast-project,
   AutoCast, eldato-dm-downloads, tortoise-launch-roadmap) shows 0
