@@ -18,6 +18,7 @@
         "reflect-hook.ts",
         "shared/",
         "auto-sync.ts",
+        "task-heartbeat.ts",
         "carousel-designer.ts",
         "cmux-session.ts",
         "custom-provider-openrouter/",
