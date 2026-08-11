@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, getTaskMaxDispatchMs } from "./index.js";
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
 
@@ -807,11 +807,39 @@ test("tick overwrites state fields (self-healing)", () => {
   equal(st.lastMarkerAt, 100);
 });
 
-test("unparseable marker-prefixed line still counts as marker (discard semantics)", () => {
+test("unknown-kind prefix line is foreign — preserved, no state change (review fix)", () => {
   const st = createHeartbeatState();
-  equal(parseHeartbeatLine("[task-heartbeat] something_unknown x=1", st, 5), true);
-  equal(st.lastMarkerAt, 5, "still a life sign");
-  equal(st.toolsInFlight, 0, "no state change");
+  equal(parseHeartbeatLine("[task-heartbeat] something_unknown x=1", st, 5), false, "unknown kind → caller keeps it as ordinary stderr");
+  equal(st.lastMarkerAt, 0, "foreign line grants no state freshness");
+  equal(st.toolsInFlight, 0);
+});
+
+test("nonce authentication — matching nonce accepted, mismatch rejected (review fix)", () => {
+  const st = createHeartbeatState();
+  equal(parseHeartbeatLine("[task-heartbeat] ready nonce=abc123", st, 5, "abc123"), true);
+  ok(st.sawReady);
+  equal(parseHeartbeatLine("[task-heartbeat] tick nonce=EVIL tools=9 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=1", st, 6, "abc123"), false, "forged tick (wrong nonce) rejected");
+  equal(st.toolsInFlight, 0, "forged tick changed nothing");
+  equal(st.lastMarkerAt, 5, "rejected marker does not refresh freshness");
+});
+
+test("tick number overflow guard — Infinity digits ignored (review fix)", () => {
+  const st = createHeartbeatState();
+  const huge = "9".repeat(400);
+  equal(parseHeartbeatLine(`[task-heartbeat] tick tools=1 turn=1 stream_age_ms=${huge} tool_age_max_ms=${huge} saw_msg=0 saw_tool=0`, st, 7), true);
+  equal(st.toolsInFlight, 1, "finite fields still parse");
+  equal(st.streamAgeMs, 0, "Infinity stream_age_ms ignored (field keeps previous value)");
+  equal(st.toolAgeMaxMs, 0, "Infinity tool_age_max_ms ignored");
+});
+
+test("turn_end resets toolsInFlight — lost tool_end can't cause false tool-stall (review fix)", () => {
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] turn_start 0", st, 1);
+  parseHeartbeatLine("[task-heartbeat] tool_start id1 bash", st, 2);
+  equal(st.toolsInFlight, 1);
+  parseHeartbeatLine("[task-heartbeat] turn_end 0", st, 3);
+  equal(st.toolsInFlight, 0, "mirrors the child's turn_end Map clear");
+  equal(st.turnActive, false);
 });
 
 test("ANSI-wrapped marker is parsed", () => {
@@ -918,6 +946,7 @@ function dinput(over: Partial<HeartbeatDecisionInput> & { state?: HeartbeatState
     toolStallMs: L,
     firstMessageMs: M,
     intervalMs: INT,
+    maxDispatchMs: 0,
     ...over,
   };
 }
@@ -950,10 +979,10 @@ test("E2: legacy byte-silence preserved when no markers ever arrived", () => {
 });
 
 test("E3: stale-state bound — killed ≤ max(2T, 2×interval) after markers stop", () => {
-  // turnActive=false → no exemption once silence exceeds T
+  // turnActive=false, no tools → no exemption once silence exceeds T
   const stNoTurn = createHeartbeatState();
-  stNoTurn.lastMarkerAt = 0 + 1; // tool_start marker at t≈0
-  stNoTurn.toolsInFlight = 1;
+  stNoTurn.lastMarkerAt = 0 + 1; // marker at t≈0, then silence
+  stNoTurn.everSawWork = true;
   const dA = heartbeatKillDecision(dinput({ now: T + 1_001, lastLifeSignAt: 1, state: stNoTurn }));
   equal(dA.kill, true);
   equal(dA.reason, "silence-threshold");
@@ -1032,13 +1061,14 @@ test("E10: preflight tool-stall bound min(L,T) + precedence over silence", () =>
   st.toolsInFlight = 1;
   st.toolAgeMaxMs = T + 1; // past min(L, T) = T
   st.lastMarkerAt = 400_000;
-  // also make silence > T so BOTH clauses could fire — tool-stall must win
-  const d = heartbeatKillDecision(dinput({ now: 400_000 + T + 1, lastLifeSignAt: 400_000, state: st, hasOutput: false }));
+  // fresh-ish marker (10s old) + silence also > T below: BOTH clauses could
+  // fire — tool-stall must win (pinned precedence)
+  const d = heartbeatKillDecision(dinput({ now: 400_000 + T + 1_000, lastLifeSignAt: 400_000, state: st, hasOutput: false }));
   equal(d.kill, true);
   equal(d.reason, "tool-stall", "pinned precedence: tool-stall → stream-stall → silence → first-message");
-  // below the bound → no kill
-  const st2 = { ...st, toolAgeMaxMs: T - 1 };
-  equal(heartbeatKillDecision(dinput({ now: 400_000 + T - 1, lastLifeSignAt: 400_000, state: st2 })).kill, false);
+  // below the bound (effective age = toolAge + markerAge) → no kill
+  const st2 = { ...st, toolAgeMaxMs: T - 1_000 };
+  equal(heartbeatKillDecision(dinput({ now: 400_000 + 10, lastLifeSignAt: 400_000, state: st2 })).kill, false);
 });
 
 test("E11: between-turn wedge — ticks stop → silence at T (S > max(2T,2×interval) pin)", () => {
@@ -1133,25 +1163,26 @@ test("marker prefix + interval clamp constants identical in child and parent", (
   equal(childHb.clampHeartbeatIntervalMs(NaN), clampHeartbeatIntervalMs(NaN));
 });
 
-test("full-format round-trip: every child formatter parses through the parent parser", () => {
+test("full-format round-trip: every child formatter parses through the parent parser (nonce-authenticated)", () => {
   const st = createHeartbeatState();
-  equal(parseHeartbeatLine(childHb.formatReady(), st, 1), true);
+  const N = "testnonce77";
+  equal(parseHeartbeatLine(childHb.formatReady(N), st, 1, N), true);
   ok(st.sawReady);
-  equal(parseHeartbeatLine(childHb.formatToolStart("call-1", "bash"), st, 2), true);
+  equal(parseHeartbeatLine(childHb.formatToolStart(N, "call-1", "bash"), st, 2, N), true);
   equal(st.toolsInFlight, 1);
   ok(st.everSawWork);
-  equal(parseHeartbeatLine(childHb.formatTurnStart(3), st, 3), true);
+  equal(parseHeartbeatLine(childHb.formatTurnStart(N, 3), st, 3, N), true);
   ok(st.turnActive);
-  equal(parseHeartbeatLine(childHb.formatTick({ tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, sawMsg: true, sawTool: false }), st, 4), true);
+  equal(parseHeartbeatLine(childHb.formatTick(N, { tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, sawMsg: true, sawTool: false }), st, 4, N), true);
   equal(st.toolsInFlight, 1);
   equal(st.turnActive, true);
   equal(st.streamAgeMs, 4242);
   equal(st.toolAgeMaxMs, 2424);
   equal(st.turnSawMessage, true);
   equal(st.turnSawTool, false);
-  equal(parseHeartbeatLine(childHb.formatToolEnd("call-1"), st, 5), true);
+  equal(parseHeartbeatLine(childHb.formatToolEnd(N, "call-1"), st, 5, N), true);
   equal(st.toolsInFlight, 0);
-  equal(parseHeartbeatLine(childHb.formatTurnEnd(3), st, 6), true);
+  equal(parseHeartbeatLine(childHb.formatTurnEnd(N, 3), st, 6, N), true);
   equal(st.turnActive, false);
 });
 
@@ -1194,10 +1225,10 @@ testAsync("child lifecycle — ready, tool-Set semantics, per-turn flags, tick f
   console.error = (line: string) => { lines.push(String(line)); };
   const restore = () => { console.error = origErr; };
   try {
-    await withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000" }, async () => {
+    await withEnv({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: undefined, TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_NONCE: "e2enonce" }, async () => {
       childFactory(api);
       await handlers.session_start({} as any);
-      ok(lines.some((l) => l === "[task-heartbeat] ready"), "ready emitted at session_start");
+      ok(lines.some((l) => l === "[task-heartbeat] ready nonce=e2enonce"), "ready emitted at session_start with the dispatch nonce");
       await handlers.turn_start({ turnIndex: 1, timestamp: Date.now() });
       // tools: start 2, end 1 → outstanding {id2}; user message_start ignored; message_update latches saw_msg
       await handlers.tool_execution_start({ toolCallId: "id1", toolName: "bash", args: {} });
@@ -1233,10 +1264,71 @@ testAsync("child lifecycle — ready, tool-Set semantics, per-turn flags, tick f
   }
 });
 
+test("E8 (review fix): mid-line marker merge — foreign head preserved, marker part discarded", () => {
+  const { ctx, acc, real } = makeIngest();
+  // unterminated foreign fragment + marker in one chunk → merged line
+  ingestHeartbeatChunk("MCP connecting to serve", ctx, 1);
+  ingestHeartbeatChunk("r\n[task-heartbeat] tick nonce=n1 tools=1 turn=1 stream_age_ms=5 tool_age_max_ms=5 saw_msg=0 saw_tool=1\n", ctx, 2);
+  equal(acc(), "MCP connecting to server\n", "foreign head survives as real stderr");
+  ok(real(), "foreign bytes flip hasOutput");
+  equal(ctx.state.toolsInFlight, 1, "marker part still parsed into state");
+  ok(!acc().includes("[task-heartbeat]"), "guarantee 6 holds on the merged-line path");
+});
+
+test("review fix: wedge with frozen tick ages — stall fires at bound, not at window expiry", () => {
+  // ticks stopped mid-tool: toolAgeMaxMs frozen below L, but true age =
+  // toolAgeMaxMs + markerAge keeps growing → tool-stall catches the wedge.
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = L - 30_000; // frozen 30s below the bound at the last tick
+  st.lastMarkerAt = 1_000_000;
+  // 40s after the last marker: effective age L+10s > L, silence only 40s
+  const d = heartbeatKillDecision(dinput({ now: 1_040_000, lastLifeSignAt: 1_000_000, state: st }));
+  equal(d.kill, true, "wedge caught by effective-age tool-stall");
+  equal(d.reason, "tool-stall");
+  // same shape for stream-stall between turns
+  const st2 = createHeartbeatState();
+  st2.everSawWork = true;
+  st2.turnActive = false;
+  st2.streamAgeMs = S - 10_000;
+  st2.lastMarkerAt = 2_000_000;
+  const d2 = heartbeatKillDecision(dinput({ now: 2_020_000, lastLifeSignAt: 2_000_000, state: st2 }));
+  equal(d2.kill, true);
+  equal(d2.reason, "stream-stall");
+});
+
+test("review fix: TASK_MAX_DISPATCH_MS — opt-in total cap markers cannot reset", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = 1_000;
+  st.lastMarkerAt = 9_000_000; // fresh markers — every per-clause bound exempt
+  const capped = heartbeatKillDecision(dinput({ now: 9_000_010, lastLifeSignAt: 9_000_000, startedAt: 0, state: st, maxDispatchMs: 600_000, hasOutput: true }));
+  equal(capped.kill, true, "total cap fires despite honest markers");
+  equal(capped.reason, "max-dispatch");
+  equal(capped.resolveUndefined, false, "partial output → defined result");
+  const uncapped = heartbeatKillDecision(dinput({ now: 9_000_010, lastLifeSignAt: 9_000_000, startedAt: 0, state: st, maxDispatchMs: 0, hasOutput: true }));
+  equal(uncapped.kill, false, "default (0) = off — issue semantics: never kill a working agent");
+});
+
+test("getTaskMaxDispatchMs — default off, ≥60s clamp", () => {
+  withEnv({ TASK_MAX_DISPATCH_MS: undefined }, () => equal(getTaskMaxDispatchMs(), 0));
+  withEnv({ TASK_MAX_DISPATCH_MS: "0" }, () => equal(getTaskMaxDispatchMs(), 0));
+  withEnv({ TASK_MAX_DISPATCH_MS: "-5" }, () => equal(getTaskMaxDispatchMs(), 0));
+  withEnv({ TASK_MAX_DISPATCH_MS: "NaN" }, () => equal(getTaskMaxDispatchMs(), 0));
+  withEnv({ TASK_MAX_DISPATCH_MS: "1000" }, () => equal(getTaskMaxDispatchMs(), 60_000));
+  withEnv({ TASK_MAX_DISPATCH_MS: "3600000" }, () => equal(getTaskMaxDispatchMs(), 3_600_000));
+});
+
 section("#176 heartbeat — spawnSubAgent wiring (source assertions)");
 
-test("task tool injects TASK_HEARTBEAT=1 with TASK_HEARTBEAT_DISABLE pre-check", () => {
+test("task tool injects TASK_HEARTBEAT=1 with TASK_HEARTBEAT_DISABLE pre-check + nonce", () => {
   ok(source.includes('TASK_HEARTBEAT_DISABLE !== "1" ? { TASK_HEARTBEAT: "1" }'), "TASK_HEARTBEAT gated on the disable flag BEFORE setting");
+  ok(source.includes("randomBytes(6).toString(\"hex\")"), "per-dispatch nonce generated");
+  ok(source.includes("TASK_HEARTBEAT_NONCE: hbNonce"), "nonce injected into the sub-agent env");
   ok(source.includes("ingestHeartbeatChunk(data.toString(), hbCtx)"), "stderr flows through the marker ingestion pipeline");
   ok(source.includes("flushHeartbeatLineBuf(hbCtx)"), "residue flushed before kill-composition and on close");
   ok(source.includes("heartbeatKillDecision({"), "tier-2 uses the state-aware decision function");

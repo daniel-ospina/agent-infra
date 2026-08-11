@@ -517,3 +517,35 @@ commit/PR reference issue #176.
   skip mechanism underspecified — naive early-return would count the skip as a
   pass → pinned SkipError sentinel caught by the test wrapper, skipped counter
   in summary, exit 0 when failed === 0) → folded (plan rev 4).
+
+## Code-review history (PR #177)
+
+- Review dispatch: bug-scan (shallow+deep) + extension-safety/integration +
+  security (threat-model) — 3 parallel reviewers. Result: 0 P0/P1, 10 P2.
+- Fixed in follow-up commit:
+  1. Mid-line marker merge (unterminated foreign fragment + marker) → split in
+     ingestHeartbeatChunk; head preserved, marker part parsed/discarded.
+  2. Tick number overflow (Number → Infinity) → non-finite values skipped.
+  3. Stale tool counter after turn_end → parent mirrors child's turn_end clear
+     (toolsInFlight = 0).
+  4. Unknown-kind prefix lines → preserved as ordinary stderr (no state, no
+     freshness) instead of silently discarded.
+  5. Wedged-child latency (frozen tick ages) → stall clauses use effective age
+     (state age + time since last marker).
+  6. Unauthenticated marker channel (MCP servers inherit the child's fd 2;
+     ambient TASK_HEARTBEAT=1) → per-dispatch nonce (TASK_HEARTBEAT_NONCE,
+     randomBytes(6)): child echoes it in every marker; parent rejects
+     mismatches as foreign.
+  7. Unbounded total dispatch time (honest drip-stream/tool-loop) → opt-in
+     TASK_MAX_DISPATCH_MS cap (default 0 = off, issue semantics preserved),
+     clause "max-dispatch".
+- Documented/accepted:
+  8. Tier-1 60s fast-fail neutralized for emitter-equipped children (hung
+     first request detected at TASK_FIRST_MESSAGE_MS=300s instead) — settled
+     scope trade-off; comment added at the first-message clause.
+  9. >4KB unterminated stderr line re-chunking — cosmetic display delta vs
+     legacy; marker discard semantics unaffected.
+  10. mcp-client `stderr: "pipe"` hardening — separate extension, filed as
+      follow-up (nonce closes the #176 attack surface).
+- Re-verified after fixes: 106/106 unit tests, E4 e2e green, nonce confirmed
+  flowing in real pi child.
