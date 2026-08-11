@@ -1,10 +1,11 @@
 # Upstream pi bug reports — drafts awaiting filing
 
-> **Status:** DRAFT — not yet filed. These are prepared by the agent-infra side
-> of the qwen-reliability work (#152/#153) so the orchestrator can file them in
-> the pi-core / pi-ai repos verbatim (or edited). Evidence is from session files
-> and logs inventoried in
-> `docs/plans/2026-08-10-qwen-reliability-plan.md` (§1, §7).
+> **Status:** DRAFT — filing attempted 2026-08-11 via `gh api`, **BLOCKED**
+> (HTTP 403: this account lacks issue-create permission on the
+> `earendil-works/pi` repo). The drafts below are complete and unchanged from
+> the qwen-reliability work; they remain ready to file manually — via the
+> browser UI, or with an account that has issue-create permission on the repo.
+> Keep the draft bodies intact.
 
 ---
 
