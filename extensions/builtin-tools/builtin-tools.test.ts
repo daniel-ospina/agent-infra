@@ -201,6 +201,11 @@ test("startup banner suppressed in print mode", () => {
   ok(source.includes("PI_MODE !== 'print'"), "banner suppression for print mode should exist (#5526 #5672)");
 });
 
+test("sub-agent env declares PI_MODE=print (#172)", () => {
+  ok(source.includes('PI_MODE: "print"'), "subAgentEnv must set PI_MODE: \"print\" so extension print guards fire (#172)");
+  ok(source.includes("SLACK_BRIDGE_DISABLE: \"1\""), "subAgentEnv still sets SLACK_BRIDGE_DISABLE=1");
+});
+
 // ── PATH augmentation (#36) ───────────────────────────
 
 section("augmentPath — sub-agent PATH augmentation (#36)");

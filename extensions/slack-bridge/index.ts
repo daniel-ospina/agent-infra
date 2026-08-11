@@ -82,6 +82,18 @@ let pendingTeam: string | null = null;
 let pendingRole: string | null = null;
 let lastAttempt = 0;
 let consecutiveFails = 0;
+// #172: whether this process is eligible for bridge routing (TUI, Slack-spawned
+// via SLACK_BRIDGE_THREAD_TS, or cmux). Captured at session_start — the 30s
+// reconnect timer has no ctx of its own and must never poll/bind in ineligible
+// headless processes.
+let bridgeEligible = false;
+// #172: "offline — terminal-only" / "bind failed" warnings are debounced to at
+// most once per session (reset on successful bind). Per-attempt notify caused
+// repeated macOS popups while the daemon was down.
+let offlineNotified = false;
+// #172: reload-safe reconnect timer handle — repeated /reload re-registers
+// registerBridgeHooks; without clearing, parallel 30s polling timers accumulate.
+let reconnectTimer: NodeJS.Timeout | null = null;
 let selectInProgress = false;
 let httpServer: Server | null = null;
 // Socket Mode receiver state (#146) — module-level (not a factory closure) so
@@ -91,6 +103,33 @@ let socketState: SocketModeState | null = null;
 let lastPostedMessageIdx = -1; // ponytail: dedup index for loop-enforcer output
 const CYCLE_BUFFER_FLUSH = 3; // ponytail: batch N cycles before posting summary
 const cycleBuffer: { slug: string; cycles: number; text: string }[] = [];
+
+// ── Mode / eligibility helpers (#172) ─────────────────
+
+/** Print mode (headless `pi -p` / task sub-agents): the bridge is fully silent. */
+function isPrintMode(): boolean {
+  return process.env.PI_MODE === "print";
+}
+
+/**
+ * Bridge-routing eligibility. Only TUI, Slack-spawned (SLACK_BRIDGE_THREAD_TS),
+ * and cmux (CMUX_WORKSPACE_ID) processes route through the bridge; RPC mode
+ * never routes (agent_end already returns on ctx.mode === "rpc"). Headless
+ * `pi -p` runs without a thread env are INELIGIBLE: they must never adopt a
+ * stored session, bind, post, or touch the daemon — zero output, zero HTTP.
+ * Deliberately NOT gated on PI_MODE alone: Slack-spawned headless sessions are
+ * legitimate (swarm agent-runner spawns `pi -p` + SLACK_BRIDGE_THREAD_TS) and
+ * must keep binding / posting / sending final:true.
+ */
+function isBridgeEligible(ctx: any): boolean {
+  if (ctx?.mode === "rpc") return false;
+  return !!ctx?.hasUI || !!process.env.SLACK_BRIDGE_THREAD_TS || !!process.env.CMUX_WORKSPACE_ID;
+}
+
+/** Factory-time eligibility (no ctx yet): env markers only. */
+function isEnvEligible(): boolean {
+  return !!process.env.SLACK_BRIDGE_THREAD_TS || !!process.env.CMUX_WORKSPACE_ID;
+}
 
 // ── Helpers (exported for testing) ────────────────────
 
@@ -103,6 +142,12 @@ export function readSession(file = SESSION_FILE): ActiveSession | null {
     if (!parsed.active_session) return null;
     const s = parsed.active_session;
     if (typeof s.session_id !== "string" || typeof s.thread_ts !== "string") return null;
+    // #172: only adopt sessions with a real Slack thread_ts — 10-digit epoch
+    // seconds + 6-digit microseconds (e.g. "1718000000.123456"). Test residue /
+    // implausible entries ("1234.5678", "#test") must never be adopted as an
+    // active session. Validate — never clear: the file is left untouched so the
+    // Bridge can reconcile it if it was ever real.
+    if (!/^\d{10}\.\d{6}$/.test(s.thread_ts)) return null;
     return {
       session_id: s.session_id,
       thread_ts: s.thread_ts,
@@ -1319,7 +1364,7 @@ export async function bindSession(
   try {
     if (!opts?.skipHealth) {
       if (!(await getHealth())) {
-        ctx.ui?.notify("[slack-bridge] offline — terminal-only", "warning");
+        notifyBridgeUnavailable(ctx, "[slack-bridge] offline — terminal-only");
         return false;
       }
     }
@@ -1334,7 +1379,7 @@ export async function bindSession(
     if (process.env.CMUX_WORKSPACE_ID) body.cmux_workspace_id = process.env.CMUX_WORKSPACE_ID;
     const res = await bridgePost("/session", body);
     if (!res || typeof res.thread_ts !== "string" || !res.thread_ts) {
-      ctx.ui?.notify("[slack-bridge] bind failed — terminal-only", "warning");
+      notifyBridgeUnavailable(ctx, "[slack-bridge] bind failed — terminal-only");
       return false;
     }
     const s: ActiveSession = {
@@ -1347,17 +1392,34 @@ export async function bindSession(
     };
     active = s;
     writeSession(s);
+    offlineNotified = false; // #172: daemon is reachable again — re-arm the warning
     if (opts?.name) renameCmuxWorkspace(opts.name);
     ctx.ui?.setStatus("slack-bridge", `${res.channel ?? "#slack"} thread`);
     return true;
   } catch {
-    ctx.ui?.notify("[slack-bridge] offline — terminal-only", "warning");
+    notifyBridgeUnavailable(ctx, "[slack-bridge] offline — terminal-only");
     return false;
   }
 }
 
 // ── Raw-stdin team selector (cmux, no readline) ─────
 // ponytail: single-char raw-mode read avoids Kitty escape sequence capture
+
+/**
+ * #172: surface a bridge-unavailable warning at most once per session.
+ * Per-attempt notify (health check / bind response / catch) caused repeated
+ * macOS popups while the daemon was down — agent_end's retroactive bind
+ * retried with backoff and re-notified each time. Reset on successful bind
+ * (offlineNotified = false in bindSession).
+ */
+function notifyBridgeUnavailable(ctx: any, msg: string): void {
+  if (offlineNotified) return;
+  if (ctx?.ui?.notify) {
+    ctx.ui.notify(msg, "warning");
+    offlineNotified = true;
+  }
+}
+
 export function selectTeamStdin(teams: Team[]): Promise<string | null> {
   return new Promise((resolve) => {
     const names = teams.map(t => t.name);
@@ -1418,10 +1480,22 @@ export default function slackBridge(pi: ExtensionAPI): void {
   // SLACK_BRIDGE_DISABLE gates session routing only; approval forwarding has
   // its own conditions (see initApprovalForwarding below).
   if (process.env.SLACK_BRIDGE_DISABLE === "1") {
-    console.log("[slack-bridge] ⏭️  Disabled — SLACK_BRIDGE_DISABLE=1 (kill switch). Unset it to enable Slack session routing.");
+    // #172: interactive-only diagnostic — task sub-agents / headless runs set
+    // SLACK_BRIDGE_DISABLE=1 as expected config (builtin-tools) and must not
+    // announce it: zero startup output in print mode.
+    if (!isPrintMode()) {
+      console.log("[slack-bridge] ⏭️  Disabled — SLACK_BRIDGE_DISABLE=1 (kill switch). Unset it to enable Slack session routing.");
+    }
   } else {
     try {
-      registerBridgeHooks(pi);
+      // #172: in print mode, register bridge hooks only for env-eligible
+      // processes (SLACK_BRIDGE_THREAD_TS / CMUX_WORKSPACE_ID — Slack-spawned
+      // sessions are legitimate headless bridge users). A bare headless
+      // `pi -p` registers nothing: structurally incapable of touching the
+      // daemon or emitting [slack-bridge] output.
+      if (!isPrintMode() || isEnvEligible()) {
+        registerBridgeHooks(pi);
+      }
       // Socket Mode receiver for approval button callbacks (#146) — runs when
       // SLACK_APP_TOKEN (xapp-...) is set; skipped in print mode (task
       // sub-agents, like approval forwarding) and when the bridge kill switch
@@ -1515,21 +1589,32 @@ function registerBridgeHooks(pi: ExtensionAPI): void {
       try {
         if (process.env.SLACK_BRIDGE_DISABLE === "1") return;
 
+        // #172: eligibility gate BEFORE any session adoption — ineligible
+        // headless processes (no UI, no SLACK_BRIDGE_THREAD_TS, no
+        // CMUX_WORKSPACE_ID) must never adopt a stored session, bind, or touch
+        // the daemon. Captured for the reconnect timer (which has no ctx).
+        bridgeEligible = isBridgeEligible(ctx);
+        if (!bridgeEligible) return;
+
         lastPostedMessageIdx = -1;
 
-        if (!active) {
+        // #172: skip file adoption for Slack-spawned sessions — the env thread
+        // bind below always wins; a stored session must never hijack it (and a
+        // failed bind must not leave a stale file session in `active`).
+        if (!active && !process.env.SLACK_BRIDGE_THREAD_TS) {
           const existing = readSession();
           if (existing) active = existing;
         }
 
         if (event.reason !== "startup" && event.reason !== "reload" && event.reason !== "fork") return;
-        if (!ctx.hasUI && !process.env.SLACK_BRIDGE_THREAD_TS && !process.env.CMUX_WORKSPACE_ID) return;
         
         const isNewSession = event.reason === "startup";
         
         // Re-bind to existing Slack thread from previous session (e.g., after reload)
         const existing = readSession();
-        if (existing && existing.thread_ts) {
+        // #172: SLACK_BRIDGE_THREAD_TS always wins over file adoption — a stale
+        // session file must never hijack a Slack-spawned bind.
+        if (existing && existing.thread_ts && !process.env.SLACK_BRIDGE_THREAD_TS) {
           active = existing;
           ctx.ui?.setStatus("slack-bridge", `${existing.channel ?? "#slack"} thread`);
           return;
@@ -1655,6 +1740,10 @@ function registerBridgeHooks(pi: ExtensionAPI): void {
         // ── Retroactive bind (if not yet bound) ──
         if (!active) {
           if (selectInProgress) return;
+          // #172: never retro-bind from an ineligible process — a bare headless
+          // `pi -p` (no UI, no thread env) must not create a Slack session/thread
+          // if the daemon is up, nor hammer HTTP if it is down.
+          if (!isBridgeEligible(ctx)) return;
           const delay = Math.min(BACKOFF_BASE_MS * 2 ** consecutiveFails, BACKOFF_CAP_MS);
           if (Date.now() - lastAttempt < delay) return;
           lastAttempt = Date.now();
@@ -1738,6 +1827,12 @@ function registerBridgeHooks(pi: ExtensionAPI): void {
     // ── session_shutdown ───────────────────────────────
     pi.on("session_shutdown", async (event: any, _ctx: any) => {
       try {
+        // #172: ineligible headless processes never own a bridge session — skip
+        // final:true / flush / server close entirely (defense in depth; the
+        // factory registration + session_start eligibility gates already keep
+        // `active` null in such processes). pi passes the full ctx (incl.
+        // hasUI / mode) to session_shutdown handlers.
+        if (!isBridgeEligible(_ctx)) return;
         const isReload = event.reason === "reload" || event.reason === "fork";
         if (active) {
           void flushCycleBuffer();
@@ -1762,7 +1857,13 @@ function registerBridgeHooks(pi: ExtensionAPI): void {
     // ponytail: 30s poll catches bridge restarts without needing /reload.
     const RECONNECT_MS = 30_000;
     let reconnecting = false;
-    const reconnectTimer = setInterval(async () => {
+    // #172: reload-safe — clear any previous interval so repeated /reload does
+    // not accumulate parallel polling timers (mirrors socketState resilience).
+    if (reconnectTimer) clearInterval(reconnectTimer);
+    reconnectTimer = setInterval(async () => {
+      // #172: only bridge-eligible processes poll for recovery (TUI / cmux /
+      // Slack-spawned). Ineligible headless runs must never touch the daemon.
+      if (!bridgeEligible) return;
       if (active) return;
       if (selectInProgress) return;
       if (reconnecting) return;
