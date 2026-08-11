@@ -99,7 +99,10 @@ verified in-repo:
   (incident 2026-08-06). L2 runs as extension-level code, which the guard does
   not intercept — a deliberate, documented carve-out, ratified by precedent:
   auto-sync.ts has always done extension-level main-checkout ff-pulls
-  (agent-infra). The carve-out is safe BECAUSE the envelope is strictly
+  (agent-infra — where the guard is disabled entirely; the precedent is
+  consistency with the guard's documented interception surface — tool_call
+  only — not a ratified license for guarded repos). The carve-out is safe
+  BECAUSE the envelope is strictly
   narrower than any bash command (deterministic ff-only pull, all guards
   pre-checked), observable (logs `[repo-freshness] auto-pull <repo> <old>→<new>`
   on every pull), and reversible (`AGENT_REPO_FRESHNESS_DISABLED=1`). Recorded
@@ -183,12 +186,23 @@ commit-workflow and using-git-worktrees precedents match).
 **Acceptance:**
 - Branch Gate detects the default branch via
   `git symbolic-ref --short refs/remotes/origin/HEAD` (fallback `main`).
-- Gate fetches (`git fetch origin "$DEFAULT_BRANCH" --quiet`) and creates the
-  branch from `origin/$DEFAULT_BRANCH` — local main untouched.
+- Gate fetches (`git fetch origin "$DEFAULT_BRANCH" --quiet`); on fetch
+  failure (offline/no origin) → explicit WARN, fall back to the existing
+  local `origin/$DEFAULT_BRANCH` ref if present, else abort with a clear
+  message (never silently branch from stale local state).
+- Creates the branch from `origin/$DEFAULT_BRANCH` — local main untouched —
+  and the checkout is FAIL-CLOSED: `git checkout -b "$EXPECTED_BRANCH"
+  "origin/$DEFAULT_BRANCH" || { echo "⛔ ..."; exit 1; }` (plan-review P2:
+  a failed checkout must never false-report success).
 - Both abort-guidance paths ("Checkout main first...") carry the same
   fetch-first + origin-base instruction.
 - Worktree Gate unchanged.
-- Drift-guard test asserts all of the above against the skill source.
+- Drift-guard test asserts all of the above against the skill source
+  (readFileSync+includes pattern, repo-relative skills/ paths — first
+  skill-markdown source assertion in the repo), PLUS a real-git runtime
+  fixture (main-worktree-guard/test.mjs precedent) covering: origin/HEAD
+  unset → fallback default; fetch failure → safe fallback/abort; checkout
+  failure → non-zero exit.
 **Files:**
 - Modify: skills/issue-workflow/SKILL.md
 - Test: extensions/shared/test-git-freshness.mjs (new; CI-run via
@@ -199,10 +213,14 @@ commit-workflow and using-git-worktrees precedents match).
 **Intent:** Ship reconciled with origin; survive the strict-up-to-date ladder
 (mandatory companion to Decision 2 — adversarial review P1).
 **Acceptance:**
-- 01-preflight.md gains a freshness step after branch detection: fetch,
-  behind-count vs origin/<default>; clean → `git -c commit.gpgsign=false pull
-  --rebase origin <default>` + re-run checks; dirty → WARN, no autostash;
-  behind=0 → silent.
+- 01-preflight.md gains a freshness step AFTER the Merged-Branch Guard and
+  BEFORE Tier Detection (plan-review P2: the guard already fetches and may
+  redirect to a fresh branch — reconciling before its verdict wastes work):
+  fetch, behind-count vs origin/<default>; clean → `git -c commit.gpgsign=false
+  pull --rebase origin <default>` + re-run checks; dirty → WARN, no autostash;
+  behind=0 → silent. Instructions MUST include: if the branch was previously
+  pushed and the post-rebase push is rejected as non-fast-forward →
+  `git push --force-with-lease` (plan-review P2: long-lived sessions).
 - 04-merge-deploy.md gains stale-merge recovery: merge blocked as stale →
   fetch → rebase (gpgsign off) → re-run typecheck/tests →
   `git push --force-with-lease` → retry merge (bounded, then escalate).
@@ -221,7 +239,11 @@ damaged (research-verified envelope).
 - `extensions/repo-freshness.ts` (flat, self-contained per #5611): interactive
   sessions only (PI_MODE≠print), git+origin repos only,
   AGENT_REPO_FRESHNESS_DISABLED=1 opt-out, agent-infra excluded (auto-sync
-  owns it).
+  owns it) via LOCAL re-implementation of the ~12-line detection (env
+  exact-match AGENT_INFRA_PATH/AGENT_INFRA_ROOT, then fingerprint
+  manifest.json + pi-bootstrap/setup.sh — same semantics as
+  main-worktree-guard/classify-git.mjs; flat files cannot import siblings,
+  #5611 — plan-review P2).
 - session_start + periodic timer (20 min default, clamped ≥5 min, started in
   session_start, cleared in session_shutdown, unref'd — pi extension rules).
 - State machine vs origin/<default> (symbolic-ref detection, fallback main):
@@ -229,13 +251,24 @@ damaged (research-verified envelope).
   MERGE_HEAD/REBASE_HEAD + no index.lock → mode auto: `git pull --ff-only`
   with `[repo-freshness] auto-pull <repo> <old>→<new>` log; mode warn: hint.
   ahead → report unpushed; diverged → guidance, never pull; feature branch →
-  report-only behind-count; index.lock/merge/rebase in progress → skip silent.
+  report-only behind-count; index.lock/merge/rebase in progress → skip
+  silent. Worktree exclusion implemented as "default branch checked out in
+  any worktree ≠ current checkout → skip" with SELF-EXCLUSION mandatory
+  (plan-review P3: naive worktree-list scanning without self-exclusion would
+  silently disable the core path).
 - Env knobs: AGENT_REPO_FRESHNESS_MODE (auto|warn, default auto),
   AGENT_REPO_FRESHNESS_INTERVAL_MS, AGENT_REPO_FRESHNESS_DISABLED.
 - fetch timeout 30s, pull timeout 120s, all failures silent-degrade (offline).
-- Unit tests against real throwaway repos (auto-sync.test.ts pattern): full
-  state matrix incl. dirty-tree abort, untracked-collision abort, lock skip,
-  feature-branch report-only, agent-infra exclusion, interval clamp.
+- The pull step is an EXPORTED function (auto-sync precedent: syncState/
+  aheadCount) so tests can invoke it directly: the extension's clean-tree
+  pre-check is layer 1 (no-op when dirty — E2), git's own pull-time abort is
+  layer 2 (final arbiter). Tests cover BOTH layers against real throwaway
+  repos (auto-sync.test.ts pattern): full state matrix incl. dirty pre-check
+  no-op, git-side dirty-tree abort (HEAD unchanged, edits preserved),
+  untracked-collision abort (file preserved), lock skip, feature-branch
+  report-only, agent-infra exclusion (fixture: throwaway repo containing
+  manifest.json + pi-bootstrap/setup.sh triggering the fingerprint), interval
+  clamp.
 **Files:**
 - Create: extensions/repo-freshness.ts
 - Test: extensions/repo-freshness.test.ts (tsx, dev gate — auto-sync precedent)
@@ -258,11 +291,20 @@ damaged (research-verified envelope).
 **Intent:** Fleet-wide safety net + verification at zero drift.
 **Acceptance:**
 - `git config --global pull.ff only` set (idempotent).
-- GitHub "require branches up to date before merging" enabled on fleet repos
-  with branch protection (agent-infra, tortoise, DMeer, premise-labs, swarm,
-  autocast-project) — admin API; monitor-and-downgrade escape hatch recorded.
-- Fleet drift audit (fetch all + behind-count) shows 0 silently-behind repos;
-  dirty/ahead repos listed for manual triage (E4).
+- GitHub "require branches to be up to date before merging" per verified
+  state (plan-review folds): agent-infra → FLIP strict false→true, keep
+  existing pipeline-compliance context; tortoise → no-op (already strict);
+  DMeer / premise-labs / swarm → CREATE protection with strict + the repo's
+  real CI check context(s) (workflow-name contexts verified to exist);
+  autocast-project → EXCLUDED from protection rollout (remote is
+  connormcmk/autocast-project — no admin access; still covered by L1/L2/L3
+  + drift audit). Verify post-apply via branches/main/protection (assert
+  strict==true, contexts non-empty). Monitor-and-downgrade escape hatch
+  recorded.
+- Fleet drift audit (fetch all + behind-count) over the known fleet dirs
+  (agent-infra, tortoise, DMeer, premise-labs, swarm, autocast-project,
+  AutoCast, eldato-dm-downloads, tortoise-launch-roadmap) shows 0
+  silently-behind repos; dirty/ahead repos listed for manual triage (E4).
 **Files:**
 - none (operational) — record results in the issue.
 
