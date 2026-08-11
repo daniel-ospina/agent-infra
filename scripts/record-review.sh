@@ -37,3 +37,22 @@ else
     "$PR" "$SHA" "$VERDICT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
 fi
 mv "$TMP" "$DIR/$PR.json"
+
+# ── Auto-post review evidence into the PR body (#163 follow-up) ──────────
+# The pipeline compliance check (c) looks for review markers in the PR
+# body/commits. Real reviews were lagging the gate because nothing posted
+# the evidence (PR #163 merged RED for exactly this). Append a marker line
+# here, at record time. Idempotent; best-effort — NEVER fails the record.
+if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
+  MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA:0:12} (${REPO})"
+  BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
+  if [ -n "$BODY" ] && ! printf '%s' "$BODY" | grep -qF "$MARKER"; then
+    NEWBODY="${BODY}
+
+${MARKER}"
+    jq -n --arg body "$NEWBODY" '{body: $body}' 2>/dev/null \
+      | gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1 \
+      && echo "review evidence posted to $REPO#$PR body" \
+      || echo "note: could not post review evidence to PR body (record still saved)" >&2
+  fi
+fi
