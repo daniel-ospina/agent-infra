@@ -236,6 +236,31 @@ fi
 | `PR_STATE = "OPEN"` | **Proceed.** The branch has an active PR — changes pushed here will update it. |
 | `PR_STATE = "no-pr"` and `ALREADY_MERGED = false` | **Proceed.** Fresh feature branch with no PR yet. |
 
+## Pre-PR Freshness Check (#178/#181)
+
+Runs AFTER the Merged-Branch Guard and BEFORE Tier Detection (the guard already
+fetches and may redirect to a fresh branch — reconciling before its verdict
+wastes work). Reconcile the branch with the origin default so stale checkouts
+never ship:
+
+```bash
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
+git fetch origin "$DEFAULT_BRANCH" --quiet
+BEHIND=$(git rev-list --count HEAD.."origin/$DEFAULT_BRANCH" 2>/dev/null || echo 0)
+```
+
+| State | Action |
+|---|---|
+| `BEHIND = 0` | Silent — already current. |
+| `BEHIND > 0` + clean tree | `git -c commit.gpgsign=false pull --rebase origin "$DEFAULT_BRANCH"`, then RE-RUN the affected pre-flight regression tests. If the branch was previously pushed and the post-rebase push is rejected as non-fast-forward → `git push --force-with-lease`. |
+| `BEHIND > 0` + dirty tree | **WARN**: "Branch is N behind origin/<default> — commit or stash first, then `git -c commit.gpgsign=false pull --rebase origin <default>`." NEVER autostash (conflict-unsafe unattended). |
+
+Notes: `commit.gpgsign=false` is process-scoped and prevents headless pinentry
+hangs during rebase (fleet ships squash-merged; research-verified). Condition 5
+in 04-merge-deploy.md still governs overlap at merge time; repos with strict
+up-to-date protection additionally use Stale-Merge Recovery there.
+
 ## Tier Detection
 
 Check the linked issue for a `complexity:*` label:

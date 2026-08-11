@@ -37,6 +37,29 @@ Post-merge verification below (deploys, smoke tests, clickthrough) remains **war
 it detects problems and auto-files issues, never blocks.
 
 
+## Stale-Merge Recovery (#178/#181 — strict up-to-date ladder)
+
+On repos with "Require branches to be up to date before merging", another merge
+can land between the last reconciliation and `gh pr merge` — the merge is then
+blocked as stale. Recovery (bounded, then escalate):
+
+```bash
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
+git fetch origin "$DEFAULT_BRANCH" --quiet
+git -c commit.gpgsign=false rebase "origin/$DEFAULT_BRANCH" || { echo "⛔ rebase conflict — resolve manually"; exit 1; }
+# RE-RUN the affected pre-flight regression tests here (same set as condition 5)
+git push --force-with-lease   # the rebase rewrote a previously-pushed branch
+# retry gh pr merge — MAX 2 recovery attempts, then escalate to the user
+```
+
+Distinct from condition 5 (proactive pre-merge overlap reconciliation via
+`git merge origin/main`): this recovery is REACTIVE after a stale block and
+uses rebase + `--force-with-lease` (single-owner agent branches; never plain
+`--force`). Mandatory companion to strict up-to-date protection (project #178
+plan-review fold).
+
+
 ## Step 3.6 — Deploy Edge Functions
 
 **Skip if** the merged PR diff contains no files matching `supabase/functions/`.
