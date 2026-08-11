@@ -34,13 +34,25 @@ three, ordered by correctness value L1 → L3 → L2.
 zero-cost `pull.ff only` machine guard. Two human decisions deferred to the
 Scope gate (L2 default mode; branch-protection backstop).
 
-## Stage 2 — Research (complete)
+## Stage 2 — Research (complete, 2 rounds)
 
 `docs/research/2026-08-11-git-freshness-agent-checkouts.md` — fresh-session
 verified (NO ISSUES FOUND after one fix cycle). Verdicts: L1 textbook (HIGH),
 L2 standard-with-guards (HIGH safety / ⚠️ emerging necessity), L3 standard
 (HIGH). Refinements folded: gpg-sign hazard, filesystem-watcher guard, pi
 timer constraint, plain-git fleet verified, `pull.ff only` guard.
+
+**Round 2** resolved the two open questions against external practice:
+- IDE consensus = auto-fetch yes, auto-pull never-under-active-work; fleet
+  management = auto-apply when safe + verify + observable (CrowdStrike:
+  kill-switch, fail-open); agent tools = fresh base at task boundaries
+  (Claude Code worktrees branch from `origin/HEAD` with fetch-refresh if
+  >24h stale). L2's envelope excludes active work by construction →
+  **auto is the evidence-backed default**.
+- OpenSSF explicitly recommends "require branches up to date before merging"
+  to stop "previously fixed issues slipping back in" (= this fleet's
+  regression class); ladder-friction criticism targets busy repos — fleet
+  throughput is low → **enable strict up-to-date as backstop**.
 
 ## Stage 3 — Scope (proportional double diamond)
 
@@ -106,15 +118,19 @@ Out: GitHub branch-protection changes (needs per-repo admin decision — open
 question 2), submodule recursion, LFS handling, Windows/CI environments,
 cmux-side surface refresh behavior.
 
-### Open questions (HUMAN GATE)
+### Decisions resolved at Scope gate (research round 2)
 
-1. **L2 default mode:** `auto` (ff-pull clean default branch without asking)
-   vs `warn` (report only). Research recommends **auto** — ff-only + clean
-   tree + git's own re-check; agents can't act on warnings anyway.
-2. **Server-side backstop:** enable "Require branches to be up to date before
-   merging" on fleet repos (agent-infra, tortoise, DMeer, premise-labs,
-   swarm…)? Recommended **yes** — complementary detection, zero agent-side
-   cost.
+1. **L2 default mode: `auto`** — within the strictest safe envelope (default
+   branch only, clean tree, ff-only, not-ahead, no merge/rebase/lock,
+   feature branches report-only) + observability: log every auto-pull,
+   `AGENT_REPO_FRESHNESS_DISABLED` kill-switch, fail-open to warn on any
+   anomaly. Evidence: IDE practice forbids pull-under-active-work (excluded
+   by construction here); fleet practice endorses auto-apply-when-safe with
+   verification; agents cannot act on warnings.
+2. **Server-side backstop: YES** — enable "Require branches to be up to date
+   before merging" on fleet repos (OpenSSF recommendation; low-throughput
+   fleet pays negligible ladder friction). Applied during rollout as an
+   operational step (admin action, not code).
 
 ### Complexity (domain-aware)
 
