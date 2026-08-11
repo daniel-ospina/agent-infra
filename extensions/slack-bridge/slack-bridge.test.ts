@@ -828,6 +828,19 @@ try {
     const r1 = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
     assert(r1.posted === 1, `conversation: gate posted (got ${r1.posted})`);
 
+    // Per-repo channel routing (#1402 rollout): req.channel wins over config.
+    writeApprovals([...base, {
+      id: "apr-chan", from_role: "product-implementer", artifact: "tortoise-scope.md",
+      context: "SCOPE for tortoise epic", status: "pending", reviewer: "human",
+      channel: "#approvals-tortoise", created_at: "2026-08-10T00:02:00Z",
+    }]);
+    const r1b = await scanApprovals({ file: approvalsFile, token: "xoxb-test", channel: "#approvals" });
+    assert(r1b.posted === 1, `channel routing: posted (got ${r1b.posted})`);
+    const chanPost = slack.requests.filter((r) => r.url === "/chat.postMessage")
+      .find((r) => r.form.get("blocks")?.includes("apr-chan"));
+    assert(chanPost?.form.get("channel") === "#approvals-tortoise",
+      "channel routing: request channel used");
+
     // Agent follow-up with parent → posted INTO the parent thread.
     writeApprovals([...base, {
       id: "apr-2", from_role: "product-implementer", artifact: "epic-scope.md",

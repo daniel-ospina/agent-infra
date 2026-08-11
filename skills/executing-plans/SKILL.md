@@ -611,11 +611,13 @@ The `commit` step (Step 6 handoff) is a `human_approval` gate in this skill's fr
 When a gate fires, the agent MUST invoke the approval router to surface the request:
 
 ```bash
-# Role-based escalation (routine gates — routes to the reports_to role, NO human dialog):
+# Portable invocation (works from ANY repo checkout — #1402 rollout):
 python3 -c "
+import os, sys
+sys.path.insert(0, os.environ.get('SWARM_ROOT', os.path.expanduser('~/swarm')))
 from operations.coordination.approval import request_approval
 request_approval('product-implementer', artifact='<plan-doc>.md', context='<checkpoint> approval for issue <N>', requires_human=False)
-print('Approval request created — routed to product-strategist')
+print('Approval request created')
 "
 ```
 

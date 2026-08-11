@@ -362,6 +362,7 @@ interface ApprovalRequest {
   created_at?: string;
   parent?: string;
   thread?: Array<{ author?: string; text?: string; ts?: string }>;
+  channel?: string; // #1402 rollout: per-repo approval channel
   // #158 dead-session recovery contract (swarm #1681 records repo/cwd and the
   // requester heartbeat):
   feedback_at?: string; // #156: when the changes_requested feedback landed
@@ -670,10 +671,12 @@ export async function scanApprovals(opts?: {
 
     // #1402 conversation: agent follow-up (parent set) → post INTO the parent
     // thread so the human sees the agent's answer in context.
+    const reqChannel = (req.channel || "").trim() || channel;
+
     if (req.parent && status === "pending" && (!req.reviewer || req.reviewer === "human")) {
       const parentState = state[req.parent];
       if (parentState?.ts && !prev) {
-        const res = await postApprovalRequest(req, token, channel, 5000, parentState.ts);
+        const res = await postApprovalRequest(req, token, reqChannel, 5000, parentState.ts);
         if (res.ok) {
           state[req.id] = { status, ts: res.ts, channel, parent_ts: parentState.ts, revision };
           result.posted++;
@@ -698,7 +701,7 @@ export async function scanApprovals(opts?: {
       prev &&
       prev.revision !== revision
     ) {
-      const res = await postApprovalRequest(req, token, channel);
+      const res = await postApprovalRequest(req, token, reqChannel);
       if (res.ok) {
         if (prev.ts && prev.channel) {
           void settleSupersededMessage({ channel: prev.channel, ts: prev.ts, revision, apiUrl: getSlackApiUrl() }).catch(() => {});
@@ -744,7 +747,7 @@ export async function scanApprovals(opts?: {
       // in-process and don't need Slack. (#157: the revision-aware title is
       // applied inside buildApprovalBlocks for any v2+ first-time post.)
       if (status === "pending" && (!req.reviewer || req.reviewer === "human")) {
-        const res = await postApprovalRequest(req, token, channel);
+        const res = await postApprovalRequest(req, token, reqChannel);
         if (res.ok) {
           state[req.id] = { status, ts: res.ts, channel, revision };
           result.posted++;
