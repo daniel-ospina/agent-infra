@@ -639,11 +639,19 @@ export function ingestHeartbeatChunk(
     // Code-review fix: an unterminated foreign stderr fragment followed by a
     // marker merges into one line — split it so the head survives as real
     // stderr and the marker part is parsed/discarded (guarantee 6).
-    const prefixIdx = line.indexOf(HEARTBEAT_MARKER_PREFIX);
-    if (prefixIdx > 0) {
-      ctx.appendStderr(line.slice(0, prefixIdx));
-      ctx.onRealOutput();
-      line = line.slice(prefixIdx);
+    // ANSI-decorated markers are pure markers — parseHeartbeatLine strips the
+    // decoration, so they must NOT split into a fake "head" (that would flip
+    // hasOutput and leak escape garbage into the accumulator).
+    const isDecoratedMarker =
+      !line.startsWith(HEARTBEAT_MARKER_PREFIX) &&
+      line.replace(ANSI_RE, "").trimStart().startsWith(HEARTBEAT_MARKER_PREFIX);
+    if (!isDecoratedMarker) {
+      const prefixIdx = line.indexOf(HEARTBEAT_MARKER_PREFIX);
+      if (prefixIdx > 0) {
+        ctx.appendStderr(line.slice(0, prefixIdx));
+        ctx.onRealOutput();
+        line = line.slice(prefixIdx);
+      }
     }
     if (!parseHeartbeatLine(line, ctx.state, now, ctx.expectedNonce)) {
       ctx.appendStderr(line + "\n");

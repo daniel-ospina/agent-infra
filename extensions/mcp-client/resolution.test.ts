@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
-import { resolveMcpJsonPath, expandEnvVars } from "./index.js";
+import { resolveMcpJsonPath, expandEnvVars, buildMcpServerEnv } from "./index.js";
 
 let passed = 0;
 let failed = 0;
@@ -191,6 +191,28 @@ await test("defaults support nested ${...} expansion", () => {
     cwd: "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
   });
   equal(out.cwd, `${process.env.HOME}/Documents/GitHub/tortoise`);
+});
+
+// ── #176: heartbeat nonce must never reach MCP servers ──────────────────
+section("buildMcpServerEnv — heartbeat nonce scrub (#176)");
+
+await test("TASK_HEARTBEAT_NONCE is scrubbed; other env + config.env preserved", () => {
+  const prevNonce = process.env.TASK_HEARTBEAT_NONCE;
+  const prevHb = process.env.TASK_HEARTBEAT;
+  process.env.TASK_HEARTBEAT_NONCE = "secret-nonce-123";
+  process.env.TASK_HEARTBEAT = "1";
+  try {
+    const env = buildMcpServerEnv({ env: { MY_SERVER_KEY: "abc" } });
+    equal(env.TASK_HEARTBEAT_NONCE, undefined, "nonce must not reach MCP servers (they inherit the child's fd 2)");
+    equal(env.TASK_HEARTBEAT, "1", "non-secret gate vars pass through harmlessly");
+    equal(env.MY_SERVER_KEY, "abc", "config.env expansion preserved");
+    equal(env.PATH, process.env.PATH, "parent env preserved");
+  } finally {
+    if (prevNonce === undefined) delete process.env.TASK_HEARTBEAT_NONCE;
+    else process.env.TASK_HEARTBEAT_NONCE = prevNonce;
+    if (prevHb === undefined) delete process.env.TASK_HEARTBEAT;
+    else process.env.TASK_HEARTBEAT = prevHb;
+  }
 });
 
 // ── Cleanup + summary ────────────────────────────────────────────────────

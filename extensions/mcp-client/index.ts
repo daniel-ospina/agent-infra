@@ -114,6 +114,20 @@ interface McpConnection {
  * base config's tortoise cwd/PYTHONPATH. Regex replacement cannot parse
  * nested braces, so a small scanner tracks ${ ... } depth explicitly.
  */
+/**
+ * Env for a stdio MCP server: the parent env (servers need API keys etc.)
+ * plus expanded config.env — MINUS the task-heartbeat nonce (#176). MCP
+ * servers inherit the child's fd 2 (MCP SDK stdio default stderr:"inherit");
+ * with the nonce they could forge valid [task-heartbeat] markers on the very
+ * pipe the parent parses. Without it, forged markers are rejected by the
+ * parent's expectedNonce check. Exported for unit tests.
+ */
+export function buildMcpServerEnv(config: { env?: Record<string, string> }): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env, ...(config.env ? expandEnvVars(config.env) : {}) };
+  delete env.TASK_HEARTBEAT_NONCE;
+  return env;
+}
+
 export function expandEnvVars(obj: Record<string, string>): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(obj)) {
@@ -381,7 +395,7 @@ class McpServerManager {
       // Expand ${VAR} placeholders in config.env (same as headers above) so
       // servers like @houtini/gemini-mcp receive real values, not literal
       // "${VAR}" strings (e.g. GEMINI_API_KEY). See tortoise issue #240.
-      const env = { ...process.env, ...(config.env ? expandEnvVars(config.env) : {}) };
+      const env = buildMcpServerEnv(config);
       transport = new StdioClientTransport({
         command: config.command,
         args: config.args ?? [],

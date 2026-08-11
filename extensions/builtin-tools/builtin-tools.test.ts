@@ -1266,13 +1266,31 @@ testAsync("child lifecycle — ready, tool-Set semantics, per-turn flags, tick f
 
 test("E8 (review fix): mid-line marker merge — foreign head preserved, marker part discarded", () => {
   const { ctx, acc, real } = makeIngest();
-  // unterminated foreign fragment + marker in one chunk → merged line
-  ingestHeartbeatChunk("MCP connecting to serve", ctx, 1);
-  ingestHeartbeatChunk("r\n[task-heartbeat] tick nonce=n1 tools=1 turn=1 stream_age_ms=5 tool_age_max_ms=5 saw_msg=0 saw_tool=1\n", ctx, 2);
-  equal(acc(), "MCP connecting to server\n", "foreign head survives as real stderr");
+  ctx.expectedNonce = "n1"; // production context: parent always authenticates
+  // Cross-chunk merge: unterminated foreign fragment, then a marker arriving
+  // on the SAME line → the split branch (prefixIdx > 0) must fire.
+  ingestHeartbeatChunk("MCP connecting ", ctx, 1);
+  ingestHeartbeatChunk("[task-heartbeat] tick nonce=n1 tools=1 turn=1 stream_age_ms=5 tool_age_max_ms=5 saw_msg=0 saw_tool=1\n", ctx, 2);
+  equal(acc(), "MCP connecting ", "foreign head survives as real stderr");
   ok(real(), "foreign bytes flip hasOutput");
   equal(ctx.state.toolsInFlight, 1, "marker part still parsed into state");
   ok(!acc().includes("[task-heartbeat]"), "guarantee 6 holds on the merged-line path");
+  // Forged marker merged onto a foreign line (wrong nonce) — BOTH parts land
+  // in the accumulator, in order (requires an authenticated context, as in
+  // production where the parent always sets expectedNonce).
+  const { ctx: c2, acc: acc2 } = makeIngest();
+  c2.expectedNonce = "n1";
+  ingestHeartbeatChunk("server log [task-heartbeat] tick nonce=EVIL tools=9 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=1\n", c2, 3);
+  equal(acc2(), "server log [task-heartbeat] tick nonce=EVIL tools=9 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=1\n", "forged merged line preserved whole");
+  equal(c2.state.toolsInFlight, 0, "forged tick changed nothing");
+});
+
+test("E8 (review fix): ANSI-decorated marker line stays a pure marker (no hasOutput flip)", () => {
+  const { ctx, acc, real } = makeIngest();
+  ingestHeartbeatChunk("\u001b[31m[task-heartbeat] ready nonce=n2\u001b[0m\n", ctx, 1);
+  equal(acc(), "", "decorated marker discarded whole — no fragment in accumulator");
+  equal(real(), false, "markers never flip hasOutput, ANSI-wrapped or not");
+  ok(ctx.state.sawReady, "decorated marker still parsed");
 });
 
 test("review fix: wedge with frozen tick ages — stall fires at bound, not at window expiry", () => {

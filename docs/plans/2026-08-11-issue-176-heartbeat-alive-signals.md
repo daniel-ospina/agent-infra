@@ -549,3 +549,15 @@ commit/PR reference issue #176.
       follow-up (nonce closes the #176 attack surface).
 - Re-verified after fixes: 106/106 unit tests, E4 e2e green, nonce confirmed
   flowing in real pi child.
+- Fix-confirmation round 2 (post-8db93a3): 3 residual P2s found and fixed:
+  11. E8 merged-line test never exercised the split branch (chunks formed two
+      lines) → true cross-chunk merge fixture + forged-nonce merged variant +
+      ANSI-decorated marker fixture.
+  12. ANSI-decorated marker lines hit the split branch (decoration flushed as
+      real stderr → hasOutput flip) → isDecoratedMarker check routes them to
+      the pure-marker path.
+  13. Nonce leaked to MCP servers via the env spread (mcp-client passes
+      {...process.env} to stdio servers; SDK default stderr:"inherit") — the
+      named attacker held both nonce and write path → buildMcpServerEnv()
+      scrubs TASK_HEARTBEAT_NONCE (unit-tested in resolution.test.ts).
+  Re-verified: 107/107 builtin-tools tests, 12/12 mcp-client tests, E4 green.
