@@ -2,7 +2,8 @@
  * builtin-tools.test.ts — unit tests for builtin-tools/index.ts
  *
  * Covers: HTML stripping, Perplexity key resolution, timeout constants,
- * provider/model resolution (#154), regression tests for known bugs
+ * provider/model resolution (#154), exit watchdog (#153), provider fallback
+ * decision logic (#152), regression tests for known bugs
  * (#5838, #5526, #5954, #5955).
  *
  * Run: npx tsx extensions/builtin-tools/builtin-tools.test.ts
@@ -11,9 +12,10 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback } from "./index.js";
 import type { ModelRegistry } from "./index.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -38,6 +40,23 @@ function test(name: string, fn: () => void) {
 function section(name: string) {
   console.log(`\n${name}:`);
 }
+
+// Async test harness (exit-watchdog timer tests use real timers).
+const asyncTests: Array<() => Promise<void>> = [];
+function testAsync(name: string, fn: () => Promise<void>) {
+  asyncTests.push(async () => {
+    try {
+      await fn();
+      passed++;
+      console.log(`  ✅ ${name}`);
+    } catch (err: any) {
+      failed++;
+      console.log(`  ❌ ${name}: ${err.message}`);
+    }
+  });
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // ── stripHtml ─────────────────────────────────────────
 
@@ -426,6 +445,202 @@ test("real registry (if present) routes bare qwen3.8-max to provider qwen", () =
   equal(resolveProviderModel("qwen3.8-max", reg).provider, "qwen");
 });
 
+// ── getExitGraceMs — exit-watchdog grace (#153) ──────
+
+section("getExitGraceMs — exit-watchdog grace (#153)");
+
+test("defaults to 120s", () => {
+  delete process.env.TASK_EXIT_GRACE_MS;
+  equal(getExitGraceMs(), DEFAULT_EXIT_GRACE_MS);
+  equal(DEFAULT_EXIT_GRACE_MS, 120_000, "plan: ~120s grace");
+});
+
+test("reads TASK_EXIT_GRACE_MS override", () => {
+  process.env.TASK_EXIT_GRACE_MS = "5000";
+  try {
+    equal(getExitGraceMs(), 5000);
+  } finally {
+    delete process.env.TASK_EXIT_GRACE_MS;
+  }
+});
+
+test("clamps to ≥ 1000ms (bogus/negative env can't instant-kill)", () => {
+  process.env.TASK_EXIT_GRACE_MS = "500"; // positive but below floor → 1000
+  try {
+    equal(getExitGraceMs(), 1000);
+  } finally {
+    delete process.env.TASK_EXIT_GRACE_MS;
+  }
+  process.env.TASK_EXIT_GRACE_MS = "0"; // zero/non-positive → treated as unset → default
+  try {
+    equal(getExitGraceMs(), DEFAULT_EXIT_GRACE_MS);
+  } finally {
+    delete process.env.TASK_EXIT_GRACE_MS;
+  }
+  process.env.TASK_EXIT_GRACE_MS = "abc";
+  try {
+    equal(getExitGraceMs(), DEFAULT_EXIT_GRACE_MS);
+  } finally {
+    delete process.env.TASK_EXIT_GRACE_MS;
+  }
+});
+
+// ── armExitWatchdog — tier-3 exit watchdog (#153) ────
+
+section("armExitWatchdog — tier-3 exit watchdog (#153)");
+
+testAsync("does not kill while streams are open", async () => {
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  const kills: string[] = [];
+  const w = armExitWatchdog({
+    pid: 9999,
+    stdout: stdout as any,
+    stderr: stderr as any,
+    graceMs: 20,
+    kill: (sig) => kills.push(sig),
+  });
+  await sleep(50); // grace passed with no stream end → nothing armed
+  equal(kills.length, 0, "no kill before streams end");
+  w.disarm();
+});
+
+testAsync("arms on BOTH stream ends and kills after grace", async () => {
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  const kills: string[] = [];
+  const w = armExitWatchdog({
+    pid: 9999,
+    stdout: stdout as any,
+    stderr: stderr as any,
+    graceMs: 20,
+    kill: (sig) => kills.push(sig),
+  });
+  stdout.emit("end");
+  await sleep(5);
+  equal(kills.length, 0, "single stream end must not arm");
+  stderr.emit("end");
+  await sleep(60); // > graceMs
+  ok(kills.length >= 1, "SIGTERM must be sent after both streams end + grace");
+  equal(kills[0], "SIGTERM");
+  w.disarm();
+});
+
+testAsync("disarm before grace cancels the kill", async () => {
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  const kills: string[] = [];
+  const w = armExitWatchdog({
+    pid: 9999,
+    stdout: stdout as any,
+    stderr: stderr as any,
+    graceMs: 20,
+    kill: (sig) => kills.push(sig),
+  });
+  stdout.emit("end");
+  stderr.emit("end");
+  w.disarm();
+  await sleep(50);
+  equal(kills.length, 0, "disarmed watchdog must not kill");
+});
+
+test("exit watchdog is wired into spawnSubAgent + env override in source (#153)", () => {
+  ok(source.includes("armExitWatchdog({"), "spawnSubAgent must arm the exit watchdog");
+  ok(source.includes("getExitGraceMs()"), "watchdog grace must come from getExitGraceMs");
+  ok(source.includes("exitWatchdog.disarm()"), "watchdog must be disarmed on settle");
+  ok(source.includes("TASK_EXIT_GRACE_MS"), "TASK_EXIT_GRACE_MS env override must exist");
+  ok(source.includes("treeKill"), "watchdog must kill via tree-kill pattern (orphan reaping)");
+});
+
+// ── getFallbackModel — provider fallback target (#152) ─
+
+section("getFallbackModel — provider fallback target (#152)");
+
+test("defaults to deepseek-v4-pro", () => {
+  delete process.env.TASK_FALLBACK_MODEL;
+  equal(getFallbackModel(), DEFAULT_FALLBACK_MODEL);
+  equal(DEFAULT_FALLBACK_MODEL, "deepseek-v4-pro");
+});
+
+test("reads TASK_FALLBACK_MODEL override", () => {
+  process.env.TASK_FALLBACK_MODEL = "claude-sonnet-4-5";
+  try {
+    equal(getFallbackModel(), "claude-sonnet-4-5");
+  } finally {
+    delete process.env.TASK_FALLBACK_MODEL;
+  }
+});
+
+// ── connectionErrorDetected — #152 signatures ────────
+
+section("connectionErrorDetected — #152 signatures");
+
+const qwenConnErr = {
+  content: [{ type: "text", text: "" }],
+  details: { stderr: "[provider] Connection error.", exitCode: 1 },
+};
+
+test('detects "Connection error." in stderr', () => {
+  ok(connectionErrorDetected(qwenConnErr));
+});
+
+test('detects stopReason "error" in stderr', () => {
+  ok(connectionErrorDetected({ content: [{ type: "text", text: "" }], details: { stderr: 'stopReason: "error"', exitCode: 1 } }));
+});
+
+test('detects "terminated" mid-stream in output with non-zero exit', () => {
+  ok(connectionErrorDetected({ content: [{ type: "text", text: 'errorMessage: "terminated"' }], details: { exitCode: 1 } }));
+});
+
+test("clean exit whose output merely mentions the phrase is NOT a failure", () => {
+  ok(!connectionErrorDetected({ content: [{ type: "text", text: "Research notes: connection error handling" }], details: { exitCode: 0 } }), "exit 0 output mention must not trigger");
+});
+
+test("undefined/null result → false", () => {
+  ok(!connectionErrorDetected(undefined));
+  ok(!connectionErrorDetected(null));
+});
+
+// ── shouldFallback — #152 decision matrix ─────────────
+
+section("shouldFallback — #152 decision matrix");
+
+test("qwen + connection error → fallback", () => {
+  ok(shouldFallback({ provider: "qwen", result: qwenConnErr, fallbackDisabled: false, isFallbackAttempt: false }));
+});
+
+test("qwen-tp + connection error → fallback (all qwen variants)", () => {
+  ok(shouldFallback({ provider: "qwen-tp", result: qwenConnErr, fallbackDisabled: false, isFallbackAttempt: false }));
+});
+
+test("deepseek + connection error → NO fallback (don't fallback-loop the fallback)", () => {
+  ok(!shouldFallback({ provider: "deepseek", result: qwenConnErr, fallbackDisabled: false, isFallbackAttempt: false }));
+});
+
+test("non-error exit → no fallback", () => {
+  ok(!shouldFallback({ provider: "qwen", result: { content: [{ type: "text", text: "task done" }], details: { exitCode: 0 } }, fallbackDisabled: false, isFallbackAttempt: false }));
+});
+
+test("TASK_FALLBACK_DISABLE → off", () => {
+  ok(!shouldFallback({ provider: "qwen", result: qwenConnErr, fallbackDisabled: true, isFallbackAttempt: false }));
+});
+
+test("isFallbackAttempt=true → no second fallback (max 1 fallback)", () => {
+  ok(!shouldFallback({ provider: "qwen", result: qwenConnErr, fallbackDisabled: false, isFallbackAttempt: true }));
+});
+
+test("unknown provider → no fallback", () => {
+  ok(!shouldFallback({ provider: "zai", result: qwenConnErr, fallbackDisabled: false, isFallbackAttempt: false }));
+});
+
+test("fallback wiring in task execute: env overrides + one-shot log (#152)", () => {
+  ok(source.includes('TASK_FALLBACK_DISABLE === "1"'), "TASK_FALLBACK_DISABLE kill switch wired");
+  ok(source.includes("TASK_FALLBACK_MODEL"), "TASK_FALLBACK_MODEL env read wired");
+  ok(source.includes("[builtin-tools] provider fallback:"), "fallback must be clearly logged with [builtin-tools] prefix");
+  ok(source.includes("isFallbackAttempt"), "fallback must not loop (max 1 fallback)");
+  ok(source.includes("getFallbackModel()"), "fallback model must come from getFallbackModel");
+});
+
 // ── getPiInvocation — canonical-copy drift guard (#101) ─
 
 section("getPiInvocation — canonical-copy drift guard (#101)");
@@ -447,9 +662,12 @@ test("builtin-tools copy matches canonical getPiInvocation in subagent/index.ts"
 
 // ── Results ───────────────────────────────────────────
 
-console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
-if (failed > 0) {
-  console.log("❌ SOME TESTS FAILED");
-  process.exit(1);
-}
-console.log("✅ ALL TESTS PASSED");
+(async () => {
+  for (const t of asyncTests) await t();
+  console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
+  if (failed > 0) {
+    console.log("❌ SOME TESTS FAILED");
+    process.exit(1);
+  }
+  console.log("✅ ALL TESTS PASSED");
+})();
