@@ -170,3 +170,103 @@ cmux-side surface refresh behavior.
 |--------|--------|-----------|
 | Org Infra | standard | two mandatory-gate skill edits; drift-guarded |
 | Config | standard | new extension: periodic timer, git lock contention, watcher guard, wiring parity |
+
+## Stage 4 — Implementation Plan
+
+Execution order: T1 ∥ T2 ∥ T3 (independent) → T4 → T5 (rollout).
+
+### Task 1: L1 — Branch Gate freshness (issue-workflow)
+
+**Intent:** Every issue branch starts from fresh origin state — closes the
+stale-branch-creation class (verified gap: zero fetch in the current gate;
+commit-workflow and using-git-worktrees precedents match).
+**Acceptance:**
+- Branch Gate detects the default branch via
+  `git symbolic-ref --short refs/remotes/origin/HEAD` (fallback `main`).
+- Gate fetches (`git fetch origin "$DEFAULT_BRANCH" --quiet`) and creates the
+  branch from `origin/$DEFAULT_BRANCH` — local main untouched.
+- Both abort-guidance paths ("Checkout main first...") carry the same
+  fetch-first + origin-base instruction.
+- Worktree Gate unchanged.
+- Drift-guard test asserts all of the above against the skill source.
+**Files:**
+- Modify: skills/issue-workflow/SKILL.md
+- Test: extensions/shared/test-git-freshness.mjs (new; CI-run via
+  extensions/*/test*.mjs glob)
+
+### Task 2: L3 — pre-PR freshness + stale-merge recovery (commit-workflow)
+
+**Intent:** Ship reconciled with origin; survive the strict-up-to-date ladder
+(mandatory companion to Decision 2 — adversarial review P1).
+**Acceptance:**
+- 01-preflight.md gains a freshness step after branch detection: fetch,
+  behind-count vs origin/<default>; clean → `git -c commit.gpgsign=false pull
+  --rebase origin <default>` + re-run checks; dirty → WARN, no autostash;
+  behind=0 → silent.
+- 04-merge-deploy.md gains stale-merge recovery: merge blocked as stale →
+  fetch → rebase (gpgsign off) → re-run typecheck/tests →
+  `git push --force-with-lease` → retry merge (bounded, then escalate).
+- Drift-guard test asserts both steps in the workflow sources.
+**Files:**
+- Modify: skills/commit-workflow/workflow/01-preflight.md
+- Modify: skills/commit-workflow/workflow/04-merge-deploy.md
+- Test: extensions/shared/test-git-freshness.mjs
+
+### Task 3: L2 — repo-freshness extension
+
+**Intent:** Ambient freshness for long-lived sessions + gate-bypassers: idle
+default branches auto-heal; feature-branch drift is surfaced; nothing is ever
+damaged (research-verified envelope).
+**Acceptance:**
+- `extensions/repo-freshness.ts` (flat, self-contained per #5611): interactive
+  sessions only (PI_MODE≠print), git+origin repos only,
+  AGENT_REPO_FRESHNESS_DISABLED=1 opt-out, agent-infra excluded (auto-sync
+  owns it).
+- session_start + periodic timer (20 min default, clamped ≥5 min, started in
+  session_start, cleared in session_shutdown, unref'd — pi extension rules).
+- State machine vs origin/<default> (symbolic-ref detection, fallback main):
+  current → silent; behind + default branch + clean + not-ahead + no
+  MERGE_HEAD/REBASE_HEAD + no index.lock → mode auto: `git pull --ff-only`
+  with `[repo-freshness] auto-pull <repo> <old>→<new>` log; mode warn: hint.
+  ahead → report unpushed; diverged → guidance, never pull; feature branch →
+  report-only behind-count; index.lock/merge/rebase in progress → skip silent.
+- Env knobs: AGENT_REPO_FRESHNESS_MODE (auto|warn, default auto),
+  AGENT_REPO_FRESHNESS_INTERVAL_MS, AGENT_REPO_FRESHNESS_DISABLED.
+- fetch timeout 30s, pull timeout 120s, all failures silent-degrade (offline).
+- Unit tests against real throwaway repos (auto-sync.test.ts pattern): full
+  state matrix incl. dirty-tree abort, untracked-collision abort, lock skip,
+  feature-branch report-only, agent-infra exclusion, interval clamp.
+**Files:**
+- Create: extensions/repo-freshness.ts
+- Test: extensions/repo-freshness.test.ts (tsx, dev gate — auto-sync precedent)
+
+### Task 4: L2 wiring + drift gate
+
+**Intent:** Emitter ships on every machine via both bootstrap paths; gate green.
+**Acceptance:**
+- manifest.json `files["extensions/"].entries` gains `repo-freshness.ts`.
+- pi-config symlink `pi-bootstrap/pi-config/extensions/repo-freshness.ts`.
+- TARGETED live-farm symlink (never the full installer — cmux-session.ts
+  divergent file, #176 lesson).
+- `scripts/check-pi-config-extensions.sh` exits 0.
+**Files:**
+- Modify: manifest.json
+- Create: pi-bootstrap/pi-config/extensions/repo-freshness.ts (symlink)
+
+### Task 5: Rollout — machine guard + protection + fleet audit
+
+**Intent:** Fleet-wide safety net + verification at zero drift.
+**Acceptance:**
+- `git config --global pull.ff only` set (idempotent).
+- GitHub "require branches up to date before merging" enabled on fleet repos
+  with branch protection (agent-infra, tortoise, DMeer, premise-labs, swarm,
+  autocast-project) — admin API; monitor-and-downgrade escape hatch recorded.
+- Fleet drift audit (fetch all + behind-count) shows 0 silently-behind repos;
+  dirty/ahead repos listed for manual triage (E4).
+**Files:**
+- none (operational) — record results in the issue.
+
+### Out of scope
+
+Submodule recursion, LFS, Windows/CI, cmux surface behavior, merge queue
+(overkill at fleet throughput).
