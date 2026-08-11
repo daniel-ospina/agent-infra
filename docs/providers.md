@@ -72,6 +72,9 @@ model.
 | `TASK_FALLBACK_MODEL` | `deepseek-v4-pro` | Model used for the one-shot fallback dispatch after a qwen connection-error death |
 | `TASK_FALLBACK_DISABLE` | unset | `1` turns the provider fallback off |
 | `TASK_HEARTBEAT_TIMEOUT_MS` | `1800000` (30 min) | Tier-2 silence threshold (pre-existing #489) |
+| `QWEN_HA_DISABLE` | unset | `1` (or `true`) disables the qwen-ha provider extension entirely (registers nothing, warns once) |
+| `QWEN_WS_BASE_URL` | aliyuncs compatible-mode/v1 (models.json default) | Endpoint override for the qwen-ha provider (§5) |
+| `QWEN_WS_API_KEY` | — | API key for qwen-ha — same key the existing `qwen` provider uses |
 
 ## 4. Design decisions + open questions
 
@@ -85,7 +88,62 @@ model.
   drain (Issue A), dead-socket pool reuse (Issue B), `"terminated"` classification
   (Issue C). Filed by the orchestrator; the agent-infra mitigations make these
   non-blocking.
-- **Settings tuning (plan T3)** and **custom qwen provider wrapper (plan T4)**
-  were assessed as upstream-dependent (pi-core per-provider retry settings and
-  `fetch`-override support are not confirmed) — not implemented in this work;
-  see the plan's risks Q1/Q2.
+- **Settings tuning (plan T3) — APPLIED (global only).** The orchestrator
+  applied `retry.provider.maxRetries` globally in `~/.pi/agent/settings.json`
+  alongside the pre-existing `retry.provider.timeoutMs: 600000`. Per-provider
+  retry blocks (`providers.qwen.retry.*`) are **not supported**: pi's
+  settings-manager `getProviderRetrySettings()` reads global `retry.provider.*`
+  only (Q2 answered — verified in `dist/core/settings-manager.js`), so retry
+  tuning is global for every provider, not qwen-specific.
+- **Custom qwen provider wrapper (plan T4) — SHIPPED** as
+  `extensions/custom-provider-qwen/` (new provider id `qwen-ha`, §5). Q1
+  answered: pi-ai **does** accept a per-request `fetch` override —
+  `StreamOptions.fetch` flows into `createClient()` → `new OpenAI({ fetch })`
+  (verified in `dist/api/openai-completions.js`), so connection hygiene is
+  expressible at the provider level with no upstream change required.
+
+## 5. qwen-ha — high-availability provider (plan T4)
+
+`extensions/custom-provider-qwen/index.ts` registers a NEW provider `qwen-ha`
+serving `qwen3.8-max` on the same aliyuncs compatible-mode endpoint, with
+connection hygiene aimed at the #152 dead-socket failure. It is a drop-in for
+`qwen`/`qwen3.8-max`: same key (`$QWEN_WS_API_KEY`), same base URL, same model
+capabilities/compat — only the HTTP layer differs.
+
+### Why a new provider id
+
+pi's legacy `registerProvider("qwen", { … })` form cannot inject a custom
+`fetch` (its `api` field is a string). The native form —
+`registerProvider(createProvider({ api }))` with a wrapped `ProviderStreams`
+object — can. Registering under `qwen-ha` (instead of overriding `qwen`) keeps
+the existing wiring untouched and gives the task-tool fallback work (#152/#154)
+an explicit target: `TASK_FALLBACK_MODEL=qwen-ha/qwen3.8-max` or provider
+`qwen-ha`.
+
+### Connection hygiene
+
+All qwen-ha requests go through a tuned undici `Agent` (the extension bundles
+its own `undici@8.9.0` copy — the same version pi ships):
+
+- `pipelining: 0` — undici closes the socket after every response; no socket
+  outlives a turn, so the LB never gets a chance to hold a socket the pool
+  still thinks is alive.
+- `keepAliveTimeout: 4000` — backstop: idle sockets die client-side at ~4s,
+  well under the endpoint's ~8-minute kill TTL, so dead-socket reuse is
+  impossible.
+- `connections: 4` — cap on concurrent sockets per origin; parallel pi
+  sessions share the pool.
+- Honors `HTTP(S)_PROXY` env vars by switching to `EnvHttpProxyAgent` when set.
+
+Tradeoff: every turn pays a fresh TCP+TLS handshake (~100–300 ms on this
+route) — noise against LLM streaming time, bought for #152 immunity.
+
+### Verified against pi 0.84.1 internals (Q1)
+
+`dist/api/openai-completions.js`: `stream()` passes `options?.fetch` into
+`createClient()` (line 128) → `new OpenAI({ apiKey, baseURL, fetch, … })`
+(line 514); `StreamOptions.fetch?: FetchFunction` is part of the public type.
+So `{ ...options, fetch: tunedFetch }` in a wrapped `ProviderStreams` is all
+that is needed — no upstream change. The extension factory is
+failure-contained: it never throws (any setup error → warn + no registration),
+so pi startup cannot be blocked.

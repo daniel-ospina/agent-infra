@@ -1,0 +1,15 @@
+{
+  "name": "custom-provider-qwen",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Qwen high-availability provider extension (plan T4): qwen-ha provider with tuned undici fetch for connection hygiene against the aliyuncs compatible-mode LB.",
+  "dependencies": {
+    "undici": "8.9.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

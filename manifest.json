@@ -21,6 +21,7 @@
         "carousel-designer.ts",
         "cmux-session.ts",
         "custom-provider-openrouter/",
+        "custom-provider-qwen/",
         "design-reviewer.ts",
         "health-check/",
         "slack-bridge/",
