@@ -147,16 +147,35 @@ CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
 # Already on the correct branch — proceed
 [ "$CURRENT_BRANCH" = "$EXPECTED_BRANCH" ] && echo "✅ On correct branch: $CURRENT_BRANCH" && exit 0
 
-# On main — create the dedicated branch
+# On main/master — create the dedicated branch from FRESH origin state
+# (#178/#179: never branch from stale local main — a stale base silently
+# re-introduces already-fixed code and merges cleanly = worst-case regression)
 if [ "$CURRENT_BRANCH" = "main" ] || [ "$CURRENT_BRANCH" = "master" ]; then
-  git checkout -b "$EXPECTED_BRANCH"
-  echo "✅ Created and switched to: $EXPECTED_BRANCH"
+  # Detect the default branch via origin/HEAD (fallback: main)
+  DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+  [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
+  # Fetch latest; on failure (offline / no origin) fall back to the existing
+  # local origin ref WITH A WARN — never silently branch from stale state
+  if ! git fetch origin "$DEFAULT_BRANCH" --quiet; then
+    if git rev-parse --verify "origin/$DEFAULT_BRANCH" >/dev/null 2>&1; then
+      echo "⚠️ fetch failed — branching from LAST KNOWN origin/$DEFAULT_BRANCH (verify freshness before shipping)"
+    else
+      echo "⛔ ABORT: fetch failed and no origin/$DEFAULT_BRANCH ref exists locally."
+      exit 1
+    fi
+  fi
+  # Fail-closed: a failed checkout must never false-report success (#179)
+  git checkout -b "$EXPECTED_BRANCH" "origin/$DEFAULT_BRANCH" || {
+    echo "⛔ ABORT: could not create $EXPECTED_BRANCH from origin/$DEFAULT_BRANCH"
+    exit 1
+  }
+  echo "✅ Created and switched to: $EXPECTED_BRANCH (from fresh origin/$DEFAULT_BRANCH)"
   exit 0
 fi
 
 # Detached HEAD? ABORT — no branch to verify
 if [ -z "$CURRENT_BRANCH" ]; then
-  echo "⛔ ABORT: Detached HEAD. Checkout main first: git checkout main && git checkout -b $EXPECTED_BRANCH"
+  echo "⛔ ABORT: Detached HEAD. Branch from fresh origin: git fetch origin main --quiet && git checkout -b $EXPECTED_BRANCH origin/main"
   exit 1
 fi
 
@@ -165,7 +184,7 @@ if ! echo "$CURRENT_BRANCH" | grep -qE "(^|/)$ISSUE_NUMBER(-|\$)"; then
   echo "⛔ ABORT: You are on branch \"$CURRENT_BRANCH\" which belongs to a DIFFERENT issue."
   echo "   This is how #74's work committed onto #73's branch (incident 2026-08-06)."
   echo "   → Stash or commit your changes on $CURRENT_BRANCH first."
-  echo "   → Then: git checkout main && git checkout -b $EXPECTED_BRANCH"
+  echo "   → Then branch from fresh origin: git fetch origin main --quiet && git checkout -b $EXPECTED_BRANCH origin/main"
   exit 1
 fi
 
