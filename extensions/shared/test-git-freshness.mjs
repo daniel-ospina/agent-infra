@@ -154,6 +154,54 @@ function makeStaleFixture(name) {
   check("F5 still on main (no false success)", branch === "main", branch);
 }
 
+// ── #181 (L3): pre-PR freshness + stale-merge recovery assertions ─────
+const preflight = readFileSync(join(PROJECT_ROOT, "skills/commit-workflow/workflow/01-preflight.md"), "utf8");
+const mergedeploy = readFileSync(join(PROJECT_ROOT, "skills/commit-workflow/workflow/04-merge-deploy.md"), "utf8");
+
+check("L3 preflight has the Pre-PR Freshness Check section",
+  preflight.includes("## Pre-PR Freshness Check (#178/#181)"));
+check("L3 freshness step placed AFTER Merged-Branch Guard, BEFORE Tier Detection",
+  preflight.indexOf("### Merged-Branch Guard") < preflight.indexOf("## Pre-PR Freshness Check") &&
+  preflight.indexOf("## Pre-PR Freshness Check") < preflight.indexOf("## Tier Detection"));
+check("L3 computes behind-count vs origin/<default>",
+  preflight.includes('git rev-list --count HEAD.."origin/$DEFAULT_BRANCH"'));
+check("L3 clean-tree rebase uses gpgsign-off",
+  preflight.includes('git -c commit.gpgsign=false pull --rebase origin "$DEFAULT_BRANCH"'));
+check("L3 dirty tree → WARN, never autostash",
+  preflight.includes("NEVER autostash"));
+check("L3 rejected post-rebase push → force-with-lease",
+  preflight.includes("git push --force-with-lease"));
+check("L3 04-merge-deploy has Stale-Merge Recovery",
+  mergedeploy.includes("## Stale-Merge Recovery (#178/#181"));
+check("L3 recovery rebases with gpgsign-off",
+  mergedeploy.includes('git -c commit.gpgsign=false rebase "origin/$DEFAULT_BRANCH"'));
+check("L3 recovery pushes with --force-with-lease (never plain --force)",
+  mergedeploy.includes("git push --force-with-lease") &&
+  !/git push --force(?!-with-lease)/.test(mergedeploy));
+check("L3 recovery bounded (max 2 attempts then escalate)",
+  mergedeploy.includes("MAX 2 recovery attempts"));
+
+// F6: runtime — behind+clean feature branch rebases onto fresh origin tip
+{
+  const { clone, other } = makeStaleFixture("l3rebase");
+  sh("git checkout -qb feat/181-work", clone);
+  writeFileSync(join(clone, "c.txt"), "feature\n");
+  sh("git add c.txt && git commit -qm feature", clone);
+  // origin/main advances AFTER the branch was cut
+  writeFileSync(join(other, "d.txt"), "newmain\n");
+  sh("git add d.txt && git commit -qm newmain && git push -q origin main", other);
+  // the mandated command sequence (dirty-checked, gpgsign-off, rebase)
+  sh("git fetch origin main --quiet", clone);
+  const behind = Number(sh('git rev-list --count HEAD..origin/main', clone).trim());
+  check("F6 behind-count detects drift", behind >= 1, `behind=${behind}`);
+  sh("git -c commit.gpgsign=false pull --rebase origin main", clone);
+  const tip = sh("git rev-parse origin/main", clone).trim();
+  const hasTip = sh("git merge-base --is-ancestor origin/main HEAD && echo yes || echo no", clone).trim();
+  check("F6 rebase landed the branch on the fresh origin tip", hasTip === "yes", tip);
+  const kept = sh("git log --oneline | grep -c feature", clone).trim();
+  check("F6 feature commit preserved through rebase", kept === "1");
+}
+
 // ── Cleanup + summary ────────────────────────────────────────────────────
 for (const dir of TMP_DIRS) {
   try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
