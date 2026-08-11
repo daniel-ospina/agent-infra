@@ -100,7 +100,7 @@ print('Approval request created')
 "
 ```
 
-This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to `operations/coordination/approvals.json` and must be checked manually.
+This triggers an osascript dialog on the human's machine. The pipeline advances after the human approves via `review_approval()`. If osascript is unavailable (non-macOS, CI, SSH), the approval is logged to the per-repo store `~/.swarm/approvals/<repo>.json` and must be checked manually.
 
 **Response mechanism:** The human clicks "Open" or "Dismiss" on the dialog. The agent monitors `pending_approvals('human')` to detect the response. See `operations/coordination/approval.py` for the full API.
 

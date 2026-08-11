@@ -66,8 +66,9 @@ terminal wrapper) and make sure the Bridge daemon is running at
 ## How approval forwarding works
 
 The swarm repo's approval router (`operations/coordination/approval.py`,
-cross-repo, out of scope for this extension) persists every request to
-`operations/coordination/approvals.json`:
+cross-repo, out of scope for this extension) persists every request to a
+**per-repo store** — `~/.swarm/approvals/<repo>.json` (outside any git tree,
+#2492):
 
 ```json
 { "id": "apr-…", "from_role": "product-strategist", "artifact": "03-scope.md",
@@ -90,10 +91,14 @@ and:
 3. **Deduplicates** via `~/.pi/agent/slack-approval-seen.json` (survives
    `/reload`), so a request is posted exactly once.
 
-**File discovery** (`SLACK_APPROVAL_FILE` overrides): walking up from the pi
-working directory, the first of `<dir>/operations/coordination/approvals.json`
-or `<dir>/swarm/operations/coordination/approvals.json` wins — this covers
-running pi from any workspace while the approvals live in the swarm repo.
+**File discovery** (`SLACK_APPROVAL_FILE` overrides): the per-repo store
+`~/.swarm/approvals/<repo>.json`, where `<repo>` is derived from the current
+repo's git origin remote (`git remote get-url origin`, same parsing as swarm's
+`_detect_repo` — #2492). Fallback (pre-#2492 checkouts, no git context):
+walking up from the pi working directory, the first of
+`<dir>/operations/coordination/approvals.json` or
+`<dir>/swarm/operations/coordination/approvals.json` wins — this covers
+running pi from any workspace.
 
 ### Interactive buttons — Socket Mode receiver (agent-infra #146)
 
