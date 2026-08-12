@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles } from "./index.js";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 
 let passed = 0;
@@ -523,6 +523,69 @@ test("handles nested roots without prefix stripping", () => {
 test("returns original when path is the root itself", () => {
   const p = "/proj";
   equal(normalizeRegistryPath(p, p), p);
+});
+
+// ── resolveMergeRoot (#190) ─────────────────────────
+
+section("resolveMergeRoot — wrong-root guard (#190)");
+
+test("prompt root that realpath-differs from blockedCwd → foreign (worktree B dispatch against worktree A block)", () => {
+  const { root, foreign } = resolveMergeRoot("/worktrees/wt-A", "[VGATE] verify files: a.ts. Classification: UI. Project root: /worktrees/wt-B");
+  equal(foreign, true, "stale block context must be flagged foreign");
+  ok(root.endsWith("/worktrees/wt-B"), "prompt's explicit root is authoritative");
+});
+
+test("prompt root matching blockedCwd → not foreign", () => {
+  const { root, foreign } = resolveMergeRoot("/worktrees/wt-A", "[VGATE] verify files: a.ts. Classification: UI. Project root: /worktrees/wt-A");
+  equal(foreign, false);
+  ok(root.endsWith("/worktrees/wt-A"));
+});
+
+test("no prompt root + blockedCwd → blockedCwd, not foreign", () => {
+  const { root, foreign } = resolveMergeRoot("/worktrees/wt-A", "[VGATE] verify files: a.ts");
+  equal(foreign, false);
+  ok(root.endsWith("/worktrees/wt-A"));
+});
+
+test("no prompt root + no blockedCwd → git-root fallback", () => {
+  const { root, foreign } = resolveMergeRoot(null, "[VGATE] verify files: a.ts");
+  equal(foreign, false);
+  ok(typeof root === "string" && root.length > 0);
+});
+
+// ── scopeFiles (#190) ────────────────────────────────
+
+section("scopeFiles — diff-scoped merge pre-filter (#190)");
+
+test("blocked-context filter: keeps files in the blocked diff, skips others", () => {
+  const { kept, skipped } = scopeFiles(["src/a.ts", "src/b.ts"], "/proj", ["src/a.ts"], new Set());
+  equal(kept.length, 1);
+  equal(kept[0], "src/a.ts");
+  equal(skipped, 1);
+});
+
+test("KNOWN path merges even with a stale blocked list (#38 — regression guard for e2e scenario 4)", () => {
+  // #38: re-verification of an already-known path is authoritative. A stale
+  // lastBlockedFiles (previous block covered different files) must NOT drop it.
+  const known = new Set(["/proj::src/a.ts"]);
+  const { kept, skipped } = scopeFiles(["src/a.ts"], "/proj", ["other/file.ts"], known);
+  equal(kept.length, 1, "known path must survive the stale blocked filter");
+  equal(kept[0], "src/a.ts");
+  equal(skipped, 0);
+});
+
+test("absolute-path input normalizes to repo-relative before filtering", () => {
+  const { kept, skipped } = scopeFiles(["/proj/src/a.ts"], "/proj", ["src/a.ts"], new Set());
+  equal(kept.length, 1);
+  equal(kept[0], "/proj/src/a.ts");
+  equal(skipped, 0);
+});
+
+test("empty blocked list + known path → kept (staged-diff not consulted)", () => {
+  const known = new Set(["/proj::src/a.ts"]);
+  const { kept, skipped } = scopeFiles(["src/a.ts"], "/proj", [], known);
+  equal(kept.length, 1);
+  equal(skipped, 0);
 });
 
 // ── mergeVerifiedFiles (#7595 / #38 / #37) ─────────────────

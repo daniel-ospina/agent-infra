@@ -18,20 +18,23 @@
 import { ok, equal } from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // ── Isolation: bridge lives under a temp HOME (never touch the real one) ──
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "vgate-e2e-"));
 process.env.HOME = TEST_ROOT;
+// The gate under test must be ACTIVE — clear the escape hatch if the parent
+// environment inherited it (sub-agent sessions pre-disable extension gates).
+delete process.env.ELDATO_SKIP_VGATE;
 
 // ── Tiny git + sha helpers ───────────────────────────
 function sha(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 function git(repo: string, args: string): string {
-  return execSync(`git ${args}`, { cwd: repo, encoding: "utf-8" }).trim();
+  return execSync(`git ${args}`, { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim();
 }
 
 // ── Fake pi ExtensionAPI ──────────────────────────────
@@ -386,17 +389,162 @@ async function main() {
     await fire("session_start", {});
   });
 
-  test("bridge file stores repo-relative keys (survives session restart)", () => {
+  test("bridge file stores compound keys (root::rel) for root-isolated recovery (#190)", () => {
     const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
     ok(existsSync(bridgePath), "bridge file must exist after PASS merges");
     const bridge = JSON.parse(readFileSync(bridgePath, "utf-8"));
     equal(bridge.status, "PASS");
     const paths = bridge.verified_files.map((vf: any) => vf.path);
+    // #190: the bridge now persists FULL compound keys (worktree-root::rel) so
+    // recovery can be worktree-isolated (#37) with stored-hash match-or-drop.
     // The bridge holds the MOST RECENT merge — after the #132 scenarios that is
     // scenario 11's plain-text-PASS merge of fileG.txt (fileA.txt was merged in
-    // scenarios 2-5 and overwritten). Repo-relative keying is the contract.
-    ok(paths.includes("fileG.txt"), `bridge keys must be repo-relative, got: ${JSON.stringify(paths)}`);
-    ok(!paths.some((p: string) => p.startsWith("/")), "bridge must not contain absolute keys");
+    // scenarios 2-5 and overwritten). Compound keying is the new contract.
+    ok(paths.some((p: string) => p.includes("::") && p.endsWith("fileG.txt")), `bridge keys must be compound (root::rel), got: ${JSON.stringify(paths)}`);
+    ok(paths.every((p: string) => p.includes("::")), `bridge must not contain bare repo-relative keys, got: ${JSON.stringify(paths)}`);
+  });
+
+  // ── #190: mid-session VGATE merge regression scenarios ──
+  // T1–T5 from the scoping doc: a mid-session [VGATE] dispatch whose PASS is
+  // registered by the tool_result hook must merge into the committing session's
+  // verifiedSet so the next git commit passes WITHOUT the BLOCK_ATTEMPT_THRESHOLD
+  // auto-bypass. These run AFTER the bridge-contract test above (which asserts
+  // on scenario 11's bridge state) and each fires session_start for isolation.
+
+  test("scenario 13 (#190 T1): mid-session plain-text PASS merges — commit allowed on next attempt, no auto-bypass", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileT1.txt"), "t1\n");
+    git(repo, "add fileT1.txt");
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c13'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first (unverified staged file)");
+    // The incident's dispatch #2 format: documented prompt, plain-text line-start PASS.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: fileT1.txt. Classification: UI. Project root: ${repo}` },
+      content: [{ type: "text", text: "All checks passed.\nPASS" }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c13'", cwd: repo },
+    });
+    equal(res, undefined, "commit must pass on the FIRST retry after mid-session PASS (no auto-bypass)");
+    git(repo, "commit -m c13");
+    await fire("session_start", {});
+  });
+
+  test("scenario 14 (#190 T2): prompt with \\n\\nClassification (no leading period) still merges", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileT2.txt"), "t2\n");
+    git(repo, "add fileT2.txt");
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c14'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first");
+    // Incident dispatch #1's deviant-but-reasonable format: newline separator,
+    // no period before Classification (old fileMatch regex parsed ZERO files).
+    const prompt = `[VGATE] verify files: fileT2.txt\n\nClassification: backend\nProject root: ${repo}`;
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: [{ type: "text", text: "PASS" }] });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c14'", cwd: repo },
+    });
+    equal(res, undefined, "newline-separated Classification must still merge (T2)");
+    git(repo, "commit -m c14");
+    await fire("session_start", {});
+  });
+
+  test("scenario 15 (#190 T3): bold/list-marked **PASS** response merges (hasPass parity with hasFail)", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileT3.txt"), "t3\n");
+    git(repo, "add fileT3.txt");
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c15'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: fileT3.txt. Classification: UI. Project root: ${repo}` },
+      content: [{ type: "text", text: "- **PASS**" }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c15'", cwd: repo },
+    });
+    equal(res, undefined, "bold PASS marker must merge (T3)");
+    git(repo, "commit -m c15");
+    await fire("session_start", {});
+  });
+
+  test("scenario 16 (#190 T4): mid-session bridge recovery — externally-written bridge unblocks the commit", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileT4.txt"), "t4\n");
+    git(repo, "add fileT4.txt");
+    // Simulate the incident's event-miss class: a sub-agent session merged a PASS
+    // and wrote the bridge (compound key + verifier-authoritative hash), but the
+    // parent's tool_result hook never saw the dispatch. The next git op must
+    // recover the bridge entry mid-session and allow the commit.
+    const realRoot = realpathSync(repo);
+    const bridgeDir = join(TEST_ROOT, ".pi", "agent", "verification");
+    mkdirSync(bridgeDir, { recursive: true });
+    writeFileSync(join(bridgeDir, "latest.json"), JSON.stringify({
+      status: "PASS",
+      verified_files: [{ path: `${realRoot}::fileT4.txt`, hash: sha("t4\n") }],
+      timestamp: new Date().toISOString(),
+    }));
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c16'", cwd: repo },
+    });
+    equal(res, undefined, "externally-written bridge must be recovered mid-session (T4)");
+    git(repo, "commit -m c16");
+    await fire("session_start", {});
+  });
+
+  test("scenario 17 (#190 T5): zero-merge PASS does not consume block context — retry dispatch still merges", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileT5.txt"), "t5\n");
+    git(repo, "add fileT5.txt");
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c17'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first");
+    // Dispatch #1: PASS but the prompt names a file OUTSIDE the blocked diff →
+    // zero-merge. The block context (lastBlockedCwd/lastBlockedFiles) must survive.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: unrelated.txt. Classification: UI. Project root: ${repo}` },
+      content: [{ type: "text", text: "PASS" }],
+    });
+    // Dispatch #2: deviant prompt with ZERO parseable files — the plain-text
+    // fallback merges the blocked diff ONLY if context survived dispatch #1.
+    const deviantPrompt = `[VGATE] verify files:\n\nClassification: UI\nProject root: ${repo}`;
+    await fire("tool_result", {
+      toolName: "task", input: { prompt: deviantPrompt },
+      content: [{ type: "text", text: "PASS" }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c17'", cwd: repo },
+    });
+    equal(res, undefined, "retry after zero-merge dispatch must still merge (context retained, T5)");
+    git(repo, "commit -m c17");
+    await fire("session_start", {});
   });
 } // main: plugin loaded; tests run sequentially via runAll()
 

@@ -58,17 +58,23 @@ export function scopeFiles(
   known: { has(key: string): boolean } = new Set<string>()
 ): { kept: string[]; skipped: number } {
   const blockedSet = new Set(lastBlockedFiles);
+  const normRoot = normalizeWorktreeRoot(projectRoot);
   let staged: Set<string> | null = null;
   const kept: string[] = [];
   let skipped = 0;
   for (const f of files) {
     const rel = normalizeRegistryPath(projectRoot, f);
+    const key = compoundKey(normRoot, rel);
+    // #38: known paths always merge (re-verification is authoritative) — a
+    // stale lastBlockedFiles list (a previous block covering different files)
+    // must NOT drop the update. Checked BEFORE the blocked-diff filter; the
+    // filter only gates BRAND-NEW paths.
+    if (known.has(key)) { kept.push(f); continue; }
     if (lastBlockedFiles.length > 0) {
       if (blockedSet.has(rel)) { kept.push(f); continue; }
       skipped++;
       continue;
     }
-    if (known.has(compoundKey(normalizeWorktreeRoot(projectRoot), rel))) { kept.push(f); continue; }
     if (staged === null) staged = new Set(computeStagedDiff(projectRoot));
     if (staged.has(rel)) { kept.push(f); continue; }
     skipped++;
