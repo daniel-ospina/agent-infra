@@ -165,6 +165,16 @@ export default function (pi: ExtensionAPI) {
     }
 
     // ── write/edit: block edits to the main checkout ──
+    // Worktrees are ISOLATED: if the session itself runs in a linked worktree,
+    // `git rev-parse --show-toplevel` returns the worktree root for BOTH the
+    // session cwd and any target inside it, so the mainTopLevel equality check
+    // below would false-positive-block every edit (incident: epic-529 worktree
+    // session blocked editing its own isolated worktree). A worktree's working
+    // tree is private by construction — allow all edits from a worktree session.
+    if (isWorktreeCwd(resolve(process.cwd()))) {
+      return undefined;
+    }
+
     const targetPath = (event.input as { path?: string }).path;
 
     const mainTopLevel = _mainTopLevel();
