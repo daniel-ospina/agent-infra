@@ -821,19 +821,50 @@ export function repoNameFromUrl(url: string | null | undefined): string | null {
   return clean || null;
 }
 
-/** Derive the current repo NAME from the git origin remote of cwd (#2492). */
-function deriveRepoName(cwd: string): string | null {
-  try {
-    const out = execSync("git remote get-url origin", {
-      cwd,
-      timeout: 2000,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return repoNameFromUrl(out.trim());
-  } catch {
-    return null;
-  }
+/**
+ * #196: git-lookup cap for approval-store repo discovery. Default 5s (was 2s)
+ * — `git remote get-url origin` intermittently stalls for multi-second stretches
+ * on macOS (observed up to >80s; ~1-in-3 suite runs flaked on the 2s cap).
+ * Env-overridable via GIT_REMOTE_TIMEOUT_MS; read per call so tests can tune.
+ * Invalid/absent → 5000. KEEP-IN-SYNC: index.ts duplicates this getter
+ * (#2492/#196).
+ */
+export function gitRemoteTimeoutMs(): number {
+  const raw = process.env.GIT_REMOTE_TIMEOUT_MS ?? "";
+  // Strict: digits only (parseInt silently truncates "1e3" → 1ms, "5000.5" →
+  // 5000), positive, and clamped to 60s so a typo can't freeze the event
+  // loop for minutes. Anything else → 5000.
+  const n = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  return Number.isSafeInteger(n) && n > 0 && n <= 60000 ? n : 5000;
+}
+
+/** Derive the current repo NAME from the git origin remote of cwd (#2492).
+ * KEEP-IN-SYNC with index.ts's deriveRepoName (#2492/#196): same cap, same
+ * ONE bounded retry on stall (Node 22 timeout error: `code === "ETIMEDOUT"` /
+ * `signal === "SIGTERM"`), fast failures stay immediate. Exported for tests /
+ * keep-in-sync regression (same precedent as repoNameFromUrl). */
+export function deriveRepoName(cwd: string): string | null {
+  let killed = false;
+  const attempt = (): string | null => {
+    try {
+      const out = execSync("git remote get-url origin", {
+        cwd,
+        timeout: gitRemoteTimeoutMs(),
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      return repoNameFromUrl(out.trim());
+    } catch (e: any) {
+      // execSync timeout kill → stall, not fast failure. Node 22: the wrapper
+      // error carries code ETIMEDOUT + signal SIGTERM (killed is undefined).
+      killed = e?.code === "ETIMEDOUT" || e?.signal === "SIGTERM";
+      return null;
+    }
+  };
+  const first = attempt();
+  if (first !== null) return first;
+  if (!killed) return null; // fast failure (no git/no remote) — zero added latency
+  return attempt(); // stall — one bounded retry, then give up
 }
 
 function findApprovalsFile(cwd = process.cwd()): string | null {
