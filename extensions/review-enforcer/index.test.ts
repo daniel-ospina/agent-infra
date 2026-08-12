@@ -19,6 +19,8 @@ import {
   logGateEvent,
   logMergeGateDecision,
   mergeGateBlockReason,
+  isGraphQLRateLimitError,
+  rateLimitMaxWaitMs,
   default as reviewEnforcerFactory,
   type ReviewRecord,
 } from "./index.js";
@@ -363,6 +365,42 @@ test("mergeGateBlockReason tags mirror evaluateMergeGate block branches", () => 
   equal(mergeGateBlockReason({ ...cleanRecord, verdict: "fail" }), "verdict_not_clean");
   equal(mergeGateBlockReason(cleanRecord), "head_advanced");
 });
+
+// ── #192: GraphQL rate-limit resilience ────────────────
+section("isGraphQLRateLimitError — GraphQL pool exhaustion signature");
+test("matches gh's GraphQL exhaustion message", () => {
+  ok(isGraphQLRateLimitError("GraphQL: API rate limit already exceeded for user ID 81560491"), "full gh message");
+  ok(isGraphQLRateLimitError("API rate limit already exceeded"), "bare exhausted message");
+  ok(isGraphQLRateLimitError("api rate limit exceeded while calling graphql"), "case-insensitive graphql mention");
+});
+test("does not match unrelated gh errors", () => {
+  ok(!isGraphQLRateLimitError("HTTP 404: Not Found"), "404");
+  ok(!isGraphQLRateLimitError("gh: command not found"), "missing gh");
+  ok(!isGraphQLRateLimitError(""), "empty string");
+  ok(!isGraphQLRateLimitError("Could not resolve to a PullRequest"), "GraphQL resolution error, not rate limit");
+});
+
+section("rateLimitMaxWaitMs — #192 cap (env-overridable)");
+test("defaults to 600000 (10 min)", () => {
+  const prev = process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS;
+  delete process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS;
+  try { equal(rateLimitMaxWaitMs(), 600000); }
+  finally { if (prev === undefined) delete process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS; else process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS = prev; }
+});
+test("respects env override; invalid values fall back to default", () => {
+  const prev = process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS;
+  try {
+    process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS = "120000";
+    equal(rateLimitMaxWaitMs(), 120000);
+    process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS = "abc";
+    equal(rateLimitMaxWaitMs(), 600000);
+    process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS = "0";
+    equal(rateLimitMaxWaitMs(), 600000);
+  } finally {
+    if (prev === undefined) delete process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS; else process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS = prev;
+  }
+});
+
 
 // ── Extension factory — audited gate behavior (#60) ──
 // The handlers registered by the factory are async functions with NO awaits
