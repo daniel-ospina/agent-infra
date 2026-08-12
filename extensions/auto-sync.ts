@@ -12,7 +12,8 @@
 // Secrets never sync: auth.json and env vars stay machine-local by design.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { execSync } from "node:child_process";
 
 export function shortHead(repo: string, ref = "HEAD"): string {
@@ -67,6 +68,70 @@ export function syncState(repo: string): "current" | "behind" | "ahead" | "diver
   return "diverged";
 }
 
+/**
+ * #203: lossless recovery for a checkout stranded on a non-main branch.
+ * Squash-merged PR work leaves a feature branch with commits that never land
+ * on main (its tree is often byte-identical to origin/main) — the checkout
+ * then reports "diverged" forever: ff-pull can't help, the main-worktree-guard
+ * blocks agent-side resets, and auto-sync warns every session while main
+ * drifts further ahead. Recovery is ONLY attempted when provably lossless:
+ *   - the tracked working tree is byte-identical to origin/main
+ *     (`git diff origin/main --quiet` exits 0), AND
+ *   - every untracked file is absent from origin/main (→ abort: new work) or
+ *     byte-identical to it (→ safe to remove; the branch switch restores it).
+ * On success the checkout ends on `main` at origin/main (0 divergence) — the
+ * stranded branch itself is left untouched (refs preserved). Never runs in
+ * "ahead" state (unpushed commits are real work) and never when the tree
+ * holds genuine uncommitted changes.
+ */
+export function tryLosslessRecover(repo: string): { recovered: boolean; reason?: string } {
+  if (syncState(repo) !== "diverged") {
+    return { recovered: false, reason: "not diverged — recovery not applicable" };
+  }
+  // 1. untracked files first — the tracked-diff below must exclude them (a
+  //    file present in origin/main but untracked in the working tree reads as
+  //    "deleted" in `git diff <commit>`, which would false-positive).
+  let untracked: string[];
+  try {
+    untracked = execSync(`git -C "${repo}" ls-files --others --exclude-standard`, { encoding: "utf-8" })
+      .split("\n").map(s => s.trim()).filter(Boolean);
+  } catch {
+    return { recovered: false, reason: "could not list untracked files" };
+  }
+  // 2. tracked working tree must match origin/main exactly (lossless).
+  const excludeArgs = untracked.map(f => `':(exclude)${f}'`).join(" ");
+  try {
+    execSync(`git -C "${repo}" diff origin/main --quiet -- . ${excludeArgs}`, { stdio: "ignore", timeout: 30_000 });
+  } catch {
+    return { recovered: false, reason: "tracked tree differs from origin/main (real uncommitted work — keep)" };
+  }
+  // 3. untracked files must not collide with origin/main content.
+  for (const f of untracked) {
+    let onMain = false;
+    try { execSync(`git -C "${repo}" cat-file -e origin/main:${f}`, { stdio: "ignore" }); onMain = true; } catch { onMain = false; }
+    if (!onMain) {
+      return { recovered: false, reason: `untracked file "${f}" is not on origin/main (new work — keep)` };
+    }
+    try {
+      const onMainContent = execSync(`git -C "${repo}" show origin/main:${f}`, { encoding: "utf-8" });
+      if (onMainContent !== readFileSync(join(repo, f), "utf-8")) {
+        return { recovered: false, reason: `untracked file "${f}" differs from origin/main — keep` };
+      }
+    } catch {
+      return { recovered: false, reason: `could not compare untracked file "${f}"` };
+    }
+  }
+  // 4. lossless — drop residue, switch to main, fast-forward to origin/main.
+  try {
+    for (const f of untracked) rmSync(join(repo, f), { force: true });
+    execSync(`git -C "${repo}" checkout -f main`, { stdio: "ignore", timeout: 30_000 });
+    execSync(`git -C "${repo}" merge --ff-only origin/main`, { stdio: "ignore", timeout: 30_000 });
+    return { recovered: true };
+  } catch (e: any) {
+    return { recovered: false, reason: `switch failed: ${e?.message ?? e}` };
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
     const infraPath = process.env.AGENT_INFRA_PATH;
@@ -94,8 +159,16 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // diverged → ff pull is blocked; surface guidance instead of a doomed pull.
+    // diverged → try lossless recovery (#203) before falling back to guidance.
+    // A stranded non-main branch whose tree matches origin/main is recoverable
+    // without any data loss; a genuine divergence (real uncommitted work or
+    // unpushed commits) is left alone with guidance, as before.
     if (state === "diverged") {
+      const rec = tryLosslessRecover(infraPath);
+      if (rec.recovered) {
+        console.log(`[auto-sync] 🔁 stranded checkout recovered — now on main at ${shortHead(infraPath)} (tree matched origin/main losslessly)`);
+        return;
+      }
       console.log(`[auto-sync] ⚠️  agent-infra has diverged from origin/main — fast-forward sync blocked:`);
       console.log(`    Local : ${shortHead(infraPath)}`);
       console.log(`    Remote: ${shortHead(infraPath, "origin/main")}`);
@@ -103,6 +176,7 @@ export default function (pi: ExtensionAPI) {
       console.log(`    History: git -C "${infraPath}" log --oneline --left-right HEAD...origin/main`);
       console.log(`    Next: stash or commit local work, then re-run sync:`);
       console.log(`        ${syncHint}`);
+      if (rec.reason) console.log(`    (auto-recovery skipped: ${rec.reason})`);
       return;
     }
 

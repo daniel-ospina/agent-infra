@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ok, equal } from "node:assert/strict";
 
-import autoSync, { syncState, aheadCount } from "./auto-sync.js";
+import autoSync, { syncState, aheadCount, tryLosslessRecover } from "./auto-sync.js";
 
 let passed = 0, failed = 0;
 async function test(name: string, fn: () => void | Promise<void>) {
@@ -138,6 +138,42 @@ async function main() {
   // empty repo, no commits at all → rev-parse fails → must classify current
   const repoEmpty = tempDir("auto-sync-empty-");
   git(repoEmpty, "init -b main -q");
+  // #203 stranded fixtures: a feature branch with a commit never on main,
+  // working tree byte-identical to origin/main (the squash-merge residue case).
+  // Each gets its own origin; the clone fetches so origin/main is current.
+  function makeStranded(): { origin: string; repo: string } {
+    const origin = seededOrigin();
+    const repo = makeClone(origin);
+    git(repo, "checkout -q -b stranded");
+    commit(repo, "stranded branch commit");          // X: child of seed, tree = seed+1 line
+    const pusher = makeClone(origin);
+    commit(pusher, "remote main commit");            // B: child of seed, same tree shape
+    git(pusher, "push -q origin main");
+    git(repo, "fetch -q origin");
+    return { origin, repo };
+  }
+  const strandedOk = makeStranded();
+  const strandedRealChange = makeStranded();
+  const strandedNewUntracked = makeStranded();
+  const strandedIdenticalUntracked = makeStranded();
+  // strandedIdenticalUntracked: main gains plan.md; the stranded clone carries
+  // the SAME plan.md as an untracked file (lossless — removable).
+  writeFileSync(join(strandedIdenticalUntracked.origin, "plan.md"), "plan\n");
+  // write into the origin's main via its clone: push plan.md from a pusher clone
+  {
+    const o = strandedIdenticalUntracked.origin;
+    const pp = makeClone(o);
+    writeFileSync(join(pp, "plan.md"), "plan\n");
+    git(pp, "add -A");
+    git(pp, "commit -q -m 'add plan.md'");
+    git(pp, "push -q origin main");
+    git(strandedIdenticalUntracked.repo, "fetch -q origin");
+    writeFileSync(join(strandedIdenticalUntracked.repo, "plan.md"), "plan\n"); // untracked, identical
+  }
+  // strandedRealChange: append a unique line → tree no longer matches origin/main
+  execSync(`echo unique-work >> "${join(strandedRealChange.repo, "file.txt")}"`);
+  // strandedNewUntracked: brand-new file not on main → keep
+  writeFileSync(join(strandedNewUntracked.repo, "new-work.md"), "x\n");
 
   console.log("  fixtures ready");
 
@@ -212,6 +248,49 @@ async function main() {
     ok(lines.some(l => l.includes("log --oneline --left-right")), "expected git log guidance");
     ok(lines.some(l => l.includes(`cd "${repoDiverged}" && ./sync.sh`)), "expected re-run hint");
     ok(!existsSync(marker), "sync.sh must not run when diverged");
+  });
+
+  // ── #203: tryLosslessRecover ─────────────────────────────
+  section("tryLosslessRecover (#203)");
+  await test("stranded branch + tree matching origin/main → recovered onto main", async () => {
+    const { repo } = strandedOk;
+    const r = tryLosslessRecover(repo);
+    ok(r.recovered, `expected recovery, got: ${JSON.stringify(r)}`);
+    equal(git(repo, "branch --show-current").trim(), "main", "must end on main");
+    equal(git(repo, "rev-parse HEAD").trim(), git(repo, "rev-parse origin/main").trim(), "HEAD must equal origin/main");
+  });
+  await test("real uncommitted change → NOT recovered (lossless guard)", async () => {
+    const r = tryLosslessRecover(strandedRealChange.repo);
+    ok(!r.recovered, "must refuse recovery with real uncommitted work");
+    ok(/differs from origin\/main/.test(r.reason ?? ""), `reason should name the guard, got: ${r.reason}`);
+  });
+  await test("untracked NEW file (not on main) → NOT recovered", async () => {
+    const r = tryLosslessRecover(strandedNewUntracked.repo);
+    ok(!r.recovered, "must refuse recovery when untracked work is not on main");
+    ok(/not on origin\/main/.test(r.reason ?? ""), `reason should name the file, got: ${r.reason}`);
+  });
+  await test("untracked file identical to main → recovered (removed, restored by main)", async () => {
+    const { repo } = strandedIdenticalUntracked;
+    const r = tryLosslessRecover(repo);
+    ok(r.recovered, `expected recovery, got: ${JSON.stringify(r)}`);
+    equal(git(repo, "branch --show-current").trim(), "main");
+    ok(existsSync(join(repo, "plan.md")), "plan.md restored by main after recovery");
+  });
+  await test("not diverged (current checkout) → NOT recovered", async () => {
+    const r = tryLosslessRecover(repoCurrent);
+    ok(!r.recovered, "must not touch a current checkout");
+    ok(/not diverged/.test(r.reason ?? ""), `reason should say not diverged, got: ${r.reason}`);
+  });
+  await test("diverged session_start auto-recovers a stranded checkout (no guidance)", async () => {
+    // NOTE: no stub sync.sh here — an untracked sync.sh is legitimately
+    // "new work not on origin/main", so recovery would (correctly) refuse.
+    // The recovery path fast-forwards itself and never reaches sync.sh.
+    const s2 = makeStranded();
+    const lines = await runSession(s2.repo, { mode: "auto" });
+    ok(lines.some(l => l.includes("stranded checkout recovered")), `expected recovery log, got: ${lines.join("\n")}`);
+    ok(!lines.some(l => l.includes("has diverged from origin/main")), "guidance must NOT print when recovered");
+    equal(git(s2.repo, "branch --show-current").trim(), "main", "session must leave checkout on main");
+    equal(git(s2.repo, "rev-parse HEAD").trim(), git(s2.repo, "rev-parse origin/main").trim(), "HEAD must equal origin/main");
   });
 
   await test("not configured (no AGENT_INFRA_PATH) → silent", async () => {
