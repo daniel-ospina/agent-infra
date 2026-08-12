@@ -10,19 +10,26 @@ import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
 // ESM named imports of builtin CJS modules (child_process) are not patchable
 // from tests, so gh calls route through runGh(). Tests inject a fake via
 // _setRunGhOverride() to exercise failure paths deterministically (no real gh).
-let runGhOverride: ((cmd: string, opts?: { cwd?: string; timeout?: number }) => string) | null = null;
+/** Options for the gh runner (mirrors execSync's opts we use). */
+export interface GhRunOpts {
+  cwd?: string;
+  timeout?: number;
+  env?: NodeJS.ProcessEnv;
+}
+
+let runGhOverride: ((cmd: string, opts?: GhRunOpts) => string) | null = null;
 
 /** TEST SEAM: replace the gh runner (returns the command's stdout, throws on
  * failure). Pass null to restore the real execSync-backed runner. Honored only
  * under NODE_ENV=test (review #212 security pass) so production code can never
  * accidentally honor a stray override. */
 export function _setRunGhOverride(
-  fn: ((cmd: string, opts?: { cwd?: string; timeout?: number }) => string) | null
+  fn: ((cmd: string, opts?: GhRunOpts) => string) | null
 ): void {
   if (process.env.NODE_ENV === "test" || fn === null) runGhOverride = fn;
 }
 
-function runGh(cmd: string, opts?: { cwd?: string; timeout?: number }): string {
+function runGh(cmd: string, opts?: GhRunOpts): string {
   if (runGhOverride !== null) return runGhOverride(cmd, opts);
   return execSync(cmd, { encoding: "utf-8", ...opts });
 }
