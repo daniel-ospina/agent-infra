@@ -42,7 +42,7 @@ Lock file `~/.pi/agent/slack-socket-owner.json` containing `{pid, startTime, hea
 | Component | File | Change |
 |---|---|---|
 | Election + saturation | `extensions/slack-bridge/socket-mode.ts` | ~270 lines: lease claim/takeover/heartbeat/release, saturation backoff, guards in onerror/onclose/disconnect/openSocket |
-| Tests | `extensions/slack-bridge/socket-mode.test.ts` | +57 asserts (tests 28–33 + takeover-lock cases): saturation disconnect, open-API saturation, owner skip, stale takeover, lease semantics, foreign-takeover close+re-election, unparseable-file protection |
+| Tests | `extensions/slack-bridge/socket-mode.test.ts` | +55 asserts (tests 28–33 + takeover-lock cases): saturation disconnect, open-API saturation, owner skip, stale takeover, lease semantics, foreign-takeover close+re-election, unparseable-file protection |
 | Docs | `extensions/slack-bridge/README.md` | single-owner section, `SLACK_SOCKET_OWNER_FILE` env row, assert counts |
 | index.ts | unchanged | existing `session_start`/`session_shutdown` wiring drives start/stop; no signature changes |
 
