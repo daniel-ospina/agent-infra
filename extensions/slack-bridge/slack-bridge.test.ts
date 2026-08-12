@@ -993,6 +993,14 @@ try {
     assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: invalid env falls back to 5000");
     process.env.GIT_REMOTE_TIMEOUT_MS = "0";
     assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: non-positive env falls back to 5000");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "1e3";
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: parseInt-truncation ('1e3') rejected → 5000");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "5000.5";
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: non-integer rejected → 5000");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "999999999";
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: above 60s clamp rejected → 5000");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "60000";
+    assert(gitRemoteTimeoutMs() === 60000, "gitRemoteTimeoutMs: clamp ceiling 60000 accepted");
   } finally {
     if (prevGitTmo === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
     else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTmo;
@@ -1022,28 +1030,31 @@ try {
     execSync("git remote add origin https://github.com/daniel-ospina/tortoise.git", { cwd: gitDir, stdio: "ignore" });
 
     // #196: git-stall retry regression — a PATH shim that sleeps past the cap
-    // on its FIRST call (simulating the observed >cap stall), then passes
-    // through to real git. Cap tuned down via GIT_REMOTE_TIMEOUT_MS so the
-    // test runs in ~1s; old code (2s cap, no retry) fails here with null.
+    // on its FIRST call (simulating the observed >cap stall) and ECHOES the
+    // origin URL on the retry. Deterministic: never passes through to real
+    // git (which itself stalls >700ms on this machine — the very premise of
+    // #196). Cap tuned down via GIT_REMOTE_TIMEOUT_MS so the test runs in
+    // ~1s; old code (2s cap, no retry) fails here with null.
     {
       const shimDir = join(tmpDir(), "shim");
       mkdirSync(shimDir, { recursive: true });
       const marker = join(shimDir, ".first-call-done");
-      const realGit = execSync("which git", { encoding: "utf-8" }).trim();
-      writeFileSync(join(shimDir, "git"), `#!/bin/sh\nif [ ! -f "$GIT_SHIM_MARKER" ]; then\n  touch "$GIT_SHIM_MARKER"\n  sleep 2\nfi\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+      writeFileSync(
+        join(shimDir, "git"),
+        `#!/bin/sh\nif [ ! -f "$GIT_SHIM_MARKER" ]; then\n  touch "$GIT_SHIM_MARKER"\n  sleep 2\nfi\necho "https://github.com/daniel-ospina/tortoise.git"\n`,
+        { mode: 0o755 },
+      );
       const prevPath = process.env.PATH;
       const prevGitTmo2 = process.env.GIT_REMOTE_TIMEOUT_MS;
       try {
         process.env.PATH = `${shimDir}:${prevPath ?? ""}`;
         process.env.GIT_SHIM_MARKER = marker;
-        process.env.REAL_GIT = realGit;
         process.env.GIT_REMOTE_TIMEOUT_MS = "700"; // cap << shim sleep → attempt 1 killed
         assert(deriveRepoName(gitDir) === "tortoise", "deriveRepoName: stall past cap → bounded retry succeeds (shim test)");
       } finally {
         if (prevPath === undefined) delete process.env.PATH;
         else process.env.PATH = prevPath;
         delete process.env.GIT_SHIM_MARKER;
-        delete process.env.REAL_GIT;
         if (prevGitTmo2 === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
         else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTmo2;
         rmSync(shimDir, { recursive: true, force: true });

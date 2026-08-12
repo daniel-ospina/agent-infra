@@ -830,8 +830,12 @@ export function repoNameFromUrl(url: string | null | undefined): string | null {
  * (#2492/#196).
  */
 export function gitRemoteTimeoutMs(): number {
-  const n = parseInt(process.env.GIT_REMOTE_TIMEOUT_MS ?? "5000", 10);
-  return Number.isInteger(n) && n > 0 ? n : 5000;
+  const raw = process.env.GIT_REMOTE_TIMEOUT_MS ?? "";
+  // Strict: digits only (parseInt silently truncates "1e3" → 1ms, "5000.5" →
+  // 5000), positive, and clamped to 60s so a typo can't freeze the event
+  // loop for minutes. Anything else → 5000.
+  const n = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  return Number.isSafeInteger(n) && n > 0 && n <= 60000 ? n : 5000;
 }
 
 /** Derive the current repo NAME from the git origin remote of cwd (#2492).

@@ -88,10 +88,9 @@ function assert(condition: boolean, label: string): void {
     execSync("git remote add origin https://github.com/owner/tortoise.git", { cwd: gitDir, stdio: "ignore" });
     mkdirSync(shimDir, { recursive: true });
     const marker = join(shimDir, ".first-call-done");
-    const realGit = execSync("which git", { encoding: "utf-8" }).trim();
     writeFileSync(
       join(shimDir, "git"),
-      `#!/bin/sh\nif [ ! -f "$GIT_SHIM_MARKER" ]; then\n  touch "$GIT_SHIM_MARKER"\n  sleep 2\nfi\nexec "${realGit}" "$@"\n`,
+      `#!/bin/sh\nif [ ! -f "$GIT_SHIM_MARKER" ]; then\n  touch "$GIT_SHIM_MARKER"\n  sleep 2\nfi\necho "https://github.com/owner/tortoise.git"\n`,
       { mode: 0o755 },
     );
     const prevPath = process.env.PATH;

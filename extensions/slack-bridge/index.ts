@@ -590,7 +590,9 @@ export function repoNameFromUrl(url: string | null | undefined): string | null {
  * killed by the execSync cap (Node 22 timeout error: `code === "ETIMEDOUT"` /
  * `signal === "SIGTERM"` — a git stall, not a fast failure); fast failures
  * (no git/no remote) stay immediate, so a non-repo cwd never pays the extra
- * cap. Worst case 2 × cap only on an actual stall. */
+ * cap. Worst case ~2 × (cap + throw lag) only on an actual stall — the
+ * killed sh's sleep grandchild holds the stdio pipe open, delaying the
+ * ETIMEDOUT throw by up to ~2s beyond the cap. */
 export function deriveRepoName(cwd: string): string | null {
   let killed = false;
   const attempt = (): string | null => {
@@ -983,8 +985,12 @@ const REDRAFT_ESCALATE_MS = 24 * 60 * 60 * 1000; // 24h — TTL escalation
  * KEEP-IN-SYNC: socket-mode.ts duplicates this getter (#2492/#196).
  */
 export function gitRemoteTimeoutMs(): number {
-  const n = parseInt(process.env.GIT_REMOTE_TIMEOUT_MS ?? "5000", 10);
-  return Number.isInteger(n) && n > 0 ? n : 5000;
+  const raw = process.env.GIT_REMOTE_TIMEOUT_MS ?? "";
+  // Strict: digits only (parseInt silently truncates "1e3" → 1ms, "5000.5" →
+  // 5000), positive, and clamped to 60s so a typo can't freeze the event
+  // loop for minutes. Anything else → 5000.
+  const n = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  return Number.isSafeInteger(n) && n > 0 && n <= 60000 ? n : 5000;
 }
 const GH_API_TIMEOUT_MS = 15000; // gh api call cap
 
