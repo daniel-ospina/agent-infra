@@ -8,6 +8,10 @@
  * Run: npx tsx extensions/review-enforcer/index.test.ts
  */
 
+// The gh-runner test seam (_setRunGhOverride) is honored only under
+// NODE_ENV=test (#212 review pass) — set it before importing the module.
+process.env.NODE_ENV = "test";
+
 import {
   extractPrNumber,
   extractRepoFlag,
@@ -21,6 +25,9 @@ import {
   mergeGateBlockReason,
   isGraphQLRateLimitError,
   rateLimitMaxWaitMs,
+  getPrHeadShaViaRest,
+  getPrHeadSha,
+  _setRunGhOverride,
   default as reviewEnforcerFactory,
   type ReviewRecord,
 } from "./index.js";
@@ -45,6 +52,16 @@ function test(name: string, fn: () => void) {
 
 function section(name: string) {
   console.log(`\n${name}:`);
+}
+
+// ── #192: gh runner override ───────────────────────────
+// index.ts routes gh calls through runGh(), which honors _setRunGhOverride().
+// Tests swap in a fake runner (returns stdout or throws) and restore with null
+// in finally — deterministic failure-path tests without real gh invocations.
+function ghError(message: string): Error & { stderr?: string } {
+  const e = new Error(message) as Error & { stderr?: string };
+  e.stderr = message;
+  return e;
 }
 
 // Async variant for extension-factory tests (pi handlers are async fns).
@@ -400,6 +417,128 @@ test("respects env override; invalid values fall back to default", () => {
     if (prev === undefined) delete process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS; else process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS = prev;
   }
 });
+
+// ── #192: REST fallback for GraphQL pool exhaustion ───
+section("getPrHeadShaViaRest — REST-pool head lookup (#192)");
+
+test("resolves the head SHA via the REST pulls endpoint", () => {
+  _setRunGhOverride(() => "a".repeat(40));
+  try {
+    equal(getPrHeadShaViaRest(138, { source: "record", repo: "owner/repo" }), "a".repeat(40));
+  } finally {
+    _setRunGhOverride(null);
+  }
+});
+
+test("null when the REST call fails (REST pool also down / network)", () => {
+  _setRunGhOverride(() => { throw new Error("connection refused"); });
+  try {
+    equal(getPrHeadShaViaRest(138, { source: "record", repo: "owner/repo" }), null);
+  } finally {
+    _setRunGhOverride(null);
+  }
+});
+
+test("builds the pulls URL and injects the repo via GH_REPO env when ctx.repo is set", () => {
+  let captured = "";
+  let capturedEnv: any = null;
+  _setRunGhOverride((cmd, opts) => { captured = cmd; capturedEnv = opts; return "a".repeat(40); });
+  try {
+    getPrHeadShaViaRest(138, { source: "flag", repo: "owner/repo" });
+    ok(captured.includes("pulls/138"), `command targets the PR: ${captured}`);
+    // `gh api` does NOT accept --repo (gh 2.97.0: "unknown flag") — the repo
+    // must come via GH_REPO env (the documented placeholder source).
+    ok(!captured.includes("--repo") && !captured.includes("-R "), `no --repo flag: ${captured}`);
+    equal((capturedEnv as any)?.env?.GH_REPO, "owner/repo", "GH_REPO env injected for placeholder resolution");
+  } finally {
+    _setRunGhOverride(null);
+  }
+});
+
+test("record.repo with shell metacharacters → record rejected (fail-closed, security)", () => {
+  // readReviewRecord must reject a malicious repo field (interpolated into
+  // shell strings by the gate) — treated as absent. Uses a PR number that
+  // cannot collide with a real record; cleanup in finally.
+  const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+  const f = resolvePath(reviews, "999.json");
+  fs.mkdirSync(reviews, { recursive: true });
+  try {
+    fs.writeFileSync(f, JSON.stringify({ pr: 999, head_sha: "a".repeat(40), verdict: "clean", repo: "owner/x; echo pwned" }));
+    equal(readReviewRecord(999), null, "malicious record.repo → null (fail-closed)");
+  } finally {
+    fs.rmSync(f, { force: true });
+  }
+});
+
+section("getPrHeadSha — GraphQL exhaustion → REST fallback before waiting (#192)");
+
+testAsync("gh pr view rate-limited → head resolved via REST without waiting (regression)", async () => {
+  let viewCalls = 0;
+  _setRunGhOverride((cmd) => {
+    if (cmd.startsWith("gh pr view")) {
+      viewCalls++;
+      throw ghError("GraphQL: API rate limit already exceeded for user ID 81560491");
+    }
+    if (cmd.startsWith("gh api repos/{owner}/{repo}/pulls/")) return "b".repeat(40);
+    throw new Error("unexpected command: " + cmd);
+  });
+  try {
+    const sha = await getPrHeadSha(138, { source: "record", repo: "owner/repo" });
+    equal(sha, "b".repeat(40));
+    ok(viewCalls === 1, `gh pr view attempted once (${viewCalls}) before REST fallback`);
+  } finally {
+    _setRunGhOverride(null);
+  }
+});
+
+testAsync("non-rate-limit gh failure → null (fail-open #138), REST fallback NOT attempted", async () => {
+  let restCalls = 0;
+  _setRunGhOverride((cmd) => {
+    if (cmd.startsWith("gh pr view")) throw ghError("HTTP 404: Not Found");
+    if (cmd.startsWith("gh api")) restCalls++;
+    return "";
+  });
+  try {
+    const sha = await getPrHeadSha(138, { source: "record", repo: "owner/repo" });
+    equal(sha, null);
+    equal(restCalls, 0, "REST fallback is only for GraphQL rate-limit errors");
+  } finally {
+    _setRunGhOverride(null);
+  }
+});
+
+testAsync("GraphQL rate-limited AND REST down → waits for reset, then retries gh pr view", async () => {
+  // Cap the wait so the test finishes fast: env override → 150ms total budget.
+  const prevCap = process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS;
+  process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS = "150";
+  let viewCalls = 0;
+  let rateLimitCalls = 0;
+  _setRunGhOverride((cmd) => {
+    if (cmd.startsWith("gh pr view")) {
+      viewCalls++;
+      throw ghError("GraphQL: API rate limit already exceeded for user ID 81560491");
+    }
+    if (cmd.startsWith("gh api repos/{owner}/{repo}/pulls/")) {
+      throw new Error("REST pool also exhausted"); // both pools down
+    }
+    if (cmd.startsWith("gh api rate_limit")) {
+      rateLimitCalls++;
+      return Math.floor(Date.now() / 1000).toString(); // reset "now" → short wait
+    }
+    return "";
+  });
+  try {
+    // Exhausts the tiny budget → fails open (null) after retry attempts.
+    const sha = await getPrHeadSha(138, { source: "record", repo: "owner/repo" });
+    equal(sha, null);
+    ok(viewCalls >= 2, `retried gh pr view after the wait (${viewCalls} attempts)`);
+    ok(rateLimitCalls >= 1, `polled gh api rate_limit for the reset window (${rateLimitCalls})`);
+  } finally {
+    _setRunGhOverride(null);
+    if (prevCap === undefined) delete process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS; else process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS = prevCap;
+  }
+});
+
 
 
 // ── Extension factory — audited gate behavior (#60) ──
