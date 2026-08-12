@@ -110,21 +110,93 @@ export function readReviewRecord(pr: number): ReviewRecord | null {
   }
 }
 
-// Current PR head via the gate's own gh call, using the resolved repo context
-// (cwd for `cd ... &&` prefixes, --repo flag for explicit owner/name). Returns
-// null on ANY failure (network, bad repo, gh missing) — the fail-open signal.
-export function getPrHeadSha(pr: number, ctx: RepoContext): string | null {
+// ── GraphQL rate-limit resilience (#192) ─────────────
+// `gh pr view --json …` uses the GraphQL pool, which resets independently of
+// the REST pool (`gh api rate_limit` is REST). Parallel sessions can exhaust
+// the GraphQL pool while REST stays healthy (observed 2026-08-12, tortoise
+// #982: the gate blocked mid-merge on "GraphQL: API rate limit already
+// exceeded"). The gate must wait for the reset window and retry — not hard-
+// fail the ceremony, and not silently skip head verification (the #138
+// fail-open path) when the pool is merely temporarily exhausted.
+
+/** True when a gh error message is the GraphQL rate-limit exhaustion signature. */
+export function isGraphQLRateLimitError(msg: string): boolean {
+  return /graphql.*rate limit|rate limit.*already exceeded|api rate limit/i.test(msg ?? "");
+}
+
+/** Max wall-clock time (ms) the gate waits for the GraphQL reset window (#192).
+ * Env-overridable (REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS); default 10 min — the
+ * observed recovery was ~5 min; a full 1h window is reachable by raising it. */
+export function rateLimitMaxWaitMs(): number {
+  const n = parseInt(process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS ?? "600000", 10);
+  return Number.isInteger(n) && n > 0 ? n : 600000;
+}
+
+/** Seconds until the GraphQL pool resets, read via the REST rate_limit endpoint
+ * (independent pool — healthy when GraphQL is exhausted). null on failure. */
+export function graphQLResetInSecs(cwd?: string): number | null {
   try {
-    const repoArg = ctx.repo ? ` --repo ${ctx.repo}` : "";
-    const out = execSync(`gh pr view ${pr} --json headRefOid --jq .headRefOid${repoArg}`, {
+    const out = execSync(`gh api rate_limit --jq '.resources.graphql.reset'`, {
       encoding: "utf-8",
-      cwd: ctx.cwd,
+      cwd,
       timeout: 15000,
     });
-    const sha = out.trim();
-    return sha || null;
+    const reset = parseInt(out.trim(), 10);
+    if (!Number.isInteger(reset)) return null;
+    return Math.max(0, reset - Math.floor(Date.now() / 1000));
   } catch {
     return null;
+  }
+}
+
+function sleepAsync(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Current PR head via the gate's own gh call, using the resolved repo context
+ * (cwd for `cd ... &&` prefixes, --repo flag for explicit owner/name). Returns
+ * null on ANY non-rate-limit failure (network, bad repo, gh missing) — the
+ * #138 fail-open signal. On GraphQL rate-limit exhaustion (#192) it waits for
+ * the reset window (bounded by rateLimitMaxWaitMs, polling via the REST pool)
+ * and retries, so a parallel-session GraphQL burn cannot strand a merge or
+ * silently skip head verification.
+ */
+export async function getPrHeadSha(pr: number, ctx: RepoContext): Promise<string | null> {
+  const repoArg = ctx.repo ? ` --repo ${ctx.repo}` : "";
+  const deadline = Date.now() + rateLimitMaxWaitMs();
+  let attempt = 0;
+  for (;;) {
+    try {
+      const out = execSync(`gh pr view ${pr} --json headRefOid --jq .headRefOid${repoArg}`, {
+        encoding: "utf-8",
+        cwd: ctx.cwd,
+        timeout: 15000,
+      });
+      const sha = out.trim();
+      return sha || null;
+    } catch (e: any) {
+      const msg = (e?.stderr ?? e?.message ?? "").toString();
+      if (!isGraphQLRateLimitError(msg)) return null; // non-rate-limit → fail-open as before
+      const waitSecs = graphQLResetInSecs(ctx.cwd);
+      const remaining = deadline - Date.now();
+      const waitMs = waitSecs === null
+        ? Math.min(30000, remaining) // cannot read reset → fixed-interval poll
+        : Math.min(waitSecs * 1000 + 5000, remaining); // reset + 5s buffer
+      if (waitMs <= 0 || waitSecs === null && remaining < 30000) {
+        console.warn(
+          `[review-enforcer] ⚠️ #192: GraphQL rate limit outlasted the ` +
+          `${Math.round(rateLimitMaxWaitMs() / 1000)}s cap — failing open (head verification skipped)`
+        );
+        return null;
+      }
+      attempt++;
+      console.warn(
+        `[review-enforcer] ⏳ #192: GraphQL rate limit (attempt ${attempt}) — ` +
+        `waiting ${Math.round(waitMs / 1000)}s for the reset window, then retrying`
+      );
+      await sleepAsync(waitMs);
+    }
   }
 }
 
@@ -331,7 +403,7 @@ export default function (pi: ExtensionAPI) {
       if (prNumber !== null) {
         const record = readReviewRecord(prNumber);
         const ctx = resolveRepoContext(command, record);
-        const currentHead = getPrHeadSha(prNumber, ctx);
+        const currentHead = await getPrHeadSha(prNumber, ctx);
         const result = evaluateMergeGate(prNumber, record, currentHead, ctx);
         if (result.status === "block") {
           console.log("[review-enforcer] 🚫 Merge registry gate blocked merge");
