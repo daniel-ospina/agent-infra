@@ -25,6 +25,16 @@
 //      ⛔ escalation banner when the entry is past the revision cap, #157).
 //      Bot posts and subtype events never self-trigger; replies under
 //      resolved approvals are ignored.
+//   8. (#188) owns the connection SINGLE-OWNER per machine: exactly one pi
+//      process holds the Socket Mode slot at a time. A lock file
+//      (~/.pi/agent/slack-socket-owner.json, {pid, startTime, heartbeat})
+//      elects the owner — concurrent sessions log a one-line skip and re-check
+//      every 30s (heartbeat 30s, staleness 90s → takeover ≤2min after the
+//      owner dies). Slack caps Socket Mode at 10 connections per app; when the
+//      app is saturated (disconnect reason `too_many_websockets`, or the same
+//      error from apps.connections.open) the receiver YIELDS the lease, logs an
+//      actionable message, and retries on a 10-minute cadence — never the
+//      fixed 60s reconnect loop (observed fail streak 41→100+, #188).
 //
 // Self-contained on purpose (#146 design decision): the ~15–30 lines of
 // overlap with index.ts (seen-file read/write, findApprovalsFile, HTTPS POST
@@ -39,7 +49,7 @@
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync, closeSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -58,6 +68,20 @@ const BACKOFF_BASE_MS = 1000;
 const BACKOFF_CAP_MS = 60000;
 const WS_OPEN = 1; // WebSocket.readyState === OPEN (Node's undici WebSocket)
 
+// ── Single-owner election (#188) ─────────────────────
+// Slack allows 10 Socket Mode connections per app. Every interactive pi
+// session would open one — the 11th (and any session when another process
+// holds the slots) gets `too_many_websockets` and closes. One owner per
+// machine, elected via a shared lock file with heartbeat + staleness
+// takeover. See module header point 8.
+const OWNER_LOCK_FILE_DEFAULT = join(homedir(), ".pi", "agent", "slack-socket-owner.json");
+const HEARTBEAT_MS = 30_000;      // owner refreshes its lease every 30s
+const OWNER_STALE_MS = 90_000;    // lease dead after 90s without a heartbeat
+const OWNER_RECHECK_MS = 30_000;  // non-owners re-check for takeover every 30s
+const SATURATION_BACKOFF_MS = 10 * 60_000; // app-level saturation → 10 min, not 60s
+const STALE_UNLINK_GRACE_MS = 2000; // unparseable lease younger than this = a live claimant mid-write
+const TAKEOVER_SUFFIX = ".takeover"; // serializes rm→claim so racers never delete a fresh lease
+
 // ── Types ────────────────────────────────────────────
 
 export interface SocketModeState {
@@ -71,6 +95,14 @@ export interface SocketModeState {
   apiUrl: string; // API base override for tests ("http://localhost:PORT")
   onVerdict?: (id: string, verdict: string, reviewer: string) => void; // test hook
   onFeedback?: (id: string, text: string, reviewer: string) => void; // #156 test hook
+  // ── Single-owner election (#188) ──
+  ownerLockFile: string | null; // override (tests); null → ~/.pi/agent/slack-socket-owner.json
+  ownsLock: boolean; // this process currently holds the owner lease
+  heartbeatTimer: NodeJS.Timeout | null; // 30s lease refresh while owner
+  saturationTimer: NodeJS.Timeout | null; // 10-min backoff while app saturated
+  ownerRecheckTimer: NodeJS.Timeout | null; // 30s re-check while another owner holds
+  ownerSkippedLogged: boolean; // one-line skip message, once per skip phase
+  lockErrorLogged: boolean; // one-line lease-write-failure warn, once per failure phase
 }
 
 interface SocketEnvelope {
@@ -78,6 +110,13 @@ interface SocketEnvelope {
   type?: string;
   reason?: string;
   payload?: any;
+}
+
+/** Owner-lease record — the single-owner election lock (#188). */
+interface OwnerRecord {
+  pid: number;
+  startTime: string;
+  heartbeat: string;
 }
 
 interface ApprovalRequest {
@@ -485,6 +524,282 @@ export function updateResolvedMessage(opts: {
     },
   ];
   return postChatUpdate({ channel: opts.channel, ts: opts.ts, text, blocks, token, apiUrl: opts.apiUrl });
+}
+
+// ── Single-owner election (#188) ──────────────────────
+// One pi process per machine holds the Socket Mode connection. The lock file
+// is the shared lease: {pid, startTime, heartbeat}. A lease is stale when the
+// pid is dead OR the heartbeat is older than OWNER_STALE_MS — takeover then
+// writes a fresh lease (atomic tmp+rename). All paths never throw.
+
+/** Resolve the owner lock path: state override || env || default. `||` not
+ * `??`: an explicit empty string falls through — same contract as #149. */
+function ownerLockPath(state: SocketModeState): string {
+  return state.ownerLockFile || process.env.SLACK_SOCKET_OWNER_FILE || OWNER_LOCK_FILE_DEFAULT;
+}
+
+/** Read the lease record; null when missing/corrupt. Never throws. */
+function readOwnerRecord(state: SocketModeState): OwnerRecord | null {
+  try {
+    const f = ownerLockPath(state);
+    if (!existsSync(f)) return null;
+    const p = JSON.parse(readFileSync(f, "utf-8"));
+    if (!p || typeof p !== "object" || !Number.isInteger(p.pid)) return null;
+    return p as OwnerRecord;
+  } catch {
+    return null;
+  }
+}
+
+/** Signal-less liveness probe (SIGTERM-safe): pid exists? Never throws. */
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    return e?.code === "EPERM"; // exists but owned by another user
+  }
+}
+
+/** Lease is dead: pid gone, or no heartbeat within OWNER_STALE_MS. */
+function ownerRecordStale(rec: OwnerRecord): boolean {
+  if (!pidAlive(rec.pid)) return true;
+  const hb = Date.parse(rec.heartbeat);
+  if (Number.isNaN(hb)) return true;
+  return Date.now() - hb > OWNER_STALE_MS;
+}
+
+/** Write the current heartbeat into the lease (atomic tmp+rename, pid-unique
+ * tmp so concurrent processes never clobber each other's temp file). */
+export function refreshOwnerHeartbeat(state: SocketModeState): void {
+  if (!state.ownsLock) return;
+  try {
+    const f = ownerLockPath(state);
+    const rec = readOwnerRecord(state);
+    if (rec && rec.pid !== process.pid) {
+      // Lost the lease: another session took over after our heartbeat lapsed
+      // (or won the claim race). Yield FULLY — close the connection too, so
+      // "one lease ⇔ one connection" holds, then re-enter the election.
+      // (Review #189: the displaced owner used to keep its WS open — an
+      // orphaned slot against Slack's 10-connection cap.)
+      state.ownsLock = false;
+      stopHeartbeat(state);
+      console.warn(`[slack-bridge] ⚠️ owner lease taken over by pid ${rec.pid} — closing connection, re-electing`);
+      try {
+        state.ws?.close(1000, "lease lost");
+        state.ws = null;
+      } catch { /* already closed */ }
+      if (state.wantRunning) scheduleOwnerRecheck(state);
+      return;
+    }
+    const now = new Date().toISOString();
+    const record: OwnerRecord = { pid: process.pid, startTime: rec?.startTime ?? now, heartbeat: now };
+    const tmp = `${f}.${process.pid}.tmp`;
+    // 0600 like the claim — the tmp mode survives the rename (review #189).
+    writeFileSync(tmp, JSON.stringify(record, null, 2), { mode: 0o600, encoding: "utf-8" });
+    renameSync(tmp, f);
+  } catch {
+    // best-effort — a lapsed lease only costs a takeover, never a crash
+  }
+}
+
+function startHeartbeat(state: SocketModeState): void {
+  stopHeartbeat(state);
+  state.heartbeatTimer = setInterval(() => refreshOwnerHeartbeat(state), HEARTBEAT_MS);
+  state.heartbeatTimer.unref(); // never hold the pi process open
+}
+
+function stopHeartbeat(state: SocketModeState): void {
+  if (state.heartbeatTimer) {
+    clearInterval(state.heartbeatTimer);
+    state.heartbeatTimer = null;
+  }
+}
+
+/** Atomically claim the lease file with O_EXCL — only one process can create
+ * it. "lost" = someone else owns the file (EEXIST); "error" = I/O failure. */
+function claimLeaseFile(f: string, record: OwnerRecord): "won" | "lost" | "error" {
+  try {
+    const fd = openSync(f, "wx", 0o600); // create-exclusive: atomic claim
+    try {
+      writeSync(fd, JSON.stringify(record, null, 2));
+    } finally {
+      closeSync(fd);
+    }
+    return "won";
+  } catch (e: any) {
+    return e?.code === "EEXIST" ? "lost" : "error";
+  }
+}
+
+/** What sits at the lease path right now? "takeover" = safe to remove and
+ * re-claim; "backoff" = a live owner/claimant — do NOT touch (review #189). */
+function takeoverTargetKind(f: string, raced: OwnerRecord | null): "takeover" | "backoff" {
+  if (raced) return ownerRecordStale(raced) ? "takeover" : "backoff";
+  // raced === null: absent, or unparseable (a live claimant between openSync
+  // and writeSync — its file is microseconds old; a crashed claimant left an
+  // empty file). Never unlink a FRESH unparseable file — that would delete a
+  // winner's in-flight claim. An OLD one is a crashed claimant → recover.
+  try {
+    const st = statSync(f);
+    return Date.now() - st.mtimeMs >= STALE_UNLINK_GRACE_MS ? "takeover" : "backoff";
+  } catch {
+    return "takeover"; // absent — claim freely (rm is a no-op)
+  }
+}
+
+/** Serialize the takeover (rm → claim) behind a second O_EXCL lock — held
+ * only for microseconds; a crashed holder is recovered via the 2s mtime
+ * grace at the next recheck. True when this process now owns the lock. The
+ * recovery rm is check-then-act (POSIX has no atomic test-and-unlink): two
+ * racers can both recover the same crashed holder's lock and both proceed —
+ * the f-claim + verify-after-claim below is the arbitration that still
+ * yields exactly one owner (review #189 pass 3). */
+function claimTakeoverLock(state: SocketModeState, f: string): boolean {
+  const tf = f + TAKEOVER_SUFFIX;
+  const now = new Date().toISOString();
+  const holder: OwnerRecord = { pid: process.pid, startTime: now, heartbeat: now };
+  let r = claimLeaseFile(tf, holder);
+  if (r === "won") return true;
+  if (r === "error") {
+    warnLockWriteOnce(state, tf);
+    return false;
+  }
+  // EEXIST: another process is mid-takeover (fresh) or crashed (old).
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (Date.now() - statSync(tf).mtimeMs < STALE_UNLINK_GRACE_MS) return false; // live takeover in progress
+    } catch {
+      return false; // vanished — retry at the next recheck
+    }
+    try { rmSync(tf, { force: true }); } catch { /* ignore */ }
+    r = claimLeaseFile(tf, holder);
+    if (r === "won") return true;
+    if (r === "error") {
+      warnLockWriteOnce(state, tf);
+      return false;
+    }
+    // lost again — a racer recovered the same crashed lock; loop once more
+  }
+  return false;
+}
+
+/** Try to become the single owner. Returns true when this process holds the
+ * lease (freshly claimed, or already owned). False when another LIVE owner
+ * holds it — caller skips connecting and re-checks later. The claim is
+ * atomic (O_EXCL), the takeover is serialized behind a second O_EXCL lock,
+ * and a verify-after-claim catches replacement races — concurrent acquirers
+ * converge to exactly one owner; a residual microseconds-wide window (two
+ * racers recovering a CRASHED takeover lock) can transiently produce two,
+ * self-healing via the heartbeat yield ≤30s (review #189). Never throws. */
+export function acquireOwnerLock(state: SocketModeState): boolean {
+  if (state.ownsLock) return true;
+  const f = ownerLockPath(state);
+  // Fast path: a live owner blocks without touching the file.
+  const rec = readOwnerRecord(state);
+  if (rec && !ownerRecordStale(rec)) return false; // another live owner
+  try {
+    mkdirSync(dirname(f), { recursive: true });
+    const now = new Date().toISOString();
+    const record: OwnerRecord = { pid: process.pid, startTime: now, heartbeat: now };
+    let result = claimLeaseFile(f, record);
+    if (result === "lost") {
+      // A racer claimed first, or a stale/corrupt record sits there (O_EXCL
+      // cannot overwrite). Decide what the current file is BEFORE touching it:
+      const raced = readOwnerRecord(state);
+      if (raced && !ownerRecordStale(raced)) return false; // a live owner won
+      if (takeoverTargetKind(f, raced) === "backoff") return false; // live claimant mid-write
+      // Serialize the dangerous rm→claim behind the takeover lock: two
+      // racers can never delete each other's fresh claim (review #189 P1).
+      if (!claimTakeoverLock(state, f)) return false; // another takeover in progress
+      try {
+        const raced2 = readOwnerRecord(state);
+        if (raced2 && !ownerRecordStale(raced2)) return false; // they won while we queued
+        try { rmSync(f, { force: true }); } catch { /* ignore */ }
+        result = claimLeaseFile(f, record);
+        if (result === "won") {
+          // Verify-after-claim: a racer's rm may have replaced our record
+          // between claim and here (residual recovery race, review #189) —
+          // if the lease no longer carries our pid, yield and re-elect.
+          const verify = readOwnerRecord(state);
+          if (!verify || verify.pid !== process.pid) result = "lost";
+        }
+        if (result !== "won") return false; // a fresh owner won between rm and claim
+      } finally {
+        try { rmSync(f + TAKEOVER_SUFFIX, { force: true }); } catch { /* ignore */ }
+      }
+    }
+    if (result !== "won") {
+      if (result === "error") warnLockWriteOnce(state, f);
+      return false;
+    }
+    state.ownsLock = true;
+    state.lockErrorLogged = false;
+    startHeartbeat(state);
+    return true;
+  } catch (e: any) {
+    warnLockWriteOnce(state, String(e?.message ?? e));
+    return false;
+  }
+}
+
+/** One warn per write-failure phase — the 30s recheck must not spam. */
+function warnLockWriteOnce(state: SocketModeState, detail: string): void {
+  if (state.lockErrorLogged) return;
+  state.lockErrorLogged = true;
+  console.warn(`[slack-bridge] owner lock write failed: ${detail} — will retry on re-check`);
+}
+
+/** Release the lease (only when we still hold it) + stop the heartbeat. */
+function releaseOwnerLock(state: SocketModeState): void {
+  stopHeartbeat(state);
+  if (!state.ownsLock) return;
+  try {
+    const f = ownerLockPath(state);
+    const rec = readOwnerRecord(state);
+    if (rec && rec.pid === process.pid && existsSync(f)) rmSync(f);
+  } catch {
+    // best-effort — a stale lease self-heals via takeover
+  }
+  state.ownsLock = false;
+}
+
+/** Slack's per-app connection limit exceeded — NOT a transient drop. Yield
+ * the lease, log an actionable message once, retry on a long cadence. Never
+ * re-enters the 60s transient loop (#188). */
+function handleSaturation(state: SocketModeState, source: string): void {
+  if (state.saturationTimer) return; // already scheduled
+  releaseOwnerLock(state);
+  console.warn(
+    `[slack-bridge] 🔌 Socket Mode saturated (${source}): Slack allows 10 connections per app and another process holds them. ` +
+    `This session yields and retries in ${SATURATION_BACKOFF_MS / 60_000} min — close other pi sessions to free a slot.`,
+  );
+  state.saturationTimer = setTimeout(() => {
+    state.saturationTimer = null;
+    if (state.wantRunning) void openSocket(state);
+  }, SATURATION_BACKOFF_MS);
+  state.saturationTimer.unref();
+}
+
+/** `too_many_websockets` — in a disconnect reason OR an apps.connections.open
+ * error — means app-level saturation, not a transient drop. */
+function isSaturationReason(reason: string | null | undefined): boolean {
+  return typeof reason === "string" && /too_many_websockets/i.test(reason);
+}
+
+/** Non-owner sessions re-check periodically: the owner may have died (stale
+ * lease → takeover) or released (session shutdown). Silent after the first
+ * skip message — no log spam (#188). */
+function scheduleOwnerRecheck(state: SocketModeState): void {
+  if (state.ownerRecheckTimer) return;
+  state.ownerRecheckTimer = setTimeout(() => {
+    state.ownerRecheckTimer = null;
+    if (state.wantRunning && !state.ownsLock && !state.saturationTimer) {
+      void openSocket(state);
+    }
+  }, OWNER_RECHECK_MS);
+  state.ownerRecheckTimer.unref();
 }
 
 // ── Verdict write contract (approvals.json) ──────────
@@ -926,7 +1241,16 @@ export function handleSocketMessage(event: MessageEvent, ws: WebSocket, state: S
       return;
     }
     if (env.type === "disconnect") {
-      console.warn(`[slack-bridge] 🔌 disconnect from Slack: ${env.reason ?? "unknown reason"} — reconnecting`);
+      const reason = env.reason ?? "unknown reason";
+      if (isSaturationReason(reason)) {
+        // App-level saturation: yield the lease, long backoff, actionable
+        // message — the onclose below must NOT schedule the 60s loop, and no
+        // misleading "— reconnecting" line is printed (review #189).
+        handleSaturation(state, `disconnect:${reason}`);
+        try { state.ws?.close(1000, "slack requested disconnect"); } catch { /* already closed */ }
+        return;
+      }
+      console.warn(`[slack-bridge] 🔌 disconnect from Slack: ${reason} — reconnecting`);
       try { state.ws?.close(1000, "slack requested disconnect"); } catch { /* already closed */ }
       scheduleReconnect(state);
       return;
@@ -971,11 +1295,19 @@ export function connectSocket(url: string, state: SocketModeState): WebSocket {
     // On failed connection establishment undici fires only `error` (no
     // `onclose`); on mid-session drops it fires error THEN close. Scheduling
     // here covers both — scheduleReconnect is idempotent (single timer).
+    // Saturation backoff (#188) owns the retry when set — never loop here.
+    releaseOwnerLock(state); // no live connection → no lease (review #189)
+    if (state.saturationTimer) return;
     scheduleReconnect(state);
   };
   ws.onclose = (event) => {
     console.log(`[slack-bridge] 🔌 Socket Mode disconnected (code=${(event as any)?.code ?? "?"}, reason=${(event as any)?.reason ?? ""})`);
     if (state.ws === ws) state.ws = null;
+    // The connection is gone — the lease goes with it. Other sessions may
+    // re-elect; our own retry re-acquires. A stuck session (bad token, dead
+    // wss URL) must not starve the machine (review #189).
+    releaseOwnerLock(state);
+    if (state.saturationTimer) return; // saturation backoff owns the retry (#188)
     scheduleReconnect(state);
   };
   return ws;
@@ -986,17 +1318,46 @@ export function connectSocket(url: string, state: SocketModeState): WebSocket {
  * same backoff loop as WS drops. Never throws. */
 async function openSocket(state: SocketModeState): Promise<void> {
   if (!state.wantRunning) return;
+  if (state.saturationTimer) return; // saturation backoff pending (#188)
+  // Single-owner gate (#188): only the lease holder connects. Another live
+  // owner → one-line skip + periodic re-check, never a connection attempt.
+  if (!state.ownsLock) {
+    if (!acquireOwnerLock(state)) {
+      if (!state.ownerSkippedLogged) {
+        state.ownerSkippedLogged = true;
+        // Differentiate the two failure causes (review #189): another live
+        // owner vs an unwritable lease path — wrong diagnosis sends users
+        // hunting for phantom sessions.
+        const held = readOwnerRecord(state);
+        const cause = held && !ownerRecordStale(held)
+          ? `another pi session owns the connection (${ownerLockPath(state)})`
+          : `could not claim the owner lease (${ownerLockPath(state)})`;
+        console.log(
+          `[slack-bridge] ⏭️ Socket Mode: ${cause} — this session skips. Will re-check in ${OWNER_RECHECK_MS / 1000}s.`,
+        );
+      }
+      scheduleOwnerRecheck(state);
+      return;
+    }
+    state.ownerSkippedLogged = false; // we hold the lease now — a future skip may log again
+  }
   let res: { ok: boolean; url?: string; error?: string };
   try {
     res = await callAppsConnectionsOpen(state.appToken, state.apiUrl);
   } catch (e: any) {
     console.error(`[slack-bridge] ❌ apps.connections.open threw: ${e?.message ?? e}`);
+    releaseOwnerLock(state); // no live connection → no lease (#189)
     scheduleReconnect(state);
     return;
   }
   if (!state.wantRunning) return; // stopped while awaiting
   if (!res.ok || !res.url) {
+    if (isSaturationReason(res.error)) {
+      handleSaturation(state, `apps.connections.open:${res.error}`);
+      return;
+    }
     console.error(`[slack-bridge] ❌ apps.connections.open failed: ${res.error ?? "no wss url"} — scheduling reconnect`);
+    releaseOwnerLock(state); // a broken config must not starve other sessions (#189)
     scheduleReconnect(state);
     return;
   }
@@ -1004,6 +1365,7 @@ async function openSocket(state: SocketModeState): Promise<void> {
     state.ws = connectSocket(res.url, state);
   } catch (e: any) {
     console.error(`[slack-bridge] ❌ WebSocket connect failed: ${e?.message ?? e}`);
+    releaseOwnerLock(state); // no live connection → no lease (#189)
     scheduleReconnect(state);
   }
 }
@@ -1032,6 +1394,7 @@ export function startSocketModeReceiver(opts?: {
   apiUrl?: string;
   approvalsFile?: string | null;
   stateFile?: string | null;
+  ownerLockFile?: string | null; // test override (#188)
   onVerdict?: (id: string, verdict: string, reviewer: string) => void;
   onFeedback?: (id: string, text: string, reviewer: string) => void;
 }): SocketModeState {
@@ -1047,6 +1410,13 @@ export function startSocketModeReceiver(opts?: {
     apiUrl: opts?.apiUrl ?? "",
     onVerdict: opts?.onVerdict,
     onFeedback: opts?.onFeedback,
+    ownerLockFile: opts?.ownerLockFile ?? null,
+    ownsLock: false,
+    heartbeatTimer: null,
+    saturationTimer: null,
+    ownerRecheckTimer: null,
+    ownerSkippedLogged: false,
+    lockErrorLogged: false,
   };
   if (!state.appToken) {
     console.log("[slack-bridge] Socket Mode off — missing SLACK_APP_TOKEN (set an xapp-... token to enable button callbacks)");
@@ -1071,6 +1441,15 @@ export function stopSocketModeReceiver(state: SocketModeState): void {
       clearTimeout(state.reconnectTimer);
       state.reconnectTimer = null;
     }
+    if (state.ownerRecheckTimer) {
+      clearTimeout(state.ownerRecheckTimer);
+      state.ownerRecheckTimer = null;
+    }
+    if (state.saturationTimer) {
+      clearTimeout(state.saturationTimer);
+      state.saturationTimer = null;
+    }
+    releaseOwnerLock(state);
     if (state.ws) {
       const ws = state.ws;
       state.ws = null;
