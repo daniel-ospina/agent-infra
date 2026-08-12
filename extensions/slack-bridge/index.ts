@@ -591,7 +591,7 @@ export function deriveRepoName(cwd: string): string | null {
   try {
     const out = execSync("git remote get-url origin", {
       cwd,
-      timeout: GIT_REMOTE_TIMEOUT_MS,
+      timeout: gitRemoteTimeoutMs(),
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -960,7 +960,17 @@ export function initApprovalForwarding(): { enabled: boolean; timer: NodeJS.Time
 
 const REDRAFT_SURFACE_MS = 60 * 60 * 1000; // 1h — surface stale redrafts
 const REDRAFT_ESCALATE_MS = 24 * 60 * 60 * 1000; // 24h — TTL escalation
-const GIT_REMOTE_TIMEOUT_MS = 2000; // spec: git config lookup, 2s cap
+/**
+ * #196: git-lookup cap for approval-store repo discovery. Default 10s (was 2s)
+ * — `git remote get-url origin` intermittently stalls for multi-second stretches
+ * on macOS (observed up to >80s; ~1-in-3 suite runs flaked on the 2s cap,
+ * falling back to the wrong store). Env-overridable via GIT_REMOTE_TIMEOUT_MS;
+ * read per call so tests/harness can tune. Invalid/absent → 10000.
+ */
+export function gitRemoteTimeoutMs(): number {
+  const n = parseInt(process.env.GIT_REMOTE_TIMEOUT_MS ?? "10000", 10);
+  return Number.isInteger(n) && n > 0 ? n : 10000;
+}
 const GH_API_TIMEOUT_MS = 15000; // gh api call cap
 
 // ── Seams (tests) ──
@@ -1003,7 +1013,7 @@ export function deriveCurrentRepo(cwd: string): string | null {
   try {
     const out = execSync("git config --get remote.origin.url", {
       cwd,
-      timeout: GIT_REMOTE_TIMEOUT_MS,
+      timeout: gitRemoteTimeoutMs(),
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
     });

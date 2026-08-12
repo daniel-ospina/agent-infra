@@ -962,7 +962,24 @@ try {
 
 // ── Approval forwarding: per-repo store discovery (#2492) ─────
 {
-  const { repoNameFromUrl, deriveRepoName, approvalsStorePath, findApprovalsFile } = await import("./index.js");
+  const { repoNameFromUrl, deriveRepoName, approvalsStorePath, findApprovalsFile, gitRemoteTimeoutMs } = await import("./index.js");
+
+  // gitRemoteTimeoutMs — #196: env-overridable git-lookup cap (default 10s).
+  // The 2s default flaked discovery on multi-second `git remote get-url` stalls.
+  const prevGitTmo = process.env.GIT_REMOTE_TIMEOUT_MS;
+  try {
+    delete process.env.GIT_REMOTE_TIMEOUT_MS;
+    assert(gitRemoteTimeoutMs() === 10000, "gitRemoteTimeoutMs: default 10000 (no env)");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "5000";
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: env override respected");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "abc";
+    assert(gitRemoteTimeoutMs() === 10000, "gitRemoteTimeoutMs: invalid env falls back to 10000");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "0";
+    assert(gitRemoteTimeoutMs() === 10000, "gitRemoteTimeoutMs: non-positive env falls back to 10000");
+  } finally {
+    if (prevGitTmo === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
+    else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTmo;
+  }
 
   // repoNameFromUrl — mirrors swarm _detect_repo parsing (last segment, .git stripped)
   assert(repoNameFromUrl("https://github.com/daniel-ospina/tortoise.git") === "tortoise", "repoNameFromUrl: https + .git → bare name");
