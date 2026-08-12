@@ -13,7 +13,7 @@
 
 import { createServer, type Server } from "node:http";
 import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawnSync, execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
@@ -36,6 +36,8 @@ import {
   findApprovalIdByThreadTs,
   updateResolvedMessage,
   repoNameFromUrl, // #2492: duplicated discovery parsing — regression-guarded
+  deriveRepoName, // #196: duplicated discovery — keep-in-sync with index.ts (retry-on-stall)
+  gitRemoteTimeoutMs, // #196: env-overridable git cap — keep-in-sync
   type SocketModeState,
 } from "./socket-mode.js";
 
@@ -65,6 +67,53 @@ function assert(condition: boolean, label: string): void {
   assert(repoNameFromUrl("") === null, "repoNameFromUrl: empty → null");
 }
 
+// #196: the duplicated git discovery must stay in sync with index.ts — same
+// env-overridable cap and the same ONE bounded retry on stall. Keep-in-sync
+// regression: a PATH git shim that sleeps past the cap on its FIRST call
+// (simulating the observed >cap stall), then passes through to real git.
+// Old code (hardcoded 2000ms, no retry) returns null here; new code resolves.
+{
+  const prevGitTmo0 = process.env.GIT_REMOTE_TIMEOUT_MS;
+  try {
+    delete process.env.GIT_REMOTE_TIMEOUT_MS;
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: default 5000 (keep-in-sync with index.ts)");
+  } finally {
+    if (prevGitTmo0 === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
+    else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTmo0;
+  }
+  const gitDir = tmpDir();
+  const shimDir = tmpDir();
+  try {
+    execSync("git init -q", { cwd: gitDir, stdio: "ignore" });
+    execSync("git remote add origin https://github.com/owner/tortoise.git", { cwd: gitDir, stdio: "ignore" });
+    mkdirSync(shimDir, { recursive: true });
+    const marker = join(shimDir, ".first-call-done");
+    const realGit = execSync("which git", { encoding: "utf-8" }).trim();
+    writeFileSync(
+      join(shimDir, "git"),
+      `#!/bin/sh\nif [ ! -f "$GIT_SHIM_MARKER" ]; then\n  touch "$GIT_SHIM_MARKER"\n  sleep 2\nfi\nexec "${realGit}" "$@"\n`,
+      { mode: 0o755 },
+    );
+    const prevPath = process.env.PATH;
+    const prevGitTmo = process.env.GIT_REMOTE_TIMEOUT_MS;
+    try {
+      process.env.PATH = `${shimDir}:${prevPath ?? ""}`;
+      process.env.GIT_SHIM_MARKER = marker;
+      process.env.GIT_REMOTE_TIMEOUT_MS = "700"; // cap << shim sleep → attempt 1 killed
+      assert(deriveRepoName(gitDir) === "tortoise", "deriveRepoName (socket-mode copy): stall past cap → bounded retry succeeds");
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+      delete process.env.GIT_SHIM_MARKER;
+      if (prevGitTmo === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
+      else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTmo;
+    }
+  } finally {
+    rmSync(gitDir, { recursive: true, force: true });
+    rmSync(shimDir, { recursive: true, force: true });
+  }
+}
+
 function tmpDir(): string {
   const d = join(tmpdir(), "socket-mode-test-" + randomUUID().slice(0, 8));
   mkdirSync(d, { recursive: true });
@@ -83,6 +132,27 @@ async function waitFor(cond: () => boolean, ms = 3000): Promise<boolean> {
     if (Date.now() - start > ms) return false;
     await sleep(25);
   }
+}
+
+/** Bounded server teardown (#196): a stalled keep-alive socket (observed with
+ * this machine's git stall) can keep server.close()'s callback pending forever
+ * and hang the suite. Grace timer force-destroys connections, then resolves
+ * regardless. For the WS mock the upgraded sockets live outside the HTTP
+ * server's tracking — destroy them explicitly too. */
+function closeServerBounded(server: Server, extraSockets?: Set<unknown>): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      try {
+        if (extraSockets) for (const s of extraSockets) { try { (s as Duplex).destroy(); } catch { /* gone */ } }
+        server.closeAllConnections();
+      } catch { /* already closed */ }
+      resolve();
+    }, 1500);
+    server.close(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 /** Capture console output for a synchronous window. Returns restore + getter. */
@@ -129,7 +199,7 @@ class MockOpenAPI {
   fail(error: string): void { this.respond = () => ({ ok: false, error }); }
 
   kill(): Promise<void> {
-    return new Promise((resolve) => this.server.close(() => resolve()));
+    return closeServerBounded(this.server);
   }
 }
 
@@ -289,7 +359,7 @@ class MockWSServer {
   clearClientMessages(): void { this.clientMessages = []; }
 
   kill(): Promise<void> {
-    return new Promise((resolve) => this.server.close(() => resolve()));
+    return closeServerBounded(this.server, this.sockets);
   }
 }
 

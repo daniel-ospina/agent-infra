@@ -586,19 +586,33 @@ export function repoNameFromUrl(url: string | null | undefined): string | null {
 /** Derive the current repo NAME from the git origin remote of cwd (#2492).
  * Same contract as swarm's `_detect_repo`: `git remote get-url origin`, then
  * the last URL segment. Failure (no git, no remote, timeout, bad cwd) → null
- * = no repo context. */
+ * = no repo context. #196: ONE bounded retry when the first attempt was
+ * killed by the execSync cap (Node 22 timeout error: `code === "ETIMEDOUT"` /
+ * `signal === "SIGTERM"` — a git stall, not a fast failure); fast failures
+ * (no git/no remote) stay immediate, so a non-repo cwd never pays the extra
+ * cap. Worst case 2 × cap only on an actual stall. */
 export function deriveRepoName(cwd: string): string | null {
-  try {
-    const out = execSync("git remote get-url origin", {
-      cwd,
-      timeout: gitRemoteTimeoutMs(),
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return repoNameFromUrl(out.trim());
-  } catch {
-    return null; // no git / no remote / timeout / bad cwd
-  }
+  let killed = false;
+  const attempt = (): string | null => {
+    try {
+      const out = execSync("git remote get-url origin", {
+        cwd,
+        timeout: gitRemoteTimeoutMs(),
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      return repoNameFromUrl(out.trim());
+    } catch (e: any) {
+      // execSync timeout kill → stall, not fast failure. Node 22: the wrapper
+      // error carries code ETIMEDOUT + signal SIGTERM (killed is undefined).
+      killed = e?.code === "ETIMEDOUT" || e?.signal === "SIGTERM";
+      return null;
+    }
+  };
+  const first = attempt();
+  if (first !== null) return first;
+  if (!killed) return null; // fast failure (no git/no remote) — zero added latency
+  return attempt(); // stall — one bounded retry, then give up
 }
 
 /** Per-repo approval store path: ~/.swarm/approvals/<repo>.json — OUTSIDE any
@@ -961,15 +975,16 @@ export function initApprovalForwarding(): { enabled: boolean; timer: NodeJS.Time
 const REDRAFT_SURFACE_MS = 60 * 60 * 1000; // 1h — surface stale redrafts
 const REDRAFT_ESCALATE_MS = 24 * 60 * 60 * 1000; // 24h — TTL escalation
 /**
- * #196: git-lookup cap for approval-store repo discovery. Default 10s (was 2s)
+ * #196: git-lookup cap for approval-store repo discovery. Default 5s (was 2s)
  * — `git remote get-url origin` intermittently stalls for multi-second stretches
  * on macOS (observed up to >80s; ~1-in-3 suite runs flaked on the 2s cap,
  * falling back to the wrong store). Env-overridable via GIT_REMOTE_TIMEOUT_MS;
- * read per call so tests/harness can tune. Invalid/absent → 10000.
+ * read per call so tests/harness can tune. Invalid/absent → 5000.
+ * KEEP-IN-SYNC: socket-mode.ts duplicates this getter (#2492/#196).
  */
 export function gitRemoteTimeoutMs(): number {
-  const n = parseInt(process.env.GIT_REMOTE_TIMEOUT_MS ?? "10000", 10);
-  return Number.isInteger(n) && n > 0 ? n : 10000;
+  const n = parseInt(process.env.GIT_REMOTE_TIMEOUT_MS ?? "5000", 10);
+  return Number.isInteger(n) && n > 0 ? n : 5000;
 }
 const GH_API_TIMEOUT_MS = 15000; // gh api call cap
 
