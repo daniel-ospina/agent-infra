@@ -12,7 +12,8 @@
  */
 
 import { createServer, type Server } from "node:http";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
@@ -25,6 +26,8 @@ import {
   startSocketModeReceiver,
   stopSocketModeReceiver,
   connectSocket,
+  acquireOwnerLock,
+  refreshOwnerHeartbeat,
   handleSocketMessage,
   ackEnvelope,
   processBlockAction,
@@ -296,6 +299,26 @@ function cryptoHash(data: string): string {
 
 // ── Fixtures ─────────────────────────────────────────
 
+/** Tmp dirs created for owner-lease test files — cleaned at the end (the
+ * suite's rmSync convention, #188 tests 28-33). */
+const ownerDirs: string[] = [];
+
+/** A per-test owner-lease path that never touches the real
+ * ~/.pi/agent/slack-socket-owner.json (live sessions hold it). */
+function testOwnerFile(): string {
+  const d = tmpDir();
+  ownerDirs.push(d);
+  return join(d, "owner.json");
+}
+
+/** A pid that is GUARANTEED dead on any OS: spawn a child, reap it, use its
+ * pid. (Fixed constants like 999999 can exist on Linux where pid_max is
+ * 4194304 — review #189.) */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ["-e", ""], { stdio: "ignore" });
+  return child.pid ?? 999999;
+}
+
 /** A realistic Socket Mode interactive envelope. */
 function interactiveEnvelope(envelopeId: string, payloadOverrides: any = {}): string {
   return JSON.stringify({
@@ -360,21 +383,27 @@ async function startConnected(opts: {
   stateFile?: string | null;
   onVerdict?: (id: string, verdict: string, reviewer: string) => void;
   onFeedback?: (id: string, text: string, reviewer: string) => void;
-} = {}): Promise<{ state: SocketModeState; api: MockOpenAPI; wsServer: MockWSServer }> {
+} = {}): Promise<{
+  state: SocketModeState; api: MockOpenAPI; wsServer: MockWSServer; ownerFile: string;
+}> {
   const api = new MockOpenAPI();
   const wsServer = new MockWSServer();
   api.setUrl(`ws://localhost:${wsServer.port}`);
   process.env.SLACK_APP_TOKEN = "xapp-test";
+  // #188: every test receiver gets its own owner lease — never touches the
+  // real ~/.pi/agent/slack-socket-owner.json (live sessions hold it).
+  const ownerFile = testOwnerFile();
   const state = startSocketModeReceiver({
     apiUrl: `http://localhost:${api.port}`,
     approvalsFile: opts.approvalsFile ?? null,
     stateFile: opts.stateFile ?? null,
+    ownerLockFile: ownerFile,
     onVerdict: opts.onVerdict,
     onFeedback: opts.onFeedback,
   });
   const connected = await waitFor(() => wsServer.connections > 0, 4000);
   assert(connected, "startConnected: WS connection established");
-  return { state, api, wsServer };
+  return { state, api, wsServer, ownerFile };
 }
 
 // ── Test 1: env gating ───────────────────────────────
@@ -597,7 +626,7 @@ async function startConnected(opts: {
   const api = new MockOpenAPI();
   api.setUrl("ws://localhost:1"); // nothing listening → error + close
   process.env.SLACK_APP_TOKEN = "xapp-test";
-  const state = startSocketModeReceiver({ apiUrl: `http://localhost:${api.port}` });
+  const state = startSocketModeReceiver({ apiUrl: `http://localhost:${api.port}`, ownerLockFile: testOwnerFile() });
   // error → close → backoff (1s) → fresh apps.connections.open
   const retried = await waitFor(() => api.requests.length >= 2, 5000);
   assert(retried, "error: reconnect attempted after WS error");
@@ -646,6 +675,8 @@ async function startConnected(opts: {
   const state: SocketModeState = {
     ws: null, reconnectTimer: null, consecutiveFails: 0, wantRunning: false,
     approvalsFile, stateFile: seenFile, appToken: "xapp-test", apiUrl: `http://localhost:${api.port}`,
+    ownerLockFile: null, ownsLock: false, heartbeatTimer: null,
+    saturationTimer: null, ownerRecheckTimer: null, ownerSkippedLogged: false, lockErrorLogged: false,
   };
   processBlockAction({
     type: "block_actions",
@@ -691,6 +722,8 @@ async function startConnected(opts: {
   const state: SocketModeState = {
     ws: null, reconnectTimer: null, consecutiveFails: 0, wantRunning: false,
     approvalsFile, stateFile: seenFile, appToken: "xapp-test", apiUrl: `http://localhost:${api.port}`,
+    ownerLockFile: null, ownsLock: false, heartbeatTimer: null,
+    saturationTimer: null, ownerRecheckTimer: null, ownerSkippedLogged: false, lockErrorLogged: false,
   };
   processBlockAction({
     type: "block_actions",
@@ -719,6 +752,8 @@ async function startConnected(opts: {
   const state: SocketModeState = {
     ws: null, reconnectTimer: null, consecutiveFails: 0, wantRunning: false,
     approvalsFile, stateFile: seenFile, appToken: "xapp-test", apiUrl: `http://localhost:${api.port}`,
+    ownerLockFile: null, ownsLock: false, heartbeatTimer: null,
+    saturationTimer: null, ownerRecheckTimer: null, ownerSkippedLogged: false, lockErrorLogged: false,
   };
   processBlockAction({
     type: "block_actions",
@@ -1067,6 +1102,210 @@ async function startConnected(opts: {
   await api.kill();
   rmSync(dir, { recursive: true, force: true });
 }
+
+// ── Test 28: saturation disconnect → yield + 10-min backoff, no 60s loop (#188) ──
+{
+  const { state, api, wsServer } = await startConnected();
+  assert(state.ownsLock === true, "sat-disconnect: receiver holds the owner lease after connect");
+  const cap = captureLogs();
+  wsServer.sendText(JSON.stringify({ type: "disconnect", reason: "too_many_websockets" }));
+  const scheduled = await waitFor(() => state.saturationTimer !== null, 2000);
+  cap.restore();
+  assert(scheduled, "sat-disconnect: 10-min saturation timer scheduled");
+  assert(state.ownsLock === false, "sat-disconnect: owner lease released (yield)");
+  assert(state.reconnectTimer === null, "sat-disconnect: no 60s reconnect timer (loop broken)");
+  assert(cap.logs.some((l) => l.includes("too_many_websockets") && l.includes("10 min")),
+    "sat-disconnect: actionable saturation message (cause + cadence)");
+  assert(!cap.logs.some((l) => l.includes("too_many_websockets") && l.includes("reconnecting")),
+    "sat-disconnect: no misleading '— reconnecting' line for saturation (review #189)");
+  const fails = state.consecutiveFails;
+  // The old buggy code would reconnect within ~1s (backoff base) — a 1.2s
+  // window makes the no-attempt assertion real regression evidence.
+  await sleep(1200);
+  assert(state.consecutiveFails === fails, "sat-disconnect: fail streak frozen during backoff");
+  assert(wsServer.connections === 1, "sat-disconnect: no reconnect attempt during backoff");
+  assert(state.saturationTimer !== null, "sat-disconnect: saturation backoff still pending");
+  stopSocketModeReceiver(state);
+  assert(state.saturationTimer === null, "sat-disconnect: stop clears the saturation timer");
+  await api.kill();
+  await wsServer.kill();
+}
+
+// ── Test 29: apps.connections.open error too_many_websockets → saturation (#188) ──
+{
+  const api = new MockOpenAPI();
+  api.fail("too_many_websockets");
+  const ownerFile = testOwnerFile();
+  process.env.SLACK_APP_TOKEN = "xapp-test";
+  const state = startSocketModeReceiver({ apiUrl: `http://localhost:${api.port}`, ownerLockFile: ownerFile });
+  const sat = await waitFor(() => state.saturationTimer !== null, 2000);
+  assert(sat, "open-sat: saturation timer scheduled on API error");
+  assert(state.ownsLock === false, "open-sat: lease released");
+  assert(!existsSync(ownerFile), "open-sat: lock file removed (yield)");
+  // 10-min backoff means zero further API calls — 1.2s window proves it
+  // (old code would have re-attempted within ~1s).
+  await sleep(1200);
+  assert(api.requests.length === 1, "open-sat: zero API stampede during backoff");
+  stopSocketModeReceiver(state);
+  delete process.env.SLACK_APP_TOKEN;
+  await api.kill();
+}
+
+// ── Test 30: second receiver skips while a live owner holds the lease (#188) ──
+{
+  const api = new MockOpenAPI();
+  const wsServer = new MockWSServer();
+  api.setUrl(`ws://localhost:${wsServer.port}`);
+  const ownerFile = testOwnerFile();
+  process.env.SLACK_APP_TOKEN = "xapp-test";
+  const first = startSocketModeReceiver({ apiUrl: `http://localhost:${api.port}`, ownerLockFile: ownerFile });
+  const connected = await waitFor(() => wsServer.connections > 0, 4000);
+  assert(connected, "owner-skip: first receiver connected (holds lease)");
+  const cap = captureLogs();
+  const second = startSocketModeReceiver({ apiUrl: `http://localhost:${api.port}`, ownerLockFile: ownerFile });
+  await sleep(400);
+  cap.restore();
+  assert(second.ownsLock === false, "owner-skip: second receiver does not claim the lease");
+  assert(wsServer.connections === 1, "owner-skip: exactly one WS connection (no contention)");
+  assert(second.ownerRecheckTimer !== null, "owner-skip: re-check timer scheduled");
+  assert(api.requests.length === 1, "owner-skip: zero extra apps.connections.open calls");
+  assert(cap.logs.some((l) => l.includes("another pi session owns the connection")),
+    "owner-skip: one-line actionable skip message");
+  stopSocketModeReceiver(second);
+  assert(second.ownerRecheckTimer === null, "owner-skip: stop clears the re-check timer");
+  stopSocketModeReceiver(first);
+  assert(!existsSync(ownerFile), "owner-skip: owner stop removes the lease");
+  delete process.env.SLACK_APP_TOKEN;
+  await api.kill();
+  await wsServer.kill();
+}
+
+// ── Test 31: stale lease (dead pid) → takeover + connect (#188) ──
+{
+  const api = new MockOpenAPI();
+  const wsServer = new MockWSServer();
+  api.setUrl(`ws://localhost:${wsServer.port}`);
+  const ownerFile = testOwnerFile();
+  writeFileSync(ownerFile, JSON.stringify({
+    pid: deadPid(), // reaped child — cannot be alive (review #189)
+    startTime: "2026-01-01T00:00:00.000Z",
+    heartbeat: "2026-01-01T00:00:00.000Z",
+  }));
+  process.env.SLACK_APP_TOKEN = "xapp-test";
+  const state = startSocketModeReceiver({ apiUrl: `http://localhost:${api.port}`, ownerLockFile: ownerFile });
+  const conn = await waitFor(() => wsServer.connections > 0, 4000);
+  assert(conn, "takeover: dead owner → new session connects");
+  assert(state.ownsLock === true, "takeover: ownsLock true after takeover");
+  const rec = JSON.parse(readFileSync(ownerFile, "utf-8"));
+  assert(rec.pid === process.pid, "takeover: lease rewritten to our pid");
+  stopSocketModeReceiver(state);
+  assert(!existsSync(ownerFile), "takeover: lease removed on stop");
+  delete process.env.SLACK_APP_TOKEN;
+  await api.kill();
+  await wsServer.kill();
+}
+
+// ── Test 32: lease semantics — live owner blocks, stale heartbeat yields (#188) ──
+{
+  const ownerFile = testOwnerFile();
+  const now = new Date().toISOString();
+  const base: SocketModeState = {
+    ws: null, reconnectTimer: null, consecutiveFails: 0, wantRunning: false,
+    approvalsFile: null, stateFile: null, appToken: "xapp-test", apiUrl: "",
+    ownerLockFile: ownerFile, ownsLock: false, heartbeatTimer: null,
+    saturationTimer: null, ownerRecheckTimer: null, ownerSkippedLogged: false, lockErrorLogged: false,
+  };
+  // Live owner = alive pid + fresh heartbeat → blocked.
+  writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, startTime: now, heartbeat: now }));
+  assert(acquireOwnerLock(base) === false, "lease: live owner (alive pid + fresh heartbeat) blocks acquisition");
+  assert(base.ownsLock === false, "lease: no lease claimed while owner lives");
+  assert(existsSync(ownerFile), "lease: live owner's file untouched");
+  // Unparseable (empty) file with FRESH mtime = a live claimant mid-write
+  // (between openSync and writeSync). Must NOT be unlinked — review #189 P1:
+  // the old code deleted the winner's in-flight claim and let two sessions
+  // both "win".
+  writeFileSync(ownerFile, "");
+  assert(acquireOwnerLock(base) === false, "lease: unparseable fresh file → back off, no unlink");
+  assert(existsSync(ownerFile), "lease: unparseable fresh file untouched (winner's claim preserved)");
+  // Stale heartbeat (alive pid) → takeover.
+  writeFileSync(ownerFile, JSON.stringify({
+    pid: process.pid, startTime: "2026-01-01T00:00:00.000Z", heartbeat: "2026-01-01T00:00:00.000Z",
+  }));
+  assert(acquireOwnerLock(base) === true, "lease: stale heartbeat (alive pid) → takeover");
+  assert(base.ownsLock === true, "lease: ownsLock after takeover");
+  const rec = JSON.parse(readFileSync(ownerFile, "utf-8"));
+  assert(rec.pid === process.pid, "lease: lease carries our pid");
+  // Heartbeat refresh advances the stamp in place (pid preserved).
+  const hb1 = Date.parse(rec.heartbeat);
+  await sleep(1050); // guarantee a distinct millisecond stamp
+  refreshOwnerHeartbeat(base);
+  const rec2 = JSON.parse(readFileSync(ownerFile, "utf-8"));
+  assert(Date.parse(rec2.heartbeat) > hb1, "lease: heartbeat advanced on refresh");
+  assert(rec2.pid === process.pid, "lease: refresh preserves ownership");
+  assert((readFileSync(ownerFile, "utf-8") !== ""), "lease: lease parses");
+  stopSocketModeReceiver(base);
+  assert(!existsSync(ownerFile), "lease: stop releases the lease");
+  // OLD unparseable file (crashed claimant, past the 2s grace) → recovered.
+  writeFileSync(ownerFile, "");
+  const old = new Date(Date.now() - 5000);
+  utimesSync(ownerFile, old, old);
+  assert(acquireOwnerLock(base) === true, "lease: old unparseable file (crashed claimant) → recovered");
+  const rec3 = JSON.parse(readFileSync(ownerFile, "utf-8"));
+  assert(rec3.pid === process.pid, "lease: recovery claim carries our pid");
+  stopSocketModeReceiver(base);
+  assert(!existsSync(ownerFile), "lease: released after recovery");
+  // Fresh takeover lock (.takeover) = a live takeover in progress → back off,
+  // lease untouched (review #189 pass 3: the EEXIST-fresh branch).
+  const deadOwner = deadPid();
+  writeFileSync(ownerFile, JSON.stringify({
+    pid: deadOwner, startTime: "2026-01-01T00:00:00.000Z", heartbeat: "2026-01-01T00:00:00.000Z",
+  }));
+  writeFileSync(ownerFile + ".takeover", JSON.stringify({
+    pid: process.pid, startTime: now, heartbeat: now,
+  }));
+  assert(acquireOwnerLock(base) === false, "lease: fresh takeover lock (live takeover) → back off");
+  assert(JSON.parse(readFileSync(ownerFile, "utf-8")).pid === deadOwner, "lease: stale record untouched");
+  assert(existsSync(ownerFile + ".takeover"), "lease: live takeover lock untouched");
+  // OLD takeover lock (crashed takeover holder, past the 2s grace) → recovered.
+  const oldTf = new Date(Date.now() - 5000);
+  utimesSync(ownerFile + ".takeover", oldTf, oldTf);
+  assert(acquireOwnerLock(base) === true, "lease: old takeover lock (crashed holder) → recovered + claimed");
+  const rec4 = JSON.parse(readFileSync(ownerFile, "utf-8"));
+  assert(rec4.pid === process.pid, "lease: claim after takeover-lock recovery carries our pid");
+  assert(!existsSync(ownerFile + ".takeover"), "lease: takeover lock released after claim");
+  stopSocketModeReceiver(base);
+  assert(!existsSync(ownerFile), "lease: released after takeover-lock recovery");
+}
+
+// ── Test 33: foreign takeover discovered at heartbeat → connection closed, re-election (#189 review) ──
+{
+  const { state, wsServer, ownerFile } = await startConnected();
+  assert(state.ownsLock === true, "yield: receiver owns the lease after connect");
+  // Simulate another process winning the lease while our heartbeat lapsed
+  // (>90s): the lease file now carries a foreign pid.
+  writeFileSync(ownerFile, JSON.stringify({
+    pid: deadPid(), startTime: new Date().toISOString(), heartbeat: new Date().toISOString(),
+  }));
+  const cap = captureLogs();
+  refreshOwnerHeartbeat(state); // exported — the real trigger is the 30s interval
+  const yielded = state.ownsLock === false;
+  cap.restore();
+  assert(yielded, "yield: lease yielded on foreign takeover");
+  assert(state.ws === null, "yield: connection closed (one lease ⇔ one connection)");
+  const closed = await waitFor(() => wsServer.clientCloseCount >= 1, 2000);
+  assert(closed, "yield: server observed the close frame");
+  assert(state.ownerRecheckTimer !== null, "yield: re-election scheduled");
+  assert(cap.logs.some((l) => l.includes("lease taken over")), "yield: takeover logged");
+  // The session re-elects via the existing machinery: foreign pid is dead →
+  // stale → takeover → reconnect. The lease must be ours again.
+  const reconnected = await waitFor(() => state.ownsLock === true, 5000);
+  assert(reconnected, "yield: session re-acquires the lease after foreign owner dies");
+  stopSocketModeReceiver(state);
+  await wsServer.kill();
+}
+
+// Cleanup: remove per-test owner-lease tmp dirs (suite rmSync convention).
+for (const d of ownerDirs) rmSync(d, { recursive: true, force: true });
 
 console.log(`\nsocket-mode.test.ts: ${passed} passed, ${failed} failed`);
 if (failed > 0) {

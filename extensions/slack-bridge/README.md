@@ -26,6 +26,7 @@ Zero runtime dependencies beyond Node stdlib.
 | `SLACK_ESCALATION_CHANNEL` | `[loop-enforcer]` escalation posts go to this channel instead of the session thread. | routing |
 | `SLACK_BOT_TOKEN` | Bot token (`xoxb-…`) with `chat:write` scope. **Also used by approval forwarding.** | routing (via daemon), **approval** |
 | `SLACK_APP_TOKEN` | App-level token (`xapp-…`) with `connections:write` scope. Enables the Socket Mode receiver for approval button callbacks (agent-infra #146). | approval buttons |
+| `SLACK_SOCKET_OWNER_FILE` | Override the single-owner lease path (default `~/.pi/agent/slack-socket-owner.json`; #188). | approval buttons |
 | `SLACK_APPROVAL_CHANNEL` | Channel for approval notifications (e.g. `#approvals`). | approval |
 | `SLACK_CHANNEL` | Fallback channel if `SLACK_APPROVAL_CHANNEL` is unset. | approval |
 | `SLACK_APPROVAL_DISABLE=1` | Kill switch for approval forwarding. | — |
@@ -126,6 +127,26 @@ Connection drops and API errors are logged and retried with exponential
 backoff (1s base, 60s cap); the receiver stops cleanly on `session_shutdown`
 and never crashes the pi session. Without `SLACK_APP_TOKEN`: zero behavior
 change — `handleApprovalCallback()` remains the (superseded) direct-call stub.
+
+**Single-owner election (agent-infra #188):** Slack allows 10 Socket Mode
+connections per app — every concurrent pi session opening one would saturate
+that limit (`too_many_websockets`), which used to spin an infinite 60s
+reconnect loop. The receiver now elects ONE owner per machine via
+`~/.pi/agent/slack-socket-owner.json` (`{pid, startTime, heartbeat}`):
+
+- The owner holds the lease (heartbeat every 30s) and is the only process
+  that connects. Concurrent sessions log a one-line skip
+  (`⏭️ Socket Mode: another pi session owns the connection…`) and re-check
+  every 30s.
+- If the owner dies, the lease goes stale (90s without a heartbeat, or dead
+  pid) and any session takes over within ≤2 min — no manual cleanup.
+- On app-level saturation (`too_many_websockets` from the disconnect envelope
+  or `apps.connections.open`) the receiver **yields** the lease and retries on
+  a 10-minute cadence with an actionable message — never the 60s loop.
+- `stopSocketModeReceiver` (session shutdown / reload) releases the lease.
+
+Override the lease path with `SLACK_SOCKET_OWNER_FILE` (testing / unusual
+homes).
 
 ### Resolved-message updates (agent-infra #150)
 
@@ -280,8 +301,8 @@ settles; missing token or channel/ts skips silently (fire-and-forget).
 ## Tests
 
 ```bash
-npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 206 asserts (self-check)
-npx tsx extensions/slack-bridge/socket-mode.test.ts    # 148 asserts (Socket Mode receiver, mock WS server)
+npx tsx extensions/slack-bridge/slack-bridge.test.ts   # 248 asserts (self-check)
+npx tsx extensions/slack-bridge/socket-mode.test.ts    # 209 asserts (Socket Mode receiver, mock WS server)
 npx tsx extensions/slack-bridge/chunker.test.ts        # 21 asserts
 ```
 
