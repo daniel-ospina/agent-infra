@@ -13,11 +13,13 @@ import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
 let runGhOverride: ((cmd: string, opts?: { cwd?: string; timeout?: number }) => string) | null = null;
 
 /** TEST SEAM: replace the gh runner (returns the command's stdout, throws on
- * failure). Pass null to restore the real execSync-backed runner. */
+ * failure). Pass null to restore the real execSync-backed runner. Honored only
+ * under NODE_ENV=test (review #212 security pass) so production code can never
+ * accidentally honor a stray override. */
 export function _setRunGhOverride(
   fn: ((cmd: string, opts?: { cwd?: string; timeout?: number }) => string) | null
 ): void {
-  runGhOverride = fn;
+  if (process.env.NODE_ENV === "test" || fn === null) runGhOverride = fn;
 }
 
 function runGh(cmd: string, opts?: { cwd?: string; timeout?: number }): string {
@@ -123,6 +125,10 @@ export function readReviewRecord(pr: number): ReviewRecord | null {
     const raw = fs.readFileSync(resolvePath(reviewsDir(), `${pr}.json`), "utf8");
     const rec = JSON.parse(raw) as ReviewRecord;
     if (!rec || typeof rec.head_sha !== "string" || typeof rec.verdict !== "string") return null;
+    // Security (#212 review): record.repo is interpolated into shell strings by
+    // the gate — enforce the same charset the flag/env sources are validated
+    // with. An invalid record is treated as absent (fail-closed).
+    if (rec.repo !== undefined && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(rec.repo)) return null;
     return rec;
   } catch {
     return null; // missing or corrupt record → treated as "no review"
@@ -138,9 +144,16 @@ export function readReviewRecord(pr: number): ReviewRecord | null {
 // fail the ceremony, and not silently skip head verification (the #138
 // fail-open path) when the pool is merely temporarily exhausted.
 
-/** True when a gh error message is the GraphQL rate-limit exhaustion signature. */
+/** True when a gh error message is the GraphQL rate-limit exhaustion signature.
+ * Requires BOTH a rate-limit phrase AND a graphql mention (either order), or
+ * the "already exceeded" phrasing — the bare "api rate limit" phrase is NOT
+ * enough (REST-pool exhaustion is a different pool whose correct response is
+ * not a bounded GraphQL wait; review #212). */
 export function isGraphQLRateLimitError(msg: string): boolean {
-  return /graphql.*rate limit|rate limit.*already exceeded|api rate limit/i.test(msg ?? "");
+  const m = msg ?? "";
+  const rateLimitPhrase = /rate\s*limit/i.test(m);
+  const mentionsGraphQL = /graphql/i.test(m);
+  return (mentionsGraphQL && rateLimitPhrase) || /already exceeded/i.test(m);
 }
 
 /** Max wall-clock time (ms) the gate waits for the GraphQL reset window (#192).
@@ -175,11 +188,14 @@ function sleepAsync(ms: number): Promise<void> {
  * git remote). Returns the head SHA, or null on any failure (network, bad repo,
  * REST pool also rate-limited) — callers then decide wait-for-reset vs fail-open. */
 export function getPrHeadShaViaRest(pr: number, ctx: RepoContext): string | null {
-  const repoArg = ctx.repo ? ` --repo ${ctx.repo}` : "";
+  // NOTE: `gh api` does NOT accept --repo (verified gh 2.97.0: "unknown flag") —
+  // the repo is injected via GH_REPO env (the documented placeholder source).
+  const cmd = `gh api repos/{owner}/{repo}/pulls/${pr} --jq .head.sha`;
   try {
-    const out = runGh(`gh api repos/{owner}/{repo}/pulls/${pr} --jq .head.sha${repoArg}`, {
+    const out = runGh(cmd, {
       cwd: ctx.cwd,
       timeout: 15000,
+      env: ctx.repo ? { ...process.env, GH_REPO: ctx.repo } : undefined,
     });
     const sha = out.trim();
     return sha || null;

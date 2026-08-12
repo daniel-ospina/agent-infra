@@ -8,6 +8,10 @@
  * Run: npx tsx extensions/review-enforcer/index.test.ts
  */
 
+// The gh-runner test seam (_setRunGhOverride) is honored only under
+// NODE_ENV=test (#212 review pass) — set it before importing the module.
+process.env.NODE_ENV = "test";
+
 import {
   extractPrNumber,
   extractRepoFlag,
@@ -435,15 +439,34 @@ test("null when the REST call fails (REST pool also down / network)", () => {
   }
 });
 
-test("builds the pulls URL and passes --repo through when ctx.repo is set", () => {
+test("builds the pulls URL and injects the repo via GH_REPO env when ctx.repo is set", () => {
   let captured = "";
-  _setRunGhOverride((cmd) => { captured = cmd; return "a".repeat(40); });
+  let capturedEnv: any = null;
+  _setRunGhOverride((cmd, opts) => { captured = cmd; capturedEnv = opts; return "a".repeat(40); });
   try {
     getPrHeadShaViaRest(138, { source: "flag", repo: "owner/repo" });
     ok(captured.includes("pulls/138"), `command targets the PR: ${captured}`);
-    ok(captured.includes("--repo owner/repo"), `command carries --repo: ${captured}`);
+    // `gh api` does NOT accept --repo (gh 2.97.0: "unknown flag") — the repo
+    // must come via GH_REPO env (the documented placeholder source).
+    ok(!captured.includes("--repo") && !captured.includes("-R "), `no --repo flag: ${captured}`);
+    equal((capturedEnv as any)?.env?.GH_REPO, "owner/repo", "GH_REPO env injected for placeholder resolution");
   } finally {
     _setRunGhOverride(null);
+  }
+});
+
+test("record.repo with shell metacharacters → record rejected (fail-closed, security)", () => {
+  // readReviewRecord must reject a malicious repo field (interpolated into
+  // shell strings by the gate) — treated as absent. Uses a PR number that
+  // cannot collide with a real record; cleanup in finally.
+  const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+  const f = resolvePath(reviews, "999.json");
+  fs.mkdirSync(reviews, { recursive: true });
+  try {
+    fs.writeFileSync(f, JSON.stringify({ pr: 999, head_sha: "a".repeat(40), verdict: "clean", repo: "owner/x; echo pwned" }));
+    equal(readReviewRecord(999), null, "malicious record.repo → null (fail-closed)");
+  } finally {
+    fs.rmSync(f, { force: true });
   }
 });
 
