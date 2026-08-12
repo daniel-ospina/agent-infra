@@ -3,7 +3,7 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
@@ -21,6 +21,59 @@ export function resolveProjectRoot(blockedCwd: string | null, prompt: string): s
   // #7595: prefer the git root of cwd over raw cwd — repo-relative hashing and
   // bridge writes are anchored at the git root; a bare cwd base silently breaks them.
   return resolveGitRoot(process.cwd());
+}
+
+// #190: merge-root resolution with a wrong-root guard. The prompt's explicit
+// `Project root:` is authoritative when it realpath-differs from the stashed
+// block cwd (the dispatch targets a different worktree — the stale block
+// context must not shadow it, or every proactive dispatch in worktree B would
+// zero-merge against worktree A's stale state and recreate the blocked-until-
+// auto-bypass loop). Returns { root, foreign } where foreign=true signals the
+// caller to clear the stale lastBlockedFiles filter. Strict extraction (no
+// resolveGitRoot(process.cwd()) fallback here): when the prompt has no root
+// and no block context exists, resolveProjectRoot's own fallback applies.
+export function resolveMergeRoot(blockedCwd: string | null, prompt: string): { root: string; foreign: boolean } {
+  const rootMatch = prompt.match(/Project root:\s*(\S+)/);
+  if (rootMatch) {
+    const promptRoot = resolve(rootMatch[1].replace(/\.+$/, ""));
+    if (blockedCwd !== null && normalizeWorktreeRoot(promptRoot) !== normalizeWorktreeRoot(blockedCwd)) {
+      return { root: promptRoot, foreign: true };
+    }
+    return { root: promptRoot, foreign: false };
+  }
+  if (blockedCwd !== null) return { root: resolve(blockedCwd), foreign: false };
+  return { root: resolveGitRoot(process.cwd()), foreign: false };
+}
+
+// #190: shared diff-scoping pre-filter for verifier PASS merges. When a block
+// context exists, keep only files in the blocked diff (#5673). When the
+// context is empty or foreign (wrong-root rebind), keep only files in the
+// current staged diff OR already known in the registry (#38 known-path
+// exemption) — prevents a full-repo-scan PASS from marking arbitrary files
+// verified, on the plain-text, fail-open, AND JSON merge paths.
+export function scopeFiles(
+  files: string[],
+  projectRoot: string,
+  lastBlockedFiles: string[],
+  known: { has(key: string): boolean } = new Set<string>()
+): { kept: string[]; skipped: number } {
+  const blockedSet = new Set(lastBlockedFiles);
+  let staged: Set<string> | null = null;
+  const kept: string[] = [];
+  let skipped = 0;
+  for (const f of files) {
+    const rel = normalizeRegistryPath(projectRoot, f);
+    if (lastBlockedFiles.length > 0) {
+      if (blockedSet.has(rel)) { kept.push(f); continue; }
+      skipped++;
+      continue;
+    }
+    if (known.has(compoundKey(normalizeWorktreeRoot(projectRoot), rel))) { kept.push(f); continue; }
+    if (staged === null) staged = new Set(computeStagedDiff(projectRoot));
+    if (staged.has(rel)) { kept.push(f); continue; }
+    skipped++;
+  }
+  return { kept, skipped };
 }
 
 // ── Compound key helpers (#37) ───────────────────────
@@ -75,6 +128,10 @@ let lastBlockedFiles: string[] = [];
 // on disk (ESLint --fix). The stored verified hash is pre-lint, but the committed version
 // is post-lint. Re-hash on the next git op to capture the post-lint state.
 let pendingRehash: string | null = null;
+// #190: the allowed commit's changed files — lint-staged can only have touched
+// these; the rehash loop must NOT re-bless unrelated verified files from disk
+// (narrowing #7574's whole-root rehash).
+let pendingRehashFiles: string[] = [];
 // #7591: auto-bypass after N persistent blocks on the same files.
 // Tracks block attempts per file; resets when file is successfully verified.
 const blockAttempts = new Map<string, number>();
@@ -91,13 +148,16 @@ function writeBridge(projectRoot: string, files: string[]): void {
     const verifiedFiles: VerifiedFile[] = [];
     for (const f of files) {
       try {
-        // #37: compound keys encode worktree root — extract root + relative
-        // path for hashing. Legacy plain-path entries use projectRoot as-is.
-        // Bridge stores REPO-RELATIVE path (e2e contract #38): the compound
-        // form is internal to the registry, not persisted.
+        // #190: the bridge persists the FULL compound key (worktree-root::rel)
+        // so recovery can be worktree-isolated (#37 property), and the
+        // REGISTRY'S STORED hash — the verifier is the authority (#38), and a
+        // disk re-hash at write time would let a post-PASS edit masquerade as
+        // verified in the now-live bridge. Legacy plain-path entries fall
+        // back to a disk hash (write-side safety only; recovery drops
+        // non-compound entries fail-closed).
         const parsed = parseCompoundKey(f);
         if (parsed) {
-          verifiedFiles.push({ path: parsed.path, hash: hashFile(parsed.root, parsed.path) });
+          verifiedFiles.push({ path: f, hash: verifiedSet.get(f) ?? hashFile(parsed.root, parsed.path) });
         } else {
           verifiedFiles.push({ path: f, hash: hashFile(projectRoot, f) });
         }
@@ -135,6 +195,54 @@ function readBridge(): { status: string; verified_files: VerifiedFile[] } | null
 function clearBridge(): void {
   try { if (existsSync(bridgePath())) unlinkSync(bridgePath()); } catch { /* best-effort */ }
 } // #5673: scope verifier to diff files, not full repo
+
+// ── Bridge recovery (#190) ────────────────────────────
+// The bridge is a cross-process recovery channel: any session/process that
+// merges a PASS writes it (full-set snapshot of its verifiedSet). Recovery
+// merges back only entries that (a) belong to the CURRENT worktree root
+// (compound-key isolation, #37) and (b) whose STORED hash still matches disk
+// (match-or-drop — never re-hash: a post-PASS edit must fail closed, not be
+// re-blessed from disk). Stale/cross-root entries are inert, so the bridge
+// is safe to leave in place across session shutdowns — clearBridge is NOT
+// called on session_shutdown (a sub-agent's shutdown must not delete the
+// parent's bridge; print-mode sub-agents fire session_shutdown on exit).
+let lastRecoveryMtime = 0;
+
+function recoverBridgeForRoot(normRoot: string): number {
+  try {
+    const st = statSync(bridgePath());
+    // Perf guard: skip when the bridge hasn't been written since our last
+    // recovery — nothing new to recover (mtime granularity edge cases are
+    // fail-closed: a skipped recovery just means a re-block + re-verify).
+    if (st.mtimeMs <= lastRecoveryMtime) return 0;
+    lastRecoveryMtime = st.mtimeMs;
+  } catch {
+    // No bridge (or unreadable) — nothing to recover. Corrupt JSON is
+    // handled inside readBridge (returns null).
+    return 0;
+  }
+  const bridge = readBridge();
+  if (!bridge || bridge.status !== "PASS") return 0;
+  let recovered = 0;
+  for (const vf of bridge.verified_files) {
+    try {
+      const parsed = parseCompoundKey(vf.path);
+      if (!parsed || parsed.root !== normRoot) continue; // foreign root — inert
+      // Match-or-drop: only merge when the stored (verifier-authoritative)
+      // hash still matches the file on disk. Never recompute a fresh hash.
+      if (vf.hash !== hashFile(parsed.root, parsed.path)) continue;
+      verifiedSet.set(vf.path, vf.hash);
+      blockAttempts.delete(vf.path);
+      recovered++;
+    } catch {
+      // Deleted/unhashable file — treat as no-match (fail-closed skip).
+    }
+  }
+  if (recovered > 0) {
+    console.log(`[verification-gate] 📂 Bridge recovery: merged ${recovered} verified files for this worktree`);
+  }
+  return recovered;
+}
 
 // ── Git operation patterns ────────────────────────────
 
@@ -407,23 +515,20 @@ export default function (pi: ExtensionAPI) {
   // ── session_start ──────────────────────────────────
   pi.on("session_start", async (_event, _ctx) => {
     verifiedSet.clear();
-    // Recover verification state from bridge file (survives reloads)
-    const bridge = readBridge();
-    if (bridge && bridge.status === "PASS") {
-      for (const vf of bridge.verified_files) {
-        // #37: only recover compound-keyed entries (worktree-root::relative-path).
-        // Legacy plain-path entries are skipped — without a worktree root they
-        // cannot be matched against the current session, and blindly loading
-        // them would risk cross-worktree hash contamination.
-        if (vf.path.includes(COMPOUND_SEP)) {
-          verifiedSet.set(vf.path, vf.hash);
-        }
-      }
-      console.log(`[verification-gate] 📂 Recovered ${verifiedSet.size} verified files from bridge`);
+    // #190: recover verification state from the bridge, root-filtered + stored-
+    // hash match-or-drop. (Replaces the blind loader — the bridge now persists
+    // compound keys with verifier-authoritative hashes.)
+    const sessionRoot = normalizeWorktreeRoot(resolveGitRoot(process.cwd()));
+    const recovered = recoverBridgeForRoot(sessionRoot);
+    if (recovered > 0) {
+      console.log(`[verification-gate] 📂 Recovered ${recovered} verified files from bridge`);
     }
+    lastRecoveryMtime = 0;
     vgateFailures = 0;
     lastBlockedCwd = null;
+    lastBlockedFiles = [];
     pendingRehash = null;
+    pendingRehashFiles = [];
     blockAttempts.clear();
 
     // Detect: disabled when no write/edit capability or opt-out
@@ -441,10 +546,14 @@ export default function (pi: ExtensionAPI) {
   // ── session_shutdown ───────────────────────────────
   pi.on("session_shutdown", async (_event, _ctx) => {
     verifiedSet.clear();
-    clearBridge();
+    // #190: clearBridge is intentionally NOT called here. The bridge is the
+    // cross-process recovery channel; a sub-agent's shutdown (print-mode pi -p
+    // fires session_shutdown on exit) must not delete the parent's bridge, and
+    // D1's stored-hash match-or-drop makes any stale entry inert (fail-closed).
     lastBlockedCwd = null;
     lastBlockedFiles = [];
     pendingRehash = null;
+    pendingRehashFiles = [];
   });
 
   // ── tool_call: block git/gh ops ────────────────────
@@ -467,17 +576,21 @@ export default function (pi: ExtensionAPI) {
     // #7574: re-hash verified files if a prior git commit was allowed.
     // lint-staged (pre-commit hook) may have modified files (ESLint --fix),
     // changing their hashes. Capture the post-lint state before the next check.
+    // #190: narrowed to the allowed commit's files (pendingRehashFiles) — only
+    // those could have been touched by lint-staged; re-hashing the whole root
+    // would re-bless unrelated verified files from disk.
     if (pendingRehash !== null) {
       const rehashRoot = pendingRehash;
       pendingRehash = null;
+      const rehashFiles = pendingRehashFiles;
+      pendingRehashFiles = [];
       const normRehashRoot = normalizeWorktreeRoot(rehashRoot);
       let rehashed = 0;
-      for (const [key] of verifiedSet) {
-        // #37: only re-hash entries belonging to this worktree.
-        const parsed = parseCompoundKey(key);
-        if (!parsed || parsed.root !== normRehashRoot) continue;
+      for (const f of rehashFiles) {
+        const key = compoundKey(normRehashRoot, normalizeRegistryPath(rehashRoot, f));
+        if (!verifiedSet.has(key)) continue;
         try {
-          verifiedSet.set(key, hashFile(parsed.root, parsed.path));
+          verifiedSet.set(key, hashFile(normRehashRoot, normalizeRegistryPath(rehashRoot, f)));
           rehashed++;
         } catch { /* file may have been deleted */ }
       }
@@ -491,6 +604,11 @@ export default function (pi: ExtensionAPI) {
     const inputCwd = event.input.cwd ? String(event.input.cwd) : process.cwd();
     const cdPath = extractCdPath(command);
     const cwd = resolveGitRoot(cdPath ?? inputCwd);
+
+    // #190: mid-session bridge recovery — defense-in-depth for the incident's
+    // event-miss class (a merge that landed via another path, e.g. a sub-agent's
+    // own tool_result handler, becomes visible at the next git op).
+    recoverBridgeForRoot(normalizeWorktreeRoot(cwd));
 
     // Compute diff
     let changedFiles: string[];
@@ -558,6 +676,9 @@ export default function (pi: ExtensionAPI) {
       // Use commit-only pattern — push does NOT trigger lint-staged.
       if (isGitCommit(command)) {
         pendingRehash = cwd;
+        // #190: narrow the rehash to the files of the allowed commit — only
+        // those could have been modified by lint-staged.
+        pendingRehashFiles = [...changedFiles];
       }
       return undefined;
     }
@@ -667,12 +788,26 @@ export default function (pi: ExtensionAPI) {
         lastBlockedFiles = [];
         return undefined;
       }
-      const hasPass = /(?:^|\n)\s*PASS/i.test(textContent) || /✅.*PASS/i.test(textContent);
+      // #190: hasPass parity with hasFail — list/bold markers (-, *, **, ***)
+      // and a word boundary so PASSED/PASSES never match (the fail-open branch
+      // below still rescues genuinely unparseable-but-verifier-intent responses).
+      const hasPass = /(?:^|\n)\s*(?:[-*•]|\d+\.)?\s*\*{0,3}PASS(?:\b|:|—)/i.test(textContent)
+        || /✅.*PASS(?:\b|:|—)/i.test(textContent);
 
       if (hasPass) {
-        // Extract file list and project root from the prompt
+        // #190: wrong-root guard — a prompt whose explicit `Project root:`
+        // realpath-differs from the stashed block cwd targets a different
+        // worktree; the stale block context must not shadow it (or every
+        // proactive dispatch in worktree B would zero-merge against A's stale
+        // state and recreate the blocked-until-auto-bypass loop).
+        const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
+        if (foreign) lastBlockedFiles = []; // stale context — do not filter against it
+        const normRoot = normalizeWorktreeRoot(projectRoot);
+
+        // Extract file list from the prompt. #190: broadened regex accepts
+        // `\n\nClassification:` and no-period separators (incident dispatch #1).
         // Format: "[VGATE] verify files: path1 path2. Classification: ... Project root: /path"
-        const fileMatch = prompt.match(/verify files:\s*(.+?)(?=\.\s+Classification:|\.\s+Project root:|$)/);
+        const fileMatch = prompt.match(/verify files:\s*(.+?)(?=(?:\.|\n)\s*(?:Classification:|Project root:|$))/);
         const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
         // Expand directory paths: if a path ends with / or doesn't contain a dot,
         // treat it as a directory and include all staged files under that directory.
@@ -687,15 +822,25 @@ export default function (pi: ExtensionAPI) {
             promptFiles.add(f);
           }
         }
-        const projectRoot = resolveProjectRoot(lastBlockedCwd, prompt);
-        const normRoot = normalizeWorktreeRoot(projectRoot);
 
-        // #5673: filter to only files in the blocked diff (not full repo scan)
-        // #37: use compound keys for comparison.
-        const blockedSet = new Set(lastBlockedFiles);
-        const filteredPromptFiles = lastBlockedFiles.length > 0
-          ? [...promptFiles].filter(f => blockedSet.has(normalizeRegistryPath(projectRoot, f)))
-          : [...promptFiles];
+        // #190: bounded fallback — zero prompt files (format deviation) with a
+        // genuine `verify files:` dispatch and a block context merges the
+        // blocked diff (the gate-generated prompt names exactly those files).
+        // The literal marker bounds this to file-verification dispatches; a
+        // paraphrase without it stays blocked (fail-closed). Never applies to
+        // the JSON branch (a JSON PASS names its files in verified_files).
+        let mergeFiles: string[];
+        if (promptFiles.size === 0 && lastBlockedFiles.length > 0 && /verify files:/i.test(prompt)) {
+          mergeFiles = [...lastBlockedFiles];
+          console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${lastBlockedFiles.length} blocked files`);
+        } else {
+          mergeFiles = [...promptFiles];
+        }
+
+        // #190: shared diff-scoping — blocked-context filter (#5673) or, when
+        // the context is empty/foreign, staged-diff scoping (never a blind
+        // pass-through; known registry keys stay mergeable per #38).
+        const { kept: filteredPromptFiles, skipped } = scopeFiles(mergeFiles, projectRoot, lastBlockedFiles, verifiedSet);
         let merged = 0;
         for (const file of filteredPromptFiles) {
           try {
@@ -709,14 +854,16 @@ export default function (pi: ExtensionAPI) {
             // file may not exist at expected path — skip
           }
         }
-        const skipped = promptFiles.size - filteredPromptFiles.length;
         if (merged > 0) {
-          console.log(`[verification-gate] ✅ Plain-text PASS — merged ${merged}/${promptFiles.size} files from prompt${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
-          writeBridge(resolveProjectRoot(lastBlockedCwd, prompt), Array.from(verifiedSet.keys()));
+          console.log(`[verification-gate] ✅ Plain-text PASS — merged ${merged}/${mergeFiles.length} files from prompt${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
+          writeBridge(projectRoot, Array.from(verifiedSet.keys()));
+          lastBlockedCwd = null; // consume on successful merge (#5607)
         } else {
-          console.error(`[verification-gate] ⚠️ Plain-text PASS but could not hash any files (${promptFiles.size} in prompt)`);
+          // #190: zero-merge does NOT consume the block context — a retry
+          // dispatch still needs lastBlockedCwd/lastBlockedFiles (a malformed
+          // first dispatch must not erase the state the retry depends on).
+          console.error(`[verification-gate] ⚠️ Plain-text PASS but could not hash any files (${mergeFiles.length} in scope)`);
         }
-        lastBlockedCwd = null; // consume: avoid stale cwd shadowing a later manual verifier dispatch (#5607)
         return undefined;
       }
 
@@ -724,7 +871,9 @@ export default function (pi: ExtensionAPI) {
       // ponytail: fail-open — if verifier is unparseable, extract files from prompt
       // and mark them as verified anyway. Better to allow the commit than
       // block on a model JSON-compliance issue (#5724).
-      const fileMatch = prompt.match(/verify files:\s*(.+?)(?=\.\s+Classification:|\.\s+Project root:|$)/);
+      // #190: broadened regex + wrong-root guard + staged-diff scoping, same as
+      // the plain-text branch (never a blind pass-through).
+      const fileMatch = prompt.match(/verify files:\s*(.+?)(?=(?:\.|\n)\s*(?:Classification:|Project root:|$))/);
       const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
       const promptFiles = new Set<string>();
       for (const f of rawFiles) {
@@ -738,10 +887,12 @@ export default function (pi: ExtensionAPI) {
         }
       }
       if (promptFiles.size > 0) {
-        const projectRoot = resolveProjectRoot(lastBlockedCwd, prompt);
+        const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
+        if (foreign) lastBlockedFiles = [];
         const normRoot = normalizeWorktreeRoot(projectRoot);
+        const { kept: scopedFiles } = scopeFiles([...promptFiles], projectRoot, lastBlockedFiles, verifiedSet);
         let merged = 0;
-        for (const file of promptFiles) {
+        for (const file of scopedFiles) {
           try {
             const relPath = normalizeRegistryPath(projectRoot, file);
             const key = compoundKey(normRoot, relPath);
@@ -752,7 +903,7 @@ export default function (pi: ExtensionAPI) {
         }
         if (merged > 0) {
           console.log(`[verification-gate] ⚠️ Verifier unparseable — fail-open: merged ${merged}/${promptFiles.size} files from prompt`);
-          writeBridge(resolveProjectRoot(lastBlockedCwd, prompt), Array.from(verifiedSet.keys()));
+          writeBridge(projectRoot, Array.from(verifiedSet.keys()));
           vgateFailures = 0;
           lastBlockedCwd = null;
           return undefined;
@@ -787,24 +938,37 @@ export default function (pi: ExtensionAPI) {
 
     // #5673/#7595: merge verifier files into the registry. Keys are normalized
     // to repo-relative; known paths always update (re-verification is authoritative).
-    const projectRoot = resolveProjectRoot(lastBlockedCwd, prompt);
-    const { merged, skipped } = mergeVerifiedFiles(verifiedSet, blockAttempts, result.verified_files, projectRoot, lastBlockedFiles);
+    // #190: wrong-root guard + shared diff-scoping — empty/foreign context scopes
+    // against the current staged diff, never a blind pass-through.
+    const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
+    if (foreign) lastBlockedFiles = []; // stale block context — do not filter against it
+    const { kept: scopedVerifiedFiles, skipped: scopeSkipped } = scopeFiles(
+      result.verified_files.map(vf => vf.path),
+      projectRoot,
+      lastBlockedFiles,
+      verifiedSet
+    );
+    const scopedResults = result.verified_files.filter(vf => scopedVerifiedFiles.includes(vf.path));
+    const { merged, skipped } = mergeVerifiedFiles(verifiedSet, blockAttempts, scopedResults, projectRoot, lastBlockedFiles);
+    const totalSkipped = skipped + scopeSkipped;
 
     // #132 A.5: only a merge proves dispatch health. A zero-merge PASS (all files
     // skipped as not-in-diff, or empty verified_files) must NOT reset the failure
     // streak — it would mask a broken verifier. Precedent: index.ts:642/686.
     if (merged > 0) {
       vgateFailures = 0;
-      console.log(`[verification-gate] ✅ Merged ${merged} verified files${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
+      console.log(`[verification-gate] ✅ Merged ${merged} verified files${totalSkipped > 0 ? ` (skipped ${totalSkipped} not in diff)` : ''} (${verifiedSet.size} total)`);
       // Write bridge file so future sessions/sub-agents can see verification status
       const verifiedPaths = Array.from(verifiedSet.keys());
       if (verifiedPaths.length > 0) {
         writeBridge(projectRoot, verifiedPaths);
       }
+      lastBlockedCwd = null; // consume on successful merge (#5607)
     } else {
-      console.error(`[verification-gate] ⚠️ PASS but merged 0 files${skipped > 0 ? ` (${skipped} skipped as not in diff)` : ' (empty verified_files)'} — failure streak NOT reset (#132)`);
+      // #190: zero-merge does NOT consume the block context — a retry dispatch
+      // still needs lastBlockedCwd/lastBlockedFiles.
+      console.error(`[verification-gate] ⚠️ PASS but merged 0 files${totalSkipped > 0 ? ` (${totalSkipped} skipped as not in diff)` : ' (empty verified_files)'} — failure streak NOT reset (#132)`);
     }
-    lastBlockedCwd = null; // consume on successful merge
     return undefined;
   });
 
