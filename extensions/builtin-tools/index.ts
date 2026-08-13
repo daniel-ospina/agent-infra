@@ -41,6 +41,7 @@ import { resolve, dirname } from "node:path";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
+import { isPrintMode } from "../shared/print-mode.js";
 import { retry, createCircuitBreaker } from "../shared/retry.js";
 import { register } from "../shared/health.js";
 import { treeKill } from "../shared/tree-kill.js";
@@ -1646,7 +1647,7 @@ export default function (pi: ExtensionAPI) {
   LOOP_ENFORCER_DISABLED: "1",
   // #172: declare print mode so extension startup diagnostics stay silent in
   // sub-agents — extensions gate banners / approval forwarding / socket
-  // receivers on `PI_MODE !== 'print'`, but pi itself never sets PI_MODE (only
+  // receivers on `isPrintMode()`, but pi itself never sets PI_MODE (only
   // swarm_daemon does). Without this, every task sub-agent emitted
   // "⏭️ Disabled — SLACK_BRIDGE_DISABLE=1" + approval lines (22× observed).
   PI_MODE: "print",
@@ -1760,7 +1761,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // #5672: suppress startup banner in print mode (task sub-agent output)
-  if (process.env.PI_MODE !== 'print') {
+  if (!isPrintMode()) {
     console.log("[builtin-tools] Registered: web_search, web_fetch, todo_write, task");
   }
 }

@@ -10,6 +10,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { register, getReport, registerExternal } from "../shared/health.js";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
+import { isPrintMode } from "../shared/print-mode.js";
 
 const EXTENSIONS_DIR = join(import.meta.dirname || __dirname, "..");
 
@@ -47,7 +48,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     // #5672: suppress startup banner in print mode (task sub-agent output)
-    if (process.env.PI_MODE !== 'print') {
+    if (!isPrintMode()) {
       console.log("[health-check] ✅ Loaded");
     }
   } catch (err: any) {

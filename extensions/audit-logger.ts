@@ -5,6 +5,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
+import { isPrintMode } from "./shared/print-mode.js";
 
 const AUDIT_DIR = `${homedir()}/.pi/agent/audit`;
 const AUDIT_FILE = `${AUDIT_DIR}/audit.jsonl`;
@@ -51,7 +52,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // #5672: suppress startup banner in print mode (task sub-agent output)
-  if (process.env.PI_MODE !== 'print') {
+  if (!isPrintMode()) {
     console.log("[audit-logger] ✅ Loaded — logging to ~/.pi/agent/audit/audit.jsonl");
   }
 }

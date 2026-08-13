@@ -6,7 +6,8 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
-// ponytail: register inlined — flat-file extensions can't resolve sibling imports (#5611)
+import { isPrintMode } from "./shared/print-mode.js";
+// ponytail: register inlined — flat extensions CAN resolve ./shared/* (verified 2026-08-13; #5611 constraint stale)
 // ── Skill read persistence across sessions ──────────
 // ponytail: persist readFiles to ~/.pi/agent/skill-reads.json.
 // Restore on session_start for reads in the last 24h. Eliminates
@@ -432,7 +433,7 @@ export default function (pi: ExtensionAPI) {
   } catch { /* fail-open — health-check falls back to filesystem discovery */ }
 
   // #5672: suppress startup banner in print mode (task sub-agent output)
-  if (process.env.PI_MODE !== 'print') {
+  if (!isPrintMode()) {
     const totalGates = Object.keys(MANIFEST).length;
     console.log(`[skill-enforcer] ✅ Loaded — enforcing ${totalGates} skill gates from manifest`);
   }

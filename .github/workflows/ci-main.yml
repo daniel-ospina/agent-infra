@@ -33,6 +33,17 @@ jobs:
             echo "== $t =="
             node "$t" || failures=$((failures+1))
           done
+          # shared/print-mode tests: the isPrintMode helper gates 17 sites (#228).
+          # print-mode.test.ts covers helper logic; print-mode-wiring.test.ts
+          # enforces the 0-raw-reads acceptance repo-wide; auto-sync.test.ts
+          # exercises the FLAT-extension ./shared/ import path (the bug class
+          # that shipped 2 files during this refactor's development).
+          echo "== extensions/shared/print-mode.test.ts =="
+          npx tsx extensions/shared/print-mode.test.ts || failures=$((failures+1))
+          echo "== extensions/shared/print-mode-wiring.test.ts =="
+          npx tsx extensions/shared/print-mode-wiring.test.ts || failures=$((failures+1))
+          echo "== extensions/auto-sync.test.ts =="
+          npx tsx extensions/auto-sync.test.ts || failures=$((failures+1))
           if [ $failures -gt 0 ]; then
             echo "❌ $failures extension test file(s) failed"
             exit 1

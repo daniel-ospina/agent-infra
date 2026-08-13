@@ -38,8 +38,10 @@
  * inject forged life signs; an ambient TASK_HEARTBEAT=1 in a user's shell
  * can't produce the nonce either.
  *
- * Self-contained by necessity: root-level flat extensions cannot resolve
- * sibling imports (#5611) — only the ExtensionAPI type is imported (erased at
+ * Self-contained by default: only the ExtensionAPI type is imported (erased at
+ * runtime, so tests can import this file without mocks). NOTE: flat extensions
+ * CAN resolve ./shared/* (verified 2026-08-13; the #5611 sibling-import constraint
+ * is stale for the current jiti/static loader).
  * runtime, so tests can import this file without mocks).
  *
  * Marker format is drift-guarded against the parent parser by E14 in
