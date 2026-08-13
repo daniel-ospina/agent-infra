@@ -4,7 +4,7 @@
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { realpathSync, existsSync } from "node:fs";
-import { classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo } from "./classify-git.mjs";
+import { classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, isAllowMarkerValid } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -205,6 +205,29 @@ const expectedMainCO = RUN_IS_MAIN ? cwdBranch : null;
 const mainCO = getMainCheckoutBranch();
 console.log(`\ngetMainCheckoutBranch() = ${mainCO} (expect "${expectedMainCO}")`);
 mainCO === expectedMainCO ? pass++ : fail++;
+
+// ── #207: TTL'd file-based escape marker ───────────────────────────────────
+// Pure TTL check: fresh marker valid; expired invalid; absent invalid;
+// directories never count (traversal guard); mtime-only semantics.
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+const markerDir = mkdtempSync(resolve(tmpdir(), "guard-marker-"));
+const marker = resolve(markerDir, ".allow-main-edits");
+writeFileSync(marker, "reason\n");
+const TTL = 15 * 60_000;
+let mp = isAllowMarkerValid(marker, Date.now() + 1000, TTL);
+console.log(`marker fresh = ${mp} (expect true)`);
+mp === true ? pass++ : fail++;
+mp = isAllowMarkerValid(marker, Date.now() + TTL + 1000, TTL);
+console.log(`marker expired = ${mp} (expect false)`);
+mp === false ? pass++ : fail++;
+mp = isAllowMarkerValid(resolve(markerDir, "nope"), Date.now() + 1000, TTL);
+console.log(`marker absent = ${mp} (expect false)`);
+mp === false ? pass++ : fail++;
+mp = isAllowMarkerValid(markerDir, Date.now() + 1000, TTL); // a directory
+console.log(`marker as directory = ${mp} (expect false — traversal guard)`);
+mp === false ? pass++ : fail++;
+rmSync(markerDir, { recursive: true, force: true });
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

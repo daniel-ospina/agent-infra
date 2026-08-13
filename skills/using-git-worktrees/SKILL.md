@@ -246,6 +246,20 @@ Ready to implement <feature-name>
   3. **Liveness marker** — the launched process must emit a periodic heartbeat (timestamped line) so a stalled worker is distinguishable from a dead one.
 - **Sanctioned alternative:** the terminal one-liner above (no pi involved).
 
+### TTL'd escape marker — deliberate SOLO sessions can escalate mid-session (#207)
+
+The env hatch (`AGENT_ALLOW_MAIN_EDITS=1`) cannot be set on a running pi process. A **deliberate solo session** that owns the machine can grant itself the same bypass for a bounded window:
+
+```bash
+touch ~/.pi/agent/.allow-main-edits          # 15-minute TTL, re-read per tool_call
+echo "recovering stranded main checkout" >> ~/.pi/agent/.allow-main-edits   # reason (audit trail)
+```
+
+- **TTL:** the marker expires 15 minutes after its last modification — expiry is checked per tool_call (never cached), so a forgotten marker self-revokes.
+- **Never automatic for parallel sessions:** the marker only affects sessions running on the same machine/user; it never applies to other agents automatically.
+- **Traversal-guarded:** only a regular file counts — a directory or symlink at the path is ignored (fail-closed).
+- **Cleanup:** `rm ~/.pi/agent/.allow-main-edits` after the operation (the TTL would do it anyway).
+
 ### Missing MCP tools in worktree sessions (NVIDIA, Supabase, etc.)
 
 - **Problem:** `.mcp.json` is gitignored (contains embedded API keys) and is therefore absent from all worktrees. When Claude Code is opened in a worktree directory, no MCP servers register → `issue-scoping`, `code-review`, `prototype-review` and any skill that routes to NVIDIA falls back to Claude sub-agents.
