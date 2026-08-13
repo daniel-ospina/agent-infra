@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
+import { isPrintMode } from "../shared/print-mode.js";
 // ponytail: inlined from verification-gate-utils.ts — pi's extension loader treats every .ts in
 // ~/.pi/agent/extensions/ as an extension and fails on a pure-helper module (no factory export).
 // Do NOT re-extract to a sibling .ts; the directory+entry pattern (see main-worktree-guard) is the

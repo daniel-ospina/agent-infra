@@ -23,8 +23,9 @@
 // (tool_call only) — extension-level pulls are outside it, same class as
 // auto-sync.ts; observable via log lines + AGENT_REPO_FRESHNESS_DISABLED=1.
 //
-// Self-contained by necessity: root-level flat extensions cannot resolve
-// sibling imports (#5611) — only the ExtensionAPI type is imported.
+// Self-contained by default: only the ExtensionAPI type is imported — except
+// shared helpers (./shared/print-mode.js; the #5611 sibling-import constraint
+// is stale for the current jiti/static loader, verified 2026-08-13).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";

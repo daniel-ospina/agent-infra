@@ -40,6 +40,7 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
+import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
 
 // Dual-support: check AGENT_* first, then ELDATO_* (Phase 1 — #7549)
 function _getEnv(name: string): string | undefined {
@@ -153,7 +154,7 @@ const SEQUENCE_TIMEOUT_MS = 10 * 60 * 1000;
 export function handleSequenceTimeout(): void {
   const top = topSkill();
   if (!top) return;
-  if (isPrintMode()) {
+  if (isPrintModeEnv()) {
     console.log(`[sequence-enforcer] ⏰ Sequence timeout — parking "${top.path}" at step ${top.stepIndex} (10min no tool calls) — state preserved`);
     auditLog({ ts: new Date().toISOString(), event: "timeout_park", skill: top.path, step: top.stepIndex, mode: resolveMode() });
     // park: keep stack/stepIndex/reviewers intact, re-arm the timer
@@ -205,7 +206,7 @@ export function resolveMode(
     const line = readFileSync(modeFile, "utf-8").split("\n")[0]!.trim();
     if (line === "warn" || line === "gate" || line === "strict") return line;
   } catch { /* file doesn't exist or unreadable */ }
-  return isPrintMode(env) ? "warn" : "gate";
+  return isPrintModeEnv(env) ? "warn" : "gate";
 }
 // ── Audit logging ──────────────────────────────────
 

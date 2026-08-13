@@ -3,7 +3,7 @@
  * Run: npx tsx extensions/shared/print-mode.test.ts
  */
 
-import { isPrintMode } from "./print-mode.js";
+import { isPrintMode, isPrintModeEnv } from "./print-mode.js";
 import { ok, equal } from "node:assert/strict";
 
 // env set (builtin-tools spawn path)
@@ -24,6 +24,17 @@ equal(isPrintMode({ PI_MODE: undefined }, ["pi"]), false, "seam: env unset no fl
 equal(isPrintMode({ PI_MODE: undefined }, ["pi", "-p"]), true, "bare pi -p → true");
 // argv without -p but with other flags
 equal(isPrintMode({}, ["pi", "-v"]), false, "-v is not print mode");
+// argv false-positive guard (review P3): -p as a VALUE-taking flag's value is NOT print
+equal(isPrintMode({}, ["pi", "--model", "-p", "hello"]), false, "--model -p → -p is a value, not print");
+equal(isPrintMode({}, ["pi", "--name", "--print"]), false, "--name --print → --print is a value, not print");
+equal(isPrintMode({}, ["pi", "-e", "-p"]), false, "-e -p → -p is an extension path value");
+// real print flag after a value-taking flag
+equal(isPrintMode({}, ["pi", "--model", "gpt", "-p"]), true, "flag after value-taking flag → print");
+
+// isPrintModeEnv — env-only (sequence-enforcer #201 semantic decisions)
+equal(isPrintModeEnv({ PI_MODE: "print" }), true, "env-only: print → true");
+equal(isPrintModeEnv({}), false, "env-only: unset → false");
+equal(isPrintModeEnv({ PI_MODE: "gate" }), false, "env-only: gate → false");
 
 ok(true, "all isPrintMode cases pass");
 console.log("print-mode.test OK");

@@ -13,18 +13,60 @@
  *   1. env.PI_MODE === "print"  — set by builtin-tools/swarm_daemon for their
  *      spawned children (env-first precedence: those children MUST be treated
  *      as print mode even when their argv lacks -p/--print).
- *   2. argv includes "-p" or "--print" — the bare `pi -p` case (the #172
- *      regression the env-only check missed).
+ *   2. argv "-p"/"--print" — the bare `pi -p` case (the #172 regression the
+ *      env-only check missed).
  *
  * The env and argv params are test seams (mirrors the sequence-enforcer
  * resolveMode seam and repo-freshness exported-internals pattern); runtime
  * callers use the defaults.
+ *
+ * isPrintModeEnv(): env-only variant. #201 decision: sequence-enforcer's
+ * SEMANTIC mode decisions (resolveMode gate/warn, timeout park/pop) are scoped
+ * to the env marker — task sub-agents / swarm_daemon workers set PI_MODE=print
+ * and cannot dispatch reviewer sub-agents (hence warn/park); a bare shell
+ * `pi -p` CAN dispatch `task` and was decided to keep gate. argv-detection at
+ * those sites would silently flip shell-spawned headless sessions to warn.
+ * Output/silence gates (banners, pulls, audit logs) use the argv-aware
+ * isPrintMode(); semantic mode decisions use isPrintModeEnv().
  */
+
+const VALUE_TAKING_FLAGS = new Set([
+  "--provider", "--model", "--api-key", "--system-prompt", "--name",
+  "--session", "--session-id", "--fork", "--session-dir", "--models",
+  "--tools", "--exclude-tools", "--thinking", "--export", "--extension",
+  "-e", "--skill", "--prompt-template", "--theme", "--tui-mode",
+  "--list-models",
+]);
+
+/**
+ * True when argv contains the print-mode flag. Mirrors pi's parser: a token
+ * following a value-taking flag is that flag's VALUE, never a flag itself —
+ * `pi --model -p hello` parses model="-p" with print=false (interactive), so
+ * the helper must NOT treat that "-p" as print mode (issue #228 review P3).
+ */
+function argvHasPrintFlag(argv: string[]): boolean {
+  for (let i = 1; i < argv.length; i++) {
+    const tok = argv[i];
+    if (VALUE_TAKING_FLAGS.has(tok)) {
+      i++; // skip the flag's value
+      continue;
+    }
+    if (tok === "-p" || tok === "--print") return true;
+  }
+  return false;
+}
 
 export function isPrintMode(
   env: Record<string, string | undefined> = process.env,
   argv: string[] = process.argv,
 ): boolean {
   if (env.PI_MODE === "print") return true;
-  return argv.includes("-p") || argv.includes("--print");
+  return argvHasPrintFlag(argv);
+}
+
+/** Env-only variant — for semantic mode decisions (see header #201 note). */
+export function isPrintModeEnv(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.PI_MODE === "print";
 }
