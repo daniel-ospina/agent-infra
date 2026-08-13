@@ -526,6 +526,30 @@ try {
     slackBridge(stubPiP);
     assert(handlersP.has("session_start") && handlersP.has("session_shutdown"),
       "#172(print+thread): bridge hooks still register for Slack-spawned sessions");
+
+    // Regression (#172, 2026-08-13): a REAL `pi -p` one-shot has NO
+    // PI_MODE env (pi parses -p/--print into an internal flag, exports
+    // nothing — cli/args.js) and must still be detected as print mode via
+    // argv, otherwise every task sub-agent enabled Socket Mode + bridge
+    // hooks and logged error/1006 pairs in every session.
+    handlersP.clear();
+    logs.length = 0;
+    delete process.env.PI_MODE;
+    delete process.env.SLACK_BRIDGE_THREAD_TS;
+    delete process.env.SLACK_BRIDGE_TEAM;
+    const argvBackup = process.argv.slice();
+    process.argv.push("-p");
+    try {
+      slackBridge(stubPiP);
+      assert(!handlersP.has("session_start"),
+        "#172(argv -p, no PI_MODE): no bridge hooks registered");
+      const sbLines3 = logs.filter((l) => l.includes("[slack-bridge]"));
+      assert(sbLines3.length === 0,
+        `#172(argv -p, no PI_MODE): zero [slack-bridge] output (got ${sbLines3.length})`);
+    } finally {
+      process.argv.length = 0;
+      process.argv.push(...argvBackup);
+    }
   } finally {
     console.log = origLog;
     console.error = origErr;
@@ -980,13 +1004,18 @@ try {
 // ── Approval forwarding: per-repo store discovery (#2492) ─────
 {
   const { repoNameFromUrl, deriveRepoName, approvalsStorePath, findApprovalsFile, gitRemoteTimeoutMs } = await import("./index.js");
+  const { loadScaledTimeoutMs, getSystemLoad } = await import("./socket-mode.js");
 
   // gitRemoteTimeoutMs — #196: env-overridable git-lookup cap (default 5s).
   // The 2s default flaked discovery on multi-second `git remote get-url` stalls.
+  // #209: the *implicit* default is load-aware; force scale-off for the
+  // deterministic "default 5000" assertions below.
   const prevGitTmo = process.env.GIT_REMOTE_TIMEOUT_MS;
+  const prevScaleOff = process.env.TASK_LOAD_SCALE_OFF;
   try {
+    process.env.TASK_LOAD_SCALE_OFF = "1";
     delete process.env.GIT_REMOTE_TIMEOUT_MS;
-    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: default 5000 (no env)");
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: default 5000 (no env, scale off)");
     process.env.GIT_REMOTE_TIMEOUT_MS = "5000";
     assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: env override respected");
     process.env.GIT_REMOTE_TIMEOUT_MS = "abc";
@@ -1004,6 +1033,24 @@ try {
   } finally {
     if (prevGitTmo === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
     else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTmo;
+    if (prevScaleOff === undefined) delete process.env.TASK_LOAD_SCALE_OFF;
+    else process.env.TASK_LOAD_SCALE_OFF = prevScaleOff;
+  }
+
+  // #209: load-aware shell-out timeout scaling (deterministic — explicit load).
+  {
+    const prevScaleOff2 = process.env.TASK_LOAD_SCALE_OFF;
+    try {
+      delete process.env.TASK_LOAD_SCALE_OFF;
+      assert(loadScaledTimeoutMs(5000, 0) === 5000, "loadScaledTimeoutMs: load <8 → 1x (5000)");
+      assert(loadScaledTimeoutMs(5000, 8) === 10000, "loadScaledTimeoutMs: load 8–15 → 2x (10000)");
+      assert(loadScaledTimeoutMs(5000, 16) === 15000, "loadScaledTimeoutMs: load ≥16 → 3x (15000)");
+      assert(loadScaledTimeoutMs(5000, 200) === 15000, "loadScaledTimeoutMs: bounded (3x ceiling, can't grow unbounded)");
+      assert(getSystemLoad() >= 0, "getSystemLoad: non-negative on this machine");
+    } finally {
+      if (prevScaleOff2 === undefined) delete process.env.TASK_LOAD_SCALE_OFF;
+      else process.env.TASK_LOAD_SCALE_OFF = prevScaleOff2;
+    }
   }
 
   // repoNameFromUrl — mirrors swarm _detect_repo parsing (last segment, .git stripped)

@@ -110,3 +110,4 @@ Both this skill and `project-workflow` gate standard/complex work — the differ
 - **Verifier quality over dispatch count.** 2 verifiers that actually review > 1 that says "looks good."
 - **Loop until clean.** Fix-and-reverify is the expected pattern. The gate stays locked until it's right.
 - **Proportional depth.** Complex issues get deeper research in issue-scoping. Standard gets lighter passes. The pipeline is the same; the sub-skills scale depth.
+- **Research path (issue #231 D11).** A standard/complex task's research = issue-scoping Phase 1.5's `### Axis Research`/`### Integration Docs` artifact (scoping stage) + writing-plans Step B's `### Pattern Research` re-derivation at the concrete plan level (planning stage). Both are fresh-query surfaces at their own granularity — the scoping artifact is PRIOR_RESEARCH for planning, never a substitute.

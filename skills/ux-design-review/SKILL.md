@@ -24,7 +24,7 @@ Before planning begins, classify whether each proposed change involves a UX deci
 | `epic-workflow` | Between Stage 3 (Scope) and Stage 4 (Plan) | `UX_RATING ≥ medium` |
 | `project-workflow` | Between Scope and Plan (proportional) | `UX_RATING ≥ medium` |
 | `writing-plans` | After prerequisite check, before draft plan | Non-Micro + touches UI files |
-| `issue-scoping` | Phase 1.5a companion | `UX_RATING ≥ medium` |
+| `issue-scoping` | Phase 3 companion (UX Prototype Gate) | `UX_RATING ≥ medium` |
 
 **Skip when:** Micro tier, pure backend/data/config changes, documentation-only, or `UX_RATING = low`.
 
@@ -102,7 +102,7 @@ Gate does NOT block — it surfaces and records. After decisions are recorded, h
 
 **Consumed by:** `epic-workflow`, `project-workflow`, `writing-plans`, `issue-scoping`  
 **References:** `question-format` (for presenting options), `human-input-framework` (for P0 escalation)  
-**Companion to:** `issue-scoping` Phase 1.5a (UX Prototype Gate) — prototype gate validates visual fidelity; design review classifies decisions
+**Companion to:** `issue-scoping` Phase 3 (UX Prototype Gate) — prototype gate validates visual fidelity; design review classifies decisions
 
 ## Anti-patterns
 
