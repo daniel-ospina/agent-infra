@@ -34,6 +34,7 @@ import {
   getHealth,
   bindSession,
   __setBridgeUrl,
+  gitRemoteTimeoutMs,
 } from "./index.js";
 
 // Resolve project root regardless of cwd — the test may be run from any directory.
@@ -81,6 +82,35 @@ let failed = 0;
 function assert(condition: boolean, label: string): void {
   if (condition) passed++;
   else { failed++; console.error(`❌ FAIL: ${label}`); }
+}
+
+// ── gitRemoteTimeoutMs — env-overridable git-lookup cap (#196 fold, #209) ──
+
+assert(gitRemoteTimeoutMs() === 10000, "gitRemoteTimeoutMs: default 10s (was hardcoded 2s)");
+
+const prevGitTimeout = process.env.GIT_REMOTE_TIMEOUT_MS;
+process.env.GIT_REMOTE_TIMEOUT_MS = "25000";
+try {
+  assert(gitRemoteTimeoutMs() === 25000, "gitRemoteTimeoutMs: env override read per call");
+} finally {
+  if (prevGitTimeout === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
+  else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTimeout;
+}
+
+process.env.GIT_REMOTE_TIMEOUT_MS = "abc";
+try {
+  assert(gitRemoteTimeoutMs() === 10000, "gitRemoteTimeoutMs: garbage → default");
+} finally {
+  if (prevGitTimeout === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
+  else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTimeout;
+}
+
+process.env.GIT_REMOTE_TIMEOUT_MS = "0";
+try {
+  assert(gitRemoteTimeoutMs() === 10000, "gitRemoteTimeoutMs: non-positive → default");
+} finally {
+  if (prevGitTimeout === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
+  else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTimeout;
 }
 
 /** Poll cond() until true or timeout (fire-and-forget HTTP needs a tick). */

@@ -10,6 +10,16 @@
 #   5. Writes manifest.json with point counts per graph
 #
 # Usage: bash scripts/daily-backup.sh [--keep N]
+#
+# Load gate (#209): BGSAVE is itself a storm igniter — the gate defers only
+# under PRE-EXISTING load. Entry preflight + pre-trigger re-check guard the
+# pre-trigger steps ONLY; once BGSAVE is in flight the script completes its
+# wait (a re-invoke would trigger a SECOND BGSAVE — aborting saves nothing).
+# Exit 3 = DEFERRED — re-invoke to complete (never a silent skip; the invoker
+# MUST re-invoke; a defer near one daily invocation can slip to the next ⇒
+# RPO ≤ 48h under sustained load — accepted trade for load safety).
+# Bypass: LOAD_GATE_FORCE=1 env (no script flag, scope-pinned).
+# See docs/ops/load-policy.md.
 
 set -euo pipefail
 
@@ -32,17 +42,87 @@ if ! [[ "$KEEP" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
+LOAD_GATE_MAX_WAIT_MIN="${LOAD_GATE_MAX_WAIT_MIN:-10}"
+
+# ── load gate (#209) ────────────────────────────────────────────────────────
+# Entry preflight BEFORE any pre-trigger step (mkdirs create state): same
+# entry rule as cron-quality-gates.sh — `check` (shouldSuspend) → go;
+# suspended → bounded poll (`check --deferred` every 60s up to
+# LOAD_GATE_MAX_WAIT_MIN; `0` = no poll); after the cap → exit 3 with a loud
+# defer log (accurate: nothing has run/been created yet).
+load_gate_entry() {
+  if [ "${LOAD_GATE_FORCE:-}" = "1" ]; then return 0; fi
+  local rc=0 out load1 suspend waited
+  out="$(node "$REPO_ROOT/scripts/load-gate.mjs" check --json 2>/dev/null)" || rc=$?
+  [ $rc -eq 0 ] && return 0
+  if [ $rc -ne 3 ]; then
+    echo "[load-gate] ERROR: gate helper failed (exit $rc) — aborting loudly" >&2
+    exit 1
+  fi
+  load1="$(printf '%s' "$out" | sed -n 's/.*"load1":\([0-9.e+-]*\).*/\1/p')"
+  suspend="$(printf '%s' "$out" | sed -n 's/.*"suspend":\([0-9.e+-]*\).*/\1/p')"
+  waited=0
+  while [ "$waited" -lt "$LOAD_GATE_MAX_WAIT_MIN" ]; do
+    sleep 60
+    waited=$((waited + 1))
+    if node "$REPO_ROOT/scripts/load-gate.mjs" check --deferred >/dev/null 2>&1; then
+      echo "[load-gate] resumed after ${waited} min poll (load < resume threshold)" >&2
+      return 0
+    fi
+  done
+  echo "[load-gate] DEFERRED — batch did NOT run; re-invoke after load < ${suspend:-?} (was ${load1:-?})" >&2
+  exit 3
+}
+
+# Pre-trigger re-check (immediately BEFORE the storm igniter): a single
+# `check`; the gate defers only under PRE-EXISTING load. Suspend → exit 3 with
+# the round-2 F6 wording — hedges the check→exec race (if BGSAVE somehow ran,
+# "re-invoke to complete copy" is still correct; exit-3 means "did not
+# complete; re-invoke").
+load_gate_pre_trigger_check() {
+  if [ "${LOAD_GATE_FORCE:-}" = "1" ]; then return 0; fi
+  local rc=0 out load1 suspend
+  out="$(node "$REPO_ROOT/scripts/load-gate.mjs" check --json 2>/dev/null)" || rc=$?
+  [ $rc -eq 0 ] && return 0
+  if [ $rc -ne 3 ]; then
+    echo "[load-gate] ERROR: gate helper failed (exit $rc) — aborting loudly" >&2
+    exit 1
+  fi
+  load1="$(printf '%s' "$out" | sed -n 's/.*"load1":\([0-9.e+-]*\).*/\1/p')"
+  suspend="$(printf '%s' "$out" | sed -n 's/.*"suspend":\([0-9.e+-]*\).*/\1/p')"
+  echo "[load-gate] DEFERRED — partial: BGSAVE may have run; re-invoke to complete copy (load ${load1:-?} ≥ suspend ${suspend:-?})" >&2
+  exit 3
+}
+
 # ── Ensure backup directories exist ──────────────────────────────
+# Entry gate runs BEFORE the mkdirs — a deferral here has created nothing.
+load_gate_entry
 mkdir -p "$BACKUP_DIR"
 mkdir -p "$OFFBOX_ROOT"
 
 # ── Step 1: Trigger BGSAVE ───────────────────────────────────────
+# Pre-trigger re-check: once BGSAVE fires below, the script NEVER aborts
+# (post-trigger completion; see header).
+load_gate_pre_trigger_check
 echo "[$(date '+%H:%M:%S')] Triggering BGSAVE on $CONTAINER..."
 docker exec "$CONTAINER" redis-cli -p "$REDIS_PORT" BGSAVE > /dev/null
 
 # Wait for BGSAVE to complete (poll LASTSAVE)
+# Post-trigger: NO abort (round-2 F2) — exit-3's "did NOT run; re-invoke"
+# contract is FALSE once BGSAVE is in flight (a re-invoke would be a SECOND
+# storm igniter). Optional warn-log; the wait completes regardless.
+LOAD_GATE_WARNED=0
 echo "[$(date '+%H:%M:%S')] Waiting for BGSAVE to complete..."
 for i in $(seq 1 30); do
+    if [ "$LOAD_GATE_WARNED" = "0" ] && [ "${LOAD_GATE_FORCE:-}" != "1" ]; then
+        lg_out="$(node "$REPO_ROOT/scripts/load-gate.mjs" check --json 2>/dev/null)" && lg_rc=0 || lg_rc=$?
+        if [ "$lg_rc" -ne 0 ]; then
+            lg_load="$(printf '%s' "$lg_out" | sed -n 's/.*"load1":\([0-9.e+-]*\).*/\1/p')"
+            lg_suspend="$(printf '%s' "$lg_out" | sed -n 's/.*"suspend":\([0-9.e+-]*\).*/\1/p')"
+            echo "[load-gate] WARN — load ${lg_load:-?} ≥ suspend ${lg_suspend:-?} during BGSAVE wait; completing (aborting would not save the in-flight save)" >&2
+            LOAD_GATE_WARNED=1
+        fi
+    fi
     LASTSAVE=$(docker exec "$CONTAINER" redis-cli -p "$REDIS_PORT" LASTSAVE 2>/dev/null || echo "0")
     # Check if there have been no changes since the BGSAVE we just triggered
     # by polling redis-cli INFO persistence
