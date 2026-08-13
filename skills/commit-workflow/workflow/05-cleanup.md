@@ -25,6 +25,37 @@ fi
 If cleanup fails: warn and continue. Never block Steps 4-5 or staging instructions.
 If not in a worktree: skip silently.
 
+### Merged-branch cleanup (post-merge, #193)
+
+Runs right after the worktree teardown above (or standalone when the session was not in a
+worktree). The merged PR branch must be deleted **regardless of worktree state** — never
+leave the branch for `gh pr merge --delete-branch` to clean up (that flag hard-fails when
+the default branch is worktree-locked; the merge ceremony in 04-merge-deploy.md already
+handled deletion separately).
+
+```bash
+# BRANCH = the merged PR branch (from the session's worktree, or resolve via gh):
+BRANCH=$(git branch --show-current)
+[ -n "$BRANCH" ] || BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
+
+# Remote delete — server-side, always possible after merge; "remote ref does not
+# exist" means deleteBranchOnMerge already removed it = success.
+git push origin --delete "$BRANCH" 2>/dev/null \
+  || echo "ℹ️ remote branch $BRANCH already deleted or unavailable"
+
+# Local delete — now safe IF the worktree was removed above (lock released).
+# If the worktree removal FAILED, do not fail the ceremony: WARN + leave a teardown note.
+if git worktree list --porcelain | grep -q "branch refs/heads/$BRANCH"; then
+  echo "⚠️ branch $BRANCH is still checked out in a worktree — local delete deferred."
+  echo "   TEARDOWN NOTE: remove the worktree and run: git branch -D $BRANCH"
+else
+  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH could not be deleted — delete manually: git branch -D $BRANCH"
+fi
+```
+
+This satisfies the #193 contract: the merged branch is deleted even when `main` is
+permanently locked by other worktrees, and a failed cleanup is a WARN — never a block.
+
 ## Step 4 — Documentation Update
 
 After merge, update relevant documentation (scope: only what actually changed):
