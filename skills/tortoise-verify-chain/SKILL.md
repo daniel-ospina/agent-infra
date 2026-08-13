@@ -4,7 +4,7 @@ title: "tortoise-verify-chain"
 doc_status: live
 subjects.team: epistemic-team
 created: 2026-07-18
-description: Verify chain integrity across all product strategy gates. Runs verify_chain(), surfaces violations, and offers fix options.
+description: Verify chain integrity across all product strategy gates. Runs the chain-integrity check (tortoise_check_structure), surfaces violations, and offers fix options.
 type: capability
 domain: capability
 status: live
