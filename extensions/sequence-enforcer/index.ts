@@ -153,7 +153,7 @@ const SEQUENCE_TIMEOUT_MS = 10 * 60 * 1000;
 export function handleSequenceTimeout(): void {
   const top = topSkill();
   if (!top) return;
-  if (process.env.PI_MODE === "print") {
+  if (isPrintMode()) {
     console.log(`[sequence-enforcer] ⏰ Sequence timeout — parking "${top.path}" at step ${top.stepIndex} (10min no tool calls) — state preserved`);
     auditLog({ ts: new Date().toISOString(), event: "timeout_park", skill: top.path, step: top.stepIndex, mode: resolveMode() });
     // park: keep stack/stepIndex/reviewers intact, re-arm the timer
@@ -205,7 +205,7 @@ export function resolveMode(
     const line = readFileSync(modeFile, "utf-8").split("\n")[0]!.trim();
     if (line === "warn" || line === "gate" || line === "strict") return line;
   } catch { /* file doesn't exist or unreadable */ }
-  return env.PI_MODE === "print" ? "warn" : "gate";
+  return isPrintMode(env) ? "warn" : "gate";
 }
 // ── Audit logging ──────────────────────────────────
 
@@ -805,7 +805,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // #5672: suppress banner in print mode (task sub-agent output)
-  if (process.env.PI_MODE !== "print") {
+  if (!isPrintMode()) {
     if (isKillSwitchActive()) {
       console.log("[sequence-enforcer] ⏸️  Loaded — kill switch active, all enforcement bypassed");
     } else {

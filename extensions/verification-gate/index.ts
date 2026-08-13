@@ -1305,7 +1305,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // #5672: suppress startup banner in print mode (task sub-agent output)
-  if (process.env.PI_MODE !== 'print') {
+  if (!isPrintMode()) {
     console.log("[verification-gate] ✅ Loaded — blocking git operations until verification complete");
   }
 

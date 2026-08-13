@@ -2,6 +2,8 @@
 //
 // Long-lived cmux pi panes drift: origin moves on, the checkout stays stale,
 // and agents working from it silently re-introduce already-fixed code. This
+// NOTE: root-level flat extensions CAN import ./shared/* (verified 2026-08-13 — the
+// #5611 sibling-import constraint is stale for the current jiti/static loader).
 // extension keeps the idle default branch fresh and surfaces feature-branch
 // drift:
 //
@@ -27,6 +29,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
+import { isPrintMode } from "./shared/print-mode.js";
 
 // ── Knobs ───────────────────────────────────────────────────────────────
 
@@ -327,7 +330,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async () => {
     // Sub-agents: no pulls, no noise (matches auto-sync.ts)
-    if (process.env.PI_MODE === "print") return;
+    if (isPrintMode()) return;
     tick(); // immediate check on session start
     if (timer) clearInterval(timer);
     timer = setInterval(tick, getFreshnessIntervalMs());

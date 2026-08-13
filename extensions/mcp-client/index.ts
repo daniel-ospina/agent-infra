@@ -27,6 +27,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { isPrintMode } from "../shared/print-mode.js";
 
 // ── Lifecycle constants (#199) ─────────────────────────────────────
 
@@ -909,7 +910,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   // #5672: suppress startup banner in print mode (task sub-agent output)
-  if (process.env.PI_MODE !== 'print') {
+  if (!isPrintMode()) {
     console.log(`[mcp-client] MCP client extension loaded`);
   }
 }

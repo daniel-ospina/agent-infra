@@ -15,6 +15,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
+import { isPrintMode } from "./shared/print-mode.js";
 
 export function shortHead(repo: string, ref = "HEAD"): string {
   try {
@@ -137,7 +138,7 @@ export default function (pi: ExtensionAPI) {
     const infraPath = process.env.AGENT_INFRA_PATH;
     if (!infraPath) return;          // not configured — silent
     if (!existsSync(infraPath)) return;
-    if (process.env.PI_MODE === "print") return; // sub-agents: no pulls, no noise
+    if (isPrintMode()) return; // sub-agents: no pulls, no noise
 
     try {
       execSync(`git -C "${infraPath}" fetch origin --quiet`, { timeout: 30_000, stdio: "ignore" });

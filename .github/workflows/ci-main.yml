@@ -33,6 +33,10 @@ jobs:
             echo "== $t =="
             node "$t" || failures=$((failures+1))
           done
+          # shared/print-mode.test.ts is the highest-leverage extension test (the
+          # isPrintMode helper gates 17 sites) — always run it in CI (#228)
+          echo "== extensions/shared/print-mode.test.ts =="
+          npx tsx extensions/shared/print-mode.test.ts || failures=$((failures+1))
           if [ $failures -gt 0 ]; then
             echo "❌ $failures extension test file(s) failed"
             exit 1

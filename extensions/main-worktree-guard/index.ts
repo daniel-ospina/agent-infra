@@ -25,6 +25,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { isAllowMarkerValid } from "./classify-git.mjs";
 import { homedir } from "node:os";
 import { realpathSync, existsSync } from "node:fs";
+import { isPrintMode } from "../shared/print-mode.js";
 
 // Shared destructive-git rules (also used by test.mjs). If the import ever
 // fails (jiti resolution edge case), the bash guard degrades to warn-only
@@ -271,7 +272,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // #5672: suppress startup banner in print mode (task sub-agent output)
-  if (process.env.PI_MODE !== 'print') {
+  if (!isPrintMode()) {
     console.log("[main-worktree-guard] ✅ Loaded — blocking write/edit + destructive git in main checkout");
   }
 

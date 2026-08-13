@@ -207,7 +207,7 @@ test("PI_MCP_SERVERS is inherited from parent env", () => {
 section("Banner suppression (#5526, #5672 regression)");
 
 test("startup banner suppressed in print mode", () => {
-  ok(source.includes("PI_MODE !== 'print'"), "banner suppression for print mode should exist (#5526 #5672)");
+  ok(source.includes("!isPrintMode()"), "banner suppression via shared helper (#5526 #5672)");
 });
 
 test("sub-agent env declares PI_MODE=print (#172)", () => {

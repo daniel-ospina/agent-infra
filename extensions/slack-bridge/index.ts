@@ -11,6 +11,7 @@
 // 0 runtime dependencies beyond Node stdlib.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isPrintMode } from "../shared/print-mode.js";
 import { request as httpRequest, createServer as httpCreateServer, type Server } from "node:http";
 import { request as httpsRequest } from "node:https";
 import {
@@ -104,22 +105,6 @@ let socketState: SocketModeState | null = null;
 let lastPostedMessageIdx = -1; // ponytail: dedup index for loop-enforcer output
 const CYCLE_BUFFER_FLUSH = 3; // ponytail: batch N cycles before posting summary
 const cycleBuffer: { slug: string; cycles: number; text: string }[] = [];
-
-// ── Mode / eligibility helpers (#172) ─────────────────
-
-/** Print mode (headless `pi -p` / task sub-agents): the bridge is fully silent. */
-function isPrintMode(): boolean {
-  // #172 print-mode detection. NOTE: pi NEVER sets PI_MODE (verified
-  // 2026-08-13: pi parses -p/--print into an internal flag in cli/args.js
-  // but exports nothing) — the env-only check was dead code, so every
-  // headless one-shot (task sub-agents spawn `pi -p ...` per builtin-tools
-  // index.ts:1380, CLI -p runs, background workers) enabled Socket Mode +
-  // bridge hooks, hit Slack's 10-connection app cap, and logged the
-  // `Socket Mode error:` / `disconnected (code=1006)` pair in every
-  // session. Detect print mode from argv as well.
-  if (process.env.PI_MODE === "print") return true;
-  return process.argv.includes("-p") || process.argv.includes("--print");
-}
 
 /**
  * Bridge-routing eligibility. Only TUI, Slack-spawned (SLACK_BRIDGE_THREAD_TS),

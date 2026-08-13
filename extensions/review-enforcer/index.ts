@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "child_process";
+import { isPrintMode } from "../shared/print-mode.js";
 import * as fs from "fs";
 import * as os from "os";
 import { resolve as resolvePath } from "path";
@@ -434,7 +435,7 @@ export default function (pi: ExtensionAPI) {
         // in print mode (sub-agents) this bare JSON would land on stderr and
         // contaminate tool-result content, breaking downstream JSON parsers.
         // Same guard as the startup banner below. #133
-        if (process.env.PI_MODE !== "print") {
+        if (!isPrintMode()) {
           console.log(
             JSON.stringify({
               event: "gate_bypass",
@@ -531,7 +532,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     // ── startup banner ────────────────────────────
-    if (process.env.PI_MODE !== "print") {
+    if (!isPrintMode()) {
       console.log("[review-enforcer] ✅ Loaded — binary review dispatch enforcement active");
     }
   } catch (err: any) {

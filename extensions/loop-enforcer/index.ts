@@ -34,6 +34,7 @@ import { evaluateTermination, type CycleData } from "./termination.js";
 import { startScheduler, releaseCronLock } from "./scheduler.js";
 import { executeWriteBack } from "./writeback.js";
 import { homedir } from "node:os";
+import { isPrintMode } from "../shared/print-mode.js";
 import { LOOPS_DIR, readManifest, writeManifest, abortLoop, abortAllLoops, buildEndSummary, pauseLoop, blockLoop, resumeLoop, type Manifest } from "./manifest.js";
 
 // ── Session context resolution ──────────────────────────────────
@@ -595,12 +596,12 @@ function getLastAssistantText(ctx: {
 
 export default function (pi: ExtensionAPI) {
   if (process.env.LOOP_ENFORCER_DISABLED === "1") {
-    if (process.env.PI_MODE !== 'print') console.log("[loop-enforcer] ⏭️  Disabled");
+    if (!isPrintMode()) console.log("[loop-enforcer] ⏭️  Disabled");
     return;
   }
 
   // #5672: suppress startup banner in print mode (task sub-agent output)
-  if (process.env.PI_MODE !== 'print') {
+  if (!isPrintMode()) {
     console.log("[loop-enforcer] ✅ Loaded");
   }
 
@@ -631,7 +632,7 @@ export default function (pi: ExtensionAPI) {
         pi.sendUserMessage(msg, opts),
     );
     // #5672: suppress startup banner in print mode (task sub-agent output)
-    if (process.env.PI_MODE !== 'print') {
+    if (!isPrintMode()) {
       console.log('[loop-enforcer] ⏰ Cron scheduler started');
     }
   } catch (err) {
