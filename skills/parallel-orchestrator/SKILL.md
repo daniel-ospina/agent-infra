@@ -124,6 +124,8 @@ The orchestrator checks the background result before starting implementation. If
 
 The `subagent` tool blocks until completion — there is no `background: true` parameter. For truly non-blocking background work (pre-warming, long-running side tasks), use `bash` background processes (`&`) with output redirected to temp files. Check temp files before the result is needed.
 
+> ⛔ **Assume dispatched sub-agents may die (#208).** The parent task tool now returns partial results within a bounded hard cap (TASK_HARD_CAP_MS, default 2h) when a sub-agent is cut — but a cut is still a cut: design dispatch waves as RESUMABLE (each sub-agent commits WIP early, the orchestrator re-dispatches on a cut and reconciles from the commit/partial result). Never design a wave where one lost sub-agent strands the rest.
+
 > ⛔ **HARD RULE (#206): never launch an unbounded nested `pi`.** Any background/nested pi launch MUST carry all three bounds — `timeout <N>` (hard cap), log-file redirect (`> file 2>&1`; pipe stdout is block-buffered and looks frozen, #202), and a liveness marker (periodic timestamped heartbeat line). The 2026-08-11→12 incident: an unbounded `pi -p` launched to escape the worktree guard sat for 105,150s before manual abort. The sanctioned guard escape is the terminal one-liner (`cd <repo> && git checkout main && git pull --ff-only`), never a nested pi.
 
 For parallel dispatch of independent blocking tasks, use `subagent({ tasks: [...] })` — the tool blocks but all tasks run concurrently.

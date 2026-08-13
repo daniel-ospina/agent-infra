@@ -467,6 +467,16 @@ export function getFirstMessageMs(): number {
  * Default 0 = OFF — the issue's core semantics ("never kill a working agent").
  * TASK_MAX_DISPATCH_MS > 0 adds a wall-clock cap markers cannot reset. */
 export const DEFAULT_MAX_DISPATCH_MS = 0;
+// #208: bounded parent wait — a hard wall-clock cap on the whole task call.
+// If neither the child's close event nor a heartbeat kill resolves the
+// promise (unreapable process, dead task call), the cap force-kills the tree
+// and resolves with partial results + a cut reason instead of blocking the
+// parent indefinitely (observed ~6h blocks on dead task calls). Default 2h —
+// generous for full ceremonies, far below the observed unbounded waits.
+export const DEFAULT_HARD_CAP_MS = 7_200_000;
+export function getTaskHardCapMs(): number {
+  return Math.max(60_000, Number(process.env.TASK_HARD_CAP_MS) || DEFAULT_HARD_CAP_MS);
+}
 export function getTaskMaxDispatchMs(): number {
   const raw = Number(process.env.TASK_MAX_DISPATCH_MS);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_MAX_DISPATCH_MS;
@@ -1210,8 +1220,28 @@ export default function (pi: ExtensionAPI) {
         if (settled) return;
         settled = true;
         exitWatchdog.disarm();
+        if (hardCapTimer) clearTimeout(hardCapTimer);
         resolve(value);
       };
+
+      // #208: bounded parent wait — if neither close nor a heartbeat kill
+      // resolves within the hard cap (dead task call), force-kill the tree and
+      // resolve with partial results + a cut reason. Fail fast, resumably.
+      let hardCapTimer: NodeJS.Timeout | null = setTimeout(() => {
+        if (settled) return;
+        console.error(`[task] sub-agent exceeded the hard cap (${getTaskHardCapMs() / 1000}s, TASK_HARD_CAP_MS) — force-killing and returning partial results (#208)`);
+        treeKill(proc.pid, "SIGTERM");
+        setTimeout(() => treeKill(proc.pid, "SIGKILL"), 5000).unref();
+        const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
+        doResolve({
+          content: [{
+            type: "text",
+            text: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.\n\nAlive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${stdout.slice(-500)}`,
+          }],
+          details: { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
+        });
+      }, getTaskHardCapMs());
+      hardCapTimer.unref();
 
       const startedAt = Date.now();
       // #176: stall bounds resolved once per dispatch (parent-side env).
@@ -1243,8 +1273,10 @@ export default function (pi: ExtensionAPI) {
         });
         if (!decision.kill) return;
         clearInterval(heartbeat);
-        proc.kill("SIGTERM");
-        const sigkillTimer = setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000);
+        // #208: treeKill — the direct child's grandchildren (nested pi, MCP
+        // server pairs) would otherwise survive as orphans holding worktrees.
+        treeKill(proc.pid, "SIGTERM");
+        const sigkillTimer = setTimeout(() => treeKill(proc.pid, "SIGKILL"), 5000);
         proc.once("close", () => clearTimeout(sigkillTimer));
 
         // Retryable kills (#5926 class): no REAL output ever arrived →
