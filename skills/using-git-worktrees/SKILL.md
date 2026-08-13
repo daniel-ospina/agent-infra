@@ -246,6 +246,25 @@ Ready to implement <feature-name>
   3. **Liveness marker** — the launched process must emit a periodic heartbeat (timestamped line) so a stalled worker is distinguishable from a dead one.
 - **Sanctioned alternative:** the terminal one-liner above (no pi involved).
 
+### Monitoring background workers — stdout is buffered, stderr is not (#202)
+
+`pi -p` stdout redirected to a FILE is block-buffered (pi accumulates per-turn
+output), so a `tail -f` log can look frozen for hours while the worker is
+actively working — **do not infer liveness from stdout alone**. The unbuffered
+signals: (1) STDERR (node writes it synchronously — the task-heartbeat marker
+stream is stderr), and (2) side effects (processes, worktree diffs).
+
+Monitor a background worker with:
+
+```bash
+bash scripts/monitor-worker.sh /tmp/pi-1.log 60   # exit 0 = fresh writes, 1 = stale, 2 = missing/empty
+watch -n 30 'bash scripts/monitor-worker.sh /tmp/pi-1.log'
+```
+
+Launch guidance: keep `2>&1` (markers + stage lines land immediately) and use
+the liveness-marker rule from the hard rule above. A stale log with fresh
+marker lines = healthy; a stale log with NO markers = inspect the process.
+
 ### TTL'd escape marker — deliberate SOLO sessions can escalate mid-session (#207)
 
 The env hatch (`AGENT_ALLOW_MAIN_EDITS=1`) cannot be set on a running pi process. A **deliberate solo session** that owns the machine can grant itself the same bypass for a bounded window:
