@@ -1322,7 +1322,14 @@ export function connectSocket(url: string, state: SocketModeState): WebSocket {
     }
   };
   ws.onerror = (event) => {
-    console.error(`[slack-bridge] 🔌 Socket Mode error: ${(event as any)?.message ?? "unknown"}`);
+    // undici fires a message-less error before most drops; the onclose
+    // handler below carries the code/reason — skip the noise line here
+    // (a bare one-shot connecting and dying logged an empty error + 1006
+    // pair in every session log, #172 print-mode regression 2026-08-13).
+    const msg = (event as any)?.message;
+    if (msg) {
+      console.error(`[slack-bridge] 🔌 Socket Mode error: ${msg}`);
+    }
     // On failed connection establishment undici fires only `error` (no
     // `onclose`); on mid-session drops it fires error THEN close. Scheduling
     // here covers both — scheduleReconnect is idempotent (single timer).
