@@ -125,57 +125,16 @@ If `HAS_COLUMN_DROP_MIGRATIONS=true` and `supabase` CLI is available:
 
 If `HAS_COLUMN_DROP_MIGRATIONS=false`: skip silently.
 
-## Replay Smoke Gate (conditional)
-
-Runs a fresh-replay smoke test of all Supabase migrations. Catches migrations that work against the current production schema but fail on cold-replay (SQLSTATE 42P13 / 42P16 / 42703, etc.).
-
-**Condition:** Only when **staged files** include changes under `supabase/migrations/`.
-
-```bash
-git diff --cached --name-only | grep -q '^supabase/migrations/' && HAS_COLUMN_DROP_MIGRATIONS=true || HAS_COLUMN_DROP_MIGRATIONS=false
-```
-
-- If `HAS_COLUMN_DROP_MIGRATIONS=true` and `supabase` CLI is available:
-  - Announce: "Running Replay Smoke Gate..."
-  - Run: `bash scripts/replay-migrations.sh`
-  - If it fails: **stop immediately** and report. Do not commit.
-- If `supabase` CLI is not available: skip with warning "Replay Smoke Gate skipped — Supabase CLI not available"
-- If `HAS_COLUMN_DROP_MIGRATIONS=false`: skip silently.
-
-> This check was moved from CI (`.github/workflows/replay-smoke-gate.yml`) to pre-flight in #6135 to avoid burning GitHub Actions minutes on every PR.
-
-## Column Drop Audit (conditional)
-
-Catches migrations that drop a column without checking for references in edge functions. Prevents runtime 500 errors caused by edge functions referencing dropped columns (#6654).
-
-**Condition:** Only when **staged files** include changes under `supabase/migrations/`.
-
-```bash
-git diff --cached --name-only | grep -q '^supabase/migrations/' && HAS_COLUMN_DROP_MIGRATIONS=true || HAS_COLUMN_DROP_MIGRATIONS=false
-```
-
-- If `HAS_COLUMN_DROP_MIGRATIONS=true`:
-  - Announce: "Running Column Drop Audit..."
-  - Run: `bash scripts/check-column-drops.sh` (extracts dropped columns and greps edge functions)
-  - If script not found, run manually:
-    - Extract dropped columns: `git diff --cached -- supabase/migrations/ | grep -Po "(?<=DROP COLUMN |ALTER TABLE \\\\w+ DROP )\\\\w+" | sort -u`
-    - For each column, search edge functions (word-boundary to avoid matching suffixes like _description_es): `grep -rn "\bCOLUMN_NAME\b" supabase/functions/ --include="*.ts"`
-    - If any matches found: **BLOCK.** Report "Column `X` is dropped in migration `Y` but referenced in edge function `Z`. Fix the edge function first."
-    - Uses previously-set `HAS_MIGRATIONS` variable from pgTAP check above (avoids redundant git diff)
-  - If no matches found: proceed.
-  - **False-positive override:** If a grep match is a false positive (comment, dead code, unrelated), add the column name to `.column-drop-audit-ignore` in the repo root (one per line). The script checks this file before reporting.
-- If `HAS_COLUMN_DROP_MIGRATIONS=false`: skip silently.
-
-> This check was added in #6698 after migration 20260720000003 dropped `user_rewards.description` but two edge functions still referenced it, causing production 500 errors.
+> Supabase-specific gates (Replay Smoke, Column Drop Audit) are eldato-only — no `supabase/` dir in agent-infra; not applicable (issue #239).
 
 ## Skill Enforcement Audit (conditional)
 
-Validates that every skill listed in the dangerous-ops manifest is present in the AGENTS.md protocol table. Prevents skills from being added without registering them in the enforcement table.
+Runs `scripts/ci/enforce-protocol-table.sh`. **Pass 1 is the live gate in agent-infra:** every dangerous-ops manifest skill (`enforcement/dangerous-ops.txt`) must resolve to a real `skills/<name>/SKILL.md` — a missing file is a silently broken enforcement gate. **Pass 2/3 (manifest ↔ AGENTS.md protocol table) are conditional:** they run only when AGENTS.md exists AND its protocol table is populated — in agent-infra the table is the template placeholder (and AGENTS.md is untracked/generated), so Pass 2/3 skip-with-note; they activate in consumer repos with populated tables (issue #239).
 
 **Condition:** Only when **staged files** include changes under `skills/`, `enforcement/`, or `AGENTS.md`.
 
 ```bash
-git diff --cached --name-only | grep -qE '^(skills/|enforcement/|AGENTS\.md)' && HAS_SKILL_CHANGES=true || HAS_SKILL_CHANGES=false
+git diff --cached --name-only --no-renames | grep -qE '^(skills/|enforcement/|AGENTS\.md)' && HAS_SKILL_CHANGES=true || HAS_SKILL_CHANGES=false
 ```
 
 - If `HAS_SKILL_CHANGES=true`:
@@ -184,7 +143,7 @@ git diff --cached --name-only | grep -qE '^(skills/|enforcement/|AGENTS\.md)' &&
   - If it fails: **stop immediately** and report. Do not commit.
 - If `HAS_SKILL_CHANGES=false`: skip silently.
 
-> This check was moved from CI (`.github/workflows/enforce-skills.yml` PR trigger) to pre-flight in #6135. The nightly cron remains in CI to catch drift on `main`.
+> Script ported into agent-infra in #239 (from eldato @ 49afc61f, blob fb4c5357). eldato's `enforce-skills.yml` was never ported; agent-infra has no CI workflow running this script — drift coverage is solely this pre-flight trigger on `skills/|enforcement/|AGENTS.md` commits (issue #239 D5).
 
 ## Issue Detection
 

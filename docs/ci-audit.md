@@ -1,9 +1,22 @@
+---
+title: "CI Audit — El Dato Repo (extraction reference)"
+type: engineering
+domain: operations
+doc_status: live
+subjects.team: organisation-design-team
+created: 2026-07-30
+aboutSubjects: organisation-design-team
+aboutObjects: eldato, agent-infra, ci-audit
+---
+
 # CI Audit — El Dato Repo
 
 > **Issue:** [#7554](https://github.com/lil-lawyer/eldato/issues/7554)
 > **Epic:** [#7535](https://github.com/lil-lawyer/eldato/issues/7535) — Agent process infrastructure for epistemic repos
 > **Phase:** 1
 > **Date:** 2026-07-30
+>
+> **Scope (issue #239):** this document is the **eldato** CI audit, kept in agent-infra as an extraction reference. Of the workflows listed in §3, only `ci.yml` and the compliance gate exist in agent-infra (eldato's `compliance-gate.yml` §3.1 — ported/renamed as `pipeline-compliance.yml`, dogfood copy per its header); all others (including `check-drift.yml`, `enforce-skills.yml`, `replay-smoke-test.yml`) describe eldato — rows struck through are explicitly not ported. agent-infra has **zero cron-scheduled workflows**.
 
 Full inventory of CI components in `/Users/home/eldato` with classification:
 - **modular**: repo-agnostic, ready to share via `agent-infra`
@@ -123,7 +136,7 @@ None identified. All scripts are referenced from `.husky/pre-push`, GitHub Actio
 
 ## 3. GitHub Actions (`.github/workflows/`)
 
-All 14 workflows contain El Dato-specific references. **None are currently modular.** Breakdown:
+All 14 workflows (eldato inventory; see scope banner) contain El Dato-specific references. **None are currently modular.** Breakdown:
 
 ### 3.1 PR-triggered (blocking)
 
@@ -149,8 +162,8 @@ All 14 workflows contain El Dato-specific references. **None are currently modul
 | Workflow | Trigger | Specific references | Modularization feasibility |
 |----------|---------|---------------------|---------------------------|
 | `check-drift.yml` | Daily 06:00 UTC | Schema drift vs production Supabase + docs drift (4:5 canvas dimension references in carousel skills) | **Low** — Supabase + El Dato docs conventions. |
-| `enforce-skills.yml` | Daily 06:00 UTC | Runs `scripts/ci/enforce-protocol-table.sh` — El Dato skill protocol table | **Medium** — Skill enforcement is generic but tied to El Dato skill conventions. |
-| `replay-smoke-test.yml` | Weekly Mon 09:00 UTC + `workflow_dispatch` | Migration replay against fresh Supabase Postgres, recovery playbook link | **Low** — Supabase-specific. |
+| ~~`enforce-skills.yml`~~ | ~~Daily 06:00 UTC~~ | **NOT PRESENT in agent-infra** — eldato-only history; the script was ported in #239 and runs only as a pre-flight check (no CI workflow). | **Medium** — port the nightly cron as a follow-up (issue #239 D5). |
+| ~~`replay-smoke-test.yml`~~ | ~~Weekly Mon 09:00 UTC + `workflow_dispatch`~~ | **NOT PRESENT in agent-infra** — eldato-only; agent-infra has no supabase/ dir (Replay Smoke Gate deleted from pre-flight in #239). | **Low** — Supabase-specific. |
 
 ### 3.4 Manual-only (`workflow_dispatch`)
 
@@ -171,7 +184,7 @@ All 14 workflows contain El Dato-specific references. **None are currently modul
 1. `log-admin-merges.yml` — Generic PR bypass detection
 2. `arch-check.yml` — Generic architecture fitness check (manual)
 3. `mutation-test.yml` — Generic mutation testing (manual)
-4. `enforce-skills.yml` — Skill protocol enforcement
+4. ~~`enforce-skills.yml`~~ — Skill protocol enforcement (eldato-only; not present in agent-infra — #239)
 5. `ci.yml` — PR CI pipeline (most complex, highest value if modularized)
 
 ---
@@ -208,7 +221,7 @@ All 14 workflows contain El Dato-specific references. **None are currently modul
 | `check:merge-collision` | npm script | Generic merge conflict detection |
 | Husky `pre-commit` (sibling import check) | Hook | Generic pi extension safety check |
 | `log-admin-merges.yml` | GHA workflow | Generic PR bypass detection pattern |
-| `enforce-skills.yml` | GHA workflow | Skill protocol enforcement, generic pattern |
+| ~~`enforce-skills.yml`~~ | GHA workflow (eldato) | Skill protocol enforcement — not present in agent-infra (#239); ported script is pre-flight-only |
 
 ### Medium-priority extraction (Phase 2)
 | Component | Type | Rationale |
@@ -216,7 +229,7 @@ All 14 workflows contain El Dato-specific references. **None are currently modul
 | Husky `pre-push` skeleton | Hook | Configurable pre-push gate structure |
 | `ci.yml` (modular version) | GHA workflow | Path-parameterized PR CI pipeline |
 | `typecheck-canary.yml` | GHA workflow | Post-merge type safety canary |
-| `replay-smoke-test.yml` | GHA workflow | Generic migration replay pattern (if DB-agnostic) |
+| ~~`replay-smoke-test.yml`~~ | GHA workflow (eldato) | Migration replay — not present in agent-infra (no supabase/ dir; #239) |
 
 ### Low-priority / El Dato only
 | Component | Type | Rationale |

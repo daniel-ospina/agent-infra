@@ -69,6 +69,13 @@ async function rest(table, opts = {}) {
 }
 
 // ── Mock fixtures (SWARM_ORG_MOCK=1) — shape mirrors real SOR rows ──
+// NOTE: production SOR rows live in the swarm Supabase `roles` table (migration
+// 00005). Registering a new role requires an INSERT — e.g. product-verifier:
+//   INSERT INTO roles (org_id, team_id, name, slug, subject_kind, held_by, loop_type, delegation, reports_to)
+//   SELECT o.id, t.id, 'Product Verifier', 'product-verifier', 'role', 'pi', 'cron', 'closed',
+//          (SELECT id FROM roles WHERE org_id = o.id AND slug = 'product-strategist')
+//   FROM organizations o JOIN teams t ON t.org_id = o.id AND t.slug = 'organisation-design-team'
+//   WHERE o.slug = 'eldato' ON CONFLICT (org_id, slug) DO NOTHING;
 const MOCK = {
   organizations: [{ id: "org-1", name: "Premise Labs", slug: "premise-labs" },
     { id: "org-2", name: "El Dato", slug: "eldato" }],
@@ -80,6 +87,7 @@ const MOCK = {
   roles: [
     { id: "r-1", org_id: "org-2", team_id: "t-1", name: "Team Strategist", slug: "team-strategist", subject_kind: "role", held_by: "pi", loop_type: "cron", delegation: "open", reports_to: null },
     { id: "r-2", org_id: "org-2", team_id: "t-1", name: "Product Strategist", slug: "product-strategist", subject_kind: "role", held_by: "pi", loop_type: "cron", delegation: "open", reports_to: "team-strategist" },
+    { id: "r-5", org_id: "org-2", team_id: "t-1", name: "Product Verifier", slug: "product-verifier", subject_kind: "role", held_by: "pi", loop_type: "cron", delegation: "closed", reports_to: "product-strategist" },
     { id: "r-3", org_id: "org-2", team_id: "t-2", name: "Growth Hacker", slug: "growth-hacker", subject_kind: "role", held_by: "pi", loop_type: "cron", delegation: "open", reports_to: null },
     { id: "r-4", org_id: "org-2", team_id: "t-3", name: "Epistemic Steward", slug: "epistemic-steward", subject_kind: "role", held_by: "pi", loop_type: "continuous", delegation: "open", reports_to: null },
   ],

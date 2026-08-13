@@ -8,23 +8,36 @@
       ],
       "env": {
         "EXA_API_KEY": "${EXA_API_KEY}"
-      }
+      },
+      "purpose": "Web search (Exa)",
+      "whenToLoad": "always (core)",
+      "cost": "one light process"
     },
-    "brave-search": {
-      "command": "npx",
+    "tortoise": {
+      "command": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}/.venv/bin/python3",
       "args": [
-        "-y",
-        "@modelcontextprotocol/server-brave-search"
+        "-m",
+        "tortoise.mcp_server"
       ],
+      "cwd": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
       "env": {
-        "BRAVE_API_KEY": "${BRAVE_API_KEY}"
-      }
+        "PYTHONPATH": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
+        "TORTOISE_DB_URI": "docker://:@localhost:16379/tortoise"
+      },
+      "purpose": "Memory graph (Tortoise) — cross-session knowledge",
+      "whenToLoad": "always (core)",
+      "cost": "one python process (venv has fastmcp)"
     },
     "playwright-browser": {
       "command": "npx",
       "args": [
         "@playwright/mcp@latest"
-      ]
+      ],
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "purpose": "Browser automation (navigate/click/screenshot)",
+      "whenToLoad": "verify/UX phases only",
+      "cost": "~170MB pair while loaded"
     },
     "gemini": {
       "command": "npx",
@@ -34,19 +47,25 @@
       ],
       "env": {
         "GEMINI_API_KEY": "${GEMINI_API_KEY}"
-      }
+      },
+      "lazy": true,
+      "purpose": "Image generation (Gemini)",
+      "whenToLoad": "image/carousel tasks",
+      "cost": "one npx process"
     },
-    "tortoise": {
-      "command": "python3",
+    "brave-search": {
+      "command": "npx",
       "args": [
-        "-m",
-        "tortoise.mcp_server"
+        "-y",
+        "@brave/brave-search-mcp-server"
       ],
-      "cwd": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
       "env": {
-        "PYTHONPATH": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-        "TORTOISE_DB_URI": "docker://:@localhost:16379/tortoise"
-      }
+        "BRAVE_API_KEY": "${BRAVE_API_KEY}"
+      },
+      "lazy": true,
+      "purpose": "Web search (Brave)",
+      "whenToLoad": "on demand",
+      "cost": "one npx process"
     }
   }
 }

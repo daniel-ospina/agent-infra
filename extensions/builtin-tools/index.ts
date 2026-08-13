@@ -1616,7 +1616,7 @@ export default function (pi: ExtensionAPI) {
       mcp_servers: Type.Optional(
         Type.String({
           description:
-            "Comma-separated MCP server names for this sub-agent. Inherits parent's PI_MCP_SERVERS by default. Add gemini,cloudinary for image generation tasks.",
+            "Comma-separated MCP server names for this sub-agent (forces eager load). Inherits parent's PI_MCP_SERVERS by default — sub-agents get the eager core (exa+tortoise) plus mcp_catalog/mcp_load for everything else. Name a lazy server (e.g. gemini) to force-load it up front; otherwise load it mid-run via mcp_load.",
         })
       ),
     }),
