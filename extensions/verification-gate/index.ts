@@ -295,7 +295,19 @@ export function isGitCommit(command: string): boolean {
 // /tmp && x"`) must not poison the resolved cwd (a poisoned cwd fed the
 // merge-scope repo/head comparison → false skip).
 export function extractCdPath(command: string): string | null {
-  const m = command.match(/(?:^|&&\s*|;\s*|\|\|\s*|\|\s*|\n\s*)\s*cd\s+(['"]?)([^;&|]+?)\1\s*(?:&&|;)/);
+  // Quote-aware: mask quoted regions so a `cd /tmp &&` inside --comment/
+  // --body prose can never anchor the separator scan (review #230 P2-3:
+  // `gh pr merge 1 --comment "see; cd /tmp && x"` poisoned the cwd). A quoted
+  // region that directly follows `cd ` is the cd ARGUMENT — preserved so
+  // `cd "/path with spaces" && git …` still extracts.
+  const masked = command.replace(
+    /(["'])(?:\\.|(?!\1)[\s\S])*\1/g,
+    (q: string, _quote: string, offset: number) => {
+      const before = command.slice(Math.max(0, offset - 4), offset);
+      return /cd\s+$/.test(before) ? q : " ".repeat(q.length);
+    },
+  );
+  const m = masked.match(/(?:^|&&\s*|;\s*|\|\|\s*|\|\s*|\n\s*)\s*cd\s+(['"]?)([^;&|]+?)\1\s*(?:&&|;)/);
   return m ? resolve(m[2]) : null;
 }
 
@@ -368,15 +380,31 @@ export function mergeCommandWindow(command: string): string {
 }
 
 // Priority 1: explicit --repo owner/name (or -R, or --repo=owner/name) flag.
+/** Normalize a raw repo capture to exactly OWNER/REPO: strip a leading
+ * [HOST/] segment (gh accepts GH_REPO=[HOST/]OWNER/REPO; --repo is
+ * OWNER/REPO only). A value with >2 segments after host-stripping, or an
+ * empty/garbage identity, yields null — fail-closed (review #230 P2-2: the
+ * unanchored capture turned "github.com/owner/repo" into the garbage
+ * identity "github.com/owner" and flipped same-repo merges into wrong
+ * cross-repo skips). */
+function normalizeRepoCapture(raw: string): string | null {
+  const parts = raw.split("/").filter(Boolean);
+  if (parts.length === 2) return parts.join("/");
+  if (parts.length === 3) return `${parts[1]}/${parts[2]}`; // host/owner/repo
+  return null; // 4+ segments — garbage identity, fail-closed
+}
+
 export function extractRepoFlag(command: string): string | null {
-  const m = command.match(/(?:--repo|-R)(?:=|\s+)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
-  return m ? m[1] : null;
+  // 2-3 segments: a HOST/ prefix must reach normalizeRepoCapture (the old
+  // two-segment capture turned "github.com/owner/repo" into "github.com/owner").
+  const m = command.match(/(?:--repo|-R)(?:=|\s+)([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+){1,3})/);
+  return m ? normalizeRepoCapture(m[1]) : null;
 }
 
 // Priority 2: GH_REPO=owner/name env assignment prefix in the command.
 export function extractGhRepoEnv(command: string): string | null {
-  const m = command.match(/(?:^|\s)GH_REPO=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
-  return m ? m[1] : null;
+  const m = command.match(/(?:^|\s)GH_REPO=([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+){1,3})/);
+  return m ? normalizeRepoCapture(m[1]) : null;
 }
 
 // Extract the PR number from `gh pr merge <n>` (merge branch only). The number
@@ -492,12 +520,18 @@ function localHeadSha(cwd: string): string | null {
   }
 }
 
-// Current PR head via gh, run WITH cwd (gh resolves the repo from the local
-// remote — no --repo needed). Same call shape as review-enforcer's
-// getPrHeadSha. null on ANY failure (network, gh missing, 404) — fail-closed.
-function getPrHeadSha(pr: number, cwd: string): string | null {
+// Current PR head via gh. When the merge command resolved an explicit repo
+// (--repo flag / GH_REPO= env), FORCE it with --repo — gh's own resolution
+// (flag > GH_REPO env > cwd) could otherwise hijack the head check to a
+// different repo when the session env carries a stale GH_REPO (review #230
+// P1: wrong skip + the #190 drift-contamination vector re-opens). When no
+// explicit repo, the head check and the actual merge inherit the same env,
+// so they agree. Same shape as review-enforcer's getPrHeadSha. null on ANY
+// failure (network, gh missing, 404) — fail-closed.
+function getPrHeadSha(pr: number, cwd: string, explicitRepo?: string | null): string | null {
   try {
-    const out = execSync(`gh pr view ${pr} --json headRefOid --jq .headRefOid`, {
+    const repoArg = explicitRepo ? ` --repo ${explicitRepo}` : "";
+    const out = execSync(`gh pr view ${pr} --json headRefOid --jq .headRefOid${repoArg}`, {
       encoding: "utf-8",
       cwd,
       timeout: 15000,
@@ -525,7 +559,7 @@ export function resolveMergeScope(command: string, cwd: string): MergeScopeDecis
   }
   const pr = extractPrNumber(window);
   const localHead = localHeadSha(cwd);
-  const prHead = pr !== null ? getPrHeadSha(pr, cwd) : null;
+  const prHead = pr !== null ? getPrHeadSha(pr, cwd, explicitRepo) : null;
   return evaluateMergeScope(cwdRepo, explicitRepo, localHead, prHead);
 }
 
