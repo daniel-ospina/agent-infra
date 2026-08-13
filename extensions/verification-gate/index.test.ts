@@ -490,6 +490,17 @@ test("cd after a command separator is still detected (P2-2 fix)", () => {
 test("cd after a bare newline separator is detected (cycle-4 P2-1 fix)", () => {
   ok(extractCdPath("echo hello\ncd /tmp && git commit")!.endsWith("/tmp"));
 });
+test("review 230 P2-3: quoted prose cd shapes never poison cwd", () => {
+  equal(extractCdPath('gh pr merge 1 --comment "see; cd /tmp && x"'), null);
+  equal(extractCdPath('gh pr merge 1 --body "first\ncd /tmp && second"'), null);
+  ok(extractCdPath('cd "/path with spaces" && git commit')!.endsWith("/path with spaces"));
+});
+
+test("review 230 P2-2: HOST/OWNER/REPO forms normalize to OWNER/REPO", () => {
+  equal(extractGhRepoEnv("GH_REPO=github.com/owner/repo gh pr merge 123"), "owner/repo");
+  equal(extractGhRepoEnv("GH_REPO=a/b/c/d gh pr merge 123"), null);
+  equal(extractRepoFlag("gh pr merge 123 --repo github.com/owner/repo"), "owner/repo");
+});
 
 // ── Module load regression ───────────────────────────
 
