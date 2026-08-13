@@ -4,8 +4,8 @@
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
-import { realpathSync, existsSync } from "node:fs";
-import { classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo } from "./classify-git.mjs";
+import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync } from "node:fs";
+import { classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -207,6 +207,114 @@ const expectedMainCO = RUN_IS_MAIN ? cwdBranch : null;
 const mainCO = getMainCheckoutBranch();
 console.log(`\ngetMainCheckoutBranch() = ${mainCO} (expect "${expectedMainCO}")`);
 mainCO === expectedMainCO ? pass++ : fail++;
+
+// ── Escape marker (#207) ────────────────────────────────────────────────────
+// TTL'd file-based escape marker for main-worktree-guard. Pure logic lives in
+// classify-git.mjs (same rules index.ts uses via jiti). Groups A/C/D are pure
+// (fake fs.Stats-shaped objects); groups B/E use tiny tmp files (tmpRepo
+// precedent) so the full read path is exercised against real fs.
+const FAKE_HOME = "/home/user";
+const fakeStats = (mtimeMs) => ({ mtimeMs });
+
+// Group A — TTL/mtime (isAllowMarkerActive, pure)
+// Single shared clock: passing explicit nowMs to BOTH the fake mtime and the
+// function prevents a millisecond straddle between two Date.now() calls from
+// flipping the strict `< ttlMs` boundary (flake fix, caught by VGATE).
+const ttlNow = Date.now();
+expectBool("marker present+fresh → active (valid → allow)", isAllowMarkerActive(fakeStats(ttlNow - (ALLOW_MAIN_EDITS_MARKER_TTL_MS - 1)), ttlNow), true);
+expectBool("marker absent (null stats) → inactive (fail-safe block)", isAllowMarkerActive(null, ttlNow), false);
+expectBool("marker expired (TTL+1) → inactive (stale → block)", isAllowMarkerActive(fakeStats(ttlNow - (ALLOW_MAIN_EDITS_MARKER_TTL_MS + 1)), ttlNow), false);
+expectBool("marker boundary (exactly TTL) → inactive (strict <)", isAllowMarkerActive(fakeStats(ttlNow - ALLOW_MAIN_EDITS_MARKER_TTL_MS), ttlNow), false);
+expectBool("marker future mtime (negative age) → active (same-user trust bound)", isAllowMarkerActive(fakeStats(ttlNow + 5000), ttlNow), true);
+expectBool("injected custom ttl honored (age 10min, ttl 5min) → inactive", isAllowMarkerActive(fakeStats(ttlNow - 10 * 60 * 1000), ttlNow, 5 * 60 * 1000), false);
+
+// Group C — path guard (isAllowMarkerPath, pure)
+expectBool("marker path exact resolved → true", isAllowMarkerPath(`${FAKE_HOME}/.pi/agent/.allow-main-edits`, FAKE_HOME), true);
+expectBool("sibling path (~/.pi/agent/other) → false", isAllowMarkerPath(`${FAKE_HOME}/.pi/agent/other-file`, FAKE_HOME), false);
+expectBool("traversal candidate + unrelated (/etc/passwd) → false",
+  isAllowMarkerPath(`${FAKE_HOME}/.pi/agent/.allow-main-edits/..`, FAKE_HOME) ||
+  isAllowMarkerPath("/etc/passwd", FAKE_HOME), false);
+
+// Group D — creation detection (isAllowMarkerCommand + extractMarkerReason, pure)
+expectBool("touch ~/.pi/agent/.allow-main-edits → true", isAllowMarkerCommand("touch ~/.pi/agent/.allow-main-edits", FAKE_HOME), true);
+expectBool("bare touch reason → null", extractMarkerReason("touch ~/.pi/agent/.allow-main-edits"), null);
+expectBool("touch + trailing # reason → true", isAllowMarkerCommand("touch ~/.pi/agent/.allow-main-edits  # recovery: stranded main", FAKE_HOME), true);
+expectBool("reason extracted from trailing comment", extractMarkerReason("touch ~/.pi/agent/.allow-main-edits  # recovery: stranded main"), "recovery: stranded main");
+expectBool("quoted $HOME variant → true", isAllowMarkerCommand('touch "$HOME/.pi/agent/.allow-main-edits"', FAKE_HOME), true);
+expectBool("bare $HOME variant → true", isAllowMarkerCommand("touch $HOME/.pi/agent/.allow-main-edits", FAKE_HOME), true);
+expectBool("touch of any other path → false", isAllowMarkerCommand("touch /tmp/foo", FAKE_HOME), false);
+expectBool("printf redirect to marker path → false (out-of-contract)", isAllowMarkerCommand("printf 'x' > ~/.pi/agent/.allow-main-edits", FAKE_HOME), false);
+expectBool("combined one-liner touch && git → not a marker command (single-command contract)", isAllowMarkerCommand("touch ~/.pi/agent/.allow-main-edits && git checkout main", FAKE_HOME), false);
+expect("combined one-liner classifies block BEFORE stamping", "touch ~/.pi/agent/.allow-main-edits && git checkout main", "block:checkout-branch");
+
+// parseMarkerContent shape assert
+{
+  const parsed = parseMarkerContent('{"session_id":"s1","reason":"recovery","ts":"2026-08-12T00:00:00.000Z"}');
+  expectBool("parseMarkerContent valid line → object with session_id/reason/ts",
+    parsed !== null && typeof parsed === "object" && parsed.session_id === "s1" && parsed.reason === "recovery" && typeof parsed.ts === "string", true);
+  expectBool("parseMarkerContent garbage/empty → null",
+    parseMarkerContent("not json {") === null && parseMarkerContent("") === null, true);
+}
+
+// Group B — content/session (readAllowMarkerState, real fs in a tmp dir) +
+// Group E — integration (per-call re-read/refresh + symlink defense)
+let markerTmp = null;
+try {
+  markerTmp = execSync("mktemp -d", { encoding: "utf-8" }).trim();
+  // macOS /var and /tmp are symlinks → realpath-resolve the base dir so the
+  // legitimate marker's realpath matches its resolve (only the explicit symlink
+  // case below may differ).
+  const baseDir = realpathSync(markerTmp);
+  const markerPath = `${baseDir}/.allow-main-edits`;
+  const stamp = (sessionId, extra) => JSON.stringify({ session_id: sessionId, ts: "2026-08-12T00:00:00.000Z", ...extra });
+
+  // 7 — valid JSON with matching session_id → active
+  writeFileSync(markerPath, stamp("sess-1", { reason: "recovery" }) + "\n");
+  expectBool("marker valid JSON + matching session_id → active", readAllowMarkerState(markerPath, "sess-1"), true);
+
+  // 8 — valid JSON with mismatched session_id → inactive (parallel-session case)
+  expectBool("marker valid JSON + mismatched session_id → inactive", readAllowMarkerState(markerPath, "sess-2"), false);
+
+  // 9 — valid JSON without session_id (bare terminal touch) → inactive
+  writeFileSync(markerPath, stamp(null, { reason: "recovery" }).replace('"session_id":null,', ""));
+  expectBool("marker valid JSON without session_id (unscoped) → inactive", readAllowMarkerState(markerPath, "sess-1"), false);
+
+  // 10 — unparseable / empty content → inactive
+  writeFileSync(markerPath, "not json {");
+  expectBool("marker unparseable content → inactive", readAllowMarkerState(markerPath, "sess-1"), false);
+  writeFileSync(markerPath, "");
+  expectBool("marker empty content → inactive", readAllowMarkerState(markerPath, "sess-1"), false);
+
+  // 11 — valid JSON without reason → still active (reason is audit-only)
+  writeFileSync(markerPath, stamp("sess-1") + "\n");
+  expectBool("marker valid JSON without reason → still active", readAllowMarkerState(markerPath, "sess-1"), true);
+
+  // 12 — headless null-id: valid stamped content but sessionId arg null → inactive
+  expectBool("headless null session id → inactive (cannot escalate)", readAllowMarkerState(markerPath, null), false);
+
+  // 23 — stale-mtime/refresh proof (no caching): 20-min-old mtime → inactive;
+  // re-`touch`; the SAME function call → active. Different results for the same
+  // path across a touch is impossible if state were cached.
+  const old = new Date(Date.now() - 20 * 60 * 1000);
+  utimesSync(markerPath, old, old);
+  expectBool("marker aged 20 min → inactive (expired)", readAllowMarkerState(markerPath, "sess-1"), false);
+  const now = new Date();
+  utimesSync(markerPath, now, now); // `touch` refreshes mtime, preserves content
+  expectBool("re-touch → SAME read call → active (refresh, no cache)", readAllowMarkerState(markerPath, "sess-1"), true);
+
+  // 24 — symlinked marker → inactive (pinned realpath-inequality check
+  // realpathSync(path) !== resolve(path), production path F6/round-2 F3)
+  const targetPath = `${baseDir}/target-file`;
+  writeFileSync(targetPath, stamp("sess-1", { reason: "recovery" }) + "\n");
+  symlinkSync(targetPath, `${baseDir}/symlinked-marker`);
+  expectBool("symlinked marker → inactive (realpath inequality)", readAllowMarkerState(`${baseDir}/symlinked-marker`, "sess-1"), false);
+} catch (e) {
+  console.log(`⏭️  marker fs cases failed to provision: ${String(e.message).slice(0, 120)}`);
+} finally {
+  if (markerTmp) {
+    try { execSync(`rm -rf "${markerTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

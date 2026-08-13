@@ -1,9 +1,15 @@
 // classify-git.mjs — shared destructive-git classification for main-worktree-guard.
 // Pure JS so both index.ts (via jiti) and test.mjs can import the SAME rules.
+//
+// Also home of the escape-marker (#207) rules — ALLOW_MAIN_EDITS_MARKER_TTL_MS,
+// isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand,
+// extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState — so test.mjs
+// exercises the SAME marker logic index.ts uses (dependency-injected, fail-safe
+// default = inactive → block).
 
 import { execSync } from "node:child_process";
 import { resolve, join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, statSync, readFileSync, realpathSync } from "node:fs";
 
 //
 // Purpose: in the SHARED main checkout, branch-state-changing git operations
@@ -194,4 +200,161 @@ export function isAgentInfraRepo(cwd = process.cwd(), env = process.env) {
     existsSync(join(topLevel, "manifest.json")) &&
     existsSync(join(topLevel, "pi-bootstrap", "setup.sh"))
   );
+}
+
+// ── Escape marker (#207) ────────────────────────────────────────────────────
+// TTL'd file marker at ~/.pi/agent/.allow-main-edits: a deliberate, audited,
+// session-scoped mid-session escalation window for a guard-blocked session.
+// All decision logic lives here (dependency-injected, isAgentInfraRepo(cwd, env)
+// pattern) so index.ts (via jiti) and test.mjs exercise the SAME rules.
+// Fail-safe: any failure (absent / unreadable / expired / unparseable /
+// unscoped / mismatched / symlinked) → inactive → block. Never env-overridable.
+
+// Single source of truth for the marker TTL — a security parameter, so it is
+// deliberately NOT env-overridable (testability comes via function params).
+export const ALLOW_MAIN_EDITS_MARKER_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Is the marker fresh? mtime-based TTL, strict `<` (a marker exactly TTL old
+ * is expired). `touch` refreshes the window. Re-read per tool_call — never
+ * cached at module level.
+ * @param {object|null} stats  fs.Stats from statSync (null = absent)
+ * @param {number} [nowMs]     injected clock (default Date.now())
+ * @param {number} [ttlMs]     injected TTL (default ALLOW_MAIN_EDITS_MARKER_TTL_MS)
+ * @returns {boolean}
+ */
+export function isAllowMarkerActive(stats, nowMs = Date.now(), ttlMs = ALLOW_MAIN_EDITS_MARKER_TTL_MS) {
+  if (!stats) return false; // absent → fail-safe block
+  const age = nowMs - stats.mtimeMs;
+  if (!Number.isFinite(age)) return false; // non-finite mtime → block
+  return age < ttlMs; // negative age = future mtime → true (same-user trust bound)
+}
+
+/**
+ * Parse the one-JSON-line marker content. Missing fields are the read-side
+ * match's problem, not the parser's.
+ * @param {string} content
+ * @returns {object|null} parsed {session_id?, reason?, ts?} or null
+ */
+export function parseMarkerContent(content) {
+  try {
+    const parsed = JSON.parse(String(content ?? "").trim());
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Exact-match path guard: the given path must resolve EXACTLY to
+ * <home>/.pi/agent/.allow-main-edits. Traversal / sibling / unrelated
+ * candidates → false; throw → false.
+ * @param {string} path
+ * @param {string} home
+ * @returns {boolean}
+ */
+export function isAllowMarkerPath(path, home) {
+  try {
+    return resolve(String(path)) === resolve(join(home, ".pi", "agent", ".allow-main-edits"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Extract the trailing `# reason` comment from a marker command.
+ * @param {string} command
+ * @returns {string|null} trimmed reason, or null when absent/empty
+ */
+export function extractMarkerReason(command) {
+  const c = String(command ?? "").trim();
+  const hashIdx = c.indexOf("#");
+  if (hashIdx === -1) return null;
+  const reason = c.slice(hashIdx + 1).trim();
+  return reason || null;
+}
+
+/**
+ * Is `command` a bare `touch <marker-path>` (optional trailing `# reason`)?
+ * One-command-per-touch contract (F10c): chains containing `&&`, `;`, `|`,
+ * `$(...)`, backticks are rejected — the guard classifies the WHOLE command
+ * before any stamping, so a combined `touch ... && git ...` one-liner stays
+ * inert. `printf`/`echo`/redirect to the marker path → false (out-of-contract:
+ * the shell write would clobber the guard's stamp → unscoped → blocked).
+ * Tilde / `$HOME` expansion (incl. quoted variants) happens BEFORE resolve.
+ * @param {string} command
+ * @param {string} home
+ * @returns {boolean}
+ */
+export function isAllowMarkerCommand(command, home) {
+  const c = String(command ?? "").trim();
+  if (!c) return false;
+  // Reject command chains / pipes / substitution (one command per touch).
+  if (/&&|\||;|\$\(|`/.test(c)) return false;
+  // Strip a trailing `# reason` comment before matching the touch form.
+  let rest = c;
+  const hashIdx = rest.indexOf("#");
+  if (hashIdx !== -1) rest = rest.slice(0, hashIdx).trim();
+  // Bare `touch <single-path-token>` only — no flags, exactly one argument.
+  const m = /^touch\s+(\S+)\s*$/.exec(rest);
+  if (!m) return false;
+  return isAllowMarkerPath(_expandMarkerToken(m[1], home), home);
+}
+
+/**
+ * The SOLE symlink defense (pinned firing form, F6/round-2 F3): reject ANY
+ * symlink indirection — realpathSync(path) must equal resolve(path). A broken
+ * link or nonexistent path makes realpathSync throw → false (absent → block).
+ * No isSymbolicLink() branch anywhere (statSync follows symlinks).
+ * @param {string} path
+ * @returns {boolean}
+ */
+export function isAllowMarkerRealpath(path) {
+  try {
+    return realpathSync(String(path)) === resolve(String(path));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Full read-side marker state: active for THIS session ⟺ realpath-clean AND
+ * mtime fresh AND content parses AND session_id matches. Any failure → false
+ * (block). This is the exact function index.ts calls per tool_call.
+ * @param {string} path
+ * @param {string|null|undefined} sessionId
+ * @param {number} [nowMs]
+ * @param {number} [ttlMs]
+ * @returns {boolean}
+ */
+export function readAllowMarkerState(path, sessionId, nowMs = Date.now(), ttlMs = ALLOW_MAIN_EDITS_MARKER_TTL_MS) {
+  try {
+    if (!isAllowMarkerRealpath(path)) return false;
+    const stats = statSync(path);
+    if (!isAllowMarkerActive(stats, nowMs, ttlMs)) return false;
+    const content = readFileSync(path, "utf-8");
+    const parsed = parseMarkerContent(content);
+    if (!parsed) return false;
+    const sid = parsed.session_id;
+    if (typeof sid !== "string" || !sessionId || sid !== sessionId) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Expand a path token: strip surrounding quotes, expand `~` / `$HOME`
+// (incl. ${HOME} and quoted variants) BEFORE resolve + exact-match.
+function _expandMarkerToken(token, home) {
+  let t = String(token).trim();
+  if (
+    (t.startsWith('"') && t.endsWith('"') && t.length >= 2) ||
+    (t.startsWith("'") && t.endsWith("'") && t.length >= 2)
+  ) {
+    t = t.slice(1, -1);
+  }
+  if (t === "~") t = home;
+  else if (t.startsWith("~/")) t = join(home, t.slice(2));
+  t = t.replace(/\$\{HOME\}|\$HOME\b/g, home);
+  return t;
 }

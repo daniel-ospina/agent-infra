@@ -26,6 +26,21 @@ The main checkout is a **SHARED HUB** that stays on `main`. Feature work happens
 
 > **Never** start feature work in the main checkout. **Never** delete a branch without checking `git worktree list` for active checkouts.
 
+## Escaping the main-checkout guard (deliberate mid-session escalation)
+
+If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the recovery git ops needed to un-strand (`git checkout main`, `git pull`, branch recovery) — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
+
+```bash
+# must be its OWN bash tool call inside a guard-loaded session
+touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>
+```
+
+- **One command per touch.** A combined `touch ... && git checkout main` in ONE bash call does NOT work — the guard classifies the whole command before stamping, so the git part blocks and the touch never runs. The recovery git op goes in the **FOLLOW-UP** call.
+- **15-minute expiry, refresh by re-touch.** The window is mtime-based (fixed 15-min TTL, not env-overridable), re-read on every tool call, never cached. Re-running the same `touch` refreshes the window; a marker exactly 15 minutes old is expired and the recovery op is blocked again.
+- **Session-scoped + guard-stamped.** Only the guard's tool_call handler writes the session id + reason stamp; a human-terminal `touch` produces an unscoped empty file → inert → blocked. Headless/print-mode sessions with a null session id cannot escalate.
+- **Delegation does NOT work.** A subagent does not inherit the parent's `PI_SESSION_ID` — recovery must run in the session that created the marker; delegating the touch to a subagent re-scopes the marker to the subagent's id or fails-closed.
+- **Hung processes are NOT helped.** A hung process cannot issue any tool call, so it can never touch a marker. The hung-process class has no owner (process-supervision follow-up required) — see the guard README (`extensions/main-worktree-guard/README.md`) for the full contract, audit location, and verification checklist.
+
 ## Step 0: Detect Main Repo Root
 
 **Always run this first.** When called from inside an agent worktree, `$PWD` and `git rev-parse --show-toplevel` return the worktree's path, not the main repo. All directory checks and worktree creation must use `$MAIN_REPO` as the base to prevent nested worktrees.
