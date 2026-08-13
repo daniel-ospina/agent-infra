@@ -19,7 +19,12 @@ import { existsSync } from "node:fs";
 export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "reset", re: /\bgit\s+reset\b/ },
   { name: "clean", re: /\bgit\s+clean\b/ },
-  { name: "merge", re: /\bgit\s+merge\b/ },
+  // #210: require space/EOL after "merge" — \b matched the hyphen in
+  // `git merge-base` (word boundary), blocking a read-only ancestor check and
+  // pushing the session into a 29h nested-pi detour (2026-08-11). The
+  // space/EOL requirement inherently excludes the read-only merge-* family
+  // (merge-base, merge-file, merge-tree) while keeping real merges blocked.
+  { name: "merge", re: /\bgit\s+merge(?:$|\s)/ },
   { name: "rebase", re: /\bgit\s+rebase\b/ },
   { name: "pull", re: /\bgit\s+pull\b/ },
   { name: "branch-force-delete", re: /\bgit\s+branch\s+-\w*D\b/ },

@@ -31,6 +31,12 @@ expect("checkout -- .", "git checkout -- .", "block:checkout-discard-all");
 expect("clean -fd", "git clean -fd", "block:clean");
 expect("pull", "git pull origin main", "block:pull");
 expect("merge", "git merge origin/main", "block:merge");
+expect("merge --ff-only", "git merge --ff-only main", "block:merge");
+// #210: read-only merge-* subcommands must NOT false-positive as merge
+// (the hyphen used to match \b — 2026-08-11 incident: a read-only ancestor
+// check was blocked, pushing the session into a 29h nested-pi detour).
+expect("merge-base allow", "git merge-base --is-ancestor main feat/x", "allow");
+expect("merge-tree allow", "git merge-tree main feat/x", "allow");
 expect("rebase", "git rebase main", "block:rebase");
 expect("branch -D", "git branch -D chore/old", "block:branch-force-delete");
 expect("force push", "git push -f origin main", "block:force-push");
