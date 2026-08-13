@@ -19,10 +19,10 @@ mkdir -p $A/skills/commit-workflow $A/skills/supabase
 touch $A/skills/commit-workflow/SKILL.md $A/skills/supabase/SKILL.md
 run "A-populated-clean" 0 "$A"
 
-# Fixture B: populated missing one manifest skill -> 1
+# Fixture B: populated table missing one manifest skill ROW -> 1 (Pass 2 forward)
 B=$(mktemp -d /tmp/239-fix-B.XXXX); cp -r $A/. $B/ 2>/dev/null; mkdir -p $B/enforcement $B/skills
 printf 'commit-workflow # p # h # m\nsupabase # p2 # h # m2\n' > $B/enforcement/dangerous-ops.txt
-rm -rf $B/skills/supabase
+printf '# AGENTS.md\n\n| Trigger | Must invoke |\n|---|---|\n| any | `skills/commit-workflow/SKILL.md` |\n' > $B/AGENTS.md
 run "B-missing-table-row" 1 "$B"
 
 # Fixture C: populated with extra ghost row not in manifest -> 1 (reverse)

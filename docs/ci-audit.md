@@ -16,7 +16,7 @@ aboutObjects: eldato, agent-infra, ci-audit
 > **Phase:** 1
 > **Date:** 2026-07-30
 >
-> **Scope (issue #239):** this document is the **eldato** CI audit, kept in agent-infra as an extraction reference. Of the workflows listed in §3, only `ci.yml` and the compliance gate exist in agent-infra (eldato's `compliance-gate.yml` §3.1 — ported/renamed as `pipeline-compliance.yml`, dogfood copy per its header); exist in agent-infra; all others (including `check-drift.yml`, `enforce-skills.yml`, `replay-smoke-test.yml`) describe eldato — rows struck through are explicitly not ported. agent-infra has **zero cron-scheduled workflows**.
+> **Scope (issue #239):** this document is the **eldato** CI audit, kept in agent-infra as an extraction reference. Of the workflows listed in §3, only `ci.yml` and the compliance gate exist in agent-infra (eldato's `compliance-gate.yml` §3.1 — ported/renamed as `pipeline-compliance.yml`, dogfood copy per its header); all others (including `check-drift.yml`, `enforce-skills.yml`, `replay-smoke-test.yml`) describe eldato — rows struck through are explicitly not ported. agent-infra has **zero cron-scheduled workflows**.
 
 Full inventory of CI components in `/Users/home/eldato` with classification:
 - **modular**: repo-agnostic, ready to share via `agent-infra`
