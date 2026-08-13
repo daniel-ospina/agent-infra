@@ -138,9 +138,20 @@ validate_brief_path() {
     */.git/*|*/.git|.git/*|*/.*|.[^/]*/*)
       echo "Error: refusing to write to a .git or hidden path: $brief" >&2; return 1 ;;
   esac
-  local dir absdir root absroot
+  local dir probe parent absdir root absroot orig_cwd
+  orig_cwd=$(pwd)
   dir=$(dirname "$brief")
-  absdir=$(cd "$dir" 2>/dev/null && pwd -P) || { echo "Error: cannot resolve directory: $dir" >&2; return 1; }
+  # Walk up to the nearest EXISTING ancestor for the containment test — tolerates
+  # create-into-missing-directory WITHOUT creating anything (cycle-3 P2: the mkdir
+  # must not run before validation, or an out-of-tree path creates dirs pre-reject).
+  probe="$dir"
+  while ! cd "$probe" 2>/dev/null; do
+    parent=$(dirname "$probe")
+    [[ "$parent" == "$probe" ]] && { echo "Error: cannot resolve directory: $dir" >&2; return 1; }
+    probe="$parent"
+  done
+  absdir=$(cd "$probe" && pwd -P)
+  cd "$orig_cwd"   # restore cwd before resolving the repo root (the walk mutated it)
   root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
   absroot=$(cd "$root" && pwd -P)
   case "$absdir" in
@@ -250,10 +261,9 @@ run_self_test() {
   grep -q 'resolved finding' "$resolv" || { echo "FAIL: resolved append content missing"; exit 1; }
   # 6. no-resolvable-path → exit 0, nothing appended (documented no-op)
   local out2 rc2
-  out2=$(cd "$testrepo" && bash "$SCRIPT_PATH" --append "orphan" 2>&1); rc2=$?
+  if out2=$(cd "$testrepo" && bash "$SCRIPT_PATH" --append "orphan" 2>&1); then rc2=0; else rc2=$?; fi
   [[ $rc2 -eq 0 ]] || { echo "FAIL: no-resolve exit code: $rc2"; exit 1; }
   echo "$out2" | grep -q "No research brief found" || { echo "FAIL: no-resolve no-op message: $out2"; exit 1; }
-  ls "$testrepo"/*.md >/dev/null 2>&1 || true
   [[ ! -f "$testrepo/orphan.md" ]] || { echo "FAIL: orphan appended despite no-op"; exit 1; }
 
   # 7. create-into-missing-directory (P3 guard)
@@ -262,6 +272,14 @@ run_self_test() {
   out3=$(cd "$testrepo" && bash "$SCRIPT_PATH" --issue-body "**Research:** $fresh" --create --append "fresh brief" 2>&1)
   [[ "$out3" == *"Appended to $fresh"* ]] || { echo "FAIL: create-into-missing-dir: $out3"; exit 1; }
   grep -q 'fresh brief' "$fresh" || { echo "FAIL: fresh brief content missing"; exit 1; }
+
+  # 8. out-of-tree path with --create → RC 3 AND no directory created (cycle-3 P2 guard)
+  local outtree="$SELF_TEST_TMP/out-of-tree"
+  local out4 rc4
+  if out4=$(cd "$testrepo" && bash "$SCRIPT_PATH" --issue-body "**Research:** $outtree/evil/brief.md" --create --append "evil" 2>&1); then rc4=0; else rc4=$?; fi
+  [[ $rc4 -eq 3 ]] || { echo "FAIL: out-of-tree RC (got $rc4): $out4"; exit 1; }
+  echo "$out4" | grep -q "outside the repo root" || { echo "FAIL: out-of-tree message: $out4"; exit 1; }
+  [[ ! -d "$outtree" ]] || { echo "FAIL: out-of-tree directory was created"; exit 1; }
 
   echo "self-test OK"
   exit 0
@@ -281,12 +299,9 @@ if ! BRIEF=$(resolve_brief_path); then
   exit 0
 fi
 
-# P3 (review round 2): with --create into a not-yet-existing directory, create the
-# parent FIRST so validate_brief_path's containment check can resolve it.
-if [[ "$DO_CREATE" -eq 1 ]]; then
-  mkdir -p "$(dirname "$BRIEF")"
-fi
-
+# P3 (review round 2): validate tolerates missing dirs by walking to the nearest
+# existing ancestor — no mkdir here (cycle-3 P2: an out-of-tree path must NOT create
+# directories pre-reject). create_brief does the mkdir -p after validation passes.
 if ! validate_brief_path "$BRIEF"; then
   exit 3
 fi
