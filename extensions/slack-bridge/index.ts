@@ -36,6 +36,7 @@ import {
   settleSupersededMessage, // #157: ↻ banner when a new revision supersedes
   settleRedraftEscalatedMessage, // #158: ⏱ banner when the 24h TTL expires (dead-session recovery)
   REVISION_CAP, // #157: shared cap — matches the epic decision
+  loadScaledTimeoutMs, // #209: load-aware shell-out timeout scaling (keep-in-sync with socket-mode.ts)
   type SocketModeState,
 } from "./socket-mode.ts";
 
@@ -108,7 +109,16 @@ const cycleBuffer: { slug: string; cycles: number; text: string }[] = [];
 
 /** Print mode (headless `pi -p` / task sub-agents): the bridge is fully silent. */
 function isPrintMode(): boolean {
-  return process.env.PI_MODE === "print";
+  // #172 print-mode detection. NOTE: pi NEVER sets PI_MODE (verified
+  // 2026-08-13: pi parses -p/--print into an internal flag in cli/args.js
+  // but exports nothing) — the env-only check was dead code, so every
+  // headless one-shot (task sub-agents spawn `pi -p ...` per builtin-tools
+  // index.ts:1380, CLI -p runs, background workers) enabled Socket Mode +
+  // bridge hooks, hit Slack's 10-connection app cap, and logged the
+  // `Socket Mode error:` / `disconnected (code=1006)` pair in every
+  // session. Detect print mode from argv as well.
+  if (process.env.PI_MODE === "print") return true;
+  return process.argv.includes("-p") || process.argv.includes("--print");
 }
 
 /**
@@ -981,16 +991,22 @@ const REDRAFT_ESCALATE_MS = 24 * 60 * 60 * 1000; // 24h — TTL escalation
  * — `git remote get-url origin` intermittently stalls for multi-second stretches
  * on macOS (observed up to >80s; ~1-in-3 suite runs flaked on the 2s cap,
  * falling back to the wrong store). Env-overridable via GIT_REMOTE_TIMEOUT_MS;
- * read per call so tests/harness can tune. Invalid/absent → 5000.
- * KEEP-IN-SYNC: socket-mode.ts duplicates this getter (#2492/#196).
+ * read per call so tests/harness can tune. #209: the *implicit* default is
+ * load-aware (5s base scaled 1x/2x/3x by loadavg, clamped to 60s); an explicit
+ * GIT_REMOTE_TIMEOUT_MS always wins. Invalid/absent → load-scaled default.
+ * KEEP-IN-SYNC: socket-mode.ts duplicates this getter (#2492/#196/#209).
  */
 export function gitRemoteTimeoutMs(): number {
   const raw = process.env.GIT_REMOTE_TIMEOUT_MS ?? "";
   // Strict: digits only (parseInt silently truncates "1e3" → 1ms, "5000.5" →
   // 5000), positive, and clamped to 60s so a typo can't freeze the event
-  // loop for minutes. Anything else → 5000.
+  // loop for minutes. Anything else → the load-scaled default (below).
   const n = /^\d+$/.test(raw) ? Number(raw) : NaN;
-  return Number.isSafeInteger(n) && n > 0 && n <= 60000 ? n : 5000;
+  if (Number.isSafeInteger(n) && n > 0 && n <= 60000) return n; // explicit env wins
+  // #209: implicit default is load-aware — 5s base scaled 1x/2x/3x by loadavg,
+  // clamped to the 60s ceiling (can't grow unbounded). Under a load storm the
+  // fixed 5s (#196) would still cut a legitimately-stalled `git remote get-url`.
+  return Math.min(60_000, loadScaledTimeoutMs(5000));
 }
 const GH_API_TIMEOUT_MS = 15000; // gh api call cap
 
@@ -1534,7 +1550,7 @@ export default function slackBridge(pi: ExtensionAPI): void {
       // #158: the dead-session recovery startup sweep rides the same
       // session_start wiring (approval capability, same disable conditions).
       // Without the token the receiver never starts — zero behavior change.
-      if (process.env.PI_MODE !== 'print') {
+      if (!isPrintMode()) {
         registerSocketModeHooks(pi);
         console.log(
           isSocketModeEnabled()
@@ -1543,7 +1559,7 @@ export default function slackBridge(pi: ExtensionAPI): void {
         );
       }
       // #5672: suppress startup banner in print mode (task sub-agent output)
-      if (process.env.PI_MODE !== 'print') {
+      if (!isPrintMode()) {
         console.log("[slack-bridge] ✅ Loaded");
       }
     } catch (err: any) {
@@ -1555,7 +1571,7 @@ export default function slackBridge(pi: ExtensionAPI): void {
   // line; starts the poller only when SLACK_BOT_TOKEN + a channel are set.
   // Skipped in print mode (task sub-agents: one-shot, no Slack — matches the
   // SLACK_BRIDGE_DISABLE=1 convention in builtin-tools).
-  if (process.env.PI_MODE !== 'print') {
+  if (!isPrintMode()) {
     initApprovalForwarding();
   }
 }

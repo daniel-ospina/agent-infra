@@ -19,6 +19,12 @@ Bounded skill that defines what the epic includes and excludes. Takes the strate
 
 ## Workflow
 
+### Step 0 — Granular Axis Research (issue #231 D11)
+
+When the research brief is **too broad for boundary decisions** (a complexity axis **expected to rate `medium+`** — preliminary assessment performed here, formalized in Step 3 below; the Review Gate validates the final ratings against the `### Axis Research Notes` output), fire granular per-axis queries — canonical / competitor-precedent / pitfalls framing, ≤ 4 total, deduped against the brief (deduplicated questions never count). Output `### Axis Research Notes` in the scope doc with a `> **Findings date:**` stamp + provenance, and append each finding to the epic brief's `## Raw Notes` via `bash scripts/_research_append.sh --epic-path <brief-path> --append "<text>" --source-tag <framing>`. Under `EXECUTION_INTENT=Budget`: defer to the brief (zero external queries). The Review Gate (below) checks `### Axis Research Notes` present-or-justified-skip for each final `medium+` axis (justified = cited brief section).
+
+> **Disambiguation:** `### Axis Research Notes` (epic tier, scope doc) is distinct from issue-scoping's `### Axis Research` (issue tier, issue comment — D5 artifact) — different levels, never merge.
+
 ### Step 1 — Scope Boundaries
 
 Define what is IN and OUT of scope:
@@ -113,6 +119,7 @@ Review this epic scope for:
 3. E2E COVERAGE: Do the high-level test cases cover all in-scope items? Any gaps?
 4. E2E TESTABILITY: Can each test case be verified without knowing UI details? (Should be behavioral, not presentational)
 5. COMPLEXITY HONESTY: Are complexity ratings justified by the scope and research?
+6. RESEARCH CHECK (issue #231 D11): For each complexity axis rated `medium+`, is `### Axis Research Notes` present in the scope doc, OR a justified skip (cited brief section covering the boundary question at sufficient granularity)?
 
 Return: NO ISSUES FOUND | ISSUES: <list>
 ```

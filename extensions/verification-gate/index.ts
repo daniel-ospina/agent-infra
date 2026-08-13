@@ -272,7 +272,11 @@ const GIT_COMMIT_PATTERN = /(^|\s)git\s+(commit|push)(?=\s|$)/;
 // not pre-push. Setting pendingRehash on push wastes I/O — the next git op re-hashes
 // all verifiedSet entries from disk unnecessarily.
 const GIT_COMMIT_ONLY_PATTERN = /(^|\s)git\s+commit(?=\s|$)/;
-const GH_PR_PATTERN = /(^|\s)gh\s+pr\s+(create|merge)(?=\s|$)/;
+const GH_PR_PATTERN = /(^|\s)gh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+(create|merge)(?=\s|$)/;
+// #204 review P2-1: gh's merge verb with the optional global -R/--repo flag
+// between `gh` and `pr` — `gh -R owner/name pr merge 123` is a valid spelling
+// and must route into the merge-scope path like the post-verb flag form.
+const GH_PR_MERGE_VERB = /(?:^|\s)gh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+merge(?=\s|$)/;
 
 export function isGitOp(command: string): boolean {
   return GIT_COMMIT_PATTERN.test(command) || GH_PR_PATTERN.test(command);
@@ -285,9 +289,278 @@ export function isGitCommit(command: string): boolean {
 // ponytail: parse cd prefixes in bash commands so git ops in worktrees
 // resolve to the correct repo root. pi's bash tool keeps process.cwd()
 // unchanged even when the shell script starts with "cd /worktree &&".
+// #204 review P2-2: the cd must sit at a REAL command boundary (start, or
+// after &&/;/||/| — and a bare newline, which bash treats as a separator)
+// — a `cd /tmp &&` sequence inside quoted prose (e.g. `--comment "see cd
+// /tmp && x"`) must not poison the resolved cwd (a poisoned cwd fed the
+// merge-scope repo/head comparison → false skip).
 export function extractCdPath(command: string): string | null {
-  const m = command.match(/(?:^|\s)cd\s+(['"]?)([^;&|]+?)\1\s*(?:&&|;)/);
+  // Quote-aware: mask quoted regions so a `cd /tmp &&` inside --comment/
+  // --body prose can never anchor the separator scan (review #230 P2-3:
+  // `gh pr merge 1 --comment "see; cd /tmp && x"` poisoned the cwd). A quoted
+  // region that directly follows `cd ` is the cd ARGUMENT — preserved so
+  // `cd "/path with spaces" && git …` still extracts.
+  const masked = command.replace(
+    /(["'])(?:\\.|(?!\1)[\s\S])*\1/g,
+    (q: string, _quote: string, offset: number) => {
+      const before = command.slice(Math.max(0, offset - 4), offset);
+      return /cd\s+$/.test(before) ? q : " ".repeat(q.length);
+    },
+  );
+  const m = masked.match(/(?:^|&&\s*|;\s*|\|\|\s*|\|\s*|\n\s*)\s*cd\s+(['"]?)([^;&|]+?)\1\s*(?:&&|;)/);
   return m ? resolve(m[2]) : null;
+}
+
+// ── Merge scope resolution (#204) ─────────────────────
+// `gh pr merge` merges REMOTELY — the local checkout's `git diff
+// origin/main...HEAD` is only meaningful when (a) the cwd repo IS the PR's
+// repo AND (b) the checkout is on the PR head branch. In orchestrator flows
+// both premises break: a session in repo A merging a PR in repo B (explicit
+// --repo/GH_REPO or not), or a same-repo checkout sitting on a stale/wrong
+// branch with unmerged residue. Blocking on that residue is a false block and
+// (per #190) the drift files get blessed into verifiedSet + the bridge once a
+// verifier dispatch resolves it — contaminating later sessions in the same
+// worktree root. The skip path below returns BEFORE computeBranchDiff, so no
+// changedFiles, no block, no verifiedSet/bridge writes: drift can never reach
+// the registry or the recovery channel.
+//
+// Cross-repo is decidable WITHOUT gh/network: an explicit --repo/-R/GH_REPO
+// names a repo; compare to the cwd origin (parsed from `git remote get-url
+// origin`). With no flag/env, gh targets the cwd repo by construction →
+// same-repo path. The head check (`gh pr view <n> --json headRefOid`) is the
+// only network call and only fires on the same-repo path.
+//
+// ponytail: extractRepoFlag/extractGhRepoEnv/extractPrNumber are local copies
+// of review-enforcer's helpers (extensions/review-enforcer/index.ts). A
+// cross-extension import would couple the two extensions' independent load
+// graphs — pi's loader compiles each extension as its own module (#5611) — and
+// the regexes are tiny (rule of two: promote to extensions/shared/ when a
+// third consumer appears). Keep them in sync with the review-enforcer source.
+
+// #204 review P2-2: verb-anchored merge detection. GH_PR_PATTERN is a
+// substring scan, so `gh pr create --body "run gh pr merge 42"` would match
+// the merge verb inside quoted prose and route a CREATE into the merge-scope
+// path (possibly skipping its branch-diff verification). Strip cd/&& prefixes
+// and inline env assignments, then the command itself must START with
+// `gh pr merge`. A chained merge (`gh issue create ... && gh pr merge 123`)
+// is NOT anchored → fail-closed status-quo verify (old behavior, no skip).
+export function isMergeCommand(command: string): boolean {
+  const stripped = command
+    .replace(/^\s+/, "")
+    .replace(/^(?:cd\s+(?:['"][^'"]+['"]|[^\s;&|]+)\s*&&\s*)+/i, "")
+    .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)+/, "");
+  // Anchored at ^ (with the optional global flag): the merge verb must be the
+  // command's OWN first verb, never a substring in prose or a chained command.
+  return /^gh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+merge(?=\s|$)/.test(stripped);
+}
+
+// #204 review P2-1: return the merge command's OWN invocation text — from the
+// last command separator before the merge verb through the next separator
+// after it, with quoted strings removed. A `--repo`/`GH_REPO` belonging to a
+// DIFFERENT command (chained with &&/;), or to quoted prose (e.g. `--comment
+// "see --repo fake/x"`), must never decide this merge's scope — a false
+// cross_repo would skip verification of a genuine same-repo merge. Keeps
+// `GH_REPO=x ` prefixes and gh's global `-R owner/name` (no separator). A
+// genuinely quoted flag VALUE (`--repo "a/b"`) degrades to no-match →
+// fail-closed verify, never a skip.
+export function mergeCommandWindow(command: string): string {
+  const verb = command.match(GH_PR_MERGE_VERB);
+  if (!verb) return command;
+  const verbStart = verb.index ?? 0;
+  const verbEnd = verbStart + verb[0].length;
+  const sepRe = /&&|\|\||;|\n|\|/g;
+  let segStart = 0;
+  for (const m of command.slice(0, verbStart).matchAll(sepRe)) {
+    segStart = (m.index ?? 0) + m[0].length;
+  }
+  const tail = command.slice(verbEnd);
+  const tailSep = tail.search(sepRe);
+  const tailEnd = tailSep === -1 ? tail.length : tailSep;
+  return command.slice(segStart, verbEnd + tailEnd).replace(/"[^"]*"/g, " ").replace(/'[^']*'/g, " ");
+}
+
+// Priority 1: explicit --repo owner/name (or -R, or --repo=owner/name) flag.
+/** Normalize a raw repo capture to exactly OWNER/REPO: strip a leading
+ * [HOST/] segment (gh accepts GH_REPO=[HOST/]OWNER/REPO; --repo is
+ * OWNER/REPO only). A value with >2 segments after host-stripping, or an
+ * empty/garbage identity, yields null — fail-closed (review #230 P2-2: the
+ * unanchored capture turned "github.com/owner/repo" into the garbage
+ * identity "github.com/owner" and flipped same-repo merges into wrong
+ * cross-repo skips). */
+function normalizeRepoCapture(raw: string): string | null {
+  const parts = raw.split("/").filter(Boolean);
+  if (parts.length === 2) return parts.join("/");
+  if (parts.length === 3) return `${parts[1]}/${parts[2]}`; // host/owner/repo
+  return null; // 4+ segments — garbage identity, fail-closed
+}
+
+export function extractRepoFlag(command: string): string | null {
+  // 2-3 segments: a HOST/ prefix must reach normalizeRepoCapture (the old
+  // two-segment capture turned "github.com/owner/repo" into "github.com/owner").
+  const m = command.match(/(?:--repo|-R)(?:=|\s+)([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+){1,3})/);
+  return m ? normalizeRepoCapture(m[1]) : null;
+}
+
+// Priority 2: GH_REPO=owner/name env assignment prefix in the command.
+export function extractGhRepoEnv(command: string): string | null {
+  const m = command.match(/(?:^|\s)GH_REPO=([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+){1,3})/);
+  return m ? normalizeRepoCapture(m[1]) : null;
+}
+
+// Extract the PR number from `gh pr merge <n>` (merge branch only). The number
+// may sit before or after flags (`gh pr merge 123 --squash` and
+// `gh pr merge --squash 123` are both valid gh spellings), so scan the token
+// stream after the merge verb for the first pure-integer token — flag values
+// (owner/name repos, quoted bodies) never tokenize as a bare integer.
+export function extractPrNumber(command: string): number | null {
+  const m = command.match(GH_PR_MERGE_VERB);
+  if (!m) return null;
+  const rest = command.slice((m.index ?? 0) + m[0].length);
+  for (const token of rest.split(/\s+/)) {
+    if (/^\d+$/.test(token)) return parseInt(token, 10);
+  }
+  return null;
+}
+
+// Parse owner/name from a git remote URL: GitHub SSH (git@github.com:o/n.git),
+// ssh://git@ (colon form), HTTPS/git:// (https://github.com/o/n.git, incl.
+// port or credentials). Host-agnostic on purpose — any host's owner/name is a
+// valid identity for the cwd-repo comparison. Anything else (local paths,
+// garbage, missing remote) → null → fail-closed to the same-repo path: an
+// unparseable origin must never produce an accidental skip. Trailing .git/
+// slashes are stripped and the result must be a valid owner/name shape, so
+// cosmetic remote drift cannot yield a garbage identity.
+export function repoNameFromRemote(url: string): string | null {
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  const ssh = trimmed.match(/^(?:git@|ssh:\/\/git@)[^:]+:(.+)$/);
+  const http = trimmed.match(/^(?:https?|git|ssh):\/\/[^/]+\/(.+)$/);
+  const raw = (ssh ?? http)?.[1];
+  if (!raw) return null;
+  const clean = raw.replace(/\.git\/?$/, "").replace(/\/+$/, "");
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(clean) ? clean : null;
+}
+
+// GitHub repo identity is case-insensitive and cosmetic `.git`/trailing-slash
+// drift must never false-mismatch — normalize both sides of the comparison so
+// a same-repo merge can never be skipped on repo-identity grounds.
+function normalizeRepoName(repo: string | null): string | null {
+  if (!repo) return null;
+  return repo.toLowerCase().replace(/\.git\/?$/, "").replace(/\/+$/, "");
+}
+
+function isCrossRepo(cwdRepo: string | null, explicitRepo: string | null): boolean {
+  const cwdRepoN = normalizeRepoName(cwdRepo);
+  const explicitRepoN = normalizeRepoName(explicitRepo);
+  return !!explicitRepoN && !!cwdRepoN && explicitRepoN !== cwdRepoN;
+}
+
+// Redact credentials from a command before it hits the audit log (the audit
+// files are world-readable — an inlined GH_TOKEN=… must never persist).
+function redactCommand(command: string): string {
+  return command
+    .replace(/\b(?:GH|GITHUB)_TOKEN=\S+/gi, "***")
+    .replace(/ghp_[A-Za-z0-9]+/g, "ghp_***")
+    .replace(/github_pat_[A-Za-z0-9_]+/g, "github_pat_***");
+}
+
+export interface MergeScopeDecision {
+  verify: boolean;
+  reason: "cross_repo" | "head_mismatch" | "same_repo_head_match" | "same_repo_head_unknown";
+}
+
+// Pure merge-scope decision (review-enforcer evaluateMergeGate style — I/O
+// separated so the 4-combo table is unit-testable).
+//
+//   explicitRepo | localHead vs prHead   | action
+//   ------------ | -------------------- | -------------------------------
+//   ≠ cwdRepo    | —                    | skip (cross_repo)
+//   = (or none)  | == (worktree merge)  | verify (status quo, no regression)
+//   = (or none)  | ≠ (stale checkout)   | skip (head_mismatch)
+//   = (or none)  | prHead unknown       | verify (fail-closed)
+//
+// Fail-closed everywhere: unknown localHead OR prHead (gh/network failure) →
+// verify (status quo); unparseable cwdRepo (null) can never produce a
+// cross_repo skip on repo grounds.
+export function evaluateMergeScope(
+  cwdRepo: string | null,
+  explicitRepo: string | null,
+  localHead: string | null,
+  prHead: string | null
+): MergeScopeDecision {
+  // GitHub repo identity is case-insensitive; cosmetic `.git`/trailing-slash
+  // drift must never produce a false cross_repo skip (normalized comparison).
+  if (isCrossRepo(cwdRepo, explicitRepo)) {
+    return { verify: false, reason: "cross_repo" };
+  }
+  if (localHead !== null && prHead !== null && localHead !== prHead) {
+    return { verify: false, reason: "head_mismatch" };
+  }
+  return {
+    verify: true,
+    reason: localHead !== null && prHead !== null ? "same_repo_head_match" : "same_repo_head_unknown",
+  };
+}
+
+function originRemote(cwd: string): string | null {
+  try {
+    const out = execSync("git remote get-url origin", { encoding: "utf-8", cwd, timeout: 5000 }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+function localHeadSha(cwd: string): string | null {
+  try {
+    const out = execSync("git rev-parse HEAD", { encoding: "utf-8", cwd, timeout: 5000 }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+// Current PR head via gh. When the merge command resolved an explicit repo
+// (--repo flag / GH_REPO= env), FORCE it with --repo — gh's own resolution
+// (flag > GH_REPO env > cwd) could otherwise hijack the head check to a
+// different repo when the session env carries a stale GH_REPO (review #230
+// P1: wrong skip + the #190 drift-contamination vector re-opens). When no
+// explicit repo, the head check and the actual merge inherit the same env,
+// so they agree. Same shape as review-enforcer's getPrHeadSha. null on ANY
+// failure (network, gh missing, 404) — fail-closed.
+function getPrHeadSha(pr: number, cwd: string, explicitRepo?: string | null): string | null {
+  try {
+    const repoArg = explicitRepo ? ` --repo ${explicitRepo}` : "";
+    const out = execSync(`gh pr view ${pr} --json headRefOid --jq .headRefOid${repoArg}`, {
+      encoding: "utf-8",
+      cwd,
+      timeout: 15000,
+    });
+    const sha = out.trim();
+    return sha || null;
+  } catch {
+    return null;
+  }
+}
+
+// I/O orchestration for the hook: repo resolution + head fetch, returning the
+// pure decision. Cross-repo short-circuits BEFORE any gh call (network-free).
+export function resolveMergeScope(command: string, cwd: string): MergeScopeDecision {
+  // Scan only the merge command's own invocation: a `--repo` in a quoted arg
+  // or a chained command belongs to a different command and must not decide
+  // this merge's scope (false cross_repo → skipped same-repo verification).
+  const window = mergeCommandWindow(command);
+  const explicitRepo = extractRepoFlag(window) ?? extractGhRepoEnv(window);
+  const cwdRepo = repoNameFromRemote(originRemote(cwd));
+  // Normalized comparison (case-insensitive, .git/trailing-slash tolerant) —
+  // cross-repo is decidable without gh/network: short-circuit BEFORE the call.
+  if (isCrossRepo(cwdRepo, explicitRepo)) {
+    return { verify: false, reason: "cross_repo" };
+  }
+  const pr = extractPrNumber(window);
+  const localHead = localHeadSha(cwd);
+  const prHead = pr !== null ? getPrHeadSha(pr, cwd, explicitRepo) : null;
+  return evaluateMergeScope(cwdRepo, explicitRepo, localHead, prHead);
 }
 
 // ── Diff computation ──────────────────────────────────
@@ -635,6 +908,20 @@ export default function (pi: ExtensionAPI) {
     // Compute diff
     let changedFiles: string[];
     if (GH_PR_PATTERN.test(command)) {
+      // #204: `gh pr merge` merges REMOTELY. Only the PR's own repo+head can
+      // be verified locally; anything else is unrelated branch residue that
+      // must neither block nor reach verifiedSet/bridge (drift contamination).
+      // `gh pr create` is NOT scoped — its diff IS this branch's files. The
+      // merge-vs-create split is verb-anchored (isMergeCommand), so a create
+      // whose --body merely MENTIONS "gh pr merge <n>" is never routed here.
+      if (isMergeCommand(command)) {
+        const decision = resolveMergeScope(command, cwd);
+        if (!decision.verify) {
+          console.log(`[verification-gate] ⏭️ Skipping verification for gh pr merge — ${decision.reason}: nothing local represents the PR`);
+          appendJsonl({ event: "gate_skip", extension: "verification-gate", reason: decision.reason, session_cwd: process.cwd(), target_cwd: cwd, command: redactCommand(command) }); // #60: durable audit record — skipped verification must leave a trace (tokens redacted: audit files are world-readable)
+          return undefined; // before computeBranchDiff: no files, no block, no registry/bridge writes
+        }
+      }
       changedFiles = computeBranchDiff(cwd);
     } else {
       changedFiles = computeStagedDiff(cwd);

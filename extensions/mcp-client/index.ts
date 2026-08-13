@@ -28,6 +28,13 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
+// ── Lifecycle constants (#199) ─────────────────────────────────────
+
+/** Default idle-stop threshold for lazy servers (30 min). */
+export const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+/** How often the idle sweep checks for lazy servers past their idle timeout. */
+export const IDLE_SWEEP_INTERVAL_MS = 60 * 1000;
+
 // ── Types ──────────────────────────────────────────────────────────
 
 interface McpServerConfig {
@@ -41,6 +48,15 @@ interface McpServerConfig {
   headers?: Record<string, string>;
   // Connection timeout override (ms). Defaults to 15000 if unset.
   timeoutMs?: number;
+  // ── Lifecycle tiering (#199) ────────────────────────────────────
+  // lazy: true → NOT connected at startup; load on demand via mcp_load.
+  lazy?: boolean;
+  // Idle-stop threshold for lazy servers (ms). Defaults to DEFAULT_IDLE_TIMEOUT_MS.
+  idleTimeoutMs?: number;
+  // Catalog metadata (surfaced via mcp_catalog; no connect needed).
+  purpose?: string;
+  whenToLoad?: string;
+  cost?: string;
 }
 
 interface McpJson {
@@ -96,6 +112,9 @@ function jsonSchemaToTypeBox(schema: any): TSchema {
 interface McpConnection {
   client: Client;
   serverName: string;
+  lazy: boolean;
+  idleTimeoutMs: number;
+  lastUsed: number;
 }
 
 // ── MCP Server Manager ──────────────────────────────────────────────
@@ -277,13 +296,47 @@ function getAllowedServers(): Set<string> | undefined {
   return new Set(raw.split(",").map(s => s.trim()).filter(Boolean));
 }
 
-class McpServerManager {
+/**
+ * #199: partition declared servers into the eager core (connect at startup)
+ * and lazy servers (skip at startup, load on demand via mcp_load).
+ *
+ * - No PI_MCP_SERVERS → non-lazy servers are eager; lazy servers are skipped.
+ * - PI_MCP_SERVERS set → ONLY the named servers load, and they load eagerly
+ *   (explicitly naming a lazy server forces eager — skills pass e.g.
+ *   gemini,cloudinary to the task tool's mcp_servers param for image work).
+ *   Unnamed servers are excluded entirely.
+ *
+ * Exported (named) for unit tests.
+ */
+export function classifyServers(
+  servers: Record<string, McpServerConfig>,
+  allowedServers: Set<string> | undefined
+): { eager: [string, McpServerConfig][]; lazySkipped: string[] } {
+  const eager: [string, McpServerConfig][] = [];
+  const lazySkipped: string[] = [];
+  for (const [name, cfg] of Object.entries(servers)) {
+    if (allowedServers && !allowedServers.has(name)) continue; // excluded by PI_MCP_SERVERS
+    const forcedEager = allowedServers?.has(name) === true;
+    if (cfg.lazy === true && !forcedEager) lazySkipped.push(name);
+    else eager.push([name, cfg]);
+  }
+  return { eager, lazySkipped };
+}
+
+export class McpServerManager {
   private connections: McpConnection[] = [];
   // #92: serverName → stdio child pid, captured at connect time (the SDK's
   // `pid` getter returns null as soon as close() starts, so it can't be read
   // later). Used to force-kill orphaned transports when disconnectAll times
   // out or pi exits without a clean session shutdown.
   private transportPids = new Map<string, number>();
+  // #199: parsed config (all declared servers, incl. lazy) + extension API,
+  // retained so mcp_catalog / mcp_load work after eager connect is done.
+  private config: McpJson | null = null;
+  private pi: ExtensionAPI | null = null;
+  private registeredTools = new Set<string>();
+  private seededTools = false;
+  private idleSweepTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     // #92: last-resort synchronous sweep — if the process exits without
@@ -314,6 +367,7 @@ class McpServerManager {
       console.log(`[mcp-client] Could not read ${mcpJsonPath}, skipping MCP`);
       return;
     }
+    this.config = config;
 
     const servers = config.mcpServers;
     if (!servers) {
@@ -321,24 +375,30 @@ class McpServerManager {
       return;
     }
 
-    // Filter by PI_MCP_SERVERS env var if set
+    // #199: eager core connects at startup; lazy servers are skipped and
+    // remain discoverable via mcp_catalog + loadable via mcp_load.
     const allowedServers = getAllowedServers();
-    const serverEntries = Object.entries(servers).filter(([name]) =>
-      !allowedServers || allowedServers.has(name)
-    );
+    const { eager, lazySkipped } = classifyServers(servers, allowedServers);
 
+    if (lazySkipped.length > 0) {
+      console.log(
+        `[mcp-client] ${lazySkipped.length} lazy server(s) not loaded at startup (load on demand via mcp_load): ${lazySkipped.join(", ")}`
+      );
+    }
     if (allowedServers) {
-      const skipped = Object.keys(servers).filter(s => !allowedServers.has(s));
-      console.log(`[mcp-client] PI_MCP_SERVERS set → loading ${serverEntries.length} of ${Object.keys(servers).length} servers (skipped: ${skipped.join(", ")})`);
+      const excluded = Object.keys(servers).filter(s => !allowedServers.has(s));
+      console.log(
+        `[mcp-client] PI_MCP_SERVERS set → loading ${eager.length} of ${Object.keys(servers).length} servers eagerly (excluded: ${excluded.join(", ")})`
+      );
     }
 
     const DEFAULT_CONNECTION_TIMEOUT_MS = 15000;
 
-    // Connect to all servers in parallel with per-server timeout.
+    // Connect to all eager servers in parallel with per-server timeout.
     // Each server can override via timeoutMs in .mcp.json (e.g. tortoise needs ~30s for warm-up).
     // Track server names alongside results so error logs identify which server failed.
     const results = await Promise.allSettled(
-      serverEntries.map(async ([serverName, serverConfig]) => {
+      eager.map(async ([serverName, serverConfig]) => {
         const startTime = Date.now();
         const timeoutMs = serverConfig.timeoutMs ?? DEFAULT_CONNECTION_TIMEOUT_MS;
         await this.connectServer(serverName, serverConfig, timeoutMs);
@@ -352,7 +412,7 @@ class McpServerManager {
       const result = results[i]!;
       if (result.status === "rejected") {
         // Use the server name from the input array at the same index
-        const serverName = serverEntries[i]?.[0] ?? "unknown";
+        const serverName = eager[i]?.[0] ?? "unknown";
         const errMsg = result.reason?.message ?? String(result.reason);
         console.log(
           `[mcp-client] Failed to connect to MCP server '${serverName}': ${errMsg}`
@@ -366,7 +426,7 @@ class McpServerManager {
         succeeded++;
       }
     }
-    console.log(`[mcp-client] Connected to ${succeeded}/${serverEntries.length} servers`);
+    console.log(`[mcp-client] Connected to ${succeeded}/${eager.length} eager servers`);
   }
 
   private async connectServer(
@@ -397,7 +457,10 @@ class McpServerManager {
       // "${VAR}" strings (e.g. GEMINI_API_KEY). See tortoise issue #240.
       const env = buildMcpServerEnv(config);
       transport = new StdioClientTransport({
-        command: config.command,
+        // #199: command may contain ${VAR} placeholders (e.g. the tortoise
+        // base config points at ${TORTOISE_HOME}/.venv/bin/python3) — expand
+        // like env/cwd, or the spawn fails with ENOENT.
+        command: expandExpr(config.command),
         args: config.args ?? [],
         env,
         // cwd may contain ${VAR} placeholders (e.g. TORTOISE_HOME in the base
@@ -422,139 +485,351 @@ class McpServerManager {
       if (pid !== null) this.transportPids.set(name, pid);
     }
 
-    this.connections.push({ client, serverName: name });
+    // #199: track tier + last-used for the idle sweep.
+    this.connections.push({
+      client,
+      serverName: name,
+      lazy: config.lazy === true,
+      idleTimeoutMs: config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
+      lastUsed: Date.now(),
+    });
   }
 
   async registerTools(pi: ExtensionAPI): Promise<void> {
-    // Dedup: skip tools already registered (e.g., from a prior session's stale state
-    // or native pi registration). Prevents "Component already exists" warnings.
-    // getAllTools() may throw during extension loading if the runtime isn't bound yet;
-    // fall back to registering all tools in that case.
-    let existingTools: Set<string>;
-    try {
-      existingTools = new Set(pi.getAllTools().map(t => t.name));
-    } catch {
-      existingTools = new Set();
-    }
-
-    for (const { client, serverName } of this.connections) {
-      try {
-        const { tools } = await client.listTools();
-        for (const tool of tools) {
-          const toolName = `mcp__${serverName}__${tool.name}`;
-          const safeName = toolName.replace(/\./g, "_");
-
-          if (existingTools.has(safeName)) {
-            console.log(`[mcp-client] Skipped duplicate tool: ${safeName}`);
-            continue;
-          }
-
-          let parameters: TSchema;
-          try {
-            parameters = jsonSchemaToTypeBox(tool.inputSchema);
-          } catch {
-            parameters = Type.Object({
-              arguments: Type.Optional(
-                Type.String({ description: "Tool arguments as JSON string" })
-              ),
-            });
-          }
-
-          pi.registerTool({
-            name: safeName,
-            label: `${serverName}:${tool.name}`,
-            description:
-              tool.description ?? `MCP tool: ${serverName}/${tool.name}`,
-            parameters,
-            async execute(
-              _toolCallId,
-              params: Record<string, unknown>
-            ) {
-              const startMs = Date.now();
-              console.log(`[mcp-client] → ${serverName}/${tool.name}`);
-              try {
-                const result = await client.callTool({
-                  name: tool.name,
-                  arguments: params,
-                }, undefined, { timeout: 3_600_000 });
-
-                console.log(`[mcp-client] ← ${serverName}/${tool.name} (${Date.now() - startMs}ms)`);
-                const textContent = result.content
-                  .filter((c: any) => c.type === "text")
-                  .map((c: any) => c.text)
-                  .join("\n");
-
-                return {
-                  content: [
-                    {
-                      type: "text" as const,
-                      text:
-                        textContent || JSON.stringify(result.content),
-                    },
-                  ],
-                  details: { serverName, toolName: tool.name },
-                };
-              } catch (err: any) {
-                return {
-                  content: [
-                    {
-                      type: "text" as const,
-                      text: `MCP tool '${tool.name}' failed: ${err.message}`,
-                    },
-                  ],
-                  details: {
-                    serverName,
-                    toolName: tool.name,
-                    isError: true,
-                  },
-                };
-              }
-            },
-          });
-
-          console.log(`[mcp-client] Registered tool: ${safeName}`);
-        }
-        console.log(
-          `[mcp-client] Registered ${tools.length} tools from '${serverName}'`
-        );
-      } catch (err: any) {
-        console.log(
-          `[mcp-client] Failed to list tools from '${serverName}': ${err.message}`
-        );
-      }
+    this.pi = pi;
+    this.seedExistingTools();
+    // #199: only connected (eager) servers have tools to register at startup;
+    // lazy servers register their tools on demand via loadServer → registerServerTools.
+    for (const { serverName } of [...this.connections]) {
+      await this.registerServerTools(serverName);
     }
   }
 
-  async disconnectAll(): Promise<void> {
-    // #36: Each client.close() gets a 5s timeout to prevent hanging the
-    // process exit when MCP servers never connected (e.g., python3 ENOENT).
-    const DISCONNECT_TIMEOUT_MS = 5000;
-    for (const { client, serverName } of this.connections) {
-      let timedOut = false;
-      try {
-        const closeOp = client.close();
-        const timeout = new Promise<void>((resolve) =>
-          setTimeout(() => {
-            timedOut = true;
-            console.log(
-              `[mcp-client] Disconnect from '${serverName}' timed out after ${DISCONNECT_TIMEOUT_MS}ms — forcing`
-            );
-            resolve();
-          }, DISCONNECT_TIMEOUT_MS)
-        );
-        await Promise.race([closeOp, timeout]);
-        if (timedOut) {
-          // #92: the race above resolved, but the hung transport child is
-          // still around — kill it so no orphan MCP process outlives pi.
-          await this.killOrphanedTransport(serverName);
+  /** Seed the dedup set from tools pi already knows about (native / prior registration). */
+  private seedExistingTools(): void {
+    if (this.seededTools || !this.pi) return;
+    this.seededTools = true;
+    try {
+      for (const t of this.pi.getAllTools()) this.registeredTools.add(t.name);
+    } catch {
+      // runtime not bound yet — rely on registeredTools only
+    }
+  }
+
+  /** Record a server as recently used (resets its idle timer). */
+  private markUsed(serverName: string): void {
+    const conn = this.findConnection(serverName);
+    if (conn) conn.lastUsed = Date.now();
+  }
+
+  private findConnection(serverName: string): McpConnection | undefined {
+    return this.connections.find((c) => c.serverName === serverName);
+  }
+
+  /** Register every tool from one connected server under mcp__<server>__<tool>. */
+  async registerServerTools(serverName: string): Promise<string[]> {
+    const conn = this.findConnection(serverName);
+    const pi = this.pi;
+    if (!conn || !pi) return [];
+    const { client } = conn;
+    const registered: string[] = [];
+    try {
+      const { tools } = await client.listTools();
+      for (const tool of tools) {
+        const toolName = `mcp__${serverName}__${tool.name}`;
+        const safeName = toolName.replace(/\./g, "_");
+
+        if (this.registeredTools.has(safeName)) {
+          console.log(`[mcp-client] Skipped duplicate tool: ${safeName}`);
+          continue;
         }
-        console.log(`[mcp-client] Disconnected from '${serverName}'`);
-      } catch {
-        // Best effort — never block process exit
+
+        let parameters: TSchema;
+        try {
+          parameters = jsonSchemaToTypeBox(tool.inputSchema);
+        } catch {
+          parameters = Type.Object({
+            arguments: Type.Optional(
+              Type.String({ description: "Tool arguments as JSON string" })
+            ),
+          });
+        }
+
+        pi.registerTool({
+          name: safeName,
+          label: `${serverName}:${tool.name}`,
+          description:
+            tool.description ?? `MCP tool: ${serverName}/${tool.name}`,
+          parameters,
+          execute: async (_toolCallId, params: Record<string, unknown>) => {
+            const startMs = Date.now();
+            try {
+              // #199: a lazy server may have been idle-stopped — reconnect on
+              // next use so a registered tool stays valid across the sweep
+              // (lazy proxy: the server starts again on first tool call).
+              let conn = this.findConnection(serverName);
+              if (!conn) {
+                const cfg = this.config?.mcpServers[serverName];
+                if (!cfg) {
+                  return {
+                    content: [
+                      { type: "text" as const, text: `MCP server '${serverName}' is not configured (see mcp_catalog).` },
+                    ],
+                    details: { serverName, toolName: tool.name, isError: true },
+                  };
+                }
+                await this.connectServer(serverName, cfg, cfg.timeoutMs ?? 15000);
+                conn = this.findConnection(serverName);
+                if (!conn) {
+                  return {
+                    content: [
+                      { type: "text" as const, text: `MCP server '${serverName}' failed to reconnect.` },
+                    ],
+                    details: { serverName, toolName: tool.name, isError: true },
+                  };
+                }
+              }
+              this.markUsed(serverName);
+              const client = conn.client;
+              console.log(`[mcp-client] → ${serverName}/${tool.name}`);
+              const result = await client.callTool(
+                { name: tool.name, arguments: params },
+                undefined,
+                { timeout: 3_600_000 }
+              );
+
+              console.log(`[mcp-client] ← ${serverName}/${tool.name} (${Date.now() - startMs}ms)`);
+              const textContent = result.content
+                .filter((c: any) => c.type === "text")
+                .map((c: any) => c.text)
+                .join("\n");
+
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: textContent || JSON.stringify(result.content),
+                  },
+                ],
+                details: { serverName, toolName: tool.name },
+              };
+            } catch (err: any) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `MCP tool '${tool.name}' failed: ${err.message}`,
+                  },
+                ],
+                details: {
+                  serverName,
+                  toolName: tool.name,
+                  isError: true,
+                },
+              };
+            }
+          },
+        });
+
+        this.registeredTools.add(safeName);
+        registered.push(safeName);
+        console.log(`[mcp-client] Registered tool: ${safeName}`);
       }
+      console.log(
+        `[mcp-client] Registered ${tools.length} tools from '${serverName}'`
+      );
+    } catch (err: any) {
+      console.log(
+        `[mcp-client] Failed to list tools from '${serverName}': ${err.message}`
+      );
+    }
+    return registered;
+  }
+
+  /**
+   * #36/#92: disconnect a single server, preserving the exact forced-close
+   * semantics of the original disconnectAll (5s client.close timeout → orphan
+   * kill on hang). Shared by disconnectAll, the #199 idle sweep, and re-loads
+   * via loadServer. No new teardown code — the same path.
+   */
+  private async closeServer(serverName: string): Promise<void> {
+    const conn = this.findConnection(serverName);
+    if (!conn) return;
+    const { client } = conn;
+    const DISCONNECT_TIMEOUT_MS = 5000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    try {
+      const closeOp = client.close();
+      const timeout = new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          console.log(
+            `[mcp-client] Disconnect from '${serverName}' timed out after ${DISCONNECT_TIMEOUT_MS}ms — forcing`
+          );
+          resolve();
+        }, DISCONNECT_TIMEOUT_MS);
+      });
+      await Promise.race([closeOp, timeout]);
+      if (timer) clearTimeout(timer); // don't leave a dangling timer that logs spuriously
+      if (timedOut) {
+        // #92: the race above resolved, but the hung transport child is
+        // still around — kill it so no orphan MCP process outlives pi.
+        await this.killOrphanedTransport(serverName);
+      }
+      console.log(`[mcp-client] Disconnected from '${serverName}'`);
+    } catch {
+      if (timer) clearTimeout(timer);
+      // Best effort — never block process exit
+    }
+    this.transportPids.delete(serverName);
+    this.connections = this.connections.filter((c) => c.serverName !== serverName);
+  }
+
+  async disconnectAll(): Promise<void> {
+    this.stopIdleSweep();
+    // Snapshot names first: closeServer mutates this.connections.
+    const names = this.connections.map((c) => c.serverName);
+    for (const name of names) {
+      await this.closeServer(name);
     }
     this.transportPids.clear();
     this.connections = [];
+  }
+
+  // ── #199: catalog + on-demand load + idle sweep ─────────────────
+
+  /** Connect a lazy server on demand and register its tools. */
+  async loadServer(serverName: string): Promise<{ registered: string[]; alreadyLoaded: boolean }> {
+    if (!this.config) throw new Error("No MCP config loaded in this session");
+    const cfg = this.config.mcpServers[serverName];
+    if (!cfg) {
+      throw new Error(
+        `Unknown MCP server '${serverName}' — run mcp_catalog to list available servers`
+      );
+    }
+
+    if (this.findConnection(serverName)) {
+      return { registered: [], alreadyLoaded: true };
+    }
+
+    const timeoutMs = cfg.timeoutMs ?? 15000;
+    await this.connectServer(serverName, cfg, timeoutMs);
+    console.log(`[mcp-client] Loaded '${serverName}' on demand`);
+    this.seedExistingTools();
+    const registered = await this.registerServerTools(serverName);
+    return { registered, alreadyLoaded: false };
+  }
+
+  /** Static catalog of every declared server (no connect required). */
+  catalog(): Array<{ name: string; tier: string; status: string; purpose: string; whenToLoad: string; cost: string }> {
+    if (!this.config) return [];
+    return Object.entries(this.config.mcpServers).map(([name, cfg]) => {
+      const lazy = cfg.lazy === true;
+      const loaded = this.findConnection(name) !== undefined;
+      return {
+        name,
+        tier: lazy ? "lazy" : "core",
+        status: loaded ? "loaded" : lazy ? "sleeping" : "not-loaded",
+        purpose: cfg.purpose ?? "",
+        whenToLoad: cfg.whenToLoad ?? "",
+        cost: cfg.cost ?? "",
+      };
+    });
+  }
+
+  /** Register the mcp_catalog + mcp_load tools (available in sub-agents too). */
+  registerLifecycleTools(pi: ExtensionAPI): void {
+    this.pi = pi;
+
+    pi.registerTool({
+      name: "mcp_catalog",
+      label: "MCP server catalog",
+      description:
+        "List every declared MCP server: name, tier (core always-on / lazy on-demand), status (loaded/sleeping), purpose, when to load, and rough cost. Use this to discover tools, then mcp_load to start a lazy server before calling its tools.",
+      parameters: Type.Object({}),
+      execute: async () => {
+        const entries = this.catalog();
+        if (entries.length === 0) {
+          return { content: [{ type: "text" as const, text: "No MCP servers declared in this session's .mcp.json." }] };
+        }
+        const lines = entries.map((e) => {
+          const meta = [e.purpose, e.whenToLoad, e.cost].filter(Boolean).join(" | ");
+          const status = e.status === "loaded" ? "loaded" : e.status === "sleeping" ? "sleeping (mcp_load to start)" : "not-loaded";
+          return `- ${e.name} [${e.tier}, ${status}]${meta ? " — " + meta : ""}`;
+        });
+        return { content: [{ type: "text" as const, text: `MCP server catalog:\n${lines.join("\n")}` }] };
+      },
+    });
+
+    pi.registerTool({
+      name: "mcp_load",
+      label: "Load MCP server on demand",
+      description:
+        "Start a lazy MCP server on first use and register its tools (named mcp__<server>__<tool>). Returns the registered tool names — call them on the NEXT turn. Servers auto-stop after an idle timeout. Use mcp_catalog to see what's available.",
+      parameters: Type.Object({
+        server: Type.String({ description: "MCP server name (see mcp_catalog)" }),
+      }),
+      execute: async (_toolCallId, params) => {
+        const serverName = String(params.server ?? "").trim();
+        if (!serverName) {
+          return { content: [{ type: "text" as const, text: "mcp_load: 'server' is required (see mcp_catalog)." }] };
+        }
+        try {
+          const { registered, alreadyLoaded } = await this.loadServer(serverName);
+          if (alreadyLoaded) {
+            return { content: [{ type: "text" as const, text: `MCP server '${serverName}' is already loaded.` }] };
+          }
+          const toolList = registered.length
+            ? registered.map((r) => `- ${r}`).join("\n")
+            : "(no tools registered)";
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Loaded '${serverName}'. Registered tools:\n${toolList}\n\nCall them on the next turn.`,
+              },
+            ],
+          };
+        } catch (err: any) {
+          return {
+            content: [
+              { type: "text" as const, text: `mcp_load failed for '${serverName}': ${err.message}` },
+            ],
+          };
+        }
+      },
+    });
+  }
+
+  private startIdleSweep(): void {
+    if (this.idleSweepTimer) return;
+    this.idleSweepTimer = setInterval(() => {
+      void this.sweepIdleServers();
+    }, IDLE_SWEEP_INTERVAL_MS);
+    // Don't keep a session alive solely for the idle sweep.
+    if (typeof this.idleSweepTimer.unref === "function") this.idleSweepTimer.unref();
+  }
+
+  private stopIdleSweep(): void {
+    if (this.idleSweepTimer) {
+      clearInterval(this.idleSweepTimer);
+      this.idleSweepTimer = null;
+    }
+  }
+
+  /** Disconnect lazy servers idle past their idleTimeoutMs. */
+  private async sweepIdleServers(): Promise<void> {
+    const now = Date.now();
+    const stale = this.connections.filter(
+      (c) => c.lazy && now - c.lastUsed >= c.idleTimeoutMs
+    );
+    for (const conn of stale) {
+      console.log(
+        `[mcp-client] Idle sweep: stopping lazy server '${conn.serverName}' (idle ≥ ${conn.idleTimeoutMs}ms)`
+      );
+      await this.closeServer(conn.serverName);
+    }
   }
 
   /**
@@ -624,6 +899,10 @@ export default async function (pi: ExtensionAPI) {
 
   await manager.connectAll(mcpJsonPath);
   await manager.registerTools(pi);
+  // #199: catalog + on-demand load tools (also present in sub-agents).
+  manager.registerLifecycleTools(pi);
+  // #199: periodic idle sweep stops lazy servers past their idle timeout.
+  manager.startIdleSweep();
 
   pi.on("session_shutdown", async () => {
     await manager.disconnectAll();

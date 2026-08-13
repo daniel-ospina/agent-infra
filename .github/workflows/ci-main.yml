@@ -2,10 +2,9 @@ name: CI on main
 # Post-merge safety net (issue #86): catches "PR A + PR B together break main"
 # that per-PR review cannot see. Runs after every push to main.
 #
-# Hard gates (fail on error): extension tests + script validation — deterministic
-# and green today. Skill lint runs warn-only: pre-existing duplicate-key
-# false-positives (steps: lists) would otherwise permanently red main; fixing
-# those is tracked separately.
+# Hard gates (fail on error): extension tests + script validation + skill lint —
+# deterministic and green today. skill-lint is the post-merge re-check; the
+# per-PR hard gate runs in ci.yml → node-ci.yml (issue #237).
 #
 # On failure, a GitHub issue is auto-filed (no human gate — the AI review gate
 # already guards merges; this is the post-merge backstop).
@@ -57,19 +56,17 @@ jobs:
           fi
           echo "✅ All scripts validated"
 
-  skill-lint-warn:
+  skill-lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Skill lint (warn-only — pre-existing duplicate-key false positives)
+      - name: Skill lint (hard gate — issue #237)
         run: |
-          node scripts/check-skill-lint.mjs --skills-dir skills 2>&1 || true
-          echo "⚠️  skill lint issues are non-blocking (pre-existing); track cleanup separately"
-          exit 0
+          node scripts/check-skill-lint.mjs --skills-dir skills
 
   auto-file-on-failure:
     runs-on: ubuntu-latest
-    needs: [extension-tests, script-validate]
+    needs: [extension-tests, script-validate, skill-lint]
     if: failure()
     steps:
       - uses: actions/github-script@v7

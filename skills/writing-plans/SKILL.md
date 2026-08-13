@@ -55,9 +55,11 @@ steps:
 
 ### Skip Rules
 
-**Skip the research intake gate (`workflow/02`) entirely when:**
+**Skip Step B of the research intake gate (`workflow/02`) — the multi-call Perplexity gate — when:**
 - The plan touches **zero third-party dependencies** — Node stdlib only, type-only imports, or in-repo wrappers used 2+ times.
-- Proceed directly to `workflow/03-integration-surface.md`.
+- Proceed directly to `workflow/03-integration-surface.md` **after Step A still runs**.
+
+> **Step A always runs (all tiers):** the intake of prior research (epic brief, `### Axis Research` / `### Integration Docs` scoping blocks) is cheap and must never be zeroed by the zero-deps skip — standard+ plans consume the scoping artifact even when no fresh gate queries fire (issue #231 D4/T4).
 
 **Skip the integration surface map (`workflow/03`) when:**
 - The plan has **no integration boundaries** — pure logic, pure config, documentation, or i18n changes.

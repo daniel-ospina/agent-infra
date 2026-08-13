@@ -155,9 +155,16 @@ await test("parses as valid config with the expected server set", () => {
   deepEqual(Object.keys(config.mcpServers).sort(), [...expected].sort());
 
   const tortoise = config.mcpServers.tortoise;
-  ok(tortoise.command === "python3", "tortoise uses local stdio spawn");
+  ok(tortoise.command.includes(".venv/bin/python3"), "tortoise uses the venv python (has fastmcp)");
   ok(tortoise.cwd.includes("TORTOISE_HOME"), "tortoise cwd uses TORTOISE_HOME");
   ok(tortoise.env.PYTHONPATH.includes("TORTOISE_HOME"), "PYTHONPATH uses TORTOISE_HOME");
+
+  // #199: tiering — exa + tortoise are the eager core; the rest are lazy.
+  equal(config.mcpServers.exa.lazy, undefined, "exa is core (eager)");
+  equal(config.mcpServers.tortoise.lazy, undefined, "tortoise is core (eager)");
+  equal(config.mcpServers["playwright-browser"].lazy, true, "playwright is lazy");
+  equal(config.mcpServers.gemini.lazy, true, "gemini is lazy");
+  equal(config.mcpServers["brave-search"].lazy, true, "brave-search is lazy");
 });
 
 section("expandEnvVars — ${VAR} and ${VAR:-default}");
