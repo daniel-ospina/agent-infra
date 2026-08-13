@@ -7,10 +7,17 @@ steps:
   - name: workspace_setup
     type: skill
     gate: auto
+  - name: parallel_check_start
+    type: gate
+    gate: checkpoint
+    token_phase: start
+    requires: [workspace_setup]
+    # #4907: run `parallel_work_check start` (C1 — delegates behind-check to
+    # checkout_guard) before touching code. Set CHECKOUT_GUARD_ENFORCE=1.
   - name: complexity_ratings
     type: skill
     gate: auto
-    requires: [workspace_setup]
+    requires: [parallel_check_start]
   - name: load_plan
     type: skill
     gate: auto
@@ -23,10 +30,17 @@ steps:
     type: skill
     gate: auto
     requires: [dependency_verification]
+  - name: parallel_check_implement
+    type: gate
+    gate: checkpoint
+    token_phase: implement
+    requires: [implement_batch]
+    # #4907: run `parallel_work_check implement` (C4 — base-drift + symbol
+    # re-check) before verification.
   - name: verify_batch
     type: skill
     gate: verifier
-    requires: [implement_batch]
+    requires: [parallel_check_implement]
   - name: verification_before_completion
     type: skill
     gate: verifier
