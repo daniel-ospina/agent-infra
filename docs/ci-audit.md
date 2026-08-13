@@ -16,7 +16,7 @@ aboutObjects: eldato, agent-infra, ci-audit
 > **Phase:** 1
 > **Date:** 2026-07-30
 >
-> **Scope (issue #239):** this document is the **eldato** CI audit, kept in agent-infra as an extraction reference. Of the workflows listed in §3, only `ci.yml` and the compliance gate exist in agent-infra (eldato's `compliance-gate.yml` §3.1 — ported/renamed as `pipeline-compliance.yml`, dogfood copy per its header); all others (including `check-drift.yml`, `enforce-skills.yml`, `replay-smoke-test.yml`) describe eldato — rows struck through are explicitly not ported. agent-infra has **zero cron-scheduled workflows**.
+> **Scope (issue #239):** this document is the **eldato** CI audit, kept in agent-infra as an extraction reference. Of the workflows listed in §3, only `ci.yml` and the compliance gate exist in agent-infra (eldato's `compliance-gate.yml` §3.1 — ported/renamed as `pipeline-compliance.yml`, dogfood copy per its header); all others (including `check-drift.yml`, `replay-smoke-test.yml`) describe eldato — rows struck through are explicitly not ported. **`enforce-skills.yml` was ported in #252** (nightly 06:00 UTC + on push to main) and is no longer eldato-only.
 
 Full inventory of CI components in `/Users/home/eldato` with classification:
 - **modular**: repo-agnostic, ready to share via `agent-infra`
@@ -162,7 +162,7 @@ All 14 workflows (eldato inventory; see scope banner) contain El Dato-specific r
 | Workflow | Trigger | Specific references | Modularization feasibility |
 |----------|---------|---------------------|---------------------------|
 | `check-drift.yml` | Daily 06:00 UTC | Schema drift vs production Supabase + docs drift (4:5 canvas dimension references in carousel skills) | **Low** — Supabase + El Dato docs conventions. |
-| ~~`enforce-skills.yml`~~ | ~~Daily 06:00 UTC~~ | **NOT PRESENT in agent-infra** — eldato-only history; the script was ported in #239 and runs only as a pre-flight check (no CI workflow). | **Medium** — port the nightly cron as a follow-up (issue #239 D5). |
+| `enforce-skills.yml` | Daily 06:00 UTC + push to main + manual | Runs `scripts/ci/enforce-protocol-table.sh` — dangerous-ops manifest/skill drift gate (Ported #252; pre-flight-only in #239). | **Low** — now implemented; deduped auto-file on failure. |
 | ~~`replay-smoke-test.yml`~~ | ~~Weekly Mon 09:00 UTC + `workflow_dispatch`~~ | **NOT PRESENT in agent-infra** — eldato-only; agent-infra has no supabase/ dir (Replay Smoke Gate deleted from pre-flight in #239). | **Low** — Supabase-specific. |
 
 ### 3.4 Manual-only (`workflow_dispatch`)
@@ -184,7 +184,7 @@ All 14 workflows (eldato inventory; see scope banner) contain El Dato-specific r
 1. `log-admin-merges.yml` — Generic PR bypass detection
 2. `arch-check.yml` — Generic architecture fitness check (manual)
 3. `mutation-test.yml` — Generic mutation testing (manual)
-4. ~~`enforce-skills.yml`~~ — Skill protocol enforcement (eldato-only; not present in agent-infra — #239)
+4. `enforce-skills.yml` — Skill protocol enforcement (ported to agent-infra in #252 — nightly + push gate)
 5. `ci.yml` — PR CI pipeline (most complex, highest value if modularized)
 
 ---
@@ -197,7 +197,7 @@ All 14 workflows (eldato inventory; see scope banner) contain El Dato-specific r
 1. Go to [Settings > Billing & plans](https://github.com/organizations/lil-lawyer/settings/billing) in the `lil-lawyer` org
 2. Check **Actions** → included minutes, used minutes, overage
 
-**Note from pre-push hook:** GitHub Actions is currently **paused for billing** reasons — the pre-push hook serves as the local CI gate. Per CLAUDE.md § "CI/CD — GitHub Actions paused".
+**Note:** this budget note describes eldato's paid-minutes context. agent-infra is a PRIVATE repo on a personal account (verified 2026-08-13); Actions is RUNNING (verified via run list, 2026-08-13) — the pre-push hook remains a supplementary local gate. The nightly enforce-skills run (#252) is ~1-2 min/day (≈30-60 min/month), well within the standard private-repo minute allowance; re-check usage if the account approaches its limit.
 
 **Threshold:** If < 1000 minutes remaining, CI should be PR-triggered only (no cron, no post-merge).
 
@@ -221,7 +221,7 @@ All 14 workflows (eldato inventory; see scope banner) contain El Dato-specific r
 | `check:merge-collision` | npm script | Generic merge conflict detection |
 | Husky `pre-commit` (sibling import check) | Hook | Generic pi extension safety check |
 | `log-admin-merges.yml` | GHA workflow | Generic PR bypass detection pattern |
-| ~~`enforce-skills.yml`~~ | GHA workflow (eldato) | Skill protocol enforcement — not present in agent-infra (#239); ported script is pre-flight-only |
+| `enforce-skills.yml` | GHA workflow | Skill protocol enforcement — PORTED to agent-infra in #252 (nightly + push); the script was pre-flight-only in #239 |
 
 ### Medium-priority extraction (Phase 2)
 | Component | Type | Rationale |

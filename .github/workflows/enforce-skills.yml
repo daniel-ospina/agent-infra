@@ -1,0 +1,81 @@
+# enforce-skills.yml — nightly + push-to-main drift gate for the dangerous-ops
+# manifest / skill files (issue #252, follow-up to #239).
+#
+# Runs scripts/ci/enforce-protocol-table.sh:
+#   - Pass 1 (the CI-relevant gate): every manifest skill resolves to a real
+#     SKILL.md (AGENTS.md is untracked -> absent in checkout -> Pass 2/3 skip)
+#   - fail-closed on missing manifest
+# On failure, auto-files ONE issue (deduped by a stable title) with the drift
+# details. The pre-flight trigger covers commit-time; this catches main-drift
+# not tied to a skills/|enforcement/|AGENTS.md commit (renames, UI merges).
+
+name: enforce-skills
+
+on:
+  schedule:
+    - cron: '0 6 * * *'        # nightly 06:00 UTC
+  push:
+    branches: [main]           # catch drift instantly on merge (schedule is best-effort)
+  workflow_dispatch:           # manual
+
+concurrency:
+  group: enforce-skills
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  enforce-skills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      details: ${{ steps.enforce.outputs.details }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run skill-enforcement audit
+        id: enforce
+        run: |
+          # set +e: the runner shell is bash -e -o pipefail — set -e would exit at
+          # the pipeline on failure, killing the PIPESTATUS capture + heredoc
+          # (drift details would be lost in exactly the failure case).
+          set +e
+          bash scripts/ci/enforce-protocol-table.sh 2>&1 | tee /tmp/drift.log
+          rc=${PIPESTATUS[0]}
+          echo "details<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/drift.log >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+  auto-file-on-failure:
+    runs-on: ubuntu-latest
+    needs: [enforce-skills]
+    if: failure() && !cancelled()
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // STABLE title — byte-identical every run so dedupe works (a sha/runId
+            // in the title would file a new issue every night). Run link + details
+            // go in the BODY only.
+            const title = '⚠️ enforce-skills: dangerous-ops manifest/skill drift detected';
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,   // github object injects no defaults — explicit owner/repo required
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const dup = issues.find(i => !i.pull_request && i.title === title);
+            if (dup) {
+              console.log(`Open issue #${dup.number} already tracks this drift — skipping.`);
+              return;
+            }
+            const details = needs.enforce-skills.outputs.details || 'no details captured';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              labels: ['bug'],
+              body: `Drift detected by ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n\`\`\`\n${details}\n\`\`\``,
+            });
