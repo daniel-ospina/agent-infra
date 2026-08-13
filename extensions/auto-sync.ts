@@ -145,6 +145,24 @@ export default function (pi: ExtensionAPI) {
       return; // offline — silent
     }
 
+    // #195 L3: warn-only orphan sweep — aborted dispatches leave worktrees/
+    // branches recorded in the teardown manifest; surface them within a day
+    // without ever auto-deleting (scan-orphans.sh --apply is the manual gate).
+    try {
+      const out = execSync(`bash "${infraPath}/scripts/scan-orphans.sh" --repo "${infraPath}" 2>&1`, {
+        timeout: 30_000,
+        encoding: "utf-8",
+      });
+      const lines = out.trim().split("\n").filter((l) => l.includes("⚠️") || l.includes("👻") || l.includes("🧹"));
+      if (lines.length > 0) {
+        console.log(`[auto-sync] 🧹 ${lines.length} orphaned worktree/branch record(s) — inspect:`);
+        console.log(lines.slice(0, 5).map((l) => `    ${l.trim()}`).join("\n"));
+        console.log(`    Cleanup: bash "${infraPath}/scripts/scan-orphans.sh" --apply`);
+      }
+    } catch {
+      // scanner missing/offline — silent (warn-only by design)
+    }
+
     const state = syncState(infraPath);
     const syncHint = `cd "${infraPath}" && ./sync.sh`;
 
