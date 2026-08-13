@@ -11,13 +11,21 @@ npx eslint --fix <relevant files>
 # Stage relevant files (specific paths, not git add -A)
 git add <relevant files>
 
-# Commit
-git commit -m "$(cat <<'EOF'
-<type>(<scope>): <subject>
-
-Closes #ISSUE_NUMBER
-EOF
-)"
+# Commit — write the message to a temp file, then commit with -F
+# ⛔ NEVER use `git commit -m "$(cat <<'EOF' ... EOF)"` heredocs. The pi bash
+#    wrapper re-processes the command string and breaks on backticks, `$()`,
+#    braces, or parens inside the message (`/bin/bash: bad substitution: no
+#    closing ')'` — observed twice, e.g. messages containing `{message,
+#    error_code}` or `over_email_send_rate_limit → ...`). Message content must
+#    never pass through bash args/substitution.
+# Write the message with the `write` tool (bypasses bash entirely) to a
+# deterministic path, then commit with -F and remove the file:
+#   /tmp/commit-msg-<branch>.md
+#   <type>(<scope>): <subject>
+#
+#   Closes #ISSUE_NUMBER
+git commit -F /tmp/commit-msg-<branch>.md
+rm -f /tmp/commit-msg-<branch>.md
 ```
 
 **IMPORTANT — commit timeout:** Always run `git commit` **foreground** with `timeout: 300000` (5 minutes minimum). Never set `run_in_background: true` for `git commit`. Never use a timeout below 300 seconds. The pre-commit hook (lint-staged running ESLint on staged TS files) takes 20–90 seconds. Killing it mid-run orphans the lint-staged backup stash and leaves `.git/index.lock` behind — causing exit code 128 on every subsequent commit until the lock is manually removed. This timeout rule also applies to all fix-loop `git commit` calls in Steps 2 and 2.5.
@@ -25,17 +33,20 @@ EOF
 ```bash
 # Push and open as DRAFT
 git push -u origin <branch>
+# ⛔ Same rule as the commit message: NEVER use `--body "$(cat <<'EOF' ...)"`
+#    heredocs — write the PR body to a temp file with the `write` tool and
+#    pass --body-file, then remove the file:
+#   /tmp/pr-body-<branch>.md
+#   ## Summary
+#   - <bullet 1>
+#   - <bullet 2>
+#
+#   Closes #ISSUE_NUMBER
 gh pr create --draft \
   --base main \
   --title "<title>" \
-  --body "$(cat <<'EOF'
-## Summary
-- <bullet 1>
-- <bullet 2>
-
-Closes #ISSUE_NUMBER
-EOF
-)"
+  --body-file /tmp/pr-body-<branch>.md
+rm -f /tmp/pr-body-<branch>.md
 ```
 
 The PostToolUse hook fires on `gh pr merge` as a safety net for manual merges outside commit-workflow. Step 2 is the primary code-review gate.

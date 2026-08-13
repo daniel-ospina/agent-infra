@@ -6,6 +6,34 @@ import * as os from "os";
 import { resolve as resolvePath } from "path";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
 
+// ── gh invocation seam (testable) ─────────────────────
+// ESM named imports of builtin CJS modules (child_process) are not patchable
+// from tests, so gh calls route through runGh(). Tests inject a fake via
+// _setRunGhOverride() to exercise failure paths deterministically (no real gh).
+/** Options for the gh runner (mirrors execSync's opts we use). */
+export interface GhRunOpts {
+  cwd?: string;
+  timeout?: number;
+  env?: NodeJS.ProcessEnv;
+}
+
+let runGhOverride: ((cmd: string, opts?: GhRunOpts) => string) | null = null;
+
+/** TEST SEAM: replace the gh runner (returns the command's stdout, throws on
+ * failure). Pass null to restore the real execSync-backed runner. Honored only
+ * under NODE_ENV=test (review #212 security pass) so production code can never
+ * accidentally honor a stray override. */
+export function _setRunGhOverride(
+  fn: ((cmd: string, opts?: GhRunOpts) => string) | null
+): void {
+  if (process.env.NODE_ENV === "test" || fn === null) runGhOverride = fn;
+}
+
+function runGh(cmd: string, opts?: GhRunOpts): string {
+  if (runGhOverride !== null) return runGhOverride(cmd, opts);
+  return execSync(cmd, { encoding: "utf-8", ...opts });
+}
+
 // Dual-support: check AGENT_* first, then ELDATO_* (Phase 1 — #7549)
 function _getEnv(name: string): string | undefined {
   return process.env[`AGENT_${name}`] ?? process.env[`ELDATO_${name}`];
@@ -104,27 +132,144 @@ export function readReviewRecord(pr: number): ReviewRecord | null {
     const raw = fs.readFileSync(resolvePath(reviewsDir(), `${pr}.json`), "utf8");
     const rec = JSON.parse(raw) as ReviewRecord;
     if (!rec || typeof rec.head_sha !== "string" || typeof rec.verdict !== "string") return null;
+    // Security (#212 review): record.repo is interpolated into shell strings by
+    // the gate — enforce the same charset the flag/env sources are validated
+    // with. An invalid record is treated as absent (fail-closed).
+    if (rec.repo !== undefined && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(rec.repo)) return null;
     return rec;
   } catch {
     return null; // missing or corrupt record → treated as "no review"
   }
 }
 
-// Current PR head via the gate's own gh call, using the resolved repo context
-// (cwd for `cd ... &&` prefixes, --repo flag for explicit owner/name). Returns
-// null on ANY failure (network, bad repo, gh missing) — the fail-open signal.
-export function getPrHeadSha(pr: number, ctx: RepoContext): string | null {
+// ── GraphQL rate-limit resilience (#192) ─────────────
+// `gh pr view --json …` uses the GraphQL pool, which resets independently of
+// the REST pool (`gh api rate_limit` is REST). Parallel sessions can exhaust
+// the GraphQL pool while REST stays healthy (observed 2026-08-12, tortoise
+// #982: the gate blocked mid-merge on "GraphQL: API rate limit already
+// exceeded"). The gate must wait for the reset window and retry — not hard-
+// fail the ceremony, and not silently skip head verification (the #138
+// fail-open path) when the pool is merely temporarily exhausted.
+
+/** True when a gh error message is the GraphQL rate-limit exhaustion signature.
+ * Requires BOTH a rate-limit phrase AND a graphql mention (either order), or
+ * the "already exceeded" phrasing — the bare "api rate limit" phrase is NOT
+ * enough (REST-pool exhaustion is a different pool whose correct response is
+ * not a bounded GraphQL wait; review #212). */
+export function isGraphQLRateLimitError(msg: string): boolean {
+  const m = msg ?? "";
+  const rateLimitPhrase = /rate\s*limit/i.test(m);
+  const mentionsGraphQL = /graphql/i.test(m);
+  return (mentionsGraphQL && rateLimitPhrase) || /already exceeded/i.test(m);
+}
+
+/** Max wall-clock time (ms) the gate waits for the GraphQL reset window (#192).
+ * Env-overridable (REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS); default 10 min — the
+ * observed recovery was ~5 min; a full 1h window is reachable by raising it. */
+export function rateLimitMaxWaitMs(): number {
+  const n = parseInt(process.env.REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS ?? "600000", 10);
+  return Number.isInteger(n) && n > 0 ? n : 600000;
+}
+
+/** Seconds until the GraphQL pool resets, read via the REST rate_limit endpoint
+ * (independent pool — healthy when GraphQL is exhausted). null on failure. */
+export function graphQLResetInSecs(cwd?: string): number | null {
   try {
-    const repoArg = ctx.repo ? ` --repo ${ctx.repo}` : "";
-    const out = execSync(`gh pr view ${pr} --json headRefOid --jq .headRefOid${repoArg}`, {
-      encoding: "utf-8",
+    const out = runGh(`gh api rate_limit --jq '.resources.graphql.reset'`, { cwd, timeout: 15000 });
+    const reset = parseInt(out.trim(), 10);
+    if (!Number.isInteger(reset)) return null;
+    return Math.max(0, reset - Math.floor(Date.now() / 1000));
+  } catch {
+    return null;
+  }
+}
+
+function sleepAsync(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** REST-pool fallback for the PR head (#192): `gh api repos/{owner}/{repo}/pulls/{pr}`
+ * uses the REST pool, which resets independently of the GraphQL pool — healthy
+ * even when `gh pr view`'s GraphQL pool is exhausted. gh fills the {owner}/{repo}
+ * placeholders from the resolved repo context (--repo flag / GH_REPO env / cwd
+ * git remote). Returns the head SHA, or null on any failure (network, bad repo,
+ * REST pool also rate-limited) — callers then decide wait-for-reset vs fail-open. */
+export function getPrHeadShaViaRest(pr: number, ctx: RepoContext): string | null {
+  // NOTE: `gh api` does NOT accept --repo (verified gh 2.97.0: "unknown flag") —
+  // the repo is injected via GH_REPO env (the documented placeholder source).
+  const cmd = `gh api repos/{owner}/{repo}/pulls/${pr} --jq .head.sha`;
+  try {
+    const out = runGh(cmd, {
       cwd: ctx.cwd,
       timeout: 15000,
+      env: ctx.repo ? { ...process.env, GH_REPO: ctx.repo } : undefined,
     });
     const sha = out.trim();
     return sha || null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Current PR head via the gate's own gh call, using the resolved repo context
+ * (cwd for `cd ... &&` prefixes, --repo flag for explicit owner/name). Returns
+ * null on ANY non-rate-limit failure (network, bad repo, gh missing) — the
+ * #138 fail-open signal. On GraphQL rate-limit exhaustion (#192) it FIRST tries
+ * the independent REST pool (`gh api repos/{owner}/{repo}/pulls/{pr}` — instant
+ * recovery, observed healthy while GraphQL was 0/5000); only if REST is also
+ * unavailable does it wait for the GraphQL reset window (bounded by
+ * rateLimitMaxWaitMs, polling `gh api rate_limit`) and retry — so a
+ * parallel-session GraphQL burn cannot strand a merge or silently skip head
+ * verification.
+ */
+export async function getPrHeadSha(pr: number, ctx: RepoContext): Promise<string | null> {
+  const repoArg = ctx.repo ? ` --repo ${ctx.repo}` : "";
+  const deadline = Date.now() + rateLimitMaxWaitMs();
+  let attempt = 0;
+  for (;;) {
+    try {
+      const out = runGh(`gh pr view ${pr} --json headRefOid --jq .headRefOid${repoArg}`, {
+        cwd: ctx.cwd,
+        timeout: 15000,
+      });
+      const sha = out.trim();
+      return sha || null;
+    } catch (e: any) {
+      const msg = (e?.stderr ?? e?.message ?? "").toString();
+      if (!isGraphQLRateLimitError(msg)) return null; // non-rate-limit → fail-open as before
+      // #192: GraphQL pool exhausted → the independent REST pool is usually
+      // healthy (observed 2026-08-12: REST 4978/5000, GraphQL 0/5000). Resolve
+      // the head there INSTANTLY instead of sleeping for the reset window.
+      const restSha = getPrHeadShaViaRest(pr, ctx);
+      if (restSha !== null) {
+        console.warn(
+          `[review-enforcer] ♻️ #192: GraphQL rate limit — resolved head via REST ` +
+          `(gh api pulls/${pr}) instead of waiting for the reset window`
+        );
+        return restSha;
+      }
+      // REST also unavailable (both pools down, network, bad repo) → wait for
+      // the GraphQL reset window (bounded) and retry, as before.
+      const waitSecs = graphQLResetInSecs(ctx.cwd);
+      const remaining = deadline - Date.now();
+      const waitMs = waitSecs === null
+        ? Math.min(30000, remaining) // cannot read reset → fixed-interval poll
+        : Math.min(waitSecs * 1000 + 5000, remaining); // reset + 5s buffer
+      if (waitMs <= 0 || waitSecs === null && remaining < 30000) {
+        console.warn(
+          `[review-enforcer] ⚠️ #192: GraphQL rate limit outlasted the ` +
+          `${Math.round(rateLimitMaxWaitMs() / 1000)}s cap — failing open (head verification skipped)`
+        );
+        return null;
+      }
+      attempt++;
+      console.warn(
+        `[review-enforcer] ⏳ #192: GraphQL rate limit (attempt ${attempt}) — ` +
+        `waiting ${Math.round(waitMs / 1000)}s for the reset window, then retrying`
+      );
+      await sleepAsync(waitMs);
+    }
   }
 }
 
@@ -331,7 +476,7 @@ export default function (pi: ExtensionAPI) {
       if (prNumber !== null) {
         const record = readReviewRecord(prNumber);
         const ctx = resolveRepoContext(command, record);
-        const currentHead = getPrHeadSha(prNumber, ctx);
+        const currentHead = await getPrHeadSha(prNumber, ctx);
         const result = evaluateMergeGate(prNumber, record, currentHead, ctx);
         if (result.status === "block") {
           console.log("[review-enforcer] 🚫 Merge registry gate blocked merge");

@@ -99,6 +99,23 @@ function tmpDir(): string {
   return d;
 }
 
+// ── Bounded server teardown (#196) ───────────────────
+// A stalled keep-alive socket (observed with this machine's git stall) can
+// keep server.close()'s callback pending indefinitely and hang the suite.
+// Grace timer force-destroys remaining connections, then resolves regardless.
+function closeServerBounded(server: Server): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      try { server.closeAllConnections(); } catch { /* already closed */ }
+      resolve();
+    }, 1500);
+    server.close(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
 // ── Mock Bridge server ──────────────────────────────
 
 class MockBridge {
@@ -160,7 +177,7 @@ class MockBridge {
   closeEarly() { this._closeEarly = true; }
 
   kill() {
-    return new Promise<void>((resolve) => this.server.close(() => resolve()));
+    return closeServerBounded(this.server);
   }
 
   killSync() { this.server.close(); }
@@ -198,7 +215,7 @@ class MockSlack {
   }
 
   kill() {
-    return new Promise<void>((resolve) => this.server.close(() => resolve()));
+    return closeServerBounded(this.server);
   }
 }
 
@@ -962,7 +979,32 @@ try {
 
 // ── Approval forwarding: per-repo store discovery (#2492) ─────
 {
-  const { repoNameFromUrl, deriveRepoName, approvalsStorePath, findApprovalsFile } = await import("./index.js");
+  const { repoNameFromUrl, deriveRepoName, approvalsStorePath, findApprovalsFile, gitRemoteTimeoutMs } = await import("./index.js");
+
+  // gitRemoteTimeoutMs — #196: env-overridable git-lookup cap (default 5s).
+  // The 2s default flaked discovery on multi-second `git remote get-url` stalls.
+  const prevGitTmo = process.env.GIT_REMOTE_TIMEOUT_MS;
+  try {
+    delete process.env.GIT_REMOTE_TIMEOUT_MS;
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: default 5000 (no env)");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "5000";
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: env override respected");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "abc";
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: invalid env falls back to 5000");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "0";
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: non-positive env falls back to 5000");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "1e3";
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: parseInt-truncation ('1e3') rejected → 5000");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "5000.5";
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: non-integer rejected → 5000");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "999999999";
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: above 60s clamp rejected → 5000");
+    process.env.GIT_REMOTE_TIMEOUT_MS = "60000";
+    assert(gitRemoteTimeoutMs() === 60000, "gitRemoteTimeoutMs: clamp ceiling 60000 accepted");
+  } finally {
+    if (prevGitTmo === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
+    else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTmo;
+  }
 
   // repoNameFromUrl — mirrors swarm _detect_repo parsing (last segment, .git stripped)
   assert(repoNameFromUrl("https://github.com/daniel-ospina/tortoise.git") === "tortoise", "repoNameFromUrl: https + .git → bare name");
@@ -986,6 +1028,38 @@ try {
     // fresh git repo with NO origin remote → null (a real state)
     assert(deriveRepoName(gitDir) === null, "deriveRepoName: git repo without origin remote → null");
     execSync("git remote add origin https://github.com/daniel-ospina/tortoise.git", { cwd: gitDir, stdio: "ignore" });
+
+    // #196: git-stall retry regression — a PATH shim that sleeps past the cap
+    // on its FIRST call (simulating the observed >cap stall) and ECHOES the
+    // origin URL on the retry. Deterministic: never passes through to real
+    // git (which itself stalls >700ms on this machine — the very premise of
+    // #196). Cap tuned down via GIT_REMOTE_TIMEOUT_MS so the test runs in
+    // ~1s; old code (2s cap, no retry) fails here with null.
+    {
+      const shimDir = join(tmpDir(), "shim");
+      mkdirSync(shimDir, { recursive: true });
+      const marker = join(shimDir, ".first-call-done");
+      writeFileSync(
+        join(shimDir, "git"),
+        `#!/bin/sh\nif [ ! -f "$GIT_SHIM_MARKER" ]; then\n  touch "$GIT_SHIM_MARKER"\n  sleep 2\nfi\necho "https://github.com/daniel-ospina/tortoise.git"\n`,
+        { mode: 0o755 },
+      );
+      const prevPath = process.env.PATH;
+      const prevGitTmo2 = process.env.GIT_REMOTE_TIMEOUT_MS;
+      try {
+        process.env.PATH = `${shimDir}:${prevPath ?? ""}`;
+        process.env.GIT_SHIM_MARKER = marker;
+        process.env.GIT_REMOTE_TIMEOUT_MS = "700"; // cap << shim sleep → attempt 1 killed
+        assert(deriveRepoName(gitDir) === "tortoise", "deriveRepoName: stall past cap → bounded retry succeeds (shim test)");
+      } finally {
+        if (prevPath === undefined) delete process.env.PATH;
+        else process.env.PATH = prevPath;
+        delete process.env.GIT_SHIM_MARKER;
+        if (prevGitTmo2 === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
+        else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTmo2;
+        rmSync(shimDir, { recursive: true, force: true });
+      }
+    }
     assert(deriveRepoName(gitDir) === "tortoise", "deriveRepoName: git origin URL → bare name");
     assert(deriveRepoName(join(tmpdir(), "definitely-not-a-repo-" + randomUUID().slice(0, 8))) === null, "deriveRepoName: no git → null");
 

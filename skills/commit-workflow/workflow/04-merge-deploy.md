@@ -22,6 +22,19 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    touching runtime code, the affected test suites are green (regression check — no regressions).
 3. **Verification gate passed** — the [VGATE] sub-agent verified all staged files (matching hashes).
 4. **PR mergeable** — GitHub reports MERGEABLE (no conflicts).
+
+> **GraphQL rate-limit resilience (#192):** `gh pr view` uses the GraphQL pool,
+> which resets independently of the REST pool (`gh api rate_limit` is REST).
+> Parallel sessions can exhaust GraphQL while REST stays healthy. The
+> review-enforcer merge gate now resolves the head via the REST pulls endpoint
+> (`gh api repos/{owner}/{repo}/pulls/{pr}` — instant recovery when only GraphQL
+> is down); only if REST is ALSO unavailable does it wait for the GraphQL reset
+> window and retry (bounded by `REVIEW_GATE_RATE_LIMIT_MAX_WAIT_MS`, default
+> 10 min) instead of failing mid-ceremony. If a ceremony still hits "GraphQL: API
+> rate limit already exceeded" on both pools, wait for the window or raise the
+> cap — do NOT re-record the review.
+> Note: #193 (gh pr merge --delete-branch vs worktree-locked default branch)
+> will also touch 04/05 later — keep these merge/cleanup changes compatible.
 5. **Current-with-main when overlapping** — if the code-review overlap signal (Step 0.9)
    flagged overlapping files OR the branch is behind `origin/main`: `git fetch origin && git
    merge origin/main` into the PR branch, then RE-RUN the affected pre-flight regression tests
