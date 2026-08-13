@@ -32,6 +32,23 @@ expect("checkout -- .", "git checkout -- .", "block:checkout-discard-all");
 expect("clean -fd", "git clean -fd", "block:clean");
 expect("pull", "git pull origin main", "block:pull");
 expect("merge", "git merge origin/main", "block:merge");
+// Issue #210 — read-only merge-* plumbing must classify as allow
+// (the hyphen is a word boundary, so the old /\bgit\s+merge\b/ matched
+// merge-base; negative lookahead (?!-) excludes the plumbing family).
+expect("merge-base --is-ancestor", "git merge-base --is-ancestor a b", "allow");
+expect("merge-base", "git merge-base a b", "allow");
+expect("merge-tree", "git merge-tree", "allow");
+expect("merge-file", "git merge-file a b c", "allow");
+expect("merge-index", "git merge-index -a", "allow");
+expect("merge-one-file", "git merge-one-file a b c", "allow");
+expect("merge-msg", "git merge-msg", "allow");
+expect("mergetool", "git mergetool", "allow");
+// regression guard — real merges still block
+expect("bare merge", "git merge", "block:merge");
+expect("merge --ff-only", "git merge --ff-only", "block:merge");
+// compound-form differentiator (F2) — (?!-) must block no-space compounds;
+// the (?:\s|$) alternative would silently allow these
+expect("merge; push compound", "git merge;git push", "block:merge");
 expect("rebase", "git rebase main", "block:rebase");
 expect("branch -D", "git branch -D chore/old", "block:branch-force-delete");
 expect("force push", "git push -f origin main", "block:force-push");

@@ -19,7 +19,7 @@ import { existsSync } from "node:fs";
 export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "reset", re: /\bgit\s+reset\b/ },
   { name: "clean", re: /\bgit\s+clean\b/ },
-  { name: "merge", re: /\bgit\s+merge\b/ },
+  { name: "merge", re: /\bgit\s+merge\b(?!-)/ },
   { name: "rebase", re: /\bgit\s+rebase\b/ },
   { name: "pull", re: /\bgit\s+pull\b/ },
   { name: "branch-force-delete", re: /\bgit\s+branch\s+-\w*D\b/ },
