@@ -787,11 +787,16 @@ export function heartbeatKillDecision(
   //    Note: with the emitter loaded, ready/turn_start latch before any
   //    provider call, so the 60s tier-1 no longer covers hung first requests
   //    — this clause is their detector now (settled scope trade-off).
+  //    #198: an IN-FLIGHT tool (toolsInFlight > 0) is activity even when the
+  //    child's saw_tool latch lags (observed: `tools=1 saw_tool=0` — a nested
+  //    task in flight while the tick reported no tool seen) — never cut a
+  //    demonstrably-working sub-agent at the first-message bound; a genuinely
+  //    hung in-flight tool is still bounded by the tool-stall clause (L).
   if (
     stateFresh &&
     st.turnActive &&
     !st.turnSawMessage &&
-    !st.turnSawTool &&
+    !(st.turnSawTool || st.toolsInFlight > 0) &&
     effStreamAge > i.firstMessageMs
   ) {
     return kill("first-message-stall");

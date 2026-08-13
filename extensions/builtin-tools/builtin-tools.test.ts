@@ -1113,6 +1113,19 @@ test("E13: first-message-stall at M — turn active, no message/tool events, ret
   // saw_tool latched → exempt
   const stTool = { ...st, turnSawTool: true };
   equal(heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: stTool, streamStallMs: 600_000 })).kill, false);
+  // #198: in-flight tool (tools=1, saw_tool=0 — the observed live-cut state)
+  // is activity — first-message bound must NOT fire; tool-stall (L) owns it.
+  const stInFlight = { ...st, toolsInFlight: 1, turnSawTool: false };
+  equal(
+    heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: stInFlight, streamStallMs: 600_000 })).kill,
+    false,
+    "in-flight tool exempts the first-message bound (#198)",
+  );
+  // ...but a long-hung in-flight tool is still cut by the tool-stall bound.
+  const stHung = { ...st, toolsInFlight: 1, turnSawTool: false, toolAgeMaxMs: 21_600_001, turnActive: true };
+  const dHung = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: stHung, streamStallMs: 600_000, toolStallMs: 21_600_000 }));
+  equal(dHung.kill, true, "hung in-flight tool still bounded by tool-stall (#198)");
+  equal(dHung.reason, "tool-stall", "tool-stall reason (#198)");
 });
 
 test("E12: ready + no turn — not tier-1-killed; ticks stop → silence at T; ticks flow → stream-stall at S", () => {
