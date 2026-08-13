@@ -5,7 +5,7 @@ domain: capability
 type: Bounded
 subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find todo_write task
-------
+---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
