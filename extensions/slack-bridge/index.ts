@@ -108,7 +108,16 @@ const cycleBuffer: { slug: string; cycles: number; text: string }[] = [];
 
 /** Print mode (headless `pi -p` / task sub-agents): the bridge is fully silent. */
 function isPrintMode(): boolean {
-  return process.env.PI_MODE === "print";
+  // #172 print-mode detection. NOTE: pi NEVER sets PI_MODE (verified
+  // 2026-08-13: pi parses -p/--print into an internal flag in cli/args.js
+  // but exports nothing) — the env-only check was dead code, so every
+  // headless one-shot (task sub-agents spawn `pi -p ...` per builtin-tools
+  // index.ts:1380, CLI -p runs, background workers) enabled Socket Mode +
+  // bridge hooks, hit Slack's 10-connection app cap, and logged the
+  // `Socket Mode error:` / `disconnected (code=1006)` pair in every
+  // session. Detect print mode from argv as well.
+  if (process.env.PI_MODE === "print") return true;
+  return process.argv.includes("-p") || process.argv.includes("--print");
 }
 
 /**
@@ -1534,7 +1543,7 @@ export default function slackBridge(pi: ExtensionAPI): void {
       // #158: the dead-session recovery startup sweep rides the same
       // session_start wiring (approval capability, same disable conditions).
       // Without the token the receiver never starts — zero behavior change.
-      if (process.env.PI_MODE !== 'print') {
+      if (!isPrintMode()) {
         registerSocketModeHooks(pi);
         console.log(
           isSocketModeEnabled()
@@ -1543,7 +1552,7 @@ export default function slackBridge(pi: ExtensionAPI): void {
         );
       }
       // #5672: suppress startup banner in print mode (task sub-agent output)
-      if (process.env.PI_MODE !== 'print') {
+      if (!isPrintMode()) {
         console.log("[slack-bridge] ✅ Loaded");
       }
     } catch (err: any) {
@@ -1555,7 +1564,7 @@ export default function slackBridge(pi: ExtensionAPI): void {
   // line; starts the poller only when SLACK_BOT_TOKEN + a channel are set.
   // Skipped in print mode (task sub-agents: one-shot, no Slack — matches the
   // SLACK_BRIDGE_DISABLE=1 convention in builtin-tools).
-  if (process.env.PI_MODE !== 'print') {
+  if (!isPrintMode()) {
     initApprovalForwarding();
   }
 }
