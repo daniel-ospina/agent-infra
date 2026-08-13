@@ -23,10 +23,17 @@ steps:
     type: skill
     gate: auto
     requires: [research_intake]
+  - name: parallel_check_plan
+    type: gate
+    gate: checkpoint
+    token_phase: plan
+    requires: [integration_surface]
+    # #4907: run `parallel_work_check plan` (C3) — CLEAR verdict writes the
+    # PASS token; fail-closed gate blocks until fresh. Set CHECKOUT_GUARD_ENFORCE=1.
   - name: draft_implementation_plan
     type: skill
     gate: auto
-    requires: [integration_surface]
+    requires: [parallel_check_plan]
   - name: plan_review
     type: parallel
     gate: verifier

@@ -1,5 +1,6 @@
 // Regression tests for main-worktree-guard (path scoping #5582 + destructive-git
 // bash guard, incident 2026-08-06).
+// + worktree-session write/edit early-return (epic-529 false-positive incident).
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
@@ -75,6 +76,10 @@ try {
   const wtDetect = isWorktreeCwd(wtPath);
   console.log(`worktree detection from worktree (expect true): ${wtDetect}`);
   wtDetect === true ? pass++ : fail++;
+  // Write/edit worktree-session early-return (mirror of index.ts fix):
+  check("own file, worktree session", `${wtPath}/AGENTS.md`, "ALLOW (worktree session)", wtPath);
+  check("deep own file, worktree session", `${wtPath}/extensions/main-worktree-guard/index.ts`, "ALLOW (worktree session)", wtPath);
+  check("main file, temp worktree session", `${MAIN}/AGENTS.md`, "ALLOW (worktree session)", wtPath);
 } catch (e) {
   console.log(`⏭️  worktree case skipped (could not provision: ${String(e.message).slice(0, 60)})`);
 } finally {
@@ -87,6 +92,9 @@ try {
 // sessionCwd mirrors the pi extension-host cwd (the project root the guard
 // protects). Passed explicitly so the suite works from any checkout.
 function guardDecision(targetPath, sessionCwd = PROJECT_CWD) {
+  // Worktrees are ISOLATED: a session rooted in a linked worktree edits freely
+  // (mirrors index.ts write/edit early-return).
+  if (isWorktreeCwd(resolve(sessionCwd))) return "ALLOW (worktree session)";
   let mainTopLevel;
   try {
     mainTopLevel = resolve(execSync("git rev-parse --show-toplevel", { encoding: "utf-8", cwd: resolve(sessionCwd), timeout: 5000 }).trim());
@@ -118,7 +126,7 @@ check("~/.pi extension", "/home/user/.pi/agent/extensions/x.ts", "ALLOW (outside
 // Session rooted in a worktree: main-checkout paths are outside its project → allowed.
 // Only meaningful when the suite itself runs from a worktree.
 if (!RUN_IS_MAIN) {
-  check("main file, worktree session", `${MAIN}/AGENTS.md`, "ALLOW (outside project)", PROJECT_CWD);
+  check("main file, worktree session", `${MAIN}/AGENTS.md`, "ALLOW (worktree session)", PROJECT_CWD);
 }
 
 // ── Infra-repo detection (#99) ─────────────────────────────────────────────
