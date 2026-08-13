@@ -150,7 +150,12 @@ validate_brief_path() {
     [[ "$parent" == "$probe" ]] && { echo "Error: cannot resolve directory: $dir" >&2; return 1; }
     probe="$parent"
   done
-  absdir=$(cd "$probe" && pwd -P)
+  # The successful cd above leaves cwd AT the resolved directory — capture
+  # it here. (Do NOT re-run `cd "$probe"` in a subshell: $probe may be a
+  # RELATIVE path, and with cwd already mutated a second `cd docs/...`
+  # fails, leaving absdir empty and rejecting valid relative briefs —
+  # issue #1145.)
+  absdir=$(pwd -P)
   cd "$orig_cwd"   # restore cwd before resolving the repo root (the walk mutated it)
   root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
   absroot=$(cd "$root" && pwd -P)
@@ -280,6 +285,18 @@ run_self_test() {
   [[ $rc4 -eq 3 ]] || { echo "FAIL: out-of-tree RC (got $rc4): $out4"; exit 1; }
   echo "$out4" | grep -q "outside the repo root" || { echo "FAIL: out-of-tree message: $out4"; exit 1; }
   [[ ! -d "$outtree" ]] || { echo "FAIL: out-of-tree directory was created"; exit 1; }
+
+  # 9. RELATIVE brief path (nested) resolves (issue #1145 — the cwd-mutating
+  #    walk used to re-`cd docs/...` from the mutated cwd, fail, and reject
+  #    valid relative paths with exit 3).
+  mkdir -p "$testrepo/docs/research"
+  local rel="$testrepo/docs/research/rel.md"
+  printf '# Brief\n\n## Raw Notes\n\n' > "$rel"
+  local out5 rc5
+  if out5=$(cd "$testrepo" && bash "$SCRIPT_PATH" --issue-body "**Research:** docs/research/rel.md" --append "relative finding" --source-tag canonical 2>&1); then rc5=0; else rc5=$?; fi
+  [[ $rc5 -eq 0 ]] || { echo "FAIL: relative path exit code (got $rc5): $out5"; exit 1; }
+  echo "$out5" | grep -q "Appended to" || { echo "FAIL: relative append message: $out5"; exit 1; }
+  grep -q 'relative finding' "$rel" || { echo "FAIL: relative append content missing"; exit 1; }
 
   echo "self-test OK"
   exit 0

@@ -8,17 +8,26 @@ description: Verify chain integrity across all product strategy gates. Runs veri
 type: capability
 domain: capability
 status: live
-allowed-tools: mcp__tortoise__tortoise_verify_chain, mcp__tortoise__tortoise_get_chain_status, mcp__tortoise__tortoise_create_point, mcp__tortoise__tortoise_query
+allowed-tools: mcp__tortoise__tortoise_check_structure, mcp__tortoise__tortoise_summarize_structure, mcp__tortoise__tortoise_create_point, mcp__tortoise__tortoise_query
 ---
 
 # tortoise:verify-chain
 
 Verify that the product strategy chain (JTBD → useCase → userJourney → workflow → requirement) has no violations.
 
+> **Tool surface (synced 2026-08-13, #1168):** the chain-verify tools live
+> on the in-repo MCP surface as `tortoise_check_structure` (Gate 0→4 chain
+> integrity — orphans/dangling refs) and `tortoise_summarize_structure`
+> (per-gate counts). The previously documented `tortoise_verify_chain` /
+> `tortoise_get_chain_status` tools do NOT exist in tool_registry.py and
+> will error with tool-not-found. (After #405 lands, `tortoise_validate_domain`
+> is the richer domain-validation surface — prefer it once available.)
+
 ## Steps
 
-1. Call `tortoise_get_chain_status()` to get summary counts per gate.
-2. Call `tortoise_verify_chain()` to get detailed violations.
+1. Call `tortoise_summarize_structure()` to get summary counts per gate.
+2. Call `tortoise_check_structure()` to get detailed chain violations
+   (Gate 0→4 orphans, dangling references).
 3. If clean: report "all chain integrity rules pass."
 4. If violations found, for each violation:
    - Surface the affected Point ID and the rule that failed.
@@ -27,9 +36,9 @@ Verify that the product strategy chain (JTBD → useCase → userJourney → wor
 
 ## Quality Gates
 
-- **G1 (Static):** Verify that the graph context exists and has Points.
+- **G1 (Static):** Verify that the graph context exists and has Points (`tortoise_query`).
 - **G2 (Semantic):** If violations are found, classify severity: P0 (orphan useCase without JTBD parent) vs P2 (missing optional metadata).
 
 ## Error Handling
 
-- If `tortoise_verify_chain` fails, report the error. Do not attempt fixes on a broken query.
+- If `tortoise_check_structure` fails, report the error. Do not attempt fixes on a broken query.
