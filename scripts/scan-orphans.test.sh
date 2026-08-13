@@ -177,6 +177,17 @@ $SCAN --apply >/dev/null 2>&1 || true
 [ -d "$FIX/wt-unrecorded" ] && ok "--apply never touches unrecorded" || bad "--apply removed unrecorded worktree"
 git branch | grep -q fix/unrecorded-1 && ok "unrecorded branch survives" || bad "unrecorded branch deleted"
 
+# 2i. poisoned record (arbitrary dir, not a registered worktree) → --apply
+#     must NEVER delete it (P1 safety gate, review #216)
+mkdir -p "$FIX/important-dir"
+echo precious > "$FIX/important-dir/data.txt"
+git branch fix/poison-1
+$RW add --branch fix/poison-1 --worktree "$FIX/important-dir" --dispatch d-poison --ts 2026-08-01T00:00:00Z >/dev/null
+$SCAN --apply >/dev/null 2>&1 || true
+[ -f "$FIX/important-dir/data.txt" ] && ok "--apply never deletes an unregistered dir" || bad "--apply DELETED an arbitrary dir (P1!)"
+git branch | grep -q fix/poison-1 && bad "poison branch survives --apply" || ok "--apply still deletes the local-only branch"
+assert_eq "$(wc -l < "$WORKTREES_RECORD" | tr -d ' ')" "0" "--apply prunes the poison record"
+
 # ── Summary ───────────────────────────────────────────────────────────────
 echo ""
 echo "=== scan-orphans.test.sh: $PASS passed, $FAIL failed ==="

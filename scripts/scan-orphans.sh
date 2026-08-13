@@ -114,16 +114,26 @@ if [ -f "$RECORD_FILE" ]; then
             continue
         fi
 
-        # Stale + local-only: orphan (dirty or clean)
+        # Stale + local-only: orphan (dirty or clean). SAFETY: a recorded dir
+        # only counts as a worktree when git confirms it is registered to THIS
+        # repo — a crafted/poisoned record must never turn --apply into an
+        # arbitrary-directory rm -rf (review #216).
+        IS_WT=false
+        if [ -n "$DIR" ]; then
+            # Canonicalize both sides: macOS /var → /private/var symlink; the
+            # porcelain prints realpaths while the record may hold the /var form.
+            WT_CANON="$(cd "$DIR" 2>/dev/null && pwd -P || echo "$DIR")"
+            git worktree list --porcelain 2>/dev/null | grep -qF "worktree $WT_CANON" && IS_WT=true
+        fi
         DIRTY_B=0
-        if [ -d "$DIR" ]; then
+        if [ "$IS_WT" = true ]; then
             worktree_clean "$DIR" || DIRTY_B=1
         fi
         if [ "$DIRTY_B" = 1 ]; then
             DIRTY=$((DIRTY + 1))
             DIRTY_OUT="${DIRTY_OUT}  ⚠️  ORPHANED BUT DIRTY: branch=$BRANCH dir=$DIR (uncommitted changes — review manually)\n"
-            if [ "$APPLY" = true ] && [ "$FORCE_DIRTY" = true ]; then
-                git worktree remove --force "$DIR" 2>/dev/null || rm -rf "$DIR" 2>/dev/null || true
+            if [ "$APPLY" = true ] && [ "$FORCE_DIRTY" = true ] && [ "$IS_WT" = true ]; then
+                git worktree remove --force "$DIR" 2>/dev/null || true
                 git branch -D "$BRANCH" 2>/dev/null || true
                 bash "$SCRIPT_DIR/record-worktree.sh" done --dispatch "$DISPATCH" >/dev/null 2>&1 || true
                 DIRTY_OUT="${DIRTY_OUT}     removed (--force-dirty).\n"
@@ -132,8 +142,10 @@ if [ -f "$RECORD_FILE" ]; then
             ORPHANS=$((ORPHANS + 1))
             ORPHAN_OUT="${ORPHAN_OUT}  🧹 ORPHANED (safe to remove): branch=$BRANCH dir=$DIR dispatch=$DISPATCH\n"
             if [ "$APPLY" = true ]; then
-                if [ -d "$DIR" ]; then
-                    git worktree remove --force "$DIR" 2>/dev/null || rm -rf "$DIR" 2>/dev/null || true
+                if [ "$IS_WT" = true ]; then
+                    git worktree remove --force "$DIR" 2>/dev/null || true
+                else
+                    ORPHAN_OUT="${ORPHAN_OUT}     ⚠️ dir not a registered worktree — record pruned, dir left alone.\n"
                 fi
                 git branch -D "$BRANCH" 2>/dev/null || true
                 bash "$SCRIPT_DIR/record-worktree.sh" done --dispatch "$DISPATCH" >/dev/null 2>&1 || true
