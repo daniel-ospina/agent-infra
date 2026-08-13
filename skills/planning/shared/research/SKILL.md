@@ -3,6 +3,7 @@ name: shared-research
 description: Research wrapper for workflows. Routes to research skill with proportional depth. Expands the routing stub with the granularity-ladder mechanics: PRIOR_RESEARCH dedup, gate mechanics (fresh-context brief review), and the output contract (fixed sections + ## Raw Notes + findings-date). Issue #231.
 domain: capability
 type: Routing
+status: live
 tags: [pipeline, shared, research]
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 created: 2026-07-26
@@ -32,7 +33,7 @@ Routes the workflow's research stage at the correct granularity rung of the ladd
 
 ## Gate Mechanics
 
-After the research stage completes (epics + standalone projects), dispatch a fresh-context reviewer via `task`:
+After the research stage completes (epics + standalone projects — any stage the workflow frontmatter declares `gate: verifier`), dispatch a fresh-context reviewer via `task`. **Precedence:** epic-research's own 4-item Review Gate remains the epic-tier gate; this 5-item checklist SUPPLEMENTS it (single dispatch, merged prompt) — it does not replace it:
 
 ```
 Review this research output for:
@@ -50,7 +51,7 @@ Fix-loop until clean or convergence (10-cycle cap).
 ## Output Contract
 
 - **Epics:** the 5-section brief + `## Raw Notes` (canonical headings per epic-research).
-- **Projects (appending to a parent brief):** timestamped entries appended via `scripts/_research_append.sh` + a `### Axis Research`-style synthesized block where the brief lacks coverage.
+- **Projects (appending to a parent brief):** timestamped entries appended via `scripts/_research_append.sh` + a synthesized block with per-framing provenance where the brief lacks coverage. **Do NOT use the `### Axis Research` heading here** — that name is issue-scoping Phase 1.5's sole artifact (D5 authorship boundary, PR #241); use a level-neutral heading (e.g., `### Targeted Research Findings`) or no heading (bare `## Raw Notes` entries).
 - **Standalone projects:** `docs/research/<slug>.md` with fixed sections + `## Raw Notes` + `> **Findings date:**`.
 - **Budget mode (`EXECUTION_INTENT=Budget`):** codebase + brief only, ≤ 2 external queries on P0-level gaps; epic tier defers to the brief entirely.
 ---

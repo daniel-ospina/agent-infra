@@ -21,7 +21,9 @@ Bounded skill that defines what the epic includes and excludes. Takes the strate
 
 ### Step 0 — Granular Axis Research (issue #231 D11)
 
-When the research brief is **too broad for boundary decisions** (a complexity axis rated `medium+` in Step 3 AND the brief covers the epic-level question but not the boundary cut), fire granular per-axis queries — canonical / competitor-reference / pitfalls framing, ≤ 4 total, deduped against the brief (deduplicated questions never count). Output `### Axis Research Notes` in the scope doc with a `> **Findings date:**` stamp + provenance. Under `EXECUTION_INTENT=Budget`: defer to the brief (zero external queries). The Review Gate (below) checks `### Axis Research Notes` present-or-justified-skip for each `medium+` axis (justified = cited brief section).
+When the research brief is **too broad for boundary decisions** (a complexity axis **expected to rate `medium+`** — preliminary assessment performed here, formalized in Step 3 below; the Review Gate validates the final ratings against the `### Axis Research Notes` output), fire granular per-axis queries — canonical / competitor-precedent / pitfalls framing, ≤ 4 total, deduped against the brief (deduplicated questions never count). Output `### Axis Research Notes` in the scope doc with a `> **Findings date:**` stamp + provenance, and append each finding to the epic brief's `## Raw Notes` via `bash scripts/_research_append.sh --epic-path <brief-path> --append "<text>" --source-tag <framing>`. Under `EXECUTION_INTENT=Budget`: defer to the brief (zero external queries). The Review Gate (below) checks `### Axis Research Notes` present-or-justified-skip for each final `medium+` axis (justified = cited brief section).
+
+> **Disambiguation:** `### Axis Research Notes` (epic tier, scope doc) is distinct from issue-scoping's `### Axis Research` (issue tier, issue comment — D5 artifact) — different levels, never merge.
 
 ### Step 1 — Scope Boundaries
 
