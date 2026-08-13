@@ -57,7 +57,7 @@ fi
 > Routed via `Level: task` + `complexity:micro` in issue-creation fractal fields (see `issue-workflow` dispatch). Standard/complex tasks route to `task-workflow-standard` — this skill is the **micro pipeline only**.
 
 1. **Align** — Inherited from parent Epic/Project. Only required if standalone.
-2. **Research** — Quick codebase check: read affected files, existing patterns.
+2. **Research** — Quick codebase check: read affected files, existing patterns. **Proportional external trigger (issue #231 D11):** after the codebase check, if the task touches **third-party deps or a novel pattern with no in-repo precedent**, fire **1–2 external queries** (canonical usage + pitfalls — `web_search`/perplexity_search, never gated models) and record as an inline `> Research note:` line in the task plan comment with a findings-date + per-framing provenance (canonical / pitfalls + source). Budget mode (`EXECUTION_INTENT=Budget`): skip external queries (codebase-read only). Mechanical trigger inputs: affected-file import lines naming third-party modules (e.g. `import ... from '^[a-z@]'`), or the issue's `**Research:**` field if present — not the `**Dependencies:**` field (that is sibling-issue ordering). No demonstrated gap → no queries; do NOT self-judge novelty loosely — the trigger is dependency/novelty evidence, not opinion.
 3. **Scope** — Inline in issue body: acceptance criteria = scope.
 4. **Plan** — Inline: 1-3 sentence implementation approach in plan comment.
 5. **Implement** — The fix.
@@ -76,7 +76,7 @@ When the task is standalone:
 | Phase | Epic Depth | Task Depth |
 |-------|-----------|------------|
 | Align | Full adversarial + Eisenhower | Inherited or quick check |
-| Research | Full research brief | Read affected files |
+| Research | Full research brief | Codebase check + proportional external trigger (1–2 queries only on third-party deps / novel pattern; Budget: skip) |
 | Scope | Scope brief + E2E | Acceptance criteria inline |
 | Plan | 8 substeps + review gates | 1-3 sentence approach |
 | Implement | TDD tasks | If NEW module or NEW public functions → invoke test-writing (Red phase first). Then direct fix. |

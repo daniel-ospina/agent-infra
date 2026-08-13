@@ -67,7 +67,7 @@ The file is overwritten on each new brainstorming session. Intent is immutable p
 Worked examples:
 
 - **Micro + Autonomous:** Codebase Explorer still skipped (Micro rule). Plan reviews run 2 cycles instead of 4 (Micro constrains). Fix P0+P1 (Micro skips P2 by default; intent does not override tier).
-- **Micro + Budget:** Same as Micro Fast — all expensive steps already skipped by Micro rules.
+- **Micro + Budget:** codebase-read only — the micro proportional external-research trigger is skipped under Budget (issue #231 D3).
 - **Complex + Budget:** code-review skips NVIDIA pattern scan (6 → 5 agents). writing-plans skips perplexity gate. All other Complex phases run normally.
 - **Standard + Budget:** issue-scoping Phase 1.5 runs ≤ 2 external queries, codebase-first, fired only on P0-level gaps (new third-party dep / novel pattern with zero in-repo precedent) — the writing-plans Perplexity gate is the total session research budget (no double-charge). (issue #231 D3)
 - **Epic-tier + Budget:** epic-plan research hooks and epic-scope granular queries defer to the epic research brief (codebase + brief only, zero external queries). (issue #231 D3)
