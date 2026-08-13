@@ -124,6 +124,8 @@ The orchestrator checks the background result before starting implementation. If
 
 The `subagent` tool blocks until completion — there is no `background: true` parameter. For truly non-blocking background work (pre-warming, long-running side tasks), use `bash` background processes (`&`) with output redirected to temp files. Check temp files before the result is needed.
 
+> ⛔ **HARD RULE (#206): never launch an unbounded nested `pi`.** Any background/nested pi launch MUST carry all three bounds — `timeout <N>` (hard cap), log-file redirect (`> file 2>&1`; pipe stdout is block-buffered and looks frozen, #202), and a liveness marker (periodic timestamped heartbeat line). The 2026-08-11→12 incident: an unbounded `pi -p` launched to escape the worktree guard sat for 105,150s before manual abort. The sanctioned guard escape is the terminal one-liner (`cd <repo> && git checkout main && git pull --ff-only`), never a nested pi.
+
 For parallel dispatch of independent blocking tasks, use `subagent({ tasks: [...] })` — the tool blocks but all tasks run concurrently.
 
 ## Partial-Failure Handling
