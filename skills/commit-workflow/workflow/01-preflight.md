@@ -129,12 +129,12 @@ If `HAS_COLUMN_DROP_MIGRATIONS=false`: skip silently.
 
 ## Skill Enforcement Audit (conditional)
 
-Validates that every skill listed in the dangerous-ops manifest is present in the AGENTS.md protocol table. Prevents skills from being added without registering them in the enforcement table.
+Runs `scripts/ci/enforce-protocol-table.sh`. **Pass 1 is the live gate in agent-infra:** every dangerous-ops manifest skill (`enforcement/dangerous-ops.txt`) must resolve to a real `skills/<name>/SKILL.md` — a missing file is a silently broken enforcement gate. **Pass 2/3 (manifest ↔ AGENTS.md protocol table) are conditional:** they run only when AGENTS.md exists AND its protocol table is populated — in agent-infra the table is the template placeholder (and AGENTS.md is untracked/generated), so Pass 2/3 skip-with-note; they activate in consumer repos with populated tables (issue #239).
 
 **Condition:** Only when **staged files** include changes under `skills/`, `enforcement/`, or `AGENTS.md`.
 
 ```bash
-git diff --cached --name-only | grep -qE '^(skills/|enforcement/|AGENTS\.md)' && HAS_SKILL_CHANGES=true || HAS_SKILL_CHANGES=false
+git diff --cached --name-only --no-renames | grep -qE '^(skills/|enforcement/|AGENTS\.md)' && HAS_SKILL_CHANGES=true || HAS_SKILL_CHANGES=false
 ```
 
 - If `HAS_SKILL_CHANGES=true`:
