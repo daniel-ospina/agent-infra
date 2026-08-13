@@ -1,6 +1,8 @@
 {
   "name": "sequence-enforcer",
   "version": "1.0.0",
+  "private": true,
+  "type": "module",
   "description": "Enforces skill step sequences at Pi runtime via YAML declarations",
   "pi": { "extensions": ["./index.ts"] }
 }
