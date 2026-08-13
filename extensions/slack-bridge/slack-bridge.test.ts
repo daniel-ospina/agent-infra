@@ -526,6 +526,30 @@ try {
     slackBridge(stubPiP);
     assert(handlersP.has("session_start") && handlersP.has("session_shutdown"),
       "#172(print+thread): bridge hooks still register for Slack-spawned sessions");
+
+    // Regression (#172, 2026-08-13): a REAL `pi -p` one-shot has NO
+    // PI_MODE env (pi parses -p/--print into an internal flag, exports
+    // nothing — cli/args.js) and must still be detected as print mode via
+    // argv, otherwise every task sub-agent enabled Socket Mode + bridge
+    // hooks and logged error/1006 pairs in every session.
+    handlersP.clear();
+    logs.length = 0;
+    delete process.env.PI_MODE;
+    delete process.env.SLACK_BRIDGE_THREAD_TS;
+    delete process.env.SLACK_BRIDGE_TEAM;
+    const argvBackup = process.argv.slice();
+    process.argv.push("-p");
+    try {
+      slackBridge(stubPiP);
+      assert(!handlersP.has("session_start"),
+        "#172(argv -p, no PI_MODE): no bridge hooks registered");
+      const sbLines3 = logs.filter((l) => l.includes("[slack-bridge]"));
+      assert(sbLines3.length === 0,
+        `#172(argv -p, no PI_MODE): zero [slack-bridge] output (got ${sbLines3.length})`);
+    } finally {
+      process.argv.length = 0;
+      process.argv.push(...argvBackup);
+    }
   } finally {
     console.log = origLog;
     console.error = origErr;
