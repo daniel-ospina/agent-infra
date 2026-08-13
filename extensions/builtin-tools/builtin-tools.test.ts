@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, getTaskMaxDispatchMs } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, getCutGapMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, getTaskMaxDispatchMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS } from "./index.js";
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
 
@@ -932,6 +932,10 @@ const S = 120_000;  // stream stall
 const L = 3_600_000; // tool stall
 const M = 300_000;  // first message
 const INT = 30_000; // tick interval
+// Cut-gap default for E1–E14 fixtures: LARGE so the new cut clause never fires
+// in pre-#208 scenarios (marker gaps there are ≤ ~70s). E15–E17 inject the
+// real floor (15s) explicitly.
+const CUT_GAP_FIXTURE = 3_600_000;
 
 function dinput(over: Partial<HeartbeatDecisionInput> & { state?: HeartbeatState } = {}): HeartbeatDecisionInput {
   return {
@@ -947,6 +951,7 @@ function dinput(over: Partial<HeartbeatDecisionInput> & { state?: HeartbeatState
     firstMessageMs: M,
     intervalMs: INT,
     maxDispatchMs: 0,
+    cutGapMs: CUT_GAP_FIXTURE,
     ...over,
   };
 }
@@ -1341,6 +1346,109 @@ test("getTaskMaxDispatchMs — default off, ≥60s clamp", () => {
   withEnv({ TASK_MAX_DISPATCH_MS: "3600000" }, () => equal(getTaskMaxDispatchMs(), 3_600_000));
 });
 
+section("#208 heartbeat — cut clause (E15–E18)");
+
+test("getCutGapMs — 1.25× interval default, 15s floor, env override", () => {
+  withEnv({ TASK_HEARTBEAT_INTERVAL_MS: undefined, TASK_HEARTBEAT_CUT_GAP_MS: undefined }, () =>
+    equal(getCutGapMs(), 37_500, "1.25 × default 30s interval"));
+  // interval floor 5s → fallback 6.25s → clamped to the 15s floor
+  withEnv({ TASK_HEARTBEAT_INTERVAL_MS: "5000", TASK_HEARTBEAT_CUT_GAP_MS: undefined }, () =>
+    equal(getCutGapMs(), 15_000));
+  withEnv({ TASK_HEARTBEAT_INTERVAL_MS: "10000", TASK_HEARTBEAT_CUT_GAP_MS: undefined }, () =>
+    equal(getCutGapMs(), 15_000, "1.25×10s=12.5s < floor → 15s"));
+  // explicit override
+  withEnv({ TASK_HEARTBEAT_CUT_GAP_MS: "20000" }, () => equal(getCutGapMs(), 20_000));
+  // garbage / 0 → default (never disable the cut detector via a bad env value)
+  withEnv({ TASK_HEARTBEAT_CUT_GAP_MS: "0" }, () => equal(getCutGapMs(), 37_500));
+  withEnv({ TASK_HEARTBEAT_CUT_GAP_MS: "NaN" }, () => equal(getCutGapMs(), 37_500));
+});
+
+test("E15: cut clause — fresh state, tool in flight, marker gap > cutGapMs → cut", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.streamAgeMs = 1_000; // frozen below stream-stall
+  st.toolAgeMaxMs = 1_000; // frozen below tool-stall
+  st.lastMarkerAt = 100_000;
+  // markerAge = 20s > cutGap 15s; stateFresh (20s ≤ 120s); tools=1 → cut
+  const d = heartbeatKillDecision(dinput({ now: 100_000 + 20_000, lastLifeSignAt: 100_000, state: st, cutGapMs: 15_000 }));
+  equal(d.kill, true);
+  equal(d.reason, "cut");
+  equal(d.resolveUndefined, false, "partials present → defined partial result");
+  // zero-partial cut stays retryable (F10) — the kill() helper maps !hasOutput
+  const d2 = heartbeatKillDecision(dinput({ now: 100_000 + 20_000, lastLifeSignAt: 100_000, state: st, cutGapMs: 15_000, hasOutput: false }));
+  equal(d2.kill, true);
+  equal(d2.reason, "cut");
+  equal(d2.resolveUndefined, true, "no real output → retryable undefined");
+});
+
+test("E16: no cut while markers tick within cutGap — busy-but-ticking exemption", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.streamAgeMs = 1_000;
+  st.toolAgeMaxMs = 1_000;
+  st.lastMarkerAt = 100_000;
+  // markerAge ≈ 1 interval (10s) < cutGap 15s → no cut
+  const d = heartbeatKillDecision(dinput({ now: 100_000 + 10_000, lastLifeSignAt: 100_000, state: st, cutGapMs: 15_000 }));
+  equal(d.kill, false, "ticking agent with a tool in flight is not cut");
+  // markers within cutGap (14s < 15s) → still exempt
+  const d2 = heartbeatKillDecision(dinput({ now: 100_000 + 14_000, lastLifeSignAt: 100_000, state: st, cutGapMs: 15_000 }));
+  equal(d2.kill, false);
+});
+
+test("E17: cut precedence + stateFresh interaction pin", () => {
+  const mkSt = () => {
+    const st = createHeartbeatState();
+    st.everSawWork = true;
+    st.turnActive = true;
+    st.toolsInFlight = 1;
+    st.streamAgeMs = 1_000;
+    st.toolAgeMaxMs = 1_000;
+    return st;
+  };
+  // (a) cut fires only while stateFresh — markerAge beyond the fresh window
+  // (max(2×T, 2×interval) = 120s here) → NO cut (the backstop owns that
+  // window, D4). Silence (121s > T, not exempt once stale) fires instead.
+  const stA = mkSt();
+  stA.lastMarkerAt = 1_000_000;
+  const dA = heartbeatKillDecision(dinput({ now: 1_000_000 + 121_000, lastLifeSignAt: 1_000_000, state: stA, cutGapMs: 15_000 }));
+  equal(dA.kill, true);
+  equal(dA.reason, "silence-threshold", "marker stream stale beyond the fresh window → silence, never cut");
+
+  // (b) silence-exempt case (turnActive + tools>0 + silenceMs > T): cut is the
+  // first non-exempt clause and fires with reason "cut" (D1 precedence slot).
+  const stB = mkSt();
+  stB.lastMarkerAt = 100_000;
+  const dB = heartbeatKillDecision(dinput({ now: 100_000 + T + 1, lastLifeSignAt: 100_000, state: stB, cutGapMs: 15_000 }));
+  equal(dB.kill, true);
+  equal(dB.reason, "cut", "silence-exempt wedge → cut (first non-exempt clause)");
+
+  // (c) placement pin: with tools=0 the cut clause never fires — that class is
+  // silence at T, unchanged.
+  const stC = createHeartbeatState();
+  stC.everSawWork = true;
+  stC.turnActive = false;
+  stC.toolsInFlight = 0;
+  stC.lastMarkerAt = 100_000;
+  const dC = heartbeatKillDecision(dinput({ now: 100_000 + T + 1, lastLifeSignAt: 100_000, state: stC, cutGapMs: 15_000 }));
+  equal(dC.kill, true);
+  equal(dC.reason, "silence-threshold", "tools=0 → silence at T, not cut");
+});
+
+test("E18: default-config cut bound ≤ 60s (F3)", () => {
+  // Worst-case resolve for the wedged class: cutGap (1.25× interval) + one 10s
+  // decision tick + ≤5s SIGKILL escalation + 2s exit-settle grace ≈ 54.5s.
+  withEnv({ TASK_HEARTBEAT_INTERVAL_MS: undefined, TASK_HEARTBEAT_CUT_GAP_MS: undefined }, () => {
+    const cutGap = getCutGapMs();
+    equal(cutGap, 37_500);
+    const worst = cutGap + 10_000 + 5_000 + 2_000;
+    ok(worst <= 60_000, `worst-case resolve ${worst}ms must be ≤ 60s`);
+  });
+});
+
 section("#176 heartbeat — spawnSubAgent wiring (source assertions)");
 
 test("task tool injects TASK_HEARTBEAT=1 with TASK_HEARTBEAT_DISABLE pre-check + nonce", () => {
@@ -1351,6 +1459,70 @@ test("task tool injects TASK_HEARTBEAT=1 with TASK_HEARTBEAT_DISABLE pre-check +
   ok(source.includes("flushHeartbeatLineBuf(hbCtx)"), "residue flushed before kill-composition and on close");
   ok(source.includes("heartbeatKillDecision({"), "tier-2 uses the state-aware decision function");
   ok(source.includes("Math.max(60_000, Number(process.env.TASK_HEARTBEAT_TIMEOUT_MS) || 1_800_000)"), "#489 clamp unchanged");
+});
+
+section("#208 — dispatch contract source-drift asserts (E19)");
+
+test("E19: settle-exactly-once + grace-race wiring pins", () => {
+  // `settled` gates EVERY settle path (exit-settle, close, backstop, heartbeat kill, error)
+  ok(source.includes("let settled = false;"), "per-dispatch settled flag exists");
+  ok(source.includes("let swept = false;"), "per-dispatch swept flag exists (sweep fires exactly once)");
+  ok(source.includes("if (settled) return;"), "doResolve guards on settled");
+  // grace timer cleared when close fires first (stale timer can never re-fire into a recycled pgid)
+  ok(source.includes("proc.on(\"exit\", (code: number | null) => {"), "exit-settle handler wired");
+  ok(source.includes("DEFAULT_EXIT_SETTLE_GRACE_MS"), "2s grace constant used by the exit-settle path");
+  ok(source.includes("if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }"), "grace timer cleared on close");
+  // exit-settle resolves via the shared finalize composition (grace race must not lose the branches)
+  ok(source.includes("finalize(code, \"exit\")"), "exit-settle calls the shared finalize");
+  ok(source.includes("finalize(code, \"close\")"), "close path calls the shared finalize");
+});
+
+test("E19: sweep wired on the SETTLE-PATH basis + safety valves", () => {
+  // settle-path sweep hook: no-sweep ONLY for close-within-grace normal success
+  ok(source.includes("doResolve(..., { sweep: settlePath === \"exit\" })") || source.includes("{ sweep: settlePath === \"exit\" }"), "exit-settle success MUST sweep; close-within-grace success does not");
+  ok(source.includes("sweepProcessGroup(childPgid, { detached })"), "sweep anchored on the captured pgid");
+  // TASK_SWEEP=0 safety valve disables the settle-path sweep ENTIRELY
+  ok(source.includes('process.env.TASK_SWEEP !== "0"'), "TASK_SWEEP=0 disables the settle-path sweep");
+  // TASK_DETACHED=0 implies TASK_SWEEP=0: the sweep is still CALLED but the
+  // shared guard skips + warns on a non-detached spawn (parent's pgid never signaled)
+  ok(source.includes("const childPgid: number | null = getPgid(proc.pid ?? 0) ?? proc.pid ?? null;"), "childPgid captured at spawn (both detached and non-detached)");
+  ok(source.includes("childPgid !== null"), "sweep gated on a non-null childPgid");
+  ok(source.includes("sweepProcessGroup(childPgid, { detached })"), "sweep passes the detached flag to the runtime guard");
+  ok(source.includes("sweepRunCount += 1"), "sweep hook counter exported for the integration harness");
+});
+
+test("E19: detached spawn + treeKill heartbeat kill + backstop + DEFAULT_TOOL_STALL_MS", () => {
+  ok(source.includes("const detached = process.env.TASK_DETACHED !== \"0\""), "spawn has detached: with TASK_DETACHED opt-out");
+  ok(source.includes("detached,"), "detached flag passed to spawn");
+  ok(source.includes("killTreeAndEscalate()"), "heartbeat kill uses the treeKill path");
+  ok(source.includes("treeKill(pid, \"SIGTERM\")"), "treeKill SIGTERM on the heartbeat kill path");
+  ok(source.includes("treeKill(pid, \"SIGKILL\")"), "treeKill SIGKILL escalation after 5s");
+  // backstop gated on stateFresh === false
+  ok(source.includes("const stateFresh = hbCtx.state.lastMarkerAt > 0 && markerAge <= freshWindowMs;"), "backstop fires only when stateFresh === false");
+  ok(source.includes("getTaskBackstopMs()"), "backstop bound resolved from the env-aware getter");
+  ok(source.includes("reason: \"cut\", backstop: true"), "backstop resolves with max-dispatch-style cut result");
+  // source-drift pin: tool-stall NOT lowered (align condition 3)
+  ok(source.includes("export const DEFAULT_TOOL_STALL_MS = 21_600_000;"), "DEFAULT_TOOL_STALL_MS unchanged (6h)");
+  ok(source.includes("classifyTaskExit(code, hbCtx.state.toolsInFlight)"), "exit taxonomy applied in the shared finalize");
+});
+
+section("#208 — classifyTaskExit taxonomy (E20)");
+
+test("E20: exit taxonomy — null → cut, 0+tools>0 → cut, 0+tools=0 → success, non-zero → failed", () => {
+  equal(classifyTaskExit(null, 1), "cut", "signal-death is a cut");
+  equal(classifyTaskExit(null, 0), "cut", "signal-death is a cut regardless of tool state");
+  equal(classifyTaskExit(0, 1), "cut", "clean mid-tool exit IS a cut (AC1 frozen rule)");
+  equal(classifyTaskExit(0, 0), "success", "clean exit with no tools in flight is success");
+  equal(classifyTaskExit(1, 0), "failed", "non-zero exit is failed (existing)");
+  equal(classifyTaskExit(2, 3), "failed", "non-zero exit with tools in flight is still failed (tool-stall semantics)");
+});
+
+test("getTaskBackstopMs — default tool-stall + 30min; env override; 0 = off", () => {
+  withEnv({ TASK_BACKSTOP_MS: undefined }, () => equal(getTaskBackstopMs(), 21_600_000 + 1_800_000));
+  withEnv({ TASK_BACKSTOP_MS: "0" }, () => equal(getTaskBackstopMs(), 0));
+  withEnv({ TASK_BACKSTOP_MS: "3600000" }, () => equal(getTaskBackstopMs(), 3_600_000));
+  withEnv({ TASK_BACKSTOP_MS: "NaN" }, () => equal(getTaskBackstopMs(), 23_400_000));
+  equal(DEFAULT_BACKSTOP_MARGIN_MS, 1_800_000);
 });
 
 

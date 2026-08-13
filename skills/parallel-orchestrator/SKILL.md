@@ -139,6 +139,18 @@ When dispatching parallel sub-agents, not all may succeed. Handle gracefully:
 
 All fan-out orchestrator skills (code-review, plan-review, prototype-review, test-review, content-strategy-agent, codebase-audit) implement this pattern.
 
+### Cut / Assume-Dead Handling (resume contract)
+
+When a worker is **cut** — killed externally (provider cut, OOM, watchdog kill) or detected dead — treat it as **assume-dead, not done** (#208):
+
+1. **Assume-dead:** a result with `killed: true, reason: "cut"` (task tool) or `stopReason: "cut"` (subagent ext — limitation: only signal-death maps to cut there, no tool state) means the worker is dead, not done — never block on it, never treat it as success, classify it as ⚠️ Cut.
+2. **Bounded wait:** parent waits are bounded (watchdog bound + margin); a cut returns partials + reason within the bound — if a dispatch exceeds it, treat as cut.
+3. **Partial-results recovery:** read the partial output (task tool content/details; subagent ext result messages) and the F6 result cache (`cachePath`) for whatever the worker produced before the cut.
+4. **Commit-early contract:** workers persist incrementally (docs, results, DB rows) so a cut loses at most the last uncommitted step; re-dispatch may re-run partial writes — workers must be idempotent.
+5. **Re-dispatch on cut:** retry **3× with backoff** (the SAME cadence as the fallback row below), then surface to human with options. Each re-dispatch is cheap: F6 caches partials on disk.
+
+> **#195 pairing:** a killed mid-write worker may leave `index.lock` / partial worktree state — run the #195 worktree-recovery path before re-dispatching into that worktree.
+
 ## Anti-Patterns
 
 | Anti-Pattern | Why It Matters |
@@ -150,5 +162,6 @@ All fan-out orchestrator skills (code-review, plan-review, prototype-review, tes
 | Infinite review cycles | Always cap at 10 cycles. Surface remaining issues to human |
 | Waiting for background tasks synchronously | Defeats the purpose. Check background results before they're needed |
 | No fallback for subagent tool failures | If the subagent tool is unreachable (network, API down), the skill hangs. Always have a fallback: retry 3× with backoff, then surface to human with options to (a) retry, (b) proceed sequentially, (c) abort. |
+| Blocking on a cut/dead sub-agent | Parent waits are bounded; a cut must return partials + reason within the watchdog bound, then the orchestrator re-dispatches instead of hanging. |
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.
