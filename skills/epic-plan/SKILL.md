@@ -84,6 +84,8 @@ Each sub-step produces a section of the epic plan document and passes through a 
 ### 1. User Journeys
 Detailed journey tables with persona mapping. Each journey describes a complete user flow with entry/exit states.
 
+**Light research hook (issue #231 D11):** for UX precedent, fire 1–2 queries ONLY on a demonstrated gap (novel interaction type absent from the brief's `### UX Pattern Research`); otherwise rely on the brief. Budget mode: defer to the brief.
+
 **Review gate:** Do journeys cover all in-scope items? Are persona-appropriate? Are edge cases (empty, error, loading) handled?
 
 ### 2. Workflows
@@ -99,15 +101,21 @@ UI prototype via `prototype-review` skill (GUI features) or markdown diagram (no
 ### 4. Data Model
 Entity definitions, relationships, RLS policies, integrity constraints. Database schema design.
 
-**Review gate:** Does data model support all workflows? Are RLS policies complete? Are integrity constraints enforced at DB level?
+**Research hook (issue #231 D11):** before drafting, if the brief is too broad for this decision (novel schema pattern, new integration, RLS complexity beyond the brief's coverage), fire 1–3 targeted external queries (canonical schema pattern / competitor-reference / pitfalls) and persist the output as a `### Data Model Research Notes` block in the epic plan doc with a `> **Findings date:**` stamp + per-framing provenance, deduped against the epic brief. Under `EXECUTION_INTENT=Budget`: defer to the brief (zero external queries).
+
+**Review gate:** Does data model support all workflows? Are RLS policies complete? Are integrity constraints enforced at DB level? **Research check:** if the hook fired, is `### Data Model Research Notes` present (or a justified skip — brief already covers at sufficient granularity, with a section citation)?
 
 ### 5. Architecture
 Target state, component boundaries, system interfaces. Deployment topology, service communication patterns.
 
-**Review gate:** Are boundaries clean? Are interfaces well-defined? Are failure modes addressed (circuit breakers, retries)?
+**Research hook (issue #231 D11):** before drafting, if the brief is too broad for this decision (novel architecture pattern, new service/integration, failure-mode design beyond the brief's coverage), fire 1–3 targeted external queries (canonical architecture pattern / competitor-reference / pitfalls) and persist the output as a `### Architecture Research Notes` block in the epic plan doc with a `> **Findings date:**` stamp + per-framing provenance, deduped against the epic brief. Under `EXECUTION_INTENT=Budget`: defer to the brief (zero external queries).
+
+**Review gate:** Are boundaries clean? Are interfaces well-defined? Are failure modes addressed (circuit breakers, retries)? **Research check:** if the hook fired, is `### Architecture Research Notes` present (or a justified skip — brief already covers at sufficient granularity, with a section citation)?
 
 ### 6. Interfaces
 API contracts, event schemas, type definitions. Contract-first design — define interfaces before implementation.
+
+**Light research hook (issue #231 D11):** for interface-contract patterns, fire 1–2 queries ONLY on a demonstrated gap (new API style / contract format absent from the brief); otherwise rely on the brief. Budget mode: defer to the brief.
 
 **Review gate:** Are contracts complete? Are error responses defined? Is versioning strategy clear?
 
