@@ -301,7 +301,7 @@ export function extractCdPath(command: string): string | null {
   // region that directly follows `cd ` is the cd ARGUMENT — preserved so
   // `cd "/path with spaces" && git …` still extracts.
   const masked = command.replace(
-    /(["'])(?:\\.|(?!\1).)*\1/g,
+    /(["'])(?:\\.|(?!\1)[\s\S])*\1/g,
     (q: string, _quote: string, offset: number) => {
       const before = command.slice(Math.max(0, offset - 4), offset);
       return /cd\s+$/.test(before) ? q : " ".repeat(q.length);
@@ -391,17 +391,19 @@ function normalizeRepoCapture(raw: string): string | null {
   const parts = raw.split("/").filter(Boolean);
   if (parts.length === 2) return parts.join("/");
   if (parts.length === 3) return `${parts[1]}/${parts[2]}`; // host/owner/repo
-  return null;
+  return null; // 4+ segments — garbage identity, fail-closed
 }
 
 export function extractRepoFlag(command: string): string | null {
-  const m = command.match(/(?:--repo|-R)(?:=|\s+)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
+  // 2-3 segments: a HOST/ prefix must reach normalizeRepoCapture (the old
+  // two-segment capture turned "github.com/owner/repo" into "github.com/owner").
+  const m = command.match(/(?:--repo|-R)(?:=|\s+)([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+){1,3})/);
   return m ? normalizeRepoCapture(m[1]) : null;
 }
 
 // Priority 2: GH_REPO=owner/name env assignment prefix in the command.
 export function extractGhRepoEnv(command: string): string | null {
-  const m = command.match(/(?:^|\s)GH_REPO=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/);
+  const m = command.match(/(?:^|\s)GH_REPO=([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+){1,3})/);
   return m ? normalizeRepoCapture(m[1]) : null;
 }
 
