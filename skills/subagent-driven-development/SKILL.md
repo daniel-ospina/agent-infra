@@ -12,6 +12,7 @@ allowed-tools: read write edit bash web_search web_fetch todo_write task grep fi
 > **Source:** Canonical copy at `skills/subagent-driven-development/SKILL.md`.
 
 # Subagent-Driven Development
+> ⛔ **HARD RULE (#206): never launch an unbounded nested `pi`.** Any nested/background pi launch MUST have all three bounds: `timeout <N>` (hard cap), log-file redirect (`> file 2>&1` — pipe stdout is block-buffered, #202), and a liveness marker (periodic heartbeat line). Background/nested pi is NEVER a valid escape from the main-worktree-guard — the sanctioned escape is the terminal one-liner (`cd <repo> && git checkout main && git pull --ff-only`).
 
 Execute plan by dispatching fresh subagent per task, with two-stage review after each: spec compliance review first, then code quality review.
 

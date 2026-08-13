@@ -229,6 +229,23 @@ Ready to implement <feature-name>
 - **Problem:** When the skill runs from inside an agent worktree, using `$(git rev-parse --show-toplevel)` or `$PWD` resolves to the current worktree, not the main repo. `git worktree add` then creates the new worktree nested inside the parent (e.g. `.worktrees/agent-a/.worktrees/agent-b/`), which accumulates cruft and breaks cleanup.
 - **Fix:** Always derive `$MAIN_REPO` in Step 0 via `git rev-parse --git-common-dir` and anchor every path (ls, check-ignore, worktree add) to `$MAIN_REPO`. Never use `$PWD` or `--show-toplevel` for path construction in this skill.
 
+### Stranded main checkout — the ONLY sanctioned recovery is a terminal one-liner (#206)
+
+- **Problem:** A main checkout stuck behind/stranded (auto-sync can't ff-pull, the guard blocks agent-side `checkout`/`pull`) is unrecoverable FROM the agent — the guard's escape hatches are env-only (`AGENT_ALLOW_MAIN_EDITS=1`) and cannot be set on a running process.
+- **Fix (the ONLY sanctioned recovery):** the human runs ONE command in a **terminal** (terminals are not intercepted by the guard):
+  ```bash
+  cd <repo> && git checkout main && git pull --ff-only
+  ```
+  Never launch a nested/background `pi` to "escape" the guard — that is how a 29h fleet hang happened (2026-08-11→12, #206).
+
+### Never launch an unbounded nested pi (#206) — hard rule
+
+- **Rule:** NEVER launch a nested `pi` (print-mode sub-agent, background session, recovery worker) without ALL THREE bounds:
+  1. **`timeout <N>`** — hard wall-clock cap on the process (e.g. `timeout 600 pi -p ...`); no unbounded launches, ever.
+  2. **Log-file redirect** — `> /tmp/<name>.log 2>&1` so progress is observable (stdout to a pipe/file is block-buffered and can appear frozen for hours, #202).
+  3. **Liveness marker** — the launched process must emit a periodic heartbeat (timestamped line) so a stalled worker is distinguishable from a dead one.
+- **Sanctioned alternative:** the terminal one-liner above (no pi involved).
+
 ### Missing MCP tools in worktree sessions (NVIDIA, Supabase, etc.)
 
 - **Problem:** `.mcp.json` is gitignored (contains embedded API keys) and is therefore absent from all worktrees. When Claude Code is opened in a worktree directory, no MCP servers register → `issue-scoping`, `code-review`, `prototype-review` and any skill that routes to NVIDIA falls back to Claude sub-agents.
