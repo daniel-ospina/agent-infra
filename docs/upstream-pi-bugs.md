@@ -62,6 +62,16 @@ streams EOF but the process is still alive after `TASK_EXIT_GRACE_MS` (default
 120s), kill it (SIGTERM → SIGKILL, tree-kill) so the parent gets the
 already-captured output instead of waiting out the 30-min heartbeat window.
 
+**#191 extension (shipped):** the hang class where stdio NEVER EOFs (a live
+child stuck in MCP disconnect cleanup) was invisible to the EOF watchdog. The
+task-heartbeat extension now emits a `session_end` completion marker from its
+`session_shutdown` hook (pi emits the event on normal print-mode teardown); the
+task tool latches it and arms a short completion watchdog
+(`TASK_EXIT_COMPLETE_GRACE_MS`, default 15s) that kills the lingering child and
+returns the captured stdout as SUCCESS (`killedAfterCompletion: true` in
+details) — completed sub-agents never surface as "Subagent was aborted".
+Absent the marker (older pi / heartbeat disabled) behavior is unchanged.
+
 ---
 
 ## Issue B: Dead connection reuse in OpenAI-compatible provider

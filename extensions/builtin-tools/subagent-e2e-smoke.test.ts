@@ -135,6 +135,40 @@ tests.push(test("E4 (#176): 70s silent tool call survives the 60s silence thresh
   ok(!stdout.includes("[task-heartbeat]"), "marker leaked into parent result");
 }));
 
+// E1 (#191): a COMPLETED nested dispatch must return success — the completion
+// watchdog (armed on the child's session_end marker) guarantees prompt return
+// even when the child lingers in MCP disconnect cleanup, so the result is
+// never surfaced as aborted / partial-results. Discriminating: old code could
+// hang the parent tool call until user abort ("Subagent was aborted") or the
+// 30-min silence kill ("Partial results" headlines).
+tests.push(test("E1 (#191): completed nested task dispatch returns success (completion grace watchdog)", async () => {
+  const liveEmitter = join(homedir(), ".pi", "agent", "extensions", "task-heartbeat.ts");
+  if (!existsSync(liveEmitter)) {
+    throw new SkipError(`live farm lacks the emitter (${liveEmitter}) — run T5 wiring`);
+  }
+  const marker = `DONE_191_${randomUUID().slice(0, 8)}`;
+  const prompt =
+    `Use the task tool to dispatch a sub-agent. The sub-agent prompt must be exactly: ` +
+    `'Reply with exactly: ${marker} (nothing else).' ` +
+    `When the task tool returns, output the sub-agent's reply verbatim.`;
+  const { stdout, stderr, code } = await spawnPi(
+    ["-p", "--provider", "deepseek", "--model", "deepseek-v4-flash", "--no-session", prompt],
+    { ...SKIP_ENV, TASK_EXIT_COMPLETE_GRACE_MS: "15000", PI_MCP_SERVERS: "none" },
+    420_000,
+  );
+  ok(code === 0 || code === null, `exit: ${code}`);
+  // Old-code failure surfaces — none may appear:
+  ok(!stdout.includes("aborted"), `completed dispatch surfaced as aborted: ${stdout.slice(0, 400)}`);
+  ok(!stdout.includes("silence threshold"), `silence kill fired on a completed dispatch: ${stdout.slice(0, 400)}`);
+  ok(!stdout.includes("circuit breaker open"), `circuit breaker opened: ${stdout.slice(0, 400)}`);
+  // The nested sub-agent's reply must come through as the result:
+  ok(stdout.includes(marker), `sub-agent answer missing: ${stdout.slice(0, 400)}`);
+  // Guarantee 6: no marker text leaks into results:
+  ok(!stdout.includes("[task-heartbeat]"), "marker leaked into parent result");
+  // A completion-watchdog rescue is legitimate (logs it) — but never a hang:
+  ok(!stderr.includes("aborted"), "aborted visible on stderr");
+}));
+
 async function run() {
   for (const t of tests) await t();
   rmSync(TEST_DIR, { recursive: true, force: true });

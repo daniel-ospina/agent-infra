@@ -12,8 +12,8 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad } from "./index.js";
-import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad } from "./index.js";
+import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
 
 /** tsx/CJS interop: the repo root is "type": "commonjs", so the child module's
@@ -23,6 +23,8 @@ const childFactory: (pi: any) => void =
 import type { ModelRegistry } from "./index.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
+import { treeKill } from "../shared/tree-kill.js";
 import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -497,6 +499,36 @@ test("clamps to ≥ 1000ms (bogus/negative env can't instant-kill)", () => {
   }
 });
 
+// ── getExitCompleteGraceMs — completion-watchdog grace (#191) ──
+
+section("getExitCompleteGraceMs — completion-watchdog grace (#191)");
+
+test("defaults to 15s", () => {
+  delete process.env.TASK_EXIT_COMPLETE_GRACE_MS;
+  equal(getExitCompleteGraceMs(), DEFAULT_EXIT_COMPLETE_GRACE_MS);
+  equal(DEFAULT_EXIT_COMPLETE_GRACE_MS, 15_000, "plan: 15s — healthy exits ~1s, hung-completion rescued before user-abort patience");
+});
+
+test("reads TASK_EXIT_COMPLETE_GRACE_MS override", () => {
+  process.env.TASK_EXIT_COMPLETE_GRACE_MS = "3000";
+  try {
+    equal(getExitCompleteGraceMs(), 3000);
+  } finally {
+    delete process.env.TASK_EXIT_COMPLETE_GRACE_MS;
+  }
+});
+
+test("clamps to ≥ 1000ms (bogus/negative env can't instant-kill)", () => {
+  process.env.TASK_EXIT_COMPLETE_GRACE_MS = "200";
+  try { equal(getExitCompleteGraceMs(), 1000); } finally { delete process.env.TASK_EXIT_COMPLETE_GRACE_MS; }
+  process.env.TASK_EXIT_COMPLETE_GRACE_MS = "0";
+  try { equal(getExitCompleteGraceMs(), DEFAULT_EXIT_COMPLETE_GRACE_MS); } finally { delete process.env.TASK_EXIT_COMPLETE_GRACE_MS; }
+  process.env.TASK_EXIT_COMPLETE_GRACE_MS = "-5";
+  try { equal(getExitCompleteGraceMs(), DEFAULT_EXIT_COMPLETE_GRACE_MS); } finally { delete process.env.TASK_EXIT_COMPLETE_GRACE_MS; }
+  process.env.TASK_EXIT_COMPLETE_GRACE_MS = "abc";
+  try { equal(getExitCompleteGraceMs(), DEFAULT_EXIT_COMPLETE_GRACE_MS); } finally { delete process.env.TASK_EXIT_COMPLETE_GRACE_MS; }
+});
+
 // ── armExitWatchdog — tier-3 exit watchdog (#153) ────
 
 section("armExitWatchdog — tier-3 exit watchdog (#153)");
@@ -562,6 +594,180 @@ test("exit watchdog is wired into spawnSubAgent + env override in source (#153)"
   ok(source.includes("exitWatchdog.disarm()"), "watchdog must be disarmed on settle");
   ok(source.includes("TASK_EXIT_GRACE_MS"), "TASK_EXIT_GRACE_MS env override must exist");
   ok(source.includes("treeKill"), "watchdog must kill via tree-kill pattern (orphan reaping)");
+});
+
+// ── armCompletionWatchdog — tier-4 completion watchdog (#191) ──
+
+section("armCompletionWatchdog — tier-4 completion watchdog (#191)");
+
+testAsync("fires after grace once armed — SIGTERM + killed latch", async () => {
+  const kills: string[] = [];
+  const logs: string[] = [];
+  const wd = armCompletionWatchdog({
+    pid: 9998,
+    graceMs: 20,
+    kill: (sig) => kills.push(sig),
+    log: (msg) => logs.push(msg),
+  });
+  equal(wd.killed, false, "not killed before grace");
+  await sleep(60); // > graceMs
+  ok(kills.length >= 1, "SIGTERM sent after grace");
+  equal(kills[0], "SIGTERM");
+  ok(wd.killed, "killed flag latched");
+  ok(logs.some((l) => l.includes("completed but did not exit")), "log explains the completion-watchdog kill");
+  wd.disarm();
+});
+
+testAsync("disarm before grace cancels the kill", async () => {
+  const kills: string[] = [];
+  const wd = armCompletionWatchdog({ pid: 9998, graceMs: 20, kill: (sig) => kills.push(sig) });
+  wd.disarm();
+  await sleep(50);
+  equal(kills.length, 0, "disarmed watchdog must not kill");
+  equal(wd.killed, false, "killed stays false after disarm");
+});
+
+testAsync("grace already elapsed when disarmed → kill already fired (killed latched)", async () => {
+  const kills: string[] = [];
+  const wd = armCompletionWatchdog({ pid: 9998, graceMs: 15, kill: (sig) => kills.push(sig) });
+  await sleep(40); // grace elapsed, kill fired
+  ok(wd.killed, "killed latches when the timer actually fires");
+  wd.disarm(); // post-fire disarm is a no-op — no double kill
+  const before = kills.length;
+  await sleep(20);
+  equal(kills.length, before, "no additional kills after disarm");
+});
+
+// ── composeTaskResult — #191 result composition ──
+
+section("composeTaskResult — #191 result composition");
+
+const ctr = (over: Partial<ComposeTaskResultInput> = {}): ComposeTaskResultInput => ({
+  stdout: "completed output",
+  stderr: "[mcp-client] Disconnect from 'exa' timed out after 5000ms — forcing",
+  exitCode: null,
+  sessionEnded: true,
+  killedAfterCompletion: false,
+  model: "m",
+  provider: "p",
+  ...over,
+});
+
+test("completed session + watchdog kill → success with stdout + killedAfterCompletion details", () => {
+  const r = composeTaskResult(ctr({ exitCode: null, killedAfterCompletion: true }));
+  equal(r.content[0].text, "completed output", "stdout is the content — never 'aborted'");
+  equal(r.details.killedAfterCompletion, true);
+  equal(r.details.exitWatchdog, "completion");
+  equal(r.details.exitCode, undefined, "null exitCode (signal death) omitted from details");
+  ok((r.details.stderr as string).includes("Disconnect from 'exa'"), "stderr moves to details.stderr (diagnostics)");
+});
+
+test("completed session + watchdog kill with numeric exitCode → exitCode carried", () => {
+  const r = composeTaskResult(ctr({ exitCode: 1, killedAfterCompletion: true }));
+  equal(r.details.exitCode, 1);
+});
+
+test("completed session + natural exit within grace → success WITHOUT kill details", () => {
+  const r = composeTaskResult(ctr({ exitCode: 0, killedAfterCompletion: false }));
+  equal(r.content[0].text, "completed output");
+  equal(r.details.killedAfterCompletion, undefined);
+  equal(r.details.exitWatchdog, undefined);
+  deepEqual(Object.keys(r.details).sort(), ["model", "provider", "stderr"].sort(), "mirrors the legacy clean-exit shape (#134)");
+});
+
+test("legacy clean exit (no session_end) keeps the exact old shape — no exitCode in details", () => {
+  const r = composeTaskResult(ctr({ exitCode: 0, sessionEnded: false, killedAfterCompletion: false }));
+  equal(r.content[0].text, "completed output");
+  equal(r.details.exitCode, undefined, "legacy code===0 success has no exitCode");
+  deepEqual(Object.keys(r.details).sort(), ["model", "provider", "stderr"].sort(), "exact legacy details shape");
+});
+
+test("completed session with EMPTY stdout → legacy failure composition (never misclassified as success)", () => {
+  const r = composeTaskResult(ctr({ stdout: "", exitCode: 1, sessionEnded: true, killedAfterCompletion: true }));
+  ok(r.content[0].text.includes("Disconnect from 'exa'") || r.content[0].text.includes("--- stderr ---"), "failure composed from stderr");
+  equal(r.details.exitCode, 1);
+  equal(r.details.killedAfterCompletion, true, "kill still reported for diagnostics");
+});
+
+test("no output at all → exit message fallback (null exitCode renders 'signal')", () => {
+  const r = composeTaskResult(ctr({ stdout: "", stderr: "", exitCode: 1, sessionEnded: true, killedAfterCompletion: false }));
+  equal(r.content[0].text, "Sub-agent exited with code 1");
+  const sig = composeTaskResult(ctr({ stdout: "", stderr: "", exitCode: null, sessionEnded: false, killedAfterCompletion: true }));
+  equal(sig.content[0].text, "Sub-agent exited with code signal", "null exitCode renders as 'signal'");
+});
+
+// ── #191 integration — real processes (deterministic, no LLM) ──
+
+section("#191 integration — real processes (deterministic, no LLM)");
+
+testAsync("completion watchdog reaps a genuinely hung node child via treeKill", async () => {
+  // The #191 hang class: the child completed its work but its event loop never
+  // drains (setInterval leak — stands in for MCP disconnect cleanup).
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const pid = child.pid!;
+  const wd = armCompletionWatchdog({ pid, graceMs: 500 }); // default killFn → real treeKill
+  const exited = new Promise<number | null>((res) => child.on("close", (c) => res(c)));
+  await sleep(1200); // grace passed, watchdog fired
+  ok(wd.killed, "watchdog fired on the hung completed child");
+  const code = await Promise.race([exited, sleep(5000).then(() => null)]);
+  equal(code, null, "child killed by signal, not a clean exit");
+  let alive = true;
+  try { process.kill(pid, 0); } catch { alive = false; }
+  equal(alive, false, "hung child reaped by treeKill");
+  wd.disarm();
+});
+
+testAsync("disarmed completion watchdog lets a clean-exit child exit naturally", async () => {
+  const child = spawn(process.execPath, ["-e", "process.exit(0);"], { stdio: ["ignore", "pipe", "pipe"] });
+  const pid = child.pid!;
+  const wd = armCompletionWatchdog({ pid, graceMs: 500 });
+  await new Promise<number | null>((res) => child.on("close", (c) => res(c)));
+  wd.disarm(); // exited before grace — disarm after the fact is a no-op
+  await sleep(700);
+  equal(wd.killed, false, "clean exit → watchdog never fired");
+});
+
+testAsync("E1: fake child completes (payload + session_end) then hangs → edge arms watchdog → composed as success", async () => {
+  const nonce = "integration-nonce-1";
+  const payload = "PAYLOAD_191_" + Date.now();
+  // Writes the payload to stdout, the authenticated session_end marker to
+  // stderr, then leaks a setInterval — the #191 hang class after completion.
+  const child = spawn(process.execPath, [
+    "-e",
+    `process.stdout.write(${JSON.stringify(payload + "\n")}); console.error(${JSON.stringify("[task-heartbeat] session_end nonce=" + nonce + "\n")}); setInterval(() => {}, 1000);`,
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  const state = createHeartbeatState();
+  let stdout = "";
+  let stderr = "";
+  let watchdog: CompletionWatchdog | null = null;
+  const ctx: HeartbeatIngestContext = {
+    state,
+    lineBuf: "",
+    expectedNonce: nonce,
+    appendStderr: (t) => { stderr += t; },
+    onLifeSign: () => {},
+    onRealOutput: () => {},
+    onSessionEnd: () => {
+      if (!watchdog) watchdog = armCompletionWatchdog({ pid: child.pid!, graceMs: 400 });
+    },
+  };
+  child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+  child.stderr.on("data", (d: Buffer) => { ingestHeartbeatChunk(d.toString(), ctx); });
+  const code = await new Promise<number | null>((res) => child.on("close", (c) => res(c)));
+  ok(watchdog, "session_end marker armed the completion watchdog");
+  ok(watchdog!.killed, "watchdog killed the hanging completed child");
+  const result = composeTaskResult({
+    stdout, stderr, exitCode: code,
+    sessionEnded: state.sessionEnded,
+    killedAfterCompletion: watchdog!.killed,
+    model: "m", provider: "p",
+  });
+  equal(result.content[0].text, payload, "completed payload returned as content — success, never 'aborted'");
+  equal(result.details.killedAfterCompletion, true);
+  equal(result.details.exitWatchdog, "completion");
+  ok(!stderr.includes("[task-heartbeat]"), "guarantee 6: marker never entered the accumulator");
 });
 
 // ── getFallbackModel — provider fallback target (#152) ─
@@ -848,6 +1054,25 @@ test("ANSI-wrapped marker is parsed", () => {
   ok(st.turnActive);
 });
 
+test("session_end marker (#191) parses, latches sessionEnded, honors the nonce", () => {
+  const st = createHeartbeatState();
+  equal(parseHeartbeatLine("[task-heartbeat] session_end nonce=abc123", st, 1, "abc123"), true);
+  ok(st.sessionEnded, "sessionEnded latched");
+  equal(st.lastMarkerAt, 1);
+  // forged (wrong nonce) → rejected, nothing latched
+  const st2 = createHeartbeatState();
+  equal(parseHeartbeatLine("[task-heartbeat] session_end nonce=EVIL", st2, 2, "abc123"), false, "forged session_end rejected");
+  equal(st2.sessionEnded, false, "forged marker must not latch sessionEnded");
+  // near-miss kind is not a marker
+  const st3 = createHeartbeatState();
+  equal(parseHeartbeatLine("[task-heartbeat] session_begin nonce=abc123", st3, 3, "abc123"), false, "unknown kind → ordinary stderr");
+  equal(st3.sessionEnded, false);
+  // unauthenticated parse (tests) still works
+  const st4 = createHeartbeatState();
+  equal(parseHeartbeatLine("[task-heartbeat] session_end nonce=xyz", st4, 4), true);
+  ok(st4.sessionEnded);
+});
+
 section("#176 heartbeat — flushHeartbeatResidue");
 
 test("marker-prefixed residue discarded; ordinary residue preserved", () => {
@@ -923,6 +1148,38 @@ test("E8: kill/close path — truncated marker residue discarded, real residue p
   ingestHeartbeatChunk("final partial progress", c2, 1); // no newline, non-marker
   equal(flushHeartbeatLineBuf(c2), "final partial progress", "non-marker residue survives (kill-result fidelity)");
   equal(acc2(), "final partial progress");
+});
+
+test("#191: ingest fires onSessionEnd once per VALID session_end marker", () => {
+  const { ctx, acc, real } = makeIngest();
+  let ends = 0;
+  ctx.expectedNonce = "n9";
+  ctx.onSessionEnd = () => { ends++; };
+  ingestHeartbeatChunk("noise\n[task-heartbeat] session_end nonce=n9\n[task-heartbeat] session_end nonce=n9\n", ctx, 1);
+  equal(ends, 2, "edge fires once per valid marker");
+  ok(ctx.state.sessionEnded);
+  equal(acc(), "noise\n", "markers discarded as usual");
+  equal(real(), true, "noise still flips hasOutput");
+});
+
+test("#191: forged session_end (wrong nonce) never fires the completion edge", () => {
+  const { ctx } = makeIngest();
+  let ends = 0;
+  ctx.expectedNonce = "n9";
+  ctx.onSessionEnd = () => { ends++; };
+  ingestHeartbeatChunk("[task-heartbeat] session_end nonce=EVIL\n", ctx, 1);
+  equal(ends, 0, "forged marker must not arm the completion watchdog");
+  equal(ctx.state.sessionEnded, false);
+});
+
+test("#191: ANSI-decorated session_end still fires the edge", () => {
+  const { ctx } = makeIngest();
+  let ends = 0;
+  ctx.expectedNonce = "n9";
+  ctx.onSessionEnd = () => { ends++; };
+  ingestHeartbeatChunk("\u001b[31m[task-heartbeat] session_end nonce=n9\u001b[0m\n", ctx, 1);
+  equal(ends, 1);
+  ok(ctx.state.sessionEnded);
 });
 
 section("#176 heartbeat — heartbeatKillDecision (E1–E3, E5–E7, E9–E13)");
@@ -1162,6 +1419,17 @@ test("no markers at all → stall clauses inert (legacy fallback guard)", () => 
   equal(d.reason, "silence-threshold", "stale/absent markers → exact legacy byte-silence");
 });
 
+test("#191: sessionEnded suppresses every heartbeat kill clause (completion watchdog owns exit)", () => {
+  const st = createHeartbeatState();
+  st.sessionEnded = true;
+  st.everSawWork = true;
+  // Every clause would otherwise fire: tier-1 zero-output, tool-stall,
+  // stream-stall, silence, first-message.
+  const d = heartbeatKillDecision(dinput({ now: 9_999_999, lastLifeSignAt: 0, hasOutput: false, state: st }));
+  equal(d.kill, false, "no kill after session_end — watchdog owns the exit");
+  equal(d.resolveUndefined, false);
+});
+
 section("#176 heartbeat — E14 drift guard (child ↔ parent marker contract)");
 
 test("marker prefix + interval clamp constants identical in child and parent", () => {
@@ -1197,6 +1465,9 @@ test("full-format round-trip: every child formatter parses through the parent pa
   equal(st.toolsInFlight, 0);
   equal(parseHeartbeatLine(childHb.formatTurnEnd(N, 3), st, 6, N), true);
   equal(st.turnActive, false);
+  // #191: session_end completion marker round-trips with the nonce and latches
+  equal(parseHeartbeatLine(childHb.formatSessionEnd(N), st, 7, N), true);
+  ok(st.sessionEnded, "session_end latches sessionEnded through the parent parser");
 });
 
 section("#176 heartbeat — child emitter (fake-pi harness)");
@@ -1266,11 +1537,14 @@ testAsync("child lifecycle — ready, tool-Set semantics, per-turn flags, tick f
       ok(tick2.includes("tools=0"), `tick2 tools=0 (turn_end cleared the Set): ${tick2}`);
       ok(tick2.includes("saw_msg=0"), "tick2 saw_msg reset by turn_start");
       ok(tick2.includes("turn=0"), "tick2 turn inactive after turn_end");
-      // shutdown clears the timer
+      // shutdown: exactly one session_end completion marker (#191) — never ticks
       const countAtShutdown = lines.length;
       await handlers.session_shutdown({} as any);
+      const afterShutdown = lines.length;
+      equal(afterShutdown, countAtShutdown + 1, "session_shutdown emits exactly one marker (session_end)");
+      equal(lines[afterShutdown - 1], "[task-heartbeat] session_end nonce=e2enonce", "session_end emitted first with the dispatch nonce (#191)");
       await sleep(5_300);
-      equal(lines.length, countAtShutdown, "no ticks after session_shutdown (timer cleared, unref'd)");
+      equal(lines.length, afterShutdown, "no ticks after session_shutdown (timer cleared, unref'd)");
     });
   } finally {
     restore();
@@ -1395,6 +1669,19 @@ test("task tool injects TASK_HEARTBEAT=1 with TASK_HEARTBEAT_DISABLE pre-check +
   ok(source.includes("flushHeartbeatLineBuf(hbCtx)"), "residue flushed before kill-composition and on close");
   ok(source.includes("heartbeatKillDecision({"), "tier-2 uses the state-aware decision function");
   ok(source.includes("Math.max(60_000, Number(process.env.TASK_HEARTBEAT_TIMEOUT_MS) || 1_800_000)"), "#489 clamp unchanged");
+});
+
+section("#191 completion watchdog — spawnSubAgent wiring (source assertions)");
+
+test("session_end edge arms the completion watchdog; close composes via composeTaskResult", () => {
+  ok(source.includes("onSessionEnd: () => {"), "session_end completion edge wired into hbCtx");
+  ok(source.includes("armCompletionWatchdog({"), "completion watchdog armed from the edge");
+  ok(source.includes("getExitCompleteGraceMs()"), "grace comes from getExitCompleteGraceMs");
+  ok(source.includes("composeTaskResult({"), "close handler composes via composeTaskResult");
+  ok(source.includes("killedAfterCompletion: completionWatchdog?.killed ?? false"), "killedAfterCompletion read from the watchdog");
+  ok(source.includes("keepCompletionWatchdog"), "abort-resolve keeps the watchdog armed for reaping");
+  ok(source.includes("TASK_EXIT_COMPLETE_GRACE_MS"), "TASK_EXIT_COMPLETE_GRACE_MS env override exists");
+  ok(source.includes("i.state.sessionEnded"), "heartbeat decision guards on sessionEnded");
 });
 
 
