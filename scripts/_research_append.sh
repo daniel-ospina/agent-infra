@@ -42,20 +42,21 @@ Usage: bash scripts/_research_append.sh \
   --self-test           Run the bash unit tests and exit.
 
 Resolution note: with no --issue-body and no --epic-path, the script appends to
-the epic sibling brief if one exists, otherwise errors (nothing to resolve).
+the epic sibling brief if one exists, otherwise exits 0 with nothing appended (documented no-op).
 
 
 Exit: 0 = success, 2 = usage error, 3 = write failed.
 EOF
 }
 
-ISSUE_BODY=""
-EPIC_PATH=""
+ISSUE_BODY="${ISSUE_BODY:-}"
+EPIC_PATH="${EPIC_PATH:-}"
 APPEND_TEXT=""
 SOURCE_TAG="canonical"
 DO_CREATE=0
 ISSUE_NUMBER=""
 SELF_TEST=0
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -70,6 +71,10 @@ while [[ $# -gt 0 ]]; do
       APPEND_TEXT="$2"; shift 2 ;;
     --source-tag)
       [[ $# -ge 2 ]] || { echo "Error: --source-tag requires a value" >&2; exit 2; }
+      case "$2" in
+        canonical|competitor|precedent|pitfalls|adversarial|question) ;;
+        *) echo "Error: --source-tag must be one of canonical|competitor|precedent|pitfalls|adversarial|question (got: $2)" >&2; exit 2 ;;
+      esac
       SOURCE_TAG="$2"; shift 2 ;;
     --create)
       DO_CREATE=1; shift ;;
@@ -90,7 +95,9 @@ resolve_research_field() {
   local value
   value=$(printf '%s\n' "$ISSUE_BODY" | awk '/^\*\*Research:\*\*/ { sub(/^\*\*Research:\*\*[[:space:]]*/, ""); print; exit }')
   [[ -n "$value" ]] || return 1
-  value=$(printf '%s' "$value" | xargs)
+  # Quoting-safe trim (code-review P3): xargs mangles quotes/backslashes.
+  value="${value#"${value%%[![:space:]]*}"}"   # strip leading whitespace
+  value="${value%"${value##*[![:space:]]}"}"   # strip trailing whitespace
   [[ -n "$value" ]] || return 1
   [[ "$value" == "none" || "$value" == "None" ]] && return 1
   printf '%s\n' "$value"
@@ -115,6 +122,31 @@ resolve_brief_path() {
   fi
   if resolve_epic_sibling; then return 0; fi
   return 1
+}
+
+validate_brief_path() {
+  # Arbitrary-path write protection (code-review P2): the resolved brief path is
+  # written to, so constrain it — markdown/yaml suffix, no .git/ traversal, no
+  # hidden basenames, must stay under the working-tree root.
+  local brief="$1"
+  case "$brief" in
+    *.md|*.yaml) ;;          # allow markdown + yaml briefs
+    *) echo "Error: resolved brief path is not a .md/.yaml file: $brief" >&2; return 1 ;;
+  esac
+  case "$brief" in
+    */.git/*|*/.git|.git/*|*/.*)
+      echo "Error: refusing to write to a .git or hidden path: $brief" >&2; return 1 ;;
+  esac
+  local dir absdir root absroot
+  dir=$(dirname "$brief")
+  absdir=$(cd "$dir" 2>/dev/null && pwd -P) || { echo "Error: cannot resolve directory: $dir" >&2; return 1; }
+  root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  absroot=$(cd "$root" && pwd -P)
+  case "$absdir" in
+    "$absroot"/*|"$absroot") ;;  # inside the working tree
+    *) echo "Error: resolved brief path is outside the repo root: $brief" >&2; return 1 ;;
+  esac
+  return 0
 }
 
 # ── Persistence ─────────────────────────────────────────────────────────────
@@ -154,29 +186,32 @@ BRIEF
 backfill_research_field() {
   local brief="$1"
   [[ -n "$ISSUE_NUMBER" ]] || return 0
+  [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "Error: --issue-number must be numeric (got: $ISSUE_NUMBER)" >&2; exit 2; }
   command -v gh >/dev/null 2>&1 || return 0
   local tmp
   tmp=$(mktemp)
+  trap 'rm -f "$tmp" "$tmp.new"' RETURN
   # gh has no single-field body edit — rewrite the body (replace **Research:** line, or
   # append it), then write back via --body-file. Best-effort: offline/gh-unavailable →
   # silently skipped (documented, not swallowed as success).
   if gh issue view "$ISSUE_NUMBER" --json body -q .body 2>/dev/null > "$tmp"; then
     if grep -q '^\*\*Research:\*\*' "$tmp"; then
-      awk -v r="**Research:** $brief" '/^\*\*Research:\*\*/{print r; next} {print}' "$tmp" > "$tmp.new" && mv "$tmp.new" "$tmp"
+      # code-review P3: pass the brief path via env (ENVIRON) — no -v string interpolation
+      # (a quote/backslash in the path would corrupt the awk program).
+      RESEARCH_BRIEF="$brief" awk '/^\*\*Research:\*\*/{print "**Research:** " ENVIRON["RESEARCH_BRIEF"]; next} {print}' "$tmp" > "$tmp.new" && mv "$tmp.new" "$tmp"
     else
       printf '\n**Research:** %s\n' "$brief" >> "$tmp"
     fi
     gh issue edit "$ISSUE_NUMBER" --body-file "$tmp" >/dev/null 2>&1 || true
   fi
-  rm -f "$tmp"
 }
 
 # ── Self-test ───────────────────────────────────────────────────────────────
 run_self_test() {
-  local tmpdir test_brief
-  tmpdir=$(mktemp -d)
-  test_brief="$tmpdir/research-brief.md"
-  trap 'rm -rf "$tmpdir"' EXIT
+  local test_brief
+  SELF_TEST_TMP=$(mktemp -d)   # script-global: bash tears down function locals before EXIT traps (P4)
+  test_brief="$SELF_TEST_TMP/research-brief.md"
+  trap 'rm -rf "$SELF_TEST_TMP"' EXIT
 
   # 1. create-on-missing
   create_brief "$test_brief"
@@ -190,7 +225,7 @@ run_self_test() {
   [[ $(grep -c -- '^- \*\*' "$test_brief") -eq 2 ]] || { echo "FAIL: append count"; exit 1; }
 
   # 3. brief-exists-but-no-Raw-Notes → created
-  local legacy="$tmpdir/legacy.md"
+  local legacy="$SELF_TEST_TMP/legacy.md"
   printf '# Legacy brief\n\n## Strategy\n\nstuff\n' > "$legacy"
   append_entry "$legacy" "third finding" "adversarial"
   grep -q '^## Raw Notes' "$legacy" || { echo "FAIL: Raw Notes not created"; exit 1; }
@@ -202,6 +237,22 @@ run_self_test() {
   append_entry "$test_brief" "fourth finding" "precedent"
   [[ $(grep -c '^## Raw Notes' "$test_brief") -eq "$before" ]] || { echo "FAIL: Raw Notes duplicated"; exit 1; }
 
+  # 5. resolution + real append via main (P0 regression guard — resolved path must be captured)
+  #    Use a temp GIT repo so validate_brief_path's containment check passes end-to-end.
+  local testrepo="$SELF_TEST_TMP/repo"
+  mkdir -p "$testrepo"
+  git -C "$testrepo" init -q
+  local resolv="$testrepo/resolvable.md"
+  printf '# Brief\n\n## Raw Notes\n\n' > "$resolv"
+  local out
+  out=$(cd "$testrepo" && bash "$SCRIPT_PATH" --issue-body "**Research:** $resolv" --append "resolved finding" --source-tag canonical 2>&1)
+  [[ "$out" == *"Appended to $resolv"* ]] || { echo "FAIL: main resolution append: $out"; exit 1; }
+  grep -q 'resolved finding' "$resolv" || { echo "FAIL: resolved append content missing"; exit 1; }
+  # 6. no-resolvable-path → exit 0, nothing appended (documented no-op)
+  local out2
+  out2=$(cd "$testrepo" && bash "$SCRIPT_PATH" --append "orphan" 2>&1)
+  echo "$out2" | grep -q "No research brief found" || { echo "FAIL: no-resolve no-op message: $out2"; exit 1; }
+
   echo "self-test OK"
   exit 0
 }
@@ -211,14 +262,17 @@ run_self_test() {
 # ── Main ────────────────────────────────────────────────────────────────────
 [[ -n "$APPEND_TEXT" ]] || { echo "Error: --append is required (or --self-test)" >&2; exit 2; }
 
-BRIEF=""
-if ! resolve_brief_path; then
+if ! BRIEF=$(resolve_brief_path); then
   if [[ "$DO_CREATE" -eq 1 ]]; then
     echo "Error: --create needs a resolvable brief path (provide --issue-body or --epic-path)" >&2
     exit 2
   fi
   echo "No research brief found — nothing appended." >&2
   exit 0
+fi
+
+if ! validate_brief_path "$BRIEF"; then
+  exit 3
 fi
 
 if [[ "$DO_CREATE" -eq 1 ]]; then

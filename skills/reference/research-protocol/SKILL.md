@@ -300,7 +300,7 @@ Every research brief (epic sibling `research-brief.md`, `docs/research/<slug>.md
 
 **Shape:**
 - Entries are **append-only, reverse-chronological** (newest last or first consistently within a brief — pick one per brief and keep it).
-- Each entry: timestamp, framing label (canonical / competitor / precedent / pitfalls / adversarial), query or question reference, findings, source tag.
+- Each entry: timestamp, framing label (canonical / competitor / precedent / pitfalls / adversarial / question), query or question reference, findings, source tag.
 - Synthesized sections may be **updated per level** — updates are documented, never silent rewrites: `[updated YYYY-MM-DD — <what changed>]`.
 - Later-stage findings may displace earlier ones — the displacement is recorded in Raw Notes with provenance (MisKnow-Agent/DRIFT compliance: later stages can challenge earlier evidence).
 

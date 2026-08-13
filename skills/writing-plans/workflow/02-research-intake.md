@@ -17,7 +17,7 @@ Before drafting the plan, gather all existing research. This avoids re-researchi
    RESEARCH_BRIEF=$(echo "$EPIC_DOC_PATH" | sed 's/\.md$/-research.md/')
    [ -f "$RESEARCH_BRIEF" ] && echo "Found: $RESEARCH_BRIEF"
    ```
-   If found, read the canonical headings — `### Strategy Context`, `### Tech Stack Research`, `### UX Pattern Research`, `### Assumptions Register` (epic-research's producer contract, issue #231 D9) — plus `## Raw Notes`. These are the architecture contract for design decisions.
+   If found, read the canonical headings — `### Strategy Context`, `### UX Pattern Research`, `### Workflow Pattern Research`, `### Tech Stack Research`, `### Assumptions Register` (epic-research's producer contract, issue #231 D9) — plus `## Raw Notes`. These are the architecture contract for design decisions.
 
 2. **Issue-scoping research:** Read the issue comments for `### Axis Research` and `### Integration Docs` blocks (output from issue-scoping Phase 1.5). These contain Perplexity findings on integrations and implementation patterns. **`### Pattern Research` is NOT consumed here** — it is Step B's exclusive output in the plan doc (authorship boundary, issue #231 D5). If the issue comment has no blocks, fall back to the research brief's `### Axis Research` section (resolved via `_research_path.sh`).
 

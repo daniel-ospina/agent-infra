@@ -902,6 +902,9 @@ gh issue comment $ISSUE_NUMBER --body "$(cat <<'PLANEOF'
 ## Plan
 <plan draft>
 
+## Clarifications
+<from clarifying-questions Step 6a (Pass A), or "none — no questions qualified">
+
 ## External Research (Phase 1.5 artifact)
 ### Axis Research
 <per-axis findings with per-framing citations (canonical / competitor-precedent / pitfalls + source), or the justified-skip trigger assessment>

@@ -25,7 +25,7 @@ aboutObjects: agent-infra, issue-231, fractal-research-ladder
 
 ### Pattern Research
 
-**Findings date:** 2026-08-14
+> **Findings date:** 2026-08-14
 
 **Library docs (preflight)** — no third-party deps in plan (skills/scripts/config only — `check-skill-lint.mjs`, `check-skill-links.sh`, `gh`, `bash` are existing in-repo tooling) — skipped.
 
@@ -428,7 +428,7 @@ This is a skills/config change — the verification surface is lint + link integ
 | T-P | Raw Notes convention defined | `grep -n "## Raw Notes" skills/reference/research-protocol/SKILL.md` | no match |
 | T-Q | Script self-test | `bash scripts/_research_append.sh --self-test` | exit ≠ 0 |
 | T-R | strategy-builder §2.4 contract untouched | `grep -n "clarifying-questions" skills/strategy-builder/workflow/02-full-build-frameworks.md` still present; clarifying-questions output block names unchanged | §2.4 missing |
-| T-S | Epic-brief heading parity (D9, ISM row 9) | `grep -n "### Strategy Context\|### Tech Stack Research\|### UX Pattern Research\|### Assumptions Register" skills/epic-research/SKILL.md` (canonical set in Step 3) && same four headings present in `skills/writing-plans/workflow/02-research-intake.md` Step A.1 | either side missing |
+| T-S | Epic-brief heading parity (D9, ISM row 9) | `grep -n "### Strategy Context\|### UX Pattern Research\|### Workflow Pattern Research\|### Tech Stack Research\|### Assumptions Register" skills/epic-research/SKILL.md` (canonical set in Step 3) && same five headings present in `skills/writing-plans/workflow/02-research-intake.md` Step A.1 | either side missing |
 | T-T | Phase-order assertion (ISM row 2) | `awk '/## Phase 5\.5/{f5=NR} /## Phase 8/{f8=NR} END{exit !(f5 && f8 && f5 < f8)}' skills/issue-scoping/SKILL.md` — solution-verify (5.5) precedes Finalize (8), so `### Integration Docs` is verifiable before posting | not ordered |
 
 Unit tests: T-Q (bash self-test for `_research_append.sh` — create-on-missing, append-preserves, section dedup, idempotency).

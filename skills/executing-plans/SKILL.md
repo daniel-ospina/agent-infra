@@ -179,7 +179,7 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
 
 5. **Determine unfamiliar:** Any package NOT covered by Pattern Research is "unfamiliar". Also treat as unfamiliar if:
    - Pattern Research is absent from the plan entirely
-   - Pattern Research exists but carries **no `> **Findings date:** YYYY-MM-DD` stamp** — findings-date ABSENT → unfamiliar directly (fail-safe re-verify; NO plan-date fallback for the coverage question — legacy unstamped plans get re-verified, issue #231 D4)
+   - Pattern Research exists, contains **actual findings**, but carries **no `> **Findings date:** YYYY-MM-DD` stamp** — findings-date ABSENT → unfamiliar directly (fail-safe re-verify; NO plan-date fallback for the coverage question — legacy unstamped plans get re-verified, issue #231 D4). **Carve-out (issue #231 H5): a documented whole-section skip is NOT "findings-date absent" — a block carrying `> Gate skipped: <justification>` / `> Bucket [name] skipped: <justification>` / `> Research skipped: no demonstrated gap` takes precedence over the stamp rule (per Step 4); only blocks containing actual findings are subject to the stamp requirement.**
    - The stamped findings are older than 6 months by **findings date** (staleness threshold unchanged; plan date plays no role in the new algorithm)
    - The plan references a different major version than what's imported (detected via package.json or import style)
 
