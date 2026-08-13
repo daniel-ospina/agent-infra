@@ -38,6 +38,8 @@ import {
   repoNameFromUrl, // #2492: duplicated discovery parsing — regression-guarded
   deriveRepoName, // #196: duplicated discovery — keep-in-sync with index.ts (retry-on-stall)
   gitRemoteTimeoutMs, // #196: env-overridable git cap — keep-in-sync
+  loadScaledTimeoutMs, // #209: load-aware shell-out timeout scaling
+  getSystemLoad, // #209: load probe (non-negative on this machine)
   type SocketModeState,
 } from "./socket-mode.js";
 
@@ -67,6 +69,22 @@ function assert(condition: boolean, label: string): void {
   assert(repoNameFromUrl("") === null, "repoNameFromUrl: empty → null");
 }
 
+// #209: load-aware shell-out timeout scaling (deterministic — explicit load).
+{
+  const prevScaleOff = process.env.TASK_LOAD_SCALE_OFF;
+  try {
+    delete process.env.TASK_LOAD_SCALE_OFF;
+    assert(loadScaledTimeoutMs(5000, 0) === 5000, "loadScaledTimeoutMs: load <8 → 1x (5000)");
+    assert(loadScaledTimeoutMs(5000, 8) === 10000, "loadScaledTimeoutMs: load 8–15 → 2x (10000)");
+    assert(loadScaledTimeoutMs(5000, 16) === 15000, "loadScaledTimeoutMs: load ≥16 → 3x (15000)");
+    assert(loadScaledTimeoutMs(5000, 200) === 15000, "loadScaledTimeoutMs: bounded (3x ceiling, can't grow unbounded)");
+    assert(getSystemLoad() >= 0, "getSystemLoad: non-negative on this machine");
+  } finally {
+    if (prevScaleOff === undefined) delete process.env.TASK_LOAD_SCALE_OFF;
+    else process.env.TASK_LOAD_SCALE_OFF = prevScaleOff;
+  }
+}
+
 // #196: the duplicated git discovery must stay in sync with index.ts — same
 // env-overridable cap and the same ONE bounded retry on stall. Keep-in-sync
 // regression: a PATH git shim that sleeps past the cap on its FIRST call
@@ -74,12 +92,16 @@ function assert(condition: boolean, label: string): void {
 // Old code (hardcoded 2000ms, no retry) returns null here; new code resolves.
 {
   const prevGitTmo0 = process.env.GIT_REMOTE_TIMEOUT_MS;
+  const prevScaleOff0 = process.env.TASK_LOAD_SCALE_OFF;
   try {
+    process.env.TASK_LOAD_SCALE_OFF = "1"; // #209: force scale-off for the deterministic default assert
     delete process.env.GIT_REMOTE_TIMEOUT_MS;
     assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: default 5000 (keep-in-sync with index.ts)");
   } finally {
     if (prevGitTmo0 === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
     else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTmo0;
+    if (prevScaleOff0 === undefined) delete process.env.TASK_LOAD_SCALE_OFF;
+    else process.env.TASK_LOAD_SCALE_OFF = prevScaleOff0;
   }
   const gitDir = tmpDir();
   const shimDir = tmpDir();
