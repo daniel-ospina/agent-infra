@@ -275,6 +275,42 @@ function loadSteps(skillPath: string): Step[] | null {
 const GIT_OP = /(^|\s)(git\s+(commit|push|merge|add)|gh\s+pr\s+(create|merge))/;
 const DESTRUCTIVE_MCP = /\b(?:delete|remove|reset|revoke|drop|truncate|merge|rebase|purge|destroy|invalidate)\b/i;
 
+// Enforcement A (issue #5039): the checkpoint step-gate requires a FRESH
+// phase-correct CLEAR token from parallel_work_check before the step may
+// proceed. Fail-closed: missing/stale/wrong-phase/non-CLEAR/corrupt → BLOCK
+// (retry + operator override are the escape). The token is written by
+// parallel_work_check ONLY on CLEAR — never on UNKNOWN — so a phase gate can
+// never silently pass on infra failure.
+const CHECKPOINT_TOKEN_FILE = "/tmp/parallel-check-token.json";
+const CHECKPOINT_TOKEN_TTL_MS = 600_000; // 10 min (plan §4)
+
+function checkpointTokenOk(step: Step): { ok: boolean; reason: string } {
+  const requiredPhase = (step as { token_phase?: string }).token_phase || "";
+  let raw: string;
+  try {
+    raw = readFileSync(CHECKPOINT_TOKEN_FILE, "utf-8");
+  } catch {
+    return { ok: false, reason: `⛔ checkpoint gate — step "${step.name}" requires a fresh parallel_work_check PASS token (${CHECKPOINT_TOKEN_FILE}) — none found. Run \`parallel_work_check <phase>\` to produce one.` };
+  }
+  let token: { phase?: string; verdict?: string; ts?: number };
+  try {
+    token = JSON.parse(raw);
+  } catch {
+    return { ok: false, reason: `⛔ checkpoint gate — step "${step.name}" token is corrupt/unreadable — BLOCK` };
+  }
+  if (token.verdict !== "CLEAR") {
+    return { ok: false, reason: `⛔ checkpoint gate — step "${step.name}" token verdict is "${token.verdict ?? "?"}" — only CLEAR passes; UNKNOWN never writes a token (fail-closed)` };
+  }
+  const ts = Number(token.ts);
+  if (!Number.isFinite(ts) || Date.now() - ts > CHECKPOINT_TOKEN_TTL_MS) {
+    return { ok: false, reason: `⛔ checkpoint gate — step "${step.name}" token is stale (>10 min TTL) — re-run \`parallel_work_check <phase>\`` };
+  }
+  if (requiredPhase && token.phase !== requiredPhase) {
+    return { ok: false, reason: `⛔ checkpoint gate — step "${step.name}" token phase "${token.phase ?? "?"}" ≠ required "${requiredPhase}" — BLOCK` };
+  }
+  return { ok: true, reason: "" };
+}
+
 // Constructive guidance for blocked tools — tells the agent what IS allowed
 // so they don't spin in circles after hitting a gate (#7459 follow-up).
 function gateGuidance(step: Step): string {
@@ -290,6 +326,9 @@ function gateGuidance(step: Step): string {
     return `→ Allowed tools: ${tools}
 → To proceed: present findings to the user for approval
 → Or: end your turn to auto-advance this gate, or use /loop stop`;
+  }
+  if (gate === "checkpoint") {
+    return `→ To proceed: run \`parallel_work_check <phase>\` until the verdict is CLEAR (writes the PASS token)`;
   }
   return "";
 }
@@ -321,6 +360,12 @@ function getExpectedToolsForStep(step: Step): { allow: string[]; block: RegExp[]
   if (gate === "human_approval" || gate === "human_review") {
     return { allow: ["read", "web_search", "web_fetch", "loop_enforcer"], block: [/.*/] };
   }
+  // checkpoint (issue #5039): token-gated, not tool-gated — the step may use
+  // whatever tools it needs, but validateToolCall blocks everything until a
+  // fresh phase-correct CLEAR token exists.
+  if (gate === "checkpoint") {
+    return { allow: [], block: [] };
+  }
   // No gate or unknown — standard work phase. Block destructive ops.
   return { allow: [], block: [GIT_OP, DESTRUCTIVE_MCP] };
 }
@@ -332,6 +377,18 @@ function validateToolCall(
     console.log(
       `[sequence-enforcer] ⚠️ warn: ${toolName} | step="${step.name}" gate="${step.gate || "none"}"`,
     );
+    return { block: false };
+  }
+
+  // checkpoint gate (issue #5039): fail-closed token validation. A missing,
+  // stale, wrong-phase, non-CLEAR, or corrupt token blocks the step entirely
+  // (retry + operator override are the documented escape).
+  if (step.gate === "checkpoint") {
+    const t = checkpointTokenOk(step);
+    if (!t.ok) {
+      auditLog({ ts: new Date().toISOString(), event: "blocked", skill: topSkill()?.path, step: step?.name, tool: toolName, mode, reason: t.reason });
+      return { block: true, reason: t.reason };
+    }
     return { block: false };
   }
 
