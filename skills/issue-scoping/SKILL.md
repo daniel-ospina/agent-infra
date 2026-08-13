@@ -84,6 +84,17 @@ This prevents silent scope creep — the user knows what was found and can prior
 
 ## Process Flow
 
+> **🛡️ Mandatory parallel-work checkpoint (#4907):** BEFORE problem-diverge, run
+> `parallel_work_check start` (C1 — closed-issue DUP_FIX search; delegates the
+> behind-origin check to checkout_guard). AFTER scope converges (before
+> solution-diverge), run `parallel_work_check scope` (C2) and write the card's
+> `touched_paths` via `update_touched_paths`. A CLEAR verdict writes the PASS
+> token (10-min TTL); the checkpoint gate (fail-closed) blocks progression
+> without it. Set `CHECKOUT_GUARD_ENFORCE=1` in the session env at these steps
+> so the stale-base guard is fail-closed, not dry-run.
+> Maintain `touched_paths` through the work; release on completion (C5).
+
+
 ```
 Phase 0: Tier classification + Skill-domain detection + Epic/component detection
 Phase 1: problem-diverge

@@ -9,10 +9,17 @@ steps:
     type: skill
     gate: auto
     produces: [typecheck_ok, tests_ok]
+  - name: parallel_check_implement
+    type: gate
+    gate: checkpoint
+    token_phase: implement
+    requires: [preflight_checks]
+    # #4907: run `parallel_work_check implement` (C4) before committing —
+    # pre-merge symbol re-check + base-drift. Fail-closed gate.
   - name: stage_and_commit
     type: skill
     gate: auto
-    requires: [preflight_checks]
+    requires: [parallel_check_implement]
     produces: [commit_hash]
   - name: create_pr
     type: skill
