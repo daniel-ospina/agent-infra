@@ -386,6 +386,68 @@ await test("timeout wiring — firing the scheduled timer callback parks in prin
   } finally { auditRelease(); }
 });
 
+// ── #229 review P2-4: checkpoint warn branch + override-park + empty-stack ──
+section("review-229: checkpoint warn, gate-override park, empty-stack no-op");
+
+await test("checkpoint step under warn emits warn_blocked with mode", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", PI_ENFORCER_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/check/SKILL.md", verifierSkillSteps(), 1);
+        await handlers.tool_call!({ toolName: "bash" });
+        ok(auditEntries.some((x) => x.event === "warn_blocked" && x.mode === "warn"),
+          "warn_blocked audited with mode:warn");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("print + explicit gate override: timeout still parks, never pops", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/demo/SKILL.md", verifierSkillSteps(), 1);
+        const before = timerCbs.length;
+        await handlers.tool_call!({ toolName: "read" });
+        equal(timerCbs.length, before + 1, "gate-override print still arms the timer");
+        timerCbs[timerCbs.length - 1]!();
+        const stack = _stackForTest();
+        equal(stack.length, 1, "print+gate override parks, not pops");
+        ok(auditEntries.some((x) => x.event === "timeout_park" && x.mode === "gate"),
+          "timeout_park audited with mode:gate");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("empty-stack timeout fires harmlessly", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: undefined, AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        const before = timerCbs.length;
+        await handlers.tool_call!({ toolName: "read" });
+        equal(timerCbs.length, before, "no timer armed with empty stack (no active skill)");
+        ok(true, "empty-stack tool_call completed without throwing");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
 // ── cleanup + summary ────────────────────────────────
 for (const d of TMP_DIRS) {
   try { rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }

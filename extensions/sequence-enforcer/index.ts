@@ -15,6 +15,13 @@
 // sub-agents to "fix" timeouts — that removes workflow enforcement and lets
 // lazy agents bypass gates. Fix the root cause instead (gate-advance logic,
 // timeout mismatches, untimed git calls).
+// #201 carve-out (supersedes the above for launcher-marked print sessions):
+// pi -p workers default to mode "warn" — verifier gates that require a task
+// dispatch are structurally unresolvable in background workers, and the old
+// timeout POP destroyed stage state. warn still counts reviewer dispatches
+// and advances steps; the override escape hatches (AGENT_SEQUENCE_MODE /
+// ELDATO_SEQUENCE_MODE / PI_ENFORCER_MODE / mode file) force gate/strict
+// anywhere, including print. Interactive sessions are unchanged.
 //
 // If a sub-agent appears stuck at a verifier gate, the bug is in gate
 // advancement or the silence threshold vs provider timeout — not the
