@@ -1,6 +1,6 @@
 ---
 name: shared-research
-description: Research wrapper for workflows. Routes to research skill with proportional depth. Expands the routing stub with the granularity-ladder mechanics: PRIOR_RESEARCH dedup, gate mechanics (fresh-context brief review), and the output contract (fixed sections + ## Raw Notes + findings-date). Issue #231.
+description: "Research wrapper for workflows. Routes to research skill with proportional depth. Expands the routing stub with the granularity-ladder mechanics: PRIOR_RESEARCH dedup, gate mechanics (fresh-context brief review), and the output contract (fixed sections + ## Raw Notes + findings-date). Issue #231."
 domain: capability
 type: Routing
 status: live
