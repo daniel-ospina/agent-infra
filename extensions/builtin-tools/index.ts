@@ -22,6 +22,12 @@
  *   - Tier 3: exit watchdog (120s, TASK_EXIT_GRACE_MS) — both stdio streams EOF
  *     but process alive → SIGTERM→SIGKILL. Fixes #153 (session finished, pi
  *     process hangs on exit — event loop won't drain).
+ *   - Tier 4: completion watchdog (15s, TASK_EXIT_COMPLETE_GRACE_MS) — the
+ *     child emits a session_end marker from its session_shutdown hook (#191);
+ *     armed on that marker, the watchdog kills a COMPLETED child still alive
+ *     after the grace (the #153 hang class — MCP disconnect cleanup never
+ *     drains — where stdio never EOFs so Tier 3 can't fire). Captured stdout
+ *     returns as SUCCESS with killedAfterCompletion detail, never "aborted".
  *   - Provider fallback: qwen connection-error storm (#152) → one retry on
  *     TASK_FALLBACK_MODEL (default deepseek-v4-pro; TASK_FALLBACK_DISABLE=1 off).
  */
@@ -262,7 +268,8 @@ export function resolveProviderModel(
 //     gets the already-captured output instead of waiting out the 30-min
 //     heartbeat window.
 //
-// Env overrides: TASK_EXIT_GRACE_MS (default 120_000), TASK_FALLBACK_MODEL
+// Env overrides: TASK_EXIT_GRACE_MS (default 120_000),
+// TASK_EXIT_COMPLETE_GRACE_MS (default 15_000 — #191), TASK_FALLBACK_MODEL
 // (default "deepseek-v4-pro"), TASK_FALLBACK_DISABLE=1 (turn fallback off).
 
 /** Default grace period between stdio EOF and forced kill (#153). */
@@ -274,6 +281,19 @@ export const DEFAULT_EXIT_GRACE_MS = 120_000;
 export function getExitGraceMs(): number {
   const raw = Number(process.env.TASK_EXIT_GRACE_MS);
   return Math.max(1_000, Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_EXIT_GRACE_MS);
+}
+
+/** Default grace between the session_end marker and the completion-watchdog
+ * kill (#191). 15s: healthy children exit in ~1s (watchdog never fires);
+ * hung-completion children are rescued well inside the user-abort patience
+ * window (was minutes of hanging). */
+export const DEFAULT_EXIT_COMPLETE_GRACE_MS = 15_000;
+
+/** Resolve the completion-watchdog grace from TASK_EXIT_COMPLETE_GRACE_MS
+ * (default 15s). Clamped ≥ 1000ms — same floor as getExitGraceMs. */
+export function getExitCompleteGraceMs(): number {
+  const raw = Number(process.env.TASK_EXIT_COMPLETE_GRACE_MS);
+  return Math.max(1_000, Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_EXIT_COMPLETE_GRACE_MS);
 }
 
 /** Minimal stream surface the watchdog needs (tests inject EventEmitter fakes). */
@@ -338,6 +358,117 @@ export function armExitWatchdog(opts: {
       clearTimers();
     },
   };
+}
+
+export interface CompletionWatchdog {
+  /** True once this watchdog fired (SIGTERM sent) — result composition reads
+   * it to report killedAfterCompletion. */
+  killed: boolean;
+  /** Cancel pending timers (call on process close / settle). */
+  disarm(): void;
+}
+
+/**
+ * Tier-4 completion watchdog (#191): armed when the child emits the
+ * session_end marker (session completed, output captured) but the process
+ * has not exited within `graceMs` — the #153 hang class AFTER completion
+ * (MCP disconnect cleanup never drains; stdio never EOFs, so the Tier-3 EOF
+ * watchdog can't fire). SIGTERM via treeKill (reaps orphaned MCP servers),
+ * then SIGKILL after 5s if still alive. Same kill semantics as armExitWatchdog.
+ *
+ * `kill` is injectable for tests; default walks the process tree with
+ * shared/tree-kill.ts.
+ */
+export function armCompletionWatchdog(opts: {
+  pid: number;
+  graceMs: number;
+  kill?: (signal: NodeJS.Signals) => void;
+  log?: (msg: string) => void;
+}): CompletionWatchdog {
+  const killFn = opts.kill ?? ((signal: NodeJS.Signals) => treeKill(opts.pid, signal));
+  const logFn = opts.log ?? ((msg: string) => console.error(`[task] ${msg}`));
+  let timer: NodeJS.Timeout | null = null;
+  let sigkillTimer: NodeJS.Timeout | null = null;
+  let disarmed = false;
+  const wd: CompletionWatchdog = {
+    killed: false,
+    disarm: () => {
+      disarmed = true;
+      if (timer) clearTimeout(timer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
+      timer = null;
+      sigkillTimer = null;
+    },
+  };
+  timer = setTimeout(() => {
+    if (disarmed) return;
+    wd.killed = true;
+    logFn(`sub-agent (pid ${opts.pid}) completed but did not exit within ${opts.graceMs / 1000}s — killing (completion watchdog)`);
+    killFn("SIGTERM");
+    sigkillTimer = setTimeout(() => killFn("SIGKILL"), 5000);
+  }, opts.graceMs);
+  return wd;
+}
+
+export interface ComposeTaskResultInput {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  /** Latched session_end marker seen — the child declared the session complete. */
+  sessionEnded: boolean;
+  /** The completion watchdog fired — killed a completed child stuck in cleanup. */
+  killedAfterCompletion: boolean;
+  model: string;
+  provider: string;
+}
+
+/**
+ * Compose the task-tool result on process close (#191). Pure — extracted for
+ * tests. Branch rules:
+ *   - sessionEnded (or the legacy code===0 success) with non-empty stdout →
+ *     SUCCESS with stdout as content, mirroring the #134 clean-exit shape
+ *     (stderr moves to details.stderr); killedAfterCompletion + exitCode are
+ *     carried in details when the completion watchdog reaped the child.
+ *   - everything else — legacy composition (stdout || stderr || exit message)
+ *     with exitCode in details — failure info is never lost, and empty-stdout
+ *     error sessions are never misclassified as success.
+ */
+export function composeTaskResult(
+  i: ComposeTaskResultInput,
+): { content: Array<{ type: string; text: string }>; details: Record<string, unknown> } {
+  const stderrClean = i.stderr
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "")
+    .trim()
+    .slice(-4000);
+  const stdout = i.stdout.trim();
+  const cleanExitSuccess = i.exitCode === 0 && stdout;
+  // #191 review P1: sessionEnded alone is NOT success — the session_end
+  // marker fires on EVERY teardown, including error exits (print mode emits
+  // it from dispose() in the finally even when stopReason === "error" set
+  // exitCode = 1). Gate on the exit status: 0 = clean; null = signal death,
+  // which post-sessionEnded only comes from the completion/exit watchdogs
+  // (the #191 rescue). A forged marker on a real failure (non-zero exit)
+  // therefore lands in the failure branch.
+  const okExit = i.exitCode === 0 || i.exitCode === null;
+  if (((i.sessionEnded && okExit) || cleanExitSuccess) && stdout) {
+    const details: Record<string, unknown> = { model: i.model, provider: i.provider };
+    if (i.killedAfterCompletion) {
+      details.killedAfterCompletion = true;
+      details.exitWatchdog = "completion";
+      if (i.exitCode !== null) details.exitCode = i.exitCode;
+    }
+    if (stderrClean) details.stderr = stderrClean;
+    return { content: [{ type: "text", text: stdout }], details };
+  }
+  const text = stdout || stderrClean || `Sub-agent exited with code ${i.exitCode ?? "signal"}`;
+  const extra = stdout ? (stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "") : "";
+  const details: Record<string, unknown> = { model: i.model, provider: i.provider, exitCode: i.exitCode };
+  if (i.killedAfterCompletion) {
+    details.killedAfterCompletion = true;
+    details.exitWatchdog = "completion";
+  }
+  return { content: [{ type: "text", text: text + extra }], details };
 }
 
 /** Default fallback model for #152 connection-error storms. */
@@ -408,6 +539,10 @@ export function shouldFallback(d: FallbackDecision): boolean {
 //   - tool call in flight / model turn active → silence kill suppressed while
 //     markers are fresh (stateFresh window = max(2×T, 2×tick interval))
 //   - markers stale/absent → exact legacy byte-silence behavior
+//   - session_end (#191): the child's session_shutdown hook declares the
+//     session complete — the parent latches sessionEnded and arms the
+//     completion watchdog (Tier 4) so a completed child stuck in cleanup is
+//     rescued promptly and its output returned as success.
 //
 // Kill clauses (precedence: tool-stall → stream-stall → silence →
 // first-message):
@@ -529,6 +664,10 @@ export interface HeartbeatState {
   everSawWork: boolean;
   /** Latched on ready — proves the emitter initialized (tier-1 slow-start). */
   sawReady: boolean;
+  /** Latched on session_end (#191) — the child declared the session complete
+   * (its session_shutdown hook fired). Gates the completion watchdog and
+   * suppresses heartbeat kills (the watchdog owns the exit from here on). */
+  sessionEnded: boolean;
   /** 0 = no marker ever received (stateFresh false → legacy behavior). */
   lastMarkerAt: number;
 }
@@ -543,17 +682,27 @@ export function createHeartbeatState(): HeartbeatState {
     turnSawTool: false,
     everSawWork: false,
     sawReady: false,
+    sessionEnded: false,
     lastMarkerAt: 0,
   };
 }
 
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 
+/** Extract the marker kind token from a raw line ("" when not a marker).
+ * Mirrors the kind extraction inside parseHeartbeatLine — used by the
+ * ingester to fire the session_end completion edge once per valid marker. */
+function markerKindOf(line: string): string {
+  const stripped = line.replace(ANSI_RE, "").trim();
+  if (!stripped.startsWith(HEARTBEAT_MARKER_PREFIX)) return "";
+  return stripped.slice(HEARTBEAT_MARKER_PREFIX.length).trim().split(/\s+/)[0] ?? "";
+}
+
 /** Kinds that make a prefix line a marker. Foreign lines that merely START
  * with the prefix (e.g. a sub-agent grepping this repo's source, a test log)
  * are preserved as ordinary stderr by returning false (code-review fix). */
 export const KNOWN_MARKER_KINDS = new Set([
-  "ready", "tool_start", "tool_end", "turn_start", "turn_end", "tick",
+  "ready", "tool_start", "tool_end", "turn_start", "turn_end", "tick", "session_end",
 ]);
 
 /**
@@ -587,6 +736,10 @@ export function parseHeartbeatLine(
   switch (kind) {
     case "ready":
       state.sawReady = true;
+      break;
+    case "session_end":
+      // #191: the child's session_shutdown hook fired — session complete.
+      state.sessionEnded = true;
       break;
     case "tool_start":
       state.toolsInFlight += 1;
@@ -659,6 +812,10 @@ export interface HeartbeatIngestContext {
   onLifeSign: () => void;
   /** Called when REAL (non-marker) bytes arrive. */
   onRealOutput: () => void;
+  /** Called once when a VALID (nonce-authenticated) session_end marker is
+   * parsed (#191) — the synchronous completion edge. The caller arms the
+   * completion watchdog here; a forged marker (wrong nonce) never reaches it. */
+  onSessionEnd?: () => void;
 }
 
 /**
@@ -699,6 +856,8 @@ export function ingestHeartbeatChunk(
     if (!parseHeartbeatLine(line, ctx.state, now, ctx.expectedNonce)) {
       ctx.appendStderr(line + "\n");
       ctx.onRealOutput();
+    } else if (ctx.onSessionEnd && markerKindOf(line) === "session_end") {
+      ctx.onSessionEnd();
     }
   }
   if (ctx.lineBuf.length > HEARTBEAT_LINE_BUF_MAX) {
@@ -774,6 +933,14 @@ export function heartbeatKillDecision(
     reason,
     resolveUndefined: !i.hasOutput,
   });
+
+  // #191: the child declared the session complete (session_end marker) — the
+  // completion watchdog owns the exit from here on. No stall/silence clause
+  // may race it and misclassify completed work as a partial-result kill
+  // (silence kills resolve with "Partial results" headlines).
+  if (i.state.sessionEnded) {
+    return { kill: false, resolveUndefined: false };
+  }
 
   // Tier-1 — first-output timeout: process-level startup hang (no real output,
   // no work marker, no ready marker).
@@ -1167,7 +1334,7 @@ export default function (pi: ExtensionAPI) {
    * Spawn a sub-agent and return its output. Returns undefined on zero-output
    * timeout (retryable) so the retry wrapper can re-spawn.
    */
-  function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[]): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
+  function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
     return new Promise((resolve) => {
       // #176 code-review: per-dispatch marker nonce — the child echoes it in
       // every [task-heartbeat] marker; markers without it are foreign (MCP
@@ -1201,6 +1368,11 @@ export default function (pi: ExtensionAPI) {
         stderr: proc.stderr,
         graceMs: getExitGraceMs(),
       });
+      // #191 tier-4: completion watchdog — armed on the child's session_end
+      // marker (see hbCtx.onSessionEnd below), NOT at spawn: a completed child
+      // still alive after the grace is stuck in cleanup (MCP disconnect
+      // timeouts) and gets killed so the captured output returns as success.
+      let completionWatchdog: CompletionWatchdog | null = null;
       // #489 class: pi in print mode BUFFERS output — a sub-agent doing long
       // consecutive tool calls (bash → read → edit) emits nothing to stdout
       // until the final turn message. The old 660s threshold (set to exceed
@@ -1238,6 +1410,18 @@ export default function (pi: ExtensionAPI) {
         onRealOutput: () => {
           hasOutput = true;
         },
+        // #191: the child declared the session complete (session_end marker) —
+        // arm the completion watchdog (Tier 4). A still-alive child after the
+        // grace is a completed session stuck in MCP disconnect cleanup; kill it
+        // so the parent returns the captured output as success instead of
+        // hanging the tool call.
+        onSessionEnd: () => {
+          if (completionWatchdog || settled) return;
+          completionWatchdog = armCompletionWatchdog({
+            pid: proc.pid ?? 0,
+            graceMs: getExitCompleteGraceMs(),
+          });
+        },
       };
 
       proc.stdout.on("data", (data: Buffer) => {
@@ -1249,10 +1433,11 @@ export default function (pi: ExtensionAPI) {
         ingestHeartbeatChunk(data.toString(), hbCtx);
       });
 
-      const doResolve = (value: { content: any[]; details: Record<string, unknown> } | undefined) => {
+      const doResolve = (value: { content: any[]; details: Record<string, unknown> } | undefined, opts?: { keepCompletionWatchdog?: boolean }) => {
         if (settled) return;
         settled = true;
         exitWatchdog.disarm();
+        if (!opts?.keepCompletionWatchdog) completionWatchdog?.disarm();
         if (hardCapTimer) clearTimeout(hardCapTimer);
         resolve(value);
       };
@@ -1343,27 +1528,58 @@ export default function (pi: ExtensionAPI) {
         });
       }, 10_000);
 
-      proc.on("close", (code: number) => {
+      // #191 P2: the agent's abort signal (user abort / turn switch). Once the
+      // session has completed (session_end seen), an abort must not wait out
+      // the remaining grace — resolve the captured output immediately. The
+      // completion watchdog stays armed (keepCompletionWatchdog) so the
+      // lingering child is still reaped; pre-completion aborts keep legacy
+      // behavior (the promise settles on close/kill as before).
+      if (signal) {
+        const onAbort = () => {
+          if (settled || !hbCtx.state.sessionEnded) return;
+          console.error(`[task] sub-agent dispatch aborted after session_end — resolving captured output (#191)`);
+          clearInterval(heartbeat);
+          doResolve(
+            composeTaskResult({
+              stdout,
+              stderr,
+              exitCode: null,
+              sessionEnded: true,
+              killedAfterCompletion: false,
+              model,
+              provider,
+            }),
+            { keepCompletionWatchdog: true },
+          );
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      proc.on("close", (code: number | null) => {
         clearInterval(heartbeat);
+        // #191: process is gone — disarm the completion watchdog even when a
+        // prior abort-resolve settled the promise (killed latches before
+        // disarm, so composition still reports the watchdog correctly).
+        completionWatchdog?.disarm();
         // #176: flush the line-buffer residue before composing the result —
         // non-marker tail preserved, truncated-marker tail discarded.
         flushHeartbeatLineBuf(hbCtx);
-        const stderrClean = cleanStderr(stderr.trim()).slice(-4000);
-        const errInfo = stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "";
-        if (code === 0 && stdout.trim()) {
-          // #134: clean exit → content carries stdout ONLY. The stderr tail is
-          // transport noise (startup banners, MCP connect, gate-bypass events)
-          // that contaminates structured task output for JSON-parsing consumers
-          // (#132 bug class). It moves to `details.stderr` for diagnostics.
-          const details: Record<string, unknown> = { model, provider };
-          if (stderrClean) details.stderr = stderrClean;
-          doResolve({ content: [{ type: "text", text: stdout.trim() }], details });
-        } else {
-          const output = stdout.trim();
-          const text = output || stderr.trim() || `Sub-agent exited with code ${code}`;
-          const extra = output ? errInfo : "";
-          doResolve({ content: [{ type: "text", text: text + extra }], details: { model, provider, exitCode: code } });
-        }
+        // #191: compose on close — sessionEnded (completed) + non-empty stdout
+        // → success with stdout; killedAfterCompletion/exitCode carried in
+        // details when the completion watchdog reaped the lingering child.
+        // Empty stdout falls back to the legacy stderr/exitCode composition so
+        // failure info is never lost and never misclassified as success.
+        doResolve(
+          composeTaskResult({
+            stdout,
+            stderr,
+            exitCode: code,
+            sessionEnded: hbCtx.state.sessionEnded,
+            killedAfterCompletion: completionWatchdog?.killed ?? false,
+            model,
+            provider,
+          }),
+        );
       });
 
       proc.on("error", (err: Error) => {
@@ -1404,7 +1620,7 @@ export default function (pi: ExtensionAPI) {
         })
       ),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
       const modelParam = params.model ?? "deepseek-v4-flash";
       // #154: resolve provider from the model param — "provider/model" splits
       // explicitly; bare model ids are looked up across configured providers
@@ -1463,7 +1679,7 @@ export default function (pi: ExtensionAPI) {
         },
       };
       let result = await retry(
-        () => spawnSubAgent(model, provider, subAgentEnv, args),
+        () => spawnSubAgent(model, provider, subAgentEnv, args, signal),
         retryOptions,
       );
 
@@ -1493,7 +1709,7 @@ export default function (pi: ExtensionAPI) {
         console.log(`[builtin-tools] provider fallback: ${provider} → ${fallbackModel} after connection error`);
         const fbArgs = ["-p", "--provider", fallbackProvider, "--model", fallbackModel, "--no-session", params.prompt];
         const fbResult = await retry(
-          () => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, fbArgs),
+          () => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, fbArgs, signal),
           retryOptions,
         );
         if (fbResult.status === "success" && fbResult.value) {

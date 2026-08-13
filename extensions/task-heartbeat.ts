@@ -19,6 +19,8 @@
  *   [task-heartbeat] tick nonce=<n> tools=<n> turn=<0|1> stream_age_ms=<n>
  *                       tool_age_max_ms=<n> saw_msg=<0|1> saw_tool=<0|1>
  *                                               — every clamped interval
+ *   [task-heartbeat] session_end nonce=<n>       — once at session_shutdown
+ *                                                  (session completed — #191)
  *
  * The parent (builtin-tools spawnSubAgent) parses these markers into state
  * (tools in flight, turn active, stream age) and suppresses the silence kill
@@ -122,6 +124,15 @@ export function formatTick(nonce: string, f: TickFields): string {
   );
 }
 
+/** Completion marker (#191): the child declares the session complete. The
+ * parent (builtin-tools) latches sessionEnded and arms a short exit grace
+ * (TASK_EXIT_COMPLETE_GRACE_MS, default 15s) so a completed child stuck in
+ * MCP disconnect cleanup is killed and its captured output returned as
+ * success instead of hanging the parent tool call. */
+export function formatSessionEnd(nonce: string): string {
+  return `${HEARTBEAT_MARKER_PREFIX} session_end nonce=${nonce}`;
+}
+
 // ── Extension ───────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -184,10 +195,21 @@ export default function (pi: ExtensionAPI) {
     tickTimer.unref?.();
   });
 
-  // Note: pi does NOT emit session_shutdown in print mode (the SIGTERM path
-  // disposes the runtime without the event) — the unref() above is what
-  // protects exit there; this handler covers interactive/future modes.
+  // The session_shutdown hook is the completion edge (#191): pi emits this
+  // event (reason "quit") from agent-session-runtime.dispose() during normal
+  // print-mode teardown (verified against the installed pi:
+  // dist/core/agent-session-runtime.js L288-294), so this is where the child
+  // declares the session complete. The marker MUST go out first — it is what
+  // lets the parent rescue a completed child stuck in cleanup (MCP disconnect
+  // timeouts never drain the event loop) instead of hanging the tool call.
+  // Ordering note (corrected, review #250 P2): print-mode ISSUES the final
+  // stdout write in the try block (text-mode output after the prompt loop)
+  // BEFORE the finally runs disposeRuntime() → session_shutdown — so the
+  // parent's pipe receives stdout bytes FIRST, the marker SECOND, and the
+  // process close LAST. The parent composes on close (after both), so the
+  // ordering is safe by construction — no skew to manage.
   pi.on("session_shutdown", async () => {
+    emit(formatSessionEnd(nonce));
     if (tickTimer) {
       clearInterval(tickTimer);
       tickTimer = null;
