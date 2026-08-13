@@ -30,6 +30,10 @@ equal(isPrintMode({}, ["pi", "--name", "--print"]), false, "--name --print → -
 equal(isPrintMode({}, ["pi", "-e", "-p"]), false, "-e -p → -p is an extension path value");
 // real print flag after a value-taking flag
 equal(isPrintMode({}, ["pi", "--model", "gpt", "-p"]), true, "flag after value-taking flag → print");
+// value-taking alias flags consume -p as their value
+equal(isPrintMode({}, ["pi", "-n", "-p"]), false, "-n -p → -p is the name value");
+equal(isPrintMode({}, ["pi", "-t", "-p"]), false, "-t -p → -p is the tools value");
+equal(isPrintMode({}, ["pi", "--mode", "--print"]), false, "--mode --print → value, not print");
 
 // isPrintModeEnv — env-only (sequence-enforcer #201 semantic decisions)
 equal(isPrintModeEnv({ PI_MODE: "print" }), true, "env-only: print → true");

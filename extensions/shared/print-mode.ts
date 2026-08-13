@@ -31,11 +31,13 @@
  */
 
 const VALUE_TAKING_FLAGS = new Set([
-  "--provider", "--model", "--api-key", "--system-prompt", "--name",
+  "--provider", "--model", "--api-key", "--system-prompt", "--name", "-n",
   "--session", "--session-id", "--fork", "--session-dir", "--models",
-  "--tools", "--exclude-tools", "--thinking", "--export", "--extension",
-  "-e", "--skill", "--prompt-template", "--theme", "--tui-mode",
-  "--list-models",
+  "--tools", "-t", "--exclude-tools", "-xt", "--thinking", "--export",
+  "--extension", "-e", "--skill", "--prompt-template", "--theme",
+  "--mode", "--append-system-prompt",
+  // --tui-mode/--list-models only consume the next token when it is NOT
+  // flag-like (pi leaves "-p" unconsumed) — excluded to avoid false negatives.
 ]);
 
 /**
