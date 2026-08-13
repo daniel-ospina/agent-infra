@@ -136,7 +136,7 @@ None identified. All scripts are referenced from `.husky/pre-push`, GitHub Actio
 
 ## 3. GitHub Actions (`.github/workflows/`)
 
-All 14 workflows (eldato; see scope banner) (eldato inventory; see scope banner) contain El Dato-specific references. **None are currently modular.** Breakdown:
+All 14 workflows (eldato inventory; see scope banner) contain El Dato-specific references. **None are currently modular.** Breakdown:
 
 ### 3.1 PR-triggered (blocking)
 
