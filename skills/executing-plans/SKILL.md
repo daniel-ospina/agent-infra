@@ -170,16 +170,17 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
    - Node.js built-ins (`fs`, `path`, `crypto`, `stream`, `http`, `https`, `url`, `os`, `events`, `util`, `buffer`, `child_process`, `tls`, `net`, `dns`, `readline`, `zlib`, `querystring`, `assert`, `cluster`, `dgram`, `domain`, `punycode`, `string_decoder`, `tty`, `vm`, `worker_threads`)
    - Type-only imports (`import type { ... } from '...'`)
 
-3. **Parse Pattern Research:** Read the plan's `### Pattern Research` section. Extract library/SDK/package names that appear in section headings or findings text. Also note `> Gate skipped` and `> Bucket [name] skipped` justifications.
+3. **Parse Pattern Research:** Read the plan's `### Pattern Research` section using an **anchored, line-level exact heading match** (`^### Pattern Research$`) — a substring match would let epic-brief headings such as `### UX Pattern Research` / `### Tech Stack Research` falsely satisfy coverage. Those epic-brief headings are PRIOR_RESEARCH context and **never** coverage evidence (issue #231 D5). Extract library/SDK/package names that appear in section headings or findings text. Also note `> Gate skipped`, `> Bucket [name] skipped`, and `> Research skipped: no demonstrated gap` justifications.
 
 4. **Cross-reference:** For each extracted package name, check if it (or its parent scope, e.g. `@supabase/supabase-js` matches `supabase`) is mentioned in Pattern Research. A package is "covered" if:
    - Its name appears in a Pattern Research bucket heading or finding
-   - The Pattern Research explicitly mentions skipping it with a valid reason (e.g., "uses in-repo wrapper exclusively")
+   - The Pattern Research explicitly mentions skipping it with a valid reason (e.g., "uses in-repo wrapper exclusively") — a **documented skip takes precedence over findings-date absence** (issue #231 H5)
    - The Pattern Research says "plan touches zero third-party deps" AND no third-party imports were found
 
 5. **Determine unfamiliar:** Any package NOT covered by Pattern Research is "unfamiliar". Also treat as unfamiliar if:
    - Pattern Research is absent from the plan entirely
-   - Pattern Research exists but the dep's findings are older than 6 months (check plan date vs current date)
+   - Pattern Research exists but carries **no `> **Findings date:** YYYY-MM-DD` stamp** — findings-date ABSENT → unfamiliar directly (fail-safe re-verify; NO plan-date fallback for the coverage question — legacy unstamped plans get re-verified, issue #231 D4)
+   - The stamped findings are older than 6 months by **findings date** (staleness threshold unchanged; plan date plays no role in the new algorithm)
    - The plan references a different major version than what's imported (detected via package.json or import style)
 
 6. **Result:** A list of `[package_name, reason_unfamiliar]` tuples.

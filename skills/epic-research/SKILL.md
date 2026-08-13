@@ -68,7 +68,20 @@ Produce an epic research brief document:
 | Assumption | Confidence | Source | Validation Plan |
 |------------|-----------|--------|-----------------|
 | <assumption> | high/medium/low | <where it came from> | <how to validate> |
+
+## Raw Notes
+<append-only evidence ledger — see the research-protocol reference skill (§13).
+Entries are timestamped + source-tagged; synthesized sections above may be updated
+per level with documented `[updated YYYY-MM-DD — <what changed>]` traces.
+Append via scripts/_research_append.sh.>
 ```
+
+> **Canonical brief structure (contract):** the five headings above — `### Strategy
+> Context`, `### UX Pattern Research`, `### Workflow Pattern Research`, `### Tech
+> Stack Research`, `### Assumptions Register` — plus `## Raw Notes` are the **canonical
+> brief contract**. Downstream consumers (writing-plans Step A.1) read these exact
+> headings. Do NOT rename them without updating every consumer; future briefs must
+> preserve this set (issue #231 D9).
 
 ### Step 4 — Hand Off
 

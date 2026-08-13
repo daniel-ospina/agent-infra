@@ -99,6 +99,7 @@ This prevents silent scope creep — the user knows what was found and can prior
 Phase 0: Tier classification + Skill-domain detection + Epic/component detection
 Phase 1: problem-diverge
 Phase 2: problem-converge
+Phase 1.5: External Research (Standard+Complex — axis matrix + question-driven + persist; see §Phase 1.5)
 Phase 2.5: 🛡️ problem-verify (Standard+Complex: 2 parallel verifiers + controller tiebreaker)
 Phase 3: Codebase Explorer + UX Prototype Gate (fed with verified problem)
 Phase 4: solution-diverge
@@ -119,6 +120,7 @@ Phase 8: Finalize + post plan
 | **problem-verify** | Skip | ✅ (2 verifiers) | ✅ (2 verifiers) |
 | solution-diverge sub-agents | 1 | 1 | 2 |
 | solution-converge sub-agents | 1 | 1 | 2 |
+| **Phase 1.5 External Research** | Skip (proportional: codebase-first + fire only on demonstrated gap) | ✅ (axis matrix, 8-cap) | ✅ (axis matrix, 14-cap) |
 | **solution-verify** / **full-diamond-verify** | ✅ (1 verifier, all phases) | ✅ (2 verifiers) | ✅ (2 verifiers) |
 | Codebase Explorer | Skip | ✅ | ✅ |
 | UX Prototype Gate | Skip | If UX_RATING ≥ medium | If UX_RATING ≥ medium |
@@ -153,7 +155,7 @@ PROBLEM-DIVERGE OUTPUT: <Agent A + Agent B outputs>
 PROBLEM-CONVERGE OUTPUT: <Agent A + Agent B outputs>
 ORIGINAL ISSUE BODY: <full issue text>
 
-CHECK FOUR DIMENSIONS:
+CHECK FOUR DIMENSIONS + DIMENSION 5:
 
 1. DIVERGE THOROUGHNESS: Did problem-diverge genuinely explore alternatives?
    - Are there alternative problem framings that differ meaningfully from the original?
@@ -178,10 +180,18 @@ CHECK FOUR DIMENSIONS:
    - Stakeholders or downstream systems not mentioned?
    - Dependencies assumed but not verified?
 
+5. RESEARCH ARTIFACT (Phase 1.5 — external best-practice research):
+   - Is the `### Axis Research` block present in the scoping output, OR a justified-skip trigger assessment (axes all low + no deps + no novel pattern)?
+   - Presence of a populated block with bare section titles but no findings = P2 (ritualization check: findings must be content, not section headers).
+   - Do findings carry per-framing provenance (canonical / competitor-precedent / pitfalls + source name or URL)?
+   - For each axis rated high: at least one framing seeks failure modes / counter-evidence (the pitfalls framing satisfies this; canonical-only for a high axis = P1).
+   - Justified-skip validity: an axis rated `medium+` skipped WITHOUT a brief-coverage citation = P1. A capped high axis reduced to one framing must keep the pitfalls framing (canonical-only = P1).
+   - P1 if artifact absent without justification; P1 if a high-rating axis has zero external findings; P2 if citations are weak.
+
 For each issue:
 ISSUE:
   severity: P0|P1|P2|P3|P4
-  dimension: diverge-thoroughness|converge-rigor|quality-vs-convenience|gaps
+  dimension: diverge-thoroughness|converge-rigor|quality-vs-convenience|gaps|research-artifact
   location: [specific diamond phase or output section]
   description: <what's wrong>
   suggestion: <what to fix>
@@ -278,10 +288,15 @@ CHECK FOUR DIMENSIONS:
    - Anything clearly missing that Wiring Check (Phase 6) will need to catch?
    - FLAG as P0 if a critical dependency is entirely absent from the plan.
 
+5. SOLUTION RESEARCH EVIDENCE (Phase 1.5 artifact → solution):
+   - Are new third-party deps / patterns introduced by the chosen approach verified externally (the `### Integration Docs` block lists dep + version + API-surface findings) OR justified-skipped (dep already used elsewhere in the codebase, or in-repo wrapper)?
+   - P1 if the chosen approach introduces a dep with zero external verification and no in-repo precedent.
+   - Do the solution approaches engage the Phase 1.5 findings (validate, refine, or explicitly reject them)? A plan that ignores its own research artifact is P2 (ritualization check — findings must feed the plan).
+
 For each issue:
 ISSUE:
   severity: P0|P1|P2|P3|P4
-  dimension: diverge-genuineness|converge-quality|completeness|wiring
+  dimension: diverge-genuineness|converge-quality|completeness|wiring|solution-research-evidence
   location: [specific diamond phase or plan section]
   description: <what's wrong>
   suggestion: <what to fix>
@@ -423,6 +438,19 @@ fi
 `issue-scoping` requires a GitHub issue. If no `ISSUE_NUMBER`:
 - **Autonomous mode:** auto-create with `gh issue create` and continue.
 - **Interactive mode:** ask. If "no issue" → abort.
+
+### Clarifying-Questions Invocation (Phase 0.5)
+
+After epic/deps detection (above), before Phase 1, invoke `clarifying-questions` with `mode=issue-pre` (additive caller — strategy-builder §2.4 remains its GTM-domain caller):
+
+```
+Run the clarifying-questions skill with:
+- mode: issue-pre (or issue-post if the issue already references codebase reads)
+- tier: <micro|standard|complex>
+- context: the issue body + epic brief summary
+```
+
+Its `### Clarifications` block is embedded in the Phase 8 plan comment; its `### Deferred to Research` queue (Pass B — researchable questions with impact ≥ 6) seeds Phase 1.5 Sub-step B (issue #231 D6).
 
 ### Label Management — Entry
 
@@ -587,6 +615,58 @@ This triggers an osascript dialog on the human's machine. The pipeline advances 
 
 ---
 
+## Phase 1.5 — External Research (Standard + Complex; Micro: proportional trigger)
+
+**Purpose:** Import external best practices and known pitfalls for the confirmed problem, per axis — the capability that was dropped in the v5.0.0 restructure (#231). This is distinct from the diamond phases' *framing* research (adversarial problem challenges): Phase 1.5 is *external knowledge import* (how others solve this, what fails in practice). Prior findings (epic brief, existing research brief) are `PRIOR_RESEARCH` context — never a substitute for fresh targeted queries at this level's granularity (research-protocol §0).
+
+**Placement:** after problem-converge (Phase 2 — the problem is confirmed, so axes are scoped from it) and before problem-verify (Phase 2.5 — the gate checks this phase's artifact). Findings feed solution-diverge (Phase 4) as PRIOR_RESEARCH.
+
+> **Reference:** research-protocol §0 (granularity ladder), §1 (five dimensions), §3 (tier-domain budget), §13 (`## Raw Notes`).
+
+### Sub-step A — Axis Research Matrix
+
+For each axis rated `medium+` (UX / Ontology / Architecture from Phase 0 ratings; **Library-deps axis triggered by third-party-dep detection** in the issue body / affected files — there is no Phase 0 Library rating field in v5):
+
+1. **Codebase-first precedent scan** — grep/read for existing patterns (3+ examples → query can be lighter or skipped with justification).
+2. **Dedup against PRIOR_RESEARCH** — if the epic brief / existing brief already covers this axis at sufficient granularity, skip with a `> Deduplicated: covered by <brief section>` note (deduplicated questions never count toward the cap).
+3. **Per-bucket protocol queries** — 1–3 external queries per axis (canonical / competitor-precedent / pitfalls), per research-protocol §1.1. **Cap reconciliation:** the D3 cap is a **post-dedup total**; when the cap binds, lower-priority axes drop to 1 framing each (a capped `medium+`/high axis that keeps only one framing MUST keep the pitfalls/adversarial one — canonical-only for a capped high axis is P1 under Phase 2.5 dimension 5).
+
+### Sub-step B — Question-Driven Research
+
+Consume the `### Deferred to Research` queue from `clarifying-questions` (Phase 0.5 invocation) and the issue's `**Research:**` field; spend remaining budget on those questions (research-protocol §1.4 — include disconfirming framings).
+
+### Sub-step C — Persist
+
+1. Append timestamped, source-tagged findings to the research brief via `bash scripts/_research_append.sh --issue-body "$ISSUE_BODY" --issue-number $ISSUE_NUMBER --append "<text>" --source-tag <canonical|competitor|precedent|pitfalls|adversarial|question> --create` (create-if-missing; `**Research:**` backfill is best-effort).
+2. Stage `### Axis Research` (from Sub-steps A/B findings) for the Phase 8 post comment. `### Integration Docs` (deps + versions + API-surface findings) is **drafted at solution-converge (Phase 4/5)** from Codebase Explorer DEPENDENCIES (Phase 3) + Phase 1.5 findings; solution-verify (Phase 5.5) checks the draft; Phase 8 posts it. *(Disambiguation: `### Integration Docs` is distinct from the plan doc's `### Integration Surface Map` — different documents, different consumers; never merge or relocate.)*
+
+### Activation Rule (necessary-not-sufficient)
+
+An axis rated `medium+` **cannot** be skipped by "no gap" — it must fire OR justify why the brief already covers it at sufficient granularity (with a section citation). A low-rated axis **may** fire on a demonstrated gap (new third-party dep, novel pattern, codebase-first scan verified absence of precedent). When NO axis fires, emit a justified-skip block:
+
+```
+### Axis Research
+> **Trigger assessment:** axes all low (UX=low, Ontology=low, Architecture=low); no third-party deps; no novel pattern (in-repo precedent: <path>). External research not demonstrated — skipped per activation rule.
+```
+
+> **Skip precedence:** a justified-skip block takes precedence over findings-date absence downstream — a plan whose research section is a documented skip is NOT re-verified at execution (executing-plans Step 1.5).
+
+### Execution-Intent Budget (D3)
+
+Read `EXECUTION_INTENT` and shape spend after PRIOR_RESEARCH dedup:
+
+| Intent | Phase 1.5 shape | Caps (post-dedup) |
+|---|---|---|
+| **Fast** (default) | Full axis matrix, per-bucket protocol | Standard ≤ 8; Complex ≤ 14 |
+| **Autonomous** | Full matrix, no early-exit | Same caps; never skip a medium+ axis |
+| **Budget** | Codebase-only + ≤ 2 queries, fired only on P0-level gaps | ≤ 2; document skip in trigger assessment |
+
+### Micro tier (proportional trigger)
+
+Micro does not run the full axis matrix. After the codebase check: if the issue touches third-party deps or a novel pattern (no in-repo precedent) → fire 1–2 external queries (canonical usage + pitfalls), record as an inline `> Research note:` in the plan comment (findings-date + provenance). Budget mode: skip external queries.
+
+---
+
 ## Phase 3 — Codebase Explorer + UX Prototype Gate
 
 Now with a VERIFIED problem definition (passed problem-verify gate).
@@ -704,6 +784,7 @@ You are a senior reviewer checking cross-diamond coherence of a scoping session.
 CONFIRMED PROBLEM: <from Phase 2>
 SOLUTION APPROACH: <from Phase 5>
 ORIGINAL ISSUE: <issue body>
+RESEARCH ARTIFACT: <### Axis Research + ### Integration Docs from Phase 1.5>
 
 CHECK:
 1. Does the solution actually address the confirmed problem? Or did it drift back to the original issue framing?
@@ -711,6 +792,7 @@ CHECK:
 3. Are edge cases from problem-diverge handled in the solution?
 4. Is there a SIMPLER approach that would achieve the same outcome? (Devil's advocate)
 5. What is the weakest assumption in this scoping?
+6. RESEARCH CROSS-CHECK: do the chosen approach's dependency claims match `### Integration Docs` (any dep in the plan absent from the research artifact, or contradicted by it, is flagged)?
 
 Output ISSUE blocks or NO ISSUES FOUND.
 ```
@@ -819,6 +901,13 @@ gh issue comment $ISSUE_NUMBER --body "$(cat <<'PLANEOF'
 
 ## Plan
 <plan draft>
+
+## External Research (Phase 1.5 artifact)
+### Axis Research
+<per-axis findings with per-framing citations (canonical / competitor-precedent / pitfalls + source), or the justified-skip trigger assessment>
+
+### Integration Docs
+<deps + versions + API-surface findings, drafted at solution-converge from Codebase Explorer DEPENDENCIES + Phase 1.5 findings — distinct from the plan doc's ### Integration Surface Map>
 
 ## Rejected Alternatives
 <alternatives and why not chosen>

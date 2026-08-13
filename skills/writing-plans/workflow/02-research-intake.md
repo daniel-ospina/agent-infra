@@ -6,7 +6,7 @@ Before drafting the plan, gather all existing research. This avoids re-researchi
 
 ### Step A — Locate Prior Research
 
-**If invoked directly from `issue-scoping` in the same session (auto-invoke path):** Skip Step A entirely — research findings, codebase context, and requirements are already live in context. Proceed to Step B (checking for any remaining implementation gaps).
+**If invoked directly from `issue-scoping` in the same session (auto-invoke path):** Skip Step A's *search* — research findings, codebase context, and requirements are already live in context — but **validate the scoping artifact exists**: the scoping comment must contain `### Axis Research` (+ `### Integration Docs` for standard+) or a justified-skip trigger assessment; if absent, note the gap and proceed (the plan's `### Pattern Research` is still authored by Step B). Proceed to Step B (checking for any remaining implementation gaps).
 
 **Otherwise:** Check for research artifacts in this order:
 
@@ -17,9 +17,9 @@ Before drafting the plan, gather all existing research. This avoids re-researchi
    RESEARCH_BRIEF=$(echo "$EPIC_DOC_PATH" | sed 's/\.md$/-research.md/')
    [ -f "$RESEARCH_BRIEF" ] && echo "Found: $RESEARCH_BRIEF"
    ```
-   If found, read the `## Strategy`, `## Tech Stack`, `## UX Patterns`, and `## Assumptions Register` sections. These are the architecture contract for design decisions.
+   If found, read the canonical headings — `### Strategy Context`, `### Tech Stack Research`, `### UX Pattern Research`, `### Assumptions Register` (epic-research's producer contract, issue #231 D9) — plus `## Raw Notes`. These are the architecture contract for design decisions.
 
-2. **Issue-scoping research:** Read the issue comments for `### Integration Docs` and `### Pattern Research` blocks (output from issue-scoping Phase 1.5). These contain Perplexity findings on integrations and implementation patterns.
+2. **Issue-scoping research:** Read the issue comments for `### Axis Research` and `### Integration Docs` blocks (output from issue-scoping Phase 1.5). These contain Perplexity findings on integrations and implementation patterns. **`### Pattern Research` is NOT consumed here** — it is Step B's exclusive output in the plan doc (authorship boundary, issue #231 D5). If the issue comment has no blocks, fall back to the research brief's `### Axis Research` section (resolved via `_research_path.sh`).
 
 3. **Standalone research briefs:** Check `docs/plans/` for a research doc matching the feature name:
    ```bash
@@ -110,10 +110,12 @@ Default to (a). Never auto-select (b) or (c).
 
 **Output**
 
-`### Pattern Research` block — embedded in the plan doc's Architecture section, persisted to the research brief's `## Raw Notes` per the persistence rules. Structure:
+`### Pattern Research` block — embedded in the plan doc's Architecture section, persisted to the research brief's `## Raw Notes` per the persistence rules (research-protocol §13). **This block is Step B's SOLE-authorship output — scoping emits `### Axis Research` / `### Integration Docs`, never this block (issue #231 D5).** Structure (findings-date stamp is mandatory — executing-plans Step 1.5 keys staleness to it):
 
 ```
 ### Pattern Research
+
+> **Findings date:** YYYY-MM-DD
 
 **Library docs (preflight)** — [list | "no third-party deps in plan — skipped"]
 
@@ -132,3 +134,5 @@ Default to (a). Never auto-select (b) or (c).
 - Competitor variance: [finding]
 - Known pitfall: [finding]
 ```
+
+**Skip propagation (issue #231 H5):** when Step B skips a bucket or the entire gate, document the skip in this block using the executing-plans-recognized vocabulary — `> Gate skipped: <justification>` / `> Bucket [name] skipped: <justification>` (or, for a scoping-side skip, `> Research skipped: no demonstrated gap`). A documented skip takes precedence over findings-date absence at execution (no re-verify).
