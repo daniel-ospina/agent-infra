@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ToolCallEvent, ToolCallEventResult, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import { relative, resolve } from "node:path";
+import { relative, resolve, isAbsolute } from "node:path";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -150,7 +150,10 @@ function bridgePath(): string {
 
 function writeBridge(projectRoot: string, files: string[]): void {
   try {
-    mkdirSync(BRIDGE_DIR, { recursive: true });
+    // #190 review: the bridge is a same-user trust channel — 0o700/0o600 so
+    // other local users can neither read (absolute worktree paths + content
+    // hashes) nor write it on shared hosts.
+    mkdirSync(BRIDGE_DIR, { recursive: true, mode: 0o700 });
     const verifiedFiles: VerifiedFile[] = [];
     for (const f of files) {
       try {
@@ -182,7 +185,7 @@ function writeBridge(projectRoot: string, files: string[]): void {
       verified_files: verifiedFiles,
       timestamp: new Date().toISOString(),
     };
-    writeFileSync(bridgePath(), JSON.stringify(payload));
+    writeFileSync(bridgePath(), JSON.stringify(payload), { mode: 0o600 });
   } catch (e) {
     console.error("[verification-gate] bridge write failed:", (e as Error).message);
   }
@@ -234,9 +237,14 @@ function recoverBridgeForRoot(normRoot: string): number {
     try {
       const parsed = parseCompoundKey(vf.path);
       if (!parsed || parsed.root !== normRoot) continue; // foreign root — inert
+      // #190 review: containment — an out-of-root rel (../) is inert against
+      // the block check (git names are repo-relative) but hashFile would read
+      // outside the root; drop such keys before hashing.
+      const relPath = normalizeRegistryPath(parsed.root, parsed.path);
+      if (relPath.startsWith("..") || isAbsolute(relPath)) continue;
       // Match-or-drop: only merge when the stored (verifier-authoritative)
       // hash still matches the file on disk. Never recompute a fresh hash.
-      if (vf.hash !== hashFile(parsed.root, parsed.path)) continue;
+      if (vf.hash !== hashFile(parsed.root, relPath)) continue;
       verifiedSet.set(vf.path, vf.hash);
       blockAttempts.delete(vf.path);
       recovered++;
@@ -246,6 +254,10 @@ function recoverBridgeForRoot(normRoot: string): number {
   }
   if (recovered > 0) {
     console.log(`[verification-gate] 📂 Bridge recovery: merged ${recovered} verified files for this worktree`);
+    // #190 review: audit parity with gate_bypass — a silent verifiedSet
+    // injection must leave a durable record (the bridge is a same-user trust
+    // channel; any recovery is worth an audit entry).
+    appendJsonl({ event: "gate_recovery", extension: "verification-gate", recovered, session_cwd: process.cwd() });
   }
   return recovered;
 }
@@ -582,6 +594,20 @@ export default function (pi: ExtensionAPI) {
     // #7574: re-hash verified files if a prior git commit was allowed.
     // lint-staged (pre-commit hook) may have modified files (ESLint --fix),
     // changing their hashes. Capture the post-lint state before the next check.
+    // Determine cwd — prefer cd prefix in command (worktree support)
+    const inputCwd = event.input.cwd ? String(event.input.cwd) : process.cwd();
+    const cdPath = extractCdPath(command);
+    const cwd = resolveGitRoot(cdPath ?? inputCwd);
+
+    // #190: mid-session bridge recovery FIRST — defense-in-depth for the
+    // incident's event-miss class (a merge that landed via another path, e.g.
+    // a sub-agent's own tool_result handler, becomes visible at the next git
+    // op). Must run BEFORE the pendingRehash writeBridge snapshot: the rehash
+    // overwrites the bridge with the parent registry, which would destroy a
+    // sub-agent's freshly-written mid-session entry before recovery could
+    // merge it (review #214 ordering bug).
+    recoverBridgeForRoot(normalizeWorktreeRoot(cwd));
+
     // #190: narrowed to the allowed commit's files (pendingRehashFiles) — only
     // those could have been touched by lint-staged; re-hashing the whole root
     // would re-bless unrelated verified files from disk.
@@ -605,16 +631,6 @@ export default function (pi: ExtensionAPI) {
         console.log(`[verification-gate] 🔄 Re-hashed ${rehashed} files after commit (lint-staged may have modified them)`);
       }
     }
-
-    // Determine cwd — prefer cd prefix in command (worktree support)
-    const inputCwd = event.input.cwd ? String(event.input.cwd) : process.cwd();
-    const cdPath = extractCdPath(command);
-    const cwd = resolveGitRoot(cdPath ?? inputCwd);
-
-    // #190: mid-session bridge recovery — defense-in-depth for the incident's
-    // event-miss class (a merge that landed via another path, e.g. a sub-agent's
-    // own tool_result handler, becomes visible at the next git op).
-    recoverBridgeForRoot(normalizeWorktreeRoot(cwd));
 
     // Compute diff
     let changedFiles: string[];
@@ -807,8 +823,13 @@ export default function (pi: ExtensionAPI) {
         // proactive dispatch in worktree B would zero-merge against A's stale
         // state and recreate the blocked-until-auto-bypass loop).
         const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
-        if (foreign) lastBlockedFiles = []; // stale context — do not filter against it
         const normRoot = normalizeWorktreeRoot(projectRoot);
+        // #190 review: expand directory paths against the PRE-clear blocked
+        // list (a foreign dispatch must still resolve dirs from the real block
+        // context), then clear the stale context atomically — lastBlockedCwd
+        // together with lastBlockedFiles, so no half-cleared (old-root + empty
+        // filter) state survives.
+        const blockedSnapshot = [...lastBlockedFiles];
 
         // Extract file list from the prompt. #190: broadened regex accepts
         // `\n\nClassification:` and no-period separators (incident dispatch #1).
@@ -820,8 +841,8 @@ export default function (pi: ExtensionAPI) {
         const promptFiles = new Set<string>();
         for (const f of rawFiles) {
           const isDir = f.endsWith('/') || !f.includes('.');
-          if (isDir && lastBlockedFiles.length > 0) {
-            for (const blocked of lastBlockedFiles) {
+          if (isDir && blockedSnapshot.length > 0) {
+            for (const blocked of blockedSnapshot) {
               if (blocked.startsWith(f)) promptFiles.add(blocked);
             }
           } else {
@@ -829,16 +850,33 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        // #190: bounded fallback — zero prompt files (format deviation) with a
-        // genuine `verify files:` dispatch and a block context merges the
-        // blocked diff (the gate-generated prompt names exactly those files).
-        // The literal marker bounds this to file-verification dispatches; a
-        // paraphrase without it stays blocked (fail-closed). Never applies to
-        // the JSON branch (a JSON PASS names its files in verified_files).
+        if (foreign) {
+          // stale context — do not filter against it (atomic clear)
+          lastBlockedFiles = [];
+          lastBlockedCwd = null;
+        }
+
+        // #190: bounded fallback — zero prompt files (deviant format, e.g.
+        // `verify files:\n\nClassification:`) with a genuine `verify files:`
+        // dispatch and a block context merges the blocked diff (the
+        // gate-generated prompt names exactly those files). #190 review
+        // hardening: the fallback fires ONLY when the response is a STANDALONE
+        // verdict line (end-anchored PASS — "All checks passed.\nPASS" or
+        // "**PASS**"), never on prose echoes ("PASS criteria are met") or
+        // format-spec quotes. A non-standalone response zero-merges (fail-
+        // closed, context retained). Never applies to the JSON branch (a JSON
+        // PASS names its files in verified_files).
         let mergeFiles: string[];
         if (promptFiles.size === 0 && lastBlockedFiles.length > 0 && /verify files:/i.test(prompt)) {
-          mergeFiles = [...lastBlockedFiles];
-          console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${lastBlockedFiles.length} blocked files`);
+          const standalonePass =
+            /(?:^|\n)\s*(?:[-*•]|\d+\.)?\s*\*{0,3}PASS(?:\b|:|—)\*{0,3}\s*$/m.test(textContent) ||
+            /✅\s*PASS(?:\b|:|—)\s*$/m.test(textContent);
+          if (standalonePass) {
+            mergeFiles = [...lastBlockedFiles];
+            console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${lastBlockedFiles.length} blocked files (standalone verdict line)`);
+          } else {
+            mergeFiles = [];
+          }
         } else {
           mergeFiles = [...promptFiles];
         }
@@ -851,8 +889,9 @@ export default function (pi: ExtensionAPI) {
         for (const file of filteredPromptFiles) {
           try {
             const relPath = normalizeRegistryPath(projectRoot, file);
+            if (relPath.startsWith("..") || isAbsolute(relPath)) continue; // out-of-root — inert (#190 review)
             const key = compoundKey(normRoot, relPath);
-            const hash = hashFile(projectRoot, file);
+            const hash = hashFile(projectRoot, relPath);
             verifiedSet.set(key, hash);
             blockAttempts.delete(key);
             merged++;

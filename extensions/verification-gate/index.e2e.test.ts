@@ -544,7 +544,43 @@ async function main() {
     });
     equal(res, undefined, "retry after zero-merge dispatch must still merge (context retained, T5)");
     git(repo, "commit -m c17");
+  });
+
+  test("scenario 18 (#190 review): prose PASS ('PASS criteria are met') never triggers the whole-diff fallback", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
     await fire("session_start", {});
+    writeFileSync(join(repo, "fileT6.txt"), "t6\n");
+    git(repo, "add fileT6.txt");
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c18'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first");
+    // Deviant prompt (zero parseable files) + PROSE PASS — the response echoes
+    // the format spec ("PASS on its own line") but is not a standalone verdict.
+    // The whole-diff fallback must NOT fire: zero merge, context retained.
+    const deviantPrompt = `[VGATE] verify files:\n\nClassification: UI\nProject root: ${repo}`;
+    await fire("tool_result", {
+      toolName: "task", input: { prompt: deviantPrompt },
+      content: [{ type: "text", text: "Remember: respond PASS on its own line. PASS criteria are met." }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c18b'", cwd: repo },
+    });
+    ok(res && res.block === true, "prose PASS must NOT merge the blocked diff (still blocked)");
+    // A genuine standalone PASS on the retry DOES merge (fallback intact).
+    await fire("tool_result", {
+      toolName: "task", input: { prompt: deviantPrompt },
+      content: [{ type: "text", text: "PASS" }],
+    });
+    const res2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c18c'", cwd: repo },
+    });
+    equal(res2, undefined, "standalone PASS with deviant prompt merges the blocked diff (context retained)");
+    git(repo, "commit -m c18c");
   });
 } // main: plugin loaded; tests run sequentially via runAll()
 
