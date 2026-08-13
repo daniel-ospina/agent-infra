@@ -170,7 +170,7 @@ Before creating the issue, verify nothing was forgotten from the parent. This ca
 - [ ] **Test-design** — does this issue's verification checklist derive from the epic's integration-surface map, covering every surface this issue touches?
 
 ### Research
-If this issue needs investigation before implementation, note what to research. For standard+complex issues, this feeds into `issue-scoping` Phase 1.5 (external research). For micro issues, skip.
+If this issue needs investigation before implementation, note what to research. For standard+complex issues, this feeds into `issue-scoping` Phase 1.5's `### Axis Research` matrix (external best-practice research per axis). For micro issues, skip.
 
 ---
 

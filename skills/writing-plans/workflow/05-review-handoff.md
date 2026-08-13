@@ -37,6 +37,8 @@ Search for `<!-- plan-review:` in the plan doc. If:
 - `status=clean` → proceed.
 - `status=capped` or `status=stalled` → stop. Surface issues to user.
 
+**Research-evidence pre-check (Standard/Complex only, issue #231 D7):** before Execution Handoff, verify the plan's `### Pattern Research` block carries the `> **Findings date:** YYYY-MM-DD` stamp OR a documented skip justification (`> Gate skipped` / `> Bucket [name] skipped` / `> Research skipped: no demonstrated gap`). Absence of both = the fresh-query evidence gate did not run — stop and run Step B before handoff. (Executing-plans Step 1.5 keys dependency staleness to this stamp; an unstamped block is treated as unfamiliar at execution.)
+
 After saving the plan, apply the `planned` label to the GitHub issue (if applicable):
 
 ```bash
