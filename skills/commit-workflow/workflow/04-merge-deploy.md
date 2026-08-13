@@ -50,6 +50,52 @@ Post-merge verification below (deploys, smoke tests, clickthrough) remains **war
 it detects problems and auto-files issues, never blocks.
 
 
+## Merge Ceremony — worktree-safe branch cleanup (#193)
+
+⛔ **NEVER pass `--delete-branch` to `gh pr merge`.** `--delete-branch` makes gh switch
+to the default branch locally so it can delete the merged branch — and that local switch
+hard-fails with `fatal: '<default>' is already used by worktree at '<path>'` whenever the
+default branch is checked out in another worktree (a **permanent condition** in
+worktree-heavy repos — many worktrees hold `main`). The merge itself HAS already
+succeeded server-side; the command just exits non-zero on the local switch, surfacing a
+confusing failure for a merge that completed (incident 2026-08-12, tortoise PR #982).
+
+Merge in **two steps** — merge first, then clean up the branch separately, degrading
+gracefully on worktree locks:
+
+**Step A — merge WITHOUT `--delete-branch`:**
+
+```bash
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
+# Merge completes server-side regardless of local worktree state:
+gh pr merge <PR_NUMBER> --merge
+# Expected: "Pull request #N was merged" — exit 0. No local branch juggling.
+```
+
+**Step B — WARN + conditional branch deletion** (never part of the merge command):
+
+```bash
+PR_BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
+# Remote delete always works — the branch is merged, and deletion is server-side:
+git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete failed — delete manually: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"
+# Local delete degrades gracefully: tolerate the worktree lock, do NOT fail the ceremony.
+# `git branch -D` (not -d) so a merged-but-not-fully-reconciled local branch still cleans up.
+if git worktree list --porcelain | grep -q "branch refs/heads/$PR_BRANCH"; then
+  echo "⚠️ branch $PR_BRANCH is checked out in another worktree — local delete deferred"
+  echo "   to Step 3.8 teardown (05-cleanup.md); a teardown note is left if the worktree cannot be removed."
+else
+  git branch -D "$PR_BRANCH" 2>&1 || echo "⚠️ local branch $PR_BRANCH could not be deleted — remove its worktree first (see 05-cleanup.md)"
+fi
+```
+
+**Never** re-run `gh pr merge` with `--delete-branch` as a "recovery" — the merge is
+already done; the only remaining work is branch cleanup, which Step B handles without
+touching the default-branch worktree. If Step B's remote delete reports
+`remote ref does not exist`, the branch was already deleted server-side
+(deleteBranchOnMerge) — that is success, not an error.
+
+
 ## Stale-Merge Recovery (#178/#181 — strict up-to-date ladder)
 
 On repos with "Require branches to be up to date before merging", another merge
