@@ -139,6 +139,43 @@ When dispatching parallel sub-agents, not all may succeed. Handle gracefully:
 
 All fan-out orchestrator skills (code-review, plan-review, prototype-review, test-review, content-strategy-agent, codebase-audit) implement this pattern.
 
+## Teardown Contract (worktrees/branches) — MANDATORY for parallel dispatch
+
+**Issue #195:** an aborted 6-task parallel dispatch left orphaned worktrees and `fix/*` branches with NO teardown (observed 2026-08-12; `.worktrees/` accumulated 60+ dead entries). Nothing owned the lifecycle. Since pi exposes no abort hook the dispatcher can rely on, teardown is **record-first**: every artifact a dispatch creates is written to a manifest before dispatch, so an abort leaves an explicit teardown trail instead of silence.
+
+**The contract — every orchestrator that spawns sub-agents which create branches/worktrees MUST:**
+
+1. **RECORD before dispatch** (each worktree/branch the sub-agent will create):
+   ```bash
+   bash scripts/record-worktree.sh add --branch fix/801-signup-rate --worktree .worktrees/fix-801-signup-rate --dispatch d-<id>
+   ```
+   (Records append to `~/.pi/agent/worktrees.jsonl` — one JSONL line per artifact: ts, branch, worktree, dispatch, repo. Writes are atomic tmp+mv; a failed write warns but NEVER blocks the dispatch.)
+
+2. **DONE on clean completion** — after the fan-in succeeds and worktrees are removed, the orchestrator removes its own records:
+   ```bash
+   bash scripts/record-worktree.sh done --dispatch d-<id>
+   ```
+
+3. **ABORT leaves the record** — on user abort, sub-agent hang, or crash, do NOT clean records. The surviving record IS the teardown manifest: the next sweep flags it.
+
+4. **SWEEP after every dispatch** (and periodically) — `scripts/scan-orphans.sh` reads the manifest + git state and classifies each record:
+   - **ORPHAN** — branch local-only, no open PR, record stale (>1d by default) → safe to remove
+   - **DIRTY-ORPHAN** — worktree holds uncommitted changes → manual review; `--apply` refuses without `--force-dirty`
+   - **RECENT** — recorded, not yet stale → listed, never removed
+   - **LIVE** — branch pushed or has an open PR → ignored
+   - **GHOST** — branch/dir already gone → record pruned
+   - **UNRECORDED** — informational only (pre-contract worktrees/branches); NEVER auto-removed
+   
+   ```bash
+   bash scripts/scan-orphans.sh            # dry-run: teardown list, deletes nothing
+   bash scripts/scan-orphans.sh --apply    # explicit removal of ORPHANs + ghost records
+   ```
+   `--apply` removes the worktree dir, deletes the local branch (never `main`/`master`, never a pushed branch, never a dirty worktree without `--force-dirty`), and prunes the record.
+
+5. **Document the wiring** — see `scripts/scan-orphans.sh --help` for the full contract and the issue-workflow skill's Worktree Gate for the dispatcher-side rules.
+
+> **Why not an abort hook?** Research for #195 found no reliable cross-session abort/cancel hook in the pi SDK. A deterministic, no-LLM record + sweep is robust to kills, crashes, and lost sessions — the record survives the process that wrote it.
+
 ## Anti-Patterns
 
 | Anti-Pattern | Why It Matters |
@@ -150,5 +187,6 @@ All fan-out orchestrator skills (code-review, plan-review, prototype-review, tes
 | Infinite review cycles | Always cap at 10 cycles. Surface remaining issues to human |
 | Waiting for background tasks synchronously | Defeats the purpose. Check background results before they're needed |
 | No fallback for subagent tool failures | If the subagent tool is unreachable (network, API down), the skill hangs. Always have a fallback: retry 3× with backoff, then surface to human with options to (a) retry, (b) proceed sequentially, (c) abort. |
+| Spawning worktrees/branches with no teardown record | Aborted dispatch silently orphans them (#195). Record every artifact before dispatch (`record-worktree.sh add`), remove on clean completion (`done`), sweep with `scan-orphans.sh` — abort leaves the record as the teardown manifest. |
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

@@ -208,6 +208,19 @@ git worktree remove --force "$WORKTREE_PATH"
 
 > **Orchestrator rule:** Parallel subagents → each gets `git worktree add` + unique `cwd`. Never reuse the same checkout. See `skills/using-git-worktrees/SKILL.md` for symlink setup and `skills/parallel-orchestrator/SKILL.md` for dispatch patterns.
 
+#### Teardown ownership — who cleans up when the dispatch dies (#195)
+
+> ⛔ **Teardown is RECORD-FIRST.** The 2026-08-12 incident: an aborted 6-task dispatch left 3 orphaned worktrees + 3 `fix/*` branches (one pushed upstream later), and `.worktrees/` accumulated 60+ dead entries — because the dispatcher created the artifacts but nothing owned teardown when the dispatch was aborted mid-run.
+
+1. **The dispatcher owns teardown** — not the sub-agent, not the worktree gate. Sub-agents die with the abort; only the dispatcher (or the record it left) survives.
+2. **Record before dispatch, always** — each artifact the sub-agent will create (branch, worktree) is written to the teardown manifest BEFORE the sub-agent starts:
+   ```bash
+   bash scripts/record-worktree.sh add --branch fix/NNN-slug --worktree ".worktrees/subagent-${SUBAGENT_ID}" --dispatch d-<dispatch-id>
+   ```
+3. **Clean completion** → remove records: `bash scripts/record-worktree.sh done --dispatch d-<dispatch-id>`
+4. **Abort/crash/hang** → leave the records. They are the teardown manifest; do not half-clean.
+5. **Sweep** → `bash scripts/scan-orphans.sh` (dry-run) / `--apply` (remove) flags stale records whose branch is local-only with no open PR, plus dirty worktrees (manual review), ghosts, and unrecorded worktrees (informational). See the script header for the full contract.
+
 <HARD-GATE>
 Do NOT write code, edit files, or form an implementation plan until the correct workflow skill has been invoked and its Align stage is complete.
 </HARD-GATE>
