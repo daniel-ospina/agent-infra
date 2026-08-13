@@ -143,7 +143,7 @@ git diff --cached --name-only --no-renames | grep -qE '^(skills/|enforcement/|AG
   - If it fails: **stop immediately** and report. Do not commit.
 - If `HAS_SKILL_CHANGES=false`: skip silently.
 
-> Script ported into agent-infra in #239 (from eldato @ fb4c5357). eldato's `enforce-skills.yml` was never ported; agent-infra has no CI workflow running this script — drift coverage is solely this pre-flight trigger on `skills/|enforcement/|AGENTS.md` commits (issue #239 D5).
+> Script ported into agent-infra in #239 (from eldato @ 49afc61f, blob fb4c5357). eldato's `enforce-skills.yml` was never ported; agent-infra has no CI workflow running this script — drift coverage is solely this pre-flight trigger on `skills/|enforcement/|AGENTS.md` commits (issue #239 D5).
 
 ## Issue Detection
 

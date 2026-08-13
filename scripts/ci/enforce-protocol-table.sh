@@ -49,7 +49,6 @@ resolution (fixture harness). Exit 0 = clean/skip, 1 = audit failure, 2 = usage.
 EOF
 }
 
-[[ $# -eq 0 ]] && true
 if [[ $# -eq 1 && "$1" == "--help" ]]; then usage; exit 0; fi
 [[ $# -eq 0 ]] || { echo "Error: unknown argument(s): $*" >&2; usage >&2; exit 2; }
 
