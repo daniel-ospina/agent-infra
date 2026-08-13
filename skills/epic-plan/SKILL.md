@@ -84,7 +84,7 @@ Each sub-step produces a section of the epic plan document and passes through a 
 ### 1. User Journeys
 Detailed journey tables with persona mapping. Each journey describes a complete user flow with entry/exit states.
 
-**Light research hook (issue #231 D11):** for UX precedent, fire 1–2 queries ONLY on a demonstrated gap (novel interaction type absent from the brief's `### UX Pattern Research`); otherwise rely on the brief. Budget mode: defer to the brief. If a light hook fires, record findings inline in the substep's plan section with a `> **Findings date:**` stamp + source AND append to the epic brief's `## Raw Notes` via the same `_research_append.sh` call as the heavy hooks (no gate check, but the ledger stays complete).
+**Light research hook (issue #231 D11):** for UX precedent, fire 1–2 queries ONLY on a demonstrated gap (novel interaction type absent from the brief's `### UX Pattern Research`); otherwise rely on the brief. Budget mode: defer to the brief. If a light hook fires, record findings inline in the substep's plan section with a `> **Findings date:**` stamp + source AND append to the epic brief's `## Raw Notes` via `_research_append.sh` (same `--epic-path --append --source-tag` invocation contract as the heavy hooks; no gate check, but the ledger stays complete).
 
 **Review gate:** Do journeys cover all in-scope items? Are persona-appropriate? Are edge cases (empty, error, loading) handled?
 
@@ -115,7 +115,7 @@ Target state, component boundaries, system interfaces. Deployment topology, serv
 ### 6. Interfaces
 API contracts, event schemas, type definitions. Contract-first design — define interfaces before implementation.
 
-**Light research hook (issue #231 D11):** for interface-contract patterns, fire 1–2 queries ONLY on a demonstrated gap (new API style / contract format absent from the brief); otherwise rely on the brief. Budget mode: defer to the brief. If a light hook fires, record findings inline in the substep's plan section with a `> **Findings date:**` stamp + source AND append to the epic brief's `## Raw Notes` via the same `_research_append.sh` call as the heavy hooks (no gate check, but the ledger stays complete).
+**Light research hook (issue #231 D11):** for interface-contract patterns, fire 1–2 queries ONLY on a demonstrated gap (new API style / contract format absent from the brief); otherwise rely on the brief. Budget mode: defer to the brief. If a light hook fires, record findings inline in the substep's plan section with a `> **Findings date:**` stamp + source AND append to the epic brief's `## Raw Notes` via `_research_append.sh` (same `--epic-path --append --source-tag` invocation contract as the heavy hooks; no gate check, but the ledger stays complete).
 
 **Review gate:** Are contracts complete? Are error responses defined? Is versioning strategy clear?
 
