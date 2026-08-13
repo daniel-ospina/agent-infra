@@ -1,9 +1,22 @@
+---
+title: "CI Audit — El Dato Repo (extraction reference)"
+type: engineering
+domain: operations
+doc_status: live
+subjects.team: organisation-design-team
+created: 2026-07-30
+aboutSubjects: organisation-design-team
+aboutObjects: eldato, agent-infra, ci-audit
+---
+
 # CI Audit — El Dato Repo
 
 > **Issue:** [#7554](https://github.com/lil-lawyer/eldato/issues/7554)
 > **Epic:** [#7535](https://github.com/lil-lawyer/eldato/issues/7535) — Agent process infrastructure for epistemic repos
 > **Phase:** 1
 > **Date:** 2026-07-30
+>
+> **Scope (issue #239):** this document is the **eldato** CI audit, kept in agent-infra as an extraction reference. Of the workflows listed in §3, only `ci.yml` and `pipeline-compliance.yml` exist in agent-infra; all others (including `check-drift.yml`, `enforce-skills.yml`, `replay-smoke-test.yml`) describe eldato — rows struck through are explicitly not ported. agent-infra has **zero cron-scheduled workflows**.
 
 Full inventory of CI components in `/Users/home/eldato` with classification:
 - **modular**: repo-agnostic, ready to share via `agent-infra`
@@ -123,7 +136,7 @@ None identified. All scripts are referenced from `.husky/pre-push`, GitHub Actio
 
 ## 3. GitHub Actions (`.github/workflows/`)
 
-All 14 workflows contain El Dato-specific references. **None are currently modular.** Breakdown:
+All 14 workflows (eldato; see scope banner) (eldato inventory; see scope banner) contain El Dato-specific references. **None are currently modular.** Breakdown:
 
 ### 3.1 PR-triggered (blocking)
 
