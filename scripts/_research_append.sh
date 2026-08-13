@@ -49,8 +49,8 @@ Exit: 0 = success, 2 = usage error, 3 = write failed.
 EOF
 }
 
-ISSUE_BODY="${ISSUE_BODY:-}"
-EPIC_PATH="${EPIC_PATH:-}"
+ISSUE_BODY=""
+EPIC_PATH=""
 APPEND_TEXT=""
 SOURCE_TAG="canonical"
 DO_CREATE=0
@@ -80,6 +80,7 @@ while [[ $# -gt 0 ]]; do
       DO_CREATE=1; shift ;;
     --issue-number)
       [[ $# -ge 2 ]] || { echo "Error: --issue-number requires a value" >&2; exit 2; }
+      [[ "$2" =~ ^[0-9]+$ ]] || { echo "Error: --issue-number must be numeric (got: $2)" >&2; exit 2; }
       ISSUE_NUMBER="$2"; shift 2 ;;
     --self-test)
       SELF_TEST=1; shift ;;
@@ -134,7 +135,7 @@ validate_brief_path() {
     *) echo "Error: resolved brief path is not a .md/.yaml file: $brief" >&2; return 1 ;;
   esac
   case "$brief" in
-    */.git/*|*/.git|.git/*|*/.*)
+    */.git/*|*/.git|.git/*|*/.*|.[^/]*/*)
       echo "Error: refusing to write to a .git or hidden path: $brief" >&2; return 1 ;;
   esac
   local dir absdir root absroot
@@ -186,7 +187,6 @@ BRIEF
 backfill_research_field() {
   local brief="$1"
   [[ -n "$ISSUE_NUMBER" ]] || return 0
-  [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || { echo "Error: --issue-number must be numeric (got: $ISSUE_NUMBER)" >&2; exit 2; }
   command -v gh >/dev/null 2>&1 || return 0
   local tmp
   tmp=$(mktemp)
@@ -249,9 +249,19 @@ run_self_test() {
   [[ "$out" == *"Appended to $resolv"* ]] || { echo "FAIL: main resolution append: $out"; exit 1; }
   grep -q 'resolved finding' "$resolv" || { echo "FAIL: resolved append content missing"; exit 1; }
   # 6. no-resolvable-path → exit 0, nothing appended (documented no-op)
-  local out2
-  out2=$(cd "$testrepo" && bash "$SCRIPT_PATH" --append "orphan" 2>&1)
+  local out2 rc2
+  out2=$(cd "$testrepo" && bash "$SCRIPT_PATH" --append "orphan" 2>&1); rc2=$?
+  [[ $rc2 -eq 0 ]] || { echo "FAIL: no-resolve exit code: $rc2"; exit 1; }
   echo "$out2" | grep -q "No research brief found" || { echo "FAIL: no-resolve no-op message: $out2"; exit 1; }
+  ls "$testrepo"/*.md >/dev/null 2>&1 || true
+  [[ ! -f "$testrepo/orphan.md" ]] || { echo "FAIL: orphan appended despite no-op"; exit 1; }
+
+  # 7. create-into-missing-directory (P3 guard)
+  local fresh="$testrepo/nested/fresh-dir/brief.md"
+  local out3
+  out3=$(cd "$testrepo" && bash "$SCRIPT_PATH" --issue-body "**Research:** $fresh" --create --append "fresh brief" 2>&1)
+  [[ "$out3" == *"Appended to $fresh"* ]] || { echo "FAIL: create-into-missing-dir: $out3"; exit 1; }
+  grep -q 'fresh brief' "$fresh" || { echo "FAIL: fresh brief content missing"; exit 1; }
 
   echo "self-test OK"
   exit 0
@@ -269,6 +279,12 @@ if ! BRIEF=$(resolve_brief_path); then
   fi
   echo "No research brief found — nothing appended." >&2
   exit 0
+fi
+
+# P3 (review round 2): with --create into a not-yet-existing directory, create the
+# parent FIRST so validate_brief_path's containment check can resolve it.
+if [[ "$DO_CREATE" -eq 1 ]]; then
+  mkdir -p "$(dirname "$BRIEF")"
 fi
 
 if ! validate_brief_path "$BRIEF"; then
