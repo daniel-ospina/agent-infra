@@ -28,9 +28,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import * as fs from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import * as path from "node:path";
 import { homedir } from "node:os";
@@ -457,6 +457,39 @@ export function getStreamStallMs(): number {
 export function getToolStallMs(): number {
   return Math.max(60_000, Number(process.env.TASK_TOOL_STALL_MS) || DEFAULT_TOOL_STALL_MS);
 }
+/**
+ * #209: system load probe — 1-minute load average. Reads /proc/loadavg
+ * (Linux) or `sysctl vm.loadavg` (macOS); 0 on failure (scale becomes 1).
+ */
+export function getSystemLoad(): number {
+  try {
+    if (existsSync("/proc/loadavg")) {
+      const l = readFileSync("/proc/loadavg", "utf-8").trim().split(/\s+/)[0];
+      const n = Number(l);
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    }
+    const out = execSync("sysctl -n vm.loadavg 2>/dev/null", { encoding: "utf-8", timeout: 2000 })
+      .trim().split(/\s+/)[1];
+    const n = Number(out);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * #209: scale a watchdog bound by system load. Under a load storm (bgsave,
+ * parallel suites) a live sub-agent's first message legitimately stalls —
+ * the static bound (#198) would still cut it. Scale: load < 8 → 1x; 8–15 →
+ * 2x; ≥16 → 3x (bounded). Env-overridable via TASK_LOAD_SCALE_OFF=1.
+ */
+export function loadScaledBound(baseMs: number, load = getSystemLoad()): number {
+  if (process.env.TASK_LOAD_SCALE_OFF === "1") return baseMs;
+  if (load < 8) return baseMs;
+  if (load < 16) return baseMs * 2;
+  return baseMs * 3;
+}
+
 export function getFirstMessageMs(): number {
   return Math.max(60_000, Number(process.env.TASK_FIRST_MESSAGE_MS) || DEFAULT_FIRST_MESSAGE_MS);
 }
@@ -1250,7 +1283,9 @@ export default function (pi: ExtensionAPI) {
         firstOutputTimeoutMs: FIRST_OUTPUT_TIMEOUT_MS,
         streamStallMs: getStreamStallMs(),
         toolStallMs: getToolStallMs(),
-        firstMessageMs: getFirstMessageMs(),
+        // #209: load-aware — under a load storm the first message legitimately
+        // stalls; scale the bound with loadavg (1x <8, 2x 8–15, 3x ≥16).
+        firstMessageMs: loadScaledBound(getFirstMessageMs()),
         intervalMs: getHeartbeatIntervalMs(),
         maxDispatchMs: getTaskMaxDispatchMs(),
       };

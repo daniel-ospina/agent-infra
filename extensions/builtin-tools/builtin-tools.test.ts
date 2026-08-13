@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad } from "./index.js";
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
 
@@ -1355,6 +1355,29 @@ test("getTaskMaxDispatchMs — default off, ≥60s clamp", () => {
 });
 
 // #208: bounded parent wait — hard cap getter
+// #209: load-aware bound scaling
+test("loadScaledBound — 1x <8, 2x 8–15, 3x ≥16; TASK_LOAD_SCALE_OFF=1 bypasses", () => {
+  equal(loadScaledBound(300_000, 0), 300_000);
+  equal(loadScaledBound(300_000, 7.9), 300_000);
+  equal(loadScaledBound(300_000, 8), 600_000);
+  equal(loadScaledBound(300_000, 15), 600_000);
+  equal(loadScaledBound(300_000, 16), 900_000);
+  equal(loadScaledBound(300_000, 60), 900_000, "3x cap is bounded");
+  withEnv({ TASK_LOAD_SCALE_OFF: "1" }, () => {
+    equal(loadScaledBound(300_000, 60), 300_000, "scale-off keeps the static bound");
+  });
+});
+
+test("getSystemLoad — live probe returns the real loadavg (regression: unimported existsSync/execSync made it dead code)", () => {
+  const load = getSystemLoad();
+  ok(Number.isFinite(load) && load >= 0, `getSystemLoad() = ${load} (finite, >= 0)`);
+  // On this machine the probe must actually READ the OS (a load storm is
+  // running); a permanent 0 means the probe is broken again.
+  if (process.platform === "darwin" || process.platform === "linux") {
+    ok(load > 0, `getSystemLoad() = ${load} > 0 (live OS read)`);
+  }
+});
+
 test("getTaskHardCapMs — default 2h, ≥60s clamp, invalid → default", () => {
   withEnv({ TASK_HARD_CAP_MS: undefined }, () => equal(getTaskHardCapMs(), DEFAULT_HARD_CAP_MS));
   withEnv({ TASK_HARD_CAP_MS: "5" }, () => equal(getTaskHardCapMs(), 60_000));
