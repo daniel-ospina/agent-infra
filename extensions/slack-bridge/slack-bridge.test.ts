@@ -1004,13 +1004,18 @@ try {
 // ── Approval forwarding: per-repo store discovery (#2492) ─────
 {
   const { repoNameFromUrl, deriveRepoName, approvalsStorePath, findApprovalsFile, gitRemoteTimeoutMs } = await import("./index.js");
+  const { loadScaledTimeoutMs, getSystemLoad } = await import("./socket-mode.js");
 
   // gitRemoteTimeoutMs — #196: env-overridable git-lookup cap (default 5s).
   // The 2s default flaked discovery on multi-second `git remote get-url` stalls.
+  // #209: the *implicit* default is load-aware; force scale-off for the
+  // deterministic "default 5000" assertions below.
   const prevGitTmo = process.env.GIT_REMOTE_TIMEOUT_MS;
+  const prevScaleOff = process.env.TASK_LOAD_SCALE_OFF;
   try {
+    process.env.TASK_LOAD_SCALE_OFF = "1";
     delete process.env.GIT_REMOTE_TIMEOUT_MS;
-    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: default 5000 (no env)");
+    assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: default 5000 (no env, scale off)");
     process.env.GIT_REMOTE_TIMEOUT_MS = "5000";
     assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: env override respected");
     process.env.GIT_REMOTE_TIMEOUT_MS = "abc";
@@ -1028,6 +1033,24 @@ try {
   } finally {
     if (prevGitTmo === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
     else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTmo;
+    if (prevScaleOff === undefined) delete process.env.TASK_LOAD_SCALE_OFF;
+    else process.env.TASK_LOAD_SCALE_OFF = prevScaleOff;
+  }
+
+  // #209: load-aware shell-out timeout scaling (deterministic — explicit load).
+  {
+    const prevScaleOff2 = process.env.TASK_LOAD_SCALE_OFF;
+    try {
+      delete process.env.TASK_LOAD_SCALE_OFF;
+      assert(loadScaledTimeoutMs(5000, 0) === 5000, "loadScaledTimeoutMs: load <8 → 1x (5000)");
+      assert(loadScaledTimeoutMs(5000, 8) === 10000, "loadScaledTimeoutMs: load 8–15 → 2x (10000)");
+      assert(loadScaledTimeoutMs(5000, 16) === 15000, "loadScaledTimeoutMs: load ≥16 → 3x (15000)");
+      assert(loadScaledTimeoutMs(5000, 200) === 15000, "loadScaledTimeoutMs: bounded (3x ceiling, can't grow unbounded)");
+      assert(getSystemLoad() >= 0, "getSystemLoad: non-negative on this machine");
+    } finally {
+      if (prevScaleOff2 === undefined) delete process.env.TASK_LOAD_SCALE_OFF;
+      else process.env.TASK_LOAD_SCALE_OFF = prevScaleOff2;
+    }
   }
 
   // repoNameFromUrl — mirrors swarm _detect_repo parsing (last segment, .git stripped)
