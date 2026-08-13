@@ -19,6 +19,13 @@
 // If a sub-agent appears stuck at a verifier gate, the bug is in gate
 // advancement or the silence threshold vs provider timeout — not the
 // enforcement itself.
+//
+// #201 (print-mode default): in non-interactive `pi -p` sessions (epic-executor
+// sub-agents, background workers) the DEFAULT mode is `warn` (never blocks) so
+// a verifier gate can't deadlock a worker that cannot dispatch reviewers.
+// Explicit AGENT_SEQUENCE_MODE / PI_ENFORCER_MODE / mode-file overrides still
+// force gate/strict in print; warn still tracks + advances + audits
+// (warn_blocked, timeout_park). See skills/enforcement/SKILL.md.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
@@ -37,7 +44,7 @@ const MODE_FILE = "/tmp/agent-sequence-mode";
 
 // ── Types ────────────────────────────────────────────
 
-interface Step {
+export interface Step {
   name: string;
   type: string;
   skill: string;
@@ -52,8 +59,15 @@ type Mode = "warn" | "gate" | "strict";
 
 // ── Loop bridge (#7040) ────────────────────────────
 
-const BRIDGE_DIR = join(homedir(), ".pi", "agent", "bridge");
-const BRIDGE_FILE = join(BRIDGE_DIR, "loop-sequence.json");
+let BRIDGE_DIR = join(homedir(), ".pi", "agent", "bridge");
+let BRIDGE_FILE = join(BRIDGE_DIR, "loop-sequence.json");
+// Test seam: redirect bridge writes away from the real ~/.pi bridge during
+// unit tests (honored only under NODE_ENV=test, mirrors review-enforcer).
+export function _setBridgeDirForTest(dir: string): void {
+  if (process.env.NODE_ENV !== "test") return;
+  BRIDGE_DIR = dir;
+  BRIDGE_FILE = join(dir, "loop-sequence.json");
+}
 
 function writeBridgeState() {
   const top = topSkill();
@@ -124,23 +138,36 @@ function findVerifierGateOwner(): SkillState | undefined {
 let sequenceTimeout: ReturnType<typeof setTimeout> | null = null;
 const SEQUENCE_TIMEOUT_MS = 10 * 60 * 1000;
 
+// #201: on 10-min idle, print-mode PARKS the skill (state preserved, timer
+// re-armed) instead of popping. Previously blocked-spam workers never timed
+// out at all (every blocked call re-armed the timer before validation) and a
+// fire discarded stepIndex + reviewers mid-stage. Interactive mode keeps the
+// established stale-cleanup pop.
+export function handleSequenceTimeout(): void {
+  const top = topSkill();
+  if (!top) return;
+  if (process.env.PI_MODE === "print") {
+    console.log(`[sequence-enforcer] ⏰ Sequence timeout — parking "${top.path}" at step ${top.stepIndex} (10min no tool calls) — state preserved`);
+    auditLog({ ts: new Date().toISOString(), event: "timeout_park", skill: top.path, step: top.stepIndex, mode: resolveMode() });
+    // park: keep stack/stepIndex/reviewers intact, re-arm the timer
+    sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
+    return;
+  }
+  console.log(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
+  // ponytail: pop only the stale skill, preserve parent (#7276)
+  skillStack.pop();
+  const parent = topSkill();
+  if (parent) {
+    console.log(`[sequence-enforcer] ↩ Restored parent: ${parent.path} (step ${parent.stepIndex}/${parent.steps.length})`);
+    writeBridgeState();
+  } else {
+    clearBridgeState();
+  }
+}
+
 function resetSequenceTimeout() {
   if (sequenceTimeout) clearTimeout(sequenceTimeout);
-  sequenceTimeout = setTimeout(() => {
-    const top = topSkill();
-    if (top) {
-      console.log(`[sequence-enforcer] ⏰ Sequence timeout — popping stale "${top.path}" (10min no tool calls)`);
-      // ponytail: pop only the stale skill, preserve parent (#7276)
-      skillStack.pop();
-      const parent = topSkill();
-      if (parent) {
-        console.log(`[sequence-enforcer] ↩ Restored parent: ${parent.path} (step ${parent.stepIndex}/${parent.steps.length})`);
-        writeBridgeState();
-      } else {
-        clearBridgeState();
-      }
-    }
-  }, SEQUENCE_TIMEOUT_MS);
+  sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
 }
 
 
@@ -153,19 +180,38 @@ function isKillSwitchActive(): boolean {
 
 // ── Mode ─────────────────────────────────────────────
 
-function resolveMode(): Mode {
-  const env = _getEnv("SEQUENCE_MODE") || process.env.PI_ENFORCER_MODE;
-  if (env === "warn" || env === "gate" || env === "strict") return env;
+// #201: print-aware default. Order is unchanged — explicit env → MODE_FILE →
+// fallback — but the fallback now branches on PI_MODE: `pi -p` sessions
+// (sub-agents, background workers) default to `warn` so a verifier gate can
+// never deadlock a worker; interactive sessions keep `gate`. Explicit
+// overrides always win — ops force gate/strict in print via env or file.
+// The env/modeFile params are test seams (mirrors repo-freshness exported
+// internals pattern); runtime callers use the defaults.
+export function resolveMode(
+  env: Record<string, string | undefined> = process.env,
+  modeFile: string = MODE_FILE,
+): Mode {
+  const envMode = (env.AGENT_SEQUENCE_MODE ?? env.ELDATO_SEQUENCE_MODE) || env.PI_ENFORCER_MODE;
+  if (envMode === "warn" || envMode === "gate" || envMode === "strict") return envMode;
   // ponytail: mode override via dedicated file (decoupled from kill switch)
   try {
-    const line = readFileSync(MODE_FILE, "utf-8").split("\n")[0]!.trim();
+    const line = readFileSync(modeFile, "utf-8").split("\n")[0]!.trim();
     if (line === "warn" || line === "gate" || line === "strict") return line;
   } catch { /* file doesn't exist or unreadable */ }
-  return "gate";
+  return env.PI_MODE === "print" ? "warn" : "gate";
 }
 // ── Audit logging ──────────────────────────────────
 
+// Test seam: tests inject a sink to capture entries without writing to the
+// real enforcement.jsonl (honored only under NODE_ENV=test).
+let auditSink: ((entry: Record<string, unknown>) => void) | null = null;
+export function _setAuditSinkForTest(sink: ((entry: Record<string, unknown>) => void) | null): void {
+  if (process.env.NODE_ENV !== "test") return;
+  auditSink = sink;
+}
+
 function auditLog(entry: Record<string, unknown>) {
+  if (auditSink) { auditSink(entry); return; }
   const auditPath = join(homedir(), ".pi", "agent", "audit", "enforcement.jsonl");
   try {
     mkdirSync(dirname(auditPath), { recursive: true });
@@ -313,7 +359,7 @@ function checkpointTokenOk(step: Step): { ok: boolean; reason: string } {
 
 // Constructive guidance for blocked tools — tells the agent what IS allowed
 // so they don't spin in circles after hitting a gate (#7459 follow-up).
-function gateGuidance(step: Step): string {
+export function gateGuidance(step: Step): string {
   const { allow } = getExpectedToolsForStep(step);
   if (allow.length === 0) return "";
   const gate = step.gate || "";
@@ -343,7 +389,7 @@ function announceGate(step: Step): void {
   console.log(`[sequence-enforcer] 🔒 Gate: ${gate} — ${guid.replace(/\n→ /g, ' | ')}`);
 }
 
-function getExpectedToolsForStep(step: Step): { allow: string[]; block: RegExp[] } {
+export function getExpectedToolsForStep(step: Step): { allow: string[]; block: RegExp[] } {
   const gate = step.gate || "";
 
   // auto: allow everything, block nothing
@@ -370,26 +416,71 @@ function getExpectedToolsForStep(step: Step): { allow: string[]; block: RegExp[]
   return { allow: [], block: [GIT_OP, DESTRUCTIVE_MCP] };
 }
 
-function validateToolCall(
+// #201: does this call satisfy gate-mode blocking semantics? Shared by gate
+// mode (actual block) and warn mode (would-block audit). allow-list wins —
+// prevents deadlock when a gate blocks its own resolution tools.
+function wouldBlockUnderGate(
+  toolName: string,
+  command: string,
+  expected: { allow: string[]; block: RegExp[] },
+): boolean {
+  if (expected.allow.length > 0 && expected.allow.includes(toolName)) return false;
+  const target = command || toolName;
+  for (const pattern of expected.block) {
+    if (pattern.test(target)) return true;
+  }
+  return false;
+}
+
+// #201: audit context for blocked/would-block entries — `allowed` lists the
+// permitted tools and `hint` carries gate guidance, so orchestrators reading
+// enforcement.jsonl can see WHY a worker is stuck and what the exit is.
+// `reason` is preserved from the original blocked entries (backward-compat).
+function blockAuditEntry(event: string, toolName: string, step: Step, mode: Mode, reason = ""): Record<string, unknown> {
+  const expected = getExpectedToolsForStep(step);
+  return {
+    ts: new Date().toISOString(),
+    event,
+    skill: topSkill()?.path,
+    step: step.name,
+    tool: toolName,
+    mode,
+    reason,
+    allowed: expected.allow,
+    hint: gateGuidance(step),
+  };
+}
+
+export function validateToolCall(
   toolName: string, command: string, step: Step, mode: Mode,
 ): { block: boolean; reason?: string } {
+  // checkpoint gate (issue #5039): fail-closed token validation. A missing,
+  // stale, wrong-phase, non-CLEAR, or corrupt token blocks the step entirely
+  // (retry + operator override are the documented escape). Computed up front
+  // so warn mode can audit would-block for checkpoint steps too.
+  const checkpoint = step.gate === "checkpoint" ? checkpointTokenOk(step) : null;
+
   if (mode === "warn") {
+    // #201: audit warn_blocked ONLY when the call would have been blocked
+    // under gate mode — gives orchestrators the "worker passed a gate that
+    // would have blocked it" signal without per-call spam.
+    const wouldBlock = checkpoint
+      ? !checkpoint.ok
+      : wouldBlockUnderGate(toolName, command, getExpectedToolsForStep(step));
     console.log(
-      `[sequence-enforcer] ⚠️ warn: ${toolName} | step="${step.name}" gate="${step.gate || "none"}"`,
+      `[sequence-enforcer] ⚠️ warn: ${toolName} | step="${step.name}" gate="${step.gate || "none"}"${wouldBlock ? " — would block under gate mode" : ""}`,
     );
+    if (wouldBlock) {
+      auditLog(blockAuditEntry("warn_blocked", toolName, step, mode, `would block under gate mode (gate: ${step.gate || "none"})`));
+      const guidance = gateGuidance(step);
+      if (guidance) console.log(`[sequence-enforcer] ${guidance.replace(/\n/g, "\n[sequence-enforcer] ")}`);
+    }
     return { block: false };
   }
 
-  // checkpoint gate (issue #5039): fail-closed token validation. A missing,
-  // stale, wrong-phase, non-CLEAR, or corrupt token blocks the step entirely
-  // (retry + operator override are the documented escape).
-  if (step.gate === "checkpoint") {
-    const t = checkpointTokenOk(step);
-    if (!t.ok) {
-      auditLog({ ts: new Date().toISOString(), event: "blocked", skill: topSkill()?.path, step: step?.name, tool: toolName, mode, reason: t.reason });
-      return { block: true, reason: t.reason };
-    }
-    return { block: false };
+  if (checkpoint && !checkpoint.ok) {
+    auditLog(blockAuditEntry("blocked", toolName, step, mode, checkpoint.reason));
+    return { block: true, reason: checkpoint.reason };
   }
 
   const expected = getExpectedToolsForStep(step);
@@ -407,7 +498,7 @@ function validateToolCall(
     }
     if (expected.allow.length > 0 && !expected.allow.includes(toolName)) {
       const reason = `⛔ strict — step "${step.name}" (gate: ${step.gate}) only allows: ${expected.allow.join(", ")}`;
-      auditLog({ ts: new Date().toISOString(), event: "blocked", skill: topSkill()?.path, step: step?.name, tool: toolName, mode, reason });
+      auditLog(blockAuditEntry("blocked", toolName, step, mode, reason));
       return {
         block: true,
         reason,
@@ -416,24 +507,35 @@ function validateToolCall(
     return { block: false };
   }
 
-  // gate mode: check allow-list first, then block destructive ops
-  // allow-list takes precedence — prevents deadlock when gate blocks its own resolution tools
-  if (expected.allow.length > 0 && expected.allow.includes(toolName)) {
-    return { block: false };
-  }
-  for (const pattern of expected.block) {
-    const target = command || toolName;
-    if (pattern.test(target)) {
-      const reason = `⛔ gate — step "${step.name}" (gate: ${step.gate}) blocks this operation`;
-      auditLog({ ts: new Date().toISOString(), event: "blocked", skill: topSkill()?.path, step: step?.name, tool: toolName, mode, reason });
-      return {
-        block: true,
-        reason,
-      };
-    }
+  // gate mode: allow-list takes precedence, then destructive blocking
+  if (wouldBlockUnderGate(toolName, command, expected)) {
+    const reason = `⛔ gate — step "${step.name}" (gate: ${step.gate}) blocks this operation`;
+    auditLog(blockAuditEntry("blocked", toolName, step, mode, reason));
+    return {
+      block: true,
+      reason,
+    };
   }
 
   return { block: false };
+}
+
+// ── Test seams (honored only under NODE_ENV=test) ─────
+
+export function _pushSkillForTest(path: string, steps: Step[], stepIndex = 0): void {
+  if (process.env.NODE_ENV !== "test") return;
+  skillStack.push({ path, steps, stepIndex, stepStartedAt: Date.now(), reviewers: new Map() });
+}
+
+export function _stackForTest(): SkillState[] {
+  return process.env.NODE_ENV === "test" ? skillStack : [];
+}
+
+export function _resetStateForTest(): void {
+  if (process.env.NODE_ENV !== "test") return;
+  skillStack = [];
+  stepCache.clear();
+  if (sequenceTimeout) { clearTimeout(sequenceTimeout); sequenceTimeout = null; }
 }
 
 // ── Extension ────────────────────────────────────────
@@ -601,8 +703,9 @@ export default function (pi: ExtensionAPI) {
         .map((s, i) => i === top.stepIndex ? `[${s.name}]` : s.name)
         .join(" → ");
       console.log(`[sequence-enforcer] 🚫 Blocked ${toolName}: ${result.reason}`);
-      auditLog({ ts: new Date().toISOString(), event: "blocked", skill: top.path, step: step.name, tool: toolName, mode, reason: result.reason });
       const guidance = gateGuidance(step);
+      // #201: enrich handler-side audit with allowed/hint gate context
+      auditLog({ ts: new Date().toISOString(), event: "blocked", skill: top.path, step: step.name, tool: toolName, mode, reason: result.reason, allowed: getExpectedToolsForStep(step).allow, hint: guidance });
       return {
         block: true,
         reason: `${result.reason}\n  → Sequence: ${trail}${guidance ? "\n" + guidance : ""}`,
