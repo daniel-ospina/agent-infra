@@ -202,11 +202,12 @@ export default function (pi: ExtensionAPI) {
   // declares the session complete. The marker MUST go out first — it is what
   // lets the parent rescue a completed child stuck in cleanup (MCP disconnect
   // timeouts never drain the event loop) instead of hanging the tool call.
-  // Ordering note: print-mode flushes the final stdout write AFTER dispose()
-  // (finally: await disposeRuntime(); await flushRawStdout();) so the marker
-  // can reach the parent slightly BEFORE the last stdout bytes. That skew is
-  // harmless — the parent composes the result on process close, which happens
-  // at least the exit grace after the marker, by which time stdout is complete.
+  // Ordering note (corrected, review #250 P2): print-mode ISSUES the final
+  // stdout write in the try block (text-mode output after the prompt loop)
+  // BEFORE the finally runs disposeRuntime() → session_shutdown — so the
+  // parent's pipe receives stdout bytes FIRST, the marker SECOND, and the
+  // process close LAST. The parent composes on close (after both), so the
+  // ordering is safe by construction — no skew to manage.
   pi.on("session_shutdown", async () => {
     emit(formatSessionEnd(nonce));
     if (tickTimer) {

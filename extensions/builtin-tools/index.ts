@@ -443,7 +443,15 @@ export function composeTaskResult(
     .slice(-4000);
   const stdout = i.stdout.trim();
   const cleanExitSuccess = i.exitCode === 0 && stdout;
-  if ((i.sessionEnded || cleanExitSuccess) && stdout) {
+  // #191 review P1: sessionEnded alone is NOT success — the session_end
+  // marker fires on EVERY teardown, including error exits (print mode emits
+  // it from dispose() in the finally even when stopReason === "error" set
+  // exitCode = 1). Gate on the exit status: 0 = clean; null = signal death,
+  // which post-sessionEnded only comes from the completion/exit watchdogs
+  // (the #191 rescue). A forged marker on a real failure (non-zero exit)
+  // therefore lands in the failure branch.
+  const okExit = i.exitCode === 0 || i.exitCode === null;
+  if (((i.sessionEnded && okExit) || cleanExitSuccess) && stdout) {
     const details: Record<string, unknown> = { model: i.model, provider: i.provider };
     if (i.killedAfterCompletion) {
       details.killedAfterCompletion = true;

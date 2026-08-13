@@ -10,7 +10,7 @@
 import { spawn } from "node:child_process";
 import { ok, equal } from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
@@ -143,8 +143,11 @@ tests.push(test("E4 (#176): 70s silent tool call survives the 60s silence thresh
 // 30-min silence kill ("Partial results" headlines).
 tests.push(test("E1 (#191): completed nested task dispatch returns success (completion grace watchdog)", async () => {
   const liveEmitter = join(homedir(), ".pi", "agent", "extensions", "task-heartbeat.ts");
-  if (!existsSync(liveEmitter)) {
-    throw new SkipError(`live farm lacks the emitter (${liveEmitter}) — run T5 wiring`);
+  // Review P1: content-aware precheck — the LIVE farm may lag the branch (the
+  // file can exist with the OLD emitter); a run against zero lines of the new
+  // code must be SKIPPED, never green.
+  if (!existsSync(liveEmitter) || !readFileSync(liveEmitter, "utf-8").includes("session_end")) {
+    throw new SkipError(`live farm lacks the #191 session_end emitter (${liveEmitter}) — deploy the branch first`);
   }
   const marker = `DONE_191_${randomUUID().slice(0, 8)}`;
   const prompt =

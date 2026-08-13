@@ -662,9 +662,18 @@ test("completed session + watchdog kill → success with stdout + killedAfterCom
   ok((r.details.stderr as string).includes("Disconnect from 'exa'"), "stderr moves to details.stderr (diagnostics)");
 });
 
-test("completed session + watchdog kill with numeric exitCode → exitCode carried", () => {
-  const r = composeTaskResult(ctr({ exitCode: 1, killedAfterCompletion: true }));
-  equal(r.details.exitCode, 1);
+test("sessionEnded + NON-ZERO exitCode → FAILURE branch (review P1: marker fires on error teardowns too)", () => {
+  const r = composeTaskResult(ctr({ exitCode: 1, killedAfterCompletion: true, stdout: "partial output" }));
+  equal(r.content[0].text.includes("completed output"), false, "not misclassified as success");
+  ok((r.content[0].text as string).includes("partial output"), "partial stdout preserved in the failure payload");
+  equal(r.details.exitCode, 1, "exit code surfaced");
+  equal(r.details.killedAfterCompletion, true, "watchdog kill still reported");
+});
+
+test("sessionEnded + null exitCode (watchdog signal death) → success (the #191 rescue)", () => {
+  const r = composeTaskResult(ctr({ exitCode: null, killedAfterCompletion: true }));
+  equal(r.content[0].text, "completed output", "signal-death after completion is success");
+  equal(r.details.exitCode, undefined, "null exitCode omitted");
 });
 
 test("completed session + natural exit within grace → success WITHOUT kill details", () => {
