@@ -582,6 +582,69 @@ async function main() {
     equal(res2, undefined, "standalone PASS with deviant prompt merges the blocked diff (context retained)");
     git(repo, "commit -m c18c");
   });
+
+  // ── #204: gh pr merge scope — cross-repo skip + same-repo status quo ──
+  // The misfire: computeBranchDiff(cwd) computed the session cwd's branch
+  // drift for a REMOTE merge (a merge that touches no local files). Each
+  // scenario uses a dedicated temp repo with an origin remote + a drift ref so
+  // the OLD behavior would block; the new behavior must skip (cross-repo,
+  // network-free) or keep status quo (same-repo head-fail → fail-closed).
+
+  test("scenario 19 (#204): cross-repo gh pr merge skips verification (network-free, no block)", async () => {
+    const repoA = join(TEST_ROOT, "repo-merge-a");
+    mkdirSync(repoA, { recursive: true });
+    git(repoA, "init -b main");
+    git(repoA, "config user.email e2e@test");
+    git(repoA, "config user.name e2e");
+    writeFileSync(join(repoA, "base.txt"), "b\n");
+    git(repoA, "add base.txt");
+    git(repoA, "commit -m base");
+    const baseSha = git(repoA, "rev-parse HEAD");
+    git(repoA, "remote add origin git@github.com:e2e/self.git");
+    // Drift: HEAD moves past origin/main — the old gate would block on this
+    // residue for a merge that touches nothing locally.
+    writeFileSync(join(repoA, "drift.txt"), "d\n");
+    git(repoA, "add drift.txt");
+    git(repoA, "commit -m drift");
+    git(repoA, `update-ref refs/remotes/origin/main ${baseSha}`);
+    await fire("session_start", {});
+    // Explicit --repo targets a DIFFERENT repo than the cwd origin → nothing
+    // local represents the PR → skip BEFORE computeBranchDiff. Decidable with
+    // zero network: no gh call, no verifier dispatch, no bridge writes.
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "gh pr merge 123 --repo other/owner", cwd: repoA },
+    });
+    equal(res, undefined, "cross-repo merge must not block on local drift residue");
+  });
+
+  test("scenario 20 (#204): same-repo merge with failing head check keeps status quo (fail-closed block)", async () => {
+    const repoB = join(TEST_ROOT, "repo-merge-b");
+    mkdirSync(repoB, { recursive: true });
+    git(repoB, "init -b main");
+    git(repoB, "config user.email e2e@test");
+    git(repoB, "config user.name e2e");
+    writeFileSync(join(repoB, "base.txt"), "b\n");
+    git(repoB, "add base.txt");
+    git(repoB, "commit -m base");
+    const baseSha = git(repoB, "rev-parse HEAD");
+    git(repoB, "remote add origin git@github.com:e2e/self.git");
+    writeFileSync(join(repoB, "drift.txt"), "d\n");
+    git(repoB, "add drift.txt");
+    git(repoB, "commit -m drift");
+    git(repoB, `update-ref refs/remotes/origin/main ${baseSha}`);
+    await fire("session_start", {});
+    // No --repo/GH_REPO → same-repo path → the gh head check runs; in this
+    // sandbox gh cannot resolve PR 123 (no network/auth, e2e/self is not a
+    // real repo) → prHead unknown → fail-closed: computeBranchDiff + block on
+    // the drift file, exactly as today.
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "gh pr merge 123", cwd: repoB },
+    });
+    ok(res && res.block === true, "same-repo merge with unknown PR head must block on drift (status quo)");
+    ok(res.reason.includes("drift.txt"), "block reason names the drift file");
+  });
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()
