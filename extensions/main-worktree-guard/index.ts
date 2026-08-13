@@ -20,7 +20,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import { resolve, dirname } from "node:path";
+import { resolve, dirname, join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { isAllowMarkerValid } from "./classify-git.mjs";
+import { homedir } from "node:os";
 import { realpathSync, existsSync } from "node:fs";
 
 // Shared destructive-git rules (also used by test.mjs). If the import ever
@@ -50,8 +53,46 @@ try {
 function _getEnv(name: string): string | undefined {
   return process.env[`AGENT_${name}`] ?? process.env[`ELDATO_${name}`];
 }
+// ── TTL'd file-based escape marker (#207) ─────────────────────
+// The env hatch (AGENT_ALLOW_MAIN_EDITS=1) cannot be set on a RUNNING pi
+// process — a stranded main checkout was unrecoverable by agents until a
+// human intervened in a terminal. A deliberate solo session can now grant
+// itself the same bypass for a bounded window by creating a marker file:
+//
+//   touch ~/.pi/agent/.allow-main-edits
+//
+// The marker is TTL'd (default 15 min), re-read on every tool_call (never
+// cached), and never applies to parallel sessions automatically. Creation is
+// logged with a reason when the reason is provided (marker content = reason).
+const ALLOW_MARKER_DEFAULT = join(homedir(), ".pi", "agent", ".allow-main-edits");
+const ALLOW_MARKER_TTL_MS = 15 * 60_000;
+
+function _allowMarkerPath(): string {
+  return process.env.ALLOW_MAIN_EDITS_MARKER || ALLOW_MARKER_DEFAULT;
+}
+
+/** Marker valid when the file exists, is a regular file, and is younger than
+ * the TTL. Re-reads on every call — expiry is checked per tool_call, never
+ * cached (pure check in classify-git.mjs, shared with test.mjs, #207). */
+function _isAllowMarkerValid(): boolean {
+  return isAllowMarkerValid(_allowMarkerPath(), Date.now(), ALLOW_MARKER_TTL_MS);
+}
+
+/** Marker creation with an audit trail: the marker's content carries the
+ * reason; the session log announces it once. Returns the marker path. */
+export function createAllowMarker(reason = "deliberate solo session"): string {
+  const path = _allowMarkerPath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${reason} (${new Date().toISOString()})
+`, "utf-8");
+  console.log(
+    `[main-worktree-guard] ⏳ Escape marker created: ${path} (TTL ${ALLOW_MARKER_TTL_MS / 60_000}min, reason: ${reason})`,
+  );
+  return path;
+}
+
 function _isAllowMainEdits(): boolean {
-  return _getEnv("ALLOW_MAIN_EDITS") === "1";
+  return _getEnv("ALLOW_MAIN_EDITS") === "1" || _isAllowMarkerValid();
 }
 // Detect if running inside agent-infra's own repo (skip worktree enforcement).
 // Implemented in classify-git.mjs (#99): env-var match (AGENT_INFRA_PATH /

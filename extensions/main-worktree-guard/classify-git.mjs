@@ -3,7 +3,7 @@
 
 import { execSync } from "node:child_process";
 import { resolve, join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 
 //
 // Purpose: in the SHARED main checkout, branch-state-changing git operations
@@ -40,6 +40,21 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "restore", re: /\bgit\s+restore\b/ },
   { name: "stash-pop", re: /\bgit\s+stash\s+(pop|apply|drop|clear)\b/ },
 ];
+
+/**
+ * #207: pure TTL check for the file-based escape marker. Valid when the path
+ * is a REGULAR FILE (directories/symlink targets never count — traversal
+ * guard) younger than the TTL. `now`/`ttlMs` overridable for tests.
+ */
+export function isAllowMarkerValid(markerPath, now = Date.now(), ttlMs = 15 * 60_000) {
+  try {
+    const st = statSync(markerPath);
+    if (!st.isFile()) return false; // dirs/symlinks-to-dirs are not markers
+    return now - st.mtimeMs <= ttlMs;
+  } catch {
+    return false; // absent/unreadable → not allowed (fail-closed)
+  }
+}
 
 /**
  * Classify a shell command for main-checkout safety.
