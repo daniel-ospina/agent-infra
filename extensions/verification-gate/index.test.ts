@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow } from "./index.js";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 
 let passed = 0;
@@ -332,6 +332,11 @@ test("detects gh pr merge", () => {
   ok(isGitOp("gh pr merge 123 --squash"));
 });
 
+test("detects gh pr merge with global -R/--repo flag before the verb (P2-1 fix)", () => {
+  ok(isGitOp("gh -R owner/name pr merge 123"));
+  ok(isGitOp("gh --repo owner/name pr merge 123"));
+});
+
 test("detects git commit at start of line with prefix", () => {
   ok(isGitOp("cd /tmp && git commit -m 'test'"));
 });
@@ -470,6 +475,20 @@ test("returns null for non-cd command", () => {
 test("returns null for cd without git op suffix", () => {
   // The regex requires && or ; after the cd path to avoid false positives
   equal(extractCdPath("cd /tmp"), null);
+});
+
+test("cd inside quoted prose does not poison cwd (P2-2 fix)", () => {
+  equal(extractCdPath('gh pr merge 1 --comment "see cd /tmp && x"'), null);
+  equal(extractCdPath("git commit -m 'run cd /tmp && fix'"), null);
+});
+
+test("cd after a command separator is still detected (P2-2 fix)", () => {
+  ok(extractCdPath("echo x && cd /tmp && git commit")!.endsWith("/tmp"));
+  ok(extractCdPath("cd /a && cd /b && git commit")!.endsWith("/a")); // first boundary-anchored cd wins
+});
+
+test("cd after a bare newline separator is detected (cycle-4 P2-1 fix)", () => {
+  ok(extractCdPath("echo hello\ncd /tmp && git commit")!.endsWith("/tmp"));
 });
 
 // ── Module load regression ───────────────────────────
@@ -772,6 +791,297 @@ test("VGATE PASS overwrites even when path not in lastBlockedFiles", () => {
   equal(merged, 1, "known path must merge even with empty lastBlockedFiles");
   equal(skipped, 0);
   equal(vs.get("/proj::src/a.ts"), "H2");
+});
+
+// ── Results ───────────────────────────────────────────
+
+// ── #204: gh pr merge scope — PR repo resolution ─────
+
+section("extractRepoFlag / extractGhRepoEnv — PR repo resolution (#204)");
+
+test("extractRepoFlag: --repo owner/name", () => {
+  equal(extractRepoFlag("gh pr merge 123 --repo acme/widget"), "acme/widget");
+});
+
+test("extractRepoFlag: -R owner/name", () => {
+  equal(extractRepoFlag("gh pr merge 123 -R acme/widget --squash"), "acme/widget");
+});
+
+test("extractRepoFlag: --repo=owner/name (equals form)", () => {
+  equal(extractRepoFlag("gh pr merge 123 --repo=acme/widget"), "acme/widget");
+});
+
+test("extractRepoFlag: absent → null", () => {
+  equal(extractRepoFlag("gh pr merge 123"), null);
+});
+
+test("extractRepoFlag: does not match git remote args", () => {
+  equal(extractRepoFlag("git remote add origin git@github.com:a/b.git"), null);
+});
+
+test("extractGhRepoEnv: GH_REPO=owner/name prefix", () => {
+  equal(extractGhRepoEnv("GH_REPO=acme/widget gh pr merge 123"), "acme/widget");
+});
+
+test("extractGhRepoEnv: absent → null", () => {
+  equal(extractGhRepoEnv("gh pr merge 123"), null);
+});
+
+test("repo priority: flag beats env when both present", () => {
+  const command = "GH_REPO=env/repo gh pr merge 123 --repo flag/repo";
+  const flag = extractRepoFlag(command);
+  const env = extractGhRepoEnv(command);
+  const resolved = flag ?? env;
+  equal(resolved, "flag/repo", "flag must take priority over env");
+});
+
+// ── #204: repoNameFromRemote URL forms ────────────────
+
+section("repoNameFromRemote — origin URL parsing (#204)");
+
+test("SSH form git@github.com:owner/name.git", () => {
+  equal(repoNameFromRemote("git@github.com:acme/widget.git"), "acme/widget");
+});
+
+test("SSH form without .git suffix", () => {
+  equal(repoNameFromRemote("git@github.com:acme/widget"), "acme/widget");
+});
+
+test("HTTPS form https://github.com/owner/name.git", () => {
+  equal(repoNameFromRemote("https://github.com/acme/widget.git"), "acme/widget");
+});
+
+test("git:// form", () => {
+  equal(repoNameFromRemote("git://github.com/acme/widget.git"), "acme/widget");
+});
+
+test("ssh://git@ with colon separator", () => {
+  equal(repoNameFromRemote("ssh://git@github.com:acme/widget.git"), "acme/widget");
+});
+
+test("HTTPS with port", () => {
+  equal(repoNameFromRemote("https://github.com:8443/acme/widget.git"), "acme/widget");
+});
+
+test("HTTPS with credentials", () => {
+  equal(repoNameFromRemote("https://user@github.com/acme/widget.git"), "acme/widget");
+});
+
+test("non-GitHub host parses (host-agnostic)", () => {
+  equal(repoNameFromRemote("git@gitlab.com:acme/widget.git"), "acme/widget");
+});
+
+test("garbage / empty → null (fail-closed)", () => {
+  equal(repoNameFromRemote(""), null);
+  equal(repoNameFromRemote("not a url"), null);
+});
+
+test("trailing slash / .git forms never yield a garbage identity (P2 fix)", () => {
+  equal(repoNameFromRemote("git@github.com:a/b.git/"), "a/b");
+  equal(repoNameFromRemote("https://github.com/a/b.git/"), "a/b");
+  equal(repoNameFromRemote("git@github.com:a/b/"), "a/b");
+});
+
+test("local path remote → null (fail-closed, no accidental skip)", () => {
+  equal(repoNameFromRemote("/tmp/some/repo.git"), null);
+  equal(repoNameFromRemote("relative/path"), null);
+});
+
+// ── #204: extractPrNumber ─────────────────────────────
+
+section("extractPrNumber — PR number from merge command (#204)");
+
+test("extracts PR number from gh pr merge", () => {
+  equal(extractPrNumber("gh pr merge 123 --squash"), 123);
+});
+
+test("extracts PR number after cd prefix", () => {
+  equal(extractPrNumber("cd /wt && gh pr merge 42"), 42);
+});
+
+test("extracts PR number when flags precede the number (P2 fix: gh pr merge --squash 123)", () => {
+  equal(extractPrNumber("gh pr merge --squash 123"), 123);
+});
+
+test("extracts PR number with flags + cd prefix in either order", () => {
+  equal(extractPrNumber("cd /wt && gh pr merge --repo x/y 42"), 42);
+  equal(extractPrNumber("gh pr merge -R x/y --squash 7"), 7);
+});
+
+test("extracts PR number with global -R flag before the verb (P2-1 fix)", () => {
+  equal(extractPrNumber("gh -R owner/name pr merge 123"), 123);
+  equal(extractPrNumber("GH_REPO=a/b gh --repo=owner/name pr merge 456"), 456);
+});
+
+test("does not mistake flag values for the PR number", () => {
+  // --repo owner/name never tokenizes as a bare integer.
+  equal(extractPrNumber("gh pr merge --repo 123/owner"), null);
+});
+
+// ── #204: verb-anchored merge detection + command window ─
+
+section("isMergeCommand / mergeCommandWindow — verb-anchored merge scoping (#204 P2 fixes)");
+
+test("isMergeCommand: true for plain merge", () => {
+  equal(isMergeCommand("gh pr merge 123 --squash"), true);
+});
+
+test("isMergeCommand: true after cd && prefix and inline env", () => {
+  equal(isMergeCommand("cd /wt && gh pr merge 42"), true);
+  equal(isMergeCommand("GH_REPO=x/y gh pr merge 42"), true);
+  equal(isMergeCommand("cd /a && cd /b && GH_REPO=x/y gh pr merge 42"), true);
+});
+
+test("isMergeCommand: true with global -R/--repo before the verb (P2-1 fix)", () => {
+  equal(isMergeCommand("gh -R owner/name pr merge 123"), true);
+  equal(isMergeCommand("gh --repo=owner/name pr merge 123"), true);
+  equal(isMergeCommand("GH_REPO=a/b gh -R owner/name pr merge 123"), true);
+});
+
+test("isMergeCommand: false when the merge verb is quoted prose in a create body (P2-2 regression)", () => {
+  equal(isMergeCommand('gh pr create --body "run gh pr merge 42 now"'), false);
+  equal(isMergeCommand("gh pr create --title 'gh pr merge 7'"), false);
+});
+
+test("isMergeCommand: false for non-merge commands", () => {
+  equal(isMergeCommand("gh pr create --title x"), false);
+  equal(isMergeCommand("git commit -m x"), false);
+  equal(isMergeCommand("gh pr merge-queue 1"), false);
+});
+
+test("isMergeCommand: chained merge is fail-closed (not detected as merge → status quo verify)", () => {
+  equal(isMergeCommand("gh issue create --repo x/y && gh pr merge 123"), false);
+});
+
+test("mergeCommandWindow: keeps the merge's own --repo flag", () => {
+  ok(mergeCommandWindow("gh pr merge 123 --repo other/owner").includes("--repo other/owner"));
+});
+
+test("mergeCommandWindow: quoted prose --repo is stripped (P2-1 regression)", () => {
+  const w = mergeCommandWindow('gh pr merge 123 --comment "see --repo fake/x docs"');
+  equal(w.includes("--repo fake/x"), false, "--repo inside quotes must not reach the flag scan");
+  ok(w.includes("--comment"), "the merge's own flags remain");
+});
+
+test("mergeCommandWindow: chained command's --repo is excluded (P2-1 regression)", () => {
+  const w = mergeCommandWindow("gh pr merge 123 && gh pr create --repo other/x");
+  equal(w.includes("other/x"), false, "chained command's repo flag must not decide this merge's scope");
+});
+
+test("mergeCommandWindow: pre-merge chained --repo is excluded", () => {
+  const w = mergeCommandWindow("gh issue create --repo x/y && gh pr merge 123");
+  equal(w.includes("--repo x/y"), false);
+  equal(w.includes("gh pr merge"), true);
+});
+
+test("mergeCommandWindow: keeps GH_REPO= env prefix and global -R flag", () => {
+  ok(mergeCommandWindow("GH_REPO=a/b gh pr merge 123").includes("GH_REPO=a/b"));
+  ok(mergeCommandWindow("gh -R owner/name pr merge 123").includes("-R owner/name"));
+});
+
+test("extractPrNumber composes with mergeCommandWindow: chained-tail integers never misread as the PR number (cycle-4 P2-2 fix)", () => {
+  // resolveMergeScope feeds the window to extractPrNumber; the window cuts the
+  // tail at the first command separator, so `|| exit 1` never supplies a number.
+  equal(extractPrNumber(mergeCommandWindow("gh pr merge --squash || exit 1")), null);
+  equal(extractPrNumber(mergeCommandWindow("gh pr merge -s -d; exit 1")), null);
+  equal(extractPrNumber(mergeCommandWindow("gh pr merge 123 --squash || exit 1")), 123, "the merge's OWN number still wins");
+});
+
+
+test("null when no number or not a merge", () => {
+  equal(extractPrNumber("gh pr merge"), null);
+  equal(extractPrNumber("gh pr create --title x"), null);
+});
+
+// ── #204: evaluateMergeScope 4-combo decision table ───
+
+section("evaluateMergeScope — merge-scope decision table (#204)");
+
+test("cross_repo: explicit repo ≠ cwd repo → skip, heads irrelevant", () => {
+  const d = evaluateMergeScope("acme/self", "acme/other", "HEAD1", "HEAD2");
+  equal(d.verify, false);
+  equal(d.reason, "cross_repo");
+});
+
+test("cross_repo: even when heads happen to match", () => {
+  const d = evaluateMergeScope("acme/self", "acme/other", "HEAD1", "HEAD1");
+  equal(d.verify, false);
+  equal(d.reason, "cross_repo");
+});
+
+test("same-repo head match → verify (worktree merge, no regression)", () => {
+  const d = evaluateMergeScope("acme/self", "acme/self", "HEAD1", "HEAD1");
+  equal(d.verify, true);
+  equal(d.reason, "same_repo_head_match");
+});
+
+test("same-repo, no explicit repo, head match → verify", () => {
+  const d = evaluateMergeScope("acme/self", null, "HEAD1", "HEAD1");
+  equal(d.verify, true);
+  equal(d.reason, "same_repo_head_match");
+});
+
+test("head_mismatch: same-repo stale checkout → skip", () => {
+  const d = evaluateMergeScope("acme/self", null, "STALE", "PRHEAD");
+  equal(d.verify, false);
+  equal(d.reason, "head_mismatch");
+});
+
+test("head_mismatch: explicit repo == cwd repo, stale checkout → skip", () => {
+  const d = evaluateMergeScope("acme/self", "acme/self", "STALE", "PRHEAD");
+  equal(d.verify, false);
+  equal(d.reason, "head_mismatch");
+});
+
+test("fail-closed: prHead unknown (gh/network failed) → verify, status quo", () => {
+  const d = evaluateMergeScope("acme/self", null, "STALE", null);
+  equal(d.verify, true);
+  equal(d.reason, "same_repo_head_unknown");
+});
+
+test("fail-closed: localHead unknown → verify", () => {
+  const d = evaluateMergeScope("acme/self", null, null, "PRHEAD");
+  equal(d.verify, true);
+  equal(d.reason, "same_repo_head_unknown");
+});
+
+test("fail-closed: unparseable cwdRepo never skips on REPO grounds", () => {
+  // Unknown head + unparseable origin → verify (never an accidental
+  // cross_repo skip). Known heads may still disagree → head_mismatch is an
+  // independent, legitimate ground.
+  const repoGround = evaluateMergeScope(null, "acme/other", "STALE", null);
+  equal(repoGround.verify, true, "unparseable origin + unknown head must verify");
+  equal(repoGround.reason, "same_repo_head_unknown");
+  const headGround = evaluateMergeScope(null, "acme/other", "STALE", "PRHEAD");
+  equal(headGround.reason, "head_mismatch", "known-head disagreement is still a valid skip ground");
+});
+
+test("repo identity comparison is case-insensitive (P2 fix)", () => {
+  const d = evaluateMergeScope("Acme/Widget", "acme/widget", "HEAD1", "HEAD1");
+  equal(d.verify, true, "GitHub repo names are case-insensitive — must not false-skip");
+  equal(d.reason, "same_repo_head_match");
+  const envCase = evaluateMergeScope("acme/widget", "ACME/WIDGET", "HEAD1", "HEAD1");
+  equal(envCase.verify, true);
+});
+
+test("repo identity comparison tolerates .git / trailing-slash drift (P2 fix)", () => {
+  const d = evaluateMergeScope("acme/widget.git", "acme/widget", "HEAD1", "HEAD1");
+  equal(d.verify, true);
+  const slash = evaluateMergeScope("acme/widget", "acme/widget/", "HEAD1", "HEAD1");
+  equal(slash.verify, true);
+});
+
+test("evaluateMergeScope never returns undefined for any input shape", () => {
+  const inputs: [string | null, string | null, string | null, string | null][] = [
+    [null, null, null, null],
+    [null, "a/b", null, null],
+    ["a/b", null, null, null],
+    ["a/b", "a/b", "X", "X"],
+  ];
+  for (const [cwdRepo, explicitRepo, localHead, prHead] of inputs) {
+    const d = evaluateMergeScope(cwdRepo, explicitRepo, localHead, prHead);
+    ok(d && typeof d.verify === "boolean" && typeof d.reason === "string", "must always return a decision");
+  }
 });
 
 // ── Results ───────────────────────────────────────────
