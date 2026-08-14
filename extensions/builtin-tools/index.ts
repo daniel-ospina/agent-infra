@@ -1641,8 +1641,12 @@ export default function (pi: ExtensionAPI) {
   PATH: augmentedPath,
   PI_SKIP_VERSION_CHECK: "1",
   // Skip extensions sub-agents never need (one-shot, no git/slack/loops/vision).
-  // Gate overrides: sub-agents can't dispatch `task` to satisfy verification-gate
-  // or review-enforcer → deadlock → 480s hang. Parent session enforces gates centrally.
+  // Gate overrides: review DISPATCH stays parent-enforced (#825) — a sub-agent
+  // must never self-satisfy the review-enforcer; the parent runs the review
+  // ceremony for the PR as a whole. VGATE is deliberately NOT bypassed (#825):
+  // the sub-agent inherits the parent's verified-file registry via the bridge
+  // file, and commits on unverified files are blocked with a report-to-parent
+  // message. Do NOT re-add ELDATO_SKIP_VGATE here.
   SKILL_ENFORCER_DISABLED: "1",
   LOOP_ENFORCER_DISABLED: "1",
   // #172: declare print mode so extension startup diagnostics stay silent in
@@ -1659,8 +1663,15 @@ export default function (pi: ExtensionAPI) {
   VISION_INTERCEPTOR_DISABLED: "1",
   ELDATO_ALLOW_MAIN_EDITS: "1",  // dual-support: also set AGENT_ variant (#7549)
   AGENT_ALLOW_MAIN_EDITS: "1",
-  ELDATO_SKIP_VGATE: "1",        // sub-agents lack `task` tool; parent enforces gates
-  AGENT_SKIP_REVIEW_GATE: "1",   // sub-agents lack `task` tool; parent enforces gates
+  // #825: NO ELDATO_SKIP_VGATE injection. The sub-agent runs with the
+  // verification-gate ACTIVE and inherits the parent's verified-file registry
+  // via the bridge (~/.pi/agent/verification/latest.json, worktree-scoped
+  // compound keys): commits on parent-verified files pass; commits on
+  // unverified files are blocked and the sub-agent reports back to the parent,
+  // which verifies and re-dispatches (or lands the change itself).
+  AGENT_SKIP_REVIEW_GATE: "1",   // review DISPATCH stays parent-enforced (#825):
+                                 // sub-agents don't run the parent's review
+                                 // ceremony; the parent dispatches reviewers.
 };
       if (params.mcp_servers) {
         subAgentEnv.PI_MCP_SERVERS = params.mcp_servers;

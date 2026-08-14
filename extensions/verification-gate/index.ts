@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
-import { isPrintMode } from "../shared/print-mode.js";
+import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
 // ponytail: inlined from verification-gate-utils.ts — pi's extension loader treats every .ts in
 // ~/.pi/agent/extensions/ as an extension and fails on a pure-helper module (no factory export).
 // Do NOT re-extract to a sibling .ts; the directory+entry pattern (see main-worktree-guard) is the
@@ -961,19 +961,26 @@ export default function (pi: ExtensionAPI) {
     // #7591: auto-bypass after N persistent blocks on the same files.
     // Track block attempts per file; allow if any file hits threshold.
     if (unverified.length > 0 || mismatched.length > 0) {
-      const allBlockedFiles = [...unverified, ...mismatched.map(m => m.file)];
-      let autoBypassed = 0;
-      for (const f of allBlockedFiles) {
-        const key = compoundKey(worktreeRoot, f);
-        const attempts = (blockAttempts.get(key) ?? 0) + 1;
-        blockAttempts.set(key, attempts);
-        if (attempts >= BLOCK_ATTEMPT_THRESHOLD) {
-          autoBypassed++;
+      // #825: sub-agents (task children — env PI_MODE=print) get NO #7591
+      // auto-bypass: a block is final. They inherit the parent's verified
+      // registry via the bridge; retrying must never silently commit unverified
+      // files. The sub-agent stops and reports the block to the parent, which
+      // verifies and re-dispatches (or lands the change itself).
+      if (!isPrintModeEnv()) {
+        const allBlockedFiles = [...unverified, ...mismatched.map(m => m.file)];
+        let autoBypassed = 0;
+        for (const f of allBlockedFiles) {
+          const key = compoundKey(worktreeRoot, f);
+          const attempts = (blockAttempts.get(key) ?? 0) + 1;
+          blockAttempts.set(key, attempts);
+          if (attempts >= BLOCK_ATTEMPT_THRESHOLD) {
+            autoBypassed++;
+          }
         }
-      }
-      if (autoBypassed === allBlockedFiles.length) {
-        console.log(`[verification-gate] ⏩ Auto-bypassed after ${BLOCK_ATTEMPT_THRESHOLD}+ attempts on ${allBlockedFiles.length} files`);
-        return undefined;
+        if (autoBypassed === allBlockedFiles.length) {
+          console.log(`[verification-gate] ⏩ Auto-bypassed after ${BLOCK_ATTEMPT_THRESHOLD}+ attempts on ${allBlockedFiles.length} files`);
+          return undefined;
+        }
       }
     }
 
@@ -1009,20 +1016,40 @@ export default function (pi: ExtensionAPI) {
     }
 
     const allBlocked = [...unverified, ...mismatched.map(m => m.file)];
-    const reason = [
-      "⛔ Verification gate — blocking git operation.",
+    // #825: sub-agents inherit the parent's verified-file registry via the
+    // bridge — a block here means the parent has NOT verified these files. The
+    // sub-agent must stop and report back (it cannot run the parent's verifier
+    // ceremony); the parent verifies and re-dispatches, or lands the change.
+    const subAgentReason = [
+      "⛔ Verification gate — blocking git operation (sub-agent).",
       "",
-      ...reasons,
+      ...reasons.map(l => l.replace("verifier sub-agent", "the parent session")),
       "",
-      `  → Dispatch the verifier sub-agent:`,
-      `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}.', ...)`,
+      `  This session is a task sub-agent: it inherits the parent session's`,
+      "  verified-file registry via the bridge file, and these files are NOT",
+      "  covered by it. The parent must verify them before this commit can land.",
       "",
-      "  Verifier response format — use one of:",
-      '    1. Plain text: "PASS" on its own line (simplest)',
-      '    2. JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"...","hash":"..."}]}',
-      "",
-      "  → Or set ELDATO_SKIP_VGATE=1 to bypass (emergency only).",
+      `  → STOP. Do not retry, do not bypass. Report this block verbatim to the`,
+      `    parent session — the parent must dispatch VGATE verification`,
+      `    ([VGATE] verify files: ${allBlocked.join(' ')}) and re-run this task,`,
+      "    or verify the files itself before pushing.",
     ].join("\n");
+    const reason = isPrintModeEnv()
+      ? subAgentReason
+      : [
+          "⛔ Verification gate — blocking git operation.",
+          "",
+          ...reasons,
+          "",
+          `  → Dispatch the verifier sub-agent:`,
+          `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}.', ...)`,
+          "",
+          "  Verifier response format — use one of:",
+          '    1. Plain text: "PASS" on its own line (simplest)',
+          '    2. JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"...","hash":"..."}]}',
+          "",
+          "  → Or set ELDATO_SKIP_VGATE=1 to bypass (emergency only).",
+        ].join("\n");
 
     console.log(`[verification-gate] 🚫 Blocked: ${unverified.length} unverified, ${mismatched.length} mismatched`);
     lastBlockedCwd = cwd; // stash authoritative cwd for the merge path (#5607)

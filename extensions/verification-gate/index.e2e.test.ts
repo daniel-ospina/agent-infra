@@ -28,6 +28,10 @@ process.env.HOME = TEST_ROOT;
 // The gate under test must be ACTIVE — clear the escape hatch if the parent
 // environment inherited it (sub-agent sessions pre-disable extension gates).
 delete process.env.ELDATO_SKIP_VGATE;
+// #825: likewise clear a parent-inherited print-mode marker — the harness runs
+// the plugin in INTERACTIVE mode by default; the #825 scenarios set PI_MODE=print
+// explicitly (and scenario 24 deletes it) to exercise the sub-agent paths.
+delete process.env.PI_MODE;
 
 // ── Tiny git + sha helpers ───────────────────────────
 function sha(text: string): string {
@@ -644,6 +648,210 @@ async function main() {
     });
     ok(res && res.block === true, "same-repo merge with unknown PR head must block on drift (status quo)");
     ok(res.reason.includes("drift.txt"), "block reason names the drift file");
+  });
+
+  // ── #825: sub-agent (env PI_MODE=print) commits inherit the parent's bridge ──
+  // builtin-tools no longer injects ELDATO_SKIP_VGATE into task sub-agents; the
+  // sub-agent's VGATE session recovers the parent's verified-file registry from
+  // the bridge file. Scenarios 21-23, 25, 26 set PI_MODE=print explicitly (the
+  // harness clears it at startup) to exercise the sub-agent paths; scenario 24
+  // deletes it to exercise the interactive (non-print) half of the message
+  // split. Each print-mode scenario's finally restores by deletion when the
+  // mode was previously undefined (assignment would leak the string
+  // "undefined" into process.env).
+
+  test("scenario 21 (#825): sub-agent inherits the parent's bridge — parent-verified file commits pass without re-dispatch", async () => {
+    const repo = join(TEST_ROOT, "repo-subagent");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "fileS.txt"), "s1\n");
+    git(repo, "add fileS.txt");
+    git(repo, "commit -m baseline");
+    // The parent VGATE-verified the staged edit; the bridge carries the
+    // compound key (worktree-root::rel) + verifier-authoritative hash.
+    writeFileSync(join(repo, "fileS.txt"), "s2\n");
+    git(repo, "add fileS.txt");
+    const realRoot = realpathSync(repo);
+    const bridgeDir = join(TEST_ROOT, ".pi", "agent", "verification");
+    const bridgePath = join(bridgeDir, "latest.json");
+    mkdirSync(bridgeDir, { recursive: true });
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print"; // sub-agent session (builtin-tools #172)
+    try {
+      await fire("session_start", {});
+      // Control FIRST: no bridge entry yet → the gate must be ACTIVE in the
+      // sub-agent and block the unverified file (proves an allow below is
+      // specifically caused by bridge inheritance, not gate inactivity).
+      const blocked = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'sub1'", cwd: repo },
+      });
+      ok(blocked && blocked.block === true, "sub-agent must block the file BEFORE the bridge is written (gate active)");
+      // Parent VGATE merge writes the bridge → the sub-agent's next git op
+      // recovers it mid-session and the commit passes WITHOUT re-dispatch.
+      writeFileSync(bridgePath, JSON.stringify({
+        status: "PASS",
+        verified_files: [{ path: `${realRoot}::fileS.txt`, hash: sha("s2\n") }],
+        timestamp: new Date().toISOString(),
+      }));
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'sub1'", cwd: repo },
+      });
+      equal(res, undefined, "parent-verified file must pass in the sub-agent via bridge inheritance (no re-dispatch)");
+      git(repo, "commit -m sub1");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+
+  test("scenario 22 (#825): sub-agent commit on UNVERIFIED files is blocked with a report-to-parent message", async () => {
+    const repo = join(TEST_ROOT, "repo-subagent");
+    git(repo, "reset -q");
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    try {
+      await fire("session_start", {});
+      writeFileSync(join(repo, "fileU.txt"), "u1\n");
+      git(repo, "add fileU.txt");
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'sub2'", cwd: repo },
+      });
+      ok(res && res.block === true, "unverified sub-agent commit must be blocked");
+      // Discriminating markers: the INTERACTIVE message also contains the bare
+      // substring "sub-agent" ("Dispatch the verifier sub-agent"), so assert
+      // sub-agent-only phrasing + absence of the parent-style instruction.
+      ok(res.reason.includes("This session is a task sub-agent"), `block reason must carry the sub-agent marker, got: ${res.reason.slice(0, 200)}`);
+      ok(/Report this block/.test(res.reason), "sub-agent block must tell the sub-agent to report to the parent");
+      ok(!/task\(prompt=/.test(res.reason), "sub-agent block must NOT instruct a task dispatch (parent-enforced)");
+      ok(!/Dispatch the verifier sub-agent/.test(res.reason), "sub-agent block must NOT carry the parent's verifier-dispatch instruction");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+
+  test("scenario 23 (#825): sub-agent has NO #7591 auto-bypass — 4th attempt still blocked", async () => {
+    const repo = join(TEST_ROOT, "repo-subagent");
+    git(repo, "reset -q");
+    git(repo, "add fileU.txt"); // re-stage the still-unverified file
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    try {
+      await fire("session_start", {});
+      for (let i = 0; i < 4; i++) {
+        const res = await fire("tool_call", {
+          type: "tool_call", toolName: "bash",
+          input: { command: "git commit -m 'sub3'", cwd: repo },
+        });
+        ok(res && res.block === true, `attempt ${i + 1} must block in sub-agent mode (no auto-bypass)`);
+      }
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+
+  test("scenario 24 (#825): INTERACTIVE session keeps the original verifier-dispatch block message (message split positive half)", async () => {
+    const repo = join(TEST_ROOT, "repo-subagent");
+    git(repo, "reset -q");
+    git(repo, "add fileU.txt"); // re-stage the still-unverified file
+    delete process.env.PI_MODE; // interactive parent session
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'par1'", cwd: repo },
+    });
+    ok(res && res.block === true, "interactive unverified commit must be blocked");
+    ok(/Dispatch the verifier sub-agent/.test(res.reason), "interactive block must keep the verifier-dispatch instruction");
+    ok(/task\(prompt=/.test(res.reason), "interactive block must show the task(...) dispatch template");
+    ok(!/Report this block/.test(res.reason), "sub-agent report-to-parent message must NOT leak into interactive sessions");
+  });
+
+  test("scenario 25 (#825): sub-agent editing a parent-verified file (hash mismatch) is blocked, no auto-bypass", async () => {
+    const repo = join(TEST_ROOT, "repo-subagent-2");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "fileM.txt"), "m1\n");
+    git(repo, "add fileM.txt");
+    git(repo, "commit -m baseline");
+    // Parent verified m2; the bridge carries the verifier-authoritative hash.
+    writeFileSync(join(repo, "fileM.txt"), "m2\n");
+    git(repo, "add fileM.txt");
+    const realRoot = realpathSync(repo);
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    writeFileSync(bridgePath, JSON.stringify({
+      status: "PASS",
+      verified_files: [{ path: `${realRoot}::fileM.txt`, hash: sha("m2\n") }],
+      timestamp: new Date().toISOString(),
+    }));
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    try {
+      await fire("session_start", {});
+      // A non-commit git op triggers mid-session bridge recovery while the file
+      // still matches the stored hash (m2) — the entry enters verifiedSet.
+      // (push, not commit: no #7574 pendingRehash re-blessing on the next op.)
+      const allowed = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git push origin main", cwd: repo },
+      });
+      equal(allowed, undefined, "parent-verified (hash-matching) file must pass the push-scope check");
+      // Sub-agent then edits the parent-verified file (m2 → m3) and stages it:
+      // the registry hash no longer matches disk → MISMATCH, fail-closed.
+      writeFileSync(join(repo, "fileM.txt"), "m3\n");
+      git(repo, "add fileM.txt");
+      for (let i = 0; i < 4; i++) {
+        const res = await fire("tool_call", {
+          type: "tool_call", toolName: "bash",
+          input: { command: "git commit -m 'subM'", cwd: repo },
+        });
+        ok(res && res.block === true, `mismatch attempt ${i + 1} must block in sub-agent mode`);
+        if (i === 0) {
+          ok(/Hash mismatch/.test(res.reason), "block reason must carry the hash-mismatch diagnostic");
+          ok(res.reason.includes("This session is a task sub-agent"), "mismatch block must still carry the sub-agent marker");
+        }
+      }
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+
+  test("scenario 26 (#825): foreign-worktree bridge entries are NOT inherited by a sub-agent (root isolation)", async () => {
+    const repo = join(TEST_ROOT, "repo-subagent-3");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "fileX.txt"), "x1\n");
+    git(repo, "add fileX.txt");
+    git(repo, "commit -m baseline");
+    writeFileSync(join(repo, "fileX.txt"), "x2\n");
+    git(repo, "add fileX.txt");
+    // Bridge entry keyed to a DIFFERENT worktree root (compound-key isolation
+    // #37/#190): recovery must drop it as inert, so the file stays unverified.
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    writeFileSync(bridgePath, JSON.stringify({
+      status: "PASS",
+      verified_files: [{ path: `/some/other/worktree::fileX.txt`, hash: sha("x2\n") }],
+      timestamp: new Date().toISOString(),
+    }));
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    try {
+      await fire("session_start", {});
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'subX'", cwd: repo },
+      });
+      ok(res && res.block === true, "foreign-root bridge entry must NOT verify the file in this worktree");
+      ok(res.reason.includes("fileX.txt"), "block reason names the file");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
   });
 } // main: plugin loaded; tests run sequentially via runAll()
 

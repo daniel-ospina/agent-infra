@@ -215,6 +215,28 @@ test("sub-agent env declares PI_MODE=print (#172)", () => {
   ok(source.includes("SLACK_BRIDGE_DISABLE: \"1\""), "subAgentEnv still sets SLACK_BRIDGE_DISABLE=1");
 });
 
+// ── Sub-agent gate inheritance (#825) ─────────────────
+
+section("Sub-agent gate env (#825)");
+
+test("sub-agent env must NOT inject ELDATO_SKIP_VGATE — sub-agent commits inherit the parent's verified-file registry via the bridge (#825)", () => {
+  ok(
+    !/ELDATO_SKIP_VGATE\s*[:=]\s*["']?1["']?/.test(source),
+    "subAgentEnv must not bypass VGATE: task sub-agents run the verification gate ACTIVE and inherit the parent's verified-file registry via the bridge file (worktree-scoped compound keys). Commits on unverified files are blocked with a report-to-parent message (#825)"
+  );
+  // Tripwire note: these source assertions are a cheap "don't re-add" guard —
+  // the authoritative behavior coverage lives in verification-gate e2e
+  // scenarios 21-26 (bridge inheritance, sub-agent block message, no
+  // auto-bypass, interactive message unchanged).
+});
+
+test("sub-agent env keeps AGENT_SKIP_REVIEW_GATE=1 — review dispatch stays parent-enforced (#825)", () => {
+  ok(
+    source.includes("AGENT_SKIP_REVIEW_GATE: \"1\""),
+    "review DISPATCH stays parent-enforced: a sub-agent never self-satisfies the review-enforcer; the parent runs the review ceremony for the PR as a whole (#825)"
+  );
+});
+
 // ── PATH augmentation (#36) ───────────────────────────
 
 section("augmentPath — sub-agent PATH augmentation (#36)");
