@@ -16,11 +16,76 @@
 #               fail: a test with zero assertion markers is a mutation that
 #               always survives — it proves nothing.
 #
-# Exit codes: 0 = clean, 1 = violations found, 2 = usage/script error.
+# Load gate (#209): entry preflight + bounded poll + mid-run re-check. Batch
+# work DEFERS under pre-existing load instead of compounding a storm.
+# Exit 3 = DEFERRED — the invoker MUST re-invoke (skills re-dispatch); a
+# defer is a promise to re-run, never a silent skip. Bypass: LOAD_GATE_FORCE=1
+# env (no script flag, scope-pinned). See docs/ops/load-policy.md.
+#
+# Exit codes: 0 = clean, 1 = violations found, 2 = usage/script error,
+# 3 = deferred — re-invoke (load gate).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+LOAD_GATE_MAX_WAIT_MIN="${LOAD_GATE_MAX_WAIT_MIN:-10}"
+
+# ── load gate (#209) ────────────────────────────────────────────────────────
+# Entry preflight: `check` (entry rule = shouldSuspend) → go → proceed;
+# suspended → bounded poll (`check --deferred` every 60s up to
+# LOAD_GATE_MAX_WAIT_MIN, default 10; `0` = no poll) → go → proceed; after the
+# cap → exit 3 with a loud defer log (accurate: nothing has run at entry).
+# The poll's --deferred mode gates on shouldResume (exit 0 only below resume),
+# so a single-sample dip between suspend and resume never thrash-resumes.
+load_gate_entry() {
+  if [ "${LOAD_GATE_FORCE:-}" = "1" ]; then return 0; fi
+  local rc=0 out load1 suspend waited
+  out="$(node "$ROOT/scripts/load-gate.mjs" check --json 2>/dev/null)" || rc=$?
+  [ $rc -eq 0 ] && return 0
+  if [ $rc -ne 3 ]; then
+    echo "[load-gate] ERROR: gate helper failed (exit $rc) — aborting loudly" >&2
+    exit 2
+  fi
+  load1="$(printf '%s' "$out" | sed -n 's/.*"load1":\([0-9.e+-]*\).*/\1/p')"
+  suspend="$(printf '%s' "$out" | sed -n 's/.*"suspend":\([0-9.e+-]*\).*/\1/p')"
+  waited=0
+  while [ "$waited" -lt "$LOAD_GATE_MAX_WAIT_MIN" ]; do
+    sleep 60
+    waited=$((waited + 1))
+    if node "$ROOT/scripts/load-gate.mjs" check --deferred >/dev/null 2>&1; then
+      echo "[load-gate] resumed after ${waited} min poll (load < resume threshold)" >&2
+      return 0
+    fi
+  done
+  echo "[load-gate] DEFERRED — batch did NOT run; re-invoke after load < ${suspend:-?} (was ${load1:-?})" >&2
+  exit 3
+}
+
+# Mid-run re-check (F7 — gating is not entry-only): time-gated at most once
+# per 60s per gate run (a node spawn per check is not free over ~100 files).
+# A suspend verdict aborts with exit 3 + loud defer log. Re-invoke is
+# idempotent for both subcommands (re-scan / re-run tests).
+LOAD_GATE_LAST_RECHECK_EPOCH=0
+load_gate_midrun_check() {
+  if [ "${LOAD_GATE_FORCE:-}" = "1" ]; then return 0; fi
+  local now
+  now="$(date +%s 2>/dev/null || echo 0)"
+  [ "$now" -lt $((LOAD_GATE_LAST_RECHECK_EPOCH + 60)) ] && return 0
+  LOAD_GATE_LAST_RECHECK_EPOCH="$now"
+  local out load1 suspend
+  out="$(node "$ROOT/scripts/load-gate.mjs" check --json 2>/dev/null)" || {
+    local rc=$?
+    # helper error mid-run: don't abort an otherwise-fine gate; entry already
+    # proved the helper runs — a transient failure is not a load verdict.
+    [ $rc -eq 3 ] || return 0
+    load1="$(printf '%s' "$out" | sed -n 's/.*"load1":\([0-9.e+-]*\).*/\1/p')"
+    suspend="$(printf '%s' "$out" | sed -n 's/.*"suspend":\([0-9.e+-]*\).*/\1/p')"
+    echo "[load-gate] DEFERRED — gate interrupted mid-run (load ${load1:-?} ≥ suspend ${suspend:-?}); re-invoke to complete" >&2
+    exit 3
+  }
+  return 0
+}
 
 usage() {
   cat <<'EOF'
@@ -34,7 +99,8 @@ Usage: scripts/cron-quality-gates.sh <arch|mutation>
             (assertion-free) tests.
   -h|--help Print this help.
 
-Exit: 0 clean, 1 violations, 2 usage error.
+Exit: 0 clean, 1 violations, 2 usage error, 3 deferred — re-invoke (load gate;
+      LOAD_GATE_FORCE=1 bypasses).
 EOF
 }
 
@@ -71,6 +137,7 @@ arch_gate() {
 
   while IFS= read -r skill_file; do
     [[ "$skill_file" == *"ARCHIVE"* || "$skill_file" == *"_deprecated"* ]] && continue
+    load_gate_midrun_check
     local skill_dir
     skill_dir="$(dirname "$skill_file")"
 
@@ -142,6 +209,7 @@ mutation_gate() {
   while IFS= read -r test_file; do
     local name
     name="$(basename "$(dirname "$test_file")")"
+    load_gate_midrun_check
 
     if node "$test_file" >/tmp/cron-mutation-out.$$ 2>&1; then
       : # test ran — check assertions below
@@ -184,8 +252,8 @@ mutation_gate() {
 
 # ── dispatch ────────────────────────────────────────────────────────────────
 case "${1:-}" in
-  arch)     arch_gate ;;
-  mutation) mutation_gate ;;
+  arch)     load_gate_entry; arch_gate ;;
+  mutation) load_gate_entry; mutation_gate ;;
   -h|--help) usage; exit 0 ;;
   *)
     echo "Error: unknown subcommand '${1:-}'" >&2

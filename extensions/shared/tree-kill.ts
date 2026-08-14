@@ -15,7 +15,15 @@
 
 import { execSync } from "node:child_process";
 
-const EXEC_TIMEOUT_MS = 2000;
+/** #209: pgrep/ps cap on the kill path — env-overridable
+ * (TREE_KILL_EXEC_TIMEOUT_MS, default 5s; invalid/absent/non-positive →
+ * default). A watchdog that fires but cannot kill leaves a zombie — the cap
+ * must be generous and deterministic (no retry: retry-under-load compounds
+ * storms, and the kill-path cap must not retry). Read per call. */
+export function execTimeoutMs(): number {
+  const n = parseInt(process.env.TREE_KILL_EXEC_TIMEOUT_MS ?? "5000", 10);
+  return Number.isInteger(n) && n > 0 ? n : 5000;
+}
 
 /** Parse whitespace/newline-separated PID output from pgrep/ps. */
 export function parsePidList(output: string): number[] {
@@ -35,13 +43,13 @@ export function parsePidList(output: string): number[] {
  */
 export function getChildPids(pid: number): number[] {
 	try {
-		const result = execSync(`pgrep -P ${pid}`, { timeout: EXEC_TIMEOUT_MS, encoding: "utf-8" });
+		const result = execSync(`pgrep -P ${pid}`, { timeout: execTimeoutMs(), encoding: "utf-8" });
 		return parsePidList(result);
 	} catch {
 		// pgrep not available, errored, or no children — try the ps fallback.
 	}
 	try {
-		const result = execSync(`ps -axo pid=,ppid=`, { timeout: EXEC_TIMEOUT_MS, encoding: "utf-8" });
+		const result = execSync(`ps -axo pid=,ppid=`, { timeout: execTimeoutMs(), encoding: "utf-8" });
 		const children: number[] = [];
 		for (const line of result.split(/\n/)) {
 			const m = line.trim().match(/^(\d+)\s+(\d+)$/);
