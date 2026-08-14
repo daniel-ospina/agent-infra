@@ -2002,6 +2002,9 @@ export default function (pi: ExtensionAPI) {
                                  // sub-agents don't run the parent's review
                                  // ceremony; the parent dispatches reviewers.
 };
+// #265/#825 resolution: sub-agents DO get the hatch (verified-file registry
+// bridge, #825) — the branch-ownership guard (M1/M2/M3) is the layer that
+// protects the shared checkout, not env removal.
       if (params.mcp_servers) {
         subAgentEnv.PI_MCP_SERVERS = params.mcp_servers;
       }

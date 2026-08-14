@@ -277,7 +277,10 @@ agents in the hub) is prevented by discipline, not just guards:
   ```
   Never launch a nested/background `pi` to "escape" the guard — that is how a 29h fleet hang happened (2026-08-11→12, #206).
 
+> **#265 marker semantics (escaped hatch):** under the TTL marker (or the env flag), the guard's M2/M3 gates are INACTIVE (the escape hatch keeps its documented semantics — a stranded main checkout stays recoverable) but M1 detection stays ACTIVE: if the branch moves again mid-session you still get the warn.
+
 ## Launching Nested pi
+### Never launch an unbounded nested pi (#206) — hard rule
 
 > **Never launch an unbounded nested pi.** Every nested or background `pi`
 > launch MUST carry a hard timeout (30 minutes — the bounded-launch template
@@ -327,6 +330,26 @@ else
   exit 1
 fi
 ```
+
+
+Launch guidance: keep `2>&1` (markers + stage lines land immediately) and use
+the liveness-marker rule from the hard rule above. A stale log with fresh
+marker lines = healthy; a stale log with NO markers = inspect the process.
+
+### TTL'd escape marker — deliberate SOLO sessions can escalate mid-session (#207)
+
+The env hatch (`AGENT_ALLOW_MAIN_EDITS=1`) cannot be set on a running pi process. A **deliberate solo session** that owns the machine can grant itself the same bypass for a bounded window:
+
+```bash
+touch ~/.pi/agent/.allow-main-edits          # 15-minute TTL, re-read per tool_call
+echo "recovering stranded main checkout" >> ~/.pi/agent/.allow-main-edits   # reason (audit trail)
+```
+
+- **TTL:** the marker expires 15 minutes after its last modification — expiry is checked per tool_call (never cached), so a forgotten marker self-revokes.
+- **Never automatic for parallel sessions:** the marker only affects sessions running on the same machine/user; it never applies to other agents automatically. Under #265 the marker ALSO no longer applies to task sub-agents (they never inherit the hatch).
+- **Traversal-guarded:** only a regular file counts — a directory or symlink at the path is ignored (fail-closed).
+- **Cleanup:** `rm ~/.pi/agent/.allow-main-edits` after the operation (the TTL would do it anyway).
+- **#265 (branch ownership):** the marker opens M2/M3 (commit/push/branch-state gates are inactive under it) but M1 branch-deviation detection STAYS ACTIVE — a deliberate solo session still sees a warn if the tree moves again.
 
 > Template semantics: `LOG` is created via `mktemp` BEFORE the launch (`$$` is the shell pid — two backgrounded launches in one bash call would collide on a `$$`-derived name; `${launch_pid}` inside the redirect is wrong because the redirect is evaluated before `$!` is captured). The deadline watchdog is the primary guarantee (SIGTERM at 30 min, SIGKILL after 60s grace — the portable equivalent of GNU `timeout --kill-after=60 1800`, which does not exist on macOS). The abort trigger is CONDITIONAL: `kill` executes only when grep finds no marker — a healthy launch that prints ALIVE is never killed at 60s. `pkill -P "$launch_pid"` is best-effort (BSD pkill exists on macOS); grandchildren may linger (accepted — full tree-kill is an extension-side concern, out of scope).
 

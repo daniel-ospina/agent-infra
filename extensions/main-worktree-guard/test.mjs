@@ -5,7 +5,7 @@
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync } from "node:fs";
-import { classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -333,6 +333,139 @@ try {
   }
 }
 
+
+// ── #265: detailed classifier (classifyGitCommandDetailed) ────────────────
+// classifyGitCommand stays FROZEN (string verdict, back-compat — the asserts
+// above are unchanged). classifyGitCommandDetailed is the object-returning
+// classifier the guard consumes EXCLUSIVELY; it verb-anchors the same legacy
+// patterns on the SKIMMED command and adds commit/push/branch-state classes.
+let dpass = 0, dfail = 0;
+function dexpect(name, command, checks) {
+  const got = classifyGitCommandDetailed(command);
+  const fails = [];
+  for (const [k, v] of Object.entries(checks)) {
+    const g = got[k];
+    const okk = Array.isArray(v)
+      ? JSON.stringify(g) === JSON.stringify(v)
+      : (typeof v === "object" && v !== null ? JSON.stringify(g) === JSON.stringify(v) : g === v);
+    if (!okk) fails.push(`${k}=${JSON.stringify(g)} (expected ${JSON.stringify(v)})`);
+  }
+  const okk = fails.length === 0;
+  console.log(`${okk ? "✅" : "❌"} ${name}: ${okk ? "" : fails.join("; ")}`);
+  okk ? dpass++ : dfail++;
+}
+
+// Skimmer: global flags stripped so verb-anchoring == bare git
+const sk = classifyGitCommandDetailed(`cd /x && git -c user.name=n -C "some dir" --git-dir=/r/.git checkout main`);
+dexpect("detailed skimmer: verb anchored", `cd /x && git -c user.name=n -C "some dir" checkout main`, { verdict: "block:checkout-branch", verb: "checkout", repoHint: "some dir" });
+dexpect("detailed skimmer: GIT_DIR prefix", `GIT_DIR=/r/.git git status`, { verb: "status", gitDirHint: "/r/.git" });
+
+// 7 canonical bypasses — ALL now classed (blocked or branchState for M3)
+dexpect("bypass: -C <path> checkout", `git -C /some/path checkout main`, { verdict: "block:checkout-branch", branchState: true });
+dexpect("bypass: -c k=v checkout", `git -c user.name=x checkout main`, { verdict: "block:checkout-branch" });
+dexpect("bypass: checkout --orphan", `git checkout --orphan newbranch`, { branchState: true });
+dexpect("bypass: symbolic-ref HEAD", `git symbolic-ref HEAD refs/heads/x`, { branchState: true });
+dexpect("bypass: update-ref refs/heads", `git update-ref refs/heads/x HEAD`, { branchState: true });
+dexpect("bypass: branch -f", `git branch -f x main`, { branchState: true });
+dexpect("bypass: switch -c", `git switch -c feat/x`, { branchState: true });
+// non-branch-state symbolic-ref/update-ref are NOT flagged
+const symRefOrigin = classifyGitCommandDetailed(`git symbolic-ref refs/remotes/origin/HEAD refs/heads/main`);
+dexpect("symbolic-ref origin → not branchState", `git symbolic-ref refs/remotes/origin/HEAD refs/heads/main`, { branchState: false });
+const updTag = classifyGitCommandDetailed(`git update-ref refs/tags/v1 HEAD`);
+dexpect("update-ref tag → not branchState", `git update-ref refs/tags/v1 HEAD`, { branchState: false });
+
+// commit matcher (commit-graph/commit-tree EXCLUDED)
+dexpect("commit → block:commit", `git commit -m x`, { verdict: "block:commit", verb: "commit" });
+dexpect("add+commit → block:commit (detailed)", `git add . && git commit -m 'x'`, { verdict: "block:commit" });
+dexpect("commit-graph NOT commit", `git commit-graph write`, { verdict: "allow", verb: "commit-graph" });
+dexpect("commit-tree NOT commit", `git commit-tree HEAD`, { verdict: "allow", verb: "commit-tree" });
+dexpect("git -c k=v commit", `git -c commit.gpgsign=false commit -am x`, { verdict: "block:commit" });
+
+// push: refspec dst + targets + force hygiene
+const pushMain = classifyGitCommandDetailed(`git push origin main`);
+dexpect("push origin main → block:push + dst", `git push origin main`, { verdict: "block:push", pushDst: "main", pushTargets: ["main"] });
+dexpect("bare push → block:push, no dst (current branch)", `git push`, { verdict: "block:push", pushDst: null, pushTargets: [] });
+dexpect("push origin → block:push, no refspec", `git push origin`, { verdict: "block:push" });
+dexpect("push HEAD:refs/heads/other → dst=other", `git push origin HEAD:refs/heads/other`, { pushDst: "other" });
+dexpect("push no-colon feat/1 → dst=feat/1", `git push origin feat/1`, { pushDst: "feat/1", pushTargets: ["feat/1"] });
+dexpect("push multi-refspec → all targets", `git push --force origin feat/1 other/2`, { verdict: "block:force-push", pushTargets: ["feat/1", "other/2"] });
+dexpect("push -f → force-push", `git push -f origin main`, { verdict: "block:force-push" });
+dexpect("push --force-with-lease → NOT force (hygiene)", `git push --force-with-lease`, { verdict: "block:push" });
+dexpect("push --force-if-includes → NOT force", `git push --force-if-includes origin feat/1`, { verdict: "block:push" });
+const del2 = classifyGitCommandDetailed(`git push origin --delete feat/x other`);
+dexpect("push --delete multi → isPushDelete + all targets", `git push origin --delete feat/x other`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x", "other"] });
+dexpect("push --delete colon form", `git push origin :feat/x`, { verdict: "block:push-delete", pushTargets: ["feat/x"] });
+
+// sync-source extraction (ownership allowance)
+dexpect("pull --rebase origin main → syncSource main", `git -c commit.gpgsign=false pull --rebase origin main`, { verdict: "block:pull", syncSource: "main" });
+dexpect("merge origin/main → syncSource", `git fetch origin && git merge origin/main`, { verdict: "block:merge", syncSource: "origin/main" });
+dexpect("rebase origin/main → syncSource", `git rebase origin/main`, { verdict: "block:rebase", syncSource: "origin/main" });
+
+// M3 subclassification surfaces (branchOp via shared classifyBranchOp)
+import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, extractGitInvocation as sharedExtractGitInvocation } from "../shared/branch-ownership.mjs";
+const co = (cmd) => {
+  const d = classifyGitCommandDetailed(cmd);
+  // P1-A: classify the STATE-mutating invocation (compound commands must gate
+  // on the checkout, not the leading pull/fetch).
+  return d.branchState ? sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs) : { op: "other" };
+};
+expectBool("detailed+shared: checkout -b → create-new", co(`git checkout -b feat/x`)?.op === "create-new", true);
+expectBool("detailed+shared: switch -c → create-new", co(`git switch -c feat/x`)?.op === "create-new", true);
+expectBool("detailed+shared: -C x checkout main → switch-existing", co(`git -C /x checkout main`)?.op === "switch-existing", true);
+expectBool("detailed+shared: checkout --orphan → orphan", co(`git checkout --orphan b`)?.op === "orphan", true);
+expectBool("detailed+shared: symbolic-ref HEAD → switch-existing", co(`git symbolic-ref HEAD refs/heads/x`)?.op === "switch-existing", true);
+expectBool("detailed+shared: update-ref refs/heads → switch-existing", co(`git update-ref refs/heads/x HEAD`)?.op === "switch-existing", true);
+expectBool("detailed+shared: branch -f → force", co(`git branch -f x main`)?.op === "force", true);
+expectBool("detailed+shared: branch -m own → rename", co(`git branch -m feat/a feat/b`)?.op === "rename", true);
+expectBool("detailed+shared: checkout -- path → other", co(`git checkout -- tortoise/sdk.py`)?.op === "other", true);
+expectBool("detailed+shared: checkout . → other", co(`git checkout .`)?.op === "other", true);
+expectBool("detailed+shared: checkout - → switch-existing", co(`git checkout -`)?.op === "switch-existing", true);
+
+// ── P1-A regression: compound commands gate on the STATE invocation ────────
+expectBool("P1-A: pull && checkout main → switch-existing", co(`git pull && git checkout main`)?.op === "switch-existing", true);
+expectBool("P1-A: fetch && checkout -b → create-new", co(`git fetch origin main && git checkout -b feat/2 origin/main`)?.op === "create-new", true);
+expectBool("P1-A: stash&&checkout main (no-space) → switch-existing", co(`git stash&&git checkout main`)?.op === "switch-existing", true);
+
+// ── P2-A regression: no-space compound commit is detected (M2 gate) ─────────
+dexpect("P2-A: no-space compound commit → block:commit", `git add .&&git commit -am x`, { verdict: "block:commit" });
+
+// ── P1-B regression: branch -D/-d set newBranch (allowance target) ─────────
+dexpect("P1-B: branch -D own → newBranch set", `git branch -D feat/1`, { verdict: "block:branch-force-delete", newBranch: "feat/1" });
+// -d is a SOFT delete: legacy verdict stays allow (M3 still gates it via
+// branchState=true + newBranch — the allowance target list must be non-empty).
+dexpect("P1-B: branch -d own → branchState + newBranch (allow)", `git branch -d feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1" });
+// ── P2 (cycle 2) regression: subshell-paren compounds ───────────────────────
+dexpect("P2: add && (commit) → block:commit", `git add . && (git commit -m x)`, { verdict: "block:commit" });
+expectBool("P2: commit && (checkout main) → branchState", classifyGitCommandDetailed(`git commit -m x && (git checkout main)`).branchState, true);
+expectBool("P2: (checkout main) alone → branchState", classifyGitCommandDetailed(`(git checkout main)`).branchState, true);
+// ── P2 (cycle 3) regression: worktree-hint on the FIRST invocation must not
+// exempt the STATE invocation's main-checkout mutation ───────────────────────
+{
+  // P2 (cycle 3): `git -C <wt> status && git checkout main` — the M3 gate must
+  // resolve the repo for the STATE invocation (the checkout), not the first
+  // invocation whose -C points at a worktree. We assert the mechanism: the
+  // preferVerb scan returns the state invocation's hints (no -C), while the
+  // default scan returns the first invocation's hints (-C present). A full
+  // eff-resolution against a fake path can't work (needs a real .git).
+  const cmd = `git -C /tmp/fake/.worktrees/x status && git checkout main`;
+  const d = classifyGitCommandDetailed(cmd);
+  const invFirst = sharedExtractGitInvocation(cmd);               // default: first invocation
+  const invState = sharedExtractGitInvocation(cmd, d.stateVerb);  // preferVerb: the checkout
+  expectBool("P2(cycle3): first-inv carries the -C hint", invFirst.cHints.length === 1, true);
+  expectBool("P2(cycle3): state-inv has NO -C hint (resolves to MAIN)", invState.cHints.length === 0, true);
+  expectBool("P2(cycle3): state-inv verb is the checkout", invState.verb === "checkout", true);
+}
+
+// Cross-consistency: resolveEffectiveRepo (branch-ownership) and the detailed
+// classifier's skimmer must agree on repo identity for adversarial commands.
+const xc1 = sharedResolveEffectiveRepo(`git -C "${MAIN}" -c k=v status`, PROJECT_CWD);
+const xc2 = classifyGitCommandDetailed(`git -C "${MAIN}" -c k=v status`);
+expectBool("cross-consistency: -C repoHint matches resolve", xc2.repoHint === MAIN || resolve(xc2.repoHint) === MAIN, true);
+const xc3 = classifyGitCommandDetailed(`GIT_DIR=${MAIN}/.git git status`);
+expectBool("cross-consistency: GIT_DIR hint", xc3.gitDirHint === `${MAIN}/.git`, true);
+
+console.log(`\ndetailed classifier: ${dpass} passed, ${dfail} failed`);
+pass += dpass; fail += dfail;
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

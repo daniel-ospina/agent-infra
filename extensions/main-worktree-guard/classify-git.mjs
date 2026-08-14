@@ -62,6 +62,276 @@ export function classifyGitCommand(command) {
   return "allow";
 }
 
+// ── Detailed classifier (#265) ────────────────────────────────────────────
+// classifyGitCommand above is FROZEN byte-identical (back-compat — test.mjs's
+// existing string assertions + external importers depend on it; it carries NO
+// new matchers). classifyGitCommandDetailed is the NEW object-returning
+// classifier that index.ts consumes EXCLUSIVELY (call-site contract, plan
+// deviation 8 / cycle-3 fold-in). It verb-anchors the SAME legacy patterns on
+// the SKIMMED command (`git -c k=v checkout main` ≡ `git checkout main`) and
+// adds commit / push / branch-state classification for the ownership gates.
+
+/** Quote-aware tokenizer (mirrors branch-ownership.mjs; kept local so
+ * classify-git stays dependency-free for jiti loading — the two are
+ * cross-checked by test-branch-ownership.mjs's consistency matrix). */
+function _tokenize(command) {
+  const tokens = [];
+  const s = String(command ?? "");
+  let i = 0;
+  while (i < s.length) {
+    while (i < s.length && /\s/.test(s[i])) i++;
+    if (i >= s.length) break;
+    let tok = "";
+    let quote = null;
+    while (i < s.length) {
+      const ch = s[i];
+      if (quote) {
+        if (ch === quote) { quote = null; i++; continue; }
+        if (ch === "\\" && quote === '"' && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
+        tok += ch; i++; continue;
+      }
+      if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
+      if (/\s/.test(ch)) break;
+      // Shell metacharacters are token boundaries too — `git add .&&git commit`
+      // must tokenize as TWO invocations (review P2: no-space compounds evaded M2).
+      // Consume the metachar so the outer loop advances (an empty-token break
+      // would infinite-loop — i never moves past it).
+      if (ch === "&" || ch === "|" || ch === ";" || ch === "(" || ch === ")") { i++; break; }
+      if (ch === "\\" && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
+      tok += ch; i++;
+    }
+    if (tok) tokens.push(tok);
+  }
+  return tokens;
+}
+
+/**
+ * Strip leading git GLOBAL flags (-C <path>, -c k=v, --git-dir[=],
+ * --work-tree[=], --namespace, --no-pager, -p) and env/cd prefixes so the
+ * verb-anchored matchers see `git checkout main` for
+ * `cd /x && GIT_DIR=.. git -C y -c k=v checkout main`.
+ * @returns {{ rest: string[], repoHint: string|null, gitDirHint: string|null }}
+ *   rest = tokens from the subcommand onward (first non-flag token after git).
+ */
+export function skimGitGlobalFlags(command) {
+  const tokens = _tokenize(command);
+  let repoHint = null;
+  let gitDirHint = null;
+  let i = 0;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (/^GIT_DIR=(.*)$/.test(t)) { gitDirHint = t.slice("GIT_DIR=".length).replace(/^["']|["']$/g, ""); i++; continue; }
+    if (/^GIT_WORK_TREE=/.test(t)) { i++; continue; }
+    if (t === "cd") { i += 2; continue; }
+    if (t === "git") break;
+    i++;
+  }
+  if (i >= tokens.length || tokens[i] !== "git") return { rest: [], repoHint, gitDirHint };
+  i++;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === "-C" || t === "--cd") { repoHint = tokens[i + 1] ?? null; i += 2; continue; }
+    if (t.startsWith("--git-dir=")) { gitDirHint = t.slice("--git-dir=".length); i++; continue; }
+    if (t === "--git-dir") { gitDirHint = tokens[i + 1] ?? ""; i += 2; continue; }
+    if (t === "--work-tree") { i += 2; continue; }
+    if (t.startsWith("--work-tree=")) { i++; continue; }
+    if (t === "--namespace") { i += 2; continue; }
+    if (t.startsWith("--namespace=")) { i++; continue; }
+    if (t === "--no-pager" || t === "-p" || t === "--paginate") { i++; continue; }
+    if (t === "-c" || t === "--config") { i += 2; continue; }
+    if (t.startsWith("-")) { i++; continue; }
+    break;
+  }
+  return { rest: tokens.slice(i), repoHint, gitDirHint };
+}
+
+function _stripQuotes(s) { return String(s ?? "").replace(/^["']|["']$/g, ""); }
+
+function _refspecDst(refspec) {
+  if (!refspec || refspec === "") return null;
+  const r = _stripQuotes(refspec);
+  const dst = r.includes(":") ? r.split(":").pop() : r;
+  if (dst === "HEAD") return null;
+  return dst.replace(/^refs\/heads\//, "");
+}
+
+/** Extract EVERY git invocation in a compound command (handles
+ * `git add . && git commit -m x` — the commit is what decideM2 must gate).
+ * @returns {Array<{verb: string|null, args: string[]}>}
+ */
+function _allGitInvocations(command) {
+  const tokens = _tokenize(command);
+  const invocations = [];
+  let i = 0;
+  while (i < tokens.length) {
+    if (tokens[i] !== "git") { i++; continue; }
+    i++;
+    while (i < tokens.length) {
+      const t = tokens[i];
+      if (/^GIT_DIR=/.test(t) || /^GIT_WORK_TREE=/.test(t)) { i++; continue; }
+      if (t === "cd") { i += 2; continue; }
+      if (t === "-C" || t === "--cd") { i += 2; continue; }
+      if (t.startsWith("--git-dir=") || t === "--git-dir") { i += t === "--git-dir" ? 2 : 1; continue; }
+      if (t === "--work-tree") { i += 2; continue; }
+      if (t.startsWith("--work-tree=")) { i++; continue; }
+      if (t === "--namespace") { i += 2; continue; }
+      if (t.startsWith("--namespace=")) { i++; continue; }
+      if (t === "--no-pager" || t === "-p" || t === "--paginate") { i++; continue; }
+      if (t === "-c" || t === "--config") { i += 2; continue; }
+      if (t.startsWith("-")) { i++; continue; }
+      break;
+    }
+    const verb = tokens[i] ?? null;
+    const args = [];
+    i++;
+    while (i < tokens.length && tokens[i] !== "git") {
+      if (!["&&", ";", "||", "|", "&", "(", ")"].includes(tokens[i])) args.push(tokens[i]);
+      i++;
+    }
+    invocations.push({ verb, args });
+  }
+  return invocations;
+}
+
+/**
+ * Detailed classification of a shell command (consumed EXCLUSIVELY by
+ * main-worktree-guard/index.ts). Shape:
+ *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
+ *     newBranch, pushDst, pushTargets, isPushDelete, renameFrom, renameTo,
+ *     syncSource }
+ * - verdict: legacy `block:*` strings for destructive patterns (verb-anchored),
+ *   plus NEW `block:commit` / `block:push` / `block:force-push`; `allow` /
+ *   `allow-non-git` otherwise.
+ * - branchState: true for checkout/switch/symbolic-ref/update-ref/branch ops
+ *   that mutate the checkout's branch (M3 gate runs on these regardless of
+ *   verdict — symbolic-ref/update-ref/branch -f have NO legacy pattern).
+ * - force-push hygiene: `--force-with-lease` / `--force-if-includes` are NOT
+ *   force (the legacy `--force\b` regex false-matches them); a force-with-lease
+ *   push classifies `block:push` (ownership path), not `block:force-push`.
+ */
+export function classifyGitCommandDetailed(command) {
+  const { repoHint, gitDirHint } = skimGitGlobalFlags(command);
+  const invocations = _allGitInvocations(command);
+  const out = {
+    verdict: "allow", repoHint, gitDirHint, verb: invocations[0]?.verb ?? null,
+    verbArgs: invocations[0]?.args ?? [], branchState: false, newBranch: null,
+    pushDst: null, pushTargets: [], isPushDelete: false,
+    renameFrom: null, renameTo: null, syncSource: null,
+  };
+  if (invocations.length === 0) return { ...out, verdict: "allow-non-git" };
+
+  // ── verb-anchored legacy destructive patterns ──
+  // Run on the RAW command (compound chains: `git pull && git merge`), and if
+  // that misses, on the SKIMMED first invocation (`git -C x checkout main` ≡
+  // `git checkout main` — the -C/-c/GIT_DIR prefixes defeat the raw regexes,
+  // which is exactly why they were verified bypasses).
+  const raw = String(command ?? "").trim();
+  const skimmedFirst = `git ${invocations[0].verb ?? ""} ${(invocations[0].args || []).join(" ")}`.trim();
+  for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
+    if (re.test(raw)) { out.verdict = `block:${name}`; break; }
+  }
+  if (out.verdict === "allow" && skimmedFirst !== "git") {
+    for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
+      if (re.test(skimmedFirst)) { out.verdict = `block:${name}`; break; }
+    }
+  }
+
+  const commitInv = invocations.find((v) => v.verb === "commit");
+  const pushInv = invocations.find((v) => v.verb === "push");
+  const stateInv = invocations.find((v) =>
+    ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb));
+  const syncInv = invocations.find((v) => ["merge", "pull", "rebase"].includes(v.verb));
+
+  // ── push: refspec targets + force-push hygiene (highest priority — a
+  // compound commit+push is adequately gated by the push target check) ──
+  if (pushInv) {
+    const legacyVerdict = out.verdict;
+    const args = pushInv.args;
+    const joined = `git push ${args.join(" ")}`;
+    const deleteIdx = args.findIndex((a) => a === "--delete" || a.startsWith("--delete="));
+    const colonTargets = args.filter((a) => /^:/.test(a));
+    if (deleteIdx !== -1 || colonTargets.length > 0 || legacyVerdict === "block:push-delete") {
+      out.isPushDelete = true;
+      out.verdict = "block:push-delete";
+      out.pushTargets = [...(deleteIdx !== -1 ? args.slice(deleteIdx + 1) : []), ...colonTargets]
+        .filter((x) => !x.startsWith("-"))
+        .map((x) => _stripQuotes(x).replace(/^:/, "").replace(/^refs\/heads\//, ""))
+        .filter(Boolean);
+    } else if (legacyVerdict === "allow" || legacyVerdict === "block:force-push") {
+      out.verdict = "block:push";
+      // git push [remote] [refspec...] — the FIRST positional is the REMOTE
+      // when there are ≥2 positionals (push.default=simple: refspec == src)
+      const positionals = args.filter((x) => !x.startsWith("-"));
+      const refspecs = positionals.length > 1 ? positionals.slice(1) : [];
+      out.pushTargets = refspecs.map(_refspecDst).filter((x) => x !== null && x !== undefined);
+      out.pushDst = out.pushTargets.length === 1 ? out.pushTargets[0] : null;
+      const hasPlainForce = /(^|\s)-f(\s|$)/.test(joined) || /(^|\s)--force(\s|$)/.test(joined);
+      if (out.verdict === "block:force-push" || hasPlainForce) {
+        if (hasPlainForce) out.verdict = "block:force-push";
+        else out.verdict = "block:push"; // legacy --force\b false-matched lease/includes
+      }
+    }
+    // legacyVerdict was some other destructive (reset etc.) → keep it
+  }
+
+  // ── commit matcher (excludes commit-graph/commit-tree) — only when no
+  // push or legacy destructive verdict already applies ──
+  if (commitInv && !pushInv && out.verdict === "allow") {
+    out.verdict = "block:commit";
+  }
+
+  // ── sync-source for merge/pull/rebase (ownership allowance) ──
+  if (syncInv && !pushInv) {
+    const args = syncInv.args;
+    const pos = args.filter((x) => !x.startsWith("-"));
+    if (syncInv.verb === "merge") out.syncSource = pos[0] ?? null;
+    else if (pos.length > 1) out.syncSource = pos[1] ?? null; // pull/rebase [remote] [ref]
+    else out.syncSource = pos[0] ?? null;
+  }
+
+  // ── branch-state verbs (M3 gate) ──
+  if (stateInv) {
+    const verb = stateInv.verb;
+    const args = stateInv.args;
+    if (verb === "checkout" || verb === "switch") {
+      out.branchState = true;
+      const flag = ["-B", "--orphan", "-b", "-c"].find((f) => args.includes(f));
+      if (flag) {
+        const idx = args.indexOf(flag);
+        out.newBranch = args[idx + 1] ?? null;
+      }
+    } else if (verb === "symbolic-ref" || verb === "update-ref") {
+      const pos = args.filter((x) => !x.startsWith("-"));
+      if ((verb === "symbolic-ref" && pos[0] === "HEAD") ||
+          (verb === "update-ref" && pos[0] && (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD"))) {
+        out.branchState = true;
+      }
+    } else if (verb === "branch") {
+      if (args.includes("-m") || args.includes("-M")) {
+        const pos = args.filter((x) => !x.startsWith("-"));
+        out.branchState = true;
+        out.renameFrom = pos[0] ?? null;
+        out.renameTo = pos[1] ?? null;
+      } else if (args.includes("-f") || args.includes("--force") ||
+                 args.includes("-D") || args.includes("-d")) {
+        // P1-B: -D/-d delete must set newBranch so the allowance target list is
+        // non-empty (a ceremony `git branch -D $PR_BRANCH` on the own branch is
+        // allowed; without this, ownershipAllowed([]) is false -> false-block).
+        out.branchState = true;
+        out.newBranch = args.filter((x) => !x.startsWith("-"))[0] ?? null;
+      }
+    }
+    // P1-A: expose the STATE-mutating invocation's verb/args — M3 must classify
+    // the invocation that changes branch state, not invocations[0] (a compound
+    // `git pull && git checkout main` would otherwise classify "pull" and skip
+    // the gate, or false-block the sanctioned create-new carve-out).
+    out.stateVerb = verb;
+    out.stateArgs = args;
+  }
+
+  return out;
+}
+
 /**
  * Is this cwd inside a git WORKTREE (as opposed to the main checkout)?
  * Main checkout: git-common-dir is ".git" (or the real .git path).

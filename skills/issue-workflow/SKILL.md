@@ -136,6 +136,12 @@ gh issue edit $ISSUE --remove-label implementing || true
 
 > ⛔ **This gate runs BEFORE any work on the issue.** Every issue gets its own branch. Every parallel subagent gets its own worktree. This prevents the 2026-08-06 incident where parallel agents collided in the shared main checkout and #74's work landed on #73's branch (PR #75 contained both).
 
+### 0. Worktree-first rule (#265 — enforced, not advisory)
+
+**Non-infra repos:** primary sessions AND write-capable sub-agent dispatches MUST run in an isolated worktree — never on the shared main checkout. The main-worktree-guard now enforces this mechanically: branch-state changes in a non-infra main checkout are BLOCKED, commits off the session baseline are BLOCKED, and sub-agents no longer inherit `AGENT_ALLOW_MAIN_EDITS` (the env pivot, #265). If the Branch Gate below detects you are in a non-infra main checkout, create a worktree first (using-git-worktrees skill) and run the gate from there.
+
+**Agent-infra (the infra repo itself):** sessions work IN main by design (#99 — extensions/skills load from the main checkout via the symlink farm). In-main `git checkout -b <branch>` is legal there (the guard's M3 create-new carve-out, #265) and the baseline re-adopts the new branch synchronously. Do NOT create a worktree for agent-infra issues.
+
 ### 1. Branch Gate (runs first — before edits or dispatch)
 
 ```bash
@@ -194,7 +200,7 @@ echo "✅ On matching branch: $CURRENT_BRANCH"
 
 ### 2. Worktree Gate (runs for parallel subagent dispatch)
 
-When dispatching multiple subagents that write to the same repo, each subagent MUST get its own worktree. The dispatcher creates them and passes the path via `cwd` — never dispatch two subagents to the same checkout.
+When dispatching multiple subagents that write to the same repo, each subagent MUST get its own worktree. The dispatcher creates them and passes the path via `cwd` — never dispatch two subagents to the same checkout. **After #265 this extends to SINGLE write-capable implementer sub-agents in non-infra repos:** the sub-agent env no longer carries `AGENT_ALLOW_MAIN_EDITS`, so a write-capable sub-agent dispatched with `cwd` = a non-infra main checkout is blocked on write/edit + destructive git. Read-only sub-agents (reviewers, researchers) need no worktree — the guard only blocks writes.
 
 ```bash
 # Dispatcher creates an isolated worktree for each subagent:

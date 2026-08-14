@@ -69,6 +69,9 @@ function extractJson(text: string): any | null {
 const SKIP_ENV = {
   LOOP_ENFORCER_DISABLED: "1", VISION_INTERCEPTOR_DISABLED: "1",
   SKILL_ENFORCER_DISABLED: "1", SLACK_BRIDGE_DISABLE: "1",
+  // #265: AGENT/ELDATO_ALLOW_MAIN_EDITS is NO LONGER set by subAgentEnv; it is
+  // kept here as an EXPLICIT fixture choice (this spawned sub-agent only reads
+  // a file in tmp/, outside any repo — the guard never sees a main checkout).
   ELDATO_ALLOW_MAIN_EDITS: "1",
 };
 
