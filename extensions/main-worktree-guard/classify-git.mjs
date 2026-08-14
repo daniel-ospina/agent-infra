@@ -105,7 +105,7 @@ function _tokenize(command) {
       // must tokenize as TWO invocations (review P2: no-space compounds evaded M2).
       // Consume the metachar so the outer loop advances (an empty-token break
       // would infinite-loop — i never moves past it).
-      if (ch === "&" || ch === "|" || ch === ";") { i++; break; }
+      if (ch === "&" || ch === "|" || ch === ";" || ch === "(" || ch === ")") { i++; break; }
       if (ch === "\\" && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
       tok += ch; i++;
     }

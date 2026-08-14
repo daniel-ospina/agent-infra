@@ -142,6 +142,9 @@ export function tokenize(command) {
       }
       if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
       if (/\s/.test(ch)) break;
+      // Subs hell parens are token boundaries — `git add . && (git commit -m x)`
+      // must gate the commit (review P2, cycle 2 — same class as the metachar fix).
+      if (ch === "(" || ch === ")") { i++; break; }
       if (ch === "\\" && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
       tok += ch; i++;
     }

@@ -337,6 +337,10 @@ dexpect("P1-B: branch -D own → newBranch set", `git branch -D feat/1`, { verdi
 // -d is a SOFT delete: legacy verdict stays allow (M3 still gates it via
 // branchState=true + newBranch — the allowance target list must be non-empty).
 dexpect("P1-B: branch -d own → branchState + newBranch (allow)", `git branch -d feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1" });
+// ── P2 (cycle 2) regression: subshell-paren compounds ───────────────────────
+dexpect("P2: add && (commit) → block:commit", `git add . && (git commit -m x)`, { verdict: "block:commit" });
+expectBool("P2: commit && (checkout main) → branchState", classifyGitCommandDetailed(`git commit -m x && (git checkout main)`).branchState, true);
+expectBool("P2: (checkout main) alone → branchState", classifyGitCommandDetailed(`(git checkout main)`).branchState, true);
 
 // Cross-consistency: resolveEffectiveRepo (branch-ownership) and the detailed
 // classifier's skimmer must agree on repo identity for adversarial commands.
