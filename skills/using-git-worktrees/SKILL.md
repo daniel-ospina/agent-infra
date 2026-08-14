@@ -279,6 +279,60 @@ echo "recovering stranded main checkout" >> ~/.pi/agent/.allow-main-edits   # re
 - **Traversal-guarded:** only a regular file counts — a directory or symlink at the path is ignored (fail-closed).
 - **Cleanup:** `rm ~/.pi/agent/.allow-main-edits` after the operation (the TTL would do it anyway).
 
+
+## Launching Nested pi
+
+> **Never launch an unbounded nested pi.** Every nested or background `pi`
+> launch MUST carry a hard timeout (30 minutes — the bounded-launch template
+> below), a log redirect (`> /tmp/<launch-unique>.log 2>&1` — unique per
+> launch; the template names it via `mktemp`), and a liveness
+> marker — a `[task-heartbeat]` line written to the log at regular intervals
+> (markers require `TASK_HEARTBEAT=1` AND `PI_MODE=print` set explicitly on
+> the launch — the runtime writes them only when both are present; the task
+> tool injects both, a manual nested launch must set them itself).
+> Abort semantics: no marker within the window → the process is dead or
+> blocked at the OS level → ABORT; markers present but no completion → the
+> timeout is the bound — do NOT extend it. Note: marker presence ≠ progress —
+> a gate-stalled pi keeps writing markers, which is exactly why the hard
+> deadline is non-negotiable. On abort: kill the launch, surface the failure
+> to the user, and never wait indefinitely — a silent wait is the failure
+> mode this rule eliminates. The ONLY sanctioned guard escape is the terminal
+> one-liner in `using-git-worktrees` (Guard Escape section), executed by the
+> user in their own terminal — never by an agent tool, which the
+> main-worktree guard blocks. When a bounded form is impossible, do not
+> launch — escalate to the user instead.
+
+### Bounded-launch template — the ONLY sanctioned form of nested pi
+
+```bash
+# Bounded nested pi launch — the ONLY sanctioned form of nested pi:
+LOG="$(mktemp /tmp/nested-pi.XXXXXX)"
+PI_MODE=print TASK_HEARTBEAT=1 pi -p "<prompt>" > "$LOG" 2>&1 &
+launch_pid=$!
+echo "launched $launch_pid → $LOG"
+
+# Deadline watchdog — portable sleep-deadline + kill -0 liveness probe
+# (no GNU timeout on macOS): SIGTERM at 1800s; SIGKILL after a 60s grace.
+( sleep 1800; if kill -0 "$launch_pid" 2>/dev/null; then kill "$launch_pid"; pkill -P "$launch_pid" 2>/dev/null; sleep 60; kill -9 "$launch_pid" 2>/dev/null; fi ) &
+
+# Liveness check + abort trigger — [task-heartbeat] markers land on stderr
+# every 30s (2>&1 merged). No marker within 60s → the process is dead or
+# blocked at the OS level → ABORT. Markers present → the launch is ALIVE and
+# the 30-min deadline watchdog is the only remaining bound — do NOT kill here:
+sleep 60
+if grep -q '\[task-heartbeat\]' "$LOG"; then
+  echo "ALIVE — bounded by the 30-min deadline watchdog"
+else
+  echo "NO MARKER — ABORTING (process dead/blocked at OS level)"
+  kill "$launch_pid" 2>/dev/null
+  pkill -P "$launch_pid" 2>/dev/null
+  echo "ABORTED — surfacing to user"
+  exit 1
+fi
+```
+
+> Template semantics: `LOG` is created via `mktemp` BEFORE the launch (`$$` is the shell pid — two backgrounded launches in one bash call would collide on a `$$`-derived name; `${launch_pid}` inside the redirect is wrong because the redirect is evaluated before `$!` is captured). The deadline watchdog is the primary guarantee (SIGTERM at 30 min, SIGKILL after 60s grace — the portable equivalent of GNU `timeout --kill-after=60 1800`, which does not exist on macOS). The abort trigger is CONDITIONAL: `kill` executes only when grep finds no marker — a healthy launch that prints ALIVE is never killed at 60s. `pkill -P "$launch_pid"` is best-effort (BSD pkill exists on macOS); grandchildren may linger (accepted — full tree-kill is an extension-side concern, out of scope).
+
 ### Missing MCP tools in worktree sessions (NVIDIA, Supabase, etc.)
 
 - **Problem:** `.mcp.json` is gitignored (contains embedded API keys) and is therefore absent from all worktrees. When Claude Code is opened in a worktree directory, no MCP servers register → `issue-scoping`, `code-review`, `prototype-review` and any skill that routes to NVIDIA falls back to Claude sub-agents.
@@ -312,7 +366,11 @@ Ready to implement auth feature
 - Skip CLAUDE.md check
 - Use `$PWD` or `git rev-parse --show-toplevel` for path construction — always use `$MAIN_REPO` from Step 0
 
+**Never:**
+- Launch an unbounded nested/background `pi` — always use the bounded-launch template in `## Launching Nested pi` (hard timeout + log redirect + liveness marker; abort on no-marker).
+
 **Always:**
+- Bound every nested/background pi launch (`PI_MODE=print TASK_HEARTBEAT=1`, `mktemp` log, `sleep 1800` + `kill -0` watchdog) and prefer the terminal one-liner for guard escapes.
 - Resolve `$MAIN_REPO` via `git rev-parse --git-common-dir` before anything else (Step 0)
 - Follow directory priority: existing > CLAUDE.md > ask
 - Verify directory is ignored for project-local

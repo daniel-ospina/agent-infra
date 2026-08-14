@@ -37,6 +37,58 @@ Execute plan by dispatching fresh subagent per task, with two-stage review after
 
 This rule applies recursively: if an implementer subagent itself dispatches further subagents (rare but allowed), it must forward the same worktree path, not create a new one.
 
+
+## Never-Unbounded-Launch Rule
+
+> **Never launch an unbounded nested pi.** Every nested or background `pi`
+> launch MUST carry a hard timeout (30 minutes — the bounded-launch template
+> below), a log redirect (`> /tmp/<launch-unique>.log 2>&1` — unique per
+> launch; the template names it via `mktemp`), and a liveness
+> marker — a `[task-heartbeat]` line written to the log at regular intervals
+> (markers require `TASK_HEARTBEAT=1` AND `PI_MODE=print` set explicitly on
+> the launch — the runtime writes them only when both are present; the task
+> tool injects both, a manual nested launch must set them itself).
+> Abort semantics: no marker within the window → the process is dead or
+> blocked at the OS level → ABORT; markers present but no completion → the
+> timeout is the bound — do NOT extend it. Note: marker presence ≠ progress —
+> a gate-stalled pi keeps writing markers, which is exactly why the hard
+> deadline is non-negotiable. On abort: kill the launch, surface the failure
+> to the user, and never wait indefinitely — a silent wait is the failure
+> mode this rule eliminates. The ONLY sanctioned guard escape is the terminal
+> one-liner in `using-git-worktrees` (Guard Escape section), executed by the
+> user in their own terminal — never by an agent tool, which the
+> main-worktree guard blocks. When a bounded form is impossible, do not
+> launch — escalate to the user instead.
+
+### Bounded nested pi launch (the ONLY sanctioned form)
+
+```bash
+# Bounded nested pi launch — the ONLY sanctioned form of nested pi:
+LOG="$(mktemp /tmp/nested-pi.XXXXXX)"
+PI_MODE=print TASK_HEARTBEAT=1 pi -p "<prompt>" > "$LOG" 2>&1 &
+launch_pid=$!
+echo "launched $launch_pid → $LOG"
+
+# Deadline watchdog — portable sleep-deadline + kill -0 liveness probe
+# (no GNU timeout on macOS): SIGTERM at 1800s; SIGKILL after a 60s grace.
+( sleep 1800; if kill -0 "$launch_pid" 2>/dev/null; then kill "$launch_pid"; pkill -P "$launch_pid" 2>/dev/null; sleep 60; kill -9 "$launch_pid" 2>/dev/null; fi ) &
+
+# Liveness check + abort trigger — [task-heartbeat] markers land on stderr
+# every 30s (2>&1 merged). No marker within 60s → the process is dead or
+# blocked at the OS level → ABORT. Markers present → the launch is ALIVE and
+# the 30-min deadline watchdog is the only remaining bound — do NOT kill here:
+sleep 60
+if grep -q '\[task-heartbeat\]' "$LOG"; then
+  echo "ALIVE — bounded by the 30-min deadline watchdog"
+else
+  echo "NO MARKER — ABORTING (process dead/blocked at OS level)"
+  kill "$launch_pid" 2>/dev/null
+  pkill -P "$launch_pid" 2>/dev/null
+  echo "ABORTED — surfacing to user"
+  exit 1
+fi
+```
+
 ## When to Use
 
 ```dot
@@ -228,6 +280,7 @@ Final reviewer: All requirements met, ready to merge
 ## Red Flags
 
 **Never:**
+- Launch an unbounded nested `pi` — every nested/background pi launch carries the bounded template (TASK_HEARTBEAT=1 + PI_MODE=print, `mktemp` log, `sleep 1800` + `kill -0` watchdog, abort on no-marker) per the `## Never-Unbounded-Launch Rule` section.
 - Start implementation on main/master branch without explicit user consent
 - Skip reviews (spec compliance OR code quality)
 - Proceed with unfixed issues

@@ -95,6 +95,13 @@ For tasks where a slow prerequisite can run in parallel with planning:
 ```
 # In Step 0, before planning begins, start typecheck in the background:
 npm install --silent 2>&1 | tail -1 && npx tsc --noEmit > /tmp/typecheck-preflight.txt 2>&1 &
+# Bounded: this is a NON-pi background job — it needs the deadline watchdog + log
+# redirect (above) but NO [task-heartbeat] markers (pi-runtime-only). Never launch
+# a nested pi this way: nested pi launches carry the FULL bounded template
+# (TASK_HEARTBEAT=1 + PI_MODE=print + mktemp log + kill -0 watchdog) — see the
+# Background Execution Note below.
+# Deadline watchdog for ANY backgrounded job (portable; no GNU timeout on macOS):
+# ( sleep 1800; if kill -0 $! 2>/dev/null; then kill $! 2>/dev/null; fi ) &
 
 # Before starting implementation, check the result:
 if [ -f /tmp/typecheck-preflight.txt ] && [ -s /tmp/typecheck-preflight.txt ]; then
@@ -195,6 +202,37 @@ When a worker is **cut** — killed externally (provider cut, OOM, watchdog kill
 > **#195 pairing:** a killed mid-write worker may leave `index.lock` / partial worktree state — run the #195 worktree-recovery path before re-dispatching into that worktree.
 
 
+
+### Bounded nested pi launch — the ONLY sanctioned form
+
+```bash
+# Bounded nested pi launch — the ONLY sanctioned form of nested pi:
+LOG="$(mktemp /tmp/nested-pi.XXXXXX)"
+PI_MODE=print TASK_HEARTBEAT=1 pi -p "<prompt>" > "$LOG" 2>&1 &
+launch_pid=$!
+echo "launched $launch_pid → $LOG"
+
+# Deadline watchdog — portable sleep-deadline + kill -0 liveness probe
+# (no GNU timeout on macOS): SIGTERM at 1800s; SIGKILL after a 60s grace.
+( sleep 1800; if kill -0 "$launch_pid" 2>/dev/null; then kill "$launch_pid"; pkill -P "$launch_pid" 2>/dev/null; sleep 60; kill -9 "$launch_pid" 2>/dev/null; fi ) &
+
+# Liveness check + abort trigger — [task-heartbeat] markers land on stderr
+# every 30s (2>&1 merged). No marker within 60s → the process is dead or
+# blocked at the OS level → ABORT. Markers present → the launch is ALIVE and
+# the 30-min deadline watchdog is the only remaining bound — do NOT kill here:
+sleep 60
+if grep -q '\[task-heartbeat\]' "$LOG"; then
+  echo "ALIVE — bounded by the 30-min deadline watchdog"
+else
+  echo "NO MARKER — ABORTING (process dead/blocked at OS level)"
+  kill "$launch_pid" 2>/dev/null
+  pkill -P "$launch_pid" 2>/dev/null
+  echo "ABORTED — surfacing to user"
+  exit 1
+fi
+```
+ (docs(skills): portable bounded-launch template + drift guard for the never-unbounded-pi rule (#206))
+
 ## Anti-Patterns
 
 | Anti-Pattern | Why It Matters |
@@ -205,6 +243,7 @@ When a worker is **cut** — killed externally (provider cut, OOM, watchdog kill
 | No structured output format | Can't deduplicate or sort results. Enforce format in agent prompts |
 | Infinite review cycles | Always cap at 10 cycles. Surface remaining issues to human |
 | Waiting for background tasks synchronously | Defeats the purpose. Check background results before they're needed |
+| Unbounded nested/background `pi` launch (no timeout, no log redirect, no liveness marker) | A gate-stalled pi can hang the fleet ~29h (#206). Always use the bounded template (`PI_MODE=print TASK_HEARTBEAT=1`, `mktemp` log, `sleep 1800` + `kill -0` watchdog, abort on no-marker); the terminal one-liner is the ONLY guard escape. |
 | No fallback for subagent tool failures | If the subagent tool is unreachable (network, API down), the skill hangs. Always have a fallback: retry 3× with backoff, then surface to human with options to (a) retry, (b) proceed sequentially, (c) abort. |
 | Spawning worktrees/branches with no teardown record | Aborted dispatch silently orphans them (#195). Record every artifact before dispatch (`record-worktree.sh add`), remove on clean completion (`done`), sweep with `scan-orphans.sh` — abort leaves the record as the teardown manifest. |
 
