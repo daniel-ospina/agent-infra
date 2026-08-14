@@ -143,7 +143,7 @@ git diff --cached --name-only --no-renames | grep -qE '^(skills/|enforcement/|AG
   - If it fails: **stop immediately** and report. Do not commit.
 - If `HAS_SKILL_CHANGES=false`: skip silently.
 
-> Script ported into agent-infra in #239 (from eldato @ 49afc61f, blob fb4c5357). The `enforce-skills.yml` workflow (#252) runs it nightly (06:00 UTC) + on push to main + manual — drift coverage is this pre-flight trigger AND the CI gate; the pre-flight catches commit-time, CI catches main-drift not tied to a commit.
+> Script ported into agent-infra in #239 (from eldato @ 49afc61f, blob fb4c5357). The `enforce-skills.yml` workflow (#252) runs it nightly (06:00 UTC) + on push to main + manual — drift coverage is this pre-flight trigger AND the CI gate; the pre-flight catches commit-time, CI catches main-drift not tied to a `skills/|enforcement/|AGENTS.md` commit.
 
 ## Issue Detection
 

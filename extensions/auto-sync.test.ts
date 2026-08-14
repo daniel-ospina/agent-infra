@@ -165,6 +165,10 @@ async function main() {
     const pp = makeClone(o);
     writeFileSync(join(pp, "plan.md"), "plan\n");
     git(pp, "add -A");
+    // CI runners have no global git identity — set it locally before the raw
+    // commit (the commit() helper does this; this path bypasses it).
+    git(pp, "config user.email test@auto-sync.local");
+    git(pp, "config user.name \"auto-sync test\"");
     git(pp, "commit -q -m 'add plan.md'");
     git(pp, "push -q origin main");
     git(strandedIdenticalUntracked.repo, "fetch -q origin");
