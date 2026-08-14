@@ -6,3 +6,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
+
+# worktrees (parallel agent isolation)
+.worktrees/

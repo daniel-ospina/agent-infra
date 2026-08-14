@@ -8,7 +8,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { parsePidList, getChildPids, treeKill } from "./tree-kill.js";
+import { parsePidList, getChildPids, treeKill, execTimeoutMs } from "./tree-kill.js";
 import { ok, equal } from "node:assert/strict";
 
 let passed = 0;
@@ -82,6 +82,45 @@ test("getChildPids on dead PID returns []", () => {
 test("treeKill guards pid <= 1 (never signals init)", () => {
 	treeKill(1, "SIGTERM"); // must not throw
 	treeKill(0, "SIGTERM");
+});
+
+// ── execTimeoutMs — env-overridable kill-path cap (#209) ────
+
+section("execTimeoutMs — env-overridable pgrep/ps cap (#209)");
+
+test("defaults to 5s", () => {
+	delete process.env.TREE_KILL_EXEC_TIMEOUT_MS;
+	equal(execTimeoutMs(), 5000, "default 5s (was hardcoded 2s)");
+});
+
+test("reads TREE_KILL_EXEC_TIMEOUT_MS override", () => {
+	process.env.TREE_KILL_EXEC_TIMEOUT_MS = "10000";
+	try {
+		equal(execTimeoutMs(), 10000);
+	} finally {
+		delete process.env.TREE_KILL_EXEC_TIMEOUT_MS;
+	}
+});
+
+test("invalid / absent / non-positive → default", () => {
+	process.env.TREE_KILL_EXEC_TIMEOUT_MS = "abc";
+	try {
+		equal(execTimeoutMs(), 5000, "garbage → default");
+	} finally {
+		delete process.env.TREE_KILL_EXEC_TIMEOUT_MS;
+	}
+	process.env.TREE_KILL_EXEC_TIMEOUT_MS = "0";
+	try {
+		equal(execTimeoutMs(), 5000, "non-positive → default");
+	} finally {
+		delete process.env.TREE_KILL_EXEC_TIMEOUT_MS;
+	}
+	process.env.TREE_KILL_EXEC_TIMEOUT_MS = "-5";
+	try {
+		equal(execTimeoutMs(), 5000, "negative → default");
+	} finally {
+		delete process.env.TREE_KILL_EXEC_TIMEOUT_MS;
+	}
 });
 
 // ── Real process children ─────────────────────────────
