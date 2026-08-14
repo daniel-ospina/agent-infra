@@ -716,7 +716,7 @@ async function main() {
     }
   });
 
-  test("scenario 22 (#825): sub-agent commit on UNVERIFIED files is blocked with a report-to-parent message", async () => {
+  test("scenario 22 (#825/#264): sub-agent commit on UNVERIFIED files is blocked with a self-verify instruction", async () => {
     const repo = join(TEST_ROOT, "repo-subagent");
     git(repo, "reset -q");
     const prevMode = process.env.PI_MODE;
@@ -734,10 +734,13 @@ async function main() {
       ok(res && res.block === true, "unverified sub-agent commit must be blocked");
       // Discriminating markers: the INTERACTIVE message also contains the bare
       // substring "sub-agent" ("Dispatch the verifier sub-agent"), so assert
-      // sub-agent-only phrasing + absence of the parent-style instruction.
+      // sub-agent-only phrasing + the in-band self-verify instruction (#264:
+      // the child HAS the task tool and self-satisfies VGATE — the old
+      // report-to-parent contract is gone).
       ok(res.reason.includes("This session is a task sub-agent"), `block reason must carry the sub-agent marker, got: ${res.reason.slice(0, 200)}`);
-      ok(/Report this block/.test(res.reason), "sub-agent block must tell the sub-agent to report to the parent");
-      ok(!/task\(prompt=/.test(res.reason), "sub-agent block must NOT instruct a task dispatch (parent-enforced)");
+      ok(/Dispatch your own VGATE verification/.test(res.reason), "sub-agent block must instruct the child to self-satisfy the gate via its own task-tool dispatch");
+      ok(/task\(prompt='\[VGATE\] verify files: fileU\.txt/.test(res.reason), "sub-agent block must show the self-dispatch task(...) template naming the blocked files");
+      ok(!/Report this block/.test(res.reason), "sub-agent block must NOT tell the child to report back to the parent (dead-end contract removed)");
       ok(!/Dispatch the verifier sub-agent/.test(res.reason), "sub-agent block must NOT carry the parent's verifier-dispatch instruction");
     } finally {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
@@ -787,7 +790,7 @@ async function main() {
     ok(!/Report this block/.test(res.reason), "sub-agent report-to-parent message must NOT leak into interactive sessions");
   });
 
-  test("scenario 25 (#825): sub-agent editing a parent-verified file (hash mismatch) is blocked, no auto-bypass", async () => {
+  test("scenario 25 (#825/#264): sub-agent editing a parent-verified file (hash mismatch) blocks, then self-satisfies VGATE in-band and commits", async () => {
     const repo = join(TEST_ROOT, "repo-subagent-2");
     mkdirSync(repo, { recursive: true });
     git(repo, "init -b main");
@@ -824,17 +827,40 @@ async function main() {
       // the registry hash no longer matches disk → MISMATCH, fail-closed.
       writeFileSync(join(repo, "fileM.txt"), "m3\n");
       git(repo, "add fileM.txt");
-      for (let i = 0; i < 4; i++) {
+      for (let i = 0; i < 3; i++) {
         const res = await fire("tool_call", {
           type: "tool_call", toolName: "bash",
           input: { command: "git commit -m 'subM'", cwd: repo },
         });
-        ok(res && res.block === true, `mismatch attempt ${i + 1} must block in sub-agent mode`);
+        ok(res && res.block === true, `mismatch attempt ${i + 1} must block in sub-agent mode (no auto-bypass)`);
         if (i === 0) {
           ok(/Hash mismatch/.test(res.reason), "block reason must carry the hash-mismatch diagnostic");
           ok(res.reason.includes("This session is a task sub-agent"), "mismatch block must still carry the sub-agent marker");
+          ok(/Dispatch your own VGATE verification/.test(res.reason), "mismatch block must instruct the child to self-satisfy the gate in-band");
+          ok(/task\(prompt='\[VGATE\] verify files: fileM\.txt/.test(res.reason), "mismatch block must show the self-dispatch task(...) template naming the blocked file");
+          ok(!/Report this block/.test(res.reason), "mismatch block must NOT carry the old report-to-parent contract");
         }
       }
+      // #264: the child HAS the task tool (builtin-tools registers it
+      // unconditionally), so it self-satisfies the gate — dispatches its own
+      // [VGATE] verification; the tool_result handler merges the PASS exactly
+      // like the parent's (verifier reports the CURRENT disk hash m3).
+      const passJson = JSON.stringify({
+        status: "PASS",
+        failures: [],
+        verified_files: [{ path: join(repo, "fileM.txt"), hash: sha("m3\n") }],
+      });
+      await fire("tool_result", {
+        toolName: "task",
+        input: { prompt: `[VGATE] verify files: fileM.txt. Classification: backend. Project root: ${repo}` },
+        content: [{ type: "text", text: passJson }],
+      });
+      const passed = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'subM'", cwd: repo },
+      });
+      equal(passed, undefined, "after the child self-dispatches VGATE verification, the commit passes");
+      git(repo, "commit -m subM"); // make the state real
     } finally {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
@@ -914,6 +940,80 @@ async function main() {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
+  });
+
+  test("scenario 28 (#264 P2/P3): TASK_HEARTBEAT_DISABLE=1 child still discriminates as a task sub-agent — marker forced by builtin-tools, no auto-bypass", async () => {
+    // A parent with TASK_HEARTBEAT_DISABLE=1 must NOT spawn a markerless child:
+    // builtin-tools now sets TASK_HEARTBEAT=1 on EVERY task child regardless of
+    // the disable flag (DISABLE still flows to the child via the env spread — it
+    // only gates the task-heartbeat EMITTER, which that extension checks itself).
+    // Without the forced marker the child would hit the interactive path and
+    // reach #7591 auto-bypass on unverified commits.
+    const repo = join(TEST_ROOT, "repo-subagent-4");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "fileD.txt"), "d1\n");
+    git(repo, "add fileD.txt");
+    git(repo, "commit -m baseline");
+    writeFileSync(join(repo, "fileD.txt"), "d2\n");
+    git(repo, "add fileD.txt");
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevDisable = process.env.TASK_HEARTBEAT_DISABLE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1"; // forced by builtin-tools even under DISABLE
+    process.env.TASK_HEARTBEAT_DISABLE = "1"; // parent-side opt-out flows to the child
+    try {
+      await fire("session_start", {});
+      for (let i = 0; i < 4; i++) {
+        const res = await fire("tool_call", {
+          type: "tool_call", toolName: "bash",
+          input: { command: "git commit -m 'subD'", cwd: repo },
+        });
+        ok(res && res.block === true, `DISABLE child attempt ${i + 1} must block in sub-agent mode (no interactive auto-bypass)`);
+        if (i === 0) {
+          ok(res.reason.includes("This session is a task sub-agent"), "DISABLE child must get the sub-agent block message, not the interactive dispatch message");
+          ok(/Dispatch your own VGATE verification/.test(res.reason), "DISABLE child must be told to self-satisfy the gate in-band");
+        }
+      }
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevDisable === undefined) delete process.env.TASK_HEARTBEAT_DISABLE; else process.env.TASK_HEARTBEAT_DISABLE = prevDisable;
+    }
+  });
+
+  test("scenario 29 (#264 P2): sub-agent session with 0 bridge-recovered files logs a startup warning surfaced in the task result", async () => {
+    // Bridge-absent/stale sub-agent session: recoverBridgeForRoot returns 0 with
+    // no diagnostic, the child's verifiedSet is empty, and every changed-file
+    // commit is a block. The fix logs an audible warning in the child's startup
+    // output so the parent sees it in the task result instead of discovering the
+    // dead-end only via a silent all-block task report. (The harness's own git
+    // root — agent-infra — is never in the bridge: prior scenarios only write
+    // TEST_ROOT repo entries, so recovery here must be 0.)
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const captured: string[] = [];
+    const origLog = console.log;
+    const origErr = console.error;
+    process.env.PI_MODE = "print"; // builtin-tools task-child markers (#172/#825)
+    process.env.TASK_HEARTBEAT = "1";
+    try {
+      console.log = ((msg: string, ...rest: unknown[]) => { captured.push(String(msg)); origLog(msg, ...rest); }) as typeof console.log;
+      console.error = ((msg: string, ...rest: unknown[]) => { captured.push(String(msg)); origErr(msg, ...rest); }) as typeof console.error;
+      await fire("session_start", {});
+    } finally {
+      console.log = origLog;
+      console.error = origErr;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+    ok(
+      captured.some(l => l.includes("0 bridge-recovered files")),
+      `sub-agent startup must warn on empty bridge recovery, got: ${captured.join(" | ")}`
+    );
   });
 } // main: plugin loaded; tests run sequentially via runAll()
 

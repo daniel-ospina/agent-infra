@@ -151,9 +151,13 @@ const BRIDGE_DIR = join(homedir(), ".pi", "agent", "verification");
 // extension gates itself on exactly this pair); swarm_daemon workers set only
 // PI_MODE=print, so isPrintModeEnv() alone would misclassify them — they have
 // no parent session to report blocks to, and must keep the interactive
-// dispatch message + #7591 auto-bypass (status quo). Edge: a parent with
-// TASK_HEARTBEAT_DISABLE=1 spawns a child without the marker → treated as
-// interactive (it retains the task tool and can self-dispatch the verifier).
+// dispatch message + #7591 auto-bypass (status quo). #264 review: builtin-tools
+// sets TASK_HEARTBEAT=1 UNCONDITIONALLY on task children — even when the
+// parent set TASK_HEARTBEAT_DISABLE=1 (the DISABLE flag only gates the
+// task-heartbeat EMITTER, which that extension checks itself; it still flows
+// to the child via the env spread). A task child can therefore NEVER fall
+// back to the interactive path: #7591 auto-bypass is unreachable for
+// sub-agent commits (#264 P2/P3).
 function isTaskSubAgent(): boolean {
   return process.env.TASK_HEARTBEAT === "1" && process.env.PI_MODE === "print";
 }
@@ -827,6 +831,15 @@ export default function (pi: ExtensionAPI) {
     const recovered = recoverBridgeForRoot(sessionRoot);
     if (recovered > 0) {
       console.log(`[verification-gate] 📂 Recovered ${recovered} verified files from bridge`);
+    } else if (isTaskSubAgent()) {
+      // #264 P2: bridge-absent (or stale) task-sub-agent session — the parent's
+      // verified-file registry is not available here, so EVERY changed-file
+      // commit will block until this session self-dispatches VGATE verification.
+      // Surfaced in the child's startup output so the parent sees it in the
+      // task result instead of discovering the dead-end only via a silent
+      // all-block task report.
+      console.log(`[verification-gate] ⚠️ Sub-agent session started with 0 bridge-recovered files for root ${sessionRoot} — the parent's verified-file registry is not available to this session; every changed-file commit will block until VGATE verification is dispatched (in-band via the task tool).`);
+      appendJsonl({ event: "gate_recovery_empty", extension: "verification-gate", subagent: true, root: sessionRoot, session_cwd: process.cwd() });
     }
     lastRecoveryMtime = 0;
     vgateFailures = 0;
@@ -976,12 +989,13 @@ export default function (pi: ExtensionAPI) {
     // auto-bypass (a block is final). Track block attempts per file; allow
     // only when ALL blocked files hit the threshold.
     if (unverified.length > 0 || mismatched.length > 0) {
-      // #825: task sub-agents (builtin-tools children — TASK_HEARTBEAT=1 +
+      // #825/#264: task sub-agents (builtin-tools children — TASK_HEARTBEAT=1 +
       // PI_MODE=print) get NO #7591 auto-bypass: a block is final. They inherit
       // the parent's verified registry via the bridge; retrying must never
-      // silently commit unverified files. The sub-agent stops and reports the
-      // block to the parent, which verifies and re-dispatches (or lands the
-      // change itself).
+      // silently commit unverified files. The sub-agent self-satisfies the gate
+      // in-band — it HAS the task tool, so it dispatches its own VGATE
+      // verification (the tool_result handler below merges PASS exactly like
+      // the parent's) and only then retries the commit.
       if (!isTaskSubAgent()) {
         const allBlockedFiles = [...unverified, ...mismatched.map(m => m.file)];
         let autoBypassed = 0;
@@ -1032,10 +1046,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     const allBlocked = [...unverified, ...mismatched.map(m => m.file)];
-    // #825: task sub-agents inherit the parent's verified-file registry via the
-    // bridge — a block here means the parent has NOT verified these files. The
-    // sub-agent must stop and report back (it cannot run the parent's verifier
-    // ceremony); the parent verifies and re-dispatches, or lands the change.
+    // #825/#264: task sub-agents inherit the parent's verified-file registry via
+    // the bridge — a block here means these files are NOT covered by it. Unlike
+    // the pre-#264 contract (block is FINAL, report to parent), the sub-agent
+    // HAS the task tool (builtin-tools registers it unconditionally) and its
+    // own tool_result handler merges a VGATE PASS exactly like the parent's —
+    // so it self-satisfies the gate in-band: dispatch its own VGATE
+    // verification, then retry the commit. The no-auto-bypass guard stays: a
+    // blocked sub-agent must still get verified (just via its own dispatch),
+    // never silently committed.
     const subAgentReason = [
       "⛔ Verification gate — blocking git operation (sub-agent).",
       "",
@@ -1043,12 +1062,14 @@ export default function (pi: ExtensionAPI) {
       "",
       `  This session is a task sub-agent: it inherits the parent session's`,
       "  verified-file registry via the bridge file, and these files are NOT",
-      "  covered by it. The parent must verify them before this commit can land.",
+      "  covered by it. This session HAS the task tool, so verify them in-band",
+      "  before retrying — do not ask the parent to re-run this task.",
       "",
-      `  → STOP. Do not retry, do not bypass. Report this block verbatim to the`,
-      `    parent session — the parent must dispatch VGATE verification`,
-      `    ([VGATE] verify files: ${allBlocked.join(' ')}) and re-run this task,`,
-      "    or verify the files itself before pushing.",
+      `  → Dispatch your own VGATE verification (self-satisfy the gate):`,
+      `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}.', ...)`,
+      "",
+      `  → On PASS, retry the git operation. Sub-agent commits get NO #7591`,
+      "    auto-bypass: an unverified commit blocks every time until verified.",
     ].join("\n");
     const reason = isTaskSubAgent()
       ? subAgentReason
