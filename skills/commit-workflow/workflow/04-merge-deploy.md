@@ -95,6 +95,15 @@ touching the default-branch worktree. If Step B's remote delete reports
 `remote ref does not exist`, the branch was already deleted server-side
 (deleteBranchOnMerge) — that is success, not an error.
 
+> **#265 branch-ownership allowance:** in agent-infra main, the main-worktree-guard
+> allows this ceremony's commands when the session is on its OWN baseline branch:
+> condition-5 `git merge origin/main`, Step B `git push origin --delete "$PR_BRANCH"`
+> and `git branch -D "$PR_BRANCH"`, and Stale-Merge's `rebase` + bare
+> `git push --force-with-lease` (the bare push compares the CURRENT branch — push
+> `--force-with-lease` is NOT classified as `--force`). If the guard reports "branch
+> ownership violated", the shared checkout was switched mid-ceremony — `git
+> checkout -b <fresh-branch>` (M3 carve-out re-baselines) and re-run the ceremony.
+
 
 ## Stale-Merge Recovery (#178/#181 — strict up-to-date ladder)
 

@@ -19,7 +19,9 @@ Execute all issues of an epic in dependency order by dispatching each issue as a
 
 ## Pre-flight: Worktree Check
 
-This skill reads files (epic docs, plans) but does NOT write code directly — it dispatches to task sub-agents. No worktree needed. Skip isolation.
+This skill reads files (epic docs, plans) but does NOT write code directly — it dispatches to task sub-agents. No worktree needed for the dispatcher itself. Skip isolation for the dispatcher.
+
+**#265 — implementer sub-agents need isolation:** sub-agents no longer inherit `AGENT_ALLOW_MAIN_EDITS` (env pivot). A WRITE-capable implementer sub-agent dispatched with `cwd` = a non-infra main checkout is blocked on write/edit + destructive git. Therefore: write-capable implementer sub-agents in non-infra repos MUST be dispatched with a per-issue worktree `cwd` (issue-workflow Worktree Gate, record-first per #195). Read-only sub-agents (reviewers, researchers) need no worktree — the guard only blocks writes. Agent-infra (the infra repo) is exempt via the repo fingerprint — implementers work in main by design (#99).
 
 ## The Process
 

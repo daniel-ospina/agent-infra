@@ -238,6 +238,8 @@ Ready to implement <feature-name>
   ```
   Never launch a nested/background `pi` to "escape" the guard — that is how a 29h fleet hang happened (2026-08-11→12, #206).
 
+> **#265 marker semantics (escaped hatch):** under the TTL marker (or the env flag), the guard's M2/M3 gates are INACTIVE (the escape hatch keeps its documented semantics — a stranded main checkout stays recoverable) but M1 detection stays ACTIVE: if the branch moves again mid-session you still get the warn. Sub-agents no longer inherit the hatch at all — the env pivot removed `AGENT_ALLOW_MAIN_EDITS` from subAgentEnv; only an EXPLICIT dispatcher-set flag or the marker opens it.
+
 ### Never launch an unbounded nested pi (#206) — hard rule
 
 - **Rule:** NEVER launch a nested `pi` (print-mode sub-agent, background session, recovery worker) without ALL THREE bounds:
@@ -275,9 +277,10 @@ echo "recovering stranded main checkout" >> ~/.pi/agent/.allow-main-edits   # re
 ```
 
 - **TTL:** the marker expires 15 minutes after its last modification — expiry is checked per tool_call (never cached), so a forgotten marker self-revokes.
-- **Never automatic for parallel sessions:** the marker only affects sessions running on the same machine/user; it never applies to other agents automatically.
+- **Never automatic for parallel sessions:** the marker only affects sessions running on the same machine/user; it never applies to other agents automatically. Under #265 the marker ALSO no longer applies to task sub-agents (they never inherit the hatch).
 - **Traversal-guarded:** only a regular file counts — a directory or symlink at the path is ignored (fail-closed).
 - **Cleanup:** `rm ~/.pi/agent/.allow-main-edits` after the operation (the TTL would do it anyway).
+- **#265 (branch ownership):** the marker opens M2/M3 (commit/push/branch-state gates are inactive under it) but M1 branch-deviation detection STAYS ACTIVE — a deliberate solo session still sees a warn if the tree moves again.
 
 ### Missing MCP tools in worktree sessions (NVIDIA, Supabase, etc.)
 

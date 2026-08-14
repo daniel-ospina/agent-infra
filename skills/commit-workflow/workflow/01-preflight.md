@@ -215,6 +215,8 @@ BEHIND=$(git rev-list --count HEAD.."origin/$DEFAULT_BRANCH" 2>/dev/null || echo
 | `BEHIND > 0` + clean tree | `git -c commit.gpgsign=false pull --rebase origin "$DEFAULT_BRANCH"`, then RE-RUN the affected pre-flight regression tests. If the branch was previously pushed and the post-rebase push is rejected as non-fast-forward → `git push --force-with-lease`. |
 | `BEHIND > 0` + dirty tree | **WARN**: "Branch is N behind origin/<default> — commit or stash first, then `git -c commit.gpgsign=false pull --rebase origin <default>`." NEVER autostash (conflict-unsafe unattended). |
 
+**Pre-flight: the main-worktree-guard's branch-ownership gates (#265) run on every bash tool_call.** In agent-infra main (where this skill works by design), the guard allows the session's OWN-branch hygiene ops — `pull --rebase`, `rebase`, `merge origin/<default>`, `push` incl. `--force-with-lease`, `push --delete` of the own branch, `branch -D` of the own branch — so this pre-flight's commands pass on the baseline branch. If a command is blocked with a "branch ownership violated" message, the shared checkout was switched under the session: `git checkout -b` a fresh branch (M3 carve-out re-baselines) and retry.
+
 Notes: `commit.gpgsign=false` is process-scoped and prevents headless pinentry
 hangs during rebase (fleet ships squash-merged; research-verified). Condition 5
 in 04-merge-deploy.md still governs overlap at merge time; repos with strict
