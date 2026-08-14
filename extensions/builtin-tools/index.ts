@@ -619,6 +619,15 @@ export function getSystemLoad(): number {
  * the static bound (#198) would still cut it. Scale: load < 8 → 1x; 8–15 →
  * 2x; ≥16 → 3x (bounded). Env-overridable via TASK_LOAD_SCALE_OFF=1.
  */
+let _load1Override: (() => number) | null = null;
+/** #272 test seam: inject a fixed load1 for the E-series (multi-tick latch
+ * tests). Pass null to restore the live os.loadavg() read. */
+export function setLoad1Override(fn: (() => number) | null): void { _load1Override = fn; }
+/** #272: live 1-min loadavg (os.loadavg()[0]) unless overridden (tests). */
+export function getLoad1(): number {
+  return _load1Override ? _load1Override() : getSystemLoad();
+}
+
 export function loadScaledBound(baseMs: number, load = getSystemLoad()): number {
   if (process.env.TASK_LOAD_SCALE_OFF === "1") return baseMs;
   if (load < 8) return baseMs;
@@ -896,6 +905,9 @@ export type HeartbeatKillReason =
 export interface HeartbeatKillDecision {
   kill: boolean;
   reason?: HeartbeatKillReason;
+  /** #272: the effective (latched) first-message bound after this tick —
+   * the loop threads it back as `latchedFirstMessageMs` next tick. */
+  firstMessageMs?: number;
   /** Kill resolves `undefined` (retryable) instead of a defined result —
    * true iff the kill fired and no REAL output ever arrived (#5926 retry
    * preservation). */
@@ -914,10 +926,16 @@ export interface HeartbeatDecisionInput {
   firstOutputTimeoutMs: number; // tier-1 (60s)
   streamStallMs: number; // S
   toolStallMs: number; // L
-  firstMessageMs: number; // M
+  firstMessageMs: number; // M (base; per-tick load scaling in #272)
   intervalMs: number; // clamped tick interval
   /** 0 = off; >0 = wall-clock cap markers cannot reset (code-review fix). */
   maxDispatchMs: number;
+  /** #272: live 1-min loadavg (injectable; absent/0 → scale inert). */
+  load1?: number;
+  /** #272: per-dispatch monotonic high-water mark of the effective
+   * first-message bound — the loop threads it back in so the bound only ever
+   * grows within a dispatch (no post-storm shrink re-cut). */
+  latchedFirstMessageMs?: number;
 }
 
 /**
@@ -942,6 +960,16 @@ export function heartbeatKillDecision(
   if (i.state.sessionEnded) {
     return { kill: false, resolveUndefined: false };
   }
+
+  // #272: effective first-message bound — load-scaled per tick, MONOTONIC per
+  // dispatch (never shrinks below the run's high-water mark; a storm that
+  // starts mid-dispatch extends the bound, and a post-storm load drop does
+  // NOT re-cut). Scale fn = loadScaledBound (bands 1x/2x/3x); load1 absent/0
+  // → scale inert (legacy-identical).
+  const effFirstMessageMs =
+    i.latchedFirstMessageMs === undefined
+      ? loadScaledBound(i.firstMessageMs, i.load1 ?? 0)
+      : Math.max(i.latchedFirstMessageMs, loadScaledBound(i.firstMessageMs, i.load1 ?? 0));
 
   // Tier-1 — first-output timeout: process-level startup hang (no real output,
   // no work marker, no ready marker).
@@ -1008,9 +1036,9 @@ export function heartbeatKillDecision(
     st.turnActive &&
     !st.turnSawMessage &&
     !(st.turnSawTool || st.toolsInFlight > 0) &&
-    effStreamAge > i.firstMessageMs
+    effStreamAge > effFirstMessageMs
   ) {
-    return kill("first-message-stall");
+    return { ...kill("first-message-stall"), firstMessageMs: effFirstMessageMs };
   }
 
   // 5. max-dispatch — opt-in total wall-clock cap (code-review fix): honest
@@ -1021,7 +1049,7 @@ export function heartbeatKillDecision(
     return kill("max-dispatch");
   }
 
-  return { kill: false, resolveUndefined: false };
+  return { kill: false, resolveUndefined: false, firstMessageMs: effFirstMessageMs };
 }
 
 export function stripHtml(html: string): string {
@@ -1471,10 +1499,14 @@ export default function (pi: ExtensionAPI) {
         toolStallMs: getToolStallMs(),
         // #209: load-aware — under a load storm the first message legitimately
         // stalls; scale the bound with loadavg (1x <8, 2x 8–15, 3x ≥16).
-        firstMessageMs: loadScaledBound(getFirstMessageMs()),
+        firstMessageMs: getFirstMessageMs(), // #272: base; per-tick scaled + latched in the loop
         intervalMs: getHeartbeatIntervalMs(),
         maxDispatchMs: getTaskMaxDispatchMs(),
       };
+      // #272: per-dispatch monotonic latch of the effective first-message
+      // bound — threaded through heartbeatKillDecision (load1 + latched),
+      // only ever grows (no post-storm re-cut); [task] log on increase.
+      let latchedEffM: number | undefined;
       const heartbeat = setInterval(() => {
         const now = Date.now();
         // Flush residue BEFORE deciding so a kill result sees everything so
@@ -1484,6 +1516,7 @@ export default function (pi: ExtensionAPI) {
         // Tier 1 + tier 2 (#176): one idle detector — tier-1 first-output
         // (startup hangs, retryable), then tool-stall → stream-stall →
         // silence → first-message over the parsed alive state.
+        const load1 = getLoad1();
         const decision = heartbeatKillDecision({
           now,
           startedAt,
@@ -1491,7 +1524,13 @@ export default function (pi: ExtensionAPI) {
           hasOutput,
           state: hbCtx.state,
           ...hbThresholds,
+          load1,
+          latchedFirstMessageMs: latchedEffM,
         });
+        if (decision.firstMessageMs !== undefined && (latchedEffM === undefined || decision.firstMessageMs > latchedEffM)) {
+          latchedEffM = decision.firstMessageMs;
+          console.error(`[task] first-message bound ${Math.round(getFirstMessageMs() / 1000)}s → ${Math.round(latchedEffM / 1000)}s (load1=${load1})`);
+        }
         if (!decision.kill) return;
         clearInterval(heartbeat);
         // #208: treeKill — the direct child's grandchildren (nested pi, MCP

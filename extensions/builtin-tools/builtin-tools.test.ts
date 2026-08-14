@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1 } from "./index.js";
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
 
@@ -1698,6 +1698,70 @@ test("session_end edge arms the completion watchdog; close composes via composeT
 
 (async () => {
   for (const t of asyncTests) await t();
+
+// ── #272: per-tick load scaling + monotonic latch (E15, E15b, E16) ────────
+function mkFirstMsg(streamAgeMs: number): HeartbeatState {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.turnSawMessage = false;
+  st.turnSawTool = false;
+  st.toolsInFlight = 0;
+  st.streamAgeMs = streamAgeMs;
+  st.lastMarkerAt = 800_000;
+  return st;
+}
+const base272 = { now: 800_000, lastLifeSignAt: 800_000, hasOutput: false, streamStallMs: 1_500_000 }; // S-pin above 3xM (900s) so only the first-message + load path varies
+
+section("#272 load-aware — per-tick load-scaled first-message bound (E15, E15b, E16)");
+test("E15: load-scaled first-message bound — saturate, mid-band, legacy (loadScaledBound bands)", () => {
+  const satOk = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(M + 1), load1: 60 }));
+  equal(satOk.kill, false, "load1=60 (3x band) → M+1 not cut");
+  const satCut = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(3 * M + 1), load1: 60 }));
+  equal(satCut.kill, true, "load1=60 → cut at 3xM+1");
+  equal(satCut.reason, "first-message-stall");
+  const midOk = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(2 * M - 1), load1: 12 }));
+  equal(midOk.kill, false, "load1=12 (2x band) → 2xM-1 not cut");
+  const midCut = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(2 * M + 1), load1: 12 }));
+  equal(midCut.kill, true, "load1=12 → cut at 2xM+1");
+  const legacy = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(M + 1), load1: 0 }));
+  equal(legacy.kill, true, "load1=0 → legacy behavior (bound = M)");
+  equal(legacy.firstMessageMs, M, "load1=0 → effM = M exactly (pre-existing assertions unchanged)");
+});
+
+test("E15b: monotonic high-water-mark latch — a post-storm load drop never re-cuts", () => {
+  const t1 = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(M + 1), load1: 60 }));
+  equal(t1.kill, false, "tick1 storm (load1=60) → M+1 not cut (bound extended to 3xM)");
+  equal(t1.firstMessageMs, 3 * M, "tick1 latched effM = 3xM");
+  const t2 = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(M + 2), load1: 60, latchedFirstMessageMs: t1.firstMessageMs }));
+  equal(t2.kill, false, "tick2 still storm → no cut at M+2");
+  equal(t2.firstMessageMs, 3 * M, "tick2 effM stays 3xM");
+  const t3 = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(2.5 * M), load1: 2, latchedFirstMessageMs: t2.firstMessageMs }));
+  equal(t3.kill, false, "tick3 load drops to 2 → bound STAYS latched at 3xM (2.5xM not cut)");
+  equal(t3.firstMessageMs, 3 * M, "tick3 effM = max(3xM, 1xM) = 3xM (monotonic)");
+  const t4 = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(3 * M + 1), load1: 2, latchedFirstMessageMs: t3.firstMessageMs }));
+  equal(t4.kill, true, "tick4 streamAge > 3xM → cut even at load1=2 (bound latched)");
+  equal(t4.reason, "first-message-stall");
+});
+
+testAsync("E16: loop-level wiring — per-tick getLoad1() read + latched bound threaded across ticks", async () => {
+  const mod = await import("./index.js");
+  let latched: number | undefined;
+  mod.setLoad1Override(() => 60);
+  try {
+    const d1 = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(M + 1), load1: mod.getLoad1(), latchedFirstMessageMs: latched }));
+    equal(d1.kill, false, "loop tick 1 — load1 from the seam (60) extends the bound");
+    latched = d1.firstMessageMs;
+    const d2 = heartbeatKillDecision(dinput({ ...base272, state: mkFirstMsg(2.5 * M), load1: mod.getLoad1(), latchedFirstMessageMs: latched }));
+    equal(d2.kill, false, "loop tick 2 — 2.5xM not cut under the latched 3xM bound");
+  } finally {
+    mod.setLoad1Override(null);
+  }
+  const builtinSource = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  ok(builtinSource.includes("latchedFirstMessageMs: latchedEffM"), "#272 loop threads the per-dispatch latch");
+  ok(builtinSource.includes("const load1 = getLoad1()"), "#272 loop reads load1 fresh per tick");
+});
+
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   if (failed > 0) {
     console.log("❌ SOME TESTS FAILED");
