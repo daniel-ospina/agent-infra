@@ -492,3 +492,106 @@ Restart the MCP server after changing the URI — the connection is resolved onc
 ---
 
 > Continue following the workflow as mandated by this skill. Do not skip steps.
+
+# Ingest Workflow (epic #902 — the bundle surface)
+
+## The Bundle Shape
+
+`tortoise_ingest` / `sdk.ingest` takes ONE heterogeneous bundle with four
+sections: `points` (statements — `kind` defaults to `statement`; `event` is
+NOT a write kind — use an ENTITY item `type:"event"` for episodic records),
+`entities` (subject/object/event/document), `sources` (url + sourceKind),
+and `connections` (operator/relation edges between them).
+
+```json
+{
+  "points": [{"ref": "p1", "kind": "statement", "content": "A implies B."}],
+  "entities": [{"ref": "s1", "type": "subject", "name": "Acme"}],
+  "sources": [{"ref": "src1", "url": "https://example.com/r", "sourceKind": "report"}],
+  "connections": [{"ref": "c1", "from": "p1", "to": "s1", "relation": "authoredBy"}]
+}
+```
+
+`granularity`: `"bulk"` (default — aggregated counts) or `"granular"`
+(adds a per-item `results` array). The response is the SAME key set either
+way: `{granularity, batch_id, created, deduped, ids, nudges, warnings}`
+(+ `results` for granular); `created`/`deduped` count
+`{points, entities, sources, connections}`; `ids` carries
+`{points, entities, sources, connections, refs}`.
+
+## Promotion policy: gated (default) vs auto
+
+`promotion_policy` is a kwarg-only param, orthogonal to granularity.
+**`"gated"` is the DEFAULT**: bundle points stay `draft` — promotion is
+explicit, NEVER automatic. An explicit `status:"live"` on a point item
+under gated is a VIOLATION (row 9 — case variants, nested `props:{...}`,
+and terminal statuses too). The sanctioned promotion routes:
+
+- **Interim route (pre-#785):** `tortoise_update_point(id, props={"status":"live"})`
+  — the guarded draft→live promote (single point). Caveat: it does NOT
+  resolve ZOMBIE draft operators (an operator whose endpoints are all live
+  stays inert until IT is explicitly promoted; auto-resolution ships with
+  the #785 promote tools).
+- `promotion_policy="auto"` opts into #131 parity (source auto-promotion on
+  first edge write) — the migration path from the old default.
+
+The response carries `warnings` (never fatal) — see the ELEVEN-key table.
+
+## Idempotent resubmission
+
+The identical bundle re-submission is SAFE: it derives the SAME
+content-derived `batch_id` and returns everything in `deduped` (exactly-once
+convergence — no duplicate points/operators/edges). Use it after a transport
+death (no response): re-send the identical bundle; the response confirms
+presence. Crash-retry semantics: an item that crashed mid-write is absorbed
+by the retry (content+kind fallback scan), never duplicated.
+
+## Retry table (error → action)
+
+| Error | Meaning | Action |
+|---|---|---|
+| `ERR_BUNDLE_INVALID` `{error, code, violations[]}` | Phase-1 validation failed; zero mutations | Fix the bundle; NEVER re-send unchanged |
+| `ERR_INVALID` `{error, code}` | Bad param (granularity/promotion_policy) or the row-9 gated guard | Fix the param; the message names valid values |
+| `ERR_QUOTA` `{error, code}` | Team cap reached (pre-write count-then-act) | Stop; escalate. Resubmit ONCE after headroom |
+| Transport death — no response | The call may have committed anything | Re-send the identical bundle (exactly-once) |
+
+## Route decision table (connections)
+
+| Connection | Route | Result |
+|---|---|---|
+| Plain `operator: IMPL/NAND` | Direct edge (operator-less) | `{"direct_edge", "from", "to", "deduped"}` |
+| `mitigation` / `reify: true` | Operator point | `{"operator_id", "deduped"}` |
+| `relation` | Structural edge | `{"relation", "from", "to", "deduped"}` |
+
+Multi-item `to` on a plain IMPL/NAND connection: use `reify:true` /
+mitigation (the operator route) or split into singular connections.
+
+## §6.6 behavior changes (migration lines)
+
+- **Default policy flipped auto→gated** — `promotion_policy="auto"` is the
+  opt-in parity mode (migration).
+- **Multi-item `to` on plain IMPL/NAND** becomes a Phase-1 rejection —
+  migrate via `reify:true`/mitigation or split.
+- **Same-pair plain connections differing only in `label`** become Phase-1
+  rejections — migrate via `reify:true` ×2 (the operator route preserves
+  both labels).
+
+## Warnings — the ELEVEN keys (closed set)
+
+`warnings` entries are key-prefixed strings. A key outside this table is a
+divergence — report it:
+
+`append_only_items` · `modified_item_residue` · `mitigation_orphan_residue`
+· `mitigation_drift_duplicate` · `nfc_straddle_duplicate` ·
+`mitigation_strength_change` · `partial_operator_residue` ·
+`operator_absorb_completed` · `label_dropped_resubmit` ·
+`direction_dropped_resubmit` · `direction_changed_resubmit`
+
+## Query-back verification (J8 exit state)
+
+After ingest, VERIFY what you wrote: `recall_subgraph(seed)` /
+`tortoise_query` reach the ingested knowledge (promoted/live content), and
+`list_batch(batch_id)` audits the exact stamped artifact set (points +
+direct edges; entities/sources are out of stamp scope). Keep bundles
+reasonably sized (large bundles are slower to validate — split when a
+bundle exceeds a few hundred items).
