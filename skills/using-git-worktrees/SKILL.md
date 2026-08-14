@@ -205,6 +205,30 @@ Tests passing (<N> tests, 0 failures)
 Ready to implement <feature-name>
 ```
 
+## Checkout Discipline — delete-on-merge + hub-check (2026-08-14, #6688/#1218)
+
+The shared-checkout incident class (wrong-branch commits, corruption via daemon
+agents in the hub) is prevented by discipline, not just guards:
+
+1. **Hub stays on `main` + clean.** Before ANY work, run the hub check:
+   `git -C <main-checkout> symbolic-ref --short HEAD` must be `main` and
+   `git -C <main-checkout> status --porcelain` empty. If not — do NOT start
+   feature work there; create a worktree. (Daemons execute in role-scoped
+   execution worktrees via the swarm runtime; interactive agents follow this
+   rule.)
+2. **Delete-on-merge.** Every worktree created for a PR/issue must be removed
+   when its branch merges: `git worktree remove <path>` (no `--force` — it
+   refuses tracked WIP). If the branch merged but the worktree lingers, prune
+   with `git worktree prune`. Accumulated worktrees are the tortoise 178-
+   worktree failure mode (#1218).
+3. **Corruption canary.** The shared canary
+   (`~/.pi/agent/scripts/checkout-hygiene/corruption_canary.py`, canonical in
+   agent-infra) detects the mass-replace corruption class (.bak files +
+   known tokens). Run it before committing or on suspicion.
+4. **Never disable the guard ambiently.** Do not export
+   `AGENT_ALLOW_MAIN_EDITS=1` (or VGATE/review skips) in shell profiles; the
+   escape hatch is per-session and time-boxed.
+
 ## Quick Reference
 
 | Situation | Action |
