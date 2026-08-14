@@ -772,8 +772,10 @@ async function main() {
     const repo = join(TEST_ROOT, "repo-subagent");
     git(repo, "reset -q");
     git(repo, "add fileU.txt"); // re-stage the still-unverified file
-    // Interactive parent session: neither sub-agent marker set (the harness
-    // preamble deleted TASK_HEARTBEAT; PI_MODE must also be deleted).
+    // Interactive parent session: clear both sub-agent markers explicitly so
+    // the scenario is self-contained (not order-dependent on prior finallys).
+    delete process.env.PI_MODE;
+    delete process.env.TASK_HEARTBEAT;
     await fire("session_start", {});
     const res = await fire("tool_call", {
       type: "tool_call", toolName: "bash",
