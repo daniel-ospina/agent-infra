@@ -45,6 +45,7 @@ import { isPrintMode } from "../shared/print-mode.js";
 import { retry, createCircuitBreaker } from "../shared/retry.js";
 import { register } from "../shared/health.js";
 import { treeKill } from "../shared/tree-kill.js";
+import { getPgid, sweepProcessGroup } from "../shared/process-sweep.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -619,6 +620,15 @@ export function getSystemLoad(): number {
  * the static bound (#198) would still cut it. Scale: load < 8 → 1x; 8–15 →
  * 2x; ≥16 → 3x (bounded). Env-overridable via TASK_LOAD_SCALE_OFF=1.
  */
+let _load1Override: (() => number) | null = null;
+/** #272 test seam: inject a fixed load1 for the E-series (multi-tick latch
+ * tests). Pass null to restore the live os.loadavg() read. */
+export function setLoad1Override(fn: (() => number) | null): void { _load1Override = fn; }
+/** #272: live 1-min loadavg (os.loadavg()[0]) unless overridden (tests). */
+export function getLoad1(): number {
+  return _load1Override ? _load1Override() : getSystemLoad();
+}
+
 export function loadScaledBound(baseMs: number, load = getSystemLoad()): number {
   if (process.env.TASK_LOAD_SCALE_OFF === "1") return baseMs;
   if (load < 8) return baseMs;
@@ -650,6 +660,65 @@ export function getTaskMaxDispatchMs(): number {
   const raw = Number(process.env.TASK_MAX_DISPATCH_MS);
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_MAX_DISPATCH_MS;
   return Math.max(60_000, raw);
+}
+
+/** Cut-gap calibration (#271, D1/F3): the marker-gap deadline for the wedged-
+ * alive class (markers stopped while a tool is in flight). Default 1.25× the
+ * tick interval (37.5s at the 30s default) — worst case 37.5s + one 10s
+ * decision tick + ≤5s kill escalation + 2s grace ≈ 54.5s ≤ 60s. Floor 15s
+ * (fast test bounds: interval floor is 5s). TASK_HEARTBEAT_CUT_GAP_MS
+ * overrides; 0/NaN → default (never disable the detector via a bad env value). */
+export function getCutGapMs(): number {
+  const raw = Number(process.env.TASK_HEARTBEAT_CUT_GAP_MS);
+  const fallback = Math.round(1.25 * getHeartbeatIntervalMs());
+  return Math.max(15_000, Number.isFinite(raw) && raw > 0 ? raw : fallback);
+}
+
+// ── #271: backstop + exit taxonomy ──────────────────────────────────
+//
+// The parent await is bounded by four layers (D4): exit-settle (≤ ~2s after
+// child death), the "cut" clause (~37.5s for the frozen-marker wedged class),
+// the #221 hard cap (2h default — the DEFAULT detector-dead last resort, NOT
+// stateFresh-gated), and this backstop — tool-stall + 30min (6h30m) as the
+// detector-dead bound when env-overridden below the hard cap. The backstop
+// fires ONLY when stateFresh === false at expiry (healthy ticking agents are
+// exempt by construction — the backstop is not a default-ON total dispatch
+// cap). TASK_BACKSTOP_MS overrides; 0 = off (deliberate unbounded-wait
+// config).
+
+/** #271 D4: backstop margin over DEFAULT_TOOL_STALL_MS (30 min). */
+export const DEFAULT_BACKSTOP_MARGIN_MS = 1_800_000;
+
+/** Grace between the child's `exit` event and the exit-settle fallback — if
+ * `close` fires within the grace the normal composition path is unchanged;
+ * only when an orphan holds the pipes (close never fires) does the
+ * exit-settle run. */
+export const DEFAULT_EXIT_SETTLE_GRACE_MS = 2_000;
+
+/** #271: test-observable count of settle-path sweep hook invocations — the
+ * sweep fires EXACTLY ONCE per dispatch (F1). Exported for the integration
+ * harness (cut-resume.integration.test.ts). */
+export let sweepRunCount = 0;
+
+/** Backstop = tool-stall (6h) + 30min margin = 6h30m (23_400_000). 0 = off. */
+export function getTaskBackstopMs(): number {
+  const raw = Number(process.env.TASK_BACKSTOP_MS);
+  if (Number.isFinite(raw) && raw === 0) return 0; // explicit opt-out
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return DEFAULT_TOOL_STALL_MS + DEFAULT_BACKSTOP_MARGIN_MS;
+}
+
+/** Exit taxonomy (#271 D6, F3): map a raw close code + frozen tool state to a
+ * dispatch outcome. A CLEAN code-0 exit while tools are frozen in flight IS
+ * a cut (AC1's construction — without the frozen rule the exact collapse this
+ * issue fixes persists); signal-death (null) is a cut; non-zero → failed
+ * (existing behavior); else success. */
+export type TaskExitClass = "cut" | "failed" | "success";
+export function classifyTaskExit(code: number | null, toolsInFlight: number): TaskExitClass {
+  if (code === null) return "cut"; // signal-death
+  if (code !== 0) return "failed";
+  if (toolsInFlight > 0) return "cut"; // frozen rule — clean mid-tool exit IS a cut
+  return "success";
 }
 
 /** Alive state parsed from [task-heartbeat] markers. Ticks overwrite the
@@ -891,11 +960,15 @@ export type HeartbeatKillReason =
   | "stream-stall"
   | "tool-stall"
   | "first-message-stall"
-  | "max-dispatch";
+  | "max-dispatch"
+  | "cut";
 
 export interface HeartbeatKillDecision {
   kill: boolean;
   reason?: HeartbeatKillReason;
+  /** #272: the effective (latched) first-message bound after this tick —
+   * the loop threads it back as `latchedFirstMessageMs` next tick. */
+  firstMessageMs?: number;
   /** Kill resolves `undefined` (retryable) instead of a defined result —
    * true iff the kill fired and no REAL output ever arrived (#5926 retry
    * preservation). */
@@ -914,10 +987,21 @@ export interface HeartbeatDecisionInput {
   firstOutputTimeoutMs: number; // tier-1 (60s)
   streamStallMs: number; // S
   toolStallMs: number; // L
-  firstMessageMs: number; // M
+  firstMessageMs: number; // M (base; per-tick load scaling in #272)
   intervalMs: number; // clamped tick interval
   /** 0 = off; >0 = wall-clock cap markers cannot reset (code-review fix). */
   maxDispatchMs: number;
+  /** #272: live 1-min loadavg (injectable; absent/0 → scale inert). */
+  load1?: number;
+  /** #272: per-dispatch monotonic high-water mark of the effective
+   * first-message bound — the loop threads it back in so the bound only ever
+   * grows within a dispatch (no post-storm shrink re-cut). */
+  latchedFirstMessageMs?: number;
+
+  /** #271: marker-gap cut deadline — liveness-loss detector for the wedged-
+   * alive class (markers stopped while a tool is in flight). See D1. */
+  cutGapMs: number;
+
 }
 
 /**
@@ -942,6 +1026,16 @@ export function heartbeatKillDecision(
   if (i.state.sessionEnded) {
     return { kill: false, resolveUndefined: false };
   }
+
+  // #272: effective first-message bound — load-scaled per tick, MONOTONIC per
+  // dispatch (never shrinks below the run's high-water mark; a storm that
+  // starts mid-dispatch extends the bound, and a post-storm load drop does
+  // NOT re-cut). Scale fn = loadScaledBound (bands 1x/2x/3x); load1 absent/0
+  // → scale inert (legacy-identical).
+  const effFirstMessageMs =
+    i.latchedFirstMessageMs === undefined
+      ? loadScaledBound(i.firstMessageMs, i.load1 ?? 0)
+      : Math.max(i.latchedFirstMessageMs, loadScaledBound(i.firstMessageMs, i.load1 ?? 0));
 
   // Tier-1 — first-output timeout: process-level startup hang (no real output,
   // no work marker, no ready marker).
@@ -993,6 +1087,25 @@ export function heartbeatKillDecision(
     return kill("silence-threshold");
   }
 
+  // 3.5. cut (#271, D1) — the operational liveness-loss detector for the
+  //    wedged-alive class: markers stopped while a tool is in flight. Placed
+  //    between silence and first-message. `stateFresh` is inherited from
+  //    tool-stall: the clause fires ONLY while the marker stream is fresh
+  //    (markerAge ≤ max(2×T, 2×interval) = 60 min at defaults) — a stream
+  //    stale beyond the fresh window can never trip cut (the backstop owns
+  //    that window, D4; E271c(a) pins this). A busy-but-ticking agent is
+  //    exempt by construction: every marker receipt resets lastMarkerAt, so
+  //    markerAge ≈ ≤1 interval < cutGapMs. Never fires with toolsInFlight == 0
+  //    (that class is silence at T, unchanged). Gated `!sessionEnded` by the
+  //    #191 early return above — the completion watchdog owns post-end exits.
+  if (
+    stateFresh &&
+    st.toolsInFlight > 0 &&
+    markerAge > i.cutGapMs
+  ) {
+    return kill("cut");
+  }
+
   // 4. first-message — turn running but no message/tool activity ever within
   //    M (hung provider request, #5926 class). Retryable when no real output.
   //    Note: with the emitter loaded, ready/turn_start latch before any
@@ -1008,9 +1121,9 @@ export function heartbeatKillDecision(
     st.turnActive &&
     !st.turnSawMessage &&
     !(st.turnSawTool || st.toolsInFlight > 0) &&
-    effStreamAge > i.firstMessageMs
+    effStreamAge > effFirstMessageMs
   ) {
-    return kill("first-message-stall");
+    return { ...kill("first-message-stall"), firstMessageMs: effFirstMessageMs };
   }
 
   // 5. max-dispatch — opt-in total wall-clock cap (code-review fix): honest
@@ -1021,7 +1134,7 @@ export function heartbeatKillDecision(
     return kill("max-dispatch");
   }
 
-  return { kill: false, resolveUndefined: false };
+  return { kill: false, resolveUndefined: false, firstMessageMs: effFirstMessageMs };
 }
 
 export function stripHtml(html: string): string {
@@ -1063,6 +1176,454 @@ function restoreTodos(pi: ExtensionAPI): void {
 }
 
 // ── Extension Entry Point ───────────────────────────────────────────
+
+export function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
+  return new Promise((resolve) => {
+    // #176 code-review: per-dispatch marker nonce — the child echoes it in
+    // every [task-heartbeat] marker; markers without it are foreign (MCP
+    // servers inherit the child's fd 2) and fall back to ordinary stderr.
+    const hbEnabled = subAgentEnv.TASK_HEARTBEAT === "1";
+    const hbNonce = hbEnabled ? randomBytes(6).toString("hex") : "";
+    const spawnEnv = hbEnabled
+      ? { ...subAgentEnv, TASK_HEARTBEAT_NONCE: hbNonce }
+      : subAgentEnv;
+    // #101: spawn via process.execPath + resolved entry script (same as the
+    // subagent tool) so a truncated PATH can't cause a non-retryable ENOENT.
+    const invocation = getPiInvocation(args);
+    // #271 (#208 D2): detached spawn → the child gets its own pgid (setsid),
+    // so a settle-path sweep can anchor on it without ever signalling the
+    // orchestrator. Opt out via TASK_DETACHED=0 (parity with
+    // SUBAGENT_DETACHED, #137 F8).
+    const detached = process.env.TASK_DETACHED !== "0";
+    const proc = spawn(invocation.command, invocation.args, {
+      cwd: process.cwd(),
+      shell: false,
+      detached,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: spawnEnv,
+    });
+    // pgid captured at spawn — for a detached spawn this is the child's OWN
+    // group (setsid); for a non-detached spawn (TASK_DETACHED=0) it is the
+    // PARENT's group — the shared sweep helper's runtime guard skips + warns
+    // there (#271 F2), so the orchestrator's own group is NEVER signaled.
+    const childPgid: number | null = getPgid(proc.pid ?? 0) ?? proc.pid ?? null;
+
+    let stdout = "";
+    let stderr = "";
+    let lastHeartbeat = Date.now();
+    // #271 F1: settle-exactly-once — `settled` gates EVERY settle path
+    // (exit-settle, close, backstop, heartbeat kill, hard cap, error);
+    // `swept` gates the fire-and-forget settle-path sweep. graceTimer is
+    // cleared when close fires first (a stale timer can never re-fire into a
+    // recycled pgid); backstopTimer is cleared on settle.
+    let settled = false;
+    let swept = false;
+    let graceTimer: NodeJS.Timeout | null = null;
+    let backstopTimer: NodeJS.Timeout | undefined;
+    // #153: tier-3 exit watchdog — both stdio streams EOF but the process
+    // is still alive → hung on exit (event loop won't drain). Kill after
+    // TASK_EXIT_GRACE_MS (default 120s) so the parent gets the already-
+    // captured output instead of waiting out the 30-min heartbeat window.
+    const exitWatchdog = armExitWatchdog({
+      pid: proc.pid ?? 0,
+      stdout: proc.stdout,
+      stderr: proc.stderr,
+      graceMs: getExitGraceMs(),
+    });
+    // #191 tier-4: completion watchdog — armed on the child's session_end
+    // marker (see hbCtx.onSessionEnd below), NOT at spawn: a completed child
+    // still alive after the grace is stuck in cleanup (MCP disconnect
+    // timeouts) and gets killed so the captured output returns as success.
+    let completionWatchdog: CompletionWatchdog | null = null;
+    // #489 class: pi in print mode BUFFERS output — a sub-agent doing long
+    // consecutive tool calls (bash → read → edit) emits nothing to stdout
+    // until the final turn message. The old 660s threshold (set to exceed
+    // the provider timeout per #67/#68) killed productive implementation
+    // agents mid-work. Default raised to 30 min; overridable via env.
+    // Clamped ≥ 60s: negative/zero/NaN/Infinity env values can't disable
+    // the kill path or kill productive agents instantly (#489).
+    const HEARTBEAT_TIMEOUT_MS = Math.max(60_000, Number(process.env.TASK_HEARTBEAT_TIMEOUT_MS) || 1_800_000);
+    const FIRST_OUTPUT_TIMEOUT_MS = 60_000;
+    let hasOutput = false;
+
+    const appendCap = (s: string, add: string, cap: number) => {
+      const merged = s + add;
+      return merged.length > cap ? merged.slice(-cap) : merged;
+    };
+    const cleanStderr = (s: string) => s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+
+    // #176: state-aware heartbeat — alive state parsed from [task-heartbeat]
+    // markers (emitted by the task-heartbeat extension, TASK_HEARTBEAT=1).
+    // Markers are filtered at DATA ARRIVAL (ingestHeartbeatChunk): they
+    // never enter the capped stderr accumulator, so no result path can ever
+    // contain marker text and a truncated marker can never flip hasOutput.
+    // Non-marker stderr bytes keep all legacy effects (hasOutput,
+    // lastHeartbeat).
+    const hbCtx: HeartbeatIngestContext = {
+      state: createHeartbeatState(),
+      lineBuf: "",
+      expectedNonce: hbEnabled ? hbNonce : undefined,
+      appendStderr: (text: string) => {
+        stderr = appendCap(stderr, text, 1_000_000);
+      },
+      onLifeSign: () => {
+        lastHeartbeat = Date.now();
+      },
+      onRealOutput: () => {
+        hasOutput = true;
+      },
+      // #191: the child declared the session complete (session_end marker) —
+      // arm the completion watchdog (Tier 4). A still-alive child after the
+      // grace is a completed session stuck in MCP disconnect cleanup; kill it
+      // so the parent returns the captured output as success instead of
+      // hanging the tool call.
+      onSessionEnd: () => {
+        if (completionWatchdog || settled) return;
+        completionWatchdog = armCompletionWatchdog({
+          pid: proc.pid ?? 0,
+          graceMs: getExitCompleteGraceMs(),
+        });
+      },
+    };
+
+    proc.stdout.on("data", (data: Buffer) => {
+      stdout = appendCap(stdout, data.toString(), 1_000_000);
+      lastHeartbeat = Date.now();
+      hasOutput = true;
+    });
+    proc.stderr.on("data", (data: Buffer) => {
+      ingestHeartbeatChunk(data.toString(), hbCtx);
+    });
+
+    const doResolve = (value: { content: any[]; details: Record<string, unknown> } | undefined, opts?: { keepCompletionWatchdog?: boolean; sweep?: boolean }) => {
+      if (settled) return;
+      settled = true;
+      exitWatchdog.disarm();
+      if (!opts?.keepCompletionWatchdog) completionWatchdog?.disarm();
+      if (hardCapTimer) clearTimeout(hardCapTimer);
+      if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+      if (backstopTimer) { clearTimeout(backstopTimer); backstopTimer = undefined; }
+      // #271 settle-path sweep hook (round-3 F2): runs whenever the exit-settle
+      // path resolved (close didn't fire within grace — a live pipe-holder
+      // keeps the pgid alive, so recycle risk doesn't apply) OR an abnormal
+      // reason resolved via the close path (kill/cut/backstop/hard-cap/
+      // signal-death/non-zero); no-sweep ONLY for close-within-grace with a
+      // normal result. Fire-and-forget AFTER resolve — sweep latency never
+      // counts against the resolve indicator (F3). Safety valve (D2):
+      // TASK_SWEEP=0 disables it ENTIRELY; a non-detached spawn
+      // (TASK_DETACHED=0) is skipped + warned by the shared guard — the
+      // orchestrator's own group is never signaled (implies TASK_SWEEP=0).
+      if (opts?.sweep && process.env.TASK_SWEEP !== "0" && childPgid !== null && !swept) {
+        swept = true;
+        sweepRunCount += 1;
+        void sweepProcessGroup(childPgid, { detached });
+      }
+      resolve(value);
+    };
+
+    // #271 (#208): heartbeat/backstop/hard-cap kill → treeKill (children-of-
+    // the-child die with the child and close the pipes promptly; the settle-
+    // path sweep catches reparented survivors). SIGKILL escalation after 5s
+    // mirrors the subagent killTree (#137) and the exit watchdog (#153).
+    const killTreeAndEscalate = () => {
+      const pid = proc.pid;
+      if (pid !== undefined) treeKill(pid, "SIGTERM");
+      else proc.kill("SIGTERM");
+      const sigkillTimer = setTimeout(() => {
+        if (proc.exitCode === null && !proc.killed) {
+          if (pid !== undefined) treeKill(pid, "SIGKILL");
+          else proc.kill("SIGKILL");
+        }
+      }, 5000);
+      sigkillTimer.unref?.();
+      proc.once("close", () => clearTimeout(sigkillTimer));
+    };
+
+    // #208: bounded parent wait — if neither close nor a heartbeat kill
+    // resolves within the hard cap (dead task call), force-kill the tree and
+    // resolve with partial results + a cut reason. Fail fast, resumably.
+    // #271 verifier P2: on default config the hard cap (2h, NOT
+    // stateFresh-gated) IS the detector-dead last resort; the #271 backstop
+    // engages only when env-overridden below it. Both carry the same
+    // retryability contract — resolveUndefined = !hasOutput — so a
+    // zero-output detector-dead wedge is retryable.
+    let hardCapTimer: NodeJS.Timeout | null = setTimeout(() => {
+      if (settled) return;
+      console.error(`[task] sub-agent exceeded the hard cap (${getTaskHardCapMs() / 1000}s, TASK_HARD_CAP_MS) — force-killing and returning partial results (#208)`);
+      killTreeAndEscalate();
+      if (!hasOutput) {
+        console.error(`[task] sub-agent exceeded the hard cap with no real output — retryable (#271)`);
+        doResolve(undefined, { sweep: true });
+        return;
+      }
+      const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
+      doResolve({
+        content: [{
+          type: "text",
+          text: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.\n\nAlive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${stdout.slice(-500)}`,
+        }],
+        details: { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
+      }, { sweep: true });
+    }, getTaskHardCapMs());
+    hardCapTimer.unref();
+
+    const startedAt = Date.now();
+    // #176: stall bounds resolved once per dispatch (parent-side env).
+    const hbThresholds = {
+      heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,
+      firstOutputTimeoutMs: FIRST_OUTPUT_TIMEOUT_MS,
+      streamStallMs: getStreamStallMs(),
+      toolStallMs: getToolStallMs(),
+      // #209: load-aware — under a load storm the first message legitimately
+      // stalls; scale the bound with loadavg (1x <8, 2x 8–15, 3x ≥16).
+      firstMessageMs: getFirstMessageMs(), // #272: base; per-tick scaled + latched in the loop
+      intervalMs: getHeartbeatIntervalMs(),
+      maxDispatchMs: getTaskMaxDispatchMs(),
+      // #271: marker-gap cut deadline — liveness-loss detector for the
+      // wedged-alive class (markers stopped while a tool is in flight). See D1.
+      cutGapMs: getCutGapMs(),
+    };
+
+    // #271 (#208 D6): sessionEnded-aware finalize — ONE composition executed
+    // by BOTH the close path and the exit-settle fallback (the grace race
+    // must not lose the branches). Verifier P1: a completed session
+    // (session_end seen) resolves through main's composeTaskResult (#250 path
+    // untouched — killedAfterCompletion/exitCode in details, completion
+    // watchdog disarmed, never "cut"); pre-completion deaths go through the
+    // exit taxonomy: clean exit while frozen toolsInFlight > 0 IS a cut (AC1's
+    // construction), signal-death (null) → cut, non-zero → failed (existing),
+    // else success. No-sweep ONLY for close-within-grace normal success;
+    // exit-settle success (live pipe-holder) MUST sweep (round-3 F2).
+    const finalize = (code: number | null, settlePath: "close" | "exit") => {
+      // #176: flush the line-buffer residue before composing the result —
+      // non-marker tail preserved, truncated-marker tail discarded.
+      flushHeartbeatLineBuf(hbCtx);
+      // #191: process is gone — disarm the completion watchdog even when a
+      // prior abort-resolve settled the promise (killed latches before
+      // disarm, so composition still reports the watchdog correctly).
+      completionWatchdog?.disarm();
+      // #250: sessionEnded branch — main's composeTaskResult unchanged: a
+      // completed session (completed child killed by the completion watchdog)
+      // resolves SUCCESS, never "cut".
+      if (hbCtx.state.sessionEnded) {
+        doResolve(
+          composeTaskResult({
+            stdout,
+            stderr,
+            exitCode: code,
+            sessionEnded: true,
+            killedAfterCompletion: completionWatchdog?.killed ?? false,
+            model,
+            provider,
+          }),
+          { sweep: settlePath === "exit" },
+        );
+        return;
+      }
+      const cls = classifyTaskExit(code, hbCtx.state.toolsInFlight);
+      const stderrClean = cleanStderr(stderr.trim()).slice(-4000);
+      if (cls === "success" && stdout.trim()) {
+        // #134: clean exit → content carries stdout ONLY. The stderr tail is
+        // transport noise (startup banners, MCP connect, gate-bypass events)
+        // that contaminates structured task output for JSON-parsing consumers
+        // (#132 bug class). It moves to `details.stderr` for diagnostics.
+        const details: Record<string, unknown> = { model, provider };
+        if (stderrClean) details.stderr = stderrClean;
+        doResolve({ content: [{ type: "text", text: stdout.trim() }], details }, { sweep: settlePath === "exit" });
+        return;
+      }
+      if (cls === "cut") {
+        // #271 cut composition (F10): resolveUndefined = !hasOutput — a
+        // zero-partial cut stays retryable by the retry wrapper, mirroring
+        // the kill-clause contract.
+        const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}`;
+        const headline = "⚠️ Sub-agent was cut — process exited mid-tool / no life signs. Partial results below — parent should decide: accept, re-dispatch, or escalate.";
+        const output = stdout.trim();
+        const errInfo = stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "";
+        const body = output
+          ? `${headline}\n\n${aliveSummary}${errInfo}\n\n--- last stdout ---\n${output.slice(-2000)}`
+          : `${headline}\n\n${aliveSummary}${errInfo}`;
+        doResolve(
+          !hasOutput
+            ? undefined
+            : { content: [{ type: "text", text: body }], details: { model, provider, killed: true, reason: "cut", exitCode: code } },
+          { sweep: true },
+        );
+        return;
+      }
+      // failed — existing non-clean composition (unchanged, mirrors
+      // composeTaskResult's failure branch: stdout || stderrClean || exit msg).
+      const output = stdout.trim();
+      const text = output || stderrClean || `Sub-agent exited with code ${code}`;
+      const extra = output ? (stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "") : "";
+      doResolve({ content: [{ type: "text", text: text + extra }], details: { model, provider, exitCode: code } }, { sweep: true });
+    };
+
+    // #272: per-dispatch monotonic latch of the effective first-message
+    // bound — threaded through heartbeatKillDecision (load1 + latched),
+    // only ever grows (a storm starting mid-dispatch extends the bound; a
+    // post-storm load drop never re-cuts); [task] log on real increase.
+    let latchedEffM: number | undefined;
+    const heartbeat = setInterval(() => {
+      const now = Date.now();
+      // Flush residue BEFORE deciding so a kill result sees everything so
+      // far (non-marker residue preserved — kill-result fidelity; marker
+      // residue discarded).
+      flushHeartbeatLineBuf(hbCtx);
+      // Tier 1 + tier 2 (#176): one idle detector — tier-1 first-output
+      // (startup hangs, retryable), then tool-stall → stream-stall →
+      // silence → cut → first-message → max-dispatch over the parsed alive
+      // state. sessionEnded short-circuits at the top of the decision.
+      const load1 = getLoad1();
+      const decision = heartbeatKillDecision({
+        now,
+        startedAt,
+        lastLifeSignAt: lastHeartbeat,
+        hasOutput,
+        state: hbCtx.state,
+        ...hbThresholds,
+        load1,
+        latchedFirstMessageMs: latchedEffM,
+      });
+      if (decision.firstMessageMs !== undefined && decision.firstMessageMs > (latchedEffM ?? getFirstMessageMs())) {
+        latchedEffM = decision.firstMessageMs;
+        console.error(`[task] first-message bound ${Math.round(getFirstMessageMs() / 1000)}s → ${Math.round(latchedEffM / 1000)}s (load1=${load1})`);
+      }
+      if (!decision.kill) return;
+      clearInterval(heartbeat);
+      // #208: treeKill — the direct child's grandchildren (nested pi, MCP
+      // server pairs) would otherwise survive as orphans holding worktrees.
+      killTreeAndEscalate();
+
+      // Retryable kills (#5926 class): no REAL output ever arrived →
+      // resolve undefined so the retry wrapper re-spawns and the circuit
+      // breaker counts the failure.
+      if (decision.resolveUndefined) {
+        if (decision.reason === "zero-output") {
+          console.error(`[task] sub-agent produced no output in ${FIRST_OUTPUT_TIMEOUT_MS / 1000}s — retryable`);
+        } else {
+          console.error(`[task] sub-agent killed (${decision.reason}) with no real output — retryable`);
+        }
+        doResolve(undefined, { sweep: true });
+        return;
+      }
+
+      const lastOutput = stdout.slice(-500);
+      const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}`;
+      const headlines: Record<string, string> = {
+        "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "tool-stall": `⚠️ Sub-agent tool call exceeded its bound (tool age ${Math.round(hbCtx.state.toolAgeMaxMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.firstMessageMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "max-dispatch": `⚠️ Sub-agent exceeded the total dispatch cap (${Math.round(hbThresholds.maxDispatchMs / 1000)}s, TASK_MAX_DISPATCH_MS). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "cut": `⚠️ Sub-agent was cut — no life signs for ${Math.round(markerAgeMs / 1000)}s (marker gap exceeded ${Math.round(hbThresholds.cutGapMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+      };
+      doResolve({
+        content: [{ type: "text", text: `${headlines[decision.reason ?? "silence-threshold"]}\n\n${aliveSummary}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${lastOutput}` }],
+        details: { model, provider, killed: true, reason: decision.reason, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
+      }, { sweep: true });
+    }, 10_000);
+
+    // #271 (#208 D4): backstop timer — the last-resort bound for the
+    // detector-dead window (marker stream stale beyond the fresh window,
+    // where neither tool-stall nor cut can fire). NOT a default-ON total
+    // dispatch cap: fires ONLY when stateFresh === false at expiry; a healthy
+    // ticking agent (stateFresh true) re-arms for another interval (F2).
+    // TASK_BACKSTOP_MS overrides; 0 = off (deliberate unbounded-wait config).
+    // PRECEDENCE (verifier P2): on defaults the #221 hard cap (2h, NOT
+    // stateFresh-gated) fires first — the backstop engages only when
+    // env-overridden below the hard cap.
+    const backstopMs = getTaskBackstopMs();
+    const freshWindowMs = Math.max(2 * HEARTBEAT_TIMEOUT_MS, 2 * getHeartbeatIntervalMs());
+    if (backstopMs > 0) {
+      const backstopFire = () => {
+        if (settled) return;
+        const now = Date.now();
+        const markerAge = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : Infinity;
+        const stateFresh = hbCtx.state.lastMarkerAt > 0 && markerAge <= freshWindowMs;
+        if (stateFresh) {
+          // healthy ticking agent — exempt by construction; re-arm for
+          // another interval (the backstop is not a total dispatch cap).
+          backstopTimer = setTimeout(backstopFire, backstopMs);
+          return;
+        }
+        clearInterval(heartbeat);
+        killTreeAndEscalate();
+        const headline = `⚠️ Sub-agent exceeded the dispatch backstop (${Math.round(backstopMs / 1000)}s, TASK_BACKSTOP_MS) with no fresh heartbeat markers. Partial results below — parent should decide: accept, re-dispatch, or escalate.`;
+        if (!hasOutput) {
+          console.error(`[task] sub-agent backstop fired with no real output — retryable`);
+          doResolve(undefined, { sweep: true });
+          return;
+        }
+        const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}`;
+        const lastOutput = stdout.slice(-500);
+        doResolve({
+          content: [{ type: "text", text: `${headline}\n\n${aliveSummary}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${lastOutput}` }],
+          details: { model, provider, killed: true, reason: "cut", backstop: true, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
+        }, { sweep: true });
+      };
+      backstopTimer = setTimeout(backstopFire, backstopMs);
+    }
+
+    // #191 P2: the agent's abort signal (user abort / turn switch). Once the
+    // session has completed (session_end seen), an abort must not wait out
+    // the remaining grace — resolve the captured output immediately. The
+    // completion watchdog stays armed (keepCompletionWatchdog) so the
+    // lingering child is still reaped; pre-completion aborts keep legacy
+    // behavior (the promise settles on close/kill as before).
+    if (signal) {
+      const onAbort = () => {
+        if (settled || !hbCtx.state.sessionEnded) return;
+        console.error(`[task] sub-agent dispatch aborted after session_end — resolving captured output (#191)`);
+        clearInterval(heartbeat);
+        doResolve(
+          composeTaskResult({
+            stdout,
+            stderr,
+            exitCode: null,
+            sessionEnded: true,
+            killedAfterCompletion: false,
+            model,
+            provider,
+          }),
+          { keepCompletionWatchdog: true },
+        );
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    proc.on("exit", (code: number | null) => {
+      // #271 F1: grace-race exit-settle — `exit` fires BEFORE `close`, and
+      // the final-output composition lives in the close path. Defer settle
+      // by 2s: if `close` fires within the grace the NORMAL path is
+      // unchanged; only when an orphan holds the pipes (close never fires)
+      // does the exit-settle run (replicating the finalize composition).
+      // The grace timer is CLEARED when close fires first (F1) — a stale
+      // timer can never re-fire into a recycled pgid.
+      clearInterval(heartbeat);
+      graceTimer = setTimeout(() => {
+        graceTimer = null;
+        finalize(code, "exit");
+      }, DEFAULT_EXIT_SETTLE_GRACE_MS);
+    });
+
+    proc.on("close", (code: number | null) => {
+      clearInterval(heartbeat);
+      if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+      finalize(code, "close");
+    });
+
+    proc.on("error", (err: Error) => {
+      clearInterval(heartbeat);
+      exitWatchdog.disarm();
+      // Spawn errors (pi not found, etc.) are NOT retryable — return the error
+      doResolve({ content: [{ type: "text", text: `Sub-agent failed: ${err.message}\n\n--- stderr ---\n${cleanStderr(stderr).slice(-4000)}` }], details: { model, provider, isError: true } });
+    });
+  });
+}
 
 export default function (pi: ExtensionAPI) {
   register("builtin-tools");
@@ -1335,262 +1896,21 @@ export default function (pi: ExtensionAPI) {
    * Spawn a sub-agent and return its output. Returns undefined on zero-output
    * timeout (retryable) so the retry wrapper can re-spawn.
    */
-  function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
-    return new Promise((resolve) => {
-      // #176 code-review: per-dispatch marker nonce — the child echoes it in
-      // every [task-heartbeat] marker; markers without it are foreign (MCP
-      // servers inherit the child's fd 2) and fall back to ordinary stderr.
-      const hbEnabled = subAgentEnv.TASK_HEARTBEAT === "1";
-      const hbNonce = hbEnabled ? randomBytes(6).toString("hex") : "";
-      const spawnEnv = hbEnabled
-        ? { ...subAgentEnv, TASK_HEARTBEAT_NONCE: hbNonce }
-        : subAgentEnv;
-      // #101: spawn via process.execPath + resolved entry script (same as the
-      // subagent tool) so a truncated PATH can't cause a non-retryable ENOENT.
-      const invocation = getPiInvocation(args);
-      const proc = spawn(invocation.command, invocation.args, {
-        cwd: process.cwd(),
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: spawnEnv,
-      });
-
-      let stdout = "";
-      let stderr = "";
-      let lastHeartbeat = Date.now();
-      let settled = false;
-      // #153: tier-3 exit watchdog — both stdio streams EOF but the process
-      // is still alive → hung on exit (event loop won't drain). Kill after
-      // TASK_EXIT_GRACE_MS (default 120s) so the parent gets the already-
-      // captured output instead of waiting out the 30-min heartbeat window.
-      const exitWatchdog = armExitWatchdog({
-        pid: proc.pid ?? 0,
-        stdout: proc.stdout,
-        stderr: proc.stderr,
-        graceMs: getExitGraceMs(),
-      });
-      // #191 tier-4: completion watchdog — armed on the child's session_end
-      // marker (see hbCtx.onSessionEnd below), NOT at spawn: a completed child
-      // still alive after the grace is stuck in cleanup (MCP disconnect
-      // timeouts) and gets killed so the captured output returns as success.
-      let completionWatchdog: CompletionWatchdog | null = null;
-      // #489 class: pi in print mode BUFFERS output — a sub-agent doing long
-      // consecutive tool calls (bash → read → edit) emits nothing to stdout
-      // until the final turn message. The old 660s threshold (set to exceed
-      // the provider timeout per #67/#68) killed productive implementation
-      // agents mid-work. Default raised to 30 min; overridable via env.
-      // Clamped ≥ 60s: negative/zero/NaN/Infinity env values can't disable
-      // the kill path or kill productive agents instantly (#489).
-      const HEARTBEAT_TIMEOUT_MS = Math.max(60_000, Number(process.env.TASK_HEARTBEAT_TIMEOUT_MS) || 1_800_000);
-      const FIRST_OUTPUT_TIMEOUT_MS = 60_000;
-      let hasOutput = false;
-
-      const appendCap = (s: string, add: string, cap: number) => {
-        const merged = s + add;
-        return merged.length > cap ? merged.slice(-cap) : merged;
-      };
-      const cleanStderr = (s: string) => s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
-
-      // #176: state-aware heartbeat — alive state parsed from [task-heartbeat]
-      // markers (emitted by the task-heartbeat extension, TASK_HEARTBEAT=1).
-      // Markers are filtered at DATA ARRIVAL (ingestHeartbeatChunk): they
-      // never enter the capped stderr accumulator, so no result path can ever
-      // contain marker text and a truncated marker can never flip hasOutput.
-      // Non-marker stderr bytes keep all legacy effects (hasOutput,
-      // lastHeartbeat).
-      const hbCtx: HeartbeatIngestContext = {
-        state: createHeartbeatState(),
-        lineBuf: "",
-        expectedNonce: hbEnabled ? hbNonce : undefined,
-        appendStderr: (text: string) => {
-          stderr = appendCap(stderr, text, 1_000_000);
-        },
-        onLifeSign: () => {
-          lastHeartbeat = Date.now();
-        },
-        onRealOutput: () => {
-          hasOutput = true;
-        },
-        // #191: the child declared the session complete (session_end marker) —
-        // arm the completion watchdog (Tier 4). A still-alive child after the
-        // grace is a completed session stuck in MCP disconnect cleanup; kill it
-        // so the parent returns the captured output as success instead of
-        // hanging the tool call.
-        onSessionEnd: () => {
-          if (completionWatchdog || settled) return;
-          completionWatchdog = armCompletionWatchdog({
-            pid: proc.pid ?? 0,
-            graceMs: getExitCompleteGraceMs(),
-          });
-        },
-      };
-
-      proc.stdout.on("data", (data: Buffer) => {
-        stdout = appendCap(stdout, data.toString(), 1_000_000);
-        lastHeartbeat = Date.now();
-        hasOutput = true;
-      });
-      proc.stderr.on("data", (data: Buffer) => {
-        ingestHeartbeatChunk(data.toString(), hbCtx);
-      });
-
-      const doResolve = (value: { content: any[]; details: Record<string, unknown> } | undefined, opts?: { keepCompletionWatchdog?: boolean }) => {
-        if (settled) return;
-        settled = true;
-        exitWatchdog.disarm();
-        if (!opts?.keepCompletionWatchdog) completionWatchdog?.disarm();
-        if (hardCapTimer) clearTimeout(hardCapTimer);
-        resolve(value);
-      };
-
-      // #208: bounded parent wait — if neither close nor a heartbeat kill
-      // resolves within the hard cap (dead task call), force-kill the tree and
-      // resolve with partial results + a cut reason. Fail fast, resumably.
-      let hardCapTimer: NodeJS.Timeout | null = setTimeout(() => {
-        if (settled) return;
-        console.error(`[task] sub-agent exceeded the hard cap (${getTaskHardCapMs() / 1000}s, TASK_HARD_CAP_MS) — force-killing and returning partial results (#208)`);
-        treeKill(proc.pid, "SIGTERM");
-        setTimeout(() => treeKill(proc.pid, "SIGKILL"), 5000).unref();
-        const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
-        doResolve({
-          content: [{
-            type: "text",
-            text: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.\n\nAlive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${stdout.slice(-500)}`,
-          }],
-          details: { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
-        });
-      }, getTaskHardCapMs());
-      hardCapTimer.unref();
-
-      const startedAt = Date.now();
-      // #176: stall bounds resolved once per dispatch (parent-side env).
-      const hbThresholds = {
-        heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS,
-        firstOutputTimeoutMs: FIRST_OUTPUT_TIMEOUT_MS,
-        streamStallMs: getStreamStallMs(),
-        toolStallMs: getToolStallMs(),
-        // #209: load-aware — under a load storm the first message legitimately
-        // stalls; scale the bound with loadavg (1x <8, 2x 8–15, 3x ≥16).
-        firstMessageMs: loadScaledBound(getFirstMessageMs()),
-        intervalMs: getHeartbeatIntervalMs(),
-        maxDispatchMs: getTaskMaxDispatchMs(),
-      };
-      const heartbeat = setInterval(() => {
-        const now = Date.now();
-        // Flush residue BEFORE deciding so a kill result sees everything so
-        // far (non-marker residue preserved — kill-result fidelity; marker
-        // residue discarded).
-        flushHeartbeatLineBuf(hbCtx);
-        // Tier 1 + tier 2 (#176): one idle detector — tier-1 first-output
-        // (startup hangs, retryable), then tool-stall → stream-stall →
-        // silence → first-message over the parsed alive state.
-        const decision = heartbeatKillDecision({
-          now,
-          startedAt,
-          lastLifeSignAt: lastHeartbeat,
-          hasOutput,
-          state: hbCtx.state,
-          ...hbThresholds,
-        });
-        if (!decision.kill) return;
-        clearInterval(heartbeat);
-        // #208: treeKill — the direct child's grandchildren (nested pi, MCP
-        // server pairs) would otherwise survive as orphans holding worktrees.
-        treeKill(proc.pid, "SIGTERM");
-        const sigkillTimer = setTimeout(() => treeKill(proc.pid, "SIGKILL"), 5000);
-        proc.once("close", () => clearTimeout(sigkillTimer));
-
-        // Retryable kills (#5926 class): no REAL output ever arrived →
-        // resolve undefined so the retry wrapper re-spawns and the circuit
-        // breaker counts the failure.
-        if (decision.resolveUndefined) {
-          if (decision.reason === "zero-output") {
-            console.error(`[task] sub-agent produced no output in ${FIRST_OUTPUT_TIMEOUT_MS / 1000}s — retryable`);
-          } else {
-            console.error(`[task] sub-agent killed (${decision.reason}) with no real output — retryable`);
-          }
-          doResolve(undefined);
-          return;
-        }
-
-        const lastOutput = stdout.slice(-500);
-        const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}`;
-        const headlines: Record<string, string> = {
-          "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-          "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-          "tool-stall": `⚠️ Sub-agent tool call exceeded its bound (tool age ${Math.round(hbCtx.state.toolAgeMaxMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-          "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.firstMessageMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-          "max-dispatch": `⚠️ Sub-agent exceeded the total dispatch cap (${Math.round(hbThresholds.maxDispatchMs / 1000)}s, TASK_MAX_DISPATCH_MS). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        };
-        doResolve({
-          content: [{ type: "text", text: `${headlines[decision.reason ?? "silence-threshold"]}\n\n${aliveSummary}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${lastOutput}` }],
-          details: { model, provider, killed: true, reason: decision.reason, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
-        });
-      }, 10_000);
-
-      // #191 P2: the agent's abort signal (user abort / turn switch). Once the
-      // session has completed (session_end seen), an abort must not wait out
-      // the remaining grace — resolve the captured output immediately. The
-      // completion watchdog stays armed (keepCompletionWatchdog) so the
-      // lingering child is still reaped; pre-completion aborts keep legacy
-      // behavior (the promise settles on close/kill as before).
-      if (signal) {
-        const onAbort = () => {
-          if (settled || !hbCtx.state.sessionEnded) return;
-          console.error(`[task] sub-agent dispatch aborted after session_end — resolving captured output (#191)`);
-          clearInterval(heartbeat);
-          doResolve(
-            composeTaskResult({
-              stdout,
-              stderr,
-              exitCode: null,
-              sessionEnded: true,
-              killedAfterCompletion: false,
-              model,
-              provider,
-            }),
-            { keepCompletionWatchdog: true },
-          );
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
-
-      proc.on("close", (code: number | null) => {
-        clearInterval(heartbeat);
-        // #191: process is gone — disarm the completion watchdog even when a
-        // prior abort-resolve settled the promise (killed latches before
-        // disarm, so composition still reports the watchdog correctly).
-        completionWatchdog?.disarm();
-        // #176: flush the line-buffer residue before composing the result —
-        // non-marker tail preserved, truncated-marker tail discarded.
-        flushHeartbeatLineBuf(hbCtx);
-        // #191: compose on close — sessionEnded (completed) + non-empty stdout
-        // → success with stdout; killedAfterCompletion/exitCode carried in
-        // details when the completion watchdog reaped the lingering child.
-        // Empty stdout falls back to the legacy stderr/exitCode composition so
-        // failure info is never lost and never misclassified as success.
-        doResolve(
-          composeTaskResult({
-            stdout,
-            stderr,
-            exitCode: code,
-            sessionEnded: hbCtx.state.sessionEnded,
-            killedAfterCompletion: completionWatchdog?.killed ?? false,
-            model,
-            provider,
-          }),
-        );
-      });
-
-      proc.on("error", (err: Error) => {
-        clearInterval(heartbeat);
-        exitWatchdog.disarm();
-        // Spawn errors (pi not found, etc.) are NOT retryable — return the error
-        doResolve({ content: [{ type: "text", text: `Sub-agent failed: ${err.message}\n\n--- stderr ---\n${cleanStderr(stderr).slice(-4000)}` }], details: { model, provider, isError: true } });
-      });
-    });
-  }
+/**
+ * Spawn a sub-agent and return its output. Returns undefined on zero-output
+ * timeout (retryable) so the retry wrapper can re-spawn.
+ *
+ * #271 dispatch contract: detached spawn + pgid capture (D2), treeKill
+ * heartbeat/backstop/hard-cap kill (guardrail 2), grace-race exit-settle
+ * (F1), settle-exactly-once (`settled` + `swept` flags), sessionEnded-aware
+ * finalize composition (verifier P1: #250 path untouched, exit taxonomy D6
+ * pre-completion), settle-path sweep hook (round-3 F2), and the
+ * stateFresh-false-gated backstop (D4).
+ *
+ * Hoisted to module scope + exported for the #271 integration harness
+ * (precedent: `runSingleAgent` exported from subagent/index.ts). It closes
+ * over no `pi` state.
+ */
 
   pi.registerTool({
     name: "task",
