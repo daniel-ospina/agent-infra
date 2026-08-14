@@ -9,6 +9,8 @@
  */
 
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ok, equal } from "node:assert/strict";
 
 let passed = 0;
@@ -48,6 +50,28 @@ async function runAll(tests: Array<() => Promise<void>>) {
 
 const tests: Array<() => Promise<void>> = [];
 
+section("#265 env pivot wiring");
+tests.push(test("subAgentEnv no longer contains AGENT/ELDATO_ALLOW_MAIN_EDITS", async () => {
+  const src = readFileSync(join(process.cwd(), "extensions", "builtin-tools", "index.ts"), "utf-8");
+  const start = src.indexOf("const subAgentEnv");
+  ok(start !== -1, "subAgentEnv block not found");
+  const blockEnd = src.indexOf("\n};", start);
+  const block = src.slice(start, blockEnd === -1 ? start + 4000 : blockEnd);
+  ok(!/ALLOW_MAIN_EDITS\s*:/.test(block), "no ALLOW_MAIN_EDITS assignment in subAgentEnv (#265)");
+  // The deliberate escape hatch must survive for EXPLICIT dispatcher use.
+  ok(block.includes("SKILL_ENFORCER_DISABLED"), "SKILL_ENFORCER_DISABLED still set for sub-agents");
+  ok(block.includes("ELDATO_SKIP_VGATE"), "ELDATO_SKIP_VGATE still set for sub-agents");
+}));
+
+tests.push(test("escape hatch flags still honored when set explicitly (classifier path)", async () => {
+  // Guard-level integration: the env flags bypass M2/M3 but M1 stays active.
+  // The pure decision layer already covers this (branch-ownership.test.mjs:
+  // decideM2 allowActive → null); this asserts the source-level contract.
+  const src = readFileSync(join(process.cwd(), "extensions", "main-worktree-guard", "index.ts"), "utf-8");
+  ok(src.includes("allowActive"), "guard references the allowActive contract");
+  ok(/if \(allowActive\) return undefined/.test(src), "M2/M3 inactive under the escape hatch");
+}));
+
 section("Sub-agent spawns (startup check)");
 tests.push(test("pi -p process starts and produces stderr", async () => {
   const stderr = await spawnAndCapture({});
@@ -68,7 +92,7 @@ tests.push(test("VISION_INTERCEPTOR_DISABLED=1 skips vision-interceptor init", a
      `vision-interceptor should be skipped. stderr: ${stderr.slice(0, 300)}`);
 }));
 
-tests.push(test("All 5 skip env vars suppress all non-essential extensions", async () => {
+tests.push(test("All 4 skip env vars suppress all non-essential extensions", async () => {
   // Needs a pi that finishes startup — in CI (no DEEPSEEK_API_KEY) pi stalls
   // during provider/MCP init and later extension messages never arrive.
   if (!process.env.DEEPSEEK_API_KEY) { console.log("  ⏭️ no DEEPSEEK_API_KEY — pi won't finish startup here"); return; }
@@ -77,7 +101,6 @@ tests.push(test("All 5 skip env vars suppress all non-essential extensions", asy
     VISION_INTERCEPTOR_DISABLED: "1",
     SKILL_ENFORCER_DISABLED: "1",
     SLACK_BRIDGE_DISABLE: "1",
-    ELDATO_ALLOW_MAIN_EDITS: "1",
   });
   // These should NOT appear
   ok(!stderr.includes("[loop-enforcer] ✅ Loaded"), "loop-enforcer should not load");

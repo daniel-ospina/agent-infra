@@ -1657,8 +1657,14 @@ export default function (pi: ExtensionAPI) {
   ...(process.env.TASK_HEARTBEAT_DISABLE !== "1" ? { TASK_HEARTBEAT: "1" } : {}),
   SLACK_BRIDGE_DISABLE: "1",
   VISION_INTERCEPTOR_DISABLED: "1",
-  ELDATO_ALLOW_MAIN_EDITS: "1",  // dual-support: also set AGENT_ variant (#7549)
-  AGENT_ALLOW_MAIN_EDITS: "1",
+  // #265: sub-agents NO LONGER inherit the main-checkout escape hatch.
+  // Previously ELDATO_ALLOW_MAIN_EDITS/AGENT_ALLOW_MAIN_EDITS were set here,
+  // silently authorizing every task sub-agent to write in a shared main
+  // checkout — the exact cross-session contamination this issue closes.
+  // Write-capable sub-agent dispatches in non-infra repos now MUST get a
+  // worktree cwd (issue-workflow Worktree Gate, worktree-first); agent-infra
+  // remains exempt via the repo fingerprint. The env flag still works when a
+  // dispatcher sets it EXPLICITLY (deliberate solo escape hatch).
   ELDATO_SKIP_VGATE: "1",        // sub-agents lack `task` tool; parent enforces gates
   AGENT_SKIP_REVIEW_GATE: "1",   // sub-agents lack `task` tool; parent enforces gates
 };
