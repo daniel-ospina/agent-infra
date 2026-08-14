@@ -14,7 +14,7 @@
  * Run: npx tsx extensions/subagent/timeout-integration.test.ts
  */
 
-import { runSingleAgent, type SingleResult } from "./index.js";
+import { runSingleAgent, isFailedResult, type SingleResult } from "./index.js";
 import type { AgentConfig } from "./agents.js";
 import { execSync } from "node:child_process";
 import { ok, equal } from "node:assert/strict";
@@ -128,6 +128,85 @@ test("spawned process tree is gone after the timeout kill", async () => {
 		// no matches (or pgrep unavailable) — expected
 	}
 	equal(matches, "", `orphaned sub-agent processes remain: ${matches}`);
+});
+
+section("#208 — external SIGKILL cut contract");
+
+test("external SIGKILL mid-task → stopReason 'cut', isFailedResult true, sweep reaps", async () => {
+	// 0 = off: the CUT contract, not the task timeout, must own the resolve.
+	process.env.SUBAGENT_TASK_TIMEOUT_MS = "0";
+	process.argv[1] = undefined as unknown as string;
+	const started = Date.now();
+	let result: SingleResult | undefined;
+	let thrown: Error | undefined;
+	let killed = 0;
+	// Wait for the child to be up, then SIGKILL it externally (provider-cut
+	// simulation). SIGKILL → close code null → the new #208 mapping sets
+	// stopReason "cut" (exitCode stays 0 — the raw code was null).
+	const killPoller = (async () => {
+		while (Date.now() - started < 20_000) {
+			let pids = "";
+			try {
+				pids = execSync('pgrep -f "sleep 120 && echo done"', { timeout: 2000, encoding: "utf-8" }).trim();
+			} catch {
+				// not up yet — poll again
+			}
+			const list = pids.split(/\s+/).filter(Boolean);
+			if (list.length > 0) {
+				for (const p of list) {
+					try {
+						process.kill(Number(p), "SIGKILL");
+					} catch {
+						/* already gone */
+					}
+				}
+				killed = list.length;
+				return;
+			}
+			await new Promise((r) => setTimeout(r, 100));
+		}
+	})();
+	try {
+		result = await runSingleAgent(
+			process.cwd(),
+			testAgents,
+			"test-agent",
+			"sleep 120 && echo done",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			makeDetails("single"),
+		);
+	} catch (err) {
+		thrown = err instanceof Error ? err : new Error(String(err));
+	} finally {
+		await killPoller;
+		process.argv[1] = savedArgv1;
+		delete process.env.SUBAGENT_TASK_TIMEOUT_MS;
+	}
+
+	const elapsed = Date.now() - started;
+	ok(killed > 0, "the sub-agent was found and SIGKILLed");
+	ok(!thrown, `runSingleAgent must not throw: ${thrown?.message}`);
+	ok(result, "runSingleAgent must return a result");
+	equal(result!.stopReason, "cut", `expected stopReason 'cut', got '${result!.stopReason}'`);
+	ok(isFailedResult(result!), "a cut result is a failure — never indistinguishable from SUCCESS");
+	ok(elapsed < 30_000, `dispatch took too long (${elapsed}ms) — the cut must resolve within the bound`);
+	// post-settle: the settle-path sweep reaps any pipe-holder (bash sleep 120
+	// grandchild) — poll until pgrep -f is empty.
+	let matches = "pending";
+	const deadline = Date.now() + 15_000;
+	while (Date.now() < deadline) {
+		try {
+			matches = execSync('pgrep -f "sleep 120 && echo done"', { timeout: 2000, encoding: "utf-8" }).trim();
+		} catch {
+			matches = ""; // no matches — expected
+		}
+		if (matches === "") break;
+		await new Promise((r) => setTimeout(r, 200));
+	}
+	equal(matches, "", `orphaned processes remain after the cut sweep: ${matches}`);
 });
 
 // ── Results ───────────────────────────────────────────
