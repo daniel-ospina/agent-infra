@@ -374,8 +374,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Full branch-ownership path (#265) ──
-      const eff = branchOwnership.resolveEffectiveRepo(command, process.cwd());
       const det = classifyGitCommandDetailed(command);
+      // P2 (cycle 3): resolve the effective repo against the STATE-mutating
+      // invocation — `git -C <wt> status && git checkout main` must gate on the
+      // main checkout, not the worktree the first invocation pointed at.
+      const eff = branchOwnership.resolveEffectiveRepo(command, process.cwd(), det.stateVerb ?? det.verb);
       const allowActive = _isAllowMainEdits();
 
       // M3: branch-state gate — applies in ANY main checkout (resolved,

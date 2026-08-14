@@ -142,9 +142,10 @@ export function tokenize(command) {
       }
       if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
       if (/\s/.test(ch)) break;
-      // Subs hell parens are token boundaries — `git add . && (git commit -m x)`
-      // must gate the commit (review P2, cycle 2 — same class as the metachar fix).
-      if (ch === "(" || ch === ")") { i++; break; }
+      // Shell metachars + subshell parens are token boundaries (mirrors
+      // classify-git.mjs) — `git add .&&git commit` and `(git commit)` must
+      // tokenize as separate invocations (reviews P2-A/P2, cycles 1-3).
+      if (ch === "&" || ch === "|" || ch === ";" || ch === "(" || ch === ")") { i++; break; }
       if (ch === "\\" && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
       tok += ch; i++;
     }
@@ -162,43 +163,43 @@ export function tokenize(command) {
  * - cHints: every `-C <path>` in order (multi -C chains resolve sequentially).
  * - verb/rest: tokens from the first non-flag token after `git` onward.
  */
-export function extractGitInvocation(command) {
+export function extractGitInvocation(command, preferVerb = null) {
   const tokens = tokenize(command);
-  const cdChain = [];
-  let gitDirHint = null;
-  const cHints = [];
+  let cdChain = [];
   let i = 0;
+  // Pre-scan: collect the cd-chain as we walk (cd persists across invocations
+  // in bash). When preferVerb is set, we scan ALL invocations and return the
+  // one whose verb matches (review P2, cycle 3: `git -C <wt> status && git
+  // checkout main` — the branch-state gate must resolve the repo for the
+  // CHECKOUT, whose -C/hints differ from the first invocation).
+  let envGitDir = null;
   while (i < tokens.length) {
     const t = tokens[i];
-    if (/^GIT_DIR=(.*)$/.test(t)) {
-      gitDirHint = t.slice("GIT_DIR=".length).replace(/^["']|["']$/g, "");
-      i++; continue;
-    }
+    if (/^GIT_DIR=(.*)$/.test(t)) { envGitDir = t.slice("GIT_DIR=".length).replace(/^["']|["']$/g, ""); i++; continue; }
     if (/^GIT_WORK_TREE=/.test(t)) { i++; continue; }
-    if (t === "cd") {
-      cdChain.push(tokens[i + 1] ?? null);
-      i += 2; continue;
+    if (t === "cd") { cdChain.push(tokens[i + 1] ?? null); i += 2; continue; }
+    if (t !== "git") { i++; continue; }
+    // ── candidate git invocation ──
+    let gitDirHint = envGitDir;   // GIT_DIR env applies to all invocations
+    const cHints = [];
+    let j = i + 1;
+    while (j < tokens.length) {
+      const tt = tokens[j];
+      if (tt === "-C" || tt === "--cd") { cHints.push(tokens[j + 1] ?? ""); j += 2; continue; }
+      if (tt.startsWith("--git-dir=")) { gitDirHint = tt.slice("--git-dir=".length); j++; continue; }
+      if (tt === "--git-dir") { gitDirHint = tokens[j + 1] ?? ""; j += 2; continue; }
+      if (tt === "--work-tree" || tt === "--namespace") { j += 2; continue; }
+      if (tt.startsWith("--work-tree=") || tt.startsWith("--namespace=")) { j++; continue; }
+      if (tt === "--no-pager" || tt === "-p" || tt === "--paginate") { j++; continue; }
+      if (tt === "-c" || tt === "--config") { j += 2; continue; } // -c k=v pairs
+      if (tt.startsWith("-")) { j++; continue; } // unknown global flags — skip
+      break; // first non-flag token = subcommand
     }
-    if (t === "git") break;
-    i++;
+    const verb = tokens[j] ?? null;
+    if (preferVerb && verb !== preferVerb) { i = j; continue; } // not the target — keep scanning
+    return { cdChain: [...cdChain], gitDirHint, cHints, verb, rest: tokens.slice(j) };
   }
-  if (i >= tokens.length || tokens[i] !== "git") return null;
-  i++;
-  while (i < tokens.length) {
-    const t = tokens[i];
-    if (t === "-C" || t === "--cd") { cHints.push(tokens[i + 1] ?? ""); i += 2; continue; }
-    if (t.startsWith("--git-dir=")) { gitDirHint = t.slice("--git-dir=".length); i++; continue; }
-    if (t === "--git-dir") { gitDirHint = tokens[i + 1] ?? ""; i += 2; continue; }
-    if (t === "--work-tree") { i += 2; continue; }
-    if (t.startsWith("--work-tree=")) { i++; continue; }
-    if (t === "--namespace") { i += 2; continue; }
-    if (t.startsWith("--namespace=")) { i++; continue; }
-    if (t === "--no-pager" || t === "-p" || t === "--paginate") { i++; continue; }
-    if (t === "-c" || t === "--config") { i += 2; continue; } // -c k=v pairs
-    if (t.startsWith("-")) { i++; continue; } // unknown global flags — skip
-    break; // first non-flag token = subcommand
-  }
-  return { cdChain, gitDirHint, cHints, verb: tokens[i] ?? null, rest: tokens.slice(i) };
+  return null;
 }
 
 /**
@@ -217,8 +218,8 @@ export function extractGitInvocation(command) {
  * @param {string} command
  * @param {string} sessionCwd
  */
-export function resolveEffectiveRepo(command, sessionCwd) {
-  const inv = extractGitInvocation(command);
+export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null) {
+  const inv = extractGitInvocation(command, preferVerb);
   if (!inv) return null;
   let cwd = sessionCwd ? resolve(sessionCwd) : process.cwd();
   for (const cd of inv.cdChain) {

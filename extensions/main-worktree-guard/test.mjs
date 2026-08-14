@@ -305,7 +305,7 @@ dexpect("merge origin/main → syncSource", `git fetch origin && git merge origi
 dexpect("rebase origin/main → syncSource", `git rebase origin/main`, { verdict: "block:rebase", syncSource: "origin/main" });
 
 // M3 subclassification surfaces (branchOp via shared classifyBranchOp)
-import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo } from "../shared/branch-ownership.mjs";
+import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, extractGitInvocation as sharedExtractGitInvocation } from "../shared/branch-ownership.mjs";
 const co = (cmd) => {
   const d = classifyGitCommandDetailed(cmd);
   // P1-A: classify the STATE-mutating invocation (compound commands must gate
@@ -341,6 +341,23 @@ dexpect("P1-B: branch -d own → branchState + newBranch (allow)", `git branch -
 dexpect("P2: add && (commit) → block:commit", `git add . && (git commit -m x)`, { verdict: "block:commit" });
 expectBool("P2: commit && (checkout main) → branchState", classifyGitCommandDetailed(`git commit -m x && (git checkout main)`).branchState, true);
 expectBool("P2: (checkout main) alone → branchState", classifyGitCommandDetailed(`(git checkout main)`).branchState, true);
+// ── P2 (cycle 3) regression: worktree-hint on the FIRST invocation must not
+// exempt the STATE invocation's main-checkout mutation ───────────────────────
+{
+  // P2 (cycle 3): `git -C <wt> status && git checkout main` — the M3 gate must
+  // resolve the repo for the STATE invocation (the checkout), not the first
+  // invocation whose -C points at a worktree. We assert the mechanism: the
+  // preferVerb scan returns the state invocation's hints (no -C), while the
+  // default scan returns the first invocation's hints (-C present). A full
+  // eff-resolution against a fake path can't work (needs a real .git).
+  const cmd = `git -C /tmp/fake/.worktrees/x status && git checkout main`;
+  const d = classifyGitCommandDetailed(cmd);
+  const invFirst = sharedExtractGitInvocation(cmd);               // default: first invocation
+  const invState = sharedExtractGitInvocation(cmd, d.stateVerb);  // preferVerb: the checkout
+  expectBool("P2(cycle3): first-inv carries the -C hint", invFirst.cHints.length === 1, true);
+  expectBool("P2(cycle3): state-inv has NO -C hint (resolves to MAIN)", invState.cHints.length === 0, true);
+  expectBool("P2(cycle3): state-inv verb is the checkout", invState.verb === "checkout", true);
+}
 
 // Cross-consistency: resolveEffectiveRepo (branch-ownership) and the detailed
 // classifier's skimmer must agree on repo identity for adversarial commands.
