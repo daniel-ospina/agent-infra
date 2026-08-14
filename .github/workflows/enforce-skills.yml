@@ -1,0 +1,136 @@
+# enforce-skills.yml — nightly + push-to-main drift gate for the dangerous-ops
+# manifest / skill files (issue #252, follow-up to #239).
+#
+# Runs scripts/ci/enforce-protocol-table.sh:
+#   - Pass 1 (the CI-relevant gate): every manifest skill resolves to a real
+#     SKILL.md (AGENTS.md is untracked -> absent in checkout -> Pass 2/3 skip)
+#   - fail-closed on missing manifest
+# On drift failure, auto-files ONE issue (deduped by a stable title) with the
+# drift details, and CLOSES it once a later run passes (review P1). Infra
+# failures (checkout, script ENOENT, timeout) are NOT filed as drift (P2).
+# The pre-flight trigger covers commit-time; this catches main-drift not tied
+# to a skills/|enforcement/|AGENTS.md commit (renames, UI merges).
+
+name: enforce-skills
+
+on:
+  schedule:
+    - cron: '0 6 * * *'        # nightly 06:00 UTC
+  push:
+    branches: [main]
+    paths:                     # drift scenarios always touch these paths (P3);
+      - 'skills/**'            # AGENTS.md is untracked -> never in a push diff
+      - 'enforcement/**'
+      - '.github/workflows/enforce-skills.yml'   # gate changes self-verify
+  workflow_dispatch:           # manual
+
+concurrency:
+  group: enforce-skills
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  enforce-skills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      details: ${{ steps.enforce.outputs.details }}
+      exit_code: ${{ steps.enforce.outputs.exit_code }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run skill-enforcement audit
+        id: enforce
+        run: |
+          # set +e: the runner shell is bash -e -o pipefail — set -e would exit at
+          # the pipeline on failure, killing the PIPESTATUS capture + heredoc
+          # (drift details would be lost in exactly the failure case).
+          set +e
+          bash scripts/ci/enforce-protocol-table.sh 2>&1 | tee /tmp/drift.log
+          rc=${PIPESTATUS[0]}
+          delim="details_EOF_$RANDOM$RANDOM"   # randomized delimiter (P4)
+          echo "details<<$delim" >> "$GITHUB_OUTPUT"
+          cat /tmp/drift.log >> "$GITHUB_OUTPUT"
+          echo "$delim" >> "$GITHUB_OUTPUT"
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+  auto-file-on-failure:
+    runs-on: ubuntu-latest
+    needs: [enforce-skills]
+    if: failure() && !cancelled()
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '⚠️ enforce-skills: dangerous-ops manifest/skill drift detected';
+            const details = needs.enforce-skills.outputs.details || '';
+            const exitCode = Number(needs.enforce-skills.outputs.exit_code || 0);
+
+            // P2: classify — the script's real verdict codes are 0/1/2. rc 124
+            // (timeout), 127 (script ENOENT / checkout failure), or empty details
+            // are INFRA failures, not drift — annotate instead of filing a false
+            // "drift detected" issue (which would also block real drift via the
+            // title dedupe).
+            const isDrift = (exitCode === 1 || exitCode === 2) && details.includes('❌');
+            if (!isDrift) {
+              core.notice(`enforce-skills: non-drift failure (rc=${exitCode}) — see run ${context.runId}; not filing a drift issue`);
+              return;
+            }
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,   // github object injects no defaults — explicit owner/repo required
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const dup = issues.find(i => !i.pull_request && i.title === title);
+            const body = `Drift detected by ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n\`\`\`\n${details.replace(/`/g, '\\`')}\n\`\`\``;
+            if (dup) {
+              // P1: recurring drift — refresh the body so it never goes stale.
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: dup.number,
+                body,
+              });
+              console.log(`Updated open issue #${dup.number} with fresh drift details.`);
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              labels: ['bug'],
+              body,
+            });
+
+  close-on-success:
+    runs-on: ubuntu-latest
+    needs: [enforce-skills]
+    if: success()
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // P1: drift fixed -> close the open drift issue (with reason).
+            const title = '⚠️ enforce-skills: dangerous-ops manifest/skill drift detected';
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', per_page: 100,
+            });
+            for (const i of issues.filter(x => !x.pull_request && x.title === title)) {
+              await github.rest.issues.update({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: i.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: i.number,
+                body: `Drift resolved — enforce-skills run ${context.runId} passed.`,
+              });
+              console.log(`Closed drift issue #${i.number} (resolved).`);
+            }
