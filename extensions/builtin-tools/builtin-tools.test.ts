@@ -1061,6 +1061,69 @@ test("nonce authentication — matching nonce accepted, mismatch rejected (revie
   equal(st.lastMarkerAt, 5, "rejected marker does not refresh freshness");
 });
 
+test("E279c: latch sources — tool_start/tool_end latch, monotonic; bare turn_start/ready do NOT", () => {
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready", st, 1);
+  equal(st.everSawRealActivity, false, "ready alone does not latch (#5926 preservation)");
+  parseHeartbeatLine("[task-heartbeat] turn_start 0", st, 2);
+  equal(st.everSawRealActivity, false, "bare turn_start does not latch (would disable hung-first-request detection)");
+  parseHeartbeatLine("[task-heartbeat] tool_start id1 read", st, 3);
+  ok(st.everSawRealActivity, "tool_start latches");
+  // monotonic — subsequent turn_start/turn_end/tool_end do NOT clear
+  parseHeartbeatLine("[task-heartbeat] tool_end id1", st, 4);
+  parseHeartbeatLine("[task-heartbeat] turn_end 0", st, 5);
+  parseHeartbeatLine("[task-heartbeat] turn_start 1", st, 6);
+  ok(st.everSawRealActivity, "latch survives turn resets (monotonic)");
+  // tool_end alone latches (short-round marker-loss corner: tool_start lost)
+  const st2 = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] turn_start 0", st2, 1);
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=5000 tool_age_max_ms=0 saw_msg=0 saw_tool=0", st2, 2);
+  equal(st2.everSawRealActivity, false, "no tool evidence yet");
+  parseHeartbeatLine("[task-heartbeat] tool_end idX", st2, 3);
+  ok(st2.everSawRealActivity, "tool_end alone latches (provably implies prior model activity)");
+});
+
+test("E279c2: turn transitions reset the parent's frozen streamAgeMs + toolAgeMaxMs (Hardening 2, parse-level)", () => {
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=600000 tool_age_max_ms=700000 saw_msg=0 saw_tool=0", st, 1);
+  equal(st.streamAgeMs, 600_000, "frozen stream age from the last tick");
+  equal(st.toolAgeMaxMs, 700_000, "frozen tool age from the last tick");
+  parseHeartbeatLine("[task-heartbeat] turn_end 0", st, 2);
+  equal(st.streamAgeMs, 0, "turn_end resets the parent's parsed streamAgeMs");
+  equal(st.toolAgeMaxMs, 0, "turn_end resets the parent's parsed toolAgeMaxMs (symmetric — stale tool age must not false tool-stall a preflight tool_start)");
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=700000 tool_age_max_ms=800000 saw_msg=0 saw_tool=0", st, 3);
+  equal(st.streamAgeMs, 700_000, "re-frozen by a later tick");
+  parseHeartbeatLine("[task-heartbeat] tool_start idX read", st, 4);
+  equal(st.streamAgeMs, 700_000, "tool_start does not reset the frozen stream age (only tool_end/turn_end/turn_start do)");
+  parseHeartbeatLine("[task-heartbeat] tool_end idX", st, 5);
+  equal(st.streamAgeMs, 0, "tool_end resets the frozen stream age (review fix — the tool_end→turn_end window)");
+  parseHeartbeatLine("[task-heartbeat] turn_start 1", st, 6);
+  equal(st.streamAgeMs, 0, "turn_start resets too (covers a lost turn_end)");
+  equal(st.toolAgeMaxMs, 0, "turn_start resets toolAgeMaxMs too");
+});
+
+test("E279d: tick latch — saw_msg/saw_tool/tools each latch; all-zero tick does not", () => {
+  for (const field of ["saw_msg=1", "saw_tool=1"]) {
+    const st = createHeartbeatState();
+    parseHeartbeatLine(`[task-heartbeat] tick tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 ${field} other=0`, st, 1);
+    ok(st.everSawRealActivity, `tick ${field} latches`);
+  }
+  const stT = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] tick tools=1 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=0 saw_tool=0", stT, 1);
+  ok(stT.everSawRealActivity, "tick tools>0 latches");
+  const stZ = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=0 saw_tool=0", stZ, 1);
+  equal(stZ.everSawRealActivity, false, "all-zero tick does not latch");
+});
+
+test("E279d2: forged tick (wrong nonce) cannot set the latch", () => {
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready nonce=abc123", st, 5, "abc123");
+  parseHeartbeatLine("[task-heartbeat] tick nonce=EVIL tools=2 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=1 saw_tool=1", st, 6, "abc123");
+  equal(st.everSawRealActivity, false, "forged tick cannot disarm #5926 detection");
+  equal(st.toolsInFlight, 0, "forged tick changed nothing");
+});
+
 test("tick number overflow guard — Infinity digits ignored (review fix)", () => {
   const st = createHeartbeatState();
   const huge = "9".repeat(400);
@@ -1422,6 +1485,211 @@ test("E13: first-message-stall at M — turn active, no message/tool events, ret
   equal(dHung.reason, "tool-stall", "tool-stall reason (#198)");
 });
 
+section("#279 first-message — everSawRealActivity gate + frozen-age transition reset (E279 series)");
+
+test("E279a: worked session, mid-turn quiet verdict → NEVER cut at M (the regression boundary)", () => {
+  // Latched session (prior tool round) now sits in a quiet verdict turn:
+  // turnActive, per-turn flags zeroed by the per-LLM-call turn_start, tools=0,
+  // streamAgeMs > M, markers FRESH. This is the exact #265 cut signature.
+  const st = createHeartbeatState();
+  st.everSawRealActivity = true; // prior tool_start latched it
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.turnSawMessage = false;
+  st.turnSawTool = false;
+  st.toolsInFlight = 0;
+  st.streamAgeMs = M + 1; // 300_001
+  st.lastMarkerAt = 800_000;
+  // S pinned above M (harness S=120s would make stream-stall preempt) — E13 precedent (L1401).
+  const d = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: st, streamStallMs: 600_000 }));
+  equal(d.kill, false, "worked session never cut at M");
+  // pre-fix bracket: identical state without the latch → the #265 class cut
+  const stPre = { ...st, everSawRealActivity: false };
+  const dPre = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: stPre, streamStallMs: 600_000 }));
+  equal(dPre.kill, true, "pre-fix state kills (the #265 class)");
+  equal(dPre.reason, "first-message-stall");
+  // latched quiet beyond S → stream-stall owns it (no unbounded wait, AC4)
+  const stS = { ...st, streamAgeMs: 600_000 };
+  const dS = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: stS, streamStallMs: 600_000 }));
+  equal(dS.kill, true, "latched session's genuine quiet is bounded by stream-stall (S), not M");
+  equal(dS.reason, "stream-stall");
+});
+
+test("E279a2: frozen-age turn transition — completed round with streamAgeMs > S must not cut the live verdict (Hardening 2, parse-driven)", () => {
+  // NESTED-TASK class: the outer sub-agent's task-tool round exceeds S (20min);
+  // the frozen streamAgeMs must not stream-stall-cut the verdict at the turn
+  // transition. Construction is PARSE-DRIVEN so the reset/latch sites run.
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] turn_start 1", st, 100_000);
+  parseHeartbeatLine("[task-heartbeat] tool_start id1 task", st, 100_001);
+  parseHeartbeatLine("[task-heartbeat] tick tools=1 turn=1 stream_age_ms=600000 tool_age_max_ms=600000 saw_msg=0 saw_tool=1", st, 400_000);
+  ok(st.everSawRealActivity, "round tick with tools=1 latches the session");
+  parseHeartbeatLine("[task-heartbeat] tool_end id1", st, 437_000);
+  // REVIEW WINDOW: a 10s decision in the tool_end→turn_end window (tools=0,
+  // frozen streamAgeMs > S, turnActive still true, markers fresh) must NOT cut
+  // — tool_end resets the parent's frozen copy (review fix).
+  equal(st.streamAgeMs, 0, "tool_end resets the parent's frozen streamAgeMs (review fix)");
+  const dToolEndWindow = heartbeatKillDecision(dinput({ now: 447_000, lastLifeSignAt: 447_000, state: st }));
+  equal(dToolEndWindow.kill, false, "no stream-stall cut in the tool_end→turn_end window");
+  parseHeartbeatLine("[task-heartbeat] turn_end 1", st, 437_001);
+  parseHeartbeatLine("[task-heartbeat] turn_start 2", st, 437_002);
+  equal(st.streamAgeMs, 0, "turn transition resets the parent's frozen streamAgeMs (Hardening 2)");
+  // decision 10s after the transition — before any self-healing tick
+  const d = heartbeatKillDecision(dinput({ now: 447_002, lastLifeSignAt: 447_002, state: st }));
+  equal(d.kill, false, "frozen age gone + latch set → never cut at the transition");
+  // pre-fix emulation: frozen age with NO reset (the P1-2 killer)
+  const stPre = createHeartbeatState();
+  stPre.everSawWork = true;
+  stPre.turnActive = true;
+  stPre.turnSawMessage = false;
+  stPre.turnSawTool = false;
+  stPre.toolsInFlight = 0;
+  stPre.streamAgeMs = 600_000;
+  stPre.lastMarkerAt = 447_000;
+  const dPre = heartbeatKillDecision(dinput({ now: 447_010, lastLifeSignAt: 447_000, state: stPre }));
+  equal(dPre.kill, true, "pre-fix: frozen age > S cuts the live session (nested-task class)");
+  equal(dPre.reason, "stream-stall");
+});
+
+test("E279b: never-worked session → cut at M PRESERVED (the #5926 guard, PARSE-DRIVEN)", () => {
+  // A session that NEVER produced a message or tool (hung first provider
+  // request). Construction is PARSE-DRIVEN so the guard is genuine: ready →
+  // turn_start → all-zero ticks with streamAge crossing M. A future
+  // implementer latching everSawRealActivity on bare ready/turn_start (or
+  // reusing everSawWork, which IS latched by turn_start) fails the latch-false
+  // assertion below.
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready", st, 100_000);
+  parseHeartbeatLine("[task-heartbeat] turn_start 0", st, 100_001);
+  equal(st.everSawRealActivity, false, "ready + bare turn_start must NOT latch (the guard invariant — a turn_start-latching implementation fails here)");
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=430000 tool_age_max_ms=0 saw_msg=0 saw_tool=0", st, 430_000);
+  equal(st.everSawRealActivity, false, "all-zero ticks never latch");
+  // S pinned above M (harness S=120s would let stream-stall preempt clause 4);
+  // hasOutput=false → retryable-undefined (#5926 contract).
+  const d = heartbeatKillDecision(dinput({ now: 440_000, lastLifeSignAt: 440_000, state: st, streamStallMs: 600_000, hasOutput: false }));
+  equal(d.kill, true, "hung first request still cut");
+  equal(d.reason, "first-message-stall");
+  equal(d.resolveUndefined, true, "retryable — #5926 preserved");
+});
+
+test("E279h: boundary — strict > at M, stateFresh window edge, markerAge accumulation, latch × load", () => {
+  // (1) strict `>` at the never-worked M boundary (unpinned before this):
+  // streamAgeMs === M exactly → NOT cut (clause needs effStreamAge > M).
+  const stExact = createHeartbeatState();
+  stExact.everSawWork = true;
+  stExact.turnActive = true;
+  stExact.turnSawMessage = false;
+  stExact.turnSawTool = false;
+  stExact.toolsInFlight = 0;
+  stExact.streamAgeMs = M; // exactly M
+  stExact.lastMarkerAt = 800_000;
+  equal(
+    heartbeatKillDecision(dinput({ now: 800_000, lastLifeSignAt: 800_000, state: stExact, streamStallMs: 600_000, hasOutput: false })).kill,
+    false,
+    "effStreamAge === M exactly → not cut (strict >)",
+  );
+  // (2) markerAge accumulation: streamAgeMs BELOW M but markerAge pushes
+  // effStreamAge over M → cut via the marker gap alone.
+  const stAcc = createHeartbeatState();
+  stAcc.everSawWork = true;
+  stAcc.turnActive = true;
+  stAcc.turnSawMessage = false;
+  stAcc.turnSawTool = false;
+  stAcc.toolsInFlight = 0;
+  stAcc.streamAgeMs = M - 1000; // below M
+  stAcc.lastMarkerAt = 800_000;
+  const dAcc = heartbeatKillDecision(dinput({ now: 802_000, lastLifeSignAt: 802_000, state: stAcc, streamStallMs: 600_000, hasOutput: false }));
+  equal(dAcc.kill, true, "markerAge (2000) pushes effStreamAge over M → cut");
+  equal(dAcc.reason, "first-message-stall");
+  // (3) stateFresh window edge: markerAge === max(2T, 2×INT) = 120s exactly →
+  // still fresh → first-message fires; markerAge = 120_001 → stale → silence
+  // owns the cut, first-message never fires.
+  const stFreshEdge = { ...stExact, streamAgeMs: M + 1, lastMarkerAt: 800_000 };
+  const dEdge = heartbeatKillDecision(dinput({ now: 920_000, lastLifeSignAt: 920_000, state: stFreshEdge, streamStallMs: 600_000, hasOutput: false }));
+  equal(dEdge.kill, true, "markerAge === 120s (fresh window edge, inclusive) → first-message can fire");
+  equal(dEdge.reason, "first-message-stall");
+  const stStaleEdge = { ...stFreshEdge, lastMarkerAt: 799_999 }; // markerAge = 120_001
+  const dStale = heartbeatKillDecision(dinput({ now: 920_000, lastLifeSignAt: 799_999, state: stStaleEdge, streamStallMs: 600_000, hasOutput: false }));
+  equal(dStale.kill, true, "stale markers + no life signs → still cut (never-worked class)");
+  equal(dStale.reason, "silence-threshold", "stale markers exempt the first-message clause (stateFresh precondition) — silence owns the cut");
+  // (4) latch × load-scaling cross-product: a LATCHED session under a load
+  // storm (load1=60 → effM = 3×M) with streamAgeMs = 3M+1 is STILL never cut
+  // at the first-message clause (S owns it).
+  const stLatched = createHeartbeatState();
+  stLatched.everSawRealActivity = true;
+  stLatched.everSawWork = true;
+  stLatched.turnActive = true;
+  stLatched.turnSawMessage = false;
+  stLatched.turnSawTool = false;
+  stLatched.toolsInFlight = 0;
+  stLatched.streamAgeMs = 3 * M + 1;
+  stLatched.lastMarkerAt = 800_000;
+  const dLoad = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: stLatched, streamStallMs: 1_500_000, load1: 60 }));
+  equal(dLoad.kill, false, "latched session under load storm never cut at first-message (effM=3×M, S owns the quiet)");
+  // (5) latched session + STALE marker stream → the silence clause still fires
+  // (the latch gates ONLY the first-message clause, not boundedness — AC4). A
+  // future over-correction latching the silence clause ("never kill a working
+  // agent") would fail this case.
+  const stLatchedStale = createHeartbeatState();
+  stLatchedStale.everSawRealActivity = true;
+  stLatchedStale.everSawWork = true;
+  stLatchedStale.turnActive = true;
+  stLatchedStale.turnSawMessage = false;
+  stLatchedStale.turnSawTool = false;
+  stLatchedStale.toolsInFlight = 0;
+  stLatchedStale.streamAgeMs = 100_000; // well below S
+  stLatchedStale.lastMarkerAt = 799_999; // markerAge = 120_001 → stale
+  const dStaleLatched = heartbeatKillDecision(dinput({ now: 920_000, lastLifeSignAt: 799_999, state: stLatchedStale, streamStallMs: 600_000, hasOutput: false }));
+  equal(dStaleLatched.kill, true, "latched session with a dead marker stream is still bounded (silence at T)");
+  equal(dStaleLatched.reason, "silence-threshold", "the latch never exempts the silence clause (boundedness preserved)");
+  equal(dStaleLatched.resolveUndefined, true, "no real output → retryable");
+});
+
+test("E279e: lost-tool_start recovered by the tick backstop (marker-loss residual, parse-driven)", () => {
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] turn_start 0", st, 100_000);
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=10000 tool_age_max_ms=0 saw_msg=0 saw_tool=0", st, 130_000);
+  equal(st.everSawRealActivity, false, "all-zero tick does not latch");
+  // the late round tick carries tools=1 → latches from the tick ALONE.
+  // Assert BEFORE parsing tool_end so the isolation point is unambiguous.
+  parseHeartbeatLine("[task-heartbeat] tick tools=1 turn=1 stream_age_ms=330000 tool_age_max_ms=330000 saw_msg=0 saw_tool=1", st, 430_000);
+  ok(st.everSawRealActivity, "tick with tools=1 latches (tick backstop) — isolated before any tool_end");
+  parseHeartbeatLine("[task-heartbeat] tool_end id1", st, 431_000);
+  parseHeartbeatLine("[task-heartbeat] turn_end 1", st, 432_000);
+  parseHeartbeatLine("[task-heartbeat] turn_start 2", st, 433_000);
+  const d = heartbeatKillDecision(dinput({ now: 443_000, lastLifeSignAt: 443_000, state: st, streamStallMs: 600_000 }));
+  equal(d.kill, false, "quiet verdict after the recovered latch is never cut at M");
+});
+
+test("E279g: latched session with a hung in-flight tool is still cut at L (tool-stall precedence)", () => {
+  const st = createHeartbeatState();
+  st.everSawRealActivity = true; // worked session
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.toolsInFlight = 1;
+  st.toolAgeMaxMs = 21_600_001;
+  st.lastMarkerAt = 800_000;
+  const d = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: st, toolStallMs: 21_600_000 }));
+  equal(d.kill, true, "hung tool still cut");
+  equal(d.reason, "tool-stall", "clause 1 precedes clause 4 regardless of the latch (AC4)");
+});
+
+test("E279f: diagnostics — latch in all alive summaries + effective-bound headline (source-scan)", () => {
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  // Anchor on the STABLE "Alive state: " prefix, not variable names or a hard
+  // site count (a legitimate 5th diagnostic site must simply expose the latch).
+  const aliveSites = src.match(/Alive state: /g) ?? [];
+  ok(aliveSites.length >= 1, "at least one Alive state: diagnostic site");
+  const aliveTemplates = src.match(/Alive state: toolsInFlight=.*?lastMarkerAgeMs=\$\{markerAgeMs\}/g) ?? [];
+  for (const site of aliveTemplates) {
+    ok(site.includes("everSawRealActivity="), "every alive summary exposes the latch");
+  }
+  ok(
+    src.includes("(decision.firstMessageMs ?? hbThresholds.firstMessageMs)"),
+    "first-message headline prints the EFFECTIVE (latched) bound, not the base (905s display bug)",
+  );
+});
+
 test("E12: ready + no turn — not tier-1-killed; ticks stop → silence at T; ticks flow → stream-stall at S", () => {
   const st = createHeartbeatState();
   st.sawReady = true;
@@ -1624,9 +1892,13 @@ test("full-format round-trip: every child formatter parses through the parent pa
   const N = "testnonce77";
   equal(parseHeartbeatLine(childHb.formatReady(N), st, 1, N), true);
   ok(st.sawReady);
+  // #279: the child's READY formatter must NOT latch (bare ready ≠ activity).
+  equal(st.everSawRealActivity, false, "formatReady must not latch (#5926 preservation)");
   equal(parseHeartbeatLine(childHb.formatToolStart(N, "call-1", "bash"), st, 2, N), true);
   equal(st.toolsInFlight, 1);
   ok(st.everSawWork);
+  // #279: the child's TOOL_START formatter MUST latch (wire-format → latch contract).
+  ok(st.everSawRealActivity, "formatToolStart latches through the parent parser");
   equal(parseHeartbeatLine(childHb.formatTurnStart(N, 3), st, 3, N), true);
   ok(st.turnActive);
   equal(parseHeartbeatLine(childHb.formatTick(N, { tools: 1, turn: true, streamAgeMs: 4242, toolAgeMaxMs: 2424, sawMsg: true, sawTool: false }), st, 4, N), true);
@@ -1640,6 +1912,10 @@ test("full-format round-trip: every child formatter parses through the parent pa
   equal(st.toolsInFlight, 0);
   equal(parseHeartbeatLine(childHb.formatTurnEnd(N, 3), st, 6, N), true);
   equal(st.turnActive, false);
+  // #279: the child's TURN_START formatter alone (fresh state) must NOT latch.
+  const stTurn = createHeartbeatState();
+  equal(parseHeartbeatLine(childHb.formatTurnStart(N, 1), stTurn, 1, N), true);
+  equal(stTurn.everSawRealActivity, false, "formatTurnStart must not latch (hung-first-request preservation)");
   // #191: session_end completion marker round-trips with the nonce and latches
   equal(parseHeartbeatLine(childHb.formatSessionEnd(N), st, 7, N), true);
   ok(st.sessionEnded, "session_end latches sessionEnded through the parent parser");

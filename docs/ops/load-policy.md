@@ -1,3 +1,14 @@
+---
+title: "Fleet Load Policy — load-aware bounds & batch suspension (#209)"
+type: engineering
+domain: operations
+doc_status: live
+subjects.team: organisation-design-team
+created: 2026-08-14
+aboutSubjects: organisation-design-team
+aboutObjects: agent-infra, builtin-tools, fleet
+---
+
 # Fleet Load Policy — load-aware bounds & batch suspension (#209)
 
 One place that pins the agent-infra fleet's load policy so operators, skills,
@@ -136,10 +147,33 @@ unconditionally.
   peaked cannot trigger an immediate re-cut.
 - **`toolsInFlight > 0` exemption (the #198 structural fix):** the first-message
   clause never fires while a tool is in flight — a live tool is bounded by the
-  6h tool-stall clause, never cut at M. Pinned by test E13b.
+  6h tool-stall clause, never cut at M. Pinned by test E13. Note (#279): with
+  the `everSawRealActivity` latch below, the per-turn exemption is subsumed
+  (every parse source of `toolsInFlight`/`turnSawTool` also latches); the
+  live #198 protection is the session-level latch — E279g pins hung-tool
+  boundedness at L.
+- **`everSawRealActivity` gate (the #279 fix):** the clause additionally never
+  fires for a session that has demonstrably worked — any parsed
+  `tool_start`/`tool_end` marker or tick reporting `tools>0`/`saw_msg`/`saw_tool`
+  latches the session monotonically. Per-LLM-call `turn_start` resets the
+  per-turn flags in both child and parent, so without this gate a tool-first
+  sub-agent was cut at M during its quiet verdict turn (5 recovered cuts). A
+  never-worked session (hung first provider request, #5926) keeps the M cut
+  unchanged — the latch is deliberately NOT set by bare `ready`/`turn_start`
+  (those fire before the first provider call). Pinned by the E279 series.
+- **Frozen-age transition reset (the #279 P1-2 hardening):** the parent's parsed
+  `streamAgeMs` is the last tick's value — a completed round can leave it frozen
+  beyond S (nested-task class), stream-stall-cutting the live verdict at the
+  turn transition. `tool_end`/`turn_end`/`turn_start` now reset the parent's
+  copy to 0 (the child self-heals via its own activity clock); quiet beyond S is
+  then genuine quiet only. Between-turn wedge detection is preserved (stream-stall at
+  S of true quiet via flowing ticks; a marker-stopped child is caught at ~S via
+  markerAge accumulation inside the 60min fresh window).
 - **Observability:** when effM extends beyond M the loop emits
   `[task] first-message bound 300s → 900s (load1=60)` (rate-limited to bound
-  increases); the kill headline shows the effective bound.
+  increases); the kill headline shows the EFFECTIVE bound (the 905s cut once
+  printed "bound 300s" under a latched 900s bound — fixed). All four `Alive
+  state:` diagnostics expose `everSawRealActivity=` for triage.
 - Tier-1 (`TASK_FIRST_OUTPUT_TIMEOUT_MS`) is **NOT** load-scaled — scaling it
   delays hung-spawn detection, and spawn retry is cheap and stateless.
 

@@ -546,16 +546,24 @@ export function shouldFallback(d: FallbackDecision): boolean {
 //     completion watchdog (Tier 4) so a completed child stuck in cleanup is
 //     rescued promptly and its output returned as success.
 //
-// Kill clauses (precedence: tool-stall → stream-stall → silence →
-// first-message):
+// Kill clauses (precedence: tool-stall → stream-stall → silence → cut →
+// first-message → max-dispatch):
 //   tool-stall ........ in-flight tool older than TASK_TOOL_STALL_MS (6h;
 //                       min(L, T) when turnActive=false — preflight-stuck)
 //   stream-stall ...... no tools, stream idle > TASK_STREAM_STALL_MS (20 min)
 //                       — also bounds between-turn wedges with flowing ticks
 //   silence ........... no bytes/markers for HEARTBEAT_TIMEOUT_MS unless
 //                       stateFresh && turnActive && (tools > 0 || stream fresh)
+//   cut (#271) ........ marker-gap deadline (TASK_HEARTBEAT_CUT_GAP_MS, ~37.5s)
+//                       while a tool is in flight — wedged-alive class
 //   first-message ..... turn active but no message/tool events for
-//                       TASK_FIRST_MESSAGE_MS (300s) — fast #5926 detection
+//                       TASK_FIRST_MESSAGE_MS (300s) — fast #5926 detection.
+//                       #279: gated on !everSawRealActivity — only fires for
+//                       sessions that NEVER demonstrated work (hung first
+//                       request); a worked session is never cut at M (its
+//                       quiet is owned by stream-stall / silence / tool-stall /
+//                       hard cap / maxDispatch).
+//   max-dispatch ...... opt-in total wall-clock cap (TASK_MAX_DISPATCH_MS)
 //
 // Kills fired while no REAL output ever arrived resolve `undefined`
 // (retryable) so retry/backoff/circuit-breaker stay live for the #5926 class.
@@ -732,6 +740,17 @@ export interface HeartbeatState {
   turnSawTool: boolean;
   /** Latched on first tool_start/turn_start — proves work started (tier-1). */
   everSawWork: boolean;
+  /** #279: monotonic session-level latch proving REAL message/tool activity
+   * (work-loop signals only). Set on tool_start/tool_end markers and on any
+   * tick reporting tools>0 || saw_msg || saw_tool. NEVER latched by bare
+   * ready/turn_start — the emitter fires those BEFORE the first provider
+   * call, so latching there would mark every session as worked and silently
+   * disable the hung-first-request detection (#5926) the first-message
+   * clause exists for. Distinct from everSawWork (which IS latched on
+   * turn_start — a deliberate footgun-guard: reusing everSawWork here would
+   * disable #5926 on every session). Never reset: turn resets in the child
+   * must not erase demonstrable activity. */
+  everSawRealActivity: boolean;
   /** Latched on ready — proves the emitter initialized (tier-1 slow-start). */
   sawReady: boolean;
   /** Latched on session_end (#191) — the child declared the session complete
@@ -751,6 +770,7 @@ export function createHeartbeatState(): HeartbeatState {
     turnSawMessage: false,
     turnSawTool: false,
     everSawWork: false,
+    everSawRealActivity: false,
     sawReady: false,
     sessionEnded: false,
     lastMarkerAt: 0,
@@ -814,15 +834,54 @@ export function parseHeartbeatLine(
     case "tool_start":
       state.toolsInFlight += 1;
       state.everSawWork = true;
+      // #279: a tool_start proves real (work-loop) activity — the first tool
+      // round must latch the session so the per-turn first-message bound can
+      // never cut a demonstrably-working sub-agent.
+      state.everSawRealActivity = true;
       break;
     case "tool_end":
       state.toolsInFlight = Math.max(0, state.toolsInFlight - 1);
+      // #279 (P1-1 hardening): a parsed tool_end provably implies PRIOR model
+      // activity — a streamed assistant message produced a tool call (even a
+      // failed/blocked/truncated one emits tool_execution_end in pi). Closes
+      // the short-round marker-loss corner: a <30s first round has no in-round
+      // ticks to latch the session, so a lost tool_start would otherwise leave
+      // zero evidence. A never-worked hung-first-request session can never
+      // reach tool code (no message → no tool_end) → #5926 stays safe.
+      state.everSawRealActivity = true;
+      // #279 (P1-2 hardening, review fix): the nested-task round's last tick
+      // froze streamAgeMs > S; tool_end drops toolsInFlight to 0, so WITHOUT
+      // this reset the 10s decision can stream-stall-cut the live verdict in
+      // the tool_end→turn_end window (clause 2 has no turnActive requirement
+      // and no latch gate). Reset here too — the child self-heals via its own
+      // touchActivity() on tool_execution_end; a wedged child is still caught
+      // at S of true quiet via growing markerAge.
+      // toolAgeMaxMs is deliberately NOT reset here (asymmetry, review note):
+      // clause 1 (tool-stall) requires toolsInFlight>0, and after tool_end the
+      // only way to regain it is a real tool_start (post turn_start's reset);
+      // a same-turn sequential tool inheriting a frozen tool_age is safe under
+      // the 2h default hard cap (a false tool-stall needs a >6h frozen age).
+      state.streamAgeMs = 0;
       break;
     case "turn_start":
       state.turnActive = true;
       state.everSawWork = true;
       state.turnSawMessage = false;
       state.turnSawTool = false;
+      // #279 (P1-2 hardening): the parent's parsed streamAgeMs is the LAST
+      // tick's value — a completed round can leave it frozen > M or even > S.
+      // The child self-heals (its handlers touchActivity()), so the parent's
+      // copy is what a 10s decision reads between the transition and the next
+      // self-healing tick. Reset here (and on turn_end + tool_end) so a fresh
+      // turn never inherits the previous turn's frozen stream age (kills the
+      // frozen-age turn-transition cut in BOTH the M and S bands — the
+      // nested-task class). toolAgeMaxMs gets the same symmetric reset (review
+      // fix): a >30min nested round frozen tool_age would otherwise false
+      // tool-stall a healthy preflight tool_start of the next turn (clause 1
+      // requires toolsInFlight>0, so a fresh turn only regains it via a real
+      // tool_start).
+      state.streamAgeMs = 0;
+      state.toolAgeMaxMs = 0;
       break;
     case "turn_end":
       state.turnActive = false;
@@ -831,6 +890,11 @@ export function parseHeartbeatLine(
       // after a lost tool_end from causing a false tool-stall kill (code-
       // review fix).
       state.toolsInFlight = 0;
+      // #279 (P1-2 hardening): see turn_start above — reset the frozen stream
+      // age + tool age here too so the transition window is covered even if the
+      // turn_start marker is lost.
+      state.streamAgeMs = 0;
+      state.toolAgeMaxMs = 0;
       break;
     case "tick": {
       for (const m of rest.matchAll(/([a-z_]+)=(\d+)/g)) {
@@ -847,6 +911,18 @@ export function parseHeartbeatLine(
           case "saw_tool": state.turnSawTool = v === 1; break;
         }
       }
+      // #279: latch from the complete post-parse state (field-order
+      // independent). The tick is the 30s LLM-independent backstop for marker
+      // loss (a lost tool_start/tool_end during a LONG round is recovered by
+      // any round tick carrying tools>0; saw_msg/saw_tool cover message-only
+      // sessions). The nonce check precedes the switch, so a forged tick
+      // cannot set the latch. The latch is monotonic — turn resets in the
+      // child cannot erase it.
+      state.everSawRealActivity =
+        state.everSawRealActivity ||
+        state.toolsInFlight > 0 ||
+        state.turnSawMessage ||
+        state.turnSawTool;
       break;
     }
     default:
@@ -1116,9 +1192,25 @@ export function heartbeatKillDecision(
   //    task in flight while the tick reported no tool seen) — never cut a
   //    demonstrably-working sub-agent at the first-message bound; a genuinely
   //    hung in-flight tool is still bounded by the tool-stall clause (L).
+  //    #279: gated on !everSawRealActivity — a session that demonstrably
+  //    WORKED (any tool_start/tool_end marker or tick saw_msg/saw_tool/
+  //    tools>0 — work-loop signals only, never a bare ready/turn_start) is
+  //    NEVER cut at M: mid-turn quiet verdicts and frozen streamAge at the
+  //    turn transition are owned by stream-stall (S) / silence (T) /
+  //    tool-stall (L) / hard cap / maxDispatch — the #198/#220 "never kill a
+  //    working agent" intent. A never-worked session keeps the M cut unchanged
+  //    (hung-first-request detection preserved, #5926). Marker STALENESS stays
+  //    covered by the stateFresh precondition above (a stale marker stream is
+  //    already exempt here). NOTE (review): the three sub-conditions
+  //    (!turnSawMessage && !(turnSawTool || toolsInFlight > 0)) are
+  //    production-DEAD whenever everSawRealActivity is false (every source of
+  //    those flags also latches) but remain FIXTURE-LOAD-BEARING — E13's
+  //    manual-construction exemption cases (saw_tool=true, toolsInFlight=1)
+  //    set them without going through parse. Do NOT "simplify" them away.
   if (
     stateFresh &&
     st.turnActive &&
+    !st.everSawRealActivity &&
     !st.turnSawMessage &&
     !(st.turnSawTool || st.toolsInFlight > 0) &&
     effStreamAge > effFirstMessageMs
@@ -1360,7 +1452,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       doResolve({
         content: [{
           type: "text",
-          text: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.\n\nAlive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${stdout.slice(-500)}`,
+          text: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.\n\nAlive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${stdout.slice(-500)}`,
         }],
         details: { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
       }, { sweep: true });
@@ -1437,7 +1529,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // zero-partial cut stays retryable by the retry wrapper, mirroring
         // the kill-clause contract.
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs}`;
         const headline = "⚠️ Sub-agent was cut — process exited mid-tool / no life signs. Partial results below — parent should decide: accept, re-dispatch, or escalate.";
         const output = stdout.trim();
         const errInfo = stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "";
@@ -1511,12 +1603,12 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
 
       const lastOutput = stdout.slice(-500);
       const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}`;
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "tool-stall": `⚠️ Sub-agent tool call exceeded its bound (tool age ${Math.round(hbCtx.state.toolAgeMaxMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
-        "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.firstMessageMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+        "first-message-stall": `⚠️ Sub-agent turn produced no first message/tool activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "max-dispatch": `⚠️ Sub-agent exceeded the total dispatch cap (${Math.round(hbThresholds.maxDispatchMs / 1000)}s, TASK_MAX_DISPATCH_MS). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "cut": `⚠️ Sub-agent was cut — no life signs for ${Math.round(markerAgeMs / 1000)}s (marker gap exceeded ${Math.round(hbThresholds.cutGapMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
       };
@@ -1558,7 +1650,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           return;
         }
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} lastMarkerAgeMs=${markerAgeMs}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs}`;
         const lastOutput = stdout.slice(-500);
         doResolve({
           content: [{ type: "text", text: `${headline}\n\n${aliveSummary}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${lastOutput}` }],
