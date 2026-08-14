@@ -238,48 +238,6 @@ Ready to implement <feature-name>
   ```
   Never launch a nested/background `pi` to "escape" the guard — that is how a 29h fleet hang happened (2026-08-11→12, #206).
 
-### Never launch an unbounded nested pi (#206) — hard rule
-
-- **Rule:** NEVER launch a nested `pi` (print-mode sub-agent, background session, recovery worker) without ALL THREE bounds:
-  1. **`timeout <N>`** — hard wall-clock cap on the process (e.g. `timeout 600 pi -p ...`); no unbounded launches, ever.
-  2. **Log-file redirect** — `> /tmp/<name>.log 2>&1` so progress is observable (stdout to a pipe/file is block-buffered and can appear frozen for hours, #202).
-  3. **Liveness marker** — the launched process must emit a periodic heartbeat (timestamped line) so a stalled worker is distinguishable from a dead one.
-- **Sanctioned alternative:** the terminal one-liner above (no pi involved).
-
-### Monitoring background workers — stdout is buffered, stderr is not (#202)
-
-`pi -p` stdout redirected to a FILE is block-buffered (pi accumulates per-turn
-output), so a `tail -f` log can look frozen for hours while the worker is
-actively working — **do not infer liveness from stdout alone**. The unbuffered
-signals: (1) STDERR (node writes it synchronously — the task-heartbeat marker
-stream is stderr), and (2) side effects (processes, worktree diffs).
-
-Monitor a background worker with:
-
-```bash
-bash scripts/monitor-worker.sh /tmp/pi-1.log 60   # exit 0 = fresh writes, 1 = stale, 2 = missing/empty
-watch -n 30 'bash scripts/monitor-worker.sh /tmp/pi-1.log'
-```
-
-Launch guidance: keep `2>&1` (markers + stage lines land immediately) and use
-the liveness-marker rule from the hard rule above. A stale log with fresh
-marker lines = healthy; a stale log with NO markers = inspect the process.
-
-### TTL'd escape marker — deliberate SOLO sessions can escalate mid-session (#207)
-
-The env hatch (`AGENT_ALLOW_MAIN_EDITS=1`) cannot be set on a running pi process. A **deliberate solo session** that owns the machine can grant itself the same bypass for a bounded window:
-
-```bash
-touch ~/.pi/agent/.allow-main-edits          # 15-minute TTL, re-read per tool_call
-echo "recovering stranded main checkout" >> ~/.pi/agent/.allow-main-edits   # reason (audit trail)
-```
-
-- **TTL:** the marker expires 15 minutes after its last modification — expiry is checked per tool_call (never cached), so a forgotten marker self-revokes.
-- **Never automatic for parallel sessions:** the marker only affects sessions running on the same machine/user; it never applies to other agents automatically.
-- **Traversal-guarded:** only a regular file counts — a directory or symlink at the path is ignored (fail-closed).
-- **Cleanup:** `rm ~/.pi/agent/.allow-main-edits` after the operation (the TTL would do it anyway).
-
-
 ## Launching Nested pi
 
 > **Never launch an unbounded nested pi.** Every nested or background `pi`

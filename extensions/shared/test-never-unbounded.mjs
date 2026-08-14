@@ -67,6 +67,17 @@ for (const [name, text] of Object.entries(SKILLS)) {
   }
 }
 
+// ── I4: ABSENCE + single-rule checks (portability guard) ──────────────────
+// The portable template supersedes #218's bare `timeout <N>` instructions —
+// GNU timeout does not exist on macOS. Assert the deprecated form is ABSENT
+// and exactly ONE never-unbounded rule block exists per file.
+const DEPRECATED_TIMEOUT = /`?timeout\s+\d+`?/; // bare `timeout <N>`/`timeout 600` form
+for (const [name, text] of Object.entries(SKILLS)) {
+  check(`I4 ${name} has no deprecated bare 'timeout <N>' form`, !DEPRECATED_TIMEOUT.test(text));
+  const ruleCount = (text.match(/Never launch an unbounded nested pi|never launch an unbounded nested `?pi/gi) || []).length;
+  check(`I4 ${name} has exactly one never-unbounded rule block`, ruleCount === 1, `found ${ruleCount}`);
+}
+
 // ── I3: deadline-watchdog block in every file + Pre-Warming retrofit ─────
 const WATCHDOG_RE = /sleep\s+1800[\s\S]{0,400}kill\s+-0/;
 for (const [name, text] of Object.entries(SKILLS)) {
