@@ -65,7 +65,7 @@ threshold — a single-sample dip between suspend and resume never thrash-resume
 | `LOAD_GATE_MAX_WAIT_MIN` | `10` | wrappers (bounded poll) | minutes to poll before exit 3; `0` = no poll (deterministic defer for tests) |
 | `LOAD_GATE_FORCE` | unset | load-gate.mjs / wrappers | `1` bypasses the gate (`--force` flag sets it) |
 | `TASK_FIRST_OUTPUT_TIMEOUT_MS` | `60_000` | builtin-tools tier-1 | first-output bound (NOT load-scaled) |
-| `GIT_REMOTE_TIMEOUT_MS` | `10_000` | slack-bridge `gitRemoteTimeoutMs()` | git config lookup cap (#196 fold) |
+| `GIT_REMOTE_TIMEOUT_MS` | load-scaled base `5_000` (x1/2/3 by loadavg tier; `TASK_LOAD_SCALE_OFF=1` → `5_000`) | slack-bridge `gitRemoteTimeoutMs()` | git config lookup cap (#196 fold, #232) |
 | `TREE_KILL_EXEC_TIMEOUT_MS` | `5_000` | tree-kill `execTimeoutMs()` | pgrep/ps cap on the kill path (#196 fold) |
 
 **One-line ordering-clamp note:** watchdog scale config requires

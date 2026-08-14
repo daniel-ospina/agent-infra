@@ -45,7 +45,7 @@ load_gate_entry() {
   [ $rc -eq 0 ] && return 0
   if [ $rc -ne 3 ]; then
     echo "[load-gate] ERROR: gate helper failed (exit $rc) — aborting loudly" >&2
-    exit 1
+    exit 2
   fi
   load1="$(printf '%s' "$out" | sed -n 's/.*"load1":\([0-9.e+-]*\).*/\1/p')"
   suspend="$(printf '%s' "$out" | sed -n 's/.*"suspend":\([0-9.e+-]*\).*/\1/p')"

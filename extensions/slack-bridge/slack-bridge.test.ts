@@ -85,8 +85,16 @@ function assert(condition: boolean, label: string): void {
 }
 
 // ── gitRemoteTimeoutMs — env-overridable git-lookup cap (#196 fold, #209) ──
-
-assert(gitRemoteTimeoutMs() === 10000, "gitRemoteTimeoutMs: default 10s (was hardcoded 2s)");
+// The implicit default is LOAD-SCALED (5000 x 1/2/3 by loadavg tier, #232);
+// pin it deterministically with TASK_LOAD_SCALE_OFF=1 (→ base 5000).
+const prevScaleOff = process.env.TASK_LOAD_SCALE_OFF;
+process.env.TASK_LOAD_SCALE_OFF = "1";
+try {
+  assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: load-scale-off default = base 5000");
+} finally {
+  if (prevScaleOff === undefined) delete process.env.TASK_LOAD_SCALE_OFF;
+  else process.env.TASK_LOAD_SCALE_OFF = prevScaleOff;
+}
 
 const prevGitTimeout = process.env.GIT_REMOTE_TIMEOUT_MS;
 process.env.GIT_REMOTE_TIMEOUT_MS = "25000";
@@ -98,19 +106,25 @@ try {
 }
 
 process.env.GIT_REMOTE_TIMEOUT_MS = "abc";
+process.env.TASK_LOAD_SCALE_OFF = "1";
 try {
-  assert(gitRemoteTimeoutMs() === 10000, "gitRemoteTimeoutMs: garbage → default");
+  assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: garbage → load-scaled default (base 5000 at scale off)");
 } finally {
   if (prevGitTimeout === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
   else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTimeout;
+  if (prevScaleOff === undefined) delete process.env.TASK_LOAD_SCALE_OFF;
+  else process.env.TASK_LOAD_SCALE_OFF = prevScaleOff;
 }
 
 process.env.GIT_REMOTE_TIMEOUT_MS = "0";
+process.env.TASK_LOAD_SCALE_OFF = "1";
 try {
-  assert(gitRemoteTimeoutMs() === 10000, "gitRemoteTimeoutMs: non-positive → default");
+  assert(gitRemoteTimeoutMs() === 5000, "gitRemoteTimeoutMs: non-positive → load-scaled default (base 5000 at scale off)");
 } finally {
   if (prevGitTimeout === undefined) delete process.env.GIT_REMOTE_TIMEOUT_MS;
   else process.env.GIT_REMOTE_TIMEOUT_MS = prevGitTimeout;
+  if (prevScaleOff === undefined) delete process.env.TASK_LOAD_SCALE_OFF;
+  else process.env.TASK_LOAD_SCALE_OFF = prevScaleOff;
 }
 
 /** Poll cond() until true or timeout (fire-and-forget HTTP needs a tick). */

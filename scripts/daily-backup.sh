@@ -116,12 +116,15 @@ echo "[$(date '+%H:%M:%S')] Waiting for BGSAVE to complete..."
 for i in $(seq 1 30); do
     if [ "$LOAD_GATE_WARNED" = "0" ] && [ "${LOAD_GATE_FORCE:-}" != "1" ]; then
         lg_out="$(node "$REPO_ROOT/scripts/load-gate.mjs" check --json 2>/dev/null)" && lg_rc=0 || lg_rc=$?
-        if [ "$lg_rc" -ne 0 ]; then
+        if [ "$lg_rc" -eq 3 ]; then
             lg_load="$(printf '%s' "$lg_out" | sed -n 's/.*"load1":\([0-9.e+-]*\).*/\1/p')"
             lg_suspend="$(printf '%s' "$lg_out" | sed -n 's/.*"suspend":\([0-9.e+-]*\).*/\1/p')"
-            echo "[load-gate] WARN — load ${lg_load:-?} ≥ suspend ${lg_suspend:-?} during BGSAVE wait; completing (aborting would not save the in-flight save)" >&2
+            echo "[load-gate] WARN — load defer (gate rc=3): load ${lg_load:-?} ≥ suspend ${lg_suspend:-?} during BGSAVE wait; completing (aborting would not save the in-flight save)" >&2
             LOAD_GATE_WARNED=1
         fi
+    elif [ "$lg_rc" -ne 0 ] && [ "$lg_rc" -ne 3 ]; then
+        echo "[load-gate] helper unavailable during wait (rc $lg_rc) — completing wait without load re-check" >&2
+    fi
     fi
     LASTSAVE=$(docker exec "$CONTAINER" redis-cli -p "$REDIS_PORT" LASTSAVE 2>/dev/null || echo "0")
     # Check if there have been no changes since the BGSAVE we just triggered
