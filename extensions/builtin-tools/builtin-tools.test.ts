@@ -216,6 +216,28 @@ test("sub-agent env declares PI_MODE=print (#172)", () => {
   ok(source.includes("SLACK_BRIDGE_DISABLE: \"1\""), "subAgentEnv still sets SLACK_BRIDGE_DISABLE=1");
 });
 
+// ── Sub-agent gate inheritance (#825) ─────────────────
+
+section("Sub-agent gate env (#825)");
+
+test("sub-agent env must NOT inject ELDATO_SKIP_VGATE — sub-agent commits inherit the parent's verified-file registry via the bridge (#825)", () => {
+  ok(
+    !/ELDATO_SKIP_VGATE\s*[:=]\s*["']?1["']?/.test(source),
+    "subAgentEnv must not bypass VGATE: task sub-agents run the verification gate ACTIVE and inherit the parent's verified-file registry via the bridge file (worktree-scoped compound keys). Commits on unverified files are blocked with a self-verify instruction — the child self-satisfies the gate in-band via its own task-tool VGATE dispatch (#825/#264)"
+  );
+  // Tripwire note: these source assertions are a cheap "don't re-add" guard —
+  // the authoritative behavior coverage lives in verification-gate e2e
+  // scenarios 21-26 (bridge inheritance, sub-agent block message, no
+  // auto-bypass, interactive message unchanged).
+});
+
+test("sub-agent env keeps AGENT_SKIP_REVIEW_GATE=1 — review dispatch stays parent-enforced (#825)", () => {
+  ok(
+    source.includes("AGENT_SKIP_REVIEW_GATE: \"1\""),
+    "review DISPATCH stays parent-enforced: a sub-agent never self-satisfies the review-enforcer; the parent runs the review ceremony for the PR as a whole (#825)"
+  );
+});
+
 // ── PATH augmentation (#36) ───────────────────────────
 
 section("augmentPath — sub-agent PATH augmentation (#36)");
@@ -1814,8 +1836,10 @@ test("getTaskHardCapMs — default 2h, ≥60s clamp, invalid → default", () =>
 
 section("#176 heartbeat — spawnSubAgent wiring (source assertions)");
 
-test("task tool injects TASK_HEARTBEAT=1 with TASK_HEARTBEAT_DISABLE pre-check + nonce", () => {
-  ok(source.includes('TASK_HEARTBEAT_DISABLE !== "1" ? { TASK_HEARTBEAT: "1" }'), "TASK_HEARTBEAT gated on the disable flag BEFORE setting");
+test("task tool injects TASK_HEARTBEAT=1 unconditionally (sub-agent-identity marker) + nonce", () => {
+  ok(source.includes('TASK_HEARTBEAT: "1"'), "TASK_HEARTBEAT set on EVERY task child — VGATE's task-sub-agent discriminator must never go missing");
+  ok(!source.includes('TASK_HEARTBEAT_DISABLE !== "1" ? { TASK_HEARTBEAT: "1" }'), "TASK_HEARTBEAT is NO LONGER gated on the disable flag (#264 P2/P3): a TASK_HEARTBEAT_DISABLE=1 parent must not spawn a markerless child that falls back to interactive auto-bypass");
+  ok(source.includes("TASK_HEARTBEAT_DISABLE") && source.includes("...process.env"), "TASK_HEARTBEAT_DISABLE still flows to the child via the env spread — the task-heartbeat emitter stays off (that extension gates on DISABLE itself)");
   ok(source.includes("randomBytes(6).toString(\"hex\")"), "per-dispatch nonce generated");
   ok(source.includes("TASK_HEARTBEAT_NONCE: hbNonce"), "nonce injected into the sub-agent env");
   ok(source.includes("ingestHeartbeatChunk(data.toString(), hbCtx)"), "stderr flows through the marker ingestion pipeline");

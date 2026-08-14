@@ -1960,9 +1960,16 @@ export default function (pi: ExtensionAPI) {
   ...process.env,
   PATH: augmentedPath,
   PI_SKIP_VERSION_CHECK: "1",
-  // Skip extensions sub-agents never need (one-shot, no git/slack/loops/vision).
-  // Gate overrides: sub-agents can't dispatch `task` to satisfy verification-gate
-  // or review-enforcer → deadlock → 480s hang. Parent session enforces gates centrally.
+  // Skip extensions sub-agents never need (one-shot, no slack/loops/vision).
+  // Gate overrides: review DISPATCH stays parent-enforced (#825) — a sub-agent
+  // must never self-satisfy the review-enforcer; the parent runs the review
+  // ceremony for the PR as a whole. Git commit verification (VGATE) is
+  // deliberately kept ACTIVE for sub-agents (#825): the sub-agent inherits the
+  // parent's verified-file registry via the bridge file, and commits on
+  // unverified files are blocked with a self-verify instruction — the child
+  // has the task tool, so it self-satisfies VGATE in-band (dispatches its own
+  // [VGATE] verification, then retries the commit; #264 review). Do NOT
+  // re-add ELDATO_SKIP_VGATE here.
   SKILL_ENFORCER_DISABLED: "1",
   LOOP_ENFORCER_DISABLED: "1",
   // #172: declare print mode so extension startup diagnostics stay silent in
@@ -1971,16 +1978,29 @@ export default function (pi: ExtensionAPI) {
   // swarm_daemon does). Without this, every task sub-agent emitted
   // "⏭️ Disabled — SLACK_BRIDGE_DISABLE=1" + approval lines (22× observed).
   PI_MODE: "print",
-  // #176: activate the task-heartbeat life-sign emitter in the sub-agent
-  // (state-aware silence detection). Opt out with TASK_HEARTBEAT_DISABLE=1 —
-  // checked BEFORE setting so it also flows to the child via the env spread.
-  ...(process.env.TASK_HEARTBEAT_DISABLE !== "1" ? { TASK_HEARTBEAT: "1" } : {}),
+  // #176/#264 review: TASK_HEARTBEAT=1 is set UNCONDITIONALLY — it doubles as
+  // the builtin-tools task-child marker that verification-gate discriminates
+  // on (isTaskSubAgent). A parent with TASK_HEARTBEAT_DISABLE=1 must NOT
+  // spawn a child without the marker: that child would fall back to the
+  // interactive path and reach #7591 auto-bypass on unverified commits (#264
+  // P2/P3). TASK_HEARTBEAT_DISABLE still flows to the child via the env
+  // spread below, so the task-heartbeat EMITTER stays off (that extension
+  // gates on DISABLE itself); only the sub-agent-identity marker is forced.
+  TASK_HEARTBEAT: "1",
   SLACK_BRIDGE_DISABLE: "1",
   VISION_INTERCEPTOR_DISABLED: "1",
   ELDATO_ALLOW_MAIN_EDITS: "1",  // dual-support: also set AGENT_ variant (#7549)
   AGENT_ALLOW_MAIN_EDITS: "1",
-  ELDATO_SKIP_VGATE: "1",        // sub-agents lack `task` tool; parent enforces gates
-  AGENT_SKIP_REVIEW_GATE: "1",   // sub-agents lack `task` tool; parent enforces gates
+  // #825: NO ELDATO_SKIP_VGATE injection. The sub-agent runs with the
+  // verification-gate ACTIVE and inherits the parent's verified-file registry
+  // via the bridge (~/.pi/agent/verification/latest.json, worktree-scoped
+  // compound keys): commits on parent-verified files pass; commits on
+  // unverified files are blocked and the sub-agent self-satisfies the gate
+  // in-band — it dispatches its own [VGATE] verification via its task tool
+  // and retries the commit (#264 review).
+  AGENT_SKIP_REVIEW_GATE: "1",   // review DISPATCH stays parent-enforced (#825):
+                                 // sub-agents don't run the parent's review
+                                 // ceremony; the parent dispatches reviewers.
 };
       if (params.mcp_servers) {
         subAgentEnv.PI_MCP_SERVERS = params.mcp_servers;
