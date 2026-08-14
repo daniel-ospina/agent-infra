@@ -101,6 +101,11 @@ function _tokenize(command) {
       }
       if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
       if (/\s/.test(ch)) break;
+      // Shell metacharacters are token boundaries too — `git add .&&git commit`
+      // must tokenize as TWO invocations (review P2: no-space compounds evaded M2).
+      // Consume the metachar so the outer loop advances (an empty-token break
+      // would infinite-loop — i never moves past it).
+      if (ch === "&" || ch === "|" || ch === ";") { i++; break; }
       if (ch === "\\" && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
       tok += ch; i++;
     }
@@ -316,11 +321,21 @@ export function classifyGitCommandDetailed(command) {
         out.branchState = true;
         out.renameFrom = pos[0] ?? null;
         out.renameTo = pos[1] ?? null;
-      } else if (args.includes("-f") || args.includes("--force")) {
+      } else if (args.includes("-f") || args.includes("--force") ||
+                 args.includes("-D") || args.includes("-d")) {
+        // P1-B: -D/-d delete must set newBranch so the allowance target list is
+        // non-empty (a ceremony `git branch -D $PR_BRANCH` on the own branch is
+        // allowed; without this, ownershipAllowed([]) is false -> false-block).
         out.branchState = true;
         out.newBranch = args.filter((x) => !x.startsWith("-"))[0] ?? null;
       }
     }
+    // P1-A: expose the STATE-mutating invocation's verb/args — M3 must classify
+    // the invocation that changes branch state, not invocations[0] (a compound
+    // `git pull && git checkout main` would otherwise classify "pull" and skip
+    // the gate, or false-block the sanctioned create-new carve-out).
+    out.stateVerb = verb;
+    out.stateArgs = args;
   }
 
   return out;

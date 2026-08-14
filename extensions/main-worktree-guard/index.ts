@@ -182,6 +182,12 @@ function _m1(pid: number) {
   const baseline = baselines.get(pid);
   if (!baseline) return;
   try {
+    // P2-B: only warn for the BASELINE repo's MAIN checkout. A session that
+    // cd'd into a worktree or another repo gets a spurious (and misleading)
+    // "commits are BLOCKED" warning — commits are NOT blocked in a worktree.
+    if (isWorktreeCwdWrite(resolve(process.cwd()))) return;
+    const keyNow = branchOwnership.repoKey(process.cwd());
+    if (!keyNow || keyNow !== baseline.repoKey) return;
     const state = branchOwnership.readBranchState(resolve(process.cwd()));
     if (!state) return;
     const dev = branchOwnership.decideM1(state.branch, baseline.branch);
@@ -377,7 +383,9 @@ export default function (pi: ExtensionAPI) {
       // verified: -C <wt> --git-dir=<main>/.git checkout operates on MAIN →
       // eff.isWorktree is false → NOT exempt).
       if (det && det.branchState && !allowActive) {
-        const branchOp = branchOwnership.classifyBranchOp(det.verb, det.verbArgs);
+        // P1-A: classify the STATE-mutating invocation (compound commands like
+        // `git pull && git checkout main` must gate on the checkout, not the pull).
+        const branchOp = branchOwnership.classifyBranchOp(det.stateVerb ?? det.verb, det.stateArgs ?? det.verbArgs);
         if (branchOp && branchOp.op !== "other") {
           if (!eff) {
             return {

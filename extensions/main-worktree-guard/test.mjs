@@ -308,7 +308,9 @@ dexpect("rebase origin/main → syncSource", `git rebase origin/main`, { verdict
 import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo } from "../shared/branch-ownership.mjs";
 const co = (cmd) => {
   const d = classifyGitCommandDetailed(cmd);
-  return d.branchState ? sharedClassifyBranchOp(d.verb, d.verbArgs) : { op: "other" };
+  // P1-A: classify the STATE-mutating invocation (compound commands must gate
+  // on the checkout, not the leading pull/fetch).
+  return d.branchState ? sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs) : { op: "other" };
 };
 expectBool("detailed+shared: checkout -b → create-new", co(`git checkout -b feat/x`)?.op === "create-new", true);
 expectBool("detailed+shared: switch -c → create-new", co(`git switch -c feat/x`)?.op === "create-new", true);
@@ -321,6 +323,20 @@ expectBool("detailed+shared: branch -m own → rename", co(`git branch -m feat/a
 expectBool("detailed+shared: checkout -- path → other", co(`git checkout -- tortoise/sdk.py`)?.op === "other", true);
 expectBool("detailed+shared: checkout . → other", co(`git checkout .`)?.op === "other", true);
 expectBool("detailed+shared: checkout - → switch-existing", co(`git checkout -`)?.op === "switch-existing", true);
+
+// ── P1-A regression: compound commands gate on the STATE invocation ────────
+expectBool("P1-A: pull && checkout main → switch-existing", co(`git pull && git checkout main`)?.op === "switch-existing", true);
+expectBool("P1-A: fetch && checkout -b → create-new", co(`git fetch origin main && git checkout -b feat/2 origin/main`)?.op === "create-new", true);
+expectBool("P1-A: stash&&checkout main (no-space) → switch-existing", co(`git stash&&git checkout main`)?.op === "switch-existing", true);
+
+// ── P2-A regression: no-space compound commit is detected (M2 gate) ─────────
+dexpect("P2-A: no-space compound commit → block:commit", `git add .&&git commit -am x`, { verdict: "block:commit" });
+
+// ── P1-B regression: branch -D/-d set newBranch (allowance target) ─────────
+dexpect("P1-B: branch -D own → newBranch set", `git branch -D feat/1`, { verdict: "block:branch-force-delete", newBranch: "feat/1" });
+// -d is a SOFT delete: legacy verdict stays allow (M3 still gates it via
+// branchState=true + newBranch — the allowance target list must be non-empty).
+dexpect("P1-B: branch -d own → branchState + newBranch (allow)", `git branch -d feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1" });
 
 // Cross-consistency: resolveEffectiveRepo (branch-ownership) and the detailed
 // classifier's skimmer must agree on repo identity for adversarial commands.

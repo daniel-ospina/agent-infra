@@ -1668,6 +1668,12 @@ export default function (pi: ExtensionAPI) {
   ELDATO_SKIP_VGATE: "1",        // sub-agents lack `task` tool; parent enforces gates
   AGENT_SKIP_REVIEW_GATE: "1",   // sub-agents lack `task` tool; parent enforces gates
 };
+// P3: the env spread above inherits the PARENT's flags — if the parent session
+// (or swarm_daemon) has AGENT_ALLOW_MAIN_EDITS=1 set, every task sub-agent would
+// silently inherit the main-checkout escape hatch, defeating #265. Delete both
+// flags so inheritance is only ever explicit (a dispatcher re-adding them).
+delete subAgentEnv.AGENT_ALLOW_MAIN_EDITS;
+delete subAgentEnv.ELDATO_ALLOW_MAIN_EDITS;
       if (params.mcp_servers) {
         subAgentEnv.PI_MCP_SERVERS = params.mcp_servers;
       }
