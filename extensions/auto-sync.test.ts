@@ -5,13 +5,15 @@
  * Uses real throwaway git repos (bare origin + clones) so the state machine is
  * exercised against genuine git semantics, not mocks.
  */
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { ok, equal } from "node:assert/strict";
 
 import autoSync, { syncState, aheadCount, tryLosslessRecover } from "./auto-sync.js";
+import { repoKey } from "./shared/branch-ownership.mjs";
 
 let passed = 0, failed = 0;
 async function test(name: string, fn: () => void | Promise<void>) {
@@ -300,6 +302,63 @@ async function main() {
   await test("not configured (no AGENT_INFRA_PATH) → silent", async () => {
     const lines = await runSessionNoConfig();
     equal(lines.length, 0, `expected no output, got: ${lines.join("\n")}`);
+  });
+
+  // ── #265: repo-lock concurrency (branch-ownership serialization) ──────────
+  section("#265 repo-lock concurrency");
+  const lockDir265 = join(homedir(), ".pi", "agent", "locks");
+  const lockPathFor = (key: string) => join(lockDir265, `${createHash("sha1").update(key).digest("hex")}.lock`);
+
+  await test("foreign contention → session skips with warn (never force-switches)", async () => {
+    const s = makeStranded();
+    // A REAL live foreign pid holds the lock (spawn a sleeper, use its pid).
+    const holder = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"]);
+    try {
+      writeFileSync(lockPathFor(repoKey(s.repo)), JSON.stringify({ pid: holder.pid, startedAt: Date.now() }));
+      const lines = await runSession(s.repo, { mode: "auto" });
+      ok(lines.some(l => l.includes("repo lock busy")),
+        `expected skip-with-warn, got: ${lines.join("\n")}`);
+      ok(!lines.some(l => l.includes("stranded checkout recovered")), "must NOT recover under contention");
+      equal(git(s.repo, "branch --show-current").trim(), "stranded", "checkout must be untouched");
+    } finally {
+      holder.kill();
+      rmSync(lockPathFor(repoKey(s.repo)), { force: true });
+    }
+  });
+
+  await test("dead-pid stale lock → stolen, recovery proceeds", async () => {
+    const s = makeStranded();
+    writeFileSync(lockPathFor(repoKey(s.repo)), JSON.stringify({ pid: 4194303, startedAt: Date.now() - 60_000 }));
+    const lines = await runSession(s.repo, { mode: "auto" });
+    ok(lines.some(l => l.includes("stranded checkout recovered")),
+      `expected recovery after stale-steal, got: ${lines.join("\n")}`);
+    equal(git(s.repo, "branch --show-current").trim(), "main");
+  });
+
+  await test("same-pid re-entrant: session-held lock never self-skips recovery", async () => {
+    const s = makeStranded();
+    // Direct call without lockHeld acquires internally (single-actor path)…
+    const r = tryLosslessRecover(s.repo);
+    ok(r.recovered, `direct recovery must not self-skip, got: ${JSON.stringify(r)}`);
+    equal(git(s.repo, "branch --show-current").trim(), "main");
+  });
+
+  await test("lock ops silent on the clean path (current-state session prints 0 lines)", async () => {
+    const lines = await runSession(repoCurrent);
+    equal(lines.length, 0, `expected no output, got: ${lines.join("\n")}`);
+  });
+
+  await test("sync.sh refuses to pull on a non-main branch (#265)", async () => {
+    const o = seededOrigin();
+    const repo = makeClone(o);
+    git(repo, "checkout -q -b feature/xyz");
+    const headBefore = git(repo, "rev-parse HEAD").trim();
+    writeFileSync(join(repo, "sync.sh"), execSync("cat sync.sh", { encoding: "utf-8" }), { mode: 0o755 });
+    const out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1 || true`, { encoding: "utf-8" });
+    ok(out.includes("refusing to pull"), `expected guard message, got: ${out}`);
+    ok(out.includes("branch-ownership guard, #265"), `expected #265 reference, got: ${out}`);
+    equal(git(repo, "rev-parse HEAD").trim(), headBefore, "HEAD must not move");
+    equal(git(repo, "branch --show-current").trim(), "feature/xyz", "branch must not switch");
   });
 
   // ── Summary ──────────────────────────────────────────────────────────────

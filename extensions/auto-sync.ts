@@ -16,6 +16,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { isPrintMode } from "./shared/print-mode.js";
+import { repoKey, acquireRepoLock, releaseRepoLock } from "./shared/branch-ownership.mjs";
 
 export function shortHead(repo: string, ref = "HEAD"): string {
   try {
@@ -84,8 +85,31 @@ export function syncState(repo: string): "current" | "behind" | "ahead" | "diver
  * stranded branch itself is left untouched (refs preserved). Never runs in
  * "ahead" state (unpushed commits are real work) and never when the tree
  * holds genuine uncommitted changes.
+ *
+ * #265: the repo lock serializes recovery-vs-recovery across concurrent pi
+ * processes. When called from session_start the lock is ALREADY held (passed
+ * via opts.lockHeld) — same-pid re-acquire is re-entrant so recovery never
+ * self-skips; direct calls (tests) acquire internally. All lossless checks are
+ * RE-VERIFIED under the lock immediately before any mutation (rmSync/checkout)
+ * — no rmSync is ever based on pre-lock state.
  */
-export function tryLosslessRecover(repo: string): { recovered: boolean; reason?: string } {
+export function tryLosslessRecover(repo: string, opts: { lockHeld?: boolean } = {}): { recovered: boolean; reason?: string } {
+  const key = repoKey(repo);
+  let lock: { held: boolean } | null = null;
+  if (!opts.lockHeld) {
+    lock = key ? acquireRepoLock(key, process.pid, { timeoutMs: 3000 }) : { held: false };
+    if (!lock.held) {
+      return { recovered: false, reason: "repo lock busy — recovery skipped" };
+    }
+  }
+  try {
+    return tryLosslessRecoverUnderLock(repo);
+  } finally {
+    if (lock && key) releaseRepoLock(key, process.pid);
+  }
+}
+
+function tryLosslessRecoverUnderLock(repo: string): { recovered: boolean; reason?: string } {
   if (syncState(repo) !== "diverged") {
     return { recovered: false, reason: "not diverged — recovery not applicable" };
   }
@@ -106,7 +130,8 @@ export function tryLosslessRecover(repo: string): { recovered: boolean; reason?:
   } catch {
     return { recovered: false, reason: "tracked tree differs from origin/main (real uncommitted work — keep)" };
   }
-  // 3. untracked files must not collide with origin/main content.
+  // 3. untracked files must not collide with origin/main content — EACH file
+  //    re-checked immediately before removal (never based on pre-lock state).
   for (const f of untracked) {
     let onMain = false;
     try { execSync(`git -C "${repo}" cat-file -e origin/main:${f}`, { stdio: "ignore" }); onMain = true; } catch { onMain = false; }
@@ -178,45 +203,60 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // diverged → try lossless recovery (#203) before falling back to guidance.
-    // A stranded non-main branch whose tree matches origin/main is recoverable
-    // without any data loss; a genuine divergence (real uncommitted work or
-    // unpushed commits) is left alone with guidance, as before.
-    if (state === "diverged") {
-      const rec = tryLosslessRecover(infraPath);
-      if (rec.recovered) {
-        console.log(`[auto-sync] 🔁 stranded checkout recovered — now on main at ${shortHead(infraPath)} (tree matched origin/main losslessly)`);
+    // #265: every MUTATION (lossless recovery, sync.sh run) is serialized by the
+    // repo lock — concurrent pi processes never interleave force-switches or
+    // ff-pulls. Clean acquire/release logs NOTHING (tests assert zero output on
+    // the "current → silent" path); only foreign contention warns (skip —
+    // recovery is convenience, never correctness-critical).
+    const mutates = state === "diverged" ||
+      (state === "behind" && (process.env.AGENT_SYNC_MODE || "warn") === "auto");
+    if (mutates) {
+      const key = repoKey(infraPath);
+      const lock = key
+        ? acquireRepoLock(key, process.pid, { timeoutMs: 3000, retryMs: 200 })
+        : { held: false };
+      if (!lock.held) {
+        console.log(`[auto-sync] ⏭️ repo lock busy — another session is syncing; skipping this start`);
         return;
       }
-      console.log(`[auto-sync] ⚠️  agent-infra has diverged from origin/main — fast-forward sync blocked:`);
-      console.log(`    Local : ${shortHead(infraPath)}`);
-      console.log(`    Remote: ${shortHead(infraPath, "origin/main")}`);
-      console.log(`    Inspect: git -C "${infraPath}" status`);
-      console.log(`    History: git -C "${infraPath}" log --oneline --left-right HEAD...origin/main`);
-      console.log(`    Next: stash or commit local work, then re-run sync:`);
-      console.log(`        ${syncHint}`);
-      if (rec.reason) console.log(`    (auto-recovery skipped: ${rec.reason})`);
-      return;
+      try {
+        if (state === "diverged") {
+          const rec = tryLosslessRecover(infraPath, { lockHeld: true });
+          if (rec.recovered) {
+            console.log(`[auto-sync] 🔁 stranded checkout recovered — now on main at ${shortHead(infraPath)} (tree matched origin/main losslessly)`);
+            return;
+          }
+          console.log(`[auto-sync] ⚠️  agent-infra has diverged from origin/main — fast-forward sync blocked:`);
+          console.log(`    Local : ${shortHead(infraPath)}`);
+          console.log(`    Remote: ${shortHead(infraPath, "origin/main")}`);
+          console.log(`    Inspect: git -C "${infraPath}" status`);
+          console.log(`    History: git -C "${infraPath}" log --oneline --left-right HEAD...origin/main`);
+          console.log(`    Next: stash or commit local work, then re-run sync:`);
+          console.log(`        ${syncHint}`);
+          if (rec.reason) console.log(`    (auto-recovery skipped: ${rec.reason})`);
+          return;
+        }
+        // behind + AGENT_SYNC_MODE=auto → sync.sh under the lock
+        try {
+          const out = execSync(`bash "${infraPath}/sync.sh" 2>&1`, { timeout: 180_000, encoding: "utf-8" });
+          console.log(`[auto-sync] ✅ agent-infra updated to ${shortHead(infraPath)} — config refreshed`);
+          const lines = out.trim().split("\n").filter(l => l.includes("warning") || l.includes("⚠"));
+          if (lines.length) console.log(lines.slice(0, 3).map(l => `    ${l}`).join("\n"));
+        } catch (e: any) {
+          const err = e as { stdout?: Buffer | string; message?: string };
+          const detail = (err.stdout ? err.stdout.toString() : err.message || "unknown error")
+            .split("\n").filter(Boolean).slice(0, 4).join("\n    ");
+          console.log(`[auto-sync] ⚠️  update available but auto-sync failed:`);
+          console.log(`    ${detail}`);
+          console.log(`[auto-sync]    Run manually: ${syncHint}`);
+        }
+        return;
+      } finally {
+        releaseRepoLock(key, process.pid);
+      }
     }
 
     if (state !== "behind") return; // current — silent
-
-    if ((process.env.AGENT_SYNC_MODE || "warn") === "auto") {
-      try {
-        const out = execSync(`bash "${infraPath}/sync.sh" 2>&1`, { timeout: 180_000, encoding: "utf-8" });
-        console.log(`[auto-sync] ✅ agent-infra updated to ${shortHead(infraPath)} — config refreshed`);
-        const lines = out.trim().split("\n").filter(l => l.includes("warning") || l.includes("⚠"));
-        if (lines.length) console.log(lines.slice(0, 3).map(l => `    ${l}`).join("\n"));
-      } catch (e: any) {
-        const err = e as { stdout?: Buffer | string; message?: string };
-        const detail = (err.stdout ? err.stdout.toString() : err.message || "unknown error")
-          .split("\n").filter(Boolean).slice(0, 4).join("\n    ");
-        console.log(`[auto-sync] ⚠️  update available but auto-sync failed:`);
-        console.log(`    ${detail}`);
-        console.log(`[auto-sync]    Run manually: ${syncHint}`);
-      }
-      return;
-    }
 
     console.log(`[auto-sync] ⚠️  agent-infra update available — run: ${syncHint}`);
   });
