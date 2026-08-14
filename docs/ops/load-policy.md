@@ -164,10 +164,11 @@ unconditionally.
 - **Frozen-age transition reset (the #279 P1-2 hardening):** the parent's parsed
   `streamAgeMs` is the last tick's value — a completed round can leave it frozen
   beyond S (nested-task class), stream-stall-cutting the live verdict at the
-  turn transition. `turn_end`/`turn_start` now reset the parent's copy to 0
-  (the child self-heals via its own activity clock); quiet beyond S is then
-  genuine quiet only. Between-turn wedge detection is preserved (stream-stall at
-  S of true quiet via flowing ticks).
+  turn transition. `tool_end`/`turn_end`/`turn_start` now reset the parent's
+  copy to 0 (the child self-heals via its own activity clock); quiet beyond S is
+  then genuine quiet only. Between-turn wedge detection is preserved (stream-stall at
+  S of true quiet via flowing ticks; a marker-stopped child is caught at ~S via
+  markerAge accumulation inside the 60min fresh window).
 - **Observability:** when effM extends beyond M the loop emits
   `[task] first-message bound 300s → 900s (load1=60)` (rate-limited to bound
   increases); the kill headline shows the EFFECTIVE bound (the 905s cut once

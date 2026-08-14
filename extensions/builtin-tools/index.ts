@@ -856,6 +856,11 @@ export function parseHeartbeatLine(
       // and no latch gate). Reset here too — the child self-heals via its own
       // touchActivity() on tool_execution_end; a wedged child is still caught
       // at S of true quiet via growing markerAge.
+      // toolAgeMaxMs is deliberately NOT reset here (asymmetry, review note):
+      // clause 1 (tool-stall) requires toolsInFlight>0, and after tool_end the
+      // only way to regain it is a real tool_start (post turn_start's reset);
+      // a same-turn sequential tool inheriting a frozen tool_age is safe under
+      // the 2h default hard cap (a false tool-stall needs a >6h frozen age).
       state.streamAgeMs = 0;
       break;
     case "turn_start":
