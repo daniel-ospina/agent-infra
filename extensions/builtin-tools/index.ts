@@ -546,14 +546,16 @@ export function shouldFallback(d: FallbackDecision): boolean {
 //     completion watchdog (Tier 4) so a completed child stuck in cleanup is
 //     rescued promptly and its output returned as success.
 //
-// Kill clauses (precedence: tool-stall → stream-stall → silence →
-// first-message):
+// Kill clauses (precedence: tool-stall → stream-stall → silence → cut →
+// first-message → max-dispatch):
 //   tool-stall ........ in-flight tool older than TASK_TOOL_STALL_MS (6h;
 //                       min(L, T) when turnActive=false — preflight-stuck)
 //   stream-stall ...... no tools, stream idle > TASK_STREAM_STALL_MS (20 min)
 //                       — also bounds between-turn wedges with flowing ticks
 //   silence ........... no bytes/markers for HEARTBEAT_TIMEOUT_MS unless
 //                       stateFresh && turnActive && (tools > 0 || stream fresh)
+//   cut (#271) ........ marker-gap deadline (TASK_HEARTBEAT_CUT_GAP_MS, ~37.5s)
+//                       while a tool is in flight — wedged-alive class
 //   first-message ..... turn active but no message/tool events for
 //                       TASK_FIRST_MESSAGE_MS (300s) — fast #5926 detection.
 //                       #279: gated on !everSawRealActivity — only fires for
@@ -561,6 +563,7 @@ export function shouldFallback(d: FallbackDecision): boolean {
 //                       request); a worked session is never cut at M (its
 //                       quiet is owned by stream-stall / silence / tool-stall /
 //                       hard cap / maxDispatch).
+//   max-dispatch ...... opt-in total wall-clock cap (TASK_MAX_DISPATCH_MS)
 //
 // Kills fired while no REAL output ever arrived resolve `undefined`
 // (retryable) so retry/backoff/circuit-breaker stay live for the #5926 class.
@@ -846,6 +849,14 @@ export function parseHeartbeatLine(
       // zero evidence. A never-worked hung-first-request session can never
       // reach tool code (no message → no tool_end) → #5926 stays safe.
       state.everSawRealActivity = true;
+      // #279 (P1-2 hardening, review fix): the nested-task round's last tick
+      // froze streamAgeMs > S; tool_end drops toolsInFlight to 0, so WITHOUT
+      // this reset the 10s decision can stream-stall-cut the live verdict in
+      // the tool_end→turn_end window (clause 2 has no turnActive requirement
+      // and no latch gate). Reset here too — the child self-heals via its own
+      // touchActivity() on tool_execution_end; a wedged child is still caught
+      // at S of true quiet via growing markerAge.
+      state.streamAgeMs = 0;
       break;
     case "turn_start":
       state.turnActive = true;
@@ -856,10 +867,16 @@ export function parseHeartbeatLine(
       // tick's value — a completed round can leave it frozen > M or even > S.
       // The child self-heals (its handlers touchActivity()), so the parent's
       // copy is what a 10s decision reads between the transition and the next
-      // self-healing tick. Reset here (and on turn_end) so a fresh turn never
-      // inherits the previous turn's frozen stream age (kills the frozen-age
-      // turn-transition cut in BOTH the M and S bands — the nested-task class).
+      // self-healing tick. Reset here (and on turn_end + tool_end) so a fresh
+      // turn never inherits the previous turn's frozen stream age (kills the
+      // frozen-age turn-transition cut in BOTH the M and S bands — the
+      // nested-task class). toolAgeMaxMs gets the same symmetric reset (review
+      // fix): a >30min nested round frozen tool_age would otherwise false
+      // tool-stall a healthy preflight tool_start of the next turn (clause 1
+      // requires toolsInFlight>0, so a fresh turn only regains it via a real
+      // tool_start).
       state.streamAgeMs = 0;
+      state.toolAgeMaxMs = 0;
       break;
     case "turn_end":
       state.turnActive = false;
@@ -869,9 +886,10 @@ export function parseHeartbeatLine(
       // review fix).
       state.toolsInFlight = 0;
       // #279 (P1-2 hardening): see turn_start above — reset the frozen stream
-      // age here too so the transition window is covered even if the turn_start
-      // marker is lost.
+      // age + tool age here too so the transition window is covered even if the
+      // turn_start marker is lost.
       state.streamAgeMs = 0;
+      state.toolAgeMaxMs = 0;
       break;
     case "tick": {
       for (const m of rest.matchAll(/([a-z_]+)=(\d+)/g)) {
@@ -1178,7 +1196,12 @@ export function heartbeatKillDecision(
   //    working agent" intent. A never-worked session keeps the M cut unchanged
   //    (hung-first-request detection preserved, #5926). Marker STALENESS stays
   //    covered by the stateFresh precondition above (a stale marker stream is
-  //    already exempt here).
+  //    already exempt here). NOTE (review): the three sub-conditions
+  //    (!turnSawMessage && !(turnSawTool || toolsInFlight > 0)) are
+  //    production-DEAD whenever everSawRealActivity is false (every source of
+  //    those flags also latches) but remain FIXTURE-LOAD-BEARING — E13's
+  //    manual-construction exemption cases (saw_tool=true, toolsInFlight=1)
+  //    set them without going through parse. Do NOT "simplify" them away.
   if (
     stateFresh &&
     st.turnActive &&

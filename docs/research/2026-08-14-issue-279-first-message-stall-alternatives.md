@@ -48,7 +48,7 @@ The first-message-stall watchdog applies its first-request bound (M=300s base) t
 **(a)** ✓ — any tool round latches via tool_start marker or tick `tools>0`/`saw_tool=1`; any assistant message latches via tick `saw_msg=1`; monotonic (no turn_start reset in the parse) → mechanism (i) and (ii) both neutralized: once latched, `effStreamAge`'s frozen value is irrelevant.
 **(b)** ✓ — a never-worked session (ready + turn_start only, all-zero ticks) keeps `everSawRealActivity=false` → cut at M unchanged. E279b pins this: a future implementer latching on turn_start would fail it.
 **(c)** ✓ — latched sessions fall to the deliberate reviewed bounds (S/L/T/hard-cap/maxDispatch); identical exposure to #198/#220 intent. No unbounded-wait.
-**(d)** ✓ — one file + tests; the smallest-blast-radius real fix. E14 untouched (no format change).
+**(d)** ✓ — one file + tests; the smallest-blast-radius real fix. E14 format unchanged (the round-trip test gains latch assertions — formatReady/formatTurnStart must-not-latch, formatToolStart must-latch — pinning the child-formatter → latch contract).
 **(e)** ✓ — E13's fixture (everSawWork=true, saw flags false, fresh markers) has `everSawRealActivity=false` by default → same decision; E15/E15b/E16 are load-scaling-only; E14 untouched.
 
 **Risks.**

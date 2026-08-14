@@ -1083,16 +1083,23 @@ test("E279c: latch sources — tool_start/tool_end latch, monotonic; bare turn_s
   ok(st2.everSawRealActivity, "tool_end alone latches (provably implies prior model activity)");
 });
 
-test("E279c2: turn transitions reset the parent's frozen streamAgeMs (Hardening 2, parse-level)", () => {
+test("E279c2: turn transitions reset the parent's frozen streamAgeMs + toolAgeMaxMs (Hardening 2, parse-level)", () => {
   const st = createHeartbeatState();
-  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=600000 tool_age_max_ms=0 saw_msg=0 saw_tool=0", st, 1);
-  equal(st.streamAgeMs, 600_000, "frozen age from the last tick");
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=600000 tool_age_max_ms=700000 saw_msg=0 saw_tool=0", st, 1);
+  equal(st.streamAgeMs, 600_000, "frozen stream age from the last tick");
+  equal(st.toolAgeMaxMs, 700_000, "frozen tool age from the last tick");
   parseHeartbeatLine("[task-heartbeat] turn_end 0", st, 2);
-  equal(st.streamAgeMs, 0, "turn_end resets the parent's parsed copy");
-  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=700000 tool_age_max_ms=0 saw_msg=0 saw_tool=0", st, 3);
+  equal(st.streamAgeMs, 0, "turn_end resets the parent's parsed streamAgeMs");
+  equal(st.toolAgeMaxMs, 0, "turn_end resets the parent's parsed toolAgeMaxMs (symmetric — stale tool age must not false tool-stall a preflight tool_start)");
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=700000 tool_age_max_ms=800000 saw_msg=0 saw_tool=0", st, 3);
   equal(st.streamAgeMs, 700_000, "re-frozen by a later tick");
-  parseHeartbeatLine("[task-heartbeat] turn_start 1", st, 4);
+  parseHeartbeatLine("[task-heartbeat] tool_start idX read", st, 4);
+  equal(st.streamAgeMs, 700_000, "tool_start does not reset the frozen stream age (only tool_end/turn_end/turn_start do)");
+  parseHeartbeatLine("[task-heartbeat] tool_end idX", st, 5);
+  equal(st.streamAgeMs, 0, "tool_end resets the frozen stream age (review fix — the tool_end→turn_end window)");
+  parseHeartbeatLine("[task-heartbeat] turn_start 1", st, 6);
   equal(st.streamAgeMs, 0, "turn_start resets too (covers a lost turn_end)");
+  equal(st.toolAgeMaxMs, 0, "turn_start resets toolAgeMaxMs too");
 });
 
 test("E279d: tick latch — saw_msg/saw_tool/tools each latch; all-zero tick does not", () => {
@@ -1518,6 +1525,12 @@ test("E279a2: frozen-age turn transition — completed round with streamAgeMs > 
   parseHeartbeatLine("[task-heartbeat] tick tools=1 turn=1 stream_age_ms=600000 tool_age_max_ms=600000 saw_msg=0 saw_tool=1", st, 400_000);
   ok(st.everSawRealActivity, "round tick with tools=1 latches the session");
   parseHeartbeatLine("[task-heartbeat] tool_end id1", st, 437_000);
+  // REVIEW WINDOW: a 10s decision in the tool_end→turn_end window (tools=0,
+  // frozen streamAgeMs > S, turnActive still true, markers fresh) must NOT cut
+  // — tool_end resets the parent's frozen copy (review fix).
+  equal(st.streamAgeMs, 0, "tool_end resets the parent's frozen streamAgeMs (review fix)");
+  const dToolEndWindow = heartbeatKillDecision(dinput({ now: 447_000, lastLifeSignAt: 447_000, state: st }));
+  equal(dToolEndWindow.kill, false, "no stream-stall cut in the tool_end→turn_end window");
   parseHeartbeatLine("[task-heartbeat] turn_end 1", st, 437_001);
   parseHeartbeatLine("[task-heartbeat] turn_start 2", st, 437_002);
   equal(st.streamAgeMs, 0, "turn transition resets the parent's frozen streamAgeMs (Hardening 2)");

@@ -147,7 +147,11 @@ unconditionally.
   peaked cannot trigger an immediate re-cut.
 - **`toolsInFlight > 0` exemption (the #198 structural fix):** the first-message
   clause never fires while a tool is in flight — a live tool is bounded by the
-  6h tool-stall clause, never cut at M. Pinned by test E13.
+  6h tool-stall clause, never cut at M. Pinned by test E13. Note (#279): with
+  the `everSawRealActivity` latch below, the per-turn exemption is subsumed
+  (every parse source of `toolsInFlight`/`turnSawTool` also latches); the
+  live #198 protection is the session-level latch — E279g pins hung-tool
+  boundedness at L.
 - **`everSawRealActivity` gate (the #279 fix):** the clause additionally never
   fires for a session that has demonstrably worked — any parsed
   `tool_start`/`tool_end` marker or tick reporting `tools>0`/`saw_msg`/`saw_tool`
