@@ -20,6 +20,11 @@ import {
 	getTaskTimeoutMs,
 	getCacheDir,
 	cacheResult,
+	resolveStopReason,
+	getSubagentBackstopMs,
+	getSubagentBackstopFreshMs,
+	backstopShouldFire,
+	DEFAULT_SUBAGENT_BACKSTOP_MARGIN_MS,
 	type SingleResult,
 } from "./index.js";
 import { augmentPath, getSubAgentPath, getPiInvocation } from "../builtin-tools/index.js";
@@ -27,6 +32,11 @@ import { ok, equal } from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// #208 source-drift asserts (pattern: builtin armExitWatchdog assert) — read
+// index.ts so wiring pins survive refactors.
+const source = fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "index.ts"), "utf-8");
 
 let passed = 0;
 let failed = 0;
@@ -47,6 +57,24 @@ function test(name: string, fn: () => void | Promise<void>) {
 
 function section(name: string) {
 	console.log(`\n${name}:`);
+}
+
+/** Set env vars for the duration of fn, restoring afterwards. */
+function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
+	const saved: Record<string, string | undefined> = {};
+	for (const [k, v] of Object.entries(vars)) {
+		saved[k] = process.env[k];
+		if (v === undefined) delete process.env[k];
+		else process.env[k] = v;
+	}
+	try {
+		fn();
+	} finally {
+		for (const [k, v] of Object.entries(saved)) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	}
 }
 
 // ── Fixtures ──────────────────────────────────────────
@@ -324,6 +352,134 @@ test("falls through to bare 'pi' for generic runtimes with no entry script", () 
 	} finally {
 		process.argv[1] = saved;
 	}
+});
+
+// ── #208 cut contract ───────────────────────────────────
+
+section("#208 — cut contract (resolveStopReason, backstop, sweep wiring)");
+
+test("isFailedResult stopReason 'cut' → failed (new)", () => {
+	ok(isFailedResult(makeResult({ stopReason: "cut" })));
+	ok(
+		isFailedResult(makeResult({ exitCode: 0, stopReason: "cut" })),
+		"exitCode 0 + cut stopReason is still failed (failure is signaled by stopReason, exitCode stays 0 — D6)",
+	);
+});
+
+test("getResultOutput cut WITH partial messages surfaces the partials (new)", () => {
+	const r = makeResult({
+		stopReason: "cut",
+		messages: [assistantMsg("partial work before the cut")],
+	});
+	equal(getResultOutput(r), "partial work before the cut");
+});
+
+test("getResultOutput cut without messages falls back to errorMessage/stderr", () => {
+	const r = makeResult({ stopReason: "cut", stderr: "worker stderr before kill" });
+	equal(getResultOutput(r), "worker stderr before kill");
+});
+
+test("resolveStopReason — timedOut → timeout", () => {
+	equal(resolveStopReason(null, { timedOut: true, wasAborted: false, backstopFired: false }), "timeout");
+	equal(resolveStopReason(0, { timedOut: true, wasAborted: false, backstopFired: false }), "timeout");
+});
+
+test("resolveStopReason — wasAborted + shouldThrowOnAbort → aborted", () => {
+	equal(resolveStopReason(null, { timedOut: false, wasAborted: true, backstopFired: false }), "aborted");
+	equal(resolveStopReason(1, { timedOut: false, wasAborted: true, backstopFired: false }), "aborted");
+});
+
+test("resolveStopReason — wasAborted after clean exit → completed_before_abort", () => {
+	equal(resolveStopReason(0, { timedOut: false, wasAborted: true, backstopFired: false }), "completed_before_abort");
+});
+
+test("resolveStopReason — backstopFired → cut", () => {
+	equal(resolveStopReason(0, { timedOut: false, wasAborted: false, backstopFired: true }), "cut");
+});
+
+test("resolveStopReason — signal-death (code null) → cut (new)", () => {
+	equal(resolveStopReason(null, { timedOut: false, wasAborted: false, backstopFired: false }), "cut");
+});
+
+test("resolveStopReason — clean exit, no flags → undefined", () => {
+	equal(resolveStopReason(0, { timedOut: false, wasAborted: false, backstopFired: false }), undefined);
+});
+
+test("getSubagentBackstopMs — timeout>0 → +15min; timeout=0 → fixed 6h30m; env override; 0 = off", () => {
+	withEnv({ SUBAGENT_BACKSTOP_MS: undefined }, () => {
+		equal(getSubagentBackstopMs(1_800_000), 1_800_000 + 900_000, "taskTimeout + 15min");
+		equal(getSubagentBackstopMs(0), 21_600_000 + 1_800_000, "timeout=0 → fixed 6h30m (unbounded wait NOT reinstated)");
+	});
+	withEnv({ SUBAGENT_BACKSTOP_MS: "0" }, () => {
+		equal(getSubagentBackstopMs(1_800_000), 0, "env 0 = off (deliberate unbounded-wait config)");
+	});
+	withEnv({ SUBAGENT_BACKSTOP_MS: "3600000" }, () => {
+		equal(getSubagentBackstopMs(1_800_000), 3_600_000, "env override");
+	});
+	equal(DEFAULT_SUBAGENT_BACKSTOP_MARGIN_MS, 900_000);
+});
+
+test("getSubagentBackstopFreshMs — default 60min, floor 60s", () => {
+	withEnv({ SUBAGENT_BACKSTOP_FRESH_MS: undefined }, () => equal(getSubagentBackstopFreshMs(), 3_600_000));
+	withEnv({ SUBAGENT_BACKSTOP_FRESH_MS: "30000" }, () => equal(getSubagentBackstopFreshMs(), 60_000));
+	withEnv({ SUBAGENT_BACKSTOP_FRESH_MS: "120000" }, () => equal(getSubagentBackstopFreshMs(), 120_000));
+});
+
+test("backstopShouldFire — deadline + stale bytes → fire; fresh bytes → re-arm; before deadline → no fire", () => {
+	const base = { startedAt: 0, lastOutputAt: 0, backstopMs: 1000, freshWindowMs: 600_000 };
+	equal(backstopShouldFire({ now: 500, ...base }), false, "before the deadline → no fire");
+	equal(backstopShouldFire({ now: 1000, ...base }), true, "deadline reached, never emitted → fire");
+	equal(backstopShouldFire({ ...base, now: 1000, lastOutputAt: 900 }), false, "bytes within the fresh window → re-arm");
+	equal(backstopShouldFire({ ...base, now: 700_000, lastOutputAt: 50_000 }), true, "deadline + stale bytes (> fresh window) → fire");
+});
+
+section("#208 — dispatch contract source-drift asserts");
+
+test("#208: settle-exactly-once + grace-race wiring pins", () => {
+	ok(source.includes("let settled = false;"), "per-dispatch settled flag exists");
+	ok(source.includes("let swept = false;"), "per-dispatch swept flag exists (sweep fires exactly once)");
+	ok(source.includes("if (settled) return;"), "doResolve guards on settled");
+	ok(source.includes('proc.on("exit", (code: number | null) => {'), "exit-settle handler wired");
+	ok(source.includes("DEFAULT_EXIT_SETTLE_GRACE_MS"), "2s grace constant used by the exit-settle path");
+	ok(source.includes('settlePath: "exit"'), "exit-settle resolves via doResolve");
+	ok(source.includes('settlePath: "close"'), "close path resolves via doResolve");
+	ok(source.includes("clearTimeout(graceTimer)"), "grace timer cleared when close fires first (F1 — stale timer can never re-fire into a recycled pgid)");
+	ok(source.includes("graceTimer = null"), "grace timer nulled after clear");
+});
+
+test("#208: stopReason mapping wired in BOTH the close path and the exit-settle fallback", () => {
+	ok(
+		source.includes("const reason = resolveStopReason(code, { timedOut, wasAborted, backstopFired });"),
+		"close + exit-settle use the shared stopReason mapping (grace race must not lose the branches)",
+	);
+	const matches = source.match(/resolveStopReason\(/g) ?? [];
+	ok(matches.length >= 4, `resolveStopReason: def + close + exit-settle + backstop (got ${matches.length})`);
+});
+
+test("#208: sweep wired on the SETTLE-PATH basis + safety valves", () => {
+	ok(source.includes("sweepProcessGroup(childPgid, { detached })"), "sweep anchored on the captured pgid");
+	ok(source.includes('process.env.SUBAGENT_SWEEP !== "0"'), "SUBAGENT_SWEEP=0 disables the settle-path sweep");
+	ok(
+		source.includes("const childPgid: number | null = getPgid(proc.pid ?? 0) ?? proc.pid ?? null;"),
+		"childPgid captured at spawn",
+	);
+	ok(source.includes("childPgid !== null"), "sweep gated on a non-null childPgid");
+	ok(source.includes('opts?.settlePath === "exit"'), "sweep runs on the exit-settle path (round-3 F2)");
+	ok(source.includes("completed_before_abort"), "completed_before_abort is excluded from the sweep set");
+});
+
+test("#208: byte-freshness-gated backstop wired (round-3 F1 option a)", () => {
+	ok(source.includes("getSubagentBackstopMs(taskTimeoutMs)"), "backstop bound resolved from the env-aware getter");
+	ok(
+		source.includes(
+			"backstopShouldFire({ now: Date.now(), startedAt, lastOutputAt, backstopMs, freshWindowMs: backstopFreshWindowMs })",
+		),
+		"byte-freshness gate sampled from the pipe accumulators",
+	);
+	ok(source.includes("lastOutputAt = Date.now()"), "lastOutputAt updated on stdout/stderr data");
+	ok(source.includes("backstopFired = true"), "backstop fire flag latched");
+	ok(source.includes('killTree("SIGTERM")'), "backstop kills the tree");
+	ok(source.includes("stopReason: reason"), "backstop resolves with stopReason (cut)");
 });
 
 // ── Results ───────────────────────────────────────────

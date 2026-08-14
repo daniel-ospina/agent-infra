@@ -18,9 +18,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 // #36: shared sub-agent PATH augmentation (python3 resolution for MCP servers)
-import { getSubAgentPath } from "../builtin-tools/index.js";
+import { getSubAgentPath, DEFAULT_TOOL_STALL_MS } from "../builtin-tools/index.js";
+
+// #208: local constants (the builtin-tools equivalents live on the builtin
+// task tool; the ext keeps its own copies so it stays self-contained).
+const DEFAULT_BACKSTOP_MARGIN_MS = 1_800_000; // 30 min over tool-stall
+const DEFAULT_EXIT_SETTLE_GRACE_MS = 2_000; // exit-settle grace (2s)
 // #137: recursive process-tree kill for abort/timeout (orphan MCP reaping)
 import { treeKill } from "../shared/tree-kill.js";
+// #208: shared pgid-anchored process-group sweep (settle-path orphan reaping)
+import { getPgid, sweepProcessGroup } from "../shared/process-sweep.js";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -192,7 +199,10 @@ export function isFailedResult(result: SingleResult): boolean {
 		result.stopReason === "error" ||
 		result.stopReason === "aborted" ||
 		// #137: per-task timeout is a failure — the worker was killed, not done.
-		result.stopReason === "timeout"
+		result.stopReason === "timeout" ||
+		// #208: an external cut (signal-death) is a failure — the worker is
+		// dead, not done; the orchestrator must re-dispatch, not accept.
+		result.stopReason === "cut"
 	);
 }
 
@@ -206,7 +216,11 @@ export function getResultOutput(result: SingleResult): string {
 	if (
 		result.stopReason === "aborted" ||
 		result.stopReason === "timeout" ||
-		result.stopReason === "completed_before_abort"
+		result.stopReason === "completed_before_abort" ||
+		// #208: a cut result carries whatever the worker produced before the
+		// signal — surface partial messages first (mirrors #137's timeout
+		// treatment).
+		result.stopReason === "cut"
 	) {
 		const output = getFinalOutput(result.messages);
 		if (output) return output;
@@ -245,6 +259,85 @@ export function getTaskTimeoutMs(raw: string | undefined = process.env.SUBAGENT_
 	// input must never kill productive agents instantly).
 	if (!Number.isFinite(n) || n <= 0) return 0;
 	return n;
+}
+
+// ── #208: cut contract + backstop (pure, unit-tested) ────────────────────
+
+/**
+ * #208 D6: settle stopReason from the RAW close code + dispatch flags.
+ * Used by BOTH the close path and the exit-settle fallback (the grace race
+ * must not lose the branches). An externally signal-killed child (code null)
+ * with no timeout/abort in progress maps to "cut". Documented limitation:
+ * the ext has no tool state, so a CLEAN mid-tool exit is undetectable here —
+ * only signal-death maps to cut (D6, scope).
+ */
+export interface ResolveStopReasonInput {
+	timedOut: boolean;
+	wasAborted: boolean;
+	backstopFired: boolean;
+}
+
+export function resolveStopReason(code: number | null, i: ResolveStopReasonInput): string | undefined {
+	if (i.timedOut) return "timeout";
+	if (i.wasAborted) {
+		// #137 F4: abort after clean exit → completed_before_abort (valid result).
+		if (!shouldThrowOnAbort(code, i.wasAborted)) return "completed_before_abort";
+		return "aborted";
+	}
+	if (i.backstopFired) return "cut";
+	if (code === null) return "cut"; // signal-death — NEW (#208)
+	return undefined;
+}
+
+/** #208 D4: subagent backstop margin over taskTimeout (15 min). */
+export const DEFAULT_SUBAGENT_BACKSTOP_MARGIN_MS = 900_000;
+
+/**
+ * #208 D4: the last-resort parent-await bound for the ext. taskTimeout + 15min
+ * when taskTimeout > 0; a FIXED tool-stall + 30min (6h30m = 23_400_000) when
+ * SUBAGENT_TASK_TIMEOUT_MS=0 — the timeout opt-out must NOT reinstate the
+ * unbounded wait (the ext has no marker clause to bound a long-lived child
+ * otherwise). SUBAGENT_BACKSTOP_MS overrides; 0 = off (deliberate
+ * unbounded-wait config).
+ */
+export function getSubagentBackstopMs(taskTimeoutMs: number): number {
+	const raw = Number(process.env.SUBAGENT_BACKSTOP_MS);
+	if (Number.isFinite(raw) && raw === 0) return 0; // explicit opt-out
+	if (Number.isFinite(raw) && raw > 0) return raw;
+	if (taskTimeoutMs > 0) return taskTimeoutMs + DEFAULT_SUBAGENT_BACKSTOP_MARGIN_MS;
+	return DEFAULT_TOOL_STALL_MS + DEFAULT_BACKSTOP_MARGIN_MS;
+}
+
+/** #208 round-3 F1 (option a): byte-freshness window — SUBAGENT_BACKSTOP_FRESH_MS
+ * (default 60 min, floor 60s). */
+export function getSubagentBackstopFreshMs(): number {
+	const raw = Number(process.env.SUBAGENT_BACKSTOP_FRESH_MS);
+	return Math.max(60_000, Number.isFinite(raw) && raw > 0 ? raw : 3_600_000);
+}
+
+/**
+ * #208 round-3 F1 (option a — byte-freshness proxy): the backstop fires only
+ * when (a) the deadline (backstopMs since start) has been reached AND (b) no
+ * stdout/stderr bytes within the fresh window. A healthy agent that emitted
+ * bytes within the window is exempt → the timer re-arms. Weaker semantics
+ * documented: unlike the builtin's marker gate, a >60-min-silent healthy ext
+ * agent is NOT exempt — the ext emits no liveness signal by design
+ * (Out-of-scope); this is the price of bounding the ext's otherwise
+ * unbounded wait in the timeout=0 config.
+ */
+export interface BackstopShouldFireInput {
+	now: number;
+	startedAt: number;
+	/** Last stdout/stderr byte timestamp (0 = never emitted). */
+	lastOutputAt: number;
+	backstopMs: number;
+	freshWindowMs: number;
+}
+
+export function backstopShouldFire(i: BackstopShouldFireInput): boolean {
+	if (i.now - i.startedAt < i.backstopMs) return false;
+	if (i.lastOutputAt > 0 && i.now - i.lastOutputAt <= i.freshWindowMs) return false;
+	return true;
 }
 
 // ── #137 F6: result caching to disk (defense in depth) ──────────────────
@@ -438,6 +531,25 @@ export async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 				env: { ...process.env, PATH: augmentedPath },
 			});
+			// #208: pgid captured at spawn — for a detached spawn this is the
+			// child's OWN group (setsid); the shared sweep helper's runtime
+			// guard skips + warns when SUBAGENT_DETACHED=0 (the child shares
+			// the orchestrator's pgid — never signal it; implies
+			// SUBAGENT_SWEEP=0).
+			const childPgid: number | null = getPgid(proc.pid ?? 0) ?? proc.pid ?? null;
+			// #208 F1: settle-exactly-once — `settled` gates EVERY settle path
+			// (exit-settle, close, backstop, error); `swept` gates the
+			// fire-and-forget settle-path sweep. graceTimer is cleared when
+			// close fires first (a stale timer can never re-fire into a
+			// recycled pgid); backstopTimer is cleared on settle and never
+			// re-armed after settle.
+			let settled = false;
+			let swept = false;
+			let graceTimer: NodeJS.Timeout | null = null;
+			let backstopTimer: NodeJS.Timeout | undefined;
+			let backstopFired = false;
+			const startedAt = Date.now();
+			let lastOutputAt = 0;
 
 			// Heartbeat: prevent silence timeout during long tool calls (review dispatches, batch reads).
 			// Research: 30s interval balances false-positives (<5s jitter risk) vs detection speed (>30s misses crashes).
@@ -484,6 +596,78 @@ export async function runSingleAgent(
 				proc.once("close", () => clearTimeout(sigkillTimer));
 			};
 
+			// #208 F1/F2: settle-exactly-once + settle-path sweep hook.
+			// doResolve wraps resolve(code ?? 0) — the settle + the sweep run
+			// EXACTLY ONCE per dispatch. Sweep gating (round-3 F2): whenever
+			// the exit-settle path resolved (close didn't fire within grace —
+			// a live pipe-holder keeps the pgid alive, so pgid-recycle risk
+			// does not apply there) OR an abnormal reason resolved via the
+			// close path (stopReason ∈ {timeout, aborted, cut} — incl. the
+			// backstop, which maps to "cut" — or a non-zero exit); no-sweep
+			// ONLY for close-within-grace with code 0 and no kill stopReason.
+			// Fire-and-forget AFTER resolve — sweep latency never counts
+			// against the resolve indicator (F3). Safety valve (D2):
+			// SUBAGENT_SWEEP=0 disables the settle-path sweep ENTIRELY; a
+			// non-detached spawn (SUBAGENT_DETACHED=0) is skipped + warned by
+			// the shared guard — the orchestrator's own group is never
+			// signaled (implies SUBAGENT_SWEEP=0).
+			const doResolve = (code: number | null, opts?: { settlePath?: "close" | "exit"; stopReason?: string }) => {
+				if (settled) return;
+				settled = true;
+				if (graceTimer) {
+					clearTimeout(graceTimer);
+					graceTimer = null;
+				}
+				if (backstopTimer) {
+					clearTimeout(backstopTimer);
+					backstopTimer = undefined;
+				}
+				const shouldSweep =
+					opts?.settlePath === "exit" ||
+					(opts?.stopReason !== undefined && opts.stopReason !== "completed_before_abort") ||
+					(code !== null && code !== 0);
+				if (shouldSweep && process.env.SUBAGENT_SWEEP !== "0" && childPgid !== null && !swept) {
+					swept = true;
+					void sweepProcessGroup(childPgid, { detached });
+				}
+				resolve(code ?? 0);
+			};
+
+			// #208 D4/round-3 F1 (option a — byte-freshness proxy): backstop
+			// timer — the last-resort parent-await bound (the ext has no marker
+			// stream, so no stateFresh analog beyond output activity). ONE-SHOT
+			// per dispatch: armed at spawn, fires at backstopMs (taskTimeout +
+			// 15min, or fixed 6h30m when timeout=0), re-armed for another
+			// interval when the freshness gate passes (bytes within the fresh
+			// window — healthy agent); fires ONCE per cut when the gate is
+			// failing (emitting-then-silent class stays bounded); cleared on
+			// settle; never re-armed after settle. SUBAGENT_BACKSTOP_MS
+			// overrides; 0 = off (deliberate unbounded-wait config).
+			const backstopMs = getSubagentBackstopMs(taskTimeoutMs);
+			const backstopFreshWindowMs = getSubagentBackstopFreshMs();
+			if (backstopMs > 0) {
+				const backstopFire = () => {
+					if (settled) return;
+					if (proc.exitCode !== null || proc.killed) return; // already exited — close will settle
+					if (!backstopShouldFire({ now: Date.now(), startedAt, lastOutputAt, backstopMs, freshWindowMs: backstopFreshWindowMs })) {
+						// healthy (bytes within the fresh window) — re-arm for
+						// another interval; the backstop is not a total dispatch cap.
+						backstopTimer = setTimeout(backstopFire, backstopMs);
+						return;
+					}
+					backstopFired = true;
+					killTree("SIGTERM");
+					// resolve IMMEDIATELY — never wait on close (the child may
+					// be wedged / a pipe-holder alive).
+					if (buffer.trim()) processLine(buffer);
+					const reason = resolveStopReason(null, { timedOut, wasAborted, backstopFired });
+					if (reason) currentResult.stopReason = reason;
+					emitUpdate();
+					doResolve(null, { settlePath: "close", stopReason: reason });
+				};
+				backstopTimer = setTimeout(backstopFire, backstopMs);
+			}
+
 			let buffer = "";
 
 			const processLine = (line: string) => {
@@ -525,6 +709,7 @@ export async function runSingleAgent(
 
 			proc.stdout.on("data", (data) => {
 				buffer += data.toString();
+				lastOutputAt = Date.now(); // #208: byte-freshness proxy (backstop gate)
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 				for (const line of lines) processLine(line);
@@ -532,37 +717,66 @@ export async function runSingleAgent(
 
 			proc.stderr.on("data", (data) => {
 				currentResult.stderr += data.toString();
+				lastOutputAt = Date.now(); // #208: byte-freshness proxy (backstop gate)
 			});
 
 			proc.on("close", (code) => {
 				clearInterval(heartbeat);
 				if (taskTimeout) clearTimeout(taskTimeout);
-				if (buffer.trim()) processLine(buffer);
-				// #137: settle stopReason from the RAW close code — null (killed by
-				// signal) is distinct from 0 (clean exit); resolve() below collapses
-				// null → 0 for the exitCode field.
-				if (timedOut) {
-					currentResult.stopReason = "timeout";
-				} else if (wasAborted) {
-					if (shouldThrowOnAbort(code, wasAborted)) {
-						currentResult.stopReason = "aborted";
-						currentResult.errorMessage = `Subagent was aborted (user-initiated). Result cache: ${cacheDir}`;
-					} else {
-						// Abort arrived after the worker exited cleanly — the result
-						// is valid and must not be discarded (F4).
-						currentResult.stopReason = "completed_before_abort";
-					}
+				if (graceTimer) {
+					clearTimeout(graceTimer);
+					graceTimer = null;
 				}
+				if (buffer.trim()) processLine(buffer);
+				// #137 + #208: settle stopReason from the RAW close code via the
+				// shared mapping (same taxonomy as the exit-settle fallback —
+				// the grace race must not lose the branches). null (killed by
+				// signal) is distinct from 0 (clean exit); resolve() below
+				// collapses null → 0 for the exitCode field. #208 cut contract
+				// (D6): signal-death maps to stopReason "cut" with exitCode
+				// staying 0 (the raw code was null — do not fabricate).
+				// Documented limitation: the ext has no tool state, so a CLEAN
+				// mid-tool exit is undetectable here — only signal-death maps
+				// to cut.
+				const reason = resolveStopReason(code, { timedOut, wasAborted, backstopFired });
+				if (reason === "aborted") {
+					currentResult.errorMessage = `Subagent was aborted (user-initiated). Result cache: ${cacheDir}`;
+				}
+				if (reason) currentResult.stopReason = reason;
 				// F2: one final update after close so the core's streaming display
 				// receives a terminal state instead of an endless spinner.
 				emitUpdate();
-				resolve(code ?? 0);
+				doResolve(code, { settlePath: "close", stopReason: reason });
+			});
+
+			proc.on("exit", (code: number | null) => {
+				// #208 F1: grace-race exit-settle — `exit` fires BEFORE `close`,
+				// and the final-output composition lives in the close path.
+				// Defer settle by 2s: if `close` fires within the grace the
+				// NORMAL path is unchanged; only when an orphan holds the pipes
+				// (close never fires) does the exit-settle run (replicating the
+				// finalize composition incl. the stopReason branches). The grace
+				// timer is CLEARED when close fires first (F1) — a stale timer
+				// can never re-fire into a recycled pgid.
+				clearInterval(heartbeat);
+				if (taskTimeout) clearTimeout(taskTimeout);
+				graceTimer = setTimeout(() => {
+					graceTimer = null;
+					if (buffer.trim()) processLine(buffer);
+					const reason = resolveStopReason(code, { timedOut, wasAborted, backstopFired });
+					if (reason === "aborted") {
+						currentResult.errorMessage = `Subagent was aborted (user-initiated). Result cache: ${cacheDir}`;
+					}
+					if (reason) currentResult.stopReason = reason;
+					emitUpdate();
+					doResolve(code, { settlePath: "exit", stopReason: reason });
+				}, DEFAULT_EXIT_SETTLE_GRACE_MS);
 			});
 
 			proc.on("error", () => {
 				clearInterval(heartbeat);
 				if (taskTimeout) clearTimeout(taskTimeout);
-				resolve(1);
+				doResolve(1, { settlePath: "close" });
 			});
 
 			if (signal) {

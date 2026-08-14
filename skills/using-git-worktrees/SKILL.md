@@ -26,6 +26,21 @@ The main checkout is a **SHARED HUB** that stays on `main`. Feature work happens
 
 > **Never** start feature work in the main checkout. **Never** delete a branch without checking `git worktree list` for active checkouts.
 
+## Escaping the main-checkout guard (deliberate mid-session escalation)
+
+If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the recovery git ops needed to un-strand (`git checkout main`, `git pull`, branch recovery) — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
+
+```bash
+# must be its OWN bash tool call inside a guard-loaded session
+touch ~/.pi/agent/.allow-main-edits  # recovery: <reason>
+```
+
+- **One command per touch.** A combined `touch ... && git checkout main` in ONE bash call does NOT work — the guard classifies the whole command before stamping, so the git part blocks and the touch never runs. The recovery git op goes in the **FOLLOW-UP** call.
+- **15-minute expiry, refresh by re-touch.** The window is mtime-based (fixed 15-min TTL, not env-overridable), re-read on every tool call, never cached. Re-running the same `touch` refreshes the window; a marker exactly 15 minutes old is expired and the recovery op is blocked again.
+- **Session-scoped + guard-stamped.** Only the guard's tool_call handler writes the session id + reason stamp; a human-terminal `touch` produces an unscoped empty file → inert → blocked. Headless/print-mode sessions with a null session id cannot escalate.
+- **Delegation does NOT work.** A subagent does not inherit the parent's `PI_SESSION_ID` — recovery must run in the session that created the marker; delegating the touch to a subagent re-scopes the marker to the subagent's id or fails-closed.
+- **Hung processes are NOT helped.** A hung process cannot issue any tool call, so it can never touch a marker. The hung-process class has no owner (process-supervision follow-up required) — see the guard README (`extensions/main-worktree-guard/README.md`) for the full contract, audit location, and verification checklist.
+
 ## Step 0: Detect Main Repo Root
 
 **Always run this first.** When called from inside an agent worktree, `$PWD` and `git rev-parse --show-toplevel` return the worktree's path, not the main repo. All directory checks and worktree creation must use `$MAIN_REPO` as the base to prevent nested worktrees.
@@ -190,6 +205,30 @@ Tests passing (<N> tests, 0 failures)
 Ready to implement <feature-name>
 ```
 
+## Checkout Discipline — delete-on-merge + hub-check (2026-08-14, #6688/#1218)
+
+The shared-checkout incident class (wrong-branch commits, corruption via daemon
+agents in the hub) is prevented by discipline, not just guards:
+
+1. **Hub stays on `main` + clean.** Before ANY work, run the hub check:
+   `git -C <main-checkout> symbolic-ref --short HEAD` must be `main` and
+   `git -C <main-checkout> status --porcelain` empty. If not — do NOT start
+   feature work there; create a worktree. (Daemons execute in role-scoped
+   execution worktrees via the swarm runtime; interactive agents follow this
+   rule.)
+2. **Delete-on-merge.** Every worktree created for a PR/issue must be removed
+   when its branch merges: `git worktree remove <path>` (no `--force` — it
+   refuses tracked WIP). If the branch merged but the worktree lingers, prune
+   with `git worktree prune`. Accumulated worktrees are the tortoise 178-
+   worktree failure mode (#1218).
+3. **Corruption canary.** The shared canary
+   (`~/.pi/agent/scripts/checkout-hygiene/corruption_canary.py`, canonical in
+   agent-infra) detects the mass-replace corruption class (.bak files +
+   known tokens). Run it before committing or on suspicion.
+4. **Never disable the guard ambiently.** Do not export
+   `AGENT_ALLOW_MAIN_EDITS=1` (or VGATE/review skips) in shell profiles; the
+   escape hatch is per-session and time-boxed.
+
 ## Quick Reference
 
 | Situation | Action |
@@ -238,30 +277,60 @@ Ready to implement <feature-name>
   ```
   Never launch a nested/background `pi` to "escape" the guard — that is how a 29h fleet hang happened (2026-08-11→12, #206).
 
-> **#265 marker semantics (escaped hatch):** under the TTL marker (or the env flag), the guard's M2/M3 gates are INACTIVE (the escape hatch keeps its documented semantics — a stranded main checkout stays recoverable) but M1 detection stays ACTIVE: if the branch moves again mid-session you still get the warn. Sub-agents no longer inherit the hatch at all — the env pivot removed `AGENT_ALLOW_MAIN_EDITS` from subAgentEnv; only an EXPLICIT dispatcher-set flag or the marker opens it.
+> **#265 marker semantics (escaped hatch):** under the TTL marker (or the env flag), the guard's M2/M3 gates are INACTIVE (the escape hatch keeps its documented semantics — a stranded main checkout stays recoverable) but M1 detection stays ACTIVE: if the branch moves again mid-session you still get the warn.
 
+## Launching Nested pi
 ### Never launch an unbounded nested pi (#206) — hard rule
 
-- **Rule:** NEVER launch a nested `pi` (print-mode sub-agent, background session, recovery worker) without ALL THREE bounds:
-  1. **`timeout <N>`** — hard wall-clock cap on the process (e.g. `timeout 600 pi -p ...`); no unbounded launches, ever.
-  2. **Log-file redirect** — `> /tmp/<name>.log 2>&1` so progress is observable (stdout to a pipe/file is block-buffered and can appear frozen for hours, #202).
-  3. **Liveness marker** — the launched process must emit a periodic heartbeat (timestamped line) so a stalled worker is distinguishable from a dead one.
-- **Sanctioned alternative:** the terminal one-liner above (no pi involved).
+> **Never launch an unbounded nested pi.** Every nested or background `pi`
+> launch MUST carry a hard timeout (30 minutes — the bounded-launch template
+> below), a log redirect (`> /tmp/<launch-unique>.log 2>&1` — unique per
+> launch; the template names it via `mktemp`), and a liveness
+> marker — a `[task-heartbeat]` line written to the log at regular intervals
+> (markers require `TASK_HEARTBEAT=1` AND `PI_MODE=print` set explicitly on
+> the launch — the runtime writes them only when both are present; the task
+> tool injects both, a manual nested launch must set them itself).
+> Abort semantics: no marker within the window → the process is dead or
+> blocked at the OS level → ABORT; markers present but no completion → the
+> timeout is the bound — do NOT extend it. Note: marker presence ≠ progress —
+> a gate-stalled pi keeps writing markers, which is exactly why the hard
+> deadline is non-negotiable. On abort: kill the launch, surface the failure
+> to the user, and never wait indefinitely — a silent wait is the failure
+> mode this rule eliminates. The ONLY sanctioned guard escape is the terminal
+> one-liner in `using-git-worktrees` (Guard Escape section), executed by the
+> user in their own terminal — never by an agent tool, which the
+> main-worktree guard blocks. When a bounded form is impossible, do not
+> launch — escalate to the user instead.
 
-### Monitoring background workers — stdout is buffered, stderr is not (#202)
-
-`pi -p` stdout redirected to a FILE is block-buffered (pi accumulates per-turn
-output), so a `tail -f` log can look frozen for hours while the worker is
-actively working — **do not infer liveness from stdout alone**. The unbuffered
-signals: (1) STDERR (node writes it synchronously — the task-heartbeat marker
-stream is stderr), and (2) side effects (processes, worktree diffs).
-
-Monitor a background worker with:
+### Bounded-launch template — the ONLY sanctioned form of nested pi
 
 ```bash
-bash scripts/monitor-worker.sh /tmp/pi-1.log 60   # exit 0 = fresh writes, 1 = stale, 2 = missing/empty
-watch -n 30 'bash scripts/monitor-worker.sh /tmp/pi-1.log'
+# Bounded nested pi launch — the ONLY sanctioned form of nested pi:
+LOG="$(mktemp /tmp/nested-pi.XXXXXX)"
+PI_MODE=print TASK_HEARTBEAT=1 pi -p "<prompt>" > "$LOG" 2>&1 &
+launch_pid=$!
+echo "launched $launch_pid → $LOG"
+
+# Deadline watchdog — portable sleep-deadline + kill -0 liveness probe
+# (no GNU timeout on macOS): SIGTERM at 1800s; SIGKILL after a 60s grace.
+( sleep 1800; if kill -0 "$launch_pid" 2>/dev/null; then kill "$launch_pid"; pkill -P "$launch_pid" 2>/dev/null; sleep 60; kill -9 "$launch_pid" 2>/dev/null; fi ) &
+
+# Liveness check + abort trigger — [task-heartbeat] markers land on stderr
+# every 30s (2>&1 merged). No marker within 60s → the process is dead or
+# blocked at the OS level → ABORT. Markers present → the launch is ALIVE and
+# the 30-min deadline watchdog is the only remaining bound — do NOT kill here:
+sleep 60
+if grep -q '\[task-heartbeat\]' "$LOG"; then
+  echo "ALIVE — bounded by the 30-min deadline watchdog"
+else
+  echo "NO MARKER — ABORTING (process dead/blocked at OS level)"
+  kill "$launch_pid" 2>/dev/null
+  pkill -P "$launch_pid" 2>/dev/null
+  echo "ABORTED — surfacing to user"
+  exit 1
+fi
 ```
+
 
 Launch guidance: keep `2>&1` (markers + stage lines land immediately) and use
 the liveness-marker rule from the hard rule above. A stale log with fresh
@@ -281,6 +350,8 @@ echo "recovering stranded main checkout" >> ~/.pi/agent/.allow-main-edits   # re
 - **Traversal-guarded:** only a regular file counts — a directory or symlink at the path is ignored (fail-closed).
 - **Cleanup:** `rm ~/.pi/agent/.allow-main-edits` after the operation (the TTL would do it anyway).
 - **#265 (branch ownership):** the marker opens M2/M3 (commit/push/branch-state gates are inactive under it) but M1 branch-deviation detection STAYS ACTIVE — a deliberate solo session still sees a warn if the tree moves again.
+
+> Template semantics: `LOG` is created via `mktemp` BEFORE the launch (`$$` is the shell pid — two backgrounded launches in one bash call would collide on a `$$`-derived name; `${launch_pid}` inside the redirect is wrong because the redirect is evaluated before `$!` is captured). The deadline watchdog is the primary guarantee (SIGTERM at 30 min, SIGKILL after 60s grace — the portable equivalent of GNU `timeout --kill-after=60 1800`, which does not exist on macOS). The abort trigger is CONDITIONAL: `kill` executes only when grep finds no marker — a healthy launch that prints ALIVE is never killed at 60s. `pkill -P "$launch_pid"` is best-effort (BSD pkill exists on macOS); grandchildren may linger (accepted — full tree-kill is an extension-side concern, out of scope).
 
 ### Missing MCP tools in worktree sessions (NVIDIA, Supabase, etc.)
 
@@ -315,7 +386,11 @@ Ready to implement auth feature
 - Skip CLAUDE.md check
 - Use `$PWD` or `git rev-parse --show-toplevel` for path construction — always use `$MAIN_REPO` from Step 0
 
+**Never:**
+- Launch an unbounded nested/background `pi` — always use the bounded-launch template in `## Launching Nested pi` (hard timeout + log redirect + liveness marker; abort on no-marker).
+
 **Always:**
+- Bound every nested/background pi launch (`PI_MODE=print TASK_HEARTBEAT=1`, `mktemp` log, `sleep 1800` + `kill -0` watchdog) and prefer the terminal one-liner for guard escapes.
 - Resolve `$MAIN_REPO` via `git rev-parse --git-common-dir` before anything else (Step 0)
 - Follow directory priority: existing > CLAUDE.md > ask
 - Verify directory is ignored for project-local
