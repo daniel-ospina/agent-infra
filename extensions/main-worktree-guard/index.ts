@@ -9,10 +9,13 @@
 //     entirely and let one agent yank the working tree out from under another
 //     (incident 2026-08-06: `git reset --hard origin/main` mid-PR).
 //
-// Worktrees are ISOLATED — none of this applies inside a worktree. The only
-// escape hatch is AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for
-// deliberate solo sessions. There is NO auto-bypass: the guard blocks every
-// time, so a rogue/parallel agent cannot retry its way past it.
+// Worktrees are ISOLATED — none of this applies inside a worktree. The
+// escape hatches are AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1)
+// for deliberate solo sessions, and the TTL'd file-based escape marker
+// (~/.pi/agent/.allow-main-edits, #207) for a deliberate mid-session
+// escalation — see extensions/main-worktree-guard/README.md. There is NO
+// auto-bypass: the guard blocks every time, so a rogue/parallel agent cannot
+// retry its way past it.
 // Degradation: if classify-git.mjs fails to load (jiti edge case), the bash
 // guard degrades to warn-only (fail-safe, never false-blocks) while the
 // write/edit guard stays fully enforced.
@@ -21,11 +24,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { resolve, dirname, join } from "node:path";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { isAllowMarkerValid } from "./classify-git.mjs";
+import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { realpathSync, existsSync } from "node:fs";
 import { isPrintMode } from "../shared/print-mode.js";
+import { appendJsonl } from "../shared/audit-log.js";
 
 // Shared destructive-git rules (also used by test.mjs). If the import ever
 // fails (jiti resolution edge case), the bash guard degrades to warn-only
@@ -41,10 +43,23 @@ let getMainCheckoutBranch: () => string | null = () => null;
 // repo fingerprint (manifest.json + pi-bootstrap/setup.sh). Default false keeps
 // the fail-safe contract — agent-infra detection never silently disables guard.
 let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) => boolean = () => false;
+// Escape-marker (#207) rules live in classify-git.mjs so test.mjs exercises the
+// SAME logic. Fail-safe defaults: every marker function degrades to inactive
+// (false/null) so a failed import NEVER silently allows.
+let isAllowMarkerActive: (stats: unknown, nowMs?: number, ttlMs?: number) => boolean = () => false;
+let isAllowMarkerPath: (path: string, home: string) => boolean = () => false;
+let isAllowMarkerCommand: (command: string, home: string) => boolean = () => false;
+let extractMarkerReason: (command: string) => string | null = () => null;
+let parseMarkerContent: (content: string) => Record<string, unknown> | null = () => null;
+let isAllowMarkerRealpath: (path: string) => boolean = () => false;
+let readAllowMarkerState: (path: string, sessionId: string | null | undefined, nowMs?: number, ttlMs?: number) => boolean = () => false;
+let ALLOW_MAIN_EDITS_MARKER_TTL_MS = 15 * 60 * 1000;
 try {
   ({ classifyGitCommand, isWorktreeCwd, extractPushDeleteBranch,
      getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch,
-     isAgentInfraRepo } =
+     isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive,
+     isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason,
+     parseMarkerContent, isAllowMarkerRealpath, readAllowMarkerState } =
     await import("./classify-git.mjs"));
 } catch (e) {
   console.warn("[main-worktree-guard] ⚠️ classify-git.mjs failed to load — bash git guard DISABLED:", String(e));
@@ -65,35 +80,53 @@ function _getEnv(name: string): string | undefined {
 // The marker is TTL'd (default 15 min), re-read on every tool_call (never
 // cached), and never applies to parallel sessions automatically. Creation is
 // logged with a reason when the reason is provided (marker content = reason).
-const ALLOW_MARKER_DEFAULT = join(homedir(), ".pi", "agent", ".allow-main-edits");
-const ALLOW_MARKER_TTL_MS = 15 * 60_000;
-
-function _allowMarkerPath(): string {
-  return process.env.ALLOW_MAIN_EDITS_MARKER || ALLOW_MARKER_DEFAULT;
-}
-
-/** Marker valid when the file exists, is a regular file, and is younger than
- * the TTL. Re-reads on every call — expiry is checked per tool_call, never
- * cached (pure check in classify-git.mjs, shared with test.mjs, #207). */
-function _isAllowMarkerValid(): boolean {
-  return isAllowMarkerValid(_allowMarkerPath(), Date.now(), ALLOW_MARKER_TTL_MS);
-}
-
-/** Marker creation with an audit trail: the marker's content carries the
- * reason; the session log announces it once. Returns the marker path. */
-export function createAllowMarker(reason = "deliberate solo session"): string {
-  const path = _allowMarkerPath();
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${reason} (${new Date().toISOString()})
-`, "utf-8");
-  console.log(
-    `[main-worktree-guard] ⏳ Escape marker created: ${path} (TTL ${ALLOW_MARKER_TTL_MS / 60_000}min, reason: ${reason})`,
-  );
-  return path;
-}
-
 function _isAllowMainEdits(): boolean {
-  return _getEnv("ALLOW_MAIN_EDITS") === "1" || _isAllowMarkerValid();
+  return _getEnv("ALLOW_MAIN_EDITS") === "1";
+}
+// ── Escape marker (#207) helpers ────────────────────────────────────────────
+// Marker path is derived per call (lazy like gateEventsFile()) — never a
+// module-level constant, so a $HOME change (tests, alternate agent dirs) works.
+function _markerPath(): string {
+  return join(homedir(), ".pi", "agent", ".allow-main-edits");
+}
+// Session id: env first (per-process scoping — pi writes PI_SESSION_ID into
+// bash-tool child envs; subagents resolve their OWN id), then the ctx
+// sessionManager fallback (loop-enforcer precedent), else null → fail-safe
+// (a headless session with no id can never have an active marker).
+function _currentSessionId(ctx?: { sessionManager?: { getSessionId?: () => string } }): string | null {
+  return process.env.PI_SESSION_ID ?? ctx?.sessionManager?.getSessionId?.() ?? null;
+}
+// Guard-stamping at creation-observation: write the stamp BEFORE allowing the
+// touch command. try/catch fail-silent (F7) — on failure the marker stays
+// absent → block; a failed stamp never weakens the gate.
+function _stampMarker(path: string, sessionId: string | null, reason: string | null): void {
+  try {
+    // P2 (review): ensure ~/.pi/agent exists — a missing dir made the stamp
+    // (and thus the whole touch path) silently dead.
+    mkdirSync(dirname(path), { recursive: true });
+    const content = JSON.stringify({
+      session_id: sessionId,
+      reason: reason ?? null,
+      ts: new Date().toISOString(),
+    });
+    writeFileSync(path, content + "\n", { flag: "w" });
+    const expiresAt = new Date(Date.now() + ALLOW_MAIN_EDITS_MARKER_TTL_MS).toISOString();
+    appendJsonl({
+      event: "gate_bypass",
+      extension: "main-worktree-guard",
+      reason: "main_edits_marker",
+      session_id: sessionId,
+      marker_path: path,
+      ttl_ms: ALLOW_MAIN_EDITS_MARKER_TTL_MS,
+      expires_at: expiresAt,
+      marker_content: content, // bare touch still records a timestamped creation (F10d)
+    });
+    console.log(
+      `[main-worktree-guard] 🔓 Escape marker active for session ${sessionId} until ${expiresAt}${reason ? ` (reason: ${reason})` : ""}`
+    );
+  } catch (e) {
+    console.warn("[main-worktree-guard] ⚠️ Escape-marker stamp failed (fail-silent — marker stays absent → block):", String(e));
+  }
 }
 // Detect if running inside agent-infra's own repo (skip worktree enforcement).
 // Implemented in classify-git.mjs (#99): env-var match (AGENT_INFRA_PATH /
@@ -123,7 +156,7 @@ const WHY = [
 ].join("\n");
 
 export default function (pi: ExtensionAPI) {
-  pi.on("tool_call", async (event, _ctx) => {
+  pi.on("tool_call", async (event, ctx) => {
     const isWrite = isToolCallEventType("write", event);
     const isEdit = isToolCallEventType("edit", event);
     const isBash = isToolCallEventType("bash", event);
@@ -134,7 +167,10 @@ export default function (pi: ExtensionAPI) {
     if (isAgentInfraRepo()) {
       return undefined; // agent-infra is a small infra repo — no worktree needed
     }
-    if (_isAllowMainEdits()) {
+    // Marker OR branch covers bash + write + edit in one check point. Re-read
+    // per tool_call (never cached) — readAllowMarkerState re-stats and re-reads
+    // the file every call, so a touch in between is always observed.
+    if (_isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(ctx))) {
       return undefined;
     }
 
@@ -203,6 +239,16 @@ export default function (pi: ExtensionAPI) {
           };
         }
       }
+      // ── Escape marker (#207): stamp + audit at creation-observation ──
+      // Ordering pinned: git classification ran FIRST (above), so a blocked
+      // command NEVER stamps — `touch ... && git checkout main` in ONE call is
+      // blocked (the git part blocks, the touch never runs; F10c). Only an
+      // ALLOWED bare `touch <marker>` (own command) reaches here; the recovery
+      // git op goes in the FOLLOW-UP call.
+      if (isAllowMarkerCommand(command, homedir())) {
+        _stampMarker(_markerPath(), _currentSessionId(ctx), extractMarkerReason(command));
+        return undefined;
+      }
       return undefined;
     }
 
@@ -226,8 +272,24 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    // If the target is OUTSIDE the project root, it's not a main-checkout edit — allow.
     const resolvedTarget = resolve(process.cwd(), targetPath ?? "");
+
+    // P2 (review): the write/edit tool is an UNAUDITED marker-creation path —
+    // an agent could `write` a stamped JSON straight to the marker file,
+    // bypassing the audited touch->stamp route (no gate_bypass audit event).
+    // Force creation through the bash touch path (guard-stamped + audited).
+    if (resolvedTarget === resolve(_markerPath())) {
+      return {
+        block: true,
+        reason: [
+          "⛔ The escape-marker file must be created via a bash `touch` command,",
+          "   not the write/edit tool — the guard stamps {session_id, reason, ts}",
+          "   and audits the creation only on the bash route (#207).",
+        ].join("\n"),
+      };
+    }
+
+    // If the target is OUTSIDE the project root, it's not a main-checkout edit — allow.
     const insideProject =
       resolvedTarget === mainTopLevel || resolvedTarget.startsWith(mainTopLevel + "/");
     if (!insideProject) {
@@ -279,7 +341,12 @@ export default function (pi: ExtensionAPI) {
   // ── Session-start hub discipline check (#73) ──
   // In the main checkout: warn if on a non-main branch or dirty working tree.
   // Non-blocking — the write/edit guard still protects; this is a discipline prompt.
-  if (!isAgentInfraRepo() && !_isAllowMainEdits()) {
+  // Marker parity: an active escape marker also suppresses the warning. Documented
+  // limitation: at module load ctx is unavailable, so this degrades to the
+  // env-only session id — for interactive sessions where the extension host
+  // lacks PI_SESSION_ID the read is false and the warning shows (fail-safe; the
+  // per-tool_call check is authoritative).
+  if (!isAgentInfraRepo() && !_isAllowMainEdits() && !readAllowMarkerState(_markerPath(), _currentSessionId(undefined))) {
     try {
       const inWorktree = isWorktreeCwd(resolve(process.cwd()));
       if (!inWorktree) {
