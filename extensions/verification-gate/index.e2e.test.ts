@@ -28,10 +28,13 @@ process.env.HOME = TEST_ROOT;
 // The gate under test must be ACTIVE — clear the escape hatch if the parent
 // environment inherited it (sub-agent sessions pre-disable extension gates).
 delete process.env.ELDATO_SKIP_VGATE;
-// #825: likewise clear a parent-inherited print-mode marker — the harness runs
-// the plugin in INTERACTIVE mode by default; the #825 scenarios set PI_MODE=print
-// explicitly (and scenario 24 deletes it) to exercise the sub-agent paths.
+// #825: likewise clear parent-inherited sub-agent markers — the harness runs
+// the plugin in INTERACTIVE mode by default; the #825 scenarios set
+// PI_MODE=print + TASK_HEARTBEAT=1 explicitly (builtin-tools' task-child
+// markers, #172/#825) to exercise the sub-agent paths, and scenario 24 deletes
+// PI_MODE to exercise the interactive (non-print) half of the message split.
 delete process.env.PI_MODE;
+delete process.env.TASK_HEARTBEAT;
 
 // ── Tiny git + sha helpers ───────────────────────────
 function sha(text: string): string {
@@ -653,12 +656,15 @@ async function main() {
   // ── #825: sub-agent (env PI_MODE=print) commits inherit the parent's bridge ──
   // builtin-tools no longer injects ELDATO_SKIP_VGATE into task sub-agents; the
   // sub-agent's VGATE session recovers the parent's verified-file registry from
-  // the bridge file. Scenarios 21-23, 25, 26 set PI_MODE=print explicitly (the
-  // harness clears it at startup) to exercise the sub-agent paths; scenario 24
-  // deletes it to exercise the interactive (non-print) half of the message
-  // split. Each print-mode scenario's finally restores by deletion when the
-  // mode was previously undefined (assignment would leak the string
-  // "undefined" into process.env).
+  // the bridge file. Scenarios 21-23, 25, 26 set the task-child marker pair
+  // (PI_MODE=print + TASK_HEARTBEAT=1, exactly what builtin-tools injects)
+  // explicitly — the harness clears them at startup — to exercise the sub-agent
+  // paths; scenario 24 deletes both to exercise the interactive (non-print)
+  // half of the message split; scenario 27 pins the swarm_daemon case
+  // (PI_MODE=print WITHOUT TASK_HEARTBEAT → interactive behavior preserved).
+  // Each print-mode scenario's finally restores by deletion when a marker was
+  // previously undefined (assignment would leak the string "undefined" into
+  // process.env).
 
   test("scenario 21 (#825): sub-agent inherits the parent's bridge — parent-verified file commits pass without re-dispatch", async () => {
     const repo = join(TEST_ROOT, "repo-subagent");
@@ -678,7 +684,9 @@ async function main() {
     const bridgePath = join(bridgeDir, "latest.json");
     mkdirSync(bridgeDir, { recursive: true });
     const prevMode = process.env.PI_MODE;
-    process.env.PI_MODE = "print"; // sub-agent session (builtin-tools #172)
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print"; // builtin-tools task-child markers (#172/#825)
+    process.env.TASK_HEARTBEAT = "1"; // sub-agent session (builtin-tools #172)
     try {
       await fire("session_start", {});
       // Control FIRST: no bridge entry yet → the gate must be ACTIVE in the
@@ -704,6 +712,7 @@ async function main() {
       git(repo, "commit -m sub1");
     } finally {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
   });
 
@@ -711,7 +720,9 @@ async function main() {
     const repo = join(TEST_ROOT, "repo-subagent");
     git(repo, "reset -q");
     const prevMode = process.env.PI_MODE;
-    process.env.PI_MODE = "print";
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print"; // builtin-tools task-child markers (#172/#825)
+    process.env.TASK_HEARTBEAT = "1";
     try {
       await fire("session_start", {});
       writeFileSync(join(repo, "fileU.txt"), "u1\n");
@@ -730,6 +741,7 @@ async function main() {
       ok(!/Dispatch the verifier sub-agent/.test(res.reason), "sub-agent block must NOT carry the parent's verifier-dispatch instruction");
     } finally {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
   });
 
@@ -738,7 +750,9 @@ async function main() {
     git(repo, "reset -q");
     git(repo, "add fileU.txt"); // re-stage the still-unverified file
     const prevMode = process.env.PI_MODE;
-    process.env.PI_MODE = "print";
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print"; // builtin-tools task-child markers (#172/#825)
+    process.env.TASK_HEARTBEAT = "1";
     try {
       await fire("session_start", {});
       for (let i = 0; i < 4; i++) {
@@ -750,6 +764,7 @@ async function main() {
       }
     } finally {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
   });
 
@@ -757,7 +772,8 @@ async function main() {
     const repo = join(TEST_ROOT, "repo-subagent");
     git(repo, "reset -q");
     git(repo, "add fileU.txt"); // re-stage the still-unverified file
-    delete process.env.PI_MODE; // interactive parent session
+    // Interactive parent session: neither sub-agent marker set (the harness
+    // preamble deleted TASK_HEARTBEAT; PI_MODE must also be deleted).
     await fire("session_start", {});
     const res = await fire("tool_call", {
       type: "tool_call", toolName: "bash",
@@ -789,7 +805,9 @@ async function main() {
       timestamp: new Date().toISOString(),
     }));
     const prevMode = process.env.PI_MODE;
-    process.env.PI_MODE = "print";
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print"; // builtin-tools task-child markers (#172/#825)
+    process.env.TASK_HEARTBEAT = "1";
     try {
       await fire("session_start", {});
       // A non-commit git op triggers mid-session bridge recovery while the file
@@ -817,6 +835,7 @@ async function main() {
       }
     } finally {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
   });
 
@@ -840,7 +859,9 @@ async function main() {
       timestamp: new Date().toISOString(),
     }));
     const prevMode = process.env.PI_MODE;
-    process.env.PI_MODE = "print";
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print"; // builtin-tools task-child markers (#172/#825)
+    process.env.TASK_HEARTBEAT = "1";
     try {
       await fire("session_start", {});
       const res = await fire("tool_call", {
@@ -851,6 +872,45 @@ async function main() {
       ok(res.reason.includes("fileX.txt"), "block reason names the file");
     } finally {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+  });
+
+  test("scenario 27 (#825): PI_MODE=print WITHOUT TASK_HEARTBEAT (swarm_daemon worker) keeps interactive behavior", async () => {
+    // #825 review: isPrintModeEnv() alone would misclassify swarm_daemon workers
+    // (they set PI_MODE=print but are NOT task sub-agents — no parent session to
+    // report blocks to). The discriminator is the task-child marker pair
+    // PI_MODE=print + TASK_HEARTBEAT=1; a print-mode process WITHOUT the
+    // heartbeat marker must keep the interactive message + #7591 auto-bypass.
+    const repo = join(TEST_ROOT, "repo-subagent");
+    git(repo, "reset -q");
+    git(repo, "add fileU.txt"); // re-stage the still-unverified file
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print"; // swarm_daemon-style: PI_MODE only, no TASK_HEARTBEAT
+    try {
+      await fire("session_start", {});
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'swarm1'", cwd: repo },
+      });
+      ok(res && res.block === true, "swarm-style print-mode commit must be blocked (unverified)");
+      ok(/Dispatch the verifier sub-agent/.test(res.reason), "swarm-style session must keep the interactive verifier-dispatch message");
+      ok(!/This session is a task sub-agent/.test(res.reason), "swarm-style session must NOT get the task-sub-agent message");
+      // Interactive auto-bypass intact: attempts 1-2 block, attempt 3 auto-bypasses.
+      const res2 = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'swarm2'", cwd: repo },
+      });
+      ok(res2 && res2.block === true, "attempt 2 must block");
+      const res3 = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'swarm3'", cwd: repo },
+      });
+      equal(res3, undefined, "attempt 3 must auto-bypass (swarm-style keeps #7591)");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
   });
 } // main: plugin loaded; tests run sequentially via runAll()

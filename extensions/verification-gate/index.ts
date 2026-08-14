@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
-import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
+import { isPrintMode } from "../shared/print-mode.js";
 // ponytail: inlined from verification-gate-utils.ts — pi's extension loader treats every .ts in
 // ~/.pi/agent/extensions/ as an extension and fails on a pure-helper module (no factory export).
 // Do NOT re-extract to a sibling .ts; the directory+entry pattern (see main-worktree-guard) is the
@@ -144,6 +144,19 @@ let pendingRehashFiles: string[] = [];
 const blockAttempts = new Map<string, number>();
 const BLOCK_ATTEMPT_THRESHOLD = 3;
 const BRIDGE_DIR = join(homedir(), ".pi", "agent", "verification");
+
+// #825: true when this process is a builtin-tools TASK sub-agent (vs a bare
+// headless `pi -p` or a swarm_daemon worker). builtin-tools sets BOTH
+// PI_MODE=print AND TASK_HEARTBEAT=1 on task children (the task-heartbeat
+// extension gates itself on exactly this pair); swarm_daemon workers set only
+// PI_MODE=print, so isPrintModeEnv() alone would misclassify them — they have
+// no parent session to report blocks to, and must keep the interactive
+// dispatch message + #7591 auto-bypass (status quo). Edge: a parent with
+// TASK_HEARTBEAT_DISABLE=1 spawns a child without the marker → treated as
+// interactive (it retains the task tool and can self-dispatch the verifier).
+function isTaskSubAgent(): boolean {
+  return process.env.TASK_HEARTBEAT === "1" && process.env.PI_MODE === "print";
+}
 
 function bridgePath(): string {
   return join(BRIDGE_DIR, "latest.json");
@@ -958,15 +971,18 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // #7591: auto-bypass after N persistent blocks on the same files.
-    // Track block attempts per file; allow if any file hits threshold.
+    // #7591: auto-bypass after N persistent blocks on the same files —
+    // interactive / non-task-sub-agent sessions only; #825 sub-agents get NO
+    // auto-bypass (a block is final). Track block attempts per file; allow
+    // only when ALL blocked files hit the threshold.
     if (unverified.length > 0 || mismatched.length > 0) {
-      // #825: sub-agents (task children — env PI_MODE=print) get NO #7591
-      // auto-bypass: a block is final. They inherit the parent's verified
-      // registry via the bridge; retrying must never silently commit unverified
-      // files. The sub-agent stops and reports the block to the parent, which
-      // verifies and re-dispatches (or lands the change itself).
-      if (!isPrintModeEnv()) {
+      // #825: task sub-agents (builtin-tools children — TASK_HEARTBEAT=1 +
+      // PI_MODE=print) get NO #7591 auto-bypass: a block is final. They inherit
+      // the parent's verified registry via the bridge; retrying must never
+      // silently commit unverified files. The sub-agent stops and reports the
+      // block to the parent, which verifies and re-dispatches (or lands the
+      // change itself).
+      if (!isTaskSubAgent()) {
         const allBlockedFiles = [...unverified, ...mismatched.map(m => m.file)];
         let autoBypassed = 0;
         for (const f of allBlockedFiles) {
@@ -1016,7 +1032,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const allBlocked = [...unverified, ...mismatched.map(m => m.file)];
-    // #825: sub-agents inherit the parent's verified-file registry via the
+    // #825: task sub-agents inherit the parent's verified-file registry via the
     // bridge — a block here means the parent has NOT verified these files. The
     // sub-agent must stop and report back (it cannot run the parent's verifier
     // ceremony); the parent verifies and re-dispatches, or lands the change.
@@ -1034,7 +1050,7 @@ export default function (pi: ExtensionAPI) {
       `    ([VGATE] verify files: ${allBlocked.join(' ')}) and re-run this task,`,
       "    or verify the files itself before pushing.",
     ].join("\n");
-    const reason = isPrintModeEnv()
+    const reason = isTaskSubAgent()
       ? subAgentReason
       : [
           "⛔ Verification gate — blocking git operation.",

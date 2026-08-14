@@ -1640,13 +1640,14 @@ export default function (pi: ExtensionAPI) {
   ...process.env,
   PATH: augmentedPath,
   PI_SKIP_VERSION_CHECK: "1",
-  // Skip extensions sub-agents never need (one-shot, no git/slack/loops/vision).
+  // Skip extensions sub-agents never need (one-shot, no slack/loops/vision).
   // Gate overrides: review DISPATCH stays parent-enforced (#825) — a sub-agent
   // must never self-satisfy the review-enforcer; the parent runs the review
-  // ceremony for the PR as a whole. VGATE is deliberately NOT bypassed (#825):
-  // the sub-agent inherits the parent's verified-file registry via the bridge
-  // file, and commits on unverified files are blocked with a report-to-parent
-  // message. Do NOT re-add ELDATO_SKIP_VGATE here.
+  // ceremony for the PR as a whole. Git commit verification (VGATE) is
+  // deliberately kept ACTIVE for sub-agents (#825): the sub-agent inherits the
+  // parent's verified-file registry via the bridge file, and commits on
+  // unverified files are blocked with a report-to-parent message. Do NOT
+  // re-add ELDATO_SKIP_VGATE here.
   SKILL_ENFORCER_DISABLED: "1",
   LOOP_ENFORCER_DISABLED: "1",
   // #172: declare print mode so extension startup diagnostics stay silent in
