@@ -1,3 +1,14 @@
+---
+title: "Provider reliability guide — qwen + the task tool"
+type: engineering
+domain: operations
+doc_status: live
+subjects.team: organisation-design-team
+created: 2026-08-14
+aboutSubjects: organisation-design-team
+aboutObjects: agent-infra, builtin-tools, custom-provider-qwen, issue-284
+---
+
 # Provider reliability guide — qwen + the task tool
 
 Covers the failure taxonomy, the agent-infra mitigations for #152 (connection
@@ -63,6 +74,16 @@ model.
 - Logged clearly: `[builtin-tools] provider fallback: qwen → deepseek-v4-pro after connection error`
 - Clean exits whose output merely *mentions* the phrase (e.g. research content
   about connection errors) do **not** trigger a fallback (exit-code guarded)
+
+### Second-model gate (`$SECOND_MODEL` — issue #284)
+
+The pipeline's "second-model" review gates (issue-scoping §5.6, code-review §6.6,
+plan-review §4.5, subagent-driven-development final reviewer) dispatch with
+`model` = `$SECOND_MODEL` (env), **default `deepseek/deepseek-v4-pro`**
+(provider-qualified — the bare id is ambiguous across providers). When the
+configured second model is set-but-unresolvable or unset-with-unresolvable-
+default, dispatch the tool default and annotate `[SECOND-MODEL-GATE] stand-in`
+(never silently substitute). Pricing decision + rationale: issue #284.
 
 ## 3. Env var reference
 

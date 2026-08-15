@@ -950,30 +950,30 @@ When the fixer loop exits with remaining issues (stall/cap/fail), the **orchestr
 
 **Pause only when:** a taxonomy-matching decision arises (human input taxonomy). Everything else proceeds unattended.
 
-### Step 6.6 — Qwen Final Gate (Two-Tier Review)
+### Step 6.6 — Second-Model Final Gate (Two-Tier Review)
 
-After the fixer loop converges clean (all Flash-based review cycles done), dispatch ONE Qwen3.8-Max reviewer as a final quality gate. Qwen is a stronger reasoner — it catches what the cheaper review agents miss.
+After the fixer loop converges clean (all Flash-based review cycles done), dispatch ONE second-model reviewer as a final quality gate. The second model is a stronger reasoner — it catches what the cheaper review agents miss.
 
-**Model:** `qwen3.8-max` (via Token Plan or configured provider).
+**Model (second-model gate):** dispatch with `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro` — provider-qualified, unambiguous; resolve via `~/.pi/agent/models.json`). When `$SECOND_MODEL` is set but unresolvable, or unset with the default unresolvable, dispatch the tool default (`deepseek-v4-flash`) and annotate the result `[SECOND-MODEL-GATE] stand-in ($SECOND_MODEL=… set-but-unresolvable | unset+default-unresolvable)`. Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only.
 
 **Dispatch:**
 ```
-task(model="qwen3.8-max", prompt=<same Agent #1 guidance-compliance + Agent #2 bug-scan prompts, single reviewer>)
+task(model=<$SECOND_MODEL per the second-model gate convention>, prompt=<same Agent #1 guidance-compliance + Agent #2 bug-scan prompts, single reviewer>)
 ```
 
-**Prompt:** Same review dimensions as Steps 4-5 agents — Qwen just applies stronger reasoning. No prompt engineering needed.
+**Prompt:** Same review dimensions as Steps 4-5 agents — the second model just applies stronger reasoning. No prompt engineering needed.
 
-**Qwen findings surfaced as `[QWEN-GATE]` severity:**
+**Second-model findings surfaced as `[SECOND-MODEL-GATE]` severity:**
 
-| Qwen Issue | Action |
+| Second-model Issue | Action |
 |---|---|
-| `[QWEN-GATE] P0` | Structural flaw missed by Flash — fix required, re-run Qwen once |
-| `[QWEN-GATE] P1` | Important gap — fix required, re-run Qwen once |
-| `[QWEN-GATE] P2` | Real improvement — fix required, re-run Qwen once (P2s block the merge gate) |
+| `[SECOND-MODEL-GATE] P0` | Structural flaw missed by Flash — fix required, re-run the second-model gate once |
+| `[SECOND-MODEL-GATE] P1` | Important gap — fix required, re-run the second-model gate once |
+| `[SECOND-MODEL-GATE] P2` | Real improvement — fix required, re-run the second-model gate once (P2s block the merge gate) |
 
-**Re-dispatch:** Max 2 Qwen cycles. On 2nd failure → surface in PR comment as `[QWEN-GATE]` with "Qwen final gate could not converge."
+**Re-dispatch:** Max 2 second-model cycles. On 2nd failure → surface in PR comment as `[SECOND-MODEL-GATE]` with "second-model final gate could not converge."
 
-**Gate passes:** Qwen returns CLEAN (no P0/P1/P2 findings). Proceed to Step 7.
+**Gate passes:** second-model gate returns CLEAN (no P0/P1/P2 findings). Proceed to Step 7.
 
 ### Step 7 — Eligibility Re-check
 
