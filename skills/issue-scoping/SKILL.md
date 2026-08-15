@@ -766,15 +766,15 @@ Same agent, independently dispatched. Controller merges if both choose same appr
 
 ---
 
-## Phase 5.6 — Qwen Coherence Check (Two-Tier Review)
+## Phase 5.6 — Second-Model Coherence Check (Two-Tier Review)
 
-After solution-verify converges clean (both diamond verification gates passed with Flash reviewers), dispatch ONE Qwen3.8-Max reviewer to check **cross-diamond coherence**. Qwen checks that the problem definition and solution approach are consistent, nothing was lost between diamonds, and the scoping output is complete.
+After solution-verify converges clean (both diamond verification gates passed with Flash reviewers), dispatch ONE second-model reviewer to check **cross-diamond coherence**. The second model checks that the problem definition and solution approach are consistent, nothing was lost between diamonds, and the scoping output is complete.
 
-**Model:** `qwen3.8-max` (via Token Plan or configured provider).
+**Model (second-model gate):** dispatch with `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro` — provider-qualified, unambiguous; resolve via `~/.pi/agent/models.json`). When `$SECOND_MODEL` is set but unresolvable, or unset with the default unresolvable, dispatch the tool default (`deepseek-v4-flash`) and annotate the result `[SECOND-MODEL-GATE] stand-in ($SECOND_MODEL=… set-but-unresolvable | unset+default-unresolvable)`. Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only.
 
 **Dispatch:**
 ```
-task(model="qwen3.8-max", prompt=<coherence check prompt>)
+task(model=<$SECOND_MODEL per the second-model gate convention>, prompt=<coherence check prompt>)
 ```
 
 **Prompt:**
@@ -797,15 +797,15 @@ CHECK:
 Output ISSUE blocks or NO ISSUES FOUND.
 ```
 
-**Qwen findings surfaced as `[QWEN-GATE]`:**
+**Second-model findings surfaced as `[SECOND-MODEL-GATE]`:**
 
-| Qwen Issue | Action |
+| Second-model Issue | Action |
 |---|---|
-| `[QWEN-GATE] P0` | Problem-solution mismatch — fix required, re-run Qwen once |
-| `[QWEN-GATE] P1` | Important gap — fix required, re-run Qwen once |
-| `[QWEN-GATE] P2` | Improvement — note, do NOT re-run |
+| `[SECOND-MODEL-GATE] P0` | Problem-solution mismatch — fix required, re-run the second-model gate once |
+| `[SECOND-MODEL-GATE] P1` | Important gap — fix required, re-run the second-model gate once |
+| `[SECOND-MODEL-GATE] P2` | Improvement — note, do NOT re-run |
 
-**Re-dispatch:** Max 2 cycles. On 2nd failure → surface in scoping comment as `[QWEN-GATE]` with "Qwen coherence check could not converge."
+**Re-dispatch:** Max 2 cycles. On 2nd failure → surface in scoping comment as `[SECOND-MODEL-GATE]` with "second-model coherence check could not converge."
 
 **Applies to:** Standard + Complex tiers only. Micro tier skips (single full-diamond-verify is sufficient).
 

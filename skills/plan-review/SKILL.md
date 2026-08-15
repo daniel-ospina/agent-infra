@@ -423,35 +423,35 @@ plan_modified_per_cycle: <json array of booleans>
   Confirmation bias makes same-context re-review unreliable.
   Always use `task` for fresh sessions.
 
-### Phase 4.5 — Qwen Final Gate (Two-Tier Review)
+### Phase 4.5 — Second-Model Final Gate (Two-Tier Review)
 
-After Phase 4 converges clean (Flash reviewers are done), dispatch ONE Qwen3.8-Max reviewer as a final quality gate. Qwen is a stronger reasoner — it catches what cheaper reviewers miss. It runs ONCE, only after Flash has converged.
+After Phase 4 converges clean (Flash reviewers are done), dispatch ONE second-model reviewer as a final quality gate. The second model is a stronger reasoner — it catches what cheaper reviewers miss. It runs ONCE, only after Flash has converged.
 
-**Model:** `qwen3.8-max` (via Token Plan or configured provider).
+**Model (second-model gate):** dispatch with `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro` — provider-qualified, unambiguous; resolve via `~/.pi/agent/models.json`). When `$SECOND_MODEL` is set but unresolvable, or unset with the default unresolvable, dispatch the tool default (`deepseek-v4-flash`) and annotate the result `[SECOND-MODEL-GATE] stand-in ($SECOND_MODEL=… set-but-unresolvable | unset+default-unresolvable)`. Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only.
 
 **Dispatch:**
 ```
-task(model="qwen3.8-max", prompt=<same prompt as Phase 1, single reviewer>)
+task(model=<$SECOND_MODEL per the second-model gate convention>, prompt=<same prompt as Phase 1, single reviewer>)
 ```
 
-**Prompt:** Same as Phase 1 reviewers — Qwen just applies stronger reasoning to the same review dimensions. No prompt engineering needed.
+**Prompt:** Same as Phase 1 reviewers — the second model just applies stronger reasoning to the same review dimensions. No prompt engineering needed.
 
-**Qwen findings are surfaced as `[QWEN-GATE]` severity tags:**
+**Second-model findings are surfaced as `[SECOND-MODEL-GATE]` severity tags:**
 
-| Qwen Issue | Action |
+| Second-model Issue | Action |
 |---|---|
-| `[QWEN-GATE] P0` | Structural flaw missed by Flash — fix required, re-run Qwen once |
-| `[QWEN-GATE] P1` | Important gap — fix required, re-run Qwen once |
-| `[QWEN-GATE] P2` | Improvement — note in plan, do NOT re-run |
-| `[QWEN-GATE] P3/P4` | Nit/suggestion — note, do NOT re-run |
+| `[SECOND-MODEL-GATE] P0` | Structural flaw missed by Flash — fix required, re-run the second-model gate once |
+| `[SECOND-MODEL-GATE] P1` | Important gap — fix required, re-run the second-model gate once |
+| `[SECOND-MODEL-GATE] P2` | Improvement — note in plan, do NOT re-run |
+| `[SECOND-MODEL-GATE] P3/P4` | Nit/suggestion — note, do NOT re-run |
 
-**Re-dispatch rule:** If Qwen finds P0 or P1 → fix → re-dispatch Qwen once. Max 2 Qwen cycles. On 2nd failure → surface to human as `[QWEN-GATE]` with "Qwen final gate could not converge."
+**Re-dispatch rule:** If the second-model gate finds P0 or P1 → fix → re-dispatch it once. Max 2 second-model cycles. On 2nd failure → surface to human as `[SECOND-MODEL-GATE]` with "second-model final gate could not converge."
 
-**Gate passes:** Qwen returns CLEAN or only P2+ issues.
+**Gate passes:** second-model gate returns CLEAN or only P2+ issues.
 
 **Log:**
 ```
-🔍 Qwen final gate: clean | N issues found (P0: X, P1: Y) — resolved in M cycles
+🔍 second-model final gate: clean | N issues found (P0: X, P1: Y) — resolved in M cycles
 ```
 
 ### Phase 5 — Final Verification

@@ -162,7 +162,9 @@ This applies even for "obvious" fixes — the cost of a wrong diagnosis is highe
 
 Use Pi's `task` tool for all sub-agent work. Sub-agents have isolated context → construct their prompts with exactly what they need.
 
-**⛔ Model override prohibition:** Do NOT pass `model: "claude-sonnet"` or any non-DeepSeek model to the `task` tool. Only DeepSeek is configured. Overriding will cause the sub-agent to fail with "No API key found for anthropic."
+**⛔ Model override prohibition:** Do NOT pass `model: "claude-sonnet"` or any non-DeepSeek model to the `task` tool. Only DeepSeek is configured for general use; see the second-model-gate exception below. Overriding will cause the sub-agent to fail with "No API key found for anthropic."
+
+**Second-model gate exception (#284):** the second-model review gates (issue-scoping §5.6 coherence check, code-review §6.6 + plan-review §4.5 final gates, subagent-driven-development final code reviewer) may dispatch `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro` — provider-qualified, unambiguous). Non-DeepSeek second models (e.g., kimi-k3, qwen3.8-max after re-enable) are permitted ONLY via an explicit `$SECOND_MODEL` override; when the configured second model is unavailable, dispatch the tool default and annotate `[SECOND-MODEL-GATE] stand-in` — never silently substitute, and never use a non-DeepSeek second model without the env override.
 
 <!-- REPO-SPECIFIC: Add tool-specific exceptions here (e.g., design_reviewer for Claude Opus) -->
 

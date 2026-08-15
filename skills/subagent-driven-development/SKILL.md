@@ -164,18 +164,18 @@ digraph process {
 
 **Implementer + per-task reviewers (spec + code quality):** Use the same model as the current session. The session model is already configured with valid credentials and is capable of every task in this workflow. Do NOT specify a different model for sub-agents unless the user explicitly instructs you to do so.
 
-**Final code reviewer (after all tasks):** Dispatch with `model="qwen3.8-max"`. This is the two-tier review pattern — Flash handles per-task reviews, Qwen3.8-Max serves as the senior gatekeeper for the final pass across the entire implementation. Qwen catches what cheaper per-task reviewers miss.
+**Final code reviewer (after all tasks):** Dispatch with the second-model gate convention — `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro`, provider-qualified; when set-but-unresolvable or unset-with-unresolvable-default, omit `model` and annotate the result `[SECOND-MODEL-GATE] stand-in`). Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only. This is the two-tier review pattern — Flash handles per-task reviews, the second model serves as the senior reviewer for the final pass across the entire implementation. It catches what cheaper per-task reviewers miss.
 
 ```
 # Per-task reviews — session model (Flash)
 task(prompt=spec_reviewer_prompt)
 task(prompt=code_quality_reviewer_prompt)
 
-# Final review — Qwen gate
-task(prompt=final_code_reviewer_prompt, model="qwen3.8-max")
+# Final review — second-model gate
+task(prompt=final_code_reviewer_prompt, model=<$SECOND_MODEL per the second-model gate convention>)
 ```
 
-If the sub-agent dispatch mechanism accepts a `model` parameter, omit it for per-task reviews to use the session default. Pass `model="qwen3.8-max"` only for the final code reviewer.
+If the sub-agent dispatch mechanism accepts a `model` parameter, omit it for per-task reviews to use the session default. Pass the `$SECOND_MODEL` value (default `deepseek/deepseek-v4-pro`) only for the final code reviewer.
 
 ## Handling Implementer Status
 

@@ -6,7 +6,7 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
 
 1. **Appropriate review clean** — the review matched to the ISSUE CONTENT + PR diff surface
    returned 0 P0, 0 P1, and 0 P2 — all findings with confidence ≥ 50 resolved (fixer loop converged;
-   Qwen final gate clean when applicable). The review
+   second-model final gate clean when applicable). The review
    is domain-dispatched, not one-size. ALWAYS-ON reviewers: bug scan (shallow+deep), guidance
    compliance, history, prior-PR comments, and SECURITY (security-review skill — HIGH-confidence
    findings only, research-before-report). Domain reviewers as applicable: infrastructure
