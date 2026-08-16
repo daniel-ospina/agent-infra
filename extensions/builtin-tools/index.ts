@@ -2029,7 +2029,7 @@ export default function (pi: ExtensionAPI) {
       mcp_servers: Type.Optional(
         Type.String({
           description:
-            "Comma-separated MCP server names for this sub-agent (forces eager load). Inherits parent's PI_MCP_SERVERS by default — sub-agents get the eager core (exa+tortoise) plus mcp_catalog/mcp_load for everything else. Name a lazy server (e.g. gemini) to force-load it up front; otherwise load it mid-run via mcp_load.",
+            "Comma-separated MCP server names for this sub-agent (forces eager load). Default: none — sub-agents start with ZERO eager MCP connects for deterministic fast startup (#286); mcp-client treats an unmatching allowlist as empty. Name any server (e.g. gemini) to force-load it up front; everything else loads mid-run via mcp_load.",
         })
       ),
     }),
@@ -2097,9 +2097,13 @@ export default function (pi: ExtensionAPI) {
 // #265/#825 resolution: sub-agents DO get the hatch (verified-file registry
 // bridge, #825) — the branch-ownership guard (M1/M2/M3) is the layer that
 // protects the shared checkout, not env removal.
-      if (params.mcp_servers) {
-        subAgentEnv.PI_MCP_SERVERS = params.mcp_servers;
-      }
+      // #286: children default to PI_MCP_SERVERS=none — a missing allowlist
+      // makes mcp-client eagerly connect ALL non-lazy servers
+      // (classifyServers treats undefined as "load all"), and cold connects
+      // hang ~15min, blocking child startup and starving the heartbeat marker
+      // stream (false first-message cuts). Children opt into servers
+      // explicitly via the mcp_servers param or mid-run mcp_load.
+      subAgentEnv.PI_MCP_SERVERS = params.mcp_servers ?? "none";
 
       const args = ["-p", "--provider", provider, "--model", model, "--no-session", params.prompt];
 
