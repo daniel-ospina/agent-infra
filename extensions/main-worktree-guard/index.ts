@@ -341,7 +341,7 @@ export default function (pi: ExtensionAPI) {
 
     // ── bash: branch-ownership + destructive git ──
     // Marker OR branch covers bash + write + edit in one check point (#266).
-    if (_isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(ctx))) {
+    if (_isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx))) {
       return undefined;
     }
     if (isBash) {
@@ -565,7 +565,7 @@ export default function (pi: ExtensionAPI) {
       // ALLOWED bare `touch <marker>` (own command) reaches here; the recovery
       // git op goes in the FOLLOW-UP call.
       if (isAllowMarkerCommand(command, homedir())) {
-        _stampMarker(_markerPath(), _currentSessionId(ctx), extractMarkerReason(command));
+        _stampMarker(_markerPath(), _currentSessionId(_ctx), extractMarkerReason(command));
         return undefined;
       }
       return undefined;
