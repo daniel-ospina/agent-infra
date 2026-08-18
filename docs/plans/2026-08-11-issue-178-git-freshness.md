@@ -1,7 +1,19 @@
 # Issue #178 — Agent git freshness: never work from stale checkouts
 
 Status: PLAN — scope approved (research round 3 adversarial confirmation: all
-practices verified good; 2×P1 + 1×P2 gaps folded)
+practices verified good; 2×P1 + 1×P2 gaps folded).
+
+> **L2 EXTENSION (2026-08-17):** the dirty+behind case is now AUTO-HEALED when
+> it is *superseded* — every dirty path's content is already on
+> origin/<default> (the "staged work merged upstream via PRs" class). The
+> extension runs a provably-lossless `git reset --hard origin/<default>` and
+> reports `cleaned-superseded`; the divergent class (M/R/T/A statuses, or
+> untracked collisions at origin-tracked paths) is never touched and warns
+> with a pointer to `scripts/stale-main-triage.sh`. Kill-switch:
+> `AGENT_REPO_FRESHNESS_NO_AUTOHEAL=1`. This closes the "agents cannot
+> respond to warnings" gap for the most common stale-main cause (E2: behind +
+> dirty → no-op+warn is now behind + superseded-dirty → auto-clean;
+> behind + divergent-dirty → no-op+warn unchanged).
 Branch: feat/178-git-freshness (cut from origin/main — dogfooding L1)
 Date: 2026-08-11
 Level: project | Complexity: standard | Team: agent-infra
