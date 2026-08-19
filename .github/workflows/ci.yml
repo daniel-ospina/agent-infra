@@ -1,5 +1,7 @@
 name: CI
-# Thin caller — delegates to reusable workflow in agent-infra
+# Thin caller (#303) — delegates to the reusable node-ci workflow in
+# agent-infra. Self-caller keeps @main (locked decision D2: same-commit,
+# no tag-before-merge problem); consumers pin @vX.Y.Z instead.
 # Budget: PR-only (shared Actions budget under daniel-ospina account)
 
 on:

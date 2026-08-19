@@ -1,8 +1,17 @@
 # GitHub Actions workflow templates
 
-Reusable workflow templates for agent-infra and consumer repos (eldato,
-tortoise, premise-labs). Consumer repos symlink or copy these into their
-`.github/workflows/`.
+Reusable workflow templates for agent-infra and consumer repos (tortoise,
+premise-labs, eldato). **Version contract (#303):** consumers call these via a
+thin `ci.yml` pinned to a semver tag — `uses:
+daniel-ospina/agent-infra/.github/workflows/<stack>-ci.yml@vX.Y.Z` — never
+`@main` (only agent-infra's own self-caller uses `@main`).
+
+The published copies in `agent-infra/.github/workflows/` are REAL COMMITTED
+FILES, materialized from these templates by `scripts/sync-ci-workflows.sh`.
+GitHub Actions CANNOT parse symlinked workflow files (#555, verified): the
+loader reads the blob, not the checkout filesystem, so any symlink under
+`.github/workflows/` fails every run at 0 jobs. The `pipeline-compliance`
+`workflow-drift` job enforces template ⇄ copy parity in CI.
 
 Templates:
 - `docs-ci.yml` — markdownlint, lychee link check, doc frontmatter

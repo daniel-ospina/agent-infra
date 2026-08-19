@@ -12,6 +12,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const ciRefCheck = require('../scripts/ci-ref-check.cjs');
 
 // ─── Env / paths ────────────────────────────────────────────────────────────
 
@@ -26,7 +27,6 @@ const EXTENSIONS_SRC = path.join(AGENT_INFRA_PATH, 'extensions');
 const SKILLS_SRC = path.join(AGENT_INFRA_PATH, 'skills');
 const SCRIPTS_SRC = path.join(AGENT_INFRA_PATH, 'scripts');
 const TEMPLATES_SRC = path.join(AGENT_INFRA_PATH, 'templates');
-const CI_SRC = path.join(TEMPLATES_SRC, '.github', 'workflows');
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -91,20 +91,6 @@ function readlinkSafe(p) {
     if (e.code !== 'ENOENT') throw e;
   }
   return null;
-}
-
-/** Detect repo stack from filesystem hints. */
-function detectStack(targetDir) {
-  if (fs.existsSync(path.join(targetDir, 'pyproject.toml')) ||
-      fs.existsSync(path.join(targetDir, 'setup.py')) ||
-      fs.existsSync(path.join(targetDir, 'setup.cfg'))) return 'python';
-  if (fs.existsSync(path.join(targetDir, 'package.json'))) return 'node';
-  return 'docs';
-}
-
-/** Map detected stack to the expected CI template filename. */
-function ciTemplateForStack(stack) {
-  return { python: 'python-ci.yml', node: 'node-ci.yml', docs: 'docs-ci.yml' }[stack];
 }
 
 /** Resolve a symlink target relative to the link's directory. */
@@ -235,8 +221,8 @@ function cmdInit(targetDir) {
       console.log(`   ✅ .husky/`);
     }
 
-    // CI workflow symlinks (detected stack only)
-    _initCISymlinks(manifest, targetDir);
+    // CI workflows (#303): reusable-workflow caller model — no symlinks.
+    _initCI(targetDir);
   }
 
   // ── Write .agent-infra-version ──
@@ -344,8 +330,8 @@ function cmdUpdate() {
       console.log(`   ⏭️  .husky/ (preserved)`);
     }
 
-    // CI workflow symlinks (detected stack only)
-    changes += _updateCISymlinks(manifest, targetDir);
+    // CI workflows (#303): BLOCK on drift, no auto-rewrite (owner decision).
+    changes += _updateCI(targetDir);
   }
 
   // ── .agent-infra-version ──
@@ -540,8 +526,8 @@ function cmdCheck(targetDir) {
       }
     }
 
-    // CI workflow symlinks (detected stack only)
-    ok += _checkCISymlinks(manifest, targetDir, issues);
+    // CI workflows (#303): real-file/pin contract — no symlinks + pin compare.
+    ok += _checkCI(manifest, targetDir, issues);
   }
 
   // ── Check .agent-infra-version ──
@@ -575,84 +561,52 @@ function cmdCheck(targetDir) {
   }
 }
 
-// ─── CI Workflow Helpers ────────────────────────────────────────────────────
+// ─── CI Workflow Helpers (#303 real-file/pin model) ─────────────────────────
+// GitHub Actions CANNOT parse symlinked workflow files (#555): the loader
+// reads the blob, not the checkout filesystem. Reusable workflows are real
+// committed files; consumers pin a semver tag recorded in manifest.json
+// `ci.ref`. `agent-infra check` (ci-ref surface) BLOCKS on a stale pin or on
+// ANY symlink under a consumer's .github/workflows/ (a symlink there is
+// itself a broken-workflow entry). No auto-rewrite (owner decision).
 
-/** _initCISymlinks — create CI symlinks for the detected stack.
- *  Called from cmdInit() inside the templates/ block. */
-function _initCISymlinks(manifest, targetDir) {
-  const ciManifest = manifest.files['templates/.github/workflows/'];
-  if (!ciManifest || ciManifest.kind !== 'symlink' || !Array.isArray(ciManifest.entries)) return;
+/** Warn loudly about symlinks under a consumer's .github/workflows/ (D3). */
+function warnCISymlinks(targetDir) {
+  const symlinks = ciRefCheck.findWorkflowSymlinks(targetDir);
+  for (const f of symlinks) {
+    console.log(`   ⚠️  ${path.relative(targetDir, f)} — SYMLINK (invalid on GitHub Actions, #555) — replace with a real file`);
+  }
+  return symlinks.length;
+}
 
-  const stack = detectStack(targetDir);
-  const expectedFile = ciTemplateForStack(stack);
-  const ciDest = path.join(targetDir, '.github', 'workflows');
-  ensureDir(ciDest);
-
-  for (const entry of ciManifest.entries) {
-    if (entry !== expectedFile) continue;
-    const src = path.join(CI_SRC, entry);
-    const dest = path.join(ciDest, entry);
-    if (!fs.existsSync(src)) {
-      console.log(`\n🔧 CI Workflows:\n   ⚠️  Source missing: ${entry}`);
-      return;
-    }
-    if (resolveLink(dest) === null && fs.existsSync(dest)) {
-      console.log(`\n🔧 CI Workflows:\n   ⚠️  ${entry} exists as local file — skipping (diverged repo)`);
-      return;
-    }
-    // Use relative symlink so CI runners can resolve within the same checkout
-    const relativeSrc = path.relative(path.dirname(dest), src);
-    removeIfExists(dest);
-    fs.symlinkSync(relativeSrc, dest);
-    console.log(`\n🔧 CI Workflows:\n   ✅ ${entry} → ${relativeSrc} (${stack} stack)`);
+/** _initCI — called from cmdInit(). No symlink creation (D3). */
+function _initCI(targetDir) {
+  const n = warnCISymlinks(targetDir);
+  if (n > 0) {
+    console.log(`\n🔧 CI Workflows:\n   ⚠️  ${n} symlink(s) under .github/workflows/ — symlinked workflows are invalid on GitHub Actions (#555). Replace with real files.`);
+  } else {
+    console.log(`\n🔧 CI Workflows:\n   ✅ no symlinks under .github/workflows/ (real-file contract, #303)`);
   }
 }
 
-/** _updateCISymlinks — refresh CI symlinks for the detected stack.
- *  Called from cmdUpdate() inside the templates/ block.
- *  Returns the number of changes made. */
-function _updateCISymlinks(manifest, targetDir) {
-  const ciManifest = manifest.files['templates/.github/workflows/'];
-  if (!ciManifest || ciManifest.kind !== 'symlink' || !Array.isArray(ciManifest.entries)) return 0;
-
-  let changes = 0;
-  const stack = detectStack(targetDir);
-  const expectedFile = ciTemplateForStack(stack);
-  const ciDest = path.join(targetDir, '.github', 'workflows');
-  ensureDir(ciDest);
-
-  for (const entry of ciManifest.entries) {
-    if (entry !== expectedFile) continue;
-    const src = path.join(CI_SRC, entry);
-    const dest = path.join(ciDest, entry);
-    if (!fs.existsSync(src)) {
-      console.log(`   ⚠️  CI template missing: ${entry}`);
-      continue;
-    }
-    const current = resolveLink(dest);
-    if (current === null && fs.existsSync(dest)) {
-      // Local file — diverged repo, don't overwrite
-      console.log(`   ⚠️  ${entry} is a local file (diverged) — skipping`);
-      continue;
-    }
-    if (current !== src) {
-      const relativeSrc = path.relative(path.dirname(dest), src);
-      removeIfExists(dest);
-      fs.symlinkSync(relativeSrc, dest);
-      console.log(`   🔄 ${entry} → ${relativeSrc}`);
-      changes++;
-    }
+/** _updateCI — called from cmdUpdate(). BLOCK on symlinks; never auto-rewrite pins. */
+function _updateCI(targetDir) {
+  const n = warnCISymlinks(targetDir);
+  if (n > 0) {
+    console.log(`   ⚠️  ${n} symlink(s) under .github/workflows/ — replace with real files before committing (#555)`);
+  } else {
+    console.log(`   ✅ CI: no symlinks under .github/workflows/ (#303)`);
   }
-  return changes;
+  // ci-ref pins are NOT auto-rewritten (owner decision #303): a stale pin
+  // must be bumped explicitly — `agent-infra check` reports and blocks.
+  return 0;
 }
 
-/** _checkCISymlinks — validate CI symlinks for the detected stack.
- *  Called from cmdCheck() inside the templates/ block.
- *  NOTE: Pushes to issues[] and increments ok directly (by reference). */
-function _checkCISymlinks(manifest, targetDir, issues) {
-  const ciManifest = manifest.files['templates/.github/workflows/'];
-  if (!ciManifest || ciManifest.kind !== 'symlink' || !Array.isArray(ciManifest.entries)) return 0;
-
+/** _checkCI — called from cmdCheck(). Pushes issues[] (exit 1 on any).
+ *  D3: zero symlinks under .github/workflows/.
+ *  D2/D6: consumer pins must equal manifest ci.ref (agent-infra itself uses
+ *  @main for its self-caller and is exempt from the pin compare).
+ *  Returns the count of green items. */
+function _checkCI(manifest, targetDir, issues) {
   const repoName = path.basename(targetDir);
   const skipRepos = ['eldato-outreach'];
   const ciDest = path.join(targetDir, '.github', 'workflows');
@@ -664,34 +618,39 @@ function _checkCISymlinks(manifest, targetDir, issues) {
   }
 
   console.log('\n🔧 CI Workflows:');
-  const stack = detectStack(targetDir);
-  const expectedFile = ciTemplateForStack(stack);
 
-  for (const entry of ciManifest.entries) {
-    if (entry !== expectedFile) continue;
-    const src = path.join(CI_SRC, entry);
-    const dest = path.join(ciDest, entry);
+  // D3 — no symlinks (any symlink = broken workflow entry on GitHub Actions).
+  const symlinks = ciRefCheck.findWorkflowSymlinks(targetDir);
+  if (symlinks.length > 0) {
+    for (const f of symlinks) {
+      issues.push({ type: 'ci', entry: path.relative(targetDir, f), reason: 'symlink under .github/workflows/ — invalid on GitHub Actions (#555), replace with a real file' });
+      console.log(`   ❌ ${path.relative(targetDir, f)} — symlink (invalid, #555)`);
+    }
+  } else {
+    ok++;
+    console.log(`   ✅ .github/workflows/ — no symlinks (real-file contract)`);
+  }
 
-    if (!fs.existsSync(src)) {
-      issues.push({ type: 'ci', entry, reason: 'source template missing from agent-infra' });
-      console.log(`   ❌ ${entry} — source template missing`);
-    } else if (!fs.existsSync(dest)) {
-      issues.push({ type: 'ci', entry, reason: 'missing — run agent-infra init' });
-      console.log(`   ❌ ${entry} — missing`);
+  // D2/D6 — pin compare (skip for agent-infra itself: @main self-caller is
+  // the locked design; consumers must pin @vX.Y.Z).
+  const ci = manifest.ci;
+  const selfRepo = targetDir === AGENT_INFRA_PATH;
+  if (!selfRepo && !fs.existsSync(ciDest)) {
+    issues.push({ type: 'ci-ref', entry: 'ci.yml', reason: 'no .github/workflows/ — run agent-infra init' });
+    console.log(`   ❌ ci.yml — missing (no .github/workflows/)`);
+  } else if (selfRepo) {
+    console.log(`   ℹ️  ${repoName} — source repo (@main self-caller, pin compare skipped)`);
+  } else if (!ci || !ci.ref) {
+    console.log(`   ⚠️  manifest.json has no ci.ref (old manifest) — pin compare skipped`);
+  } else {
+    const drift = ciRefCheck.checkCiRefs(targetDir, ci.ref);
+    if (drift.length === 0) {
+      ok++;
+      console.log(`   ✅ ci-ref — all agent-infra pins @${ci.ref}`);
     } else {
-      const linkTarget = readlinkSafe(dest);
-      if (linkTarget === null) {
-        issues.push({ type: 'ci', entry, reason: 'local file (not symlinked) — run agent-infra update to restore' });
-        console.log(`   ⚠️  ${entry} — local file (not symlinked)`);
-      } else {
-        const resolved = path.resolve(path.dirname(dest), linkTarget);
-        if (resolved !== src) {
-          issues.push({ type: 'ci', entry, reason: `stale symlink: points to ${resolved}, expected ${src}` });
-          console.log(`   ⚠️  ${entry} — stale (→ ${linkTarget})`);
-        } else {
-          ok++;
-          console.log(`   ✅ ${entry} (${stack} stack)`);
-        }
+      for (const d of drift) {
+        issues.push({ type: 'ci-ref', entry: d.file, reason: `pinned @${d.ref}, expected @${d.expected} — run agent-infra update to learn the bump, then edit the uses: ref (no auto-rewrite)` });
+        console.log(`   ❌ ${d.file} — pinned @${d.ref}, expected @${d.expected}`);
       }
     }
   }
@@ -707,7 +666,7 @@ function usage() {
 Commands:
   init <repo>    Bootstrap a repo with symlinks + templates
   update          Refresh symlinks, preserve local files
-  check [repo]    Verify symlinks match manifest.json
+  check [repo]    Verify symlinks + version + CI pin (ci-ref) match manifest.json
 
 Env:
   AGENT_INFRA_PATH   Path to the agent-infra repo (default: parent of this script)`);

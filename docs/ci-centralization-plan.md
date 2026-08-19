@@ -17,7 +17,7 @@ governingAgreement: eldato#7535
 
 > **Epic:** [#7535](https://github.com/lil-lawyer/eldato/issues/7535) — Agent process infrastructure for epistemic repos
 > **Phase:** 3 (replaces ad-hoc CI)
-> **Design Direction (LOCKED):** Hybrid approach — CI execution via **GitHub reusable workflows** (`on: workflow_call`) hosted in `agent-infra/.github/workflows/`, called by thin `ci.yml` callers in each repo. Templates live in `agent-infra/templates/.github/workflows/` and are **symlinked** into each repo for `agent-infra check` drift detection (same pattern as extensions and skills). Local dev/check uses symlinks; CI execution uses reusable workflows.
+> **Design Direction (LOCKED, revised 2026-08-19 by #303):** CI execution via **GitHub reusable workflows** (`on: workflow_call`) hosted in `agent-infra/.github/workflows/`, called by thin `ci.yml` callers in each repo pinned to a **semver tag** (`@vX.Y.Z`). The reusable workflows are **REAL COMMITTED FILES** materialized from `agent-infra/templates/.github/workflows/` by `scripts/sync-ci-workflows.sh` — **no symlinks anywhere under `.github/workflows/`** (GitHub Actions reads symlinks as their link-target string, so a symlinked workflow fails every run at 0 jobs — #555 root cause, verified). The original symlink-based design below is kept as the historical record; locked decisions D1–D7 in [issue #303](https://github.com/daniel-ospina/agent-infra/issues/303) supersede it.
 
 ---
 
@@ -44,13 +44,19 @@ The root cause isn't duplication (only ~60 lines total across 2 repos testing en
 | Per-stack templates are the right granularity | **Validated** — 3 stacks, 3 templates, ~30 lines each |
 | Symlinks propagate template updates automatically | **Validated** — same mechanism as extensions/skills. Tested: `agent-infra update` refreshes symlinks. |
 
-### Success Criteria (Definition of Done)
+### Success Criteria (Definition of Done — revised 2026-08-19, #303 D7)
 
-1. All 3 repos (tortoise, premise-labs, agent-infra) have CI symlinked from agent-infra templates
-2. `agent-infra check` passes on all 3 repos (symlinks present + valid)
-3. Per-stack template documentation exists in `agent-infra/templates/.github/README.md`
-4. `agent-infra update` refreshes CI symlinks on all repos
-5. premise-labs has CI for the first time (markdown lint + link check)
+> The original DoD below (symlinked CI in consumer repos) is **impossible as designed**:
+> any symlink under `.github/workflows/` is itself a broken-workflow entry to GitHub
+> Actions (#555 — cross-repo, same-repo, and workflow-discovery variants all fail at
+> 0 jobs). Superseded by the real-file/pin design:
+
+1. `agent-infra/.github/workflows/{python,node,docs}-ci.yml` are **real committed files** (zero symlinks under any `.github/workflows/` in scope); agent-infra's own PR CI (thin caller, `@main` self-caller) runs real jobs — no "workflow file issue"/"error parsing called workflow" runs.
+2. ≥2 consumers (tortoise, premise-labs) have a thin `ci.yml` calling `daniel-ospina/agent-infra/.github/workflows/<stack>-ci.yml@vX.Y.Z`; repo-specific jobs (test matrix, migrations, service containers) remain local siblings; no workflow symlinks in consumers.
+3. A workflow change in agent-infra lands in consumers by **version bump** (tag + manifest `ci.ref` + pin edit) — no manual copying; `agent-infra check` (ci-ref surface) reports and **blocks** on a stale pin.
+4. Pin-drift detection exists and fires on a stale pin: `agent-infra check` ci-ref compare vs `manifest.json ci.ref`, exit 1 on mismatch (composes with the #305 drift-check workflow).
+5. Template ⇄ copy parity is CI-enforced (pipeline-compliance `workflow-drift` job).
+6. `docs/ci-centralization-plan.md` DoD reflects the real-file/pin design (this section) and is met.
 
 ---
 
