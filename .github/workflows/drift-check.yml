@@ -50,6 +50,10 @@ on:
         type: string
         default: ''
         description: Override the check command (advanced — must exit 0 to pass)
+    secrets:
+      AGENT_INFRA_READ_TOKEN:
+        required: false
+        description: "PAT / fine-grained token with read access to daniel-ospina/agent-infra — REQUIRED when the consumer repo is private (the caller's GITHUB_TOKEN cannot read a private agent-infra). Name the secret AGENT_INFRA_READ_TOKEN in the consumer repo and wire it with secrets: inherit."
 
 permissions:
   contents: read
@@ -70,6 +74,10 @@ jobs:
           repository: daniel-ospina/agent-infra
           ref: ${{ inputs.agent-infra-ref }}
           path: .agent-infra
+          # Private consumer repos cannot read daniel-ospina/agent-infra with
+          # the caller's GITHUB_TOKEN — the consumer sets an
+          # AGENT_INFRA_READ_TOKEN secret (secrets: inherit) when required.
+          token: ${{ secrets.AGENT_INFRA_READ_TOKEN || github.token }}
 
       - name: Run agent-infra check (CI mode)
         id: drift
@@ -81,10 +89,13 @@ jobs:
           # name `consumer`, so pass the real repo name explicitly.
           AGENT_INFRA_REPO_NAME: ${{ github.event.repository.name }}
         run: |
-          if [ -n "${{ inputs.check-command }}" ]; then
-            ${{ inputs.check-command }}; code=$?
+          cmd="${{ inputs.check-command }}"
+          if [ -n "$cmd" ]; then
+            bash -c "$cmd"
+            code=$?
           else
-            node "$AGENT_INFRA_PATH/bin/agent-infra.js" check . --ci; code=$?
+            node "$AGENT_INFRA_PATH/bin/agent-infra.js" check . --ci
+            code=$?
           fi
           echo "drift_exit=$code" >> "$GITHUB_OUTPUT"
           exit 0
