@@ -58,6 +58,8 @@ The root cause isn't duplication (only ~60 lines total across 2 repos testing en
 5. Template ⇄ copy parity is CI-enforced (pipeline-compliance `workflow-drift` job).
 6. `docs/ci-centralization-plan.md` DoD reflects the real-file/pin design (this section) and is met.
 
+> **Known limitation (verified 2026-08-19):** the same-account access rule applies **only to private caller repos**. GitHub blocks public repositories from calling reusable workflows in private repos (agent-infra Actions → General → Access: "access is allowed only from private repositories"). tortoise is public → its thin caller fails with "workflow was not found" at 0 jobs; premise-labs (private) resolves the same `@v0.1.0` ref fine. tortoise migration unblocks when the owner chooses: make agent-infra public, move the reusable workflows to a dedicated public repo, or make tortoise private.
+
 ---
 
 ## Solution Design
