@@ -2,6 +2,10 @@
 
 Centralized agent infrastructure for Premise Labs repos. Extensions, skills, and scripts used by `tortoise`, `premise-labs`, and `eldato`.
 
+## Source-Available Notice
+
+This repository is **source-available**: it is published publicly for viewing purposes only and is **not** open source. All rights are reserved by the owner. **No license is granted** — you may read and view the code via GitHub's public access, but you have **no right to copy, modify, redistribute, sublicense, or use it commercially** (or for any other purpose) without explicit written permission from the owner. No license file is included by design; absence of a license means default copyright protection applies.
+
 ## Structure
 
 ```
