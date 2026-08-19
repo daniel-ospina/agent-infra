@@ -9,11 +9,12 @@ on:
 
 jobs:
   ci:
-    # During review: point at this branch — main's node-ci.yml is still a
-    # symlink until this PR merges (#555: GitHub cannot parse symlinked
-    # workflow files → 0-job 'workflow file issue'). Flip back to @main
-    # after merge (real file lands on main).
-    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@feat/303-ci-central
+    # node-ci.yml is materialized as a REAL file on this branch — GitHub
+    # Actions cannot parse symlinked workflow files (#555); main's copy is
+    # still a symlink, so the self-caller points at this branch during review.
+    # Flip back to @main after merge (real file lands on main). #303 syncs
+    # the full set via scripts/sync-ci-workflows.sh.
+    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@feat/305-drift-ci
     secrets: inherit
 
   drift-check:
