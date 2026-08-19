@@ -9,5 +9,9 @@ on:
 
 jobs:
   ci:
-    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
+    # During review: point at this branch — main's node-ci.yml is still a
+    # symlink until this PR merges (#555: GitHub cannot parse symlinked
+    # workflow files → 0-job 'workflow file issue'). Flip back to @main
+    # after merge (real file lands on main).
+    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@feat/303-ci-central
     secrets: inherit
