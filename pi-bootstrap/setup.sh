@@ -211,6 +211,38 @@ else
   echo "    skills copied ($(ls "$DEST/skills" | wc -l | tr -d ' ') items)"
 fi
 
+# Scripts farm (checkout-hygiene): symlink the launchd scripts the plist
+# jobs invoke (corruption-canary + hub-state-check convention, #304). Keeps
+# repo symlinks (updates flow via git pull) like the skills farm; replaces
+# stale/foreign links with fresh ones. Test files and plist templates are
+# not farmed (tests don't ship; plists are rendered from templates/launchd).
+SCRIPTS_SRC="$INFRA_ROOT/scripts/checkout-hygiene"
+if [ -d "$SCRIPTS_SRC" ]; then
+  mkdir -p "$DEST/scripts/checkout-hygiene"
+  linked=0; kept_farm=0
+  for f in "$SCRIPTS_SRC"/*; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    case "$base" in
+      *.plist|*.test.*) continue ;;
+    esac
+    dest="$DEST/scripts/checkout-hygiene/$base"
+    if [ -L "$dest" ]; then
+      dest_resolved="$(resolve_path "$dest")"
+      repo_resolved="$(resolve_path "$f")"
+      if [ -n "$dest_resolved" ] && [ -n "$repo_resolved" ] && [ "$dest_resolved" = "$repo_resolved" ]; then
+        kept_farm=$((kept_farm+1))
+        continue
+      fi
+      echo "    replacing stale/foreign scripts symlink: $base"
+      rm -f "$dest"
+    fi
+    ln -s "$f" "$dest"
+    linked=$((linked+1))
+  done
+  echo "    scripts/checkout-hygiene farm: $linked linked, $kept_farm kept"
+fi
+
 # Wire shell profile (idempotent): auto-sync env + optional keys file
 ZSHRC="$HOME/.zshrc"
 [ -f "$ZSHRC" ] || touch "$ZSHRC"
@@ -248,6 +280,22 @@ if [ "$TORTOISE_HOME_SET" -eq 1 ]; then
   echo "    MCP: tortoise will use TORTOISE_HOME for its local MCP server"
 else
   echo "    note: TORTOISE_HOME not set and no tortoise checkout found — tortoise MCP server unavailable until set"
+fi
+
+# Launchd agents (idempotent, #304): install the versioned plist templates
+# (hub-state-check + corruption-canary). The installer renders → diffs vs the
+# installed plist → skips when identical, reloads on change — safe on every
+# run. Broken script targets fail loudly (non-zero) but don't abort setup:
+# the message + --status are the diagnostic. macOS only (launchctl).
+if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/install-launchd.sh" ]; then
+  echo ""
+  echo "==> Launchd agents"
+  if bash "$INFRA_ROOT/scripts/install-launchd.sh"; then
+    echo "    launchd: in sync (see --status for detail)"
+  else
+    echo "    WARNING: launchd install reported failures (see above) — run:"
+    echo "      $INFRA_ROOT/scripts/install-launchd.sh --status"
+  fi
 fi
 
 echo ""

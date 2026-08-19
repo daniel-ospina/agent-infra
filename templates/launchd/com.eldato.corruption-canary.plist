@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- corruption-canary (#6689): detect a recurrence of the mass-replace
+         corruption class over the shared checkout, every 15 min. Canonical
+         script: agent-infra/scripts/checkout-hygiene/corruption_canary.py
+         (installed to ~/.pi/agent/scripts/checkout-hygiene/).
+         Rendered by scripts/install-launchd.sh (#304) — {{PYTHON_BIN}},
+         {{HOME}}, {{SWARM_ROOT}} placeholders only, no machine-specific
+         paths. The swarm root is the checkout the canary watches. -->
+    <key>Label</key>
+    <string>com.eldato.corruption-canary</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON_BIN}}</string>
+        <string>{{HOME}}/.pi/agent/scripts/checkout-hygiene/corruption_canary.py</string>
+        <string>--root</string>
+        <string>{{SWARM_ROOT}}</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/corruption-canary.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/corruption-canary.log</string>
+</dict>
+</plist>
