@@ -1,1 +1,67 @@
-../../templates/.github/workflows/docs-ci.yml
+name: Docs CI
+# Reusable workflow — Documentation CI (markdownlint, lychee link check, frontmatter)
+# Source: agent-infra/templates/.github/workflows/docs-ci.yml
+# Called via: uses: daniel-ospina/agent-infra/.github/workflows/docs-ci.yml@<ref>
+# Version contract (#303): consumers pin a semver tag (e.g. @v0.1.0). A
+# workflow change lands in consumers by an explicit version bump — never @main.
+# Materialized to .github/workflows/ by scripts/sync-ci-workflows.sh (real
+# files only — GitHub Actions CANNOT parse symlinked workflow files, #555).
+# Budget: PR-only (shared Actions budget under daniel-ospina account)
+#
+# Inputs:
+#   markdownlint-command  markdownlint invocation (repo config respected in CWD).
+#                         '' = skip the markdownlint job.
+#   link-check-args       lychee args. '' = skip the link-check job.
+#   frontmatter-command   doc frontmatter validator invocation. '' = skip.
+#   node-version          Node version for setup-node.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '22'
+      markdownlint-command:
+        type: string
+        default: "npx markdownlint-cli '**/*.md' --ignore node_modules --ignore .git"
+      link-check-args:
+        type: string
+        default: "--no-progress './**/*.md'"
+      frontmatter-command:
+        type: string
+        default: 'node scripts/check-doc-affiliation.cjs --all'
+
+jobs:
+  markdownlint:
+    runs-on: ubuntu-latest
+    if: inputs.markdownlint-command != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - run: ${{ inputs.markdownlint-command }}
+
+  link-check:
+    runs-on: ubuntu-latest
+    if: inputs.link-check-args != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: ${{ inputs.link-check-args }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  frontmatter:
+    runs-on: ubuntu-latest
+    if: inputs.frontmatter-command != ''
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate doc frontmatter
+        run: |
+          if [ -f scripts/check-doc-affiliation.cjs ]; then
+            ${{ inputs.frontmatter-command }}
+          else
+            echo "⚠️  scripts/check-doc-affiliation.cjs not found — skipping"
+          fi

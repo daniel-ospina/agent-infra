@@ -61,3 +61,34 @@ jobs:
             exit 2
           fi
           bash scripts/check-pipeline-compliance.sh
+
+  workflow-drift:
+    # #303 drift guard — reusable workflows must be REAL COMMITTED FILES in
+    # .github/workflows/, materialized from templates/ by
+    # scripts/sync-ci-workflows.sh. GitHub Actions CANNOT parse symlinked
+    # workflow files (#555): the loader reads the blob, not the checkout
+    # filesystem. This job fails on (a) a template edit without
+    # materialization, or (b) any symlink under .github/workflows/.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reusable workflows match templates
+        run: |
+          failures=0
+          for f in python-ci.yml node-ci.yml docs-ci.yml; do
+            if ! diff -q "templates/.github/workflows/$f" ".github/workflows/$f" >/dev/null 2>&1; then
+              echo "::error::$f differs from templates/.github/workflows/$f — edit the template, then run scripts/sync-ci-workflows.sh and commit the materialized copy"
+              failures=$((failures+1))
+            fi
+          done
+          if [ "$failures" -gt 0 ]; then exit 1; fi
+          echo "✅ all reusable workflows match templates"
+      - name: No symlinks under .github/workflows
+        run: |
+          SYMLINKS=$(find .github/workflows -type l | wc -l | tr -d ' ')
+          if [ "$SYMLINKS" -ne 0 ]; then
+            find .github/workflows -type l
+            echo "::error::symlinks under .github/workflows/ are invalid on GitHub Actions (#555) — replace with real files"
+            exit 1
+          fi
+          echo "✅ no symlinks under .github/workflows"

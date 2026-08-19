@@ -28,6 +28,9 @@ jobs:
       - name: Run extension tests
         run: |
           failures=0
+          # #303 — pin-drift unit tests for the ci-ref check (bin/agent-infra.js surface).
+          echo "== scripts/ci-ref-check.test.mjs =="
+          node scripts/ci-ref-check.test.mjs || failures=$((failures+1))
           for t in extensions/*/test*.mjs; do
             [ -f "$t" ] || continue
             echo "== $t =="
