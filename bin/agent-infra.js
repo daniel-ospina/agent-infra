@@ -8,6 +8,9 @@
 //   init <repo>   Bootstrap a repo with symlinks + templates
 //   update         Refresh symlinks, preserve local files, report version
 //   check [repo]   Verify symlinks match manifest.json
+//                  --ci  CI mode: tiered drift gate — structural drift fails
+//                        (exit 1), content drift warns (exit 0), machine-local
+//                        surfaces skipped/informational (#305)
 
 const fs = require('fs');
 const path = require('path');
@@ -27,6 +30,7 @@ const EXTENSIONS_SRC = path.join(AGENT_INFRA_PATH, 'extensions');
 const SKILLS_SRC = path.join(AGENT_INFRA_PATH, 'skills');
 const SCRIPTS_SRC = path.join(AGENT_INFRA_PATH, 'scripts');
 const TEMPLATES_SRC = path.join(AGENT_INFRA_PATH, 'templates');
+const CI_SRC = path.join(TEMPLATES_SRC, '.github', 'workflows');
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -91,6 +95,20 @@ function readlinkSafe(p) {
     if (e.code !== 'ENOENT') throw e;
   }
   return null;
+}
+
+/** Detect repo stack from filesystem hints. */
+function detectStack(targetDir) {
+  if (fs.existsSync(path.join(targetDir, 'pyproject.toml')) ||
+      fs.existsSync(path.join(targetDir, 'setup.py')) ||
+      fs.existsSync(path.join(targetDir, 'setup.cfg'))) return 'python';
+  if (fs.existsSync(path.join(targetDir, 'package.json'))) return 'node';
+  return 'docs';
+}
+
+/** Map detected stack to the expected CI template filename. */
+function ciTemplateForStack(stack) {
+  return { python: 'python-ci.yml', node: 'node-ci.yml', docs: 'docs-ci.yml' }[stack];
 }
 
 /** Resolve a symlink target relative to the link's directory. */
@@ -221,7 +239,7 @@ function cmdInit(targetDir) {
       console.log(`   ✅ .husky/`);
     }
 
-    // CI workflows (#303): reusable-workflow caller model — no symlinks.
+    // CI workflow symlinks (detected stack only)
     _initCI(targetDir);
   }
 
@@ -330,7 +348,7 @@ function cmdUpdate() {
       console.log(`   ⏭️  .husky/ (preserved)`);
     }
 
-    // CI workflows (#303): BLOCK on drift, no auto-rewrite (owner decision).
+    // CI workflow symlinks (detected stack only)
     changes += _updateCI(targetDir);
   }
 
@@ -352,55 +370,80 @@ function cmdUpdate() {
   }
 }
 
+/** Classify a non-matching symlink target.
+ *  'machine-local' — committed absolute/escaping path, unverifiable on a CI
+ *  runner (the normal state of a consumer's committed symlinks).
+ *  'stale' — resolves inside the repo tree (a genuinely rotted relative link). */
+function classifyUnresolved(linkTarget, resolved, targetDir) {
+  const external = path.isAbsolute(linkTarget) || path.relative(targetDir, resolved).startsWith('..');
+  return external ? 'machine-local' : 'stale';
+}
+
 /** check [targetDir] — verify symlinks match manifest.json */
-function cmdCheck(targetDir) {
+function cmdCheck(targetDir, ciMode) {
   targetDir = targetDir ? path.resolve(targetDir) : process.cwd();
 
   const manifest = loadManifest();
   const version = manifest.version;
+  // Repo identity for exemptions + summary. In CI the checkout dir is a fixed
+  // name (drift-check.yml checks out to ./consumer), so the real repo name is
+  // passed via AGENT_INFRA_REPO_NAME; locally it is the target dir's basename.
+  const repoName = process.env.AGENT_INFRA_REPO_NAME || path.basename(targetDir);
+  // Manifest-driven exemptions (#305): manifest.check.exemptions[<repo>] lists
+  // surfaces to skip for this repo (unlinked consumers, self-contained CI, ...).
+  // NOTE: exemptions apply in BOTH local and CI mode — they replace the old
+  // hardcoded eldato-outreach skip, which was also mode-independent.
+  const exemptList = ((manifest.check && manifest.check.exemptions) || {})[repoName] || [];
+  const exempted = (surface) => exemptList.includes(surface);
 
-  console.log(`🔍 Checking agent-infra v${version}`);
+  console.log(`🔍 Checking agent-infra v${version}${ciMode ? ' (CI mode)' : ''}`);
   console.log(`   agent-infra at: ${AGENT_INFRA_PATH}`);
   console.log(`   target: ${targetDir}\n`);
 
-  const issues = [];
+  const issues = []; // { type, entry, reason, tier: 'fail' | 'warn' | 'info' }
   let ok = 0;
 
-  // ── Check extensions ──
-  const extManifest = manifest.files['extensions/'];
-  if (extManifest && Array.isArray(extManifest.entries)) {
-    console.log('📦 Extensions:');
-    for (const rawEntry of extManifest.entries) {
-      const entry = rawEntry.replace(/\/+$/, '');
-      const expectedSrc = path.join(EXTENSIONS_SRC, entry);
-      const linkPath = path.join(PI_EXTENSIONS, entry);
+  // ── Check extensions ── (machine-local ~/.pi farm — skipped in CI mode)
+  if (ciMode) {
+    console.log('   ⏭️  Extensions — skipped in CI mode (machine-local; owned by the local pre-commit gate)');
+  } else {
+    const extManifest = manifest.files['extensions/'];
+    if (extManifest && Array.isArray(extManifest.entries)) {
+      console.log('📦 Extensions:');
+      for (const rawEntry of extManifest.entries) {
+        const entry = rawEntry.replace(/\/+$/, '');
+        const expectedSrc = path.join(EXTENSIONS_SRC, entry);
+        const linkPath = path.join(PI_EXTENSIONS, entry);
 
-      if (!fs.existsSync(expectedSrc)) {
-        issues.push({ type: 'extensions', entry, reason: `source missing: ${expectedSrc}` });
-        console.log(`   ❌ ${entry} — source missing`);
-        continue;
-      }
+        if (!fs.existsSync(expectedSrc)) {
+          issues.push({ type: 'extensions', entry, reason: `source missing: ${expectedSrc}` });
+          console.log(`   ❌ ${entry} — source missing`);
+          continue;
+        }
 
-      const linkTarget = readlinkSafe(linkPath);
-      if (linkTarget === null) {
-        issues.push({ type: 'extensions', entry, reason: `not a symlink (or missing): ${linkPath}` });
-        console.log(`   ❌ ${entry} — not symlinked`);
-        continue;
-      }
+        const linkTarget = readlinkSafe(linkPath);
+        if (linkTarget === null) {
+          issues.push({ type: 'extensions', entry, reason: `not a symlink (or missing): ${linkPath}` });
+          console.log(`   ❌ ${entry} — not symlinked`);
+          continue;
+        }
 
-      const resolved = path.resolve(path.dirname(linkPath), linkTarget);
-      if (resolved !== expectedSrc) {
-        issues.push({ type: 'extensions', entry, reason: `points to ${resolved}, expected ${expectedSrc}` });
-        console.log(`   ⚠️  ${entry} — stale (→ ${linkTarget})`);
-      } else {
-        ok++;
-        console.log(`   ✅ ${entry}`);
+        const resolved = path.resolve(path.dirname(linkPath), linkTarget);
+        if (resolved !== expectedSrc) {
+          issues.push({ type: 'extensions', entry, reason: `points to ${resolved}, expected ${expectedSrc}` });
+          console.log(`   ⚠️  ${entry} — stale (→ ${linkTarget})`);
+        } else {
+          ok++;
+          console.log(`   ✅ ${entry}`);
+        }
       }
     }
   }
 
-  // ── Check skills ──
-  if (manifest.files['skills/']) {
+  // ── Check skills ── (machine-local — skipped in CI mode)
+  if (ciMode) {
+    console.log('   ⏭️  Skills — skipped in CI mode (machine-local; owned by the local pre-commit gate)');
+  } else if (manifest.files['skills/']) {
     const expected = SKILLS_SRC;
     if (!fs.existsSync(expected)) {
       issues.push({ type: 'skills', reason: `source missing: ${expected}` });
@@ -427,8 +470,10 @@ function cmdCheck(targetDir) {
   // ── Check scripts (in target repo) ──
   if (manifest.files['scripts/']) {
     const scriptsDest = path.join(targetDir, 'scripts');
-    if (!fs.existsSync(SCRIPTS_SRC)) {
-      issues.push({ type: 'scripts', reason: `source missing: ${SCRIPTS_SRC}` });
+    if (exempted('scripts')) {
+      console.log(`\n🔧 Scripts:\n   ⏭️  scripts/ — exempted via manifest check.exemptions`);
+    } else if (!fs.existsSync(SCRIPTS_SRC)) {
+      issues.push({ type: 'scripts', tier: 'fail', reason: `source missing: ${SCRIPTS_SRC}` });
       console.log(`\n🔧 Scripts:\n   ❌ scripts/ — source missing`);
     } else {
       console.log(`\n🔧 Scripts:`);
@@ -436,19 +481,24 @@ function cmdCheck(targetDir) {
       if (linkTarget === null) {
         // Only flag as issue if this is a target repo check (not agent-infra itself)
         if (targetDir !== AGENT_INFRA_PATH) {
-          issues.push({ type: 'scripts', reason: `not symlinked: ${scriptsDest}` });
+          issues.push({ type: 'scripts', tier: 'fail', reason: `not symlinked: ${scriptsDest}` });
           console.log(`   ❌ scripts/ — not symlinked`);
         } else {
           console.log(`   ℹ️  scripts/ — source repo (no symlink needed)`);
         }
       } else {
         const resolved = path.resolve(path.dirname(scriptsDest), linkTarget);
-        if (resolved !== SCRIPTS_SRC) {
-          issues.push({ type: 'scripts', reason: `points to ${resolved}, expected ${SCRIPTS_SRC}` });
-          console.log(`   ⚠️  scripts/ — stale (→ ${linkTarget})`);
-        } else {
+        if (resolved === SCRIPTS_SRC) {
           ok++;
           console.log(`   ✅ scripts/`);
+        } else if (ciMode && !fs.existsSync(resolved) && classifyUnresolved(linkTarget, resolved, targetDir) === 'machine-local') {
+          // Committed absolute symlinks point at a machine-local agent-infra
+          // checkout — unverifiable on the CI runner, not propagation drift.
+          issues.push({ type: 'scripts', tier: 'info', reason: `symlink target machine-local (${linkTarget}) — unverifiable on CI runner` });
+          console.log(`   ℹ️  scripts/ — symlink → ${linkTarget} (machine-local, unverifiable in CI)`);
+        } else {
+          issues.push({ type: 'scripts', tier: 'fail', reason: `points to ${resolved}, expected ${SCRIPTS_SRC}` });
+          console.log(`   ⚠️  scripts/ — stale (→ ${linkTarget})`);
         }
       }
     }
@@ -461,15 +511,19 @@ function cmdCheck(targetDir) {
     // AGENTS.md
     const agentsDest = path.join(targetDir, 'AGENTS.md');
     const agentsSrc = path.join(TEMPLATES_SRC, 'AGENTS.base.md');
-    if (!fs.existsSync(agentsDest)) {
-      issues.push({ type: 'templates', entry: 'AGENTS.md', reason: 'missing' });
+    if (exempted('templates/AGENTS.md')) {
+      console.log(`   ⏭️  AGENTS.md — exempted via manifest check.exemptions`);
+    } else if (!fs.existsSync(agentsDest)) {
+      issues.push({ type: 'templates', entry: 'AGENTS.md', tier: 'fail', reason: 'missing' });
       console.log(`   ❌ AGENTS.md — missing`);
     } else if (!fs.existsSync(agentsSrc)) {
-      issues.push({ type: 'templates', entry: 'AGENTS.md', reason: 'source missing: AGENTS.base.md' });
+      issues.push({ type: 'templates', entry: 'AGENTS.md', tier: 'fail', reason: 'source missing: AGENTS.base.md' });
       console.log(`   ❌ AGENTS.md — source missing`);
     } else if (!filesEqual(agentsDest, agentsSrc)) {
-      issues.push({ type: 'templates', entry: 'AGENTS.md', reason: 'differs from AGENTS.base.md' });
-      console.log(`   ⚠️  AGENTS.md — differs from base`);
+      issues.push({ type: 'templates', entry: 'AGENTS.md', tier: ciMode ? 'warn' : 'fail', reason: 'differs from AGENTS.base.md' });
+      console.log(ciMode
+        ? `   ⚠️  AGENTS.md — differs from base (content drift — warning only in CI)`
+        : `   ⚠️  AGENTS.md — differs from base`);
     } else {
       ok++;
       console.log(`   ✅ AGENTS.md`);
@@ -478,15 +532,19 @@ function cmdCheck(targetDir) {
     // .mcp.json
     const mcpDest = path.join(targetDir, '.mcp.json');
     const mcpSrc = path.join(TEMPLATES_SRC, '.mcp.base.json');
-    if (!fs.existsSync(mcpDest)) {
-      issues.push({ type: 'templates', entry: '.mcp.json', reason: 'missing' });
+    if (exempted('templates/.mcp.json')) {
+      console.log(`   ⏭️  .mcp.json — exempted via manifest check.exemptions`);
+    } else if (!fs.existsSync(mcpDest)) {
+      issues.push({ type: 'templates', entry: '.mcp.json', tier: 'fail', reason: 'missing' });
       console.log(`   ❌ .mcp.json — missing`);
     } else if (!fs.existsSync(mcpSrc)) {
-      issues.push({ type: 'templates', entry: '.mcp.json', reason: 'source missing: .mcp.base.json' });
+      issues.push({ type: 'templates', entry: '.mcp.json', tier: 'fail', reason: 'source missing: .mcp.base.json' });
       console.log(`   ❌ .mcp.json — source missing`);
     } else if (!filesEqual(mcpDest, mcpSrc)) {
-      issues.push({ type: 'templates', entry: '.mcp.json', reason: 'differs from .mcp.base.json' });
-      console.log(`   ⚠️  .mcp.json — differs from base`);
+      issues.push({ type: 'templates', entry: '.mcp.json', tier: ciMode ? 'warn' : 'fail', reason: 'differs from .mcp.base.json' });
+      console.log(ciMode
+        ? `   ⚠️  .mcp.json — differs from base (content drift — warning only in CI)`
+        : `   ⚠️  .mcp.json — differs from base`);
     } else {
       ok++;
       console.log(`   ✅ .mcp.json`);
@@ -495,11 +553,13 @@ function cmdCheck(targetDir) {
     // .husky/
     const huskyDest = path.join(targetDir, '.husky');
     const huskySrc = path.join(TEMPLATES_SRC, '.husky');
-    if (!fs.existsSync(huskyDest)) {
-      issues.push({ type: 'templates', entry: '.husky/', reason: 'missing' });
+    if (exempted('templates/.husky/')) {
+      console.log(`   ⏭️  .husky/ — exempted via manifest check.exemptions`);
+    } else if (!fs.existsSync(huskyDest)) {
+      issues.push({ type: 'templates', entry: '.husky/', tier: 'fail', reason: 'missing' });
       console.log(`   ❌ .husky/ — missing`);
     } else if (!fs.existsSync(huskySrc)) {
-      issues.push({ type: 'templates', entry: '.husky/', reason: 'source missing' });
+      issues.push({ type: 'templates', entry: '.husky/', tier: 'fail', reason: 'source missing' });
       console.log(`   ❌ .husky/ — source missing`);
     } else {
       let huskyOk = true;
@@ -507,16 +567,18 @@ function cmdCheck(targetDir) {
         const srcHook = path.join(huskySrc, entry.name);
         const destHook = path.join(huskyDest, entry.name);
         if (!fs.existsSync(destHook)) {
-          issues.push({ type: 'templates', entry: `.husky/${entry.name}`, reason: 'missing' });
+          issues.push({ type: 'templates', entry: `.husky/${entry.name}`, tier: 'fail', reason: 'missing' });
           console.log(`   ❌ .husky/${entry.name} — missing`);
           huskyOk = false;
         } else if (!fs.existsSync(srcHook)) {
-          issues.push({ type: 'templates', entry: `.husky/${entry.name}`, reason: 'source missing' });
+          issues.push({ type: 'templates', entry: `.husky/${entry.name}`, tier: 'fail', reason: 'source missing' });
           console.log(`   ❌ .husky/${entry.name} — source missing`);
           huskyOk = false;
         } else if (entry.isFile() && !filesEqual(destHook, srcHook)) {
-          issues.push({ type: 'templates', entry: `.husky/${entry.name}`, reason: 'differs from base' });
-          console.log(`   ⚠️  .husky/${entry.name} — differs from base`);
+          issues.push({ type: 'templates', entry: `.husky/${entry.name}`, tier: ciMode ? 'warn' : 'fail', reason: 'differs from base' });
+          console.log(ciMode
+            ? `   ⚠️  .husky/${entry.name} — differs from base (content drift — warning only in CI)`
+            : `   ⚠️  .husky/${entry.name} — differs from base`);
           huskyOk = false;
         }
       }
@@ -527,21 +589,21 @@ function cmdCheck(targetDir) {
     }
 
     // CI workflows (#303): real-file/pin contract — no symlinks + pin compare.
-    ok += _checkCI(manifest, targetDir, issues);
+    ok += _checkCI(manifest, targetDir, issues, ciMode, exempted);
   }
 
-  // ── Check .agent-infra-version ──
+  // ── Check .agent-infra-version ── (the propagation contract — always fails)
   const versionFile = path.join(targetDir, '.agent-infra-version');
   const fileVersion = (() => {
     try { return fs.readFileSync(versionFile, 'utf-8').trim(); } catch { return null; }
   })();
   console.log(`\n📌 .agent-infra-version:`);
   if (!fileVersion) {
-    issues.push({ type: 'version', reason: 'missing .agent-infra-version' });
+    issues.push({ type: 'version', tier: 'fail', reason: 'missing .agent-infra-version' });
     console.log(`   ❌ missing`);
   } else if (fileVersion !== version) {
-    issues.push({ type: 'version', reason: `${fileVersion} ≠ ${version}` });
-    console.log(`   ⚠️  ${fileVersion} (manifest: ${version})`);
+    issues.push({ type: 'version', tier: 'fail', reason: `${fileVersion} ≠ ${version}` });
+    console.log(`   ❌ ${fileVersion} (manifest: ${version}) — run agent-infra update`);
   } else {
     ok++;
     console.log(`   ✅ ${version}`);
@@ -549,6 +611,52 @@ function cmdCheck(targetDir) {
 
   // ── Summary ──
   console.log(`\n${'─'.repeat(50)}`);
+  if (ciMode) {
+    // Tiered gate (#305): structural drift fails the job; content drift warns
+    // (exit 0) because consumers legitimately customize copied templates;
+    // machine-local symlink targets are informational.
+    const fails = issues.filter((i) => i.tier === 'fail');
+    const warns = issues.filter((i) => i.tier === 'warn');
+    const infos = issues.filter((i) => i.tier === 'info');
+    const status = fails.length ? 'FAIL' : (warns.length ? 'WARN' : 'CLEAN');
+
+    for (const issue of fails) {
+      const loc = issue.entry ? `${issue.type}/${issue.entry}` : issue.type;
+      console.log(`   ❌ ${loc}: ${issue.reason}`);
+    }
+    for (const issue of warns) {
+      const loc = issue.entry ? `${issue.type}/${issue.entry}` : issue.type;
+      console.log(`   ⚠️  ${loc}: ${issue.reason}`);
+    }
+    for (const issue of infos) {
+      const loc = issue.entry ? `${issue.type}/${issue.entry}` : issue.type;
+      console.log(`   ℹ️  ${loc}: ${issue.reason}`);
+    }
+
+    console.log(`\n${'─'.repeat(50)}`);
+    console.log(`agent-infra drift summary (${repoName}):`);
+    console.log(`   status: ${status}`);
+    console.log(`   structural: ${fails.length}`);
+    console.log(`   content: ${warns.length}`);
+    console.log(`   info: ${infos.length}`);
+    console.log(`   exempted surfaces: ${exemptList.length ? exemptList.join(', ') : '(none)'}`);
+
+    if (status === 'FAIL') {
+      console.log(`   remediation: run \`agent-infra update\` in this repo — or \`./sync --all\` from`);
+      console.log(`                agent-infra to batch-fix all linked repos. If the repo was`);
+      console.log(`                never bootstrapped: run \`agent-infra init\`.`);
+      process.exit(1);
+    }
+    if (status === 'WARN') {
+      console.log(`   → content drift only — passing (exit 0). Customization is legitimate;`);
+      console.log(`     the template merge/overwrite policy is out of scope (#305).`);
+    } else {
+      console.log(`   → clean`);
+    }
+    process.exit(0);
+  }
+
+  // Local mode — unchanged behavior: any issue fails
   if (issues.length === 0) {
     console.log(`✅ All checks passed (${ok} items). agent-infra v${version}.`);
   } else {
@@ -605,15 +713,19 @@ function _updateCI(targetDir) {
  *  D3: zero symlinks under .github/workflows/.
  *  D2/D6: consumer pins must equal manifest ci.ref (agent-infra itself uses
  *  @main for its self-caller and is exempt from the pin compare).
+ *  #305: the hardcoded eldato-outreach skip is replaced by the manifest-driven
+ *  exemptions (manifest.check.exemptions); CI-mode issues carry a `tier` for
+ *  the tiered summary.
  *  Returns the count of green items. */
-function _checkCI(manifest, targetDir, issues) {
+function _checkCI(manifest, targetDir, issues, ciMode, exempted) {
   const repoName = path.basename(targetDir);
-  const skipRepos = ['eldato-outreach'];
   const ciDest = path.join(targetDir, '.github', 'workflows');
   let ok = 0;
 
-  if (skipRepos.includes(repoName)) {
-    console.log(`\n🔧 CI Workflows:\n   ⏭️  ${repoName} — uses external CI (skipped)`);
+  // #305: the hardcoded skip list (was: ['eldato-outreach']) is replaced by
+  // the manifest-driven exemptions (manifest.check.exemptions).
+  if (exempted('templates/.github/workflows/')) {
+    console.log(`\n🔧 CI Workflows:\n   ⏭️  ${repoName} — CI-workflow surface exempted via manifest check.exemptions`);
     return 0;
   }
 
@@ -623,7 +735,7 @@ function _checkCI(manifest, targetDir, issues) {
   const symlinks = ciRefCheck.findWorkflowSymlinks(targetDir);
   if (symlinks.length > 0) {
     for (const f of symlinks) {
-      issues.push({ type: 'ci', entry: path.relative(targetDir, f), reason: 'symlink under .github/workflows/ — invalid on GitHub Actions (#555), replace with a real file' });
+      issues.push({ type: 'ci', entry: path.relative(targetDir, f), tier: 'fail', reason: 'symlink under .github/workflows/ — invalid on GitHub Actions (#555), replace with a real file' });
       console.log(`   ❌ ${path.relative(targetDir, f)} — symlink (invalid, #555)`);
     }
   } else {
@@ -636,7 +748,7 @@ function _checkCI(manifest, targetDir, issues) {
   const ci = manifest.ci;
   const selfRepo = targetDir === AGENT_INFRA_PATH;
   if (!selfRepo && !fs.existsSync(ciDest)) {
-    issues.push({ type: 'ci-ref', entry: 'ci.yml', reason: 'no .github/workflows/ — run agent-infra init' });
+    issues.push({ type: 'ci-ref', entry: 'ci.yml', tier: 'fail', reason: 'no .github/workflows/ — run agent-infra init' });
     console.log(`   ❌ ci.yml — missing (no .github/workflows/)`);
   } else if (selfRepo) {
     console.log(`   ℹ️  ${repoName} — source repo (@main self-caller, pin compare skipped)`);
@@ -649,7 +761,7 @@ function _checkCI(manifest, targetDir, issues) {
       console.log(`   ✅ ci-ref — all agent-infra pins @${ci.ref}`);
     } else {
       for (const d of drift) {
-        issues.push({ type: 'ci-ref', entry: d.file, reason: `pinned @${d.ref}, expected @${d.expected} — run agent-infra update to learn the bump, then edit the uses: ref (no auto-rewrite)` });
+        issues.push({ type: 'ci-ref', entry: d.file, tier: 'fail', reason: `pinned @${d.ref}, expected @${d.expected} — run agent-infra update to learn the bump, then edit the uses: ref (no auto-rewrite)` });
         console.log(`   ❌ ${d.file} — pinned @${d.ref}, expected @${d.expected}`);
       }
     }
@@ -667,9 +779,12 @@ Commands:
   init <repo>    Bootstrap a repo with symlinks + templates
   update          Refresh symlinks, preserve local files
   check [repo]    Verify symlinks + version + CI pin (ci-ref) match manifest.json
+                 --ci  CI mode: structural drift fails (exit 1), content
+                       drift warns (exit 0), machine-local surfaces skipped
 
 Env:
-  AGENT_INFRA_PATH   Path to the agent-infra repo (default: parent of this script)`);
+  AGENT_INFRA_PATH   Path to the agent-infra repo (default: parent of this script)
+  AGENT_INFRA_CI=1   Equivalent to --ci (both select CI mode)`);
   process.exit(1);
 }
 
@@ -692,7 +807,10 @@ switch (cmd) {
     break;
 
   case 'check':
-    cmdCheck(args[1] || null);
+    cmdCheck(
+      args.slice(1).find((a) => !a.startsWith('--')) || null,
+      args.includes('--ci') || process.env.AGENT_INFRA_CI === '1'
+    );
     break;
 
   default:

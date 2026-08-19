@@ -1,0 +1,14 @@
+name: Docs CI (fixture consumer)
+# #303 consumer caller — a real, committed workflow file (NOT a symlink:
+# GitHub Actions cannot parse symlinked workflow files, #555). Pinned to the
+# agent-infra manifest ci.ref; agent-infra check (ci-ref surface) blocks when
+# this pin drifts from manifest.ci.ref.
+on:
+  pull_request:
+
+jobs:
+  docs:
+    uses: daniel-ospina/agent-infra/.github/workflows/docs-ci.yml@v0.1.0
+    with:
+      markdownlint-command: "npx --yes markdownlint-cli2 '**/*.md'"
+    secrets: inherit

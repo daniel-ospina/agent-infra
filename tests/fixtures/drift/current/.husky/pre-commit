@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fixture pre-commit — customized copy (content drift → warn in CI mode).
+echo "fixture pre-commit (customized)"
+exit 0
