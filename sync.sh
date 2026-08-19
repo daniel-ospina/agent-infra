@@ -21,4 +21,13 @@ git pull --ff-only origin main || { echo "⚠️  pull failed — local changes 
 echo "==> refreshing pi config"
 ./pi-bootstrap/setup.sh
 
+# #304 propagation trigger: setup.sh runs the installer, but re-running it
+# here makes a merged plist-template bump apply on the next sync even when
+# setup.sh skipped the launchd step (e.g. non-Darwin). Idempotent: renders →
+# diffs → skips when nothing changed, reloads on drift.
+if [ -x ./scripts/install-launchd.sh ]; then
+  echo "==> syncing launchd agents (idempotent)"
+  bash ./scripts/install-launchd.sh
+fi
+
 echo "==> sync complete ✅"
