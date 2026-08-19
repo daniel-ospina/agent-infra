@@ -5,7 +5,7 @@
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync } from "node:fs";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -466,6 +466,168 @@ expectBool("cross-consistency: GIT_DIR hint", xc3.gitDirHint === `${MAIN}/.git`,
 
 console.log(`\ndetailed classifier: ${dpass} passed, ${dfail} failed`);
 pass += dpass; fail += dfail;
+
+// ── M4: hub-state gate (#1484) ──────────────────────────────────────────────
+// evaluateHubGate gates EVERY git invocation in a command against the recovery
+// allowlist. The gate is marker-agnostic by design — index.ts invokes it even
+// when the TTL marker is active (D3: M4 stays active under the marker; only the
+// env flag AGENT_ALLOW_MAIN_EDITS=1 disables it). Hub branch = "pr1467" below
+// (the 2026-08-18 incident state: off-main + 3 untracked files, 38 commits).
+function m4(name, command, currentBranch, expectedVerdict) {
+  const got = evaluateHubGate(command, currentBranch);
+  const ok = got.verdict === expectedVerdict;
+  console.log(`${ok ? "✅" : "❌"} M4 ${name}: ${got.verdict}${ok ? "" : ` (expected ${expectedVerdict})`}`);
+  ok ? pass++ : fail++;
+}
+
+m4("commit blocked", `git commit -m x`, "pr1467", "block");
+m4("add+commit compound blocked", `git add . && git commit -m 'x'`, "pr1467", "block");
+m4("checkout -b blocked", `git checkout -b feat/x`, "pr1467", "block");
+m4("switch -c blocked", `git switch -c feat/x`, "pr1467", "block");
+m4("checkout other branch blocked", `git checkout feat/other`, "pr1467", "block");
+m4("checkout . blocked", `git checkout .`, "pr1467", "block");
+m4("checkout - (prev branch) blocked", `git checkout -`, "pr1467", "block");
+m4("push foreign branch blocked", `git push origin main`, "pr1467", "block");
+m4("merge blocked", `git merge origin/main`, "pr1467", "block");
+m4("rebase blocked", `git rebase main`, "pr1467", "block");
+m4("reset blocked", `git reset --hard origin/main`, "pr1467", "block");
+m4("clean blocked", `git clean -fd`, "pr1467", "block");
+m4("restore blocked", `git restore .`, "pr1467", "block");
+m4("stash pop blocked", `git stash pop`, "pr1467", "block");
+m4("stash (push) blocked", `git stash`, "pr1467", "block");
+m4("branch -D blocked", `git branch -D old`, "pr1467", "block");
+m4("tag create blocked", `git tag v1`, "pr1467", "block");
+m4("symbolic-ref HEAD blocked", `git symbolic-ref HEAD refs/heads/x`, "pr1467", "block");
+m4("checkout main allowed (recovery)", `git checkout main`, "pr1467", "recovery");
+m4("checkout master allowed (recovery)", `git checkout master`, "pr1467", "recovery");
+m4("switch main allowed (recovery)", `git switch main`, "pr1467", "recovery");
+m4("pull --ff-only allowed", `git pull --ff-only origin main`, "pr1467", "recovery");
+m4("plain pull blocked (may merge)", `git pull origin main`, "pr1467", "block");
+m4("fetch allowed", `git fetch origin`, "pr1467", "recovery");
+m4("status allowed", `git status`, "pr1467", "recovery");
+m4("log allowed", `git log --oneline -5`, "pr1467", "recovery");
+m4("worktree add allowed", `git worktree add ../wt -b feat/x origin/main`, "pr1467", "recovery");
+m4("worktree list allowed", `git worktree list`, "pr1467", "recovery");
+m4("worktree prune allowed", `git worktree prune`, "pr1467", "recovery");
+m4("worktree remove allowed", `git worktree remove ../wt`, "pr1467", "recovery");
+m4("push own branch allowed (WIP preservation)", `git push origin pr1467`, "pr1467", "recovery");
+m4("bare push allowed (own branch via push.default)", `git push`, "pr1467", "recovery");
+m4("force push of own branch blocked", `git push -f origin pr1467`, "pr1467", "block");
+m4("push --delete blocked", `git push origin --delete feat/x`, "pr1467", "block");
+m4("detached hub: bare push blocked", `git push`, null, "block");
+m4("recovery compound allowed", `git checkout main && git pull --ff-only`, "pr1467", "recovery");
+m4("read-only compound allowed", `git diff HEAD && git show HEAD`, "pr1467", "allowed");
+m4("mixed recovery + read-only allowed", `git fetch origin && git log --oneline -3`, "pr1467", "recovery");
+m4("compound with one mutation blocked", `git fetch origin && git commit -m x`, "pr1467", "block");
+m4("merge-base read-only allowed", `git merge-base --is-ancestor main feat/x`, "pr1467", "allowed");
+m4("branch list read-only allowed", `git branch -a`, "pr1467", "allowed");
+m4("branch create blocked", `git branch feat/x`, "pr1467", "block");
+m4("stash list read-only allowed", `git stash list`, "pr1467", "allowed");
+m4("non-git not gated", `python3 test.py`, "pr1467", "non-git");
+m4("marker touch not gated", `touch ~/.pi/agent/.allow-main-edits  # recovery`, "pr1467", "non-git");
+// Clean-hub semantics: on `main`, checkout main is still NOT a mutation escape
+// (M3 blocks the direct form in index.ts) but the gate itself only fires in a
+// disordered hub — these assert the gate would not block clean-state harm.
+m4("clean hub: push own branch allowed", `git push origin main`, "main", "recovery");
+m4("clean hub: checkout -b still blocked", `git checkout -b feat/x`, "main", "block");
+
+// ── readHubDisorder (#1484) ────────────────────────────────────────────────
+// The hub's legal state is main/master + empty porcelain; untracked counts as
+// dirty. Guard-scoped: a worktree cwd (session) is exempt by default (D5).
+let hubTmp = null;
+try {
+  hubTmp = execSync("mktemp -d", { encoding: "utf-8" }).trim();
+  const r = `${hubTmp}/hubrepo`;
+  execSync(`git init -q -b main "${r}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: r, stdio: "ignore" });
+  execSync("touch a.txt && git add . && git commit -qm init", { cwd: r, stdio: "ignore" });
+
+  expectBool("disorder: main+clean → null", readHubDisorder(r).disorder === null, true);
+  expectBool("disorder: branch read on main", readHubDisorder(r).branch === "main", true);
+  execSync("touch untracked.txt", { cwd: r, stdio: "ignore" });
+  expectBool("disorder: untracked file → dirty", readHubDisorder(r).disorder === "dirty", true);
+  execSync("rm untracked.txt && git checkout -qb feat/x", { cwd: r, stdio: "ignore" });
+  expectBool("disorder: off-main clean → off_main", readHubDisorder(r).disorder === "off_main", true);
+  execSync("touch untracked2.txt", { cwd: r, stdio: "ignore" });
+  expectBool("disorder: off-main + untracked → both", readHubDisorder(r).disorder === "both", true);
+  execSync("rm untracked2.txt && git checkout -q main", { cwd: r, stdio: "ignore" });
+  // Worktree session exempt by default (D5); explicit skipWorktree:false still
+  // refuses a worktree git-dir (never reads a foreign checkout's state).
+  const wt2 = `${hubTmp}/hubwt`;
+  execSync(`git worktree add -q "${wt2}" -b wt/feat HEAD`, { cwd: r, stdio: "ignore" });
+  expectBool("disorder: worktree cwd exempt by default", readHubDisorder(wt2).disorder === null, true);
+  expectBool("disorder: worktree git-dir refused (D5)", readHubDisorder(wt2, { skipWorktree: false }).disorder === null, true);
+  // master counts as on-main (D1: main/master)
+  execSync("git checkout -q -b master", { cwd: r, stdio: "ignore" });
+  expectBool("disorder: master+clean → null", readHubDisorder(r).disorder === null, true);
+} catch (e) {
+  console.log(`⏭️  readHubDisorder fs cases failed to provision: ${String(e.message).slice(0, 120)}`);
+} finally {
+  if (hubTmp) {
+    try { execSync(`rm -rf "${hubTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+}
+
+// ── Script backdoor closure (#1484, Slice E) ───────────────────────────────
+// extractScriptPath: only LEADING interpreter/script positions count (env / cd
+// / separators allowed) so `git add ./foo` never false-matches a script.
+function scriptPath(name, command, expected) {
+  const got = extractScriptPath(command);
+  const ok = got === expected;
+  console.log(`${ok ? "✅" : "❌"} script-path ${name}: ${got}${ok ? "" : ` (expected ${expected})`}`);
+  ok ? pass++ : fail++;
+}
+scriptPath("bash /tmp/x.sh", `bash /tmp/x.sh`, "/tmp/x.sh");
+scriptPath("bash with redirect", `bash /tmp/x.sh 2>&1`, "/tmp/x.sh");
+scriptPath("sh ./foo.sh", `sh ./foo.sh`, "./foo.sh");
+scriptPath("source tilde", `source ~/.setup.sh`, "~/.setup.sh");
+scriptPath("direct ./exec", `./script.sh args`, "./script.sh");
+scriptPath("direct abs exec", `/abs/script.sh --flag`, "/abs/script.sh");
+scriptPath("env prefix", `FOO=1 bash /tmp/x.sh`, "/tmp/x.sh");
+scriptPath("cd prefix compound", `cd /x && bash /tmp/x.sh`, "/tmp/x.sh");
+scriptPath("inline -c → null", `bash -c 'git checkout main'`, null);
+scriptPath("git add ./foo → null", `git add ./foo`, null);
+scriptPath("python3 → null", `python3 x.py`, null);
+scriptPath("plain command → null", `ls -la`, null);
+scriptPath("empty → null", "", null);
+
+// scriptGitVerdict: a script's git content is gated by the SAME allowlist —
+// recovery scripts (hub-worktree.sh: fetch + worktree add) keep working, the
+// backdoor (`write /tmp/x.sh` with git mutations) is closed.
+let scriptTmp = null;
+try {
+  scriptTmp = execSync("mktemp -d", { encoding: "utf-8" }).trim();
+  const mk = (name, content) => {
+    const p = `${scriptTmp}/${name}`;
+    writeFileSync(p, content);
+    return p;
+  };
+  const blockCommit = mk("commit.sh", `#!/bin/bash\ngit add .\ngit commit -m 'x'\n`);
+  expectBool("script: git commit → block", scriptGitVerdict(blockCommit, "pr1467") === "block", true);
+  const blockCheckoutB = mk("checkout-b.sh", `#!/bin/bash\ngit checkout -b feat/x\n`);
+  expectBool("script: checkout -b → block", scriptGitVerdict(blockCheckoutB, "pr1467") === "block", true);
+  const blockForeignPush = mk("foreign-push.sh", `#!/bin/bash\ngit push origin main\n`);
+  expectBool("script: foreign push → block", scriptGitVerdict(blockForeignPush, "pr1467") === "block", true);
+  const rec = mk("recovery.sh", `#!/bin/bash\ngit checkout main && git pull --ff-only\n`);
+  expectBool("script: sanctioned recovery → allow", scriptGitVerdict(rec, "pr1467") === "allow", true);
+  const wtHelper = mk("hub-worktree.sh", `#!/bin/bash\ngit fetch origin main\ngit worktree add ../.worktrees/x -b feat/x origin/main\nln -s ../.env .env\n`);
+  expectBool("script: hub-worktree.sh pattern → allow", scriptGitVerdict(wtHelper, "pr1467") === "allow", true);
+  const ownPush = mk("own-push.sh", `#!/bin/bash\ngit push origin pr1467\n`);
+  expectBool("script: WIP push of own branch → allow", scriptGitVerdict(ownPush, "pr1467") === "allow", true);
+  const readOnly = mk("readonly.sh", `#!/bin/bash\ngit status\ngit log --oneline -3\n`);
+  expectBool("script: read-only git → allow", scriptGitVerdict(readOnly, "pr1467") === "allow", true);
+  const noGit = mk("nogit.sh", `#!/bin/bash\necho hello\n`);
+  expectBool("script: no git → allow", scriptGitVerdict(noGit, "pr1467") === "allow", true);
+  expectBool("script: missing file → allow (nothing to execute)", scriptGitVerdict(`${scriptTmp}/nope.sh`, "pr1467") === "allow", true);
+  const comment = mk("comment.sh", `# this script talks about git for fun\necho done\n`);
+  expectBool("script: git only in comment prose → allow", scriptGitVerdict(comment, "pr1467") === "allow", true);
+} catch (e) {
+  console.log(`⏭️  script-verdict fs cases failed to provision: ${String(e.message).slice(0, 120)}`);
+} finally {
+  if (scriptTmp) {
+    try { execSync(`rm -rf "${scriptTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);
