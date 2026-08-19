@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ToolCallEvent, ToolCallEventResult, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import { relative, resolve, isAbsolute } from "node:path";
+import { relative, resolve, isAbsolute, join, dirname, basename } from "node:path";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -640,7 +640,14 @@ export function normalizeRegistryPath(projectRoot: string, filePath: string): st
   let realRoot = projectRoot;
   let realAbs = abs;
   try { realRoot = realpathSync(projectRoot); } catch { /* keep lexical */ }
-  try { realAbs = realpathSync(abs); } catch { /* keep lexical */ }
+  try {
+    // realpath the PARENT DIR only. realpathSync(abs) resolves a symlinked
+    // FILE to its target, so a committed symlink (e.g. agent-infra drift
+    // fixtures, scripts/ and CI-workflow links) would be registered under the
+    // TARGET's relative path — a key that never matches git's verbatim path
+    // and blocks every commit touching it (#305).
+    realAbs = join(realpathSync(dirname(abs)), basename(abs));
+  } catch { /* keep lexical */ }
   const rel = relative(realRoot, realAbs);
   return rel === "" ? filePath : rel;
 }

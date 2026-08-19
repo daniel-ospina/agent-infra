@@ -9,3 +9,7 @@ __pycache__/
 
 # worktrees (parallel agent isolation)
 .worktrees/
+
+# drift-check test fixtures — the version pin is test state, never committed
+# (tests/drift/run.sh writes it; consumers commit their own real pins)
+tests/fixtures/drift/*/.agent-infra-version

@@ -9,6 +9,9 @@
 
 import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow } from "./index.js";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
+import { mkdtempSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 let passed = 0;
 let failed = 0;
@@ -553,6 +556,24 @@ test("handles nested roots without prefix stripping", () => {
 test("returns original when path is the root itself", () => {
   const p = "/proj";
   equal(normalizeRegistryPath(p, p), p);
+});
+
+test("symlinked FILE keeps the git-verbatim relative path (#305)", () => {
+  // Regression: realpathSync(abs) used to resolve through the link to its
+  // target, registering a committed symlink under the TARGET's path — a key
+  // that never matches the block check's verbatim git path, so every commit
+  // touching the symlink was blocked as "unverified" forever.
+  const root = mkdtempSync(join(tmpdir(), "vgate-nrp-"));
+  try {
+    writeFileSync(join(root, "target.yml"), "target\n");
+    symlinkSync("target.yml", join(root, "link.yml"));
+    equal(normalizeRegistryPath(root, "link.yml"), "link.yml");
+    equal(normalizeRegistryPath(root, join(root, "link.yml")), "link.yml");
+    // regular file still normalizes through a symlinked PARENT dir
+    equal(normalizeRegistryPath(root, "target.yml"), "target.yml");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ── resolveMergeRoot (#190) ─────────────────────────

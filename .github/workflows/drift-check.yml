@@ -1,0 +1,101 @@
+name: agent-infra drift check
+# Reusable workflow — consumer-side drift gate (#305).
+#
+# The `agent-infra check` CLI (bin/agent-infra.js) is the propagation drift
+# detector: it verifies a repo's copied agent-infra surfaces against the
+# checked-out agent-infra manifest. This workflow runs it in CI mode (`--ci`),
+# which is TIERED:
+#
+#   FAIL (exit 1)  — structural drift: .agent-infra-version pin mismatch or
+#                    missing, missing/stale symlinks (scripts/, CI workflows),
+#                    missing copied templates, workflow `uses:` refs pinned to
+#                    something other than manifest.check.ci.ref (#303 contract).
+#   WARN (exit 0)  — content drift: AGENTS.md / .mcp.json / .husky/* differ from
+#                    the base templates. Consumers legitimately customize these;
+#                    the merge/overwrite policy is a separate issue.
+#   SKIP           — machine-local surfaces (extensions/skills under ~/.pi) and
+#                    surfaces exempted per-repo via manifest.check.exemptions
+#                    (unlinked consumers, self-contained CI per #555, ...).
+#
+# Consumers wire one job into their ci.yml:
+#
+#   drift-check:
+#     uses: daniel-ospina/agent-infra/.github/workflows/drift-check.yml@main
+#
+# The checked-out agent-infra ref defaults to @main — "stale" means "differs
+# from latest main" (no release tags exist yet). agent-infra-ref is overridable
+# (e.g. pinning to a #303 release tag once the version contract lands).
+#
+# Remediation (printed by the CLI on FAIL):
+#   run `agent-infra update` in this repo — or `./sync --all` from agent-infra
+#   to batch-fix all linked repos. If the repo was never bootstrapped:
+#   run `agent-infra init`.
+#
+# Coverage discovery: the consumer set is `./sync --list`-discoverable locally
+# (repos carrying .agent-infra-version under $AGENT_INFRA_REPOS_ROOT). There is
+# no cross-repo registry; this workflow gates the repo it is called from.
+#
+# Self-test: agent-infra's own ci.yml runs tests/drift/run.sh (tiered exit
+# codes + fixtures + workflow YAML validity). agent-infra itself never
+# bootstraps its own checkout, so the self-test uses fixture repos.
+
+on:
+  workflow_call:
+    inputs:
+      agent-infra-ref:
+        type: string
+        default: main
+        description: agent-infra ref to check against (default main — stale pin = differs from latest main)
+      check-command:
+        type: string
+        default: ''
+        description: Override the check command (advanced — must exit 0 to pass)
+
+permissions:
+  contents: read
+
+jobs:
+  drift-check:
+    name: agent-infra drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout consumer repo
+        uses: actions/checkout@v4
+        with:
+          path: consumer
+
+      - name: Checkout agent-infra (${{ inputs.agent-infra-ref }})
+        uses: actions/checkout@v4
+        with:
+          repository: daniel-ospina/agent-infra
+          ref: ${{ inputs.agent-infra-ref }}
+          path: .agent-infra
+
+      - name: Run agent-infra check (CI mode)
+        id: drift
+        shell: bash
+        working-directory: consumer
+        env:
+          AGENT_INFRA_PATH: ${{ github.workspace }}/.agent-infra
+          # Exemption keys are repo basenames; the checkout dir is the fixed
+          # name `consumer`, so pass the real repo name explicitly.
+          AGENT_INFRA_REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          if [ -n "${{ inputs.check-command }}" ]; then
+            ${{ inputs.check-command }}; code=$?
+          else
+            node "$AGENT_INFRA_PATH/bin/agent-infra.js" check . --ci; code=$?
+          fi
+          echo "drift_exit=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Drift gate (structural drift fails)
+        if: always()
+        shell: bash
+        run: |
+          code="${{ steps.drift.outputs.drift_exit }}"
+          if [ "$code" != "0" ]; then
+            echo "::error::agent-infra drift detected — run \`agent-infra update\` in this repo (or \`./sync --all\` from agent-infra to batch-fix all linked repos). See the 'Run agent-infra check (CI mode)' step for the failing surfaces."
+            exit 1
+          fi
+          echo "✅ agent-infra drift check passed (structural surfaces clean; content drift is warn-only)"

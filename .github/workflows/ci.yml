@@ -15,3 +15,15 @@ jobs:
     # after merge (real file lands on main).
     uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@feat/303-ci-central
     secrets: inherit
+
+  drift-check:
+    # #305 — self-test of the drift-check CI gate. agent-infra's own checkout
+    # is never bootstrapped (no committed AGENTS.md/.mcp.json/.husky pin — it's
+    # the source), so this runs the fixture-based test suite: tiered exit codes
+    # (structural fail / content warn / clean), stale-pin regression, and the
+    # drift-check.yml YAML validity.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Drift-check tests (tiered exits, fixtures, workflow YAML)
+        run: bash tests/drift/run.sh
