@@ -4,7 +4,6 @@ import { execSync } from "node:child_process";
 import { relative, resolve, isAbsolute, join, dirname, basename } from "node:path";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync } from "node:fs";
-import { join } from "node:path";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
@@ -261,8 +260,9 @@ function recoverBridgeForRoot(normRoot: string): number {
       const relPath = normalizeRegistryPath(parsed.root, parsed.path);
       if (relPath.startsWith("..") || isAbsolute(relPath)) continue;
       // Match-or-drop: only merge when the stored (verifier-authoritative)
-      // hash still matches the file on disk. Never recompute a fresh hash.
-      if (vf.hash !== hashFile(parsed.root, relPath)) continue;
+      // hash still matches the file on disk (sha1 or sha256, #320). Never
+      // recompute a fresh hash — a post-PASS edit must fail closed.
+      if (!hashMatchesDisk(parsed.root, relPath, vf.hash)) continue;
       verifiedSet.set(vf.path, vf.hash);
       blockAttempts.delete(vf.path);
       recovered++;
@@ -627,6 +627,22 @@ function hashFile(projectRoot: string, filePath: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
+/**
+ * #320: verifier-submitted hashes may be sha1 (40-hex) or sha256 (64-hex) —
+ * LLM verifiers pick whatever hash tool they know, and an algorithm mismatch
+ * must not false-block an unchanged file. Accept a match with EITHER
+ * algorithm (inferred by hex length; hex compare is case-insensitive). The
+ * check is anti-drift (file changed between verification and commit) and any
+ * content change flips both digests, so sha1 acceptance does not weaken it.
+ * Unknown lengths are compared as sha256 → fail closed (no match → block).
+ */
+export function hashMatchesDisk(projectRoot: string, filePath: string, storedHash: string): boolean {
+  const absPath = resolve(projectRoot, filePath);
+  const content = readFileSync(absPath);
+  const algo = storedHash.length === 40 ? "sha1" : "sha256";
+  return createHash(algo).update(content).digest("hex") === storedHash.toLowerCase();
+}
+
 // #7595: verifier sub-agents may return absolute paths (e.g.
 // "/Users/x/repo/src/a.ts") or root-relative forms ("./src/a.ts") while
 // git diff yields repo-relative paths ("src/a.ts"). Registry keys must be
@@ -986,7 +1002,7 @@ export default function (pi: ExtensionAPI) {
       const verifiedHash = verifiedSet.get(key);
       if (verifiedHash === undefined) {
         unverified.push(file);
-      } else if (verifiedHash !== currentHash) {
+      } else if (!hashMatchesDisk(cwd, file, verifiedHash)) {
         mismatched.push({ file, expected: verifiedHash, actual: currentHash });
       }
     }
