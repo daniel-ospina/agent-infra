@@ -157,8 +157,13 @@ const BRIDGE_DIR = join(homedir(), ".pi", "agent", "verification");
 // to the child via the env spread). A task child can therefore NEVER fall
 // back to the interactive path: #7591 auto-bypass is unreachable for
 // sub-agent commits (#264 P2/P3).
-function isTaskSubAgent(): boolean {
-  return process.env.TASK_HEARTBEAT === "1" && process.env.PI_MODE === "print";
+function isTaskSubAgent(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  // Env-param seam (mirrors task-heartbeat's taskHeartbeatActive): reads the
+  // env via a parameter, never raw process.env — keeps the #228 print-mode
+  // wiring gate (extensions/shared/print-mode-wiring.test.ts) green.
+  return env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print";
 }
 
 function bridgePath(): string {

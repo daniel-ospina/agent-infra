@@ -1,3 +1,14 @@
+---
+title: "Upstream pi bug reports — drafts awaiting filing"
+type: engineering
+domain: operations
+doc_status: live
+subjects.team: organisation-design-team
+created: 2026-08-11
+aboutSubjects: organisation-design-team
+aboutObjects: agent-infra, pi-coding-agent, pi-ai
+---
+
 # Upstream pi bug reports — drafts awaiting filing
 
 > **Status:** DRAFT — filing attempted 2026-08-11 via `gh api`, **BLOCKED**
@@ -177,3 +188,46 @@ Add sub-classification so callers can escalate:
 `connectionErrorDetected()` in `extensions/builtin-tools/index.ts` recognizes
 `Connection error` / `stopReason: "error"` / `terminated` signatures and routes
 qwen dispatches to the fallback provider regardless of sub-classification.
+
+## Issue D: agent-level retry backoff has no delay cap — network outages kill sessions
+
+**Repo:** pi-core (`@earendil-works/pi-coding-agent`)
+**Severity:** Medium — a session dies on any network outage longer than the
+quick-retry window; there is no "pause and wait for connectivity" mode.
+
+### Symptom
+On a network drop, the agent-level retry (the "Retry N/3" path) runs 3 quick
+attempts (2s → 4s → 8s with the defaults) and then the session **ends with an
+error**. When the network returns minutes later, nothing resumes. There is no
+supported way to say "after the quick retries, keep trying every 5 minutes
+until connectivity returns" — `retry.maxRetries` can be raised, but the
+backoff `baseDelayMs * 2^(attempt-1)` then grows unboundedly (17 min, 34 min,
+68 min, … gaps), so a laptop left on through an overnight outage waits hours
+after the network returns.
+
+### Suspected cause
+`dist/core/agent-session.js` `_prepareRetry()` computes
+`delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1)` with **no cap**, and
+`@earendil-works/pi-ai/dist/utils/retry.js` `retryAssistantCall()` (used by
+compaction / branch-summary) does the same. `retry.provider.maxRetryDelayMs`
+caps only the SDK-level `retryProviderRequest()` path, not the agent-level
+retry.
+
+### Expected behavior
+Add a configurable agent-level max retry delay, e.g. `retry.maxDelayMs`
+(default: none → current exponential behavior), so
+`delayMs = min(baseDelayMs * 2^(attempt-1), maxDelayMs)`. With
+`retry.maxRetries` raised this yields "quick retries, then every N seconds
+indefinitely" — a session pauses through an outage and resumes automatically
+when connectivity returns. The retry should stay abortable (Esc /
+`abort_retry`), and long retry sleeps should not block compaction/summarization
+lifecycle events.
+
+### Mitigation in agent-infra (already shipped)
+- `scripts/patch-pi-retry.sh` caps the backoff at 5 min in both files (wired
+  into `pi-bootstrap/setup.sh`, re-applied on every sync; see
+  `docs/providers.md §6`).
+- `retry.maxRetries: 10000` in `~/.pi/agent/settings.json`.
+- `extensions/builtin-tools/index.ts` suppresses task-tool sub-agent kills
+  while the network is unreachable (fresh heartbeat markers prove the child is
+  alive and retrying, not wedged).
