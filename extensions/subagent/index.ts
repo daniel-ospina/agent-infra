@@ -42,8 +42,10 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
+// Parallel dispatch caps (#317): raised 8→16 (MAX_PARALLEL_TASKS) and 4→16 (MAX_CONCURRENCY) —
+// direct DeepSeek API is concurrency-only (500 v4-pro / 2,500 v4-flash), no RPM limits; M5/32GB host.
+const MAX_PARALLEL_TASKS = 16;
+const MAX_CONCURRENCY = 16;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
