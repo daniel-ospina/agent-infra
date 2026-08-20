@@ -68,7 +68,7 @@ Group files by category for specialist routing:
 
 ## Phase 2: Fan-Out (5 Parallel Agents)
 
-**Concurrency control:** Max 8 parallel agents. Stagger launches by 200ms between agents to avoid API rate limits. Use `subagent({ tasks: [...] })` for true parallel dispatch. Each task in the array needs `{ agent: "worker", task: "<prompt>" }`. On rate-limit errors, retry with exponential backoff (1s, 2s, 4s) + jitter ±200ms. See `parallel-orchestrator` reference skill for full pattern.
+**Concurrency control:** Max 16 parallel agents (bounded by fan-in context + worktree contention, NOT API limits — direct DeepSeek API is concurrency-only, #317). Stagger launches by 200ms between agents to smooth provider load. Use `subagent({ tasks: [...] })` for true parallel dispatch. Each task in the array needs `{ agent: "worker", task: "<prompt>" }`. On rate-limit errors, retry with exponential backoff (1s, 2s, 4s) + jitter ±200ms. See `parallel-orchestrator` reference skill for full pattern.
 
 Launch all 5 agents simultaneously using the subagent tool. Each agent receives:
 - The file list for its domain

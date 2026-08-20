@@ -63,7 +63,7 @@ done
 
 If `gh` CLI is unavailable, warn and proceed (graceful degradation).
 
-**Concurrency control:** Max 8 parallel sub-agents per dependency level. Stagger launches by 200ms between agents to avoid API rate limits. On rate-limit errors, retry with exponential backoff (1s, 2s, 4s) + jitter ±200ms. See `parallel-orchestrator` reference skill for full pattern.
+**Concurrency control:** Max 16 parallel sub-agents per dependency level (bounded by fan-in context + worktree contention, NOT API limits — direct DeepSeek API is concurrency-only: 500 v4-pro / 2,500 v4-flash, #317). Stagger launches by 200ms between agents to smooth provider load. On rate-limit errors, retry with exponential backoff (1s, 2s, 4s) + jitter ±200ms. See `parallel-orchestrator` reference skill for full pattern.
 
 For each dependency level (issues that can run in parallel):
 
@@ -145,6 +145,6 @@ If the user starts a new session and wants to resume:
 - **Fresh context per issue:** Each sub-agent runs in a fresh pi session — no context pollution.
 - **Progress reports are heartbeats:** Never stop after "X/N done." Keep going until exhausted or blocked.
 - **Tortoise/FalkorDB is the cross-session ledger:** After each merge, commit-workflow records completion. On new session, epic-executor reads the ledger to resume.
-- **Concurrency capped:** Max 8 parallel sub-agents per dependency level. Stagger 200ms between launches.
+- **Concurrency capped:** Max 16 parallel sub-agents per dependency level. Stagger 200ms between launches.
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.
