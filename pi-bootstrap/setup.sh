@@ -80,14 +80,24 @@ PY
 }
 merge_settings() {
   # Source wins for keys it defines; target keeps local extras (skills,
-  # packages, env, ...) so per-machine bits survive re-syncs.
+  # packages, env, ...) so per-machine bits survive re-syncs. The `retry`
+  # subtree is deep-merged per-key (source wins per key it defines, local
+  # overrides survive) — a shallow merge would let the source `retry` block
+  # silently reset a user's `retry.enabled: false` (the documented kill
+  # switch) on every sync (#318 review).
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$SRC/settings.json" "$DEST/settings.json" << 'PY'
 import json, os, sys
 src = json.load(open(sys.argv[1]))
 dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
-json.dump({**dst, **src}, open(sys.argv[2], "w"), indent=2)
-print("    settings.json merged (local extras preserved)")
+merged = {**dst, **src}
+if isinstance(src.get("retry"), dict) and isinstance(dst.get("retry"), dict):
+    retry = {**dst["retry"], **src["retry"]}
+    if isinstance(src["retry"].get("provider"), dict) and isinstance(dst["retry"].get("provider"), dict):
+        retry["provider"] = {**dst["retry"]["provider"], **src["retry"]["provider"]}
+    merged["retry"] = retry
+json.dump(merged, open(sys.argv[2], "w"), indent=2)
+print("    settings.json merged (local extras preserved; retry deep-merged)")
 PY
   else
     cp "$SRC/settings.json" "$DEST/settings.json"
@@ -181,6 +191,24 @@ if command -v npm >/dev/null 2>&1; then
   done
 else
   echo "    warning: npm not found - extension deps skipped (mcp-client/builtin-tools/loop-enforcer may not load)"
+fi
+
+# Offline-resume retry patch (idempotent, #318): cap pi's agent-level retry
+# backoff at 5 min so sessions survive network outages instead of stopping
+# after 3 quick retries. Re-applied on every sync so a `pi update` that
+# rewrites the dist can't silently lose the patch. Non-zero (pi missing /
+# patch target changed by an upgrade) is a warning, not an abort — the
+# message is the diagnostic; re-run after a pi update if it failed.
+echo "==> Offline-resume retry patch"
+if [ -x "$INFRA_ROOT/scripts/patch-pi-retry.sh" ]; then
+  if bash "$INFRA_ROOT/scripts/patch-pi-retry.sh"; then
+    echo "    retry patch: ok"
+  else
+    echo "    WARNING: retry patch reported failures (see above) — run:"
+    echo "      $INFRA_ROOT/scripts/patch-pi-retry.sh"
+  fi
+else
+  echo "    WARNING: scripts/patch-pi-retry.sh missing — offline-resume retry patch NOT applied (sessions still stop after 3 quick retries on network loss)."
 fi
 
 # Small config / rules files
