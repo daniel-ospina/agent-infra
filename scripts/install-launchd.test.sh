@@ -151,7 +151,7 @@ BOOTSTRAP_COUNT2="$(grep -c 'launchctl bootstrap' "$LOG")"
 assert_eq "$BOOTSTRAP_COUNT2" "$BOOTSTRAP_COUNT1" "no reload on no-change"
 
 echo "── 4. Change → reload ────────────────────────────────────────────"
-sed -i '' 's/<integer>21600<\/integer>/<integer>21601<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist"
+sed -i.bak 's/<integer>21600<\/integer>/<integer>21601<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist" && rm -f "$TEMPLATES/com.eldato.hub-state-check.plist".bak
 OUT="$(run_installer "$HOME1")"
 RC=$?
 assert_eq "$RC" "0" "change install exits 0"
@@ -163,8 +163,8 @@ assert_eq "$BOOTSTRAP_COUNT3" "$((BOOTSTRAP_COUNT2 + 1))" "exactly one reload fo
 echo "── 5. Bootstrap failure is loud ──────────────────────────────────"
 # Restore the template, then force a change so the installer reloads — with
 # the shim configured to fail bootstrap. Must be loud + non-zero.
-sed -i '' 's/<integer>21601<\/integer>/<integer>21600<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist"
-sed -i '' 's/<integer>21600<\/integer>/<integer>21602<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist"
+sed -i.bak 's/<integer>21601<\/integer>/<integer>21600<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist" && rm -f "$TEMPLATES/com.eldato.hub-state-check.plist".bak
+sed -i.bak 's/<integer>21600<\/integer>/<integer>21602<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist" && rm -f "$TEMPLATES/com.eldato.hub-state-check.plist".bak
 set +e
 OUT="$(FAKE_BOOTSTRAP_FAIL=1 run_installer "$HOME1" 2>&1)"
 RC=$?
@@ -177,7 +177,7 @@ echo "── 6. Broken-target guard ──────────────�
 # case) → installer must refuse with a non-zero exit and no bootstrap.
 rm -f "$HOME1/.pi/agent/scripts/checkout-hygiene/hub-state-check.sh"
 rm -f "$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
-sed -i '' 's/<integer>21602<\/integer>/<integer>21601<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist"
+sed -i.bak 's/<integer>21602<\/integer>/<integer>21601<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist" && rm -f "$TEMPLATES/com.eldato.hub-state-check.plist".bak
 set +e
 OUT="$(run_installer "$HOME1" 2>&1)"
 RC=$?
@@ -207,7 +207,7 @@ echo "── 8. --status ──────────────────�
 # Template is at 21601; HOME1 hub is not installed (test 5 rollback + test 6
 # refusal) → install it, then bump the template to show DRIFT in --status.
 OUT="$(run_installer "$HOME1" 2>&1)"
-sed -i '' 's/<integer>21601<\/integer>/<integer>21603<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist"
+sed -i.bak 's/<integer>21601<\/integer>/<integer>21603<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist" && rm -f "$TEMPLATES/com.eldato.hub-state-check.plist".bak
 OUT="$(run_installer "$HOME1" --status)"
 RC=$?
 assert_eq "$RC" "0" "--status exits 0"

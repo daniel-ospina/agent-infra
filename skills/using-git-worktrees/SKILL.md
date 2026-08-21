@@ -320,7 +320,7 @@ sequence, in order:
 > **#265 marker semantics (escaped hatch):** under the TTL marker (or the env flag), the guard's M2/M3 gates are INACTIVE (the escape hatch keeps its documented semantics — a stranded main checkout stays recoverable) but M1 detection stays ACTIVE: if the branch moves again mid-session you still get the warn.
 
 ## Launching Nested pi
-### Never launch an unbounded nested pi (#206) — hard rule
+### The hard rule — bounded nested pi only (#206)
 
 > **Never launch an unbounded nested pi.** Every nested or background `pi`
 > launch MUST carry a hard timeout (30 minutes — the bounded-launch template
