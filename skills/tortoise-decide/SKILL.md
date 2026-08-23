@@ -51,17 +51,15 @@ confidence** — plus the *why*: the top reasons (edges) that moved each option.
 
 Use the Tortoise MCP tools (never a local FalkorDB):
 
-1. **Create the nodes** — one tool call per point, `dedup=True` semantics:
-   - options → `pointKind: option`
-   - criteria → `pointKind: criterion`
-   - findings → `pointKind: evidence`
-   - content = the description; keep ids stable (`opt:a`, `crit:1`, `finding:1`).
-2. **Wire the edges** — `create_operator` for each IMPL/NAND; mitigation
-   strength in `[0.10, 0.50]` for relevance edges.
-3. **Compute** — `compute_confidence` (EP belief propagation on the decision
-   subgraph) → the per-option confidence.
-4. **Sanity** — `check_structure` before presenting (the graph must be
-   structurally sound: no orphan operators, edges well-formed).
+1. **Create the nodes** — `tortoise_create_point` per point (dedup by
+   content): options → `pointKind: option`, criteria → `criterion`,
+   findings → `evidence`; keep ids stable (`opt:a`, `crit:1`, `finding:1`).
+2. **Wire the edges** — `tortoise_create_operator` for each IMPL/NAND;
+   mitigation strength in `[0.10, 0.50]` for relevance edges.
+3. **Compute** — `tortoise_compute_confidence` (EP belief propagation on the
+   decision subgraph) → the per-option confidence.
+4. **Sanity** — `tortoise_check_structure` before presenting (the graph must
+   be structurally sound: no orphan operators, edges well-formed).
 
 ### Output contract
 
