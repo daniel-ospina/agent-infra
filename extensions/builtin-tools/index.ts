@@ -893,7 +893,11 @@ export function parseHeartbeatLine(
       // #282: tool_start is a first-activity source (same sites as
       // everSawRealActivity) — anchor it so a tool_start-first session (the
       // short-round marker-loss corner #279 P1-1 closes) is not reported as
-      // firstActivityLagMs=-1.
+      // firstActivityLagMs=-1. A parsed tool_start provably implies PRIOR
+      // model output (a streamed message produced the tool call) — same
+      // evidence tool_end uses — so latch everSawMsg here too (review P2:
+      // symmetric with tool_end).
+      state.everSawMsg = true;
       if (state.firstActivityAt === 0) state.firstActivityAt = now;
       break;
     case "tool_end":

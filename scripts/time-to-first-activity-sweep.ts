@@ -26,6 +26,16 @@
  * Default sessions dir: ~/.pi/agent/sessions (scans only agent-infra* cwd slugs).
  *
  * Read-only — never modifies session logs.
+ *
+ * KNOWN LIMITATION (review #332 P1): exact-hash pairing is ~impossible in
+ * practice — pi TRANSFORMS the child's first user message (system preamble
+ * injected, body abridged), so the raw prompt never appears verbatim. Prefix
+ * matches are accepted only with verified full-text containment of a prompt
+ * fragment + a 10-min time window; anything else is reported UNPAIRED (never
+ * nearest-ts guesswork). Reliable pairing needs a verified channel (e.g., the
+ * child session id surfaced in the task tool's result) — tracked as a
+ * follow-up. Until then the sweep reports honest '0 paired' rather than
+ * fabricated slow-thinking-tail numbers.
  */
 
 import { createHash } from "node:crypto";
@@ -36,6 +46,8 @@ import { join } from "node:path";
 interface TaskCall {
   promptSha: string;
   promptPrefixSha: string;
+  /** First 400 chars of the prompt — the containment-check fragment. */
+  promptFrag: string;
   ts: number;
   callId: string;
   logFile: string;
@@ -137,15 +149,15 @@ function scanSessionFile(path: string): { calls: TaskCall[]; results: TaskResult
         msgCount++;
         if (!firstMsgAt) firstMsgAt = ts;
         const hasToolCall = content.some((c: any) => c && c.type === "toolCall");
-        if (hasToolCall && !firstToolAt) {
-          firstToolAt = ts;
+        if (hasToolCall) {
           toolCount++;
+          if (!firstToolAt) firstToolAt = ts;
         }
         for (const c of content) {
           if (c && c.type === "toolCall" && c.name === "task") {
             const prompt = typeof c.arguments === "string" ? c.arguments : (c.arguments?.prompt ?? "");
             const p = typeof prompt === "string" ? prompt : JSON.stringify(prompt);
-            calls.push({ promptSha: sha(p), promptPrefixSha: sha(p.slice(0, 120)), ts, callId: c.id ?? "", logFile: path });
+            calls.push({ promptSha: sha(p), promptPrefixSha: sha(p.slice(0, 120)), promptFrag: p.slice(0, 400), ts, callId: c.id ?? "", logFile: path });
           }
         }
         lastRole = role;
@@ -229,25 +241,58 @@ function main(): void {
     if (!callsByPrefix.has(c.promptPrefixSha)) callsByPrefix.set(c.promptPrefixSha, []);
     callsByPrefix.get(c.promptPrefixSha)!.push(c);
   }
-  const pickCall = (candidates: TaskCall[], childTs: number): TaskCall | undefined =>
-    candidates.reduce<TaskCall | undefined>((best, c) => {
-      if (!best) return c;
-      return Math.abs(c.ts - childTs) < Math.abs(best.ts - childTs) ? c : best;
-    }, undefined);
+  // #282 review P1: pairing must be VERIFIED, never nearest-ts guesswork.
+  // The child's first user message is pi-transformed (system preamble injected,
+  // body abridged) so exact-hash matching is ~impossible in practice. A pair is
+  // accepted only when (a) the timestamps fit a window (child spawns within
+  // seconds of the dispatch) AND (b) the prompt hash matches exactly, OR the
+  // child's transformed first message CONTAINS a substantial prompt fragment
+  // (the preamble is a superset region). Anything else is reported UNPAIRED —
+  // never silently mispaired.
+  const PAIR_WINDOW_MS = 10 * 60_000; // generous; children spawn ~immediately
+  const FRAGMENT_LEN = 300;           // substantial enough to be distinctive
+  const pickCall = (candidates: TaskCall[], childTs: number): TaskCall | undefined => {
+    let best: TaskCall | undefined;
+    for (const c of candidates) {
+      if (Math.abs(c.ts - childTs) > PAIR_WINDOW_MS) continue; // time window
+      if (!best || Math.abs(c.ts - childTs) < Math.abs(best.ts - childTs)) best = c;
+    }
+    return best;
+  };
+  const containsPromptFragment = (childFirstMsg: string, prompt: string): boolean => {
+    if (!childFirstMsg || !prompt) return false;
+    // Try several offsets: the preamble is prepended, so the raw prompt (or a
+    // substantial fragment of it) should appear verbatim somewhere inside.
+    for (const off of [0, 120, 240]) {
+      const frag = prompt.slice(off, off + FRAGMENT_LEN);
+      if (frag.length >= 120 && childFirstMsg.includes(frag)) return true;
+    }
+    return false;
+  };
 
   const paired: Array<{ child: SessionLogStats; dispatch: Dispatch; timeToFirstMsg: number; timeToFirstTool: number; duration: number }> = [];
   let exact = 0;
   let prefixOnly = 0;
+  let rejected = 0; // candidates found but containment/time-window verification failed
   for (const s of allStats) {
     let call = pickCall(callsBySha.get(s.firstUserMsgSha) ?? [], s.startedAt);
-    if (!call) {
-      const byPrefix = callsByPrefix.get(s.firstUserMsgPrefixSha) ?? [];
-      if (byPrefix.length) {
-        call = pickCall(byPrefix, s.startedAt);
-        prefixOnly++;
-      }
-    } else {
+    if (call) {
       exact++;
+    } else {
+      // Prefix/nearest-ts candidates are accepted ONLY with verified
+      // full-text containment of a substantial prompt fragment (the child's
+      // first message is pi-transformed: preamble injected + body abridged —
+      // a prefix-hash coincidence alone proves nothing, review P1).
+      const byPrefix = callsByPrefix.get(s.firstUserMsgPrefixSha) ?? [];
+      const candidates = pickCall(byPrefix, s.startedAt)
+        ? byPrefix.filter((c) => Math.abs(c.ts - s.startedAt) <= 10 * 60_000)
+        : [];
+      call = undefined;
+      for (const c of candidates) {
+        if (containsPromptFragment(s.firstUserMsg, c.promptFrag)) { call = c; break; }
+      }
+      if (call) prefixOnly++;
+      else if (candidates.length) rejected++;
     }
     if (!call) continue;
     const dispatch = dispatches.find((d) => d.call === call)!;
@@ -259,7 +304,7 @@ function main(): void {
       duration: dispatch.result ? dispatch.result.ts - call.ts : -1,
     });
   }
-  console.log(`Pass 2: paired ${paired.length}/${allStats.length} sessions → dispatches (${exact} exact-hash, ${prefixOnly} prefix-hash)`);
+  console.log(`Pass 2: paired ${paired.length}/${allStats.length} sessions → dispatches (${exact} exact-hash, ${prefixOnly} verified-prefix, ${rejected} candidate-but-unverified)`);
 
   const success = paired.filter((p) => p.dispatch.result && !p.dispatch.result.isError);
   const failed = paired.filter((p) => p.dispatch.result && p.dispatch.result.isError);
