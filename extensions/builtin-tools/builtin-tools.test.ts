@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS } from "./index.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
@@ -1791,6 +1791,98 @@ test("E279f: diagnostics — latch in all alive summaries + effective-bound head
     src.includes("(decision.firstMessageMs ?? hbThresholds.firstMessageMs)"),
     "first-message headline prints the EFFECTIVE (latched) bound, not the base (905s display bug)",
   );
+});
+
+section("#282 first-message-stall triage — tick/marker history instrumentation (E282 series)");
+
+test("E282a: never-worked run — counters/latches/trace recorded (parse-level)", () => {
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready", st, 100_000);
+  parseHeartbeatLine("[task-heartbeat] turn_start 0", st, 100_001);
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=30000 tool_age_max_ms=0 saw_msg=0 saw_tool=0", st, 130_000);
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=60000 tool_age_max_ms=0 saw_msg=0 saw_tool=0", st, 160_000);
+  equal(st.markerCount, 4, "all 4 valid markers counted");
+  equal(st.tickCount, 2, "2 ticks counted");
+  equal(st.firstMarkerAt, 100_000, "first-marker anchor = ready ts");
+  equal(st.firstTickAt, 130_000, "first-tick anchor = first tick ts");
+  equal(st.everSawMsg, false, "never-worked: no message ever");
+  equal(st.everSawTool, false, "never-worked: no tool ever");
+  equal(st.everSawRealActivity, false, "never-worked: no observable activity");
+  equal(st.firstActivityAt, 0, "never-worked: no first-activity anchor");
+  equal(st.toolsMaxInFlight, 0, "never-worked: no tools");
+  deepEqual(st.activityTrace, ["ready", "turn_start", "tick", "tick"], "trace = first-N marker kinds in order");
+});
+
+test("E282b: activity evolution — msg/tool latches + first-activity anchor + tools high-water (parse-level, monotonic)", () => {
+  const st = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready", st, 100_000);
+  parseHeartbeatLine("[task-heartbeat] turn_start 0", st, 100_001);
+  // message-only activity via a saw_msg=1 tick
+  parseHeartbeatLine("[task-heartbeat] tick tools=0 turn=1 stream_age_ms=12000 tool_age_max_ms=0 saw_msg=1 saw_tool=0", st, 112_000);
+  ok(st.everSawMsg, "saw_msg=1 tick latches everSawMsg");
+  equal(st.firstActivityAt, 112_000, "first-activity anchor = the saw_msg tick");
+  // tool activity via tool_start
+  parseHeartbeatLine("[task-heartbeat] tool_start id1 bash", st, 113_000);
+  ok(st.everSawTool, "tool_start latches everSawTool");
+  equal(st.toolsMaxInFlight, 1, "tools high-water = 1 after tool_start");
+  // a tools=2 tick raises the high-water
+  parseHeartbeatLine("[task-heartbeat] tick tools=2 turn=1 stream_age_ms=20000 tool_age_max_ms=0 saw_msg=0 saw_tool=0", st, 114_000);
+  equal(st.toolsMaxInFlight, 2, "tools high-water = 2 (tick-reported)");
+  // turn transition resets per-turn flags but NOT the session instrumentation
+  parseHeartbeatLine("[task-heartbeat] turn_end 0", st, 115_000);
+  parseHeartbeatLine("[task-heartbeat] turn_start 1", st, 115_001);
+  ok(st.everSawMsg && st.everSawTool, "turn resets do NOT erase session latches (monotonic)");
+  equal(st.tickCount, 2, "turn resets do not reset counters");
+  equal(st.firstActivityAt, 112_000, "first-activity anchor is the FIRST activity, never overwritten");
+  // trace bounded at HEARTBEAT_TRACE_MAX
+  for (let i = 0; i < 20; i++) {
+    parseHeartbeatLine(`[task-heartbeat] tick tools=0 turn=1 stream_age_ms=${i}000 tool_age_max_ms=0 saw_msg=0 saw_tool=0`, st, 200_000 + i * 1000);
+  }
+  equal(st.activityTrace.length, HEARTBEAT_TRACE_MAX, "trace bounded at HEARTBEAT_TRACE_MAX");
+  ok(
+    st.activityTrace.every((k) => ["ready", "turn_start", "tool_start", "turn_end", "tick"].includes(k)),
+    "trace contains only marker kinds",
+  );
+
+  // tool_start-FIRST session (short first round, no in-round tick) — the
+  // #279 P1-1 corner: tool_start anchors firstActivityAt (same sites as
+  // everSawRealActivity) so a worked session is never reported as
+  // firstActivityLagMs=-1.
+  const st2 = createHeartbeatState();
+  parseHeartbeatLine("[task-heartbeat] ready", st2, 300_000);
+  parseHeartbeatLine("[task-heartbeat] turn_start 0", st2, 300_001);
+  parseHeartbeatLine("[task-heartbeat] tool_start id1 bash", st2, 300_010);
+  ok(st2.everSawRealActivity, "tool_start latches everSawRealActivity");
+  equal(st2.firstActivityAt, 300_010, "tool_start-FIRST session anchors firstActivityAt at the tool_start ts");
+  equal(st2.everSawTool, true, "tool_start latches everSawTool");
+  equal(st2.firstActivityAt, 300_010, "anchor is the FIRST activity — never overwritten by later tool_end");
+  parseHeartbeatLine("[task-heartbeat] tool_end id1", st2, 300_500);
+  equal(st2.firstActivityAt, 300_010, "tool_end does not overwrite the existing anchor");
+});
+
+test("E282c: diagnostics — first-message-stall [task] triage line + tick/marker history in every alive summary (source-scan)", () => {
+  const src = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  ok(src.includes("[task] first-message-stall diagnostic:"), "first-message-stall kills emit the #282 [task] triage line");
+  ok(
+    /\[task\] first-message-stall diagnostic:[\s\S]*?tickCount=/.test(src),
+    "the triage line records tickCount",
+  );
+  ok(
+    /\[task\] first-message-stall diagnostic:[\s\S]*?firstTickLagMs=/.test(src),
+    "the triage line records firstTickLagMs",
+  );
+  ok(
+    /\[task\] first-message-stall diagnostic:[\s\S]*?trace=\[/.test(src),
+    "the triage line records the activity trace",
+  );
+  const aliveTemplates = src.match(/Alive state: toolsInFlight=[^\n]*/g) ?? [];
+  ok(aliveTemplates.length >= 1, "alive summary sites present");
+  for (const site of aliveTemplates) {
+    ok(site.includes("lastMarkerAgeMs="), "every alive summary carries the pre-existing fields");
+    ok(site.includes("tickCount="), "every alive summary exposes tickCount (#282)");
+    ok(site.includes("firstTickLagMs="), "every alive summary exposes firstTickLagMs (#282)");
+    ok(site.includes("trace=["), "every alive summary exposes the activity trace (#282)");
+  }
 });
 
 test("E12: ready + no turn — not tier-1-killed; ticks stop → silence at T; ticks flow → stream-stall at S", () => {
