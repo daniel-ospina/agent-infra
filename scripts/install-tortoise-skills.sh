@@ -6,7 +6,7 @@
 # machine); personal for Pi (~/.pi/agent/skills — the only supported path).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/daniel-ospina/tortoise/main/scripts/install-tortoise-skills.sh | bash -s -- --harness claude
+#   curl -fsSL https://raw.githubusercontent.com/daniel-ospina/agent-infra/main/scripts/install-tortoise-skills.sh | bash -s -- --harness claude
 #   (or codex | cursor | pi)
 #
 # Idempotent: re-running updates the skills in place. Prints the verify step.
@@ -27,7 +27,7 @@ if [ -z "$HARNESS" ]; then
 fi
 
 SKILLS=(how-to-use-tortoise tortoise-decide tortoise-file-finding)
-REPO_URL="https://github.com/daniel-ospina/tortoise.git"
+REPO_URL="https://github.com/daniel-ospina/agent-infra.git"
 REPO_BRANCH="main"
 
 case "$HARNESS" in
