@@ -88,7 +88,7 @@ IF HAS_INFRA AND NOT HAS_WEB:
   Dispatch infra-verify alone (same task() as above).
 ```
 
-**Playwright MCP:** If Playwright MCP is not available in the parent agent context, skip web surface with message "Playwright MCP not available — skipping web clickthrough." The `task` call passes no explicit `mcp_servers` — it inherits from the parent. If the parent agent has Playwright MCP active, sub-agents will too.
+**Playwright MCP:** If Playwright MCP is not available in the parent agent context, skip web surface with message "Playwright MCP not available — skipping web clickthrough." The `task` call MUST pass `mcp_servers` explicitly (e.g. `mcp_servers: "playwright-browser"`) — since #286 sub-agents default to `PI_MCP_SERVERS=none` (zero eager connects), they no longer inherit the parent's MCP servers. Load Playwright mid-run via `mcp_load` if you prefer lazy loading.
 
 ### Step 3 — Collect Results & Report
 

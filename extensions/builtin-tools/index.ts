@@ -2103,7 +2103,7 @@ export default function (pi: ExtensionAPI) {
       // hang ~15min, blocking child startup and starving the heartbeat marker
       // stream (false first-message cuts). Children opt into servers
       // explicitly via the mcp_servers param or mid-run mcp_load.
-      subAgentEnv.PI_MCP_SERVERS = params.mcp_servers ?? "none";
+      subAgentEnv.PI_MCP_SERVERS = params.mcp_servers?.trim() || "none"; // #286 P2: "" (empty string) must not fall through to eager-load-all
 
       const args = ["-p", "--provider", provider, "--model", model, "--no-session", params.prompt];
 

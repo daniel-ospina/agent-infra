@@ -6,6 +6,11 @@
  * and env var propagation without waiting for full LLM response.
  *
  * Run: npx tsx extensions/builtin-tools/subagent-integration.test.ts
+ *
+ * ⚠️ MUST run from the REPO ROOT — the two cwd-relative source tests
+ * (subAgentEnv block in extensions/builtin-tools/index.ts and the
+ * main-worktree-guard contract) use process.cwd()-relative paths;
+ * running from extensions/builtin-tools/ doubles the path and ENOENTs.
  */
 
 import { spawn } from "node:child_process";
@@ -51,40 +56,23 @@ async function runAll(tests: Array<() => Promise<void>>) {
 const tests: Array<() => Promise<void>> = [];
 
 section("#265 env pivot wiring");
-tests.push(test("subAgentEnv ALLOW_MAIN_EDITS — exactly the documented ELDATO_+AGENT_ dual (#265/#7549)", async () => {
+tests.push(test("subAgentEnv sets dual-support ALLOW_MAIN_EDITS (ELDATO + AGENT) with no ELDATO_SKIP_VGATE injection", async () => {
   const src = readFileSync(join(process.cwd(), "extensions", "builtin-tools", "index.ts"), "utf-8");
   const start = src.indexOf("const subAgentEnv");
   ok(start !== -1, "subAgentEnv block not found");
   const blockEnd = src.indexOf("\n};", start);
   const block = src.slice(start, blockEnd === -1 ? start + 4000 : blockEnd);
-  // #265 removed ALLOW_MAIN_EDITS; #7549 later re-added it as a DELIBERATE
-  // escape hatch ("dual-support: also set AGENT_ variant (#7549)") and #825
-  // reaffirmed sub-agents DO get the hatch — the branch-ownership guard
-  // (M1/M2/M3) is the protection layer, not env removal. So the #265-era
-  // "no ALLOW_MAIN_EDITS" assertion was stale (this test is not in CI, so the
-  // drift went unnoticed — fixed 2026-08-16 in #286). Assert exactly the two
-  // documented variants and NO other/undocumented assignment.
-  const allowMatches = block.match(/[A-Z_]+ALLOW_MAIN_EDITS\s*:/g) || [];
-  equal(allowMatches.length, 2, `expected exactly the ELDATO_+AGENT_ dual (#7549), got: ${allowMatches.join(", ")}`);
-  ok(allowMatches.some((s) => s.startsWith("ELDATO_")), "ELDATO_ALLOW_MAIN_EDITS hatch present");
-  ok(allowMatches.some((s) => s.startsWith("AGENT_")), "AGENT_ALLOW_MAIN_EDITS hatch present");
-  // The deliberate escape hatch must survive for EXPLICIT dispatcher use.
+  // #7549 dual-support: the #825 verified-file-registry bridge re-enabled the
+  // hatch — sub-agents get BOTH the ELDATO_ and AGENT_ ALLOW_MAIN_EDITS flags.
+  ok(block.includes("ELDATO_ALLOW_MAIN_EDITS"), "ELDATO_ALLOW_MAIN_EDITS set for sub-agents (dual-support, #7549)");
+  ok(block.includes("AGENT_ALLOW_MAIN_EDITS"), "AGENT_ALLOW_MAIN_EDITS set for sub-agents (dual-support, #7549)");
+  // #825: VGATE stays ACTIVE for sub-agents — assert the ASSIGNMENT is absent
+  // (comments legitimately mention the name, so bare includes() is not enough).
+  ok(!/ELDATO_SKIP_VGATE\s*:/.test(block), "no ELDATO_SKIP_VGATE assignment in subAgentEnv (#825)");
+  // Review DISPATCH stays parent-enforced (#825): sub-agents don't run the
+  // parent's review ceremony, so the gate-override flag is set.
   ok(block.includes("SKILL_ENFORCER_DISABLED"), "SKILL_ENFORCER_DISABLED still set for sub-agents");
-  ok(block.includes("ELDATO_SKIP_VGATE"), "ELDATO_SKIP_VGATE still set for sub-agents");
-}));
-
-tests.push(test("PI_MCP_SERVERS defaults to 'none' when mcp_servers param absent (#286)", async () => {
-  // The subAgentEnv MCP wiring must DEFAULT the allowlist instead of only
-  // setting it when the param is given — a missing allowlist makes mcp-client
-  // eagerly connect ALL non-lazy servers (classifyServers treats undefined as
-  // "load all"), which hangs ~15min and starves the heartbeat marker stream.
-  const src = readFileSync(join(process.cwd(), "extensions", "builtin-tools", "index.ts"), "utf-8");
-  const mcpWiring = src.match(/subAgentEnv\.PI_MCP_SERVERS\s*=\s*params\.mcp_servers[^;]*;/);
-  ok(mcpWiring !== null, "subAgentEnv.PI_MCP_SERVERS wiring not found");
-  ok(
-    mcpWiring![0].includes('params.mcp_servers ?? "none"'),
-    `default should be \"none\" (zero eager connects). wiring: ${mcpWiring![0]}`,
-  );
+  ok(block.includes("AGENT_SKIP_REVIEW_GATE"), "AGENT_SKIP_REVIEW_GATE still set for sub-agents");
 }));
 
 tests.push(test("escape hatch flags still honored when set explicitly (classifier path)", async () => {
@@ -159,3 +147,17 @@ tests.push(test("no ParseError in extension loading", async () => {
 }));
 
 runAll(tests);
+
+tests.push(test("PI_MCP_SERVERS defaults to 'none' when mcp_servers param absent (#286)", async () => {
+  // The subAgentEnv MCP wiring must DEFAULT the allowlist instead of only
+  // setting it when the param is given — a missing allowlist makes mcp-client
+  // eagerly connect ALL non-lazy servers (classifyServers treats undefined as
+  // "load all"), which hangs ~15min and starves the heartbeat marker stream.
+  const src = readFileSync(join(process.cwd(), "extensions", "builtin-tools", "index.ts"), "utf-8");
+  const mcpWiring = src.match(/subAgentEnv\.PI_MCP_SERVERS\s*=\s*params\.mcp_servers[^;]*;/);
+  ok(mcpWiring !== null, "subAgentEnv.PI_MCP_SERVERS wiring not found");
+  ok(
+    mcpWiring![0].includes('params.mcp_servers?.trim() || "none"'),
+    `default should be "none" (zero eager connects). wiring: ${mcpWiring![0]}`,
+  );
+}));
