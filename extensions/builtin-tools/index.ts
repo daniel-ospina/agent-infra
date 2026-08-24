@@ -759,6 +759,39 @@ export interface HeartbeatState {
   sessionEnded: boolean;
   /** 0 = no marker ever received (stateFresh false → legacy behavior). */
   lastMarkerAt: number;
+
+  /** #282: first-message-stall triage instrumentation (additive, session-level,
+   * monotonic — never reset by turn resets in the child). Records the run's
+   * tick/marker history so a never-worked cut can be triaged into "genuinely
+   * hung provider" vs "slow pre-activity thinking": a hung first request shows
+   * ticks streaming with all-zero saw flags and firstActivityLagMs = -1, while
+   * a slow-thinking startup-heavy dispatch shows the same zero flags but a
+   * first tick/marker lag within the bound's intent. */
+  /** Total valid markers parsed (any kind) — marker history density. */
+  markerCount: number;
+  /** Total tick markers parsed (the 30s LLM-independent backstop). */
+  tickCount: number;
+  /** ts of the first valid marker (0 = none) → first-marker lag anchor. */
+  firstMarkerAt: number;
+  /** ts of the first tick marker (0 = none) → first-tick lag anchor. */
+  firstTickAt: number;
+  /** Session latch — a streamed message was ever observed (tick saw_msg=1 or
+   * implied by a parsed tool_end, which provably implies prior model output).
+   * Distinct from per-turn turnSawMessage (resets on turn_start). */
+  everSawMsg: boolean;
+  /** Session latch — tool activity was ever observed (tool_start/tool_end or
+   * tick saw_tool=1). Distinct from per-turn turnSawTool (resets on turn_start). */
+  everSawTool: boolean;
+  /** ts of the first everSawRealActivity source (0 = none) — the parent's
+   * time-to-first-observable-activity, comparable to the child's own
+   * time-to-first-activity measured from session logs (#282 sweep). */
+  firstActivityAt: number;
+  /** High-water mark of toolsInFlight ever parsed. */
+  toolsMaxInFlight: number;
+  /** First-N marker kinds in parse order (bounded, oldest kept) — the run's
+   * saw_msg/saw_tool/tools evolution at a glance (e.g. [ready,turn_start,
+   * tick,tick]). */
+  activityTrace: string[];
 }
 
 export function createHeartbeatState(): HeartbeatState {
@@ -774,6 +807,16 @@ export function createHeartbeatState(): HeartbeatState {
     sawReady: false,
     sessionEnded: false,
     lastMarkerAt: 0,
+    // #282 triage instrumentation — see HeartbeatState.
+    markerCount: 0,
+    tickCount: 0,
+    firstMarkerAt: 0,
+    firstTickAt: 0,
+    everSawMsg: false,
+    everSawTool: false,
+    firstActivityAt: 0,
+    toolsMaxInFlight: 0,
+    activityTrace: [],
   };
 }
 
@@ -823,6 +866,13 @@ export function parseHeartbeatLine(
     if (!nm || nm[1] !== expectedNonce) return false;
   }
   state.lastMarkerAt = now;
+  // #282: marker-history instrumentation — every valid marker counts; the
+  // trace keeps the FIRST kinds (a never-worked cut's whole history is its
+  // startup: ready → turn_start → zero ticks, so oldest-first is the
+  // triage-relevant order).
+  state.markerCount += 1;
+  if (state.firstMarkerAt === 0) state.firstMarkerAt = now;
+  if (state.activityTrace.length < HEARTBEAT_TRACE_MAX) state.activityTrace.push(kind);
   switch (kind) {
     case "ready":
       state.sawReady = true;
@@ -833,11 +883,18 @@ export function parseHeartbeatLine(
       break;
     case "tool_start":
       state.toolsInFlight += 1;
+      state.toolsMaxInFlight = Math.max(state.toolsMaxInFlight, state.toolsInFlight);
+      state.everSawTool = true;
       state.everSawWork = true;
       // #279: a tool_start proves real (work-loop) activity — the first tool
       // round must latch the session so the per-turn first-message bound can
       // never cut a demonstrably-working sub-agent.
       state.everSawRealActivity = true;
+      // #282: tool_start is a first-activity source (same sites as
+      // everSawRealActivity) — anchor it so a tool_start-first session (the
+      // short-round marker-loss corner #279 P1-1 closes) is not reported as
+      // firstActivityLagMs=-1.
+      if (state.firstActivityAt === 0) state.firstActivityAt = now;
       break;
     case "tool_end":
       state.toolsInFlight = Math.max(0, state.toolsInFlight - 1);
@@ -849,6 +906,13 @@ export function parseHeartbeatLine(
       // zero evidence. A never-worked hung-first-request session can never
       // reach tool code (no message → no tool_end) → #5926 stays safe.
       state.everSawRealActivity = true;
+      if (state.firstActivityAt === 0) state.firstActivityAt = now;
+      // #282: a parsed tool_end provably implies prior model output — the
+      // streamed message that produced the tool call — so it latches the
+      // msg/tool session flags AND the first-activity anchor (the same
+      // evidence #279 P1-1 uses for everSawRealActivity).
+      state.everSawMsg = true;
+      state.everSawTool = true;
       // #279 (P1-2 hardening, review fix): the nested-task round's last tick
       // froze streamAgeMs > S; tool_end drops toolsInFlight to 0, so WITHOUT
       // this reset the 10s decision can stream-stall-cut the live verdict in
@@ -897,13 +961,18 @@ export function parseHeartbeatLine(
       state.toolAgeMaxMs = 0;
       break;
     case "tick": {
+      state.tickCount += 1;
+      if (state.firstTickAt === 0) state.firstTickAt = now;
       for (const m of rest.matchAll(/([a-z_]+)=(\d+)/g)) {
         const v = Number(m[2]);
         // Overflow guard: arbitrarily long digit strings parse to Infinity and
         // would fire a stall clause instantly (code-review fix).
         if (!Number.isFinite(v)) continue;
         switch (m[1]) {
-          case "tools": state.toolsInFlight = v; break;
+          case "tools":
+            state.toolsInFlight = v;
+            state.toolsMaxInFlight = Math.max(state.toolsMaxInFlight, v);
+            break;
           case "turn": state.turnActive = v === 1; break;
           case "stream_age_ms": state.streamAgeMs = v; break;
           case "tool_age_max_ms": state.toolAgeMaxMs = v; break;
@@ -918,11 +987,18 @@ export function parseHeartbeatLine(
       // sessions). The nonce check precedes the switch, so a forged tick
       // cannot set the latch. The latch is monotonic — turn resets in the
       // child cannot erase it.
+      const prevActivity = state.everSawRealActivity;
       state.everSawRealActivity =
         state.everSawRealActivity ||
         state.toolsInFlight > 0 ||
         state.turnSawMessage ||
         state.turnSawTool;
+      // #282: session-level activity latches + first-activity anchor. Latched
+      // only on a false→true transition so the anchor is the FIRST observable
+      // activity, not the latest tick; turn resets cannot erase them.
+      if (state.turnSawMessage) state.everSawMsg = true;
+      if (state.turnSawTool) state.everSawTool = true;
+      if (!prevActivity && state.everSawRealActivity) state.firstActivityAt = now;
       break;
     }
     default:
@@ -946,6 +1022,11 @@ export function flushHeartbeatResidue(
 
 /** Bounded residual line buffer for marker ingestion (few KB). */
 export const HEARTBEAT_LINE_BUF_MAX = 4_096;
+
+/** #282: activityTrace cap — the FIRST N marker kinds are kept (oldest-first
+ * is the triage-relevant order for a never-worked cut, whose whole history is
+ * its startup). O(1) bounded memory regardless of session length. */
+export const HEARTBEAT_TRACE_MAX = 8;
 
 export interface HeartbeatIngestContext {
   state: HeartbeatState;
@@ -1452,7 +1533,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       doResolve({
         content: [{
           type: "text",
-          text: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.\n\nAlive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${stdout.slice(-500)}`,
+          text: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.\n\nAlive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}]\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${stdout.slice(-500)}`,
         }],
         details: { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
       }, { sweep: true });
@@ -1529,7 +1610,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // zero-partial cut stays retryable by the retry wrapper, mirroring
         // the kill-clause contract.
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}]`;
         const headline = "⚠️ Sub-agent was cut — process exited mid-tool / no life signs. Partial results below — parent should decide: accept, re-dispatch, or escalate.";
         const output = stdout.trim();
         const errInfo = stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "";
@@ -1603,7 +1684,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
 
       const lastOutput = stdout.slice(-500);
       const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs}`;
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}]`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
@@ -1612,6 +1693,18 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         "max-dispatch": `⚠️ Sub-agent exceeded the total dispatch cap (${Math.round(hbThresholds.maxDispatchMs / 1000)}s, TASK_MAX_DISPATCH_MS). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "cut": `⚠️ Sub-agent was cut — no life signs for ${Math.round(markerAgeMs / 1000)}s (marker gap exceeded ${Math.round(hbThresholds.cutGapMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
       };
+      // #282: first-message-stall triage line — every clause-4 kill is a
+      // never-worked session by construction (#279 gate); record the run's
+      // tick/marker history so the cut can be triaged into "genuinely hung
+      // provider" (zero saw flags + no first activity) vs "slow pre-activity
+      // thinking on a startup-heavy dispatch" (same markers, first tick/marker
+      // lag within the bound's intent). Also mirrored into the partial's
+      // aliveSummary above.
+      if (decision.reason === "first-message-stall") {
+        console.error(
+          `[task] first-message-stall diagnostic: elapsedMs=${Math.round(hbCtx.state.streamAgeMs / 1000)}s tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] bound=${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s`,
+        );
+      }
       doResolve({
         content: [{ type: "text", text: `${headlines[decision.reason ?? "silence-threshold"]}\n\n${aliveSummary}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${lastOutput}` }],
         details: { model, provider, killed: true, reason: decision.reason, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
@@ -1650,7 +1743,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           return;
         }
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs}`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}]`;
         const lastOutput = stdout.slice(-500);
         doResolve({
           content: [{ type: "text", text: `${headline}\n\n${aliveSummary}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${lastOutput}` }],
