@@ -622,6 +622,296 @@ export function readAllowMarkerState(path, sessionId, nowMs = Date.now(), ttlMs 
   }
 }
 
+// ── M4: hub-state gate (#1484) ─────────────────────────────────────────────
+// The shared main checkout (the hub) must stay on `main` and clean. When it is
+// off-main or dirty, the guard BLOCKS all git ops except the sanctioned
+// recovery allowlist (Slice B): checkout main/master, pull --ff-only, fetch,
+// status, log, worktree add/list/prune/remove, push origin <checked-out-branch>
+// (WIP preservation — the stranded branch's commits must not silently die),
+// and the escape-marker touch. Read-only ops stay allowed. Everything else
+// (commit, push of any OTHER branch, checkout -b, merge/rebase/reset/clean,
+// write/edit in the hub) is blocked — even under the TTL marker (D3: only the
+// env flag AGENT_ALLOW_MAIN_EDITS=1 is a full bypass).
+// Pure JS so test.mjs exercises the SAME rules index.ts applies.
+
+/** Verbs that can mutate repo/remote state and are therefore NOT read-only in
+ * a disordered hub without argument guards (handled in isHubRecoveryInvocation). */
+const HUB_GUARDED_VERBS = new Set([
+  "branch", "tag", "stash", "submodule", "symbolic-ref", "remote", "worktree",
+]);
+
+/** Read-only verbs — safe to run in a disordered hub (no state mutation). */
+const HUB_READONLY_VERBS = new Set([
+  "status", "log", "diff", "show", "blame", "remote", "rev-parse",
+  "rev-list", "ls-files", "ls-tree", "ls-remote", "grep", "shortlog",
+  "describe", "name-rev", "cat-file", "for-each-ref", "help", "version",
+  "merge-base", "merge-tree", "merge-file", "merge-index", "merge-msg",
+  "merge-one-file", "mergetool", "check-ref-format", "var", "hash-object",
+  "count-objects", "verify-pack", "verify-commit", "verify-tag", "config",
+  "reflog", "whatchanged", "cherry", "fsck",
+]);
+
+/** Mutating git verbs with NO sanctioned recovery form — always blocked. */
+const HUB_MUTATING_VERBS = new Set([
+  "commit", "add", "merge", "rebase", "reset", "clean", "restore", "rm",
+  "mv", "cherry-pick", "revert", "am", "apply", "update-ref",
+  "update-index", "checkout-index", "gc", "prune", "repack", "notes",
+  "replace", "filter-branch", "format-patch", "bundle", "send-email",
+  "checkout", "switch", "pull", "push", "fetch",
+]);
+
+/**
+ * Classify ONE git invocation (verb + args) against the hub-recovery
+ * allowlist. Returns:
+ *   "recovery" — a sanctioned recovery op (checkout main, pull --ff-only,
+ *                fetch, status, log, worktree ops, push of the checked-out
+ *                branch).
+ *   "readonly" — a harmless read (diff/show/blame/...).
+ *   "block"    — a mutation outside the allowlist (commit, checkout -b,
+ *                foreign push, merge, reset, clean, ...).
+ * @param {string} verb
+ * @param {string[]} args
+ * @param {string|null} currentBranch — branch checked out in the hub (for the
+ *   push carve-out; null = detached → foreign pushes are unknowable → block).
+ */
+export function isHubRecoveryInvocation(verb, args, currentBranch) {
+  const a = args || [];
+  const pos = a.filter((x) => !x.startsWith("-"));
+  const flag = (f) => a.includes(f);
+  switch (verb) {
+    case "checkout":
+    case "switch":
+      // ONLY `checkout main|master` (recovery). Path-restore (--), discard-all
+      // (.), previous-branch (-), create/force/orphan/detach forms → block.
+      if (a.includes("--")) return "block";
+      if (["-b", "-B", "-c", "-f", "--force", "--orphan", "--detach"].some(flag)) return "block";
+      if (pos.length !== 1 || pos[0] === "." || pos[0] === "-") return "block";
+      return pos[0] === "main" || pos[0] === "master" ? "recovery" : "block";
+    case "pull":
+      // Plain pull may merge — only --ff-only is lossless recovery.
+      return flag("--ff-only") ? "recovery" : "block";
+    case "fetch":
+      return "recovery";
+    case "status":
+    case "log":
+      return "recovery";
+    case "worktree": {
+      // Worktree ops never mutate the hub's own branch/index — all subcommands
+      // are sanctioned recovery tooling.
+      const sub = pos[0];
+      if (!sub) return "recovery";
+      return ["add", "list", "prune", "remove"].includes(sub) ? "recovery" : "block";
+    }
+    case "push": {
+      // WIP preservation: push of the CHECKED-OUT branch to origin is the one
+      // allowed push (the stranded lane's 38 commits must not silently die).
+      // Force/delete/mirror/tags and foreign targets → block.
+      if (flag("-f") || flag("--force") || flag("--delete") ||
+          a.includes("--mirror") || a.includes("--tags")) return "block";
+      if (!currentBranch) return "block"; // detached hub — push target unknowable
+      const refspecs = pos.length > 1 ? pos.slice(1) : [];
+      const dsts = refspecs.length
+        ? refspecs.map((r) => _refspecDst(r)).filter((x) => x !== null && x !== undefined)
+        : [currentBranch]; // bare push → push.default=simple → current branch
+      if (dsts.length === 0) return "block";
+      return dsts.every((d) => d === currentBranch) ? "recovery" : "block";
+    }
+    default:
+      break;
+  }
+  if (HUB_MUTATING_VERBS.has(verb)) return "block";
+  if (HUB_GUARDED_VERBS.has(verb)) {
+    // Verbs with a read-only form and a mutating form — gate on the args.
+    if (verb === "branch") {
+      // `git branch` bare / -a / -r / -vv / --show-current = list (read-only);
+      // create (`git branch foo`), delete/rename/force → block.
+      if (["-d", "-D", "-m", "-M", "-f", "--force"].some(flag)) return "block";
+      return pos.length > 0 ? "block" : "readonly";
+    }
+    if (verb === "tag") return pos.length > 0 ? "block" : "readonly"; // create/delete
+    if (verb === "stash") {
+      const sub = pos[0];
+      if (!sub) return "block"; // bare `git stash` = push
+      return sub === "list" || sub === "show" ? "readonly" : "block";
+    }
+    if (verb === "submodule") {
+      const sub = pos[0];
+      if (!sub) return "block";
+      return ["status", "foreach", "summary"].includes(sub) ? "readonly" : "block";
+    }
+    if (verb === "symbolic-ref") {
+      return pos[0] === "HEAD" ? "block" : "readonly"; // HEAD = branch-state change
+    }
+    if (verb === "remote") {
+      const sub = pos[0];
+      if (!sub || ["-v", "show", "get-url", "list"].includes(sub)) return "readonly";
+      return "block"; // add/remove/set-url/prune mutate remote config/refs
+    }
+    return "block"; // worktree handled above; unreachable guard
+  }
+  if (HUB_READONLY_VERBS.has(verb)) return "readonly";
+  return "block"; // fail-closed: unknown git verb is not sanctioned recovery
+}
+
+/**
+ * Evaluate a WHOLE shell command against the hub-recovery allowlist.
+ * Every git invocation in a compound command is gated (`git pull && git
+ * commit` → block on the commit). Returns:
+ *   { verdict: "non-git" }             — no git invocation (not gated)
+ *   { verdict: "allowed" }             — all invocations read-only
+ *   { verdict: "recovery" }            — at least one sanctioned recovery op,
+ *                                        none blocked
+ *   { verdict: "block", reason }       — a non-sanctioned mutation present
+ * @param {string} command
+ * @param {string|null} currentBranch — hub's checked-out branch (push carve-out)
+ */
+export function evaluateHubGate(command, currentBranch) {
+  const invocations = _allGitInvocations(command);
+  if (invocations.length === 0) return { verdict: "non-git" };
+  let sawRecovery = false;
+  for (const inv of invocations) {
+    if (!inv.verb) continue;
+    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch);
+    if (v === "block") {
+      return {
+        verdict: "block",
+        reason: [
+          `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+          `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
+          `   Sanctioned recovery ops only: git checkout main|master, git pull`,
+          `   --ff-only, git fetch, git status, git log, git worktree`,
+          `   add|list|prune, git push origin <checked-out-branch> (WIP), marker touch.`,
+          `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
+          `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+        ].join("\n"),
+      };
+    }
+    if (v === "recovery") sawRecovery = true;
+  }
+  return { verdict: sawRecovery ? "recovery" : "allowed" };
+}
+
+/**
+ * Hub disorder of a repo checkout: "off_main" | "dirty" | "both" | null.
+ * The hub's only legal state is main/master + empty porcelain — untracked
+ * files count as dirty (`status --porcelain` includes them).
+ * Resolves the MAIN checkout via git-common-dir semantics (getMainCheckoutBranch
+ * pattern) so it works from a worktree too (D5) — pass the session cwd.
+ * @param {string} cwd
+ * @param {{ skipWorktree?: boolean, skipInfra?: boolean, env?: object }} [opts]
+ * @returns {{ disorder: string|null, branch: string|null }}
+ */
+export function readHubDisorder(cwd, { skipWorktree = true, skipInfra = true, env } = {}) {
+  try {
+    if (skipWorktree && isWorktreeCwd(cwd)) return { disorder: null, branch: null };
+    if (skipInfra && isAgentInfraRepo(cwd, env)) return { disorder: null, branch: null }; // #99
+    const gitDir = execSync("git rev-parse --git-dir", {
+      encoding: "utf-8", cwd, timeout: 5000,
+    }).trim();
+    if (gitDir.includes("/worktrees/") || gitDir.endsWith("/worktrees")) {
+      return { disorder: null, branch: null };
+    }
+    const branch = execSync("git branch --show-current", {
+      encoding: "utf-8", cwd, timeout: 5000,
+    }).trim() || null;
+    const porcelain = execSync("git status --porcelain", {
+      encoding: "utf-8", cwd, timeout: 5000,
+    }).trim();
+    const onMain = branch === "main" || branch === "master";
+    const dirty = porcelain.length > 0;
+    if (onMain && !dirty) return { disorder: null, branch };
+    const disorder = !onMain && dirty ? "both" : onMain ? "dirty" : "off_main";
+    return { disorder, branch };
+  } catch {
+    return { disorder: null, branch: null }; // degrade — never false-block on git errors
+  }
+}
+
+// ── Script backdoor closure (#1484, Slice E) ────────────────────────────────
+// The documented escape (`write /tmp/x.sh` + `bash /tmp/x.sh`) executes
+// arbitrary git unblocked. Closure: when the session cwd IS the hub main
+// checkout, shell-script execution whose content performs a non-sanctioned git
+// mutation is blocked (a script's git ops are gated EXACTLY like direct git
+// ops — recovery scripts like hub-worktree.sh keep working).
+
+const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "source"]);
+
+/**
+ * Extract the script path from a shell command, or null when the command does
+ * not execute a script FILE (inline `-c` strings are the caller's command
+ * itself and are gated by the normal classifier). Only LEADING positions count
+ * (env-prefix / cd / separators allowed) so `git add ./foo` never false-matches.
+ * @param {string} command
+ * @returns {string|null}
+ */
+export function extractScriptPath(command) {
+  const tokens = _tokenize(command);
+  let i = 0;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }   // env prefix
+    if (t === "cd") { i += 2; continue; }                         // cd prefix
+    if (t === "&&" || t === ";" || t === "||") { i++; continue; } // separators
+    break;
+  }
+  if (i >= tokens.length) return null;
+  const t = tokens[i];
+  if (SHELL_INTERPRETERS.has(t)) {
+    const next = tokens[i + 1];
+    if (!next || next.startsWith("-")) return null; // flags / -c inline
+    return next;
+  }
+  if (t === ".") { // `. script`
+    const next = tokens[i + 1];
+    return next && !next.startsWith("-") ? next : null;
+  }
+  if (/^\.{0,2}\//.test(t)) return t; // ./x.sh or /abs/x.sh direct execution
+  return null;
+}
+
+/**
+ * Gate a script FILE's git content against the hub-recovery allowlist.
+ * "block" = the script performs a non-sanctioned git mutation (backdoor
+ * pattern); "allow" = no git, or all git ops are sanctioned/read-only.
+ * Unreadable/missing file → "allow" (the file doesn't exist yet — nothing to
+ * execute; a later call re-checks after the write).
+ * @param {string} path
+ * @param {string|null} currentBranch
+ * @returns {"allow"|"block"}
+ */
+export function scriptGitVerdict(path, currentBranch) {
+  let content;
+  try {
+    content = readFileSync(path, "utf-8");
+  } catch {
+    return "allow";
+  }
+  const invocations = _allGitInvocations(_stripShellComments(content));
+  for (const inv of invocations) {
+    if (!inv.verb) continue;
+    if (isHubRecoveryInvocation(inv.verb, inv.args, currentBranch) === "block") {
+      return "block";
+    }
+  }
+  return "allow";
+}
+
+/** Strip shell comments (# … to EOL) quote-aware — a `# git commit` remark in a
+ * script's prose must not gate as a real invocation, and an inline ` # reason`
+ * on a recovery line must not poison its arg list. */
+function _stripShellComments(content) {
+  return String(content).split("\n").map((line) => {
+    let inS = false, inD = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === "'" && !inD) { inS = !inS; continue; }
+      if (ch === '"' && !inS) { inD = !inD; continue; }
+      if (ch === "#" && !inS && !inD) return line.slice(0, i);
+    }
+    return line;
+  }).join("\n");
+}
+
 // Expand a path token: strip surrounding quotes, expand `~` / `$HOME`
 // (incl. ${HOME} and quoted variants) BEFORE resolve + exact-match.
 function _expandMarkerToken(token, home) {

@@ -168,3 +168,64 @@ So `{ ...options, fetch: tunedFetch }` in a wrapped `ProviderStreams` is all
 that is needed — no upstream change. The extension factory is
 failure-contained: it never throws (any setup error → warn + no registration),
 so pi startup cannot be blocked.
+
+## 6. Offline-resume retry — survive network outages, don't stop (#318)
+
+By default pi retries a failed LLM turn 3 times (2s → 4s → 8s exponential
+backoff) and then **ends the session** with the error. On a wifi drop that
+means a session stops dead; when the network returns nothing resumes. The
+agent-infra offline-resume patch changes the policy to: quick retries first,
+then keep retrying **every 5 minutes indefinitely** until connectivity
+returns. The session pauses, the user's laptop can sleep through a dead
+connection, and work resumes automatically — nothing is lost, nothing needs
+re-running.
+
+### What changed
+
+| Surface | Change | Where |
+|---|---|---|
+| Agent-turn retry (the visible "Retry N/M" path) | Backoff capped at 5 min | patched `dist/core/agent-session.js` in the installed pi |
+| Compaction / branch-summary retry | Same 5-min cap (same no-cap backoff) | patched `pi-ai/dist/utils/retry.js` |
+| Retry budget | `retry.maxRetries: 10000` (≈34 days at 5-min intervals = effectively infinite) | `~/.pi/agent/settings.json` + `pi-bootstrap/pi-config/settings.json` |
+| Task sub-agents | Network-aware kill suppression — while the network is unreachable AND the child is alive (fresh heartbeat markers), the stall clauses (stream-stall / silence / first-message) don't kill it; it survives in retry | `extensions/builtin-tools/index.ts` (`heartbeatKillDecision` + probe in the heartbeat loop) |
+
+### The patch lifecycle
+
+The pi dist patch is **not** a normal repo file — it lives in the installed
+package and would be wiped by `pi update`. `scripts/patch-pi-retry.sh`
+applies it idempotently (no-op when already patched, fails loudly if a pi
+upgrade changed the target code so the patch must be re-based). It is wired
+into `pi-bootstrap/setup.sh`, which auto-sync runs at every session start, so
+a pi update is re-patched automatically on the next sync. Verify anytime:
+
+```bash
+scripts/patch-pi-retry.sh --check
+```
+
+### Behavior
+
+- Network dies mid-turn: 3 quick retries (2s/4s/8s), then retries at
+  16s → 32s → 64s → 128s → 256s → **every 300s (5 min) indefinitely**.
+- Abort anytime with Esc (RPC `abort_retry`); `retry.enabled: false` in
+  settings disables retrying entirely (setup.sh deep-merges the `retry` block
+  per-key, so a local `enabled: false` survives every sync). Note: with the
+  huge budget, a persistent retryable failure (sustained 5xx) retries for
+  days instead of ending the session loudly — the abort path and
+  `enabled: false` are the escapes.
+- A task sub-agent in retry is not killed by the parent while the network is
+  down — but ONLY for kills the pure decision would suppress (network down
+  AND fresh heartbeat markers; a never-initialized child or a dead child with
+  stale markers is still killed, outage or not). The hard cap
+  (`TASK_HARD_CAP_MS`, 2h default) still bounds each dispatch as the last
+  resort — the opt-in `TASK_MAX_DISPATCH_MS` wall-clock cap is also
+  suppressed during an outage (the child is waiting, not drip-streaming; the
+  hard cap is the outage bound). The suppression is ON by default (behavior
+  change for task sub-agents); `TASK_NETWORK_WAIT=0` disables it (fail-open
+  legacy).
+- Env knobs: `PI_MAX_RETRY_DELAY_MS` (patch cap, default 300000),
+  `TASK_NETWORK_PROBE_URL` (probe target, default = provider baseUrl from
+  models.json), `TASK_NETWORK_PROBE_TIMEOUT_MS` (default 5000, clamped ≤ 9s
+  so ticks never overlap), `TASK_NETWORK_PROBE_CACHE_MS` (default 15000).
+
+Upstream gap (no configurable agent-level retry delay cap) is drafted in
+`docs/upstream-pi-bugs.md` as Issue D.

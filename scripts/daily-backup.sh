@@ -125,7 +125,6 @@ for i in $(seq 1 30); do
     elif [ "$lg_rc" -ne 0 ] && [ "$lg_rc" -ne 3 ]; then
         echo "[load-gate] helper unavailable during wait (rc $lg_rc) — completing wait without load re-check" >&2
     fi
-    fi
     LASTSAVE=$(docker exec "$CONTAINER" redis-cli -p "$REDIS_PORT" LASTSAVE 2>/dev/null || echo "0")
     # Check if there have been no changes since the BGSAVE we just triggered
     # by polling redis-cli INFO persistence

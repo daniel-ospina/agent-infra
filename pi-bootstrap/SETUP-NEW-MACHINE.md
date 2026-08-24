@@ -35,8 +35,15 @@ cd <repo-path>/pi-bootstrap && ./setup.sh
 
    (Example: `cd ~/Documents/GitHub/agent-infra/pi-bootstrap && ./setup.sh`)
 
-It copies your models, agents, extensions, rules, skills, and **MCP config** into
+It copies your models, agents, extensions, rules, skills, scripts, and **MCP config** into
 `~/.pi/agent`. Run it again anytime to refresh.
+
+**Launchd agents (macOS):** setup.sh also installs the scheduled jobs via
+`scripts/install-launchd.sh` — the versioned plist templates in
+`templates/launchd/` (hub-state-check every 6h; corruption-canary every
+15 min on swarm hosts). The installer is idempotent: renders → diffs vs the
+installed plist → skips when identical, reloads on change. Run
+`scripts/install-launchd.sh --status` to inspect; `--uninstall` to remove.
 
 ## Step 3 — Transfer your keys (one-time, ~5 min)
 
@@ -66,8 +73,16 @@ machine's pi instance.
   start pi, it checks GitHub and if the main Mac published updates, it pulls
   them and refreshes this machine's config. Nothing to do.
 - Manual refresh anytime: `cd ~/agent-infra && ./sync.sh`
-- **What syncs:** skills, extensions, agents, models, settings, rules, and the
-  base MCP config (`templates/.mcp.base.json` → `~/.pi/agent/.mcp.json`).
+- **Launchd on a swarm host:** after the one-time setup, run the swarm
+  bootstrap (`bash scripts/bootstrap.sh` in the swarm checkout) — it installs
+  the 8 swarm daemons (its own installer) and delegates the agent-infra jobs
+  (hub-state-check + corruption-canary) to `scripts/install-launchd.sh`, so
+  the full 10-job fleet converges. Order: `pi-bootstrap/setup.sh` →
+  swarm `bootstrap.sh` → `scripts/install-launchd.sh` (all idempotent).
+- **What syncs:** skills, extensions, agents, models, settings, rules, the
+  base MCP config (`templates/.mcp.base.json` → `~/.pi/agent/.mcp.json`), the
+  `scripts/checkout-hygiene/` farm (symlinks into `~/.pi/agent/scripts/`), and
+  the launchd agents (via `scripts/install-launchd.sh`, #304).
 - **MCP servers:** pi loads MCP servers from the first `.mcp.json` found walking
   up from your working directory to the repo's git top-level, falling back to
   `~/.pi/agent/.mcp.json` (the base config). A repo-local `.mcp.json` overrides

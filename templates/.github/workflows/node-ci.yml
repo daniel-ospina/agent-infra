@@ -1,8 +1,11 @@
 name: Node.js CI
 # Reusable workflow — Node.js CI (script validate, skill lint, typecheck, lint)
 # Source: agent-infra/templates/.github/workflows/node-ci.yml
-# Called via: uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
-# Symlinked from repos for `agent-infra check` drift detection.
+# Called via: uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@<ref>
+# Version contract (#303): consumers pin a semver tag (e.g. @v0.1.0); only
+# agent-infra's own self-caller uses @main (same-commit, no tag-before-merge).
+# Materialized to .github/workflows/ by scripts/sync-ci-workflows.sh (real
+# files only — GitHub Actions CANNOT parse symlinked workflow files, #555).
 # Budget: PR-only (shared Actions budget under daniel-ospina account)
 
 on:

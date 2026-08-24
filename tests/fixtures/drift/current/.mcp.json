@@ -1,0 +1,6 @@
+{
+  "mcpServers": {
+    "exa": { "command": "npx", "args": ["-y", "@mcp/exa"] },
+    "fixture-local": { "command": "node", "args": ["local-server.js"], "description": "fixture customization — content drift is warn-only in CI" }
+  }
+}

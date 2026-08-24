@@ -1,10 +1,9 @@
 import type { ExtensionAPI, ToolCallEvent, ToolCallEventResult, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import { relative, resolve, isAbsolute } from "node:path";
+import { relative, resolve, isAbsolute, join, dirname, basename } from "node:path";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync } from "node:fs";
-import { join } from "node:path";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
@@ -158,8 +157,13 @@ const BRIDGE_DIR = join(homedir(), ".pi", "agent", "verification");
 // to the child via the env spread). A task child can therefore NEVER fall
 // back to the interactive path: #7591 auto-bypass is unreachable for
 // sub-agent commits (#264 P2/P3).
-function isTaskSubAgent(): boolean {
-  return process.env.TASK_HEARTBEAT === "1" && process.env.PI_MODE === "print";
+function isTaskSubAgent(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  // Env-param seam (mirrors task-heartbeat's taskHeartbeatActive): reads the
+  // env via a parameter, never raw process.env — keeps the #228 print-mode
+  // wiring gate (extensions/shared/print-mode-wiring.test.ts) green.
+  return env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print";
 }
 
 function bridgePath(): string {
@@ -261,8 +265,9 @@ function recoverBridgeForRoot(normRoot: string): number {
       const relPath = normalizeRegistryPath(parsed.root, parsed.path);
       if (relPath.startsWith("..") || isAbsolute(relPath)) continue;
       // Match-or-drop: only merge when the stored (verifier-authoritative)
-      // hash still matches the file on disk. Never recompute a fresh hash.
-      if (vf.hash !== hashFile(parsed.root, relPath)) continue;
+      // hash still matches the file on disk (sha1 or sha256, #320). Never
+      // recompute a fresh hash — a post-PASS edit must fail closed.
+      if (!hashMatchesDisk(parsed.root, relPath, vf.hash)) continue;
       verifiedSet.set(vf.path, vf.hash);
       blockAttempts.delete(vf.path);
       recovered++;
@@ -627,6 +632,22 @@ function hashFile(projectRoot: string, filePath: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
+/**
+ * #320: verifier-submitted hashes may be sha1 (40-hex) or sha256 (64-hex) —
+ * LLM verifiers pick whatever hash tool they know, and an algorithm mismatch
+ * must not false-block an unchanged file. Accept a match with EITHER
+ * algorithm (inferred by hex length; hex compare is case-insensitive). The
+ * check is anti-drift (file changed between verification and commit) and any
+ * content change flips both digests, so sha1 acceptance does not weaken it.
+ * Unknown lengths are compared as sha256 → fail closed (no match → block).
+ */
+export function hashMatchesDisk(projectRoot: string, filePath: string, storedHash: string): boolean {
+  const absPath = resolve(projectRoot, filePath);
+  const content = readFileSync(absPath);
+  const algo = storedHash.length === 40 ? "sha1" : "sha256";
+  return createHash(algo).update(content).digest("hex") === storedHash.toLowerCase();
+}
+
 // #7595: verifier sub-agents may return absolute paths (e.g.
 // "/Users/x/repo/src/a.ts") or root-relative forms ("./src/a.ts") while
 // git diff yields repo-relative paths ("src/a.ts"). Registry keys must be
@@ -640,7 +661,14 @@ export function normalizeRegistryPath(projectRoot: string, filePath: string): st
   let realRoot = projectRoot;
   let realAbs = abs;
   try { realRoot = realpathSync(projectRoot); } catch { /* keep lexical */ }
-  try { realAbs = realpathSync(abs); } catch { /* keep lexical */ }
+  try {
+    // realpath the PARENT DIR only. realpathSync(abs) resolves a symlinked
+    // FILE to its target, so a committed symlink (e.g. agent-infra drift
+    // fixtures, scripts/ and CI-workflow links) would be registered under the
+    // TARGET's relative path — a key that never matches git's verbatim path
+    // and blocks every commit touching it (#305).
+    realAbs = join(realpathSync(dirname(abs)), basename(abs));
+  } catch { /* keep lexical */ }
   const rel = relative(realRoot, realAbs);
   return rel === "" ? filePath : rel;
 }
@@ -979,7 +1007,7 @@ export default function (pi: ExtensionAPI) {
       const verifiedHash = verifiedSet.get(key);
       if (verifiedHash === undefined) {
         unverified.push(file);
-      } else if (verifiedHash !== currentHash) {
+      } else if (!hashMatchesDisk(cwd, file, verifiedHash)) {
         mismatched.push({ file, expected: verifiedHash, actual: currentHash });
       }
     }

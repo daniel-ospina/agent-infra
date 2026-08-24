@@ -5,7 +5,7 @@
 //  1. write/edit tool calls (collision between parallel agents),
 //  2. destructive/state-changing git commands via the bash tool (git reset
 //     --hard, branch checkout/switch, pull/merge/rebase, clean, force-push,
-//     branch -D, restore, stash pop), and
+//     branch -D, restore, stash pop),
 //  3. (#265) cross-session BRANCH OWNERSHIP: the shared checkout is a
 //     multi-actor resource — one session's `git checkout` moves the branch
 //     under every other session, so commits land on the wrong branch and
@@ -13,13 +13,22 @@
 //     session_start; M1 warns on branch deviation (every tool_call), M2
 //     blocks commit/push off-baseline, M3 gates branch-state mutations, and
 //     an ownership allowance keeps the agent-infra merge ceremony working.
+//  4. (#1484) HUB DISCIPLINE (M4): the hub's only legal states are main+clean.
+//     When the session cwd IS the hub and it is off-main or dirty, every git
+//     op outside the sanctioned recovery allowlist is BLOCKED (checkout
+//     main/master, pull --ff-only, fetch, status, log, worktree ops, push
+//     origin <checked-out-branch>, marker touch) and write/edit is blocked —
+//     even under the TTL marker (only AGENT_ALLOW_MAIN_EDITS=1 disables it).
+//     The script backdoor (`bash /tmp/x.sh` with git ops) is closed: a
+//     script's git content is gated by the SAME allowlist.
 //
 // Worktrees are ISOLATED — none of this applies inside a worktree. The only
 // escape hatch is AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) or
 // the TTL'd file marker (#207) for deliberate solo sessions; under the hatch
 // M2/M3 are inactive (escape-hatch contract preserved) but M1 detection stays
-// ACTIVE. There is NO auto-bypass: the guard blocks every time, so a
-// rogue/parallel agent cannot retry its way past it.
+// ACTIVE and M4 stays ACTIVE (a stranded lane recovers with the marker but
+// cannot resume feature work in the hub). There is NO auto-bypass: the guard
+// blocks every time, so a rogue/parallel agent cannot retry its way past it.
 //
 // Degradation contract:
 //  - classify-git.mjs load failure → bash git guard degrades to warn-only
@@ -56,6 +65,13 @@ let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
 let getMainCheckoutBranch: () => string | null = () => null;
 let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) => boolean = () => false;
+// #1484 M4 hub-state gate + script-backdoor closure. Fail-safe defaults: every
+// decision degrades to inactive/allow so a failed import NEVER false-blocks
+// (the git commands were allow-listed before M4; the guard stays permissive).
+let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean; skipInfra?: boolean; env?: Record<string, string | undefined> }) => { disorder: string | null; branch: string | null } = () => ({ disorder: null, branch: null });
+let evaluateHubGate: (command: string, currentBranch: string | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string } = () => ({ verdict: "non-git" });
+let extractScriptPath: (command: string) => string | null = () => null;
+let scriptGitVerdict: (path: string, currentBranch: string | null) => "allow" | "block" = () => "allow";
 let classifierLoaded = false;
 let ALLOW_MAIN_EDITS_MARKER_TTL_MS = 15 * 60 * 1000;
 // Escape-marker (#207) rules live in classify-git.mjs so test.mjs exercises the
@@ -74,7 +90,8 @@ try {
      getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS,
      isAllowMarkerActive, isAllowMarkerPath, isAllowMarkerCommand,
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
-     readAllowMarkerState } =
+     readAllowMarkerState, readHubDisorder, evaluateHubGate,
+     extractScriptPath, scriptGitVerdict } =
     await import("./classify-git.mjs"));
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
@@ -165,6 +182,53 @@ function _mainTopLevel(): string | null {
     );
   } catch {
     return null;
+  }
+}
+
+// ── M4: hub-state gate (#1484) ─────────────────────────────────────────────
+// The hub's only legal states are main+clean. When the session cwd IS the hub
+// main checkout (non-infra) and the hub is off-main or dirty, every git op is
+// gated by the recovery allowlist (classify-git evaluateHubGate) and write/edit
+// in the hub is blocked. M4 stays ACTIVE under the TTL marker (D3 — mirrors
+// M1's detect-stays-active contract): a stranded lane can recover with the
+// marker but cannot resume feature work in the hub. Only AGENT_ALLOW_MAIN_EDITS
+// =1 (env, session start) is a full bypass. Worktree sessions and agent-infra
+// are exempt (D5 / #99).
+function _hubState(): { disorder: string | null; branch: string | null } {
+  try {
+    return readHubDisorder(resolve(process.cwd()));
+  } catch {
+    return { disorder: null, branch: null }; // degrade — never false-block
+  }
+}
+
+// Script-backdoor closure (Slice E): the documented escape
+// (`write /tmp/x.sh` + `bash /tmp/x.sh`) is closed by gating the script's git
+// content with the SAME recovery allowlist — a script that performs a
+// non-sanctioned git mutation is blocked. Recovery scripts (hub-worktree.sh:
+// fetch + worktree add) keep working. Returns a block reason or null.
+function _backdoorBlock(command: string): string | null {
+  try {
+    if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktrees are isolated
+    if (isAgentInfraRepo()) return null; // #99 carve-out
+    const scriptPath = extractScriptPath(command);
+    if (!scriptPath) return null;
+    const resolved = resolve(process.cwd(), scriptPath);
+    if (!existsSync(resolved) || !statSync(resolved).isFile()) return null;
+    const branch = getMainCheckoutBranch();
+    if (scriptGitVerdict(resolved, branch) === "block") {
+      return [
+        `⛔ Script execution blocked — git-bearing script in the shared main checkout (#1484).`,
+        `   The script backdoor (write /tmp/x.sh + bash /tmp/x.sh) is closed:`,
+        `   ${resolved} contains a non-sanctioned git operation.`,
+        `   → Run the git commands directly (recovery: git checkout main && git pull --ff-only),`,
+        `     or work in an isolated worktree:`,
+        `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+      ].join("\n");
+    }
+    return null;
+  } catch {
+    return null; // fail-silent — never block on read/stat errors
   }
 }
 
@@ -268,9 +332,11 @@ export default function (pi: ExtensionAPI) {
     }
 
     // ── Hub-discipline check (rehomed from extension-init; #73) ──
-    // Interactive-only (deliberate sub-agent-noise fix: today print-mode
-    // sub-agents DO receive the box) and skipped under the escape hatch.
-    if (isPrintMode() || _isAllowMainEdits()) return;
+    // #1484: runs in print mode too — a print-mode session rooted in the hub
+    // gets the warn (daemons live in role-scoped worktrees, so legitimate
+    // headless sessions never see it; the 29h silent incident was invisible
+    // to them). Skipped only under the escape hatch.
+    if (_isAllowMainEdits()) return;
     try {
       const inWorktree = isWorktreeCwdWrite(resolve(process.cwd()));
       if (inWorktree) return;
@@ -339,9 +405,49 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
+    // ── M4: hub-state gate + script-backdoor closure (#1484) ──
+    // Runs BEFORE the marker/flag bypass: M4 stays ACTIVE under the TTL marker
+    // (D3 — a stranded lane recovers with the marker but cannot resume feature
+    // work in the hub); only the env flag disables it. Read-only ops, worktree
+    // sessions, and agent-infra stay exempt.
+    if (!_isAllowMainEdits()) {
+      if (isBash) {
+        const command = (event.input as { command?: string }).command ?? "";
+        const backdoor = _backdoorBlock(command);
+        if (backdoor) return { block: true, reason: backdoor };
+        const st = _hubState();
+        if (st.disorder) {
+          const gate = evaluateHubGate(command, st.branch);
+          if (gate.verdict === "block") {
+            return { block: true, reason: gate.reason ?? "" };
+          }
+          if (gate.verdict === "recovery" || gate.verdict === "allowed") {
+            return undefined; // sanctioned recovery / read-only — done
+          }
+        }
+      } else if (isWrite || isEdit) {
+        // Non-recovery edits in a disordered hub are blocked EVEN under the
+        // marker (D3); a clean hub keeps today's marker semantics (deliberate
+        // solo sessions) and the write/edit block below.
+        const st = _hubState();
+        if (st.disorder) {
+          return {
+            block: true,
+            reason: [
+              `⛔ File edits blocked — the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+              `   The hub's only legal states are main+clean. Non-recovery edits are`,
+              `   blocked even under the TTL marker (D3).`,
+              `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
+              `   → Do feature work in a worktree: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+            ].join("\n"),
+          };
+        }
+      }
+    }
+
     // ── bash: branch-ownership + destructive git ──
     // Marker OR branch covers bash + write + edit in one check point (#266).
-    if (_isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(ctx))) {
+    if (_isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx))) {
       return undefined;
     }
     if (isBash) {
@@ -457,6 +563,20 @@ export default function (pi: ExtensionAPI) {
       // semantics — the hatch is a full bypass).
       if (allowActive) return undefined;
 
+      // ── Escape marker (#207): stamp + audit at creation-observation ──
+      // ORDERING FIX (#1484): the stamp must run BEFORE the allow/allow-non-git
+      // early return — a bare `touch <marker>` classifies "allow-non-git" and
+      // was silently swallowed by that return, so the guard NEVER stamped and
+      // the marker was inert in production (the 2026-08-18 incident's empty
+      // unscoped marker file is exactly this bug's evidence). Git classification
+      // ran FIRST (M3 above), so a blocked command NEVER stamps — `touch ... &&
+      // git checkout main` is blocked and the touch never runs (F10c). Only an
+      // ALLOWED bare `touch <marker>` (own command) reaches here.
+      if (isAllowMarkerCommand(command, homedir())) {
+        _stampMarker(_markerPath(), _currentSessionId(_ctx), extractMarkerReason(command));
+        return undefined;
+      }
+
       if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return undefined;
 
       // ── Ownership allowance (agent-infra main, own baseline branch) ──
@@ -557,16 +677,6 @@ export default function (pi: ExtensionAPI) {
             ...WHY.split("\n").slice(1),
           ].join("\n"),
         };
-      }
-      // ── Escape marker (#207): stamp + audit at creation-observation ──
-      // Ordering pinned: git classification ran FIRST (above), so a blocked
-      // command NEVER stamps — `touch ... && git checkout main` in ONE call is
-      // blocked (the git part blocks, the touch never runs; F10c). Only an
-      // ALLOWED bare `touch <marker>` (own command) reaches here; the recovery
-      // git op goes in the FOLLOW-UP call.
-      if (isAllowMarkerCommand(command, homedir())) {
-        _stampMarker(_markerPath(), _currentSessionId(ctx), extractMarkerReason(command));
-        return undefined;
       }
       return undefined;
     }

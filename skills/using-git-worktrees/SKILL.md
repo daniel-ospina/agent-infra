@@ -215,7 +215,14 @@ agents in the hub) is prevented by discipline, not just guards:
    `git -C <main-checkout> status --porcelain` empty. If not — do NOT start
    feature work there; create a worktree. (Daemons execute in role-scoped
    execution worktrees via the swarm runtime; interactive agents follow this
-   rule.)
+   rule.) Since #1484 the guard's **M4 gate** enforces this at runtime and the
+   **nightly hub-state check** (`scripts/checkout-hygiene/hub-state-check.sh`,
+   launchd every 6h) fails loudly with the recovery command + a deduped GitHub
+   issue. To create a worktree in ONE command — with .env/.venv/.mcp.json
+   auto-setup, never `/tmp`, never detached — use:
+   ```bash
+   bash scripts/checkout-hygiene/hub-worktree.sh <branch>   # from any checkout of the repo
+   ```
 2. **Delete-on-merge.** Every worktree created for a PR/issue must be removed
    when its branch merges: `git worktree remove <path>` (no `--force` — it
    refuses tracked WIP). If the branch merged but the worktree lingers, prune
@@ -277,10 +284,43 @@ agents in the hub) is prevented by discipline, not just guards:
   ```
   Never launch a nested/background `pi` to "escape" the guard — that is how a 29h fleet hang happened (2026-08-11→12, #206).
 
+### Hub-state recovery contract (#1484) — when the hub goes off-`main`/dirty
+
+The 2026-08-18 incident (tortoise hub on `pr1467`, 29h off-main, 38 commits,
+sibling disruption, VGATE collision) is the canonical failure. The recovery
+sequence, in order:
+
+1. **Diagnose** — run the hub-state check or read the nightly issue:
+   ```bash
+   bash scripts/checkout-hygiene/hub-state-check.sh --repo <repo>  # FAIL + HUB_DISORDER + recovery command
+   ```
+   The guard's M4 gate is now ACTIVE in an off-main/dirty hub: only sanctioned
+   recovery ops pass (`git checkout main`, `git pull --ff-only`, `git fetch`,
+   `git status/log`, `git worktree add/list/prune`, `git push origin
+   <checked-out-branch>`, marker touch). Feature ops (`commit`, `checkout -b`,
+   foreign pushes, edits) are BLOCKED — even under the TTL marker (only
+   `AGENT_ALLOW_MAIN_EDITS=1` disables M4).
+2. **Preserve WIP** — if the stranded branch has commits that are not on
+   origin, the ONE allowed M4 push preserves them before any checkout:
+   ```bash
+   git push origin <stranded-branch>   # the sanctioned WIP-preservation carve-out
+   ```
+3. **Recover** — the sanctioned terminal one-liner (human terminal, #206):
+   ```bash
+   cd <repo> && git checkout main && git pull --ff-only
+   ```
+   Agent-side, `git checkout main` and `git pull --ff-only` are M4-sanctioned
+   and run directly (no marker needed).
+4. **Never escape via nested pi** — do NOT relaunch a nested/background `pi`
+   to get around M4; the script backdoor is closed and the only full bypass is
+   the env flag at session start. If the lane needs to keep working, use
+   `hub-worktree.sh <branch>` (one command, never `/tmp`, never detached,
+   auto-setup symlinks — the root-cause fix from the incident).
+
 > **#265 marker semantics (escaped hatch):** under the TTL marker (or the env flag), the guard's M2/M3 gates are INACTIVE (the escape hatch keeps its documented semantics — a stranded main checkout stays recoverable) but M1 detection stays ACTIVE: if the branch moves again mid-session you still get the warn.
 
 ## Launching Nested pi
-### Never launch an unbounded nested pi (#206) — hard rule
+### The hard rule — bounded nested pi only (#206)
 
 > **Never launch an unbounded nested pi.** Every nested or background `pi`
 > launch MUST carry a hard timeout (30 minutes — the bounded-launch template

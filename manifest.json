@@ -48,14 +48,35 @@
     "bin/": {
       "kind": "script",
       "essential": true
+    }
+  },
+  "ci": {
+    "ref": "v0.1.0",
+    "sha": "8ea4a08ab795d63f64622ea8c796f9bdcd197147",
+    "note": "Consumers pin uses: daniel-ospina/agent-infra/.github/workflows/<stack>-ci.yml@vX.Y.Z. Bump = tag + ci.ref edit + agent-infra update (no auto-rewrite; agent-infra check blocks on stale pin). #303"
+  },
+  "check": {
+    "ci": {
+      "ref": "v0.1.0"
     },
-    "templates/.github/workflows/": {
-      "kind": "symlink",
-      "essential": false,
-      "entries": [
-        "python-ci.yml",
-        "node-ci.yml",
-        "docs-ci.yml"
+    "exemptions": {
+      "eldato-outreach": [
+        "templates/.github/workflows/"
+      ],
+      "premise-labs": [
+        "templates/.github/workflows/"
+      ],
+      "tortoise": [
+        "templates/.github/workflows/"
+      ],
+      "dmer": [
+        "scripts"
+      ],
+      "dmeer": [
+        "scripts"
+      ],
+      "eldato": [
+        "scripts"
       ]
     }
   }
