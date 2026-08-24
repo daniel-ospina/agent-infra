@@ -147,3 +147,17 @@ tests.push(test("no ParseError in extension loading", async () => {
 }));
 
 runAll(tests);
+
+tests.push(test("PI_MCP_SERVERS defaults to 'none' when mcp_servers param absent (#286)", async () => {
+  // The subAgentEnv MCP wiring must DEFAULT the allowlist instead of only
+  // setting it when the param is given — a missing allowlist makes mcp-client
+  // eagerly connect ALL non-lazy servers (classifyServers treats undefined as
+  // "load all"), which hangs ~15min and starves the heartbeat marker stream.
+  const src = readFileSync(join(process.cwd(), "extensions", "builtin-tools", "index.ts"), "utf-8");
+  const mcpWiring = src.match(/subAgentEnv\.PI_MCP_SERVERS\s*=\s*params\.mcp_servers[^;]*;/);
+  ok(mcpWiring !== null, "subAgentEnv.PI_MCP_SERVERS wiring not found");
+  ok(
+    mcpWiring![0].includes('params.mcp_servers?.trim() || "none"'),
+    `default should be "none" (zero eager connects). wiring: ${mcpWiring![0]}`,
+  );
+}));
