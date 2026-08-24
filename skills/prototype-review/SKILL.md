@@ -167,7 +167,7 @@ Read `operations/ai-workflow-tools/config.json`. Extract:
 
 If the config file is missing or malformed, use the defaults above.
 
-**Concurrency control:** This skill dispatches reviewers via the MCP `prototype_review_cycle` wrapper, which handles parallelism internally. When refactoring to use `subagent({ tasks: [...] })` directly, cap at 8 parallel agents, stagger 200ms, and apply exponential retry backoff (1s, 2s, 4s) + jitter ±200ms. See `parallel-orchestrator` reference skill for the full pattern.
+**Concurrency control:** This skill dispatches reviewers via the MCP `prototype_review_cycle` wrapper, which handles parallelism internally. When refactoring to use `subagent({ tasks: [...] })` directly, cap at 16 parallel agents (per parallel-orchestrator #317), stagger 200ms, and apply exponential retry backoff (1s, 2s, 4s) + jitter ±200ms. See `parallel-orchestrator` reference skill for the full pattern.
 
 ## Mode Routing
 

@@ -69,6 +69,22 @@ await test("PI_MCP_SERVERS excludes unlisted servers entirely", () => {
   deepEqual(lazySkipped, []);
 });
 
+await test("PI_MCP_SERVERS='none' (sub-agent default, #286) → zero eager connects", () => {
+  // The task tool's default allowlist is the sentinel "none" — it matches no
+  // declared server, so classifyServers must exclude EVERYTHING (eager=[]):
+  // deterministic zero-connect startup for sub-agents. Servers load only when
+  // named explicitly (mcp_servers param) or via mid-run mcp_load.
+  const servers = {
+    exa: {},
+    tortoise: {},
+    "playwright-browser": { lazy: true },
+    gemini: { lazy: true },
+  };
+  const { eager, lazySkipped } = classifyServers(servers, new Set(["none"]));
+  deepEqual(eager, []);
+  deepEqual(lazySkipped, []);
+});
+
 await test("lazy flag preserved in eager result when forced", () => {
   const servers = { gemini: { lazy: true } };
   const { eager } = classifyServers(servers, new Set(["gemini"]));

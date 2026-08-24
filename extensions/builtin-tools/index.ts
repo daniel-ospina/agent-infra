@@ -168,7 +168,7 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 // first provider in registry order.
 
 export interface ModelRegistry {
-  providers?: Record<string, { models?: Array<{ id: string }> }>;
+  providers?: Record<string, { baseUrl?: string; models?: Array<{ id: string }> }>;
 }
 
 export interface ProviderModelResolution {
@@ -201,6 +201,20 @@ export function loadModelRegistry(): ModelRegistry {
   } catch {
     return {};
   }
+}
+
+/**
+ * Resolve a provider's base URL from models.json for the network probe
+ * (#318). Returns "" when the provider or baseUrl is missing — callers then
+ * fail open (no network-aware suppression).
+ */
+export function resolveProviderBaseUrl(
+  provider: string | undefined | null,
+  registry: ModelRegistry = loadModelRegistry(),
+): string {
+  if (!provider) return "";
+  const p = registry.providers?.[provider];
+  return (typeof p?.baseUrl === "string" ? p.baseUrl : "").trim();
 }
 
 /**
@@ -1163,6 +1177,13 @@ export interface HeartbeatDecisionInput {
    * alive class (markers stopped while a tool is in flight). See D1. */
   cutGapMs: number;
 
+  /** #318: network is unreachable (probe failed). When true AND heartbeat
+   * markers are fresh, the waiting/stall clauses below are outage artifacts
+   * (the child's pi retries every ~5 min), not wedges — they are suppressed
+   * so the sub-agent survives the outage in place. Stale markers (dead
+   * child) or a reachable network fail open to the legacy decision. */
+  networkDown?: boolean;
+
 }
 
 /**
@@ -1221,6 +1242,19 @@ export function heartbeatKillDecision(
   // interval — negligible against minute-scale bounds.
   const effStreamAge = st.streamAgeMs + markerAge;
   const effToolAge = st.toolAgeMaxMs + markerAge;
+
+  // #318: network-aware survival — a sub-agent whose LLM call is failing
+  // because the network is down (pi retry: quick attempts then every 5 min)
+  // looks exactly like a stall to every waiting clause below. When the
+  // network is unreachable AND the child is demonstrably alive (fresh
+  // heartbeat markers), suppress the stall clauses so it survives the outage
+  // in place and resumes when connectivity returns. Stale markers (dead
+  // child) or a reachable network fail open to the exact legacy decision.
+  // tier-1 zero-output is untouched (it requires !sawReady — a child that
+  // never initialized is a startup hang, outage or not).
+  if (i.networkDown && stateFresh) {
+    return { kill: false, resolveUndefined: false, firstMessageMs: effFirstMessageMs };
+  }
 
   // 1. tool-stall — desynced-counter / absurd-hang bound. Preflight-stuck
   //    children (turnActive=false) get the tighter min(L, T) ceiling.
@@ -1642,7 +1676,63 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // only ever grows (a storm starting mid-dispatch extends the bound; a
     // post-storm load drop never re-cuts); [task] log on real increase.
     let latchedEffM: number | undefined;
-    const heartbeat = setInterval(() => {
+    // #318: network-aware kill suppression — before honoring a stall-kill,
+    // probe connectivity to the sub-agent's provider. When the network is
+    // unreachable and the child is alive (fresh heartbeat markers), the
+    // stall is the outage, not a wedge: skip the kill, keep the interval
+    // running, and let the child's own pi retry (quick attempts then every
+    // 5 min) resume when connectivity returns. Probe result cached per
+    // dispatch (TASK_NETWORK_PROBE_CACHE_MS, default 15s) and only refreshed
+    // on demand (kill imminent or recovery check while suppressed).
+    // TASK_NETWORK_WAIT=0 disables (fail-open legacy behavior).
+    const networkWaitEnabled = process.env.TASK_NETWORK_WAIT !== "0";
+    // Probe timeout clamped BELOW the 10s heartbeat tick so a slow probe can
+    // never overlap two ticks (each tick would otherwise re-run the kill
+    // path on the same decision).
+    const networkProbeTimeoutMs = Math.min(9_000, Math.max(1_000, Number(process.env.TASK_NETWORK_PROBE_TIMEOUT_MS) || 5_000));
+    const networkProbeCacheMs = Math.max(1_000, Number(process.env.TASK_NETWORK_PROBE_CACHE_MS) || 15_000);
+    const probeBaseUrl = process.env.TASK_NETWORK_PROBE_URL || resolveProviderBaseUrl(provider);
+    // Fail open when the probe URL is malformed or non-http(s): a probe that
+    // can never succeed must not suppress kills forever with a misleading
+    // "network unreachable" log.
+    let probeUrlValid = false;
+    try {
+      const u = new URL(probeBaseUrl);
+      probeUrlValid = u.protocol === "http:" || u.protocol === "https:";
+    } catch {
+      probeUrlValid = false;
+    }
+    let networkDown = false;
+    let networkProbeAt = 0;
+    let networkProbeInFlight: Promise<boolean> | null = null;
+    let networkSuppressLogged = false;
+    const probeNetwork = (): Promise<boolean> => {
+      if (networkProbeInFlight) return networkProbeInFlight;
+      if (Date.now() - networkProbeAt < networkProbeCacheMs) return Promise.resolve(networkDown);
+      if (!probeUrlValid) return Promise.resolve(false); // unresolvable → fail open
+      networkProbeInFlight = (async () => {
+        let down = false;
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), networkProbeTimeoutMs);
+        try {
+          await fetch(probeBaseUrl, { method: "GET", signal: ctrl.signal, redirect: "follow" });
+        } catch {
+          down = true;
+        } finally {
+          clearTimeout(t);
+        }
+        networkDown = down;
+        networkProbeAt = Date.now();
+        networkProbeInFlight = null;
+        // Re-arm the one-time suppression log on any down→up transition so a
+        // later outage logs its first suppression again.
+        if (!down) networkSuppressLogged = false;
+        return down;
+      })();
+      return networkProbeInFlight;
+    };
+
+    const heartbeat = setInterval(async () => {
       const now = Date.now();
       // Flush residue BEFORE deciding so a kill result sees everything so
       // far (non-marker residue preserved — kill-result fidelity; marker
@@ -1662,12 +1752,57 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         ...hbThresholds,
         load1,
         latchedFirstMessageMs: latchedEffM,
+        networkDown: networkWaitEnabled ? networkDown : undefined,
       });
       if (decision.firstMessageMs !== undefined && decision.firstMessageMs > (latchedEffM ?? getFirstMessageMs())) {
         latchedEffM = decision.firstMessageMs;
         console.error(`[task] first-message bound ${Math.round(getFirstMessageMs() / 1000)}s → ${Math.round(latchedEffM / 1000)}s (load1=${load1})`);
       }
+      // #318: probe gate — a cold/stale cache can't suppress (the decision
+      // above ran with the cached value; a stale-down cache suppresses via
+      // the pure function, so this branch handles the cold-cache first
+      // detection and the recovery refresh while suppressed).
+      if (networkWaitEnabled) {
+        if (decision.kill) {
+          const down = await probeNetwork();
+          if (down) {
+            // Only suppress when the pure function itself would suppress
+            // this kill (networkDown && fresh markers && not tier-1):
+            // re-derive with networkDown forced true. A zero-output
+            // (never-initialized) or stale-marker (dead child) kill still
+            // fires — outage or not.
+            const redecided = heartbeatKillDecision({
+              now,
+              startedAt,
+              lastLifeSignAt: lastHeartbeat,
+              hasOutput,
+              state: hbCtx.state,
+              ...hbThresholds,
+              load1,
+              latchedFirstMessageMs: latchedEffM,
+              networkDown: true,
+            });
+            if (!redecided.kill) {
+              if (!networkSuppressLogged) {
+                networkSuppressLogged = true;
+                console.error(`[task] network unreachable (probe ${probeBaseUrl || provider || "unknown"}) — suppressing ${decision.reason ?? "stall"} kill; sub-agent waits in retry (#318)`);
+              }
+              return;
+            }
+          }
+          networkSuppressLogged = false;
+        } else if (networkDown && Date.now() - networkProbeAt >= networkProbeCacheMs) {
+          // suppressed by a stale cache — refresh in the background so a
+          // recovered network is detected without waiting for a kill.
+          void probeNetwork();
+        }
+      }
       if (!decision.kill) return;
+      // The await above opened a settle window (close/exit/hard-cap/backstop
+      // can resolve the promise while the probe was in flight). Never run
+      // the kill path against a settled/exited child — treeKill on a
+      // recycled pid would signal an unrelated process tree (#318 review).
+      if (settled || proc.exitCode !== null) return;
       clearInterval(heartbeat);
       // #208: treeKill — the direct child's grandchildren (nested pi, MCP
       // server pairs) would otherwise survive as orphans holding worktrees.
@@ -2126,7 +2261,7 @@ export default function (pi: ExtensionAPI) {
       mcp_servers: Type.Optional(
         Type.String({
           description:
-            "Comma-separated MCP server names for this sub-agent (forces eager load). Inherits parent's PI_MCP_SERVERS by default — sub-agents get the eager core (exa+tortoise) plus mcp_catalog/mcp_load for everything else. Name a lazy server (e.g. gemini) to force-load it up front; otherwise load it mid-run via mcp_load.",
+            "Comma-separated MCP server names for this sub-agent (forces eager load). Default: none — sub-agents start with ZERO eager MCP connects for deterministic fast startup (#286); mcp-client treats an unmatching allowlist as empty. Name any server (e.g. gemini) to force-load it up front; everything else loads mid-run via mcp_load.",
         })
       ),
     }),
@@ -2194,9 +2329,13 @@ export default function (pi: ExtensionAPI) {
 // #265/#825 resolution: sub-agents DO get the hatch (verified-file registry
 // bridge, #825) — the branch-ownership guard (M1/M2/M3) is the layer that
 // protects the shared checkout, not env removal.
-      if (params.mcp_servers) {
-        subAgentEnv.PI_MCP_SERVERS = params.mcp_servers;
-      }
+      // #286: children default to PI_MCP_SERVERS=none — a missing allowlist
+      // makes mcp-client eagerly connect ALL non-lazy servers
+      // (classifyServers treats undefined as "load all"), and cold connects
+      // hang ~15min, blocking child startup and starving the heartbeat marker
+      // stream (false first-message cuts). Children opt into servers
+      // explicitly via the mcp_servers param or mid-run mcp_load.
+      subAgentEnv.PI_MCP_SERVERS = params.mcp_servers?.trim() || "none"; // #286 P2: "" (empty string) must not fall through to eager-load-all
 
       const args = ["-p", "--provider", provider, "--model", model, "--no-session", params.prompt];
 

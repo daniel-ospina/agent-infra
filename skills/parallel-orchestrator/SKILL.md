@@ -41,14 +41,14 @@ The subagent tool blocks until ALL tasks complete. All tasks run concurrently �
 ### 2. Concurrency Control
 
 ```
-MAX_CONCURRENCY = 8            # hard cap — never exceed
+MAX_CONCURRENCY = 16           # hard cap — never exceed (bounded by fan-in context + worktree contention, NOT API limits — direct DeepSeek API is concurrency-only: 500 v4-pro / 2,500 v4-flash, #317)
 STAGGER_MS = 200               # delay between task launches
 RETRY_BACKOFF = [1000, 2000, 4000]  # exponential backoff + jitter ±200ms
 ```
 
 **Rules:**
 - Never launch more than `MAX_CONCURRENCY` tasks in a single `subagent` call
-- If you have N > 8 tasks, batch them: first 8 → wait → next 8
+- If you have N > 16 tasks, batch them: first 16 → wait → next 16
 - Stagger launches within each batch: add a brief pause between constructing task prompts
 - On rate-limit errors: retry with exponential backoff. After 3 retries, surface the failure
 
@@ -237,8 +237,8 @@ fi
 
 | Anti-Pattern | Why It Matters |
 |---|---|
-| Dispatching 20+ agents at once | API rate limits, context pressure on fan-in. Cap at 8, batch the rest |
-| No staggered launches | Burst dispatch can trigger rate limits. 200ms stagger smooths load |
+| Dispatching 20+ agents at once | Context pressure on fan-in (orchestrator ingests all results) + worktree/merge contention. Cap at 16, batch the rest |
+| No staggered launches | Burst dispatch can spike provider load / hit account-level concurrency caps. 200ms stagger smooths load |
 | Sub-agents touching same files | Merge conflicts, inconsistent state. Partition file ownership before dispatch |
 | No structured output format | Can't deduplicate or sort results. Enforce format in agent prompts |
 | Infinite review cycles | Always cap at 10 cycles. Surface remaining issues to human |

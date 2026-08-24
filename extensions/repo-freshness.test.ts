@@ -23,6 +23,8 @@ import repoFreshness, {
   behindCount,
   aheadCount,
   repoClean,
+  dirtySuperseded,
+  autoHealDisabled,
   mergeOrRebaseInProgress,
   indexLocked,
   defaultBranchInOtherWorktree,
@@ -227,6 +229,261 @@ await test("behind + dirty tree → WARN, no pull (layer-1 pre-check)", async ()
   equal(r.action, "warn-behind");
   equal(sh("git rev-parse HEAD", clone), before);
   ok(logs.some((l) => l.includes("DIRTY")), "dirty warning logged");
+});
+
+await test("behind + superseded dirty tree → auto-cleaned (cleaned-superseded)", async () => {
+  // Every dirty path's content is already on origin/main (e.g. staged work
+  // that was merged upstream via PRs) — reset --hard is provably lossless.
+  const { clone, other } = makeRepo("superseded");
+  writeFileSync(join(clone, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm local-dup", clone);
+  writeFileSync(join(other, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm upstream-dup", other);
+  writeFileSync(join(other, "adv.txt"), "advance\n");
+  sh("git add adv.txt && git commit -qm advance && git push -q origin main", other);
+  sh("git reset --soft HEAD~1 && git reset -q HEAD", clone);
+  ok(!repoClean(clone), "fixture must be dirty");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "cleaned-superseded", "superseded dirty tree must auto-clean");
+  ok(repoClean(clone), "tree must be clean after auto-reset");
+  equal(sh("git rev-parse HEAD", clone), sh("git rev-parse origin/main", clone), "HEAD must move to origin/main");
+});
+
+await test("behind + divergent dirty tree → WARN, DIRTY logged, never reset", async () => {
+  const { clone, other } = makeRepo("divergent");
+  advanceOrigin(other);
+  writeFileSync(join(clone, "a.txt"), "genuinely-new-local-content\n");
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "warn-behind");
+  equal(sh("git rev-parse HEAD", clone), before, "HEAD must not move");
+  ok(!repoClean(clone), "dirty content must survive");
+  ok(logs.some((l) => l.includes("DIRTY")), "dirty warning logged");
+  ok(logs.some((l) => l.includes("NOT superseded")), "triage hint logged");
+});
+
+await test("behind + untracked collision (origin-tracked path, diff content) → WARN, file preserved", async () => {
+  const { clone, other } = makeRepo("collision");
+  writeFileSync(join(other, "will-track.txt"), "upstream-version\n");
+  sh("git add will-track.txt && git commit -qm add && git push -q origin main", other);
+  writeFileSync(join(clone, "will-track.txt"), "local-precious-version\n");
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "warn-behind", "untracked collision must NOT auto-reset");
+  equal(sh("git rev-parse HEAD", clone), before);
+  equal(execSync("cat will-track.txt", { cwd: clone, encoding: "utf-8" }).trim(), "local-precious-version", "precious untracked content must survive");
+});
+
+await test("autoHealDisabled → superseded dirty tree warns, never resets", async () => {
+  const { clone, other } = makeRepo("noheal");
+  writeFileSync(join(clone, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm local-dup", clone);
+  writeFileSync(join(other, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm upstream-dup", other);
+  sh("git push -q origin main", other);
+  sh("git reset --soft HEAD~1 && git reset -q HEAD", clone);
+  ok(!repoClean(clone), "fixture must be dirty");
+  const env = { ...BASE_ENV, AGENT_REPO_FRESHNESS_NO_AUTOHEAL: "1" };
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, env); } finally { captureStop(); }
+  equal(r.action, "warn-behind", "kill-switch must disable the auto-reset");
+  equal(sh("git rev-parse HEAD", clone), before, "HEAD must not move");
+});
+
+await test("behind + untracked DIR vs origin-tracked FILE at same path → WARN, dir preserved (P0 regression)", async () => {
+  // P0: `git status --porcelain` collapses an untracked dir to `?? sub/`; if
+  // origin tracks a FILE literally named `sub`, the old rev-parse check on
+  // `sub/` failed and skipped → superseded → reset --hard DELETED the dir.
+  // -uall -z + prefix-overlap detection must now WARN and preserve it.
+  const { clone, other } = makeRepo("dirfile");
+  writeFileSync(join(other, "sub"), "upstream-tracked-file\n");
+  sh("git add sub && git commit -qm add-file-sub && git push -q origin main", other);
+  mkdirSync(join(clone, "sub"));
+  writeFileSync(join(clone, "sub", "note.txt"), "PRECIOUS-USER-DATA\n");
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "warn-behind", "dir-vs-file collision must NOT auto-reset");
+  equal(sh("git rev-parse HEAD", clone), before, "HEAD must not move");
+  equal(execSync("cat sub/note.txt", { cwd: clone, encoding: "utf-8" }).trim(), "PRECIOUS-USER-DATA", "precious untracked dir content must survive");
+});
+
+await test("behind + superseded dirty tree + untracked NEW files → cleaned, new files preserved", async () => {
+  const { clone, other } = makeRepo("newnotes");
+  writeFileSync(join(clone, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm local-dup", clone);
+  writeFileSync(join(other, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm upstream-dup", other);
+  sh("git push -q origin main", other);
+  sh("git reset --soft HEAD~1 && git reset -q HEAD", clone);
+  mkdirSync(join(clone, "notes"));
+  writeFileSync(join(clone, "notes", "my-notes.txt"), "brand-new-local\n");
+  ok(!repoClean(clone), "fixture must be dirty");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "cleaned-superseded", "superseded + new-untracked must still auto-clean");
+  equal(execSync("cat notes/my-notes.txt", { cwd: clone, encoding: "utf-8" }).trim(), "brand-new-local", "new untracked file must survive the reset");
+});
+
+await test("behind + D-only superseded (origin added files, local staged identical) → cleaned", async () => {
+  const { clone, other } = makeRepo("donly");
+  writeFileSync(join(clone, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm local-dup", clone);
+  writeFileSync(join(other, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm upstream-dup", other);
+  writeFileSync(join(other, "adv.txt"), "advance\n");
+  writeFileSync(join(other, "adv2.txt"), "advance2\n");
+  sh("git add adv.txt adv2.txt && git commit -qm advance && git push -q origin main", other);
+  sh("git reset --soft HEAD~1 && git reset -q HEAD", clone);
+  ok(!repoClean(clone), "fixture must be dirty");
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "cleaned-superseded", "D-only tracked delta must auto-clean");
+  ok(repoClean(clone), "tree clean after reset");
+});
+
+await test("behind + superseded dirty tree + mode=warn → WARN, never reset", async () => {
+  const { clone, other } = makeRepo("modewarn");
+  writeFileSync(join(clone, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm local-dup", clone);
+  writeFileSync(join(other, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm upstream-dup", other);
+  sh("git push -q origin main", other);
+  sh("git reset --soft HEAD~1 && git reset -q HEAD", clone);
+  ok(!repoClean(clone), "fixture must be dirty");
+  const env = { ...BASE_ENV, AGENT_REPO_FRESHNESS_MODE: "warn" };
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, env); } finally { captureStop(); }
+  equal(r.action, "warn-behind", "mode=warn must disable the auto-reset");
+  equal(sh("git rev-parse HEAD", clone), before, "HEAD must not move");
+});
+await test("behind + superseded dirty tree + IGNORED file at origin-tracked path → WARN, file preserved", async () => {
+  // Ignored files are invisible to plain status/diff, yet reset --hard also
+  // deletes them "in the way of writing tracked files". This fixture forces
+  // the DIRTY branch via a superseded a.txt change, and the ignored .env
+  // collides with origin's force-added tracked .env — must WARN + preserve
+  // (the ignored blob was never staged; deletion would be unrecoverable).
+  const { clone, other, base } = makeRepo("ignoredenv");
+  writeFileSync(join(clone, ".gitignore"), ".env\n");
+  writeFileSync(join(clone, ".env"), "SECRET=local-precious\n");
+  sh("git add .gitignore && git commit -qm add-gitignore && git push -q origin main", clone);
+  writeFileSync(join(clone, "a.txt"), "v2\n"); // superseded change → dirty branch
+  try { sh("git -C '" + other + "' pull -q origin main", base); } catch (e) { throw new Error("PULL FAILED: " + String(e).slice(0, 300)); }
+  writeFileSync(join(other, "a.txt"), "v2\n");
+  writeFileSync(join(other, ".env"), "SECRET=upstream\n");
+  sh("git add a.txt && git add -f .env && git commit -qm upstream && git push -q origin main", other);
+  ok(!repoClean(clone), "fixture must be dirty (a.txt modified)");
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "warn-behind", "ignored-file collision must NOT auto-reset");
+  equal(sh("git rev-parse HEAD", clone), before, "HEAD must not move");
+  equal(execSync("cat .env", { cwd: clone, encoding: "utf-8" }).trim(), "SECRET=local-precious", "ignored local .env must survive");
+});
+
+await test("behind + case-insensitive collision (origin Readme.md vs local readme.md) → WARN, file preserved", async () => {
+  // P0 (case-fold): on macOS APFS / Windows NTFS (core.ignorecase=true,
+  // the clone default on this machine), a local `readme.md` collides with an
+  // origin-tracked `Readme.md` — byte-case Set membership would miss it and
+  // reset --hard would destroy the local file. The fold must catch it.
+  const { clone, other, base } = makeRepo("casefold");
+  sh("git config core.ignorecase true", clone);
+  sh("git config core.ignorecase true", other);
+  writeFileSync(join(other, "Readme.md"), "upstream-readme\n");
+  sh("git add Readme.md && git commit -qm add-readme && git push -q origin main", other);
+  sh("git -C '" + clone + "' fetch -q origin main", base);
+  writeFileSync(join(clone, "readme.md"), "PRECIOUS-LOCAL-CONTENT\n");
+  ok(!repoClean(clone), "fixture must be dirty");
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "warn-behind", "case-variant collision must NOT auto-reset");
+  equal(sh("git rev-parse HEAD", clone), before, "HEAD must not move");
+  equal(execSync("cat readme.md", { cwd: clone, encoding: "utf-8" }).trim(), "PRECIOUS-LOCAL-CONTENT", "case-variant local file must survive");
+});
+
+await test("behind + assume-unchanged local mod at origin-tracked path → WARN, file preserved", async () => {
+  // P1: `git update-index --assume-unchanged` (the common "pin local config"
+  // pattern) hides local mods from diff/status, yet reset --hard overwrites
+  // them. ls-files -v 'h' flag must catch it when the tree also has a
+  // superseded dirty change (the auto-reset trigger confluence).
+  const { clone, other, base } = makeRepo("assumeunchanged");
+  writeFileSync(join(clone, "b.txt"), "LOCAL-PRECIOUS-B\n");
+  sh("git add b.txt && git commit -qm add-b && git push -q origin main", clone);
+  sh("git update-index --assume-unchanged b.txt", clone);
+  writeFileSync(join(clone, "b.txt"), "LOCAL-PRECIOUS-B-MODIFIED\n");
+  writeFileSync(join(clone, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm local-dup && git reset --soft HEAD~1 && git reset -q HEAD", clone);
+  sh("git -C '" + other + "' pull -q origin main", base); // ff to b.txt
+  writeFileSync(join(other, "a.txt"), "v2\n");
+  writeFileSync(join(other, "b.txt"), "UPSTREAM-B\n");
+  sh("git add a.txt b.txt && git commit -qm upstream && git push -q origin main", other);
+  ok(!repoClean(clone), "fixture must be dirty (a.txt modified)");
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "warn-behind", "assume-unchanged collision must NOT auto-reset");
+  equal(sh("git rev-parse HEAD", clone), before, "HEAD must not move");
+  equal(execSync("cat b.txt", { cwd: clone, encoding: "utf-8" }).trim(), "LOCAL-PRECIOUS-B-MODIFIED", "assume-unchanged local content must survive");
+});
+
+await test("behind + MM staged-only content (staged v3, worktree==origin, HEAD v1) → WARN, index preserved", async () => {
+  // P2-MM guard: staged blob not in HEAD or origin must block the reset.
+  const { clone, other, base } = makeRepo("mmguard");
+  writeFileSync(join(clone, "a.txt"), "v1\n");
+  sh("git add a.txt && git commit -qm v1 && git push -q origin main", clone);
+  sh("git -C '" + other + "' pull -q origin main", base); // other catches up to v1
+  advanceOrigin(other); // clone becomes behind
+  // stage v3 (staged-only), then revert the worktree to match origin
+  writeFileSync(join(clone, "a.txt"), "v3-STAGED-ONLY\n");
+  sh("git add a.txt", clone);
+  writeFileSync(join(clone, "a.txt"), "v1\n"); // worktree back to origin
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "warn-behind", "MM staged-only content must NOT auto-reset");
+  equal(sh("git rev-parse HEAD", clone), before, "HEAD must not move");
+  equal(execSync("git show :a.txt", { cwd: clone, encoding: "utf-8" }).trim(), "v3-STAGED-ONLY", "staged blob must survive");
+});
+
+await test("behind + assume-unchanged QUOTEPATH file (café.txt) → WARN, file preserved", async () => {
+  // P1: `git ls-files -v` C-escapes non-ASCII names under core.quotepath
+  // (default on) — the -z raw form must still catch the pinned local mod.
+  const { clone, other, base } = makeRepo("quotepath");
+  writeFileSync(join(clone, "café.txt"), "PINNED-ORIGINAL\n");
+  sh("git add 'café.txt' && git commit -qm add-cafe && git push -q origin main", clone);
+  sh("git update-index --assume-unchanged 'café.txt'", clone);
+  writeFileSync(join(clone, "café.txt"), "PINNED-LOCAL-MOD\n");
+  writeFileSync(join(clone, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm local-dup && git reset --soft HEAD~1 && git reset -q HEAD", clone);
+  try { sh("git -C '" + other + "' pull -q origin main", base); } catch (e) { throw new Error("PULL FAILED: " + String(e).slice(0, 300)); }
+  writeFileSync(join(other, "a.txt"), "v2\n");
+  sh("git add a.txt && git commit -qm upstream && git push -q origin main", other);
+  ok(!repoClean(clone), "fixture must be dirty (a.txt modified)");
+  const before = sh("git rev-parse HEAD", clone);
+  captureStart();
+  let r: any;
+  try { r = freshnessTick(clone, BASE_ENV); } finally { captureStop(); }
+  equal(r.action, "warn-behind", "quotepath assume-unchanged collision must NOT auto-reset");
+  equal(sh("git rev-parse HEAD", clone), before, "HEAD must not move");
+  equal(execSync("cat 'café.txt'", { cwd: clone, encoding: "utf-8" }).trim(), "PINNED-LOCAL-MOD", "pinned non-ASCII local content must survive");
 });
 
 await test("feature branch → report-only, NEVER pulled", async () => {

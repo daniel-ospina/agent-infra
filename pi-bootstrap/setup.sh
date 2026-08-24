@@ -80,14 +80,24 @@ PY
 }
 merge_settings() {
   # Source wins for keys it defines; target keeps local extras (skills,
-  # packages, env, ...) so per-machine bits survive re-syncs.
+  # packages, env, ...) so per-machine bits survive re-syncs. The `retry`
+  # subtree is deep-merged per-key (source wins per key it defines, local
+  # overrides survive) — a shallow merge would let the source `retry` block
+  # silently reset a user's `retry.enabled: false` (the documented kill
+  # switch) on every sync (#318 review).
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$SRC/settings.json" "$DEST/settings.json" << 'PY'
 import json, os, sys
 src = json.load(open(sys.argv[1]))
 dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
-json.dump({**dst, **src}, open(sys.argv[2], "w"), indent=2)
-print("    settings.json merged (local extras preserved)")
+merged = {**dst, **src}
+if isinstance(src.get("retry"), dict) and isinstance(dst.get("retry"), dict):
+    retry = {**dst["retry"], **src["retry"]}
+    if isinstance(src["retry"].get("provider"), dict) and isinstance(dst["retry"].get("provider"), dict):
+        retry["provider"] = {**dst["retry"]["provider"], **src["retry"]["provider"]}
+    merged["retry"] = retry
+json.dump(merged, open(sys.argv[2], "w"), indent=2)
+print("    settings.json merged (local extras preserved; retry deep-merged)")
 PY
   else
     cp "$SRC/settings.json" "$DEST/settings.json"
@@ -183,6 +193,24 @@ else
   echo "    warning: npm not found - extension deps skipped (mcp-client/builtin-tools/loop-enforcer may not load)"
 fi
 
+# Offline-resume retry patch (idempotent, #318): cap pi's agent-level retry
+# backoff at 5 min so sessions survive network outages instead of stopping
+# after 3 quick retries. Re-applied on every sync so a `pi update` that
+# rewrites the dist can't silently lose the patch. Non-zero (pi missing /
+# patch target changed by an upgrade) is a warning, not an abort — the
+# message is the diagnostic; re-run after a pi update if it failed.
+echo "==> Offline-resume retry patch"
+if [ -x "$INFRA_ROOT/scripts/patch-pi-retry.sh" ]; then
+  if bash "$INFRA_ROOT/scripts/patch-pi-retry.sh"; then
+    echo "    retry patch: ok"
+  else
+    echo "    WARNING: retry patch reported failures (see above) — run:"
+    echo "      $INFRA_ROOT/scripts/patch-pi-retry.sh"
+  fi
+else
+  echo "    WARNING: scripts/patch-pi-retry.sh missing — offline-resume retry patch NOT applied (sessions still stop after 3 quick retries on network loss)."
+fi
+
 # Small config / rules files
 cp "$SRC/skills-repos.yaml"          "$DEST/skills-repos.yaml"
 cp "$SRC/coding-rules.md"            "$DEST/coding-rules.md"
@@ -209,6 +237,38 @@ else
   mkdir -p "$DEST/skills"
   cp -R "$INFRA_ROOT/skills/." "$DEST/skills"
   echo "    skills copied ($(ls "$DEST/skills" | wc -l | tr -d ' ') items)"
+fi
+
+# Scripts farm (checkout-hygiene): symlink the launchd scripts the plist
+# jobs invoke (corruption-canary + hub-state-check convention, #304). Keeps
+# repo symlinks (updates flow via git pull) like the skills farm; replaces
+# stale/foreign links with fresh ones. Test files and plist templates are
+# not farmed (tests don't ship; plists are rendered from templates/launchd).
+SCRIPTS_SRC="$INFRA_ROOT/scripts/checkout-hygiene"
+if [ -d "$SCRIPTS_SRC" ]; then
+  mkdir -p "$DEST/scripts/checkout-hygiene"
+  linked=0; kept_farm=0
+  for f in "$SCRIPTS_SRC"/*; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    case "$base" in
+      *.plist|*.test.*) continue ;;
+    esac
+    dest="$DEST/scripts/checkout-hygiene/$base"
+    if [ -L "$dest" ]; then
+      dest_resolved="$(resolve_path "$dest")"
+      repo_resolved="$(resolve_path "$f")"
+      if [ -n "$dest_resolved" ] && [ -n "$repo_resolved" ] && [ "$dest_resolved" = "$repo_resolved" ]; then
+        kept_farm=$((kept_farm+1))
+        continue
+      fi
+      echo "    replacing stale/foreign scripts symlink: $base"
+      rm -f "$dest"
+    fi
+    ln -s "$f" "$dest"
+    linked=$((linked+1))
+  done
+  echo "    scripts/checkout-hygiene farm: $linked linked, $kept_farm kept"
 fi
 
 # Wire shell profile (idempotent): auto-sync env + optional keys file
@@ -248,6 +308,22 @@ if [ "$TORTOISE_HOME_SET" -eq 1 ]; then
   echo "    MCP: tortoise will use TORTOISE_HOME for its local MCP server"
 else
   echo "    note: TORTOISE_HOME not set and no tortoise checkout found — tortoise MCP server unavailable until set"
+fi
+
+# Launchd agents (idempotent, #304): install the versioned plist templates
+# (hub-state-check + corruption-canary). The installer renders → diffs vs the
+# installed plist → skips when identical, reloads on change — safe on every
+# run. Broken script targets fail loudly (non-zero) but don't abort setup:
+# the message + --status are the diagnostic. macOS only (launchctl).
+if [[ "$(uname)" == "Darwin" ]] && [ -x "$INFRA_ROOT/scripts/install-launchd.sh" ]; then
+  echo ""
+  echo "==> Launchd agents"
+  if bash "$INFRA_ROOT/scripts/install-launchd.sh"; then
+    echo "    launchd: in sync (see --status for detail)"
+  else
+    echo "    WARNING: launchd install reported failures (see above) — run:"
+    echo "      $INFRA_ROOT/scripts/install-launchd.sh --status"
+  fi
 fi
 
 echo ""

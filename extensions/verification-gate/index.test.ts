@@ -7,8 +7,12 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk } from "./index.js";
+import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
+import { mkdtempSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 let passed = 0;
 let failed = 0;
@@ -555,6 +559,24 @@ test("returns original when path is the root itself", () => {
   equal(normalizeRegistryPath(p, p), p);
 });
 
+test("symlinked FILE keeps the git-verbatim relative path (#305)", () => {
+  // Regression: realpathSync(abs) used to resolve through the link to its
+  // target, registering a committed symlink under the TARGET's path — a key
+  // that never matches the block check's verbatim git path, so every commit
+  // touching the symlink was blocked as "unverified" forever.
+  const root = mkdtempSync(join(tmpdir(), "vgate-nrp-"));
+  try {
+    writeFileSync(join(root, "target.yml"), "target\n");
+    symlinkSync("target.yml", join(root, "link.yml"));
+    equal(normalizeRegistryPath(root, "link.yml"), "link.yml");
+    equal(normalizeRegistryPath(root, join(root, "link.yml")), "link.yml");
+    // regular file still normalizes through a symlinked PARENT dir
+    equal(normalizeRegistryPath(root, "target.yml"), "target.yml");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ── resolveMergeRoot (#190) ─────────────────────────
 
 section("resolveMergeRoot — wrong-root guard (#190)");
@@ -1092,6 +1114,76 @@ test("evaluateMergeScope never returns undefined for any input shape", () => {
   for (const [cwdRepo, explicitRepo, localHead, prHead] of inputs) {
     const d = evaluateMergeScope(cwdRepo, explicitRepo, localHead, prHead);
     ok(d && typeof d.verify === "boolean" && typeof d.reason === "string", "must always return a decision");
+  }
+});
+
+// ── hashMatchesDisk (#320) ───────────────────────────
+
+section("hashMatchesDisk — sha1/sha256 acceptance (#320)");
+
+test("sha1 stored hash matches unchanged disk file", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-hm-"));
+  try {
+    writeFileSync(join(root, "a.ts"), "content-a\n");
+    const sha1 = createHash("sha1").update("content-a\n").digest("hex");
+    equal(hashMatchesDisk(root, "a.ts", sha1), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sha1 stored hash fails on edited disk file (anti-drift preserved)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-hm-"));
+  try {
+    writeFileSync(join(root, "a.ts"), "content-a\n");
+    const sha1 = createHash("sha1").update("content-a\n").digest("hex");
+    writeFileSync(join(root, "a.ts"), "content-b\n");
+    equal(hashMatchesDisk(root, "a.ts", sha1), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sha256 stored hash matches unchanged disk file (status quo)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-hm-"));
+  try {
+    writeFileSync(join(root, "a.ts"), "content-a\n");
+    const sha256 = createHash("sha256").update("content-a\n").digest("hex");
+    equal(hashMatchesDisk(root, "a.ts", sha256), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("uppercase hex stored hash matches (case-insensitive)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-hm-"));
+  try {
+    writeFileSync(join(root, "a.ts"), "content-a\n");
+    const sha1 = createHash("sha1").update("content-a\n").digest("hex").toUpperCase();
+    equal(hashMatchesDisk(root, "a.ts", sha1), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unknown-length hash (md5, 32-hex) fails closed", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-hm-"));
+  try {
+    writeFileSync(join(root, "a.ts"), "content-a\n");
+    const md5 = createHash("md5").update("content-a\n").digest("hex");
+    equal(hashMatchesDisk(root, "a.ts", md5), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("missing file throws (consistent with hashFile; callers fail closed)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-hm-"));
+  try {
+    const sha1 = createHash("sha1").update("x").digest("hex");
+    throws(() => hashMatchesDisk(root, "missing.ts", sha1));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

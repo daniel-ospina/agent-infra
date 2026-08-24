@@ -62,3 +62,14 @@ Incidents (2026-08-06):
 1. **Hub branch:** `main` only. Feature branches live in worktrees. Main checkout is a shared hub. ✅ (#40)
 2. **`deleteBranchOnMerge`:** **Enabled** on `daniel-ospina/agent-infra` (2026-08-07, #74). Rationale: the main-worktree-guard (Layer 1) blocks destructive git operations in the main checkout, and #73 provides coordinated deletion checks. Stale-branch cleanup script (`scripts/cleanup-stale-branches.sh`) catches any stragglers with notification-first dry-run default.
 3. **Policy docs:** Live in `skills/using-git-worktrees/SKILL.md` under "Shared Checkout Policy" section, with a reference back to this research doc.
+
+## Incidents
+
+| Date | Incident | Layer gap | Resolution |
+|---|---|---|---|
+| 2026-08-06 | `git reset --hard origin/main` mid-PR wiped another lane's branch; branch switches under live sessions; `push --delete` of a checked-out branch | L1/L3 | destructive-git + coordinated-delete blocks (#73, `1e71c5c`) |
+| 2026-08-18 | **Hub discipline failure (canonical writeup):** tortoise hub checked out on `pr1467` at 13:42, stayed **29h off-main** with **38 commits ahead** + 3 untracked files. The checkout bypassed the guard (hatch / script backdoor / terminal — audit log + empty unscoped marker rule out the TTL-marker path). Sibling sessions hit M2 blocks and needed worktree-context merge workarounds; VGATE tripped on foreign staged files. Root cause: the lane's worktree was broken — detached HEAD in `/private/tmp` (reaped), no `.env`/`.venv`/`.mcp.json` in worktrees — so the hub was the only path that worked. | L2 (warn-only, print-mode-skipped, no local visibility) | **#1484** — M4 hard block on non-recovery git ops in a disordered hub (stays active under the marker), script-backdoor closure, nightly `hub-state-check.sh` (launchd 6h, deduped GitHub issue), documented recovery contract in the skill, `hub-worktree.sh` one-command helper (never `/tmp`, never detached, auto-setup) |
+
+Lesson (from the #1484 root-cause pass): agents choose the hub when the
+sanctioned path fails. Enforcement without usability (working worktrees) only
+moves the failure — #1484 ships both the M4 block AND the one-command helper.

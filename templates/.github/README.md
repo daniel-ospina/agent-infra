@@ -1,16 +1,25 @@
 # CI Templates
 
-Per-stack CI workflow templates deployed as symlinks into each repo.
+Per-stack reusable CI workflows (`on: workflow_call`) consumed by thin
+`ci.yml` callers pinned to a semver tag (#303).
 
 ## Deployment
 
-CI templates are deployed via **symlinks** (same pattern as extensions and skills):
+Templates in `templates/.github/workflows/` are the source of truth. The
+published reusable workflows in `agent-infra/.github/workflows/` are REAL
+COMMITTED FILES materialized from them by `scripts/sync-ci-workflows.sh`
+(GitHub Actions CANNOT parse symlinked workflow files — #555). Consumers
+call them pinned to a tag:
 
 ```
-<repo>/.github/workflows/<template> → agent-infra/templates/.github/workflows/<template>
+jobs:
+  ci:
+    uses: daniel-ospina/agent-infra/.github/workflows/python-ci.yml@v0.1.0
+    secrets: inherit
 ```
 
-Updates to templates propagate automatically — no manual sync needed.
+A workflow change lands in consumers by an explicit version bump (tag +
+manifest `ci.ref`); `agent-infra check` blocks on a stale pin.
 
 ## Stack Detection
 
@@ -20,17 +29,13 @@ Updates to templates propagate automatically — no manual sync needed.
 | `package.json` | `node-ci.yml` | Node.js |
 | Neither | `docs-ci.yml` | Docs/Markdown |
 
-## Divergence
+## Drift
 
-A repo that needs custom CI replaces the symlink with a local file:
-
-```bash
-rm .github/workflows/python-ci.yml
-cp $AGENT_INFRA_PATH/templates/.github/workflows/python-ci.yml .github/workflows/python-ci.yml
-# Edit the file locally
-```
-
-`agent-infra check` warns when it finds a local file where a symlink is expected.
+Any symlink under a consumer's `.github/workflows/` is a broken workflow
+entry to GitHub Actions (#555) — `agent-infra check` reports it as an issue.
+In agent-infra itself, the `pipeline-compliance` `workflow-drift` job fails
+CI when `.github/workflows/{python,node,docs}-ci.yml` drift from the
+templates (run `scripts/sync-ci-workflows.sh` to materialize).
 
 ## Templates
 

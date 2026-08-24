@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS } from "./index.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
@@ -1483,6 +1483,109 @@ test("E13: first-message-stall at M — turn active, no message/tool events, ret
   const dHung = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: stHung, streamStallMs: 600_000, toolStallMs: 21_600_000 }));
   equal(dHung.kill, true, "hung in-flight tool still bounded by tool-stall (#198)");
   equal(dHung.reason, "tool-stall", "tool-stall reason (#198)");
+});
+
+section("#318 network-down survival — heartbeatKillDecision suppression");
+
+test("E318a: stream-stall suppressed when network down + fresh markers (offline survival)", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.turnActive = true;
+  st.lastMarkerAt = 800_000;
+  st.streamAgeMs = S + 1; // stream-stall threshold exceeded
+  // baseline: without network awareness the stall kills
+  const d = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: st, hasOutput: false }));
+  equal(d.kill, true);
+  equal(d.reason, "stream-stall");
+  // network down + fresh markers → suppressed (the child is retrying, not wedged)
+  const dn = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: st, hasOutput: false, networkDown: true }));
+  equal(dn.kill, false, "network-down survival suppresses the stall");
+  equal(dn.resolveUndefined, false);
+});
+
+test("E318b: first-message-stall suppressed when network down + fresh markers", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true; // turn_start seen
+  st.turnActive = true;
+  st.turnSawMessage = false;
+  st.turnSawTool = false;
+  st.streamAgeMs = M + 1;
+  st.lastMarkerAt = 800_000;
+  const d = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: st, hasOutput: false, streamStallMs: 600_000 }));
+  equal(d.kill, true, "baseline: kills without network awareness");
+  equal(d.reason, "first-message-stall");
+  const dn = heartbeatKillDecision(dinput({ now: 800_010, lastLifeSignAt: 800_000, state: st, hasOutput: false, streamStallMs: 600_000, networkDown: true }));
+  equal(dn.kill, false, "network-down survival suppresses first-message");
+});
+
+test("E318c: networkDown + STALE markers still kills (dead child is not an outage)", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.lastMarkerAt = 800_000;
+  st.streamAgeMs = S + 1;
+  // markerAge 180s > fresh window (max(2T, 2×INT) = 120s) → stale
+  const now = 800_000 + 180_000;
+  const d = heartbeatKillDecision(dinput({ now, lastLifeSignAt: 800_000, state: st, hasOutput: false, networkDown: true }));
+  equal(d.kill, true, "stale markers → kill not suppressed");
+  equal(d.reason, "silence-threshold");
+});
+
+test("E318d: tier-1 zero-output never suppressed (never-initialized child is a startup hang)", () => {
+  const st = createHeartbeatState(); // no ready, no work markers
+  const d = heartbeatKillDecision(dinput({ now: 61_000, lastLifeSignAt: 0, hasOutput: false, state: st, networkDown: true }));
+  equal(d.kill, true);
+  equal(d.reason, "zero-output");
+});
+
+test("E318e: networkDown without markers (stateFresh=false) fails open to legacy", () => {
+  const st = createHeartbeatState();
+  st.everSawWork = true;
+  st.streamAgeMs = S + 1; // stream-stall threshold exceeded
+  // no lastMarkerAt (never any markers) → stateFresh false → no suppression
+  const d = heartbeatKillDecision(dinput({ now: 300_000, lastLifeSignAt: 100_000, state: st, hasOutput: false, networkDown: true }));
+  equal(d.kill, true, "markerless child still killed — legacy behavior preserved");
+});
+
+test("E318f: resolveProviderBaseUrl resolves from models.json registry", () => {
+  const reg = {
+    providers: {
+      deepseek: { baseUrl: "https://api.deepseek.com", models: [] },
+      bare: { models: [] },
+    },
+  };
+  equal(resolveProviderBaseUrl("deepseek", reg), "https://api.deepseek.com");
+  equal(resolveProviderBaseUrl("bare", reg), "", "no baseUrl → empty (fail open)");
+  equal(resolveProviderBaseUrl("missing", reg), "", "unknown provider → empty");
+  equal(resolveProviderBaseUrl("", reg), "", "empty provider → empty");
+  equal(resolveProviderBaseUrl("deepseek", {}), "", "empty registry → empty");
+});
+
+testAsync("E318g: loop-level probe gate — suppresses only what the pure function would suppress; settled guard + probe clamp pinned", async () => {
+  const builtinSource = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
+  // The loop gate must re-derive the decision with networkDown forced true
+  // (so tier-1 zero-output and stale-marker kills still fire — outage or not)
+  // instead of suppressing every kill reason when the probe says "down".
+  ok(
+    builtinSource.includes("const redecided = heartbeatKillDecision({") &&
+      builtinSource.includes("networkDown: true,\n            });"),
+    "#318 loop gate re-derives the pure-function decision before suppressing",
+  );
+  ok(
+    builtinSource.includes("if (settled || proc.exitCode !== null) return;"),
+    "#318 kill path guarded after the await window (recycled-pid treeKill hazard)",
+  );
+  ok(
+    builtinSource.includes("Math.min(9_000, Math.max(1_000, Number(process.env.TASK_NETWORK_PROBE_TIMEOUT_MS)"),
+    "#318 probe timeout clamped below the 10s tick so ticks can never overlap",
+  );
+  ok(
+    builtinSource.includes("probeUrlValid") && builtinSource.includes('u.protocol === "http:"'),
+    "#318 probe URL validated (http/https) — a malformed URL fails open, never suppresses forever",
+  );
+  ok(
+    builtinSource.includes("if (!down) networkSuppressLogged = false;"),
+    "#318 suppression log re-armed on down→up so repeated outages log again",
+  );
 });
 
 section("#279 first-message — everSawRealActivity gate + frozen-age transition reset (E279 series)");
