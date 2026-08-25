@@ -172,11 +172,20 @@ export function extractGitInvocation(command, preferVerb = null) {
   // one whose verb matches (review P2, cycle 3: `git -C <wt> status && git
   // checkout main` — the branch-state gate must resolve the repo for the
   // CHECKOUT, whose -C/hints differ from the first invocation).
+  // #337: also collect same-command `VAR=value` assignments so a `cd $WT`
+  // (or `cd "${WT}"`) can be resolved against them by resolveEffectiveRepo.
   let envGitDir = null;
+  const vars = {};
   while (i < tokens.length) {
     const t = tokens[i];
     if (/^GIT_DIR=(.*)$/.test(t)) { envGitDir = t.slice("GIT_DIR=".length).replace(/^["']|["']$/g, ""); i++; continue; }
     if (/^GIT_WORK_TREE=/.test(t)) { i++; continue; }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+      const eq = t.indexOf("=");
+      vars[t.slice(0, eq)] = t.slice(eq + 1).replace(/^["']|["']$/g, "");
+      i++;
+      continue;
+    }
     if (t === "cd") { cdChain.push(tokens[i + 1] ?? null); i += 2; continue; }
     if (t !== "git") { i++; continue; }
     // ── candidate git invocation ──
@@ -197,7 +206,7 @@ export function extractGitInvocation(command, preferVerb = null) {
     }
     const verb = tokens[j] ?? null;
     if (preferVerb && verb !== preferVerb) { i = j; continue; } // not the target — keep scanning
-    return { cdChain: [...cdChain], gitDirHint, cHints, verb, rest: tokens.slice(j) };
+    return { cdChain: [...cdChain], gitDirHint, cHints, verb, rest: tokens.slice(j), vars };
   }
   return null;
 }
@@ -224,7 +233,14 @@ export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null) {
   let cwd = sessionCwd ? resolve(sessionCwd) : process.cwd();
   for (const cd of inv.cdChain) {
     if (!cd) continue;
-    cwd = resolve(cwd, cd); // bash: `cd a && cd b` ends in b, relative to a
+    const expanded = _expandCdVars(cd, inv.vars);
+    // #337: an unresolvable `$VAR` cd target (no same-command assignment) must
+    // NOT resolve to a bogus literal path (`<cwd>/$WT` → git read fails →
+    // fail-closed block). Conservatively fall back to the session cwd — the
+    // KNOWN reference point (the hub/main checkout) so the main-checkout gates
+    // still apply rather than guessing a worktree.
+    if (expanded === null) continue;
+    cwd = resolve(cwd, expanded); // bash: `cd a && cd b` ends in b, relative to a
   }
   for (const c of inv.cHints) {
     if (!c) continue;
@@ -241,6 +257,24 @@ export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null) {
       state.gitDir.includes("/worktrees/") || state.gitDir.endsWith("/worktrees"),
     currentBranch: state.branch,
   };
+}
+
+/** Expand `$VAR` / `${VAR}` in a cd target against same-command assignments.
+ * Returns the expanded path, or null when any `$VAR` is unresolvable (caller
+ * falls back to the session cwd — conservative, #337). Tilde/home expansion is
+ * out of scope (unchanged from the pre-#337 behavior). */
+function _expandCdVars(token, vars) {
+  let t = String(token ?? "").replace(/^["']|["']$/g, "");
+  if (!t.includes("$")) return t;
+  const map = vars || {};
+  let ok = true;
+  t = t.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, braced, plain) => {
+    const name = braced ?? plain;
+    if (Object.prototype.hasOwnProperty.call(map, name)) return map[name];
+    ok = false;
+    return m;
+  });
+  return ok ? t : null;
 }
 
 // ── M3 pure classification of branch-state verbs ───────────────────────────

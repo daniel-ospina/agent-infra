@@ -79,6 +79,25 @@ ok("resolveEffectiveRepo: cd into worktree", (() => {
   return r && r.isWorktree === true;
 })(), "cd wt");
 
+// #337: a `cd $WT` whose target is a shell variable must resolve from a
+// same-command `VAR=value` assignment (the literal `$WT` path used to make the
+// ownership `git read` fail → fail-closed block). Unresolvable vars fall back
+// to the session cwd (conservative — the known hub reference point).
+ok("resolveEffectiveRepo: VAR= cd into worktree", (() => {
+  const r = resolveEffectiveRepo(`WT="${WT}" cd "$WT" && git commit -m x`, MAIN);
+  return r && r.isWorktree === true && r.currentBranch === "feat/wt";
+})(), "VAR cd");
+
+ok("resolveEffectiveRepo: ${VAR} cd into worktree", (() => {
+  const r = resolveEffectiveRepo('WT="' + WT + '" cd "${WT}" && git commit -m x', MAIN);
+  return r && r.isWorktree === true;
+})(), "${VAR} cd");
+
+ok("resolveEffectiveRepo: unresolvable $VAR cd → session cwd fallback", (() => {
+  const r = resolveEffectiveRepo(`cd $UNRESOLVED_WT && git commit -m x`, MAIN);
+  return r && r.isWorktree === false && r.currentBranch === "main" && r.repoKey === mainKey;
+})(), "unresolvable VAR cd");
+
 // cycle-4 adversarial: -C wt --git-dir=<main>/.git operates on the MAIN repo
 ok("resolveEffectiveRepo: -C wt --git-dir=main → NOT worktree (main repo)", (() => {
   const r = resolveEffectiveRepo(`git -C "${WT}" --git-dir="${join(MAIN, ".git")}" checkout -f side`, MAIN);
