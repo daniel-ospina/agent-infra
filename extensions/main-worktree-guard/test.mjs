@@ -525,6 +525,21 @@ m4("branch create blocked", `git branch feat/x`, "pr1467", "block");
 m4("stash list read-only allowed", `git stash list`, "pr1467", "allowed");
 m4("non-git not gated", `python3 test.py`, "pr1467", "non-git");
 m4("marker touch not gated", `touch ~/.pi/agent/.allow-main-edits  # recovery`, "pr1467", "non-git");
+
+// ── #337: wrappers (pipes/redirects/&&/cd) must not break the allowlist match ──
+// The leading git invocation is extracted and classified on its OWN; the
+// trailing pipe/redirect consumer (`tail`/`head`/`echo`) is not a git arg.
+m4("piped recovery: checkout main | tail", `git checkout main 2>&1 | tail -3`, "pr1467", "recovery");
+m4("piped read-only: show-ref | head", `git show-ref --verify refs/heads/main 2>&1 | head -2`, "pr1467", "allowed");
+m4("redirect suffix: status > log", `git status > /tmp/status.log`, "pr1467", "recovery");
+m4("branch --show-current + echo suffix", `git branch --show-current echo === ...`, "pr1467", "allowed");
+m4("leading cd + recovery compound", `cd /tmp && git checkout main && git pull --ff-only`, "pr1467", "recovery");
+// CRITICAL: a wrapper must NOT mask a destructive op in ANY segment.
+m4("echo && reset --hard blocked", `echo x && git reset --hard`, "pr1467", "block");
+m4("piped destructive: reset | tail blocked", `git reset --hard 2>&1 | tail -3`, "pr1467", "block");
+m4("recovery then destructive blocked", `git checkout main && git reset --hard`, "pr1467", "block");
+// Fail-closed preserved: checkout -- <files> (path-restore) is still a mutation.
+m4("checkout -- files still blocked", `git checkout -- file.txt`, "pr1467", "block");
 // Clean-hub semantics: on `main`, checkout main is still NOT a mutation escape
 // (M3 blocks the direct form in index.ts) but the gate itself only fires in a
 // disordered hub — these assert the gate would not block clean-state harm.

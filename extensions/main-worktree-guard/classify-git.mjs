@@ -73,7 +73,15 @@ export function classifyGitCommand(command) {
 
 /** Quote-aware tokenizer (mirrors branch-ownership.mjs; kept local so
  * classify-git stays dependency-free for jiti loading — the two are
- * cross-checked by test-branch-ownership.mjs's consistency matrix). */
+ * cross-checked by test-branch-ownership.mjs's consistency matrix).
+ *
+ * Unlike branch-ownership's `tokenize`, this EMITS shell operators (`&&`, `||`,
+ * `|`, `&`, `;`, `(`, `)`) and redirects (`>`, `>>`, `<`, `<<`, and fd-prefixed
+ * forms like `2>`, `2>>`, `2>&1`, `1>&2`, `2>&-`) as their own tokens so
+ * `_allGitInvocations` can delimit a git invocation's args at a pipe/redirect
+ * instead of swallowing the trailing `tail`/`head`/`echo` consumer into the
+ * verb's arg list (#337). The fd digit must ABUT the redirect (no space) — a
+ * space makes the number a real arg (`git add 2 > out` keeps `2`). */
 function _tokenize(command) {
   const tokens = [];
   const s = String(command ?? "");
@@ -81,28 +89,75 @@ function _tokenize(command) {
   while (i < s.length) {
     while (i < s.length && /\s/.test(s[i])) i++;
     if (i >= s.length) break;
+
+    // Two-char operators (`>>`/`<<` are redirects, not just `>`+`>`).
+    const two = s.slice(i, i + 2);
+    if (two === "&&" || two === "||" || two === ">>" || two === "<<") {
+      tokens.push(two);
+      i += 2;
+      continue;
+    }
+
+    const ch = s[i];
+
+    // fd-prefixed redirect (no intervening space): `2>`, `2>>`, `2<`, `2<<`,
+    // `2>&1`, `1>&2`, `2>&-`. Consume the whole redirect operator as ONE token
+    // so `git checkout main 2>&1 | tail -3` leaves `checkout` with just `main`.
+    if (/[0-9]/.test(ch)) {
+      let j = i;
+      while (j < s.length && /[0-9]/.test(s[j])) j++;
+      if (j < s.length && (s[j] === ">" || s[j] === "<")) {
+        let k = j + 1;
+        if (k < s.length && (s[k] === ">" || s[k] === "<")) k++;
+        if (k < s.length && s[k] === "&") {
+          k++;
+          while (k < s.length && /[0-9-]/.test(s[k])) k++;
+        }
+        tokens.push(s.slice(i, k));
+        i = k;
+        continue;
+      }
+    }
+
+    // Single-char shell operators: pipes, list separators, redirects, subshells.
+    if (ch === "&" || ch === "|" || ch === ";" || ch === "(" || ch === ")" || ch === ">" || ch === "<") {
+      tokens.push(ch);
+      i++;
+      continue;
+    }
+
+    // Regular token (quote- and escape-aware).
     let tok = "";
     let quote = null;
     while (i < s.length) {
-      const ch = s[i];
+      const c = s[i];
       if (quote) {
-        if (ch === quote) { quote = null; i++; continue; }
-        if (ch === "\\" && quote === '"' && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
-        tok += ch; i++; continue;
+        if (c === quote) { quote = null; i++; continue; }
+        if (c === "\\" && quote === '"' && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
+        tok += c; i++; continue;
       }
-      if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
-      if (/\s/.test(ch)) break;
-      // Shell metacharacters are token boundaries too — `git add .&&git commit`
-      // must tokenize as TWO invocations (review P2: no-space compounds evaded M2).
-      // Consume the metachar so the outer loop advances (an empty-token break
-      // would infinite-loop — i never moves past it).
-      if (ch === "&" || ch === "|" || ch === ";" || ch === "(" || ch === ")") { i++; break; }
-      if (ch === "\\" && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
-      tok += ch; i++;
+      if (c === "'" || c === '"') { quote = c; i++; continue; }
+      if (/\s/.test(c)) break;
+      if (c === "&" || c === "|" || c === ";" || c === "(" || c === ")" || c === ">" || c === "<") break;
+      if (c === "\\" && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
+      tok += c; i++;
     }
     if (tok) tokens.push(tok);
   }
   return tokens;
+}
+
+/** Shell operators that end a git invocation's arg list (a pipe/redirect/chain
+ * means the NEXT word starts a new command — a `tail`/`head`/`echo` consumer). */
+const _SHELL_OPS = new Set(["&&", "||", "|", "&", ";", "(", ")"]);
+function _isShellBoundary(tok) {
+  if (_SHELL_OPS.has(tok)) return true;
+  if (tok === ">" || tok === ">>" || tok === "<" || tok === "<<") return true;
+  // fd-prefixed redirects emitted by _tokenize: `2>`, `2>>`, `2<`, `2<<`, `2>&1`,
+  // `1>&2`, `2>&-`.
+  if (/^[0-9]+(?:>>?|<<?)$/.test(tok)) return true;
+  if (/^[0-9]+>&[0-9]*-?$/.test(tok)) return true;
+  return false;
 }
 
 /**
@@ -184,8 +239,13 @@ function _allGitInvocations(command) {
     const verb = tokens[i] ?? null;
     const args = [];
     i++;
-    while (i < tokens.length && tokens[i] !== "git") {
-      if (!["&&", ";", "||", "|", "&", "(", ")"].includes(tokens[i])) args.push(tokens[i]);
+    // #337: STOP at a pipe/redirect/chain instead of skipping it — the trailing
+    // `tail`/`head`/`echo` consumer of a wrapper (`git ... 2>&1 | tail -3`) must
+    // NOT pollute the verb's arg list. The NEXT `git` token still starts a new
+    // invocation (every invocation is gated, so a destructive op in ANY segment
+    // still blocks).
+    while (i < tokens.length && tokens[i] !== "git" && !_isShellBoundary(tokens[i])) {
+      args.push(tokens[i]);
       i++;
     }
     invocations.push({ verb, args });
@@ -642,7 +702,7 @@ const HUB_GUARDED_VERBS = new Set([
 
 /** Read-only verbs — safe to run in a disordered hub (no state mutation). */
 const HUB_READONLY_VERBS = new Set([
-  "status", "log", "diff", "show", "blame", "remote", "rev-parse",
+  "status", "log", "diff", "show", "show-ref", "blame", "remote", "rev-parse",
   "rev-list", "ls-files", "ls-tree", "ls-remote", "grep", "shortlog",
   "describe", "name-rev", "cat-file", "for-each-ref", "help", "version",
   "merge-base", "merge-tree", "merge-file", "merge-index", "merge-msg",
@@ -726,6 +786,11 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
       // `git branch` bare / -a / -r / -vv / --show-current = list (read-only);
       // create (`git branch foo`), delete/rename/force → block.
       if (["-d", "-D", "-m", "-M", "-f", "--force"].some(flag)) return "block";
+      // #337: `--show-current` is a STANDALONE read-only mode — git ignores
+      // trailing operands (verified: `git branch --show-current echo === ...`
+      // prints the branch and exits 0), so a wrapper suffix must not flip a
+      // list into a branch-create.
+      if (flag("--show-current")) return "readonly";
       return pos.length > 0 ? "block" : "readonly";
     }
     if (verb === "tag") return pos.length > 0 ? "block" : "readonly"; // create/delete
