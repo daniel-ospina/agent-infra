@@ -1015,6 +1015,97 @@ async function main() {
       `sub-agent startup must warn on empty bridge recovery, got: ${captured.join(" | ")}`
     );
   });
+
+  section("#336 — hash-less PASS records blocked files (one-dispatch loop)");
+
+  test("scenario 30 (#336): JSON PASS with empty verified_files records the blocked files — commit allowed", async () => {
+    const repo = join(TEST_ROOT, "repo-336");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "file336.txt"), "v1\n");
+    git(repo, "add file336.txt");
+    git(repo, "commit -m baseline");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "file336.txt"), "v2\n");
+    git(repo, "add file336.txt");
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c336'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first");
+    // Verifier returns a schema-valid PASS with NO per-file hashes — the
+    // pre-#336 gate zero-merged this and re-blocked every retry.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: file336.txt. Classification: UI. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [] }) }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c336'", cwd: repo },
+    });
+    equal(res, undefined, "empty-verified_files PASS must record blocked files and allow the commit (one dispatch)");
+    git(repo, "commit -m c336");
+    await fire("session_start", {});
+  });
+
+  test("scenario 31 (#336): bare PASS with a prompt lacking the literal 'verify files:' still records blocked files", async () => {
+    const repo = join(TEST_ROOT, "repo-336");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "file336b.txt"), "w1\n");
+    git(repo, "add file336b.txt");
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c336b'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first");
+    // Verifier dispatched via a NON-standard prompt (no `verify files:` literal,
+    // detected only by agent === 'verifier') returns a bare PASS. The pre-#336
+    // fallback required the `verify files:` phrase → zero-merge → re-block loop.
+    await fire("tool_result", {
+      toolName: "subagent",
+      input: { agent: "verifier", task: "Please check the staged files" },
+      content: [{ type: "text", text: "PASS" }],
+    });
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c336b'", cwd: repo },
+    });
+    equal(res, undefined, "bare PASS with a non-standard prompt must record blocked files (one dispatch)");
+    git(repo, "commit -m c336b");
+    await fire("session_start", {});
+  });
+
+  test("scenario 32 (#336): post-PASS edit of a recorded file re-blocks (fail-closed)", async () => {
+    const repo = join(TEST_ROOT, "repo-336");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "file336c.txt"), "x1\n");
+    git(repo, "add file336c.txt");
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c336c'", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "must be blocked first");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: file336c.txt. Classification: UI. Project root: ${repo}` },
+      content: [{ type: "text", text: "PASS" }],
+    });
+    // Edit AFTER the PASS, then stage — the recorded hash must no longer match.
+    writeFileSync(join(repo, "file336c.txt"), "x2\n");
+    git(repo, "add file336c.txt");
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c336c'", cwd: repo },
+    });
+    ok(res && res.block === true, "post-PASS edit must re-block (hash mismatch, fail-closed)");
+    ok(/Hash mismatch/.test(res.reason), "block reason must carry the hash-mismatch diagnostic");
+    await fire("session_start", {});
+  });
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

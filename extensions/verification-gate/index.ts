@@ -710,6 +710,38 @@ export function mergeVerifiedFiles(
   return { merged, skipped };
 }
 
+// #336: hash-and-merge a set of files into the registry using their CURRENT
+// disk state. Used when a verifier returns PASS WITHOUT verifier-supplied
+// hashes (plain-text PASS, or JSON with empty verified_files): the verifier
+// judged the files ready but supplied no per-file hashes, so the gate records
+// the current disk hash. The caller diff-scopes the file list (scopeFiles) so
+// a hash-less PASS can never mark arbitrary files verified. Recording the
+// current hash (not a blind "verified forever") preserves fail-closed: a
+// post-PASS edit flips the hash and the block check re-blocks.
+export function hashAndMergeFiles(
+  verifiedSet: Map<string, string>,
+  blockAttempts: Map<string, number>,
+  files: string[],
+  projectRoot: string
+): number {
+  const normRoot = normalizeWorktreeRoot(projectRoot);
+  let merged = 0;
+  for (const file of files) {
+    try {
+      const relPath = normalizeRegistryPath(projectRoot, file);
+      if (relPath.startsWith("..") || isAbsolute(relPath)) continue; // out-of-root — inert (#190 review)
+      const key = compoundKey(normRoot, relPath);
+      const hash = hashFile(projectRoot, relPath);
+      verifiedSet.set(key, hash);
+      blockAttempts.delete(key);
+      merged++;
+    } catch {
+      // file may not exist at expected path — skip (deleted/unhashable)
+    }
+  }
+  return merged;
+}
+
 // ── JSON extraction ───────────────────────────────────
 
 /**
@@ -1094,7 +1126,7 @@ export default function (pi: ExtensionAPI) {
       "  before retrying — do not ask the parent to re-run this task.",
       "",
       `  → Dispatch your own VGATE verification (self-satisfy the gate):`,
-      `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}.', ...)`,
+      `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}. Return ONLY JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"<repo-relative>","hash":"<sha256>"}]}.', ...)`,
       "",
       `  → On PASS, retry the git operation. Sub-agent commits get NO #7591`,
       "    auto-bypass: an unverified commit blocks every time until verified.",
@@ -1107,11 +1139,7 @@ export default function (pi: ExtensionAPI) {
           ...reasons,
           "",
           `  → Dispatch the verifier sub-agent:`,
-          `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}.', ...)`,
-          "",
-          "  Verifier response format — use one of:",
-          '    1. Plain text: "PASS" on its own line (simplest)',
-          '    2. JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"...","hash":"..."}]}',
+          `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}. Return ONLY JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"<repo-relative>","hash":"<sha256>"}]}.', ...)`,
           "",
           "  → Or set ELDATO_SKIP_VGATE=1 to bypass (emergency only).",
         ].join("\n");
@@ -1203,7 +1231,6 @@ export default function (pi: ExtensionAPI) {
         // proactive dispatch in worktree B would zero-merge against A's stale
         // state and recreate the blocked-until-auto-bypass loop).
         const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
-        const normRoot = normalizeWorktreeRoot(projectRoot);
         // #190 review: expand directory paths against the PRE-clear blocked
         // list (a foreign dispatch must still resolve dirs from the real block
         // context), then clear the stale context atomically — lastBlockedCwd
@@ -1236,49 +1263,31 @@ export default function (pi: ExtensionAPI) {
           lastBlockedCwd = null;
         }
 
-        // #190: bounded fallback — zero prompt files (deviant format, e.g.
-        // `verify files:\n\nClassification:`) with a genuine `verify files:`
-        // dispatch and a block context merges the blocked diff (the
-        // gate-generated prompt names exactly those files). #190 review
-        // hardening: the fallback fires ONLY when the response is a STANDALONE
-        // verdict line (end-anchored PASS — "All checks passed.\nPASS" or
-        // "**PASS**"), never on prose echoes ("PASS criteria are met") or
-        // format-spec quotes. A non-standalone response zero-merges (fail-
-        // closed, context retained). Never applies to the JSON branch (a JSON
-        // PASS names its files in verified_files).
+        // #336: when the prompt names files, merge those (diff-scoped). When it
+        // names none (deviant/foreign prompt, or a verifier dispatched without
+        // the literal `verify files:` phrase), fall back to the files the gate
+        // is CURRENTLY blocking — the authoritative set — instead of
+        // zero-merging. The pre-#336 fallback only fired for standalone verdict
+        // lines AND only when the prompt contained `verify files:`; a plain
+        // PASS from any other dispatch shape recorded nothing and forced a
+        // re-dispatch loop. Prose echoes ("PASS criteria are met") never reach
+        // this branch (hasPass is line-anchored), so the fallback stays
+        // fail-safe: it only fires on a genuine PASS signal.
         let mergeFiles: string[];
-        if (promptFiles.size === 0 && lastBlockedFiles.length > 0 && /verify files:/i.test(prompt)) {
-          const standalonePass =
-            /(?:^|\n)\s*(?:[-*•]|\d+\.)?\s*\*{0,3}PASS(?:\b|:|—)\*{0,3}\s*$/m.test(textContent) ||
-            /✅\s*PASS(?:\b|:|—)\s*$/m.test(textContent);
-          if (standalonePass) {
-            mergeFiles = [...lastBlockedFiles];
-            console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${lastBlockedFiles.length} blocked files (standalone verdict line)`);
-          } else {
-            mergeFiles = [];
-          }
-        } else {
+        if (promptFiles.size > 0) {
           mergeFiles = [...promptFiles];
+        } else if (lastBlockedFiles.length > 0) {
+          mergeFiles = [...lastBlockedFiles];
+          console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${lastBlockedFiles.length} blocked files`);
+        } else {
+          mergeFiles = [];
         }
 
         // #190: shared diff-scoping — blocked-context filter (#5673) or, when
         // the context is empty/foreign, staged-diff scoping (never a blind
         // pass-through; known registry keys stay mergeable per #38).
         const { kept: filteredPromptFiles, skipped } = scopeFiles(mergeFiles, projectRoot, lastBlockedFiles, verifiedSet);
-        let merged = 0;
-        for (const file of filteredPromptFiles) {
-          try {
-            const relPath = normalizeRegistryPath(projectRoot, file);
-            if (relPath.startsWith("..") || isAbsolute(relPath)) continue; // out-of-root — inert (#190 review)
-            const key = compoundKey(normRoot, relPath);
-            const hash = hashFile(projectRoot, relPath);
-            verifiedSet.set(key, hash);
-            blockAttempts.delete(key);
-            merged++;
-          } catch {
-            // file may not exist at expected path — skip
-          }
-        }
+        const merged = hashAndMergeFiles(verifiedSet, blockAttempts, filteredPromptFiles, projectRoot);
         if (merged > 0) {
           console.log(`[verification-gate] ✅ Plain-text PASS — merged ${merged}/${mergeFiles.length} files from prompt${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
           writeBridge(projectRoot, Array.from(verifiedSet.keys()));
@@ -1367,6 +1376,30 @@ export default function (pi: ExtensionAPI) {
     // against the current staged diff, never a blind pass-through.
     const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
     if (foreign) lastBlockedFiles = []; // stale block context — do not filter against it
+
+    // #336: a schema-valid PASS with EMPTY verified_files carries no
+    // verifier-supplied hashes — the pre-#336 code zero-merged here (records
+    // nothing) and every commit/PR create re-blocked despite a fresh PASS.
+    // Fall back to the files the gate is CURRENTLY blocking: hash them at
+    // merge time (current disk state) so a post-PASS edit still re-blocks
+    // (fail-closed), and diff-scope them so a hash-less PASS can never mark
+    // arbitrary files verified. A foreign (wrong-root) block context is
+    // already cleared above → lastBlockedFiles is empty → zero-merge.
+    if (result.verified_files.length === 0) {
+      const fallbackMerged = hashAndMergeFiles(verifiedSet, blockAttempts, lastBlockedFiles, projectRoot);
+      if (fallbackMerged > 0) {
+        vgateFailures = 0;
+        console.log(`[verification-gate] ✅ PASS (empty verified_files) — recorded ${fallbackMerged} blocked files from disk (${verifiedSet.size} total)`);
+        writeBridge(projectRoot, Array.from(verifiedSet.keys()));
+        lastBlockedCwd = null; // consume on successful merge (#5607)
+      } else {
+        // #190: zero-merge does NOT consume the block context — a retry
+        // dispatch still needs lastBlockedCwd/lastBlockedFiles.
+        console.error(`[verification-gate] ⚠️ PASS with empty verified_files and no block context — zero-merge, failure streak NOT reset (#132)`);
+      }
+      return undefined;
+    }
+
     const { kept: scopedVerifiedFiles, skipped: scopeSkipped } = scopeFiles(
       result.verified_files.map(vf => vf.path),
       projectRoot,
