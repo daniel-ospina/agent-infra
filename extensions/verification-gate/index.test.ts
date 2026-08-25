@@ -7,10 +7,10 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
-import { mkdtempSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -1182,6 +1182,58 @@ test("missing file throws (consistent with hashFile; callers fail closed)", () =
   try {
     const sha1 = createHash("sha1").update("x").digest("hex");
     throws(() => hashMatchesDisk(root, "missing.ts", sha1));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── hashAndMergeFiles (#336) ─────────────────────────
+
+section("hashAndMergeFiles — hash-less PASS records blocked files (#336)");
+
+test("hashes blocked files into the registry under compound keys", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-ham-"));
+  try {
+    writeFileSync(join(root, "a.ts"), "content-a\n");
+    writeFileSync(join(root, "b.ts"), "content-b\n");
+    const vs = new Map<string, string>();
+    const ba = new Map<string, number>();
+    const merged = hashAndMergeFiles(vs, ba, ["a.ts", "b.ts"], root);
+    equal(merged, 2, "both files must be recorded");
+    const normRoot = realpathSync(root);
+    equal(vs.get(`${normRoot}::a.ts`), createHash("sha256").update("content-a\n").digest("hex"), "a.ts recorded with its current disk hash");
+    equal(vs.get(`${normRoot}::b.ts`), createHash("sha256").update("content-b\n").digest("hex"), "b.ts recorded with its current disk hash");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resets block-attempt counters for recorded files", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-ham2-"));
+  try {
+    writeFileSync(join(root, "a.ts"), "content-a\n");
+    const vs = new Map<string, string>();
+    const normRoot = realpathSync(root);
+    const ba = new Map<string, number>([[`${normRoot}::a.ts`, 2]]);
+    hashAndMergeFiles(vs, ba, ["a.ts"], root);
+    equal(ba.has(`${normRoot}::a.ts`), false, "counter cleared for recorded file");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("post-PASS edit flips the recorded hash (fail-closed re-block)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-ham3-"));
+  try {
+    writeFileSync(join(root, "a.ts"), "v1\n");
+    const vs = new Map<string, string>();
+    const ba = new Map<string, number>();
+    hashAndMergeFiles(vs, ba, ["a.ts"], root);
+    const normRoot = realpathSync(root);
+    const stored = vs.get(`${normRoot}::a.ts`)!;
+    equal(stored, createHash("sha256").update("v1\n").digest("hex"), "hash recorded at PASS time");
+    writeFileSync(join(root, "a.ts"), "v2\n"); // post-PASS edit
+    equal(hashMatchesDisk(root, "a.ts", stored), false, "edited file must no longer match the recorded hash → re-block");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
