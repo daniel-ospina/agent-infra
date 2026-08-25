@@ -245,7 +245,7 @@ echo "$TIER" > /tmp/agent-issue-complexity
 
 ### Micro Tier Auto-Detection & Gate Behavior
 
-When `TIER = Micro` or auto-detected (1 file, <20 added lines, no migrations):
+When `TIER = Micro` or auto-detected (1 file, <20 added lines, no migrations, or docs/CSS/static-only per 02-commit-pr.md Step 1.5):
 
 | Gate | Micro Behavior |
 |------|---------------|

@@ -68,6 +68,7 @@ gh pr diff <PR_NUMBER> | grep -c '^+[^+]' 2>/dev/null || echo 0
 
 Classification rules (first match wins):
 - Any file matching `supabase/migrations/` or `supabase/functions/` → **Complex**
+- All changed files are docs (`*.md`), styles (`*.css`/`*.scss`), or static pages (`*.html` — e.g. `website/*.html`/`docs/**/*.html`, NOT build templates like `public/index.html`) → **Micro** (proportional-gates Low risk: docs/CSS/static → skip the code-review gate; the 1-dispatch review enforcer + pre-commit lint are kept as the safety net)
 - File count = 1 AND added line count < 20 → **Micro**
 - Otherwise → **Standard**
 
