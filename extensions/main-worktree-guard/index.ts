@@ -21,6 +21,16 @@
 //     even under the TTL marker (only AGENT_ALLOW_MAIN_EDITS=1 disables it).
 //     The script backdoor (`bash /tmp/x.sh` with git ops) is closed: a
 //     script's git content is gated by the SAME allowlist.
+//  5. (#347) WORKTREE-TARGET EXEMPTION: M4 resolves each git invocation's
+//     EFFECTIVE target (cd-chains, -C, GIT_DIR/--git-dir, subshell/pipe
+//     scoping, worktree-list membership + cwd containment) and EXEMPTS
+//     invocations whose target is an isolated worktree — a hub-rooted session
+//     that `cd`s into a worktree is no longer frozen by hub disorder. The
+//     write/edit M4 block is target-aware (hub-equality: only hub-targeted
+//     writes block); the script backdoor resolves against the command's
+//     execution cwd. No total-bash-gate bypass: the exemption is
+//     per-invocation and semantic (never path-string-based); hub/foreign/
+//     unresolvable targets keep today's gating.
 //
 // Worktrees are ISOLATED — none of this applies inside a worktree. The only
 // escape hatch is AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) or
@@ -70,6 +80,13 @@ let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) =
 // (the git commands were allow-listed before M4; the guard stays permissive).
 let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean; skipInfra?: boolean; env?: Record<string, string | undefined> }) => { disorder: string | null; branch: string | null } = () => ({ disorder: null, branch: null });
 let evaluateHubGate: (command: string, currentBranch: string | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string } = () => ({ verdict: "non-git" });
+// #347: per-invocation target-aware M4 gate + execution-cwd resolution + write
+// target toplevel. Fail-safe defaults degrade to inactive (gate → non-git /
+// null) so a failed import NEVER false-blocks; on classify-git load failure
+// readHubDisorder also degrades to null → M4 off (existing contract).
+let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string } = () => ({ verdict: "non-git" });
+let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
+let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 let extractScriptPath: (command: string) => string | null = () => null;
 let scriptGitVerdict: (path: string, currentBranch: string | null) => "allow" | "block" = () => "allow";
 let classifierLoaded = false;
@@ -91,7 +108,8 @@ try {
      isAllowMarkerActive, isAllowMarkerPath, isAllowMarkerCommand,
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
      readAllowMarkerState, readHubDisorder, evaluateHubGate,
-     extractScriptPath, scriptGitVerdict } =
+     extractScriptPath, scriptGitVerdict, evaluateHubGateWithTargets,
+     commandExecutionCwd, resolveTargetTopLevel } =
     await import("./classify-git.mjs"));
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
@@ -188,12 +206,16 @@ function _mainTopLevel(): string | null {
 // ── M4: hub-state gate (#1484) ─────────────────────────────────────────────
 // The hub's only legal states are main+clean. When the session cwd IS the hub
 // main checkout (non-infra) and the hub is off-main or dirty, every git op is
-// gated by the recovery allowlist (classify-git evaluateHubGate) and write/edit
-// in the hub is blocked. M4 stays ACTIVE under the TTL marker (D3 — mirrors
-// M1's detect-stays-active contract): a stranded lane can recover with the
-// marker but cannot resume feature work in the hub. Only AGENT_ALLOW_MAIN_EDITS
-// =1 (env, session start) is a full bypass. Worktree sessions and agent-infra
-// are exempt (D5 / #99).
+// gated by the recovery allowlist (classify-git evaluateHubGateWithTargets) and
+// write/edit in the hub is blocked. #347: each git invocation's EFFECTIVE
+// target is resolved — invocations targeting an isolated worktree (worktree-
+// list membership + cwd containment) are exempt from hub disorder; the
+// write/edit M4 block gates only HUB-targeted writes (hub-equality); the script
+// backdoor resolves against the command's execution cwd. M4 stays ACTIVE under
+// the TTL marker (D3 — mirrors M1's detect-stays-active contract): a stranded
+// lane can recover with the marker but cannot resume feature work in the hub.
+// Only AGENT_ALLOW_MAIN_EDITS=1 (env, session start) is a full bypass. Worktree
+// sessions and agent-infra are exempt (D5 / #99).
 function _hubState(): { disorder: string | null; branch: string | null } {
   try {
     return readHubDisorder(resolve(process.cwd()));
@@ -207,16 +229,20 @@ function _hubState(): { disorder: string | null; branch: string | null } {
 // content with the SAME recovery allowlist — a script that performs a
 // non-sanctioned git mutation is blocked. Recovery scripts (hub-worktree.sh:
 // fetch + worktree add) keep working. Returns a block reason or null.
-function _backdoorBlock(command: string): string | null {
+function _backdoorBlock(command: string, execCwd?: string): string | null {
   try {
-    if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktrees are isolated
+    if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktree sessions are isolated
     if (isAgentInfraRepo()) return null; // #99 carve-out
     const scriptPath = extractScriptPath(command);
     if (!scriptPath) return null;
-    const resolved = resolve(process.cwd(), scriptPath);
+    // #347: resolve the script path + content gating against the command's
+    // EXECUTION cwd (cd-resolved), not the session cwd — a hub session running
+    // `cd <wt> && bash x.sh` resolves x.sh inside the worktree.
+    const base = execCwd ? resolve(execCwd) : resolve(process.cwd());
+    const resolved = resolve(base, scriptPath);
     if (!existsSync(resolved) || !statSync(resolved).isFile()) return null;
     const branch = getMainCheckoutBranch();
-    if (scriptGitVerdict(resolved, branch) === "block") {
+    if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd())) === "block") {
       return [
         `⛔ Script execution blocked — git-bearing script in the shared main checkout (#1484).`,
         `   The script backdoor (write /tmp/x.sh + bash /tmp/x.sh) is closed:`,
@@ -413,34 +439,48 @@ export default function (pi: ExtensionAPI) {
     if (!_isAllowMainEdits()) {
       if (isBash) {
         const command = (event.input as { command?: string }).command ?? "";
-        const backdoor = _backdoorBlock(command);
+        // #347: execution-cwd-aware backdoor (script path + content gating
+        // resolve against the command's cd-target, not the session cwd).
+        const execCwd = commandExecutionCwd(command, process.cwd()) ?? undefined;
+        const backdoor = _backdoorBlock(command, execCwd);
         if (backdoor) return { block: true, reason: backdoor };
         const st = _hubState();
         if (st.disorder) {
-          const gate = evaluateHubGate(command, st.branch);
+          // #347: per-invocation target resolution — git ops whose effective
+          // target is an isolated worktree are exempt from hub disorder; every
+          // other invocation (hub, foreign, unresolvable) keeps today's block.
+          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()));
           if (gate.verdict === "block") {
             return { block: true, reason: gate.reason ?? "" };
           }
           if (gate.verdict === "recovery" || gate.verdict === "allowed") {
-            return undefined; // sanctioned recovery / read-only — done
+            return undefined; // sanctioned recovery / read-only / worktree-isolated — done
           }
         }
       } else if (isWrite || isEdit) {
-        // Non-recovery edits in a disordered hub are blocked EVEN under the
-        // marker (D3); a clean hub keeps today's marker semantics (deliberate
-        // solo sessions) and the write/edit block below.
+        // #347: the M4 disorder block is TARGET-AWARE (hub-equality) — only
+        // HUB-targeted writes are blocked while the hub is disordered;
+        // worktree/foreign//tmp targets are isolated (writes never mutate git
+        // refs) and fall through to the marker bypass + downstream gate. D3
+        // preserved: this block still runs BEFORE the marker bypass, so an
+        // active TTL marker cannot write into the hub.
+        const targetPath = (event.input as { path?: string }).path ?? "";
         const st = _hubState();
         if (st.disorder) {
-          return {
-            block: true,
-            reason: [
-              `⛔ File edits blocked — the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
-              `   The hub's only legal states are main+clean. Non-recovery edits are`,
-              `   blocked even under the TTL marker (D3).`,
-              `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
-              `   → Do feature work in a worktree: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
-            ].join("\n"),
-          };
+          const targetTop = resolveTargetTopLevel(targetPath);
+          const mainTop = _mainTopLevel();
+          if (targetTop && targetTop === mainTop) {
+            return {
+              block: true,
+              reason: [
+                `⛔ File edits blocked — the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+                `   The hub's only legal states are main+clean. Non-recovery edits are`,
+                `   blocked even under the TTL marker (D3).`,
+                `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
+                `   → Do feature work in a worktree: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+              ].join("\n"),
+            };
+          }
         }
       }
     }

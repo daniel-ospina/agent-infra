@@ -4,8 +4,8 @@
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
-import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync } from "node:fs";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict } from "./classify-git.mjs";
+import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync } from "node:fs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -164,7 +164,7 @@ try {
   expectBool("plain git repo, no env", isAgentInfraRepo(tmpRepo, noEnv), false);
   expectBool("plain git repo, env points at infra", isAgentInfraRepo(tmpRepo, envPathMatch), false);
 } catch (e) {
-  console.log(`⏭️  non-infra repo case skipped (could not provision: ${String(e.message).slice(0, 60)})`);
+  console.error(`❌ non-infra repo case FAILED to provision: ${String(e.message).slice(0, 120)}`); fail++;
 } finally {
   if (tmpRepo) {
     try { execSync(`rm -rf "${tmpRepo}"`, { stdio: "ignore" }); } catch {}
@@ -326,7 +326,7 @@ try {
   symlinkSync(targetPath, `${baseDir}/symlinked-marker`);
   expectBool("symlinked marker → inactive (realpath inequality)", readAllowMarkerState(`${baseDir}/symlinked-marker`, "sess-1"), false);
 } catch (e) {
-  console.log(`⏭️  marker fs cases failed to provision: ${String(e.message).slice(0, 120)}`);
+  console.error(`❌ marker fs cases FAILED to provision: ${String(e.message).slice(0, 120)}`); fail++;
 } finally {
   if (markerTmp) {
     try { execSync(`rm -rf "${markerTmp}"`, { stdio: "ignore" }); } catch {}
@@ -576,7 +576,7 @@ try {
   execSync("git checkout -q -b master", { cwd: r, stdio: "ignore" });
   expectBool("disorder: master+clean → null", readHubDisorder(r).disorder === null, true);
 } catch (e) {
-  console.log(`⏭️  readHubDisorder fs cases failed to provision: ${String(e.message).slice(0, 120)}`);
+  console.error(`❌ readHubDisorder fs cases FAILED to provision: ${String(e.message).slice(0, 120)}`); fail++;
 } finally {
   if (hubTmp) {
     try { execSync(`rm -rf "${hubTmp}"`, { stdio: "ignore" }); } catch {}
@@ -617,31 +617,200 @@ try {
     writeFileSync(p, content);
     return p;
   };
+  // #347: existing script-verdict call sites pass MAIN explicitly as the
+  // executionCwd — the suite supports running from a linked worktree
+  // (RUN_IS_MAIN branching), where process.cwd() = the worktree would flip
+  // these assertions (plan-verify P1).
   const blockCommit = mk("commit.sh", `#!/bin/bash\ngit add .\ngit commit -m 'x'\n`);
-  expectBool("script: git commit → block", scriptGitVerdict(blockCommit, "pr1467") === "block", true);
+  expectBool("script: git commit → block", scriptGitVerdict(blockCommit, "pr1467", MAIN) === "block", true);
   const blockCheckoutB = mk("checkout-b.sh", `#!/bin/bash\ngit checkout -b feat/x\n`);
-  expectBool("script: checkout -b → block", scriptGitVerdict(blockCheckoutB, "pr1467") === "block", true);
+  expectBool("script: checkout -b → block", scriptGitVerdict(blockCheckoutB, "pr1467", MAIN) === "block", true);
   const blockForeignPush = mk("foreign-push.sh", `#!/bin/bash\ngit push origin main\n`);
-  expectBool("script: foreign push → block", scriptGitVerdict(blockForeignPush, "pr1467") === "block", true);
+  expectBool("script: foreign push → block", scriptGitVerdict(blockForeignPush, "pr1467", MAIN) === "block", true);
   const rec = mk("recovery.sh", `#!/bin/bash\ngit checkout main && git pull --ff-only\n`);
-  expectBool("script: sanctioned recovery → allow", scriptGitVerdict(rec, "pr1467") === "allow", true);
+  expectBool("script: sanctioned recovery → allow", scriptGitVerdict(rec, "pr1467", MAIN) === "allow", true);
   const wtHelper = mk("hub-worktree.sh", `#!/bin/bash\ngit fetch origin main\ngit worktree add ../.worktrees/x -b feat/x origin/main\nln -s ../.env .env\n`);
-  expectBool("script: hub-worktree.sh pattern → allow", scriptGitVerdict(wtHelper, "pr1467") === "allow", true);
+  expectBool("script: hub-worktree.sh pattern → allow", scriptGitVerdict(wtHelper, "pr1467", MAIN) === "allow", true);
   const ownPush = mk("own-push.sh", `#!/bin/bash\ngit push origin pr1467\n`);
-  expectBool("script: WIP push of own branch → allow", scriptGitVerdict(ownPush, "pr1467") === "allow", true);
+  expectBool("script: WIP push of own branch → allow", scriptGitVerdict(ownPush, "pr1467", MAIN) === "allow", true);
   const readOnly = mk("readonly.sh", `#!/bin/bash\ngit status\ngit log --oneline -3\n`);
-  expectBool("script: read-only git → allow", scriptGitVerdict(readOnly, "pr1467") === "allow", true);
+  expectBool("script: read-only git → allow", scriptGitVerdict(readOnly, "pr1467", MAIN) === "allow", true);
   const noGit = mk("nogit.sh", `#!/bin/bash\necho hello\n`);
-  expectBool("script: no git → allow", scriptGitVerdict(noGit, "pr1467") === "allow", true);
-  expectBool("script: missing file → allow (nothing to execute)", scriptGitVerdict(`${scriptTmp}/nope.sh`, "pr1467") === "allow", true);
+  expectBool("script: no git → allow", scriptGitVerdict(noGit, "pr1467", MAIN) === "allow", true);
+  expectBool("script: missing file → allow (nothing to execute)", scriptGitVerdict(`${scriptTmp}/nope.sh`, "pr1467", MAIN) === "allow", true);
   const comment = mk("comment.sh", `# this script talks about git for fun\necho done\n`);
-  expectBool("script: git only in comment prose → allow", scriptGitVerdict(comment, "pr1467") === "allow", true);
+  expectBool("script: git only in comment prose → allow", scriptGitVerdict(comment, "pr1467", MAIN) === "allow", true);
 } catch (e) {
-  console.log(`⏭️  script-verdict fs cases failed to provision: ${String(e.message).slice(0, 120)}`);
+  console.error(`❌ script-verdict fs cases FAILED to provision: ${String(e.message).slice(0, 120)}`); fail++;
 } finally {
   if (scriptTmp) {
     try { execSync(`rm -rf "${scriptTmp}"`, { stdio: "ignore" }); } catch {}
   }
+}
+
+// ── #347: M4 worktree-target exemption ──────────────────────────────────────
+// Regression tests: a hub-rooted session's git ops whose EFFECTIVE target is an
+// isolated worktree must NOT be frozen by hub disorder; hub/foreign/unresolvable
+// targets keep today's blocks. No total-bash-gate bypass: per-invocation
+// resolution (C1), semantic worktree predicate (worktree-list membership + cwd
+// containment), realpath normalization both sides (macOS /tmp → /private/tmp).
+// Provisioned on a realpath-stable tmp dir (mirrors the marker test's baseDir
+// pattern). T30/T31 (clean-hub no-op / worktree-session no-op) are index-level
+// gates (st.disorder null → gate not consulted) — covered by the live e2e.
+let m4Tmp = null;
+let m4Provisioned = false;
+try {
+  m4Tmp = realpathSync(execSync("mktemp -d", { encoding: "utf-8" }).trim());
+  const hubR = `${m4Tmp}/hub`;
+  const wtR = `${m4Tmp}/wt`;
+  execSync(`git init -q -b main "${hubR}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: hubR, stdio: "ignore" });
+  execSync("touch a.txt && git add . && git commit -qm init", { cwd: hubR, stdio: "ignore" });
+  execSync(`git worktree add -q "${wtR}" -b wt/feat HEAD`, { cwd: hubR, stdio: "ignore" });
+  execSync(`mkdir -p "${wtR}/subdir"`, { stdio: "ignore" });
+  execSync(`ln -s "${wtR}" "${m4Tmp}/link"`, { stdio: "ignore" }); // for T28 (realpath spelling)
+  // Foreign repo + worktree (C5: not in the hub's worktree map → must block).
+  const foreignR = `${m4Tmp}/foreign`;
+  const foreignWt = `${m4Tmp}/foreign-wt`;
+  execSync(`git init -q -b main "${foreignR}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: foreignR, stdio: "ignore" });
+  execSync("touch f.txt && git add . && git commit -qm init", { cwd: foreignR, stdio: "ignore" });
+  execSync(`git worktree add -q "${foreignWt}" -b f/wt HEAD`, { cwd: foreignR, stdio: "ignore" });
+  // Second worktree of the hub — REMOVED without prune for T34 (stale admin dir).
+  const wt2R = `${m4Tmp}/wt2`;
+  execSync(`git worktree add -q "${wt2R}" -b wt/feat2 HEAD`, { cwd: hubR, stdio: "ignore" });
+  execSync(`rm -rf "${wt2R}"`, { stdio: "ignore" }); // no prune — leaves a stale reverse-pointer admin dir
+  execSync("touch dirty.txt", { cwd: hubR, stdio: "ignore" }); // dirty hub
+  m4Provisioned = true;
+
+  function m4t(name, command, expectedVerdict) {
+    const got = evaluateHubGateWithTargets(command, "main", hubR).verdict;
+    const ok = got === expectedVerdict;
+    console.log(`${ok ? "✅" : "❌"} M4T ${name}: ${got}${ok ? "" : ` (expected ${expectedVerdict})`}`);
+    ok ? pass++ : fail++;
+  }
+
+  m4t("T1: cd wt commit — THE FIX", `cd "${wtR}" && git commit -m x`, "allowed");
+  m4t("T2: -C wt commit", `git -C "${wtR}" commit -m x`, "allowed");
+  m4t("T3: same-segment $VAR cd", `WT="${wtR}" cd "$WT" && git commit -m x`, "allowed");
+  m4t("T4: unresolvable $VAR", `cd $UNRESOLVED_WT && git commit -m x`, "block");
+  m4t("T5: hub commit (main never in map)", `git commit -m x`, "block");
+  m4t("T6: hub reset", `git -C "${hubR}" reset --hard`, "block");
+  m4t("T7: P1 mixed compound", `cd "${wtR}" && git commit && git -C "${hubR}" reset --hard`, "block");
+  m4t("T8: same-verb compound", `git -C "${wtR}" commit -m a && git -C "${hubR}" commit -m b`, "block");
+  m4t("T9: cycle-4 trap (block verb)", `git -C "${wtR}" --git-dir="${hubR}/.git" reset --hard`, "block");
+  m4t("T10: env git-dir trap", `GIT_DIR="${hubR}/.git" git -C "${wtR}" commit`, "block");
+  m4t("T11: admin-dir from hub cwd", `git --git-dir="${hubR}/.git/worktrees/wt" reset --hard`, "block");
+  m4t("T12: subshell cd does not leak", `(cd "${wtR}") && git reset --hard`, "block");
+  m4t("T13: subshell inherits cd", `cd "${wtR}" && (git reset --hard)`, "allowed");
+  m4t("T14: subshell + outer hub reset", `(cd "${wtR}" && git commit) && git reset --hard`, "block");
+  m4t("T15: cd outside + -C inside parens", `cd "${wtR}" && (git -C "${hubR}" reset --hard)`, "block");
+  m4t("T16: cd + -C inside subshell", `(cd "${wtR}" && git -C "${hubR}" reset --hard)`, "block");
+  m4t("T17: cd + -C override → hub", `cd "${wtR}" && git -C "${hubR}" reset --hard`, "block");
+  m4t("T18: workTree mismatch (flag)", `cd "${wtR}" && git -C "${wtR}" --work-tree="${hubR}" reset --hard`, "block");
+  m4t("T18a: workTree mismatch (env)", `GIT_WORK_TREE="${hubR}" git -C "${wtR}" commit`, "block");
+  m4t("T18b: admin-dir + cwd inside = the wt", `git -C "${wtR}" --git-dir="${hubR}/.git/worktrees/wt" reset --hard`, "allowed");
+  m4t("T19: GIT_DIR next-command scoping", `GIT_DIR="${hubR}/.git" git status && git -C "${wtR}" commit -m x`, "recovery");
+  m4t("T20: gitfile from hub cwd → block (containment)", `GIT_DIR="${wtR}/.git" git commit -m x`, "block");
+  m4t("T20a: gitfile from inside the wt", `cd "${wtR}" && GIT_DIR="${wtR}/.git" git commit -m x`, "allowed");
+  m4t("T21: foreign non-worktree repo → block (C5)", `git -C "${foreignR}" reset --hard`, "block");
+  m4t("T22: foreign worktree → block (not in hub map, C5)", `git -C "${foreignWt}" commit -m x`, "block");
+  m4t("T23: read-only in wt", `cd "${wtR}" && git status`, "recovery");
+  m4t("T23b: read-only log in wt", `cd "${wtR}" && git log --oneline -3`, "recovery");
+  m4t("T24: checkout main in wt → recovery (never resolved)", `cd "${wtR}" && git checkout main`, "recovery");
+  m4t("T25: exempt mutation + hub recovery mix", `cd "${wtR}" && git commit && git fetch`, "recovery");
+  m4t("T26: failed cd → hub cwd → gate", `cd /nonexistent && git commit -m x`, "block");
+  m4t("T26b: successful cd to non-git dir → conservative block", `cd /tmp && git commit -m x`, "block");
+  m4t("T26c: tilde cd → conservative block", `cd ~/x && git commit -m x`, "block");
+  m4t("T27: subdir containment", `cd "${wtR}/subdir" && git commit -m x`, "allowed");
+  m4t("T28: symlink spelling (realpath both sides)", `cd "${m4Tmp}/link/subdir" && git commit -m x`, "allowed");
+  m4t("T29: traversal out of the wt", `cd "${wtR}/../hub" && git commit -m x`, "block");
+  m4t("T32: pipe-cd false exemption", `cd /tmp | cd "${wtR}" && git commit -m x`, "block");
+  m4t("T33: pipe-cd mirror (C0 at pipeline start)", `cd "${wtR}" | cd /tmp && git commit -m x`, "block");
+  m4t("T34: stale admin dir skipped (wt2 rm -rf, no prune)", `cd "${wtR}" && git commit -m x`, "allowed");
+  m4t("T35: failed-cd prefix stands", `cd "${wtR}" && cd /nonexistent && git commit -m x`, "allowed");
+
+  // ── Shape regression (allGitInvocations extended shape) — content-pinned ──
+  const shapeInv = allGitInvocations(`cd "${wtR}" && git -C "${hubR}" reset --hard`);
+  expectBool("shape: cdChain content pinned", Array.isArray(shapeInv[0].cdChain) && shapeInv[0].cdChain[0] === wtR, true);
+  expectBool("shape: cHints content pinned", Array.isArray(shapeInv[0].cHints) && shapeInv[0].cHints[0] === hubR, true);
+  expectBool("shape: args exact", JSON.stringify(shapeInv[0].args) === JSON.stringify(["--hard"]), true);
+  const popInv = allGitInvocations(`cd /x && (cd /y) && git commit -m x`);
+  expectBool("shape: subshell cd does not leak into the outer chain", popInv[0].cdChain.length === 1 && popInv[0].cdChain[0] === "/x", true);
+  // Observable resolution (test-review: assert the exported consumer, not just the parse shape).
+  const obsTgt = resolveInvocationTarget(shapeInv[0], hubR, hubR);
+  expectBool("observable: resolveInvocationTarget → hub, not worktree", obsTgt !== null && obsTgt.isWorktree === false && obsTgt.effectiveCwd === hubR, true);
+  const obsTgt2 = resolveInvocationTarget(allGitInvocations(`cd "${wtR}" && git commit -m x`)[0], hubR, hubR);
+  expectBool("observable: resolveInvocationTarget → worktree", obsTgt2 !== null && obsTgt2.isWorktree === true, true);
+
+  // ── Backdoor (B) — commandExecutionCwd + scriptGitVerdict ──
+  const cec = (cmd) => commandExecutionCwd(cmd, hubR);
+  expectBool("B1: sequential cd chain", cec(`cd /tmp && cd "${wtR}" && bash ./s.sh`) === wtR, true);
+  expectBool("B2: same-segment $VAR cd", cec(`V="${wtR}" cd "$V" && bash ./s.sh`) === wtR, true);
+  expectBool("B3: no cd → session cwd", cec(`bash /abs/s.sh`) === hubR, true);
+  expectBool("B4: subshell wrapper", cec(`(cd "${wtR}" && bash ./s.sh)`) === wtR, true);
+  expectBool("B5: failed cd → session cwd", cec(`cd /nonexistent && bash x.sh`) === hubR, true);
+  expectBool("B6: inner cd does not leak", cec(`cd "${wtR}" && (cd /tmp) && bash s.sh`) === wtR, true);
+  expectBool("B13: cd hub + (cd wt) → hub (no leak)", cec(`cd "${hubR}" && (cd "${wtR}") && bash x.sh`) === hubR, true);
+  expectBool("B17: pipe → session cwd (subshell segments)", cec(`cd /tmp | cd "${wtR}" && bash x.sh`) === hubR, true);
+
+  const mkS = (name, content) => { const p = `${m4Tmp}/${name}`; writeFileSync(p, content); return p; };
+  const sMutHub = mkS("mut-hub.sh", `git -C "${hubR}" reset --hard\n`);
+  const sTgtWt = mkS("tgt-wt.sh", `git -C "${wtR}" commit -m x\n`);
+  const sPlain = mkS("plain.sh", `git reset --hard\n`);
+  const sSubshell = mkS("subshell.sh", `(cd "${wtR}" && git commit)\n`);
+  const sCdWt = mkS("cd-wt.sh", `cd "${wtR}" && git commit -m x\n`);
+  const sCdWtMulti = mkS("cd-wt-multi.sh", `cd "${wtR}"\ngit commit -m x\n`);
+  const sMixedWtFirst = mkS("mixed-wt-first.sh", `git -C "${wtR}" commit -m x\ngit -C "${hubR}" reset --hard\n`);
+  const sMixedHubFirst = mkS("mixed-hub-first.sh", `git -C "${hubR}" reset --hard\ngit -C "${wtR}" commit -m x\n`);
+  expectBool("B7: script -C hub from wt cwd → block", scriptGitVerdict(sMutHub, "main", wtR, hubR) === "block", true);
+  expectBool("B8: script wt-targeted content → allow", scriptGitVerdict(sTgtWt, "main", wtR, hubR) === "allow", true);
+  expectBool("B9: script plain reset at wt cwd → allow (isolated)", scriptGitVerdict(sPlain, "main", wtR, hubR) === "allow", true);
+  expectBool("B4old: script plain reset at hub cwd → block", scriptGitVerdict(sPlain, "main", hubR, hubR) === "block", true);
+  expectBool("B10: script subshell wt content → allow", scriptGitVerdict(sSubshell, "main", hubR, hubR) === "allow", true);
+  expectBool("B10b: script plain cd-chain content → allow (incident shape)", scriptGitVerdict(sCdWt, "main", hubR, hubR) === "allow", true);
+  expectBool("B10c: script multi-line cd-chain content → allow", scriptGitVerdict(sCdWtMulti, "main", hubR, hubR) === "allow", true);
+  expectBool("B16: script -C wt executed at /tmp → allow (session map)", scriptGitVerdict(sTgtWt, "main", "/tmp", hubR) === "allow", true);
+  expectBool("B11: end-to-end closure — /tmp script with hub-mutating content → block", (() => { const p = mkS("closure.sh", `git reset --hard\n`); return scriptGitVerdict(p, "main", "/tmp", hubR) === "block"; })(), true);
+  expectBool("B11b: MIXED content wt-first → block (loop-continues-on-exemption)", scriptGitVerdict(sMixedWtFirst, "main", hubR, hubR) === "block", true);
+  expectBool("B11c: MIXED content hub-first → block", scriptGitVerdict(sMixedHubFirst, "main", hubR, hubR) === "block", true);
+  expectBool("B12: extractScriptPath handles subshell wrappers", extractScriptPath(`(cd /tmp && bash x.sh)`) === "x.sh", true);
+  expectBool("B12b: end-to-end subshell script at wt cwd → allow", (() => {
+    const p = mkS("mutation.sh", `git reset --hard\n`);
+    const execCwd = commandExecutionCwd(`(cd "${wtR}" && bash ./mutation.sh)`, hubR);
+    return execCwd === wtR && scriptGitVerdict(p, "main", execCwd, hubR) === "allow";
+  })(), true);
+
+  // ── Write gate (W) — resolveTargetTopLevel predicate ──
+  const hubTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: hubR, encoding: "utf-8" }).trim());
+  const wtTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: wtR, encoding: "utf-8" }).trim());
+  const rttl = (target, cwd) => resolveTargetTopLevel(target, cwd ?? hubR);
+  expectBool("W1: hub file → hub toplevel (M4 block condition)", rttl("dirty.txt") === hubTop, true);
+  expectBool("W2: wt file → wt toplevel (≠ hub → no M4 block)", rttl("x.txt", wtR) === wtTop && wtTop !== hubTop, true);
+  expectBool("W2b: PRODUCTION frame — absolute wt path from hub cwd", rttl(`${wtR}/x.txt`) === wtTop, true);
+  expectBool("W3: wt deep path → wt toplevel", rttl("deep/x.txt", wtR) === wtTop, true);
+  expectBool("W5: missing dir under hub → walk-up → hub toplevel", rttl("newdir/x.txt") === hubTop, true);
+  expectBool("W4: /tmp target → null (outside any repo)", rttl("/tmp/foo.md") === null, true);
+
+  // ── Degradation (D) ──
+  const classifySrc = readFileSync(new URL("./classify-git.mjs", import.meta.url), "utf-8");
+  // C2 static assert: no IMPORT of branch-ownership (comments may reference the
+  // name — the two-tokenizers precedent; the module must stay dependency-free
+  // for jiti loading). Catches static, dynamic (import()), and require() forms.
+  const branchImports = classifySrc.split("\n").filter((l) => l.includes("branch-ownership") && /(^\s*import\b|import\s*\(|require\s*\()/.test(l));
+  expectBool("D2: classify-git.mjs imports no branch-ownership (C2)", branchImports.length === 0, true);
+} catch (e) {
+  // A security-gate regression suite must FAIL, not silently skip, when its
+  // fixtures can't be provisioned (test-review P1).
+  console.error(`❌ #347 m4t cases FAILED to provision: ${String(e.message).slice(0, 160)}`);
+  fail++;
+  if (!m4Provisioned) console.error("   → the worktree-target exemption (T/B/W/D) assertions were NOT run — suite must fail.");
+} finally {
+  if (m4Tmp) {
+    try { execSync(`git worktree remove --force "${m4Tmp}/wt"`, { stdio: "ignore" }); } catch {}
+    try { execSync(`rm -rf "${m4Tmp}"`, { stdio: "ignore" }); } catch {}
+  }
+  try { execSync("git worktree prune", { stdio: "ignore" }); } catch {}
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

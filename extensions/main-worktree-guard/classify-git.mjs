@@ -7,9 +7,9 @@
 // exercises the SAME marker logic index.ts uses (dependency-injected, fail-safe
 // default = inactive → block).
 
-import { execSync } from "node:child_process";
-import { resolve, join } from "node:path";
-import { existsSync, statSync, readFileSync, realpathSync } from "node:fs";
+import { execSync, execFileSync } from "node:child_process";
+import { resolve, join, dirname } from "node:path";
+import { existsSync, statSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 
 //
 // Purpose: in the SHARED main checkout, branch-state-changing git operations
@@ -210,30 +210,241 @@ function _refspecDst(refspec) {
   return dst.replace(/^refs\/heads\//, "");
 }
 
+/** Expand `$VAR` / `${VAR}` in a cd target against same-segment assignments
+ * (mirrors branch-ownership's _expandCdVars — #337). Returns the expanded
+ * target, or null when any `$VAR` is unresolvable (caller treats as
+ * conservative → no exemption). Tokens from _tokenize are already quote-
+ * stripped; the strip here is a safety net for direct callers. */
+function _expandCdVars(token, vars) {
+  let t = String(token ?? "").replace(/^["']|["']$/g, "");
+  if (!t.includes("$")) return t;
+  const map = vars || {};
+  let ok = true;
+  t = t.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, braced, plain) => {
+    const name = braced ?? plain;
+    if (Object.prototype.hasOwnProperty.call(map, name)) return map[name];
+    ok = false;
+    return m;
+  });
+  return ok ? t : null;
+}
+
+/** realpath a path; null on failure (nonexistent / ENOENT → conservative). */
+function _realpathSafe(p) {
+  try {
+    return realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve a cd-chain (already var-expanded at walk time) against a base cwd.
+ * Failed-cd semantics (cycle-4 P3, state (a)): a target that does not resolve
+ * to an existing directory discards the failed target AND everything after it;
+ * the resolved prefix stands (bash keeps the cwd before the failed cd). A null
+ * entry (unresolvable $VAR / tilde / cd-) → whole chain null → conservative
+ * (no exemption). */
+function _resolveCdChain(cdChain, sessionCwd) {
+  let cwd = sessionCwd ? resolve(sessionCwd) : process.cwd();
+  for (const target of cdChain || []) {
+    if (target === null || target === "~" || target.startsWith("~/") || target === "-") {
+      return null;
+    }
+    const next = resolve(cwd, target);
+    if (!existsSync(next)) break; // failed cd — keep the resolved prefix
+    cwd = next;
+  }
+  return cwd;
+}
+
+/** Worktree map: canonical gitDir → worktree path, derived from the
+ * `<common>/worktrees/<name>/gitdir` reverse-pointer files (git worktree list
+ * --porcelain has NO gitdir column — empirically verified) + the filesystem
+ * layout. Main checkout excluded by construction (its common dir is `common`
+ * itself, never under `common/worktrees/`). Per-entry try/catch: stale admin
+ * dirs (rm -rf <wt> without prune → ENOENT) are skipped, other worktrees stay
+ * exempt (T34). Map key = realpath of the admin dir (which `git rev-parse
+ * --git-dir` returns for a worktree cwd — probe-verified), NOT the reverse-
+ * pointer content (which is the gitfile path <wt>/.git and differs).
+ * @param {string} sessionCwd — the guard's session root (the hub).
+ * @returns {Map<string,string>}
+ */
+function _worktreeGitdirMap(sessionCwd) {
+  const map = new Map();
+  try {
+    const commonRaw = execSync("git rev-parse --git-common-dir", {
+      encoding: "utf-8", cwd: resolve(sessionCwd), timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const common = _realpathSafe(resolve(sessionCwd, commonRaw));
+    if (common === null) return map;
+    const adminRoot = join(common, "worktrees");
+    if (!existsSync(adminRoot)) return map;
+    for (const name of readdirSync(adminRoot)) {
+      try {
+        const gitfile = readFileSync(join(adminRoot, name, "gitdir"), "utf-8").trim();
+        const wtPath = _realpathSafe(dirname(gitfile));
+        const adminKey = _realpathSafe(join(adminRoot, name));
+        if (wtPath === null || adminKey === null) continue; // stale entry — skip
+        map.set(adminKey, wtPath);
+      } catch {
+        // per-entry skip — never abort the whole map for one stale dir
+      }
+    }
+  } catch {
+    // whole-map conservative fallback (empty map → no exemptions)
+  }
+  return map;
+}
+
+/** Resolve a git invocation's effective target. Returns
+ * { effectiveCwd, gitDir, worktreePath, isWorktree } or null (unresolvable /
+ * git/fs failure → conservative, no exemption).
+ * @param {{cdChain?: Array<string|null>, cHints?: string[], gitDirHint?: string|null, workTreeHint?: string|null}} inv
+ * @param {string} sessionCwd — cwd frame for the worktree MAP (the hub).
+ * @param {string} [baseCwd] — cd-chain/cHints resolution base (scriptGitVerdict
+ *   passes executionCwd; the bash gate passes sessionCwd).
+ */
+export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd = sessionCwd) {
+  try {
+    const chainCwd = _resolveCdChain(inv.cdChain || [], baseCwd);
+    if (chainCwd === null) return null; // unresolvable cd → conservative
+    let cwd = chainCwd;
+    for (const c of inv.cHints || []) cwd = resolve(cwd, c);
+    cwd = _realpathSafe(cwd);
+    if (cwd === null) return null;
+    let raw;
+    if (inv.gitDirHint) {
+      // args-array form (execFileSync — execSync has NO array overload, cycle-4
+      // P1): no shell interpolation; git resolves gitfiles to the canonical
+      // git-dir.
+      raw = execFileSync("git", ["--git-dir=" + resolve(cwd, inv.gitDirHint), "rev-parse", "--git-dir"], {
+        encoding: "utf-8", cwd, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } else {
+      raw = execSync("git rev-parse --git-dir", { encoding: "utf-8", cwd, timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    }
+    const gitDir = _realpathSafe(resolve(cwd, raw));
+    if (gitDir === null) return null;
+    const worktreePath = _worktreeGitdirMap(sessionCwd).get(gitDir) ?? null;
+    if (worktreePath === null) {
+      return { effectiveCwd: cwd, gitDir, worktreePath: null, isWorktree: false };
+    }
+    const cwdReal = _realpathSafe(cwd);
+    if (cwdReal === null) return null;
+    const inside = cwdReal === worktreePath || cwdReal.startsWith(worktreePath + "/");
+    // workTree mismatch guard: a work-tree hint pointing OUTSIDE the worktree
+    // means the invocation operates on a foreign working tree → not isolated.
+    if (inv.workTreeHint) {
+      const wt = _realpathSafe(resolve(cwd, inv.workTreeHint));
+      if (wt !== null && !(wt === worktreePath || wt.startsWith(worktreePath + "/"))) {
+        return { effectiveCwd: cwd, gitDir, worktreePath, isWorktree: false };
+      }
+    }
+    return { effectiveCwd: cwd, gitDir, worktreePath, isWorktree: inside };
+  } catch {
+    return null; // conservative — never false-exempt
+  }
+}
+
 /** Extract EVERY git invocation in a compound command (handles
  * `git add . && git commit -m x` — the commit is what decideM2 must gate).
- * @returns {Array<{verb: string|null, args: string[]}>}
+ * Extended shape (#347): per-invocation { verb, args, cdChain, cHints,
+ * gitDirHint, workTreeHint, vars } — cdChain is subshell- AND pipe-scoped
+ * (bash semantics, probe-verified): `(` pushes a chain copy / `)` pops (cds
+ * inside parens never leak); every `|` pipeline segment runs in a subshell
+ * seeded from C0 = the chain at the last command boundary BEFORE the first
+ * pipe segment, and segment cds are discarded at the pipeline end.
+ * cd targets are var-expanded AT WALK TIME against segment-local vars; an
+ * unresolvable `$VAR` pushes a null marker (conservative → no exemption).
+ * {verb, args} are unchanged for existing consumers.
+ * @returns {Array<{verb: string|null, args: string[], cdChain: Array<string|null>, cHints: string[], gitDirHint: string|null, workTreeHint: string|null, vars: object}>}
  */
-function _allGitInvocations(command) {
+export function allGitInvocations(command) {
   const tokens = _tokenize(command);
   const invocations = [];
+  // Per-paren-depth frame: chain, vars, baseLen (chain length at last
+  // boundary), pipeC0 (chain before the first pipe segment), pipeActive.
+  const stack = [{ chain: [], vars: {}, baseLen: 0, pipeC0: null, pipeActive: false }];
+  const frame = () => stack[stack.length - 1];
+  const boundary = () => {
+    const f = frame();
+    if (f.pipeActive && f.pipeC0) f.chain.splice(0, f.chain.length, ...f.pipeC0); // pipeline ended — restore C0
+    f.pipeActive = false;
+    f.pipeC0 = null;
+    f.vars = {};
+    f.baseLen = f.chain.length;
+  };
+  let pendingHints = {}; // GIT_DIR= / GIT_WORK_TREE= env prefixes — next command only
   let i = 0;
   while (i < tokens.length) {
-    if (tokens[i] !== "git") { i++; continue; }
+    const t = tokens[i];
+    if (t === "cd") {
+      const target = tokens[i + 1] ?? null;
+      i += 2;
+      const f = frame();
+      const expanded = target === null ? null : _expandCdVars(target, f.vars);
+      f.chain.push(expanded);
+      continue;
+    }
+    if (t === "(") {
+      const f = frame();
+      if (f.pipeActive && f.pipeC0) f.chain.splice(0, f.chain.length, ...f.pipeC0);
+      stack.push({ chain: [...f.chain], vars: {}, baseLen: f.chain.length, pipeC0: null, pipeActive: false });
+      pendingHints = {};
+      i++;
+      continue;
+    }
+    if (t === ")") {
+      if (stack.length > 1) stack.pop();
+      pendingHints = {};
+      i++;
+      continue;
+    }
+    if (t === "|") {
+      const f = frame();
+      if (!f.pipeActive) {
+        f.pipeC0 = f.chain.slice(0, f.baseLen); // C0 = chain at the last boundary BEFORE the first pipe segment
+        f.pipeActive = true;
+      }
+      f.chain.splice(0, f.chain.length, ...(f.pipeC0 || [])); // discard segment cds, reseed from C0
+      f.vars = {};
+      f.baseLen = f.chain.length;
+      pendingHints = {};
+      i++;
+      continue;
+    }
+    if (t === "&&" || t === "||" || t === ";") { boundary(); pendingHints = {}; i++; continue; }
+    if (/^GIT_DIR=/.test(t)) { pendingHints.gitDirHint = t.slice("GIT_DIR=".length); i++; continue; }
+    if (/^GIT_WORK_TREE=/.test(t)) { pendingHints.workTreeHint = t.slice("GIT_WORK_TREE=".length); i++; continue; }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+      const eq = t.indexOf("=");
+      frame().vars[t.slice(0, eq)] = t.slice(eq + 1);
+      i++;
+      continue;
+    }
+    if (t !== "git") { i++; continue; }
+    // ── git invocation ──
     i++;
+    const f = frame();
+    const cHints = [];
+    let gitDirHint = pendingHints.gitDirHint ?? null;
+    let workTreeHint = pendingHints.workTreeHint ?? null;
+    pendingHints = {};
     while (i < tokens.length) {
-      const t = tokens[i];
-      if (/^GIT_DIR=/.test(t) || /^GIT_WORK_TREE=/.test(t)) { i++; continue; }
-      if (t === "cd") { i += 2; continue; }
-      if (t === "-C" || t === "--cd") { i += 2; continue; }
-      if (t.startsWith("--git-dir=") || t === "--git-dir") { i += t === "--git-dir" ? 2 : 1; continue; }
-      if (t === "--work-tree") { i += 2; continue; }
-      if (t.startsWith("--work-tree=")) { i++; continue; }
-      if (t === "--namespace") { i += 2; continue; }
-      if (t.startsWith("--namespace=")) { i++; continue; }
-      if (t === "--no-pager" || t === "-p" || t === "--paginate") { i++; continue; }
-      if (t === "-c" || t === "--config") { i += 2; continue; }
-      if (t.startsWith("-")) { i++; continue; }
+      const g = tokens[i];
+      if (/^GIT_DIR=/.test(g)) { gitDirHint = g.slice("GIT_DIR=".length); i++; continue; }
+      if (/^GIT_WORK_TREE=/.test(g)) { workTreeHint = g.slice("GIT_WORK_TREE=".length); i++; continue; }
+      if (g === "cd") { i += 2; continue; }
+      if (g === "-C" || g === "--cd") { cHints.push(tokens[i + 1] ?? ""); i += 2; continue; }
+      if (g.startsWith("--git-dir=")) { gitDirHint = g.slice("--git-dir=".length); i++; continue; }
+      if (g === "--git-dir") { gitDirHint = tokens[i + 1] ?? null; i += 2; continue; }
+      if (g.startsWith("--work-tree=")) { workTreeHint = g.slice("--work-tree=".length); i++; continue; }
+      if (g === "--work-tree") { workTreeHint = tokens[i + 1] ?? null; i += 2; continue; }
+      if (g === "--namespace") { i += 2; continue; }
+      if (g.startsWith("--namespace=")) { i++; continue; }
+      if (g === "--no-pager" || g === "-p" || g === "--paginate") { i++; continue; }
+      if (g === "-c" || g === "--config") { i += 2; continue; }
+      if (g.startsWith("-")) { i++; continue; }
       break;
     }
     const verb = tokens[i] ?? null;
@@ -248,7 +459,12 @@ function _allGitInvocations(command) {
       args.push(tokens[i]);
       i++;
     }
-    invocations.push({ verb, args });
+    invocations.push({
+      verb, args,
+      cdChain: f.pipeActive ? f.chain.slice(0, f.baseLen) : [...f.chain],
+      cHints, gitDirHint, workTreeHint,
+      vars: { ...f.vars },
+    });
   }
   return invocations;
 }
@@ -271,7 +487,7 @@ function _allGitInvocations(command) {
  */
 export function classifyGitCommandDetailed(command) {
   const { repoHint, gitDirHint } = skimGitGlobalFlags(command);
-  const invocations = _allGitInvocations(command);
+  const invocations = allGitInvocations(command);
   const out = {
     verdict: "allow", repoHint, gitDirHint, verb: invocations[0]?.verb ?? null,
     verbArgs: invocations[0]?.args ?? [], branchState: false, newBranch: null,
@@ -831,7 +1047,7 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
  * @param {string|null} currentBranch — hub's checked-out branch (push carve-out)
  */
 export function evaluateHubGate(command, currentBranch) {
-  const invocations = _allGitInvocations(command);
+  const invocations = allGitInvocations(command);
   if (invocations.length === 0) return { verdict: "non-git" };
   let sawRecovery = false;
   for (const inv of invocations) {
@@ -854,6 +1070,142 @@ export function evaluateHubGate(command, currentBranch) {
     if (v === "recovery") sawRecovery = true;
   }
   return { verdict: sawRecovery ? "recovery" : "allowed" };
+}
+
+/** #347 — evaluateHubGate with PER-INVOCATION target resolution. Classify
+ * first (recovery/readonly → zero resolution cost — sanctioned regardless of
+ * target); on a `block` verdict, resolve the invocation's effective target and
+ * EXEMPT it when it is an isolated worktree (worktree-list membership + cwd
+ * containment). Anything else (hub, foreign, unresolvable) keeps today's
+ * block. Same verdict vocabulary as evaluateHubGate (non-git/allowed/recovery/
+ * block); evaluateHubGate stays contract-identical for existing callers/tests.
+ * @param {string} command
+ * @param {string|null} currentBranch — hub's checked-out branch (push carve-out)
+ * @param {string} [sessionCwd] — session root; the worktree MAP is derived here
+ *   (M4 only fires when session cwd IS the hub).
+ */
+export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd()) {
+  const invocations = allGitInvocations(command);
+  if (invocations.length === 0) return { verdict: "non-git" };
+  let sawRecovery = false;
+  for (const inv of invocations) {
+    if (!inv.verb) continue;
+    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch);
+    if (v === "block") {
+      const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
+      if (target && target.isWorktree) continue; // #347: isolated worktree target
+      return {
+        verdict: "block",
+        reason: [
+          `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+          `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
+          `   Sanctioned recovery ops only: git checkout main|master, git pull`,
+          `   --ff-only, git fetch, git status, git log, git worktree`,
+          `   add|list|prune, git push origin <checked-out-branch> (WIP), marker touch.`,
+          `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
+          `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+        ].join("\n"),
+      };
+    }
+    if (v === "recovery") sawRecovery = true;
+  }
+  return { verdict: sawRecovery ? "recovery" : "allowed" };
+}
+
+/** #347 — the execution cwd of a shell command: the cdChain state AT the
+ * script-path token (interpreter/script position, not end-of-command), with
+ * the SAME subshell/pipe-scoped chain semantics as allGitInvocations. Returns
+ * null when no script token is found or a cd is unresolvable (caller falls
+ * back to the session cwd — true bash semantics when a cd fails).
+ * @param {string} command
+ * @param {string} [sessionCwd]
+ * @returns {string|null}
+ */
+export function commandExecutionCwd(command, sessionCwd = process.cwd()) {
+  const tokens = _tokenize(command);
+  const stack = [{ chain: [], vars: {}, baseLen: 0, pipeC0: null, pipeActive: false }];
+  const frame = () => stack[stack.length - 1];
+  const boundary = () => {
+    const f = frame();
+    if (f.pipeActive && f.pipeC0) f.chain.splice(0, f.chain.length, ...f.pipeC0);
+    f.pipeActive = false;
+    f.pipeC0 = null;
+    f.vars = {};
+    f.baseLen = f.chain.length;
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+      const eq = t.indexOf("=");
+      frame().vars[t.slice(0, eq)] = t.slice(eq + 1);
+      continue;
+    }
+    if (t === "cd") {
+      const target = tokens[i + 1] ?? null;
+      i++;
+      const f = frame();
+      const expanded = target === null ? null : _expandCdVars(target, f.vars);
+      f.chain.push(expanded);
+      continue;
+    }
+    if (t === "(") {
+      const f = frame();
+      if (f.pipeActive && f.pipeC0) f.chain.splice(0, f.chain.length, ...f.pipeC0);
+      stack.push({ chain: [...f.chain], vars: {}, baseLen: f.chain.length, pipeC0: null, pipeActive: false });
+      continue;
+    }
+    if (t === ")") { if (stack.length > 1) stack.pop(); continue; }
+    if (t === "|") {
+      const f = frame();
+      if (!f.pipeActive) {
+        f.pipeC0 = f.chain.slice(0, f.baseLen);
+        f.pipeActive = true;
+      }
+      f.chain.splice(0, f.chain.length, ...(f.pipeC0 || []));
+      f.vars = {};
+      f.baseLen = f.chain.length;
+      continue;
+    }
+    if (t === "&&" || t === "||" || t === ";") { boundary(); continue; }
+    // script-path token: return the chain state AT this point (cycle-4 P2).
+    if (SHELL_INTERPRETERS.has(t)) {
+      const next = tokens[i + 1];
+      if (next && !next.startsWith("-")) return _resolveCdChain(frame().chain, sessionCwd);
+      continue; // `-c` inline or flag — not a script file (gated by the normal classifier)
+    }
+    if (t === ".") {
+      const next = tokens[i + 1];
+      if (next && !next.startsWith("-")) return _resolveCdChain(frame().chain, sessionCwd);
+      continue;
+    }
+    if (/^\.{0,2}\//.test(t)) return _resolveCdChain(frame().chain, sessionCwd); // ./x.sh direct execution
+  }
+  return null; // no script file executed
+}
+
+/** #347 — resolve the git TOP-LEVEL of a write/edit target path (walking up to
+ * the nearest existing ancestor dir so writes into not-yet-created dirs still
+ * resolve). Returns the resolve-normalized toplevel (mirroring _mainTopLevel)
+ * or null on git/fs failure (caller falls through — downstream warns-not-blocks).
+ * @param {string} targetPath — write/edit tool path (relative to cwd)
+ * @param {string} [cwd]
+ * @returns {string|null}
+ */
+export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
+  try {
+    let dir = dirname(resolve(cwd, targetPath ?? ""));
+    while (!existsSync(dir)) {
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    const top = execSync("git rev-parse --show-toplevel", {
+      encoding: "utf-8", cwd: dir, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return top ? resolve(top) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -917,6 +1269,7 @@ export function extractScriptPath(command) {
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }   // env prefix
     if (t === "cd") { i += 2; continue; }                         // cd prefix
     if (t === "&&" || t === ";" || t === "||") { i++; continue; } // separators
+    if (t === "(" || t === ")") { i++; continue; }                 // #347: subshell wrappers
     break;
   }
   if (i >= tokens.length) return null;
@@ -944,17 +1297,24 @@ export function extractScriptPath(command) {
  * @param {string|null} currentBranch
  * @returns {"allow"|"block"}
  */
-export function scriptGitVerdict(path, currentBranch) {
+export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd()) {
   let content;
   try {
     content = readFileSync(path, "utf-8");
   } catch {
     return "allow";
   }
-  const invocations = _allGitInvocations(_stripShellComments(content));
+  const invocations = allGitInvocations(_stripShellComments(content));
   for (const inv of invocations) {
     if (!inv.verb) continue;
     if (isHubRecoveryInvocation(inv.verb, inv.args, currentBranch) === "block") {
+      // #347: per-invocation target exemption — the worktree map comes from the
+      // SESSION repo (the guard's hub; explicit param for testability),
+      // executionCwd is the script's cd-chain base. Worktree-targeted script
+      // content is isolated; content that targets the hub (or a foreign /
+      // unresolvable target) still blocks.
+      const target = resolveInvocationTarget(inv, sessionCwd, executionCwd);
+      if (target && target.isWorktree) continue;
       return "block";
     }
   }

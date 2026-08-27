@@ -56,10 +56,23 @@ session start, deliberate solo session) disables M4. The sanctioned terminal
 one-liner (`cd <repo> && git checkout main && git pull --ff-only`) is
 touched only by humans and is unaffected.
 
-**Scope:** M4 fires only when the session cwd IS the hub's main checkout.
-Worktree sessions are exempt (they are isolated by construction); agent-infra
-is exempt (#99 — in-main feature work is its norm; its hub-discipline check is
-downgraded to a dirty-warn).
+**Scope (#347):** M4 fires only when the session cwd IS the hub's main checkout
+and the hub is off-main/dirty. Worktree sessions are exempt (they are isolated
+by construction); agent-infra is exempt (#99 — in-main feature work is its
+norm; its hub-discipline check is downgraded to a dirty-warn). **Worktree-
+TARGETED git ops are exempt per-invocation:** M4 resolves each git invocation's
+EFFECTIVE target (cd-chains, `-C`, `GIT_DIR`/`--git-dir`, subshell/pipe
+scoping, `git worktree list` membership + cwd containment, realpath-normalized)
+and exempts invocations targeting an isolated worktree — a hub-rooted session
+that `cd`s into a worktree is no longer frozen by hub disorder (2026-08-27
+tortoise incident class). No total-bash-gate bypass: the exemption is semantic,
+never path-string-based; hub/foreign/unresolvable targets keep today's blocks
+(including `git -C <wt> --git-dir=<hub>/.git …`, `--git-dir=<hub>/.git/worktrees/<x>`
+from the hub cwd, and `GIT_DIR=<wt>/.git` from the hub cwd). The write/edit M4
+block is target-aware (hub-equality): only HUB-targeted writes block while the
+hub is disordered (D3 preserved — the block still runs before the marker
+bypass); worktree/foreign/`/tmp` writes are isolated. `GIT_DIR`/`GIT_WORK_TREE`
+env prefixes are scoped to the next command only (bash semantics).
 
 **The script backdoor is CLOSED.** The old escape — `write /tmp/x.sh` + `bash
 /tmp/x.sh` — executed arbitrary git unblocked. Now a shell-script execution
@@ -67,6 +80,11 @@ downgraded to a dirty-warn).
 non-sanctioned git mutation is blocked: the script's git ops are gated by the
 SAME recovery allowlist. Recovery scripts keep working (`hub-worktree.sh`
 contains only `fetch` + `worktree add`), and read-only git in scripts is fine.
+**#347:** the script path + content gating resolve against the command's
+EXECUTION cwd (cd-resolved, subshell/pipe-scoped) — `cd <wt> && bash x.sh`
+resolves x.sh inside the worktree; worktree-targeted script content is exempt,
+while content targeting the hub (`git -C <hub> reset …`) blocks even from a
+worktree cwd. Subshell-wrapped executions (`(cd … && bash x.sh)`) are covered.
 
 ### Incident writeup — 2026-08-18 (the canonical hub-discipline failure)
 
