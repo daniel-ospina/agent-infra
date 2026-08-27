@@ -289,7 +289,8 @@ function _resolveCdChain(cdChain, sessionCwd) {
  * (probe-verified divergence), and content pointing at a non-gitfile path is
  * omitted from porcelain entirely. Also guards the derivation against future
  * drift in git's own worktree model.
- * Parsed with `--porcelain -z` (NUL-delimited fields — git ≥ 2.25): a path
+ * Parsed with `--porcelain -z` (NUL-delimited fields — git ≥ 2.36; the `-z`
+ * option for `git worktree list` landed in 2.36.0): a path
  * with an EMBEDDED newline is accepted by git at creation (probe-verified;
  * an earlier line-split parse mis-split such paths and would have
  * false-blocked the worktree via the cross-check) and survives the NUL
@@ -320,7 +321,7 @@ export function worktreeListPorcelainPaths(sessionCwd = process.cwd()) {
     }
     return paths;
   } catch {
-    return null; // git unavailable / pre-2.25 → cross-check skipped (no false-blocks)
+    return null; // git unavailable / pre-2.36 → cross-check skipped (no false-blocks)
   }
 }
 
@@ -357,7 +358,7 @@ function _worktreeGitdirMap(sessionCwd) {
     const adminNames = readdirSync(adminRoot);
     if (adminNames.length === 0) return map; // no linked worktrees → nothing to cross-check (skip the spawn)
     // Issue #351: cross-check the reverse-pointer derivation against git's own
-    // view ONCE per map build. null (git failure / git < 2.25) → cross-check
+    // view ONCE per map build. null (git failure / git < 2.36) → cross-check
     // skipped — a secondary git call must never become a new false-block
     // source; the skip is surfaced ONCE (diagnosability, review #353 P2).
     const porcelainPaths = worktreeListPorcelainPaths(sessionCwd);
