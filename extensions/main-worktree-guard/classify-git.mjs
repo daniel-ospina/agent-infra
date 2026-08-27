@@ -456,12 +456,14 @@ export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd
  *   onOther(token), onGitStart(frame), onGitEnd({verb,args,cHints,gitDirHint,
  *   workTreeHint,cdChain,vars}).
  */
-function _walkShell(command, h = {}) {
+function _walkShell(command, h = {}, seedVars = {}) {
   const tokens = _tokenize(command);
   // Per-paren-depth frame: chain, vars (persisted shell state), segVars (vars
   // at the last boundary — the expansion scope for a segment's own words),
   // baseLen (chain length at last boundary), pipeC0, pipeActive.
-  const stack = [{ chain: [], vars: {}, segVars: {}, baseLen: 0, pipeC0: null, pipeActive: false, persistHints: { gitDirHint: null, workTreeHint: null } }];
+  // seedVars (round-13): command-level assignments passed into nested walks
+  // (`-c` inlines, substitution spans) so mid-span `$VAR` command words resolve.
+  const stack = [{ chain: [], vars: { ...seedVars }, segVars: { ...seedVars }, baseLen: 0, pipeC0: null, pipeActive: false, persistHints: { gitDirHint: null, workTreeHint: null } }];
   const frame = () => stack[stack.length - 1];
   const refreshSeg = (f) => { f.segVars = { ...f.vars }; };
   const restoreC0 = (f) => { if (f.pipeActive && f.pipeC0) f.chain.splice(0, f.chain.length, ...f.pipeC0); };
@@ -475,7 +477,7 @@ function _walkShell(command, h = {}) {
     refreshSeg(f);
     h.onBoundary?.();
   };
-  const subshellReset = (f) => { f.vars = {}; f.baseLen = f.chain.length; refreshSeg(f); };
+  const subshellReset = (f) => { f.baseLen = f.chain.length; refreshSeg(f); }; // round-13: pipe segments INHERIT vars (bash) — `G=git; echo x | $G reset` must resolve G
   let pendingHints = {}; // GIT_DIR=x / GIT_WORK_TREE=x prefixes — next command only
   let prevWasBoundary = true; // cd is the builtin only in command-word position (round-3)
   let i = 0;
@@ -507,6 +509,11 @@ function _walkShell(command, h = {}) {
       i++;
       continue;
     }
+    // Round-13 (final gate P1): compound-command reserved words (for/do/done/
+    // if/then/else/elif/fi/while/until/select/!/case/esac) start a new command
+    // word position — a following `$VAR` must resolve (`G=git; for i in 1; do
+    // $G …; done` ran git — probe). They never consume command position.
+    if (COMPOUND_WORDS.has(t)) { i++; prevWasBoundary = true; continue; }
     if (t === "{" || t === "}") { i++; prevWasBoundary = true; continue; } // brace-group boundaries (round-11)
     if (t === ")") {
       if (stack.length > 1) stack.pop();
@@ -651,7 +658,7 @@ function _walkShell(command, h = {}) {
             // Recursively walk the inline command (its cds resolve from the
             // CURRENT chain) and forward its git invocations.
             const base = [...frame().chain];
-            const nested = allGitInvocations(inline);
+            const nested = allGitInvocations(inline, frame().vars); // round-13: seed the nested walk with the current shell state
             for (const ni of nested) {
               h.onGitEnd?.({
                 ...ni,
@@ -826,11 +833,11 @@ function _walkShell(command, h = {}) {
  * {verb, args} are unchanged for existing consumers.
  * @returns {Array<{verb: string|null, args: string[], cdChain: Array<string|null>, cHints: string[], gitDirHint: string|null, workTreeHint: string|null, vars: object}>}
  */
-export function allGitInvocations(command) {
+export function allGitInvocations(command, seedVars = {}) {
   const invocations = [];
   _walkShell(command, {
     onGitEnd: (inv) => invocations.push(inv),
-  });
+  }, seedVars);
   return invocations;
 }
 
@@ -1522,6 +1529,10 @@ function _extractSubstitutionSpans(token) {
  * cat is not a spawner). */
 const SPAWNER_WORDS = new Set(["env", "sudo", "command", "xargs", "exec", "nohup", "nice", "time", "eval", "sh", "bash", "zsh", "dash", "ksh"]);
 
+/** Compound-command reserved words (round-13): they start a new command-word
+ * position — a following `$VAR` must resolve as the command. */
+const COMPOUND_WORDS = new Set(["for", "do", "done", "if", "then", "else", "elif", "fi", "while", "until", "select", "!", "case", "esac"]);
+
 /** Does a substitution span carry an unverifiable git execution? Token-level
  * scan: literal git; a `$VAR` as the first command token (skipping leading env
  * assignments); an interpreter or path as the first command token (script-in-
@@ -1533,7 +1544,13 @@ function _spanCarriesGit(inner, cmdVars = {}) {
   // message must NOT re-freeze the worktree commit — second-model P1);
   // mutations/unknown verbs fail closed. A bare prose "git" word (no
   // invocation) passes.
-  for (const gi of allGitInvocations(inner)) {
+  for (const gi of allGitInvocations(inner, cmdVars)) { // round-13: seed with command assignments — mid-span $VAR resolves
+    if (gi.verb === "__unverifiable__") return true;
+    // Round-13 (second-model P1): `git symbolic-ref <non-HEAD>` is a shared-ref
+    // mutation on the direct surface (T64) but isHubRecoveryInvocation returns
+    // "readonly" — mirror the special case here so the substitution surface
+    // does not re-open it.
+    if (gi.verb === "symbolic-ref" && !(gi.args || []).includes("HEAD")) return true;
     if (gi.verb && isHubRecoveryInvocation(gi.verb, gi.args, null) === "block") return true;
   }
   for (const sub of _extractSubstitutionSpans(inner)) {

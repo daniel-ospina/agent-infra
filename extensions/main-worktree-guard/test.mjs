@@ -808,6 +808,12 @@ try {
   m4t("T96: top-level spawner \$VAR command → block", `G=git; env \$G -C "${hubR}" reset --hard`, "block");
   m4t("T97: multiword \$VAR command value → block (unverifiable)", `G="git -C "${hubR}" reset --hard"; \$G`, "block");
   m4t("T98: second pipe-to-shell segment → block (scan every segment)", `echo x | bash && printf "git reset --hard" | sh`, "block");
+  // ── Round-13 closures (final gate round 5, all probe-verified) ──
+  m4t("T99: pipe-segment \$VAR command → block (vars inherited)", `G=git; echo x | \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T100: for/do \$VAR command → block (compound word)", `G=git; for i in 1; do \$G -C "${hubR}" reset --hard; done`, "block");
+  m4t("T101: if/then \$VAR command → block", `G=git; if true; then \$G -C "${hubR}" reset --hard; fi`, "block");
+  m4t("T102: quoted substitution with prefix \$VAR → block", `G=git; "\$( cd /tmp && \$G -C "${hubR}" reset --hard )"`, "block");
+  m4t("T103: symbolic-ref non-HEAD in substitution → block (shared ref)", `cd "${wtR}" && git commit -m "\$(git symbolic-ref refs/remotes/origin/HEAD refs/heads/main)"`, "block");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
