@@ -66,23 +66,34 @@ scoping, `git worktree list` membership derived from the worktrees' reverse-
 pointer admin dirs — porcelain has no gitdir column — + cwd containment,
 realpath-normalized) and exempts worktree-targeted invocations — a hub-rooted
 session that `cd`s into a worktree is no longer frozen by hub disorder
-(2026-08-27 tortoise incident class). **Shared-ref verbs are NOT exempt:**
-worktrees share the hub's ref namespace — `push`/`update-ref`/`symbolic-ref`/
-`tag`/`branch -D`/`remote`/object-store ops from a worktree target are
-re-classified against the worktree's OWN checked-out branch (`git push origin
-<the wt's branch>` is the carve-out); `push -f`/foreign/delete still block.
-No total-bash-gate bypass: the exemption is semantic, never path-string-based;
-hub/foreign/unresolvable targets keep today's blocks (including `-C <wt>
---git-dir=<hub>/.git …`, `--git-dir=<hub>/.git/worktrees/<x>` from the hub
-cwd, `GIT_DIR=<wt>/.git` from the hub cwd, and crafted reverse-pointer files —
-two-way back-reference validation). The write/edit M4 block is target-aware
-(hub-equality): only HUB-targeted writes block while the hub is disordered (D3
-preserved — the block still runs before the marker bypass); worktree/foreign/
-`/tmp` writes are isolated. `GIT_DIR`/`GIT_WORK_TREE` env PREFIXES are scoped
-to the next command only; `export GIT_DIR=`/`export GIT_WORK_TREE=` persist for
-the whole command (bash env state). `VAR=x cd "$VAR"` same-segment expansion
-is bash-faithful (pre-assignment — unresolvable → conservative block).
-Worktree exemptions are audited (`event: "m4_worktree_exemption"`).
+(2026-08-27 tortoise incident class). **Shared-ref verbs are NOT exempt (round-3 inverted allowlist):** worktrees
+share the hub's ref namespace — only worktree-LOCAL verbs (commit/add/reset/
+merge/rebase/checkout/restore/clean/apply/pull/… — the wt's own working tree,
+index, and branch) are auto-exempt; everything else (`push`/`update-ref`/
+`symbolic-ref`/`tag`/`branch -D`/`remote`/`stash`/object-store/UNKNOWN verbs
+like `git subtree push`) is re-classified against the worktree's OWN checked-out
+branch (`git push origin <the wt's branch>` is the carve-out; push `-f`/
+foreign/delete/empty-source-`:ref`/`--all`/`--prune` still block).
+**Main-protection:** a worktree checked out on `main`/`master` is the hub's
+protected branch — mutations block; `git checkout main` from a worktree while
+the hub is off-main (main free) blocks. `GIT_INDEX_FILE`/`GIT_OBJECT_DIRECTORY`
+redirecting outside the worktree block. `&>`/`>&` are single redirect tokens
+(not background boundaries). `cd` is recognized only in command-word position
+(`echo cd …` is not a cd). No total-bash-gate bypass: the exemption is semantic,
+never path-string-based; hub/foreign/unresolvable targets keep today's blocks
+(including `-C <wt> --git-dir=<hub>/.git …`, `--git-dir=<hub>/.git/worktrees/<x>`
+from the hub cwd, `GIT_DIR=<wt>/.git` from the hub cwd, and crafted reverse-
+pointer files — two-way back-reference validation). The write/edit M4 block is
+target-aware (hub-equality): only HUB-targeted writes block while the hub is
+disordered (D3 preserved — the block still runs before the marker bypass);
+worktree/foreign/`/tmp` writes are isolated. `GIT_DIR`/`GIT_WORK_TREE` env
+PREFIXES are scoped to the next command only (a bare prefix overrides an
+exported value — bash); `export GIT_DIR=`/`export GIT_WORK_TREE=` persist for
+the whole command until `unset`/`export` without value; `VAR=x cd "$VAR"`
+same-segment expansion is bash-faithful (pre-assignment — unresolvable →
+conservative block); `VAR=x` followed by a redirect is a prefix, not a
+statement. Worktree exemptions are audited (`event:
+"m4_worktree_exemption"`).
 
 **The script backdoor is CLOSED.** The old escape — `write /tmp/x.sh` + `bash
 /tmp/x.sh` — executed arbitrary git unblocked. Now a shell-script execution

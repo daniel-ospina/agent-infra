@@ -92,7 +92,7 @@ function _tokenize(command) {
 
     // Two-char operators (`>>`/`<<` are redirects, not just `>`+`>`).
     const two = s.slice(i, i + 2);
-    if (two === "&&" || two === "||" || two === ">>" || two === "<<") {
+    if (two === "&&" || two === "||" || two === ">>" || two === "<<" || two === "&>" || two === ">&" || two === "&>>") {
       tokens.push(two);
       i += 2;
       continue;
@@ -302,6 +302,15 @@ function _worktreeGitdirMap(sessionCwd) {
         // per-entry skip — never abort the whole map for one stale dir
       }
     }
+    // Round-3 (second-model P2): admin dirs exist but NO entry survived the
+    // two-way validation — the git layout may have changed (a silent re-freeze
+    // of the exact incident class this fix cures). One-time diagnosable warn.
+    if (adminNames.length > 0 && map.size === 0) {
+      console.warn(
+        `[main-worktree-guard] ⚠️ worktree map empty despite ${adminNames.length} admin dir(s) — ` +
+        `git layout may have changed; worktree-target exemption DISABLED (conservative).`
+      );
+    }
   } catch {
     // whole-map conservative fallback (empty map → no exemptions)
   }
@@ -352,6 +361,21 @@ export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd
     if (inv.workTreeHint) {
       const wt = _realpathSafe(resolve(cwd, inv.workTreeHint));
       if (wt !== null && !(wt === worktreePath || wt.startsWith(worktreePath + "/"))) {
+        return { effectiveCwd: cwd, gitDir, worktreePath, worktreeBranch: null, isWorktree: false };
+      }
+    }
+    // Index/object-redirect guard (round-3, second-model P2): GIT_INDEX_FILE /
+    // GIT_OBJECT_DIRECTORY resolving OUTSIDE the worktree redirects the
+    // mutation into the hub's state — not isolated.
+    if (inv.indexFileHint) {
+      const idx = _realpathSafe(resolve(cwd, inv.indexFileHint));
+      if (idx !== null && !(idx === worktreePath || idx.startsWith(worktreePath + "/"))) {
+        return { effectiveCwd: cwd, gitDir, worktreePath, worktreeBranch: null, isWorktree: false };
+      }
+    }
+    if (inv.objDirsHint) {
+      const od = _realpathSafe(resolve(cwd, inv.objDirsHint.split(":")[0] ?? ""));
+      if (od !== null && !(od === worktreePath || od.startsWith(worktreePath + "/"))) {
         return { effectiveCwd: cwd, gitDir, worktreePath, worktreeBranch: null, isWorktree: false };
       }
     }
@@ -435,10 +459,11 @@ function _walkShell(command, h = {}) {
   const subshellReset = (f) => { f.vars = {}; f.baseLen = f.chain.length; refreshSeg(f); };
   let persistHints = { gitDirHint: null, workTreeHint: null }; // export GIT_DIR=... — whole command
   let pendingHints = {}; // GIT_DIR=x / GIT_WORK_TREE=x prefixes — next command only
+  let prevWasBoundary = true; // cd is the builtin only in command-word position (round-3)
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
-    if (t === "cd") {
+    if (t === "cd" && prevWasBoundary) {
       const next = tokens[i + 1];
       const hasTarget = next !== undefined && !_isShellBoundary(next);
       const target = hasTarget ? next : null; // bare cd / cd <boundary> → null marker (T45a)
@@ -451,6 +476,7 @@ function _walkShell(command, h = {}) {
         : _expandCdVars(target, f.segVars);
       f.chain.push(expanded);
       h.onCd?.(expanded);
+      prevWasBoundary = false;
       continue;
     }
     if (t === "(") {
@@ -458,6 +484,8 @@ function _walkShell(command, h = {}) {
       restoreC0(f);
       stack.push({ chain: [...f.chain], vars: {}, segVars: {}, baseLen: f.chain.length, pipeC0: null, pipeActive: false });
       pendingHints = {};
+      persistHints = { ...persistHints }; // exports are subshell-scoped (round-3 P3)
+      prevWasBoundary = true;
       h.onParenPush?.();
       i++;
       continue;
@@ -465,6 +493,7 @@ function _walkShell(command, h = {}) {
     if (t === ")") {
       if (stack.length > 1) stack.pop();
       pendingHints = {};
+      prevWasBoundary = true;
       h.onParenPop?.();
       i++;
       continue;
@@ -478,12 +507,14 @@ function _walkShell(command, h = {}) {
       f.chain.splice(0, f.chain.length, ...(f.pipeC0 || [])); // discard segment cds, reseed from C0
       subshellReset(f);
       pendingHints = {};
+      persistHints = { gitDirHint: null, workTreeHint: null }; // pipe segments are subshells — exports don't leak (round-3)
+      prevWasBoundary = true;
       h.onPipe?.();
       i++;
       continue;
     }
-    if (t === "&&" || t === "||" || t === ";") { boundary(false); pendingHints = {}; i++; continue; }
-    if (t === "&") { boundary(true); pendingHints = {}; i++; continue; } // background — whole list in a subshell
+    if (t === "&&" || t === "||" || t === ";") { boundary(false); pendingHints = {}; prevWasBoundary = true; i++; continue; }
+    if (t === "&") { boundary(true); pendingHints = {}; persistHints = { gitDirHint: null, workTreeHint: null }; prevWasBoundary = true; i++; continue; } // background — whole list in a subshell
     if (t === "export") {
       const next = tokens[i + 1];
       if (next && /^(GIT_DIR|GIT_WORK_TREE)=/.test(next)) {
@@ -491,24 +522,57 @@ function _walkShell(command, h = {}) {
         const name = next.slice(0, eq), value = next.slice(eq + 1);
         if (name === "GIT_DIR") persistHints.gitDirHint = value; else persistHints.workTreeHint = value;
         i += 2;
-        continue;
+      } else if (next === "GIT_DIR" || next === "GIT_WORK_TREE") {
+        // `unset`-style revert via `export GIT_DIR` (no =) → clear (round-3)
+        if (next === "GIT_DIR") persistHints.gitDirHint = null; else persistHints.workTreeHint = null;
+        i += 2;
+      } else {
+        i++;
       }
-      i++;
+      prevWasBoundary = true;
+      continue;
+    }
+    if (t === "unset") {
+      const next = tokens[i + 1];
+      if (next === "GIT_DIR") { persistHints.gitDirHint = null; i += 2; }
+      else if (next === "GIT_WORK_TREE") { persistHints.workTreeHint = null; i += 2; }
+      else { i++; }
+      prevWasBoundary = true;
       continue;
     }
     if (/^GIT_DIR=/.test(t)) { pendingHints.gitDirHint = t.slice("GIT_DIR=".length); i++; continue; }
     if (/^GIT_WORK_TREE=/.test(t)) { pendingHints.workTreeHint = t.slice("GIT_WORK_TREE=".length); i++; continue; }
+    // Round-3 (second-model P2): index/object-redirect env vars are hub-mutation
+    // vectors (`GIT_INDEX_FILE=<hub>/.git/index git add` from a wt stages the
+    // HUB's index) — captured like GIT_DIR and conservatively blocked when they
+    // resolve outside the worktree.
+    if (/^GIT_INDEX_FILE=/.test(t)) { pendingHints.indexFileHint = t.slice("GIT_INDEX_FILE=".length); i++; continue; }
+    if (/^GIT_OBJECT_DIRECTORY=/.test(t) || /^GIT_ALTERNATE_OBJECT_DIRECTORIES=/.test(t)) { pendingHints.objDirsHint = t.slice(t.indexOf("=") + 1); i++; continue; }
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
       const eq = t.indexOf("=");
-      const nextT = tokens[i + 1];
-      const isStatement = !nextT || _isShellBoundary(nextT);
-      if (isStatement) {
-        // assignment STATEMENT — persists as shell state (real bash)
-        frame().vars[t.slice(0, eq)] = t.slice(eq + 1);
+      // Statement-vs-prefix (round-3 P1): scan past io-redirects + their operands
+      // and env prefixes — an assignment is a STATEMENT (persists) only when no
+      // command word follows; `VAR=x > /dev/null git fetch` is a PREFIX (env-only).
+      let j = i + 1;
+      let isStatement = true;
+      while (j < tokens.length) {
+        const n = tokens[j];
+        // Redirects (+ operands) and fd-redirects first — they are ALSO shell
+        // boundaries for the args loop but do NOT terminate an assignment
+        // statement (`VAR=x > /dev/null git fetch` is a PREFIX, round-3).
+        if (/^(?:[0-9]+)?[<>]/.test(n) || n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^[0-9]+>&[0-9]*-?$/.test(n)) {
+          j += 2; // redirect + its operand
+          continue;
+        }
+        if (_isShellBoundary(n)) break; // boundary → statement
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(n)) { j++; continue; } // another prefix
+        isStatement = false; // a command word follows → prefix
+        break;
       }
-      // else: env PREFIX for the next command — does NOT persist and is NOT
-      // visible to that command's own word expansion (bash) — irrelevant to the
-      // guard except as a trap; correctly ignored.
+      if (isStatement) frame().vars[t.slice(0, eq)] = t.slice(eq + 1);
+      // else: env PREFIX — does NOT persist, NOT visible to the next command's own
+      // word expansion (bash) — irrelevant to the guard except as a trap; ignored.
+      // prevWasBoundary stays TRUE for prefixes (the next token is the command word).
       i++;
       continue;
     }
@@ -522,6 +586,7 @@ function _walkShell(command, h = {}) {
       } else {
         i++; // `-c` inline or flag — not a script file (gated by the normal classifier)
       }
+      prevWasBoundary = false;
       continue;
     }
     if (t === ".") {
@@ -532,20 +597,26 @@ function _walkShell(command, h = {}) {
       } else {
         i++;
       }
+      prevWasBoundary = false;
       continue;
     }
     if (/^\.{0,2}\//.test(t)) {
       h.onScriptToken?.([...frame().chain]);
       i++;
+      prevWasBoundary = false;
       continue;
     }
-    if (t !== "git") { h.onOther?.(t); i++; continue; }
+    if (t !== "git") { h.onOther?.(t); i++; prevWasBoundary = false; continue; }
     // ── git invocation ──
     i++;
     const f = frame();
     const cHints = [];
-    let gitDirHint = persistHints.gitDirHint ?? pendingHints.gitDirHint ?? null;
-    let workTreeHint = persistHints.workTreeHint ?? pendingHints.workTreeHint ?? null;
+    // Round-3 P1: a bare per-command prefix WINS over an exported value (bash:
+    // `export GIT_DIR=/a; GIT_DIR=/b git …` runs with /b — probe-verified).
+    let gitDirHint = pendingHints.gitDirHint ?? persistHints.gitDirHint ?? null;
+    let workTreeHint = pendingHints.workTreeHint ?? persistHints.workTreeHint ?? null;
+    let indexFileHint = pendingHints.indexFileHint ?? null;
+    let objDirsHint = pendingHints.objDirsHint ?? null;
     pendingHints = {};
     h.onGitStart?.(f);
     while (i < tokens.length) {
@@ -558,6 +629,8 @@ function _walkShell(command, h = {}) {
       if (g === "--git-dir") { gitDirHint = tokens[i + 1] ?? null; i += 2; continue; }
       if (g.startsWith("--work-tree=")) { workTreeHint = g.slice("--work-tree=".length); i++; continue; }
       if (g === "--work-tree") { workTreeHint = tokens[i + 1] ?? null; i += 2; continue; }
+      if (/^GIT_INDEX_FILE=/.test(g)) { indexFileHint = g.slice("GIT_INDEX_FILE=".length); i++; continue; }
+      if (/^GIT_OBJECT_DIRECTORY=/.test(g) || /^GIT_ALTERNATE_OBJECT_DIRECTORIES=/.test(g)) { objDirsHint = g.slice(g.indexOf("=") + 1); i++; continue; }
       if (g === "--namespace") { i += 2; continue; }
       if (g.startsWith("--namespace=")) { i++; continue; }
       if (g === "--no-pager" || g === "-p" || g === "--paginate") { i++; continue; }
@@ -578,10 +651,11 @@ function _walkShell(command, h = {}) {
       i++;
     }
     h.onGitEnd?.({
-      verb, args, cHints, gitDirHint, workTreeHint,
+      verb, args, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint,
       cdChain: f.pipeActive ? f.chain.slice(0, f.baseLen) : [...f.chain],
       vars: { ...f.vars },
     });
+    prevWasBoundary = false;
   }
   return tokens;
 }
@@ -1116,13 +1190,18 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
     case "push": {
       // WIP preservation: push of the CHECKED-OUT branch to origin is the one
       // allowed push (the stranded lane's 38 commits must not silently die).
-      // Force/delete/mirror/tags and foreign targets → block.
+      // Force/delete/mirror/tags/--all/--prune/--follow-tags and foreign
+      // targets → block. Round-3 P1: the `:branch` EMPTY-SOURCE refspec form is
+      // a remote-branch DELETION — block it even when the dst matches; a bare
+      // `HEAD` refspec resolves to the checked-out branch.
       if (flag("-f") || flag("--force") || flag("--delete") ||
-          a.includes("--mirror") || a.includes("--tags")) return "block";
+          a.includes("--mirror") || a.includes("--tags") ||
+          a.includes("--all") || a.includes("--prune") || a.includes("--follow-tags")) return "block";
       if (!currentBranch) return "block"; // detached hub — push target unknowable
       const refspecs = pos.length > 1 ? pos.slice(1) : [];
+      if (refspecs.some((r) => /^\+*:/.test(r))) return "block"; // empty-source = delete
       const dsts = refspecs.length
-        ? refspecs.map((r) => _refspecDst(r)).filter((x) => x !== null && x !== undefined)
+        ? refspecs.map((r) => (r === "HEAD" ? currentBranch : _refspecDst(r))).filter((x) => x !== null && x !== undefined)
         : [currentBranch]; // bare push → push.default=simple → current branch
       if (dsts.length === 0) return "block";
       return dsts.every((d) => d === currentBranch) ? "recovery" : "block";
@@ -1207,30 +1286,42 @@ export function evaluateHubGate(command, currentBranch) {
   return { verdict: sawRecovery ? "recovery" : "allowed" };
 }
 
-/** Verbs that mutate refs/remotes/object-store SHARED with the hub — git
- * worktrees share the REF NAMESPACE (only the working tree/index are
- * isolated; code-review #4 probe: `cd <wt> && git push -f origin main` and
- * `git tag`/`git branch -D`/`git update-ref` from a worktree mutate shared
- * refs). A worktree-targeted invocation of these is NOT auto-exempt: it is
- * re-classified against the worktree's OWN branch (the push carve-out must
- * derive from the worktree's HEAD, not the hub's), else blocked. Worktree-
- * LOCAL verbs (commit/add/reset/checkout/merge/rebase/restore/clean/stash)
- * stay exempt — they only touch the wt's own working tree/index/branch. */
-const WORKTREE_SHARED_REF_VERBS = new Set([
-  "push", "update-ref", "symbolic-ref", "tag", "branch", "remote",
-  "gc", "prune", "repack", "notes", "replace", "filter-branch",
-  "send-email", "bundle",
+/** Verbs whose mutation is provably WORKTREE-LOCAL (working tree + index + the
+ * wt's OWN checked-out branch only) — auto-exempt for worktree targets.
+ * Everything else (push/update-ref/symbolic-ref/tag/branch/remote/stash/
+ * object-store/UNKNOWN verbs like `git subtree push`) is re-classified against
+ * the worktree's OWN branch — recovery carve-outs (e.g. push of the wt's
+ * branch) apply, everything else blocks. Round-3: INVERTED allowlist — the
+ * denylist form let unknown verbs (subtree push of main) and `stash` (shared
+ * refs/stash) slip through as auto-exempt (code-review round-3 probes).
+ * Worktrees share the hub's REF NAMESPACE (only working tree/index isolated). */
+const WORKTREE_LOCAL_VERBS = new Set([
+  "commit", "add", "rm", "mv", "restore", "checkout", "switch", "reset",
+  "merge", "rebase", "cherry-pick", "revert", "clean", "apply", "am", "pull",
 ]);
+
+function _mainProtectionReason(inv, note) {
+  return [
+    `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+    `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
+    `   ${note}`,
+    `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
+    `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+  ].join("\n");
+}
 
 /** #347 — evaluateHubGate with PER-INVOCATION target resolution. Classify
  * first (recovery/readonly → zero resolution cost — sanctioned regardless of
  * target); on a `block` verdict, resolve the invocation's effective target and
  * EXEMPT it when it is an isolated worktree (worktree-list membership + cwd
- * containment) AND the verb is worktree-LOCAL (shared-ref verbs are
- * re-classified against the worktree's own branch — code-review #4). Anything
- * else (hub, foreign, unresolvable) keeps today's block. Same verdict
- * vocabulary as evaluateHubGate (non-git/allowed/recovery/block);
- * evaluateHubGate stays contract-identical for existing callers/tests.
+ * containment) AND the verb is worktree-LOCAL (round-3 inverted allowlist).
+ * Shared-ref/unknown verbs are re-classified against the worktree's own branch
+ * (code-review #4/round-3). Main-protection (round-3 P1): a worktree on
+ * main/master is the hub's protected branch — mutations block; `checkout main`
+ * from a worktree while the hub is OFF-main (main free) blocks. Anything else
+ * (hub, foreign, unresolvable) keeps today's block. Same verdict vocabulary as
+ * evaluateHubGate (non-git/allowed/recovery/block); evaluateHubGate stays
+ * contract-identical for existing callers/tests.
  * @param {string} command
  * @param {string|null} currentBranch — hub's checked-out branch (push carve-out)
  * @param {string} [sessionCwd] — session root; the worktree MAP is derived here
@@ -1244,31 +1335,59 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
   for (const inv of invocations) {
     if (!inv.verb) continue;
     const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch);
+    // Main-protection interception for the SANCTIONED form: `checkout main` from
+    // a worktree while the hub is off-main lets the wt take the protected branch
+    // (git allows it — main is free) and then commit/push mutate main.
+    if (v === "recovery" && (inv.verb === "checkout" || inv.verb === "switch")) {
+      const pos = (inv.args || []).filter((x) => !x.startsWith("-"));
+      if (pos.length === 1 && (pos[0] === "main" || pos[0] === "master") &&
+          currentBranch !== "main" && currentBranch !== "master") {
+        const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
+        if (target && target.isWorktree &&
+            target.worktreeBranch !== "main" && target.worktreeBranch !== "master") {
+          exempted = true;
+          return {
+            verdict: "block", exempted: true,
+            reason: _mainProtectionReason(inv,
+              `Worktree checkout of the hub's protected branch "${pos[0]}" while the hub is`,
+              `off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
+          };
+        }
+      }
+      sawRecovery = true;
+      continue;
+    }
     if (v === "block") {
       const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
       if (target && target.isWorktree) {
         exempted = true;
-        if (!WORKTREE_SHARED_REF_VERBS.has(inv.verb)) continue; // worktree-local — isolated
-        // Shared-ref verb: re-classify against the WORKTREE's own branch — the
-        // recovery carve-out (e.g. push origin <checked-out-branch>) derives
-        // from the wt's HEAD, not the hub's.
-        const wv = isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch);
-        if (wv === "block") {
+        // Main-protection: a worktree on the hub's protected branch is NOT
+        // isolated for mutations (commits/pushes move the shared main ref).
+        if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
           return {
             verdict: "block", exempted: true,
-            reason: [
-              `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
-              `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
-              `   Shared-ref/remote mutation from a worktree target — worktrees share the`,
-              `   hub's ref namespace (#347 code-review). Sanctioned ops only: git push`,
-              `   origin <the worktree's checked-out branch>, git worktree add|list|prune.`,
-              `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
-              `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
-            ].join("\n"),
+            reason: _mainProtectionReason(inv,
+              `The worktree is checked out on the hub's protected branch "${target.worktreeBranch}" —`,
+              `its mutations would advance the shared main ref.`),
           };
         }
-        if (wv === "recovery") sawRecovery = true;
-        continue; // readonly / sanctioned recovery for the wt's own branch — allowed
+        if (!WORKTREE_LOCAL_VERBS.has(inv.verb)) {
+          // Shared-ref/remote/unknown verb: re-classify against the WORKTREE's
+          // own branch — the recovery carve-out (e.g. push origin
+          // <checked-out-branch>) derives from the wt's HEAD, not the hub's.
+          const wv = isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch);
+          if (wv === "block") {
+            return {
+              verdict: "block", exempted: false, // audit must NOT log blocked ops as exemptions (round-3)
+              reason: _mainProtectionReason(inv,
+                `Shared-ref/remote/unknown mutation from a worktree target — worktrees share`,
+                `the hub's ref namespace. Sanctioned: git push origin <the worktree's branch>.`),
+            };
+          }
+          if (wv === "recovery") sawRecovery = true;
+          continue; // readonly / sanctioned recovery for the wt's own branch — allowed
+        }
+        continue; // worktree-local verb — isolated
       }
       return {
         verdict: "block",
@@ -1442,8 +1561,15 @@ export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd
       // content that targets the hub (or a foreign/unresolvable target) blocks.
       const target = resolveInvocationTarget(inv, sessionCwd, executionCwd);
       if (target && target.isWorktree) {
-        if (!WORKTREE_SHARED_REF_VERBS.has(inv.verb)) continue;
-        if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) !== "block") continue;
+        // Main-protection (round-3): a worktree on the hub's protected branch
+        // is NOT isolated for mutations.
+        if (target.worktreeBranch === "main" || target.worktreeBranch === "master") return "block";
+        if (!WORKTREE_LOCAL_VERBS.has(inv.verb)) {
+          // shared-ref/remote/unknown verb — re-classify against the wt's branch
+          if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") return "block";
+          continue;
+        }
+        continue;
       }
       return "block";
     }

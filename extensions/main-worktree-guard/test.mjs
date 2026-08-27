@@ -746,6 +746,52 @@ try {
   m4t("T44: push of the wt's OWN branch → recovery (wt-HEAD carve-out)", `cd "${wtR}" && git push origin wt/feat`, "recovery");
   m4t("T45: bare cd → conservative (null marker)", `cd && git commit -m x`, "block");
   expectBool("T45a: bare cd pushes a null marker (mechanism pin)", allGitInvocations(`cd && git commit -m x`)[0].cdChain[0] === null, true);
+  // ── Round-3 closures (code-review re-review, all probe-verified) ──
+  m4t("T46: echo's cd arg is NOT the builtin → block", `echo cd "${wtR}" && git commit -m x`, "block");
+  m4t("T47: echo cd arg does not pollute the chain → allowed", `cd "${wtR}" && echo cd "${hubR}" && git commit -m x`, "allowed");
+  m4t("T48: push empty-source refspec (delete) → block", `cd "${wtR}" && git push origin :wt/feat`, "block");
+  m4t("T49: push --all → block (foreign branches)", `cd "${wtR}" && git push --all origin`, "block");
+  m4t("T50: push origin HEAD → recovery (resolves to wt branch)", `cd "${wtR}" && git push origin HEAD`, "recovery");
+  m4t("T51: &> redirect is not a background boundary → allowed", `cd "${wtR}" &>/dev/null && git commit -m x`, "allowed");
+  m4t("T52: GIT_INDEX_FILE redirect outside wt → block", `cd "${wtR}" && GIT_INDEX_FILE="${hubR}/.git/index" git commit -m x`, "block");
+  m4t("T53: stash mutates shared refs/stash → block", `cd "${wtR}" && git stash`, "block");
+  m4t("T54: stash list → allowed (readonly)", `cd "${wtR}" && git stash list`, "allowed");
+  m4t("T55: unknown verb (subtree push) → block (inverted allowlist)", `cd "${wtR}" && git subtree push --prefix=docs origin main`, "block");
+  m4t("T56: redirect makes VAR a prefix (not statement) → block", `VAR="${wtR}" > /dev/null git fetch; cd "$VAR" && git commit -m x`, "block");
+
+  // ── Round-3: main-protection (worktree on the hub's protected branch) ──
+  // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
+  // can take main. Separate mini-fixture: hub → hub/off, wt on main.
+  let m4MainTmp = null;
+  try {
+    m4MainTmp = realpathSync(execSync("mktemp -d", { encoding: "utf-8" }).trim());
+    const mhub = `${m4MainTmp}/hub`;
+    const mwt = `${m4MainTmp}/wt`;
+    const mwtmain = `${m4MainTmp}/wtmain`;
+    execSync(`git init -q -b main "${mhub}"`, { stdio: "ignore" });
+    execSync("git config user.email t@t && git config user.name t", { cwd: mhub, stdio: "ignore" });
+    execSync("touch a && git add . && git commit -qm init", { cwd: mhub, stdio: "ignore" });
+    execSync(`git worktree add -q "${mwt}" -b wt/feat HEAD`, { cwd: mhub, stdio: "ignore" });
+    execSync("git checkout -q -b hub/off", { cwd: mhub, stdio: "ignore" }); // hub OFF main — main is free
+    execSync(`git worktree add -q "${mwtmain}" main`, { cwd: mhub, stdio: "ignore" }); // a wt ON main
+    execSync("touch dirty.txt", { cwd: mhub, stdio: "ignore" });
+    const m4m = (name, cmd, exp) => {
+      const got = evaluateHubGateWithTargets(cmd, "hub/off", mhub).verdict;
+      const ok = got === exp;
+      console.log(`${ok ? "✅" : "❌"} M4M ${name}: ${got}${ok ? "" : ` (expected ${exp})`}`);
+      ok ? pass++ : fail++;
+    };
+    m4m("M1: wt ON main → commit blocked (main-protection)", `cd "${mwtmain}" && git commit -m x`, "block");
+    m4m("M2: wt checkout main while hub off-main → blocked", `cd "${mwt}" && git checkout main`, "block");
+    m4m("M3: wt on feature branch → commit allowed", `cd "${mwt}" && git commit -m x`, "allowed");
+  } catch (e) {
+    console.error(`❌ main-protection fixtures FAILED: ${String(e.message).slice(0, 120)}`);
+    fail++;
+  } finally {
+    if (m4MainTmp) {
+      try { execSync(`rm -rf "${m4MainTmp}"`, { stdio: "ignore" }); } catch {}
+    }
+  }
 
   // ── Shape regression (allGitInvocations extended shape) — content-pinned ──
   const shapeInv = allGitInvocations(`cd "${wtR}" && git -C "${hubR}" reset --hard`);

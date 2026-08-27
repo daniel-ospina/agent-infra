@@ -460,11 +460,17 @@ sides).
    CLEAN hub, `cd <wt> && git commit && git -C <hub> reset --hard` can still slip
    past the legacy destructive gate. M4's per-invocation resolution blocks it in
    the disordered case. Follow-up: per-invocation resolution in the #265 path.
-2. **Worktree-targeted push of a foreign branch (pre-existing #265 gap):**
-   worktree-targeted push is exempt as a worktree target, but push mutates the
-   shared ref store. Matches today's worktree-session behavior; out of scope.
-3. **`$VAR` resolution is same-segment-only**: env-provided vars are
-   unresolvable → conservative block. Follow-up: consult `process.env`.
+2. **Shared-ref mutations from a worktree target are gated (code-review
+   round-2 narrowing):** worktrees share the hub's ref namespace — `push -f` /
+   foreign/delete, `tag`, `branch -D`, `update-ref`, `symbolic-ref`, `remote`,
+   object-store ops from a worktree target re-classify against the worktree's
+   own branch; only `git push origin <the wt's checked-out branch>` is the
+   carve-out (T39-T44). Worktree-LOCAL verbs stay exempt.
+3. **`$VAR` expansion is bash-faithful (round-2 correction):** same-segment
+   `VAR=x cd "$VAR"` expands pre-assignment → unresolvable → conservative
+   block (T3 corrected); boundary-separated `VAR=x && cd "$VAR"` persists as
+   real shell state (T3b). Env-provided vars are unresolvable → conservative
+   block. Follow-up: consult `process.env` for shell-exported vars.
 4. **GIT_DIR-from-hub-cwd worktree targeting (T20) is conservatively blocked**
    (cycle-4 P2 rationale corrected): git resolves the gitfile to the wt's admin
    dir and operates on the WT (branch + working tree) — the block is the
