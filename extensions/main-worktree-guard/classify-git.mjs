@@ -305,7 +305,11 @@ function _worktreeGitdirMap(sessionCwd) {
         } catch {
           continue; // no .git back-reference → not a git worktree → reject
         }
-        if (!backRef.includes(adminKey)) continue; // crafted/stale → reject
+        // Round-5 (second-model P2): EXACT back-reference — parse the gitdir
+        // line and compare equality (a substring match let a crafted `wt-evil`
+        // gitfile pass for admin dir `wt`).
+        const gm = backRef.match(/gitdir:\s*(.+)/);
+        if (!gm || _realpathSafe(resolve(gm[1].trim())) !== adminKey) continue; // crafted/stale → reject
         map.set(adminKey, wtPath);
       } catch {
         // per-entry skip — never abort the whole map for one stale dir
@@ -627,7 +631,11 @@ function _walkShell(command, h = {}) {
       while (j < tokens.length) {
         const n = tokens[j];
         if (n === "-c" || n === "--command") {
-          const inline = tokens[j + 1];
+          // Round-5 (security F3): skip flags AFTER -c too — `bash -c -x 'git
+          // reset'` takes the first NON-flag token as the command string.
+          let m = j + 1;
+          while (m < tokens.length && tokens[m].startsWith("-")) m++;
+          const inline = tokens[m];
           if (inline !== undefined && !_isShellBoundary(inline)) {
             // Recursively walk the inline command (its cds resolve from the
             // CURRENT chain) and forward its git invocations.
@@ -641,7 +649,7 @@ function _walkShell(command, h = {}) {
               });
             }
             sawInline = true;
-            i = j + 2;
+            i = m + 1;
           }
           break;
         }
@@ -719,8 +727,21 @@ function _walkShell(command, h = {}) {
     // NOT pollute the verb's arg list. The NEXT `git` token still starts a new
     // invocation (every invocation is gated, so a destructive op in ANY segment
     // still blocks).
-    while (i < tokens.length && tokens[i] !== "git" && !_isShellBoundary(tokens[i])) {
-      args.push(tokens[i]);
+    while (i < tokens.length && tokens[i] !== "git") {
+      const g = tokens[i];
+      if (_isShellBoundary(g)) {
+        // Round-5 (security P2): redirects (+ operands) do NOT terminate a
+        // simple command's args — only `; & | && || ( )` do (`git push > /tmp/l
+        // origin main:main` must keep its refspec args; truncating them would
+        // classify as a bare push of the current branch).
+        if (g === ">" || g === ">>" || g === "<" || g === "<<" || g === "&>" || g === ">&" || g === "&>>" || /^(?:[0-9]+)?[<>]/.test(g) || /^[0-9]+>&[0-9]*-?$/.test(g)) {
+          const fdSingle = /^[0-9]+>&[0-9]*-?$/.test(g); // 2>&1 — no separate operand
+          i += fdSingle ? 1 : 2;
+          continue;
+        }
+        break; // real command boundary
+      }
+      args.push(g);
       i++;
     }
     h.onGitEnd?.({
@@ -776,7 +797,21 @@ export function classifyGitCommandDetailed(command) {
     pushDst: null, pushTargets: [], isPushDelete: false,
     renameFrom: null, renameTo: null, syncSource: null,
   };
-  if (invocations.length === 0) return { ...out, verdict: "allow-non-git" };
+  if (invocations.length === 0) {
+    // Round-5 (security F1): the raw destructive-pattern pass must run BEFORE
+    // the zero-invocation early return — `eval "git reset --hard"` /
+    // `echo "$(git pull …)"` / backticks collapse to ONE opaque token, so
+    // allGitInvocations finds nothing, but the RAW text still matches the
+    // legacy patterns (`git reset --hard` inside the string). The old early
+    // return made these a full M4/M2/legacy bypass (probe-verified).
+    const raw0 = String(command ?? "").trim();
+    for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
+      if (re.test(raw0)) {
+        return { ...out, verdict: `block:${name}` };
+      }
+    }
+    return { ...out, verdict: "allow-non-git" };
+  }
 
   // ── verb-anchored legacy destructive patterns ──
   // Run on the RAW command (compound chains: `git pull && git merge`), and if
@@ -1412,6 +1447,23 @@ function _mainProtectionReason(inv, note) {
  */
 export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd()) {
   const invocations = allGitInvocations(command);
+  // Round-5 (second-model P1): eval / $( ) / backtick command substitution is
+  // an UNVERIFIABLE one-token shell construct — the substituted content runs
+  // ungated by the invocation walk. Fail closed BEFORE the zero-invocation
+  // return: any command containing a substitution AND a git token is blocked
+  // while the hub is disordered (conservative — never a false exemption).
+  if (invocations.length === 0 && /\$\(|`|\beval\s+/.test(command) && /\bgit\b/.test(command)) {
+    return {
+      verdict: "block",
+      reason: [
+        `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+        `   Blocked: command substitution / eval with git content — the substituted`,
+        `   invocation cannot be verified per-invocation (fail-closed).`,
+        `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
+        `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+      ].join("\n"),
+    };
+  }
   if (invocations.length === 0) return { verdict: "non-git" };
   let sawRecovery = false;
   let exempted = false;
@@ -1443,6 +1495,21 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
       if (target && target.isWorktree) {
         exempted = true;
+        // Round-5 (second-model P1): `pull` is worktree-LOCAL but accepts a
+        // fetch-style refspec whose dst can be the protected branch — the dst
+        // guard must run BEFORE the local-verb exemption (`cd <wt> && git pull
+        // origin +main:refs/heads/main` rewrote main — probe). Same for fetch.
+        if (inv.verb === "pull" || inv.verb === "fetch") {
+          for (const x of inv.args || []) {
+            if (x.includes(":") && (_refspecDst(x) === "main" || _refspecDst(x) === "master")) {
+              return {
+                verdict: "block", exempted: false,
+                reason: _mainProtectionReason(inv,
+                  `pull/fetch refspec dst writes the hub's protected branch — not isolated.`),
+              };
+            }
+          }
+        }
         // Main-protection (round-3 P1): a worktree on the hub's protected branch
         // is NOT isolated for mutations (commits/pushes move the shared main ref).
         if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
@@ -1509,6 +1576,24 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         ].join("\n"),
       };
     }
+    if (v === "recovery" && inv.verb === "push") {
+      // Round-5 (security F3-adjacent): the push carve-out derives from the
+      // HUB's branch — `cd <wt> && git push origin main:main` gets "recovery"
+      // at first pass (dst matches the hub branch) and never re-classifies
+      // against the WORKTREE's branch. Re-validate recovery pushes whose target
+      // is a worktree against the wt's own branch.
+      const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
+      if (target && target.isWorktree &&
+          isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") {
+        return {
+          verdict: "block", exempted: false,
+          reason: _mainProtectionReason(inv,
+            `push from a worktree target of a branch other than the worktree's own — not isolated.`),
+        };
+      }
+      sawRecovery = true;
+      continue;
+    }
     if (v === "recovery") sawRecovery = true;
     // Round-4 (security P2): `git symbolic-ref <non-HEAD>` from a worktree
     // rewrites a SHARED ref (refs/remotes/origin/HEAD probe) — the readonly
@@ -1522,6 +1607,19 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
             `symbolic-ref from a worktree target rewrites a shared ref — not isolated.`),
         };
       }
+    }
+    // Round-5 (second-model P1): eval / $( ) / backtick command substitution is
+    // an UNVERIFIABLE one-token shell construct — the substituted content runs
+    // ungated by the invocation walk. Fail closed: any command containing a
+    // substitution AND a git token is blocked while the hub is disordered
+    // (conservative — never a false exemption).
+    if (/\$\(|`|\beval\s+/.test(command) && /\bgit\b/.test(command)) {
+      return {
+        verdict: "block",
+        reason: _mainProtectionReason(inv,
+          `Command substitution / eval present — the substituted git content cannot be`,
+          `verified per-invocation; blocked while the hub is disordered (fail-closed).`),
+      };
     }
   }
   return { verdict: sawRecovery ? "recovery" : "allowed", exempted };
@@ -1688,6 +1786,13 @@ export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd
       // content that targets the hub (or a foreign/unresolvable target) blocks.
       const target = resolveInvocationTarget(inv, sessionCwd, executionCwd);
       if (target && target.isWorktree) {
+        // Round-5 (second-model P1): pull refspec dst guard BEFORE the local-verb
+        // exemption (mirror of the bash-gate hoist).
+        if (inv.verb === "pull" || inv.verb === "fetch") {
+          for (const x of inv.args || []) {
+            if (x.includes(":") && (_refspecDst(x) === "main" || _refspecDst(x) === "master")) return "block";
+          }
+        }
         // Main-protection (round-3): a worktree on the hub's protected branch
         // is NOT isolated for mutations.
         if (target.worktreeBranch === "main" || target.worktreeBranch === "master") return "block";

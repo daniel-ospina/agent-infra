@@ -768,6 +768,13 @@ try {
   m4t("T62: unset deletes vars → block", `WT="${wtR}"; unset WT; cd "$WT" && git commit -m x`, "block");
   m4t("T63: redirect-led cd (real builtin) → allowed", `> /dev/null cd "${wtR}" && git commit -m x`, "allowed");
   m4t("T64: symbolic-ref non-HEAD from wt → block (shared ref)", `cd "${wtR}" && git symbolic-ref refs/remotes/origin/HEAD refs/heads/x`, "block");
+  // ── Round-5 closures (final gate re-review, all probe-verified) ──
+  m4t("T65: bash -c -x inline (flag after -c) → block", `bash -c -x "git commit -m x"`, "block");
+  m4t("T66: eval git content → block (fail-closed substitution)", `eval "git reset --hard"`, "block");
+  m4t("T67: \$( ) command substitution with git → block", `echo "\$(git pull origin +main:main)"`, "block");
+  m4t("T68: pull refspec dst main from wt → block (round-5 P1)", `cd "${wtR}" && git pull origin +main:refs/heads/main`, "block");
+  m4t("T69: push origin main:main from wt → block (wt-branch re-validation)", `cd "${wtR}" && git push origin main:main`, "block");
+  m4t("T70: push wt own branch with redirect → recovery (args preserved)", `cd "${wtR}" && git push > /tmp/m4-push.log origin wt/feat`, "recovery");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
