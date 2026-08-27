@@ -1522,7 +1522,8 @@ const WORKTREE_LOCAL_VERBS = new Set([
   "merge", "rebase", "cherry-pick", "revert", "clean", "apply", "am", "pull",
 ]);
 
-function _mainProtectionReason(inv, note) {
+function _mainProtectionReason(inv, ...notes) {
+  const note = notes.join(" "); // round-21 (P2): variadic — 7 call sites pass TWO literals
   return [
     `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
     `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
@@ -1715,7 +1716,13 @@ function _unverifiableGitContent(command) {
 function _worktreeCheckoutBlock(inv, target, currentBranch) {
   const args = inv.args || [];
   const pos = args.filter((x) => !x.startsWith("-"));
-  if (args.some((x) => x === "-B" || x === "-C" || x === "--force-create") && pos.length >= 1) {
+  // Round-21 (final gate P1): attached short-option args (`-Cmain` ≡ `-C
+  // main`, `-Bfeat/x` ≡ `-B feat/x`) and bare/dash forms (`checkout -B -`)
+  // evaded the exact-match + pos-length check — probe: `switch -Cmain` moved
+  // refs/heads/main. Block on the MERE PRESENCE of a force-create flag (a
+  // bare `-B`/`-C` is malformed anyway — blocking is harmless).
+  const hasForceMove = args.some((x) => x === "-B" || x === "-C" || x === "--force-create" || /^-[BC][^-]/.test(x));
+  if (hasForceMove) {
     return _mainProtectionReason(inv,
       `force-create checkout/switch moves a SHARED branch ref (≡ git branch -f) — not worktree-local.`);
   }

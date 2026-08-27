@@ -828,6 +828,8 @@ try {
   m4t("T114: switch -C non-main from wt → block", `cd "${wtR}" && git switch -C feat/other`, "block");
   m4t("T115: flag-with-operand before -c inline → block", `bash --rcfile /tmp/decoy.sh -c "git commit -m x"`, "block");
   m4t("T116: checkout -b (create) → allowed", `cd "${wtR}" && git checkout -b feat/new`, "allowed");
+  m4t("T117: attached -Cmain → block (round-21)", `cd "${wtR}" && git switch -Cmain`, "block");
+  m4t("T118: attached -Bmain → block (round-21)", `cd "${wtR}" && git checkout -Bmain`, "block");
   // T112 (flag-with-operand) is a BACKDOOR-path closure — the pure gate sees no
   // invocation; the production block is extractScriptPath → scriptGitVerdict.
   expectBool("T112: flag-with-operand then script → script path + content gated (round-19)", (() => {
