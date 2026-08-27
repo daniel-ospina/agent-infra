@@ -823,6 +823,11 @@ try {
   m4t("T109: digit-less fd-dup before -c inline → block (round-17)", `bash <&0 -c "git reset --hard"`, "block");
   m4t("T110: stdin-redirect before -c inline → block (round-18)", `bash < /dev/null -c "git commit -m x"`, "block");
   m4t("T111: process substitution with git → block (round-19)", `bash <(echo "git commit -m x")`, "block");
+  // Round-20 closures (second-model P1s — force-create = branch -f; script surface)
+  m4t("T113: checkout -B non-main from wt → block", `cd "${wtR}" && git checkout -B feat/other`, "block");
+  m4t("T114: switch -C non-main from wt → block", `cd "${wtR}" && git switch -C feat/other`, "block");
+  m4t("T115: flag-with-operand before -c inline → block", `bash --rcfile /tmp/decoy.sh -c "git commit -m x"`, "block");
+  m4t("T116: checkout -b (create) → allowed", `cd "${wtR}" && git checkout -b feat/new`, "allowed");
   // T112 (flag-with-operand) is a BACKDOOR-path closure — the pure gate sees no
   // invocation; the production block is extractScriptPath → scriptGitVerdict.
   expectBool("T112: flag-with-operand then script → script path + content gated (round-19)", (() => {
@@ -937,12 +942,30 @@ try {
   const sWordHash = mkS("word-hash.sh", `echo a#b && git reset --hard\n`);
   expectBool("B33: script a#b (word-start comment rule) + reset → block (round-8)", scriptGitVerdict(sWordHash, "main", hubR, hubR) === "block", true);
   expectBool("B34: extractScriptPath stdin-redirect → the script path (round-14)", extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B41: script checkout/switch main-protection (round-20)", (() => {
+    const mk = (c) => { const p = `${m4Tmp}/s${Date.now()}${Math.random().toString(36).slice(2)}.sh`; writeFileSync(p, c); return p; };
+    return scriptGitVerdict(mk("git checkout main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -B main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git switch -C main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -B feat/other\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -b feat/new\n"), "hub/off", wtR, hubR) === "allow" &&
+      scriptGitVerdict(mk("git commit -m x\n"), "hub/off", wtR, hubR) === "allow";
+  })(), true);
   expectBool("B35: stdin-redirect script content gated → block", (() => { const p = mkS("stdin.sh", `git reset --hard\n`); return extractScriptPath(`bash < ${p}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "block"; })(), true);
   expectBool("B36: fd-redirect before stdin-redirect → the stdin path (round-15)", extractScriptPath(`bash 2>&1 < /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash 2>/dev/null < /tmp/evil.sh`) === "/tmp/evil.sh", true);
   expectBool("B37: fd-INPUT dup before the script path → the script path (round-16)", extractScriptPath(`bash 2<&1 /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash 2<&- /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`sh 0<&1 /tmp/evil.sh`) === "/tmp/evil.sh", true);
   expectBool("B38: digit-less fd-dup / stdin+arg / spawner-prefix → the script path (round-17)", extractScriptPath(`bash <&0 /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash <&- /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /dev/null /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`exec bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`env bash /tmp/evil.sh`) === "/tmp/evil.sh", true);
   expectBool("B39: spawner-flag → the interpreter's script path (round-18)", extractScriptPath(`env -i bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`sudo -u root bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`timeout 5 bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /dev/null -c "git commit"`) === null, true);
   expectBool("B40: flag-with-operand + stdin-flag → the script path (round-19)", extractScriptPath(`bash < /dev/null -x /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash --rcfile /tmp/decoy.sh /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash -O extglob /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B41: script checkout/switch main-protection (round-20)", (() => {
+    const mk = (c) => { const p = `${m4Tmp}/s${Date.now()}${Math.random().toString(36).slice(2)}.sh`; writeFileSync(p, c); return p; };
+    return scriptGitVerdict(mk("git checkout main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -B main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git switch -C main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -B feat/other\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -b feat/new\n"), "hub/off", wtR, hubR) === "allow" &&
+      scriptGitVerdict(mk("git commit -m x\n"), "hub/off", wtR, hubR) === "allow";
+  })(), true);
   expectBool("B12b: end-to-end subshell script at wt cwd → allow", (() => {
     const p = mkS("mutation.sh", `git reset --hard\n`);
     const execCwd = commandExecutionCwd(`(cd "${wtR}" && bash ./mutation.sh)`, hubR);

@@ -675,8 +675,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
           j += 2;
           continue;
         }
-        if (n === "-c" || n === "--command") {
-          // Round-5 (security F3): skip flags AFTER -c too — `bash -c -x 'git
+        if (n === "-c" || n === "--command") {          // Round-5 (security F3): skip flags AFTER -c too — `bash -c -x 'git
           // reset'` takes the first NON-flag token as the command string.
           let m = j + 1;
           while (m < tokens.length && tokens[m].startsWith("-")) m++;
@@ -699,7 +698,11 @@ function _walkShell(command, h = {}, seedVars = {}) {
           break;
         }
         if (!n.startsWith("-")) break; // first non-flag = the script path
+        // Round-20 (security P1): skip flag OPERANDS for operand-taking flags
+        // (`bash --rcfile decoy -c 'git commit'` broke at `decoy` and never
+        // walked the inline — probe committed to the hub).
         j++;
+        if (n === "--rcfile" || n === "--init-file" || n === "-O" || n === "-o") j++;
       }
       if (!sawInline) {
         // first non-flag token = script path (skip ALL flags)
@@ -1702,6 +1705,34 @@ function _unverifiableGitContent(command) {
   return false;
 }
 
+/** Round-20 (second-model P1): checkout/switch force-create and main-protection
+ * shared by the bash gate AND scriptGitVerdict (the script surface previously
+ * lacked these — `cd <wt> && bash evil.sh` with `git checkout -B main` content
+ * force-moved the protected branch while the hub was disordered; probe).
+ * force-create (-B/-C/--force-create) with a positional target is `git branch
+ * -f` in disguise — a SHARED-ref move, not worktree-local (`branch -f` and
+ * `update-ref` are already blocked). Returns a block reason or null. */
+function _worktreeCheckoutBlock(inv, target, currentBranch) {
+  const args = inv.args || [];
+  const pos = args.filter((x) => !x.startsWith("-"));
+  if (args.some((x) => x === "-B" || x === "-C" || x === "--force-create") && pos.length >= 1) {
+    return _mainProtectionReason(inv,
+      `force-create checkout/switch moves a SHARED branch ref (≡ git branch -f) — not worktree-local.`);
+  }
+  if (pos.length >= 1 && (pos[0] === "main" || pos[0] === "master") &&
+      currentBranch !== "main" && currentBranch !== "master") {
+    return _mainProtectionReason(inv,
+      `checkout/switch of the hub's protected branch "${pos[0]}" from a worktree while the hub`,
+      `is off-main — the wt would take it and its commits/pushes would mutate it.`);
+  }
+  if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
+    return _mainProtectionReason(inv,
+      `The worktree is checked out on the hub's protected branch "${target.worktreeBranch}" —`,
+      `its mutations would advance the shared main ref.`);
+  }
+  return null;
+}
+
 /** #347 — evaluateHubGate with PER-INVOCATION target resolution. Classify
  * first (recovery/readonly → zero resolution cost — sanctioned regardless of
  * target); on a `block` verdict, resolve the invocation's effective target and
@@ -1796,6 +1827,15 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
               };
             }
           }
+        }
+        // Round-20 (second-model P1): shared checkout/switch guard — force-create
+        // (-B/-C/--force-create) moves a SHARED ref (≡ branch -f) and the
+        // main-protection (wt-on-main, checkout-main-while-off-main) now also
+        // applies to NON-main force-create targets (`checkout -B feat/other`
+        // moved refs/heads/feat/other — probe) and to the SCRIPT surface.
+        if (inv.verb === "checkout" || inv.verb === "switch") {
+          const cb = _worktreeCheckoutBlock(inv, target, currentBranch);
+          if (cb) return { verdict: "block", exempted: false, reason: cb };
         }
         // Main-protection (round-3 P1): a worktree on the hub's protected branch
         // is NOT isolated for mutations (commits/pushes move the shared main ref).
@@ -2078,8 +2118,15 @@ export function extractScriptPath(command) {
       }
       if (_isShellBoundary(n)) break;
       if (n.startsWith("-")) {
-        if (n === "-c" || n === "--command") sawInline = true;
+        // Round-20 (security P1): skip flag OPERANDS for operand-taking flags
+        // (`bash --rcfile decoy -c 'git commit'` broke at `decoy` and never
+        // walked the inline — probe committed to the hub). -c/--command handled
+        // above; --rcfile/--init-file/-O/-o take an operand; simple flags (-x,
+        // -e, -i) don't — conservatively skip the next token for all but known
+        // operand-less flags.
+        if (n === "-c" || n === "--command") { sawInline = true; j++; continue; }
         j++;
+        if (n === "--rcfile" || n === "--init-file" || n === "-O" || n === "-o") j++;
         continue;
       }
       lastPositional = n;
@@ -2126,7 +2173,15 @@ export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd
   for (const inv of invocations) {
     if (!inv.verb) continue;
     if (inv.verb === "__unverifiable__") return "block"; // round-12: multiword $VAR command
-    if (isHubRecoveryInvocation(inv.verb, inv.args, currentBranch) === "block") {
+    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch);
+    // Round-20 (second-model P1): the script surface lacked the bash gate's
+    // recovery-checkout main-protection — `cd <wt> && bash evil.sh` with
+    // `git checkout main` content (hub off-main) takes the protected branch.
+    if (v === "recovery" && (inv.verb === "checkout" || inv.verb === "switch")) {
+      const target = resolveInvocationTarget(inv, sessionCwd, executionCwd);
+      if (target && target.isWorktree && _worktreeCheckoutBlock(inv, target, currentBranch)) return "block";
+    }
+    if (v === "block") {
       // #347: per-invocation target exemption — the worktree map comes from the
       // SESSION repo (the guard's hub; explicit param for testability),
       // executionCwd is the script's cd-chain base. Worktree-targeted content
@@ -2141,6 +2196,13 @@ export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd
           for (const x of inv.args || []) {
             if (x.includes(":") && (_refspecDst(x) === "main" || _refspecDst(x) === "master")) return "block";
           }
+        }
+        // Round-20 (second-model P1): shared checkout/switch guard — the script
+        // surface previously had NO main-protection (`cd <wt> && bash evil.sh`
+        // with `git checkout -B main` content force-moved the protected branch;
+        // probe). Mirrors the bash gate via the shared helper.
+        if (inv.verb === "checkout" || inv.verb === "switch") {
+          if (_worktreeCheckoutBlock(inv, target, currentBranch)) return "block";
         }
         // Main-protection (round-3): a worktree on the hub's protected branch
         // is NOT isolated for mutations.
