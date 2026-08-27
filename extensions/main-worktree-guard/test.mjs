@@ -1043,9 +1043,20 @@ try {
   expectWriteTargets("append redirect → scratch", `echo x >> foo.tmp`, [{ resolvedPath: "/repo/foo.tmp", via: "redirect" }]);
   expectWriteTargets("tee -a → scratch", `echo hi | tee -a foo.bak`, [{ resolvedPath: "/repo/foo.bak", via: "tee" }]);
   expectWriteTargets("python open w → migrations", `python3 -c "open('migrations/001.sql','w').write('x')"`, [{ resolvedPath: "/repo/migrations/001.sql", via: "python" }]);
+  expectWriteTargets("python open escaped-double-quote (round-2 closure)", `python3 -c "open(\\"docs/plans/x.md\\",\\"w\\").write(1)"`, [{ resolvedPath: "/repo/docs/plans/x.md", via: "python" }]);
   expectWriteTargets("absolute hub path preserved", `cat > /repo/docs/plans/x.md`, [{ resolvedPath: "/repo/docs/plans/x.md", via: "redirect" }]);
+  // Round-2 closures: quote-aware redirect scan + the >&/>|/1> operator family.
+  expectWriteTargets("quoted > is NOT a redirect (read-only)", `grep ">" docs/plans/x.md`, []);
+  expectWriteTargets("quoted >> is NOT a redirect (read-only)", `echo ">>" migrations/001.sql`, []);
+  expectWriteTargets(">& form → redirect", `cat >& docs/plans/x.md`, [{ resolvedPath: "/repo/docs/plans/x.md", via: "redirect" }]);
+  expectWriteTargets(">| form → redirect (noclobber)", `cat >| docs/plans/x.md`, [{ resolvedPath: "/repo/docs/plans/x.md", via: "redirect" }]);
+  expectWriteTargets("&>> form → redirect", `cat x &>> foo.tmp`, [{ resolvedPath: "/repo/foo.tmp", via: "redirect" }]);
+  expectWriteTargets("1> form → redirect", `cat x 1> foo.tmp`, [{ resolvedPath: "/repo/foo.tmp", via: "redirect" }]);
+  expectWriteTargets("quoted operand with spaces → redirect", `cat > "/repo/docs/plans/my file.md"`, [{ resolvedPath: "/repo/docs/plans/my file.md", via: "redirect" }]);
   expectWriteTargets("input redirect → no write", `wc -l < docs/plans/x.md`, []);
   expectWriteTargets("stderr redirect → no content write", `cat x 2> foo.tmp`, []);
+  expectWriteTargets("fd-dup 2>&1 → no write", `cat x 2>&1 docs/plans/x.md`, []);
+  expectWriteTargets(">& fd operand → no write (fd-dup)", `cat >& 2 foo.tmp`, []);
   expectWriteTargets("/dev/null → skipped", `git diff > /dev/null`, []);
   expectWriteTargets("no write target", `ls -la`, []);
   expectWriteTargets("read-only python open → no write", `python3 -c "open('docs/plans/x.md').read()"`, []);
@@ -1077,7 +1088,7 @@ try {
 } catch (e) {
   // A security-gate regression suite must FAIL, not silently skip, when its
   // fixtures can't be provisioned (test-review P1).
-  console.error(`❌ #347 m4t cases FAILED to provision: ${String(e.message).slice(0, 160)}`);
+  console.error(`❌ guard test-suite cases FAILED to provision: ${String(e.message).slice(0, 160)}`);
   fail++;
   if (!m4Provisioned) console.error("   → the worktree-target exemption (T/B/W/D) assertions were NOT run — suite must fail.");
 } finally {

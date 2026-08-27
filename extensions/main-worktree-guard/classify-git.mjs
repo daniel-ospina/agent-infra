@@ -2055,10 +2055,13 @@ export function matchHubWipPattern(resolvedPath) {
  * Extract NON-GIT write targets from a bash command (#350 Indicators: heredoc /
  * tee / python open() writes bypass the write/edit tool gate). Heuristic and
  * NEVER blocking — the caller warns only:
- *   - `>` / `>>` / `&>` / `&>>` (and `1>`/`1>>`) stdout redirects → the target
- *     (fd-2 stderr redirects `2>` are not content writes; `/dev/null` skipped)
+ *   - redirect operators OUTSIDE quotes (`>`, `>>`, `>&`, `>|`, `&>`, `&>>`,
+ *     `0>`/`1>`) → the target (stderr `2>` and fd-dup/close `2>&1`/`>&-` are
+ *     NOT content writes; `/dev/null` skipped; quoted `>` in read-only commands
+ *     like `grep ">" x.md` is NOT a redirect — quote-aware scan)
  *   - `tee <path>` → the tee target (first non-flag positional)
- *   - python `open("<path>", "w"|"a"…)` → the path
+ *   - python `open("<path>", "w"|"a"…)` → the path (incl. backslash-escaped
+ *     quotes: `python3 -c "open(\"x.md\",\"w\")"`)
  * Targets resolve against `cwd` (the session cwd — a heuristic: cd-prefixed
  * writes are false-negatives, acceptable for a warning-only heuristic; a
  * warning is cheap, a missed one is not an incident).
@@ -2068,7 +2071,6 @@ export function matchHubWipPattern(resolvedPath) {
  */
 export function extractBashWriteTargets(command, cwd = process.cwd()) {
   const out = [];
-  const tokens = _tokenize(command);
   const seen = new Set();
   const push = (raw, via) => {
     const t = _stripQuotes(String(raw ?? "").trim());
@@ -2078,15 +2080,53 @@ export function extractBashWriteTargets(command, cwd = process.cwd()) {
     seen.add(resolved);
     out.push({ resolvedPath: resolved, via });
   };
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
-    if (t === ">" || t === ">>" || t === "&>" || t === "&>>" || /^1>>?$/.test(t)) {
-      if (i + 1 < tokens.length && !_isShellBoundary(tokens[i + 1])) {
-        push(tokens[i + 1], "redirect");
-        i++;
+  // Quote-aware redirect scan over the RAW command (the shared _tokenize
+  // strips quotes, so a quoted `>` in a read-only command would tokenize as a
+  // bare `>` and false-positive as a redirect — round-1 closure). fd-dup/close
+  // forms (`2>&1`, `1>&2`, `>&-`) have a digit/dash operand → skipped.
+  const s = String(command);
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "'") { const close = s.indexOf("'", i + 1); i = close === -1 ? s.length : close + 1; continue; }
+    if (ch === '"') { const close = s.indexOf('"', i + 1); i = close === -1 ? s.length : close + 1; continue; }
+    let fd = "";
+    let j = i;
+    while (j < s.length && /[0-9]/.test(s[j])) { fd += s[j]; j++; }
+    if (j < s.length && s[j] === ">") {
+      let k = j + 1;
+      let op = ">";
+      if (k < s.length && (s[k] === ">" || s[k] === "|" || s[k] === "&")) { op += s[k]; k++; }
+      let p = k;
+      while (p < s.length && /\s/.test(s[p])) p++;
+      let operand = "";
+      while (p < s.length && !/\s/.test(s[p])) {
+        const c = s[p];
+        if (c === "'" || c === '"') {
+          const q = c;
+          p++;
+          while (p < s.length && s[p] !== q) operand += s[p++];
+          if (p < s.length) p++;
+          continue;
+        }
+        if (";&|()".includes(c)) break;
+        operand += c;
+        p++;
       }
+      // `>& <fd>` / `>&-` are fd-dup/close, not file writes; stderr `2>` is
+      // not content. Content fds: bare/0/1.
+      const isDup = op.includes("&") && /^-?[0-9]*$/.test(operand);
+      const isContentFd = fd === "" || fd === "0" || fd === "1";
+      if (!isDup && isContentFd) push(operand, "redirect");
+      i = p > k ? p : k;
       continue;
     }
+    i++;
+  }
+  // tee: first non-flag positional (tokenized — no quotes issue for flags)
+  const tokens = _tokenize(command);
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
     if (t === "tee") {
       for (let j = i + 1; j < tokens.length; j++) {
         const n = tokens[j];
@@ -2099,7 +2139,10 @@ export function extractBashWriteTargets(command, cwd = process.cwd()) {
       continue;
     }
   }
-  const pyRe = /open\s*\(\s*["']([^"']+)["']\s*,\s*["'][wa][^"']*["']/g;
+  // python open() writes — regex over the raw command; tolerate backslash-
+  // escaped quotes (`open(\"x\",\"w\")` inside a double-quoted shell string).
+  // Lazy path capture so the closing escaped-quote backslash is not eaten.
+  const pyRe = /open\s*\(\s*\\*["']([^"']+?)\\*["']\s*,\s*\\*["'][wa][^"']*["']/g;
   let m;
   while ((m = pyRe.exec(String(command))) !== null) push(m[1], "python");
   return out;

@@ -244,31 +244,63 @@ function _hubState(): { disorder: string | null; branch: string | null } {
 // block: the write/edit block for main-checkout edits is unchanged; these are
 // discipline prompts surfacing the violation at write time.
 const HUB_HYGIENE_THROTTLE_MS = 5 * 60 * 1000; // periodic scan: at most once per 5 min
+const MAIN_TOP_RETRY_MS = 30 * 1000;          // failed cache resolution: retry after 30s (never per-command)
 const WIP_PATTERN_LABEL: Record<string, string> = {
   "docs/plans": "a plan doc in docs/plans/",
   migrations: "a migration in migrations/",
   scratch: "a scratch/backup file (.tmp/.bak/.scratch/~)",
 };
 let cachedMainTopLevel: string | null | undefined; // undefined = not yet resolved
+let lastMainTopAttemptMs = 0;
 let lastHubHygieneMs = 0;
-const warnedWipPatterns = new Set<string>(); // tool-call warnings: once per pattern per session
+const warnedWipTargets = new Set<string>(); // tool-call warnings: once per (pattern,path) per session
 const warnedWipPaths = new Set<string>();    // inventory warnings: once per path per session
 
 // The MAIN checkout's toplevel (git worktree list first entry = the primary
-// worktree, per git docs — works from a hub session AND a worktree session).
-// One git call at first use; refreshed by the throttled hygiene check
-// (worktree topology is stable within a session). Never on the bash hot path.
+// worktree — empirically stable on git 2.50.1, though not formally guaranteed
+// by git docs). Works from a hub session AND a worktree session. One git call
+// at first use (warmed at session_start); a FAILED resolution is NOT cached
+// terminally — it is retried after MAIN_TOP_RETRY_MS so a transient failure
+// cannot disable the surfaces for the whole session. Never on the bash hot
+// path: retries are bounded by the negative TTL.
 function _cachedMainTopLevel(force = false): string | null {
-  if (cachedMainTopLevel !== undefined && !force) return cachedMainTopLevel;
+  const now = Date.now();
+  if (!force && cachedMainTopLevel !== undefined) return cachedMainTopLevel;
+  if (!force && lastMainTopAttemptMs !== 0 && now - lastMainTopAttemptMs < MAIN_TOP_RETRY_MS) {
+    return cachedMainTopLevel ?? null; // negative-TTL: skip retry within the window
+  }
+  lastMainTopAttemptMs = now;
   try {
     const first = execSync("git worktree list --porcelain", {
       encoding: "utf-8", timeout: 5000,
     }).split("\n")[0] ?? "";
-    cachedMainTopLevel = first ? resolve(first.replace(/^worktree\s+/, "").trim()) : null;
+    // realpath-normalize (mirrors the #347 hub-equality doctrine — symlink
+    // spellings of the hub must not diverge from the write-target side).
+    cachedMainTopLevel = first ? realpathSync(resolve(first.replace(/^worktree\s+/, "").trim())) : null;
   } catch {
     cachedMainTopLevel = null;
   }
   return cachedMainTopLevel;
+}
+
+// Realpath the nearest EXISTING ancestor of a (possibly not-yet-created)
+// target path, re-appending the missing tail — the realpath twin of
+// resolveTargetTopLevel's walk-up, so hub-equality compares realpath-normalized
+// paths on both sides (symlinked hub spellings converge).
+function _realpathNearest(p: string): string {
+  try {
+    let d = p;
+    let tail = "";
+    while (!existsSync(d)) {
+      const parent = dirname(d);
+      if (parent === d) break;
+      tail = d.slice(parent.length) + tail;
+      d = parent;
+    }
+    return realpathSync(d) + tail;
+  } catch {
+    return p;
+  }
 }
 
 function _truncatePath(p: string, max = 52): string {
@@ -276,7 +308,8 @@ function _truncatePath(p: string, max = 52): string {
   return s.length <= max ? s : "…" + s.slice(-(max - 1));
 }
 
-// Shared box-drawn banner (matches the existing hub-discipline style).
+// Shared box-drawn banner (matches the existing hub-discipline style; every
+// content line stays within the 62-char interior — round-1 closure).
 function _warnHubWip(pattern: string, targetPath: string, via?: string) {
   const label = WIP_PATTERN_LABEL[pattern] ?? pattern;
   const viaNote = via ? ` (via bash ${via})` : "";
@@ -286,8 +319,8 @@ function _warnHubWip(pattern: string, targetPath: string, via?: string) {
     "╔══════════════════════════════════════════════════════════════════╗",
     L("⚠️  HUB WIP — PUT IT IN A WORKTREE (#350)"),
     "╠══════════════════════════════════════════════════════════════════╣",
-    L(`A write targets ${label} directly in the shared main checkout${viaNote}.`),
-    L(`  ${_truncatePath(targetPath)}`),
+    L(`Target: ${_truncatePath(targetPath, via ? 34 : 52)}${viaNote}`),
+    L(`Pattern: ${label}`),
     L(""),
     L("Untracked WIP in main is the #347 amplifier: it marks the hub"),
     L("dirty, trips M4's freeze, and collides with parallel agents."),
@@ -332,18 +365,39 @@ function _maybeWarnHubWipInventory(wip: { path: string; pattern: string }[]) {
   _warnHubWipInventory(fresh);
 }
 
-// Run `git status --porcelain --untracked-files=all` in the session repo and
-// classify untracked WIP. Returns null on git failure / worktree session
-// (warn-only helper — degrades silently).
-function _hubWipInventory(): { untracked: string[]; wip: { path: string; pattern: string }[]; changeCount: number } | null {
+// Bounded untracked-WIP classification from a COLLAPSED porcelain string:
+// classify the collapsed entries directly, and expand per-file
+// (--untracked-files=all) only when `?? ` entries exist — a clean hub costs
+// zero extra git calls and a huge untracked tree cannot stall the check
+// (the collapsed pass already flagged it dirty). Warn-only — degrades silently.
+function _wipFromPorcelain(porcelain: string): { path: string; pattern: string }[] {
   try {
-    if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktree sessions are isolated
-    const porcelain = execSync("git status --porcelain --untracked-files=all", {
+    if (!classifierLoaded) return []; // degraded: classifyUntrackedWip is inert
+    const parsed = classifyUntrackedWip(porcelain);
+    if (!porcelain.includes("?? ")) return parsed.wip;
+    const all = execSync("git status --porcelain=v1 --untracked-files=all", {
       encoding: "utf-8", timeout: 5000,
     }).trim();
-    const parsed = classifyUntrackedWip(porcelain);
-    const changeCount = porcelain.length > 0 ? porcelain.split("\n").length : 0;
-    return { ...parsed, changeCount };
+    return classifyUntrackedWip(all).wip;
+  } catch {
+    return []; // warn-only — degrade silently, never blocks
+  }
+}
+
+// Classify untracked WIP in the session repo (two-phase, same bounded
+// expansion as _wipFromPorcelain). Returns null on git failure / worktree
+// session / classifier load failure (warn-only helper — degrades silently).
+function _hubWipInventory(): { untracked: string[]; wip: { path: string; pattern: string }[] } | null {
+  try {
+    if (!classifierLoaded) return null; // degraded: classifyUntrackedWip is inert — stay dormant
+    if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktree sessions are isolated
+    const porcelain = execSync("git status --porcelain=v1", {
+      encoding: "utf-8", timeout: 5000,
+    }).trim();
+    return {
+      untracked: classifyUntrackedWip(porcelain).untracked,
+      wip: _wipFromPorcelain(porcelain),
+    };
   } catch {
     return null; // warn-only — degrade silently, never blocks
   }
@@ -351,14 +405,15 @@ function _hubWipInventory(): { untracked: string[]; wip: { path: string; pattern
 
 // Throttled periodic hub-hygiene check (#350): once per HUB_HYGIENE_THROTTLE_MS
 // re-scan the hub for untracked WIP and warn (path-deduped). NEVER per-command
-// — the time throttle keeps it off the bash hot path.
+// — the time throttle keeps it off the bash hot path; the cache is only
+// refreshed when it is unresolved (a warm cache is stable within a session).
 function _periodicHubHygieneCheck() {
   if (_isAllowMainEdits()) return; // full bypass — no prompts
   const now = Date.now();
   if (now - lastHubHygieneMs < HUB_HYGIENE_THROTTLE_MS) return;
   lastHubHygieneMs = now;
   try {
-    _cachedMainTopLevel(true); // refresh the cached hub toplevel
+    _cachedMainTopLevel(); // refresh only when unresolved (negative-TTL bounds retries)
     const inv = _hubWipInventory();
     if (!inv) return;
     _maybeWarnHubWipInventory(inv.wip);
@@ -366,30 +421,31 @@ function _periodicHubHygieneCheck() {
 }
 
 // #350 write-gate WARNING (never block): a write/edit target inside the hub
-// main checkout matching the WIP patterns (docs/plans/, migrations/, scratch).
+// main checkout matching the WIP patterns (docs/plans/, migrations, scratch).
 // Pure pattern pre-filter first (cheap), then hub-equality against the cached
-// main toplevel. Skips /tmp scratch-ish targets (hub-equality) and dedupes per
-// pattern per session.
+// main toplevel (realpath-normalized both sides). Skips /tmp scratch-ish
+// targets (hub-equality) and dedupes per (pattern, path) per session.
 function _maybeWarnHubWipWrite(targetPath: string | undefined) {
   try {
     if (!targetPath) return;
     if (_isAllowMainEdits()) return;
     const pattern = matchHubWipPattern(targetPath);
     if (!pattern) return;
-    const resolved = resolve(process.cwd(), targetPath);
+    const resolved = _realpathNearest(resolve(process.cwd(), targetPath));
     const mainTop = _cachedMainTopLevel();
     if (!mainTop) return;
     if (resolved !== mainTop && !resolved.startsWith(mainTop + "/")) return; // not hub-targeted
-    const dedupeKey = `write:${pattern}`;
-    if (warnedWipPatterns.has(dedupeKey)) return;
-    warnedWipPatterns.add(dedupeKey);
-    _warnHubWip(pattern, resolved);
+    const dedupeKey = `write:${pattern}:${resolved}`;
+    if (warnedWipTargets.has(dedupeKey)) return;
+    warnedWipTargets.add(dedupeKey);
+    _warnHubWip(pattern, resolve(process.cwd(), targetPath)); // display the un-realpath'd path
   } catch { /* warn-only — never blocks */ }
 }
 
 // #350 bash-write detection (never block): heredoc/tee/python open() writing a
-// WIP pattern into the hub main checkout. Pure-token pre-filter + cached hub
-// toplevel — no per-command git; warnings dedupe per pattern per session.
+// WIP pattern into the hub main checkout. Pure quote-aware scan + cached hub
+// toplevel (realpath-normalized) — no per-command git; warnings dedupe per
+// (pattern, path) per session.
 function _maybeWarnBashWrite(command: string) {
   try {
     if (_isAllowMainEdits()) return;
@@ -398,12 +454,13 @@ function _maybeWarnBashWrite(command: string) {
     const mainTop = _cachedMainTopLevel();
     if (!mainTop) return;
     for (const t of targets) {
-      if (t.resolvedPath !== mainTop && !t.resolvedPath.startsWith(mainTop + "/")) continue;
+      const resolvedReal = _realpathNearest(t.resolvedPath);
+      if (resolvedReal !== mainTop && !resolvedReal.startsWith(mainTop + "/")) continue;
       const pattern = matchHubWipPattern(t.resolvedPath);
       if (!pattern) continue;
-      const dedupeKey = `bash:${pattern}`;
-      if (warnedWipPatterns.has(dedupeKey)) continue;
-      warnedWipPatterns.add(dedupeKey);
+      const dedupeKey = `bash:${pattern}:${resolvedReal}`;
+      if (warnedWipTargets.has(dedupeKey)) continue;
+      warnedWipTargets.add(dedupeKey);
       _warnHubWip(pattern, t.resolvedPath, t.via);
     }
   } catch { /* warn-only — never blocks */ }
@@ -550,19 +607,21 @@ export default function (pi: ExtensionAPI) {
     if (_isAllowMainEdits()) return;
     try {
       // #350: warm the cached hub toplevel before any tool_call so the
-      // bash-write/write-gate warnings never trigger a git call mid-command.
+      // bash-write/write-gate warnings never trigger a git call mid-command,
+      // and seed the periodic-hygiene throttle (the inventory already ran here).
       _cachedMainTopLevel();
+      lastHubHygieneMs = Date.now();
       const inWorktree = isWorktreeCwdWrite(resolve(process.cwd()));
       if (inWorktree) return;
       const currentBranch = getMainCheckoutBranch();
-      // #350: --untracked-files=all so untracked WIP files (the #347 amplifier
-      // inventory) are reported per-file, not collapsed to `?? dir/`.
-      const porcelain = execSync("git status --porcelain --untracked-files=all", {
+      // #73 dirty check stays on COLLAPSED porcelain (untracked dirs → one
+      // `?? dir/` entry) — fast and robust on hubs with large untracked trees;
+      // the #350 inventory expands per-file below, bounded by a `?? ` gate.
+      const porcelain = execSync("git status --porcelain=v1", {
         encoding: "utf-8", timeout: 5000,
       }).trim();
       const onNonMain = currentBranch && currentBranch !== "main" && currentBranch !== "master";
       const dirty = porcelain.length > 0;
-      const wipInv = classifyUntrackedWip(porcelain);
 
       if (isAgentInfraRepo()) {
         // Downgraded agent-infra variant: branch deviation is the NORM in the
@@ -572,7 +631,7 @@ export default function (pi: ExtensionAPI) {
         if (dirty) {
           console.warn(`[main-worktree-guard] ⚠️ agent-infra main checkout is DIRTY (${porcelain.split("\n").length} change(s)) — parallel sessions may collide; commit or stash before other agents start.`);
         }
-        _maybeWarnHubWipInventory(wipInv.wip);
+        _maybeWarnHubWipInventory(_wipFromPorcelain(porcelain));
         return;
       }
       if (onNonMain || dirty) {
@@ -601,8 +660,10 @@ export default function (pi: ExtensionAPI) {
         console.warn(lines.join("\n"));
       }
       // #350: the untracked-WIP inventory (docs/plans/, migrations/, scratch)
-      // — makes the #73 dirty-warn's WIP-doc pattern explicit.
-      _maybeWarnHubWipInventory(wipInv.wip);
+      // — makes the #73 dirty-warn's WIP-doc pattern explicit. Bounded: the
+      // per-file expansion runs only when the collapsed porcelain shows
+      // untracked content (clean hub → zero extra git calls).
+      _maybeWarnHubWipInventory(_wipFromPorcelain(porcelain));
     } catch (e) {
       // Degrade silently — this is a non-blocking discipline check
       console.warn("[main-worktree-guard] ⚠️ Hub discipline check failed:", String(e));
@@ -1057,8 +1118,9 @@ export default function (pi: ExtensionAPI) {
       const inWorktree = isWorktreeCwd(resolve(process.cwd()));
       if (!inWorktree) {
         const currentBranch = getMainCheckoutBranch();
-        // #350: --untracked-files=all for the per-file WIP inventory.
-        const porcelain = execSync("git status --porcelain --untracked-files=all", {
+        // #350: the #73 dirty check stays on collapsed porcelain (fast); the
+        // per-file WIP inventory is bounded by _wipFromPorcelain.
+        const porcelain = execSync("git status --porcelain=v1", {
           encoding: "utf-8", timeout: 5000,
         }).trim();
         const onNonMain = currentBranch &&
@@ -1090,7 +1152,7 @@ export default function (pi: ExtensionAPI) {
         }
         // #350: the untracked-WIP inventory (path-deduped against the
         // session_start run — whichever fires first warns).
-        _maybeWarnHubWipInventory(classifyUntrackedWip(porcelain).wip);
+        _maybeWarnHubWipInventory(_wipFromPorcelain(porcelain));
       }
     } catch (e) {
       // Degrade silently — this is a non-blocking discipline check

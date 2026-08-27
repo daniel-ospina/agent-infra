@@ -183,12 +183,27 @@ prompts):
    false-positive warnings are acceptable, false-blocks are not (there are
    none — this path never blocks).
 3. **Hub-hygiene inventory:** the session-start hub-discipline check (#73) now
-   also lists untracked WIP files (`git status --porcelain
-   --untracked-files=all`), calling out `docs/plans/` and `migrations/` as the
-   #347 amplifier pattern, plus a **throttled periodic re-scan** (once per
-   5 minutes — never per-command) that flags new untracked WIP mid-session.
-   All warnings dedupe per pattern/path per session and are suppressed under
-   the env hatch (`AGENT_ALLOW_MAIN_EDITS=1`).
+   also lists untracked WIP files (`git status --porcelain=v1
+   --untracked-files=all`, bounded — the per-file expansion runs only when
+   untracked content exists, so a clean hub costs zero extra git calls),
+   calling out `docs/plans/` and `migrations/` as the #347 amplifier pattern,
+   plus a **throttled periodic re-scan** (once per 5 minutes — never
+   per-command) that flags new untracked WIP mid-session.
+
+**Suppression:** all warnings are suppressed under the env hatch
+(`AGENT_ALLOW_MAIN_EDITS=1`). Under the TTL escape marker (#207), the
+**tool-call-time prompts** (write-gate and bash-write warnings, periodic
+re-scan) are also suppressed (the marker bypass returns before they run), but
+the **session-start inventory** still fires once (it layers on the #73
+session-start banner, which fires under the marker). All warnings dedupe per
+(pattern, path) per session.
+
+**Design deviations (documented):** the bash-write heuristic resolves targets
+against the session cwd — `cd`-prefixed writes into the hub are false-negatives
+(a warning is cheap, a missed one is not an incident); a failed hub-toplevel
+cache resolution disables the three surfaces for up to 30s (then retries —
+never terminally); hub-equality assumes the session stays in one repo (M4's
+blocks use fresh per-call resolution and are unaffected).
 
 **Why warning, not block:** the write/edit block for main-checkout edits is a
 deliberate permanent gate for non-infra repos; these patterns are a hygiene
