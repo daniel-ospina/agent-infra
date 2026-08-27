@@ -814,6 +814,10 @@ try {
   m4t("T101: if/then \$VAR command → block", `G=git; if true; then \$G -C "${hubR}" reset --hard; fi`, "block");
   m4t("T102: quoted substitution with prefix \$VAR → block", `G=git; "\$( cd /tmp && \$G -C "${hubR}" reset --hard )"`, "block");
   m4t("T103: symbolic-ref non-HEAD in substitution → block (shared ref)", `cd "${wtR}" && git commit -m "\$(git symbolic-ref refs/remotes/origin/HEAD refs/heads/main)"`, "block");
+  // ── Round-14 closures (final gate round 6, all probe-verified) ──
+  m4t("T104: heredoc fed to a shell with git → block", `cat <<'EOF' | sh\ngit -C "${hubR}" reset --hard\nEOF`, "block");
+  m4t("T105: spawner + flag var-hop (env -i) → block", `G=git; env -i \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T106: spawner + flag operand var-hop (sudo -u root) → block", `G=git; sudo -u root \$G -C "${hubR}" reset --hard`, "block");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
@@ -920,6 +924,8 @@ try {
   expectBool("B32: script COMMENT substitution → allow (comment-stripped scan)", scriptGitVerdict(sComment, "main", hubR, hubR) === "allow", true);
   const sWordHash = mkS("word-hash.sh", `echo a#b && git reset --hard\n`);
   expectBool("B33: script a#b (word-start comment rule) + reset → block (round-8)", scriptGitVerdict(sWordHash, "main", hubR, hubR) === "block", true);
+  expectBool("B34: extractScriptPath stdin-redirect → the script path (round-14)", extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B35: stdin-redirect script content gated → block", (() => { const p = mkS("stdin.sh", `git reset --hard\n`); return extractScriptPath(`bash < ${p}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "block"; })(), true);
   expectBool("B12b: end-to-end subshell script at wt cwd → allow", (() => {
     const p = mkS("mutation.sh", `git reset --hard\n`);
     const execCwd = commandExecutionCwd(`(cd "${wtR}" && bash ./mutation.sh)`, hubR);

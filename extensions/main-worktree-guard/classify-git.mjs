@@ -480,6 +480,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
   const subshellReset = (f) => { f.baseLen = f.chain.length; refreshSeg(f); }; // round-13: pipe segments INHERIT vars (bash) — `G=git; echo x | $G reset` must resolve G
   let pendingHints = {}; // GIT_DIR=x / GIT_WORK_TREE=x prefixes — next command only
   let prevWasBoundary = true; // cd is the builtin only in command-word position (round-3)
+  let spawnerPending = false; // round-14: a spawner's args keep command position
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
@@ -538,8 +539,8 @@ function _walkShell(command, h = {}, seedVars = {}) {
       i++;
       continue;
     }
-    if (t === "&&" || t === "||" || t === ";") { boundary(false); pendingHints = {}; prevWasBoundary = true; i++; continue; }
-    if (t === "&") { boundary(true); pendingHints = {}; frame().persistHints = { gitDirHint: null, workTreeHint: null }; prevWasBoundary = true; i++; continue; } // background — whole list in a subshell
+    if (t === "&&" || t === "||" || t === ";") { boundary(false); pendingHints = {}; prevWasBoundary = true; spawnerPending = false; i++; continue; }
+    if (t === "&") { boundary(true); pendingHints = {}; frame().persistHints = { gitDirHint: null, workTreeHint: null }; prevWasBoundary = true; spawnerPending = false; i++; continue; } // background — whole list in a subshell
     if (t === "export") {
       // Round-4: `export` consumes ALL following words as args (none is a
       // command word — `export cd <wt> && git commit` does NOT run cd). Only
@@ -737,16 +738,21 @@ function _walkShell(command, h = {}, seedVars = {}) {
       }
     }
     if (!isGitToken) {
-      // Round-12 (final gate P1): a SPAWNER at command position (env/command/
-      // sudo/xargs/exec/...) runs its following $VAR as the spawned command —
-      // keep prevWasBoundary so the $VAR resolves (`env $G …`; `cat $FILE`
-      // stays an ordinary arg — cat is not a spawner).
+      // Round-12/14 (final gate P1): a SPAWNER at command position
+      // (env/command/sudo/xargs/exec/...) runs its following $VAR as the
+      // spawned command. While spawnerPending, keep command position across the
+      // spawner's OWN argument tokens (flags, flag operands, env assignments) —
+      // `sudo -u root $G` / `env -i $G` resolve `$G` (the old one-token window
+      // let `env -i $G reset` run git — probe moved HEAD). `cat $FILE` stays an
+      // ordinary arg (cat is not a spawner).
       const isSpawner = prevWasBoundary && SPAWNER_WORDS.has(t);
       h.onOther?.(t);
       i++;
-      prevWasBoundary = isSpawner;
+      if (isSpawner) spawnerPending = true;
+      prevWasBoundary = spawnerPending; // keep command position while the spawner's args are pending
       continue;
     }
+    spawnerPending = false; // a git-resolving token ends the spawner window
     // ── git invocation ──
     i++;
     const f = frame();
@@ -1604,6 +1610,11 @@ function _unverifiableGitContent(command) {
       if (_spanCarriesGit(inner, cmdVars)) return true;
     }
   }
+  // Round-14 (final gate P1): heredoc bodies fed to a shell interpreter are
+  // executable text (`cat <<'EOF' | sh` + `git -C <hub> reset` moved HEAD —
+  // probe; the piped-stdin closure's remaining open syntax). A heredoc + a
+  // shell interpreter + git content is unverifiable → fail-closed.
+  if (/<</.test(c) && /(?:^|[\s|;])(?:sh|bash|zsh|dash|ksh)\b/.test(c) && /\bgit\b/.test(c)) return true;
   // Round-11 (final gate P1): an interpreter `-c` inline command starting with
   // a $VAR command word that is ASSIGNED in the command is unverifiable —
   // `export G=git; sh -c '$G reset'` fails closed; `sh -c '$EDITOR x'` (env
@@ -1982,11 +1993,26 @@ export function extractScriptPath(command) {
   if (SHELL_INTERPRETERS.has(t)) {
     // Round-4: skip ALL leading interpreter flags (`bash -x evil.sh` — the old
     // code returned null on the first `-x`, reopening the script backdoor).
+    // Round-14: also skip redirect operators + operands (`bash < /tmp/evil.sh`
+    // returned "<" as the script path — the stdin-redirect backdoor, second-
+    // model P1).
     let j = i + 1;
     let sawInline = false;
-    while (j < tokens.length && tokens[j].startsWith("-")) {
-      if (tokens[j] === "-c" || tokens[j] === "--command") sawInline = true;
-      j++;
+    while (j < tokens.length) {
+      const n = tokens[j];
+      if (n.startsWith("-")) {
+        if (n === "-c" || n === "--command") sawInline = true;
+        j++;
+        continue;
+      }
+      if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n) || /^[0-9]+>&[0-9]*-?$/.test(n)) {
+        // The redirect's OPERAND is the script file for stdin-redirect
+        // (`bash < /tmp/evil.sh` — the old code returned "<" and reopened the
+        // backdoor, second-model P1).
+        const operand = tokens[j + 1];
+        return operand && !operand.startsWith("-") ? operand : null;
+      }
+      break;
     }
     if (sawInline) return null; // `-c 'inline'` — not a script file (gated by the normal classifier)
     return j < tokens.length ? tokens[j] : null;
