@@ -1721,7 +1721,7 @@ function _worktreeCheckoutBlock(inv, target, currentBranch) {
   // evaded the exact-match + pos-length check — probe: `switch -Cmain` moved
   // refs/heads/main. Block on the MERE PRESENCE of a force-create flag (a
   // bare `-B`/`-C` is malformed anyway — blocking is harmless).
-  const hasForceMove = args.some((x) => x === "-B" || x === "-C" || x === "--force-create" || /^-[BC][^-]/.test(x));
+  const hasForceMove = args.some((x) => x === "-B" || x === "-C" || x === "--force-create" || x.startsWith("--force-create=") || /^-[BC][^-]/.test(x));
   if (hasForceMove) {
     return _mainProtectionReason(inv,
       `force-create checkout/switch moves a SHARED branch ref (≡ git branch -f) — not worktree-local.`);
