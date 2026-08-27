@@ -157,6 +157,46 @@ live `pr1467` hub fails the check — that is the point.
   untouched.
 - **Not a terminal gate:** humans in a terminal can always run the one-liner.
 
+## Hub-WIP hygiene warnings — put WIP in a worktree (#350)
+
+The **#347 amplifier**: agents write WIP (plan docs to `docs/plans/`,
+migrations, scratch files) directly in the hub main checkout instead of an
+isolated worktree. The write/edit tool blocks non-infra main edits, but
+**agent-infra is exempt** (#99) and **bash heredoc/tee/python writes are
+unguarded** — so the discipline violation silently accumulates, marks the hub
+dirty, and trips M4's freeze. Three **warn-only** surfaces (never block — the
+write/edit block for main-checkout edits is unchanged; these are discipline
+prompts):
+
+1. **Write/edit-gate warning:** a write/edit target inside the hub main
+   checkout matching the WIP patterns (`docs/plans/` segment pair, any
+   `migrations/` segment, scratch suffixes `.tmp`/`.bak`/`.scratch`/`~`) emits a
+   prominent `HUB WIP — PUT IT IN A WORKTREE` banner instead of silently
+   passing. Relevant where the write is NOT already blocked: agent-infra
+   sessions (exempt) and worktree sessions writing into the hub via an absolute
+   path. For non-infra main-checkout writes (already blocked), the block reason
+   now names the amplifier pattern.
+2. **Bash-write detection:** hub-targeted non-git bash writes — `>`/`>>`
+   redirects, `tee`, python `open(…, "w"|"a")` — whose target matches a WIP
+   pattern emit the same banner with a `(via bash …)` note. Heuristic and
+   conservative: `/tmp` scratch-ish targets are excluded (hub-equality),
+   false-positive warnings are acceptable, false-blocks are not (there are
+   none — this path never blocks).
+3. **Hub-hygiene inventory:** the session-start hub-discipline check (#73) now
+   also lists untracked WIP files (`git status --porcelain
+   --untracked-files=all`), calling out `docs/plans/` and `migrations/` as the
+   #347 amplifier pattern, plus a **throttled periodic re-scan** (once per
+   5 minutes — never per-command) that flags new untracked WIP mid-session.
+   All warnings dedupe per pattern/path per session and are suppressed under
+   the env hatch (`AGENT_ALLOW_MAIN_EDITS=1`).
+
+**Why warning, not block:** the write/edit block for main-checkout edits is a
+deliberate permanent gate for non-infra repos; these patterns are a hygiene
+signal, and an agent may legitimately need a scratch file briefly. The
+warning surfaces the violation at write time so the agent moves the work to a
+worktree (`bash scripts/checkout-hygiene/hub-worktree.sh <branch>`) before it
+becomes the next M4 freeze.
+
 ## Environment variables
 
 | Variable | Purpose | Required for |
@@ -336,3 +376,9 @@ shared main checkout of a project with the guard active:
    only `fetch`/`worktree add`/`status` → runs.
 10. `bash scripts/checkout-hygiene/hub-state-check.sh --repo <hub>` → exit 0
     on main+clean, exit 1 + recovery command on off-main/dirty.
+11. **#350 WIP hygiene:** from the hub main checkout — `cat >
+    docs/plans/wip.md` (bash) or `write docs/plans/wip.md` (agent-infra) →
+    `HUB WIP — PUT IT IN A WORKTREE` warning, command still runs (never
+    blocked); `echo x > /tmp/foo.tmp` → no warning (outside the hub); the
+    session-start banner lists untracked `docs/plans/`/`migrations/`/scratch
+    files when present.

@@ -2015,6 +2015,120 @@ export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
   }
 }
 
+// ── #350: hub-WIP hygiene — write-gate WARNING + hub-hygiene check ──────────
+// The #347 amplifier: agents write WIP (plan docs to docs/plans/, migrations,
+// scratch files) directly in the hub main checkout instead of an isolated
+// worktree. These helpers are PURE classification (no git, no fs) — index.ts
+// decides hub-ness (is the path inside the hub main checkout?) and when to
+// WARN (never block). /tmp scratch-ish targets are FINE — the caller's
+// hub-equality gate excludes them before any warning.
+
+const WIP_SCRATCH_SUFFIXES = [".tmp", ".bak", ".scratch"];
+
+/**
+ * Classify a path against the hub-WIP patterns (#350):
+ *   "docs/plans" — a `docs` segment immediately followed by a `plans` segment
+ *   "migrations" — any path segment named exactly `migrations`
+ *   "scratch"    — basename ends with .tmp / .bak / .scratch / `~` (vim backup)
+ * Returns null when no pattern matches. PATTERN-ONLY: hub-ness is the caller's
+ * job — `/tmp/foo.tmp` classifies "scratch" here but must NOT warn (index.ts
+ * gates on hub-equality first). Segment-aware (never prefix-string):
+ * `/repo/docs/plans-extra/x.md` and `/repo/notdocs/plans/x.md` do not
+ * false-match docs/plans.
+ * @param {string} resolvedPath
+ * @returns {"docs/plans"|"migrations"|"scratch"|null}
+ */
+export function matchHubWipPattern(resolvedPath) {
+  const p = String(resolvedPath ?? "").replace(/\\/g, "/");
+  const base = p.split("/").pop() ?? "";
+  if (base.endsWith("~")) return "scratch";
+  for (const s of WIP_SCRATCH_SUFFIXES) if (base.endsWith(s)) return "scratch";
+  const segs = p.split("/").filter((s) => s.length > 0);
+  for (let i = 0; i < segs.length; i++) {
+    if (segs[i] === "migrations") return "migrations";
+    if (segs[i] === "docs" && segs[i + 1] === "plans") return "docs/plans";
+  }
+  return null;
+}
+
+/**
+ * Extract NON-GIT write targets from a bash command (#350 Indicators: heredoc /
+ * tee / python open() writes bypass the write/edit tool gate). Heuristic and
+ * NEVER blocking — the caller warns only:
+ *   - `>` / `>>` / `&>` / `&>>` (and `1>`/`1>>`) stdout redirects → the target
+ *     (fd-2 stderr redirects `2>` are not content writes; `/dev/null` skipped)
+ *   - `tee <path>` → the tee target (first non-flag positional)
+ *   - python `open("<path>", "w"|"a"…)` → the path
+ * Targets resolve against `cwd` (the session cwd — a heuristic: cd-prefixed
+ * writes are false-negatives, acceptable for a warning-only heuristic; a
+ * warning is cheap, a missed one is not an incident).
+ * @param {string} command
+ * @param {string} [cwd]
+ * @returns {{ resolvedPath: string, via: "redirect"|"tee"|"python" }[]}
+ */
+export function extractBashWriteTargets(command, cwd = process.cwd()) {
+  const out = [];
+  const tokens = _tokenize(command);
+  const seen = new Set();
+  const push = (raw, via) => {
+    const t = _stripQuotes(String(raw ?? "").trim());
+    if (!t || t === "/dev/null" || t.startsWith("/dev/")) return;
+    const resolved = resolve(cwd, t);
+    if (seen.has(resolved)) return;
+    seen.add(resolved);
+    out.push({ resolvedPath: resolved, via });
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === ">" || t === ">>" || t === "&>" || t === "&>>" || /^1>>?$/.test(t)) {
+      if (i + 1 < tokens.length && !_isShellBoundary(tokens[i + 1])) {
+        push(tokens[i + 1], "redirect");
+        i++;
+      }
+      continue;
+    }
+    if (t === "tee") {
+      for (let j = i + 1; j < tokens.length; j++) {
+        const n = tokens[j];
+        if (_isShellBoundary(n)) break;
+        if (n === "-a") continue;
+        if (n.startsWith("-")) continue;
+        push(n, "tee");
+        break;
+      }
+      continue;
+    }
+  }
+  const pyRe = /open\s*\(\s*["']([^"']+)["']\s*,\s*["'][wa][^"']*["']/g;
+  let m;
+  while ((m = pyRe.exec(String(command))) !== null) push(m[1], "python");
+  return out;
+}
+
+/**
+ * Parse `git status --porcelain` (v1) output for UNTRACKED WIP (#350).
+ * Untracked lines start with `?? `; porcelain v1 collapses untracked
+ * DIRECTORIES to a single `?? dir/` entry (pass --untracked-files=all for
+ * per-file entries). Classifies each entry with matchHubWipPattern — the #347
+ * amplifier inventory for the session-start / periodic hub-hygiene check.
+ * @param {string} porcelain
+ * @returns {{ untracked: string[], wip: { path: string, pattern: string }[] }}
+ */
+export function classifyUntrackedWip(porcelain) {
+  const untracked = [];
+  const wip = [];
+  for (const line of String(porcelain ?? "").split("\n")) {
+    if (!line.startsWith("?? ")) continue;
+    let p = line.slice(3).trim();
+    if (!p) continue;
+    p = p.replace(/^"(.*)"$/, "$1"); // quoted-spelling paths (spaces)
+    untracked.push(p);
+    const pat = matchHubWipPattern(p);
+    if (pat) wip.push({ path: p, pattern: pat });
+  }
+  return { untracked, wip };
+}
+
 /**
  * Hub disorder of a repo checkout: "off_main" | "dirty" | "both" | null.
  * The hub's only legal state is main/master + empty porcelain — untracked

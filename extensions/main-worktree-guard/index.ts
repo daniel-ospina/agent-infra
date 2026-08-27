@@ -31,6 +31,16 @@
 //     execution cwd. No total-bash-gate bypass: the exemption is
 //     per-invocation and semantic (never path-string-based); hub/foreign/
 //     unresolvable targets keep today's gating.
+//  6. (#350) HUB-WIP HYGIENE WARNINGS (never blocks): agents write WIP (plan
+//     docs to docs/plans/, migrations, scratch files) directly in the hub main
+//     checkout — the #347 amplifier. Three warn-only surfaces: (a) the
+//     write/edit gate warns (agent-infra exemption + worktree-session
+//     absolute-path writes into the hub) when the target matches the WIP
+//     patterns; (b) bash-write detection warns on hub-targeted heredoc/tee/
+//     python open() writes (heuristic, never blocks); (c) the session-start
+//     hub-discipline check gains an untracked-WIP inventory (docs/plans/,
+//     migrations/, scratch) + a throttled (5 min) periodic re-scan. All
+//     warnings dedupe per pattern/path and are suppressed under the env hatch.
 //
 // Worktrees are ISOLATED — none of this applies inside a worktree. The only
 // escape hatch is AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) or
@@ -84,6 +94,12 @@ let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 let extractScriptPath: (command: string) => string | null = () => null;
 let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string) => "allow" | "block" = () => "allow";
+// #350: hub-WIP hygiene helpers (warn-only). Fail-safe defaults: inert
+// (null/[]) so a failed import NEVER false-blocks — these warnings are
+// discipline prompts, not gates.
+let matchHubWipPattern: (resolvedPath: string) => "docs/plans" | "migrations" | "scratch" | null = () => null;
+let extractBashWriteTargets: (command: string, cwd?: string) => { resolvedPath: string; via: string }[] = () => [];
+let classifyUntrackedWip: (porcelain: string) => { untracked: string[]; wip: { path: string; pattern: string }[] } = () => ({ untracked: [], wip: [] });
 let classifierLoaded = false;
 let ALLOW_MAIN_EDITS_MARKER_TTL_MS = 15 * 60 * 1000;
 // Escape-marker (#207) rules live in classify-git.mjs so test.mjs exercises the
@@ -104,7 +120,8 @@ try {
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
      readAllowMarkerState, readHubDisorder,
      extractScriptPath, scriptGitVerdict, evaluateHubGateWithTargets,
-     commandExecutionCwd, resolveTargetTopLevel } =
+     commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern,
+     extractBashWriteTargets, classifyUntrackedWip } =
     await import("./classify-git.mjs"));
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
@@ -217,6 +234,179 @@ function _hubState(): { disorder: string | null; branch: string | null } {
   } catch {
     return { disorder: null, branch: null }; // degrade — never false-block
   }
+}
+
+// ── #350: hub-WIP hygiene (write-gate WARNING + hub-hygiene check) ─────────
+// The #347 amplifier: agents write WIP (plan docs to docs/plans/, migrations,
+// scratch files) directly in the hub main checkout instead of a worktree,
+// either via the write/edit tool (agent-infra is exempt from the block) or via
+// bash heredoc/tee/python (unguarded). All three surfaces below WARN — never
+// block: the write/edit block for main-checkout edits is unchanged; these are
+// discipline prompts surfacing the violation at write time.
+const HUB_HYGIENE_THROTTLE_MS = 5 * 60 * 1000; // periodic scan: at most once per 5 min
+const WIP_PATTERN_LABEL: Record<string, string> = {
+  "docs/plans": "a plan doc in docs/plans/",
+  migrations: "a migration in migrations/",
+  scratch: "a scratch/backup file (.tmp/.bak/.scratch/~)",
+};
+let cachedMainTopLevel: string | null | undefined; // undefined = not yet resolved
+let lastHubHygieneMs = 0;
+const warnedWipPatterns = new Set<string>(); // tool-call warnings: once per pattern per session
+const warnedWipPaths = new Set<string>();    // inventory warnings: once per path per session
+
+// The MAIN checkout's toplevel (git worktree list first entry = the primary
+// worktree, per git docs — works from a hub session AND a worktree session).
+// One git call at first use; refreshed by the throttled hygiene check
+// (worktree topology is stable within a session). Never on the bash hot path.
+function _cachedMainTopLevel(force = false): string | null {
+  if (cachedMainTopLevel !== undefined && !force) return cachedMainTopLevel;
+  try {
+    const first = execSync("git worktree list --porcelain", {
+      encoding: "utf-8", timeout: 5000,
+    }).split("\n")[0] ?? "";
+    cachedMainTopLevel = first ? resolve(first.replace(/^worktree\s+/, "").trim()) : null;
+  } catch {
+    cachedMainTopLevel = null;
+  }
+  return cachedMainTopLevel;
+}
+
+function _truncatePath(p: string, max = 52): string {
+  const s = String(p);
+  return s.length <= max ? s : "…" + s.slice(-(max - 1));
+}
+
+// Shared box-drawn banner (matches the existing hub-discipline style).
+function _warnHubWip(pattern: string, targetPath: string, via?: string) {
+  const label = WIP_PATTERN_LABEL[pattern] ?? pattern;
+  const viaNote = via ? ` (via bash ${via})` : "";
+  const L = (t: string) => "║  " + t.padEnd(62) + "║";
+  const lines = [
+    "",
+    "╔══════════════════════════════════════════════════════════════════╗",
+    L("⚠️  HUB WIP — PUT IT IN A WORKTREE (#350)"),
+    "╠══════════════════════════════════════════════════════════════════╣",
+    L(`A write targets ${label} directly in the shared main checkout${viaNote}.`),
+    L(`  ${_truncatePath(targetPath)}`),
+    L(""),
+    L("Untracked WIP in main is the #347 amplifier: it marks the hub"),
+    L("dirty, trips M4's freeze, and collides with parallel agents."),
+    L("→ Create a worktree (one command):"),
+    L("  bash scripts/checkout-hygiene/hub-worktree.sh <branch>"),
+    "╚══════════════════════════════════════════════════════════════════╝",
+    "",
+  ];
+  console.warn(lines.join("\n"));
+}
+
+// Inventory banner for the session-start / periodic hub-hygiene check.
+function _warnHubWipInventory(wip: { path: string; pattern: string }[]) {
+  if (wip.length === 0) return;
+  const L = (t: string) => "║  " + t.padEnd(62) + "║";
+  const lines = [
+    "",
+    "╔══════════════════════════════════════════════════════════════════╗",
+    L("⚠️  UNTRACKED WIP IN MAIN — #347 AMPLIFIER (#350)"),
+    "╠══════════════════════════════════════════════════════════════════╣",
+    L("Untracked WIP files in the shared main checkout — move them to a"),
+    L("worktree (hub hygiene):"),
+    ...wip.slice(0, 8).map((w) => L(`  • ${_truncatePath(w.path, 44)} (${w.pattern})`)),
+    ...(wip.length > 8 ? [L(`  … and ${wip.length - 8} more`)] : []),
+    L(""),
+    L("Untracked WIP marks the hub dirty → M4 freezes every sibling"),
+    L("session (the 2026-08-27 tortoise incident class)."),
+    L("→ Create a worktree:"),
+    L("  bash scripts/checkout-hygiene/hub-worktree.sh <branch>"),
+    "╚══════════════════════════════════════════════════════════════════╝",
+    "",
+  ];
+  console.warn(lines.join("\n"));
+}
+
+// Path-deduped inventory warning (shared by the session-start check and the
+// periodic check — whichever fires first warns; the other is silent).
+function _maybeWarnHubWipInventory(wip: { path: string; pattern: string }[]) {
+  const fresh = wip.filter((w) => !warnedWipPaths.has(w.path));
+  if (fresh.length === 0) return;
+  for (const w of fresh) warnedWipPaths.add(w.path);
+  _warnHubWipInventory(fresh);
+}
+
+// Run `git status --porcelain --untracked-files=all` in the session repo and
+// classify untracked WIP. Returns null on git failure / worktree session
+// (warn-only helper — degrades silently).
+function _hubWipInventory(): { untracked: string[]; wip: { path: string; pattern: string }[]; changeCount: number } | null {
+  try {
+    if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktree sessions are isolated
+    const porcelain = execSync("git status --porcelain --untracked-files=all", {
+      encoding: "utf-8", timeout: 5000,
+    }).trim();
+    const parsed = classifyUntrackedWip(porcelain);
+    const changeCount = porcelain.length > 0 ? porcelain.split("\n").length : 0;
+    return { ...parsed, changeCount };
+  } catch {
+    return null; // warn-only — degrade silently, never blocks
+  }
+}
+
+// Throttled periodic hub-hygiene check (#350): once per HUB_HYGIENE_THROTTLE_MS
+// re-scan the hub for untracked WIP and warn (path-deduped). NEVER per-command
+// — the time throttle keeps it off the bash hot path.
+function _periodicHubHygieneCheck() {
+  if (_isAllowMainEdits()) return; // full bypass — no prompts
+  const now = Date.now();
+  if (now - lastHubHygieneMs < HUB_HYGIENE_THROTTLE_MS) return;
+  lastHubHygieneMs = now;
+  try {
+    _cachedMainTopLevel(true); // refresh the cached hub toplevel
+    const inv = _hubWipInventory();
+    if (!inv) return;
+    _maybeWarnHubWipInventory(inv.wip);
+  } catch { /* warn-only */ }
+}
+
+// #350 write-gate WARNING (never block): a write/edit target inside the hub
+// main checkout matching the WIP patterns (docs/plans/, migrations/, scratch).
+// Pure pattern pre-filter first (cheap), then hub-equality against the cached
+// main toplevel. Skips /tmp scratch-ish targets (hub-equality) and dedupes per
+// pattern per session.
+function _maybeWarnHubWipWrite(targetPath: string | undefined) {
+  try {
+    if (!targetPath) return;
+    if (_isAllowMainEdits()) return;
+    const pattern = matchHubWipPattern(targetPath);
+    if (!pattern) return;
+    const resolved = resolve(process.cwd(), targetPath);
+    const mainTop = _cachedMainTopLevel();
+    if (!mainTop) return;
+    if (resolved !== mainTop && !resolved.startsWith(mainTop + "/")) return; // not hub-targeted
+    const dedupeKey = `write:${pattern}`;
+    if (warnedWipPatterns.has(dedupeKey)) return;
+    warnedWipPatterns.add(dedupeKey);
+    _warnHubWip(pattern, resolved);
+  } catch { /* warn-only — never blocks */ }
+}
+
+// #350 bash-write detection (never block): heredoc/tee/python open() writing a
+// WIP pattern into the hub main checkout. Pure-token pre-filter + cached hub
+// toplevel — no per-command git; warnings dedupe per pattern per session.
+function _maybeWarnBashWrite(command: string) {
+  try {
+    if (_isAllowMainEdits()) return;
+    const targets = extractBashWriteTargets(command, process.cwd());
+    if (targets.length === 0) return;
+    const mainTop = _cachedMainTopLevel();
+    if (!mainTop) return;
+    for (const t of targets) {
+      if (t.resolvedPath !== mainTop && !t.resolvedPath.startsWith(mainTop + "/")) continue;
+      const pattern = matchHubWipPattern(t.resolvedPath);
+      if (!pattern) continue;
+      const dedupeKey = `bash:${pattern}`;
+      if (warnedWipPatterns.has(dedupeKey)) continue;
+      warnedWipPatterns.add(dedupeKey);
+      _warnHubWip(pattern, t.resolvedPath, t.via);
+    }
+  } catch { /* warn-only — never blocks */ }
 }
 
 // Script-backdoor closure (Slice E): the documented escape
@@ -359,21 +549,30 @@ export default function (pi: ExtensionAPI) {
     // to them). Skipped only under the escape hatch.
     if (_isAllowMainEdits()) return;
     try {
+      // #350: warm the cached hub toplevel before any tool_call so the
+      // bash-write/write-gate warnings never trigger a git call mid-command.
+      _cachedMainTopLevel();
       const inWorktree = isWorktreeCwdWrite(resolve(process.cwd()));
       if (inWorktree) return;
       const currentBranch = getMainCheckoutBranch();
-      const porcelain = execSync("git status --porcelain", {
+      // #350: --untracked-files=all so untracked WIP files (the #347 amplifier
+      // inventory) are reported per-file, not collapsed to `?? dir/`.
+      const porcelain = execSync("git status --porcelain --untracked-files=all", {
         encoding: "utf-8", timeout: 5000,
       }).trim();
       const onNonMain = currentBranch && currentBranch !== "main" && currentBranch !== "master";
       const dirty = porcelain.length > 0;
+      const wipInv = classifyUntrackedWip(porcelain);
 
       if (isAgentInfraRepo()) {
         // Downgraded agent-infra variant: branch deviation is the NORM in the
-        // infra repo (in-main feature work per #99) — warn on dirty tree only.
+        // infra repo (in-main feature work per #99) — warn on dirty tree only,
+        // plus the #350 untracked-WIP inventory (the #347 amplifier lives in
+        // the infra hub too: plan docs in docs/plans/, migrations, scratch).
         if (dirty) {
           console.warn(`[main-worktree-guard] ⚠️ agent-infra main checkout is DIRTY (${porcelain.split("\n").length} change(s)) — parallel sessions may collide; commit or stash before other agents start.`);
         }
+        _maybeWarnHubWipInventory(wipInv.wip);
         return;
       }
       if (onNonMain || dirty) {
@@ -401,6 +600,9 @@ export default function (pi: ExtensionAPI) {
         );
         console.warn(lines.join("\n"));
       }
+      // #350: the untracked-WIP inventory (docs/plans/, migrations/, scratch)
+      // — makes the #73 dirty-warn's WIP-doc pattern explicit.
+      _maybeWarnHubWipInventory(wipInv.wip);
     } catch (e) {
       // Degrade silently — this is a non-blocking discipline check
       console.warn("[main-worktree-guard] ⚠️ Hub discipline check failed:", String(e));
@@ -500,6 +702,11 @@ export default function (pi: ExtensionAPI) {
     }
     if (isBash) {
       const command = (event.input as { command?: string }).command ?? "";
+      // #350: hub-WIP discipline prompts (never block) — bash-write detection
+      // (heredoc/tee/python into the hub) + the throttled periodic hub-hygiene
+      // scan (once per 5 min — never per-command).
+      _maybeWarnBashWrite(command);
+      _periodicHubHygieneCheck();
 
       // ── Degradation fallback (branch-ownership OR detailed classifier
       // unavailable): behave exactly like today — agent-infra exempt,
@@ -737,6 +944,9 @@ export default function (pi: ExtensionAPI) {
     // session blocked editing its own isolated worktree). A worktree's working
     // tree is private by construction — allow all edits from a worktree session.
     if (isWorktreeCwdWrite(resolve(process.cwd()))) {
+      // #350: a worktree session writing WIP into the HUB via an absolute path
+      // is still the #347 amplifier — warn (never block).
+      _maybeWarnHubWipWrite((event.input as { path?: string }).path);
       return undefined;
     }
 
@@ -746,6 +956,9 @@ export default function (pi: ExtensionAPI) {
     // is where infra fixes land; the branch-ownership gates (M1/M2/M3) now cover
     // its bash git surface instead.
     if (isAgentInfraRepo()) {
+      // #350: agent-infra is exempt from the write/edit BLOCK (#99), so the WIP
+      // warning is the only signal for WIP written straight into the infra hub.
+      _maybeWarnHubWipWrite(targetPath);
       return undefined;
     }
     if (_isAllowMainEdits()) {
@@ -805,10 +1018,17 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (topLevel === mainTopLevel) {
+      // #350: surface the WIP-pattern violation in the block reason (same block
+      // decision — the message now names the amplifier pattern).
+      const wipPattern = matchHubWipPattern(targetPath ?? "");
+      const wipHint = wipPattern
+        ? `   This looks like ${WIP_PATTERN_LABEL[wipPattern] ?? wipPattern} written directly into main — the #347 amplifier; use a worktree.`
+        : "";
       return {
         block: true,
         reason: [
           "⛔ File edits in the main checkout are blocked.",
+          ...(wipHint ? [wipHint] : []),
           "   Why: Parallel agents editing main could silently overwrite each",
           "   other's uncommitted changes. Each agent needs its own branch.",
           "   → Create a worktree: invoke the using-git-worktrees skill.",
@@ -837,7 +1057,8 @@ export default function (pi: ExtensionAPI) {
       const inWorktree = isWorktreeCwd(resolve(process.cwd()));
       if (!inWorktree) {
         const currentBranch = getMainCheckoutBranch();
-        const porcelain = execSync("git status --porcelain", {
+        // #350: --untracked-files=all for the per-file WIP inventory.
+        const porcelain = execSync("git status --porcelain --untracked-files=all", {
           encoding: "utf-8", timeout: 5000,
         }).trim();
         const onNonMain = currentBranch &&
@@ -867,6 +1088,9 @@ export default function (pi: ExtensionAPI) {
           );
           console.warn(lines.join("\n"));
         }
+        // #350: the untracked-WIP inventory (path-deduped against the
+        // session_start run — whichever fires first warns).
+        _maybeWarnHubWipInventory(classifyUntrackedWip(porcelain).wip);
       }
     } catch (e) {
       // Degrade silently — this is a non-blocking discipline check

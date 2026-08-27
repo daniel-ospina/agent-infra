@@ -5,7 +5,7 @@
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync } from "node:fs";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -999,6 +999,73 @@ try {
   expectBool("W5: missing dir under hub → walk-up → hub toplevel", rttl("newdir/x.txt") === hubTop, true);
   expectBool("W4: /tmp target → null (outside any repo)", rttl("/tmp/foo.md") === null, true);
   expectBool("W6: foreign repo file → foreign toplevel (≠ hub → no M4 block)", rttl("f.txt", foreignR) === resolve(execSync("git rev-parse --show-toplevel", { cwd: foreignR, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim()) && rttl("f.txt", foreignR) !== hubTop, true);
+
+  // ── #350: hub-WIP hygiene — write-gate warning path classification ──────
+  // matchHubWipPattern is PATTERN-ONLY (hub-ness is the caller's job — the
+  // index.ts warning gates on hub-equality BEFORE warning, so /tmp scratch-ish
+  // targets never warn). Pin the segment-aware matcher + the caller contract.
+  function expectWip(name, path, expected) {
+    const got = matchHubWipPattern(path);
+    const ok = got === expected;
+    console.log(`${ok ? "✅" : "❌"} wip-pattern ${name}: ${got}${ok ? "" : ` (expected ${expected})`}`);
+    ok ? pass++ : fail++;
+  }
+  expectWip("docs/plans absolute", "/repo/docs/plans/2026-08-27-x.md", "docs/plans");
+  expectWip("docs/plans relative", "docs/plans/x.md", "docs/plans");
+  expectWip("docs/plans dir entry (porcelain)", "docs/plans/", "docs/plans");
+  expectWip("migrations deep segment", "/repo/db/migrations/0001.sql", "migrations");
+  expectWip("migrations top-level dir", "migrations/001.sql", "migrations");
+  expectWip("supabase migrations", "supabase/migrations/x.sql", "migrations");
+  expectWip("scratch .tmp", "/repo/foo.tmp", "scratch");
+  expectWip("scratch .bak", "/repo/foo.bak", "scratch");
+  expectWip("scratch .scratch", "/repo/foo.scratch", "scratch");
+  expectWip("scratch ~-suffix (vim backup)", "/repo/foo.md~", "scratch");
+  expectWip("docs/ alone → null", "/repo/docs/x.md", null);
+  expectWip("plans/ alone → null", "/repo/plans/x.md", null);
+  expectWip("docs not followed by plans → null", "/repo/docs/plans-extra/x.md", null);
+  expectWip("notdocs/plans → null (segment-aware)", "/repo/notdocs/plans/x.md", null);
+  expectWip("regular source file → null", "/repo/src/index.ts", null);
+  expectWip("tmp scratch OUTSIDE hub → pattern still scratch (caller gates on hub-ness)", "/tmp/foo.tmp", "scratch");
+
+  // ── #350: bash-write detection (extractBashWriteTargets) ────────────────
+  // Heredoc / tee / python open() writes bypass the write/edit tool gate —
+  // extract the non-git write targets so index.ts can warn (never block).
+  function expectWriteTargets(name, command, expected) {
+    const got = extractBashWriteTargets(command, "/repo");
+    const gotStr = JSON.stringify(got);
+    const expectedStr = JSON.stringify(expected);
+    const ok = gotStr === expectedStr;
+    console.log(`${ok ? "✅" : "❌"} bash-write ${name}: ${gotStr}${ok ? "" : ` (expected ${expectedStr})`}`);
+    ok ? pass++ : fail++;
+  }
+  expectWriteTargets("heredoc redirect → docs/plans", `cat > docs/plans/x.md <<'EOF'`, [{ resolvedPath: "/repo/docs/plans/x.md", via: "redirect" }]);
+  expectWriteTargets("redirect after heredoc delimiter", `cat <<'EOF' > migrations/001.sql`, [{ resolvedPath: "/repo/migrations/001.sql", via: "redirect" }]);
+  expectWriteTargets("append redirect → scratch", `echo x >> foo.tmp`, [{ resolvedPath: "/repo/foo.tmp", via: "redirect" }]);
+  expectWriteTargets("tee -a → scratch", `echo hi | tee -a foo.bak`, [{ resolvedPath: "/repo/foo.bak", via: "tee" }]);
+  expectWriteTargets("python open w → migrations", `python3 -c "open('migrations/001.sql','w').write('x')"`, [{ resolvedPath: "/repo/migrations/001.sql", via: "python" }]);
+  expectWriteTargets("absolute hub path preserved", `cat > /repo/docs/plans/x.md`, [{ resolvedPath: "/repo/docs/plans/x.md", via: "redirect" }]);
+  expectWriteTargets("input redirect → no write", `wc -l < docs/plans/x.md`, []);
+  expectWriteTargets("stderr redirect → no content write", `cat x 2> foo.tmp`, []);
+  expectWriteTargets("/dev/null → skipped", `git diff > /dev/null`, []);
+  expectWriteTargets("no write target", `ls -la`, []);
+  expectWriteTargets("read-only python open → no write", `python3 -c "open('docs/plans/x.md').read()"`, []);
+
+  // ── #350: hub-hygiene untracked-WIP inventory (classifyUntrackedWip) ────
+  function expectUntrackedWip(name, porcelain, expectedUntracked, expectedWip) {
+    const got = classifyUntrackedWip(porcelain);
+    const gotU = JSON.stringify(got.untracked);
+    const gotW = JSON.stringify(got.wip);
+    const ok = gotU === JSON.stringify(expectedUntracked) && gotW === JSON.stringify(expectedWip);
+    console.log(`${ok ? "✅" : "❌"} untracked-wip ${name}: ${gotU}${ok ? "" : ` (expected ${JSON.stringify(expectedUntracked)})`}`);
+    ok ? pass++ : fail++;
+  }
+  expectUntrackedWip("clean porcelain → no untracked", "", [], []);
+  expectUntrackedWip("plan doc flagged", "?? docs/plans/x.md", ["docs/plans/x.md"], [{ path: "docs/plans/x.md", pattern: "docs/plans" }]);
+  expectUntrackedWip("migration flagged, tracked change skipped", "?? supabase/migrations/001.sql\n M src/index.ts", ["supabase/migrations/001.sql"], [{ path: "supabase/migrations/001.sql", pattern: "migrations" }]);
+  expectUntrackedWip("untracked DIR entry (porcelain v1)", "?? docs/plans/", ["docs/plans/"], [{ path: "docs/plans/", pattern: "docs/plans" }]);
+  expectUntrackedWip("scratch flagged, normal file not", "?? foo.tmp\n?? src/new.ts", ["foo.tmp", "src/new.ts"], [{ path: "foo.tmp", pattern: "scratch" }]);
+  expectUntrackedWip("tracked-only changes → no wip", " M src/index.ts\nD  old.txt", [], []);
+  expectUntrackedWip("quoted-spelling path unquoted", '?? "docs/plans/my file.md"', ["docs/plans/my file.md"], [{ path: "docs/plans/my file.md", pattern: "docs/plans" }]);
 
   // ── Degradation (D) ──
   const classifySrc = readFileSync(new URL("./classify-git.mjs", import.meta.url), "utf-8");
