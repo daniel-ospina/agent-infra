@@ -758,6 +758,16 @@ try {
   m4t("T54: stash list → allowed (readonly)", `cd "${wtR}" && git stash list`, "allowed");
   m4t("T55: unknown verb (subtree push) → block (inverted allowlist)", `cd "${wtR}" && git subtree push --prefix=docs origin main`, "block");
   m4t("T56: redirect makes VAR a prefix (not statement) → block", `VAR="${wtR}" > /dev/null git fetch; cd "$VAR" && git commit -m x`, "block");
+  // ── Round-4 closures (re-review round 2, all probe-verified) ──
+  m4t("T57: bash -c inline gating → block", `bash -c "git commit -m x"`, "block");
+  m4t("T58: sh -c inline with wt cd → allowed", `sh -c "cd ${wtR} && git commit -m x"`, "allowed");
+  m4t("T59: &> redirect does not pollute args → recovery", `git checkout main &> /dev/null`, "recovery");
+  m4t("T60a: fetch explicit dst main:main → block", `git fetch origin main:main`, "block");
+  m4t("T60b: fetch implicit dst main → recovery", `git fetch origin main`, "recovery");
+  m4t("T61: export consumes args (cd not a command) → block", `export cd "${wtR}" && git commit -m x`, "block");
+  m4t("T62: unset deletes vars → block", `WT="${wtR}"; unset WT; cd "$WT" && git commit -m x`, "block");
+  m4t("T63: redirect-led cd (real builtin) → allowed", `> /dev/null cd "${wtR}" && git commit -m x`, "allowed");
+  m4t("T64: symbolic-ref non-HEAD from wt → block (shared ref)", `cd "${wtR}" && git symbolic-ref refs/remotes/origin/HEAD refs/heads/x`, "block");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
@@ -783,6 +793,7 @@ try {
     };
     m4m("M1: wt ON main → commit blocked (main-protection)", `cd "${mwtmain}" && git commit -m x`, "block");
     m4m("M2: wt checkout main while hub off-main → blocked", `cd "${mwt}" && git checkout main`, "block");
+    m4m("M2b: wt checkout -B main (force) while hub off-main → blocked (round-4)", `cd "${mwt}" && git checkout -B main`, "block");
     m4m("M3: wt on feature branch → commit allowed", `cd "${mwt}" && git commit -m x`, "allowed");
   } catch (e) {
     console.error(`❌ main-protection fixtures FAILED: ${String(e.message).slice(0, 120)}`);
@@ -853,6 +864,7 @@ try {
   expectBool("B11b: MIXED content wt-first → block (loop-continues-on-exemption)", scriptGitVerdict(sMixedWtFirst, "main", hubR, hubR) === "block", true);
   expectBool("B11c: MIXED content hub-first → block", scriptGitVerdict(sMixedHubFirst, "main", hubR, hubR) === "block", true);
   expectBool("B12: extractScriptPath handles subshell wrappers", extractScriptPath(`(cd /tmp && bash x.sh)`) === "x.sh", true);
+  expectBool("B29: extractScriptPath skips interpreter flags (round-4)", extractScriptPath(`bash -x evil.sh`) === "evil.sh", true);
   expectBool("B12b: end-to-end subshell script at wt cwd → allow", (() => {
     const p = mkS("mutation.sh", `git reset --hard\n`);
     const execCwd = commandExecutionCwd(`(cd "${wtR}" && bash ./mutation.sh)`, hubR);

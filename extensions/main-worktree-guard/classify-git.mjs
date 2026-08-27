@@ -91,8 +91,16 @@ function _tokenize(command) {
     if (i >= s.length) break;
 
     // Two-char operators (`>>`/`<<` are redirects, not just `>`+`>`).
+    // Check THREE-char `&>>` BEFORE the two-char `&>` (round-4: `&>>` was dead
+    // behind `&>` — the bug reviewer probe).
+    const three = s.slice(i, i + 3);
+    if (three === "&>>") {
+      tokens.push(three);
+      i += 3;
+      continue;
+    }
     const two = s.slice(i, i + 2);
-    if (two === "&&" || two === "||" || two === ">>" || two === "<<" || two === "&>" || two === ">&" || two === "&>>") {
+    if (two === "&&" || two === "||" || two === ">>" || two === "<<" || two === "&>" || two === ">&") {
       tokens.push(two);
       i += 2;
       continue;
@@ -152,7 +160,7 @@ function _tokenize(command) {
 const _SHELL_OPS = new Set(["&&", "||", "|", "&", ";", "(", ")"]);
 function _isShellBoundary(tok) {
   if (_SHELL_OPS.has(tok)) return true;
-  if (tok === ">" || tok === ">>" || tok === "<" || tok === "<<") return true;
+  if (tok === ">" || tok === ">>" || tok === "<" || tok === "<<" || tok === "&>" || tok === ">&" || tok === "&>>") return true;
   // fd-prefixed redirects emitted by _tokenize: `2>`, `2>>`, `2<`, `2<<`, `2>&1`,
   // `1>&2`, `2>&-`.
   if (/^[0-9]+(?:>>?|<<?)$/.test(tok)) return true;
@@ -279,7 +287,8 @@ function _worktreeGitdirMap(sessionCwd) {
     if (common === null) return map;
     const adminRoot = join(common, "worktrees");
     if (!existsSync(adminRoot)) return map;
-    for (const name of readdirSync(adminRoot)) {
+    const adminNames = readdirSync(adminRoot);
+    for (const name of adminNames) {
       try {
         const gitfile = readFileSync(join(adminRoot, name, "gitdir"), "utf-8").trim();
         const wtPath = _realpathSafe(dirname(gitfile));
@@ -368,14 +377,14 @@ export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd
     // GIT_OBJECT_DIRECTORY resolving OUTSIDE the worktree redirects the
     // mutation into the hub's state — not isolated.
     if (inv.indexFileHint) {
-      const idx = _realpathSafe(resolve(cwd, inv.indexFileHint));
-      if (idx !== null && !(idx === worktreePath || idx.startsWith(worktreePath + "/"))) {
+      const idx = _realpathSafe(resolve(cwd, inv.indexFileHint)) ?? resolve(cwd, inv.indexFileHint); // resolve fallback for not-yet-existing (round-4)
+      if (!(idx === worktreePath || idx.startsWith(worktreePath + "/"))) {
         return { effectiveCwd: cwd, gitDir, worktreePath, worktreeBranch: null, isWorktree: false };
       }
     }
     if (inv.objDirsHint) {
-      const od = _realpathSafe(resolve(cwd, inv.objDirsHint.split(":")[0] ?? ""));
-      if (od !== null && !(od === worktreePath || od.startsWith(worktreePath + "/"))) {
+      const od = _realpathSafe(resolve(cwd, inv.objDirsHint.split(":")[0] ?? "")) ?? resolve(cwd, inv.objDirsHint.split(":")[0] ?? "");
+      if (!(od === worktreePath || od.startsWith(worktreePath + "/"))) {
         return { effectiveCwd: cwd, gitDir, worktreePath, worktreeBranch: null, isWorktree: false };
       }
     }
@@ -442,7 +451,7 @@ function _walkShell(command, h = {}) {
   // Per-paren-depth frame: chain, vars (persisted shell state), segVars (vars
   // at the last boundary — the expansion scope for a segment's own words),
   // baseLen (chain length at last boundary), pipeC0, pipeActive.
-  const stack = [{ chain: [], vars: {}, segVars: {}, baseLen: 0, pipeC0: null, pipeActive: false }];
+  const stack = [{ chain: [], vars: {}, segVars: {}, baseLen: 0, pipeC0: null, pipeActive: false, persistHints: { gitDirHint: null, workTreeHint: null } }];
   const frame = () => stack[stack.length - 1];
   const refreshSeg = (f) => { f.segVars = { ...f.vars }; };
   const restoreC0 = (f) => { if (f.pipeActive && f.pipeC0) f.chain.splice(0, f.chain.length, ...f.pipeC0); };
@@ -457,7 +466,6 @@ function _walkShell(command, h = {}) {
     h.onBoundary?.();
   };
   const subshellReset = (f) => { f.vars = {}; f.baseLen = f.chain.length; refreshSeg(f); };
-  let persistHints = { gitDirHint: null, workTreeHint: null }; // export GIT_DIR=... — whole command
   let pendingHints = {}; // GIT_DIR=x / GIT_WORK_TREE=x prefixes — next command only
   let prevWasBoundary = true; // cd is the builtin only in command-word position (round-3)
   let i = 0;
@@ -482,9 +490,9 @@ function _walkShell(command, h = {}) {
     if (t === "(") {
       const f = frame();
       restoreC0(f);
-      stack.push({ chain: [...f.chain], vars: {}, segVars: {}, baseLen: f.chain.length, pipeC0: null, pipeActive: false });
+      stack.push({ chain: [...f.chain], vars: {}, segVars: {}, baseLen: f.chain.length, pipeC0: null, pipeActive: false, persistHints: { ...f.persistHints } });
       pendingHints = {};
-      persistHints = { ...persistHints }; // exports are subshell-scoped (round-3 P3)
+      frame().persistHints = { ...frame().persistHints }; // exports are subshell-scoped
       prevWasBoundary = true;
       h.onParenPush?.();
       i++;
@@ -507,36 +515,47 @@ function _walkShell(command, h = {}) {
       f.chain.splice(0, f.chain.length, ...(f.pipeC0 || [])); // discard segment cds, reseed from C0
       subshellReset(f);
       pendingHints = {};
-      persistHints = { gitDirHint: null, workTreeHint: null }; // pipe segments are subshells — exports don't leak (round-3)
+      frame().persistHints = { gitDirHint: null, workTreeHint: null }; // pipe segments are subshells — exports don't leak
       prevWasBoundary = true;
       h.onPipe?.();
       i++;
       continue;
     }
     if (t === "&&" || t === "||" || t === ";") { boundary(false); pendingHints = {}; prevWasBoundary = true; i++; continue; }
-    if (t === "&") { boundary(true); pendingHints = {}; persistHints = { gitDirHint: null, workTreeHint: null }; prevWasBoundary = true; i++; continue; } // background — whole list in a subshell
+    if (t === "&") { boundary(true); pendingHints = {}; frame().persistHints = { gitDirHint: null, workTreeHint: null }; prevWasBoundary = true; i++; continue; } // background — whole list in a subshell
     if (t === "export") {
-      const next = tokens[i + 1];
-      if (next && /^(GIT_DIR|GIT_WORK_TREE)=/.test(next)) {
-        const eq = next.indexOf("=");
-        const name = next.slice(0, eq), value = next.slice(eq + 1);
-        if (name === "GIT_DIR") persistHints.gitDirHint = value; else persistHints.workTreeHint = value;
-        i += 2;
-      } else if (next === "GIT_DIR" || next === "GIT_WORK_TREE") {
-        // `unset`-style revert via `export GIT_DIR` (no =) → clear (round-3)
-        if (next === "GIT_DIR") persistHints.gitDirHint = null; else persistHints.workTreeHint = null;
-        i += 2;
-      } else {
-        i++;
+      // Round-4: `export` consumes ALL following words as args (none is a
+      // command word — `export cd <wt> && git commit` does NOT run cd). Only
+      // GIT_DIR/GIT_WORK_TREE assignments (or bare names) affect persistHints.
+      let j = i + 1;
+      while (j < tokens.length && !_isShellBoundary(tokens[j])) {
+        const n = tokens[j];
+        if (/^GIT_DIR=(.*)$/.test(n)) { frame().persistHints.gitDirHint = n.slice("GIT_DIR=".length); }
+        else if (/^GIT_WORK_TREE=(.*)$/.test(n)) { frame().persistHints.workTreeHint = n.slice("GIT_WORK_TREE=".length); }
+        else if (n === "GIT_DIR") { frame().persistHints.gitDirHint = null; }
+        else if (n === "GIT_WORK_TREE") { frame().persistHints.workTreeHint = null; }
+        j++;
       }
+      i = j;
       prevWasBoundary = true;
       continue;
     }
     if (t === "unset") {
-      const next = tokens[i + 1];
-      if (next === "GIT_DIR") { persistHints.gitDirHint = null; i += 2; }
-      else if (next === "GIT_WORK_TREE") { persistHints.workTreeHint = null; i += 2; }
-      else { i++; }
+      // Round-4: `unset` consumes ALL following args; deletes the named var
+      // from persisted shell state (not just GIT_DIR/GIT_WORK_TREE — `unset
+      // WT` must clear a stale WT used by a later `cd "$WT"`, security P2).
+      let j = i + 1;
+      while (j < tokens.length && !_isShellBoundary(tokens[j])) {
+        const n = tokens[j];
+        if (n === "GIT_DIR") frame().persistHints.gitDirHint = null;
+        else if (n === "GIT_WORK_TREE") frame().persistHints.workTreeHint = null;
+        else if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(n)) {
+          delete frame().vars[n];
+          delete frame().segVars[n];
+        }
+        j++;
+      }
+      i = j;
       prevWasBoundary = true;
       continue;
     }
@@ -548,6 +567,15 @@ function _walkShell(command, h = {}) {
     // resolve outside the worktree.
     if (/^GIT_INDEX_FILE=/.test(t)) { pendingHints.indexFileHint = t.slice("GIT_INDEX_FILE=".length); i++; continue; }
     if (/^GIT_OBJECT_DIRECTORY=/.test(t) || /^GIT_ALTERNATE_OBJECT_DIRECTORIES=/.test(t)) { pendingHints.objDirsHint = t.slice(t.indexOf("=") + 1); i++; continue; }
+    // Redirects (bare + fd-prefixed + &>) never start a command — skip them
+    // (and their operand) WITHOUT clearing prevWasBoundary, so a redirect-led
+    // command word is still recognized: `> /dev/null cd <wt> && git commit` runs
+    // the cd (round-4 bug reviewer R4-11).
+    if (t === ">" || t === ">>" || t === "<" || t === "<<" || t === "&>" || t === ">&" || t === "&>>" || /^(?:[0-9]+)?[<>]/.test(t) || /^[0-9]+>&[0-9]*-?$/.test(t)) {
+      const fdSingle = /^[0-9]+>&[0-9]*-?$/.test(t); // 2>&1 — no separate operand
+      i += fdSingle ? 1 : 2;
+      continue;
+    }
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
       const eq = t.indexOf("=");
       // Statement-vs-prefix (round-3 P1): scan past io-redirects + their operands
@@ -572,19 +600,64 @@ function _walkShell(command, h = {}) {
       if (isStatement) frame().vars[t.slice(0, eq)] = t.slice(eq + 1);
       // else: env PREFIX — does NOT persist, NOT visible to the next command's own
       // word expansion (bash) — irrelevant to the guard except as a trap; ignored.
-      // prevWasBoundary stays TRUE for prefixes (the next token is the command word).
+      // prevWasBoundary stays TRUE for prefixes (the next token is the command
+      // word), EXCEPT redirects+operands in between: skip them in the main walk
+      // WITHOUT clearing prevWasBoundary — `VAR=x > /dev/null cd /wt` runs the cd
+      // (round-4 bug reviewer; previously the `>`/operand hit onOther → a real cd
+      // was missed → false-block freeze).
+      if (!isStatement) {
+        let k = i + 1;
+        while (k < tokens.length && (/^(?:[0-9]+)?[<>]/.test(tokens[k]) || tokens[k] === ">" || tokens[k] === ">>" || tokens[k] === "<" || tokens[k] === "<<" || tokens[k] === "&>" || tokens[k] === ">&" || tokens[k] === "&>>" || /^[0-9]+>&[0-9]*-?$/.test(tokens[k]))) {
+          k += 2; // skip redirect + operand
+        }
+        i = k - 1; // the loop's i++ lands on the command word
+      }
       i++;
       continue;
     }
-    // Script-path tokens (backdoor surface): interpreter + non-flag path,
-    // `. script`, or ./x.sh direct execution — snapshot the chain AT this point.
+    // Script-path tokens (backdoor surface): interpreter + flags + path,
+    // `. script`, or ./x.sh direct execution. Round-4: skip ALL leading
+    // interpreter flags (`bash -x evil.sh` — the old code returned null on the
+    // first `-x`), and gate `-c 'inline command'` content by recursively
+    // walking it (the interpreter-inline bypass: `bash -c 'git reset --hard'`
+    // previously produced zero invocations → the whole M4 gate was skipped).
     if (SHELL_INTERPRETERS.has(t)) {
-      const next = tokens[i + 1];
-      if (next && !next.startsWith("-")) {
-        h.onScriptToken?.([...frame().chain]);
-        i += 2;
-      } else {
-        i++; // `-c` inline or flag — not a script file (gated by the normal classifier)
+      let j = i + 1;
+      let sawInline = false;
+      while (j < tokens.length) {
+        const n = tokens[j];
+        if (n === "-c" || n === "--command") {
+          const inline = tokens[j + 1];
+          if (inline !== undefined && !_isShellBoundary(inline)) {
+            // Recursively walk the inline command (its cds resolve from the
+            // CURRENT chain) and forward its git invocations.
+            const base = [...frame().chain];
+            const nested = allGitInvocations(inline);
+            for (const ni of nested) {
+              h.onGitEnd?.({
+                ...ni,
+                cdChain: [...base, ...ni.cdChain],
+                cHints: [...(frame().pipeActive ? frame().chain.slice(0, frame().baseLen) : []), ...ni.cHints],
+              });
+            }
+            sawInline = true;
+            i = j + 2;
+          }
+          break;
+        }
+        if (!n.startsWith("-")) break; // first non-flag = the script path
+        j++;
+      }
+      if (!sawInline) {
+        // first non-flag token = script path (skip ALL flags)
+        let k = i + 1;
+        while (k < tokens.length && tokens[k].startsWith("-")) k++;
+        if (k < tokens.length) {
+          h.onScriptToken?.([...frame().chain]);
+          i = k + 1;
+        } else {
+          i++;
+        }
       }
       prevWasBoundary = false;
       continue;
@@ -613,8 +686,8 @@ function _walkShell(command, h = {}) {
     const cHints = [];
     // Round-3 P1: a bare per-command prefix WINS over an exported value (bash:
     // `export GIT_DIR=/a; GIT_DIR=/b git …` runs with /b — probe-verified).
-    let gitDirHint = pendingHints.gitDirHint ?? persistHints.gitDirHint ?? null;
-    let workTreeHint = pendingHints.workTreeHint ?? persistHints.workTreeHint ?? null;
+    let gitDirHint = pendingHints.gitDirHint ?? frame().persistHints.gitDirHint ?? null;
+    let workTreeHint = pendingHints.workTreeHint ?? frame().persistHints.workTreeHint ?? null;
     let indexFileHint = pendingHints.indexFileHint ?? null;
     let objDirsHint = pendingHints.objDirsHint ?? null;
     pendingHints = {};
@@ -1172,11 +1245,21 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
       if (["-b", "-B", "-c", "-f", "--force", "--orphan", "--detach"].some(flag)) return "block";
       if (pos.length !== 1 || pos[0] === "." || pos[0] === "-") return "block";
       return pos[0] === "main" || pos[0] === "master" ? "recovery" : "block";
-    case "pull":
-      // Plain pull may merge — only --ff-only is lossless recovery.
-      return flag("--ff-only") ? "recovery" : "block";
     case "fetch":
+    case "pull": {
+      // Round-4 (security re-review F3): fetch/pull are sanctioned recovery
+      // ONLY when the refspec does not write the protected branch —
+      // `git fetch origin +backup:refs/heads/main` redirects main to a
+      // non-main history (probe-verified). Only EXPLICIT `:dst` refspecs
+      // matter (`git fetch origin main` has an implicit dst under
+      // refs/remotes/); a dst of refs/heads/main|master is a shared-branch-ref
+      // mutation → block.
+      for (const x of a) {
+        if (x.includes(":") && (_refspecDst(x) === "main" || _refspecDst(x) === "master")) return "block";
+      }
+      if (verb === "pull" && !flag("--ff-only")) return "block";
       return "recovery";
+    }
     case "status":
     case "log":
       return "recovery";
@@ -1345,9 +1428,8 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
         if (target && target.isWorktree &&
             target.worktreeBranch !== "main" && target.worktreeBranch !== "master") {
-          exempted = true;
           return {
-            verdict: "block", exempted: true,
+            verdict: "block", exempted: false, // audit must NOT log blocked ops (round-4)
             reason: _mainProtectionReason(inv,
               `Worktree checkout of the hub's protected branch "${pos[0]}" while the hub is`,
               `off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
@@ -1361,17 +1443,42 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
       if (target && target.isWorktree) {
         exempted = true;
-        // Main-protection: a worktree on the hub's protected branch is NOT
-        // isolated for mutations (commits/pushes move the shared main ref).
+        // Main-protection (round-3 P1): a worktree on the hub's protected branch
+        // is NOT isolated for mutations (commits/pushes move the shared main ref).
         if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
           return {
-            verdict: "block", exempted: true,
+            verdict: "block", exempted: false, // audit must NOT log blocked ops (round-3/4)
             reason: _mainProtectionReason(inv,
               `The worktree is checked out on the hub's protected branch "${target.worktreeBranch}" —`,
               `its mutations would advance the shared main ref.`),
           };
         }
+        // Round-4 (security F2 + second-model P1): `checkout -B main` from a wt
+        // force-moves the shared main ref — intercept ANY checkout/switch whose
+        // TARGET branch is main/master (not just the sanctioned `checkout main`
+        // recovery form, which the recovery-interception above handles).
+        if (inv.verb === "checkout" || inv.verb === "switch") {
+          const pos = (inv.args || []).filter((x) => !x.startsWith("-"));
+          if (pos.length >= 1 && (pos[0] === "main" || pos[0] === "master")) {
+            return {
+              verdict: "block", exempted: false,
+              reason: _mainProtectionReason(inv,
+                `Worktree checkout targeting the hub's protected branch "${pos[0]}" while the hub`,
+                `is off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
+            };
+          }
+        }
         if (!WORKTREE_LOCAL_VERBS.has(inv.verb)) {
+          // Round-4 (security P2): `git symbolic-ref <non-HEAD>` from a wt
+          // rewrites a SHARED ref (refs/remotes/origin/HEAD probe) — the
+          // readonly classification is unsafe for worktree targets.
+          if (inv.verb === "symbolic-ref") {
+            return {
+              verdict: "block", exempted: false,
+              reason: _mainProtectionReason(inv,
+                `symbolic-ref from a worktree target rewrites a shared ref — not isolated.`),
+            };
+          }
           // Shared-ref/remote/unknown verb: re-classify against the WORKTREE's
           // own branch — the recovery carve-out (e.g. push origin
           // <checked-out-branch>) derives from the wt's HEAD, not the hub's.
@@ -1403,6 +1510,19 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       };
     }
     if (v === "recovery") sawRecovery = true;
+    // Round-4 (security P2): `git symbolic-ref <non-HEAD>` from a worktree
+    // rewrites a SHARED ref (refs/remotes/origin/HEAD probe) — the readonly
+    // classification is unsafe for worktree targets.
+    if (v === "readonly" && inv.verb === "symbolic-ref" && !(inv.args || []).includes("HEAD")) {
+      const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
+      if (target && target.isWorktree) {
+        return {
+          verdict: "block", exempted: false,
+          reason: _mainProtectionReason(inv,
+            `symbolic-ref from a worktree target rewrites a shared ref — not isolated.`),
+        };
+      }
+    }
   }
   return { verdict: sawRecovery ? "recovery" : "allowed", exempted };
 }
@@ -1520,9 +1640,16 @@ export function extractScriptPath(command) {
   if (i >= tokens.length) return null;
   const t = tokens[i];
   if (SHELL_INTERPRETERS.has(t)) {
-    const next = tokens[i + 1];
-    if (!next || next.startsWith("-")) return null; // flags / -c inline
-    return next;
+    // Round-4: skip ALL leading interpreter flags (`bash -x evil.sh` — the old
+    // code returned null on the first `-x`, reopening the script backdoor).
+    let j = i + 1;
+    let sawInline = false;
+    while (j < tokens.length && tokens[j].startsWith("-")) {
+      if (tokens[j] === "-c" || tokens[j] === "--command") sawInline = true;
+      j++;
+    }
+    if (sawInline) return null; // `-c 'inline'` — not a script file (gated by the normal classifier)
+    return j < tokens.length ? tokens[j] : null;
   }
   if (t === ".") { // `. script`
     const next = tokens[i + 1];

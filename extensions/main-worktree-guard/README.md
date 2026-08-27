@@ -75,25 +75,38 @@ like `git subtree push`) is re-classified against the worktree's OWN checked-out
 branch (`git push origin <the wt's branch>` is the carve-out; push `-f`/
 foreign/delete/empty-source-`:ref`/`--all`/`--prune` still block).
 **Main-protection:** a worktree checked out on `main`/`master` is the hub's
-protected branch — mutations block; `git checkout main` from a worktree while
-the hub is off-main (main free) blocks. `GIT_INDEX_FILE`/`GIT_OBJECT_DIRECTORY`
-redirecting outside the worktree block. `&>`/`>&` are single redirect tokens
-(not background boundaries). `cd` is recognized only in command-word position
-(`echo cd …` is not a cd). No total-bash-gate bypass: the exemption is semantic,
-never path-string-based; hub/foreign/unresolvable targets keep today's blocks
-(including `-C <wt> --git-dir=<hub>/.git …`, `--git-dir=<hub>/.git/worktrees/<x>`
-from the hub cwd, `GIT_DIR=<wt>/.git` from the hub cwd, and crafted reverse-
-pointer files — two-way back-reference validation). The write/edit M4 block is
-target-aware (hub-equality): only HUB-targeted writes block while the hub is
-disordered (D3 preserved — the block still runs before the marker bypass);
-worktree/foreign/`/tmp` writes are isolated. `GIT_DIR`/`GIT_WORK_TREE` env
-PREFIXES are scoped to the next command only (a bare prefix overrides an
-exported value — bash); `export GIT_DIR=`/`export GIT_WORK_TREE=` persist for
-the whole command until `unset`/`export` without value; `VAR=x cd "$VAR"`
-same-segment expansion is bash-faithful (pre-assignment — unresolvable →
-conservative block); `VAR=x` followed by a redirect is a prefix, not a
-statement. Worktree exemptions are audited (`event:
-"m4_worktree_exemption"`).
+protected branch — mutations block; `git checkout main` AND force forms
+(`checkout -B main`) from a worktree while the hub is off-main (main free)
+block. **Interpreter-inline gating:** `bash -c 'git …'`/`sh -c`/`zsh -c`/
+`eval` content is recursively parsed and gated (no inline bypass);
+`bash -x evil.sh` style leading interpreter flags are skipped (script files
+still gated). **fetch/pull refspecs:** explicit `:dst` refspecs writing
+`refs/heads/main|master` block (implicit-dst fetches stay recovery).
+**symbolic-ref** from a worktree target blocks (shared refs). `GIT_INDEX_FILE`/
+`GIT_OBJECT_DIRECTORY` redirecting outside the worktree block (with a
+resolve-fallback for not-yet-existing paths). `&>`/`>&`/`&>>` are single
+redirect tokens (not background boundaries) and are args boundaries.
+`export`/`unset` consume all following args (their operands are never command
+words); `unset NAME` deletes the persisted var; redirects never start a command
+(a redirect-led `cd` is still the builtin). No total-bash-gate bypass: the
+exemption is semantic, never path-string-based; hub/foreign/unresolvable
+targets keep today's blocks (including `-C <wt> --git-dir=<hub>/.git …`,
+`--git-dir=<hub>/.git/worktrees/<x>` from the hub cwd, `GIT_DIR=<wt>/.git`
+from the hub cwd, and crafted reverse-pointer files — two-way back-reference
+validation; note: an agent that writes `.git/worktrees/` internals directly is
+a deliberate-bypass actor, same class as the documented `GIT_INDEX_FILE`
+limitation). The write/edit M4 block is target-aware (hub-equality): only
+HUB-targeted writes block while the hub is disordered (D3 preserved — the
+block still runs before the marker bypass); worktree/foreign/`/tmp` writes are
+isolated. `GIT_DIR`/`GIT_WORK_TREE` env PREFIXES are scoped to the next command
+only (a bare prefix overrides an exported value — bash);
+`export GIT_DIR=`/`export GIT_WORK_TREE=` persist for the whole command until
+`unset`/`export` without value, and are subshell-scoped (`(unset GIT_DIR)`
+does not leak); `VAR=x cd "$VAR"` same-segment expansion is bash-faithful
+(pre-assignment — unresolvable → conservative block); `VAR=x` followed by a
+redirect is a prefix, not a statement. Worktree exemptions are audited
+(`event: "m4_worktree_exemption"` — blocked ops are never logged as
+exemptions).
 
 **The script backdoor is CLOSED.** The old escape — `write /tmp/x.sh` + `bash
 /tmp/x.sh` — executed arbitrary git unblocked. Now a shell-script execution
