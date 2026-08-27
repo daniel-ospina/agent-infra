@@ -164,7 +164,7 @@ function _isShellBoundary(tok) {
   // fd-prefixed redirects emitted by _tokenize: `2>`, `2>>`, `2<`, `2<<`, `2>&1`,
   // `1>&2`, `2>&-`.
   if (/^[0-9]+(?:>>?|<<?)$/.test(tok)) return true;
-  if (/^[0-9]+>&[0-9]*-?$/.test(tok)) return true;
+  if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$/.test(tok)) return true;
   return false;
 }
 
@@ -599,8 +599,8 @@ function _walkShell(command, h = {}, seedVars = {}) {
     // (and their operand) WITHOUT clearing prevWasBoundary, so a redirect-led
     // command word is still recognized: `> /dev/null cd <wt> && git commit` runs
     // the cd (round-4 bug reviewer R4-11).
-    if (t === ">" || t === ">>" || t === "<" || t === "<<" || t === "&>" || t === ">&" || t === "&>>" || /^(?:[0-9]+)?[<>]/.test(t) || /^[0-9]+>&[0-9]*-?$/.test(t)) {
-      const fdSingle = /^[0-9]+>&[0-9]*-?$/.test(t); // 2>&1 — no separate operand
+    if (t === ">" || t === ">>" || t === "<" || t === "<<" || t === "&>" || t === ">&" || t === "&>>" || /^(?:[0-9]+)?[<>]/.test(t) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$/.test(t)) {
+      const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$/.test(t); // 2>&1 — no separate operand
       i += fdSingle ? 1 : 2;
       continue;
     }
@@ -616,7 +616,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
         // Redirects (+ operands) and fd-redirects first — they are ALSO shell
         // boundaries for the args loop but do NOT terminate an assignment
         // statement (`VAR=x > /dev/null git fetch` is a PREFIX, round-3).
-        if (/^(?:[0-9]+)?[<>]/.test(n) || n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^[0-9]+>&[0-9]*-?$/.test(n)) {
+        if (/^(?:[0-9]+)?[<>]/.test(n) || n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$/.test(n)) {
           j += 2; // redirect + its operand
           continue;
         }
@@ -635,7 +635,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
       // was missed → false-block freeze).
       if (!isStatement) {
         let k = i + 1;
-        while (k < tokens.length && (/^(?:[0-9]+)?[<>]/.test(tokens[k]) || tokens[k] === ">" || tokens[k] === ">>" || tokens[k] === "<" || tokens[k] === "<<" || tokens[k] === "&>" || tokens[k] === ">&" || tokens[k] === "&>>" || /^[0-9]+>&[0-9]*-?$/.test(tokens[k]))) {
+        while (k < tokens.length && (/^(?:[0-9]+)?[<>]/.test(tokens[k]) || tokens[k] === ">" || tokens[k] === ">>" || tokens[k] === "<" || tokens[k] === "<<" || tokens[k] === "&>" || tokens[k] === ">&" || tokens[k] === "&>>" || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$/.test(tokens[k]))) {
           k += 2; // skip redirect + operand
         }
         i = k - 1; // the loop's i++ lands on the command word
@@ -654,6 +654,10 @@ function _walkShell(command, h = {}, seedVars = {}) {
       let sawInline = false;
       while (j < tokens.length) {
         const n = tokens[j];
+        // Round-16 (final gate P1): skip operand-less fd redirects (`2<&1`,
+        // `2<&-`) when scanning for -c / the script path — `bash 2<&1 -c
+        // 'git reset'` ran the inline (probe moved HEAD).
+        if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$/.test(n)) { j++; continue; }
         if (n === "-c" || n === "--command") {
           // Round-5 (security F3): skip flags AFTER -c too — `bash -c -x 'git
           // reset'` takes the first NON-flag token as the command string.
@@ -814,8 +818,8 @@ function _walkShell(command, h = {}, seedVars = {}) {
         // simple command's args — only `; & | && || ( )` do (`git push > /tmp/l
         // origin main:main` must keep its refspec args; truncating them would
         // classify as a bare push of the current branch).
-        if (g === ">" || g === ">>" || g === "<" || g === "<<" || g === "&>" || g === ">&" || g === "&>>" || /^(?:[0-9]+)?[<>]/.test(g) || /^[0-9]+>&[0-9]*-?$/.test(g)) {
-          const fdSingle = /^[0-9]+>&[0-9]*-?$/.test(g); // 2>&1 — no separate operand
+        if (g === ">" || g === ">>" || g === "<" || g === "<<" || g === "&>" || g === ">&" || g === "&>>" || /^(?:[0-9]+)?[<>]/.test(g) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$/.test(g)) {
+          const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$/.test(g); // 2>&1 — no separate operand
           i += fdSingle ? 1 : 2;
           continue;
         }
@@ -2010,13 +2014,13 @@ export function extractScriptPath(command) {
         j++;
         continue;
       }
-      if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n) || /^[0-9]+>&[0-9]*-?$/.test(n)) {
+      if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$/.test(n)) {
         // Round-15 (final gate P1): only a STDIN redirect (`<`, `<<`, `0<`)
         // has a script-file operand. `>`/`>>`/`&>`/`>&`/fd-`>` operands are
         // OUTPUT files — skip operator+operand and continue scanning
         // (`bash 2>&1 < /tmp/evil.sh` re-opened the backdoor — the old code
         // returned the first redirect's operand, which was `2>&1`'s neighbor).
-        const isFdSingle = /^[0-9]+>&[0-9]*-?$/.test(n); // 2>&1 — no operand
+        const isFdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$/.test(n); // 2>&1 — no operand
         if (n === "<" || n === "<<" || n === "0<" || n === "0<<") {
           const operand = tokens[j + 1];
           return operand && !operand.startsWith("-") ? operand : null; // the stdin file IS the script

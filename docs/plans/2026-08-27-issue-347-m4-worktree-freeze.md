@@ -489,8 +489,9 @@ sides).
    obfuscation (`${G:0:3}`, `${X//foo/git}` quote-concat name-splitting) is a
    deliberate-bypass actor — the guard's threat model is accidental collision,
    not adversarial shell. Documented residual conservative false-blocks:
-   read-only git in a substitution (`git commit -m "$(git rev-parse HEAD)"`),
    heredoc-to-shell with a git word (`cat <<'EOF' | bash` + git status),
+   (read-only/recovery git in a substitution now PASSES — round-13 `_spanCarriesGit`
+   classifies span verbs; only mutations/unknowns fail closed,)
    spawner-window `eval cd`/`command cd` (conservative), `env -C <wt>`-style
    spawner flags.
 5b. **`-c core.worktree=<path>` redirection**: empirically IGNORED by git 2.50.1

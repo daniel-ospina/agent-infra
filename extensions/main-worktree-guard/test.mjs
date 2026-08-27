@@ -819,6 +819,7 @@ try {
   m4t("T105: spawner + flag var-hop (env -i) → block", `G=git; env -i \$G -C "${hubR}" reset --hard`, "block");
   m4t("T106: spawner + flag operand var-hop (sudo -u root) → block", `G=git; sudo -u root \$G -C "${hubR}" reset --hard`, "block");
   m4t("T107: spawner-window cd is NOT the builtin → block (round-15)", `env -i cd "${wtR}"; git commit -m x`, "block");
+  m4t("T108: fd-INPUT redirect before -c inline → block (round-16)", `bash 2<&1 -c "git reset --hard"`, "block");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
@@ -928,6 +929,7 @@ try {
   expectBool("B34: extractScriptPath stdin-redirect → the script path (round-14)", extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh", true);
   expectBool("B35: stdin-redirect script content gated → block", (() => { const p = mkS("stdin.sh", `git reset --hard\n`); return extractScriptPath(`bash < ${p}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "block"; })(), true);
   expectBool("B36: fd-redirect before stdin-redirect → the stdin path (round-15)", extractScriptPath(`bash 2>&1 < /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash 2>/dev/null < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B37: fd-INPUT dup before the script path → the script path (round-16)", extractScriptPath(`bash 2<&1 /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash 2<&- /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`sh 0<&1 /tmp/evil.sh`) === "/tmp/evil.sh", true);
   expectBool("B12b: end-to-end subshell script at wt cwd → allow", (() => {
     const p = mkS("mutation.sh", `git reset --hard\n`);
     const execCwd = commandExecutionCwd(`(cd "${wtR}" && bash ./mutation.sh)`, hubR);
