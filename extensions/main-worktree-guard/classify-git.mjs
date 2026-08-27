@@ -1458,15 +1458,16 @@ function _unverifiableGitContent(command) {
   const c = String(command ?? "");
   const tokens = _tokenize(c);
   for (const t of tokens) {
-    // $( ) / backtick substitution: test the SUBSTITUTION SPAN for git OR a
-    // shell var reference — `G=git; echo "$($G reset)"` evades a literal-git
-    // scan (security re-review P2, probe: hub WIP destroyed), while prose
-    // "git" in the surrounding token (`-m "use git $(date)"`) must NOT
-    // false-block (second-model P2).
-    const m = t.match(/\$\(([^)]*)\)|`([^`]*)`/);
-    if (m) {
-      const inner = (m[1] ?? m[2] ?? "");
-      if (/\bgit\b/.test(inner) || /\$[A-Za-z_]|\$\{/.test(inner)) return true;
+    // $( ) / backtick substitution: test EVERY span (matchAll — a non-global
+    // String.match only inspects the FIRST span, letting `$(date) $(git -C
+    // <hub> reset)` evade — final gate P1). A span carries git OR a var in
+    // COMMAND-NAME position (`$($G reset)` — the var-hop; `$(cat $FILE)` has
+    // the var in argument position and must NOT false-block — final gate P2).
+    const spans = [...t.matchAll(/\$\(([^)]*)\)|`([^`]*)`/g)];
+    for (const m of spans) {
+      const inner = (m[1] ?? m[2] ?? "").trim();
+      if (/\bgit\b/.test(inner)) return true;
+      if (/^(\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)/.test(inner)) return true;
     }
   }
   // eval / alias / function indirection: token-scoped — only the construct's
@@ -1876,7 +1877,11 @@ function _stripShellComments(content) {
       const ch = line[i];
       if (ch === "'" && !inD) { inS = !inS; continue; }
       if (ch === '"' && !inS) { inD = !inD; continue; }
-      if (ch === "#" && !inS && !inD) return line.slice(0, i);
+      // Round-7 (final gate P2): bash starts a comment only at a WORD-START
+      // `#` (line start or preceded by whitespace) — `echo a#b && git reset`
+      // keeps `a#b` as one word and runs the reset; the old truncate-at-any-`#`
+      // let it through as a "comment".
+      if (ch === "#" && !inS && !inD && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
     }
     return line;
   }).join("\n");

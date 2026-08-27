@@ -786,6 +786,8 @@ try {
   m4t("T77: alias + worktree commit → allowed (no false-block)", `cd "${wtR}" && alias ll="ls -la" && git commit -m x`, "allowed");
   m4t("T78: \$VAR hop inside substitution → block", `G=git; echo "\$(\$G -C "${hubR}" reset --hard)"`, "block");
   m4t("T79: prose git + \$(date) → allowed (substitution-span scoped)", `cd "${wtR}" && git commit -m "use git \$(date)"`, "allowed");
+  m4t("T80: multi-span — git in the 2nd substitution → block (matchAll)", `echo "\$(date) \$(git -C "${hubR}" reset --hard)"`, "block");
+  m4t("T81: \$VAR in substitution ARG position → allowed (no false-block)", `cd "${wtR}" && git commit -m "\$(cat \$MSG_FILE)"`, "allowed");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
@@ -890,6 +892,8 @@ try {
   expectBool("B31: script substitution git → block", scriptGitVerdict(sSubScript, "main", hubR, hubR) === "block", true);
   const sComment = mkS("comment-sub.sh", `# note: runs $(git rev-parse HEAD)\ngit status\n`);
   expectBool("B32: script COMMENT substitution → allow (comment-stripped scan)", scriptGitVerdict(sComment, "main", hubR, hubR) === "allow", true);
+  const sWordHash = mkS("word-hash.sh", `echo a#b && git reset --hard\n`);
+  expectBool("B33: script a#b (word-start comment rule) + reset → block (round-8)", scriptGitVerdict(sWordHash, "main", hubR, hubR) === "block", true);
   expectBool("B12b: end-to-end subshell script at wt cwd → allow", (() => {
     const p = mkS("mutation.sh", `git reset --hard\n`);
     const execCwd = commandExecutionCwd(`(cd "${wtR}" && bash ./mutation.sh)`, hubR);
