@@ -502,12 +502,12 @@ function _walkShell(command, h = {}) {
       restoreC0(f);
       stack.push({ chain: [...f.chain], vars: {}, segVars: {}, baseLen: f.chain.length, pipeC0: null, pipeActive: false, persistHints: { ...f.persistHints } });
       pendingHints = {};
-      frame().persistHints = { ...frame().persistHints }; // exports are subshell-scoped
       prevWasBoundary = true;
       h.onParenPush?.();
       i++;
       continue;
     }
+    if (t === "{" || t === "}") { i++; prevWasBoundary = true; continue; } // brace-group boundaries (round-11)
     if (t === ")") {
       if (stack.length > 1) stack.pop();
       pendingHints = {};
@@ -544,6 +544,11 @@ function _walkShell(command, h = {}) {
         else if (/^GIT_WORK_TREE=(.*)$/.test(n)) { frame().persistHints.workTreeHint = n.slice("GIT_WORK_TREE=".length); }
         else if (n === "GIT_DIR") { frame().persistHints.gitDirHint = null; }
         else if (n === "GIT_WORK_TREE") { frame().persistHints.workTreeHint = null; }
+        else if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(n)) {
+          // Round-11: `export G=git` sets the var (bash) — the $VAR command-word
+          // resolution (final gate P1) reads frame().vars.
+          frame().vars[n.slice(0, n.indexOf("="))] = n.slice(n.indexOf("=") + 1);
+        }
         j++;
       }
       i = j;
@@ -693,10 +698,22 @@ function _walkShell(command, h = {}) {
       prevWasBoundary = false;
       continue;
     }
-    // Round-6 (final gate P0): treat ANY token whose basename is `git` as a
+    // Round-11 (final gate P1): treat ANY token whose basename is `git` as a
     // git invocation start — `/usr/bin/git commit` bypassed the tokenizer's
-    // bare-`git` check (probe-verified: absolute-path git executed ungated).
-    if (!/^(?:.*\/)?git$/.test(t)) { h.onOther?.(t); i++; prevWasBoundary = false; continue; }
+    // bare-`git` check. ALSO resolve a command-position `$VAR` against
+    // prior-segment assignments (`G=git; $G -C <hub> reset --hard` bypassed the
+    // ENTIRE gate — allGitInvocations saw no git token; frame().vars already
+    // tracks G=git, the value was in hand and unused). Unresolvable `$VAR`
+    // command words (`$EDITOR`, `$BROWSER`) fall through (no false-block).
+    let isGitToken = /^(?:.*\/)?git$/.test(t);
+    if (!isGitToken && prevWasBoundary && /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(t)) {
+      const name = t.replace(/^\$\{?/, "").replace(/\}?$/, "");
+      const val = frame().vars[name];
+      if (val !== undefined && /^(?:.*\/)?git$/.test(String(val).trim().split(/\s+/)[0])) {
+        isGitToken = true;
+      }
+    }
+    if (!isGitToken) { h.onOther?.(t); i++; prevWasBoundary = false; continue; }
     // ── git invocation ──
     i++;
     const f = frame();
@@ -1484,17 +1501,31 @@ const SPAWNER_WORDS = new Set(["env", "sudo", "command", "xargs", "exec", "nohup
  * assignments); an interpreter or path as the first command token (script-in-
  * substitution); a SPAWNER at command position (start or after pipe/`;`) with
  * any `$VAR` argument. Recurses into nested substitutions (paren-balanced). */
-function _spanCarriesGit(inner) {
-  if (/\bgit\b/.test(inner)) return true;
+function _spanCarriesGit(inner, cmdVars = {}) {
+  // Literal git in the span: classify each git invocation — READ-ONLY and
+  // sanctioned-recovery verbs pass (`git describe`, `git status` in a commit
+  // message must NOT re-freeze the worktree commit — second-model P1);
+  // mutations/unknown verbs fail closed. A bare prose "git" word (no
+  // invocation) passes.
+  for (const gi of allGitInvocations(inner)) {
+    if (gi.verb && isHubRecoveryInvocation(gi.verb, gi.args, null) === "block") return true;
+  }
   for (const sub of _extractSubstitutionSpans(inner)) {
-    if (_spanCarriesGit(sub)) return true;
+    if (_spanCarriesGit(sub, cmdVars)) return true;
   }
   const t = _tokenize(inner);
   let k = 0;
-  while (k < t.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(t[k])) k++; // env prefixes
+  while (k < t.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t[k]) || t[k] === "{" || t[k] === "}")) k++; // env prefixes + brace-group openers (R11-4)
   const first = t[k];
   if (first === undefined) return false;
-  if (/^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/.test(first)) return true; // $VAR as command
+  if (/^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/.test(first)) {
+    // $VAR as command: resolve against the command's own assignments
+    // (`G=git; $( { $G reset; } )` — the outer G is known here; R11-4).
+    // Unassigned (env-provided $EDITOR) passes.
+    const name = first.replace(/^\$\{?/, "").replace(/\}?$/, "");
+    if (cmdVars[name] !== undefined && /^(?:.*\/)?git$/.test(String(cmdVars[name]).trim().split(/\s+/)[0])) return true;
+    return false;
+  }
   if (SHELL_INTERPRETERS.has(first) || /^\.{0,2}\//.test(first)) return true; // interpreter/path
   for (let i = k; i < t.length; i++) {
     if (SPAWNER_WORDS.has(t[i]) && (i === k || t[i - 1] === "|" || t[i - 1] === ";")) {
@@ -1512,11 +1543,33 @@ function _spanCarriesGit(inner) {
  * false-block). */
 function _unverifiableGitContent(command) {
   const c = String(command ?? "");
+  // Command-level assignments — the $VAR command-word resolution in spans and
+  // -c inlines resolves against these (`G=git; $( { $G reset; } )` — the nested
+  // walk's fresh frame has no G, but the OUTER command assigned it; R11-4).
+  const cmdVars = {};
+  for (const m of c.matchAll(/(?:^|[;&|\s])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=([^\s;&|]+)/g)) {
+    cmdVars[m[1]] = m[2];
+  }
+  // Round-11 (security P1): span extraction on the RAW command (unquoted
+  // `$( … )` splits into `$`/`(` tokens — the token-level scan missed them).
+  for (const inner of _extractSubstitutionSpans(c)) {
+    if (_spanCarriesGit(inner, cmdVars)) return true;
+  }
   const tokens = _tokenize(c);
   for (const t of tokens) {
     for (const inner of _extractSubstitutionSpans(t)) {
-      if (_spanCarriesGit(inner)) return true;
+      if (_spanCarriesGit(inner, cmdVars)) return true;
     }
+  }
+  // Round-11 (final gate P1): an interpreter `-c` inline command starting with
+  // a $VAR command word that is ASSIGNED in the command is unverifiable —
+  // `export G=git; sh -c '$G reset'` fails closed; `sh -c '$EDITOR x'` (env
+  // var, not command-assigned) passes (the second-model's no-blanket-block
+  // warning).
+  const cInlineVar = c.match(/\b(?:sh|bash|zsh|dash|ksh)\s+-c\s+['"]?\$(\{?[A-Za-z_][A-Za-z0-9_]*\}?)/);
+  if (cInlineVar) {
+    const name = cInlineVar[1].replace(/[{}]/g, "");
+    if (new RegExp(`(?:^|[;&|\\s])(?:export\\s+)?${name}=`).test(c)) return true;
   }
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
@@ -1529,10 +1582,30 @@ function _unverifiableGitContent(command) {
       if (/\bgit\b/.test(def)) return true;
     }
   }
-  // Round-10 (security P1): piped-stdin shell — `printf 'git …' | bash` runs
-  // the piped text as commands; the final segment is a shell interpreter and
-  // the command carries git content → unverifiable → fail-closed.
-  if (/\|\s*(?:bash|sh|zsh|dash|ksh)\s*(?:$|&&|\|\||;)/.test(c) && /\bgit\b/.test(c)) return true;
+  // Round-10/11 (security P1): piped-stdin shell — `printf 'git …' | bash` runs
+  // the piped text as commands. Classify the PIPED CONTENT (tokens between the
+  // pipe and a shell interpreter at ANY position — `| bash | cat`, `| bash -s`
+  // evaded the final-segment rule): mutations/unknowns/$VAR-command → block;
+  // read-only/recovery content (`echo 'git log' | bash`) passes.
+  const tokensAll = tokens;
+  for (let i = 0; i < tokensAll.length; i++) {
+    if (tokensAll[i] === "|" && i + 1 < tokensAll.length && SHELL_INTERPRETERS.has(tokensAll[i + 1])) {
+      const piped = tokensAll.slice(0, i).join(" ");
+      const pInns = allGitInvocations(piped);
+      if (pInns.length === 0) {
+        // Literal git text piped to a shell — classify the raw `git <verb>`
+        // occurrences (a `printf 'git log' | bash` passes — readonly; a
+        // `printf 'git reset' | bash` blocks).
+        const verbs = [...piped.matchAll(/\bgit\s+([A-Za-z][A-Za-z0-9-]*)/g)].map((m) => m[1]);
+        if (verbs.some((v) => isHubRecoveryInvocation(v, [], null) === "block")) return true;
+        if (piped.includes("git") && /\$[A-Za-z_]/.test(piped)) return true; // $VAR + git text → unverifiable
+      }
+      for (const pi of pInns) {
+        if (pi.verb && isHubRecoveryInvocation(pi.verb, pi.args, null) === "block") return true;
+      }
+      return false; // all piped git read-only/recovery → pass
+    }
+  }
   return false;
 }
 

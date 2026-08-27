@@ -796,6 +796,12 @@ try {
   m4t("T86: piped-stdin shell with git → block", `printf "git -C "${hubR}" reset --hard" | bash`, "block");
   m4t("T87: script-in-substitution → block", `echo "\$(bash /tmp/m4-evil.sh)"`, "block");
   m4t("T88: spawner word in ARG position → non-git (no false-block)", `echo "\$(echo time \$DUR)"`, "non-git");
+  // ── Round-11 closures (final gate round 3, all probe-verified) ──
+  m4t("T89: top-level \$VAR command word → block", `G=git; \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T90: brace-group \$VAR substitution → block", `G=git; \$( { \$G -C "${hubR}" reset --hard; } )`, "block");
+  m4t("T91: sh -c \$EDITOR (unassigned var) → non-git (no false-block)", `sh -c '\$EDITOR /tmp/x.txt'`, "non-git");
+  m4t("T92: read-only git in substitution → allowed (no freeze)", `cd "${wtR}" && git commit -m "v\$(git describe --tags)"`, "allowed");
+  m4t("T93: read-only piped git → non-git (no false-block)", `echo "git log" | bash`, "non-git");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
