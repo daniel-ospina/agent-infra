@@ -1447,49 +1447,92 @@ function _mainProtectionReason(inv, note) {
   ].join("\n");
 }
 
-/** Round-6 (final gate P1): content-scoped UNVERIFIABLE-git detection. The
- * invocation walk cannot see git inside $( ) / backticks / eval / alias /
- * function indirection (they collapse to opaque tokens). Scan the substituted
- * CONTENT (not the whole command — a worktree-exempt `git commit` before a
- * `$(date)` must not false-block): if any substitution/indirection carries a
- * git token (incl. absolute-path git), the command is unverifiable → the
- * caller fails closed while the hub is disordered. */
+/** Round-10 (final gate P1): paren-balanced extraction of $( … ) and backtick
+ * spans from a token (a naive `[^)]*` truncated at the FIRST `)` — nested
+ * substitutions evaded; security reviewer probe destroyed a hub commit). */
+function _extractSubstitutionSpans(token) {
+  const spans = [];
+  let i = 0;
+  while (i < token.length) {
+    if (token[i] === "$" && token[i + 1] === "(") {
+      let depth = 1, j = i + 2;
+      while (j < token.length && depth > 0) {
+        if (token[j] === "(") depth++;
+        else if (token[j] === ")") depth--;
+        j++;
+      }
+      spans.push(token.slice(i + 2, Math.max(i + 2, j - 1)));
+      i = j;
+    } else if (token[i] === "`") {
+      const j = token.indexOf("`", i + 1);
+      spans.push(token.slice(i + 1, j > -1 ? j : token.length));
+      i = j > -1 ? j + 1 : token.length;
+    } else {
+      i++;
+    }
+  }
+  return spans;
+}
+
+/** Shell words that SPAWN a command — a `$VAR` in their ARGUMENTS is the
+ * spawned command (`$(env $G reset)` = `git reset`; `$(cat $FILE)` is safe —
+ * cat is not a spawner). */
+const SPAWNER_WORDS = new Set(["env", "sudo", "command", "xargs", "exec", "nohup", "nice", "time", "eval", "sh", "bash", "zsh", "dash", "ksh"]);
+
+/** Does a substitution span carry an unverifiable git execution? Token-level
+ * scan: literal git; a `$VAR` as the first command token (skipping leading env
+ * assignments); an interpreter or path as the first command token (script-in-
+ * substitution); a SPAWNER at command position (start or after pipe/`;`) with
+ * any `$VAR` argument. Recurses into nested substitutions (paren-balanced). */
+function _spanCarriesGit(inner) {
+  if (/\bgit\b/.test(inner)) return true;
+  for (const sub of _extractSubstitutionSpans(inner)) {
+    if (_spanCarriesGit(sub)) return true;
+  }
+  const t = _tokenize(inner);
+  let k = 0;
+  while (k < t.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(t[k])) k++; // env prefixes
+  const first = t[k];
+  if (first === undefined) return false;
+  if (/^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/.test(first)) return true; // $VAR as command
+  if (SHELL_INTERPRETERS.has(first) || /^\.{0,2}\//.test(first)) return true; // interpreter/path
+  for (let i = k; i < t.length; i++) {
+    if (SPAWNER_WORDS.has(t[i]) && (i === k || t[i - 1] === "|" || t[i - 1] === ";")) {
+      if (t.slice(i + 1).some((a) => /\$/.test(a))) return true;
+    }
+  }
+  return false;
+}
+
+/** Round-6+: content-scoped UNVERIFIABLE-git detection. The invocation walk
+ * cannot see git inside $( ) / backticks / eval / alias / function indirection
+ * / piped-stdin shells (they collapse to opaque tokens or bypass the walk).
+ * Fail closed while the hub is disordered — but only for the construct's OWN
+ * content (a worktree-exempt `git commit` before a `$(date)` must not
+ * false-block). */
 function _unverifiableGitContent(command) {
   const c = String(command ?? "");
   const tokens = _tokenize(c);
   for (const t of tokens) {
-    // $( ) / backtick substitution: test EVERY span (matchAll — a non-global
-    // String.match only inspects the FIRST span, letting `$(date) $(git -C
-    // <hub> reset)` evade — final gate P1). A span carries git OR a var in
-    // COMMAND-NAME position (`$($G reset)` — the var-hop; `$(cat $FILE)` has
-    // the var in argument position and must NOT false-block — final gate P2).
-    const spans = [...t.matchAll(/\$\(([^)]*)\)|`([^`]*)`/g)];
-    for (const m of spans) {
-      const inner = (m[1] ?? m[2] ?? "").trim();
-      if (/\bgit\b/.test(inner)) return true;
-      // Var in COMMAND position — directly (`$($G reset)`) OR via a spawner
-      // builtin (`$(env $G reset)`, `$(sudo $G)`, `$(command $G)`, `$(xargs $G)`
-      // — the var in ARGUMENT position of a spawner IS the spawned command;
-      // round-8's start-anchor missed it, final gate P1). `$(cat $FILE)` passes
-      // (cat is not a spawner — T81).
-      if (/^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/.test(inner)) return true;
-      if (/(?:^|[\s|;])(?:env|sudo|command|xargs|exec|nohup|nice|time|eval|sh|bash|zsh|dash|ksh)\s+\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/.test(inner)) return true;
+    for (const inner of _extractSubstitutionSpans(t)) {
+      if (_spanCarriesGit(inner)) return true;
     }
   }
-  // eval / alias / function indirection: token-scoped — only the construct's
-  // OWN operands count (`cd <wt> && alias ll="ls -la" && git commit` must NOT
-  // false-block; `alias g=git` / `eval "$G reset"` must).
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
     if (t === "eval") {
       const rest = tokens.slice(i + 1, i + 4).join(" ");
-      if (/\bgit\b/.test(rest) || /\$[A-Za-z_]|\$\{/.test(rest)) return true;
+      if (/\bgit\b/.test(rest) || _spanCarriesGit(rest)) return true;
     }
     if ((t === "alias" || t === "function") && tokens[i + 1]) {
       const def = tokens.slice(i + 1, i + 3).join(" ");
       if (/\bgit\b/.test(def)) return true;
     }
   }
+  // Round-10 (security P1): piped-stdin shell — `printf 'git …' | bash` runs
+  // the piped text as commands; the final segment is a shell interpreter and
+  // the command carries git content → unverifiable → fail-closed.
+  if (/\|\s*(?:bash|sh|zsh|dash|ksh)\s*(?:$|&&|\|\||;)/.test(c) && /\bgit\b/.test(c)) return true;
   return false;
 }
 

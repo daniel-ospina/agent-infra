@@ -790,6 +790,12 @@ try {
   m4t("T81: \$VAR in substitution ARG position → allowed (no false-block)", `cd "${wtR}" && git commit -m "\$(cat \$MSG_FILE)"`, "allowed");
   m4t("T82: spawner-builtin var-hop (env) → block (round-9)", `G=git; echo "\$(env \$G -C "${hubR}" reset --hard)"`, "block");
   m4t("T83: spawner-builtin var-hop mid-span (xargs) → block (round-9)", `G=git; echo "\$(echo x | xargs \$G -C "${hubR}" reset --hard)"`, "block");
+  // ── Round-10 closures (final gate round 2, all probe-verified — hub commits destroyed pre-fix) ──
+  m4t("T84: spawner + flag var-hop (env -i) → block", `G=git; echo "\$(env -i \$G -C "${hubR}" reset --hard HEAD~1)"`, "block");
+  m4t("T85: interpreter -c var-hop (sh -c) → block", `G="git -C "${hubR}" reset --hard"; echo "\$(sh -c \"\$G\")"`, "block");
+  m4t("T86: piped-stdin shell with git → block", `printf "git -C "${hubR}" reset --hard" | bash`, "block");
+  m4t("T87: script-in-substitution → block", `echo "\$(bash /tmp/m4-evil.sh)"`, "block");
+  m4t("T88: spawner word in ARG position → non-git (no false-block)", `echo "\$(echo time \$DUR)"`, "non-git");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
