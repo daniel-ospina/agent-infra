@@ -668,6 +668,13 @@ function _walkShell(command, h = {}, seedVars = {}) {
         // `2<&-`) when scanning for -c / the script path — `bash 2<&1 -c
         // 'git reset'` ran the inline (probe moved HEAD).
         if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(n)) { j++; continue; }
+        // Round-18 (final gate P1): skip redirect operators + operands too
+        // (`bash < /dev/null -c 'git commit'` broke at the bare `<` and never
+        // walked the inline — probe; the inline committed to the hub).
+        if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n)) {
+          j += 2;
+          continue;
+        }
         if (n === "-c" || n === "--command") {
           // Round-5 (security F3): skip flags AFTER -c too — `bash -c -x 'git
           // reset'` takes the first NON-flag token as the command string.
@@ -1552,7 +1559,7 @@ function _extractSubstitutionSpans(token) {
 /** Shell words that SPAWN a command — a `$VAR` in their ARGUMENTS is the
  * spawned command (`$(env $G reset)` = `git reset`; `$(cat $FILE)` is safe —
  * cat is not a spawner). */
-const SPAWNER_WORDS = new Set(["env", "sudo", "command", "xargs", "exec", "nohup", "nice", "time", "eval", "sh", "bash", "zsh", "dash", "ksh"]);
+const SPAWNER_WORDS = new Set(["env", "sudo", "command", "xargs", "exec", "nohup", "nice", "time", "timeout", "stdbuf", "setsid", "eval", "sh", "bash", "zsh", "dash", "ksh"]);
 
 /** Compound-command reserved words (round-13): they start a new command-word
  * position — a following `$VAR` must resolve as the command. */
@@ -2003,7 +2010,25 @@ export function extractScriptPath(command) {
     const t = tokens[i];
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }   // env prefix
     if (t === "cd") { i += 2; continue; }                         // cd prefix
-    if (SPAWNER_WORDS.has(t) && !SHELL_INTERPRETERS.has(t)) { i++; continue; } // round-17 (P2): `exec bash evil.sh` / `env bash evil.sh` — the OUTER spawner is not the interpreter
+    if (SPAWNER_WORDS.has(t) && !SHELL_INTERPRETERS.has(t)) {
+      // round-17 (P2): `exec bash evil.sh` / `env bash evil.sh` — the OUTER
+      // spawner is not the interpreter. Round-18 (P1): jump to the FIRST
+      // interpreter past the spawner's flags/operands (`sudo -u root bash
+      // evil.sh` — `-u`'s operand `root` broke the scan; probe executed the
+      // script ungated). No interpreter before a boundary → the spawner's own
+      // command is non-interpreter (keep scanning from the next token).
+      let k = i + 1;
+      let found = false;
+      while (k < tokens.length) {
+        const n = tokens[k];
+        if (_isShellBoundary(n) || n === "&&" || n === "||" || n === "&" || n === "|" || n === "(" || n === ")") break;
+        if (SHELL_INTERPRETERS.has(n)) { found = true; break; }
+        k++;
+      }
+      if (found) { i = k; continue; }
+      i++;
+      continue;
+    }
     if (t === "&&" || t === ";" || t === "||") { i++; continue; } // separators
     if (t === "(" || t === ")") { i++; continue; }                 // #347: subshell wrappers
     if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(t) || t === "<&" || /^[<>]&/.test(t)) { i++; continue; } // round-17: fd-dup/close prefixes
@@ -2038,7 +2063,11 @@ export function extractScriptPath(command) {
           // Round-17 (final gate P1): `bash < file script.sh` executes
           // script.sh (the stdin operand is NOT the script when an argument
           // follows) — the script argument is the token AFTER the operand.
-          const arg = tokens[j + 2];
+          // Round-18: if `-c` follows the operand, it's an inline (gated by
+          // the normal classifier) — return null, not the operand.
+          const after = tokens[j + 2];
+          if (after === "-c" || after === "--command") return null;
+          const arg = after;
           if (arg !== undefined && !arg.startsWith("-") &&
               !(arg === ">" || arg === ">>" || arg === "<" || arg === "<<" || arg === "&>" || arg === ">&" || arg === "&>>" || /^(?:[0-9]+)?[<>]/.test(arg) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(arg))) {
             return arg; // the script ARGUMENT
