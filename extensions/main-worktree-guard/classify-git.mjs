@@ -289,13 +289,13 @@ function _resolveCdChain(cdChain, sessionCwd) {
  * (probe-verified divergence), and content pointing at a non-gitfile path is
  * omitted from porcelain entirely. Also guards the derivation against future
  * drift in git's own worktree model.
- * Known residual (documented, not closed): a worktree path with an EMBEDDED
- * newline would break the line-split parse (git's own admin-file format is
- * line-terminated — such paths are rejected at creation; `-z` would be needed
- * for a fully-quoted parse). Paths with leading/trailing SPACES are handled:
- * only the line terminator is stripped, path whitespace is preserved (review
- * P2 — a `.trim()` here would realpath-fail a legit trailing-space path and
- * false-block it via the cross-check).
+ * Parsed with `--porcelain -z` (NUL-delimited fields — git ≥ 2.25): a path
+ * with an EMBEDDED newline is accepted by git at creation (probe-verified;
+ * an earlier line-split parse mis-split such paths and would have
+ * false-blocked the worktree via the cross-check) and survives the NUL
+ * split verbatim. Older git without `-z` → exec failure → null → cross-check
+ * skipped (documented degradation + one-time warn). No whitespace stripping
+ * at all — a trailing-space or trailing-CR path realpaths to itself.
  * @param {string} sessionCwd — cwd frame (the hub) for `git worktree list`.
  * @returns {Set<string>|null} realpath'd worktree paths, or null when git
  *   cannot run — the caller SKIPS the cross-check on null: a secondary git
@@ -304,23 +304,23 @@ function _resolveCdChain(cdChain, sessionCwd) {
  */
 export function worktreeListPorcelainPaths(sessionCwd = process.cwd()) {
   try {
-    const out = execSync("git worktree list --porcelain", {
+    const out = execSync("git worktree list --porcelain -z", {
       encoding: "utf-8", cwd: resolve(sessionCwd), timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
     });
     const paths = new Set();
-    for (const line of out.split("\n")) {
-      if (line.startsWith("worktree ")) {
-        // Strip ONLY the line terminator — never path whitespace (a legit
-        // trailing-space path must realpath to itself, review #353 P2).
-        let raw = line.slice("worktree ".length);
-        if (raw.endsWith("\r")) raw = raw.slice(0, -1); // CRLF robustness
-        const rp = _realpathSafe(raw);
+    // NUL-delimited fields: every `worktree <path>` field starts a record.
+    // Records are `\0\0`-separated; the NUL split alone preserves embedded
+    // newlines/whitespace in paths (review #353 round-1 P2 — a `.trim()` or
+    // line-split here would realpath-fail legit paths and false-block them).
+    for (const field of out.split("\0")) {
+      if (field.startsWith("worktree ")) {
+        const rp = _realpathSafe(field.slice("worktree ".length));
         if (rp !== null) paths.add(rp);
       }
     }
     return paths;
   } catch {
-    return null; // git unavailable → cross-check skipped (no false-blocks)
+    return null; // git unavailable / pre-2.25 → cross-check skipped (no false-blocks)
   }
 }
 
@@ -355,16 +355,18 @@ function _worktreeGitdirMap(sessionCwd) {
     const adminRoot = join(common, "worktrees");
     if (!existsSync(adminRoot)) return map;
     const adminNames = readdirSync(adminRoot);
+    if (adminNames.length === 0) return map; // no linked worktrees → nothing to cross-check (skip the spawn)
     // Issue #351: cross-check the reverse-pointer derivation against git's own
-    // view ONCE per map build. null (git failure / git < 2.16) → cross-check
+    // view ONCE per map build. null (git failure / git < 2.25) → cross-check
     // skipped — a secondary git call must never become a new false-block
     // source; the skip is surfaced ONCE (diagnosability, review #353 P2).
     const porcelainPaths = worktreeListPorcelainPaths(sessionCwd);
-    if (porcelainPaths === null && adminNames.length > 0 && !_porcelainSkipWarned) {
+    if (porcelainPaths === null && !_porcelainSkipWarned) {
       _porcelainSkipWarned = true;
       console.warn(
         `[main-worktree-guard] ⚠️ porcelain cross-check unavailable (git worktree list failed) — ` +
-        `#351 hardening SKIPPED for this session; two-way validation still active (conservative).`
+        `#351 hardening SKIPPED while unavailable (re-engages automatically on recovery); ` +
+        `two-way validation still active (conservative).`
       );
     }
     for (const name of adminNames) {

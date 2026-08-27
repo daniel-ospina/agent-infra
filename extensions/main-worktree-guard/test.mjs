@@ -777,6 +777,23 @@ try {
   } catch (e) {
     console.log(`⏭️ X5 skipped (could not provision trailing-space worktree: ${String(e.message).slice(0, 60)})`);
   }
+  // X6 (review #353 round-1 P2): a LEGIT worktree whose path contains an
+  // EMBEDDED NEWLINE is accepted by git at creation (probe-verified) and must
+  // survive the cross-check — the `--porcelain -z` parse keeps the path
+  // verbatim inside a NUL-delimited field (a line-split parse would mis-split
+  // it → false-block).
+  try {
+    const nlWt = `${m4Tmp}/nl\nwt`;
+    execSync(`git worktree add -q --detach "${nlWt}" HEAD`, { cwd: hubR, stdio: "ignore" });
+    const nlRp = realpathSync(nlWt);
+    expectBool("X6: legit embedded-newline worktree survives the cross-check (-z parse)", [...worktreeGitdirMap(hubR).values()].includes(nlRp), true);
+    expectBool("X6b: porcelain helper parses the embedded-newline path (-z)", (() => {
+      const ps = worktreeListPorcelainPaths(hubR);
+      return ps !== null && ps.has(nlRp);
+    })(), true);
+  } catch (e) {
+    console.log(`⏭️ X6 skipped (could not provision newline-path worktree: ${String(e.message).slice(0, 60)})`);
+  }
   m4t("T35: failed-cd prefix stands", `cd "${wtR}" && cd /nonexistent && git commit -m x`, "allowed");
   // ── Code-review round-2 fixes: bash-faithful boundaries + shared-ref verbs ──
   m4t("T36: background & — cd does not leak to foreground", `cd "${wtR}" & git commit -m x`, "block");
