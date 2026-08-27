@@ -93,9 +93,11 @@ exemption is semantic, never path-string-based; hub/foreign/unresolvable
 targets keep today's blocks (including `-C <wt> --git-dir=<hub>/.git …`,
 `--git-dir=<hub>/.git/worktrees/<x>` from the hub cwd, `GIT_DIR=<wt>/.git`
 from the hub cwd, and crafted reverse-pointer files — two-way back-reference
-validation; note: an agent that writes `.git/worktrees/` internals directly is
-a deliberate-bypass actor, same class as the documented `GIT_INDEX_FILE`
-limitation). The write/edit M4 block is target-aware (hub-equality): only
+validation — since #351 cross-checked against `git worktree list --porcelain`
+too; note: an agent that writes `.git/worktrees/` internals directly is a
+deliberate-bypass actor, same class as the documented `GIT_INDEX_FILE`
+limitation — see the [deliberate-obfuscation residual
+tier](#deliberate-obfuscation-residual-tier-out-of-threat-model-351)). The write/edit M4 block is target-aware (hub-equality): only
 HUB-targeted writes block while the hub is disordered (D3 preserved — the
 block still runs before the marker bypass); worktree/foreign/`/tmp` writes are
 isolated. `GIT_DIR`/`GIT_WORK_TREE` env PREFIXES are scoped to the next command
@@ -156,6 +158,94 @@ live `pr1467` hub fails the check — that is the point.
 - **Not an agent-infra gate:** the infra repo's in-main feature work (#99) is
   untouched.
 - **Not a terminal gate:** humans in a terminal can always run the one-liner.
+
+## Deliberate-obfuscation residual tier (out of threat model) (#351)
+
+**The threat-model boundary, stated once:** the guard defends against
+**ACCIDENTAL collision** between parallel agents — a session that runs an
+ordinary `git reset --hard`, `git checkout -b`, or `git -C <hub> …` in the
+shared main checkout, or an ungated write into it. It does **NOT** defend
+against **adversarial shell** — an actor deliberately obfuscating git
+invocations to evade classification. A deliberate-bypass actor is the same
+threat class as a human editing `.git/` internals by hand; **no tool gate can
+fully close it** (only policy + worktree isolation can). The residual tier is
+documented here (issue #351) so the boundary is explicit and future work does
+not rediscover it as a "hole". The guard rejects the ACCIDENTAL variants of
+every class below — the two-way reverse-pointer validation + porcelain
+cross-check close the map-poisoning variants (Residual 2), the walker's
+command-position `$VAR` resolution closes plain-`${VAR}` name-splitting
+(round-11), and the semantic core closes the accidental spelling family; the
+deliberate variants remain documented residual.
+
+### Residual 1 — Bash-expansion name-splitting (parameter expansions)
+
+A git command word synthesized from a parameter expansion in command
+position:
+
+```bash
+G=git; ${G:0:3} -C <hub> reset --hard            # ${G:0:3} → "git" — classified "non-git", runs
+X=foocmd; ${X//foo/git} -C <hub> reset --hard    # substitution → "git"
+```
+
+Probe-verified (2026-08, #351): both verdict `non-git` — the walker's
+command-position `$VAR` resolution (round-11) only handles plain `${VAR}` /
+`$VAR`, so no invocation is seen and the command executes. Closing this
+requires a **full bash expansion evaluator** (offset/length slices, `//` / `#`
+/ `%` substitutions with glob semantics, arithmetic, nesting, env-var
+dependence) — and every closure reveals a sibling, so the family is
+open-ended. **Decision: deferred** — see the hardening table below.
+
+> **Already-closed sibling (documented for accuracy):** quote-concat
+> name-splitting (`G='g'it`, `'g'it -C … reset --hard`) is NOT open — the
+> tokenizer strips quotes, so `'g'it` tokens as `git`, and the round-11
+> assignment var-hop (`G='g'it; $G …`) resolves to a git word. Only
+> parameter-expansion operations remain in this class.
+
+### Residual 2 — direct `.git/worktrees/` internals writes (map poisoning)
+
+An agent writing the reverse-pointer files + a crafted back-referencing
+gitfile can poison the worktree map:
+
+```bash
+mkdir -p <hub>/.git/worktrees/evil && printf '<path>/.git\n' > <hub>/.git/worktrees/evil/gitdir
+printf 'gitdir: <hub>/.git/worktrees/evil\n' > <path>/.git
+```
+
+The **two-way back-reference validation** (VULN-003 closure) rejects the
+accidental variants — a crafted gitdir whose target has no back-referencing
+gitfile, a substring-matching gitfile, a stale admin dir. A **determined
+writer defeats it**: a fully-consistent pair passes two-way AND `git worktree
+list` (git derives its view from the same reverse-pointer files —
+probe-verified), and the fake admin dir still fails `git rev-parse` (it is not
+a complete git directory: no `commondir`/`HEAD`), so the poison is inert
+without a full admin-dir craft. #351 added the **porcelain cross-check**
+(hardening table below) as defense-in-depth: partial crafts whose
+reverse-pointer content git cannot resolve from its own frame (relative
+content, dangling gitfile) are now rejected at map build. Fully-consistent
+crafts remain documented residual — a deliberate-bypass actor.
+
+### Residual 3 — the open-ended grammar-spelling family
+
+Every closure (redirect / fd / spawner / flag / substitution spelling)
+reveals a sibling — #347's 24 code-review rounds closed spellings in waves
+(`2>&1` → `<&0` → `< /dev/null` → `bash <(...)`; `-C` → `--cd` → `-Cfoo` →
+`--git-dir=…`; `checkout -B` → `switch -C` → `-Bmain` →
+`--force-create=…` → `-bfoo`; …). The family is open-ended by construction: a
+grammar over shell spelling has infinitely many members. The guard's
+mitigation is the **semantic core** — per-invocation effective-target
+resolution, shared-ref re-classification, fail-closed defaults for
+unresolvable forms — not spelling enumeration.
+
+### Hardening decision (#351)
+
+| Item | Decision | Rationale |
+|---|---|---|
+| `git worktree list` porcelain cross-check (P2) | **IMPLEMENTED** | One `execSync` per map build; no new deps; conservative on disagreement (entry rejected → block); probe-verified it cannot false-block legitimate worktrees (git's porcelain lists every entry the two-way check accepts); new regression pins X1–X4 in `test.mjs`. |
+| Bash-expansion evaluator for command-position `${…}` / `${var//…}` (P2) | **DEFERRED** | A full evaluator is a large lift; a bounded one for the documented spellings is either trivially bypassable (the family is open-ended — `${G:0:3}` → `${G::3}` → `${G#g}` → …) or risks false-positives on legitimate expansions (`${HOME}`, `${PWD}`, `${SHA:0:7}` must keep passing — probe-verified today). Cost/benefit vs. the accidental-collision threat model: an accidental actor never writes `${G:0:3}`; closing it adds walker complexity to a 24-round-reviewed, fully-pinned regression suite for an out-of-model adversary. Revisit if the threat model ever includes adversarial shell. |
+
+Cross-references: plan `docs/plans/2026-08-27-issue-347-m4-worktree-freeze.md`
+§5a (the residual tier), issue #351 (this decision), #347 / PR #348 (the
+review rounds that surfaced the family).
 
 ## Environment variables
 

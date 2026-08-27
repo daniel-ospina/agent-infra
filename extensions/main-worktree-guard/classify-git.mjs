@@ -275,6 +275,44 @@ function _resolveCdChain(cdChain, sessionCwd) {
   return cwd;
 }
 
+/** Issue #351 (P2 hardening): derive git's OWN worktree list (`git worktree
+ * list --porcelain`) as a realpath-normalized set of worktree paths, for the
+ * reverse-pointer map cross-check. Porcelain has NO gitdir column
+ * (empirically verified — plan P0), so the cross-check compares the map's
+ * DERIVED wtPath against git's reported worktree paths. git resolves its view
+ * from the SAME reverse-pointer files, so a fully-consistent deliberate craft
+ * (reverse-pointer + back-referencing gitfile) passes both — documented
+ * residual, out of the accidental-collision threat model. The cross-check
+ * rejects PARTIAL/INCONSISTENT crafts whose reverse-pointer content git cannot
+ * resolve from its own frame — e.g. RELATIVE gitdir content: git resolves it
+ * against the admin dir, the guard's dirname() against the process cwd
+ * (probe-verified divergence), and content pointing at a non-gitfile path is
+ * omitted from porcelain entirely. Also guards the derivation against future
+ * drift in git's own worktree model.
+ * @param {string} sessionCwd — cwd frame (the hub) for `git worktree list`.
+ * @returns {Set<string>|null} realpath'd worktree paths, or null when git
+ *   cannot run — the caller SKIPS the cross-check on null: a secondary git
+ *   call at map-build time must never become a new false-block source (the
+ *   two-way back-reference validation stays the primary gate).
+ */
+export function worktreeListPorcelainPaths(sessionCwd = process.cwd()) {
+  try {
+    const out = execSync("git worktree list --porcelain", {
+      encoding: "utf-8", cwd: resolve(sessionCwd), timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    });
+    const paths = new Set();
+    for (const line of out.split("\n")) {
+      if (line.startsWith("worktree ")) {
+        const rp = _realpathSafe(line.slice("worktree ".length).trim());
+        if (rp !== null) paths.add(rp);
+      }
+    }
+    return paths;
+  } catch {
+    return null; // git unavailable → cross-check skipped (no false-blocks)
+  }
+}
+
 /** Worktree map: canonical gitDir → worktree path, derived from the
  * `<common>/worktrees/<name>/gitdir` reverse-pointer files (git worktree list
  * --porcelain has NO gitdir column — empirically verified) + the filesystem
@@ -298,6 +336,10 @@ function _worktreeGitdirMap(sessionCwd) {
     const adminRoot = join(common, "worktrees");
     if (!existsSync(adminRoot)) return map;
     const adminNames = readdirSync(adminRoot);
+    // Issue #351: cross-check the reverse-pointer derivation against git's own
+    // view ONCE per map build. null (git failure) → cross-check skipped (a
+    // secondary git call must never become a new false-block source).
+    const porcelainPaths = worktreeListPorcelainPaths(sessionCwd);
     for (const name of adminNames) {
       try {
         const gitfile = readFileSync(join(adminRoot, name, "gitdir"), "utf-8").trim();
@@ -320,6 +362,12 @@ function _worktreeGitdirMap(sessionCwd) {
         // gitfile pass for admin dir `wt`).
         const gm = backRef.match(/gitdir:\s*(.+)/);
         if (!gm || _realpathSafe(resolve(gm[1].trim())) !== adminKey) continue; // crafted/stale → reject
+        // Issue #351 porcelain cross-check: git's OWN `git worktree list` must
+        // list this worktree path. A craft the two-way check accepts (back-
+        // referencing gitfile exists) but git cannot resolve from its own frame
+        // (relative reverse-pointer content, dangling gitfile) is rejected
+        // conservatively here — the entry never poisons the exemption map.
+        if (porcelainPaths !== null && !porcelainPaths.has(wtPath)) continue;
         map.set(adminKey, wtPath);
       } catch {
         // per-entry skip — never abort the whole map for one stale dir
@@ -339,6 +387,12 @@ function _worktreeGitdirMap(sessionCwd) {
   }
   return map;
 }
+
+/** Exported alias for tests: the map builder is the only way to observe the
+ * porcelain cross-check's per-entry rejection (the crafted-entry fixture never
+ * reaches resolveInvocationTarget's rev-parse — the fake admin dir is not a
+ * real git dir, so the conservative block there would mask the map-level pin). */
+export const worktreeGitdirMap = _worktreeGitdirMap;
 
 /** Resolve a git invocation's effective target. Returns
  * { effectiveCwd, gitDir, worktreePath, worktreeBranch, isWorktree } or null

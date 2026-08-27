@@ -3,9 +3,9 @@
 // + worktree-session write/edit early-return (epic-529 false-positive incident).
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
-import { resolve, dirname } from "node:path";
+import { resolve, dirname, relative } from "node:path";
 import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync } from "node:fs";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -733,6 +733,34 @@ try {
   m4t("T33: pipe-cd mirror (C0 at pipeline start)", `cd "${wtR}" | cd /tmp && git commit -m x`, "block");
   m4t("T34: stale admin dir skipped (wt2 rm -rf, no prune)", `cd "${wtR}" && git commit -m x`, "allowed");
   m4t("T34b: CRAFTED reverse-pointer rejected (two-way validation)", `git --git-dir="${hubR}/.git/worktrees/wt2" reset --hard`, "block");
+  // ── Issue #351: porcelain cross-check (P2 hardening) ──
+  // The reverse-pointer map is cross-checked against git's OWN view (`git
+  // worktree list --porcelain`). git derives its view from the SAME reverse-
+  // pointer files, so a fully-consistent deliberate craft passes both
+  // (documented residual — deliberate-bypass actor, out of the accidental-
+  // collision threat model). The cross-check rejects PARTIAL crafts whose
+  // reverse-pointer content git cannot resolve from its own frame.
+  const craftedDir = `${m4Tmp}/crafted`;
+  execSync(`mkdir -p "${craftedDir}"`, { stdio: "ignore" });
+  execSync(`mkdir -p "${hubR}/.git/worktrees/crafted"`, { stdio: "ignore" });
+  execSync(`printf 'gitdir: ${hubR}/.git/worktrees/crafted\n' > "${craftedDir}/.git"`, { stdio: "ignore" });
+  // Reverse-pointer content RELATIVE to the guard's process cwd: the two-way
+  // back-reference PASSES (the gitfile at the target back-refs this admin
+  // dir), but git resolves relative content from ITS frame (the admin dir) →
+  // the entry is absent from porcelain → the cross-check rejects it
+  // (conservative). Probe-verified: git omits / marks prunable what it cannot
+  // resolve, while the guard's dirname() resolves against process cwd.
+  const relGitfile = relative(PROJECT_CWD, `${craftedDir}/.git`);
+  execSync(`printf '%s\n' "${relGitfile}" > "${hubR}/.git/worktrees/crafted/gitdir"`, { stdio: "ignore" });
+  const xMap = worktreeGitdirMap(hubR);
+  const legitAdmin = realpathSync(`${hubR}/.git/worktrees/wt`);
+  expectBool("X1: legit worktree survives the porcelain cross-check (no false-block)", xMap.has(legitAdmin) && xMap.get(legitAdmin) === wtR, true);
+  expectBool("X2: partial craft (two-way passes, porcelain disagrees) → rejected by cross-check", !xMap.has(realpathSync(`${hubR}/.git/worktrees/crafted`)), true);
+  expectBool("X3: T34b crafted reverse-pointer (gitdir→hub/.git) still rejected", !xMap.has(realpathSync(`${hubR}/.git/worktrees/wt2`)), true);
+  expectBool("X4: porcelain helper parses the live fixture (hub + wt listed)", (() => {
+    const ps = worktreeListPorcelainPaths(hubR);
+    return ps !== null && ps.has(realpathSync(hubR)) && ps.has(realpathSync(wtR));
+  })(), true);
   m4t("T35: failed-cd prefix stands", `cd "${wtR}" && cd /nonexistent && git commit -m x`, "allowed");
   // ── Code-review round-2 fixes: bash-faithful boundaries + shared-ref verbs ──
   m4t("T36: background & — cd does not leak to foreground", `cd "${wtR}" & git commit -m x`, "block");
