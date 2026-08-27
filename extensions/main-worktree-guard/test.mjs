@@ -761,6 +761,22 @@ try {
     const ps = worktreeListPorcelainPaths(hubR);
     return ps !== null && ps.has(realpathSync(hubR)) && ps.has(realpathSync(wtR));
   })(), true);
+  // X5 (review #353 P2): a LEGIT worktree whose path ends in a SPACE must
+  // survive the cross-check — git creates such paths and porcelain preserves
+  // the whitespace; the parse must strip only the line terminator, never path
+  // whitespace (a trim would realpath-fail the path → false-block).
+  try {
+    const spaceWt = `${m4Tmp}/spacewt `;
+    execSync(`git worktree add -q "${spaceWt}" -b wt/space HEAD`, { cwd: hubR, stdio: "ignore" });
+    const spaceRp = realpathSync(spaceWt);
+    expectBool("X5: legit trailing-space worktree survives the cross-check (whitespace preserved)", [...worktreeGitdirMap(hubR).values()].includes(spaceRp), true);
+    expectBool("X5b: porcelain helper keeps the trailing-space path", (() => {
+      const ps = worktreeListPorcelainPaths(hubR);
+      return ps !== null && ps.has(spaceRp);
+    })(), true);
+  } catch (e) {
+    console.log(`⏭️ X5 skipped (could not provision trailing-space worktree: ${String(e.message).slice(0, 60)})`);
+  }
   m4t("T35: failed-cd prefix stands", `cd "${wtR}" && cd /nonexistent && git commit -m x`, "allowed");
   // ── Code-review round-2 fixes: bash-faithful boundaries + shared-ref verbs ──
   m4t("T36: background & — cd does not leak to foreground", `cd "${wtR}" & git commit -m x`, "block");

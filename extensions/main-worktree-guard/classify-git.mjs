@@ -289,6 +289,13 @@ function _resolveCdChain(cdChain, sessionCwd) {
  * (probe-verified divergence), and content pointing at a non-gitfile path is
  * omitted from porcelain entirely. Also guards the derivation against future
  * drift in git's own worktree model.
+ * Known residual (documented, not closed): a worktree path with an EMBEDDED
+ * newline would break the line-split parse (git's own admin-file format is
+ * line-terminated — such paths are rejected at creation; `-z` would be needed
+ * for a fully-quoted parse). Paths with leading/trailing SPACES are handled:
+ * only the line terminator is stripped, path whitespace is preserved (review
+ * P2 — a `.trim()` here would realpath-fail a legit trailing-space path and
+ * false-block it via the cross-check).
  * @param {string} sessionCwd — cwd frame (the hub) for `git worktree list`.
  * @returns {Set<string>|null} realpath'd worktree paths, or null when git
  *   cannot run — the caller SKIPS the cross-check on null: a secondary git
@@ -303,7 +310,11 @@ export function worktreeListPorcelainPaths(sessionCwd = process.cwd()) {
     const paths = new Set();
     for (const line of out.split("\n")) {
       if (line.startsWith("worktree ")) {
-        const rp = _realpathSafe(line.slice("worktree ".length).trim());
+        // Strip ONLY the line terminator — never path whitespace (a legit
+        // trailing-space path must realpath to itself, review #353 P2).
+        let raw = line.slice("worktree ".length);
+        if (raw.endsWith("\r")) raw = raw.slice(0, -1); // CRLF robustness
+        const rp = _realpathSafe(raw);
         if (rp !== null) paths.add(rp);
       }
     }
@@ -313,15 +324,23 @@ export function worktreeListPorcelainPaths(sessionCwd = process.cwd()) {
   }
 }
 
+// One-time warn flag: the porcelain skip must be diagnosable without spamming
+// the per-invocation map-build hot path (review #353 P2).
+let _porcelainSkipWarned = false;
+
 /** Worktree map: canonical gitDir → worktree path, derived from the
  * `<common>/worktrees/<name>/gitdir` reverse-pointer files (git worktree list
  * --porcelain has NO gitdir column — empirically verified) + the filesystem
  * layout. Main checkout excluded by construction (its common dir is `common`
  * itself, never under `common/worktrees/`). Per-entry try/catch: stale admin
  * dirs (rm -rf <wt> without prune → ENOENT) are skipped, other worktrees stay
- * exempt (T34). Map key = realpath of the admin dir (which `git rev-parse
- * --git-dir` returns for a worktree cwd — probe-verified), NOT the reverse-
- * pointer content (which is the gitfile path <wt>/.git and differs).
+ * exempt (T34). Entries whose derived wtPath `git worktree list --porcelain`
+ * does not list are additionally rejected (issue #351 cross-check; when git
+ * cannot run the cross-check is SKIPPED with a one-time warn — fail-safe,
+ * never a new false-block source). Map key = realpath of the admin dir (which
+ * `git rev-parse --git-dir` returns for a worktree cwd — probe-verified), NOT
+ * the reverse-pointer content (which is the gitfile path <wt>/.git and
+ * differs).
  * @param {string} sessionCwd — the guard's session root (the hub).
  * @returns {Map<string,string>}
  */
@@ -337,9 +356,17 @@ function _worktreeGitdirMap(sessionCwd) {
     if (!existsSync(adminRoot)) return map;
     const adminNames = readdirSync(adminRoot);
     // Issue #351: cross-check the reverse-pointer derivation against git's own
-    // view ONCE per map build. null (git failure) → cross-check skipped (a
-    // secondary git call must never become a new false-block source).
+    // view ONCE per map build. null (git failure / git < 2.16) → cross-check
+    // skipped — a secondary git call must never become a new false-block
+    // source; the skip is surfaced ONCE (diagnosability, review #353 P2).
     const porcelainPaths = worktreeListPorcelainPaths(sessionCwd);
+    if (porcelainPaths === null && adminNames.length > 0 && !_porcelainSkipWarned) {
+      _porcelainSkipWarned = true;
+      console.warn(
+        `[main-worktree-guard] ⚠️ porcelain cross-check unavailable (git worktree list failed) — ` +
+        `#351 hardening SKIPPED for this session; two-way validation still active (conservative).`
+      );
+    }
     for (const name of adminNames) {
       try {
         const gitfile = readFileSync(join(adminRoot, name, "gitdir"), "utf-8").trim();
