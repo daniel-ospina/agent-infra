@@ -343,6 +343,12 @@ function _worktreeGitdirMap(sessionCwd) {
  */
 export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd = sessionCwd) {
   try {
+    // Round-6 (final gate P2): unresolvable $VAR in a -C/--git-dir/--work-tree/
+    // INDEX operand ("\u0000" sentinel from the walker) → conservative.
+    if ((inv.cHints || []).includes("\u0000") || inv.gitDirHint === "\u0000" ||
+        inv.workTreeHint === "\u0000" || inv.indexFileHint === "\u0000" || inv.objDirsHint === "\u0000") {
+      return null;
+    }
     const chainCwd = _resolveCdChain(inv.cdChain || [], baseCwd);
     if (chainCwd === null) return null; // unresolvable cd → conservative
     let cwd = chainCwd;
@@ -681,13 +687,16 @@ function _walkShell(command, h = {}) {
       prevWasBoundary = false;
       continue;
     }
-    if (/^\.{0,2}\//.test(t)) {
+    if (/^\.{0,2}\//.test(t) && !/^(?:.*\/)?git$/.test(t)) {
       h.onScriptToken?.([...frame().chain]);
       i++;
       prevWasBoundary = false;
       continue;
     }
-    if (t !== "git") { h.onOther?.(t); i++; prevWasBoundary = false; continue; }
+    // Round-6 (final gate P0): treat ANY token whose basename is `git` as a
+    // git invocation start — `/usr/bin/git commit` bypassed the tokenizer's
+    // bare-`git` check (probe-verified: absolute-path git executed ungated).
+    if (!/^(?:.*\/)?git$/.test(t)) { h.onOther?.(t); i++; prevWasBoundary = false; continue; }
     // ── git invocation ──
     i++;
     const f = frame();
@@ -700,18 +709,28 @@ function _walkShell(command, h = {}) {
     let objDirsHint = pendingHints.objDirsHint ?? null;
     pendingHints = {};
     h.onGitStart?.(f);
+    // Round-6 (final gate P2): -C/--git-dir/--work-tree/INDEX operands are
+    // var-expanded against PRIOR-segment vars at walk time, mirroring the cd
+    // path — `VAR=<wt> && git -C "$VAR" commit` froze because the literal
+    // `$VAR` resolved as a path. Unresolvable → "\u0000" sentinel (resolveInvocationTarget
+    // treats it as conservative — null would be ambiguous with "no hint").
+    const expand = (raw) => {
+      if (raw === null || raw === undefined) return null;
+      const e = _expandCdVars(raw, f.segVars);
+      return e === null ? "\u0000" : e;
+    };
     while (i < tokens.length) {
       const g = tokens[i];
-      if (/^GIT_DIR=/.test(g)) { gitDirHint = g.slice("GIT_DIR=".length); i++; continue; }
-      if (/^GIT_WORK_TREE=/.test(g)) { workTreeHint = g.slice("GIT_WORK_TREE=".length); i++; continue; }
+      if (/^GIT_DIR=/.test(g)) { gitDirHint = expand(g.slice("GIT_DIR=".length)); i++; continue; }
+      if (/^GIT_WORK_TREE=/.test(g)) { workTreeHint = expand(g.slice("GIT_WORK_TREE=".length)); i++; continue; }
       if (g === "cd") { i += 2; continue; }
-      if (g === "-C" || g === "--cd") { cHints.push(tokens[i + 1] ?? ""); i += 2; continue; }
-      if (g.startsWith("--git-dir=")) { gitDirHint = g.slice("--git-dir=".length); i++; continue; }
-      if (g === "--git-dir") { gitDirHint = tokens[i + 1] ?? null; i += 2; continue; }
-      if (g.startsWith("--work-tree=")) { workTreeHint = g.slice("--work-tree=".length); i++; continue; }
-      if (g === "--work-tree") { workTreeHint = tokens[i + 1] ?? null; i += 2; continue; }
-      if (/^GIT_INDEX_FILE=/.test(g)) { indexFileHint = g.slice("GIT_INDEX_FILE=".length); i++; continue; }
-      if (/^GIT_OBJECT_DIRECTORY=/.test(g) || /^GIT_ALTERNATE_OBJECT_DIRECTORIES=/.test(g)) { objDirsHint = g.slice(g.indexOf("=") + 1); i++; continue; }
+      if (g === "-C" || g === "--cd") { cHints.push(expand(tokens[i + 1] ?? null)); i += 2; continue; }
+      if (g.startsWith("--git-dir=")) { gitDirHint = expand(g.slice("--git-dir=".length)); i++; continue; }
+      if (g === "--git-dir") { gitDirHint = expand(tokens[i + 1] ?? null); i += 2; continue; }
+      if (g.startsWith("--work-tree=")) { workTreeHint = expand(g.slice("--work-tree=".length)); i++; continue; }
+      if (g === "--work-tree") { workTreeHint = expand(tokens[i + 1] ?? null); i += 2; continue; }
+      if (/^GIT_INDEX_FILE=/.test(g)) { indexFileHint = expand(g.slice("GIT_INDEX_FILE=".length)); i++; continue; }
+      if (/^GIT_OBJECT_DIRECTORY=/.test(g) || /^GIT_ALTERNATE_OBJECT_DIRECTORIES=/.test(g)) { objDirsHint = expand(g.slice(g.indexOf("=") + 1)); i++; continue; }
       if (g === "--namespace") { i += 2; continue; }
       if (g.startsWith("--namespace=")) { i++; continue; }
       if (g === "--no-pager" || g === "-p" || g === "--paginate") { i++; continue; }
@@ -727,7 +746,7 @@ function _walkShell(command, h = {}) {
     // NOT pollute the verb's arg list. The NEXT `git` token still starts a new
     // invocation (every invocation is gated, so a destructive op in ANY segment
     // still blocks).
-    while (i < tokens.length && tokens[i] !== "git") {
+    while (i < tokens.length && !/^(?:.*\/)?git$/.test(tokens[i])) {
       const g = tokens[i];
       if (_isShellBoundary(g)) {
         // Round-5 (security P2): redirects (+ operands) do NOT terminate a
@@ -1277,7 +1296,7 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
       // ONLY `checkout main|master` (recovery). Path-restore (--), discard-all
       // (.), previous-branch (-), create/force/orphan/detach forms → block.
       if (a.includes("--")) return "block";
-      if (["-b", "-B", "-c", "-f", "--force", "--orphan", "--detach"].some(flag)) return "block";
+      if (["-b", "-B", "-c", "-C", "-f", "--force", "--create", "--force-create", "--orphan", "--detach"].some(flag)) return "block";
       if (pos.length !== 1 || pos[0] === "." || pos[0] === "-") return "block";
       return pos[0] === "main" || pos[0] === "master" ? "recovery" : "block";
     case "fetch":
@@ -1428,6 +1447,25 @@ function _mainProtectionReason(inv, note) {
   ].join("\n");
 }
 
+/** Round-6 (final gate P1): content-scoped UNVERIFIABLE-git detection. The
+ * invocation walk cannot see git inside $( ) / backticks / eval / alias /
+ * function indirection (they collapse to opaque tokens). Scan the substituted
+ * CONTENT (not the whole command — a worktree-exempt `git commit` before a
+ * `$(date)` must not false-block): if any substitution/indirection carries a
+ * git token (incl. absolute-path git), the command is unverifiable → the
+ * caller fails closed while the hub is disordered. */
+function _unverifiableGitContent(command) {
+  const c = String(command ?? "");
+  const tokens = _tokenize(c);
+  for (const t of tokens) {
+    if ((t.includes("$(") || t.includes("`")) && /\bgit\b/.test(t)) return true;
+  }
+  // eval <string>, alias g=git, function indirection + git intent
+  if (/\beval\s+/.test(c) && /\bgit\b/.test(c)) return true;
+  if (/(^|[;&|\s])\b(alias|function)\b/.test(c) && /\bgit\b/.test(c)) return true;
+  return false;
+}
+
 /** #347 — evaluateHubGate with PER-INVOCATION target resolution. Classify
  * first (recovery/readonly → zero resolution cost — sanctioned regardless of
  * target); on a `block` verdict, resolve the invocation's effective target and
@@ -1447,18 +1485,19 @@ function _mainProtectionReason(inv, note) {
  */
 export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd()) {
   const invocations = allGitInvocations(command);
-  // Round-5 (second-model P1): eval / $( ) / backtick command substitution is
-  // an UNVERIFIABLE one-token shell construct — the substituted content runs
-  // ungated by the invocation walk. Fail closed BEFORE the zero-invocation
-  // return: any command containing a substitution AND a git token is blocked
-  // while the hub is disordered (conservative — never a false exemption).
-  if (invocations.length === 0 && /\$\(|`|\beval\s+/.test(command) && /\bgit\b/.test(command)) {
+  // Round-5/6 (second-model P1): eval / $( ) / backtick / alias / function
+  // command substitution is an UNVERIFIABLE one-token shell construct — the
+  // substituted content runs ungated by the invocation walk. Fail closed BEFORE
+  // the invocation loop (a preceding worktree-exempt `continue` must not skip
+  // the check): if any substitution/indirection content carries git, block while
+  // the hub is disordered (content-scoped — `git commit -m "$(date)"` passes).
+  if (_unverifiableGitContent(command)) {
     return {
       verdict: "block",
       reason: [
         `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
-        `   Blocked: command substitution / eval with git content — the substituted`,
-        `   invocation cannot be verified per-invocation (fail-closed).`,
+        `   Blocked: command substitution / eval / alias indirection with git content — the`,
+        `   substituted invocation cannot be verified per-invocation (fail-closed).`,
         `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
         `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
       ].join("\n"),
@@ -1609,18 +1648,9 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       }
     }
     // Round-5 (second-model P1): eval / $( ) / backtick command substitution is
-    // an UNVERIFIABLE one-token shell construct — the substituted content runs
-    // ungated by the invocation walk. Fail closed: any command containing a
-    // substitution AND a git token is blocked while the hub is disordered
-    // (conservative — never a false exemption).
-    if (/\$\(|`|\beval\s+/.test(command) && /\bgit\b/.test(command)) {
-      return {
-        verdict: "block",
-        reason: _mainProtectionReason(inv,
-          `Command substitution / eval present — the substituted git content cannot be`,
-          `verified per-invocation; blocked while the hub is disordered (fail-closed).`),
-      };
-    }
+    // an UNVERIFIABLE one-token shell construct — handled pre-loop by
+    // _unverifiableGitContent (a preceding worktree-exempt `continue` must not
+    // skip the fail-closed check, final gate P1).
   }
   return { verdict: sawRecovery ? "recovery" : "allowed", exempted };
 }
@@ -1775,6 +1805,10 @@ export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd
     return "allow";
   }
   const invocations = allGitInvocations(_stripShellComments(content));
+  // Round-6 (second-model P2): the script surface needs the same substitution /
+  // eval / alias fail-closed — a script containing `echo "$(git -C <hub>
+  // reset --hard)"` yields zero invocations and would otherwise be "allow".
+  if (_unverifiableGitContent(content)) return "block";
   for (const inv of invocations) {
     if (!inv.verb) continue;
     if (isHubRecoveryInvocation(inv.verb, inv.args, currentBranch) === "block") {

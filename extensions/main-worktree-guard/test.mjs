@@ -775,6 +775,13 @@ try {
   m4t("T68: pull refspec dst main from wt → block (round-5 P1)", `cd "${wtR}" && git pull origin +main:refs/heads/main`, "block");
   m4t("T69: push origin main:main from wt → block (wt-branch re-validation)", `cd "${wtR}" && git push origin main:main`, "block");
   m4t("T70: push wt own branch with redirect → recovery (args preserved)", `cd "${wtR}" && git push > /tmp/m4-push.log origin wt/feat`, "recovery");
+  // ── Round-6 closures (final gate round 2, all probe-verified) ──
+  m4t("T71: absolute-path git → gated", `/usr/bin/git commit -m x`, "block");
+  m4t("T72: absolute-path git targeting wt → allowed", `/usr/bin/git -C "${wtR}" commit -m x`, "allowed");
+  m4t("T73: substitution AFTER a worktree exemption → block (fail-closed pre-loop)", `cd "${wtR}" && git commit -m x && echo "\$(git -C "${hubR}" reset --hard)"`, "block");
+  m4t("T74: substitution without git → allowed (no false-block)", `cd "${wtR}" && git commit -m x && echo "\$(date)"`, "allowed");
+  m4t("T75: switch -C main → block (force-create protected branch)", `git switch -C main`, "block");
+  m4t("T76: -C \"\$VAR\" var-expanded → allowed", `VAR="${wtR}" && git -C "$VAR" commit -m x`, "allowed");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
@@ -801,6 +808,7 @@ try {
     m4m("M1: wt ON main → commit blocked (main-protection)", `cd "${mwtmain}" && git commit -m x`, "block");
     m4m("M2: wt checkout main while hub off-main → blocked", `cd "${mwt}" && git checkout main`, "block");
     m4m("M2b: wt checkout -B main (force) while hub off-main → blocked (round-4)", `cd "${mwt}" && git checkout -B main`, "block");
+    m4m("M4: wt switch -C main while hub off-main → blocked (round-6)", `cd "${mwt}" && git switch -C main`, "block");
     m4m("M3: wt on feature branch → commit allowed", `cd "${mwt}" && git commit -m x`, "allowed");
   } catch (e) {
     console.error(`❌ main-protection fixtures FAILED: ${String(e.message).slice(0, 120)}`);
@@ -872,6 +880,8 @@ try {
   expectBool("B11c: MIXED content hub-first → block", scriptGitVerdict(sMixedHubFirst, "main", hubR, hubR) === "block", true);
   expectBool("B12: extractScriptPath handles subshell wrappers", extractScriptPath(`(cd /tmp && bash x.sh)`) === "x.sh", true);
   expectBool("B29: extractScriptPath skips interpreter flags (round-4)", extractScriptPath(`bash -x evil.sh`) === "evil.sh", true);
+  const sAlias = mkS("alias.sh", `alias g=git\ng reset --hard HEAD~1\n`);
+  expectBool("B30: alias indirection script → block (round-6 fail-closed)", scriptGitVerdict(sAlias, "main", hubR, hubR) === "block", true);
   expectBool("B12b: end-to-end subshell script at wt cwd → allow", (() => {
     const p = mkS("mutation.sh", `git reset --hard\n`);
     const execCwd = commandExecutionCwd(`(cd "${wtR}" && bash ./mutation.sh)`, hubR);
