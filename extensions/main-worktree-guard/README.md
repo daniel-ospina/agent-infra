@@ -196,14 +196,22 @@ prompts):
 re-scan) are also suppressed (the marker bypass returns before they run), but
 the **session-start inventory** still fires once (it layers on the #73
 session-start banner, which fires under the marker). All warnings dedupe per
-(pattern, path) per session.
+(surface, pattern, path) per session — the write-gate and bash surfaces keep
+separate dedupe namespaces, and the inventory dedupes per path.
 
 **Design deviations (documented):** the bash-write heuristic resolves targets
 against the session cwd — `cd`-prefixed writes into the hub are false-negatives
 (a warning is cheap, a missed one is not an incident); a failed hub-toplevel
 cache resolution disables the three surfaces for up to 30s (then retries —
 never terminally); hub-equality assumes the session stays in one repo (M4's
-blocks use fresh per-call resolution and are unaffected).
+blocks use fresh per-call resolution and are unaffected); the python `open()`
+regex only fires when a python interpreter token is present and commands over
+64KB skip the scan; heredoc bodies are scanned literally, so a body line
+containing `> <wip-path>` can emit a spurious banner (P3 — warn-only, deduped
+per path; the real redirect target still warns); an intra-repo symlink alias
+(e.g. `docs-link → docs/plans`) can miss the pattern on the un-realpath'd
+spelling (warn-only false-negative — the perf constraint keeps the pure pattern
+filter first).
 
 **Why warning, not block:** the write/edit block for main-checkout edits is a
 deliberate permanent gate for non-infra repos; these patterns are a hygiene
