@@ -782,6 +782,10 @@ try {
   m4t("T74: substitution without git → allowed (no false-block)", `cd "${wtR}" && git commit -m x && echo "\$(date)"`, "allowed");
   m4t("T75: switch -C main → block (force-create protected branch)", `git switch -C main`, "block");
   m4t("T76: -C \"\$VAR\" var-expanded → allowed", `VAR="${wtR}" && git -C "$VAR" commit -m x`, "allowed");
+  // ── Round-7 refinements (final gate round 3, all probe-verified) ──
+  m4t("T77: alias + worktree commit → allowed (no false-block)", `cd "${wtR}" && alias ll="ls -la" && git commit -m x`, "allowed");
+  m4t("T78: \$VAR hop inside substitution → block", `G=git; echo "\$(\$G -C "${hubR}" reset --hard)"`, "block");
+  m4t("T79: prose git + \$(date) → allowed (substitution-span scoped)", `cd "${wtR}" && git commit -m "use git \$(date)"`, "allowed");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
@@ -882,6 +886,10 @@ try {
   expectBool("B29: extractScriptPath skips interpreter flags (round-4)", extractScriptPath(`bash -x evil.sh`) === "evil.sh", true);
   const sAlias = mkS("alias.sh", `alias g=git\ng reset --hard HEAD~1\n`);
   expectBool("B30: alias indirection script → block (round-6 fail-closed)", scriptGitVerdict(sAlias, "main", hubR, hubR) === "block", true);
+  const sSubScript = mkS("sub.sh", `echo "$(git -C "${hubR}" reset --hard)"\n`);
+  expectBool("B31: script substitution git → block", scriptGitVerdict(sSubScript, "main", hubR, hubR) === "block", true);
+  const sComment = mkS("comment-sub.sh", `# note: runs $(git rev-parse HEAD)\ngit status\n`);
+  expectBool("B32: script COMMENT substitution → allow (comment-stripped scan)", scriptGitVerdict(sComment, "main", hubR, hubR) === "allow", true);
   expectBool("B12b: end-to-end subshell script at wt cwd → allow", (() => {
     const p = mkS("mutation.sh", `git reset --hard\n`);
     const execCwd = commandExecutionCwd(`(cd "${wtR}" && bash ./mutation.sh)`, hubR);

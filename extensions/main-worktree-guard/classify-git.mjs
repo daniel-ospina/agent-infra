@@ -1458,11 +1458,31 @@ function _unverifiableGitContent(command) {
   const c = String(command ?? "");
   const tokens = _tokenize(c);
   for (const t of tokens) {
-    if ((t.includes("$(") || t.includes("`")) && /\bgit\b/.test(t)) return true;
+    // $( ) / backtick substitution: test the SUBSTITUTION SPAN for git OR a
+    // shell var reference — `G=git; echo "$($G reset)"` evades a literal-git
+    // scan (security re-review P2, probe: hub WIP destroyed), while prose
+    // "git" in the surrounding token (`-m "use git $(date)"`) must NOT
+    // false-block (second-model P2).
+    const m = t.match(/\$\(([^)]*)\)|`([^`]*)`/);
+    if (m) {
+      const inner = (m[1] ?? m[2] ?? "");
+      if (/\bgit\b/.test(inner) || /\$[A-Za-z_]|\$\{/.test(inner)) return true;
+    }
   }
-  // eval <string>, alias g=git, function indirection + git intent
-  if (/\beval\s+/.test(c) && /\bgit\b/.test(c)) return true;
-  if (/(^|[;&|\s])\b(alias|function)\b/.test(c) && /\bgit\b/.test(c)) return true;
+  // eval / alias / function indirection: token-scoped — only the construct's
+  // OWN operands count (`cd <wt> && alias ll="ls -la" && git commit` must NOT
+  // false-block; `alias g=git` / `eval "$G reset"` must).
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "eval") {
+      const rest = tokens.slice(i + 1, i + 4).join(" ");
+      if (/\bgit\b/.test(rest) || /\$[A-Za-z_]|\$\{/.test(rest)) return true;
+    }
+    if ((t === "alias" || t === "function") && tokens[i + 1]) {
+      const def = tokens.slice(i + 1, i + 3).join(" ");
+      if (/\bgit\b/.test(def)) return true;
+    }
+  }
   return false;
 }
 
@@ -1808,7 +1828,10 @@ export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd
   // Round-6 (second-model P2): the script surface needs the same substitution /
   // eval / alias fail-closed — a script containing `echo "$(git -C <hub>
   // reset --hard)"` yields zero invocations and would otherwise be "allow".
-  if (_unverifiableGitContent(content)) return "block";
+  // Round-7: run the scan on COMMENT-STRIPPED content (a comment like
+  // `# runs $(git rev-parse)` must not false-block an otherwise-clean script).
+  const strippedContent = _stripShellComments(content);
+  if (_unverifiableGitContent(strippedContent)) return "block";
   for (const inv of invocations) {
     if (!inv.verb) continue;
     if (isHubRecoveryInvocation(inv.verb, inv.args, currentBranch) === "block") {
