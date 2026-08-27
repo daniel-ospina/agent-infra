@@ -802,6 +802,12 @@ try {
   m4t("T91: sh -c \$EDITOR (unassigned var) → non-git (no false-block)", `sh -c '\$EDITOR /tmp/x.txt'`, "non-git");
   m4t("T92: read-only git in substitution → allowed (no freeze)", `cd "${wtR}" && git commit -m "v\$(git describe --tags)"`, "allowed");
   m4t("T93: read-only piped git → non-git (no false-block)", `echo "git log" | bash`, "non-git");
+  // ── Round-12 closures (final gate round 4, all probe-verified) ──
+  m4t("T94: subshell-inherited \$VAR command → block", `G=git; ( \$G -C "${hubR}" reset --hard HEAD~1 )`, "block");
+  m4t("T95: eval \$VAR command → block", `G=git; eval \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T96: top-level spawner \$VAR command → block", `G=git; env \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T97: multiword \$VAR command value → block (unverifiable)", `G="git -C "${hubR}" reset --hard"; \$G`, "block");
+  m4t("T98: second pipe-to-shell segment → block (scan every segment)", `echo x | bash && printf "git reset --hard" | sh`, "block");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree

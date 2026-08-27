@@ -500,7 +500,7 @@ function _walkShell(command, h = {}) {
     if (t === "(") {
       const f = frame();
       restoreC0(f);
-      stack.push({ chain: [...f.chain], vars: {}, segVars: {}, baseLen: f.chain.length, pipeC0: null, pipeActive: false, persistHints: { ...f.persistHints } });
+      stack.push({ chain: [...f.chain], vars: { ...f.vars }, segVars: { ...f.segVars }, baseLen: f.chain.length, pipeC0: null, pipeActive: false, persistHints: { ...f.persistHints } }); // round-12: bash subshells INHERIT variables
       pendingHints = {};
       prevWasBoundary = true;
       h.onParenPush?.();
@@ -709,11 +709,37 @@ function _walkShell(command, h = {}) {
     if (!isGitToken && prevWasBoundary && /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(t)) {
       const name = t.replace(/^\$\{?/, "").replace(/\}?$/, "");
       const val = frame().vars[name];
-      if (val !== undefined && /^(?:.*\/)?git$/.test(String(val).trim().split(/\s+/)[0])) {
-        isGitToken = true;
+      if (val !== undefined) {
+        const words = String(val).trim().split(/\s+/);
+        if (/^(?:.*\/)?git$/.test(words[0])) {
+          if (words.length > 1) {
+            // Round-12 (final gate P1): a MULTIWORD git value (`G="git -C <hub>
+            // reset"; $G`) cannot be expanded into the invocation shape — the
+            // real args live inside the var. Emit an unverifiable marker so the
+            // gate fails closed.
+            h.onGitEnd?.({
+              verb: "__unverifiable__", args: [], cdChain: [...frame().chain], cHints: [],
+              gitDirHint: null, workTreeHint: null, indexFileHint: null, objDirsHint: null, vars: { ...frame().vars },
+            });
+            i++;
+            prevWasBoundary = false;
+            continue;
+          }
+          isGitToken = true;
+        }
       }
     }
-    if (!isGitToken) { h.onOther?.(t); i++; prevWasBoundary = false; continue; }
+    if (!isGitToken) {
+      // Round-12 (final gate P1): a SPAWNER at command position (env/command/
+      // sudo/xargs/exec/...) runs its following $VAR as the spawned command —
+      // keep prevWasBoundary so the $VAR resolves (`env $G …`; `cat $FILE`
+      // stays an ordinary arg — cat is not a spawner).
+      const isSpawner = prevWasBoundary && SPAWNER_WORDS.has(t);
+      h.onOther?.(t);
+      i++;
+      prevWasBoundary = isSpawner;
+      continue;
+    }
     // ── git invocation ──
     i++;
     const f = frame();
@@ -1575,7 +1601,7 @@ function _unverifiableGitContent(command) {
     const t = tokens[i];
     if (t === "eval") {
       const rest = tokens.slice(i + 1, i + 4).join(" ");
-      if (/\bgit\b/.test(rest) || _spanCarriesGit(rest)) return true;
+      if (/\bgit\b/.test(rest) || _spanCarriesGit(rest, cmdVars)) return true; // round-12: pass cmdVars — `eval $G` resolves
     }
     if ((t === "alias" || t === "function") && tokens[i + 1]) {
       const def = tokens.slice(i + 1, i + 3).join(" ");
@@ -1603,7 +1629,9 @@ function _unverifiableGitContent(command) {
       for (const pi of pInns) {
         if (pi.verb && isHubRecoveryInvocation(pi.verb, pi.args, null) === "block") return true;
       }
-      return false; // all piped git read-only/recovery → pass
+      continue; // round-12 (second-model P1): scan EVERY pipe-to-shell segment — the
+      // old `return false` after the first clean segment let `echo x | bash &&
+      // printf 'git reset' | sh` through (the second segment ran the hub reset).
     }
   }
   return false;
@@ -1651,6 +1679,18 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
   let exempted = false;
   for (const inv of invocations) {
     if (!inv.verb) continue;
+    if (inv.verb === "__unverifiable__") {
+      return {
+        verdict: "block", exempted: false,
+        reason: [
+          `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+          `   Blocked: unverifiable \$VAR command expansion (multiword git value) —`,
+          `   the expanded invocation cannot be classified per-invocation (fail-closed).`,
+          `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
+          `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+        ].join("\n"),
+      };
+    }
     const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch);
     // Main-protection interception for the SANCTIONED form: `checkout main` from
     // a worktree while the hub is off-main lets the wt take the protected branch
@@ -1765,13 +1805,25 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       // against the WORKTREE's branch. Re-validate recovery pushes whose target
       // is a worktree against the wt's own branch.
       const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
-      if (target && target.isWorktree &&
-          isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") {
-        return {
-          verdict: "block", exempted: false,
-          reason: _mainProtectionReason(inv,
-            `push from a worktree target of a branch other than the worktree's own — not isolated.`),
-        };
+      if (target && target.isWorktree) {
+        // Round-12 (second-model P2): a wt on the hub's protected branch must
+        // not push it via HEAD/bare forms either (`git push origin HEAD` /
+        // bare `git push` from a wt on main classify recovery but push main).
+        if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
+          return {
+            verdict: "block", exempted: false,
+            reason: _mainProtectionReason(inv,
+              `push from a worktree on the hub's protected branch "${target.worktreeBranch}" —`,
+              `would advance the shared main ref.`),
+          };
+        }
+        if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") {
+          return {
+            verdict: "block", exempted: false,
+            reason: _mainProtectionReason(inv,
+              `push from a worktree target of a branch other than the worktree's own — not isolated.`),
+          };
+        }
       }
       sawRecovery = true;
       continue;
@@ -1957,6 +2009,7 @@ export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd
   if (_unverifiableGitContent(strippedContent)) return "block";
   for (const inv of invocations) {
     if (!inv.verb) continue;
+    if (inv.verb === "__unverifiable__") return "block"; // round-12: multiword $VAR command
     if (isHubRecoveryInvocation(inv.verb, inv.args, currentBranch) === "block") {
       // #347: per-invocation target exemption — the worktree map comes from the
       // SESSION repo (the guard's hub; explicit param for testability),
