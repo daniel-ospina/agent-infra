@@ -4,8 +4,8 @@
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
-import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync } from "node:fs";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict } from "./classify-git.mjs";
+import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync } from "node:fs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -164,7 +164,7 @@ try {
   expectBool("plain git repo, no env", isAgentInfraRepo(tmpRepo, noEnv), false);
   expectBool("plain git repo, env points at infra", isAgentInfraRepo(tmpRepo, envPathMatch), false);
 } catch (e) {
-  console.log(`⏭️  non-infra repo case skipped (could not provision: ${String(e.message).slice(0, 60)})`);
+  console.error(`❌ non-infra repo case FAILED to provision: ${String(e.message).slice(0, 120)}`); fail++;
 } finally {
   if (tmpRepo) {
     try { execSync(`rm -rf "${tmpRepo}"`, { stdio: "ignore" }); } catch {}
@@ -326,7 +326,7 @@ try {
   symlinkSync(targetPath, `${baseDir}/symlinked-marker`);
   expectBool("symlinked marker → inactive (realpath inequality)", readAllowMarkerState(`${baseDir}/symlinked-marker`, "sess-1"), false);
 } catch (e) {
-  console.log(`⏭️  marker fs cases failed to provision: ${String(e.message).slice(0, 120)}`);
+  console.error(`❌ marker fs cases FAILED to provision: ${String(e.message).slice(0, 120)}`); fail++;
 } finally {
   if (markerTmp) {
     try { execSync(`rm -rf "${markerTmp}"`, { stdio: "ignore" }); } catch {}
@@ -576,7 +576,7 @@ try {
   execSync("git checkout -q -b master", { cwd: r, stdio: "ignore" });
   expectBool("disorder: master+clean → null", readHubDisorder(r).disorder === null, true);
 } catch (e) {
-  console.log(`⏭️  readHubDisorder fs cases failed to provision: ${String(e.message).slice(0, 120)}`);
+  console.error(`❌ readHubDisorder fs cases FAILED to provision: ${String(e.message).slice(0, 120)}`); fail++;
 } finally {
   if (hubTmp) {
     try { execSync(`rm -rf "${hubTmp}"`, { stdio: "ignore" }); } catch {}
@@ -617,31 +617,408 @@ try {
     writeFileSync(p, content);
     return p;
   };
+  // #347: existing script-verdict call sites pass MAIN explicitly as the
+  // executionCwd — the suite supports running from a linked worktree
+  // (RUN_IS_MAIN branching), where process.cwd() = the worktree would flip
+  // these assertions (plan-verify P1).
   const blockCommit = mk("commit.sh", `#!/bin/bash\ngit add .\ngit commit -m 'x'\n`);
-  expectBool("script: git commit → block", scriptGitVerdict(blockCommit, "pr1467") === "block", true);
+  expectBool("script: git commit → block", scriptGitVerdict(blockCommit, "pr1467", MAIN) === "block", true);
   const blockCheckoutB = mk("checkout-b.sh", `#!/bin/bash\ngit checkout -b feat/x\n`);
-  expectBool("script: checkout -b → block", scriptGitVerdict(blockCheckoutB, "pr1467") === "block", true);
+  expectBool("script: checkout -b → block", scriptGitVerdict(blockCheckoutB, "pr1467", MAIN) === "block", true);
   const blockForeignPush = mk("foreign-push.sh", `#!/bin/bash\ngit push origin main\n`);
-  expectBool("script: foreign push → block", scriptGitVerdict(blockForeignPush, "pr1467") === "block", true);
+  expectBool("script: foreign push → block", scriptGitVerdict(blockForeignPush, "pr1467", MAIN) === "block", true);
   const rec = mk("recovery.sh", `#!/bin/bash\ngit checkout main && git pull --ff-only\n`);
-  expectBool("script: sanctioned recovery → allow", scriptGitVerdict(rec, "pr1467") === "allow", true);
+  expectBool("script: sanctioned recovery → allow", scriptGitVerdict(rec, "pr1467", MAIN) === "allow", true);
   const wtHelper = mk("hub-worktree.sh", `#!/bin/bash\ngit fetch origin main\ngit worktree add ../.worktrees/x -b feat/x origin/main\nln -s ../.env .env\n`);
-  expectBool("script: hub-worktree.sh pattern → allow", scriptGitVerdict(wtHelper, "pr1467") === "allow", true);
+  expectBool("script: hub-worktree.sh pattern → allow", scriptGitVerdict(wtHelper, "pr1467", MAIN) === "allow", true);
   const ownPush = mk("own-push.sh", `#!/bin/bash\ngit push origin pr1467\n`);
-  expectBool("script: WIP push of own branch → allow", scriptGitVerdict(ownPush, "pr1467") === "allow", true);
+  expectBool("script: WIP push of own branch → allow", scriptGitVerdict(ownPush, "pr1467", MAIN) === "allow", true);
   const readOnly = mk("readonly.sh", `#!/bin/bash\ngit status\ngit log --oneline -3\n`);
-  expectBool("script: read-only git → allow", scriptGitVerdict(readOnly, "pr1467") === "allow", true);
+  expectBool("script: read-only git → allow", scriptGitVerdict(readOnly, "pr1467", MAIN) === "allow", true);
   const noGit = mk("nogit.sh", `#!/bin/bash\necho hello\n`);
-  expectBool("script: no git → allow", scriptGitVerdict(noGit, "pr1467") === "allow", true);
-  expectBool("script: missing file → allow (nothing to execute)", scriptGitVerdict(`${scriptTmp}/nope.sh`, "pr1467") === "allow", true);
+  expectBool("script: no git → allow", scriptGitVerdict(noGit, "pr1467", MAIN) === "allow", true);
+  expectBool("script: missing file → allow (nothing to execute)", scriptGitVerdict(`${scriptTmp}/nope.sh`, "pr1467", MAIN) === "allow", true);
   const comment = mk("comment.sh", `# this script talks about git for fun\necho done\n`);
-  expectBool("script: git only in comment prose → allow", scriptGitVerdict(comment, "pr1467") === "allow", true);
+  expectBool("script: git only in comment prose → allow", scriptGitVerdict(comment, "pr1467", MAIN) === "allow", true);
 } catch (e) {
-  console.log(`⏭️  script-verdict fs cases failed to provision: ${String(e.message).slice(0, 120)}`);
+  console.error(`❌ script-verdict fs cases FAILED to provision: ${String(e.message).slice(0, 120)}`); fail++;
 } finally {
   if (scriptTmp) {
     try { execSync(`rm -rf "${scriptTmp}"`, { stdio: "ignore" }); } catch {}
   }
+}
+
+// ── #347: M4 worktree-target exemption ──────────────────────────────────────
+// Regression tests: a hub-rooted session's git ops whose EFFECTIVE target is an
+// isolated worktree must NOT be frozen by hub disorder; hub/foreign/unresolvable
+// targets keep today's blocks. No total-bash-gate bypass: per-invocation
+// resolution (C1), semantic worktree predicate (worktree-list membership + cwd
+// containment), realpath normalization both sides (macOS /tmp → /private/tmp).
+// Provisioned on a realpath-stable tmp dir (mirrors the marker test's baseDir
+// pattern). T30/T31 (clean-hub no-op / worktree-session no-op) are index-level
+// gates (st.disorder null → gate not consulted) — covered by the live e2e.
+let m4Tmp = null;
+let m4Provisioned = false;
+try {
+  m4Tmp = realpathSync(execSync("mktemp -d", { encoding: "utf-8" }).trim());
+  const hubR = `${m4Tmp}/hub`;
+  const wtR = `${m4Tmp}/wt`;
+  execSync(`git init -q -b main "${hubR}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: hubR, stdio: "ignore" });
+  execSync("touch a.txt && git add . && git commit -qm init", { cwd: hubR, stdio: "ignore" });
+  execSync(`git worktree add -q "${wtR}" -b wt/feat HEAD`, { cwd: hubR, stdio: "ignore" });
+  execSync(`mkdir -p "${wtR}/subdir"`, { stdio: "ignore" });
+  execSync(`ln -s "${wtR}" "${m4Tmp}/link"`, { stdio: "ignore" }); // for T28 (realpath spelling)
+  // Foreign repo + worktree (C5: not in the hub's worktree map → must block).
+  const foreignR = `${m4Tmp}/foreign`;
+  const foreignWt = `${m4Tmp}/foreign-wt`;
+  execSync(`git init -q -b main "${foreignR}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: foreignR, stdio: "ignore" });
+  execSync("touch f.txt && git add . && git commit -qm init", { cwd: foreignR, stdio: "ignore" });
+  execSync(`git worktree add -q "${foreignWt}" -b f/wt HEAD`, { cwd: foreignR, stdio: "ignore" });
+  // Second worktree of the hub — REMOVED without prune for T34 (stale admin dir).
+  const wt2R = `${m4Tmp}/wt2`;
+  execSync(`git worktree add -q "${wt2R}" -b wt/feat2 HEAD`, { cwd: hubR, stdio: "ignore" });
+  execSync(`rm -rf "${wt2R}"`, { stdio: "ignore" }); // no prune — leaves a stale reverse-pointer admin dir
+  // T34b (code-review VULN-003): CRAFT the stale admin dir's reverse-pointer
+  // file to point at the HUB — the two-way back-reference check must reject it.
+  execSync(`printf '${hubR}/.git\n' > "${hubR}/.git/worktrees/wt2/gitdir"`, { stdio: "ignore" });
+  execSync("touch dirty.txt", { cwd: hubR, stdio: "ignore" }); // dirty hub
+  m4Provisioned = true;
+
+  function m4t(name, command, expectedVerdict) {
+    const got = evaluateHubGateWithTargets(command, "main", hubR).verdict;
+    const ok = got === expectedVerdict;
+    console.log(`${ok ? "✅" : "❌"} M4T ${name}: ${got}${ok ? "" : ` (expected ${expectedVerdict})`}`);
+    ok ? pass++ : fail++;
+  }
+
+  m4t("T1: cd wt commit — THE FIX", `cd "${wtR}" && git commit -m x`, "allowed");
+  m4t("T2: -C wt commit", `git -C "${wtR}" commit -m x`, "allowed");
+  m4t("T3: same-segment $VAR cd → conservative block (bash pre-assignment expansion)", `WT="${wtR}" cd "$WT" && git commit -m x`, "block");
+  m4t("T3b: boundary-separated $VAR cd (real shell state) → allowed", `WT="${wtR}" && cd "$WT" && git commit -m x`, "allowed");
+  m4t("T4: unresolvable $VAR", `cd $UNRESOLVED_WT && git commit -m x`, "block");
+  m4t("T5: hub commit (main never in map)", `git commit -m x`, "block");
+  m4t("T6: hub reset", `git -C "${hubR}" reset --hard`, "block");
+  m4t("T7: P1 mixed compound", `cd "${wtR}" && git commit && git -C "${hubR}" reset --hard`, "block");
+  m4t("T8: same-verb compound", `git -C "${wtR}" commit -m a && git -C "${hubR}" commit -m b`, "block");
+  m4t("T9: cycle-4 trap (block verb)", `git -C "${wtR}" --git-dir="${hubR}/.git" reset --hard`, "block");
+  m4t("T10: env git-dir trap", `GIT_DIR="${hubR}/.git" git -C "${wtR}" commit`, "block");
+  m4t("T11: admin-dir from hub cwd", `git --git-dir="${hubR}/.git/worktrees/wt" reset --hard`, "block");
+  m4t("T12: subshell cd does not leak", `(cd "${wtR}") && git reset --hard`, "block");
+  m4t("T13: subshell inherits cd", `cd "${wtR}" && (git reset --hard)`, "allowed");
+  m4t("T14: subshell + outer hub reset", `(cd "${wtR}" && git commit) && git reset --hard`, "block");
+  m4t("T15: cd outside + -C inside parens", `cd "${wtR}" && (git -C "${hubR}" reset --hard)`, "block");
+  m4t("T16: cd + -C inside subshell", `(cd "${wtR}" && git -C "${hubR}" reset --hard)`, "block");
+  m4t("T17: cd + -C override → hub", `cd "${wtR}" && git -C "${hubR}" reset --hard`, "block");
+  m4t("T18: workTree mismatch (flag)", `cd "${wtR}" && git -C "${wtR}" --work-tree="${hubR}" reset --hard`, "block");
+  m4t("T18a: workTree mismatch (env)", `GIT_WORK_TREE="${hubR}" git -C "${wtR}" commit`, "block");
+  m4t("T18b: admin-dir + cwd inside = the wt", `git -C "${wtR}" --git-dir="${hubR}/.git/worktrees/wt" reset --hard`, "allowed");
+  m4t("T19: GIT_DIR next-command scoping", `GIT_DIR="${hubR}/.git" git status && git -C "${wtR}" commit -m x`, "recovery");
+  m4t("T20: gitfile from hub cwd → block (containment)", `GIT_DIR="${wtR}/.git" git commit -m x`, "block");
+  m4t("T20a: gitfile from inside the wt", `cd "${wtR}" && GIT_DIR="${wtR}/.git" git commit -m x`, "allowed");
+  m4t("T21: foreign non-worktree repo → block (C5)", `git -C "${foreignR}" reset --hard`, "block");
+  m4t("T22: foreign worktree → block (not in hub map, C5)", `git -C "${foreignWt}" commit -m x`, "block");
+  m4t("T23: read-only in wt", `cd "${wtR}" && git status`, "recovery");
+  m4t("T23b: read-only log in wt", `cd "${wtR}" && git log --oneline -3`, "recovery");
+  m4t("T24: checkout main in wt → recovery (never resolved)", `cd "${wtR}" && git checkout main`, "recovery");
+  m4t("T25: exempt mutation + hub recovery mix", `cd "${wtR}" && git commit && git fetch`, "recovery");
+  m4t("T26: failed cd → hub cwd → gate", `cd /nonexistent && git commit -m x`, "block");
+  m4t("T26b: successful cd to non-git dir → conservative block", `cd /tmp && git commit -m x`, "block");
+  m4t("T26c: tilde cd → conservative block", `cd ~/x && git commit -m x`, "block");
+  m4t("T27: subdir containment", `cd "${wtR}/subdir" && git commit -m x`, "allowed");
+  m4t("T28: symlink spelling (realpath both sides)", `cd "${m4Tmp}/link/subdir" && git commit -m x`, "allowed");
+  m4t("T29: traversal out of the wt", `cd "${wtR}/../hub" && git commit -m x`, "block");
+  m4t("T32: pipe-cd false exemption", `cd /tmp | cd "${wtR}" && git commit -m x`, "block");
+  m4t("T33: pipe-cd mirror (C0 at pipeline start)", `cd "${wtR}" | cd /tmp && git commit -m x`, "block");
+  m4t("T34: stale admin dir skipped (wt2 rm -rf, no prune)", `cd "${wtR}" && git commit -m x`, "allowed");
+  m4t("T34b: CRAFTED reverse-pointer rejected (two-way validation)", `git --git-dir="${hubR}/.git/worktrees/wt2" reset --hard`, "block");
+  m4t("T35: failed-cd prefix stands", `cd "${wtR}" && cd /nonexistent && git commit -m x`, "allowed");
+  // ── Code-review round-2 fixes: bash-faithful boundaries + shared-ref verbs ──
+  m4t("T36: background & — cd does not leak to foreground", `cd "${wtR}" & git commit -m x`, "block");
+  m4t("T37: export GIT_DIR persists (VULN-002 closure)", `export GIT_DIR="${hubR}/.git" && git -C "${wtR}" commit -m x`, "block");
+  m4t("T38: export GIT_WORK_TREE persists (VULN-002 closure)", `export GIT_WORK_TREE="${hubR}" && cd "${wtR}" && git commit -m x`, "block");
+  m4t("T39: shared-ref push -f from wt → block", `cd "${wtR}" && git push -f origin main`, "block");
+  m4t("T40: shared-ref update-ref from wt → block", `cd "${wtR}" && git update-ref refs/heads/x HEAD`, "block");
+  m4t("T41: shared-ref tag from wt → block", `cd "${wtR}" && git tag v1`, "block");
+  m4t("T42: shared-ref branch -D from wt → block", `cd "${wtR}" && git branch -D feature`, "block");
+  m4t("T43: shared-ref symbolic-ref from wt → block", `cd "${wtR}" && git symbolic-ref HEAD refs/heads/x`, "block");
+  m4t("T44: push of the wt's OWN branch → recovery (wt-HEAD carve-out)", `cd "${wtR}" && git push origin wt/feat`, "recovery");
+  m4t("T45: bare cd → conservative (null marker)", `cd && git commit -m x`, "block");
+  expectBool("T45a: bare cd pushes a null marker (mechanism pin)", allGitInvocations(`cd && git commit -m x`)[0].cdChain[0] === null, true);
+  // ── Round-3 closures (code-review re-review, all probe-verified) ──
+  m4t("T46: echo's cd arg is NOT the builtin → block", `echo cd "${wtR}" && git commit -m x`, "block");
+  m4t("T47: echo cd arg does not pollute the chain → allowed", `cd "${wtR}" && echo cd "${hubR}" && git commit -m x`, "allowed");
+  m4t("T48: push empty-source refspec (delete) → block", `cd "${wtR}" && git push origin :wt/feat`, "block");
+  m4t("T49: push --all → block (foreign branches)", `cd "${wtR}" && git push --all origin`, "block");
+  m4t("T50: push origin HEAD → recovery (resolves to wt branch)", `cd "${wtR}" && git push origin HEAD`, "recovery");
+  m4t("T51: &> redirect is not a background boundary → allowed", `cd "${wtR}" &>/dev/null && git commit -m x`, "allowed");
+  m4t("T52: GIT_INDEX_FILE redirect outside wt → block", `cd "${wtR}" && GIT_INDEX_FILE="${hubR}/.git/index" git commit -m x`, "block");
+  m4t("T53: stash mutates shared refs/stash → block", `cd "${wtR}" && git stash`, "block");
+  m4t("T54: stash list → allowed (readonly)", `cd "${wtR}" && git stash list`, "allowed");
+  m4t("T55: unknown verb (subtree push) → block (inverted allowlist)", `cd "${wtR}" && git subtree push --prefix=docs origin main`, "block");
+  m4t("T56: redirect makes VAR a prefix (not statement) → block", `VAR="${wtR}" > /dev/null git fetch; cd "$VAR" && git commit -m x`, "block");
+  // ── Round-4 closures (re-review round 2, all probe-verified) ──
+  m4t("T57: bash -c inline gating → block", `bash -c "git commit -m x"`, "block");
+  m4t("T58: sh -c inline with wt cd → allowed", `sh -c "cd ${wtR} && git commit -m x"`, "allowed");
+  m4t("T59: &> redirect does not pollute args → recovery", `git checkout main &> /dev/null`, "recovery");
+  m4t("T60a: fetch explicit dst main:main → block", `git fetch origin main:main`, "block");
+  m4t("T60b: fetch implicit dst main → recovery", `git fetch origin main`, "recovery");
+  m4t("T61: export consumes args (cd not a command) → block", `export cd "${wtR}" && git commit -m x`, "block");
+  m4t("T62: unset deletes vars → block", `WT="${wtR}"; unset WT; cd "$WT" && git commit -m x`, "block");
+  m4t("T63: redirect-led cd (real builtin) → allowed", `> /dev/null cd "${wtR}" && git commit -m x`, "allowed");
+  m4t("T64: symbolic-ref non-HEAD from wt → block (shared ref)", `cd "${wtR}" && git symbolic-ref refs/remotes/origin/HEAD refs/heads/x`, "block");
+  // ── Round-5 closures (final gate re-review, all probe-verified) ──
+  m4t("T65: bash -c -x inline (flag after -c) → block", `bash -c -x "git commit -m x"`, "block");
+  m4t("T66: eval git content → block (fail-closed substitution)", `eval "git reset --hard"`, "block");
+  m4t("T67: \$( ) command substitution with git → block", `echo "\$(git pull origin +main:main)"`, "block");
+  m4t("T68: pull refspec dst main from wt → block (round-5 P1)", `cd "${wtR}" && git pull origin +main:refs/heads/main`, "block");
+  m4t("T69: push origin main:main from wt → block (wt-branch re-validation)", `cd "${wtR}" && git push origin main:main`, "block");
+  m4t("T70: push wt own branch with redirect → recovery (args preserved)", `cd "${wtR}" && git push > /tmp/m4-push.log origin wt/feat`, "recovery");
+  // ── Round-6 closures (final gate round 2, all probe-verified) ──
+  m4t("T71: absolute-path git → gated", `/usr/bin/git commit -m x`, "block");
+  m4t("T72: absolute-path git targeting wt → allowed", `/usr/bin/git -C "${wtR}" commit -m x`, "allowed");
+  m4t("T73: substitution AFTER a worktree exemption → block (fail-closed pre-loop)", `cd "${wtR}" && git commit -m x && echo "\$(git -C "${hubR}" reset --hard)"`, "block");
+  m4t("T74: substitution without git → allowed (no false-block)", `cd "${wtR}" && git commit -m x && echo "\$(date)"`, "allowed");
+  m4t("T75: switch -C main → block (force-create protected branch)", `git switch -C main`, "block");
+  m4t("T76: -C \"\$VAR\" var-expanded → allowed", `VAR="${wtR}" && git -C "$VAR" commit -m x`, "allowed");
+  // ── Round-7 refinements (final gate round 3, all probe-verified) ──
+  m4t("T77: alias + worktree commit → allowed (no false-block)", `cd "${wtR}" && alias ll="ls -la" && git commit -m x`, "allowed");
+  m4t("T78: \$VAR hop inside substitution → block", `G=git; echo "\$(\$G -C "${hubR}" reset --hard)"`, "block");
+  m4t("T79: prose git + \$(date) → allowed (substitution-span scoped)", `cd "${wtR}" && git commit -m "use git \$(date)"`, "allowed");
+  m4t("T80: multi-span — git in the 2nd substitution → block (matchAll)", `echo "\$(date) \$(git -C "${hubR}" reset --hard)"`, "block");
+  m4t("T81: \$VAR in substitution ARG position → allowed (no false-block)", `cd "${wtR}" && git commit -m "\$(cat \$MSG_FILE)"`, "allowed");
+  m4t("T82: spawner-builtin var-hop (env) → block (round-9)", `G=git; echo "\$(env \$G -C "${hubR}" reset --hard)"`, "block");
+  m4t("T83: spawner-builtin var-hop mid-span (xargs) → block (round-9)", `G=git; echo "\$(echo x | xargs \$G -C "${hubR}" reset --hard)"`, "block");
+  // ── Round-10 closures (final gate round 2, all probe-verified — hub commits destroyed pre-fix) ──
+  m4t("T84: spawner + flag var-hop (env -i) → block", `G=git; echo "\$(env -i \$G -C "${hubR}" reset --hard HEAD~1)"`, "block");
+  m4t("T85: interpreter -c var-hop (sh -c) → block", `G="git -C "${hubR}" reset --hard"; echo "\$(sh -c \"\$G\")"`, "block");
+  m4t("T86: piped-stdin shell with git → block", `printf "git -C "${hubR}" reset --hard" | bash`, "block");
+  m4t("T87: script-in-substitution → block", `echo "\$(bash /tmp/m4-evil.sh)"`, "block");
+  m4t("T88: spawner word in ARG position → non-git (no false-block)", `echo "\$(echo time \$DUR)"`, "non-git");
+  // ── Round-11 closures (final gate round 3, all probe-verified) ──
+  m4t("T89: top-level \$VAR command word → block", `G=git; \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T90: brace-group \$VAR substitution → block", `G=git; \$( { \$G -C "${hubR}" reset --hard; } )`, "block");
+  m4t("T91: sh -c \$EDITOR (unassigned var) → non-git (no false-block)", `sh -c '\$EDITOR /tmp/x.txt'`, "non-git");
+  m4t("T92: read-only git in substitution → allowed (no freeze)", `cd "${wtR}" && git commit -m "v\$(git describe --tags)"`, "allowed");
+  m4t("T93: read-only piped git → non-git (no false-block)", `echo "git log" | bash`, "non-git");
+  // ── Round-12 closures (final gate round 4, all probe-verified) ──
+  m4t("T94: subshell-inherited \$VAR command → block", `G=git; ( \$G -C "${hubR}" reset --hard HEAD~1 )`, "block");
+  m4t("T95: eval \$VAR command → block", `G=git; eval \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T96: top-level spawner \$VAR command → block", `G=git; env \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T97: multiword \$VAR command value → block (unverifiable)", `G="git -C "${hubR}" reset --hard"; \$G`, "block");
+  m4t("T98: second pipe-to-shell segment → block (scan every segment)", `echo x | bash && printf "git reset --hard" | sh`, "block");
+  // ── Round-13 closures (final gate round 5, all probe-verified) ──
+  m4t("T99: pipe-segment \$VAR command → block (vars inherited)", `G=git; echo x | \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T100: for/do \$VAR command → block (compound word)", `G=git; for i in 1; do \$G -C "${hubR}" reset --hard; done`, "block");
+  m4t("T101: if/then \$VAR command → block", `G=git; if true; then \$G -C "${hubR}" reset --hard; fi`, "block");
+  m4t("T102: quoted substitution with prefix \$VAR → block", `G=git; "\$( cd /tmp && \$G -C "${hubR}" reset --hard )"`, "block");
+  m4t("T103: symbolic-ref non-HEAD in substitution → block (shared ref)", `cd "${wtR}" && git commit -m "\$(git symbolic-ref refs/remotes/origin/HEAD refs/heads/main)"`, "block");
+  // ── Round-14 closures (final gate round 6, all probe-verified) ──
+  m4t("T104: heredoc fed to a shell with git → block", `cat <<'EOF' | sh\ngit -C "${hubR}" reset --hard\nEOF`, "block");
+  m4t("T105: spawner + flag var-hop (env -i) → block", `G=git; env -i \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T106: spawner + flag operand var-hop (sudo -u root) → block", `G=git; sudo -u root \$G -C "${hubR}" reset --hard`, "block");
+  m4t("T107: spawner-window cd is NOT the builtin → block (round-15)", `env -i cd "${wtR}"; git commit -m x`, "block");
+  m4t("T108: fd-INPUT redirect before -c inline → block (round-16)", `bash 2<&1 -c "git reset --hard"`, "block");
+  m4t("T109: digit-less fd-dup before -c inline → block (round-17)", `bash <&0 -c "git reset --hard"`, "block");
+  m4t("T110: stdin-redirect before -c inline → block (round-18)", `bash < /dev/null -c "git commit -m x"`, "block");
+  m4t("T111: process substitution with git → block (round-19)", `bash <(echo "git commit -m x")`, "block");
+  // Round-20 closures (second-model P1s — force-create = branch -f; script surface)
+  m4t("T113: checkout -B non-main from wt → block", `cd "${wtR}" && git checkout -B feat/other`, "block");
+  m4t("T114: switch -C non-main from wt → block", `cd "${wtR}" && git switch -C feat/other`, "block");
+  m4t("T115: flag-with-operand before -c inline → block", `bash --rcfile /tmp/decoy.sh -c "git commit -m x"`, "block");
+  m4t("T116: checkout -b (create) → allowed", `cd "${wtR}" && git checkout -b feat/new`, "allowed");
+  m4t("T117: attached -Cmain → block (round-21)", `cd "${wtR}" && git switch -Cmain`, "block");
+  m4t("T118: attached -Bmain → block (round-21)", `cd "${wtR}" && git checkout -Bmain`, "block");
+  m4t("T119: long-option equals force-create → block (round-22)", `cd "${wtR}" && git switch --force-create=main main~2`, "block");
+  m4t("T120: HUB-path attached/equals force-create → block (round-23)", `cd "${hubR}" && git switch -Cmain master`, "block");
+  m4t("T121: HUB-path attached lowercase create → block (round-24)", `cd "${hubR}" && git checkout -bfoo main`, "block");
+  // T112 (flag-with-operand) is a BACKDOOR-path closure — the pure gate sees no
+  // invocation; the production block is extractScriptPath → scriptGitVerdict.
+  expectBool("T112: flag-with-operand then script → script path + content gated (round-19)", (() => {
+    const p = `${m4Tmp}/evil.sh`;
+    writeFileSync(p, `git reset --hard\n`);
+    return extractScriptPath(`bash --rcfile /tmp/decoy.sh ${p}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "block";
+  })(), true);
+
+  // ── Round-3: main-protection (worktree on the hub's protected branch) ──
+  // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
+  // can take main. Separate mini-fixture: hub → hub/off, wt on main.
+  let m4MainTmp = null;
+  try {
+    m4MainTmp = realpathSync(execSync("mktemp -d", { encoding: "utf-8" }).trim());
+    const mhub = `${m4MainTmp}/hub`;
+    const mwt = `${m4MainTmp}/wt`;
+    const mwtmain = `${m4MainTmp}/wtmain`;
+    execSync(`git init -q -b main "${mhub}"`, { stdio: "ignore" });
+    execSync("git config user.email t@t && git config user.name t", { cwd: mhub, stdio: "ignore" });
+    execSync("touch a && git add . && git commit -qm init", { cwd: mhub, stdio: "ignore" });
+    execSync(`git worktree add -q "${mwt}" -b wt/feat HEAD`, { cwd: mhub, stdio: "ignore" });
+    execSync("git checkout -q -b hub/off", { cwd: mhub, stdio: "ignore" }); // hub OFF main — main is free
+    execSync(`git worktree add -q "${mwtmain}" main`, { cwd: mhub, stdio: "ignore" }); // a wt ON main
+    execSync("touch dirty.txt", { cwd: mhub, stdio: "ignore" });
+    const m4m = (name, cmd, exp) => {
+      const got = evaluateHubGateWithTargets(cmd, "hub/off", mhub).verdict;
+      const ok = got === exp;
+      console.log(`${ok ? "✅" : "❌"} M4M ${name}: ${got}${ok ? "" : ` (expected ${exp})`}`);
+      ok ? pass++ : fail++;
+    };
+    m4m("M1: wt ON main → commit blocked (main-protection)", `cd "${mwtmain}" && git commit -m x`, "block");
+    m4m("M2: wt checkout main while hub off-main → blocked", `cd "${mwt}" && git checkout main`, "block");
+    m4m("M2b: wt checkout -B main (force) while hub off-main → blocked (round-4)", `cd "${mwt}" && git checkout -B main`, "block");
+    m4m("M4: wt switch -C main while hub off-main → blocked (round-6)", `cd "${mwt}" && git switch -C main`, "block");
+    m4m("M3: wt on feature branch → commit allowed", `cd "${mwt}" && git commit -m x`, "allowed");
+  } catch (e) {
+    console.error(`❌ main-protection fixtures FAILED: ${String(e.message).slice(0, 120)}`);
+    fail++;
+  } finally {
+    if (m4MainTmp) {
+      try { execSync(`rm -rf "${m4MainTmp}"`, { stdio: "ignore" }); } catch {}
+    }
+  }
+
+  // ── Shape regression (allGitInvocations extended shape) — content-pinned ──
+  const shapeInv = allGitInvocations(`cd "${wtR}" && git -C "${hubR}" reset --hard`);
+  expectBool("shape: cdChain content pinned", Array.isArray(shapeInv[0].cdChain) && shapeInv[0].cdChain[0] === wtR, true);
+  expectBool("shape: cHints content pinned", Array.isArray(shapeInv[0].cHints) && shapeInv[0].cHints[0] === hubR, true);
+  expectBool("shape: args exact", JSON.stringify(shapeInv[0].args) === JSON.stringify(["--hard"]), true);
+  const popInv = allGitInvocations(`cd /x && (cd /y) && git commit -m x`);
+  expectBool("shape: subshell cd does not leak into the outer chain", popInv[0].cdChain.length === 1 && popInv[0].cdChain[0] === "/x", true);
+  // Observable resolution (test-review: assert the exported consumer, not just the parse shape).
+  const obsTgt = resolveInvocationTarget(shapeInv[0], hubR, hubR);
+  expectBool("observable: resolveInvocationTarget → hub, not worktree", obsTgt !== null && obsTgt.isWorktree === false && obsTgt.effectiveCwd === hubR, true);
+  const obsTgt2 = resolveInvocationTarget(allGitInvocations(`cd "${wtR}" && git commit -m x`)[0], hubR, hubR);
+  expectBool("observable: resolveInvocationTarget → worktree", obsTgt2 !== null && obsTgt2.isWorktree === true, true);
+
+  // ── Backdoor (B) — commandExecutionCwd + scriptGitVerdict ──
+  const cec = (cmd) => commandExecutionCwd(cmd, hubR);
+  expectBool("B1: sequential cd chain", cec(`cd /tmp && cd "${wtR}" && bash ./s.sh`) === wtR, true);
+  expectBool("B2: same-segment $VAR cd → null (unresolvable, caller falls back)", cec(`V="${wtR}" cd "$V" && bash ./s.sh`) === null, true);
+  expectBool("B2b: boundary-separated $VAR cd (real shell state)", cec(`V="${wtR}" && cd "$V" && bash ./s.sh`) === wtR, true);
+  expectBool("B3: no cd → session cwd", cec(`bash /abs/s.sh`) === hubR, true);
+  expectBool("B4: subshell wrapper", cec(`(cd "${wtR}" && bash ./s.sh)`) === wtR, true);
+  expectBool("B5: failed cd → session cwd", cec(`cd /nonexistent && bash x.sh`) === hubR, true);
+  expectBool("B6: inner cd does not leak", cec(`cd "${wtR}" && (cd /tmp) && bash s.sh`) === wtR, true);
+  expectBool("B13: cd hub + (cd wt) → hub (no leak)", cec(`cd "${hubR}" && (cd "${wtR}") && bash x.sh`) === hubR, true);
+  expectBool("B17: pipe → session cwd (subshell segments)", cec(`cd /tmp | cd "${wtR}" && bash x.sh`) === hubR, true);
+  expectBool("B18: background & — cd does not leak (code-review round-2)", cec(`cd "${wtR}" & bash s.sh`) === hubR, true);
+
+  const mkS = (name, content) => { const p = `${m4Tmp}/${name}`; writeFileSync(p, content); return p; };
+  const sMutHub = mkS("mut-hub.sh", `git -C "${hubR}" reset --hard\n`);
+  const sTgtWt = mkS("tgt-wt.sh", `git -C "${wtR}" commit -m x\n`);
+  const sPlain = mkS("plain.sh", `git reset --hard\n`);
+  const sSubshell = mkS("subshell.sh", `(cd "${wtR}" && git commit)\n`);
+  const sCdWt = mkS("cd-wt.sh", `cd "${wtR}" && git commit -m x\n`);
+  const sCdWtMulti = mkS("cd-wt-multi.sh", `cd "${wtR}"\ngit commit -m x\n`);
+  const sMixedWtFirst = mkS("mixed-wt-first.sh", `git -C "${wtR}" commit -m x\ngit -C "${hubR}" reset --hard\n`);
+  const sMixedHubFirst = mkS("mixed-hub-first.sh", `git -C "${hubR}" reset --hard\ngit -C "${wtR}" commit -m x\n`);
+  // Round-2 closures on the SCRIPT-BACKDOOR surface (test-review P1s — the script
+  // surface shares _walkShell/resolveInvocationTarget with the bash gate but must
+  // pin the same closures).
+  const sAmp = mkS("amp.sh", `cd "${wtR}" & git commit -m x\n`);
+  const sExportDir = mkS("export-gitdir.sh", `export GIT_DIR="${hubR}/.git" && git -C "${wtR}" commit -m x\n`);
+  const sExportWt = mkS("export-worktree.sh", `export GIT_WORK_TREE="${hubR}" && cd "${wtR}" && git commit -m x\n`);
+  const sPushF = mkS("push-f.sh", `cd "${wtR}" && git push -f origin main\n`);
+  const sTag = mkS("tag.sh", `cd "${wtR}" && git tag v1\n`);
+  const sSymRef = mkS("symref.sh", `cd "${wtR}" && git symbolic-ref HEAD refs/heads/x\n`);
+  const sUpdRef = mkS("updref.sh", `cd "${wtR}" && git update-ref refs/heads/x HEAD\n`);
+  const sBranchD = mkS("branch-d.sh", `cd "${wtR}" && git branch -D feature\n`);
+  const sPushOwn = mkS("push-own.sh", `cd "${wtR}" && git push origin wt/feat\n`);
+  const sCrafted = mkS("crafted.sh", `git --git-dir="${hubR}/.git/worktrees/wt2" reset --hard\n`);
+  expectBool("B7: script -C hub from wt cwd → block", scriptGitVerdict(sMutHub, "main", wtR, hubR) === "block", true);
+  expectBool("B8: script wt-targeted content → allow", scriptGitVerdict(sTgtWt, "main", wtR, hubR) === "allow", true);
+  expectBool("B9: script plain reset at wt cwd → allow (isolated)", scriptGitVerdict(sPlain, "main", wtR, hubR) === "allow", true);
+  expectBool("B4old: script plain reset at hub cwd → block", scriptGitVerdict(sPlain, "main", hubR, hubR) === "block", true);
+  expectBool("B10: script subshell wt content → allow", scriptGitVerdict(sSubshell, "main", hubR, hubR) === "allow", true);
+  expectBool("B10b: script plain cd-chain content → allow (incident shape)", scriptGitVerdict(sCdWt, "main", hubR, hubR) === "allow", true);
+  expectBool("B10c: script multi-line cd-chain content → allow", scriptGitVerdict(sCdWtMulti, "main", hubR, hubR) === "allow", true);
+  expectBool("B16: script -C wt executed at /tmp → allow (session map)", scriptGitVerdict(sTgtWt, "main", "/tmp", hubR) === "allow", true);
+  expectBool("B11: end-to-end closure — /tmp script with hub-mutating content → block", (() => { const p = mkS("closure.sh", `git reset --hard\n`); return scriptGitVerdict(p, "main", "/tmp", hubR) === "block"; })(), true);
+  expectBool("B11b: MIXED content wt-first → block (loop-continues-on-exemption)", scriptGitVerdict(sMixedWtFirst, "main", hubR, hubR) === "block", true);
+  expectBool("B11c: MIXED content hub-first → block", scriptGitVerdict(sMixedHubFirst, "main", hubR, hubR) === "block", true);
+  expectBool("B12: extractScriptPath handles subshell wrappers", extractScriptPath(`(cd /tmp && bash x.sh)`) === "x.sh", true);
+  expectBool("B29: extractScriptPath skips interpreter flags (round-4)", extractScriptPath(`bash -x evil.sh`) === "evil.sh", true);
+  const sAlias = mkS("alias.sh", `alias g=git\ng reset --hard HEAD~1\n`);
+  expectBool("B30: alias indirection script → block (round-6 fail-closed)", scriptGitVerdict(sAlias, "main", hubR, hubR) === "block", true);
+  const sSubScript = mkS("sub.sh", `echo "$(git -C "${hubR}" reset --hard)"\n`);
+  expectBool("B31: script substitution git → block", scriptGitVerdict(sSubScript, "main", hubR, hubR) === "block", true);
+  const sComment = mkS("comment-sub.sh", `# note: runs $(git rev-parse HEAD)\ngit status\n`);
+  expectBool("B32: script COMMENT substitution → allow (comment-stripped scan)", scriptGitVerdict(sComment, "main", hubR, hubR) === "allow", true);
+  const sWordHash = mkS("word-hash.sh", `echo a#b && git reset --hard\n`);
+  expectBool("B33: script a#b (word-start comment rule) + reset → block (round-8)", scriptGitVerdict(sWordHash, "main", hubR, hubR) === "block", true);
+  expectBool("B34: extractScriptPath stdin-redirect → the script path (round-14)", extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B41: script checkout/switch main-protection (round-20)", (() => {
+    const mk = (c) => { const p = `${m4Tmp}/s${Date.now()}${Math.random().toString(36).slice(2)}.sh`; writeFileSync(p, c); return p; };
+    return scriptGitVerdict(mk("git checkout main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -B main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git switch -C main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -B feat/other\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -b feat/new\n"), "hub/off", wtR, hubR) === "allow" &&
+      scriptGitVerdict(mk("git commit -m x\n"), "hub/off", wtR, hubR) === "allow";
+  })(), true);
+  expectBool("B35: stdin-redirect script content gated → block", (() => { const p = mkS("stdin.sh", `git reset --hard\n`); return extractScriptPath(`bash < ${p}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "block"; })(), true);
+  expectBool("B36: fd-redirect before stdin-redirect → the stdin path (round-15)", extractScriptPath(`bash 2>&1 < /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash 2>/dev/null < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B37: fd-INPUT dup before the script path → the script path (round-16)", extractScriptPath(`bash 2<&1 /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash 2<&- /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`sh 0<&1 /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B38: digit-less fd-dup / stdin+arg / spawner-prefix → the script path (round-17)", extractScriptPath(`bash <&0 /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash <&- /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /dev/null /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`exec bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`env bash /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B39: spawner-flag → the interpreter's script path (round-18)", extractScriptPath(`env -i bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`sudo -u root bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`timeout 5 bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /dev/null -c "git commit"`) === null, true);
+  expectBool("B40: flag-with-operand + stdin-flag → the script path (round-19)", extractScriptPath(`bash < /dev/null -x /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash --rcfile /tmp/decoy.sh /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash -O extglob /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  expectBool("B41: script checkout/switch main-protection (round-20)", (() => {
+    const mk = (c) => { const p = `${m4Tmp}/s${Date.now()}${Math.random().toString(36).slice(2)}.sh`; writeFileSync(p, c); return p; };
+    return scriptGitVerdict(mk("git checkout main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -B main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git switch -C main\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -B feat/other\n"), "hub/off", wtR, hubR) === "block" &&
+      scriptGitVerdict(mk("git checkout -b feat/new\n"), "hub/off", wtR, hubR) === "allow" &&
+      scriptGitVerdict(mk("git commit -m x\n"), "hub/off", wtR, hubR) === "allow";
+  })(), true);
+  expectBool("B12b: end-to-end subshell script at wt cwd → allow", (() => {
+    const p = mkS("mutation.sh", `git reset --hard\n`);
+    const execCwd = commandExecutionCwd(`(cd "${wtR}" && bash ./mutation.sh)`, hubR);
+    return execCwd === wtR && scriptGitVerdict(p, "main", execCwd, hubR) === "allow";
+  })(), true);
+  // Round-2 script-backdoor closure pins (test-review P1s)
+  expectBool("B19: script content & background → block at hub cwd / allow at wt cwd", scriptGitVerdict(sAmp, "main", hubR, hubR) === "block" && scriptGitVerdict(sAmp, "main", wtR, hubR) === "allow", true);
+  expectBool("B20: script export GIT_DIR persistence → block", scriptGitVerdict(sExportDir, "main", wtR, hubR) === "block", true);
+  expectBool("B21: script export GIT_WORK_TREE persistence → block", scriptGitVerdict(sExportWt, "main", wtR, hubR) === "block", true);
+  expectBool("B22: script shared-ref push -f → block", scriptGitVerdict(sPushF, "main", hubR, hubR) === "block", true);
+  expectBool("B23: script shared-ref tag → block", scriptGitVerdict(sTag, "main", hubR, hubR) === "block", true);
+  expectBool("B24: script shared-ref symbolic-ref → block", scriptGitVerdict(sSymRef, "main", hubR, hubR) === "block", true);
+  expectBool("B25: script shared-ref update-ref → block", scriptGitVerdict(sUpdRef, "main", hubR, hubR) === "block", true);
+  expectBool("B26: script shared-ref branch -D → block", scriptGitVerdict(sBranchD, "main", hubR, hubR) === "block", true);
+  expectBool("B27: script push of the wt's OWN branch → allow (wt-HEAD carve-out)", scriptGitVerdict(sPushOwn, "main", hubR, hubR) === "allow", true);
+  expectBool("B28: script crafted gitdir attack → block (two-way validation)", scriptGitVerdict(sCrafted, "main", wtR, hubR) === "block", true);
+
+  // ── Write gate (W) — resolveTargetTopLevel predicate ──
+  const hubTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: hubR, encoding: "utf-8" }).trim());
+  const wtTop = resolve(execSync("git rev-parse --show-toplevel", { cwd: wtR, encoding: "utf-8" }).trim());
+  const rttl = (target, cwd) => resolveTargetTopLevel(target, cwd ?? hubR);
+  expectBool("W1: hub file → hub toplevel (M4 block condition)", rttl("dirty.txt") === hubTop, true);
+  expectBool("W2: wt file → wt toplevel (≠ hub → no M4 block)", rttl("x.txt", wtR) === wtTop && wtTop !== hubTop, true);
+  expectBool("W2b: PRODUCTION frame — absolute wt path from hub cwd", rttl(`${wtR}/x.txt`) === wtTop, true);
+  expectBool("W3: wt deep path → wt toplevel", rttl("deep/x.txt", wtR) === wtTop, true);
+  expectBool("W5: missing dir under hub → walk-up → hub toplevel", rttl("newdir/x.txt") === hubTop, true);
+  expectBool("W4: /tmp target → null (outside any repo)", rttl("/tmp/foo.md") === null, true);
+  expectBool("W6: foreign repo file → foreign toplevel (≠ hub → no M4 block)", rttl("f.txt", foreignR) === resolve(execSync("git rev-parse --show-toplevel", { cwd: foreignR, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim()) && rttl("f.txt", foreignR) !== hubTop, true);
+
+  // ── Degradation (D) ──
+  const classifySrc = readFileSync(new URL("./classify-git.mjs", import.meta.url), "utf-8");
+  // C2 static assert: no IMPORT of branch-ownership (comments may reference the
+  // name — the two-tokenizers precedent; the module must stay dependency-free
+  // for jiti loading). Catches static, dynamic (import()), and require() forms.
+  const branchImports = classifySrc.split("\n").filter((l) => l.includes("branch-ownership") && /(^\s*import\b|import\s*\(|require\s*\()/.test(l));
+  expectBool("D2: classify-git.mjs imports no branch-ownership (C2)", branchImports.length === 0, true);
+} catch (e) {
+  // A security-gate regression suite must FAIL, not silently skip, when its
+  // fixtures can't be provisioned (test-review P1).
+  console.error(`❌ #347 m4t cases FAILED to provision: ${String(e.message).slice(0, 160)}`);
+  fail++;
+  if (!m4Provisioned) console.error("   → the worktree-target exemption (T/B/W/D) assertions were NOT run — suite must fail.");
+} finally {
+  if (m4Tmp) {
+    try { execSync(`git worktree remove --force "${m4Tmp}/wt"`, { stdio: "ignore" }); } catch {}
+    try { execSync(`rm -rf "${m4Tmp}"`, { stdio: "ignore" }); } catch {}
+  }
+  try { execSync("git worktree prune", { stdio: "ignore" }); } catch {}
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
