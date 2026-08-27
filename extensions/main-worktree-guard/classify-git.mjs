@@ -1381,7 +1381,14 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
       // ONLY `checkout main|master` (recovery). Path-restore (--), discard-all
       // (.), previous-branch (-), create/force/orphan/detach forms → block.
       if (a.includes("--")) return "block";
-      if (["-b", "-B", "-c", "-C", "-f", "--force", "--create", "--force-create", "--orphan", "--detach"].some(flag)) return "block";
+      // Round-23 (final gate P1): force-create in ANY spelling (attached
+      // short-option `-Cmain`/`-Bmain`, long-option equals `--force-create=`)
+      // evaded the exact-match flag list and classified the HUB-path checkout
+      // as sanctioned recovery (`cd <hub> && git switch -Cmain master` moved
+      // refs/heads/main — probe). Block on the spelling family — same as the
+      // worktree gate (shared-ref move ≡ branch -f).
+      if (["-b", "-B", "-c", "-C", "-f", "--force", "--create", "--force-create", "--orphan", "--detach"].some(flag) ||
+          a.some((x) => x.startsWith("--force-create=") || /^-[BC][^-]/.test(x))) return "block";
       if (pos.length !== 1 || pos[0] === "." || pos[0] === "-") return "block";
       return pos[0] === "main" || pos[0] === "master" ? "recovery" : "block";
     case "fetch":
