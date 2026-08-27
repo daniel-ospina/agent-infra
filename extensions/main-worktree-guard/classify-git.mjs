@@ -1625,6 +1625,17 @@ function _unverifiableGitContent(command) {
   for (const m of c.matchAll(/(?:^|[;&|\s])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=([^\s;&|]+)/g)) {
     cmdVars[m[1]] = m[2];
   }
+  // Round-19 (final gate P1): process substitution `<( echo 'git …' )` feeds
+  // a shell interpreter a script with NO file — the content is executable
+  // text (probe: `bash <(echo 'git commit')` committed to the hub). Classify
+  // the <( )/>( ) spans like $() content.
+  for (const m of c.matchAll(/[<>]\(([^)]*)\)/g)) {
+    // The FD's CONTENT is what the shell executes — a git word ANYWHERE in the
+    // substitution output is unverifiable (bash <(echo 'git commit') runs git;
+    // `bash <(echo 'git status')` is conservatively blocked too — the gate
+    // cannot evaluate echo's output).
+    if (/\bgit\b/.test(m[1] ?? "") || _spanCarriesGit(m[1] ?? "")) return true;
+  }
   // Round-11 (security P1): span extraction on the RAW command (unquoted
   // `$( … )` splits into `$`/`(` tokens — the token-level scan missed them).
   for (const inner of _extractSubstitutionSpans(c)) {
@@ -2037,51 +2048,47 @@ export function extractScriptPath(command) {
   if (i >= tokens.length) return null;
   const t = tokens[i];
   if (SHELL_INTERPRETERS.has(t)) {
-    // Round-4: skip ALL leading interpreter flags (`bash -x evil.sh` — the old
-    // code returned null on the first `-x`, reopening the script backdoor).
-    // Round-14: also skip redirect operators + operands (`bash < /tmp/evil.sh`
-    // returned "<" as the script path — the stdin-redirect backdoor, second-
-    // model P1).
+    // Round-19 (final gate P1): the script file is the LAST positional
+    // (non-flag, non-redirect) token before a boundary — `bash --rcfile decoy
+    // evil.sh`, `bash -O extglob evil.sh`, `bash < /dev/null -x evil.sh` all
+    // execute evil.sh (the old scan broke at the first flag-operand and gated
+    // the WRONG file — probe: evil.sh ran ungated). If no positional exists,
+    // a stdin redirect's operand IS the script (`bash < evil.sh`); `-c`/
+    // `--command` means an inline (return null — gated by the normal
+    // classifier); process substitution `<( … )` is an FD, not a file (null —
+    // _unverifiableGitContent fails closed on the content).
     let j = i + 1;
     let sawInline = false;
+    let stdinOperand = null;
+    let lastPositional = null;
+    let sawProcessSub = false;
     while (j < tokens.length) {
       const n = tokens[j];
+      // Redirects FIRST — they are also shell boundaries but are NOT command
+      // terminators in this scan (B34 regression: `bash < evil.sh` broke at
+      // the `<` before the redirect branch ran).
+      if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(n)) { j++; continue; } // fd-dup/close — no operand
+      if (n === "<(" || n.startsWith("<(")) { sawProcessSub = true; j++; continue; } // process substitution FD
+      if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n)) {
+        if (n === "<" || n === "<<" || n === "0<" || n === "0<<") {
+          stdinOperand = tokens[j + 1]; // the stdin file (script only if no positional follows)
+        }
+        j += 2;
+        continue;
+      }
+      if (_isShellBoundary(n)) break;
       if (n.startsWith("-")) {
         if (n === "-c" || n === "--command") sawInline = true;
         j++;
         continue;
       }
-      if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(n)) {
-        // Round-15 (final gate P1): only a STDIN redirect (`<`, `<<`, `0<`)
-        // has a script-file operand. `>`/`>>`/`&>`/`>&`/fd-`>` operands are
-        // OUTPUT files — skip operator+operand and continue scanning
-        // (`bash 2>&1 < /tmp/evil.sh` re-opened the backdoor — the old code
-        // returned the first redirect's operand, which was `2>&1`'s neighbor).
-        const isFdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(n); // 2>&1 — no operand
-        if (n === "<" || n === "<<" || n === "0<" || n === "0<<") {
-          const operand = tokens[j + 1];
-          // Round-17 (final gate P1): `bash < file script.sh` executes
-          // script.sh (the stdin operand is NOT the script when an argument
-          // follows) — the script argument is the token AFTER the operand.
-          // Round-18: if `-c` follows the operand, it's an inline (gated by
-          // the normal classifier) — return null, not the operand.
-          const after = tokens[j + 2];
-          if (after === "-c" || after === "--command") return null;
-          const arg = after;
-          if (arg !== undefined && !arg.startsWith("-") &&
-              !(arg === ">" || arg === ">>" || arg === "<" || arg === "<<" || arg === "&>" || arg === ">&" || arg === "&>>" || /^(?:[0-9]+)?[<>]/.test(arg) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(arg))) {
-            return arg; // the script ARGUMENT
-          }
-          return operand && !operand.startsWith("-") ? operand : null; // the stdin file IS the script
-        }
-        if (isFdSingle) { j++; continue; }
-        j += 2; // output redirect + operand — skip, keep scanning
-        continue;
-      }
-      break;
+      lastPositional = n;
+      j++;
     }
-    if (sawInline) return null; // `-c 'inline'` — not a script file (gated by the normal classifier)
-    return j < tokens.length ? tokens[j] : null;
+    if (sawInline) return null; // `-c 'inline'` — gated by the normal classifier
+    if (sawProcessSub) return null; // `bash <(echo 'git …')` — FD, not a file (fail-closed via _unverifiableGitContent)
+    if (lastPositional !== null) return lastPositional; // the script ARGUMENT (last positional)
+    return stdinOperand && !stdinOperand.startsWith("-") ? stdinOperand : null; // the stdin file IS the script
   }
   if (t === ".") { // `. script`
     const next = tokens[i + 1];

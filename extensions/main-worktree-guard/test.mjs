@@ -822,6 +822,14 @@ try {
   m4t("T108: fd-INPUT redirect before -c inline → block (round-16)", `bash 2<&1 -c "git reset --hard"`, "block");
   m4t("T109: digit-less fd-dup before -c inline → block (round-17)", `bash <&0 -c "git reset --hard"`, "block");
   m4t("T110: stdin-redirect before -c inline → block (round-18)", `bash < /dev/null -c "git commit -m x"`, "block");
+  m4t("T111: process substitution with git → block (round-19)", `bash <(echo "git commit -m x")`, "block");
+  // T112 (flag-with-operand) is a BACKDOOR-path closure — the pure gate sees no
+  // invocation; the production block is extractScriptPath → scriptGitVerdict.
+  expectBool("T112: flag-with-operand then script → script path + content gated (round-19)", (() => {
+    const p = `${m4Tmp}/evil.sh`;
+    writeFileSync(p, `git reset --hard\n`);
+    return extractScriptPath(`bash --rcfile /tmp/decoy.sh ${p}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "block";
+  })(), true);
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree
@@ -934,6 +942,7 @@ try {
   expectBool("B37: fd-INPUT dup before the script path → the script path (round-16)", extractScriptPath(`bash 2<&1 /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash 2<&- /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`sh 0<&1 /tmp/evil.sh`) === "/tmp/evil.sh", true);
   expectBool("B38: digit-less fd-dup / stdin+arg / spawner-prefix → the script path (round-17)", extractScriptPath(`bash <&0 /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash <&- /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /dev/null /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`exec bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`env bash /tmp/evil.sh`) === "/tmp/evil.sh", true);
   expectBool("B39: spawner-flag → the interpreter's script path (round-18)", extractScriptPath(`env -i bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`sudo -u root bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`timeout 5 bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /dev/null -c "git commit"`) === null, true);
+  expectBool("B40: flag-with-operand + stdin-flag → the script path (round-19)", extractScriptPath(`bash < /dev/null -x /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash --rcfile /tmp/decoy.sh /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash -O extglob /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh", true);
   expectBool("B12b: end-to-end subshell script at wt cwd → allow", (() => {
     const p = mkS("mutation.sh", `git reset --hard\n`);
     const execCwd = commandExecutionCwd(`(cd "${wtR}" && bash ./mutation.sh)`, hubR);
