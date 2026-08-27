@@ -494,6 +494,13 @@ sides).
    classifies span verbs; only mutations/unknowns fail closed,)
    spawner-window `eval cd`/`command cd` (conservative), `env -C <wt>`-style
    spawner flags.
+   **#351 amendment (see `extensions/main-worktree-guard/README.md`
+   "Deliberate-obfuscation residual tier"):** quote-concat name-splitting is
+   CLOSED (round-11 assignment var-hop + tokenizer quote-stripping — probe-
+   verified); the open residual is parameter-expansion operations
+   (`${G:0:3}`, `${X//foo/git}`, …). The worktree-map build additionally
+   cross-checks against `git worktree list --porcelain` (rejects entries git's
+   own view doesn't list).
 5b. **`-c core.worktree=<path>` redirection**: empirically IGNORED by git 2.50.1
    (no redirection effect) — no hole today; optional hardening note to treat it
    like the workTree hint in the mismatch guard.

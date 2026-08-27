@@ -92,10 +92,13 @@ words); `unset NAME` deletes the persisted var; redirects never start a command
 exemption is semantic, never path-string-based; hub/foreign/unresolvable
 targets keep today's blocks (including `-C <wt> --git-dir=<hub>/.git …`,
 `--git-dir=<hub>/.git/worktrees/<x>` from the hub cwd, `GIT_DIR=<wt>/.git`
-from the hub cwd, and crafted reverse-pointer files — two-way back-reference
-validation; note: an agent that writes `.git/worktrees/` internals directly is
-a deliberate-bypass actor, same class as the documented `GIT_INDEX_FILE`
-limitation). The write/edit M4 block is target-aware (hub-equality): only
+from the hub cwd, and crafted reverse-pointer files — mitigated (for the
+accidental variants) by two-way back-reference validation plus, since #351, a
+`git worktree list --porcelain` cross-check (see the [deliberate-obfuscation
+residual tier](#deliberate-obfuscation-residual-tier-out-of-threat-model-351);
+a fully-consistent deliberate craft passes both — an agent that writes
+`.git/worktrees/` internals directly is a deliberate-bypass actor, same class
+as the documented `GIT_INDEX_FILE` limitation). The write/edit M4 block is target-aware (hub-equality): only
 HUB-targeted writes block while the hub is disordered (D3 preserved — the
 block still runs before the marker bypass); worktree/foreign/`/tmp` writes are
 isolated. `GIT_DIR`/`GIT_WORK_TREE` env PREFIXES are scoped to the next command
@@ -222,6 +225,98 @@ signal, and an agent may legitimately need a scratch file briefly. The
 warning surfaces the violation at write time so the agent moves the work to a
 worktree (`bash scripts/checkout-hygiene/hub-worktree.sh <branch>`) before it
 becomes the next M4 freeze.
+
+## Deliberate-obfuscation residual tier (out of threat model) (#351)
+
+**The threat-model boundary, stated once:** the guard defends against
+**ACCIDENTAL collision** between parallel agents — a session that runs an
+ordinary `git reset --hard`, `git checkout -b`, or `git -C <hub> …` in the
+shared main checkout, or an ungated write into it. It does **NOT** defend
+against **adversarial shell** — an actor deliberately obfuscating git
+invocations to evade classification. A deliberate-bypass actor is the same
+threat class as a human editing `.git/` internals by hand; **no tool gate can
+fully close it** (only policy + worktree isolation can). The residual tier is
+documented here (issue #351) so the boundary is explicit and future work does
+not rediscover it as a "hole". The guard rejects the ACCIDENTAL variants of
+every class below — the two-way reverse-pointer validation + porcelain
+cross-check close the map-poisoning variants (Residual 2), the walker's
+command-position `$VAR` resolution closes plain-`${VAR}` name-splitting
+(round-11), and the semantic core closes the accidental spelling family; the
+deliberate variants remain documented residual.
+
+### Residual 1 — Bash-expansion name-splitting (parameter expansions)
+
+A git command word synthesized from a parameter expansion in command
+position:
+
+```bash
+G=git; ${G:0:3} -C <hub> reset --hard            # ${G:0:3} → "git" — classified "non-git", runs
+X=foocmd; ${X//foo/git} -C <hub> reset --hard    # substitution → "git"
+```
+
+Probe-verified (2026-08, #351): both verdict `non-git` — the walker's
+command-position `$VAR` resolution (round-11) only handles plain `${VAR}` /
+`$VAR`, so no invocation is seen and the command executes. Closing this
+requires a **full bash expansion evaluator** (offset/length slices, `//` / `#`
+/ `%` substitutions with glob semantics, arithmetic, nesting, env-var
+dependence) — and every closure reveals a sibling, so the family is
+open-ended. **Decision: deferred** — see the hardening table below.
+
+> **Already-closed sibling (documented for accuracy):** quote-concat
+> name-splitting (`G='g'it`, `'g'it -C … reset --hard`) is NOT open — the
+> tokenizer strips quotes, so `'g'it` tokens as `git`, and the round-11
+> assignment var-hop (`G='g'it; $G …`) resolves to a git word. The
+> same-segment PREFIX spelling (`G='g'it $G …`) is also not a hole: bash
+> expands `$G` pre-assignment (VULN-001 semantics — unset G makes it a
+> no-op), and when G is pre-set in a prior segment, round-11 resolves it and
+> blocks (probe-verified, #351). Only parameter-expansion operations remain in
+> this class.
+
+### Residual 2 — direct `.git/worktrees/` internals writes (map poisoning)
+
+An agent writing the reverse-pointer files + a crafted back-referencing
+gitfile can poison the worktree map:
+
+```bash
+mkdir -p <hub>/.git/worktrees/evil && printf '<path>/.git\n' > <hub>/.git/worktrees/evil/gitdir
+printf 'gitdir: <hub>/.git/worktrees/evil\n' > <path>/.git
+```
+
+The **two-way back-reference validation** (VULN-003 closure) rejects the
+accidental variants — a crafted gitdir whose target has no back-referencing
+gitfile, a substring-matching gitfile, a stale admin dir. A **determined
+writer defeats it**: a fully-consistent pair passes two-way AND `git worktree
+list` (git derives its view from the same reverse-pointer files —
+probe-verified), and the fake admin dir still fails `git rev-parse` (it is not
+a complete git directory: no `commondir`/`HEAD`), so the poison is inert
+without a full admin-dir craft. #351 added the **porcelain cross-check**
+(hardening table below) as defense-in-depth: partial crafts whose
+reverse-pointer content git cannot resolve from its own frame (relative
+content, dangling gitfile) are now rejected at map build. Fully-consistent
+crafts remain documented residual — a deliberate-bypass actor.
+
+### Residual 3 — the open-ended grammar-spelling family
+
+Every closure (redirect / fd / spawner / flag / substitution spelling)
+reveals a sibling — #347's 24 code-review rounds closed spellings in waves
+(`2>&1` → `<&0` → `< /dev/null` → `bash <(...)`; `-C` → `--cd` → `-Cfoo` →
+`--git-dir=…`; `checkout -B` → `switch -C` → `-Bmain` →
+`--force-create=…` → `-bfoo`; …). The family is open-ended by construction: a
+grammar over shell spelling has infinitely many members. The guard's
+mitigation is the **semantic core** — per-invocation effective-target
+resolution, shared-ref re-classification, fail-closed defaults for
+unresolvable forms — not spelling enumeration.
+
+### Hardening decision (#351)
+
+| Item | Decision | Rationale |
+|---|---|---|
+| `git worktree list` porcelain cross-check (P2) | **IMPLEMENTED** | One `execSync` per map build — and the map builds per classified git invocation while the hub has linked worktrees (a few ms each; the plan's sessionCwd-keyed cache, follow-up #7, is the future mitigation — a TTL cache was rejected here because it would open a false-block window for a worktree added within the TTL). Parsed with `--porcelain -z` (git ≥ 2.36 — the `-z` option for `git worktree list` landed in 2.36.0; older git → skip + one-time warn). Conservative on disagreement (entry rejected → block). Degrades to skip (two-way validation only) when `git worktree list` cannot run — surfaced by a one-time warn. Probe-verified it cannot false-block legitimate worktrees (git's porcelain lists every entry the two-way check accepts; paths with trailing spaces or embedded newlines preserved by the NUL parse). New regression pins X1–X6/X5b/X6b in `test.mjs`. |
+| Bash-expansion evaluator for command-position `${…}` / `${var//…}` (P2) | **DEFERRED** | A full evaluator is a large lift; a bounded one for the documented spellings is either trivially bypassable (the family is open-ended — `${G:0:3}` → `${G::3}` → `${G#g}` → …) or risks false-positives on legitimate expansions (`${HOME}`, `${PWD}`, `${SHA:0:7}` must keep passing — probe-verified today). Cost/benefit vs. the accidental-collision threat model: an accidental actor never writes `${G:0:3}`; closing it adds walker complexity to a 24-round-reviewed, fully-pinned regression suite for an out-of-model adversary. Revisit if the threat model ever includes adversarial shell. |
+
+Cross-references: plan `docs/plans/2026-08-27-issue-347-m4-worktree-freeze.md`
+§5a (the residual tier), issue #351 (this decision), #347 / PR #348 (the
+review rounds that surfaced the family).
 
 ## Environment variables
 
