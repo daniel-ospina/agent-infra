@@ -1013,6 +1013,8 @@ try {
   expectWip("docs/plans absolute", "/repo/docs/plans/2026-08-27-x.md", "docs/plans");
   expectWip("docs/plans relative", "docs/plans/x.md", "docs/plans");
   expectWip("docs/plans dir entry (porcelain)", "docs/plans/", "docs/plans");
+  expectWip("docs/plans scratch-suffixed → docs/plans (segment precedence, second-model)", "/repo/docs/plans/foo.tmp", "docs/plans");
+  expectWip("migrations scratch-suffixed → migrations (segment precedence)", "/repo/migrations/0001.sql.bak", "migrations");
   expectWip("migrations deep segment", "/repo/db/migrations/0001.sql", "migrations");
   expectWip("migrations top-level dir", "migrations/001.sql", "migrations");
   expectWip("supabase migrations", "supabase/migrations/x.sql", "migrations");
@@ -1044,6 +1046,10 @@ try {
   expectWriteTargets("tee -a → scratch", `echo hi | tee -a foo.bak`, [{ resolvedPath: "/repo/foo.bak", via: "tee" }]);
   expectWriteTargets("python open w → migrations", `python3 -c "open('migrations/001.sql','w').write('x')"`, [{ resolvedPath: "/repo/migrations/001.sql", via: "python" }]);
   expectWriteTargets("python open escaped-double-quote (round-2 closure)", `python3 -c "open(\\"docs/plans/x.md\\",\\"w\\").write(1)"`, [{ resolvedPath: "/repo/docs/plans/x.md", via: "python" }]);
+  expectWriteTargets("python versioned interpreter (second-model closure)", `python3.11 -c "open('migrations/001.sql','w')"`, [{ resolvedPath: "/repo/migrations/001.sql", via: "python" }]);
+  expectWriteTargets("python venv-pathed interpreter (second-model closure)", `venv/bin/python -c "open('docs/plans/x.md','w')"`, [{ resolvedPath: "/repo/docs/plans/x.md", via: "python" }]);
+  expectWriteTargets("tee as ARGUMENT → no tee target (second-model closure)", `grep tee docs/plans/x.md`, []);
+  expectWriteTargets("echo tee arg → no tee target (second-model closure)", `echo tee migrations/001.sql`, []);
   expectWriteTargets("absolute hub path preserved", `cat > /repo/docs/plans/x.md`, [{ resolvedPath: "/repo/docs/plans/x.md", via: "redirect" }]);
   // Round-2 closures: quote-aware redirect scan + the >&/>|/1> operator family.
   expectWriteTargets("quoted > is NOT a redirect (read-only)", `grep ">" docs/plans/x.md`, []);

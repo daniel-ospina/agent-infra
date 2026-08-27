@@ -205,10 +205,13 @@ against the session cwd — `cd`-prefixed writes into the hub are false-negative
 cache resolution disables the three surfaces for up to 30s (then retries —
 never terminally); hub-equality assumes the session stays in one repo (M4's
 blocks use fresh per-call resolution and are unaffected); the python `open()`
-regex only fires when a python interpreter token is present and commands over
-64KB skip the scan; heredoc bodies are scanned literally, so a body line
-containing `> <wip-path>` can emit a spurious banner (P3 — warn-only, deduped
-per path; the real redirect target still warns); an intra-repo symlink alias
+regex only fires when a python interpreter token is present (bare, versioned
+like `python3.11`, or path-qualified like `venv/bin/python`; commands over
+64KB skip the scan) — prose that mixes an unquoted python token with a quoted
+`open(…,"w")` can still false-positive (warn-only, deduped); heredoc bodies
+are scanned literally, so a body line containing `> <wip-path>` can emit a
+spurious banner (P3 — warn-only, deduped per path; the real redirect target
+still warns); an intra-repo symlink alias
 (e.g. `docs-link → docs/plans`) can miss the pattern on the un-realpath'd
 spelling (warn-only false-negative — the perf constraint keeps the pure pattern
 filter first).

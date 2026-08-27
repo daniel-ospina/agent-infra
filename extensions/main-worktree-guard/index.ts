@@ -265,10 +265,10 @@ const warnedWipPaths = new Set<string>();    // inventory warnings: once per pat
 // surfaces for the whole session. The retry is bounded to once per 30s and
 // only fires on the rare null-cache path, so it never sits on the bash hot
 // path for healthy sessions.
-function _cachedMainTopLevel(force = false): string | null {
+function _cachedMainTopLevel(): string | null {
   const now = Date.now();
-  if (!force && typeof cachedMainTopLevel === "string") return cachedMainTopLevel;
-  if (!force && lastMainTopAttemptMs !== 0 && now - lastMainTopAttemptMs < MAIN_TOP_RETRY_MS) {
+  if (typeof cachedMainTopLevel === "string") return cachedMainTopLevel;
+  if (lastMainTopAttemptMs !== 0 && now - lastMainTopAttemptMs < MAIN_TOP_RETRY_MS) {
     return cachedMainTopLevel ?? null; // negative-TTL: skip retry within the window
   }
   lastMainTopAttemptMs = now;
@@ -389,17 +389,14 @@ function _wipFromPorcelain(porcelain: string): { path: string; pattern: string }
 // Classify untracked WIP in the session repo (two-phase, same bounded
 // expansion as _wipFromPorcelain). Returns null on git failure / worktree
 // session / classifier load failure (warn-only helper — degrades silently).
-function _hubWipInventory(): { untracked: string[]; wip: { path: string; pattern: string }[] } | null {
+function _hubWipInventory(): { wip: { path: string; pattern: string }[] } | null {
   try {
     if (!classifierLoaded) return null; // degraded: classifyUntrackedWip is inert — stay dormant
     if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktree sessions are isolated
     const porcelain = execSync("git status --porcelain=v1", {
       encoding: "utf-8", timeout: 5000,
     }).trim();
-    return {
-      untracked: classifyUntrackedWip(porcelain).untracked,
-      wip: _wipFromPorcelain(porcelain),
-    };
+    return { wip: _wipFromPorcelain(porcelain) };
   } catch {
     return null; // warn-only — degrade silently, never blocks
   }

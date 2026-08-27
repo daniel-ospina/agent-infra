@@ -2040,14 +2040,17 @@ const WIP_SCRATCH_SUFFIXES = [".tmp", ".bak", ".scratch"];
  */
 export function matchHubWipPattern(resolvedPath) {
   const p = String(resolvedPath ?? "").replace(/\\/g, "/");
-  const base = p.split("/").pop() ?? "";
-  if (base.endsWith("~")) return "scratch";
-  for (const s of WIP_SCRATCH_SUFFIXES) if (base.endsWith(s)) return "scratch";
+  // Segment patterns take precedence over the scratch suffix (a plan doc named
+  // `foo.tmp` inside docs/plans/ is a plan doc — the WHERE is the actionable
+  // signal; the scratch label is the fallback for unlocated scratch files).
   const segs = p.split("/").filter((s) => s.length > 0);
   for (let i = 0; i < segs.length; i++) {
     if (segs[i] === "migrations") return "migrations";
     if (segs[i] === "docs" && segs[i + 1] === "plans") return "docs/plans";
   }
+  const base = p.split("/").pop() ?? "";
+  if (base.endsWith("~")) return "scratch";
+  for (const s of WIP_SCRATCH_SUFFIXES) if (base.endsWith(s)) return "scratch";
   return null;
 }
 
@@ -2127,11 +2130,15 @@ export function extractBashWriteTargets(command, cwd = process.cwd()) {
     if (j > i) { i = j; continue; }
     i++;
   }
-  // tee: first non-flag positional (tokenized — no quotes issue for flags)
+  // tee: first non-flag positional — but ONLY when `tee` is the command in its
+  // pipeline segment (first token or after a boundary), not an ARGUMENT to
+  // another command (`grep tee x.md` searches a file for the word "tee").
   const tokens = _tokenize(command);
+  let prevBoundary = true;
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
-    if (t === "tee") {
+    if (_isShellBoundary(t)) { prevBoundary = true; continue; }
+    if (t === "tee" && prevBoundary) {
       for (let j = i + 1; j < tokens.length; j++) {
         const n = tokens[j];
         if (_isShellBoundary(n)) break;
@@ -2140,8 +2147,10 @@ export function extractBashWriteTargets(command, cwd = process.cwd()) {
         push(n, "tee");
         break;
       }
+      prevBoundary = false;
       continue;
     }
+    prevBoundary = false;
   }
   // python open() writes — regex over the raw command; tolerate backslash-
   // escaped quotes (`open(\"x\",\"w\")` inside a double-quoted shell string).
@@ -2150,8 +2159,10 @@ export function extractBashWriteTargets(command, cwd = process.cwd()) {
   // so quoted prose (`git commit -m "open('x.tmp','w')"`) does not false-
   // positive; (b) bound the backslash run to \\\\{0,4} and skip the scan for
   // commands over 64KB — no quadratic backtracking on adversarial input.
+  // Round-3 (second-model P2): the gate also matches versioned (`python3.11`)
+  // and path-qualified (`/usr/bin/python3`, `venv/bin/python`) interpreters.
   const pyRe = /open\s*\(\s*\\{0,4}["']([^"']+?)\\{0,4}["']\s*,\s*\\{0,4}["'][wa][^"']*["']/g;
-  const hasPython = /(?:^|[\s;|&(])python(?:2|3)?(?:[\s;|&)]|$)/.test(String(command));
+  const hasPython = /(?:^|[\/\s;|&(])python(?:2|3)?(?:\.[0-9]+)*(?:[\s;|&)]|$)/.test(String(command));
   if (hasPython && s.length <= 64 * 1024) {
     let m;
     while ((m = pyRe.exec(String(command))) !== null) push(m[1], "python");
