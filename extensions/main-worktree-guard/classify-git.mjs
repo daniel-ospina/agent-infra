@@ -2099,6 +2099,185 @@ export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
   }
 }
 
+// ── #350: hub-WIP hygiene — write-gate WARNING + hub-hygiene check ──────────
+// The #347 amplifier: agents write WIP (plan docs to docs/plans/, migrations,
+// scratch files) directly in the hub main checkout instead of an isolated
+// worktree. These helpers are PURE classification (no git, no fs) — index.ts
+// decides hub-ness (is the path inside the hub main checkout?) and when to
+// WARN (never block). /tmp scratch-ish targets are FINE — the caller's
+// hub-equality gate excludes them before any warning.
+
+const WIP_SCRATCH_SUFFIXES = [".tmp", ".bak", ".scratch"];
+
+/**
+ * Classify a path against the hub-WIP patterns (#350):
+ *   "docs/plans" — a `docs` segment immediately followed by a `plans` segment
+ *   "migrations" — any path segment named exactly `migrations`
+ *   "scratch"    — basename ends with .tmp / .bak / .scratch / `~` (vim backup)
+ * Returns null when no pattern matches. PATTERN-ONLY: hub-ness is the caller's
+ * job — `/tmp/foo.tmp` classifies "scratch" here but must NOT warn (index.ts
+ * gates on hub-equality first). Segment-aware (never prefix-string):
+ * `/repo/docs/plans-extra/x.md` and `/repo/notdocs/plans/x.md` do not
+ * false-match docs/plans.
+ * @param {string} resolvedPath
+ * @returns {"docs/plans"|"migrations"|"scratch"|null}
+ */
+export function matchHubWipPattern(resolvedPath) {
+  const p = String(resolvedPath ?? "").replace(/\\/g, "/");
+  // Segment patterns take precedence over the scratch suffix (a plan doc named
+  // `foo.tmp` inside docs/plans/ is a plan doc — the WHERE is the actionable
+  // signal; the scratch label is the fallback for unlocated scratch files).
+  const segs = p.split("/").filter((s) => s.length > 0);
+  for (let i = 0; i < segs.length; i++) {
+    if (segs[i] === "migrations") return "migrations";
+    if (segs[i] === "docs" && segs[i + 1] === "plans") return "docs/plans";
+  }
+  const base = p.split("/").pop() ?? "";
+  if (base.endsWith("~")) return "scratch";
+  for (const s of WIP_SCRATCH_SUFFIXES) if (base.endsWith(s)) return "scratch";
+  return null;
+}
+
+/**
+ * Extract NON-GIT write targets from a bash command (#350 Indicators: heredoc /
+ * tee / python open() writes bypass the write/edit tool gate). Heuristic and
+ * NEVER blocking — the caller warns only:
+ *   - redirect operators OUTSIDE quotes (`>`, `>>`, `>&`, `>|`, `&>`, `&>>`,
+ *     `0>`/`1>`) → the target (stderr `2>` and fd-dup/close `2>&1`/`>&-` are
+ *     NOT content writes; `/dev/null` skipped; quoted `>` in read-only commands
+ *     like `grep ">" x.md` is NOT a redirect — quote-aware scan)
+ *   - `tee <path>` → the tee target (first non-flag positional)
+ *   - python `open("<path>", "w"|"a"…)` → the path (incl. backslash-escaped
+ *     quotes: `python3 -c "open(\"x.md\",\"w\")"`)
+ * Targets resolve against `cwd` (the session cwd — a heuristic: cd-prefixed
+ * writes are false-negatives, acceptable for a warning-only heuristic; a
+ * warning is cheap, a missed one is not an incident).
+ * @param {string} command
+ * @param {string} [cwd]
+ * @returns {{ resolvedPath: string, via: "redirect"|"tee"|"python" }[]}
+ */
+export function extractBashWriteTargets(command, cwd = process.cwd()) {
+  const out = [];
+  const seen = new Set();
+  const push = (raw, via) => {
+    const t = _stripQuotes(String(raw ?? "").trim());
+    if (!t || t === "/dev/null" || t.startsWith("/dev/")) return;
+    const resolved = resolve(cwd, t);
+    if (seen.has(resolved)) return;
+    seen.add(resolved);
+    out.push({ resolvedPath: resolved, via });
+  };
+  // Quote-aware redirect scan over the RAW command (the shared _tokenize
+  // strips quotes, so a quoted `>` in a read-only command would tokenize as a
+  // bare `>` and false-positive as a redirect — round-1 closure). fd-dup/close
+  // forms (`2>&1`, `1>&2`, `>&-`) have a digit/dash operand → skipped.
+  const s = String(command);
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "'") { const close = s.indexOf("'", i + 1); i = close === -1 ? s.length : close + 1; continue; }
+    if (ch === '"') { const close = s.indexOf('"', i + 1); i = close === -1 ? s.length : close + 1; continue; }
+    let fd = "";
+    let j = i;
+    while (j < s.length && /[0-9]/.test(s[j])) { fd += s[j]; j++; }
+    if (j < s.length && s[j] === ">") {
+      let k = j + 1;
+      let op = ">";
+      if (k < s.length && (s[k] === ">" || s[k] === "|" || s[k] === "&")) { op += s[k]; k++; }
+      let p = k;
+      while (p < s.length && /\s/.test(s[p])) p++;
+      let operand = "";
+      while (p < s.length && !/\s/.test(s[p])) {
+        const c = s[p];
+        if (c === "'" || c === '"') {
+          const q = c;
+          p++;
+          while (p < s.length && s[p] !== q) operand += s[p++];
+          if (p < s.length) p++;
+          continue;
+        }
+        if (";&|()".includes(c)) break;
+        operand += c;
+        p++;
+      }
+      // `>& <fd>` / `>&-` are fd-dup/close, not file writes; stderr `2>` is
+      // not content. Content fds: bare/0/1.
+      const isDup = op.includes("&") && /^-?[0-9]*$/.test(operand);
+      const isContentFd = fd === "" || fd === "0" || fd === "1";
+      if (!isDup && isContentFd) push(operand, "redirect");
+      i = p > k ? p : k;
+      continue;
+    }
+    // A digit run not followed by `>` can never start a redirect — skip the
+    // whole run in one step (round-2 perf closure: O(L) not O(L²) on long
+    // numeric payloads like `echo 1111… > foo`).
+    if (j > i) { i = j; continue; }
+    i++;
+  }
+  // tee: first non-flag positional — but ONLY when `tee` is the command in its
+  // pipeline segment (first token or after a boundary), not an ARGUMENT to
+  // another command (`grep tee x.md` searches a file for the word "tee").
+  const tokens = _tokenize(command);
+  let prevBoundary = true;
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (_isShellBoundary(t)) { prevBoundary = true; continue; }
+    if (t === "tee" && prevBoundary) {
+      for (let j = i + 1; j < tokens.length; j++) {
+        const n = tokens[j];
+        if (_isShellBoundary(n)) break;
+        if (n === "-a") continue;
+        if (n.startsWith("-")) continue;
+        push(n, "tee");
+        break;
+      }
+      prevBoundary = false;
+      continue;
+    }
+    prevBoundary = false;
+  }
+  // python open() writes — regex over the raw command; tolerate backslash-
+  // escaped quotes (`open(\"x\",\"w\")` inside a double-quoted shell string).
+  // Lazy path capture so the closing escaped-quote backslash is not eaten.
+  // Round-2 hardening: (a) require a python interpreter token in the command
+  // so quoted prose (`git commit -m "open('x.tmp','w')"`) does not false-
+  // positive; (b) bound the backslash run to \\\\{0,4} and skip the scan for
+  // commands over 64KB — no quadratic backtracking on adversarial input.
+  // Round-3 (second-model P2): the gate also matches versioned (`python3.11`)
+  // and path-qualified (`/usr/bin/python3`, `venv/bin/python`) interpreters.
+  const pyRe = /open\s*\(\s*\\{0,4}["']([^"']+?)\\{0,4}["']\s*,\s*\\{0,4}["'][wa][^"']*["']/g;
+  const hasPython = /(?:^|[\/\s;|&(])python(?:2|3)?(?:\.[0-9]+)*(?:[\s;|&)]|$)/.test(String(command));
+  if (hasPython && s.length <= 64 * 1024) {
+    let m;
+    while ((m = pyRe.exec(String(command))) !== null) push(m[1], "python");
+  }
+  return out;
+}
+
+/**
+ * Parse `git status --porcelain` (v1) output for UNTRACKED WIP (#350).
+ * Untracked lines start with `?? `; porcelain v1 collapses untracked
+ * DIRECTORIES to a single `?? dir/` entry (pass --untracked-files=all for
+ * per-file entries). Classifies each entry with matchHubWipPattern — the #347
+ * amplifier inventory for the session-start / periodic hub-hygiene check.
+ * @param {string} porcelain
+ * @returns {{ untracked: string[], wip: { path: string, pattern: string }[] }}
+ */
+export function classifyUntrackedWip(porcelain) {
+  const untracked = [];
+  const wip = [];
+  for (const line of String(porcelain ?? "").split("\n")) {
+    if (!line.startsWith("?? ")) continue;
+    let p = line.slice(3).trim();
+    if (!p) continue;
+    p = p.replace(/^"(.*)"$/, "$1"); // quoted-spelling paths (spaces)
+    untracked.push(p);
+    const pat = matchHubWipPattern(p);
+    if (pat) wip.push({ path: p, pattern: pat });
+  }
+  return { untracked, wip };
+}
+
 /**
  * Hub disorder of a repo checkout: "off_main" | "dirty" | "both" | null.
  * The hub's only legal state is main/master + empty porcelain — untracked
