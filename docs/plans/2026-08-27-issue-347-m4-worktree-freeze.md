@@ -479,11 +479,20 @@ sides).
 5. **Non-git writes into main** (heredoc/tee/python open) remain a separate
    hygiene issue — follow-up issue to be filed (write-gate warning for
    docs/plans/ in the hub).
-5a. **GIT_INDEX_FILE / other index-redirect env vars are not modeled** —
-   `GIT_INDEX_FILE=<hub>/.git/index git -C <wt> commit` passes the predicate
-   while staging the hub's index onto the wt branch (T20 class via an unparsed
-   env var). Deliberate bypass class (adversarial); follow-up if M4's threat
-   model includes adversarial agents.
+5a. **GIT_INDEX_FILE / GIT_OBJECT_DIRECTORY / GIT_ALTERNATE_OBJECT_DIRECTORIES**
+   redirecting OUTSIDE the worktree are BLOCKED (round-3: indexFileHint /
+   objDirsHint captured by the walker; resolveInvocationTarget conservatively
+   rejects them when they resolve outside the worktree — T52; resolve-fallback
+   for not-yet-existing paths). The remaining unmodeled class is deliberate
+   bypass: an agent that writes `.git/worktrees/` internals directly (crafted
+   reverse-pointer + back-referencing gitfile) or uses bash-expansion
+   obfuscation (`${G:0:3}`, `${X//foo/git}` quote-concat name-splitting) is a
+   deliberate-bypass actor — the guard's threat model is accidental collision,
+   not adversarial shell. Documented residual conservative false-blocks:
+   read-only git in a substitution (`git commit -m "$(git rev-parse HEAD)"`),
+   heredoc-to-shell with a git word (`cat <<'EOF' | bash` + git status),
+   spawner-window `eval cd`/`command cd` (conservative), `env -C <wt>`-style
+   spawner flags.
 5b. **`-c core.worktree=<path>` redirection**: empirically IGNORED by git 2.50.1
    (no redirection effect) — no hole today; optional hardening note to treat it
    like the workTree hint in the mismatch guard.

@@ -484,7 +484,12 @@ function _walkShell(command, h = {}, seedVars = {}) {
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
-    if (t === "cd" && prevWasBoundary) {
+    if (t === "cd" && prevWasBoundary && !spawnerPending) {
+      // Round-15 (final gate P1): while a spawner's args are pending, `cd` is
+      // NOT the shell builtin — only eval/command propagate cd to the current
+      // shell; env/sudo/nice/time run it in a subprocess, so the parent cwd
+      // stays the hub (`env -i cd <wt>; git commit` ran git in the hub —
+      // probe; the round-14 spawner window had made it wt-exempt → allowed).
       const next = tokens[i + 1];
       const hasTarget = next !== undefined && !_isShellBoundary(next);
       const target = hasTarget ? next : null; // bare cd / cd <boundary> → null marker (T45a)
@@ -2006,11 +2011,19 @@ export function extractScriptPath(command) {
         continue;
       }
       if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n) || /^[0-9]+>&[0-9]*-?$/.test(n)) {
-        // The redirect's OPERAND is the script file for stdin-redirect
-        // (`bash < /tmp/evil.sh` — the old code returned "<" and reopened the
-        // backdoor, second-model P1).
-        const operand = tokens[j + 1];
-        return operand && !operand.startsWith("-") ? operand : null;
+        // Round-15 (final gate P1): only a STDIN redirect (`<`, `<<`, `0<`)
+        // has a script-file operand. `>`/`>>`/`&>`/`>&`/fd-`>` operands are
+        // OUTPUT files — skip operator+operand and continue scanning
+        // (`bash 2>&1 < /tmp/evil.sh` re-opened the backdoor — the old code
+        // returned the first redirect's operand, which was `2>&1`'s neighbor).
+        const isFdSingle = /^[0-9]+>&[0-9]*-?$/.test(n); // 2>&1 — no operand
+        if (n === "<" || n === "<<" || n === "0<" || n === "0<<") {
+          const operand = tokens[j + 1];
+          return operand && !operand.startsWith("-") ? operand : null; // the stdin file IS the script
+        }
+        if (isFdSingle) { j++; continue; }
+        j += 2; // output redirect + operand — skip, keep scanning
+        continue;
       }
       break;
     }
