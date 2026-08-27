@@ -788,6 +788,8 @@ try {
   m4t("T79: prose git + \$(date) → allowed (substitution-span scoped)", `cd "${wtR}" && git commit -m "use git \$(date)"`, "allowed");
   m4t("T80: multi-span — git in the 2nd substitution → block (matchAll)", `echo "\$(date) \$(git -C "${hubR}" reset --hard)"`, "block");
   m4t("T81: \$VAR in substitution ARG position → allowed (no false-block)", `cd "${wtR}" && git commit -m "\$(cat \$MSG_FILE)"`, "allowed");
+  m4t("T82: spawner-builtin var-hop (env) → block (round-9)", `G=git; echo "\$(env \$G -C "${hubR}" reset --hard)"`, "block");
+  m4t("T83: spawner-builtin var-hop mid-span (xargs) → block (round-9)", `G=git; echo "\$(echo x | xargs \$G -C "${hubR}" reset --hard)"`, "block");
 
   // ── Round-3: main-protection (worktree on the hub's protected branch) ──
   // The hub fixture is on main+clean; the freeze requires OFF-main so a worktree

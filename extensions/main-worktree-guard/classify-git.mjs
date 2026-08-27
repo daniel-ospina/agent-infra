@@ -1467,7 +1467,13 @@ function _unverifiableGitContent(command) {
     for (const m of spans) {
       const inner = (m[1] ?? m[2] ?? "").trim();
       if (/\bgit\b/.test(inner)) return true;
-      if (/^(\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)/.test(inner)) return true;
+      // Var in COMMAND position — directly (`$($G reset)`) OR via a spawner
+      // builtin (`$(env $G reset)`, `$(sudo $G)`, `$(command $G)`, `$(xargs $G)`
+      // — the var in ARGUMENT position of a spawner IS the spawned command;
+      // round-8's start-anchor missed it, final gate P1). `$(cat $FILE)` passes
+      // (cat is not a spawner — T81).
+      if (/^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/.test(inner)) return true;
+      if (/(?:^|[\s|;])(?:env|sudo|command|xargs|exec|nohup|nice|time|eval|sh|bash|zsh|dash|ksh)\s+\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/.test(inner)) return true;
     }
   }
   // eval / alias / function indirection: token-scoped — only the construct's
