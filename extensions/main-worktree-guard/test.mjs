@@ -832,6 +832,7 @@ try {
   m4t("T118: attached -Bmain → block (round-21)", `cd "${wtR}" && git checkout -Bmain`, "block");
   m4t("T119: long-option equals force-create → block (round-22)", `cd "${wtR}" && git switch --force-create=main main~2`, "block");
   m4t("T120: HUB-path attached/equals force-create → block (round-23)", `cd "${hubR}" && git switch -Cmain master`, "block");
+  m4t("T121: HUB-path attached lowercase create → block (round-24)", `cd "${hubR}" && git checkout -bfoo main`, "block");
   // T112 (flag-with-operand) is a BACKDOOR-path closure — the pure gate sees no
   // invocation; the production block is extractScriptPath → scriptGitVerdict.
   expectBool("T112: flag-with-operand then script → script path + content gated (round-19)", (() => {

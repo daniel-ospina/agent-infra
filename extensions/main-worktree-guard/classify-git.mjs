@@ -1388,7 +1388,7 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
       // refs/heads/main — probe). Block on the spelling family — same as the
       // worktree gate (shared-ref move ≡ branch -f).
       if (["-b", "-B", "-c", "-C", "-f", "--force", "--create", "--force-create", "--orphan", "--detach"].some(flag) ||
-          a.some((x) => x.startsWith("--force-create=") || /^-[BC][^-]/.test(x))) return "block";
+          a.some((x) => x.startsWith("--force-create=") || /^-[bBcC][^-]/.test(x))) return "block";
       if (pos.length !== 1 || pos[0] === "." || pos[0] === "-") return "block";
       return pos[0] === "main" || pos[0] === "master" ? "recovery" : "block";
     case "fetch":
