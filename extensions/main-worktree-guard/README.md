@@ -61,18 +61,28 @@ and the hub is off-main/dirty. Worktree sessions are exempt (they are isolated
 by construction); agent-infra is exempt (#99 — in-main feature work is its
 norm; its hub-discipline check is downgraded to a dirty-warn). **Worktree-
 TARGETED git ops are exempt per-invocation:** M4 resolves each git invocation's
-EFFECTIVE target (cd-chains, `-C`, `GIT_DIR`/`--git-dir`, subshell/pipe
-scoping, `git worktree list` membership + cwd containment, realpath-normalized)
-and exempts invocations targeting an isolated worktree — a hub-rooted session
-that `cd`s into a worktree is no longer frozen by hub disorder (2026-08-27
-tortoise incident class). No total-bash-gate bypass: the exemption is semantic,
-never path-string-based; hub/foreign/unresolvable targets keep today's blocks
-(including `git -C <wt> --git-dir=<hub>/.git …`, `--git-dir=<hub>/.git/worktrees/<x>`
-from the hub cwd, and `GIT_DIR=<wt>/.git` from the hub cwd). The write/edit M4
-block is target-aware (hub-equality): only HUB-targeted writes block while the
-hub is disordered (D3 preserved — the block still runs before the marker
-bypass); worktree/foreign/`/tmp` writes are isolated. `GIT_DIR`/`GIT_WORK_TREE`
-env prefixes are scoped to the next command only (bash semantics).
+EFFECTIVE target (cd-chains, `-C`, `GIT_DIR`/`--git-dir`, subshell/pipe/`&`
+scoping, `git worktree list` membership derived from the worktrees' reverse-
+pointer admin dirs — porcelain has no gitdir column — + cwd containment,
+realpath-normalized) and exempts worktree-targeted invocations — a hub-rooted
+session that `cd`s into a worktree is no longer frozen by hub disorder
+(2026-08-27 tortoise incident class). **Shared-ref verbs are NOT exempt:**
+worktrees share the hub's ref namespace — `push`/`update-ref`/`symbolic-ref`/
+`tag`/`branch -D`/`remote`/object-store ops from a worktree target are
+re-classified against the worktree's OWN checked-out branch (`git push origin
+<the wt's branch>` is the carve-out); `push -f`/foreign/delete still block.
+No total-bash-gate bypass: the exemption is semantic, never path-string-based;
+hub/foreign/unresolvable targets keep today's blocks (including `-C <wt>
+--git-dir=<hub>/.git …`, `--git-dir=<hub>/.git/worktrees/<x>` from the hub
+cwd, `GIT_DIR=<wt>/.git` from the hub cwd, and crafted reverse-pointer files —
+two-way back-reference validation). The write/edit M4 block is target-aware
+(hub-equality): only HUB-targeted writes block while the hub is disordered (D3
+preserved — the block still runs before the marker bypass); worktree/foreign/
+`/tmp` writes are isolated. `GIT_DIR`/`GIT_WORK_TREE` env PREFIXES are scoped
+to the next command only; `export GIT_DIR=`/`export GIT_WORK_TREE=` persist for
+the whole command (bash env state). `VAR=x cd "$VAR"` same-segment expansion
+is bash-faithful (pre-assignment — unresolvable → conservative block).
+Worktree exemptions are audited (`event: "m4_worktree_exemption"`).
 
 **The script backdoor is CLOSED.** The old escape — `write /tmp/x.sh` + `bash
 /tmp/x.sh` — executed arbitrary git unblocked. Now a shell-script execution

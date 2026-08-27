@@ -79,16 +79,11 @@ let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) =
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
 let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean; skipInfra?: boolean; env?: Record<string, string | undefined> }) => { disorder: string | null; branch: string | null } = () => ({ disorder: null, branch: null });
-let evaluateHubGate: (command: string, currentBranch: string | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string } = () => ({ verdict: "non-git" });
-// #347: per-invocation target-aware M4 gate + execution-cwd resolution + write
-// target toplevel. Fail-safe defaults degrade to inactive (gate → non-git /
-// null) so a failed import NEVER false-blocks; on classify-git load failure
-// readHubDisorder also degrades to null → M4 off (existing contract).
-let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string } = () => ({ verdict: "non-git" });
+let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 let extractScriptPath: (command: string) => string | null = () => null;
-let scriptGitVerdict: (path: string, currentBranch: string | null) => "allow" | "block" = () => "allow";
+let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string) => "allow" | "block" = () => "allow";
 let classifierLoaded = false;
 let ALLOW_MAIN_EDITS_MARKER_TTL_MS = 15 * 60 * 1000;
 // Escape-marker (#207) rules live in classify-git.mjs so test.mjs exercises the
@@ -107,7 +102,7 @@ try {
      getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS,
      isAllowMarkerActive, isAllowMarkerPath, isAllowMarkerCommand,
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
-     readAllowMarkerState, readHubDisorder, evaluateHubGate,
+     readAllowMarkerState, readHubDisorder,
      extractScriptPath, scriptGitVerdict, evaluateHubGateWithTargets,
      commandExecutionCwd, resolveTargetTopLevel } =
     await import("./classify-git.mjs"));
@@ -450,6 +445,19 @@ export default function (pi: ExtensionAPI) {
           // target is an isolated worktree are exempt from hub disorder; every
           // other invocation (hub, foreign, unresolvable) keeps today's block.
           const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()));
+          if (gate.exempted) {
+            // #347 code-review: audit worktree exemptions — a deliberate gate
+            // relaxation must be observable (the 2026-08-18 incident was a
+            // silent gate failure).
+            try {
+              appendJsonl({
+                event: "m4_worktree_exemption",
+                extension: "main-worktree-guard",
+                command: command.slice(0, 300),
+                session_id: _currentSessionId(_ctx),
+              });
+            } catch { /* audit is best-effort — never blocks */ }
+          }
           if (gate.verdict === "block") {
             return { block: true, reason: gate.reason ?? "" };
           }
