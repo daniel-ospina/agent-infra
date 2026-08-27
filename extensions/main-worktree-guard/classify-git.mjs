@@ -2121,6 +2121,10 @@ export function extractBashWriteTargets(command, cwd = process.cwd()) {
       i = p > k ? p : k;
       continue;
     }
+    // A digit run not followed by `>` can never start a redirect — skip the
+    // whole run in one step (round-2 perf closure: O(L) not O(L²) on long
+    // numeric payloads like `echo 1111… > foo`).
+    if (j > i) { i = j; continue; }
     i++;
   }
   // tee: first non-flag positional (tokenized — no quotes issue for flags)
@@ -2142,9 +2146,16 @@ export function extractBashWriteTargets(command, cwd = process.cwd()) {
   // python open() writes — regex over the raw command; tolerate backslash-
   // escaped quotes (`open(\"x\",\"w\")` inside a double-quoted shell string).
   // Lazy path capture so the closing escaped-quote backslash is not eaten.
-  const pyRe = /open\s*\(\s*\\*["']([^"']+?)\\*["']\s*,\s*\\*["'][wa][^"']*["']/g;
-  let m;
-  while ((m = pyRe.exec(String(command))) !== null) push(m[1], "python");
+  // Round-2 hardening: (a) require a python interpreter token in the command
+  // so quoted prose (`git commit -m "open('x.tmp','w')"`) does not false-
+  // positive; (b) bound the backslash run to \\\\{0,4} and skip the scan for
+  // commands over 64KB — no quadratic backtracking on adversarial input.
+  const pyRe = /open\s*\(\s*\\{0,4}["']([^"']+?)\\{0,4}["']\s*,\s*\\{0,4}["'][wa][^"']*["']/g;
+  const hasPython = /(?:^|[\s;|&(])python(?:2|3)?(?:[\s;|&)]|$)/.test(String(command));
+  if (hasPython && s.length <= 64 * 1024) {
+    let m;
+    while ((m = pyRe.exec(String(command))) !== null) push(m[1], "python");
+  }
   return out;
 }
 

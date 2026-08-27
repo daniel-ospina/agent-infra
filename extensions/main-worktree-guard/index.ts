@@ -260,12 +260,14 @@ const warnedWipPaths = new Set<string>();    // inventory warnings: once per pat
 // worktree — empirically stable on git 2.50.1, though not formally guaranteed
 // by git docs). Works from a hub session AND a worktree session. One git call
 // at first use (warmed at session_start); a FAILED resolution is NOT cached
-// terminally — it is retried after MAIN_TOP_RETRY_MS so a transient failure
-// cannot disable the surfaces for the whole session. Never on the bash hot
-// path: retries are bounded by the negative TTL.
+// terminally — the negative-TTL gate (MAIN_TOP_RETRY_MS) re-attempts on the
+// next tool call after 30s, so a transient failure cannot disable the
+// surfaces for the whole session. The retry is bounded to once per 30s and
+// only fires on the rare null-cache path, so it never sits on the bash hot
+// path for healthy sessions.
 function _cachedMainTopLevel(force = false): string | null {
   const now = Date.now();
-  if (!force && cachedMainTopLevel !== undefined) return cachedMainTopLevel;
+  if (!force && typeof cachedMainTopLevel === "string") return cachedMainTopLevel;
   if (!force && lastMainTopAttemptMs !== 0 && now - lastMainTopAttemptMs < MAIN_TOP_RETRY_MS) {
     return cachedMainTopLevel ?? null; // negative-TTL: skip retry within the window
   }
@@ -280,7 +282,7 @@ function _cachedMainTopLevel(force = false): string | null {
   } catch {
     cachedMainTopLevel = null;
   }
-  return cachedMainTopLevel;
+  return cachedMainTopLevel ?? null;
 }
 
 // Realpath the nearest EXISTING ancestor of a (possibly not-yet-created)
@@ -309,7 +311,7 @@ function _truncatePath(p: string, max = 52): string {
 }
 
 // Shared box-drawn banner (matches the existing hub-discipline style; every
-// content line stays within the 62-char interior — round-1 closure).
+// content line is kept within the 62-char interior so the box stays square).
 function _warnHubWip(pattern: string, targetPath: string, via?: string) {
   const label = WIP_PATTERN_LABEL[pattern] ?? pattern;
   const viaNote = via ? ` (via bash ${via})` : "";
@@ -341,7 +343,7 @@ function _warnHubWipInventory(wip: { path: string; pattern: string }[]) {
     "╔══════════════════════════════════════════════════════════════════╗",
     L("⚠️  UNTRACKED WIP IN MAIN — #347 AMPLIFIER (#350)"),
     "╠══════════════════════════════════════════════════════════════════╣",
-    L("Untracked WIP files in the shared main checkout — move them to a"),
+    L("Untracked WIP in the shared main checkout — move it to a"),
     L("worktree (hub hygiene):"),
     ...wip.slice(0, 8).map((w) => L(`  • ${_truncatePath(w.path, 44)} (${w.pattern})`)),
     ...(wip.length > 8 ? [L(`  … and ${wip.length - 8} more`)] : []),
@@ -454,10 +456,10 @@ function _maybeWarnBashWrite(command: string) {
     const mainTop = _cachedMainTopLevel();
     if (!mainTop) return;
     for (const t of targets) {
+      const pattern = matchHubWipPattern(t.resolvedPath); // pure pre-filter FIRST — no fs on the hot path
+      if (!pattern) continue;
       const resolvedReal = _realpathNearest(t.resolvedPath);
       if (resolvedReal !== mainTop && !resolvedReal.startsWith(mainTop + "/")) continue;
-      const pattern = matchHubWipPattern(t.resolvedPath);
-      if (!pattern) continue;
       const dedupeKey = `bash:${pattern}:${resolvedReal}`;
       if (warnedWipTargets.has(dedupeKey)) continue;
       warnedWipTargets.add(dedupeKey);
