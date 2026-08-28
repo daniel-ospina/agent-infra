@@ -192,6 +192,11 @@ Repo-specific config:
 - `eslint.config.*` or `.eslintrc.*` (for lint)
 
 Jobs that can't run (e.g., no `tsconfig.json`) skip gracefully with `⚠️` warnings — they don't fail the build.
+The **one deliberate exception** is the `skill-lint` job (#254, Task 11): since the frontmatter
+validator is a required gate, a MISSING `scripts/check-skill-lint.mjs` now fails the job
+(`❌ missing required gate, FAILING`) instead of skipping. This is a stated breaking change for
+consumer repos that sync the new template without the script — propagation to consumer repos
+(eldato, tortoise, worktrees) is tracked by issue #359 (soft dependency, can ship separately).
 
 #### `docs-ci.yml` — Markdown/Documentation Repos
 

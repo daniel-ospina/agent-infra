@@ -89,7 +89,7 @@ load_gate_midrun_check() {
 
 usage() {
   cat <<'EOF'
-Usage: scripts/cron-quality-gates.sh <arch|mutation>
+Usage: scripts/cron-quality-gates.sh <arch|mutation|oracle>
 
   arch      Verify every `scripts/<name>` reference in skills/**/SKILL.md
             resolves to an existing file in scripts/. Fails on missing
@@ -97,7 +97,16 @@ Usage: scripts/cron-quality-gates.sh <arch|mutation>
             script references without failing.
   mutation  Run every extensions/*/test.mjs; fail on non-running or vacuous
             (assertion-free) tests.
+  oracle    Run the #254 dev-machine oracle: the frontmatter validator's
+            drift lock against pi's real bundle (fixture parity + live-corpus
+            parity + extraction parity + deterministic fuzz + version pin).
+            pi must be installed (dev machine / cron only). Writes a
+            last-oracle-run timestamp consumed by the arch/mutation staleness
+            warnings (Task 10 f).
   -h|--help Print this help.
+
+Exit: 0 clean, 1 violations/drift, 2 usage/environment error, 3 deferred —
+      re-invoke (load gate; LOAD_GATE_FORCE=1 bypasses).
 
 Exit: 0 clean, 1 violations, 2 usage error, 3 deferred — re-invoke (load gate;
       LOAD_GATE_FORCE=1 bypasses).
@@ -250,10 +259,55 @@ mutation_gate() {
   exit 0
 }
 
+# ── oracle — #254 frontmatter-validator drift lock ──────────────────────────
+LAST_ORACLE_RUN="$ROOT/.last-oracle-run"
+ORACLE_STALE_DAYS="${ORACLE_STALE_DAYS:-7}"
+
+oracle_staleness_warning() {
+  # Task 10 (f): arch/mutation warn (never fail) when the oracle hasn't run
+  # recently — a drifting validator is exactly what the oracle exists to catch.
+  if [ -f "$LAST_ORACLE_RUN" ]; then
+    local last_run stale_days
+    last_run="$(cat "$LAST_ORACLE_RUN")"
+    stale_days=$(( ($(date +%s) - last_run) / 86400 ))
+    if [ "$stale_days" -ge "$ORACLE_STALE_DAYS" ]; then
+      echo "⚠️  oracle drift-lock last ran ${stale_days}d ago (>=$ORACLE_STALE_DAYS) — run: scripts/cron-quality-gates.sh oracle"
+    fi
+  else
+    echo "⚠️  oracle drift-lock has never run — run: scripts/cron-quality-gates.sh oracle"
+  fi
+}
+
+oracle_gate() {
+  echo "=== cron-quality-gates oracle ==="
+  echo "Running scripts/check-skill-lint.oracle.test.mjs (pi bundle parity)…"
+
+  if ! command -v node >/dev/null 2>&1; then
+    echo "❌ node not found — oracle requires node" >&2
+    exit 2
+  fi
+
+  node scripts/check-skill-lint.oracle.test.mjs
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    date +%s > "$LAST_ORACLE_RUN"
+    echo "✅ oracle clean — timestamp written to $LAST_ORACLE_RUN"
+    exit 0
+  fi
+  # 1 = drift (incl. pi version mismatch), 2 = pi not found / environment
+  if [ "$rc" -eq 2 ]; then
+    echo "❌ oracle environment failure (pi not found?) — re-probe deliberately" >&2
+    exit 2
+  fi
+  echo "❌ oracle drift detected — linter verdicts diverged from pi's loader; re-probe + fix, never soft-skip" >&2
+  exit 1
+}
+
 # ── dispatch ────────────────────────────────────────────────────────────────
 case "${1:-}" in
-  arch)     load_gate_entry; arch_gate ;;
-  mutation) load_gate_entry; mutation_gate ;;
+  arch)     load_gate_entry; oracle_staleness_warning; arch_gate ;;
+  mutation) load_gate_entry; oracle_staleness_warning; mutation_gate ;;
+  oracle)   load_gate_entry; oracle_gate ;;
   -h|--help) usage; exit 0 ;;
   *)
     echo "Error: unknown subcommand '${1:-}'" >&2
