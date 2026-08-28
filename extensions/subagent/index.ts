@@ -526,12 +526,37 @@ export async function runSingleAgent(
 			// so treeKill can signal it (and its MCP server children) without
 			// ever signalling the orchestrator. Opt out via SUBAGENT_DETACHED=0.
 			const detached = process.env.SUBAGENT_DETACHED !== "0";
+			// #285 P1-2: subagent-tool children get the task-sub-agent identity
+			// markers (TASK_HEARTBEAT=1 + PI_MODE=print — the pair that
+			// verification-gate / review-enforcer / task-heartbeat discriminate
+			// on) so the fail-closed gates apply uniformly across BOTH
+			// dispatchers (builtin-tools task tool + this tool). The emitter is
+			// kept inert via TASK_HEARTBEAT_DISABLE=1 (this tool has no
+			// per-dispatch nonce and no parent marker parser — a live emitter
+			// would pollute every dispatch result with empty-nonce noise). The
+			// parent's inherited review-gate bypass env (ELDATO_SKIP_VGATE /
+			// ELDATO_SKIP_REVIEW_GATE / AGENT_SKIP_REVIEW_GATE) is stripped;
+			// AGENT_SKIP_REVIEW_GATE is then FORCED to "1" (#825: review
+			// DISPATCH stays parent-enforced — the child must never self-
+			// satisfy the review-enforcer; the merge-registry gate stays
+			// ACTIVE, #285 P1-2b).
+			const childEnv: Record<string, string | undefined> = {
+				...process.env,
+				PATH: augmentedPath,
+				TASK_HEARTBEAT: "1",
+				PI_MODE: "print",
+				TASK_HEARTBEAT_DISABLE: "1",
+				AGENT_SKIP_REVIEW_GATE: "1",
+			};
+			// #285 Fix A: key-specific strip of the inherited bypass vars.
+			delete childEnv.ELDATO_SKIP_VGATE;
+			delete childEnv.ELDATO_SKIP_REVIEW_GATE;
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				shell: false,
 				detached,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, PATH: augmentedPath },
+				env: childEnv,
 			});
 			// #208: pgid captured at spawn — for a detached spawn this is the
 			// child's OWN group (setsid); the shared sweep helper's runtime

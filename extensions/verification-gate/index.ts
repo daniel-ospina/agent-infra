@@ -7,7 +7,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpat
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
-import { isPrintMode } from "../shared/print-mode.js";
+import { isPrintMode, argvAllowsTask } from "../shared/print-mode.js";
 // ponytail: inlined from verification-gate-utils.ts — pi's extension loader treats every .ts in
 // ~/.pi/agent/extensions/ as an extension and fails on a pure-helper module (no factory export).
 // Do NOT re-extract to a sibling .ts; the directory+entry pattern (see main-worktree-guard) is the
@@ -164,6 +164,37 @@ function isTaskSubAgent(
   // env via a parameter, never raw process.env — keeps the #228 print-mode
   // wiring gate (extensions/shared/print-mode-wiring.test.ts) green.
   return env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print";
+}
+
+/**
+ * #285 P1-1/P1-2b: refuse any path that would auto-DISABLE the gate for a
+ * task sub-agent (the session_start escape hatch + the 3 vgateFailures
+ * tool_result sites). Returns true when the bypass was REFUSED (task
+ * sub-agent — plain-text WARN + durable audit, extensionEnabled stays true →
+ * still blocking); false → the caller proceeds with its existing disable
+ * behavior. Inlined module-level alongside isTaskSubAgent (extension-loader
+ * constraint — no sibling helper file; see the ponytail note above).
+ */
+function refuseAutoBypassForSubAgent(): boolean {
+  if (!isTaskSubAgent()) return false;
+  console.warn("[verification-gate] ⚠️ Bypass refused for task sub-agent — VGATE stays ACTIVE (#285)");
+  appendJsonl({ event: "gate_bypass_refused", extension: "verification-gate", subagent: true, session_cwd: process.cwd() });
+  return true;
+}
+
+/**
+ * #285 P1-A: task-tool-aware guidance for a refused bypass / a final block.
+ * Task-capable sub-agents self-satisfy VGATE in-band (dispatch their own
+ * [VGATE] verification and retry); task-RESTRICTED agents (--tools allowlists
+ * without task — the 7 restricted user agents) cannot — the block is final,
+ * they return to the parent session (which runs the verification ceremony and
+ * will re-dispatch them). argv seam (default process.argv) keeps the e2e
+ * deterministic.
+ */
+function subAgentProceedInstruction(): string {
+  return argvAllowsTask()
+    ? "To satisfy the gate, dispatch your own [VGATE] verification in-band via the task tool, then retry the git operation."
+    : "STOP — this block is final; do not bypass; return to the parent session (it runs the verification ceremony and will re-dispatch you).";
 }
 
 function bridgePath(): string {
@@ -874,6 +905,52 @@ export function isValidResult(obj: any): obj is VerificationResult {
   );
 }
 
+/**
+ * #285 P1-A Surface 1: the sub-agent block message, task-tool-aware. The old
+ * text unconditionally claimed "This session HAS the task tool" — false for
+ * the 7 task-restricted user agents (--tools allowlists without task: planner,
+ * verifier, reviewer, scout, code-reviewer, bug-scanner, product-verifier).
+ * Task-capable → in-band self-satisfy (dispatch [VGATE] via the task tool,
+ * retry). Task-restricted → FINAL block: return to the parent session (it runs
+ * the verification ceremony and will re-dispatch). The argv param is the e2e
+ * seam (the harness's process.argv has no --tools → task-capable by default).
+ */
+export function buildSubAgentBlockMessage(
+  reasons: string[],
+  cwd: string,
+  allBlocked: string[],
+  argv: string[] = process.argv,
+): string {
+  const taskCapable = argvAllowsTask(argv);
+  const action = taskCapable
+    ? [
+        "  This session has the task tool, so verify them in-band",
+        "  before retrying — do not ask the parent to re-run this task.",
+        "",
+        "  → Dispatch your own VGATE verification (self-satisfy the gate):",
+        `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}. Return ONLY JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"<repo-relative>","hash":"<sha256>"}]}.', ...)`,
+        "",
+        "  → On PASS, retry the git operation. Sub-agent commits get NO #7591",
+        "    auto-bypass: an unverified commit blocks every time until verified.",
+      ]
+    : [
+        "  This session is task-RESTRICTED (task is not in the tool allowlist),",
+        "  so the gate cannot be satisfied in-band.",
+        "  STOP — this block is final; do not bypass; return to the parent",
+        "  session (it runs the verification ceremony and will re-dispatch you).",
+      ];
+  return [
+    "⛔ Verification gate — blocking git operation (sub-agent).",
+    "",
+    ...reasons.map(l => l.replace("verifier sub-agent", "the parent session")),
+    "",
+    "  This session is a task sub-agent: it inherits the parent session's",
+    "  verified-file registry via the bridge file, and these files are NOT",
+    "  covered by it.",
+    ...action,
+  ].join("\n");
+}
+
 // ── Plugin ────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -898,7 +975,10 @@ export default function (pi: ExtensionAPI) {
       // Surfaced in the child's startup output so the parent sees it in the
       // task result instead of discovering the dead-end only via a silent
       // all-block task report.
-      console.log(`[verification-gate] ⚠️ Sub-agent session started with 0 bridge-recovered files for root ${sessionRoot} — the parent's verified-file registry is not available to this session; every changed-file commit will block until VGATE verification is dispatched (in-band via the task tool).`);
+      // #285 P1-A Surface 2: task-tool-aware instruction — a restricted
+      // sub-agent cannot self-satisfy in-band; the block is final.
+      const taskCapable = argvAllowsTask();
+      console.log(`[verification-gate] ⚠️ Sub-agent session started with 0 bridge-recovered files for root ${sessionRoot} — the parent's verified-file registry is not available to this session; every changed-file commit will block until VGATE verification is dispatched ${taskCapable ? "(in-band via the task tool)." : "by the parent session — this session is task-restricted, so return to the parent (the block is final)."}`);
       appendJsonl({ event: "gate_recovery_empty", extension: "verification-gate", subagent: true, root: sessionRoot, session_cwd: process.cwd() });
     }
     lastRecoveryMtime = 0;
@@ -913,9 +993,19 @@ export default function (pi: ExtensionAPI) {
     // ponytail: dedicated escape hatch — ELDATO_ALLOW_MAIN_EDITS is the worktree
     // guard's bypass and must not disable commit verification (#7470)
     if (process.env.ELDATO_SKIP_VGATE === "1") {
-      extensionEnabled = false;
-      console.log("[verification-gate] ⏸️  Disabled — ELDATO_SKIP_VGATE=1");
-      appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "escape_hatch", session_cwd: process.cwd() }); // #60: durable audit record (fail-safe)
+      // #285 Fix B: a polluted parent launch env (swarm_daemon sets
+      // ELDATO_SKIP_VGATE=1) must NOT disable the gate in a task child — the
+      // escape hatch belongs to the interactive parent session only; the child
+      // either self-satisfies VGATE in-band or returns to the parent. The
+      // deliberate-flag case (an emergency ELDATO_SKIP_VGATE=1 set by a human
+      // for a task sub-agent) is refused the same way: the gate stays ACTIVE.
+      if (refuseAutoBypassForSubAgent()) {
+        console.warn(`[verification-gate] ${subAgentProceedInstruction()}`);
+      } else {
+        extensionEnabled = false;
+        console.log("[verification-gate] ⏸️  Disabled — ELDATO_SKIP_VGATE=1");
+        appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "escape_hatch", session_cwd: process.cwd() }); // #60: durable audit record (fail-safe)
+      }
     } else {
       extensionEnabled = true;
     }
@@ -943,9 +1033,16 @@ export default function (pi: ExtensionAPI) {
     // not only at session load. Allows mid-session emergency bypass
     // when a stale-hash block strikes.
     if (process.env.ELDATO_SKIP_VGATE === "1") {
-      console.log("[verification-gate] ⏩ Bypassed — ELDATO_SKIP_VGATE=1 (per-command)");
-      appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "per_command_escape_hatch", session_cwd: process.cwd() }); // #60: durable audit record (fail-safe)
-      return undefined;
+      if (refuseAutoBypassForSubAgent()) {
+        // #285 Fix B: refused — fall through so the command is STILL gated
+        // (blocked unless the files are verified); the WARN above + this
+        // instruction tell the child how to proceed.
+        console.warn(`[verification-gate] ${subAgentProceedInstruction()}`);
+      } else {
+        console.log("[verification-gate] ⏩ Bypassed — ELDATO_SKIP_VGATE=1 (per-command)");
+        appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "per_command_escape_hatch", session_cwd: process.cwd() }); // #60: durable audit record (fail-safe)
+        return undefined;
+      }
     }
 
     const command = String(event.input.command ?? "");
@@ -1107,32 +1204,17 @@ export default function (pi: ExtensionAPI) {
 
     const allBlocked = [...unverified, ...mismatched.map(m => m.file)];
     // #825/#264: task sub-agents inherit the parent's verified-file registry via
-    // the bridge — a block here means these files are NOT covered by it. Unlike
-    // the pre-#264 contract (block is FINAL, report to parent), the sub-agent
-    // HAS the task tool (builtin-tools registers it unconditionally) and its
-    // own tool_result handler merges a VGATE PASS exactly like the parent's —
-    // so it self-satisfies the gate in-band: dispatch its own VGATE
-    // verification, then retry the commit. The no-auto-bypass guard stays: a
-    // blocked sub-agent must still get verified (just via its own dispatch),
-    // never silently committed.
-    const subAgentReason = [
-      "⛔ Verification gate — blocking git operation (sub-agent).",
-      "",
-      ...reasons.map(l => l.replace("verifier sub-agent", "the parent session")),
-      "",
-      `  This session is a task sub-agent: it inherits the parent session's`,
-      "  verified-file registry via the bridge file, and these files are NOT",
-      "  covered by it. This session HAS the task tool, so verify them in-band",
-      "  before retrying — do not ask the parent to re-run this task.",
-      "",
-      `  → Dispatch your own VGATE verification (self-satisfy the gate):`,
-      `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}. Return ONLY JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"<repo-relative>","hash":"<sha256>"}]}.', ...)`,
-      "",
-      `  → On PASS, retry the git operation. Sub-agent commits get NO #7591`,
-      "    auto-bypass: an unverified commit blocks every time until verified.",
-    ].join("\n");
+    // the bridge — a block here means these files are NOT covered by it. The
+    // child self-satisfies the gate in-band (it HAS the task tool and its own
+    // tool_result handler merges a VGATE PASS exactly like the parent's) —
+    // dispatch its own VGATE verification, then retry the commit. The
+    // no-auto-bypass guard stays: a blocked sub-agent must still get verified
+    // (just via its own dispatch), never silently committed. #285 P1-A: the
+    // message is now task-tool-aware (buildSubAgentBlockMessage branches for
+    // task-restricted agents — the old text unconditionally claimed the task
+    // tool).
     const reason = isTaskSubAgent()
-      ? subAgentReason
+      ? buildSubAgentBlockMessage(reasons, cwd, allBlocked)
       : [
           "⛔ Verification gate — blocking git operation.",
           "",
@@ -1170,7 +1252,13 @@ export default function (pi: ExtensionAPI) {
     if (!content || content.length === 0) {
       console.error("[verification-gate] ⚠️ Verifier sub-agent returned empty content. Format: prompt must say 'verify files:' (plural); response must contain 'PASS' or valid JSON {status, failures, verified_files}.");
       vgateFailures++;
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
+      // #285 P1-1: a task sub-agent never auto-disables on repeated dispatch
+      // failures — the threshold disable is refused (WARN + audit, gate stays
+      // ACTIVE → still blocking).
+      if (vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
+        extensionEnabled = false;
+        console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures");
+      }
       return undefined;
     }
 
@@ -1182,7 +1270,12 @@ export default function (pi: ExtensionAPI) {
     if (!textContent) {
       console.error("[verification-gate] ⚠️ Verifier sub-agent returned no text content. Format: response must contain 'PASS' or valid JSON {status, failures, verified_files}.");
       vgateFailures++;
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
+      // #285 P1-1: no threshold auto-disable for task sub-agents (see the
+      // empty-content site — same refusal).
+      if (vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
+        extensionEnabled = false;
+        console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures");
+      }
       return undefined;
     }
 
@@ -1321,6 +1414,19 @@ export default function (pi: ExtensionAPI) {
         }
       }
       if (promptFiles.size > 0) {
+        // #285 P2-B: refuse the #5724 fail-open prompt-merge for task
+        // sub-agents — an unparseable verifier response must NOT silently
+        // bless the prompt files in a child (the child's own re-dispatch with
+        // the required JSON format is the path). Mirror the hasFail terminal:
+        // no merge, NO vgateFailures increment, block state
+        // (lastBlockedCwd/lastBlockedFiles) PRESERVED so the re-dispatch still
+        // has its subject. Interactive sessions keep the #5724 fail-open
+        // unchanged (model JSON-compliance noise must not block a legit user).
+        if (isTaskSubAgent()) {
+          console.warn("[verification-gate] ⚠️ Verifier unparseable — fail-open REFUSED for task sub-agent; files NOT recorded; re-dispatch with the required JSON format (#285)");
+          appendJsonl({ event: "gate_bypass_refused", extension: "verification-gate", subagent: true, reason: "fail_open_refused", session_cwd: process.cwd() });
+          return undefined;
+        }
         const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
         if (foreign) lastBlockedFiles = [];
         const normRoot = normalizeWorktreeRoot(projectRoot);
@@ -1344,7 +1450,12 @@ export default function (pi: ExtensionAPI) {
         }
       }
       vgateFailures++;
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD) { extensionEnabled = false; console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures"); }
+      // #285 P1-1: no threshold auto-disable for task sub-agents (refused —
+      // gate stays ACTIVE → still blocking).
+      if (vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
+        extensionEnabled = false;
+        console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures");
+      }
       return undefined;
     }
 

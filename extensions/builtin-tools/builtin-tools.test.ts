@@ -238,6 +238,22 @@ test("sub-agent env keeps AGENT_SKIP_REVIEW_GATE=1 — review dispatch stays par
   );
 });
 
+test("sub-agent env strips inherited ELDATO_SKIP_VGATE / ELDATO_SKIP_REVIEW_GATE AFTER the ...process.env spread — polluted parent envs cannot leak the bypass into task children (#285)", () => {
+  const spreadIdx = source.indexOf("...process.env");
+  const delVgate = source.indexOf("delete subAgentEnv.ELDATO_SKIP_VGATE");
+  const delVgateReview = source.indexOf("delete subAgentEnv.ELDATO_SKIP_REVIEW_GATE");
+  ok(spreadIdx !== -1, "subAgentEnv must spread process.env (#5838)");
+  ok(delVgate !== -1 && delVgate > spreadIdx, "delete subAgentEnv.ELDATO_SKIP_VGATE must appear AFTER the spread (a pre-spread delete would be overwritten by the inherited value)");
+  ok(delVgateReview !== -1 && delVgateReview > spreadIdx, "delete subAgentEnv.ELDATO_SKIP_REVIEW_GATE must appear AFTER the spread");
+  ok(!/subAgentEnv\.ELDATO_SKIP_VGATE\s*=/.test(source), "no line may re-assign ELDATO_SKIP_VGATE after the strip");
+  ok(!/subAgentEnv\.ELDATO_SKIP_REVIEW_GATE\s*=/.test(source), "no line may re-assign ELDATO_SKIP_REVIEW_GATE after the strip");
+});
+
+test("key-specific strip: BOTH ALLOW_MAIN_EDITS variants survive (#285/#7470/#7549)", () => {
+  ok(source.includes('ELDATO_ALLOW_MAIN_EDITS: "1"'), "ELDATO_ALLOW_MAIN_EDITS must remain set (branch-ownership escape hatch, #7470)");
+  ok(source.includes('AGENT_ALLOW_MAIN_EDITS: "1"'), "AGENT_ALLOW_MAIN_EDITS must remain set (dual-support, #7549)");
+});
+
 // ── PATH augmentation (#36) ───────────────────────────
 
 section("augmentPath — sub-agent PATH augmentation (#36)");
@@ -2298,7 +2314,7 @@ test("getSystemLoad — live probe returns the real loadavg (regression: unimpor
   }
 });
 
-test("getTaskHardCapMs — default 2h, ≥60s clamp, invalid → default", () => {
+test("getTaskHardCapMs — default 6h, ≥60s clamp, invalid → default", () => {
   withEnv({ TASK_HARD_CAP_MS: undefined }, () => equal(getTaskHardCapMs(), DEFAULT_HARD_CAP_MS));
   withEnv({ TASK_HARD_CAP_MS: "5" }, () => equal(getTaskHardCapMs(), 60_000));
   withEnv({ TASK_HARD_CAP_MS: "3600000" }, () => equal(getTaskHardCapMs(), 3_600_000));
