@@ -53,12 +53,12 @@ Skipped — no user-facing journeys (infrastructure guard, no UI).
 - No LOGIC changes to `classify-git.mjs`, `index.ts`, or `branch-ownership.mjs`.
 
 **Files:**
-- Modify: `extensions/main-worktree-guard/test.mjs` (m4t block after T1, line 696 + nested-worktree fixture provisioning in the m4Tmp try block ~lines 666-678; expectBool contract pin after the existing "observable:" assertions, lines 950-952)
-- Modify: `extensions/main-worktree-guard/classify-git.mjs` (JSDoc comment on resolveInvocationTarget, ~line 300 — comment-only)
+- Modify: `extensions/main-worktree-guard/test.mjs` (m4t block after the T1 case; nested-worktree fixture provisioning in the m4Tmp try block; contract pin after the existing `observable:` assertions)
+- Modify: `extensions/main-worktree-guard/classify-git.mjs` (JSDoc input-contract note on `resolveInvocationTarget`, comment-only)
 
 **Step 1: Add the m4t regression cases directly after T1**
 
-In `extensions/main-worktree-guard/test.mjs`, in the `#347: M4 worktree-target exemption` m4t block, immediately after the T1 line (696):
+In `extensions/main-worktree-guard/test.mjs`, in the `#347: M4 worktree-target exemption` m4t block, immediately after the `T1` case:
 
 ```js
 m4t("T1: cd wt commit — THE FIX", `cd "${wtR}" && git commit -m x`, "allowed");
@@ -69,10 +69,12 @@ add:
 ```js
 // #349 regression: the issue claimed the exemption doesn't fire for the
 // standard `cd <worktree> && git …` form ("cdChain not extracted"). Falsified
-// by probe: the walker DOES extract the cd target (see T1b's allowed verdict
-// above + the T45a cdChain content pin). These cases pin the issue's exact
-// incident command forms so a future regression fails loudly instead of
-// freezing worktree sessions.
+// by probe: the walker DOES extract the cd target (see the T1b-T1f allowed
+// verdicts below + the "shape: cdChain content pinned" expectBool). These
+// cases pin the issue's exact incident command forms so a future regression
+// fails loudly instead of freezing worktree sessions. T1d/T1e resolve the
+// relative `../wt` against the sessionCwd frame (hubR) — the production
+// bash-gate base-cwd path.
 m4t("T1b: cd abs-wt git add -A — the #349 incident form", `cd "${wtR}" && git add -A`, "allowed");
 m4t("T1c: git -C abs-wt add -A — Indicator 2 cross-check", `git -C "${wtR}" add -A`, "allowed");
 m4t("T1d: RELATIVE cd into wt + git add", `cd ../wt && git add -A`, "allowed");
@@ -92,11 +94,12 @@ execSync(`git worktree add -q "${hubR}/.worktrees/n" -b wt/n HEAD`, { cwd: hubR,
 
 **Step 3: Add the probe-shape contract pin near the existing "observable:" assertions**
 
-After the existing `observable: resolveInvocationTarget → worktree` expectBool (line 952), add:
+After the existing `observable: resolveInvocationTarget → worktree` expectBool, add:
 
 ```js
 // #349 contract pin: resolveInvocationTarget consumes an INVOCATION object
-// {cdChain, cHints, gitDirHint, workTreeHint} — there is NO `cmd` field. The
+// {cdChain, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint} —
+// there is NO `cmd` field. The
 // issue's probe `resolveInvocationTarget({cmd: 'cd <wt> && git add -A', args: [...]}, hub)`
 // trivially yields an EMPTY cdChain → effectiveCwd = hub → isWorktree:false.
 // That result is EXPECTED for the wrong shape, not evidence of a parsing bug.
