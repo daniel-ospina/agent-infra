@@ -563,10 +563,11 @@ function _walkShell(command, h = {}, seedVars = {}) {
   const tokens = _tokenize(command);
   // Per-paren-depth frame: chain, vars (persisted shell state), segVars (vars
   // at the last boundary — the expansion scope for a segment's own words),
-  // baseLen (chain length at last boundary), pipeC0, pipeActive.
+  // baseLen (chain length at last boundary), pipeC0, pipeActive, pushtack
+  // (issue #354: chain length at each pushd — popd truncates back to it, D1).
   // seedVars (round-13): command-level assignments passed into nested walks
   // (`-c` inlines, substitution spans) so mid-span `$VAR` command words resolve.
-  const stack = [{ chain: [], vars: { ...seedVars }, segVars: { ...seedVars }, baseLen: 0, pipeC0: null, pipeActive: false, persistHints: { gitDirHint: null, workTreeHint: null } }];
+  const stack = [{ chain: [], vars: { ...seedVars }, segVars: { ...seedVars }, baseLen: 0, pipeC0: null, pipeActive: false, persistHints: { gitDirHint: null, workTreeHint: null }, pushtack: [] }];
   const frame = () => stack[stack.length - 1];
   const refreshSeg = (f) => { f.segVars = { ...f.vars }; };
   const restoreC0 = (f) => { if (f.pipeActive && f.pipeC0) f.chain.splice(0, f.chain.length, ...f.pipeC0); };
@@ -608,10 +609,54 @@ function _walkShell(command, h = {}, seedVars = {}) {
       prevWasBoundary = false;
       continue;
     }
+    // Issue #354: pushd/popd are REAL cwd-state builtins (like cd) — recognized
+    // in the SAFE direction only (no bypass). Design D1: popd truncates the
+    // chain to the PRE-pushd boundary (a per-frame pushtack records the chain
+    // length at each pushd), NOT "pop the last entry" — the naive form diverges
+    // from bash when a cd intervenes (`pushd wt; cd sub; popd` → bash cwd is the
+    // HUB; pop-last would resolve the wt → bypass). Bare pushd / pushd
+    // <boundary> / flag forms (`-n`, `+N`, `-N`, `--`) never cd → null marker;
+    // an empty-stack popd (bash errors, cwd unchanged) → null marker — both
+    // conservative (no exemption). Same command-position guard as cd: a
+    // pushd/popd after a spawner (`sudo pushd`) runs in a subprocess and must
+    // not mutate the parent chain.
+    if (t === "pushd" && prevWasBoundary && !spawnerPending) {
+      const next = tokens[i + 1];
+      const isFlagForm = next !== undefined && (next.startsWith("-") || /^\+[0-9]+$/.test(next));
+      const hasTarget = next !== undefined && !_isShellBoundary(next) && !isFlagForm;
+      const target = hasTarget ? next : null; // bare / <boundary> / flag → null marker
+      i += hasTarget ? 2 : 1;
+      const f = frame();
+      // Bare / ~ / cd- / unresolvable $VAR → null marker (mirrors the cd branch).
+      const expanded = (target === null || target === "~" || target.startsWith("~/") || target === "-")
+        ? null
+        : _expandCdVars(target, f.segVars);
+      if (expanded === null) {
+        f.chain.push(null); // conservative — never a bypass
+      } else {
+        f.pushtack.push(f.chain.length); // D1: record the PRE-pushd boundary
+        f.chain.push(expanded);
+      }
+      h.onCd?.(expanded);
+      prevWasBoundary = false;
+      continue;
+    }
+    if (t === "popd" && prevWasBoundary && !spawnerPending) {
+      i++;
+      const f = frame();
+      const mark = f.pushtack.pop();
+      if (mark === undefined) {
+        f.chain.push(null); // empty stack → bash errors, cwd unchanged → conservative
+      } else {
+        f.chain.splice(mark, f.chain.length - mark); // D1: truncate to the pre-pushd state
+      }
+      prevWasBoundary = false;
+      continue;
+    }
     if (t === "(") {
       const f = frame();
       restoreC0(f);
-      stack.push({ chain: [...f.chain], vars: { ...f.vars }, segVars: { ...f.segVars }, baseLen: f.chain.length, pipeC0: null, pipeActive: false, persistHints: { ...f.persistHints } }); // round-12: bash subshells INHERIT variables
+      stack.push({ chain: [...f.chain], vars: { ...f.vars }, segVars: { ...f.segVars }, baseLen: f.chain.length, pipeC0: null, pipeActive: false, persistHints: { ...f.persistHints }, pushtack: [...f.pushtack] }); // round-12: bash subshells INHERIT variables (issue #354: and a COPY of the dir stack)
       pendingHints = {};
       prevWasBoundary = true;
       h.onParenPush?.();
