@@ -932,18 +932,34 @@ try {
   m4t("T131: ( pushd wt ) → block (subshell does not leak)", `( pushd "${wtR}" ) && git commit -m x`, "block");
   m4t("T132: pushd wt && pushd hub && popd → allowed (nested pushd — popd restores the 1st target)", `pushd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
   m4t("T133: pushd wt && pushd hub && popd && popd → block (double popd — restores hub)", `pushd "${wtR}" && pushd "${hubR}" && popd && popd && git commit -m x`, "block");
-  // ── #366 review (P1 SECURITY BYPASS): popd ARG forms keep cwd at the CURRENT
-  // stack top — the HUB for a wt→hub pushd chain — so truncating to the pre-pushd
-  // boundary would resolve the chain to the wt and exempt a hub-targeted mutation.
-  // Bash-probe-verified (bash 3.2): only bare popd / `--` / `+0` return to the
-  // pre-pushd cwd; `-n` (no cd), `+N`/`-N` (N≥1), `-0` (removes the stack bottom)
-  // and path operands keep cwd at the top. All arg forms → NULL marker → block.
+  // ── #366 review (P1 SECURITY BYPASS, round-2): popd ARG forms keep cwd at
+  // the CURRENT stack top — the HUB for a wt→hub pushd chain — so truncating
+  // to the pre-pushd boundary would resolve the chain to the wt and exempt a
+  // hub-targeted mutation. Bash-probe-verified (bash 3.2): only bare popd /
+  // `--` / boundary-next `+0` return to the pre-pushd cwd; `-n` (NOCD),
+  // `+N`/`-N` (N≥1), `-0` (removes the stack bottom) and path operands keep
+  // cwd at the top. Round-2 (cycle-2 bypass): popd scans the ENTIRE argument
+  // list — a `+0` followed by ANY word (`+0 -n` NOCD, `+0 /x`, `+0 -1`, `+0
+  // foo`) parses to a NON-truncating form → cwd stays at the hub → block.
+  // All arg forms → NULL marker → block.
   m4t("T134: popd -n → block (cwd stays at hub — #366 bypass pin)", `cd "${wtR}" && pushd "${hubR}" && popd -n && git commit -m x`, "block");
   m4t("T135: popd +1 → block (cwd stays at hub — #366 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd +1 && git commit -m x`, "block");
   m4t("T136: popd -0 → block (removes stack bottom, cwd stays at hub — #366 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd -0 && git commit -m x`, "block");
   m4t("T137: popd /x → block (path operand — #366 bypass pin)", `pushd "${wtR}" && popd /x && git commit -m x`, "block");
   m4t("T138: bare popd → allowed (control — returns to wt)", `cd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
-  expectBool("#366: popd arg forms consume ONE token (walker stays in sync — git still found)", (() => {
+  // ── #366 review round-2 (cycle-2 bypass): popd +0 MULTI-ARG forms ──
+  // bash 3.2's popd scans the ENTIRE argument list: a `+0` followed by ANY
+  // word parses to a NON-truncating form → no cd → cwd stays at the CURRENT
+  // stack top (the hub). Probe-verified: `+0 -n` sets NOCD (cwd stays hub);
+  // `+0 /x` / `+0 foo` error (no pop, no cd — cwd stays hub); `+0 -1` removes
+  // a NON-top entry (the new top is the hub). The cycle-1 guard consumed only
+  // the `+0` token and truncated → chain resolved to the wt → hub commit
+  // exempted → bypass. Now: any word after `+0` → NULL marker → block.
+  m4t("T139: popd +0 -n → block (NOCD — cwd stays at hub — cycle-2 bypass pin)", `cd "${wtR}" && pushd "${hubR}" && popd +0 -n && git commit -m x`, "block");
+  m4t("T140: popd +0 /x → block (operand clobbers — cwd stays at hub — cycle-2 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd +0 /x && git commit -m x`, "block");
+  m4t("T141: popd +0 -1 → block (index clobbers — cwd stays at hub — cycle-2 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd +0 -1 && git commit -m x`, "block");
+  m4t("T142: popd +0 → allowed (CONTROL — boundary-next +0 pops top, cds to wt)", `pushd "${wtR}" && pushd "${hubR}" && popd +0 && git commit -m x`, "allowed");
+  expectBool("#366: popd arg forms consume ALL tokens to the boundary (walker stays in sync — git still found)", (() => {
     const invs = allGitInvocations(`cd "${wtR}" && pushd "${hubR}" && popd -n && git commit -m x`);
     return invs.length === 1 && invs[0].verb === "commit" && invs[0].cdChain[invs[0].cdChain.length - 1] === null;
   })(), true);

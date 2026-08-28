@@ -621,19 +621,26 @@ function _walkShell(command, h = {}, seedVars = {}) {
     // pushd/popd after a spawner (`sudo pushd`) runs in a subprocess and must
     // not mutate the parent chain.
     //
-    // Issue #366 review (P1 SECURITY BYPASS): only a BARE popd (next token
-    // undefined / shell boundary) — plus `--` (bash's option terminator: the
-    // remaining list is empty → bare semantics) and `+0` (removes the top,
-    // cds to the new top = the pre-pushd cwd) — truncates to the pushtack
-    // boundary. EVERY other argument form keeps cwd at the CURRENT stack top
-    // (probe-verified on bash 3.2: `-n` pops without cd; `+N`/`-N` with N≥1
-    // and `-0`/path operands remove a NON-top entry — the cd target is the
-    // remaining top, i.e. the HUB for a wt→hub pushd chain). Truncating for
-    // those forms would resolve the chain to the wt and exempt a hub-targeted
-    // mutation → guard bypass. They consume the single (first) argument token
-    // — bash 3.2 popd takes at most ONE argument, later ones are ignored —
-    // and push a NULL marker (conservative → block, never exempt), mirroring
-    // the pushd branch's flag handling and the cd branch's bare-cd pattern.
+    // Issue #366 review (P1 SECURITY BYPASS, round-2): only a BARE popd (next
+    // token undefined / shell boundary) — plus `--` (bash's option terminator
+    // — probe-verified: `popd -- <any operand>` behaves like bare popd, cds
+    // to the new top) and `+0` with NOTHING after it (removes the top, cds to
+    // the new top = the pre-pushd cwd) — truncates to the pushtack boundary.
+    // EVERY other argument form keeps cwd at the CURRENT stack top, i.e. the
+    // HUB for a wt→hub pushd chain (probe-verified on bash 3.2): `-n` sets
+    // NOCD (pops WITHOUT cd); `+N`/`-N` with N≥1 / `-0` remove a NON-top
+    // entry — the cd target is the remaining top (the hub); path-like
+    // operands are errors (no pop, no cd — cwd stays hub). CRITICAL (cycle-2
+    // review): bash 3.2's popd scans the ENTIRE argument list — a `+0`
+    // followed by ANY word (`popd +0 -n`, `popd +0 /x`, `popd +0 -1`,
+    // `popd +0 foo` — all probe-verified) parses to a NON-truncating form →
+    // no cd to the new top → cwd stays at the hub. Truncating for those
+    // forms would resolve the chain to the wt and exempt a hub-targeted
+    // mutation → guard bypass. The null-marker path consumes ALL popd
+    // argument tokens up to the next shell boundary (bash's arg scan consumes
+    // every word) so the walker stays in sync, and pushes a NULL marker
+    // (conservative → block, never exempt), mirroring the pushd branch's flag
+    // handling and the cd branch's bare-cd pattern.
     if (t === "pushd" && prevWasBoundary && !spawnerPending) {
       const next = tokens[i + 1];
       const isFlagForm = next !== undefined && (next.startsWith("-") || /^\+[0-9]+$/.test(next));
@@ -658,22 +665,28 @@ function _walkShell(command, h = {}, seedVars = {}) {
     if (t === "popd" && prevWasBoundary && !spawnerPending) {
       const next = tokens[i + 1];
       const hasArg = next !== undefined && !_isShellBoundary(next);
-      // #366: the D1 truncate is valid ONLY for bare popd / `--` / `+0` — the
-      // forms whose cd target IS the pre-pushd cwd (probe-verified). Any other
-      // argument (`-n`, `+0`'s negation `-0`, `+N`/`-N` with N≥1, path-like
-      // operand) keeps cwd at the current stack top → NULL marker so the chain
-      // resolves conservatively (block) and the hub-targeted mutation is never
-      // exempted. Consume exactly ONE argument token (bash takes at most one;
-      // later words are ignored) so the walker never desyncs.
-      const isTruncateForm = next === undefined || _isShellBoundary(next) || next === "--" || next === "+0";
-      if (hasArg && !isTruncateForm) {
-        i += 2; // popd + its single argument token
+      // #366 round-2: the D1 truncate is valid ONLY for bare popd / `--` /
+      // `+0` with NOTHING after it. `+0` is a truncate form ONLY when
+      // tokens[i+2] is undefined or a shell boundary — bash 3.2's popd scans
+      // the ENTIRE argument list, so `popd +0 -n` (NOCD), `popd +0 /x`,
+      // `popd +0 -1`, `popd +0 foo` all parse to NON-truncating forms → no cd
+      // → cwd stays at the current stack top (the HUB for a wt→hub chain;
+      // probe-verified). Any other argument (alone OR following `+0`) → NULL
+      // marker so the chain resolves conservatively (block) and the hub-
+      // targeted mutation is never exempted. Consume ALL popd argument tokens
+      // up to the next shell boundary (bash's arg scan consumes every word)
+      // so the walker never desyncs.
+      const isTruncateForm = !hasArg || next === "--" || (next === "+0" && (tokens[i + 2] === undefined || _isShellBoundary(tokens[i + 2])));
+      if (!isTruncateForm) {
+        let j = i + 1;
+        while (j < tokens.length && !_isShellBoundary(tokens[j])) j++;
+        i = j;
         const f = frame();
         f.chain.push(null); // conservative — cwd stays at the current top (the hub)
         prevWasBoundary = false;
         continue;
       }
-      i += hasArg ? 2 : 1; // bare popd / `--` / `+0` — consume the argument token too
+      i += hasArg ? 2 : 1; // bare popd / `--` / boundary-next `+0` — consume the argument token too
       const f = frame();
       const mark = f.pushtack.pop();
       if (mark === undefined) {
