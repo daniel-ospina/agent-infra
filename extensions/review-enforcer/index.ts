@@ -42,6 +42,17 @@ function _getEnv(name: string): string | undefined {
 function _skipReviewGate(): boolean {
   return _getEnv("SKIP_REVIEW_GATE") === "1";
 }
+
+// #285 P1-2b: local task-sub-agent discriminator — mirrors verification-gate's
+// isTaskSubAgent (TASK_HEARTBEAT=1 ∧ PI_MODE=print, the marker pair BOTH
+// dispatchers force on task children). Drift-guarded by the E14-style source
+// test in index.test.ts. Env-param seam (same pattern as verification-gate)
+// keeps the #228 print-mode wiring gate green.
+function isTaskSubAgent(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print";
+}
 // Namespaced marker files (Phase 1 — #7549)
 const ISSUE_COMPLEXITY_FILE = "/tmp/agent-issue-complexity";
 
@@ -284,18 +295,33 @@ export function evaluateMergeGate(
   pr: number,
   record: ReviewRecord | null,
   currentHead: string | null,
-  ctx: RepoContext
+  ctx: RepoContext,
+  taskSubAgent: boolean = false,
 ): MergeGateResult {
   if (!record) {
+    // #285 Fix C: the emergency-bypass line is FALSE for task sub-agents — the
+    // skip flag is already forced on them (#825) and the merge-registry gate
+    // stays ACTIVE (#285 P1-2b), so the line would instruct an action that
+    // cannot unlock the merge. Shape-aware: the parent session must record the
+    // review instead.
+    const lines = taskSubAgent
+      ? [
+          "✅ Review enforcement (merge registry) gate is working correctly.",
+          `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
+          "   → The parent session must record the review:",
+          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+          "   → The bypass flag does NOT unlock sub-agent merges (#285).",
+        ]
+      : [
+          "✅ Review enforcement (merge registry) gate is working correctly.",
+          `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
+          "   → Run the code-review skill, then record the verdict:",
+          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+          "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
+        ];
     return {
       status: "block",
-      reason: [
-        "✅ Review enforcement (merge registry) gate is working correctly.",
-        `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
-        "   → Run the code-review skill, then record the verdict:",
-        "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
-        "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
-      ].join("\n"),
+      reason: lines.join("\n"),
     };
   }
   if (record.verdict !== "clean" && record.verdict !== "clean-micro") {
@@ -423,26 +449,40 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (_skipReviewGate()) {
-        extensionEnabled = false;
-        console.log(
-          "⚠️  REVIEW GATES DISABLED — all quality checks bypassed.",
-          "To re-enable, unset AGENT_SKIP_REVIEW_GATE (or ELDATO_SKIP_REVIEW_GATE) and restart."
-        );
-        // #60: durable audit record — the console.log JSON below stays, this
-        // ADDS the persistent trail (append-only JSONL, fail-safe).
-        logGateEvent("gate_bypass", { reason: "escape_hatch" });
-        // bypass log — machine-readable JSON. Only emit in interactive mode:
-        // in print mode (sub-agents) this bare JSON would land on stderr and
-        // contaminate tool-result content, breaking downstream JSON parsers.
-        // Same guard as the startup banner below. #133
-        if (!isPrintMode()) {
+        if (isTaskSubAgent()) {
+          // #285 P1-2b/P2-a: AGENT_SKIP_REVIEW_GATE=1 is FORCED on task
+          // children by both dispatchers (#825) — for them it is NOT a bypass:
+          // review DISPATCH stays parent-enforced (the parent runs the review
+          // ceremony for the PR as a whole), and the merge-registry gate stays
+          // ACTIVE below. Audit the truthful event — gate_bypass/escape_hatch
+          // would be a false record for a session that is NOT bypassed.
+          extensionEnabled = true;
           console.log(
-            JSON.stringify({
-              event: "gate_bypass",
-              reason: "escape_hatch",
-              timestamp: new Date().toISOString(),
-            })
+            "[review-enforcer] review DISPATCH is parent-enforced (#825) — the parent session runs the review ceremony; VGATE + merge-registry gate protect this PR"
           );
+          appendJsonl({ event: "review_gate_parent_enforced", extension: "review-enforcer", subagent: true, session_cwd: process.cwd() });
+        } else {
+          extensionEnabled = false;
+          console.log(
+            "⚠️  REVIEW GATES DISABLED — all quality checks bypassed.",
+            "To re-enable, unset AGENT_SKIP_REVIEW_GATE (or ELDATO_SKIP_REVIEW_GATE) and restart."
+          );
+          // #60: durable audit record — the console.log JSON below stays, this
+          // ADDS the persistent trail (append-only JSONL, fail-safe).
+          logGateEvent("gate_bypass", { reason: "escape_hatch" });
+          // bypass log — machine-readable JSON. Only emit in interactive mode:
+          // in print mode (sub-agents) this bare JSON would land on stderr and
+          // contaminate tool-result content, breaking downstream JSON parsers.
+          // Same guard as the startup banner below. #133
+          if (!isPrintMode()) {
+            console.log(
+              JSON.stringify({
+                event: "gate_bypass",
+                reason: "escape_hatch",
+                timestamp: new Date().toISOString(),
+              })
+            );
+          }
         }
       } else {
         extensionEnabled = true;
@@ -478,7 +518,9 @@ export default function (pi: ExtensionAPI) {
         const record = readReviewRecord(prNumber);
         const ctx = resolveRepoContext(command, record);
         const currentHead = await getPrHeadSha(prNumber, ctx);
-        const result = evaluateMergeGate(prNumber, record, currentHead, ctx);
+        // #285 Fix C: the no-record block message is shape-aware (task
+        // sub-agents get the "parent must record the review" variant).
+        const result = evaluateMergeGate(prNumber, record, currentHead, ctx, isTaskSubAgent());
         if (result.status === "block") {
           console.log("[review-enforcer] 🚫 Merge registry gate blocked merge");
           logMergeGateDecision(prNumber, result, record); // #60: durable audit record
@@ -489,9 +531,17 @@ export default function (pi: ExtensionAPI) {
         return undefined;
       }
 
-      if (dispatchCount > 0) {
+      // #285 P1-2b: task sub-agents skip the DISPATCH-count gate — review
+      // dispatch is parent-enforced (#825) and their own in-band [VGATE]
+      // dispatches are never counted (tool_result noise fix below). Only the
+      // merge-registry gate above stays ACTIVE for them (fail-closed on
+      // missing reviews/<PR>.json).
+      const taskSubAgent = isTaskSubAgent();
+      if (dispatchCount > 0 || (taskSubAgent && _skipReviewGate())) {
         console.log(
-          `[review-enforcer] ✅ ${dispatchCount} reviewer dispatch(es) — allowing git op`
+          taskSubAgent && dispatchCount === 0
+            ? "[review-enforcer] ✅ Git op allowed — review DISPATCH is parent-enforced for this sub-agent (#825); the merge-registry gate protects merges"
+            : `[review-enforcer] ✅ ${dispatchCount} reviewer dispatch(es) — allowing git op`
         );
         return undefined;
       }
@@ -519,6 +569,12 @@ export default function (pi: ExtensionAPI) {
     // ── tool_result: count task dispatches ─────────
     pi.on("tool_result", async (event, _ctx) => {
       if (event.toolName !== "task") return undefined;
+      // #285 P2: task sub-agents never count dispatches — review DISPATCH is
+      // parent-enforced (#825), and their own in-band [VGATE] dispatches must
+      // not be counted/audited as review dispatches. (Today they never reach
+      // this point: extensionEnabled was false; under P1-2b it stays true, so
+      // this early return is what keeps the noise out.)
+      if (isTaskSubAgent()) return undefined;
       if (!extensionEnabled) return undefined;
 
       dispatchCount++;

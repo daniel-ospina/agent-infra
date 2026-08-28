@@ -12,6 +12,15 @@
 // NODE_ENV=test (#212 review pass) — set it before importing the module.
 process.env.NODE_ENV = "test";
 
+// #285 isolation: the parent launch env may carry the task-sub-agent markers
+// (TASK_HEARTBEAT=1 / PI_MODE=print — this suite's own scenarios set them
+// explicitly). Delete inherited markers at load so the INTERACTIVE tests run
+// interactive regardless of a polluting parent env (mirrors the
+// verification-gate e2e harness's load-time isolation: the polluted-parent
+// class is exactly what #285 fixes).
+delete process.env.TASK_HEARTBEAT;
+delete process.env.PI_MODE;
+
 import {
   extractPrNumber,
   extractRepoFlag,
@@ -679,6 +688,175 @@ testAsync("gh pr merge with no review record → blocked AND merge_gate_block au
       equal(blockLines[0].reason, "no_review_record");
     } finally {
       process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+// ── #285: task sub-agents — merge-registry gate ACTIVE, truthful audit ──
+
+section("#285 — evaluateMergeGate shape-aware no-record message (Fix C)");
+
+test("task-sub-agent shape drops the false emergency-bypass line", () => {
+  const r = evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" }, true);
+  ok(r.status === "block");
+  const reason = (r as any).reason as string;
+  ok(reason.includes("does NOT unlock sub-agent merges (#285)"), "task-sub-agent shape must carry the #285 line");
+  ok(!reason.includes("Emergency: set AGENT_SKIP_REVIEW_GATE"), "no false emergency-bypass line for task sub-agents");
+});
+
+test("interactive shape keeps the emergency escape-hatch line (unchanged)", () => {
+  const r = evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" });
+  ok((r as any).reason.includes("Emergency: set AGENT_SKIP_REVIEW_GATE"), "interactive shape unchanged");
+});
+
+test("#285 drift guard: isTaskSubAgent reads the marker pair the dispatchers force", () => {
+  const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  ok(
+    src.includes('env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print"'),
+    "review-enforcer isTaskSubAgent must read TASK_HEARTBEAT=1 ∧ PI_MODE=print (same pair as verification-gate / task-heartbeat)"
+  );
+});
+
+testAsync("task sub-agent session_start audit is review_gate_parent_enforced, not gate_bypass (P2-a)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const lines = readAuditLines(auditLogPath());
+      equal(lines.length, 1, "exactly one audit entry");
+      equal(lines[0].event, "review_gate_parent_enforced");
+      equal(lines[0].extension, "review-enforcer");
+      ok(lines[0].subagent === true, "subagent flag set");
+      ok(!lines.some((l) => l.event === "gate_bypass"), "no gate_bypass/escape_hatch record for a task sub-agent");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("task sub-agent: git commit ungated, gh pr merge WITHOUT record blocked (P1-2b)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      // DISPATCH-count gate skipped for task sub-agents (P1-2b): no dispatch
+      // needed for commit/push/create.
+      const commit = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+      equal(commit, undefined, "dispatch-count gate must be skipped for task sub-agents");
+      // ...but the MERGE-registry gate stays ACTIVE: no record → fail-closed.
+      const res = await fire("tool_call", {
+        toolName: "bash",
+        input: { command: "gh pr merge 99999997 --repo nonexistent/repo" },
+      });
+      ok(res && res.block === true, "task sub-agent merge must be blocked without a review record");
+      ok((res.reason as string).includes("does NOT unlock sub-agent merges"), "block reason must be the #285 shape");
+      const blockLines = readAuditLines(auditLogPath()).filter((l) => l.event === "merge_gate_block");
+      equal(blockLines.length, 1);
+      equal(blockLines[0].reason, "no_review_record");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("task sub-agent gh pr merge WITH clean record + matching head → allowed (P1-2b)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    const pr = 99999996;
+    const head = "b".repeat(40);
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(reviews, { recursive: true });
+    fs.writeFileSync(resolvePath(reviews, `${pr}.json`), JSON.stringify({ pr, head_sha: head, verdict: "clean" }));
+    _setRunGhOverride(() => head);
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
+      equal(res, undefined, "clean record + matching head → merge allowed in the task sub-agent");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("task sub-agent in-band [VGATE] dispatch produces NO review_dispatch record (P2 tool_result noise)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const captured: string[] = [];
+      const origLog = console.log;
+      console.log = ((msg: string, ...rest: unknown[]) => { captured.push(String(msg)); origLog(msg, ...rest); }) as typeof console.log;
+      try {
+        await fire("tool_result", { toolName: "task" });
+        await fire("tool_result", { toolName: "task" });
+      } finally {
+        console.log = origLog;
+      }
+      ok(!captured.some((l) => l.includes("Reviewer dispatch counted")), "no dispatch-counted line for the task sub-agent");
+      ok(!readAuditLines(auditLogPath()).some((l) => l.event === "review_dispatch"), "no review_dispatch audit record");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("interactive bypass unchanged — gh pr merge also ungated (escape hatch preserved)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const lines = readAuditLines(auditLogPath());
+      equal(lines[0].event, "gate_bypass", "interactive bypass still audits gate_bypass/escape_hatch");
+      const commit = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+      equal(commit, undefined);
+      const merge = await fire("tool_call", { toolName: "bash", input: { command: "gh pr merge 99999995" } });
+      equal(merge, undefined, "interactive escape hatch must bypass the merge gate too (full bypass unchanged)");
+    } finally {
+      delete process.env.AGENT_SKIP_REVIEW_GATE;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
   });
 });
