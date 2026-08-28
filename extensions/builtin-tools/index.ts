@@ -672,8 +672,10 @@ export const DEFAULT_MAX_DISPATCH_MS = 0;
 // If neither the child's close event nor a heartbeat kill resolves the
 // promise (unreapable process, dead task call), the cap force-kills the tree
 // and resolves with partial results + a cut reason instead of blocking the
-// parent indefinitely (observed ~6h blocks on dead task calls). Default 2h —
-// generous for full ceremonies, far below the observed unbounded waits.
+// parent indefinitely (observed ~6h blocks on dead task calls). Default 6h —
+// generous for full pipeline ceremonies, far below the observed unbounded
+// waits; the detector-dead backstop (TASK_BACKSTOP_MS) still bounds
+// frozen-agent hangs.
 export const DEFAULT_HARD_CAP_MS = 21_600_000; // 6h (was 2h, #363): full-pipeline sub-agent runs (scope→verify→plan→implement→review) exceed 2h; 2h killed mid-pipeline workers. Env-overridable (TASK_HARD_CAP_MS, 60s floor).
 export function getTaskHardCapMs(): number {
   return Math.max(60_000, Number(process.env.TASK_HARD_CAP_MS) || DEFAULT_HARD_CAP_MS);
@@ -942,7 +944,9 @@ export function parseHeartbeatLine(
       // clause 1 (tool-stall) requires toolsInFlight>0, and after tool_end the
       // only way to regain it is a real tool_start (post turn_start's reset);
       // a same-turn sequential tool inheriting a frozen tool_age is safe under
-      // the 6h default hard cap (a false tool-stall needs a >18h frozen age).
+      // the 6h default hard cap (a false tool-stall needs a >6h frozen age —
+      // reachable only at the ~6h hard-cap boundary, so a healthy agent is
+      // never killed early; the tool-stall bound itself is unchanged at 6h).
       state.streamAgeMs = 0;
       break;
     case "turn_start":
@@ -1553,7 +1557,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // #208: bounded parent wait — if neither close nor a heartbeat kill
     // resolves within the hard cap (dead task call), force-kill the tree and
     // resolve with partial results + a cut reason. Fail fast, resumably.
-    // #271 verifier P2: on default config the hard cap (2h, NOT
+    // #271 verifier P2: on default config the hard cap (6h, NOT
     // stateFresh-gated) IS the detector-dead last resort; the #271 backstop
     // engages only when env-overridden below it. Both carry the same
     // retryability contract — resolveUndefined = !hasOutput — so a
@@ -1856,7 +1860,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // dispatch cap: fires ONLY when stateFresh === false at expiry; a healthy
     // ticking agent (stateFresh true) re-arms for another interval (F2).
     // TASK_BACKSTOP_MS overrides; 0 = off (deliberate unbounded-wait config).
-    // PRECEDENCE (verifier P2): on defaults the #221 hard cap (2h, NOT
+    // PRECEDENCE (verifier P2): on defaults the #221 hard cap (6h, NOT
     // stateFresh-gated) fires first — the backstop engages only when
     // env-overridden below the hard cap.
     const backstopMs = getTaskBackstopMs();
