@@ -503,6 +503,10 @@ export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd
     // workTreeHint-REQUIRED: `--git-dir` ALONE (work-tree defaults to cwd = hub)
     // stages HUB files into the wt index — cross-contamination — and must NOT
     // fire (structural by BOTH-hints).
+    // wtHintInside & the mismatch guard below share wtHintReal → mutually exclusive
+    // by construction: the signal fires only when workTreeHint is INSIDE the wt, the
+    // guard returns isWorktree:false when it's OUTSIDE, and the branch probe is gated
+    // after the mismatch return — `inside` never leaks into the probe for mismatch cases.
     const wtHintInside = !!(inv.gitDirHint && inv.workTreeHint) &&
       wtHintReal !== null &&
       (wtHintReal === worktreePath || wtHintReal.startsWith(worktreePath + "/"));

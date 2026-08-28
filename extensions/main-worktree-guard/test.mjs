@@ -829,6 +829,7 @@ try {
   m4t("T129: SUBDIR work-tree both-flags → allowed (prefix containment)", `git --git-dir="${wtR}/.git" --work-tree="${wtR}/subdir" add -A`, "allowed");
   m4t("T130: CROSS-wt mismatch (wt gitdir + nested-wt work-tree) → block", `git --git-dir="${wtR}/.git" --work-tree="${hubR}/.worktrees/n" add -A`, "block");
   m4t("T130b: wt gitdir + HUB work-tree mismatch → block", `git --git-dir="${wtR}/.git" --work-tree="${hubR}" add -A`, "block");
+  m4t("T131b: HUB both-flags (hub gitdir + hub work-tree) → block (never in map)", `git --git-dir="${hubR}/.git" --work-tree="${hubR}" add -A`, "block");
   m4t("T133: SPACE-SEPARATED both-flags → allowed (walker 2nd extraction path)", `git --git-dir "${wtR}/.git" --work-tree "${wtR}" add -A`, "allowed");
   // #355 probe-identity pin: the cwd-independent branch probe (explicit
   // --git-dir=<admin>) must equal the cwd-scoped probe value for a cwd-contained
