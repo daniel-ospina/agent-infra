@@ -673,9 +673,10 @@ export const DEFAULT_MAX_DISPATCH_MS = 0;
 // promise (unreapable process, dead task call), the cap force-kills the tree
 // and resolves with partial results + a cut reason instead of blocking the
 // parent indefinitely (observed ~6h blocks on dead task calls). Default 6h —
-// generous for full pipeline ceremonies, far below the observed unbounded
-// waits; the detector-dead backstop (TASK_BACKSTOP_MS) still bounds
-// frozen-agent hangs.
+// generous for full pipeline ceremonies, at the observed worst-case boundary
+// (still deterministic partial results + cut reason instead of blocking; the
+// detector-dead backstop (TASK_BACKSTOP_MS) still bounds
+// frozen-agent hangs).
 export const DEFAULT_HARD_CAP_MS = 21_600_000; // 6h (was 2h, #363): full-pipeline sub-agent runs (scope→verify→plan→implement→review) exceed 2h; 2h killed mid-pipeline workers. Env-overridable (TASK_HARD_CAP_MS, 60s floor).
 export function getTaskHardCapMs(): number {
   return Math.max(60_000, Number(process.env.TASK_HARD_CAP_MS) || DEFAULT_HARD_CAP_MS);
