@@ -334,6 +334,25 @@ export function evaluateMergeGate(
     };
   }
   if (currentHead === null) {
+    // #285: FAIL-CLOSED for task sub-agents. The #138 fail-open — "never
+    // strand a cross-repo interactive merge" — exists for interactive
+    // sessions that can diagnose/resolve a gh failure themselves. A task
+    // sub-agent cannot: under the restricted-agent posture an unverifiable
+    // head must NOT merge silently. It escalates to the parent session, which
+    // runs the merge ceremony interactively (where fail-open still applies).
+    if (taskSubAgent) {
+      return {
+        status: "block",
+        reason: [
+          "✅ Review enforcement (merge registry) gate is working correctly.",
+          `❌ Could not verify head of PR #${pr} via gh (repo context: ${ctx.source}) — head verification is mandatory for sub-agent merges.`,
+          "   → The sub-agent cannot complete the merge ceremony here.",
+          "   → Return to the parent session: it records the review and runs the merge interactively.",
+          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+          "   → The #138 fail-open (merge without head verification) is interactive-only; sub-agent merges are fail-closed (#285).",
+        ].join("\n"),
+      };
+    }
     // Fail-open with a loud warning: transient gh errors (network etc.) or an
     // unresolvable repo must never strand a cross-repo merge — blocking is
     // exactly the bug #138 fixes. Tell the user how to make it resolvable.

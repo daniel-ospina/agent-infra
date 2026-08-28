@@ -709,6 +709,21 @@ test("interactive shape keeps the emergency escape-hatch line (unchanged)", () =
   ok((r as any).reason.includes("Emergency: set AGENT_SKIP_REVIEW_GATE"), "interactive shape unchanged");
 });
 
+test("task-sub-agent + unverifiable head → BLOCK with return-to-parent message (fail-closed)", () => {
+  const r = evaluateMergeGate(138, cleanRecord, null, { source: "record", repo: "owner/repo" }, true);
+  equal(r.status, "block");
+  const reason = (r as any).reason as string;
+  ok(reason.includes("Return to the parent session"), "block reason must direct the sub-agent back to the parent session for the merge ceremony");
+  ok(reason.includes("fail-closed (#285)"), "block reason must mark sub-agent merges fail-closed");
+  ok(!reason.includes("WITHOUT head verification"), "no fail-open warning for task sub-agents");
+});
+
+test("interactive + unverifiable head → failopen (unchanged, #138)", () => {
+  const r = evaluateMergeGate(138, cleanRecord, null, { source: "record", repo: "owner/repo" });
+  equal(r.status, "failopen");
+  ok((r as any).warning.includes("WITHOUT head verification"), "interactive fail-open behavior unchanged");
+});
+
 test("#285 drift guard: isTaskSubAgent reads the marker pair the dispatchers force", () => {
   const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8");
   ok(
@@ -797,6 +812,39 @@ testAsync("task sub-agent gh pr merge WITH clean record + matching head → allo
       await fire("session_start");
       const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
       equal(res, undefined, "clean record + matching head → merge allowed in the task sub-agent");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("task sub-agent: gh head-lookup failure → merge BLOCKED with return-to-parent reason (fail-closed wiring)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    const pr = 99999994;
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(reviews, { recursive: true });
+    // Clean record exists — the ONLY thing missing is head verification
+    // (gh fails), which must now block the task sub-agent (was failopen).
+    fs.writeFileSync(resolvePath(reviews, `${pr}.json`), JSON.stringify({ pr, head_sha: "d".repeat(40), verdict: "clean" }));
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
+      ok(res && res.block === true, "task sub-agent merge must be BLOCKED when the head cannot be verified (fail-closed)");
+      ok((res.reason as string).includes("Return to the parent session"), "block reason must direct the sub-agent back to the parent session");
+      const blockLines = readAuditLines(auditLogPath()).filter((l) => l.event === "merge_gate_block");
+      equal(blockLines.length, 1, "one merge_gate_block audit entry");
     } finally {
       _setRunGhOverride(null);
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
