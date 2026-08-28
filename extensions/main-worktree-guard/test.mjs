@@ -717,6 +717,10 @@ try {
   m4t("T3b: boundary-separated $VAR cd (real shell state) → allowed", `WT="${wtR}" && cd "$WT" && git commit -m x`, "allowed");
   m4t("T4: unresolvable $VAR", `cd $UNRESOLVED_WT && git commit -m x`, "block");
   m4t("T5: hub commit (main never in map)", `git commit -m x`, "block");
+  // #349 mandate (c): hub-targeted `git add -A` WITHOUT a cd has no worktree
+  // target — the exemption must NOT fire (the worktree map never contains the
+  // hub; empty cdChain → effectiveCwd = sessionCwd = hub → isWorktree:false).
+  m4t("T5a: hub git add -A (no cd) — no exemption without a worktree target", `git add -A`, "block");
   m4t("T6: hub reset", `git -C "${hubR}" reset --hard`, "block");
   m4t("T7: P1 mixed compound", `cd "${wtR}" && git commit && git -C "${hubR}" reset --hard`, "block");
   m4t("T8: same-verb compound", `git -C "${wtR}" commit -m a && git -C "${hubR}" commit -m b`, "block");
