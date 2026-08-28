@@ -7,10 +7,10 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
-import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -1237,6 +1237,53 @@ test("post-PASS edit flips the recorded hash (fail-closed re-block)", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ── #285 — task-tool-aware sub-agent block message + drift guard ──
+
+section("buildSubAgentBlockMessage — task-tool-aware (#285 P1-A)");
+
+test("task-capable (default argv): in-band self-dispatch instruction kept", () => {
+  const msg = buildSubAgentBlockMessage(["  Unverified files:"], "/repo", ["a.ts"]);
+  ok(msg.includes("This session is a task sub-agent"), "carries the sub-agent marker");
+  ok(/Dispatch your own VGATE verification/.test(msg), "in-band self-dispatch instruction");
+  ok(!/STOP — this block is final/.test(msg), "no final-block phrasing for task-capable");
+});
+
+test("task-restricted (--tools allowlist without task): return-to-parent instruction", () => {
+  const msg = buildSubAgentBlockMessage(["  Unverified files:"], "/repo", ["a.ts"], ["pi", "-p", "--tools", "read,bash,edit,write"]);
+  ok(/STOP — this block is final; do not bypass; return to the parent\s+session/.test(msg), "final-block return-to-parent instruction");
+  ok(!/Dispatch your own VGATE verification/.test(msg), "no in-band self-dispatch for restricted agents");
+  ok(!/This session has the task tool/.test(msg), "must not claim the task tool");
+});
+
+test("--tools with task ∈ allowlist → task-capable", () => {
+  const msg = buildSubAgentBlockMessage([], "/repo", ["a.ts"], ["pi", "-p", "--tools", "read,bash,edit,write,task"]);
+  ok(/Dispatch your own VGATE verification/.test(msg));
+});
+
+test("--exclude-tools task → restricted", () => {
+  const msg = buildSubAgentBlockMessage([], "/repo", ["a.ts"], ["pi", "-p", "--exclude-tools", "task"]);
+  ok(/STOP — this block is final/.test(msg));
+});
+
+test("--no-tools → restricted", () => {
+  const msg = buildSubAgentBlockMessage([], "/repo", ["a.ts"], ["pi", "-p", "--no-tools"]);
+  ok(/STOP — this block is final/.test(msg));
+});
+
+test("block reason lines are diff-scoped exactly like the inline text (reasons + file list)", () => {
+  const msg = buildSubAgentBlockMessage(["  Unverified files:", "    - x.ts"], "/repo", ["x.ts"]);
+  ok(msg.includes("- x.ts"), "reasons preserved");
+  ok(/verify files: x\.ts/.test(msg), "blocked files named in the dispatch template");
+});
+
+test("#285 drift guard: isTaskSubAgent reads the marker pair the dispatchers force", () => {
+  const src = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  ok(
+    src.includes('env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print"'),
+    "verification-gate isTaskSubAgent must read TASK_HEARTBEAT=1 ∧ PI_MODE=print (same pair as review-enforcer / task-heartbeat)"
+  );
 });
 
 // ── Results ───────────────────────────────────────────

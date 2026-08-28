@@ -40,10 +40,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate skill YAML frontmatter
         run: |
+          # #254 — fail-closed flip (D9): the frontmatter validator is a
+          # required gate. A missing script is a broken gate, not a skip.
           if [ -f scripts/check-skill-lint.mjs ]; then
             node scripts/check-skill-lint.mjs
           else
-            echo "⚠️  scripts/check-skill-lint.mjs not found — skipping"
+            echo "❌ scripts/check-skill-lint.mjs not found — missing required gate, FAILING (#254)"
+            exit 1
           fi
 
   typecheck:

@@ -8,7 +8,7 @@
 # dir — never touches the real ~/Library/LaunchAgents or real launchd.
 #
 # Coverage (issue #304 test plan):
-#   fresh-HOME simulation  both jobs installed with substituted paths
+#   fresh-HOME simulation  all jobs installed with substituted paths
 #   render determinism     same env → byte-identical output
 #   idempotent skip        second run: "unchanged", no bootout/bootstrap
 #   change → reload        template bump → reinstall + one new bootstrap
@@ -117,8 +117,14 @@ assert_contains "$(cat "$CANARY_INSTALLED")" "$HOME1/swarm/.venv/bin/python" "ca
 assert_contains "$(cat "$CANARY_INSTALLED")" "--root" "canary plist keeps --root"
 assert_contains "$(cat "$CANARY_INSTALLED")" "agent-infra-plist-version: 0.1.0" "canary template carries version marker"
 assert_contains "$(cat "$HUB_INSTALLED")" "agent-infra-plist-version: 0.1.0" "hub template carries version marker"
+# #254 Task 10 drift-watch — the oracle plist is a third template job; it is
+# installed on every machine (only {{AGENT_INFRA_PATH}} — always resolved).
+ORACLE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
+assert_contains "$OUT" "com.eldato.skill-lint-oracle: installed + loaded" "skill-lint-oracle installed on fresh machine"
+assert_contains "$(cat "$ORACLE_INSTALLED")" "cron-quality-gates.sh" "oracle plist rendered with AGENT_INFRA_PATH"
+assert_contains "$(cat "$ORACLE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "oracle template carries version marker"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "2" "fresh install bootstraps both jobs"
+assert_eq "$BOOTSTRAP_COUNT1" "3" "fresh install bootstraps all jobs"
 
 echo "── 2. Render determinism ─────────────────────────────────────────"
 # Direct byte-identity check: two renders of the same template with the same

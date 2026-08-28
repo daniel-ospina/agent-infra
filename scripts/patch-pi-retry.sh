@@ -48,6 +48,33 @@ INFRA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CAP_MS="${PI_MAX_RETRY_DELAY_MS:-300000}"
 MARKER="agent-infra offline-resume patch"
 
+# #254 drift-watch precondition (Task 10): pi version change without a
+# successful oracle re-probe is a LOUD FAILURE. The frontmatter validator's
+# committed fixture records (frontmatter-fixtures.mjs PI_VERSION_PIN) are
+# pinned to the installed pi version — a pi bump invalidates them until the
+# probe re-derives them (scripts/probe-frontmatter-fixtures.mjs --write) and
+# the oracle re-verifies (scripts/check-skill-lint.oracle.test.mjs).
+check_oracle_reprobe_precondition() {
+  [ -f "$INFRA_ROOT/scripts/frontmatter-fixtures.mjs" ] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  [ -n "${PI_PKG:-}" ] && [ -f "$PI_PKG/dist/bundle/index.js" ] || return 0
+  local pin live last_run age
+  pin="$(node -e "import('$INFRA_ROOT/scripts/frontmatter-fixtures.mjs').then(m=>console.log(m.PI_VERSION_PIN))" 2>/dev/null || true)"
+  [ -n "$pin" ] || return 0
+  live="$(node -e "import('$PI_PKG/dist/bundle/index.js').then(m=>console.log(m.VERSION))" 2>/dev/null || true)"
+  [ -n "$live" ] && [ "$pin" != "$live" ] || return 0
+  last_run="$(cat "$INFRA_ROOT/.last-oracle-run" 2>/dev/null || echo 0)"
+  age=$(( ($(date +%s) - last_run) / 86400 ))
+  if [ "$age" -gt 1 ]; then
+    echo "❌ pi version $live != validator pin $pin and the oracle has NOT re-probed recently (${age}d) —" >&2
+    echo "   run: node scripts/probe-frontmatter-fixtures.mjs --write (re-derive fixture records)" >&2
+    echo "   then: node scripts/check-skill-lint.oracle.test.mjs (verify) before touching pi (#254)" >&2
+    return 1
+  fi
+  echo "⚠️  pi version $live != pin $pin but the oracle re-probed recently — fixture records are current, proceeding" >&2
+  return 0
+}
+
 # The cap is interpolated into the applied patch — validate it is a plain
 # number BEFORE use so a bad env value can never corrupt the patched dist.
 case "$CAP_MS" in
@@ -86,6 +113,12 @@ find_pi_pkg() {
 
 PI_PKG="$(find_pi_pkg || true)"
 PI_AI="${PI_PKG:+$PI_PKG/node_modules/@earendil-works/pi-ai}"
+
+# #254 drift-watch precondition — pi version drift without a recent oracle
+# re-probe blocks the patch path (never silently patch against stale pins).
+if [ "${1:-}" != "--check" ] && [ "${1:-}" != "--paths" ]; then
+  check_oracle_reprobe_precondition || exit 1
+fi
 
 # The capped code line for THIS cap — the already-patched and verification
 # checks are cap-aware single-line greps (a multi-line grep pattern would

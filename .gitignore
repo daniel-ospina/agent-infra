@@ -22,3 +22,6 @@ tmp/
 # drift-check test fixtures — the version pin is test state, never committed
 # (tests/drift/run.sh writes it; consumers commit their own real pins)
 tests/fixtures/drift/*/.agent-infra-version
+
+# #254 — oracle drift-lock runtime timestamp (dev-machine cron state)
+.last-oracle-run

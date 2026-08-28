@@ -672,9 +672,12 @@ export const DEFAULT_MAX_DISPATCH_MS = 0;
 // If neither the child's close event nor a heartbeat kill resolves the
 // promise (unreapable process, dead task call), the cap force-kills the tree
 // and resolves with partial results + a cut reason instead of blocking the
-// parent indefinitely (observed ~6h blocks on dead task calls). Default 2h —
-// generous for full ceremonies, far below the observed unbounded waits.
-export const DEFAULT_HARD_CAP_MS = 7_200_000;
+// parent indefinitely (observed ~6h blocks on dead task calls). Default 6h —
+// generous for full pipeline ceremonies, at the observed worst-case boundary
+// (still deterministic partial results + cut reason instead of blocking; the
+// detector-dead backstop (TASK_BACKSTOP_MS) still bounds
+// frozen-agent hangs).
+export const DEFAULT_HARD_CAP_MS = 21_600_000; // 6h (was 2h, #363): full-pipeline sub-agent runs (scope→verify→plan→implement→review) exceed 2h; 2h killed mid-pipeline workers. Env-overridable (TASK_HARD_CAP_MS, 60s floor).
 export function getTaskHardCapMs(): number {
   return Math.max(60_000, Number(process.env.TASK_HARD_CAP_MS) || DEFAULT_HARD_CAP_MS);
 }
@@ -700,7 +703,7 @@ export function getCutGapMs(): number {
 //
 // The parent await is bounded by four layers (D4): exit-settle (≤ ~2s after
 // child death), the "cut" clause (~37.5s for the frozen-marker wedged class),
-// the #221 hard cap (2h default — the DEFAULT detector-dead last resort, NOT
+// the #221 hard cap (6h default — the DEFAULT detector-dead last resort, NOT
 // stateFresh-gated), and this backstop — tool-stall + 30min (6h30m) as the
 // detector-dead bound when env-overridden below the hard cap. The backstop
 // fires ONLY when stateFresh === false at expiry (healthy ticking agents are
@@ -942,7 +945,9 @@ export function parseHeartbeatLine(
       // clause 1 (tool-stall) requires toolsInFlight>0, and after tool_end the
       // only way to regain it is a real tool_start (post turn_start's reset);
       // a same-turn sequential tool inheriting a frozen tool_age is safe under
-      // the 2h default hard cap (a false tool-stall needs a >6h frozen age).
+      // the 6h default hard cap (a false tool-stall needs a >6h frozen age —
+      // reachable only at the ~6h hard-cap boundary, so a healthy agent is
+      // never killed early; the tool-stall bound itself is unchanged at 6h).
       state.streamAgeMs = 0;
       break;
     case "turn_start":
@@ -1553,7 +1558,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // #208: bounded parent wait — if neither close nor a heartbeat kill
     // resolves within the hard cap (dead task call), force-kill the tree and
     // resolve with partial results + a cut reason. Fail fast, resumably.
-    // #271 verifier P2: on default config the hard cap (2h, NOT
+    // #271 verifier P2: on default config the hard cap (6h, NOT
     // stateFresh-gated) IS the detector-dead last resort; the #271 backstop
     // engages only when env-overridden below it. Both carry the same
     // retryability contract — resolveUndefined = !hasOutput — so a
@@ -1856,7 +1861,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // dispatch cap: fires ONLY when stateFresh === false at expiry; a healthy
     // ticking agent (stateFresh true) re-arms for another interval (F2).
     // TASK_BACKSTOP_MS overrides; 0 = off (deliberate unbounded-wait config).
-    // PRECEDENCE (verifier P2): on defaults the #221 hard cap (2h, NOT
+    // PRECEDENCE (verifier P2): on defaults the #221 hard cap (6h, NOT
     // stateFresh-gated) fires first — the backstop engages only when
     // env-overridden below the hard cap.
     const backstopMs = getTaskBackstopMs();
@@ -2326,6 +2331,16 @@ export default function (pi: ExtensionAPI) {
                                  // sub-agents don't run the parent's review
                                  // ceremony; the parent dispatches reviewers.
 };
+  // #285: key-specific strip of review-gate bypass env inherited from the
+  // parent launch env (swarm_daemon sets the skip vars — see the #285-F1
+  // swarm follow-up); the ...process.env spread above would otherwise leak
+  // them into every task child, silently defeating the #825 contract
+  // ("VGATE stays ACTIVE for sub-agents"). Key-specific ONLY:
+  // AGENT_SKIP_REVIEW_GATE stays forced to "1" (#825) and the
+  // ALLOW_MAIN_EDITS branch-ownership variants (#7470/#7549) must survive —
+  // never a prefix sweep.
+  delete subAgentEnv.ELDATO_SKIP_VGATE;
+  delete subAgentEnv.ELDATO_SKIP_REVIEW_GATE;
 // #265/#825 resolution: sub-agents DO get the hatch (verified-file registry
 // bridge, #825) — the branch-ownership guard (M1/M2/M3) is the layer that
 // protects the shared checkout, not env removal.

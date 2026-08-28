@@ -66,6 +66,46 @@ export function isPrintMode(
   return argvHasPrintFlag(argv);
 }
 
+/**
+ * #285 P1-A: task-tool capability from argv — is `task` in the session's tool
+ * allowlist? The subagent tool passes agent.tools.join(",") as the --tools
+ * value (extensions/subagent/index.ts); a MISSING --tools flag means the
+ * default toolset, which includes task. Value-taking-flag aware (mirrors
+ * argvHasPrintFlag): a token following --tools/-t is that flag's VALUE, never
+ * a flag. --exclude-tools containing task, or --no-tools, → restricted.
+ * Env/argv param seam for deterministic e2e (the verification-gate harness's
+ * process.argv has no --tools, so scenarios inject one explicitly).
+ */
+export function argvAllowsTask(argv: string[] = process.argv): boolean {
+  for (let i = 1; i < argv.length; i++) {
+    const tok = argv[i];
+    if (tok === "--tools" || tok === "-t") {
+      const value = argv[i + 1];
+      if (value === undefined) return false; // dangling flag — fail-closed
+      return value.split(",").map((s) => s.trim()).includes("task");
+    }
+    if (tok.startsWith("--tools=")) {
+      return tok.slice("--tools=".length).split(",").map((s) => s.trim()).includes("task");
+    }
+    if (tok === "--exclude-tools" || tok === "-xt") {
+      const value = argv[i + 1];
+      if (value !== undefined && value.split(",").map((s) => s.trim()).includes("task")) {
+        return false; // task explicitly excluded
+      }
+    } else if (tok.startsWith("--exclude-tools=")) {
+      if (tok.slice("--exclude-tools=".length).split(",").map((s) => s.trim()).includes("task")) {
+        return false;
+      }
+    }
+    if (tok === "--no-tools") return false;
+    if (VALUE_TAKING_FLAGS.has(tok)) {
+      i++; // skip the flag's value
+      continue;
+    }
+  }
+  return true; // no --tools flag → default toolset includes task
+}
+
 /** Env-only variant — for semantic mode decisions (see header #201 note). */
 export function isPrintModeEnv(
   env: Record<string, string | undefined> = process.env,

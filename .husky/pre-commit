@@ -37,6 +37,13 @@ check_version() {
 
 check_version
 
+# #254 Task 0 — authoring-time frontmatter gate for staged SKILL.md files
+# (pi's real loader; throws/drop-via-description/BOM). SKIPs visibly when pi
+# is not installed — a missing local pi must not block commits.
+if command -v node >/dev/null 2>&1 && [ -f scripts/check-staged-skill-frontmatter.mjs ]; then
+  node scripts/check-staged-skill-frontmatter.mjs || exit 1
+fi
+
 # Only run lint-staged if this is a Node.js project (has package.json)
 if [ -f package.json ] && command -v npx >/dev/null 2>&1; then
   npx lint-staged
