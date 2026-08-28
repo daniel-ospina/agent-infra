@@ -17,7 +17,7 @@
           "cacheRead": 0.0028,
           "cacheWrite": 0
         },
-        "contextWindow": 1000000,
+        "contextWindow": 400000,
         "maxTokens": 384000,
         "compat": {
           "supportsStore": false,
@@ -28,6 +28,40 @@
         "thinkingLevelMap": {
           "minimal": null,
           "low": null,
+          "medium": null,
+          "high": "high",
+          "max": "max"
+        }
+      },
+      {
+        "id": "deepseek-v4-flash-vision-exp",
+        "name": "DeepSeek V4 Flash Vision Exp",
+        "api": "openai-completions",
+        "baseUrl": "https://api.deepseek.com",
+        "provider": "deepseek",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 0.14,
+          "output": 0.28,
+          "cacheRead": 0.0028,
+          "cacheWrite": 0
+        },
+        "contextWindow": 400000,
+        "maxTokens": 384000,
+        "compat": {
+          "supportsStore": false,
+          "supportsDeveloperRole": false,
+          "maxTokensField": "max_tokens",
+          "requiresReasoningContentOnAssistantMessages": true,
+          "thinkingFormat": "deepseek"
+        },
+        "thinkingLevelMap": {
+          "minimal": null,
+          "low": "low",
           "medium": null,
           "high": "high",
           "max": "max"
@@ -49,7 +83,7 @@
           "cacheRead": 0.003625,
           "cacheWrite": 0
         },
-        "contextWindow": 1000000,
+        "contextWindow": 400000,
         "maxTokens": 384000,
         "compat": {
           "supportsStore": false,
@@ -66,7 +100,7 @@
         }
       }
     ],
-    "checkedAt": 1786028403985,
+    "checkedAt": 1787934826000,
     "lastModified": 1785502707000,
     "etag": "W/\"15596aeadbdb5757401fcd2de812dcda\""
   },
@@ -1165,7 +1199,7 @@
           "cacheRead": 0.01764,
           "cacheWrite": 0
         },
-        "contextWindow": 1048576,
+        "contextWindow": 400000,
         "maxTokens": 131072,
         "compat": {
           "supportsDeveloperRole": false,
@@ -1197,7 +1231,7 @@
           "cacheRead": 0.018,
           "cacheWrite": 0
         },
-        "contextWindow": 1048576,
+        "contextWindow": 400000,
         "maxTokens": 65536,
         "compat": {
           "supportsDeveloperRole": false,
@@ -1229,7 +1263,7 @@
           "cacheRead": 0.003625,
           "cacheWrite": 0
         },
-        "contextWindow": 1048576,
+        "contextWindow": 400000,
         "maxTokens": 384000,
         "compat": {
           "supportsDeveloperRole": false,
@@ -6512,7 +6546,7 @@
           "cacheRead": 0.018,
           "cacheWrite": 0
         },
-        "contextWindow": 1048576,
+        "contextWindow": 400000,
         "maxTokens": 65536,
         "compat": {
           "supportsDeveloperRole": false,
@@ -6673,7 +6707,7 @@
         }
       }
     ],
-    "checkedAt": 1786028403686,
+    "checkedAt": 1787934826000,
     "lastModified": 1786021119000,
     "etag": "W/\"986113d19c165b543435448193641f78\""
   },
@@ -7016,7 +7050,7 @@
         }
       }
     ],
-    "checkedAt": 1786027811630,
+    "checkedAt": 1787934826000,
     "lastModified": 1786021090000,
     "etag": "W/\"2174ed7392c0d5376beba2c4ee0b170f\""
   },
@@ -7315,7 +7349,7 @@
         }
       }
     ],
-    "checkedAt": 1785991398116,
+    "checkedAt": 1787934826000,
     "lastModified": 1785502723000,
     "etag": "W/\"b6bb22c1d1f7ad7ef58529c125535a4d\""
   },
@@ -7614,7 +7648,7 @@
         }
       }
     ],
-    "checkedAt": 1786027811628,
+    "checkedAt": 1787934826000,
     "lastModified": 1785502722000,
     "etag": "W/\"afb16fb1ea6c24c1a16a7acfcb4c5bea\""
   },
@@ -7736,7 +7770,7 @@
         "maxTokens": 131072
       }
     ],
-    "checkedAt": 1786027811625,
+    "checkedAt": 1787934826000,
     "lastModified": 1785760830000,
     "etag": "W/\"98c169c629803193583fc42e7311af91\""
   },
@@ -8656,7 +8690,7 @@
         "maxTokens": 131072
       }
     ],
-    "checkedAt": 1786027811613,
+    "checkedAt": 1787934826000,
     "lastModified": 1785760812000,
     "etag": "W/\"bfdd70cee2b1e644efa969c8774173f9\""
   },
@@ -8742,7 +8776,7 @@
           "cacheRead": 0,
           "cacheWrite": 0
         },
-        "contextWindow": 1000000,
+        "contextWindow": 400000,
         "maxTokens": 384000
       },
       {
@@ -8775,7 +8809,7 @@
           "cacheRead": 0,
           "cacheWrite": 0
         },
-        "contextWindow": 1000000,
+        "contextWindow": 400000,
         "maxTokens": 384000
       },
       {
@@ -8808,7 +8842,7 @@
           "cacheRead": 0,
           "cacheWrite": 0
         },
-        "contextWindow": 1000000,
+        "contextWindow": 400000,
         "maxTokens": 384000
       },
       {
@@ -9126,7 +9160,7 @@
         "maxTokens": 131072
       }
     ],
-    "checkedAt": 1786027811506,
+    "checkedAt": 1787934826000,
     "lastModified": 1786021121000,
     "etag": "W/\"74f5486135bda241d6efc1d458dcc0e9\""
   }

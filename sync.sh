@@ -31,4 +31,15 @@ if [[ "$(uname)" == "Darwin" ]] && [ -x ./scripts/install-launchd.sh ]; then
   bash ./scripts/install-launchd.sh
 fi
 
+# #341 — cost-config drift guard, LIVE pass (runs after setup.sh, which just
+# re-applied the shipped clamp). BLOCKs on models.json/settings.json drift
+# (the config authority — a live 1M session means ~50x cold re-ingestion);
+# WARNs on models-store.json drift (the 4h pi.dev refresh may legitimately
+# revert the store — detected here, alerted by the weekly report + tripwire,
+# never a sync-fatal). COST_CLAMP_OVERRIDE=1 is the documented rollback escape.
+if [ -x ./scripts/check-cost-config.sh ]; then
+  echo "==> cost-config guard (live pass)"
+  bash ./scripts/check-cost-config.sh
+fi
+
 echo "==> sync complete ✅"
