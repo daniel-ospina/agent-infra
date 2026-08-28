@@ -10,7 +10,7 @@
     "keepRecentTokens": 20000
   },
   "retry": {
-    "maxRetries": 10000,
+    "maxRetries": 5,
     "baseDelayMs": 2000,
     "provider": {
       "timeoutMs": 600000

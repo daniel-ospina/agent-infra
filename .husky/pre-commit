@@ -44,6 +44,13 @@ if command -v node >/dev/null 2>&1 && [ -f scripts/check-staged-skill-frontmatte
   node scripts/check-staged-skill-frontmatter.mjs || exit 1
 fi
 
+# #341 — cost-config drift guard (shipped configs only; the live pass runs at
+# sync.sh). Blocks commits that revert the deepseek clamp or the settings
+# compaction/retry contract.
+if [ -f scripts/check-cost-config.sh ]; then
+  bash scripts/check-cost-config.sh --shipped-only || exit 1
+fi
+
 # Only run lint-staged if this is a Node.js project (has package.json)
 if [ -f package.json ] && command -v npx >/dev/null 2>&1; then
   npx lint-staged

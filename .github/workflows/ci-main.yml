@@ -94,9 +94,21 @@ jobs:
         run: |
           node scripts/check-skill-lint.mjs --skills-dir skills
 
+  cost-config-guard:
+    # #341 — post-merge re-check of the deepseek context clamp @400K on shipped
+    # configs (models.json + models-store.json + settings.json contract).
+    # Shipped-only: the live pass runs at sync.sh; catalog-store drift is
+    # DETECTED (warn) not blocked — the 4h pi.dev refresh may legitimately
+    # revert the store, and the weekly report + tripwire are the alert path.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cost-config guard (shipped, --shipped-only)
+        run: bash scripts/check-cost-config.sh --shipped-only
+
   auto-file-on-failure:
     runs-on: ubuntu-latest
-    needs: [extension-tests, script-validate, skill-lint]
+    needs: [extension-tests, script-validate, skill-lint, cost-config-guard]
     if: failure()
     steps:
       - uses: actions/github-script@v7

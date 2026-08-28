@@ -27,3 +27,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Drift-check tests (tiered exits, fixtures, workflow YAML)
         run: bash tests/drift/run.sh
+
+  cost-config:
+    # #341 — cost-config drift guard (config clamp @400K): asserts the shipped
+    # deepseek context clamp + settings compaction/retry contract, then runs
+    # the fixture suite (backdoor drift blocks/warns, clean 400K passes,
+    # override honored). Shipped-only — CI has no live ~/.pi/agent.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cost-config guard (shipped, --shipped-only)
+        run: bash scripts/check-cost-config.sh --shipped-only
+      - name: Cost-config guard tests (fixtures, detect-not-block semantics)
+        run: bash tests/cost-config/run.sh
