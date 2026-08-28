@@ -430,6 +430,20 @@ export const worktreeGitdirMap = _worktreeGitdirMap;
  * is the checked-out branch of a resolved worktree (used by the shared-ref
  * verb gate — the push carve-out must re-derive from the worktree's HEAD, not
  * the hub's, code-review #4).
+ * #355: containment is now git's EFFECTIVE-TARGET semantics, not just cwd:
+ * `gitDirHint` resolving to a mapped worktree's gitdir AND `workTreeHint`
+ * resolving inside that worktree is a POSITIVE signal (isWorktree: true even
+ * with effectiveCwd outside the worktreePath) — `git --git-dir=<wt>/.git
+ * --work-tree=<wt> <verb>` fully determines git's repo + work-tree and is
+ * byte-equivalent to the exempted `-C <wt>` form. `--git-dir` ALONE stays
+ * blocked (work-tree defaults to cwd = hub → cross-contamination; the signal
+ * is workTreeHint-REQUIRED by construction). Consumers evaluateHubGateWithTargets
+ * (M4) and scriptGitVerdict read only isWorktree/worktreeBranch; effectiveCwd
+ * remains the walker-resolved cwd for all other cases. The branch probe is
+ * effective-target-aware (cwd-independent): `git --git-dir=<gitDir> branch
+ * --show-current` reads the worktree's OWN HEAD from any cwd — a hub probe is
+ * structurally impossible (inside=true ⇒ gitDir is a mapped worktree's admin
+ * dir).
  * ⚠️ INPUT CONTRACT (#349): the fields resolveInvocationTarget READS are
  * ({cdChain, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint});
  * the full emitted allGitInvocations invocation shape also carries
@@ -476,12 +490,34 @@ export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd
     }
     const cwdReal = _realpathSafe(cwd);
     if (cwdReal === null) return null;
-    const inside = cwdReal === worktreePath || cwdReal.startsWith(worktreePath + "/");
-    // workTree mismatch guard: a work-tree hint pointing OUTSIDE the worktree
-    // means the invocation operates on a foreign working tree → not isolated.
+    // #355: workTreeHint realpath — computed ONCE, shared by the positive
+    // containment signal AND the mismatch guard (one realpath, both guards —
+    // they can never disagree at the realpath-normalization boundary).
+    const wtHintReal = inv.workTreeHint ? _realpathSafe(resolve(cwd, inv.workTreeHint)) : null;
+    // #355 positive containment signal: gitDirHint resolving to a mapped
+    // worktree's gitdir (map hit above ⇒ worktreePath !== null) AND workTreeHint
+    // resolving inside that worktree ⇒ git's effective target IS the worktree
+    // regardless of cwd. `git --git-dir=<wt>/.git --work-tree=<wt> <verb>` from
+    // the hub cwd is byte-equivalent to the exempted `git -C <wt> <verb>` (both
+    // operate on the wt index, zero hub interaction; probed on git 2.50.1).
+    // workTreeHint-REQUIRED: `--git-dir` ALONE (work-tree defaults to cwd = hub)
+    // stages HUB files into the wt index — cross-contamination — and must NOT
+    // fire (structural by BOTH-hints).
+    // wtHintInside & the mismatch guard below share wtHintReal → mutually exclusive
+    // by construction: the signal fires only when workTreeHint is INSIDE the wt, the
+    // guard returns isWorktree:false when it's OUTSIDE, and the branch probe is gated
+    // after the mismatch return — `inside` never leaks into the probe for mismatch cases.
+    const wtHintInside = !!(inv.gitDirHint && inv.workTreeHint) &&
+      wtHintReal !== null &&
+      (wtHintReal === worktreePath || wtHintReal.startsWith(worktreePath + "/"));
+    const inside = wtHintInside || cwdReal === worktreePath || cwdReal.startsWith(worktreePath + "/");
+    // workTree mismatch guard (unchanged semantics — shared wtHintReal): a
+    // work-tree hint pointing OUTSIDE the worktree means the invocation operates
+    // on a foreign working tree → not isolated. Mutually exclusive with
+    // wtHintInside by construction.
     if (inv.workTreeHint) {
-      const wt = _realpathSafe(resolve(cwd, inv.workTreeHint));
-      if (wt !== null && !(wt === worktreePath || wt.startsWith(worktreePath + "/"))) {
+      if (wtHintReal !== null &&
+          !(wtHintReal === worktreePath || wtHintReal.startsWith(worktreePath + "/"))) {
         return { effectiveCwd: cwd, gitDir, worktreePath, worktreeBranch: null, isWorktree: false };
       }
     }
@@ -505,11 +541,21 @@ export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd
     let worktreeBranch = null;
     if (inside) {
       try {
-        worktreeBranch = execSync("git branch --show-current", {
-          encoding: "utf-8", cwd, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+        // Cwd-INDEPENDENT probe (#355): --git-dir is a global option valid on
+        // `branch`. With the resolved admin dir (gitDir), the probe reads the
+        // WT's OWN HEAD from ANY cwd — inside=true ⇒ worktreePath !== null ⇒
+        // gitDir is a mapped worktree's admin dir, so a hub probe is
+        // structurally impossible. Value-identical to the old cwd-scoped probe
+        // for every cwd-contained case (gitfile resolution ≡ direct admin-dir
+        // read; the map's two-way validation guarantees wt/.git back-references
+        // this admin dir). Replaces the old probe 1:1 — zero extra spawn.
+        // Explicit --git-dir also beats ambient GIT_DIR env (CLI > env),
+        // fixing the old probe's latent mis-derivation (probe-verified).
+        worktreeBranch = execFileSync("git", ["--git-dir=" + gitDir, "branch", "--show-current"], {
+          encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
         }).trim() || null;
       } catch {
-        worktreeBranch = null;
+        worktreeBranch = null; // git read failure → conservative (unchanged)
       }
     }
     return { effectiveCwd: cwd, gitDir, worktreePath, worktreeBranch, isWorktree: inside };

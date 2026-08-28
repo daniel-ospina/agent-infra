@@ -816,6 +816,34 @@ try {
   } catch (e) {
     console.log(`⏭️ X6 skipped (could not provision newline-path worktree: ${String(e.message).slice(0, 60)})`);
   }
+  // ── Issue #355: --git-dir + --work-tree both-inside-wt = POSITIVE containment ──
+  // A hub-rooted invocation supplying BOTH --git-dir=<wt>/.git AND --work-tree=<wt>
+  // fully determines git's effective repo + work-tree (cwd becomes irrelevant):
+  // empirically byte-equivalent to the exempted `git -C <wt> add -A` (probe:
+  // stages wt-only.txt into the wt index, hub untouched). --git-dir ALONE must
+  // stay BLOCKED (work-tree defaults to cwd = hub → stages HUB files into the
+  // wt index — cross-contamination, probed). The signal requires BOTH hints.
+  m4t("T122: --git-dir + --work-tree both-in-wt add — THE FIX", `git --git-dir="${wtR}/.git" --work-tree="${wtR}" add -A`, "allowed");
+  m4t("T123: --git-dir ALONE from hub → block (cross-contamination)", `git --git-dir="${wtR}/.git" add -A`, "block");
+  m4t("T124: hub git-dir + wt work-tree mismatch → block", `git --git-dir="${hubR}/.git" --work-tree="${wtR}" add -A`, "block");
+  m4t("T125: RELATIVE both-flags from hub cwd → allowed", `git --git-dir="../wt/.git" --work-tree="../wt" add -A`, "allowed");
+  m4t("T126: env-form GIT_DIR+GIT_WORK_TREE both-in-wt → allowed", `GIT_DIR="${wtR}/.git" GIT_WORK_TREE="${wtR}" git add -A`, "allowed");
+  m4t("T127: admin-dir both-flags → allowed (gitfile-free gitdir)", `git --git-dir="${hubR}/.git/worktrees/wt" --work-tree="${wtR}" add -A`, "allowed");
+  m4t("T128: NESTED-wt both-flags (tortoise .worktrees geometry) → allowed", `git --git-dir="${hubR}/.worktrees/n/.git" --work-tree="${hubR}/.worktrees/n" add -A`, "allowed");
+  m4t("T129: SUBDIR work-tree both-flags → allowed (prefix containment)", `git --git-dir="${wtR}/.git" --work-tree="${wtR}/subdir" add -A`, "allowed");
+  m4t("T130: CROSS-wt mismatch (wt gitdir + nested-wt work-tree) → block", `git --git-dir="${wtR}/.git" --work-tree="${hubR}/.worktrees/n" add -A`, "block");
+  m4t("T130b: wt gitdir + HUB work-tree mismatch → block", `git --git-dir="${wtR}/.git" --work-tree="${hubR}" add -A`, "block");
+  m4t("T131b: HUB both-flags (hub gitdir + hub work-tree) → block (never in map)", `git --git-dir="${hubR}/.git" --work-tree="${hubR}" add -A`, "block");
+  m4t("T133: SPACE-SEPARATED both-flags → allowed (walker 2nd extraction path)", `git --git-dir "${wtR}/.git" --work-tree "${wtR}" add -A`, "allowed");
+  // #355 probe-identity pin: the cwd-independent branch probe (explicit
+  // --git-dir=<admin>) must equal the cwd-scoped probe value for a cwd-contained
+  // invocation — divergence would mean the fix changed an existing
+  // worktreeBranch value (verdict-affecting via main-protection).
+  const probeAdmin = execSync(`git --git-dir="${hubR}/.git/worktrees/wt" branch --show-current`, { encoding: "utf-8" }).trim();
+  const probeCwd = execSync(`cd "${wtR}" && git branch --show-current`, { encoding: "utf-8" }).trim();
+  const eqTgt = resolveInvocationTarget(allGitInvocations(`cd "${wtR}" && git commit -m x`)[0], hubR, hubR);
+  expectBool("T132: cwd-independent probe ≡ cwd-scoped probe (no existing value change)",
+    eqTgt?.worktreeBranch === probeCwd && probeAdmin === probeCwd, true);
   m4t("T35: failed-cd prefix stands", `cd "${wtR}" && cd /nonexistent && git commit -m x`, "allowed");
   // ── Code-review round-2 fixes: bash-faithful boundaries + shared-ref verbs ──
   m4t("T36: background & — cd does not leak to foreground", `cd "${wtR}" & git commit -m x`, "block");
@@ -951,6 +979,14 @@ try {
     m4m("M2b: wt checkout -B main (force) while hub off-main → blocked (round-4)", `cd "${mwt}" && git checkout -B main`, "block");
     m4m("M4: wt switch -C main while hub off-main → blocked (round-6)", `cd "${mwt}" && git switch -C main`, "block");
     m4m("M3: wt on feature branch → commit allowed", `cd "${mwt}" && git commit -m x`, "allowed");
+    // #355: wt-ON-MAIN both-flags from the hub — the SECURITY regression guard.
+    // Post-fix the exemption fires (isWorktree true) but the cwd-independent probe
+    // reads the WT's HEAD → "main" → main-protection blocks. Pre-fix: containment
+    // miss → block. A future change that mis-derives worktreeBranch from the hub
+    // (hub/off) would silently return allowed and advance refs/heads/main — this
+    // pin flips red and fails.
+    m4m("M5: wt-ON-MAIN both-flags commit from hub → block (main-protection, #355)",
+        `git --git-dir="${mwtmain}/.git" --work-tree="${mwtmain}" commit -m x`, "block");
   } catch (e) {
     console.error(`❌ main-protection fixtures FAILED: ${String(e.message).slice(0, 120)}`);
     fail++;
