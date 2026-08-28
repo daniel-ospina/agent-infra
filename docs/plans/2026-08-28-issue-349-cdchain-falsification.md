@@ -101,8 +101,8 @@ After the existing `observable: resolveInvocationTarget → worktree` expectBool
 ```js
 // #349 contract pin: resolveInvocationTarget consumes an INVOCATION object
 // {cdChain, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint} —
-// there is NO `cmd` field. The
-// issue's probe `resolveInvocationTarget({cmd: 'cd <wt> && git add -A', args: [...]}, hub)`
+// there is NO `cmd` field. The issue's probe
+// `resolveInvocationTarget({cmd: 'cd <wt> && git add -A', args: [...]}, hub)`
 // trivially yields an EMPTY cdChain → effectiveCwd = hub → isWorktree:false.
 // That result is EXPECTED for the wrong shape, not evidence of a parsing bug
 // (the #349 misdiagnosis — the walker extracts cd targets fine, T1b/T1d/T1e).
