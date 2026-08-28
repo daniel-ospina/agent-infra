@@ -161,3 +161,26 @@ tests.push(test("PI_MCP_SERVERS defaults to 'none' when mcp_servers param absent
     `default should be "none" (zero eager connects). wiring: ${mcpWiring![0]}`,
   );
 }));
+
+section("#285 review-gate env strip at both dispatch boundaries");
+tests.push(test("builtin-tools subAgentEnv deletes inherited ELDATO_SKIP_VGATE/ELDATO_SKIP_REVIEW_GATE after the spread (#285 Fix A)", async () => {
+  // Polluted-parent contract: swarm_daemon launches pi with
+  // ELDATO_SKIP_VGATE=1 + AGENT_SKIP_REVIEW_GATE=1 (M1, swarm follow-up); the
+  // task-tool child must never inherit them through the ...process.env spread.
+  const src = readFileSync(join(process.cwd(), "extensions", "builtin-tools", "index.ts"), "utf-8");
+  const spreadIdx = src.indexOf("...process.env");
+  const delVgate = src.indexOf("delete subAgentEnv.ELDATO_SKIP_VGATE");
+  const delVgateReview = src.indexOf("delete subAgentEnv.ELDATO_SKIP_REVIEW_GATE");
+  ok(delVgate !== -1 && delVgate > spreadIdx, "ELDATO_SKIP_VGATE delete must sit after the ...process.env spread");
+  ok(delVgateReview !== -1 && delVgateReview > spreadIdx, "ELDATO_SKIP_REVIEW_GATE delete must sit after the ...process.env spread");
+}));
+
+tests.push(test("subagent tool child env carries task-sub-agent markers + TASK_HEARTBEAT_DISABLE=1 + AGENT_SKIP_REVIEW_GATE=1, bypass vars stripped (#285 P1-2)", async () => {
+  const src = readFileSync(join(process.cwd(), "extensions", "subagent", "index.ts"), "utf-8");
+  ok(src.includes('TASK_HEARTBEAT: "1"'), "subagent-tool children must get TASK_HEARTBEAT=1 (task-sub-agent identity, #285 P1-2)");
+  ok(src.includes('PI_MODE: "print"'), "subagent-tool children must get PI_MODE=print (#285 P1-2)");
+  ok(src.includes('TASK_HEARTBEAT_DISABLE: "1"'), "subagent-tool children must get TASK_HEARTBEAT_DISABLE=1 (heartbeat emitter inert — no nonce / no parent marker parser)");
+  ok(src.includes('AGENT_SKIP_REVIEW_GATE: "1"'), "review DISPATCH stays parent-enforced (#825)");
+  ok(src.includes("delete childEnv.ELDATO_SKIP_VGATE"), "ELDATO_SKIP_VGATE must be stripped from the subagent-tool child env (#285 Fix A)");
+  ok(src.includes("delete childEnv.ELDATO_SKIP_REVIEW_GATE"), "ELDATO_SKIP_REVIEW_GATE must be stripped from the subagent-tool child env (#285 Fix A)");
+}));

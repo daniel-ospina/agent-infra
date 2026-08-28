@@ -3,7 +3,7 @@
  * Run: npx tsx extensions/shared/print-mode.test.ts
  */
 
-import { isPrintMode, isPrintModeEnv } from "./print-mode.js";
+import { isPrintMode, isPrintModeEnv, argvAllowsTask } from "./print-mode.js";
 import { ok, equal } from "node:assert/strict";
 
 // env set (builtin-tools spawn path)
@@ -39,6 +39,23 @@ equal(isPrintMode({}, ["pi", "--mode", "--print"]), false, "--mode --print → v
 equal(isPrintModeEnv({ PI_MODE: "print" }), true, "env-only: print → true");
 equal(isPrintModeEnv({}), false, "env-only: unset → false");
 equal(isPrintModeEnv({ PI_MODE: "gate" }), false, "env-only: gate → false");
+
+// argvAllowsTask — task-tool capability from --tools (verification-gate #285 P1-A)
+equal(argvAllowsTask(["pi"]), true, "no --tools flag → default toolset includes task");
+equal(argvAllowsTask(["pi", "-p"]), true, "-p alone → task available");
+equal(argvAllowsTask(["pi", "-p", "--tools", "read,bash,edit,write"]), false, "allowlist without task → restricted");
+equal(argvAllowsTask(["pi", "-p", "--tools", "read,bash,edit,write,task"]), true, "task ∈ allowlist → capable");
+equal(argvAllowsTask(["pi", "-p", "--tools=read,bash"]), false, "--tools= equals form without task → restricted");
+equal(argvAllowsTask(["pi", "-p", "-t", "read,bash"]), false, "-t alias without task → restricted");
+equal(argvAllowsTask(["pi", "-p", "--exclude-tools", "task"]), false, "--exclude-tools task → restricted");
+equal(argvAllowsTask(["pi", "-p", "--exclude-tools", "vision"]), true, "--exclude-tools without task → task still available");
+equal(argvAllowsTask(["pi", "-p", "--no-tools"]), false, "--no-tools → restricted");
+// value-taking-flag awareness: a later --tools value is never misread as a flag
+equal(argvAllowsTask(["pi", "--model", "gpt", "--tools", "read"]), false, "--tools after a value-taking flag still parsed");
+// task token after an unrelated value-taking flag's value must not be confused
+equal(argvAllowsTask(["pi", "-p", "--name", "task", "--tools", "read"]), false, "'task' as a name value is not the allowlist");
+
+equal(argvAllowsTask(["pi", "-p", "--tools"]), false, "dangling --tools → fail-closed restricted");
 
 ok(true, "all isPrintMode cases pass");
 console.log("print-mode.test OK");

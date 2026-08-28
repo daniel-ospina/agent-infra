@@ -44,6 +44,14 @@ function git(repo: string, args: string): string {
   return execSync(`git ${args}`, { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim();
 }
 
+// #285: audit-trail reader (HOME is redirected to TEST_ROOT at load, so the
+// gate's durable audit log lands under TEST_ROOT/.pi/agent/audit/).
+function readAuditLines(): Record<string, any>[] {
+  const p = join(TEST_ROOT, ".pi", "agent", "audit", "gate-events.jsonl");
+  if (!existsSync(p)) return [];
+  return readFileSync(p, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
+
 // ── Fake pi ExtensionAPI ──────────────────────────────
 interface Handler { (event: any, ctx: any): any }
 const handlers = new Map<string, Handler[]>();
@@ -1104,7 +1112,230 @@ async function main() {
     });
     ok(res && res.block === true, "post-PASS edit must re-block (hash mismatch, fail-closed)");
     ok(/Hash mismatch/.test(res.reason), "block reason must carry the hash-mismatch diagnostic");
-    await fire("session_start", {});
+    await fire("session_start", {})
+  });
+
+  section("#285 — fail-closed gates for task sub-agents (polluted parent, no auto-disable, no fail-open)");
+
+  test("scenario 33 (#285 Fix B): polluted-parent task sub-agent — ELDATO_SKIP_VGATE=1 refused, gate stays ACTIVE", async () => {
+    const repo = join(TEST_ROOT, "repo-285-b");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "f285b.txt"), "v1\n");
+    git(repo, "add f285b.txt");
+    git(repo, "commit -m baseline");
+    writeFileSync(join(repo, "f285b.txt"), "v2\n");
+    git(repo, "add f285b.txt");
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.ELDATO_SKIP_VGATE;
+    const captured: string[] = [];
+    const origWarn = console.warn;
+    process.env.PI_MODE = "print"; // builtin-tools task-child markers (#172/#825)
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.ELDATO_SKIP_VGATE = "1"; // polluted parent launch env (swarm daemon M1)
+    try {
+      console.warn = ((msg: string, ...rest: unknown[]) => { captured.push(String(msg)); origWarn(msg, ...rest); }) as typeof console.warn;
+      await fire("session_start", {});
+    } finally {
+      console.warn = origWarn;
+    }
+    // The per-command bypass branch ALSO runs (ELDATO_SKIP_VGATE still set):
+    // refused → falls through → the commit is gated as usual → blocked.
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'b285'", cwd: repo },
+    });
+    ok(res && res.block === true, "task sub-agent under a polluted parent env must STILL block the unverified commit (no disable, no per-command bypass)");
+    ok(captured.some(l => l.includes("Bypass refused for task sub-agent")), "refused-bypass WARN must be emitted at session_start");
+    ok(captured.some(l => l.includes("VGATE stays ACTIVE")), "WARN must state VGATE stays ACTIVE");
+    const refused = readAuditLines().filter(l => l.event === "gate_bypass_refused");
+    ok(refused.length >= 1, "gate_bypass_refused audit event must be written");
+    ok(readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "escape_hatch").length === 0,
+       "no escape_hatch gate_bypass record for the task sub-agent");
+    git(repo, "reset -q");
+    if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    if (prevSkip === undefined) delete process.env.ELDATO_SKIP_VGATE; else process.env.ELDATO_SKIP_VGATE = prevSkip;
+  });
+
+  test("scenario 34 (#285 P1-1): task sub-agent + 3× empty-content VGATE dispatches → gate NEVER auto-disables", async () => {
+    const repo = join(TEST_ROOT, "repo-285-p11");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "f34.txt"), "v1\n");
+    git(repo, "add f34.txt");
+    git(repo, "commit -m baseline");
+    writeFileSync(join(repo, "f34.txt"), "v2\n");
+    git(repo, "add f34.txt");
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    try {
+      await fire("session_start", {});
+      const blocked = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'p11'", cwd: repo },
+      });
+      ok(blocked && blocked.block === true, "must be blocked first");
+      const prompt = `[VGATE] verify files: f34.txt. Classification: UI. Project root: ${repo}`;
+      for (let i = 0; i < 3; i++) {
+        await fire("tool_result", { toolName: "task", input: { prompt }, content: [] });
+      }
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'p11'", cwd: repo },
+      });
+      ok(res && res.block === true, "gate must STILL block after 3 empty-content dispatch failures in a task sub-agent (threshold disable refused, P1-1)");
+      const res2 = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'p11'", cwd: repo },
+      });
+      ok(res2 && res2.block === true, "no delayed auto-bypass: attempt 4 still blocked");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+  });
+
+  test("scenario 35 (#285 P1-1): task sub-agent + 3× unparseable VGATE outputs WITHOUT prompt files → gate NEVER auto-disables", async () => {
+    const repo = join(TEST_ROOT, "repo-285-p11b");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "f35.txt"), "v1\n");
+    git(repo, "add f35.txt");
+    git(repo, "commit -m baseline");
+    writeFileSync(join(repo, "f35.txt"), "v2\n");
+    git(repo, "add f35.txt");
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    try {
+      await fire("session_start", {});
+      const blocked = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'p11b'", cwd: repo },
+      });
+      ok(blocked && blocked.block === true, "must be blocked first");
+      // Prompt WITHOUT the `verify files:` literal → no prompt files → the
+      // #5724 fail-open merge is unreachable → pure dispatch failure.
+      const prompt = `[VGATE] check the staged changes. Classification: UI. Project root: ${repo}`;
+      for (let i = 0; i < 3; i++) {
+        await fire("tool_result", {
+          toolName: "task",
+          input: { prompt },
+          content: [{ type: "text", text: "Verifier output was not parseable." }],
+        });
+      }
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'p11b'", cwd: repo },
+      });
+      ok(res && res.block === true, "gate must STILL block after 3 unparseable-no-files dispatch failures in a task sub-agent");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+  });
+
+  test("scenario 36 (#285 P2-B): task sub-agent + unparseable output WITH prompt files → fail-open REFUSED, block state preserved for re-dispatch", async () => {
+    const repo = join(TEST_ROOT, "repo-285-p2b");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "f36.txt"), "v1\n");
+    git(repo, "add f36.txt");
+    git(repo, "commit -m baseline");
+    writeFileSync(join(repo, "f36.txt"), "v2\n");
+    git(repo, "add f36.txt");
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    try {
+      await fire("session_start", {});
+      const blocked = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'p2b'", cwd: repo },
+      });
+      ok(blocked && blocked.block === true, "must be blocked first");
+      const prompt = `[VGATE] verify files: f36.txt. Classification: backend. Project root: ${repo}`;
+      await fire("tool_result", {
+        toolName: "task",
+        input: { prompt },
+        content: [{ type: "text", text: "Verifier output was not parseable." }],
+      });
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'p2b'", cwd: repo },
+      });
+      ok(res && res.block === true, "unparseable-with-files dispatch must NOT fail open in a task sub-agent (files NOT recorded)");
+      const refused = readAuditLines().filter(l => l.event === "gate_bypass_refused" && l.reason === "fail_open_refused");
+      ok(refused.length >= 1, "gate_bypass_refused with reason fail_open_refused must be audited");
+      // vgateFailures was NOT incremented (the refused branch returns before
+      // the counter) and lastBlockedCwd/lastBlockedFiles were NOT consumed —
+      // a proper JSON PASS re-dispatch still merges and unblocks:
+      await fire("tool_result", {
+        toolName: "task",
+        input: { prompt },
+        content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repo, "f36.txt"), hash: sha("v2\n") }] }) }],
+      });
+      const passed = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'p2b'", cwd: repo },
+      });
+      equal(passed, undefined, "valid JSON PASS after the refused dispatch must unblock the commit (block state preserved for re-dispatch)");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+  });
+
+  test("scenario 37 (#285 P1-A): task-RESTRICTED sub-agent block message instructs return-to-parent (no in-band dispatch)", async () => {
+    const repo = join(TEST_ROOT, "repo-285-p1a");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "f37.txt"), "v1\n");
+    git(repo, "add f37.txt");
+    git(repo, "commit -m baseline");
+    writeFileSync(join(repo, "f37.txt"), "v2\n");
+    git(repo, "add f37.txt");
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const savedArgv = process.argv;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    // argv seam (P1-A): a restricted agent allowlist WITHOUT task. The
+    // harness's process.argv has no --tools → task-capable by default; the
+    // message builder reads process.argv at block time.
+    process.argv = ["pi", "-p", "--tools", "read,bash,edit,write"] as unknown as string[];
+    try {
+      await fire("session_start", {});
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'p1a'", cwd: repo },
+      });
+      ok(res && res.block === true, "restricted sub-agent commit must block");
+      ok(res.reason.includes("This session is a task sub-agent"), "restricted block must carry the sub-agent marker");
+      ok(/STOP — this block is final; do not bypass; return to the parent\s+session/.test(res.reason), "restricted block must instruct return-to-parent");
+      ok(!/Dispatch your own VGATE verification/.test(res.reason), "restricted block must NOT instruct in-band self-dispatch");
+      ok(!/This session has the task tool/.test(res.reason), "restricted block must not claim the task tool");
+    } finally {
+      process.argv = savedArgv;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
   });
 } // main: plugin loaded; tests run sequentially via runAll()
 

@@ -2331,6 +2331,16 @@ export default function (pi: ExtensionAPI) {
                                  // sub-agents don't run the parent's review
                                  // ceremony; the parent dispatches reviewers.
 };
+  // #285: key-specific strip of review-gate bypass env inherited from the
+  // parent launch env (swarm_daemon sets the skip vars — see the #285-F1
+  // swarm follow-up); the ...process.env spread above would otherwise leak
+  // them into every task child, silently defeating the #825 contract
+  // ("VGATE stays ACTIVE for sub-agents"). Key-specific ONLY:
+  // AGENT_SKIP_REVIEW_GATE stays forced to "1" (#825) and the
+  // ALLOW_MAIN_EDITS branch-ownership variants (#7470/#7549) must survive —
+  // never a prefix sweep.
+  delete subAgentEnv.ELDATO_SKIP_VGATE;
+  delete subAgentEnv.ELDATO_SKIP_REVIEW_GATE;
 // #265/#825 resolution: sub-agents DO get the hatch (verified-file registry
 // bridge, #825) — the branch-ownership guard (M1/M2/M3) is the layer that
 // protects the shared checkout, not env removal.
