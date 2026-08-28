@@ -33,6 +33,11 @@
 # ubuntu-latest + macOS.
 set -uo pipefail
 
+# Fail-closed on a missing python3 (the JSON-tree-walk detector depends on it):
+# a config we cannot parse must never read green (review P2 — PATH-stripped
+# python3 previously produced a PASS on an unparsed config).
+command -v python3 >/dev/null 2>&1 || { echo "error: python3 required (stdlib only) — present on ubuntu-latest + macOS" >&2; exit 2; }
+
 CLAMP=400000
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SHIPPED_DIR="$ROOT/pi-bootstrap/pi-config"
