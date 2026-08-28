@@ -375,6 +375,17 @@ const VALUE_POOL = [
   "&v [1, 2]",
   "&v # comment",
   "*v",
+  // P1-3 — tab-lead block-scalar body lines (pi drops; validator must flag
+  // throw-tab-indent) and tab-after-spaces (pi loads; must stay clean).
+  "|\n\tline1",
+  "|\n  line1\n\tline2",
+  "|\n  line1\n  \tok",
+  // P2-1 — invalid explicit-indent block-scalar headers (pi drops; validator
+  // must flag throw-invalid-block-header).
+  "|0",
+  "|12",
+  "|+0",
+  ">0",
 ];
 const KEY_POOL = ["name", "description", "steps", "other", "key", "subjects.team"];
 

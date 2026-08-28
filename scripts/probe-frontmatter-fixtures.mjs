@@ -17,6 +17,11 @@
  * live pi results are compared against the committed records — zero
  * mismatches or exit 1 (drift).
  *
+ * P2-2: `--write` ABORTS when the module's FUZZ_TRIAGE append region is
+ * non-empty — the regeneration always emits an empty FUZZ_TRIAGE, so running
+ * it after a `--write-append` would silently drop the appended triage
+ * entries. Move them into FIXTURE_DEFS (or clear the region) first.
+ *
  * Dep-free (O/I (3)); pi required (dev machine / cron only).
  */
 
@@ -71,6 +76,12 @@ const FIXTURE_DEFS = [
   { id: 'throw-quote-dedent', class: 'throw-unbalanced-quote', expected: ['throw-unbalanced-quote', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: "a\nb"\n---\nbody\n', note: 'dedented continuation — quote never closes' },
   { id: 'throw-flow-unclosed', class: 'throw-unclosed-flow', expected: ['throw-unclosed-flow'], expectedRelation: 'drop', content: '---\nname: x\ndescription: {a: b\n---\nbody\n' },
   { id: 'throw-tab-indent', class: 'throw-tab-indent', expected: ['throw-tab-indent'], expectedRelation: 'drop', content: '---\nname: x\ndescription: test\n\tbar: baz\n---\nbody\n' },
+  { id: 'throw-tab-indent-block-body', class: 'throw-tab-indent', expected: ['throw-tab-indent', GD], expectedRelation: 'drop', content: '---\nname: x\ndescription: |\n\tline1\n---\nbody\n', note: 'P1-3 — block-scalar body line whose indentation STARTS with a tab; yaml.js computes indent 0 → "Block scalar values in collections must be indented" → pi drops. The scalar ends with no content, so the description also trips the string gate.' },
+  { id: 'throw-tab-indent-block-body-later', class: 'throw-tab-indent', expected: ['throw-tab-indent'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |\n  line1\n\tline2\n---\nbody\n', note: 'P1-3 — tab-lead body line after an established contentIndent → "Block scalar lines must not be less indented than their first line" → pi drops' },
+  { id: 'throw-block-header-indent-0', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |0\n  line1\n---\nbody\n', note: 'P2-1 — |0 explicit-indent header: yaml "Block scalar header includes extra characters" → pi drops. The header never opens a scalar, so the dangling body line is structurally processed (bare-key).' },
+  { id: 'throw-block-header-indent-12', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |12\n  line1\n---\nbody\n', note: 'P2-1 — |12 two-digit explicit-indent header' },
+  { id: 'throw-block-header-plus-0', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |+0\n  line1\n---\nbody\n', note: 'P2-1 — |+0 chomp + explicit-indent 0 header' },
+  { id: 'throw-block-header-fold-0', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: >0\n  line1\n---\nbody\n', note: 'P2-1 — >0 folded with explicit-indent 0 header' },
   { id: 'throw-reserved-at', class: 'throw-reserved-char-start', expected: ['throw-reserved-char-start'], expectedRelation: 'drop', content: '---\nname: x\ndescription: @x\n---\nbody\n' },
   { id: 'throw-reserved-backtick', class: 'throw-reserved-char-start', expected: ['throw-reserved-char-start'], expectedRelation: 'drop', content: '---\nname: x\ndescription: `x`\n---\nbody\n' },
   { id: 'throw-reserved-percent', class: 'throw-reserved-char-start', expected: ['throw-reserved-char-start'], expectedRelation: 'drop', content: '---\nname: x\ndescription: %foo\n---\nbody\n' },
@@ -155,6 +166,7 @@ const FIXTURE_DEFS = [
   { id: 'ok-block-minimal-folded', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: >\n folded\n text\n---\nbody\n', note: 'P1-1 — folded `>` with 1-space body' },
   { id: 'ok-block-explicit-indent-2', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |2\n  line1\n  line2\n---\nbody\n', note: 'P1-1 — explicit indent indicator |2, body at exactly contentIndent' },
   { id: 'ok-block-explicit-keep-2', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |+2\n  line1\n---\nbody\n', note: 'P1-1 — chomp+indent |+2' },
+  { id: 'ok-block-tab-after-spaces', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |\n  line1\n  \tline2\n---\nbody\n', note: 'P1-3 — tab AFTER spaces in a block-scalar body line is legal content-indent whitespace; pi loads and preserves the tab in the value (only a line STARTING with a tab ends the scalar)' },
   { id: 'ok-block-folded-explicit-2', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: >2\n  folded\n  text\n---\nbody\n', note: 'P1-1 — folded with explicit indent >2' },
   { id: 'ok-block-dedent-content-indent', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |2\n    line1\n  line2\n---\nbody\n', note: 'P1-1 — first line more-indented, later line dedents TO the explicit contentIndent; pi loads (extra spaces are content)' },
   { id: 'ok-block-folded', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: >\n  folded\n  text\n---\nbody\n' },
@@ -275,6 +287,21 @@ async function main() {
   const outFile = path.join(path.dirname(fileURLToPath(import.meta.url)), 'frontmatter-fixtures.mjs');
 
   if (write) {
+    // P2-2: `--write` regenerates the whole module and fixtureModuleContent
+    // always emits an EMPTY FUZZ_TRIAGE — re-running it after a
+    // `--write-append` would silently discard the hand-persisted triage
+    // entries (the append region is the only non-derived state in the file).
+    // Abort with guidance instead of dropping triage data.
+    let hasTriage = false;
+    if (fs.existsSync(outFile)) {
+      const existingSrc = fs.readFileSync(outFile, 'utf8');
+      const region = existingSrc.match(/export const FUZZ_TRIAGE = \[([\s\S]*?)\n\];/);
+      if (region && region[1].trim() !== '') hasTriage = true;
+    }
+    if (hasTriage) {
+      console.error('❌ --write would discard appended FUZZ_TRIAGE entries (the append region is non-empty). Move them into FIXTURE_DEFS first (then re-run --write), or clear the region — --write regenerates the whole module.');
+      process.exit(2);
+    }
     const content = fixtureModuleContent(
       records.map(({ piConsequence, ...rest }) => ({ ...rest, piConsequence })),
       piVersion

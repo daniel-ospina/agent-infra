@@ -78,6 +78,7 @@ export const ERROR_CLASSES = [
   'throw-unresolved-alias',
   'throw-flow-map-mid-scalar',
   'throw-multiple-tokens',
+  'throw-invalid-block-header',
   'dup-key',
   // truncate classes (P1 — pi loads but corrupts the value)
   'truncate-unquoted-hash',
@@ -507,6 +508,17 @@ export function tokenizeFrontmatter(yamlString) {
       };
     }
 
+    // P2-1: `|0` / `|12` / `|+0` / `|-0` / `>0` — a block-scalar header with a
+    // DIGIT explicit-indent that the valid regex rejects ([1-9]? only) falls
+    // through to the plain-scalar path → typed as string → gate passes →
+    // validator clean while pi throws "Block scalar header includes extra
+    // characters" (probe: every digit form throws — |0 |00 |12 |+0 |-0 >0 |2x;
+    // single-digit 1-9 like `|1` is valid and handled above).
+    if (/^[>|][+-]?[0-9]+/.test(valueText)) {
+      emit({ t: TOKEN.TOKENIZE_ERROR, kind: 'block-header', line: lineNo, detail: 'invalid block scalar header (extra characters)' });
+      return { nextI: startI };
+    }
+
     // quoted value
     if (valueText[0] === '"' || valueText[0] === "'") {
       const q = scanQuoted(valueText, lineNo, keyIndent, startI);
@@ -630,7 +642,20 @@ export function tokenizeFrontmatter(yamlString) {
         i++;
         continue;
       }
-      if (state.blockScalar.contentIndent === null) {
+      // P1-3: a body line whose indentation STARTS with a tab ends the scalar
+      // and falls through to the structural tab-indent path (throw-tab-indent).
+      // splitLines normalizes a leading tab to 2 spaces for `indent`, so the
+      // scalar would otherwise swallow the line as content while yaml.js
+      // computes it as indent 0 and throws ("Block scalar values in
+      // collections must be indented" / "Block scalar lines must not be less
+      // indented than their first line") → pi drops and the validator stays
+      // clean (false negative). A tab AFTER spaces (`  \tline2`) is legal
+      // content-indent whitespace — pi loads it and the tab is preserved in
+      // the value — so ONLY a line STARTING with a tab ends the scalar.
+      if (L.raw.startsWith('\t')) {
+        flushBlockBody();
+        state.blockScalar = null;
+      } else if (state.blockScalar.contentIndent === null) {
         if (L.indent > state.blockScalar.parentIndent) {
           state.blockScalar.contentIndent = L.indent;
         } else {
@@ -913,6 +938,10 @@ const ruleThrowBlockSeqInline = (tokens) => tokens
   .filter((tk) => tk.t === TOKEN.VALUE_PLAIN && tk.blockSeqInline)
   .map((tk) => finding('throw-block-seq-inline', null, tk.line, 'block sequence on the same line as a key value (yaml: unexpected block-seq-ind on same line with key)'));
 
+const ruleThrowBlockHeader = (tokens) => tokens
+  .filter((tk) => tk.t === TOKEN.TOKENIZE_ERROR && tk.kind === 'block-header')
+  .map((tk) => finding('throw-invalid-block-header', null, tk.line, 'invalid block scalar header (yaml: block scalar header includes extra characters)'));
+
 const ruleDupKey = (tokens) => {
   const out = [];
   for (const tk of tokens) {
@@ -1024,6 +1053,7 @@ const RULES = [
   ruleThrowFlowMapMid,
   ruleThrowMultipleTokens,
   ruleThrowBlockSeqInline,
+  ruleThrowBlockHeader,
   ruleDupKey,
   ruleTruncateHash,
 ];
