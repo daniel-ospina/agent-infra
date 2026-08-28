@@ -93,12 +93,21 @@ data-source-discovery task — no persisted retry records exist to analyze yet.)
   - `models.json` drift (any deepseek-served id > 400K) → **BLOCK (exit 1)**.
   - `settings.json` drift (compaction block / `retry.maxRetries != 10000`) →
     **BLOCK (exit 1)**.
+  - **Missing shipped `models.json` / `settings.json` → BLOCK (exit 1)**:
+    deletion of the clamp authority is itself terminal drift (clamp gone while
+    CI stays green). Store-class and live-dir-missing (first-install) stay
+    WARN.
   - `models-store.json` drift → **WARN** (a hard red would break auto-sync the
     moment pi's refresh legitimately reverts the store — the verifier P0).
     The alert path is the **weekly report** (`fleet-cost-report.sh`, PR-B) and
     the **tripwire**: any compaction record with `tokensBefore ≥ 900K`
     (0.9 × 1M — NOT 0.9 × 400K, which would misclassify every post-clamp
     compaction as a ceiling).
+  - **PR-A ships a detect-only store-drift signal**: the store WARN goes to
+    stdout and the sync log only — there is **no escalation recipient yet**
+    (no email/Slack/ticket) until PR-B lands `fleet-cost-report.sh` (weekly)
+    and the tripwire. A drifted live store between PR-A and PR-B is visible in
+    the next sync/CI run's log but alerts nobody on its own.
   - Wired: `--shipped-only` in pre-commit + ci.yml/ci-main.yml; the **live
     pass** in `sync.sh` (after setup.sh) blocks on models.json/settings.json
     drift and warns on store drift.

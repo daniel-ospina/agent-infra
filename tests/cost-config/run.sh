@@ -12,6 +12,12 @@
 #   7. --shipped-only                              → exit 0, no live-dir access
 #   8. matcher negatives: kimi-k3 (excluded by decision) never flagged
 #   9. `~deepseek` alias + vision-exp covered (present in fixture output)
+#  10. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
+#      format-independent detection (P1 regression pin)
+#  11. MINIFIED clean 400K models.json              → PASS (exit 0)
+#  12. missing SHIPPED models.json                  → BLOCK (exit 1, authority
+#      deleted = clamp gone); missing LIVE models.json → WARN (first-install)
+#  13. compaction.enabled=false                     → BLOCK (exit 1)
 #
 # Fixtures under tests/fixtures/cost-config/ are regenerated from the LIVE
 # store at implementation time (backdoor-* hold the pre-clamp 1M values; the
@@ -102,6 +108,41 @@ echo ""
 echo "7. --shipped-only runs without a live dir (CI/pre-commit shape)"
 run_guard 0 "--shipped-only" --shipped-only
 if grep -q "live pass skipped" "$OUT"; then pass "live pass skipped"; else fail "expected skip notice"; tail -10 "$OUT"; fi
+
+echo ""
+echo "8. MINIFIED models.json (1M backdoor) → BLOCK, exit 1 (P1 regression pin)"
+run_guard 1 "backdoor-minified" --live-dir "$FIX/backdoor-minified"
+if grep -q "BLOCK-level violation" "$OUT"; then pass "BLOCK summary present"; else fail "expected BLOCK summary"; tail -20 "$OUT"; fi
+if grep -q "deepseek-v4-pro contextWindow=1000000" "$OUT"; then pass "minified deepseek-v4-pro flagged"; else fail "minified deepseek-v4-pro not flagged"; sed -n '1,30p' "$OUT"; fi
+
+echo ""
+echo "9. MINIFIED clean 400K models.json → PASS, exit 0"
+run_guard 0 "clean-minified" --live-dir "$FIX/clean-minified"
+if grep -q "✅ cost-config guard: PASS" "$OUT"; then pass "summary PASS"; else fail "expected PASS summary"; tail -20 "$OUT"; fi
+
+echo ""
+echo "10. missing SHIPPED models.json → BLOCK, exit 1 (clamp authority deleted)"
+TMP_ROOT="$(mktemp -d /tmp/cost-config-missing.XXXXXX)"
+mkdir -p "$TMP_ROOT/scripts"
+cp "$GUARD" "$TMP_ROOT/scripts/check-cost-config.sh"
+mkdir -p "$TMP_ROOT/pi-bootstrap/pi-config"
+cp "$FIX/missing-models/models-store.json" "$FIX/missing-models/settings.json" "$TMP_ROOT/pi-bootstrap/pi-config/"
+bash "$TMP_ROOT/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "missing shipped models.json → exit 1"; else fail "expected exit 1, got $code"; tail -20 "$OUT"; fi
+if grep -q "file missing" "$OUT"; then pass "missing-file block reported"; else fail "expected missing-file message"; tail -20 "$OUT"; fi
+rm -rf "$TMP_ROOT"
+
+echo ""
+echo "11. missing LIVE models.json (first-install path) → WARN, exit 0"
+run_guard 0 "missing-live-models" --live-dir "$FIX/missing-models"
+if grep -q "file missing" "$OUT"; then pass "live missing reported as warn"; else fail "expected missing-file warn"; tail -20 "$OUT"; fi
+if grep -q "BLOCK-level violation" "$OUT"; then fail "live missing must NOT block"; else pass "live missing is warn-only"; fi
+
+echo ""
+echo "12. compaction.enabled=false → BLOCK, exit 1"
+run_guard 1 "backdoor-compaction-disabled" --live-dir "$FIX/backdoor-compaction-disabled"
+if grep -q "compaction.enabled expected true" "$OUT"; then pass "compaction.enabled drift flagged"; else fail "expected enabled message"; tail -20 "$OUT"; fi
 
 echo ""
 if [ "$failures" -eq 0 ]; then
