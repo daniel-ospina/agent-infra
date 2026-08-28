@@ -944,6 +944,95 @@ try {
   m4t("T119: long-option equals force-create → block (round-22)", `cd "${wtR}" && git switch --force-create=main main~2`, "block");
   m4t("T120: HUB-path attached/equals force-create → block (round-23)", `cd "${hubR}" && git switch -Cmain master`, "block");
   m4t("T121: HUB-path attached lowercase create → block (round-24)", `cd "${hubR}" && git checkout -bfoo main`, "block");
+  // ── Issue #354: pushd/popd cwd-state recognition (conservative false-block) ──
+  // _walkShell now treats pushd/popd as REAL cwd-state mutations (like cd) in
+  // the SAFE direction only (no bypass). Design D1: popd truncates the chain to
+  // the PRE-pushd boundary (recorded on a per-frame pushtack), NOT "pop the last
+  // entry" — the naive form diverges from bash when a cd intervenes between
+  // pushd and popd (`pushd wt; cd sub; popd` → bash cwd is the HUB; pop-last
+  // would resolve the wt → bypass). Bare/flag/empty-stack forms → null marker
+  // (conservative). Bash-probe-verified semantics (2026-08-28, bash 3.2).
+  m4t("T122: pushd wt && git commit && popd — THE FIX", `pushd "${wtR}" && git commit -m x && popd`, "allowed");
+  m4t("T123: pushd hub → block (chain [hub] → hub)", `pushd "${hubR}" && git commit -m x`, "block");
+  m4t("T124: bare pushd → block (null marker)", `pushd && git commit -m x`, "block");
+  m4t("T125: cd wt && pushd hub → block (chain [wt, hub] → hub)", `cd "${wtR}" && pushd "${hubR}" && git commit -m x`, "block");
+  m4t("T126: pushd wt && cd subdir && popd → block (D1: popd restores hub — bypass pin)", `pushd "${wtR}" && cd subdir && popd && git commit -m x`, "block");
+  m4t("T127: pushd wt && popd → block (popd returns to hub)", `pushd "${wtR}" && popd && git commit -m x`, "block");
+  m4t("T128: cd wt && pushd hub && popd → allowed (popd returns to wt)", `cd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
+  m4t("T129: pushd -n wt → block (flag form never cds → conservative)", `pushd -n "${wtR}" && git commit -m x`, "block");
+  m4t("T130: pushd wt | cat → block (pipe segment does not leak)", `pushd "${wtR}" | cat && git commit -m x`, "block");
+  m4t("T131: ( pushd wt ) → block (subshell does not leak)", `( pushd "${wtR}" ) && git commit -m x`, "block");
+  m4t("T132: pushd wt && pushd hub && popd → allowed (nested pushd — popd restores the 1st target)", `pushd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
+  m4t("T133: pushd wt && pushd hub && popd && popd → block (double popd — restores hub)", `pushd "${wtR}" && pushd "${hubR}" && popd && popd && git commit -m x`, "block");
+  // ── #366 review (P1 SECURITY BYPASS, round-2): popd ARG forms keep cwd at
+  // the CURRENT stack top — the HUB for a wt→hub pushd chain — so truncating
+  // to the pre-pushd boundary would resolve the chain to the wt and exempt a
+  // hub-targeted mutation. Bash-probe-verified (bash 3.2): only bare popd /
+  // `--` / boundary-next `+0` return to the pre-pushd cwd; `-n` (NOCD),
+  // `+N`/`-N` (N≥1), `-0` (removes the stack bottom) and path operands keep
+  // cwd at the top. Round-2 (cycle-2 bypass): popd scans the ENTIRE argument
+  // list — a `+0` followed by ANY word (`+0 -n` NOCD, `+0 /x`, `+0 -1`, `+0
+  // foo`) parses to a NON-truncating form → cwd stays at the hub → block.
+  // All arg forms → NULL marker → block.
+  m4t("T134: popd -n → block (cwd stays at hub — #366 bypass pin)", `cd "${wtR}" && pushd "${hubR}" && popd -n && git commit -m x`, "block");
+  m4t("T135: popd +1 → block (cwd stays at hub — #366 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd +1 && git commit -m x`, "block");
+  m4t("T136: popd -0 → block (removes stack bottom, cwd stays at hub — #366 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd -0 && git commit -m x`, "block");
+  m4t("T137: popd /x → block (path operand — #366 bypass pin)", `pushd "${wtR}" && popd /x && git commit -m x`, "block");
+  m4t("T138: bare popd → allowed (control — returns to wt)", `cd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
+  // ── #366 review round-2 (cycle-2 bypass): popd +0 MULTI-ARG forms ──
+  // bash 3.2's popd scans the ENTIRE argument list: a `+0` followed by ANY
+  // word parses to a NON-truncating form → no cd → cwd stays at the CURRENT
+  // stack top (the hub). Probe-verified: `+0 -n` sets NOCD (cwd stays hub);
+  // `+0 /x` / `+0 foo` error (no pop, no cd — cwd stays hub); `+0 -1` on the
+  // pinned pushd-chain (3-stack) keeps cwd at the hub — ACCURATE block,
+  // null-mark REQUIRED (a true 2-stack `cd wt && pushd hub` would cd to the
+  // new top, but that shape is not this test). The cycle-1 guard consumed
+  // only the `+0` token and truncated → chain resolved to the wt → hub commit
+  // exempted → bypass. Now: any word after `+0` → NULL marker → block.
+  m4t("T139: popd +0 -n → block (NOCD — cwd stays at hub — cycle-2 bypass pin)", `cd "${wtR}" && pushd "${hubR}" && popd +0 -n && git commit -m x`, "block");
+  m4t("T140: popd +0 /x → block (operand clobbers — cwd stays at hub — cycle-2 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd +0 /x && git commit -m x`, "block");
+  m4t("T141: popd +0 -1 → block (3-stack — cwd stays at hub — ACCURATE block, null-mark required)", `pushd "${wtR}" && pushd "${hubR}" && popd +0 -1 && git commit -m x`, "block");
+  m4t("T142: popd +0 → allowed (CONTROL — boundary-next +0 pops top, cds to wt)", `pushd "${wtR}" && pushd "${hubR}" && popd +0 && git commit -m x`, "allowed");
+  expectBool("#366: popd arg forms consume ALL tokens to the boundary (walker stays in sync — git still found)", (() => {
+    const invs = allGitInvocations(`cd "${wtR}" && pushd "${hubR}" && popd -n && git commit -m x`);
+    return invs.length === 1 && invs[0].verb === "commit" && invs[0].cdChain[invs[0].cdChain.length - 1] === null;
+  })(), true);
+  // ── #366 review round-3 (empty-quoted operands — THIS fix): `""` / `''` /
+  // `''""` are REAL bash arguments (empty words). The old tokenizer DROPPED
+  // them (`if (tok)` filter), so `popd ""` parsed as a BARE popd (truncate)
+  // and `popd +0 ""` as boundary-next `+0` (truncate) → the chain resolved to
+  // the wt → a hub-targeted `git commit` after them was EXEMPTED while the
+  // real commit landed on the HUB (probe-verified: hub log advanced, wt log
+  // stayed). The tokenizer now emits a NUL-prefixed sentinel for empty-quoted
+  // words; the popd branch sees ANY real argument token (incl. the sentinel —
+  // it is NOT a shell boundary) → NULL marker → block.
+  m4t("T143: popd \"\" → block (empty-quoted operand is a REAL arg — round-3 bypass pin)", `cd "${wtR}" && pushd "${hubR}" && popd "" && git commit -m x`, "block");
+  m4t("T144: popd +0 \"\" → block (empty operand after +0 clobbers the truncate — round-3 pin)", `cd "${wtR}" && pushd "${hubR}" && popd +0 "" && git commit -m x`, "block");
+  m4t("T145: popd \"\" +0 → block (empty operand before +0 — round-3 pin)", `cd "${wtR}" && pushd "${hubR}" && popd "" +0 && git commit -m x`, "block");
+  m4t("T146: popd +0 '' '' → block (multiple empty operands — round-3 pin)", `cd "${wtR}" && pushd "${hubR}" && popd +0 '' '' && git commit -m x`, "block");
+  // Control: the T128 pin above already covers bare `popd` → allowed; re-pin
+  // here so the round-3 block list has its control adjacent.
+  m4t("T147: bare popd → allowed (CONTROL — round-3 control unchanged)", `cd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
+  expectBool("#366 round-3: empty-quoted popd operand → null marker in cdChain (never a truncate)", (() => {
+    const inv = allGitInvocations(`cd "${wtR}" && pushd "${hubR}" && popd "" && git commit -m x`)[0];
+    return inv.verb === "commit" && inv.cdChain[inv.cdChain.length - 1] === null;
+  })(), true);
+  expectBool("#366 round-3: empty-quoted operand after +0 is NOT a shell boundary → null marker", (() => {
+    const inv = allGitInvocations(`cd "${wtR}" && pushd "${hubR}" && popd +0 "" && git commit -m x`)[0];
+    return inv.verb === "commit" && inv.cdChain[inv.cdChain.length - 1] === null;
+  })(), true);
+  // Conservative-side pins (sentinel blast radius): `popd ""` on an EMPTY
+  // stack errors in bash (cwd unchanged) → null marker → block; `pushd ""`
+  // pushes the CURRENT dir WITHOUT cd (cwd unchanged — probe-verified) → the
+  // chain keeps resolving to the pre-pushd cwd (sentinel → nonexistent path →
+  // break → prefix kept) → wt stays allowed / hub stays blocked; `cd ""` is a
+  // no-op in bash (cwd unchanged) → the chain keeps the pre-cd cwd → wt stays
+  // allowed.
+  m4t("T148: popd \"\" on empty stack → block (bash errors, cwd unchanged — conservative)", `popd "" && git commit -m x`, "block");
+  m4t("T149: pushd \"\" from wt → allowed (bash: pushes current dir, no cd — cwd stays wt)", `cd "${wtR}" && pushd "" && git commit -m x`, "allowed");
+  m4t("T150: pushd \"\" from hub → block (cwd stays hub)", `cd "${hubR}" && pushd "" && git commit -m x`, "block");
+  m4t("T151: cd \"\" → allowed (bash cd \"\" is a no-op — cwd unchanged, keeps the chain)", `cd "${wtR}" && cd "" && git commit -m x`, "allowed");
+  m4t("T152: git commit -m \"\" from wt → allowed (sentinel in args — commit classification unchanged)", `cd "${wtR}" && git commit -m ""`, "allowed");
   // T112 (flag-with-operand) is a BACKDOOR-path closure — the pure gate sees no
   // invocation; the production block is extractScriptPath → scriptGitVerdict.
   expectBool("T112: flag-with-operand then script → script path + content gated (round-19)", (() => {
@@ -1017,6 +1106,34 @@ try {
   // (the #349 misdiagnosis — the walker extracts cd targets fine, T1b/T1d/T1e).
   const badShape = resolveInvocationTarget({ cmd: `cd "${wtR}" && git add -A`, args: ["add", "-A"] }, hubR, hubR);
   expectBool("contract: {cmd,args} probe shape is NOT the invocation contract (empty cdChain → hub → isWorktree:false — #349 misdiagnosis)", badShape !== null && badShape.isWorktree === false && badShape.effectiveCwd === hubR, true);
+
+  // ── #354: pushd/popd shape/observable pins ──
+  // The walker's pushd branch must produce the SAME shape contracts as cd
+  // (cdChain entries at the git invocation; resolveInvocationTarget consumes
+  // them), and the D1 truncate-to-boundary model must be observable, not just
+  // a verdict-level effect.
+  expectBool("#354: pushd target lands in cdChain at the git invocation", (() => {
+    const inv = allGitInvocations(`pushd "${wtR}" && git commit -m x`)[0];
+    return Array.isArray(inv.cdChain) && inv.cdChain.length === 1 && inv.cdChain[0] === wtR;
+  })(), true);
+  expectBool("#354: resolveInvocationTarget → worktree for pushd-wrapped git", (() => {
+    const t = resolveInvocationTarget(allGitInvocations(`pushd "${wtR}" && git commit -m x`)[0], hubR, hubR);
+    return t !== null && t.isWorktree === true;
+  })(), true);
+  expectBool("#354: popd after git empties the chain (restores hub)", (() => {
+    const invs = allGitInvocations(`pushd "${wtR}" && git commit -m x && popd && git commit -m x`);
+    return invs[0].cdChain.length === 1 && invs[0].cdChain[0] === wtR && invs[1].cdChain.length === 0;
+  })(), true);
+  expectBool("#354: empty-stack popd → null marker (conservative)", allGitInvocations(`popd && git commit -m x`)[0].cdChain[0] === null, true);
+  expectBool("#354: popd restores PRE-pushd chain across an intervening cd (T126 shape pin)", allGitInvocations(`pushd "${wtR}" && cd subdir && popd && git commit -m x`)[0].cdChain.length === 0, true);
+  expectBool("#354: nested pushd single popd restores the 1st pushd target (T132 shape pin)", (() => {
+    const inv = allGitInvocations(`pushd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`)[0];
+    return inv.cdChain.length === 1 && inv.cdChain[0] === wtR;
+  })(), true);
+  expectBool("#354: background & clears chain, stale pushtack pop is a no-op", (() => {
+    const invs = allGitInvocations(`pushd "${wtR}" && git commit -m x & popd && git commit -m x`);
+    return invs[0].cdChain.length === 1 && invs[0].cdChain[0] === wtR && invs[1].cdChain.length === 0;
+  })(), true);
 
   // ── Backdoor (B) — commandExecutionCwd + scriptGitVerdict ──
   const cec = (cmd) => commandExecutionCwd(cmd, hubR);

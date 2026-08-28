@@ -144,9 +144,18 @@ function _tokenize(command) {
       continue;
     }
 
-    // Regular token (quote- and escape-aware).
+    // Regular token (quote- and escape-aware). sawQuote tracks whether the word
+    // region contained ANY quote — a word that ENDS empty after a quote-pair
+    // (`""` / `''` / `''""`) is a REAL bash argument (an empty word) and must
+    // survive tokenization as the _EMPTY_QUOTED sentinel (#366 round-3): the
+    // old `if (tok)` filter dropped it, turning `popd ""` into a bare popd
+    // (truncate) — a hub-targeted commit after it was exempted. A token that is
+    // empty WITHOUT quotes is impossible (the loop always appends a char before
+    // breaking unless a quote consumed the word), so tok==="" && sawQuote is
+    // exactly the empty-quoted case.
     let tok = "";
     let quote = null;
+    let sawQuote = false;
     while (i < s.length) {
       const c = s[i];
       if (quote) {
@@ -154,16 +163,35 @@ function _tokenize(command) {
         if (c === "\\" && quote === '"' && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
         tok += c; i++; continue;
       }
-      if (c === "'" || c === '"') { quote = c; i++; continue; }
+      if (c === "'" || c === '"') { quote = c; sawQuote = true; i++; continue; }
       if (/\s/.test(c)) break;
       if (c === "&" || c === "|" || c === ";" || c === "(" || c === ")" || c === ">" || c === "<") break;
       if (c === "\\" && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
       tok += c; i++;
     }
     if (tok) tokens.push(tok);
+    else if (sawQuote) tokens.push(_EMPTY_QUOTED); // empty-quoted word → REAL empty arg (sentinel)
   }
   return tokens;
 }
+
+/** Sentinel token emitted by _tokenize for an EMPTY-QUOTED shell word (`""` /
+ * `''` / `''""`). bash treats such a word as a REAL argument — an empty word.
+ * The old `if (tok)` filter silently DROPPED it, which made `popd ""` parse as
+ * a bare popd (truncate) and `popd +0 ""` as boundary-next `+0` (truncate):
+ * the chain resolved to the worktree and a hub-targeted `git commit` was
+ * exempted (probe-verified bypass, #366 round-3 — real commit landed on the
+ * HUB while the guard said allowed). The NUL prefix cannot collide with a real
+ * shell word (bash words are NUL-terminated C strings) and keeps the token
+ * TRUTHY — a literal `""` would be re-dropped by consumers that check
+ * truthiness. Every consumer that cannot interpret it degrades conservatively:
+ * the cd-chain resolver hits a nonexistent path (existsSync → false) → break →
+ * keeps the resolved prefix — the exact bash `cd ""` semantics (cwd unchanged);
+ * resolveInvocationTarget's realpathSafe throws ERR_INVALID_ARG_VALUE on the
+ * NUL path → null → conservative; verb matchers compare against specific flag
+ * strings and never match the sentinel.
+ */
+const _EMPTY_QUOTED = "\u0000EMPTY";
 
 /** Shell operators that end a git invocation's arg list (a pipe/redirect/chain
  * means the NEXT word starts a new command — a `tail`/`head`/`echo` consumer). */
@@ -609,10 +637,11 @@ function _walkShell(command, h = {}, seedVars = {}) {
   const tokens = _tokenize(command);
   // Per-paren-depth frame: chain, vars (persisted shell state), segVars (vars
   // at the last boundary — the expansion scope for a segment's own words),
-  // baseLen (chain length at last boundary), pipeC0, pipeActive.
+  // baseLen (chain length at last boundary), pipeC0, pipeActive, pushtack
+  // (issue #354: chain length at each pushd — popd truncates back to it, D1).
   // seedVars (round-13): command-level assignments passed into nested walks
   // (`-c` inlines, substitution spans) so mid-span `$VAR` command words resolve.
-  const stack = [{ chain: [], vars: { ...seedVars }, segVars: { ...seedVars }, baseLen: 0, pipeC0: null, pipeActive: false, persistHints: { gitDirHint: null, workTreeHint: null } }];
+  const stack = [{ chain: [], vars: { ...seedVars }, segVars: { ...seedVars }, baseLen: 0, pipeC0: null, pipeActive: false, persistHints: { gitDirHint: null, workTreeHint: null }, pushtack: [] }];
   const frame = () => stack[stack.length - 1];
   const refreshSeg = (f) => { f.segVars = { ...f.vars }; };
   const restoreC0 = (f) => { if (f.pipeActive && f.pipeC0) f.chain.splice(0, f.chain.length, ...f.pipeC0); };
@@ -654,10 +683,110 @@ function _walkShell(command, h = {}, seedVars = {}) {
       prevWasBoundary = false;
       continue;
     }
+    // Issue #354: pushd/popd are REAL cwd-state builtins (like cd) — recognized
+    // in the SAFE direction only (no bypass). Design D1: popd truncates the
+    // chain to the PRE-pushd boundary (a per-frame pushtack records the chain
+    // length at each pushd), NOT "pop the last entry" — the naive form diverges
+    // from bash when a cd intervenes (`pushd wt; cd sub; popd` → bash cwd is the
+    // HUB; pop-last would resolve the wt → bypass). Bare pushd / pushd
+    // <boundary> / flag forms (`-n`, `+N`, `-N`, `--`) never cd → null marker;
+    // an empty-stack popd (bash errors, cwd unchanged) → null marker — both
+    // conservative (no exemption). Same command-position guard as cd: a
+    // pushd/popd after a spawner (`sudo pushd`) runs in a subprocess and must
+    // not mutate the parent chain.
+    //
+    // Issue #366 review (P1 SECURITY BYPASS, round-2): only a BARE popd (next
+    // token undefined / shell boundary) — plus `--` (bash's option terminator
+    // — probe-verified: `popd -- <any operand>` behaves like bare popd, cds
+    // to the new top) and `+0` with NOTHING after it (removes the top, cds to
+    // the new top = the pre-pushd cwd) — truncates to the pushtack boundary.
+    // EVERY other argument form keeps cwd at the CURRENT stack top, i.e. the
+    // HUB for a wt→hub pushd chain (probe-verified on bash 3.2): `-n` sets
+    // NOCD (pops WITHOUT cd); `+N`/`-N` with N≥1 / `-0` remove a NON-top
+    // entry — for the pinned pushd-chain (3-stack with the session root on
+    // the stack) `+0 -1` keeps cwd at the HUB (accurate block — null-mark is
+    // REQUIRED; on a true 2-stack `cd wt && pushd hub` bash would cd to the
+    // new top, but that shape is not the pinned test); path-like operands are
+    // errors (no pop, no cd — cwd stays hub). CRITICAL (cycle-2
+    // review): bash 3.2's popd scans the ENTIRE argument list — a `+0`
+    // followed by ANY word (`popd +0 -n`, `popd +0 /x`, `popd +0 -1`,
+    // `popd +0 foo` — all probe-verified) parses to a NON-truncating form →
+    // no cd to the new top → cwd stays at the hub. Truncating for those
+    // forms would resolve the chain to the wt and exempt a hub-targeted
+    // mutation → guard bypass. The null-marker path consumes ALL popd
+    // argument tokens up to the next shell boundary (bash's arg scan consumes
+    // every word) so the walker stays in sync, and pushes a NULL marker
+    // (conservative → block, never exempt), mirroring the pushd branch's flag
+    // handling and the cd branch's bare-cd pattern.
+    if (t === "pushd" && prevWasBoundary && !spawnerPending) {
+      const next = tokens[i + 1];
+      const isFlagForm = next !== undefined && (next.startsWith("-") || /^\+[0-9]+$/.test(next));
+      const hasTarget = next !== undefined && !_isShellBoundary(next) && !isFlagForm;
+      const target = hasTarget ? next : null; // bare / <boundary> / flag → null marker
+      i += hasTarget ? 2 : 1;
+      const f = frame();
+      // Bare / ~ / cd- / unresolvable $VAR → null marker (mirrors the cd branch).
+      const expanded = (target === null || target === "~" || target.startsWith("~/") || target === "-")
+        ? null
+        : _expandCdVars(target, f.segVars);
+      if (expanded === null) {
+        f.chain.push(null); // conservative — never a bypass
+      } else {
+        f.pushtack.push(f.chain.length); // D1: record the PRE-pushd boundary
+        f.chain.push(expanded);
+      }
+      h.onCd?.(expanded);
+      prevWasBoundary = false;
+      continue;
+    }
+    if (t === "popd" && prevWasBoundary && !spawnerPending) {
+      const next = tokens[i + 1];
+      const hasArg = next !== undefined && !_isShellBoundary(next);
+      // #366 round-2: the D1 truncate is valid ONLY for bare popd / `--` /
+      // `+0` with NOTHING after it. `+0` is a truncate form ONLY when
+      // tokens[i+2] is undefined or a shell boundary — bash 3.2's popd scans
+      // the ENTIRE argument list, so `popd +0 -n` (NOCD), `popd +0 /x`,
+      // `popd +0 -1`, `popd +0 foo` all parse to NON-truncating forms → no cd
+      // → cwd stays at the current stack top (the HUB for a wt→hub chain;
+      // probe-verified). Any other argument (alone OR following `+0`) → NULL
+      // marker so the chain resolves conservatively (block) and the hub-
+      // targeted mutation is never exempted. Consume ALL popd argument tokens
+      // up to the next shell boundary (bash's arg scan consumes every word)
+      // so the walker never desyncs.
+      // #366 round-3: an EMPTY-QUOTED operand (`""` / `''`) is a REAL bash
+      // argument — the tokenizer emits the _EMPTY_QUOTED sentinel for it, so
+      // `popd ""` has next = sentinel (hasArg → NOT a truncate form → NULL
+      // marker; probe: bash treats `popd ""` as a pop-without-cd — cwd stays
+      // at the hub) and `popd +0 ""` has tokens[i+2] = sentinel, which is NOT
+      // a shell boundary (_isShellBoundary(sentinel) → false) → NOT a truncate
+      // form → NULL marker (probe: `popd +0 ""` / `popd "" +0` /
+      // `popd +0 '' ''` all keep cwd at the hub). The empty-quoted arg is
+      // NEVER a shell boundary — it is a real word.
+      const isTruncateForm = !hasArg || next === "--" || (next === "+0" && (tokens[i + 2] === undefined || _isShellBoundary(tokens[i + 2])));
+      if (!isTruncateForm) {
+        let j = i + 1;
+        while (j < tokens.length && !_isShellBoundary(tokens[j])) j++;
+        i = j;
+        const f = frame();
+        f.chain.push(null); // conservative — cwd stays at the current top (the hub)
+        prevWasBoundary = false;
+        continue;
+      }
+      i += hasArg ? 2 : 1; // bare popd / `--` / boundary-next `+0` — consume the argument token too
+      const f = frame();
+      const mark = f.pushtack.pop();
+      if (mark === undefined) {
+        f.chain.push(null); // empty stack → bash errors, cwd unchanged → conservative
+      } else {
+        f.chain.splice(mark, f.chain.length - mark); // D1: truncate to the pre-pushd state
+      }
+      prevWasBoundary = false;
+      continue;
+    }
     if (t === "(") {
       const f = frame();
       restoreC0(f);
-      stack.push({ chain: [...f.chain], vars: { ...f.vars }, segVars: { ...f.segVars }, baseLen: f.chain.length, pipeC0: null, pipeActive: false, persistHints: { ...f.persistHints } }); // round-12: bash subshells INHERIT variables
+      stack.push({ chain: [...f.chain], vars: { ...f.vars }, segVars: { ...f.segVars }, baseLen: f.chain.length, pipeC0: null, pipeActive: false, persistHints: { ...f.persistHints }, pushtack: [...f.pushtack] }); // round-12: bash subshells INHERIT variables (issue #354: and a COPY of the dir stack)
       pendingHints = {};
       prevWasBoundary = true;
       h.onParenPush?.();
