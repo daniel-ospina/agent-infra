@@ -265,7 +265,12 @@ export function tokenizeFrontmatter(yamlString) {
 
   const flushBlockBody = () => {
     if (state.blockBody.length > 0 && state.blockScalar) {
-      emit({ t: TOKEN.VALUE_BLOCK_BODY, lines: state.blockBody, indent: state.blockScalar.contentIndent, line: state.blockScalar.startLine });
+      // an all-blank body resolves to "" in yaml (chomping) — pi's
+      // description gate drops it, so emit no VALUE_BLOCK_BODY token (the
+      // header alone types as empty-string → gate-description-nonstring)
+      if (!state.blockBody.every((raw) => raw.trim() === '')) {
+        emit({ t: TOKEN.VALUE_BLOCK_BODY, lines: state.blockBody, indent: state.blockScalar.contentIndent, line: state.blockScalar.startLine });
+      }
       state.blockBody = [];
     }
   };
@@ -489,7 +494,14 @@ export function tokenizeFrontmatter(yamlString) {
         nextI: startI,
         blockScalarStart: {
           parentIndent: keyIndent,
-          contentIndent: explicit !== null ? keyIndent + explicit : keyIndent + 1,
+          // P1-1: lazy contentIndent — with no explicit indicator the
+          // effective indent is the FIRST non-blank content line's indent
+          // (resolved in the main scan loop; must exceed parentIndent).
+          // Previously `keyIndent + 1` made a body indented exactly at that
+          // column fall through to structural tokenization (bogus
+          // throw-bare-key / gate-description-nonstring) even though pi
+          // loads it (`|` + 1-space body, `|2`, `|+2`, `>2` — probe).
+          contentIndent: explicit !== null ? keyIndent + explicit : null,
           startLine: lineNo,
         },
       };
@@ -548,10 +560,28 @@ export function tokenizeFrontmatter(yamlString) {
       if (am) {
         const name = am[1];
         const after = am[2] ?? '';
-        const resolved = after.trim() === '' ? { type: 'null', value: null } : resolvePlainScalar(after.trim());
+        const afterTrim = after.trim();
+        // P1-2: type the anchored value with the SAME dispatch as scanValue
+        // below — flow `{...}`/`[...]` → collection, quoted → string with
+        // unquoted content (empty/ws-only → empty-string), comment/blank →
+        // null, else the plain-scalar resolver. Previously every anchored
+        // value went through resolvePlainScalar, so `a: &v {k: 1}` registered
+        // as string and `description: *v` passed the gate while pi resolved
+        // the map and DROPPED the skill (the #242 incident class).
+        let resolved;
+        if (afterTrim === '' || afterTrim.startsWith('#')) {
+          resolved = { type: 'null', value: null };
+        } else if (afterTrim[0] === '{' || afterTrim[0] === '[') {
+          resolved = { type: 'collection', value: afterTrim[0] === '{' ? {} : [] };
+        } else if (afterTrim[0] === '"' || afterTrim[0] === "'") {
+          const q = scanQuoted(afterTrim, lineNo, keyIndent, startI);
+          resolved = q.content.trim() === '' ? { type: 'empty-string', value: q.content } : { type: 'string', value: q.content };
+        } else {
+          resolved = resolvePlainScalar(afterTrim);
+        }
         anchors.set(name, resolved);
         emit({ t: TOKEN.ANCHOR, name, line: lineNo });
-        if (after.trim() === '') {
+        if (afterTrim === '') {
           emit({ t: TOKEN.VALUE_EMPTY, indent: keyIndent, line: lineNo });
           return { nextI: startI };
         }
@@ -588,15 +618,38 @@ export function tokenizeFrontmatter(yamlString) {
   while (i < lines.length) {
     const L = lines[i];
 
-    // block-scalar body consumption
+    // block-scalar body consumption (P1-1): blank lines are always body
+    // (yaml: blank lines never end a block scalar); content lines must be
+    // indented AT LEAST contentIndent (auto-detected from the first non-blank
+    // line when no explicit indicator was given, else parentIndent + explicit
+    // indicator). A line indented less than contentIndent ends the scalar and
+    // is processed structurally.
     if (state.blockScalar) {
-      if (L.isBlank || L.indent > state.blockScalar.contentIndent) {
+      if (L.isBlank) {
         state.blockBody.push(L.raw);
         i++;
         continue;
       }
-      flushBlockBody();
-      state.blockScalar = null;
+      if (state.blockScalar.contentIndent === null) {
+        if (L.indent > state.blockScalar.parentIndent) {
+          state.blockScalar.contentIndent = L.indent;
+        } else {
+          // first non-blank line is not deeper than the parent key — the
+          // scalar has no content (empty value; pi loads "" and the
+          // description gate drops it)
+          flushBlockBody();
+          state.blockScalar = null;
+        }
+      }
+      if (state.blockScalar && L.indent >= state.blockScalar.contentIndent) {
+        state.blockBody.push(L.raw);
+        i++;
+        continue;
+      }
+      if (state.blockScalar) {
+        flushBlockBody();
+        state.blockScalar = null;
+      }
     }
 
     if (L.isBlank) {

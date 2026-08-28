@@ -1834,5 +1834,225 @@ export const FIXTURES = [
       "description": "foo",
       "diagnostics": []
     }
+  },
+  {
+    "id": "ok-block-minimal-indent",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |\n line1\n line2\n---\nbody\n",
+    "note": "P1-1 — body at the auto-detected contentIndent (1 space after a 0-indent key); pi loads",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1\nline2\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-minimal-folded",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: >\n folded\n text\n---\nbody\n",
+    "note": "P1-1 — folded `>` with 1-space body",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "folded text\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-explicit-indent-2",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |2\n  line1\n  line2\n---\nbody\n",
+    "note": "P1-1 — explicit indent indicator |2, body at exactly contentIndent",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1\nline2\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-explicit-keep-2",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |+2\n  line1\n---\nbody\n",
+    "note": "P1-1 — chomp+indent |+2",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-folded-explicit-2",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: >2\n  folded\n  text\n---\nbody\n",
+    "note": "P1-1 — folded with explicit indent >2",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "folded text\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-dedent-content-indent",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |2\n    line1\n  line2\n---\nbody\n",
+    "note": "P1-1 — first line more-indented, later line dedents TO the explicit contentIndent; pi loads (extra spaces are content)",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "  line1\nline2\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-alias-quoted-string",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\na: &v \"x\"\nname: x\ndescription: *v\n---\nbody\n",
+    "note": "P1-2 — double-quoted anchored value → string (unquoted data \"x\")",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "x",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-alias-single-quoted-string",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\na: &v 'y'\nname: x\ndescription: *v\n---\nbody\n",
+    "note": "P1-2 — single-quoted anchored value → string",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "y",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "gate-desc-alias-flow-map",
+    "class": "gate-description-nonstring",
+    "expected": [
+      "gate-description-nonstring"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\na: &v {k: 1}\nname: x\ndescription: *v\n---\nbody\n",
+    "note": "P1-2 — flow-map anchored value: alias must type as collection, not string (pi resolves the map → drops)",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "description is required"
+      ]
+    }
+  },
+  {
+    "id": "gate-desc-alias-flow-seq",
+    "class": "gate-description-nonstring",
+    "expected": [
+      "gate-description-nonstring"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\na: &v [1, 2]\nname: x\ndescription: *v\n---\nbody\n",
+    "note": "P1-2 — flow-seq anchored value → collection",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "description is required"
+      ]
+    }
+  },
+  {
+    "id": "gate-desc-alias-empty-quoted",
+    "class": "gate-description-nonstring",
+    "expected": [
+      "gate-description-nonstring"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\na: &v \"\"\nname: x\ndescription: *v\n---\nbody\n",
+    "note": "P1-2 — empty quoted anchored value → empty-string (pi loads \"\" and drops)",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "description is required"
+      ]
+    }
+  },
+  {
+    "id": "gate-desc-alias-comment",
+    "class": "gate-description-nonstring",
+    "expected": [
+      "gate-description-nonstring"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\na: &v # comment\nname: x\ndescription: *v\n---\nbody\n",
+    "note": "P1-2 — comment after the anchor name → null value",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "description is required"
+      ]
+    }
+  },
+  {
+    "id": "gate-desc-empty-block-blank",
+    "class": "gate-description-nonstring",
+    "expected": [
+      "gate-description-nonstring"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\nname: x\ndescription: |\n\nother: y\n---\nbody\n",
+    "note": "P1-1 — block scalar with only blank body resolves to \"\" → pi drops",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "description is required"
+      ]
+    }
   }
 ];
+
+// ── fuzz-triage append region (--write-append; regenerate via probe --write) ──
+export const FUZZ_TRIAGE = [
+];
+

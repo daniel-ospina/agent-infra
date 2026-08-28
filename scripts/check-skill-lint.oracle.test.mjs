@@ -34,7 +34,7 @@ import {
   extractFrontmatter,
   validateFrontmatter,
 } from "./frontmatter-validate.mjs";
-import { FIXTURES, PI_VERSION_PIN, FUZZ_SEED } from "./frontmatter-fixtures.mjs";
+import { FIXTURES, PI_VERSION_PIN, FUZZ_SEED, FUZZ_TRIAGE } from "./frontmatter-fixtures.mjs";
 import { resolvePiBundle } from "./probe-frontmatter-fixtures.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -59,6 +59,11 @@ function section(name) {
   console.log(`\n${name}:`);
 }
 const setEq = (a, b) => a.length === b.length && [...a].sort().join() === [...b].sort().join();
+
+/** block-scalar fixture — value is a canonical representation (contentIndent
+ *  not stripped, chomping not applied), so the oracle asserts direction
+ *  (both non-empty strings) instead of byte equality. */
+const isBlockScalarFixture = (content) => /:[ \t]*[>|](?:[+-]?[1-9]?)[ \t]*\n/.test(content);
 
 // ── pi bundle ───────────────────────────────────────────────────────────────
 let pi;
@@ -161,12 +166,27 @@ for (const fx of FIXTURES) {
     if ((fx.expectedRelation === "load" || fx.expectedRelation === "load-with-truncation") && con.loaded) {
       const derived = String(verdict.data.description);
       const loaded = String(con.description);
-      if (fx.content.includes("\n  ") || fx.content.includes("\n    ")) {
+      if (fx.content.includes("\n  ") || fx.content.includes("\n    ") || isBlockScalarFixture(fx.content)) {
         assert.ok(derived.trim() !== "" && loaded.trim() !== "", `fixture ${fx.id}: multi-line description must stay a non-empty string on both sides`);
       } else {
         assert.equal(derived, loaded, `fixture ${fx.id}: derived description != pi loaded description`);
       }
     }
+  });
+}
+
+// ── (a2) fuzz-triage parity (--write-append entries, P1-3) ──────────────────
+section("fuzz-triage parity — appended entries (--write-append)");
+
+for (const fx of FUZZ_TRIAGE ?? []) {
+  test(`triage ${fx.id} (${fx.expectedRelation})`, () => {
+    const verdict = validateFrontmatter(fx.content);
+    assert.ok(
+      setEq(verdict.findings.map((f) => f.class), fx.expected),
+      `validator [${verdict.findings.map((f) => f.class).join(", ")}] != expected [${fx.expected.join(", ")}]`
+    );
+    const con = piConsequence(fx.content);
+    assertParity(verdict, con, `triage ${fx.id}`);
   });
 }
 
@@ -343,6 +363,18 @@ const VALUE_POOL = [
   '"a\nb"',
   "continued",
   "sub-key: value",
+  // P1-2 — matching anchor/alias name pairs: when a case draws `&v …` before
+  // `*v` the alias resolves (collection → gate, quoted → string, null → gate);
+  // when `*v` comes first it is an unresolved-alias throw. Both sides of the
+  // parity contract are exercised.
+  "&v",
+  "&v 42",
+  "&v \"x\"",
+  "&v 'y'",
+  "&v {k: 1}",
+  "&v [1, 2]",
+  "&v # comment",
+  "*v",
 ];
 const KEY_POOL = ["name", "description", "steps", "other", "key", "subjects.team"];
 
@@ -460,18 +492,35 @@ if (appendIdx >= 0) {
   };
   const fixtureSrc = fs.readFileSync(FIXTURES_FILE, "utf8");
   const marker = "// ── fuzz-triage append region (--write-append; regenerate via probe --write) ──";
-  let next;
-  const entries = fixtureSrc.indexOf(marker) >= 0
-    ? fixtureSrc.slice(0, fixtureSrc.indexOf(marker))
-    : fixtureSrc.replace(/export const FIXTURES = (\[[\s\S]*?\]);\s*$/, "export const FIXTURES = $1;");
-  if (fixtureSrc.indexOf(marker) < 0) {
-    next = fixtureSrc.replace(/\n\s*\];\s*$/, ",\n  ];\n\n") + "\n" + marker + "\n";
+  const json = JSON.stringify(entry, null, 2);
+  let updated;
+  const markerIdx = fixtureSrc.indexOf(marker);
+  if (markerIdx < 0) {
+    // first append — create the FUZZ_TRIAGE region at the END of the module.
+    // P1-3: the previous append wrote a bare top-level `{...},` AFTER the
+    // FIXTURES `];` — a SyntaxError on import that broke CI. The appended
+    // entries must live inside `export const FUZZ_TRIAGE = [ ... ];`
+    // (trailing comma legal) so the module always parses.
+    updated = `${fixtureSrc.replace(/\s+$/, "")}\n\n${marker}\nexport const FUZZ_TRIAGE = [\n${json},\n];\n`;
+  } else {
+    const closeIdx = fixtureSrc.indexOf("];", markerIdx);
+    if (closeIdx < 0) {
+      console.error("❌ FUZZ_TRIAGE region is malformed (no closing `];`) — fix by hand or regenerate via probe --write");
+      process.exit(2);
+    }
+    updated = `${fixtureSrc.slice(0, closeIdx)}${json},\n${fixtureSrc.slice(closeIdx)}`;
   }
-  const body = fixtureSrc.indexOf(marker) >= 0 ? fixtureSrc : next;
-  const updated = body.endsWith(marker + "\n")
-    ? body + JSON.stringify(entry, null, 2) + ",\n"
-    : body.replace(new RegExp(marker + "\\n"), marker + "\n" + JSON.stringify(entry, null, 2) + ",\n");
   fs.writeFileSync(FIXTURES_FILE, updated);
+  // self-check (P1-3): the written module must parse — on failure revert the
+  // file and exit 2 (a corrupt fixtures module breaks CI on the next import)
+  try {
+    execFileSync(process.execPath, ["--check", FIXTURES_FILE], { stdio: "pipe" });
+  } catch (e) {
+    fs.writeFileSync(FIXTURES_FILE, fixtureSrc); // revert
+    const firstErr = String(e.stderr ?? e.message).trim().split("\n")[0];
+    console.error(`❌ --write-append produced an invalid module — reverted (${firstErr})`);
+    process.exit(2);
+  }
   console.log(`✅ appended ${id} (${relation}) to ${FIXTURES_FILE} — review, then regenerate with probe --write after moving it into FIXTURE_DEFS`);
   process.exit(0);
 }
