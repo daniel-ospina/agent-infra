@@ -700,10 +700,13 @@ try {
   m4t("T1: cd wt commit — THE FIX", `cd "${wtR}" && git commit -m x`, "allowed");
   // #349 regression: the issue claimed the exemption doesn't fire for the
   // standard `cd <worktree> && git …` form ("cdChain not extracted"). Falsified
-  // by probe: the walker DOES extract the cd target (see T1b's allowed verdict
-  // above + the T45a cdChain content pin). These cases pin the issue's exact
-  // incident command forms so a future regression fails loudly instead of
-  // freezing worktree sessions.
+  // by probe: the walker DOES extract the cd target (see the T1b-T1f allowed
+  // verdicts below + the "shape: cdChain content pinned" expectBool). These
+  // cases pin the issue's exact incident command forms so a future regression
+  // fails loudly instead of freezing worktree sessions. T1d/T1e resolve the
+  // relative `../wt` against the sessionCwd frame (hubR) — the production
+  // bash-gate base-cwd path (the resolution base the #349 misdiagnosis
+  // hinged on).
   m4t("T1b: cd abs-wt git add -A — the #349 incident form", `cd "${wtR}" && git add -A`, "allowed");
   m4t("T1c: git -C abs-wt add -A — Indicator 2 cross-check", `git -C "${wtR}" add -A`, "allowed");
   m4t("T1d: RELATIVE cd into wt + git add", `cd ../wt && git add -A`, "allowed");

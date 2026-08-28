@@ -9,7 +9,7 @@ aboutSubjects: organisation-design-team
 aboutObjects: agent-infra, issue-349, main-worktree-guard
 ---
 
-<!-- research-path: docs/plans/2026-08-28-issue-349-cdchain-falsification.md -->
+<!-- research-path: none (no external research — falsification evidence in #349: probes on e0bf46f + main, both `allowed`; audit-log timeline) -->
 
 # Issue #349 — #347 Worktree Exemption Fires for `cd <worktree> && git …` — Falsification + Regression Tests
 
@@ -17,10 +17,9 @@ aboutObjects: agent-infra, issue-349, main-worktree-guard
 
 **Goal:** Prove (in code and in the issue record) that the #347 M4 worktree-target exemption already fires for the standard `cd <worktree> && git …` invocation form, and add the regression tests the issue mandates — with no production code change.
 
-**Team:** unknown (agent-infra — infrastructure)
-**Role:** (unavailable)
+**Team:** organisation-design-team
 
-**Architecture:** The bug report #349 is falsified by direct probe of the deployed commit (e0bf46f) and of `main`: `allGitInvocations`/`_walkShell` extract the `cd` target into `cdChain`, and `resolveInvocationTarget` resolves it to `isWorktree: true`, so `evaluateHubGateWithTargets('cd <abs-wt> && git add -A', …)` returns `allowed` on a dirty hub. The issue's evidence — `resolveInvocationTarget({cmd, args}, hub)` → `isWorktree: false` — came from calling the function with the wrong input shape (it consumes `{cdChain, cHints, gitDirHint, workTreeHint}`; there is no `cmd` field), so the result was the trivially-expected empty-chain fallback to the hub, not evidence of a parsing bug. The remaining real gap is the issue's Target 3: test.mjs has no `git add` m4t case and no relative-`cd` m4t case. This plan adds those regression cases (pinning the incident's exact command forms and the correct invocation-object contract), and records the falsification in the issue.
+**Architecture:** The bug report #349 is falsified by direct probe of the deployed commit (e0bf46f) and of `main`: `allGitInvocations`/`_walkShell` extract the `cd` target into `cdChain`, and `resolveInvocationTarget` resolves it to `isWorktree: true`, so `evaluateHubGateWithTargets('cd <abs-wt> && git add -A', …)` returns `allowed` on a dirty hub. The issue's evidence — `resolveInvocationTarget({cmd, args}, hub)` → `isWorktree: false` — came from calling the function with the wrong input shape (it consumes the allGitInvocations invocation object `{cdChain, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint}`; there is no `cmd` field), so the result was the trivially-expected empty-chain fallback to the hub, not evidence of a parsing bug. The remaining real gap is the issue's Target 3: test.mjs has no `git add` m4t case and no relative-`cd` m4t case. This plan adds those regression cases (pinning the incident's exact command forms and the correct invocation-object contract), and records the falsification in the issue.
 
 ### Pattern Research
 

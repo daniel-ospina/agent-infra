@@ -520,15 +520,16 @@ export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd
 /** Extract EVERY git invocation in a compound command (handles
  * `git add . && git commit -m x` — the commit is what decideM2 must gate).
  * Extended shape (#347): per-invocation { verb, args, cdChain, cHints,
- * gitDirHint, workTreeHint, vars } — cdChain is subshell- AND pipe-scoped
- * (bash semantics, probe-verified): `(` pushes a chain copy / `)` pops (cds
+ * gitDirHint, workTreeHint, indexFileHint, objDirsHint, vars } — cdChain is
+ * subshell- AND pipe-scoped (bash semantics, probe-verified): `(` pushes a
+ * chain copy / `)` pops (cds
  * inside parens never leak); every `|` pipeline segment runs in a subshell
  * seeded from C0 = the chain at the last command boundary BEFORE the first
  * pipe segment, and segment cds are discarded at the pipeline end.
  * cd targets are var-expanded AT WALK TIME against segment-local vars; an
  * unresolvable `$VAR` pushes a null marker (conservative → no exemption).
  * {verb, args} are unchanged for existing consumers.
- * @returns {Array<{verb: string|null, args: string[], cdChain: Array<string|null>, cHints: string[], gitDirHint: string|null, workTreeHint: string|null, vars: object}>}
+ * @returns {Array<{verb: string|null, args: string[], cdChain: Array<string|null>, cHints: string[], gitDirHint: string|null, workTreeHint: string|null, indexFileHint: string|null, objDirsHint: string|null, vars: object}>}
  */
 /** Shared shell-chain walker (#347 code-review P1): ONE parser for the
  * cd-chain state machine consumed by allGitInvocations AND commandExecutionCwd
@@ -952,12 +953,13 @@ function _walkShell(command, h = {}, seedVars = {}) {
 /** Extract EVERY git invocation in a compound command (handles
  * `git add . && git commit -m x` — the commit is what decideM2 must gate).
  * Extended shape (#347): per-invocation { verb, args, cdChain, cHints,
- * gitDirHint, workTreeHint, vars } — cdChain is subshell- AND pipe-scoped
+ * gitDirHint, workTreeHint, indexFileHint, objDirsHint, vars } — cdChain is
+ * subshell- AND pipe-scoped
  * (shared _walkShell; bash semantics, probe-verified). cd targets are
  * var-expanded against PRIOR-segment vars only; an unresolvable `$VAR` (or
  * bare cd / ~ / cd-) pushes a null marker (conservative → no exemption).
  * {verb, args} are unchanged for existing consumers.
- * @returns {Array<{verb: string|null, args: string[], cdChain: Array<string|null>, cHints: string[], gitDirHint: string|null, workTreeHint: string|null, vars: object}>}
+ * @returns {Array<{verb: string|null, args: string[], cdChain: Array<string|null>, cHints: string[], gitDirHint: string|null, workTreeHint: string|null, indexFileHint: string|null, objDirsHint: string|null, vars: object}>}
  */
 export function allGitInvocations(command, seedVars = {}) {
   const invocations = [];
