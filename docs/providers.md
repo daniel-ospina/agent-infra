@@ -216,7 +216,7 @@ scripts/patch-pi-retry.sh --check
   down — but ONLY for kills the pure decision would suppress (network down
   AND fresh heartbeat markers; a never-initialized child or a dead child with
   stale markers is still killed, outage or not). The hard cap
-  (`TASK_HARD_CAP_MS`, 2h default) still bounds each dispatch as the last
+  (`TASK_HARD_CAP_MS`, 6h default) still bounds each dispatch as the last
   resort — the opt-in `TASK_MAX_DISPATCH_MS` wall-clock cap is also
   suppressed during an outage (the child is waiting, not drip-streaming; the
   hard cap is the outage bound). The suppression is ON by default (behavior

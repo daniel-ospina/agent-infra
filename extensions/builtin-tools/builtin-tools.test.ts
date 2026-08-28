@@ -2314,7 +2314,7 @@ test("getSystemLoad — live probe returns the real loadavg (regression: unimpor
   }
 });
 
-test("getTaskHardCapMs — default 2h, ≥60s clamp, invalid → default", () => {
+test("getTaskHardCapMs — default 6h, ≥60s clamp, invalid → default", () => {
   withEnv({ TASK_HARD_CAP_MS: undefined }, () => equal(getTaskHardCapMs(), DEFAULT_HARD_CAP_MS));
   withEnv({ TASK_HARD_CAP_MS: "5" }, () => equal(getTaskHardCapMs(), 60_000));
   withEnv({ TASK_HARD_CAP_MS: "3600000" }, () => equal(getTaskHardCapMs(), 3_600_000));
