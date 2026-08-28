@@ -674,7 +674,7 @@ export const DEFAULT_MAX_DISPATCH_MS = 0;
 // and resolves with partial results + a cut reason instead of blocking the
 // parent indefinitely (observed ~6h blocks on dead task calls). Default 2h —
 // generous for full ceremonies, far below the observed unbounded waits.
-export const DEFAULT_HARD_CAP_MS = 7_200_000;
+export const DEFAULT_HARD_CAP_MS = 21_600_000; // 6h (was 2h, #363): full-pipeline sub-agent runs (scope→verify→plan→implement→review) exceed 2h; 2h killed mid-pipeline workers. Env-overridable (TASK_HARD_CAP_MS, 60s floor).
 export function getTaskHardCapMs(): number {
   return Math.max(60_000, Number(process.env.TASK_HARD_CAP_MS) || DEFAULT_HARD_CAP_MS);
 }
@@ -700,7 +700,7 @@ export function getCutGapMs(): number {
 //
 // The parent await is bounded by four layers (D4): exit-settle (≤ ~2s after
 // child death), the "cut" clause (~37.5s for the frozen-marker wedged class),
-// the #221 hard cap (2h default — the DEFAULT detector-dead last resort, NOT
+// the #221 hard cap (6h default — the DEFAULT detector-dead last resort, NOT
 // stateFresh-gated), and this backstop — tool-stall + 30min (6h30m) as the
 // detector-dead bound when env-overridden below the hard cap. The backstop
 // fires ONLY when stateFresh === false at expiry (healthy ticking agents are
@@ -942,7 +942,7 @@ export function parseHeartbeatLine(
       // clause 1 (tool-stall) requires toolsInFlight>0, and after tool_end the
       // only way to regain it is a real tool_start (post turn_start's reset);
       // a same-turn sequential tool inheriting a frozen tool_age is safe under
-      // the 2h default hard cap (a false tool-stall needs a >6h frozen age).
+      // the 6h default hard cap (a false tool-stall needs a >18h frozen age).
       state.streamAgeMs = 0;
       break;
     case "turn_start":
