@@ -963,6 +963,42 @@ try {
     const invs = allGitInvocations(`cd "${wtR}" && pushd "${hubR}" && popd -n && git commit -m x`);
     return invs.length === 1 && invs[0].verb === "commit" && invs[0].cdChain[invs[0].cdChain.length - 1] === null;
   })(), true);
+  // ── #366 review round-3 (empty-quoted operands — THIS fix): `""` / `''` /
+  // `''""` are REAL bash arguments (empty words). The old tokenizer DROPPED
+  // them (`if (tok)` filter), so `popd ""` parsed as a BARE popd (truncate)
+  // and `popd +0 ""` as boundary-next `+0` (truncate) → the chain resolved to
+  // the wt → a hub-targeted `git commit` after them was EXEMPTED while the
+  // real commit landed on the HUB (probe-verified: hub log advanced, wt log
+  // stayed). The tokenizer now emits a NUL-prefixed sentinel for empty-quoted
+  // words; the popd branch sees ANY real argument token (incl. the sentinel —
+  // it is NOT a shell boundary) → NULL marker → block.
+  m4t("T143: popd \"\" → block (empty-quoted operand is a REAL arg — round-3 bypass pin)", `cd "${wtR}" && pushd "${hubR}" && popd "" && git commit -m x`, "block");
+  m4t("T144: popd +0 \"\" → block (empty operand after +0 clobbers the truncate — round-3 pin)", `cd "${wtR}" && pushd "${hubR}" && popd +0 "" && git commit -m x`, "block");
+  m4t("T145: popd \"\" +0 → block (empty operand before +0 — round-3 pin)", `cd "${wtR}" && pushd "${hubR}" && popd "" +0 && git commit -m x`, "block");
+  m4t("T146: popd +0 '' '' → block (multiple empty operands — round-3 pin)", `cd "${wtR}" && pushd "${hubR}" && popd +0 '' '' && git commit -m x`, "block");
+  // Control: the T128 pin above already covers bare `popd` → allowed; re-pin
+  // here so the round-3 block list has its control adjacent.
+  m4t("T147: bare popd → allowed (CONTROL — round-3 control unchanged)", `cd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
+  expectBool("#366 round-3: empty-quoted popd operand → null marker in cdChain (never a truncate)", (() => {
+    const inv = allGitInvocations(`cd "${wtR}" && pushd "${hubR}" && popd "" && git commit -m x`)[0];
+    return inv.verb === "commit" && inv.cdChain[inv.cdChain.length - 1] === null;
+  })(), true);
+  expectBool("#366 round-3: empty-quoted operand after +0 is NOT a shell boundary → null marker", (() => {
+    const inv = allGitInvocations(`cd "${wtR}" && pushd "${hubR}" && popd +0 "" && git commit -m x`)[0];
+    return inv.verb === "commit" && inv.cdChain[inv.cdChain.length - 1] === null;
+  })(), true);
+  // Conservative-side pins (sentinel blast radius): `popd ""` on an EMPTY
+  // stack errors in bash (cwd unchanged) → null marker → block; `pushd ""`
+  // pushes the CURRENT dir WITHOUT cd (cwd unchanged — probe-verified) → the
+  // chain keeps resolving to the pre-pushd cwd (sentinel → nonexistent path →
+  // break → prefix kept) → wt stays allowed / hub stays blocked; `cd ""` is a
+  // no-op in bash (cwd unchanged) → the chain keeps the pre-cd cwd → wt stays
+  // allowed.
+  m4t("T148: popd \"\" on empty stack → block (bash errors, cwd unchanged — conservative)", `popd "" && git commit -m x`, "block");
+  m4t("T149: pushd \"\" from wt → allowed (bash: pushes current dir, no cd — cwd stays wt)", `cd "${wtR}" && pushd "" && git commit -m x`, "allowed");
+  m4t("T150: pushd \"\" from hub → block (cwd stays hub)", `cd "${hubR}" && pushd "" && git commit -m x`, "block");
+  m4t("T151: cd \"\" → allowed (bash cd \"\" is a no-op — cwd unchanged, keeps the chain)", `cd "${wtR}" && cd "" && git commit -m x`, "allowed");
+  m4t("T152: git commit -m \"\" from wt → allowed (sentinel in args — commit classification unchanged)", `cd "${wtR}" && git commit -m ""`, "allowed");
   // T112 (flag-with-operand) is a BACKDOOR-path closure — the pure gate sees no
   // invocation; the production block is extractScriptPath → scriptGitVerdict.
   expectBool("T112: flag-with-operand then script → script path + content gated (round-19)", (() => {

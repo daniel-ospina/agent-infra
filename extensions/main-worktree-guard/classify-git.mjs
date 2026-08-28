@@ -144,9 +144,18 @@ function _tokenize(command) {
       continue;
     }
 
-    // Regular token (quote- and escape-aware).
+    // Regular token (quote- and escape-aware). sawQuote tracks whether the word
+    // region contained ANY quote — a word that ENDS empty after a quote-pair
+    // (`""` / `''` / `''""`) is a REAL bash argument (an empty word) and must
+    // survive tokenization as the _EMPTY_QUOTED sentinel (#366 round-3): the
+    // old `if (tok)` filter dropped it, turning `popd ""` into a bare popd
+    // (truncate) — a hub-targeted commit after it was exempted. A token that is
+    // empty WITHOUT quotes is impossible (the loop always appends a char before
+    // breaking unless a quote consumed the word), so tok==="" && sawQuote is
+    // exactly the empty-quoted case.
     let tok = "";
     let quote = null;
+    let sawQuote = false;
     while (i < s.length) {
       const c = s[i];
       if (quote) {
@@ -154,16 +163,35 @@ function _tokenize(command) {
         if (c === "\\" && quote === '"' && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
         tok += c; i++; continue;
       }
-      if (c === "'" || c === '"') { quote = c; i++; continue; }
+      if (c === "'" || c === '"') { quote = c; sawQuote = true; i++; continue; }
       if (/\s/.test(c)) break;
       if (c === "&" || c === "|" || c === ";" || c === "(" || c === ")" || c === ">" || c === "<") break;
       if (c === "\\" && i + 1 < s.length) { tok += s[i + 1]; i += 2; continue; }
       tok += c; i++;
     }
     if (tok) tokens.push(tok);
+    else if (sawQuote) tokens.push(_EMPTY_QUOTED); // empty-quoted word → REAL empty arg (sentinel)
   }
   return tokens;
 }
+
+/** Sentinel token emitted by _tokenize for an EMPTY-QUOTED shell word (`""` /
+ * `''` / `''""`). bash treats such a word as a REAL argument — an empty word.
+ * The old `if (tok)` filter silently DROPPED it, which made `popd ""` parse as
+ * a bare popd (truncate) and `popd +0 ""` as boundary-next `+0` (truncate):
+ * the chain resolved to the worktree and a hub-targeted `git commit` was
+ * exempted (probe-verified bypass, #366 round-3 — real commit landed on the
+ * HUB while the guard said allowed). The NUL prefix cannot collide with a real
+ * shell word (bash words are NUL-terminated C strings) and keeps the token
+ * TRUTHY — a literal `""` would be re-dropped by consumers that check
+ * truthiness. Every consumer that cannot interpret it degrades conservatively:
+ * the cd-chain resolver hits a nonexistent path (existsSync → false) → break →
+ * keeps the resolved prefix — the exact bash `cd ""` semantics (cwd unchanged);
+ * resolveInvocationTarget's realpathSafe throws ERR_INVALID_ARG_VALUE on the
+ * NUL path → null → conservative; verb matchers compare against specific flag
+ * strings and never match the sentinel.
+ */
+const _EMPTY_QUOTED = "\u0000EMPTY";
 
 /** Shell operators that end a git invocation's arg list (a pipe/redirect/chain
  * means the NEXT word starts a new command — a `tail`/`head`/`echo` consumer). */
@@ -676,6 +704,15 @@ function _walkShell(command, h = {}, seedVars = {}) {
       // targeted mutation is never exempted. Consume ALL popd argument tokens
       // up to the next shell boundary (bash's arg scan consumes every word)
       // so the walker never desyncs.
+      // #366 round-3: an EMPTY-QUOTED operand (`""` / `''`) is a REAL bash
+      // argument — the tokenizer emits the _EMPTY_QUOTED sentinel for it, so
+      // `popd ""` has next = sentinel (hasArg → NOT a truncate form → NULL
+      // marker; probe: bash treats `popd ""` as a pop-without-cd — cwd stays
+      // at the hub) and `popd +0 ""` has tokens[i+2] = sentinel, which is NOT
+      // a shell boundary (_isShellBoundary(sentinel) → false) → NOT a truncate
+      // form → NULL marker (probe: `popd +0 ""` / `popd "" +0` /
+      // `popd +0 '' ''` all keep cwd at the hub). The empty-quoted arg is
+      // NEVER a shell boundary — it is a real word.
       const isTruncateForm = !hasArg || next === "--" || (next === "+0" && (tokens[i + 2] === undefined || _isShellBoundary(tokens[i + 2])));
       if (!isTruncateForm) {
         let j = i + 1;
