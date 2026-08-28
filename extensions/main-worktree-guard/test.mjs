@@ -951,13 +951,14 @@ try {
   // bash 3.2's popd scans the ENTIRE argument list: a `+0` followed by ANY
   // word parses to a NON-truncating form → no cd → cwd stays at the CURRENT
   // stack top (the hub). Probe-verified: `+0 -n` sets NOCD (cwd stays hub);
-  // `+0 /x` / `+0 foo` error (no pop, no cd — cwd stays hub); `+0 -1` removes
-  // a NON-top entry (the new top is the hub). The cycle-1 guard consumed only
-  // the `+0` token and truncated → chain resolved to the wt → hub commit
-  // exempted → bypass. Now: any word after `+0` → NULL marker → block.
+  // `+0 /x` / `+0 foo` error (no pop, no cd — cwd stays hub); `+0 -1` on a
+  // 2-stack cds to the NEW top (the wt) — a conservative false-block, NOT a
+  // hub-cwd match (keep it null-marked: block > exempt). The cycle-1 guard
+  // consumed only the `+0` token and truncated → chain resolved to the wt →
+  // hub commit exempted → bypass. Now: any word after `+0` → NULL marker → block.
   m4t("T139: popd +0 -n → block (NOCD — cwd stays at hub — cycle-2 bypass pin)", `cd "${wtR}" && pushd "${hubR}" && popd +0 -n && git commit -m x`, "block");
   m4t("T140: popd +0 /x → block (operand clobbers — cwd stays at hub — cycle-2 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd +0 /x && git commit -m x`, "block");
-  m4t("T141: popd +0 -1 → block (index clobbers — cwd stays at hub — cycle-2 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd +0 -1 && git commit -m x`, "block");
+  m4t("T141: popd +0 -1 → block (conservative false-block — bash cds to new top = wt; keep null-marked)", `pushd "${wtR}" && pushd "${hubR}" && popd +0 -1 && git commit -m x`, "block");
   m4t("T142: popd +0 → allowed (CONTROL — boundary-next +0 pops top, cds to wt)", `pushd "${wtR}" && pushd "${hubR}" && popd +0 && git commit -m x`, "allowed");
   expectBool("#366: popd arg forms consume ALL tokens to the boundary (walker stays in sync — git still found)", (() => {
     const invs = allGitInvocations(`cd "${wtR}" && pushd "${hubR}" && popd -n && git commit -m x`);

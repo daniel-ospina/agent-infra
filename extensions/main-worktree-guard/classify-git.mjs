@@ -657,8 +657,10 @@ function _walkShell(command, h = {}, seedVars = {}) {
     // EVERY other argument form keeps cwd at the CURRENT stack top, i.e. the
     // HUB for a wt→hub pushd chain (probe-verified on bash 3.2): `-n` sets
     // NOCD (pops WITHOUT cd); `+N`/`-N` with N≥1 / `-0` remove a NON-top
-    // entry — the cd target is the remaining top (the hub); path-like
-    // operands are errors (no pop, no cd — cwd stays hub). CRITICAL (cycle-2
+    // entry (the cd target is the remaining top — for a 2-stack `+0 -1` bash
+    // cds to the NEW top = the wt: a conservative false-block, NOT a hub-cwd
+    // match — keep it null-marked, block > exempt); path-like operands are
+    // errors (no pop, no cd — cwd stays hub). CRITICAL (cycle-2
     // review): bash 3.2's popd scans the ENTIRE argument list — a `+0`
     // followed by ANY word (`popd +0 -n`, `popd +0 /x`, `popd +0 -1`,
     // `popd +0 foo` — all probe-verified) parses to a NON-truncating form →
