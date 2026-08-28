@@ -669,6 +669,10 @@ try {
   execSync(`git worktree add -q "${wtR}" -b wt/feat HEAD`, { cwd: hubR, stdio: "ignore" });
   execSync(`mkdir -p "${wtR}/subdir"`, { stdio: "ignore" });
   execSync(`ln -s "${wtR}" "${m4Tmp}/link"`, { stdio: "ignore" }); // for T28 (realpath spelling)
+  // #349: nested wt INSIDE the hub dir (the tortoise .worktrees/<n> geometry —
+  // the incident's exact layout, durably pinned after the repro scripts die).
+  execSync(`mkdir -p "${hubR}/.worktrees"`, { stdio: "ignore" });
+  execSync(`git worktree add -q "${hubR}/.worktrees/n" -b wt/n HEAD`, { cwd: hubR, stdio: "ignore" });
   // Foreign repo + worktree (C5: not in the hub's worktree map → must block).
   const foreignR = `${m4Tmp}/foreign`;
   const foreignWt = `${m4Tmp}/foreign-wt`;
@@ -694,6 +698,17 @@ try {
   }
 
   m4t("T1: cd wt commit — THE FIX", `cd "${wtR}" && git commit -m x`, "allowed");
+  // #349 regression: the issue claimed the exemption doesn't fire for the
+  // standard `cd <worktree> && git …` form ("cdChain not extracted"). Falsified
+  // by probe: the walker DOES extract the cd target (see T1b's allowed verdict
+  // above + the T45a cdChain content pin). These cases pin the issue's exact
+  // incident command forms so a future regression fails loudly instead of
+  // freezing worktree sessions.
+  m4t("T1b: cd abs-wt git add -A — the #349 incident form", `cd "${wtR}" && git add -A`, "allowed");
+  m4t("T1c: git -C abs-wt add -A — Indicator 2 cross-check", `git -C "${wtR}" add -A`, "allowed");
+  m4t("T1d: RELATIVE cd into wt + git add", `cd ../wt && git add -A`, "allowed");
+  m4t("T1e: RELATIVE cd into wt + git commit", `cd ../wt && git commit -m x`, "allowed");
+  m4t("T1f: NESTED wt-inside-hub (the tortoise .worktrees geometry) + git add", `cd "${hubR}/.worktrees/n" && git add -A`, "allowed");
   m4t("T2: -C wt commit", `git -C "${wtR}" commit -m x`, "allowed");
   m4t("T3: same-segment $VAR cd → conservative block (bash pre-assignment expansion)", `WT="${wtR}" cd "$WT" && git commit -m x`, "block");
   m4t("T3b: boundary-separated $VAR cd (real shell state) → allowed", `WT="${wtR}" && cd "$WT" && git commit -m x`, "allowed");
@@ -950,6 +965,15 @@ try {
   expectBool("observable: resolveInvocationTarget → hub, not worktree", obsTgt !== null && obsTgt.isWorktree === false && obsTgt.effectiveCwd === hubR, true);
   const obsTgt2 = resolveInvocationTarget(allGitInvocations(`cd "${wtR}" && git commit -m x`)[0], hubR, hubR);
   expectBool("observable: resolveInvocationTarget → worktree", obsTgt2 !== null && obsTgt2.isWorktree === true, true);
+  // #349 contract pin: resolveInvocationTarget consumes an INVOCATION object
+  // {cdChain, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint} —
+  // there is NO `cmd` field. The issue's probe
+  // `resolveInvocationTarget({cmd: 'cd <wt> && git add -A', args: [...]}, hub)`
+  // trivially yields an EMPTY cdChain → effectiveCwd = hub → isWorktree:false.
+  // That result is EXPECTED for the wrong shape, not evidence of a parsing bug
+  // (the #349 misdiagnosis — the walker extracts cd targets fine, T1b/T1d/T1e).
+  const badShape = resolveInvocationTarget({ cmd: `cd "${wtR}" && git add -A`, args: ["add", "-A"] }, hubR, hubR);
+  expectBool("contract: {cmd,args} probe shape is NOT the invocation contract (empty cdChain → hub → isWorktree:false — #349 misdiagnosis)", badShape !== null && badShape.isWorktree === false && badShape.effectiveCwd === hubR, true);
 
   // ── Backdoor (B) — commandExecutionCwd + scriptGitVerdict ──
   const cec = (cmd) => commandExecutionCwd(cmd, hubR);

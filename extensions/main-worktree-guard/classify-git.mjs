@@ -430,7 +430,14 @@ export const worktreeGitdirMap = _worktreeGitdirMap;
  * is the checked-out branch of a resolved worktree (used by the shared-ref
  * verb gate — the push carve-out must re-derive from the worktree's HEAD, not
  * the hub's, code-review #4).
- * @param {{cdChain?: Array<string|null>, cHints?: string[], gitDirHint?: string|null, workTreeHint?: string|null}} inv
+ * ⚠️ INPUT CONTRACT (#349): `inv` is the allGitInvocations invocation object
+ * ({cdChain, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint}) —
+ * there is NO `cmd` field. Calling with a raw-command shape like
+ * `{cmd: 'cd <wt> && git add -A', args: [...]}` trivially yields an EMPTY
+ * cdChain → effectiveCwd = baseCwd (the hub) → isWorktree:false. That result
+ * is EXPECTED for the wrong shape, NOT evidence of a parsing bug — a `{cmd}`
+ * probe is what misdiagnosed issue #349.
+ * @param {{cdChain?: Array<string|null>, cHints?: string[], gitDirHint?: string|null, workTreeHint?: string|null, indexFileHint?: string|null, objDirsHint?: string|null}} inv
  * @param {string} sessionCwd — cwd frame for the worktree MAP (the hub).
  * @param {string} [baseCwd] — cd-chain/cHints resolution base (scriptGitVerdict
  *   passes executionCwd; the bash gate passes sessionCwd).
