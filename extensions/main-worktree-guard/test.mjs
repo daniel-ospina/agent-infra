@@ -932,6 +932,21 @@ try {
   m4t("T131: ( pushd wt ) → block (subshell does not leak)", `( pushd "${wtR}" ) && git commit -m x`, "block");
   m4t("T132: pushd wt && pushd hub && popd → allowed (nested pushd — popd restores the 1st target)", `pushd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
   m4t("T133: pushd wt && pushd hub && popd && popd → block (double popd — restores hub)", `pushd "${wtR}" && pushd "${hubR}" && popd && popd && git commit -m x`, "block");
+  // ── #366 review (P1 SECURITY BYPASS): popd ARG forms keep cwd at the CURRENT
+  // stack top — the HUB for a wt→hub pushd chain — so truncating to the pre-pushd
+  // boundary would resolve the chain to the wt and exempt a hub-targeted mutation.
+  // Bash-probe-verified (bash 3.2): only bare popd / `--` / `+0` return to the
+  // pre-pushd cwd; `-n` (no cd), `+N`/`-N` (N≥1), `-0` (removes the stack bottom)
+  // and path operands keep cwd at the top. All arg forms → NULL marker → block.
+  m4t("T134: popd -n → block (cwd stays at hub — #366 bypass pin)", `cd "${wtR}" && pushd "${hubR}" && popd -n && git commit -m x`, "block");
+  m4t("T135: popd +1 → block (cwd stays at hub — #366 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd +1 && git commit -m x`, "block");
+  m4t("T136: popd -0 → block (removes stack bottom, cwd stays at hub — #366 bypass pin)", `pushd "${wtR}" && pushd "${hubR}" && popd -0 && git commit -m x`, "block");
+  m4t("T137: popd /x → block (path operand — #366 bypass pin)", `pushd "${wtR}" && popd /x && git commit -m x`, "block");
+  m4t("T138: bare popd → allowed (control — returns to wt)", `cd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
+  expectBool("#366: popd arg forms consume ONE token (walker stays in sync — git still found)", (() => {
+    const invs = allGitInvocations(`cd "${wtR}" && pushd "${hubR}" && popd -n && git commit -m x`);
+    return invs.length === 1 && invs[0].verb === "commit" && invs[0].cdChain[invs[0].cdChain.length - 1] === null;
+  })(), true);
   // T112 (flag-with-operand) is a BACKDOOR-path closure — the pure gate sees no
   // invocation; the production block is extractScriptPath → scriptGitVerdict.
   expectBool("T112: flag-with-operand then script → script path + content gated (round-19)", (() => {

@@ -620,6 +620,20 @@ function _walkShell(command, h = {}, seedVars = {}) {
     // conservative (no exemption). Same command-position guard as cd: a
     // pushd/popd after a spawner (`sudo pushd`) runs in a subprocess and must
     // not mutate the parent chain.
+    //
+    // Issue #366 review (P1 SECURITY BYPASS): only a BARE popd (next token
+    // undefined / shell boundary) — plus `--` (bash's option terminator: the
+    // remaining list is empty → bare semantics) and `+0` (removes the top,
+    // cds to the new top = the pre-pushd cwd) — truncates to the pushtack
+    // boundary. EVERY other argument form keeps cwd at the CURRENT stack top
+    // (probe-verified on bash 3.2: `-n` pops without cd; `+N`/`-N` with N≥1
+    // and `-0`/path operands remove a NON-top entry — the cd target is the
+    // remaining top, i.e. the HUB for a wt→hub pushd chain). Truncating for
+    // those forms would resolve the chain to the wt and exempt a hub-targeted
+    // mutation → guard bypass. They consume the single (first) argument token
+    // — bash 3.2 popd takes at most ONE argument, later ones are ignored —
+    // and push a NULL marker (conservative → block, never exempt), mirroring
+    // the pushd branch's flag handling and the cd branch's bare-cd pattern.
     if (t === "pushd" && prevWasBoundary && !spawnerPending) {
       const next = tokens[i + 1];
       const isFlagForm = next !== undefined && (next.startsWith("-") || /^\+[0-9]+$/.test(next));
@@ -642,7 +656,24 @@ function _walkShell(command, h = {}, seedVars = {}) {
       continue;
     }
     if (t === "popd" && prevWasBoundary && !spawnerPending) {
-      i++;
+      const next = tokens[i + 1];
+      const hasArg = next !== undefined && !_isShellBoundary(next);
+      // #366: the D1 truncate is valid ONLY for bare popd / `--` / `+0` — the
+      // forms whose cd target IS the pre-pushd cwd (probe-verified). Any other
+      // argument (`-n`, `+0`'s negation `-0`, `+N`/`-N` with N≥1, path-like
+      // operand) keeps cwd at the current stack top → NULL marker so the chain
+      // resolves conservatively (block) and the hub-targeted mutation is never
+      // exempted. Consume exactly ONE argument token (bash takes at most one;
+      // later words are ignored) so the walker never desyncs.
+      const isTruncateForm = next === undefined || _isShellBoundary(next) || next === "--" || next === "+0";
+      if (hasArg && !isTruncateForm) {
+        i += 2; // popd + its single argument token
+        const f = frame();
+        f.chain.push(null); // conservative — cwd stays at the current top (the hub)
+        prevWasBoundary = false;
+        continue;
+      }
+      i += hasArg ? 2 : 1; // bare popd / `--` / `+0` — consume the argument token too
       const f = frame();
       const mark = f.pushtack.pop();
       if (mark === undefined) {
