@@ -74,7 +74,8 @@ add:
 // cases pin the issue's exact incident command forms so a future regression
 // fails loudly instead of freezing worktree sessions. T1d/T1e resolve the
 // relative `../wt` against the sessionCwd frame (hubR) — the production
-// bash-gate base-cwd path.
+// bash-gate base-cwd path (the resolution base the #349 misdiagnosis
+// hinged on).
 m4t("T1b: cd abs-wt git add -A — the #349 incident form", `cd "${wtR}" && git add -A`, "allowed");
 m4t("T1c: git -C abs-wt add -A — Indicator 2 cross-check", `git -C "${wtR}" add -A`, "allowed");
 m4t("T1d: RELATIVE cd into wt + git add", `cd ../wt && git add -A`, "allowed");
@@ -87,7 +88,8 @@ m4t("T1f: NESTED wt-inside-hub (the tortoise .worktrees geometry) + git add", `c
 In the `#347: M4 worktree-target exemption` provisioning block (~lines 666-678), after the existing worktree adds, add:
 
 ```js
-// #349: nested wt INSIDE the hub dir (the tortoise .worktrees/<n> geometry).
+// #349: nested wt INSIDE the hub dir (the tortoise .worktrees/<n> geometry —
+// the incident's exact layout, durably pinned after the repro scripts die).
 execSync(`mkdir -p "${hubR}/.worktrees"`, { stdio: "ignore" });
 execSync(`git worktree add -q "${hubR}/.worktrees/n" -b wt/n HEAD`, { cwd: hubR, stdio: "ignore" });
 ```
@@ -102,7 +104,8 @@ After the existing `observable: resolveInvocationTarget → worktree` expectBool
 // there is NO `cmd` field. The
 // issue's probe `resolveInvocationTarget({cmd: 'cd <wt> && git add -A', args: [...]}, hub)`
 // trivially yields an EMPTY cdChain → effectiveCwd = hub → isWorktree:false.
-// That result is EXPECTED for the wrong shape, not evidence of a parsing bug.
+// That result is EXPECTED for the wrong shape, not evidence of a parsing bug
+// (the #349 misdiagnosis — the walker extracts cd targets fine, T1b/T1d/T1e).
 const badShape = resolveInvocationTarget({ cmd: `cd "${wtR}" && git add -A`, args: ["add", "-A"] }, hubR, hubR);
 expectBool("contract: {cmd,args} probe shape is NOT the invocation contract (empty cdChain → hub → isWorktree:false — #349 misdiagnosis)", badShape !== null && badShape.isWorktree === false && badShape.effectiveCwd === hubR, true);
 ```
@@ -119,7 +122,7 @@ Delete `extensions/main-worktree-guard/.repro-349.mjs` and `.scope-349.mjs` (eph
 
 **Intent:** Close #349 with the evidence so the phantom repro cannot be re-filed, and per the auto-file rule, route the verifiers' P3 hardening findings to separate issues.
 **Acceptance:**
-- Issue #349 has a comment documenting: (a) the falsification evidence (probes on e0bf46f + main, both `allowed`), (b) the probe-shape misconstruction, (c) the audit-log timeline (1765 session 08-27 08:14Z predates the 13:16Z fix; 08-28 production premise-labs `cd <wt> && git add/commit/push` sessions fired 6 `m4_worktree_exemption` audit events), (d) the test additions, (e) links to the two hardening issues.
+- Issue #349 has a comment documenting: (a) the falsification evidence (probes on e0bf46f + main, both `allowed`), (b) the probe-shape misconstruction, (c) the audit-log timeline (1765 session 08-27 08:14Z predates the fix — e0bf46f 2026-08-27 13:16 +02:00 = 11:16Z; 08-28 production premise-labs `cd <wt> && git add/commit/push` sessions fired 6 `m4_worktree_exemption` audit events), (d) the test additions, (e) links to the two hardening issues.
 - Two separate GitHub issues filed for the P3 hardening findings (pushd/popd not recognized; `--git-dir <wt>/.git --work-tree <wt>` positive containment signal not recognized) — NOT folded into #349.
 - Labels: `scoping` removed, `invalid` added (falsified bug report — the honest close label).
 
@@ -128,7 +131,7 @@ Delete `extensions/main-worktree-guard/.repro-349.mjs` and `.scope-349.mjs` (eph
 
 **Step 1: Post the falsification comment on #349**
 
-`gh issue comment 349 --body "<evidence comment>"` — verbatim probe commands + outputs (from the scope runs), audit-log evidence (1765 session 08:14Z < fix 13:16Z; 08-28 production exemption events), test additions, hardening issue links, close rationale.
+`gh issue comment 349 --body "<evidence comment>"` — verbatim probe commands + outputs (from the scope runs), audit-log evidence (1765 session 08:14Z < fix — e0bf46f 2026-08-27 13:16 +02:00 = 11:16Z; 08-28 production exemption events), test additions, hardening issue links, close rationale.
 
 **Step 2: File the two P3 hardening issues**
 
