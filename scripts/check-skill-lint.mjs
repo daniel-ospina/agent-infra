@@ -4,11 +4,16 @@
  *
  * Skill Lint — frontmatter validation for every SKILL.md.
  *
- * Catches:
+ * Catches (via scripts/frontmatter-validate.mjs, the dep-free validator that
+ * mirrors pi's loader grammar — issue #254):
  *   - unquoted `: ` in description  → "Nested mappings not allowed"
  *   - missing/empty frontmatter     → body parsed as YAML → alias errors
  *   - duplicate keys in one mapping → "Map keys must be unique"
- *   - Bounded/Workflow/Routing missing allowed-tools → writing-skills schema violation
+ *   - every enumerated pi-loader throw class (quotes/flow/tabs/aliases/
+ *     multi-doc/reserved-starts/block-seq hazards)
+ *   - silent truncation at unquoted ` #` (P1 — pi loads the truncated value)
+ *   - string-type gate on name/description (pi DROPS non-string descriptions)
+ *   - Bounded/Workflow/Routing missing allowed-tools → writing-skills schema
  *   - name != directory name mismatch (shared-<dir> routing wrappers allowed)
  *
  * Usage:
@@ -16,30 +21,25 @@
  *   node scripts/check-skill-lint.mjs --skills-dir /path/to/skills
  *   REPO_PATH=/path/to/repo node scripts/check-skill-lint.mjs
  *
- * Exit: 0 = clean, 1 = P0 violations, 2 = script error
+ * Exit: 0 = clean, 1 = findings (P0 or P1 — any finding fails, D3),
+ *       2 = script error. An EXPLICIT --skills-dir pointing at a missing
+ *       directory → exit 2 (fail-closed, D9); an implicitly resolved missing
+ *       skills dir → exit 0 (the reusable workflow runs on consumer repos
+ *       that may have no skills tree — flipping would break every consumer).
  */
 
 import { readFileSync, readdirSync, existsSync } from 'fs';
 import { join, basename, dirname } from 'path';
-
-// Dynamic import: js-yaml is optional. If not installed, frontmatter
-// validation is limited to structural checks (no YAML parsing).
-let load;
-try {
-  const jsYaml = await import('js-yaml');
-  load = jsYaml.load;
-} catch {
-  load = null;
-}
+import { pathToFileURL } from 'url';
+import { validateFrontmatter } from './frontmatter-validate.mjs';
 
 // ── CLI ────────────────────────────────────────────────────────────────────
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const args = {
-    repo: process.env.REPO_PATH || null,
+    repo: null,
     skillsDir: null,
     help: false,
   };
-
   for (let i = 0; i < argv.length; i++) {
     switch (argv[i]) {
       case '--repo': {
@@ -66,7 +66,7 @@ function parseArgs(argv) {
   return args;
 }
 
-function printHelp() {
+export function printHelp() {
   console.log(`check-skill-lint.mjs — validate SKILL.md frontmatter
 
 Usage:
@@ -91,15 +91,16 @@ Skills directory resolution order:
 
 Exit codes:
   0  clean
-  1  P0 violations found
-  2  script error`);
+  1  findings found (P0 = pi would drop the skill; P1 = pi loads but the
+     value is silently corrupted)
+  2  script error (incl. explicit --skills-dir pointing at a missing dir — the
+     fail-closed flip, D9; an IMPLICIT no-skills-dir stays exit 0 so consumer
+     repos without a skills tree keep passing)`);
 }
 
 // ── Resolve skills directory ────────────────────────────────────────────────
-function resolveSkillsDir(args) {
+export function resolveSkillsDir(args, cwd = process.cwd()) {
   if (args.skillsDir) return args.skillsDir;
-
-  const cwd = process.cwd();
 
   // If repo is set, try repo/operations/skills
   if (args.repo) {
@@ -125,7 +126,7 @@ function resolveSkillsDir(args) {
 }
 
 // ── Skill file discovery ────────────────────────────────────────────────────
-function findSkillFiles(dir) {
+export function findSkillFiles(dir) {
   const out = [];
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     if (e.name.startsWith('_') || e.name.startsWith('.')) continue;
@@ -136,146 +137,91 @@ function findSkillFiles(dir) {
   return out;
 }
 
-// ── Frontmatter parser ─────────────────────────────────────────────────────
-function parseFrontmatter(content) {
-  if (!content.startsWith('---')) return { ok: false, reason: 'missing opening ---' };
-  const end = content.indexOf('---', 3);
-  if (end === -1) return { ok: false, reason: 'missing closing ---' };
-  const yaml = content.slice(3, end).trim();
-  if (!yaml) return { ok: false, reason: 'empty frontmatter' };
+// ── lint one file → issue lines ─────────────────────────────────────────────
+function lintFile(file, rel) {
+  const issues = [];
+  const dirName = basename(dirname(file));
 
-  // js-yaml not available — do structural check only
-  if (!load) {
-    // Basic structural validation: check for required fields in raw YAML
-    const hasName = /^name\s*:/m.test(yaml);
-    const hasDesc = /^description\s*:/m.test(yaml);
-    const issues = [];
-    if (!hasName) issues.push('missing required field name');
-    if (!hasDesc) issues.push('missing required field description');
-    if (issues.length > 0) return { ok: false, reason: issues.join('; ') };
-    // Return minimal data for downstream checks
-    const nameMatch = yaml.match(/^name\s*:\s*(.+)$/m);
-    const descMatch = yaml.match(/^description\s*:\s*(.+)$/m);
-    return { ok: true, data: { name: nameMatch ? nameMatch[1].trim() : '', description: descMatch ? descMatch[1].trim() : ' ' }, yaml };
-  }
-
+  let content;
   try {
-    return { ok: true, data: load(yaml) || {}, yaml };
+    content = readFileSync(file, 'utf-8');
   } catch (e) {
-    return { ok: false, reason: e.message };
+    issues.push(`[P0] file-read: ${e.message}\n  ${rel}`);
+    return issues;
   }
+
+  const fm = validateFrontmatter(content);
+
+  if (!fm.ok) {
+    for (const f of fm.findings) issues.push(`[P0] frontmatter: ${f.class} — ${f.message}\n  ${rel}`);
+    return issues;
+  }
+  for (const f of fm.findings) {
+    issues.push(`[${f.severity}] frontmatter: ${f.class} — ${f.message}\n  ${rel}`);
+  }
+
+  // name != dir (shared-<dir> routing-wrapper exemption; non-string names are
+  // already flagged by gate-name-* — pi falls back to the dir name)
+  if (typeof fm.data.name === 'string' && fm.data.name && fm.data.name !== dirName && fm.data.name !== `shared-${dirName}`) {
+    issues.push(`[P0] name: frontmatter name '${fm.data.name}' != directory '${dirName}'\n  ${rel}`);
+  }
+
+  // writing-skills frontmatter schema: allowed-tools is required for
+  // Bounded/Workflow skills (Routing is the shared-router variant used by
+  // planning/shared). reference and typeless skills are exempt.
+  if (fm.data.type && ['Bounded', 'Workflow', 'Routing'].includes(fm.data.type) && !('allowed-tools' in fm.data)) {
+    issues.push(`[P0] allowed-tools: type '${fm.data.type}' requires allowed-tools (writing-skills frontmatter schema)\n  ${rel}`);
+  }
+
+  // Catch agents asking forbidden question — AGENTS.md §Batch Implementation
+  if (/sequential\s+or\s+parallel/i.test(content)) {
+    issues.push(`[P0] forbidden-prompt: "sequential or parallel" — agents must plan parallelism themselves\n  ${rel}`);
+  }
+
+  return issues;
 }
 
-function findDuplicateKeys(yaml) {
-  // Flags duplicate keys within the SAME mapping. YAML allows the same key
-  // name at different nesting levels (a false positive of the naive version)
-  // and repeated keys across list elements (each `- ` opens a fresh mapping).
-  // Strategy: track an indentation-aware generation counter. Every list
-  // element bumps the generation; keys nested deeper than the most recent
-  // list element belong to the new generation, so repeats across elements
-  // are NOT flagged. A repeat at the same indent within one generation is a
-  // real duplicate (e.g. js-yaml's "duplicated mapping key").
-  let gen = 0;
-  let activeListIndent = -1;
-  const seen = new Map(); // `indent:gen` -> Set<key>
-  const dups = [];
-  for (const line of yaml.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('---') || trimmed.startsWith('...')) continue;
-    const indent = line.match(/^[ \t]*/)[0].replace(/\t/g, '  ').length;
+// ── run() seam (deps injection, load-gate.test.mjs pattern) ────────────────
+export function run(argv, deps = {}) {
+  const cwd = deps.cwd || process.cwd();
+  const args = parseArgs(argv);
 
-    // List element: starts a fresh mapping for everything nested under it
-    if (/^-\s/.test(trimmed)) {
-      gen += 1;
-      activeListIndent = indent;
-      continue;
-    }
+  if (args.help) { printHelp(); return 0; }
 
-    const m = line.match(/^(\s*)([A-Za-z0-9_-]+)\s*:/);
-    if (!m) continue;
-    const key = m[2];
-    // Keys deeper than the most recent list element belong to that element
-    // (new generation). Keys at or above it belong to the pre-list block.
-    const effectiveGen = indent > activeListIndent ? gen : gen - (activeListIndent >= 0 ? 1 : 0);
-    const id = `${indent}:${effectiveGen}`;
-    if (!seen.has(id)) seen.set(id, new Set());
-    if (seen.get(id).has(key)) dups.push(`'${key}' (indent ${indent})`);
-    else seen.get(id).add(key);
+  const SKILLS_DIR = resolveSkillsDir(args, cwd);
+
+  if (args.skillsDir && SKILLS_DIR && !existsSync(SKILLS_DIR)) {
+    // D9 — explicit --skills-dir pointing at a missing dir is a script error
+    console.error(`Error: skills directory not found: ${SKILLS_DIR}`);
+    return 2;
   }
-  return [...new Set(dups)];
-}
-
-// ── Main ────────────────────────────────────────────────────────────────────
-function main() {
-  const args = parseArgs(process.argv.slice(2));
-
-  if (args.help) { printHelp(); process.exit(0); }
-
-  const SKILLS_DIR = resolveSkillsDir(args);
 
   if (!SKILLS_DIR || !existsSync(SKILLS_DIR)) {
+    // implicit resolution found nothing — consumer repos may have no skills
+    // tree; exit 0 (D9 dir-level decision)
     console.log(`ℹ  No skills directory found — nothing to lint.`);
     console.log('   Tried: --skills-dir, --repo/operations/skills, --repo/.agents/skills, --repo/skills, ./operations/skills, ./.agents/skills, ./skills');
-    process.exit(0);
+    return 0;
   }
-
-  const REQUIRED = ['name', 'description'];
 
   const files = findSkillFiles(SKILLS_DIR);
   const issues = [];
-
   for (const file of files) {
-    const rel = file.replace(process.cwd() + '/', '');
-    let content;
-    try {
-      content = readFileSync(file, 'utf-8');
-    } catch (e) {
-      issues.push(`[P0] file-read: ${e.message}\n  ${rel}`);
-      continue;
-    }
-    const dirName = basename(dirname(file));
-    const fm = parseFrontmatter(content);
-
-    if (!fm.ok) {
-      issues.push(`[P0] frontmatter: ${fm.reason}\n  ${rel}`);
-      continue;
-    }
-    for (const field of REQUIRED) {
-      if (!(field in fm.data)) issues.push(`[P0] frontmatter: missing required field '${field}'\n  ${rel}`);
-    }
-    if (fm.data.name && fm.data.name !== dirName && fm.data.name !== `shared-${dirName}`) {
-      // `shared-<dir>` is the routing-wrapper convention (writing-skills.md:
-      // "shared-verify at ../planning/shared/verify/SKILL.md"). Anything else
-      // is a copy-paste name mismatch.
-      issues.push(`[P0] name: frontmatter name '${fm.data.name}' != directory '${dirName}'\n  ${rel}`);
-    }
-    if ('description' in fm.data && String(fm.data.description).trim() === '') {
-      issues.push(`[P0] description: empty\n  ${rel}`);
-    }
-
-    // writing-skills frontmatter schema: allowed-tools is required for
-    // Bounded/Workflow skills (Routing is the shared-router variant used by
-    // planning/shared). reference and typeless skills are exempt.
-    if (fm.data.type && ['Bounded', 'Workflow', 'Routing'].includes(fm.data.type) && !('allowed-tools' in fm.data)) {
-      issues.push(`[P0] allowed-tools: type '${fm.data.type}' requires allowed-tools (writing-skills frontmatter schema)\n  ${rel}`);
-    }
-    for (const key of findDuplicateKeys(fm.yaml)) {
-      issues.push(`[P0] duplicate-key: '${key}' appears more than once\n  ${rel}`);
-    }
-
-    // Catch agents asking forbidden question — AGENTS.md §Batch Implementation
-    if (/sequential\s+or\s+parallel/i.test(content)) {
-      issues.push(`[P0] forbidden-prompt: "sequential or parallel" — agents must plan parallelism themselves\n  ${rel}`);
-    }
+    const rel = file.startsWith(cwd) ? file.slice(cwd.length + 1) : file;
+    issues.push(...lintFile(file, rel));
   }
 
   console.log(`${files.length} SKILL.md files checked. ${issues.length} issue(s).`);
   if (issues.length === 0) {
     console.log('Clean.');
-    process.exit(0);
+    return 0;
   }
   for (const i of issues) console.log(`\n${i}`);
-  process.exit(1);
+  return 1;
 }
 
-main();
+const isMain =
+  process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+if (isMain) {
+  process.exit(run(process.argv.slice(2)));
+}

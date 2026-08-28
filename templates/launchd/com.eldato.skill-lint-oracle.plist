@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- skill-lint-oracle (#254, Task 10 drift-watch): run the frontmatter
+         validator's drift lock against pi's real bundle every 24h. The
+         oracle re-derives pi's net consequence for the enumerated fixture
+         matrix + the live skills/ corpus + deterministic fuzz and fails on
+         ANY divergence or pi version drift (pi changed without a successful
+         re-probe → loud failure, never soft-skip). A clean run writes the
+         last-oracle-run timestamp consumed by the cron arch/mutation
+         staleness warnings.
+         Canonical script: {{AGENT_INFRA_PATH}}/scripts/cron-quality-gates.sh
+         (subcommand `oracle`; loads the load gate, then the oracle test).
+         Rendered by scripts/install-launchd.sh (#304) — placeholders only,
+         no machine-specific paths. -->
+    <key>Label</key>
+    <string>com.eldato.skill-lint-oracle</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{AGENT_INFRA_PATH}}/scripts/cron-quality-gates.sh</string>
+        <string>oracle</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>86400</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/skill-lint-oracle.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/skill-lint-oracle.log</string>
+</dict>
+</plist>

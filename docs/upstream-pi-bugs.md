@@ -231,3 +231,70 @@ lifecycle events.
 - `extensions/builtin-tools/index.ts` suppresses task-tool sub-agent kills
   while the network is unreachable (fresh heartbeat markers prove the child is
   alive and retrying, not wedged).
+
+---
+
+## Issue #360: skill silently dropped when frontmatter description is missing/empty — warning is emitted but never surfaced
+
+**Repo:** pi-core (`@earendil-works/pi-coding-agent`)
+**Severity:** Medium — an author ships a SKILL.md with a missing or empty `description:` and the skill silently dies in pi (the #242 incident class: CI green, skill dead).
+
+### Symptom
+`loadSkillFromFile` (dist/core/skills.js:232-233, 252) drops the skill when
+`typeof description !== "string" || description.trim() === ""`. The loader DOES
+emit a warning diagnostic ("description is required" via `validateDescription`)
+— but that diagnostic is a return value of `loadSkillsFromDir`, and no surface
+consumes it in the normal agent flow. The author sees nothing; the skill just
+never appears in `available_skills`.
+
+### Evidence
+- `skills.js:232` — `const hasDescription = typeof description === "string" && description.trim() !== ""`
+- `skills.js:233` — `if (!isDeclaredSkill && !hasDescription) return { skill: null, diagnostics }`
+- `skills.js:252` — `if (!hasDescription) return { skill: null, diagnostics }`
+- A SKILL.md with `description: null` / `description: ""` / no description key
+  → `loadSkillsFromDir` returns zero skills for that file + one warning that is
+  not surfaced.
+
+### Expected behavior
+A declared skill (`basename === "SKILL.md"`) with a missing/empty description
+should produce a user-visible error at load time (or the diagnostics should be
+surfaced through the session log / a startup warning), so a dead skill is
+never silent.
+
+### Mitigation in agent-infra (shipped, #254)
+- The dep-free validator flags it as P0 `gate-description-nonstring` (pi drops
+  → the skill is dead) — CI fails, the author fixes it before merge.
+- The pre-commit hook (scripts/check-staged-skill-frontmatter.mjs) blocks the
+  commit at authoring time.
+
+---
+
+## Issue #361: unquoted ` #` in a plain-scalar value silently truncates the value with zero diagnostic
+
+**Repo:** pi-core (`@earendil-works/pi-coding-agent`)
+**Severity:** Low-Medium — silent value corruption: the skill LOADS, so nobody
+notices the description was cut at the first ` #`.
+
+### Symptom
+A plain scalar value containing ` #` (whitespace-preceded hash — the YAML
+comment indicator) is truncated by the parser. `description: Build skills # with
+care` loads as `"Build skills"`. yaml parses this per spec (the `#` starts a
+comment), but the corruption is author-invisible: no diagnostic, no warning,
+and the skill loads — only the DESCRIPTION is wrong.
+
+### Evidence
+- Probe (pi v0.84.3, yaml 2.9.0): `description: foo # bar` → `loadSkillsFromDir`
+  loads the skill with `description: "foo"`. `foo#bar` (no space) → intact
+  `"foo#bar"`. `foo #bar` (space before #) → `"foo"`.
+- Whitespace-precedence rule verbatim: ` #` preceded by whitespace starts a
+  comment; `#` immediately after a non-space character is literal.
+
+### Expected behavior
+No diagnostic exists for this class — a lint/authoring tool should flag
+unquoted ` #` in plain values (P1: pi loads but silently corrupts the value).
+
+### Mitigation in agent-infra (shipped, #254)
+- The validator flags it as P1 `truncate-unquoted-hash` (any finding fails the
+  lint) — the author is told to quote the value.
+- Documented in docs/plans/2026-08-28-issue-254-skill-lint-yaml.md §2
+  (truncate-classes) and §5.4 R3 (acknowledged-drift register).
