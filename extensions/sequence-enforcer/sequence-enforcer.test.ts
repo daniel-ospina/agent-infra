@@ -85,6 +85,13 @@ const origLog = console.log;
 function captureStart() { logs = []; console.log = (line: string) => { logs.push(String(line)); }; }
 function captureStop() { console.log = origLog; }
 
+// captured console.warn — the session_start argv-warn note is a console.warn
+// (distinct from the captureStart console.log sink above).
+let warns: string[] = [];
+const origWarn = console.warn;
+function warnCaptureStart() { warns = []; console.warn = (line: string) => { warns.push(String(line)); }; }
+function warnCaptureStop() { console.warn = origWarn; }
+
 // audit sink capture — intercepts auditLog writes (test seam)
 let auditEntries: Record<string, unknown>[] = [];
 function auditCapture() { auditEntries = []; _setAuditSinkForTest((e) => auditEntries.push(e)); }
@@ -123,6 +130,42 @@ async function withEnv(kv: Record<string, string | undefined>, fn: () => void | 
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
+  }
+}
+
+// argv save/restore helper — the session_start argv-warn note and resolveMode()
+// run with DEFAULT args (real process.argv), so the bare-shell `pi -p`
+// scenario is simulated by mutating process.argv for the duration of fn.
+async function withArgv(argv: string[], fn: () => void | Promise<void>) {
+  const saved = process.argv;
+  process.argv = argv;
+  try { await fn(); }
+  finally { process.argv = saved; }
+}
+
+// mode-file harness (#380 review P3): session_start reads the REAL MODE_FILE
+// (/tmp/agent-sequence-mode) with default resolveMode() args — there is no
+// test seam for it (deliberate: the file is the documented Change-Mode
+// mechanism, not a test hook). The harness saves the file's current content,
+// writes/deletes the scenario state, runs fn, then restores the original
+// content (or removes the file if it was absent) in a finally. The mode file
+// is routinely written by agents anyway; restore-in-finally keeps this safe.
+const MODE_FILE_REAL = "/tmp/agent-sequence-mode";
+async function withModeFile(content: string | null, fn: () => void | Promise<void>) {
+  const had = existsSync(MODE_FILE_REAL);
+  const saved = had ? readFileSync(MODE_FILE_REAL, "utf-8") : null;
+  try {
+    if (content === null) {
+      try { rmSync(MODE_FILE_REAL); } catch { /* already absent */ }
+    } else {
+      writeFileSync(MODE_FILE_REAL, content, "utf-8");
+    }
+    await fn();
+  } finally {
+    try {
+      if (had) writeFileSync(MODE_FILE_REAL, saved!, "utf-8");
+      else { try { rmSync(MODE_FILE_REAL); } catch { /* already absent */ } }
+    } catch { /* best-effort restore */ }
   }
 }
 
@@ -1395,6 +1438,65 @@ await test("session_start clears the armed sequence timer (a stale timer never f
       ok(clearedTimers.length >= 1, "session_start cleared the armed timer (cycle-2 Extension-safety)");
     });
   } finally { _setTokenFileForTest(null); }
+});
+
+// ── #380 review (P3, last deliberate gap): the modeFileWarn branch of the
+// session_start argv-warn note. When a session resolves warn via argv-detected
+// print (bare-shell `pi -p`, no PI_MODE env), the extension logs a console.warn
+// telling the session-log reader the verifier-step allow-list is NOT enforced.
+// Cycle-3/4 fix: a mode-file "warn" (the documented operator Change-Mode
+// mechanism) counts as an EXPLICIT override — the note must NOT fire for a
+// deliberate operator file. session_start calls resolveMode() with DEFAULT
+// args (reads the REAL MODE_FILE), so these tests drive the file directly via
+// withModeFile + withArgv (save/restore in finally; audit captured via sink).
+const ARGV_WARN_NOTE = "warn default via argv-detected print";
+
+await test("session_start: mode-file warn suppresses the argv-detected-print console.warn (explicit operator override wins)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  warnCaptureStart();
+  try {
+    await withModeFile("warn", async () => {
+      await withArgv(["pi", "-p"], async () => {
+        await withEnv(
+          { AGENT_SEQUENCE_MODE: undefined, ELDATO_SEQUENCE_MODE: undefined, PI_ENFORCER_MODE: undefined, PI_MODE: undefined, AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+          async () => {
+            sequenceEnforcer(pi as any);
+            await handlers.session_start!();
+            ok(!warns.some((w) => w.includes(ARGV_WARN_NOTE)),
+              "mode-file warn is an explicit override — the argv-default misdiagnosis note must NOT fire");
+            const startup = auditEntries.find((x) => x.event === "startup");
+            ok(startup && startup.mode === "warn", "startup audited as warn (mode file drives the mode)");
+          },
+        );
+      });
+    });
+  } finally { warnCaptureStop(); auditRelease(); }
+});
+
+await test("session_start CONTROL: NO mode file + bare-shell pi -p → the argv-detected-print console.warn DOES fire (non-vacuous)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  warnCaptureStart();
+  try {
+    await withModeFile(null, async () => {
+      await withArgv(["pi", "-p"], async () => {
+        await withEnv(
+          { AGENT_SEQUENCE_MODE: undefined, ELDATO_SEQUENCE_MODE: undefined, PI_ENFORCER_MODE: undefined, PI_MODE: undefined, AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+          async () => {
+            sequenceEnforcer(pi as any);
+            await handlers.session_start!();
+            const fired = warns.filter((w) => w.includes(ARGV_WARN_NOTE));
+            equal(fired.length, 1, "no mode file: bare-shell argv -p with no PI_MODE is a warn DEFAULT — the note MUST fire exactly once");
+            const startup = auditEntries.find((x) => x.event === "startup");
+            ok(startup && startup.mode === "warn", "control also resolves warn (via the argv default)");
+          },
+        );
+      });
+    });
+  } finally { warnCaptureStop(); auditRelease(); }
 });
 
 await test("cross-session isolation: A's one-shot advance consumes only the file A's checkpoint consumed (phase/repo binding)", async () => {
