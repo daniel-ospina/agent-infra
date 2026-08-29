@@ -1,7 +1,7 @@
 ---
 title: "#357 — Checkpoint Gate Deadlock Fix — Implementation Plan"
 type: engineering
-domain: platform
+domain: operations
 doc_status: draft
 subjects.team: organisation-design-team
 created: 2026-08-29

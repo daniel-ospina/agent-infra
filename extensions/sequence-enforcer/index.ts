@@ -15,23 +15,30 @@
 // sub-agents to "fix" timeouts — that removes workflow enforcement and lets
 // lazy agents bypass gates. Fix the root cause instead (gate-advance logic,
 // timeout mismatches, untimed git calls).
-// #201 carve-out (supersedes the above for launcher-marked print sessions):
-// pi -p workers default to mode "warn" — verifier gates that require a task
+// #201 carve-out (HISTORICAL — REVERSED by #357, see below): launcher-marked
+// print sessions default to mode "warn" — verifier gates that require a task
 // dispatch are structurally unresolvable in background workers, and the old
 // timeout POP destroyed stage state. warn still counts reviewer dispatches
 // and advances steps; the override escape hatches (AGENT_SEQUENCE_MODE /
 // ELDATO_SEQUENCE_MODE / PI_ENFORCER_MODE / mode file) force gate/strict
 // anywhere, including print. Interactive sessions are unchanged.
+// #357 (Task 4): the carve-out is REVERSED — ALL `pi -p` sessions (env- OR
+// argv-detected) default to warn. The checkpoint step-gate (#5039) is
+// unsatisfiable AND inescapable in the bare-shell class (118/118 production
+// blocks; a gate-mode worker at a checkpoint has no in-session escape).
+// resolveMode uses isPrintMode(env, argv); explicit overrides still win.
 //
 // If a sub-agent appears stuck at a verifier gate, the bug is in gate
 // advancement or the silence threshold vs provider timeout — not the
 // enforcement itself.
 //
-// #201 (print-mode default): in non-interactive `pi -p` sessions (epic-executor
-// sub-agents, background workers) the DEFAULT mode is `warn` (never blocks) so
-// a verifier gate can't deadlock a worker that cannot dispatch reviewers.
-// Explicit AGENT_SEQUENCE_MODE / PI_ENFORCER_MODE / mode-file overrides still
-// force gate/strict in print; warn still tracks + advances + audits
+// #201/#357 (print-mode default): in non-interactive `pi -p` sessions
+// (epic-executor sub-agents, background workers) the DEFAULT mode is `warn`
+// (never blocks). #357 (Task 4) widened the detection from PI_MODE env to
+// argv (bare-shell `pi -p` with no PI_MODE included) — the checkpoint gate
+// deadlock evidence (118/118 blocks) reversed the #201 carve-out. Explicit
+// AGENT_SEQUENCE_MODE / PI_ENFORCER_MODE / mode-file overrides still force
+// gate/strict in print; warn still tracks + advances + audits
 // (warn_blocked, timeout_park). See skills/enforcement/SKILL.md.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -39,7 +46,7 @@ import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
-import { isPrintMode } from "../shared/print-mode.js";
+import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
 
 // #357 (Task 1): inline copy of pi's `isToolCallEventType` — the suite runs in
 // CI with ZERO node_modules (zero-dep route), so the runtime value import from
@@ -192,19 +199,25 @@ function recordMarker(toolCallId: string, entry: CheckpointMarker): void {
 // checkpoint advance: announceGate for the next step; completion pops the skill.
 function advanceCheckpoint(skill: SkillState): void {
   const next = skill.stepIndex + 1;
+  // #357 review (Bug-scan P2): capture the coalesce key BEFORE incrementing —
+  // checkpointKey() reads skill.stepIndex, so deleting after the increment
+  // cleared the NEW step's record while the pre-advance window lingered.
+  const leavingKey = checkpointKey(skill);
   if (next < skill.steps.length) {
     skill.stepIndex = next;
     skill.stepStartedAt = Date.now();
     // #357 (Task 8, j): advance resets the block streak + audit coalescer.
     checkpointBlockStreak = null;
-    auditCoalesce.delete(checkpointKey(skill));
+    auditCoalesce.delete(leavingKey);
     console.log(
       `[sequence-enforcer] ⏩ Checkpoint advanced → step ${next}/${skill.steps.length}: ${skill.steps[next]!.name}`,
     );
     announceGate(skill.steps[next]!);
     writeBridgeState();
-    // (h) force-file consumption hook — wired in Task 10: if this advance was
-    // driven by the operator force file, delete it (one-shot per checkpoint).
+    // (h) force-file consumption is done by the CALLERS (tool_call / tool_result
+    // handlers, Task 10): any checkpoint advance consumes a present force file
+    // (one-shot — it must never pass a same-phase adjacent checkpoint),
+    // regardless of which token drove the advance (real token or force).
     return;
   }
   console.log(
@@ -241,11 +254,15 @@ export function handleSequenceTimeout(
   // in ALL modes — a checkpoint is never popped (pop → re-read/re-pop loop +
   // silent enforcement loss). This is also the timer-driven path for a fully
   // idle session at an un-CLEAR-able checkpoint (the only trigger that fires
-  // with ZERO further events).
-  const step = top.steps[top.stepIndex];
-  if (step?.gate === "checkpoint") {
-    if (Date.now() - top.stepStartedAt > WALL_CLOCK_STALL_MS) {
-      parkCheckpoint(top, "checkpoint stall (sequence timeout)");
+  // with ZERO further events). #357 review (Bug-scan P2): the owner is resolved
+  // via the stack-walk — a checkpoint owner can sit BELOW a sub-skill frame
+  // (read is an escape tool and pushes sub-skill frames); a top-only check
+  // would pop the sub-skill instead of parking the owner.
+  const owner = findCheckpointGateOwner();
+  if (owner) {
+    const step = owner.steps[owner.stepIndex];
+    if (step?.gate === "checkpoint" && Date.now() - owner.stepStartedAt > WALL_CLOCK_STALL_MS) {
+      parkCheckpoint(owner, "checkpoint stall (sequence timeout)");
     }
     // re-arm: parked state preserved; one-shot suppresses repeat parks
     sequenceTimeout = setTimeout(handleSequenceTimeout, SEQUENCE_TIMEOUT_MS);
@@ -441,8 +458,13 @@ export function loadSteps(skillPath: string): Step[] | null {
     const steps: Step[] = JSON.parse(json);
     stepCache.set(skillPath, steps.length > 0 ? steps : null);
     return steps.length > 0 ? steps : null;
-  } catch {
-    stepCache.set(skillPath, null);
+  } catch (e) {
+    // #357 review (Security "Needs verification"): a bridge failure (python
+    // missing, vendored skill_declaration.py crashing, 5s timeout) must NOT be
+    // silent — a silent null cache disables ALL gate enforcement on that skill
+    // read (fail-open, no signal). Log loudly AND skip caching so the next read
+    // retries (transient failures self-heal instead of pinning the skill dead).
+    console.warn(`[sequence-enforcer] ⚠️ python bridge failed for ${skillPath}: ${String(e)} — gate enforcement off for this read (frontmatter steps will load on retry)`);
     return null;
   }
 }
@@ -496,7 +518,7 @@ const DESTRUCTIVE_MCP = /\b(?:delete|remove|reset|revoke|drop|truncate|merge|reb
 // Enforcement A (issue #5039): the checkpoint step-gate requires a FRESH
 // phase-correct CLEAR token from parallel_work_check before the step may
 // proceed. Fail-closed: missing/stale/wrong-phase/non-CLEAR/corrupt → BLOCK
-// (retry + operator override are the escape). The token is written by
+// (retry + the operator force-pass are the escape). The token is written by
 // parallel_work_check ONLY on CLEAR — never on UNKNOWN — so a phase gate can
 // never silently pass on infra failure.
 const CHECKPOINT_TOKEN_FILE = "/tmp/parallel-check-token.json";
@@ -520,7 +542,7 @@ export function _setForceFileForTest(path: string | null): void {
 function forceFile(): string {
   return FORCE_FILE_OVERRIDE ?? FORCE_FILE;
 }
-let currentRepoCache: string | null = null;
+let currentRepoCache: { cwd: string; repo: string } | null = null;
 let repoTestOverride: string | null = null;
 export function _setRepoForTest(repo: string | null): void {
   if (process.env.NODE_ENV !== "test") return;
@@ -528,14 +550,18 @@ export function _setRepoForTest(repo: string | null): void {
 }
 function currentRepo(): string {
   if (repoTestOverride) return repoTestOverride;
-  if (currentRepoCache) return currentRepoCache;
+  // #357 review (Bug-scan P2): the cache is keyed on cwd — agents cd between
+  // repos routinely; a session-start remote would weaken the force-file repo
+  // binding. Only re-resolves on cwd change (the git call is 5s-throttled).
+  const cwd = process.cwd();
+  if (currentRepoCache && currentRepoCache.cwd === cwd) return currentRepoCache.repo;
   try {
     const url = execFileSync("git", ["remote", "get-url", "origin"], { encoding: "utf-8", timeout: 5000 }).trim();
-    currentRepoCache = url || "unknown";
+    currentRepoCache = { cwd, repo: url || "unknown" };
   } catch {
-    currentRepoCache = "unknown";
+    currentRepoCache = { cwd, repo: "unknown" };
   }
-  return currentRepoCache;
+  return currentRepoCache.repo;
 }
 
 // Read + validate the force file. Malformed (truncated JSON, {} , missing
@@ -581,6 +607,10 @@ function readForceFile(): { status: "none" | "malformed" | "ok"; data?: Record<s
 // checkpoints.
 function consumeForceFile(skill: SkillState, stepName: string, mode: Mode): void {
   const f = readForceFile();
+  // #357 review: no file present → no-op. Callers invoke consumption on ANY
+  // checkpoint advance (real-token-wins and warn-mode included) — an absent
+  // file must not spam a checkpoint_force_pass audit.
+  if (f.status === "none") return;
   auditLog({
     ts: new Date().toISOString(),
     event: "checkpoint_force_pass",
@@ -634,7 +664,15 @@ function tokenFile(): string {
   // #357 (Task 3): read the PLAIN env name FIRST — the swarm writer honors
   // PARALLEL_CHECK_TOKEN_FILE; _getEnv() would read AGENT_/ELDATO_ prefixed
   // names and never see the writer's contract. Aliases are optional fallback.
-  return TOKEN_FILE_OVERRIDE ?? process.env.PARALLEL_CHECK_TOKEN_FILE ?? CHECKPOINT_TOKEN_FILE;
+  if (TOKEN_FILE_OVERRIDE !== null) return TOKEN_FILE_OVERRIDE;
+  const envPath = process.env.PARALLEL_CHECK_TOKEN_FILE;
+  if (envPath) return envPath;
+  // #357 review (Bug-scan P2): under NODE_ENV=test, never fall through to the
+  // REAL /tmp token file — a machine with a fresh phase-correct token would
+  // flip not-ok escape tests to the ok-token path (probe-pollution — the exact
+  // class this PR eliminates). Mirrors the audit-sink NODE_ENV=test guard.
+  if (process.env.NODE_ENV === "test") return "/tmp/sequence-enforcer-test-none/token.json";
+  return CHECKPOINT_TOKEN_FILE;
 }
 
 export function checkpointTokenOk(step: Step): { ok: boolean; reason: string; viaForce?: boolean } {
@@ -687,14 +725,26 @@ export function checkpointTokenOk(step: Step): { ok: boolean; reason: string; vi
   if (force.status === "ok") {
     const f = force.data!;
     const forceTs = parseTokenTs(f.ts);
+    const repoNow = currentRepo();
     if (
       f.phase === requiredPhase &&
-      f.repo === currentRepo() &&
+      f.repo === repoNow &&
       forceTs !== null &&
+      forceTs <= Date.now() && // #357 review (Bug-scan P2): reject future ts — a skew/typo must not grant an infinite operator TTL
       Date.now() - forceTs <= FORCE_TTL_MS
     ) {
       return { ok: true, reason: "", viaForce: true };
     }
+    // #357 review (Bug-scan P2): a present-but-rejected force file must not
+    // silently strand the session — name the mismatch (mirrors the malformed
+    // note; silent-strand was the exact class the malformed note was added for).
+    const why =
+      forceTs === null ? "unparseable ts"
+      : f.phase !== requiredPhase ? `phase "${f.phase}" ≠ "${requiredPhase}"`
+      : f.repo !== repoNow ? `repo "${f.repo}" ≠ "${repoNow}"`
+      : forceTs > Date.now() ? "future ts"
+      : "TTL expired (>60 min)";
+    reason += ` (note: force file ${forceFile()} exists but is rejected — ${why}; fix or delete it)`;
   }
   // fail-closed: the real-token reason, plus a malformed-force note when present
   // (diagnose, don't let a broken force file silently strand the session).
@@ -830,14 +880,14 @@ function blockAuditEntry(event: string, toolName: string, step: Step, mode: Mode
 
 export function validateToolCall(
   toolName: string, command: unknown, step: Step, mode: Mode,
-): { block: boolean; reason?: string; wouldBlock?: boolean } {
+): { block: boolean; reason?: string; wouldBlock?: boolean; freshTokenBlock?: boolean } {
   // #357 (Task 5): validateToolCall is PURE — it never writes audit. The
   // handler owns every audit write (single-audit: one entry per blocked /
   // would-block / allowed call). wouldBlock signals warn-mode would-block so
   // the handler can write ONE warn_blocked entry and skip the allowed entry.
   // checkpoint gate (issue #5039): fail-closed token validation. A missing,
   // stale, wrong-phase, non-CLEAR, or corrupt token blocks the step entirely
-  // (retry + operator override are the documented escape). Computed up front
+  // (retry + the operator force-pass are the documented escape). Computed up front
   // so warn mode can report would-block for checkpoint steps too.
   const checkpoint = step.gate === "checkpoint" ? checkpointTokenOk(step) : null;
 
@@ -854,10 +904,13 @@ export function validateToolCall(
   }
 
   // #357 (Task 6, d): checkpoint escape + guards (gate/strict only — warn never
-  // blocks). EVALUATION ORDER (P1): the (d) guard runs against THIS step BEFORE
-  // the (c) advancement evaluation (Task 7) — a checker re-run at an ok-
-  // checkpoint is blocked against the checkpoint step (token_fresh event
-  // references the pre-advance step), then advancement proceeds (token ok).
+  // blocks). EVALUATION ORDER (P1): the HANDLER evaluates the (c) token-ok
+  // advancement FIRST (blocked-call rule, Task 7) and validates this call
+  // against the CAPTURED pre-advance step object. So at an ok-checkpoint the
+  // (d) guards below run against the step the call was made at — a checker
+  // re-run is blocked (token_fresh; the step has already moved) while
+  // non-checker tools proceed; at a pending checkpoint the escape is the only
+  // pass.
   if (step.gate === "checkpoint" && (mode === "gate" || mode === "strict")) {
     // Defensive type-guard (P1): a non-string / missing bash command is a
     // fail-closed BLOCK — never throw into the handler (a throw could fail-open
@@ -871,11 +924,17 @@ export function validateToolCall(
       // BLOCKED by the checkpoint_token_fresh execution guard — re-running
       // can REMOVE the valid token (checker writes only on CLEAR; UNKNOWN
       // deletes it), stranding the session.
+      // #357 review (Historical-context P2): NON-checker tools are NOT blocked
+      // here — the handler's blocked-call rule has ALREADY advanced the step
+      // (the fresh token satisfied the gate), so this call proceeds and the
+      // NEXT call is validated against the next step. Blocking the advancing
+      // call would contradict step-entry guidance ("proceed with the next
+      // step") and burn a blocked audit entry in the success path.
       if (toolName === "read" || toolName === "loop_enforcer") return { block: false };
       if (toolName === "bash" && CHECKPOINT_ESCAPE_RE.test(command)) {
-        return { block: true, reason: `⛔ checkpoint gate — step "${step.name}" already has a fresh phase-correct token — do NOT re-run the checker (a re-run can REMOVE the token on UNKNOWN)` };
+        return { block: true, freshTokenBlock: true, reason: `⛔ checkpoint gate — step "${step.name}" already has a fresh phase-correct token — do NOT re-run the checker (a re-run can REMOVE the token on UNKNOWN)` };
       }
-      return { block: true, reason: `⛔ checkpoint gate — step "${step.name}" already passed (fresh token) — proceed; escape tools (read, loop_enforcer) remain available` };
+      return { block: false };
     }
     // No fresh token — the escape is the ONLY way out: read, loop_enforcer,
     // or the sole-command checker invocation (CLEAR-able). Everything else
@@ -1007,6 +1066,7 @@ export function _resetStateForTest(): void {
   currentRepoCache = null;
   repoTestOverride = null;
   FORCE_FILE_OVERRIDE = null;
+  TOKEN_FILE_OVERRIDE = null; // #357 review (Historical P3): reset-contract completeness — a stale token path must not leak into the next test
   if (sequenceTimeout) { clearTimeout(sequenceTimeout); sequenceTimeout = null; }
 }
 
@@ -1014,9 +1074,18 @@ export function _resetStateForTest(): void {
 
 export default function (pi: ExtensionAPI) {
   // ── session_start ──────────────────────────────
-  pi.on("session_start", async (_event, _ctx) => {
+  pi.on("session_start", async (event, _ctx) => {
     stepCache.clear();
     skillStack = [];
+    // #357 review (Extension-safety P1): the module-level recovery state is
+    // per-session — pi reuses the module scope across /new /resume /fork, so a
+    // parked checkpoint, a partial block-streak, a coalesce window, or stale
+    // markers MUST NOT bleed into the next session (one-shot suppression would
+    // silently swallow the recovery signal; a 1-2 streak would pre-park).
+    markers.clear();
+    parkedCheckpoints.clear();
+    checkpointBlockStreak = null;
+    auditCoalesce.clear();
     // ponytail: kill switch is a single-session escape — clear stale switches so new
     // sessions don't start silently bypassed (#7470). Env var bypass is unaffected.
     try {
@@ -1027,16 +1096,30 @@ export default function (pi: ExtensionAPI) {
       // #357 (Task 10, h): session_start cleanup mirrors the kill-switch hygiene.
       // Documented machine-shared hazard: any new session's start unlinks a
       // lingering operator force file (per-session scoping is the filed issue).
+      // #357 review (Extension-safety P2): scoped to NEW sessions — a mid-session
+      // /reload must not discard the operator's bypass for the CURRENT session.
       if (existsSync(forceFile())) {
-        unlinkSync(forceFile());
-        console.log("[sequence-enforcer] 🧹 Cleared stale force-pass file from previous session");
+        if ((event as any)?.reason === "reload") {
+          console.log("[sequence-enforcer] ⏸️  session reload — leaving operator force-pass file in place");
+        } else {
+          unlinkSync(forceFile());
+          console.log("[sequence-enforcer] 🧹 Cleared stale force-pass file from previous session");
+        }
       }
     } catch { /* best-effort */ }
     if (isKillSwitchActive()) {
       console.log("[sequence-enforcer] ⏸️  Kill switch active — all enforcement bypassed");
     } else {
-      auditLog({ ts: new Date().toISOString(), event: "startup", mode: resolveMode() });
-  console.log(`[sequence-enforcer] ✅ Loaded — mode: ${resolveMode()}`);
+      const mode = resolveMode();
+      auditLog({ ts: new Date().toISOString(), event: "startup", mode });
+      console.log(`[sequence-enforcer] ✅ Loaded — mode: ${mode}`);
+      // #357 review (pr-comment-history P2): when a session resolves warn via
+      // ARGV (bare-shell `pi -p`, no PI_MODE env — the #201 carve-out reversal
+      // class), name the enforcement now audit-only so the session log reader
+      // knows the verifier-step allow-list is not enforced and how to restore it.
+      if (mode === "warn" && !isPrintModeEnv(process.env) && isPrintMode(process.env, process.argv)) {
+        console.warn("[sequence-enforcer] ⚠️ warn default via argv-detected print (bare-shell pi -p, no PI_MODE) — verifier-step allow-list NOT enforced; AGENT_SEQUENCE_MODE=gate restores it");
+      }
     }
   });
 
@@ -1044,6 +1127,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, _ctx) => {
     stepCache.clear();
     skillStack = [];
+    // #357 review: same per-session hygiene as session_start.
+    markers.clear();
+    parkedCheckpoints.clear();
+    checkpointBlockStreak = null;
+    auditCoalesce.clear();
     clearBridgeState();
   });
 
@@ -1103,6 +1191,11 @@ export default function (pi: ExtensionAPI) {
       }
       if (advanced > 0) {
         top.stepIndex += advanced;
+        // #357 review (Bug-scan P2): auto-advancing into a checkpoint step must
+        // restart its stall clock — otherwise auto steps spanning >5 min of wall
+        // time leave a stale stepStartedAt and the FIRST call at the freshly-
+        // reached checkpoint fires a spurious wall-clock park.
+        top.stepStartedAt = Date.now();
         // If all steps are now completed (past last step):
         if (top.stepIndex >= top.steps.length) {
           console.log(
@@ -1168,7 +1261,21 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── tool_call: enforce step sequence ───────────
+  // Deployment-order assumption (#357 review, Extension-safety P2): extensions
+  // load in OS directory order (loader.js discoverExtensionsInDir) — a blocker
+  // registered BEFORE this handler (main-worktree-guard, review-enforcer) may
+  // intercept a call before checkpoint advancement/audit. That only DELAYS the
+  // advance (fail-safe — the next unblocked call advances), never bypasses the
+  // gate. The read-tracker above is guaranteed FIRST within this file by
+  // registration order.
   pi.on("tool_call", async (event, _ctx) => {
+    // #357 review (Extension-safety P1): emitToolCall has NO per-handler
+    // try/catch (runner.js) — a throw would error the tool call AND skip every
+    // remaining tool_call blocker (skill-enforcer, verification-gate, ...). The
+    // body is type-guarded fail-closed, but belt-and-suspenders: on an
+    // unexpected throw, audit handler_error and fail open (allow) so the tool
+    // chain survives; the other blockers still run.
+    try {
     const top = topSkill();
     const toolName = (event as any).toolName ?? event.toolName ?? "";
     if (isKillSwitchActive()) {
@@ -1215,6 +1322,10 @@ export default function (pi: ExtensionAPI) {
       // warn_blocked + checkpoint_skipped_warn).
       if (mode === "warn") {
         advanceCheckpoint(target);
+        // #357 review: consume a present force file on a warn-mode advance too —
+        // warn auto-advances without honoring it, but the one-shot invariant
+        // must not leave the operator's file to pass a later same-phase gate.
+        consumeForceFile(target, ownerStep.name, mode);
         auditLog({ ts: new Date().toISOString(), event: "checkpoint_skipped_warn", skill: target.path, step: ownerStep.name, tool: toolName, mode, token_state: tokenStateLabel(tokenState.reason), hint: gateGuidance(ownerStep, "warn") });
         return undefined;
       }
@@ -1226,13 +1337,15 @@ export default function (pi: ExtensionAPI) {
         // token satisfied the gate), and the advancing call is never re-validated
         // against the next step.
         advanceCheckpoint(target);
-        // #357 (Task 10, h): a force-driven advance consumes the file IMMEDIATELY
-        // (before validation — the one-shot invariant: the file can never pass a
-        // same-phase adjacent checkpoint). The call is STILL validated against the
-        // captured checkpoint step (blocked-call rule): with the force consumed,
-        // a non-escape call blocks (escape semantics), a checker re-run is the
-        // escape — both after the consumption.
-        if (tokenState.viaForce) consumeForceFile(target, ownerStep.name, mode);
+        // #357 (Task 10, h): a checkpoint advance consumes a PRESENT force file
+        // IMMEDIATELY (before validation — the one-shot invariant: the file can
+        // never pass a same-phase adjacent checkpoint). #357 review (Bug-scan
+        // P2): consumed on ANY advance, not just viaForce — a real-token-wins
+        // advance must not leave the operator's file to pass a later same-phase
+        // checkpoint. The call is STILL validated against the captured step: with
+        // a force consumed and no real token, the pending-checkpoint escape
+        // semantics apply; with a real token, the ok-checkpoint token_fresh guard.
+        consumeForceFile(target, ownerStep.name, mode);
         const result = validateToolCall(toolName, command, ownerStep, mode);
         if (result.block) {
           const trail = target.steps
@@ -1242,7 +1355,7 @@ export default function (pi: ExtensionAPI) {
           const guidance = gateGuidance(ownerStep);
           const key = checkpointKey(target);
           if (!shouldCoalesceBlocked(key)) {
-            auditLog({ ts: new Date().toISOString(), event: "blocked", skill: target.path, step: ownerStep.name, tool: toolName, mode, reason: result.reason, allowed: getExpectedToolsForStep(ownerStep).allow, hint: guidance });
+            auditLog({ ts: new Date().toISOString(), event: result.freshTokenBlock ? "checkpoint_token_fresh" : "blocked", skill: target.path, step: ownerStep.name, tool: toolName, mode, reason: result.reason, allowed: getExpectedToolsForStep(ownerStep).allow, hint: guidance });
           }
           return {
             block: true,
@@ -1328,6 +1441,10 @@ export default function (pi: ExtensionAPI) {
 
     auditLog({ ts: new Date().toISOString(), event: "allowed", skill: top.path, step: step.name, tool: toolName, mode });
     return undefined;
+    } catch (e) {
+      auditLog({ ts: new Date().toISOString(), event: "handler_error", handler: "enforcement", error: String(e) });
+      return undefined; // fail-safe allow + loud audit; other blockers still run
+    }
   });
 
   // #357 (Task 7, c): classify the token state for checkpoint_skipped_warn audits.
@@ -1366,7 +1483,8 @@ function tokenStateLabel(reason: string): string {
       const st = checkpointTokenOk(ownerStep);
       if (!marker.ok && st.ok) {
         advanceCheckpoint(marker.skill); // token produced by this call's completion
-        if (st.viaForce) consumeForceFile(marker.skill, ownerStep.name, resolveMode());
+        // #357 review: same any-advance consumption (real-token-wins included).
+        consumeForceFile(marker.skill, ownerStep.name, resolveMode());
       }
       return undefined;
     }

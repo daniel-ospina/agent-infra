@@ -136,10 +136,14 @@ function fakePi(): { pi: any; handlers: Record<string, Handler> } {
       on: (ev: string, h: Handler) => { (registered[ev] ??= []).push(h); },
     },
     handlers: new Proxy({} as Record<string, Handler>, {
-      get: (_t, prop: string) => (ev?: any, ctx?: any) => {
+      // #357 review (Bug-scan P2): await each handler IN ORDER and return the
+      // last settled result — pi's emitToolCall awaits handlers sequentially;
+      // the previous fire-and-collect silently diverged the moment any handler
+      // became genuinely async (enforcement must see the read-tracker's push).
+      get: (_t, prop: string) => async (ev?: any, ctx?: any) => {
         let result: unknown;
-        for (const h of registered[prop] ?? []) result = h(ev, ctx);
-        return result as Promise<unknown>;
+        for (const h of registered[prop] ?? []) result = await h(ev, ctx);
+        return result;
       },
     }),
   };
@@ -587,6 +591,43 @@ await test("read/loop_enforcer still allowed at an ok-checkpoint", () => {
   } finally { _setTokenFileForTest(null); }
 });
 
+await test("non-checker tool at a fresh-ok checkpoint → allowed (friction fix: the step already advanced; the next step validates)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined }, async () => {
+      sequenceEnforcer(pi as any);
+      _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+      writeToken(new Date().toISOString(), { phase: "plan" });
+      const res = await handlers.tool_call!({ toolName: "write", toolCallId: "w1", input: { path: "x", content: "y" } });
+      ok(!res || !res.block, "write allowed at fresh-ok checkpoint (blocked-call rule already advanced)");
+      equal(_stackForTest()[0]!.stepIndex, 1, "advance happened");
+      ok(!auditEntries.some((x) => x.event === "blocked"), "no spurious blocked audit in the success path");
+    });
+  } finally { auditRelease(); _setTokenFileForTest(null); }
+});
+
+await test("handler: checker re-run at a fresh-ok checkpoint → audit event checkpoint_token_fresh (the documented 4-event set)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv({ PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined }, async () => {
+      sequenceEnforcer(pi as any);
+      _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+      writeToken(new Date().toISOString(), { phase: "plan" });
+      const res = await handlers.tool_call!({ toolName: "bash", toolCallId: "tf1", input: { command: "parallel_work_check.sh plan" } });
+      ok(res && res.block, "checker re-run blocked at fresh-ok checkpoint");
+      equal(_stackForTest()[0]!.stepIndex, 1, "advance still happened (blocked-call rule)");
+      const fresh = auditEntries.filter((x) => x.event === "checkpoint_token_fresh");
+      equal(fresh.length, 1, "distinct checkpoint_token_fresh event emitted");
+      ok(!auditEntries.some((x) => x.event === "blocked" && x.tool === "bash"), "not logged as generic blocked");
+      ok((fresh[0]!.reason as string).includes("do NOT re-run"), "reason carries the token_fresh guidance");
+    });
+  } finally { auditRelease(); _setTokenFileForTest(null); }
+});
+
 await test("escape works under strict mode too", () => {
   ok(!validateToolCall("bash", "parallel_work_check.sh plan", checkpointStep(), "strict").block);
   ok(validateToolCall("bash", "rm -rf /", checkpointStep(), "strict").block);
@@ -860,6 +901,30 @@ await test("worker completes a multi-checkpoint skill end-to-end under warn (bot
   } finally { auditRelease(); }
 });
 
+await test("warn-mode advance consumes a present force file (one-shot invariant under warn too)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    _setRepoForTest("test-repo");
+    const forcePath = join(tmpDir("force-warn"), "force.json");
+    writeFileSync(forcePath, JSON.stringify({ verdict: "CLEAR", phase: "plan", operator: "daniel", origin: "shell", repo: "test-repo", ts: new Date().toISOString() }));
+    _setForceFileForTest(forcePath);
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+        await handlers.tool_call!({ toolName: "bash", toolCallId: "w1", input: { command: "rm -rf /" } });
+        equal(_stackForTest()[0]!.stepIndex, 1, "warn advanced");
+        ok(!existsSync(forcePath), "force file consumed on the warn advance (never passes a later same-phase gate)");
+        const pass = auditEntries.filter((x) => x.event === "checkpoint_force_pass");
+        equal(pass.length, 1, "checkpoint_force_pass audited for the consumed file");
+      },
+    );
+  } finally { auditRelease(); _setForceFileForTest(null); _setRepoForTest(null); }
+});
+
 // ── #357 Task 8: park-only checkpoint recovery (j) ──
 section("checkpoint recovery (j) — park-only");
 
@@ -927,6 +992,28 @@ await test("wall-clock stall: backdated checkpoint parks on the next tool_call (
   } finally { auditRelease(); _setTokenFileForTest(null); }
 });
 
+await test("auto-advance restarts the checkpoint stall clock (no spurious wall-clock park on first call at the checkpoint)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(GATE_ENV, async () => {
+      sequenceEnforcer(pi as any);
+      const steps = [
+        makeStep({ name: "a1", gate: "auto" }),
+        makeStep({ name: "check", gate: "checkpoint", token_phase: "plan" }),
+      ];
+      _pushSkillForTest("/repo/skills/auto/SKILL.md", steps, 0);
+      _stackForTest()[0]!.stepStartedAt = Date.now() - 6 * 60 * 1000; // stale clock from a long auto phase
+      // reading ANOTHER skill's SKILL.md auto-advances the top past `a1` into `check`
+      await handlers.tool_call!({ toolName: "read", toolCallId: "r1", input: { path: "/repo/skills/other/SKILL.md" } });
+      equal(_stackForTest()[0]!.stepIndex, 1, "auto-advanced into the checkpoint");
+      await handlers.tool_call!({ toolName: "read", toolCallId: "r2", input: { path: "x" } }); // first call AT the checkpoint
+      ok(!auditEntries.some((x) => x.event === "checkpoint_block_recovery"), "no spurious wall-clock park — the clock restarted at checkpoint entry");
+    });
+  } finally { auditRelease(); _setTokenFileForTest(null); }
+});
+
 await test("timer-driven park: ZERO further events after the arming call → sequence timer parks an idle checkpoint", async () => {
   _resetStateForTest();
   const { pi, handlers } = fakePi();
@@ -944,6 +1031,24 @@ await test("timer-driven park: ZERO further events after the arming call → seq
       equal(rec.length, 1, "idle checkpoint parked via the timer (timer-driven, not event-driven)");
       equal(_stackForTest().length, 1, "parked, never popped");
       equal(_stackForTest()[0]!.stepIndex, 0, "state preserved");
+    });
+  } finally { auditRelease(); _setTokenFileForTest(null); }
+});
+
+await test("timeout parks a checkpoint owner BELOW a sub-skill frame (owner via stack-walk, not top-only)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(GATE_ENV, async () => {
+      sequenceEnforcer(pi as any);
+      _pushSkillForTest("/repo/skills/owner/SKILL.md", checkpointSkillSteps(), 0); // owner at its checkpoint
+      _pushSkillForTest("/repo/skills/sub/SKILL.md", [makeStep({ name: "sub" })], 0); // sub-skill ABOVE the owner
+      _stackForTest()[0]!.stepStartedAt = Date.now() - 6 * 60 * 1000; // backdate the OWNER's clock
+      handleSequenceTimeout(process.env, ["pi"]);
+      const parks = auditEntries.filter((x) => x.event === "checkpoint_block_recovery");
+      equal(parks.length, 1, "owner parked despite sitting below the top frame");
+      equal(_stackForTest().length, 2, "stack preserved (park, never pop)");
     });
   } finally { auditRelease(); _setTokenFileForTest(null); }
 });
@@ -1111,6 +1216,8 @@ await test("force wrong-phase → block (a plan force never passes the implement
     writeForceFile({ ...FORCE_GOOD, phase: "implement" });
     const r = checkpointTokenOk(makeStep({ gate: "checkpoint", token_phase: "plan" }));
     ok(!r.ok, "wrong-phase force blocked");
+    ok(r.reason.includes("exists but is rejected"), "reason names the rejected force file (no silent strand)");
+    ok(r.reason.includes('phase "implement" ≠ "plan"'), "reason names the phase mismatch");
   } finally { _setForceFileForTest(null); _setRepoForTest(null); }
 });
 
@@ -1119,7 +1226,9 @@ await test("force repo-mismatch → block (a force written in repo A never passe
   try {
     _setRepoForTest("test-repo");
     writeForceFile({ ...FORCE_GOOD, repo: "other-repo" });
-    ok(!checkpointTokenOk(makeStep({ gate: "checkpoint", token_phase: "plan" })).ok);
+    const r = checkpointTokenOk(makeStep({ gate: "checkpoint", token_phase: "plan" }));
+    ok(!r.ok, "repo-mismatch force blocked");
+    ok(r.reason.includes('repo "other-repo" ≠ "test-repo"'), "reason names the repo mismatch");
   } finally { _setForceFileForTest(null); _setRepoForTest(null); }
 });
 
@@ -1129,6 +1238,17 @@ await test("force TTL: >60 min stale force → block (operator TTL re-checked pe
     _setRepoForTest("test-repo");
     writeForceFile({ ...FORCE_GOOD, ts: new Date(Date.now() - 61 * 60 * 1000).toISOString() });
     ok(!checkpointTokenOk(makeStep({ gate: "checkpoint", token_phase: "plan" })).ok);
+  } finally { _setForceFileForTest(null); _setRepoForTest(null); }
+});
+
+await test("force future-ts → rejected (a clock-skewed ts must not grant an infinite operator TTL)", async () => {
+  _resetStateForTest();
+  try {
+    _setRepoForTest("test-repo");
+    writeForceFile({ ...FORCE_GOOD, ts: new Date(Date.now() + 5 * 60 * 1000).toISOString() });
+    const r = checkpointTokenOk(makeStep({ gate: "checkpoint", token_phase: "plan" }));
+    ok(!r.ok, "future-ts force blocked");
+    ok(r.reason.includes("future ts"), "reason names the future-ts rejection");
   } finally { _setForceFileForTest(null); _setRepoForTest(null); }
 });
 
@@ -1206,6 +1326,44 @@ await test("session_start cleanup: a lingering force file is unlinked at session
   } finally { _setForceFileForTest(null); }
 });
 
+await test("session_start does NOT unlink on a mid-session reload (operator's file for the CURRENT session survives)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  try {
+    writeForceFile(FORCE_GOOD);
+    sequenceEnforcer(pi as any);
+    await handlers.session_start!({ type: "session_start", reason: "reload" } as any);
+    ok(existsSync(forceFilePath()), "reload leaves the operator's force-pass file in place");
+  } finally { _setForceFileForTest(null); }
+});
+
+await test("session_start resets recovery state (a prior session's one-shot park does NOT suppress the next session's signal)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(GATE_ENV, async () => {
+      sequenceEnforcer(pi as any);
+      // Session 1: 3 consecutive blocks → park (one-shot per checkpoint)
+      _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+      for (let i = 0; i < 3; i++) {
+        await handlers.tool_call!({ toolName: "bash", toolCallId: `s1b${i}`, input: { command: "rm -rf /" } });
+      }
+      let parks = auditEntries.filter((x) => x.event === "checkpoint_block_recovery");
+      equal(parks.length, 1, "session 1 parked once");
+      // Session 2 begins — the park and the partial streak must be forgotten
+      await handlers.session_start!();
+      await handlers.session_shutdown!();
+      _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+      for (let i = 0; i < 3; i++) {
+        await handlers.tool_call!({ toolName: "bash", toolCallId: `s2b${i}`, input: { command: "rm -rf /" } });
+      }
+      parks = auditEntries.filter((x) => x.event === "checkpoint_block_recovery");
+      equal(parks.length, 2, "session 2 parks again — the one-shot suppression did NOT leak across sessions");
+    });
+  } finally { auditRelease(); _setTokenFileForTest(null); }
+});
+
 await test("cross-session isolation: A's one-shot advance consumes only the file A's checkpoint consumed (phase/repo binding)", async () => {
   _resetStateForTest();
   const { pi, handlers } = fakePi();
@@ -1228,6 +1386,26 @@ await test("cross-session isolation: A's one-shot advance consumes only the file
       ok(existsSync(forceFilePath()), "second file untouched until ITS checkpoint advances (one-shot per checkpoint)");
     });
   } finally { auditRelease(); _setForceFileForTest(null); _setRepoForTest(null); }
+});
+
+await test("real-token-wins advance consumes a present force file (one-shot invariant across token paths)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    _setRepoForTest("test-repo");
+    await withEnv(GATE_ENV, async () => {
+      sequenceEnforcer(pi as any);
+      _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+      writeForceFile(FORCE_GOOD);
+      writeToken(new Date().toISOString(), { phase: "plan" }); // REAL token ALSO fresh
+      await handlers.tool_call!({ toolName: "read", toolCallId: "rw1", input: { path: "x" } });
+      equal(_stackForTest()[0]!.stepIndex, 1, "advanced via the real token");
+      ok(!existsSync(forceFilePath()), "force file consumed despite the real-token advance (must never pass a same-phase adjacent checkpoint)");
+      const pass = auditEntries.filter((x) => x.event === "checkpoint_force_pass");
+      equal(pass.length, 1, "checkpoint_force_pass audited — the operator's file was present at the advance");
+    });
+  } finally { auditRelease(); _setForceFileForTest(null); _setTokenFileForTest(null); _setRepoForTest(null); }
 });
 
 

@@ -20,14 +20,15 @@
  * resolveMode seam and repo-freshness exported-internals pattern); runtime
  * callers use the defaults.
  *
- * isPrintModeEnv(): env-only variant. #201 decision: sequence-enforcer's
- * SEMANTIC mode decisions (resolveMode gate/warn, timeout park/pop) are scoped
- * to the env marker — task sub-agents / swarm_daemon workers set PI_MODE=print
- * and cannot dispatch reviewer sub-agents (hence warn/park); a bare shell
- * `pi -p` CAN dispatch `task` and was decided to keep gate. argv-detection at
- * those sites would silently flip shell-spawned headless sessions to warn.
- * Output/silence gates (banners, pulls, audit logs) use the argv-aware
- * isPrintMode(); semantic mode decisions use isPrintModeEnv().
+ * isPrintModeEnv(): env-only variant. — HISTORICAL (#201 decision; SUPERSEDED
+ * by #357 below for the sequence-enforcer's semantic sites). #201 scoped the
+ * enforcer's SEMANTIC mode decisions (resolveMode gate/warn, timeout park/pop)
+ * to the env marker, reasoning that a bare shell `pi -p` CAN dispatch `task`
+ * and should keep gate. #357 reverses that for the enforcer (see below).
+ * isPrintModeEnv is retained for callers OUTSIDE the enforcer that still want
+ * the env-only signal (e.g. output/silence gates). Do NOT restore the carve-
+ * out for resolveMode/handleSequenceTimeout without revisiting the checkpoint
+ * deadlock evidence (#357: 118/118 production blocks in the bare-shell class).
  *
  * #357 (Task 4) — the #201 carve-out is REVERSED for semantic mode decisions:
  * resolveMode() now uses isPrintMode(env, argv) as its fallback. The carve-out

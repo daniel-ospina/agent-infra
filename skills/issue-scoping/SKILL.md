@@ -85,11 +85,12 @@ This prevents silent scope creep — the user knows what was found and can prior
 ## Process Flow
 
 > **🛡️ Mandatory parallel-work checkpoint (#4907):** BEFORE problem-diverge, run
-> `<path>/parallel_work_check.sh start` (C1 — closed-issue DUP_FIX search;
-> delegates the behind-origin check to checkout_guard; resolve the checker via
-> `$PARALLEL_CHECK_BIN` — bare names and repo-relative paths fail the escape).
+> `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh start` (C1 —
+> closed-issue DUP_FIX search; delegates the behind-origin check to
+> checkout_guard; `$PARALLEL_CHECK_BIN` overrides the path — bare names and
+> repo-relative paths fail the escape).
 > AFTER scope converges (before solution-diverge), run
-> `<path>/parallel_work_check.sh scope` (C2) and write the card's
+> `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh scope` (C2) and write the card's
 > `touched_paths` via `update_touched_paths`. A CLEAR verdict writes the PASS
 > token (10-min TTL); the checkpoint gate (fail-closed) blocks progression
 > without it. Set `CHECKOUT_GUARD_ENFORCE=1` in the session env at these steps

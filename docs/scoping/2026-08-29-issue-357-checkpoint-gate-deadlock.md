@@ -1,3 +1,14 @@
+---
+title: "#357 — Checkpoint Gate Deadlock Fix — Scope"
+type: engineering
+domain: operations
+doc_status: draft
+subjects.team: organisation-design-team
+created: 2026-08-29
+aboutSubjects: sequence-enforcer, enforcement, pi-extensions
+aboutObjects: agent-infra, issue-357
+---
+
 # Scope: #357 — sequence-enforcer checkpoint step-gate deadlocks pi -p workers
 
 > Issue: https://github.com/daniel-ospina/agent-infra/issues/357
