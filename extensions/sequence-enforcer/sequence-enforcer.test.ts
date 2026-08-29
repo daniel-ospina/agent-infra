@@ -1460,6 +1460,49 @@ await test("mismatched-phase force file is LEFT for its own checkpoint (phase-aw
   } finally { auditRelease(); _setForceFileForTest(null); _setTokenFileForTest(null); _setRepoForTest(null); }
 });
 
+await test("non-passable force file (expired / wrong-repo / future-ts) survives a real-token advance; malformed is cleaned without a force_pass audit", async () => {
+  const variants: Array<{ label: string; obj: unknown }> = [
+    { label: "expired", obj: { ...FORCE_GOOD, ts: new Date(Date.now() - 61 * 60 * 1000).toISOString() } },
+    { label: "wrong-repo", obj: { ...FORCE_GOOD, repo: "other-repo" } },
+    { label: "future-ts", obj: { ...FORCE_GOOD, ts: new Date(Date.now() + 5 * 60 * 1000).toISOString() } },
+  ];
+  for (const v of variants) {
+    _resetStateForTest();
+    const { pi, handlers } = fakePi();
+    auditCapture();
+    try {
+      _setRepoForTest("test-repo");
+      await withEnv(GATE_ENV, async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+        writeForceFile(v.obj);
+        writeToken(new Date().toISOString(), { phase: "plan" }); // REAL token drives the advance
+        await handlers.tool_call!({ toolName: "read", toolCallId: "fv1", input: { path: "x" } });
+        equal(_stackForTest()[0]!.stepIndex, 1, `${v.label}: advanced via the real token`);
+        ok(existsSync(forceFilePath()), `${v.label}: non-passable force file survives the advance (never consumed — it could not pass this checkpoint)`);
+        ok(!auditEntries.some((x) => x.event === "checkpoint_force_pass"), `${v.label}: no false force-pass audit`);
+      });
+    } finally { auditRelease(); _setForceFileForTest(null); _setTokenFileForTest(null); _setRepoForTest(null); }
+  }
+  // malformed: cleaned up on the advance, but WITHOUT a force_pass audit (it never passed anything)
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    _setRepoForTest("test-repo");
+    await withEnv(GATE_ENV, async () => {
+      sequenceEnforcer(pi as any);
+      _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+      writeForceFile("{not json");
+      writeToken(new Date().toISOString(), { phase: "plan" });
+      await handlers.tool_call!({ toolName: "read", toolCallId: "fv2", input: { path: "x" } });
+      equal(_stackForTest()[0]!.stepIndex, 1, "malformed: advanced via the real token");
+      ok(!existsSync(forceFilePath()), "malformed: file cleaned up on the advance (never passable — no trap left)");
+      ok(!auditEntries.some((x) => x.event === "checkpoint_force_pass"), "malformed: no force-pass audit (it never passed anything)");
+    });
+  } finally { auditRelease(); _setForceFileForTest(null); _setTokenFileForTest(null); _setRepoForTest(null); }
+});
+
 
 await test("print + no override → warn (the #201 default)", () => {
   equal(resolveMode({ PI_MODE: "print" }, "/nonexistent/mode-file"), "warn");
@@ -1718,6 +1761,26 @@ await test("task tool_call → reviewer counted; tool_result → advances to nex
       },
     );
   } finally { auditRelease(); }
+});
+
+await test("warn mode: sequence timer does NOT park a backdated checkpoint owner (park is gate/strict-only; re-arm persists)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+        backdateCheckpoint(6); // stall > 5 min
+        const before = timerCbs.length;
+        handleSequenceTimeout(process.env, ["-p"]);
+        ok(!auditEntries.some((x) => x.event === "checkpoint_block_recovery"), "warn mode: no park — recovery-signal noise in a success path (warn auto-advances)");
+        equal(timerCbs.length, before + 1, "timer re-armed");
+      },
+    );
+  } finally { auditRelease(); _setTokenFileForTest(null); }
 });
 
 await test("timeout wiring — firing the scheduled timer callback parks in print mode", async () => {
