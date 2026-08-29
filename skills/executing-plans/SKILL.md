@@ -12,8 +12,10 @@ steps:
     gate: checkpoint
     token_phase: start
     requires: [workspace_setup]
-    # #4907: run `parallel_work_check start` (C1 — delegates behind-check to
-    # checkout_guard) before touching code. Set CHECKOUT_GUARD_ENFORCE=1.
+    # #4907: run `<path>/parallel_work_check.sh start` (C1 — delegates behind-
+    # check to checkout_guard; resolve via $PARALLEL_CHECK_BIN) before touching
+    # code. Set CHECKOUT_GUARD_ENFORCE=1. read/loop_enforcer are the in-session
+    # escape; force-pass via /tmp/parallel-check-force.json.
   - name: complexity_ratings
     type: skill
     gate: auto
@@ -35,8 +37,8 @@ steps:
     gate: checkpoint
     token_phase: implement
     requires: [implement_batch]
-    # #4907: run `parallel_work_check implement` (C4 — base-drift + symbol
-    # re-check) before verification.
+    # #4907: run `<path>/parallel_work_check.sh implement` (C4 — base-drift +
+    # symbol re-check; resolve via $PARALLEL_CHECK_BIN) before verification.
   - name: verify_batch
     type: skill
     gate: verifier

@@ -28,6 +28,20 @@
  * those sites would silently flip shell-spawned headless sessions to warn.
  * Output/silence gates (banners, pulls, audit logs) use the argv-aware
  * isPrintMode(); semantic mode decisions use isPrintModeEnv().
+ *
+ * #357 (Task 4) — the #201 carve-out is REVERSED for semantic mode decisions:
+ * resolveMode() now uses isPrintMode(env, argv) as its fallback. The carve-out
+ * assumed bare-shell `pi -p` workers can always dispatch task — but the
+ * checkpoint step-gate (Enforcement A #5039) is unsatisfiable AND inescapable
+ * in exactly that class (workers deadlock: 118/118 production blocks). A worker
+ * that hits a checkpoint gate with a gate-mode default has no in-session escape
+ * (loop_enforcer/read are also blocked until a token exists), so warn is the
+ * safe default for ALL print sessions, env- or argv-detected. Explicit
+ * AGENT_SEQUENCE_MODE/ELDATO_SEQUENCE_MODE/PI_ENFORCER_MODE/mode-file
+ * overrides still force gate/strict. handleSequenceTimeout's park/pop predicate
+ * uses the same (env, argv) seam so parked behavior and the audited mode match.
+ * --mode json/rpc spawns remain gate-resolving residuals (documented in the
+ * #357 scoping doc) — the helper itself is unchanged.
  */
 
 const VALUE_TAKING_FLAGS = new Set([

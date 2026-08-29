@@ -50,6 +50,11 @@ jobs:
           npx tsx extensions/shared/print-mode-wiring.test.ts || failures=$((failures+1))
           echo "== extensions/auto-sync.test.ts =="
           npx tsx extensions/auto-sync.test.ts || failures=$((failures+1))
+          # #357 — sequence-enforcer: the gate-critical suite was the only one NOT
+          # in CI (the never-passable checkpoint contract shipped untested, 08-12).
+          # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
+          echo "== extensions/sequence-enforcer/sequence-enforcer.test.ts =="
+          npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
           if [ $failures -gt 0 ]; then
             echo "❌ $failures extension test file(s) failed"
             exit 1

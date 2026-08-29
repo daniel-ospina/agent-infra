@@ -28,8 +28,13 @@ steps:
     gate: checkpoint
     token_phase: plan
     requires: [integration_surface]
-    # #4907: run `parallel_work_check plan` (C3) — CLEAR verdict writes the
-    # PASS token; fail-closed gate blocks until fresh. Set CHECKOUT_GUARD_ENFORCE=1.
+    # #4907: run `<path>/parallel_work_check.sh plan` (C3) — resolve the checker
+    # via $PARALLEL_CHECK_BIN (default /Users/danielospina/swarm/operations/
+    # coordination/parallel_work_check.sh; bare names + repo-relative paths fail
+    # the escape). CLEAR verdict writes the PASS token; the gate blocks until
+    # fresh. Set CHECKOUT_GUARD_ENFORCE=1. At the gate: read / loop_enforcer are
+    # always allowed; operator force-pass via /tmp/parallel-check-force.json
+    # (one-shot, 60-min TTL, repo-bound, human-only).
   - name: draft_implementation_plan
     type: skill
     gate: auto
