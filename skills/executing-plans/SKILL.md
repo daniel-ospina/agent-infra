@@ -12,8 +12,12 @@ steps:
     gate: checkpoint
     token_phase: start
     requires: [workspace_setup]
-    # #4907: run `parallel_work_check start` (C1 — delegates behind-check to
-    # checkout_guard) before touching code. Set CHECKOUT_GUARD_ENFORCE=1.
+    # #4907: run `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh start` (C1 —
+    # delegates the behind-check to checkout_guard; $PARALLEL_CHECK_BIN overrides
+    # the path) before touching code. Set CHECKOUT_GUARD_ENFORCE=1. read /
+    # loop_enforcer are the in-session escape; force-pass via /tmp/parallel-check-force.json.
+    # (the escape requires the `.sh|.py` suffix; no-suffix bare names fail —
+    # prefer the resolved absolute path).
   - name: complexity_ratings
     type: skill
     gate: auto
@@ -35,8 +39,12 @@ steps:
     gate: checkpoint
     token_phase: implement
     requires: [implement_batch]
-    # #4907: run `parallel_work_check implement` (C4 — base-drift + symbol
-    # re-check) before verification.
+    # #4907: run `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh implement` (C4 —
+    # base-drift + symbol re-check; $PARALLEL_CHECK_BIN overrides the path)
+    # before verification. read / loop_enforcer are the in-session escape;
+    # operator force-pass via /tmp/parallel-check-force.json (one-shot).
+    # (the escape requires the `.sh|.py` suffix; no-suffix bare names fail —
+    # prefer the resolved absolute path).
   - name: verify_batch
     type: skill
     gate: verifier

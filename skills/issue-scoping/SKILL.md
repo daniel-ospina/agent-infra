@@ -85,13 +85,19 @@ This prevents silent scope creep — the user knows what was found and can prior
 ## Process Flow
 
 > **🛡️ Mandatory parallel-work checkpoint (#4907):** BEFORE problem-diverge, run
-> `parallel_work_check start` (C1 — closed-issue DUP_FIX search; delegates the
-> behind-origin check to checkout_guard). AFTER scope converges (before
-> solution-diverge), run `parallel_work_check scope` (C2) and write the card's
+> `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh start` (C1 —
+> closed-issue DUP_FIX search; delegates the behind-origin check to
+> checkout_guard; `$PARALLEL_CHECK_BIN` overrides the path — the escape
+> requires the `.sh|.py` suffix; prefer the resolved absolute path (no-suffix
+> bare names fail).
+> AFTER scope converges (before solution-diverge), run
+> `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh scope` (C2) and write the card's
 > `touched_paths` via `update_touched_paths`. A CLEAR verdict writes the PASS
 > token (10-min TTL); the checkpoint gate (fail-closed) blocks progression
 > without it. Set `CHECKOUT_GUARD_ENFORCE=1` in the session env at these steps
-> so the stale-base guard is fail-closed, not dry-run.
+> so the stale-base guard is fail-closed, not dry-run. At a pending gate:
+> `read`/`loop_enforcer` are the in-session escape; the operator force-pass is
+> `/tmp/parallel-check-force.json` (one-shot, 60-min TTL, repo-bound).
 > Maintain `touched_paths` through the work; release on completion (C5).
 
 
