@@ -22,6 +22,7 @@ import {
   checkpointTokenOk,
   parseTokenTs,
   loadSteps,
+  CHECKPOINT_WHITESPACE_REJECT,
   _setTokenFileForTest,
   _setForceFileForTest,
   _setRepoForTest,
@@ -96,10 +97,12 @@ function auditRelease() { _setAuditSinkForTest(null); }
 const origSetTimeout = globalThis.setTimeout;
 const origClearTimeout = globalThis.clearTimeout;
 let timerCbs: Array<() => void> = [];
+let clearedTimers: unknown[] = [];
 function installFakeTimers() {
   timerCbs = [];
+  clearedTimers = [];
   (globalThis as any).setTimeout = (cb: () => void) => { timerCbs.push(cb); return timerCbs.length; };
-  (globalThis as any).clearTimeout = () => {};
+  (globalThis as any).clearTimeout = (id: unknown) => { clearedTimers.push(id); };
 }
 function restoreTimers() {
   (globalThis as any).setTimeout = origSetTimeout;
@@ -423,15 +426,30 @@ await test("checkpoint step WITH token_phase → no F2 warning", async () => {
 // ── auditLog — NODE_ENV=test sink hygiene (#357 Task 8, landed early) ──
 section("auditLog — no production writes under NODE_ENV=test without a sink");
 
-await test("auditLog with no sink under NODE_ENV=test → ZERO production writes (probe-hygiene)", () => {
+await test("auditLog with no sink under NODE_ENV=test → ZERO production writes (probe-hygiene)", async () => {
   const auditPath = join(homedir(), ".pi", "agent", "audit", "enforcement.jsonl");
   const before = existsSync(auditPath) ? readFileSync(auditPath, "utf-8") : "";
-  _setAuditSinkForTest(null);
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  _setAuditSinkForTest(null); // NO sink — without the NODE_ENV=test guard this WOULD write the production log
   try {
-    // drive a full enforcement path with no sink — would previously fall
-    // through to the real ~/.pi/agent/audit/enforcement.jsonl
-    const step = makeStep({ name: "review", gate: "verifier" });
-    validateToolCall("bash", "rm -rf /", step, "gate");
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        // a real handler path: blocked call at a pending checkpoint — auditLog
+        // (event: blocked) fires; it must NOT reach the production file.
+        _pushSkillForTest("/repo/skills/check/SKILL.md", [makeStep({ name: "check", gate: "checkpoint", token_phase: "plan" })], 0);
+        await handlers.tool_call!({ toolName: "bash", toolCallId: "hyg1", input: { command: "rm -rf /" } });
+        // and a warn-mode checkpoint_skipped_warn path
+        await withEnv(
+          { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+          async () => {
+            await handlers.tool_call!({ toolName: "bash", toolCallId: "hyg2", input: { command: "rm -rf /" } });
+          },
+        );
+      },
+    );
   } finally {
     _setAuditSinkForTest(null);
   }
@@ -525,12 +543,11 @@ await test("BLOCKED: task tool (not an escape tool)", () => {
 });
 
 await test("U+0020-not-rejected regression: the reject-set does NOT match a plain space", () => {
-  const reject = /[^\S\u0020]|[\u200B-\u200D\u2060\u0085]/u;
-  ok(!reject.test(" "), "plain space must NOT be rejected");
-  ok(reject.test("\t"), "tab rejected");
-  ok(reject.test("\n"), "newline rejected");
-  ok(reject.test("\u00a0"), "NBSP rejected");
-  ok(reject.test("\u200b"), "zero-width rejected");
+  ok(!CHECKPOINT_WHITESPACE_REJECT.test(" "), "plain space must NOT be rejected");
+  ok(CHECKPOINT_WHITESPACE_REJECT.test("\t"), "tab rejected");
+  ok(CHECKPOINT_WHITESPACE_REJECT.test("\n"), "newline rejected");
+  ok(CHECKPOINT_WHITESPACE_REJECT.test("\u00a0"), "NBSP rejected");
+  ok(CHECKPOINT_WHITESPACE_REJECT.test("\u200b"), "zero-width rejected");
 });
 
 await test("malformed bash events → fail-closed BLOCK, no throw (input:{} / undefined / 42 / null)", () => {
@@ -1364,6 +1381,22 @@ await test("session_start resets recovery state (a prior session's one-shot park
   } finally { auditRelease(); _setTokenFileForTest(null); }
 });
 
+await test("session_start clears the armed sequence timer (a stale timer never fires into a new session)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  try {
+    await withEnv(GATE_ENV, async () => {
+      sequenceEnforcer(pi as any);
+      _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0);
+      await handlers.tool_call!({ toolName: "bash", toolCallId: "st1", input: { command: "rm -rf /" } }); // arms the 10-min timer
+      ok(timerCbs.length >= 1, "timer armed by the tool_call");
+      clearedTimers.length = 0;
+      await handlers.session_start!();
+      ok(clearedTimers.length >= 1, "session_start cleared the armed timer (cycle-2 Extension-safety)");
+    });
+  } finally { _setTokenFileForTest(null); }
+});
+
 await test("cross-session isolation: A's one-shot advance consumes only the file A's checkpoint consumed (phase/repo binding)", async () => {
   _resetStateForTest();
   const { pi, handlers } = fakePi();
@@ -1404,6 +1437,25 @@ await test("real-token-wins advance consumes a present force file (one-shot inva
       ok(!existsSync(forceFilePath()), "force file consumed despite the real-token advance (must never pass a same-phase adjacent checkpoint)");
       const pass = auditEntries.filter((x) => x.event === "checkpoint_force_pass");
       equal(pass.length, 1, "checkpoint_force_pass audited — the operator's file was present at the advance");
+    });
+  } finally { auditRelease(); _setForceFileForTest(null); _setTokenFileForTest(null); _setRepoForTest(null); }
+});
+
+await test("mismatched-phase force file is LEFT for its own checkpoint (phase-aware consumption)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    _setRepoForTest("test-repo");
+    await withEnv(GATE_ENV, async () => {
+      sequenceEnforcer(pi as any);
+      _pushSkillForTest("/repo/skills/check/SKILL.md", checkpointSkillSteps(), 0); // plan checkpoint
+      writeForceFile({ ...FORCE_GOOD, phase: "implement" }); // operator pre-wrote the IMPLEMENT file
+      writeToken(new Date().toISOString(), { phase: "plan" }); // real plan token advances check1
+      await handlers.tool_call!({ toolName: "read", toolCallId: "mm1", input: { path: "x" } });
+      equal(_stackForTest()[0]!.stepIndex, 1, "advanced via the real plan token");
+      ok(existsSync(forceFilePath()), "implement-phase file survives the plan advance — it is for ITS checkpoint");
+      ok(!auditEntries.some((x) => x.event === "checkpoint_force_pass"), "no false force-pass claim at the wrong step");
     });
   } finally { auditRelease(); _setForceFileForTest(null); _setTokenFileForTest(null); _setRepoForTest(null); }
 });

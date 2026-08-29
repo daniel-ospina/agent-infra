@@ -87,8 +87,9 @@ This prevents silent scope creep — the user knows what was found and can prior
 > **🛡️ Mandatory parallel-work checkpoint (#4907):** BEFORE problem-diverge, run
 > `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh start` (C1 —
 > closed-issue DUP_FIX search; delegates the behind-origin check to
-> checkout_guard; `$PARALLEL_CHECK_BIN` overrides the path — bare names and
-> repo-relative paths fail the escape).
+> checkout_guard; `$PARALLEL_CHECK_BIN` overrides the path — the escape
+> requires the `.sh|.py` suffix; prefer the resolved absolute path (no-suffix
+> bare names fail).
 > AFTER scope converges (before solution-diverge), run
 > `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh scope` (C2) and write the card's
 > `touched_paths` via `update_touched_paths`. A CLEAR verdict writes the PASS

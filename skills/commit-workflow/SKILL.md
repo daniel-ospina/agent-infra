@@ -16,7 +16,8 @@ steps:
     requires: [preflight_checks]
     # #4907: run `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh implement` (C4) before committing
     # — pre-merge symbol re-check + base-drift ($PARALLEL_CHECK_BIN overrides the
-    # path; bare names fail the escape). Fail-closed gate; read / loop_enforcer
+    # path; the escape requires the `.sh|.py` suffix — no-suffix bare names
+    # fail). Fail-closed gate; read / loop_enforcer
     # are the in-session escape; operator force-pass via /tmp/parallel-check-force.json.
   - name: stage_and_commit
     type: skill

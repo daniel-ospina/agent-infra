@@ -29,8 +29,9 @@ steps:
     token_phase: plan
     requires: [integration_surface]
     # #4907: run `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh plan` (C3)
-    # — or `$PARALLEL_CHECK_BIN plan` when that env override is set (bare names
-    # and repo-relative paths fail the escape). CLEAR verdict writes the PASS
+    # — or `$PARALLEL_CHECK_BIN plan` when that env override is set (the escape
+    # requires the `.sh|.py` suffix — prefer the resolved absolute path;
+    # no-suffix bare names fail). CLEAR verdict writes the PASS
     # token; the gate blocks until
     # fresh. Set CHECKOUT_GUARD_ENFORCE=1. At the gate: read / loop_enforcer are
     # always allowed; operator force-pass via /tmp/parallel-check-force.json
