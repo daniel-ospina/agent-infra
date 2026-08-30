@@ -1,0 +1,16 @@
+name: Bad Workflow
+# Regression fixture (#398): the #394 defect class — a literal `${{` token in
+# a plain YAML scalar description. GitHub parses ${{ in plain scalars; the
+# trailing quote breaks the expression lexer → 'workflow file issue', zero jobs.
+on:
+  workflow_call:
+    inputs:
+      test-command:
+        type: string
+        default: ''
+        description: MUST NOT contain '${{'.
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hello
