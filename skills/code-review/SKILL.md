@@ -34,7 +34,14 @@ steps:
     gate: auto
     requires: [fixer_loop]
     produces: [review_posted]
+  - name: record_review
+    type: skill
+    gate: auto
+    requires: [post_and_log]
+    produces: [review_recorded]
 ---
+> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
+> Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
@@ -58,11 +65,11 @@ Provide a code review for the given pull request.
 **Routing:**
 - `--standard-tier` present → skip to **Standard-Tier Review**
 - `--re-review` present (without `--standard-tier`) → skip to **Smart Re-Review**
-- Neither flag → follow steps 1–9 below
+- Neither flag → follow steps 1–10 below
 
 ## Auto-Continue Protocol
 
-**After review completes clean (0 P0, 0 P1, 0 P2 — all findings with confidence ≥ 50 resolved), auto-merge if applicable and proceed immediately. Do NOT pause to ask "shall I merge?" or "review complete — proceed?"**
+**After review completes clean (0 P0, 0 P1, 0 P2 — all findings with confidence ≥ 50 resolved), record the verdict (Step 10), then auto-merge if applicable and proceed immediately. Do NOT pause to ask "shall I merge?" or "review complete — proceed?"**
 
 **Self-Healing:** When review finds issues, the fixer loop (Steps 6-6.5) handles all severity levels with confidence scoring, convergence detection, and escalation. Do NOT apply separate fixing logic — use the existing fixer loop. See Steps 6-6.5 for the full self-healing workflow.
 
@@ -828,7 +835,7 @@ Return ONLY the number.
 
 ### Step 6 — Filter & Fix
 
-Filter out issues with score < 50. If none survive → go to Step 9 (Logging), then stop.
+Filter out issues with score < 50. If none survive → go to Step 9 (Logging), then Step 10 (record the verdict), then stop.
 
 **Fixer configuration** — read `operations/ai-workflow-tools/config.json` (defaults if missing):
 - `fixer_enabled`: default `true`
@@ -1068,6 +1075,38 @@ true
 **Check types:** `CLAUDE.md-adherence`, `comment-compliance`, `bug`, `historical-context`, `pr-comment-history`, `security`, `sql-test-gap`, `content-generation-gap`, `gate-warning`, `continuity-directive`, `frontmatter`, `broken-reference`, `sequence-correctness`, `handover-contract`, `gate-placement`, `orchestrator-dependency`, `io-contract`, `review-gate-integration`, `standalone-invocability`, `cross-skill-assumption`, `vocabulary-conflict`, `ontology-drift`, `downstream-impact`, `template-validity`, `subject-registry`, `runtime-safety`, `error-handling`, `silent-failure`, `config-validity`, `ux-consistency`, `ux-coverage`, `ux-realism`, `integration`, `architectural-soundness`, `contract-completeness`, `schema-correctness`, `ontology-alignment`, `e2e-coverage`, `e2e-reproducibility`, `config-consistency`, `secret-leak`, `insecure-default`
 **Severity:** `high` (90-100), `medium` (70-89), `low` (50-69)
 
+### Step 10 — Record Review Verdict (ai-review-gate evidence, #2058)
+
+When the review converged clean (0 P0, 0 P1, 0 P2 — all findings with
+confidence ≥ 50 resolved), record the verdict so the `ai-review-gate` required
+check can go green. Best-effort — NEVER fails the workflow:
+
+```bash
+# Resolve record-review.sh explicitly — ~/.pi/agent/scripts is not on PATH.
+RECORD_SH="$(command -v record-review.sh 2>/dev/null || true)"
+if [ -z "$RECORD_SH" ] && [ -x "$HOME/.pi/agent/scripts/record-review.sh" ]; then
+  RECORD_SH="$HOME/.pi/agent/scripts/record-review.sh"
+fi
+if [ -n "$RECORD_SH" ]; then
+  # REST head resolution (GraphQL-exhaustion resilience, per #192).
+  HEAD_SHA="$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>" --jq .head.sha 2>/dev/null || true)"
+  [ -n "$HEAD_SHA" ] && "$RECORD_SH" <PR_NUMBER> "$HEAD_SHA" clean
+fi
+```
+
+- `record-review.sh` auto-resolves `<owner/repo>`; pass it explicitly as the 4th
+  arg when run outside the git repo.
+- The evidence post triggers the `edited` event, which re-runs the
+  `ai-review-gate` workflow and turns the check green (the marker is HMAC-signed;
+  see the workflow header in `.github/workflows/ai-review-gate.yml`).
+- If the PR head moves AFTER recording (fix commits, merge of main), the gate
+  turns red again: re-review the new head and re-record. NEVER re-record a moved
+  head without a fresh review — the gate binds the full head sha.
+- A saved record with a FAILED evidence post (transient API error) leaves the
+  gate red: re-run `record-review.sh` to retry the post (the script warns and
+  exits 0 on transient failures).
+- If `record-review.sh` is unavailable (repo without the gate), skip silently.
+
 ## Standard-Tier Review (`--standard-tier`)
 
 Runs 2 agents. Used when full review is disproportionate.
@@ -1076,7 +1115,7 @@ Runs 2 agents. Used when full review is disproportionate.
 
 **Step 4:** Launch only 2 parallel agents — Guidance Compliance + Bug Scan (shallow only, Agent #2a). Skip Agent #2b (deep), Agent #3 (History), and Agent #4 (PR Comments).
 
-**Step 5 onward:** Same as full review (scoring, filter, fixer, re-check, comment, logging). Append `(standard-tier review: guidance compliance + bug scan)` to comment header.
+**Step 5 onward:** Same as full review (scoring, filter, fixer, re-check, comment, logging), then record the verdict (Step 10). Append `(standard-tier review: guidance compliance + bug scan)` to comment header.
 
 ### Standard-Tier + Re-review
 
@@ -1097,7 +1136,7 @@ Targeted review on fix commits only. Skipped agents: Git History, PR Comments (s
 - Bug Scan (delta diff)
 - Guidance Compliance — code comments subset (delta diff, code comments only)
 
-**Step E — Continue from Step 5:** Scoring, filter (skip fixer loop — `--re-review` disables it), re-check, comment, logging. Append `(re-review: fix-commits delta)` to comment header.
+**Step E — Continue from Step 5:** Scoring, filter (skip fixer loop — `--re-review` disables it), re-check, comment, logging, then record the verdict (Step 10). Append `(re-review: fix-commits delta)` to comment header.
 
 ## False Positives to Ignore
 

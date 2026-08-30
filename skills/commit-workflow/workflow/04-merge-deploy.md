@@ -40,6 +40,16 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    merge origin/main` into the PR branch, then RE-RUN the affected pre-flight regression tests
    on the merged state BEFORE merging. Non-overlapping, current branches skip this (no standing
    churn). Literal conflicts surface here and remain blocked by condition 4.
+6. **Review record at the final head (ai-review-gate, #2058)** — a clean review record
+   (`~/.pi/agent/reviews/<PR>.json`, verdict `clean`/`clean-micro`) exists at the CURRENT head
+   sha. The `code-review` skill records automatically on clean convergence (Step 10). If the
+   head moved after the record (fix commits, merge of main): re-run the `code-review` skill on
+   the new head, then re-record —
+   `~/.pi/agent/scripts/record-review.sh <PR> <full-head-sha> clean <owner/repo>` (the script
+   is not on PATH — use the explicit path).
+   NEVER re-record a moved head without a fresh review: the `ai-review-gate` required check
+   verifies signature + full-sha freshness, and the review-enforcer blocks the merge command
+   without a matching record, so the ceremony stays red until evidence is genuinely refreshed.
 
 **Human escalation (only for):** P0 findings requiring an architectural or security decision —
 irreversible operations, data loss, security breach — and only after the code-review fixer loop
