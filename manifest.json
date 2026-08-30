@@ -63,12 +63,6 @@
       "eldato-outreach": [
         "templates/.github/workflows/"
       ],
-      "premise-labs": [
-        "templates/.github/workflows/"
-      ],
-      "tortoise": [
-        "templates/.github/workflows/"
-      ],
       "dmer": [
         "scripts"
       ],
