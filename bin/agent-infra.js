@@ -746,6 +746,18 @@ function _checkCI(manifest, targetDir, issues, ciMode, exempted) {
   // D2/D6 — pin compare (skip for agent-infra itself: @main self-caller is
   // the locked design; consumers must pin @vX.Y.Z).
   const ci = manifest.ci;
+
+  // #387 sync guard — manifest.check.ci.ref is a declared mirror of ci.ref
+  // (read nowhere in code; drift-check.yml documents it as the contract).
+  // Keep the two halves on ONE release axis so a bump cannot drift them
+  // apart. Fail-closed + null-safe (absent check block = old manifest, skip).
+  const checkCi = manifest.check && manifest.check.ci;
+  if (ci && ci.ref && checkCi && checkCi.ref && checkCi.ref !== ci.ref) {
+    issues.push({ type: 'ci-ref', entry: 'manifest.json', tier: 'fail',
+      reason: `manifest.check.ci.ref (${checkCi.ref}) ≠ manifest.ci.ref (${ci.ref}) — keep both in sync (#387)` });
+    console.log(`   ❌ manifest.json — check.ci.ref ${checkCi.ref} ≠ ci.ref ${ci.ref} (#387 sync guard)`);
+  }
+
   const selfRepo = targetDir === AGENT_INFRA_PATH;
   if (!selfRepo && !fs.existsSync(ciDest)) {
     issues.push({ type: 'ci-ref', entry: 'ci.yml', tier: 'fail', reason: 'no .github/workflows/ — run agent-infra init' });
