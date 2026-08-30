@@ -1,5 +1,5 @@
 name: Node.js CI
-# Reusable workflow — Node.js CI (script validate, skill lint, typecheck, lint)
+# Reusable workflow — Node.js CI (script validate, skill lint, typecheck, lint, unit-test)
 # Source: agent-infra/templates/.github/workflows/node-ci.yml
 # Called via: uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@<ref>
 # Version contract (#303): consumers pin a semver tag (e.g. @v0.1.0); only
@@ -7,6 +7,22 @@ name: Node.js CI
 # Materialized to .github/workflows/ by scripts/sync-ci-workflows.sh (real
 # files only — GitHub Actions CANNOT parse symlinked workflow files, #555).
 # Budget: PR-only (shared Actions budget under daniel-ospina account)
+#
+# #387 — unit-test capability + skip-input contract:
+#   * unit-test job runs when test-command OR test-glob is set ('' = skip).
+#     test-command is an escape hatch (npm ci && vitest, npx tsx suites,
+#     failure accumulators) and OVERRIDES test-glob when both are set.
+#     test-command MUST NOT contain '${{' (Actions expression syntax).
+#   * script-validate / skill-lint are boolean skip inputs, default true
+#     (backward-compatible: existing callers keep both gates). Consumers
+#     with a broken-on-runner scripts/ symlink (e.g. tortoise) or no
+#     scripts/check-skill-lint.mjs (un-bootstrapped) MUST pass false.
+#     default:true is load-bearing — boolean workflow_call inputs default
+#     to FALSE when unset, which would silently disable the #254 gate.
+#   * typecheck/lint self-skip on missing config (no force-skip inputs —
+#     test-only consumers with configs use test-command).
+#   * Skip is observable via the callee run log (job-level if: skip lists
+#     the job as skipped).
 
 on:
   workflow_call:
@@ -14,9 +30,30 @@ on:
       node-version:
         type: string
         default: '22'
+      working-directory:
+        type: string
+        default: '.'
+        description: Directory for the unit-test job's steps.
+      test-glob:
+        type: string
+        default: ''
+        description: Glob passed to `node --test` (e.g. 'src/*.test.js'). '' + test-command '' = job skipped.
+      test-command:
+        type: string
+        default: ''
+        description: Escape hatch — arbitrary test invocation (e.g. 'npm ci && vitest run', npx tsx suites, failure accumulators). OVERRIDES test-glob when both set. MUST NOT contain '${{'.
+      script-validate:
+        type: boolean
+        default: true
+        description: Run the script-validate job. Pass false for consumers with a broken-on-runner scripts/ symlink (skip observable via callee run log).
+      skill-lint:
+        type: boolean
+        default: true
+        description: Run the skill-lint job (#254 fail-closed). Pass false for un-bootstrapped consumers without scripts/check-skill-lint.mjs (skip observable via callee run log).
 
 jobs:
   script-validate:
+    if: inputs.script-validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +72,7 @@ jobs:
           echo "✅ All scripts validated"
 
   skill-lint:
+    if: inputs.skill-lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,6 +84,8 @@ jobs:
             node scripts/check-skill-lint.mjs
           else
             echo "❌ scripts/check-skill-lint.mjs not found — missing required gate, FAILING (#254)"
+            echo "   If this repo is NOT agent-infra-bootstrapped (no scripts/ symlink), pass skill-lint: false"
+            echo "   in the node-ci.yml call (#387). A bootstrapped repo missing the gate is a real failure."
             exit 1
           fi
 
@@ -78,3 +118,24 @@ jobs:
           else
             echo "⚠️  No ESLint config found — skipping lint"
           fi
+
+  unit-test:
+    # #387 — reusable unit-suite runner. Job-level if: skip + step-level if:
+    # branch selection (test-command wins when both set). NO shell
+    # interpolation of the command (a quoted interpolation breaks any
+    # command containing quotes — the failure-accumulator case).
+    runs-on: ubuntu-latest
+    if: inputs.test-command != '' || inputs.test-glob != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Custom test command
+        if: inputs.test-command != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.test-command }}
+      - name: Glob-based node --test
+        if: inputs.test-command == '' && inputs.test-glob != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: node --test ${{ inputs.test-glob }}
