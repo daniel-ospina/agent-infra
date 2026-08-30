@@ -38,7 +38,8 @@ if ! git -C "$ROOT" diff --quiet -- tests/fixtures/drift/current || ! git -C "$R
 fi
 
 # #387: case 9 backup path for the LIVE root manifest.json (tamper target).
-MANIFEST_BAK="${TMPDIR:-/tmp}/manifest.json.387.bak"
+# mktemp per-invocation (CWE-377 — no fixed world-writable path; SEC-001).
+MANIFEST_BAK="$(mktemp "${TMPDIR:-/tmp}/manifest.json.387.XXXXXX")"
 
 cleanup() {
   git -C "$ROOT" checkout -- tests/fixtures/drift/current 2>/dev/null || true

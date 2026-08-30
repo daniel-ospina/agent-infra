@@ -1,3 +1,14 @@
+---
+title: "#387 — CI Centralization (unit-test capability + enforcement activation) — Research Brief"
+type: engineering
+domain: operations
+doc_status: draft
+subjects.team: organisation-design-team
+created: 2026-08-30
+aboutSubjects: node-ci.yml, drift-check, manifest.json, sync-ci-workflows.sh
+aboutObjects: agent-infra, tortoise, premise-labs, issue-387
+---
+
 # Research Brief — #387: reusable unit-test workflow + drift-check contract
 
 > Issue: https://github.com/daniel-ospina/agent-infra/issues/387

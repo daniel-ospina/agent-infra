@@ -1,3 +1,14 @@
+---
+title: "#387 — CI Centralization (unit-test capability + enforcement activation) — Scoping Plan"
+type: engineering
+domain: operations
+doc_status: draft
+subjects.team: organisation-design-team
+created: 2026-08-30
+aboutSubjects: node-ci.yml, drift-check, manifest.json, sync-ci-workflows.sh
+aboutObjects: agent-infra, tortoise, premise-labs, issue-387
+---
+
 # #387 Implementation Plan — CI centralization: unit-test capability + #303 enforcement activation
 
 > Source: issue-scoping (v5.1 double diamond + verify gates, cycles 1-5) — 2026-08-30

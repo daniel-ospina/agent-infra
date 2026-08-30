@@ -1,3 +1,14 @@
+---
+title: "#387 — CI Centralization (unit-test capability + enforcement activation) — Implementation Plan"
+type: engineering
+domain: operations
+doc_status: draft
+subjects.team: organisation-design-team
+created: 2026-08-30
+aboutSubjects: node-ci.yml, drift-check, manifest.json, sync-ci-workflows.sh
+aboutObjects: agent-infra, tortoise, premise-labs, issue-387
+---
+
 <!-- research-path: docs/research/2026-08-30-387-ci-centralization.md -->
 
 # CI Centralization: reusable unit-test workflow + #303 enforcement activation — Implementation Plan
