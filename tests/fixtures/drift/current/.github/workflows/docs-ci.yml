@@ -8,7 +8,7 @@ on:
 
 jobs:
   docs:
-    uses: daniel-ospina/agent-infra/.github/workflows/docs-ci.yml@v0.1.0
+    uses: daniel-ospina/agent-infra/.github/workflows/docs-ci.yml@v0.1.1
     with:
       markdownlint-command: "npx --yes markdownlint-cli2 '**/*.md'"
     secrets: inherit

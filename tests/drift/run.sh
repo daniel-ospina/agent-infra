@@ -11,12 +11,13 @@
 #   6. local (non-CI) mode unchanged        → content drift still exit 1
 #   7. clean fixture (exact base copies)    → status CLEAN, exit 0
 #   8. --ci skips machine-local extensions/skills; local mode checks them
+#   9. check.ci.ref ≠ ci.ref sync guard       → status FAIL, exit 1 (#387)
 #
 # Fixture: tests/fixtures/drift/current/ simulates a consumer repo. Its
-# scripts/ + .github/workflows/docs-ci.yml are RELATIVE symlinks into the
-# agent-infra checkout (the CI self-test shape; a real consumer's committed
-# symlinks are machine-local absolute paths and hit the info tier on runners).
-# The version pin is test state — written here, gitignored.
+# scripts/ is a RELATIVE symlink into the agent-infra checkout; its
+# .github/workflows/docs-ci.yml is a REAL committed file (D3 real-file
+# contract — the symlink header comment was stale). The version pin is
+# test state — written here, gitignored.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -28,16 +29,27 @@ failures=0
 
 # P2-5: guard against clobbering local fixture edits — the cleanup restores the
 # fixture via `git checkout`, which discards uncommitted modifications.
-if ! git -C "$ROOT" diff --quiet -- tests/fixtures/drift/current; then
-  echo "❌ tests/fixtures/drift/current has uncommitted modifications —"
+# Extended (#387): case 9 tampers the LIVE root manifest.json — preflight it too.
+if ! git -C "$ROOT" diff --quiet -- tests/fixtures/drift/current || ! git -C "$ROOT" diff --quiet -- manifest.json; then
+  echo "❌ tests/fixtures/drift/current or manifest.json has uncommitted modifications —"
   echo "   the test suite rewrites fixture files and restores them from git."
-  echo "   Commit or stash the fixture changes first."
+  echo "   Commit or stash the changes first."
   exit 1
 fi
+
+# #387: case 9 backup path for the LIVE root manifest.json (tamper target).
+# mktemp per-invocation (CWE-377 — no fixed world-writable path; SEC-001).
+MANIFEST_BAK="$(mktemp "${TMPDIR:-/tmp}/manifest.json.387.XXXXXX")"
 
 cleanup() {
   git -C "$ROOT" checkout -- tests/fixtures/drift/current 2>/dev/null || true
   rm -f "$FIX/.agent-infra-version" "$FIX/.github/workflows/docs-ci.yml.bak" "$OUT"
+  # #387: restore the live manifest.json (cp-back, NOT git checkout — uncommitted
+  # manifest edits must survive an aborted run). Idempotent with the in-case restore.
+  if [ -f "$MANIFEST_BAK" ]; then
+    cp "$MANIFEST_BAK" "$ROOT/manifest.json"
+    rm -f "$MANIFEST_BAK"
+  fi
 }
 trap cleanup EXIT
 
@@ -121,6 +133,23 @@ if grep -q "📦 Extensions:" "$OUT"; then fail "--ci still checked extensions";
 # environment-dependent: symlinks point at the local agent-infra checkout).
 AGENT_INFRA_PATH="$ROOT" node "$CLI" check "$FIX" >"$OUT" 2>&1
 if grep -q "📦 Extensions:" "$OUT"; then pass "extensions section present in local mode"; else fail "extensions section missing in local mode"; fi
+
+echo ""
+echo "9. Sync guard — check.ci.ref ≠ ci.ref → FAIL, exit 1 (#387)"
+cp "$ROOT/manifest.json" "$MANIFEST_BAK"
+node -e "
+const fs = require('fs');
+const p = process.argv[1];
+const m = JSON.parse(fs.readFileSync(p, 'utf8'));
+// Tamper ONLY the nested check.ci.ref (the two refs are identical strings —
+// sed would hit the wrong one or both; the guard must see a mismatch).
+m.check.ci.ref = 'v9.9.9';
+fs.writeFileSync(p, JSON.stringify(m, null, 2) + '\n');
+" "$ROOT/manifest.json"
+run_check 1 "sync guard (--ci)" --ci
+if grep -q "sync guard" "$OUT"; then pass "sync guard message present"; else fail "expected sync guard message"; tail -15 "$OUT"; fi
+cp "$MANIFEST_BAK" "$ROOT/manifest.json"
+rm -f "$MANIFEST_BAK"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

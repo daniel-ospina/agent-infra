@@ -19,47 +19,51 @@ permissions:
 
 jobs:
   extension-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Run extension tests
-        run: |
-          failures=0
-          # #303 — pin-drift unit tests for the ci-ref check (bin/agent-infra.js surface).
-          echo "== scripts/ci-ref-check.test.mjs =="
-          node scripts/ci-ref-check.test.mjs || failures=$((failures+1))
-          # #254 — frontmatter validator fixture-regression (post-merge, ci-main)
-          echo "== scripts/check-skill-lint.test.mjs =="
-          node scripts/check-skill-lint.test.mjs || failures=$((failures+1))
-          for t in extensions/*/test*.mjs; do
-            [ -f "$t" ] || continue
-            echo "== $t =="
-            node "$t" || failures=$((failures+1))
-          done
-          # shared/print-mode tests: the isPrintMode helper gates 17 sites (#228).
-          # print-mode.test.ts covers helper logic; print-mode-wiring.test.ts
-          # enforces the 0-raw-reads acceptance repo-wide; auto-sync.test.ts
-          # exercises the FLAT-extension ./shared/ import path (the bug class
-          # that shipped 2 files during this refactor's development).
-          echo "== extensions/shared/print-mode.test.ts =="
-          npx tsx extensions/shared/print-mode.test.ts || failures=$((failures+1))
-          echo "== extensions/shared/print-mode-wiring.test.ts =="
-          npx tsx extensions/shared/print-mode-wiring.test.ts || failures=$((failures+1))
-          echo "== extensions/auto-sync.test.ts =="
-          npx tsx extensions/auto-sync.test.ts || failures=$((failures+1))
-          # #357 — sequence-enforcer: the gate-critical suite was the only one NOT
-          # in CI (the never-passable checkpoint contract shipped untested, 08-12).
-          # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
-          echo "== extensions/sequence-enforcer/sequence-enforcer.test.ts =="
-          npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
-          if [ $failures -gt 0 ]; then
-            echo "❌ $failures extension test file(s) failed"
-            exit 1
-          fi
-          echo "✅ All extension tests passed"
+    # #387 — dogfood the reusable capability (was: inline failure accumulator).
+    # Stack gates skipped: ci-main keeps richer inline copies (bash -n + installer
+    # tests #304, --skills-dir skill-lint) whose coverage node-ci jobs lack — keep
+    # them. (No job duplication in practice: agent-infra has no root tsconfig/eslint,
+    # so node-ci typecheck/lint self-skip; the unit-test job is the only new surface.)
+    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
+    with:
+      node-version: '22'
+      script-validate: false
+      skill-lint: false
+      test-command: |
+        failures=0
+        # #303 — pin-drift unit tests for the ci-ref check (bin/agent-infra.js surface).
+        echo "== scripts/ci-ref-check.test.mjs =="
+        node scripts/ci-ref-check.test.mjs || failures=$((failures+1))
+        # #254 — frontmatter validator fixture-regression (post-merge, ci-main)
+        echo "== scripts/check-skill-lint.test.mjs =="
+        node scripts/check-skill-lint.test.mjs || failures=$((failures+1))
+        for t in extensions/*/test*.mjs; do
+          [ -f "$t" ] || continue
+          echo "== $t =="
+          node "$t" || failures=$((failures+1))
+        done
+        # shared/print-mode tests: the isPrintMode helper gates 17 sites (#228).
+        # print-mode.test.ts covers helper logic; print-mode-wiring.test.ts
+        # enforces the 0-raw-reads acceptance repo-wide; auto-sync.test.ts
+        # exercises the FLAT-extension ./shared/ import path (the bug class
+        # that shipped 2 files during this refactor's development).
+        echo "== extensions/shared/print-mode.test.ts =="
+        npx tsx extensions/shared/print-mode.test.ts || failures=$((failures+1))
+        echo "== extensions/shared/print-mode-wiring.test.ts =="
+        npx tsx extensions/shared/print-mode-wiring.test.ts || failures=$((failures+1))
+        echo "== extensions/auto-sync.test.ts =="
+        npx tsx extensions/auto-sync.test.ts || failures=$((failures+1))
+        # #357 — sequence-enforcer: the gate-critical suite was the only one NOT
+        # in CI (the never-passable checkpoint contract shipped untested, 08-12).
+        # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
+        echo "== extensions/sequence-enforcer/sequence-enforcer.test.ts =="
+        npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
+        if [ $failures -gt 0 ]; then
+          echo "❌ $failures extension test file(s) failed"
+          exit 1
+        fi
+        echo "✅ All extension tests passed"
+    secrets: inherit
 
   script-validate:
     runs-on: ubuntu-latest

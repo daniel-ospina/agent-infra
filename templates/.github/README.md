@@ -14,7 +14,7 @@ call them pinned to a tag:
 ```
 jobs:
   ci:
-    uses: daniel-ospina/agent-infra/.github/workflows/python-ci.yml@v0.1.0
+    uses: daniel-ospina/agent-infra/.github/workflows/python-ci.yml@v0.1.1
     secrets: inherit
 ```
 
