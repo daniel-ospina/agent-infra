@@ -1,0 +1,45 @@
+--- a/scripts/parallel_work_check.py
++++ b/scripts/parallel_work_check.py
+@@ -76,6 +76,16 @@
+ from urllib.request import Request, urlopen
+ 
+ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
++# Vendored layout: scripts/ lives one level under the repo root (agent-infra);
++# the original lived two levels down (operations/coordination). Resolve the
++# repo root as the first ancestor containing the connectors/ package so both
++# layouts import cleanly.
++for _anc in (Path(__file__).resolve().parent,
++             Path(__file__).resolve().parent.parent,
++             Path(__file__).resolve().parent.parent.parent):
++    if (_anc / "connectors").is_dir():
++        _REPO_ROOT = _anc
++        break
+ if str(_REPO_ROOT) not in sys.path:
+     sys.path.insert(0, str(_REPO_ROOT))
+ 
+@@ -563,6 +573,12 @@
+ 
+ def _check_c3(ctx: _Ctx) -> CheckResult:
+     if not ctx.card_id:
++        # #383: non-swarm pipelines have no board card. With NO claimed
++        # touched paths there is no overlap scope to check — CLEAR (nothing
++        # can overlap). If paths ARE claimed but no card exists, keep
++        # failing closed (board intent is unclaimable).
++        if not ctx.paths:
++            return CheckResult(ctx.code, "CLEAR", "no-card-no-scope")
+         return CheckResult(ctx.code, "UNKNOWN",
+                            "missing-card-context SWARM_CARD_ID")
+     try:
+@@ -606,8 +622,10 @@
+                            f"behind-origin by {behind} commit(s)",
+                            ("rebase",))
+     if not ctx.card_id:
+-        return CheckResult(ctx.code, "UNKNOWN",
+-                           "missing-card-context SWARM_CARD_ID")
++        # #383: non-swarm pipelines have no board card. The git staleness
++        # gate above (fetch + behind-origin) already ran; the card only
++        # gates board-scoped ancestry/symbol claims.
++        return CheckResult(ctx.code, "CLEAR", "no-card")
+     try:
+         card = ctx.board.get_card(ctx.card_id, ctx.remaining())
+     except InfraError as e:

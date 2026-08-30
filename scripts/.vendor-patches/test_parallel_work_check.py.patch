@@ -1,0 +1,92 @@
+--- a/scripts/test_parallel_work_check.py
++++ b/scripts/test_parallel_work_check.py
+@@ -764,6 +764,7 @@
+     assert line.startswith("C2: OVERLAP"), line
+ 
+ 
++@pytest.mark.xfail(strict=False, reason="known swarm-main failure — timeout-mock race; upstream fix tracked (swarm issue filed); vendored parity 32/1/1 — on the vendored layout this test PASSES deterministically (xpass under strict=False); the sibling test_bash_timeout_contract owns the timeout contract")
+ def test_bash_timeout_unknown_and_exit_zero(tmp_path):
+     """E2E-8: budget overrun → UNKNOWN verdict line, exit 0, no token."""
+     repo, _ = _make_repo(tmp_path)
+@@ -785,3 +786,81 @@
+                           text=True, env=os.environ, timeout=30)
+     assert proc.returncode == 0
+     assert proc.stdout.strip().splitlines()[0].startswith("C?: UNKNOWN")
++
++
++def test_bash_timeout_contract(tmp_path):
++    """#383: deterministic sibling for the xfail'd swarm-flaky timeout test —
++    the bash-level watchdog contract owned here: budget overrun → C1: UNKNOWN
++    first line, exit 0, NO token written. The xfail (strict=False) is
++    satisfied by both pass and fail, so this sibling is the load-bearing
++    assertion (a regression that hangs or writes a token on timeout would
++    otherwise be CI-green indefinitely).
++    """
++    repo, _ = _make_repo(tmp_path)
++    gh, sb = _serve(), _serve()
++    _gh(gh, closed=[{"number": 1, "title": "x"}])
++    gh.routes["state:closed"]["sleep"] = 2.0
++    _board(sb, [_card()])
++    token = tmp_path / "token.json"
++    env = _bash_env(_url(gh), _url(sb), tmp_path, token, timeout="0.05")
++    proc = _run_bash(tmp_path, "start", repo, env, symbol="auth_token")
++    assert proc.returncode == 0
++    line = proc.stdout.strip().splitlines()[0]
++    assert line.startswith("C1: UNKNOWN"), line
++    assert not token.exists()
++
++
++def _fake_interpreter(tmp_path, body: str) -> Path:
++    """#383: a fake PYTHON_BIN the .sh wrapper executes (it ignores argv).
++    Simulates the python side for watchdog error-branch tests."""
++    fake = tmp_path / "fake_interp.sh"
++    fake.write_text("#!/usr/bin/env bash\nset -u\n" + body + "\n")
++    fake.chmod(0o755)
++    return fake
++
++
++def test_bash_watchdog_unlink_on_hang(tmp_path):
++    """#383: write-then-hang watchdog window — python writes a CLEAR token
++    (and a mid-write unique tmp) then blocks; the watchdog SIGKILLs it
++    (skipping python's own cleanup); the .sh error branch must unlink the
++    token AND the scoped tmp, emit UNKNOWN, exit 0."""
++    token = tmp_path / "token.json"
++    fake = _fake_interpreter(tmp_path, f'''
++TOKEN="${{PARALLEL_CHECK_TOKEN_FILE:-{token}}}"
++printf '%s' '{{"phase":"start","verdict":"CLEAR","code":"C1","ts":1}}' > "$TOKEN"
++printf x > "$TOKEN.tmp.$$"
++sleep 30
++''')
++    env = dict(os.environ)
++    env["PYTHON_BIN"] = str(fake)
++    env["PARALLEL_CHECK_TOKEN_FILE"] = str(token)
++    env["PARALLEL_CHECK_TIMEOUT_SECS"] = "0.1"
++    proc = subprocess.run(["bash", str(CHECK_SH), "start"], capture_output=True,
++                          text=True, env=env, timeout=30)
++    assert proc.returncode == 0
++    assert proc.stdout.strip().splitlines()[0].startswith("C1: UNKNOWN")
++    assert not token.exists()
++    assert not list(tmp_path.glob("token.json.tmp.*"))
++
++
++def test_bash_watchdog_unlink_on_non_clear_verdict(tmp_path):
++    """#383: UNKNOWN verdicts exit 0 by design — a token surviving a
++    non-CLEAR verdict would let the enforcer's marker advance (which reads
++    only the token) pass a check the operator just saw fail. The .sh must
++    unlink the token on any non-CLEAR first line, not just rc != 0."""
++    token = tmp_path / "token.json"
++    fake = _fake_interpreter(tmp_path, f'''
++TOKEN="${{PARALLEL_CHECK_TOKEN_FILE:-{token}}}"
++printf '%s' '{{"phase":"start","verdict":"CLEAR","code":"C1","ts":1}}' > "$TOKEN"
++echo "C1: UNKNOWN  fake  options="
++exit 0
++''')
++    env = dict(os.environ)
++    env["PYTHON_BIN"] = str(fake)
++    env["PARALLEL_CHECK_TOKEN_FILE"] = str(token)
++    env["PARALLEL_CHECK_TIMEOUT_SECS"] = "1"
++    proc = subprocess.run(["bash", str(CHECK_SH), "start"], capture_output=True,
++                          text=True, env=env, timeout=30)
++    assert proc.returncode == 0
++    assert proc.stdout.strip().splitlines()[0].startswith("C1: UNKNOWN")
++    assert not token.exists()

@@ -1,0 +1,91 @@
+--- a/scripts/parallel_work_check.sh
++++ b/scripts/parallel_work_check.sh
+@@ -85,10 +85,39 @@
+ # Budget: python enforces PARALLEL_CHECK_TIMEOUT_SECS internally and emits
+ # UNKNOWN on overrun; this shell watchdog is the hard backstop for a hung
+ # subprocess (bounded, env-overridable — swarm #196 pattern).
++# #383 patch: the watchdog budget is CLAMPED to PARALLEL_CHECK_BUDGET_MAX
++# (env, default 60) so an unbounded or non-finite value (inf/nan/1e309)
++# cannot stall the watchdog indefinitely (GNU `sleep inf` sleeps forever).
++# The python side (run_check) gains the same clamp in #383 Task 2 Step 4 —
++# until then the clamped shell watchdog is the ONLY bound: python's
++# float("1e309") silently overflows to inf (no exception), so its deadline
++# becomes inf and it does NOT fail closed on its own; the watchdog kills it
++# at ≤ BUDGET_MAX+2s → fail-closed UNKNOWN.
+ budget="${PARALLEL_CHECK_TIMEOUT_SECS:-2}"
++budget_max="${PARALLEL_CHECK_BUDGET_MAX:-60}"
++budget="$(awk -v b="$budget" -v m="$budget_max" 'BEGIN {
++    # Regex-gate the raw strings first: one-true-awk (macOS) leaves "nan"/
++    # "inf" as STRINGS that compare lexically ("nan" >= "0" is true), so
++    # the numeric NaN test (x != x) is unreliable across awk impls. Only a
++    # plain finite decimal literal is accepted; anything else → default.
++    # The max cap (m) gets the same gate + a hard ceiling: a non-finite or
++    # absurd cap would otherwise let x escape as inf through the compare
++    # and re-open the indefinite-stall class.
++    if (b ~ /^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/) x = b + 0;
++    else x = -1;                       # non-numeric → default below
++    if (m ~ /^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/) m = m + 0;
++    else m = 60;                       # non-numeric cap → default
++    if (!(m > 0) || m > 86400) m = 60; # inf/overflow/negative/absurd cap → default
++    if (!(x >= 0) || x > m) x = (x > 0) ? m : 2;  # NaN/negative → default; overflow → max
++    if (x < 0.05) x = 0.05;            # min clamp ("0" → fast watchdog)
++    printf "%.1f", x }' 2>/dev/null || echo "2.0")"
+ watchdog_s="$(awk -v b="$budget" 'BEGIN { printf "%.1f", b + 2.0 }' 2>/dev/null \
+     || echo "4.0")"
+ 
++# #383 patch: the token path must be resolved here too — the error branch
++# unlinks it (see below).
++token_file="${PARALLEL_CHECK_TOKEN_FILE:-/tmp/parallel-check-token.json}"
++
+ tmp_out="$(mktemp "${TMPDIR:-/tmp}/parallel-check-out.XXXXXX")"
+ 
+ args=("$phase")
+@@ -96,10 +125,21 @@
+ [ -n "$symbol" ] && args+=(--symbol "$symbol")
+ 
+ set +e
+-"$PYTHON_BIN" "$SCRIPT_DIR/parallel_work_check.py" "${args[@]}" \
+-    >"$tmp_out" 2>/dev/null &
+-pid=$!
+-( sleep "$watchdog_s"; kill -9 "$pid" 2>/dev/null ) &
++# #383 patch: run python in its own process group (setsid, Linux/CI) so the
++# watchdog can kill the WHOLE tree — a hung `git fetch` subprocess must die
++# with python instead of orphaning (macOS lacks setsid → plain kill; the
++# orphan corner is documented in VENDOR.md).
++if command -v setsid >/dev/null 2>&1; then
++    setsid "$PYTHON_BIN" "$SCRIPT_DIR/parallel_work_check.py" "${args[@]}" \
++        >"$tmp_out" 2>/dev/null &
++    pid=$!
++    ( sleep "$watchdog_s"; kill -9 -- -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null ) &
++else
++    "$PYTHON_BIN" "$SCRIPT_DIR/parallel_work_check.py" "${args[@]}" \
++        >"$tmp_out" 2>/dev/null &
++    pid=$!
++    ( sleep "$watchdog_s"; kill -9 "$pid" 2>/dev/null ) &
++fi
+ watchdog_pid=$!
+ wait "$pid"
+ rc=$?
+@@ -110,8 +150,22 @@
+ rm -f "$tmp_out"
+ 
+ if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
++    # #383 patch: a watchdog SIGKILL skips python's own cleanup — a stale
++    # CLEAR token would otherwise survive and the enforcer's marker advance
++    # would pass a check the operator just saw fail. Unlink the token AND
++    # the checker's own tmp files, scoped to the token's prefix — an
++    # unscoped `*.tmp.*` glob in /tmp would delete unrelated same-user tmp
++    # files and a concurrent invocation's in-flight unique tmp.
++    rm -f "$token_file" "$(dirname "$token_file")/$(basename "$token_file")"*.tmp.* 2>/dev/null || true
+     echo "$code: UNKNOWN  check-timeout-or-error rc=$rc  options="
+ else
++    # #383 patch: UNKNOWN verdicts exit 0 by design — the token must not
++    # survive a non-CLEAR verdict either (the enforcer marker advance reads
++    # only the token file, never the verdict line).
++    case "$out" in
++        *": CLEAR"*) ;;
++        *) rm -f "$token_file" 2>/dev/null || true ;;
++    esac
+     echo "$out"
+ fi
+ 
