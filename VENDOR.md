@@ -29,9 +29,9 @@ swarm base byte-for-byte from the repo root.
 
 | # | File | Content |
 |---|---|---|
-| P1 | `parallel_work_check.py` | Pre-existing 3-hunk divergence: (a) `_REPO_ROOT` ancestor-probe for the agent-infra `scripts/` layout (10 lines — swarm's `parent.parent.parent` resolves to the wrong dir here; without it `from connectors.supabase_swarm import store` fails and the checker degrades to UNKNOWN); (b) `no-card-no-scope` CLEAR branch in `_check_c3`; (c) `no-card` CLEAR branch in `_check_c4` (the pre-#383 partial — Task 2 replaces these with the distinguishable no-board skip). |
+| P1 | `parallel_work_check.py` | Pre-existing 3-hunk divergence: (a) `_REPO_ROOT` ancestor-probe for the agent-infra `scripts/` layout (10 lines — swarm's `parent.parent.parent` resolves to the wrong dir here; without it `from connectors.supabase_swarm import store` fails and the checker degrades to UNKNOWN); (b) `no-card-no-scope` CLEAR branch in `_check_c3`; (c) `no-card` CLEAR branch in `_check_c4`. **Task 2 (#383 Phase B) replaces the partial CLEARs with the full no-board machinery:** the shared five-family signal constants (`_SB_URL_NAMES`/`_SB_KEY_NAMES`/`_CARD_ID_NAMES`/`_AGENT_ID_NAMES`/`_PATHS_NAMES` — 14 names, consumed by BOTH the read paths and the `_is_no_board` predicate, never prose); the predicate (absent = unset OR empty/whitespace, ANY signal → fail-closed); the distinguishable `CLEAR no-board-skip: <advisory>` verdict + `mode:"no-board-skip"` token field (`_skip` helper; C1–C5 no-board branches; the vacuous CLEARs deleted — board-mode-no-card → swarm-parity UNKNOWN); the retained git-local checks (C1 fetch/guard/dup-search, C4 fetch/behind/symbol-gated hoisted pickaxe — failures stay UNKNOWN, never skip); `GitOps.remote_url()` + cwd-based ops-target resolution (--repo → PARALLEL_CHECK_REPO → cwd — never presence-keyed); the python-side budget clamp to `PARALLEL_CHECK_BUDGET_MAX` (default 60, non-finite-safe); the ATOMIC `_apply_token` (per-invocation-unique mkstemp tmp `<tokenfile>.tmp.<unique>` in dirname — mode 0600 — + `os.rename`, finally-cleanup, write-failure → unlink-existing + `warn=token-write-failed`, unlink failures → `warn=unlink-failed`); **the code-quality round (#383 Task 2 P2/P3): `GitOps.remote_url()` strips ANY userinfo on scheme-bearing URLs — `user:pass@`, the bare-PAT form `https://ghp_…@host/...` (no colon), and `ssh://git@host/...` all → stripped (netloc rebuilt via `rsplit("@", 1)[-1]`, host:port preserved; userinfo is never part of repo identity); scp-form `git@github.com:org/repo.git` has NO scheme → no netloc → byte-identical; parse failure → "unknown"; Task-3 `bindingRepo()` MUST strip ALL userinfo identically) + lazy token_repo (resolved only on a CLEAR verdict) + the non-OSError isolation around the `_apply_token` call (`warn=token-error:<TypeName>`); the near-miss/new-signal warn notes (B27); the module docstring INTERFACE contract. |
 | P2 | `parallel_work_check.sh` | #383 wrapper patch: budget clamp to `PARALLEL_CHECK_BUDGET_MAX` (env, default 60 — non-finite/unbounded values cannot stall the watchdog; raw-string regex gate because macOS one-true-awk leaves `nan`/`inf` as strings that compare lexically); `setsid` + process-group kill (Linux/CI — a hung `git fetch` dies with python instead of orphaning); error branch unlinks the token on `rc != 0` OR a non-CLEAR first-line verdict, plus a scoped tmp-glob `$(dirname)/$(basename)`*.tmp.* (watchdog SIGKILL skips python's own cleanup; a stale CLEAR token would otherwise pass the enforcer's marker advance). |
-| P3 | `test_parallel_work_check.py` | Restores the 2 `CHECKOUT_GUARD_SWARM_ROOT` fixture lines at their swarm positions (the C1 bash e2e tests hang without them); xfail (strict=False) on the swarm-flaky timeout test + the deterministic `test_bash_timeout_contract` sibling + `test_bash_watchdog_unlink_on_hang` + `test_bash_watchdog_unlink_on_non_clear_verdict`; later B-series/T-series additions from the #383 plan land here too. |
+| P3 | `test_parallel_work_check.py` | Restores the 2 `CHECKOUT_GUARD_SWARM_ROOT` fixture lines at their swarm positions (the C1 bash e2e tests hang without them); xfail (strict=False) on the swarm-flaky timeout test + the deterministic `test_bash_timeout_contract` sibling + `test_bash_watchdog_unlink_on_hang` + `test_bash_watchdog_unlink_on_non_clear_verdict`; **the full B1–B34 series** (no-board skips per check, negative fences, guard/dup precedence, pickaxe hoist + symbol gate, token mode/repo, distinguishable contract, bash e2e + realistic consumer probe incl. the non-main and no-origin fork variants, repo resolution incl. insteadOf, drift-script mechanics, consumer-env fixture assertions, board-mode resolution, the 14-name predicate fold + names-parity + timeout edge/non-finite folds, vacuous-CLEAR deletion, override parity, near-miss/new-signal warns + stale-clone edge, deterministic concurrency, write/unlink-failure verdict notes, atomic mechanism, retained-check failure edges, guard-parity two-case, watchdog×concurrent-writer barrier variant + heartbeat contract, the extended B26 strip-ALL-userinfo sanitization (bare-PAT + ssh://git@ stripped, scp-form + plain https unchanged) and the non-finite-budget watchdog test (fake-interpreter hang + `PARALLEL_CHECK_TIMEOUT_SECS=inf`, bounded run, `C1: UNKNOWN`, no token)) **+ the #388 deterministic-timeout fix (mock sleep 5.0s outside the watchdog window + `CHECKOUT_GUARD_SWARM_ROOT` so the guard cannot race the budget)**. |
 
 ## Sync & Conflict Procedure
 
@@ -66,7 +66,29 @@ swarm base byte-for-byte from the repo root.
   `origin` remote (fork layout, only `upstream`) fails closed UNKNOWN on
   C1/C4 with binding passing via both-"unknown" (B17 renamed-remote variant);
   guidance names the `origin` requirement.
-- **Budget clamp:** `PARALLEL_CHECK_BUDGET_MAX` (env, default 60) clamps the `.sh` watchdog budget — non-finite values (`inf`/`nan`/`1e309`) and huge values cannot stall the watchdog indefinitely. The `nan`/`inf` strings are gated by a raw-string regex before numeric conversion (one-true-awk on macOS leaves them as strings; the numeric `x != x` NaN test is unreliable there), and the max cap itself is regex-gated + hard-capped at 86400s so a misconfigured `PARALLEL_CHECK_BUDGET_MAX` cannot re-open the stall class. The PYTHON side (`run_check`) gains the SAME clamp in Task 2 Step 4 — until then python-side non-finite budgets do NOT fail closed on their own (`float("1e309")` silently overflows to `inf`, no exception), so the clamped shell watchdog is the only bound (kills at ≤ BUDGET_MAX+2s → fail-closed UNKNOWN).
+- **Budget clamp:** `PARALLEL_CHECK_BUDGET_MAX` (env, default 60) bounds
+  BOTH sides, but the two clamps are DELIBERATELY DIVERGENT — the verified
+  .sh-vs-python table (all fail-closed): `inf` → .sh 2.0 vs python 60.0;
+  `nan` → .sh 2.0 vs python immediate-UNKNOWN (`min(nan, max)` = nan →
+  deadline nan → `budget_ok()` False); `0` → .sh 0.05 (min clamp) vs python
+  0.0 (immediate UNKNOWN); `budget_max > 86400` → .sh resets to 60 vs
+  python accepts verbatim. The .sh watchdog clamp is the HARD BACKSTOP: the
+  raw strings are regex-gated (one-true-awk on macOS leaves `nan`/`inf` as
+  strings that compare lexically, so only a plain finite decimal literal is
+  accepted — anything else → default 2.0), the max cap is regex-gated +
+  hard-capped at 86400s (→ 60), and the min is 0.05 — a non-finite or
+  unbounded value can never stall the watchdog (kills at ≤ cap+2s →
+  fail-closed UNKNOWN). The PYTHON side clamps python's OWN deadline:
+  `budget = min(float(raw), PARALLEL_CHECK_BUDGET_MAX)` with the same
+  env-read constant + default 60 + `except (ValueError, OverflowError) →
+  default` — `float("inf")`/`"1e309"` parse without ValueError and min()
+  bounds them; `float("nan")` → immediate fail-closed UNKNOWN. The
+  divergences are intentional and fail-closed: the watchdog always fires
+  within a bounded window (≤ cap+2s) — no stall, and a misbehaving python
+  can neither stall the gate nor wrongly pass it (killed → UNKNOWN, no
+  token); pinned by the B23 non-finite/upper-bound folds + the wrapper-level
+  non-finite watchdog test (fake-interpreter hang with
+  `PARALLEL_CHECK_TIMEOUT_SECS=inf`, bounded run, `C1: UNKNOWN`, no token).
 - **Heartbeats (`scripts/heartbeats/`, gitignored):** holds the guard's single
   accumulating `checkout_guard.log` — the checker itself writes NO heartbeat
   files (`heartbeat_at` is a supabase lease column); per-run heartbeat files

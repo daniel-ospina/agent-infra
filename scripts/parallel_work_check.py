@@ -6,7 +6,17 @@ O/I/T (plan §6 + issue #4904 review fixes):
   parallel_work_check <phase: start|scope|plan|implement|merge> [--repo PATH] [--symbol STRING]
   stdout (ONE machine-parseable line; the bash wrapper always exits 0 — callers
   parse the verdict line, never the exit code):
-    <C#>: <CLEAR|STALE|OVERLAP|DUP_FIX|UNKNOWN>  [details]  options=<a|b>
+    <C#>: <CLEAR|STALE|OVERLAP|DUP_FIX|UNKNOWN>  [details]  [warn=<note> ...]  options=<a|b>
+
+  No-board sessions (issue #383): a tenant with NO board signals skips the
+  pure-board sub-checks with a DISTINGUISHABLE verdict —
+    <C#>: CLEAR  no-board-skip: <advisory>  options=
+  (never a byte-identical vacuous CLEAR; `_skip()` is the only emitter). The
+  git-local checks stay retained in no-board mode (C1 fetch/guard/dup-search,
+  C4 fetch/behind/symbol-gated pickaxe) and their failures still fail closed
+  to UNKNOWN. warn=<note> tokens ride the verdict line (the bash wrapper's
+  head -n 1 drops any standalone stdout line): token-write-failed,
+  unlink-failed, near-miss:<name>, new-signal:<name>.
 
 Phases:
   C1 start     — git fetch → behind-origin check DELEGATED to checkout_guard.sh
@@ -42,7 +52,10 @@ env-overridable timeout, script-error). Token semantics: the PASS token
 (/tmp/parallel-check-token.json, env PARALLEL_CHECK_TOKEN_FILE) is written
 ONLY on CLEAR; any other verdict removes it — UNKNOWN at a gated checkpoint
 means NO token, and the enforcer gate (issue #5039) blocks with
-retry(2)+override. Advisory reads (C2 git-history, C4 -S) fail open to
+retry(2)+override. The CLEAR token payload carries mode ("" for board mode,
+"no-board-skip" for no-board skips) and repo (URL form via `git remote
+get-url` of the resolved ops target; "unknown" when undeterminable).
+Advisory reads (C2 git-history, C4 -S) fail open to
 CLEAR; phase gates never silently pass. Budget: <1s typical, ≤2s hard bound
 (env PARALLEL_CHECK_TIMEOUT_SECS, default 2.0) — overrun → UNKNOWN.
 
@@ -59,6 +72,10 @@ Environment (all injectable, tests point them at local mocks):
   PARALLEL_CHECK_TOKEN_FILE (default /tmp/parallel-check-token.json)
   PARALLEL_CHECK_SYMBOL                       — keyword fallback for --symbol
   PARALLEL_CHECK_REPO                         — repo fallback for --repo
+
+The five signal families (board URL/key, card, agent, paths) are shared
+module-level constants consumed by BOTH the read paths and _is_no_board;
+absent = unset OR empty/whitespace (stripped value-truthiness).
 """
 from __future__ import annotations
 
@@ -68,11 +85,12 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -96,9 +114,35 @@ VERDICTS = ("CLEAR", "STALE", "OVERLAP", "DUP_FIX", "UNKNOWN")
 
 TOKEN_FILE_DEFAULT = "/tmp/parallel-check-token.json"
 BUDGET_DEFAULT = 2.0
+BUDGET_MAX_DEFAULT = 60.0
 GIT_HISTORY_HOURS = 72.0
 SYMBOL_LOOKBACK_DAYS = 14.0
 PR_PATH_CAP = 5  # max touched files sent to the open-PR search at C3
+
+# ── #383: the FIVE signal families (14 names) — ONE set of shared constants
+# consumed by BOTH the read paths (_sb_config, _paths_from_env, run_check's
+# card/agent reads) AND the _is_no_board predicate, so the predicate can never
+# diverge from the read paths (a names-parity B-test pins it — B23 P2).
+# Absent = unset OR empty/whitespace (stripped value-truthiness).
+_SB_URL_NAMES = ("PARALLEL_CHECK_SB_URL", "SUPABASE_URL_ORG_DATA",
+                 "SUPABASE_URL")
+_SB_KEY_NAMES = ("PARALLEL_CHECK_SB_KEY", "SUPABASE_SERVICE_ROLE_KEY_ORG_DATA",
+                 "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_ANON_KEY_ORG_DATA",
+                 "SUPABASE_ANON_KEY")
+_CARD_ID_NAMES = ("SWARM_CARD_ID", "CARD_ID")
+_AGENT_ID_NAMES = ("AGENT_ID", "SWARM_AGENT_ID")
+_PATHS_NAMES = ("SWARM_TOUCHED_PATHS", "TOUCHED_PATHS")
+_BOARD_NAMES = _SB_URL_NAMES + _SB_KEY_NAMES  # the 8 board signals
+_SIGNAL_FAMILIES = (_SB_URL_NAMES, _SB_KEY_NAMES, _CARD_ID_NAMES,
+                    _AGENT_ID_NAMES, _PATHS_NAMES)
+
+# B27: board-signal NAMES absent from the probe-time snapshot (the committed
+# consumer-env fixture inventories, scripts/testdata/consumer-env-*.names) that
+# are now present → warn=new-signal:<name>. BAKED constant derived from the
+# fixtures at implementation time (runtime stays stdlib-only, no file dep); the
+# B27 parity test re-derives it and trips CI if a fixture adds a name. Today the
+# union is empty — neither capture exports a board signal.
+NEW_BOARD_SIGNAL_NAMES: tuple[str, ...] = ()
 
 _HASH_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -108,7 +152,7 @@ class InfraError(Exception):
 
 
 class CheckResult:
-    __slots__ = ("code", "verdict", "details", "options")
+    __slots__ = ("code", "verdict", "details", "options", "mode", "warns")
 
     def __init__(self, code: str, verdict: str, details: str = "",
                  options: tuple[str, ...] = ()):
@@ -116,14 +160,22 @@ class CheckResult:
         self.verdict = verdict
         self.details = details
         self.options = options
+        # #383: token mode ("" for board CLEAR, "no-board-skip" for skips)
+        # + warn= notes that ride the verdict line (B27/B29 contract).
+        self.mode = ""
+        self.warns: list[str] = []
 
     def line(self) -> str:
         opts = "|".join(self.options)
         # keep the trailing options=<...> token unique for parsers
         details = self.details.replace("options=", "opts=")
+        parts = [f"{self.code}: {self.verdict}"]
         if details:
-            return f"{self.code}: {self.verdict}  {details}  options={opts}"
-        return f"{self.code}: {self.verdict}  options={opts}"
+            parts.append(f"  {details}")
+        if self.warns:
+            parts.append("  " + " ".join(f"warn={w}" for w in self.warns))
+        parts.append(f"  options={opts}")
+        return "".join(parts)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return self.line()
@@ -132,15 +184,22 @@ class CheckResult:
 # ── env helpers ────────────────────────────────────────────────
 
 def _env(env: dict, names: tuple[str, ...], default: str = "") -> str:
+    """First STRIPPED-truthy value in the names tuple, else default.
+
+    B23 P2: strip BEFORE truthiness — a whitespace-valued earlier name is
+    absent (never shadows a valid later name in the chain, e.g. slug/
+    board pairs) and a whitespace single name yields its documented
+    fallback. All callers already strip/split/float their result, so this
+    is behavior-preserving for valid values."""
     for name in names:
-        value = env.get(name, "")
+        value = env.get(name, "").strip()
         if value:
             return value
     return default
 
 
 def _paths_from_env(env: dict) -> list[str]:
-    raw = _env(env, ("SWARM_TOUCHED_PATHS", "TOUCHED_PATHS"))
+    raw = _env(env, _PATHS_NAMES)
     return _normalize_paths(raw.split() if raw else [])
 
 
@@ -336,9 +395,63 @@ class GitOps:
                 current.add(line)
         return commits
 
+    def remote_url(self, timeout: float = 5.0) -> str:
+        """#383: URL form of the ops target's origin (B18/B22/B26/B32).
+
+        `git -C <repo> remote get-url origin`, trimmed; fail → "unknown"
+        (both-"unknown" binding parity with the enforcer). NEVER the raw
+        PARALLEL_CHECK_REPO env string and never _REPO_ROOT's remote.
+
+        P2/P3 (code-quality round): the token's repo field must never carry a
+        credential — the /tmp token file is created mode 0600 via mkstemp
+        (since the P3 round), but the payload is only as safe as the string
+        written into it. urlsplit: ANY non-empty userinfo on a scheme-bearing
+        URL is stripped — BOTH the `user:pass@` form AND the bare-PAT form
+        (`https://ghp_FAKETOKEN@github.com/org/repo.git`, NO colon — common
+        for GitHub PATs-as-username) would leak the secret verbatim if left.
+        The netloc is rebuilt WITHOUT userinfo (`rsplit("@", 1)[-1]`,
+        host:port preserved exactly) → `https://github.com/org/repo.git`.
+        This also strips `ssh://git@host/...` → `ssh://host/...` — userinfo
+        is never part of repo identity. scp-form
+        `git@github.com:org/repo.git` (no scheme → no netloc) is NOT a URL
+        form and stays byte-identical — the normal ssh remote keeps enforcer
+        binding parity. Parse failure → "unknown". URL-form contract
+        otherwise unchanged.
+
+        CRITICAL PARITY NOTE: Task 3's enforcer `bindingRepo()` MUST strip
+        ALL userinfo from scheme-bearing URLs identically — a
+        credential-bearing origin must bind consistently (sanitized checker
+        side vs raw enforcer side would mismatch → spurious BLOCK). The
+        both-"unknown" parity anchors the no-remote case.
+        """
+        out = self._run_ok(["remote", "get-url", "origin"], timeout)
+        raw = (out or "").strip()
+        if not raw:
+            return "unknown"
+        try:
+            parts = urlsplit(raw)
+        except ValueError:
+            return "unknown"
+        # scp-form / file URLs have empty scheme/netloc (urlsplit puts the
+        # whole string in path) → the scheme+netloc guard leaves them
+        # byte-identical (the normal ssh remote form).
+        if parts.scheme and parts.netloc and "@" in parts.netloc:
+            # P2 (code-quality round): strip ANY non-empty userinfo — the
+            # `user:pass@` form AND the bare-PAT form
+            # (`https://ghp_FAKETOKEN@github.com/org/repo.git`, NO colon —
+            # common for GitHub PATs-as-username) both leak the credential
+            # verbatim if left. Rebuild the netloc WITHOUT userinfo via
+            # `rsplit("@", 1)[-1]` — host:port survive exactly. This also
+            # strips `ssh://git@host/...` → `ssh://host/...`: userinfo is
+            # never part of repo identity (Task 3's bindingRepo() mirrors
+            # strip-ALL — simpler than the old colon heuristic).
+            return parts._replace(
+                netloc=parts.netloc.rsplit("@", 1)[-1]).geturl()
+        return raw
+
 
 def _resolve_slug(env: dict, git: GitOps, timeout: float) -> str:
-    slug = _env(env, ("PARALLEL_CHECK_REPO_SLUG", "GH_REPOSITORY"))
+    slug = _env(env, ("PARALLEL_CHECK_REPO_SLUG", "GH_REPOSITORY")).strip()
     if slug:
         return slug
     url = git._run_ok(["config", "--get", "remote.origin.url"], timeout) or ""
@@ -348,13 +461,25 @@ def _resolve_slug(env: dict, git: GitOps, timeout: float) -> str:
 
 
 def _sb_config(env: dict) -> tuple[str, str]:
-    url = _env(env, ("PARALLEL_CHECK_SB_URL", "SUPABASE_URL_ORG_DATA",
-                     "SUPABASE_URL"))
-    key = _env(env, ("PARALLEL_CHECK_SB_KEY",
-                     "SUPABASE_SERVICE_ROLE_KEY_ORG_DATA",
-                     "SUPABASE_SERVICE_ROLE_KEY",
-                     "SUPABASE_ANON_KEY_ORG_DATA", "SUPABASE_ANON_KEY"))
+    # #383: reads the SAME shared constants the predicate consumes — the
+    # 8-name board signal set can never diverge between the read path and
+    # _is_no_board (B23 P2 names-parity).
+    url = _env(env, _SB_URL_NAMES).strip()
+    key = _env(env, _SB_KEY_NAMES).strip()
     return url, key
+
+
+def _resolve_ops_target(repo: str | None, env: dict) -> str:
+    """#383: ops-target chain — --repo → PARALLEL_CHECK_REPO (stripped;
+    empty/whitespace falls through, never presence-keyed) → cwd. Under the
+    canonical invocation cwd == _REPO_ROOT; worktree/session checkouts
+    resolve to the session cwd (B18/B22/B32)."""
+    if repo and repo.strip():
+        return os.path.abspath(repo)
+    env_repo = _env(env, ("PARALLEL_CHECK_REPO",))
+    if env_repo and env_repo.strip():
+        return os.path.abspath(env_repo)
+    return os.path.abspath(os.getcwd())
 
 
 def _guard_runner(repo: str, env: dict, timeout: float) -> str:
@@ -382,34 +507,96 @@ def _guard_runner(repo: str, env: dict, timeout: float) -> str:
 # ── token (PASS evidence for the enforcer gate, issue #5039) ──
 
 def _apply_token(res: CheckResult, phase: str, env: dict, token_file: str,
-                 card_id: str, repo: str, symbol: str) -> None:
+                 card_id: str, token_repo: str, symbol: str) -> tuple[str, ...]:
+    """Write (CLEAR) or unlink (anything else) the PASS token.
+
+    #383 contract: CLEAR payload carries mode (res.mode) + repo (URL form via
+    remote get-url of the resolved ops target — never "" and never a path
+    string). The write is ATOMIC: serialize to a per-invocation-unique tmp in
+    dirname(token_file) (<tokenfile>.tmp.<mkstemp-unique>) + os.rename
+    (same-directory rename). On write failure the tmp is cleaned in a finally, ANY existing
+    token at the target is UNLINKED (restoring the enforcer's "none found"
+    BLOCK backstop) and a failure note rides the verdict line as
+    warn=token-write-failed. Unlink failures surface as warn=unlink-failed —
+    never silent (the old `except OSError: pass` is removed). Returns the warn
+    notes for run_check to append to the verdict line.
+    """
+    warns: list[str] = []
     if res.verdict == "CLEAR":
         payload = {"code": res.code, "phase": phase, "verdict": "CLEAR",
                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                   "card_id": card_id or "", "repo": repo,
-                   "symbol": symbol or ""}
+                   "card_id": card_id or "", "repo": token_repo,
+                   "symbol": symbol or "", "mode": res.mode}
+        tmp_path: str | None = None
         try:
             directory = os.path.dirname(token_file)
             if directory:
                 os.makedirs(directory, exist_ok=True)
-            with open(token_file, "w") as handle:
+            # P3 (code-quality round): per-INVOCATION-unique tmp via mkstemp
+            # (the old `<tokenfile>.tmp.<pid>` name is pid-unique only — two
+            # run_check calls in ONE process would share it and clobber each
+            # other's mid-write file). mkstemp keeps the same same-dir +
+            # `<tokenfile>.tmp.*` glob contract (B30/B34 pin it) and creates
+            # the file mode 0600 — the renamed token inherits that 0600 (same
+            # inode via os.rename), so the payload is never staged through nor
+            # left in a umask-open file.
+            fd, tmp_path = tempfile.mkstemp(
+                dir=directory, prefix=f"{os.path.basename(token_file)}.tmp.")
+            with os.fdopen(fd, "w") as handle:
                 json.dump(payload, handle)
+            os.rename(tmp_path, token_file)
+            tmp_path = None  # consumed by the rename
         except OSError:
-            pass  # best-effort; the verdict line is authoritative
+            warns.append("token-write-failed")
+            try:
+                if os.path.exists(token_file):
+                    os.unlink(token_file)
+            except OSError:
+                warns.append("unlink-failed")
+        finally:
+            if tmp_path is not None and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    warns.append("unlink-failed")
     else:
         try:
             if os.path.exists(token_file):
                 os.unlink(token_file)
         except OSError:
-            pass
+            warns.append("unlink-failed")
+    return tuple(warns)
 
 
-# ── context ────────────────────────────────────────────────────
+# ── #383: no-board tenant detection + distinguishable skip ──
+
+def _is_no_board(env: dict) -> bool:
+    """True iff ALL FIVE signal families are absent.
+
+    Absent = unset OR empty/whitespace (stripped value-truthiness, NOT
+    presence-keyed — no-board consumer shells ubiquitously export empty vars).
+    ANY non-empty signal → False (fail-closed). The name sets are the SAME
+    shared constants the read paths consume (B23 P2 names-parity).
+    """
+    for family in _SIGNAL_FAMILIES:
+        if any((env.get(name) or "").strip() for name in family):
+            return False
+    return True
+
+
+def _near_miss_name(env: dict) -> str | None:
+    """B27: EXACTLY ONE board-signal-family member non-empty → its name
+    (near-miss: a session that looks no-board except one stray board var —
+    ambiguous → fail-closed UNKNOWN + warn=near-miss:<name>)."""
+    non_empty = [name for name in _BOARD_NAMES
+                 if (env.get(name) or "").strip()]
+    return non_empty[0] if len(non_empty) == 1 else None
+
 
 class _Ctx:
     __slots__ = ("code", "env", "repo", "symbol", "now", "card_id", "agent",
                  "paths", "deadline", "token_file", "store", "gh", "board",
-                 "git", "guard", "repo_slug")
+                 "git", "guard", "repo_slug", "is_no_board")
 
     def remaining(self) -> float:
         return max(0.05, self.deadline - time.monotonic())
@@ -419,6 +606,15 @@ class _Ctx:
 
     def over_budget(self) -> CheckResult:
         return CheckResult(self.code, "UNKNOWN", "budget-exceeded")
+
+
+def _skip(ctx: _Ctx, detail: str) -> CheckResult:
+    """#383: the distinguishable no-board skip — CLEAR with a no-board-skip
+    advisory + mode (never a byte-identical vacuous CLEAR; B15 pins the
+    contract)."""
+    res = CheckResult(ctx.code, "CLEAR", f"no-board-skip: {detail}")
+    res.mode = "no-board-skip"
+    return res
 
 
 class _NoBoard:
@@ -480,6 +676,12 @@ def _check_c1(ctx: _Ctx) -> CheckResult:
             title = str(top.get("title") or "").strip()[:60]
             return CheckResult(ctx.code, "DUP_FIX",
                                f"closed-issue #{top.get('number')} {title}")
+    if ctx.is_no_board:
+        # #383: no-board tenant — the board scan is board-only and skipped;
+        # fetch/guard/dup-search above are retained and still fail closed.
+        if not ctx.budget_ok():
+            return ctx.over_budget()
+        return _skip(ctx, "no board session — board scan skipped")
     # Board scan: another running card claiming the same issue.
     try:
         cards = ctx.board.list_cards(ctx.remaining())
@@ -502,6 +704,9 @@ def _check_c1(ctx: _Ctx) -> CheckResult:
 
 
 def _check_c2(ctx: _Ctx) -> CheckResult:
+    if ctx.is_no_board:
+        # #383: claim-intent + overlap checks are board-only.
+        return _skip(ctx, "no board session — claim/overlap checks skipped")
     if not ctx.card_id or not ctx.agent:
         return CheckResult(ctx.code, "UNKNOWN",
                            "missing-card-context SWARM_CARD_ID/AGENT_ID")
@@ -572,13 +777,12 @@ def _check_c2(ctx: _Ctx) -> CheckResult:
 
 
 def _check_c3(ctx: _Ctx) -> CheckResult:
+    if ctx.is_no_board:
+        # #383: no-board tenant — open-PR overlap scope is board-only.
+        return _skip(ctx, "no board session — open-PR overlap check skipped")
     if not ctx.card_id:
-        # #383: non-swarm pipelines have no board card. With NO claimed
-        # touched paths there is no overlap scope to check — CLEAR (nothing
-        # can overlap). If paths ARE claimed but no card exists, keep
-        # failing closed (board intent is unclaimable).
-        if not ctx.paths:
-            return CheckResult(ctx.code, "CLEAR", "no-card-no-scope")
+        # #383 (B24): the partial's vacuous `no-card-no-scope` CLEAR is
+        # DELETED — board-mode-no-card fails closed (swarm-parity UNKNOWN).
         return CheckResult(ctx.code, "UNKNOWN",
                            "missing-card-context SWARM_CARD_ID")
     try:
@@ -621,11 +825,26 @@ def _check_c4(ctx: _Ctx) -> CheckResult:
         return CheckResult(ctx.code, "STALE",
                            f"behind-origin by {behind} commit(s)",
                            ("rebase",))
+    if ctx.is_no_board:
+        # #383: no-board tenant — the git staleness gate above (fetch +
+        # behind-origin) already ran; the pickaxe re-check is retained and
+        # SYMBOL-GATED (never pickaxe(None) — B11/B25/B31), then skip the
+        # board-scoped ancestry/symbol claims.
+        if ctx.symbol:
+            picks = ctx.git.pickaxe(ctx.symbol, SYMBOL_LOOKBACK_DAYS,
+                                    "origin/main", ctx.remaining())
+            if picks:
+                return CheckResult(
+                    ctx.code, "DUP_FIX",
+                    f"symbol-recheck {len(picks)} commit(s)-in-14d")
+        if not ctx.budget_ok():
+            return ctx.over_budget()
+        return _skip(ctx, "no board session — board-scoped checks skipped")
     if not ctx.card_id:
-        # #383: non-swarm pipelines have no board card. The git staleness
-        # gate above (fetch + behind-origin) already ran; the card only
-        # gates board-scoped ancestry/symbol claims.
-        return CheckResult(ctx.code, "CLEAR", "no-card")
+        # #383 (B24): the partial's dead `no-card` CLEAR is DELETED —
+        # board-mode-no-card fails closed (swarm-parity UNKNOWN).
+        return CheckResult(ctx.code, "UNKNOWN",
+                           "missing-card-context SWARM_CARD_ID")
     try:
         card = ctx.board.get_card(ctx.card_id, ctx.remaining())
     except InfraError as e:
@@ -665,6 +884,9 @@ def _check_c4(ctx: _Ctx) -> CheckResult:
 
 
 def _check_c5(ctx: _Ctx) -> CheckResult:
+    if ctx.is_no_board:
+        # #383: release/notify orchestration is board-only.
+        return _skip(ctx, "no board session — merge orchestration skipped")
     if not ctx.card_id or not ctx.agent:
         return CheckResult(ctx.code, "UNKNOWN",
                            "missing-card-context SWARM_CARD_ID/AGENT_ID")
@@ -748,25 +970,38 @@ def run_check(phase: str, repo: str | None = None, symbol: str | None = None,
     env = dict(os.environ if env is None else env)
     code = PHASE_CODE[phase]
     token_file = _env(env, ("PARALLEL_CHECK_TOKEN_FILE",), TOKEN_FILE_DEFAULT)
-    repo_path = os.path.abspath(
-        repo or _env(env, ("PARALLEL_CHECK_REPO",)) or str(_REPO_ROOT))
+    # #383: ops-target chain — --repo → PARALLEL_CHECK_REPO (stripped,
+    # empty/whitespace falls through) → cwd (B18/B22/B32).
+    repo_path = _resolve_ops_target(repo, env)
     symbol = (symbol or _env(env, ("PARALLEL_CHECK_SYMBOL",))).strip() or None
-    card_id = _env(env, ("SWARM_CARD_ID", "CARD_ID"))
-    agent = _env(env, ("AGENT_ID", "SWARM_AGENT_ID"))
+    # #383: read paths consume the SAME shared constants the predicate uses
+    # (B23 P2 names-parity); stripped values = value-truthiness everywhere.
+    card_id = _env(env, _CARD_ID_NAMES).strip()
+    agent = _env(env, _AGENT_ID_NAMES).strip()
     paths = _paths_from_env(env)
     now = now or datetime.now(timezone.utc)
+    # #383 (B23): the budget CLAMP — min(parse, PARALLEL_CHECK_BUDGET_MAX)
+    # with the same env-read constant + default 60 as the .sh watchdog;
+    # float("inf")/"1e309" parse WITHOUT ValueError and min() bounds them;
+    # float("nan") → min(nan, max) = nan → deadline nan → budget_ok() False
+    # → immediate UNKNOWN (fail-closed, acceptable).
     try:
-        budget = float(_env(env, ("PARALLEL_CHECK_TIMEOUT_SECS",),
-                            str(BUDGET_DEFAULT)))
-    except ValueError:
+        budget = min(
+            float(_env(env, ("PARALLEL_CHECK_TIMEOUT_SECS",),
+                       str(BUDGET_DEFAULT))),
+            float(_env(env, ("PARALLEL_CHECK_BUDGET_MAX",),
+                       str(BUDGET_MAX_DEFAULT))),
+        )
+    except (ValueError, OverflowError):
         budget = BUDGET_DEFAULT
 
     sb_url, sb_key = _sb_config(env)
     git = git or GitOps(repo_path, env)
     board = board or (BoardRest(sb_url, sb_key) if sb_url else _NoBoard())
     gh = gh or GhRest(_env(env, ("GH_API_BASE",),
-                           "https://api.github.com"),
-                      _env(env, ("GH_TOKEN",)))
+                           "https://api.github.com").strip()
+                      or "https://api.github.com",
+                      _env(env, ("GH_TOKEN",)).strip())
     if store is None:
         from connectors.supabase_swarm import store as default_store
         store = default_store()
@@ -790,16 +1025,60 @@ def run_check(phase: str, repo: str | None = None, symbol: str | None = None,
     ctx.git = git
     ctx.guard = guard
     ctx.repo_slug = _resolve_slug(env, git, ctx.remaining())
+    # #383: tenant detection — the predicate is set BEFORE the phase check
+    # (after env resolution, before board construction).
+    ctx.is_no_board = _is_no_board(env)
+
+    # B27: warn notes that ride the verdict line — near-miss (exactly one
+    # board-family member → UNKNOWN + warn=near-miss:<name>) and new-signal
+    # (a board-signal NAME absent from the probe-time snapshot, now present).
+    warns: list[str] = []
+    near_miss = None if ctx.is_no_board else _near_miss_name(env)
+    if near_miss is not None:
+        warns.append(f"near-miss:{near_miss}")
+    for name in NEW_BOARD_SIGNAL_NAMES:
+        if (env.get(name) or "").strip():
+            warns.append("new-signal:" + name)
 
     try:
-        result = _CHECKERS[phase](ctx)
+        if near_miss is not None:
+            # ambiguous single board signal → deterministic UNKNOWN, no check
+            result = CheckResult(code, "UNKNOWN")
+        else:
+            result = _CHECKERS[phase](ctx)
     except InfraError as e:
         result = CheckResult(code, "UNKNOWN", str(e))
     except Exception as e:  # script-error must never crash the caller
         result = CheckResult(code, "UNKNOWN",
                              f"script-error {type(e).__name__}: {e}")
 
-    _apply_token(result, phase, env, token_file, card_id, repo_path, symbol)
+    result.warns.extend(warns)
+    # P3 (code-quality round): token_repo is LAZY — resolved ONLY on a CLEAR
+    # verdict. The old eager call paid a ~25ms `git remote get-url` subprocess
+    # + budget slice on EVERY invocation, including UNKNOWN/STALE paths where
+    # the token is never written (only CLEAR writes one). main()'s exception
+    # path keeps passing "unknown".
+    if result.verdict == "CLEAR":
+        try:
+            token_repo = git.remote_url(ctx.remaining())
+        except Exception:
+            token_repo = "unknown"   # same fail-safe as remote_url's internal paths
+    else:
+        token_repo = "unknown"
+    # P3 (code-quality round): _apply_token catches OSError internally
+    # (write/unlink failures → its specific warn notes); a NON-OSError (e.g.
+    # a future non-serializable payload → TypeError from json.dump) would
+    # propagate out of run_check and violate its documented "NEVER raises"
+    # contract (currently unreachable, but the asymmetry is a latent
+    # footgun). The outer wrapper ONLY contains the non-OSError class — the
+    # OSError path still flows through the internal handling and its notes
+    # are never swallowed (mirrors the lazy remote_url isolation just above).
+    try:
+        token_warns = _apply_token(result, phase, env, token_file, card_id,
+                                   token_repo, symbol)
+    except Exception as e:  # non-OSError only — OSError is handled inside
+        token_warns = (f"token-error:{type(e).__name__}",)
+    result.warns.extend(token_warns)
     return result
 
 
@@ -817,9 +1096,12 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # defense-in-depth: still emit a verdict line
         result = CheckResult(PHASE_CODE[args.phase], "UNKNOWN",
                              f"script-error {type(e).__name__}: {e}")
+        # #383 signature-sync under the new _apply_token contract (mode/repo
+        # params): the verdict is UNKNOWN, so ONLY the unlink branch can run —
+        # never a CLEAR-shaped token when repo/mode are unknowable.
         _apply_token(result, args.phase, dict(os.environ),
                      _env(dict(os.environ), ("PARALLEL_CHECK_TOKEN_FILE",),
-                          TOKEN_FILE_DEFAULT), "", "", "")
+                          TOKEN_FILE_DEFAULT), "", "unknown", "")
     print(result.line(), flush=True)
     return 0
 

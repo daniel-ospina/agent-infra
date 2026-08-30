@@ -1,7 +1,7 @@
 {
   "base_rev": "29dd67e8",
   "source": "https://github.com/daniel-ospina/swarm",
-  "generated": "2026-08-29",
+  "generated": "2026-08-30",
   "files": {
     "scripts/checkout_guard.sh": {
       "identical@base": true,
@@ -12,19 +12,19 @@
       "identical@base": false,
       "patch": "scripts/.vendor-patches/parallel_work_check.sh.patch",
       "base_sha256": "f26569c60ea1f5559591f73cbb846cc221d4bfc6cf12aa2c99a5fb25ccf7b7a2",
-      "patched_sha256": "76d5ff438236e331e15e7c6eec7462f4a1eb7b710d66ac958641b52e4312a44a"
+      "patched_sha256": "23f99eade41bb58ea6c3cd886c98583303d91f20ad077d9e62bf951a9b1feb88"
     },
     "scripts/parallel_work_check.py": {
       "identical@base": false,
       "patch": "scripts/.vendor-patches/parallel_work_check.py.patch",
       "base_sha256": "fa71e6b5c1e135a7a48462facb5a1b67d7d7296584918b4b4de3fab4d75f7581",
-      "patched_sha256": "55aaf365036c56f3cfcb8bd00c89eeefaef48d2854bbbc9b17fa2111b9b140d2"
+      "patched_sha256": "a91dcad392ac3aa8f61472520879e4b26038832df9775bee5cd372c82c8cab36"
     },
     "scripts/test_parallel_work_check.py": {
       "identical@base": false,
       "patch": "scripts/.vendor-patches/test_parallel_work_check.py.patch",
       "base_sha256": "2ad53d8ae271336d2b4cd87048078a125c8bb9cc49280096ca234609f7cf4b64",
-      "patched_sha256": "cd045e38dc622443bdf0139a48e252768ecea2968c784dcb2395ece76e5660f3"
+      "patched_sha256": "3eb8d0470f158dc55892dd3dcf27a950225aba49cd65f891ec344fbd7a7b7b9b"
     },
     "scripts/fake_supabase.py": {
       "identical@base": true,

@@ -88,11 +88,15 @@ esac
 # #383 patch: the watchdog budget is CLAMPED to PARALLEL_CHECK_BUDGET_MAX
 # (env, default 60) so an unbounded or non-finite value (inf/nan/1e309)
 # cannot stall the watchdog indefinitely (GNU `sleep inf` sleeps forever).
-# The python side (run_check) gains the same clamp in #383 Task 2 Step 4 —
-# until then the clamped shell watchdog is the ONLY bound: python's
-# float("1e309") silently overflows to inf (no exception), so its deadline
-# becomes inf and it does NOT fail closed on its own; the watchdog kills it
-# at ≤ BUDGET_MAX+2s → fail-closed UNKNOWN.
+# This .sh clamp is the HARD BACKSTOP and deliberately DIVERGES from the
+# python side (which clamps python's OWN deadline — min(float(raw),
+# BUDGET_MAX), except (ValueError, OverflowError) → default 60): the regex
+# gate maps non-finite raw strings to the default 2.0 (python: inf → 60.0,
+# nan → immediate UNKNOWN), the min clamp floors "0" at 0.05 (python: 0.0),
+# and a cap > 86400 resets to 60 (python accepts it verbatim). Every
+# divergence is fail-closed: the watchdog always fires within a bounded
+# window (≤ cap+2s), so a HUNG python is SIGKILLed → fail-closed UNKNOWN,
+# never a stall and never a wrongly-passing gate.
 budget="${PARALLEL_CHECK_TIMEOUT_SECS:-2}"
 budget_max="${PARALLEL_CHECK_BUDGET_MAX:-60}"
 budget="$(awk -v b="$budget" -v m="$budget_max" 'BEGIN {
