@@ -12,7 +12,7 @@ name: Node.js CI
 #   * unit-test job runs when test-command OR test-glob is set ('' = skip).
 #     test-command is an escape hatch (npm ci && vitest, npx tsx suites,
 #     failure accumulators) and OVERRIDES test-glob when both are set.
-#     test-command MUST NOT contain '${{' (Actions expression syntax).
+#     test-command MUST NOT contain Actions expression syntax (dollar-brace-brace).
 #   * script-validate / skill-lint are boolean skip inputs, default true
 #     (backward-compatible: existing callers keep both gates). Consumers
 #     with a broken-on-runner scripts/ symlink (e.g. tortoise) or no
@@ -41,7 +41,7 @@ on:
       test-command:
         type: string
         default: ''
-        description: Escape hatch — arbitrary test invocation (e.g. 'npm ci && vitest run', npx tsx suites, failure accumulators). OVERRIDES test-glob when both set. MUST NOT contain '${{'.
+        description: Escape hatch — arbitrary test invocation (e.g. 'npm ci && vitest run', npx tsx suites, failure accumulators). OVERRIDES test-glob when both set. MUST NOT contain Actions expression syntax (dollar-brace-brace); plain shell only.
       script-validate:
         type: boolean
         default: true
