@@ -51,13 +51,13 @@
     }
   },
   "ci": {
-    "ref": "v0.1.0",
+    "ref": "v0.1.1",
     "sha": "8ea4a08ab795d63f64622ea8c796f9bdcd197147",
     "note": "Consumers pin uses: daniel-ospina/agent-infra/.github/workflows/<stack>-ci.yml@vX.Y.Z. Bump = tag + ci.ref edit + agent-infra update (no auto-rewrite; agent-infra check blocks on stale pin). #303"
   },
   "check": {
     "ci": {
-      "ref": "v0.1.0"
+      "ref": "v0.1.1"
     },
     "exemptions": {
       "eldato-outreach": [
