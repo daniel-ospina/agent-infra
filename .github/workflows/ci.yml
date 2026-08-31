@@ -40,3 +40,20 @@ jobs:
         run: bash scripts/check-cost-config.sh --shipped-only
       - name: Cost-config guard tests (fixtures, detect-not-block semantics)
         run: bash tests/cost-config/run.sh
+
+  actionlint:
+    # #398 — workflow YAML syntax + Actions-expression errors fail CI BEFORE
+    # merge (the #394 defect class: a literal '${{' in a plain YAML scalar
+    # description broke the expression lexer → whole workflow failed at
+    # validation with 'workflow file issue', zero jobs, zero logs; only the
+    # post-merge backstop caught it). Zero-new-deps: official rhysd/actionlint
+    # docker image (pinned 1.7.12); scope = syntax + expression only
+    # (-shellcheck=: pre-existing style-level shellcheck findings on clean
+    # main must not trip the gate).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Actionlint gate (workflows + templates)
+        run: bash scripts/check-workflow-actionlint.sh
+      - name: Actionlint gate tests (fixtures, #394 regression)
+        run: bash tests/actionlint/run.sh
