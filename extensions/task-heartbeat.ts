@@ -46,8 +46,41 @@
  *
  * Marker format is drift-guarded against the parent parser by E14 in
  * extensions/builtin-tools/builtin-tools.test.ts (round-trip + constant parity).
+ *
+ * ── Orphan watchdog (#385) ────────────────────────────────────────────────────
+ * This extension ALSO carries the child-side parent-death watchdog: when the
+ * orchestrator (parent pi) is SIGKILLed (macOS Jetsam or any cause), the child
+ * reparents to PID 1 and every parent-side reaping path (settle-path pgid sweep,
+ * treeKill, the 6h hard-cap timer, mcp-client's process.on("exit") transport kill)
+ * dies with the parent — the orphan would accumulate forever, holding pi + MCP
+ * memory. The watchdog makes cleanup parent-independent:
+ *
+ *   - gate: orphanWatchdogActive() = TASK_HEARTBEAT=1 AND PI_MODE=print AND
+ *     ORPHAN_WATCHDOG != "0" — the repo's established sub-agent identity pair
+ *     (verification-gate/review-enforcer isTaskSubAgent). DISABLE-agnostic:
+ *     TASK_HEARTBEAT_DISABLE=1 (subagent-extension children) silences the
+ *     EMITTER only, never the watchdog. Exempts swarm_daemon workers
+ *     (PI_MODE=print only — no pair) and user one-shot `pi -p` runs.
+ *   - detection: poll process.ppid (module-load scope, unref'd, zero exec —
+ *     Node's ppid is dynamic and flips to 1 on reparenting, macOS-verified).
+ *     Predicate: ppid !== originalPpid || ppid === 1 (subreaper + boot-race arms).
+ *   - self-termination: double-confirm + min-uptime guards, then kill OWN
+ *     descendant tree (MCP grandchildren, bash forks) TERM → grace → SIGKILL +
+ *     a pgid catch-net, append a durable attribution line, exit(137). The
+ *     mcp-client process.on("exit") transport kill runs as a second net.
+ *   - safety valves: ORPHAN_WATCHDOG=0 (farm-wide opt-out), min-uptime +
+ *     double-confirm (false-positive insurance), fired latch, NODE_ENV=test
+ *     gated test hooks.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+// #385: shared process primitives — flat extensions CAN resolve ./shared/*
+// (verified 2026-08-13). getChildPids/treeKill for the descendant kill,
+// getPgid/listPgid for the pgid catch-net.
+import { getChildPids, treeKill } from "./shared/tree-kill.js";
+import { getPgid, listPgid } from "./shared/process-sweep.js";
 
 // ── Marker contract (drift-guarded vs builtin-tools/index.ts — E14) ────
 
@@ -135,9 +168,192 @@ export function formatSessionEnd(nonce: string): string {
   return `${HEARTBEAT_MARKER_PREFIX} session_end nonce=${nonce}`;
 }
 
+// ── Orphan watchdog (#385) ───────────────────────────────────────────────
+// Child-side parent-death detection: poll process.ppid (module-load scope,
+// unref'd, zero exec — Node's ppid is dynamic and flips to 1 on reparenting,
+// macOS-verified); on double-confirm + min-uptime, kill the OWN descendant
+// tree (MCP grandchildren / bash forks) and exit(137). See the file header
+// for the full contract. Test hooks are NODE_ENV=test-gated (#212 precedent).
+
+export const ORPHAN_WATCHDOG_INTERVAL_MIN_MS = 5_000;
+export const DEFAULT_ORPHAN_WATCHDOG_INTERVAL_MS = 15_000;
+export const DEFAULT_ORPHAN_WATCHDOG_MIN_UPTIME_MS = 60_000;
+export const ORPHAN_WATCHDOG_GRACE_MIN_MS = 1_000;
+export const DEFAULT_ORPHAN_WATCHDOG_GRACE_MS = 4_000;
+export const ORPHAN_WATCHDOG_LOG_PATH = path.join(os.homedir(), ".pi", "agent", "orphan-watchdog.log");
+
+/** Poll interval: ORPHAN_WATCHDOG_INTERVAL_MS, default 15s, floor 5s. */
+export function getOrphanIntervalMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = Number(env.ORPHAN_WATCHDOG_INTERVAL_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_ORPHAN_WATCHDOG_INTERVAL_MS;
+  return Math.max(ORPHAN_WATCHDOG_INTERVAL_MIN_MS, raw);
+}
+
+/** Min-uptime guard: never self-terminate before this age (default 60s). */
+export function getOrphanMinUptimeMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = Number(env.ORPHAN_WATCHDOG_MIN_UPTIME_MS);
+  if (!Number.isFinite(raw) || raw < 0) return DEFAULT_ORPHAN_WATCHDOG_MIN_UPTIME_MS;
+  return raw;
+}
+
+/** TERM→KILL grace between the descendant walks (default 4s, floor 1s). */
+export function getOrphanGraceMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = Number(env.ORPHAN_WATCHDOG_GRACE_MS);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_ORPHAN_WATCHDOG_GRACE_MS;
+  return Math.max(ORPHAN_WATCHDOG_GRACE_MIN_MS, raw);
+}
+
+/** Watchdog gate — the repo's sub-agent identity pair + opt-out valve.
+ * DISABLE-agnostic: TASK_HEARTBEAT_DISABLE=1 silences the emitter only.
+ * Exempts swarm_daemon workers (PI_MODE=print only) and user one-shots. */
+export function orphanWatchdogActive(env: Record<string, string | undefined> = process.env): boolean {
+  return env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print" && env.ORPHAN_WATCHDOG !== "0";
+}
+
+/** Orphan predicate: ppid CHANGED (reparented — covers Linux subreaper
+ * adoption to a non-1 pid) OR ppid === 1 (launchd adoption on macOS; also the
+ * boot-race arm where the parent died before this extension loaded). */
+export function isOrphaned(ppid: number, originalPpid: number): boolean {
+  return ppid !== originalPpid || ppid === 1;
+}
+
+export interface OrphanWatchdogHooks {
+  ppidGetter: () => number;
+  nowGetter: () => number;
+  killDescendants: (graceMs: number) => Promise<void>;
+  exitProcess: (code: number) => void;
+  appendLog: (line: string) => void;
+}
+
+const defaultAppendLog = (line: string): void => {
+  try {
+    fs.appendFileSync(ORPHAN_WATCHDOG_LOG_PATH, `${line}\n`, "utf8");
+  } catch {
+    // best-effort — a log failure must never break the kill path
+  }
+};
+
+/** Default descendant-kill orchestration: TERM direct children (treeKill
+ * recurses children-first within each subtree — MCP grandchildren and bash
+ * forks die), ref'd grace, SIGKILL survivors, then a pgid catch-net when the
+ * child is its own pgid leader (detached spawn) — closes the mid-fork escape
+ * (a descendant forked between the re-walk and exit). Never signals self. */
+const defaultKillDescendants = async (graceMs: number): Promise<void> => {
+  for (const childPid of getChildPids(process.pid)) treeKill(childPid, "SIGTERM");
+  await new Promise((resolve) => setTimeout(resolve, graceMs));
+  for (const childPid of getChildPids(process.pid)) treeKill(childPid, "SIGKILL");
+  const ownPgid = getPgid(process.pid);
+  if (ownPgid !== null && ownPgid === process.pid) {
+    for (const member of listPgid(ownPgid)) {
+      if (member !== process.pid) {
+        try {
+          process.kill(member, "SIGKILL");
+        } catch {
+          // ESRCH — already dead
+        }
+      }
+    }
+  }
+};
+
+/** Module-level test hooks — honored ONLY under NODE_ENV=test (#212
+ * security-pass convention: review-enforcer _setRunGhOverride precedent). */
+export const orphanWatchdogHooks: OrphanWatchdogHooks = {
+  ppidGetter: () => process.ppid,
+  nowGetter: () => Date.now(),
+  killDescendants: defaultKillDescendants,
+  exitProcess: ((code: number) => {
+    process.exit(code);
+  }) as (code: number) => void,
+  appendLog: defaultAppendLog,
+};
+
+let watchdogArmed = false;
+
+/** Test-only reset of the already-armed latch (NODE_ENV=test-gated per the
+ * #212 security-pass convention). Each test arms a fresh watchdog. */
+export function _resetWatchdogArmedForTests(): void {
+  if (process.env.NODE_ENV === "test") watchdogArmed = false;
+}
+
+export interface OrphanWatchdogHandle {
+  timer: ReturnType<typeof setInterval>;
+  poll: () => void;
+}
+
+/** Arm the parent-death watchdog at module-load scope. Returns null when the
+ * gate is off or the watchdog is already armed (pi's loader re-runs the
+ * factory on ctx.reload()). The handle exposes {timer, poll} so tests can
+ * assert unref + drive polls synchronously. */
+export function armOrphanWatchdog(): OrphanWatchdogHandle | null {
+  if (!orphanWatchdogActive()) return null;
+  if (watchdogArmed) return null;
+  watchdogArmed = true;
+
+  const originalPpid = orphanWatchdogHooks.ppidGetter();
+  const startedAt = orphanWatchdogHooks.nowGetter();
+  let confirmCount = 0;
+  let fired = false;
+
+  const poll = (): void => {
+    if (fired) return;
+    const now = orphanWatchdogHooks.nowGetter();
+    const cur = orphanWatchdogHooks.ppidGetter();
+    if (isOrphaned(cur, originalPpid)) {
+      confirmCount += 1;
+      if (confirmCount >= 2 && now - startedAt >= getOrphanMinUptimeMs()) {
+        fired = true;
+        void fireSequence(originalPpid, cur, now - startedAt);
+      }
+    } else {
+      confirmCount = 0;
+    }
+  };
+
+  const timer = setInterval(poll, getOrphanIntervalMs());
+  timer.unref?.();
+  return { timer, poll };
+}
+
+/** Fire sequence: EPIPE-guarded stderr line + durable attribution append,
+ * then kill the descendant tree (TERM → grace → SIGKILL + pgid catch-net)
+ * and exit(137). try/finally: the exit ALWAYS runs even if an unanticipated
+ * exception occurs mid-sequence. */
+async function fireSequence(originalPpid: number, curPpid: number, uptimeMs: number): Promise<void> {
+  // Capture the hook FUNCTIONS once — the sequence may be suspended across
+  // awaits (grace sleep, killDescendants); a later hooks mutation/restore
+  // (tests) must never swap the exit function under the running sequence.
+  const killDescendants = orphanWatchdogHooks.killDescendants;
+  const exitProcess = orphanWatchdogHooks.exitProcess;
+  const appendLog = orphanWatchdogHooks.appendLog;
+  const logLine = `[task-heartbeat] orphan_watchdog parent=${originalPpid} ppid=${curPpid} uptime_ms=${uptimeMs} pid=${process.pid} — self-terminating`;
+  try {
+    try {
+      console.error(logLine);
+    } catch {
+      // stderr EPIPE to a dead parent surfaces as a silenced async 'error'
+      // event (Node swallows it by default) — never break the kill path
+    }
+    appendLog(logLine);
+    await killDescendants(getOrphanGraceMs());
+  } catch {
+    // An exception in the kill path must never prevent the exit — we are
+    // self-terminating anyway. Swallow and fall through to the finally.
+  } finally {
+    exitProcess(137);
+  }
+}
+
 // ── Extension ───────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // #385: the orphan watchdog arms in EVERY dispatch child (identity pair),
+  // even when the emitter is disabled (TASK_HEARTBEAT_DISABLE=1 — subagent-
+  // extension children). Module-load scope: a child wedged before
+  // session_start still self-terminates when its parent is killed.
+  if (orphanWatchdogActive()) {
+    armOrphanWatchdog();
+  }
   if (!taskHeartbeatActive()) return;
 
   // Per-dispatch nonce set by the parent task tool — echoed in every marker so
