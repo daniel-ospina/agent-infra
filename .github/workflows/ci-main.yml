@@ -115,9 +115,26 @@ jobs:
       - name: Cost-config guard (shipped, --shipped-only)
         run: bash scripts/check-cost-config.sh --shipped-only
 
+  python-ci:
+    # #383 — post-merge run of the vendored parallel_work_check suite via the
+    # reusable python-ci.yml (finally called, per the Task 5 intent). The
+    # skip-empty guard (install-extras: '') skips the extras install; pytest
+    # lands in the setup-python 3.12 toolcache. python-version MUST be '3.12'
+    # to match test-command's `python3.12` — the runner's system python3.12
+    # has neither pytest nor pytest-timeout (a 3.11/3.12 mismatch would fail
+    # every post-merge run and auto-file false "main broken by merge" issues).
+    uses: daniel-ospina/agent-infra/.github/workflows/python-ci.yml@main
+    secrets: inherit
+    with:
+      python-version: '3.12'
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q'
+      lint-command: ''
+      typecheck-command: ''
+      install-extras: ''
+
   auto-file-on-failure:
     runs-on: ubuntu-latest
-    needs: [extension-tests, script-validate, skill-lint, cost-config-guard]
+    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, python-ci]
     if: failure()
     steps:
       - uses: actions/github-script@v7
