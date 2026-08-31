@@ -12,6 +12,8 @@
 #   7. clean fixture (exact base copies)    → status CLEAN, exit 0
 #   8. --ci skips machine-local extensions/skills; local mode checks them
 #   9. check.ci.ref ≠ ci.ref sync guard       → status FAIL, exit 1 (#387)
+#  10. inline generic test job (exemplar)      → status FAIL, exit 1 (#389)
+#  11. repo-specific inline jobs (boundary)    → status CLEAN, exit 0 (#389)
 #
 # Fixture: tests/fixtures/drift/current/ simulates a consumer repo. Its
 # scripts/ is a RELATIVE symlink into the agent-infra checkout; its
@@ -150,6 +152,49 @@ run_check 1 "sync guard (--ci)" --ci
 if grep -q "sync guard" "$OUT"; then pass "sync guard message present"; else fail "expected sync guard message"; tail -15 "$OUT"; fi
 cp "$MANIFEST_BAK" "$ROOT/manifest.json"
 rm -f "$MANIFEST_BAK"
+
+echo ""
+echo "10. Inline generic test job → FAIL, exit 1 (#389)"
+echo "$VERSION" > "$FIX/.agent-infra-version"
+REF="$(node -e "console.log(require('$ROOT/manifest.json').ci.ref)")"
+cat > "$FIX/.github/workflows/inline-generic-test.yml" <<'YAML'
+name: inline generic test (fixture #389)
+on:
+  pull_request:
+jobs:
+  dashboard-js-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dashboard JS unit tests (node --test, zero deps)
+        run: node --test src/*.test.js
+        working-directory: website/apps/dashboard
+YAML
+run_check 1 "inline generic test job (--ci)" --ci
+if grep -q "status: FAIL" "$OUT"; then pass "summary status FAIL"; else fail "expected status: FAIL"; tail -15 "$OUT"; fi
+if grep -q "inline generic test job" "$OUT"; then pass "inline-job flag present"; else fail "expected inline-job flag"; tail -15 "$OUT"; fi
+if grep -q "node-ci.yml@$REF" "$OUT"; then pass "remediation names node-ci.yml@$REF"; else fail "remediation missing node-ci.yml@$REF"; tail -15 "$OUT"; fi
+rm -f "$FIX/.github/workflows/inline-generic-test.yml"
+
+echo ""
+echo "11. Repo-specific inline jobs → CLEAN, exit 0 (#389 boundary)"
+cat > "$FIX/.github/workflows/repo-specific-tests.yml" <<'YAML'
+name: repo-specific gates (fixture #389)
+on:
+  pull_request:
+jobs:
+  migration-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: bash .github/scripts/check-migration-append-only prefix
+  welcome-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - run: node --experimental-strip-types tests/test_waitlist_subscribe.mjs
+YAML
+run_check 0 "repo-specific inline jobs not flagged (--ci)" --ci
+if grep -q "inline test jobs — no generic" "$OUT"; then pass "inline jobs surface clean"; else fail "expected clean inline-jobs line"; tail -15 "$OUT"; fi
+rm -f "$FIX/.github/workflows/repo-specific-tests.yml"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

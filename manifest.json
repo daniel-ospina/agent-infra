@@ -60,9 +60,6 @@
       "ref": "v0.1.1"
     },
     "exemptions": {
-      "eldato-outreach": [
-        "templates/.github/workflows/"
-      ],
       "dmer": [
         "scripts"
       ],
