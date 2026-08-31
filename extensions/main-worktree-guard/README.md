@@ -66,7 +66,31 @@ scoping, `git worktree list` membership derived from the worktrees' reverse-
 pointer admin dirs — porcelain has no gitdir column — + cwd containment,
 realpath-normalized) and exempts worktree-targeted invocations — a hub-rooted
 session that `cd`s into a worktree is no longer frozen by hub disorder
-(2026-08-27 tortoise incident class). **Shared-ref verbs are NOT exempt (round-3 inverted allowlist):** worktrees
+(2026-08-27 tortoise incident class). **CROSS-REPO worktrees (#397):** the
+worktree map used to be derived from the SESSION cwd frame only, so a worktree
+of a DIFFERENT repo (an agent-infra worktree reached from a tortoise session)
+missed the map and every sanctioned agent-infra mutation was false-blocked
+(2026-08-30 #387: 4 commits, 3 pushes, a PR body and a tag all had to be
+delegated to gate-exempt sub-agents). `resolveInvocationTarget` now falls back
+to deriving the map from the invocation's OWN frame (the cwd where git itself
+resolved the git-dir) with the same two-way back-reference + porcelain
+cross-check — a foreign worktree is recognized, tagged `foreignWorktree`, and
+treated as **fully isolated**: git repos never share ref namespaces, so none of
+the session-hub protections (shared-ref re-classification, main-protection,
+protected-branch refspec guards) apply to it. Only the session repo's own
+worktrees share the hub's ref namespace. A foreign-wt push/fetch whose remote
+operand resolves into the session hub's repo is NOT exempt — it rewrites the
+hub's OWN refs: direct local paths, `file://`/`file://localhost/` URLs (LOCAL
+transports), CONFIGURED remote names whose (push)url is a hub path (`remote add
+hub <hub-path>` then `push hub main`), `-c`/`--config`/`--config-env=`/
+`GIT_CONFIG_*` remote overrides (effective-config probes, cycle-4/5), `--repo=`
+(a FALLBACK — the positional `<repository>` takes precedence per git docs),
+and bare/refspec-first pushes resolving to such a remote (cycle-2/3/4/5
+closures, same git-common-dir identity). Documented residual: a foreign-wt
+push naming the session repo's origin as a NON-local URL (http/ssh/git/scp)
+can still advance the session repo's REMOTE refs — the gate cannot cheaply
+compare remote URLs; the session hub's LOCAL refs are unreachable through a
+non-local transport.**Shared-ref verbs are NOT exempt (round-3 inverted allowlist):** worktrees
 share the hub's ref namespace — only worktree-LOCAL verbs (commit/add/reset/
 merge/rebase/checkout/restore/clean/apply/pull/… — the wt's own working tree,
 index, and branch) are auto-exempt; everything else (`push`/`update-ref`/
@@ -77,7 +101,23 @@ foreign/delete/empty-source-`:ref`/`--all`/`--prune` still block).
 **Main-protection:** a worktree checked out on `main`/`master` is the hub's
 protected branch — mutations block; `git checkout main` AND force forms
 (`checkout -B main`) from a worktree while the hub is off-main (main free)
-block. **Interpreter-inline gating:** `bash -c 'git …'`/`sh -c`/`zsh -c`/
+block. (Both bullets are session-repo-scoped: foreign worktrees are exempt per
+the #397 doctrine above.) **Recovery-checkout verification (#397 hardening):**
+a sanctioned-recovery `git checkout main|master` is refused loudly when the
+branch cannot be checked out in the target repo (no local `refs/heads/<b>` and
+no unique remote-tracking DWIM source — DWIM is checked per configured remote's
+FETCH REFSPEC, matching git's `checkout --guess`/`unique_tracking_name`, so a
+planted tracking ref with no matching refspec, or a multi-remote ambiguity,
+both block) — `git checkout -q main
+2>/dev/null` swallows the failure, the agent proceeds believing it is on main,
+and the next destructive op moves the CURRENT branch (2026-08-30 #387: a
+swallowed checkout failure preceded a reset that moved `feat/387-ci-central`
+to main). The gate fails loudly instead of blessing a doomed checkout.
+(Residuals: `git -c checkout.guess=false` disables DWIM entirely; a dirty
+working tree can still fail the checkout at run time — both fail VISIBLY
+unless stderr is swallowed; the hardening closes the silent-failure class.)
+The same hardening applies to the SCRIPT surface (`scriptGitVerdict`).
+**Interpreter-inline gating:** `bash -c 'git …'`/`sh -c`/`zsh -c`/
 `eval` content is recursively parsed and gated (no inline bypass);
 `bash -x evil.sh` style leading interpreter flags are skipped (script files
 still gated). **fetch/pull refspecs:** explicit `:dst` refspecs writing

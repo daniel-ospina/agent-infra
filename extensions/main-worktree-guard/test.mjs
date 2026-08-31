@@ -680,6 +680,67 @@ try {
   execSync("git config user.email t@t && git config user.name t", { cwd: foreignR, stdio: "ignore" });
   execSync("touch f.txt && git add . && git commit -qm init", { cwd: foreignR, stdio: "ignore" });
   execSync(`git worktree add -q "${foreignWt}" -b f/wt HEAD`, { cwd: foreignR, stdio: "ignore" });
+  // #397 hardening fixtures: a MAINLESS foreign repo (worktree created from a
+  // feature branch — the #387 incident geometry: `git checkout main` CANNOT
+  // succeed, and the swallowed failure preceded a wrong-branch reset) and a
+  // DWIM repo (no local main, but a UNIQUE refs/remotes/origin/main — git's
+  // checkout --guess WOULD succeed → the gate must allow).
+  const mainlessR = `${m4Tmp}/mainless`;
+  const mainlessWt = `${m4Tmp}/mainless-wt`;
+  execSync(`git init -q -b feat/x "${mainlessR}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: mainlessR, stdio: "ignore" });
+  execSync("touch m.txt && git add . && git commit -qm init", { cwd: mainlessR, stdio: "ignore" });
+  execSync(`git worktree add -q "${mainlessWt}" -b f/wt2 HEAD`, { cwd: mainlessR, stdio: "ignore" });
+  const dwimR = `${m4Tmp}/dwim`;
+  execSync(`git init -q -b feat/x "${dwimR}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: dwimR, stdio: "ignore" });
+  execSync("touch d.txt && git add . && git commit -qm init", { cwd: dwimR, stdio: "ignore" });
+  // Cycle-3 P1 fixtures: foreignR gets a REAL origin (bare clone — so
+  // `push origin` is a realistic non-hub push) AND a `hubpath` alias remote
+  // pointing at the SESSION HUB (the named-remote vector: `remote add hub
+  // <hub-path>` + `push hub main` rewrote the hub's local main — demonstrated
+  // in cycle-3 review). The bare clone is created here, before the DWIM/
+  // nofetch/mirror fixtures reference it.
+  execSync(`git clone -q --bare "${foreignR}" "${m4Tmp}/origin-bare"`, { stdio: "ignore" });
+  execSync(`git remote add origin "${m4Tmp}/origin-bare"`, { cwd: foreignR, stdio: "ignore" });
+  execSync(`git remote add hubpath "${hubR}"`, { cwd: foreignR, stdio: "ignore" });
+  execSync(`git remote add origin "${m4Tmp}/origin-bare"`, { cwd: dwimR, stdio: "ignore" });
+  execSync("git fetch -q origin", { cwd: dwimR, stdio: "ignore" });
+  // Code-review P2 fixtures: (a) a repo with a CRAFTED refs/remotes/origin/main
+  // but NO configured remote — git checkout --guess iterates configured remotes,
+  // so git REFUSES this checkout while a raw ref-count would bless it; (b) a
+  // remote whose name contains a SLASH (origin/sub) — git DWIMs successfully
+  // and a fixed refname-strip would mis-count it.
+  const craftedR = `${m4Tmp}/crafted-remote`;
+  execSync(`git init -q -b feat/x "${craftedR}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: craftedR, stdio: "ignore" });
+  execSync("touch c.txt && git add . && git commit -qm init", { cwd: craftedR, stdio: "ignore" });
+  execSync("git update-ref refs/remotes/origin/main HEAD", { cwd: craftedR, stdio: "ignore" });
+  const slashR = `${m4Tmp}/slash-remote`;
+  execSync(`git init -q -b feat/x "${slashR}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: slashR, stdio: "ignore" });
+  execSync("touch s.txt && git add . && git commit -qm init", { cwd: slashR, stdio: "ignore" });
+  execSync(`git remote add origin/sub "${m4Tmp}/origin-bare"`, { cwd: slashR, stdio: "ignore" });
+  execSync("git fetch -q origin/sub", { cwd: slashR, stdio: "ignore" });
+  // Cycle-2 P3 fixtures: (a) a remote with NO fetch refspec + planted tracking
+  // ref — git's unique_tracking_name requires a matching fetch refspec, so git
+  // REFUSES this checkout while a raw ref-count would bless it; (b) a remote
+  // with a NON-STANDARD fetch refspec destination (refs/remotes/mirror/*) —
+  // git DWIMs successfully, the verifier must honor the refspec mapping.
+  const noFetchR = `${m4Tmp}/nofetch`;
+  execSync(`git init -q -b feat/x "${noFetchR}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: noFetchR, stdio: "ignore" });
+  execSync("touch n.txt && git add . && git commit -qm init", { cwd: noFetchR, stdio: "ignore" });
+  execSync(`git remote add r1 "${m4Tmp}/origin-bare"`, { cwd: noFetchR, stdio: "ignore" });
+  execSync("git config --unset-all remote.r1.fetch", { cwd: noFetchR, stdio: "ignore" });
+  execSync("git update-ref refs/remotes/r1/main HEAD", { cwd: noFetchR, stdio: "ignore" });
+  const mirrorR = `${m4Tmp}/mirror`;
+  execSync(`git init -q -b feat/x "${mirrorR}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: mirrorR, stdio: "ignore" });
+  execSync("touch m.txt && git add . && git commit -qm init", { cwd: mirrorR, stdio: "ignore" });
+  execSync(`git remote add m1 "${m4Tmp}/origin-bare"`, { cwd: mirrorR, stdio: "ignore" });
+  execSync("git config remote.m1.fetch '+refs/heads/*:refs/remotes/mirror/*'", { cwd: mirrorR, stdio: "ignore" });
+  execSync("git update-ref refs/remotes/mirror/main HEAD", { cwd: mirrorR, stdio: "ignore" });
   // Second worktree of the hub — REMOVED without prune for T34 (stale admin dir).
   const wt2R = `${m4Tmp}/wt2`;
   execSync(`git worktree add -q "${wt2R}" -b wt/feat2 HEAD`, { cwd: hubR, stdio: "ignore" });
@@ -740,7 +801,156 @@ try {
   m4t("T20: gitfile from hub cwd → block (containment)", `GIT_DIR="${wtR}/.git" git commit -m x`, "block");
   m4t("T20a: gitfile from inside the wt", `cd "${wtR}" && GIT_DIR="${wtR}/.git" git commit -m x`, "allowed");
   m4t("T21: foreign non-worktree repo → block (C5)", `git -C "${foreignR}" reset --hard`, "block");
-  m4t("T22: foreign worktree → block (not in hub map, C5)", `git -C "${foreignWt}" commit -m x`, "block");
+  // Issue #397: foreign worktrees are now recognized via the invocation-frame
+  // map fallback (the SAME two-way back-reference + porcelain cross-check) and
+  // are FULLY isolated — disjoint ref namespaces mean their mutations can never
+  // touch the session hub, so every session-hub protection (shared-ref verb
+  // re-classification, main-protection, refspec guards) is a false block. The
+  // old C5 conservatism ("not in the hub's worktree map → block") was the
+  // session-scoped map's blindness, exactly what #397 fixes (2026-08-30 #387:
+  // agent-infra worktree commits/pushes/tags from a tortoise session were all
+  // false-blocked and had to be delegated to gate-exempt sub-agents).
+  m4t("T22: foreign worktree commit → allowed (#397 — disjoint refs, fully isolated)", `git -C "${foreignWt}" commit -m x`, "allowed");
+  m4t("T397a: foreign wt tag → allowed (disjoint refs — was false-blocked #387)", `cd "${foreignWt}" && git tag v1`, "allowed");
+  m4t("T397b: foreign wt push own branch → allowed", `cd "${foreignWt}" && git push origin f/wt`, "allowed");
+  expectBool("#397: foreign wt pushes are NEVER blocked (any branch — disjoint refs)", (() => {
+    // A push whose dst matches the SESSION branch name classifies "recovery"
+    // (dst == currentBranch), any other foreign-branch push classifies
+    // "allowed" — both pass the gate (index.ts treats recovery/allowed
+    // identically); the C5-era verdict was a hard block for both shapes.
+    const a = evaluateHubGateWithTargets(`cd "${foreignWt}" && git push origin main`, "main", hubR).verdict;
+    const b = evaluateHubGateWithTargets(`cd "${foreignWt}" && git push origin main`, "hub/off", hubR).verdict;
+    const c = evaluateHubGateWithTargets(`cd "${foreignWt}" && git push -f origin f/wt`, "main", hubR).verdict;
+    return a !== "block" && b !== "block" && c !== "block";
+  })(), true);
+  m4t("T397d: foreign wt checkout -b → allowed (worktree-local)", `cd "${foreignWt}" && git checkout -b f/new`, "allowed");
+  m4t("T397e: foreign repo WITH main — checkout main → recovery (branch exists)", `git -C "${foreignR}" checkout main`, "recovery");
+  m4t("T397f: foreign MAINLESS wt checkout main → block (#397 hardening — fail loudly)", `git -C "${mainlessWt}" checkout main`, "block");
+  m4t("T397g: foreign MAINLESS wt switch main → block (switch form)", `git -C "${mainlessWt}" switch main`, "block");
+  m4t("T397h: foreign DWIM repo checkout main → recovery (unique remote-tracking source)", `git -C "${dwimR}" checkout main`, "recovery");
+  m4t("T397i: foreign MAINLESS wt checkout -b main origin/main → allowed (escape route)", `git -C "${mainlessWt}" checkout -b main origin/main`, "allowed");
+  // Code-review round-1 closures (P1/P2 findings): script-surface hardening,
+  // dead-sessionCwd fail-open guard, configured-remote DWIM accuracy.
+  expectBool("#397 (P1): script surface mirrors the hardening — checkout main in a MAINLESS repo blocks", (() => {
+    const p = `${m4Tmp}/mainless-checkout.sh`; writeFileSync(p, `git checkout main\n`);
+    return scriptGitVerdict(p, "main", mainlessWt, hubR) === "block" &&
+      scriptGitVerdict(p, "main", foreignWt, hubR) === "allow" && // with-main foreign wt → verifiable
+      scriptGitVerdict(p, "main", wtR, hubR) === "allow"; // session wt, hub has main
+  })(), true);
+  expectBool("#397 (P2): DEAD sessionCwd cannot tag a SESSION worktree as foreign (conservative, no fallback)", (() => {
+    // sessionCwd dead → session map empty; without the sessionReal guard the
+    // fallback would hit the wt's own frame and set foreignWorktree:true →
+    // shared-ref/main-protection fail-open.
+    const t = resolveInvocationTarget(allGitInvocations(`cd "${wtR}" && git commit -m x`)[0], `${m4Tmp}/dead-session`, wtR);
+    return t !== null && t.isWorktree === false;
+  })(), true);
+  m4t("T397j: CRAFTED refs/remotes/origin/main with NO configured remote → block (git DWIM refuses it)", `git -C "${craftedR}" checkout main`, "block");
+  m4t("T397k: SLASH-named remote (origin/sub) DWIM → recovery (git DWIMs successfully)", `git -C "${slashR}" checkout main`, "recovery");
+  m4t("T397l: remote with NO fetch refspec + planted tracking ref → block (git DWIM refuses)", `git -C "${noFetchR}" checkout main`, "block");
+  m4t("T397m: NON-STANDARD fetch refspec destination (mirror namespace) → recovery (git DWIMs)", `git -C "${mirrorR}" checkout main`, "recovery");
+  // Cycle-2 P1 closure: a foreign-wt push whose remote operand is a LOCAL PATH
+  // into the SESSION HUB rewrites the hub's own refs (hub off-main → receive
+  // accepts main) — the foreign carve-out must NOT exempt it. Probed: pre-#397
+  // this was blocked (isWorktree false); the carve-out would have allowed it.
+  m4t("T397n: foreign wt push -f to SESSION HUB local path → block (cycle-2 P1 closure)", `git -C "${foreignWt}" push -f "${hubR}" HEAD:refs/heads/main`, "block");
+  m4t("T397o: foreign wt push (recovery-shaped dst) to SESSION HUB local path → block", `git -C "${foreignWt}" push "${hubR}" main`, "block");
+  m4t("T397p: foreign wt push to its OWN origin (not the hub) → NOT blocked (control)", `git -C "${foreignWt}" push "${m4Tmp}/origin-bare" f/wt`, "allowed");
+  // Cycle-3 P1 closures: file:// is a LOCAL transport (stripped + identity-
+  // checked) and a CONFIGURED remote name whose URL is a local path into the
+  // hub is NOT exempt — both were demonstrated rewriting the hub's local main.
+  m4t("T397q: foreign wt push -f via file:// URL into the SESSION HUB → block (cycle-3 P1)", `git -C "${foreignWt}" push -f "file://${hubR}" HEAD:refs/heads/main`, "block");
+  m4t("T397r: foreign wt push -f via NAMED REMOTE alias into the SESSION HUB → block (cycle-3 P1)", `git -C "${foreignWt}" push -f hubpath HEAD:refs/heads/main`, "block");
+  m4t("T397s: -o/--push-option VALUE is skipped, hub path still detected → block (cycle-3 P2)", `git -C "${foreignWt}" push -o ci.skip "${hubR}" HEAD:refs/heads/main`, "block");
+  // Cycle-4 P1 closures: file://localhost host-strip, -c/--config remote
+  // overrides, GIT_CONFIG_* env overrides, and --repo=<hub> precedence — all
+  // were demonstrated rewriting the hub's local main with verdict allowed.
+  m4t("T397t: file://localhost HOST form (leading slash preserved) → block (cycle-4 P1)", `git -C "${foreignWt}" push -f "file://localhost${hubR}" HEAD:refs/heads/main`, "block");
+  m4t("T397u: -c remote.origin.url override re-pointing at the HUB → block (cycle-4 P1)", `git -C "${foreignWt}" -c remote.origin.url="${hubR}" push -f origin HEAD:refs/heads/main`, "block");
+  m4t("T397v: --repo=<hub> with NO positional → block (git uses the fallback — cycle-5 precedence fix)", `git -C "${foreignWt}" push --repo="${hubR}"`, "block");
+  expectBool("#397 (cycle-5 P1): positional <repository> takes precedence over --repo (git docs — no false block)", (() => {
+    // git: the positional wins — `push --repo=<hub> origin f/wt` pushes to
+    // origin (the foreign repo's own origin → not the hub → NOT blocked).
+    const g = evaluateHubGateWithTargets(`git -C "${foreignWt}" push --repo="${hubR}" origin f/wt`, "main", hubR).verdict;
+    return g !== "block";
+  })(), true);
+  m4t("T397w: GIT_CONFIG_* env override re-pointing at the HUB → block (cycle-4 P1)", `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0="${hubR}" git -C "${foreignWt}" push -f origin HEAD:refs/heads/main`, "block");
+  // Cycle-5 P1 closures: -o VALUE that is an EXISTING path must be skipped
+  // (the old scan grabbed it as the remote → bypass), --config-env indirection,
+  // and refspec-first operands (git resolves the default remote — never a
+  // hub-path vector, and must not false-block).
+  m4t("T397x: -o VALUE is an existing non-hub path — hub operand still detected → block (cycle-5 P1)", `git -C "${foreignWt}" push -f -o "${m4Tmp}/origin-bare" "${hubR}" HEAD:refs/heads/main`, "block");
+  m4t("T397y: --config-env=<name>=<envvar> indirection re-pointing at the HUB → block (cycle-5 P1)", `HUBPUSH="${hubR}" git -C "${foreignWt}" --config-env=remote.origin.url=HUBPUSH push -f origin HEAD:refs/heads/main`, "block");
+  // Cycle-6 P1/P3 closures: value-taking options beyond -o (--receive-pack /
+  // --exec / combined short forms like -fo), the --config-env SPACE form, and
+  // `checkout main --` (block-classified spelling) reaching the hardening.
+  m4t("T397aa: --receive-pack <value> then hub path → block (cycle-6 P1)", `git -C "${foreignWt}" push -f --receive-pack "${m4Tmp}/origin-bare" "${hubR}" HEAD:refs/heads/main`, "block");
+  m4t("T397bb: combined short form -fo <value> then hub path → block (cycle-6 P1)", `git -C "${foreignWt}" push -fo ci.skip "${hubR}" HEAD:refs/heads/main`, "block");
+  m4t("T397cc: --config-env SPACE form (name=envvar as separate arg) → block (cycle-6 P1)", `HUBPUSH="${hubR}" git -C "${foreignWt}" --config-env remote.origin.url=HUBPUSH push -f origin HEAD:refs/heads/main`, "block");
+  m4t("T397dd: checkout main -- (block-classified spelling) in a MAINLESS foreign wt → block (cycle-6 P3 hardening)", `git -C "${mainlessWt}" checkout main --`, "block");
+  expectBool("#397 (cycle-6 P3): checkout main -- in a WITH-main foreign wt → NOT blocked (control)", (() => {
+    const g = evaluateHubGateWithTargets(`git -C "${foreignWt}" checkout main --`, "main", hubR).verdict;
+    return g !== "block";
+  })(), true);
+  expectBool("#397 (cycle-6 P1): script surface closes --receive-pack + --config-env space form", (() => {
+    const p1 = `${m4Tmp}/rppush.sh`; writeFileSync(p1, `git push -f --receive-pack "${m4Tmp}/origin-bare" "${hubR}" HEAD:refs/heads/main\n`);
+    const p2 = `${m4Tmp}/cespace.sh`; writeFileSync(p2, `HUBPUSH="${hubR}" git --config-env remote.origin.url=HUBPUSH push -f origin HEAD:refs/heads/main\n`);
+    return scriptGitVerdict(p1, "main", foreignWt, hubR) === "block" &&
+      scriptGitVerdict(p2, "main", foreignWt, hubR) === "block";
+  })(), true);
+  expectBool("#397 (cycle-5 P2): refspec-first push (no explicit remote) → NOT blocked (default chain)", (() => {
+    const g = evaluateHubGateWithTargets(`git -C "${foreignWt}" push HEAD:refs/heads/f/wt`, "main", hubR).verdict;
+    return g !== "block"; // allowed or recovery both pass the gate
+  })(), true);
+  expectBool("#397 (cycle-5 P1): script surface closes the -o existing-path + --config-env vectors", (() => {
+    const p1 = `${m4Tmp}/oopush.sh`; writeFileSync(p1, `git push -f -o "${m4Tmp}/origin-bare" "${hubR}" HEAD:refs/heads/main\n`);
+    const p2 = `${m4Tmp}/cepush.sh`; writeFileSync(p2, `HUBPUSH="${hubR}" git --config-env=remote.origin.url=HUBPUSH push -f origin HEAD:refs/heads/main\n`);
+    return scriptGitVerdict(p1, "main", foreignWt, hubR) === "block" &&
+      scriptGitVerdict(p2, "main", foreignWt, hubR) === "block";
+  })(), true);
+  expectBool("#397 (cycle-4 P1): overrides pointing at a NON-hub stay allowed (no false blocks)", (() => {
+    const g = (cmd) => evaluateHubGateWithTargets(cmd, "main", hubR).verdict;
+    const a = g(`git -C "${foreignWt}" -c remote.origin.url="${m4Tmp}/origin-bare" push origin f/wt`);
+    const b = g(`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0=file://${m4Tmp}/origin-bare git -C "${foreignWt}" push origin f/wt`);
+    return a !== "block" && b !== "block";
+  })(), true);
+  expectBool("#397 (cycle-4 P1): script surface closes the -c override vector", (() => {
+    const p = `${m4Tmp}/coverride.sh`; writeFileSync(p, `git -c remote.origin.url="${hubR}" push -f origin HEAD:refs/heads/main\n`);
+    return scriptGitVerdict(p, "main", foreignWt, hubR) === "block";
+  })(), true);
+  expectBool("#397 (cycle-3 P1): script surface closes the file:// + named-remote vectors", (() => {
+    const p1 = `${m4Tmp}/filepush.sh`; writeFileSync(p1, `git push -f "file://${hubR}" HEAD:refs/heads/main\n`);
+    const p2 = `${m4Tmp}/aliaspush.sh`; writeFileSync(p2, `git push -f hubpath HEAD:refs/heads/main\n`);
+    return scriptGitVerdict(p1, "main", foreignWt, hubR) === "block" &&
+      scriptGitVerdict(p2, "main", foreignWt, hubR) === "block";
+  })(), true);
+  expectBool("#397 (cycle-2 P1): script surface mirrors the local-path push closure", (() => {
+    const p = `${m4Tmp}/hubpush.sh`; writeFileSync(p, `git push -f "${hubR}" HEAD:refs/heads/main\n`);
+    return scriptGitVerdict(p, "main", foreignWt, hubR) === "block" &&
+      scriptGitVerdict(p, "main", wtR, hubR) === "block"; // session wt — hub-targeted regardless
+  })(), true);
+  expectBool("#397: hardening fires in BOTH hub states (target-repo-scoped, not session-branch-scoped)", (() => {
+    const onMain = evaluateHubGateWithTargets(`git -C "${mainlessWt}" checkout main`, "main", hubR).verdict;
+    const offMain = evaluateHubGateWithTargets(`git -C "${mainlessWt}" checkout main`, "hub/off", hubR).verdict;
+    return onMain === "block" && offMain === "block";
+  })(), true);
+  expectBool("#397 hardening block reason is loud + actionable (fail loudly, never move the wrong branch)", (() => {
+    const r = evaluateHubGateWithTargets(`git -C "${mainlessWt}" checkout main`, "main", hubR);
+    return r.verdict === "block" && /no branch "main" exists/.test(r.reason ?? "") && /WRONG\s+branch/.test(r.reason ?? "");
+  })(), true);
+  expectBool("#397: resolveInvocationTarget tags a FOREIGN worktree (foreignWorktree:true)", (() => {
+    const t = resolveInvocationTarget(allGitInvocations(`git -C "${foreignWt}" commit -m x`)[0], hubR, hubR);
+    return t !== null && t.isWorktree === true && t.foreignWorktree === true;
+  })(), true);
+  expectBool("#397: SESSION worktree is NOT foreign (foreignWorktree:false — shared-ref rules still apply)", (() => {
+    const t = resolveInvocationTarget(allGitInvocations(`cd "${wtR}" && git commit -m x`)[0], hubR, hubR);
+    return t !== null && t.isWorktree === true && t.foreignWorktree === false;
+  })(), true);
+  // #397 script surface: foreign worktree content is fully isolated (mirror of
+  // the bash gate); session-wt shared-ref script content stays blocked (B23).
+  expectBool("#397: script in a FOREIGN wt with tag content → allow (disjoint refs)", (() => {
+    const p = `${m4Tmp}/foreign-tag.sh`; writeFileSync(p, `git tag v2\n`);
+    return scriptGitVerdict(p, "main", foreignWt, hubR) === "allow";
+  })(), true);
   m4t("T23: read-only in wt", `cd "${wtR}" && git status`, "recovery");
   m4t("T23b: read-only log in wt", `cd "${wtR}" && git log --oneline -3`, "recovery");
   m4t("T24: checkout main in wt → recovery (never resolved)", `cd "${wtR}" && git checkout main`, "recovery");
