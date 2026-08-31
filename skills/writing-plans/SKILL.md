@@ -28,11 +28,14 @@ steps:
     gate: checkpoint
     token_phase: plan
     requires: [integration_surface]
-    # #4907: run `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh plan` (C3)
-    # — or `$PARALLEL_CHECK_BIN plan` when that env override is set (the escape
-    # requires the `.sh|.py` suffix — prefer the resolved absolute path;
-    # no-suffix bare names fail). CLEAR verdict writes the PASS
-    # token; the gate blocks until
+    # #4907: resolve `$AGENT_INFRA_PATH` — a required prerequisite per AGENTS.md
+    # (NO `$HOME/agent-infra` default fiction; if unset, the pending-gate
+    # guidance says to set it) — and run the absolute path
+    # `…/scripts/parallel_work_check.sh plan` (C3). The pending-gate guidance
+    # prints the resolved command — use that form (it is escape-regex-safe);
+    # do NOT run `$PARALLEL_CHECK_BIN`/`env PARALLEL_CHECK_BIN=…` at the gate
+    # (not in the escape allowlist); `.sh|.py` suffix required. CLEAR verdict
+    # writes the PASS token; the gate blocks until
     # fresh. Set CHECKOUT_GUARD_ENFORCE=1. At the gate: read / loop_enforcer are
     # always allowed; operator force-pass via /tmp/parallel-check-force.json
     # (one-shot, 60-min TTL, repo-bound, human-only).

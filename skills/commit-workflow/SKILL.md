@@ -14,11 +14,16 @@ steps:
     gate: checkpoint
     token_phase: implement
     requires: [preflight_checks]
-    # #4907: run `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh implement` (C4) before committing
-    # — pre-merge symbol re-check + base-drift ($PARALLEL_CHECK_BIN overrides the
-    # path; the escape requires the `.sh|.py` suffix — no-suffix bare names
-    # fail). Fail-closed gate; read / loop_enforcer
-    # are the in-session escape; operator force-pass via /tmp/parallel-check-force.json.
+    # #4907: before committing, resolve `$AGENT_INFRA_PATH` — a required
+    # prerequisite per AGENTS.md (NO `$HOME/agent-infra` default fiction; if
+    # unset, the pending-gate guidance says to set it) — and run the absolute
+    # path `…/scripts/parallel_work_check.sh implement` (C4 — pre-merge symbol
+    # re-check + base-drift). The pending-gate guidance prints the resolved
+    # command — use that form (it is escape-regex-safe); do NOT run
+    # `$PARALLEL_CHECK_BIN`/`env PARALLEL_CHECK_BIN=…` at the gate (not in the
+    # escape allowlist); `.sh|.py` suffix required. Fail-closed gate; read /
+    # loop_enforcer are the in-session escape; operator force-pass via
+    # /tmp/parallel-check-force.json.
   - name: stage_and_commit
     type: skill
     gate: auto
