@@ -9,6 +9,7 @@
 
 import { execSync, execFileSync } from "node:child_process";
 import { resolve, join, dirname } from "node:path";
+import { homedir } from "node:os";
 import { existsSync, statSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 
 //
@@ -473,7 +474,8 @@ export const worktreeGitdirMap = _worktreeGitdirMap;
  * structurally impossible (inside=true ⇒ gitDir is a mapped worktree's admin
  * dir).
  * ⚠️ INPUT CONTRACT (#349): the fields resolveInvocationTarget READS are
- * ({cdChain, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint});
+ * ({cdChain, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint,
+ * configOverrides, configEnvOverrides, envPrefixes});
  * the full emitted allGitInvocations invocation shape also carries
  * verb/args/vars. There is NO `cmd` field. Calling with a raw-command shape
  * like `{cmd: 'cd <wt> && git add -A', args: [...]}` trivially yields an
@@ -512,9 +514,42 @@ export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd
     }
     const gitDir = _realpathSafe(resolve(cwd, raw));
     if (gitDir === null) return null;
-    const worktreePath = _worktreeGitdirMap(sessionCwd).get(gitDir) ?? null;
+    // Issue #397 (cross-repo worktree ops): the worktree map used to be built
+    // from the SESSION cwd frame ONLY, so a worktree of a DIFFERENT repo (e.g.
+    // an agent-infra worktree reached from a tortoise session) missed the map
+    // and was conservatively classified hub-targeted — M4 then blocked every
+    // sanctioned agent-infra mutation (2026-08-30 #387: 4 commits, 3 pushes,
+    // a PR body and a tag all had to be delegated to gate-exempt sub-agents).
+    // Fall back to deriving the map from the invocation's OWN frame — the cwd
+    // where git itself just resolved gitDir — so foreign-repo worktrees are
+    // recognized with the SAME two-way back-reference + porcelain cross-check
+    // (equally conservative). The hit is tagged foreignWorktree so consumers
+    // can apply foreign-repo semantics (a foreign wt shares NO ref namespace
+    // with the session hub). Same-frame invocations skip the redundant rebuild
+    // (identical map by construction); the fallback fires only on a session-map
+    // miss, i.e. foreign/odd geometries — rare on the gate's hot path.
+    const sessionMap = _worktreeGitdirMap(sessionCwd);
+    let worktreePath = sessionMap.get(gitDir) ?? null;
+    let foreignWorktree = false;
+    // sessionReal null (dead/unresolvable sessionCwd) must NOT look like a
+    // "different frame": the session map is empty for a dead cwd, and without
+    // this guard a SESSION worktree reached via a real baseCwd would be tagged
+    // foreignWorktree → fail-open past shared-ref/main-protection (code-review
+    // P2, #397). Dead session cwd → conservative (no fallback, isWorktree
+    // false).
+    const sessionReal = _realpathSafe(sessionCwd);
+    if (worktreePath === null && sessionReal !== null && sessionReal !== cwd) {
+      const hit = _worktreeGitdirMap(cwd).get(gitDir);
+      // cycle-2 P2 closure: repo-identity check — a SESSION worktree (reached
+      // while the session map's whole build transiently failed) must never be
+      // tagged foreign (shared-ref/main-protection fail-open).
+      if (hit !== undefined && !_sameRepoAsSession(gitDir, sessionCwd)) {
+        worktreePath = hit;
+        foreignWorktree = true;
+      }
+    }
     if (worktreePath === null) {
-      return { effectiveCwd: cwd, gitDir, worktreePath: null, worktreeBranch: null, isWorktree: false };
+      return { effectiveCwd: cwd, gitDir, worktreePath: null, worktreeBranch: null, isWorktree: false, foreignWorktree: false };
     }
     const cwdReal = _realpathSafe(cwd);
     if (cwdReal === null) return null;
@@ -586,7 +621,7 @@ export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd
         worktreeBranch = null; // git read failure → conservative (unchanged)
       }
     }
-    return { effectiveCwd: cwd, gitDir, worktreePath, worktreeBranch, isWorktree: inside };
+    return { effectiveCwd: cwd, gitDir, worktreePath, worktreeBranch, isWorktree: inside, foreignWorktree: inside && foreignWorktree };
   } catch {
     return null; // conservative — never false-exempt
   }
@@ -905,13 +940,17 @@ function _walkShell(command, h = {}, seedVars = {}) {
       }
       if (isStatement) frame().vars[t.slice(0, eq)] = t.slice(eq + 1);
       // else: env PREFIX — does NOT persist, NOT visible to the next command's own
-      // word expansion (bash) — irrelevant to the guard except as a trap; ignored.
+      // word expansion (bash). Captured as envPrefixes (cycle-5 P1): the gate's
+      // own config probes need the same env git sees (`HUBPUSH=<hub> git
+      // --config-env=remote.origin.url=HUBPUSH push …` silently re-points a
+      // foreign push at the hub).
       // prevWasBoundary stays TRUE for prefixes (the next token is the command
       // word), EXCEPT redirects+operands in between: skip them in the main walk
       // WITHOUT clearing prevWasBoundary — `VAR=x > /dev/null cd /wt` runs the cd
       // (round-4 bug reviewer; previously the `>`/operand hit onOther → a real cd
       // was missed → false-block freeze).
       if (!isStatement) {
+        (pendingHints.envPrefixes || (pendingHints.envPrefixes = [])).push(t);
         let k = i + 1;
         while (k < tokens.length && (/^(?:[0-9]+)?[<>]/.test(tokens[k]) || tokens[k] === ">" || tokens[k] === ">>" || tokens[k] === "<" || tokens[k] === "<<" || tokens[k] === "&>" || tokens[k] === ">&" || tokens[k] === "&>>" || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(tokens[k]))) {
           k += 2; // skip redirect + operand
@@ -1024,7 +1063,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
             // gate fails closed.
             h.onGitEnd?.({
               verb: "__unverifiable__", args: [], cdChain: [...frame().chain], cHints: [],
-              gitDirHint: null, workTreeHint: null, indexFileHint: null, objDirsHint: null, vars: { ...frame().vars },
+              gitDirHint: null, workTreeHint: null, indexFileHint: null, objDirsHint: null, configOverrides: [], configEnvOverrides: [], envPrefixes: [], vars: { ...frame().vars },
             });
             i++;
             prevWasBoundary = false;
@@ -1054,12 +1093,20 @@ function _walkShell(command, h = {}, seedVars = {}) {
     i++;
     const f = frame();
     const cHints = [];
+    // Cycle-4 P1: -c/--config overrides are captured (key/value pairs) so the
+    // gate's OWN config probes (push-remote resolution, _pushRemoteIsSessionHub)
+    // see the SAME effective config git uses — `git -c remote.origin.url=<hub>
+    // push origin …` silently re-points the push at the hub otherwise.
+    // Cycle-5 P1: --config-env=<name>=<envvar> is the env-indirection form.
+    const configOverrides = [];
+    const configEnvOverrides = [];
     // Round-3 P1: a bare per-command prefix WINS over an exported value (bash:
     // `export GIT_DIR=/a; GIT_DIR=/b git …` runs with /b — probe-verified).
     let gitDirHint = pendingHints.gitDirHint ?? frame().persistHints.gitDirHint ?? null;
     let workTreeHint = pendingHints.workTreeHint ?? frame().persistHints.workTreeHint ?? null;
     let indexFileHint = pendingHints.indexFileHint ?? null;
     let objDirsHint = pendingHints.objDirsHint ?? null;
+    const envPrefixes = pendingHints.envPrefixes ? [...pendingHints.envPrefixes] : [];
     pendingHints = {};
     h.onGitStart?.(f);
     // Round-6 (final gate P2): -C/--git-dir/--work-tree/INDEX operands are
@@ -1087,7 +1134,9 @@ function _walkShell(command, h = {}, seedVars = {}) {
       if (g === "--namespace") { i += 2; continue; }
       if (g.startsWith("--namespace=")) { i++; continue; }
       if (g === "--no-pager" || g === "-p" || g === "--paginate") { i++; continue; }
-      if (g === "-c" || g === "--config") { i += 2; continue; }
+      if (g === "-c" || g === "--config") { configOverrides.push(tokens[i + 1] ?? "\u0000"); i += 2; continue; }
+      if (g === "--config-env") { configEnvOverrides.push(tokens[i + 1] ?? "\u0000"); i += 2; continue; } // cycle-6 P1: space form
+      if (g.startsWith("--config-env=")) { configEnvOverrides.push(g.slice("--config-env=".length)); i++; continue; }
       if (g.startsWith("-")) { i++; continue; }
       break;
     }
@@ -1118,6 +1167,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
     }
     h.onGitEnd?.({
       verb, args, cHints, gitDirHint, workTreeHint, indexFileHint, objDirsHint,
+      configOverrides, configEnvOverrides, envPrefixes,
       cdChain: f.pipeActive ? f.chain.slice(0, f.baseLen) : [...f.chain],
       vars: { ...f.vars },
     });
@@ -1135,7 +1185,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
  * var-expanded against PRIOR-segment vars only; an unresolvable `$VAR` (or
  * bare cd / ~ / cd-) pushes a null marker (conservative → no exemption).
  * {verb, args} are unchanged for existing consumers.
- * @returns {Array<{verb: string|null, args: string[], cdChain: Array<string|null>, cHints: string[], gitDirHint: string|null, workTreeHint: string|null, indexFileHint: string|null, objDirsHint: string|null, vars: object}>}
+ * @returns {Array<{verb: string|null, args: string[], cdChain: Array<string|null>, cHints: string[], gitDirHint: string|null, workTreeHint: string|null, indexFileHint: string|null, objDirsHint: string|null, configOverrides: string[], vars: object}>}
  */
 export function allGitInvocations(command, seedVars = {}) {
   const invocations = [];
@@ -1809,6 +1859,317 @@ function _mainProtectionReason(inv, ...notes) {
   ].join("\n");
 }
 
+/** Common-dir identity helpers (#397 cycle-2 closures): repo identity is the
+ * git-common-dir — a session worktree ALWAYS shares the session repo's common
+ * dir, a foreign worktree NEVER does, and a push remote whose path resolves
+ * into the session repo (hub, its worktrees, or a bare repo) is the hub's own
+ * ref store. `git -C <dir> rev-parse --git-common-dir` returns a relative path
+ * from a main checkout / absolute from a worktree — both normalized here. */
+function _repoCommonDir(repoDir) {
+  try {
+    const raw = execFileSync("git", ["-C", repoDir, "rev-parse", "--git-common-dir"], {
+      encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return _realpathSafe(raw.startsWith("/") ? raw : resolve(repoDir, raw));
+  } catch {
+    return null; // not a git repo / git failure
+  }
+}
+
+function _gitdirCommonDir(gitDir) {
+  try {
+    const raw = execFileSync("git", ["--git-dir=" + gitDir, "rev-parse", "--git-common-dir"], {
+      encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return _realpathSafe(raw.startsWith("/") ? raw : resolve(gitDir, raw));
+  } catch {
+    return null;
+  }
+}
+
+/** Issue #397 (cycle-2 P2 closure): the foreignWorktree tag must be repo-
+ * identity-checked, not frame-implied. If the SESSION map's whole build
+ * transiently fails (empty map) while the invocation-frame build succeeds, a
+ * SESSION worktree would be tagged foreign → shared-ref/main-protection
+ * fail-open. A session wt always shares the session repo's common dir; a
+ * foreign wt never does. Conservative direction (cycle-3 P2): ANY probe
+ * failure → treat as the SESSION repo (never foreign-tag a possibly-session
+ * worktree); only a PROVEN common-dir mismatch (both probes succeed, dirs
+ * differ) means foreign. */
+function _sameRepoAsSession(gitDir, sessionCwd) {
+  const gdCommon = _gitdirCommonDir(gitDir);
+  const sCommon = _repoCommonDir(resolve(sessionCwd));
+  if (gdCommon === null || sCommon === null) return true; // unverifiable → conservative: same repo
+  return gdCommon === sCommon;
+}
+
+/** Issue #397 (cycle-2 P1 closure): a push/fetch whose remote operand resolves
+ * into the SESSION HUB's repo (same git-common-dir identity — covers the hub,
+ * its worktrees, and bare repos) rewrites the hub's OWN refs — the exact state
+ * M4 protects — so the foreign carve-out must NOT exempt it. Handles every
+ * operand form git accepts: scheme URLs (file:// is a LOCAL transport —
+ * stripped and identity-checked; http/ssh/git/git@host:path are non-local and
+ * stay exempt — the documented residual: a NON-local URL can still advance the
+ * session repo's REMOTE refs; its LOCAL refs are unreachable), CONFIGURED
+ * remote names (resolved via remote.<name>.pushurl/.url and re-classified —
+ * cycle-3 P1: `remote add hub <hub-path>` then `push hub main` rewrote the
+ * hub's local main, demonstrated), and direct local paths (absolute or
+ * relative — resolved against the invocation's effective cwd, git -C
+ * semantics). Bare pushes resolve the effective remote (remote.pushDefault →
+ * branch.<cur>.remote → origin). A local-path-looking operand that cannot be
+ * resolved FAILS CLOSED (block — git would fail the push anyway).
+ * @param {{verb:string,args:string[]}} inv
+ * @param {object|null} target — resolveInvocationTarget output (gitDir /
+ *   effectiveCwd / worktreeBranch used)
+ * @param {string} sessionCwd
+ */
+/** Effective git config overrides for the gate's OWN probes (cycles 4-5 P1
+ * closures): -c/--config pairs, --config-env=<name>=<envvar> indirections
+ * (resolved against statement vars → env prefixes → process.env), GIT_CONFIG_*
+ * env prefixes, and statement GIT_CONFIG_* vars — so the probes see the SAME
+ * effective config git uses (`-c remote.origin.url=<hub>` / `HUBPUSH=<hub> git
+ * --config-env=remote.origin.url=HUBPUSH push …` silently re-point a foreign
+ * push at the hub otherwise). Returns { cfgArgs, cfgEnv } to spread onto
+ * execFileSync. */
+function _effectiveConfig(inv) {
+  const cfgArgs = [];
+  for (const o of inv.configOverrides || []) {
+    if (o && o !== "\u0000") cfgArgs.push("-c", o);
+  }
+  for (const ce of inv.configEnvOverrides || []) {
+    const eq = ce.indexOf("=");
+    if (eq <= 0) continue;
+    const name = ce.slice(0, eq), envName = ce.slice(eq + 1);
+    const val = (inv.vars && inv.vars[envName]) ??
+      (inv.envPrefixes || []).map((p) => { const e = p.indexOf("="); return e > 0 && p.slice(0, e) === envName ? p.slice(e + 1) : null; }).find((v) => v !== null) ??
+      process.env[envName];
+    if (val !== undefined && val !== null) cfgArgs.push("-c", `${name}=${val}`);
+  }
+  const cfgEnv = {};
+  for (const p of inv.envPrefixes || []) {
+    const eq = p.indexOf("=");
+    if (eq > 0 && p.startsWith("GIT_CONFIG_")) cfgEnv[p.slice(0, eq)] = p.slice(eq + 1);
+  }
+  try {
+    const n = Number(inv.vars && inv.vars.GIT_CONFIG_COUNT);
+    if (Number.isInteger(n) && n > 0 && n <= 64) {
+      for (let k = 0; k < n; k++) {
+        const key = inv.vars && inv.vars[`GIT_CONFIG_KEY_${k}`];
+        if (key) cfgEnv[`GIT_CONFIG_KEY_${k}`] = key, cfgEnv[`GIT_CONFIG_VALUE_${k}`] = (inv.vars && inv.vars[`GIT_CONFIG_VALUE_${k}`]) ?? "";
+      }
+      cfgEnv.GIT_CONFIG_COUNT = String(n);
+    }
+  } catch { /* malformed count → ignore */ }
+  return { cfgArgs, cfgEnv };
+}
+
+/** Issue #397 (cycle-2 P1 closure): a push/fetch whose remote operand resolves
+ * into the SESSION HUB's repo (same git-common-dir identity — covers the hub,
+ * its worktrees, and bare repos) rewrites the hub's OWN refs — the exact state
+ * M4 protects — so the foreign carve-out must NOT exempt it. Handles every
+ * operand form git accepts: scheme URLs (file:// is a LOCAL transport —
+ * stripped and identity-checked; http/ssh/git/git@host:path are non-local and
+ * stay exempt — the documented residual: a NON-local URL can still advance the
+ * session repo's REMOTE refs; its LOCAL refs are unreachable), CONFIGURED
+ * remote names (resolved via remote.<name>.pushurl/.url — INCLUDING
+ * -c/--config/--config-env/GIT_CONFIG_* overrides — and re-classified),
+ * `--repo=` (a FALLBACK only — git: the positional <repository> takes
+ * precedence), and direct local paths (absolute or relative — resolved against
+ * the invocation's effective cwd, git -C semantics). Bare pushes (and
+ * refspec-first forms like `push HEAD:main`) resolve the effective remote
+ * (remote.pushDefault → branch.<cur>.remote → origin). A local-path-looking
+ * operand that cannot be resolved FAILS CLOSED (block — git would fail the
+ * push anyway).
+ * @param {{verb:string,args:string[],configOverrides?:string[],configEnvOverrides?:string[],envPrefixes?:string[],vars?:object}} inv
+ * @param {object|null} target — resolveInvocationTarget output (gitDir /
+ *   effectiveCwd / worktreeBranch used)
+ * @param {string} sessionCwd
+ */
+function _pushRemoteIsSessionHub(inv, target, sessionCwd) {
+  const gitDir = target && target.gitDir;
+  // 0. effective config for the gate's own probes (cycle-4/5 P1 closures)
+  const { cfgArgs, cfgEnv } = _effectiveConfig(inv);
+  const gitConfigGet = (key) => {
+    try {
+      return execFileSync("git", [...cfgArgs, "--git-dir=" + gitDir, "config", "--get", key], {
+        encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+        env: { ...process.env, ...cfgEnv },
+      }).trim();
+    } catch { return ""; } // key unset → empty (git config --get exits 1 on missing keys)
+  };
+  // 1. remote operand: the first non-option positional is the <repository>
+  // (git: the positional TAKES PRECEDENCE over --repo — cycle-5 P1);
+  // value-taking options skip their value token (cycle-3/5/6 P1s: -o/
+  // --push-option/--repo/--receive-pack/--exec/--upload-pack/--depth/--refmap,
+  // plus combined short forms like -fo = -f -o <v>); --repo's value is the
+  // FALLBACK when no positional repository exists; a refspec-looking first
+  // positional (`src:dst` / `:dst`, non-scheme, non-scp) is NOT a repository.
+  const VALUE_OPTS = new Set(["-o", "--push-option", "--repo", "--receive-pack", "--exec", "--upload-pack", "--depth", "--refmap", "--jobs"]);
+  const args = inv.args || [];
+  let remote = null;
+  let repoFallback = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (VALUE_OPTS.has(a)) { if (a === "--repo") repoFallback = args[i + 1] ?? null; i++; continue; }
+    if (a.startsWith("--repo=")) { repoFallback = a.slice("--repo=".length); continue; }
+    if (a.startsWith("-")) {
+      // combined short flags whose LAST letter takes a value (-fo = -f -o <v>)
+      if (/^-[^-]{2,}$/.test(a) && a.endsWith("o")) { i++; continue; }
+      continue;
+    }
+    if (a.includes(":") && !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(a) && !/^[^/\s]+@[^/\s]+:/.test(a)) continue; // refspec (`src:dst`/`:dst`/`+src:dst`) — not a repo operand
+    remote = a;
+    break;
+  }
+  if (remote === null) remote = repoFallback;
+  // 2. bare push → effective remote (push.default chain); none → no vector
+  if (remote === null && gitDir) {
+    remote = gitConfigGet("remote.pushDefault");
+    if (!remote && target.worktreeBranch) remote = gitConfigGet(`branch.${target.worktreeBranch}.remote`);
+    if (!remote) {
+      try {
+        const remotes = execFileSync("git", [...cfgArgs, "--git-dir=" + gitDir, "remote"], {
+          encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+          env: { ...process.env, ...cfgEnv },
+        }).split("\n").filter(Boolean);
+        if (remotes.includes("origin")) remote = "origin";
+      } catch { /* no default remote resolvable */ }
+    }
+  }
+  if (remote === null) return false;
+  // 3. classify the operand → local repo path or null (non-local transport)
+  const toPath = (s) => {
+    if (/^file:\/\//.test(s)) {
+      // file:// is a LOCAL transport — strip the scheme + an optional
+      // localhost HOST ONLY (never the path's leading slash — cycle-4 P1:
+      // `file://localhost/private/…` must keep `/private/…`).
+      let p = s.slice("file://".length);
+      if (p.startsWith("localhost")) p = p.slice("localhost".length);
+      return /^[^/]/.test(p) ? null : p; // file://host/... — non-local host
+    }
+    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(s) || /^[^/\s]+@[^/\s]+:/.test(s)) return null;
+    return s; // local path (absolute or relative)
+  };
+  let repoPath = null;
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(remote) || /^[^/\s]+@[^/\s]+:/.test(remote)) {
+    repoPath = toPath(remote); // file:// → path; http/ssh/git/scp → null (exempt)
+  } else if (gitDir) {
+    // pushurl overrides url; each lookup independently (missing key exits 1 —
+    // a shared try/catch would abort the whole resolution, cycle-3 debug).
+    const pushUrl = gitConfigGet(`remote.${remote}.pushurl`);
+    const url = pushUrl || gitConfigGet(`remote.${remote}.url`);
+    repoPath = url ? toPath(url) : toPath(remote); // not configured → treat operand as a local path (conservative)
+  } else {
+    repoPath = toPath(remote);
+  }
+  if (repoPath === null) return false; // non-local transport — documented residual
+  const base = target && target.effectiveCwd ? resolve(target.effectiveCwd) : resolve(sessionCwd);
+  // cycle-4 P3: expand a leading ~/ (the shell would have before git saw it)
+  const expanded = repoPath.startsWith("~/") ? join(homedir(), repoPath.slice(2)) : repoPath;
+  const targetReal = _realpathSafe(resolve(base, expanded));
+  if (targetReal === null) return true; // local-path-looking operand unresolvable → FAIL CLOSED
+  const tCommon = _repoCommonDir(targetReal);
+  const sCommon = _repoCommonDir(resolve(sessionCwd));
+  return tCommon !== null && sCommon !== null && tCommon === sCommon;
+}
+
+/** Issue #397 hardening — fail loudly, never move the wrong branch. Verifies
+ * that a sanctioned-recovery `git checkout <branch>` (main/master only — the
+ * recovery target) can actually succeed in the repo owning `gitDir`: the
+ * branch exists locally (refs/heads/&lt;b&gt;) or has a UNIQUE remote-tracking DWIM
+ * source (exactly one refs/remotes/&lt;configured-remote&gt;/&lt;b&gt; — git's checkout
+ * --guess iterates CONFIGURED remotes, so a crafted tracking ref with no
+ * configured remote does NOT DWIM, and a multi-remote match is ambiguous →
+ * checkout fails). Tag refs do NOT satisfy the check (a tag checkout lands
+ * detached, not on the branch). Any git read failure → false (conservative:
+ * never bless a possibly-doomed checkout).
+ * Mirrors git's own decision surface so the gate fails loudly BEFORE the
+ * checkout runs — `git checkout -q main 2>/dev/null` swallows the failure,
+ * the agent proceeds believing it is on main, and the next destructive op
+ * moves the CURRENT branch (2026-08-30 #387: a swallowed checkout failure
+ * preceded a reset that moved feat/387-ci-central to main).
+ * Residuals (documented, out of micro scope): `git -c checkout.guess=false`
+ * disables DWIM entirely (the gate still blesses a DWIM-able checkout — the
+ * failure is then VISIBLE unless stderr is swallowed); a dirty working tree
+ * can still fail the checkout at run time (predicting conflicts requires a
+ * side-effecting probe). The hardening closes the SILENT-failure class.
+ * @param {string} gitDir — the invocation's resolved git-dir (session hub's
+ *   .git, or a worktree admin dir; refs + remote config are repo-global so
+ *   either resolves).
+ * @param {string} branch — "main" / "master" (recovery targets only).
+ * @param {object} [inv] — the invocation (configOverrides/envPrefixes threaded
+ *   into the probes — cycle-5 P3: a crafted `-c remote.origin.fetch=…` must
+ *   not diverge the gate's DWIM view from git's).
+ */
+function _recoveryCheckoutVerifiable(gitDir, branch, inv) {
+  const { cfgArgs, cfgEnv } = _effectiveConfig(inv);
+  const run = (args) => execFileSync("git", [...cfgArgs, "--git-dir=" + gitDir, ...args], {
+    encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, ...cfgEnv },
+  });
+  try {
+    run(["show-ref", "--verify", "--quiet", "refs/heads/" + branch]);
+    return true; // local branch exists
+  } catch {
+    /* fall through to the DWIM check */
+  }
+  // DWIM (git checkout --guess / unique_tracking_name): count the configured
+  // remotes whose FETCH REFSPEC maps refs/heads/<b> onto an EXISTING tracking
+  // ref. A planted refs/remotes/* entry whose remote has no matching fetch
+  // refspec does NOT DWIM (git refuses — cycle-2 P3 probe); non-standard
+  // refspec destinations (e.g. refs/remotes/mirror/*) are honored exactly like
+  // git does. Per-refspec matching also handles multi-component remote names
+  // (`origin/sub` → refs/remotes/origin/sub/*). Exactly one matching remote =
+  // git's ambiguity contract (0 or 2+ → checkout fails).
+  let matches = 0;
+  try {
+    const remotes = run(["remote"]).split("\n").filter((n) => n.length > 0);
+    for (const r of remotes) {
+      const fetches = (() => {
+        try {
+          return run(["config", "--get-all", `remote.${r}.fetch`]).split("\n").filter((n) => n.length > 0);
+        } catch {
+          return []; // no fetch refspec configured → this remote is no DWIM source
+        }
+      })();
+      for (const f of fetches) {
+        const fq = f.replace(/^\+/, ""); // drop the forced flag
+        const [src, dst] = fq.split(":");
+        if (!src || !dst) continue;
+        const si = src.indexOf("*"), di = dst.indexOf("*");
+        if (si === -1 || di === -1) continue; // single-refspec — not a heads mapping
+        if (src.slice(0, si) !== "refs/heads/" || src.slice(si + 1) !== "") continue; // must cover refs/heads/*
+        const mapped = dst.slice(0, di) + branch + dst.slice(di + 1);
+        try {
+          run(["show-ref", "--verify", "--quiet", mapped]);
+          matches++;
+          break; // one matching refspec per remote
+        } catch {
+          /* tracking ref absent — keep scanning */
+        }
+      }
+    }
+  } catch {
+    return false; // git read failure → conservative: refuse to bless the checkout
+  }
+  return matches === 1;
+}
+
+/** Shared block-reason for the recovery-checkout hardening (#397) — loud +
+ * actionable (fail loudly, never move the wrong branch). */
+function _recoveryCheckoutBlockReason(inv, branch) {
+  return [
+    `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+    `   Blocked: \`git ${inv.verb} ${branch}\` — no branch "${branch}" exists in the target`,
+    `   repo (no refs/heads/${branch}, no unique remote-tracking DWIM source; a tag named`,
+    `   "${branch}" would check out DETACHED, not the branch).`,
+    `   A silently-failed checkout strands the repo on the CURRENT branch while the agent`,
+    `   believes it is on "${branch}" — a subsequent destructive op would move the WRONG`,
+    `   branch (#397).`,
+    `   → Reconcile branch state first: \`git checkout -b ${branch} origin/${branch}\``,
+    `     (or \`git fetch\`) then retry.`,
+  ].join("\n");
+}
+
 /** Round-10 (final gate P1): paren-balanced extraction of $( … ) and backtick
  * spans from a token (a naive `[^)]*` truncated at the FIRST `)` — nested
  * substitutions evaded; security reviewer probe destroyed a hub commit). */
@@ -2076,17 +2437,42 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
     // (git allows it — main is free) and then commit/push mutate main.
     if (v === "recovery" && (inv.verb === "checkout" || inv.verb === "switch")) {
       const pos = (inv.args || []).filter((x) => !x.startsWith("-"));
-      if (pos.length === 1 && (pos[0] === "main" || pos[0] === "master") &&
-          currentBranch !== "main" && currentBranch !== "master") {
+      if (pos.length === 1 && (pos[0] === "main" || pos[0] === "master")) {
         const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
-        if (target && target.isWorktree &&
-            target.worktreeBranch !== "main" && target.worktreeBranch !== "master") {
-          return {
-            verdict: "block", exempted: false, // audit must NOT log blocked ops (round-4)
-            reason: _mainProtectionReason(inv,
-              `Worktree checkout of the hub's protected branch "${pos[0]}" while the hub is`,
-              `off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
-          };
+        if (target) {
+          // Issue #397 hardening — fail loudly, never move the wrong branch: a
+          // sanctioned-recovery checkout of main/master whose branch CANNOT be
+          // checked out in the target repo (no refs/heads/<b>, no unique
+          // remote-tracking DWIM source) is refused loudly. Applies regardless
+          // of the session hub's branch: the checkout's success depends on the
+          // TARGET repo's refs, and a foreign-repo checkout is otherwise
+          // unobserved by the gate. `git checkout -q main 2>/dev/null` swallows
+          // the failure, the agent proceeds believing it is on main, and the
+          // next destructive op runs against the CURRENT branch (2026-08-30
+          // #387: a swallowed checkout failure preceded a reset that moved
+          // feat/387-ci-central to main).
+          if (!_recoveryCheckoutVerifiable(target.gitDir, pos[0], inv)) {
+            return {
+              verdict: "block", exempted: false,
+              reason: _recoveryCheckoutBlockReason(inv, pos[0]),
+            };
+          }
+          // Main-protection guards the SESSION hub's protected branch. A
+          // FOREIGN worktree (different repo than the session hub — recognized
+          // via the invocation-frame map fallback) taking its OWN repo's main
+          // is the foreign repo's business: git repos never share ref
+          // namespaces, so the wt cannot advance the session hub's main
+          // (2026-08-30 #387: agent-infra worktree ops from a tortoise session).
+          if (currentBranch !== "main" && currentBranch !== "master" &&
+              target.isWorktree && !target.foreignWorktree &&
+              target.worktreeBranch !== "main" && target.worktreeBranch !== "master") {
+            return {
+              verdict: "block", exempted: false, // audit must NOT log blocked ops (round-4)
+              reason: _mainProtectionReason(inv,
+                `Worktree checkout of the hub's protected branch "${pos[0]}" while the hub is`,
+                `off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
+            };
+          }
         }
       }
       sawRecovery = true;
@@ -2096,6 +2482,51 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
       if (target && target.isWorktree) {
         exempted = true;
+        // Issue #397: a FOREIGN worktree (different repo than the session hub,
+        // hit via the invocation-frame map fallback) is FULLY isolated from the
+        // hub by construction — git repos never share ref namespaces — so every
+        // session-hub protection below (shared-ref verb re-classification,
+        // main-protection, protected-branch refspec guards) is a false block
+        // for it: its mutations only ever touch the FOREIGN repo's own refs.
+        // Only the session repo's own worktrees share the hub's ref namespace
+        // (2026-08-30 #387: agent-infra worktree commits/pushes/tags from a
+        // tortoise session were all false-blocked as if they touched tortoise).
+        // Documented residual (code-review P2): a foreign-wt push that EXPLICITLY
+        // names the session repo's origin URL (`git -C <foreign-wt> push
+        // <session-origin-url> <sha>:refs/heads/main`) can still advance the
+        // session repo's REMOTE refs — the gate cannot cheaply compare remote
+        // URLs; the session HUB's LOCAL refs remain untouchable.
+        if (target.foreignWorktree) {
+          // cycle-2 P1 closure: a push/fetch whose remote operand is a LOCAL
+          // PATH into the session hub rewrites the hub's OWN refs — blocked
+          // outright (never re-classified as the wt's own branch: the
+          // destination refs live in the session repo).
+          if ((inv.verb === "push" || inv.verb === "fetch") &&
+              _pushRemoteIsSessionHub(inv, target, sessionCwd)) {
+            return {
+              verdict: "block", exempted: false,
+              reason: _mainProtectionReason(inv,
+                `push/fetch from a foreign worktree targeting the SESSION HUB via a local`,
+                `path — not isolated (the hub's own refs are at stake).`),
+            };
+          }
+          // cycle-6 P3: a checkout/switch of main/master that classified as a
+          // BLOCK verb (e.g. `checkout main --` — the "--" breaks the recovery
+          // pattern) still needs the recovery-checkout hardening: fail loudly
+          // when the branch cannot be checked out in the target repo (#387
+          // silent-failure class).
+          if (inv.verb === "checkout" || inv.verb === "switch") {
+            const pos = (inv.args || []).filter((x) => !x.startsWith("-"));
+            if (pos.length === 1 && (pos[0] === "main" || pos[0] === "master") &&
+                !_recoveryCheckoutVerifiable(target.gitDir, pos[0], inv)) {
+              return {
+                verdict: "block", exempted: false,
+                reason: _recoveryCheckoutBlockReason(inv, pos[0]),
+              };
+            }
+          }
+          continue; // the foreign repo's own business — isolated
+        }
         // Round-5 (second-model P1): `pull` is worktree-LOCAL but accepts a
         // fetch-style refspec whose dst can be the protected branch — the dst
         // guard must run BEFORE the local-verb exemption (`cd <wt> && git pull
@@ -2194,23 +2625,39 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       // is a worktree against the wt's own branch.
       const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
       if (target && target.isWorktree) {
-        // Round-12 (second-model P2): a wt on the hub's protected branch must
-        // not push it via HEAD/bare forms either (`git push origin HEAD` /
-        // bare `git push` from a wt on main classify recovery but push main).
-        if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
+        // Issue #397: a FOREIGN worktree pushes only the foreign repo's refs —
+        // the session-hub re-validation (wt's own branch / protected branch)
+        // doesn't apply. `cd <foreign-wt> && git push origin <anything>` cannot
+        // touch the session hub (disjoint ref namespaces).
+        // cycle-2 P1 closure: a local-path remote resolving into the session
+        // hub is NOT a foreign push — it rewrites the hub's own refs.
+        if (target.foreignWorktree && _pushRemoteIsSessionHub(inv, target, sessionCwd)) {
           return {
             verdict: "block", exempted: false,
             reason: _mainProtectionReason(inv,
-              `push from a worktree on the hub's protected branch "${target.worktreeBranch}" —`,
-              `would advance the shared main ref.`),
+              `push from a foreign worktree targeting the SESSION HUB via a local`,
+              `path — not isolated (the hub's own refs are at stake).`),
           };
         }
-        if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") {
-          return {
-            verdict: "block", exempted: false,
-            reason: _mainProtectionReason(inv,
-              `push from a worktree target of a branch other than the worktree's own — not isolated.`),
-          };
+        if (!target.foreignWorktree) {
+          // Round-12 (second-model P2): a wt on the hub's protected branch must
+          // not push it via HEAD/bare forms either (`git push origin HEAD` /
+          // bare `git push` from a wt on main classify recovery but push main).
+          if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
+            return {
+              verdict: "block", exempted: false,
+              reason: _mainProtectionReason(inv,
+                `push from a worktree on the hub's protected branch "${target.worktreeBranch}" —`,
+                `would advance the shared main ref.`),
+            };
+          }
+          if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") {
+            return {
+              verdict: "block", exempted: false,
+              reason: _mainProtectionReason(inv,
+                `push from a worktree target of a branch other than the worktree's own — not isolated.`),
+            };
+          }
         }
       }
       sawRecovery = true;
@@ -2222,7 +2669,10 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
     // classification is unsafe for worktree targets.
     if (v === "readonly" && inv.verb === "symbolic-ref" && !(inv.args || []).includes("HEAD")) {
       const target = resolveInvocationTarget(inv, sessionCwd, sessionCwd);
-      if (target && target.isWorktree) {
+      // Issue #397: a FOREIGN worktree's symbolic-ref writes only the foreign
+      // repo's refs (disjoint namespace) — the session-hub shared-ref concern
+      // doesn't apply.
+      if (target && target.isWorktree && !target.foreignWorktree) {
         return {
           verdict: "block", exempted: false,
           reason: _mainProtectionReason(inv,
@@ -2640,8 +3090,19 @@ export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd
     // recovery-checkout main-protection — `cd <wt> && bash evil.sh` with
     // `git checkout main` content (hub off-main) takes the protected branch.
     if (v === "recovery" && (inv.verb === "checkout" || inv.verb === "switch")) {
+      const pos = (inv.args || []).filter((x) => !x.startsWith("-"));
       const target = resolveInvocationTarget(inv, sessionCwd, executionCwd);
-      if (target && target.isWorktree && _worktreeCheckoutBlock(inv, target, currentBranch)) return "block";
+      // Issue #397: mirror the bash gate's recovery-checkout hardening — a
+      // script whose checkout of main/master cannot succeed in the target repo
+      // (no local branch, no unique DWIM source) is the #387 silent-failure
+      // class (swallowed failure → wrong-branch reset); block it loudly. The
+      // main-protection guard below is session-hub-scoped: a FOREIGN worktree
+      // (different repo — invocation-frame map hit) taking its OWN repo's main
+      // cannot touch the session hub (disjoint ref namespaces).
+      if (target && pos.length === 1 && (pos[0] === "main" || pos[0] === "master") &&
+          !_recoveryCheckoutVerifiable(target.gitDir, pos[0], inv)) return "block";
+      if (target && target.isWorktree && !target.foreignWorktree &&
+          _worktreeCheckoutBlock(inv, target, currentBranch)) return "block";
     }
     if (v === "block") {
       // #347: per-invocation target exemption — the worktree map comes from the
@@ -2652,6 +3113,17 @@ export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd
       // content that targets the hub (or a foreign/unresolvable target) blocks.
       const target = resolveInvocationTarget(inv, sessionCwd, executionCwd);
       if (target && target.isWorktree) {
+        // Issue #397: a FOREIGN worktree is FULLY isolated from the session hub
+        // (disjoint ref namespaces) — every session-hub protection below is a
+        // false block for it, mirror of the bash gate's foreign continue.
+        if (target.foreignWorktree) {
+          // cycle-2 P1 closure (mirror of the bash gate): a push/fetch in script
+          // content whose remote operand is a local path into the session hub
+          // rewrites the hub's own refs — not isolated.
+          if ((inv.verb === "push" || inv.verb === "fetch") &&
+              _pushRemoteIsSessionHub(inv, target, sessionCwd)) return "block";
+          continue;
+        }
         // Round-5 (second-model P1): pull refspec dst guard BEFORE the local-verb
         // exemption (mirror of the bash-gate hoist).
         if (inv.verb === "pull" || inv.verb === "fetch") {
