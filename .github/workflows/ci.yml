@@ -75,8 +75,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install pytest + pytest-timeout
-        run: pip install pytest pytest-timeout
+      - name: Install pytest + pytest-timeout + pyyaml
+        # pyyaml: the sequence-enforcer's loadSteps frontmatter fallback runs
+        # `python3 -c 'import yaml'` — the CI runner's python3 has no PyYAML by
+        # default (local macOS python3 does), which fails the token_phase +
+        # F2 activation tests (loadSteps returns null → no steps parsed).
+        run: pip install pytest pytest-timeout pyyaml
       - name: Vendored parallel_work_check suite (pytest, B1–B34)
         run: python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
