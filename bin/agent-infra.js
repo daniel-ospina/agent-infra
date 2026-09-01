@@ -777,6 +777,32 @@ function _checkCI(manifest, targetDir, issues, ciMode, exempted) {
         console.log(`   ❌ ${d.file} — pinned @${d.ref}, expected @${d.expected}`);
       }
     }
+
+    // #389 — inline generic test jobs: a consumer workflow that inlines a
+    // generic JS/TS suite runner (node --test / vitest / npx tsx --test over
+    // a static glob/directory) instead of calling the reusable unit-test
+    // capability. Repo-specific gates (file-specific runs, migration guards,
+    // e2e harnesses, artifact suites, dynamic targets, loops over dynamic
+    // iterables) are deliberately non-targets (scoping plan rev 5 boundary
+    // contract). Old-manifest consumers (no ci.ref) keep the warning above
+    // and skip this rule (progressive rollout — the version gate already
+    // FAILs those repos).
+    const inline = ciRefCheck.checkInlineGenericJobs(targetDir, ci.ref);
+    if (inline.length === 0) {
+      ok++;
+      console.log(`   ✅ inline test jobs — no generic dir-suite runners (#389)`);
+    } else {
+      for (const f of inline) {
+        // Per-pattern remediation (#389 plan rev 5): node --test over a
+        // static glob → test-glob input; vitest/tsx/loop → test-command.
+        const input = f.pattern === 'node --test' ? 'test-glob' : 'test-command';
+        issues.push({
+          type: 'ci-inline', entry: `${f.file} (${f.job})`, tier: 'fail',
+          reason: `inline generic test job '${f.job}' (${f.pattern}) — expressible via the reusable unit-test capability; call node-ci.yml@${ci.ref} with ${input} instead`,
+        });
+        console.log(`   ❌ ${f.file} (${f.job}) — inline generic test job (${f.pattern}); use node-ci.yml@${ci.ref} ${input} instead`);
+      }
+    }
   }
 
   return ok;
