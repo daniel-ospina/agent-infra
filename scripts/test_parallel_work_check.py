@@ -1236,13 +1236,11 @@ def _noboard_bash_env(gh, sb, tmp_path, token, timeout="6"):
     timeout default 6 (P3, flake #392): a SAFE budget for the ~278ms warm
     real-python pipeline — the old 0.5s left only ~220ms headroom on the
     C1: CLEAR assertions and flaked under load. 6s gives ~5.7s headroom
-    (~20x) while keeping B17's five .sh runs (~8s watchdog each) inside
-    the 60s per-test pytest-timeout gate. (The literal 10s convention
-    would cost ~12s/run → B17 ≈ 61s → killed by --timeout=60. macOS bash
-    3.2 quirk: a killed watchdog subshell orphans its `sleep`, which holds
-    the stdout pipe open until the watchdog timer expires — every .sh
-    invocation costs budget+2.0s under pipe capture, independent of how
-    fast python is.) The tight-budget timeout contract is owned by
+    (~20x). (#391: the budget+2.0s watchdog tail this margin once
+    protected against is gone — the watchdog subshell redirects its stdio
+    to /dev/null so a killed subshell's orphaned `sleep` no longer holds
+    the caller's stdout pipe open; each .sh invocation now returns ≈ the
+    python pipeline time.) The tight-budget timeout contract is owned by
     test_bash_timeout_contract (0.05s) and the B23 folds, NOT by B16/B17."""
     env = _bash_env(_url(gh), _url(sb), tmp_path, token, timeout=timeout)
     for name in ("SWARM_CARD_ID", "AGENT_ID", "SWARM_TOUCHED_PATHS",

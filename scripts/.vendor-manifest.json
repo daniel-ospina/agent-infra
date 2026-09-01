@@ -12,7 +12,7 @@
       "identical@base": false,
       "patch": "scripts/.vendor-patches/parallel_work_check.sh.patch",
       "base_sha256": "f26569c60ea1f5559591f73cbb846cc221d4bfc6cf12aa2c99a5fb25ccf7b7a2",
-      "patched_sha256": "23f99eade41bb58ea6c3cd886c98583303d91f20ad077d9e62bf951a9b1feb88"
+      "patched_sha256": "ab413ecd3c7cc419d56d1f49f818012b4ab83f295ed4a1a87ee07c2cefd07530"
     },
     "scripts/parallel_work_check.py": {
       "identical@base": false,
@@ -24,7 +24,7 @@
       "identical@base": false,
       "patch": "scripts/.vendor-patches/test_parallel_work_check.py.patch",
       "base_sha256": "2ad53d8ae271336d2b4cd87048078a125c8bb9cc49280096ca234609f7cf4b64",
-      "patched_sha256": "2b496a64354dec81d752caec42a5d6c42318efa7ded26f24e575ca5ccf7d0ec8"
+      "patched_sha256": "250f6f7745a4478846d7b2bd396d6203d01bd545cda681e9db4611616037c205"
     },
     "scripts/fake_supabase.py": {
       "identical@base": true,
