@@ -25,3 +25,4 @@ tests/fixtures/drift/*/.agent-infra-version
 
 # #254 — oracle drift-lock runtime timestamp (dev-machine cron state)
 .last-oracle-run
+scripts/heartbeats/

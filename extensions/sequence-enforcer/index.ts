@@ -46,6 +46,7 @@ import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unlinkSync, renameSync } from "node:fs";
 import { resolve, join, dirname } from "node:path";
+import { isIP } from "node:net"; // #383 (Task 3, P3-1 FINAL mechanical): true IPv6 mirror — zero-dep builtin
 import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
 
 // #357 (Task 1): inline copy of pi's `isToolCallEventType` — the suite runs in
@@ -344,7 +345,21 @@ export function _setAuditSinkForTest(sink: ((entry: Record<string, unknown>) => 
 }
 
 function auditLog(entry: Record<string, unknown>) {
-  if (auditSink) { auditSink(entry); return; }
+  if (auditSink) {
+    try { auditSink(entry); } catch (e) {
+      // #383 (Task 3) T6(i): a raising sink (write failure injected by the test)
+      // must NOT escape into the tool_call handler's fail-open catch — the
+      // advance outcome is unchanged, but the failure is surfaced deterministically
+      // (never silent: the post-merge lag tripwire cannot distinguish "event never
+      // emitted" from "sink failed").
+      // #383 (Task 3) P3-2 (code-quality): the T6(i) intent holds only while
+      // console.warn itself doesn't throw — a throwing warn would escape
+      // auditLog into the tool_call handler's fail-open catch (converting the
+      // advance outcome). Defensive last resort: never let auditLog throw.
+      try { console.warn(`[sequence-enforcer] ⚠️ audit sink failed: ${String(e)}`); } catch { /* last resort */ }
+    }
+    return;
+  }
   // #357 (Task 8, landed early — Batch-1 verifier P1): under NODE_ENV=test with
   // no sink installed, do NOT fall through to the production log — test runs
   // must never pollute ~/.pi/agent/audit/enforcement.jsonl (probe-pollution
@@ -354,7 +369,14 @@ function auditLog(entry: Record<string, unknown>) {
   try {
     mkdirSync(dirname(auditPath), { recursive: true });
     appendFileSync(auditPath, JSON.stringify(entry) + "\n");
-  } catch { /* fail silently — audit is best-effort */ }
+  } catch (e) {
+    // #383 (Task 3): the old silent catch (`/* fail silently */`) is gone — a
+    // sink failure must be surfaced, never silent. Still non-throwing: an audit
+    // throw must never reach the tool_call handler's fail-open catch.
+    // #383 (Task 3) P3-2 (code-quality): throw-proof the production-log failure
+    // surface too — a throwing console.warn must never escape auditLog.
+    try { console.warn(`[sequence-enforcer] ⚠️ audit write failed: ${String(e)}`); } catch { /* last resort */ }
+  }
 }
 
 
@@ -558,8 +580,104 @@ export function _setRepoForTest(repo: string | null): void {
   if (process.env.NODE_ENV !== "test") return;
   repoTestOverride = repo;
 }
+
+// #383 (Task 3): mirror the checker's GitOps.remote_url() userinfo
+// sanitization EXACTLY (Python urlsplit vs Node URL parsing differ — this is a
+// pure string transformation, byte-identical to Python's
+// `parts._replace(netloc=…).geturl()`). Strip ALL userinfo from
+// scheme-bearing URLs — BOTH the bare-PAT form (`https://TOKEN@host/…`, no
+// colon — common for GitHub PATs-as-username) AND the `user:pass@` form;
+// host:port survive exactly (last-`@` split, like Python's rsplit("@",1)).
+// scp-form `git@host:org/repo.git` has no scheme → no netloc in urlsplit →
+// byte-identical untouched. No match / no userinfo → unchanged. Empty → "unknown".
+export function sanitizeRemoteUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "unknown";
+  const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)/.exec(trimmed);
+  if (!m) return trimmed;
+  // #383 (Task 3) P3-1 (code-quality): urlsplit raises ValueError on an
+  // UNBALANCED-bracket netloc (`https://user@[::1/org/repo.git` → Python
+  // "unknown"); the regex would accept the mangled netloc and pass it through
+  // verbatim → spurious cross-repo BLOCK. A netloc containing a `[` XOR `]`
+  // returns "unknown", matching Python's urlsplit bracket ValueError.
+  // #383 (Task 3) P3-1 (FINAL mechanical round): the balanced-but-invalid
+  // check is now a TRUE IPv6 mirror — Node's built-in `net.isIP` (zero deps),
+  // mirroring Python 3.12 urlsplit's bracketed-host ipaddress check: the
+  // bracketed host is preserved IFF `isIP(inner) === 6`. This rejects
+  // everything urlsplit's ValueError rejects — letters ("notanip"), bare hex
+  // ("deadbeef"), empty "[]", bracketed IPv4 ("[127.0.0.1]" → isIP 4 ≠ 6),
+  // and the loose-regex survivors (`[:1]`, `[1:2]`, `[::::]`, 9-hextet,
+  // 5-digit hextet, `[a:b]` — all isIP 0). Zone-IDs: Node ≥22's isIP accepts
+  // `fe80::1%eth0` (isIP 6), which Python 3.12 ALSO preserves — so on the pi
+  // runtime (v22.23.2) the mirror is COMPLETE, no residue. On a pre-22 Node
+  // (isIP 0 for zone-IDs) the direction is fail-closed: spurious BLOCK, never
+  // a silent pass. Brackets live in the host part — slice after the last `@`
+  // so userinfo is excluded.
+  if (m[2].includes("[") || m[2].includes("]")) {
+    const hostPart = m[2].slice(m[2].lastIndexOf("@") + 1);
+    const open = hostPart.indexOf("[");
+    const close = hostPart.indexOf("]");
+    if (open === -1 || close === -1 || close < open) return "unknown"; // unbalanced → urlsplit ValueError parity
+    const inner = hostPart.slice(open + 1, close);
+    if (isIP(inner) !== 6) return "unknown"; // balanced-but-invalid → urlsplit ValueError parity
+  }
+  if (!m[2].includes("@")) return trimmed;
+  // #383 (Task 3) P2-1 (code-quality): Python's urlsplit LOWERCASES the scheme
+  // (parts.scheme); the old regex preserved case — `git remote add origin
+  // HTTPS://TOKEN@host/…` is stored verbatim, so the enforcer bound
+  // `HTTPS://…` vs the checker's lowercased `https://…` → spurious cross-repo
+  // BLOCK. Lowercase the scheme on the rebuilt URL (the no-userinfo path stays
+  // case-preserved like Python's raw return).
+  return m[1].toLowerCase() + "://" + m[2].slice(m[2].lastIndexOf("@") + 1) + trimmed.slice(m[0].length);
+}
+
+// #383 (Task 3): PARALLEL_CHECK_REPO is documented as a PATH while token.repo
+// carries the URL form — resolveRepo runs the SAME `git -C <v> remote get-url
+// origin` the checker's GitOps.remote_url() runs (trimmed, fail → "unknown"),
+// so a path-valued env binds identically to the checker's resolution. Bad
+// paths (nonexistent / plain file / non-git dir) → "unknown" — NEVER a throw
+// (a throw here would land in the tool_call handler's fail-open catch and
+// convert BLOCK→ALLOW — the T14/T15 hazard class).
+// #383 (Task 3) P2-2/P3 (code-quality): resolveRepo is memoized keyed on the
+// env VALUE AND the cwd — this cache MIRRORS currentRepo's cwd-keyed cache
+// exactly (same key shape, same invalidation). With a RELATIVE
+// PARALLEL_CHECK_REPO (`.`, the natural operator shorthand) the `git -C <v>`
+// binding is cwd-relative, so a mid-session chdir MUST re-resolve, else the
+// enforcer stays pinned to the OLD repo while the checker binds the NEW one →
+// spurious cross-repo BLOCK (fail-closed, but a regression for relative-path
+// configs). bindingRepo() runs at every checkpoint tool_call (token check +
+// the skip-audit's binding), and an uncached `git -C` spawn per call was 2–3
+// subprocesses per tool call; the operator's PARALLEL_CHECK_REPO is
+// session-stable and the cwd is stable within a resolution burst, so
+// same-value/same-cwd re-resolution (e.g. the skip-audit binding right after
+// the token check) reuses the already-resolved binding — no re-spawn.
+let envRepoCache: { v: string | undefined; cwd: string; repo: string } | null = null;
+function resolveRepo(v: string): string {
+  if (envRepoCache && envRepoCache.v === v && envRepoCache.cwd === process.cwd()) return envRepoCache.repo;
+  let repo: string;
+  try {
+    const url = execFileSync("git", ["-C", v, "remote", "get-url", "origin"], { encoding: "utf-8", timeout: 5000 }).trim();
+    repo = sanitizeRemoteUrl(url || "unknown");
+  } catch {
+    repo = "unknown";
+  }
+  envRepoCache = { v, cwd: process.cwd(), repo };
+  return repo;
+}
+
+// #383 (Task 3): the checkpoint binding repo — resolveRepo(PARALLEL_CHECK_REPO)
+// (PATH form; empty/whitespace falls through, never presence-keyed — T14)
+// || currentRepo() (cwd). The enforcer NEVER learns a `--repo X` flag the
+// checker ran with — T14 pins the named-mismatch BLOCK + the
+// PARALLEL_CHECK_REPO remediation.
+function bindingRepo(): string {
+  const envRepo = process.env.PARALLEL_CHECK_REPO;
+  if (envRepo && envRepo.trim()) return resolveRepo(envRepo);
+  return currentRepo();
+}
+
 function currentRepo(): string {
-  if (repoTestOverride) return repoTestOverride;
+  if (repoTestOverride) return sanitizeRemoteUrl(repoTestOverride);
   // #357 review (Bug-scan P2): the cache is keyed on cwd — agents cd between
   // repos routinely; a session-start remote would weaken the force-file repo
   // binding. Only re-resolves on cwd change (the git call is 5s-throttled).
@@ -567,7 +685,11 @@ function currentRepo(): string {
   if (currentRepoCache && currentRepoCache.cwd === cwd) return currentRepoCache.repo;
   try {
     const url = execFileSync("git", ["remote", "get-url", "origin"], { encoding: "utf-8", timeout: 5000 }).trim();
-    currentRepoCache = { cwd, repo: url || "unknown" };
+    // #383 (Task 3) CRITICAL PARITY: the cached value is SANITIZED through the
+    // same userinfo-strip as the checker's remote_url — a credential-bearing
+    // origin must bind identically on both sides, else a sanitized checker
+    // token vs raw enforcer repo → spurious cross-repo BLOCK.
+    currentRepoCache = { cwd, repo: sanitizeRemoteUrl(url || "unknown") };
   } catch {
     currentRepoCache = { cwd, repo: "unknown" };
   }
@@ -585,7 +707,12 @@ function readForceFile(): { status: "none" | "malformed" | "ok"; data?: Record<s
     try {
       raw = readFileSync(file, "utf-8");
     } catch {
-      return { status: "none" };
+      // #383 (Task 3) P3-3 (code-quality): a PRESENT-but-unreadable force file
+      // (chmod 000) is NOT "none found" — mirror T10d's token-file handling:
+      // name it malformed (the malformed note names the file; cleanup on
+      // advance still applies via consumeForceFile). A silent "none" would
+      // mislabel an operator bypass as absent.
+      return existsSync(file) ? { status: "malformed" } : { status: "none" };
     }
     let f: unknown;
     try {
@@ -606,17 +733,37 @@ function readForceFile(): { status: "none" | "malformed" | "ok"; data?: Record<s
     ) {
       return { status: "malformed" };
     }
+    // #383 (Task 3) P3-2 (FINAL senior round): the force-file repo comparison
+    // (`f.repo === repoNow` at the checkpointTokenOk force branch AND the
+    // consumeForceFile passable check) read f.repo RAW while currentRepo() is
+    // SANITIZED → a hand-written force file carrying a credential-bearing repo
+    // (copied from `git remote get-url origin` on a token-auth checkout) now
+    // mismatches → rejected (fail-closed, diagnosable). Sanitize HERE — the
+    // single read site feeds BOTH comparisons AND the checkpoint_force_pass
+    // audit's repo field (a raw credential-bearing repo would leak into the
+    // audit; the skip-audit's repo already comes from the sanitized
+    // bindingRepo()). Mirrors the token path (the checker sanitizes token.repo
+    // before writing).
+    d.repo = sanitizeRemoteUrl(d.repo);
     return { status: "ok", data: d };
   } catch {
-    return { status: "none" };
+    // P3-3: same present-but-unreadable guard for any unexpected throw in the
+    // validation block — an existing file is malformed, never silently "none".
+    return existsSync(file) ? { status: "malformed" } : { status: "none" };
   }
 }
 
 // Consume the force file (one-shot per checkpoint): audit the human-read-only
-// checkpoint_force_pass event, then unlink so a single file can never pass two
-// checkpoints. #357 review (cycle 2, Bug-scan P2): PHASE-AWARE — only a file
-// that could have passed THIS checkpoint is consumed + audited.
-function consumeForceFile(skill: SkillState, stepName: string, mode: Mode, requiredPhase: string): void {
+// checkpoint_force_pass event ONLY when the operator's file actually DROVE the
+// pass, then unlink so a single file can never pass two checkpoints.
+// #357 review (cycle 2, Bug-scan P2): PHASE-AWARE — only a file that could
+// have passed THIS checkpoint is consumed + audited. #383 (Task 3) ONE pinned
+// criterion: checkpoint_force_pass is emitted iff ctx.viaForce && mode !==
+// "warn" — a real-token-wins consume or a warn-mode consume (which auto-
+// advances WITHOUT honoring the file) unlinks but never claims a force pass
+// (flipped real-token-wins + warn-mode-consume tests; the warn site passes a
+// force-suppressed context).
+function consumeForceFile(skill: SkillState, stepName: string, mode: Mode, requiredPhase: string, ctx: { viaForce: boolean }): void {
   const f = readForceFile();
   // #357 review: no file present → no-op. Callers invoke consumption on ANY
   // checkpoint advance (real-token-wins and warn-mode included) — an absent
@@ -645,17 +792,19 @@ function consumeForceFile(skill: SkillState, stepName: string, mode: Mode, requi
     try { if (existsSync(forceFile())) unlinkSync(forceFile()); } catch { /* best-effort */ }
     return;
   }
-  auditLog({
-    ts: new Date().toISOString(),
-    event: "checkpoint_force_pass",
-    skill: skill.path,
-    step: stepName,
-    mode,
-    phase: f.status === "ok" ? f.data!.phase : "?",
-    operator: f.status === "ok" ? f.data!.operator : "?",
-    origin: f.status === "ok" ? f.data!.origin : "?",
-    repo: f.status === "ok" ? f.data!.repo : "?",
-  });
+  if (ctx.viaForce && mode !== "warn") {
+    auditLog({
+      ts: new Date().toISOString(),
+      event: "checkpoint_force_pass",
+      skill: skill.path,
+      step: stepName,
+      mode,
+      phase: f.status === "ok" ? f.data!.phase : "?",
+      operator: f.status === "ok" ? f.data!.operator : "?",
+      origin: f.status === "ok" ? f.data!.origin : "?",
+      repo: f.status === "ok" ? f.data!.repo : "?",
+    });
+  }
   try {
     if (existsSync(forceFile())) unlinkSync(forceFile());
   } catch { /* best-effort */ }
@@ -709,7 +858,17 @@ function tokenFile(): string {
   return CHECKPOINT_TOKEN_FILE;
 }
 
-export function checkpointTokenOk(step: Step): { ok: boolean; reason: string; viaForce?: boolean } {
+// #383 (Task 3): mode-aware, binding-aware token check. opts.enforceBinding is
+// TRUE only in gate/strict (warn is binding-free — a warn session auto-advances
+// audit-only and must never be gated by a repo mismatch). Returns the token's
+// mode ("no-board-skip" for skip tokens, "" for board CLEAR) so the advance
+// sites can emit the distinct checkpoint_no_board_skip audit keyed on
+// ok && mode === "no-board-skip" && !viaForce.
+export function checkpointTokenOk(
+  step: Step,
+  opts: { enforceBinding?: boolean } = {},
+): { ok: boolean; reason: string; viaForce?: boolean; mode?: string } {
+  const enforceBinding = opts.enforceBinding === true;
   const requiredPhase = step.token_phase || "";
   // #357 (Task 3): a checkpoint step WITHOUT token_phase is unpassable-by-design
   // — any-phase CLEAR would satisfy a meaningless phase check. Fail-closed FIRST
@@ -718,40 +877,91 @@ export function checkpointTokenOk(step: Step): { ok: boolean; reason: string; vi
     return { ok: false, reason: `⛔ checkpoint gate — step "${step.name}" is checkpoint-gated but declares NO token_phase (frontmatter \`token_phase:\` missing) — unpassable-by-design. Fix the skill declaration or use the operator force-pass.` };
   }
   const file = tokenFile();
-  let raw: string;
+  let raw = "";
+  let unreadable = false;
   try {
     raw = readFileSync(file, "utf-8");
   } catch {
-    raw = "";
+    // #383 (Task 3) T10d: a PRESENT-but-unreadable file (chmod 000) is NOT
+    // "none found" — a named corrupt/unreadable reason, never a silent empty
+    // read collapsing into the none-found message.
+    unreadable = existsSync(file);
   }
   let reason = "";
   let realOk = false;
+  let tokenMode = "";
   if (raw) {
-    let token: { phase?: string; verdict?: string; ts?: unknown } | null = null;
+    let token: { phase?: string; verdict?: string; ts?: unknown; repo?: unknown; mode?: unknown } | null = null;
     try {
-      token = JSON.parse(raw);
+      const parsed: unknown = JSON.parse(raw);
+      // #383 (Task 3) T10e: valid-JSON-but-wrong-SHAPE (null/[]/scalar) must
+      // get a NAMED corrupt reason — the old `if (token)` falsy path left
+      // reason EMPTY (an empty-reason BLOCK — the diagnosability hole T10 pins).
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        reason = `⛔ checkpoint gate — step "${step.name}" token is corrupt/unreadable (wrong shape) — BLOCK`;
+      } else {
+        token = parsed as typeof token;
+      }
     } catch {
       reason = `⛔ checkpoint gate — step "${step.name}" token is corrupt/unreadable — BLOCK`;
     }
     if (token) {
-      if (token.verdict !== "CLEAR") {
+      if (typeof token.verdict !== "string") {
+        // #383 (Task 3) T10e: an object WITHOUT a verdict field is a wrong-shape
+        // token (the old code reported `verdict is "?"` — same block, but not a
+        // corrupt classification; T10e pins the named corrupt reason for {} too).
+        reason = `⛔ checkpoint gate — step "${step.name}" token is corrupt/unreadable (missing verdict field) — BLOCK`;
+      } else if (token.verdict !== "CLEAR") {
         reason = `⛔ checkpoint gate — step "${step.name}" token verdict is "${token.verdict ?? "?"}" — only CLEAR passes; UNKNOWN never writes a token (fail-closed)`;
       } else {
+        tokenMode = typeof token.mode === "string" ? token.mode : "";
         const ts = parseTokenTs(token.ts);
         if (ts === null || Date.now() - ts > CHECKPOINT_TOKEN_TTL_MS) {
           reason = `⛔ checkpoint gate — step "${step.name}" token is stale (>10 min TTL) — re-run \`parallel_work_check <phase>\``;
+        } else if (ts > Date.now()) {
+          // #383 (Task 3) T16: reject future ts with a NAMED reason (mirrors the
+          // force-file rejection below) — a clock-skewed/edited token never
+          // TTL-expires and, in no-board mode where all phases CLEAR, ONE
+          // tampered token would satisfy every gate in a session.
+          reason = `⛔ checkpoint gate — step "${step.name}" token ts is in the future — BLOCK (clock skew or tampered token — re-run \`parallel_work_check ${requiredPhase}\`)`;
         } else if (requiredPhase && token.phase !== requiredPhase) {
           reason = `⛔ checkpoint gate — step "${step.name}" token phase "${token.phase ?? "?"}" ≠ required "${requiredPhase}" — BLOCK`;
+        } else if (enforceBinding) {
+          const bind = bindingRepo();
+          const tokenRepo = typeof token.repo === "string" ? token.repo : "";
+          if (tokenRepo !== bind) {
+            // #383 (Task 3): repo binding — token.repo (URL form, sanitized by
+            // the checker's GitOps.remote_url) must match this checkout's repo.
+            // CRITICAL PARITY: bindingRepo() mirrors the checker's userinfo
+            // sanitization so a credential-bearing origin binds identically on
+            // both sides. both-"unknown" passes (no-remote parity); a legacy
+            // abspath-form / missing repo BLOCKs (deploy-window reverse edge).
+            // #383 (Task 3) P3-3 (FINAL senior round): echo the SANITIZED token
+            // repo in the block reason — the old interpolation leaked a raw
+            // credential-bearing token.repo into the audit reason + console
+            // output (exposure ~nil — the checker sanitizes before writing; a
+            // credential-bearing value needs a tampered token — but the
+            // skip-audit's repo is already sanitized via bindingRepo()). The
+            // host survives sanitization, so the reason still names the repo
+            // meaningfully.
+            reason = `⛔ checkpoint gate — step "${step.name}" token repo "${sanitizeRemoteUrl(tokenRepo)}" does not match this checkout's repo "${bind}" — BLOCK (re-run the checker from this checkout, or set PARALLEL_CHECK_REPO to the checker's checkout path)`;
+          } else {
+            realOk = true;
+          }
         } else {
           realOk = true;
         }
       }
     }
+  } else if (unreadable) {
+    // #383 (Task 3) T10d: named unreadable-file reason (never a throw into the
+    // fail-open catch).
+    reason = `⛔ checkpoint gate — step "${step.name}" token file is unreadable (${file}) — BLOCK (fix permissions or re-run the checker)`;
   } else {
     reason = `⛔ checkpoint gate — step "${step.name}" requires a fresh parallel_work_check PASS token (${file}) — none found. Run \`parallel_work_check <phase>\` to produce one.`;
   }
 
-  if (realOk) return { ok: true, reason: "" };
+  if (realOk) return { ok: true, reason: "", mode: tokenMode };
 
   // #357 (Task 10, h): operator force-pass — honored ONLY when the real token
   // fails. verdict CLEAR + phase match + repo binding + operator TTL.
@@ -767,7 +977,10 @@ export function checkpointTokenOk(step: Step): { ok: boolean; reason: string; vi
       forceTs <= Date.now() && // #357 review (Bug-scan P2): reject future ts — a skew/typo must not grant an infinite operator TTL
       Date.now() - forceTs <= FORCE_TTL_MS
     ) {
-      return { ok: true, reason: "", viaForce: true };
+      // #383 (Task 3): the return carries the (failed) token's mode so the
+      // advance sites' skip-audit guard (`!viaForce`) never emits a spurious
+      // checkpoint_no_board_skip on a force-driven advance (T6(h)).
+      return { ok: true, reason: "", viaForce: true, mode: tokenMode };
     }
     // #357 review (Bug-scan P2): a present-but-rejected force file must not
     // silently strand the session — name the mismatch (mirrors the malformed
@@ -802,22 +1015,70 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
     if (!requiredPhase) {
       return `→ Checkpoint "${step.name}" is unpassable (missing token_phase in the skill frontmatter) — contact the operator. No parallel_work_check invocation can clear it.`;
     }
-    const tokenState = checkpointTokenOk(step);
+    const tokenState = checkpointTokenOk(step, { enforceBinding: mode !== "warn" });
     if (tokenState.ok) {
       // State 2: fresh phase-correct token — do NOT re-run the checker
       // (a re-run can REMOVE the token on UNKNOWN, stranding the session).
-      return `→ Checkpoint "${step.name}" already has a fresh phase-${requiredPhase} token — do NOT re-run the checker. Proceed with the next step.`;
+      // #383 (Task 3): name a no-board-skip token (State-2 note) so the agent
+      // understands the skip semantics it advanced on.
+      // #383 (Task 3) P3-4 (code-quality): a FORCE-driven pass (viaForce) must
+      // NOT be mislabeled as "a fresh token" — the force file drove the advance
+      // (a re-run would SUCCEED once the file is consumed; the "do NOT re-run"
+      // premise holds only for a real token). Name the operator force-pass; the
+      // no-board-skip note is gated on !viaForce (a force advance never
+      // consumed a skip token).
+      if (tokenState.viaForce) {
+        return `→ Checkpoint "${step.name}" passed via an operator force-pass (no fresh token — the force file is consumed on advance). A checker re-run would now succeed; run \`parallel_work_check ${requiredPhase}\` if you want a real token. Proceed with the next step.`;
+      }
+      const nbNote = tokenState.mode === "no-board-skip" ? " (no-board-skip token — the vendored checker skipped pure-board sub-checks)" : "";
+      return `→ Checkpoint "${step.name}" already has a fresh phase-${requiredPhase} token${nbNote} — do NOT re-run the checker. Proceed with the next step.`;
     }
     // State 1: no-ok token — name a CLEAR-able invocation. The PRIMARY command is
     // the parent/main-checkout run (omit --repo: checkout_guard C1 DEFERs on any
     // non-main worktree branch, so --repo <own-worktree> is GUARANTEED to DEFER
-    // and must NOT be the primary form). Resolve PARALLEL_CHECK_BIN at runtime
-    // (env override; default the swarm checkout path — machine-specific, see docs).
+    // and must NOT be the primary form). #383 (Task 3) L814 intent: resolve
+    // `$AGENT_INFRA_PATH` — a REQUIRED prerequisite per AGENTS.md — there is NO
+    // `$HOME/agent-infra` default fiction (agent-infra lives at
+    // $HOME/Documents/GitHub/agent-infra here; pointing at a nonexistent default
+    // path is worse than saying so). Guidance says 'set AGENT_INFRA_PATH' when
+    // unset.
     if (mode === "warn") {
       return `→ Checkpoint "${step.name}" — warn: auto-advancing past checkpoint (audit-only). No checker run needed.`;
     }
-    const bin = process.env.PARALLEL_CHECK_BIN || "/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh";
-    return `→ To proceed: run \`${bin} ${requiredPhase}\` until the verdict is CLEAR (writes the PASS token).
+    // #383 (Task 3): THROW-SAFE canonical resolution — PARALLEL_CHECK_BIN
+    // (internal bin-location override) first, else
+    // $AGENT_INFRA_PATH/scripts/parallel_work_check.sh. The printed command
+    // NEVER carries an `env PARALLEL_CHECK_BIN=…` prefix — the escape-regex
+    // allowlist is GH_TOKEN|CHECKOUT_GUARD_ENFORCE|AGENT_INFRA_PATH;
+    // PARALLEL_CHECK_BIN is NOT allowed, so an env-prefixed print would be
+    // unexecutable at the gate (Task 4's skills rewrite says the same). When
+    // BOTH are absent, emit the 'set AGENT_INFRA_PATH' instruction — a
+    // TypeError here would land in the tool_call handler's fail-open catch
+    // (~1495-1516) and convert the pending-checkpoint BLOCK into an ALLOW,
+    // silently ungating exactly the no-board consumer population this plan
+    // targets (T15).
+    const bin = process.env.PARALLEL_CHECK_BIN;
+    const infraPath = process.env.AGENT_INFRA_PATH;
+    const resolvedBin = bin || (infraPath && join(infraPath, "scripts", "parallel_work_check.sh"));
+    if (!resolvedBin) {
+      return `→ To proceed: set AGENT_INFRA_PATH (a required prerequisite per AGENTS.md), then run \`…/scripts/parallel_work_check.sh ${requiredPhase}\` until the verdict is CLEAR (writes the PASS token).
+→ Escape tools available: read, loop_enforcer
+→ If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
+    }
+    // #383 (Task 3) State-1: ENFORCE-prefix emission for the start phase (C1 is
+    // the checkout_guard entry — CHECKOUT_GUARD_ENFORCE is on the escape
+    // allowlist); other phases print the bare resolved path.
+    const enforcePrefix = requiredPhase === "start" ? "env CHECKOUT_GUARD_ENFORCE=1 " : "";
+    // T15 SET-but-NONEXISTENT variant: name the broken path, distinguishing it
+    // from the unset state (the runnable form is still printed).
+    // #383 (Task 3) P3-5 (code-quality): the hint ALSO fires for a ghost
+    // PARALLEL_CHECK_BIN — the old `!bin` guard only covered the
+    // AGENT_INFRA_PATH derivation, silently printing an unexecutable bin path.
+    // `resolvedBin &&` covers BOTH sources; the note names them generically.
+    const ghostHint = resolvedBin && !existsSync(resolvedBin)
+      ? " (note: the resolved path does not exist — check PARALLEL_CHECK_BIN / AGENT_INFRA_PATH)"
+      : "";
+    return `→ To proceed: run \`${enforcePrefix}${resolvedBin} ${requiredPhase}\`${ghostHint} until the verdict is CLEAR (writes the PASS token).
 → Escape tools available: read, loop_enforcer
 → If the check cannot CLEAR in this environment, the checkpoint is unpassable — end your turn and report`;
   }
@@ -922,8 +1183,10 @@ export function validateToolCall(
   // checkpoint gate (issue #5039): fail-closed token validation. A missing,
   // stale, wrong-phase, non-CLEAR, or corrupt token blocks the step entirely
   // (retry + the operator force-pass are the documented escape). Computed up front
-  // so warn mode can report would-block for checkpoint steps too.
-  const checkpoint = step.gate === "checkpoint" ? checkpointTokenOk(step) : null;
+  // so warn mode can report would-block for checkpoint steps too. #383 (Task 3):
+  // the mode-aware wrapper — binding is enforced in gate/strict only (warn is
+  // binding-free; a warn session auto-advances audit-only).
+  const checkpoint = step.gate === "checkpoint" ? checkpointTokenOk(step, { enforceBinding: mode !== "warn" }) : null;
 
   if (mode === "warn") {
     // #201: warn_blocked ONLY when the call would have been blocked under gate
@@ -1098,6 +1361,7 @@ export function _resetStateForTest(): void {
   auditCoalesce.clear();
   markers.clear();
   currentRepoCache = null;
+  envRepoCache = null; // #383 (Task 3) P2-2/P3: reset the env+cwd-keyed repo cache with the rest
   repoTestOverride = null;
   FORCE_FILE_OVERRIDE = null;
   TOKEN_FILE_OVERRIDE = null; // #357 review (Historical P3): reset-contract completeness — a stale token path must not leak into the next test
@@ -1350,7 +1614,9 @@ export default function (pi: ExtensionAPI) {
       const ownerStep = target.steps[target.stepIndex];
       if (!ownerStep || ownerStep.gate !== "checkpoint") return undefined;
       const toolCallId = (event as any).toolCallId ?? "";
-      const tokenState = checkpointTokenOk(ownerStep);
+      // #383 (Task 3): the mode-aware wrapper — binding is enforced in
+      // gate/strict only (warn is binding-free).
+      const tokenState = checkpointTokenOk(ownerStep, { enforceBinding: mode !== "warn" });
       const checkpointIndex = target.stepIndex;
 
       // #357 (Task 8, j): wall-clock is the AUTHORITATIVE trigger — evaluated per
@@ -1371,7 +1637,11 @@ export default function (pi: ExtensionAPI) {
         // advance too — warn auto-advances without honoring it, but the one-shot
         // invariant must not leave the operator's file to pass a later same-phase
         // gate. Consumed BEFORE advanceCheckpoint (cycle 3, announceGate accuracy).
-        consumeForceFile(target, ownerStep.name, mode, ownerStep.token_phase ?? "");
+        // #383 (Task 3): the warn site passes a FORCE-SUPPRESSED context — warn
+        // auto-advances without honoring the file, so the force file never
+        // actually DROVE the pass (the mode-qualified viaForce criterion; flipped
+        // warn-mode-consume test: consumed, no checkpoint_force_pass audit).
+        consumeForceFile(target, ownerStep.name, mode, ownerStep.token_phase ?? "", { viaForce: false });
         advanceCheckpoint(target);
         auditLog({ ts: new Date().toISOString(), event: "checkpoint_skipped_warn", skill: target.path, step: ownerStep.name, tool: toolName, mode, token_state: tokenStateLabel(tokenState.reason), hint: gateGuidance(ownerStep, "warn") });
         return undefined;
@@ -1391,7 +1661,30 @@ export default function (pi: ExtensionAPI) {
         // STILL validated against the captured step: with a force consumed and
         // no real token, the pending-checkpoint escape semantics apply; with a
         // real token, the ok-checkpoint token_fresh guard.
-        consumeForceFile(target, ownerStep.name, mode, ownerStep.token_phase ?? "");
+        // #383 (Task 3): viaForce context — a real-token-wins consume unlinks
+        // but emits NO checkpoint_force_pass (the force file did not drive the
+        // pass; flipped real-token-wins test).
+        consumeForceFile(target, ownerStep.name, mode, ownerStep.token_phase ?? "", { viaForce: tokenState.viaForce === true });
+        // #383 (Task 3): the skip audit is emitted AT the token-driven advance
+        // branch, keyed on the MODE-AWARE token check's result — ok && mode ===
+        // "no-board-skip" && !viaForce. NEVER inside checkpointTokenOk (it runs
+        // at all four call sites → 2-4× per advance + on non-advancing calls;
+        // T6(f) pins exactly ONE per advance). A force-driven advance (viaForce)
+        // must not emit a spurious skip audit (T6(h)); a board-mode token
+        // (mode "") must not (T6(a)).
+        if (tokenState.ok && tokenState.mode === "no-board-skip" && !tokenState.viaForce) {
+          auditLog({
+            ts: new Date().toISOString(),
+            event: "checkpoint_no_board_skip",
+            skill: target.path,
+            step: ownerStep.name,
+            tool: toolName,
+            mode,
+            token_mode: tokenState.mode,
+            phase: ownerStep.token_phase ?? "",
+            repo: bindingRepo(),
+          });
+        }
         advanceCheckpoint(target);
         const result = validateToolCall(toolName, command, ownerStep, mode);
         if (result.block) {
@@ -1542,12 +1835,32 @@ function tokenStateLabel(reason: string): string {
       if (marker.skill.stepIndex !== marker.stepIndex) return undefined; // sibling advanced
       const ownerStep = marker.skill.steps[marker.skill.stepIndex];
       if (!ownerStep || ownerStep.gate !== "checkpoint") return undefined;
-      const st = checkpointTokenOk(ownerStep);
+      // #383 (Task 3): the mode-aware wrapper (binding in gate/strict only).
+      const markerMode = resolveMode();
+      const st = checkpointTokenOk(ownerStep, { enforceBinding: markerMode !== "warn" });
       if (!marker.ok && st.ok) {
         // #357 review: same any-advance consumption (real-token-wins included);
         // consumed BEFORE advanceCheckpoint so announceGate(next) sees the
         // post-consumption token state (cycle-3 P3).
-        consumeForceFile(marker.skill, ownerStep.name, resolveMode(), ownerStep.token_phase ?? "");
+        // #383 (Task 3): viaForce context + the skip audit — the canonical
+        // gate-mode no-board flow (pending checkpoint → checker run as the
+        // escape call → token produced → marker advance). The ~1550 site gets
+        // the same viaForce criterion (T6(g)) and the same skip-audit key
+        // (ok && mode === "no-board-skip" && !viaForce).
+        consumeForceFile(marker.skill, ownerStep.name, markerMode, ownerStep.token_phase ?? "", { viaForce: st.viaForce === true });
+        if (st.ok && st.mode === "no-board-skip" && !st.viaForce) {
+          auditLog({
+            ts: new Date().toISOString(),
+            event: "checkpoint_no_board_skip",
+            skill: marker.skill.path,
+            step: ownerStep.name,
+            tool: String((event as any)?.toolName ?? ""),
+            mode: markerMode,
+            token_mode: st.mode,
+            phase: ownerStep.token_phase ?? "",
+            repo: bindingRepo(),
+          });
+        }
         advanceCheckpoint(marker.skill); // token produced by this call's completion
       }
       return undefined;

@@ -57,3 +57,60 @@ jobs:
         run: bash scripts/check-workflow-actionlint.sh
       - name: Actionlint gate tests (fixtures, #394 regression)
         run: bash tests/actionlint/run.sh
+
+  verify:
+    # #383 — vendored parallel_work_check pytest suite (self-contained) +
+    # sequence-enforcer tsx suite (incl. the joint checker→enforcer token-shape
+    # test) + the Task 4 literal-path fence (machine-checked, not manual).
+    # Self-contained per-PR: no dependency on post-merge python-ci or the
+    # private swarm checkout. ONE canonical interpreter (3.12) across the
+    # Task 1 local env, this job, and ci-main's python-ci caller — a
+    # 3.11/3.12 divergence would pass PR CI and only break post-merge.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pytest + pytest-timeout + pyyaml
+        # pyyaml: the sequence-enforcer's loadSteps frontmatter fallback runs
+        # `python3 -c 'import yaml'` — the CI runner's python3 has no PyYAML by
+        # default (local macOS python3 does), which fails the token_phase +
+        # F2 activation tests (loadSteps returns null → no steps parsed).
+        run: pip install pytest pytest-timeout pyyaml
+      - name: Vendored parallel_work_check suite (pytest, B1–B34)
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q
+      - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
+        run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
+      - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
+        # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
+        # (provenance).
+        run: '! grep -rE ''/Users/danielospina/swarm/operations/coordination'' skills/ extensions/ scripts/'
+
+  vendor-drift:
+    # #383 — the SINGLE vendor drift gate: bash syntax + manifest verification
+    # (identical@base sha256s + ledger patches reverse-apply to the swarm base).
+    # Isolated as its own job so drift failures get their own red signal,
+    # decoupled from the pytest/tsx suite. Verifies against the pinned
+    # base_rev in scripts/.vendor-manifest.json; the private swarm checkout
+    # (default branch, full history — the rev sits on main's history) provides
+    # the base anchor. Requires AGENT_INFRA_READ_TOKEN (read access to
+    # daniel-ospina/swarm) — the same cross-repo pattern as drift-check.yml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: daniel-ospina/swarm
+          fetch-depth: 0
+          path: swarm
+          token: ${{ secrets.AGENT_INFRA_READ_TOKEN || github.token }}
+      - name: Bash syntax check (vendored scripts + drift gate)
+        run: bash -n scripts/checkout_guard.sh scripts/parallel_work_check.sh scripts/check-vendor-drift.sh
+      - name: Vendor drift gate (manifest)
+        env:
+          SWARM_ROOT: ${{ github.workspace }}/swarm
+        run: scripts/check-vendor-drift.sh --manifest

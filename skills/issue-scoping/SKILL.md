@@ -84,17 +84,29 @@ This prevents silent scope creep — the user knows what was found and can prior
 
 ## Process Flow
 
-> **🛡️ Mandatory parallel-work checkpoint (#4907):** BEFORE problem-diverge, run
-> `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh start` (C1 —
+> **🛡️ Mandatory parallel-work checkpoint (#4907):** BEFORE problem-diverge,
+> resolve `$AGENT_INFRA_PATH` — a required prerequisite per AGENTS.md (NO
+> `$HOME/agent-infra` default fiction; if unset, the pending-gate guidance
+> says to set it) — and run the absolute path
+> `…/scripts/parallel_work_check.sh start` (C1 —
 > closed-issue DUP_FIX search; delegates the behind-origin check to
-> checkout_guard; `$PARALLEL_CHECK_BIN` overrides the path — the escape
-> requires the `.sh|.py` suffix; prefer the resolved absolute path (no-suffix
-> bare names fail).
-> AFTER scope converges (before solution-diverge), run
-> `/Users/danielospina/swarm/operations/coordination/parallel_work_check.sh scope` (C2) and write the card's
+> checkout_guard) as `env CHECKOUT_GUARD_ENFORCE=1 <resolved-path> start`.
+> The pending-gate guidance prints the resolved command — use that form (it is
+> escape-regex-safe); do NOT run `$PARALLEL_CHECK_BIN`/`env
+> PARALLEL_CHECK_BIN=…` at the gate (not in the escape allowlist); the
+> `.sh|.py` suffix is required (no-suffix bare names fail).
+> AFTER scope converges (before solution-diverge), resolve `$AGENT_INFRA_PATH`
+> (same required prerequisite as the start step; use the pending-gate
+> guidance's printed form — do NOT run `$PARALLEL_CHECK_BIN`/`env
+> PARALLEL_CHECK_BIN=…` at the gate (not in the escape allowlist); the
+> `.sh|.py` suffix is required) and run the absolute path
+> `…/scripts/parallel_work_check.sh scope` (C2) and write the card's
 > `touched_paths` via `update_touched_paths`. A CLEAR verdict writes the PASS
 > token (10-min TTL); the checkpoint gate (fail-closed) blocks progression
-> without it. Set `CHECKOUT_GUARD_ENFORCE=1` in the session env at these steps
+> without it. No-board pipelines (all board/card/agent/paths signals empty)
+> pass the checkpoints via the distinguishable `CLEAR  no-board-skip`
+> verdict — the checker's predicate treats empty/whitespace signals as absent.
+> Set `CHECKOUT_GUARD_ENFORCE=1` in the session env at these steps
 > so the stale-base guard is fail-closed, not dry-run. At a pending gate:
 > `read`/`loop_enforcer` are the in-session escape; the operator force-pass is
 > `/tmp/parallel-check-force.json` (one-shot, 60-min TTL, repo-bound).

@@ -1,0 +1,55 @@
+{
+  "base_rev": "29dd67e8",
+  "source": "https://github.com/daniel-ospina/swarm",
+  "generated": "2026-08-30",
+  "files": {
+    "scripts/checkout_guard.sh": {
+      "identical@base": true,
+      "base_sha256": "ed1877cf9d2f7791b3d61578aabaa2af545b6642ed4159c1c70d571e2558023c",
+      "patched_sha256": "ed1877cf9d2f7791b3d61578aabaa2af545b6642ed4159c1c70d571e2558023c"
+    },
+    "scripts/parallel_work_check.sh": {
+      "identical@base": false,
+      "patch": "scripts/.vendor-patches/parallel_work_check.sh.patch",
+      "base_sha256": "f26569c60ea1f5559591f73cbb846cc221d4bfc6cf12aa2c99a5fb25ccf7b7a2",
+      "patched_sha256": "23f99eade41bb58ea6c3cd886c98583303d91f20ad077d9e62bf951a9b1feb88"
+    },
+    "scripts/parallel_work_check.py": {
+      "identical@base": false,
+      "patch": "scripts/.vendor-patches/parallel_work_check.py.patch",
+      "base_sha256": "fa71e6b5c1e135a7a48462facb5a1b67d7d7296584918b4b4de3fab4d75f7581",
+      "patched_sha256": "a91dcad392ac3aa8f61472520879e4b26038832df9775bee5cd372c82c8cab36"
+    },
+    "scripts/test_parallel_work_check.py": {
+      "identical@base": false,
+      "patch": "scripts/.vendor-patches/test_parallel_work_check.py.patch",
+      "base_sha256": "2ad53d8ae271336d2b4cd87048078a125c8bb9cc49280096ca234609f7cf4b64",
+      "patched_sha256": "2b496a64354dec81d752caec42a5d6c42318efa7ded26f24e575ca5ccf7d0ec8"
+    },
+    "scripts/fake_supabase.py": {
+      "identical@base": true,
+      "base_sha256": "d3f08c1329a6946ac89bfaa4d1522d97ead9896d27da467f613fdf07e251b7da",
+      "patched_sha256": "d3f08c1329a6946ac89bfaa4d1522d97ead9896d27da467f613fdf07e251b7da"
+    },
+    "connectors/__init__.py": {
+      "identical@base": true,
+      "base_sha256": "fbcda65af652877fcb8de731b65a637a116aade33192ee1c10d6017ab0d87ff0",
+      "patched_sha256": "fbcda65af652877fcb8de731b65a637a116aade33192ee1c10d6017ab0d87ff0"
+    },
+    "connectors/supabase_swarm.py": {
+      "identical@base": true,
+      "base_sha256": "4b29a2895e846a844f682747b5846aa55915dc831420e334ecbdf3cc2919ee8d",
+      "patched_sha256": "4b29a2895e846a844f682747b5846aa55915dc831420e334ecbdf3cc2919ee8d"
+    },
+    "connectors/supabase_org.py": {
+      "identical@base": true,
+      "base_sha256": "8454dd12b36ba4111f5328e0cd91af9698712e535aded3486409c7a6e8bba871",
+      "patched_sha256": "8454dd12b36ba4111f5328e0cd91af9698712e535aded3486409c7a6e8bba871"
+    },
+    "connectors/hosted_tortoise.py": {
+      "identical@base": true,
+      "base_sha256": "fca9d4f4b2505fdeeb41b8bfab33ebae91e45fd9554ba4fa3363298c95fd31b4",
+      "patched_sha256": "fca9d4f4b2505fdeeb41b8bfab33ebae91e45fd9554ba4fa3363298c95fd31b4"
+    }
+  }
+}

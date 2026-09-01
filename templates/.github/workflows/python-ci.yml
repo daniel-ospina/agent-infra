@@ -44,7 +44,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
+      # #383 — skip-empty guard: skip the extras install when install-extras
+      # is '' (no package to install) or the repo has no packaging metadata.
       - run: pip install -e "${{ inputs.install-extras }}"
+        if: inputs.install-extras != '' && (hashFiles('pyproject.toml') != '' || hashFiles('setup.py') != '' || hashFiles('setup.cfg') != '')
       - run: pip install pytest pytest-timeout
       - run: ${{ inputs.test-command }}
 
@@ -67,7 +70,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
+      # #383 — skip-empty guard: skip the extras install when install-extras
+      # is '' (no package to install) or the repo has no packaging metadata.
       - run: pip install -e "${{ inputs.install-extras }}"
+        if: inputs.install-extras != '' && (hashFiles('pyproject.toml') != '' || hashFiles('setup.py') != '' || hashFiles('setup.cfg') != '')
       - run: pip install mypy
       - name: Set typecheck target
         run: |

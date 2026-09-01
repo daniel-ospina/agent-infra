@@ -64,6 +64,8 @@ When choosing between two approaches, prefer the one that produces the better ou
 
 <!-- REPO-SPECIFIC: Add your skill compliance table here. Map trigger → skill → consequence of skipping. -->
 
+**Vendored swarm artifacts** (scripts/parallel_work_check.*, scripts/checkout_guard.sh, connectors/): see `VENDOR.md` — base rev + patch ledger + drift gate (`scripts/check-vendor-drift.sh --manifest`).
+
 ## ⛔ HARD RULE: Skill Compliance
 
 **Skills are NON-NEGOTIABLE. No shortcuts, no "I know this one," no skipping because you're in a hurry.**
