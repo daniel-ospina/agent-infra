@@ -76,11 +76,27 @@ const WS_OPEN = 1; // WebSocket.readyState === OPEN (Node's undici WebSocket)
 // takeover. See module header point 8.
 const OWNER_LOCK_FILE_DEFAULT = join(homedir(), ".pi", "agent", "slack-socket-owner.json");
 const HEARTBEAT_MS = 30_000;      // owner refreshes its lease every 30s
-const OWNER_STALE_MS = 90_000;    // lease dead after 90s without a heartbeat
 const OWNER_RECHECK_MS = 30_000;  // non-owners re-check for takeover every 30s
 const SATURATION_BACKOFF_MS = 10 * 60_000; // app-level saturation → 10 min, not 60s
 const STALE_UNLINK_GRACE_MS = 2000; // unparseable lease younger than this = a live claimant mid-write
 const TAKEOVER_SUFFIX = ".takeover"; // serializes rm→claim so racers never delete a fresh lease
+// ── #386 lease fencing ─────────────────────────────────────────────────────
+// No single 90s staleness tier (the ping-pong source). One rule: a lease is
+// stale when the pid is DEAD, a ZOMBIE, or its identity (boot time) MISMATCHES
+// (→ takeover at the next recheck, ≤ ~30s + jitter, as before) OR the pid is
+// alive+verified with no heartbeat within FROZEN_OWNER_STALE_MS (Jetsam-frozen
+// sessions — the machine-wide freeze keeps them frozen, so the threshold is
+// 2.2× the heartbeat window). Displaced owners re-elect after DISPLACED_GRACE_MS
+// (one lease duration + jitter) — never on the 1s reconnect loop. Thresholds
+// are injectable: state.<x> ?? env SLACK_SOCKET_* ?? default (getter-level,
+// mirroring ownerLockPath — #386 D5).
+const FROZEN_OWNER_STALE_MS = 200_000; // alive-verified pid: stale after 200s w/o heartbeat (~4 min worst case)
+const DISPLACED_GRACE_MS = 90_000;     // displaced owner waits ~one lease duration + jitter before re-electing
+const LEASE_HOLD_MAX_FAILS = 3;        // hold the lease across transient drops; release after this many backoffs (~7s)
+const MIN_STABLE_CONNECT_MS = HEARTBEAT_MS; // hello resets the fail streak only if the prior connection survived ≥ this
+const PID_PROBE_TTL_MS = 30_000;       // pid boot-time probe memo TTL (matches HEARTBEAT_MS)
+const RECHECK_JITTER_FRAC = 0.3;       // ±30% jitter on recheck/grace timers (k8s precedent — de-synchronize N sessions)
+const PID_BOOT_TOLERANCE_MS = 2000;    // ±2s identity comparison tolerance
 
 // ── Types ────────────────────────────────────────────
 
@@ -103,6 +119,15 @@ export interface SocketModeState {
   ownerRecheckTimer: NodeJS.Timeout | null; // 30s re-check while another owner holds
   ownerSkippedLogged: boolean; // one-line skip message, once per skip phase
   lockErrorLogged: boolean; // one-line lease-write-failure warn, once per failure phase
+  // ── #386 lease fencing ──
+  leaseLost: boolean; // displaced by a foreign takeover — gates reconnect + grace re-election
+  displacedReelectTimer: NodeJS.Timeout | null; // the ONLY re-entry timer while leaseLost
+  connectedAt: number | null; // epoch ms of the last successful hello (flap detection, D3)
+  // injectable thresholds (tests) — getter-level env fallback SLACK_SOCKET_* (D5)
+  frozenOwnerStaleMs?: number;
+  displacedGraceMs?: number;
+  leaseHoldMaxFails?: number;
+  minStableConnectMs?: number;
 }
 
 interface SocketEnvelope {
@@ -116,6 +141,11 @@ interface SocketEnvelope {
 interface OwnerRecord {
   pid: number;
   startTime: string;
+  /** ms epoch boot time of the holder process — pid identity (#386 D1).
+   * REQUIRED: claim writes it from ownBootTimeMs(); refresh PRESERVES it
+   * (rec?.bootTime ?? ownBootTimeMs()). Old leases without it are
+   * identity-unverifiable → frozen tier, never an aggressive steal. */
+  bootTime: number;
   heartbeat: string;
 }
 
@@ -551,6 +581,31 @@ function readOwnerRecord(state: SocketModeState): OwnerRecord | null {
   }
 }
 
+/** #386 threshold getters — state override ?? env SLACK_SOCKET_* ?? default.
+ * Getter-level (not receiver-start) so bare-state tests can inject via env. */
+function numEnv(name: string, dflt: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : dflt;
+}
+function frozenStaleMs(state: SocketModeState): number {
+  return state.frozenOwnerStaleMs ?? numEnv("SLACK_SOCKET_FROZEN_STALE_MS", FROZEN_OWNER_STALE_MS);
+}
+function displacedGraceMs(state: SocketModeState): number {
+  return state.displacedGraceMs ?? numEnv("SLACK_SOCKET_DISPLACED_GRACE_MS", DISPLACED_GRACE_MS);
+}
+function leaseHoldMaxFails(state: SocketModeState): number {
+  return state.leaseHoldMaxFails ?? numEnv("SLACK_SOCKET_LEASE_HOLD_MAX_FAILS", LEASE_HOLD_MAX_FAILS);
+}
+function minStableConnectMs(state: SocketModeState): number {
+  return state.minStableConnectMs ?? numEnv("SLACK_SOCKET_MIN_STABLE_CONNECT_MS", MIN_STABLE_CONNECT_MS);
+}
+
+/** ±~30% jitter — N sessions on a fixed cadence converge on the same instant
+ * (k8s lease-controller precedent). */
+function jittered(ms: number): number {
+  return Math.round(ms * (1 - RECHECK_JITTER_FRAC + Math.random() * 2 * RECHECK_JITTER_FRAC));
+}
+
 /** Signal-less liveness probe (SIGTERM-safe): pid exists? Never throws. */
 function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -562,12 +617,110 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-/** Lease is dead: pid gone, or no heartbeat within OWNER_STALE_MS. */
-function ownerRecordStale(rec: OwnerRecord): boolean {
+/** Parse macOS `ps -o lstart=` (LC_ALL=C) → ms epoch. Pure + exported for tests. */
+export function parsePsLstart(s: string): number | null {
+  const m = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +(\d+) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/.exec(s.trim());
+  if (!m) return null;
+  const months: Record<string, number> = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+  const ms = Date.UTC(Number(m[7]), months[m[2]] ?? -1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]));
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/** Parse Linux /proc/<pid>/stat field 22 (starttime in clock ticks since boot,
+ * after the last ')' — comm may contain parens/spaces) + /proc/stat btime.
+ * USER_HZ = 100 on mainstream kernels. Pure + exported for tests. */
+export function parseProcStarttime(stat: string, btimeSec: number): number | null {
+  const close = stat.lastIndexOf(")");
+  if (close < 0) return null;
+  const fields = stat.slice(close + 1).trim().split(/\s+/);
+  // after ')': index 0 = field 3 (state), so field 22 = index 19
+  const startTicks = Number(fields[19]);
+  if (!Number.isFinite(startTicks)) return null;
+  return Math.round((startTicks / 100) * 1000 + btimeSec * 1000);
+}
+
+/** Probe a pid's boot time + zombie state from the OS (memoized 30s TTL,
+ * load-scaled timeout, LC_ALL=C). Zombie detection is FOLDED INTO the probe
+ * (one execSync parses both). Null bootTime / true zombie on failure. Never
+ * throws. */
+const pidProbeCache = new Map<number, { bootTime: number | null; zombie: boolean; at: number }>();
+export function probePidBootTime(pid: number): { bootTime: number | null; zombie: boolean } {
+  const now = Date.now();
+  const cached = pidProbeCache.get(pid);
+  if (cached && now - cached.at < PID_PROBE_TTL_MS) return cached;
+  let bootTime: number | null = null;
+  let zombie = false;
+  // Load computed ONCE per probe and passed explicitly — per-probe
+  // getSystemLoad() would double the blocking shell-outs (D6).
+  const load = getSystemLoad();
+  const tmo = loadScaledTimeoutMs(2000, load);
+  try {
+    if (process.platform === "darwin") {
+      const out = execSync(`ps -p ${pid} -o lstart= -o state=`, {
+        encoding: "utf8", timeout: tmo, env: { ...process.env, LC_ALL: "C" },
+      }).trim();
+      if (out) {
+        const last = out.lastIndexOf(" ");
+        const state = out.slice(last + 1);
+        zombie = state === "Z";
+        if (!zombie) bootTime = parsePsLstart(out.slice(0, last));
+      }
+    } else if (process.platform === "linux") {
+      const stat = execSync(`cat /proc/${pid}/stat`, { encoding: "utf8", timeout: tmo }).trim();
+      const close = stat.lastIndexOf(")");
+      if (close >= 0) {
+        const fields = stat.slice(close + 1).trim().split(/\s+/);
+        zombie = fields[0] === "Z";
+        if (!zombie) {
+          const btimeOut = execSync(`awk '/^btime / {print $2}' /proc/stat`, { encoding: "utf8", timeout: tmo }).trim();
+          const btime = Number(btimeOut);
+          if (Number.isFinite(btime)) bootTime = parseProcStarttime(stat, btime);
+        }
+      }
+    }
+  } catch {
+    // unverifiable — caller falls to the frozen tier, never an aggressive steal
+  }
+  pidProbeCache.set(pid, { bootTime, zombie, at: now });
+  return { bootTime, zombie };
+}
+
+let ownBootTime: number | null = null;
+/** Boot time of THIS process (ms epoch) from the SAME kernel-stored source
+ * the identity probe reads (never Date.now()-derived — a wall-clock value
+ * shifts with NTP and would turn a healthy owner into an identity mismatch,
+ * #386 D1). Cached once; 0 on probe failure = identity-unverifiable (frozen
+ * tier for everyone — never an aggressive steal). */
+export function ownBootTimeMs(): number {
+  if (ownBootTime === null) ownBootTime = probePidBootTime(process.pid).bootTime ?? 0;
+  return ownBootTime;
+}
+
+/** Lease dead? Explicit check order (#386 D1 — no 90s fallback tier):
+ *  1. pid gone (kill 0)            → stale immediately (never probes identity)
+ *  2. zombie                       → stale immediately
+ *  3. identity mismatch (boot ±2s) → stale immediately (pid-reuse = dead owner)
+ *  4. heartbeat NaN                → stale (pre-existing, self-healing)
+ *  5. alive + verified OR unverifiable → stale after FROZEN_OWNER_STALE_MS */
+function ownerRecordStale(rec: OwnerRecord, state: SocketModeState): boolean {
   if (!pidAlive(rec.pid)) return true;
+  const probe = probePidBootTime(rec.pid);
+  if (probe.zombie) return true;
+  if (probe.bootTime !== null && Number.isFinite(rec.bootTime) && rec.bootTime > 0) {
+    if (Math.abs(probe.bootTime - rec.bootTime) > PID_BOOT_TOLERANCE_MS) return true;
+  }
   const hb = Date.parse(rec.heartbeat);
   if (Number.isNaN(hb)) return true;
-  return Date.now() - hb > OWNER_STALE_MS;
+  return Date.now() - hb > frozenStaleMs(state);
+}
+
+/** #386 hold-across-transients: release the lease only when the fail streak
+ * crossed LEASE_HOLD_MAX_FAILS (checked BEFORE scheduleReconnect increments —
+ * a threshold-3 chain releases on the 4th drop ≈ 1+2+4s backoffs). Transient
+ * single drops keep the lease (no steal window); a wedged session still
+ * releases (~7s) so the machine converges (#189 starvation property). */
+function releaseOwnerLockPastMaxFails(state: SocketModeState): void {
+  if (state.consecutiveFails >= leaseHoldMaxFails(state)) releaseOwnerLock(state);
 }
 
 /** Write the current heartbeat into the lease (atomic tmp+rename, pid-unique
@@ -580,21 +733,25 @@ export function refreshOwnerHeartbeat(state: SocketModeState): void {
     if (rec && rec.pid !== process.pid) {
       // Lost the lease: another session took over after our heartbeat lapsed
       // (or won the claim race). Yield FULLY — close the connection too, so
-      // "one lease ⇔ one connection" holds, then re-enter the election.
-      // (Review #189: the displaced owner used to keep its WS open — an
-      // orphaned slot against Slack's 10-connection cap.)
+      // "one lease ⇔ one connection" holds, then re-enter the election AFTER
+      // the displaced-owner grace (never on the 1s reconnect loop — the
+      // ping-pong source, #386 D4).
       state.ownsLock = false;
       stopHeartbeat(state);
-      console.warn(`[slack-bridge] ⚠️ owner lease taken over by pid ${rec.pid} — closing connection, re-electing`);
+      state.leaseLost = true;
+      state.consecutiveFails = 0; // fresh backoff after grace (D8)
+      console.warn(`[slack-bridge] ⚠️ owner lease taken over by pid ${rec.pid} — closing connection, re-electing after grace`);
+      if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
+      if (state.ownerRecheckTimer) { clearTimeout(state.ownerRecheckTimer); state.ownerRecheckTimer = null; }
       try {
         state.ws?.close(1000, "lease lost");
         state.ws = null;
       } catch { /* already closed */ }
-      if (state.wantRunning) scheduleOwnerRecheck(state);
+      if (state.wantRunning) scheduleDisplacedReelect(state);
       return;
     }
     const now = new Date().toISOString();
-    const record: OwnerRecord = { pid: process.pid, startTime: rec?.startTime ?? now, heartbeat: now };
+    const record: OwnerRecord = { pid: process.pid, startTime: rec?.startTime ?? now, bootTime: rec?.bootTime ?? ownBootTimeMs(), heartbeat: now };
     const tmp = `${f}.${process.pid}.tmp`;
     // 0600 like the claim — the tmp mode survives the rename (review #189).
     writeFileSync(tmp, JSON.stringify(record, null, 2), { mode: 0o600, encoding: "utf-8" });
@@ -635,8 +792,8 @@ function claimLeaseFile(f: string, record: OwnerRecord): "won" | "lost" | "error
 
 /** What sits at the lease path right now? "takeover" = safe to remove and
  * re-claim; "backoff" = a live owner/claimant — do NOT touch (review #189). */
-function takeoverTargetKind(f: string, raced: OwnerRecord | null): "takeover" | "backoff" {
-  if (raced) return ownerRecordStale(raced) ? "takeover" : "backoff";
+function takeoverTargetKind(f: string, raced: OwnerRecord | null, state: SocketModeState): "takeover" | "backoff" {
+  if (raced) return ownerRecordStale(raced, state) ? "takeover" : "backoff";
   // raced === null: absent, or unparseable (a live claimant between openSync
   // and writeSync — its file is microseconds old; a crashed claimant left an
   // empty file). Never unlink a FRESH unparseable file — that would delete a
@@ -698,24 +855,24 @@ export function acquireOwnerLock(state: SocketModeState): boolean {
   const f = ownerLockPath(state);
   // Fast path: a live owner blocks without touching the file.
   const rec = readOwnerRecord(state);
-  if (rec && !ownerRecordStale(rec)) return false; // another live owner
+  if (rec && !ownerRecordStale(rec, state)) return false; // another live owner
   try {
     mkdirSync(dirname(f), { recursive: true });
     const now = new Date().toISOString();
-    const record: OwnerRecord = { pid: process.pid, startTime: now, heartbeat: now };
+    const record: OwnerRecord = { pid: process.pid, startTime: now, bootTime: ownBootTimeMs(), heartbeat: now };
     let result = claimLeaseFile(f, record);
     if (result === "lost") {
       // A racer claimed first, or a stale/corrupt record sits there (O_EXCL
       // cannot overwrite). Decide what the current file is BEFORE touching it:
       const raced = readOwnerRecord(state);
-      if (raced && !ownerRecordStale(raced)) return false; // a live owner won
-      if (takeoverTargetKind(f, raced) === "backoff") return false; // live claimant mid-write
+      if (raced && !ownerRecordStale(raced, state)) return false; // a live owner won
+      if (takeoverTargetKind(f, raced, state) === "backoff") return false; // live claimant mid-write
       // Serialize the dangerous rm→claim behind the takeover lock: two
       // racers can never delete each other's fresh claim (review #189 P1).
       if (!claimTakeoverLock(state, f)) return false; // another takeover in progress
       try {
         const raced2 = readOwnerRecord(state);
-        if (raced2 && !ownerRecordStale(raced2)) return false; // they won while we queued
+        if (raced2 && !ownerRecordStale(raced2, state)) return false; // they won while we queued
         try { rmSync(f, { force: true }); } catch { /* ignore */ }
         result = claimLeaseFile(f, record);
         if (result === "won") {
@@ -736,6 +893,8 @@ export function acquireOwnerLock(state: SocketModeState): boolean {
     }
     state.ownsLock = true;
     state.lockErrorLogged = false;
+    state.leaseLost = false; // #386 D2 — acquire-success is the single clear point
+    if (state.displacedReelectTimer) { clearTimeout(state.displacedReelectTimer); state.displacedReelectTimer = null; }
     startHeartbeat(state);
     return true;
   } catch (e: any) {
@@ -790,16 +949,40 @@ function isSaturationReason(reason: string | null | undefined): boolean {
 
 /** Non-owner sessions re-check periodically: the owner may have died (stale
  * lease → takeover) or released (session shutdown). Silent after the first
- * skip message — no log spam (#188). */
+ * skip message — no log spam (#188). Jittered (#386 D8). */
 function scheduleOwnerRecheck(state: SocketModeState): void {
   if (state.ownerRecheckTimer) return;
+  if (state.leaseLost) return; // displaced — the grace re-election owns re-entry (#386)
+  const delay = jittered(OWNER_RECHECK_MS);
   state.ownerRecheckTimer = setTimeout(() => {
     state.ownerRecheckTimer = null;
+    if (state.wantRunning && !state.ownsLock && !state.saturationTimer && !state.leaseLost) {
+      void openSocket(state);
+    }
+  }, delay);
+  state.ownerRecheckTimer.unref();
+}
+
+/** #386 displaced-owner grace re-election: after a foreign takeover, wait one
+ * lease duration (+ jitter) before re-entering the election. Double-armed
+ * timers opened a second live WS (D4) — the grace timer is the ONLY re-entry
+ * path while leaseLost; re-yield re-schedules it (single timer). */
+function scheduleDisplacedReelect(state: SocketModeState): void {
+  if (!state.wantRunning || !state.leaseLost) return;
+  if (state.saturationTimer) return;
+  if (state.displacedReelectTimer) {
+    clearTimeout(state.displacedReelectTimer);
+    state.displacedReelectTimer = null;
+  }
+  const grace = jittered(displacedGraceMs(state));
+  console.log(`[slack-bridge] ⏳ re-electing Socket Mode owner after grace (${Math.round(grace / 1000)}s, jittered)`);
+  state.displacedReelectTimer = setTimeout(() => {
+    state.displacedReelectTimer = null;
     if (state.wantRunning && !state.ownsLock && !state.saturationTimer) {
       void openSocket(state);
     }
-  }, OWNER_RECHECK_MS);
-  state.ownerRecheckTimer.unref();
+  }, grace);
+  state.displacedReelectTimer.unref();
 }
 
 // ── Verdict write contract (approvals.json) ──────────
@@ -1307,8 +1490,17 @@ export function handleSocketMessage(event: MessageEvent, ws: WebSocket, state: S
     if (!env || typeof env !== "object") return;
 
     if (env.type === "hello") {
-      // Connected — reset the reconnect backoff (plan §Phase 5)
-      state.consecutiveFails = 0;
+      // Connected — reset the reconnect backoff ONLY when the previous
+      // connection survived the min-stable window (#386 D3 flap bound): a
+      // connect→hello→instant-drop flap must accumulate toward the lease
+      // release threshold instead of resetting forever (a flapping owner
+      // would hold the lease indefinitely). First connection / pre-hello
+      // drop (connectedAt null) resets normally.
+      const now = Date.now();
+      if (state.connectedAt === null || now - state.connectedAt >= minStableConnectMs(state)) {
+        state.consecutiveFails = 0;
+      }
+      state.connectedAt = now;
       console.log("[slack-bridge] 🔌 Socket Mode connected (hello)");
       return;
     }
@@ -1374,19 +1566,22 @@ export function connectSocket(url: string, state: SocketModeState): WebSocket {
     // On failed connection establishment undici fires only `error` (no
     // `onclose`); on mid-session drops it fires error THEN close. Scheduling
     // here covers both — scheduleReconnect is idempotent (single timer).
-    // Saturation backoff (#188) owns the retry when set — never loop here.
-    releaseOwnerLock(state); // no live connection → no lease (review #189)
-    if (state.saturationTimer) return;
+    // Displaced (#386) and saturation (#188) backoffs own the retry — never
+    // loop here. Transient drops HOLD the lease (release only past the
+    // hold threshold — no steal window for healthy drops, #386 D3).
+    if (state.leaseLost || state.saturationTimer) return;
+    releaseOwnerLockPastMaxFails(state);
     scheduleReconnect(state);
   };
   ws.onclose = (event) => {
     console.log(`[slack-bridge] 🔌 Socket Mode disconnected (code=${(event as any)?.code ?? "?"}, reason=${(event as any)?.reason ?? ""})`);
-    if (state.ws === ws) state.ws = null;
-    // The connection is gone — the lease goes with it. Other sessions may
-    // re-elect; our own retry re-acquires. A stuck session (bad token, dead
-    // wss URL) must not starve the machine (review #189).
-    releaseOwnerLock(state);
-    if (state.saturationTimer) return; // saturation backoff owns the retry (#188)
+    if (state.ws === ws) state.ws = null; // BEFORE the guards — a stale ws must never linger
+    // The connection is gone. Transient drops hold the lease (#386 D3); a
+    // wedged session (bad token, dead wss URL) still releases past the hold
+    // threshold so it cannot starve the machine (#189). Displaced/saturated
+    // sessions yield to their own retry owners.
+    if (state.leaseLost || state.saturationTimer) return;
+    releaseOwnerLockPastMaxFails(state);
     scheduleReconnect(state);
   };
   return ws;
@@ -1408,7 +1603,7 @@ async function openSocket(state: SocketModeState): Promise<void> {
         // owner vs an unwritable lease path — wrong diagnosis sends users
         // hunting for phantom sessions.
         const held = readOwnerRecord(state);
-        const cause = held && !ownerRecordStale(held)
+        const cause = held && !ownerRecordStale(held, state)
           ? `another pi session owns the connection (${ownerLockPath(state)})`
           : `could not claim the owner lease (${ownerLockPath(state)})`;
         console.log(
@@ -1425,7 +1620,7 @@ async function openSocket(state: SocketModeState): Promise<void> {
     res = await callAppsConnectionsOpen(state.appToken, state.apiUrl);
   } catch (e: any) {
     console.error(`[slack-bridge] ❌ apps.connections.open threw: ${e?.message ?? e}`);
-    releaseOwnerLock(state); // no live connection → no lease (#189)
+    releaseOwnerLockPastMaxFails(state); // #386 hold-across-transients (openSocket failure path, D3)
     scheduleReconnect(state);
     return;
   }
@@ -1436,7 +1631,7 @@ async function openSocket(state: SocketModeState): Promise<void> {
       return;
     }
     console.error(`[slack-bridge] ❌ apps.connections.open failed: ${res.error ?? "no wss url"} — scheduling reconnect`);
-    releaseOwnerLock(state); // a broken config must not starve other sessions (#189)
+    releaseOwnerLockPastMaxFails(state); // #386 hold-across-transients (D3)
     scheduleReconnect(state);
     return;
   }
@@ -1444,7 +1639,7 @@ async function openSocket(state: SocketModeState): Promise<void> {
     state.ws = connectSocket(res.url, state);
   } catch (e: any) {
     console.error(`[slack-bridge] ❌ WebSocket connect failed: ${e?.message ?? e}`);
-    releaseOwnerLock(state); // no live connection → no lease (#189)
+    releaseOwnerLockPastMaxFails(state); // #386 hold-across-transients (D3)
     scheduleReconnect(state);
   }
 }
@@ -1453,6 +1648,7 @@ async function openSocket(state: SocketModeState): Promise<void> {
  * Fresh apps.connections.open per attempt (never reuse old WSS URLs). */
 function scheduleReconnect(state: SocketModeState): void {
   if (!state.wantRunning) return;
+  if (state.leaseLost) return; // displaced — the grace re-election owns retry (#386 D9 choke-point)
   if (state.reconnectTimer) return; // already scheduled
   const backoff = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** state.consecutiveFails);
   state.consecutiveFails++;
@@ -1528,6 +1724,11 @@ export function stopSocketModeReceiver(state: SocketModeState): void {
       clearTimeout(state.saturationTimer);
       state.saturationTimer = null;
     }
+    if (state.displacedReelectTimer) {
+      clearTimeout(state.displacedReelectTimer);
+      state.displacedReelectTimer = null;
+    }
+    state.leaseLost = false; // #386 — a fresh receiver starts clean
     releaseOwnerLock(state);
     if (state.ws) {
       const ws = state.ws;

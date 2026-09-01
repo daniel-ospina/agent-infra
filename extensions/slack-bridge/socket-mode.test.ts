@@ -41,11 +41,17 @@ import {
   loadScaledTimeoutMs, // #209: load-aware shell-out timeout scaling
   getSystemLoad, // #209: load probe (non-negative on this machine)
   type SocketModeState,
+  ownBootTimeMs, // #386 pid identity
+  parsePsLstart, // #386 pure parser (macOS)
+  parseProcStarttime, // #386 pure parser (Linux)
+  probePidBootTime, // #386 pid probe
 } from "./socket-mode.js";
 
 // ── Environment hygiene ─────────────────────────────
 for (const k of [
   "SLACK_APP_TOKEN", "SLACK_API_URL", "SLACK_APPROVAL_FILE", "SLACK_APPROVAL_STATE_FILE",
+  "SLACK_SOCKET_FROZEN_STALE_MS", "SLACK_SOCKET_DISPLACED_GRACE_MS",
+  "SLACK_SOCKET_LEASE_HOLD_MAX_FAILS", "SLACK_SOCKET_MIN_STABLE_CONNECT_MS",
 ]) {
   delete process.env[k];
 }
@@ -555,6 +561,11 @@ async function startConnected(opts: {
   const { state, wsServer } = await startConnected();
   assert(state.ws !== null, "hello: socket connected (state.ws set)");
   state.consecutiveFails = 5; // simulate a fail streak, then prove hello resets it
+  // #386 D3 flap bound: hello resets the streak only when the previous
+  // connection survived minStableConnectMs — pin connectedAt old so the
+  // stable-reset path is deterministic regardless of event-loop timing
+  // (the inter-hello gap here is machine-speed, ~1-25ms).
+  state.connectedAt = Date.now() - 60_000;
   wsServer.sendText(JSON.stringify({ type: "hello", num_connections: 1 }));
   const reset = await waitFor(() => state.consecutiveFails === 0, 2000);
   assert(reset, "hello: backoff reset to 0");
@@ -564,6 +575,10 @@ async function startConnected(opts: {
 
 // ── Test 4: disconnect → reconnect with backoff ──────
 {
+  // #386 D3: the auto-hello on the new connection resets the streak only if
+  // the previous connection survived minStableConnectMs — inject 500ms (the
+  // two hellos are ~1010ms apart under the 1s backoff — safe margin).
+  process.env.SLACK_SOCKET_MIN_STABLE_CONNECT_MS = "500";
   const { state, api, wsServer } = await startConnected();
   assert(wsServer.connections === 1, "disconnect: initial connection");
   wsServer.dropClient(); // network drop → onclose → scheduleReconnect
@@ -576,6 +591,7 @@ async function startConnected(opts: {
   stopSocketModeReceiver(state);
   await api.kill();
   await wsServer.kill();
+  delete process.env.SLACK_SOCKET_MIN_STABLE_CONNECT_MS;
 }
 
 // ── Test 5: envelope ACK ─────────────────────────────
@@ -1326,16 +1342,46 @@ async function startConnected(opts: {
   assert(base.ownsLock === true, "lease: ownsLock after takeover");
   const rec = JSON.parse(readFileSync(ownerFile, "utf-8"));
   assert(rec.pid === process.pid, "lease: lease carries our pid");
-  // Heartbeat refresh advances the stamp in place (pid preserved).
+  // Heartbeat refresh advances the stamp in place (pid preserved). #386 D1:
+  // bootTime must be PRESERVED on refresh (never re-derived from Date.now()).
   const hb1 = Date.parse(rec.heartbeat);
   await sleep(1050); // guarantee a distinct millisecond stamp
   refreshOwnerHeartbeat(base);
   const rec2 = JSON.parse(readFileSync(ownerFile, "utf-8"));
   assert(Date.parse(rec2.heartbeat) > hb1, "lease: heartbeat advanced on refresh");
   assert(rec2.pid === process.pid, "lease: refresh preserves ownership");
+  assert(rec2.bootTime === rec.bootTime && Number.isFinite(rec.bootTime) && rec.bootTime > 0,
+    "lease: refresh preserves bootTime (#386 D1)");
   assert((readFileSync(ownerFile, "utf-8") !== ""), "lease: lease parses");
   stopSocketModeReceiver(base);
   assert(!existsSync(ownerFile), "lease: stop releases the lease");
+  // #386 frozen tier: alive pid + VERIFIED identity (real bootTime) + heartbeat
+  // inside FROZEN_OWNER_STALE_MS → BLOCKED (Jetsam-frozen owner is not stolen
+  // early — the 90s ping-pong source); heartbeat beyond the frozen threshold →
+  // takeover. Identity-mismatch (wrong bootTime) + fresh heartbeat → takeover
+  // immediately (pid-reuse = dead owner). Unverifiable (no bootTime) → frozen.
+  const ownBoot = ownBootTimeMs();
+  const hb90sAgo = new Date(Date.now() - 100_000).toISOString();
+  writeFileSync(ownerFile, JSON.stringify({
+    pid: process.pid, startTime: now, bootTime: ownBoot, heartbeat: hb90sAgo,
+  }));
+  assert(acquireOwnerLock(base) === false, "#386 frozen: alive+verified pid, heartbeat 100s old → blocked (frozen tier)");
+  const hb250sAgo = new Date(Date.now() - 250_000).toISOString();
+  writeFileSync(ownerFile, JSON.stringify({
+    pid: process.pid, startTime: now, bootTime: ownBoot, heartbeat: hb250sAgo,
+  }));
+  assert(acquireOwnerLock(base) === true, "#386 frozen: alive+verified pid, heartbeat 250s old → takeover");
+  stopSocketModeReceiver(base);
+  writeFileSync(ownerFile, JSON.stringify({
+    pid: process.pid, startTime: now, bootTime: ownBoot - 10_000_000, heartbeat: now,
+  }));
+  assert(acquireOwnerLock(base) === true, "#386 identity: bootTime mismatch + fresh heartbeat → immediate takeover");
+  stopSocketModeReceiver(base);
+  writeFileSync(ownerFile, JSON.stringify({
+    pid: process.pid, startTime: now, heartbeat: now, // no bootTime → unverifiable
+  }));
+  assert(acquireOwnerLock(base) === false, "#386 identity: unverifiable lease → frozen tier, blocked");
+  stopSocketModeReceiver(base);
   // OLD unparseable file (crashed claimant, past the 2s grace) → recovered.
   writeFileSync(ownerFile, "");
   const old = new Date(Date.now() - 5000);
@@ -1368,10 +1414,17 @@ async function startConnected(opts: {
   assert(!existsSync(ownerFile), "lease: released after takeover-lock recovery");
 }
 
-// ── Test 33: foreign takeover discovered at heartbeat → connection closed, re-election (#189 review) ──
+// ── Test 33: foreign takeover discovered at heartbeat → connection closed, grace re-election (#189 review + #386 fencing) ──
 {
   const { state, wsServer, ownerFile } = await startConnected();
   assert(state.ownsLock === true, "yield: receiver owns the lease after connect");
+  // #386 D5: inject a short displaced grace so the 5s re-elect window holds
+  // (getter-level env fallback — read at schedule time). Restored below.
+  const envBackup: Record<string, string | undefined> = {};
+  for (const k of ["SLACK_SOCKET_DISPLACED_GRACE_MS", "SLACK_SOCKET_FROZEN_STALE_MS"]) {
+    envBackup[k] = process.env[k];
+  }
+  process.env.SLACK_SOCKET_DISPLACED_GRACE_MS = "500";
   // Simulate another process winning the lease while our heartbeat lapsed
   // (>90s): the lease file now carries a foreign pid.
   writeFileSync(ownerFile, JSON.stringify({
@@ -1385,14 +1438,66 @@ async function startConnected(opts: {
   assert(state.ws === null, "yield: connection closed (one lease ⇔ one connection)");
   const closed = await waitFor(() => wsServer.clientCloseCount >= 1, 2000);
   assert(closed, "yield: server observed the close frame");
-  assert(state.ownerRecheckTimer !== null, "yield: re-election scheduled");
+  // #386 D4: the yield schedules ONLY the grace timer — no 30s recheck, no
+  // 1s reconnect (the ping-pong source). Flip vs pre-#386.
+  assert(state.ownerRecheckTimer === null, "yield: no 30s recheck scheduled (grace owns re-entry)");
+  assert(state.displacedReelectTimer !== null, "yield: displaced grace re-election scheduled");
+  assert(state.leaseLost === true, "yield: leaseLost set");
+  assert(state.reconnectTimer === null, "yield: no 1s reconnect scheduled (grace owns re-entry)");
+  assert(state.consecutiveFails === 0, "yield: fail streak reset at displacement (#386 D8)");
+  assert(!cap.logs.some((l) => l.includes("reconnecting in")), "yield: no 1s reconnect burst logged");
   assert(cap.logs.some((l) => l.includes("lease taken over")), "yield: takeover logged");
-  // The session re-elects via the existing machinery: foreign pid is dead →
-  // stale → takeover → reconnect. The lease must be ours again.
+  // The session re-elects via the grace timer: foreign pid is dead → stale →
+  // takeover → reconnect. The lease must be ours again, leaseLost cleared at
+  // acquire-success, grace timer cleared.
   const reconnected = await waitFor(() => state.ownsLock === true, 5000);
   assert(reconnected, "yield: session re-acquires the lease after foreign owner dies");
+  assert(state.leaseLost === false, "yield: leaseLost cleared at acquire-success (#386 D2)");
+  assert(state.displacedReelectTimer === null, "yield: grace timer cleared after re-acquire");
+  stopSocketModeReceiver(state);
+  assert(state.leaseLost === false, "yield: stop resets leaseLost");
+  assert(state.displacedReelectTimer === null, "yield: stop clears the grace timer");
+  await wsServer.kill();
+  for (const k of ["SLACK_SOCKET_DISPLACED_GRACE_MS", "SLACK_SOCKET_FROZEN_STALE_MS"]) {
+    if (envBackup[k] === undefined) delete process.env[k]; else process.env[k] = envBackup[k]!;
+  }
+}
+
+// ── #386 parser unit tests ──────────────────────────
+{
+  const parsed = parsePsLstart("Sun Aug 30 12:00:00 2026");
+  assert(parsed === Date.UTC(2026, 7, 30, 12, 0, 0), "#386 parsePsLstart: canonical form");
+  assert(parsePsLstart("garbage") === null, "#386 parsePsLstart: garbage → null");
+  const starttime = parseProcStarttime("1 (comm with) spaces 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 1234 21 23", 1000);
+  assert(starttime !== null, "#386 parseProcStarttime: parses");
+  assert(starttime === Math.round((1234 / 100) * 1000 + 1000 * 1000), "#386 parseProcStarttime: ticks + btime");
+  assert(parseProcStarttime("noparen", 0) === null, "#386 parseProcStarttime: no close paren → null");
+  const self = probePidBootTime(process.pid);
+  assert(self.bootTime !== null && Math.abs(self.bootTime - ownBootTimeMs()) < 2000,
+    "#386 probe: own pid probe consistent with ownBootTimeMs (±2s)");
+}
+
+// ── #386 transient-drop hold ─────────────────────────
+{
+  // A healthy drop keeps the lease (streak below threshold); a wedged session
+  // releases past the hold threshold (no starvation, #189 preserved).
+  const { state, wsServer, ownerFile } = await startConnected();
+  assert(state.ownsLock === true, "hold: owns lease after connect");
+  process.env.SLACK_SOCKET_LEASE_HOLD_MAX_FAILS = "2";
+  wsServer.dropClient(); // transient drop #1 (streak 0 → below 2 → hold)
+  await sleep(300);
+  assert(state.ownsLock === true, "hold: lease held across transient drop (streak < threshold)");
+  await waitFor(() => wsServer.connections >= 2, 6000); // reconnect re-acquires (still owner)
+  wsServer.dropClient(); // drop #2 (streak 1 → below 2 → hold)
+  await sleep(300);
+  assert(state.ownsLock === true, "hold: lease held on drop #2");
+  await waitFor(() => wsServer.connections >= 3, 6000);
+  wsServer.dropClient(); // drop #3 (streak 2 → ≥ threshold → release)
+  await sleep(300);
+  assert(state.ownsLock === false, "hold: lease released past the hold threshold (wedged-session no-starvation)");
   stopSocketModeReceiver(state);
   await wsServer.kill();
+  delete process.env.SLACK_SOCKET_LEASE_HOLD_MAX_FAILS;
 }
 
 // Cleanup: remove per-test owner-lease tmp dirs (suite rmSync convention).
