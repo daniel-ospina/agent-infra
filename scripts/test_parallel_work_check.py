@@ -1444,6 +1444,18 @@ def test_b19_c5_negative_fence_board_no_card(tmp_path):
 
 # ── B20: vendor-drift script mechanics ───────────────────────────────
 
+def _has_swarm_checkout() -> bool:
+    """B20's drift-ledger test needs the REAL swarm checkout (check-vendor-drift.sh
+    exits 2 without a git repo at SWARM_ROOT even in --manifest mode, because it
+    reverse-applies the ledger patches against the swarm base files). CI runners
+    have no ~/swarm — the CI drift gate is the vendor-drift job; B20 is the
+    local ledger test (mirrors the _has_supabase_v2 skipif precedent)."""
+    return (Path(os.path.expanduser("~/swarm")) / ".git").is_dir()
+
+
+@pytest.mark.skipif(not _has_swarm_checkout(),
+                    reason="swarm checkout required for the drift-ledger test "
+                           "(CI drift gate = the vendor-drift job)")
 def test_b20_vendor_drift_manifest(tmp_path):
     """check-vendor-drift.sh --manifest against a fixture copy: clean → 0;
     an identical@base edit → non-zero; a deleted patched file → non-zero."""

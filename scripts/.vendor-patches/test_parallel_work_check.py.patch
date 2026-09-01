@@ -157,7 +157,7 @@
      proc = _run_bash(tmp_path, "start", repo, env, symbol="auth_token")
      assert proc.returncode == 0
      line = proc.stdout.strip().splitlines()[0]
-@@ -785,3 +881,1465 @@
+@@ -785,3 +881,1477 @@
                            text=True, env=os.environ, timeout=30)
      assert proc.returncode == 0
      assert proc.stdout.strip().splitlines()[0].startswith("C?: UNKNOWN")
@@ -724,6 +724,18 @@
 +
 +# ── B20: vendor-drift script mechanics ───────────────────────────────
 +
++def _has_swarm_checkout() -> bool:
++    """B20's drift-ledger test needs the REAL swarm checkout (check-vendor-drift.sh
++    exits 2 without a git repo at SWARM_ROOT even in --manifest mode, because it
++    reverse-applies the ledger patches against the swarm base files). CI runners
++    have no ~/swarm — the CI drift gate is the vendor-drift job; B20 is the
++    local ledger test (mirrors the _has_supabase_v2 skipif precedent)."""
++    return (Path(os.path.expanduser("~/swarm")) / ".git").is_dir()
++
++
++@pytest.mark.skipif(not _has_swarm_checkout(),
++                    reason="swarm checkout required for the drift-ledger test "
++                           "(CI drift gate = the vendor-drift job)")
 +def test_b20_vendor_drift_manifest(tmp_path):
 +    """check-vendor-drift.sh --manifest against a fixture copy: clean → 0;
 +    an identical@base edit → non-zero; a deleted patched file → non-zero."""
