@@ -104,8 +104,10 @@ swarm base byte-for-byte from the repo root.
   macOS bash 3.2 killing the subshell orphans its `sleep` child, which would
   otherwise hold the caller's stdout/stderr pipe open until the full
   `watchdog_s` (budget+2.0s) elapsed — the redirect makes the orphan hold
-  `/dev/null` instead, so invocations return ≈ budget rather than
-  budget+2.0s. **Job-control caveat
+  `/dev/null` instead, so invocations return ≈ the python pipeline time
+  (bounded by budget) rather than budget+2.0s; the residual orphaned `sleep`
+  (self-cleaning within `watchdog_s`) is accepted as a benign, bounded
+  residual. **Job-control caveat
   (setsid branch):** under `set -m`/interactive job control, bash backgrounds
   `setsid` into a fresh process group and it forks — the wrapper's captured pid
   is the dead parent and the group-kill misses. Non-interactive automation (the
