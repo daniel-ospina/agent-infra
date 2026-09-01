@@ -27,6 +27,10 @@ Zero runtime dependencies beyond Node stdlib.
 | `SLACK_BOT_TOKEN` | Bot token (`xoxb-…`) with `chat:write` scope. **Also used by approval forwarding.** | routing (via daemon), **approval** |
 | `SLACK_APP_TOKEN` | App-level token (`xapp-…`) with `connections:write` scope. Enables the Socket Mode receiver for approval button callbacks (agent-infra #146). | approval buttons |
 | `SLACK_SOCKET_OWNER_FILE` | Override the single-owner lease path (default `~/.pi/agent/slack-socket-owner.json`; #188). | approval buttons |
+| `SLACK_SOCKET_FROZEN_STALE_MS` | Frozen-owner staleness threshold (default `200000`; #386 — alive+verified owner without a heartbeat this long → takeover). | approval buttons |
+| `SLACK_SOCKET_DISPLACED_GRACE_MS` | Displaced-owner re-election grace (default `90000`; #386 — wait one lease duration + jitter before re-electing). | approval buttons |
+| `SLACK_SOCKET_LEASE_HOLD_MAX_FAILS` | Transient-drop lease hold (default `3`; #386 — release the lease only after this many backoffs). | approval buttons |
+| `SLACK_SOCKET_MIN_STABLE_CONNECT_MS` | Flap-bound minimum stable connection (default `30000`; #386 — hello resets the fail streak only if the prior connection survived this long). | approval buttons |
 | `SLACK_APPROVAL_CHANNEL` | Channel for approval notifications (e.g. `#approvals`). | approval |
 | `SLACK_CHANNEL` | Fallback channel if `SLACK_APPROVAL_CHANNEL` is unset. | approval |
 | `SLACK_APPROVAL_DISABLE=1` | Kill switch for approval forwarding. | — |
@@ -128,25 +132,43 @@ backoff (1s base, 60s cap); the receiver stops cleanly on `session_shutdown`
 and never crashes the pi session. Without `SLACK_APP_TOKEN`: zero behavior
 change — `handleApprovalCallback()` remains the (superseded) direct-call stub.
 
-**Single-owner election (agent-infra #188):** Slack allows 10 Socket Mode
-connections per app — every concurrent pi session opening one would saturate
-that limit (`too_many_websockets`), which used to spin an infinite 60s
-reconnect loop. The receiver now elects ONE owner per machine via
-`~/.pi/agent/slack-socket-owner.json` (`{pid, startTime, heartbeat}`):
+**Single-owner election (agent-infra #188, fenced #386):** Slack allows 10
+Socket Mode connections per app — every concurrent pi session opening one
+would saturate that limit (`too_many_websockets`), which used to spin an
+infinite 60s reconnect loop. The receiver elects ONE owner per machine via
+`~/.pi/agent/slack-socket-owner.json` (`{pid, startTime, bootTime, heartbeat}`):
 
 - The owner holds the lease (heartbeat every 30s) and is the only process
   that connects. Concurrent sessions log a one-line skip
   (`⏭️ Socket Mode: another pi session owns the connection…`) and re-check
-  every 30s.
-- If the owner dies, the lease goes stale (90s without a heartbeat, or dead
-  pid) and any session takes over within ≤2 min — no manual cleanup.
+  every 30s (jittered ±30%).
+- **Lease fencing (#386)** — no single 90s staleness tier (the ping-pong
+  source when many sessions freeze under memory pressure):
+  - **Dead / zombie / identity-mismatched owner** (pid's boot time no longer
+    matches the lease — pid-reuse counts as dead) → takeover at the next
+    recheck, ≤ ~30s + jitter.
+  - **Alive-but-frozen owner** (Jetsam freeze > 200s without a heartbeat) →
+    takeover after the frozen tier (~200s threshold, ≤ ~4 min worst case) —
+    a frozen session is NOT stolen early, which was the lease-fight loop.
+  - **Displaced owners** wait a ~90s grace (one lease duration + jitter)
+    before re-electing — never the 1s reconnect loop. The grace timer is the
+    only re-entry path while displaced.
+  - **Transient drops hold the lease** (release only after 3 backoffs ≈ 7s) —
+    a healthy drop no longer opens a steal window; a wedged session still
+    releases so the machine converges.
 - On app-level saturation (`too_many_websockets` from the disconnect envelope
   or `apps.connections.open`) the receiver **yields** the lease and retries on
   a 10-minute cadence with an actionable message — never the 60s loop.
 - `stopSocketModeReceiver` (session shutdown / reload) releases the lease.
+- Zero-owner window note: during a flapping owner's growing backoff the lease
+  is briefly absent (≤8s first, ≤60s cap under persistent flap) — button
+  clicks in that window are lost until the next claim.
 
 Override the lease path with `SLACK_SOCKET_OWNER_FILE` (testing / unusual
-homes).
+homes). Fencing thresholds are overridable per-machine:
+`SLACK_SOCKET_FROZEN_STALE_MS` (default 200000), `SLACK_SOCKET_DISPLACED_GRACE_MS`
+(default 90000), `SLACK_SOCKET_LEASE_HOLD_MAX_FAILS` (default 3),
+`SLACK_SOCKET_MIN_STABLE_CONNECT_MS` (default 30000).
 
 ### Resolved-message updates (agent-infra #150)
 
