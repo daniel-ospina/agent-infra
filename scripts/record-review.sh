@@ -10,8 +10,28 @@
 # <repo> is optional (owner/name). When omitted it is auto-detected via
 # GH_REPO env or `gh repo view` when run inside a git repo. The merge gate
 # uses the repo field to verify PRs in ANY repo, not just the pi process cwd.
+#
+# --force-stale (any position): record a head_sha that is NOT the PR's
+# current head. Off by default — the stale-sha guard (#2133) refuses such
+# records with exit 3 because the ai-review-gate rejects them anyway.
 set -euo pipefail
-PR="${1:?usage: record-review.sh <pr> <head_sha> [verdict] [repo]}"
+# Scan args for --force-stale (any position); everything else stays
+# positional.
+FORCE_STALE=0
+POSITIONAL=()
+for _arg in "$@"; do
+  if [ "$_arg" = "--force-stale" ]; then
+    FORCE_STALE=1
+  else
+    POSITIONAL+=("$_arg")
+  fi
+done
+if [ "${#POSITIONAL[@]}" -gt 0 ]; then
+  set -- "${POSITIONAL[@]}"
+else
+  set --
+fi
+PR="${1:?usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale]}"
 SHA="${2:?missing head_sha}"
 VERDICT="${3:-clean}"
 REPO="${4:-}"
@@ -28,15 +48,41 @@ fi
 if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "head_sha must be a full 40-char hex sha (got '${SHA:0:12}…'); refusing to record" >&2; exit 2
 fi
-if ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-  echo "repo must be owner/name (got '$REPO'); refusing to record" >&2; exit 2
-fi
-# Auto-detect repo (owner/name) when not passed explicitly.
+# Auto-detect repo (owner/name) when not passed explicitly. Detect BEFORE
+# format-checking: an omitted repo is legal here (auto-detected), and when
+# nothing is detectable the record proceeds repo-less for backward compat.
 if [ -z "$REPO" ]; then
   REPO="${GH_REPO:-}"
 fi
 if [ -z "$REPO" ]; then
   REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+fi
+if [ -n "$REPO" ] && ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  echo "repo must be owner/name (got '$REPO'); refusing to record" >&2; exit 2
+fi
+# ── Stale-sha guard (#2133): verify $SHA is the PR's CURRENT head ─────────
+# The ai-review-gate binds the recorded FULL sha into the signed marker and
+# rejects any record whose sha != the PR head at check time. tortoise PR
+# #2074 recorded a stale-but-well-formed sha (…d329… vs real head …1ebe…,
+# both under short prefix 4cb7e671), causing repeated gate failures that
+# masqueraded as "No AI review evidence". Refuse mismatches up front unless
+# --force-stale is passed. Fail-OPEN when the head cannot be fetched (a
+# transient gh/API failure must not block a legitimate record); skip when no
+# repo is detectable (backward compat — record as before).
+if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
+  CURRENT_HEAD="$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
+  # gh api prints 4xx error bodies to stdout — only a well-formed 40-hex
+  # sha counts as a successful fetch; anything else fails open.
+  if ! [[ "$CURRENT_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "⚠️ stale-sha guard: could not fetch the current head of $REPO#$PR (gh/API failure?) — continuing fail-open; double-check the sha before relying on the gate" >&2
+  elif [ "$CURRENT_HEAD" != "$SHA" ]; then
+    echo "stale-sha guard: provided sha $SHA is NOT the current PR head $CURRENT_HEAD — the ai-review-gate will reject this record" >&2
+    if [ "$FORCE_STALE" -ne 1 ]; then
+      echo "refusing to record stale sha $SHA for $REPO#$PR — re-record with the current head ${CURRENT_HEAD:0:12}… (or pass --force-stale to override)" >&2
+      exit 3
+    fi
+    echo "⚠️ --force-stale passed: recording stale sha $SHA anyway — the ai-review-gate will keep rejecting until re-recorded at the current head" >&2
+  fi
 fi
 DIR="$HOME/.pi/agent/reviews"
 mkdir -p "$DIR"
