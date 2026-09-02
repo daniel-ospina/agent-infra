@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: infra-verify
 description: "Script-based verification for infrastructure, skills, and config changes. Unlike web/desktop clickthrough, infra has no UI — verification is automated script validation. Invoked by post-deploy-verify router for infra surface PRs."
 domain: engineering

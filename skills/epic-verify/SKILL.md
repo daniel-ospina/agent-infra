@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: epic-verify
 description: "Bounded skill for epic pipeline verification. Final gate before implementation begins — verifies cross-phase coherence, E2E test alignment from high-level to detailed, and pipeline artifact completeness. Invoked by epic-plan after epic-decompose completes."
 domain: planning

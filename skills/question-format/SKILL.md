@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: question-format
 description: "Reference protocol for presenting decisions to users. All skills that ask the user to choose between options MUST use this format. Consumed by other skills — not invoked directly."
 type: reference

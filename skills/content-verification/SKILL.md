@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: content-verification
 version: 1.0.0
 description: "Content-domain verification gate. Dispatches the content pipeline v2 reviewers — breadth + depth in parallel (post-writing), then fact-checker (writing) after the reviewer cycle is clean — for editorial, guide, deal, and refresh content. Invoked by test-routing when domain=content; referenced by research-verification and issue-creation as the Content verification trigger. Returns structured P0/P1/P2 issues + verdict."

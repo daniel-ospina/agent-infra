@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: improvement-opportunities
 description: Identifies what could be better in the epic — missed optimizations, simplifications, or better approaches. Use during Coherence Review for all complexity axes. Returns structured ISSUE blocks or NO ISSUES FOUND.
 allowed-tools: read bash grep find web_search web_fetch todo_write task

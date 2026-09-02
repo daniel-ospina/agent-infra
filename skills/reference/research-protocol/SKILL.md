@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: research-protocol
 description: "Reference for how to conduct research. Consumed by other skills — not invoked directly. Encodes five research dimensions within a domain-aware structure (Cynefin + Double Diamond + Estuarine Mapping + Distributed Sensing), the ## Raw Notes persistence convention, and the fractal granularity ladder. Restored 2026-08-13 from the eldato archive (issue #231)."
 type: reference

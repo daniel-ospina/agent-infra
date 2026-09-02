@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: shared-verify
 description: Pre + post-deploy verification gate. Epic → epic-verify, Project → verification-before-completion.
 domain: capability

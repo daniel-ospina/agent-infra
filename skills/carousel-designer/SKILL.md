@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: carousel-designer
 description: Visual design critique for rendered carousel slides. Single Opus session critiques composite slide images, generates CSS fixes, and re-reviews in a continuous loop until clean. Final verification by separate DeepSeek model. Plugs into art-director Gate 2 for post-render carousel QA.
 allowed-tools: read task bash mcp__gemini__gemini-analyze-image

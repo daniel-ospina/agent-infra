@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: architectural-soundness
 description: Validates that the epic's architecture aligns with the overall system design and epic goals. Use when reviewing Architecture substep output for Architecture complexity axis. Reuses patterns from plan-review architectural-soundness reviewer. Returns structured ISSUE blocks or NO ISSUES FOUND.
 allowed-tools: read bash grep find web_search web_fetch todo_write task

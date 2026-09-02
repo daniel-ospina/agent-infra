@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: ux-coverage
 description: Verifies that all user roles and UI states are covered in epic user journeys. Use when reviewing User Journeys substep output for UX complexity axis. Returns structured ISSUE blocks or NO ISSUES FOUND.
 allowed-tools: read bash grep find web_search web_fetch todo_write task

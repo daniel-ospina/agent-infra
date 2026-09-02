@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: carousel-b2b-images
 description: Generates AI images for carousel slides via OpenRouter API. Invoked by carousel-b2b-strategy. Generates optimized prompts, submits to OpenRouter, runs quality checks, uploads to Cloudinary, and presents options for user selection.
 allowed-tools: read write edit bash web_search web_fetch task

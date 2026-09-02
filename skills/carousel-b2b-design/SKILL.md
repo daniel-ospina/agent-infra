@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: carousel-b2b-design
 description: Renders carousel slides to PNG via Playwright. Invoked by carousel-b2b-strategy. Takes script + selected images → builds HTML/CSS → renders each slide → runs 12-item checklist → outputs PNGs + carousel-preview.html.
 allowed-tools: read write edit bash

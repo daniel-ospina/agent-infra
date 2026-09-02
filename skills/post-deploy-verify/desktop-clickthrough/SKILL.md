@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: desktop-clickthrough
 description: "cliclick + CDP clickthrough protocol for Electron desktop apps. Uses real mouse clicks and common-sense navigation (human-emulation pattern). Adds pipeline contract, human gate, and structured JSON output. Invoked by post-deploy-verify router for desktop surface PRs."
 domain: engineering
