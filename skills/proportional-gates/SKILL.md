@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: proportional-gates
 description: "Reference: replaces rigid/programmatic skill rules with judgment-based gating. Consumed by other skills — not invoked directly. Defines proportionality principle, risk-tiered verification, and the 'reviewer validates judgment' pattern."
 type: reference

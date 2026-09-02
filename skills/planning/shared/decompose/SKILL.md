@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: shared-decompose
 description: MECE-first decomposition + child issue generation. Routes to epic-decompose.
 domain: capability

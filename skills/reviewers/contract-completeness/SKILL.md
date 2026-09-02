@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: contract-completeness
 description: Validates that all component interfaces in the epic have complete input/output definitions. Use when reviewing Interfaces substep output for Architecture complexity axis. Returns structured ISSUE blocks or NO ISSUES FOUND.
 allowed-tools: read bash grep find web_search web_fetch todo_write task

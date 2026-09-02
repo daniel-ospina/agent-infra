@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: web-clickthrough
 description: "Agent-executed clickthrough protocol for web apps. Reads Tortoise graph for relevant user journeys, then walks them using Playwright with common sense — clicking by text, filling by label, verifying visually. Not a deterministic script. Invoked by post-deploy-verify router for web surface PRs."
 domain: engineering

@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: risk-completeness
 description: Verifies that all risks are identified and have mitigation strategies in the epic. Use during Coherence Review for all complexity axes. Returns structured ISSUE blocks or NO ISSUES FOUND.
 allowed-tools: read bash grep find web_search web_fetch todo_write task

@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: human-input-framework
 description: "Reference taxonomy for when coding workflow skills should pause for human input vs proceed autonomously. Not invoked directly — consumed by other skills."
 type: reference

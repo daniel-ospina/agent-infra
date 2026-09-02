@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: e2e-coverage
 description: Verifies that all high-level user scenarios are fleshed out into detailed end-to-end test descriptions. Use when reviewing Detailed E2E substep output for Architecture + UX complexity axes. Returns structured ISSUE blocks or NO ISSUES FOUND.
 allowed-tools: read bash grep find web_search web_fetch todo_write task

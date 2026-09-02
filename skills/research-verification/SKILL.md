@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: research-verification
 description: "Thin wrapper that standardizes invocation of the research skill's adversarial review gate. Ensures disconfirming queries are run and assumptions are challenged. Invoked by test-routing when domain=research."
 domain: engineering

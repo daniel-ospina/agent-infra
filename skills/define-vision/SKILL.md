@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: define-vision
 description: "Defines S4 (Vision) artifacts — environmental scan, competitor research, brainstorming, options — for any function, team, or role."
 domain: capability

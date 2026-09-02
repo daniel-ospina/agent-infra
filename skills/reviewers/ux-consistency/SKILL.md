@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: ux-consistency
 description: Detects contradictory or inconsistent user flows across epic journeys. Use when reviewing User Journeys substep output for UX complexity axis. Returns structured ISSUE blocks or NO ISSUES FOUND.
 allowed-tools: read bash grep find web_search web_fetch todo_write task

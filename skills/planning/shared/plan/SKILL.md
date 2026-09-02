@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: shared-plan
 description: Planning substeps. Epic → epic-plan. Project → wired inline in project-workflow.
 domain: capability

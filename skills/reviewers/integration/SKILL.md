@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: integration
 description: Validates that component boundaries in the epic architecture are clean and all integration surfaces are accounted for. Use when reviewing Architecture substep output for Architecture complexity axis. Reuses patterns from plan-review integration reviewer. Returns structured ISSUE blocks or NO ISSUES FOUND.
 allowed-tools: read bash grep find web_search web_fetch todo_write task

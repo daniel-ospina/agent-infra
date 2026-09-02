@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: test-debt-gate
 description: Reference for test regression gate semantics. Consumed, not invoked — classification rules, block-vs-warn, flaky re-run protocol, no-silent-pass auto-file protocol, and tech-debt pre-flight UX. Used by commit-workflow (regression gate), executing-plans, and issue-scoping.
 type: reference

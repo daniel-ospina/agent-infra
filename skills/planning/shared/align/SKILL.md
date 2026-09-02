@@ -1,4 +1,5 @@
 ---
+disable-model-invocation: true
 name: shared-align
 description: Strategic go/no-go gate for workflows. Routes to epic-align skill.
 domain: capability
