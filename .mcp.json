@@ -18,13 +18,22 @@
       ],
       "env": {
         "BRAVE_API_KEY": "${BRAVE_API_KEY}"
-      }
+      },
+      "lazy": true,
+      "purpose": "Web search (Brave)",
+      "whenToLoad": "on demand",
+      "cost": "one npx process"
     },
     "playwright-browser": {
       "command": "npx",
       "args": [
         "@playwright/mcp@latest"
-      ]
+      ],
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "purpose": "Browser automation (navigate/click/screenshot)",
+      "whenToLoad": "verify/UX phases only",
+      "cost": "~170MB pair while loaded"
     },
     "gemini": {
       "command": "npx",
@@ -34,7 +43,11 @@
       ],
       "env": {
         "GEMINI_API_KEY": "${GEMINI_API_KEY}"
-      }
+      },
+      "lazy": true,
+      "purpose": "Image generation (Gemini)",
+      "whenToLoad": "image/carousel tasks",
+      "cost": "one npx process"
     },
     "tortoise": {
       "command": "python3",
