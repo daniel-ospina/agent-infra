@@ -59,7 +59,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
-      - run: pip install ruff
+      # #414 — ruff drift guard: the unpinned `pip install ruff` here made
+      # consumers lint against whatever ruff is latest on PyPI, so a ruff
+      # release (rule-surface drift) turned consumer PRs red with no code change
+      # (tortoise #2150/#1685 class). Pinned to the current consumer pin
+      # (tortoise dev group + lint-command prefix: ruff==0.16.4). Bump
+      # ceremony: edit the pin here → semver tag bump (version contract
+      # #303) → consumers repin the tag AND their own ruff pin in lockstep.
+      - run: pip install ruff==0.16.4
       - run: ${{ inputs.lint-command }}
 
   typecheck:
