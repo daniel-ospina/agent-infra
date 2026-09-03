@@ -41,7 +41,7 @@ stops the server, the next tool call transparently reconnects it.
 
 ## Pre-loaded core
 
-`exa` (search) and `tortoise` (memory graph) stay eager. `tortoise` is launched
+`tortoise` (memory graph) is the only always-eager core server. `exa` (semantic search) was demoted to lazy (#419) — Perplexity is the primary search source; Exa loads on demand via `mcp_load` for semantic/scholarly/entity discovery. `tortoise` is launched
 with `${TORTOISE_HOME}/.venv/bin/python3` (the venv has `fastmcp`; global
 python3 does not).
 
