@@ -159,8 +159,8 @@ await test("parses as valid config with the expected server set", () => {
   ok(tortoise.cwd.includes("TORTOISE_HOME"), "tortoise cwd uses TORTOISE_HOME");
   ok(tortoise.env.PYTHONPATH.includes("TORTOISE_HOME"), "PYTHONPATH uses TORTOISE_HOME");
 
-  // #199: tiering — exa + tortoise are the eager core; the rest are lazy.
-  equal(config.mcpServers.exa.lazy, undefined, "exa is core (eager)");
+  // #199/#419: tiering — tortoise is the eager core; exa is lazy (semantic/scholarly fallback, #419).
+  equal(config.mcpServers.exa.lazy, true, "exa is lazy (#419 — not core)");
   equal(config.mcpServers.tortoise.lazy, undefined, "tortoise is core (eager)");
   equal(config.mcpServers["playwright-browser"].lazy, true, "playwright is lazy");
   equal(config.mcpServers.gemini.lazy, true, "gemini is lazy");

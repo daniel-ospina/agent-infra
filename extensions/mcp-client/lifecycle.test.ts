@@ -41,19 +41,19 @@ section("classifyServers — eager core vs lazy skip");
 
 await test("no PI_MCP_SERVERS: non-lazy eager, lazy skipped", () => {
   const servers = {
-    exa: {},
+    alpha: {},
     tortoise: {},
     "playwright-browser": { lazy: true },
     gemini: { lazy: true },
   };
   const { eager, lazySkipped } = classifyServers(servers, undefined);
-  deepEqual(eager.map(([n]) => n).sort(), ["exa", "tortoise"]);
+  deepEqual(eager.map(([n]) => n).sort(), ["alpha", "tortoise"]);
   deepEqual(lazySkipped.sort(), ["gemini", "playwright-browser"]);
 });
 
 await test("PI_MCP_SERVERS names a lazy server → forced eager", () => {
   const servers = {
-    exa: {},
+    alpha: {},
     "playwright-browser": { lazy: true },
     gemini: { lazy: true },
   };
@@ -63,9 +63,9 @@ await test("PI_MCP_SERVERS names a lazy server → forced eager", () => {
 });
 
 await test("PI_MCP_SERVERS excludes unlisted servers entirely", () => {
-  const servers = { exa: {}, gemini: { lazy: true }, tortoise: {} };
-  const { eager, lazySkipped } = classifyServers(servers, new Set(["exa"]));
-  deepEqual(eager.map(([n]) => n), ["exa"]);
+  const servers = { alpha: {}, gemini: { lazy: true }, tortoise: {} };
+  const { eager, lazySkipped } = classifyServers(servers, new Set(["alpha"]));
+  deepEqual(eager.map(([n]) => n), ["alpha"]);
   deepEqual(lazySkipped, []);
 });
 
@@ -75,7 +75,7 @@ await test("PI_MCP_SERVERS='none' (sub-agent default, #286) → zero eager conne
   // deterministic zero-connect startup for sub-agents. Servers load only when
   // named explicitly (mcp_servers param) or via mid-run mcp_load.
   const servers = {
-    exa: {},
+    alpha: {},
     tortoise: {},
     "playwright-browser": { lazy: true },
     gemini: { lazy: true },
@@ -103,7 +103,7 @@ function makeManagerWithConfig(servers: Record<string, any>): McpServerManager {
 
 await test("lists all declared servers with tier/status/metadata", () => {
   const m = makeManagerWithConfig({
-    exa: { purpose: "Search" },
+    alpha: { purpose: "Search" },
     "playwright-browser": {
       lazy: true,
       purpose: "Browser automation",
@@ -115,10 +115,10 @@ await test("lists all declared servers with tier/status/metadata", () => {
   const cat = m.catalog();
   equal(cat.length, 3);
 
-  const exa = cat.find((c) => c.name === "exa")!;
-  equal(exa.tier, "core");
-  equal(exa.status, "not-loaded");
-  equal(exa.purpose, "Search");
+  const alpha = cat.find((c) => c.name === "alpha")!;
+  equal(alpha.tier, "core");
+  equal(alpha.status, "not-loaded");
+  equal(alpha.purpose, "Search");
 
   const pw = cat.find((c) => c.name === "playwright-browser")!;
   equal(pw.tier, "lazy");
@@ -128,11 +128,11 @@ await test("lists all declared servers with tier/status/metadata", () => {
 });
 
 await test("connected server reports status loaded", () => {
-  const m = makeManagerWithConfig({ exa: {} });
+  const m = makeManagerWithConfig({ alpha: {} });
   (m as any).connections = [
-    { client: {}, serverName: "exa", lazy: false, idleTimeoutMs: 0, lastUsed: 0 },
+    { client: {}, serverName: "alpha", lazy: false, idleTimeoutMs: 0, lastUsed: 0 },
   ];
-  equal(m.catalog().find((c) => c.name === "exa")!.status, "loaded");
+  equal(m.catalog().find((c) => c.name === "alpha")!.status, "loaded");
 });
 
 await test("catalog returns [] when no config loaded", () => {
@@ -177,7 +177,7 @@ await test("markUsed resets lastUsed so a used lazy server is not swept", async 
 section("loadServer — validation");
 
 await test("unknown server name rejects with a catalog hint", async () => {
-  const m = makeManagerWithConfig({ exa: {} });
+  const m = makeManagerWithConfig({ alpha: {} });
   let threw = false;
   try {
     await m.loadServer("nope");
@@ -192,7 +192,7 @@ await test("loadServer without config rejects", async () => {
   const m = new McpServerManager();
   let threw = false;
   try {
-    await m.loadServer("exa");
+    await m.loadServer("alpha");
   } catch (err: any) {
     threw = true;
     ok(err.message.includes("No MCP config"), err.message);

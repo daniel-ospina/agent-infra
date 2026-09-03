@@ -199,20 +199,20 @@ YouTube is often the first place leading-edge practice appears — before papers
 
 
 
-#### Exa (academic paper discovery)
+#### Exa (semantic/scholarly discovery — DEPRECATED from core, lazy on demand #419)
 
-**Exa** — semantic search for academic papers and technical content. Primary source alongside Perplexity. Best for finding specific papers, arXiv preprints, and technical documentation. Invocation: `mcp__exa__web_search_exa` or stdin: `npx -y exa-mcp-server`.
+**Exa** — semantic search for academic papers and technical content. **Secondary, on-demand source — NOT primary** (#419). Perplexity is the primary source for all web research; Exa is a lazy fallback used only when a query needs semantic/scholarly/entity discovery that keyword retrieval misses: specific papers, arXiv preprints, technical documentation, people/company/prospect research. **It is no longer loaded at session start.** Invocation: `mcp_load exa` → next turn `mcp__exa__web_search_exa` (or stdin: `npx -y exa-mcp-server`). If `mcp_load` fails, degrade gracefully to Perplexity — do not retry-loop (lazy-load failure class #199/#358). **Sub-agents:** dispatched `task` sub-agents start with zero eager MCP connects (#286) — when a sub-agent may need semantic/scholarly discovery, name `exa` in the task tool's `mcp_servers` param, or instruct it to `mcp_load exa` mid-run.
 
 **Brave** — backup only. Web search fallback if Perplexity is unavailable. Same invocation pattern. Not a primary source — Perplexity returns better results for all tested query types.
 
 #### Exa + Brave (legacy — formerly P1 add-ons)
 
-**Exa MCP** — semantic discovery (embeddings-based, 81% WebWalker):
+**Exa MCP** — semantic discovery (embeddings-based, 81% WebWalker). **Lazy (on demand, #419) — do NOT add to eager core:**
 ```json
-// Add to .mcp.json:
-{"exa": {"command": "npx", "args": ["-y", "exa-mcp-server"], "env": {"EXA_API_KEY": "<key>"}}}
+// .mcp.json (lazy — loads only via mcp_load exa):
+{"exa": {"command": "npx", "args": ["-y", "exa-mcp-server"], "env": {"EXA_API_KEY": "<key>"}, "lazy": true}}
 ```
-Free tier: 20K queries. Catches what keyword search misses. Weak on time-sensitive queries (24% FreshQA).
+Free tier: $10/mo credits (~1.4K searches/mo). Catches what keyword search misses. Weak on time-sensitive queries (24% FreshQA).
 
 **Brave MCP** — independent index verification (47% HLE):
 ```json
@@ -221,7 +221,7 @@ Free tier: 20K queries. Catches what keyword search misses. Weak on time-sensiti
 ```
 $1/mo for 200 queries. Independent index — cross-source fact-checking.
 
-**Status:** Installed. Configured in `.mcp.json`. Exa free tier: 20K queries/mo. Brave: $1/mo for 200 queries. Cost discipline: prefer free sources first; use Exa/Brave only when semantic discovery or index diversity is needed. When active, they join Perplexity as independent source categories for confidence-tier classification (§5a).
+**Status:** Exa installed but **lazy** (#419) — never eager, never primary. Load on demand via `mcp_load exa` only when a query needs semantic/scholarly/entity discovery (academic papers, arXiv, people/company/prospect research). Perplexity is the go-to source for everything else. Brave: $1/mo for 200 queries, lazy fallback. Cost discipline: prefer Perplexity first; use Exa/Brave only when semantic discovery or index diversity is needed. When active, they join Perplexity as independent source categories for confidence-tier classification (§5a).
 
 #### Semantic Scholar API (deprecated — unreliable)
 
@@ -253,7 +253,7 @@ Requires `OPENALEX_API_KEY` (set in `.env.local`) for polite pool access. Max 10
 When research requires academic paper discovery, use this 4-stage pipeline:
 
 #### Stage 1: Broad Scan
-Use Exa (semantic/embeddings), Brave (independent index), and Perplexity (synthesis) to surface candidate papers and topics. Dispatch all three in parallel. Prefer free sources first (OpenAlex → Semantic Scholar → Exa → Brave) to manage costs. Exa free tier: 20K queries. Brave: $1/mo for 200 queries.
+Use Exa (`mcp_load exa` first — lazy #419), Brave (independent index), and Perplexity (synthesis) to surface candidate papers and topics. Dispatch Perplexity always; Exa/Brave only when semantic or index diversity is needed. Perplexity first — it is the primary source; Exa free tier: $10/mo credits (~1.4K searches). Brave: $1/mo for 200 queries.
 
 #### Stage 2: Filter
 Use OpenAlex + Semantic Scholar to confirm relevance via metadata. Scoring rubric: citations > 10, year >= 2023, open access preferred. Normalize/dedupe results in synthesis: dedupe by DOI (exact), then title (fuzzy, difflib ratio >= 0.85). The legacy normalize helper lives in the **eldato** repo (`operations/tools/research/normalize.py` — run from an eldato checkout).

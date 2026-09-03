@@ -9,9 +9,11 @@
       "env": {
         "EXA_API_KEY": "${EXA_API_KEY}"
       },
-      "purpose": "Web search (Exa)",
-      "whenToLoad": "always (core)",
-      "cost": "one light process"
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "purpose": "Semantic search (Exa) — scholarly/semantic/entity discovery",
+      "whenToLoad": "on demand — semantic/scholarly/prospect discovery only (#419)",
+      "cost": "one light process; Perplexity is the primary source"
     },
     "tortoise": {
       "command": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}/.venv/bin/python3",
