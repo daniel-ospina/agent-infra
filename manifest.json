@@ -57,7 +57,7 @@
   },
   "check": {
     "ci": {
-      "ref": "v0.1.1"
+      "ref": "v0.1.2"
     },
     "exemptions": {
       "dmer": [
