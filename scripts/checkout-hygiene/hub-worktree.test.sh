@@ -184,6 +184,27 @@ assert_eq "$hubdirty" "0" "hub CLEAN after non-ASCII salvage"
 git -C "$REPO" worktree remove --force "$REPO/.worktrees/feat/salvage-utf8" 2>/dev/null || true
 git -C "$REPO" branch -q -D feat/salvage-utf8 2>/dev/null || true
 
+# 7c. Tracked SYMLINK dirt (retargeted) → captured AS A LINK; the link's old
+# target file must stay untouched (cycle-2 P1: cp wrote THROUGH the WT symlink).
+git -C "$REPO" checkout -q main
+git -C "$REPO" clean -fdq
+git -C "$REPO" reset -q --hard HEAD 2>/dev/null || true
+echo "victim-content" > "$REPO/victim.txt"
+echo "target-content" > "$REPO/target.txt"
+ln -s victim.txt "$REPO/weblink"
+git -C "$REPO" add victim.txt target.txt weblink && git -C "$REPO" commit -qm add-links
+git -C "$REPO" push -q origin main
+rm "$REPO/weblink" && ln -s target.txt "$REPO/weblink"   # retarget dirty
+out="$(bash "$HELPER" salvage feat/salvage-symlink "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "salvage succeeds with tracked symlink dirt"
+grep -q "victim-content" "$REPO/.worktrees/feat/salvage-symlink/victim.txt" 2>/dev/null && ok "victim file NOT corrupted in the branch" || bad "VICTIM FILE CORRUPTED in the branch"
+[ "$(readlink "$REPO/.worktrees/feat/salvage-symlink/weblink" 2>/dev/null || true)" = "target.txt" ] && ok "retargeted symlink captured verbatim" || bad "symlink retarget NOT captured"
+hubdirty="$(git -C "$REPO" status --porcelain | wc -l | tr -d ' ')"
+assert_eq "$hubdirty" "0" "hub CLEAN after symlink salvage"
+[ -L "$REPO/weblink" ] && ok "hub weblink restored as a symlink" || bad "hub weblink not a symlink"
+git -C "$REPO" worktree remove --force "$REPO/.worktrees/feat/salvage-symlink" 2>/dev/null || true
+git -C "$REPO" branch -q -D feat/salvage-symlink 2>/dev/null || true
+
 echo ""
 echo "hub-worktree.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

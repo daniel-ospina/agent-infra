@@ -196,15 +196,32 @@ salvage() {
     fi
     # gitlink (submodule) dirt: the pointer change needs operator handling —
     # cp-ing the submodule dir would embed a nested repo into the WT commit.
+    local trackmode=""
     if [[ "$xy" != "??" ]]; then
-      local submode
-      submode="$(git -C "$MAIN_REPO" ls-files -s -- "$clean_rel" 2>/dev/null | awk '{print $1}' || true)"
-      if [[ "$submode" = "160000" ]]; then
-        echo "   ⏭  submodule dirt at $clean_rel (pointer change) — operator handling; captured copy skipped"
+      trackmode="$(git -C "$MAIN_REPO" ls-files -s -- "$clean_rel" 2>/dev/null | awk '{print $1}' || true)"
+      if [[ "$trackmode" = "160000" ]]; then
+        echo "   ⏭  submodule dirt at $clean_rel (pointer change) — NOT captured; operator must commit the gitlink update from a worktree"
         continue
       fi
     fi
-    if [[ -d "$src" ]]; then
+    if [[ -L "$src" || "$trackmode" = "120000" ]]; then
+      # SYMLINK dirt (retargeted tracked link, or untracked link): cp would
+      # DEREFERENCE the link and (with the WT's own symlink present) write
+      # THROUGH it into the link's target — corrupting an innocent tracked
+      # file. Capture the link itself: drop the WT copy and recreate the
+      # symlink with the hub's (dirty) target verbatim.
+      mkdir -p "$(dirname "$dst")"
+      rm -rf "$dst"
+      local link_target
+      link_target="$(readlink "$src" 2>/dev/null || true)"
+      if [[ -n "$link_target" ]]; then
+        ln -s "$link_target" "$dst"; captured=$((captured + 1))
+      elif [[ -e "$src" ]]; then
+        # index says mode 120000 but the file is no longer a link — copy
+        # content as a regular file.
+        cp -f "$src" "$dst"; captured=$((captured + 1))
+      fi
+    elif [[ -d "$src" ]]; then
       mkdir -p "$(dirname "$dst")"; cp -Rf "$src" "$dst"; captured=$((captured + 1))
     elif [[ -e "$src" ]]; then
       mkdir -p "$(dirname "$dst")"; cp -f "$src" "$dst"; captured=$((captured + 1))
@@ -275,7 +292,7 @@ salvage() {
       " M"|"MM"|" D")
         mode_t="$(git -C "$MAIN_REPO" ls-files -s -- "$rest" | awk '{print $1}')"
         case "$mode_t" in
-          160000) echo "   ⏭  submodule dirt at $rest — leave (separate repo); salvage captured its pointer change" >&2 ;;
+          160000) echo "   ⏭  submodule dirt at $rest — left for operator handling (NOT captured on the branch)" >&2 ;;
           120000) # symlink — recreate as a symlink, not a regular file
             local target
             target="$(git -C "$MAIN_REPO" show "HEAD:$rest" 2>/dev/null || true)"
