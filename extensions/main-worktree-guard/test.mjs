@@ -574,6 +574,9 @@ bdNames("bdNames push dot remote → null (P1-2)", "push", [".", "--delete", "ma
 bdNames("bdNames push local-path remote → null (P1-2)", "push", ["/tmp/r", "--delete", "x"], null);
 bdNames("bdNames push bare-name leading (no origin) → null (P1-1)", "push", ["pr1467", "--delete", "stale"], null);
 bdNames("bdNames push no-remote delete → allowed", "push", ["--delete", "stale"], ["stale"]);
+bdNames("bdNames push colon heads/main shorthand → main (P1)", "push", ["origin", ":heads/main"], ["main"]);
+bdNames("bdNames push --delete heads/main → main (P1)", "push", ["origin", "--delete", "heads/main"], ["main"]);
+bdNames("bdNames push colon heads/feat/x → feat/x (P1)", "push", ["origin", ":heads/feat/x"], ["feat/x"]);
 bdNames("bdNames branch -D", "branch", ["-D", "old"], ["old"]);
 bdNames("bdNames branch -d", "branch", ["-d", "old"], ["old"]);
 bdNames("bdNames branch merged -Dx", "branch", ["-Dold"], ["old"]);
@@ -623,6 +626,14 @@ const wgOtherRemote = evaluateHubGateWithTargets(`git push gitlab --delete feat/
 const okOtherRemote = wgOtherRemote.verdict === "block";
 console.log(`${okOtherRemote ? "✅" : "❌"} bd runtime non-origin remote → block: ${wgOtherRemote.verdict}`);
 okOtherRemote ? pass++ : fail++;
+const wgHeadsMain = evaluateHubGateWithTargets(`git push origin :heads/main`, "feat/x", process.cwd(), new Set());
+const okHeadsMain = wgHeadsMain.verdict === "block";
+console.log(`${okHeadsMain ? "✅" : "❌"} bd runtime heads/main shorthand → block (P1): ${wgHeadsMain.verdict}`);
+okHeadsMain ? pass++ : fail++;
+const wgHeadsWt = evaluateHubGateWithTargets(`git push origin :heads/feat/wt2`, "main", process.cwd(), new Set(["feat/wt2"]));
+const okHeadsWt = wgHeadsWt.verdict === "block";
+console.log(`${okHeadsWt ? "✅" : "❌"} bd runtime heads/<checked-out> → block (P1): ${wgHeadsWt.verdict}`);
+okHeadsWt ? pass++ : fail++;
 const wgBranchD = evaluateHubGateWithTargets(`git branch -D feat/old`, "main", process.cwd(), new Set(["feat/x"]));
 const okBranchD = wgBranchD.verdict === "recovery";
 console.log(`${okBranchD ? "✅" : "❌"} bd runtime branch -D unchecked-out → recovery: ${wgBranchD.verdict}`);

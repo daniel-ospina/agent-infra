@@ -1835,7 +1835,8 @@ export function branchDeleteNames(verb, args) {
     const clean = (x) => x
       .replace(/^["']|["']$/g, "")
       .replace(/^:+(refs\/heads\/)?/, "")
-      .replace(/^refs\/heads\//, "");
+      .replace(/^refs\/heads\//, "")
+      .replace(/^heads\//, ""); // git dst-inference: `:heads/main` → refs/heads/main (#439 P1)
     const names = [...new Set(rawTargets.map(clean).filter((x) => x.length > 0))];
     return names.length > 0 ? names : null;
   }
