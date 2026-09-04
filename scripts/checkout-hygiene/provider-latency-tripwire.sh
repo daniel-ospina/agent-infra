@@ -10,7 +10,9 @@
 # 99.8% prefix-cache hit on repeat.
 #
 # Canonical script: agent-infra/scripts/checkout-hygiene/provider-latency-tripwire.sh
-# (symlinked to ~/.pi/agent/scripts/checkout-hygiene/ by pi-bootstrap/setup.sh;
+# (COPIED to ~/.pi/agent/scripts/checkout-hygiene/ by pi-bootstrap/setup.sh —
+# #427: symlinks into the repo EPERM'd launchd bash under macOS TCC, so the
+# farm refreshes real copies on every sync instead;
 # launched hourly by com.eldato.provider-latency-tripwire plist, rendered by
 # scripts/install-launchd.sh #304).
 #

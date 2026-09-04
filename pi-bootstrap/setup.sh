@@ -239,17 +239,27 @@ else
   echo "    skills copied ($(ls "$DEST/skills" | wc -l | tr -d ' ') items)"
 fi
 
-# Scripts farm (checkout-hygiene): symlink the launchd scripts the plist
-# jobs invoke (corruption-canary + hub-state-check convention, #304;
-# provider-latency-tripwire added #424). Keeps
-# repo symlinks (updates flow via git pull) like the skills farm; replaces
-# stale/foreign links with fresh ones. Test files and plist templates are
-# not farmed (tests don't ship; plists are rendered from templates/launchd).
-SCRIPTS_SRC="$INFRA_ROOT/scripts/checkout-hygiene"
-if [ -d "$SCRIPTS_SRC" ]; then
+# Scripts farm (launchd-invoked): COPY (not symlink) repo scripts into
+# ~/.pi/agent/scripts. #427: symlinks into the repo (~/Documents, macOS
+# TCC-protected) made launchd-spawned bash fail with EPERM at script-open;
+# real files under ~/.pi/agent are readable, so copies revive the
+# SELF-CONTAINED launchd jobs (provider-latency-tripwire; corruption-canary
+# only because python is TCC-exempt — it reads SWARM_ROOT via git at runtime
+# and would fail like hub-state-check under a bash shebang).
+# hub-state-check + skill-lint-oracle additionally read ~/Documents content
+# via git/node → still TCC-blocked under launchd regardless (see #427; the
+# fix is a Full-Disk-Access grant, not a path change). Same model as the
+# skills farm: idempotent refresh on each sync.sh. Stale-dest caveat: a farm
+# script removed from the repo is NOT deleted from ~/.pi (extras kept) —
+# install-launchd's broken-target check can no longer catch it, so removing
+# a farmed script must also remove/retire its plist job. Test files and
+# plist templates are not farmed (tests don't ship; plists render from
+# templates/launchd).
+scripts_dir="$INFRA_ROOT/scripts/checkout-hygiene"
+if [ -d "$scripts_dir" ]; then
   mkdir -p "$DEST/scripts/checkout-hygiene"
-  linked=0; kept_farm=0
-  for f in "$SCRIPTS_SRC"/*; do
+  copied=0
+  for f in "$scripts_dir"/*; do
     [ -f "$f" ] || continue
     base="$(basename "$f")"
     case "$base" in
@@ -257,19 +267,14 @@ if [ -d "$SCRIPTS_SRC" ]; then
     esac
     dest="$DEST/scripts/checkout-hygiene/$base"
     if [ -L "$dest" ]; then
-      dest_resolved="$(resolve_path "$dest")"
-      repo_resolved="$(resolve_path "$f")"
-      if [ -n "$dest_resolved" ] && [ -n "$repo_resolved" ] && [ "$dest_resolved" = "$repo_resolved" ]; then
-        kept_farm=$((kept_farm+1))
-        continue
-      fi
-      echo "    replacing stale/foreign scripts symlink: $base"
+      echo "    replacing farm symlink with real copy: $base"
       rm -f "$dest"
     fi
-    ln -s "$f" "$dest"
-    linked=$((linked+1))
+    cp -f "$f" "$dest"
+    chmod +x "$dest" 2>/dev/null || true
+    copied=$((copied+1))
   done
-  echo "    scripts/checkout-hygiene farm: $linked linked, $kept_farm kept"
+  echo "    scripts/checkout-hygiene farm: $copied copied (real files, #427)"
 fi
 
 # Wire shell profile (idempotent): auto-sync env + optional keys file

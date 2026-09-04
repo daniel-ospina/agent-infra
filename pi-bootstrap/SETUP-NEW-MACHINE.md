@@ -83,7 +83,9 @@ machine's pi instance.
   swarm `bootstrap.sh` → `scripts/install-launchd.sh` (all idempotent).
 - **What syncs:** skills, extensions, agents, models, settings, rules, the
   base MCP config (`templates/.mcp.base.json` → `~/.pi/agent/.mcp.json`), the
-  `scripts/checkout-hygiene/` farm (symlinks into `~/.pi/agent/scripts/`), and
+  `scripts/checkout-hygiene/` farm (real copies refreshed into
+  `~/.pi/agent/scripts/`; #427 — symlinks into the repo were TCC-blocked for
+  launchd bash, so setup.sh copies instead), and
   the launchd agents (via `scripts/install-launchd.sh`, #304).
 - **MCP servers:** pi loads MCP servers from the first `.mcp.json` found walking
   up from your working directory to the repo's git top-level, falling back to
