@@ -50,6 +50,26 @@ cat > "$TMP/bin/npm" <<'EOF'
 exit 0
 EOF
 chmod +x "$TMP/bin/npm"
+# #446 regression: this test runs the REAL setup.sh under a temp HOME, and
+# setup.sh invokes scripts/install-launchd.sh (real launchd, real gui domain).
+# Pre-fix, install-launchd bootstrapped the REAL domain with temp-home plists
+# whose paths die with this test's TMP dir — observed: provider-latency-
+# tripwire registered to a deleted pi-setup-test.*/home path, runs=0 (#446).
+# Two-layer defense: (1) this shim shadows the real launchctl so ANY call is
+# recorded (exit 99 — a call is a test failure by definition); (2) the
+# installer's own temp-HOME guard refuses before calling launchctl, so the
+# shim log stays empty. A non-empty log or a missing guard message fails the
+# test. The installer happy-path stays covered hermetically by
+# scripts/install-launchd.test.sh (fake HOME + shim + ELDATO_ALLOW_TEST_HOME=1).
+cat > "$TMP/bin/launchctl" <<'EOF'
+#!/bin/bash
+# #446: real launchctl must NEVER be reachable from this temp-HOME setup test.
+echo "UNEXPECTED launchctl call: $*" >> "${LAUNCHCTL_LOG:?}"
+exit 99
+EOF
+chmod +x "$TMP/bin/launchctl"
+export LAUNCHCTL_LOG="$TMP/launchctl.log"
+: > "$LAUNCHCTL_LOG"
 export PATH="$TMP/bin:$PATH"
 export HOME="$HOME_DIR"
 
@@ -272,6 +292,29 @@ check_content_matches "$DEST/extensions" "run6"
 check_fix_markers "$DEST/extensions" "run6"
 
 # --- done -----------------------------------------------------------------
+# #446: seven setup.sh runs happened under the temp HOME; the launchctl shim
+# must be SILENT (no call escaped to any launchctl) and the installer's
+# temp-HOME guard must have refused every time (message present per run).
+# Darwin-only in practice (setup.sh reaches install-launchd only on Darwin);
+# guarded so a hypothetical Linux CI run can't fail on these assertions.
+if [[ "$(uname)" == "Darwin" ]]; then
+  setup_runs="$(grep -c '^---- setup.sh run' "$RUNS_LOG")"
+  if [ -s "$LAUNCHCTL_LOG" ]; then
+    fail "launchctl was called $setup_runs setup-run(s) in: $(cat "$LAUNCHCTL_LOG" | head -1)"
+  elif [ "$setup_runs" -ge 1 ]; then
+    echo "ok: zero launchctl calls across $setup_runs setup runs (real domain untouched)"
+  else
+    fail "no setup.sh runs recorded — cannot verify launchctl isolation"
+  fi
+  guard_hits="$(grep -c 'refusing to manage launchd jobs' "$RUNS_LOG" || true)"
+  if [ "$guard_hits" -eq "$setup_runs" ] && [ "$setup_runs" -ge 1 ]; then
+    echo "ok: temp-HOME guard fired on all $setup_runs runs"
+  else
+    fail "temp-HOME guard fired $guard_hits/$setup_runs runs (expected every run)"
+  fi
+else
+  echo "ok: launchctl-isolation assertions skipped (non-Darwin)"
+fi
 if [ "$FAILURES" -gt 0 ]; then
   echo ""
   echo "FAILURES: $FAILURES — full output: $RUNS_LOG" >&2

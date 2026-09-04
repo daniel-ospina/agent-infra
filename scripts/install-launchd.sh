@@ -35,6 +35,9 @@
 # Env overrides (also used by install-launchd.test.sh):
 #   TEMPLATES_DIR   template dir (default: this repo's templates/launchd)
 #   AGENTS_DIR      install dir   (default: $HOME/Library/LaunchAgents)
+#   ELDATO_ALLOW_TEST_HOME   permit launchd management when $HOME is not the
+#                            real user home (tests ONLY — requires a launchctl
+#                            shim on PATH so nothing reaches the real domain)
 #
 # Exit codes: 0 = ok (or clean skip), 1 = failure (loud), 2 = usage error.
 set -uo pipefail
@@ -289,6 +292,32 @@ retire_pass() {
 
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     usage
+fi
+
+# ── temp-HOME guard (#446) ──────────────────────────────────────────────
+# A run with HOME ≠ the real user home (pi-bootstrap tests bootstrap the real
+# gui domain with throwaway temp-home plists) registers jobs whose plist path
+# belongs to a dir that dies with the test — the exact observed failure:
+# com.eldato.provider-latency-tripwire registered to a deleted
+# pi-setup-test.*/home path, runs=0, dead through the #413 incident window.
+# Refuse ALL launchd management (install AND --uninstall) when HOME is not
+# the real home. Tests opt in with ELDATO_ALLOW_TEST_HOME=1 AND a launchctl
+# shim on PATH (install-launchd.test.sh) so nothing reaches the real domain.
+# On non-Darwin (no dscl — CI) the real home is unknown; the guard is
+# skipped there and the launchctl shim is the only isolation (no gui domain).
+if [ "${ELDATO_ALLOW_TEST_HOME:-}" != "1" ]; then
+    # `|| true`: no set -e here, but keep the probe abort-proof against any
+    # future hardening (a dscl failure must SKIP the guard, never kill it).
+    # sed (not awk $2): NFSHomeDirectory values can contain spaces
+    # (e.g. /Users/John Smith) — only the prefix is stripped (cycle 3 P3).
+    real_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p' | head -1 || true)"
+    if [ -n "$real_home" ] && [ "$HOME" != "$real_home" ]; then
+        echo "ERROR: refusing to manage launchd jobs: HOME=$HOME is not the real home ($real_home)." >&2
+        echo "       A temp-HOME run registers jobs against plist paths that vanish (#446)." >&2
+        echo "       Tests: put a launchctl shim on PATH and set ELDATO_ALLOW_TEST_HOME=1" >&2
+        echo "       (see scripts/install-launchd.test.sh)." >&2
+        exit 1
+    fi
 fi
 
 # ── --uninstall must work on a BROKEN machine — before env resolution ──
