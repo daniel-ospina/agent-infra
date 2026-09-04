@@ -110,7 +110,7 @@ file_alert() { # <latency> <detail>
   local title="provider-latency: api.deepseek.com FAIL (${latency}s, threshold ${THRESHOLD_S}s)"
   local body="Provider-latency tripwire FAILED at $TS.
 
-- probe: deepseek-v4-flash chat/completions (5-token prompt)
+- probe: deepseek-v4-flash chat/completions (5-token reply cap)
 - measured: ${latency}s (threshold ${THRESHOLD_S}s)
 - detail: $detail
 - context: the 2026-09-02/03 regression (30-70s/call) was a provider-side
@@ -119,7 +119,7 @@ file_alert() { # <latency> <detail>
   in /tmp/provider-latency-tripwire.log."
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    log "  [dry-run] would file: $title"
+    log "$TS [dry-run] would file: $title"
     return 0
   fi
   # Dedup: one OPEN provider-latency issue → comment; else create.
@@ -128,12 +128,12 @@ file_alert() { # <latency> <detail>
   existing="$(printf '%s' "$existing" | tr -d '[]')"
   if [ -n "$existing" ] && [ "$existing" != "null" ]; then
     "$GH_BIN" issue comment --repo "$REPO" "$existing" --body "$body" >/dev/null 2>&1 \
-      && log "  → commented on existing provider-latency issue #$existing ($REPO)" \
-      || log "⚠️  gh comment failed for $REPO (issue #$existing)" >&2
+      && log "$TS → commented on existing provider-latency issue #$existing ($REPO)" \
+      || log "$TS ⚠️ gh comment failed for $REPO (issue #$existing)" >&2
   else
     local url
     url="$("$GH_BIN" issue create --repo "$REPO" --title "$title" --body "$body" 2>/dev/null || true)"
-    if [ -n "$url" ]; then log "  → opened provider-latency issue: $url"; else log "⚠️  gh issue create failed for $REPO" >&2; fi
+    if [ -n "$url" ]; then log "$TS → opened provider-latency issue: $url"; else log "$TS ⚠️ gh issue create failed for $REPO" >&2; fi
   fi
 }
 
@@ -167,7 +167,7 @@ case "$HTTP" in
     ;;
   429|5*)
     log "$TS FAIL http=${HTTP} wall=${LATENCY:-?}s (provider overload/error)"
-    file_alert "${LATENCY:-${HTTP}}" "http ${HTTP}"
+    file_alert "${LATENCY:-unknown}" "http ${HTTP}"
     exit 1
     ;;
   *)

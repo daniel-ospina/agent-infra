@@ -40,8 +40,10 @@ It copies your models, agents, extensions, rules, skills, scripts, and **MCP con
 
 **Launchd agents (macOS):** setup.sh also installs the scheduled jobs via
 `scripts/install-launchd.sh` — the versioned plist templates in
-`templates/launchd/` (hub-state-check every 6h; corruption-canary every
-15 min on swarm hosts). The installer is idempotent: renders → diffs vs the
+`templates/launchd/` (hub-state-check every 6h; skill-lint-oracle daily;
+provider-latency-tripwire every 1h — the api.deepseek.com latency alert
+#424; corruption-canary every 15 min on swarm hosts). The installer is
+idempotent: renders → diffs vs the
 installed plist → skips when identical, reloads on change. Run
 `scripts/install-launchd.sh --status` to inspect; `--uninstall` to remove.
 

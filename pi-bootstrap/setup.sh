@@ -240,7 +240,8 @@ else
 fi
 
 # Scripts farm (checkout-hygiene): symlink the launchd scripts the plist
-# jobs invoke (corruption-canary + hub-state-check convention, #304). Keeps
+# jobs invoke (corruption-canary + hub-state-check convention, #304;
+# provider-latency-tripwire added #424). Keeps
 # repo symlinks (updates flow via git pull) like the skills farm; replaces
 # stale/foreign links with fresh ones. Test files and plist templates are
 # not farmed (tests don't ship; plists are rendered from templates/launchd).

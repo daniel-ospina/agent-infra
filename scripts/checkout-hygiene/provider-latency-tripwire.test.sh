@@ -57,7 +57,7 @@ trip() {
   done
   local log="$TMP/run.log" stub_log="$TMP/stub.log" rc out
   : > "$stub_log"; : > "$log"
-  out="$(cd "$TMP" && env -i HOME="$HOME" PATH="$PATH" PLT_LOG="$log" \
+  out="$(cd "$TMP" && env -i HOME="$HOME" PATH="$PATH" PLT_KEY=test PLT_LOG="$log" \
     GH_BIN="$TMP/gh-stub" STUB_LOG="$stub_log" ${envs[@]+"${envs[@]}"} \
     bash "$CHECK" ${args[@]+"${args[@]}"} 2>&1)" && rc=0 || rc=$?
   LAST_OUT="$out"

@@ -68,8 +68,10 @@ mkfakehome() { # $1 = home dir
     mkdir -p "$1/.pi/agent/scripts/checkout-hygiene"
     touch "$1/.pi/agent/scripts/checkout-hygiene/hub-state-check.sh"
     touch "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
+    touch "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
     chmod +x "$1/.pi/agent/scripts/checkout-hygiene/hub-state-check.sh"
     chmod +x "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
+    chmod +x "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
     mkdir -p "$1/swarm/.venv/bin"
     touch "$1/swarm/.venv/bin/python"
     chmod +x "$1/swarm/.venv/bin/python"
@@ -123,8 +125,14 @@ ORACLE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist
 assert_contains "$OUT" "com.eldato.skill-lint-oracle: installed + loaded" "skill-lint-oracle installed on fresh machine"
 assert_contains "$(cat "$ORACLE_INSTALLED")" "cron-quality-gates.sh" "oracle plist rendered with AGENT_INFRA_PATH"
 assert_contains "$(cat "$ORACLE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "oracle template carries version marker"
+# #424 — the latency tripwire is a fourth template job (every machine: hourly
+# api.deepseek.com probe, alert on >15s latency via deduped GitHub issue).
+TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
+assert_contains "$OUT" "com.eldato.provider-latency-tripwire: installed + loaded" "provider-latency-tripwire installed on fresh machine"
+assert_contains "$(cat "$TRIPWIRE_INSTALLED")" "$HOME1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh" "tripwire plist rendered with fake HOME"
+assert_contains "$(cat "$TRIPWIRE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "tripwire template carries version marker"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "3" "fresh install bootstraps all jobs"
+assert_eq "$BOOTSTRAP_COUNT1" "4" "fresh install bootstraps all jobs"
 
 echo "── 2. Render determinism ─────────────────────────────────────────"
 # Direct byte-identity check: two renders of the same template with the same

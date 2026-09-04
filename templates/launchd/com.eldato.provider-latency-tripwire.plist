@@ -4,7 +4,7 @@
 <plist version="1.0">
 <dict>
     <!-- provider-latency-tripwire (#413/#424): every 1h probe
-         api.deepseek.com chat/completions (deepseek-v4-flash, 5-token prompt);
+         api.deepseek.com chat/completions (deepseek-v4-flash, 5-token reply);
          on latency > 15s (or timeout/provider error), open/comment ONE deduped
          GitHub issue so the next provider-side latency incident is detected
          and dated within ~1h (postmortem of the 2026-09-02/03 30-70s
