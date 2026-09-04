@@ -1746,9 +1746,11 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
       // a remote-branch DELETION — block it even when the dst matches; a bare
       // `HEAD` refspec resolves to the checked-out branch. #439 P2: git merges
       // no-arg short flags into clusters (`-dq` = -d --quiet) — exact-match
-      // misses them, so any single-dash short cluster containing d or f
-      // (push's only destructive short flags: --delete / --force) blocks.
-      const hasShortDestructiveCluster = a.some((x) => /^-[^-]/.test(x) && /[df]/.test(x));
+      // misses them, so a cluster made ONLY of push's no-arg short alphabet
+      // (v q n u 4 6 d f) containing d or f (push's destructive shorts) blocks.
+      // Attached push-option values (`-odraft`, `-uofoo`) contain other letters
+      // (o) and are NOT clusters — they keep flowing (cycle-5 probe).
+      const hasShortDestructiveCluster = a.some((x) => /^-[vqnu46df]+$/.test(x) && /[df]/.test(x));
       if (flag("-f") || flag("--force") || flag("--delete") || flag("-d") ||
           hasShortDestructiveCluster ||
           a.includes("--mirror") || a.includes("--tags") ||

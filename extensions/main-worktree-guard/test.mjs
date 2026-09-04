@@ -519,6 +519,8 @@ m4("push -dq cluster blocked", `git push origin -dq pr1467`, "pr1467", "block");
 m4("push -fd cluster blocked", `git push -fd origin main`, "main", "block");
 m4("push -qvdf cluster blocked", `git push origin -qvdf pr1467`, "pr1467", "block");
 m4("push -q non-destructive still recovery", `git push -q origin pr1467`, "pr1467", "recovery");
+m4("push attached -o value not a cluster (cycle-5)", `git push -odraft origin pr1467`, "pr1467", "recovery");
+m4("push -u -o mix recovery", `git push -uqv origin pr1467`, "pr1467", "recovery");
 m4("status allowed", `git status`, "pr1467", "recovery");
 m4("log allowed", `git log --oneline -5`, "pr1467", "recovery");
 m4("worktree add allowed", `git worktree add ../wt -b feat/x origin/main`, "pr1467", "recovery");
