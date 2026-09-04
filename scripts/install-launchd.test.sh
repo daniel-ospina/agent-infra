@@ -7,17 +7,24 @@
 # throwaway fake HOME + fake templates dir + fake `launchctl` shim in a temp
 # dir — never touches the real ~/Library/LaunchAgents or real launchd.
 #
-# Coverage (issue #304 test plan):
-#   fresh-HOME simulation  all jobs installed with substituted paths
+# Coverage (issue #304 test plan + #432 retirement):
+#   fresh-HOME simulation  all ACTIVE jobs installed with substituted paths;
+#                          retired jobs (hub-state-check, skill-lint-oracle)
+#                          never installed
+#   retirement             pre-seeded retired plists unloaded + removed
 #   render determinism     same env → byte-identical output
 #   idempotent skip        second run: "unchanged", no bootout/bootstrap
 #   change → reload        template bump → reinstall + one new bootstrap
 #   bootstrap failure      shim FAILS bootstrap → installer exits 1, loud
 #   broken-target guard    missing script → refuse, exit 1, no install
-#   placeholder skip       no swarm root → canary skipped (exit 0), hub installed
+#   placeholder skip       no swarm root → canary skipped (exit 0), tripwire ok
 #   --status               installed/loaded/drift reporting
 #   --uninstall            bootout + remove; re-run reports NOT INSTALLED
 #   template lint          plutil -lint the rendered plists (when plutil exists)
+#
+# Vehicle job for reload/fail/broken-target/status sections = the latency
+# tripwire (com.eldato.provider-latency-tripwire, StartInterval 3600); the
+# canary (StartInterval 900) is the swarm-root-conditional job.
 
 set -euo pipefail
 
@@ -66,17 +73,30 @@ chmod +x "$T/bin/launchctl"
 # Fake HOME with a farmed scripts dir + a swarm checkout.
 mkfakehome() { # $1 = home dir
     mkdir -p "$1/.pi/agent/scripts/checkout-hygiene"
-    touch "$1/.pi/agent/scripts/checkout-hygiene/hub-state-check.sh"
     touch "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
     touch "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
-    chmod +x "$1/.pi/agent/scripts/checkout-hygiene/hub-state-check.sh"
     chmod +x "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
     chmod +x "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
     mkdir -p "$1/swarm/.venv/bin"
     touch "$1/swarm/.venv/bin/python"
     chmod +x "$1/swarm/.venv/bin/python"
-    mkdir -p "$1/tortoise/.git"
     mkdir -p "$1/Library/LaunchAgents"
+}
+
+# Retired-job labels: seeds the fake home with their OLD installed plists so
+# the retirement pass has something to unload (mirrors real machines that
+# installed them pre-retirement — #432).
+seed_retired() { # $1 = home dir
+    for label in com.eldato.hub-state-check com.eldato.skill-lint-oracle; do
+        cat > "$1/Library/LaunchAgents/$label.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$label</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>/x/$label.sh</string></array>
+</dict></plist>
+EOF
+    done
 }
 
 # Copies repo templates into a scratch dir (installer's template dir is
@@ -86,9 +106,10 @@ cp -R "$REPO_TEMPLATES" "$TEMPLATES"
 
 HOME1="$T/home1"; mkfakehome "$HOME1"
 HOME2="$T/home2"; mkfakehome "$HOME2"
-TORTOISE="$T/home1/tortoise"
 LOG="$T/launchctl.log"
+LOG2="$T/launchctl-retire.log"  # isolated log for the HOME2 retirement section
 : > "$LOG"
+: > "$LOG2"
 
 run_installer() { # <home> [extra env assignments...]
     (
@@ -98,7 +119,6 @@ run_installer() { # <home> [extra env assignments...]
         export TEMPLATES_DIR="$TEMPLATES"
         export AGENTS_DIR="$HOME/Library/LaunchAgents"
         export SWARM_ROOT="$HOME/swarm"
-        export TORTOISE_REPO="$HOME/tortoise"
         export PYTHON_BIN="$HOME/swarm/.venv/bin/python"
         shift
         bash "$INSTALLER" "$@"
@@ -109,79 +129,94 @@ echo "── 1. Fresh-HOME simulation ──────────────
 OUT="$(run_installer "$HOME1")"
 RC=$?
 assert_eq "$RC" "0" "fresh install exits 0"
-assert_contains "$OUT" "hub-state-check: installed + loaded" "hub-state-check installed on fresh machine"
 assert_contains "$OUT" "corruption-canary: installed + loaded" "corruption-canary installed on fresh machine"
-HUB_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
+assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider-latency-tripwire installed on fresh machine"
 CANARY_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.corruption-canary.plist"
-assert_contains "$(cat "$HUB_INSTALLED")" "$HOME1/.pi/agent/scripts/checkout-hygiene/hub-state-check.sh" "hub plist rendered with fake HOME"
-assert_contains "$(cat "$HUB_INSTALLED")" "$TORTOISE" "hub plist rendered TORTOISE_REPO env"
+TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
+HUB_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
+ORACLE_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
 assert_contains "$(cat "$CANARY_INSTALLED")" "$HOME1/swarm/.venv/bin/python" "canary plist rendered PYTHON_BIN"
 assert_contains "$(cat "$CANARY_INSTALLED")" "--root" "canary plist keeps --root"
 assert_contains "$(cat "$CANARY_INSTALLED")" "agent-infra-plist-version: 0.1.0" "canary template carries version marker"
-assert_contains "$(cat "$HUB_INSTALLED")" "agent-infra-plist-version: 0.1.0" "hub template carries version marker"
-# #254 Task 10 drift-watch — the oracle plist is a third template job; it is
-# installed on every machine (only {{AGENT_INFRA_PATH}} — always resolved).
-# NOTE (#427): the oracle is TCC-bound to its ~/Documents repo home under
-# launchd (bash/git/node blocked; python exempt) — tracked in #427, not
-# farmable (dirname-$0 self-location needs repo siblings).
-ORACLE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
-assert_contains "$OUT" "com.eldato.skill-lint-oracle: installed + loaded" "skill-lint-oracle installed on fresh machine"
-assert_contains "$(cat "$ORACLE_INSTALLED")" "cron-quality-gates.sh" "oracle plist rendered with AGENT_INFRA_PATH"
-assert_contains "$(cat "$ORACLE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "oracle template carries version marker"
-# #424 — the latency tripwire is a fourth template job (every machine: hourly
-# api.deepseek.com probe, alert on >15s latency via deduped GitHub issue).
-TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
-assert_contains "$OUT" "com.eldato.provider-latency-tripwire: installed + loaded" "provider-latency-tripwire installed on fresh machine"
 assert_contains "$(cat "$TRIPWIRE_INSTALLED")" "$HOME1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh" "tripwire plist rendered with fake HOME"
 assert_contains "$(cat "$TRIPWIRE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "tripwire template carries version marker"
+# #432 — hub-state-check + skill-lint-oracle are RETIRED from launchd (their
+# work moved to extensions/session-checks.ts — macOS TCC blocks launchd from
+# ~/Documents, so they run from pi's session_start instead).
+assert_not_contains "$OUT" "hub-state-check: installed + loaded" "retired hub job NOT installed on fresh machine"
+assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired oracle job NOT installed on fresh machine"
+[ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
+[ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "4" "fresh install bootstraps all jobs"
+assert_eq "$BOOTSTRAP_COUNT1" "2" "fresh install bootstraps only active jobs"
 
-echo "── 2. Render determinism ─────────────────────────────────────────"
+echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
+seed_retired "$HOME2"
+OUT="$(LOG="$LOG2" run_installer "$HOME2")"
+RC=$?
+assert_eq "$RC" "0" "installer with seeded retired jobs exits 0"
+assert_contains "$OUT" "com.eldato.hub-state-check: RETIRED (unloaded + removed)" "hub retired job unloaded + removed"
+assert_contains "$OUT" "com.eldato.skill-lint-oracle: RETIRED (unloaded + removed)" "oracle retired job unloaded + removed"
+[ ! -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist" ] && ok "hub retired plist file gone" || bad "hub retired plist file gone"
+[ ! -f "$HOME2/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist" ] && ok "oracle retired plist file gone" || bad "oracle retired plist file gone"
+OUT="$(LOG="$LOG2" run_installer "$HOME2")"
+RC=$?
+assert_eq "$RC" "0" "retirement is idempotent (second run exits 0)"
+assert_not_contains "$OUT" "RETIRED (unloaded + removed)" "no repeat retirement chatter"
+# A retired label that STILL has a template is a config error → loud + exit 1.
+cp "$REPO_TEMPLATES/com.eldato.provider-latency-tripwire.plist" "$TEMPLATES/com.eldato.hub-state-check.plist"
+set +e
+OUT="$(LOG="$LOG2" run_installer "$HOME2" 2>&1)"
+RC=$?
+set -e
+assert_eq "$RC" "1" "retired label with template → exit 1"
+assert_contains "$OUT" "com.eldato.hub-state-check is in RETIRED but a template still exists" "retire/template conflict named loudly"
+[ ! -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist" ] && ok "conflicting template NOT installed" || bad "conflicting template NOT installed"
+rm -f "$TEMPLATES/com.eldato.hub-state-check.plist"
+
+echo "── 3. Render determinism ─────────────────────────────────────────"
 # Direct byte-identity check: two renders of the same template with the same
 # env must be byte-identical (same placeholder set → same output).
 render_twice() {
     local r1 r2
     r1="$(HOME="$HOME2" TEMPLATES_DIR="$TEMPLATES" SWARM_ROOT="$HOME2/swarm" \
-        TORTOISE_REPO="$HOME2/tortoise" PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
-        sed -e "s|{{HOME}}|$HOME2|g" -e "s|{{TORTOISE_REPO}}|$HOME2/tortoise|g" \
-            -e "s|{{SWARM_ROOT}}|$HOME2/swarm|g" -e "s|{{PYTHON_BIN}}|$HOME2/swarm/.venv/bin/python|g" \
-            "$TEMPLATES/com.eldato.hub-state-check.plist")"
+        PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
+        sed -e "s|{{HOME}}|$HOME2|g" -e "s|{{PYTHON_BIN}}|$HOME2/swarm/.venv/bin/python|g" \
+            "$TEMPLATES/com.eldato.corruption-canary.plist")"
     r2="$(HOME="$HOME2" TEMPLATES_DIR="$TEMPLATES" SWARM_ROOT="$HOME2/swarm" \
-        TORTOISE_REPO="$HOME2/tortoise" PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
-        sed -e "s|{{HOME}}|$HOME2|g" -e "s|{{TORTOISE_REPO}}|$HOME2/tortoise|g" \
-            -e "s|{{SWARM_ROOT}}|$HOME2/swarm|g" -e "s|{{PYTHON_BIN}}|$HOME2/swarm/.venv/bin/python|g" \
-            "$TEMPLATES/com.eldato.hub-state-check.plist")"
+        PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
+        sed -e "s|{{HOME}}|$HOME2|g" -e "s|{{PYTHON_BIN}}|$HOME2/swarm/.venv/bin/python|g" \
+            "$TEMPLATES/com.eldato.corruption-canary.plist")"
     assert_eq "$(printf '%s' "$r1" | shasum | cut -d' ' -f1)" \
         "$(printf '%s' "$r2" | shasum | cut -d' ' -f1)" \
         "same env → byte-identical render"
 }
 render_twice
 
-echo "── 3. Idempotent skip ────────────────────────────────────────────"
+echo "── 4. Idempotent skip ────────────────────────────────────────────"
 OUT="$(run_installer "$HOME1")"
 RC=$?
 assert_eq "$RC" "0" "re-run exits 0"
-assert_contains "$OUT" "hub-state-check: unchanged (skip)" "hub job skipped when identical"
+assert_contains "$OUT" "provider-latency-tripwire: unchanged (skip)" "tripwire job skipped when identical"
 assert_contains "$OUT" "corruption-canary: unchanged (skip)" "canary job skipped when identical"
 BOOTSTRAP_COUNT2="$(grep -c 'launchctl bootstrap' "$LOG")"
 assert_eq "$BOOTSTRAP_COUNT2" "$BOOTSTRAP_COUNT1" "no reload on no-change"
 
-echo "── 4. Change → reload ────────────────────────────────────────────"
-sed -i.bak 's/<integer>21600<\/integer>/<integer>21601<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist" && rm -f "$TEMPLATES/com.eldato.hub-state-check.plist".bak
+echo "── 5. Change → reload ────────────────────────────────────────────"
+sed -i.bak 's/<integer>3600<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
 OUT="$(run_installer "$HOME1")"
 RC=$?
 assert_eq "$RC" "0" "change install exits 0"
-assert_contains "$OUT" "hub-state-check: installed + loaded" "hub reloaded on template change"
-assert_contains "$(cat "$HUB_INSTALLED")" "21601" "new StartInterval applied"
+assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "tripwire reloaded on template change"
+assert_contains "$(cat "$TRIPWIRE_INSTALLED")" "3601" "new StartInterval applied"
 BOOTSTRAP_COUNT3="$(grep -c 'launchctl bootstrap' "$LOG")"
 assert_eq "$BOOTSTRAP_COUNT3" "$((BOOTSTRAP_COUNT2 + 1))" "exactly one reload for the changed job"
 
-echo "── 5. Bootstrap failure is loud ──────────────────────────────────"
-# Restore the template, then force a change so the installer reloads — with
-# the shim configured to fail bootstrap. Must be loud + non-zero.
-sed -i.bak 's/<integer>21601<\/integer>/<integer>21600<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist" && rm -f "$TEMPLATES/com.eldato.hub-state-check.plist".bak
-sed -i.bak 's/<integer>21600<\/integer>/<integer>21602<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist" && rm -f "$TEMPLATES/com.eldato.hub-state-check.plist".bak
+echo "── 6. Bootstrap failure is loud ──────────────────────────────────"
+# Force a change so the installer reloads — with the shim configured to fail
+# bootstrap. Must be loud + non-zero.
+sed -i.bak 's/<integer>3601<\/integer>/<integer>3600<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
+sed -i.bak 's/<integer>3600<\/integer>/<integer>3602<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
 set +e
 OUT="$(FAKE_BOOTSTRAP_FAIL=1 run_installer "$HOME1" 2>&1)"
 RC=$?
@@ -189,12 +224,12 @@ set -e
 assert_eq "$RC" "1" "bootstrap failure → exit 1"
 assert_contains "$OUT" "FAIL" "bootstrap failure reported loudly"
 
-echo "── 6. Broken-target guard ────────────────────────────────────────"
-# Remove the farmed script the hub plist points at (the today-broken symlink
-# case) → installer must refuse with a non-zero exit and no bootstrap.
-rm -f "$HOME1/.pi/agent/scripts/checkout-hygiene/hub-state-check.sh"
-rm -f "$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
-sed -i.bak 's/<integer>21602<\/integer>/<integer>21601<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist" && rm -f "$TEMPLATES/com.eldato.hub-state-check.plist".bak
+echo "── 7. Broken-target guard ────────────────────────────────────────"
+# Remove the farmed script the tripwire plist points at (the today-broken
+# symlink case) → installer must refuse with a non-zero exit and no bootstrap.
+rm -f "$HOME1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
+rm -f "$TRIPWIRE_INSTALLED"
+sed -i.bak 's/<integer>3602<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
 set +e
 OUT="$(run_installer "$HOME1" 2>&1)"
 RC=$?
@@ -203,46 +238,47 @@ assert_eq "$RC" "1" "broken script target → exit 1"
 assert_contains "$OUT" "broken target" "broken target named"
 assert_contains "$OUT" "FAIL" "broken target refuses install"
 BOOTSTRAP_COUNT4="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT4" "$((BOOTSTRAP_COUNT3 + 1))" "no bootstrap for a refused job (count frozen after test 5's failed reload)"
+assert_eq "$BOOTSTRAP_COUNT4" "$((BOOTSTRAP_COUNT3 + 1))" "no bootstrap for a refused job (count frozen after test 6's failed reload)"
 # Restore the farmed script so later tests install cleanly
 mkfakehome "$HOME1"
 
-echo "── 7. Placeholder skip (no swarm root) ───────────────────────────"
-# HOME2 without a swarm root: canary must be SKIPPED (loud, exit 0), hub
-# installed. SWARM_ROOT is env-only in the installer — no auto-detect.
+echo "── 8. Placeholder skip (no swarm root) ───────────────────────────"
+# HOME2 without a swarm root: canary must be SKIPPED (loud, exit 0), tripwire
+# still installed. SWARM_ROOT is env-only in the installer — no auto-detect.
 rm -rf "$HOME2/swarm"
 OUT="$(HOME="$HOME2" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" TEMPLATES_DIR="$TEMPLATES" \
     AGENTS_DIR="$HOME2/Library/LaunchAgents" SWARM_ROOT="" \
-    TORTOISE_REPO="$TORTOISE" PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
+    PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
     bash "$INSTALLER" 2>&1)"
 RC=$?
 assert_eq "$RC" "0" "placeholder skip exits 0 (non-swarm machine ok)"
 assert_contains "$OUT" "SKIP com.eldato.corruption-canary" "canary skipped without swarm root"
-assert_contains "$OUT" "hub-state-check: installed + loaded" "hub still installed without swarm"
+assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "tripwire still installed without swarm"
 
-echo "── 8. --status ───────────────────────────────────────────────────"
-# Template is at 21601; HOME1 hub is not installed (test 5 rollback + test 6
-# refusal) → install it, then bump the template to show DRIFT in --status.
+echo "── 9. --status ───────────────────────────────────────────────────"
+# Template is at 3601; HOME1 tripwire is not installed (test 6 rollback + test
+# 7 refusal) → install it, then bump the template to show DRIFT in --status.
 OUT="$(run_installer "$HOME1" 2>&1)"
-sed -i.bak 's/<integer>21601<\/integer>/<integer>21603<\/integer>/' "$TEMPLATES/com.eldato.hub-state-check.plist" && rm -f "$TEMPLATES/com.eldato.hub-state-check.plist".bak
+sed -i.bak 's/<integer>3601<\/integer>/<integer>3603<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
 OUT="$(run_installer "$HOME1" --status)"
 RC=$?
 assert_eq "$RC" "0" "--status exits 0"
-assert_contains "$OUT" "hub-state-check: installed=loaded version=v0.1.0 (DRIFTED" "status flags drifted hub"
+assert_contains "$OUT" "provider-latency-tripwire: installed=loaded version=v0.1.0 (DRIFTED" "status flags drifted tripwire"
 assert_contains "$OUT" "corruption-canary: installed=loaded version=v0.1.0 (in sync)" "status reports canary in sync"
+assert_contains "$OUT" "Retired (moved to session-checks, #432)" "status lists retired jobs"
 
-echo "── 9. --uninstall ────────────────────────────────────────────────"
+echo "── 10. --uninstall ───────────────────────────────────────────────"
 OUT="$(run_installer "$HOME1" --uninstall)"
 RC=$?
 assert_eq "$RC" "0" "--uninstall exits 0"
-assert_contains "$OUT" "hub-state-check: unloaded + removed" "hub removed"
+assert_contains "$OUT" "provider-latency-tripwire: unloaded + removed" "tripwire removed"
 assert_contains "$OUT" "corruption-canary: unloaded + removed" "canary removed"
-[ ! -f "$HUB_INSTALLED" ] && ok "hub file gone" || bad "hub file gone"
+[ ! -f "$TRIPWIRE_INSTALLED" ] && ok "tripwire file gone" || bad "tripwire file gone"
 [ ! -f "$CANARY_INSTALLED" ] && ok "canary file gone" || bad "canary file gone"
 OUT="$(run_installer "$HOME1" --status)"
 assert_contains "$OUT" "NOT INSTALLED" "status reports clean after uninstall"
 
-echo "── 10. Template lint (plutil, when present) ──────────────────────"
+echo "── 11. Template lint (plutil, when present) ──────────────────────"
 if command -v plutil >/dev/null 2>&1; then
     LINT_OK=1
     for t in "$REPO_TEMPLATES"/*.plist; do
@@ -250,8 +286,8 @@ if command -v plutil >/dev/null 2>&1; then
     done
     assert_eq "$LINT_OK" "1" "all repo templates lint clean"
     # rendered output must lint too (fresh HOME render, after uninstall)
-    OUT="$(run_installer "$HOME1" >/dev/null; plutil -lint "$HUB_INSTALLED" >/dev/null 2>&1; echo $?)"
-    assert_eq "$OUT" "0" "rendered+installed hub plist lints clean"
+    OUT="$(run_installer "$HOME1" >/dev/null; plutil -lint "$TRIPWIRE_INSTALLED" >/dev/null 2>&1; echo $?)"
+    assert_eq "$OUT" "0" "rendered+installed tripwire plist lints clean"
     OUT="$(plutil -lint "$CANARY_INSTALLED" >/dev/null 2>&1; echo $?)"
     assert_eq "$OUT" "0" "rendered+installed canary plist lints clean"
 else

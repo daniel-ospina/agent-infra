@@ -12,7 +12,7 @@
 # Placeholders substituted from env (with machine defaults):
 #   {{HOME}}              $HOME (required)
 #   {{PATH}}              the installer's PATH (launchd's default PATH lacks
-#                         homebrew/bin — the hub job needs `gh` on it)
+#                         homebrew/bin — the alert jobs need `gh` on it)
 #   {{AGENT_INFRA_PATH}}  this repo's MAIN checkout (env overrides; worktree-safe)
 #   {{TORTOISE_REPO}}     env, else ~/Documents/GitHub/tortoise, else sibling ../tortoise
 #   {{SWARM_ROOT}}        env only ("if present" — no auto-detect; canary is
@@ -134,7 +134,7 @@ PY
 }
 
 # Verify every absolute path in ProgramArguments resolves (catches broken
-# symlinks — e.g. hub-state-check.sh pointing at a not-yet-pulled checkout).
+# symlinks — e.g. provider-latency-tripwire.sh pointing at a not-yet-pulled checkout).
 # $1 = rendered plist FILE. Prints broken targets; exits 1 if any.
 verify_targets() {
     local arg bad=0
@@ -239,6 +239,54 @@ uninstall_job() {
     fi
 }
 
+# Retired launchd jobs (#432 — Option C): labels listed in
+# templates/launchd/RETIRED. Their work moved to extensions/session-checks.ts
+# (session_start, age-gated) because launchd cannot run them — macOS TCC
+# blocks launchd-spawned processes from ~/Documents regardless of interpreter
+# (#427/#431). The installer unloads + removes retired jobs on machines that
+# installed them pre-retirement (the template loop only manages PRESENT
+# templates, so a removed template would otherwise strand installed jobs
+# forever). A retired label must NOT also have a *.plist template.
+retired_labels() {
+    local manifest="$TEMPLATES_DIR/RETIRED" label
+    [ -f "$manifest" ] || return 0
+    while IFS= read -r label; do
+        case "$label" in
+            ""|"#"*) continue ;;
+        esac
+        printf '%s\n' "$label"
+    done < "$manifest"
+}
+
+is_retired() { # $1 = label → 0 when it is listed in RETIRED
+    retired_labels | grep -qxF -- "$1"
+}
+
+retire_job() { # $1 = label; unload + remove when installed (silent when gone)
+    local label="$1" installed
+    installed="$AGENTS_DIR/$label.plist"
+    if [ -f "$installed" ]; then
+        launchctl bootout "$DOMAIN" "$installed" 2>/dev/null || true
+        rm -f "$installed"
+        echo "  $label: RETIRED (unloaded + removed)"
+    fi
+}
+
+# Unload retired jobs in both flows: the --uninstall path and the idempotent
+# install path (so a merged retirement propagates on the next sync).
+retire_pass() {
+    local label rc=0
+    for label in $(retired_labels); do
+        if [ -f "$TEMPLATES_DIR/$label.plist" ]; then
+            echo "ERROR: $label is in RETIRED but a template still exists — remove one or the other" >&2
+            rc=1
+            continue
+        fi
+        retire_job "$label"
+    done
+    return "$rc"
+}
+
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     usage
 fi
@@ -250,6 +298,7 @@ if [ "${1:-}" = "--uninstall" ]; then
         [ -f "$template" ] || continue
         uninstall_job "$template"
     done
+    retire_pass || exit 1
     echo "Done. Agent-infra jobs removed."
     exit 0
 fi
@@ -267,8 +316,11 @@ if [ "${1:-}" = "--status" ]; then
         [ -f "$template" ] || continue
         status_job "$template"
     done
+    if [ -n "$(retired_labels)" ]; then
+        echo "Retired (moved to session-checks, #432): $(retired_labels | tr '\n' ' ')"
+    fi
     echo "Env: AGENT_INFRA_PATH=$AGENT_INFRA_PATH"
-    echo "     TORTOISE_REPO=${TORTOISE_REPO:-<unset — hub job will degrade>}"
+    echo "     TORTOISE_REPO=${TORTOISE_REPO:-<unset — session-checks will use the sibling tortoise or skip the hub leg>}"
     echo "     SWARM_ROOT=${SWARM_ROOT:-<unset — canary job skipped>}"
     exit 0
 fi
@@ -280,8 +332,15 @@ fi
 
 echo "=== Installing agent-infra launchd agents (idempotent) ==="
 fail=0
+# Retire first (#432): unload jobs whose work moved to session-checks.
+retire_pass || fail=1
 for template in "$TEMPLATES_DIR"/*.plist; do
     [ -f "$template" ] || continue
+    if is_retired "$(basename "$template" .plist)"; then
+        # retire_pass already ERRORED above (fail=1) — don't ALSO install it.
+        echo "  $(basename "$template" .plist): skipped (in RETIRED — remove the template)" >&2
+        continue
+    fi
     install_job "$template" || fail=1
 done
 if [ "$fail" -ne 0 ]; then

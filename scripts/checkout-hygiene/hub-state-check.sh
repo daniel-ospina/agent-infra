@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hub-state-check.sh — nightly/local hub-discipline check (#1484).
+# hub-state-check.sh — session-gated local hub-discipline check (#1484).
 #
 # The shared main checkout (the hub) must stay on `main` and CLEAN. This script
 # verifies it locally (a GitHub Actions runner cannot observe the local hub —
@@ -19,13 +19,17 @@
 #                    (fallback: $PWD when it is a git repo) + $AGENT_INFRA_PATH.
 #     --gh-report    on FAIL, open/comment ONE GitHub issue per repo (dedup by
 #                    open "hub-state" issues). Uses `gh` (GH_BIN override for
-#                    tests). Rate-limited by the launchd cadence (6h), no auto-fix.
+#                    tests). Rate-limited by the session-checks 6h age gate
+#                    (#432 — pi session start), no auto-fix.
 #
 # Exit codes (cron-quality-gates conventions): 0 = all PASS, 1 = any FAIL,
 # 2 = usage/script error.
 #
-# Deployed as launchd agent com.eldato.hub-state-check.plist (every 6h).
-
+# Deployed via extensions/session-checks.ts (#432 — Option C): age-gated at
+# pi session_start (runs when the last run is >6h old; ~/.pi/agent/state).
+# NOT a launchd job anymore — macOS TCC blocks launchd-spawned processes from
+# reading ~/Documents, where the repos it checks live.
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

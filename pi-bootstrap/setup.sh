@@ -242,20 +242,20 @@ fi
 # Scripts farm (launchd-invoked): COPY (not symlink) repo scripts into
 # ~/.pi/agent/scripts. #427: symlinks into the repo (~/Documents, macOS
 # TCC-protected) made launchd-spawned bash fail with EPERM at script-open;
-# real files under ~/.pi/agent are readable, so copies revive the
-# SELF-CONTAINED launchd jobs (provider-latency-tripwire; corruption-canary
-# runs because its watched root ~/swarm is NOT TCC-protected — not because
-# of python; #431 probe: python3 EPERMs on ~/Documents under launchd exactly
-# like bash/git/node. The wall is path-based, interpreter-independent).
-# hub-state-check + skill-lint-oracle additionally read ~/Documents content
-# via git/node → still TCC-blocked under launchd regardless (see #427; the
-# fix is a Full-Disk-Access grant, not a path change). Same model as the
-# skills farm: idempotent refresh on each sync.sh. Stale-dest caveat: a farm
-# script removed from the repo is NOT deleted from ~/.pi (extras kept) —
-# install-launchd's broken-target check can no longer catch it, so removing
-# a farmed script must also remove/retire its plist job. Test files and
-# plist templates are not farmed (tests don't ship; plists render from
-# templates/launchd).
+# real files under ~/.pi/agent are readable, so copies revive the two
+# remaining launchd jobs — provider-latency-tripwire (#424, self-contained)
+# and corruption-canary (watches ~/swarm, an UNPROTECTED path — #431 probe:
+# python3 EPERMs on ~/Documents under launchd exactly like bash/git/node;
+# the TCC wall is path-based, interpreter-independent).
+# hub-state-check + skill-lint-oracle are NOT launchd jobs anymore (#432 —
+# Option C): they read ~/Documents repos, which launchd can never do without
+# an FDA grant, so extensions/session-checks.ts runs them age-gated from pi's
+# session_start (TCC-approved tree). Same model as the skills farm: idempotent
+# refresh on each sync.sh. Stale-dest caveat: a farm script removed from the
+# repo is NOT deleted from ~/.pi (extras kept) — install-launchd's
+# broken-target check can no longer catch it, so removing a farmed script
+# must also remove/retire its plist job. Test files and plist templates are
+# not farmed (tests don't ship; plists render from templates/launchd).
 scripts_dir="$INFRA_ROOT/scripts/checkout-hygiene"
 if [ -d "$scripts_dir" ]; then
   mkdir -p "$DEST/scripts/checkout-hygiene"
