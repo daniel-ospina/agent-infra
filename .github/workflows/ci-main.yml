@@ -99,6 +99,10 @@ jobs:
           done
           bash scripts/install-launchd.test.sh || errors=$((errors+1))
           bash scripts/record-review.test.sh || errors=$((errors+1))
+          # #449 — pi-bootstrap setup regression suite (no-nesting #93, active-refresh,
+          # farm-link preservation, extensions/ content parity = #447 ship-list drift
+          # tripwire, #446 launchctl isolation). Real setup.sh, hermetic (~2min).
+          bash pi-bootstrap/tests/test-setup-no-nesting.sh || errors=$((errors+1))
           if [ $errors -gt 0 ]; then
             echo "❌ $errors bash script(s)/test(s) failed validation"
             exit 1
