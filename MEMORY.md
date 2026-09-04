@@ -20,3 +20,5 @@
 - [gh]: `gh issue comment` heredocs break on backticks/`$()`/parens in the body (bash re-processes the command) — always write the body with the `write` tool and pass `--body-file`.
 - [extensions]: print-mode-wiring.test.ts fails on ANY raw `process.env.PI_MODE` read in production extension files (zero-raw-reads discipline, #228) — route every read through shared/print-mode.ts (isPrintMode/isPrintModeEnv); my review round hit this at VGATE.
 - [extensions]: the deployed extension at ~/.pi/agent/extensions/<name>/ is a COPY, not a symlink — repo changes reach live sessions only via ./sync.sh AND a pi restart (module loads at startup); a running session keeps the OLD module (audit-window lag is expected, not a deploy failure).
+
+- [git-stash]: dropped stash@{0} lost untracked gate scripts (check-ask-*) — default git stash list/show skips third-parent content (git stash show -u reveals it) → inspect `git ls-tree -r stash@{N}^3` before any drop
