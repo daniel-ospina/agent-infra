@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- provider-latency-tripwire (#413/#424): every 1h probe
+         api.deepseek.com chat/completions (deepseek-v4-flash, 5-token prompt);
+         on latency > 15s (or timeout/provider error), open/comment ONE deduped
+         GitHub issue so the next provider-side latency incident is detected
+         and dated within ~1h (postmortem of the 2026-09-02/03 30-70s
+         regression). PASS/SKIP runs are quiet (exit 0, line appended to
+         /tmp/provider-latency-tripwire.log). API key resolved at runtime from
+         ~/pi-keys.env (launchd does not inherit the shell profile).
+         Canonical script: agent-infra/scripts/checkout-hygiene/provider-latency-tripwire.sh
+         (symlinked to ~/.pi/agent/scripts/checkout-hygiene/ by
+         pi-bootstrap/setup.sh). Rendered by scripts/install-launchd.sh (#304)
+         — placeholders only, no machine-specific paths. -->
+    <key>Label</key>
+    <string>com.eldato.provider-latency-tripwire</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/provider-latency-tripwire.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/provider-latency-tripwire.out.log</string>
+</dict>
+</plist>
