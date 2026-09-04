@@ -112,16 +112,23 @@ done
 
 # ── GitHub reporting (dedup: one open issue per repo, comment on existing) ──
 if [[ $GH_REPORT -eq 1 && $FAIL -gt 0 ]]; then
-  for fail_line in "${FAIL_LINES[@]}"; do
-    IFS='|' read -r repo_path disorder branch porcelain_count <<<"$fail_line"
-    # Repo slug from the remote URL (https or ssh forms).
-    slug="$(git -C "$repo_path" remote get-url origin 2>/dev/null | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git$##' || true)"
-    if [[ -z "$slug" ]]; then
-      echo "⚠️  no origin remote for $repo_path — skipping GitHub issue" >&2
-      continue
-    fi
-    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    body="Hub-discipline check FAILED for **$repo_path** at $ts.
+  # #431: FAIL can be set WITHOUT a FAIL_LINES entry (not-a-directory,
+  # not-a-git-repo — incl. the launchd-TCC git-EPERM case). On macOS bash 3.2
+  # `"${FAIL_LINES[@]}"` on an EMPTY array is an unbound-variable error under
+  # set -u → the whole report leg crashed before filing anything.
+  if [[ ${#FAIL_LINES[@]} -eq 0 ]]; then
+    echo "⚠️  FAIL set but no repo-level FAIL_LINES (bad repo arg / not a git repo / EPERM?) — nothing to report" >&2
+  else
+    for fail_line in "${FAIL_LINES[@]}"; do
+      IFS='|' read -r repo_path disorder branch porcelain_count <<<"$fail_line"
+      # Repo slug from the remote URL (https or ssh forms).
+      slug="$(git -C "$repo_path" remote get-url origin 2>/dev/null | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git$##' || true)"
+      if [[ -z "$slug" ]]; then
+        echo "⚠️  no origin remote for $repo_path — skipping GitHub issue" >&2
+        continue
+      fi
+      ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      body="Hub-discipline check FAILED for **$repo_path** at $ts.
 
 - \`HUB_DISORDER=$disorder\` (branch=\`$branch\`, porcelain=$porcelain_count)
 - The shared main checkout must stay on \`main\` and clean (hub discipline, #1484).
@@ -133,19 +140,20 @@ cd $repo_path && git checkout main && git pull --ff-only
 \`\`\`
 
 WIP on a stranded branch is preserved by \`git push origin <checked-out-branch>\` before recovery."
-    # Dedup: one OPEN hub-state issue per repo → comment; else create.
-    # gh --jq prints the number, or empty/[]/null when none is open.
-    existing="$("$GH_BIN" issue list --repo "$slug" --state open --search "hub-state in:title" --json number --jq '.[0].number' 2>/dev/null || true)"
-    existing="$(printf '%s' "$existing" | tr -d '[]')"
-    if [[ -n "$existing" && "$existing" != "null" ]]; then
-      "$GH_BIN" issue comment --repo "$slug" "$existing" --body "$body" >/dev/null 2>&1 \
-        && echo "  → commented on existing hub-state issue #$existing ($slug)" \
-        || echo "⚠️  gh comment failed for $slug (issue #$existing)" >&2
-    else
-      url="$("$GH_BIN" issue create --repo "$slug" --title "hub-state FAIL: $repo_path ($disorder)" --body "$body" 2>/dev/null || true)"
-      if [[ -n "$url" ]]; then echo "  → opened hub-state issue: $url"; else echo "⚠️  gh issue create failed for $slug" >&2; fi
-    fi
-  done
+      # Dedup: one OPEN hub-state issue per repo → comment; else create.
+      # gh --jq prints the number, or empty/[]/null when none is open.
+      existing="$("$GH_BIN" issue list --repo "$slug" --state open --search "hub-state in:title" --json number --jq '.[0].number' 2>/dev/null || true)"
+      existing="$(printf '%s' "$existing" | tr -d '[]')"
+      if [[ -n "$existing" && "$existing" != "null" ]]; then
+        "$GH_BIN" issue comment --repo "$slug" "$existing" --body "$body" >/dev/null 2>&1 \
+          && echo "  → commented on existing hub-state issue #$existing ($slug)" \
+          || echo "⚠️  gh comment failed for $slug (issue #$existing)" >&2
+      else
+        url="$("$GH_BIN" issue create --repo "$slug" --title "hub-state FAIL: $repo_path ($disorder)" --body "$body" 2>/dev/null || true)"
+        if [[ -n "$url" ]]; then echo "  → opened hub-state issue: $url"; else echo "⚠️  gh issue create failed for $slug" >&2; fi
+      fi
+    done
+  fi
 fi
 
 echo ""

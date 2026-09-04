@@ -142,7 +142,28 @@ touch "$GH_EXISTING"
 out="$(bash "$CHECK" --repo "$HUB" --gh-report 2>&1)" && rc=0 || rc=$?
 assert_contains "$out" "commented on existing hub-state issue" "repeat FAIL comments on the open issue (dedup)"
 if grep -q "issue create" "$GH_STUB_LOG"; then bad "dedup: no second issue create"; else ok "dedup: no second issue create"; fi
+
 assert_contains "$(cat "$GH_STUB_LOG")" "issue comment --repo daniel-ospina/tortoise 123" "comment targets the existing issue number"
+
+# #431 regression: FAIL without any FAIL_LINES (not-a-directory / not-a-git-repo
+# / launchd-TCC git-EPERM) used to crash the report leg with an unbound-variable
+# error on macOS bash 3.2 set -u. Must exit 1 cleanly with a loud warning and
+# NO gh traffic (there is no repo-level line to report).
+: > "$GH_STUB_LOG"
+out="$(bash "$CHECK" --repo "$FIX/does-not-exist" --gh-report 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" "1" "no-line FAIL exits 1 (was unbound-variable crash)"
+assert_contains "$out" "no repo-level FAIL_LINES" "no-line FAIL warns loudly"
+if [ -s "$GH_STUB_LOG" ]; then bad "no-line FAIL: zero gh traffic"; else ok "no-line FAIL: zero gh traffic"; fi
+
+# Same guard, second trigger: an existing dir that is NOT a git repo (git
+# rev-parse --git-common-dir fails — the historical launchd-TCC EPERM shape).
+mkdir -p "$FIX/not-a-git-repo"
+: > "$GH_STUB_LOG"
+out="$(bash "$CHECK" --repo "$FIX/not-a-git-repo" --gh-report 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" "1" "not-a-git-repo FAIL exits 1 (no crash)"
+assert_contains "$out" "no repo-level FAIL_LINES" "not-a-git-repo path warns too"
+if [ -s "$GH_STUB_LOG" ]; then bad "not-a-git-repo: zero gh traffic"; else ok "not-a-git-repo: zero gh traffic"; fi
+
 rm -f "$GH_EXISTING"
 git -C "$HUB" checkout -q main 2>/dev/null || true
 rm -f "$HUB/untracked.txt"
