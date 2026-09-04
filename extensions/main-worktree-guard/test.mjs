@@ -5,7 +5,7 @@
 import { execSync } from "node:child_process";
 import { resolve, dirname, relative } from "node:path";
 import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync } from "node:fs";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -504,6 +504,30 @@ m4("switch main allowed (recovery)", `git switch main`, "pr1467", "recovery");
 m4("pull --ff-only allowed", `git pull --ff-only origin main`, "pr1467", "recovery");
 m4("plain pull blocked (may merge)", `git pull origin main`, "pr1467", "block");
 m4("fetch allowed", `git fetch origin`, "pr1467", "recovery");
+// #439 P1 (cycle-3 probe): bare `heads/` dst shorthand rewrites the local trunk
+// in a disordered hub (`fetch origin backup:heads/main` moved refs/heads/main).
+m4("fetch heads/main dst blocked", `git fetch origin backup:heads/main`, "pr1467", "block");
+m4("fetch +heads/main dst blocked", `git fetch origin +backup:heads/main`, "pr1467", "block");
+m4("fetch refs/heads/main dst blocked (F3)", `git fetch origin backup:refs/heads/main`, "pr1467", "block");
+// #439 P2 (cycle-3 probe): `git push -d <b>` is the --delete short form and was
+// classified recovery for the checked-out branch — delete the origin copy of
+// the WIP lane (and origin/main when dirty-on-main).
+m4("push -d own branch blocked", `git push origin -d pr1467`, "pr1467", "block");
+m4("push -d main blocked", `git push -d origin main`, "main", "block");
+// #439 P2 cluster spellings: git merges short flags (-dq = -d --quiet).
+m4("push -dq cluster blocked", `git push origin -dq pr1467`, "pr1467", "block");
+m4("push -fd cluster blocked", `git push -fd origin main`, "main", "block");
+m4("push -qvdf cluster blocked", `git push origin -qvdf pr1467`, "pr1467", "block");
+m4("push -q non-destructive still recovery", `git push -q origin pr1467`, "pr1467", "recovery");
+m4("push attached -o value not a cluster (cycle-5)", `git push -odraft origin pr1467`, "pr1467", "recovery");
+m4("push -u -o mix recovery", `git push -uqv origin pr1467`, "pr1467", "recovery");
+// #439 P2 (cycle-6): long-option prefix abbreviations (git accepts unambiguous
+// prefixes: --del = --delete, --mir = --mirror).
+m4("push --del abbrev blocked", `git push origin --del pr1467`, "pr1467", "block");
+m4("push --dele abbrev blocked", `git push origin --dele pr1467`, "pr1467", "block");
+m4("push --mir abbrev blocked", `git push origin --mir`, "pr1467", "block");
+m4("push --del main abbrev blocked", `git push origin --del main`, "main", "block");
+m4("push --dry-run abbrev still recovery", `git push --dry origin pr1467`, "pr1467", "recovery");
 m4("status allowed", `git status`, "pr1467", "recovery");
 m4("log allowed", `git log --oneline -5`, "pr1467", "recovery");
 m4("worktree add allowed", `git worktree add ../wt -b feat/x origin/main`, "pr1467", "recovery");
@@ -545,6 +569,115 @@ m4("checkout -- files still blocked", `git checkout -- file.txt`, "pr1467", "blo
 // disordered hub — these assert the gate would not block clean-state harm.
 m4("clean hub: push own branch allowed", `git push origin main`, "main", "recovery");
 m4("clean hub: checkout -b still blocked", `git checkout -b feat/x`, "main", "block");
+
+// ── #436 (B carve-out): collision-free branch ref-deletes ────────────────────
+// Pure helpers: branchDeleteNames extracts the deleted branch(es);
+// branchDeleteAllowance gates on checked-out-anywhere (hub + worktrees).
+// The RUNTIME gate (evaluateHubGateWithTargets) only carves out when the
+// caller passes a checkedOutBranches Set (opt-in, fail-closed otherwise).
+function bdNames(name, verb, args, expected) {
+  const got = branchDeleteNames(verb, args);
+  const ok = JSON.stringify(got) === JSON.stringify(expected);
+  console.log(`${ok ? "✅" : "❌"} ${name}: ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(expected)})`}`);
+  ok ? pass++ : fail++;
+}
+function bdAllow(name, names, current, checkedOut, expected) {
+  const got = branchDeleteAllowance(names, current, checkedOut);
+  const ok = got === expected;
+  console.log(`${ok ? "✅" : "❌"} ${name}: ${got}${ok ? "" : ` (expected ${expected})`}`);
+  ok ? pass++ : fail++;
+}
+bdNames("bdNames push --delete short", "push", ["origin", "--delete", "feat/x"], ["feat/x"]);
+bdNames("bdNames push --delete full ref", "push", ["origin", "--delete", "refs/heads/feat/x"], ["feat/x"]);
+bdNames("bdNames push colon form", "push", ["origin", ":feat/x"], ["feat/x"]);
+bdNames("bdNames push colon + delete multi", "push", ["origin", "--delete", "a", ":refs/heads/b"], ["a", "b"]);
+bdNames("bdNames push normal push → null", "push", ["origin", "main"], null);
+bdNames("bdNames push pre-flag positional → null (P1-1)", "push", ["origin", "pr1467", "--delete", "stale"], null);
+bdNames("bdNames push non-origin leading remote → null (P1-2)", "push", ["gitlab", "--delete", "stale"], null);
+bdNames("bdNames push dot remote → null (P1-2)", "push", [".", "--delete", "main"], null);
+bdNames("bdNames push local-path remote → null (P1-2)", "push", ["/tmp/r", "--delete", "x"], null);
+bdNames("bdNames push bare-name leading (no origin) → null (P1-1)", "push", ["pr1467", "--delete", "stale"], null);
+bdNames("bdNames push no-remote delete → allowed", "push", ["--delete", "stale"], ["stale"]);
+bdNames("bdNames push colon heads/main shorthand → main (P1)", "push", ["origin", ":heads/main"], ["main"]);
+bdNames("bdNames push --delete heads/main → main (P1)", "push", ["origin", "--delete", "heads/main"], ["main"]);
+bdNames("bdNames push colon heads/feat/x → feat/x (P1)", "push", ["origin", ":heads/feat/x"], ["feat/x"]);
+bdNames("bdNames branch -D", "branch", ["-D", "old"], ["old"]);
+bdNames("bdNames branch -d", "branch", ["-d", "old"], ["old"]);
+bdNames("bdNames branch merged -Dx", "branch", ["-Dold"], ["old"]);
+bdNames("bdNames branch list → null", "branch", ["-a"], null);
+bdNames("bdNames non-delete verb → null", "commit", ["-m", "x"], null);
+bdAllow("bdAllow current branch blocked", ["main"], "main", new Set(), false);
+bdAllow("bdAllow checked-out-in-wt blocked", ["feat/x"], "main", new Set(["feat/x"]), false);
+bdAllow("bdAllow stale branch allowed", ["feat/old"], "main", new Set(["feat/x"]), true);
+bdAllow("bdAllow main blocked off-main (P1-2)", ["main"], "feat/x", new Set(["feat/y"]), false);
+bdAllow("bdAllow master blocked off-main (P1-2)", ["master"], "feat/x", new Set(), false);
+bdAllow("bdAllow multi with one checked-out → blocked", ["a", "feat/x"], "main", new Set(["feat/x"]), false);
+bdAllow("bdAllow empty names → blocked", [], "main", new Set(), false);
+// RUNTIME opt-in: null set (default) keeps fail-closed; a Set activates it.
+const wgNoSet = evaluateHubGateWithTargets(`git push origin --delete feat/old`, "main", process.cwd());
+const okNoSet = wgNoSet.verdict === "block";
+console.log(`${okNoSet ? "✅" : "❌"} bd runtime null set → block: ${wgNoSet.verdict}`);
+okNoSet ? pass++ : fail++;
+const wgSet = evaluateHubGateWithTargets(`git push origin --delete feat/old`, "main", process.cwd(), new Set(["feat/x"]));
+const okSet = wgSet.verdict === "recovery";
+console.log(`${okSet ? "✅" : "❌"} bd runtime with set (unchecked-out) → recovery: ${wgSet.verdict}`);
+okSet ? pass++ : fail++;
+const wgOwn = evaluateHubGateWithTargets(`git push origin --delete main`, "main", process.cwd(), new Set(["feat/x"]));
+const okOwn = wgOwn.verdict === "block";
+console.log(`${okOwn ? "✅" : "❌"} bd runtime own branch still blocked: ${wgOwn.verdict}`);
+okOwn ? pass++ : fail++;
+const wgCompound = evaluateHubGateWithTargets(`git push origin --delete feat/old && git commit -m x`, "main", process.cwd(), new Set(["feat/x"]));
+const okCompound = wgCompound.verdict === "block";
+console.log(`${okCompound ? "✅" : "❌"} bd runtime delete+commit → still block (no laundering): ${wgCompound.verdict}`);
+okCompound ? pass++ : fail++;
+const wgCheckedOut = evaluateHubGateWithTargets(`git push origin --delete feat/x`, "main", process.cwd(), new Set(["feat/x"]));
+const okCheckedOut = wgCheckedOut.verdict === "block";
+console.log(`${okCheckedOut ? "✅" : "❌"} bd runtime checked-out-in-wt → block: ${wgCheckedOut.verdict}`);
+okCheckedOut ? pass++ : fail++;
+const wgPreFlag = evaluateHubGateWithTargets(`git push origin pr1467 --delete stale`, "pr1467", process.cwd(), new Set(["stale"]));
+const okPreFlag = wgPreFlag.verdict === "block";
+console.log(`${okPreFlag ? "✅" : "❌"} bd runtime pre-flag positional → block (P1-1): ${wgPreFlag.verdict}`);
+okPreFlag ? pass++ : fail++;
+const wgMainOffMain = evaluateHubGateWithTargets(`git push origin --delete main`, "feat/x", process.cwd(), new Set(["feat/y"]));
+const okMainOffMain = wgMainOffMain.verdict === "block";
+console.log(`${okMainOffMain ? "✅" : "❌"} bd runtime main delete off-main → block (P1-2): ${wgMainOffMain.verdict}`);
+okMainOffMain ? pass++ : fail++;
+const wgDot = evaluateHubGateWithTargets(`git push . --delete main`, "feat/x", process.cwd(), new Set());
+const okDot = wgDot.verdict === "block";
+console.log(`${okDot ? "✅" : "❌"} bd runtime dot-remote delete → block (P1-2): ${wgDot.verdict}`);
+okDot ? pass++ : fail++;
+const wgOtherRemote = evaluateHubGateWithTargets(`git push gitlab --delete feat/old`, "main", process.cwd(), new Set());
+const okOtherRemote = wgOtherRemote.verdict === "block";
+console.log(`${okOtherRemote ? "✅" : "❌"} bd runtime non-origin remote → block: ${wgOtherRemote.verdict}`);
+okOtherRemote ? pass++ : fail++;
+const wgHeadsMain = evaluateHubGateWithTargets(`git push origin :heads/main`, "feat/x", process.cwd(), new Set());
+const okHeadsMain = wgHeadsMain.verdict === "block";
+console.log(`${okHeadsMain ? "✅" : "❌"} bd runtime heads/main shorthand → block (P1): ${wgHeadsMain.verdict}`);
+okHeadsMain ? pass++ : fail++;
+const wgHeadsWt = evaluateHubGateWithTargets(`git push origin :heads/feat/wt2`, "main", process.cwd(), new Set(["feat/wt2"]));
+const okHeadsWt = wgHeadsWt.verdict === "block";
+console.log(`${okHeadsWt ? "✅" : "❌"} bd runtime heads/<checked-out> → block (P1): ${wgHeadsWt.verdict}`);
+okHeadsWt ? pass++ : fail++;
+const wgBranchD = evaluateHubGateWithTargets(`git branch -D feat/old`, "main", process.cwd(), new Set(["feat/x"]));
+const okBranchD = wgBranchD.verdict === "recovery";
+console.log(`${okBranchD ? "✅" : "❌"} bd runtime branch -D unchecked-out → recovery: ${wgBranchD.verdict}`);
+okBranchD ? pass++ : fail++;
+// Pure new-file write decision (write carve-out, #436).
+function nf(name, rel, untracked, expected) {
+  const got = newFileWriteCollisionFree(rel, untracked);
+  const ok = got === expected;
+  console.log(`${ok ? "✅" : "❌"} ${name}: ${got}${ok ? "" : ` (expected ${expected})`}`);
+  ok ? pass++ : fail++;
+}
+nf("newfile clean tree → allow", "docs/research/new.md", [], true);
+nf("newfile tracked-dirty elsewhere → allow (untracked only)", "docs/research/new.md", [], true);
+nf("newfile inside sibling untracked dir → block", "docs/planning/z.md", ["docs/planning/x.md"], false);
+nf("newfile under untracked dir entry → block", "docs/planning/z.md", ["docs/planning/"], false);
+nf("newfile in OTHER clean dir → allow", "docs/research/new.md", ["docs/planning/x.md"], true);
+nf("newfile at root with untracked root file → allow", "notes.md", ["other.md"], true);
+nf("newfile path traversal → block", "../etc/x.md", [], false);
+nf("newfile dirty path equality → block", "docs/planning/x.md", ["docs/planning/x.md"], false);
+
 
 // ── readHubDisorder (#1484) ────────────────────────────────────────────────
 // The hub's legal state is main/master + empty porcelain; untracked counts as
