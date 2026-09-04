@@ -18,6 +18,9 @@
 #   bootstrap failure      shim FAILS bootstrap → installer exits 1, loud
 #   broken-target guard    missing script → refuse, exit 1, no install
 #   placeholder skip       no swarm root → canary skipped (exit 0), tripwire ok
+#   temp-HOME guard (#446) HOME ≠ real home, no override → refuse install AND
+#                          --uninstall before any launchctl call (zero calls);
+#                          override + shim → isolated install proceeds
 #   --status               installed/loaded/drift reporting
 #   --uninstall            bootout + remove; re-run reports NOT INSTALLED
 #   template lint          plutil -lint the rendered plists (when plutil exists)
@@ -70,6 +73,20 @@ exit 0
 SHIM
 chmod +x "$T/bin/launchctl"
 
+# Deterministic fake real-home for the #446 temp-HOME guard: makes the
+# refusal path CI-portable. Ubuntu runners have no dscl, so the guard would
+# fail open there and section 11's refusal assertions would fail (install
+# proceeds). The stub keeps the guard firing on EVERY platform whenever HOME
+# is a temp dir (real_home=/test-real-home never equals a temp HOME). All
+# other sections run with ELDATO_ALLOW_TEST_HOME=1 (guard bypassed), so the
+# stub only affects the refusal section. Output mirrors real dscl's
+# "NFSHomeDirectory: <path>" one-liner the installer parses.
+cat > "$T/bin/dscl" <<'SHIM'
+#!/usr/bin/env bash
+echo "NFSHomeDirectory: /test-real-home"
+SHIM
+chmod +x "$T/bin/dscl"
+
 # Fake HOME with a farmed scripts dir + a swarm checkout.
 mkfakehome() { # $1 = home dir
     mkdir -p "$1/.pi/agent/scripts/checkout-hygiene"
@@ -120,6 +137,7 @@ run_installer() { # <home> [extra env assignments...]
         export AGENTS_DIR="$HOME/Library/LaunchAgents"
         export SWARM_ROOT="$HOME/swarm"
         export PYTHON_BIN="$HOME/swarm/.venv/bin/python"
+        export ELDATO_ALLOW_TEST_HOME=1  # #446: fake HOME + launchctl shim above = isolated
         shift
         bash "$INSTALLER" "$@"
     )
@@ -247,7 +265,7 @@ echo "── 8. Placeholder skip (no swarm root) ──────────�
 # still installed. SWARM_ROOT is env-only in the installer — no auto-detect.
 rm -rf "$HOME2/swarm"
 OUT="$(HOME="$HOME2" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" TEMPLATES_DIR="$TEMPLATES" \
-    AGENTS_DIR="$HOME2/Library/LaunchAgents" SWARM_ROOT="" \
+    AGENTS_DIR="$HOME2/Library/LaunchAgents" SWARM_ROOT="" ELDATO_ALLOW_TEST_HOME=1 \
     PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
     bash "$INSTALLER" 2>&1)"
 RC=$?
@@ -278,7 +296,41 @@ assert_contains "$OUT" "corruption-canary: unloaded + removed" "canary removed"
 OUT="$(run_installer "$HOME1" --status)"
 assert_contains "$OUT" "NOT INSTALLED" "status reports clean after uninstall"
 
-echo "── 11. Template lint (plutil, when present) ──────────────────────"
+echo "── 11. Temp-HOME guard refuses launchd management (#446) ────────────"
+# A run with HOME ≠ the real home and NO ELDATO_ALLOW_TEST_HOME override must
+# refuse BEFORE any launchctl call — that is what keeps pi-bootstrap's
+# setup-test (which runs the REAL setup.sh under a temp HOME) from registering
+# real-domain jobs against throwaway plist paths. The shim records every
+# invocation, so "zero calls" is directly assertable. Also exercised: the
+# guard fires identically for --uninstall (equally destructive to real jobs).
+HOME3="$T/home3"; mkfakehome "$HOME3"
+LOG3="$T/launchctl-refusal.log"; : > "$LOG3"
+set +e
+OUT="$(HOME="$HOME3" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG3" \
+    TEMPLATES_DIR="$TEMPLATES" AGENTS_DIR="$HOME3/Library/LaunchAgents" \
+    SWARM_ROOT="$HOME3/swarm" PYTHON_BIN="$HOME3/swarm/.venv/bin/python" \
+    bash "$INSTALLER" 2>&1)"
+RC=$?
+set -e
+assert_eq "$RC" "1" "temp-HOME install (no override) → exit 1"
+assert_contains "$OUT" "refusing to manage launchd jobs" "refusal names the guard"
+assert_contains "$OUT" "not the real home" "refusal explains the HOME mismatch"
+[ ! -s "$LOG3" ] && ok "zero launchctl calls on refusal (nothing touched any domain)" || bad "zero launchctl calls on refusal (got: $(cat "$LOG3"))"
+set +e
+OUT="$(HOME="$HOME3" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG3" \
+    bash "$INSTALLER" --uninstall 2>&1)"
+RC=$?
+set -e
+assert_eq "$RC" "1" "temp-HOME --uninstall (no override) → exit 1"
+[ ! -s "$LOG3" ] && ok "zero launchctl calls on --uninstall refusal" || bad "zero launchctl calls on --uninstall refusal"
+# With the override the SAME home installs cleanly through the shim (the
+# override is the test's explicit isolation proof, #446).
+OUT="$(LOG="$LOG" run_installer "$HOME3" 2>&1)"
+RC=$?
+assert_eq "$RC" "0" "override + shim → temp-HOME install proceeds (isolated)"
+assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "override install works hermetically"
+
+echo "── 12. Template lint (plutil, when present) ──────────────────────"
 if command -v plutil >/dev/null 2>&1; then
     LINT_OK=1
     for t in "$REPO_TEMPLATES"/*.plist; do
