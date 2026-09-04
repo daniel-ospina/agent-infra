@@ -49,19 +49,31 @@ classes of operation that cannot touch the dirty set or any sibling are
 not-checked-out-anywhere semantics:
 
 1. **Branch ref-cleanup** — `git push origin --delete <b>` and
-   `git branch -D <b>` are allowed when `<b>` is checked out NOWHERE (not the
-   hub's branch, not in any worktree). `git` itself refuses deleting a branch
-   checked out in any worktree; the remote-delete gate protects siblings whose
-   worktree tracks the deleted branch. Per-invocation and opt-in (the caller
-   passes the checked-out set) — a compound `delete && commit` still blocks on
-   the commit (no laundering).
+   `git branch -D <b>` are allowed when `<b>` is checked out NOWHERE in this
+   clone (not the hub's branch, not in any worktree) and is not `main`/
+   `master`. `git` itself refuses deleting a branch checked out in any
+   worktree; the remote-delete gate protects siblings whose worktree tracks
+   the deleted branch. Shape-restricted (fail-closed): the remote (when
+   present) must be exactly `origin`, no pre-flag positionals (git treats
+   them as delete refspecs — `push origin pr1467 --delete stale` deletes
+   both), and `main`/`master`/`.`/local-path/URL remotes are refused.
+   Per-invocation and opt-in (the caller passes the checked-out set) — a
+   compound `delete && commit` still blocks on the commit (no laundering).
+   Documented residuals (#439 P2-3): if `git worktree list` fails the set
+   degrades to the hub's own branch only (a sibling worktree checkout of the
+   deleted branch is then invisible — local `branch -D` stays protected by
+   git itself); sibling CLONES of the repo are out of the guard's visibility
+   (same limitation as the degradation path).
 2. **New-file writes** — the write/edit tool may CREATE a file at a path that
-   does not exist AND is not inside a directory that currently holds sibling
-   untracked content (expanded `--untracked-files=all` porcelain). Overwrites
+   does not exist AND is not inside the immediate container of a sibling
+   untracked file (expanded `--untracked-files=all` porcelain). Overwrites
    of existing files (tracked or untracked) stay blocked — that is the
    hub-feature-edit vector (#347 amplifier). Fixes the tortoise #2238 friction
-   (new docs forced to /tmp during the API-keys workstream). Both carve-outs
-   are pure-logic unit-tested in `test.mjs` (`branchDeleteNames` /
+   (new docs forced to /tmp during the API-keys workstream). Residuals
+   (#439 P2-4, additive-only): immediate-container scope (a deeper tracked dir
+   containing a sibling's new subdir stays writable) and lexical (not
+   symlink-resolved) path comparison. Both carve-outs are pure-logic
+   unit-tested in `test.mjs` (`branchDeleteNames` /
    `branchDeleteAllowance` / `newFileWriteCollisionFree` + runtime pins).
 
 **Why WIP preservation:** the 2026-08-18 incident left 38 commits on `pr1467`

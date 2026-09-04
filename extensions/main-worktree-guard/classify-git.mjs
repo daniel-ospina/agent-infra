@@ -1798,10 +1798,19 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
 
 /**
  * #436 (B carve-out): extract the deleted branch SHORT names from a branch /
- * push-delete git invocation, or null when the invocation is not a ref-delete.
- * Handles: `git push <remote> --delete <b>`, `git push origin :b` /
- * `:refs/heads/b`, `git branch -d|-D|--delete <b>` (merged-short-flag `-Db`
- * included). Strips quotes and the refs/heads/ prefix.
+ * push-delete git invocation, or null when the invocation is not a ref-delete
+ * OR is outside the MINIMAL SAFE SHAPE SET (fail-closed on ambiguity):
+ *   push forms allowed: `git push [origin] --delete <b>...` and
+ *     `git push [origin] :<b>...` — the remote (when present) must be
+ *     exactly `origin`; NOTHING else may precede the delete flag / colon
+ *     targets (git treats pre-flag positionals as delete refspecs too:
+ *     `git push origin pr1467 --delete stale` deletes pr1467 AND stale —
+ *     probe-verified, #439 P1-1); local-path/URL/`.`/other-name remotes are
+ *     refused (a `git push . --delete main` removes the local trunk with no
+ *     server gate — #439 P1-2).
+ *   branch forms: `git branch -d|-D|--delete <b>...` (merged `-Db` accepted).
+ * Main/master targets are NOT filtered here — branchDeleteAllowance blocks
+ * them unconditionally.
  * @param {string} verb
  * @param {string[]} args
  * @returns {string[]|null} deleted branch short names, or null
@@ -1809,25 +1818,31 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
 export function branchDeleteNames(verb, args) {
   const a = args || [];
   if (verb === "push") {
-    const deleteIdx = a.findIndex((x) => x === "--delete" || x.startsWith("--delete="));
+    const flagIdx = a.findIndex((x) => x === "--delete" || x.startsWith("--delete="));
     const colonTargets = a.filter((x) => /^:/.test(x));
-    if (deleteIdx === -1 && colonTargets.length === 0) return null;
-    const raw = deleteIdx !== -1 ? a.slice(deleteIdx + 1) : [];
+    if (flagIdx === -1 && colonTargets.length === 0) return null;
+    // Leading positionals: with --delete, only a single `origin` remote may
+    // precede the flag; any other pre-flag positional is a git delete refspec
+    // (P1-1) or a non-origin remote (P1-2) → refuse the carve-out.
+    const leading = flagIdx !== -1
+      ? a.slice(0, flagIdx).filter((x) => !x.startsWith("-"))
+      : a.filter((x) => !x.startsWith("-") && !/^:/.test(x));
+    if (leading.length > 1) return null;
+    if (leading.length === 1 && leading[0] !== "origin") return null;
+    const rawTargets = flagIdx !== -1
+      ? a.slice(flagIdx + 1).filter((x) => !x.startsWith("-"))
+      : colonTargets;
     const clean = (x) => x
       .replace(/^["']|["']$/g, "")
       .replace(/^:+(refs\/heads\/)?/, "")
       .replace(/^refs\/heads\//, "");
-    const names = [...new Set([...raw, ...colonTargets]
-      .filter((x) => !x.startsWith("-"))
-      .map(clean)
-      .filter((x) => x.length > 0 && x !== ":"))];
+    const names = [...new Set(rawTargets.map(clean).filter((x) => x.length > 0))];
     return names.length > 0 ? names : null;
   }
   if (verb === "branch") {
     const hasDelete = a.some((x) => x === "-d" || x === "-D" || x === "--delete" ||
       /^-[dD]./.test(x) && !x.startsWith("--"));
     if (!hasDelete) return null;
-    // `-Dbranch` merged form: the operand rides the flag; `-D branch` splits.
     const names = [];
     for (const x of a) {
       if (/^-[dD][^-]/.test(x)) { names.push(x.slice(2)); continue; }
@@ -1853,6 +1868,12 @@ export function branchDeleteNames(verb, args) {
  * `index.ts` push-delete block). The hub's own branch is always checked out in
  * the hub → always blocked here.
  *
+ * main/master are blocked UNCONDITIONALLY (#439 P1-2): the protected trunk
+ * must never be reachable through the carve-out, even when the hub is off-main
+ * (a `git push . --delete main` removes the LOCAL trunk with no server gate;
+ * the disordered hub cannot restore origin/main). branchDeleteNames already
+ * refuses non-origin/local-path/ambiguous push shapes (#439 P1-1).
+ *
  * Fail-safe: an unresolvable/empty checkedOutBranches set still blocks a
  * target equal to currentBranch; empty names → no allowance.
  *
@@ -1866,6 +1887,7 @@ export function branchDeleteAllowance(targetNames, currentBranch, checkedOutBran
   const names = Array.isArray(targetNames) ? targetNames.filter(Boolean) : [];
   if (names.length === 0) return false; // unparseable targets → no carve-out
   return names.every((n) => {
+    if (n === "main" || n === "master") return false; // protected trunk — never allow
     if (n === currentBranch) return false; // the hub's own branch — never allow
     if (checkedOutBranches && checkedOutBranches.has(n)) return false; // a sibling worktree
     return true;
@@ -1875,14 +1897,21 @@ export function branchDeleteAllowance(targetNames, currentBranch, checkedOutBran
 /**
  * #436 (B carve-out): collision-free NEW-FILE write decision (pure).
  *
- * A write to a path that does not exist AND is not inside a directory that
- * currently holds sibling untracked content cannot clobber anything — the
- * exact thing the M4 write freeze protects against. Overwrites of existing
- * files (tracked or untracked) stay blocked (caller checks existence): that is
- * the hub-feature-edit vector (#347 amplifier). Untracked-container logic uses
- * the EXPANDED porcelain paths (--untracked-files=all) so a sibling's
- * brand-new directory is a no-fly zone while a clean tracked tree accepts new
- * files freely.
+ * A write to a path that does not exist AND is not inside the IMMEDIATE
+ * container of a sibling untracked file cannot clobber anything — the exact
+ * thing the M4 write freeze protects against. Overwrites of existing files
+ * (tracked or untracked) stay blocked (caller checks existence): that is the
+ * hub-feature-edit vector (#347 amplifier). Sibling untracked containers come
+ * from the EXPANDED porcelain paths (--untracked-files=all).
+ *
+ * Documented residuals (#439 P2-4, additive-only — the existsSync overwrite
+ * gate holds and distinct new filenames never collide in git): (1) only the
+ * IMMEDIATE container of an untracked leaf is protected — a deeper tracked
+ * dir that merely CONTAINS a sibling's new subdir stays writable (two new
+ * files with different names in the same tracked dir are the normal parallel
+ * case; git tracks them as distinct untracked paths); (2) paths are compared
+ * lexically (resolve-normalized), so a tracked symlink alias pointing into an
+ * untracked dir can bypass the container check — warn-only consequence.
  * @param {string} relPath — target path RELATIVE to the hub toplevel.
  * @param {string[]} untrackedPaths — untracked file/dir paths from the
  *   EXPANDED porcelain (classifyUntrackedWip(expanded).untracked).
