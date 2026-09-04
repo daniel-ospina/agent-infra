@@ -15,8 +15,9 @@
 #     hub, so dirty sets were previously irreducible by agents).
 #
 #     Guard posture (no allowlist change): hub-side git is restricted to the
-#     M4-sanctioned verb surface — fetch / worktree add (recovery), status /
-#     show / ls-files / branch --show-current (readonly), plus non-git
+#     M4-sanctioned verb surface — fetch / worktree add|remove (recovery),
+#     status / show / ls-files / branch --show-current (readonly), branch -D
+#     (empty-capture cleanup only, never on the hub branch), plus non-git
 #     cp/rm/mkdir/ln. The WT commit/push run after `cd` into the worktree and
 #     are worktree-local + own-branch (exempt in direct command context).
 #     Tracked-file reverts use `git show HEAD:path > path` (readonly git +
@@ -30,6 +31,9 @@
 #     Junk (tool/runtime artifacts: .playwright-mcp, .wrangler, __pycache__,
 #     *.pyc/*.tmp/*.bak/*~, .DS_Store, srv.pid) is skipped from the capture
 #     AND removed from the hub — the goal is a hub back to main+CLEAN.
+#     A junk-ONLY dirty hub captures nothing → exit 1 and the junk is left in
+#     place (never destroyed). If the push to origin FAILS, the hub is NOT
+#     cleaned either — the dirty set stays recoverable (hub + local branch).
 #     Everything else (legit work product) goes to the branch. Staged-only
 #     entries (git add'd before the disorder) are captured but need a human
 #     terminal `git reset` to fully clean the hub index (warned — M4 blocks
@@ -123,7 +127,11 @@ setup_symlinks() {
 salvage() {
   local hub_branch porcelain clean_rel
   hub_branch="$(git -C "$MAIN_REPO" branch --show-current 2>/dev/null || echo "detached")"
-  porcelain="$(git -C "$MAIN_REPO" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)"
+  # RAW porcelain (-z + quotepath=false): paths arrive verbatim, NUL-terminated
+  # — no C-style/octal escaping, so non-ASCII (café) and spaced paths are safe.
+  # tr NUL->newline for line parsing; records are always "XY <path>" (char 2 is
+  # a space) — bare records are the old-side of a rename pair and get skipped.
+  porcelain="$(git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain=v1 -z --untracked-files=all 2>/dev/null | tr '\0' '\n' || true)"
 
   if [[ -z "$porcelain" ]]; then
     echo "hub-worktree: salvage: the hub is CLEAN on '$hub_branch' — nothing to salvage" >&2
@@ -156,12 +164,9 @@ salvage() {
   echo "hub-worktree: salvage: capturing dirty + untracked (junk excluded)…"
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
+    [[ "${line:2:1}" == " " ]] || continue   # -z format: "XY <path>"; bare = rename old-side
     xy="${line:0:2}"
     rest="${line:3}"
-    # porcelain quotes paths with special chars — strip outer quotes
-    if [[ "$rest" == \"* ]]; then rest="${rest#\"}"; rest="${rest%\"}"; fi
-    # rename/copy entries: "R  old -> new" → the NEW path is the live one
-    if [[ "$rest" == *" -> "* ]]; then rest="${rest##* -> }"; fi
     [[ -z "$rest" ]] && continue
 
     case "$xy" in
@@ -225,21 +230,26 @@ salvage() {
   if ( cd "$WT_PATH" && git push -q origin "$BRANCH" 2>/dev/null ); then
     echo "hub-worktree: salvage: pushed $BRANCH to origin — open the PR: gh pr create --base main --head $BRANCH"
   else
-    echo "⚠️  hub-worktree: salvage: push failed (offline?) — the branch is committed locally; push later from $WT_PATH" >&2
+    echo "hub-worktree: salvage: PUSH FAILED (origin rejected or unreachable)." >&2
+    echo "   The dirty set is SAFE: it remains on the hub AND is committed on $BRANCH" >&2
+    echo "   (worktree: $WT_PATH). The hub was NOT cleaned — no content destroyed." >&2
+    echo "   Push manually from the worktree once the origin is reachable, then" >&2
+    echo "   re-run salvage (a clean hub will refuse; the branch then carries the work)." >&2
+    exit 1
   fi
 
   # ── Hub cleanup: revert tracked dirt to HEAD via git show redirects ──
   # (readonly git + ungated bash redirect — NOT git restore, which M4 blocks).
   echo "hub-worktree: salvage: returning the hub to clean…"
   local mode_t
-  # COLLAPSED porcelain for the cleanup scan: untracked dirs arrive whole
+  # COLLAPSED RAW porcelain for the cleanup scan: untracked dirs arrive whole
   # ("?? .playwright-mcp/") so rm -rf removes the container, not just the files
-  # (empty dirs are invisible to git and would otherwise linger).
-  git -C "$MAIN_REPO" status --porcelain=v1 2>/dev/null | while IFS= read -r line; do
+  # (empty dirs are invisible to git and would otherwise linger); -z means
+  # paths are verbatim (no escaping), bare records (rename old-side) skipped.
+  git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain=v1 -z 2>/dev/null | tr '\0' '\n' | while IFS= read -r line; do
     [[ -z "$line" ]] && continue
+    [[ "${line:2:1}" == " " ]] || continue
     xy="${line:0:2}"; rest="${line:3}"
-    if [[ "$rest" == \"* ]]; then rest="${rest#\"}"; rest="${rest%\"}"; fi
-    if [[ "$rest" == *" -> "* ]]; then rest="${rest##* -> }"; fi
     case "$xy" in
       "??")
         # All untracked content is handled: non-junk was captured + committed
@@ -257,10 +267,10 @@ salvage() {
     esac
   done
   # Tracked-modified/deleted (unstaged) → restore from HEAD byte-exact.
-  git -C "$MAIN_REPO" status --porcelain=v1 2>/dev/null | while IFS= read -r line; do
+  git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain=v1 -z 2>/dev/null | tr '\0' '\n' | while IFS= read -r line; do
     [[ -z "$line" ]] && continue
+    [[ "${line:2:1}" == " " ]] || continue
     xy="${line:0:2}"; rest="${line:3}"
-    if [[ "$rest" == \"* ]]; then rest="${rest#\"}"; rest="${rest%\"}"; fi
     case "$xy" in
       " M"|"MM"|" D")
         mode_t="$(git -C "$MAIN_REPO" ls-files -s -- "$rest" | awk '{print $1}')"
