@@ -14,7 +14,12 @@
          Canonical script: {{AGENT_INFRA_PATH}}/scripts/cron-quality-gates.sh
          (subcommand `oracle`; loads the load gate, then the oracle test).
          Rendered by scripts/install-launchd.sh (#304) — placeholders only,
-         no machine-specific paths. -->
+         no machine-specific paths. NOTE (#427): this job cannot run under
+         launchd while its script + fixtures live in ~/Documents (macOS TCC
+         blocks launchd-spawned bash/git/node reads there — EPERM). Only a
+         Full-Disk-Access grant (or running the gate through a TCC-approved
+         host) revives it; do NOT farm-copy it — it self-locates via
+         dirname("$0") and needs its repo siblings. -->
     <key>Label</key>
     <string>com.eldato.skill-lint-oracle</string>
     <key>ProgramArguments</key>

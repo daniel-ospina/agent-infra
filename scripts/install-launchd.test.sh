@@ -121,6 +121,9 @@ assert_contains "$(cat "$CANARY_INSTALLED")" "agent-infra-plist-version: 0.1.0" 
 assert_contains "$(cat "$HUB_INSTALLED")" "agent-infra-plist-version: 0.1.0" "hub template carries version marker"
 # #254 Task 10 drift-watch — the oracle plist is a third template job; it is
 # installed on every machine (only {{AGENT_INFRA_PATH}} — always resolved).
+# NOTE (#427): the oracle is TCC-bound to its ~/Documents repo home under
+# launchd (bash/git/node blocked; python exempt) — tracked in #427, not
+# farmable (dirname-$0 self-location needs repo siblings).
 ORACLE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
 assert_contains "$OUT" "com.eldato.skill-lint-oracle: installed + loaded" "skill-lint-oracle installed on fresh machine"
 assert_contains "$(cat "$ORACLE_INSTALLED")" "cron-quality-gates.sh" "oracle plist rendered with AGENT_INFRA_PATH"
