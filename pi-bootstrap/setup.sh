@@ -244,8 +244,9 @@ fi
 # TCC-protected) made launchd-spawned bash fail with EPERM at script-open;
 # real files under ~/.pi/agent are readable, so copies revive the
 # SELF-CONTAINED launchd jobs (provider-latency-tripwire; corruption-canary
-# only because python is TCC-exempt — it reads SWARM_ROOT via git at runtime
-# and would fail like hub-state-check under a bash shebang).
+# runs because its watched root ~/swarm is NOT TCC-protected — not because
+# of python; #431 probe: python3 EPERMs on ~/Documents under launchd exactly
+# like bash/git/node. The wall is path-based, interpreter-independent).
 # hub-state-check + skill-lint-oracle additionally read ~/Documents content
 # via git/node → still TCC-blocked under launchd regardless (see #427; the
 # fix is a Full-Disk-Access grant, not a path change). Same model as the
