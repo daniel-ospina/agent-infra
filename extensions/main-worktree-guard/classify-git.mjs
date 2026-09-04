@@ -1744,8 +1744,13 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
       // Force/delete/mirror/tags/--all/--prune/--follow-tags and foreign
       // targets → block. Round-3 P1: the `:branch` EMPTY-SOURCE refspec form is
       // a remote-branch DELETION — block it even when the dst matches; a bare
-      // `HEAD` refspec resolves to the checked-out branch.
-      if (flag("-f") || flag("--force") || flag("--delete") || flag("-d") || // -d = --delete (push short form, #439 P2)
+      // `HEAD` refspec resolves to the checked-out branch. #439 P2: git merges
+      // no-arg short flags into clusters (`-dq` = -d --quiet) — exact-match
+      // misses them, so any single-dash short cluster containing d or f
+      // (push's only destructive short flags: --delete / --force) blocks.
+      const hasShortDestructiveCluster = a.some((x) => /^-[^-]/.test(x) && /[df]/.test(x));
+      if (flag("-f") || flag("--force") || flag("--delete") || flag("-d") ||
+          hasShortDestructiveCluster ||
           a.includes("--mirror") || a.includes("--tags") ||
           a.includes("--all") || a.includes("--prune") || a.includes("--follow-tags")) return "block";
       if (!currentBranch) return "block"; // detached hub — push target unknowable

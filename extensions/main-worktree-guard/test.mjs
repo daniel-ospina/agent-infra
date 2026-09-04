@@ -514,6 +514,11 @@ m4("fetch refs/heads/main dst blocked (F3)", `git fetch origin backup:refs/heads
 // the WIP lane (and origin/main when dirty-on-main).
 m4("push -d own branch blocked", `git push origin -d pr1467`, "pr1467", "block");
 m4("push -d main blocked", `git push -d origin main`, "main", "block");
+// #439 P2 cluster spellings: git merges short flags (-dq = -d --quiet).
+m4("push -dq cluster blocked", `git push origin -dq pr1467`, "pr1467", "block");
+m4("push -fd cluster blocked", `git push -fd origin main`, "main", "block");
+m4("push -qvdf cluster blocked", `git push origin -qvdf pr1467`, "pr1467", "block");
+m4("push -q non-destructive still recovery", `git push -q origin pr1467`, "pr1467", "recovery");
 m4("status allowed", `git status`, "pr1467", "recovery");
 m4("log allowed", `git log --oneline -5`, "pr1467", "recovery");
 m4("worktree add allowed", `git worktree add ../wt -b feat/x origin/main`, "pr1467", "recovery");
