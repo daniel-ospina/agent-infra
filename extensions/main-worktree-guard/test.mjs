@@ -5,7 +5,7 @@
 import { execSync } from "node:child_process";
 import { resolve, dirname, relative } from "node:path";
 import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync } from "node:fs";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -545,6 +545,80 @@ m4("checkout -- files still blocked", `git checkout -- file.txt`, "pr1467", "blo
 // disordered hub — these assert the gate would not block clean-state harm.
 m4("clean hub: push own branch allowed", `git push origin main`, "main", "recovery");
 m4("clean hub: checkout -b still blocked", `git checkout -b feat/x`, "main", "block");
+
+// ── #436 (B carve-out): collision-free branch ref-deletes ────────────────────
+// Pure helpers: branchDeleteNames extracts the deleted branch(es);
+// branchDeleteAllowance gates on checked-out-anywhere (hub + worktrees).
+// The RUNTIME gate (evaluateHubGateWithTargets) only carves out when the
+// caller passes a checkedOutBranches Set (opt-in, fail-closed otherwise).
+function bdNames(name, verb, args, expected) {
+  const got = branchDeleteNames(verb, args);
+  const ok = JSON.stringify(got) === JSON.stringify(expected);
+  console.log(`${ok ? "✅" : "❌"} ${name}: ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(expected)})`}`);
+  ok ? pass++ : fail++;
+}
+function bdAllow(name, names, current, checkedOut, expected) {
+  const got = branchDeleteAllowance(names, current, checkedOut);
+  const ok = got === expected;
+  console.log(`${ok ? "✅" : "❌"} ${name}: ${got}${ok ? "" : ` (expected ${expected})`}`);
+  ok ? pass++ : fail++;
+}
+bdNames("bdNames push --delete short", "push", ["origin", "--delete", "feat/x"], ["feat/x"]);
+bdNames("bdNames push --delete full ref", "push", ["origin", "--delete", "refs/heads/feat/x"], ["feat/x"]);
+bdNames("bdNames push colon form", "push", ["origin", ":feat/x"], ["feat/x"]);
+bdNames("bdNames push colon + delete multi", "push", ["origin", "--delete", "a", ":refs/heads/b"], ["a", "b"]);
+bdNames("bdNames push normal push → null", "push", ["origin", "main"], null);
+bdNames("bdNames branch -D", "branch", ["-D", "old"], ["old"]);
+bdNames("bdNames branch -d", "branch", ["-d", "old"], ["old"]);
+bdNames("bdNames branch merged -Dx", "branch", ["-Dold"], ["old"]);
+bdNames("bdNames branch list → null", "branch", ["-a"], null);
+bdNames("bdNames non-delete verb → null", "commit", ["-m", "x"], null);
+bdAllow("bdAllow current branch blocked", ["main"], "main", new Set(), false);
+bdAllow("bdAllow checked-out-in-wt blocked", ["feat/x"], "main", new Set(["feat/x"]), false);
+bdAllow("bdAllow stale branch allowed", ["feat/old"], "main", new Set(["feat/x"]), true);
+bdAllow("bdAllow multi with one checked-out → blocked", ["a", "feat/x"], "main", new Set(["feat/x"]), false);
+bdAllow("bdAllow empty names → blocked", [], "main", new Set(), false);
+// RUNTIME opt-in: null set (default) keeps fail-closed; a Set activates it.
+const wgNoSet = evaluateHubGateWithTargets(`git push origin --delete feat/old`, "main", process.cwd());
+const okNoSet = wgNoSet.verdict === "block";
+console.log(`${okNoSet ? "✅" : "❌"} bd runtime null set → block: ${wgNoSet.verdict}`);
+okNoSet ? pass++ : fail++;
+const wgSet = evaluateHubGateWithTargets(`git push origin --delete feat/old`, "main", process.cwd(), new Set(["feat/x"]));
+const okSet = wgSet.verdict === "recovery";
+console.log(`${okSet ? "✅" : "❌"} bd runtime with set (unchecked-out) → recovery: ${wgSet.verdict}`);
+okSet ? pass++ : fail++;
+const wgOwn = evaluateHubGateWithTargets(`git push origin --delete main`, "main", process.cwd(), new Set(["feat/x"]));
+const okOwn = wgOwn.verdict === "block";
+console.log(`${okOwn ? "✅" : "❌"} bd runtime own branch still blocked: ${wgOwn.verdict}`);
+okOwn ? pass++ : fail++;
+const wgCompound = evaluateHubGateWithTargets(`git push origin --delete feat/old && git commit -m x`, "main", process.cwd(), new Set(["feat/x"]));
+const okCompound = wgCompound.verdict === "block";
+console.log(`${okCompound ? "✅" : "❌"} bd runtime delete+commit → still block (no laundering): ${wgCompound.verdict}`);
+okCompound ? pass++ : fail++;
+const wgCheckedOut = evaluateHubGateWithTargets(`git push origin --delete feat/x`, "main", process.cwd(), new Set(["feat/x"]));
+const okCheckedOut = wgCheckedOut.verdict === "block";
+console.log(`${okCheckedOut ? "✅" : "❌"} bd runtime checked-out-in-wt → block: ${wgCheckedOut.verdict}`);
+okCheckedOut ? pass++ : fail++;
+const wgBranchD = evaluateHubGateWithTargets(`git branch -D feat/old`, "main", process.cwd(), new Set(["feat/x"]));
+const okBranchD = wgBranchD.verdict === "recovery";
+console.log(`${okBranchD ? "✅" : "❌"} bd runtime branch -D unchecked-out → recovery: ${wgBranchD.verdict}`);
+okBranchD ? pass++ : fail++;
+// Pure new-file write decision (write carve-out, #436).
+function nf(name, rel, untracked, expected) {
+  const got = newFileWriteCollisionFree(rel, untracked);
+  const ok = got === expected;
+  console.log(`${ok ? "✅" : "❌"} ${name}: ${got}${ok ? "" : ` (expected ${expected})`}`);
+  ok ? pass++ : fail++;
+}
+nf("newfile clean tree → allow", "docs/research/new.md", [], true);
+nf("newfile tracked-dirty elsewhere → allow (untracked only)", "docs/research/new.md", [], true);
+nf("newfile inside sibling untracked dir → block", "docs/planning/z.md", ["docs/planning/x.md"], false);
+nf("newfile under untracked dir entry → block", "docs/planning/z.md", ["docs/planning/"], false);
+nf("newfile in OTHER clean dir → allow", "docs/research/new.md", ["docs/planning/x.md"], true);
+nf("newfile at root with untracked root file → allow", "notes.md", ["other.md"], true);
+nf("newfile path traversal → block", "../etc/x.md", [], false);
+nf("newfile dirty path equality → block", "docs/planning/x.md", ["docs/planning/x.md"], false);
+
 
 // ── readHubDisorder (#1484) ────────────────────────────────────────────────
 // The hub's legal state is main/master + empty porcelain; untracked counts as

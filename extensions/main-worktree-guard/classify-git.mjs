@@ -1797,6 +1797,113 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
 }
 
 /**
+ * #436 (B carve-out): extract the deleted branch SHORT names from a branch /
+ * push-delete git invocation, or null when the invocation is not a ref-delete.
+ * Handles: `git push <remote> --delete <b>`, `git push origin :b` /
+ * `:refs/heads/b`, `git branch -d|-D|--delete <b>` (merged-short-flag `-Db`
+ * included). Strips quotes and the refs/heads/ prefix.
+ * @param {string} verb
+ * @param {string[]} args
+ * @returns {string[]|null} deleted branch short names, or null
+ */
+export function branchDeleteNames(verb, args) {
+  const a = args || [];
+  if (verb === "push") {
+    const deleteIdx = a.findIndex((x) => x === "--delete" || x.startsWith("--delete="));
+    const colonTargets = a.filter((x) => /^:/.test(x));
+    if (deleteIdx === -1 && colonTargets.length === 0) return null;
+    const raw = deleteIdx !== -1 ? a.slice(deleteIdx + 1) : [];
+    const clean = (x) => x
+      .replace(/^["']|["']$/g, "")
+      .replace(/^:+(refs\/heads\/)?/, "")
+      .replace(/^refs\/heads\//, "");
+    const names = [...new Set([...raw, ...colonTargets]
+      .filter((x) => !x.startsWith("-"))
+      .map(clean)
+      .filter((x) => x.length > 0 && x !== ":"))];
+    return names.length > 0 ? names : null;
+  }
+  if (verb === "branch") {
+    const hasDelete = a.some((x) => x === "-d" || x === "-D" || x === "--delete" ||
+      /^-[dD]./.test(x) && !x.startsWith("--"));
+    if (!hasDelete) return null;
+    // `-Dbranch` merged form: the operand rides the flag; `-D branch` splits.
+    const names = [];
+    for (const x of a) {
+      if (/^-[dD][^-]/.test(x)) { names.push(x.slice(2)); continue; }
+      if (x === "-d" || x === "-D" || x === "--delete") continue;
+      if (x.startsWith("-") || x === "--") continue;
+      names.push(x);
+    }
+    return names.filter((n) => n.length > 0).length > 0
+      ? names.filter((n) => n.length > 0)
+      : null;
+  }
+  return null;
+}
+
+/**
+ * #436 (B carve-out): branch ref-cleanup allowance for a DISORDERED hub.
+ *
+ * Deleting a branch that nobody has checked out cannot disturb the dirty set
+ * or any sibling session: `git branch -D <b>` of a branch checked out in any
+ * worktree is refused by git itself, and `git push --delete <b>` only harms a
+ * sibling whose worktree (or the hub) has <b> checked out — hence the
+ * checked-out-anywhere gate (mirror of the degradation path's semantics,
+ * `index.ts` push-delete block). The hub's own branch is always checked out in
+ * the hub → always blocked here.
+ *
+ * Fail-safe: an unresolvable/empty checkedOutBranches set still blocks a
+ * target equal to currentBranch; empty names → no allowance.
+ *
+ * @param {string[]} targetNames — deleted branch SHORT names.
+ * @param {string|null} currentBranch — the hub's checked-out branch.
+ * @param {Set<string>} [checkedOutBranches] — branch SHORT names checked out
+ *   anywhere (hub + all worktrees); empty/absent → only currentBranch protects.
+ * @returns {boolean} true when the delete is collision-free (allow).
+ */
+export function branchDeleteAllowance(targetNames, currentBranch, checkedOutBranches = new Set()) {
+  const names = Array.isArray(targetNames) ? targetNames.filter(Boolean) : [];
+  if (names.length === 0) return false; // unparseable targets → no carve-out
+  return names.every((n) => {
+    if (n === currentBranch) return false; // the hub's own branch — never allow
+    if (checkedOutBranches && checkedOutBranches.has(n)) return false; // a sibling worktree
+    return true;
+  });
+}
+
+/**
+ * #436 (B carve-out): collision-free NEW-FILE write decision (pure).
+ *
+ * A write to a path that does not exist AND is not inside a directory that
+ * currently holds sibling untracked content cannot clobber anything — the
+ * exact thing the M4 write freeze protects against. Overwrites of existing
+ * files (tracked or untracked) stay blocked (caller checks existence): that is
+ * the hub-feature-edit vector (#347 amplifier). Untracked-container logic uses
+ * the EXPANDED porcelain paths (--untracked-files=all) so a sibling's
+ * brand-new directory is a no-fly zone while a clean tracked tree accepts new
+ * files freely.
+ * @param {string} relPath — target path RELATIVE to the hub toplevel.
+ * @param {string[]} untrackedPaths — untracked file/dir paths from the
+ *   EXPANDED porcelain (classifyUntrackedWip(expanded).untracked).
+ * @returns {boolean} true when the new-file write is collision-free (allow).
+ */
+export function newFileWriteCollisionFree(relPath, untrackedPaths) {
+  const rel = String(relPath ?? "").replace(/\\/g, "/").replace(/^\//, "");
+  if (!rel || rel.startsWith("../") || rel.split("/").includes("..")) return false;
+  const paths = Array.isArray(untrackedPaths) ? untrackedPaths : [];
+  for (const raw of paths) {
+    const u = String(raw).replace(/^["']|["']$/g, "").replace(/\\/g, "/").replace(/\/$/, "");
+    if (!u || u === ".") continue;
+    const container = u.includes("/") ? u.slice(0, u.lastIndexOf("/")) : ".";
+    if (u === rel) return false; // dirty path itself (paranoia — rel should not exist)
+    if (rel.startsWith(u + "/")) return false; // inside an untracked file/dir path
+    if (container !== "." && rel.startsWith(container + "/")) return false; // sibling's untracked dir
+  }
+  return true;
+}
+
+/**
  * Evaluate a WHOLE shell command against the hub-recovery allowlist.
  * Every git invocation in a compound command is gated (`git pull && git
  * commit` → block on the commit). Returns:
@@ -2394,7 +2501,7 @@ function _worktreeCheckoutBlock(inv, target, currentBranch) {
  * @param {string} [sessionCwd] — session root; the worktree MAP is derived here
  *   (M4 only fires when session cwd IS the hub).
  */
-export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd()) {
+export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd(), checkedOutBranches = null) {
   const invocations = allGitInvocations(command);
   // Round-5/6 (second-model P1): eval / $( ) / backtick / alias / function
   // command substitution is an UNVERIFIABLE one-token shell construct — the
@@ -2603,6 +2710,18 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           continue; // readonly / sanctioned recovery for the wt's own branch — allowed
         }
         continue; // worktree-local verb — isolated
+      }
+      // #436 (B carve-out): collision-free branch ref-delete in the
+      // disordered hub — `git push origin --delete <b>` / `git branch -D <b>`
+      // where <b> is checked out nowhere (hub + worktrees) cannot touch the
+      // dirty set or any sibling. Per-invocation, so a compound
+      // `delete && commit` still blocks on the commit (no laundering).
+      // Opt-in: only callers that pass a checkedOutBranches Set (index.ts M4
+      // gate) activate the carve-out — a null/absent set keeps fail-closed.
+      const delNames = checkedOutBranches ? branchDeleteNames(inv.verb, inv.args) : null;
+      if (delNames && branchDeleteAllowance(delNames, currentBranch, checkedOutBranches)) {
+        sawRecovery = true; // sanctioned cleanup op — command may proceed
+        continue;
       }
       return {
         verdict: "block",

@@ -39,9 +39,30 @@ BLOCKED**, and write/edit in the hub is blocked too.
 | `git pull --ff-only` (plain pull may merge → blocked) | `git checkout -b` / `switch -c`, any other checkout |
 | `git fetch` | `git push` to any branch but the checked-out one |
 | `git status`, `git log`, read-only ops (`diff`, `show`, …) | `git merge` / `rebase` / `reset` / `clean` / `restore` |
-| `git worktree add/list/prune/remove` | `git push -f` / `--delete` |
-| `git push origin <currently-checked-out-branch>` (WIP preservation) | write/edit tools in the hub |
+| `git worktree add/list/prune/remove` | `git push -f` / `--delete` (see #436 carve-out below) |
+| `git push origin <currently-checked-out-branch>` (WIP preservation) | write/edit OVERWRITES in the hub (see #436 carve-out below) |
 | `touch ~/.pi/agent/.allow-main-edits` (escape marker) | |
+
+**#436 carve-outs (collision-free ops stay legal while disordered):** two
+classes of operation that cannot touch the dirty set or any sibling are
+**allowed** in a disordered hub, mirroring the degradation path's
+not-checked-out-anywhere semantics:
+
+1. **Branch ref-cleanup** — `git push origin --delete <b>` and
+   `git branch -D <b>` are allowed when `<b>` is checked out NOWHERE (not the
+   hub's branch, not in any worktree). `git` itself refuses deleting a branch
+   checked out in any worktree; the remote-delete gate protects siblings whose
+   worktree tracks the deleted branch. Per-invocation and opt-in (the caller
+   passes the checked-out set) — a compound `delete && commit` still blocks on
+   the commit (no laundering).
+2. **New-file writes** — the write/edit tool may CREATE a file at a path that
+   does not exist AND is not inside a directory that currently holds sibling
+   untracked content (expanded `--untracked-files=all` porcelain). Overwrites
+   of existing files (tracked or untracked) stay blocked — that is the
+   hub-feature-edit vector (#347 amplifier). Fixes the tortoise #2238 friction
+   (new docs forced to /tmp during the API-keys workstream). Both carve-outs
+   are pure-logic unit-tested in `test.mjs` (`branchDeleteNames` /
+   `branchDeleteAllowance` / `newFileWriteCollisionFree` + runtime pins).
 
 **Why WIP preservation:** the 2026-08-18 incident left 38 commits on `pr1467`
 in the hub. `git push origin <checked-out-branch>` is the ONE allowed push so

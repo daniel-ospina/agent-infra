@@ -67,7 +67,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import { resolve, dirname, join } from "node:path";
+import { resolve, dirname, join, relative } from "node:path";
 import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { isPrintMode } from "../shared/print-mode.js";
@@ -89,7 +89,7 @@ let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) =
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
 let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean; skipInfra?: boolean; env?: Record<string, string | undefined> }) => { disorder: string | null; branch: string | null } = () => ({ disorder: null, branch: null });
-let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
+let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 let extractScriptPath: (command: string) => string | null = () => null;
@@ -101,6 +101,8 @@ let matchHubWipPattern: (resolvedPath: string) => "docs/plans" | "migrations" | 
 let extractBashWriteTargets: (command: string, cwd?: string) => { resolvedPath: string; via: string }[] = () => [];
 let classifyUntrackedWip: (porcelain: string) => { untracked: string[]; wip: { path: string; pattern: string }[] } = () => ({ untracked: [], wip: [] });
 let classifierLoaded = false;
+let branchDeleteAllowance: (targetNames: string[], currentBranch: string | null, checkedOutBranches?: Set<string>) => boolean = () => false;
+let newFileWriteCollisionFree: (relPath: string, untrackedPaths: string[]) => boolean = () => false;
 let ALLOW_MAIN_EDITS_MARKER_TTL_MS = 15 * 60 * 1000;
 // Escape-marker (#207) rules live in classify-git.mjs so test.mjs exercises the
 // SAME logic. Fail-safe defaults: every marker function degrades to inactive
@@ -121,7 +123,7 @@ try {
      readAllowMarkerState, readHubDisorder,
      extractScriptPath, scriptGitVerdict, evaluateHubGateWithTargets,
      commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern,
-     extractBashWriteTargets, classifyUntrackedWip } =
+     extractBashWriteTargets, classifyUntrackedWip, branchDeleteAllowance, newFileWriteCollisionFree } =
     await import("./classify-git.mjs"));
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
@@ -233,6 +235,31 @@ function _hubState(): { disorder: string | null; branch: string | null } {
     return readHubDisorder(resolve(process.cwd()));
   } catch {
     return { disorder: null, branch: null }; // degrade — never false-block
+  }
+}
+
+// #436 (B carve-out): collision-free NEW-FILE write allowance in a disordered
+// hub (pure decision in classify-git newFileWriteCollisionFree — unit-tested).
+// Overwrites of existing files (tracked or untracked) stay blocked: that is
+// the hub-feature-edit vector (#347 amplifier) that created the dirty sets in
+// the first place. Failsafe: any git/parse error → false (block).
+function _hubNewFileWriteAllowed(targetPath: string): boolean {
+  try {
+    if (!targetPath || !classifierLoaded) return false;
+    const resolved = resolve(process.cwd(), targetPath);
+    if (existsSync(resolved)) return false; // overwrite, not a new file
+    const mainTop = _mainTopLevel();
+    if (!mainTop) return false;
+    const rel = relative(mainTop, resolved);
+    if (!rel || rel.startsWith("..")) return false; // outside hub
+    const porcelain = execSync("git status --porcelain=v1 --untracked-files=all", {
+      encoding: "utf-8", timeout: 5000,
+    }).trim();
+    if (!porcelain) return true; // hub clean (caller usually only asks when disordered — still safe)
+    const { untracked } = classifyUntrackedWip(porcelain);
+    return newFileWriteCollisionFree(rel, untracked);
+  } catch {
+    return false; // fail-safe — never carve out on error
   }
 }
 
@@ -706,7 +733,17 @@ export default function (pi: ExtensionAPI) {
           // #347: per-invocation target resolution — git ops whose effective
           // target is an isolated worktree are exempt from hub disorder; every
           // other invocation (hub, foreign, unresolvable) keeps today's block.
-          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()));
+          // #436 (B): branch ref-delete carve-out needs the checked-out-anywhere
+          // set (hub + worktrees) — mirrors the degradation path semantics.
+          const checkedOutNames = new Set<string>();
+          try {
+            for (const branchRef of getWorktreeBranches().keys()) {
+              const short = branchRef.replace(/^refs\/heads\//, "");
+              if (short && short !== branchRef) checkedOutNames.add(short);
+            }
+          } catch { /* empty set → only the hub's current branch protects */ }
+          if (st.branch) checkedOutNames.add(st.branch);
+          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames);
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
             // relaxation must be observable (the 2026-08-18 incident was a
@@ -740,6 +777,15 @@ export default function (pi: ExtensionAPI) {
           const targetTop = resolveTargetTopLevel(targetPath);
           const mainTop = _mainTopLevel();
           if (targetTop && targetTop === mainTop) {
+            // #436 (B carve-out): a NEW-FILE write to a path outside the dirty
+            // set / sibling untracked dirs is collision-free — allow it so
+            // hub-resident sessions stop being forced to /tmp for legit new
+            // docs (the API-keys-session friction, tortoise #2238). Overwrites
+            // stay blocked. D3 preserved: the marker bypass does not re-enable
+            // overwrites (this block still runs before the marker check).
+            if (_hubNewFileWriteAllowed(targetPath)) {
+              return undefined; // new-file write — collision-free by construction
+            }
             return {
               block: true,
               reason: [
