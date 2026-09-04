@@ -27,8 +27,11 @@ import {
   extractGhRepoEnv,
   extractCdPath,
   resolveRepoContext,
+  repoFromGitRemote,
+  parseCdChains,
   evaluateMergeGate,
   readReviewRecord,
+  reviewRecordFile,
   logGateEvent,
   logMergeGateDecision,
   mergeGateBlockReason,
@@ -41,6 +44,7 @@ import {
   type ReviewRecord,
 } from "./index.js";
 import { ok, equal } from "node:assert/strict";
+import { execSync } from "node:child_process";
 import { resolve as resolvePath } from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -190,6 +194,57 @@ test("takes the LAST cd in a chain (effective cwd)", () => {
   equal(extractCdPath("cd /a ; cd /b ; gh pr merge 138"), resolvePath("/b"));
 });
 
+test("newline-separated cd IS a cd chain (bash semantics; cycle 2 P2-2)", () => {
+  equal(extractCdPath("cd /tmp/foo\ngh pr merge 138"), resolvePath("/tmp/foo"));
+  equal(extractCdPath("cd /tmp/foo\ncd /tmp/bar\ngh pr merge 138"), resolvePath("/tmp/bar"), "last cd wins");
+});
+
+test("prose cd inside quoted args is NEVER a cd chain (quote-aware; #230 class)", () => {
+  equal(extractCdPath('gh pr merge 138 --comment "see; cd /tmp/foo && run it"'), null, "quoted prose ignored");
+  equal(extractCdPath('gh pr merge 138 --comment "cd /tmp/foo"'), null, "leading quoted prose ignored");
+});
+
+test("quoted cd target still parsed (target quotes ≠ prose)", () => {
+  equal(extractCdPath('cd "/tmp/foo bar" && gh pr merge 138'), resolvePath("/tmp/foo bar"));
+});
+
+test("~ and ~/ cd targets expand to the home dir (cycle 3 P2-1)", () => {
+  equal(extractCdPath("cd ~ && gh pr merge 138"), os.homedir());
+  equal(extractCdPath("cd ~/sub && gh pr merge 138"), resolvePath(os.homedir(), "sub"));
+});
+
+test("parseCdChains: $VAR / quoted-$( ) cd target → unattributable, never session-cwd", () => {
+  const r1 = parseCdChains('cd "$HOME/x" && gh pr merge 138');
+  equal(r1.last, null, "$ target not guessed");
+  equal(r1.unattributable, true, "reported so the gate skips the cwd fallback");
+  const r2 = parseCdChains("cd $WORKTREE && gh pr merge 138");
+  equal(r2.last, null);
+  equal(r2.unattributable, true);
+});
+
+test("parseCdChains: subshell (cd …) is unattributable", () => {
+  const r = parseCdChains("(cd /tmp/foo && gh pr merge 138)");
+  equal(r.last, null);
+  equal(r.unattributable, true, "bash runs the cd; the gate must not trust the session cwd");
+});
+
+test("parseCdChains: bare cd → home, NOT unattributable", () => {
+  const r = parseCdChains("cd && gh pr merge 138");
+  equal(r.last, os.homedir());
+  equal(r.unattributable, false);
+});
+
+test("parseCdChains: prose cd inside quoted args counted nowhere (quote-aware)", () => {
+  const r = parseCdChains('gh pr merge 138 --comment "cd /tmp/foo"');
+  equal(r.last, null);
+  equal(r.unattributable, false, "quoted prose is not a cd bash will run");
+});
+
+test("cd /x || exit idiom splits at the pipe (cycle 4 P3)", () => {
+  equal(parseCdChains("cd /tmp/x || exit 1\ngh pr merge 138").last, resolvePath("/tmp/x"));
+  equal(extractCdPath("cd /tmp/x || exit 1\ngh pr merge 138"), resolvePath("/tmp/x"));
+});
+
 test("null when no cd prefix", () => {
   equal(extractCdPath("gh pr merge 138"), null);
 });
@@ -289,6 +344,187 @@ section("readReviewRecord — record I/O");
 test("null for a non-existent PR record (no files touched)", () => {
   equal(readReviewRecord(99999999), null);
 });
+
+// ── #426 repo-qualified registry (cross-repo PR-number collisions) ───
+// Every FS-touching test runs under withTempHome (temp $HOME): both the
+// reviews dir AND the audit log (~/.pi/agent/audit/gate-events.jsonl, written
+// by readReviewRecord's collision audit) resolve from $HOME per call — real
+// agent state is never touched (review P2-2). Unique PR numbers, cleanups in
+// finally inside the temp home (the dir itself is removed by withTempHome).
+const PR_CLEAN = 900201;
+const PR_MIGRATE = 900202;
+const PR_COLLIDE = 900203;
+const PR_NOREPO = 900204;
+const PR_FOREIGN_NOARG = 900205;
+
+function writeReviewFile(file: string, body: Record<string, unknown>): void {
+  fs.mkdirSync(resolvePath(os.homedir(), ".pi", "agent", "reviews"), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(body));
+}
+
+function tempAuditLines(): Record<string, any>[] {
+  const audit = resolvePath(os.homedir(), ".pi", "agent", "audit", "gate-events.jsonl");
+  if (!fs.existsSync(audit)) return [];
+  return fs
+    .readFileSync(audit, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+}
+
+section("#426 readReviewRecord — repo-qualified keying");
+
+test("qualified file for THIS repo is read", async () => {
+  await withTempHome(async () => {
+    writeReviewFile(reviewRecordFile("daniel-ospina/agent-infra", PR_CLEAN), {
+      pr: PR_CLEAN, head_sha: "a".repeat(40), verdict: "clean", repo: "daniel-ospina/agent-infra" });
+    const rec = readReviewRecord(PR_CLEAN, "daniel-ospina/agent-infra");
+    ok(rec !== null, "record found via qualified key");
+    equal(rec?.repo, "daniel-ospina/agent-infra", "repo field intact");
+  });
+});
+
+test("ANOTHER repo's qualified file does not satisfy this repo's gate", async () => {
+  await withTempHome(async () => {
+    writeReviewFile(reviewRecordFile("daniel-ospina/DMeer", PR_CLEAN), {
+      pr: PR_CLEAN, head_sha: "a".repeat(40), verdict: "clean", repo: "daniel-ospina/DMeer" });
+    equal(readReviewRecord(PR_CLEAN, "daniel-ospina/agent-infra"), null, "DMeer record invisible to agent-infra gate");
+  });
+});
+
+test("qualified file whose EMBEDDED repo disagrees with the slug → null (P2-1 identical-slug defense)", async () => {
+  await withTempHome(async () => {
+    // Same physical slug path, content claims a DIFFERENT repo (identical-slug
+    // overwrite across owners a-b/c vs a/b-c, or tampering).
+    writeReviewFile(reviewRecordFile("daniel-ospina/agent-infra", PR_CLEAN), {
+      pr: PR_CLEAN, head_sha: "a".repeat(40), verdict: "clean", repo: "premise-labs/other" });
+    equal(readReviewRecord(PR_CLEAN, "daniel-ospina/agent-infra"), null, "embedded-repo mismatch fails closed");
+    const last = tempAuditLines().filter((l) => l.event === "review_record_collision" && l.pr === PR_CLEAN).at(-1);
+    ok(!!last && last.recordRepo === "premise-labs/other", "mismatch audited");
+  });
+});
+
+test("slug parity: TS slug matches the bash ${REPO%%/*}-${REPO#*/} contract", () => {
+  // record-review.sh derives the filename the same way; a drift (e.g. one side
+  // using "_") would break every repo'd flow with no other test catching it.
+  equal(reviewRecordFile("premise-labs/agent-infra", PR_CLEAN).endsWith("premise-labs-agent-infra-" + PR_CLEAN + ".json"), true);
+  equal(reviewRecordFile("daniel-ospina/DMeer", PR_CLEAN).endsWith("daniel-ospina-DMeer-" + PR_CLEAN + ".json"), true);
+  equal(reviewRecordFile("a-b/c", PR_CLEAN).endsWith("a-b-c-" + PR_CLEAN + ".json"), true, "dash owner+repo single-separator contract");
+  equal(reviewRecordFile("a/b-c", PR_CLEAN).endsWith("a-b-c-" + PR_CLEAN + ".json"), true, "identical slug for the cross-owner collision class");
+});
+
+test("legacy <pr>.json migration fallback: matching repo still read (pre-#426 records)", async () => {
+  await withTempHome(async () => {
+    writeReviewFile(reviewRecordFile(undefined, PR_MIGRATE), {
+      pr: PR_MIGRATE, head_sha: "a".repeat(40), verdict: "clean", repo: "daniel-ospina/agent-infra" });
+    ok(readReviewRecord(PR_MIGRATE, "daniel-ospina/agent-infra") !== null, "legacy record with matching repo read (migration)");
+  });
+});
+
+test("legacy record from ANOTHER repo → null (the real #426 collision) + audited", async () => {
+  await withTempHome(async () => {
+    writeReviewFile(reviewRecordFile(undefined, PR_COLLIDE), {
+      pr: PR_COLLIDE, head_sha: "a".repeat(40), verdict: "clean", repo: "daniel-ospina/DMeer" });
+    equal(readReviewRecord(PR_COLLIDE, "daniel-ospina/agent-infra"), null, "foreign legacy record fails closed");
+    const last = tempAuditLines().filter((l) => l.event === "review_record_collision" && l.pr === PR_COLLIDE).at(-1);
+    ok(!!last && last.recordRepo === "daniel-ospina/DMeer" && last.gateRepo === "daniel-ospina/agent-infra",
+      "collision audited with both repos (temp home)");
+  });
+});
+
+test("repo-less legacy record (predates repo field) still read via repo'd fallback", async () => {
+  await withTempHome(async () => {
+    writeReviewFile(reviewRecordFile(undefined, PR_NOREPO), { pr: PR_NOREPO, head_sha: "a".repeat(40), verdict: "clean" });
+    ok(readReviewRecord(PR_NOREPO, "daniel-ospina/agent-infra") !== null,
+      "pre-repo-field record readable (can't prove repo — trusted legacy)");
+  });
+});
+
+test("NO repo context: repo-less legacy still read (cannot be foreign)", async () => {
+  await withTempHome(async () => {
+    writeReviewFile(reviewRecordFile(undefined, PR_NOREPO), { pr: PR_NOREPO, head_sha: "a".repeat(40), verdict: "clean" });
+    ok(readReviewRecord(PR_NOREPO) !== null, "repo-less legacy readable with no repo context");
+  });
+});
+
+test("NO repo context: repo'd legacy from another repo REJECTED (review P0-2 false-allow)", async () => {
+  await withTempHome(async () => {
+    // The exact #426 shape: DMeer#<pr>'s record sits at <pr>.json; the gate has
+    // no repo signal (no flag/env/cd/remote). It must NOT satisfy the merge —
+    // nor drive the head lookup for DMeer's PR — so it fails closed + audits.
+    writeReviewFile(reviewRecordFile(undefined, PR_FOREIGN_NOARG), {
+      pr: PR_FOREIGN_NOARG, head_sha: "a".repeat(40), verdict: "clean", repo: "daniel-ospina/DMeer" });
+    equal(readReviewRecord(PR_FOREIGN_NOARG), null, "foreign repo'd legacy rejected with no repo context");
+    const last = tempAuditLines().filter((l) => l.event === "review_record_collision" && l.pr === PR_FOREIGN_NOARG).at(-1);
+    ok(!!last && last.recordRepo === "daniel-ospina/DMeer", "rejection audited (gateRepo null = no repo signal)");
+  });
+});
+
+test("NO repo context: single matching qualified file is its own repo proof", async () => {
+  await withTempHome(async () => {
+    writeReviewFile(reviewRecordFile("daniel-ospina/agent-infra", PR_CLEAN), {
+      pr: PR_CLEAN, head_sha: "a".repeat(40), verdict: "clean", repo: "daniel-ospina/agent-infra" });
+    const rec = readReviewRecord(PR_CLEAN);
+    ok(rec !== null, "unique qualified file resolves its own repo");
+    equal(rec?.repo, "daniel-ospina/agent-infra", "repo derived from filename");
+  });
+});
+
+test("NO repo context: ambiguous multi-owner qualified files → null (cannot pick)", async () => {
+  await withTempHome(async () => {
+    writeReviewFile(reviewRecordFile("daniel-ospina/agent-infra", PR_CLEAN), {
+      pr: PR_CLEAN, head_sha: "a".repeat(40), verdict: "clean", repo: "daniel-ospina/agent-infra" });
+    writeReviewFile(reviewRecordFile("premise-labs/foo", PR_CLEAN), {
+      pr: PR_CLEAN, head_sha: "a".repeat(40), verdict: "clean", repo: "premise-labs/foo" });
+    equal(readReviewRecord(PR_CLEAN), null, "ambiguous qualified set fails closed");
+  });
+});
+
+section("#426 repoFromGitRemote — merge-environment repo resolution (P0-1)");
+
+test("origin remote (ssh form) resolves owner/name", () => {
+  const dir = fs.mkdtempSync(resolvePath(os.tmpdir(), "re-remote-"));
+  try {
+    execSync(`git init -q "${dir}"`, { stdio: "ignore" });
+    execSync(`git -C "${dir}" remote add origin git@github.com:daniel-ospina/agent-infra.git`, { stdio: "ignore" });
+    equal(repoFromGitRemote(dir), "daniel-ospina/agent-infra", "ssh remote parsed");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("origin remote (https form, no .git) resolves owner/name", () => {
+  const dir = fs.mkdtempSync(resolvePath(os.tmpdir(), "re-remote-"));
+  try {
+    execSync(`git init -q "${dir}"`, { stdio: "ignore" });
+    execSync(`git -C "${dir}" remote add origin https://github.com/premise-labs/agent-infra`, { stdio: "ignore" });
+    equal(repoFromGitRemote(dir), "premise-labs/agent-infra", "https remote parsed");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("non-git dir → null", () => {
+  const dir = fs.mkdtempSync(resolvePath(os.tmpdir(), "re-remote-"));
+  try {
+    equal(repoFromGitRemote(dir), null, "no origin → null (caller falls back)");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("non-GitHub origin → null", () => {
+  const dir = fs.mkdtempSync(resolvePath(os.tmpdir(), "re-remote-"));
+  try {
+    execSync(`git init -q "${dir}"`, { stdio: "ignore" });
+    execSync(`git -C "${dir}" remote add origin git@gitlab.com:other/thing.git`, { stdio: "ignore" });
+    equal(repoFromGitRemote(dir), null, "gitlab origin → null (gate only knows GitHub repos)");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 
 // ── Durable audit trail (#60) — log helpers ───────────
 
@@ -589,6 +825,7 @@ async function withTempHome(fn: () => Promise<void>): Promise<void> {
     await fn();
   } finally {
     process.env.HOME = prevHome;
+    fs.rmSync(dir, { recursive: true, force: true }); // no re-home-* leaks (P3-1)
   }
 }
 
@@ -817,6 +1054,150 @@ testAsync("task sub-agent gh pr merge WITH clean record + matching head → allo
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
       if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("cd-chain merge resolves envRepo from the cd target's git remote → qualified record allows (P0-1 regression)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    const pr = 99999993;
+    const head = "c".repeat(40);
+    const gitDir = fs.mkdtempSync(resolvePath(os.tmpdir(), "re-envrepo-"));
+    execSync(`git init -q "${gitDir}"`, { stdio: "ignore" });
+    execSync(`git -C "${gitDir}" remote add origin git@github.com:daniel-ospina/agent-infra.git`, { stdio: "ignore" });
+    // THE record for this PR is repo-qualified (post-#426 write shape) —
+    // only reachable when the gate resolves agent-infra from the environment.
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(reviews, { recursive: true });
+    const qualified = resolvePath(reviews, `daniel-ospina-agent-infra-${pr}.json`);
+    fs.writeFileSync(qualified, JSON.stringify({ pr, head_sha: head, verdict: "clean", repo: "daniel-ospina/agent-infra" }));
+    _setRunGhOverride(() => head);
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `cd "${gitDir}" && gh pr merge ${pr}` } });
+      equal(res, undefined, "qualified record read via cd-target envRepo → merge allowed");
+    } finally {
+      _setRunGhOverride(null);
+      fs.rmSync(gitDir, { recursive: true, force: true });
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("cd ~/… merge into ANOTHER repo is NOT authorized by the session-cwd repo's record (cycle 3 P2-1 regression)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    const pr = 99999992;
+    const head = "e".repeat(40);
+    // The merge target: a ~-cd'd git worktree whose origin is DMeer. The test
+    // process's real cwd is an agent-infra worktree — the WRONG repo.
+    const dmeerWt = resolvePath(os.homedir(), "dmeer-wt"); // under the temp HOME
+    fs.mkdirSync(dmeerWt, { recursive: true });
+    execSync(`git init -q "${dmeerWt}"`, { stdio: "ignore" });
+    execSync(`git -C "${dmeerWt}" remote add origin git@github.com:daniel-ospina/DMeer.git`, { stdio: "ignore" });
+    // A CLEAN agent-infra record exists for the same PR number (the wrong
+    // repo's evidence — exactly what a cwd fallback would wrongly consume).
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(reviews, { recursive: true });
+    const wrongRecord = resolvePath(reviews, `daniel-ospina-agent-infra-${pr}.json`);
+    fs.writeFileSync(wrongRecord, JSON.stringify({ pr, head_sha: head, verdict: "clean", repo: "daniel-ospina/agent-infra" }));
+    _setRunGhOverride(() => head);
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `cd ~/dmeer-wt && gh pr merge ${pr}` } });
+      ok(res && res.block === true, "cross-repo ~-cd merge must be BLOCKED, not authorized by agent-infra's record");
+      ok((res.reason as string).includes("No review record"), "block says no record for the DMeer PR");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("unattributable cd ($VAR/$(…)/subshell) is NEVER attributed to the session repo (cycle 4 P1 regression)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    const pr = 99999991;
+    const head = "f".repeat(40);
+    // Session cwd is an agent-infra worktree. A DMeer worktree exists under the
+    // temp HOME, reached via an UNPARSEABLE cd ($HOME expansion). A clean
+    // agent-infra record for the same PR number exists (the wrong repo's
+    // evidence — a cwd/no-repo attribution would consume it and silently allow
+    // an unreviewed DMeer merge).
+    const dmeerWt = resolvePath(os.homedir(), "dmeer-wt");
+    fs.mkdirSync(dmeerWt, { recursive: true });
+    execSync(`git init -q "${dmeerWt}"`, { stdio: "ignore" });
+    execSync(`git -C "${dmeerWt}" remote add origin git@github.com:daniel-ospina/DMeer.git`, { stdio: "ignore" });
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(reviews, { recursive: true });
+    fs.writeFileSync(resolvePath(reviews, `daniel-ospina-agent-infra-${pr}.json`), JSON.stringify({ pr, head_sha: head, verdict: "clean", repo: "daniel-ospina/agent-infra" }));
+    _setRunGhOverride(() => head);
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      // Sub-agent shape: must fail CLOSED with the resolvable-cd remediation.
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `cd "$HOME/dmeer-wt" && gh pr merge ${pr}` } });
+      ok(res && res.block === true, "unattributable-cd sub-agent merge must BLOCK, not silently allow");
+      ok((res.reason as string).includes("not statically resolvable"), "block explains the cd target cannot be resolved");
+      ok(!(res.reason as string).includes("No review record found"), "reason is cd-attribution advice, not a misleading no-record message");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("unattributable cd, interactive session → visible fail-open, never a silent clean allow (cycle 4)", async () => {
+  await withTempHome(async () => {
+    const pr = 99999990;
+    const head = "g".repeat(40);
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(reviews, { recursive: true });
+    // Clean record for the SESSION repo at the same PR number — the wrong
+    // repo's evidence that a silent attribution would consume.
+    fs.writeFileSync(resolvePath(reviews, `daniel-ospina-agent-infra-${pr}.json`), JSON.stringify({ pr, head_sha: head, verdict: "clean", repo: "daniel-ospina/agent-infra" }));
+    const logged: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: any[]) => { logged.push(args.map(String).join(" ")); };
+    _setRunGhOverride(() => head);
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `(cd "$HOME/dmeer-wt" && gh pr merge ${pr})` } });
+      equal(res, undefined, "interactive: not a hard block (fail-open path)");
+      ok(logged.some((l) => l.includes("not statically resolvable")), "interactive fail-open is VISIBLE (warning logged)");
+      ok(!logged.some((l) => l.includes("Merge registry gate passed")), "never logged as a clean gate pass");
+    } finally {
+      _setRunGhOverride(null);
+      console.log = origLog;
     }
   });
 });

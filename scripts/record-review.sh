@@ -86,7 +86,17 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
 fi
 DIR="$HOME/.pi/agent/reviews"
 mkdir -p "$DIR"
-TMP="$DIR/$PR.json.tmp"
+# #426: registry key is repo-qualified when the repo is known — PR numbers
+# collide across repos (a stale DMeer #441 record in 441.json blocked
+# agent-infra #441's merge). Legacy <pr>.json stays for repo-less records.
+if [ -n "$REPO" ]; then
+  FILE="$DIR/${REPO%/*}-${REPO#*/}-$PR.json"
+  LEGACY="$DIR/$PR.json"
+else
+  FILE="$DIR/$PR.json"
+  LEGACY=""
+fi
+TMP="$FILE.tmp"
 if [ -n "$REPO" ]; then
   printf '{"pr":%d,"head_sha":"%s","verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
     "$PR" "$SHA" "$VERDICT" "$REPO" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
@@ -94,7 +104,19 @@ else
   printf '{"pr":%d,"head_sha":"%s","verdict":"%s","reviewed_at":"%s"}\n' \
     "$PR" "$SHA" "$VERDICT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
 fi
-mv "$TMP" "$DIR/$PR.json"
+mv "$TMP" "$FILE"
+# Migration (#426): a legacy <pr>.json that belongs to THIS repo is
+# superseded by the qualified file — remove it so stale number-keyed copies
+# can't collide later. Discriminate "no repo field at all" from "unparseable":
+# only a legacy record whose embedded repo EXACTLY equals $REPO is deleted;
+# anything else (foreign repo, formatted JSON we can't parse, no field) is
+# LEFT ALONE — never delete a file that might be another repo's data.
+if [ -n "$LEGACY" ] && [ -f "$LEGACY" ]; then
+  LEGACY_REPO="$(sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$LEGACY" | head -1)"
+  if [ -n "$LEGACY_REPO" ] && [ "$LEGACY_REPO" = "$REPO" ]; then
+    rm -f "$LEGACY"
+  fi
+fi
 
 # ── Auto-post review evidence into the PR body (#163 follow-up) ──────────
 # The pipeline compliance check (c) looks for review markers in the PR
@@ -115,6 +137,12 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
   # The record is written from these same args, so record and marker are
   # consistent by construction (head_sha == $SHA, verdict == $VERDICT).
+  # The marker text is a SEPARATE contract from the record filename: the
+  # external ai-review-gate required check regex-matches
+  #   ^review recorded: reviews/<PR>.json verdict=… @ <sha> (<owner/repo>) sig=…
+  # (tortoise .github/workflows/ai-review-gate.yml), so the marker KEEPS the
+  # legacy-style reviews/<PR>.json reference even though the record file is
+  # now repo-qualified (#426). Never rename it to match the file.
   MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA} (${REPO})"
   if [ -n "$GATE_KEY" ]; then
     SIG="$(printf '%s' "$MARKER" | openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"

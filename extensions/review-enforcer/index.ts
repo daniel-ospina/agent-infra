@@ -84,6 +84,61 @@ export interface ReviewRecord {
   repo?: string; // owner/name — written by record-review.sh (optional, older records lack it)
 }
 
+/**
+ * Registry key (#426): PR numbers collide across repos (a stale DMeer #441
+ * record sat in agent-infra's 441.json and blocked its merge). Records are
+ * now keyed <owner>-<repo>-<pr>.json when the repo is known. The slug
+ * embeds both owner and repo in [A-Za-z0-9_.-]+ form — collision-free within
+ * a single owner (a trailing -<pr> split is unambiguous). Two owners whose
+ * slugs coincide (a-b/c vs a/b-c → a-b-c) overwrite the SAME file on disk;
+ * readReviewRecord defends that class by comparing the record's embedded
+ * repo field against the requested repo (P2-1, cycle 2). Legacy <pr>.json
+ * stays readable ONLY via the fallback paths below.
+ */
+export function reviewRecordFile(repo: string | undefined, pr: number): string {
+  const dir = reviewsDir();
+  return repo
+    ? resolvePath(dir, `${repo.replace("/", "-")}-${pr}.json`)
+    : resolvePath(dir, `${pr}.json`);
+}
+
+function readRecordFile(path: string): ReviewRecord | null {
+  try {
+    const raw = fs.readFileSync(path, "utf8");
+    const rec = JSON.parse(raw) as ReviewRecord;
+    if (!rec || typeof rec.head_sha !== "string" || typeof rec.verdict !== "string") return null;
+    // Security (#212 review): record.repo is interpolated into shell strings by
+    // the gate — enforce the same charset the flag/env sources are validated
+    // with. An invalid record is treated as absent (fail-closed).
+    if (rec.repo !== undefined && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(rec.repo)) return null;
+    return rec;
+  } catch {
+    return null; // missing or corrupt record → treated as "no review"
+  }
+}
+
+/**
+ * Resolve owner/name from the origin remote of a git worktree — no network.
+ * The effective cwd for `gh pr merge` is the LAST cd in the command chain
+ * (extractCdPath) else the pi session cwd; the gh CLI itself would infer the
+ * repo the same way. #426 review P0-1: plain `gh pr merge N` (no --repo /
+ * GH_REPO= / cd) must still hit the repo-qualified registry, so the gate
+ * resolves the repo from the merge ENVIRONMENT, not just the command text.
+ */
+export function repoFromGitRemote(dir: string): string | null {
+  try {
+    const url = execSync(`git -C "${dir}" config --get remote.origin.url`, {
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+    }).trim();
+    const m = url.match(/github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/);
+    return m ? m[1] : null;
+  } catch {
+    return null; // not a git dir / no origin / not GitHub → caller falls back
+  }
+}
+
 export interface RepoContext {
   repo?: string; // owner/name → passed as --repo to the gate's own gh calls
   cwd?: string; // resolved cd path → passed as cwd to the gate's own gh calls
@@ -108,19 +163,99 @@ export function extractGhRepoEnv(command: string): string | null {
   return m ? m[1] : null;
 }
 
-// Priority 3: `cd <path> &&/; ...` prefix. Equivalent to verification-gate's
-// extractCdPath (pi's bash tool keeps process.cwd() unchanged even when the
-// shell script starts with "cd /worktree &&"), but takes the LAST cd in a
-// chain (`cd /a && cd /b && gh ...` → /b), since that is the effective cwd
-// when the gh command runs. Handles cd "path", cd 'path', unquoted, and ; chains.
-export function extractCdPath(command: string): string | null {
-  const re = /(?:^|\s)cd\s+(['"]?)([^;&|]+?)\1\s*(?:&&|;)/g;
-  let m: RegExpExecArray | null;
-  let last: RegExpExecArray | null = null;
-  while ((m = re.exec(command)) !== null) {
-    last = m;
+/**
+ * Repo context is resolved in priority order from the merge command itself
+ * (extractRepoFlag, then GH_REPO=, then cd — LAST cd in the chain wins, since
+ * that is the effective cwd when the gh command runs), with the pi process
+ * cwd as a fail-open fallback (never block on an unresolvable repo).
+ *
+ * The cd scan is SEGMENT-based (split on &&/;/newline), not a regex over the
+ * whole command: prose arguments like `--comment "see; cd /tmp && …"` must
+ * never parse as a cd chain (verification-gate fixed this class in #230), and
+ * a bash-style newline-separated `cd /x\ngh pr merge` IS a cd chain (#426
+ * review cycle 2 P2-2). parseCdChains ALSO reports unattributable cds (cycle
+ * 3 P2-1): bash expands `~`, `$VAR`/`$(…)`/backticks and runs subshell
+ * `(cd … && …)` — targets the parser cannot resolve statically. When such a cd
+ * is present but unparsed, the effective merge cwd is UNKNOWN and the gate
+ * must not fall back to the session cwd's repo (that fallback is how a
+ * `cd ~/…/DMeer && merge` would get authorized by an agent-infra record —
+ * the reverse #426).
+ */
+
+/** Expand a cd target the way bash would when statically resolvable.
+ * `~`/`~/…` → home; a path still containing $/backtick is unresolvable
+ * statically → null (bash WOULD expand it, so callers treat the cwd as
+ * unattributable rather than guessing). */
+export function expandCdTarget(path: string): string | null {
+  if (path === "~") return os.homedir();
+  if (path.startsWith("~/")) return resolvePath(os.homedir(), path.slice(2));
+  if (/[$`]/.test(path)) return null;
+  return resolvePath(path);
+}
+
+export interface CdChainInfo {
+  last: string | null; // resolved path of the last parseable `cd <path>`
+  unattributable: boolean; // a cd bash WILL run but we can't resolve its target
+}
+
+export function parseCdChains(command: string): CdChainInfo {
+  // Quote-aware scan splitting on &&/;\n OUTSIDE quotes — prose like
+  // `--comment "see; cd /tmp && …"` must never parse as a cd chain (#230
+  // class). Counts standalone `cd` words outside quotes so unparseable forms
+  // (subshell `(cd …`, `cd $VAR`, `cd "$(…)"`) are detected, not silently
+  // mis-attributed to the session cwd (cycle 3 P2-1).
+  const segments: string[] = [];
+  let cur = "", q: string | null = null, esc = false;
+  let cdWords = 0;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (esc) { cur += c; esc = false; continue; }
+    if (q) {
+      cur += c;
+      if (c === "\\") esc = true;
+      else if (c === q) q = null;
+      continue;
+    }
+    if (c === '"' || c === "'") { q = c; cur += c; continue; }
+    if (c === "&" && command[i + 1] === "&") { segments.push(cur); cur = ""; i++; continue; }
+    if (c === ";" || c === "\n" || c === "|") {
+      // `|` (incl. `||`) splits too — the real `cd /x || exit 1` idiom must
+      // not capture `|| exit 1` into the cd target (cycle 4 P3).
+      if (c === "|" && command[i + 1] === "|") i++;
+      segments.push(cur); cur = ""; continue;
+    }
+    if (c === "c" && command.startsWith("cd", i)) {
+      const after = command[i + 2];
+      const before = command[i - 1];
+      if (
+        (after === undefined || /[\s;&|()]/.test(after)) &&
+        (before === undefined || /[\s;&|(\n]/.test(before))
+      ) {
+        cdWords++;
+      }
+    }
+    cur += c;
   }
-  return last ? resolvePath(last[2]) : null;
+  segments.push(cur);
+  let last: string | null = null;
+  for (const seg of segments) {
+    const m = seg.match(/^\s*cd\s+(['"]?)(.+?)\1\s*$/);
+    if (m) last = m[2];
+  }
+  if (last !== null) {
+    const resolved = expandCdTarget(last.trim());
+    return { last: resolved, unattributable: resolved === null };
+  }
+  // Bare `cd` (no target) → HOME in bash.
+  const bare = segments.some((s) => /^\s*cd\s*$/.test(s));
+  if (bare) return { last: os.homedir(), unattributable: false };
+  // Any OTHER unparsed cd word (subshell `(cd …`, `cd $VAR`, `cd "$(…)"`, …)
+  // means the effective cwd is unattributable — say so.
+  return { last: null, unattributable: cdWords > 0 };
+}
+
+export function extractCdPath(command: string): string | null {
+  return parseCdChains(command).last;
 }
 
 export function resolveRepoContext(command: string, record: ReviewRecord | null): RepoContext {
@@ -139,19 +274,60 @@ export function reviewsDir(): string {
   return resolvePath(os.homedir(), ".pi", "agent", "reviews");
 }
 
-export function readReviewRecord(pr: number): ReviewRecord | null {
-  try {
-    const raw = fs.readFileSync(resolvePath(reviewsDir(), `${pr}.json`), "utf8");
-    const rec = JSON.parse(raw) as ReviewRecord;
-    if (!rec || typeof rec.head_sha !== "string" || typeof rec.verdict !== "string") return null;
-    // Security (#212 review): record.repo is interpolated into shell strings by
-    // the gate — enforce the same charset the flag/env sources are validated
-    // with. An invalid record is treated as absent (fail-closed).
-    if (rec.repo !== undefined && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(rec.repo)) return null;
-    return rec;
-  } catch {
-    return null; // missing or corrupt record → treated as "no review"
+export function readReviewRecord(pr: number, repo?: string): ReviewRecord | null {
+  // #426: repo-qualified lookup when the gate resolved the repo (from the merge
+  // command --repo/GH_REPO/cd, or the merge environment's git remote). A record
+  // written for ANOTHER repo must never satisfy this repo's gate.
+  if (repo) {
+    const qualified = readRecordFile(reviewRecordFile(repo, pr));
+    if (qualified && qualified.repo !== undefined && qualified.repo !== repo) {
+      // The file exists but claims a different repo (identical-slug overwrite
+      // across owners, or tampering) — audit + treat as absent (P2-1).
+      logGateEvent("review_record_collision", { pr, recordRepo: qualified.repo, gateRepo: repo });
+      return null;
+    }
+    if (qualified) return qualified;
+    // Legacy migration fallback: pre-#426 records live at <pr>.json with the
+    // repo embedded. Read it ONLY when it belongs to this repo (or predates
+    // the repo field entirely) — a cross-repo collision fails closed.
+    const legacy = readRecordFile(reviewRecordFile(undefined, pr));
+    if (legacy && legacy.repo !== undefined && legacy.repo !== repo) {
+      // Real #426 collision (e.g. DMeer#441's record in 441.json while gating
+      // agent-infra #441) — audit + treat as absent.
+      logGateEvent("review_record_collision", { pr, recordRepo: legacy.repo, gateRepo: repo });
+      return null;
+    }
+    return legacy;
   }
+  // No repo context (flag/env/cd/remote all failed — the gh merge itself
+  // would run in the session cwd). Trust ONLY records whose key proves their
+  // repo:
+  //   • a single uniquely-matching qualified file (<owner>-<repo>-<pr>.json),
+  //   • a repo-less legacy record (predates the repo field — cannot be foreign).
+  // A number-keyed legacy record that EMBEDS a repo is rejected (#426 review
+  // P0-2): it may belong to a different repo's PR with the same number, and
+  // must not satisfy this merge — nor drive the head lookup for the wrong PR.
+  try {
+    const dir = reviewsDir();
+    const matches = fs
+      .readdirSync(dir)
+      .filter((f) => new RegExp(`^[A-Za-z0-9_.-]+-[A-Za-z0-9_.-]+-${pr}\.json$`).test(f));
+    if (matches.length === 1) {
+      const rec = readRecordFile(resolvePath(dir, matches[0]));
+      if (rec) return rec;
+    } else if (matches.length > 1) {
+      logGateEvent("review_record_collision", { pr, ambiguous: matches });
+      return null;
+    }
+  } catch {
+    /* reviews dir absent → no qualified files */
+  }
+  const legacy = readRecordFile(reviewRecordFile(undefined, pr));
+  if (legacy && legacy.repo !== undefined) {
+    logGateEvent("review_record_collision", { pr, recordRepo: legacy.repo, gateRepo: null });
+    return null;
+  }
+  return legacy;
 }
 
 // ── GraphQL rate-limit resilience (#192) ─────────────
@@ -357,8 +533,8 @@ export function evaluateMergeGate(
     // unresolvable repo must never strand a cross-repo merge — blocking is
     // exactly the bug #138 fixes. Tell the user how to make it resolvable.
     const advice =
-      ctx.source === "fallback"
-        ? "The repo could not be resolved (fell back to the pi process cwd). If this PR is in " +
+      ctx.source === "fallback" && !ctx.repo
+        ? "The repo could not be resolved (no --repo/GH_REPO/cd, and the session cwd is not a GitHub worktree). If this PR is in " +
           "another repo, re-record with repo info — record-review.sh <PR> <head_sha> clean owner/repo — " +
           "or pass --repo owner/repo to gh pr merge."
         : "If this persists, re-record with repo info — record-review.sh <PR> <head_sha> clean owner/repo — " +
@@ -534,8 +710,49 @@ export default function (pi: ExtensionAPI) {
       // commit/push and gh pr create, below.
       const prNumber = extractPrNumber(command);
       if (prNumber !== null) {
-        const record = readReviewRecord(prNumber);
-        const ctx = resolveRepoContext(command, record);
+        // #426: repo resolution is command-first (--repo / GH_REPO / cd), then
+        // the merge ENVIRONMENT — git remote of the cd target, else of the pi
+        // session cwd — so plain `gh pr merge N` still hits the repo-qualified
+        // registry. record.repo is deliberately NOT used to pick the PR for
+        // head verification (review P0-2 false-allow: a foreign record must
+        // not drive the head lookup for the wrong repo's PR).
+        const cmdCtx = resolveRepoContext(command, null);
+        const cdInfo = parseCdChains(command);
+        // Cycle 4 P1: an unattributable cd (`cd $VAR`, `cd "$(…)"`, subshell
+        // `(cd …)`) means the merge runs SOMEWHERE ELSE — but the no-repo read
+        // and head-verify machinery below would attribute it to the session
+        // cwd's repo (the exact wrong-repo-record allow this PR kills). Such
+        // merges are handled here, before any record read or head fetch:
+        // sub-agents fail CLOSED; interactive sessions get a VISIBLE fail-open
+        // with remediation (consistent with #138's interactive-only fail-open
+        // — the external ai-review-gate required check stays the backstop).
+        const unattrib = cmdCtx.source === "fallback" && !cmdCtx.repo && cdInfo.unattributable && !cdInfo.last;
+        if (unattrib) {
+          const advice =
+            "The merge command's cd target is not statically resolvable (subshell/$VAR/backtick cd, e.g. `(cd …)`, `cd $X`). " +
+            `PR #${prNumber} cannot be attributed to a repo — re-run with an absolute-path cd or pass --repo owner/repo.`;
+          if (isTaskSubAgent()) {
+            const msg = `[review-enforcer] 🚫 Merge registry gate blocked — ${advice}`;
+            logMergeGateDecision(prNumber, { status: "block", reason: msg }, null); // #60
+            return { block: true, reason: msg };
+          }
+          const warn = `⚠️  [review-enforcer] ${advice} Allowing merge WITHOUT repo attribution or review-record check (interactive fail-open).`;
+          console.log(warn);
+          logMergeGateDecision(prNumber, { status: "failopen", warning: warn }, null); // #60
+          return undefined;
+        }
+        // Session-cwd fallback fires ONLY for commands with NO cd at all (a
+        // parsed cd target is resolved above; anything else would authorize a
+        // cross-repo merge with the wrong repo's record).
+        const cdPath = cmdCtx.source === "cd" ? cmdCtx.cwd : cdInfo.last;
+        const envRepo =
+          cmdCtx.repo ??
+          (cdPath ? repoFromGitRemote(cdPath) : null) ??
+          (cmdCtx.source === "fallback" && !cdInfo.unattributable && !cdInfo.last
+            ? repoFromGitRemote(process.cwd())
+            : null);
+        const ctx = envRepo ? { ...cmdCtx, repo: envRepo } : cmdCtx;
+        const record = readReviewRecord(prNumber, envRepo ?? undefined);
         const currentHead = await getPrHeadSha(prNumber, ctx);
         // #285 Fix C: the no-record block message is shape-aware (task
         // sub-agents get the "parent must record the review" variant).
