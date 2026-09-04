@@ -504,6 +504,16 @@ m4("switch main allowed (recovery)", `git switch main`, "pr1467", "recovery");
 m4("pull --ff-only allowed", `git pull --ff-only origin main`, "pr1467", "recovery");
 m4("plain pull blocked (may merge)", `git pull origin main`, "pr1467", "block");
 m4("fetch allowed", `git fetch origin`, "pr1467", "recovery");
+// #439 P1 (cycle-3 probe): bare `heads/` dst shorthand rewrites the local trunk
+// in a disordered hub (`fetch origin backup:heads/main` moved refs/heads/main).
+m4("fetch heads/main dst blocked", `git fetch origin backup:heads/main`, "pr1467", "block");
+m4("fetch +heads/main dst blocked", `git fetch origin +backup:heads/main`, "pr1467", "block");
+m4("fetch refs/heads/main dst blocked (F3)", `git fetch origin backup:refs/heads/main`, "pr1467", "block");
+// #439 P2 (cycle-3 probe): `git push -d <b>` is the --delete short form and was
+// classified recovery for the checked-out branch — delete the origin copy of
+// the WIP lane (and origin/main when dirty-on-main).
+m4("push -d own branch blocked", `git push origin -d pr1467`, "pr1467", "block");
+m4("push -d main blocked", `git push -d origin main`, "main", "block");
 m4("status allowed", `git status`, "pr1467", "recovery");
 m4("log allowed", `git log --oneline -5`, "pr1467", "recovery");
 m4("worktree add allowed", `git worktree add ../wt -b feat/x origin/main`, "pr1467", "recovery");

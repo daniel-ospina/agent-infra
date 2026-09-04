@@ -254,7 +254,10 @@ function _refspecDst(refspec) {
   const r = _stripQuotes(refspec);
   const dst = r.includes(":") ? r.split(":").pop() : r;
   if (dst === "HEAD") return null;
-  return dst.replace(/^refs\/heads\//, "");
+  // git dst-inference shorthand: `:heads/main` / `backup:heads/main` resolve
+  // to refs/heads/main on the remote (#439 P1 — probe-verified; a disordered
+  // hub `git fetch origin backup:heads/main` moved local refs/heads/main).
+  return dst.replace(/^refs\/heads\//, "").replace(/^heads\//, "");
 }
 
 /** Expand `$VAR` / `${VAR}` in a cd target against same-segment assignments
@@ -1742,7 +1745,7 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
       // targets → block. Round-3 P1: the `:branch` EMPTY-SOURCE refspec form is
       // a remote-branch DELETION — block it even when the dst matches; a bare
       // `HEAD` refspec resolves to the checked-out branch.
-      if (flag("-f") || flag("--force") || flag("--delete") ||
+      if (flag("-f") || flag("--force") || flag("--delete") || flag("-d") || // -d = --delete (push short form, #439 P2)
           a.includes("--mirror") || a.includes("--tags") ||
           a.includes("--all") || a.includes("--prune") || a.includes("--follow-tags")) return "block";
       if (!currentBranch) return "block"; // detached hub — push target unknowable
