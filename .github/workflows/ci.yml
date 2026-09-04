@@ -90,6 +90,21 @@ jobs:
         # (provenance).
         run: '! grep -rE ''/Users/danielospina/swarm/operations/coordination'' skills/ extensions/ scripts/'
 
+  setup-suite:
+    # #449 — pi-bootstrap setup regression suite, per-PR gate: the ONLY run-site
+    # that catches the #447 ship-list drift class at PR time (previously the
+    # parity suite ran nowhere in CI — the drift shipped silently and was found
+    # by manual invocation only). Real setup.sh under a temp HOME, hermetic
+    # (npm stubbed, launchctl shim, Darwin-gated assertions); ~2min.
+    # Covers: no-nesting (#93), active-file refresh, farm-link preservation,
+    # extensions/ content parity (single source of truth #95), launchd
+    # isolation (#446).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: pi-bootstrap setup regression suite
+        run: bash pi-bootstrap/tests/test-setup-no-nesting.sh
+
   vendor-drift:
     # #383 — the SINGLE vendor drift gate: bash syntax + manifest verification
     # (identical@base sha256s + ledger patches reverse-apply to the swarm base).
