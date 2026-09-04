@@ -186,10 +186,12 @@ out the TTL-marker path). The consequences, all of which M4 now prevents:
   → Slice D ships `hub-worktree.sh` (one command, never `/tmp`, never detached,
   auto-setup symlinks) so isolation is the easy path again.
 
-**The nightly hub-state check (`hub-state-check.sh`, launchd every 6h)** is the
-visibility layer: it fails loudly with the recovery command and opens one
-deduped GitHub issue per repo when the hub goes bad. Day 0 validation: the
-live `pr1467` hub fails the check — that is the point.
+**The age-gated hub-state check (`hub-state-check.sh`, run at pi session start by
+`extensions/session-checks.ts` — #432; launchd can't read ~/Documents under TCC)
+watches the tortoise main checkout (agent-infra main is #99-exempt)**: it fails
+loudly with the recovery command and opens one deduped GitHub issue when the
+hub goes bad. Day 0 validation: the live `pr1467` hub fails the check — that is
+the point.
 
 ### What this gate is NOT
 
@@ -376,7 +378,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 
 | Escape | How | Consequence (what you are opting into) |
 |---|---|---|
-| env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass — M1/M2/M3/M4 all off. The nightly `hub-state-check` will FLAG the hub and open a GitHub issue; sibling sessions in the hub are unprotected and will be disrupted. Prefer `hub-worktree.sh <branch>` instead. |
+| env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass — M1/M2/M3/M4 all off. Nothing automated flags agent-infra main dirt (hub-state-check is tortoise-only — agent-infra is #99-exempt); sibling sessions in the hub are unprotected and will be disrupted. Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
 | script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. It was the most likely vector for the 2026-08-18 incident; it no longer exists. |
 | terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | THE sanctioned recovery (#206). Terminals are never intercepted; this is how a stranded hub gets un-stranded. |

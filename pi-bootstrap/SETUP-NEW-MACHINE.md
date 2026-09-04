@@ -40,12 +40,29 @@ It copies your models, agents, extensions, rules, skills, scripts, and **MCP con
 
 **Launchd agents (macOS):** setup.sh also installs the scheduled jobs via
 `scripts/install-launchd.sh` — the versioned plist templates in
-`templates/launchd/` (hub-state-check every 6h; skill-lint-oracle daily;
-provider-latency-tripwire every 1h — the api.deepseek.com latency alert
-#424; corruption-canary every 15 min on swarm hosts). The installer is
+`templates/launchd/` (provider-latency-tripwire every 1h — the
+api.deepseek.com latency alert #424; corruption-canary every 15 min on swarm
+hosts). The installer is
 idempotent: renders → diffs vs the
 installed plist → skips when identical, reloads on change. Run
 `scripts/install-launchd.sh --status` to inspect; `--uninstall` to remove.
+
+**Session checks (macOS):** hub-state-check (repo drift) + skill-lint-oracle
+(skill-lint drift lock) can't run under launchd — macOS TCC blocks
+launchd-spawned processes from reading ~/Documents, and both checks read the
+repos there (#427/#431). They are RETIRED from launchd
+(`templates/launchd/RETIRED`, #432) and instead run from
+`extensions/session-checks.ts` at every pi session start, age-gated
+(hub >6h, oracle >24h, ~/.pi/agent/state) — i.e. they run while you work,
+not on a headless 24/7 timer. Hub surface = the tortoise checkout only
+(TORTOISE_REPO env / sibling), parity with the retired job — agent-infra's
+main checkout stays #99-exempt from hub flags; `SESSION_CHECKS_REPOS` adds
+more. `SESSION_CHECKS_OFF=1` disables; windows via
+`SESSION_CHECKS_HUB_H` / `SESSION_CHECKS_ORACLE_H` (0 = never auto-run).
+First run after setup: no state epochs exist yet → the first session start
+runs both checks once, and hub's --gh-report becomes LIVE (it was TCC-dead
+under launchd) — if the main checkout is dirty at that moment it files one
+deduped issue per repo. Expected behavior, not a fault.
 
 ## Step 3 — Transfer your keys (one-time, ~5 min)
 
@@ -78,8 +95,8 @@ machine's pi instance.
 - **Launchd on a swarm host:** after the one-time setup, run the swarm
   bootstrap (`bash scripts/bootstrap.sh` in the swarm checkout) — it installs
   the 8 swarm daemons (its own installer) and delegates the agent-infra jobs
-  (hub-state-check + corruption-canary) to `scripts/install-launchd.sh`, so
-  the full 10-job fleet converges. Order: `pi-bootstrap/setup.sh` →
+  (corruption-canary) to `scripts/install-launchd.sh`, so the full fleet
+  converges. Order: `pi-bootstrap/setup.sh` →
   swarm `bootstrap.sh` → `scripts/install-launchd.sh` (all idempotent).
 - **What syncs:** skills, extensions, agents, models, settings, rules, the
   base MCP config (`templates/.mcp.base.json` → `~/.pi/agent/.mcp.json`), the

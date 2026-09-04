@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # hub-state-check.test.sh — self-check for scripts/checkout-hygiene/hub-state-check.sh
-# (#1484, Slice A: nightly hub-discipline check).
+# (#1484; deployed session-gated via extensions/session-checks.ts, #432).
 #
 # Run: bash scripts/checkout-hygiene/hub-state-check.test.sh
 # Exits 0 when ALL assertions pass, 1 on any failure. Self-contained: builds

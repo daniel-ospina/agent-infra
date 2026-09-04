@@ -1,0 +1,18 @@
+# Retired launchd jobs (#432 — Option C; issue #431 decision).
+#
+# hub-state-check (repo drift) + skill-lint-oracle (skill-lint drift lock)
+# cannot run under launchd: macOS TCC blocks launchd-spawned processes from
+# reading ~/Documents (EPERM for bash, git, node AND python — #427 probe),
+# and both jobs inherently read the repos there. Their work moved to
+# extensions/session-checks.ts, which runs them age-gated (hub >6h, oracle
+# >24h) from pi's session_start — an interactive, TCC-approved process tree.
+#
+# install-launchd.sh unloads + removes jobs listed here on machines that
+# installed them pre-retirement. A label here must NOT also have a *.plist
+# template in this directory (installer errors on the conflict).
+#
+# Corruption-canary + provider-latency-tripwire REMAIN launchd jobs: the
+# canary watches ~/swarm (unprotected), the tripwire touches no protected
+# path — both run fine under launchd.
+com.eldato.hub-state-check
+com.eldato.skill-lint-oracle

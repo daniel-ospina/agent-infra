@@ -216,9 +216,11 @@ agents in the hub) is prevented by discipline, not just guards:
    feature work there; create a worktree. (Daemons execute in role-scoped
    execution worktrees via the swarm runtime; interactive agents follow this
    rule.) Since #1484 the guard's **M4 gate** enforces this at runtime and the
-   **nightly hub-state check** (`scripts/checkout-hygiene/hub-state-check.sh`,
-   launchd every 6h) fails loudly with the recovery command + a deduped GitHub
-   issue. To create a worktree in ONE command — with .env/.venv/.mcp.json
+   **age-gated hub-state check** (`scripts/checkout-hygiene/hub-state-check.sh`,
+   run by `extensions/session-checks.ts` at pi session start — launchd can't
+   read ~/Documents under macOS TCC, #432) fails loudly with the recovery
+   command + a deduped GitHub issue on the tortoise hub. To create a worktree
+   in ONE command — with .env/.venv/.mcp.json
    auto-setup, never `/tmp`, never detached — use:
    ```bash
    bash scripts/checkout-hygiene/hub-worktree.sh <branch>   # from any checkout of the repo
