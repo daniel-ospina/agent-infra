@@ -521,6 +521,13 @@ m4("push -qvdf cluster blocked", `git push origin -qvdf pr1467`, "pr1467", "bloc
 m4("push -q non-destructive still recovery", `git push -q origin pr1467`, "pr1467", "recovery");
 m4("push attached -o value not a cluster (cycle-5)", `git push -odraft origin pr1467`, "pr1467", "recovery");
 m4("push -u -o mix recovery", `git push -uqv origin pr1467`, "pr1467", "recovery");
+// #439 P2 (cycle-6): long-option prefix abbreviations (git accepts unambiguous
+// prefixes: --del = --delete, --mir = --mirror).
+m4("push --del abbrev blocked", `git push origin --del pr1467`, "pr1467", "block");
+m4("push --dele abbrev blocked", `git push origin --dele pr1467`, "pr1467", "block");
+m4("push --mir abbrev blocked", `git push origin --mir`, "pr1467", "block");
+m4("push --del main abbrev blocked", `git push origin --del main`, "main", "block");
+m4("push --dry-run abbrev still recovery", `git push --dry origin pr1467`, "pr1467", "recovery");
 m4("status allowed", `git status`, "pr1467", "recovery");
 m4("log allowed", `git log --oneline -5`, "pr1467", "recovery");
 m4("worktree add allowed", `git worktree add ../wt -b feat/x origin/main`, "pr1467", "recovery");

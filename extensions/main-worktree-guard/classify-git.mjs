@@ -1751,8 +1751,17 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
       // Attached push-option values (`-odraft`, `-uofoo`) contain other letters
       // (o) and are NOT clusters — they keep flowing (cycle-5 probe).
       const hasShortDestructiveCluster = a.some((x) => /^-[vqnu46df]+$/.test(x) && /[df]/.test(x));
+      // #439 P2 (cycle-6): git accepts unambiguous long-option PREFIX
+      // abbreviations (`--del` = --delete, `--mir` = --mirror) — exact-match
+      // misses them. Block any arg that is a strict prefix of a destructive
+      // long option (same set the exact list blocks; --force-with-lease is
+      // NOT in either set — parity with the existing exact behavior).
+      const DESTRUCTIVE_LONGS = ["--delete", "--force", "--mirror", "--prune", "--tags", "--all", "--follow-tags"];
+      const hasDestructiveAbbrev = a.some((x) =>
+        /^--[a-z][a-z0-9-]*$/.test(x) &&
+        DESTRUCTIVE_LONGS.some((opt) => opt.startsWith(x) && x.length < opt.length));
       if (flag("-f") || flag("--force") || flag("--delete") || flag("-d") ||
-          hasShortDestructiveCluster ||
+          hasShortDestructiveCluster || hasDestructiveAbbrev ||
           a.includes("--mirror") || a.includes("--tags") ||
           a.includes("--all") || a.includes("--prune") || a.includes("--follow-tags")) return "block";
       if (!currentBranch) return "block"; // detached hub — push target unknowable
