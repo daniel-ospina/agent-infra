@@ -69,7 +69,16 @@
  * later cross-reference noun); and the trailing affirmative override
  * requires a VALUE-BOUND signal (verb forms / outcome adjectives / "at
  * bar"), never a bare "result" noun or a verb bound to its own clause's
- * decimal. The #2009 co-location record is
+ * decimal. Round-15 (cycle-8 review) extends the value binding to the
+ * step-(1) HEAD-window explicit-measured scan: a measurement/result word
+ * in the 40-char head window whose OWN clause carries a DIFFERENT decimal
+ * ("measured 0.284 last run. mapped agreement **0.85** is the bar", "The
+ * parity gate measured 0.284 last run; mapped agreement **0.85** is the
+ * bar") is bound to that decimal's record and does NOT upgrade the 0.85
+ * bar mention into a measured at-bar figure — the clause-order mirror of
+ * the round-14 tail binding, so the same sentence demotes whether the
+ * measurement clause precedes (head window) or follows (tail) the bar
+ * mention. The #2009 co-location record is
  * read per SENTENCE — whose clause also ends at a top-level em/en-dash
  * (round-12: "…#2009 verified OPEN — the earlier (d) FAIL was resolved…"
  * joins a NEW clause bound to a different subject, so it never negates the
@@ -343,10 +352,18 @@ function cMeasuredFigures(sec) {
         // (1) explicit-result override: a measurement verb bound to THIS
         // phrase ("measured mapped agreement **0.85**") or an outcome
         // parenthetical ("(bar met)", "(met)", "(pass)") — the 0.85 IS the
-        // recorded at-bar figure. (The tight char verb binding keeps a
-        // measurement verb from an EARLIER sentence — "Measured … 0.284 last
-        // run. mapped agreement **0.85** …" — from upgrading a bar mention.)
-        const explicitMeasured = /\b(?:measured|recorded|scored|reported|observed)\b|\bresult\b/i.test(head + m[1]);
+        // recorded at-bar figure. Round-15: the head-window scan is
+        // VALUE-BOUND, mirroring the round-14 tail classifier — a
+        // measurement/result word whose OWN clause carries a DIFFERENT
+        // decimal is bound to that decimal's record and cannot upgrade the
+        // bar mention ("measured 0.284 last run. mapped agreement **0.85**
+        // is the bar", "The parity gate measured 0.284 last run; mapped
+        // agreement **0.85** is the bar" — the 0.284 clause is the record,
+        // so the 0.85 demotes via (2)/(3) below instead of passing as
+        // measured). (The tight char verb binding keeps a measurement verb
+        // from an EARLIER sentence — "Measured … 0.284 last run. mapped
+        // agreement **0.85** …" — from upgrading a bar mention.)
+        const explicitMeasured = cHeadWindowMeasuresValue(sent, m.index - head.length, head + m[1], val);
         const outcomeParen = /\((?:the\s+)?(?:0?\.?85\s+)?(?:bar|threshold|gate|target)\s+(?:met|passed|exceeded|satisfied|achieved|hit|cleared|reached)\s*\)|\((?:met|pass|passed|at\s+(?:the\s+)?bar|bar\s+met|bar\s+passed)\)/i.test(tail);
         if (explicitMeasured || outcomeParen) {
           out.push(val);
@@ -678,6 +695,40 @@ function cTailNegatesMeasurement(tail) {
     else affirmativeAll++;
   }
   return negatedAll > 0 && affirmativeAll === 0;
+}
+// Round-15 (cycle-8 review): the step-(1) HEAD-window explicit-measured
+// scan, VALUE-BOUND symmetrically with the round-14 tail classifier. The
+// window (the <= 40 chars before the "mapped agreement" keyword plus the
+// keyword-to-value run-up) may carry a measurement/result word whose OWN
+// clause — a top-level-boundary span over the WHOLE sentence
+// (cTailClauseSpan), so the clause can end past the 40-char clip — also
+// carries a DIFFERENT decimal: "measured 0.284 last run. mapped agreement
+// **0.85** is the bar" and "The parity gate measured 0.284 last run;
+// mapped agreement **0.85** is the bar" record a 0.284 measurement inside
+// the verb's clause, so the verb is bound to THAT decimal's record and
+// must not upgrade the 0.85 bar mention into a measured at-bar figure
+// (without this binding the step-(2)/(3) demotion is never reached and the
+// gate falsely passes). The word measures the capture only when no OTHER
+// decimal sits in its own clause — "measured mapped agreement **0.85**"
+// (verb directly before the keyword, no decimal between; the captured
+// value reached through the keyword is the clause's only decimal) still
+// records the at-bar figure. A word from an EARLIER sentence never reaches
+// the window (the head clip ends at the previous period, and the decimal
+// record it binds is already out of reach).
+function cHeadWindowMeasuresValue(sent, winStart, winText, val) {
+  const re = /\b(?:measured|recorded|scored|reported|observed|result)\b/gi;
+  let w;
+  while ((w = re.exec(winText)) !== null) {
+    const { start, end } = cTailClauseSpan(sent, winStart + w.index);
+    const dRe = /[01]?\.[0-9]+/g;
+    let dm;
+    let boundElsewhere = false;
+    while ((dm = dRe.exec(sent.slice(start, end))) !== null) {
+      if (Number(dm[0]) !== val) { boundElsewhere = true; break; }
+    }
+    if (!boundElsewhere) return true;
+  }
+  return false;
 }
 // Round-11 HEAD-window bar-restatement signal for an at-bar (0.85) capture:
 // bar/plan nouns and verbs sitting in the bounded window BEFORE the "mapped
