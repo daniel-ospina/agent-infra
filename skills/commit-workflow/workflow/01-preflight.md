@@ -36,7 +36,7 @@ fi
 - Triggers only on `docs/**/*.md` files (zero overhead for code-only commits)
 - Uses `--diff-filter=ACMR` to catch creates, modifies, renames
 - Blocks commit if validation fails (exit 1)
-- Low-risk tier — skips typecheck/build for doc-only changes
+- Low-risk tier — skips typecheck/build for doc-only changes (mechanism separation: this "Low-risk tier" and the "Low (docs, config, CSS, strings)" risk rows in the stack tables below are pre-flight SCRIPT gates — typecheck/build skip only — distinct from the extension gates' scoping: VGATE's content-shape exemption keys on file shape at ANY tier, not on this risk tier)
 
 ## Pre-flight Verification (proportional — from proportional-gates v1.0.0)
 
@@ -245,16 +245,18 @@ echo "$TIER" > /tmp/agent-issue-complexity
 
 ### Micro Tier Auto-Detection & Gate Behavior
 
-When `TIER = Micro` or auto-detected (1 file, <20 added lines, no migrations, or docs/CSS/static-only per 02-commit-pr.md Step 1.5):
+When `TIER = Micro` or auto-detected (1 file, <20 added lines, no migrations, or docs/CSS/static-only per 02-commit-pr.md Step 1.5).
+
+Mechanism separation: the VGATE content-shape skip is extension-side and shape-based (applies at ANY tier; code sets never skip); the review-enforcer micro warn-only is marker-based (extension reads `/tmp/agent-issue-complexity` = micro); a docs-only commit on an UNLABELED issue is VGATE shape-exempt but still review-enforcer-blocked at 0 dispatches.
 
 | Gate | Micro Behavior |
 |------|---------------|
-| Review-enforcer | **KEPT** — 1 task sub-agent dispatch required before git ops |
-| Verification-gate (VGATE) | **SKIPPED** — single reviewer dispatch is sufficient |
+| Review-enforcer | **WARN-ONLY** at micro — 0 reviewer dispatches warn but do not block (extension reads /tmp/agent-issue-complexity = micro); Standard+/unset block |
+| Verification-gate (VGATE) | **shape-gated, not tier-gated** — docs/CSS/static-only sets skip regardless of tier; code sets never skip (see Pi Extension Gates → Verification Gate below) |
 | Lint/Typecheck | **KEPT** — runs in pre-commit hooks, zero agent overhead |
 | Code review (Step 3) | **SKIPPED** — per commit-workflow/03-code-review.md |
 
-**Rationale:** A single reviewer sub-agent catches stupid agent mistakes without the 3+ minute per-file VGATE overhead. For a 2-line fix, a 10-second "CLEAN" review is proportional. Zero gates would let obvious bugs through.
+**Rationale:** Micro-tier CODE commits keep full VGATE (shape-gated — the extension skips only docs/CSS/static sets, never code); the reviewer dispatch (review-enforcer, warn-only at micro) plus VGATE-on-code is the net.
 
 ## Wiring-Gap Check (canary-fix PRs only)
 
@@ -283,13 +285,13 @@ If `WIRING_CHECK=true`, before committing:
 
 This guard exists because #4327/#4328 demonstrated a type error fix can mask a wiring gap: `tripadvisor_url` existed in the DB and types but wasn't fetched by `useDeals.ts`, producing a silent `undefined`.
 
-## Pi Extension Gates (mandatory — not tier-gated)
+## Pi Extension Gates (extension-enforced — per-gate scoping)
 
-These two checks are enforced by Pi extensions and apply to every commit regardless of risk tier.
+These checks are enforced by Pi extensions — each with per-gate scoping rather than a blanket tier rule: the review-enforcer is tier-gated (micro warn-only via marker; Standard+/unset block); VGATE is content-shape gated (docs/CSS/static-only sets exempt, code never). Neither is bypassed for code-bearing sets.
 
 ### Review Enforcer Gate
 
-The `review-enforcer` extension blocks git operations unless at least one `task` sub-agent was dispatched this session.
+The `review-enforcer` extension blocks git operations unless at least one `task` sub-agent was dispatched this session — Micro tier is warn-only (extension reads `/tmp/agent-issue-complexity` = micro; 0 dispatches warn but do not block); Standard+/unset block.
 
 ```bash
 # This gate fires ON the git commit/push command itself — not as a separate check.
@@ -307,7 +309,32 @@ The `review-enforcer` extension blocks git operations unless at least one `task`
 
 ### Verification Gate
 
-The `verification-gate` extension blocks `git commit` unless every staged file has been verified by a `[VGATE]` sub-agent.
+The `verification-gate` extension blocks `git commit` unless every staged file has been verified by a `[VGATE]` sub-agent — except where the content-shape exemption below applies.
+
+**Content-shape exemption (docs/CSS/static-only — extension-side, tier-independent):**
+when the op's relevant file set (staged diff for commit/push; branch diff for
+`gh pr create`/merge) is ENTIRELY docs/CSS/static AND no file sits under a
+build-output directory, VGATE skips the op (audited `gate_skip:
+content_shape_exempt`). Code-bearing or mixed sets are NEVER exempt; among
+`git commit` invocations only the bare form qualifies — `-a`/`--all`/`--amend`/
+pathspec anywhere in the op re-gates the whole command (push / `gh pr create`/
+merge ops with no commit invocation qualify on file shape alone).
+
+<!-- VGATE-SHAPE-RULE: machine-read by extensions/verification-gate/index.test.ts drift test — keep in sync with SHAPE_EXEMPT_EXTENSIONS + BUILD_OUTPUT_SEGMENTS in extensions/verification-gate/index.ts -->
+| Exempt extension | Build-output path segments (any depth — NOT exempt) |
+|---|---|
+| `.md` | `public/` `dist/` `build/` |
+| `.css` | `public/` `dist/` `build/` |
+| `.scss` | `public/` `dist/` `build/` |
+| `.html` | `public/` `dist/` `build/` |
+<!-- /VGATE-SHAPE-RULE -->
+(Drift test normalizes the trailing `/` before comparing to `BUILD_OUTPUT_SEGMENTS`.)
+
+Delete-shaped pushes (`git push origin --delete <branch>`, `git push --delete
+origin <branch>`, `git push origin :<branch>`) ship no local file content and
+skip VGATE before any diff computation (audited `gate_skip:
+delete_push_no_content`). Content pushes keep the staged check. `git branch -D`
+/ `git worktree remove` are not VGATE-intercepted.
 
 **How to satisfy:**
 ```bash
@@ -333,7 +360,7 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 
 **When:** Standard+Complex tier commits where staged files include `.ts`, `.tsx`, `.py`, `.sql`, `.js`, or `.jsx`.
 
-**Skip:** Micro tier commits, or commits with no matching file extensions.
+**Skip:** Micro tier commits (tier-gated — the Mechanism below greps the issue BODY for `complexity:micro`, a third, separate micro channel from the review-enforcer's `/tmp/agent-issue-complexity` marker; VGATE is shape-gated, never micro-gated), or commits with no matching file extensions.
 
 **Mechanism:**
 
