@@ -725,6 +725,31 @@ const DESTRUCTIVE_MCP = /\b(?:delete|remove|reset|revoke|drop|truncate|merge|reb
 const CHECKPOINT_TOKEN_FILE = "/tmp/parallel-check-token.json";
 const CHECKPOINT_TOKEN_TTL_MS = 600_000; // 10 min (plan §4)
 
+// #378: PER-SESSION token-file scoping. The token default used to be a single
+// machine-global path (/tmp/parallel-check-token.json) that concurrent pi
+// sessions on one host shared — session A's CLEAR token satisfied (or was
+// clobbered by) session B (last-writer-wins, machine-global). The default is
+// now scoped per session: `/tmp/parallel-check-token.<sid>.json`, where <sid>
+// is the pi session id (ctx.sessionManager.getSessionId() — the SAME value pi
+// injects as PI_SESSION_ID into bash-tool child envs, so the vendored checker
+// running as an in-session bash call derives the identical path). A session
+// only ever reads/writes/unlinks ITS OWN token; a lingering token from another
+// session can neither satisfy nor be clobbered by this one. Unscoped fallback:
+// when NO session id is resolvable (operator shell runs of the checker, a
+// no-ctx/stale-runner boundary — auditSessionId null) both sides fall back to
+// the legacy unscoped path, so the checker↔enforcer contract never splits.
+// Explicit PARALLEL_CHECK_TOKEN_FILE overrides still win verbatim on both
+// sides (never session-scoped — an override is deliberate operator intent).
+// Sanitization parity is BYTE-wise on all three sides (TS Buffer loop, python
+// utf-8 bytes, bash `tr -c`): every byte outside [A-Za-z0-9._-] becomes "_",
+// so a hostile/exotic session id can never smuggle a path separator and the
+// three implementations can never drift (a code-point regex would map one
+// non-ASCII char to one "_" while tr maps its N bytes — different filenames).
+// Force file (#357 h): deliberately LEFT machine-shared — the operator writes
+// it by hand from a shell that has no session id; single-operator assumption
+// documented in skills/enforcement (the new-session unlink hazard is the
+// documented cost; a per-session force suffix needs an operator-visible id).
+
 // #357 (Task 10, h): operator force-pass — a scoped, documented, one-shot
 // bypass distinct from the kill switch. Formalizes the proven hand-token
 // practice for gate-mode interactive worktree sessions where the checker
@@ -1030,8 +1055,53 @@ function tokenFile(): string {
   // REAL /tmp token file — a machine with a fresh phase-correct token would
   // flip not-ok escape tests to the ok-token path (probe-pollution — the exact
   // class this PR eliminates). Mirrors the audit-sink NODE_ENV=test guard.
-  if (process.env.NODE_ENV === "test") return "/tmp/sequence-enforcer-test-none/token.json";
-  return CHECKPOINT_TOKEN_FILE;
+  // #378: the test-mode base is session-scoped TOO (auditSessionId drives the
+  // suffix) so the suite can observe the per-session wiring without touching
+  // the real /tmp (see the #378 cross-session isolation tests).
+  if (process.env.NODE_ENV === "test") return scopedTokenFilePath(auditSessionId, "/tmp/sequence-enforcer-test-none/token.json");
+  // #378: default is PER-SESSION scoped — the captured ctx session id (the
+  // SAME id pi injects as PI_SESSION_ID into the checker's bash child env), or
+  // the legacy unscoped path when no session is resolvable.
+  return scopedTokenFilePath(auditSessionId);
+}
+
+// #378: session-scope a base file path — insert the sanitized session id
+// before the base's last filename extension (…/token.json →
+// …/token.<sid>.json; a base with no extension gains a trailing .<sid>). A
+// null/empty/whitespace session id returns the base UNCHANGED (the unscoped
+// fallback contract). Exported for the checker-parity + isolation tests.
+export function scopedTokenFilePath(sessionId: string | null, base = CHECKPOINT_TOKEN_FILE): string {
+  const scope = sessionFileScope(sessionId);
+  if (scope === null) return base;
+  const slash = base.lastIndexOf("/");
+  const dot = base.lastIndexOf(".");
+  if (dot > slash) return base.slice(0, dot) + "." + scope + base.slice(dot);
+  return base + "." + scope;
+}
+
+// #378: byte-wise filename sanitization shared by the enforcer (Node Buffer),
+// the vendored checker (python utf-8 bytes) and its .sh wrapper (tr -c) —
+// every byte outside [A-Za-z0-9._-] becomes "_" (path-separator-smuggle-safe;
+// identical output on all three sides, including multi-byte UTF-8 input where
+// a per-code-point regex would drift from tr). Returns null for a null or
+// empty (post-sanitize) input → unscoped fallback.
+function sessionFileScope(raw: string | null): string | null {
+  if (raw === null) return null;
+  // Trim first — an empty/whitespace id is the UNSCOPED fallback (mirrors the
+  // checker's python `strip()` before sanitize).
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const bytes = Buffer.from(trimmed, "utf-8");
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i]!;
+    const c = String.fromCharCode(b);
+    out +=
+      (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a) || c === "." || c === "_" || c === "-"
+        ? c
+        : "_";
+  }
+  return out.length > 0 ? out : null;
 }
 
 // #383 (Task 3): mode-aware, binding-aware token check. opts.enforceBinding is

@@ -1,6 +1,28 @@
 --- a/scripts/parallel_work_check.sh
 +++ b/scripts/parallel_work_check.sh
-@@ -85,10 +85,43 @@
+@@ -23,7 +23,9 @@
+ #                checkpoint_pass + overlap_decision events, advance_phase
+ #
+ # UNKNOWN = infra/timeout. The PASS token (default
+-# /tmp/parallel-check-token.json) is written ONLY on a CLEAR verdict —
++# /tmp/parallel-check-token.json, PER-SESSION scoped to
++# /tmp/parallel-check-token.<session-id>.json when run inside a pi session —
++# PI_SESSION_ID is set; #378) is written ONLY on a CLEAR verdict —
+ # UNKNOWN at a gated checkpoint means NO token and the enforcer gate
+ # (issue #5039) blocks with retry(2)+override. Phase gates never silently
+ # pass; advisory reads fail open to CLEAR.
+@@ -36,7 +38,9 @@
+ #   SWARM_CARD_ID|CARD_ID  AGENT_ID|SWARM_AGENT_ID
+ #   SWARM_TOUCHED_PATHS|TOUCHED_PATHS  PARALLEL_CHECK_SYMBOL
+ #   PARALLEL_CHECK_TIMEOUT_SECS (budget, default 2 — overrun → UNKNOWN)
+-#   PARALLEL_CHECK_TOKEN_FILE (default /tmp/parallel-check-token.json)
++#   PARALLEL_CHECK_TOKEN_FILE (default /tmp/parallel-check-token.json —
++#     per-session scoped to parallel-check-token.<PI_SESSION_ID>.json inside
++#     a pi session, #378)
+ #   PARALLEL_CHECK_REPO (repo fallback for --repo)
+ #   CHECKOUT_GUARD_* passthrough (checkout_guard.sh config)
+ set -uo pipefail
+@@ -85,10 +89,75 @@
  # Budget: python enforces PARALLEL_CHECK_TIMEOUT_SECS internally and emits
  # UNKNOWN on overrun; this shell watchdog is the hard backstop for a hung
  # subprocess (bounded, env-overridable — swarm #196 pattern).
@@ -39,12 +61,44 @@
  
 +# #383 patch: the token path must be resolved here too — the error branch
 +# unlinks it (see below).
-+token_file="${PARALLEL_CHECK_TOKEN_FILE:-/tmp/parallel-check-token.json}"
++# #378 patch: the DEFAULT is now PER-SESSION scoped — pi injects PI_SESSION_ID
++# (== ctx.sessionManager.getSessionId()) into bash-tool child envs, so a
++# checker run inside a pi session writes /tmp/parallel-check-token.<sid>.json
++# and the enforcer of THAT SAME session reads it (concurrent sessions no
++# longer share/clobber one machine-global file). This wrapper MUST derive the
++# identical path for its error-branch unlink (a watchdog SIGKILL skips
++# python's own cleanup). Sanitization mirrors the python side (utf-8 bytes)
++# and the enforcer (Node Buffer) BYTE-wise via `tr -c` — every byte outside
++# [A-Za-z0-9._-] becomes '_', so the three implementations can never drift
++# (session ids are ASCII UUIDs in practice; byte-wise keeps parity even then).
++# No PI_SESSION_ID (operator shell run) or an explicit PARALLEL_CHECK_TOKEN_FILE
++# → the legacy unscoped path / verbatim override, matching python + enforcer.
++# LC_ALL=C pins `tr` to BYTE-wise semantics on every platform (a UTF-8-locale
++# BSD tr maps one multibyte char → one '_' while GNU/Linux tr and python map
++# each byte → a divergent filename; ids are ASCII in practice, but the C-locale
++# pin keeps the three implementations byte-identical even for exotic input).
++# The id is whitespace-trimmed first (python `.strip()` / TS `.trim()` parity)
++# so a padded or ALL-whitespace id falls back unscoped on every side.
++token_file="${PARALLEL_CHECK_TOKEN_FILE:-}"
++if [ -z "$token_file" ]; then
++    token_sid_raw="${PI_SESSION_ID:-}"
++    # Trim leading+trailing whitespace so a padded / ALL-whitespace id behaves
++    # like the python (.strip) and TS (.trim) sides — all-whitespace MUST fall
++    # back to the UNSCOPED path on EVERY side (the #378 parity invariant).
++    token_sid_raw="${token_sid_raw#"${token_sid_raw%%[![:space:]]*}"}"
++    token_sid_raw="${token_sid_raw%"${token_sid_raw##*[![:space:]]}"}"
++    token_sid="$(printf '%s' "$token_sid_raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
++    if [ -n "$token_sid" ]; then
++        token_file="/tmp/parallel-check-token.${token_sid}.json"
++    else
++        token_file="/tmp/parallel-check-token.json"
++    fi
++fi
 +
  tmp_out="$(mktemp "${TMPDIR:-/tmp}/parallel-check-out.XXXXXX")"
  
  args=("$phase")
-@@ -96,10 +129,28 @@
+@@ -96,10 +165,28 @@
  [ -n "$symbol" ] && args+=(--symbol "$symbol")
  
  set +e
@@ -77,7 +131,7 @@
  watchdog_pid=$!
  wait "$pid"
  rc=$?
-@@ -110,8 +161,22 @@
+@@ -110,8 +197,22 @@
  rm -f "$tmp_out"
  
  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
