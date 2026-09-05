@@ -336,6 +336,76 @@ export function resolveMode(
 }
 // ── Audit logging ──────────────────────────────────
 
+// #377: session attribution for audit entries. The pi session id is captured
+// from the event ctx (ctx.sessionManager.getSessionId — the authoritative
+// in-process source) and stamped onto every enforcement entry, so probe/test
+// pollution is attributable and the positive-audit gate (#357 criterion 16)
+// can name exactly which sessions started after a deploy.
+let auditSessionId: string | null = null;
+// Test seam: force a deterministic session id (honored only under
+// NODE_ENV=test — mirrors _setAuditSinkForTest / _setForceFileForTest / other
+// sibling seams where null DEACTIVATES the override). With an override active,
+// capture short-circuits ctx resolution, so tests can drive the no-ctx audit
+// paths (timeout/timer) deterministically.
+let auditSessionOverride: { active: boolean; id: string | null } = { active: false, id: null };
+export function _setAuditSessionIdForTest(id: string | null): void {
+  if (process.env.NODE_ENV !== "test") return;
+  auditSessionOverride = { active: id !== null, id };
+  if (id !== null) auditSessionId = id;
+}
+
+// Test getter: read the captured session id under NODE_ENV=test (mirrors
+// _stackForTest / _markerCountForTest) so tests can assert capture semantics
+// (ctx-first resolution, override precedence, shutdown drop) directly.
+export function _auditSessionIdForTest(): string | null {
+  return process.env.NODE_ENV === "test" ? auditSessionId : null;
+}
+
+// Resolve the session id from the event ctx. ctx is the SOLE authoritative
+// source — there is deliberately NO process.env.PI_SESSION_ID fallback
+// (#377 scope + code review P2): pi injects PI_SESSION_ID into bash-tool child
+// envs (and create-harness execution envs), so a nested pi launched inside an
+// outer session's bash tool inherits the OUTER id; falling back to it would
+// stamp the outer session on the nested stream — the exact probe-misattribution
+// failure this issue exists to close (loop-enforcer precedent: ctx-only,
+// null when unresolvable; an unattributed entry beats a misattributed one).
+// ctx.sessionManager is a lazy getter in pi's runner that can throw when the
+// runner is stale (assertActive) — the try/catch keeps captureAuditSession
+// throw-free at every call site (#383 P3-2 "never let an external surface
+// throw" convention).
+function resolveSessionId(ctx: { sessionManager?: { getSessionId?: () => string } } | undefined): string | null {
+  try {
+    return ctx?.sessionManager?.getSessionId?.() ?? null;
+  } catch {
+    // Stale-runner ctx (assertActive throws post-fork/reload): returning null is
+    // deliberate — captureAuditSession stores it, so an unresolvable boundary
+    // stamps null. Unattributed beats stale: "keeping the prior id" would stamp
+    // the PRE-change session on the post-fork stream (the #377 misattribution
+    // class). Never throws.
+    return null;
+  }
+}
+
+let sessionIdWarned = false;
+
+// Capture at an event boundary. Under test with an override installed, the
+// override wins so direct helper/timer audit paths are deterministic. Never
+// throws (resolveSessionId swallows; override path is pure assignment).
+function captureAuditSession(ctx: { sessionManager?: { getSessionId?: () => string } } | undefined): void {
+  if (process.env.NODE_ENV === "test" && auditSessionOverride.active) {
+    auditSessionId = auditSessionOverride.id;
+    return;
+  }
+  auditSessionId = resolveSessionId(ctx);
+  // Loud-diagnosis convention (#383): a systemic inability to attribute must
+  // not be silent (the downstream gate reads null as "no session"). One-time
+  // warn per process, production only (tests drive ctx fixtures / override).
+  if (auditSessionId === null && process.env.NODE_ENV !== "test" && !sessionIdWarned) {
+    sessionIdWarned = true;
+    try { console.warn("[sequence-enforcer] ⚠️ audit session_id unresolvable (ctx.sessionManager absent or stale) — entries stamped null"); } catch { /* last resort */ }
+  }
+}
+
 // Test seam: tests inject a sink to capture entries without writing to the
 // real enforcement.jsonl (honored only under NODE_ENV=test).
 let auditSink: ((entry: Record<string, unknown>) => void) | null = null;
@@ -345,8 +415,14 @@ export function _setAuditSinkForTest(sink: ((entry: Record<string, unknown>) => 
 }
 
 function auditLog(entry: Record<string, unknown>) {
+  // #377: stamp the session id on the single choke point — every entry type
+  // (startup, blocked, allowed, warn_blocked, checkpoint_*, timeout_park,
+  // handler_error, bypassed) carries it. Always-present key (string | null)
+  // so group-by consumers never split on missing-vs-null; pre-#377 lines have
+  // no key and are treated as null by the reader.
+  const stamped = { ...entry, session_id: auditSessionId };
   if (auditSink) {
-    try { auditSink(entry); } catch (e) {
+    try { auditSink(stamped); } catch (e) {
       // #383 (Task 3) T6(i): a raising sink (write failure injected by the test)
       // must NOT escape into the tool_call handler's fail-open catch — the
       // advance outcome is unchanged, but the failure is surfaced deterministically
@@ -365,10 +441,10 @@ function auditLog(entry: Record<string, unknown>) {
   // must never pollute ~/.pi/agent/audit/enforcement.jsonl (probe-pollution
   // incident class; the scope doc's 20:33:28 artifacts).
   if (process.env.NODE_ENV === "test") return;
-  const auditPath = join(homedir(), ".pi", "agent", "audit", "enforcement.jsonl");
+  const auditPath = enforcementLogFile();
   try {
     mkdirSync(dirname(auditPath), { recursive: true });
-    appendFileSync(auditPath, JSON.stringify(entry) + "\n");
+    appendFileSync(auditPath, JSON.stringify(stamped) + "\n");
   } catch (e) {
     // #383 (Task 3): the old silent catch (`/* fail silently */`) is gone — a
     // sink failure must be surfaced, never silent. Still non-throwing: an audit
@@ -377,6 +453,106 @@ function auditLog(entry: Record<string, unknown>) {
     // surface too — a throwing console.warn must never escape auditLog.
     try { console.warn(`[sequence-enforcer] ⚠️ audit write failed: ${String(e)}`); } catch { /* last resort */ }
   }
+}
+
+// ── enforcement.jsonl path + reader (#377) ─────────
+
+// Lazy path resolution (mirrors shared/audit-log.ts gateEventsFile()):
+// resolved per call, not at module load, so a $HOME change (tests, alternate
+// agent dirs) takes effect.
+export function enforcementLogFile(): string {
+  return join(homedir(), ".pi", "agent", "audit", "enforcement.jsonl");
+}
+
+export interface EnforcementLogEntry {
+  ts: string;
+  session_id?: string | null;
+  event: string;
+  [key: string]: unknown;
+}
+
+export interface ReadEnforcementLogOptions {
+  /** Explicit file path (default: enforcementLogFile()). */
+  file?: string;
+  /** Only entries whose ts >= since (ISO-8601, inclusive). */
+  since?: string;
+  /** Only entries whose event name is in this list. */
+  events?: string[];
+  /** Only entries from this exact session id. */
+  sessionId?: string;
+  /** Cap: return only the `limit` most recent matching entries. */
+  limit?: number;
+}
+
+export interface ReadEnforcementLogResult {
+  entries: EnforcementLogEntry[];
+  /** Lines that could not be parsed into a valid entry: malformed JSON,
+   *  non-object JSON (arrays/primitives/null), or objects missing string
+   *  ts/event. Blank lines are ignored (not counted). */
+  skipped: number;
+}
+
+// Small enforcement.jsonl reader (the enforcement SKILL.md "reader is a
+// swarm-side follow-up" note). Tolerant on DATA (missing file → empty,
+// malformed lines skipped and counted, never throws) but fail-closed on
+// FILTER INPUT: an unparseable `since`, or a non-positive `limit`, returns an
+// empty result rather than silently dropping the filter and over-reporting
+// (the #357-16 gate must never answer "every startup session since the
+// beginning of the log" on a typo'd ts). Entries return in file order
+// (append-only → chronological). Missing session_id (pre-#377 lines) equals
+// null under a sessionId filter — excluded, never a crash.
+// Semantics: events: [] or undefined = no event filter; limit: undefined = no
+// cap, limit <= 0 = empty result; since: undefined = no filter.
+export function readEnforcementLog(opts: ReadEnforcementLogOptions = {}): ReadEnforcementLogResult {
+  const file = opts.file ?? enforcementLogFile();
+  // Fail-closed on filter input before touching the file. Requires a finite
+  // positive limit: 0, negatives, NaN, and ±Infinity all return empty (NaN <= 0
+  // is false and Infinity > 0 is true — bare comparisons would let those
+  // silently drop the cap and over-report).
+  if (opts.limit !== undefined && (!Number.isFinite(opts.limit) || opts.limit <= 0)) {
+    return { entries: [], skipped: 0 };
+  }
+  const sinceMs = opts.since !== undefined ? Date.parse(opts.since) : NaN;
+  if (opts.since !== undefined && Number.isNaN(sinceMs)) return { entries: [], skipped: 0 };
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf-8");
+  } catch {
+    return { entries: [], skipped: 0 }; // absent / unreadable → empty
+  }
+  const entries: EnforcementLogEntry[] = [];
+  let skipped = 0;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      skipped++;
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      skipped++;
+      continue;
+    }
+    const entry = parsed as EnforcementLogEntry;
+    if (typeof entry.ts !== "string" || typeof entry.event !== "string") {
+      skipped++;
+      continue;
+    }
+    if (opts.events && opts.events.length > 0 && !opts.events.includes(entry.event)) continue;
+    if (opts.sessionId !== undefined && entry.session_id !== opts.sessionId) continue;
+    if (!Number.isNaN(sinceMs)) {
+      const tsMs = Date.parse(entry.ts);
+      if (Number.isNaN(tsMs) || tsMs < sinceMs) continue;
+    }
+    entries.push(entry);
+  }
+  if (opts.limit !== undefined && entries.length > opts.limit) {
+    return { entries: entries.slice(entries.length - opts.limit), skipped };
+  }
+  return { entries, skipped };
 }
 
 
@@ -1365,6 +1541,11 @@ export function _resetStateForTest(): void {
   repoTestOverride = null;
   FORCE_FILE_OVERRIDE = null;
   TOKEN_FILE_OVERRIDE = null; // #357 review (Historical P3): reset-contract completeness — a stale token path must not leak into the next test
+  // #377: reset-contract completeness — a session id captured by one test must
+  // not bleed into the next (the override is cleared to its inactive default;
+  // the captured id is dropped so the next session_start/ctx re-resolves).
+  auditSessionOverride = { active: false, id: null };
+  auditSessionId = null;
   if (sequenceTimeout) { clearTimeout(sequenceTimeout); sequenceTimeout = null; }
 }
 
@@ -1375,6 +1556,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (event, _ctx) => {
     stepCache.clear();
     skillStack = [];
+    // #377: capture the pi session id BEFORE the startup audit write so the
+    // first entry of every session is attributable. ctx.sessionManager is the
+    // authoritative in-process source.
+    captureAuditSession(_ctx);
     // #357 review (Extension-safety P1): the module-level recovery state is
     // per-session — pi reuses the module scope across /new /resume /fork, so a
     // parked checkpoint, a partial block-streak, a coalesce window, or stale
@@ -1432,6 +1617,9 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_shutdown ───────────────────────────
   pi.on("session_shutdown", async (_event, _ctx) => {
+    // #377: session ended — drop the captured id so a hypothetical stale write
+    // between sessions can never be misattributed to the previous session.
+    auditSessionId = null;
     stepCache.clear();
     skillStack = [];
     // #357 review: same per-session hygiene as session_start.
@@ -1446,6 +1634,9 @@ export default function (pi: ExtensionAPI) {
   // ── agent_end ──────────────────────────────────
   // ponytail: advance past human_review gates (resolved between turns), preserve state
   pi.on("agent_end", async (_event, _ctx) => {
+    // #377: refresh at the agent boundary — a session may be forked/restored
+    // between turns without a fresh session_start; ctx is always authoritative.
+    captureAuditSession(_ctx);
     const top = topSkill();
     if (!top) return;
     const step = top.steps[top.stepIndex];
@@ -1584,6 +1775,9 @@ export default function (pi: ExtensionAPI) {
     // unexpected throw, audit handler_error and fail open (allow) so the tool
     // chain survives; the other blockers still run.
     try {
+    // #377: refresh the session id at the audit-writing boundary (a session
+    // can fork/restore mid-process without session_start).
+    captureAuditSession(_ctx);
     const top = topSkill();
     const toolName = (event as any).toolName ?? event.toolName ?? "";
     if (isKillSwitchActive()) {
@@ -1814,6 +2008,8 @@ function tokenStateLabel(reason: string): string {
 
 // ── tool_result: advance step on gate fulfillment ──
   pi.on("tool_result", async (event, _ctx) => {
+    // #377: refresh the session id at the audit-writing boundary.
+    captureAuditSession(_ctx);
     const top = topSkill();
     if (isKillSwitchActive()) {
       auditLog({ ts: new Date().toISOString(), event: "bypassed", reason: "kill_switch", tool: event.toolName });
