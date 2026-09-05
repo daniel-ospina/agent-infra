@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
+from uuid import uuid4
 
 import pytest
 
@@ -2353,3 +2354,165 @@ def test_b34_heartbeat_contract(tmp_path):
         pwc._guard_runner(str(repo), env, 10.0)
     files = list(hb_dir.glob("*"))
     assert len(files) <= 1, f"heartbeats growth: {[f.name for f in files]}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# #378 — per-session token-file scoping (writer side)
+# ══════════════════════════════════════════════════════════════════════
+# The token DEFAULT is per-session: when the checker runs inside a pi session
+# (PI_SESSION_ID set in the bash-tool child env — the SAME id the enforcer
+# resolves via ctx.sessionManager.getSessionId()), the default token path is
+# /tmp/parallel-check-token.<sid>.json so concurrent sessions never
+# share/clobber one machine-global file. Env override wins VERBATIM; no
+# session → the legacy unscoped default. Sanitization is BYTE-wise and must
+# mirror the enforcer (Node Buffer) + the .sh wrapper (LC_ALL=C tr -c).
+
+def test_378_session_scope_suffix_none_for_empty(monkeypatch):
+    assert pwc._session_scope_suffix({}) is None
+    assert pwc._session_scope_suffix({"PI_SESSION_ID": ""}) is None
+    assert pwc._session_scope_suffix({"PI_SESSION_ID": "   "}) is None
+
+
+def test_378_session_scope_suffix_sanitizes_bytewise():
+    assert pwc._session_scope_suffix(
+        {"PI_SESSION_ID": "01a072a1-93dc-7805-9a3c-a7a908512c6b"}
+    ) == "01a072a1-93dc-7805-9a3c-a7a908512c6b"
+    # path separators / traversal can never reach a filename
+    assert pwc._session_scope_suffix(
+        {"PI_SESSION_ID": "../evil"}) == ".._evil"
+    # 'é' = 0xC3 0xA9 → TWO underscores (byte-wise — the enforcer Buffer and
+    # the .sh `tr -c` map each utf-8 byte, NOT each code point).
+    assert pwc._session_scope_suffix({"PI_SESSION_ID": "sessé"}) == "sess__"
+    # NBSP (U+00A0 = 0xC2 0xA0) is NOT trimmed — trim is ASCII-whitespace-only
+    # on all three sides — it sanitizes to two underscores (python/TS/.sh
+    # parity; a bare `.strip()` would diverge from the .sh).
+    assert pwc._session_scope_suffix(
+        {"PI_SESSION_ID": "\u00a0sess\u00a0"}) == "__sess__"
+
+
+def test_378_token_file_path_resolution(monkeypatch, tmp_path):
+    base = tmp_path / "token.json"
+    monkeypatch.setattr(pwc, "TOKEN_FILE_DEFAULT", str(base))
+    # override wins VERBATIM (never session-scoped) — even with a session id
+    override = str(tmp_path / "custom.json")
+    assert pwc._token_file_path(
+        {"PI_SESSION_ID": "sess-378", "PARALLEL_CHECK_TOKEN_FILE": override}
+    ) == override
+    # no session → legacy unscoped default
+    assert pwc._token_file_path({}) == str(base)
+    assert pwc._token_file_path({"PARALLEL_CHECK_TOKEN_FILE": "   "}) == str(base)
+    # session → per-session scoped default (suffix before the extension)
+    assert pwc._token_file_path({"PI_SESSION_ID": "sess-378"}) == \
+        str(tmp_path / "token.sess-378.json")
+    assert pwc._token_file_path({"PI_SESSION_ID": "../evil"}) == \
+        str(tmp_path / "token..._evil.json")
+
+
+def test_378_token_file_path_enforcer_parity_shape():
+    """#378 enforcer-parity shape: the REAL (unpatched) default resolves to
+    /tmp/parallel-check-token.<sid>.json — the EXACT path shape the enforcer
+    derives from the same session id (both sides must agree byte-for-byte)."""
+    assert pwc._token_file_path({"PI_SESSION_ID": "sess-378-parity"}) == \
+        "/tmp/parallel-check-token.sess-378-parity.json"
+    assert pwc._token_file_path({}) == "/tmp/parallel-check-token.json"
+
+
+def test_378_run_check_writes_scoped_default_token(monkeypatch, tmp_path):
+    """no-board C1 CLEAR with PI_SESSION_ID set + no override → the token lands
+    at the SESSION-SCOPED default, not the unscoped base (hermetic via the
+    monkeypatched TOKEN_FILE_DEFAULT base)."""
+    base = tmp_path / "token.json"
+    monkeypatch.setattr(pwc, "TOKEN_FILE_DEFAULT", str(base))
+    env = _env_noboard()
+    env["PI_SESSION_ID"] = "sess-378-e2e"
+    res = pwc.run_check(
+        "start", repo=str(tmp_path), env=env,
+        git=FakeGit(), gh=ThrowingBoard(), board=ThrowingBoard(),
+        guard=_guard_clear, now=NOW)
+    assert res.verdict == "CLEAR"
+    assert (tmp_path / "token.sess-378-e2e.json").exists(), \
+        "token written at the session-scoped default"
+    assert not base.exists(), "unscoped base must NOT receive the token"
+
+
+def test_378_run_check_no_session_writes_unscoped_default(monkeypatch, tmp_path):
+    """no PI_SESSION_ID (operator shell run) → the legacy unscoped default
+    receives the token (writer↔reader both fall back — no split contract)."""
+    base = tmp_path / "token.json"
+    monkeypatch.setattr(pwc, "TOKEN_FILE_DEFAULT", str(base))
+    env = _env_noboard()
+    env.pop("PI_SESSION_ID", None)
+    res = pwc.run_check(
+        "start", repo=str(tmp_path), env=env,
+        git=FakeGit(), gh=ThrowingBoard(), board=ThrowingBoard(),
+        guard=_guard_clear, now=NOW)
+    assert res.verdict == "CLEAR"
+    assert base.exists()
+    assert not (tmp_path / "token.none.json").exists()
+
+
+def test_378_bash_wrapper_parity_with_python_on_padded_nonascii_id(tmp_path):
+    """#378 .sh↔python parity on a whitespace-PADDED non-ASCII session id.
+    python (the canonical writer) computes the scope (trim + byte sanitize);
+    the .sh wrapper's error-branch unlink must target EXACTLY that path — if
+    the wrapper drifts (no trim, or a code-point tr instead of byte-wise), the
+    stale scoped CLEAR survives the watchdog unlink and this test fails."""
+    sid = f"\n  pwc378-{uuid4().hex}-sess-é  \n"  # leading/trailing \n+spaces + é (2 utf-8 bytes)
+    scope = pwc._session_scope_suffix({"PI_SESSION_ID": sid})
+    assert scope is not None
+    assert scope.endswith("-sess-__"), \
+        f"byte-wise é → 2 underscores (got {scope!r})"
+    scoped = Path(f"/tmp/parallel-check-token.{scope}.json")
+    fake = _fake_interpreter(tmp_path, f'''
+printf '%s' '{{"phase":"start","verdict":"CLEAR","code":"C1","ts":1}}' > "{scoped}"
+sleep 30
+''')
+    env = dict(os.environ)
+    env["PYTHON_BIN"] = str(fake)
+    env["PI_SESSION_ID"] = sid
+    env.pop("PARALLEL_CHECK_TOKEN_FILE", None)   # scoping must not be masked
+    env["PARALLEL_CHECK_TIMEOUT_SECS"] = "0.1"
+    try:
+        proc = subprocess.run(["bash", str(CHECK_SH), "start"],
+                              capture_output=True, text=True, env=env,
+                              timeout=30)
+        assert proc.returncode == 0
+        assert proc.stdout.strip().splitlines()[0].startswith("C1: UNKNOWN")
+        assert not scoped.exists(), \
+            "the .sh error branch unlinked the SAME scoped path python derives"
+    finally:
+        try:
+            scoped.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def test_378_bash_wrapper_unlinks_the_scoped_default_on_watchdog(tmp_path):
+    """#378 .sh parity: with PI_SESSION_ID set and NO PARALLEL_CHECK_TOKEN_FILE
+    override, the wrapper's error-branch unlink targets the SESSION-SCOPED
+    default path (a watchdog SIGKILL skips python's own cleanup — the stale
+    scoped CLEAR must not survive to pass the enforcer's marker advance)."""
+    sid = f"pwc378-{uuid4().hex}"
+    scoped = Path(f"/tmp/parallel-check-token.{sid}.json")
+    fake = _fake_interpreter(tmp_path, f'''
+printf '%s' '{{"phase":"start","verdict":"CLEAR","code":"C1","ts":1}}' > "{scoped}"
+sleep 30
+''')
+    env = dict(os.environ)
+    env["PYTHON_BIN"] = str(fake)
+    env["PI_SESSION_ID"] = sid
+    env.pop("PARALLEL_CHECK_TOKEN_FILE", None)   # scoping must not be masked
+    env["PARALLEL_CHECK_TIMEOUT_SECS"] = "0.1"
+    try:
+        proc = subprocess.run(["bash", str(CHECK_SH), "start"],
+                              capture_output=True, text=True, env=env,
+                              timeout=30)
+        assert proc.returncode == 0
+        assert proc.stdout.strip().splitlines()[0].startswith("C1: UNKNOWN")
+        assert not scoped.exists(), \
+            "the .sh error branch unlinked the SESSION-SCOPED default token"
+    finally:
+        try:
+            scoped.unlink()
+        except FileNotFoundError:
+            pass

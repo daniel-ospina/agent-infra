@@ -20,9 +20,16 @@
  Phases:
    C1 start     — git fetch → behind-origin check DELEGATED to checkout_guard.sh
                   (issue #4905; its 'checkout-guard VERDICT:' stdout line is
-@@ -42,7 +52,10 @@
- (/tmp/parallel-check-token.json, env PARALLEL_CHECK_TOKEN_FILE) is written
- ONLY on CLEAR; any other verdict removes it — UNKNOWN at a gated checkpoint
+@@ -39,10 +49,15 @@
+ 
+ UNKNOWN = infra/timeout (supabase-unreachable, git-timeout with bounded
+ env-overridable timeout, script-error). Token semantics: the PASS token
+-(/tmp/parallel-check-token.json, env PARALLEL_CHECK_TOKEN_FILE) is written
+-ONLY on CLEAR; any other verdict removes it — UNKNOWN at a gated checkpoint
++(default /tmp/parallel-check-token.json — PER-SESSION scoped to
++/tmp/parallel-check-token.<sid>.json when run inside a pi session, sid =
++PI_SESSION_ID; #378) is written ONLY on CLEAR; any other verdict removes
++it — UNKNOWN at a gated checkpoint
  means NO token, and the enforcer gate (issue #5039) blocks with
 -retry(2)+override. Advisory reads (C2 git-history, C4 -S) fail open to
 +retry(2)+override. The CLEAR token payload carries mode ("" for board mode,
@@ -32,8 +39,16 @@
  CLEAR; phase gates never silently pass. Budget: <1s typical, ≤2s hard bound
  (env PARALLEL_CHECK_TIMEOUT_SECS, default 2.0) — overrun → UNKNOWN.
  
-@@ -59,6 +72,10 @@
-   PARALLEL_CHECK_TOKEN_FILE (default /tmp/parallel-check-token.json)
+@@ -55,10 +70,17 @@
+   SWARM_CARD_ID | CARD_ID                     — our card
+   AGENT_ID | SWARM_AGENT_ID                   — our agent
+   SWARM_TOUCHED_PATHS | TOUCHED_PATHS         — repo-relative, ws-separated
++  PI_SESSION_ID (set by pi in bash-tool children) — scopes the token default
+   PARALLEL_CHECK_TIMEOUT_SECS (default 2.0)   — wall-clock budget
+-  PARALLEL_CHECK_TOKEN_FILE (default /tmp/parallel-check-token.json)
++  PARALLEL_CHECK_TOKEN_FILE (default /tmp/parallel-check-token.json —
++    per-session scoped to parallel-check-token.<PI_SESSION_ID>.json when
++    the env carries PI_SESSION_ID, #378)
    PARALLEL_CHECK_SYMBOL                       — keyword fallback for --symbol
    PARALLEL_CHECK_REPO                         — repo fallback for --repo
 +
@@ -43,7 +58,7 @@
  """
  from __future__ import annotations
  
-@@ -68,14 +85,25 @@
+@@ -68,14 +90,25 @@
  import re
  import subprocess
  import sys
@@ -70,15 +85,19 @@
  if str(_REPO_ROOT) not in sys.path:
      sys.path.insert(0, str(_REPO_ROOT))
  
-@@ -86,10 +114,36 @@
+@@ -85,11 +118,40 @@
+ VERDICTS = ("CLEAR", "STALE", "OVERLAP", "DUP_FIX", "UNKNOWN")
  
  TOKEN_FILE_DEFAULT = "/tmp/parallel-check-token.json"
++# #378: when run inside a pi session the default is per-session scoped to
++# /tmp/parallel-check-token.<sid>.json (sid = PI_SESSION_ID); see
++# _token_file_path. TOKEN_FILE_DEFAULT stays the UNSCOPED base + fallback.
  BUDGET_DEFAULT = 2.0
 +BUDGET_MAX_DEFAULT = 60.0
  GIT_HISTORY_HOURS = 72.0
  SYMBOL_LOOKBACK_DAYS = 14.0
  PR_PATH_CAP = 5  # max touched files sent to the open-PR search at C3
-+
+ 
 +# ── #383: the FIVE signal families (14 names) — ONE set of shared constants
 +# consumed by BOTH the read paths (_sb_config, _paths_from_env, run_check's
 +# card/agent reads) AND the _is_no_board predicate, so the predicate can never
@@ -95,7 +114,7 @@
 +_BOARD_NAMES = _SB_URL_NAMES + _SB_KEY_NAMES  # the 8 board signals
 +_SIGNAL_FAMILIES = (_SB_URL_NAMES, _SB_KEY_NAMES, _CARD_ID_NAMES,
 +                    _AGENT_ID_NAMES, _PATHS_NAMES)
- 
++
 +# B27: board-signal NAMES absent from the probe-time snapshot (the committed
 +# consumer-env fixture inventories, scripts/testdata/consumer-env-*.names) that
 +# are now present → warn=new-signal:<name>. BAKED constant derived from the
@@ -107,7 +126,7 @@
  _HASH_RE = re.compile(r"^[0-9a-f]{40}$")
  
  
-@@ -98,7 +152,7 @@
+@@ -98,7 +160,7 @@
  
  
  class CheckResult:
@@ -116,7 +135,7 @@
  
      def __init__(self, code: str, verdict: str, details: str = "",
                   options: tuple[str, ...] = ()):
-@@ -106,14 +160,22 @@
+@@ -106,14 +168,22 @@
          self.verdict = verdict
          self.details = details
          self.options = options
@@ -141,7 +160,7 @@
  
      def __repr__(self) -> str:  # pragma: no cover - debugging aid
          return self.line()
-@@ -122,15 +184,22 @@
+@@ -122,15 +192,72 @@
  # ── env helpers ────────────────────────────────────────────────
  
  def _env(env: dict, names: tuple[str, ...], default: str = "") -> str:
@@ -160,19 +179,70 @@
      return default
  
  
++# #378: PER-SESSION token-file scoping. The token default is no longer a
++# single machine-global path: when this checker runs INSIDE a pi session
++# (its bash-tool child env carries PI_SESSION_ID — the SAME value the
++# session's enforcer resolves via ctx.sessionManager.getSessionId()), the
++# default resolves to /tmp/parallel-check-token.<sid>.json so concurrent
++# sessions never share/clobber one token. Env override
++# (PARALLEL_CHECK_TOKEN_FILE) wins VERBATIM (never session-scoped — an
++# override is deliberate operator intent). No session (operator shell run)
++# → the legacy unscoped default — the enforcer of a no-session boundary
++# (auditSessionId null) reads the same unscoped path, so the contract never
++# splits. Sanitization is BYTE-wise (utf-8): every byte outside
++# [A-Za-z0-9._-] becomes "_" — byte-identical to the .sh wrapper's `tr -c`
++# and the enforcer's Node-Buffer scope, so all three derive the same path
++# from the same id (a code-point regex would map one non-ASCII char to one
++# "_" while tr maps its N bytes → drift).
++_SESSION_ID_ENV = "PI_SESSION_ID"
++_FILENAME_SAFE_BYTES = re.compile(rb"[^A-Za-z0-9._-]")
++
++
++def _session_scope_suffix(env: dict) -> str | None:
++    """Sanitized per-session scope suffix from PI_SESSION_ID; None when unset
++    / empty / whitespace (the caller falls back to the unscoped path). Trim is
++    ASCII-whitespace-only (" \t\n\r\v\f") to mirror the TS `sessionFileScope`
++    and the .sh pattern trim exactly — JS `.trim()`/python bare `.strip()`
++    would also strip NBSP/BOM, which the .sh does not (an NBSP-padded id must
++    sanitize to underscores on EVERY side, not trim on some)."""
++    raw = (env.get(_SESSION_ID_ENV) or "").strip(" \t\n\r\v\f")
++    if not raw:
++        return None
++    safe = _FILENAME_SAFE_BYTES.sub(
++        b"_", raw.encode("utf-8", "replace")).decode("ascii")
++    return safe or None
++
++
++def _token_file_path(env: dict) -> str:
++    """Resolve the token path: PARALLEL_CHECK_TOKEN_FILE override (verbatim,
++    first stripped-truthy) → per-session scoped default → legacy unscoped
++    default. Reads the TOKEN_FILE_DEFAULT module global at call time (tests
++    monkeypatch it to a tmp base for hermetic scoped-path assertions)."""
++    explicit = _env(env, ("PARALLEL_CHECK_TOKEN_FILE",))
++    if explicit:
++        return explicit
++    suffix = _session_scope_suffix(env)
++    if suffix is None:
++        return TOKEN_FILE_DEFAULT
++    base_dir = os.path.dirname(TOKEN_FILE_DEFAULT)
++    stem, ext = os.path.splitext(os.path.basename(TOKEN_FILE_DEFAULT))
++    return os.path.join(base_dir, f"{stem}.{suffix}{ext}")
++
++
  def _paths_from_env(env: dict) -> list[str]:
 -    raw = _env(env, ("SWARM_TOUCHED_PATHS", "TOUCHED_PATHS"))
 +    raw = _env(env, _PATHS_NAMES)
      return _normalize_paths(raw.split() if raw else [])
  
  
-@@ -326,9 +395,63 @@
+@@ -325,10 +452,64 @@
+             elif current is not None:
                  current.add(line)
          return commits
- 
++
 +    def remote_url(self, timeout: float = 5.0) -> str:
 +        """#383: URL form of the ops target's origin (B18/B22/B26/B32).
- 
++
 +        `git -C <repo> remote get-url origin`, trimmed; fail → "unknown"
 +        (both-"unknown" binding parity with the enforcer). NEVER the raw
 +        PARALLEL_CHECK_REPO env string and never _REPO_ROOT's remote.
@@ -192,7 +262,7 @@
 +        form and stays byte-identical — the normal ssh remote keeps enforcer
 +        binding parity. Parse failure → "unknown". URL-form contract
 +        otherwise unchanged.
-+
+ 
 +        CRITICAL PARITY NOTE: Task 3's enforcer `bindingRepo()` MUST strip
 +        ALL userinfo from scheme-bearing URLs identically — a
 +        credential-bearing origin must bind consistently (sanitized checker
@@ -223,7 +293,7 @@
 +            return parts._replace(
 +                netloc=parts.netloc.rsplit("@", 1)[-1]).geturl()
 +        return raw
-+
+ 
 +
  def _resolve_slug(env: dict, git: GitOps, timeout: float) -> str:
 -    slug = _env(env, ("PARALLEL_CHECK_REPO_SLUG", "GH_REPOSITORY"))
@@ -231,7 +301,7 @@
      if slug:
          return slug
      url = git._run_ok(["config", "--get", "remote.origin.url"], timeout) or ""
-@@ -338,15 +461,27 @@
+@@ -338,15 +519,27 @@
  
  
  def _sb_config(env: dict) -> tuple[str, str]:
@@ -265,7 +335,7 @@
  def _guard_runner(repo: str, env: dict, timeout: float) -> str:
      """Run checkout_guard.sh (issue #4905) and return its stdout.
  
-@@ -372,34 +507,96 @@
+@@ -372,34 +565,96 @@
  # ── token (PASS evidence for the enforcer gate, issue #5039) ──
  
  def _apply_token(res: CheckResult, phase: str, env: dict, token_file: str,
@@ -338,7 +408,7 @@
  
 -# ── context ────────────────────────────────────────────────────
 +# ── #383: no-board tenant detection + distinguishable skip ──
-+
+ 
 +def _is_no_board(env: dict) -> bool:
 +    """True iff ALL FIVE signal families are absent.
 +
@@ -360,7 +430,7 @@
 +    non_empty = [name for name in _BOARD_NAMES
 +                 if (env.get(name) or "").strip()]
 +    return non_empty[0] if len(non_empty) == 1 else None
- 
++
 +
  class _Ctx:
      __slots__ = ("code", "env", "repo", "symbol", "now", "card_id", "agent",
@@ -370,7 +440,7 @@
  
      def remaining(self) -> float:
          return max(0.05, self.deadline - time.monotonic())
-@@ -411,6 +608,15 @@
+@@ -411,6 +666,15 @@
          return CheckResult(self.code, "UNKNOWN", "budget-exceeded")
  
  
@@ -386,7 +456,7 @@
  class _NoBoard:
      """Stub for a missing board URL — phase code stays ordered and specific."""
  
-@@ -470,6 +676,12 @@
+@@ -470,6 +734,12 @@
              title = str(top.get("title") or "").strip()[:60]
              return CheckResult(ctx.code, "DUP_FIX",
                                 f"closed-issue #{top.get('number')} {title}")
@@ -399,7 +469,7 @@
      # Board scan: another running card claiming the same issue.
      try:
          cards = ctx.board.list_cards(ctx.remaining())
-@@ -492,6 +704,9 @@
+@@ -492,6 +762,9 @@
  
  
  def _check_c2(ctx: _Ctx) -> CheckResult:
@@ -409,7 +479,7 @@
      if not ctx.card_id or not ctx.agent:
          return CheckResult(ctx.code, "UNKNOWN",
                             "missing-card-context SWARM_CARD_ID/AGENT_ID")
-@@ -562,7 +777,12 @@
+@@ -562,7 +835,12 @@
  
  
  def _check_c3(ctx: _Ctx) -> CheckResult:
@@ -422,7 +492,7 @@
          return CheckResult(ctx.code, "UNKNOWN",
                             "missing-card-context SWARM_CARD_ID")
      try:
-@@ -605,7 +825,24 @@
+@@ -605,7 +883,24 @@
          return CheckResult(ctx.code, "STALE",
                             f"behind-origin by {behind} commit(s)",
                             ("rebase",))
@@ -447,7 +517,7 @@
          return CheckResult(ctx.code, "UNKNOWN",
                             "missing-card-context SWARM_CARD_ID")
      try:
-@@ -647,6 +884,9 @@
+@@ -647,6 +942,9 @@
  
  
  def _check_c5(ctx: _Ctx) -> CheckResult:
@@ -457,12 +527,14 @@
      if not ctx.card_id or not ctx.agent:
          return CheckResult(ctx.code, "UNKNOWN",
                             "missing-card-context SWARM_CARD_ID/AGENT_ID")
-@@ -730,25 +970,38 @@
+@@ -729,26 +1027,39 @@
+         raise ValueError(f"phase {phase!r} not in {PHASES}")
      env = dict(os.environ if env is None else env)
      code = PHASE_CODE[phase]
-     token_file = _env(env, ("PARALLEL_CHECK_TOKEN_FILE",), TOKEN_FILE_DEFAULT)
+-    token_file = _env(env, ("PARALLEL_CHECK_TOKEN_FILE",), TOKEN_FILE_DEFAULT)
 -    repo_path = os.path.abspath(
 -        repo or _env(env, ("PARALLEL_CHECK_REPO",)) or str(_REPO_ROOT))
++    token_file = _token_file_path(env)
 +    # #383: ops-target chain — --repo → PARALLEL_CHECK_REPO (stripped,
 +    # empty/whitespace falls through) → cwd (B18/B22/B32).
 +    repo_path = _resolve_ops_target(repo, env)
@@ -505,7 +577,7 @@
      if store is None:
          from connectors.supabase_swarm import store as default_store
          store = default_store()
-@@ -772,16 +1025,60 @@
+@@ -772,16 +1083,60 @@
      ctx.git = git
      ctx.guard = guard
      ctx.repo_slug = _resolve_slug(env, git, ctx.remaining())
@@ -568,17 +640,19 @@
      return result
  
  
-@@ -799,9 +1096,12 @@
+@@ -799,9 +1154,13 @@
      except Exception as e:  # defense-in-depth: still emit a verdict line
          result = CheckResult(PHASE_CODE[args.phase], "UNKNOWN",
                               f"script-error {type(e).__name__}: {e}")
 +        # #383 signature-sync under the new _apply_token contract (mode/repo
 +        # params): the verdict is UNKNOWN, so ONLY the unlink branch can run —
 +        # never a CLEAR-shaped token when repo/mode are unknowable.
++        # #378: the exception path resolves the SAME session-scoped default
++        # (_token_file_path reads PI_SESSION_ID from os.environ).
          _apply_token(result, args.phase, dict(os.environ),
-                      _env(dict(os.environ), ("PARALLEL_CHECK_TOKEN_FILE",),
+-                     _env(dict(os.environ), ("PARALLEL_CHECK_TOKEN_FILE",),
 -                          TOKEN_FILE_DEFAULT), "", "", "")
-+                          TOKEN_FILE_DEFAULT), "", "unknown", "")
++                     _token_file_path(dict(os.environ)), "", "unknown", "")
      print(result.line(), flush=True)
      return 0
  

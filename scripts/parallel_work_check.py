@@ -49,8 +49,10 @@ Phases:
 
 UNKNOWN = infra/timeout (supabase-unreachable, git-timeout with bounded
 env-overridable timeout, script-error). Token semantics: the PASS token
-(/tmp/parallel-check-token.json, env PARALLEL_CHECK_TOKEN_FILE) is written
-ONLY on CLEAR; any other verdict removes it — UNKNOWN at a gated checkpoint
+(default /tmp/parallel-check-token.json — PER-SESSION scoped to
+/tmp/parallel-check-token.<sid>.json when run inside a pi session, sid =
+PI_SESSION_ID; #378) is written ONLY on CLEAR; any other verdict removes
+it — UNKNOWN at a gated checkpoint
 means NO token, and the enforcer gate (issue #5039) blocks with
 retry(2)+override. The CLEAR token payload carries mode ("" for board mode,
 "no-board-skip" for no-board skips) and repo (URL form via `git remote
@@ -68,8 +70,11 @@ Environment (all injectable, tests point them at local mocks):
   SWARM_CARD_ID | CARD_ID                     — our card
   AGENT_ID | SWARM_AGENT_ID                   — our agent
   SWARM_TOUCHED_PATHS | TOUCHED_PATHS         — repo-relative, ws-separated
+  PI_SESSION_ID (set by pi in bash-tool children) — scopes the token default
   PARALLEL_CHECK_TIMEOUT_SECS (default 2.0)   — wall-clock budget
-  PARALLEL_CHECK_TOKEN_FILE (default /tmp/parallel-check-token.json)
+  PARALLEL_CHECK_TOKEN_FILE (default /tmp/parallel-check-token.json —
+    per-session scoped to parallel-check-token.<PI_SESSION_ID>.json when
+    the env carries PI_SESSION_ID, #378)
   PARALLEL_CHECK_SYMBOL                       — keyword fallback for --symbol
   PARALLEL_CHECK_REPO                         — repo fallback for --repo
 
@@ -113,6 +118,9 @@ PHASE_CODE = {"start": "C1", "scope": "C2", "plan": "C3",
 VERDICTS = ("CLEAR", "STALE", "OVERLAP", "DUP_FIX", "UNKNOWN")
 
 TOKEN_FILE_DEFAULT = "/tmp/parallel-check-token.json"
+# #378: when run inside a pi session the default is per-session scoped to
+# /tmp/parallel-check-token.<sid>.json (sid = PI_SESSION_ID); see
+# _token_file_path. TOKEN_FILE_DEFAULT stays the UNSCOPED base + fallback.
 BUDGET_DEFAULT = 2.0
 BUDGET_MAX_DEFAULT = 60.0
 GIT_HISTORY_HOURS = 72.0
@@ -196,6 +204,56 @@ def _env(env: dict, names: tuple[str, ...], default: str = "") -> str:
         if value:
             return value
     return default
+
+
+# #378: PER-SESSION token-file scoping. The token default is no longer a
+# single machine-global path: when this checker runs INSIDE a pi session
+# (its bash-tool child env carries PI_SESSION_ID — the SAME value the
+# session's enforcer resolves via ctx.sessionManager.getSessionId()), the
+# default resolves to /tmp/parallel-check-token.<sid>.json so concurrent
+# sessions never share/clobber one token. Env override
+# (PARALLEL_CHECK_TOKEN_FILE) wins VERBATIM (never session-scoped — an
+# override is deliberate operator intent). No session (operator shell run)
+# → the legacy unscoped default — the enforcer of a no-session boundary
+# (auditSessionId null) reads the same unscoped path, so the contract never
+# splits. Sanitization is BYTE-wise (utf-8): every byte outside
+# [A-Za-z0-9._-] becomes "_" — byte-identical to the .sh wrapper's `tr -c`
+# and the enforcer's Node-Buffer scope, so all three derive the same path
+# from the same id (a code-point regex would map one non-ASCII char to one
+# "_" while tr maps its N bytes → drift).
+_SESSION_ID_ENV = "PI_SESSION_ID"
+_FILENAME_SAFE_BYTES = re.compile(rb"[^A-Za-z0-9._-]")
+
+
+def _session_scope_suffix(env: dict) -> str | None:
+    """Sanitized per-session scope suffix from PI_SESSION_ID; None when unset
+    / empty / whitespace (the caller falls back to the unscoped path). Trim is
+    ASCII-whitespace-only (" \t\n\r\v\f") to mirror the TS `sessionFileScope`
+    and the .sh pattern trim exactly — JS `.trim()`/python bare `.strip()`
+    would also strip NBSP/BOM, which the .sh does not (an NBSP-padded id must
+    sanitize to underscores on EVERY side, not trim on some)."""
+    raw = (env.get(_SESSION_ID_ENV) or "").strip(" \t\n\r\v\f")
+    if not raw:
+        return None
+    safe = _FILENAME_SAFE_BYTES.sub(
+        b"_", raw.encode("utf-8", "replace")).decode("ascii")
+    return safe or None
+
+
+def _token_file_path(env: dict) -> str:
+    """Resolve the token path: PARALLEL_CHECK_TOKEN_FILE override (verbatim,
+    first stripped-truthy) → per-session scoped default → legacy unscoped
+    default. Reads the TOKEN_FILE_DEFAULT module global at call time (tests
+    monkeypatch it to a tmp base for hermetic scoped-path assertions)."""
+    explicit = _env(env, ("PARALLEL_CHECK_TOKEN_FILE",))
+    if explicit:
+        return explicit
+    suffix = _session_scope_suffix(env)
+    if suffix is None:
+        return TOKEN_FILE_DEFAULT
+    base_dir = os.path.dirname(TOKEN_FILE_DEFAULT)
+    stem, ext = os.path.splitext(os.path.basename(TOKEN_FILE_DEFAULT))
+    return os.path.join(base_dir, f"{stem}.{suffix}{ext}")
 
 
 def _paths_from_env(env: dict) -> list[str]:
@@ -969,7 +1027,7 @@ def run_check(phase: str, repo: str | None = None, symbol: str | None = None,
         raise ValueError(f"phase {phase!r} not in {PHASES}")
     env = dict(os.environ if env is None else env)
     code = PHASE_CODE[phase]
-    token_file = _env(env, ("PARALLEL_CHECK_TOKEN_FILE",), TOKEN_FILE_DEFAULT)
+    token_file = _token_file_path(env)
     # #383: ops-target chain — --repo → PARALLEL_CHECK_REPO (stripped,
     # empty/whitespace falls through) → cwd (B18/B22/B32).
     repo_path = _resolve_ops_target(repo, env)
@@ -1099,9 +1157,10 @@ def main(argv: list[str] | None = None) -> int:
         # #383 signature-sync under the new _apply_token contract (mode/repo
         # params): the verdict is UNKNOWN, so ONLY the unlink branch can run —
         # never a CLEAR-shaped token when repo/mode are unknowable.
+        # #378: the exception path resolves the SAME session-scoped default
+        # (_token_file_path reads PI_SESSION_ID from os.environ).
         _apply_token(result, args.phase, dict(os.environ),
-                     _env(dict(os.environ), ("PARALLEL_CHECK_TOKEN_FILE",),
-                          TOKEN_FILE_DEFAULT), "", "unknown", "")
+                     _token_file_path(dict(os.environ)), "", "unknown", "")
     print(result.line(), flush=True)
     return 0
 
