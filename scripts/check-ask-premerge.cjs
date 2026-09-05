@@ -117,20 +117,34 @@ function isSkipNote(sec) {
   // A SKIPPED/not-measured note ("SKIPPED this run", "was not measured",
   // "abstention_n = 0"). "pre-gate skip count = 0" in the FULL-run record
   // is the OPPOSITE — a measurement statement that nothing was skipped — and
-  // must not flag the section.
-  return /SKIPPED this run|was not measured|not measured this run|abstention_n\s*=\s*0\b/.test(sec);
+  // must not flag the section. Bare SKIPPED / "not measured …" / harness
+  // skip language does flag.
+  return /\bSKIPPED\b|\bnot measured\b|abstention_n\s*=\s*0\b/.test(sec);
+}
+// A measured figure: the number must be a RESULT, not a target or an
+// incidental integer. The accuracy window is scanned so a "target/should
+// reach/required/expected … 0.9" sentence (a plan, not a measurement) and
+// incidental integers (report.py:1664) never count.
+function hasAccuracyMeasure(sec) {
+  const re = /abstention accuracy([^0-9]{0,40})((?:0(?:\.\d+)?|1(?:\.0+)?))(?![0-9])/gi;
+  let m;
+  while ((m = re.exec(sec)) !== null) {
+    const gap = m[1].toLowerCase();
+    // the figure is a target/plan word's subject, not a measured result
+    if (/should|target|goal|reach|required|must|expected|aim|planned|bar|at least|>=|≥/.test(gap)) continue;
+    return true;
+  }
+  return false;
 }
 function isMeasuredFigure(sec) {
   // abstention_n = N (>0): the run's graded-abstention count.
   if (/abstention_n\s*=\s*[1-9][0-9]*(?:\s*>\s*0)?/i.test(sec)) return true;
-  // abstention arm measured with a decimal fraction (0..1) or ratio.
+  // abstention arm measured with a decimal fraction (0..1) or ratio. A
+  // measured arm of 0/30 with skip language is caught by isSkipNote before
+  // this is consulted.
   if (/abstention arm[: ]+(?:0(?:\.\d+)?|1(?:\.0+)?|\d+\s*\/\s*\d+)/i.test(sec)) return true;
-  // abstention accuracy figure: a 0..1 decimal (may carry a parenthetical
-  // qualifier before the value, e.g. "(judge-marker): **0.9") — but the
-  // FIGURE is mandatory and must be a plausible accuracy value (0.9, 0.867),
-  // never an incidental integer (report.py:1664) or a historical quote in a
-  // SKIPPED note.
-  return /abstention accuracy[^0-9]{0,40}(?:0(?:\.\d+)?|1(?:\.0+)?)(?![0-9])/i.test(sec);
+  // abstention accuracy result figure (0.9, 0.867, 1.0) — see above guard.
+  return hasAccuracyMeasure(sec);
 }
 function hasRemainsDisposition(sec) {
   // Explicit recorded disposition phrases ONLY — the "REMAINS for the
@@ -159,8 +173,10 @@ if (!aOk) {
 // em-dash) — a FAIL verdict whose heading also mentions a historical PASS
 // ("… was **PASS** on the old lane") does not satisfy.
 function bHeadingPass(headingLine) {
-  const m = headingLine.match(/—\s*(?:\*\*PASS\*\*|re-run:\s*\*\*PASS\*\*)/);
-  return !!m;
+  // PASS must be the em-dash verdict token AND the heading must not go on to
+  // record a FAIL later in the same line ("— **PASS** on the old lane;
+  // current re-run: **FAIL …**" is a FAIL verdict, not a PASS one).
+  return /—\s*(?:\*\*PASS\*\*|re-run:\s*\*\*PASS\*\*)/.test(headingLine) && !/\*\*FAIL/.test(headingLine);
 }
 const bSections = newestEraSections(/^### \(b\) Product-lane known-answer smoke/);
 if (bSections.length === 0) {
@@ -200,13 +216,21 @@ const cSections = newestEraSections(/^### \(c\) Detector-parity/);
 if (cSections.length === 0) {
   fail("runbook (c) missing the detector-parity verdict section for the current era (the measurement MUST be recorded).");
 }
-const cFigures = cSections.flatMap(({ sec }) => cMeasuredFigures(sec));
-if (cFigures.length === 0) {
+// Per-section evaluation: a current-era (c) section holding a measured
+// mapped-agreement figure < 0.85 must carry #2009 IN THAT SAME SECTION
+// (no cross-section borrowing — a #2009 dropped into a different current-era
+// (c) section does not excuse this section's sub-bar branch). At least one
+// current-era (c) section must record a measured figure.
+const cSectionsWithFigures = cSections.filter(({ sec }) => cMeasuredFigures(sec).length > 0);
+if (cSectionsWithFigures.length === 0) {
   fail("runbook (c) must record a numeric measured mapped-agreement figure in the current-era detector-parity verdict section (a restatement of the >= 0.85 bar is not a measurement) (P2-3).");
 }
-const cLow = cFigures.some((n) => n < 0.85);
-if (cLow && !cSections.some(({ sec }) => /#2009/.test(sec))) {
-  fail("runbook (c): mapped agreement < 0.85 requires the tracked follow-up issue (#2009) on file in the current-era section (P2-3).");
+const cLowSectionMissingIssue = cSectionsWithFigures.find(({ sec }) => {
+  const figs = cMeasuredFigures(sec);
+  return figs.some((n) => n < 0.85) && !/#2009/.test(sec);
+});
+if (cLowSectionMissingIssue) {
+  fail("runbook (c): a current-era detector-parity section records mapped agreement < 0.85 without the tracked follow-up issue (#2009) co-located in that same section (P2-3).");
 }
 
 // (d) QA spot-check — the CURRENT-ERA (d) verdicts must record a terminal
@@ -231,12 +255,32 @@ const productDecision = (function () {
   }
   return out.join("\n");
 })();
-const mootPhrase = /\(d\) gate is MOOT|\(d\) is MOOT by product decision|\(d\)\s+gate\s+is\s+MOOT\s+by product decision/i;
-const mootOverride = mootPhrase.test(productDecision);
+// An AFFIRMATIVE standing MOOT declaration. The override must be declared
+// in present force — a quoted historical decision or a rescue notice ("…is
+// withdrawn/superseded/re-binds…") does not excuse a current FAIL. The
+// phrase must appear NOT inside a quoted/historical/negated context: no
+// rescue or negation token within 60 chars before the phrase and 120 chars
+// after it.
+function affirmativeMoot(text) {
+  if (!text) return false;
+  const re = /\(d\)\s+gate\s+is\s+MOOT(?:\s+by product decision)?|\(d\)\s+is\s+MOOT(?:\s+by product decision)?/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const before = text.slice(Math.max(0, m.index - 60), m.index);
+    const after = text.slice(re.lastIndex, Math.min(text.length, re.lastIndex + 120));
+    const rescue = /no longer|not\s+MOOT|rescind|withdraw|supersede|re-?bind|invalidat|reinstat|cease|lift(?:ed)?\s+the\s+override/i;
+    if (!rescue.test(before + " " + after)) return true;
+  }
+  return false;
+}
+const mootOverride = affirmativeMoot(productDecision);
 
 function dPassMeasured(sec) {
   const head = sec.split("\n")[0] || "";
-  if (/—\s*(?:\*\*PASS\*\*|re-run:\s*\*\*PASS\*\*)/.test(head)) return true;
+  // PASS must be the em-dash verdict token AND the heading must not go on to
+  // record a FAIL later in the same line ("— **PASS** on the old lane; current
+  // re-run: **FAIL …**" is a FAIL heading, not a PASS one).
+  if (/—\s*(?:\*\*PASS\*\*|re-run:\s*\*\*PASS\*\*)/.test(head) && !/\*\*FAIL/.test(head)) return true;
   const fraction = sec.match(/aggregate\s*\*{0,2}\s*(?:[|:]+\s*)?\*{0,2}\s*(\d{1,3})\s*\/\s*(\d{1,3})/i);
   const decimal = sec.match(/aggregate\s*\*{0,2}\s*(?:[|:]+\s*)?\*{0,2}\s*([01](?:\.[0-9]+)?)/i);
   let v = null;
@@ -253,11 +297,12 @@ if (dSections.length === 0) {
 }
 const dPass = dSections.some(({ sec }) => dPassMeasured(sec));
 const dRemains = dSections.some(({ sec }) => hasRemainsDisposition(sec));
-// MOOT excuse: declared in the PRODUCT DECISION block, OR co-located with
-// the FAIL it excuses inside a current-era (d) verdict section.
-const dMootCoLocated = dSections.some(({ sec }) => mootPhrase.test(sec));
+// MOOT excuse: declared affirmatively in the PRODUCT DECISION block, OR
+// co-located with the FAIL it excuses inside a current-era (d) verdict
+// section.
+const dMootCoLocated = dSections.some(({ sec }) => affirmativeMoot(sec));
 if (!dPass && !dRemains && !mootOverride && !dMootCoLocated) {
-  fail("runbook (d) current-era verdicts must record a terminal spot-check disposition — measured aggregate >= 0.8 (PASS), explicit REMAINS for the parent, or the #2013 product-decision MOOT override (declared in the PRODUCT DECISION section, or co-located with the FAIL it excuses) (P2-1).");
+  fail("runbook (d) current-era verdicts must record a terminal spot-check disposition — measured aggregate >= 0.8 (PASS), explicit REMAINS for the parent, or the #2013 product-decision MOOT override declared affirmatively (in the PRODUCT DECISION section, or co-located with the FAIL it excuses) (P2-1).");
 }
 
 // The LLM regression module must have PASSED in fixture mode (not just the
@@ -278,18 +323,28 @@ const testJob = jobBlock(wf, "test");
 if (testJob === null) {
   fail("python-ci.yml must define a `test` job (Task 12 deliverable, P3-2).");
 }
+// Identify the ACTUAL fast-suite pytest step by what it RUNS, not by a
+// label an adversary could mint on a decoy step: the step whose `run:`
+// invokes `python -m pytest $FILES` (the fast suite the fixture-mode
+// regression module runs in). A decoy step named "Run fast test suite" /
+// id pytest-run that only `echo`s (or carries the env var but never runs
+// pytest) is not the wiring.
 const pytestSteps = stepsOf(testJob).filter(
-  (s) => /id:\s*pytest-run/.test(s) || /Run fast test suite/.test(s)
+  (s) => /python -m pytest\s+\$FILES|python -m pytest/.test(stepRunOf(s)) && !/echo \"TORTOISE|Skip-fail guard/.test(s)
 );
 if (pytestSteps.length === 0) {
-  fail('python-ci.yml `test` job must run the fast pytest suite in a step (id: pytest-run) that sets TORTOISE_ASK_LLM_REGRESSION: "1" in its env (Task 12 deliverable, P3-2).');
+  fail('python-ci.yml `test` job must run the fast pytest suite (a step whose `run:` invokes `python -m pytest $FILES`) with TORTOISE_ASK_LLM_REGRESSION: "1" set in that step\'s env (Task 12 deliverable, P3-2).');
 }
-const wiringOnPytestStep = pytestSteps.some((s) => {
+// Step-level `if:` conditions (e.g. `if: matrix.half == 'b'`) are not part
+// of the recorded wiring: the module must run with the env var on every
+// pytest fast-suite execution, so a step that conditionally skips a half is
+// not accepted as the wiring.
+const envPytestStep = pytestSteps.find((s) => {
   const envBlock = envBlockOf(s);
-  return envBlock !== null && /^[ \t]*TORTOISE_ASK_LLM_REGRESSION:\s*["']?1["']?\s*(?:#.*)?$/m.test(envBlock);
+  return envBlock !== null && /^[ \t]*TORTOISE_ASK_LLM_REGRESSION:\s*["']?1["']?\s*(?:#.*)?$/m.test(envBlock) && !/^[ \t]*if:/m.test(s);
 });
-if (!wiringOnPytestStep) {
-  fail('python-ci.yml must set TORTOISE_ASK_LLM_REGRESSION: "1" in the `env:` block of the pytest step that runs the fixture-mode regression (the step whose `run:` invokes pytest) — a mapping elsewhere in the job does not reach the module (P3-2).');
+if (!envPytestStep) {
+  fail('python-ci.yml must set TORTOISE_ASK_LLM_REGRESSION: "1" in the `env:` block of the fast-suite pytest step (the step whose `run:` invokes `python -m pytest`) — a mapping on a different step, behind a step-level `if:`, or in a comment does not reach the fixture-mode module (P3-2).');
 }
 
 console.log("✅ check-ask-premerge: Task 12 gate artifacts on file (current-era runbook (a)-(d) dispositions + pytest-step fixture-mode regression wiring).");
@@ -329,6 +384,27 @@ function stepsOf(jobText) {
     out.push(ls.slice(a, b).join("\n"));
   }
   return out;
+}
+
+// Extract the `run:` payload of a step (the text after the step's `run:`
+// key) — used to identify the step that ACTUALLY invokes pytest.
+function stepRunOf(stepText) {
+  const ls = stepText.split("\n");
+  const idx = ls.findIndex((l) => /^[ \t]*run:[ \t]*(\||[>+-])?[ \t]*(#.*)?$/.test(l) || /^[ \t]*run:[ \t]*[^#|].*/.test(l));
+  if (idx === -1) return "";
+  const runIndent = (ls[idx].match(/^[ \t]*/) || [""])[0].length;
+  // inline run: `run: python -m pytest ...`
+  const inline = ls[idx].replace(/^[ \t]*run:[ \t]*/, "");
+  if (inline && !/^[|>+-]/.test(inline)) return inline;
+  const out = [];
+  for (let i = idx + 1; i < ls.length; i++) {
+    const l = ls[i];
+    if (l.trim() === "" || /^[ \t]*#/.test(l)) continue;
+    const indent = (l.match(/^[ \t]*/) || [""])[0].length;
+    if (indent <= runIndent) break;
+    out.push(l);
+  }
+  return out.join("\n");
 }
 
 // Extract the `env:` mapping block of a step: the lines after the step's
