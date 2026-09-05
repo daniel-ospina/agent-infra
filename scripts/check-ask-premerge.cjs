@@ -40,8 +40,14 @@
  * the 0.85 bar", "(the gate bar) … measured result 0.284 …") is not a
  * measurement, while an explicitly measured or bare at-bar declaration
  * ("measured mapped agreement **0.85** (bar met)", "mapped agreement
- * reached **0.85** — recorded result this cycle.") IS a recorded figure;
- * and the #2009 co-location record is read per SENTENCE — negated mentions
+ * reached **0.85** — recorded result this cycle.") IS a recorded figure; an
+ * affirmative bar-noun outcome (", bar met)", "(the bar was met)", "at bar
+ * this cycle") or a trailing measurement verb ("**0.85** — measured this
+ * run.") also records it (round-12); and the #2009 co-location record is
+ * read per SENTENCE — whose clause also ends at a top-level em/en-dash
+ * (round-12: "…#2009 verified OPEN — the earlier (d) FAIL was resolved…"
+ * joins a NEW clause bound to a different subject, so it never negates the
+ * follow-up record) — negated mentions
  * ("No tracked follow-up **#2009** is needed…", "…#2009 (… long annotation
  * …) was waived…", "shipped without #2009") record that the follow-up does
  * not exist, while "#2009 verified OPEN / is required / is needed /
@@ -252,6 +258,12 @@ if (!bSections.some(({ sec }) => bHeadingPass(sec.split("\n")[0] || ""))) {
 // agreement** | **0.284 (gate ≥ 0.85) → FAIL** |" — are unaffected: the
 // "(gate ≥ 0.85)" ANNOTATION after a measured value continues with an
 // operator + decimal, so it never reads as a restatement.
+// Round-12: the post-nominal bar noun is OUTCOME-SCOPED — a noun heading an
+// affirmative outcome (", bar met)", "(the bar was met)", "at bar this
+// cycle") is the RESULT's subject and records the value, while a negated
+// outcome ("(the gate bar) was NOT reached") still restates; and a
+// trailing measurement/outcome signal with no different-bound decimal
+// ("**0.85** — measured this run.") overrides a head-window bar noun.
 function cMeasuredFigures(sec) {
   const out = [];
   for (const sent of splitSentences(sec)) {
@@ -289,16 +301,29 @@ function cMeasuredFigures(sec) {
           continue;
         }
         // (2) bar-restatement signals in the same sentence — post-nominal
-        // bar noun ("0.85 is the bar/target", "the 0.85 bar") or a tail
-        // measurement binding a DIFFERENT decimal.
+        // bar noun ("0.85 is the bar/target", "the 0.85 bar", "(the gate
+        // bar) was NOT reached") or a tail measurement binding a DIFFERENT
+        // decimal. Round-12: the bar noun is OUTCOME-SCOPED — a noun
+        // heading an affirmative outcome (", bar met)", "(the bar was met)",
+        // "at bar this cycle") is the result's subject, not a restatement.
         if (cTailMarksBarRestatement(tail, val)) continue;
-        // (3) round-11: bar/plan wording in the HEAD window BEFORE the
+        // (3) round-12: trailing measurement/outcome override — a
+        // measurement/outcome signal in the tail with NO different-bound
+        // decimal ("**0.85** — measured this run.", "(the bar was met)")
+        // records the value as the measured at-bar figure. Runs BEFORE the
+        // head-window demotion below so "The (c) bar comparison: mapped
+        // agreement **0.85** — measured this run." still counts as measured.
+        if (cTailMarksMeasuredOutcome(tail, val)) {
+          out.push(val);
+          continue;
+        }
+        // (4) round-11: bar/plan wording in the HEAD window BEFORE the
         // keyword — "The (c) bar is mapped agreement **0.85**", "the (c)
         // threshold for parity is mapped agreement **0.85**", "the (c) gate
         // requires mapped agreement **0.85**" — the capture names the
         // threshold the run must hit, not a recorded figure.
         if (cHeadMarksBarRestatement(head)) continue;
-        // (4) default: a bare at-bar declaration IS the recorded verdict
+        // (5) default: a bare at-bar declaration IS the recorded verdict
         // (the >= 0.85 contract holds; no #2009 needed).
         out.push(val);
         continue;
@@ -313,7 +338,7 @@ function cMeasuredFigures(sec) {
 // capture's sentence):
 //   (a) a post-nominal bar noun naming the captured value as the threshold —
 //       "0.85 is the bar", "0.85 is the target", "the 0.85 bar", "(the gate
-//       bar)", "mapped agreement is the 0.85 bar …". Only
+//       bar) was NOT reached", "mapped agreement is the 0.85 bar …". Only
 //       punctuation/articles/adjectives
 //       may sit between the value and the noun (no digit, no comparison
 //       operator), and no comparison operator + decimal may FOLLOW the noun:
@@ -323,18 +348,67 @@ function cMeasuredFigures(sec) {
 //       "… the previous run measured 0.284 below the bar": the measured
 //       figure is bound to another number, so the captured 0.85 is the
 //       quoted bar, not the record.
+//   Round-12 (a) is OUTCOME-SCOPED: the noun only restates when it names the
+//   value AS the threshold. A bar noun heading an AFFIRMATIVE outcome — ",
+//   bar met)", "(the bar was met)", "bar passed" — or the "at (the) bar"
+//   measurement form ("0.85 at bar this cycle") is the RESULT's subject (the
+//   value met the bar) and does NOT restate; a NEGATED outcome ("(the gate
+//   bar) was NOT reached") keeps the restatement reading.
 function cTailMarksBarRestatement(tail, captured) {
   // Round-11: `target`/`goal` restored to the noun alternation (round-10
   // dropped `target` from round-9's bar|threshold|target|gate|requirement,
   // so "mapped agreement **0.85** is the target; no run was executed"
-  // wrongly counted the quoted target as a recorded at-bar figure).
-  const noun = /^(?:(?![0-9<>=≥≤\n])[\s\S]){0,90}?\b(?:the\s+)?(?:0?\.?85\s+)?(?:gate\s+)?(?:bar|threshold|gate|ceiling|requirement|minimum|target|goal)\b/i.exec(tail);
+  // wrongly counted the quoted target as a recorded at-bar figure). Round-12:
+  // the run-up groups capture where the noun WORD itself starts, so the gap
+  // before it ("at (the) bar"?) and the text after it (outcome verb?) can be
+  // read independently.
+  const noun = /^((?:(?![0-9<>=≥≤\n])[\s\S]){0,90}?)(\b(?:the\s+)?(?:0?\.?85\s+)?(?:gate\s+)?)(bar|threshold|gate|ceiling|requirement|minimum|target|goal)\b/i.exec(tail);
   if (noun) {
-    const after = tail.slice(noun.index + noun[0].length, noun.index + noun[0].length + 60);
-    if (!/[<>≥≤=]\s*[01]?(?:\.\d+|\d)/.test(after)) return true;
+    const nounStart = noun[1].length + noun[2].length;
+    const after = tail.slice(nounStart + noun[3].length, nounStart + noun[3].length + 60);
+    // a comparison operator + decimal right after the noun is an ANNOTATION
+    // on the value, not a restatement signal — fall through to the
+    // whole-tail bound-decimal check below.
+    if (!/[<>≥≤=]\s*[01]?(?:\.\d+|\d)/.test(after)) {
+      // a tail measurement/result verb binding a DIFFERENT decimal still
+      // marks the captured value as the quoted bar ("0.85 (the gate bar) was
+      // NOT reached; measured result 0.284 this run" — the 0.284 is the
+      // record, the 0.85 the bar).
+      const bound = /(?:measured|recorded|scored|result|reported|observed)\b[^.!?\n]{0,80}?([01]?\.[0-9]+)/i.exec(tail);
+      if (bound && Number(bound[1]) !== captured) return true;
+      // affirmative outcome verb heading the noun's own clause -> the value
+      // met the bar (a recorded at-bar result), not a restatement;
+      // negated-outcome forms ("was NOT reached", "not met") restate.
+      const afterClause = after.split(/[;.!?—–\n]/)[0];
+      if (!/\b(?:not|never|no)\b/i.test(afterClause) &&
+          /\b(?:met|passed|holds?|satisfied|cleared|exceeded|achieved|hit|reached)\b/i.test(afterClause)) {
+        return false;
+      }
+      // "at (the) bar" immediately before the noun = measured AT the bar.
+      if (/(?:\s|^)(?:at|measured)\s+(?:the\s+)?$/.test(tail.slice(0, nounStart))) return false;
+      // default: the value is named AS the bar/plan -> restatement.
+      return true;
+    }
   }
   const bound = /(?:measured|recorded|scored|result|reported|observed)\b[^.!?\n]{0,80}?([01]?\.[0-9]+)/i.exec(tail);
   return !!bound && Number(bound[1]) !== captured;
+}
+// Round-12 trailing measurement/outcome override for an at-bar (0.85)
+// capture: a measurement or outcome signal in the tail of the SAME sentence
+// — "**0.85** — measured this run.", "(the bar was met)", ", bar met)",
+// "at bar this cycle", "… holds" — records the captured value as the run's
+// measured at-bar figure even when a HEAD-window bar noun exists ("The (c)
+// bar comparison: mapped agreement **0.85** — measured this run."). It is
+// suppressed when the tail binds a DIFFERENT decimal to a measurement/result
+// verb — that decimal is the record and the captured value the quoted bar
+// ("0.85 — the previous run measured 0.284 below the bar", "0.85 (the gate
+// bar) was NOT reached; measured result 0.284 this run" stay restatements
+// via cTailMarksBarRestatement above). Mirrors the outcomeParen word set
+// generalized to unbracketed tails.
+function cTailMarksMeasuredOutcome(tail, captured) {
+  const bound = /(?:measured|recorded|scored|result|reported|observed)\b[^.!?\n]{0,80}?([01]?\.[0-9]+)/i.exec(tail);
+  if (bound && Number(bound[1]) !== captured) return false;
+  return /\b(?:measured|recorded|scored|reported|observed|result|met|passed|holds?|satisfied|cleared|exceeded|achieved|hit|reached)\b|at\s+(?:the\s+)?bar\b/i.test(tail);
 }
 // Round-11 HEAD-window bar-restatement signal for an at-bar (0.85) capture:
 // bar/plan nouns and verbs sitting in the bounded window BEFORE the "mapped
@@ -342,8 +416,10 @@ function cTailMarksBarRestatement(tail, captured) {
 // "the (c) threshold for parity is mapped agreement **0.85**", "the (c)
 // gate requires mapped agreement **0.85**" — name the value as the THRESHOLD
 // the run must hit, not a recorded figure. (The explicit-measured override
-// above already returned for "measured mapped agreement **0.85**", so a
-// head-window bar noun can never demote a genuinely recorded at-bar result.)
+// above already returned for "measured mapped agreement **0.85**", and the
+// round-12 trailing-measurement override runs before this step, so neither a
+// head-window bar noun nor a head-window modal can demote a genuinely
+// measured at-bar result.)
 function cHeadMarksBarRestatement(head) {
   return /(?:^|[^A-Za-z0-9_])(?:the\s+)?(?:\(c\)\s+)?(?:parity\s+)?(?:bar|threshold|gate|requirement|target|goal)s?\b/i.test(head) ||
     /\b(?:requires?|needs?|must|should)\b/i.test(head);
@@ -393,7 +469,13 @@ function sentenceNegatesIssue2009(s) {
 // AFFIRM that #2009 stays open/tracked. The long-parenthetical waiver still
 // fires THROUGH the balanced annotation (the annotation is part of #2009's
 // clause): "…#2009 (\"…\", opened 2026-08-30, owner epistemic-team) was
-// waived by the product decision." negates the issue.
+// waived by the product decision." negates the issue. Round-12: the clause
+// ALSO ends at a top-level em/en-dash, so a dash-joined follow-on clause
+// bound to a different subject ("…#2009 verified OPEN — the earlier (d) FAIL
+// was resolved by the product decision…", "…#2009 remains OPEN — the
+// exposure question was resolved by gating ask off") never falsely negates
+// an affirmative OPEN record. Dash boundaries fire only at paren-depth 0
+// (the long annotation's own em-dashes stay inside the clause).
 function issueClauseNegations2009(s) {
   const mentionRe = /#2009\b/g;
   let m;
@@ -417,10 +499,20 @@ function issueClauseNegations2009(s) {
   return false;
 }
 // The clause a #2009 mention heads: from just past the token to the next
-// top-level boundary — a `,` `;` `!` `?` or a period that is not part of a
-// decimal — with balanced parenthetical spans kept WHOLE (the runbook's long
-// annotation after #2009 carries its own commas/periods and is still the
-// same clause as the predicate that follows it).
+// top-level boundary — a `,` `;` `!` `?`, an em/en-dash (the runbook's
+// DOMINANT intra-sentence connector: "…#2009 verified OPEN — the earlier (d)
+// FAIL was resolved by the product decision" joins a NEW clause bound to a
+// different subject, so the disposition word after the dash must not negate
+// the follow-up record), or a period that is not part of a decimal — with
+// balanced parenthetical spans kept WHOLE (the runbook's long annotation
+// after #2009 carries its own commas/periods/em-dashes — "…("fix(product):
+// … under-detects — 0.284 …", opened …)" — and is still the same clause as
+// the predicate that follows it, so dash boundaries fire only at depth 0).
+// A top-level `:` is deliberately NOT a boundary: a colon heads an
+// EXPLANATION of the same clause (the runbook's "#2009 …:" records restate
+// the subject's own disposition — "#2009 … not required: …" keeps its
+// predicate in-clause), while an em/en-dash virtually always joins a NEW
+// independent clause bound to its own subject.
 function clauseAfter(text, from) {
   let depth = 0;
   let out = "";
@@ -430,7 +522,7 @@ function clauseAfter(text, from) {
     if (ch === ")" && depth > 0) { depth--; out += ch; continue; }
     if (depth === 0) {
       const nxt = text[i + 1] || "";
-      if (ch === "," || ch === ";" || ch === "!" || ch === "?" || (ch === "." && !/[0-9]/.test(nxt))) break;
+      if (ch === "," || ch === ";" || ch === "!" || ch === "?" || ch === "—" || ch === "–" || (ch === "." && !/[0-9]/.test(nxt))) break;
     }
     out += ch;
   }
