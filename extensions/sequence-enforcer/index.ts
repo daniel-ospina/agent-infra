@@ -505,10 +505,13 @@ export interface ReadEnforcementLogResult {
 // cap, limit <= 0 = empty result; since: undefined = no filter.
 export function readEnforcementLog(opts: ReadEnforcementLogOptions = {}): ReadEnforcementLogResult {
   const file = opts.file ?? enforcementLogFile();
-  // Fail-closed on filter input before touching the file. !(limit > 0) covers
-  // 0, negatives, AND NaN/Infinity (NaN <= 0 is false — a bare <= 0 check
-  // would let limit: NaN silently drop the cap and over-report).
-  if (opts.limit !== undefined && !(opts.limit > 0)) return { entries: [], skipped: 0 };
+  // Fail-closed on filter input before touching the file. Requires a finite
+  // positive limit: 0, negatives, NaN, and ±Infinity all return empty (NaN <= 0
+  // is false and Infinity > 0 is true — bare comparisons would let those
+  // silently drop the cap and over-report).
+  if (opts.limit !== undefined && (!Number.isFinite(opts.limit) || opts.limit <= 0)) {
+    return { entries: [], skipped: 0 };
+  }
   const sinceMs = opts.since !== undefined ? Date.parse(opts.since) : NaN;
   if (opts.since !== undefined && Number.isNaN(sinceMs)) return { entries: [], skipped: 0 };
   let raw: string;
