@@ -352,18 +352,20 @@ function cMeasuredFigures(sec) {
         // (1) explicit-result override: a measurement verb bound to THIS
         // phrase ("measured mapped agreement **0.85**") or an outcome
         // parenthetical ("(bar met)", "(met)", "(pass)") — the 0.85 IS the
-        // recorded at-bar figure. Round-15: the head-window scan is
-        // VALUE-BOUND, mirroring the round-14 tail classifier — a
-        // measurement/result word whose OWN clause carries a DIFFERENT
-        // decimal is bound to that decimal's record and cannot upgrade the
+        // recorded at-bar figure. Round-17: the head-window scan is
+        // CLAUSE-BOUND, mirroring the round-14 tail classifier — a
+        // measurement verb whose OWN clause carries ANY decimal (value-
+        // agnostic) is bound to that clause's record and cannot upgrade the
         // bar mention ("measured 0.284 last run. mapped agreement **0.85**
         // is the bar", "The parity gate measured 0.284 last run; mapped
-        // agreement **0.85** is the bar" — the 0.284 clause is the record,
-        // so the 0.85 demotes via (2)/(3) below instead of passing as
-        // measured). (The tight char verb binding keeps a measurement verb
-        // from an EARLIER sentence — "Measured … 0.284 last run. mapped
-        // agreement **0.85** …" — from upgrading a bar mention.)
-        const explicitMeasured = cHeadWindowMeasuresValue(sent, m.index - head.length, head + m[1], val);
+        // agreement **0.85** is the bar", "the earlier 0.85 result was
+        // recorded at the calibration gate; mapped agreement **0.85** is
+        // the bar" — the record clause is another figure, so the 0.85
+        // demotes via (2)/(3) below instead of passing as measured). (The
+        // tight char verb binding keeps a measurement verb from an EARLIER
+        // sentence — "Measured … 0.284 last run. mapped agreement
+        // **0.85** …" — from upgrading a bar mention.)
+        const explicitMeasured = cHeadWindowMeasuresValue(sent, m.index - head.length, head + m[1], m.index);
         const outcomeParen = /\((?:the\s+)?(?:0?\.?85\s+)?(?:bar|threshold|gate|target)\s+(?:met|passed|exceeded|satisfied|achieved|hit|cleared|reached)\s*\)|\((?:met|pass|passed|at\s+(?:the\s+)?bar|bar\s+met|bar\s+passed)\)/i.test(tail);
         if (explicitMeasured || outcomeParen) {
           out.push(val);
@@ -697,37 +699,57 @@ function cTailNegatesMeasurement(tail) {
   return negatedAll > 0 && affirmativeAll === 0;
 }
 // Round-15 (cycle-8 review): the step-(1) HEAD-window explicit-measured
-// scan, VALUE-BOUND symmetrically with the round-14 tail classifier. The
+// scan, CLAUSE-BOUND symmetrically with the round-14 tail classifier. The
 // window (the <= 40 chars before the "mapped agreement" keyword plus the
 // keyword-to-value run-up) may carry a measurement/result word whose OWN
 // clause — a top-level-boundary span over the WHOLE sentence
-// (cTailClauseSpan), so the clause can end past the 40-char clip — also
-// carries a DIFFERENT decimal: "measured 0.284 last run. mapped agreement
-// **0.85** is the bar" and "The parity gate measured 0.284 last run;
-// mapped agreement **0.85** is the bar" record a 0.284 measurement inside
-// the verb's clause, so the verb is bound to THAT decimal's record and
-// must not upgrade the 0.85 bar mention into a measured at-bar figure
-// (without this binding the step-(2)/(3) demotion is never reached and the
-// gate falsely passes). The word measures the capture only when no OTHER
-// decimal sits in its own clause — "measured mapped agreement **0.85**"
-// (verb directly before the keyword, no decimal between; the captured
-// value reached through the keyword is the clause's only decimal) still
-// records the at-bar figure. A word from an EARLIER sentence never reaches
-// the window (the head clip ends at the previous period, and the decimal
-// record it binds is already out of reach). Round-16 (cycle-9 review): the
-// scan is also NEGATION-GUARDED, mirroring the round-13 tail guard
-// (cTrailSignalNegated) — a measurement/result word whose OWN clause
-// (the same cTailClauseSpan computed below) carries a negator ("The
-// parity gate was NOT measured this run; …", "not measured this cycle
-// (run not executed); …", "(c) not measured this cycle; the bar is …")
-// records a NEGATED outcome and never upgrades the bar mention into a
-// recorded at-bar figure. Without this guard a negated measurement verb in
-// the head window fired the step-(1) explicit-measured override and the
-// capture never reached the step-(2)/(3)/(5) demotions, so the verdict
-// flipped solely on clause order (bar mention before vs after the negated
-// clause) — contradicting the head/tail symmetry the round-14 tail
-// classifier already provides.
-function cHeadWindowMeasuresValue(sent, winStart, winText, val) {
+// (cTailClauseSpan), so the clause can end past the 40-char clip — carries
+// a decimal that records ANOTHER figure: "measured 0.284 last run. mapped
+// agreement **0.85** is the bar" and "The parity gate measured 0.284 last
+// run; mapped agreement **0.85** is the bar" record a 0.284 measurement
+// inside the verb's clause, so the verb is bound to THAT decimal's record
+// and must not upgrade the 0.85 bar mention into a measured at-bar figure
+// (without this binding the step-(2)/(3)/(5) demotion is never reached and
+// the gate falsely passes).
+//   Round-17 (cycle-10 review): round-15's binding was VALUE-INEQUALITY-
+// BASED — it bound a word to its clause decimal only when that decimal
+// DIFFERED from the bar constant — so an EARLIER-RECORD cross-ref carrying
+// the SAME value as the capture left the verb unbound, step (1) fired, and
+// the capture never reached the step-(2)/(3)/(5) demotions (the code's own
+// canonical docstring example flipped on clause order: "the earlier 0.85
+// result was recorded at the calibration gate; mapped agreement **0.85**
+// is the bar." passed while its tail twin demoted). The binding is now
+// POSITION/IDENTITY-based, mirroring round-14's value-agnostic clause
+// binding (cTailClauseHasDecimal binds ANY clause decimal): a MEASUREMENT
+// VERB (measured|recorded|scored|reported|observed) is bound by ANY
+// decimal in its own clause — before or after the keyword, equal or
+// different — because the clause's own record ("the earlier run recorded
+// mapped agreement **0.85** at the calibration gate", "measured 0.284
+// last run") narrates a different figure; the bare RESULT noun is bound by
+// a clause decimal that occurs BEFORE the capture's "mapped agreement"
+// keyword position, since the capture's own value always FOLLOWS the
+// keyword — only a clause whose decimal is reached at/after the keyword
+// can be this capture's own measurement ("the result this run: mapped
+// agreement **0.85**; no bar change." still measures). A verb whose own
+// clause ends before the keyword and carries no decimal ("measured this
+// run; mapped agreement **0.85**") still fires the override; "measured
+// mapped agreement **0.85**" records the at-bar figure through the
+// bare-default/trailing paths below. A word from an EARLIER sentence never
+// reaches the window (the head clip ends at the previous period, and the
+// decimal record it binds is already out of reach).
+//   Round-16 (cycle-9 review): the scan is also NEGATION-GUARDED,
+// mirroring the round-13 tail guard (cTrailSignalNegated) — a
+// measurement/result word whose OWN clause (the same cTailClauseSpan
+// computed below) carries a negator ("The parity gate was NOT measured
+// this run; …", "not measured this cycle (run not executed); …", "(c)
+// not measured this cycle; the bar is …") records a NEGATED outcome and
+// never upgrades the bar mention into a recorded at-bar figure. Without
+// this guard a negated measurement verb in the head window fired the
+// step-(1) explicit-measured override and the capture never reached the
+// step-(2)/(3)/(5) demotions, so the verdict flipped solely on clause
+// order (bar mention before vs after the negated clause) — contradicting
+// the head/tail symmetry the round-14 tail classifier already provides.
+function cHeadWindowMeasuresValue(sent, winStart, winText, kwStart) {
   const re = /\b(?:measured|recorded|scored|reported|observed|result)\b/gi;
   let w;
   while ((w = re.exec(winText)) !== null) {
@@ -739,13 +761,20 @@ function cHeadWindowMeasuresValue(sent, winStart, winText, val) {
     // demotions (parens stay whole, so "(run not executed)" still counts;
     // a negator in a LATER clause never leaks back past the boundary).
     if (new RegExp(C_TRAIL_NEGATOR_SRC, "i").test(clause)) continue;
+    // Round-17 binding: a measurement VERB is bound by ANY decimal in its
+    // own clause (the clause records a different figure — value-agnostic,
+    // mirroring cTailClauseHasDecimal); the bare RESULT noun is bound when
+    // its clause carries a decimal BEFORE the capture's keyword (the
+    // capture's own value always follows the keyword, so a pre-keyword
+    // decimal is another record). An unbound word measures this capture.
+    const bareNoun = /^result\b/i.test(w[0]);
     const dRe = /[01]?\.[0-9]+/g;
     let dm;
-    let boundElsewhere = false;
+    let bound = false;
     while ((dm = dRe.exec(clause)) !== null) {
-      if (Number(dm[0]) !== val) { boundElsewhere = true; break; }
+      if (!bareNoun || start + dm.index < kwStart) { bound = true; break; }
     }
-    if (!boundElsewhere) return true;
+    if (!bound) return true;
   }
   return false;
 }
