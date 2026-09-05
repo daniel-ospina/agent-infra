@@ -3126,7 +3126,13 @@ export function firstHubTrackedWrite(candidates, trackedRels) {
  * later-line closer, delim not numeric) is the remaining shift swallow
  * corner; `source`/`.` file targets ARE surfaced as script tokens (cycle-18
  * P2-1) — the caller's existsSync + content walk gates their tracked writes
- * exactly like `bash f` scripts.
+ * exactly like `bash f` scripts. MECHANISM BOUNDARY (post-#474 review): the
+ * gate scans bash write PRIMITIVES — `>`/`>>`/`>&` redirects, `tee`, python
+ * `open(...,'w'|'a')` — NOT in-place overwrite VERBS (`sed -i`, `perl -pi`,
+ * `cp`/`mv` onto a tracked file, `install`, `dd of=`, `tar -x`/`unzip -o`
+ * into the hub, `patch -p1`): those contain no write-primitive construct and
+ * are deliberately outside this walker's scope (the write/edit-tool freeze
+ * and the M4 git gate are the controls for verb-style overwrites).
  */
 export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const s = String(command ?? "");

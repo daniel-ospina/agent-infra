@@ -266,9 +266,15 @@ dirty, and trips M4's freeze. Surfaces (in a NON-infra repo):
    static walker CAN name; operands that are shell expansions (`> $OUT`,
    `> "$FILE"`, `> $(cmd)`, `~`/`~user` paths) stay literal and are NOT
    resolved (out of threat model — the walker has no shell state; see the
-   classify-git.mjs docstring residual list). NEW-file and untracked-WIP
-   targets are NOT this gate's concern (see 3; the #436 collision-free
-   carve-out semantics apply).
+   classify-git.mjs docstring residual list). Mechanism boundary (post-#474
+   review): the gate covers bash write PRIMITIVES — `>`/`>>`/`>&` redirects,
+   `tee`, and python `open(…,"w"/"a")` — NOT in-place overwrite VERBS
+   (`sed -i`, `perl -pi`, `cp`/`mv` onto a tracked file, `install`, `dd
+   of=`, `tar -x` into the hub); those contain no write-primitive construct
+   and are outside this mechanism's scope — the write/edit-tool freeze and
+   the M4 git gate remain the controls for verb-style overwrites. NEW-file
+   and untracked-WIP targets are NOT this gate's concern (see 3; the #436
+   collision-free carve-out semantics apply).
 3. **Bash-write warning (untracked WIP — still warn-only):** hub-targeted
    non-git bash writes whose target matches a WIP pattern emit the same banner
    with a `(via bash …)` note. Heuristic and conservative: `/tmp` scratch-ish

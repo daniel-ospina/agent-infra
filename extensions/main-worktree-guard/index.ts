@@ -613,10 +613,13 @@ function _hubBashTrackedWrite(command: string, execCwd?: string): { resolvedPath
 function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string }): string {
   return [
     `⛔ Bash write to a tracked hub file blocked (${hit.rel}).`,
-    `   The shared main checkout is OFF-MAIN or DIRTY (#1484) — tracked-file`,
-    `   overwrites via bash respect the SAME gate as the write/edit tools.`,
+    `   The shared main checkout is OFF-MAIN or DIRTY (#1484) — bash WRITE`,
+    `   PRIMITIVES to tracked files respect the SAME gate as the tools:`,
+    `   >/>>/&> redirects, tee, and python open(...,"w"/"a").`,
     `   Untracked/new-file writes stay allowed; only session-start host env`,
     `   (AGENT_ALLOW_MAIN_EDITS=1) bypasses — a mid-command export cannot.`,
+    `   (In-place overwrite VERBS like sed -i / cp are not a write primitive;`,
+    `   prefer the salvage/worktree routes below for those.)`,
     `   → Capture the dirty set first (hub returns to main+CLEAN):`,
     `     bash scripts/checkout-hygiene/hub-worktree.sh salvage <branch> <repo>`,
     `   → Or write into a worktree (using-git-worktrees skill).`,
