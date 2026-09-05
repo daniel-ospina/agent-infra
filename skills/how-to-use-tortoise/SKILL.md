@@ -2,6 +2,7 @@
 name: how-to-use-tortoise
 description: Create points, operators, mitigations, NANDs, supersede, delete, and annotate on the Tortoise graph. Use when asked to write to the Tortoise graph — creating points, operators, mitigations, NAND edges, superseding points, deleting, or annotating.
 domain: capability
+subjects.team: organisation-design-team
 type: Workflow
 status: live
 tags: [tortoise, graph, epistemology, knowledge-graph, operations, search, entity-type, pack, decision-comparison, discovery]

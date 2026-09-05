@@ -2,6 +2,7 @@
 name: app-test
 description: "Automated E2E testing for desktop (Electron) and web apps. Launches app, runs test scenarios, screenshots, verifies logs and database state. Invoke when asked to test the app, verify a release, or smoke-test after deploy."
 domain: engineering
+subjects.team: organisation-design-team
 type: Bounded
 status: live
 allowed-tools: read write edit bash grep find web_search web_fetch
@@ -256,3 +257,5 @@ grep -i "supabase\|error\|fatal" ~/Library/Application\ Support/ig-daemon/logs/s
 # Kill DMer after tests
 pkill -f "DMer" 2>/dev/null
 ```
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

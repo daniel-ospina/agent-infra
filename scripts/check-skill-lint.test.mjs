@@ -146,6 +146,20 @@ test("missing description tree fails (gate-description-nonstring)", () => {
   assert.match(r.stdout, /\[P0\] frontmatter: gate-description-nonstring/);
 });
 
+test("no-frontmatter file → single root-cause finding, no structural-rule noise (#381 review)", () => {
+  // A file whose frontmatter failed to extract (no opening ---) must report
+  // ONLY the extraction P0 — the data-derived structural rules (subjects.team,
+  // mandatory blocks) must not stack misleading findings on the empty data.
+  const dir = tmpTree({
+    "nofm/SKILL.md": "name: nofm\ndescription: test\nbody\n",
+  });
+  const r = runLint(["--skills-dir", dir], REPO_ROOT);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /\[P0\] frontmatter: extract-missing-opening/);
+  assert.doesNotMatch(r.stdout, /\[P0\] subjects\.team:/);
+  assert.doesNotMatch(r.stdout, /\[P0\] mandatory-blocks:/);
+});
+
 test("explicit --skills-dir <missing> → exit 2 (fail-closed flip, D9)", () => {
   const r = runLint(["--skills-dir", path.join(os.tmpdir(), "no-such-skill-dir-254")], REPO_ROOT);
   assert.equal(r.status, 2);
@@ -209,9 +223,15 @@ test("indented `  ---` does NOT terminate extraction (folds into the scalar)", (
 // ── (f) name≠dir with quoted-name regression ────────────────────────────────
 section("quote-aware name/description data (name≠dir regression)");
 
+// Minimal fully-compliant skill body for fixtures that must lint CLEAN: has
+// subjects.team + both mandatory blocks (#381 rules). Keeps the fixture
+// focused on the name≠dir axis, not the new structural rules.
+const compliantSkill = (name, dir) =>
+  `---\nname: ${name}\ndescription: test\nsubjects.team: organisation-design-team\n---\n> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.\n> Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.\n\nbody\n---\n> Continue following the workflow as mandated by this skill. Do not skip steps.\n`;
+
 test('name: "bar" in dir bar → clean (quoted value unquoted)', () => {
   const dir = tmpTree({
-    "bar/SKILL.md": '---\nname: "bar"\ndescription: test\n---\nbody\n',
+    "bar/SKILL.md": compliantSkill('"bar"', 'bar'),
   });
   const r = runLint(["--skills-dir", dir], REPO_ROOT);
   assert.equal(r.status, 0, r.stdout);
@@ -219,7 +239,7 @@ test('name: "bar" in dir bar → clean (quoted value unquoted)', () => {
 
 test('name: "foo" in dir bar → P0 name mismatch (no literal-quote false negative)', () => {
   const dir = tmpTree({
-    "bar/SKILL.md": '---\nname: "foo"\ndescription: test\n---\nbody\n',
+    "bar/SKILL.md": compliantSkill('"foo"', 'bar'),
   });
   const r = runLint(["--skills-dir", dir], REPO_ROOT);
   assert.equal(r.status, 1);
@@ -228,10 +248,52 @@ test('name: "foo" in dir bar → P0 name mismatch (no literal-quote false negati
 
 test("shared-<dir> routing-wrapper exemption still honored", () => {
   const dir = tmpTree({
-    "shared/SKILL.md": "---\nname: shared-shared\ndescription: test\n---\nbody\n",
+    "shared/SKILL.md": compliantSkill("shared-shared", "shared"),
   });
   const r = runLint(["--skills-dir", dir], REPO_ROOT);
   assert.equal(r.status, 0, r.stdout);
+});
+
+// ── (f2) issue-381 structural rules — subjects.team + mandatory blocks ─────
+section("issue-381 structural rules — subjects.team + mandatory blocks");
+
+const skillWith = ({ team = true, gate = true, cont = true } = {}) => {
+  const fmKeys = ["name: x", "description: test"];
+  if (team) fmKeys.push("subjects.team: organisation-design-team");
+  const gateBlock = gate
+    ? "> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.\n> Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.\n\n"
+    : "";
+  const contBlock = cont
+    ? "---\n> Continue following the workflow as mandated by this skill. Do not skip steps.\n"
+    : "";
+  return `---\n${fmKeys.join("\n")}\n---\n${gateBlock}body\n${contBlock}`;
+};
+
+test("compliant minimal skill (team + gate + continuity) → clean exit 0", () => {
+  const dir = tmpTree({ "x/SKILL.md": skillWith() });
+  const r = runLint(["--skills-dir", dir], REPO_ROOT);
+  assert.equal(r.status, 0, r.stdout);
+});
+
+test("missing subjects.team → P0 subjects.team finding, exit 1", () => {
+  const dir = tmpTree({ "x/SKILL.md": skillWith({ team: false }) });
+  const r = runLint(["--skills-dir", dir], REPO_ROOT);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /\[P0\] subjects\.team: missing required 'subjects\.team'/);
+});
+
+test("missing gate warning → P0 mandatory-blocks (MUST be read in full), exit 1", () => {
+  const dir = tmpTree({ "x/SKILL.md": skillWith({ gate: false }) });
+  const r = runLint(["--skills-dir", dir], REPO_ROOT);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /\[P0\] mandatory-blocks: missing '⛔ MUST be read in full' gate warning/);
+});
+
+test("missing continuity directive → P0 mandatory-blocks (Continue following), exit 1", () => {
+  const dir = tmpTree({ "x/SKILL.md": skillWith({ cont: false }) });
+  const r = runLint(["--skills-dir", dir], REPO_ROOT);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /\[P0\] mandatory-blocks: missing 'Continue following the workflow' continuity directive/);
 });
 
 // ── (g) 121-tree sweep — zero false positives ───────────────────────────────

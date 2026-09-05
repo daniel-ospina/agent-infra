@@ -1,6 +1,7 @@
 ---
 name: codebase-audit
 description: "Full codebase audit coordinating security, bug, config, supply-chain, and database specialists. Use when asked to 'audit the codebase', 'find all bugs', 'security audit', 'full audit', 'code quality scan', or 'run codebase audit'."
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 steps:
   - name: file_discovery

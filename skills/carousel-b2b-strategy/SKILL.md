@@ -1,6 +1,7 @@
 ---
 name: carousel-b2b-strategy
 description: 7-phase stateful pipeline for B2B carousel content with status.yaml tracking and cross-session resume. Use when asked to create a carousel, social media post, or thought leadership content. NEVER create carousel content without reading this skill — this is a pipeline with persistent state, not a one-shot content task.
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 1.0.0
 ---

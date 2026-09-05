@@ -2,6 +2,7 @@
 name: ux-verification
 description: "Use when verifying UI changes for component library compliance, common UX failure patterns, and accessibility basics. Complexity-proportional: UX=low checks component catalog, UX=medium adds failure patterns, UX=high dispatches full ux-path-auditor. Invoked by test-routing when UI changes are detected."
 domain: engineering
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch
 ---
 
@@ -176,3 +177,5 @@ Depth=full detected. Dispatching ux-path-auditor for:
 | Loading/empty/error states | Users see blank pages, crashes, or unhelpful error messages |
 | Keyboard navigation | Keyboard-only users cannot use the feature — accessibility regression |
 | Responsive check | Mobile users get broken layouts — horizontal scroll, tiny touch targets |
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

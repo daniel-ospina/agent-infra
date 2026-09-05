@@ -2,6 +2,7 @@
 name: code-review
 description: MANDATORY code review for standard+complex PRs. Dispatches parallel reviewers. Skipping ships unreviewed code to production.
 domain: engineering
+subjects.team: organisation-design-team
 version: 3.2.0
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 steps:

@@ -2,6 +2,7 @@
 name: test-writing
 description: Use when writing tests during implementation — enforces Red-Green-Refactor cycle, 7-point quality self-check, and workflow/journey alignment. Invoked by executing-plans for test-writing task steps.
 domain: engineering
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

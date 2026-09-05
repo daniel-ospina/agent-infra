@@ -3,6 +3,7 @@ name: project-workflow
 description: Fractal planning pipeline for projects (standard/complex issues). Routes through 6 stages with proportional depth — inherits Align from parent Epic, runs proportional review gates.
 type: Workflow
 domain: capability
+subjects.team: organisation-design-team
 status: live
 tags: [pipeline, project, planning, fractal, orchestrator]
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task

@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: research-verification
 description: "Thin wrapper that standardizes invocation of the research skill's adversarial review gate. Ensures disconfirming queries are run and assumptions are challenged. Invoked by test-routing when domain=research."
 domain: engineering
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch
 ---
 
@@ -95,3 +96,5 @@ Route to the `research` skill's adversarial review gate. This runs:
 | Disconfirming queries | Research confirms existing bias — missed alternatives, unchallenged assumptions |
 | Assumption challenge | Untracked assumptions become silent design constraints |
 | Source verification | Claims treated as facts without evidence — decisions built on sand |
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: clarifying-questions
 description: "Scores and surfaces clarifying questions before planning proceeds. Callers: issue-scoping (Phase 0.5, mode=issue-pre) and strategy-builder (§2.4, GTM domain). Not invoked directly by users."
 domain: capability
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

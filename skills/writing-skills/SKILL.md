@@ -2,6 +2,7 @@
 name: writing-skills
 description: How to create, structure, and maintain agent skills following project conventions. Reference skill — not a workflow. Covers frontmatter schema, mandatory blocks, naming rules, structure patterns, and pi compliance.
 domain: capability
+subjects.team: organisation-design-team
 type: reference
 status: live
 tags: [skill-authoring, conventions, reference]

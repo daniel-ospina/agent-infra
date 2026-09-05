@@ -1,6 +1,7 @@
 ---
 name: prototype-review
 description: Automated review-fix cycle for El Dato HTML prototypes. Dispatches 3 parallel NVIDIA reviewers (ux-coherence, accessibility, user-journey-logic) per cycle, merges issues, runs fixer, and loops until clean or hard cap. Invoked after ui_prototype generates an HTML file. Can also be invoked manually on any prototype HTML file.
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

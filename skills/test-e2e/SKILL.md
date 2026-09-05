@@ -2,6 +2,7 @@
 name: test-e2e
 description: "Use when writing Playwright end-to-end tests. Two depths: smoke (single session, @smoke tag, <30s, key journeys only) and full (multi-page flows, visual regression, @e2e tag). Uses existing critical-paths Playwright project. Invoked by test-routing when critical paths need e2e coverage."
 domain: engineering
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find
 ---
 
@@ -183,3 +184,5 @@ page.locator('button:has-text("Confirmar")')
 | Visual regression | UI regressions invisible — layout breaks, missing elements, style corruption |
 | Selector rules | Tests break on every i18n change or CTA text update — maintenance burden |
 | @smoke tag | Smoke suite runs full e2e — CI slows down, developers skip tests |
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

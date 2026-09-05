@@ -3,6 +3,7 @@ allowed-tools: read write edit bash grep find web_search web_fetch todo_write ta
 name: content-humanizer
 description: Naturalization pass that removes AI writing patterns from drafts BEFORE the reviewer cycle. Invoke after initial drafting, before reviewers. This is a preparation step — it doesn't produce final content, it prepares the draft for the quality gate.
 domain: growth
+subjects.team: organisation-design-team
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.

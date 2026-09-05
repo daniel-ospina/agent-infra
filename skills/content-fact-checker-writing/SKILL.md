@@ -2,6 +2,7 @@
 name: content-fact-checker-writing
 version: 1.1.0
 description: Use after the text reviewer cycle is clean, before final delivery. Cross-checks all factual claims in the written content against the verified research brief. No Perplexity calls — only cross-references against verified research. Returns issues in standard P0/P1/P2 reviewer format.
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

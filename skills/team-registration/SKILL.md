@@ -2,11 +2,14 @@
 name: team-registration
 description: Checklist for registering a new team across all operational surfaces. Use when creating a new team to ensure no registration surface is missed. Supabase is the canonical source of truth.
 domain: operations
+subjects.team: organisation-design-team
 type: reference
 status: live
 allowed-tools: read write edit bash
 tags: [operations, team-setup, checklist]
 ---
+> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
+> Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 # Team Registration
 

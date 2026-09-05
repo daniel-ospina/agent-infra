@@ -2,6 +2,7 @@
 name: content-staleness-scanner
 version: 1.0.0
 description: Use when scanning for stale editorial content that needs refreshing, when asked to "check for stale content", "find pages that need refreshing", "run staleness scan", or "what content needs a refresh". Queries the DB, outputs a prioritized refresh queue, and optionally triggers content-refresh for each item.
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

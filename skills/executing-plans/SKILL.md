@@ -2,6 +2,7 @@
 name: executing-plans
 description: Use when you have a written implementation plan to execute in a separate session with review checkpoints
 domain: engineering
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash web_search web_fetch todo_write task grep find
 steps:
   - name: workspace_setup

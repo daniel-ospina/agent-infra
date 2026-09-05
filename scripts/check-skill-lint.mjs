@@ -15,6 +15,9 @@
  *   - string-type gate on name/description (pi DROPS non-string descriptions)
  *   - Bounded/Workflow/Routing missing allowed-tools → writing-skills schema
  *   - name != directory name mismatch (shared-<dir> routing wrappers allowed)
+ *   - missing subjects.team frontmatter → writing-skills REQUIRED field (#381)
+ *   - missing mandatory blocks (gate warning + continuity directive) →
+ *     writing-skills Mandatory Blocks — no exceptions (#381)
  *
  * Usage:
  *   node scripts/check-skill-lint.mjs --repo /path/to/repo
@@ -152,7 +155,15 @@ function lintFile(file, rel) {
 
   const fm = validateFrontmatter(content);
 
-  if (!fm.ok) {
+  // Internal validator error OR a frontmatter that failed to extract
+  // (missing opening/closing `---`, empty) — fm.ok stays true on extract
+  // failures but data is the empty default and deriveData never ran. The
+  // structural rules below (name != dir, allowed-tools, subjects.team,
+  // mandatory blocks) are schema checks over DERIVED frontmatter data — on
+  // a data-less file they would stack misleading findings on top of the
+  // extraction P0. Emit the root-cause findings and stop, matching the
+  // pre-existing defensive behavior of the name/allowed-tools guards.
+  if (!fm.ok || !fm.yamlString) {
     for (const f of fm.findings) issues.push(`[P0] frontmatter: ${f.class} — ${f.message}\n  ${rel}`);
     return issues;
   }
@@ -171,6 +182,26 @@ function lintFile(file, rel) {
   // planning/shared). reference and typeless skills are exempt.
   if (fm.data.type && ['Bounded', 'Workflow', 'Routing'].includes(fm.data.type) && !('allowed-tools' in fm.data)) {
     issues.push(`[P0] allowed-tools: type '${fm.data.type}' requires allowed-tools (writing-skills frontmatter schema)\n  ${rel}`);
+  }
+
+  // writing-skills frontmatter schema: subjects.team is REQUIRED on every
+  // SKILL.md — "from issue **Team:** → AGENT_SESSION_TEAM → fallback
+  // organisation-design-team" (#381 — 81/97 skills lacked it and no check
+  // caught the gap; the linter now enforces presence + non-empty value).
+  const subjectsTeam = fm.data['subjects.team'];
+  if (typeof subjectsTeam !== 'string' || subjectsTeam.trim() === '') {
+    issues.push(`[P0] subjects.team: missing required 'subjects.team' frontmatter key (writing-skills frontmatter schema — REQUIRED; fallback organisation-design-team)\n  ${rel}`);
+  }
+
+  // writing-skills Mandatory Blocks — every SKILL.md, no exceptions (#381):
+  //   gate warning (⛔ MUST be read in full) after frontmatter, and
+  //   continuity directive (Continue following the workflow) at the bottom.
+  // Validation mirrors writing-skills' own grep contract verbatim.
+  if (!content.includes('MUST be read in full')) {
+    issues.push(`[P0] mandatory-blocks: missing '⛔ MUST be read in full' gate warning after frontmatter (writing-skills Mandatory Blocks — no exceptions)\n  ${rel}`);
+  }
+  if (!content.includes('Continue following the workflow')) {
+    issues.push(`[P0] mandatory-blocks: missing 'Continue following the workflow' continuity directive at the bottom (writing-skills Mandatory Blocks — no exceptions)\n  ${rel}`);
   }
 
   // Catch agents asking forbidden question — AGENTS.md §Batch Implementation

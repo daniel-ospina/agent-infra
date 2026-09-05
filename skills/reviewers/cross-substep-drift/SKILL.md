@@ -2,6 +2,7 @@
 disable-model-invocation: true
 name: cross-substep-drift
 description: Detects inconsistencies across epic substeps through forward, reverse, and cross-reference passes. Use during Coherence Review for all complexity axes. Returns structured ISSUE blocks or NO ISSUES FOUND.
+subjects.team: organisation-design-team
 allowed-tools: read bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

@@ -82,6 +82,20 @@ const FIXTURE_DEFS = [
   { id: 'throw-block-header-indent-12', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |12\n  line1\n---\nbody\n', note: 'P2-1 — |12 two-digit explicit-indent header' },
   { id: 'throw-block-header-plus-0', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |+0\n  line1\n---\nbody\n', note: 'P2-1 — |+0 chomp + explicit-indent 0 header' },
   { id: 'throw-block-header-fold-0', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: >0\n  line1\n---\nbody\n', note: 'P2-1 — >0 folded with explicit-indent 0 header' },
+  // #370 — block-scalar header + space + NON-comment token (P1 false negative:
+  // the old valid-header trailing `[ \t].*` swallowed any text as a comment).
+  // yaml: "Not a YAML token: <tok>" → pi drops; validator now throws
+  // throw-invalid-block-header (block-header-trailing variant). The header
+  // never opens a scalar, so a dangling body line is structurally processed
+  // (bare-key).
+  { id: 'throw-block-header-trailing-token', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: | comment\n  line1\n---\nbody\n', note: '#370 — `| comment` space-then-token (the exact O/I repro)' },
+  { id: 'throw-block-header-trailing-digit', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: | 0\n  line1\n---\nbody\n', note: '#370 — `| 0` space-then-digit (distinct from #369 P2-1 \'|0\' adjacent-digit form)' },
+  { id: 'throw-block-header-trailing-fold', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: > text\n  line1\n---\nbody\n', note: '#370 — folded `> text` space-then-token' },
+  { id: 'throw-block-header-trailing-explicit', class: 'throw-invalid-block-header', expected: ['throw-invalid-block-header', 'throw-bare-key'], expectedRelation: 'drop', content: '---\nname: x\ndescription: |1 token\n  line1\n---\nbody\n', note: '#370 — valid explicit-indent header |1 followed by space-then-token' },
+  // #370 ok-pins — a whitespace run + #-comment (or bare trailing whitespace)
+  // after the header is legal; pi loads and must stay validator-clean.
+  { id: 'ok-block-header-comment', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: | #c\n  line1\n---\nbody\n', note: '#370 pin — #-comment immediately after the header stays legal (pi loads, body is the value)' },
+  { id: 'ok-block-header-comment-spaced', class: 'ok', expected: [], expectedRelation: 'load', content: '---\nname: x\ndescription: |  # comment\n  line1\n---\nbody\n', note: '#370 pin — whitespace run + #-comment after the header stays legal (multi-space; guards the trimStart boundary)' },
   { id: 'throw-reserved-at', class: 'throw-reserved-char-start', expected: ['throw-reserved-char-start'], expectedRelation: 'drop', content: '---\nname: x\ndescription: @x\n---\nbody\n' },
   { id: 'throw-reserved-backtick', class: 'throw-reserved-char-start', expected: ['throw-reserved-char-start'], expectedRelation: 'drop', content: '---\nname: x\ndescription: `x`\n---\nbody\n' },
   { id: 'throw-reserved-percent', class: 'throw-reserved-char-start', expected: ['throw-reserved-char-start'], expectedRelation: 'drop', content: '---\nname: x\ndescription: %foo\n---\nbody\n' },
