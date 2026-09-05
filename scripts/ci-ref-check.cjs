@@ -110,6 +110,17 @@ function checkCiRefs(targetDir, ciRef) {
 // changed-files loops) must NOT trip. See
 // docs/scoping/2026-08-31-issue-389-inline-jobs-plan.md (rev 6) for the
 // boundary contract and the pin list; the unit tests mechanically enforce it.
+//
+// #403 extends the rule to python-ci.yml's dir-suite class: an inline pytest
+// dir-suite (python -m pytest / pytest / uv run pytest over a static
+// glob/directory — what python-ci's test-command input centralizes) FAILS
+// drift-check with remediation naming python-ci.yml@<ref>. Same boundary
+// grammar: concrete .py files (incl. `::` node-ids) file-specific; artifact
+// segments neutral; dirs under an `e2e` segment are the e2e-harness class
+// (tortoise hosted-e2e runs tests/e2e/hosted/); `--collect-only` is a probe
+// (never executes tests); dynamic targets and changed-files loops neutral;
+// services/strategy/container/uses jobs suppressed. Enforced live over the
+// wired consumers (tortoise + premise-labs acceptance gate).
 
 /** Build-output directory names — client-build class (issue-named repo-specific). */
 const ARTIFACT_DIRS = ['dist', 'build', 'out', '.next'];
@@ -137,6 +148,60 @@ const TEST_LOOKING = /tests?\/|__tests__|\.test\.|\.spec\./;
 
 /** Concrete source-file extensions → file-specific (repo-specific class). */
 const SOURCE_EXT = /\.(?:js|mjs|cjs|ts|mts|cts|jsx|tsx)$/i;
+
+/** Python test-source extension → file-specific (repo-specific class). */
+const PY_SOURCE_EXT = /\.py$/i;
+
+/**
+ * uv run flags that consume a separate value token (space form). Skipped
+ * WITH their value so the scan lands on the actual pytest/python runner
+ * (`uv run --extra test python -m pytest tests/` → suite). Flags without
+ * values (--frozen / --active / --no-sync / --locked / …) are skipped singly.
+ */
+const UV_RUN_VALUE_FLAGS = new Set([
+  '--extra', '--group', '--with', '--with-editable', '--with-requirements',
+  '--directory', '--python-platform', '--python', '--index',
+  '--default-index', '--extra-index-url', '--find-links', '--exclude-newer',
+  '--exclude-newer-package', '--package', '--project', '--only-group',
+  '--no-build-package', '--no-binary-package', '--cache-dir',
+  '--allow-insecure-host',
+  '-p', '-w', '-f', '-i', '-P', '-C',
+]);
+
+/**
+ * Pytest flags that consume a separate value token (space form). Space-form
+ * flags BEFORE a target must not be mistaken for the target (`-m smoke
+ * tests/foo.py` → the file stays the target; `-m "not e2e" tests/` → the
+ * dir still flags). `=value` forms are single tokens (already flag-skipped).
+ * Covers the core pytest + common plugin (pytest-timeout / pytest-cov /
+ * pytest-xdist / logging) surface used in CI. Documented limitation: a
+ * pytest flag NOT listed here that takes a space-form value before a
+ * concrete-file target would misread its value as the target (precision
+ * trade-off mirroring #389's explicit flag-list approach).
+ */
+const PYTEST_VALUE_FLAGS = new Set([
+  '-m', '-k', '-p', '-o', '-c', '-n', '-r', '-W',
+  '--ignore', '--deselect', '--cov', '--timeout', '--junitxml',
+  '--basetemp', '--rootdir', '--confcutdir', '--tb', '--pyargs',
+  '--maxfail', '--durations', '--capture', '--color', '--show-capture',
+  '--dist', '--numprocesses', '--max-worker-restart',
+  '--log-level', '--log-cli-level', '--log-format', '--log-file',
+  '--log-file-mode', '--log-file-level', '--result-log', '--report-log',
+  '--cov-config', '--cov-report', '--cov-fail-under', '--timeout-method',
+  '--ignore-glob', '--last-failed-no-failures', '--cache-show',
+  '--html', '--base-url', '--override-ini', '--pdbcls',
+]);
+
+/**
+ * E2E-harness directory marker (#403). python dir-suite targets whose
+ * collapsed path contains an `e2e` segment are the repo-specific e2e-harness
+ * class (tortoise hosted-e2e runs `python -m pytest tests/e2e/hosted/`), NOT
+ * generic dir-suites: the reusable python capability (pip install pytest +
+ * test-command) does not express the harness structure (embedded servers,
+ * log monitors, parity assertions). Name-keyed precision boundary mirroring
+ * ARTIFACT_DIRS (#389 plan rev 5). Node/tsx/vitest targets are untouched.
+ */
+const E2E_DIRS = ['e2e'];
 
 /** Dynamic-target markers. */
 const DYNAMIC = /\$\{\{|\$\(|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^}]*\}|\$@|\$[1-9]/;
@@ -492,16 +557,29 @@ function positionalIndexes(tokens, valueFlags) {
 
 /**
  * Classify a primary target token. Returns 'suite' | 'neutral'.
- * Order: dynamic → artifact → glob → file-specific → dir/bare.
+ * Order: dynamic → artifact (+ runner-specific neutral dirs) → glob →
+ * file-specific → dir/bare. opts.sourceExt / opts.neutralDirs let the
+ * python rule carve .py files and e2e-harness dirs without touching the
+ * node/tsx/vitest boundary (#403).
  */
 function classifyTarget(tok, opts = {}) {
   const t = stripTokenQuotes(String(tok));
   if (!opts.ignoreTargetDynamics && DYNAMIC.test(t)) return 'neutral';
   const segs = collapsePath(t.replace(/^\.\//, ''));
-  if (segs.some((seg) => ARTIFACT_DIRS.includes(seg))) return 'neutral';
+  if (segs.some((seg) => ARTIFACT_DIRS.includes(seg) || (opts.neutralDirs || []).includes(seg))) return 'neutral';
   if (/[*?[]/.test(t)) return 'suite'; // glob
-  if (SOURCE_EXT.test(t)) return 'neutral'; // concrete file
+  if ((opts.sourceExt || SOURCE_EXT).test(t)) return 'neutral'; // concrete file
   return 'suite'; // directory or bare
+}
+
+/**
+ * python dir-suite target classifier. `::` node-id tails collapse to the
+ * concrete file (`tests/foo.py::test_bar` → file-specific); `.py` is the
+ * file extension; paths under an `e2e` segment are the e2e-harness class.
+ */
+function classifyPythonTarget(tok, opts = {}) {
+  const t = String(stripTokenQuotes(tok)).split('::')[0];
+  return classifyTarget(t, Object.assign({}, opts, { sourceExt: PY_SOURCE_EXT, neutralDirs: E2E_DIRS }));
 }
 
 /** First line of a command, truncated for diagnostics. */
@@ -519,7 +597,60 @@ function matchRunner(text, opts = {}) {
   if (nodeHit) return nodeHit;
   const vitestHit = matchVitest(tokens, opts);
   if (vitestHit) return vitestHit;
-  return matchTsx(tokens, opts);
+  const tsxHit = matchTsx(tokens, opts);
+  if (tsxHit) return tsxHit;
+  return matchPytest(tokens, opts);
+}
+
+/**
+ * pytest dir-suite runner detection (#403). Forms: `pytest <target>`, `python
+ * -m pytest <target>` (interpreter python | python3 | python3.12), optionally
+ * wrapped in `uv run`. Shares the node target grammar (dynamic/artifact/
+ * glob/file/dir) plus the python-specific classes: concrete .py files (incl.
+ * `::` node-ids) are file-specific; targets under an `e2e` segment are the
+ * e2e-harness class; `--collect-only` is a probe (never executes tests).
+ * Pattern 'pytest' maps remediation to python-ci.yml test-command (python-ci
+ * has no test-glob input).
+ */
+function matchPytest(tokens, opts) {
+  let base = 0;
+  if (tokens[0] === 'uv' && tokens[1] === 'run') {
+    base = 2;
+    // Value-taking uv flags (--extra test, --group dev, --with ruff) advance
+    // PAST flag+value so the runner is found; valueless flags (--frozen,
+    // --active, --no-sync) are skipped singly. A value token that is itself
+    // `pytest` is consumed (`uv run --with pytest -c 'code'` is NOT a suite).
+    while (base < tokens.length && tokens[base].startsWith('-')) {
+      if (UV_RUN_VALUE_FLAGS.has(tokens[base])) base += 2;
+      else base += 1;
+    }
+  }
+  if (base >= tokens.length) return null;
+  let pIdx = -1;
+  if (tokens[base] === 'pytest') pIdx = base;
+  else if (/^python\d*(?:\.\d+)?$/.test(tokens[base])) {
+    // Scan for the `-m pytest` module pair, skipping dash flags. -W / -X
+    // are value-taking interpreter flags (`python -W error -m pytest`, `-X
+    // dev`) — consume their value token so it isn't read as a positional.
+    for (let j = base + 1; j < tokens.length; j++) {
+      if (tokens[j] === '-m') {
+        if (tokens[j + 1] === 'pytest') { pIdx = j + 1; break; }
+        break; // -m with another module → not a pytest run
+      }
+      if (tokens[j] === '-W' || tokens[j] === '-X') { j++; continue; }
+      if (!tokens[j].startsWith('-')) break; // positional before -m → not the module form
+    }
+  }
+  if (pIdx === -1) return null;
+  const tail = tokens.slice(pIdx + 1);
+  if (tail.includes('--collect-only')) return null; // probe — collects, never runs
+  const pos = positionalIndexes(tail, PYTEST_VALUE_FLAGS);
+  if (!pos.length) {
+    if (tail.includes('--help') || tail.includes('--version')) return null; // probe
+    return { pattern: 'pytest', command: null }; // bare → rootdir dir-suite
+  }
+  if (classifyPythonTarget(tail[pos[0]], opts) === 'neutral') return null;
+  return { pattern: 'pytest', command: null };
 }
 
 /** node --test: exact `--test` before the first positional after the runner. */
@@ -594,7 +725,10 @@ function matchTsx(tokens, opts) {
 /**
  * Anchored loop classification. Only commands STARTING with for/while are
  * loops; the verdict governs the whole span (opaque to segment processing).
- * Executed-heredoc bodies are OR'd into the body check.
+ * Executed-heredoc bodies are OR'd into the body check. Returns
+ * { pattern } — 'loop' for node-family bodies, 'pytest' when the loop body's
+ * suite is a pytest dir-suite (the python capability, so remediation names
+ * python-ci.yml; #403).
  */
 function matchAnchoredLoop(prepared) {
   const text = prepared.text.trim();
@@ -610,26 +744,44 @@ function matchAnchoredLoop(prepared) {
   // Body suite check — reuses the full runner classification, target
   // dynamics IGNORED (the iterable's staticness IS the dynamic decision).
   const body = loop.body || '';
-  if (suitePresentInText(body)) return { pattern: 'loop', command: null };
-  for (const eb of prepared.executedBodies) {
-    if (suitePresentInText(eb)) return { pattern: 'loop', command: null };
+  let family = suiteFamilyInText(body);
+  if (!family) {
+    for (const eb of prepared.executedBodies) {
+      family = suiteFamilyInText(eb);
+      if (family) break;
+    }
   }
-  return null;
+  if (!family) return null;
+  // e2e-harness iterables are repo-specific for the python family (mirrors
+  // the direct-form E2E_DIRS carve — a static python glob loop over
+  // tests/e2e/*.py must not flag; node-family loops are unchanged).
+  if (family === 'pytest'
+      && collapsePath(String(iterable).replace(/^\.\//, ''))
+        .some((seg) => E2E_DIRS.includes(seg))) return null;
+  return { pattern: family };
 }
 
-/** True when the text contains a suite invocation (loop-body context). */
-function suitePresentInText(text) {
+/**
+ * Return the suite-runner family present in text: 'pytest' when a pytest
+ * dir-suite invocation is found, 'loop' for any other (node/vitest/tsx)
+ * suite. Loop-body context (target dynamics ignored).
+ */
+function suiteFamilyInText(text) {
   const prepared = prepareCommand(text);
-  if (matchAnchoredLoop(prepared)) return true;
+  const loopHit = matchAnchoredLoop(prepared);
+  if (loopHit) return loopHit.pattern;
   for (const eb of prepared.executedBodies) {
-    if (suitePresentInText(eb)) return true;
+    const f = suiteFamilyInText(eb);
+    if (f) return f;
   }
   for (const seg of splitSegments(prepared.text)) {
     const { text: stripped, innerHit } = stripHeadWrappers(seg);
-    if (innerHit) return true;
-    if (stripped && matchRunner(stripped, { ignoreTargetDynamics: true })) return true;
+    if (innerHit) return innerHit.pattern === 'pytest' ? 'pytest' : 'loop';
+    if (!stripped) continue;
+    const hit = matchRunner(stripped, { ignoreTargetDynamics: true });
+    if (hit) return hit.pattern === 'pytest' ? 'pytest' : 'loop';
   }
-  return false;
+  return null;
 }
 
 /** Parse an anchored for/while loop. Returns null or { iterable, src, body }. */
@@ -657,7 +809,7 @@ function prepareCommand(command) {
 
 /**
  * Classify one run command. Returns null or { pattern, command }.
- * pattern ∈ 'node --test' | 'vitest' | 'tsx --test' | 'loop'.
+ * pattern ∈ 'node --test' | 'vitest' | 'tsx --test' | 'loop' | 'pytest'.
  */
 function matchGenericSuite(command) {
   const prepared = prepareCommand(command);
@@ -665,7 +817,7 @@ function matchGenericSuite(command) {
   // (a neutral anchored loop is opaque — no fall-through to segments).
   const loopHit = matchAnchoredLoop(prepared);
   if (loopHit === null && /^(for|while)\b/.test(prepared.text.trim())) return null;
-  if (loopHit) return { pattern: 'loop', command: previewCommand(command) };
+  if (loopHit) return { pattern: loopHit.pattern, command: previewCommand(command) };
   for (const body of prepared.executedBodies) {
     const hit = matchGenericSuite(body); // recursive (executed heredoc body)
     if (hit) return hit;
@@ -721,10 +873,29 @@ function checkInlineGenericJobs(targetDir, ciRef) {
   return findings;
 }
 
+// Per-pattern reusable-capability mapping (#389 plan rev 5 + #403). Each
+// finding pattern remediates to the reusable workflow that centralizes that
+// capability, with the input that expresses the shape: node --test over a
+// static glob → node-ci test-glob; vitest/tsx/loop → node-ci test-command;
+// pytest dir-suites → python-ci test-command (python-ci has no test-glob).
+const REMEDIATION = {
+  'node --test': { workflow: 'node-ci.yml', input: 'test-glob' },
+  vitest: { workflow: 'node-ci.yml', input: 'test-command' },
+  'tsx --test': { workflow: 'node-ci.yml', input: 'test-command' },
+  loop: { workflow: 'node-ci.yml', input: 'test-command' },
+  pytest: { workflow: 'python-ci.yml', input: 'test-command' },
+};
+
+/** Remediation capability for a finding pattern (null when unknown). */
+function remediationFor(pattern) {
+  return REMEDIATION[pattern] || null;
+}
+
 module.exports = {
   AGENT_INFRA_WORKFLOW_PREFIX,
   REUSABLE_WORKFLOWS,
   ARTIFACT_DIRS,
+  REMEDIATION,
   parseUsesRefs,
   agentInfraUses,
   workflowFilesIn,
@@ -734,4 +905,5 @@ module.exports = {
   findInlineGenericTestJobs,
   checkInlineGenericJobs,
   matchGenericSuite,
+  remediationFor,
 };
