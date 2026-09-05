@@ -1296,18 +1296,22 @@ try {
   // pushd and popd (`pushd wt; cd sub; popd` → bash cwd is the HUB; pop-last
   // would resolve the wt → bypass). Bare/flag/empty-stack forms → null marker
   // (conservative). Bash-probe-verified semantics (2026-08-28, bash 3.2).
-  m4t("T122: pushd wt && git commit && popd — THE FIX", `pushd "${wtR}" && git commit -m x && popd`, "allowed");
-  m4t("T123: pushd hub → block (chain [hub] → hub)", `pushd "${hubR}" && git commit -m x`, "block");
-  m4t("T124: bare pushd → block (null marker)", `pushd && git commit -m x`, "block");
-  m4t("T125: cd wt && pushd hub → block (chain [wt, hub] → hub)", `cd "${wtR}" && pushd "${hubR}" && git commit -m x`, "block");
-  m4t("T126: pushd wt && cd subdir && popd → block (D1: popd restores hub — bypass pin)", `pushd "${wtR}" && cd subdir && popd && git commit -m x`, "block");
-  m4t("T127: pushd wt && popd → block (popd returns to hub)", `pushd "${wtR}" && popd && git commit -m x`, "block");
-  m4t("T128: cd wt && pushd hub && popd → allowed (popd returns to wt)", `cd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
-  m4t("T129: pushd -n wt → block (flag form never cds → conservative)", `pushd -n "${wtR}" && git commit -m x`, "block");
-  m4t("T130: pushd wt | cat → block (pipe segment does not leak)", `pushd "${wtR}" | cat && git commit -m x`, "block");
-  m4t("T131: ( pushd wt ) → block (subshell does not leak)", `( pushd "${wtR}" ) && git commit -m x`, "block");
-  m4t("T132: pushd wt && pushd hub && popd → allowed (nested pushd — popd restores the 1st target)", `pushd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
-  m4t("T133: pushd wt && pushd hub && popd && popd → block (double popd — restores hub)", `pushd "${wtR}" && pushd "${hubR}" && popd && popd && git commit -m x`, "block");
+  // #371 renumber: the #354 pushd/popd base block collided with #355's
+  // gitdir/worktree block (both T122-T133 on main). #355 keeps T122-T133; the
+  // pushd lineage continues T153+ (T150-T152 were taken by this lineage's own
+  // follow-on popd rounds), so this base block renumbers T122-T133 → T153-T164.
+  m4t("T153: pushd wt && git commit && popd — THE FIX", `pushd "${wtR}" && git commit -m x && popd`, "allowed");
+  m4t("T154: pushd hub → block (chain [hub] → hub)", `pushd "${hubR}" && git commit -m x`, "block");
+  m4t("T155: bare pushd → block (null marker)", `pushd && git commit -m x`, "block");
+  m4t("T156: cd wt && pushd hub → block (chain [wt, hub] → hub)", `cd "${wtR}" && pushd "${hubR}" && git commit -m x`, "block");
+  m4t("T157: pushd wt && cd subdir && popd → block (D1: popd restores hub — bypass pin)", `pushd "${wtR}" && cd subdir && popd && git commit -m x`, "block");
+  m4t("T158: pushd wt && popd → block (popd returns to hub)", `pushd "${wtR}" && popd && git commit -m x`, "block");
+  m4t("T159: cd wt && pushd hub && popd → allowed (popd returns to wt)", `cd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
+  m4t("T160: pushd -n wt → block (flag form never cds → conservative)", `pushd -n "${wtR}" && git commit -m x`, "block");
+  m4t("T161: pushd wt | cat → block (pipe segment does not leak)", `pushd "${wtR}" | cat && git commit -m x`, "block");
+  m4t("T162: ( pushd wt ) → block (subshell does not leak)", `( pushd "${wtR}" ) && git commit -m x`, "block");
+  m4t("T163: pushd wt && pushd hub && popd → allowed (nested pushd — popd restores the 1st target)", `pushd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
+  m4t("T164: pushd wt && pushd hub && popd && popd → block (double popd — restores hub)", `pushd "${wtR}" && pushd "${hubR}" && popd && popd && git commit -m x`, "block");
   // ── #366 review (P1 SECURITY BYPASS, round-2): popd ARG forms keep cwd at
   // the CURRENT stack top — the HUB for a wt→hub pushd chain — so truncating
   // to the pre-pushd boundary would resolve the chain to the wt and exempt a
@@ -1354,7 +1358,7 @@ try {
   m4t("T144: popd +0 \"\" → block (empty operand after +0 clobbers the truncate — round-3 pin)", `cd "${wtR}" && pushd "${hubR}" && popd +0 "" && git commit -m x`, "block");
   m4t("T145: popd \"\" +0 → block (empty operand before +0 — round-3 pin)", `cd "${wtR}" && pushd "${hubR}" && popd "" +0 && git commit -m x`, "block");
   m4t("T146: popd +0 '' '' → block (multiple empty operands — round-3 pin)", `cd "${wtR}" && pushd "${hubR}" && popd +0 '' '' && git commit -m x`, "block");
-  // Control: the T128 pin above already covers bare `popd` → allowed; re-pin
+  // Control: the T159 pin above already covers bare `popd` → allowed; re-pin
   // here so the round-3 block list has its control adjacent.
   m4t("T147: bare popd → allowed (CONTROL — round-3 control unchanged)", `cd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`, "allowed");
   expectBool("#366 round-3: empty-quoted popd operand → null marker in cdChain (never a truncate)", (() => {
@@ -1469,8 +1473,8 @@ try {
     return invs[0].cdChain.length === 1 && invs[0].cdChain[0] === wtR && invs[1].cdChain.length === 0;
   })(), true);
   expectBool("#354: empty-stack popd → null marker (conservative)", allGitInvocations(`popd && git commit -m x`)[0].cdChain[0] === null, true);
-  expectBool("#354: popd restores PRE-pushd chain across an intervening cd (T126 shape pin)", allGitInvocations(`pushd "${wtR}" && cd subdir && popd && git commit -m x`)[0].cdChain.length === 0, true);
-  expectBool("#354: nested pushd single popd restores the 1st pushd target (T132 shape pin)", (() => {
+  expectBool("#354: popd restores PRE-pushd chain across an intervening cd (T157 shape pin)", allGitInvocations(`pushd "${wtR}" && cd subdir && popd && git commit -m x`)[0].cdChain.length === 0, true);
+  expectBool("#354: nested pushd single popd restores the 1st pushd target (T163 shape pin)", (() => {
     const inv = allGitInvocations(`pushd "${wtR}" && pushd "${hubR}" && popd && git commit -m x`)[0];
     return inv.cdChain.length === 1 && inv.cdChain[0] === wtR;
   })(), true);
