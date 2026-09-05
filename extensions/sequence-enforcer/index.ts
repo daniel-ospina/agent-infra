@@ -338,24 +338,20 @@ export function resolveMode(
 
 // #377: session attribution for audit entries. The pi session id is captured
 // from the event ctx (ctx.sessionManager.getSessionId — the authoritative
-// in-process source: pi injects PI_SESSION_ID only into bash-tool child envs,
-// never the extension-host env, and an inherited env value would misattribute
-// a nested session to its outer launcher) and stamped onto every enforcement
-// entry, so probe/test pollution is attributable and the positive-audit gate
-// (#357 criterion 16) can name exactly which sessions started after a deploy.
+// in-process source) and stamped onto every enforcement entry, so probe/test
+// pollution is attributable and the positive-audit gate (#357 criterion 16)
+// can name exactly which sessions started after a deploy.
 let auditSessionId: string | null = null;
 // Test seam: force a deterministic session id (honored only under
-// NODE_ENV=test — mirrors _setAuditSinkForTest; an override installed here
-// wins over ctx resolution, so tests can drive the timeout/timer audit paths
-// that carry no ctx).
+// NODE_ENV=test — mirrors _setAuditSinkForTest / _setForceFileForTest / other
+// sibling seams where null DEACTIVATES the override). With an override active,
+// capture short-circuits ctx resolution, so tests can drive the no-ctx audit
+// paths (timeout/timer) deterministically.
 let auditSessionOverride: { active: boolean; id: string | null } = { active: false, id: null };
 export function _setAuditSessionIdForTest(id: string | null): void {
   if (process.env.NODE_ENV !== "test") return;
-  auditSessionOverride = { active: true, id };
-  // Also populate the current value immediately — the seam is the capture for
-  // no-ctx audit paths (timeout/timer), so callers should not need to route a
-  // fake session_start first.
-  auditSessionId = id;
+  auditSessionOverride = { active: id !== null, id };
+  if (id !== null) auditSessionId = id;
 }
 
 // Test getter: read the captured session id under NODE_ENV=test (mirrors
@@ -365,23 +361,44 @@ export function _auditSessionIdForTest(): string | null {
   return process.env.NODE_ENV === "test" ? auditSessionId : null;
 }
 
-// Resolve the session id from the event ctx, with PI_SESSION_ID env as a
-// last-resort fallback for non-pi-host execution. ctx-first ordering is
-// deliberate (#377 scope review P2): main-worktree-guard reads env first for
-// ITS bash-child scopes, but this extension only ever runs in the extension
-// host where ctx.sessionManager is the sole authoritative source.
+// Resolve the session id from the event ctx. ctx is the SOLE authoritative
+// source — there is deliberately NO process.env.PI_SESSION_ID fallback
+// (#377 scope + code review P2): pi injects PI_SESSION_ID into bash-tool child
+// envs (and create-harness execution envs), so a nested pi launched inside an
+// outer session's bash tool inherits the OUTER id; falling back to it would
+// stamp the outer session on the nested stream — the exact probe-misattribution
+// failure this issue exists to close (loop-enforcer precedent: ctx-only,
+// null when unresolvable; an unattributed entry beats a misattributed one).
+// ctx.sessionManager is a lazy getter in pi's runner that can throw when the
+// runner is stale (assertActive) — the try/catch keeps captureAuditSession
+// throw-free at every call site (#383 P3-2 "never let an external surface
+// throw" convention).
 function resolveSessionId(ctx: { sessionManager?: { getSessionId?: () => string } } | undefined): string | null {
-  return ctx?.sessionManager?.getSessionId?.() ?? process.env.PI_SESSION_ID ?? null;
+  try {
+    return ctx?.sessionManager?.getSessionId?.() ?? null;
+  } catch {
+    return null; // stale runner ctx — keep prior captured id, never throw
+  }
 }
 
+let sessionIdWarned = false;
+
 // Capture at an event boundary. Under test with an override installed, the
-// override wins so direct helper/timer audit paths are deterministic.
+// override wins so direct helper/timer audit paths are deterministic. Never
+// throws (resolveSessionId swallows; override path is pure assignment).
 function captureAuditSession(ctx: { sessionManager?: { getSessionId?: () => string } } | undefined): void {
   if (process.env.NODE_ENV === "test" && auditSessionOverride.active) {
     auditSessionId = auditSessionOverride.id;
     return;
   }
   auditSessionId = resolveSessionId(ctx);
+  // Loud-diagnosis convention (#383): a systemic inability to attribute must
+  // not be silent (the downstream gate reads null as "no session"). One-time
+  // warn per process, production only (tests drive ctx fixtures / override).
+  if (auditSessionId === null && process.env.NODE_ENV !== "test" && !sessionIdWarned) {
+    sessionIdWarned = true;
+    try { console.warn("[sequence-enforcer] ⚠️ audit session_id unresolvable (ctx.sessionManager absent) — entries stamped null"); } catch { /* last resort */ }
+  }
 }
 
 // Test seam: tests inject a sink to capture entries without writing to the
@@ -469,12 +486,22 @@ export interface ReadEnforcementLogResult {
 }
 
 // Small enforcement.jsonl reader (the enforcement SKILL.md "reader is a
-// swarm-side follow-up" note). Tolerant: missing file → empty, malformed
-// lines skipped (counted), never throws. Entries return in file order
+// swarm-side follow-up" note). Tolerant on DATA (missing file → empty,
+// malformed lines skipped and counted, never throws) but fail-closed on
+// FILTER INPUT: an unparseable `since`, or a non-positive `limit`, returns an
+// empty result rather than silently dropping the filter and over-reporting
+// (the #357-16 gate must never answer "every startup session since the
+// beginning of the log" on a typo'd ts). Entries return in file order
 // (append-only → chronological). Missing session_id (pre-#377 lines) equals
 // null under a sessionId filter — excluded, never a crash.
+// Semantics: events: [] or undefined = no event filter; limit: undefined = no
+// cap, limit <= 0 = empty result; since: undefined = no filter.
 export function readEnforcementLog(opts: ReadEnforcementLogOptions = {}): ReadEnforcementLogResult {
   const file = opts.file ?? enforcementLogFile();
+  // Fail-closed on filter input before touching the file.
+  if (opts.limit !== undefined && opts.limit <= 0) return { entries: [], skipped: 0 };
+  const sinceMs = opts.since !== undefined ? Date.parse(opts.since) : NaN;
+  if (opts.since !== undefined && Number.isNaN(sinceMs)) return { entries: [], skipped: 0 };
   let raw: string;
   try {
     raw = readFileSync(file, "utf-8");
@@ -483,7 +510,6 @@ export function readEnforcementLog(opts: ReadEnforcementLogOptions = {}): ReadEn
   }
   const entries: EnforcementLogEntry[] = [];
   let skipped = 0;
-  const sinceMs = opts.since !== undefined ? Date.parse(opts.since) : NaN;
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -511,7 +537,7 @@ export function readEnforcementLog(opts: ReadEnforcementLogOptions = {}): ReadEn
     }
     entries.push(entry);
   }
-  if (opts.limit !== undefined && opts.limit > 0 && entries.length > opts.limit) {
+  if (opts.limit !== undefined && entries.length > opts.limit) {
     return { entries: entries.slice(entries.length - opts.limit), skipped };
   }
   return { entries, skipped };

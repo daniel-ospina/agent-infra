@@ -2973,18 +2973,23 @@ await test("session_start captures ctx session id and startup audit entry carrie
   const { pi, handlers } = fakePi();
   auditCapture();
   try {
-    sequenceEnforcer(pi as any);
-    // ctx with sessionManager.getSessionId() → authoritative in-process source.
-    const ctx = { sessionManager: { getSessionId: () => "sess-377a" } };
-    await handlers.session_start!({ type: "session_start", reason: "startup" }, ctx);
-    const startup = auditEntries.find((x) => x.event === "startup");
-    ok(startup, "startup entry emitted");
-    equal(startup!.session_id, "sess-377a", "startup entry carries the ctx session id");
-    equal(_auditSessionIdForTest(), "sess-377a", "module captured id from ctx (ctx-first)");
+    await withEnv(
+      { PI_SESSION_ID: undefined, PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        // ctx with sessionManager.getSessionId() → authoritative in-process source.
+        const ctx = { sessionManager: { getSessionId: () => "sess-377a" } };
+        await handlers.session_start!({ type: "session_start", reason: "startup" }, ctx);
+        const startup = auditEntries.find((x) => x.event === "startup");
+        ok(startup, "startup entry emitted");
+        equal(startup!.session_id, "sess-377a", "startup entry carries the ctx session id");
+        equal(_auditSessionIdForTest(), "sess-377a", "module captured id from ctx (ctx-first)");
+      },
+    );
   } finally { auditRelease(); }
 });
 
-await test("no ctx + no env → session_id is null on entries (always-present key)", async () => {
+await test("no ctx → session_id is null on entries (always-present key)", async () => {
   _resetStateForTest();
   const { pi, handlers } = fakePi();
   auditCapture();
@@ -3003,39 +3008,66 @@ await test("no ctx + no env → session_id is null on entries (always-present ke
   } finally { auditRelease(); }
 });
 
-await test("env PI_SESSION_ID fallback when no ctx (non-pi-host execution)", async () => {
+await test("env PI_SESSION_ID is NOT consulted (ctx-only — closes the inherited-env misattribution channel)", async () => {
   _resetStateForTest();
   const { pi, handlers } = fakePi();
   auditCapture();
   try {
     await withEnv(
-      { PI_SESSION_ID: "sess-env-9", PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      // Host env carries an (inherited, outer-session) id; no ctx → must NOT
+      // stamp it (a nested pi inside an outer bash tool inherits the outer id).
+      { PI_SESSION_ID: "sess-env-outer", PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
       async () => {
         sequenceEnforcer(pi as any);
-        await handlers.session_start!(); // no ctx → env fallback
+        await handlers.session_start!(); // no ctx
         const startup = auditEntries.find((x) => x.event === "startup");
-        equal(startup!.session_id, "sess-env-9", "env PI_SESSION_ID used as last-resort fallback");
+        equal(startup!.session_id, null, "env PI_SESSION_ID is never used as a fallback (probe-misattribution channel closed)");
       },
     );
   } finally { auditRelease(); }
 });
 
-await test("blocked/allowed/timeout-park entries all carry the captured session id", async () => {
+await test("blocked/allowed entries carry the ctx session id at the tool_call boundary", async () => {
   _resetStateForTest();
   const { pi, handlers } = fakePi();
   auditCapture();
   try {
     await withEnv(
-      { PI_SESSION_ID: "sess-377b", PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      { PI_SESSION_ID: undefined, PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
       async () => {
         sequenceEnforcer(pi as any);
-        await handlers.session_start!();
+        const ctx = { sessionManager: { getSessionId: () => "sess-377b" } };
+        await handlers.session_start!({ type: "session_start", reason: "startup" }, ctx);
         // blocked at a pending checkpoint
         _pushSkillForTest("/repo/skills/check/SKILL.md", [makeStep({ name: "check", gate: "checkpoint", token_phase: "plan" })], 0);
-        await handlers.tool_call!({ toolName: "bash", toolCallId: "s1", input: { command: "rm -rf /" } });
+        await handlers.tool_call!({ toolName: "bash", toolCallId: "s1", input: { command: "rm -rf /" } }, ctx);
         const blocked = auditEntries.filter((x) => x.event === "blocked");
         ok(blocked.length >= 1, "blocked entry present");
-        ok(blocked.every((x) => x.session_id === "sess-377b"), "blocked entries carry session id");
+        ok(blocked.every((x) => x.session_id === "sess-377b"), "blocked entries carry the ctx session id");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("captureAuditSession never throws on a throwing ctx.sessionManager getter (stale runner)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_SESSION_ID: undefined, PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        // pi's ctx.sessionManager is a lazy getter that can throw (assertActive
+        // on a stale runner) — capture must swallow, never propagate.
+        const staleCtx = { get sessionManager() { throw new Error("stale runner"); } };
+        await handlers.session_start!({ type: "session_start", reason: "startup" }, staleCtx as any);
+        const startup = auditEntries.find((x) => x.event === "startup");
+        ok(startup, "startup entry STILL emitted despite throwing ctx getter");
+        equal(startup!.session_id, null, "unresolvable (throwing) ctx → null, no throw");
+        // subsequent ctx-less handler also does not throw
+        await handlers.session_shutdown!();
+        ok(true, "session_shutdown with no ctx completed without throwing");
       },
     );
   } finally { auditRelease(); }
@@ -3047,10 +3079,11 @@ await test("module-level captured session id is dropped at session_shutdown (no 
   auditCapture();
   try {
     await withEnv(
-      { PI_SESSION_ID: "sess-shutdown", PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      { PI_SESSION_ID: undefined, PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
       async () => {
         sequenceEnforcer(pi as any);
-        await handlers.session_start!();
+        const ctx = { sessionManager: { getSessionId: () => "sess-shutdown" } };
+        await handlers.session_start!({ type: "session_start", reason: "startup" }, ctx);
         equal(_auditSessionIdForTest(), "sess-shutdown", "captured before shutdown");
         await handlers.session_shutdown!();
         equal(_auditSessionIdForTest(), null, "dropped at shutdown — a stale write can never be misattributed");
@@ -3059,13 +3092,11 @@ await test("module-level captured session id is dropped at session_shutdown (no 
   } finally { auditRelease(); }
 });
 
-await test("_resetStateForTest clears the session override + captured id (reset contract)", async () => {
+await test("_setAuditSessionIdForTest(null) deactivates the override (sibling-seam convention)", async () => {
   _resetStateForTest();
   _setAuditSessionIdForTest("sess-override-1");
   equal(_auditSessionIdForTest(), "sess-override-1", "override captured");
-  _resetStateForTest();
-  equal(_auditSessionIdForTest(), null, "reset drops captured id");
-  // override inactive → a ctx-less session_start resolves to null, not the stale override
+  _setAuditSessionIdForTest(null);
   const { pi, handlers } = fakePi();
   auditCapture();
   try {
@@ -3073,12 +3104,20 @@ await test("_resetStateForTest clears the session override + captured id (reset 
       { PI_SESSION_ID: undefined, PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
       async () => {
         sequenceEnforcer(pi as any);
-        await handlers.session_start!();
+        await handlers.session_start!(); // ctx-less, override deactivated
         const startup = auditEntries.find((x) => x.event === "startup");
-        equal(startup!.session_id, null, "no stale override after reset");
+        equal(startup!.session_id, null, "null deactivates — a ctx-less session_start resolves to null, not a forced value");
       },
     );
-  } finally { auditRelease(); }
+  } finally { auditRelease(); _resetStateForTest(); }
+});
+
+await test("_resetStateForTest clears the session override + captured id (reset contract)", async () => {
+  _resetStateForTest();
+  _setAuditSessionIdForTest("sess-override-1");
+  equal(_auditSessionIdForTest(), "sess-override-1", "override captured");
+  _resetStateForTest();
+  equal(_auditSessionIdForTest(), null, "reset drops captured id");
 });
 
 await test("audit sink override forces a deterministic session id (test seam)", async () => {
@@ -3093,7 +3132,7 @@ await test("audit sink override forces a deterministic session id (test seam)", 
         sequenceEnforcer(pi as any);
         await handlers.session_start!();
         const startup = auditEntries.find((x) => x.event === "startup");
-        equal(startup!.session_id, "sess-forced", "override wins over ctx/env for deterministic tests");
+        equal(startup!.session_id, "sess-forced", "override drives a deterministic id for no-ctx test paths");
       },
     );
   } finally { auditRelease(); _setAuditSessionIdForTest(null); _resetStateForTest(); }
@@ -3144,6 +3183,31 @@ await test("events filter narrows to the named event(s)", () => {
   const r = readEnforcementLog({ file, events: ["startup", "blocked"] });
   equal(r.entries.length, 2);
   ok(r.entries.every((x) => x.event === "startup" || x.event === "blocked"));
+});
+
+await test("events: [] is documented as NO event filter (returns all)", () => {
+  const file = join(tmpDir("reader-events-empty"), "enforcement.jsonl");
+  writeFixture(file, [
+    JSON.stringify({ ts: "2026-08-30T01:00:00.000Z", event: "startup", session_id: "s1" }),
+    JSON.stringify({ ts: "2026-08-30T02:00:00.000Z", event: "blocked", session_id: "s2" }),
+  ]);
+  const r = readEnforcementLog({ file, events: [] });
+  equal(r.entries.length, 2, "empty events array = unfiltered (documented semantics)");
+});
+
+await test("fail-closed filter input: limit <= 0 and unparseable since return empty (never silently unfiltered)", () => {
+  const file = join(tmpDir("reader-failclosed"), "enforcement.jsonl");
+  writeFixture(file, [
+    JSON.stringify({ ts: "2026-08-30T01:00:00.000Z", event: "startup", session_id: "a" }),
+    JSON.stringify({ ts: "2026-08-30T02:00:00.000Z", event: "startup", session_id: "b" }),
+  ]);
+  // limit 0 / negative → empty, never "no cap"
+  equal(readEnforcementLog({ file, limit: 0 }).entries.length, 0, "limit 0 → empty");
+  equal(readEnforcementLog({ file, limit: -3 }).entries.length, 0, "negative limit → empty");
+  // unparseable since → empty, never "every entry since the beginning"
+  const bad = readEnforcementLog({ file, since: "not-a-date" });
+  equal(bad.entries.length, 0, "unparseable since → empty (fail-closed for the #357-16 gate)");
+  equal(bad.skipped, 0);
 });
 
 await test("sessionId filter includes exact matches and excludes null + pre-#377 (missing key) lines", () => {
