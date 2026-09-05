@@ -146,6 +146,20 @@ test("missing description tree fails (gate-description-nonstring)", () => {
   assert.match(r.stdout, /\[P0\] frontmatter: gate-description-nonstring/);
 });
 
+test("no-frontmatter file → single root-cause finding, no structural-rule noise (#381 review)", () => {
+  // A file whose frontmatter failed to extract (no opening ---) must report
+  // ONLY the extraction P0 — the data-derived structural rules (subjects.team,
+  // mandatory blocks) must not stack misleading findings on the empty data.
+  const dir = tmpTree({
+    "nofm/SKILL.md": "name: nofm\ndescription: test\nbody\n",
+  });
+  const r = runLint(["--skills-dir", dir], REPO_ROOT);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /\[P0\] frontmatter: extract-missing-opening/);
+  assert.doesNotMatch(r.stdout, /\[P0\] subjects\.team:/);
+  assert.doesNotMatch(r.stdout, /\[P0\] mandatory-blocks:/);
+});
+
 test("explicit --skills-dir <missing> → exit 2 (fail-closed flip, D9)", () => {
   const r = runLint(["--skills-dir", path.join(os.tmpdir(), "no-such-skill-dir-254")], REPO_ROOT);
   assert.equal(r.status, 2);

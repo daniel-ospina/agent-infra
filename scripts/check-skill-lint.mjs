@@ -155,7 +155,15 @@ function lintFile(file, rel) {
 
   const fm = validateFrontmatter(content);
 
-  if (!fm.ok) {
+  // Internal validator error OR a frontmatter that failed to extract
+  // (missing opening/closing `---`, empty) — fm.ok stays true on extract
+  // failures but data is the empty default and deriveData never ran. The
+  // structural rules below (name != dir, allowed-tools, subjects.team,
+  // mandatory blocks) are schema checks over DERIVED frontmatter data — on
+  // a data-less file they would stack misleading findings on top of the
+  // extraction P0. Emit the root-cause findings and stop, matching the
+  // pre-existing defensive behavior of the name/allowed-tools guards.
+  if (!fm.ok || !fm.yamlString) {
     for (const f of fm.findings) issues.push(`[P0] frontmatter: ${f.class} — ${f.message}\n  ${rel}`);
     return issues;
   }
