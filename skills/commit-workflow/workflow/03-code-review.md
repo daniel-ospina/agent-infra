@@ -28,7 +28,7 @@ Pass these ratings to code-review Step 4 dispatch logic. When all empty, the 6 a
 
 ## Step 2 — Code-Review Gate
 
-**Micro tier: skip entirely.** Pre-flight checks (typecheck, tests) are the safety net. Proceed directly to Step 3 (`04-merge-deploy.md`).
+**Micro tier: skip entirely.** No code-review agents are dispatched for Micro — the code-review gate is skipped by design, consistent with the review-enforcer extension being **WARN-ONLY at Micro** (tier read from the `/tmp/agent-issue-complexity` marker; 0 reviewer dispatches warn but do not block — `extensions/review-enforcer/index.ts` micro branch; Standard+/unset block). The safety net at Micro is pre-flight per risk tier (typecheck/tests on code-bearing sets, skipped for Low docs/CSS/static per 01-preflight.md) plus VGATE (content-shape gated — runs on code sets at any tier, exempts docs/CSS/static-only sets). Proceed directly to Step 3 (`04-merge-deploy.md`).
 
 **Standard tier:** Invoke `code-review` with the 6-agent review (guidance, bug scan, security):
 
