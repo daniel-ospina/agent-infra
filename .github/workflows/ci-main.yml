@@ -51,6 +51,18 @@ jobs:
         npx tsx extensions/shared/print-mode.test.ts || failures=$((failures+1))
         echo "== extensions/shared/print-mode-wiring.test.ts =="
         npx tsx extensions/shared/print-mode-wiring.test.ts || failures=$((failures+1))
+        # #382 — the remaining shared/*.test.ts suites (audit-log, process-sweep,
+        # retry, tree-kill) were unwired: the extensions/*/test*.mjs glob above
+        # misses .ts files. Loop the rest, skipping the explicitly-listed ones
+        # (a future shared suite is picked up automatically). Zero-dep tsx route.
+        for t in extensions/shared/*.test.ts; do
+          [ -f "$t" ] || continue  # no-match guard (glob loops elsewhere in this file)
+          case "$t" in
+            extensions/shared/print-mode.test.ts|extensions/shared/print-mode-wiring.test.ts) continue ;;
+          esac
+          echo "== $t =="
+          npx tsx "$t" || failures=$((failures+1))
+        done
         echo "== extensions/auto-sync.test.ts =="
         npx tsx extensions/auto-sync.test.ts || failures=$((failures+1))
         echo "== extensions/session-checks.test.ts =="
