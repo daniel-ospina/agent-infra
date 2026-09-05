@@ -3,6 +3,7 @@ name: task-workflow
 description: Lightweight fractal pipeline for micro tasks (complexity:micro). Routes through all 6 stages inline — no Bounded skill dispatch. Agent applies the phase discipline directly. Standard/complex tasks route to task-workflow-standard.
 type: Workflow
 domain: capability
+subjects.team: organisation-design-team
 status: live
 tags: [pipeline, task, planning, fractal, orchestrator, lightweight]
 summary: "Workflow skill for micro-issues — all 6 pipeline stages applied inline with no sub-skill dispatch. Canonical micro pipeline (task-workflow-micro merged here)."

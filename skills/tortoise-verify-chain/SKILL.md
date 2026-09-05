@@ -10,6 +10,8 @@ domain: capability
 status: live
 allowed-tools: mcp__tortoise__tortoise_check_structure, mcp__tortoise__tortoise_summarize_structure, mcp__tortoise__tortoise_create_point, mcp__tortoise__tortoise_query
 ---
+> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
+> Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 # tortoise:verify-chain
 
@@ -42,3 +44,5 @@ Verify that the product strategy chain (JTBD → useCase → userJourney → wor
 ## Error Handling
 
 - If `tortoise_check_structure` fails, report the error. Do not attempt fixes on a broken query.
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

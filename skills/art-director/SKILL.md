@@ -1,6 +1,7 @@
 ---
 name: art-director
 description: Thin design system orchestrator for the carousel pipeline. Receives carousel content from carousel-b2b-strategy, enforces design rules, validates tokens and safe zones pre-render, and routes post-render output to QA skills. Not a design tool — routes and gates.
+subjects.team: organisation-design-team
 allowed-tools: read bash task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

@@ -2,6 +2,7 @@
 name: test-design
 description: "Use before any feature implementation to map integration surfaces and assign test layers per surface. Produces a structured integration surface map that prevents integration bugs before code is written."
 domain: engineering
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

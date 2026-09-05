@@ -2,6 +2,7 @@
 disable-model-invocation: true
 name: question-format
 description: "Reference protocol for presenting decisions to users. All skills that ask the user to choose between options MUST use this format. Consumed by other skills — not invoked directly."
+subjects.team: organisation-design-team
 type: reference
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 1.2.0

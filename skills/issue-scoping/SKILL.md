@@ -2,6 +2,7 @@
 name: issue-scoping
 description: "MANDATORY before implementing any issue. Double diamond: diverges on problem and solution before converging, with verification gates after each diamond. Produces plan with confirmed problem definition, evaluated alternatives, complexity ratings. Skipping causes unplanned code with no review gates."
 domain: capability
+subjects.team: organisation-design-team
 version: 5.1.0
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---

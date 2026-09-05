@@ -1,6 +1,7 @@
 ---
 name: experiment-analysis
 description: Analyze A/B/n experiment results accounting for mid-experiment fixes, data quality degradation, and issue/PR timelines. Produces a structured analysis report with statistical rigor, data quality tiers, and decision recommendations. Use when asked to "analyze the experiment", "what did the test show", "experiment results", or "should we ship the winner".
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 1.0.0
 ---

@@ -1,6 +1,7 @@
 ---
 name: plan-review
 description: Review-fix cycle for implementation plans. Sits between writing-plans and executing-plans. Launches proportional parallel reviewers, merges issues, fixes with research, and loops until clean or convergence. Invoked by writing-plans after saving the plan doc.
+subjects.team: organisation-design-team
 version: 2.3.0
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 steps:

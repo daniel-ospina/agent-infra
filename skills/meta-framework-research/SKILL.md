@@ -2,6 +2,7 @@
 name: meta-framework-research
 description: "Use when asked to research a domain's ontology, taxonomy, and methodology hierarchy — any domain. Produces a structured meta-framework document with thinkers, frameworks, tensions, and gaps. 7-phase pipeline with parallel sub-agent dispatch and fresh-context review gate."
 domain: capability
+subjects.team: organisation-design-team
 type: Workflow
 status: live
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task

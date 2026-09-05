@@ -2,8 +2,12 @@
 name: enforcement
 description: Manage the sequence-enforcer that gates skill execution. Check mode, change enforcement level, or kill-switch.
 domain: capability
+subjects.team: organisation-design-team
 allowed-tools: bash
 ---
+> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
+> Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
+
 > ⛔ **HUMAN APPROVAL REQUIRED for ALL operations except checking current mode.** Do not change enforcement level, kill enforcement, or re-enable enforcement without explicit human authorization. The kill switch exists as a safety valve for humans — agents must NEVER engage it autonomously. If enforcement is blocking legitimate work, escalate to the human.
 
 # Enforcement
@@ -62,3 +66,5 @@ This is a safety valve for humans. If an agent is blocked by a false positive, e
 ```bash
 cat ~/.pi/agent/audit/enforcement.jsonl
 ```
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

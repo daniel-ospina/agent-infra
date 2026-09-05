@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: shared-research
 description: "Research wrapper for workflows. Routes to research skill with proportional depth. Expands the routing stub with the granularity-ladder mechanics: PRIOR_RESEARCH dedup, gate mechanics (fresh-context brief review), and the output contract (fixed sections + ## Raw Notes + findings-date). Issue #231."
 domain: capability
+subjects.team: organisation-design-team
 type: Routing
 status: live
 tags: [pipeline, shared, research]

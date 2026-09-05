@@ -2,6 +2,7 @@
 name: content-reviewer-depth
 version: 1.0.0
 description: Use when reviewing editorial, guide, or deal content for local depth, unique insights, and audience consistency. Checks that content goes beyond generic travel blog coverage, incorporates unique research findings, and speaks consistently to the right audience (residents for ES, expats/tourists for EN). Returns structured issues and specific fixes. Part of content pipeline v2 post-writing review — run in parallel with other reviewers.
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

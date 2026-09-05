@@ -2,6 +2,7 @@
 disable-model-invocation: true
 name: human-input-framework
 description: "Reference taxonomy for when coding workflow skills should pause for human input vs proceed autonomously. Not invoked directly — consumed by other skills."
+subjects.team: organisation-design-team
 type: reference
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 2.0.0

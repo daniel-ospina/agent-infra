@@ -1,6 +1,7 @@
 ---
 name: skill-sync
 description: "Use after creating, editing, or deleting any skill in agent-infra/skills/. Commits skill changes to the repo for version control and disaster recovery."
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 2.2.0
 ---

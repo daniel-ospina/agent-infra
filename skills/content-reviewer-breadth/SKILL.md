@@ -2,6 +2,7 @@
 name: content-reviewer-breadth
 version: 1.0.0
 description: Use when reviewing editorial, guide, or deal content to ensure nothing essential from the research brief was dropped during writing. Checks neighborhood coverage, cuisine/experience types, price tiers, and partner completeness. Returns structured issues and specific fixes. Part of content pipeline v2 post-writing review — run in parallel with other reviewers.
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

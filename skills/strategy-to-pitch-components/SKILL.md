@@ -1,6 +1,7 @@
 ---
 name: strategy-to-pitch-components
 description: Bridge strategy analysis into hypothesis-driven, culturally-grounded pitch components for the WhatsApp outreach agent — produces TypeScript constants with confidence tracking, manifest, sales research brief. Abundant human gates for tight alignment.
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
