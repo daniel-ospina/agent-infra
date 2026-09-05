@@ -487,8 +487,22 @@ export function tokenizeFrontmatter(yamlString) {
     }
 
     // block scalar header: | > with chomp/explicit-indent modifiers
-    const bm = /^([>|])([+-]?)([1-9]?)(?:[ \t].*)?$/.exec(valueText);
+    const bm = /^([>|])([+-]?)([1-9]?)(?:[ \t]+(.*))?$/.exec(valueText);
     if (bm && bm[1]) {
+      // #370 (P0 false negative): yaml permits ONLY a `#`-prefixed comment
+      // (or bare trailing whitespace) after a block-scalar header on the same
+      // line. Any other token — `| comment`, `| 0`, `> text`, `|1 token` — is
+      // a lex error ("Not a YAML token: <tok>"; probe pi 0.84.3 / yaml 2.9.0)
+      // and pi DROPS the skill. The previous trailing `[ \t].*` matched ANY
+      // text as a "comment", so these emitted a valid header + block body →
+      // typed as string → gate passed → validator clean while pi dropped.
+      // `| #c`, `|  #c` (whitespace run + comment) and `| ` (bare trailing
+      // whitespace) are legal and must keep passing.
+      const afterWs = (bm[4] ?? '').trimStart();
+      if (afterWs !== '' && !afterWs.startsWith('#')) {
+        emit({ t: TOKEN.TOKENIZE_ERROR, kind: 'block-header-trailing', line: lineNo, detail: 'non-comment token after a block scalar header' });
+        return { nextI: startI };
+      }
       emit({ t: TOKEN.VALUE_BLOCK_HEADER, chomp: bm[2] || '', indent: keyIndent, line: lineNo });
       const explicit = bm[3] ? parseInt(bm[3], 10) : null;
       return {
@@ -939,8 +953,10 @@ const ruleThrowBlockSeqInline = (tokens) => tokens
   .map((tk) => finding('throw-block-seq-inline', null, tk.line, 'block sequence on the same line as a key value (yaml: unexpected block-seq-ind on same line with key)'));
 
 const ruleThrowBlockHeader = (tokens) => tokens
-  .filter((tk) => tk.t === TOKEN.TOKENIZE_ERROR && tk.kind === 'block-header')
-  .map((tk) => finding('throw-invalid-block-header', null, tk.line, 'invalid block scalar header (yaml: block scalar header includes extra characters)'));
+  .filter((tk) => tk.t === TOKEN.TOKENIZE_ERROR && (tk.kind === 'block-header' || tk.kind === 'block-header-trailing'))
+  .map((tk) => finding('throw-invalid-block-header', null, tk.line, tk.kind === 'block-header-trailing'
+    ? 'block scalar header followed by a non-comment token (yaml: not a YAML token)'
+    : 'invalid block scalar header (yaml: block scalar header includes extra characters)'));
 
 const ruleDupKey = (tokens) => {
   const out = [];

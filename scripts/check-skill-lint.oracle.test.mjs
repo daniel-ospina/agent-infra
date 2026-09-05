@@ -386,6 +386,18 @@ const VALUE_POOL = [
   "|12",
   "|+0",
   ">0",
+  // #370 — block-scalar header + space + NON-comment token (pi drops: "Not a
+  // YAML token: <tok>"; validator flags throw-invalid-block-header). The
+  // whitespace-run + #-comment forms must stay passing wherever pi loads.
+  "| #c",
+  "|  # two-space comment",
+  "| comment",
+  "| 0",
+  "| 42",
+  "> text",
+  "|1 token",
+  "|- x",
+  "| x # y",
 ];
 const KEY_POOL = ["name", "description", "steps", "other", "key", "subjects.team"];
 
