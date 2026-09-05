@@ -3131,8 +3131,11 @@ export function firstHubTrackedWrite(candidates, trackedRels) {
  * `open(...,'w'|'a')` — NOT in-place overwrite VERBS (`sed -i`, `perl -pi`,
  * `cp`/`mv` onto a tracked file, `install`, `dd of=`, `tar -x`/`unzip -o`
  * into the hub, `patch -p1`): those contain no write-primitive construct and
- * are deliberately outside this walker's scope (the write/edit-tool freeze
- * and the M4 git gate are the controls for verb-style overwrites).
+ * are deliberately outside this walker's scope. A raw bash verb overwrite of
+ * a tracked hub file while disordered is NOT covered by any guard — the
+ * write/edit freeze only intercepts tool events and M4 classifies these as
+ * non-git/allowed (documented residual: only write PRIMITIVES are gated on
+ * the bash route; tool-mediated and git-verb overwrites stay frozen/M4-gated).
  */
 export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const s = String(command ?? "");

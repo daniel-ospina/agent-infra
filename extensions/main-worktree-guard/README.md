@@ -270,11 +270,15 @@ dirty, and trips M4's freeze. Surfaces (in a NON-infra repo):
    review): the gate covers bash write PRIMITIVES — `>`/`>>`/`>&` redirects,
    `tee`, and python `open(…,"w"/"a")` — NOT in-place overwrite VERBS
    (`sed -i`, `perl -pi`, `cp`/`mv` onto a tracked file, `install`, `dd
-   of=`, `tar -x` into the hub); those contain no write-primitive construct
-   and are outside this mechanism's scope — the write/edit-tool freeze and
-   the M4 git gate remain the controls for verb-style overwrites. NEW-file
-   and untracked-WIP targets are NOT this gate's concern (see 3; the #436
-   collision-free carve-out semantics apply).
+   of=`, `tar -x`/`unzip -o` into the hub, `patch -p1`); those contain no
+   write-primitive construct and are outside this mechanism's scope. NOTE —
+   a raw bash verb overwrite of a tracked hub file while disordered is NOT
+   covered by any guard: the write/edit freeze only intercepts tool events,
+   and M4 classifies these as non-git (allowed). Documented residual: only
+   write PRIMITIVES are gated on the bash route (verb overwrites via the
+   write/edit tools stay frozen, and git-verb overwrites stay M4-gated).
+   NEW-file and untracked-WIP targets are NOT this gate's concern (see 3;
+   the #436 collision-free carve-out semantics apply).
 3. **Bash-write warning (untracked WIP — still warn-only):** hub-targeted
    non-git bash writes whose target matches a WIP pattern emit the same banner
    with a `(via bash …)` note. Heuristic and conservative: `/tmp` scratch-ish
