@@ -48,7 +48,28 @@
  * run.", "— not measured this cycle (run not executed).", "— never met
  * this run.") records that the bar was NOT met / the run produced no
  * measurement, so it demotes the capture even under a head-window bar noun
- * or a bare at-bar declaration (round-13); and the #2009 co-location record is
+ * or a bare at-bar declaration (round-13); Round-14 makes the demotion and
+ * the restatement/override decisions CLAUSE-BOUND (a cycle-7 review found
+ * the all-negated scan and the any-affirmative override misread natural
+ * note/cross-reference voice): the demotion now reads the value's OWN
+ * outcome clause (the first clause group after the value — "not measured
+ * this run", "was NOT reached this run") and fires on its negation even
+ * when a LATER clause carries bare result/recorded-style words that do not
+ * measure THIS capture ("result pending until the lane re-runs.", "the
+ * recorded result is in the FAILURE BRANCH record below.", "the earlier
+ * 0.85 result was recorded at the calibration gate." — the last a
+ * self-contained earlier record, whose decimal binds its verb even when the
+ * decimal PRECEDES it); only an affirmative OUTCOME word ("bar met", "at
+ * bar") in the value's own clause rescues. Symmetrically, a post-nominal
+ * bar noun ("gate", "bar") in an UNRELATED later clause no longer demotes
+ * a genuinely measured value — "mapped agreement **0.85** — measured this
+ * run (no product-side flip smuggled into the gate)." and "… — measured
+ * this run; see the gate status table below." record the at-bar figure
+ * (an affirmative measurement signal earlier in the sentence defeats the
+ * later cross-reference noun); and the trailing affirmative override
+ * requires a VALUE-BOUND signal (verb forms / outcome adjectives / "at
+ * bar"), never a bare "result" noun or a verb bound to its own clause's
+ * decimal. The #2009 co-location record is
  * read per SENTENCE — whose clause also ends at a top-level em/en-dash
  * (round-12: "…#2009 verified OPEN — the earlier (d) FAIL was resolved…"
  * joins a NEW clause bound to a different subject, so it never negates the
@@ -276,6 +297,25 @@ if (!bSections.some(({ sec }) => bHeadingPass(sec.split("\n")[0] || ""))) {
 // negated ("**0.85** — not measured this run; no run executed") demotes the
 // capture outright — the sentence records that no measurement/outcome
 // occurred, so even the bare at-bar default must not count it.
+// Round-14 (cycle-7 review): the demotion, the restatement, and the
+// affirmative override are CLAUSE-BOUND — each decision reflects which
+// clause binds the capture. The demotion reads the value's OWN outcome
+// clause (the first clause group after the value): when it is NEGATED
+// ("not measured this run", "was NOT reached this run") the capture is
+// demoted even if a LATER clause carries bare result/recorded-style words
+// ("result pending…", "the recorded result is in the FAILURE BRANCH record
+// below", "the earlier 0.85 result was recorded at the calibration gate" —
+// cross-references/self-contained records, never a measurement of this
+// capture); only an affirmative OUTCOME word in the value's own clause
+// rescues. The post-nominal bar noun is bound the other way too: a bar noun
+// in an unrelated later clause ("(no product-side flip smuggled into the
+// gate)", "see the gate status table below") does not demote a capture
+// whose own clause affirmatively measured it — an affirmative signal
+// earlier in the sentence defeats the later noun. And the trailing
+// affirmative override needs a VALUE-BOUND signal (verb forms, outcome
+// adjectives, "at bar"): a bare "result" noun never fires it, and a
+// measurement verb whose own clause carries a decimal (before OR after the
+// verb) is bound to that decimal's record, not this capture.
 function cMeasuredFigures(sec) {
   const out = [];
   for (const sent of splitSentences(sec)) {
@@ -318,16 +358,24 @@ function cMeasuredFigures(sec) {
         // decimal. Round-12: the bar noun is OUTCOME-SCOPED — a noun
         // heading an affirmative outcome (", bar met)", "(the bar was met)",
         // "at bar this cycle") is the result's subject, not a restatement.
+        // Round-14: the noun is also CLAUSE-BOUND — a bar noun in an
+        // unrelated LATER clause ("(no product-side flip smuggled into the
+        // gate)", "see the gate status table below") does not demote a
+        // capture whose own clause affirmatively measured it.
         if (cTailMarksBarRestatement(tail, val)) continue;
-        // (3) round-13: NEGATED trailing measurement/outcome demotion — when
-        // the tail's measurement/outcome signals are ALL negated ("**0.85**
-        // — not measured this run; no run executed", "The (c) bar is mapped
-        // agreement **0.85** — was NOT reached this run."), the sentence
-        // records that NO measurement/outcome occurred: the capture is not a
-        // recorded figure even when no bar noun names it (closes the
-        // negation-blind bare-at-bar default gap) and even under a
-        // head-window bar noun. Runs BEFORE the affirmative trailing
-        // override and the head-window demotion below.
+        // (3) round-13/14: NEGATED trailing measurement/outcome demotion —
+        // when the value's OWN outcome clause (the first clause group after
+        // the value) is NEGATED ("**0.85** — not measured this run; no run
+        // executed", "The (c) bar is mapped agreement **0.85** — was NOT
+        // reached this run."), the sentence records that NO measurement/
+        // outcome occurred: the capture is not a recorded figure even when
+        // no bar noun names it (closes the negation-blind bare-at-bar
+        // default gap) and even under a head-window bar noun. Round-14: the
+        // demotion is CLAUSE-BOUND — a bare result/recorded-style word in a
+        // LATER clause ("result pending…", "the recorded result is in the
+        // FAILURE BRANCH record below", "the earlier 0.85 result was
+        // recorded…") is a cross-reference, never a veto. Runs BEFORE the
+        // affirmative trailing override and the head-window demotion below.
         if (cTailNegatesMeasurement(tail)) continue;
         // (4) round-12: trailing measurement/outcome override — an
         // AFFIRMATIVE measurement/outcome signal in the tail with NO
@@ -338,7 +386,11 @@ function cMeasuredFigures(sec) {
         // counts as measured. Round-13: the scan is NEGATION-GUARDED — a
         // matched verb whose own clause carries a negator ("was NOT
         // reached", "not measured") records a NEGATED outcome and does not
-        // override.
+        // override. Round-14: the affirmative signal must be VALUE-BOUND —
+        // verb forms / outcome adjectives / "at bar", never a bare "result"
+        // noun, and a measurement verb whose own clause carries a decimal
+        // (before OR after the verb) is bound to that decimal's record, not
+        // this capture.
         if (cTailMarksMeasuredOutcome(tail, val)) {
           out.push(val);
           continue;
@@ -380,6 +432,14 @@ function cMeasuredFigures(sec) {
 //   measurement form ("0.85 at bar this cycle") is the RESULT's subject (the
 //   value met the bar) and does NOT restate; a NEGATED outcome ("(the gate
 //   bar) was NOT reached") keeps the restatement reading.
+//   Round-14 (F1) makes (a) CLAUSE-BOUND as well: the noun only restates
+//   when it (re)names the CAPTURED value. When an AFFIRMATIVE
+//   measurement/outcome signal sits between the value and the noun with no
+//   different-bound decimal ("mapped agreement **0.85** — measured this run
+//   (no product-side flip smuggled into the gate).", "… — measured this run;
+//   see the gate status table below."), the value's own clause already
+//   recorded the at-bar figure and the later bar noun is an UNRELATED
+//   cross-reference — not a restatement.
 function cTailMarksBarRestatement(tail, captured) {
   // Round-11: `target`/`goal` restored to the noun alternation (round-10
   // dropped `target` from round-9's bar|threshold|target|gate|requirement,
@@ -410,6 +470,12 @@ function cTailMarksBarRestatement(tail, captured) {
           /\b(?:met|passed|holds?|satisfied|cleared|exceeded|achieved|hit|reached)\b/i.test(afterClause)) {
         return false;
       }
+      // Round-14 (F1): an affirmative measurement/outcome signal between the
+      // value and the noun records THIS capture as measured — the later
+      // noun is a cross-reference, not a restatement ("measured this run
+      // (no product-side flip smuggled into the gate)", "measured this run;
+      // see the gate status table below").
+      if (cTailAffirmBefore(tail, nounStart)) return false;
       // "at (the) bar" immediately before the noun = measured AT the bar.
       if (/(?:\s|^)(?:at|measured)\s+(?:the\s+)?$/.test(tail.slice(0, nounStart))) return false;
       // default: the value is named AS the bar/plan -> restatement.
@@ -450,6 +516,51 @@ function cTrailSignalRunup(tail, signalIndex) {
 function cTrailSignalNegated(tail, signalIndex) {
   return new RegExp(C_TRAIL_NEGATOR_SRC, "i").test(cTrailSignalRunup(tail, signalIndex));
 }
+// Round-14 clause primitives for the trailing-signal decisions. A tail
+// signal's CLAUSE SPAN is the paren-depth-0 text between the top-level
+// boundaries (a ; ! ? em/en-dash, newline, or decimal-free period) around
+// it — used to tell a signal that is bound to ITS OWN decimal's record
+// ("the earlier 0.85 result was recorded …") from a signal that measures
+// the captured value.
+function cTailClauseSpan(tail, idx) {
+  const isBoundary = (i) => {
+    const ch = tail[i];
+    const nxt = tail[i + 1] || "";
+    return ch === ";" || ch === "!" || ch === "?" || ch === "—" || ch === "–" ||
+      ch === "\n" || (ch === "." && !/[0-9]/.test(nxt));
+  };
+  let start = 0;
+  let depth = 0;
+  for (let i = 0; i < tail.length; i++) {
+    const ch = tail[i];
+    if (ch === "(") { depth++; continue; }
+    if (ch === ")" && depth > 0) { depth--; continue; }
+    if (depth === 0 && isBoundary(i)) {
+      if (i < idx) start = i + 1;
+      else return { start, end: i };
+    }
+  }
+  return { start, end: tail.length };
+}
+function cTailClauseHasDecimal(tail, idx) {
+  const { start, end } = cTailClauseSpan(tail, idx);
+  return /[0-9]\.[0-9]/.test(tail.slice(start, end));
+}
+// Round-14 (F1): does an AFFIRMATIVE (negation-free) measurement/outcome
+// signal appear in tail[0, upTo) — the text between the captured value and
+// a later bar noun? If so the value's own clause measured it and the later
+// noun is a cross-reference ("(no product-side flip smuggled into the
+// gate)", "see the gate status table below"), not a restatement naming the
+// value as the threshold.
+function cTailAffirmBefore(tail, upTo) {
+  const seg = tail.slice(0, upTo);
+  const re = new RegExp(C_TRAIL_SIGNAL_SRC, "gi");
+  let m;
+  while ((m = re.exec(seg)) !== null) {
+    if (!cTrailSignalNegated(seg, m.index)) return true;
+  }
+  return false;
+}
 // Round-12 trailing measurement/outcome override for an at-bar (0.85)
 // capture: an AFFIRMATIVE measurement or outcome signal in the tail of the
 // SAME sentence — "**0.85** — measured this run.", "(the bar was met)", ",
@@ -463,40 +574,110 @@ function cTrailSignalNegated(tail, signalIndex) {
 // run" stay restatements via cTailMarksBarRestatement above). Round-13: the
 // scan is NEGATION-GUARDED — only an affirmative signal (no negator in its
 // own clause run-up) returns true; a negated outcome never overrides.
+// Round-14 (F2b): the affirmative signal must be VALUE-BOUND — a bare
+// "result" NOUN never overrides (it names an outcome record without
+// measuring this capture), and a measurement verb/adjective whose OWN
+// clause carries a decimal is bound to that decimal's record — the binding
+// is SYMMETRIC, so a decimal BEFORE the verb ("the earlier 0.85 result was
+// recorded …") suppresses the verb exactly like a decimal after it.
 function cTailMarksMeasuredOutcome(tail, captured) {
   const bound = /(?:measured|recorded|scored|result|reported|observed)\b[^.!?\n]{0,80}?([01]?\.[0-9]+)/i.exec(tail);
   if (bound && Number(bound[1]) !== captured) return false;
   const re = new RegExp(C_TRAIL_SIGNAL_SRC, "gi");
   let m;
   while ((m = re.exec(tail)) !== null) {
-    if (!cTrailSignalNegated(tail, m.index)) return true;
+    if (cTrailSignalNegated(tail, m.index)) continue;
+    const word = m[0].toLowerCase();
+    // a bare "result" noun is not a measurement of this capture.
+    if (/^result\b/.test(word)) continue;
+    // a measurement verb/adjective bound to a decimal inside its own clause
+    // records THAT decimal (symmetrically — before or after the verb), not
+    // this capture.
+    if (/^(?:measured|recorded|scored|reported|observed)\b/.test(word) &&
+        cTailClauseHasDecimal(tail, m.index)) continue;
+    return true;
   }
   return false;
 }
-// Round-13 negated-outcome demotion: a tail whose measurement/outcome
-// signals are ALL negated — "**0.85** — not measured this run; no run
-// executed", "**0.85** — was NOT reached this run (execution errored before
-// completion)", "**0.85** — never met this cycle" — records that the run
-// produced NO measurement/outcome, so the captured 0.85 is not a recorded
-// figure. This closes the negation-blind bare-at-bar default gap (round-11
-// AND round-12 both counted "mapped agreement **0.85** — not measured this
-// run; no run executed" as a measured at-bar figure because no bar noun
-// named the value as the threshold) and demotes a negated trailing outcome
-// even under a head-window bar noun ("The (c) bar is mapped agreement
-// **0.85** — was NOT reached this run."), which the round-12 trailing
-// override otherwise let fire BEFORE the round-11 head-window demotion. An
-// affirmative signal elsewhere in the tail ("… recorded result this cycle")
-// still records the figure.
+// Round-13/14 negated-outcome demotion: when the value's OWN outcome
+// clause — the first clause group after the value ("**0.85** — not
+// measured this run; no run executed", "**0.85** — was NOT reached this
+// run (execution errored before completion)", "**0.85** — never met this
+// cycle") — records a NEGATED measurement/outcome, the captured 0.85 is
+// not a recorded figure. This closes the negation-blind bare-at-bar
+// default gap (round-11 AND round-12 both counted "mapped agreement
+// **0.85** — not measured this run; no run executed" as a measured at-bar
+// figure because no bar noun named the value as the threshold) and demotes
+// a negated trailing outcome even under a head-window bar noun ("The (c)
+// bar is mapped agreement **0.85** — was NOT reached this run."), which
+// the round-12 trailing override otherwise let fire BEFORE the round-11
+// head-window demotion. Round-14 (F2): the decision is CLAUSE-BOUND — only
+// the value's own outcome clause counts. A negated signal there demotes
+// even when a LATER clause carries bare result/recorded-style words
+// ("result pending until the lane re-runs", "the recorded result is in the
+// FAILURE BRANCH record below", "the earlier 0.85 result was recorded at
+// the calibration gate"): those are cross-references / self-contained
+// earlier records, never a measurement of THIS capture, and cannot veto
+// the demotion. Only an affirmative OUTCOME word in the value's own clause
+// ("bar met", "at bar this cycle") records the at-bar result and rescues.
+// Round-13's all-negated scan is kept as a fallback for tails whose own
+// clause carries no signal but whose EVERY tail signal is negated
+// ("execution errored before completion; not measured").
+function cTailOwnClauseEnd(tail) {
+  const n = tail.length;
+  let i = 0;
+  // a leading em/en-dash or semicolon connector opens the value's outcome
+  // clause ("**0.85** — measured this run."), so it and any leading
+  // whitespace (plus the closing `**` of a bolded value, which the capture
+  // regex leaves at the tail's head) are skipped rather than terminating
+  // the clause before it starts.
+  while (i < n && /[\s—–;*]/.test(tail[i])) i++;
+  if (i >= n) return n;
+  let depth = 0;
+  for (; i < n; i++) {
+    const ch = tail[i];
+    if (ch === "(") { depth++; continue; }
+    if (ch === ")" && depth > 0) { depth--; continue; }
+    if (depth === 0) {
+      const nxt = tail[i + 1] || "";
+      if (ch === ";" || ch === "!" || ch === "?" || ch === "—" || ch === "–" ||
+          ch === "\n" || (ch === "." && !/[0-9]/.test(nxt))) return i;
+    }
+  }
+  return n;
+}
 function cTailNegatesMeasurement(tail) {
+  // (1) own-outcome-clause demotion (round-14 F2): the value's own outcome
+  // clause records a NEGATED measurement/outcome — see the docstring above.
+  const clause = tail.slice(0, cTailOwnClauseEnd(tail));
   const re = new RegExp(C_TRAIL_SIGNAL_SRC, "gi");
   let m;
   let negated = 0;
-  let affirmative = 0;
-  while ((m = re.exec(tail)) !== null) {
-    if (cTrailSignalNegated(tail, m.index)) negated++;
-    else affirmative++;
+  let affirmedOutcome = 0;
+  while ((m = re.exec(clause)) !== null) {
+    const word = m[0].toLowerCase();
+    const atBar = /^at\b/.test(word);
+    const outcome = atBar || /\b(?:met|passed|holds?|satisfied|cleared|exceeded|achieved|hit|reached)\b/.test(word);
+    if (cTrailSignalNegated(clause, m.index)) negated++;
+    else if (outcome) affirmedOutcome++;
   }
-  return negated > 0 && affirmative === 0;
+  if (negated > 0 && affirmedOutcome === 0) return true;
+  // (2) all-negated fallback (round-13): when the own clause carries no
+  // signal at all but EVERY measurement/outcome signal in the whole tail is
+  // negated ("execution errored before completion; not measured", "no run
+  // executed; never met this cycle"), the sentence still records that no
+  // measurement/outcome occurred — demote. (A bare affirmative word
+  // elsewhere keeps this from firing; the clause-bound rule above handles
+  // those tails.)
+  const re2 = new RegExp(C_TRAIL_SIGNAL_SRC, "gi");
+  let n2;
+  let negatedAll = 0;
+  let affirmativeAll = 0;
+  while ((n2 = re2.exec(tail)) !== null) {
+    if (cTrailSignalNegated(tail, n2.index)) negatedAll++;
+    else affirmativeAll++;
+  }
+  return negatedAll > 0 && affirmativeAll === 0;
 }
 // Round-11 HEAD-window bar-restatement signal for an at-bar (0.85) capture:
 // bar/plan nouns and verbs sitting in the bounded window BEFORE the "mapped
