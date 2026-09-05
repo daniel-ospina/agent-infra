@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
@@ -1254,6 +1254,17 @@ test("task-capable (default argv): in-band self-dispatch instruction kept", () =
   ok(!/STOP — this block is final/.test(msg), "no final-block phrasing for task-capable");
 });
 
+test("#483: task-capable self-dispatch template keeps the literal task(prompt='[VGATE] verify files: … form verbatim", () => {
+  // The tool_result handler identifies a verifier dispatch by prompt.includes("[VGATE]")
+  // and the file-match regex reads "[VGATE] verify files: <paths>" — the template's
+  // quoting/token form is load-bearing for the #264 in-band self-satisfaction ceremony.
+  // Pre-#483 this exact copy was pinned ONLY at the e2e layer (scenarios 22/25); the
+  // #483 relaxation moved e2e to semantic asserts, so the verbatim copy lives here.
+  const msg = buildSubAgentBlockMessage(["  Unverified files:"], "/repo", ["a.ts"]);
+  const template = `task(prompt='[VGATE] verify files: a.ts. Classification: <UI|backend|both>. Project root: /repo. Return ONLY JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"<repo-relative>","hash":"<sha256>"}]}.', ...)`;
+  ok(msg.includes(template), "task-capable dispatch template must keep the exact task(prompt='[VGATE] verify files: … form (tool_result merge contract)");
+});
+
 test("task-restricted (--tools allowlist without task): return-to-parent instruction", () => {
   const msg = buildSubAgentBlockMessage(["  Unverified files:"], "/repo", ["a.ts"], ["pi", "-p", "--tools", "read,bash,edit,write"]);
   ok(/STOP — this block is final; do not bypass; return to the parent\s+session/.test(msg), "final-block return-to-parent instruction");
@@ -1282,12 +1293,25 @@ test("block reason lines are diff-scoped exactly like the inline text (reasons +
   ok(/verify files: x\.ts/.test(msg), "blocked files named in the dispatch template");
 });
 
-test("#285 drift guard: isTaskSubAgent reads the marker pair the dispatchers force", () => {
-  const src = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
-  ok(
-    src.includes('env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print"'),
-    "verification-gate isTaskSubAgent must read TASK_HEARTBEAT=1 ∧ PI_MODE=print (same pair as review-enforcer / task-heartbeat)"
-  );
+// #285/#483 drift guard (BEHAVIORAL): isTaskSubAgent must read the marker pair
+// TASK_HEARTBEAT=1 ∧ PI_MODE=print — the SAME pair review-enforcer's
+// isTaskSubAgent and task-heartbeat's taskHeartbeatActive/orphanWatchdogActive
+// read (builtin-tools forces both markers on every task child, #172/#825).
+// The three predicates can't import each other (extension-loader constraint —
+// each extension file is standalone), so the pair is pinned per-extension.
+// Behavioral (constructed env objects) rather than the pre-#483 source-text
+// readFileSync: a cosmetic refactor (operand reorder, const extraction) must
+// NOT fail the guard — only a semantic drift of the pair must. Includes the
+// #825 discriminator half: PI_MODE=print WITHOUT TASK_HEARTBEAT
+// (swarm_daemon worker) is NOT a task sub-agent.
+test("#285 drift guard: isTaskSubAgent reads the marker pair the dispatchers force (behavioral, #483)", () => {
+  ok(isTaskSubAgent({ TASK_HEARTBEAT: "1", PI_MODE: "print" }), "task-child marker pair → true (builtin-tools injects exactly these, #172/#825)");
+  equal(isTaskSubAgent({ PI_MODE: "print" }), false, "PI_MODE=print alone (swarm_daemon worker) is NOT a task sub-agent (#825 discriminator)");
+  equal(isTaskSubAgent({ TASK_HEARTBEAT: "1" }), false, "TASK_HEARTBEAT=1 alone is not print mode → false");
+  equal(isTaskSubAgent({ TASK_HEARTBEAT: "0", PI_MODE: "print" }), false, "present-but-non-1 TASK_HEARTBEAT value must NOT satisfy the pair (strict === \"1\" on the heartbeat half)");
+  equal(isTaskSubAgent({ TASK_HEARTBEAT: "1", PI_MODE: "print", TASK_HEARTBEAT_DISABLE: "1" }), true, "DISABLE flag must NOT affect the discriminator (builtin-tools forces the marker even under DISABLE, #264 P2/P3)");
+  equal(isTaskSubAgent({}), false, "clean env → false");
+  equal(isTaskSubAgent({ TASK_HEARTBEAT: "1", PI_MODE: "gate" }), false, "non-print PI_MODE value → false");
 });
 
 // ── #472 proportionality — content-shape exemption (mechanism a) ──
