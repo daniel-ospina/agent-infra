@@ -155,10 +155,20 @@ function hasRemainsDisposition(sec) {
   // "full graded run REMAINS" / "full spot-check REMAINS". Ordinary prose
   // using REMAINS as a copula ("the spot-check REMAINS a FAIL", "grading
   // remains incomplete") never matches.
+  //
+  // Round-8: the trailing-REMAINS form is tested PER LINE across the whole
+  // section, not just the first (heading) line — a BODY line recording the
+  // pending-disposition form ("Some text.\nThe full spot-check REMAINS") is
+  // a preliminary note, not an unexcused FAIL. The noun phrase must sit
+  // immediately before a TRAILING REMAINS (end-of-line or closing `**`), so
+  // prose that continues past REMAINS ("REMAINS a FAIL", "**MERGE REMAINS
+  // BLOCKED**") and lowercase copula prose ("grading remains incomplete")
+  // can never flip a genuine FAIL into a REMAINS disposition.
   const head = sec.split("\n")[0] || "";
   return /REMAINS for the parent/.test(sec) ||
     /\bREMAINS\s*(?:\*\*|$)/.test(head) ||
-    /\*\*REMAINS\*\*/.test(sec);
+    /\*\*REMAINS\*\*/.test(sec) ||
+    /\b(?:full\s+)?(?:graded\s+run|spot-check|QA\s+spot-check|graded\s+_abs)\s+REMAINS\s*(?:\*\*|$)/m.test(sec);
 }
 const aSections = newestEraSections(/^### \(a\) Graded `_abs`/);
 if (aSections.length === 0) {
@@ -208,29 +218,53 @@ function cMeasuredFigures(sec) {
     if (!Number.isFinite(val)) continue;
     // trailing comparison operator directly before the value -> the bar operand
     if (/(?:>=|<=|[><=≥≤])\s*$/.test(m[1])) continue;
-    // the bar constant 0.85 is not a measured figure unless it appears as an
-    // explicit measured result right after the phrase with no bar wording.
-    if (val === 0.85) continue;
+    // the bar constant 0.85 is skipped only when the captured gap m[1] names
+    // bar/plan wording (a restatement of the >= 0.85 threshold — "mapped
+    // agreement is the >= 0.85 bar", "target 0.85" — is not a measured
+    // result). An EXPLICIT measured result of exactly 0.85 with no bar
+    // wording in the gap ("measured mapped agreement **0.85** (bar met)")
+    // sits AT the pass threshold — >= 0.85 needs no #2009 — so it must be
+    // recorded as a figure (round-8).
+    if (val === 0.85 && /bar|threshold|target|gate|at least|minimum|required|or higher|or above|restatement|>=|≥|below|under/i.test(m[1])) continue;
     out.push(val);
   }
   return out;
+}
+// An AFFIRMATIVE #2009 mention inside a section: the token is counted only
+// when it is NOT inside an explicit negation window (preceding ~40 chars or
+// following ~60 chars naming no/not/never/waiv…/unneeded/unnecessary/no
+// longer/superseded/closed/resolved/without). A NEGATED mention ("No #2009
+// is needed (issue waived).", "#2009 not required") records that the
+// follow-up does NOT exist — bare substring presence must not satisfy the
+// P2-3 co-location requirement (round-8).
+function hasAffirmativeIssue2009(sec) {
+  const neg = /\b(?:no|not|never|without|waiv\w*|unneeded|unnecessary|no\s+longer|superseded|closed|resolved|dropped|removed)\b/i;
+  const re = /#2009/g;
+  let m;
+  while ((m = re.exec(sec)) !== null) {
+    const pre = sec.slice(Math.max(0, m.index - 40), m.index);
+    const post = sec.slice(m.index + m[0].length, m.index + m[0].length + 60);
+    if (!neg.test(pre) && !neg.test(post)) return true;
+  }
+  return false;
 }
 const cSections = newestEraSections(/^### \(c\) Detector-parity/);
 if (cSections.length === 0) {
   fail("runbook (c) missing the detector-parity verdict section for the current era (the measurement MUST be recorded).");
 }
 // Per-section evaluation: a current-era (c) section holding a measured
-// mapped-agreement figure < 0.85 must carry #2009 IN THAT SAME SECTION
-// (no cross-section borrowing — a #2009 dropped into a different current-era
-// (c) section does not excuse this section's sub-bar branch). At least one
-// current-era (c) section must record a measured figure.
+// mapped-agreement figure < 0.85 must carry an AFFIRMATIVE #2009 mention
+// IN THAT SAME SECTION (no cross-section borrowing — a #2009 dropped into a
+// different current-era (c) section does not excuse this section's sub-bar
+// branch; a negated mention records the follow-up does not exist). At least
+// one current-era (c) section must record a measured figure.
 const cSectionsWithFigures = cSections.filter(({ sec }) => cMeasuredFigures(sec).length > 0);
 if (cSectionsWithFigures.length === 0) {
   fail("runbook (c) must record a numeric measured mapped-agreement figure in the current-era detector-parity verdict section (a restatement of the >= 0.85 bar is not a measurement) (P2-3).");
 }
 const cLowSectionMissingIssue = cSectionsWithFigures.find(({ sec }) => {
   const figs = cMeasuredFigures(sec);
-  return figs.some((n) => n < 0.85) && !/#2009/.test(sec);
+  return figs.some((n) => n < 0.85) && !hasAffirmativeIssue2009(sec);
 });
 if (cLowSectionMissingIssue) {
   fail("runbook (c): a current-era detector-parity section records mapped agreement < 0.85 without the tracked follow-up issue (#2009) co-located in that same section (P2-3).");

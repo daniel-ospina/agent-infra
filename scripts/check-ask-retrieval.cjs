@@ -17,7 +17,10 @@
  *      0.500") — both spellings must parse. The ordering applies to the
  *      LAST recorded occurrence of each key (the most recent measurement
  *      in the doc), so a later appended re-measure that contradicts the
- *      baseline cannot hide below the first record.
+ *      baseline cannot hide below the first record — and a FINAL
+ *      occurrence that is itself out of range (not parseable as 0..1) is
+ *      a fabricated record that fails the gate rather than being skipped
+ *      in favor of an earlier in-range value (round-8).
  *   3. The acceptance-fixture file (tests/test_ask_retrieval_levers.py)
  *      exists AND actually implements the #2070 Acceptance Indicator:
  *      a NON-EMPTY RECORDED_FAILURES list on a CODE line (comment-only
@@ -26,7 +29,9 @@
  *      land in the assembled context (an `assert ... & gold` intersection
  *      on the context-derived set — a vacuous `pass`-body def, a
  *      commented-out decorator/def, a docstring merely quoting the assert,
- *      a negated `gold is None` assert, or a bare token mention is NOT
+ *      a NEGATED intersection in either operand order (`assert not
+ *      (ctx_ids & gold)` / `assert gold & ctx_ids == set()`), or a phrase
+ *      that only appears in a string literal or trailing comment is NOT
  *      the indicator (P3-4).
  *
  * Plain CJS, zero npm deps (the repo's script convention — mirrors
@@ -130,14 +135,30 @@ if (!/Follow-up \(2\) status|#2070 retrieval optimisation loop/.test(statusText)
 // LAST recorded occurrence of each key within the status section governs
 // (a later appended contradictory re-measure inside the section cannot hide
 // below an earlier one).
-function recallIn(key, hay) {
+function recallScan(key, hay) {
+  // Parse every `<key> recall <number>` occurrence. Returns the last
+  // IN-RANGE (0..1) value — the most recent physically possible
+  // measurement — plus the RAW text of the doc's FINAL occurrence and
+  // whether that final occurrence fell outside [0,1]. An out-of-range
+  // final record (recall 2.5 is not a 0..1 figure) must NOT be silently
+  // dropped in favor of an earlier in-range value: the newest record would
+  // then hide from the ordering guard (round-8).
   const re = new RegExp(`${key} recall\\s*\\*{0,2}\\s*([0-9]*\\.[0-9]+|[0-9]+)`, "g");
-  let m, last = null;
+  let m;
+  let last = null;
+  let raw = null;
+  let lastOut = false;
   while ((m = re.exec(hay)) !== null) {
+    raw = m[1];
     const v = Number(m[1]);
-    if (Number.isFinite(v) && v >= 0 && v <= 1) last = v;
+    lastOut = !(Number.isFinite(v) && v >= 0 && v <= 1);
+    if (!lastOut) last = v;
   }
-  return last;
+  return { last, raw, lastOut };
+}
+// recallIn = the last in-range value only (what the ordering guard compares).
+function recallIn(key, hay) {
+  return recallScan(key, hay).last;
 }
 // Locality: the current #2070 status section itself must carry the figures.
 const pool = recallIn("pool@120", statusText);
@@ -150,9 +171,21 @@ if (pool === null || ctx40 === null || ctxCap === null) {
 // the LAST recorded occurrence of each key ANYWHERE in the doc, so a later
 // appended re-measure that contradicts the baseline (in a newer dated block
 // below the status section) cannot hide below the current-section record.
-const poolAll = recallIn("pool@120", text) ?? pool;
-const ctx40All = recallIn("ctx@40", text) ?? ctx40;
-const ctxCapAll = recallIn("ctx@cap", text) ?? ctxCap;
+const poolScan = recallScan("pool@120", text);
+const ctx40Scan = recallScan("ctx@40", text);
+const ctxCapScan = recallScan("ctx@cap", text);
+const poolAll = poolScan.last ?? pool;
+const ctx40All = ctx40Scan.last ?? ctx40;
+const ctxCapAll = ctxCapScan.last ?? ctxCap;
+// The FINAL recorded occurrence of a key must itself be a parseable 0..1
+// figure (the header contract): an out-of-range last record is a fabricated
+// measurement, not a stale note to skip past — fail with the same
+// internally-inconsistent signal the ordering checks emit.
+for (const [key, scan] of [["pool@120", poolScan], ["ctx@40", ctx40Scan], ["ctx@cap", ctxCapScan]]) {
+  if (scan.lastOut) {
+    fail(`recall ordering violated in the most recent measurement anywhere in the doc: ${key} (${scan.raw}) is not a parseable 0..1 recall figure — the runbook record is internally inconsistent (fabricated?).`);
+  }
+}
 if (ctx40All > poolAll + 1e-9) {
   fail(`recall ordering violated in the most recent measurement anywhere in the doc: ctx@40 (${ctx40All}) > pool@120 (${poolAll}) — the runbook record is internally inconsistent (fabricated?).`);
 }
@@ -224,17 +257,31 @@ if (goldDef) {
     // the AFFIRMATIVE truth value being tested. The real fixture asserts
     // `assert ctx_ids & gold, (…` and `assert {h["id"] for h in ctx} &
     // gold, (…`. A NEGATED or empty-claim intersection does not count —
-    // `assert not (ctx_ids & gold)` or `assert ctx_ids & gold == set()`
-    // assert the #2070 bug still exists (gold NOT in context), so they must
-    // not satisfy the indicator.
+    // `assert not (ctx_ids & gold)` / `assert gold & ctx_ids == set()`
+    // (EITHER operand order) assert the #2070 bug still exists (gold NOT in
+    // context), so they must not satisfy the indicator.
     hasGoldIntersectAssert = body.some((l) => {
-      // must be an assert mentioning an intersection with gold
-      if (!/\bassert\b[^\n]*&[^\n]*\bgold\b|\bassert\b[^\n]*\bgold\b[^\n]*&/.test(l)) return false;
-      // reject negation: `assert not (ctx & gold)`
-      if (/\bassert\b[^\n]*\bnot\s*\(?[^\n]*&[^\n]*\bgold\b/i.test(l)) return false;
-      // reject empty-claims: `& gold == set()` / `== []` / `== 0` / `is None`
-      if (/&[^\n]*\bgold\b[^\n]*==\s*(?:set\(\)|\[\]|\{\}|0(?:\.[0-9]+)?|None|False)/.test(l)) return false;
-      if (/&[^\n]*\bgold\b[^\n]*\bis\s+(?:None|False)/.test(l)) return false;
+      // Each line is SANITIZED before the token tests: single/double-quoted
+      // string spans and trailing `# …` inline comments are blanked first
+      // (mirrors the fast-suite step scrub in check-ask-premerge.cjs). A
+      // quoted phrase or trailing comment that merely MENTIONS the assert
+      // (`_msg = "assert ctx_ids & gold"  # spoof`, `assert ctx_ids,
+      // "expected ctx_ids & gold …"`, `assert ctx_ids  # … & gold …`) is
+      // not an executed assertion and must not satisfy the indicator. This
+      // scrub is scoped to the per-line intersection check ONLY — the
+      // RECORDED_FAILURES / parametrize-decorator checks above keep their
+      // raw text because they legitimately need the string contents.
+      const s = l.replace(/"[^"]*"/g, " ").replace(/'[^']*'/g, " ").replace(/\s*#.*$/, "");
+      // must be an assert mentioning an intersection with gold (either
+      // operand order: `ctx & gold` or `gold & ctx`)
+      if (!/\bassert\b[^\n]*&[^\n]*\bgold\b|\bassert\b[^\n]*\bgold\b[^\n]*&/.test(s)) return false;
+      // reject negation in BOTH operand orders: `assert not (ctx_ids &
+      // gold)` AND `assert not (gold & ctx_ids)`
+      if (/\bassert\b[^\n]*\bnot\s*\(?[^\n]*(?:&[^\n]*\bgold\b|\bgold\b[^\n]*&)/i.test(s)) return false;
+      // reject empty-claims in BOTH operand orders: `ctx_ids & gold ==
+      // set()` / `gold & ctx_ids == set()` / `== []` / `== {}` / `== 0`
+      if (/(?:&[^\n]*\bgold\b|\bgold\b[^\n]*&)[^\n]*==\s*(?:set\(\)|\[\]|\{\}|0(?:\.[0-9]+)?|None|False)/.test(s)) return false;
+      if (/(?:&[^\n]*\bgold\b|\bgold\b[^\n]*&)[^\n]*\bis\s+(?:None|False)/.test(s)) return false;
       return true;
     });
   }
