@@ -265,18 +265,21 @@ function cMeasuredFigures(sec) {
       if (/(?:>=|<=|[><=≥≤])\s*$/.test(m[1])) continue;
       // plan/target wording between the keyword and the value -> the value is
       // a TARGET the run must hit, not this run's result. WORD-BOUNDED (see
-      // the classification note above for the "reached" fix).
-      if (/\b(?:should|target(?:s|ed|ing)?|goal|must|expected|required|requirement|aim(?:s|ed|ing)?|planned?|bar|threshold|gate|ceiling|minimum|at\s+least|or\s+higher|or\s+above|below|under|no\s+less\s+than|restatement)\b/i.test(m[1])) continue;
+      // the classification note above for the "reached" fix). Round-11 adds
+      // the `requires|needs` VERB inflections — "mapped agreement requires
+      // **0.85** to pass" names the target, not a recorded result (round-10
+      // carried only the nominal/adjectival required|requirement forms).
+      if (/\b(?:should|target(?:s|ed|ing)?|goal|must|expected|required|requirement|requires?|needs?|aim(?:s|ed|ing)?|planned?|bar|threshold|gate|ceiling|minimum|at\s+least|or\s+higher|or\s+above|below|under|no\s+less\s+than|restatement)\b/i.test(m[1])) continue;
       if (val === 0.85) {
         // The bar constant is ambiguous: it may RESTATE the >= 0.85
         // threshold or record a result AT the bar. Decide from the SAME
         // sentence as the capture.
         const tail = sent.slice(m.index + m[0].length, m.index + m[0].length + 160);
-        const head = sent.slice(Math.max(0, m.index - 30), m.index);
+        const head = sent.slice(Math.max(0, m.index - 40), m.index);
         // (1) explicit-result override: a measurement verb bound to THIS
         // phrase ("measured mapped agreement **0.85**") or an outcome
         // parenthetical ("(bar met)", "(met)", "(pass)") — the 0.85 IS the
-        // recorded at-bar figure. (The tight 30-char verb binding keeps a
+        // recorded at-bar figure. (The tight char verb binding keeps a
         // measurement verb from an EARLIER sentence — "Measured … 0.284 last
         // run. mapped agreement **0.85** …" — from upgrading a bar mention.)
         const explicitMeasured = /\b(?:measured|recorded|scored|reported|observed)\b|\bresult\b/i.test(head + m[1]);
@@ -286,9 +289,16 @@ function cMeasuredFigures(sec) {
           continue;
         }
         // (2) bar-restatement signals in the same sentence — post-nominal
-        // bar noun or a tail measurement binding a DIFFERENT decimal.
+        // bar noun ("0.85 is the bar/target", "the 0.85 bar") or a tail
+        // measurement binding a DIFFERENT decimal.
         if (cTailMarksBarRestatement(tail, val)) continue;
-        // (3) default: a bare at-bar declaration IS the recorded verdict
+        // (3) round-11: bar/plan wording in the HEAD window BEFORE the
+        // keyword — "The (c) bar is mapped agreement **0.85**", "the (c)
+        // threshold for parity is mapped agreement **0.85**", "the (c) gate
+        // requires mapped agreement **0.85**" — the capture names the
+        // threshold the run must hit, not a recorded figure.
+        if (cHeadMarksBarRestatement(head)) continue;
+        // (4) default: a bare at-bar declaration IS the recorded verdict
         // (the >= 0.85 contract holds; no #2009 needed).
         out.push(val);
         continue;
@@ -302,8 +312,9 @@ function cMeasuredFigures(sec) {
 // SAME sentence only (bounded windows; splitSentences already isolated the
 // capture's sentence):
 //   (a) a post-nominal bar noun naming the captured value as the threshold —
-//       "0.85 is the bar", "the 0.85 bar", "(the gate bar)", "mapped
-//       agreement is the 0.85 bar …". Only punctuation/articles/adjectives
+//       "0.85 is the bar", "0.85 is the target", "the 0.85 bar", "(the gate
+//       bar)", "mapped agreement is the 0.85 bar …". Only
+//       punctuation/articles/adjectives
 //       may sit between the value and the noun (no digit, no comparison
 //       operator), and no comparison operator + decimal may FOLLOW the noun:
 //       "(gate ≥ 0.85) → FAIL" is an ANNOTATION on a measured value, so it
@@ -313,13 +324,29 @@ function cMeasuredFigures(sec) {
 //       figure is bound to another number, so the captured 0.85 is the
 //       quoted bar, not the record.
 function cTailMarksBarRestatement(tail, captured) {
-  const noun = /^(?:(?![0-9<>=≥≤\n])[\s\S]){0,90}?\b(?:the\s+)?(?:0?\.?85\s+)?(?:gate\s+)?(?:bar|threshold|gate|ceiling|requirement|minimum)\b/i.exec(tail);
+  // Round-11: `target`/`goal` restored to the noun alternation (round-10
+  // dropped `target` from round-9's bar|threshold|target|gate|requirement,
+  // so "mapped agreement **0.85** is the target; no run was executed"
+  // wrongly counted the quoted target as a recorded at-bar figure).
+  const noun = /^(?:(?![0-9<>=≥≤\n])[\s\S]){0,90}?\b(?:the\s+)?(?:0?\.?85\s+)?(?:gate\s+)?(?:bar|threshold|gate|ceiling|requirement|minimum|target|goal)\b/i.exec(tail);
   if (noun) {
     const after = tail.slice(noun.index + noun[0].length, noun.index + noun[0].length + 60);
     if (!/[<>≥≤=]\s*[01]?(?:\.\d+|\d)/.test(after)) return true;
   }
   const bound = /(?:measured|recorded|scored|result|reported|observed)\b[^.!?\n]{0,80}?([01]?\.[0-9]+)/i.exec(tail);
   return !!bound && Number(bound[1]) !== captured;
+}
+// Round-11 HEAD-window bar-restatement signal for an at-bar (0.85) capture:
+// bar/plan nouns and verbs sitting in the bounded window BEFORE the "mapped
+// agreement" keyword phrase — "The (c) bar is mapped agreement **0.85**",
+// "the (c) threshold for parity is mapped agreement **0.85**", "the (c)
+// gate requires mapped agreement **0.85**" — name the value as the THRESHOLD
+// the run must hit, not a recorded figure. (The explicit-measured override
+// above already returned for "measured mapped agreement **0.85**", so a
+// head-window bar noun can never demote a genuinely recorded at-bar result.)
+function cHeadMarksBarRestatement(head) {
+  return /(?:^|[^A-Za-z0-9_])(?:the\s+)?(?:\(c\)\s+)?(?:parity\s+)?(?:bar|threshold|gate|requirement|target|goal)s?\b/i.test(head) ||
+    /\b(?:requires?|needs?|must|should)\b/i.test(head);
 }
 // An AFFIRMATIVE #2009 mention inside a section: the token counts only when
 // at least one SENTENCE containing #2009 records it affirmatively. Negation
@@ -339,33 +366,89 @@ function issueSentences(sec) {
   return splitSentences(sec);
 }
 function sentenceNegatesIssue2009(s) {
-  return [
-    // Determiner negation binding the issue noun phrase — round-10 accepts
-    // the runbook's canonical NP with its adjectives and markdown bold:
-    // "No #2009 is needed (issue waived).", "no follow-up #2009 was filed
-    // this cycle", "No tracked follow-up **#2009** is needed for this
-    // branch." (round-9 required `no` DIRECTLY before the issue token and
-    // missed the "tracked" adjective).
-    /\bno\s+(?:\*\*)?(?:tracked\s+)?(?:follow-?up\s+)?(?:issue\s+)?(?:\*\*)?#2009(?:\*\*)?\b/i,
-    // Negated-state predicate ON the issue, scanned over the WHOLE isolated
-    // sentence (round-10: the runbook's standard long parenthetical
-    // annotation after #2009 — "(#2009 (\"fix(product): …\", opened
-    // 2026-08-30, owner epistemic-team) …" — sits BETWEEN the issue and its
-    // predicate, so a fixed char window died before reaching it): "#2009 …
-    // is/… not|never|no longer needed|required|waived|applicable|…".
-    /#2009\b[\s\S]{0,240}?\b(?:(?:is|was|has\s+been|remains|gets?)\s+)?(?:not|never|no\s+longer)\s+(?:needed|required|waived|warranted|necessary|applicable|tracked|filed|opened|wanted)\b/i,
-    // Disposition/waiver predicate applied to the issue as its SUBJECT — the
-    // predicate must FOLLOW #2009, so "the old detector default was
-    // superseded by #2009" (verb before the issue) affirms the issue's
-    // existence and never negates it. Whole-sentence scan with the same
-    // long-annotation allowance: "…tracked follow-up #2009 (\"…\", opened
-    // 2026-08-30, owner epistemic-team) was waived by the product decision."
-    /#2009\b[\s\S]{0,240}?\b(?:(?:is|was|has\s+been|gets?|remains)\s+)?(?:waived|superseded|dropped|removed|withdrawn|closed|resolved|rejected|abandoned|unneeded|unnecessary)\b/i,
-    // "…merged/shipped/passed … without #2009" — round-10 fixes round-9's
-    // dead boundary: `#` is not a word char, so `\b#2009` could never match;
-    // the required split is `#2009\b` (boundary AFTER the digits).
-    /\bwithout\b[^.!?\n]{0,40}#2009\b/i,
-  ].some((re) => re.test(s));
+  // (1) Determiner negation binding the issue noun phrase — round-10 accepts
+  // the runbook's canonical NP with its adjectives and markdown bold:
+  // "No #2009 is needed (issue waived).", "no follow-up #2009 was filed
+  // this cycle", "No tracked follow-up **#2009** is needed for this
+  // branch." (round-9 required `no` DIRECTLY before the issue token and
+  // missed the "tracked" adjective) — and (2) "…merged/shipped/passed …
+  // without #2009" (round-10 fixed round-9's dead boundary: `#` is not a
+  // word char, so the split is `#2009\b`) — stay direct regex tests. The
+  // negated-state and disposition predicates are clause- and subject-bound
+  // in issueClauseNegations2009() (round-11, below).
+  if (
+    /\bno\s+(?:\*\*)?(?:tracked\s+)?(?:follow-?up\s+)?(?:issue\s+)?(?:\*\*)?#2009(?:\*\*)?\b/i.test(s) ||
+    /\bwithout\b[^.!?\n]{0,40}#2009\b/i.test(s)
+  ) {
+    return true;
+  }
+  return /#2009/.test(s) && issueClauseNegations2009(s);
+}
+// Round-11: negated-state/disposition predicates for a #2009 mention are
+// SAME-CLAUSE and ISSUE-BOUND. Round-10's whole-sentence 240-char scan
+// over-negated when the predicate word sat (a) in a LATER clause bound to a
+// different subject — "…required for this branch; the earlier (d) FAIL was
+// resolved by the product decision." — or (b) was ITSELF negated — "…it has
+// not been waived…", "nothing has closed or dropped it" — both of which
+// AFFIRM that #2009 stays open/tracked. The long-parenthetical waiver still
+// fires THROUGH the balanced annotation (the annotation is part of #2009's
+// clause): "…#2009 (\"…\", opened 2026-08-30, owner epistemic-team) was
+// waived by the product decision." negates the issue.
+function issueClauseNegations2009(s) {
+  const mentionRe = /#2009\b/g;
+  let m;
+  while ((m = mentionRe.exec(s)) !== null) {
+    const clause = clauseAfter(s, m.index + m[0].length);
+    // (a) not-needed / not-in-existence predicates — the negator is
+    // INTRINSIC to the signal ("#2009 … is not required", "…no longer
+    // needed", "…has not been filed"), so the negator+word pair IS the
+    // negation (a bare "is OPEN and required" never matches).
+    if (/\b(?:(?:is|was|has\s+been|remains|gets?)\s+)?(?:not|never|no\s+longer)\s+(?:been\s+)?(?:needed|required|warranted|necessary|applicable|tracked|filed|opened|wanted)\b/i.test(clause)) return true;
+    // (b) disposition/waiver predicates applied to the issue as its subject
+    // — counted only when NOT themselves negated: a negator earlier in the
+    // clause ("was not waived", "nothing has closed …") AFFIRMS the issue.
+    const dispRe = /\b(?:(?:is|was|has\s+been|gets?|remains)\s+)?(?:waived|superseded|dropped|removed|withdrawn|closed|resolved|rejected|abandoned|unneeded|unnecessary)\b/gi;
+    let d;
+    while ((d = dispRe.exec(clause)) !== null) {
+      const before = clause.slice(0, d.index);
+      if (!/\b(?:not|never|nothing|no\s+one|nobody|no)\b/i.test(stripParentheticals(before))) return true;
+    }
+  }
+  return false;
+}
+// The clause a #2009 mention heads: from just past the token to the next
+// top-level boundary — a `,` `;` `!` `?` or a period that is not part of a
+// decimal — with balanced parenthetical spans kept WHOLE (the runbook's long
+// annotation after #2009 carries its own commas/periods and is still the
+// same clause as the predicate that follows it).
+function clauseAfter(text, from) {
+  let depth = 0;
+  let out = "";
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "(") { depth++; out += ch; continue; }
+    if (ch === ")" && depth > 0) { depth--; out += ch; continue; }
+    if (depth === 0) {
+      const nxt = text[i + 1] || "";
+      if (ch === "," || ch === ";" || ch === "!" || ch === "?" || (ch === "." && !/[0-9]/.test(nxt))) break;
+    }
+    out += ch;
+  }
+  return out;
+}
+// Remove balanced (…)-spans from a clause prefix: a negator INSIDE an
+// annotation parenthetical between the issue and its predicate never cancels
+// the predicate ("#2009 (owner: X) was waived" negates regardless of the
+// annotation's content).
+function stripParentheticals(text) {
+  let depth = 0;
+  let out = "";
+  for (const ch of text) {
+    if (ch === "(") { depth++; continue; }
+    if (ch === ")") { if (depth > 0) depth--; continue; }
+    if (depth === 0) out += ch;
+  }
+  return out;
 }
 function hasAffirmativeIssue2009(sec) {
   for (const s of issueSentences(sec)) {
