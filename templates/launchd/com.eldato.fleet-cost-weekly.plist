@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- fleet-cost-weekly (#373): weekly visible-fleet cadence. Runs the
+         fleet cost report (ceiling-compaction count, cache-share, out+reason
+         trend) + the truncation watch over the last 7 days of session JSONLs;
+         on escalation, files/updates ONE deduped GitHub issue so the
+         store-drift WARN class (#341 PR-A shipped detect-only) finally has an
+         escalation recipient. Runs weekly (StartCalendarInterval Sunday
+         06:30 local). Canonical scripts: agent-infra/scripts/fleet-cost-weekly.sh
+         (+ fleet-cost-report.sh, watch-truncation.sh, session-postmortem.sh —
+         COPIED to ~/.pi/agent/scripts/ by pi-bootstrap/setup.sh scripts farm;
+         #427: launchd cannot read ~/Documents repos under macOS TCC). Rendered
+         by scripts/install-launchd.sh (#304) — placeholders only. -->
+    <key>Label</key>
+    <string>com.eldato.fleet-cost-weekly</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/fleet-cost-weekly.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/fleet-cost-weekly.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/fleet-cost-weekly.out.log</string>
+</dict>
+</plist>
