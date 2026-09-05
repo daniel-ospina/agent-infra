@@ -103,6 +103,15 @@ Usage: scripts/cron-quality-gates.sh <arch|mutation|oracle>
             pi must be installed (dev machine / cron only). Writes a
             last-oracle-run timestamp consumed by the arch/mutation staleness
             warnings (Task 10 f).
+  fleet     #341 PR-B weekly visible-fleet cadence: session-postmortem's shared
+            parser over recent sessions (compaction records included) + the
+            fleet cost report + the truncation watch. Load-gated like the other
+            subcommands; the launchd plist (farmed fleet-cost-weekly.sh driver)
+            is the always-on schedule — this is the agent-invoked repo-tree
+            entry that surfaces the report + watch. Runs session-postmortem
+            over the last FLEET_DAYS (default 7) via the report/watch, which
+            share the parser (--summary). Exit 1 = report escalated or watch
+            triggered (the pre-committed rollback procedure is printed).
   -h|--help Print this help.
 
 Exit: 0 clean, 1 violations/drift, 2 usage/environment error, 3 deferred —
@@ -303,11 +312,52 @@ oracle_gate() {
   exit 1
 }
 
+# ── fleet — #341 PR-B weekly visible-fleet cadence ─────────────────────────
+FLEET_DAYS="${FLEET_DAYS:-7}"
+
+fleet_gate() {
+  echo "=== cron-quality-gates fleet (visible-fleet feedback loop, #341 PR-B) ==="
+  echo "Running session-postmortem shared parser + fleet cost report + truncation watch over the last ${FLEET_DAYS} day(s)…"
+
+  local report_rc=0 watch_rc=0 report watch
+  # The report + watch shell to the SHARED parser (session-postmortem.sh
+  # --summary), so per-session retros and the fleet report cannot drift.
+  # Run against the repo copy here (agent-invoked, repo tree readable); the
+  # farmed launchd driver (fleet-cost-weekly.sh) is the always-on schedule.
+  report="$(bash "$ROOT/scripts/fleet-cost-report.sh" --days "$FLEET_DAYS" 2>&1)" || report_rc=$?
+  echo "$report"
+  echo ""
+
+  watch="$(bash "$ROOT/scripts/watch-truncation.sh" --days "$FLEET_DAYS" 2>&1)" || watch_rc=$?
+  echo "$watch"
+
+  # Preserve the sub-tool exit contract: rc=2 (either tool) is an
+  # ENVIRONMENT/USAGE error (sessions dir missing, parser broken, data-absence
+  # gate) — exit 2, NOT a fleet escalation. Only an actual report/watch
+  # escalation (rc=1) exits 1.
+  if [ "$report_rc" -eq 2 ] || [ "$watch_rc" -eq 2 ]; then
+    echo ""
+    echo "❌ fleet gate ENV ERROR (report rc=$report_rc, watch rc=$watch_rc) — see above."
+    exit 2
+  fi
+  if [ "$report_rc" -ne 0 ] || [ "$watch_rc" -ne 0 ]; then
+    echo ""
+    echo "❌ fleet gate FAILED (report rc=$report_rc, watch rc=$watch_rc) — see the"
+    echo "   report/watch above. The truncation watch's pre-committed rollback"
+    echo "   procedure is printed there."
+    exit 1
+  fi
+  echo ""
+  echo "✅ fleet gate clean — thresholds within the 400K regime."
+  exit 0
+}
+
 # ── dispatch ────────────────────────────────────────────────────────────────
 case "${1:-}" in
   arch)     load_gate_entry; oracle_staleness_warning; arch_gate ;;
   mutation) load_gate_entry; oracle_staleness_warning; mutation_gate ;;
   oracle)   load_gate_entry; oracle_gate ;;
+  fleet)    load_gate_entry; fleet_gate ;;
   -h|--help) usage; exit 0 ;;
   *)
     echo "Error: unknown subcommand '${1:-}'" >&2

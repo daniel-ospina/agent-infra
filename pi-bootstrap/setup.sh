@@ -278,6 +278,28 @@ if [ -d "$scripts_dir" ]; then
   echo "    scripts/checkout-hygiene farm: $copied copied (real files, #427)"
 fi
 
+# Fleet-scripts farm (#373): the weekly fleet-cost cadence runs under launchd
+# (com.eldato.fleet-cost-weekly plist), which cannot read ~/Documents — same
+# TCC wall as #427. session-postmortem.sh (the shared parser), the report,
+# the watch, and the weekly driver must ALL sit in ~/.pi/agent/scripts so the
+# driver's sibling calls resolve. Same idempotent real-copy refresh model.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh)
+mkdir -p "$DEST/scripts"
+fleet_copied=0
+for base in "${fleet_srcs[@]}"; do
+  f="$INFRA_ROOT/scripts/$base"
+  [ -f "$f" ] || continue
+  dest="$DEST/scripts/$base"
+  if [ -L "$dest" ]; then
+    echo "    replacing farm symlink with real copy: $base"
+    rm -f "$dest"
+  fi
+  cp -f "$f" "$dest"
+  chmod +x "$dest" 2>/dev/null || true
+  fleet_copied=$((fleet_copied+1))
+done
+echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
+
 # Wire shell profile (idempotent): auto-sync env + optional keys file
 ZSHRC="$HOME/.zshrc"
 [ -f "$ZSHRC" ] || touch "$ZSHRC"
