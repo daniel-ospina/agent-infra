@@ -327,6 +327,116 @@ export const FIXTURES = [
     }
   },
   {
+    "id": "throw-block-header-trailing-token",
+    "class": "throw-invalid-block-header",
+    "expected": [
+      "throw-invalid-block-header",
+      "throw-bare-key"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\nname: x\ndescription: | comment\n  line1\n---\nbody\n",
+    "note": "#370 — `| comment` space-then-token (the exact O/I repro)",
+    "piConsequence": {
+      "parseErr": "Not a YAML token: comment at line 2, column 16:",
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "Not a YAML token: comment at line 2, column 16:"
+      ]
+    }
+  },
+  {
+    "id": "throw-block-header-trailing-digit",
+    "class": "throw-invalid-block-header",
+    "expected": [
+      "throw-invalid-block-header",
+      "throw-bare-key"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\nname: x\ndescription: | 0\n  line1\n---\nbody\n",
+    "note": "#370 — `| 0` space-then-digit (distinct from #369 P2-1 '|0' adjacent-digit form)",
+    "piConsequence": {
+      "parseErr": "Not a YAML token: 0 at line 2, column 16:",
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "Not a YAML token: 0 at line 2, column 16:"
+      ]
+    }
+  },
+  {
+    "id": "throw-block-header-trailing-fold",
+    "class": "throw-invalid-block-header",
+    "expected": [
+      "throw-invalid-block-header",
+      "throw-bare-key"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\nname: x\ndescription: > text\n  line1\n---\nbody\n",
+    "note": "#370 — folded `> text` space-then-token",
+    "piConsequence": {
+      "parseErr": "Not a YAML token: text at line 2, column 16:",
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "Not a YAML token: text at line 2, column 16:"
+      ]
+    }
+  },
+  {
+    "id": "throw-block-header-trailing-explicit",
+    "class": "throw-invalid-block-header",
+    "expected": [
+      "throw-invalid-block-header",
+      "throw-bare-key"
+    ],
+    "expectedRelation": "drop",
+    "content": "---\nname: x\ndescription: |1 token\n  line1\n---\nbody\n",
+    "note": "#370 — valid explicit-indent header |1 followed by space-then-token",
+    "piConsequence": {
+      "parseErr": "Not a YAML token: token at line 2, column 17:",
+      "loaded": false,
+      "name": null,
+      "description": null,
+      "diagnostics": [
+        "Not a YAML token: token at line 2, column 17:"
+      ]
+    }
+  },
+  {
+    "id": "ok-block-header-comment",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: | #c\n  line1\n---\nbody\n",
+    "note": "#370 pin — #-comment immediately after the header stays legal (pi loads, body is the value)",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1\n",
+      "diagnostics": []
+    }
+  },
+  {
+    "id": "ok-block-header-comment-spaced",
+    "class": "ok",
+    "expected": [],
+    "expectedRelation": "load",
+    "content": "---\nname: x\ndescription: |  # comment\n  line1\n---\nbody\n",
+    "note": "#370 pin — whitespace run + #-comment after the header stays legal (multi-space; guards the trimStart boundary)",
+    "piConsequence": {
+      "parseErr": null,
+      "loaded": true,
+      "name": "x",
+      "description": "line1\n",
+      "diagnostics": []
+    }
+  },
+  {
     "id": "throw-reserved-at",
     "class": "throw-reserved-char-start",
     "expected": [
