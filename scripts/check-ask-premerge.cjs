@@ -327,14 +327,20 @@ function affirmativeMoot(text) {
   if (!text) return false;
   const affirmRe = /\(d\)\s+gate\s+is\s+MOOT(?:\s+by product decision)?|\(d\)\s+is\s+MOOT(?:\s+by product decision)?/i;
   // Recognizable rescission templates, all naming the override/(d)/MOOT as
-  // the subject being undone:
+  // the subject being undone. Filler verbs between "no longer" and MOOT are
+  // tolerated ("no longer considered/deemed/held MOOT") so a genuine
+  // reversal with natural wording is honored regardless of the filler word
+  // (round-7 coverage gap: canonical-phrase and filler-verb reversals must
+  // behave identically).
   const rescueTemplates = [
-    /\(d\)\s+gate\s+(?:is\s+)?no\s+longer\s+(?:a\s+|the\s+)?MOOT/i, // (d) gate is no longer MOOT
-    /\bno\s+longer\s+(?:a\s+|the\s+)?MOOT\b/i, // …is no longer MOOT…
-    /\b(?:not|never)\s+(?:a\s+|the\s+)?MOOT\b/i, // not MOOT
+    /\(d\)\s+gate\s+(?:is\s+)?no\s+longer\s+(?:(?:a|the)\s+)?(?:(?:considered|deemed|held|treated|regarded)(?:\s+as)?\s+)?MOOT/i, // (d) gate is no longer (considered) MOOT
+    /\bno\s+longer\s+(?:(?:a|the)\s+)?(?:(?:considered|deemed|held|treated|regarded)(?:\s+as)?\s+)?MOOT\b/i, // …is no longer (considered) MOOT…
+    /\b(?:not|never)\s+(?:(?:a|the)\s+)?(?:(?:considered|deemed|held|treated|regarded)(?:\s+as)?\s+)?MOOT\b/i, // not (considered) MOOT
     /\(d\)\s+gate\s+re-?binds?/i, // (d) gate re-binds
-    /(?:MOOT\s+)?override[^.!?\n]{0,60}\b(?:rescind|withdraw|supersede|revoke|overturn|invalidat|re-?bind|cease)\w*\b/i, // the override … is rescinded/…
+    /(?:MOOT\s+)?override[^.!?\n]{0,60}\b(?:rescind|withdraw|supersede|revoke|overturn|invalidat|re-?bind|cease|eliminate|displace)\w*\b/i, // the override … is rescinded/superseded/…
     /\bdeclaration[^.!?\n]{0,60}\b(?:is|was|has\s+been)\s+(?:rescinded|withdrawn|superseded|revoked|overturned)\b/i, // the declaration … is withdrawn
+    /\bdeclaration[^.!?\n]{0,40}\bsupersedes\b/i, // this declaration supersedes (the earlier MOOT)
+    /\b(?:this|the|that|earlier)\s+(?:decision|declaration|override|amendment|reversal|update|record)[^.!?\n]{0,60}\bsupersedes\b[^.!?\n]{0,50}\b(?:MOOT|override|declaration|\(d\))/i, // this decision supersedes the MOOT declaration / (d) gate
     /\b(?:RESCINDED|REVOKED|WITHDRAWN|SUPERSEDED)\b[^.!?\n]{0,60}\b(?:\(d\)|override|MOOT)/, // RESCINDED: …the (d) gate / override
     /\(d\)\s+gate\s+(?:re-?binds|is\s+no\s+longer\s+(?:in\s+effect|binding|active))\b/i, // (d) gate re-binds / no longer in effect
   ];
