@@ -60,6 +60,18 @@ When problem-diverge discovers that the issue describes a symptom rather than th
 
 **Gate:** When problem-converge picks a confirmed problem definition, compare it to the original issue. If the original described a symptom and scoping settled on a fix for that symptom without addressing the root cause, the scoping is incomplete. The verification gates (2.5) check for this.
 
+## Design Principle: Issue-Body Solutions Are Hypotheses, Not the Plan
+
+An issue body may assert a solution direction — "the fix is X", "implement exemption in Y". That assertion is the **author's hypothesis, not the plan.** Authoring bias is real: the author can be wrong, can write mid-frustration, and `issue-creation` deliberately separates what-and-why (creation) from how (scoping). The red flag that guards an *agent* thinking "I already know what to do…" must apply equally when the *issue body itself* prescribes the fix (exhibit: #472 — body said "None — scope is clear" while listing an open direction fork; the worker misread the prescribed direction as settled).
+
+**What this means in the double diamond:**
+- **problem-diverge:** challenge the framing a prescribed fix embeds — a body that states a solution has already skipped part of the problem diamond; scoping must not inherit the skip.
+- **problem-converge:** confirming the problem does NOT confirm the body's proposed solution — they are independent claims.
+- **solution-diverge:** the body's stated fix is ONE candidate approach (often the author's first idea). Generate 2-3 distinct approaches that include it as a candidate.
+- **solution-converge:** choose on evidence and outcome quality. The body's fix wins only if it survives comparison against the alternatives.
+
+**Gate:** If the final plan matches the solution the issue body prescribed, the scope must show the re-derivation that earned it (alternatives considered, evidence, rejected-with-rationale). A plan that adopts the body's fix without re-derivation is a bypass. The verification gates (2.5 / 5.5) check for this.
+
 ## Design Principle: File Extra Issues, Don't Silently Absorb
 
 Scoping often discovers things that are genuinely separate from the issue at hand — adjacent bugs, unrelated improvements, documentation gaps, tech debt. These are NOT hard dependencies and should NOT be silently absorbed into the scope. They should be filed as separate GitHub issues so they're tracked, prioritized, and owned independently.
@@ -188,6 +200,7 @@ CHECK FOUR DIMENSIONS + DIMENSION 5:
    - Were rejected alternatives documented with rationale?
    - Is there a falsification check? Confidence score?
    - DID CONVERGENCE PICK THE ORIGINAL ISSUE'S FRAMING WITHOUT CHALLENGING IT? Flag as P1.
+   - WAS A SOLUTION THE ISSUE BODY PRESCRIBES ("the fix is X") ADOPTED AS SETTLED WITHOUT RE-DERIVATION IN THE DOUBLE DIAMOND? Flag as P1.
 
 3. QUALITY OVER CONVENIENCE: Did convergence prioritize correctness over ease?
    - Was a framing rejected because it required more research?
@@ -294,6 +307,7 @@ CHECK FOUR DIMENSIONS:
    - Were rejected alternatives documented with "when this WOULD have been better"?
    - DID CONVERGENCE PICK THE APPROACH WITH FEWER FILES TO TOUCH? Flag as P1.
    - IS THERE A BETTER APPROACH THAT WAS REJECTED FOR CONVENIENCE? Flag as P0.
+   - WAS THE ISSUE BODY'S PRESCRIBED SOLUTION TREATED AS THE PLAN (ADOPTED UNCHANGED) RATHER THAN RE-DERIVED AND VERIFIED AGAINST ALTERNATIVES? Flag as P1.
 
 3. PLAN COMPLETENESS: Does the plan surface everything?
    - All states: loading, empty, error, edge cases?
@@ -367,6 +381,7 @@ CHECK ACROSS ALL PHASES:
 4. SOLUTION CONVERGE: Quality over convenience? Rejected alternatives documented?
 5. COMPLETENESS: States covered? Edge cases? Prerequisites? Acceptance Criteria?
 6. WIRING: Integration surfaces accounted for?
+7. HYPOTHESIS RULE: If the issue body prescribes a solution ("the fix is X"), was it treated as a hypothesis to verify — not the settled plan?
 
 Severity: P0=structural, P1=important gap, P2=improvement, P3=nitpick, P4=suggestion.
 If no issues: NO ISSUES FOUND
@@ -494,12 +509,13 @@ gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q '^scop
 - Fetch with `gh issue view`
 - Understand problem, proposed fix, impact
 - Identify affected files and systems
+- Treat any proposed fix in the body ("the fix is X") as the author's HYPOTHESIS — one candidate to verify in the double diamond, not the plan (see Design Principle above)
 
 ---
 
 ## Phase 1 — problem-diverge: Diverge on Problem
 
-**Purpose:** Explore the problem space broadly. The issue body states ONE problem definition — generate alternatives.
+**Purpose:** Explore the problem space broadly. The issue body states ONE problem definition — generate alternatives. If the body also prescribes a solution ("the fix is X"), treat it as a hypothesis to challenge — never as a settled plan.
 
 ### Sub-Agent Dispatch
 
@@ -770,6 +786,7 @@ PROJECT ROOT: <absolute path>
 ⛔ QUALITY OVER CONVENIENCE: Pick the approach that produces the BETTER OUTCOME.
 Evaluate on: outcome quality, edge case handling, failure mode coverage, future extensibility.
 Do NOT evaluate on: diff size, number of files touched, implementation speed.
+⛔ HYPOTHESIS, NOT PLAN: the issue body's prescribed fix ("the fix is X") is the author's hypothesis — one candidate approach. Re-derive from the CONFIRMED PROBLEM; adopt the body's fix only if it wins on evidence against the alternatives.
 
 1. PICK THE BEST APPROACH. Document why. Document rejected alternatives.
 2. DRAFT THE PLAN: problem statement, proposed solution, implementation plan, testing strategy, verification plan, acceptance criteria, runtime prerequisites.

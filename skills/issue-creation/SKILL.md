@@ -171,7 +171,12 @@ Before creating the issue, verify nothing was forgotten from the parent. This ca
 - [ ] **Test-design** — does this issue's verification checklist derive from the epic's integration-surface map, covering every surface this issue touches?
 
 ### Research
-If this issue needs investigation before implementation, note what to research. For standard+complex issues, this feeds into `issue-scoping` Phase 1.5's `### Axis Research` matrix (external best-practice research per axis). For micro issues, skip.
+Two independent questions — an issue body must answer both without conflating them:
+
+1. **Investigation** — does implementation need external knowledge or codebase research first? If yes, say what (and link any brief via `**Research:**`). For standard+complex issues this feeds `issue-scoping` Phase 1.5's `### Axis Research` matrix (external best-practice research per axis). For micro issues, skip.
+2. **Open decisions** — which design choices must the Scope stage resolve? List them explicitly under `### Research Needed`. This is independent of question 1: "no investigation needed" says nothing about whether decisions are still open.
+
+**Never write "None — scope is clear" in `### Research Needed`:** "no research needed" answers only the investigation question — scope is not "clear" by default, and the Scope stage re-derives the approach regardless. An issue body that asserts a fix ("the fix is X") states the author's **hypothesis**, never a settled plan — `issue-scoping` treats it as a hypothesis to verify in the double diamond.
 
 ---
 
@@ -197,7 +202,7 @@ If this issue needs investigation before implementation, note what to research. 
 <relevant decisions from parent epic, inherited context, or "Standalone — no inherited context">
 
 ### Research Needed
-<what to investigate before implementation, or "None — scope is clear">
+<one of: (a) investigation required — what to research and why; (b) open design decisions the Scope stage must resolve — list EACH explicitly (non-empty = the solution is NOT settled); (c) "None" only when both (a) and (b) are genuinely absent. Never "None — scope is clear": no investigation ≠ no open decisions. A body that prescribes a fix states a hypothesis for Scope to verify — not the plan.>
 
 ### Verification Checklist
 Derived from the epic's test-design surface map — one row per surface this issue touches:
