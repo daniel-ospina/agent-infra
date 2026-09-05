@@ -11,8 +11,9 @@ name: agent-infra drift check
 #                    missing copied templates, workflow `uses:` refs pinned to
 #                    something other than manifest.ci.ref (#303 contract; check.ci.ref is kept in sync by the _checkCI guard, #387), inline
 #                    generic test jobs (node --test / vitest / tsx --test over
-#                    static globs — expressible via the reusable unit-test
-#                    capability, #389).
+#                    static globs or a python -m pytest / pytest dir-suite —
+#                    expressible via the reusable unit-test (node-ci.yml) /
+#                    python test (python-ci.yml) capabilities, #389/#403).
 #   WARN (exit 0)  — content drift: AGENTS.md / .mcp.json / .husky/* differ from
 #                    the base templates. Consumers legitimately customize these;
 #                    the merge/overwrite policy is a separate issue.

@@ -21,6 +21,8 @@ import {
   findWorkflowSymlinks,
   checkCiRefs,
   findInlineGenericTestJobs,
+  checkInlineGenericJobs,
+  remediationFor,
 } from "./ci-ref-check.cjs";
 
 let passed = 0;
@@ -301,7 +303,6 @@ test("#389 writing heredoc with suite text is NOT flagged", () => {
   "npx vitest --version",
   "npx tsx scripts/build.ts --test",
   "bash .github/scripts/check-migration-append-only prefix",
-  "uv run pytest tests/",
   "npm test",
   "npx jest tests/",
   "echo vitest",
@@ -397,6 +398,257 @@ test("#389 self-assertion: agent-infra's own workflows have 0 findings", () => {
     }
   }
   assert.deepEqual(hits, [], `agent-infra workflows should not self-flag: ${hits.join(", ")}`);
+});
+
+// ── Pytest dir-suite class (#403) ──────────────────────────────────────────
+// python-ci.yml is the peer reusable python test capability (test-command
+// input). A consumer that inlines a bare pytest dir-suite (python -m pytest /
+// pytest / uv run pytest over a static glob/directory) instead of calling it
+// FAILS drift-check with remediation naming python-ci.yml@<ref>. Boundary:
+// concrete .py files (incl. `::` node-ids), artifact + e2e-harness dirs,
+// --collect-only probes, dynamic targets, changed-files loops, and
+// services/strategy/container/uses jobs are non-targets — enforced live over
+// tortoise + premise-labs (acceptance gate).
+
+// Must flag (generic python dir/glob/bare suites):
+// NOTE: `uv run pytest tests/` moved here from the #389 non-flag list — its
+// #389 rationale was "not a node runner", which no longer holds once the
+// python dir-suite class exists (tracked follow-on #403).
+[
+  "python -m pytest tests/",
+  "python -m pytest tests/ -x --timeout=30 -q",
+  "python3 -m pytest tests/",
+  "python3.12 -m pytest tests/",
+  "pytest tests/",
+  "pytest",
+  "uv run pytest tests/",
+  "uv run python -m pytest tests/",
+  "python -m pytest .",
+  "python -m pytest tests/test_*.py",
+  "python -m pytest tests/unit tests/integration",
+  "RUN_CI=1 python -m pytest tests/",
+  "timeout 300 python -m pytest tests/",
+  "bash -c \"pip install -e . && python -m pytest tests/\"",
+  "bash -c \"cd tests && python -m pytest .\"",
+  "set -e; python -m pytest tests/",
+  "python -m pytest -q tests/",
+  "python -m pytest -m \"not e2e\" tests/",
+  "python -m pytest tests/ --timeout=30 -p no:cacheprovider",
+  "python -m pytest tests/ --ignore=tests/e2e",
+  "uv run --frozen pytest tests/",
+  "uv run --active python -m pytest tests/",
+  "uv run --extra test pytest tests/",
+  "uv run --extra test python -m pytest tests/",
+  "uv run --group dev pytest tests/",
+  "uv run --directory backend pytest tests/",
+  "uv run --with ruff pytest tests/",
+  "uv run --with pytest pytest tests/",
+  "uv run -p 3.12 pytest tests/",
+  "uv run --no-binary pytest tests/",
+  "uv run -w ruff pytest tests/",
+  "uv run --project backend pytest tests/",
+  "python -W error -m pytest tests/",
+  "python -X dev -m pytest tests/",  "pip install -e . && python -m pytest tests/",
+  "python -m pytest tests/ 2>&1 | tee pytest.log",
+  "if git diff --quiet; then python -m pytest tests/; fi",
+  "for f in tests/*.py; do python -m pytest \"$f\"; done",
+  "for f in tests/*_test.py; do python -m pytest \"$f\"; done",
+].forEach((cmd) => {
+  test(`#403 flags: ${cmd.slice(0, 60)}`, () => {
+    const hits = find(cmd);
+    assert.equal(hits.length, 1, `expected 1 finding for: ${cmd} — got ${JSON.stringify(hits)}`);
+  });
+});
+
+test("#403 multi-line run block flags (pip install + python dir-suite)", () => {
+  const hits = findInlineGenericTestJobs(wfBlock(["pip install -e .", "python -m pytest tests/ -x --timeout=30 -q"]));
+  assert.equal(hits.length, 1);
+});
+
+test("#403 static-iterable pytest loop flags with python-ci remediation pattern", () => {
+  const hits = findInlineGenericTestJobs(wfBlock(["for f in tests/*.py; do python -m pytest \"$f\"; done"]));
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].pattern, "pytest", "python loop must remediate to python-ci.yml, not node-ci.yml");
+});
+
+test("#389 node static-iterable loop keeps the node-ci loop pattern", () => {
+  const hits = findInlineGenericTestJobs(wfBlock(["for f in tests/*.test.js; do node --test \"$f\"; done"]));
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].pattern, "loop");
+});
+
+test("#403 executed heredoc body with a python dir-suite flags", () => {
+  const hits = findInlineGenericTestJobs(wfBlock(["bash <<'EOF'", "python -m pytest tests/", "EOF"]));
+  assert.equal(hits.length, 1);
+});
+
+test("#403 writing heredoc with a python dir-suite is NOT flagged", () => {
+  const hits = findInlineGenericTestJobs(wfBlock(["cat > file <<'EOF'", "python -m pytest tests/", "EOF"]));
+  assert.equal(hits.length, 0);
+});
+
+// Must NOT flag (python file-specific / e2e harness / probes / dynamic / non-suite):
+[
+  // file-specific e2e + unit runs (tortoise welcome-e2e / deploy-pages / monitor shapes)
+  "python -m pytest tests/e2e/test_welcome_page.py -q -rs -p no:cacheprovider",
+  "python -m pytest tests/e2e/test_legal_pages.py tests/e2e/test_signup_form_safety_e2e.py -v",
+  "python3 -m pytest tests/e2e/test_blog.py -v",
+  "python -m pytest tests/e2e/test_welcome_page.py tests/test_waitlist_form.py -q -rs -p no:cacheprovider",
+  // concrete file + marker/-k flags
+  "python -m pytest tests/test_hosted_api.py -k \"concurrent_first_calls or registry_anchor_reuses\" -v --timeout=300",
+  "python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q",
+  "python -m pytest -m smoke tests/test_foo.py",
+  // space-form value flags BEFORE a concrete-file target (review #403: unlisted
+  // flag values must not be misread as a suite target)
+  "python -m pytest --durations 5 tests/e2e/test_x.py",
+  "pytest --maxfail 2 tests/test_foo.py",
+  "pytest -q --capture fd tests/e2e/test_x.py",
+  "python -m pytest --color yes tests/test_foo.py",
+  // node-id target → the concrete file
+  "python -m pytest tests/test_event_store.py::test_seq_is_monotonic -x",
+  // e2e-harness directory class (tortoise hosted-e2e runs tests/e2e/hosted/)
+  "python -m pytest tests/e2e/hosted/ -q -rs -p no:cacheprovider --durations=10 --capture=sys 2>&1 | tee /tmp/hosted-e2e.log",
+  "python -m pytest e2e/",
+  "python -m pytest tests/e2e/*.py",
+  // collect-only probes (never executes tests — tortoise uv-lock-check shape)
+  "uv run pytest tests/ --collect-only -q --ignore=tests/e2e",
+  "python -m pytest --collect-only",
+  "pytest --collect-only tests/",
+  // dynamic targets / shell-var indirection
+  "python -m pytest $TEST_GLOB",
+  "python -m pytest tests/${{ matrix.dir }}",
+  "python -m pytest $FILES",
+  // changed-files loops (dynamic iterable → whole span neutral)
+  "for f in $(git diff --name-only --diff-filter=d); do python -m pytest \"$f\"; done",
+  "for f in ${{ needs.changes.outputs.carve_out }}; do python -m pytest \"$f\"; done",
+  // uv --with whose value IS the runner token: the value is consumed, the
+  // -c string is not a pytest run (no dir-suite)
+  "uv run --with pytest -c \"import foo; foo.main()\"",
+  "uv run -w pytest -c \"import foo; foo.main()\"",
+  // unlisted-plugin space-form value flags before a neutral target
+  "python -m pytest --html report.html tests/e2e/",
+  "python -m pytest --base-url http://localhost tests/e2e/test_x.py",
+  "python -m pytest --override-ini addopts=-q tests/e2e/test_x.py",
+  // e2e-harness iterables are neutral for the python family (mirror of the
+  // direct-form tests/e2e carve)
+  "for f in tests/e2e/*.py; do python -m pytest \"$f\"; done",
+  "for f in tests/e2e/hosted/*.py; do python -m pytest \"$f\"; done",
+  // non-pytest python runners / probes / echo
+  "python -m mypy tortoise/",
+  "python -m unittest tests/",
+  "python scripts/run-tests.py",
+  "uv run python scripts/foo.py",
+  "uv lock --check",
+  "uv sync --frozen",
+  "pip install pytest pytest-timeout",
+  "pytest --version",
+  "python -m pytest --help",
+  "echo python -m pytest tests/",
+].forEach((cmd) => {
+  test(`#403 does NOT flag: ${cmd.slice(0, 60)}`, () => {
+    const hits = find(cmd);
+    assert.equal(hits.length, 0, `expected 0 findings for: ${cmd} — got ${JSON.stringify(hits)}`);
+  });
+});
+
+// Workflow shapes + live acceptance shapes:
+test("#403 premise-labs python-tests shape (services:) is suppressed", () => {
+  const content = [
+    "jobs:",
+    "  python-tests:",
+    "    runs-on: ubuntu-latest",
+    "    services:",
+    "      postgres:",
+    "        image: postgres",
+    "    steps:",
+    "      - run: python -m pytest tests/ -q --timeout=60",
+  ].join("\n");
+  assert.equal(findInlineGenericTestJobs(content).length, 0);
+});
+
+test("#403 tortoise uv-lock-check collect-only shape NOT flagged", () => {
+  const content = [
+    "jobs:",
+    "  uv-lock-check:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - run: uv run pytest tests/ --collect-only -q --ignore=tests/e2e",
+  ].join("\n");
+  assert.equal(findInlineGenericTestJobs(content).length, 0);
+});
+
+test("#403 tortoise hosted-e2e harness dir-suite NOT flagged", () => {
+  const content = [
+    "jobs:",
+    "  hosted-e2e:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - run: |",
+    "          set -o pipefail",
+    "          RUN_HOSTED_E2E=1 python -m pytest tests/e2e/hosted/ \\",
+    "            -q -rs -p no:cacheprovider --durations=10 --capture=sys 2>&1 | tee /tmp/hosted-e2e.log",
+  ].join("\n");
+  assert.equal(findInlineGenericTestJobs(content).length, 0);
+});
+
+test("#403 tortoise changed-files carve-out loop shape NOT flagged", () => {
+  const content = [
+    "jobs:",
+    "  test-carve-out:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - run: |",
+    "          FILES=\"\"",
+    "          for f in ${{ needs.changes.outputs.carve_out }}; do FILES=\"$FILES tests/$f.py\"; done",
+    "          python -m pytest $FILES -q --timeout=60",
+  ].join("\n");
+  assert.equal(findInlineGenericTestJobs(content).length, 0);
+});
+
+test("#403 consumer exemplar (bare python dir-suite job) flags with pattern pytest", () => {
+  const content = [
+    "jobs:",
+    "  python-tests:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - uses: actions/checkout@v4",
+    "      - uses: actions/setup-python@v5",
+    "        with:",
+    "          python-version: '3.12'",
+    "      - run: pip install -e .",
+    "      - run: python -m pytest tests/ -q --timeout=60",
+  ].join("\n");
+  const hits = findInlineGenericTestJobs(content);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].job, "python-tests");
+  assert.equal(hits[0].pattern, "pytest");
+});
+
+test("#403 remediation maps pytest → python-ci.yml test-command (#389 patterns unchanged)", () => {
+  assert.deepEqual(remediationFor("pytest"), { workflow: "python-ci.yml", input: "test-command" });
+  assert.deepEqual(remediationFor("node --test"), { workflow: "node-ci.yml", input: "test-glob" });
+  assert.deepEqual(remediationFor("vitest"), { workflow: "node-ci.yml", input: "test-command" });
+  assert.deepEqual(remediationFor("tsx --test"), { workflow: "node-ci.yml", input: "test-command" });
+  assert.deepEqual(remediationFor("loop"), { workflow: "node-ci.yml", input: "test-command" });
+  assert.equal(remediationFor("nope"), null);
+});
+
+test("#403 checkInlineGenericJobs dir-level finding carries remediationRef", () => {
+  const repo = tmpRepo();
+  const wf = path.join(repo, ".github", "workflows");
+  fs.mkdirSync(wf, { recursive: true });
+  fs.writeFileSync(path.join(wf, "ci.yml"), [
+    "jobs:",
+    "  python-tests:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "      - run: python -m pytest tests/ -x --timeout=30 -q",
+  ].join("\n"));
+  const hits = checkInlineGenericJobs(repo, "v0.1.2");
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].file, path.join(".github", "workflows", "ci.yml"));
+  assert.equal(hits[0].pattern, "pytest");
+  assert.equal(hits[0].remediationRef, "v0.1.2");
 });
 
 // ── Summary ────────────────────────────────────────────────────────────────
