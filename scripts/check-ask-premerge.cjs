@@ -356,13 +356,28 @@ if (testJob === null) {
 // label an adversary could mint on a decoy step: the step whose `run:`
 // invokes the fast suite (`python -m pytest $FILES` — the fixture-mode
 // regression module runs inside that suite via the matrix file list). A
-// step running a DIFFERENT suite (test_hosted_api.py, test-slow files) or a
-// decoy that only echoes/quotes the command (single- or double-quoted) does
-// not execute the module and is not the wiring.
+// step running a DIFFERENT suite (test_hosted_api.py, test-slow files), a
+// decoy that only echoes/quotes the command (single-, double-quoted, or a
+// here-doc whose BODY quotes it — here-doc bodies are inert DATA, never
+// executed), or an env-mapping decoy is not the wiring.
 function isFastSuitePytestStep(stepText) {
   const run = stepRunOf(stepText);
   if (!run) return false;
-  for (const rawLine of run.split("\n")) {
+  const lines = run.split("\n");
+  let heredocTerm = null; // active here-doc terminator (body lines are data)
+  for (const rawLine of lines) {
+    // a here-doc opener (`<<[-]?['"]?WORD`) makes every following line inert
+    // until a line that IS the terminator — pytest text inside a here-doc
+    // body is echoed/consumed, never executed.
+    if (heredocTerm !== null) {
+      if (rawLine.trim() === heredocTerm) heredocTerm = null;
+      continue;
+    }
+    const ho = rawLine.match(/<<[-]?['"]?([A-Za-z_][A-Za-z0-9_]*)/);
+    if (ho) {
+      heredocTerm = ho[1];
+      continue;
+    }
     let line = rawLine;
     // strip comments then quoted spans (a quoted echo of the command is not
     // an execution of it, regardless of the quote character)
