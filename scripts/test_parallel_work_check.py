@@ -2457,7 +2457,7 @@ def test_378_bash_wrapper_parity_with_python_on_padded_nonascii_id(tmp_path):
     the .sh wrapper's error-branch unlink must target EXACTLY that path — if
     the wrapper drifts (no trim, or a code-point tr instead of byte-wise), the
     stale scoped CLEAR survives the watchdog unlink and this test fails."""
-    sid = f"  pwc378-{uuid4().hex}-sess-é  "   # padded + é (2 utf-8 bytes)
+    sid = f"\n  pwc378-{uuid4().hex}-sess-é  \n"  # leading/trailing \n+spaces + é (2 utf-8 bytes)
     scope = pwc._session_scope_suffix({"PI_SESSION_ID": sid})
     assert scope is not None
     assert scope.endswith("-sess-__"), \

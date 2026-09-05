@@ -147,8 +147,12 @@ if [ -z "$token_file" ]; then
     # Trim leading+trailing ASCII whitespace so a padded / ALL-whitespace id
     # behaves like the python (strip " \t\n\r\v\f") and TS (same set) sides —
     # all-whitespace MUST fall back to the UNSCOPED path on EVERY side (the
-    # #378 parity invariant). LC_ALL=C pins `sed`'s [:space:] to ASCII.
-    token_sid_raw="$(printf '%s' "${PI_SESSION_ID:-}" | LC_ALL=C sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    # #378 parity invariant). The trim is WHOLE-STRING via parameter expansion
+    # (a sed line-record trim would diverge from python/TS on an embedded or
+    # leading newline) and locale-independent (no [:space:] class lookup).
+    token_sid_raw="${PI_SESSION_ID:-}"
+    while [[ "$token_sid_raw" == [$' \t\n\r\v\f']* ]]; do token_sid_raw="${token_sid_raw#?}"; done
+    while [[ "$token_sid_raw" == *[$' \t\n\r\v\f'] ]]; do token_sid_raw="${token_sid_raw%?}"; done
     token_sid="$(printf '%s' "$token_sid_raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
     if [ -n "$token_sid" ]; then
         token_file="/tmp/parallel-check-token.${token_sid}.json"
