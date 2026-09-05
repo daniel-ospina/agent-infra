@@ -63,7 +63,7 @@ const setEq = (a, b) => a.length === b.length && [...a].sort().join() === [...b]
 /** block-scalar fixture — value is a canonical representation (contentIndent
  *  not stripped, chomping not applied), so the oracle asserts direction
  *  (both non-empty strings) instead of byte equality. */
-const isBlockScalarFixture = (content) => /:[ \t]*[>|](?:[+-]?[1-9]?)[ \t]*\n/.test(content);
+const isBlockScalarFixture = (content) => /:[ \t]*[>|](?:[+-]?[1-9]?)[ \t]*(?:#.*)?\n/.test(content);
 
 // ── pi bundle ───────────────────────────────────────────────────────────────
 let pi;
@@ -386,6 +386,18 @@ const VALUE_POOL = [
   "|12",
   "|+0",
   ">0",
+  // #370 — block-scalar header + space + NON-comment token (pi drops: "Not a
+  // YAML token: <tok>"; validator flags throw-invalid-block-header). The
+  // whitespace-run + #-comment forms must stay passing wherever pi loads.
+  "| #c",
+  "|  # two-space comment",
+  "| comment",
+  "| 0",
+  "| 42",
+  "> text",
+  "|1 token",
+  "|- x",
+  "| x # y",
 ];
 const KEY_POOL = ["name", "description", "steps", "other", "key", "subjects.team"];
 
