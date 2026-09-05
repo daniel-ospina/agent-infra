@@ -7,10 +7,10 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
-import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync } from "node:fs";
+import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -511,25 +511,29 @@ test("review 230 P2-2: HOST/OWNER/REPO forms normalize to OWNER/REPO", () => {
 section("Module load regression");
 
 test("imports verification-gate without errors (#5622 regression)", async () => {
-  // The fact that this test file imports from verification-gate.js
-  // without throwing is itself the test. If the module had import
-  // errors (like #5622), this file wouldn't load at all.
-  ok(true, "module loaded successfully");
+  // A static-import crash fails the whole file at load (the real #5622
+  // signal), so an ok(true) body would be empty. What the static import does
+  // NOT check is the module's primary export — the plugin factory the e2e
+  // harness mounts via mod.default — so assert it is present and callable.
+  const mod = (await import("./index.js")) as any;
+  equal(typeof mod.default, "function", "plugin factory default export must be callable");
 });
 
 test("exported functions are callable (#5527 regression)", () => {
-  // Verify exported functions exist and don't throw on basic calls
-  ok(typeof extractJson === "function");
-  ok(typeof isValidResult === "function");
-  ok(typeof isGitOp === "function");
-  ok(typeof isGitCommit === "function");
-  ok(typeof resolveProjectRoot === "function");
-
-  // Quick smoke test — should not throw
-  extractJson('{"status":"PASS","failures":[],"verified_files":[]}');
-  isGitOp("git commit -m test");
-  isGitCommit("git commit -m test");
-  ok(true, "all exports callable without errors");
+  // Smoke-verify the exported surface — INCLUDING the #472 predicates — with
+  // concrete outcomes (not ok(true)): a regression that starts throwing or
+  // drops an export fails here with a named diagnostic.
+  const callables = [
+    extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot,
+    isShapeExemptFile, isDeletionPush, isBareCommitShape,
+  ] as const;
+  for (const fn of callables) ok(typeof fn === "function", "export must be callable");
+  equal(extractJson('{"status":"PASS","failures":[],"verified_files":[]}')!.status, "PASS", "extractJson smoke");
+  equal(isGitOp("git commit -m test"), true, "isGitOp smoke");
+  equal(isGitCommit("git commit -m test"), true, "isGitCommit smoke");
+  ok(isShapeExemptFile("README.md"), "isShapeExemptFile smoke");
+  ok(isDeletionPush("git push origin --delete feat/x"), "isDeletionPush smoke");
+  ok(isBareCommitShape("git commit -m x"), "isBareCommitShape smoke");
 });
 
 // ── normalizeRegistryPath (#7595) ────────────────────
@@ -1283,6 +1287,432 @@ test("#285 drift guard: isTaskSubAgent reads the marker pair the dispatchers for
   ok(
     src.includes('env.TASK_HEARTBEAT === "1" && env.PI_MODE === "print"'),
     "verification-gate isTaskSubAgent must read TASK_HEARTBEAT=1 ∧ PI_MODE=print (same pair as review-enforcer / task-heartbeat)"
+  );
+});
+
+// ── #472 proportionality — content-shape exemption (mechanism a) ──
+
+section("isShapeExemptFile — content-shape exemption (#472 mechanism a)");
+
+test("exempt: docs/CSS/static content classes (top-level + nested docs, all four extensions)", () => {
+  const exempt = [
+    "docs/README.md",
+    "README.md",
+    "MEMORY.md",
+    "docs/research/x.md",
+    "website/index.html",
+    "docs/guides/index.html",
+    "theme.css",
+    "theme.scss",
+  ];
+  for (const p of exempt) ok(isShapeExemptFile(p), `${p} must be exempt`);
+});
+
+test("denylist: ANY file under a build-output segment stays gated (all 4 extensions, any depth)", () => {
+  const denied = [
+    "public/index.html",
+    "dist/bundle.css",
+    "build/out.css",
+    "website/public/index.html",
+    "public/README.md",
+    "assets/build/x.md",
+  ];
+  for (const p of denied) equal(isShapeExemptFile(p), false, `${p} must NOT be exempt (build output)`);
+});
+
+test("fail-closed: every other extension + extension-less files keep the gate ON", () => {
+  const denied = ["src/app.ts", "Dockerfile", "LICENSE", "package.json", "supabase/migrations/x.sql", "docs/CHANGELOG", "website/README", ""];
+  for (const p of denied) equal(isShapeExemptFile(p), false, `${p === "" ? "<empty>" : p} must NOT be exempt`);
+});
+
+test("case-insensitive match (path lowercased before compare — macOS default FS)", () => {
+  equal(isShapeExemptFile("Public/index.html"), false, "uppercase build segment still denied");
+  equal(isShapeExemptFile("DIST/bundle.css"), false, "uppercase build segment still denied");
+  ok(isShapeExemptFile("docs/README.md"), "nested docs exempt");
+  ok(isShapeExemptFile("README.MD"), "uppercase extension exempt");
+});
+
+test("exact-segment boundary: prefix lookalikes (build-guide/, public-assets/, dist-notes/) stay exempt", () => {
+  // The build-output denylist matches EXACT path segments (index.ts:
+  // "Exact-segment match: `build-guide/` is NOT `build/` and stays exempt").
+  // A regression to substring/prefix matching would deny these while every
+  // deny-pin above still denies — only an allow-side pin catches it.
+  const exempt = [
+    "build-guide/README.md",
+    "public-assets/theme.css",
+    "dist-notes/index.html",
+    "docs/guides/build-guide/x.md",
+  ];
+  for (const p of exempt) ok(isShapeExemptFile(p), `${p} must stay exempt (prefix lookalike, not a build-output segment)`);
+});
+
+// ── #472 proportionality — delete-shaped push classification (mechanism b) ──
+
+section("isDeletionPush — delete-shaped push classification (#472 mechanism b)");
+
+// FULL 05-cleanup.md merged-branch cleanup ceremony block — the code body
+// between the fences (skills/commit-workflow/workflow/05-cleanup.md:37-53),
+// VERBATIM, and the real #470 incident shape: an agent pastes the whole doc
+// block as ONE command. Carries full-line `#` comment scaffolding (incl. the
+// apostrophe in "session's worktree" — plan D5: full-line comments must never
+// poison the quote scan), a backslash-newline continuation, ℹ️/⚠️ echo
+// fallbacks, and if/fi blocks. Shared by BOTH predicates so the full-block
+// fixture stays in sync across the isDeletionPush and isBareCommitShape
+// classification surfaces.
+const FULL_05_CLEANUP_BLOCK = `# BRANCH = the merged PR branch (from the session's worktree, or resolve via gh):
+BRANCH=$(git branch --show-current)
+[ -n "$BRANCH" ] || BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
+
+# Remote delete — server-side, always possible after merge; "remote ref does not
+# exist" means deleteBranchOnMerge already removed it = success.
+git push origin --delete "$BRANCH" 2>/dev/null \\
+  || echo "ℹ️ remote branch $BRANCH already deleted or unavailable"
+
+# Local delete — now safe IF the worktree was removed above (lock released).
+# If the worktree removal FAILED, do not fail the ceremony: WARN + leave a teardown note.
+if git worktree list --porcelain | grep -q "branch refs/heads/$BRANCH"; then
+  echo "⚠️ branch $BRANCH is still checked out in a worktree — local delete deferred."
+  echo "   TEARDOWN NOTE: remove the worktree and run: git branch -D $BRANCH"
+else
+  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH could not be deleted — delete manually: git branch -D $BRANCH"
+fi`;
+
+test("TRUE: delete-shaped forms (flag either position, :refspec, -d, multi-target, redirects, cd-prefix)", () => {
+  const truePins = [
+    "git push origin --delete feat/x",
+    "git push --delete origin feat/x",
+    "git push origin :feat/x",
+    "git push origin :refs/heads/feat/x",
+    "git push -d origin feat/x",
+    "git push origin --delete a b c",
+    // 05-cleanup incident literal — real backslash-newline continuation:
+    `git push origin --delete "$BRANCH" 2>/dev/null \\
+  || echo "remote branch $BRANCH already deleted"`,
+    "cd /repo && git push origin --delete feat/x",
+    "git push origin :feat/x 2>/dev/null || true",
+  ];
+  for (const c of truePins) ok(isDeletionPush(c), `must classify pure deletion: ${JSON.stringify(c)}`);
+});
+
+test("FALSE: vacuous-truth guard + any content refspec/flag/mixed/chain/commit/gh-op", () => {
+  const falsePins = [
+    "git push",
+    "git push origin",
+    "git push origin main",
+    "git push -u origin x",
+    "git push --force-with-lease origin main",
+    "git push origin main --delete foo",
+    "git push origin --delete a && git push origin main",
+    "git push origin --delete a & git push origin main",
+    "git commit -m x && git push origin --delete foo",
+    "git push --tags",
+    "git push --all",
+    "git push --mirror origin",
+    "git push origin --delete",
+    'git push origin "main"',
+    "gh -R daniel-ospina/agent-infra pr merge 5 && git push origin --delete foo",
+  ];
+  for (const c of falsePins) equal(isDeletionPush(c), false, `must stay gated: ${c}`);
+});
+
+test("review P1/P2-1 repros: bare-colon refspec and git-global-flag commit stay gated", () => {
+  // P1: bare `:` is git's matching-push fallback (ships content) — must NOT
+  // classify as pure deletion; `:$VAR` may expand empty at runtime.
+  // P2-1: `-C repo` between git and commit made the old substring scan miss
+  // the commit → the -a sweep would ride the docs exemption.
+  equal(isDeletionPush("git push origin :"), false, "bare colon = matching-push fallback → ships content (P1 repro)");
+  equal(isDeletionPush("git push origin :$BRANCH"), false, ":$VAR may expand empty at runtime");
+  equal(isDeletionPush("git -C repo commit -am x && git push origin --delete foo"), false, "commit behind git global flag (P2-1 repro)");
+  equal(isDeletionPush('git -c "user.name=A B" commit -am x && git push origin --delete foo'), false, "quoted-value global flag hides the content commit (P2-1 quote-aware repro)");
+});
+
+test("prefix-verb pins (classifier flip surface >= interception surface)", () => {
+  equal(isDeletionPush("sudo git push origin main"), false, "prefixed content push stays gated");
+  equal(isDeletionPush("env GIT_DIR=. git push origin main"), false, "env-prefixed content push stays gated");
+  equal(isDeletionPush("nohup git push origin main"), false, "nohup-prefixed content push stays gated");
+  ok(isDeletionPush("sudo git push origin --delete feat/x"), "prefix-stripped pure deletion classifies TRUE");
+});
+
+test("wrapper containment pins (fail-closed — substring scan symmetric with interception)", () => {
+  const wrapperPins = [
+    "sh -c 'git push origin main'",
+    "sh -c 'git commit -am x' && git push origin --delete foo",
+    "! git commit -am x && git push origin --delete foo",
+    "! gh pr merge 5 && git push origin --delete foo",
+    "! git push origin --delete foo",
+    'GIT_SSH_COMMAND="ssh -o BatchMode=yes" git push origin --delete foo',
+  ];
+  for (const c of wrapperPins) equal(isDeletionPush(c), false, `must stay gated: ${c}`);
+});
+
+test("non-interception pins: git branch -D / git worktree remove / gh pr view are NOT git ops", () => {
+  equal(isDeletionPush("git branch -D feat/x"), false);
+  equal(isGitOp("git branch -D feat/x"), false);
+  equal(isDeletionPush("git worktree remove feat/x"), false);
+  equal(isGitOp("git worktree remove feat/x"), false);
+  equal(isDeletionPush("gh pr view 5"), false);
+});
+
+test("04-merge-deploy.md Step B literal (TRUE ceremony fixture — 2>&1 drop, gh api prose, quote-strip)", () => {
+  // Copied VERBATIM from skills/commit-workflow/workflow/04-merge-deploy.md:91.
+  const literal = `git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete failed — delete manually: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"`;
+  ok(isDeletionPush(literal), "merge-deploy ceremony delete must classify pure");
+});
+
+test("05-cleanup.md FULL fenced block (TRUE fixture — whole-ceremony paste, #470 shape)", () => {
+  // The #470 cleanup incident shape: the FULL 05-cleanup.md merged-branch
+  // ceremony pasted as ONE command. Full-line `#` comments — including an
+  // apostrophe ("session's worktree") and lines mentioning gated verbs — must
+  // not poison the quote scan or flip purity (plan D5 conformance); the only
+  // gated op in the block is the remote delete push → TRUE.
+  ok(isDeletionPush(FULL_05_CLEANUP_BLOCK), "whole 05-cleanup ceremony block must classify as pure deletion");
+});
+
+test("#472 fixture drift guard: FULL_05_CLEANUP_BLOCK == the live 05-cleanup.md ceremony block", () => {
+  // FULL_05_CLEANUP_BLOCK claims VERBATIM fidelity to
+  // skills/commit-workflow/workflow/05-cleanup.md but is a hand-maintained
+  // copy — a doc edit (e.g. a maintainer adding a content push or a commit
+  // invocation to the ceremony) would silently desync the pinned
+  // classification surface from the command agents actually run. Mirror the
+  // 01-preflight drift guard: enforce from an agent-infra source checkout,
+  // soft-skip deployed copies (isSourceCheckout).
+  if (!isSourceCheckout()) {
+    console.log("  ↪ skip (deployed copy — not an agent-infra source checkout)");
+    return;
+  }
+  const docText = resolveRepoDoc(
+    "../../skills/commit-workflow/workflow/05-cleanup.md",
+    "../../skills/commit-workflow/workflow/05-cleanup.md",
+    "skills/commit-workflow/workflow/05-cleanup.md",
+  );
+  if (docText === null) {
+    ok(false, "05-cleanup.md unreachable from the agent-infra source tree — FULL_05_CLEANUP_BLOCK fixture drift guard would pass vacuously; restore the doc or fix the resolution");
+    return;
+  }
+  // Extract the merged-branch ceremony ```bash fence (starts with the BRANCH
+  // resolution line; closes at the ``` after the branch -D fallback).
+  const fenceOpen = docText.indexOf("```bash\n# BRANCH = the merged PR branch");
+  ok(fenceOpen !== -1, "05-cleanup.md must contain the merged-branch ceremony ```bash fence");
+  const bodyStart = fenceOpen + "```bash\n".length;
+  const fenceClose = docText.indexOf("\n```", bodyStart);
+  ok(fenceClose !== -1, "05-cleanup.md ceremony fence must close");
+  equal(
+    docText.slice(bodyStart, fenceClose).trimEnd(),
+    FULL_05_CLEANUP_BLOCK,
+    "05-cleanup.md ceremony block drifted from FULL_05_CLEANUP_BLOCK — re-copy VERBATIM (isDeletionPush and isBareCommitShape both pin it)"
+  );
+});
+
+test("quote-aware comment strip: multi-line quoted values keep closing quotes (M1/B1/B2 fail-open regressions)", () => {
+  // Review M1: a `#`-leading line INSIDE an open multi-line string is DATA, not
+  // a comment — a blind pre-regex strip deleted its closing quote, collapsing
+  // a REAL content push on the next line into the delete segment → false skip.
+  // The strip is quote-aware (scanner state): the closing quote survives, the
+  // content push is its own segment → gated.
+  const m1 = `git push origin --delete feat/x "note:\n# end of note"\ngit push origin main`;
+  equal(isDeletionPush(m1), false, "content push after a multi-line quoted value must stay gated (M1)");
+  const m1c = `git push origin --delete feat/x "note: hi"\ngit push origin main`;
+  equal(isDeletionPush(m1c), false, "control without #-line still gated");
+  // Full-line comment mentioning a gated verb is stripped → does NOT flip purity.
+  equal(isDeletionPush(`# then: git commit -am x\ngit push origin --delete feat/x`), true, "full-line comment verb-mention stripped (D5)");
+  // Inline comment mentioning a gated verb (after real code) is NOT stripped →
+  // flips purity (fail-closed, symmetric with the gate's own substring scan).
+  equal(isDeletionPush(`echo hi # then: git commit -am x\ngit push origin --delete feat/x`), false, "inline comment verb-mention stays gated");
+  // Review P1-1: a comment line ENDING in a backslash must not swallow the next
+  // real line (the old global backslash-newline join erased the comment's
+  // terminator; bash terminates comments at the newline regardless of a
+  // trailing backslash). Content after a backslash-comment is its own segment.
+  equal(isDeletionPush(`git push origin --delete feat/x\n# cleanup note \\\ngit push origin main`), false, "content push after a backslash-terminated comment stays gated (P1-1)");
+  equal(isDeletionPush(`git push origin --delete feat/x\n# cleanup note \\\necho done`), true, "delete-only after a backslash-terminated comment stays pure");
+  // Review deep-P2 (delete-target absorption): an absorbed "delete target"
+  // must be a SINGLE LITERAL shell word — command substitution / backtick /
+  // quote-swallowed prose with whitespace must keep the gate ON.
+  equal(isDeletionPush(`git push origin --delete feat/x $(git push origin main)`), false, "command substitution after --delete stays gated (deep-P2)");
+  equal(isDeletionPush("git push origin --delete feat/x $(git push origin main)"), false, "nested content push in $() stays gated");
+  equal(isDeletionPush("git push origin --delete feat/x \u0060git push origin main\u0060"), false, "nested content push in backticks stays gated");
+  equal(isDeletionPush(`git push origin --delete feat/x # session's note\ngit push origin main`), false, "inline-comment apostrophe absorbing a content-push line stays gated");
+  equal(isDeletionPush(`git push origin --delete "$BRANCH" 2>/dev/null || echo done`), true, "blessed $BRANCH delete ceremony still pure");
+});
+
+// ── #472 proportionality — commit-form guard (D2) ──
+
+section("isBareCommitShape — commit-form guard (#472 D2, FORALL semantics, fail-closed whitelist)");
+
+test("BARE → true (whitelist value/boolean flags, cd-prefix, vacuous non-commit)", () => {
+  const barePins = [
+    "git commit -m x",
+    "git commit -m x -s",
+    "git commit -S -m x",
+    "git commit --message x",
+    "git commit -F msg.txt",
+    "cd /repo && git commit -m x",
+    "git push origin main",
+  ];
+  for (const c of barePins) ok(isBareCommitShape(c), `must be bare/vacuous: ${c}`);
+  // Review 2a-2 (adjudicated known over-gate, NOT a pin): a trailing bash
+  // comment (`git commit -m x # docs WIP`) reads as a pathspec → false →
+  // VGATE runs. Fail-closed friction; a #-break fix opened fail-open
+  // spellings (quoted "#file" pathspec, continued line after inline comment)
+  // and was reverted. A QUOTED -m value containing # is consumed by -m and
+  // stays bare:
+  ok(isBareCommitShape('git commit -m "msg with # hash"'), "quoted -m value with # is bare");
+});
+
+test("review P2-1: bare commit behind git global flags is still bare", () => {
+  // `-C repo` / `--no-pager` between `git` and `commit` — old substring scan
+  // never registered these as commit segments (fail-open via vacuous allow).
+  ok(isBareCommitShape("git -C repo commit -m x"), "bare commit behind git global flag");
+  ok(isBareCommitShape("git --no-pager commit -m x"), "bare commit behind --no-pager");
+});
+
+test("NON-BARE → false (sweeps, attached spellings, pathspec, amend, only-mode, unknown long flags)", () => {
+  const nonBarePins = [
+    'git commit -am "x"',
+    'git commit -am"x"',
+    "git commit -amx",
+    "git commit --all -m x",
+    "git commit -m x path/to/file",
+    "git commit --amend -m x",
+    "git commit -o code.ts -m x",
+    "git commit -m x --only",
+    "git commit -mx",
+    "git commit -a",
+  ];
+  for (const c of nonBarePins) equal(isBareCommitShape(c), false, `must NOT be bare: ${c}`);
+});
+
+test("review P2-1: -a sweep behind git global flags is non-bare", () => {
+  // The whole point of containment: `git -C repo commit -am x` must register
+  // as a commit so the -a sweep can never ride a docs-only staged set.
+  equal(isBareCommitShape("git -C repo commit -am x"), false, "-a sweep behind git global flag");
+  equal(isBareCommitShape('git --no-pager commit -am "x"'), false, "-am behind --no-pager");
+});
+
+test("∀ semantics: ANY non-bare commit invocation poisons the whole command", () => {
+  equal(isBareCommitShape("git commit -am x && git commit -m y"), false, "first commit sweeps -a");
+  equal(isBareCommitShape("git commit -m x && git commit --amend -m y"), false, "second commit amends");
+  equal(isBareCommitShape('git commit -m x && git -c "user.name=A B" commit -am y'), false, "second commit behind quoted-value global option sweeps -a");
+  ok(isBareCommitShape("git commit -m x && git commit -m y"), "all-bare chain must be allowed");
+  // Review P1-1 (FORALL surface): an -a sweep after a backslash-terminated
+  // comment line must stay visible (bash terminates comments at the newline;
+  // the trailing backslash is inert comment text).
+  equal(isBareCommitShape("git commit -m \"base\"\n# note \\\ngit commit -am x"), false, "-a sweep after a backslash-terminated comment stays gated (P1-1)");
+});
+
+test("wrapper containment pins (fail-closed — wrapper commits never ride a docs exemption)", () => {
+  const wrapperPins = [
+    "sh -c 'git commit -am x'",
+    "! git commit -am x",
+    "sudo -u me git commit -am x",
+    "bash -c 'git commit -m x'",
+  ];
+  for (const c of wrapperPins) equal(isBareCommitShape(c), false, `must NOT be bare: ${c}`);
+});
+
+test("05-cleanup.md fenced block (TRUE fixture — no commit invocations → vacuously bare)", () => {
+  // FULL_05_CLEANUP_BLOCK — the shared verbatim code body from
+  // skills/commit-workflow/workflow/05-cleanup.md:37-53 (defined in the
+  // isDeletionPush section above; the identical full-block literal is pinned
+  // on BOTH predicates so they cannot drift apart).
+  ok(isBareCommitShape(FULL_05_CLEANUP_BLOCK), "ceremony block with no commit invocations is vacuously bare");
+});
+
+// ── Shared doc-resolution for the two #472 drift guards ──
+// Enforcement target: the agent-infra SOURCE CHECKOUT. A deployed extension
+// copy (~/.pi/agent/extensions/… — the pi agent layout) has no .git marker
+// above it, and the skills/ tree next to it is an INDEPENDENTLY-SYNCED
+// artifact: doc↔exports enforcement against that pair is meaningless (a doc
+// that predates the fence would red-flag as drift). Source runs resolve the
+// doc and fail loudly if it is missing or drifted; deployed runs soft-skip.
+function isSourceCheckout(): boolean {
+  return existsSync(new URL("../../.git", import.meta.url)); // dir in a clone, file in a worktree
+}
+function resolveRepoDoc(relFromHere: string, ...cwdRels: string[]): string | null {
+  const viaUrl = new URL(relFromHere, import.meta.url);
+  if (existsSync(viaUrl)) return readFileSync(viaUrl, "utf8");
+  for (const rel of cwdRels) {
+    if (existsSync(rel)) return readFileSync(rel, "utf8");
+  }
+  return null;
+}
+
+// ── #472 — doc drift test: 01-preflight VGATE-SHAPE-RULE fence ↔ exports ──
+
+section("doc drift test — 01-preflight VGATE-SHAPE-RULE fence ↔ exports");
+
+test("#472 drift guard: 01-preflight VGATE-SHAPE-RULE fence == SHAPE_EXEMPT_EXTENSIONS + BUILD_OUTPUT_SEGMENTS", () => {
+  // Enforcement runs only from an agent-infra source checkout (isSourceCheckout
+  // — .git marker above this file). Deployed extension copies soft-skip: their
+  // sibling skills/ doc is an independently-synced artifact, and comparing this
+  // copy's exports against a doc that may simply predate the fence would be a
+  // spurious red, not drift detection.
+  if (!isSourceCheckout()) {
+    console.log("  ↪ skip (deployed copy — not an agent-infra source checkout)");
+    return;
+  }
+  const docText = resolveRepoDoc(
+    "../../skills/commit-workflow/workflow/01-preflight.md",
+    "../../skills/commit-workflow/workflow/01-preflight.md",
+    "skills/commit-workflow/workflow/01-preflight.md",
+  );
+  if (docText === null) {
+    ok(false, "01-preflight.md unreachable from the agent-infra source tree — VGATE-SHAPE-RULE drift guard would pass vacuously; restore the doc or fix the resolution");
+    return;
+  }
+
+  // Extract rows between the opener and closer comment lines.
+  const open = docText.indexOf("<!-- VGATE-SHAPE-RULE");
+  const close = docText.indexOf("<!-- /VGATE-SHAPE-RULE", open);
+  ok(open !== -1, "01-preflight.md must contain the VGATE-SHAPE-RULE opener comment");
+  ok(close !== -1 && close > open, "01-preflight.md must contain the VGATE-SHAPE-RULE closer comment");
+
+  const rows = docText
+    .slice(open, close)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith("|"));
+  ok(rows.length >= 3, "VGATE-SHAPE-RULE fence must contain a header row, a separator row, and ≥1 data row");
+  // Content-validate the separator anchor so a layout edit (stray | line
+  // inserted above the table, separator deleted/reworded) fails with a clear
+  // structural error instead of leaking `---` tokens into the deepEqual diff.
+  ok(/^\|[\s:|-]+\|$/.test(rows[1]),
+     `VGATE-SHAPE-RULE fence layout changed — row 1 must be the --- separator: ${rows[1]}`);
+
+  // Header + separator are anchored by POSITION (rows 0-1) — the fence is
+  // machine-read, so a cosmetic reword of the header cell must not break the
+  // parse. Any data row with ≠2 populated cells FAILS loudly: a malformed or
+  // prose row inside the fence is drift and must never be silently ignored.
+  const cellSplit = (rawLine: string): string[] =>
+    rawLine.split("|").map((c) => c.trim()).filter((c) => c.length > 0);
+
+  const fenceExts = new Set<string>();
+  const fenceSegs = new Set<string>();
+  for (const rawLine of rows.slice(2)) {
+    const cells = cellSplit(rawLine);
+    ok(cells.length === 2, `malformed VGATE-SHAPE-RULE data row (must be exactly 2 populated cells): ${rawLine}`);
+    if (cells.length !== 2) continue;
+    // Data row: col 1 = extension token(s); col 2 = code-span segment tokens.
+    // NORMALIZE: strip surrounding backticks from every token, then strip a
+    // trailing `/` from segment tokens (`public/` → `public`) for the compare.
+    const tokens = (cell: string): string[] =>
+      cell.split(/\s+/).map((t) => t.replace(/^`+/, "").replace(/`+$/, "")).filter((t) => t.length > 0);
+    for (const ext of tokens(cells[0])) fenceExts.add(ext);
+    for (const seg of tokens(cells[1])) fenceSegs.add(seg.replace(/\/+$/, ""));
+  }
+
+  const fenceExtList = [...fenceExts].sort();
+  const fenceSegList = [...fenceSegs].sort();
+  const extExports = [...SHAPE_EXEMPT_EXTENSIONS].sort();
+  const segExports = [...BUILD_OUTPUT_SEGMENTS].sort();
+  deepEqual(
+    fenceExtList,
+    extExports,
+    `fence extensions {${fenceExtList.join(", ")}} != exports {${extExports.join(", ")}} — 01-preflight.md VGATE-SHAPE-RULE drifted from SHAPE_EXEMPT_EXTENSIONS`
+  );
+  deepEqual(
+    fenceSegList,
+    segExports,
+    `fence segments {${fenceSegList.join(", ")}} != exports {${segExports.join(", ")}} — 01-preflight.md VGATE-SHAPE-RULE drifted from BUILD_OUTPUT_SEGMENTS`
   );
 });
 

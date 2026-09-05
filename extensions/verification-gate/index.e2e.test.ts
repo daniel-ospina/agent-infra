@@ -1337,6 +1337,501 @@ async function main() {
       if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
   });
+
+  // ── #472: proportionality — content-shape VGATE exemption + delete-push short-circuit ──
+  // Mechanism (a): ops whose relevant file set is ENTIRELY docs/CSS/static
+  // (no build-output path segment) skip VGATE — audited gate_skip:
+  // content_shape_exempt. Allow-only (no verifiedSet/bridge writes) and
+  // bare-commit guarded (isBareCommitShape — `-a`/bundles/pathspecs are never
+  // exempt, D2). Mechanism (b): delete-shaped pushes ship NO local content and
+  // short-circuit before any staged-diff computation — audited gate_skip:
+  // delete_push_no_content. Both are additive early-return skips; the
+  // unverified loop, #7591 auto-bypass, and sub-agent semantics stay
+  // byte-identical. Each scenario uses a dedicated repo dir + session_start
+  // (standard isolation); audit assertions use delta-counts over
+  // readAuditLines() (records accumulate across scenarios).
+
+  section("#472 — proportionality");
+
+  test("scenario 38 (#472): docs-only commit unblocked (content-shape exemption, allow-only)", async () => {
+    const repo = join(TEST_ROOT, "repo-472-38");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "# demo\n");
+    mkdirSync(join(repo, "styles"), { recursive: true });
+    writeFileSync(join(repo, "styles", "theme.css"), "body{}\n");
+    git(repo, "add README.md styles/theme.css");
+    await fire("session_start", {});
+    const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const bypassBefore = readAuditLines().filter((l) => l.event === "gate_bypass").length;
+    // D1 allow-only snapshot (taken BEFORE the commit so the check is self-
+    // contained — no ordering dependency on earlier scenarios having written
+    // the bridge). This repo NEVER has a verifier dispatch, so a byte change
+    // (or a file appearing) across the exempt commit is contamination.
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    const bridgeBefore = existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m docs", cwd: repo },
+    });
+    equal(res, undefined, "docs-only commit must be ALLOWED (content-shape exemption)");
+    const audit = readAuditLines();
+    ok(audit.filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
+       "audit must record a gate_skip with reason content_shape_exempt");
+    ok(audit.filter((l) => l.event === "gate_bypass").length === bypassBefore,
+       "the skip must NOT add any gate_bypass entry (allow-only, no self-bless — D1)");
+    // Audit deltas alone cannot catch a self-blessing skip (a contamination
+    // regression emits gate_skip, not gate_bypass) — assert the durable
+    // registry channel directly: byte-identical bridge across the skip.
+    equal(existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null, bridgeBefore,
+       "exempt skip must leave the bridge byte-identical (allow-only, D1 — no verifiedSet/bridge writes)");
+  });
+
+  test("scenario 39 (#472): docs-only gh pr create unblocked (branch-diff path)", async () => {
+    const repo = join(TEST_ROOT, "repo-472-39");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base39.txt"), "b\n");
+    git(repo, "add base39.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    git(repo, "remote add origin git@github.com:e2e/self.git"); // scenario 19/20 remote/head sandbox
+    // Docs-only feature branch ahead of origin/main (which stays at the base):
+    git(repo, "checkout -b feat-docs");
+    writeFileSync(join(repo, "README.md"), "# docs\n");
+    git(repo, "add README.md");
+    git(repo, "commit -m docs");
+    git(repo, `update-ref refs/remotes/origin/main ${baseSha}`);
+    await fire("session_start", {});
+    const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    const bridgeBefore = existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null;
+    // `gh pr create` is NOT merge-scoped — its diff IS this branch's files
+    // (computeBranchDiff). An all-docs branch diff hits mechanism (a).
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "gh pr create --title t", cwd: repo },
+    });
+    equal(res, undefined, "docs-only gh pr create must be ALLOWED (branch diff is all docs)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
+       "audit must record the content_shape_exempt skip for the create");
+    // D1 allow-only on the branch-diff surface: this repo never dispatched, so
+    // the bridge must be byte-identical across the exempt create (scenario 38
+    // pins the staged-diff surface; this pins computeBranchDiff).
+    equal(existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null, bridgeBefore,
+       "exempt gh pr create must leave the bridge byte-identical (allow-only, D1)");
+    // Mixed-branch denial (mechanism (a) on the branch-diff surface): a branch
+    // carrying docs AND code must block on `gh pr create` — only an all-docs
+    // branch is exempt. Scenarios 40/41/42 pin the staged-diff half, 44-leg4
+    // pins an all-code merge diff; this pins the MIXED branch diff for the
+    // create verb — a diff-scoping regression that filtered the branch diff
+    // down to exempt-typed files would pass 39's all-docs leg but fail here.
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "app.ts"), "export const a = 1;\n");
+    git(repo, "add src/app.ts");
+    git(repo, "commit -m code");
+    const res2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "gh pr create --title t2", cwd: repo },
+    });
+    ok(res2 && res2.block === true, "mixed docs+code branch must block on gh pr create (never exempt)");
+    ok(res2.reason.includes("src/app.ts"), "create block reason names the code file");
+  });
+
+  test("scenario 39b (#472): docs-only gh pr merge unblocked (same-repo sandbox — exemption fires AFTER the #204 scope check)", async () => {
+    const repo = join(TEST_ROOT, "repo-472-39b");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base39b.txt"), "b\n");
+    git(repo, "add base39b.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    git(repo, "remote add origin git@github.com:e2e/self.git");
+    git(repo, "checkout -b feat-docs");
+    writeFileSync(join(repo, "README.md"), "# docs\n");
+    mkdirSync(join(repo, "styles"), { recursive: true });
+    writeFileSync(join(repo, "styles", "theme.css"), "body{}\n");
+    git(repo, "add README.md styles/theme.css");
+    git(repo, "commit -m docs");
+    git(repo, `update-ref refs/remotes/origin/main ${baseSha}`);
+    await fire("session_start", {});
+    const before = readAuditLines();
+    // Same-repo merge (no --repo/-R): gh resolves the cwd origin e2e/self —
+    // not a real repo — so the head check fails → same_repo_head_unknown
+    // (verify: true — only cross_repo/head_mismatch skip, mirror of scenario
+    // 20) → computeBranchDiff runs → the ALL-DOCS branch diff hits mechanism
+    // (a). Pins the ordering property: (a) fires only AFTER the #204
+    // merge-scope early return (a future move of (a) before GH_PR_PATTERN
+    // would exempt cross-repo merges without the scope check).
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "gh pr merge 123", cwd: repo },
+    });
+    equal(res, undefined, "docs-only same-repo merge must be ALLOWED via the content-shape exemption");
+    const fresh = readAuditLines().slice(before.length);
+    ok(fresh.some((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt"),
+       "mechanism (a) must fire AFTER the scope check (audited content_shape_exempt)");
+    ok(!fresh.some((l) => l.event === "gate_skip" && (l.reason === "cross_repo" || l.reason === "head_mismatch")),
+       "the #204 merge-scope skip must NOT be the path taken (head check failed → verify:true, then (a) exempts)");
+  });
+
+  test("scenario 40 (#472): mixed docs+code staged set is NEVER exempt — block names both files", async () => {
+    const repo = join(TEST_ROOT, "repo-472-40");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "# mixed\n");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "app.ts"), "export const a = 1;\n");
+    git(repo, "add README.md src/app.ts");
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m mixed", cwd: repo },
+    });
+    ok(res && res.block === true, "mixed docs+code staged set must be blocked (never exempt)");
+    ok(res.reason.includes("README.md"), "block reason names the docs file");
+    ok(res.reason.includes("src/app.ts"), "block reason names the code file");
+  });
+
+  test("scenario 41 (#472): docs exemption cannot dodge code verification; -a/-am sweep guard isolation (D2)", async () => {
+    const repo = join(TEST_ROOT, "repo-472-41");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "r1\n");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "app.ts"), "a1\n");
+    // Leg A — docs-only commit is exempt (allowed), then a CODE commit still
+    // blocks; a fresh VGATE PASS (plain-text/JSON merge pattern) unblocks it.
+    git(repo, "add README.md");
+    await fire("session_start", {});
+    const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const docs = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m docs", cwd: repo },
+    });
+    equal(docs, undefined, "docs-only commit is exempt (allowed)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
+       "docs commit audited content_shape_exempt");
+    git(repo, "commit -m docs"); // make the docs commit real (index clean)
+    git(repo, "add src/app.ts");
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m code", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "a code commit right after a docs commit must STILL block");
+    ok(blocked.reason.includes("src/app.ts"), "block reason names the .ts file");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/app.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "src/app.ts"), hash: sha("a1\n") }],
+      }) }],
+    });
+    const allowed = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m code", cwd: repo },
+    });
+    equal(allowed, undefined, "code commit must be ALLOWED after a fresh VGATE PASS (exemption never substitutes for verification)");
+    git(repo, "commit -m code"); // make the code commit real
+    // Leg B — guard isolation: staged docs ONLY + dirty UNSTAGED code file.
+    writeFileSync(join(repo, "README.md"), "r2\n");
+    git(repo, "add README.md");
+    writeFileSync(join(repo, "src", "app.ts"), "a2\n"); // dirty — NOT staged
+    const sweep1 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: 'git commit -am "x"', cwd: repo },
+    });
+    ok(sweep1 && sweep1.block === true, "git commit -am with only docs staged must NOT ride the exemption (guard rejects the sweep → VGATE runs)");
+    ok(sweep1.reason.includes("README.md"), "-am block reason names the staged docs (unverified)");
+    ok(!/Hash mismatch/.test(sweep1.reason),
+       "re-edited staged docs must read as UNVERIFIED, never hash-mismatch — if the Leg-A exemption had registered README.md (D1 contamination), the r2 edit would stale-hash against it");
+    ok(git(repo, "status --porcelain").includes(" M src/app.ts"), "the -a sweep did NOT commit the dirty code file (working tree still dirty)");
+    const sweep2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: 'git commit -am"x"', cwd: repo }, // attached -am spelling (cycle-3 P1 repro)
+    });
+    ok(sweep2 && sweep2.block === true, "attached -am\"x\" spelling must also be rejected (never exempt)");
+    const bare = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m x", cwd: repo },
+    });
+    equal(bare, undefined, "bare git commit -m over ONLY staged docs is exempt");
+    ok(git(repo, "status --porcelain").includes(" M src/app.ts"), "code file is STILL uncommitted after the bare docs commit (D2: -a and bundles never exempt)");
+  });
+
+  test("scenario 42 (#472): build-template boundary — public/ stays gated, website/ is exempt", async () => {
+    const repo = join(TEST_ROOT, "repo-472-42");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base42.txt"), "b\n");
+    git(repo, "add base42.txt");
+    git(repo, "commit -m base");
+    // Build-template side of the boundary: public/ is a BUILD_OUTPUT_SEGMENT
+    // at any depth → its .html stays gated even though .html is exempt-typed.
+    mkdirSync(join(repo, "public"), { recursive: true });
+    writeFileSync(join(repo, "public", "index.html"), "<h1>app</h1>\n");
+    writeFileSync(join(repo, "README.md"), "r1\n");
+    git(repo, "add public/index.html README.md");
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m tpl", cwd: repo },
+    });
+    ok(res && res.block === true, "public/index.html + docs must block (build template is never exempt, D3)");
+    ok(res.reason.includes("public/index.html"), "block reason names the build-template file");
+    git(repo, "commit -m tpl"); // make the mixed commit real → index clean
+    // Static-site side of the boundary: website/ is NOT a build-output segment.
+    mkdirSync(join(repo, "website"), { recursive: true });
+    writeFileSync(join(repo, "website", "index.html"), "<h1>site</h1>\n");
+    writeFileSync(join(repo, "README.md"), "r2\n");
+    git(repo, "add website/index.html README.md");
+    const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const res2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m static", cwd: repo },
+    });
+    equal(res2, undefined, "website/index.html + docs must be ALLOWED (website/ is not a build-output segment)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
+       "static-site commit audited content_shape_exempt");
+  });
+
+  test("scenario 43 (#470 repro, #472): 05-cleanup delete push over parked WIP unblocked — blesses nothing", async () => {
+    const repo = join(TEST_ROOT, "repo-472-43");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "wip43.ts"), "wip\n");
+    git(repo, "add wip43.ts"); // parked WIP — staged, unverified, never committed
+    await fire("session_start", {});
+    const delBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "delete_push_no_content").length;
+    // The #470 cleanup command (05-cleanup.md merged-branch remote delete):
+    // multiline backslash continuation + 2>/dev/null redirect + || echo
+    // fallback. Must classify as a delete-shaped push (mechanism b) and skip
+    // BEFORE any staged-diff computation over the parked WIP.
+    const cleanupLiteral = `git push origin --delete "$BRANCH" 2>/dev/null \\
+  || echo "remote branch $BRANCH already deleted"`;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: cleanupLiteral, cwd: repo },
+    });
+    equal(res, undefined, "delete push over parked WIP must be ALLOWED (mechanism b short-circuit)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "delete_push_no_content").length > delBefore,
+       "audit must record delete_push_no_content");
+    // The deletion blessed NOTHING: committing the still-parked WIP blocks.
+    const commit = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m wip", cwd: repo },
+    });
+    ok(commit && commit.block === true, "parked WIP commit must STILL block after the delete push (nothing blessed)");
+    ok(commit.reason.includes("wip43.ts"), "block reason names the parked WIP file");
+  });
+
+  test("scenario 44 (#472): content push stays gated — chain, single-& background, and same-repo gh merge", async () => {
+    const repo = join(TEST_ROOT, "repo-472-44");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base44.txt"), "b\n");
+    git(repo, "add base44.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    // Origin MATCHES the -R target below so the merge leg is the SAME-REPO
+    // path (a cross-repo sandbox would skip on repo grounds, scenario 19).
+    git(repo, "remote add origin git@github.com:daniel-ospina/agent-infra.git");
+    // Legs 1-3: parked WIP premise (staged unverified file); session_start per
+    // leg keeps each block at attempt 1 (#7591 threshold never reached).
+    for (let leg = 1; leg <= 3; leg++) {
+      await fire("session_start", {});
+      writeFileSync(join(repo, "wip44.ts"), `wip leg ${leg}\n`);
+      git(repo, "add wip44.ts");
+      const cmd = leg === 1 ? "git push origin main"
+        : leg === 2 ? "git push origin --delete a && git push origin main"
+        : "git push origin --delete a & git push origin main"; // single-& background
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: cmd, cwd: repo },
+      });
+      ok(res && res.block === true, `content push leg ${leg} must stay gated: ${cmd}`);
+      ok(res.reason.includes("wip44.ts"), `leg ${leg} block reason names the parked WIP`);
+    }
+    // Leg 4: gh pr merge over parked WIP must run the #204 merge-scope path,
+    // NOT short-circuit on mechanism (b). Commit a drift file (real commit,
+    // leaving wip44.ts parked) so the branch diff is non-empty, then point
+    // origin/main at the base. gh's head check fails deterministically here
+    // (PR 5 does not exist on daniel-ospina/agent-infra) → same_repo_head_unknown
+    // → computeBranchDiff → block on the drift file (scenario 20 mirror). If a
+    // future environment resolves the head, the decision flips to
+    // head_mismatch (skip) — assert reality either way.
+    writeFileSync(join(repo, "drift44.txt"), "d\n");
+    git(repo, "add drift44.txt");
+    git(repo, "commit -m drift -- drift44.txt"); // commit ONLY the drift file
+    git(repo, `update-ref refs/remotes/origin/main ${baseSha}`);
+    await fire("session_start", {});
+    const before4 = readAuditLines();
+    const res4 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "gh -R daniel-ospina/agent-infra pr merge 5", cwd: repo },
+    });
+    const fresh4 = readAuditLines().slice(before4.length);
+    ok(!fresh4.some((l) => l.event === "gate_skip" && l.reason === "delete_push_no_content"),
+       "mechanism (b) must NOT short-circuit a gh pr merge (no delete_push_no_content skip)");
+    if (res4 && res4.block === true) {
+      ok(res4.reason.includes("drift44.txt"), "same-repo merge with unknown PR head blocks on the drift file (status quo)");
+    } else {
+      equal(res4, undefined, "merge was resolved by the #204 scope path (head_mismatch skip)");
+      ok(fresh4.some((l) => l.event === "gate_skip" && l.reason === "head_mismatch"),
+         "the head_mismatch skip must be audited when the head check succeeds");
+    }
+  });
+
+  test("scenario 45 (#472): non-interception pins — git branch -D and git worktree remove never gate", async () => {
+    const repo = join(TEST_ROOT, "repo-472-45");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base45.txt"), "b\n");
+    git(repo, "add base45.txt");
+    git(repo, "commit -m base");
+    git(repo, "branch feat/x"); // realism: the branch exists
+    await fire("session_start", {});
+    const n0 = readAuditLines().length;
+    const r1 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git branch -D feat/x", cwd: repo },
+    });
+    equal(r1, undefined, "git branch -D is not a VGATE-intercepted op");
+    equal(readAuditLines().length, n0, "git branch -D must add NO audit entry");
+    const r2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git worktree remove feat/x", cwd: repo },
+    });
+    equal(r2, undefined, "git worktree remove is not a VGATE-intercepted op");
+    equal(readAuditLines().length, n0, "git worktree remove must add NO audit entry");
+  });
+
+  test("scenario 46 (#472): flag-before-remote delete push unblocked; sub-agent docs commit exempt (deterministic, no bypass channel)", async () => {
+    const repo = join(TEST_ROOT, "repo-472-46");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base46.txt"), "b\n");
+    git(repo, "add base46.txt");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "wip46.ts"), "w\n");
+    git(repo, "add wip46.ts"); // parked WIP — must not block a delete push
+    await fire("session_start", {});
+    // (a) flag-before-remote spelling: git push --delete origin feat/x.
+    const delBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "delete_push_no_content").length;
+    const resA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --delete origin feat/x", cwd: repo },
+    });
+    equal(resA, undefined, "flag-before-remote delete push must be ALLOWED (mechanism b)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "delete_push_no_content").length > delBefore,
+       "audit must record delete_push_no_content for the --delete-first spelling");
+    // (b) sub-agent mode (task-child markers, scenario 25 env pattern): a
+    // docs-only commit is exempt there too — content-shape is a pure function
+    // of the op's file set, so child behavior is uniform (no bypass channel;
+    // #825 children still block on CODE).
+    git(repo, "reset -q"); // drop the parked WIP from the index
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print"; // builtin-tools task-child markers (#172/#825)
+    process.env.TASK_HEARTBEAT = "1";
+    try {
+      await fire("session_start", {});
+      const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+      mkdirSync(join(repo, "docs"), { recursive: true });
+      writeFileSync(join(repo, "docs", "notes46.md"), "n\n");
+      git(repo, "add docs/notes46.md");
+      const resB = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m docs46", cwd: repo },
+      });
+      equal(resB, undefined, "sub-agent docs-only commit must be ALLOWED (content-shape exemption in child mode)");
+      ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
+         "child docs skip audited content_shape_exempt");
+      // (c) child-mode delete push over parked WIP — mechanism (b) is
+      // mode-independent: the short-circuit fires in the sub-agent too (a
+      // pure early return — no interaction with the #825 block-message split).
+      writeFileSync(join(repo, "wip46.ts"), "w\n");
+      git(repo, "add wip46.ts");
+      const delChildBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "delete_push_no_content").length;
+      const resC = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git push --delete origin feat/x", cwd: repo },
+      });
+      equal(resC, undefined, "child-mode delete push must be ALLOWED (mechanism b fires in sub-agent mode too)");
+      ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "delete_push_no_content").length > delChildBefore,
+         "child delete push audited delete_push_no_content");
+      // (d) child-mode MIXED docs+code staged set — falls through the
+      // exemption (never exempt) to the sub-agent block path naming the code
+      // file (scenario 40's child half: marker + file list must be right).
+      git(repo, "reset -q");
+      writeFileSync(join(repo, "README.md"), "# mixed\n");
+      mkdirSync(join(repo, "src"), { recursive: true });
+      writeFileSync(join(repo, "src", "code46.ts"), "export const c = 1;\n");
+      git(repo, "add README.md src/code46.ts");
+      const mixedBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+      const resD = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m mixed46", cwd: repo },
+      });
+      ok(resD && resD.block === true, "child-mode mixed docs+code commit must block (never exempt)");
+      ok(resD.reason.includes("This session is a task sub-agent"), "child mixed block must carry the sub-agent marker");
+      ok(resD.reason.includes("src/code46.ts"), "child mixed block names the code file");
+      equal(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length, mixedBefore,
+            "child mixed block must NOT add a content_shape_exempt skip");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+  });
+
+  test("scenario 47 (#472): all-docs staged PUSH unblocked (content-shape exemption — push half of commit/push)", async () => {
+    // Surface map row 1 covers "(commit/push staged diff)". Scenarios 38/41/42
+    // exercise the commit verb and 39/39b the gh branch-diff verbs — never a
+    // plain `git push` over an all-docs staged diff. Mechanism (a) must NOT be
+    // commit-only: isBareCommitShape("git push …") is vacuously bare (unit-
+    // pinned), so a push whose staged set is all-docs is exempt too. This pins
+    // that at the hook level with the audit record.
+    const repo = join(TEST_ROOT, "repo-472-47");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base47.txt"), "b\n");
+    git(repo, "add base47.txt");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "README.md"), "# docs\n");
+    git(repo, "add README.md");
+    await fire("session_start", {});
+    const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main", cwd: repo },
+    });
+    equal(res, undefined, "all-docs staged push must be ALLOWED (content-shape exemption applies to pushes)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
+       "audit must record content_shape_exempt for the push");
+  });
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

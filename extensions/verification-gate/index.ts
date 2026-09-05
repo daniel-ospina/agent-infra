@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ToolCallEvent, ToolCallEventResult, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import { relative, resolve, isAbsolute, join, dirname, basename } from "node:path";
+import { relative, resolve, isAbsolute, join, dirname, basename, extname } from "node:path";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -340,6 +340,28 @@ export function isGitCommit(command: string): boolean {
   return GIT_COMMIT_ONLY_PATTERN.test(command);
 }
 
+// ── Content-shape exemption (#472 mechanism a) ───────
+// Single source for the doc contract (01-preflight.md VGATE-SHAPE-RULE fence —
+// index.test.ts drift test keeps the two in sync). Docs/CSS/static classes are
+// exempt; ANY file under a build-output segment (public/ dist/ build/, any
+// depth) is a GENERATED artifact and stays gated. Fail-closed: the class list
+// is CLOSED — every other extension (and extension-less files: Dockerfile,
+// LICENSE) keeps the gate ON. Case-insensitive match (path lowercased first —
+// macOS default FS is case-insensitive); the doc fence tokens are lowercase
+// (02-commit-pr.md Step 1.5), so lowercasing never diverges from them.
+// Exact-segment match: `build-guide/` is NOT `build/` and stays exempt.
+export const SHAPE_EXEMPT_EXTENSIONS: readonly string[] = [".md", ".css", ".scss", ".html"];
+export const BUILD_OUTPUT_SEGMENTS: readonly string[] = ["public", "dist", "build"];
+
+export function isShapeExemptFile(repoRelativePath: string): boolean {
+  const lower = repoRelativePath.toLowerCase(); // macOS default FS is case-insensitive; repo path case is not normalized by git
+  if (!SHAPE_EXEMPT_EXTENSIONS.includes(extname(lower))) return false;
+  for (const segment of lower.split("/")) {
+    if (BUILD_OUTPUT_SEGMENTS.includes(segment)) return false;
+  }
+  return true;
+}
+
 // ponytail: parse cd prefixes in bash commands so git ops in worktrees
 // resolve to the correct repo root. pi's bash tool keeps process.cwd()
 // unchanged even when the shell script starts with "cd /worktree &&".
@@ -518,6 +540,20 @@ function redactCommand(command: string): string {
     .replace(/github_pat_[A-Za-z0-9_]+/g, "github_pat_***");
 }
 
+// #472: shared gate_skip audit — field shape identical to the #204 merge-scope
+// skip (:1105) so all skip surfaces stay audit-synced (#60).
+function logGateSkip(reason: string, command: string, cwd: string, extra: Record<string, unknown> = {}): void {
+  appendJsonl({
+    event: "gate_skip",
+    extension: "verification-gate",
+    reason,
+    session_cwd: process.cwd(),
+    target_cwd: cwd,
+    command: redactCommand(command),
+    ...extra,
+  });
+}
+
 export interface MergeScopeDecision {
   verify: boolean;
   reason: "cross_repo" | "head_mismatch" | "same_repo_head_match" | "same_repo_head_unknown";
@@ -615,6 +651,302 @@ export function resolveMergeScope(command: string, cwd: string): MergeScopeDecis
   const localHead = localHeadSha(cwd);
   const prHead = pr !== null ? getPrHeadSha(pr, cwd, explicitRepo) : null;
   return evaluateMergeScope(cwdRepo, explicitRepo, localHead, prHead);
+}
+
+// ── Delete-shaped push classification (#472 mechanism b) ──
+// A remote-ref deletion (`git push origin --delete X` / `git push --delete
+// origin X` / `git push origin :X`) ships NO local file content — a staged-diff
+// check over a zero-byte deletion inspects the ENTIRE index and blocks on other
+// sessions' parked WIP (the #470 cleanup incident). WHOLE-COMMAND purity:
+// fires only when EVERY gated op in the command is a delete-shaped push; any
+// content refspec, git commit, or gh pr create|merge anywhere falls back to
+// today's gating (fail-closed).
+//
+// Deliberately narrower than a full bash lexer: the regex layer holding #5571
+// heredoc / #204 prose edge cases is untouched; only this predicate parses, and
+// only push-shaped segments it can prove pure.
+
+// Quote-aware top-level split on real separators (&& || ; | \n AND single &
+// — bash background operator: `a & git push origin main` backgrounds the first
+// op and runs the content push; a single & can never appear inside a
+// legitimate unquoted token, so flushing on it is safe and closes the
+// fail-open where the content push after & was absorbed as a delete target).
+// EXCEPTIONS (redirect syntax, NOT backgrounding): `&>` (ch followed by >) and
+// `>&` (ch preceded by >, as in 2>&1) are redirects — no flush there; the
+// redirect token is dropped later. Separators inside quotes are prose and never
+// split. Backslash-newline continuations are handled INLINE in the non-quote
+// path (no global pre-join) so the 05-cleanup literal `…2>/dev/null \` +
+// newline + `|| echo …` yields one push segment + one non-gated echo segment
+// AND a trailing `\` on a COMMENT line cannot swallow the next real line
+// (bash terminates comments at the newline regardless of a trailing
+// backslash — review P1-1).
+function splitCommandSegments(command: string): string[] {
+  const segments: string[] = [];
+  let cur = "";
+  let quote: string | null = null;
+  const flush = () => { if (cur.trim()) { segments.push(cur); cur = ""; } };
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote !== null) {
+      cur += ch;
+      if (ch === "\\" && i + 1 < command.length) { cur += command[++i]; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    // #472 (plan D5 conformance): a `#` while OUTSIDE any quote and with only
+    // whitespace accumulated since the last separator/newline starts a bash
+    // full-line comment — pure scaffolding that must never poison the quote
+    // scan (an apostrophe in "session's worktree" would otherwise open an
+    // unterminated quote state and collapse real segments — the 05-cleanup
+    // ceremony block). QUOTE-AWARE by construction: this branch is unreachable
+    // while quote !== null, so a `#`-leading line INSIDE an open multi-line
+    // string is data and keeps its closing quote (a blind pre-regex strip
+    // deleted that quote and masked a real content push after a multi-line
+    // value — review M1). Skip to end of line without flushing: nothing
+    // executable can follow a comment on the same line in bash — the trailing
+    // backslash of a comment line is INERT comment text (the newline
+    // terminates the comment in real bash) and is consumed by this skip, so a
+    // content line after a backslash-terminated comment is its own segment
+    // (review P1-1); the real newline is processed by the "\n" branch below.
+    if (ch === "#" && cur.trim() === "") {
+      while (i + 1 < command.length && command[i + 1] !== "\n") i++;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < command.length && command[i + 1] === "\n") { i++; continue; } // inline backslash-newline continuation (join, no flush)
+    if (ch === "\n") { flush(); continue; }
+    if ((ch === "&" || ch === "|") && command[i + 1] === ch) { flush(); i++; continue; } // && ||
+    if (ch === "&" && command[i + 1] === ">") { cur += ch; continue; } // &> redirect
+    if (ch === "&" && i > 0 && command[i - 1] === ">") { cur += ch; continue; } // >& redirect (2>&1)
+    if (ch === ";" || ch === "|" || ch === "&") { flush(); continue; } // ; | single-& background
+    cur += ch;
+  }
+  flush();
+  return segments;
+}
+
+// Strip cd/&& prefixes, inline env assignments, and command-prefix verbs
+// (sudo/env/nohup/time/command) from a segment head — so a prefix-verb form the
+// extension's interception patterns would still match (`sudo git push origin
+// main`, `nohup git commit`) classifies identically to the bare form instead of
+// being mis-treated as scaffolding. Loop until stable (cd chains + env + prefix
+// verbs may combine).
+function stripSegmentHead(segment: string): string {
+  let s = segment.trim();
+  for (let i = 0; i < 5; i++) {
+    const next = s
+      .replace(/^(?:cd\s+(?:['"][^'"]+['"]|[^\s;&|]+)\s*&&\s*)+/i, "")
+      .replace(/^(?:(?:env|sudo|nohup|time|command)\s+)+/, "")
+      .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)+/, "");
+    if (next === s) break;
+    s = next;
+  }
+  return s;
+}
+
+// Quote-aware tokenizer for a push segment's argument text: keeps quoted
+// values ("$BRANCH") as ONE token; strips the quote characters (D6).
+function tokenizePushArgs(text: string): string[] {
+  const tokens: string[] = [];
+  let cur = "";
+  let quote: string | null = null;
+  const flush = () => { if (cur.length > 0) { tokens.push(cur); cur = ""; } };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote !== null) {
+      if (ch === "\\" && i + 1 < text.length) { cur += text[++i]; continue; }
+      if (ch === quote) { quote = null; flush(); continue; }
+      cur += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (/\s/.test(ch)) { flush(); continue; }
+    cur += ch;
+  }
+  flush();
+  return tokens;
+}
+
+// Shell redirection token (2>/dev/null, 2>&1, >file, >>file). DROPPED
+// anywhere in a push segment — a redirect is never a boundary and never a
+// refspec.
+function isRedirectToken(token: string): boolean {
+  return /^(?:\d+)?(?:>>?|<<?|&>|>&)/.test(token);
+}
+
+// True when segment is `git push` whose args are a remote PLUS deletion forms
+// ONLY. Requires an explicit ∃-deletion marker (D4) — bare `git push origin`
+// (no marker) is NOT pure (vacuous-truth guard). Any other flag, a second
+// remote, a bare content refspec, or an unknown shape → false (fail-closed).
+function isPureDeletionPushSegment(segment: string): boolean {
+  const stripped = stripSegmentHead(segment);
+  if (!/^git\s+push(?=\s|$)/.test(stripped)) return false;
+  const rest = stripped.replace(/^git\s+push\s*/, "");
+  const tokens = tokenizePushArgs(rest);
+  let sawRemote = false;
+  let sawDeletionMarker = false;
+  let sawDeleteFlag = false;   // --delete/-d seen (either position)
+  for (const token of tokens) {
+    if (isRedirectToken(token)) continue;
+    if (token === "--delete" || token === "-d") { sawDeleteFlag = true; continue; }
+    if (token.startsWith("-")) return false; // any other flag → fail-closed
+    // :refspec deletion — marker must be a NON-EMPTY LITERAL ref name
+    // (`:feat/x`, `:refs/heads/feat/x`). Bare `:` is git's matching-push
+    // fallback that SHIPS CONTENT, and `:$VAR` can expand empty at runtime →
+    // both return false (fail-closed; review P1). Only the blessed `--delete
+    // "$BRANCH"` ceremony is variable-tolerant (empty → git errors, no push).
+    if (token.startsWith(":")) {
+      if (!/^:[A-Za-z0-9][A-Za-z0-9._/\-]*$/.test(token)) return false;
+      sawDeletionMarker = true;
+      continue;
+    }
+    if (!sawRemote) { sawRemote = true; continue; } // first non-flag = remote
+    // Subsequent bare tokens are delete targets ONLY if a --delete flag was
+    // seen; otherwise they are content refspecs → not pure.
+    if (sawDeleteFlag) {
+      // Review deep-P2 (delete-target absorption): an absorbed "delete target"
+      // must be a SINGLE LITERAL shell word. Reject tokens carrying command
+      // substitution / backtick residue (`$(git push origin main)`, backtick)
+      // or quote-swallowed prose with whitespace/newline (an inline-comment
+      // apostrophe after the push opens an unterminated quote that would
+      // absorb a following content-push line into one target token). A real
+      // content push hidden either way must keep the gate ON (fail-closed).
+      // The blessed `--delete "$BRANCH"` ceremony token (`$BRANCH`) is a clean
+      // single word and passes; ref names (feat/x, refs/heads/x, tags/v1.0)
+      // pass.
+      if (!/^[A-Za-z0-9_$@./:-]+$/.test(token)) return false;
+      sawDeletionMarker = true;
+      continue;
+    }
+    return false;
+  }
+  return sawRemote && sawDeletionMarker;
+}
+
+// Matches a `git … commit` subcommand invocation anywhere in a segment,
+// tolerating git global options between `git` and `commit` (`-C repo`,
+// `-c k=v`, `--no-pager`, `--git-dir=…`). Returns `{ index, end }` — the
+// match's start offset AND the byte offset AFTER the `commit` verb — or null
+// when the segment holds no commit invocation. Used by BOTH predicates as
+// fail-closed containment — `git -C repo commit -am x` must register as a
+// commit or the `-a` sweep rides the docs exemption (review P2-1).
+// Head-anchored OR wrapper-prefixed: substring scan symmetric with
+// GIT_COMMIT_ONLY_PATTERN's `(^|\s)` (the `\b` at the start also catches
+// `! git commit`, `sh -c 'git commit …'`, `sudo … git commit`). Callers
+// decide how to treat offset: isDeletionPush only needs presence (`!== null`,
+// any commit anywhere flips purity); isBareCommitShape requires a
+// HEAD-ANCHORED match (`index === 0` — stripSegmentHead already normalized
+// prefix verbs, so a nonzero offset means a wrapper/negation form that is not
+// provably bare, resolution A).
+function findGitCommit(stripped: string): { index: number; end: number } | null {
+  const m = stripped.match(/\bgit(?:\s+-[^\s]+(?:\s+(?!commit\b)(?:'[^']*'|"[^"]*"|\S+))?)*\s+commit\b/);
+  if (!m || m.index === undefined) return null;
+  return { index: m.index, end: m.index + m[0].length };
+}
+
+// Whole-command purity (D5): true iff the command has ≥1 push op AND every
+// gated op (git commit|push per GIT_COMMIT_PATTERN; gh pr create|merge per
+// GH_PR_PATTERN — INCLUDING the global -R/--repo spelling) is a delete-shaped
+// push. Scaffolding segments (assignments, gh pr view, git branch -D,
+// full-line comments, if/fi, $(…)) never flip purity — FULL-LINE `#` comments
+// are stripped quote-aware in splitCommandSegments before this scan (an
+// apostrophe in a comment must not open a quote state). An INLINE comment
+// carrying a literal gated-verb string after real code (`echo hi # then: git
+// commit -am x`) is not stripped and DOES flip purity: fail-closed, symmetric
+// with the gate's own substring interception patterns (both see the raw
+// text).
+export function isDeletionPush(command: string): boolean {
+  let sawPush = false;
+  for (const segment of splitCommandSegments(command)) {
+    const stripped = stripSegmentHead(segment);
+    // CONTAINMENT BACKSTOP (fail-closed, symmetric with the interception
+    // surface): the gate's GIT_COMMIT_PATTERN / GH_PR_PATTERN are SUBSTRING
+    // scans — they fire on `sh -c 'git commit …'`, `! git commit …`,
+    // wrapper-prefixed forms etc. Head-anchored checks alone would treat such
+    // wrapper segments as scaffolding and let mechanism (b) short-circuit a
+    // command that really contains a commit/merge.
+    //   1. gh pr create|merge anywhere (bare, -R/--repo, or wrapper) → false
+    //   2. git commit anywhere (bare or wrapper) → false
+    //   3. head-anchored `git push` → isPureDeletionPushSegment decides
+    //   4. git push in a WRAPPER form → cannot prove purity → false
+    //   5. no gated verb → scaffolding, ignored (D5)
+    const ghOp = /\bgh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+(?:create|merge)\b/;
+    if (ghOp.test(stripped)) return false;
+    if (findGitCommit(stripped) !== null) return false;
+    if (/^git\s+push(?=\s|$)/.test(stripped)) {
+      sawPush = true;
+      if (!isPureDeletionPushSegment(segment)) return false;
+      continue;
+    }
+    if (/\bgit\s+push\b/.test(stripped)) return false; // wrapper push — not provably pure
+    // else: scaffolding — ignored (D5)
+  }
+  return sawPush;
+}
+
+// ── D2 commit-form guard (FORALL semantics + fail-closed whitelist) ──
+// A docs/CSS/static exemption may apply to an op only when EVERY `git commit`
+// invocation in the command is a BARE commit (explicit `git add` + `git
+// commit`, no -a/--all/--amend/pathspec, per 02-commit-pr.md Step 1);
+// non-commit gated ops (push, gh pr create/merge) qualify on file shape
+// alone — isBareCommitShape is vacuously true when no commit invocation
+// exists (e2e scenarios 39/39b/47 pin the push/pr-create/pr-merge
+// exemptions). FORALL: if ANY commit invocation is non-bare, the whole
+// command is non-bare.
+//
+// FAIL-CLOSED MODEL: instead of modeling every git flag (bundles, -a/-o/-i
+// sweeps, attached values), the guard ALLOWS only a small whitelist of benign
+// exact tokens and REJECTS everything else (→ VGATE runs → safe direction).
+const BARE_COMMIT_VALUE_FLAGS = new Set(["-m", "-F", "-C", "-c"]);
+const BARE_COMMIT_VALUE_LONG = new Set(["--message", "--file", "--reedit-message", "--reuse-message"]);
+const BARE_COMMIT_BOOLEAN = new Set(["-s", "-S", "-q", "-v", "-e", "-n", "--signoff", "--no-verify", "--no-edit", "--edit", "--quiet", "--verbose"]);
+
+export function isBareCommitShape(command: string): boolean {
+  for (const segment of splitCommandSegments(command)) {
+    const stripped = stripSegmentHead(segment);
+    // CONTAINMENT (fail-closed): wrapper-prefixed commits count as commit
+    // segments (substring scan symmetric with GIT_COMMIT_ONLY_PATTERN) so the
+    // -a sweep can never ride a docs-only staged set to an exemption.
+    const commitMatch = findGitCommit(stripped); // head-anchored OR global-flag form — fail-closed containment (review P2-1)
+    if (commitMatch === null) continue;          // no commit invocation → vacuous segment
+    // HEAD-ANCHORED ONLY (review resolution A): stripSegmentHead already
+    // normalizes prefix verbs (sudo/env/nohup/time/command), so a match at
+    // index 0 IS the real command head — `git -C repo commit -m x` is a bare
+    // commit and may parse. A match at offset > 0 means a wrapper/negation
+    // prefix (`bash -c 'git commit …'`, `sh -c '…'`, `! git commit …`,
+    // `sudo -u me git commit …` — the -u arg is not stripped) — not provably
+    // bare → VGATE runs (fail-closed, plan: wrapper form never exempt).
+    if (commitMatch.index !== 0) return false;
+    const rest = stripped.slice(commitMatch.end);
+    const tokens = tokenizePushArgs(rest);
+    let afterDashDash = false;
+    for (let i = 0; i < tokens.length; i++) {
+      const tok = tokens[i];
+      if (afterDashDash) return false;               // pathspec after -- → non-bare
+      if (tok === "--") { afterDashDash = true; continue; }
+      if (tok.startsWith("--")) {
+        if (BARE_COMMIT_VALUE_LONG.has(tok)) { i++; continue; } // consume value
+        if (BARE_COMMIT_BOOLEAN.has(tok)) continue;
+        return false; // unknown long → non-bare (fail-closed)
+      }
+      if (tok.startsWith("-")) {
+        if (BARE_COMMIT_VALUE_FLAGS.has(tok)) { i++; continue; } // -m x: consume value
+        if (BARE_COMMIT_BOOLEAN.has(tok)) continue;
+        // Any OTHER single-dash token (-a, -am, -am"x", -mx, -o, -i, …) is
+        // REJECTED: may be a sweep, pathspec mode, or attached-value spelling.
+        return false;
+      }
+      // Review 2a-2 (adjudicated — NOT fixed): a trailing bash comment
+      // (`git commit -m x # docs WIP`) reads its words as pathspecs → non-bare
+      // → VGATE runs. That is fail-closed friction ONLY, and a #-break fix
+      // opened two fail-open spellings (quoted `"#file"` pathspec; a
+      // backslash-continued line after an inline comment swallowing a real
+      // second command — bash ends comments at the REAL newline). Reverted:
+      // fail-closed beats friction-free (documented known over-gate).
+      return false; // bare positional token = pathspec → non-bare
+    }
+  }
+  return true; // no commit segment, or every commit bare → guard satisfied
 }
 
 // ── Diff computation ──────────────────────────────────
@@ -1089,6 +1421,21 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // #472 mechanism (b): delete-shaped pushes ship NO local file content — a
+    // remote-ref deletion must not trigger a whole-index staged-diff check
+    // (the #470 cleanup block over another session's parked WIP). Short-circuit
+    // BEFORE any diff computation — THIS op creates no NEW verifiedSet/bridge
+    // entries (a pendingRehash armed by a PRIOR allowed commit may already
+    // have re-hashed + written the bridge above — content-neutral, no new
+    // blessings). Purity-gated (isDeletionPush): any content refspec / git
+    // commit / gh pr op in the command falls back to today's gating
+    // (fail-closed).
+    if (isDeletionPush(command)) {
+      console.log("[verification-gate] ⏭️ Skipping VGATE — delete-shaped push: no local content ships");
+      logGateSkip("delete_push_no_content", command, cwd);
+      return undefined;
+    }
+
     // Compute diff
     let changedFiles: string[];
     if (GH_PR_PATTERN.test(command)) {
@@ -1102,7 +1449,7 @@ export default function (pi: ExtensionAPI) {
         const decision = resolveMergeScope(command, cwd);
         if (!decision.verify) {
           console.log(`[verification-gate] ⏭️ Skipping verification for gh pr merge — ${decision.reason}: nothing local represents the PR`);
-          appendJsonl({ event: "gate_skip", extension: "verification-gate", reason: decision.reason, session_cwd: process.cwd(), target_cwd: cwd, command: redactCommand(command) }); // #60: durable audit record — skipped verification must leave a trace (tokens redacted: audit files are world-readable)
+          logGateSkip(decision.reason, command, cwd); // #60: durable audit record — skipped verification must leave a trace
           return undefined; // before computeBranchDiff: no files, no block, no registry/bridge writes
         }
       }
@@ -1113,6 +1460,43 @@ export default function (pi: ExtensionAPI) {
 
     if (changedFiles.length === 0) {
       // No changed files — allow
+      return undefined;
+    }
+
+    // #472 mechanism (a): content-shape exemption — docs/CSS/static-only sets
+    // (no build-output paths) skip VGATE (01-preflight.md "Verification Gate";
+    // mirrors 02-commit-pr.md Step 1.5's Micro content class). TIER-INDEPENDENT:
+    // content shape decides, never the complexity label. ALLOW-ONLY: no NEW
+    // verifiedSet/bridge entries originate from the exempt op — the registry
+    // stays verifier-authoritative; a later MIXED op verifies everything fresh
+    // (docs included). Commit-form guard (isBareCommitShape): among `git
+    // commit` invocations only the bare form qualifies — `-a`/`--all`/`--amend`/
+    // pathspec anywhere re-gates the whole command (D2); push / gh pr
+    // create|merge ops with no commit invocation qualify on file shape alone.
+    // Exempt files are not registered here, so a post-exempt lint-staged
+    // rewrite cannot stale-hash a future block via THIS op — but a bare
+    // exempt COMMIT still arms the #7574 re-hash (review deep-P2): the file
+    // may already be registered from an EARLIER mixed VGATE PASS, and the
+    // pre-commit hook's rewrite would otherwise go stale with no safety net.
+    if (changedFiles.length > 0 && isBareCommitShape(command) && changedFiles.every((file) => isShapeExemptFile(file))) {
+      console.log(`[verification-gate] ⏭️ Skipping VGATE — ${changedFiles.length} docs/static file(s): content-shape exemption (tier-independent)`);
+      logGateSkip("content_shape_exempt", command, cwd, { files: changedFiles.length });
+      // deep-review P2: mirror the verified-allow branch — a bare exempt
+      // COMMIT arms the #7574 pendingRehash so the next git op re-hashes the
+      // committed files from disk (clearing any lint-staged rewrite of a file
+      // registered by an earlier MIXED pass); pushes/gh ops leave it unset
+      // (lint-staged runs on commit, not push — same as the verified-allow
+      // branch below).
+      // Trust boundary (review 2a-1, documented): the shape check measures
+      // rename DESTINATIONS (`git mv src/app.ts docs/code.md` lists only the
+      // new path) — a deliberate code→docs rename rides the exemption, same
+      // class as copying code into a fresh `.md` (inherent to the Z-NARROW
+      // extension-keyed design, accepted in plan D1; rename-source plumbing
+      // is a follow-up).
+      if (isGitCommit(command)) {
+        pendingRehash = cwd;
+        pendingRehashFiles = [...changedFiles];
+      }
       return undefined;
     }
 
