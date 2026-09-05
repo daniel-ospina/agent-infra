@@ -248,33 +248,106 @@ if (cLowSectionMissingIssue) {
 //      excuse it) OR co-located with the FAIL it excuses inside the (d)
 //      verdict section. A FAIL-only (d) record with no such declared
 //      override BLOCKS the merge.
-const productDecision = (function () {
-  const out = [];
-  let inPd = false;
+// (d) QA spot-check — the CURRENT-ERA (d) verdicts must record a terminal
+// disposition. Accepted dispositions (P2-1 — the old whole-file /0\.8/ sniff
+// matched the Procedure's target wording permanently):
+//   1. a measured aggregate >= 0.8 (PASS) in a current-era section, or
+//   2. the explicit REMAINS state for the parent in a current-era section,
+//   3. a current-era FAIL that is excused by the #2013 product-decision
+//      MOOT override — recorded EITHER in the runbook's `## PRODUCT
+//      DECISION` dated declaration block (the section-scoped override:
+//      a MOOT sentence in the Procedure or a background note does not
+//      excuse it) OR co-located with the FAIL it excuses inside the (d)
+//      verdict section. A FAIL-only (d) record with no such declared
+//      override BLOCKS the merge.
+//
+// Override governance (round-6): ALL `## PRODUCT DECISION` blocks are
+// collected and the NEWEST-dated one governs (same newest-wins rule as the
+// verdict eras; an undated block is treated as current/newest). A
+// rescission recorded in a NEWER governing block therefore disables an
+// older block's MOOT declaration, and a stale older block can never keep an
+// override alive after it was rescinded.
+function productDecisionBlocks() {
+  const blocks = [];
+  let cur = null;
+  let curDate = null;
+  const flush = () => {
+    if (cur) blocks.push({ date: curDate, text: cur.join("\n") });
+    cur = null;
+    curDate = null;
+  };
   for (const l of lines) {
-    if (/^## PRODUCT DECISION/.test(l)) inPd = true;
-    else if (inPd && /^## /.test(l)) break;
-    else if (inPd) out.push(l);
+    if (/^## PRODUCT DECISION/.test(l)) {
+      flush();
+      cur = [];
+      const d = l.match(/(\d{4}-\d{2}-\d{2})/);
+      curDate = d ? d[1] : null;
+    } else if (cur) {
+      if (/^## /.test(l)) flush();
+      else cur.push(l);
+    }
   }
-  return out.join("\n");
-})();
-// An AFFIRMATIVE standing MOOT declaration. The override must be declared
-// in present force — a quoted historical decision or a rescue notice ("…is
-// withdrawn/superseded/re-binds…") does not excuse a current FAIL. The
-// phrase must appear NOT inside a quoted/historical/negated context: no
-// rescue or negation token within 60 chars before the phrase and 120 chars
-// after it.
-function affirmativeMoot(text) {
-  if (!text) return false;
-  const re = /\(d\)\s+gate\s+is\s+MOOT(?:\s+by product decision)?|\(d\)\s+is\s+MOOT(?:\s+by product decision)?/gi;
+  flush();
+  return blocks;
+}
+const pdBlocks = productDecisionBlocks();
+const pdNewest = pdBlocks.reduce((m, b) => (b.date !== null && (m === null || b.date > m) ? b.date : m), null);
+const governingPd = pdBlocks.filter((b) => (pdNewest === null ? true : b.date === null || b.date === pdNewest));
+const productDecision = governingPd.map((b) => b.text).join("\n");
+// An AFFIRMATIVE STANDING MOOT declaration, evaluated over the governing
+// PRODUCT DECISION corpus (or a co-located (d) section). The override is in
+// force only if the LAST statement about it is an affirmative declaration —
+// a RESCISSION recorded after it ("…is rescinded/withdrawn/superseded…",
+// "the (d) gate re-binds", "is no longer MOOT") disables it.
+//
+// Detection is SENTENCE-scoped and SUBJECT-anchored with RECOGNIZABLE
+// RESCISSION TEMPLATES (not a flat ±char window): a rescue only counts when
+// it names the override/(d) gate/MOOT declaration as the thing being
+// undone. Unrelated prose — "The superseded #2071 note", "Merge is no
+// longer blocked by (d)" (a consequence, not a rescission) — never matches
+// a template, closing the round-6 r3a false-block. The "last statement
+// wins" ordering closes the r3c repro (a rescue sentence far below the MOOT
+// phrase is honored) and the newest-governing-block model closes r3b.
+function mootSentences(text) {
+  const out = [];
+  // sentence boundary: . ! ? optionally followed by ** (markdown bold) then
+  // whitespace + a capital/`(/digit. A decimal point (0.9) or date (08-30)
+  // is not a boundary.
+  const re = /[.!?](?:\*{2})?(?=\s+[A-Z0-9(])/g;
+  let last = 0;
   let m;
   while ((m = re.exec(text)) !== null) {
-    const before = text.slice(Math.max(0, m.index - 60), m.index);
-    const after = text.slice(re.lastIndex, Math.min(text.length, re.lastIndex + 120));
-    const rescue = /no longer|not\s+MOOT|rescind|withdraw|supersede|re-?bind|invalidat|reinstat|cease|lift(?:ed)?\s+the\s+override/i;
-    if (!rescue.test(before + " " + after)) return true;
+    out.push(text.slice(last, m.index + m[0].length).trim());
+    last = re.lastIndex;
   }
-  return false;
+  out.push(text.slice(last).trim());
+  return out.filter((s) => s.length > 0);
+}
+function affirmativeMoot(text) {
+  if (!text) return false;
+  const affirmRe = /\(d\)\s+gate\s+is\s+MOOT(?:\s+by product decision)?|\(d\)\s+is\s+MOOT(?:\s+by product decision)?/i;
+  // Recognizable rescission templates, all naming the override/(d)/MOOT as
+  // the subject being undone:
+  const rescueTemplates = [
+    /\(d\)\s+gate\s+(?:is\s+)?no\s+longer\s+(?:a\s+|the\s+)?MOOT/i, // (d) gate is no longer MOOT
+    /\bno\s+longer\s+(?:a\s+|the\s+)?MOOT\b/i, // …is no longer MOOT…
+    /\b(?:not|never)\s+(?:a\s+|the\s+)?MOOT\b/i, // not MOOT
+    /\(d\)\s+gate\s+re-?binds?/i, // (d) gate re-binds
+    /(?:MOOT\s+)?override[^.!?\n]{0,60}\b(?:rescind|withdraw|supersede|revoke|overturn|invalidat|re-?bind|cease)\w*\b/i, // the override … is rescinded/…
+    /\bdeclaration[^.!?\n]{0,60}\b(?:is|was|has\s+been)\s+(?:rescinded|withdrawn|superseded|revoked|overturned)\b/i, // the declaration … is withdrawn
+    /\b(?:RESCINDED|REVOKED|WITHDRAWN|SUPERSEDED)\b[^.!?\n]{0,60}\b(?:\(d\)|override|MOOT)/, // RESCINDED: …the (d) gate / override
+    /\(d\)\s+gate\s+(?:re-?binds|is\s+no\s+longer\s+(?:in\s+effect|binding|active))\b/i, // (d) gate re-binds / no longer in effect
+  ];
+  let verdict = "none";
+  for (const s of mootSentences(text)) {
+    const rescued = rescueTemplates.some((re) => re.test(s));
+    if (rescued) {
+      verdict = "rescinded";
+    } else if (affirmRe.test(s)) {
+      verdict = "affirmed";
+    }
+  }
+  return verdict === "affirmed";
 }
 const mootOverride = affirmativeMoot(productDecision);
 
@@ -316,6 +389,14 @@ function isDFailVerdict(sec) {
   if (hasRemainsDisposition(sec)) return false;
   const head = sec.split("\n")[0] || "";
   if (/\*\*FAIL/.test(head)) return true;
+  // A heading that records an explicit em-dash PASS verdict (with no FAIL
+  // token on the heading) is a PASS section — body prose that NARRATES the
+  // historical sub-bar figure before the current >= 0.8 result must not turn
+  // it into a FAIL verdict (round-6 d1: PASS heading, body "full run recorded
+  // aggregate 0.43 … re-run scored 0.90 — PASS"). Only sections whose body
+  // records the measured verdict figure itself (heading without an explicit
+  // verdict token) are evaluated from the body aggregate.
+  if (/(?:\u2014|—)\s*(?:\*\*PASS\*\*|re-run:\s*\*\*PASS\*\*)/.test(head)) return false;
   const fraction = sec.match(/aggregate\s*\*{0,2}\s*(?:[|:]+\s*)?\*{0,2}\s*(\d{1,3})\s*\/\s*(\d{1,3})/i);
   const decimal = sec.match(/aggregate\s*\*{0,2}\s*(?:[|:]+\s*)?\*{0,2}\s*([01](?:\.[0-9]+)?)/i);
   let v = null;

@@ -73,44 +73,96 @@ if (!fs.existsSync(RUNBOOK)) {
 
 const text = fs.readFileSync(RUNBOOK, "utf8");
 
-// 1. The #2070 status section must exist.
-if (!/Follow-up \(2\) status — #2070|#2070 retrieval optimisation loop/.test(text)) {
+// Extract the #2070 follow-up status section(s): `##`-scoped blocks whose
+// own heading names the #2070 status ("Follow-up (2) status — #2070 …" /
+// "#2070 retrieval optimisation loop"). Each block carries the date on its
+// `##` heading line; the NEWEST-dated status section governs (an identical
+// copy re-planted into an OLDER preserved era block must never satisfy the
+// gate — the current status section must itself record the measurement).
+// Blocks with no date on the heading are treated as current/newest.
+function status2070Sections() {
+  const ls = text.split("\n");
+  const blocks = [];
+  let cur = null;
+  let curDate = null;
+  const flush = () => {
+    if (cur) blocks.push({ date: curDate, sec: cur.join("\n") });
+    cur = null;
+    curDate = null;
+  };
+  for (const line of ls) {
+    if (/^## /.test(line)) {
+      flush();
+      if (/^## [^\n]*#2070|^## Follow-up \(2\) status/.test(line)) {
+        cur = [line];
+        const d = line.match(/(\d{4}-\d{2}-\d{2})/);
+        curDate = d ? d[1] : null;
+      }
+    } else if (cur) {
+      cur.push(line);
+    }
+  }
+  flush();
+  return blocks;
+}
+
+// 1+2. The #2070 status section must exist AND record the measured
+// baseline IN THAT SECTION (a stale copy preserved in an older era does not
+// count). Recall figures are parsed from the newest-dated #2070 status
+// section only.
+const statusBlocks = status2070Sections();
+if (statusBlocks.length === 0) {
+  fail("runbook lacks the #2070 retrieval follow-up status section — record the optimisation-loop result before merging.");
+}
+const newestDate = statusBlocks.reduce((m, b) => (b.date !== null && (m === null || b.date > m) ? b.date : m), null);
+const currentStatus = statusBlocks.filter((b) => (newestDate === null ? true : b.date === null || b.date === newestDate));
+const statusText = currentStatus.map((b) => b.sec).join("\n");
+if (!/Follow-up \(2\) status|#2070 retrieval optimisation loop/.test(statusText)) {
   fail("runbook lacks the #2070 retrieval follow-up status section — record the optimisation-loop result before merging.");
 }
 
-// 2. The measured baseline must be recorded with sane, CONSISTENT recall
-// values. One tolerant parse pattern for all three keys (bold optional —
-// the runbook bolds pool@120/ctx@40 and leaves ctx@cap un-bolded, but a
-// future normalization in EITHER direction must not false-block), each
-// range-checked 0..1. The LAST recorded occurrence of each key governs
-// (the doc may preserve an older measurement below a newer one; ordering
-// is validated against the most recent measurement on file, so a later
-// appended contradictory re-measure cannot hide below an old record).
-function recall(key) {
+// 2. The measured baseline must be recorded INSIDE the newest #2070 status
+// section (see status2070Sections above — a stale preserved-era copy is not
+// the current record) with sane, CONSISTENT recall values. One tolerant
+// parse pattern for all three keys (bold optional — the runbook bolds
+// pool@120/ctx@40 and leaves ctx@cap un-bolded, but a future normalization
+// in EITHER direction must not false-block), each range-checked 0..1. The
+// LAST recorded occurrence of each key within the status section governs
+// (a later appended contradictory re-measure inside the section cannot hide
+// below an earlier one).
+function recallIn(key, hay) {
   const re = new RegExp(`${key} recall\\s*\\*{0,2}\\s*([0-9]*\\.[0-9]+|[0-9]+)`, "g");
   let m, last = null;
-  while ((m = re.exec(text)) !== null) {
+  while ((m = re.exec(hay)) !== null) {
     const v = Number(m[1]);
     if (Number.isFinite(v) && v >= 0 && v <= 1) last = v;
   }
   return last;
 }
-const pool = recall("pool@120");
-const ctx40 = recall("ctx@40");
-const ctxCap = recall("ctx@cap");
+// Locality: the current #2070 status section itself must carry the figures.
+const pool = recallIn("pool@120", statusText);
+const ctx40 = recallIn("ctx@40", statusText);
+const ctxCap = recallIn("ctx@cap", statusText);
 if (pool === null || ctx40 === null || ctxCap === null) {
-  fail("runbook lacks the measured baseline (pool@120 / ctx@40 / ctx@cap recall) — the #2070 gate requires before/after numbers, not assertions.");
+  fail("runbook #2070 status section lacks the measured baseline (pool@120 / ctx@40 / ctx@cap recall) — the #2070 gate requires before/after numbers inside the CURRENT status section, not assertions or a stale preserved-era copy.");
 }
-if (ctx40 > pool + 1e-9) {
-  fail(`recall ordering violated in the most recent measurement: ctx@40 (${ctx40}) > pool@120 (${pool}) — the runbook record is internally inconsistent (fabricated?).`);
+// Whole-file consistency (round-2 guard, kept): ordering is validated against
+// the LAST recorded occurrence of each key ANYWHERE in the doc, so a later
+// appended re-measure that contradicts the baseline (in a newer dated block
+// below the status section) cannot hide below the current-section record.
+const poolAll = recallIn("pool@120", text) ?? pool;
+const ctx40All = recallIn("ctx@40", text) ?? ctx40;
+const ctxCapAll = recallIn("ctx@cap", text) ?? ctxCap;
+if (ctx40All > poolAll + 1e-9) {
+  fail(`recall ordering violated in the most recent measurement anywhere in the doc: ctx@40 (${ctx40All}) > pool@120 (${poolAll}) — the runbook record is internally inconsistent (fabricated?).`);
 }
 // ctx@cap is the cap-review window recall: it sits between the ctx@40
 // assembled context and the pool@120 retrieval pool (A6 threads the window
 // limit in tandem with context_item_cap). A cap figure outside [ctx@40,
 // pool@120] is internally inconsistent — the same fabrication signal the
 // ctx@40 <= pool@120 check encodes.
-if (ctxCap < ctx40 - 1e-9 || ctxCap > pool + 1e-9) {
-  fail(`recall ordering violated in the most recent measurement: ctx@cap (${ctxCap}) must satisfy ctx@40 (${ctx40}) <= ctx@cap <= pool@120 (${pool}) — the runbook record is internally inconsistent (fabricated?).`);
+if (ctxCapAll < ctx40All - 1e-9 || ctxCapAll > poolAll + 1e-9) {
+  fail(`recall ordering violated in the most recent measurement anywhere in the doc: ctx@cap (${ctxCapAll}) must satisfy ctx@40 (${ctx40All}) <= ctx@cap <= pool@120 (${poolAll}) — the runbook record is internally inconsistent (fabricated?).`);
 }
 
 // 3. The acceptance fixtures must exist AND implement the gold-turn gate.
