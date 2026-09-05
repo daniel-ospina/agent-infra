@@ -41,6 +41,22 @@ jobs:
       - name: Cost-config guard tests (fixtures, detect-not-block semantics)
         run: bash tests/cost-config/run.sh
 
+  pi-config-extensions:
+    # #498 — pi-config extension-farm parity gate (issue #95 invariant): every
+    # extensions/ top-level entry except *.test.ts must be farm-wired into
+    # pi-bootstrap/pi-config/extensions (single source of truth — a new
+    # extension that isn't wired ships on NO machine). Repo-tree only, no
+    # live ~/.pi/agent dependency, then the runtime-fixture suite exercising
+    # checks 1–3 (materialized copy / mistargeted link / unwired entry) +
+    # the *.test.ts exclusion.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extension-farm parity gate (symlink farm into extensions/)
+        run: bash scripts/check-pi-config-extensions.sh
+      - name: Extension-farm parity gate tests (fixtures, checks 1-3)
+        run: bash tests/pi-config-extensions/run.sh
+
   actionlint:
     # #398 — workflow YAML syntax + Actions-expression errors fail CI BEFORE
     # merge (the #394 defect class: a literal '${{' in a plain YAML scalar

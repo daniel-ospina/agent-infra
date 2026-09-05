@@ -150,6 +150,18 @@ jobs:
       - name: Cost-config guard (shipped, --shipped-only)
         run: bash scripts/check-cost-config.sh --shipped-only
 
+  pi-config-extensions-guard:
+    # #498 — post-merge re-check of the pi-config extension-farm parity gate
+    # (issue #95 invariant): every extensions/ top-level entry except
+    # *.test.ts must be farm-wired into pi-bootstrap/pi-config/extensions.
+    # Catches the "PR merged without wiring" drift class that per-PR CI cannot
+    # see when the farm edit and the extension land on different branches.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extension-farm parity gate (symlink farm into extensions/)
+        run: bash scripts/check-pi-config-extensions.sh
+
   python-ci:
     # #383 — post-merge run of the vendored parallel_work_check suite via the
     # reusable python-ci.yml (finally called, per the Task 5 intent). The
@@ -169,7 +181,7 @@ jobs:
 
   auto-file-on-failure:
     runs-on: ubuntu-latest
-    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, python-ci]
+    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, python-ci]
     if: failure()
     steps:
       - uses: actions/github-script@v7
