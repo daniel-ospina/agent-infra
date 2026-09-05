@@ -3204,6 +3204,7 @@ await test("fail-closed filter input: limit <= 0 and unparseable since return em
   // limit 0 / negative → empty, never "no cap"
   equal(readEnforcementLog({ file, limit: 0 }).entries.length, 0, "limit 0 → empty");
   equal(readEnforcementLog({ file, limit: -3 }).entries.length, 0, "negative limit → empty");
+  equal(readEnforcementLog({ file, limit: NaN }).entries.length, 0, "limit NaN → empty (NaN <= 0 is false — bare <= 0 would silently drop the cap)");
   // unparseable since → empty, never "every entry since the beginning"
   const bad = readEnforcementLog({ file, since: "not-a-date" });
   equal(bad.entries.length, 0, "unparseable since → empty (fail-closed for the #357-16 gate)");

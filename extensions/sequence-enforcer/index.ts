@@ -377,7 +377,12 @@ function resolveSessionId(ctx: { sessionManager?: { getSessionId?: () => string 
   try {
     return ctx?.sessionManager?.getSessionId?.() ?? null;
   } catch {
-    return null; // stale runner ctx — keep prior captured id, never throw
+    // Stale-runner ctx (assertActive throws post-fork/reload): returning null is
+    // deliberate — captureAuditSession stores it, so an unresolvable boundary
+    // stamps null. Unattributed beats stale: "keeping the prior id" would stamp
+    // the PRE-change session on the post-fork stream (the #377 misattribution
+    // class). Never throws.
+    return null;
   }
 }
 
@@ -397,7 +402,7 @@ function captureAuditSession(ctx: { sessionManager?: { getSessionId?: () => stri
   // warn per process, production only (tests drive ctx fixtures / override).
   if (auditSessionId === null && process.env.NODE_ENV !== "test" && !sessionIdWarned) {
     sessionIdWarned = true;
-    try { console.warn("[sequence-enforcer] ⚠️ audit session_id unresolvable (ctx.sessionManager absent) — entries stamped null"); } catch { /* last resort */ }
+    try { console.warn("[sequence-enforcer] ⚠️ audit session_id unresolvable (ctx.sessionManager absent or stale) — entries stamped null"); } catch { /* last resort */ }
   }
 }
 
@@ -481,7 +486,9 @@ export interface ReadEnforcementLogOptions {
 
 export interface ReadEnforcementLogResult {
   entries: EnforcementLogEntry[];
-  /** Lines skipped because they were not parseable JSON (blank lines ignored). */
+  /** Lines that could not be parsed into a valid entry: malformed JSON,
+   *  non-object JSON (arrays/primitives/null), or objects missing string
+   *  ts/event. Blank lines are ignored (not counted). */
   skipped: number;
 }
 
@@ -498,8 +505,10 @@ export interface ReadEnforcementLogResult {
 // cap, limit <= 0 = empty result; since: undefined = no filter.
 export function readEnforcementLog(opts: ReadEnforcementLogOptions = {}): ReadEnforcementLogResult {
   const file = opts.file ?? enforcementLogFile();
-  // Fail-closed on filter input before touching the file.
-  if (opts.limit !== undefined && opts.limit <= 0) return { entries: [], skipped: 0 };
+  // Fail-closed on filter input before touching the file. !(limit > 0) covers
+  // 0, negatives, AND NaN/Infinity (NaN <= 0 is false — a bare <= 0 check
+  // would let limit: NaN silently drop the cap and over-report).
+  if (opts.limit !== undefined && !(opts.limit > 0)) return { entries: [], skipped: 0 };
   const sinceMs = opts.since !== undefined ? Date.parse(opts.since) : NaN;
   if (opts.since !== undefined && Number.isNaN(sinceMs)) return { entries: [], skipped: 0 };
   let raw: string;
