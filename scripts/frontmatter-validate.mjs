@@ -489,7 +489,8 @@ export function tokenizeFrontmatter(yamlString) {
     // block scalar header: | > with chomp/explicit-indent modifiers
     const bm = /^([>|])([+-]?)([1-9]?)(?:[ \t]+(.*))?$/.exec(valueText);
     if (bm && bm[1]) {
-      // #370 (P0 false negative): yaml permits ONLY a `#`-prefixed comment
+      // #370 (P1 false negative — issue severity; the guard emits a P0 throw):
+      // yaml permits ONLY a `#`-prefixed comment
       // (or bare trailing whitespace) after a block-scalar header on the same
       // line. Any other token — `| comment`, `| 0`, `> text`, `|1 token` — is
       // a lex error ("Not a YAML token: <tok>"; probe pi 0.84.3 / yaml 2.9.0)

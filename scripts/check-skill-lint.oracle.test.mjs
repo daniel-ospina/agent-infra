@@ -63,7 +63,7 @@ const setEq = (a, b) => a.length === b.length && [...a].sort().join() === [...b]
 /** block-scalar fixture — value is a canonical representation (contentIndent
  *  not stripped, chomping not applied), so the oracle asserts direction
  *  (both non-empty strings) instead of byte equality. */
-const isBlockScalarFixture = (content) => /:[ \t]*[>|](?:[+-]?[1-9]?)[ \t]*\n/.test(content);
+const isBlockScalarFixture = (content) => /:[ \t]*[>|](?:[+-]?[1-9]?)[ \t]*(?:#.*)?\n/.test(content);
 
 // ── pi bundle ───────────────────────────────────────────────────────────────
 let pi;
