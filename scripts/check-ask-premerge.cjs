@@ -117,9 +117,12 @@ function isSkipNote(sec) {
   // A SKIPPED/not-measured note ("SKIPPED this run", "was not measured",
   // "abstention_n = 0"). "pre-gate skip count = 0" in the FULL-run record
   // is the OPPOSITE — a measurement statement that nothing was skipped — and
-  // must not flag the section. Bare SKIPPED / "not measured …" / harness
-  // skip language does flag.
-  return /\bSKIPPED\b|\bnot measured\b|abstention_n\s*=\s*0\b/.test(sec);
+  // must not flag the section. Case-insensitive skip language (a record that
+  // says "grading skipped this cycle" / "the run was not executed" is a
+  // skip note whether or not it uses uppercase) plus harness skip phrasings
+  // does flag.
+  return /\bSKIPPED\b|\bnot measured\b|\bnot executed\b|\bwas not run\b|\bdeferred\b|\bskip(?:ped)? note\b|abstention_n\s*=\s*0\b|\b0\s*of\s*[1-9][0-9]*\b(?=[^\n]*skipped|skipped[^\n]*0\s*of)/i.test(sec) ||
+    /\bgrading skipped\b|\bnothing measured\b|\bskipped this (?:cycle|run|session)\b/i.test(sec);
 }
 // A measured figure: the number must be a RESULT, not a target or an
 // incidental integer. The accuracy window is scanned so a "target/should
@@ -131,7 +134,7 @@ function hasAccuracyMeasure(sec) {
   while ((m = re.exec(sec)) !== null) {
     const gap = m[1].toLowerCase();
     // the figure is a target/plan word's subject, not a measured result
-    if (/should|target|goal|reach|required|must|expected|aim|planned|bar|at least|>=|≥/.test(gap)) continue;
+    if (/should|target|goal|reach|required|must|expected|aim|planned|bar|threshold|ceiling|at least|>=|≥/.test(gap)) continue;
     return true;
   }
   return false;
@@ -299,8 +302,34 @@ const dPass = dSections.some(({ sec }) => dPassMeasured(sec));
 const dRemains = dSections.some(({ sec }) => hasRemainsDisposition(sec));
 // MOOT excuse: declared affirmatively in the PRODUCT DECISION block, OR
 // co-located with the FAIL it excuses inside a current-era (d) verdict
-// section.
+// section (same era-wide semantics — one declared override excuses the
+// current era's FAIL verdicts, whether recorded at block level or co-located).
 const dMootCoLocated = dSections.some(({ sec }) => affirmativeMoot(sec));
+// Era-relabel spoof guard: a PASS/REMAINS recorded elsewhere in the SAME
+// era must not mask a FAIL verdict that is unexcused (no REMAINS-for-parent
+// in its own section, no MOOT override anywhere in the era). A fabricated
+// `## … (current-date)` block carrying a fake PASS re-tags into the current
+// era and would otherwise flip `.some()` green over a genuine unexcused
+// FAIL. Sections that record their own REMAINS-for-parent are preliminary
+// notes, not FAIL verdicts, and never trigger this.
+function isDFailVerdict(sec) {
+  if (hasRemainsDisposition(sec)) return false;
+  const head = sec.split("\n")[0] || "";
+  if (/\*\*FAIL/.test(head)) return true;
+  const fraction = sec.match(/aggregate\s*\*{0,2}\s*(?:[|:]+\s*)?\*{0,2}\s*(\d{1,3})\s*\/\s*(\d{1,3})/i);
+  const decimal = sec.match(/aggregate\s*\*{0,2}\s*(?:[|:]+\s*)?\*{0,2}\s*([01](?:\.[0-9]+)?)/i);
+  let v = null;
+  if (fraction) {
+    const dd = Number(fraction[2]);
+    v = dd === 0 ? null : Number(fraction[1]) / dd;
+  }
+  if (v === null && decimal) v = Number(decimal[1]);
+  return Number.isFinite(v) && v !== null && v < 0.8;
+}
+const dUnexcusedFail = dSections.some(({ sec }) => isDFailVerdict(sec)) && !mootOverride && !dMootCoLocated;
+if (dUnexcusedFail) {
+  fail("runbook (d) current-era verdicts record an unexcused FAIL (no REMAINS-for-parent in the section, no PRODUCT DECISION MOOT override, no co-located MOOT) — a PASS/REMAINS recorded elsewhere in the same era cannot mask it (era-relabel spoof) (P2-1).");
+}
 if (!dPass && !dRemains && !mootOverride && !dMootCoLocated) {
   fail("runbook (d) current-era verdicts must record a terminal spot-check disposition — measured aggregate >= 0.8 (PASS), explicit REMAINS for the parent, or the #2013 product-decision MOOT override declared affirmatively (in the PRODUCT DECISION section, or co-located with the FAIL it excuses) (P2-1).");
 }
@@ -325,13 +354,28 @@ if (testJob === null) {
 }
 // Identify the ACTUAL fast-suite pytest step by what it RUNS, not by a
 // label an adversary could mint on a decoy step: the step whose `run:`
-// invokes `python -m pytest $FILES` (the fast suite the fixture-mode
-// regression module runs in). A decoy step named "Run fast test suite" /
-// id pytest-run that only `echo`s (or carries the env var but never runs
-// pytest) is not the wiring.
-const pytestSteps = stepsOf(testJob).filter(
-  (s) => /python -m pytest\s+\$FILES|python -m pytest/.test(stepRunOf(s)) && !/echo \"TORTOISE|Skip-fail guard/.test(s)
-);
+// invokes the fast suite (`python -m pytest $FILES` — the fixture-mode
+// regression module runs inside that suite via the matrix file list). A
+// step running a DIFFERENT suite (test_hosted_api.py, test-slow files) or a
+// decoy that only echoes/quotes the command (single- or double-quoted) does
+// not execute the module and is not the wiring.
+function isFastSuitePytestStep(stepText) {
+  const run = stepRunOf(stepText);
+  if (!run) return false;
+  for (const rawLine of run.split("\n")) {
+    let line = rawLine;
+    // strip comments then quoted spans (a quoted echo of the command is not
+    // an execution of it, regardless of the quote character)
+    line = line.replace(/#.*$/, "").replace(/'[^']*'/g, " ").replace(/"[^"]*"/g, " ");
+    const t = line.trim();
+    if (!t) continue;
+    // a leading echo/printf/cat/comment statement does not execute pytest
+    if (/^(echo|printf|cat|#|\|)\b/.test(t)) continue;
+    if (/python\s+-m\s+pytest\s+\$FILES\b/.test(t)) return true;
+  }
+  return false;
+}
+const pytestSteps = stepsOf(testJob).filter((s) => isFastSuitePytestStep(s));
 if (pytestSteps.length === 0) {
   fail('python-ci.yml `test` job must run the fast pytest suite (a step whose `run:` invokes `python -m pytest $FILES`) with TORTOISE_ASK_LLM_REGRESSION: "1" set in that step\'s env (Task 12 deliverable, P3-2).');
 }

@@ -122,14 +122,18 @@ if (!fs.existsSync(FIXTURES)) {
   fail(`acceptance fixtures missing: ${FIXTURES} — the 4 gold-turn-inclusion fixtures are #2070 Acceptance Indicator 1.`);
 }
 const rawFixture = fs.readFileSync(FIXTURES, "utf8");
-// De-comment + de-docstring: remove full-line comments and every
-// triple-quoted span (docstrings, multi-line strings) BEFORE code checks,
-// so a comment-only RECORDED_FAILURES mention, a commented-out
-// decorator/def/assert, or docstring prose that merely QUOTES "assert
-// ctx_ids & gold" can never satisfy the code checks. Triple-quote spans are
-// replaced with newlines to preserve line numbering for later indexing.
+// De-comment + de-docstring: remove full-line comments BEFORE triple-quoted
+// spans, then remove the triple-quoted spans (docstrings, multi-line
+// strings). Order matters: a full-line comment that QUOTES the delimiter
+// ("the gate regex uses \"\"\" …") must not open a span that swallows live
+// code. Only then do code checks run, so a comment-only RECORDED_FAILURES
+// mention, a commented-out decorator/def/assert, or docstring prose that
+// merely quotes "assert ctx_ids & gold" can never satisfy them.
 function stripCommentsAndDocstrings(raw) {
-  const noDoc = raw
+  // pass 1: full-line comments -> blank (keeps line count stable)
+  const noComments = raw.split("\n").map((l) => (/^\s*#/.test(l) ? "" : l)).join("\n");
+  // pass 2: every """ … """ / ''' … ''' span (incl. cross-line) -> newlines
+  const noDoc = noComments
     .replace(/"""[^]*?"""/g, (m) => m.replace(/[^\n]/g, ""))
     .replace(/'''[^]*?'''/g, (m) => m.replace(/[^\n]/g, ""));
   return noDoc.split("\n").filter((l) => !/^\s*#/.test(l));
@@ -164,13 +168,23 @@ if (goldDef) {
       }
     }
     // The body must ASSERT the gold turns land in the assembled context:
-    // an intersection of a context-derived id set with the gold set. The
-    // real fixture asserts `assert ctx_ids & gold` and `assert {h["id"]
-    // for h in ctx} & gold` — both match `assert ... & gold`. A negated
-    // (`assert gold is None`), bare-presence (`assert gold`), docstring-
-    // quoted, or comment-only mention does not (comments + docstrings
-    // already stripped).
-    hasGoldIntersectAssert = body.some((l) => /assert[^\n]*&[^\n]*\bgold\b|\bassert[^\n]*\bgold\b[^\n]*&/.test(l));
+    // an intersection of a context-derived id set with the gold set that is
+    // the AFFIRMATIVE truth value being tested. The real fixture asserts
+    // `assert ctx_ids & gold, (…` and `assert {h["id"] for h in ctx} &
+    // gold, (…`. A NEGATED or empty-claim intersection does not count —
+    // `assert not (ctx_ids & gold)` or `assert ctx_ids & gold == set()`
+    // assert the #2070 bug still exists (gold NOT in context), so they must
+    // not satisfy the indicator.
+    hasGoldIntersectAssert = body.some((l) => {
+      // must be an assert mentioning an intersection with gold
+      if (!/\bassert\b[^\n]*&[^\n]*\bgold\b|\bassert\b[^\n]*\bgold\b[^\n]*&/.test(l)) return false;
+      // reject negation: `assert not (ctx & gold)`
+      if (/\bassert\b[^\n]*\bnot\s*\(?[^\n]*&[^\n]*\bgold\b/i.test(l)) return false;
+      // reject empty-claims: `& gold == set()` / `== []` / `== 0` / `is None`
+      if (/&[^\n]*\bgold\b[^\n]*==\s*(?:set\(\)|\[\]|\{\}|0(?:\.[0-9]+)?|None|False)/.test(l)) return false;
+      if (/&[^\n]*\bgold\b[^\n]*\bis\s+(?:None|False)/.test(l)) return false;
+      return true;
+    });
   }
 }
 if (!hasRecordedIds || !goldDef || !hasGoldIntersectAssert) {
