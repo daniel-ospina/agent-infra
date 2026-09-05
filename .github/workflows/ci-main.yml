@@ -79,6 +79,15 @@ jobs:
         echo "== extensions/review-enforcer/index.test.ts =="
         (cd extensions/review-enforcer && npm ci --no-audit --no-fund --loglevel=error) && \
           NODE_ENV=test npx tsx extensions/review-enforcer/index.test.ts || failures=$((failures+1))
+        # #379 — verification-gate: the commit-gate suite (unit 173 + e2e 39)
+        # was unwired. Same route as review-enforcer above (real runtime pi
+        # import — isToolCallEventType): devDep pinned 0.84.3, npm ci once, run
+        # both files. index.e2e.test.ts redirects HOME to a temp dir (hermetic).
+        echo "== extensions/verification-gate/index.test.ts =="
+        (cd extensions/verification-gate && npm ci --no-audit --no-fund --loglevel=error) && \
+          npx tsx extensions/verification-gate/index.test.ts || failures=$((failures+1))
+        echo "== extensions/verification-gate/index.e2e.test.ts =="
+        npx tsx extensions/verification-gate/index.e2e.test.ts || failures=$((failures+1))
         if [ $failures -gt 0 ]; then
           echo "❌ $failures extension test file(s) failed"
           exit 1
