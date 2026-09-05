@@ -218,33 +218,84 @@ function cMeasuredFigures(sec) {
     if (!Number.isFinite(val)) continue;
     // trailing comparison operator directly before the value -> the bar operand
     if (/(?:>=|<=|[><=≥≤])\s*$/.test(m[1])) continue;
-    // the bar constant 0.85 is skipped only when the captured gap m[1] names
-    // bar/plan wording (a restatement of the >= 0.85 threshold — "mapped
-    // agreement is the >= 0.85 bar", "target 0.85" — is not a measured
-    // result). An EXPLICIT measured result of exactly 0.85 with no bar
-    // wording in the gap ("measured mapped agreement **0.85** (bar met)")
-    // sits AT the pass threshold — >= 0.85 needs no #2009 — so it must be
-    // recorded as a figure (round-8).
-    if (val === 0.85 && /bar|threshold|target|gate|at least|minimum|required|or higher|or above|restatement|>=|≥|below|under/i.test(m[1])) continue;
+    // The bar constant is skipped ONLY when the capture is a RESTATEMENT of
+    // the >= 0.85 threshold, not a recorded result sitting AT the bar
+    // (round-9). A restatement is (a) target/plan wording in the gap BEFORE
+    // the value — the same plan-wording list the (a) gate's
+    // hasAccuracyMeasure uses (should|target|goal|reach|required|must|
+    // expected|aim|planned|bar|threshold|ceiling|at least|>=|≥) plus the
+    // round-8 bar terms ("must hit 0.85", "target 0.85", "expected 0.85") —
+    // or (b) a POST-NOMINAL bar noun naming the constant right after the
+    // value ("is the 0.85 bar", "a 0.85 threshold"). The post-nominal scan
+    // cannot cross an opening parenthesis: a noun inside a parenthetical
+    // outcome ("(bar met)", "(threshold exceeded)") annotates a measured
+    // result, and an EXPLICIT measured result (measurement wording in the
+    // ~60 chars before the capture — "measured mapped agreement **0.85**") —
+    // always counts: it sits AT the pass threshold — >= 0.85 needs no #2009 —
+    // so it must be recorded as a figure (round-8 goal).
+    if (val === 0.85) {
+      const head = sec.slice(Math.max(0, m.index - 60), m.index);
+      const tail = sec.slice(m.index + m[0].length, m.index + m[0].length + 40);
+      const explicitResult = /measured|recorded|scored|\bresult\b/i.test(head) ||
+        /\((?:bar|threshold|gate|target)\b[^)]{0,24}?\b(?:met|passed|exceeded|satisfied|achieved|hit|cleared|reached)\)/i.test(tail);
+      if (!explicitResult) {
+        const planWording = /should|target|goal|reach|required|must|expected|aim|planned|bar|threshold|gate|ceiling|at least|minimum|or higher|or above|restatement|>=|≥|below|under/i.test(m[1]);
+        const postNominal = /^[^0-9\n(]{0,40}?\b(?:bar|threshold|target|gate|requirement)\b/i.test(tail);
+        if (planWording || postNominal) continue;
+      }
+    }
     out.push(val);
   }
   return out;
 }
-// An AFFIRMATIVE #2009 mention inside a section: the token is counted only
-// when it is NOT inside an explicit negation window (preceding ~40 chars or
-// following ~60 chars naming no/not/never/waiv…/unneeded/unnecessary/no
-// longer/superseded/closed/resolved/without). A NEGATED mention ("No #2009
-// is needed (issue waived).", "#2009 not required") records that the
-// follow-up does NOT exist — bare substring presence must not satisfy the
-// P2-3 co-location requirement (round-8).
-function hasAffirmativeIssue2009(sec) {
-  const neg = /\b(?:no|not|never|without|waiv\w*|unneeded|unnecessary|no\s+longer|superseded|closed|resolved|dropped|removed)\b/i;
-  const re = /#2009/g;
+// An AFFIRMATIVE #2009 mention inside a section: the token counts only when
+// at least one SENTENCE containing #2009 records it affirmatively. Negation
+// is SENTENCE-scoped and ISSUE-BINDING (round-9): a mention is negated only
+// when the sentence names the follow-up as not needed / not existing /
+// waived / superseded / closed ("No #2009 is needed (issue waived).",
+// "#2009 is not required", "#2009 was superseded by #21xx", "shipped
+// without #2009", "#2009 closed as wontfix"). A bare negator word anywhere
+// in a flat char radius is NOT enough — unrelated prose in the same section
+// ("No annotation work was done this cycle.") or a parenthetical sitting
+// far past the token ("(no product-side flip smuggled into the gate)")
+// must never negate a genuine OPEN record (the round-8 flat ±60/40 window
+// false-blocked both).
+function issueSentences(sec) {
+  // Sentence boundaries: . ! ? optionally followed by markdown bold, then
+  // whitespace + a capital/digit/(/#/* — mootSentences' class extended with
+  // # and * so a sentence that STARTS with "#2009 …" or "**No …" splits
+  // cleanly instead of gluing onto the previous sentence.
+  const out = [];
+  const re = /[.!?](?:\*{2})?(?=\s+[A-Z0-9(#*])/g;
+  let last = 0;
   let m;
   while ((m = re.exec(sec)) !== null) {
-    const pre = sec.slice(Math.max(0, m.index - 40), m.index);
-    const post = sec.slice(m.index + m[0].length, m.index + m[0].length + 60);
-    if (!neg.test(pre) && !neg.test(post)) return true;
+    out.push(sec.slice(last, m.index + m[0].length).trim());
+    last = re.lastIndex;
+  }
+  out.push(sec.slice(last).trim());
+  return out.filter((s) => s.length > 0);
+}
+function sentenceNegatesIssue2009(s) {
+  return [
+    // "No #2009 is needed (issue waived)." / "no #2009 was filed this cycle"
+    /\bno\s+(?:#2009|follow-?up\s+#2009|issue\s+#2009)\b/i,
+    // "#2009 is/… not|never|no longer needed|required|waived|…" ("#2009 not
+    // required", "#2009 no longer applicable", "#2009 never tracked")
+    /#2009\b[^.!?\n]{0,60}?\b(?:is|was|has\s+been|remains)?\s*(?:not|never|no\s+longer)\s+(?:needed|required|waived|warranted|necessary|applicable|tracked|filed|opened)\b/i,
+    // "#2009 was waived / superseded (by …) / dropped / removed" — the
+    // follow-up is recorded as no longer an open obligation
+    /#2009\b[^.!?\n]{0,80}?\b(?:waived|superseded|dropped|removed|unneeded|unnecessary)\b/i,
+    // "#2009 was closed (as wontfix) / resolved" — direct predicate on the
+    // issue only, so an unrelated "closed" in the sentence cannot negate
+    /#2009\b[^.!?\n]{0,60}?\b(?:is|was|has\s+been|gets?|remains)?\s*(?:closed|resolved)\b(?:[^.!?\n]{0,20}?\bas\s+(?:won'?t|wont|not)\s+fix\b)?/i,
+    // "…merged/shipped/passed … without #2009"
+    /\bwithout\b[^.!?\n]{0,40}\b#2009\b/i,
+  ].some((re) => re.test(s));
+}
+function hasAffirmativeIssue2009(sec) {
+  for (const s of issueSentences(sec)) {
+    if (/#2009/.test(s) && !sentenceNegatesIssue2009(s)) return true;
   }
   return false;
 }
