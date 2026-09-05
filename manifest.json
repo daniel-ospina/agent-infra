@@ -20,6 +20,7 @@
         "auto-sync.ts",
         "repo-freshness.ts",
         "task-heartbeat.ts",
+        "session-checks.ts",
         "carousel-designer.ts",
         "cmux-session.ts",
         "custom-provider-openrouter/",

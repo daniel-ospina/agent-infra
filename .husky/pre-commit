@@ -51,6 +51,15 @@ if [ -f scripts/check-cost-config.sh ]; then
   bash scripts/check-cost-config.sh --shipped-only || exit 1
 fi
 
+# #498 — pi-config extension-farm parity gate (issue #95 invariant): every
+# extensions/ top-level entry except *.test.ts must be farm-wired into
+# pi-bootstrap/pi-config/extensions (single source of truth). Blocks commits
+# that add an extension without wiring it — unwired extensions ship on NO
+# machine. Repo-tree only; no live ~/.pi/agent dependency.
+if [ -f scripts/check-pi-config-extensions.sh ]; then
+  bash scripts/check-pi-config-extensions.sh || exit 1
+fi
+
 # Only run lint-staged if this is a Node.js project (has package.json)
 if [ -f package.json ] && command -v npx >/dev/null 2>&1; then
   npx lint-staged
