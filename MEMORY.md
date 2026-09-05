@@ -22,3 +22,4 @@
 - [extensions]: the deployed extension at ~/.pi/agent/extensions/<name>/ is a COPY, not a symlink — repo changes reach live sessions only via ./sync.sh AND a pi restart (module loads at startup); a running session keeps the OLD module (audit-window lag is expected, not a deploy failure).
 
 - [git-stash]: dropped stash@{0} lost untracked gate scripts (check-ask-*) — default git stash list/show skips third-parent content (git stash show -u reveals it) → inspect `git ls-tree -r stash@{N}^3` before any drop
+- [llm-ops]: local Qwen 32B-class quality insufficient for agentic coding → decision 2026-09-05 (SWE-bench 69 vs DeepSeek V4-Flash ~79, Terminal-Bench 40 vs 83) → keep coding on remote DeepSeek; local Qwen only for zero-cost review/drafting batches, and never co-resident on the 32GB M5 (needs load/unload choreography). Full record: docs/research/2026-09-05-local-qwen-32b-decision.md
