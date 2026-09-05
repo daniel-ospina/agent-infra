@@ -738,8 +738,9 @@ const CHECKPOINT_TOKEN_TTL_MS = 600_000; // 10 min (plan §4)
 // when NO session id is resolvable (operator shell runs of the checker, a
 // no-ctx/stale-runner boundary — auditSessionId null) both sides fall back to
 // the legacy unscoped path, so the checker↔enforcer contract never splits.
-// Explicit PARALLEL_CHECK_TOKEN_FILE overrides still win verbatim on both
-// sides (never session-scoped — an override is deliberate operator intent).
+// Explicit PARALLEL_CHECK_TOKEN_FILE overrides still win on both sides
+// (whitespace-trimmed, never session-scoped — an override is deliberate
+// operator intent).
 // Sanitization parity is BYTE-wise on all three sides (TS Buffer loop, python
 // utf-8 bytes, bash `tr -c`): every byte outside [A-Za-z0-9._-] becomes "_",
 // so a hostile/exotic session id can never smuggle a path separator and the
@@ -1048,8 +1049,11 @@ function tokenFile(): string {
   // #357 (Task 3): read the PLAIN env name FIRST — the swarm writer honors
   // PARALLEL_CHECK_TOKEN_FILE; _getEnv() would read AGENT_/ELDATO_ prefixed
   // names and never see the writer's contract. Aliases are optional fallback.
+  // #378 (review): the override is whitespace-trimmed to match the python
+  // writer (_env strips) — a padded/empty override would otherwise split the
+  // reader (literal padded path) from the writer (stripped value).
   if (TOKEN_FILE_OVERRIDE !== null) return TOKEN_FILE_OVERRIDE;
-  const envPath = process.env.PARALLEL_CHECK_TOKEN_FILE;
+  const envPath = process.env.PARALLEL_CHECK_TOKEN_FILE?.trim();
   if (envPath) return envPath;
   // #357 review (Bug-scan P2): under NODE_ENV=test, never fall through to the
   // REAL /tmp token file — a machine with a fresh phase-correct token would
@@ -1087,9 +1091,11 @@ export function scopedTokenFilePath(sessionId: string | null, base = CHECKPOINT_
 // empty (post-sanitize) input → unscoped fallback.
 function sessionFileScope(raw: string | null): string | null {
   if (raw === null) return null;
-  // Trim first — an empty/whitespace id is the UNSCOPED fallback (mirrors the
-  // checker's python `strip()` before sanitize).
-  const trimmed = raw.trim();
+  // Trim first — an empty/whitespace id is the UNSCOPED fallback. ASCII-only
+  // whitespace, mirroring the checker's python strip(" \t\n\r\v\f") and the
+  // .sh pattern trim — JS .trim() would also strip NBSP/BOM, which python/bash
+  // do not (an NBSP-padded id sanitizes to underscores on every side instead).
+  const trimmed = raw.replace(/^[ \t\n\r\v\f]+|[ \t\n\r\v\f]+$/g, "");
   if (trimmed === "") return null;
   const bytes = Buffer.from(trimmed, "utf-8");
   let out = "";

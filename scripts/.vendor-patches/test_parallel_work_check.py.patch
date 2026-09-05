@@ -160,7 +160,7 @@
      proc = _run_bash(tmp_path, "start", repo, env, symbol="auth_token")
      assert proc.returncode == 0
      line = proc.stdout.strip().splitlines()[0]
-@@ -785,3 +882,1632 @@
+@@ -785,3 +882,1637 @@
                            text=True, env=os.environ, timeout=30)
      assert proc.returncode == 0
      assert proc.stdout.strip().splitlines()[0].startswith("C?: UNKNOWN")
@@ -1665,6 +1665,11 @@
 +    # 'é' = 0xC3 0xA9 → TWO underscores (byte-wise — the enforcer Buffer and
 +    # the .sh `tr -c` map each utf-8 byte, NOT each code point).
 +    assert pwc._session_scope_suffix({"PI_SESSION_ID": "sessé"}) == "sess__"
++    # NBSP (U+00A0 = 0xC2 0xA0) is NOT trimmed — trim is ASCII-whitespace-only
++    # on all three sides — it sanitizes to two underscores (python/TS/.sh
++    # parity; a bare `.strip()` would diverge from the .sh).
++    assert pwc._session_scope_suffix(
++        {"PI_SESSION_ID": "\u00a0sess\u00a0"}) == "__sess__"
 +
 +
 +def test_378_token_file_path_resolution(monkeypatch, tmp_path):

@@ -2383,6 +2383,11 @@ def test_378_session_scope_suffix_sanitizes_bytewise():
     # 'é' = 0xC3 0xA9 → TWO underscores (byte-wise — the enforcer Buffer and
     # the .sh `tr -c` map each utf-8 byte, NOT each code point).
     assert pwc._session_scope_suffix({"PI_SESSION_ID": "sessé"}) == "sess__"
+    # NBSP (U+00A0 = 0xC2 0xA0) is NOT trimmed — trim is ASCII-whitespace-only
+    # on all three sides — it sanitizes to two underscores (python/TS/.sh
+    # parity; a bare `.strip()` would diverge from the .sh).
+    assert pwc._session_scope_suffix(
+        {"PI_SESSION_ID": "\u00a0sess\u00a0"}) == "__sess__"
 
 
 def test_378_token_file_path_resolution(monkeypatch, tmp_path):

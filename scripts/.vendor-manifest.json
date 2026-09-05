@@ -12,19 +12,19 @@
       "identical@base": false,
       "patch": "scripts/.vendor-patches/parallel_work_check.sh.patch",
       "base_sha256": "f26569c60ea1f5559591f73cbb846cc221d4bfc6cf12aa2c99a5fb25ccf7b7a2",
-      "patched_sha256": "62d918a151ea68275dc74953df0e6ce50d32b983ecafbff8f887ebb913e82fcd"
+      "patched_sha256": "a3e2ea0d72c2aecde0d2f619097228ca34676a2cc352b748443b00f33d5d8d90"
     },
     "scripts/parallel_work_check.py": {
       "identical@base": false,
       "patch": "scripts/.vendor-patches/parallel_work_check.py.patch",
       "base_sha256": "fa71e6b5c1e135a7a48462facb5a1b67d7d7296584918b4b4de3fab4d75f7581",
-      "patched_sha256": "5fd41a62ce9bdc36362c66f899b128855678f7bbccaa54bd0ce99678ab2a457d"
+      "patched_sha256": "c66e4f20a0476d8b0d4bc0d0ef5d378b4fa08566648be9dfafd6aa3c9e462a5f"
     },
     "scripts/test_parallel_work_check.py": {
       "identical@base": false,
       "patch": "scripts/.vendor-patches/test_parallel_work_check.py.patch",
       "base_sha256": "2ad53d8ae271336d2b4cd87048078a125c8bb9cc49280096ca234609f7cf4b64",
-      "patched_sha256": "1a134efa331ebc6c3249ad6108f5b4577c87ad601ea004ebac58d941cdbb3586"
+      "patched_sha256": "b1189c3c5b946c37fe2d349007540bc0eca7f04ccca0c9ea7bd461b9f7a3a329"
     },
     "scripts/fake_supabase.py": {
       "identical@base": true,

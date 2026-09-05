@@ -144,12 +144,11 @@ watchdog_s="$(awk -v b="$budget" 'BEGIN { printf "%.1f", b + 2.0 }' 2>/dev/null 
 # so a padded or ALL-whitespace id falls back unscoped on every side.
 token_file="${PARALLEL_CHECK_TOKEN_FILE:-}"
 if [ -z "$token_file" ]; then
-    token_sid_raw="${PI_SESSION_ID:-}"
-    # Trim leading+trailing whitespace so a padded / ALL-whitespace id behaves
-    # like the python (.strip) and TS (.trim) sides — all-whitespace MUST fall
-    # back to the UNSCOPED path on EVERY side (the #378 parity invariant).
-    token_sid_raw="${token_sid_raw#"${token_sid_raw%%[![:space:]]*}"}"
-    token_sid_raw="${token_sid_raw%"${token_sid_raw##*[![:space:]]}"}"
+    # Trim leading+trailing ASCII whitespace so a padded / ALL-whitespace id
+    # behaves like the python (strip " \t\n\r\v\f") and TS (same set) sides —
+    # all-whitespace MUST fall back to the UNSCOPED path on EVERY side (the
+    # #378 parity invariant). LC_ALL=C pins `sed`'s [:space:] to ASCII.
+    token_sid_raw="$(printf '%s' "${PI_SESSION_ID:-}" | LC_ALL=C sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     token_sid="$(printf '%s' "$token_sid_raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
     if [ -n "$token_sid" ]; then
         token_file="/tmp/parallel-check-token.${token_sid}.json"

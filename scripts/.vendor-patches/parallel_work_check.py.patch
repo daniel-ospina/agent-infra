@@ -160,7 +160,7 @@
  
      def __repr__(self) -> str:  # pragma: no cover - debugging aid
          return self.line()
-@@ -122,15 +192,68 @@
+@@ -122,15 +192,72 @@
  # ── env helpers ────────────────────────────────────────────────
  
  def _env(env: dict, names: tuple[str, ...], default: str = "") -> str:
@@ -200,8 +200,12 @@
 +
 +def _session_scope_suffix(env: dict) -> str | None:
 +    """Sanitized per-session scope suffix from PI_SESSION_ID; None when unset
-+    / empty / whitespace (the caller falls back to the unscoped path)."""
-+    raw = (env.get(_SESSION_ID_ENV) or "").strip()
++    / empty / whitespace (the caller falls back to the unscoped path). Trim is
++    ASCII-whitespace-only (" \t\n\r\v\f") to mirror the TS `sessionFileScope`
++    and the .sh pattern trim exactly — JS `.trim()`/python bare `.strip()`
++    would also strip NBSP/BOM, which the .sh does not (an NBSP-padded id must
++    sanitize to underscores on EVERY side, not trim on some)."""
++    raw = (env.get(_SESSION_ID_ENV) or "").strip(" \t\n\r\v\f")
 +    if not raw:
 +        return None
 +    safe = _FILENAME_SAFE_BYTES.sub(
@@ -231,13 +235,14 @@
      return _normalize_paths(raw.split() if raw else [])
  
  
-@@ -326,9 +449,63 @@
+@@ -325,10 +452,64 @@
+             elif current is not None:
                  current.add(line)
          return commits
- 
++
 +    def remote_url(self, timeout: float = 5.0) -> str:
 +        """#383: URL form of the ops target's origin (B18/B22/B26/B32).
- 
++
 +        `git -C <repo> remote get-url origin`, trimmed; fail → "unknown"
 +        (both-"unknown" binding parity with the enforcer). NEVER the raw
 +        PARALLEL_CHECK_REPO env string and never _REPO_ROOT's remote.
@@ -257,7 +262,7 @@
 +        form and stays byte-identical — the normal ssh remote keeps enforcer
 +        binding parity. Parse failure → "unknown". URL-form contract
 +        otherwise unchanged.
-+
+ 
 +        CRITICAL PARITY NOTE: Task 3's enforcer `bindingRepo()` MUST strip
 +        ALL userinfo from scheme-bearing URLs identically — a
 +        credential-bearing origin must bind consistently (sanitized checker
@@ -288,7 +293,7 @@
 +            return parts._replace(
 +                netloc=parts.netloc.rsplit("@", 1)[-1]).geturl()
 +        return raw
-+
+ 
 +
  def _resolve_slug(env: dict, git: GitOps, timeout: float) -> str:
 -    slug = _env(env, ("PARALLEL_CHECK_REPO_SLUG", "GH_REPOSITORY"))
@@ -296,7 +301,7 @@
      if slug:
          return slug
      url = git._run_ok(["config", "--get", "remote.origin.url"], timeout) or ""
-@@ -338,15 +515,27 @@
+@@ -338,15 +519,27 @@
  
  
  def _sb_config(env: dict) -> tuple[str, str]:
@@ -330,7 +335,7 @@
  def _guard_runner(repo: str, env: dict, timeout: float) -> str:
      """Run checkout_guard.sh (issue #4905) and return its stdout.
  
-@@ -372,34 +561,96 @@
+@@ -372,34 +565,96 @@
  # ── token (PASS evidence for the enforcer gate, issue #5039) ──
  
  def _apply_token(res: CheckResult, phase: str, env: dict, token_file: str,
@@ -435,7 +440,7 @@
  
      def remaining(self) -> float:
          return max(0.05, self.deadline - time.monotonic())
-@@ -411,6 +662,15 @@
+@@ -411,6 +666,15 @@
          return CheckResult(self.code, "UNKNOWN", "budget-exceeded")
  
  
@@ -451,7 +456,7 @@
  class _NoBoard:
      """Stub for a missing board URL — phase code stays ordered and specific."""
  
-@@ -470,6 +730,12 @@
+@@ -470,6 +734,12 @@
              title = str(top.get("title") or "").strip()[:60]
              return CheckResult(ctx.code, "DUP_FIX",
                                 f"closed-issue #{top.get('number')} {title}")
@@ -464,7 +469,7 @@
      # Board scan: another running card claiming the same issue.
      try:
          cards = ctx.board.list_cards(ctx.remaining())
-@@ -492,6 +758,9 @@
+@@ -492,6 +762,9 @@
  
  
  def _check_c2(ctx: _Ctx) -> CheckResult:
@@ -474,7 +479,7 @@
      if not ctx.card_id or not ctx.agent:
          return CheckResult(ctx.code, "UNKNOWN",
                             "missing-card-context SWARM_CARD_ID/AGENT_ID")
-@@ -562,7 +831,12 @@
+@@ -562,7 +835,12 @@
  
  
  def _check_c3(ctx: _Ctx) -> CheckResult:
@@ -487,7 +492,7 @@
          return CheckResult(ctx.code, "UNKNOWN",
                             "missing-card-context SWARM_CARD_ID")
      try:
-@@ -605,7 +879,24 @@
+@@ -605,7 +883,24 @@
          return CheckResult(ctx.code, "STALE",
                             f"behind-origin by {behind} commit(s)",
                             ("rebase",))
@@ -512,7 +517,7 @@
          return CheckResult(ctx.code, "UNKNOWN",
                             "missing-card-context SWARM_CARD_ID")
      try:
-@@ -647,6 +938,9 @@
+@@ -647,6 +942,9 @@
  
  
  def _check_c5(ctx: _Ctx) -> CheckResult:
@@ -522,7 +527,7 @@
      if not ctx.card_id or not ctx.agent:
          return CheckResult(ctx.code, "UNKNOWN",
                             "missing-card-context SWARM_CARD_ID/AGENT_ID")
-@@ -729,26 +1023,39 @@
+@@ -729,26 +1027,39 @@
          raise ValueError(f"phase {phase!r} not in {PHASES}")
      env = dict(os.environ if env is None else env)
      code = PHASE_CODE[phase]
@@ -572,7 +577,7 @@
      if store is None:
          from connectors.supabase_swarm import store as default_store
          store = default_store()
-@@ -772,16 +1079,60 @@
+@@ -772,16 +1083,60 @@
      ctx.git = git
      ctx.guard = guard
      ctx.repo_slug = _resolve_slug(env, git, ctx.remaining())
@@ -635,7 +640,7 @@
      return result
  
  
-@@ -799,9 +1150,13 @@
+@@ -799,9 +1154,13 @@
      except Exception as e:  # defense-in-depth: still emit a verdict line
          result = CheckResult(PHASE_CODE[args.phase], "UNKNOWN",
                               f"script-error {type(e).__name__}: {e}")

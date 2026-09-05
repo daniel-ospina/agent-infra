@@ -227,8 +227,12 @@ _FILENAME_SAFE_BYTES = re.compile(rb"[^A-Za-z0-9._-]")
 
 def _session_scope_suffix(env: dict) -> str | None:
     """Sanitized per-session scope suffix from PI_SESSION_ID; None when unset
-    / empty / whitespace (the caller falls back to the unscoped path)."""
-    raw = (env.get(_SESSION_ID_ENV) or "").strip()
+    / empty / whitespace (the caller falls back to the unscoped path). Trim is
+    ASCII-whitespace-only (" \t\n\r\v\f") to mirror the TS `sessionFileScope`
+    and the .sh pattern trim exactly — JS `.trim()`/python bare `.strip()`
+    would also strip NBSP/BOM, which the .sh does not (an NBSP-padded id must
+    sanitize to underscores on EVERY side, not trim on some)."""
+    raw = (env.get(_SESSION_ID_ENV) or "").strip(" \t\n\r\v\f")
     if not raw:
         return None
     safe = _FILENAME_SAFE_BYTES.sub(

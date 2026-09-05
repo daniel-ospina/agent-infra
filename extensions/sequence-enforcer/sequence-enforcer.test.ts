@@ -3180,6 +3180,9 @@ await test("scopedTokenFilePath: NON-ASCII input is BYTE-wise (multi-byte char �
   // ONE underscore and drift from the checker's byte-wise tr — the #378 parity
   // contract pins two.
   equal(scopedTokenFilePath("sessé"), "/tmp/parallel-check-token.sess__.json");
+  // NBSP (U+00A0 = 0xC2 0xA0) is NOT trimmed (trim is ASCII-whitespace-only on
+  // all three sides) — it sanitizes to two underscores, matching python/bash.
+  equal(scopedTokenFilePath("\u00a0sess\u00a0"), "/tmp/parallel-check-token.__sess__.json");
 });
 
 await test("tokenFile default scopes to the CAPTURED session id (test-mode base; observed via the none-found reason)", () => {
