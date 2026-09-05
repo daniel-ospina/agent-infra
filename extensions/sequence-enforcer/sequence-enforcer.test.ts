@@ -22,6 +22,7 @@ import {
   checkpointTokenOk,
   parseTokenTs,
   sanitizeRemoteUrl,
+  scopedTokenFilePath,
   loadSteps,
   CHECKPOINT_WHITESPACE_REJECT,
   _setTokenFileForTest,
@@ -3136,6 +3137,133 @@ await test("audit sink override forces a deterministic session id (test seam)", 
       },
     );
   } finally { auditRelease(); _setAuditSessionIdForTest(null); _resetStateForTest(); }
+});
+
+section("#378 per-session token-file scoping");
+
+// #378: the token default is per-session — /tmp/parallel-check-token.json →
+// /tmp/parallel-check-token.<sid>.json (sid = the ctx session id, the SAME
+// value pi injects as PI_SESSION_ID into the checker's bash child env). The
+// vendored checker (python + .sh) sanitizes identically (byte-wise), so
+// writer and reader agree; these tests pin the enforcer side + the isolation
+// property (session A's token never satisfies session B and vice versa).
+
+await test("scopedTokenFilePath: null/empty/whitespace session → unscoped base (fallback contract)", () => {
+  equal(scopedTokenFilePath(null), "/tmp/parallel-check-token.json");
+  equal(scopedTokenFilePath(""), "/tmp/parallel-check-token.json");
+  equal(scopedTokenFilePath("   "), "/tmp/parallel-check-token.json");
+});
+
+await test("scopedTokenFilePath: session suffix inserted before the extension — distinct per session", () => {
+  equal(scopedTokenFilePath("sess-378a"), "/tmp/parallel-check-token.sess-378a.json");
+  equal(scopedTokenFilePath("sess-378b"), "/tmp/parallel-check-token.sess-378b.json");
+  ok(scopedTokenFilePath("sess-378a") !== scopedTokenFilePath("sess-378b"), "two sessions never share a path");
+  // a custom base is respected (used by the checker-parity + test-mode wiring tests)
+  equal(scopedTokenFilePath("s1", "/x/y/token.json"), "/x/y/token.s1.json");
+  equal(scopedTokenFilePath("s1", "/x/y/token"), "/x/y/token.s1", "extension-less base gains a trailing .<sid>");
+  equal(scopedTokenFilePath(null, "/x/y/custom.json"), "/x/y/custom.json");
+});
+
+await test("scopedTokenFilePath: hostile session ids are byte-sanitized (no path separator can ever reach the filename)", () => {
+  // the BASE path legitimately contains separators — the assertion is that the
+  // SCOPED suffix injects none: the last path segment carries only safe chars.
+  equal(scopedTokenFilePath("sess/../../etc"), "/tmp/parallel-check-token.sess_.._.._etc.json");
+  const last = scopedTokenFilePath("../evil").split("/").pop()!;
+  ok(!last.includes("/"), "no separator reaches the filename segment");
+  equal(scopedTokenFilePath("../evil"), "/tmp/parallel-check-token..._evil.json");
+  equal(scopedTokenFilePath("a b"), "/tmp/parallel-check-token.a_b.json");
+  equal(scopedTokenFilePath("sess\tid"), "/tmp/parallel-check-token.sess_id.json");
+});
+
+await test("scopedTokenFilePath: NON-ASCII input is BYTE-wise (multi-byte char → one '_' per utf-8 byte, checker tr parity)", () => {
+  // 'é' = 0xC3 0xA9 → 2 bytes → 2 underscores. A code-point regex would emit
+  // ONE underscore and drift from the checker's byte-wise tr — the #378 parity
+  // contract pins two.
+  equal(scopedTokenFilePath("sessé"), "/tmp/parallel-check-token.sess__.json");
+  // NBSP (U+00A0 = 0xC2 0xA0) is NOT trimmed (trim is ASCII-whitespace-only on
+  // all three sides) — it sanitizes to two underscores, matching python/bash.
+  equal(scopedTokenFilePath("\u00a0sess\u00a0"), "/tmp/parallel-check-token.__sess__.json");
+});
+
+await test("tokenFile default scopes to the CAPTURED session id (test-mode base; observed via the none-found reason)", () => {
+  _resetStateForTest();
+  try {
+    _setAuditSessionIdForTest("sess-scope-1");
+    _setTokenFileForTest(null);
+    const r = checkpointTokenOk(makeStep({ name: "check", gate: "checkpoint", token_phase: "plan" }));
+    ok(!r.ok, "no token at the scoped path → block");
+    ok(r.reason.includes("test-none/token.sess-scope-1.json"), "read default is the SESSION-scoped test-mode path (reason: " + r.reason + ")");
+  } finally { _setTokenFileForTest(null); _resetStateForTest(); }
+});
+
+await test("tokenFile default WITHOUT a session id → unscoped test-mode base (no-session fallback)", () => {
+  _resetStateForTest();
+  try {
+    _setTokenFileForTest(null);
+    const r = checkpointTokenOk(makeStep({ name: "check", gate: "checkpoint", token_phase: "plan" }));
+    ok(!r.ok, "no token → block");
+    ok(r.reason.includes("test-none/token.json") && !r.reason.includes("test-none/token.sess-"),
+      "no session id → unscoped read (reason: " + r.reason + ")");
+  } finally { _setTokenFileForTest(null); _resetStateForTest(); }
+});
+
+await test("tokenFile: an explicit PARALLEL_CHECK_TOKEN_FILE env override is honored VERBATIM (never session-scoped)", async () => {
+  _resetStateForTest();
+  const d = tmpDir("tok378env");
+  const p = join(d, "custom.json");
+  writeFileSync(p, JSON.stringify({ verdict: "CLEAR", phase: "plan", repo: "test-repo", ts: new Date().toISOString() }));
+  try {
+    _setAuditSessionIdForTest("sess-scope-env");
+    await withEnv({ PARALLEL_CHECK_TOKEN_FILE: p }, () => {
+      _setTokenFileForTest(null);
+      _setRepoForTest("test-repo");
+      const r = checkpointTokenOk(makeStep({ name: "check", gate: "checkpoint", token_phase: "plan" }), { enforceBinding: true });
+      ok(r.ok, "verbatim env-override token satisfies the checkpoint despite the captured session id");
+    });
+  } finally { _setTokenFileForTest(null); _setRepoForTest(null); _resetStateForTest(); }
+});
+
+await test("#378 cross-session isolation: A's scoped token does NOT satisfy B; B's own token does (no shared-path pass or clobber)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  const dir = "/tmp/sequence-enforcer-test-none";
+  const fileA = join(dir, "token.sess-378-A.json");
+  const fileB = join(dir, "token.sess-378-B.json");
+  try {
+    await withEnv(GATE_ENV, async () => {
+      sequenceEnforcer(pi as any);
+      _setRepoForTest("test-repo");
+      mkdirSync(dir, { recursive: true });
+      // ── session A: a fresh gate session on the same machine ──
+      const ctxA = { sessionManager: { getSessionId: () => "sess-378-A" } };
+      await handlers.session_start!({ type: "session_start", reason: "startup" }, ctxA);
+      _pushSkillForTest("/repo/skills/a/SKILL.md", checkpointSkillSteps(), 0);
+      // A's checker run produced a CLEAR token at A's SCOPED default path.
+      writeFileSync(fileA, JSON.stringify({ verdict: "CLEAR", phase: "plan", repo: "test-repo", ts: new Date().toISOString() }));
+      const resA = await handlers.tool_call!({ toolName: "read", toolCallId: "a1", input: { path: "x" } }, ctxA);
+      ok(!(resA && resA.block), "session A advances on ITS OWN scoped token");
+      equal(_stackForTest()[0]!.stepIndex, 1, "A advanced past the checkpoint");
+      // ── session B starts (fresh session_start resets stack state — mirrors a new process) ──
+      const ctxB = { sessionManager: { getSessionId: () => "sess-378-B" } };
+      await handlers.session_start!({ type: "session_start", reason: "startup" }, ctxB);
+      _pushSkillForTest("/repo/skills/b/SKILL.md", checkpointSkillSteps(), 0);
+      // A's token STILL lingers at A's scoped path — B must never see it.
+      const blocked = await handlers.tool_call!({ toolName: "bash", toolCallId: "b1", input: { command: "rm -rf /" } }, ctxB);
+      ok(blocked && blocked.block, "session B is BLOCKED — A's scoped token does not satisfy B (no cross-session pass)");
+      ok(String(blocked.reason).includes("sess-378-B"), "the block reason names B's scoped path, not A's");
+      equal(_stackForTest()[0]!.stepIndex, 0, "B did NOT advance on A's token");
+      // B writes ITS OWN token → advances (same-repo concurrency both hold tokens, no clobber).
+      writeFileSync(fileB, JSON.stringify({ verdict: "CLEAR", phase: "plan", repo: "test-repo", ts: new Date().toISOString() }));
+      const resB = await handlers.tool_call!({ toolName: "read", toolCallId: "b2", input: { path: "x" } }, ctxB);
+      ok(!(resB && resB.block), "session B advances on ITS OWN scoped token");
+      equal(_stackForTest()[0]!.stepIndex, 1, "B advanced past the checkpoint on its own token");
+    });
+  } finally {
+    try { rmSync(fileA, { force: true }); } catch { /* best-effort */ }
+    try { rmSync(fileB, { force: true }); } catch { /* best-effort */ }
+    auditRelease(); _setRepoForTest(null); _setTokenFileForTest(null); _resetStateForTest();
+  }
 });
 
 section("#377 enforcement.jsonl reader");
