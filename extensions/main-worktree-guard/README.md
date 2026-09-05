@@ -235,16 +235,14 @@ the point.
   untouched.
 - **Not a terminal gate:** humans in a terminal can always run the one-liner.
 
-## Hub-WIP hygiene warnings — put WIP in a worktree (#350)
+## Hub-WIP hygiene warnings — put WIP in a worktree (#350) + #437 tracked-write gate
 
 The **#347 amplifier**: agents write WIP (plan docs to `docs/plans/`,
 migrations, scratch files) directly in the hub main checkout instead of an
 isolated worktree. The write/edit tool blocks non-infra main edits, but
-**agent-infra is exempt** (#99) and **bash heredoc/tee/python writes are
+**agent-infra is exempt** (#99) and **bash heredoc/tee/python writes were
 unguarded** — so the discipline violation silently accumulates, marks the hub
-dirty, and trips M4's freeze. Three **warn-only** surfaces (never block — the
-write/edit block for main-checkout edits is unchanged; these are discipline
-prompts):
+dirty, and trips M4's freeze. Surfaces (in a NON-infra repo):
 
 1. **Write/edit-gate warning:** a write/edit target inside the hub main
    checkout matching the WIP patterns (`docs/plans/` segment pair, any
@@ -254,19 +252,48 @@ prompts):
    sessions (exempt) and worktree sessions writing into the hub via an absolute
    path. For non-infra main-checkout writes (already blocked), the block reason
    now names the amplifier pattern.
-2. **Bash-write detection:** hub-targeted non-git bash writes — `>`/`>>`
-   redirects, `tee`, python `open(…, "w"|"a")` — whose target matches a WIP
-   pattern emit the same banner with a `(via bash …)` note. Heuristic and
-   conservative: `/tmp` scratch-ish targets are excluded (hub-equality),
-   false-positive warnings are acceptable, false-blocks are not (there are
-   none — this path never blocks).
-3. **Hub-hygiene inventory:** the session-start hub-discipline check (#73) now
+2. **Bash-write GATE for tracked files in a DISORDERED hub (#437):** while the
+   hub is OFF-MAIN or DIRTY, a bash write (`>`/`>>` redirect, `tee`, python
+   `open(…, "w"|"a")`) whose target is an INDEX-TRACKED file in the hub is
+   **blocked** — the same freeze the write/edit tools apply, on the bash route
+   that previously landed the tracked-file dirt of the 2026-08-31 tortoise
+   session (write/edit blocked → python-heredoc fallback → landed). Tracked-ness
+   is exact (`git ls-files --error-unmatch`, one bounded call for all
+   candidates, only while disordered); hub-equality is realpath-normalized.
+   Block message states the single coherent rule: bash writes respect the same
+   hub gate as the tools; only the session-start host env bypasses — a
+   mid-command `export` cannot. The gate resolves redirect operands that the
+   static walker CAN name; operands that are shell expansions (`> $OUT`,
+   `> "$FILE"`, `> $(cmd)`, `~`/`~user` paths) stay literal and are NOT
+   resolved (out of threat model — the walker has no shell state; see the
+   classify-git.mjs docstring residual list). Mechanism boundary (post-#474
+   review): the gate covers bash write PRIMITIVES — `>`/`>>`/`>&` redirects,
+   `tee`, and python `open(…,"w"/"a")` — NOT in-place overwrite VERBS
+   (`sed -i`, `perl -pi`, `cp`/`mv` onto a tracked file, `install`, `dd
+   of=`, `tar -x`/`unzip -o` into the hub, `patch -p1`); those contain no
+   write-primitive construct and are outside this mechanism's scope. NOTE —
+   a raw bash verb overwrite of a tracked hub file while disordered is NOT
+   covered by any guard: the write/edit freeze only intercepts tool events,
+   and M4 classifies these as non-git (allowed). Documented residual: only
+   write PRIMITIVES are gated on the bash route (verb overwrites via the
+   write/edit tools stay frozen, and git-verb overwrites stay M4-gated).
+   NEW-file and untracked-WIP targets are NOT this gate's concern (see 3;
+   the #436 collision-free carve-out semantics apply).
+3. **Bash-write warning (untracked WIP — still warn-only):** hub-targeted
+   non-git bash writes whose target matches a WIP pattern emit the same banner
+   with a `(via bash …)` note. Heuristic and conservative: `/tmp` scratch-ish
+   targets are excluded (hub-equality), false-positive warnings are acceptable,
+   false-blocks are not. Untracked WIP stays warn-only (#437 keeps this — the
+   gate covers only index-tracked files).
+4. **Hub-hygiene inventory:** the session-start hub-discipline check (#73) now
    also lists untracked WIP files (`git status --porcelain=v1
    --untracked-files=all`, bounded — the per-file expansion runs only when
    untracked content exists, so a clean hub costs zero extra git calls),
    calling out `docs/plans/` and `migrations/` as the #347 amplifier pattern,
    plus a **throttled periodic re-scan** (once per 5 minutes — never
-   per-command) that flags new untracked WIP mid-session.
+   per-command) that flags new untracked WIP mid-session. The #73 session-start
+   banner also carries a routing nudge: the concrete `hub-worktree.sh <branch>`
+   one-liner (plus a `salvage` hint when dirty-on-main — #2238/#435).
 
 **Suppression:** all warnings are suppressed under the env hatch
 (`AGENT_ALLOW_MAIN_EDITS=1`). Under the TTL escape marker (#207), the
@@ -294,12 +321,19 @@ still warns); an intra-repo symlink alias
 spelling (warn-only false-negative — the perf constraint keeps the pure pattern
 filter first).
 
-**Why warning, not block:** the write/edit block for main-checkout edits is a
-deliberate permanent gate for non-infra repos; these patterns are a hygiene
-signal, and an agent may legitimately need a scratch file briefly. The
-warning surfaces the violation at write time so the agent moves the work to a
-worktree (`bash scripts/checkout-hygiene/hub-worktree.sh <branch>`) before it
-becomes the next M4 freeze.
+**Why warning, not block (untracked WIP):** the write/edit block for
+main-checkout edits is a deliberate permanent gate for non-infra repos; the
+untracked-WIP patterns are a hygiene signal, and an agent may legitimately
+need a scratch file briefly. The warning surfaces the violation at write time
+so the agent moves the work to a worktree
+(`bash scripts/checkout-hygiene/hub-worktree.sh <branch>`) before it becomes
+the next M4 freeze. The #437 tracked-write gate is the exception that DOES
+block: writing an index-tracked hub file via bash while the hub is disordered
+destroys the very dirty delta the freeze protects (and is the mechanism that
+created the 2026-08-31 tortoise dirt). Its tracked-ness test is exact
+(`git ls-files`), so the heuristic deviations below (false-positives on
+heredoc bodies, cd-prefix false-negatives, symlink aliases) apply to the
+WARN surface only — the block fires only on a real tracked hub file.
 
 ## Deliberate-obfuscation residual tier (out of threat model) (#351)
 

@@ -21,6 +21,12 @@
 //     even under the TTL marker (only AGENT_ALLOW_MAIN_EDITS=1 disables it).
 //     The script backdoor (`bash /tmp/x.sh` with git ops) is closed: a
 //     script's git content is gated by the SAME allowlist.
+//  4b. (#437) BASH-WRITE GATE on the disordered hub: while the hub is off-main
+//     or dirty, a bash write to an INDEX-TRACKED hub file (heredoc/tee/`>`
+//     redirect/python open(…,"w") — the mechanism that created the
+//     2026-08-31 tortoise dirt after write/edit blocked) is BLOCKED, mirroring
+//     the write/edit freeze on the bash route. Untracked/new-file writes stay
+//     warn-only (#350) / allowed (#436 carve-out).
 //  5. (#347) WORKTREE-TARGET EXEMPTION: M4 resolves each git invocation's
 //     EFFECTIVE target (cd-chains, -C, GIT_DIR/--git-dir, subshell/pipe
 //     scoping, worktree-list membership + cwd containment) and EXEMPTS
@@ -66,7 +72,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { resolve, dirname, join, relative } from "node:path";
 import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -100,6 +106,14 @@ let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?
 let matchHubWipPattern: (resolvedPath: string) => "docs/plans" | "migrations" | "scratch" | null = () => null;
 let extractBashWriteTargets: (command: string, cwd?: string) => { resolvedPath: string; via: string }[] = () => [];
 let classifyUntrackedWip: (porcelain: string) => { untracked: string[]; wip: { path: string; pattern: string }[] } = () => ({ untracked: [], wip: [] });
+// #437 (C): PER-WRITE-SITE bash-write candidates (cd-aware) for the
+// disordered-hub gate + the pure tracked intersect. Fail-safe defaults inert.
+let bashWriteTargetsResolved: (command: string, cwd?: string) => ({ resolvedPath: string; via: string; site: string; scriptToks?: { path: string; cwd: string }[] })[] = () => [];
+// #437 (C): bash-write gate for TRACKED hub files in a DISORDERED hub (pure
+// intersect of bash-write candidates with index-tracked rels). Fail-safe
+// default: inert (null) — a failed import NEVER false-blocks (same contract
+// as the #350 warn helpers; the gate is opt-in by explicit call only).
+let firstHubTrackedWrite: (candidates: { resolvedPath: string; rel: string }[], trackedRels: string[]) => { resolvedPath: string; rel: string } | null = () => null;
 let classifierLoaded = false;
 let branchDeleteAllowance: (targetNames: string[], currentBranch: string | null, checkedOutBranches?: Set<string>) => boolean = () => false;
 let newFileWriteCollisionFree: (relPath: string, untrackedPaths: string[]) => boolean = () => false;
@@ -123,7 +137,8 @@ try {
      readAllowMarkerState, readHubDisorder,
      extractScriptPath, scriptGitVerdict, evaluateHubGateWithTargets,
      commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern,
-     extractBashWriteTargets, classifyUntrackedWip, branchDeleteAllowance, newFileWriteCollisionFree } =
+     extractBashWriteTargets, classifyUntrackedWip, branchDeleteAllowance, newFileWriteCollisionFree,
+     firstHubTrackedWrite, bashWriteTargetsResolved } =
     await import("./classify-git.mjs"));
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
@@ -492,6 +507,125 @@ function _maybeWarnBashWrite(command: string) {
   } catch { /* warn-only — never blocks */ }
 }
 
+// #437 (C): bash-write GATE for TRACKED hub files in a DISORDERED hub — the
+// root-cause closure for the dirty-hub inflow (session 01a05704 wrote tracked
+// hub files via python/heredoc after write/edit tools blocked; the #350
+// bash-write path was warn-only). Semantics mirror the M4 write/edit gate:
+// while the hub is disordered, overwriting an EXISTING tracked hub file via
+// bash is blocked; NEW-file writes and untracked WIP keep the warn-only
+// treatment (and the #436 collision-free carve-out). Fail-safe: any git/
+// parse error → null (never false-block). One bounded `git ls-files` spawn
+// for all candidates, only while the hub is disordered. Uses the
+// PER-WRITE-SITE extractor (bashWriteTargetsResolved — cd-aware, -c/eval
+// recursion, heredoc-body/escaped-\> exclusion) + reads script-file content
+// (`bash /tmp/x.sh` → the script's own writes are real code — git-side
+// scriptGitVerdict parity).
+function _hubBashTrackedWrite(command: string, execCwd?: string): { resolvedPath: string; rel: string } | null {
+  try {
+    if (!classifierLoaded || isWorktreeCwdWrite(resolve(process.cwd()))) return null;
+    // cycle-27 P2: the base MUST be the session cwd — bashWriteTargetsResolved
+    // applies the command's OWN cd chain from its session base (script tokens
+    // carry their site cwd). Passing a pre-consumed execCwd (already cd'd by
+    // commandExecutionCwd for the git-side _backdoorBlock) DOUBLE-APPLIED the
+    // relative cd (`cd docs && bash x.sh` with a docs/docs/ dir present made
+    // x.sh resolve one level too deep → existsSync miss → content never walked).
+    const base = resolve(process.cwd());
+    const extracted = bashWriteTargetsResolved(command, base);
+    const targets = extracted.filter((t) => (t as { resolvedPath?: string }).resolvedPath);
+    if (targets.length === 0 && !(extracted as { scriptToks?: unknown[] }).scriptToks?.length) return null;
+    const mainTop = _cachedMainTopLevel();
+    if (!mainTop) return null;
+    // Hub-equality filter (realpath-normalized both sides — mirrors the #350
+    // warn path): only targets physically inside the session hub qualify.
+    // (Worktree targets — cd /wt && … — resolve OUTSIDE mainTop → exempt.)
+    const candidates: { resolvedPath: string; rel: string }[] = [];
+    for (const t of targets) {
+      const tPath = (t as { resolvedPath: string }).resolvedPath;
+      const resolvedReal = _realpathNearest(tPath);
+      if (resolvedReal !== mainTop && !resolvedReal.startsWith(mainTop + "/")) continue;
+      const rel = resolvedReal.slice(mainTop.length).replace(/^[/\\]+/, "");
+      if (!rel || resolvedReal === mainTop) continue;
+      candidates.push({ resolvedPath: tPath, rel });
+    }
+    // Script-file content (`bash /tmp/x.sh` / `source f` / `. f`): resolve +
+    // read (<=64KB) and run the same walker over the script body — its
+    // redirects/tee/python run in the SCRIPT's own process against the caller's
+    // cwd (git-side scriptGitVerdict reads the same way; bounded read,
+    // fail-open on error). cycle-21 P2-3: NESTED script/source chains
+    // (wrapper.sh sources lib.sh) are followed to a bounded depth.
+    const scriptToks = (extracted as { scriptToks?: { path: string; cwd: string }[] }).scriptToks ?? [];
+    const seenScripts = new Set<string>();
+    const pendingScripts = scriptToks.slice();
+    let depthBudget = 8;
+    while (pendingScripts.length > 0 && depthBudget-- > 0) {
+      const st = pendingScripts.shift()!;
+      const stKey = `${st.cwd || base}\u0000${st.path}`;
+      if (seenScripts.has(stKey)) continue;
+      seenScripts.add(stKey);
+      try {
+        const sp = resolve(st.cwd || base, st.path);
+        if (!existsSync(sp) || !statSync(sp).isFile()) continue;
+        // cycle-24 P2: a DIRECT-EXEC token (`./run.sh`) only runs when the
+        // file is executable — a non-exec data file (./README.md) is
+        // "permission denied" in real bash and its prose must never content-walk.
+        if ((st as { mode?: string }).mode === "direct" && (statSync(sp).mode & 0o111) === 0) continue;
+        const content = readFileSync(sp, "utf-8").slice(0, 64 * 1024);
+        const innerR = bashWriteTargetsResolved(content, st.cwd || base);
+        for (const inner of innerR) {
+          const ip = (inner as { resolvedPath?: string }).resolvedPath;
+          if (!ip) continue;
+          const resolvedReal = _realpathNearest(ip);
+          if (resolvedReal !== mainTop && !resolvedReal.startsWith(mainTop + "/")) continue;
+          const rel = resolvedReal.slice(mainTop.length).replace(/^[/\\]+/, "");
+          if (!rel || resolvedReal === mainTop) continue;
+          candidates.push({ resolvedPath: ip, rel });
+        }
+        for (const nested of (innerR as { scriptToks?: { path: string; cwd: string }[] }).scriptToks ?? []) {
+          pendingScripts.push(nested);
+        }
+      } catch { /* never false-block */ }
+    }
+    if (candidates.length === 0) return null;
+    // ONE bounded index query for all candidates: `git ls-files
+    // --error-unmatch` prints exactly the TRACKED rels (exit≠0 when any path
+    // is untracked — stdout still carries the tracked matches; execFileSync
+    // throws on exit≠0, so catch and read the captured stdout).
+    let out = "";
+    try {
+      out = execFileSync("git", ["ls-files", "--error-unmatch", "--", ...candidates.map((c) => c.rel)], {
+        cwd: mainTop, encoding: "utf-8", timeout: 5000,
+      }).toString();
+    } catch (e) {
+      out = (e as { stdout?: Buffer | string }).stdout?.toString?.() ?? "";
+    }
+    const trackedRels = out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (trackedRels.length === 0) return null;
+    return firstHubTrackedWrite(candidates, trackedRels);
+  } catch {
+    return null; // never false-block
+  }
+}
+
+// #437 (C): the block reason for a tracked-hub bash write — states the single
+// coherent rule (bash writes respect the same hub gate as the write/edit
+// tools; only session-start host env bypasses; a mid-command `export` cannot)
+// plus the sanctioned ways forward (salvage / worktree / new-file path).
+function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string }): string {
+  return [
+    `⛔ Bash write to a tracked hub file blocked (${hit.rel}).`,
+    `   The shared main checkout is OFF-MAIN or DIRTY (#1484) — bash WRITE`,
+    `   PRIMITIVES to tracked files respect the SAME gate as the tools:`,
+    `   >/>>/&> redirects, tee, and python open(...,"w"/"a").`,
+    `   Untracked/new-file writes stay allowed; only session-start host env`,
+    `   (AGENT_ALLOW_MAIN_EDITS=1) bypasses — a mid-command export cannot.`,
+    `   (In-place overwrite VERBS like sed -i / cp are not a write primitive;`,
+    `   prefer the salvage/worktree routes below for those.)`,
+    `   → Capture the dirty set first (hub returns to main+CLEAN):`,
+    `     bash scripts/checkout-hygiene/hub-worktree.sh salvage <branch> <repo>`,
+    `   → Or write into a worktree (using-git-worktrees skill).`,
+  ].join("\n");
+}
+
 // Script-backdoor closure (Slice E): the documented escape
 // (`write /tmp/x.sh` + `bash /tmp/x.sh`) is closed by gating the script's git
 // content with the SAME recovery allowlist — a script that performs a
@@ -674,10 +808,21 @@ export default function (pi: ExtensionAPI) {
         for (const issue of issues) {
           lines.push(`║  ${issue.padEnd(62)}║`);
         }
+        // #437 (C): routing nudge — the concrete one-liner beats the generic
+        // skill pointer (cycle-28 P2: the SESSION_START copy must carry the
+        // same nudge as the module-load copy — it is the one that fires on
+        // /resume and in print-mode/task-sub-agent contexts).
+        const nudge: string[] = [];
+        nudge.push("Feature work should happen in isolated worktrees.");
+        nudge.push("→ using-git-worktrees skill, or hub-worktree.sh <branch>");
+        nudge.push("   (helper: agent-infra scripts/checkout-hygiene/)");
+        if (dirty && !onNonMain) {
+          nudge.push("→ dirty-on-main: hub-worktree.sh salvage <branch> first");
+        }
+        for (const n of nudge) {
+          lines.push(`║  ${n.padEnd(62)}║`);
+        }
         lines.push(
-          "║                                                                  ║",
-          "║  The main checkout is a shared hub — parallel agents may collide. ║",
-          "║  Feature work should happen in isolated worktrees.                ║",
           "║  → Invoke the using-git-worktrees skill to create one.            ║",
           "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning.         ║",
           "╚══════════════════════════════════════════════════════════════════╝",
@@ -730,6 +875,15 @@ export default function (pi: ExtensionAPI) {
         if (backdoor) return { block: true, reason: backdoor };
         const st = _hubState();
         if (st.disorder) {
+          // #437 (C): bash writes to TRACKED hub files while the hub is
+          // disordered — the dirty-hub inflow closure (the write/edit gate
+          // already freezes overwrites; this mirrors it for the bash route).
+          // Runs BEFORE the git gate so a command whose git verbs are
+          // read-only but whose redirects overwrite a tracked hub file (the
+          // manual `git show HEAD:x > x` revert trick) is still blocked —
+          // the sanctioned path is hub-worktree.sh salvage (#435).
+          const bashWrite = _hubBashTrackedWrite(command, execCwd);
+          if (bashWrite) return { block: true, reason: _hubBashWriteBlockReason(bashWrite) };
           // #347: per-invocation target resolution — git ops whose effective
           // target is an isolated worktree are exempt from hub disorder; every
           // other invocation (hub, foreign, unresolvable) keeps today's block.
@@ -1184,10 +1338,22 @@ export default function (pi: ExtensionAPI) {
           for (const issue of issues) {
             lines.push(`║  ${issue.padEnd(62)}║`);
           }
+          const nudge: string[] = [];
+          // #437 (C): routing nudge — the concrete one-liner beats the generic
+          // skill pointer. Width-safe for the 62-char banner box; the helper
+          // lives in agent-infra (scripts/checkout-hygiene/) and takes
+          // <branch> or the salvage subcommand (#435) for dirty-on-main.
+          nudge.push("Feature work should happen in isolated worktrees.");
+          nudge.push("→ using-git-worktrees skill, or hub-worktree.sh <branch>");
+          nudge.push("   (helper: agent-infra scripts/checkout-hygiene/)");
+          if (dirty && !onNonMain) {
+            // dirty-on-main: the deadlock state (#2238) — capture the set first.
+            nudge.push("→ dirty-on-main: hub-worktree.sh salvage <branch> first");
+          }
+          for (const n of nudge) {
+            lines.push(`║  ${n.padEnd(62)}║`);
+          }
           lines.push(
-            "║                                                                  ║",
-            "║  The main checkout is a shared hub — parallel agents may collide. ║",
-            "║  Feature work should happen in isolated worktrees.                ║",
             "║  → Invoke the using-git-worktrees skill to create one.            ║",
             "║  → Set AGENT_ALLOW_MAIN_EDITS=1 to suppress this warning.         ║",
             "╚══════════════════════════════════════════════════════════════════╝",
