@@ -714,16 +714,35 @@ function cTailNegatesMeasurement(tail) {
 // value reached through the keyword is the clause's only decimal) still
 // records the at-bar figure. A word from an EARLIER sentence never reaches
 // the window (the head clip ends at the previous period, and the decimal
-// record it binds is already out of reach).
+// record it binds is already out of reach). Round-16 (cycle-9 review): the
+// scan is also NEGATION-GUARDED, mirroring the round-13 tail guard
+// (cTrailSignalNegated) — a measurement/result word whose OWN clause
+// (the same cTailClauseSpan computed below) carries a negator ("The
+// parity gate was NOT measured this run; …", "not measured this cycle
+// (run not executed); …", "(c) not measured this cycle; the bar is …")
+// records a NEGATED outcome and never upgrades the bar mention into a
+// recorded at-bar figure. Without this guard a negated measurement verb in
+// the head window fired the step-(1) explicit-measured override and the
+// capture never reached the step-(2)/(3)/(5) demotions, so the verdict
+// flipped solely on clause order (bar mention before vs after the negated
+// clause) — contradicting the head/tail symmetry the round-14 tail
+// classifier already provides.
 function cHeadWindowMeasuresValue(sent, winStart, winText, val) {
   const re = /\b(?:measured|recorded|scored|reported|observed|result)\b/gi;
   let w;
   while ((w = re.exec(winText)) !== null) {
     const { start, end } = cTailClauseSpan(sent, winStart + w.index);
+    const clause = sent.slice(start, end);
+    // Round-16 negation guard: a negator inside the word's own clause means
+    // the verb records a NEGATED measurement/outcome, never a measured
+    // at-bar figure — skip the word and fall through to the step-(2)/(3)/(5)
+    // demotions (parens stay whole, so "(run not executed)" still counts;
+    // a negator in a LATER clause never leaks back past the boundary).
+    if (new RegExp(C_TRAIL_NEGATOR_SRC, "i").test(clause)) continue;
     const dRe = /[01]?\.[0-9]+/g;
     let dm;
     let boundElsewhere = false;
-    while ((dm = dRe.exec(sent.slice(start, end))) !== null) {
+    while ((dm = dRe.exec(clause)) !== null) {
       if (Number(dm[0]) !== val) { boundElsewhere = true; break; }
     }
     if (!boundElsewhere) return true;
