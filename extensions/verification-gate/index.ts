@@ -157,7 +157,15 @@ const BRIDGE_DIR = join(homedir(), ".pi", "agent", "verification");
 // to the child via the env spread). A task child can therefore NEVER fall
 // back to the interactive path: #7591 auto-bypass is unreachable for
 // sub-agent commits (#264 P2/P3).
-function isTaskSubAgent(
+// #483: EXPORTED so index.test.ts can pin the marker pair BEHAVIORALLY
+// (constructed env objects) — pre-#483 the guard readFileSync'd this source
+// and matched the literal text, so a cosmetic refactor (operand reorder,
+// const extraction) failed it spuriously. The pair remains a cross-extension
+// contract: review-enforcer's isTaskSubAgent and task-heartbeat's
+// taskHeartbeatActive/orphanWatchdogActive read the same markers, and the
+// three can't import each other (extension-loader constraint), so each pins
+// the pair in its own suite. Only a semantic drift of the pair must fail.
+export function isTaskSubAgent(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
   // Env-param seam (mirrors task-heartbeat's taskHeartbeatActive): reads the

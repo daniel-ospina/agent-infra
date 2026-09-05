@@ -747,7 +747,13 @@ async function main() {
       // report-to-parent contract is gone).
       ok(res.reason.includes("This session is a task sub-agent"), `block reason must carry the sub-agent marker, got: ${res.reason.slice(0, 200)}`);
       ok(/Dispatch your own VGATE verification/.test(res.reason), "sub-agent block must instruct the child to self-satisfy the gate via its own task-tool dispatch");
-      ok(/task\(prompt='\[VGATE\] verify files: fileU\.txt/.test(res.reason), "sub-agent block must show the self-dispatch task(...) template naming the blocked files");
+      ok(res.reason.includes("task(prompt="), "sub-agent block must show the self-dispatch task(...) template");
+      // #483: anchor the file INSIDE the template region (not merely the reasons
+      // block, where "- fileU.txt" also appears) — proves the block call site
+      // passed allBlocked through, without pinning quoting/layout (exact copy
+      // lives in the unit tests).
+      const tpl = res.reason.slice(res.reason.indexOf("task(prompt="));
+      ok(tpl.includes("verify files:") && tpl.includes("fileU.txt"), "self-dispatch template must name the blocked file in-band (verify files: <file> merge contract)");
       ok(!/Report this block/.test(res.reason), "sub-agent block must NOT tell the child to report back to the parent (dead-end contract removed)");
       ok(!/Dispatch the verifier sub-agent/.test(res.reason), "sub-agent block must NOT carry the parent's verifier-dispatch instruction");
     } finally {
@@ -845,7 +851,12 @@ async function main() {
           ok(/Hash mismatch/.test(res.reason), "block reason must carry the hash-mismatch diagnostic");
           ok(res.reason.includes("This session is a task sub-agent"), "mismatch block must still carry the sub-agent marker");
           ok(/Dispatch your own VGATE verification/.test(res.reason), "mismatch block must instruct the child to self-satisfy the gate in-band");
-          ok(/task\(prompt='\[VGATE\] verify files: fileM\.txt/.test(res.reason), "mismatch block must show the self-dispatch task(...) template naming the blocked file");
+          ok(res.reason.includes("task(prompt="), "mismatch block must show the self-dispatch task(...) template");
+          // #483: anchor the file INSIDE the template region (not merely the
+          // reasons block) — proves allBlocked reached the template, without
+          // pinning quoting/layout (exact copy lives in the unit tests).
+          const tpl = res.reason.slice(res.reason.indexOf("task(prompt="));
+          ok(tpl.includes("verify files:") && tpl.includes("fileM.txt"), "mismatch dispatch template must name the blocked file in-band (verify files: <file> merge contract)");
           ok(!/Report this block/.test(res.reason), "mismatch block must NOT carry the old report-to-parent contract");
         }
       }
@@ -1136,29 +1147,36 @@ async function main() {
     process.env.PI_MODE = "print"; // builtin-tools task-child markers (#172/#825)
     process.env.TASK_HEARTBEAT = "1";
     process.env.ELDATO_SKIP_VGATE = "1"; // polluted parent launch env (swarm daemon M1)
+    // #483: the ENTIRE scenario body is wrapped (session_start, the commit
+    // tool_call exercising the per-command refusal, and every assertion) so
+    // the finally restores the polluted-parent env on ANY mid-body throw —
+    // the pre-#483 shape restored PI_MODE/TASK_HEARTBEAT/ELDATO_SKIP_VGATE
+    // only at the END of the body (~6 assertions later), leaking child-mode +
+    // escape-hatch env into scenarios 34+ (which would take the refused-
+    // bypass branch) and misattributing the failure.
     try {
       console.warn = ((msg: string, ...rest: unknown[]) => { captured.push(String(msg)); origWarn(msg, ...rest); }) as typeof console.warn;
       await fire("session_start", {});
+      // The per-command bypass branch ALSO runs (ELDATO_SKIP_VGATE still set):
+      // refused → falls through → the commit is gated as usual → blocked.
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'b285'", cwd: repo },
+      });
+      ok(res && res.block === true, "task sub-agent under a polluted parent env must STILL block the unverified commit (no disable, no per-command bypass)");
+      ok(captured.some(l => l.includes("Bypass refused for task sub-agent")), "refused-bypass WARN must be emitted at session_start");
+      ok(captured.some(l => l.includes("VGATE stays ACTIVE")), "WARN must state VGATE stays ACTIVE");
+      const refused = readAuditLines().filter(l => l.event === "gate_bypass_refused");
+      ok(refused.length >= 1, "gate_bypass_refused audit event must be written");
+      ok(readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "escape_hatch").length === 0,
+         "no escape_hatch gate_bypass record for the task sub-agent");
+      git(repo, "reset -q");
     } finally {
       console.warn = origWarn;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.ELDATO_SKIP_VGATE; else process.env.ELDATO_SKIP_VGATE = prevSkip;
     }
-    // The per-command bypass branch ALSO runs (ELDATO_SKIP_VGATE still set):
-    // refused → falls through → the commit is gated as usual → blocked.
-    const res = await fire("tool_call", {
-      type: "tool_call", toolName: "bash",
-      input: { command: "git commit -m 'b285'", cwd: repo },
-    });
-    ok(res && res.block === true, "task sub-agent under a polluted parent env must STILL block the unverified commit (no disable, no per-command bypass)");
-    ok(captured.some(l => l.includes("Bypass refused for task sub-agent")), "refused-bypass WARN must be emitted at session_start");
-    ok(captured.some(l => l.includes("VGATE stays ACTIVE")), "WARN must state VGATE stays ACTIVE");
-    const refused = readAuditLines().filter(l => l.event === "gate_bypass_refused");
-    ok(refused.length >= 1, "gate_bypass_refused audit event must be written");
-    ok(readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "escape_hatch").length === 0,
-       "no escape_hatch gate_bypass record for the task sub-agent");
-    git(repo, "reset -q");
-    if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
-    if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
-    if (prevSkip === undefined) delete process.env.ELDATO_SKIP_VGATE; else process.env.ELDATO_SKIP_VGATE = prevSkip;
   });
 
   test("scenario 34 (#285 P1-1): task sub-agent + 3× empty-content VGATE dispatches → gate NEVER auto-disables", async () => {
@@ -1328,7 +1346,8 @@ async function main() {
       });
       ok(res && res.block === true, "restricted sub-agent commit must block");
       ok(res.reason.includes("This session is a task sub-agent"), "restricted block must carry the sub-agent marker");
-      ok(/STOP — this block is final; do not bypass; return to the parent\s+session/.test(res.reason), "restricted block must instruct return-to-parent");
+      ok(res.reason.includes("return to the parent"), "restricted block must instruct the child to return to the parent session (semantic)");
+      ok(res.reason.includes("block is final"), "restricted block must mark the block final (no in-band self-satisfy) — exact STOP/em-dash phrasing pinned in the unit tests");
       ok(!/Dispatch your own VGATE verification/.test(res.reason), "restricted block must NOT instruct in-band self-dispatch");
       ok(!/This session has the task tool/.test(res.reason), "restricted block must not claim the task tool");
     } finally {
