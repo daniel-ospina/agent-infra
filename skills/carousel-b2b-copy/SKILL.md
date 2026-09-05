@@ -2,6 +2,7 @@
 disable-model-invocation: true
 name: carousel-b2b-copy
 description: Generates carousel copy and creative direction from a creative brief. Invoked by carousel-b2b-strategy. Runs internal review loop (tone, brand, structure) before presenting script to user.
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

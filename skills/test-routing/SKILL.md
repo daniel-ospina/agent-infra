@@ -2,6 +2,7 @@
 name: test-routing
 description: "Entry point for verification dispatch. Reads integration surface map + complexity ratings, determines required verification domains and depth, dispatches to sub-skills. Domain-aware (code/content/config/research/ux) + complexity-proportional. Use before implementing any feature to route to correct verification."
 domain: engineering
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 
@@ -205,3 +206,5 @@ See `repo-conventions.md` for repo-specific pipeline skill names and integration
 | Complexity scaling | Over-testing simple features (wasted time) or under-testing complex features (escaped bugs) |
 | Fallback on error | Router crash blocks the pipeline — no verification happens at all |
 | Non-code domains | Content/config/research issues get code-test suggestions — nonsensical routing |
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

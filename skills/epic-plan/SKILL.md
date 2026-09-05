@@ -2,6 +2,7 @@
 name: epic-plan
 description: "Modular epic planning skill with 8 sub-steps, each with its own review gate. Replaces the monolithic epic-planning skill (now archived). Sequence: User Journeys → Workflows → Prototype → Data Model → Architecture → Interfaces → Detailed E2E → Coherence Review. Invoked after epic-scope approval."
 domain: planning
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 steps:
   - name: user_journeys

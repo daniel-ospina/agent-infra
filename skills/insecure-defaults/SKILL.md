@@ -1,6 +1,7 @@
 ---
 name: insecure-defaults
 description: "Detects fail-open insecure defaults (hardcoded secrets, weak auth, permissive security) that allow apps to run insecurely in production. Use when auditing security, reviewing config management, or analyzing environment variable handling."
+subjects.team: organisation-design-team
 allowed-tools: read, grep, find, bash
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

@@ -1,6 +1,7 @@
 ---
 name: ux-qa
 description: "Meta-orchestrator for end-to-end UX QA runs. Dispatches ux-path-mapper, ux-path-auditor, and ux-problem-triage in sequence, manages the human review gate for UX issues, and creates GitHub issues for all actionable findings."
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

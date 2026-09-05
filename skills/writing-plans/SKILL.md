@@ -2,6 +2,7 @@
 name: writing-plans
 description: Use when you have a spec or requirements for a multi-step task, before touching code. Assumes requirements, priorities, and needs are already captured by `issue-scoping`. Focuses on design decisions and implementation steps.
 domain: engineering
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash web_search web_fetch todo_write task grep find
 steps:
   - name: read_workflow_files

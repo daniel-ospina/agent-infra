@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: epic-research
 description: "Bounded skill wrapping the existing research skill for epic-scope investigation. Adds epic-specific research brief sections (Strategy, UX Patterns, Workflow Patterns, Tech Stack, Assumptions Register). Thin wrapper — delegates deep research to the research skill. Invoked by epic-plan after strategy alignment."
 domain: planning
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

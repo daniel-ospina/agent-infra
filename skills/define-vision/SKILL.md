@@ -8,6 +8,8 @@ subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 1.0.0
 ---
+> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
+> Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 # Define Vision (S4) [DEPRECATED]
 

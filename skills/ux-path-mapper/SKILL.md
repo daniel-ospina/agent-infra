@@ -1,6 +1,7 @@
 ---
 name: ux-path-mapper
 description: "Crawls the live El Dato app via Playwright MCP browser tools, exploring routes across auth states, and produces a structured path-map.json documenting all nodes, edges, and user journey flows"
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

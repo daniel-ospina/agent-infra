@@ -3,6 +3,7 @@ name: epic-workflow
 description: Fractal planning pipeline for epics. Routes through 6 stages (Align → Research → Scope → Plan → Decompose → Verify) at full depth with all review gates, E2E tests, MECE-first decomposition, and 3 human gates.
 type: Workflow
 domain: capability
+subjects.team: organisation-design-team
 status: live
 tags: [pipeline, epic, planning, fractal, orchestrator]
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task

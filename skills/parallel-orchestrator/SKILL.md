@@ -2,6 +2,7 @@
 disable-model-invocation: true
 name: parallel-orchestrator
 description: Reference pattern for parallel sub-agent dispatch, fan-out/fan-in, concurrency control, retry with backoff, and convergence gates. Consumed by other skills — not invoked directly.
+subjects.team: organisation-design-team
 type: reference
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---

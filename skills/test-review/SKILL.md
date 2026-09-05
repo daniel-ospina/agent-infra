@@ -1,6 +1,7 @@
 ---
 name: test-review
 description: Review-fix loop for tests. Dispatches 4 parallel reviewers (correctness, coverage+surface, journey-alignment, test-quality), merges issues, fixes with research, and loops until clean or convergence. Invoked by test-writing after test creation and by code-review at PR time.
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 1.0.0
 steps:

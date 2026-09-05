@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: epic-align
 description: "Bounded skill for epic strategy alignment. Runs BEFORE research — adversarial check, Eisenhower matrix, profit growth alignment. Produces a decision rationale that either validates the feature or suggests alternatives. Invoked by epic-plan at pipeline start."
 domain: planning
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

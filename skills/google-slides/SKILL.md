@@ -1,6 +1,7 @@
 ---
 name: google-slides
 description: "Creates branded Google Slides presentations for El Dato. 3-phase pipeline: Brief → Generate → Review. Uses Composio Google Slides integration for markdown→Slides conversion with El Dato brand tokens. Supports optional image generation for storyboarding. Vision-model design critique via read_image (Opus-class) for visual quality."
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

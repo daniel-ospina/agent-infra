@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: epic-decompose
 description: "Bounded skill for work decomposition into GitHub issues. Takes the approved epic plan and generates child issues with per-issue review gates and MECE verification (Mutually Exclusive, Collectively Exhaustive). Uses the issue-creation skill for each issue. Invoked by epic-plan after coherence review passes."
 domain: planning
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 steps:
   - name: extract_work_units

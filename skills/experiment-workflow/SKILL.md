@@ -2,6 +2,7 @@
 name: experiment-workflow
 description: Scientific method for product experiments. 9-stage pipeline with pre-registration, validation gate, and falsification check. Reuses shared/align, research, scope, decompose. Forks shared/plan and shared/verify for experiment-specific needs.
 domain: capability
+subjects.team: organisation-design-team
 type: Workflow
 status: live
 tags: [pipeline, experiment, scientific-method, pre-registration]

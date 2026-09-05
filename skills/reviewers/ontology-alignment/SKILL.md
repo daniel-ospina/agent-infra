@@ -2,6 +2,7 @@
 disable-model-invocation: true
 name: ontology-alignment
 description: Detects vocabulary drift and semantic inconsistency in epic terminology. Use when reviewing Data Model substep output for Ontology complexity axis. Returns structured ISSUE blocks or NO ISSUES FOUND.
+subjects.team: organisation-design-team
 allowed-tools: read bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

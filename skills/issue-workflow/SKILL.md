@@ -2,6 +2,7 @@
 name: issue-workflow
 description: Entry-point router for any GitHub issue. Detects Level (Epic/Project/Task) from fractal fields and dispatches to the correct workflow skill. Use when asked to implement, fix, work on, or close any issue.
 domain: capability
+subjects.team: organisation-design-team
 type: Workflow
 status: live
 tags: [pipeline, issue, routing, fractal, orchestrator, entry-point]

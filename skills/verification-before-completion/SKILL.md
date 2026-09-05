@@ -1,6 +1,7 @@
 ---
 name: verification-before-completion
 description: "Proof-of-work gate before claiming any task is done. Runs verification appropriate to the task type (code → typecheck+tests, deploy → browser screenshot, content → schema validate). Use whenever Pi is about to tell the user something is 'done' or 'fixed.' Not tied to commit-workflow — covers non-commit verification (research, content, config, deploy)."
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash
 version: 1.1.0
 ---
@@ -309,3 +310,5 @@ supabase functions list | grep <name> && agent-browser open $PROD_URL/api/test -
 - commit-workflow skill (pre-flight checks)
 - ux-qa skill (full UX audit)
 - issue-scoping skill (Double Diamond + integrated verification gates)
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

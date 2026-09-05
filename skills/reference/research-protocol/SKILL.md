@@ -4,7 +4,10 @@ name: research-protocol
 description: "Reference for how to conduct research. Consumed by other skills — not invoked directly. Encodes five research dimensions within a domain-aware structure (Cynefin + Double Diamond + Estuarine Mapping + Distributed Sensing), the ## Raw Notes persistence convention, and the fractal granularity ladder. Restored 2026-08-13 from the eldato archive (issue #231)."
 type: reference
 domain: capability
+subjects.team: organisation-design-team
 ---
+> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
+> Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 # Research Protocol
 
@@ -344,3 +347,5 @@ Every research brief (epic sibling `research-brief.md`, `docs/research/<slug>.md
 - **DRIFT/TELBench** (arXiv 2606.02060): Inherited claims without revalidation are the top error source in long-horizon research.
 - **STALE** (arXiv 2605.06527): Recognition of updated evidence does not imply application — re-derive at the point of use.
 - **MisKnow-Agent** (arXiv 2607.20891): Later-stage research that can challenge earlier evidence reduces false-conclusion adoption.
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.
