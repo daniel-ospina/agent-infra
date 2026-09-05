@@ -34,7 +34,49 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GH_BIN="${GH_BIN:-gh}"
-RECOVERY_HINT="recovery: cd <repo> && git checkout main && git pull --ff-only"
+
+# #437 (C): disorder-aware recovery guidance. The old static hint
+# ("checkout main && git pull --ff-only") is a no-op on the DIRTY-ON-MAIN
+# deadlock (#2238): checkout succeeds, pull fails, and no sanctioned op
+# resolves the dirty set. The fix for that state is hub-worktree.sh salvage
+# (#435) — captures the dirty set (tracked + untracked minus tool junk) into
+# a PR-ready branch and returns the hub to main+CLEAN. Emits by disorder
+# class; prints nothing on clean.
+# $1=on_main(0/1) $2=dirty(0/1) $3=repo $4=branch
+recovery_guide() {
+  local on_main="$1" dirty="$2" repo="$3" branch="$4"
+  local lines=()
+  if [[ "$branch" == "detached" || -z "$branch" ]]; then
+    if [[ $dirty -eq 1 ]]; then
+      lines+=("The hub is detached AND dirty. Name the stray HEAD commit first if it matters:")
+      lines+=("cd $repo && git branch <name> HEAD        # only if the detached commit matters")
+      lines+=("cd $repo && git checkout main")
+      lines+=("Then capture the dirty set:")
+      lines+=("bash $SCRIPT_DIR/hub-worktree.sh salvage <new-branch> $repo")
+    else
+      lines+=("The hub is detached. Return it to main:")
+      lines+=("cd $repo && git branch <name> HEAD        # only if the detached commit matters")
+      lines+=("cd $repo && git checkout main && git pull --ff-only")
+    fi
+  elif [[ $dirty -eq 1 ]]; then
+    if [[ $on_main -eq 1 ]]; then
+      lines+=("The hub is dirty ON MAIN (the #2238 deadlock — no sanctioned hub op resolves it).")
+      lines+=("Capture the dirty set into a PR-ready branch (the hub returns to main+CLEAN):")
+      lines+=("bash $SCRIPT_DIR/hub-worktree.sh salvage <new-branch> $repo")
+    else
+      lines+=("The hub is off main AND dirty. Preserve the stranded branch WIP first:")
+      lines+=("cd $repo && git push origin $branch")
+      lines+=("cd $repo && git checkout main && git pull --ff-only")
+      lines+=("Then capture any remaining dirty-on-main leftovers:")
+      lines+=("bash $SCRIPT_DIR/hub-worktree.sh salvage <new-branch> $repo")
+    fi
+  else
+    lines+=("The hub is off main (stranded branch). Preserve the branch state, then return:")
+    lines+=("cd $repo && git push origin $branch")
+    lines+=("cd $repo && git checkout main && git pull --ff-only")
+  fi
+  printf '%s\n' "${lines[@]}"
+}
 
 usage() {
   sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
@@ -104,7 +146,7 @@ for repo_arg in "${REPOS[@]}"; do
   else
     echo "FAIL  $MAIN_REPO (branch=$BRANCH, porcelain=$PORCELAIN_COUNT)"
     echo "HUB_DISORDER=$disorder branch=$BRANCH repo=$MAIN_REPO porcelain_count=$PORCELAIN_COUNT ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "  $RECOVERY_HINT" | sed "s|<repo>|$MAIN_REPO|"
+    recovery_guide "$on_main" "$dirty" "$MAIN_REPO" "$BRANCH" | sed 's/^/  /' 
     FAIL_LINES+=("$MAIN_REPO|$disorder|$BRANCH|$PORCELAIN_COUNT")
     FAIL=$((FAIL + 1))
   fi
@@ -128,18 +170,20 @@ if [[ $GH_REPORT -eq 1 && $FAIL -gt 0 ]]; then
         continue
       fi
       ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      on_main=1; dirty=0
+      [[ "$disorder" == off_main* ]] && on_main=0
+      [[ "$disorder" == *dirty ]] && dirty=1
+      guide="$(recovery_guide "$on_main" "$dirty" "$repo_path" "$branch")"
       body="Hub-discipline check FAILED for **$repo_path** at $ts.
 
 - \`HUB_DISORDER=$disorder\` (branch=\`$branch\`, porcelain=$porcelain_count)
 - The shared main checkout must stay on \`main\` and clean (hub discipline, #1484).
 - Untracked files count as dirty. Checked via \`git status --porcelain\` from the local hub.
 
-**Sanctioned recovery (terminal):**
+**Recovery steps (by disorder class):**
 \`\`\`bash
-cd $repo_path && git checkout main && git pull --ff-only
-\`\`\`
-
-WIP on a stranded branch is preserved by \`git push origin <checked-out-branch>\` before recovery."
+$guide
+\`\`\`"
       # Dedup: one OPEN hub-state issue per repo → comment; else create.
       # gh --jq prints the number, or empty/[]/null when none is open.
       existing="$("$GH_BIN" issue list --repo "$slug" --state open --search "hub-state in:title" --json number --jq '.[0].number' 2>/dev/null || true)"

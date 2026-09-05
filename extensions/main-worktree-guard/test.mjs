@@ -3,9 +3,10 @@
 // + worktree-session write/edit early-return (epic-529 false-positive incident).
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
-import { resolve, dirname, relative } from "node:path";
-import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync } from "node:fs";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree } from "./classify-git.mjs";
+import { resolve, dirname, relative, join } from "node:path";
+import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -1655,6 +1656,836 @@ try {
   expectWriteTargets("no write target", `ls -la`, []);
   expectWriteTargets("read-only python open → no write", `python3 -c "open('docs/plans/x.md').read()"`, []);
 
+  // ── #437 (C) round-1 hardening: bashWriteTargetsResolved — per-write-site
+  // cwd (cd-chains), -c/eval recursion, heredoc-body/escaped-> exclusion.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437-"));
+    mkdirSync(join(H, "docs"));
+    const WT = mkdtempSync(join(tmpdir(), "bwt437wt-"));
+    const rel = (p) => p.replace(H, "H").replace(WT, "WT");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => {
+      const got = pluck(cmd).join(" | ");
+      expectBool(`C437r1: ${label}`, got.includes(needle), true);
+    };
+    const lacks = (cmd, needle, label) => {
+      const got = pluck(cmd).join(" | ");
+      expectBool(`C437r1: ${label}`, !got.includes(needle), true);
+    };
+    has("echo x > docs/ONTOLOGY.md", "redirect:H/docs/ONTOLOGY.md", "plain redirect site");
+    has("cd docs && echo x > ONTOLOGY.md", "redirect:H/docs/ONTOLOGY.md", "cd-prefixed write resolves at the cd site");
+    has("cd docs && echo x > ../README.md", "redirect:H/README.md", "cd-prefixed ../ write resolves through the chain");
+    has("(cd " + WT + " && echo x > README.md)", "redirect:WT/README.md", "subshell worktree write resolves at the WT");
+    has("cd " + WT + " && echo x > README.md", "redirect:WT/README.md", "worktree write (not the hub) resolves at the WT");
+    has("echo a \\> docs/ONTOLOGY.md", "", "escaped \\> emits nothing") || console.log("  (escaped check via empty)");
+    if (pluck("echo a \\> docs/ONTOLOGY.md").length !== 0) console.log("  ❌ C437r1: escaped > emitted a candidate");
+    else { pass++; console.log("  ✅ C437r1: escaped \\> emits nothing"); }
+    has("sh -c 'echo x > docs/ONTOLOGY.md'", "redirect:H/docs/ONTOLOGY.md", "-c payload recursed at the site cwd");
+    has("cat > new.md <<EOF\nrun: tool > docs/ONTOLOGY.md\nEOF\n", "redirect:H/new.md", "heredoc's own redirect target kept");
+    lacks("cat > new.md <<EOF\nrun: tool > docs/ONTOLOGY.md\nEOF\n", "docs/ONTOLOGY.md", "heredoc-body mention NOT a redirect");
+    has("cd docs && python3 - <<'EOF'\nopen('ONTOLOGY.md','w')\nEOF", "python:H/docs/ONTOLOGY.md", "python heredoc after cd resolves at the cd site");
+    const st = bashWriteTargetsResolved("bash /tmp/x.sh", H);
+    expectBool("C437r1: bash <script> surfaces a script token", Array.isArray(st.scriptToks) && st.scriptToks.length === 1, true);
+  }
+
+  // ── #437 (C) round-2 (v4) pins: heredoc-body isolation, && boundaries,
+  // prose-open exclusion, pipe/bg isolation, redirect-on-cd ────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437v4-"));
+    mkdirSync(join(H, "docs"));
+    const WT = mkdtempSync(join(tmpdir(), "bwt437v4wt-"));
+    const rel = (p) => p.replace(H, "H").replace(WT, "WT");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437v4: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C437v4: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    // heredoc body content never swallows trailing code nor shifts cwd
+    has("python3 - <<EOF\nprint(1 << 4)\nEOF\necho x > tracked.md", "redirect:H/tracked.md", "bit-shift heredoc body does not swallow the trailing write");
+    has("cat > out.md <<EOF\n  cd docs\nEOF\necho real > tracked.md", "redirect:H/tracked.md", "body cd-text does not shift the real write cwd");
+    // prose open() never emits (python-interpreter extent gate)
+    lacks('git commit -m "open(\'x.tmp\',\'w\')"', "python:", "prose open() in a commit message emits nothing");
+    // && is a continuation boundary (cd applies); | / & isolate; redirect-on-cd is pre-cd
+    has("cd docs && echo x > ONTOLOGY.md", "redirect:H/docs/ONTOLOGY.md", "&& applies the pending cd");
+    has("cd docs | echo x > README.md", "redirect:H/README.md", "pipe isolates (cd dies at |)");
+    has("cd docs & echo x > README.md", "redirect:H/README.md", "background isolates (cd dies at &)");
+    has("cd docs > list.txt", "redirect:H/list.txt", "redirect on the cd command resolves pre-cd");
+    has("(cd " + WT + " && echo x > README.md)", "redirect:WT/README.md", "subshell worktree write at the WT");
+    has("cd " + WT + " && echo x > README.md", "redirect:WT/README.md", "worktree write (not the hub)");
+    has("cd docs && echo x > f.md && cd .. && echo y > g.md", "redirect:H/docs/f.md", "multi-cd chain first write at docs");
+    has("cd docs && echo x > f.md && cd .. && echo y > g.md", "redirect:H/g.md", "multi-cd chain second write at root");
+  }
+
+  // ── #437 (C) round-3 (v5) pins: heredoc header-remainder walking, <<<,
+  // quoted eval, multi-heredoc forward scan, async-list reseed ─────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437v5-"));
+    mkdirSync(join(H, "docs"));
+    const WT = mkdtempSync(join(tmpdir(), "bwt437v5wt-"));
+    const rel = (p) => p.replace(H, "H").replace(WT, "WT");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437v5: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    // heredoc HEADER remainder is code (runs after cat reads the body)
+    has("cat <<EOF && echo x > tracked.md\nbody\nEOF", "redirect:H/tracked.md", "heredoc header && code still walked");
+    has("cat <<EOF; echo x > tracked.md\nbody\nEOF", "redirect:H/tracked.md", "heredoc header ; code still walked");
+    has("cat <<'EOF' > docs/ONTOLOGY.md\nbody\nEOF", "redirect:H/docs/ONTOLOGY.md", "redirect after the heredoc marker detected");
+    // here-string <<< is DATA — no heredoc swallow
+    has("cat <<< 'content' > tracked.md", "redirect:H/tracked.md", "here-string content does not swallow the write");
+    // quoted eval recurses on the unquoted payload
+    has("eval 'echo x > tracked.md'", "redirect:H/tracked.md", "quoted eval recursed");
+    has('eval "echo x > tracked.md"', "redirect:H/tracked.md", "double-quoted eval recursed");
+    // multi-heredoc bodies scanned forward (no double-count); trailing code walked
+    has("cat <<A <<B\nb1\nb2\nA\nB\necho x > tracked.md", "redirect:H/tracked.md", "multi-heredoc trailing write detected");
+    // async list: the WHOLE `cd docs && true` is subshell'd
+    has("cd docs && true & echo x > tracked.md", "redirect:H/tracked.md", "async list reseeds to the pre-cd cwd");
+  }
+
+  // ── #437 (C) round-4 (cycle-4 fixes) pins: python-extent tightness (no
+  // prose attribution), interpreter flag-skipping, tee multi-target ────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r4-"));
+    mkdirSync(join(H, "docs"));
+    const rel = (p) => p.replace(H, "H");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r4: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C437r4: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    // write-free commands with python -c bit-shifts + prose open() → nothing
+    lacks("python3 -c 'x = 1 << 4' && echo 'see open(\"index.ts\",\"w\") in docs'", "python:", "-c bit-shift + later prose never attributed");
+    lacks("python3 build.py && echo 'note open(\"classify-git.mjs\",\"w\") shape'", "python:", "python-run segment does not leak past &&");
+    lacks("python3 -c 'y = 2 << 8'\ncat <<'EOF'\nopen('README.md','w')\nEOF", "python:", "cat-heredoc prose open() not attributed to an earlier python");
+    // real python open() still caught
+    has("python3 -c 'open(\"x.md\",\"w\")'", "python:H/x.md", "-c payload open() caught");
+    has("python3 - <<'EOF'\nopen('tracked.md','w')\nEOF", "python:H/tracked.md", "python heredoc open() caught");
+    // interpreter flag forms
+    has("bash -eu -c 'echo x > tracked.md'", "redirect:H/tracked.md", "bash -eu -c recursed");
+    has("sh -e -c 'echo x > tracked.md'", "redirect:H/tracked.md", "sh -e -c recursed");
+    {
+      const st = bashWriteTargetsResolved("bash -x /tmp/evil.sh", H).scriptToks || [];
+      expectBool("C437r4: bash -x <script> surfaces a script token", st.length === 1, true);
+    }
+    // tee multi-target
+    has("echo x | tee a.md b.md", "tee:H/a.md", "tee first target");
+    has("echo x | tee a.md b.md", "tee:H/b.md", "tee second target");
+  }
+
+  // ── #437 (C) round-5 (cycle-5 fixes) pins: interpreter flags beyond the
+  // simple class, long options, stdin scripts, heredoc-fed interpreters ─────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r5-"));
+    mkdirSync(join(H, "docs"));
+    const rel = (p) => p.replace(H, "H");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r5: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const stok = (cmd, needle, label) => {
+      const st = bashWriteTargetsResolved(cmd, H).scriptToks || [];
+      expectBool(`C437r5: ${label}`, st.some((t) => t.path === needle), true);
+    };
+    stok("bash -l /tmp/x.sh", "/tmp/x.sh", "bash -l reaches the script path");
+    stok("bash --login /tmp/x.sh", "/tmp/x.sh", "bash --login reaches the script path");
+    stok("bash < /tmp/x.sh", "/tmp/x.sh", "bash < f stdin script surfaced");
+    stok("bash -s < /tmp/x.sh", "/tmp/x.sh", "bash -s < f stdin script surfaced");
+    has("bash -l -c 'echo x > f'", "redirect:H/f", "bash -l -c payload recursed");
+    has("bash --norc -c 'echo x > f'", "redirect:H/f", "bash --norc -c payload recursed");
+    has("bash <<'EOF'\necho x > f\nEOF", "redirect:H/f", "heredoc-fed bash body recursed as code");
+    has("sh <<EOF\necho x > f\nEOF", "redirect:H/f", "heredoc-fed sh body recursed as code");
+    // cat-fed heredoc bodies stay DATA (no code execution semantics)
+    {
+      const ws = pluck("cat <<'EOF'\necho x > f\nEOF").join(" | ");
+      expectBool("C437r5: cat heredoc body stays data", !ws.includes("redirect:H/f"), true);
+    }
+  }
+
+  // ── #437 (C) round-6 (cycle-6 fixes) pins: redirects between interpreter
+  // and <<, interpreter-heredoc header remainder, exec parity, stdin deferral
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r6-"));
+    mkdirSync(join(H, "docs"));
+    const rel = (p) => p.replace(H, "H");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r6: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("cd docs && bash 2>/dev/null <<EOF\necho x > ONTOLOGY.md\nEOF", "redirect:H/docs/ONTOLOGY.md", "redirect before the interpreter heredoc — body still recursed");
+    has("cd docs && bash > /tmp/out.log <<EOF\necho x > ONTOLOGY.md\nEOF", "redirect:H/docs/ONTOLOGY.md", "> log before the heredoc");
+    has("bash <<'EOF' > docs/ONTOLOGY.md\nbody\nEOF", "redirect:H/docs/ONTOLOGY.md", "header-remainder redirect after an interpreter heredoc caught");
+    has("cd docs && bash <<EOF && echo y > ONTOLOGY.md\nbody\nEOF", "redirect:H/docs/ONTOLOGY.md", "header-remainder && write after an interpreter heredoc caught");
+    has("exec bash 2>&1 <<'EOF'\necho x > tracked.md\nEOF", "redirect:H/tracked.md", "exec interpreter heredoc recursed");
+    has("bash < /dev/null <<EOF\necho x > tracked.md\nEOF", "redirect:H/tracked.md", "stdin redirect overridden by a later heredoc (code)");
+    {
+      const st = bashWriteTargetsResolved("bash < f.sh", H).scriptToks || [];
+      expectBool("C437r6: bare stdin script deferred + pushed", st.length === 1 && st[0].path === "f.sh" && st[0].viaStdin === true, true);
+    }
+  }
+
+  // ── #437 (C) round-7 (cycle-7 fix) pins: dup/close redirects between the
+  // interpreter and -c/script must not eat the next word ────────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r7-"));
+    mkdirSync(join(H, "docs"));
+    const rel = (p) => p.replace(H, "H");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r7: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("bash 2>&1 -c 'echo x > docs/ONTOLOGY.md'", "redirect:H/docs/ONTOLOGY.md", "2>&1 before -c does not eat the payload");
+    has("exec bash 2>&1 -c 'echo x > tracked.md'", "redirect:H/tracked.md", "exec 2>&1 before -c");
+    has("bash >&2 -c 'echo x > f.md'", "redirect:H/f.md", ">&2 before -c");
+    has("bash 2>&- -c 'echo x > f.md'", "redirect:H/f.md", "2>&- before -c");
+    {
+      const st = bashWriteTargetsResolved("bash 2>&1 /tmp/x.sh", H).scriptToks || [];
+      expectBool("C437r7: 2>&1 before the script path — script still reached", st.some((t) => t.path === "/tmp/x.sh"), true);
+    }
+  }
+
+  // ── #437 (C) round-8 (cycle-8 fix) pins: input-direction dup/close
+  // (2<&1, 2<&-, <&1, <&-) between interpreter/exec and -c/script ──────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r8-"));
+    mkdirSync(join(H, "docs"));
+    const rel = (p) => p.replace(H, "H");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r8: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("bash 2<&1 -c 'echo x > docs/ONTOLOGY.md'", "redirect:H/docs/ONTOLOGY.md", "2<&1 before -c — payload recursed");
+    has("bash 2<&- -c 'echo x > tracked.md'", "redirect:H/tracked.md", "2<&- before -c");
+    has("exec bash 2<&1 -c 'echo x > tracked.md'", "redirect:H/tracked.md", "exec 2<&1 before -c");
+    {
+      const st = bashWriteTargetsResolved("bash 2<&1 /tmp/x.sh", H).scriptToks || [];
+      expectBool("C437r8: 2<&1 before the script path — script still reached", st.some((t) => t.path === "/tmp/x.sh"), true);
+    }
+  }
+
+  // ── #437 (C) round-9 (cycle-9 fix) pins: digit-less input dup/close
+  // (<&1, <&-, <&0) between interpreter/exec and -c/script ─────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r9-"));
+    mkdirSync(join(H, "docs"));
+    const rel = (p) => p.replace(H, "H");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r9: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("bash <&1 -c 'echo x > docs/ONTOLOGY.md'", "redirect:H/docs/ONTOLOGY.md", "<&1 before -c");
+    has("bash <&- -c 'echo x > tracked.md'", "redirect:H/tracked.md", "<&- before -c");
+    has("exec bash <&1 -c 'echo x > tracked.md'", "redirect:H/tracked.md", "exec <&1 before -c");
+    has("bash -l <&1 -c 'echo x > docs/ONTOLOGY.md'", "redirect:H/docs/ONTOLOGY.md", "flag + <&1 before -c");
+    {
+      const st = bashWriteTargetsResolved("bash <&1 /tmp/x.sh", H).scriptToks || [];
+      expectBool("C437r9: <&1 before the script path — script reached", st.some((t) => t.path === "/tmp/x.sh"), true);
+    }
+  }
+
+  // ── #437 (C) round-10 (cycle-8 review) pins: &> redirect-all in cd-chains
+  // resolves at the post-cd cwd; fd 3-9 interpreter redirects reach scripts ─
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r10-"));
+    mkdirSync(join(H, "docs"));
+    const rel = (p) => p.replace(H, "H");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r10: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("cd docs && echo hi &> README.md", "redirect:H/docs/README.md", "&> resolves at the post-cd cwd");
+    has("cd docs && echo hi &>> README.md", "redirect:H/docs/README.md", "&>> resolves at the post-cd cwd");
+    has("true && cd docs && echo hi &> README.md", "redirect:H/docs/README.md", "&> after a && chain");
+    {
+      const st = bashWriteTargetsResolved("bash 3> /dev/null writer.sh", H).scriptToks || [];
+      expectBool("C437r10: fd-3 redirect does not eat the script path", st.some((t) => t.path === "writer.sh"), true);
+    }
+    {
+      const st = bashWriteTargetsResolved("bash 3>&2 x.sh", H).scriptToks || [];
+      expectBool("C437r10: fd-3 dup does not eat the script path", st.some((t) => t.path === "x.sh"), true);
+    }
+    has("bash 3<&0 -c 'echo hi > tracked.md'", "redirect:H/tracked.md", "fd-3 dup before -c — payload recursed");
+  }
+
+  // ── #437 (C) round-11 (cycle-9 review) pins: interpreter redirect operands
+  // BEFORE the script/-c are pushed; >& file = redirect-all content write ──
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r11-"));
+    mkdirSync(join(H, "docs"));
+    const rel = (p) => p.replace(H, "H");
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${rel(x.resolvedPath)}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r11: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C437r11: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    has("bash > docs/README.md /tmp/x.sh", "redirect:H/docs/README.md", "interpreter > operand before the script pushed");
+    has("exec bash > docs/README.md /tmp/x.sh", "redirect:H/docs/README.md", "exec interpreter > operand pushed");
+    has("bash >& docs/README.md /tmp/x.sh", "redirect:H/docs/README.md", ">& FILE is a content write (not dup)");
+    has("bash >& docs/README.md -c 'echo hi > f.md'", "redirect:H/f.md", ">& file before -c — payload still recursed");
+    lacks("bash 2> err.txt /tmp/x.sh", "redirect:H/err.txt", "2> stderr operand is NOT content");
+  }
+
+  // ── #437 (C) round-12 (cycle-10 review) pins: `bash < f x.sh` (no -s) — the
+  // positional FILE is the script; only -s makes stdin the program (B38 parity)
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r12-"));
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path + (t.viaStdin ? "[stdin]" : "")).sort();
+    expectBool("C437r12: bash < /dev/null /tmp/evil.sh — file arg is the script", st("bash < /dev/null /tmp/evil.sh").join("|") === "/tmp/evil.sh", true);
+    expectBool("C437r12: bash < f x.sh — x.sh surfaced", st("bash < f x.sh").join("|") === "x.sh", true);
+    expectBool("C437r12: exec bash < f x.sh — x.sh surfaced", st("exec bash < f x.sh").join("|") === "x.sh", true);
+    expectBool("C437r12: bash -s < f — stdin IS the program", st("bash -s < f arg1").join("|") === "f[stdin]", true);
+    expectBool("C437r12: bash < f.sh — bare stdin script", st("bash < f.sh").join("|") === "f.sh[stdin]", true);
+  }
+
+  // ── #437 (C) round-13 (cycle-11 review) pins: -s positional is $0 (keep
+  // scanning); a no-`-s` heredoc-header POSITIONAL is the script (body = DATA)
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r13-"));
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path + (t.viaStdin ? "[stdin]" : "")).sort();
+    const redir = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).length;
+    const hd = (c) => c + "\n" + "echo hi > tracked.md" + "\nEOF";
+    // -s: a positional is $0 — the heredoc body IS the program
+    expectBool("C437r13: bash -s z <<'EOF' — body recursed (program), z dropped", redir(hd("bash -s z <<'EOF'")) === 1 && st(hd("bash -s z <<'EOF'")).length === 0, true);
+    expectBool("C437r13: bash -s z < f — f is the program (stdin), z dropped", st("bash -s z < f").join("|") === "f[stdin]", true);
+    // no -s: header positional before the heredoc body IS the script; body = data
+    expectBool("C437r13: bash <<'EOF' x.sh — x.sh is the script, body not code", redir(hd("bash <<'EOF' x.sh")) === 0 && st(hd("bash <<'EOF' x.sh")).join("|") === "x.sh", true);
+    expectBool("C437r13: exec bash -s z <<'EOF' — body recursed", redir(hd("exec bash -s z <<'EOF'")) === 1, true);
+    expectBool("C437r13: exec bash <<'EOF' x.sh — x.sh is the script", st(hd("exec bash <<'EOF' x.sh")).join("|") === "x.sh", true);
+  }
+
+  // ── #437 (C) round-14 (cycle-12 review) pins: heredoc terminator matching
+  // is bash-exact — plain << needs a column-0 delimiter line (leading ws or
+  // trailing padding keeps the body open); <<- strips leading tabs only ──
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r14-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r14: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, label) => expectBool(`C437r14: ${label}`, pluck(cmd).length === 0, true);
+    // padded delimiter-equal line mid-body is DATA — the region stays open
+    lacks("cat <<'EOF'\nline one\n  EOF\necho x > tracked.md\nEOF", "space-indented EOF mid-body does NOT terminate plain <<");
+    lacks("cat <<'EOF'\nline one\nEOF   \necho x > tracked.md\nEOF", "trailing-whitespace EOF does NOT terminate plain <<");
+    lacks("cat <<-EOF\n  EOF\necho x > tracked.md\nEOF", "space-indented EOF does NOT terminate <<- (tabs only)");
+    // <<- with a TAB-indented terminator: body ends there, the NEXT line runs
+    has("cat <<-EOF\n\tline one\n\tEOF\necho x > tracked.md\nEOF", "redirect:H/tracked.md", "<<- tab-terminator ends the body — the following command runs");
+    // python-extent: padded mid-body EOF keeps the python heredoc open
+    has("python3 - <<'EOF'\n  EOF\nopen('tracked.md','w').write('x')\nEOF", "python:H/tracked.md", "python extent stays open past a padded EOF line");
+  }
+
+  // ── #437 (C) round-15 (cycle-13 review) pins: heredoc-delimiter scan is
+  // quote-aware — a `<<token` inside "…"/'…' prose is NOT a second delimiter ─
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r15-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r15: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("cat <<EOF && echo 'usage: pass <<token here'\nbody\nEOF\necho x > tracked.md", "redirect:H/tracked.md", "<< in single-quoted prose is not a delimiter — trailing write still caught");
+    has("cat <<EOF && echo \"usage: pass <<token here\"\nbody\nEOF\necho x > tracked.md", "redirect:H/tracked.md", "<< in double-quoted prose is not a delimiter");
+    {
+      const r = bashWriteTargetsResolved("cat <<A <<B && echo \"x <<C\"\n1\nA\n2\nB\necho y > tracked.md", H);
+      expectBool("C437r15: quoted << after a multi-heredoc header stays prose", r.filter((x) => x.resolvedPath).length === 1, true);
+    }
+  }
+
+  // ── #437 (C) round-16 (cycle-14 review) pins: unquoted heredoc delimiters
+  // may carry non-word chars (A-B, EOF.2); single quotes have NO backslash
+  // escape (`'C:\'` closes at the quote after the backslash) ────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r16-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r16: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("cat <<A-B\nbody\nA-B\necho v > tracked.md", "redirect:H/tracked.md", "A-B heredoc delimiter terminates — trailing write caught");
+    has("cat <<EOF.2\nbody\nEOF.2\necho v > tracked.md", "redirect:H/tracked.md", "EOF.2 heredoc delimiter terminates");
+    has("echo 'a\\' && cat <<EOF > tracked.md\nbody\nEOF", "redirect:H/tracked.md", "single-quote backslash closes at the quote — heredoc redirect caught");
+    has("echo 'C:\\' && echo z > tracked.md", "redirect:H/tracked.md", "single-quote backslash does not swallow the trailing write");
+  }
+
+  // ── #437 (C) round-17 (cycle-15 review) pins: `<<` inside open (( / $((  is
+  // the SHIFT operator (never a heredoc); eval dq payloads honor \" escapes ──
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r17-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r17: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("n=$((1 << 2))\necho x > tracked.md", "redirect:H/tracked.md", "shift in $(( )) is not a heredoc — the later write is caught");
+    has("(( n = 1 << 2 ))\necho x > tracked.md", "redirect:H/tracked.md", "shift in (( )) is not a heredoc");
+    has("n=$((x <<= 2))\necho w > tracked.md", "redirect:H/tracked.md", "<<= shift is not a heredoc");
+    has("(( x )) && cat <<EOF\nbody\nEOF\necho y > tracked.md", "redirect:H/tracked.md", "CLOSED arithmetic before a real heredoc — the heredoc body skipped, trailing write caught");
+    has('eval "echo x > \\"tracked.md\\""', "redirect:H/tracked.md", "eval dq payload: \" escapes honored");
+    has('eval "echo x > \\"my file.md\\""', "redirect:H/my file.md", "eval dq payload with an escaped-quoted space path");
+    {
+      const r = bashWriteTargetsResolved("bash -c 'echo $((1 << 2))\necho y > tracked.md'", H);
+      expectBool("C437r17: -c payload shift does not swallow the second line", r.filter((x) => x.resolvedPath).some((x) => x.resolvedPath.endsWith("tracked.md")), true);
+    }
+  }
+
+  // ── #437 (C) round-18 (cycle-16 review) pins: multi-line arithmetic shift
+  // (delim all-digits or followed by `))`) is never a heredoc; tee heredoc
+  // headers drop the delimiter word ───────────────────────────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r18-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r18: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, label) => expectBool(`C437r18: ${label}`, pluck(cmd).length === 0, true);
+    has("(( n = 1\n<< 2 ))\necho real > tracked.md", "redirect:H/tracked.md", "multi-line (( )) shift — trailing write caught");
+    has("echo $(( 1\n<< 2 ))\necho real > tracked.md", "redirect:H/tracked.md", "multi-line $(( )) shift");
+    has("$((1 << 2 << 3))\necho real > tracked.md", "redirect:H/tracked.md", "chained shift on one line");
+    has("(( a\n<< b ))\necho real > tracked.md", "redirect:H/tracked.md", "var-RHS shift at expression end");
+    has("tee out1.txt <<EOF\ndata\nEOF", "tee:H/out1.txt", "tee heredoc target kept");
+    lacks("tee <<EOF\ndata\nEOF", "tee with NO target and a heredoc — no phantom delimiter word");
+  }
+
+  // ── #437 (C) round-19 (cycle-17 review) pins: arithmetic shift whose `))`
+  // closer is on a LATER line than the var-RHS `<<` — not an unterminated hd ─
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r19-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r19: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("(( acc = base\n<< bits\n)) && echo real > tracked.md", "redirect:H/tracked.md", "closer on a later line than a var-RHS shift");
+    has("echo $(( x\n<< y\n)) && echo real > tracked.md", "redirect:H/tracked.md", "$(( var-RHS shift, closer later line");
+    has("cat <<EOF && : $((1+1))\nbody\nEOF\necho z > tracked.md", "redirect:H/tracked.md", "a REAL heredoc followed by arith on the header stays a heredoc");
+    {
+      const r = bashWriteTargetsResolved("cat <<EOF\nbody\nEOF", H);
+      expectBool("C437r19: plain heredoc body stays data", r.filter((x) => x.resolvedPath).length === 0, true);
+    }
+  }
+
+  // ── #437 (C) round-20 (cycle-18 review) pins: source/. surface the sourced
+  // file as a script token (parity with the git-side SHELL_INTERPRETERS) ──
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r20-"));
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r20: ${label}`, st(cmd).join("|").includes(needle), true);
+    has("source /tmp/evil.sh", "/tmp/evil.sh", "source <file> surfaces the file");
+    has(". /tmp/evil.sh", "/tmp/evil.sh", ". <file> surfaces the file");
+    has(". ./local.sh", "./local.sh", "relative dot-source surfaces the file");
+    {
+      const r = bashWriteTargetsResolved(". foo && echo x > tracked.md", H);
+      expectBool("C437r20: dot-source + a trailing write both caught", r.scriptToks.some((t) => t.path === "foo") && r.some((x) => x.resolvedPath && x.resolvedPath.endsWith("tracked.md")), true);
+    }
+  }
+
+  // ── #437 (C) round-21 (r23 VGATE X7) pins: dot-source at a NEWLINE command
+  // position is the builtin (the backward scan stops AT \n, not past it) ──
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r21-"));
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r21: ${label}`, st(cmd).join("|").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C437r21: ${label}`, !st(cmd).join("|").includes(needle), true);
+    has("true\n. /tmp/evil.sh", "/tmp/evil.sh", "dot-source after a NEWLINE is the builtin");
+    has("echo ok\nsource /tmp/evil.sh", "/tmp/evil.sh", "source after a newline");
+    lacks("find . -name README.md", "README.md", "arg-position . in find stays silent");
+    lacks("git add . README.md", "README.md", "arg-position . in git add stays silent");
+    lacks("echo . README.md", "README.md", "arg-position . in echo stays silent");
+  }
+
+  // ── #437 (C) round-22 (cycle-20 review) pins: brace groups / reserved
+  // words / ! / time all put a bare `.`/source at a TRUE command position ──
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r22-"));
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r22: ${label}`, st(cmd).join("|").includes(needle), true);
+    has("{ . /tmp/evil.sh; }", "/tmp/evil.sh", "brace-group dot-source gated");
+    has("{ source /tmp/evil.sh; }", "/tmp/evil.sh", "brace-group source gated");
+    has("if true; then . /tmp/evil.sh; fi", "/tmp/evil.sh", "then-position dot-source gated");
+    has("! . /tmp/evil.sh", "/tmp/evil.sh", "!-prefixed dot-source gated");
+    has("while true; do . f; break; done", "f", "do-position dot-source gated");
+    const neg = (cmd, label) => expectBool(`C437r22: ${label}`, st(cmd).length === 0, true);
+    neg("find . -name README.md", "arg-dot find stays silent");
+    neg("git add . README.md", "arg-dot git add stays silent");
+  }
+
+  // ── #437 (C) round-23 (cycle-21 review) pins: env-assignment prefix before
+  // . / source; if/while/until CONDITION position; nested source words inside
+  // recursed -c/eval/heredoc payloads ────────────────────────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r23-"));
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r23: ${label}`, st(cmd).join("|").includes(needle), true);
+    has("VAR=val . /tmp/evil.sh", "/tmp/evil.sh", "assignment-prefixed dot-source gated");
+    has("VAR=val source /tmp/evil.sh", "/tmp/evil.sh", "assignment-prefixed source gated");
+    has("A=1 B=2 . /tmp/evil.sh", "/tmp/evil.sh", "multi-assignment dot-source gated");
+    has("if . /tmp/evil.sh; then echo hi; fi", "/tmp/evil.sh", "if-CONDITION dot-source gated");
+    has("while . f; do break; done", "f", "while-condition dot-source gated");
+    has("until . f; do break; done", "f", "until-condition dot-source gated");
+    has("bash -c 'source /tmp/evil.sh'", "/tmp/evil.sh", "-c payload nested source surfaced");
+    has("eval 'source /tmp/evil.sh'", "/tmp/evil.sh", "eval payload nested source surfaced");
+    has("bash <<'EOF'\nsource /tmp/evil.sh\nEOF", "/tmp/evil.sh", "heredoc-body nested source surfaced");
+    const neg = (cmd, label) => expectBool(`C437r23: ${label}`, st(cmd).length === 0, true);
+    neg("find . -name README.md", "arg-dot find stays silent");
+    neg("echo . tracked.md", "arg-dot echo stays silent");
+  }
+
+  // ── #437 (C) round-24 (cycle-22 review) pins: special-word handlers only
+  // fire on the FIRST word of a simple command (arg positions demoted);
+  // spawner prefixes (sudo/env/xargs/time/nohup/VAR=) still reach the command
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r24-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path).sort();
+    const none = (cmd, label) => expectBool(`C437r24: ${label}`, pluck(cmd).length === 0 && st(cmd).length === 0, true);
+    none("grep tee README.md", "grep's tee ARG is not a tee command");
+    none("echo tee README.md", "echo's tee ARG is not a tee command");
+    none("echo bash -c 'echo x > tracked.md'", "echo's bash ARG payload is not recursed");
+    expectBool("C437r24: echo-cd-arg — the write stays at the session cwd", pluck("echo cd /tmp && echo x > README.md").join("|").includes("redirect:H/README.md"), true);
+    const has = (cmd, needle, label) => expectBool(`C437r24: ${label}`, pluck(cmd).join(" | ").includes(needle) || st(cmd).join("|").includes(needle), true);
+    has("sudo bash -c 'echo x > tracked.md'", "tracked.md", "sudo-reached bash -c payload recursed");
+    has("sudo -u root bash -c 'echo x > tracked.md'", "tracked.md", "sudo -u root reaches bash -c");
+    has("env -i bash -c 'echo x > tracked.md'", "tracked.md", "env -i reaches bash -c");
+    has("xargs bash /tmp/x.sh", "/tmp/x.sh", "xargs reaches the script");
+    has("time tee f.md", "tee:H/f.md", "time prefix reaches tee");
+    has("VAR=val bash /tmp/x.sh", "/tmp/x.sh", "assignment prefix reaches bash");
+  }
+
+  // ── #437 (C) round-25 (cycle-23 review) pins: path-qualified interpreters,
+  // direct-exec script paths, exec-direct; builtin/\\/command/pushd/popd cd
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r25-"));
+    mkdirSync(join(H, "sub"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path).sort();
+    const hasW = (cmd, needle, label) => expectBool(`C437r25: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const hasS = (cmd, needle, label) => expectBool(`C437r25: ${label}`, st(cmd).join("|").includes(needle), true);
+    hasS("/usr/bin/bash /tmp/x.sh", "/tmp/x.sh", "path-qualified bash reaches the script");
+    hasW("/usr/bin/bash -c 'echo x > tracked.md'", "redirect:H/tracked.md", "path-qualified bash -c payload recursed");
+    hasS("sudo /usr/bin/bash /tmp/x.sh", "/tmp/x.sh", "spawner + path-qualified bash reaches the script");
+    hasS("./run.sh arg1", "./run.sh", "direct-exec ./run.sh surfaced");
+    hasS("/abs/exec.sh", "/abs/exec.sh", "direct-exec absolute path surfaced");
+    hasS("exec /usr/bin/bash /tmp/x.sh", "/tmp/x.sh", "exec path-qualified bash reaches the script");
+    hasS("exec ./run.sh", "./run.sh", "exec direct-exec surfaced");
+    hasW("builtin cd sub && echo x > f", "redirect:H/sub/f", "builtin cd applies");
+    hasW("command cd sub && echo x > f", "redirect:H/sub/f", "command cd applies");
+    hasW("\\cd sub && echo x > f", "redirect:H/sub/f", "backslash-escaped cd applies");
+    hasW("pushd sub && echo x > f && popd && echo y > g", "redirect:H/g", "popd restores the pre-pushd cwd");
+    expectBool("C437r25: echo ./run.sh — arg path is NOT a script", st("echo ./run.sh").length === 0, true);
+  }
+
+  // ── #437 (C) round-26 (cycle-24 review) pins: ( pushd/popd ) subshell dir
+  // stacks are DISCARDED (single-level ) restore — cycle-24 P1); direct-exec
+  // scriptToks carry mode:"direct" ────────────────────────────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r26-"));
+    mkdirSync(join(H, "a")); mkdirSync(join(H, "c")); mkdirSync(join(H, "wt"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r26: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    // real bash: the subshell pushd is discarded; the outer popd errors (empty) → cwd stays at the last cd
+    has("cd a && ( pushd wt ) ; cd ../c; popd; echo x > f.md", "redirect:H/c/f.md", "( pushd ) inside a subshell is discarded — outer popd errors, cwd stays at cd ../c");
+    has("cd a; pushd ../c && ( pushd wt ); popd; echo x > f.md", "redirect:H/a/f.md", "inherited stack survives the subshell — popd restores a");
+    has("cd a && ( popd ) ; echo x > f.md", "redirect:H/a/f.md", "( popd ) on an empty copied stack is a no-op — cwd stays a");
+    {
+      const r = bashWriteTargetsResolved("./run.sh x", H);
+      const tok = (r.scriptToks || []).find((t) => t.path === "./run.sh");
+      expectBool("C437r26: direct-exec scriptToks carry mode:direct", tok !== undefined && tok.mode === "direct", true);
+    }
+  }
+
+  // ── #437 (C) round-27 (cycle-25 review) pins: case-pattern ) is not a frame
+  // pop; os.chdir inside a python extent shifts the open() attribution ──
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r27-"));
+    mkdirSync(join(H, "sub"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r27: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("( cd sub && case y in y) echo x > f.md ;; esac )", "redirect:H/sub/f.md", "case-pattern ) does not pop the enclosing subshell");
+    has("( cd a && ( cd sub && case y in y) echo x > f.md;; esac ) && echo z > g.md", "redirect:H/g.md", "nested subshell + case — outer writes resolve at the hub root");
+    has("python3 - <<'EOF'\nimport os\nos.chdir('sub')\nopen('f.md','w').write('x')\nEOF", "python:H/sub/f.md", "os.chdir in a python heredoc shifts the open() target");
+    has("python3 -c 'import os; os.chdir(\"sub\"); open(\"f.md\",\"w\").write(1)'", "python:H/sub/f.md", "os.chdir in a python -c payload shifts the open() target");
+  }
+
+  // ── #437 (C) round-28 (cycle-26 review) pins: case-arm BODY first word is a
+  // new command (cd/python/bash dispatch); python -c payloads honor \" escapes
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r28-"));
+    mkdirSync(join(H, "sub"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r28: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("case q in q) cd sub && echo x > f.md ;; esac", "redirect:H/sub/f.md", "cd as the case-arm FIRST word applies");
+    has("case y in y) python3 -c 'open(\"f5.md\",\"w\")' ;; esac", "python:H/f5.md", "python as the case-arm first word registers its extent");
+    has("case y in y) bash -c 'echo x > f6.md' ;; esac", "redirect:H/f6.md", "bash -c as the case-arm first word recurses");
+    has("case x in a) echo 1;; b) cd sub && echo x > f.md;; esac", "redirect:H/sub/f.md", "later arm bodies dispatch");
+    has("python3 -c 'import os; os.chdir(\"sub\"); open(\"b5.md\",\"w\").close()'", "python:H/sub/b5.md", "python -c with escaped quotes — chdir + open inside the extent");
+    has("python3 -c 'a=\"v\"; open(\"f1.md\",\"w\").close()'", "python:H/f1.md", "python -c with an escaped-quote assignment before the open");
+  }
+
+  // ── #437 (C) round-29 (r32 VGATE P5) pin: chdir inside a DOUBLE-quoted -c
+  // payload with \" escapes resolves at the chdir'd dir (lazy group) ──
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r29-"));
+    mkdirSync(join(H, "sub"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const cmd = 'python3 -c "import os; os.chdir(\\"sub\\"); open(\\"f.md\\",\\"w\\").close()"';
+    expectBool("C437r29: dq-escaped chdir in a -c payload — open lands in sub", pluck(cmd).join("|") === "python:H/sub/f.md", true);
+  }
+
+  // ── #437 (C) round-30 (cycle-29 review) pin: tee positionals AFTER a
+  // heredoc marker are real targets (only the delimiter word is dropped) ──
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r30-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r30: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("echo hi | tee a.md <<EOF b.md", "tee:H/b.md", "tee positional after the heredoc marker is a target");
+    has("echo hi | tee <<EOF tracked.md", "tee:H/tracked.md", "tee with only the heredoc marker reaches the tracked target");
+    has("echo hi | tee a.md <<EOF b.md c.md", "tee:H/c.md", "multiple positionals after the marker");
+    {
+      const r = bashWriteTargetsResolved("tee out1.txt <<EOF\ndata\nEOF", H);
+      expectBool("C437r30: the delimiter word is NOT a phantom target", !r.filter((x) => x.resolvedPath).some((x) => x.resolvedPath.endsWith("EOF")), true);
+    }
+  }
+
+  // ── #437 (C) round-31 (cycle-30 review) pins: path-qualified tee and
+  // fully-quoted command words dispatch the special handlers ────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r31-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r31: ${label}`, pluck(cmd).join(" | ").includes(needle) || st(cmd).join("|").includes(needle), true);
+    has("/usr/bin/tee abs.md <<EOF\ndata\nEOF", "tee:H/abs.md", "path-qualified tee reaches its targets");
+    has("/bin/tee a.md <<EOF\ndata\nEOF", "tee:H/a.md", "/bin/tee reaches its targets");
+    has('"tee" q1.md <<EOF\ndata\nEOF', "tee:H/q1.md", "fully-quoted tee word dispatches");
+    has("'bash' -c 'echo x > f.md'", "redirect:H/f.md", "fully-quoted bash -c recurses");
+    has("\"python3\" -c 'open(\"f.md\",\"w\")'", "python:H/f.md", "fully-quoted python -c registers");
+    mkdirSync(join(H, "sub"));
+    has("\"cd\" sub && echo x > f.md", "redirect:H/sub/f.md", "fully-quoted cd applies");
+    const none = (cmd, label) => expectBool(`C437r31: ${label}`, pluck(cmd).length === 0, true);
+    none("echo \"tee x\"", "prose quoted tee arg stays silent");
+    none("echo 'bash -c y'", "prose quoted bash arg stays silent");
+  }
+
+  // ── #437 (C) round-32 (r37 VGATE P3) pins: exec is a spawner prefix — the
+  // exec'd word dispatches normally (tee/python/bash/scripts) ────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r32-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r32: ${label}`, pluck(cmd).join(" | ").includes(needle) || st(cmd).join("|").includes(needle), true);
+    has("exec /usr/bin/tee tracked.md <<EOF\ndata\nEOF", "tee:H/tracked.md", "exec path-qualified tee reaches its targets");
+    has("exec tee tracked.md <<EOF\ndata\nEOF", "tee:H/tracked.md", "exec bare tee reaches its targets");
+    has("exec python3 -c 'open(\"tracked.md\",\"w\")'", "python:H/tracked.md", "exec python -c registers its open()");
+    has("exec bash /tmp/x.sh", "/tmp/x.sh", "exec bash still reaches the script");
+    has("exec ./run.sh", "./run.sh", "exec direct-exec still surfaces");
+    {
+      const r = bashWriteTargetsResolved("echo exec tee f", H);
+      expectBool("C437r32: exec in prose arg position stays silent", r.filter((x) => x.resolvedPath).length === 0, true);
+    }
+  }
+
+  // ── #437 (C) round-33 (cycle-32 review) pins: chained spawners re-pend;
+  // exec -a operand; numeric flag operands; env -S inline payload ───────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r33-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r33: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("env env tee f.md", "tee:H/f.md", "chained env env reaches tee");
+    has("command env tee f.md", "tee:H/f.md", "command env reaches tee");
+    has("nohup env tee f.md", "tee:H/f.md", "nohup env reaches tee");
+    has("sudo -u root env tee f.md", "tee:H/f.md", "sudo env reaches tee");
+    has("exec env VAR=x tee f.md", "tee:H/f.md", "exec env reaches tee");
+    has("builtin exec tee f.md", "tee:H/f.md", "builtin exec reaches tee");
+    has("command exec tee f.md", "tee:H/f.md", "command exec reaches tee");
+    has("setsid tee f.md", "tee:H/f.md", "setsid reaches tee");
+    has("exec -a custom tee tracked.md <<EOF\ndata\nEOF", "tee:H/tracked.md", "exec -a argv0 keeps tee");
+    has("nice -n 5 tee f.md", "tee:H/f.md", "numeric -n operand consumed");
+    has("xargs -n 2 tee f.md", "tee:H/f.md", "xargs -n 2 consumed");
+    has("sudo -u 501 tee f.md", "tee:H/f.md", "sudo -u 501 consumed");
+    has("env -S 'tee f.md'", "tee:H/f.md", "env -S payload recurses tee");
+    has("env -S 'bash -c \"echo x > f.md\"'", "redirect:H/f.md", "env -S bash -c recurses redirect");
+    const none = (cmd, label) => expectBool(`C437r33: ${label}`, pluck(cmd).length === 0, true);
+    none("echo 5 42", "bare numeric args stay data");
+    none("echo exec tee f", "prose exec stays silent");
+  }
+
+  // ── #437 (C) round-34 (cycle-33 review) pins: env -S is one exec line —
+  // quote-stripped remainder recursed (trailing operands + split shells) ──
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r34-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r34: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("env -S 'tee a.md' b.md", "tee:H/b.md", "env -S trailing operand appended (b.md)");
+    has("env -S 'sh -c' 'echo hi > b.md'", "redirect:H/b.md", "env -S split-shell writes b.md");
+    has("env -S 'bash -c' 'echo hi > c.md' d.md", "redirect:H/c.md", "env -S bash -c writes c.md");
+    has("env -S tee a.md", "tee:H/a.md", "env -S raw operand");
+    has("env -S 'tee f.md'", "tee:H/f.md", "env -S quoted single cmd");
+    has("env -S 'bash -c \"echo x > f.md\"'", "redirect:H/f.md", "env -S nested-dq payload");
+    has("env -S 'tee a.md' b.md", "tee:H/a.md", "env -S trailing operand appended (a.md)");
+    // dead exec handler removal sanity (exec routing through the spawner chain)
+    has("exec tee z.md <<EOF\ndata\nEOF", "tee:H/z.md", "exec tee survives handler removal");
+    has("builtin exec bash -c 'echo x > g.md'", "redirect:H/g.md", "builtin exec bash survives handler removal");
+    const none = (cmd, label) => expectBool(`C437r34: ${label}`, pluck(cmd).length === 0, true);
+    none("env -u HOME echo hi", "env -u plain stays silent");
+    none("echo env -S 'tee a.md'", "prose env -S stays silent");
+  }
+
+  // ── #437 (C) round-35 (cycle-34 review) pins: env -S operator/assignment
+  // false-positive guards ────────────────────────────────────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r35-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r35: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("env -S 'tee a.md' b.md", "tee:H/b.md", "env -S trailing operand still resolves");
+    has("env -S 'sh -c' 'echo hi > b.md'", "redirect:H/b.md", "env -S shell -c payload still recurses");
+    has("env -S tee a.md", "tee:H/a.md", "env -S raw operand still resolves");
+    has("env -u HOME -S 'tee x.md'", "tee:H/x.md", "env option-then--S still resolves");
+    const none = (cmd, label) => expectBool(`C437r35: ${label}`, pluck(cmd).length === 0, true);
+    none("env -S 'echo hi > f.md'", "env -S literal > is argv, not a write");
+    none("env -S 'echo hi' tracked.md", "env -S echo arg read-only");
+    none("env FOO=bar -S 'tee x.md'", "env assignment ends option parsing (-S is the utility, rc=127)");
+    none("env -S 'grep foo' tracked.md", "env -S grep reads only");
+  }
+
+  // ── #437 (C) round-36 (cycle-35 review) pins: envSawAssign is per-env-session
+  // state — reset at every separator/chained re-pend ────────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r36-"));
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map((x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r36: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("env FOO=bar; env -S 'tee x.md'", "tee:H/x.md", "assignment env then fresh env -S resolves");
+    has("env FOO=bar echo z; env -S 'tee b.md'", "tee:H/b.md", "cmd then fresh env -S resolves");
+    has("env FOO=bar env -S 'tee x.md'", "tee:H/x.md", "chained env after assignment resolves -S");
+    has("env -u HOME FOO=bar env -S 'tee y.md'", "tee:H/y.md", "chained env with -u+assign resolves -S");
+    has("env FOO=bar tee a.md && env -S 'sh -c' 'echo hi > e.md'", "redirect:H/e.md", "env -S after && resolves");
+    const none = (cmd, label) => expectBool(`C437r36: ${label}`, pluck(cmd).length === 0, true);
+    none("env FOO=bar -S 'tee x.md'", "same-env assignment still suppresses -S");
+  }
+
+  // ── #437 (C) round-37 (cycle-36 review) pins: case PATTERN phase + body
+  // subshell close + tee boundary at ;/&&/| ───────────────────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r37-"));
+    mkdirSync(join(H, "sub"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r37: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("case y in y) echo x > f.md ;; esac", "redirect:H/f.md", "plain case arm body writes");
+    has("( cd sub && case y in y) echo x > f.md ;; esac )", "redirect:H/sub/f.md", "case pattern ) keeps the enclosing subshell frame");
+    has("case y in y) ( cd sub && echo x > f2.md ) ;; esac", "redirect:H/sub/f2.md", "subshell opened in an arm body keeps its cwd");
+    has("case y in y) ( cd sub ) && echo x > f.md ;; esac", "redirect:H/f.md", "body subshell ) restores cwd (no frame leak)");
+    has("echo hi | tee a.md <<EOF b.md", "tee:H/a.md", "tee heredoc positional still real");
+    const none = (cmd, label) => expectBool(`C437r37: ${label}`, pluck(cmd).length === 0, true);
+    none("case x in a|./release.sh|b) echo hi;; esac", "case PATTERN word is never dispatched");
+    none("case x in\n./release.sh) echo hi;; esac", "multiline pattern suppressed");
+    none("case x in tee) echo hi;; esac", "pattern tee never fires");
+    none("for i in a b; do echo hi; done", "for-loop in is untouched");
+    const noNeedle = (cmd, absent, label) => expectBool(`C437r37: ${label}`, !pluck(cmd).join(" | ").includes(absent), true);
+    noNeedle("echo hi | tee a.md; cat tracked.md", "tee:H/tracked.md", "tee stops at ; (no later-command junk)");
+    noNeedle("echo hi | tee a.md && cat tracked.md", "tee:H/tracked.md", "tee stops at &&");
+  }
+
+  // ── #437 (C) round-38 (cycle-37 review) pins: for-in inside case arms,
+  // cross-arm cwd isolation, cased-value never dispatched ────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r38-"));
+    mkdirSync(join(H, "sub"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const st = (cmd) => (bashWriteTargetsResolved(cmd, H).scriptToks || []).map((t) => t.path.replace(H, "H")).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r38: ${label}`, pluck(cmd).join(" | ").includes(needle) || st(cmd).join("|").includes(needle), true);
+    has("case x in x) for i in 1 2; do echo hi | tee tracked.md; done;; esac", "tee:H/tracked.md", "for-in inside an arm: tee body writes");
+    has("case x in x) for i in 1 2; do cd sub && echo hi > tracked.md; done;; esac", "redirect:H/sub/tracked.md", "for-in arm with cd: sub cwd");
+    has("case x in x) for i in 1; do :; done; cd sub && echo hi > tracked.md;; esac", "redirect:H/sub/tracked.md", "post-for cd still applies");
+    has("case w in v) cd sub;; w) echo hi > tracked.md;; esac", "redirect:H/tracked.md", "cross-arm cd does NOT bleed (arm w at root)");
+    const none = (cmd, label) => expectBool(`C437r38: ${label}`, pluck(cmd).length === 0 && st(cmd).length === 0, true);
+    none("case ./run.sh in x) echo hi;; esac", "cased-value path never direct-execs");
+    none("case tee in x) echo hi;; esac", "cased-value tee never fires");
+    none("case x in a|./run.sh|b) echo hi;; esac", "patterns still suppressed");
+    none("for i in a b; do echo hi; done", "top-level for untouched");
+    none("case x in x) for i in 1 2; do echo z; done;; esac", "for-in loop without writes silent");
+  }
+
+  // ── #437 (C) round-39 (cycle-38 review) pins: a MATCHED case arm's cd
+  // persists past esac — union over every arm-matched reality ────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r39-"));
+    mkdirSync(join(H, "docs")); mkdirSync(join(H, "sub"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r39: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("case a in a) cd docs;; esac; echo hi > f1.md", "redirect:H/docs/f1.md", "matched-arm cd persists past esac (docs)");
+    has("case a in a) cd docs; esac; echo hi > f2.md", "redirect:H/docs/f2.md", "no-;; arm cd persists past esac");
+    has("case x in a) cd docs;; b) cd sub;; esac; echo hi > z.md", "redirect:H/sub/z.md", "multi-arm union covers the last cd arm");
+    has("case x in a) cd docs;; b) cd sub;; esac; echo hi > z.md", "redirect:H/docs/z.md", "multi-arm union covers an earlier cd arm");
+    has("case a in a) cd docs;; esac; echo hi > f1.md", "redirect:H/f1.md", "unmatched-arm entry twin still emitted");
+    has("case a in a) cd docs;; esac; cd sub && echo hi > q.md", "redirect:H/sub/q.md", "tail cd resolves from the arm terminal");
+    const none = (cmd, label) => expectBool(`C437r39: ${label}`, pluck(cmd).length === 0, true);
+    none("case x in esac; echo hi", "empty case writes nothing");
+  }
+
+  // ── #437 (C) round-40 (cycle-39 review) pins: stacked-case fork union +
+  // python fork-twins reach their sites ──────────────────────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r40-"));
+    mkdirSync(join(H, "docs")); mkdirSync(join(H, "docs", "sub")); mkdirSync(join(H, "sub"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r40: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("case a in a) cd docs;; esac; case x in b) cd sub;; esac; echo hi > f1.md", "redirect:H/docs/f1.md", "later-case-unmatched reality kept (docs)");
+    has("case a in a) cd docs;; esac; case b in b) cd sub;; esac; echo hi > f1.md", "redirect:H/docs/sub/f1.md", "later-case-matched cd (docs/sub)");
+    has("case a in a) cd docs;; esac; python3 - <<'PY'\nopen('s3.md','w')\nPY", "python:H/s3.md", "python heredoc fork twin reaches the root site");
+    has("case a in a) cd docs;; esac; python3 -c 'open(\"tracked.md\",\"w\")'", "python:H/tracked.md", "python -c fork twin reaches the root site");
+    const none = (cmd, label) => expectBool(`C437r40: ${label}`, pluck(cmd).length === 0, true);
+    none("echo hi", "prose silence");
+  }
+
+  // ── #437 (C) round-41 (cycle-40 review) pins: pattern-literal case; fork
+  // fields inherited by subshells; stacked-case per-alt arm expansion ────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r41-"));
+    mkdirSync(join(H, "docs")); mkdirSync(join(H, "docs", "sub")); mkdirSync(join(H, "sub"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r41: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("case $x in a) cd docs;; esac; ( echo hi > t.md )", "redirect:H/t.md", "fork alts survive into a subshell body");
+    has("case $x in a) cd docs;; esac; ( echo hi > t.md )", "redirect:H/docs/t.md", "primary fork cwd inside a subshell body");
+    has("case z in a) cd docs;; esac; case $y in b) cd sub;; esac; echo hi > t.md", "redirect:H/sub/t.md", "stacked case: later arm runs from an earlier alt (root->sub)");
+    has("case z in a) cd docs;; esac; case $y in b) cd sub;; esac; echo hi > t.md", "redirect:H/docs/sub/t.md", "stacked case: later arm from the primary (docs->sub)");
+    has("case $x in case) cd docs;; esac; cd sub && echo hi > f.md", "redirect:H/sub/f.md", "pattern-literal case does not leak caseDepth (tail cd shifts alts)");
+    has("case $x in case) cd docs;; esac; cd sub && echo hi > f.md", "redirect:H/docs/sub/f.md", "pattern-literal case: matched arm then tail cd");
+    const none = (cmd, label) => expectBool(`C437r41: ${label}`, pluck(cmd).length === 0, true);
+    none("echo hi", "prose silence");
+  }
+
+  // ── #437 (C) round-42 (cycle-41 review) pins: quoted pattern-literal esac
+  // ───────────────────────────────────────────────────────────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r42-"));
+    mkdirSync(join(H, "docs")); mkdirSync(join(H, "sub"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r42: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("case $x in \"esac\") cd sub;; esac; echo hi > f.md", "redirect:H/sub/f.md", "quoted esac is a pattern: its arm cds");
+    has("case $x in \"esac\") cd sub;; esac; echo hi > f.md", "redirect:H/f.md", "quoted esac pattern: no-match entry reality kept");
+    has("case $x in a) cd docs;; \"esac\") cd sub;; esac; echo hi > f.md", "redirect:H/docs/f.md", "two arms: docs reality");
+    has("case $x in a) cd docs;; \"esac\") cd sub;; esac; echo hi > f.md", "redirect:H/sub/f.md", "two arms: sub reality");
+    const none = (cmd, label) => expectBool(`C437r42: ${label}`, pluck(cmd).length === 0, true);
+    none("echo hi", "prose silence");
+  }
+
+  // ── #437 (C) round-43 (cycle-42 review) pins: bare esac is positional —
+  // a LIVE pattern member after | or ( ───────────────────────────────────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r43-"));
+    mkdirSync(join(H, "docs"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r43: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("case $mode in sync|esac) cd docs;; esac; echo b > t.md", "redirect:H/docs/t.md", "alt-member esac: matched arm cds (docs)");
+    has("case $mode in sync|esac) cd docs;; esac; echo b > t.md", "redirect:H/t.md", "alt-member esac: unmatched entry reality kept (root)");
+    has("case $mode in (sync|esac) cd docs;; esac; echo b > t.md", "redirect:H/t.md", "paren alt-member esac: entry reality kept");
+    const none = (cmd, label) => expectBool(`C437r43: ${label}`, pluck(cmd).length === 0, true);
+    none("echo hi", "prose silence");
+  }
+
+  // ── #437 (C) round-44 (cycle-43 review) pins: paren-led pattern arms push
+  // no frame; fork-alt cap raised so ≥9 cd-arms keep every terminal ──────
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt437r44-"));
+    mkdirSync(join(H, "y", "a"), { recursive: true });
+    mkdirSync(join(H, "d1")); mkdirSync(join(H, "d8")); mkdirSync(join(H, "d9"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C437r44: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    has("( cd y && case $v in (a) cd y/a;; esac; echo x > tracked.md ) && echo z > tracked.md", "redirect:H/tracked.md", "paren-led pattern arm inside a real subshell: root write not lost");
+    has("case $v in a) cd d1;; b) cd d2;; c) cd d3;; d) cd d4;; e) cd d5;; f) cd d6;; g) cd d7;; h) cd d8;; i) cd d9;; esac; echo tail > tracked.md", "redirect:H/d8/tracked.md", "9 cd-arms: the 8th arm terminal survives the alt cap");
+    has("case a in (a) cd y/a;; esac; echo hi > t.md", "redirect:H/y/a/t.md", "paren-led arm body cd applies");
+    const none = (cmd, label) => expectBool(`C437r44: ${label}`, pluck(cmd).length === 0, true);
+    none("echo hi", "prose silence");
+  }
+
+  // ── #437 (C): firstHubTrackedWrite — pure intersect for the disordered-hub
+  // bash-write GATE (index.ts feeds ONE bounded `git ls-files --error-unmatch`
+  // output; this pure fn picks the first candidate that is index-tracked).
+  const t437cands = [
+    { resolvedPath: "/hub/docs/ONTOLOGY.md", rel: "docs/ONTOLOGY.md" },
+    { resolvedPath: "/hub/scratch.tmp", rel: "scratch.tmp" },
+    { resolvedPath: "/hub/a.txt", rel: "a.txt" },
+  ];
+  {
+    const hit = firstHubTrackedWrite(t437cands, ["a.txt", "src/x.ts"]);
+    expectBool("C437: tracked candidate found (first intersect)", hit?.rel === "a.txt", true);
+    const none = firstHubTrackedWrite(t437cands, ["zzz.md"]);
+    expectBool("C437: no tracked candidate → null", none === null, true);
+    const empty = firstHubTrackedWrite([], ["a.txt"]);
+    expectBool("C437: empty candidates → null", empty === null, true);
+    const relnormal = firstHubTrackedWrite([{ resolvedPath: "/hub/x", rel: "./docs/x.md" }], ["docs/x.md"]);
+    expectBool("C437: leading ./ in candidate rel still matches tracked (raw candidate returned)", relnormal?.resolvedPath === "/hub/x", true);
+    const slashnorm = firstHubTrackedWrite([{ resolvedPath: "/hub/y", rel: "/docs/y.md" }], ["docs/y.md"]);
+    expectBool("C437: leading / in candidate rel still matches tracked", slashnorm?.rel === "/docs/y.md", true);
+  }
   // ── #350: hub-hygiene untracked-WIP inventory (classifyUntrackedWip) ────
   function expectUntrackedWip(name, porcelain, expectedUntracked, expectedWip) {
     const got = classifyUntrackedWip(porcelain);

@@ -56,7 +56,8 @@ out="$(bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "untracked → exit 1"
 assert_contains "$out" "FAIL  $HUB" "untracked prints FAIL"
 assert_contains "$out" "HUB_DISORDER=dirty" "untracked → HUB_DISORDER=dirty"
-assert_contains "$out" "recovery: cd $HUB && git checkout main && git pull --ff-only" "FAIL prints recovery command"
+assert_contains "$out" "salvage <new-branch> $HUB" "dirty-on-main FAIL prints the #435 salvage step"
+assert_contains "$out" "hub-worktree.sh salvage" "dirty-on-main FAIL prints salvage"
 rm "$HUB/untracked.txt"
 
 # ── 3. FAIL on staged + unstaged ──────────────────────────────────────────
@@ -75,6 +76,8 @@ git -C "$HUB" checkout -qb feat/incident
 out="$(bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
 assert_eq "$rc" 1 "off-main → exit 1"
 assert_contains "$out" "HUB_DISORDER=off_main" "off-main → HUB_DISORDER=off_main"
+assert_contains "$out" "git push origin feat/incident" "off-main FAIL prints the WIP-preservation push"
+assert_contains "$out" "git checkout main && git pull --ff-only" "off-main FAIL prints the return-to-main steps"
 git -C "$HUB" checkout -q main
 
 # ── 5. Worktree resolution (D5): check from INSIDE a worktree ─────────────

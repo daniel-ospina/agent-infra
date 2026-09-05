@@ -8,7 +8,7 @@
 // default = inactive → block).
 
 import { execSync, execFileSync } from "node:child_process";
-import { resolve, join, dirname } from "node:path";
+import { resolve, join, dirname, relative } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, statSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 
@@ -3056,6 +3056,1194 @@ export function extractBashWriteTargets(command, cwd = process.cwd()) {
   }
   return out;
 }
+
+/**
+ * #437 (C): intersect bash-write candidates with hub-INDEX-tracked paths —
+ * the decision that turns the #350 warn-only bash-write heuristic into a
+ * GATE for tracked hub files in a DISORDERED hub. PURE (no git): the caller
+ * (index.ts) supplies the tracked set from ONE bounded `git ls-files
+ * --error-unmatch` call; candidates carry their hub-relative rel alongside
+ * the resolved absolute path. Untracked/new-file targets are NOT this gate's
+ * concern (they keep the #350 warn-only treatment — legit WIP scratch).
+ * @param {{resolvedPath: string, rel: string}[]} candidates hub-resolved write targets
+ * @param {string[]} trackedRels hub-relative rels known to be index-tracked
+ * @returns {{resolvedPath: string, rel: string} | null}
+ */
+export function firstHubTrackedWrite(candidates, trackedRels) {
+  const norm = (r) => String(r ?? "").replace(/^\/+/, "").replace(/^(\.\/)+/, "");
+  const tracked = new Set((trackedRels ?? []).map(norm));
+  for (const c of candidates ?? []) {
+    const rel = norm(c.rel);
+    if (rel && tracked.has(rel)) return c;
+  }
+  return null;
+}
+
+
+
+/**
+ * #437 (C) review-hardening (v6): PER-WRITE-SITE resolved bash-write candidates
+ * for the disordered-hub GATE. Bash-correct semantics (probe-verified):
+ *  - cd applies to FOLLOWING commands (at the next &&/;/||/newline/`)`/end),
+ *    never within its own simple command — redirections on the cd command
+ *    (`cd docs > list.txt`) resolve PRE-cd; `cd docs && echo x > f` POST-cd.
+ *    A pending cd DIES at isolation boundaries (`|` pipe segments / `&`
+ *    background lists reseed to the list-start cwd — subshell semantics).
+ *  - heredoc BODIES are stdin data — skipped ENTIRELY in the walk (they never
+ *    shift the cwd, emit tee/cd words, or swallow trailing code; an
+ *    unterminated heredoc swallows to EOF, matching bash's heredoc wait).
+ *    python `open()` inside python-heredoc bodies is caught by the raw regex
+ *    at the python token's extent + cwd (the 2026-08-31 incident shape).
+ *  - python `open()` candidates emit ONLY inside a python interpreter's
+ *    extent — quoted prose / grep-for-text never emit (legacy hasPython gate).
+ *  - `-c`/`eval` payloads recurse (real code at the site cwd); script-file
+ *    tokens surfaced for the caller's read (scriptGitVerdict parity).
+ *    Interpreter FLAGS skip mirroring the git side: -c / letter-runs-with-c →
+ *    payload; --rcfile/--init-file/-O/-o skip flag+operand; every other
+ *    -flag/--option is operand-less (`bash -l x.sh`, `bash --norc x.sh` still
+ *    reach the script); `< f` / `bash -s < f` stdin scripts surface as script
+ *    tokens; interpreter-fed heredocs (`bash <<'EOF'`) recurse the BODY as
+ *    CODE (bash/sh/zsh/dash/ksh read stdin) — cat-style bodies stay data.
+ *  - escaped `\>` never starts a redirect; `2>`/fd-dup/close never emit.
+ * PURE (no git; fs only for cd-target existence). Caller filters
+ * hub-equality + tracked-ness. Documented residuals (out of threat model):
+ * a cd TARGET that is an unresolved `$VAR` (`for d in sub; do cd $d && echo x
+ * > f; done`) leaves the cwd at the token site (no shell state — same family
+ * as the git-side M4 conservative $VAR handling; cycle-26 P2-3 documented);
+ * python write modes OUTSIDE `open(...,'w*'|'a*')` (e.g. `r+`, `x`) and
+ * pathlib write_text/write_bytes are not matched (the 2026-08-31 incident
+ * used 'w'); unquoted-delim heredoc bodies
+ * can carry `$(…)`/backtick substitution (bodies are walked as data except
+ * for the interpreter-heredoc carve-out above); REDIRECT OPERANDS that are
+ * shell expansions (`> $OUT`, `> "$FILE"`, `> $(cmd)`, `> ~/x` / `~user/x`)
+ * stay LITERAL — the pure walker has no shell state to resolve them (an
+ * `echo x > $OUT` pointing at a tracked hub file needs a deliberate
+ * variable-binding + expansion; cycle-18 P2-2, in the same family the
+ * git-side M4 classifier handles by conservative null/block on unresolved
+ * `$VAR` in cd-chains); multi-line arithmetic whose `<<` RHS is a variable
+ * AND whose `))` closer sits on the SAME line as the `<<` with the opener
+ * on an EARLIER line (`(( a\n<< b + c ))` — closer not `))`-adjacent, not a
+ * later-line closer, delim not numeric) is the remaining shift swallow
+ * corner; `source`/`.` file targets ARE surfaced as script tokens (cycle-18
+ * P2-1) — the caller's existsSync + content walk gates their tracked writes
+ * exactly like `bash f` scripts.
+ */
+export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
+  const s = String(command ?? "");
+  const out = [];
+  const seen = new Set();
+  const base0 = resolve(sessionCwd || process.cwd());
+  const push = (raw, cwd, via, site = "top") => {
+    const t = _stripQuotes(String(raw ?? "").trim());
+    if (!t || t === "/dev/null" || t.startsWith("/dev/")) return;
+    const resolved = resolve(cwd, t);
+    const key = `${via}:${resolved}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ resolvedPath: resolved, via, site });
+  };
+  // Bash cwd semantics (probe-verified):
+  //  - cd applies to FOLLOWING commands (at the next &&/;/||/newline/`)`/end),
+  //    never within its own simple command (redirections resolve PRE-cd).
+  //  - `|` pipe segments and `&` backgrounded lists run in subshells — a cd
+  //    since the list's last continuation boundary does NOT survive them;
+  //    `( )` subshells snapshot the cwd and restore on `)`.
+  //  - heredoc BODIES are stdin data (skipped entirely in the walk; bodies
+  //    never shift the cwd, emit tee/cd words, or swallow trailing code — an
+  //    unterminated heredoc swallows to EOF, matching bash's heredoc wait).
+  const frames = [{ cwd: base0, pending: null, forkCwd: null, forkAlts: [] }];
+  // pipeBase: cwd at the start of the current PIPE list (updated at every
+  // continuation boundary incl. &&); asyncBase: cwd at the start of the
+  // current async segment (updated only at ;/newline/start/(/post-& — NOT at
+  // && — so `cd docs && true & echo x > f` reseeds the echo to the PRE-cd
+  // cwd, matching bash: the WHOLE `cd docs && true` list is async).
+  const pipeBase = [base0];
+  const asyncBase = [base0];
+  let skipStart = -1;   // active heredoc-body region [skipStart, skipEnd):
+  let skipEnd = -1;     // the header remainder is walked; the body is jumped
+  // simple-command arg-position state (cycle-22 P1): special-word handlers
+  // (cd/python/tee/interpreters/exec/eval/./source) fire ONLY on the FIRST
+  // word of a simple command (after assignments/spawners/redirects) — `grep
+  // tee f`, `echo bash -c '…'`, `echo cd /tmp && …` are ARG positions.
+  let segHadWord = false;          // a command word seen in this segment
+  let caseDepth = 0;               // case … in p) … esac — a pattern terminator ) is NOT a frame pop (cycle-25 P2-1)
+  let casePattern = false;         // cycle-36 P2-1: inside a case, words between `in` and the arm's `)` are PATTERNS — never dispatched
+  let caseValPending = false;      // cycle-37 F3: after `case` the NEXT word is the cased VALUE — never dispatched (bash doesn't execute it)
+  let caseValConsumed = false;     // cycle-37 F1: only a case's OWN `in` (after its value) opens the pattern phase — a for/select `in` inside an arm must NOT
+  const caseCwdStack = [];         // cycle-37 F2: each case arm runs from the pre-case cwd (real bash executes ONE arm) — restore at every arm terminator + esac
+  let forceCmdNext = false;        // a leading \\ escape dropped — the word is at command position
+  let spawnerPending = null;       // sudo/env/xargs/… — next real word is a command
+  let envSawAssign = false;        // cycle-34 P2-2: env option parsing ENDS at the first name=value operand
+  let spawnerOperandNext = false;  // a spawner flag that takes an operand
+  const SPAWNER_WORDS = new Set(["sudo", "env", "xargs", "nohup", "command", "time", "nice", "doas", "stdbuf", "timeout", "builtin", "exec", "setsid"]); // exec = spawner prefix (r37 P3); setsid cycle-32 P1-1
+  let dirStack = [];            // pushd/popd directory stack (cycle-23 F2)
+  let dirStackSnapshots = [];  // FULL copy per ( - restored at ) (cycle-24 P1 r29 D1-D3:
+                               // a subshell gets a COPY — ( popd ) must not eat an inherited entry)
+  const SPAWNER_FLAG_OPERANDS = {
+    exec: ["-a"],   // cycle-32 P1-2: exec -a argv0 cmd
+    sudo: ["-u", "--user", "-g", "--group", "-C", "-h", "--host", "-D", "-T", "-r", "-t", "-p", "-U"],
+    env: ["-u", "--unset", "-C", "--chdir", "-S"],
+    xargs: ["-a", "-E", "-I", "-L", "-n", "-P", "-s", "-d", "-i", "--max-args", "--max-lines", "--replace", "--max-procs"],
+    nice: ["-n"],
+    timeout: ["-s", "-k", "--signal", "--kill-after"],
+  };
+  const RESET_WORDS = new Set(["then", "do", "else", "elif", "fi", "done", "esac", "in", "if", "while", "until", "case", "for", "select", "function", "{", "}", "!", "[[", "]]", "time"]);
+  const redirs = [];
+  const pythons = [];
+  const tees = [];
+  const inlinePays = [];
+  const scriptToks = [];
+  const n = s.length;
+  const f = () => frames[frames.length - 1];
+  // cycle-38 P1 (r38 reviewer): a MATCHED case arm's trailing cd persists past
+  // esac (case runs in the current shell). The walker can't know which arm
+  // matched, so when any arm ended deeper than the case entry it resumes the
+  // continuation at that arm's terminal cwd AND emits an entry-base twin for
+  // direct writes (the unmatched-arm reality). Return the twin entry or null.
+  const forkTwins = (o) => {
+    const fr = f();
+    if (!fr.forkCwd || !fr.forkAlts || !fr.forkAlts.length) return [];
+    return fr.forkAlts.map((b) => ({ ...o, cwd: b }));
+  };
+  const pipeB = () => pipeBase[pipeBase.length - 1];
+  const asyncB = () => asyncBase[asyncBase.length - 1];
+  const skipWs = (k) => { while (k < n && /\s/.test(s[k])) k++; return k; };
+  const readWord = (k) => {
+    let w = "";
+    let q = null;
+    while (k < n && !(q === null && (/\s/.test(s[k]) || ";|&()".includes(s[k]) || s[k] === ">" || s[k] === "<"))) {
+      const ch = s[k];
+      if (q) { if (ch === q) q = null; else w += ch; k++; continue; }
+      if (ch === "'" || ch === '"') { q = ch; k++; continue; }
+      if (ch === "\\") { if (k + 1 < n) { w += s[k + 1]; k += 2; continue; } }
+      w += ch; k++;
+    }
+    return { w, k };
+  };
+  const applyPending = () => {
+    const fr = f();
+    if (fr.pending) { fr.cwd = fr.pending; fr.pending = null; }
+    pipeBase[pipeBase.length - 1] = fr.cwd;   // &&/;/newline: pipes start here
+  };
+  const updateAsyncBase = () => { asyncBase[asyncBase.length - 1] = f().cwd; };
+  const lineEndOf = (i0) => { const e = s.indexOf("\n", i0); return e === -1 ? n : e; };
+  // cycle-11: real bash `bash <<'EOF' x.sh` — a FILE POSITIONAL (no -s) on
+  // the heredoc header is the SCRIPT; the body is stdin DATA. Returns the
+  // first non-flag word on the header line after the opener (skipping extra
+  // redirects fd>/< / >& / <& / >> …) — or null.
+  const heredocHeaderPositional = (i0) => {
+    if (s[i0 + 2] === "<") return null;      // <<< here-string: no header line
+    const end = lineEndOf(i0);
+    let p = i0 + 2;
+    while (p < end && !/\s/.test(s[p])) p++; // past the delimiter token
+    while (p < end) {
+      p = skipWs(p);
+      if (p >= end) break;
+      const c = s[p];
+      if (c === ">" || c === "<" || c === "&" || (c >= "0" && c <= "9")) {
+        let q = p;
+        while (q < end && /[<>&|0-9-]/.test(s[q])) q++; // operator run
+        while (q < end && !/\s/.test(s[q])) q++;        // operand word
+        p = q;
+        continue;
+      }
+      const w = readWord(p);
+      if (w.w === "") break;
+      if (w.w.startsWith("-")) { p = w.k; continue; }
+      return w.w;
+    }
+    return null;
+  };
+  // Heredoc-body region for the delims on the CURRENT header line: returns
+  // [regionStart, regionEnd) covering the bodies in order, or null for a
+  // here-string `<<<` (data, not a heredoc). The HEADER remainder (code after
+  // the marker on the same line — `cat <<EOF && echo x > f`) is NOT in the
+  // region: the walker scans it and jumps only [regionStart, regionEnd).
+  // Multi-heredoc bodies (`cat <<A <<B`) are searched FORWARD from the
+  // previous body's end (no double-count). Unterminated → [start, n)
+  // (bash waits for the delim — trailing text is body, never executed code).
+  const heredocRegion = (i0) => {
+    if (s[i0 + 2] === "<") return null; // <<< here-string
+    // arithmetic-context guard (cycle-15 D1, cycle-16 VGATE X1-X5): inside
+    // (( … )) / $(( … )) a `<<` is the SHIFT operator, never a heredoc —
+    // treating it as one swallowed the rest of the command. The scan is
+    // SAME-LINE and quote/comment-aware: only a `((` in CODE position before
+    // i0 (no `))` closer between, not inside '…'/"…" spans or after a `#`
+    // comment) counts — `echo '(( n' && cat <<EOF` must NOT be suppressed.
+    {
+      let j = i0 - 1;
+      const nl = s.lastIndexOf("\n", i0);
+      while (j > nl) {
+        const c = s[j];
+        if (c === "'") {
+          j--;
+          while (j > nl && s[j] !== "'") j--; // skip the sq span
+          j--;
+          continue;
+        }
+        if (c === '"') {
+          j--;
+          while (j > nl) {
+            if (s[j] === "\\") j -= 2;
+            else if (s[j] === '"') break;
+            else j--;
+          }
+          j--;
+          continue;
+        }
+        if (c === "#" && (j === 0 || /[\s;&|(\n]/.test(s[j - 1]))) break; // comment: no arith before it on this line
+        if (c === ")" && s[j - 1] === ")") break; // a )) closer between → not inside arithmetic
+        if (c === "(" && s[j - 1] === "(") return null; // (( still open in code position
+        j--;
+      }
+    }
+    const le = lineEndOf(i0);
+    const line = s.slice(i0, le);
+    const delims = [];
+    // <<- flag captured so terminator lines may strip LEADING TABS ONLY
+    // (bash: plain << needs an EXACT column-0 delimiter line — any leading
+    // ws or trailing padding keeps the body open — cycle-12 finding).
+    // Quote-aware scan: a `<<` inside "…"/'…' prose is NOT a heredoc marker
+    // (cycle-13 P1 — `cat <<EOF && echo "pass <<token"` must not add a bogus
+    // delimiter that swallows the region to EOF).
+    const qre = /<<(-)?[ \t]*(?:"([^"]*)"|'([^']*)'|([^|&;()<>\s'"]+))/;
+    let p2q = 0;
+    let sq = false, dq = false;
+    while (p2q < line.length) {
+      const c = line[p2q];
+      if (sq) { if (c === "'") sq = false; p2q++; continue; }
+      if (dq) { if (c === "\\") p2q += 2; else { if (c === '"') dq = false; p2q++; } continue; }
+      if (c === "'") { sq = true; p2q++; continue; }
+      if (c === '"') { dq = true; p2q++; continue; }
+      if (c === "<" && line[p2q + 1] === "<") {
+        const mq = qre.exec(line.slice(p2q));
+        if (mq) {
+          // cycle-16 P1: a `<<` whose delimiter is all-digits or is followed
+          // by `))` (after optional ws) is an ARITHMETIC SHIFT, not a heredoc
+          // (`$((1 << 2))`, `(( a << b ))`, incl. multi-line forms where the
+          // (( opener sits on an earlier line and the same-line guard can't
+          // see it). Rejecting keeps the rest of the command from being
+          // swallowed as an unterminated "body".
+          const dqEnd = p2q + mq[0].length;
+          let dx = dqEnd;
+          while (dx < line.length && (line[dx] === " " || line[dx] === "\t")) dx++;
+          if ((line[dx] === ")" && line[dx + 1] === ")") || (mq[4] !== undefined && /^[0-9]+$/.test(mq[4]))) return null;
+          delims.push({ d: mq[2] ?? mq[3] ?? mq[4], tabStrip: !!mq[1] });
+          p2q = dqEnd;
+          continue;
+        }
+      }
+      p2q++;
+    }
+    if (delims.length === 0) return null;
+    let searchFrom = le === n ? n : le + 1;
+    let regionStart = searchFrom;
+    let regionEnd = searchFrom;
+    for (const { d, tabStrip } of delims.slice(0, 64)) {
+      let lineStart = searchFrom;
+      let found = false;
+      while (lineStart <= n) {
+        const le2 = s.indexOf("\n", lineStart);
+        const leAt = le2 === -1 ? n : le2;
+        const cand = s.slice(lineStart, leAt);
+        const norm = tabStrip ? cand.replace(/^\t+/, "") : cand;
+        if (norm === d) { regionEnd = leAt; found = true; break; }
+        if (le2 === -1) break;
+        lineStart = le2 + 1;
+      }
+      if (!found) {
+        // cycle-17 residual: an arithmetic shift whose `))` closer sits on a
+        // LATER line than the `<<` (`(( acc = base\n<< bits\n)) && echo x >
+        // f` — delimiter is a plain word, closer not adjacent). Before
+        // committing to an unterminated swallow, peek the next few body lines
+        // for a line that opens with `))` (the arith closer).
+        let pk = searchFrom;
+        for (let tries = 0; tries < 3 && pk <= n; tries++) {
+          const pl2 = s.indexOf("\n", pk);
+          const plAt = pl2 === -1 ? n : pl2;
+          if (/^\s*\)\)/.test(s.slice(pk, plAt))) return null;
+          if (pl2 === -1) break;
+          pk = pl2 + 1;
+        }
+        return [regionStart, n];
+      }
+      searchFrom = regionEnd < n ? regionEnd + 1 : n;
+    }
+    return [regionStart, regionEnd];
+  };
+  let i = 0;
+  while (i < n) {
+    // jump an active heredoc-body region (header remainder was walked before)
+    if (i >= skipStart && skipStart !== -1) { i = skipEnd; skipStart = -1; skipEnd = -1; continue; }
+    const ch = s[i];
+    if (ch === "\\") {
+      if (i + 1 < n && /[A-Za-z0-9_./~-]/.test(s[i + 1])) { forceCmdNext = true; i++; continue; } // \\cd ≡ cd — drop the escape
+      i += 2; continue; // \\> etc — escaped non-word stays inert
+    }
+    if (/\s/.test(ch)) { if (ch === "\n") { applyPending(); updateAsyncBase(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false; } i++; continue; }
+    if (ch === "#" && (i === 0 || /[\s;&|(\n]/.test(s[i - 1]))) { while (i < n && s[i] !== "\n") i++; continue; }
+    if (ch === "(") {
+      if (casePattern) {
+        // cycle-43 P2-1: a `(` in the PATTERN phase is case syntax (paren-led
+        // arm `(a)`, extglob `@(a|b)`) — NOT a subshell. Pushing a frame here
+        // leaks it (the pattern arm's `)` is a non-pop), so a REAL enclosing
+        // subshell's `)` later pops the wrong frame and every subsequent write
+        // resolves from a stale cwd.
+        i++; continue;
+      }
+      applyPending();
+      frames.push({ cwd: f().cwd, pending: null, forkCwd: f().forkCwd, forkAlts: f().forkAlts ? [...f().forkAlts] : [] }); // cycle-40 F2: a subshell inherits the parent's case-fork realities
+      pipeBase.push(f().cwd); asyncBase.push(f().cwd); updateAsyncBase();
+      segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
+      dirStackSnapshots.push(dirStack.slice());
+      i++; continue;
+    }
+    if (ch === ")") {
+      // cycle-36 P2-1/P2-2: a `)` closes an ARM only while in the PATTERN phase
+      // (`case x in a|b) …`). A `)` in the arm BODY is a normal subshell close —
+      // the old caseDepth>0 blanket gate leaked the frame (cwd stuck inside the
+      // subshell → later writes attributed to the wrong dir → missed blocks).
+      if (casePattern) {
+        casePattern = false;
+        segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false; // the arm body is a NEW command (cycle-26 P2-1)
+        if (caseCwdStack.length > 0) {
+          // cycle-37 F2: each arm evaluates from the pre-case cwd — an earlier
+          // arm's cd must not bleed into this arm's resolution.
+          const cst = caseCwdStack[caseCwdStack.length - 1];
+          const preTerm = f().cwd;
+          f().cwd = cst.cwd;
+          f().pending = null;
+          // cycle-38 P1: this arm ended deeper than the case entry — remember
+          // its terminal cwd (a MATCHED arm's cd persists past esac in bash).
+          if (preTerm !== cst.cwd) { if (!cst.terms) cst.terms = []; if (!cst.terms.includes(preTerm)) cst.terms.push(preTerm); }
+        }
+        i++; continue;                     // case-pattern terminator (y) — NOT a subshell close
+      }
+      if (frames.length > 1) { frames.pop(); pipeBase.pop(); asyncBase.pop(); }
+      applyPending(); updateAsyncBase();
+      segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
+      if (dirStackSnapshots.length > 0) dirStack = dirStackSnapshots.pop(); // subshell copy semantics
+      i++; continue;
+    }
+    if (ch === "&") {
+      if (s[i + 1] === "&") { applyPending(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false; i += 2; continue; } // && continuation
+      if (s[i + 1] === ">") {
+        // &> / &>> — redirect-ALL (stdout+stderr), NOT background-&: the
+        // operand belongs to the FOLLOWING command at the CURRENT cwd
+        // (cd docs && echo hi &> f resolves docs/f — cycle-8 P2)
+        let p2 = i + 2;
+        if (s[p2] === ">") p2++;
+        p2 = skipWs(p2);
+        const operand = readWord(p2);
+        if (operand.w && !/^-?[0-9]*$/.test(operand.w)) { const _rt1 = { raw: operand.w, cwd: f().cwd }; redirs.push(_rt1, ...forkTwins(_rt1)); }
+        i = operand.k;
+        continue;
+      }
+      f().pending = null;              // a cd in the async list dies with the subshell
+      f().cwd = asyncB();              // the WHOLE async list ran at the segment start
+      pipeBase[pipeBase.length - 1] = f().cwd;
+      updateAsyncBase();
+      segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
+      i++;
+      continue;
+    }
+    if (ch === "|") {
+      if (s[i + 1] === "|") { applyPending(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false; i += 2; continue; } // || continuation
+      f().pending = null;
+      f().cwd = pipeB();               // pipe segments from the pipe-list start
+      segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
+      i++;
+      continue;
+    }
+    if (ch === ";") {
+      if (s[i + 1] === ";") {
+        // `;;` ends an arm — the next arm's words are PATTERNS again (cycle-36
+        // P2-1); `;;&` (keep matching) is the same; `;&` (fallthrough body) is
+        // deliberately NOT pattern-phase (the next arm body runs commands).
+        if (caseDepth > 0 && s[i + 2] !== "&") casePattern = true;
+        applyPending(); updateAsyncBase(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false;
+        i += 2; continue;
+      }
+      applyPending(); updateAsyncBase(); segHadWord = false; spawnerPending = null; spawnerOperandNext = false; envSawAssign = false; i++; continue;
+    }
+    // redirects (incl. fd-prefixed)
+    if (ch === ">" || (ch >= "0" && ch <= "9")) {
+      let k = i;
+      while (k < n && s[k] >= "0" && s[k] <= "9") k++;
+      const fdRun = s.slice(i, k);
+      if (fdRun && s[k] !== ">" && s[k] !== "<") {
+        // plain digits, NOT an fd: if a spawner flag operand is pending the
+        // number IS that operand (nice -n 5 / sudo -u 501) — consume it so the
+        // next real word dispatches as the command (cycle-32 P1-3); otherwise
+        // the number is data.
+        if (spawnerOperandNext) spawnerOperandNext = false;
+        i = k; continue;
+      }
+      if (fdRun !== "" && fdRun !== "0" && fdRun !== "1") {
+        // stderr / other fd: never a content write — skip op + operand
+        let p = k + 1;
+        if (s[p] === ">" || s[p] === "|" || s[p] === "&") p++;
+        if (s[p] === "&") p++;
+        p = skipWs(p);
+        i = readWord(p).k;
+        continue;
+      }
+      let p = k;                                            // at '>'
+      let op = ">";
+      const n1 = s[p + 1];
+      if (n1 === ">" || n1 === "|") { op += n1; p += 2; }
+      else if (n1 === "&") {
+        const q2 = skipWs(p + 2);
+        if (/^[0-9-]/.test(s.slice(q2))) { i = q2; continue; } // fd-dup/close
+        op = ">&"; p = q2;
+      } else p++;
+      p = skipWs(p);
+      const operand = readWord(p);
+      if (op.includes("&") && /^-?[0-9]*$/.test(operand.w)) { i = operand.k; continue; }
+      const _rt2 = { raw: operand.w, cwd: f().cwd }; redirs.push(_rt2, ...forkTwins(_rt2));        // pre-cd (pending not applied)
+      i = operand.k;
+      continue;
+    }
+    if (ch === "<") {
+      if (s[i + 1] === "<") {
+        if (s[i + 2] === "<") {
+          // <<< here-string: the content is DATA (and may contain a python-ish
+          // open()/redirect-looking text) — skip the operand, keep scanning
+          let k = i + 3;
+          k = skipWs(k);
+          i = readWord(k).k;
+          continue;
+        }
+        if (i >= skipStart && skipStart !== -1) {
+          // a SECOND `<<` on the SAME header line (cat <<A <<B): its body is
+          // already inside the active region — skip this delim token only
+          let k = i + 2;
+          if (s[k] === "-") k++;
+          k = skipWs(k);
+          const qd = s[k] === "'" || s[k] === '"' ? s[k] : null;
+          if (qd) { k++; while (k < n && s[k] !== qd) k++; k++; }
+          else k = readWord(k).k;
+          i = k;
+          continue;
+        }
+        const rg = heredocRegion(i);
+        if (rg) {
+          // walk the header remainder first; jump the body [start, end) at the
+          // top of the loop (cat <<EOF && echo x > f — echo runs after cat
+          // finishes reading the body → its write must still be detected)
+          skipStart = rg[0]; skipEnd = rg[1];
+          i += 2;
+          continue;
+        }
+        i += 2;
+        continue;
+      }
+      let k = i + 1;
+      if (s[k] === "<") k++;                                // <<< here-string
+      k = skipWs(k);
+      i = readWord(k).k;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const qq = ch;
+      // cycle-30 P2-2: a FULLY-QUOTED word at a TRUE command position
+      // ("tee" f.md / 'bash' -c '...' / "cd" /tmp ≡ the unquoted word —
+      // bash strips quotes before tokenizing). Prose quotes after a command
+      // word (echo "tee x") keep the span-skip below.
+      const qPrev = i === 0 ? undefined : s[i - 1];
+      const qAtCmd = !segHadWord && (i === 0 || (qPrev !== undefined && /[;&|({ \t\n]/.test(qPrev)));
+      let k = i + 1;
+      let wholeWord = false;
+      if (qAtCmd) {
+        while (k < n && s[k] !== qq) { if (qq === '"' && s[k] === "\\") k += 2; else k++; }
+        const afterQ = k < n ? s[k + 1] : undefined;
+        wholeWord = k >= n || afterQ === undefined || /\s|[;&|()\n<>]/.test(afterQ);
+        if (wholeWord) {
+          // fall through to the readWord dispatch below (readWord strips the
+          // quotes) — do NOT consume the span as data
+        } else {
+          k = i + 1;
+          while (k < n && s[k] !== qq) { if (qq === '"' && s[k] === "\\") k++; k++; }
+          i = k + 1;
+          continue;
+        }
+      }
+      if (!wholeWord && !qAtCmd) {
+        k = i + 1;
+        while (k < n && s[k] !== qq) {
+          // backslash escapes ONLY inside DOUBLE quotes (bash single quotes
+          // have no escape — `'a\\'` closes at the quote after the backslash;
+          // treating \ as an escape swallowed to the next quote — cycle-14
+          // P2-2: `echo 'C:\\' && echo z > tracked.md` was missed).
+          if (qq === '"' && s[k] === "\\") k++;
+          k++;
+        }
+        i = k + 1;
+        continue;
+      }
+    }    const w0 = readWord(i);
+    const wstart = i;
+    i = w0.k;
+    const prev = s[wstart - 1];
+    const atCmdPos = forceCmdNext || wstart === 0 || (prev !== undefined && /[;&|()\s\n]/.test(prev)); // ) = case-arm start (cycle-26 P2-1)
+    forceCmdNext = false;
+    if (!atCmdPos || w0.w === "") continue;
+    const cwd = f().cwd;
+    // `case x in` — only the CASE's own `in` (preceded by its value word)
+    // opens the PATTERN phase. cycle-36 P2-1 set this on ANY `in` with
+    // caseDepth>0 — a `for i in …` inside an arm wrongly flipped to pattern
+    // (cycle-37 F1: loop-body commands suppressed → missed writes).
+    if (w0.w === "in" && caseDepth > 0 && (caseValConsumed || caseValPending)) {
+      casePattern = true;
+      caseValConsumed = false;
+      caseValPending = false;
+      caseCwdStack.push({ cwd: f().cwd, terms: undefined }); // cycle-37 F2: arms evaluate from this cwd
+      continue;
+    }
+    if (caseValPending) {
+      // cycle-37 F3: the cased-VALUE word (`case ./run.sh in …`) is never
+      // executed by bash — consume it without dispatching (no direct-exec /
+      // tee / cd handlers may fire on it). `in` itself is handled above (a
+      // quote-span may have swallowed the value first).
+      caseValPending = false;
+      caseValConsumed = true;
+      continue;
+    }
+    // ── case PATTERN phase (cycle-36 P2-1): between `case x in` and an arm's
+    // `)` the words are PATTERNS — bash never executes them. A `|`/`;;`/newline
+    // resets segHadWord, so without this gate `case x in a|./release.sh|b)`
+    // would dispatch the pattern word as a command (false block). Only case/
+    // esac pass through during the phase.
+    if (casePattern) {
+      // cycle-41 P2: ONLY a BARE esac terminates (quoted "esac"/'esac' is a
+      // valid pattern literal — `case $x in "esac") cd sub;; esac` — and bash
+      // rejects a bare esac as a pattern). Quote chars inside the raw word
+      // span ⇒ pattern literal ⇒ skip (mirror of the cycle-40 F1 `case` fix).
+      const rawW = s.slice(wstart, w0.k);
+      // cycle-42 P2: bash reserves `esac` POSITIONALLY — only at a
+      // pattern-list start (after `in`/`;;`) is it the terminator. After `|`
+      // or `(` it is a LIVE literal pattern member (`case $X in y|esac)`
+      // matches X=esac) — closing early reattributes the arm cd as
+      // unconditional and drops the entry reality.
+      let bk = wstart - 1;
+      while (bk >= 0 && /\s/.test(s[bk])) bk--;
+      const prevSig = bk >= 0 ? s[bk] : "";
+      if (w0.w === "esac" && !/[`'"]/.test(rawW) && prevSig !== "|" && prevSig !== "(") {
+        caseDepth = Math.max(0, caseDepth - 1);
+        casePattern = false;
+        caseValConsumed = false; caseValPending = false;
+        if (caseCwdStack.length > 0) {
+          const cso = caseCwdStack.pop();
+          // cycle-38 P1: the LAST arm's terminal is only visible here (no next
+          // arm to peek-restore it) — and its trailing cd may still be pending
+          // (an arm ending at esac without `;;`).
+          applyPending();
+          const terms = cso.terms || [];
+          const lastArmT = f().cwd;
+          if (lastArmT !== cso.cwd && !terms.includes(lastArmT)) terms.push(lastArmT);
+          if (terms.length > 0) {
+            // a MATCHED case arm's cd persists past esac — resume at the last
+            // cd-ing arm's terminal; the OTHER possible bases (the case entry +
+            // earlier arms' terminals) are forkAlts so direct writes also emit
+            // entry/arm twins (union over every arm-matched reality — bash runs
+            // exactly one arm, the value is unknown).
+            f().cwd = terms[terms.length - 1];
+            if (!f().forkCwd) {
+              f().forkCwd = terms[terms.length - 1];
+              f().forkAlts = [cso.cwd, ...terms.slice(0, -1)].filter((x) => x !== f().forkCwd);
+              f().forkAlts = [...new Set(f().forkAlts)].slice(0, 64);
+            } else {
+              // cycle-39 F1: a LATER cd-ing case while a fork is active — its
+              // entry (the pre-case primary cwd) is another real outcome
+              // (later case unmatched) — union it into the alts.
+              let alts2 = [...f().forkAlts, cso.cwd];
+              // cycle-40 F3: the later case's value is ORTHOGONAL to the
+              // earlier fork — its cd-ing arm also runs from EVERY earlier
+              // base. Derive each alt's matched-arm terminal via the arm's
+              // relative step from the case entry.
+              const relT = relative(cso.cwd, terms[terms.length - 1]);
+              if (relT && relT !== ".") {
+                for (const b of f().forkAlts) {
+                  const nb = resolve(b, relT);
+                  if (existsSync(nb)) alts2.push(nb);
+                }
+              }
+              f().forkAlts = [...new Set(alts2.filter((x) => x !== f().cwd))].slice(0, 64);
+            }
+          } else f().cwd = cso.cwd;
+        }
+      }
+      // cycle-40 F1: a pattern-phase word `case` (case $x in case)) is a
+      // PATTERN literal — never opens a nested case (leaking caseDepth would
+      // disable the caseDepth===0 alt-shift gate forever).
+      continue;
+    }
+    // ── simple-command arg-position gate (cycle-22 P1) ──────────────────────
+    // Only the FIRST word of a simple command (optionally after redirects /
+    // env-assignment prefixes / a spawner prefix) may be cd/python/tee/an
+    // interpreter/exec/eval/./source. A special word AFTER a plain command
+    // word is an ARG (`grep tee f`, `echo bash -c '…'`, `echo cd /tmp && …`).
+    if (spawnerOperandNext) { spawnerOperandNext = false; continue; }
+    if (spawnerPending !== null) {
+      if (w0.w.startsWith("-") && !(spawnerPending === "env" && envSawAssign)) {
+        // cycle-34 P2-2: env option parsing ENDS at the first name=value
+        // operand — `env FOO=bar -S 'tee x.md'` treats -S as the utility name
+        // (rc=127, nothing runs). Flags after an env assignment are the command.
+        const opd = SPAWNER_FLAG_OPERANDS[spawnerPending];
+        if (opd && opd.includes(w0.w) && !(spawnerPending === "env" && (w0.w === "-S" || w0.w === "--split-string"))) spawnerOperandNext = true;
+        // env -S 'cmd string': env SPLITS the string and APPENDS every trailing
+        // operand — one exec line (cycle-33 P2-1). Capture the full remainder
+        // of the simple command (to segment end) verbatim and recurse it as one
+        // inline payload: `env -S 'tee a.md' b.md` → a.md+b.md,
+        // `env -S 'sh -c' 'echo hi > b.md'` → b.md.
+        if (spawnerPending === "env" && (w0.w === "-S" || w0.w === "--split-string")) {
+          let kS = skipWs(w0.k);
+          let dq = null;
+          let jS = kS;
+          let stripped = "";
+          while (jS < n && jS - kS < 4096) {
+            const cS = s[jS];
+            if (dq === null && (cS === "\n" || cS === ";" || cS === "&")) break;
+            if (dq !== null && cS === "\\") { stripped += s[jS + 1] ?? ""; jS += 2; continue; }
+            if (dq === null && (cS === "'" || cS === '"')) { dq = cS; jS++; continue; }
+            if (dq !== null && cS === dq) { dq = null; jS++; continue; }
+            stripped += cS;
+            jS++;
+          }
+          const stp = stripped.trim();
+          // cycle-34 P2-1: env does NOT interpret shell operators inside the -S
+          // string — `env -S 'echo hi > f.md'` prints "hi > f.md" and writes
+          // NOTHING (operators are literal argv). Only when the -S command is a
+          // SHELL with -c do the operators become real code. So: drop
+          // whitespace-delimited operator tokens for non-shell payloads.
+          const isShellC = /^(bash|sh|zsh|dash|ksh|ash|mksh|busybox)\b/.test(stp) && /(^|\s)-c(\s|$)/.test(stp);
+          const payload = isShellC
+            ? stp
+            : stp.replace(/(?:^|\s+)(?:>>|<<|&&|\|\||[><|&;()])+(?=\s|$)/g, " ").trim();
+          if (payload) { const _ip1 = { payload, cwd }; inlinePays.push(_ip1, ...forkTwins(_ip1)); }
+          spawnerPending = null;
+          spawnerOperandNext = false;
+          i = jS;      // let the loop re-handle the separator at jS
+          continue;
+        }
+        continue;
+      }
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w0.w)) {
+        // cycle-34 P2-2: for env, an assignment ends option parsing.
+        if (spawnerPending === "env") envSawAssign = true;
+        continue; // spawner env prefix
+      }
+      // cycle-32 P1-1: a CHAINED spawner (env env tee, command exec tee,
+      // sudo env tee, builtin exec tee) re-pends — the next real word is the
+      // command.
+      const wBase3 = w0.w.lastIndexOf("/") >= 0 ? w0.w.slice(w0.w.lastIndexOf("/") + 1) : w0.w;
+      if (SPAWNER_WORDS.has(wBase3)) { spawnerPending = wBase3; envSawAssign = false; continue; }
+      spawnerPending = null; envSawAssign = false; // the first real word IS the command
+      segHadWord = true;
+    } else if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w0.w)) {
+      continue;                         // assignment prefix — next word is the command
+    } else if (segHadWord) {
+      continue;                         // an ARG of the current command — demote
+    } else if (RESET_WORDS.has(w0.w)) {
+      if (w0.w === "case") { caseDepth++; caseValPending = true; caseValConsumed = false; }
+      else if (w0.w === "esac") {
+        caseDepth = Math.max(0, caseDepth - 1);
+        caseValConsumed = false; caseValPending = false;
+        if (caseCwdStack.length > 0) {
+          const cso = caseCwdStack.pop();
+          // cycle-38 P1: the LAST arm's terminal is only visible here (no next
+          // arm to peek-restore it) — and its trailing cd may still be pending
+          // (an arm ending at esac without `;;`).
+          applyPending();
+          const terms = cso.terms || [];
+          const lastArmT = f().cwd;
+          if (lastArmT !== cso.cwd && !terms.includes(lastArmT)) terms.push(lastArmT);
+          if (terms.length > 0) {
+            // a MATCHED case arm's cd persists past esac — resume at the last
+            // cd-ing arm's terminal; the OTHER possible bases (the case entry +
+            // earlier arms' terminals) are forkAlts so direct writes also emit
+            // entry/arm twins (union over every arm-matched reality — bash runs
+            // exactly one arm, the value is unknown).
+            f().cwd = terms[terms.length - 1];
+            if (!f().forkCwd) {
+              f().forkCwd = terms[terms.length - 1];
+              f().forkAlts = [cso.cwd, ...terms.slice(0, -1)].filter((x) => x !== f().forkCwd);
+              f().forkAlts = [...new Set(f().forkAlts)].slice(0, 64);
+            } else {
+              // cycle-39 F1: a LATER cd-ing case while a fork is active — its
+              // entry (the pre-case primary cwd) is another real outcome
+              // (later case unmatched) — union it into the alts.
+              let alts2 = [...f().forkAlts, cso.cwd];
+              // cycle-40 F3: the later case's value is ORTHOGONAL to the
+              // earlier fork — its cd-ing arm also runs from EVERY earlier
+              // base. Derive each alt's matched-arm terminal via the arm's
+              // relative step from the case entry.
+              const relT = relative(cso.cwd, terms[terms.length - 1]);
+              if (relT && relT !== ".") {
+                for (const b of f().forkAlts) {
+                  const nb = resolve(b, relT);
+                  if (existsSync(nb)) alts2.push(nb);
+                }
+              }
+              f().forkAlts = [...new Set(alts2.filter((x) => x !== f().cwd))].slice(0, 64);
+            }
+          } else f().cwd = cso.cwd;
+        }
+      }
+      continue;                         // { } then/do/! etc — the next word is the command
+    } else {
+      segHadWord = true;                // the command word (special or plain)
+      const wBase2 = w0.w.lastIndexOf("/") >= 0 ? w0.w.slice(w0.w.lastIndexOf("/") + 1) : w0.w;
+      if (SPAWNER_WORDS.has(wBase2)) { spawnerPending = wBase2; envSawAssign = false; continue; }
+    }
+    if (w0.w === "cd" || w0.w === "pushd") {
+      const nxt = skipWs(i);
+      const tgt = readWord(nxt);
+      i = tgt.k;
+      if (w0.w === "pushd") {
+        // flag / +N / bare forms don't cd (conservative no-op) — only a dir operand
+        if (!tgt.w || tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w)) { f().pending = null; continue; }
+        dirStack.push(f().cwd);
+      }
+      if (tgt.w && tgt.w !== "~" && !tgt.w.startsWith("~/") && tgt.w !== "-") {
+        const next = resolve(cwd, tgt.w);
+        f().pending = existsSync(next) ? next : null;       // failed cd — unchanged
+        const frcd = f();
+        if (frcd.forkCwd && frcd.forkAlts.length && caseDepth === 0) {
+          // cycle-38 P1: COMMON tail cds (outside any case arm) apply to every
+          // arm-matched reality — shift the fork alts by the same relative
+          // step. cycle-39 F1: a cd inside a LATER case's arm is conditional
+          // (only the matched-arm reality takes it) — it must NOT shift the
+          // alts, which represent realities that never ran that arm.
+          frcd.forkAlts = [...new Set(frcd.forkAlts.map((b) => { const nx = resolve(b, tgt.w); return existsSync(nx) ? nx : b; }))].slice(0, 64);
+        }
+      } else f().pending = null;
+      continue;
+    }
+    if (w0.w === "popd") {
+      const tgt = readWord(skipWs(i));
+      i = tgt.k;
+      if (tgt.w && (tgt.w.startsWith("-") || /^[+-][0-9]/.test(tgt.w))) { continue; } // -n/+N: no cd
+      const d = dirStack.pop();
+      f().pending = d !== undefined && existsSync(d) ? d : null; // empty stack → bash no-op
+      continue;
+    }
+    if (w0.w === "python" || w0.w.startsWith("python")) {
+      // python interpreter extent for open()-attribution: a real python
+      // heredoc (python3 - <<EOF — the incident shape) OR a -c payload OR the
+      // end of the python's own segment (next &&/||/;/|/&/\n — NEVER past it,
+      // so a later `echo open(...)` prose cannot be attributed to python).
+      // ORDER matters: check -c FIRST (a quoted payload may itself contain
+      // `<<` bit-shifts — `python3 -c 'x = 1 << 4'` — which must NOT parse as
+      // a heredoc). The heredoc scan is quote-aware over the line AFTER the
+      // python token's args (a `<<` inside a quoted arg is not a heredoc).
+      let ext = n;
+      let k0 = skipWs(i);
+      const first = readWord(k0);
+      let afterArgs = first.k;
+      if (first.w === "-" ) {
+        // python3 - <<EOF / python3 - script.py
+        const nxt = skipWs(first.k);
+        afterArgs = nxt;
+      }
+      if (first.w === "-c" || /^-[a-zA-Z]*c/.test(first.w)) {
+        // -c payload (quoted) — extent = end of the payload, honoring \" escapes
+        // in double quotes (cycle-26 P2-2: `python3 -c "a=\"v\"; open(\"f\",…)"`
+        // truncated at the first escaped quote → opens after it were dropped).
+        const k3 = skipWs(first.k);
+        const q3 = s[k3];
+        if (q3 === "'" || q3 === '"') {
+          let kk = k3 + 1;
+          while (kk < n && s[kk] !== q3) {
+            if (q3 === '"' && s[kk] === "\\") kk += 2;
+            else kk++;
+          }
+          ext = Math.min(n, kk + 1);
+        } else {
+          const pl = readWord(k3);
+          ext = pl.k;
+        }
+      } else {
+        // heredoc on the python's line (quote-aware)? python3 - <<EOF feeds
+        // python's stdin — its body IS python code (open() there is real).
+        const nl = s.indexOf("\n", i);
+        const lineEndAt = nl === -1 ? n : nl;
+        let hm = null;
+        {
+          let scan = i;
+          let qq = null;
+          while (scan < lineEndAt && !hm) {
+            const c2 = s[scan];
+            if (qq) { if (c2 === qq) qq = null; scan++; continue; }
+            if (c2 === "'" || c2 === '"') { qq = c2; scan++; continue; }
+            if (c2 === "<") {
+              const m = /^<<(-)?[ \t]*(?:"([^"]*)"|'([^']*)'|([^|&;()<>\s'"]+))/.exec(s.slice(scan, lineEndAt));
+              if (m && !(s[scan + 2] === "<")) { hm = m; break; }
+            }
+            scan++;
+          }
+        }
+        if (hm) {
+          const delim = hm[2] ?? hm[3] ?? hm[4];
+          const tabStrip = !!hm[1];
+          const bodyStart = nl === -1 ? n : nl + 1;
+          const lines = s.slice(bodyStart).split("\n");
+          for (let li = 0; li < lines.length; li++) {
+            const cand = lines[li];
+            const norm = tabStrip ? cand.replace(/^\t+/, "") : cand;
+            if (norm === delim) { ext = bodyStart + lines.slice(0, li + 1).join("\n").length; break; }
+          }
+        } else {
+          // segment end: first of &&/||/;/|/&/\n after the python token
+          const ends = [n];
+          for (const sep of ["&&", "||", ";", "|", "&", "\n"]) {
+            const idx = s.indexOf(sep, afterArgs);
+            if (idx !== -1) ends.push(idx);
+          }
+          ext = Math.min(...ends);
+        }
+      }
+      const _py = { idx: wstart, extentEnd: ext, cwd }; pythons.push(_py, ...forkTwins(_py));
+      continue;
+    }
+    {
+      // cycle-30 P2-1: path-qualified tee (/usr/bin/tee ≡ tee) — basename
+      // normalization mirrors the interpreter branch below.
+      const teeBase = w0.w.lastIndexOf("/") >= 0 ? w0.w.slice(w0.w.lastIndexOf("/") + 1) : w0.w;
+      if (teeBase === "tee") { const _tt = { idx: wstart, end: w0.k, cwd }; tees.push(_tt, ...forkTwins(_tt)); continue; }
+    }
+    {
+      // interpreter scan condition (cycle-23 F1): bare OR path-qualified
+      // shells (/usr/bin/bash ≡ bash), `source`/`.` (with their arg-position
+      // sub-gate), and DIRECT-EXEC script paths (`./run.sh`, `/abs/x.sh` —
+      // git-side extractScriptPath parity: /^\\.{0,2}\// is a script).
+      const w0Base = w0.w.lastIndexOf("/") >= 0 ? w0.w.slice(w0.w.lastIndexOf("/") + 1) : w0.w;
+      const isInterp = w0Base === "bash" || w0Base === "sh" || w0Base === "zsh" || w0Base === "dash" || w0Base === "ksh";
+      const isDot = w0.w === "." || w0.w === "source";
+      if (isDot)
+      // source/. f run f in the CURRENT shell — a sourced file's tracked
+      // writes must be gated like any script (cycle-18 P2-1 parity with the
+      // git-side SHELL_INTERPRETERS list). BUT the ubiquitous `find .`, `git
+      // add .`, `echo .` put a bare `.` in ARGUMENT position — only a `.`/
+      // source at TRUE command position (start or after ;/&&/||/|/&/\n,
+      // skipping whitespace) is the dot builtin (cycle-19 P2-1).
+      if (w0.w === "." || w0.w === "source") {
+        let b = wstart - 1;
+        while (b >= 0 && (s[b] === " " || s[b] === "\t")) b--; // stop AT \n so it tests as a boundary (r23 X7)
+        let trueCmdPos = b === -1 || "[;&|({\n}!".includes(s[b]);
+        // env-assignment prefix: `VAR=val . f` / `A=1 B=2 . f` — the dot is
+        // the assignment's command (cycle-21 P2-1).
+        if (!trueCmdPos) {
+          let bb = b;
+          while (bb >= 0) {
+            let e = bb;
+            while (e >= 0 && /[A-Za-z0-9_=]/.test(s[e])) e--; // include `=` so VAR=val reads as one token
+            const tok = s.slice(e + 1, bb + 1);
+            if (tok === "" || !tok.includes("=")) break;
+            trueCmdPos = true;
+            bb = e;
+            while (bb >= 0 && (s[bb] === " " || s[bb] === "\t")) bb--;
+          }
+        }
+        if (!trueCmdPos) {
+          // reserved words / prefix commands also put `.` at a true command
+          // position: `{ . f; }`, `if x; then . f; fi`, `! . f`, `time . f`,
+          // `fn() { . f; }`, `if . f; then` (cycle-20 P2-1 + cycle-21 P2-2).
+          let wb = b;
+          while (wb >= 0 && /[A-Za-z_]/.test(s[wb])) wb--;
+          const prevWord = s.slice(wb + 1, b + 1);
+          if (["then", "do", "else", "elif", "time", "fi", "done", "esac", "in", "function", "if", "while", "until", "case"].includes(prevWord)) trueCmdPos = true;
+        }
+        if (!trueCmdPos) { i = w0.k; continue; }
+      }
+      if (!(isInterp || isDot)) {
+        // DIRECT-EXEC script path (`./run.sh`, `/abs/x.sh`) — surface as a
+        // script token so the caller content-walks it (cycle-23 F1; git-side
+        // extractScriptPath parity: a command word starting ./ ../ or / is a
+        // script). Any other word falls through to the exec/eval handlers.
+        if (/^\.{0,2}\//.test(w0.w)) { const _st1 = { path: w0.w, cwd, mode: "direct" }; scriptToks.push(_st1, ...forkTwins(_st1)); i = w0.k; continue; } // cycle-24 P2: exec-bit-gated by the caller
+        // NOT an interpreter-shaped word — fall OUT of this handler to the
+        // exec/eval checks below (no scan, no continue).
+      } else {
+      // skip leading FLAGS mirroring the git-side round-19/20 semantics:
+      //  -c/--command (incl. single-dash letter runs CONTAINING c — bash
+      //   parses -xc/-ec left to right and -c consumes the payload) → recurse
+      //   the payload; --rcfile/--init-file/-O/-o take an OPERAND (skip 2);
+      //   every OTHER -flag / --long-option is operand-less (skip 1 — so
+      //   `bash -l /tmp/x.sh` and `bash --norc /tmp/x.sh` still reach the
+      //   script path); REDIRECTS between the interpreter and a heredoc
+      //   (`bash 2>/dev/null <<EOF`, `bash > log <<EOF`) are consumed like
+      //   the top-level walker; `< f` DEFERS a stdin-script token (a LATER
+      //   `<<` overrides it — last stdin wins → the heredoc body is CODE);
+      //   `<<'EOF'` with no script path yet → body recursed as code and the
+      //   HEADER REMAINDER walked (skipStart/skipEnd region); the first
+      //   non-flag word is the script path.
+      let k = skipWs(i);
+      let done = false;
+      let deferredStdin = null;
+      let sawDashS = false;              // -s: stdin IS the program (args positional)
+      while (!done && k < n) {
+        k = skipWs(k);
+        if (k >= n) break;
+        const at = s[k];
+        if (at === ">" || (at >= "0" && at <= "9")) {
+          let rk = k;
+          while (rk < n && /[0-9]/.test(s[rk])) rk++;
+          const fdRun = s.slice(k, rk);           // fd prefix (bare/0/1 = content)
+          const contentFd = fdRun === "" || fdRun === "0" || fdRun === "1";
+          if (s[rk] === ">") {
+            let p2 = rk + 1;
+            if (s[p2] === ">" || s[p2] === "|") {
+              p2++;
+              p2 = skipWs(p2);
+              const opnd = readWord(p2);
+              if (contentFd && opnd.w && !/^-?[0-9]*$/.test(opnd.w)) { const _rt3 = { raw: opnd.w, cwd: f().cwd }; redirs.push(_rt3, ...forkTwins(_rt3)); }
+              k = opnd.k;
+              continue;
+            }
+            if (s[p2] === "&") {
+              p2++;
+              if (/[0-9-]/.test(s[p2])) {
+                // fd dup/close (2>&1, >&-): NO file operand
+                while (p2 < n && /[0-9-]/.test(s[p2])) p2++;
+                k = p2;
+                continue;
+              }
+              // >& file — legacy redirect-ALL: the operand IS a content write
+              p2 = skipWs(p2);
+              const opnd = readWord(p2);
+              if (opnd.w && !/^-?[0-9]*$/.test(opnd.w)) { const _rt4 = { raw: opnd.w, cwd: f().cwd }; redirs.push(_rt4, ...forkTwins(_rt4)); }
+              k = opnd.k;
+              continue;
+            }
+            p2 = skipWs(p2);
+            const opnd = readWord(p2);
+            if (contentFd && opnd.w && !/^-?[0-9]*$/.test(opnd.w)) { const _rt3 = { raw: opnd.w, cwd: f().cwd }; redirs.push(_rt3, ...forkTwins(_rt3)); }
+            k = opnd.k;
+            continue;
+          }
+          if (s[rk] === "<") {
+            const q2 = skipWs(rk + 1);
+            if (s[q2] === "&") {
+              // input-direction dup/close (2<&1, 2<&-, <&1, <&-): NO file
+              // operand — resume after the dup target (cycle-8 P1 parity)
+              let p2 = q2 + 1;
+              while (p2 < n && /[0-9-]/.test(s[p2])) p2++;
+              k = p2;
+              continue;
+            }
+            k = readWord(q2).k;
+            continue;
+          }
+          k = rk;
+          continue;
+        }
+        if (at === "<") {
+          // bare input dup/close (<&1, <&-, <&0): NO file operand
+          if (s[k + 1] === "&") {
+            let p2 = k + 2;
+            while (p2 < n && /[0-9-]/.test(s[p2])) p2++;
+            k = p2;
+            continue;
+          }
+          // stdin redirect: bash < f / bash -s < f — the operand is the script
+          if (s[k + 1] === "<") {
+            // heredoc-fed interpreter. Cycle-11: with NO -s a file POSITIONAL
+            // on the header (`bash <<'EOF' x.sh`) is the SCRIPT — the body is
+            // stdin DATA; alone or with -s the body is the program.
+            const hr = heredocRegion(k);
+            if (hr) {
+              const body = s.slice(hr[0], hr[1]);
+              if (!sawDashS) {
+                const hpos = heredocHeaderPositional(k);
+                if (hpos) {
+                  const _st2 = { path: hpos, cwd }; scriptToks.push(_st2, ...forkTwins(_st2)); // x.sh IS the program
+                } else if (body.trim()) { const _ip2 = { payload: body, cwd }; inlinePays.push(_ip2, ...forkTwins(_ip2)); }
+              } else if (body.trim()) { const _ip2 = { payload: body, cwd }; inlinePays.push(_ip2, ...forkTwins(_ip2)); }
+              skipStart = hr[0]; skipEnd = hr[1];       // body jumped by the main loop
+            }
+            deferredStdin = null;                // heredoc overrides < f
+            i = k + 2;                           // header remainder WALKED
+            done = true;
+            continue;
+          }
+          let k2 = k + 1;
+          k2 = skipWs(k2);
+          const sp = readWord(k2);
+          deferredStdin = { path: sp.w };
+          k = sp.k;
+          continue;                              // a later << overrides; else EOF pushes it
+        }
+        const w1 = readWord(k);
+        if (w1.w === "" ) { done = true; continue; }
+        if (w1.w === "-c" || w1.w === "--command") {
+          const k2 = skipWs(w1.k);
+          const _ip3 = { payload: readWord(k2).w, cwd }; inlinePays.push(_ip3, ...forkTwins(_ip3));
+          i = readWord(k2).k;
+          done = true;
+        } else if (/^-[a-zA-Z]+$/.test(w1.w) && w1.w.includes("c")) {
+          // single-dash letter run containing c (bash -lc '…', sh -ec '…')
+          const k2 = skipWs(w1.k);
+          const _ip3 = { payload: readWord(k2).w, cwd }; inlinePays.push(_ip3, ...forkTwins(_ip3));
+          i = readWord(k2).k;
+          done = true;
+        } else if (w1.w === "--rcfile" || w1.w === "--init-file" || w1.w === "-O" || w1.w === "-o") {
+          const k2 = skipWs(w1.k);
+          k = readWord(k2).k;                    // flag + operand
+        } else if (w1.w.startsWith("-") && w1.w !== "-") {
+          if (w1.w === "-s") sawDashS = true;    // bash -s: commands from stdin
+          k = w1.k;                              // operand-less flag/option — skip 1
+        } else if (deferredStdin !== null) {
+          if (sawDashS) {
+            k = w1.k;                            // -s given: positional args, stdin is the program
+          } else {
+            // NO -s: a positional FILE after `< f` is the SCRIPT (real bash:
+            // bash < f x.sh runs x.sh — cycle-10 P2-10 parity with B38).
+            deferredStdin = null;                // < f becomes a plain input redirect
+            const _st3 = { path: w1.w, cwd }; scriptToks.push(_st3, ...forkTwins(_st3));
+            i = w1.k;
+            done = true;
+          }
+        } else if (sawDashS) {
+          k = w1.k;                            // -s: positional is $0 — keep
+                                               // scanning for < f / <<EOF (the real program)
+        } else {
+          const _st3 = { path: w1.w, cwd }; scriptToks.push(_st3, ...forkTwins(_st3));  // the script path
+          i = w1.k;
+          done = true;
+        }
+      }
+      if (!done) {
+        if (deferredStdin !== null) { const _st4 = { path: deferredStdin.path, cwd, viaStdin: true }; scriptToks.push(_st4, ...forkTwins(_st4)); }
+        i = Math.max(i, k);
+      }
+      continue;
+      } // end else: interpreter scan
+    }
+    // (cycle-33 P3-1) The former `if (w0.w === "exec")` handler was DELETED —
+    // exec is a spawner-prefix word (SPAWNER_WORDS) since r37-P3; fresh-command
+    // and chained-spawner routes both re-pend it, so this block was dead code.
+    // exec-driven interpreter/tee/script scanning runs via the standard chain.
+
+    if (w0.w === "eval") {
+      // quoted eval ('echo x > f') — the STANDARD form — must recurse on the
+      // UNQUOTED payload; bare eval collects words until a boundary/newline.
+      let k = skipWs(i);
+      const qd = s[k] === "'" || s[k] === '"' ? s[k] : null;
+      if (qd) {
+        k++;
+        let pl = "";
+        while (k < n && s[k] !== qd && pl.length < 4096) {
+          if (qd === '"' && s[k] === "\\" && k + 1 < n) {
+            // dq escape (cycle-15 D2): \" / \\ / \$ → the literal next char
+            pl += s[k + 1];
+            k += 2;
+            continue;
+          }
+          pl += s[k]; k++;
+        }
+        const _ip4 = { payload: pl, cwd }; inlinePays.push(_ip4, ...forkTwins(_ip4));
+        i = k + 1;
+      } else {
+        let pl = "";
+        while (k < n && !";|&()\n".includes(s[k]) && pl.length < 4096) { pl += s[k]; k++; }
+        const _ip5 = { payload: pl.trim(), cwd }; inlinePays.push(_ip5, ...forkTwins(_ip5));
+        i = k;
+      }
+      continue;
+    }
+  }
+  applyPending();
+  for (const r of redirs) push(r.raw, r.cwd, "redirect", "site");
+  for (const t of tees) {
+    // cycle-36 B: the collection must stop at the first top-level `;`/`&`/`|`/`)`
+    // boundary too — `echo hi | tee a.md; cat tracked.md` would otherwise collect
+    // `cat`/`tracked.md` as tee targets (false block on a later command's words).
+    // Quote-aware so a `;` inside a quoted word (e.g. a here-doc delimiter or
+    // quoted arg) does not split.
+    let segEnd = -1;
+    let dqT = null;
+    for (let kT = t.idx; kT < n; kT++) {
+      const cT = s[kT];
+      if (dqT === null && cT === "\n") { segEnd = kT; break; }
+      if (dqT === null && (cT === ";" || cT === "&" || cT === "|" || cT === ")")) { segEnd = kT; break; }
+      if (dqT !== null && cT === "\\") { kT++; continue; }
+      if (dqT === null && (cT === "'" || cT === '"')) { dqT = cT; continue; }
+      if (dqT !== null && cT === dqT) { dqT = null; }
+    }
+    if (segEnd === -1) segEnd = n;
+    const lim = segEnd === -1 ? n : Math.min(segEnd, t.idx + 300);
+    // slice from the END of the tee word (a quote-led or path-qualified tee
+    // starts earlier than +3 — cycle-30 P2-1/P2-2)
+    const teeWordEnd = t.end ?? t.idx + 3;
+    const rawWords = _tokenize(s.slice(teeWordEnd, lim));
+    // ALL non-flag positionals are write targets (echo x | tee a.md b.md).
+    // cycle-16 P2 + cycle-29 (review): a heredoc header `tee f <<EOF` feeds
+    // tee from the BODY — drop `<<` and the DELIMITER word only; positionals
+    // AFTER the delimiter are REAL targets (bash: `tee a.md <<EOF b.md` writes
+    // a.md AND b.md — the earlier dropAll guard dropped them).
+    const words = [];
+    let heredocDrop = 0;
+    for (const w of rawWords) {
+      if (heredocDrop > 0) { heredocDrop--; continue; }
+      if (w === "<<" || w === "<<-") { heredocDrop = 1; continue; }
+      if (_isShellBoundary(w)) continue;
+      words.push(w);
+    }
+    for (const w of words) {
+      if (!w.startsWith("-") && !w.startsWith(">") && !w.startsWith("<")) {
+        push(w, t.cwd, "tee", "site");
+      }
+    }
+  }
+  // python open(): only inside a python interpreter extent (quoted prose and
+  // grep-for-text NEVER emit — the interpreter gate the legacy extractor had)
+  const pyRe = /open\s*\(\s*\\{0,4}["']([^"']+?)\\{0,4}["']\s*,\s*\\{0,4}["'][wa][^"']*["']/g;
+  if (s.length <= 64 * 1024 && pythons.length > 0) {
+    const chdirRe = /os\.chdir\s*\(\s*\\{0,4}["']([^"']+?)\\{0,4}["']\s*\)/g; // lazy group mirrors pyRe (r32 P5: greedy ate the closing-\\ escape)
+    let m;
+    while ((m = pyRe.exec(s)) !== null) {
+      // cycle-39 F2: a python site may exist at MULTIPLE fork bases (the
+      // cycle-38 case-fork twins share idx/extentEnd with different cwd) —
+      // attribute the open() to EVERY containing site so the unmatched-arm
+      // reality is not silently dropped (find() kept only the first).
+      const sites = pythons.filter((p2) => m.index >= p2.idx && m.index < p2.extentEnd);
+      if (!sites.length) continue;
+      // cycle-25 P2-2: os.chdir() inside the python extent shifts the write
+      // target — replay the chdirs BEFORE this open() against the site cwd.
+      for (const site of sites) {
+        let pyCwd = site.cwd;
+        chdirRe.lastIndex = site.idx;
+        let cm;
+        while ((cm = chdirRe.exec(s)) !== null && cm.index < m.index) {
+          if (cm.index >= site.idx && cm.index < site.extentEnd && !/^\s*$/.test(cm[1])) {
+            pyCwd = /^\//.test(cm[1]) ? cm[1] : resolve(pyCwd, cm[1]);
+          }
+        }
+        push(m[1], pyCwd, "python", "site");
+      }
+    }
+  }
+  for (const p2 of inlinePays) {
+    if (!p2.payload || p2.payload.length > 8192) continue;
+    const innerR = bashWriteTargetsResolved(p2.payload, p2.cwd);
+    for (const inner of innerR) {
+      const key = `${inner.via}:${inner.resolvedPath}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ ...inner, site: "inline" });
+    }
+    // cycle-21 P2-3: a source/./script word INSIDE a recursed payload (`bash
+    // -c 'source /tmp/evil.sh'`) is a scriptTok of the inner result — merge
+    // it so the caller content-walks the nested file too.
+    for (const innerSt of innerR.scriptToks || []) {
+      if (!scriptToks.some((t) => t.path === innerSt.path && t.cwd === innerSt.cwd)) scriptToks.push(innerSt);
+    }
+  }
+  out.scriptToks = scriptToks;
+  return out;
+}
+
 
 /**
  * Parse `git status --porcelain` (v1) output for UNTRACKED WIP (#350).
