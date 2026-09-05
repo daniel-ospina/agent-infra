@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: shared-plan
 description: Planning substeps. Epic → epic-plan. Project → wired inline in project-workflow.
 domain: capability
+subjects.team: organisation-design-team
 type: Routing
 status: stub
 tags: [pipeline, shared, plan]

@@ -1,6 +1,7 @@
 ---
 name: android-deploy
 description: Build and deploy the El Dato Scanner app to Google Play Internal Testing. Use when asked to "deploy the scanner", "build the APK/AAB", "upload to Play Store", or "ship a new scanner version".
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

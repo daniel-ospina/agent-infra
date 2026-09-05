@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: epic-scope
 description: "Bounded skill for epic scoping. Takes strategy decision + research brief and produces scoped boundaries, high-level E2E test cases (BEFORE user journeys), and complexity ratings. Includes review gate with fresh-context reviewer. Invoked by epic-plan after research."
 domain: planning
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

@@ -1,6 +1,7 @@
 ---
 name: epic-executor
 description: Use when instructed to complete all issues of an epic, or to process a batch of open issues. Dispatches each issue as a task sub-agent in dependency order using parallel subagent dispatch. Auto-continues until exhausted. Never pauses for /auto. Supports cross-session resume via Tortoise/FalkorDB.
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 1.0.0
 ---

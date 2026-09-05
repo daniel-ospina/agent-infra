@@ -2,6 +2,7 @@
 disable-model-invocation: true
 name: execution-intent
 description: "Canonical reference for the session-level execution intent flag. Defines the Fast/Autonomous/Budget profiles, propagation rules, and sub-agent preamble template. Cross-referenced by 9 pipeline skills."
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

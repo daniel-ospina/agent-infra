@@ -2,11 +2,12 @@
 name: issue-creation
 description: Use when creating GitHub issues, when epic-decompose generates child issues, or when a standalone feature needs an issue with O/I/T, affiliation, and domain-aware complexity before planning begins.
 domain: capability
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch
 version: 2.0.0
 ---
 
-> ⛔ **This skill MUST be read and followed in full — not skimmed.** Formal review gates depend on its workflow.
+> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 # Issue Creation
@@ -246,3 +247,5 @@ gh issue edit $ISSUE_NUMBER --add-label "team:$TEAM" || true
 | Skipping context for epic-linked issues | Read the epic doc. Inherited decisions prevent re-litigation. |
 | Using micro fast-path for non-trivial work | Fast-path = obvious fix. If you hesitate, use the full pipeline. |
 | Planning implementation during creation | Creation = what & why. Planning = how. Don't mix them. |
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

@@ -2,6 +2,7 @@
 name: commit-workflow
 description: MANDATORY before any git commit, push, or merge. Runs pre-flight (typecheck, tests, pgTAP), creates PR, code-review gate, auto-merge. Skipping bypasses ALL quality gates.
 domain: engineering
+subjects.team: organisation-design-team
 version: 1.1.0
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 steps:

@@ -2,6 +2,7 @@
 name: test-integration
 description: "Use when writing integration tests for DB surfaces, API calls, or auth flows. Guides agents through Supabase local setup, Vitest configuration, transaction isolation, and RLS verification. Invoked by test-routing when integration surfaces are detected."
 domain: engineering
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find
 ---
 
@@ -220,3 +221,5 @@ Create an integration-specific Vitest config with sequential execution to avoid 
 | Transaction tests | Partial writes corrupt data — deal created but credits not deducted |
 | RLS tests | Security vulnerabilities — users access other users' data |
 | Race condition tests | Duplicate claims, lost updates under concurrent load |
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

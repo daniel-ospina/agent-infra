@@ -2,6 +2,7 @@
 name: tortoise-decide
 description: Make a decision with the Tortoise graph — refine the decision, research options/criteria/findings, wire IMPL/NAND/mitigation edges, and rank options by EP confidence. Invoke this skill when the user needs to decide between options and the graph should hold the reasoning.
 domain: capability
+subjects.team: organisation-design-team
 type: Workflow
 status: live
 tags: [tortoise, graph, decision, epistemology, ep-confidence]
@@ -10,6 +11,8 @@ created: 2026-08-23
 updated: 2026-08-23
 allowed-tools: read write bash grep
 ---
+> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
+> Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 > ⛔ **Read this skill in full before running a decision comparison.** The graph's reasoning (the IMPL/NAND/mitigation structure) is the deliverable — the ranking is the read-out.
 
@@ -103,3 +106,5 @@ tenants use the MCP tools above.
 - ⛔ **Don't store decisions as first-class Points** — the graph says "this
   state is based on these reasons"; the decision dimension is the
   decision-as-Event timeline.
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

@@ -1,6 +1,7 @@
 ---
 name: ux-path-auditor
 description: Walks every step of every journey in a path-map.json via Playwright MCP, runs a 10-check audit checklist at each screen (desktop + mobile viewports), captures DOM/console/network evidence, deduplicates findings, and writes audit-report.json
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

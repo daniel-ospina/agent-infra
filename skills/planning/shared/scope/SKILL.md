@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: shared-scope
 description: Scope + E2E proportional to issue size. Routes to issue-scoping.
 domain: capability
+subjects.team: organisation-design-team
 type: Routing
 status: stub
 tags: [pipeline, shared, scope]

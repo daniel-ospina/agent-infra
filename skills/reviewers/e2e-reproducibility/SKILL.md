@@ -2,6 +2,7 @@
 disable-model-invocation: true
 name: e2e-reproducibility
 description: Validates that described E2E tests can actually be executed — checks for concrete setup, clear assertions, and runnable conditions. Use when reviewing Detailed E2E substep output for Architecture + UX complexity axes. Returns structured ISSUE blocks or NO ISSUES FOUND.
+subjects.team: organisation-design-team
 allowed-tools: read bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

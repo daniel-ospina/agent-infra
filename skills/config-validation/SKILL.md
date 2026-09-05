@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: config-validation
 description: "Thin wrapper that runs relevant check scripts based on changed files. Maps file types to validation scripts (migrations → check-migration-*, skills → check-skill-lint, etc.). Invoked by test-routing when domain=config."
 domain: engineering
+subjects.team: organisation-design-team
 allowed-tools: read bash grep find
 ---
 
@@ -111,3 +112,5 @@ done
 | Migration drift check | Schema drifts from source of truth |
 | Skill lint check | Malformed skill files break agent workflows |
 | Test regression check | Flaky tests accumulate, CI becomes unreliable |
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

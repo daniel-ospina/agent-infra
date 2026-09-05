@@ -5,9 +5,12 @@ created: 2026-07-18
 description: Ingest a research finding into the Tortoise graph. Creates a Point, checks for existing related claims, and surfaces connection candidates.
 type: capability
 domain: capability
+subjects.team: organisation-design-team
 status: live
 allowed-tools: mcp__tortoise__tortoise_create_point, mcp__tortoise__tortoise_query
 ---
+> ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
+> Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 # tortoise:file-finding
 
@@ -38,3 +41,5 @@ The steps below use the MCP tools, which work for both audiences when an MCP ser
 
 - If `tortoise_create_point` fails, report the error and do not proceed to query.
 - If `tortoise_query` returns empty, report "no existing Points from this source" — this is a success state.
+---
+> Continue following the workflow as mandated by this skill. Do not skip steps.

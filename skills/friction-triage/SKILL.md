@@ -2,6 +2,7 @@
 name: friction-triage
 description: Use when a session postmortem or friction_events.jsonl shows friction patterns — BEFORE filing any fix issues. Triage classifies each friction (agent-error, gate-bug, design-gap, workaround-signal), clusters related events, researches root causes, and only then files scoped issues with research mandates.
 domain: capability
+subjects.team: organisation-design-team
 type: Bounded
 status: draft
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task

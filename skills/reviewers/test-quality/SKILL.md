@@ -2,6 +2,7 @@
 disable-model-invocation: true
 name: test-quality
 description: Validates tests verify the right thing — checks behavior-vs-implementation, mock discipline, outcome alignment, implementation coupling, and negative case coverage. Use when reviewing test files in test-review, epic-plan Detailed E2E substep, or verification-before-completion. Returns structured ISSUE blocks or NO ISSUES FOUND.
+subjects.team: organisation-design-team
 allowed-tools: read bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

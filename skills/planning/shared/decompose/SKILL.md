@@ -3,6 +3,7 @@ disable-model-invocation: true
 name: shared-decompose
 description: MECE-first decomposition + child issue generation. Routes to epic-decompose.
 domain: capability
+subjects.team: organisation-design-team
 type: Routing
 status: stub
 tags: [pipeline, shared, decompose]

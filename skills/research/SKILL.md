@@ -1,6 +1,7 @@
 ---
 name: research
 description: "Use for ANY non-trivial research — whether the user says 'research this' or the agent needs to investigate a technical question, compare approaches, evaluate trade-offs, understand a new domain, or make architecture decisions. Provides problem reframing, domain detection (Clear/Complicated/Complex), internal+external search, adversarial queries, and depth scaling. NOT for trivial single-fact lookups or content-pipeline keyword/SERP research (use content-research for that)."
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 version: 1.0.0
 ---

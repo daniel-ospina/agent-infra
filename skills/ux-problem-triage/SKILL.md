@@ -1,6 +1,7 @@
 ---
 name: ux-problem-triage
 description: "Reads audit-report.json produced by ux-path-auditor, classifies each finding as UX-change-required or tech-change-required using a structured rule table, and writes ux-issues.json and tech-issues.json for the ux-qa orchestrator"
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

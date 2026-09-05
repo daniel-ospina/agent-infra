@@ -2,6 +2,7 @@
 name: ux-design-review
 description: "Pre-planning gate that classifies whether proposed changes involve UX decisions, presents structured options, and records user choices. Invoked by epic-workflow, project-workflow, and writing-plans when UX_RATING ≥ medium or changes touch UI. Not a design tool — a classification and decision-routing gate."
 domain: capability
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.

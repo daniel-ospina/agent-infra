@@ -2,6 +2,7 @@
 name: goal-setting
 description: Formalize loop goals with O/I/T structure, loop type selection, and verification criteria. Use before /loop start, or when asked to "set a goal", "define loop criteria", or "prepare a loop".
 domain: capability
+subjects.team: organisation-design-team
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.

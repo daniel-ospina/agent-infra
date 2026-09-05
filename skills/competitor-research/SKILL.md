@@ -2,6 +2,7 @@
 name: competitor-research
 description: Use when asked to "research a competitor", "analyze competitor X", "profile competitor", "competitive analysis", "competitor deep dive", or when evaluating a competitor's product, strategy, positioning, traction, or business model. Produces structured profiles following the skill's 11-dimension competitor template (bootstrapped to the output directory as _template.md on first run) and updates the competitive analysis synthesis.
 domain: capability
+subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch task
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
