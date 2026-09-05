@@ -17,12 +17,13 @@
  *      0.500") — both spellings must parse.
  *   3. The acceptance-fixture file (tests/test_ask_retrieval_levers.py)
  *      exists AND actually implements the #2070 Acceptance Indicator:
- *      a NON-EMPTY RECORDED_FAILURES list (the recorded gold-turn ids)
- *      with a `def test_gold_turn_in_context*` function parametrized over
- *      it whose body ASSERTS the gold turns land in the assembled context.
- *      An empty stub (`RECORDED_FAILURES = []`), a commented-out def, a
- *      vacuous `pass`-body placeholder, or a bare token mention is NOT the
- *      indicator (P3-4).
+ *      a NON-EMPTY RECORDED_FAILURES list on a CODE line (comment-only
+ *      mentions do not count) with a `def test_gold_turn_in_context*`
+ *      function parametrized over it whose body ASSERTS the gold turns
+ *      land in the assembled context (an `assert ... & gold` intersection
+ *      on the context-derived set — a vacuous `pass`-body def, a
+ *      commented-out decorator/def, a negated `gold is None` assert, or a
+ *      bare token mention is NOT the indicator (P3-4).
  *
  * Plain CJS, zero npm deps (the repo's script convention — mirrors
  * scripts/check-ask-premerge.cjs). Invoked by the commit-workflow
@@ -32,10 +33,10 @@
  * "pool@120 recall **0.750**" / "ctx@40 recall **0.125**" (bold) and
  * "ctx@cap recall 0.500" (UN-bolded). All three are parsed with optional
  * bold (`\*{0,2}`). The fixture's parametrized gold-turn def is the
- * Acceptance Indicator: its body must contain an `assert ... gold` line
- * (the real fixture asserts `ctx_ids & gold`). If the runbook's or
- * fixture's phrasing changes, update the regexes AND this contract
- * together.
+ * Acceptance Indicator: its body must contain an `assert` line that
+ * intersects the context ids with the gold set (`& gold`; the real
+ * fixture asserts `ctx_ids & gold`). If the runbook's or fixture's
+ * phrasing changes, update the regexes AND this contract together.
  *
  * PLACEMENT (P3-5): this is a TORTOISE-specific gate living in the shared
  * symlinked suite — it reads the tortoise runbook (docs/runbook/1987-...).
@@ -77,12 +78,21 @@ if (!/Follow-up \(2\) status — #2070|#2070 retrieval optimisation loop/.test(t
 // values. One tolerant parse pattern for all three keys (bold optional —
 // the runbook bolds pool@120/ctx@40 and leaves ctx@cap un-bolded, but a
 // future normalization in EITHER direction must not false-block), each
-// range-checked 0..1.
+// range-checked 0..1. The LAST recorded occurrence of each key governs
+// (the doc may preserve an older measurement below a newer one; ordering
+// is validated against the most recent measurement on file, so a later
+// appended contradictory re-measure cannot hide below an old record).
 function recall(key) {
   // Tolerant parse: optional bold on either side of the value, capture the
   // numeric token only (no trailing punctuation — "0.500." must parse as
   // 0.5, not NaN).
-  return parseRecall(text, new RegExp(`${key} recall\\s*\\*{0,2}\\s*([0-9]*\\.[0-9]+|[0-9]+)`));
+  const re = new RegExp(`${key} recall\\s*\\*{0,2}\\s*([0-9]*\\.[0-9]+|[0-9]+)`, "g");
+  let m, last = null;
+  while ((m = re.exec(text)) !== null) {
+    const v = Number(m[1]);
+    if (Number.isFinite(v) && v >= 0 && v <= 1) last = v;
+  }
+  return last;
 }
 const pool = recall("pool@120");
 const ctx40 = recall("ctx@40");
@@ -110,27 +120,50 @@ if (ctxCap < ctx40 - 1e-9 || ctxCap > pool + 1e-9) {
 if (!fs.existsSync(FIXTURES)) {
   fail(`acceptance fixtures missing: ${FIXTURES} — the 4 gold-turn-inclusion fixtures are #2070 Acceptance Indicator 1.`);
 }
-const fixtureText = fs.readFileSync(FIXTURES, "utf8");
-// Non-empty RECORDED_FAILURES list with at least one quoted gold-turn id.
-const hasRecordedIds = /RECORDED_FAILURES\s*=\s*\[[^\]]*["'][A-Za-z0-9_][A-Za-z0-9_-]*["']/.test(fixtureText);
+const rawFixture = fs.readFileSync(FIXTURES, "utf8");
+// Strip full-line comments so a comment-only RECORDED_FAILURES mention or a
+// commented-out decorator/def/assert can never satisfy a code check.
+const codeLines = rawFixture.split("\n").filter((l) => !/^\s*#/.test(l));
+const fixtureText = codeLines.join("\n");
+// Non-empty RECORDED_FAILURES list on a CODE line with at least one quoted
+// gold-turn id (P3-4: an empty stub `RECORDED_FAILURES = []` fails).
+const hasRecordedIds = /^[ \t]*RECORDED_FAILURES\s*=\s*\[[^\]]*["'][A-Za-z0-9_][A-Za-z0-9_-]*["']/m.test(fixtureText);
 // A parametrized gold-turn def: @pytest.mark.parametrize(..., RECORDED_FAILURES)
-// immediately above an un-commented `def test_gold_turn_in_context`, whose body
-// actually asserts the gold-turn-in-context result (P3-4: a vacuous `pass` body
-// or a bare token mention is NOT the indicator).
+// on code lines immediately above an un-commented `def test_gold_turn_in_context`.
 const goldDef = fixtureText.match(
-  /@pytest\.mark\.parametrize\([^)]*RECORDED_FAILURES[^)]*\)\s*\n\s*def test_gold_turn_in_context\w*\s*\([^)]*\):[ \t]*\n((?:[ \t]+.*\n?)*)/
+  /^[ \t]*@pytest\.mark\.parametrize\([^)]*RECORDED_FAILURES[^)]*\)[ \t]*\n[ \t]*def (test_gold_turn_in_context\w*)\s*\([^)]*\):/m
 );
-const hasGoldDefBody = !!goldDef && /assert[^\n]*gold/.test(goldDef[1]);
-if (!hasRecordedIds || !goldDef || !hasGoldDefBody) {
-  fail(`${FIXTURES} must define a NON-EMPTY RECORDED_FAILURES list (the recorded gold-turn ids) and a def test_gold_turn_in_context* parametrized over it whose body asserts the gold turns land in the assembled context — the 4 gold-turn fixtures are the gate (P3-4); an empty stub, placeholder, or bare mention does not pass.`);
+let hasGoldIntersectAssert = false;
+if (goldDef) {
+  const defName = goldDef[1];
+  const di = codeLines.findIndex((l) => new RegExp(`^[ \\t]*def ${defName}\\s*\\(`).test(l));
+  if (di !== -1) {
+    // Body = indented block following the def line; stops at the next
+    // column-0 code line. Keeps blank/indented lines so a legitimately
+    // multi-line or blank-line-separated body still parses.
+    const body = [];
+    for (let i = di + 1; i < codeLines.length; i++) {
+      const line = codeLines[i];
+      if (/^[ \t]/.test(line)) {
+        body.push(line);
+      } else if (line.trim() === "") {
+        continue;
+      } else {
+        break;
+      }
+    }
+    // The body must ASSERT the gold turns land in the assembled context:
+    // an intersection of a context-derived id set with the gold set. The
+    // real fixture asserts `assert ctx_ids & gold` and `assert {h["id"]
+    // for h in ctx} & gold` — both match `assert ... & gold`. A negated
+    // (`assert gold is None`), bare-presence (`assert gold`), or
+    // comment-only mention does not (comments already stripped).
+    hasGoldIntersectAssert = body.some((l) => /assert[^\n]*&[^\n]*\bgold\b|\bassert[^\n]*\bgold\b[^\n]*&/.test(l));
+  }
+}
+if (!hasRecordedIds || !goldDef || !hasGoldIntersectAssert) {
+  fail(`${FIXTURES} must define a NON-EMPTY RECORDED_FAILURES list (the recorded gold-turn ids) on a code line and a def test_gold_turn_in_context* parametrized over it whose body ASSERTS the gold turns land in the assembled context (an "assert ... & gold" intersection) — the gold-turn fixtures are the gate (P3-4); an empty stub, placeholder, comment-only mention, or negated/bare assert does not pass.`);
 }
 
 console.log(`✅ check-ask-retrieval: baseline pool@120=${pool} ctx@40=${ctx40} ctx@cap=${ctxCap} recorded & consistent; gold-turn acceptance fixtures on file; gate passes.`);
 process.exit(0);
-
-function parseRecall(text, re) {
-  const m = text.match(re);
-  if (!m) return null;
-  const v = Number(m[1]);
-  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : null;
-}
