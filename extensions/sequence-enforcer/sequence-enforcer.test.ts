@@ -28,11 +28,16 @@ import {
   _setForceFileForTest,
   _setRepoForTest,
   _setAuditSinkForTest,
+  _setAuditSessionIdForTest,
+  _auditSessionIdForTest,
   _setBridgeDirForTest,
   _pushSkillForTest,
   _stackForTest,
   _resetStateForTest,
   _markerCountForTest,
+  readEnforcementLog,
+  enforcementLogFile,
+  type EnforcementLogEntry,
   default as sequenceEnforcer,
   type Step,
 } from "./index.js";
@@ -2958,6 +2963,239 @@ await test("empty-stack timeout fires harmlessly", async () => {
       },
     );
   } finally { auditRelease(); }
+});
+
+// ── #377: audit session_id schema + enforcement.jsonl reader ──
+section("#377 session attribution (audit session_id)");
+
+await test("session_start captures ctx session id and startup audit entry carries it", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    sequenceEnforcer(pi as any);
+    // ctx with sessionManager.getSessionId() → authoritative in-process source.
+    const ctx = { sessionManager: { getSessionId: () => "sess-377a" } };
+    await handlers.session_start!({ type: "session_start", reason: "startup" }, ctx);
+    const startup = auditEntries.find((x) => x.event === "startup");
+    ok(startup, "startup entry emitted");
+    equal(startup!.session_id, "sess-377a", "startup entry carries the ctx session id");
+    equal(_auditSessionIdForTest(), "sess-377a", "module captured id from ctx (ctx-first)");
+  } finally { auditRelease(); }
+});
+
+await test("no ctx + no env → session_id is null on entries (always-present key)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_SESSION_ID: undefined, PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        await handlers.session_start!(); // no ctx → no session id
+        const startup = auditEntries.find((x) => x.event === "startup");
+        ok(startup, "startup entry emitted");
+        ok("session_id" in startup!, "session_id key always present");
+        equal(startup!.session_id, null, "unresolvable session → null, not missing-key ambiguity");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("env PI_SESSION_ID fallback when no ctx (non-pi-host execution)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_SESSION_ID: "sess-env-9", PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        await handlers.session_start!(); // no ctx → env fallback
+        const startup = auditEntries.find((x) => x.event === "startup");
+        equal(startup!.session_id, "sess-env-9", "env PI_SESSION_ID used as last-resort fallback");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("blocked/allowed/timeout-park entries all carry the captured session id", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_SESSION_ID: "sess-377b", PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        await handlers.session_start!();
+        // blocked at a pending checkpoint
+        _pushSkillForTest("/repo/skills/check/SKILL.md", [makeStep({ name: "check", gate: "checkpoint", token_phase: "plan" })], 0);
+        await handlers.tool_call!({ toolName: "bash", toolCallId: "s1", input: { command: "rm -rf /" } });
+        const blocked = auditEntries.filter((x) => x.event === "blocked");
+        ok(blocked.length >= 1, "blocked entry present");
+        ok(blocked.every((x) => x.session_id === "sess-377b"), "blocked entries carry session id");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("module-level captured session id is dropped at session_shutdown (no cross-session bleed)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_SESSION_ID: "sess-shutdown", PI_MODE: "print", AGENT_SEQUENCE_MODE: "gate", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        await handlers.session_start!();
+        equal(_auditSessionIdForTest(), "sess-shutdown", "captured before shutdown");
+        await handlers.session_shutdown!();
+        equal(_auditSessionIdForTest(), null, "dropped at shutdown — a stale write can never be misattributed");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("_resetStateForTest clears the session override + captured id (reset contract)", async () => {
+  _resetStateForTest();
+  _setAuditSessionIdForTest("sess-override-1");
+  equal(_auditSessionIdForTest(), "sess-override-1", "override captured");
+  _resetStateForTest();
+  equal(_auditSessionIdForTest(), null, "reset drops captured id");
+  // override inactive → a ctx-less session_start resolves to null, not the stale override
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_SESSION_ID: undefined, PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        await handlers.session_start!();
+        const startup = auditEntries.find((x) => x.event === "startup");
+        equal(startup!.session_id, null, "no stale override after reset");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("audit sink override forces a deterministic session id (test seam)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_SESSION_ID: undefined, PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        _setAuditSessionIdForTest("sess-forced");
+        sequenceEnforcer(pi as any);
+        await handlers.session_start!();
+        const startup = auditEntries.find((x) => x.event === "startup");
+        equal(startup!.session_id, "sess-forced", "override wins over ctx/env for deterministic tests");
+      },
+    );
+  } finally { auditRelease(); _setAuditSessionIdForTest(null); _resetStateForTest(); }
+});
+
+section("#377 enforcement.jsonl reader");
+
+function writeFixture(file: string, lines: string[]) {
+  writeFileSync(file, lines.join("\n") + "\n", "utf-8");
+}
+
+await test("enforcementLogFile() resolves the real audit path via os.homedir()", () => {
+  equal(enforcementLogFile(), join(homedir(), ".pi", "agent", "audit", "enforcement.jsonl"));
+  ok(enforcementLogFile().startsWith(homedir()), "derived from os.homedir()");
+});
+
+await test("missing file → empty result, zero skipped (tolerant)", () => {
+  const r = readEnforcementLog({ file: join(tmpDir("reader-missing"), "enforcement.jsonl") });
+  equal(r.entries.length, 0);
+  equal(r.skipped, 0);
+});
+
+await test("parses valid lines in file order; blank + malformed lines counted as skipped", () => {
+  const file = join(tmpDir("reader-parse"), "enforcement.jsonl");
+  writeFixture(file, [
+    JSON.stringify({ ts: "2026-08-30T01:00:00.000Z", event: "startup", mode: "warn", session_id: "s1" }),
+    "",
+    "not-json{{{",
+    JSON.stringify({ ts: "2026-08-30T02:00:00.000Z", event: "blocked", skill: "/x", session_id: "s2" }),
+    JSON.stringify({ ts: "2026-08-30T03:00:00.000Z", event: "allowed", session_id: null }),
+  ]);
+  const r = readEnforcementLog({ file });
+  equal(r.skipped, 1, "only the malformed line is skipped (blank ignored)");
+  equal(r.entries.length, 3, "three valid lines parsed");
+  equal(r.entries[0]!.event, "startup");
+  equal(r.entries[1]!.session_id, "s2");
+  equal(r.entries[2]!.session_id, null);
+  ok(r.entries[0]!.ts < r.entries[1]!.ts, "file order preserved (chronological)");
+});
+
+await test("events filter narrows to the named event(s)", () => {
+  const file = join(tmpDir("reader-events"), "enforcement.jsonl");
+  writeFixture(file, [
+    JSON.stringify({ ts: "2026-08-30T01:00:00.000Z", event: "startup", session_id: "s1" }),
+    JSON.stringify({ ts: "2026-08-30T02:00:00.000Z", event: "warn_blocked", session_id: "s1" }),
+    JSON.stringify({ ts: "2026-08-30T03:00:00.000Z", event: "blocked", session_id: "s1" }),
+  ]);
+  const r = readEnforcementLog({ file, events: ["startup", "blocked"] });
+  equal(r.entries.length, 2);
+  ok(r.entries.every((x) => x.event === "startup" || x.event === "blocked"));
+});
+
+await test("sessionId filter includes exact matches and excludes null + pre-#377 (missing key) lines", () => {
+  const file = join(tmpDir("reader-session"), "enforcement.jsonl");
+  writeFixture(file, [
+    JSON.stringify({ ts: "2026-08-30T01:00:00.000Z", event: "startup", session_id: "want-1" }),
+    JSON.stringify({ ts: "2026-08-30T02:00:00.000Z", event: "startup", session_id: null }),
+    // pre-#377 line: no session_id key at all
+    JSON.stringify({ ts: "2026-08-30T03:00:00.000Z", event: "startup" }),
+    JSON.stringify({ ts: "2026-08-30T04:00:00.000Z", event: "startup", session_id: "other" }),
+  ]);
+  const r = readEnforcementLog({ file, sessionId: "want-1" });
+  equal(r.entries.length, 1);
+  equal(r.entries[0]!.session_id, "want-1");
+});
+
+await test("since filter is inclusive on ISO ts", () => {
+  const file = join(tmpDir("reader-since"), "enforcement.jsonl");
+  writeFixture(file, [
+    JSON.stringify({ ts: "2026-08-30T01:00:00.000Z", event: "startup", session_id: "a" }),
+    JSON.stringify({ ts: "2026-08-30T02:00:00.000Z", event: "startup", session_id: "b" }),
+  ]);
+  const r = readEnforcementLog({ file, since: "2026-08-30T02:00:00.000Z" });
+  equal(r.entries.length, 1);
+  equal(r.entries[0]!.session_id, "b", "boundary ts included (inclusive since)");
+});
+
+await test("limit returns the most recent N matching entries", () => {
+  const file = join(tmpDir("reader-limit"), "enforcement.jsonl");
+  writeFixture(file, [
+    JSON.stringify({ ts: "2026-08-30T01:00:00.000Z", event: "startup", session_id: "a" }),
+    JSON.stringify({ ts: "2026-08-30T02:00:00.000Z", event: "startup", session_id: "b" }),
+    JSON.stringify({ ts: "2026-08-30T03:00:00.000Z", event: "startup", session_id: "c" }),
+    JSON.stringify({ ts: "2026-08-30T04:00:00.000Z", event: "startup", session_id: "d" }),
+  ]);
+  const r = readEnforcementLog({ file, limit: 2 });
+  equal(r.entries.length, 2);
+  equal(r.entries[0]!.session_id, "c", "limit keeps the most recent entries");
+  equal(r.entries[1]!.session_id, "d");
+});
+
+await test("reader is the swarm-side positive-audit gate primitive: startup sessions since a ts", () => {
+  const file = join(tmpDir("reader-gate"), "enforcement.jsonl");
+  writeFixture(file, [
+    JSON.stringify({ ts: "2026-08-30T01:00:00.000Z", event: "startup", mode: "gate", session_id: "pre" }),
+    JSON.stringify({ ts: "2026-08-30T02:00:00.000Z", event: "startup", mode: "warn", session_id: "post1" }),
+    JSON.stringify({ ts: "2026-08-30T03:00:00.000Z", event: "startup", mode: "warn", session_id: "post2" }),
+  ]);
+  // #357 criterion 16: name exactly which sessions started after a deploy ts.
+  const r = readEnforcementLog({ file, since: "2026-08-30T02:00:00.000Z", events: ["startup"] });
+  const ids = r.entries.map((x) => x.session_id).sort();
+  deepEqual(ids, ["post1", "post2"], "post-deploy startup sessions are named exactly");
 });
 
 // ── cleanup + summary ────────────────────────────────
