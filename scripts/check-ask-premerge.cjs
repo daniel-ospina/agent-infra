@@ -33,8 +33,20 @@
  * verdicts ("— **PASS**", "— **FAIL …**"), measured figures ("abstention_n
  * = 30", "abstention arm: 1.0", "mapped agreement 0.284", "aggregate 0.43
  * (9/21)"), and disposition markers ("**REMAINS for the parent:**", "(d)
- * gate is MOOT by product decision"). If the runbook's phrasing changes,
- * update the check AND this contract together.
+ * gate is MOOT by product decision"). Since the (c) bar constant (0.85) and
+ * an at-bar result are spelled identically, the (c) gate also classifies
+ * each "mapped agreement <decimal>" capture from its OWN sentence — a
+ * bar/plan restatement ("mapped agreement >= 0.85", "mapped agreement is
+ * the 0.85 bar", "(the gate bar) … measured result 0.284 …") is not a
+ * measurement, while an explicitly measured or bare at-bar declaration
+ * ("measured mapped agreement **0.85** (bar met)", "mapped agreement
+ * reached **0.85** — recorded result this cycle.") IS a recorded figure;
+ * and the #2009 co-location record is read per SENTENCE — negated mentions
+ * ("No tracked follow-up **#2009** is needed…", "…#2009 (… long annotation
+ * …) was waived…", "shipped without #2009") record that the follow-up does
+ * not exist, while "#2009 verified OPEN / is required / is needed /
+ * tracked" and "superseded by #2009" (issue as object) affirm it. If the
+ * runbook's phrasing changes, update the check AND this contract together.
  *
  * PLACEMENT (P3-5): this is a TORTOISE-specific gate living in the shared
  * symlinked suite — it reads the tortoise runbook (docs/runbook/1987-...) and
@@ -209,88 +221,150 @@ if (!bSections.some(({ sec }) => bHeadingPass(sec.split("\n")[0] || ""))) {
 // ≥ 0.85" as a target) is NOT a measurement, and a bar restatement ("mapped
 // agreement >= 0.85", a lone "threshold 0.85", "below the 0.85 bar") is not
 // a measured figure.
+//
+// MEASURED-vs-BAR CLASSIFICATION (round-10, SENTENCE-SCOPED): the 0.85 bar
+// constant and a recorded result sitting AT the bar are spelled identically
+// ("mapped agreement 0.85"), so every "mapped agreement <decimal>" capture
+// is classified from ITS OWN SENTENCE (shared splitSentences()) — never
+// across a sentence boundary ("Measured … 0.284 last run." cannot upgrade a
+// bar mention in the NEXT sentence, and a measurement bound to a different
+// decimal in the SAME sentence demotes an at-bar mention to a restatement).
+// A capture is skipped as a BAR RESTATEMENT when (a) a comparison operator
+// sits directly before the value ("mapped agreement >= 0.85", "= 0.91");
+// (b) plan/target wording sits between "mapped agreement" and the value,
+// WORD-BOUNDED (should|target|goal|must|expected|required|bar|threshold|
+// gate|…|below|under — round-9's un-anchored /reach/ substring matched the
+// RESULT verb "reached" and false-blocked "mapped agreement reached **0.85**",
+// a recorded result; "reached" is deliberately absent so "should/must reach"
+// still plans via the modal); (c) for the bar-constant 0.85 ONLY, the same
+// sentence marks the value AS the bar — a post-nominal bar noun ("0.85 is
+// the bar", "(the gate bar)", "the 0.85 bar") or tail wording binding a
+// DIFFERENT decimal as the measurement ("0.85 — the previous run measured
+// 0.284 below the bar"). A capture COUNTS as a measured figure when it is
+// explicitly measured (measurement verb tightly bound before the value —
+// "measured mapped agreement **0.85**" — or an outcome parenthetical —
+// "(bar met)"/"(met)"/"(pass)") or is a bare at-bar declaration with no
+// bar/plan wording in its sentence: the (c) check's purpose is to catch a
+// section that records NO measurement while quoting the bar; a declared
+// "mapped agreement **0.85**" IS the runbook's recorded verdict sitting at
+// the >= 0.85 contract and passes without #2009 (round-8 at-bar goal). The
+// real runbook phrasings — "mapped agreement 0.284", "| **MAPPED
+// agreement** | **0.284 (gate ≥ 0.85) → FAIL** |" — are unaffected: the
+// "(gate ≥ 0.85)" ANNOTATION after a measured value continues with an
+// operator + decimal, so it never reads as a restatement.
 function cMeasuredFigures(sec) {
   const out = [];
-  const re = /mapped agreement([\s\S]{0,80}?)([01]?\.[0-9]+)/gi;
-  let m;
-  while ((m = re.exec(sec)) !== null) {
-    const val = Number(m[2]);
-    if (!Number.isFinite(val)) continue;
-    // trailing comparison operator directly before the value -> the bar operand
-    if (/(?:>=|<=|[><=≥≤])\s*$/.test(m[1])) continue;
-    // The bar constant is skipped ONLY when the capture is a RESTATEMENT of
-    // the >= 0.85 threshold, not a recorded result sitting AT the bar
-    // (round-9). A restatement is (a) target/plan wording in the gap BEFORE
-    // the value — the same plan-wording list the (a) gate's
-    // hasAccuracyMeasure uses (should|target|goal|reach|required|must|
-    // expected|aim|planned|bar|threshold|ceiling|at least|>=|≥) plus the
-    // round-8 bar terms ("must hit 0.85", "target 0.85", "expected 0.85") —
-    // or (b) a POST-NOMINAL bar noun naming the constant right after the
-    // value ("is the 0.85 bar", "a 0.85 threshold"). The post-nominal scan
-    // cannot cross an opening parenthesis: a noun inside a parenthetical
-    // outcome ("(bar met)", "(threshold exceeded)") annotates a measured
-    // result, and an EXPLICIT measured result (measurement wording in the
-    // ~60 chars before the capture — "measured mapped agreement **0.85**") —
-    // always counts: it sits AT the pass threshold — >= 0.85 needs no #2009 —
-    // so it must be recorded as a figure (round-8 goal).
-    if (val === 0.85) {
-      const head = sec.slice(Math.max(0, m.index - 60), m.index);
-      const tail = sec.slice(m.index + m[0].length, m.index + m[0].length + 40);
-      const explicitResult = /measured|recorded|scored|\bresult\b/i.test(head) ||
-        /\((?:bar|threshold|gate|target)\b[^)]{0,24}?\b(?:met|passed|exceeded|satisfied|achieved|hit|cleared|reached)\)/i.test(tail);
-      if (!explicitResult) {
-        const planWording = /should|target|goal|reach|required|must|expected|aim|planned|bar|threshold|gate|ceiling|at least|minimum|or higher|or above|restatement|>=|≥|below|under/i.test(m[1]);
-        const postNominal = /^[^0-9\n(]{0,40}?\b(?:bar|threshold|target|gate|requirement)\b/i.test(tail);
-        if (planWording || postNominal) continue;
+  for (const sent of splitSentences(sec)) {
+    const re = /mapped agreement([\s\S]{0,80}?)([01]?\.[0-9]+)/gi;
+    let m;
+    while ((m = re.exec(sent)) !== null) {
+      const val = Number(m[2]);
+      if (!Number.isFinite(val)) continue;
+      // trailing comparison operator directly before the value -> the bar
+      // operand ("mapped agreement >= 0.85", "= 0.91"), not a record
+      if (/(?:>=|<=|[><=≥≤])\s*$/.test(m[1])) continue;
+      // plan/target wording between the keyword and the value -> the value is
+      // a TARGET the run must hit, not this run's result. WORD-BOUNDED (see
+      // the classification note above for the "reached" fix).
+      if (/\b(?:should|target(?:s|ed|ing)?|goal|must|expected|required|requirement|aim(?:s|ed|ing)?|planned?|bar|threshold|gate|ceiling|minimum|at\s+least|or\s+higher|or\s+above|below|under|no\s+less\s+than|restatement)\b/i.test(m[1])) continue;
+      if (val === 0.85) {
+        // The bar constant is ambiguous: it may RESTATE the >= 0.85
+        // threshold or record a result AT the bar. Decide from the SAME
+        // sentence as the capture.
+        const tail = sent.slice(m.index + m[0].length, m.index + m[0].length + 160);
+        const head = sent.slice(Math.max(0, m.index - 30), m.index);
+        // (1) explicit-result override: a measurement verb bound to THIS
+        // phrase ("measured mapped agreement **0.85**") or an outcome
+        // parenthetical ("(bar met)", "(met)", "(pass)") — the 0.85 IS the
+        // recorded at-bar figure. (The tight 30-char verb binding keeps a
+        // measurement verb from an EARLIER sentence — "Measured … 0.284 last
+        // run. mapped agreement **0.85** …" — from upgrading a bar mention.)
+        const explicitMeasured = /\b(?:measured|recorded|scored|reported|observed)\b|\bresult\b/i.test(head + m[1]);
+        const outcomeParen = /\((?:the\s+)?(?:0?\.?85\s+)?(?:bar|threshold|gate|target)\s+(?:met|passed|exceeded|satisfied|achieved|hit|cleared|reached)\s*\)|\((?:met|pass|passed|at\s+(?:the\s+)?bar|bar\s+met|bar\s+passed)\)/i.test(tail);
+        if (explicitMeasured || outcomeParen) {
+          out.push(val);
+          continue;
+        }
+        // (2) bar-restatement signals in the same sentence — post-nominal
+        // bar noun or a tail measurement binding a DIFFERENT decimal.
+        if (cTailMarksBarRestatement(tail, val)) continue;
+        // (3) default: a bare at-bar declaration IS the recorded verdict
+        // (the >= 0.85 contract holds; no #2009 needed).
+        out.push(val);
+        continue;
       }
+      out.push(val);
     }
-    out.push(val);
   }
   return out;
+}
+// Bar-restatement tail signals for an at-bar (0.85) capture, scanned in the
+// SAME sentence only (bounded windows; splitSentences already isolated the
+// capture's sentence):
+//   (a) a post-nominal bar noun naming the captured value as the threshold —
+//       "0.85 is the bar", "the 0.85 bar", "(the gate bar)", "mapped
+//       agreement is the 0.85 bar …". Only punctuation/articles/adjectives
+//       may sit between the value and the noun (no digit, no comparison
+//       operator), and no comparison operator + decimal may FOLLOW the noun:
+//       "(gate ≥ 0.85) → FAIL" is an ANNOTATION on a measured value, so it
+//       never matches a restatement.
+//   (b) tail wording binding a DIFFERENT decimal as the run's measurement —
+//       "… the previous run measured 0.284 below the bar": the measured
+//       figure is bound to another number, so the captured 0.85 is the
+//       quoted bar, not the record.
+function cTailMarksBarRestatement(tail, captured) {
+  const noun = /^(?:(?![0-9<>=≥≤\n])[\s\S]){0,90}?\b(?:the\s+)?(?:0?\.?85\s+)?(?:gate\s+)?(?:bar|threshold|gate|ceiling|requirement|minimum)\b/i.exec(tail);
+  if (noun) {
+    const after = tail.slice(noun.index + noun[0].length, noun.index + noun[0].length + 60);
+    if (!/[<>≥≤=]\s*[01]?(?:\.\d+|\d)/.test(after)) return true;
+  }
+  const bound = /(?:measured|recorded|scored|result|reported|observed)\b[^.!?\n]{0,80}?([01]?\.[0-9]+)/i.exec(tail);
+  return !!bound && Number(bound[1]) !== captured;
 }
 // An AFFIRMATIVE #2009 mention inside a section: the token counts only when
 // at least one SENTENCE containing #2009 records it affirmatively. Negation
 // is SENTENCE-scoped and ISSUE-BINDING (round-9): a mention is negated only
 // when the sentence names the follow-up as not needed / not existing /
-// waived / superseded / closed ("No #2009 is needed (issue waived).",
-// "#2009 is not required", "#2009 was superseded by #21xx", "shipped
-// without #2009", "#2009 closed as wontfix"). A bare negator word anywhere
-// in a flat char radius is NOT enough — unrelated prose in the same section
-// ("No annotation work was done this cycle.") or a parenthetical sitting
-// far past the token ("(no product-side flip smuggled into the gate)")
-// must never negate a genuine OPEN record (the round-8 flat ±60/40 window
-// false-blocked both).
+// waived / superseded / closed ("No tracked follow-up **#2009** is needed for
+// this branch.", "#2009 … not required", "…#2009 … was waived by the product
+// decision", "shipped without #2009", "#2009 closed as wontfix"). A bare
+// negator word anywhere in a flat char radius is NOT enough — unrelated
+// prose in the same section ("No annotation work was done this cycle.") or
+// a parenthetical sitting far past the token ("(no product-side flip
+// smuggled into the gate)") must never negate a genuine OPEN record.
 function issueSentences(sec) {
-  // Sentence boundaries: . ! ? optionally followed by markdown bold, then
-  // whitespace + a capital/digit/(/#/* — mootSentences' class extended with
-  // # and * so a sentence that STARTS with "#2009 …" or "**No …" splits
+  // Shared sentence boundaries — see splitSentences(): a sentence that
+  // STARTS with "#2009 …", "**No …" or "(#2009 …" after a terminator splits
   // cleanly instead of gluing onto the previous sentence.
-  const out = [];
-  const re = /[.!?](?:\*{2})?(?=\s+[A-Z0-9(#*])/g;
-  let last = 0;
-  let m;
-  while ((m = re.exec(sec)) !== null) {
-    out.push(sec.slice(last, m.index + m[0].length).trim());
-    last = re.lastIndex;
-  }
-  out.push(sec.slice(last).trim());
-  return out.filter((s) => s.length > 0);
+  return splitSentences(sec);
 }
 function sentenceNegatesIssue2009(s) {
   return [
-    // "No #2009 is needed (issue waived)." / "no #2009 was filed this cycle"
-    /\bno\s+(?:#2009|follow-?up\s+#2009|issue\s+#2009)\b/i,
-    // "#2009 is/… not|never|no longer needed|required|waived|…" ("#2009 not
-    // required", "#2009 no longer applicable", "#2009 never tracked")
-    /#2009\b[^.!?\n]{0,60}?\b(?:is|was|has\s+been|remains)?\s*(?:not|never|no\s+longer)\s+(?:needed|required|waived|warranted|necessary|applicable|tracked|filed|opened)\b/i,
-    // "#2009 was waived / superseded (by …) / dropped / removed" — the
-    // follow-up is recorded as no longer an open obligation
-    /#2009\b[^.!?\n]{0,80}?\b(?:waived|superseded|dropped|removed|unneeded|unnecessary)\b/i,
-    // "#2009 was closed (as wontfix) / resolved" — direct predicate on the
-    // issue only, so an unrelated "closed" in the sentence cannot negate
-    /#2009\b[^.!?\n]{0,60}?\b(?:is|was|has\s+been|gets?|remains)?\s*(?:closed|resolved)\b(?:[^.!?\n]{0,20}?\bas\s+(?:won'?t|wont|not)\s+fix\b)?/i,
-    // "…merged/shipped/passed … without #2009"
-    /\bwithout\b[^.!?\n]{0,40}\b#2009\b/i,
+    // Determiner negation binding the issue noun phrase — round-10 accepts
+    // the runbook's canonical NP with its adjectives and markdown bold:
+    // "No #2009 is needed (issue waived).", "no follow-up #2009 was filed
+    // this cycle", "No tracked follow-up **#2009** is needed for this
+    // branch." (round-9 required `no` DIRECTLY before the issue token and
+    // missed the "tracked" adjective).
+    /\bno\s+(?:\*\*)?(?:tracked\s+)?(?:follow-?up\s+)?(?:issue\s+)?(?:\*\*)?#2009(?:\*\*)?\b/i,
+    // Negated-state predicate ON the issue, scanned over the WHOLE isolated
+    // sentence (round-10: the runbook's standard long parenthetical
+    // annotation after #2009 — "(#2009 (\"fix(product): …\", opened
+    // 2026-08-30, owner epistemic-team) …" — sits BETWEEN the issue and its
+    // predicate, so a fixed char window died before reaching it): "#2009 …
+    // is/… not|never|no longer needed|required|waived|applicable|…".
+    /#2009\b[\s\S]{0,240}?\b(?:(?:is|was|has\s+been|remains|gets?)\s+)?(?:not|never|no\s+longer)\s+(?:needed|required|waived|warranted|necessary|applicable|tracked|filed|opened|wanted)\b/i,
+    // Disposition/waiver predicate applied to the issue as its SUBJECT — the
+    // predicate must FOLLOW #2009, so "the old detector default was
+    // superseded by #2009" (verb before the issue) affirms the issue's
+    // existence and never negates it. Whole-sentence scan with the same
+    // long-annotation allowance: "…tracked follow-up #2009 (\"…\", opened
+    // 2026-08-30, owner epistemic-team) was waived by the product decision."
+    /#2009\b[\s\S]{0,240}?\b(?:(?:is|was|has\s+been|gets?|remains)\s+)?(?:waived|superseded|dropped|removed|withdrawn|closed|resolved|rejected|abandoned|unneeded|unnecessary)\b/i,
+    // "…merged/shipped/passed … without #2009" — round-10 fixes round-9's
+    // dead boundary: `#` is not a word char, so `\b#2009` could never match;
+    // the required split is `#2009\b` (boundary AFTER the digits).
+    /\bwithout\b[^.!?\n]{0,40}#2009\b/i,
   ].some((re) => re.test(s));
 }
 function hasAffirmativeIssue2009(sec) {
@@ -298,6 +372,26 @@ function hasAffirmativeIssue2009(sec) {
     if (/#2009/.test(s) && !sentenceNegatesIssue2009(s)) return true;
   }
   return false;
+}
+// Sentence terminators shared by every sentence-scoped classification in
+// this file (the #2009 mention scan above, the (c) measured-vs-bar
+// classifier, and the MOOT-governance scan below): a . ! ? optionally
+// closing markdown bold, then whitespace followed by a sentence-initial
+// char — a capital, a digit, `(` (a parenthetical start), `#` (an issue-ref
+// start: "#2009 …") or `*` (a bold/italic start: "**No …"). Requiring the
+// whitespace keeps decimals ("0.85"), dates ("2026-08-30") and dotted file
+// names ("detector_parity.py --gate") from splitting mid-token.
+function splitSentences(text) {
+  const out = [];
+  const re = /[.!?](?:\*{2})?(?=\s+[A-Z0-9(#*])/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    out.push(text.slice(last, m.index + m[0].length).trim());
+    last = re.lastIndex;
+  }
+  out.push(text.slice(last).trim());
+  return out.filter((s) => s.length > 0);
 }
 const cSections = newestEraSections(/^### \(c\) Detector-parity/);
 if (cSections.length === 0) {
@@ -394,19 +488,12 @@ const productDecision = governingPd.map((b) => b.text).join("\n");
 // wins" ordering closes the r3c repro (a rescue sentence far below the MOOT
 // phrase is honored) and the newest-governing-block model closes r3b.
 function mootSentences(text) {
-  const out = [];
-  // sentence boundary: . ! ? optionally followed by ** (markdown bold) then
-  // whitespace + a capital/`(/digit. A decimal point (0.9) or date (08-30)
-  // is not a boundary.
-  const re = /[.!?](?:\*{2})?(?=\s+[A-Z0-9(])/g;
-  let last = 0;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    out.push(text.slice(last, m.index + m[0].length).trim());
-    last = re.lastIndex;
-  }
-  out.push(text.slice(last).trim());
-  return out.filter((s) => s.length > 0);
+  // Sentence boundaries are the SHARED splitSentences() boundary (see its
+  // definition above): . ! ? optionally closing ** (markdown bold) then
+  // whitespace + a capital/`(/digit — with the round-10 extension so a
+  // sentence that STARTS with "#…" or "**…" also splits cleanly. A decimal
+  // point (0.9) or date (08-30) is never a boundary.
+  return splitSentences(text);
 }
 function affirmativeMoot(text) {
   if (!text) return false;
