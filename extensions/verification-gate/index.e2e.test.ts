@@ -20,7 +20,7 @@ import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 // ── Isolation: bridge lives under a temp HOME (never touch the real one) ──
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "vgate-e2e-"));
@@ -42,6 +42,42 @@ function sha(text: string): string {
 }
 function git(repo: string, args: string): string {
   return execSync(`git ${args}`, { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim();
+}
+
+// ── D1 deterministic sentinel bridge (#482) ──────────
+// Fixed PASS-shaped bytes planted immediately before an exempt op so the D1 allow-only
+// byte-identity assert is ordering-independent (the old null-tolerant both-absent compare
+// degraded to null===null whenever prior scenarios hadn't written the bridge). Foreign
+// root → inert to every recovery (index.ts drops entries whose root ≠ the worktree root),
+// inert to single-slot overwrite, and no post-39 scenario reads pre-38 bridge bytes.
+// ⛔ The sentinel occupies the single bridge slot from scenario 38 until scenario 41's
+// first real PASS write (Leg-A) — do NOT insert a bridge-READING scenario between 38 and
+// 41 without reseeding a real bridge first.
+const D1_SENTINEL_ROOT = "/__vgate-e2e-sentinel-root__";
+const D1_SENTINEL_JSON = JSON.stringify({
+  status: "PASS",
+  verified_files: [{ path: `${D1_SENTINEL_ROOT}::sentinel`, hash: "0123456789abcdef".repeat(4) }], // fixed 64-hex
+  timestamp: "2026-01-01T00:00:00.000Z", // fixed ISO — never Date.now()
+});
+function seedD1Sentinel(bridgePath: string): void {
+  mkdirSync(dirname(bridgePath), { recursive: true });
+  writeFileSync(bridgePath, D1_SENTINEL_JSON, "utf8");
+}
+function assertD1BridgeUntouched(bridgePath: string, repoRoot: string, label: string): void {
+  const after = existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null;
+  // Byte-identity is the PRIMARY detector (throws BEFORE the parse below — when the
+  // byte-equal passes, the content IS the sentinel, so the parse loop is defense-in-depth
+  // that can only ever see the sentinel's own foreign-root entry; it exists to catch a
+  // FUTURE loosening of the byte check to a per-field compare). Keep the parse AFTER the
+  // throwing equal — never reorder.
+  equal(after, D1_SENTINEL_JSON,
+    `${label} — exempt op must leave the deterministic D1 sentinel bridge byte-identical (allow-only: no verifiedSet/bridge writes)`);
+  const repoReal = realpathSync(repoRoot);
+  for (const vf of (JSON.parse(after as string).verified_files ?? [])) {
+    const sepIdx = vf.path.indexOf("::");
+    ok(sepIdx === -1 || vf.path.slice(0, sepIdx) !== repoReal,
+      `${label} — no verified_files entry may be keyed under the scenario repo root (${repoReal}): ${vf.path} would survive recovery`);
+  }
 }
 
 // #285: audit-trail reader (HOME is redirected to TEST_ROOT at load, so the
@@ -1385,12 +1421,13 @@ async function main() {
     await fire("session_start", {});
     const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
     const bypassBefore = readAuditLines().filter((l) => l.event === "gate_bypass").length;
-    // D1 allow-only snapshot (taken BEFORE the commit so the check is self-
-    // contained — no ordering dependency on earlier scenarios having written
-    // the bridge). This repo NEVER has a verifier dispatch, so a byte change
-    // (or a file appearing) across the exempt commit is contamination.
     const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
-    const bridgeBefore = existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null;
+    // #482: seed the deterministic sentinel AFTER session_start and IMMEDIATELY BEFORE
+    // the exempt op — byte-identity is then ordering-independent and self-contained (the
+    // old pre/post snapshot compare degraded to null===null when prior scenarios never
+    // wrote the bridge). This repo NEVER has a verifier dispatch, so a byte change (or a
+    // file appearing) across the exempt commit is contamination.
+    seedD1Sentinel(bridgePath);
     const res = await fire("tool_call", {
       type: "tool_call", toolName: "bash",
       input: { command: "git commit -m docs", cwd: repo },
@@ -1401,11 +1438,9 @@ async function main() {
        "audit must record a gate_skip with reason content_shape_exempt");
     ok(audit.filter((l) => l.event === "gate_bypass").length === bypassBefore,
        "the skip must NOT add any gate_bypass entry (allow-only, no self-bless — D1)");
-    // Audit deltas alone cannot catch a self-blessing skip (a contamination
-    // regression emits gate_skip, not gate_bypass) — assert the durable
-    // registry channel directly: byte-identical bridge across the skip.
-    equal(existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null, bridgeBefore,
-       "exempt skip must leave the bridge byte-identical (allow-only, D1 — no verifiedSet/bridge writes)");
+    // Audit deltas alone cannot catch a self-blessing skip (a contamination regression
+    // emits gate_skip, not gate_bypass) — assert the durable registry channel directly.
+    assertD1BridgeUntouched(bridgePath, repo, "docs-only commit");
   });
 
   test("scenario 39 (#472): docs-only gh pr create unblocked (branch-diff path)", async () => {
@@ -1427,10 +1462,12 @@ async function main() {
     git(repo, `update-ref refs/remotes/origin/main ${baseSha}`);
     await fire("session_start", {});
     const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
-    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
-    const bridgeBefore = existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null;
     // `gh pr create` is NOT merge-scoped — its diff IS this branch's files
     // (computeBranchDiff). An all-docs branch diff hits mechanism (a).
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    // #482: deterministic sentinel seeded AFTER session_start and IMMEDIATELY BEFORE the
+    // exempt create — byte-identity ordering-independent (see scenario 38).
+    seedD1Sentinel(bridgePath);
     const res = await fire("tool_call", {
       type: "tool_call", toolName: "bash",
       input: { command: "gh pr create --title t", cwd: repo },
@@ -1439,10 +1476,9 @@ async function main() {
     ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
        "audit must record the content_shape_exempt skip for the create");
     // D1 allow-only on the branch-diff surface: this repo never dispatched, so
-    // the bridge must be byte-identical across the exempt create (scenario 38
-    // pins the staged-diff surface; this pins computeBranchDiff).
-    equal(existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null, bridgeBefore,
-       "exempt gh pr create must leave the bridge byte-identical (allow-only, D1)");
+    // the sentinel bridge must be byte-identical across the exempt create
+    // (scenario 38 pins the staged-diff surface; this pins computeBranchDiff).
+    assertD1BridgeUntouched(bridgePath, repo, "docs-only gh pr create");
     // Mixed-branch denial (mechanism (a) on the branch-diff surface): a branch
     // carrying docs AND code must block on `gh pr create` — only an all-docs
     // branch is exempt. Scenarios 40/41/42 pin the staged-diff half, 44-leg4
@@ -1575,7 +1611,9 @@ async function main() {
     ok(sweep1.reason.includes("README.md"), "-am block reason names the staged docs (unverified)");
     ok(!/Hash mismatch/.test(sweep1.reason),
        "re-edited staged docs must read as UNVERIFIED, never hash-mismatch — if the Leg-A exemption had registered README.md (D1 contamination), the r2 edit would stale-hash against it");
-    ok(git(repo, "status --porcelain").includes(" M src/app.ts"), "the -a sweep did NOT commit the dirty code file (working tree still dirty)");
+    // #482: the sweep1 porcelain assert is DELETED — a BLOCKED -am can never execute, so
+    // the working tree was invariant regardless of verdict (tautological). The real
+    // porcelain evidence now lives on the ALLOWED bare commit below (which executes).
     const sweep2 = await fire("tool_call", {
       type: "tool_call", toolName: "bash",
       input: { command: 'git commit -am"x"', cwd: repo }, // attached -am spelling (cycle-3 P1 repro)
@@ -1586,7 +1624,19 @@ async function main() {
       input: { command: "git commit -m x", cwd: repo },
     });
     equal(bare, undefined, "bare git commit -m over ONLY staged docs is exempt");
-    ok(git(repo, "status --porcelain").includes(" M src/app.ts"), "code file is STILL uncommitted after the bare docs commit (D2: -a and bundles never exempt)");
+    // #482: make the allowed bare docs commit REAL (Leg-A pattern) and pin the exact
+    // porcelain — the old post-block porcelain assert was tautological (a blocked -am can
+    // never execute, so the tree was invariant). The real commit proves the docs exemption
+    // committed README.md ONLY and left the dirty UNSTAGED src/app.ts untouched (D2: -a
+    // sweeps and bundles never ride the docs exemption).
+    git(repo, "commit -m x"); // execute the allowed docs commit for real
+    // Raw porcelain read — the git() helper trims, which would eat the leading column
+    // space of the two-column status (" M " = worktree-modified, not "M " staged); the
+    // exact-porcelain pin needs the RAW bytes: exactly one line, no staged entries, no
+    // untracked files.
+    const porcelain = execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    equal(porcelain, " M src/app.ts\n",
+       "real bare docs commit must commit README.md only — raw porcelain exactly ' M src/app.ts' (dirty unstaged src/app.ts untouched; D2: -a sweeps and bundles never ride the docs exemption)");
   });
 
   test("scenario 42 (#472): build-template boundary — public/ stays gated, website/ is exempt", async () => {
