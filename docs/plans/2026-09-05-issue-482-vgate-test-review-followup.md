@@ -158,9 +158,12 @@ invariance; it still guarded the Leg-A exemption/porcelain state at sweep time, 
 hook-decision pins cover the rejection); after the ALLOWED
 bare `git commit -m x` verdict, execute `git(repo, "commit -m x")` for real (the Leg-A
 pattern at L1544/L1565) and assert exact porcelain. Why: the real commit turns a
-harness-only verdict into real index state, so the exact-porcelain assert now proves the
-docs exemption committed README.md ONLY and never rode `-a` or dragged the dirty
-unstaged `src/app.ts`. Option (2) (index-object immutability across blocked sweeps via
+harness-only verdict into real index state, so the exact-porcelain assert now pins the
+end-to-end outcome of the gate-approved docs commit: README.md ONLY lands as a commit
+and the dirty unstaged `src/app.ts` stays untouched (a bare `commit -m` commits only the
+index by git invariant — the D2 REJECTION of `-a` sweeps and bundles is pinned by the
+sweep1/sweep2 `block === true` hook-decision asserts, which red first on any such
+regression). Option (2) (index-object immutability across blocked sweeps via
 `write-tree` snapshots) adds plumbing to prove a property the harness architecture already
 guarantees (a BLOCKED tool_call never executes — there is no git process to mutate
 anything); **(2) would have been better if** the gate ever executed commands on block
@@ -797,7 +800,7 @@ function assertD1BridgeUntouched(bridgePath: string, repoRoot: string, label: st
     }
   }
   equal(after, D1_SENTINEL_JSON,
-    `${label} — exempt op must leave the deterministic D1 sentinel bridge byte-identical (allow-only: no verifiedSet/bridge writes)`);
+    `${label} — exempt op must leave the deterministic D1 sentinel bridge byte-identical (allow-only: no durable bridge write; in-memory verifiedSet contamination is pinned by scenario 41's no-hash-mismatch + still-block asserts)`);
 }
 ```
 
@@ -863,8 +866,10 @@ Keep the sweep1/sweep2 hook-decision pins.
     // #482: make the allowed bare docs commit REAL (Leg-A pattern) and pin the exact
     // porcelain — the old post-block porcelain assert was vacuous-but-green: a blocked -am
     // never executes, so it could only ever pass regardless of verdict. The real commit
-    // proves the docs exemption committed README.md ONLY and left the dirty UNSTAGED
-    // src/app.ts untouched (D2: -a sweeps and bundles never ride the docs exemption).
+    // executes the gate-approved docs exemption end-to-end: README.md r2 lands as a commit
+    // and the dirty UNSTAGED src/app.ts stays untouched (bare commit -m commits only the
+    // index by git invariant — the D2 REJECTION of -a sweeps and bundles is pinned by the
+    // sweep1/sweep2 block asserts above, which red first on any such regression).
     git(repo, "commit -m x"); // execute the allowed docs commit for real
     // Raw porcelain read — the git() helper trims, which would eat the leading column
     // space of the two-column status (" M " = worktree-modified, not "M " staged); the
@@ -872,7 +877,7 @@ Keep the sweep1/sweep2 hook-decision pins.
     // untracked files.
     const porcelain = execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 });
     equal(porcelain, " M src/app.ts\n",
-       "real bare docs commit must commit README.md only — raw porcelain exactly ' M src/app.ts' (dirty unstaged src/app.ts untouched; D2: -a sweeps and bundles never ride the docs exemption)");
+       "real bare docs commit must commit README.md only — raw porcelain exactly ' M src/app.ts' (dirty unstaged src/app.ts untouched — end-to-end outcome of the gate-approved docs commit; D2 sweep rejection is pinned by the sweep1/sweep2 block asserts above)");
   });
 ```
 
