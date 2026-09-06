@@ -466,7 +466,7 @@ classify_candidates() {
         case "$stat" in Z*) continue ;; esac
         # own-session veto (PI_SESSION_ID hard gate)
         if [ -n "${PI_SESSION_ID:-}" ]; then
-            if printf '%s\n' "$(store_records_for_pid "$pid")" | grep -qE "	${PI_SESSION_ID}(\t|$)"; then
+            if printf '%s\n' "$(store_records_for_pid "$pid")" | grep -qE "	${PI_SESSION_ID}(	|$)"; then
                 [ "$emit" = 1 ] && say "$pid tty=$tty SKIP own-session (PI_SESSION_ID match)"
                 continue
             fi
