@@ -827,12 +827,23 @@ export default function (pi: ExtensionAPI) {
           tier = fs.readFileSync(ISSUE_COMPLEXITY_FILE, "utf8").trim().toLowerCase();
         }
       } catch (_err) { /* best-effort */ }
+      // #516: BOTH block returns below must emit a durable audit entry — the
+      // pre-#516 dispatch-count block wrote console only (no appendJsonl),
+      // unlike the merge-registry gate's logMergeGateDecision trail, so
+      // blocked-op frequency/attribution was unreconstructible from
+      // gate-events.jsonl. Emit gate_block + reason no_reviewers_dispatch + the
+      // TIER_RULE-vocabulary tier (micro | standard | complex | unknown |
+      // unlabeled; marker-absent maps to "unlabeled") so the tier of every
+      // blocked op — the docs-only micro class (#485) included — is
+      // reconstructible. Pinned by index.test.ts T1 (micro) + T1b (others).
       if (tier === "micro") {
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
+        logGateEvent("gate_block", { reason: "no_reviewers_dispatch", tier: "micro" }); // #516: durable audit
         return { block: true, reason: MICRO_BLOCK_MESSAGE };
       }
 
       console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched");
+      logGateEvent("gate_block", { reason: "no_reviewers_dispatch", tier: tier === "" ? "unlabeled" : tier }); // #516: durable audit
       return { block: true, reason: BLOCK_MESSAGE };
     });
 
