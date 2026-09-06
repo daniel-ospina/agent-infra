@@ -37,8 +37,10 @@ verified green: unit suite `197 passed / 0 failed` (worktree run), e2e suite has
   - **Deployed physical copy** (`~/.pi/agent/extensions/verification-gate` + the
     independently-synced `~/.pi/agent/skills` tree) must KEEP soft-skipping with current
     behavior in (a) the current source checkout and (b) the current deployed layout.
-  - **Skip arm differentiates**: `deployed` (informative skip — doc present but fence-less)
-    vs `unknown` (LOUD warning, never silent — the code-only-archive case FAILS CLOSED).
+  - **Skip arm differentiates**: `deployed` (informative skip — pi-home LOCATION soft-skips
+    regardless of doc generation (rule 2), or a fence-less sibling doc outside pi-home
+    (rule 5)) vs `unknown` (LOUD warning, never silent — the code-only-archive case FAILS
+    CLOSED).
   - **Activation canary** added that does NOT red legitimate deployed runs (gated on
     git/CI presence).
 - **T2** — deterministic PASS-shaped sentinel bridge: fixed bytes
@@ -313,7 +315,7 @@ Replace the current pre-resolve skip arm (comment at L1496-1502 + `if (!isSource
   // its fence state (fence-less → rule 5 deployed soft-skip; cycle-2 R1-F2); doc-less
   // code-only archives FAIL CLOSED (unknown, loud).
   const { layout, docText } = probeGuardLayout(
-    DRIFT_GUARD_05_FENCE_MARKER, // shared const — single source of truth with the canary
+    DRIFT_GUARD_05_FENCE_MARKER, // shared const — single source of truth with the extraction + canary
     "../../skills/commit-workflow/workflow/05-cleanup.md",
     "../../skills/commit-workflow/workflow/05-cleanup.md",
     "skills/commit-workflow/workflow/05-cleanup.md",
@@ -849,7 +851,7 @@ Keep the mixed-branch denial leg and its asserts untouched.
 (a) DELETE the sweep1-era porcelain assert — it was vacuous-but-green, not provably
 invariant: a blocked `-am` never executes, so the assert could only ever pass regardless of
 verdict (it still guarded the Leg-A exemption/porcelain state at sweep time, but the
-hook-verdict pins below already prove the sweep is rejected — code-review F9 wording).
+hook-verdict pins above already prove the sweep is rejected — code-review F9 wording).
 Historical deleted line:
 `ok(git(repo, "status --porcelain").includes(" M src/app.ts"), "the -a sweep did NOT commit the dirty code file (working tree still dirty)");`
 Keep the sweep1/sweep2 hook-decision pins.
@@ -952,9 +954,12 @@ body and this plan instead of the workflow comment.
   default-branch, real-homedir path — still not committed: a machine-dependent default assert
   stays deliberately dropped). A CI-without-git run whose doc is
   fence-less classifies `deployed` (rule 5) — the canary logs a consistency line and returns
-  (guards soft-skip in agreement; R2-1) — now gated on `probe.fencePresent === false`
-  (code-review F5): a deployed verdict with a FENCED doc (rule-4-under-CI regression) falls
-  through and reds the `equal(layout, "source")` instead of being masked by the log. In deployed/unknown runs it skips with an explicit
+  (guards soft-skip in agreement; R2-1) — now gated on `docText !== null &&
+  probe.fencePresent === false` (code-review F5's fence premise + cycle-2 fixer B2's
+  doc-resolvable premise): a doc-null deployed verdict (rule-3 regression) and a FENCED-doc
+  deployed verdict (rule-4-under-CI regression) both fall through so
+  `equal(layout, "source")` reds them; only a genuinely fence-less RESOLVABLE doc (rule 5)
+  returns at the arm. In deployed/unknown runs it skips with an explicit
   activation-gate log line (never red). Rules 2/5/6 REAL-wiring paths remain sim-B/C-verified
   (not CI-reachable in-repo: pi-home and doc-less layouts cannot be staged from a git checkout
   — documented residual); the location decision is additionally pinned by the classifier's
