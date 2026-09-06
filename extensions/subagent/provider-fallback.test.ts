@@ -83,6 +83,7 @@ const succeed = () => { writeEvent(successMsg); process.exitCode = 0; };
 const failExhaustion = () => { writeEvent(failMsg); fs.writeSync(2, '402 {"message":"Insufficient Balance"}\\n'); process.exitCode = 1; };
 const failConnection = () => { fs.writeSync(2, "Connection error.\\n"); process.exitCode = 1; };
 const failNonProvider = () => { fs.writeSync(2, "TypeError: x is not a function\\n    at foo (bar.js:1:2)\\n"); process.exitCode = 1; };
+const failBadModel = () => { writeEvent({ ...failMsg, model: 42 }); fs.writeSync(2, '402 {"message":"Insufficient Balance"}\\n'); process.exitCode = 1; };
 const hold = () => { setInterval(() => {}, 1 << 30); };
 if (mode === "hold-attempt-1") {
   if (attempt === "1") hold(); else failExhaustion();
@@ -92,6 +93,8 @@ if (mode === "hold-attempt-1") {
   succeed();
 } else if (attempt === "1") {
   succeed();
+} else if (mode === "bad-model") {
+  failBadModel();
 } else if (mode === "connection") {
   failConnection();
 } else if (mode === "nonprovider") {
@@ -316,6 +319,23 @@ test("exhaustion + UNSET fallback env (same-account default): no doomed duplicat
 	equal(r.stopReason, "error");
 	equal(r.fallbackTo, undefined, "no fallback annotation — no fallback happened");
 	equal(readSpawnLog(logPath).length, 1, "exactly ONE spawn (attempt 0) — no doomed duplicate");
+	fs.rmSync(cwd, { recursive: true, force: true });
+	fs.rmSync(logPath, { force: true });
+});
+
+test("child emits a NON-STRING msg.model: no crash — gate falls back to agent.model (round-4 typeof guard)", async () => {
+	// Unvalidated child JSON: model: 42 must never reach modelProviderFamily's
+	// .indexOf. With the guard the fill is skipped → attempt0Model stays
+	// agent.model (unset) → explicit fallback env (default here) → NOT doomed →
+	// the recovery still fires.
+	const cwd = makeProjectCwd([{ name: "test-agent" }]);
+	const logPath = path.join(tmpRoot, `log-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+	const resp = await runTool(singleParams(cwd, `pfbt-badmodel-${Date.now()}`), { cwd, logPath, mode: "bad-model" });
+	const r = resp.details.results[0];
+	equal(r.exitCode, 0, "dispatch completes and recovers on the fallback — no crash, no doomed skip");
+	equal(r.fallbackTo, FALLBACK_MODEL);
+	ok(!resp.isError, "no error from the dispatch itself");
+	equal(readSpawnLog(logPath).length, 2, "attempt 0 (bad model) failed provider-style → fallback attempt 1 succeeded");
 	fs.rmSync(cwd, { recursive: true, force: true });
 	fs.rmSync(logPath, { force: true });
 });

@@ -58,14 +58,20 @@ Gating (all must hold or → `"none"`):
    scanned):
    - **TEXT PRE-CLEAN** (both passes) — `stripLocalLines` drops WHOLE lines that
      reference loopback/unix targets UNLESS the line reads as a provider transport
-     with a local proxy HOP: a scheme-fronted loopback authority
-     (`http://localhost:8000/api` — the /api is the LOCAL url's own path) is always
-     local; otherwise the line survives only when a strong transport token
-     (`https?|api|provider|upstream`) PRECEDES the loopback reference (a
+     with a local proxy HOP. Round-4 mechanics: INDENTED continuation lines (node's
+     real error+cause dumps: stack frames, `cause:`, `errno:`, `code:`, `address:`)
+     first FOLD into their parent line so a multi-line "TypeError: fetch failed …
+     cause: Error: connect ECONNREFUSED 127.0.0.1:5432" dump stays local-associated;
+     scheme-fronted local URLs (`http://localhost:8000/api` — host+port+path) are
+     removed WHOLE so their own api/http tokens never read as a provider transport;
+     then the line survives only when a strong transport token
+     (`https?|api|provider|upstream`) PRECEDES the remaining loopback reference (a
      "via/through <loopback>" hop reads after the provider host — "402 from
-     https://api.deepseek.com via localhost:8080"). Round-3: the round-2
-     any-token-on-line refinement re-admitted pure-local lines whose local URL
-     carried /api tokens — now closed.
+     https://api.deepseek.com via localhost:8080", incl. a scheme-full hop). Bare
+     `/var/run/*.sock` docker paths count as local targets. (Round-3 closed the
+     round-2 any-token-on-line refinement that re-admitted pure-local lines whose
+     local URL carried /api tokens; round-4 closed the canonical node multi-line
+     dump that leaked past line-scoped drops.)
    - **PHRASE scan on STRIPPED text** — first remove stack-frame tails
      (`[\w$@./:-]+:\d+(?::\d+)?` — `index.ts:402:11`, `loader:507:10`,
      `lib/api/request.js:402:11`, `src/provider.ts:507:10`), then match the text phrases
@@ -202,7 +208,7 @@ fallbackModel = getSubagentFallbackModel();      (resolved once)
 fallbackModelExplicit = SUBAGENT_FALLBACK_MODEL set non-empty
 result = await runAttempt(false)                 (attempt 0 — args/env byte-identical to today)
 willFallback = shouldFallbackDispatch({ classify(result), fallbackDisabled,
-                                        signalAborted, attempt0Model: agent.model,
+                                        signalAborted, attempt0Model: result.model ?? agent.model,
                                         fallbackModel, fallbackModelExplicit })
 if !willFallback && class == exhaustion && !disabled && !aborted:
     log to stderr: "[subagent] provider failure (exhaustion) not re-dispatched: ..."
@@ -323,7 +329,7 @@ invisible to them (each `runSingleAgent` call just returns a recovered result).
 | file | layer | covers |
 |---|---|---|
 | `extensions/subagent/index.test.ts` (extend) | unit | `classifyProviderFailure` (per class + positives: exit-0 + stopReason "error" in-band, cut with stderr signature → classifies per §1 always-scan, cut carrying an in-band `errorMessage` provider signature → classifies (genuine provider-death-then-signal), port-bearing transport positives `402 from api.deepseek.com:443`, `error 402 from https://api.deepseek.com:443`, `504 from https://proxy:8443`; negatives: success, agent-error text, unknown-agent, exit-0 output mentions, timeout, aborted, marker-less cut, realistic non-provider stderr: JS stack frame `index.ts:402:11`, node-internal frame `loader:507:10`, token-bearing module frames `lib/api/request.js:402:11` + `src/provider.ts:507:10` + `at getProvider (src/provider.ts:402:11)`, `Disk quota exceeded` (ENOSPC), error-object dump `code: 429` without transport token, duration/measurement text `api responded in 512ms` + `{"message":"done","elapsed":"500ms"}` + `upstream ok in 500ms`), `shouldFallbackDispatch` decision matrix (disable env, signal aborted, class none), `getSubagentFallbackModel` env resolution (default/override/blank), source-drift pins for orchestrator wiring |
-| `extensions/subagent/provider-fallback.test.ts` (NEW) | hermetic E2E (stub contract above) | 1. single-mode recovery: attempt 0 exhaustion-fail → attempt 1 success; assert success, `fallbackTo` set, `fallbackFrom`, `result.model === fallbackModel`, spawn log = 2 lines, TWO distinct cache dirs exist and returned `cachePath` = attempt-1's dir. 2. success-path regression: always-success stub → 1 spawn, NO `fallbackFrom`/`fallbackTo`. 3. non-provider failure negative: `nonprovider` mode → 1 spawn, no annotation (bug-crash must NOT latch, E2E). 4. single-mode double-failure (`always-fail` mode): stub fails both attempts → explicit failure + `fallbackFrom`/`fallbackTo` set, spawn log = 2, no attempt 2. 5. parallel-mode recovery (headline): N tasks, all fail attempt 0 / succeed attempt 1 → `successCount == N`, spawn log = 2N, each recovered result carries `fallbackTo`. 6. parallel always-fail (`always-fail` mode): N tasks fail both attempts → batch completes with N explicit per-dispatch failures, spawn log = 2N (recovery attempted per dispatch; no silent whole-batch loss). 7. chain continuation: step 1 recovers (fail→succeed), step 2 succeeds → chain completes 2/2 steps, spawn log = 3. 8. disable-env: `SUBAGENT_FALLBACK_DISABLE=1` + exhaustion mode → 1 spawn, no recovery. 9. abort during attempt 1 (`hold-attempt-1` mode): attempt 0 fails; attempt-1 stub appends its spawn-log line then sleeps; abort fired after the poller observes the attempt-1 line → attempt-1 killed → settles `stopReason "aborted"`, spawn count = 2, no attempt 2 (deterministic — abort lands during the attempt's settle, not the synchronous orchestrator window; attempt-1 log-before-sleep ordering closes the race). 10. connection-mode variant of row 1 (stderr-only signature path). 11. exhaustion + UNSET fallback env (same-account default): the §2 gate skips the doomed duplicate — 1 spawn, no annotation, honest explicit failure. Suite also clears the abort-test's losing 15s race guard timer so the suite exits immediately on the success path (code-review round: the un-cleared timer idled the suite ~15s/run). |
+| `extensions/subagent/provider-fallback.test.ts` (NEW) | hermetic E2E (stub contract above) | 1. single-mode recovery: attempt 0 exhaustion-fail → attempt 1 success; assert success, `fallbackTo` set, `fallbackFrom`, `result.model === fallbackModel`, spawn log = 2 lines, TWO distinct cache dirs exist and returned `cachePath` = attempt-1's dir. 2. success-path regression: always-success stub → 1 spawn, NO `fallbackFrom`/`fallbackTo`. 3. non-provider failure negative: `nonprovider` mode → 1 spawn, no annotation (bug-crash must NOT latch, E2E). 4. single-mode double-failure (`always-fail` mode): stub fails both attempts → explicit failure + `fallbackFrom`/`fallbackTo` set, spawn log = 2, no attempt 2. 5. parallel-mode recovery (headline): N tasks, all fail attempt 0 / succeed attempt 1 → `successCount == N`, spawn log = 2N, each recovered result carries `fallbackTo`. 6. parallel always-fail (`always-fail` mode): N tasks fail both attempts → batch completes with N explicit per-dispatch failures, spawn log = 2N (recovery attempted per dispatch; no silent whole-batch loss). 7. chain continuation: step 1 recovers (fail→succeed), step 2 succeeds → chain completes 2/2 steps, spawn log = 3. 8. disable-env: `SUBAGENT_FALLBACK_DISABLE=1` + exhaustion mode → 1 spawn, no recovery. 9. abort during attempt 1 (`hold-attempt-1` mode): attempt 0 fails; attempt-1 stub appends its spawn-log line then sleeps; abort fired after the poller observes the attempt-1 line → attempt-1 killed → settles `stopReason "aborted"`, spawn count = 2, no attempt 2 (deterministic — abort lands during the attempt's settle, not the synchronous orchestrator window; attempt-1 log-before-sleep ordering closes the race). 10. connection-mode variant of row 1 (stderr-only signature path). 11. exhaustion + UNSET fallback env (same-account default): the §2 gate skips the doomed duplicate — 1 spawn, no annotation, honest explicit failure. 12. child emits a NON-STRING `msg.model` (`model: 42`): no crash — the typeof-guarded fill is skipped, the exhaustion gate falls back to `agent.model`, recovery fires (round-4). Suite also clears the abort-test's losing 15s race guard timer so the suite exits immediately on the success path (code-review round: the un-cleared timer idled the suite ~15s/run). |
 
 No CI wiring in this issue: extensions/builtin-tools + subagent suites require the pi
 runtime packages + real `pi` binary, which the GitHub runner lacks (#498 tracks

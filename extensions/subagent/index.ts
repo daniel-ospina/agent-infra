@@ -194,7 +194,7 @@ function getFinalOutput(messages: Message[]): string {
 		const msg = messages[i];
 		if (msg.role === "assistant") {
 			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
+				if (part.type === "text" && typeof part.text === "string") return part.text;
 			}
 		}
 	}
@@ -502,12 +502,13 @@ const NUMERIC_ANCHOR = /(?:http|status|response|request|api|provider|upstream|me
  * "our status update: no credits left" must never latch. */
 const OUTPUT_PHRASE_ANCHOR = /(?:https?|api|provider|upstream)/i;
 
-/** Loopback/unix targets — local-dependency lines, never provider evidence. */
-const LOCAL_TARGET = /(?:127\.0\.0\.1|localhost|::1|unix:|0\.0\.0\.0)/i;
+/** Loopback/unix/socket targets — local-dependency lines, never provider evidence. */
+const LOCAL_TARGET = /(?:127\.0\.0\.1|localhost|::1|unix:|0\.0\.0\.0|\/var\/run\/[^\s:/]*\.sock)/i;
 
-/** A scheme-fronted loopback authority (`http://localhost:8000/api`) — the local
- * URL's own path may carry strong tokens; the target is still local. */
-const SCHEME_FRONTED_LOCAL = /https?:\/\/[^/\s]*(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])/i;
+/** A scheme-fronted loopback authority (`http://localhost:8000/api/v1`) — the local
+ * URL's own scheme+port+path may carry strong tokens (api/http…); the target is
+ * still local, so the WHOLE spelling is removed before the precede check. */
+const SCHEME_FRONTED_LOCAL = /https?:\/\/[^\s]*(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])[^\s]*/gi;
 
 /** Anchor window (chars, either direction) for phrase matches on the
  * composed-output channel (round-3: co-location, not anywhere-in-field). */
@@ -546,25 +547,36 @@ export function stripStackFrames(text: string): string {
 	return text.replace(/[\w$@./:-]+:\d+(?::\d+)?/g, "");
 }
 
-/** #496: strip LINES that reference loopback/unix targets UNLESS the line reads
- * as a provider transport with a local proxy HOP — a down localhost DB / docker
- * daemon / local MCP server is local-dependency noise (a doomed re-dispatch
- * cannot help it), but "402 from https://api.deepseek.com via localhost:8080"
- * (provider host FIRST, loopback hop after) keeps its genuine signature.
- * Whole-line drop rules (round-3): a scheme-fronted loopback authority
- * (`http://localhost:8000/api` — the /api is the LOCAL url's own path) is always
- * local; otherwise the line survives only when a strong transport token
- * PRECEDES the loopback reference (a "via/through <loopback>" hop reads after
- * the provider host in real proxy copy). */
+/** #496: drop lines/regions that reference loopback/unix/socket targets UNLESS
+ * the text reads as a provider transport with a local proxy HOP — a down
+ * localhost DB / docker daemon / local MCP server is local-dependency noise (a
+ * doomed re-dispatch cannot help it), but "402 from https://api.deepseek.com via
+ * localhost:8080" (provider host FIRST, loopback hop after — incl. a
+ * scheme-fronted hop) keeps its genuine signature. Round-4: INDENTED
+ * continuation lines (node's error+cause dumps: stack frames, `cause:`, `errno:`,
+ * `code:`, `address:` lines) are first folded into their parent line, so the
+ * local association of a multi-line "TypeError: fetch failed\n  cause: Error:
+ * connect ECONNREFUSED 127.0.0.1:5432\n  errno: …" dump survives the whole-line
+ * drop; and scheme-fronted local URLs are removed before the precede check so
+ * their own scheme/api tokens never look like a provider transport. */
 export function stripLocalLines(text: string): string {
-	return text
-		.split("\n")
+	const folded: string[] = [];
+	for (const rawLine of text.split("\n")) {
+		if (/^\s+/.test(rawLine) && folded.length > 0) {
+			folded[folded.length - 1] += " " + rawLine.trim();
+		} else {
+			folded.push(rawLine);
+		}
+	}
+	return folded
 		.filter((line) => {
 			if (!LOCAL_TARGET.test(line)) return true;
-			if (SCHEME_FRONTED_LOCAL.test(line)) return false;
-			const localIdx = line.search(LOCAL_TARGET);
-			const strongIdx = line.search(OUTPUT_PHRASE_ANCHOR);
-			return strongIdx !== -1 && strongIdx < localIdx;
+			// Remove scheme-fronted local URLs (their own path/scheme can carry
+			// api/http tokens that must not read as a provider transport).
+			const cleaned = line.replace(SCHEME_FRONTED_LOCAL, " ");
+			const localIdx = cleaned.search(LOCAL_TARGET);
+			const strongIdx = cleaned.search(OUTPUT_PHRASE_ANCHOR);
+			return strongIdx !== -1 && (localIdx === -1 || strongIdx < localIdx);
 		})
 		.join("\n");
 }
@@ -1072,8 +1084,11 @@ export async function runSingleAgent(
 								currentResult.usage.contextTokens = usage.totalTokens || 0;
 							}
 							if (!currentResult.model && typeof msg.model === "string" && msg.model) currentResult.model = msg.model;
-							if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-							if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+							// The event payload is child-emitted JSON cast to Message —
+							// sibling fills are typeof-guarded too so a non-string can
+							// never reach the classifier's text scanners (round-4).
+							if (typeof msg.stopReason === "string") currentResult.stopReason = msg.stopReason;
+							if (typeof msg.errorMessage === "string") currentResult.errorMessage = msg.errorMessage;
 						}
 						emitUpdate();
 					}

@@ -692,6 +692,27 @@ test("stripLocalLines drops scheme-fronted local URLs and post-loopback tokens (
 	equal(stripLocalLines("127.0.0.1:5432 down\n402 from api.deepseek.com:443"), "402 from api.deepseek.com:443");
 });
 
+test("stripLocalLines folds indented error+cause dumps; keeps scheme-full proxy hops (round-4)", () => {
+	// Real node unhandled-fetch dump — the cause/errno continuation lines are
+	// indented; folding puts the loopback evidence on the phrase's line.
+	const nodeDump =
+		"TypeError: fetch failed\n" +
+		"    at fetch (node:internal/undici:1)\n" +
+		"    at async main (/repo/a.js:3:1) {\n" +
+		"  cause: Error: connect ECONNREFUSED 127.0.0.1:5432\n" +
+		"      at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1)\n" +
+		"      errno: -61, code: 'ECONNREFUSED', syscall: 'connect', address: '127.0.0.1', port: 5432\n" +
+		"    }\n";
+	equal(stripLocalLines(nodeDump), "");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: nodeDump })), "none");
+	// node's docker-daemon-down http form (bare socket path).
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Error: connect ECONNREFUSED /var/run/docker.sock, retrying" })), "none");
+	// A provider transport with a SCHEME-FULL local hop is a keep (round-4:
+	// scheme-fronted test ordering no longer drops strong-precedes hops).
+	equal(stripLocalLines("402 from https://api.deepseek.com via http://localhost:8080"), "402 from https://api.deepseek.com via http://localhost:8080");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "402 from https://api.deepseek.com via http://localhost:8080" })), "exhaustion");
+});
+
 // #496 mid-stream socket vocabulary aligned with pi's own retry.js (code-review
 // round: these terminal texts were empirically-verified misses).
 test("mid-stream socket/transport deaths classify as connection", () => {
