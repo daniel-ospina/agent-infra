@@ -141,7 +141,7 @@ Steps:
 ## Task 6: plist + farm + installer-test bumps
 
 **Intent:** Ship the hourly carrier with the farmed-copy + armed-by-default contract, and keep the installer suite truthful.
-**Acceptance:** `templates/launchd/com.eldato.pi-session-reaper.plist` renders `{{HOME}}/.pi/agent/scripts/pi-reap-idle.sh` with `REAP_DRY_RUN=0` + `{{PATH}}` env + StartInterval 3600 + StandardOut/Err → `/tmp/pi-reap-idle.out.log`; `pi-bootstrap/setup.sh` farm list gains `pi-reap-idle.sh` (re-commented); `scripts/install-launchd.test.sh`: mkfakehome farmed list +1, bootstrap count 3→4 (all sites), per-job installed+loaded assert, rendered-plist content asserts (`REAP_DRY_RUN` = `0`, `StartInterval` 3600, farmed path). `bash scripts/install-launchd.test.sh` green.
+**Acceptance:** `templates/launchd/com.eldato.pi-session-reaper.plist` renders `{{HOME}}/.pi/agent/scripts/pi-reap-idle.sh` with `REAP_DRY_RUN=0` + `{{PATH}}` env + StartInterval 3600 and intentionally sets NO StandardOutPath/StandardErrorPath (round-1/2: launchd capture would grow an unbounded world-readable twin of the capped per-user log; `$HOME/.pi/agent/state/pi-reap-idle.log` is authoritative); `pi-bootstrap/setup.sh` farm list gains `pi-reap-idle.sh` (re-commented); `scripts/install-launchd.test.sh`: mkfakehome farmed list +1, bootstrap count 3→4 (all sites), per-job installed+loaded assert, rendered-plist content asserts (`REAP_DRY_RUN` = `0`, `StartInterval` 3600, farmed path). `bash scripts/install-launchd.test.sh` green.
 **Files:**
 - Create: `templates/launchd/com.eldato.pi-session-reaper.plist`
 - Modify: `pi-bootstrap/setup.sh`, `scripts/install-launchd.test.sh`

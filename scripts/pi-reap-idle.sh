@@ -41,7 +41,7 @@ set -uo pipefail
 
 SCRIPT_NAME="pi-reap-idle.sh"
 ISSUE_REF="#469"
-REAP_LOG="${REAP_LOG:-$HOME/.pi/agent/state/pi-reap-idle.log}"
+REAP_LOG="${REAP_LOG:-${HOME:-}/.pi/agent/state/pi-reap-idle.log}"
 PS_BIN="${PS_BIN:-/bin/ps}"
 KILL_BIN="${KILL_BIN:-/bin/kill}"
 DATE_BIN="${DATE_BIN:-/bin/date}"
@@ -141,11 +141,15 @@ CANDIDATES=""  # newline-separated candidate pids (tty'd + pi-argv)
 
 ps_enumeration() {
     local raw
+    [ -n "${PS_TABLE:-}" ] && rm -f "$PS_TABLE" "$PS_TABLE.raw" 2>/dev/null
     PS_TABLE="$(mktemp "${TMPDIR:-/tmp}/pi-reap-ps.XXXXXX")"
     # Pinned bulk contract carries lstart (documented) but rows are parsed by
     # token scan (4-digit year token => stat/rss/command follow) so spacey
     # command columns never shift the parse.
-    { "$PS_BIN" -axo pid=,ppid=,pgid=,tty=,lstart=,stat=,rss=,command= 2>/dev/null || true; } \
+    # PI_REAP_SELF_PID is exported to the ps child so a shimmed PS_BIN can
+    # stamp the reaper's own row deterministically (test harness; real ps
+    # ignores it). In a pipeline subshell $$ is still the shell's own pid.
+    { PI_REAP_SELF_PID="$$" "$PS_BIN" -axo pid=,ppid=,pgid=,tty=,lstart=,stat=,rss=,command= 2>/dev/null || true; } \
         | sed 's/^ *//' >"$PS_TABLE.raw"
     awk '{
         pid=$1; ppid=$2; pgid=$3; tty=$4
@@ -211,6 +215,7 @@ is_self_like() {
 DESC_MAP=""
 
 descendant_map_build() {
+    [ -n "${DESC_MAP:-}" ] && rm -f "$DESC_MAP" 2>/dev/null
     DESC_MAP="$(mktemp "${TMPDIR:-/tmp}/pi-reap-desc.XXXXXX")"
     python3 - "$PS_TABLE" "$DESC_MAP" <<'PYEOF'
 import sys
@@ -255,6 +260,7 @@ has_live_pi_descendant() {
 # agentLifecycle<TAB>runtimeStatus<TAB>sessionId<TAB>cwd
 STORE_TSV=""
 store_read() { # 0 on success; 3 on missing/corrupt (python exit)
+    [ -n "${STORE_TSV:-}" ] && rm -f "$STORE_TSV" 2>/dev/null
     STORE_TSV="$(mktemp "${TMPDIR:-/tmp}/pi-reap-store.XXXXXX")"
     python3 - "$CMUX_STORE" "$STORE_TSV" <<'PYEOF'
 import json, sys
@@ -349,6 +355,10 @@ def last_entry(path):
             except Exception:
                 # torn / partial trailing write — keep scanning older lines
                 continue
+            if not isinstance(obj, dict):
+                # valid JSON but not a record (scalar/array) — an undatable
+                # write: fail closed like the undatable-dict case
+                return None, "unparseable"
             ep = parse_ts(obj.get("timestamp"))
             if ep is None:
                 # newest COMPLETE line is undatable — a write we cannot age;
@@ -486,11 +496,14 @@ classify_candidates() {
             le="$(jsonl_epoch_for "$rf")"
             if [ -z "$le" ]; then abstain=$((abstain+1)); continue; fi
             vote=$((vote+1))
-            # sid/sfile stay in lockstep with the MAX-epoch (age-setting)
-            # record — settle-3 re-probes exactly the file that decided
-            # eligibility, never a younger sibling.
+            # sid/sfile track the MAX-epoch (age-setting) record — settle-3
+            # re-probes exactly the file(s) that decided eligibility. TIED
+            # equal-max twins are unioned (colon-joined) so a resumed twin is
+            # never invisible to the settle gate (arbitrary-twin re-probe).
             if [ -z "$youngest" ] || [ "$le" -gt "$youngest" ]; then
                 youngest="$le"; sid="$rsid"; sfile="$rf"
+            elif [ "$le" = "$youngest" ]; then
+                case ":$sfile:" in *":$rf:"*) ;; *) sfile="$sfile:$rf" ;; esac
             fi
         done <<<"$matched"
         if [ "$vote" -eq 0 ]; then
@@ -552,12 +565,17 @@ reap_one() { # <cand-line> <now>
         log "SETTLE-SKIP $pid incarnation changed (pid reused) — suppress"
         return 0
     fi
-    # settle 3: JSONL activity advanced since classification?
-    fresh_epoch="$(jsonl_epoch_for "$sfile")"
-    if [ -n "$class_epoch" ] && [ -n "$fresh_epoch" ] && [ "$fresh_epoch" -gt "$class_epoch" ]; then
-        log "SETTLE-SKIP $pid activity advanced (jsonl ${class_epoch} -> ${fresh_epoch}) — suppress"
-        return 0
-    fi
+    # settle 3: JSONL activity advanced since classification? Every deciding
+    # (max-epoch) file is re-probed — an advance on ANY tied twin suppresses.
+    while IFS= read -r sf; do
+        [ -n "$sf" ] || continue
+        fresh_epoch="$(jsonl_epoch_for "$sf")"
+        if [ -n "$class_epoch" ] && [ -n "$fresh_epoch" ] && [ "$fresh_epoch" -gt "$class_epoch" ]; then
+            log "SETTLE-SKIP $pid activity advanced ($sf ${class_epoch} -> ${fresh_epoch}) — suppress"
+            return 0
+        fi
+    done <<<"$(printf '%s' "$sfile" | tr ':' '\n')"
+    # (single-file case: one iteration, identical semantics to round 1)
     signal_target "$pid" "$pgid2" TERM
     log "SIGNAL pid=$pid pgid=$pgid2 SIGTERM rss=${rss:-0} idle_h=${idle_h}h session=$sid jsonl=$sfile"
     sleep "$REAP_GRACE_SECONDS"
@@ -663,6 +681,12 @@ run() {
     # the log's own directory (never a predictable sibling name — a local
     # attacker could pre-seed a symlink at a fixed path).
     mkdir -p "${REAP_LOG%/*}" 2>/dev/null || true
+    # fail-closed: an armed pass must never run with no audit trail — if the
+    # log cannot be created/appended, abort (exit 3) before any signal.
+    if ! : >>"$REAP_LOG" 2>/dev/null; then
+        echo "FAIL-CLOSED abort: REAP_LOG unwritable ($REAP_LOG) (exit 3)" >&2
+        exit 3
+    fi
     if [ -f "$REAP_LOG" ]; then
         trunc="$(mktemp "${REAP_LOG%/*}/pi-reap-log-trunc.XXXXXX" 2>/dev/null)" || trunc=""
         if [ -n "$trunc" ]; then

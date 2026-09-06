@@ -79,40 +79,14 @@ cat > "$T/bin/ps" <<'SHIM'
 SOURCE="${FAKE_PS_SOURCE:?}"
 if [ "${1:-}" = "-axo" ]; then
     sed 's/^ *//' "$SOURCE"
-    # Inject a self row whose pid is the REAPER, not the shim: inside a
-    # pipeline the shim's \$PPID is an intermediate subshell, so walk the real
-    # ancestor chain (\/bin/ps — never the shim) to the pi-reap-idle.sh
-    # process and stamp that pid. Ancestor rows 400000/400001 follow so the
-    # ancestor-walk self-exclusion is exercised deterministically.
-    SELF_PID="$PPID"
-    BEST="$SELF_PID"
-    i=0
-    while [ "$i" -lt 8 ]; do
-        # ps reads race empty when a frame exits mid-walk (suite runs
-        # concurrently / under load): retry before trusting the result — a
-        # stranded walk emits the self row at the WRONG pid and the reaper's
-        # real \$\$ row is missing, silently disabling B9's self-tty/ancestor
-        # skips.
-        CMD=""; t=0
-        while [ -z "$CMD" ] && [ "$t" -lt 3 ]; do
-            CMD="$(/bin/ps -o command= -p "$SELF_PID" 2>/dev/null | tr -d '\n')"
-            [ -z "$CMD" ] && sleep 0.05; t=$((t+1))
-        done
-        if [ -n "$CMD" ]; then
-            case "$CMD" in
-                *pi-reap-idle.sh*) BEST="$SELF_PID" ;;   # keep walking up: the
-            esac                                            # OUT=$(...) subshell also
-        fi                                                  # carries the script argv
-        NEXT=""; t=0
-        while [ -z "$NEXT" ] && [ "$t" -lt 3 ]; do
-            NEXT="$(/bin/ps -o ppid= -p "$SELF_PID" 2>/dev/null | tr -d ' ')"
-            [ -z "$NEXT" ] && sleep 0.05; t=$((t+1))
-        done
-        [ -n "$NEXT" ] || break
-        [ "$NEXT" = "$SELF_PID" ] && break
-        SELF_PID="$NEXT"; i=$((i+1))
-    done
-    SELF_PID="$BEST"
+    # Inject a self row whose pid is the REAPER, not the shim. The reaper
+    # exports PI_REAP_SELF_PID=$$ on its bulk ps call (real ps ignores it) —
+    # deterministic, no real-process ancestry walk (walks race under fork
+    # churn: a stranded walk emits the row at the wrong pid, silently
+    # disabling B9's self-tty/ancestor skips). Fall back to $PPID when the
+    # var is absent. Ancestor rows 400000/400001 follow so the ancestor-walk
+    # self-exclusion is exercised deterministically.
+    SELF_PID="${PI_REAP_SELF_PID:-$PPID}"
     echo "$SELF_PID 400000 400000 ${FAKE_SELF_TTY:-tts000} R 0 0 /usr/bin/env bash pi-reap-idle-self"
     echo "400000 400001 400000 ${FAKE_SELF_TTY:-tts000} S 0 0 /bin/launchd-self"
     echo "400001 1 400001 ?? S 0 0 /sbin/launchd"
@@ -316,6 +290,19 @@ OUT="$(REAP_NOW_EPOCH=$NOW REAP_LOG="$T/A5/r.log" bash "$REAPER" --probe-jsonl "
 assert_eq "$(field_of "$OUT" idle_proven)" "False" "A5 undatable newest line abstains (no older-line fallback)"
 assert_eq "$(field_of "$OUT" reason)" "unparseable" "A5 reason=unparseable"
 rm -rf "$T/A5"
+
+# A6: newest line valid JSON but a SCALAR (42/true/"str"/[1,2]) — not a record
+# -> fail-closed unparseable, no crash, one row still emitted for the file
+mk_env A6; mkdir -p "$T/A6/sessions"
+for SC in 42 true 'null' '"astring"'; do
+    G="$T/A6/sessions/s$SC.jsonl"
+    printf '%s\n' '{"timestamp":"2026-09-03T20:00:00.000Z","x":1}' > "$G"
+    printf '%s\n' "$SC" >> "$G"
+    OUT="$(REAP_NOW_EPOCH=$NOW REAP_LOG="$T/A6/r.log" bash "$REAPER" --probe-jsonl "$G" 2>&1)"
+    assert_eq "$(field_of "$OUT" idle_proven)" "False" "A6 scalar-tail $SC -> not idle (no crash)"
+    assert_eq "$(field_of "$OUT" reason)" "unparseable" "A6 scalar-tail $SC reason=unparseable"
+done
+rm -rf "$T/A6"
 
 echo "fixture pack B: cmux join + vetoes + resolution (dry-run verdicts)"
 mk_env B
@@ -797,6 +784,34 @@ assert_contains "$(cat "$T/C25/kill.log")" "kill -TERM -20251" "C25 TERM issued"
 assert_not_contains "$(cat "$T/C25/kill.log")" "KILL" "C25 SIGKILL suppressed on pid reuse after TERM"
 assert_contains "$(cat "$T/C25/reap.log")" "pid reused after TERM" "C25 reuse-after-TERM suppress reason logged"
 rm -rf "$T/C25"
+
+# C26: equal-epoch TIED twins — the settle gate must re-probe BOTH deciding
+# files, not the store-order-first twin. Candidates A (pid 20260) and B
+# (pid 20261, whose cmux twins x+y share one equal max epoch). A's TERM
+# (kill-side) appends a fresh entry to B's TWIN-y file; B's settle re-probe
+# must see it via the tied union (pre-fix it re-probed only twin x, the
+# store-order-first file, and would have TERM'd a just-active session).
+mk_env C26
+make_lookup "$T/C26/date.lookup"
+printf '%s\n' "$(psrow 20260 400000 20260 ttys338 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/c26a")" \
+               "$(psrow 20261 400000 20261 ttys338 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/c26b")" > "$T/C26/ps-source"
+printf '%s' '{"c26a":{"pid":20260,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/c26a"},"c26x":{"pid":20261,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/c26b"},"c26y":{"pid":20261,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/c26b"}}' | cmux_store C26
+session_jsonl C26 /Users/t/c26a c26a "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+session_jsonl C26 /Users/t/c26b c26x "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+session_jsonl C26 /Users/t/c26b c26y "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+cat > "$T/C26/settle-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM) printf '%s\n' '{"timestamp":"2026-09-05T01:00:00.000Z","x":"fresh"}' >> "$T/C26/sessions/--Users-t-c26b--/${E_SEP3_2000}_c26y.jsonl" ;;
+esac
+SH
+chmod +x "$T/C26/settle-side.sh"
+: > "$T/C26/kill.log"
+OUT="$(FAKE_KILL_SIDE="$T/C26/settle-side.sh" REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=tts900 run_reaper C26 --apply 2>&1)"
+assert_contains "$(cat "$T/C26/kill.log")" "kill -TERM -20260" "C26 candidate A TERM'd normally"
+assert_not_contains "$(cat "$T/C26/kill.log")" "kill -TERM -20261" "C26 tied-twin advance suppresses B's TERM"
+assert_contains "$(cat "$T/C26/reap.log")" "activity advanced" "C26 tied-twin advance suppress reason logged"
+rm -rf "$T/C26"
 
 echo "════════════════════════════════════════════════════════════════"
 echo "PASS=$PASS FAIL=$FAIL"
