@@ -183,10 +183,11 @@ function setup() {
 	delete process.env.TASK_SWEEP;
 	delete process.env.TASK_DETACHED;
 	// sentinel process in the orchestrator's OWN group — must survive every sweep.
-	// Lifetime 10 min (not 120s): slow CI (marker timeouts) can stretch the
+	// Lifetime 30 min (not 120s): slow CI (marker timeouts) can stretch the
 	// suite past 2 min — a dead sentinel false-fails the TASK_DETACHED=0 and
-	// AC3 exclusion assertions (#536).
-	sentinel = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], { stdio: "ignore" });
+	// AC3 exclusion assertions (#536). Self-terminates on expiry; teardown
+	// SIGKILLs it on every path.
+	sentinel = spawn(process.execPath, ["-e", "setTimeout(() => {}, 1800000)"], { stdio: "ignore" });
 }
 
 function teardown() {
@@ -214,11 +215,12 @@ function mkMarker(prefix: string): string {
 /** pgrep -f pattern that can never match its own invoking shell. Linux procps
  * pgrep matches the execSync `/bin/sh -c pgrep -f "<marker>"` wrapper (the
  * marker text sits in ITS argv) — so a plain pattern never observes "gone".
- * Character-classing the first char fixes it: the literal wrapper argv
- * contains `[a]c1-…` which the regex `[a]c1-…` does not match, while the real
- * process argv (`simulate cut ac1-…`) still does. BSD/macOS pgrep does not
- * self-match the parent sh, so this only bites on Linux CI — but it must pass
- * there (cut-resume runs in ci-main extension-tests). */
+ * Character-classing the first char fixes it: the `[a]` class matches a bare
+ * 'a', which in the wrapper's literal argv is followed by `]` (no match), but
+ * in the real child argv (`simulate cut ac1-<ts>-<seq>`) by `c` (match).
+ * BSD/macOS pgrep does not self-match the parent sh, so this only bites on
+ * Linux CI — but it must pass there (cut-resume runs in ci-main
+ * extension-tests). */
 function markerPattern(marker: string): string {
 	return `[${marker[0]}]${marker.slice(1)}`;
 }
