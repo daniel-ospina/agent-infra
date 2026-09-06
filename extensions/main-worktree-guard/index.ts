@@ -262,7 +262,7 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
       ...blockedBranches.map((b: string) => `   • ${b}`),
       "",
       "   Why: deleting a remote branch while another session has it",
-      "   checked out destroys that session's upstream (incident 2026-08-06).",
+      "   checked out destroys that session's upstream (#73 / incident 2026-08-06).",
       "   → Switch those worktrees/main to another branch first, then retry.",
       "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
     ].join("\n"),
@@ -1033,11 +1033,24 @@ export default function (pi: ExtensionAPI) {
         // `allow-non-git` is intentionally absent: a non-empty extractor
         // requires a literal `git push` token, so the legacy verdict for any
         // such command is `allow` or a `block:*` — never `allow-non-git`.
-        if (verdict === "block:push-delete" ||
-            (verdict === "allow" && rawDeleteNames.length > 0)) {
+        // The extractor is string-matched, so a command that merely MENTIONS a
+        // delete push (`echo git push origin -d b`, comments) is conservatively
+        // over-matched — a false-block only when the target is checked out
+        // elsewhere; identical safe-direction over-match exists for the frozen
+        // `--delete` spelling (DESTRUCTIVE_GIT_PATTERNS echo precedent).
+        // A `block:force-push` verdict that ALSO carries a delete spelling
+        // (`git push --force origin --delete b` / `-d b` — the force-less twin
+        // is caught via the allow path) runs the coordinated check too; when
+        // no sibling holds the target, it FALLS THROUGH to the generic block
+        // arm below so the main-checkout force-push block is preserved.
+        const pushDeleteVerdict = verdict === "block:push-delete" ||
+          (verdict === "allow" && rawDeleteNames.length > 0) ||
+          (verdict === "block:force-push" && rawDeleteNames.length > 0);
+        if (pushDeleteVerdict) {
           const blocked = _coordinatedDeleteBlock(rawDeleteNames);
           if (blocked) return blocked;
-          return undefined;
+          if (verdict === "block:push-delete" || verdict === "allow") return undefined;
+          // verdict === block:force-push: fall through to the generic arm.
         }
         if (verdict.startsWith("block:")) {
           let inWorktree = true;
@@ -1157,33 +1170,8 @@ export default function (pi: ExtensionAPI) {
 
       // ── push --delete: retained #73 coordinated check (foreign targets) ──
       if (det.verdict === "block:push-delete" && det.pushTargets.length > 0) {
-        const worktreeBranches = getWorktreeBranches();
-        const blockedBranches: string[] = [];
-        for (const branchName of det.pushTargets) {
-          const branchRef = `refs/heads/${branchName}`;
-          const checkedOutPaths = [...(worktreeBranches.get(branchRef) || [])];
-          if (isBranchInMainCheckout(branchName)) {
-            const mainTopLevel = _mainTopLevel();
-            const mainLabel = mainTopLevel || "main checkout";
-            if (!checkedOutPaths.includes(mainLabel)) checkedOutPaths.push(mainLabel);
-          }
-          if (checkedOutPaths.length > 0) {
-            blockedBranches.push(`"${branchName}" — checked out in: ${checkedOutPaths.join(", ")}`);
-          }
-        }
-        if (blockedBranches.length > 0) {
-          return {
-            block: true,
-            reason: [
-              `⛔ Cannot delete — the following branches are currently checked out:`,
-              ...blockedBranches.map((b: string) => `   • ${b}`),
-              "",
-              "   Why: deleting a remote branch while another session has it",
-              "   checked out destroys that session's upstream (#73 / incident 2026-08-06).",
-              "   → Switch those worktrees/main to another branch first, then retry.",
-            ].join("\n"),
-          };
-        }
+        const blocked = _coordinatedDeleteBlock(det.pushTargets);
+        if (blocked) return blocked;
         return undefined; // foreign deletes with no checked-out targets — allowed (today's behavior)
       }
 

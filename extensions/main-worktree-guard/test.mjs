@@ -185,7 +185,13 @@ function expectBranches(command, expectedArray) {
 expectBranches("git push origin --delete feat/x", ["feat/x"]);
 expectBranches("git push --delete feat/x", ["feat/x"]);
 expectBranches("git push origin --delete refs/heads/feat/x", ["feat/x"]);
-expectBranches("git push --delete chore/old-branch origin", ["chore/old-branch"]);
+// Flag BEFORE the remote: git treats the first positional as the REPOSITORY
+// when ≥2 positionals follow the flag (`--delete origin c` deletes c on
+// origin — probe-verified). The first following positional is dropped.
+expectBranches("git push --delete origin c", ["c"]);
+expectBranches("git push origin main && git push --delete origin c", ["c"]); // later-segment flag-before-remote
+expectBranches("git push --delete chore/old-branch origin", ["origin"]); // git-invalid (chore/old-branch is not a repo) — repo-drop still applied
+expectBranches("git push origin --delete a b", ["a"]); // repo precedes flag — a and b are BOTH refspecs; single-target contract keeps a
 expectBranches('git push origin --delete "feat/x"', ["feat/x"]);
 expectBranches("git push origin --delete 'feat/x'", ["feat/x"]);
 expectBranches("git push origin :feat/x", ["feat/x"]);
@@ -201,6 +207,14 @@ expectBranches("git push origin --delete feat/x; git push origin -d feat/y", ["f
 expectBranches("git push origin main && git push origin -d old-feat", ["old-feat"]); // delete in a LATER push segment
 expectBranches("git push origin -do draft feat/x", ["feat/x"]); // -do draft = -d -o draft — value skipped
 expectBranches("git push origin -o draft -d feat/x", ["feat/x"]); // standalone -o value skipped
+expectBranches("git push origin -d -qo draft feat/x", ["feat/x"]); // d-less cluster ending in -o still consumes its value
+expectBranches("git push origin ':feat/x'", ["feat/x"]); // quoted empty-source colon = a delete (quote-aware)
+expectBranches("git push origin -qo :tag feat/x", null); // -o consumes :tag as its VALUE — no delete refspec
+// -o value that looks like a flag is consumed, never a delete:
+expectBranches("git push origin -o -d feat/x", null);
+// Consecutive arg-takers pair off → trailing -d is a REAL delete:
+expectBranches("git push origin -o -o -d feat/x", ["feat/x"]);
+expectBranches("git push origin -o -o -o -d feat/x", null); // odd chain consumes -d
 expectBranches("git push origin -d", null); // no target — invalid in git
 // Non-delete coloned refspecs (src:dst) are NOT deletes — never extracted.
 expectBranches("git push origin main:feature", null);
@@ -428,6 +442,21 @@ dexpect("push -do push-option cluster → delete", `git push origin -do draft fe
 // -odraft: the o comes FIRST so d is part of -o's VALUE, not an option — a
 // normal push (git parses no delete).
 dexpect("push -odraft (o first) → NOT delete", `git push origin -odraft feat/x`, { verdict: "block:push", isPushDelete: false });
+// A delete-shaped token consumed as `-o`/`--push-option`'s VALUE is a normal
+// push, never a delete (probe-verified: git deletes nothing) — the matcher is
+// value-slot aware, mirroring the whole-command extractor.
+dexpect("push -o consumes -d → normal push", `git push origin -o -d feat/x`, { verdict: "block:push", isPushDelete: false });
+dexpect("push -qo consumes -d → normal push", `git push origin -qo -d feat/x`, { verdict: "block:push", isPushDelete: false });
+dexpect("push --push-option consumes -d → normal push", `git push origin --push-option -d feat/x`, { verdict: "block:push", isPushDelete: false });
+// Consecutive arg-takers PAIR OFF: the first -o consumes the second as its
+// value, so a trailing -d is a REAL delete (probe-verified remote delete).
+dexpect("push -o -o pairs → trailing -d deletes", `git push origin -o -o -d feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push -qo -o pairs → trailing -d deletes", `git push origin -qo -o -d feat/x`, { verdict: "block:push-delete", isPushDelete: true });
+dexpect("push -o -o -o -d → odd chain consumes -d (no delete)", `git push origin -o -o -o -d feat/x`, { verdict: "block:push", isPushDelete: false });
+// Later-segment delete in a compound: the FIRST invocation's positionals are
+// ordinary push refspecs, never delete targets (#504 fold-in fallback).
+dexpect("compound later-segment --delete → real target only", `git push origin main && git push origin --delete b`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
+dexpect("compound later-segment colon delete → real target only", `git push origin feat/x && git push origin :b`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
 // --d is AMBIGUOUS with --dry-run — git rejects it (rc 129, probe-verified);
 // it never deletes, so it stays a plain block:push (never block:push-delete).
 dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d feat/x`, { verdict: "block:push", isPushDelete: false });
