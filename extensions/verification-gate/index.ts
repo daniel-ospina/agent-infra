@@ -530,11 +530,21 @@ function findGitVerbInvocation(
         // token is never a value (do not swallow a following -c). Attached
         // `=` unknowns carry their value and consume nothing.
         if (t.includes("=")) continue;
-        const nxt = readShellToken(text, p, true); // peek join-mode: a VALUE may carry abutting quotes; the verb itself is unaffected (trailing wrapper quote still strips)
-        if (nxt === null) break;
-        if (verbs.has(nxt.content)) continue; // verb wins → this dash is a boolean; CONTINUE so the next iteration returns the verb (break here abandoned the candidate — #490 T2 P1)
-        if (nxt.content.startsWith("-")) { p = nxt.rawStart; continue; } // never a value — re-process the dash token next
-        p = nxt.rawEnd; // consume the value token
+        // Verb-wins probe in DEFAULT mode: a verb is always a plain word, and the
+        // default-mode quote-abutting rule terminates cleanly at a wrapper's
+        // closing quote (`sh -c 'git --no-optional-locks commit' && git push` —
+        // the quote ends the word, the verb matches, the candidate survives).
+        // Join mode here would treat the closing quote as an opening
+        // concatenation quote and swallow the rest of the command (P1, #490 T2 r3).
+        const verbProbe = readShellToken(text, p);
+        if (verbProbe === null) break;
+        if (verbs.has(verbProbe.content)) continue; // verb wins → this dash is a boolean; CONTINUE so the next iteration returns the verb (break here abandoned the candidate — #490 T2 P1)
+        if (verbProbe.content.startsWith("-")) { p = verbProbe.rawStart; continue; } // never a value — re-process the dash token next
+        // Not the verb → it is the option's VALUE: consume it in join mode (bash
+        // word-concatenation — an abutting quote is part of the value).
+        const val = readShellToken(text, p, true);
+        if (val === null) break;
+        p = val.rawEnd;
         continue;
       }
       // First non-option token: must be the verb.

@@ -2477,7 +2477,19 @@ test("RED (#490 T2 round-2): out-of-table no-value global before verb + abutting
   equal(commitSweepClass("git -c core.editor='vim -w' commit -am x"), "sweep", "...sweep");
   equal(isBareCommitShape("git -c core.editor='commit x' commit -am y"), false, "verb-like word inside a value never binds as the verb");
   equal(commitSweepClass("git -c core.editor='vim -w' commit -am x && git push origin main"), "sweep", "compound with abutting-quote value keeps sweep");
-  ok(isGitOp("git --no-pager commit -m x"), "in-table boolean regression guard");
+  // GREEN-ON-BOTH guards (round-1 code also passed — kept for regression, not RED):
+  equal(isBareCommitShape("git -c core.editor='commit x' commit -am y"), false, "verb-like word inside a token-start-quote value never binds as the verb (green-on-both)");
+  ok(isGitOp("git --no-pager commit -m x"), "in-table boolean regression guard (green-on-both)");
+});
+
+test("RED (#490 T2 round-3): wrapper-contained global+verb followed by && git push must intercept", () => {
+  // The round-2 join-mode peek swallowed a wrapper's closing quote + the rest of
+  // the command when the verb was the LAST token inside the quote → candidate
+  // abandoned → isGitOp false → the trailing push sailed unverified (P1, r3).
+  ok(isGitOp("sh -c 'git --no-optional-locks commit' && git push origin main"), "wrapped no-value-global commit + trailing push must intercept");
+  ok(isGitOp("echo \"git --no-optional-locks commit\" && git push origin main"), "prose-wrapped + trailing push must intercept");
+  ok(isGitOp("sh -c 'git --no-optional-locks commit' && echo hi && git push origin main"), "wrapped + interposed echo + push must intercept");
+  equal(commitSweepClass("sh -c 'git --no-optional-locks commit -am x' && git push origin main"), "none", "wrapper-contained sweep stays 'none'/staged per #489 semantics (wrapper-alone → staged scope — documented residual #539); the interception pins above are the r3 regression guards");
 });
 
 section("#490 T2 — cwd-neutral boundary + containment guards (group B)");
