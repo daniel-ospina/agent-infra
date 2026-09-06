@@ -822,7 +822,10 @@ export function altGateEligible(requested: LegRef, opts: { registry?: ModelRegis
  * SAME id the child usage rows carry (each spawn appends its own
  * event=dispatch-usage row with the reused nonce), so venice-route and
  * dispatch-usage rows are joinable per dispatch for the 0a burn window.
- * Null when the dispatch ran without a heartbeat nonce (failover disabled). */
+ * Null only when the CALLER supplies none (direct/legacy call sites); the
+ * task-tool execute path always sets it BEFORE the append (round-2 P2-1:
+ * unconditional — a task child always runs a heartbeat nonce, so the route
+ * row shares it in every config, PROVIDER_FAILOVER_DISABLE included). */
 export function recordVeniceRoute(
   dispatchLeg: LegRef,
   family: string | null,
@@ -3345,8 +3348,14 @@ export default function (pi: ExtensionAPI) {
       // caller-set TASK_HEARTBEAT_NONCE instead of generating its own).
       // Generated BEFORE the venice-route append (round-1 P2): the route row
       // and every per-leg dispatch-usage row carry the same dispatchId, so
-      // cold-class burn is joinable per dispatch.
-      if (failoverActive && family) subAgentEnv.TASK_HEARTBEAT_NONCE = randomBytes(6).toString("hex");
+      // cold-class burn is joinable per dispatch. Deliberately NOT
+      // conditional on failoverActive (round-2 P2-1): a task child ALWAYS
+      // runs TASK_HEARTBEAT=1 (set below) and spawnSubAgent auto-generates a
+      // nonce when the caller leaves it unset — so under
+      // PROVIDER_FAILOVER_DISABLE=1 the child's dispatch-usage row would
+      // carry an AUTO nonce the venice-route row could never join. The
+      // shared id is set in every config; the child simply reuses it.
+      subAgentEnv.TASK_HEARTBEAT_NONCE = randomBytes(6).toString("hex");
       // #512 proof-of-routing ledger: an actual venice dispatch (the cold-class
       // seam resolved to the venice leg and no kill switch gated it) appends a
       // venice-route audit row so credit burn is attributable per dispatch
@@ -3358,7 +3367,7 @@ export default function (pi: ExtensionAPI) {
           family ?? null,
           failoverResolution.hop ?? null,
           subAgentEnv,
-          failoverActive && family ? (subAgentEnv.TASK_HEARTBEAT_NONCE ?? null) : null,
+          subAgentEnv.TASK_HEARTBEAT_NONCE ?? null,
         );
         console.log(`[task] cold-class route → ${dispatchLeg.provider}/${dispatchLeg.model} (venice-route ledger)`);
       }

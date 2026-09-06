@@ -32,7 +32,7 @@
  * Run: npx tsx extensions/builtin-tools/provider-failover.integration.test.ts
  */
 
-import { spawnSubAgent } from "./index.js";
+import { spawnSubAgent, recordVeniceRoute } from "./index.js";
 import { readLatchState } from "../shared/provider-failover.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -296,6 +296,52 @@ test("usage ledger: TASK_USAGE_LEDGER=1 appends the event=dispatch-usage audit r
 		equal(row.cost, 0.000123);
 		ok(childNonce.length >= 6, "child nonce present");
 		equal(row.dispatchId, childNonce, "dispatch-usage row carries the per-dispatch nonce (round-1 P2 join key)");
+	} finally {
+		if (savedLedger === undefined) delete process.env.TASK_USAGE_LEDGER;
+		else process.env.TASK_USAGE_LEDGER = savedLedger;
+	}
+});
+
+test("usage ledger round-2 P2-3: venice-route + dispatch-usage rows SHARE the pre-set dispatchId (joinable per dispatch)", async () => {
+	// Simulates the execute path exactly: the parent hoists ONE shared nonce
+	// into subAgentEnv BEFORE the venice-route append and the spawn (now
+	// unconditional — round-2 P2-1). dispatch() carries that nonce through to
+	// spawnSubAgent, which REUSES it (no auto-generation); the usage-emitting
+	// child authenticates against it, so the dispatch-usage row and the
+	// route row appended with the SAME nonce join on dispatchId.
+	const sharedNonce = "deadbeef0123";
+	const savedLedger = process.env.TASK_USAGE_LEDGER;
+	process.env.TASK_USAGE_LEDGER = "1";
+	try {
+		const { value, childNonce } = await dispatch("usage", {
+			TASK_USAGE_CAPTURE: "1",
+			TASK_HEARTBEAT_NONCE: sharedNonce,
+		});
+		ok(value, "defined result expected");
+		ok(value!.details!.dispatchUsage, "detail attached");
+		// route row — appended by the execute path with the SAME shared nonce
+		// (recordVeniceRoute is called BEFORE the spawn with that nonce; we
+		// replay the call here with the identical value the hoist produced)
+		recordVeniceRoute(
+			{ provider: "venice", model: "deepseek-v4-flash" },
+			"deepseek-v4-flash",
+			null,
+			process.env as Record<string, string | undefined>,
+			sharedNonce,
+		);
+		const file = path.join(process.env.PI_CODING_AGENT_DIR!, "audit", "provider-failover.jsonl");
+		const rows = fs
+			.readFileSync(file, "utf-8")
+			.trim()
+			.split("\n")
+			.map((l) => JSON.parse(l));
+		const usageRow = [...rows].reverse().find((r) => r.event === "dispatch-usage");
+		const routeRow = [...rows].reverse().find((r) => r.event === "venice-route");
+		ok(usageRow && routeRow, "both ledger rows present (this dispatch's last-appended rows)");
+		equal(childNonce, sharedNonce, "child authenticated against the PRE-SET nonce — spawnSubAgent reused it (no auto-gen)");
+		equal(routeRow.dispatchId, sharedNonce, "venice-route row carries the shared dispatchId");
+		equal(usageRow.dispatchId, sharedNonce, "dispatch-usage row carries the shared dispatchId");
+		equal(routeRow.dispatchId, usageRow.dispatchId, "rows JOIN on dispatchId (round-1 P2 fix — joinable per dispatch)");
 	} finally {
 		if (savedLedger === undefined) delete process.env.TASK_USAGE_LEDGER;
 		else process.env.TASK_USAGE_LEDGER = savedLedger;
