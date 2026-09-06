@@ -314,17 +314,24 @@ advancing the deepseek root on another account's evidence.
 
 ### Fallback + kill switches
 
-- **Exhaustion fallback** (venice 402/`low_balance`/auth-blocked): the #476
-  machinery hops venice → deepseek official → openrouter via the
-  independent-provider discriminator — a canceled/empty venice account never
-  strands the dispatch.
+- **Exhaustion fallback** (venice 402/`low_balance`): the #476 machinery hops
+  venice → deepseek official → openrouter via the independent-provider
+  discriminator (account-of-record: the drain records under `primaries["venice"]`,
+  never re-latching the deepseek root). A canceled/empty venice account does
+  NOT auto-hop in-dispatch (401/403 = annotation-only `return` + durable
+  block, amendment-1 P1-1); the block then gates SUBSEQUENT cold dispatches to
+  the default leg pre-spawn (next bullet).
 - Kill switches, in order: unset `COLD_CLASS_PROVIDER` (full revert),
   remove/unset `VENICE_API_KEY` (missing-key → the task-tool gate resolves the
-  dispatch to the default deepseek leg BEFORE any spawn), or
-  `PROVIDER_FAILOVER_DISABLE=1` (note: this combo also disables the
-  deepseek→openrouter fallback — A1 P3). Durable venice auth-blocks
-  (`blockedLegs["venice"]`, 24h TTL) also gate subsequent cold dispatches to
-  the default leg; the block self-heals on key remediation.
+  dispatch to the default deepseek leg BEFORE any spawn), and — for a durable
+  venice auth-block (`blockedLegs["venice"]`, 24h TTL) — the same gate sends
+  subsequent cold dispatches to the default leg; the block self-heals on key
+  remediation.
+- ⛔ `PROVIDER_FAILOVER_DISABLE=1` is NOT a cold-class kill switch (A1 P3): it
+  only disables the #476 fallback machinery — the alternate-leg gate and the
+  venice leg ignore it, so cold venice routing stays ACTIVE with NO automatic
+  recovery (a venice 402 then strands the dispatch). Full revert requires
+  unsetting `COLD_CLASS_PROVIDER` (and removing `VENICE_API_KEY`).
 
 ### Measurement (the 0a gate)
 
@@ -332,15 +339,22 @@ Production cold-class routing stays OFF until a ≥2-week prospective usage
 window validates the burn economics. Per-dispatch measurement is
 **default-off**:
 
-- `TASK_USAGE_CAPTURE=1` (child env): the child accumulates message_end usage
-  across healthy turns and emits ONE `[task-usage]` stderr line at
-  session_shutdown (nonce-authenticated; provider attribution from the CLI
-  leg — a venice child never mislabels itself deepseek).
-- `TASK_USAGE_LEDGER=1` (parent env): the task tool attaches
-  `details.dispatchUsage` and appends an `event=dispatch-usage` row to
-  `audit/provider-failover.jsonl`.
+- `TASK_USAGE_CAPTURE=1` must reach the CHILD env (task children inherit it;
+  a non-task `pi -p` process with the var exported never emits — the
+  emission requires a task identity, `TASK_HEARTBEAT=1` + nonce, round-2 P2).
+  The child accumulates message_end usage across healthy turns and emits ONE
+  `[task-usage]` stderr line at session_shutdown (nonce-authenticated;
+  provider attribution from the CLI leg — a venice child never mislabels
+  itself deepseek).
+- The parent attaches `details.dispatchUsage` to the settled result whenever
+  the child emitted (CAPTURE reached the child). `TASK_USAGE_LEDGER=1`
+  (parent env) ADDITIONALLY appends the durable `event=dispatch-usage` row to
+  `audit/provider-failover.jsonl` (the 0a window reads the ledger).
 - A real venice dispatch appends an `event=venice-route` row to the same
   audit file (attributable credit burn without scraping session files).
+  `venice-route` and `dispatch-usage` rows share the per-dispatch
+  `dispatchId` (the TASK_HEARTBEAT_NONCE hex), so route rows and per-leg
+  usage rows are joinable per dispatch.
 
 ### Registry
 
