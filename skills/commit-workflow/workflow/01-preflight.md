@@ -220,7 +220,9 @@ BEHIND=$(git rev-list --count HEAD.."origin/$DEFAULT_BRANCH" 2>/dev/null || echo
 Notes: `commit.gpgsign=false` is process-scoped and prevents headless pinentry
 hangs during rebase (fleet ships squash-merged; research-verified). Condition 5
 in 04-merge-deploy.md still governs overlap at merge time; repos with strict
-up-to-date protection additionally use Stale-Merge Recovery there.
+up-to-date protection additionally use the **Auto-merge ceremony in 04-merge-deploy.md
+(#500)** at merge time — Stale-Merge Recovery there only when auto-merge is
+unavailable (repo settings) or the arm failed and a one-shot manual merge can still win.
 
 ## Tier Detection
 

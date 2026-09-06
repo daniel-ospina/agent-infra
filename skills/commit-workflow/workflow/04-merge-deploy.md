@@ -135,9 +135,15 @@ branch reconciled, checks green):**
 # No local branch juggling; safe in worktree-heavy repos (never pairs with
 # --delete-branch; use Step B for cleanup after the merge lands).
 gh pr merge <PR_NUMBER> --auto --merge
-# Expected: "Pull request #N is now auto-merge eligible" — exit 0.
-# Poll until the merge completes (auto-merge applies when the last gate clears):
-git fetch origin main --quiet && git rev-parse origin/main
+# Expected: "✓ Pull request <owner/repo>#<N> will be automatically merged when
+# all requirements are met" — exit 0 is the true signal (the string varies by
+# gh version; a non-zero exit is the only failure signal).
+# Poll until the auto-merge APPLIES — never infer completion from origin/main,
+# which advances on ANY concurrent merge (a false "done" sends Step B to delete
+# the head branch of a still-armed PR, closing it unmerged):
+gh pr view <PR_NUMBER> --json state,mergedAt -q .state   # loop until "MERGED"
+# (Default-branch resolution when the default is not main:
+# DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@'); [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main")
 ```
 
 **If auto-merge PAUSES** (branch went behind while armed — GitHub reports the PR as
@@ -149,7 +155,11 @@ review at the new head (condition 6 — the sha moved), then re-arm:
 git -c commit.gpgsign=false rebase origin/main   # or: git merge origin/main per condition 5
 # RE-RUN the affected pre-flight regression tests here
 git push --force-with-lease
-# re-record the review at the new head (code-review skill / record-review.sh), then:
+# The head sha moved → run the `code-review` skill at the new head (fresh review;
+# it auto-records on clean convergence). Do NOT re-record via record-review.sh
+# alone — condition 6 forbids recording a moved head without a fresh review, and
+# the ai-review-gate full-sha freshness check keeps the arm red until evidence is
+# genuinely refreshed. Then re-arm:
 gh pr merge <PR_NUMBER> --auto --merge
 ```
 
