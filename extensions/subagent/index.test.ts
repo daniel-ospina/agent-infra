@@ -30,7 +30,10 @@ import {
 	getSubagentFallbackModel,
 	DEFAULT_SUBAGENT_FALLBACK_MODEL,
 	stripStackFrames,
+	stripLocalLines,
 	scanForProviderFailure,
+	modelProviderFamily,
+	exhaustionFallbackDoomed,
 	type ProviderFailureClass,
 	type SingleResult,
 } from "./index.js";
@@ -555,6 +558,24 @@ test("exit 0 + stopReason error with in-band 'bad gateway' message → provider 
 	equal(classifyProviderFailure(r), "provider");
 });
 
+test("composed-output prose without a transport anchor → none (content must not latch)", () => {
+	const r = makeResult({ exitCode: 1, stopReason: "error", messages: [assistantMsg("The background process was terminated by the supervisor.")] });
+	equal(classifyProviderFailure(r), "none");
+	const r2 = makeResult({ exitCode: 1, stopReason: "error", messages: [assistantMsg("the docs mention no credits and rate limits for the v2 API")] });
+	equal(classifyProviderFailure(r2), "exhaustion", "transport-anchored prose still classifies (no credits → exhaustion)");
+});
+
+test("stderr trailing-window: a stale early provider blip does not latch a later death", () => {
+	// A RECOVERED blip sits >8KB before the end (benign agent logs fill the gap);
+	// the terminal text is unrelated → the blip must not latch a bug crash.
+	const stale = "Connection error. retrying...\n".repeat(50);
+	const filler = "agent step ok\n".repeat(1000); // ~13KB benign tail context
+	const r = makeResult({ exitCode: 1, stderr: stale + filler + "TypeError: x is not a function\n at run (app.ts:3:1)" });
+	equal(classifyProviderFailure(r), "none");
+	const r2 = makeResult({ exitCode: 1, stderr: stale + filler + "Connection error. retrying..." });
+	equal(classifyProviderFailure(r2), "connection", "a terminal provider signature within the window classifies");
+});
+
 test("cut with stderr connection signature → connection (always-scanned stderr)", () => {
 	const r = makeResult({ exitCode: 0, stopReason: "cut", stderr: "Connection error. retrying..." });
 	equal(classifyProviderFailure(r), "connection");
@@ -614,10 +635,44 @@ test("duration/measurement shapes → none (numeric right-guard)", () => {
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: 'level=info msg="upstream ok in 500ms"' })), "none");
 });
 
+test("space-delimited duration shapes → none (unit-suffix guard, code-review round)", () => {
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "api responded in 500 ms" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "request took 402 ms to complete" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "retrying api call after 500 ms" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "upstream latency 402.5 ms" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "cached in 500 mb of ram" })), "none");
+});
+
 section("scanForProviderFailure / stripStackFrames — #496 two-pass scan");
 
 test("stripStackFrames removes path:line[:col] tails", () => {
 	equal(stripStackFrames("boom at /a/b/index.ts:402:11 done"), "boom at  done");
+});
+
+test("stripLocalLines removes loopback-targeted lines only", () => {
+	equal(stripLocalLines("Error: connect ECONNREFUSED 127.0.0.1:5432"), "");
+	equal(stripLocalLines("unix:///var/run/docker.sock: permission denied"), "");
+	equal(stripLocalLines("Connection error.\nrefused by localhost db\n402 from api.deepseek.com:443"), "Connection error.\n402 from api.deepseek.com:443");
+});
+
+// #496 mid-stream socket vocabulary aligned with pi's own retry.js (code-review
+// round: these terminal texts were empirically-verified misses).
+test("mid-stream socket/transport deaths classify as connection", () => {
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, errorMessage: "connection lost" })), "connection");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, errorMessage: "other side closed" })), "connection");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "stream ended before message_stop" })), "connection");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "TypeError: fetch failed" })), "connection");
+});
+
+test("loopback-only local-dependency failures → none (doomed re-dispatch must not fire)", () => {
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Error: connect ECONNREFUSED 127.0.0.1:5432" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "connect ECONNREFUSED localhost:5432" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" })), "none");
+});
+
+test("genuine provider transport line survives local-line stripping", () => {
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "localhost:5432 down\n402 from api.deepseek.com:443" })), "exhaustion");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "docker daemon down\nConnection error." })), "connection");
 });
 
 test("scanForProviderFailure: phrase on stripped text; numeric anchored on original", () => {
@@ -632,22 +687,117 @@ test("scanForProviderFailure: phrase on stripped text; numeric anchored on origi
 
 section("shouldFallbackDispatch — #496 decision matrix");
 
+// Default decision: enabled, no abort, explicit fallback model on a DIFFERENT
+// family than attempt 0 (the recovery case every matrix row below exercises).
+const DEFAULT_DECISION = {
+	fallbackDisabled: false,
+	signalAborted: false,
+	attempt0Model: "deepseek-v4-flash",
+	fallbackModel: "qwen/qwen3.8-max",
+	fallbackModelExplicit: true,
+};
+
 test("provider class + enabled + not aborted → true", () => {
-	ok(shouldFallbackDispatch({ providerFailureClass: "connection", fallbackDisabled: false, signalAborted: false }));
-	ok(shouldFallbackDispatch({ providerFailureClass: "exhaustion", fallbackDisabled: false, signalAborted: false }));
-	ok(shouldFallbackDispatch({ providerFailureClass: "provider", fallbackDisabled: false, signalAborted: false }));
+	ok(shouldFallbackDispatch({ ...DEFAULT_DECISION, providerFailureClass: "connection" }));
+	ok(shouldFallbackDispatch({ ...DEFAULT_DECISION, providerFailureClass: "provider" }));
+	ok(shouldFallbackDispatch({ ...DEFAULT_DECISION, providerFailureClass: "exhaustion" }));
 });
 
 test("class none → false", () => {
-	equal(shouldFallbackDispatch({ providerFailureClass: "none", fallbackDisabled: false, signalAborted: false }), false);
+	equal(shouldFallbackDispatch({ ...DEFAULT_DECISION, providerFailureClass: "none" }), false);
 });
 
 test("fallbackDisabled → false even for a provider class", () => {
-	equal(shouldFallbackDispatch({ providerFailureClass: "connection", fallbackDisabled: true, signalAborted: false }), false);
+	equal(shouldFallbackDispatch({ ...DEFAULT_DECISION, providerFailureClass: "connection", fallbackDisabled: true }), false);
 });
 
 test("signalAborted → false even for a provider class", () => {
-	equal(shouldFallbackDispatch({ providerFailureClass: "connection", fallbackDisabled: false, signalAborted: true }), false);
+	equal(shouldFallbackDispatch({ ...DEFAULT_DECISION, providerFailureClass: "connection", signalAborted: true }), false);
+});
+
+test("exhaustion same-account default/default → false (doomed 402 duplicate, #476/#497)", () => {
+	// Attempt 0 rides pi's default model (no agent.model) + fallback env unset →
+	// both resolve to the same default account → skip the doomed re-run.
+	equal(
+		shouldFallbackDispatch({
+			providerFailureClass: "exhaustion",
+			fallbackDisabled: false,
+			signalAborted: false,
+			attempt0Model: undefined,
+			fallbackModel: "deepseek-v4-pro",
+			fallbackModelExplicit: false,
+		}),
+		false,
+	);
+});
+
+test("exhaustion same-family bare ids → false", () => {
+	equal(
+		shouldFallbackDispatch({
+			...DEFAULT_DECISION,
+			providerFailureClass: "exhaustion",
+			fallbackModelExplicit: false,
+			fallbackModel: "deepseek-v4-pro",
+		}),
+		false,
+	);
+});
+
+test("exhaustion cross-account (default dispatch, explicit qwen fallback) → true", () => {
+	equal(
+		shouldFallbackDispatch({
+			...DEFAULT_DECISION,
+			providerFailureClass: "exhaustion",
+			attempt0Model: undefined,
+			fallbackModel: "qwen/qwen3.8-max",
+		}),
+		true,
+	);
+});
+
+test("exhaustion unknown-bare ids (not provably same account) → true", () => {
+	ok(
+		shouldFallbackDispatch({
+			...DEFAULT_DECISION,
+			providerFailureClass: "exhaustion",
+			attempt0Model: "pinned-primary-model",
+			fallbackModel: "stub-fallback-model",
+		}),
+	);
+});
+
+test("connection/provider classes ignore the exhaustion gate (same-family still falls back)", () => {
+	// Same-family default config is fine for connection/provider: a transient
+	// blip can clear between attempts — only account-scoped 402 is doomed.
+	ok(
+		shouldFallbackDispatch({
+			...DEFAULT_DECISION,
+			providerFailureClass: "connection",
+			fallbackModelExplicit: false,
+			fallbackModel: "deepseek-v4-pro",
+		}),
+	);
+});
+
+section("modelProviderFamily / exhaustionFallbackDoomed — #496 same-account gate");
+
+test("qualified ids → provider; known bare ids → family; unknown bare/null → null", () => {
+	equal(modelProviderFamily("qwen/qwen3.8-max"), "qwen");
+	equal(modelProviderFamily("deepseek/deepseek-v4-pro"), "deepseek");
+	equal(modelProviderFamily("deepseek-v4-flash"), "deepseek");
+	equal(modelProviderFamily("qwen3.8-max"), "qwen");
+	equal(modelProviderFamily("kimi-k3"), "kimi");
+	equal(modelProviderFamily("glm-5.2"), "zai");
+	equal(modelProviderFamily("stub-fallback-model"), null);
+	equal(modelProviderFamily(undefined), null);
+});
+
+test("exhaustionFallbackDoomed: default/default doomed; explicit different family not", () => {
+	ok(exhaustionFallbackDoomed({ attempt0Model: undefined, fallbackModel: "deepseek-v4-pro", fallbackModelExplicit: false }));
+	equal(exhaustionFallbackDoomed({ attempt0Model: undefined, fallbackModel: "qwen/qwen3.8-max", fallbackModelExplicit: true }), false);
+	equal(exhaustionFallbackDoomed({ attempt0Model: "deepseek-v4-flash", fallbackModel: "deepseek-v4-pro", fallbackModelExplicit: false }), true);
+	equal(exhaustionFallbackDoomed({ attempt0Model: "qwen/qwen3.8-max", fallbackModel: "deepseek-v4-pro", fallbackModelExplicit: false }), false);
+	equal(exhaustionFallbackDoomed({ attempt0Model: "pinned-primary-model", fallbackModel: "stub-fallback-model", fallbackModelExplicit: false }), false);
 });
 
 section("getSubagentFallbackModel — #496 env resolution");

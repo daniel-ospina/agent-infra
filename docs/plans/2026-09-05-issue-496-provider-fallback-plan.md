@@ -54,31 +54,47 @@ Gating (all must hold or → `"none"`):
 2. `stopReason` NOT in `{"timeout", "aborted"}` — those are OUR kills (per-task cap /
    user abort), not provider deaths; re-dispatch would be wrong (worker may have been
    productive; abort must be honored).
-3. **TWO-PASS SCAN over each scanned field** (`errorMessage`, `stderr`, and output when
+3. **TWO-PASS SCAN over each scanned field** (`errorMessage`, stderr-TAIL, and output when
    scanned):
+   - **TEXT PRE-CLEAN** (both passes) — `stripLocalLines` removes WHOLE lines that
+     reference loopback/unix targets (`127.0.0.1|localhost|::1|unix:|0.0.0.0`): a down
+     localhost DB / docker daemon is local-dependency noise, not provider evidence, and a
+     doomed re-dispatch cannot help it. Provider transport lines never reference loopback
+     → no genuine signature is lost (code-review round: reproduced latch `Error: connect
+     ECONNREFUSED 127.0.0.1:5432`).
    - **PHRASE scan on STRIPPED text** — first remove stack-frame tails
      (`[\w$@./:-]+:\d+(?::\d+)?` — `index.ts:402:11`, `loader:507:10`,
      `lib/api/request.js:402:11`, `src/provider.ts:507:10`), then match the text phrases
      below.
-   - **NUMERIC scan on the ORIGINAL (unstripped) text** — numerics are left-delimited
+   - **NUMERIC scan on the cleaned (unstripped) text** — numerics are left-delimited
      `(?<![\w$@./:-])(402|429|5\d\d)(?![a-z])` (a glued `:402` in a frame path is
-     excluded by the left guard; a duration `512ms`/`500ms` is excluded by the right
-     guard) AND adjacent (≤25 chars, either direction) to a transport/API token
+     excluded by the left guard; a letter/unit suffix is excluded by the right guards:
+     `512ms`, the SPACE-DELIMITED latency log `500 ms`, and the decimal `402.5 ms` all
+     stay out — duration/measurement shapes → none; the code-review round found the
+     original `(?![a-z])` guard missed space-delimited `500 ms`/`402.5 ms` forms) AND
+     adjacent (≤25 chars, either direction) to a transport/API token
      (`http|status|response|request|api|provider|upstream|message`). This keeps genuine
      port-bearing/gateway shapes (`402 from api.deepseek.com:443`, `error 402 from
      https://api.deepseek.com:443`, `504 from https://proxy:8443` — transport word
-     survives in the ORIGINAL text even though the strip would delete the glued host)
+     survives in the cleaned text even though the strip would delete the glued host)
      while no stack frame or measurement shape can match.
-   Then the always-scanned fields are `errorMessage + stderr` (for EVERY stopReason,
-   including a "cut" whose in-band `errorMessage` still carries the provider signature
-   from a `message_end` error event before signal-death); the composed result output
-   (`getResultOutput`) is additionally scanned ONLY when `exitCode !== 0 || stopReason ===
-   "error"` (mirrors `isFailedResult`'s own failure disjunction; a pi run that exits 0 but
-   carries a final `message_end` with `stopReason "error"` IS a failure and its content
-   must be scanned). A clean exit whose output merely MENTIONS the phrase is not a
-   provider failure. `stopReason === "cut"` classifies via the always-scanned
-   (two-pass) `errorMessage`/`stderr` fields ONLY (a cut's exitCode stays 0 — its output
-   content is NOT scanned; a marker-less cut = no signature in either field =
+   Then the always-scanned fields are `errorMessage` (FULL) + the **stderr TAIL — last
+   8KB** (`stderr.slice(-8192)`) for EVERY stopReason, including a "cut" whose in-band
+   `errorMessage` still carries the provider signature from a `message_end` error event
+   before signal-death. The stderr window bounds the classifier to the terminal death
+   context: a RECOVERED early provider blip (pi retries internally) or MCP/local-tool
+   noise farther than 8KB from the end can no longer latch a later non-provider death
+   (code-review round: full-buffer scanning let an early blip latch a bug crash); the
+   composed result output (`getResultOutput`) is additionally scanned ONLY when
+   `exitCode !== 0 || stopReason === "error"` AND the field carries a strong transport
+   anchor (`OUTPUT_PHRASE_ANCHOR = https?|api|provider|upstream|status|response` —
+   deliberately excludes the loose prose words request/message). Composed output is
+   AGENT/LLM prose — content, not provider evidence: bare "terminated"/"no credits" prose
+   must never re-run the task (code-review round: reproduced content latch "The
+   background process was terminated by the supervisor."). A clean exit whose output
+   merely MENTIONS the phrase is not a provider failure. `stopReason === "cut"` classifies
+   via the always-scanned `errorMessage`/stderr-TAIL fields ONLY (a cut's exitCode stays 0
+   — its output content is NOT scanned; a marker-less cut = no signature in either field =
    bug-crash/backstop/OOM — the #476 "bug-crash must not latch" analog; a cut that
    carries an in-band error signature DOES classify — genuine provider-death-then-signal
    recovery must not be silently missed).
@@ -91,8 +107,8 @@ cannot match. Text phrases are loose. Case-insensitive; ordered for reporting pr
 
 | class | patterns |
 |---|---|
-| `exhaustion` | phrases: `insufficient balance`, `credit balance too low`, `out of credits`, `insufficient credits`, `no credits`, `payment required`; numeric `402`: ≤25-char transport adjacency either direction (token list below) — ALL numerics carry the §1 gate-3 guards `(?<![\w$@./:-])`…`(?![a-z])` (the table shows the adjacency shape only; never match a bare numeric without the guards) |
-| `connection` | `connection error`, `terminated`, `econnreset`, `econnrefused`, `enotfound`, `etimedout`, `epipe`, `socket hang up`, `network error`, `connect timed out` |
+| `exhaustion` | phrases: `insufficient balance`, `credit balance too low`, `out of credits`, `insufficient credits`, `no credits`, `payment required`; numeric `402`: ≤25-char transport adjacency either direction (token list below) — ALL numerics carry the §1 gate-3 guards `(?<![\w$@./:-])`…`(?![a-z])(?!\s*\.?\d*\s*(?:ms|us|ns|mb|kb|gb|bytes?|b|s|m|h)\b)` (the table shows the adjacency shape only; never match a bare numeric without the guards) |
+| `connection` | `connection error`, `connection lost`, `other side closed`, `stream ended`, `terminated`, `econnreset`, `econnrefused`, `enotfound`, `etimedout`, `epipe`, `socket hang up`, `network error`, `connect timed out`, `fetch failed` — the added mid-stream/socket family (`connection lost`, `other side closed`, `stream ended`, `fetch failed`) aligns with pi's OWN runtime retry vocabulary (pi-ai `RETRYABLE_PROVIDER_ERROR_PATTERN`): a run that DIED after pi exhausted its internal provider retries carrying these terminal texts is high-signal provider death (code-review round: empirically-verified misses on the mid-stream socket family) |
 | `provider` | phrases: `rate limit`, `too many requests`, `upstream error`, `provider error`, `internal server error`, `bad gateway`, `service unavailable`; numerics `429`/`5\d\d`: same transport-adjacency + §1 guards |
 
 Unit negatives MUST include realistic non-provider stderr (none of these can match
@@ -101,17 +117,35 @@ a node-internal frame (`node:internal/modules/cjs/loader:507:10`), TOKEN-BEARING
 frames (`.../node_modules/undici/lib/api/request.js:402:11`, `.../src/provider.ts:507:10`,
 `at getProvider (src/provider.ts:402:11)` — glued `:402` fails the numeric left guard),
 `Disk quota exceeded` (ENOSPC), an error-object dump containing `code: 429` with no
-transport token, and duration/measurement shapes (`api responded in 512ms`,
-`{"message":"done","elapsed":"500ms"}`, `upstream ok in 500ms` — the numeric right
-guard `(?![a-z])` excludes unit-suffixed codes) — each asserting `"none"`.
+transport token, duration/measurement shapes (`api responded in 512ms`,
+`{"message":"done","elapsed":"500ms"}`, `upstream ok in 500ms`, AND the
+space-delimited/decimal forms `api responded in 500 ms`, `request took 402 ms to
+complete`, `upstream latency 402.5 ms` — code-review round), loopback-only local
+dependency failures (`Error: connect ECONNREFUSED 127.0.0.1:5432`, docker daemon
+`unix://` line), composed-output prose without a transport anchor ("The background
+process was terminated by the supervisor."), and a stale early blip >8KB before a
+non-provider terminal error (stderr trailing-window) — each asserting `"none"`.
 
 ### 2. Decision — `shouldFallbackDispatch(...)` (exported, unit-tested)
 
 All must hold: `classifyProviderFailure(...) !== "none"`, fallback enabled
-(`SUBAGENT_FALLBACK_DISABLE !== "1"`), caller signal not aborted, and this is NOT already
-a fallback attempt (orchestrator guarantees by structure — max 1). Mirrors builtin
-`shouldFallback` shape (env kill-switch + max-1-fallback + signature gate) minus the
-qwen-only provider gate (generalized per issue).
+(`SUBAGENT_FALLBACK_DISABLE !== "1"`), caller signal not aborted, this is NOT already
+a fallback attempt (orchestrator guarantees by structure — max 1), and — NEW for the
+`exhaustion` class specifically — the fallback is not a PROVABLY-DOOMED same-account
+duplicate (`exhaustionFallbackDoomed`): 402 is account-scoped (#476), so re-running the
+full task on the same exhausted account cannot recover yet re-executes side effects at
+~2× cost (the exact harm #497 documents). Doomed when (a) attempt 0 rode pi's default
+model (no `agent.model`) AND the fallback env is UNSET (both resolve to the same default
+family — the common default-config case), or (b) both model families are KNOWN-equal
+(`modelProviderFamily`: provider for `provider/model` ids, known family for bare
+`deepseek`/`qwen`/`kimi`/`glm` ids, null for unknown bare ids — a provably-cross-account
+exhaustion fallback, e.g. default dispatch + explicit `qwen/...` fallback or a qwen/kimi
+primary (#284 second-model gate) + default deepseek fallback, STILL fires). The
+orchestrator logs an honest-failure line to stderr when the exhaustion skip applies. The
+connection/provider classes IGNORE this gate (a transient blip can clear between
+attempts — only account-scoped 402 is doomed). Mirrors builtin `shouldFallback` shape
+(env kill-switch + max-1-fallback + signature gate) minus the qwen-only provider gate
+(generalized per issue).
 
 ### 3. Fallback model — `getSubagentFallbackModel()` (exported, unit-tested)
 
@@ -119,12 +153,12 @@ qwen-only provider gate (generalized per issue).
 `TASK_FALLBACK_MODEL`). NO `--provider` flag on either attempt: primary dispatches pass
 none today and the child resolves provider from model config; passing a bare model keeps
 child-side resolution identical to today and leaves #476's latch-aware resolution (which
-will slot in here) authoritative. Documented residual: if the fallback model re-resolves
-to the SAME exhausted provider, the fallback fails → explicit per-dispatch failure (the
-honest outcome). NOTE: today's repo default (`deepseek-v4-pro`) is same-provider for most
-dispatches — real recovery value in the common config requires the operator to point
-`SUBAGENT_FALLBACK_MODEL` at a provider-diverse model, or #476's latch-aware alias-chain
-(which is the actual exhaustion fix).
+will slot in here) authoritative. The default-config same-provider residual is now
+HANDLED at the decision gate (§2): a default-config 402 no longer pays a doomed
+duplicate run — recovery value requires `SUBAGENT_FALLBACK_MODEL` to point at a
+provider-diverse model, or #476's latch-aware alias-chain (the actual exhaustion fix).
+NOTE: the operator's env choice is trusted — an EXPLICIT same-family fallback still
+falls back (their informed choice).
 
 ### 4. Orchestration — `runSingleAgent` (public signature UNCHANGED)
 
@@ -134,8 +168,15 @@ Refactor: the existing single-spawn body becomes an internal per-attempt closure
 ```
 agent lookup + unknown-agent early return        (unchanged — never falls back)
 fallbackModel = getSubagentFallbackModel();      (resolved once)
+fallbackModelExplicit = SUBAGENT_FALLBACK_MODEL set non-empty
 result = await runAttempt(false)                 (attempt 0 — args/env byte-identical to today)
-if shouldFallbackDispatch(classify(result), env, signal):
+willFallback = shouldFallbackDispatch({ classify(result), fallbackDisabled,
+                                        signalAborted, attempt0Model: agent.model,
+                                        fallbackModel, fallbackModelExplicit })
+if !willFallback && class == exhaustion && !disabled && !aborted:
+    log to stderr: "[subagent] provider failure (exhaustion) not re-dispatched: ..."
+    (honest-failure visibility — default-config 402 is account-scoped; §2)
+if willFallback:
     log to stderr: "[subagent] provider fallback: <from> → <to> (<class>)"
     result = await runAttempt(true)              (attempt 1)
 return result                                    (attempt 1's result, annotated, wins)
@@ -251,7 +292,7 @@ invisible to them (each `runSingleAgent` call just returns a recovered result).
 | file | layer | covers |
 |---|---|---|
 | `extensions/subagent/index.test.ts` (extend) | unit | `classifyProviderFailure` (per class + positives: exit-0 + stopReason "error" in-band, cut with stderr signature → classifies per §1 always-scan, cut carrying an in-band `errorMessage` provider signature → classifies (genuine provider-death-then-signal), port-bearing transport positives `402 from api.deepseek.com:443`, `error 402 from https://api.deepseek.com:443`, `504 from https://proxy:8443`; negatives: success, agent-error text, unknown-agent, exit-0 output mentions, timeout, aborted, marker-less cut, realistic non-provider stderr: JS stack frame `index.ts:402:11`, node-internal frame `loader:507:10`, token-bearing module frames `lib/api/request.js:402:11` + `src/provider.ts:507:10` + `at getProvider (src/provider.ts:402:11)`, `Disk quota exceeded` (ENOSPC), error-object dump `code: 429` without transport token, duration/measurement text `api responded in 512ms` + `{"message":"done","elapsed":"500ms"}` + `upstream ok in 500ms`), `shouldFallbackDispatch` decision matrix (disable env, signal aborted, class none), `getSubagentFallbackModel` env resolution (default/override/blank), source-drift pins for orchestrator wiring |
-| `extensions/subagent/provider-fallback.test.ts` (NEW) | hermetic E2E (stub contract above) | 1. single-mode recovery: attempt 0 exhaustion-fail → attempt 1 success; assert success, `fallbackTo` set, `fallbackFrom`, `result.model === fallbackModel`, spawn log = 2 lines, TWO distinct cache dirs exist and returned `cachePath` = attempt-1's dir. 2. success-path regression: always-success stub → 1 spawn, NO `fallbackFrom`/`fallbackTo`. 3. non-provider failure negative: `nonprovider` mode → 1 spawn, no annotation (bug-crash must NOT latch, E2E). 4. single-mode double-failure (`always-fail` mode): stub fails both attempts → explicit failure + `fallbackFrom`/`fallbackTo` set, spawn log = 2, no attempt 2. 5. parallel-mode recovery (headline): N tasks, all fail attempt 0 / succeed attempt 1 → `successCount == N`, spawn log = 2N, each recovered result carries `fallbackTo`. 6. parallel always-fail (`always-fail` mode): N tasks fail both attempts → batch completes with N explicit per-dispatch failures, spawn log = 2N (recovery attempted per dispatch; no silent whole-batch loss). 7. chain continuation: step 1 recovers (fail→succeed), step 2 succeeds → chain completes 2/2 steps, spawn log = 3. 8. disable-env: `SUBAGENT_FALLBACK_DISABLE=1` + exhaustion mode → 1 spawn, no recovery. 9. abort during attempt 1 (`hold-attempt-1` mode): attempt 0 fails; attempt-1 stub appends its spawn-log line then sleeps; abort fired after the poller observes the attempt-1 line → attempt-1 killed → settles `stopReason "aborted"`, spawn count = 2, no attempt 2 (deterministic — abort lands during the attempt's settle, not the synchronous orchestrator window; attempt-1 log-before-sleep ordering closes the race). 10. connection-mode variant of row 1 (stderr-only signature path) |
+| `extensions/subagent/provider-fallback.test.ts` (NEW) | hermetic E2E (stub contract above) | 1. single-mode recovery: attempt 0 exhaustion-fail → attempt 1 success; assert success, `fallbackTo` set, `fallbackFrom`, `result.model === fallbackModel`, spawn log = 2 lines, TWO distinct cache dirs exist and returned `cachePath` = attempt-1's dir. 2. success-path regression: always-success stub → 1 spawn, NO `fallbackFrom`/`fallbackTo`. 3. non-provider failure negative: `nonprovider` mode → 1 spawn, no annotation (bug-crash must NOT latch, E2E). 4. single-mode double-failure (`always-fail` mode): stub fails both attempts → explicit failure + `fallbackFrom`/`fallbackTo` set, spawn log = 2, no attempt 2. 5. parallel-mode recovery (headline): N tasks, all fail attempt 0 / succeed attempt 1 → `successCount == N`, spawn log = 2N, each recovered result carries `fallbackTo`. 6. parallel always-fail (`always-fail` mode): N tasks fail both attempts → batch completes with N explicit per-dispatch failures, spawn log = 2N (recovery attempted per dispatch; no silent whole-batch loss). 7. chain continuation: step 1 recovers (fail→succeed), step 2 succeeds → chain completes 2/2 steps, spawn log = 3. 8. disable-env: `SUBAGENT_FALLBACK_DISABLE=1` + exhaustion mode → 1 spawn, no recovery. 9. abort during attempt 1 (`hold-attempt-1` mode): attempt 0 fails; attempt-1 stub appends its spawn-log line then sleeps; abort fired after the poller observes the attempt-1 line → attempt-1 killed → settles `stopReason "aborted"`, spawn count = 2, no attempt 2 (deterministic — abort lands during the attempt's settle, not the synchronous orchestrator window; attempt-1 log-before-sleep ordering closes the race). 10. connection-mode variant of row 1 (stderr-only signature path). 11. exhaustion + UNSET fallback env (same-account default): the §2 gate skips the doomed duplicate — 1 spawn, no annotation, honest explicit failure. Suite also clears the abort-test's losing 15s race guard timer so the suite exits immediately on the success path (code-review round: the un-cleared timer idled the suite ~15s/run). |
 
 No CI wiring in this issue: extensions/builtin-tools + subagent suites require the pi
 runtime packages + real `pi` binary, which the GitHub runner lacks (#498 tracks
@@ -285,3 +326,13 @@ extension-farm CI wiring). New + existing suites run locally via the repo recipe
   error`) and trigger a fallback attempt that would hang the suite for hours. The
   disable env keeps the real-pi suites deterministically on the non-fallback path; the
   fallback path is covered by the hermetic stub suite instead.
+- **Code-review convergence (PR #505, 4 parallel reviewers → 0 P0/P1):** every P2
+  finding was triaged, empirically verified, and fixed in this revision — classifier
+  false-positives (space-delimited/decimal duration numerics, loopback-local dependency
+  lines, composed-output prose without a transport anchor, stale early blips via the
+  stderr terminal window) and false-negatives (pi retry.js mid-stream socket vocabulary:
+  `connection lost` / `other side closed` / `stream ended` / `fetch failed`) were both
+  closed with regression rows; the default-config exhaustion 402 no longer pays a doomed
+  same-account duplicate run (§2 gate + honest-failure log); the hermetic abort test's
+  leaked 15s guard timer is cleared (suite wall 20.8s → 9.7s). Final suite counts:
+  index.test.ts 104/104, provider-fallback.test.ts 13/13, real-pi suites green.

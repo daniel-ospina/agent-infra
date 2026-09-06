@@ -479,20 +479,34 @@ type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 export type ProviderFailureClass = "none" | "connection" | "exhaustion" | "provider";
 
 /** Text-phrase signatures per class (case-insensitive). Numeric status codes are
- * handled separately (see NUMERIC_STATUS) — bare numerics never match. */
+ * handled separately (see NUMERIC_STATUS) — bare numerics never match. The
+ * connection set aligns with pi's OWN runtime retry vocabulary (pi-ai
+ * RETRYABLE_PROVIDER_ERROR_PATTERN: connection lost / other side closed /
+ * fetch failed / stream-ended shapes): a run that DIED after pi exhausted its
+ * internal provider retries carrying these terminal texts is high-signal
+ * provider death (code-review round: empirically-verified misses on the
+ * mid-stream socket family). */
 const PROVIDER_PHRASE_PATTERNS: Array<[ProviderFailureClass, RegExp]> = [
 	["exhaustion", /insufficient balance|credit balance too low|out of credits|insufficient credits|no credits|payment required/i],
-	["connection", /connection error|terminated|econnreset|econnrefused|enotfound|etimedout|epipe|socket hang up|network error|connect timed out/i],
+	["connection", /connection error|connection lost|other side closed|stream ended|terminated|econnreset|econnrefused|enotfound|etimedout|epipe|socket hang up|network error|connect timed out|fetch failed/i],
 	["provider", /rate limit|too many requests|upstream error|provider error|internal server error|bad gateway|service unavailable/i],
 ];
 
 /** Transport/API tokens that may anchor a numeric status code within 25 chars. */
 const NUMERIC_ANCHOR = /(?:http|status|response|request|api|provider|upstream|message)/i;
 
+/** Strong transport tokens that must co-occur for a PHRASE match to count on the
+ * composed-output channel (agent prose). Deliberately excludes the loose prose
+ * words request/message — a composed "the request was terminated" must not
+ * latch. */
+const OUTPUT_PHRASE_ANCHOR = /(?:https?|api|provider|upstream|status|response)/i;
+
 /** Numeric status candidates: left-delimited (a glued `:402` inside a frame path
- * `request.js:402:11` is excluded) and right-delimited (a unit-suffixed duration
- * `512ms` is excluded). */
-const NUMERIC_STATUS = /(?<![\w$@./:-])(402|429|5\d\d)(?![a-z])/g;
+ * `request.js:402:11` is excluded) and right-delimited against a letter AND an
+ * optional-space/decimal unit suffix — `512ms`, the space-delimited latency log
+ * `500 ms`, and `402.5 ms` all stay out (duration/measurement shapes → none),
+ * while `HTTP 429` and `402 {` keep matching. */
+const NUMERIC_STATUS = /(?<![\w$@./:-])(402|429|5\d\d)(?![a-z])(?!\s*\.?\d*\s*(?:ms|us|ns|mb|kb|gb|bytes?|b|s|m|h)\b)/g;
 
 function numericClassFor(code: string): ProviderFailureClass | null {
 	if (code === "402") return "exhaustion";
@@ -508,21 +522,38 @@ export function stripStackFrames(text: string): string {
 	return text.replace(/[\w$@./:-]+:\d+(?::\d+)?/g, "");
 }
 
+/** #496: strip LINES that reference loopback/unix targets — local-dependency
+ * noise (a down localhost DB / docker daemon / local MCP server) is NOT provider
+ * evidence and a doomed re-dispatch cannot help it. Provider transport lines
+ * never reference loopback, so no genuine signature is lost. */
+export function stripLocalLines(text: string): string {
+	return text
+		.split("\n")
+		.filter((line) => !/(?:127\.0\.0\.1|localhost|::1|unix:|0\.0\.0\.0)/i.test(line))
+		.join("\n");
+}
+
 /** #496: two-pass signature scan over ONE field. Pass 1 — text phrases on the
- * stack-frame-stripped text. Pass 2 — guarded numeric status codes on the
- * ORIGINAL text, adjacent (≤25 chars, either direction) to a transport/API
- * token. Returns the class or "none". */
-export function scanForProviderFailure(text: string): ProviderFailureClass {
+ * stack-frame-stripped, loopback-noise-free text. Pass 2 — guarded numeric
+ * status codes on the same cleaned text (port-glued transport hosts like
+ * `api.deepseek.com:443` survive — only whole loopback lines are removed),
+ * adjacent (≤25 chars, either direction) to a transport/API token. Returns the
+ * class or "none". `requireTransportAnchor` is for the COMPOSED-OUTPUT channel
+ * (agent/LLM prose is content, not provider evidence): when set, both passes run
+ * only if the field carries a transport/API token at all. */
+export function scanForProviderFailure(text: string, requireTransportAnchor = false): ProviderFailureClass {
 	if (!text) return "none";
-	const stripped = stripStackFrames(text);
+	const cleaned = stripLocalLines(text);
+	if (requireTransportAnchor && !OUTPUT_PHRASE_ANCHOR.test(cleaned)) return "none";
+	const stripped = stripStackFrames(cleaned);
 	for (const [cls, re] of PROVIDER_PHRASE_PATTERNS) {
 		if (re.test(stripped)) return cls;
 	}
-	for (const m of text.matchAll(NUMERIC_STATUS)) {
+	for (const m of cleaned.matchAll(NUMERIC_STATUS)) {
 		const cls = numericClassFor(m[0]);
 		if (!cls) continue;
-		const before = text.slice(Math.max(0, (m.index ?? 0) - 25), m.index ?? 0);
-		const after = text.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 25);
+		const before = cleaned.slice(Math.max(0, (m.index ?? 0) - 25), m.index ?? 0);
+		const after = cleaned.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 25);
 		if (NUMERIC_ANCHOR.test(before) || NUMERIC_ANCHOR.test(after)) return cls;
 	}
 	return "none";
@@ -537,15 +568,27 @@ export function scanForProviderFailure(text: string): ProviderFailureClass {
  * (signal-death) classifies ONLY via the always-scanned fields: its exitCode stays
  * 0 so its output content is not scanned; a marker-less cut (no signature in
  * errorMessage/stderr) is a bug-crash/backstop/OOM and returns "none". */
+/** #496: terminal-context window for the always-scanned stderr channel (bytes
+ * from the END). stderr accumulates the child's ENTIRE session — MCP/local-tool
+ * noise and RECOVERED early provider blips (pi retries internally before this
+ * run's terminal failure). Only the trailing region is the death context: a
+ * genuine provider death prints its terminal error last (code-review round:
+ * full-buffer scanning let a recovered early blip latch a later non-provider
+ * death). */
+const STDERR_TERMINAL_WINDOW = 8 * 1024;
+
 export function classifyProviderFailure(result: SingleResult): ProviderFailureClass {
 	if (!isFailedResult(result)) return "none";
 	if (result.stopReason === "timeout" || result.stopReason === "aborted") return "none";
-	const fields: string[] = [result.errorMessage ?? "", result.stderr ?? ""];
-	if (result.exitCode !== 0 || result.stopReason === "error") {
-		fields.push(getResultOutput(result));
-	}
-	for (const field of fields) {
+	const stderr = (result.stderr ?? "").slice(-STDERR_TERMINAL_WINDOW);
+	for (const field of [result.errorMessage ?? "", stderr]) {
 		const cls = scanForProviderFailure(field);
+		if (cls !== "none") return cls;
+	}
+	// Composed output is agent/LLM prose — scanned only with a transport anchor
+	// (bare "terminated"/"no credits" prose must never re-run the task).
+	if (result.exitCode !== 0 || result.stopReason === "error") {
+		const cls = scanForProviderFailure(getResultOutput(result), true);
 		if (cls !== "none") return cls;
 	}
 	return "none";
@@ -558,17 +601,67 @@ export interface FallbackDispatchDecision {
 	fallbackDisabled: boolean;
 	/** Orchestrator re-checks the abort signal before spawning attempt 1. */
 	signalAborted: boolean;
+	/** The model attempt 0 dispatched (agent.model; undefined → the child rides
+	 * pi's own default model). Feeds the exhaustion same-account gate. */
+	attempt0Model?: string;
+	/** The resolved fallback model id (getSubagentFallbackModel()). */
+	fallbackModel: string;
+	/** SUBAGENT_FALLBACK_MODEL set by the operator (non-empty). */
+	fallbackModelExplicit: boolean;
+}
+
+/** #496: provider family of a model id — the provider for provider-qualified
+ * ids (qwen/qwen3.8-max, deepseek/deepseek-v4-pro), the known family for bare
+ * ids of the configured families, and null for unknown bare ids (resolution
+ * follows pi's own rules at spawn time — the account cannot be proven). */
+export function modelProviderFamily(model: string | undefined): string | null {
+	if (!model) return null;
+	const slash = model.indexOf("/");
+	if (slash > 0) return model.slice(0, slash).toLowerCase();
+	if (/^deepseek/i.test(model)) return "deepseek";
+	if (/^qwen/i.test(model)) return "qwen";
+	if (/^kimi/i.test(model)) return "kimi";
+	if (/^glm/i.test(model)) return "zai";
+	return null;
+}
+
+/** #496: is an exhaustion (402) fallback a GUARANTEED-DOOMED same-account
+ * duplicate? 402 is account-scoped (#476): re-running the full task on the same
+ * exhausted account cannot recover, yet re-executes side effects at ~2× cost —
+ * the exact harm #497 documents for 402-after-tool-calls. Doomed when attempt 0
+ * rode pi's default model and the fallback env is unset (both resolve to the
+ * same default family), OR both model families are known-equal. When the
+ * fallback model is explicitly set to a DIFFERENT family (qwen/kimi/…) the
+ * exhaustion fallback stays on — cross-account recovery is the only 402 fix. */
+export function exhaustionFallbackDoomed(o: {
+	attempt0Model: string | undefined;
+	fallbackModel: string;
+	fallbackModelExplicit: boolean;
+}): boolean {
+	if (o.attempt0Model === undefined || o.attempt0Model === "") {
+		// attempt 0 rides pi's default model; an UNSET fallback env rides the
+		// same default family → provably same account. An explicit fallback is
+		// the operator's informed choice — its account is not provable here.
+		return !o.fallbackModelExplicit;
+	}
+	const a = modelProviderFamily(o.attempt0Model);
+	const f = modelProviderFamily(o.fallbackModel);
+	return a !== null && f !== null && a === f;
 }
 
 /** #496: should attempt 0 be re-dispatched ONCE on the fallback model? All must
  * hold: fallback enabled (not SUBAGENT_FALLBACK_DISABLE), no abort in progress,
- * and the result is a genuine provider-failure class. Mirrors the builtin #152
- * shouldFallback shape minus the qwen-only provider gate (generalized). Max ONE
- * fallback is structural — the orchestrator never re-classifies attempt 1. */
+ * a genuine provider-failure class, and — for exhaustion specifically — the
+ * fallback must not be a provably doomed same-account duplicate
+ * (exhaustionFallbackDoomed). Mirrors the builtin #152 shouldFallback shape
+ * minus the qwen-only provider gate (generalized). Max ONE fallback is
+ * structural — the orchestrator never re-classifies attempt 1. */
 export function shouldFallbackDispatch(d: FallbackDispatchDecision): boolean {
 	if (d.fallbackDisabled) return false;
 	if (d.signalAborted) return false;
-	return d.providerFailureClass !== "none";
+	if (d.providerFailureClass === "none") return false;
+	if (d.providerFailureClass === "exhaustion" && exhaustionFallbackDoomed(d)) return false;
+	return true;
 }
 
 /** #496: fallback model for provider-failure re-dispatches. Mirrors builtin
@@ -615,6 +708,7 @@ export async function runSingleAgent(
 	// state machine (#208) and its own cache entry (#137 F6).
 	const fallbackModel = getSubagentFallbackModel();
 	const fallbackDisabled = process.env.SUBAGENT_FALLBACK_DISABLE === "1";
+	const fallbackModelExplicit = process.env.SUBAGENT_FALLBACK_MODEL !== undefined && process.env.SUBAGENT_FALLBACK_MODEL.trim() !== "";
 
 	const runAttempt = async (isFallback: boolean): Promise<SingleResult> => {
 		// #496: the model slot — agent.model on attempt 0; the fallback model on
@@ -1034,13 +1128,22 @@ export async function runSingleAgent(
 	// is re-checked so a user abort between attempts never spawns attempt 1.
 	let result = await runAttempt(false);
 	const failureClass = classifyProviderFailure(result);
-	if (
-		shouldFallbackDispatch({
-			providerFailureClass: failureClass,
-			fallbackDisabled,
-			signalAborted: signal?.aborted ?? false,
-		})
-	) {
+	const willFallback = shouldFallbackDispatch({
+		providerFailureClass: failureClass,
+		fallbackDisabled,
+		signalAborted: signal?.aborted ?? false,
+		attempt0Model: agent.model,
+		fallbackModel,
+		fallbackModelExplicit,
+	});
+	if (!willFallback && failureClass === "exhaustion" && !fallbackDisabled && !(signal?.aborted ?? false)) {
+		// #496: honest-failure visibility — a default-configuration 402 (same
+		// account) is NOT silently swallowed into a doomed duplicate run.
+		console.error(
+			`[subagent] provider failure (exhaustion) not re-dispatched: ${agent.model ?? "(default)"} and ${fallbackModel} ride the same account; set SUBAGENT_FALLBACK_MODEL to a different provider to enable 402 recovery`,
+		);
+	}
+	if (willFallback) {
 		console.error(
 			`[subagent] provider fallback: ${agent.model ?? "(default)"} → ${fallbackModel} (${failureClass}) after ${result.stopReason ?? `exit ${result.exitCode}`}`,
 		);

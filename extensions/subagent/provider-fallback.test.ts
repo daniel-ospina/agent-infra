@@ -123,11 +123,12 @@ function makeProjectCwd(agents: Array<{ name: string; model?: string }>): string
 	return dir;
 }
 
-function runTool(params: any, opts: { signal?: AbortSignal; cwd: string; mode?: string; logPath: string; fallbackDisabled?: boolean }): Promise<any> {
+function runTool(params: any, opts: { signal?: AbortSignal; cwd: string; mode?: string; logPath: string; fallbackDisabled?: boolean; unsetFallbackEnv?: boolean }): Promise<any> {
 	const prev = { mode: process.env.SUBAGENT_STUB_MODE, log: process.env.SUBAGENT_STUB_LOG, fb: process.env.SUBAGENT_FALLBACK_MODEL, dis: process.env.SUBAGENT_FALLBACK_DISABLE };
 	process.env.SUBAGENT_STUB_MODE = opts.mode ?? "exhaustion";
 	process.env.SUBAGENT_STUB_LOG = opts.logPath;
-	process.env.SUBAGENT_FALLBACK_MODEL = FALLBACK_MODEL;
+	if (opts.unsetFallbackEnv) delete process.env.SUBAGENT_FALLBACK_MODEL;
+	else process.env.SUBAGENT_FALLBACK_MODEL = FALLBACK_MODEL;
 	if (opts.fallbackDisabled) process.env.SUBAGENT_FALLBACK_DISABLE = "1";
 	else delete process.env.SUBAGENT_FALLBACK_DISABLE;
 	process.argv[1] = STUB_PATH;
@@ -292,6 +293,24 @@ test("non-provider failure negative: bug-crash stderr → 1 spawn, no annotation
 	equal(r.exitCode, 1);
 	equal(r.fallbackTo, undefined, "no fallback attempted for a non-provider failure");
 	equal(readSpawnLog(logPath).length, 1, "exactly 1 spawn");
+	fs.rmSync(cwd, { recursive: true, force: true });
+	fs.rmSync(logPath, { force: true });
+});
+
+test("exhaustion + UNSET fallback env (same-account default): no doomed duplicate — honest single failure", async () => {
+	// #496 code-review round: with the DEFAULT config (model-less agent → pi's
+	// default model family; SUBAGENT_FALLBACK_MODEL unset), a 402 is account-
+	// scoped (#476) — attempt 1 would re-run the FULL task on the same exhausted
+	// account (guaranteed-doomed, ~2× cost + re-executed side effects). The gate
+	// must keep the honest single-attempt failure instead.
+	const cwd = makeProjectCwd([{ name: "test-agent" }]);
+	const logPath = path.join(tmpRoot, `log-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+	const resp = await runTool(singleParams(cwd, `pfbt-doomed-${Date.now()}`), { cwd, logPath, mode: "exhaustion", unsetFallbackEnv: true });
+	const r = resp.details.results[0];
+	ok(resp.isError, "the honest single-attempt failure is an explicit error");
+	equal(r.stopReason, "error");
+	equal(r.fallbackTo, undefined, "no fallback annotation — no fallback happened");
+	equal(readSpawnLog(logPath).length, 1, "exactly ONE spawn (attempt 0) — no doomed duplicate");
 	fs.rmSync(cwd, { recursive: true, force: true });
 	fs.rmSync(logPath, { force: true });
 });
@@ -466,10 +485,14 @@ test("abort during the fallback attempt: attempt-1 settles 'aborted', no attempt
 		equal(linesBefore.length, 2, "attempt 0 failed → fallback attempt 1 spawned");
 		equal(linesBefore[1].attempt, "1");
 		controller.abort();
+		let timer: NodeJS.Timeout | undefined;
 		const resp = await Promise.race([
 			dispatch,
-			new Promise((_, rej) => setTimeout(() => rej(new Error("dispatch did not settle after the abort (15s)")), 15_000)),
+			new Promise((_, rej) => {
+				timer = setTimeout(() => rej(new Error("dispatch did not settle after the abort (15s)")), 15_000);
+			}),
 		]);
+		clearTimeout(timer); // the losing 15s guard must not keep the suite alive (code-review round)
 		const r = resp.details.results[0];
 		ok(resp.isError, "an aborted fallback attempt is an explicit failure");
 		equal(r.stopReason, "aborted", `attempt-1 settles aborted (not cut): got ${r.stopReason}`);
