@@ -619,6 +619,39 @@ const BLOCK_MESSAGE = [
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
+export { BLOCK_MESSAGE };
+
+// #485: micro is no longer a 0-dispatch pass-through — the VGATE docs/CSS/static
+// shape skip (#472) removed the backstop that made that leniency safe (a
+// docs-only micro commit at 0 dispatches cleared every enforced gate). Micro now
+// BLOCKS at 0 dispatches like every tier. The micro remediation must NOT point
+// at the code-review skill: micro skips the multi-agent code-review gate
+// (commit-workflow 03-code-review.md), so BLOCK_MESSAGE above would misdirect a
+// blocked micro agent.
+export const MICRO_BLOCK_MESSAGE = [
+  "✅ Review enforcement gate is working correctly.",
+  "❌ No reviewers were dispatched in this session before the git operation (micro tier).",
+  "   → Micro skips the multi-agent code-review GATE (commit-workflow 03-code-review.md) — the review-enforcer ≥1-dispatch rule still applies (#485).",
+  "   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch naming the diff — even a trivial one-line review counts:",
+  "   →   task(prompt='[REVIEW] docs-only change — verify claims/consistency against the docs diff; return NO ISSUES FOUND or list issues')",
+  "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
+  "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
+].join("\n");
+
+// #485: uniform ≥1-dispatch policy declaration — every tier blocks at 0
+// dispatches. Declarative: consumed by the drift-pin test (fence ↔ export
+// compare in index.test.ts T2) only — the block decision is uniform, so no
+// production branch consults it; T1/T1b/T3 carry the code↔behavior pins.
+// Keys: micro/standard/complex = marker values written by 01-preflight Tier
+// Detection; unknown = the literal pre-flight TIER when the issue is
+// unlabeled; unlabeled = no marker file present. All map to "block".
+export const TIER_RULE = {
+  micro: "block",
+  standard: "block",
+  complex: "block",
+  unknown: "block",
+  unlabeled: "block",
+} as const;
 
 // ── Extension ─────────────────────────────────────────
 
@@ -696,7 +729,7 @@ export default function (pi: ExtensionAPI) {
       } catch (_err) { /* best-effort cleanup */ }
     });
 
-    // ── tool_call: block git ops if no reviewers (proportional) ──
+    // ── tool_call: block git ops if no reviewers (uniform ≥1-dispatch, all tiers) ──
     pi.on("tool_call", async (event, _ctx) => {
       if (!isToolCallEventType("bash", event)) return undefined;
       if (!extensionEnabled) return undefined;
@@ -782,8 +815,12 @@ export default function (pi: ExtensionAPI) {
         return undefined;
       }
 
-      // Proportional gate: micro tier → warn only, standard/complex/unset → block
-      // Tier is read from marker file (env vars from bash export never reach Node.js)
+      // #485: uniform ≥1-dispatch block — every tier (micro, standard, complex,
+      // unlabeled) blocks at 0 dispatches. The tier read survives ONLY for
+      // message selection: micro skips the multi-agent code-review gate
+      // (03-code-review.md), so its remediation differs from BLOCK_MESSAGE.
+      // Pinned by index.test.ts (behavioral T1/T1b + fence drift T2 + source
+      // shape T3). The #285 task-sub-agent early return above is untouched.
       let tier = "";
       try {
         if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
@@ -791,20 +828,24 @@ export default function (pi: ExtensionAPI) {
         }
       } catch (_err) { /* best-effort */ }
       if (tier === "micro") {
-        console.log(
-          "[review-enforcer] ⚠️  No reviewers dispatched — micro tier allows bypass. " +
-          "Dispatch a reviewer sub-agent for non-trivial changes."
-        );
-        return undefined;
+        console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
+        return { block: true, reason: MICRO_BLOCK_MESSAGE };
       }
 
       console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched");
       return { block: true, reason: BLOCK_MESSAGE };
     });
 
-    // ── tool_result: count task dispatches ─────────
+    // ── tool_result: count sub-agent dispatches ────
     pi.on("tool_result", async (event, _ctx) => {
-      if (event.toolName !== "task") return undefined;
+      // The gate counts ANY sub-agent dispatch: the `task` tool or the
+      // specialized-agent `subagent` tool (extensions/subagent). Both are
+      // sub-agent dispatches — the content-free floor (#485 F2) makes no
+      // quality distinction, and the #485 second-model gate flagged that a
+      // docs-only micro change reviewed via the `subagent` tool must not
+      // false-block post-flip (micro relies on this counter as its only gate;
+      // VGATE is shape-exempt and code review is skipped at micro).
+      if (event.toolName !== "task" && event.toolName !== "subagent") return undefined;
       // #285 P2: task sub-agents never count dispatches — review DISPATCH is
       // parent-enforced (#825), and their own in-band [VGATE] dispatches must
       // not be counted/audited as review dispatches. (Today they never reach

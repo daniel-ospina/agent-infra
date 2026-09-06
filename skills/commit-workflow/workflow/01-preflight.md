@@ -238,7 +238,7 @@ gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep '^complex
 - `complexity:complex` → **TIER = Complex**
 - No label found or `ISSUE_NUMBER = 'none'` → **TIER = unknown** (classify from diff in Step 1.5 / `02-commit-pr.md`)
 
-Store as `TIER` for subsequent steps. Export as `AGENT_ISSUE_COMPLEXITY` for downstream extension gates (review-enforcer proportional blocking):
+Store as `TIER` for subsequent steps. Export as `AGENT_ISSUE_COMPLEXITY` (legacy annotation — the extension never consults this env var for gate decisions; the review-enforcer session_start handler reads it only to warn that it has no effect (~index.ts L670); #493 owns dropping the export. The marker write below IS read, for message selection only since #485):
 
 ```bash
 export AGENT_ISSUE_COMPLEXITY=$TIER
@@ -249,16 +249,16 @@ echo "$TIER" > /tmp/agent-issue-complexity
 
 When `TIER = Micro` or auto-detected (1 file, <20 added lines, no migrations, or docs/CSS/static-only per 02-commit-pr.md Step 1.5).
 
-Mechanism separation: the VGATE content-shape skip is extension-side and shape-based (applies at ANY tier; code sets never skip); the review-enforcer micro warn-only is marker-based (extension reads `/tmp/agent-issue-complexity` = micro); a docs-only commit on an UNLABELED issue is VGATE shape-exempt but still review-enforcer-blocked at 0 dispatches.
+Mechanism separation: the VGATE content-shape skip is extension-side and shape-based (applies at ANY tier; code sets never skip); the review-enforcer ≥1-dispatch rule is **uniform — every tier (micro, standard, complex, unknown/unlabeled) blocks at 0 dispatches** (the pre-#485 micro branch let a 0-dispatch session through — the VGATE docs/CSS/static skip removed the backstop that made that leniency safe, so a docs-only micro commit at 0 dispatches cleared every enforced gate). The extension reads `/tmp/agent-issue-complexity` ONLY to select the micro-specific remediation message (micro skips the multi-agent code-review gate), never to allow/block. A docs-only commit at 0 dispatches is review-enforcer-blocked at every tier — labeled-micro included.
 
 | Gate | Micro Behavior |
 |------|---------------|
-| Review-enforcer | **WARN-ONLY** at micro — 0 reviewer dispatches warn but do not block (extension reads /tmp/agent-issue-complexity = micro); Standard+/unset block |
+| Review-enforcer | **BLOCK at 0 dispatches — ≥1 sub-agent dispatch required at EVERY tier, micro included (#485)** (the gate counts any sub-agent dispatch — the `task` or `subagent` tool). The VGATE docs/CSS/static skip removed the backstop that made the pre-#485 micro leniency safe. Code sets satisfy the dispatch via VGATE's own [VGATE] verification dispatch; docs-only sets dispatch a lightweight reviewer (even a trivial one-line review counts). The marker read (/tmp/agent-issue-complexity = micro) selects the micro remediation message only |
 | Verification-gate (VGATE) | **shape-gated, not tier-gated** — docs/CSS/static-only sets skip regardless of tier; code sets never skip (see Pi Extension Gates → Verification Gate below) |
 | Lint/Typecheck | **KEPT** — runs in pre-commit hooks, zero agent overhead |
 | Code review (Step 3) | **SKIPPED** — per commit-workflow/03-code-review.md |
 
-**Rationale:** Micro-tier CODE commits keep full VGATE (shape-gated — the extension skips only docs/CSS/static sets, never code); the reviewer dispatch (review-enforcer, warn-only at micro) plus VGATE-on-code is the net.
+**Rationale:** Micro-tier CODE commits keep full VGATE (shape-gated — the extension skips only docs/CSS/static sets, never code), and VGATE's own [VGATE] verification dispatch satisfies the review-enforcer ≥1-dispatch rule before the commit — micro code sets clear the gate with no extra ceremony. The residual case the uniform block closes is the docs-only micro commit: VGATE shape-exempts it and the multi-agent code-review gate is skipped at micro, so the ≥1 dispatch must come from a lightweight reviewer dispatch (even a trivial one-line review counts).
 
 ## Wiring-Gap Check (canary-fix PRs only)
 
@@ -289,11 +289,13 @@ This guard exists because #4327/#4328 demonstrated a type error fix can mask a w
 
 ## Pi Extension Gates (extension-enforced — per-gate scoping)
 
-These checks are enforced by Pi extensions — each with per-gate scoping rather than a blanket tier rule: the review-enforcer is tier-gated (micro warn-only via marker; Standard+/unset block); VGATE is content-shape gated (docs/CSS/static-only sets exempt, code never). Neither is bypassed for code-bearing sets.
+These checks are enforced by Pi extensions — each with per-gate scoping rather than a blanket tier rule: the review-enforcer applies a **uniform ≥1-dispatch block — every tier (micro, standard, complex, unknown/unlabeled) blocks at 0 dispatches** (the marker read selects only the micro-specific remediation message); VGATE is content-shape gated (docs/CSS/static-only sets exempt, code never). Neither is bypassed for code-bearing sets.
 
 ### Review Enforcer Gate
 
-The `review-enforcer` extension blocks git operations unless at least one `task` sub-agent was dispatched this session — Micro tier is warn-only (extension reads `/tmp/agent-issue-complexity` = micro; 0 dispatches warn but do not block); Standard+/unset block.
+The `review-enforcer` extension blocks git operations unless at least one sub-agent was dispatched this session — the gate counts ANY sub-agent dispatch (the `task` tool or the specialized-agent `subagent` tool; content-free floor — see the micro rationale below) — **at every tier, micro included** (0 dispatches block; pre-#485 the micro branch let a 0-dispatch session through — the VGATE docs/CSS/static skip removed the backstop that made that leniency safe. The extension reads `/tmp/agent-issue-complexity` only to select the micro-specific remediation message below; it never selects allow/block).
+
+> **Task sub-agents are exempt from the commit-time dispatch floor** (#285/#825): their review DISPATCH is parent-enforced — the parent session runs the review ceremony, so a task sub-agent's own git ops do not re-trigger the floor. The merge-registry gate still requires a recorded clean review before merge. The "every tier blocks at 0 dispatches" uniform floor describes the tier dimension; the sub-agent session shape is this documented carve-out.
 
 ```bash
 # This gate fires ON the git commit/push command itself — not as a separate check.
@@ -302,12 +304,25 @@ The `review-enforcer` extension blocks git operations unless at least one `task`
 ```
 
 **How to satisfy:**
-1. Before `git commit`, dispatch a `task` sub-agent to review your changes
+1. Before `git commit`, dispatch a `task` sub-agent (or `subagent`-tool agent) to review your changes
 2. The reviewer must return a result (even "NO ISSUES FOUND")
-3. The gate counts task dispatches — 1 is enough
+3. The gate counts any sub-agent dispatch (task or subagent tool) — 1 is enough
+4. **Micro tier:** code sets satisfy the dispatch via VGATE's own [VGATE] verification dispatch; docs-only micro sets (VGATE content-shape exempt) dispatch a lightweight reviewer naming the diff — the multi-agent code-review gate stays skipped per 03-code-review.md
 
-**Failure:** "No reviewers were dispatched in this session before the git operation."  
+**Failure:** "No reviewers were dispatched in this session before the git operation." (micro tier receives a micro-specific message directing a lightweight docs reviewer).  
 **Bypass:** `AGENT_SKIP_REVIEW_GATE=1` (emergency only)
+
+<!-- REVIEW-ENFORCER-TIER-RULE: machine-read by extensions/review-enforcer/index.test.ts (drift pin T2) — must stay in sync with TIER_RULE in extensions/review-enforcer/index.ts. Every tier blocks at 0 dispatches (#485). -->
+
+| Tier | Dispatch rule |
+|------|---------------|
+| micro | block |
+| standard | block |
+| complex | block |
+| unknown | block |
+| unlabeled | block |
+
+<!-- /REVIEW-ENFORCER-TIER-RULE -->
 
 ### Verification Gate
 
