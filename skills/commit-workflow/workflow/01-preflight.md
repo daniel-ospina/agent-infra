@@ -238,10 +238,9 @@ gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep '^complex
 - `complexity:complex` → **TIER = Complex**
 - No label found or `ISSUE_NUMBER = 'none'` → **TIER = unknown** (classify from diff in Step 1.5 / `02-commit-pr.md`)
 
-Store as `TIER` for subsequent steps. Export as `AGENT_ISSUE_COMPLEXITY` (legacy annotation — the extension never consults this env var for gate decisions; the review-enforcer session_start handler reads it only to warn that it has no effect (~index.ts L670); #493 owns dropping the export. The marker write below IS read, for message selection only since #485):
+Store as `TIER` for subsequent steps. Write the marker file — the only channel the review-enforcer reads (a bash-exported `AGENT_ISSUE_COMPLEXITY` env var has no effect: the extension's session_start handler reads it only to warn that it is dead — `extensions/review-enforcer/index.ts` ~L670; the vestigial export was dropped in #493). Since #485 the marker selects only the micro-specific remediation message, never allow/block:
 
 ```bash
-export AGENT_ISSUE_COMPLEXITY=$TIER
 echo "$TIER" > /tmp/agent-issue-complexity
 ```
 

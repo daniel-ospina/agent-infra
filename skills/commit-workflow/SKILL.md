@@ -83,20 +83,22 @@ escalation is exhausted (per the `code-review` skill, Step 6.5 Orchestrator Esca
 > **What to do:** Read every file listed under "What you are missing" below before performing any operation this skill covers.
 
 
-## Extension-Enforced Gates (apply regardless of tier)
+## Extension-Enforced Gates (per-gate scoping)
 
-Two Pi extensions block git operations and are NOT tier-gated — they apply to every commit:
+Two Pi extensions enforce the quality gates below. Neither is a blanket tier rule — each has its own scoping mechanism, and neither is bypassed for code-bearing sets:
 
 ### Review Enforcer (`review-enforcer`)
-Blocks `git commit/push` and `gh pr create/merge` unless at least one `task` sub-agent was dispatched this session.
+Blocks `git commit/push` and `gh pr create/merge` unless ≥1 sub-agent was dispatched this session (the `task` tool or the specialized-agent `subagent` tool — any dispatch counts).
 
-- **What it wants:** ≥1 `task` dispatch before any git op
-- **What to do:** Dispatch a reviewer sub-agent (even a trivial one-line reviewer). It doesn't need to find issues — it just needs to have run.
+- **Scope:** **uniform ≥1-dispatch block — every tier (micro, standard, complex, unknown/unlabeled) blocks at 0 dispatches (#485)** — see the REVIEW-ENFORCER-TIER-RULE fence in `workflow/01-preflight.md` (machine-read; drift-pinned to `TIER_RULE` in `extensions/review-enforcer/index.ts`)
+- **What it wants:** ≥1 sub-agent dispatch before any git op
+- **What to do:** Dispatch a reviewer sub-agent (even a trivial one-line reviewer). It doesn't need to find issues — it just needs to have run. Code-bearing sets satisfy the floor via VGATE's own [VGATE] verification dispatch; docs-only sets dispatch a lightweight reviewer naming the diff.
 - **Bypass:** `AGENT_SKIP_REVIEW_GATE=1` (emergency only)
 
 ### Verification Gate (`verification-gate`)
-Blocks `git commit` unless every staged file has been verified by a `[VGATE]` sub-agent.
+Blocks `git commit` unless every file the commit records has been verified by a `[VGATE]` sub-agent — **content-SHAPE gated, not tier-gated**.
 
+- **Content-shape exemption:** docs/CSS/static-only file sets (no build-output path segment) skip VGATE at ANY tier; code-bearing or mixed sets are NEVER exempt — see the VGATE-SHAPE-RULE fence in `workflow/01-preflight.md` (machine-read; drift-pinned to `SHAPE_EXEMPT_EXTENSIONS` + `BUILD_OUTPUT_SEGMENTS` in `extensions/verification-gate/index.ts`)
 - **What it wants:** A `task` dispatch with `[VGATE] verify files:<paths>` in the prompt
 - **Response format:** Must include `PASS` on its own line, or valid JSON: `{"status": "PASS", "failures": [], "verified_files": [{"path": "...", "hash": "..."}]}`
 - **Gotcha:** Prompt must say `verify files:` (plural), not `verify file:` (singular) — the regex won't match singular.
