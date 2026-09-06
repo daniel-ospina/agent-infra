@@ -102,7 +102,7 @@ Blocks `git commit` unless every file the commit records has been verified by a 
 - **What it wants:** A `task` dispatch with `[VGATE] verify files:<paths>` in the prompt
 - **Response format:** Must include `PASS` on its own line, or valid JSON: `{"status": "PASS", "failures": [], "verified_files": [{"path": "...", "hash": "..."}]}`
 - **Gotcha:** Prompt must say `verify files:` (plural), not `verify file:` (singular) — the regex won't match singular.
-- **Bypass:** `AGENT_SKIP_VGATE=1` at session start (disables the gate entirely). `AGENT_ALLOW_MAIN_EDITS=1` no longer disables VGATE — it is the worktree-guard bypass only (#7470)
+- **Bypass:** `ELDATO_SKIP_VGATE=1` at session start (disables the gate entirely). `AGENT_ALLOW_MAIN_EDITS=1` no longer disables VGATE — it is the worktree-guard bypass only (#7470)
 
 ## What you are missing
 

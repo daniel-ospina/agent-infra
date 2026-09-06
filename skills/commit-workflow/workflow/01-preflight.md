@@ -396,7 +396,7 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 **Gotchas:**
 - If staged files change after verification, hashes won't match — re-verify
 - The gate extracts file paths from the prompt, not the response — make sure paths are correct
-- `AGENT_SKIP_VGATE=1` at session start disables this gate entirely (`AGENT_ALLOW_MAIN_EDITS=1` no longer does — #7470)
+- `ELDATO_SKIP_VGATE=1` at session start disables this gate entirely (`AGENT_ALLOW_MAIN_EDITS=1` no longer does — #7470)
 
 ---
 
