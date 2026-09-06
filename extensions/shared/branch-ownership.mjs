@@ -504,12 +504,20 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
  *   merge/pull/rebase → current branch == baseline branch suffices (the
  *     mutation only ever advances the session's OWN branch; syncSource
  *     presence is not required — bare `git pull` pulls the own upstream).
- *   push / force-push / push-delete / branch-force-delete → EVERY named
- *     target == baseline branch (all-targets semantics — a multi-refspec
- *     `git push origin feat/1 other/2` must never slip a foreign target
- *     past the gate; symmetric with the delete case).
+ *   push / force-push / push-delete → EVERY named target == baseline branch
+ *     (all-targets semantics — a multi-refspec `git push origin feat/1 other/2`
+ *     must never slip a foreign target past the gate; symmetric with the
+ *     delete case).
+ *   branch-force-delete (LOCAL `git branch -D`) → every named target ==
+ *     baseline branch OR a branch THIS session itself created via the M3
+ *     create-new/rename carve-outs (ownedBranches — #376 review fold-in: after
+ *     the sanctioned ceremony return-to-baseline the baseline is main again,
+ *     but deleting the session's OWN merged ceremony branch locally must still
+ *     pass; git already refuses deleting a branch checked out in ANY worktree,
+ *     so a pid-owned local delete is collision-free). Remote pushes/deletes of
+ *     owned branches stay baseline-only.
  */
-export function ownershipAllowed({ opKind, currentBranch, baselineBranch, targets, syncSource }) {
+export function ownershipAllowed({ opKind, currentBranch, baselineBranch, targets, syncSource, ownedBranches }) {
   if (!baselineBranch) return false;
   if (currentBranch !== baselineBranch) return false;
   switch (opKind) {
@@ -522,7 +530,12 @@ export function ownershipAllowed({ opKind, currentBranch, baselineBranch, target
     case "push-delete":
     case "branch-force-delete": {
       const t = (targets || []).map((x) => (x === "HEAD" ? currentBranch : x)).filter(Boolean);
-      return t.length > 0 && t.every((x) => x === baselineBranch);
+      if (t.length === 0) return false;
+      if (opKind === "branch-force-delete") {
+        const own = (ownedBranches || []).filter((b) => b !== "main" && b !== "master");
+        return t.every((x) => x === baselineBranch || own.includes(x));
+      }
+      return t.every((x) => x === baselineBranch);
     }
     default:
       return false;

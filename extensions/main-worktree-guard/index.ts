@@ -723,6 +723,11 @@ const WHY = [
 const baselines = new Map<number, { repoKey: string; branch: string | null; head: string; original: string | null }>();
 const warnedDeviations = new Map<number, Set<string>>();
 const pendingBaseline = new Set<number>(); // lock contended at session_start → record on first tool_call
+// Branches THIS pid created via the M3 create-new/rename carve-outs (#376 review
+// fold-in): their LOCAL deletion stays allowed after the ceremony return re-bases
+// the baseline to main (git refuses deleting a branch checked out anywhere, so a
+// pid-owned local delete is collision-free). Never seeded from session state.
+const ownedBranches = new Map<number, Set<string>>();
 
 function _recordBaseline(pid: number) {
   if (!branchOwnership) return;
@@ -1123,7 +1128,19 @@ export default function (pi: ExtensionAPI) {
             if (m3?.reBaseline) {
               // Synchronous re-baseline: the allowed carve-out / own rename
               // adopts the new branch NOW — the next tool_call emits ZERO M1
-              // warns (AC3).
+              // warns (AC3). Record branches this pid CREATED (create-new) or
+              // renamed its own baseline to, so their post-ceremony LOCAL
+              // delete is still allowed after the #376 return re-baselines to
+              // the original (#376 review fold-in).
+              if (branchOp.op === "create-new" && branchOp.branch) {
+                let owned = ownedBranches.get(pid);
+                if (!owned) { owned = new Set(); ownedBranches.set(pid, owned); }
+                owned.add(branchOp.branch);
+              } else if (branchOp.op === "rename" && branchOp.to) {
+                let owned = ownedBranches.get(pid);
+                if (!owned) { owned = new Set(); ownedBranches.set(pid, owned); }
+                owned.add(branchOp.to);
+              }
               _rebaseline(pid, m3.reBaseline);
               return undefined;
             }
@@ -1178,6 +1195,9 @@ export default function (pi: ExtensionAPI) {
           baselineBranch: baseline?.branch ?? null,
           targets,
           syncSource: det.syncSource,
+          // #376 review fold-in: branches this pid created stay locally deletable
+          // after the ceremony return re-bases the baseline (own-branch hygiene).
+          ownedBranches: ownedBranches.get(pid),
         })) {
           // #443: det.pushTargets describe ONLY the first push invocation. A
           // delete in a LATER compound segment of the -d/--del family (no

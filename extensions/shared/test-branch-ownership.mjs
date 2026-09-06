@@ -296,6 +296,15 @@ ok("allow: push multi with foreign false", ownershipAllowed({ opKind: "force-pus
 ok("allow: push-delete own", ownershipAllowed({ opKind: "push-delete", currentBranch: "feat/1", baselineBranch: "feat/1", targets: ["feat/1"] }) === true);
 ok("allow: branch -D own", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "feat/1", baselineBranch: "feat/1", targets: ["feat/1"] }) === true);
 ok("allow: branch -D foreign false", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "feat/1", baselineBranch: "feat/1", targets: ["other"] }) === false);
+// #376 review fold-in: after the sanctioned ceremony return (baseline main
+// again), LOCAL delete of the branch THIS session created stays allowed; the
+// baseline-only semantics for everything else (incl. pushes) are unchanged.
+ok("allow: branch -D pid-owned post-return", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === true);
+ok("allow: branch -D not-owned post-return false", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"] }) === false);
+ok("allow: branch -D owned+baseline mixed all-own", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["main", "feat/2"], ownedBranches: ["feat/2"] }) === true);
+ok("allow: branch -D master protected even if listed owned (never trunk)", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["master"], ownedBranches: ["master"] }) === false);
+ok("allow: branch -D owned off-baseline false", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "feat/1", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === false);
+ok("allow: push of owned branch stays baseline-only", ownershipAllowed({ opKind: "push", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === false);
 ok("allow: bare pull own", ownershipAllowed({ opKind: "pull", currentBranch: "feat/1", baselineBranch: "feat/1" }) === true);
 
 // ── Lock lifecycle ─────────────────────────────────────────────────────────

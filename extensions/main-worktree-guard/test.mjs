@@ -487,7 +487,7 @@ dexpect("merge origin/main → syncSource", `git fetch origin && git merge origi
 dexpect("rebase origin/main → syncSource", `git rebase origin/main`, { verdict: "block:rebase", syncSource: "origin/main" });
 
 // M3 subclassification surfaces (branchOp via shared classifyBranchOp)
-import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, extractGitInvocation as sharedExtractGitInvocation, decideM3 as sharedDecideM3 } from "../shared/branch-ownership.mjs";
+import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, extractGitInvocation as sharedExtractGitInvocation, decideM3 as sharedDecideM3, ownershipAllowed as sharedOwnershipAllowed } from "../shared/branch-ownership.mjs";
 const co = (cmd) => {
   const d = classifyGitCommandDetailed(cmd);
   // P1-A: classify the STATE-mutating invocation (compound commands must gate
@@ -537,6 +537,12 @@ dexpect("restore-from-branch verdict stays block:checkout-branch", `git checkout
   expectBool("#376: git checkout - (prev-branch, ambiguous) → blocked", prev?.block === true, true);
   const nonInfra = sharedDecideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline: ceremonyBaseline, currentBranch: "feat/2", repoKey: "k" });
   expectBool("#376: non-infra repo return-to-original STILL blocked", nonInfra?.block === true, true);
+  // Post-return local delete of the session's OWN merged branch: the index.ts
+  // wiring records create-new branches per pid (ownedBranches), so once the
+  // baseline re-based to main the branch-force-delete allowance still accepts
+  // the merged ceremony branch (git refuses deleting a checked-out branch).
+  expectBool("#376: post-return branch -D of pid-owned merged branch → allowed", sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === true, true);
+  expectBool("#376: post-return branch -D of foreign branch → blocked (not owned)", sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/other"] }) === false, true);
 }
 
 // ── #376: real-repo adapter pin (the index.ts M3 sequence on a live repo) ──

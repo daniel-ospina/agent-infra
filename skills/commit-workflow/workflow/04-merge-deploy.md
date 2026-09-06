@@ -132,9 +132,12 @@ git checkout main
 # repos and other checkouts still block switch-existing.
 
 # Step B may have deferred the merged branch's LOCAL delete while it was checked
-# out here; the return to main releases that lock. 05-cleanup.md's merged-branch
-# cleanup resolves the PR branch via `gh pr view` headRefName (never the current
-# branch), so it deletes the released local branch correctly from main.
+# out here; the return to main releases that lock. Deleting it now is own-branch
+# hygiene: the guard allows a LOCAL `git branch -D` of a branch this session
+# created via the M3 create-new carve-out (pid-owned), even after the baseline
+# re-based to main (#376). 05-cleanup.md's merged-branch cleanup resolves the PR
+# branch via `gh pr view` headRefName (never the current branch) and runs that
+# delete from main.
 ```
 
 Non-agent-infra sessions and agent-infra **worktree** sessions skip Step C — after the merge ceremony their feature work lives in an isolated worktree, and 05-cleanup's teardown returns them to their base.
