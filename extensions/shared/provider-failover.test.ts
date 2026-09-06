@@ -194,11 +194,29 @@ test("REAL venice 401 body (0b probe capture, 2026-09-06): '{\"error\":\"Authent
   // this body with HTTP 401 — NO key wording, NO code token. Pre-extension
   // this missed every auth signature → null → no durable block → every
   // canceled-sub dispatch spawned a doomed venice child. The observed
-  // wording now anchors SIG_AUTH_KEY (authentication failed).
+  // wording anchors the LATE bare-auth check (SIG_AUTH_FAILED, after the
+  // exhaustion signatures — round-1 P2): phrase-only bodies classify
+  // auth_permanent, but an exhaustion body CONTAINING the phrase still
+  // classifies exhaustion (see the falsification pin below).
   const cls = classifyExhaustionText('{"error":"Authentication failed"}');
   equal(cls.kind, "auth_permanent");
   equal(cls.reason, "blocked");
-  equal(cls.matched, "auth-key-wording");
+  equal(cls.matched, "auth-failed-wording");
+});
+
+test("falsification (round-1 P2): exhaustion bodies containing 'authentication failed' → exhaustion, never auth block", () => {
+  // Code-review round-1 P2: the unscoped `authentication\s+failed`
+  // alternation in SIG_AUTH_KEY (checked FIRST) would classify any
+  // exhaustion body that contains the phrase as auth_permanent → durable
+  // block instead of an exhaustion latch/hop. The phrase now matches a LATE
+  // check that runs after the exhaustion signatures.
+  const c1 = classifyExhaustionText('{"error":{"code":"INSUFFICIENT_BALANCE","message":"Insufficient USD or Diem balance"}}');
+  equal(c1.kind, "exhaustion", "balance code alone → exhaustion");
+  const c2 = classifyExhaustionText('Authentication failed: {"error":{"code":"INSUFFICIENT_BALANCE","message":"Insufficient USD or Diem balance to complete request"}}');
+  equal(c2.kind, "exhaustion", "wrapper prefix + balance body → exhaustion (phrase must not preempt)");
+  equal(c2.matched, "venice-insufficient-usd-or-diem", "prose matches before the code token (both exhaustion)");
+  const c3 = classifyExhaustionText("authentication failed — insufficient balance");
+  equal(c3.kind, "exhaustion", "insufficient-balance + auth phrase → exhaustion");
 });
 
 section("classifier narrowing pins (deep-review) — generic fragments never false-block");
@@ -846,6 +864,36 @@ test("WRITE parity: hop-leg (openrouter) drain under fresh root still records un
   ok(isLatched("deepseek", state, { env }), "record continues under the root (in-flight continuation)");
   equal(state.primaries.deepseek.families["deepseek-v4-flash"].activeLeg, null, "terminal — nothing after openrouter");
   ok(!state.primaries["openrouter"], "no own openrouter record — absorbed by the root (unchanged #476 semantics)");
+});
+
+test("WRITE round-1 P2: fromLeg-less venice drain under a FRESH root latch still records under venice (own account)", () => {
+  const { env } = makeEnv("v-write-fromlegless");
+  // deepseek root freshly latched (in-flight exhaustion)
+  setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: FLASH_PRIMARY,
+    env,
+  });
+  const rootFamBefore = JSON.stringify(readLatchState(env).primaries.deepseek.families["deepseek-v4-flash"]);
+  // venice drains WITHOUT a fromLeg (marker carries only provider) — the
+  // effective-provider discriminator must still treat it as venice's own
+  // account event, never re-latch/advance the deepseek root.
+  const state = setExhausted({
+    primaryProvider: "venice",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    env,
+  });
+  ok(isLatched("venice", state, { env }), "venice own record (fromLeg-less write)");
+  equal(
+    JSON.stringify(state.primaries.deepseek.families["deepseek-v4-flash"]),
+    rootFamBefore,
+    "deepseek root family state untouched by fromLeg-less venice evidence",
+  );
 });
 
 test("READ: next venice ask after a venice own-latch → hops onto the own record's active leg (deepseek official)", () => {

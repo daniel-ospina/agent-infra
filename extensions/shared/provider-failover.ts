@@ -314,6 +314,13 @@ const SIG_INSUFFICIENT_BALANCE = /(insufficient\s+balance|balance\s+insufficient
  * OpenRouter's actual 402 body text "Insufficient credits. Add more using
  * https://openrouter.ai/credits" (SDK path omits the status — review P2). */
 const SIG_CREDIT_LOW = /(credit\s+balance\s+(?:is\s+)?too\s+low|insufficient\s+credit)/i;
+/** Bare "authentication failed" phrase with NO key wording — the real venice
+ * 401 body (`{"error":"Authentication failed"}`). Deliberately NOT in
+ * SIG_AUTH_KEY (see classifyExhaustionText ordering): checked after the
+ * exhaustion signatures so a 402/exhaustion body containing the phrase
+ * (wrapper prefix, key-scoped spend-limit codes) classifies exhaustion, and
+ * only phrase-only bodies classify auth_permanent. */
+const SIG_AUTH_FAILED = /authentication\s+failed/i;
 /** 402 co-occurring with a credit-exhaustion phrase within a bounded
  * line-local window (review P2 — a distant balance/credit word on another
  * line must not pair with an unrelated 402 token). Bare `credit`, bare
@@ -325,7 +332,7 @@ const SIG_CREDIT_LOW = /(credit\s+balance\s+(?:is\s+)?too\s+low|insufficient\s+c
 const SIG_402_CREDIT = /402[^\n]{0,160}(insufficient|credit\s+balance|too\s+low|exhausted)|(insufficient|credit\s+balance|too\s+low|exhausted)[^\n]{0,160}402/i;
 /** Fuzzy billing wording WITHOUT 402 → audit-only (never latches). */
 const SIG_FUZZY = /(insufficient_quota|insufficient quota|billing|usage limit reached|monthly usage|quota exceeded|credit balance)/i;
-const SIG_AUTH_KEY = /(invalid\s+x-api-key|invalid\s+api[_-]?key|api[_-]?key.{0,40}(invalid|incorrect|blocked)|api\s+key.{0,40}(invalid|incorrect|blocked)|incorrect\s+api\s+key|invalid_api_key|apikey-error|authentication\s+failed)/i;
+const SIG_AUTH_KEY = /(invalid\s+x-api-key|invalid\s+api[_-]?key|api[_-]?key.{0,40}(invalid|incorrect|blocked)|api\s+key.{0,40}(invalid|incorrect|blocked)|incorrect\s+api\s+key|invalid_api_key|apikey-error)/i;
 /** Venice 402/exhaustion patterns (#512, docs-anchored — docs.venice.ai
  * /api-reference/error-codes; amendment-3 P1). The published schema:
  *   - error.code INSUFFICIENT_BALANCE, message "Insufficient USD or Diem
@@ -340,8 +347,12 @@ const SIG_AUTH_KEY = /(invalid\s+x-api-key|invalid\s+api[_-]?key|api[_-]?key.{0,
  *     spend-limit wording alone must not classify; the snake-case CODE token
  *     is the anchor (OpenAI-compatible bodies carry code next to message).
  *   - 401-class: AUTHENTICATION_FAILED bodies carry key wording ("API key …
- *     invalid") → SIG_AUTH_KEY above fires first; PRO_ONLY_MODEL is a
- *     model-tier error (NOT balance/auth) → stays null (audit-only).
+ *     invalid") → SIG_AUTH_KEY fires first; a phrase-only body (the real
+ *     venice 401 `{"error":"Authentication failed"}`, no key wording) hits
+ *     the LATE bare-auth check (SIG_AUTH_FAILED, after the exhaustion
+ *     signatures — round-1 P2, so an exhaustion body containing the phrase
+ *     still classifies exhaustion); PRO_ONLY_MODEL is a model-tier error
+ *     (NOT balance/auth) → stays null (audit-only).
  * NOTE (residual, #512 P1-4/0b): fixtures are docs-anchored/assumed — the
  * classifier link is MECHANISM-verified via the mock-endpoint test; a REAL
  * venice 402 body is an OPEN operator gate until a drained second account
@@ -372,10 +383,14 @@ export function classifyExhaustionText(text: string | null | undefined): Exhaust
   if (!text) return { kind: null, reason: null, matched: null };
   const t = text.slice(0, 2000); // bounded — status bodies are short
 
-  // Permanent auth class FIRST (401/403 + key wording, OR key wording alone —
-  // real 401 bodies often omit the status number in the message text, e.g.
-  // DeepSeek's `Authentication Fails, Your api key: **** is invalid` and
-  // Aliyun's `Incorrect API key provided ... apikey-error`). Never exhaustion.
+  // Permanent auth class FIRST — KEY-WORDING only (401/403 + key wording,
+  // OR key wording alone — real 401 bodies often omit the status number in
+  // the message text, e.g. DeepSeek's `Authentication Fails, Your api key:
+  // **** is invalid` and Aliyun's `Incorrect API key provided ...
+  // apikey-error`). Never exhaustion. NOTE (round-1 P2): the bare phrase
+  // `authentication failed` is NOT here — it lives in a LATE check after the
+  // exhaustion signatures (SIG_AUTH_FAILED below) so an exhaustion body
+  // containing the phrase still classifies exhaustion.
   if (SIG_AUTH_KEY.test(t)) {
     return { kind: "auth_permanent", reason: "blocked", matched: "auth-key-wording" };
   }
@@ -425,6 +440,18 @@ export function classifyExhaustionText(text: string | null | undefined): Exhaust
     // SDK-wrapped status shape. Line-local + credit-scoped so "billing: 402
     // invoices pending" (audit-only) can never latch (review P3).
     return { kind: "exhaustion", reason: "402", matched: "402+credit-near" };
+  }
+  // Bare "authentication failed" (no key wording) — checked AFTER the
+  // exhaustion signatures (code-review round-1 P2): an exhaustion-class body
+  // that CONTAINS the phrase (a wrapper prefix, or venice's key-scoped
+  // spend-limit codes whose message can open with "API key …") must classify
+  // exhaustion, not a durable auth block. Phrase-only bodies (the real venice
+  // 401 `{"error":"Authentication failed"}`) still classify auth_permanent
+  // here — the observed 401 has NO key wording, so it cannot match SIG_AUTH_KEY.
+  // Checked BEFORE SIG_FUZZY: auth is the more conservative class than
+  // audit_only when a body carries both billing-fuzzy and auth wording.
+  if (SIG_AUTH_FAILED.test(t)) {
+    return { kind: "auth_permanent", reason: "blocked", matched: "auth-failed-wording" };
   }
   if (SIG_FUZZY.test(t)) {
     // fuzzy billing wording without 402 — audit-only (never latch) per plan
@@ -1029,9 +1056,17 @@ export function setExhausted(input: LatchInput): LatchState {
     // (resolveWithChain independentAsk): the discriminator is identical, so
     // root-shadow and write placement cannot disagree. Table-leg drains keep
     // the #476 account-of-record placement (root when in-flight/root leg).
-    const fromIsIndependent =
-      input.fromLeg !== undefined &&
-      !legIsFamilyMember(input.family, input.fromLeg.provider);
+    //
+    // Discriminator derived from the EFFECTIVE provider (fromLeg when given,
+    // else the drain's primaryProvider — code-review round-1 P2): a
+    // fromLeg-less drain on an off-table provider is that provider's own
+    // account event too, so the write-side rule cannot disagree with the
+    // read side for fromLeg-less writes (the comment above is unconditional;
+    // the code must be as well). legIsFamilyMember(undefined, …) is false,
+    // so a family-less drain of an off-table provider also lands on its own
+    // entry — matching the read side's early must-stay.
+    const drainProvider = input.fromLeg?.provider ?? input.primaryProvider;
+    const fromIsIndependent = !legIsFamilyMember(input.family, drainProvider);
     const primaryProvider = fromIsIndependent
       ? input.primaryProvider
       : root && (fromIsRoot || rootFresh)
