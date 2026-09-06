@@ -277,7 +277,7 @@ test("usage ledger: TASK_USAGE_LEDGER=1 appends the event=dispatch-usage audit r
 	const savedLedger = process.env.TASK_USAGE_LEDGER;
 	process.env.TASK_USAGE_LEDGER = "1";
 	try {
-		const { value } = await dispatch("usage", { TASK_USAGE_CAPTURE: "1" });
+		const { value, childNonce } = await dispatch("usage", { TASK_USAGE_CAPTURE: "1" });
 		ok(value, "defined result expected");
 		const u = value!.details!.dispatchUsage as any;
 		ok(u, "detail attached");
@@ -294,6 +294,8 @@ test("usage ledger: TASK_USAGE_LEDGER=1 appends the event=dispatch-usage audit r
 		equal(row.cacheRead, 5000);
 		equal(row.cacheWrite, 0);
 		equal(row.cost, 0.000123);
+		ok(childNonce.length >= 6, "child nonce present");
+		equal(row.dispatchId, childNonce, "dispatch-usage row carries the per-dispatch nonce (round-1 P2 join key)");
 	} finally {
 		if (savedLedger === undefined) delete process.env.TASK_USAGE_LEDGER;
 		else process.env.TASK_USAGE_LEDGER = savedLedger;

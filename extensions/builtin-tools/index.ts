@@ -54,6 +54,7 @@ import {
   markLegBlocked,
   resolveWithChain,
   nextLegAfter,
+  familyLegs,
   rootPrimaryOfFamily,
   noHop,
   blockOnExhaustion,
@@ -815,12 +816,19 @@ export function altGateEligible(requested: LegRef, opts: { registry?: ModelRegis
 /** #512: append the venice-route audit row for a REAL cold-class venice
  * dispatch (audit/provider-failover.jsonl; event=venice-route). Extracted
  * from the execute path so the append site is directly pinnable (round-4
- * P2). Audit-only — never throws (appendLedger). */
+ * P2). Audit-only — never throws (appendLedger).
+ *
+ * dispatchId (round-1 P2): the per-dispatch TASK_HEARTBEAT_NONCE hex — the
+ * SAME id the child usage rows carry (each spawn appends its own
+ * event=dispatch-usage row with the reused nonce), so venice-route and
+ * dispatch-usage rows are joinable per dispatch for the 0a burn window.
+ * Null when the dispatch ran without a heartbeat nonce (failover disabled). */
 export function recordVeniceRoute(
   dispatchLeg: LegRef,
   family: string | null,
   hop: string | null,
   env: Record<string, string | undefined> = process.env,
+  dispatchId: string | null = null,
 ): void {
   appendLedger(
     {
@@ -830,6 +838,7 @@ export function recordVeniceRoute(
       provider: dispatchLeg.provider,
       class: "cold",
       hop,
+      ...(dispatchId ? { dispatchId } : {}),
     },
     "venice-route",
     env,
@@ -1078,6 +1087,53 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
         annotations: {
           failoverBlockedEnv: true,
           failoverNote: "TASK_EXHAUSTION_BLOCK=1 — a markerless hop advance is blocked (fail-fast)",
+        },
+      };
+    }
+    // #512 off-table discriminator on the MARKERLESS path (round-1 P2): a
+    // connection-error on an OFF-TABLE dispatched leg (venice — the cold-class
+    // seam) is NOT a chain-hop event. Venice is not a member of the family's
+    // chain table; a transport error on it is its OWN availability problem,
+    // not evidence about the deepseek family's legs. The chain-walk below
+    // would re-dispatch cold traffic onto the family chain and — under a
+    // FRESH deepseek root latch — land on OPENROUTER (real-cost) on evidence
+    // about nothing but a venice transport error. Instead: re-dispatch ONCE
+    // on the family's DEFAULT leg (legs[0] = deepseek official — the same
+    // default the kill-switch gate resolves to), never walking past it. When
+    // the default is unavailable/latched, return (no advance) — cold traffic
+    // never rides the family chain on an off-table leg's transport evidence.
+    if (!legIsFamilyMember(family, dispatched.provider)) {
+      const famLegs = familyLegs(family);
+      const defaultLeg = famLegs?.[0];
+      const step = nextLegAfter(family, dispatched, readLatchState(env), { env });
+      // nextLegAfter from a NON-table position walks legs[0..] (findIndex -1
+      // → first available). Accept ONLY when the first available leg IS the
+      // family default (deepseek official) — a deeper first-available leg
+      // means the default itself is latched/blocked, and the off-table leg's
+      // transport error must not skip the default for a deeper chain leg.
+      if (
+        defaultLeg &&
+        step.leg &&
+        step.leg.provider === defaultLeg.provider &&
+        step.leg.model === defaultLeg.model
+      ) {
+        return {
+          action: "advance",
+          nextLeg: step.leg,
+          annotations: {
+            failoverConnectionAdvance: true,
+            failoverHop: `${dispatched.provider}->${step.leg.provider}`,
+            failoverNote:
+              "connection-error on an off-table cold-class leg — re-dispatching on the family default (deepseek official); no chain walk",
+          },
+        };
+      }
+      return {
+        action: "return",
+        nextLeg: null,
+        annotations: {
+          failoverNote:
+            "connection-error on an off-table cold-class leg — default leg unavailable/latched; no advance (cold traffic never rides the family chain on off-table transport evidence)",
         },
       };
     }
@@ -2355,7 +2411,10 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // result as details.dispatchUsage; when the PARENT also opts into the
         // durable ledger (TASK_USAGE_LEDGER=1), the row is appended for the
         // 0a prospective collection window. Never throws; ledger failures are
-        // audit-only.
+        // audit-only. dispatchId = the per-dispatch TASK_HEARTBEAT_NONCE hex
+        // (round-1 P2): decision-loop hops reuse the caller-set nonce, so
+        // every leg row of ONE dispatch shares the id and joins the
+        // event=venice-route row recorded at dispatch resolution.
         if (hbEnabled) {
           const usage = scanStderrForUsage(stderr, hbNonce);
           if (usage) {
@@ -2371,6 +2430,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
                   cacheRead: usage.cacheRead,
                   cacheWrite: usage.cacheWrite,
                   cost: usage.cost,
+                  ...(hbNonce ? { dispatchId: hbNonce } : {}),
                 },
                 "dispatch-usage",
                 subAgentEnv,
@@ -3280,19 +3340,28 @@ export default function (pi: ExtensionAPI) {
       }
       const family = failoverResolution.family; // undefined = not a chain member
       let dispatchLeg: LegRef = failoverResolution.leg;
+      // #476: one dispatch-chain nonce shared by the child's marker stream,
+      // this decision table, and the ledger rows (spawnSubAgent REUSES a
+      // caller-set TASK_HEARTBEAT_NONCE instead of generating its own).
+      // Generated BEFORE the venice-route append (round-1 P2): the route row
+      // and every per-leg dispatch-usage row carry the same dispatchId, so
+      // cold-class burn is joinable per dispatch.
+      if (failoverActive && family) subAgentEnv.TASK_HEARTBEAT_NONCE = randomBytes(6).toString("hex");
       // #512 proof-of-routing ledger: an actual venice dispatch (the cold-class
       // seam resolved to the venice leg and no kill switch gated it) appends a
       // venice-route audit row so credit burn is attributable per dispatch
       // WITHOUT scraping session files (audit/provider-failover.jsonl;
       // event=venice-route). Append-only + never throws (appendLedger).
       if (dispatchLeg.provider === "venice") {
-        recordVeniceRoute(dispatchLeg, family ?? null, failoverResolution.hop ?? null, subAgentEnv);
+        recordVeniceRoute(
+          dispatchLeg,
+          family ?? null,
+          failoverResolution.hop ?? null,
+          subAgentEnv,
+          failoverActive && family ? (subAgentEnv.TASK_HEARTBEAT_NONCE ?? null) : null,
+        );
         console.log(`[task] cold-class route → ${dispatchLeg.provider}/${dispatchLeg.model} (venice-route ledger)`);
       }
-      // #476: one dispatch-chain nonce shared by the child's marker stream
-      // and this decision table (spawnSubAgent REUSES a caller-set
-      // TASK_HEARTBEAT_NONCE instead of generating its own).
-      if (failoverActive && family) subAgentEnv.TASK_HEARTBEAT_NONCE = randomBytes(6).toString("hex");
       const buildArgs = (leg: LegRef): string[] =>
         ["-p", "--provider", leg.provider, "--model", leg.model, "--no-session", params.prompt];
       const spawnLeg = (leg: LegRef) => spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal);

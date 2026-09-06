@@ -2930,6 +2930,83 @@ test("decidePostDispatch: terminal hop leg connection-error → return (never re
   }
 });
 
+test("#512 round-1 P2: OFF-TABLE venice markerless connection-error → re-dispatch on the family DEFAULT (never a chain walk)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    env.PROVIDER_FAILOVER_BLOCKED = ""; // qwen-tp unblocked so the old bug would skip past deepseek
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: { provider: "venice", model: "deepseek-v4-flash" },
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: null,
+      env,
+    });
+    equal(decision.action, "advance", "venice transport error → one re-dispatch on the default");
+    deepEqual(decision.nextLeg, { provider: "deepseek", model: "deepseek-v4-flash" }, "target = deepseek official (family default), never a deeper chain leg");
+    ok(String(decision.annotations.failoverNote).includes("no chain walk"), "annotation says no chain walk");
+  } finally {
+    cleanup();
+  }
+});
+
+test("#512 round-1 P2: OFF-TABLE venice connection-error under a FRESH deepseek root latch → return (never rides openrouter)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // deepseek root freshly latched (in-flight exhaustion) → the default leg
+    // itself is unavailable; the OLD code walked the chain and landed on
+    // OPENROUTER on nothing but a venice transport error (real-cost cold
+    // traffic). The off-table discriminator must return instead.
+    setExhausted({
+      primaryProvider: "deepseek",
+      reason: "402",
+      source: "marker",
+      family: "deepseek-v4-flash",
+      fromLeg: FLASH_ROOT,
+      env,
+    });
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: { provider: "venice", model: "deepseek-v4-flash" },
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: null,
+      env,
+    });
+    equal(decision.action, "return", "no advance when the default is latched — cold traffic never rides the chain on off-table transport evidence");
+    ok(String(decision.annotations.failoverNote).includes("no advance"), "non-advance note present");
+  } finally {
+    cleanup();
+  }
+});
+
+test("#512 round-1 P2: TABLE-leg connection-error behavior is BYTE-IDENTICAL (qwen-tp still advances)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    env.PROVIDER_FAILOVER_BLOCKED = "";
+    setExhausted({
+      primaryProvider: "deepseek",
+      reason: "402",
+      source: "marker",
+      family: "deepseek-v4-flash",
+      fromLeg: FLASH_ROOT,
+      env,
+    });
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: QWENTP_FLASH,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: null,
+      env,
+    });
+    equal(decision.action, "advance", "table-leg (qwen-tp) storm still advances along the chain");
+    deepEqual(decision.nextLeg, OPENROUTER_FLASH, "qwen-tp → openrouter (unchanged #476 semantics)");
+  } finally {
+    cleanup();
+  }
+});
+
 test("leg circuit breaker: 2 connection-error strikes / 60s open the leg; open leg never advances", () => {
   const { env, cleanup } = freshFailoverEnv();
   try {
@@ -3480,7 +3557,27 @@ test("recordVeniceRoute: a real venice dispatch appends the audit row with kind/
     equal(row.class, "cold");
     equal(row.family, "deepseek-v4-flash");
     equal(row.hop, null);
+    equal(row.dispatchId, undefined, "no dispatchId when none provided (legacy call)");
     ok(typeof row.ts === "string" && !Number.isNaN(Date.parse(row.ts)), "ISO timestamp");
+  } finally {
+    cleanup();
+  }
+});
+
+test("recordVeniceRoute round-1 P2: dispatchId rides the row when provided (joinable with dispatch-usage rows)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    recordVeniceRoute(
+      { provider: "venice", model: "deepseek-v4-flash" },
+      "deepseek-v4-flash",
+      null,
+      env,
+      "dispatch-nonce-abc",
+    );
+    const file = join(env.PI_CODING_AGENT_DIR!, "audit", "provider-failover.jsonl");
+    const row = JSON.parse(readFileSync(file, "utf-8").trim().split("\n")[0]);
+    equal(row.event, "venice-route");
+    equal(row.dispatchId, "dispatch-nonce-abc", "route row carries the per-dispatch id");
   } finally {
     cleanup();
   }
