@@ -278,12 +278,15 @@ if [ -d "$scripts_dir" ]; then
   echo "    scripts/checkout-hygiene farm: $copied copied (real files, #427)"
 fi
 
-# Fleet-scripts farm (#373): the weekly fleet-cost cadence runs under launchd
-# (com.eldato.fleet-cost-weekly plist), which cannot read ~/Documents — same
-# TCC wall as #427. session-postmortem.sh (the shared parser), the report,
-# the watch, and the weekly driver must ALL sit in ~/.pi/agent/scripts so the
-# driver's sibling calls resolve. Same idempotent real-copy refresh model.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh)
+# Fleet-scripts farm (#373 + #469): the weekly fleet-cost cadence runs under
+# launchd (com.eldato.fleet-cost-weekly plist) and the pi-session reaper runs
+# hourly (com.eldato.pi-session-reaper plist) — launchd cannot read
+# ~/Documents (same TCC wall as #427). session-postmortem.sh (the shared
+# parser), the report, the watch, the weekly driver, and the reaper must ALL
+# sit in ~/.pi/agent/scripts so the drivers' sibling calls resolve and the
+# plists' ProgramArguments targets exist (broken-target guard). Same
+# idempotent real-copy refresh model.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
