@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
@@ -526,7 +526,7 @@ test("exported functions are callable (#5527 regression)", () => {
   // drops an export fails here with a named diagnostic.
   const callables = [
     extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot,
-    isShapeExemptFile, isDeletionPush, isBareCommitShape,
+    isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass,
   ] as const;
   for (const fn of callables) ok(typeof fn === "function", "export must be callable");
   equal(extractJson('{"status":"PASS","failures":[],"verified_files":[]}')!.status, "PASS", "extractJson smoke");
@@ -535,6 +535,7 @@ test("exported functions are callable (#5527 regression)", () => {
   ok(isShapeExemptFile("README.md"), "isShapeExemptFile smoke");
   ok(isDeletionPush("git push origin --delete feat/x"), "isDeletionPush smoke");
   ok(isBareCommitShape("git commit -m x"), "isBareCommitShape smoke");
+  ok(typeof commitSweepClass === "function", "commitSweepClass smoke (callable)");
 });
 
 // ── normalizeRegistryPath (#7595) ────────────────────
@@ -1384,9 +1385,12 @@ section("isDeletionPush — delete-shaped push classification (#472 mechanism b)
 // fallbacks, and if/fi blocks. Shared by BOTH predicates so the full-block
 // fixture stays in sync across the isDeletionPush and isBareCommitShape
 // classification surfaces.
-const FULL_05_CLEANUP_BLOCK = `# BRANCH = the merged PR branch (from the session's worktree, or resolve via gh):
-BRANCH=$(git branch --show-current)
-[ -n "$BRANCH" ] || BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
+const FULL_05_CLEANUP_BLOCK = `# BRANCH = the merged PR branch — resolve via gh FIRST. Deriving from the current
+# branch is ambiguous after the #376 Step C return: an in-main ceremony session
+# now sits on main, and \`git branch --show-current\` would target the default
+# branch. gh knows the PR's head branch regardless of local checkout state.
+BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null)
+[ -n "$BRANCH" ] || BRANCH=$(git branch --show-current)
 
 # Remote delete — server-side, always possible after merge; "remote ref does not
 # exist" means deleteBranchOnMerge already removed it = success.
@@ -1399,7 +1403,7 @@ if git worktree list --porcelain | grep -q "branch refs/heads/$BRANCH"; then
   echo "⚠️ branch $BRANCH is still checked out in a worktree — local delete deferred."
   echo "   TEARDOWN NOTE: remove the worktree and run: git branch -D $BRANCH"
 else
-  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH could not be deleted — delete manually: git branch -D $BRANCH"
+  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH not found or could not be deleted — delete manually: git branch -D $BRANCH"
 fi`;
 
 // ── #482 — shared drift-guard skip-arm messaging for the THREE guards (01-preflight,
@@ -1706,6 +1710,114 @@ test("05-cleanup.md fenced block (TRUE fixture — no commit invocations → vac
   // isDeletionPush section above; the identical full-block literal is pinned
   // on BOTH predicates so they cannot drift apart).
   ok(isBareCommitShape(FULL_05_CLEANUP_BLOCK), "ceremony block with no commit invocations is vacuously bare");
+});
+
+// ── #489 — auto-sweep commit classification (diff-scope mirror of the D2 guard) ──
+// isBareCommitShape decides the content-shape EXEMPTION; commitSweepClass decides the
+// DIFF SURFACE. `git commit -a` / `--all` record the tracked WORKING TREE, not just the
+// staged index — a gate scoped to `git diff --cached` lets a staged-docs verifier PASS
+// unlock a commit that then sweeps dirty, never-verified code (the #489 hole). The
+// classifier detects sweep-form commit invocations so the hook can diff `git diff HEAD`
+// instead. Values: "sweep" (every head-anchored commit invocation in the command sweeps),
+// "mixed" (≥1 sweep + ≥1 non-sweep head-anchored invocation — the non-sweep commit records
+// index-only content, so the hook must verify staged ∪ worktree), "none" (no sweep —
+// staged/index scope unchanged, #489 T2). Token model mirrors git's parser: required-value
+// shorts m/F/C/c/t consume rest-of-cluster or the NEXT token (even dash-leading —
+// `git commit -m --amend` is message "--amend", not an amend); optional-value shorts S/u
+// consume ATTACHED cluster chars only, never the next token (`-Sa` = gpg keyid a,
+// `-uall` = untracked mode all — neither sweeps; `-S -a` DOES sweep); required-value longs
+// (--message --file --reedit-message --reuse-message --author --date --template --cleanup
+// --fixup --squash --trailer --pathspec-from-file — --encoding is NOT a git commit option,
+// verified) consume the next token; scanning continues past positional/pathspec and unknown
+// tokens — only `--` (pathspec terminator) and end-of-stream end flag parsing; only
+// HEAD-ANCHORED commit invocations classify (wrappers/prose stay "none" — unchanged staged
+// scope, no under-gate, residual #539).
+
+section("commitSweepClass — auto-sweep commit classification (#489)");
+
+test("SWEEP → \"sweep\" (single pure-sweep invocation)", () => {
+  const pins = [
+    "git commit -a",
+    "git commit --all -m x",
+    "git commit -am x",
+    'git commit -am "x"',
+    "git commit -amx",                       // -a + -m(x attached)
+    "git commit -vam x",                     // -v -a -m(x)
+    "git commit -qam x",
+    "git -C repo commit -am x",              // sweep behind git global flags (PURE-PREDICATE pin — hook interception gap tracked by #490)
+    "git --no-pager commit -am x",
+    "git commit --author \"Jane <j@d>\" -a -m x",  // scan continues past required-value longs
+    "git commit --date 2024-01-01 -a -m x",
+    "git commit --trailer \"A=b\" -a -m x",   // required-value long consumes its value, then -a
+    "git commit --message=msg -a -m x",   // ATTACHED-equals value long must NOT swallow the trailing -a
+    "git commit --file msg.txt -a",       // value-long member pin (--file)
+    "git commit --cleanup strip -a -m x", // value-long member pin (--cleanup)
+    "git commit --template tpl.txt -a",   // value-long member pin (--template)
+    "git commit --reuse-message HEAD -a", // value-long member pin (--reuse-message)
+    "git commit --fixup HEAD -a",         // value-long member pin (--fixup)
+    "git commit --squash HEAD -a",        // value-long member pin (--squash)
+    "git commit --no-verify -a -m x",     // BOOLEAN long before -a must NOT swallow it (guards against a wrongful SWEEP_VALUE_LONGS addition)
+    "git commit --encoding -a -m x",      // --encoding is NOT a git commit option (verified: "error: unknown option `encoding'") — a wrongful SWEEP_VALUE_LONGS addition would swallow the -a → false-negative guard
+    "git commit -t tpl.txt -a -m x",
+    "git commit -S -a -m x",                  // optional-value -S never consumes the NEXT token → -a is real
+    "git commit -u -a -m x",                  // same for -u
+    "git commit --amend -a",                  // via the -a arm
+    "git commit -a --amend",
+    "git commit -a -m x && git commit --all -m y", // every head-anchored invocation sweeps → sweep
+    "git commit -am x && git push origin main",    // push segment is vacuous (no commit invocation)
+  ];
+  for (const c of pins) equal(commitSweepClass(c), "sweep", `must be sweep: ${c}`);
+});
+
+test("MIXED (sweep + non-sweep commit in one command) → \"mixed\"", () => {
+  const pins = [
+    "git commit -m x && git commit --all -m y",   // bare then sweep
+    "git commit -am x && git commit -m y",         // sweep then bare
+    "git commit -m x f.txt && git commit -a -m y", // pathspec then sweep
+    // wrapper/negation commit + head-anchored sweep: the wrapper's bare half ships
+    // the whole index (staged-only content invisible to `git diff HEAD`) → must be
+    // MIXED (union scope), never pure-sweep (reviewer finding, #489 round 2):
+    "sh -c 'git commit -m y' && git commit -am x",
+    "! git commit -m y && git commit --all -m x",
+    "bash -lc 'git commit -m y' && git commit -am x",
+  ];
+  for (const c of pins) equal(commitSweepClass(c), "mixed", `must be mixed: ${c}`);
+});
+
+test("NONE (bare / amend-alone / pathspec / value-swallowed / vacuous) → \"none\"", () => {
+  const pins = [
+    "git commit -m x",
+    "git commit -m x -s",
+    "git commit -F msg.txt",
+    "git commit -c HEAD -m x",
+    "git commit -C HEAD -m x",
+    "git commit -S -m x",
+    "git commit -m -a",                  // message "-a"
+    "git commit -m --amend",             // message "--amend"
+    "git commit --message -a",           // subject "-a"
+    "git commit --message --all",
+    "git commit --message=--amend",      // attached value
+    "git commit --message=-a",           // attached value never scanned for '-a' chars
+    "git commit --reuse-message -a",      // required-value long consumes the dash-leading "-a" as its value (membership-observable pin)
+    "git commit --file -a",               // same — --file value "-a" (membership-observable pin)
+    "git commit --template -a",           // same — --template value "-a" (membership-observable pin)
+    "git commit -ma x",                  // -m value "a" + pathspec x
+    "git commit -mx",                    // -m value x
+    "git commit -Sa -m x",               // -S optional keyid "a" (attached) — NOT a sweep
+    "git commit -uall -m x",             // -u optional mode "all" (attached)
+    "git commit -ta x",                  // -t template "a" + pathspec x
+    "git commit --amend -m x",           // amend alone — index scope (#489 T1 letter; T2)
+    "git commit -m x f.txt",             // pathspec
+    "git commit -o code.ts -m x",        // only-mode pathspec
+    "git commit -m x --only",
+    "git commit -m x -- -a",             // `--` pathspec terminator → "-a" is a path, not a flag
+    "git commit --all=true",             // invalid attached spelling — not the flag
+    "sh -c 'git commit -am x'",          // wrapper — non-head-anchored → none (staged scope, unchanged; #539)
+    "! git commit -am x",
+    "git push origin main",              // vacuous — no commit invocation
+    "gh pr create --body 'git commit -am x'",  // prose — never classified
+  ];
+  for (const c of pins) equal(commitSweepClass(c), "none", `must be none: ${c}`);
 });
 
 // ── #482 — shared drift-guard layout gate (replaces the two-#472-guard isSourceCheckout

@@ -957,6 +957,106 @@ export function isBareCommitShape(command: string): boolean {
   return true; // no commit segment, or every commit bare → guard satisfied
 }
 
+// ── #489 — auto-sweep commit classification (diff-scope mirror of the D2 guard) ──
+// isBareCommitShape decides the content-shape EXEMPTION; commitSweepClass decides the
+// DIFF SURFACE. `git commit -a` / `--all` record the tracked WORKING TREE, not just the
+// staged index — a gate scoped to `git diff --cached` lets a staged-docs verifier PASS
+// unlock a commit that then sweeps dirty, never-verified code (the #489 hole). Values:
+// "sweep" (every head-anchored commit invocation in the command sweeps → hook diffs
+// `git diff HEAD`, exactly what the sweep records); "mixed" (≥1 sweep + ≥1 non-sweep
+// head-anchored invocation → hook verifies staged ∪ worktree — the non-sweep commit
+// records index-only content invisible to a WT-only scope); "none" (no sweep — staged/
+// index scope unchanged, #489 T2). Token model mirrors git's parser: required-value
+// shorts m/F/C/c/t consume rest-of-cluster or the NEXT token (even dash-leading —
+// `git commit -m --amend` is message "--amend", not an amend); optional-value shorts S/u
+// consume ATTACHED cluster chars only, never the next token (`-Sa` = gpg keyid a,
+// `-uall` = untracked mode all — neither sweeps; `-S -a` DOES sweep); required-value
+// longs consume the next token; scanning continues past positional/pathspec and unknown
+// tokens — only `--` (pathspec terminator) and end-of-stream end flag parsing; only
+// HEAD-ANCHORED commit invocations classify (wrapper/negation/prose forms stay "none" —
+// unchanged staged scope, no new under-gate; the wrapper-hidden sweep variant is
+// residual #539, and the git-global-option interception gap is residual #490).
+export type CommitSweepClass = "sweep" | "mixed" | "none";
+
+// #489: required-value LONG options on `git commit` — each consumes the NEXT token as
+// its value (even dash-leading: `git commit --message -a` is a bare commit with subject
+// "-a"). --encoding is NOT a git commit option (verified empirically: "error: unknown
+// option `encoding'") and must NOT be added — a wrongly-included boolean would skipNext
+// over a real `-a` → false negative.
+const SWEEP_VALUE_LONGS = new Set([
+  "--message", "--file", "--reedit-message", "--reuse-message", "--author",
+  "--date", "--template", "--cleanup", "--fixup", "--squash", "--trailer",
+  "--pathspec-from-file",
+]);
+
+// Scan ONE commit invocation's post-verb token stream for a sweep flag, mirroring git's
+// option parser token order. Required-value shorts m/F/C/c/t consume rest-of-cluster or
+// the NEXT token; optional-value shorts S/u consume ATTACHED cluster chars only (never
+// the next token); scanning continues past positional/pathspec + unknown tokens — only
+// `--` and end-of-stream terminate. Returns true on the first `-a` char or `--all`.
+function scanCommitInvocationForSweep(rest: string): boolean {
+  const tokens = tokenizePushArgs(rest);
+  let skipNext = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (skipNext) { skipNext = false; continue; }
+    if (tok === "--") return false;          // pathspec terminator — nothing after is a flag
+    if (tok === "--all") return true;
+    if (tok.startsWith("--")) {
+      if (SWEEP_VALUE_LONGS.has(tok)) skipNext = true; // required-value long consumes next token
+      continue;                              // boolean/unknown longs are not sweep forms
+    }
+    if (tok.startsWith("-") && tok.length > 1) {
+      for (let j = 1; j < tok.length; j++) {
+        const c = tok[j];
+        if (c === "a") return true;          // -a sweep (bundle member: -am, -vam, -qa, ...)
+        if (c === "m" || c === "F" || c === "C" || c === "c" || c === "t") {
+          // required-value short: attached rest is the value; bare form takes the NEXT token
+          if (j + 1 < tok.length) break;
+          skipNext = true;
+          break;
+        }
+        if (c === "S" || c === "u") {
+          // optional-value short: consumes ATTACHED rest only (`-Sa` keyid a, `-uall` mode)
+          break;
+        }
+        // booleans (e/i/n/o/q/s/v) and unknown chars: continue scanning the cluster
+      }
+      continue;
+    }
+    // positional token (pathspec): git parses flags AFTER positionals — keep scanning
+  }
+  return false;
+}
+
+export function commitSweepClass(command: string): CommitSweepClass {
+  let sawSweep = false;
+  let sawNonSweepCommit = false;
+  for (const segment of splitCommandSegments(command)) {
+    const stripped = stripSegmentHead(segment);
+    const commitMatch = findGitCommit(stripped); // substring scan — head-anchored OR wrapper form
+    if (commitMatch === null) continue;          // no commit invocation — vacuous segment
+    if (commitMatch.index !== 0) {
+      // wrapper/negation/prose commit invocation — its (bare) commit half ships
+      // the WHOLE index (staged-only content whose disk state == HEAD is
+      // invisible to `git diff HEAD`), so a composite that ALSO contains a
+      // head-anchored sweep must classify "mixed" → union(staged, WT) scope.
+      // Fail-closed: treating wrappers as invisible here let
+      // `sh -c 'git commit -m y' && git commit -am x` ship staged-only code
+      // unverified (reviewer finding, #489 round 2).
+      sawNonSweepCommit = true;
+      continue;
+    }
+    if (scanCommitInvocationForSweep(stripped.slice(commitMatch.end))) {
+      sawSweep = true;
+    } else {
+      sawNonSweepCommit = true;
+    }
+  }
+  if (!sawSweep) return "none";
+  return sawNonSweepCommit ? "mixed" : "sweep";
+}
+
 // ── Diff computation ──────────────────────────────────
 
 function resolveGitRoot(cwd: string): string {
@@ -981,6 +1081,32 @@ function computeStagedDiff(cwd: string): string[] {
     return out ? out.split("\n").filter(Boolean) : [];
   } catch {
     return [];
+  }
+}
+
+// #489: the file set a sweep commit (`git commit -a`/`--all`) actually records — the
+// tracked WORKING TREE vs HEAD. Unborn HEAD (no commits yet): `git commit -a` records
+// only the index (verified empirically), and `git diff HEAD` errors — the staged-diff
+// fallback is the exact `-a` set for that state. Any OTHER diff failure (corrupt index,
+// permission) is logged and falls back to the staged scope (status-quo semantics; a
+// genuinely broken repo fails at `git commit` time anyway) — accepted residual, see the
+// #489 plan surface-map row 2.
+function computeWorktreeDiff(cwd: string): string[] {
+  try {
+    execSync("git rev-parse --verify HEAD", { encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore" });
+  } catch {
+    return computeStagedDiff(cwd); // unborn HEAD
+  }
+  try {
+    const out = execSync("git diff HEAD --name-only", {
+      encoding: "utf-8",
+      cwd,
+      timeout: 5000,
+    }).trim();
+    return out ? out.split("\n").filter(Boolean) : [];
+  } catch (e) {
+    console.error("[verification-gate] ⚠️ git diff HEAD failed — falling back to staged scope:", (e as Error).message);
+    return computeStagedDiff(cwd);
   }
 }
 
@@ -1444,15 +1570,38 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    // Compute diff
+    // Compute diff — #489: auto-sweep commits (`-a`/`--all`) record the
+    // working tree, not just the index; their verification file set must be
+    // HEAD-vs-working-tree (`git diff HEAD` — exactly what the sweep commits)
+    // or the staged-docs verifier PASS lets the swept code ride unverified
+    // (D2 forces the gate to run but cannot widen the file set). Classifier:
+    // "sweep" (pure-sweep command) → WT diff only (no wasted staged
+    // subprocess); "mixed" (sweep + non-sweep commit in one command) →
+    // deduped union(staged, WT) — a WT-only scope would blind the gate to
+    // index-only content a BARE commit in the chain records (NAME-scoped:
+    // disk-hash verification cannot verify staged-only content whose disk
+    // state equals HEAD — pre-existing limitation of the disk-based verifier,
+    // not introduced here); "none" → today's staged scope. Mixed sweep+gh-pr
+    // chains keep the gh branch path (unchanged; #540). ⛔ This block sits
+    // AFTER the top-of-op pendingRehash loop + recoverBridgeForRoot — do not
+    // move it above them (scenario 41's post-fix greenness depends on the
+    // Leg-A allowed commit's armed pendingRehash executing before the block
+    // check).
+    const sweepClass = commitSweepClass(command);
     let changedFiles: string[];
-    if (GH_PR_PATTERN.test(command)) {
+    if (sweepClass !== "none" && !GH_PR_PATTERN.test(command)) {
+      const worktree = computeWorktreeDiff(cwd);
+      changedFiles = sweepClass === "sweep" ? worktree
+        : Array.from(new Set([...computeStagedDiff(cwd), ...worktree]));
+    } else if (GH_PR_PATTERN.test(command)) {
       // #204: `gh pr merge` merges REMOTELY. Only the PR's own repo+head can
       // be verified locally; anything else is unrelated branch residue that
       // must neither block nor reach verifiedSet/bridge (drift contamination).
       // `gh pr create` is NOT scoped — its diff IS this branch's files. The
       // merge-vs-create split is verb-anchored (isMergeCommand), so a create
       // whose --body merely MENTIONS "gh pr merge <n>" is never routed here.
+      // ⛔ PRESERVE VERBATIM — the merge-scope skip below returns undefined
+      // (console.log + logGateSkip) and must not be dropped (scenario 19).
       if (isMergeCommand(command)) {
         const decision = resolveMergeScope(command, cwd);
         if (!decision.verify) {

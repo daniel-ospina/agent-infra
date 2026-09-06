@@ -1924,6 +1924,276 @@ async function main() {
     ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
        "audit must record content_shape_exempt for the push");
   });
+
+  test("scenario 48 (#489): git commit -a / --all sweeps dirty code — working-tree diff scope (HEAD mode)", async () => {
+    // The #489 hole: `git commit -a` records the tracked WORKING TREE, not just the
+    // index. A gate scoped to `git diff --cached` sees only staged docs, a docs PASS
+    // unlocks the commit, and the sweep ships never-verified dirty code. Post-fix the
+    // file set comes from `git diff HEAD` (exactly what the sweep records).
+    const repo = join(TEST_ROOT, "repo-489-48");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "r1\n");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "app.ts"), "a1\n");
+    git(repo, "add README.md src/app.ts");
+    git(repo, "commit -m base");
+    // Session layout: session_start at the start and before legs B/E/F/G. The
+    // B/E/F resets are isolation hygiene (clears verifiedSet + #7591 counters;
+    // auto-bypass is unreachable here, app.ts never exceeds attempt 2 under any
+    // layout). TWO load-bearing boundaries: (1) NO session_start between Leg B's
+    // PASS and Leg C's allow (README registration must survive verifiedSet.clear()
+    // into Leg C); (2) Leg G's session_start is REQUIRED, not hygiene — Leg F's
+    // fire-time bridge recovery re-registers app.ts sha("a4\n") into the in-memory
+    // verifiedSet, and recovery is ADD-ONLY (fire-time match-or-drop can drop a
+    // stale bridge entry but never removes an already-merged in-memory key), so
+    // without the reset the G discriminator fire would classify app.ts (disk a5)
+    // as a HASH MISMATCH, not unverified — reddening the !/Hash mismatch/ assert.
+    // Every block-expecting leg edits its file to NEW content first, so the
+    // tool_call bridge-recovery match-or-drop drops stale hashes (block
+    // expectations stay deterministic).
+    await fire("session_start", {});
+    // Leg A — staged docs + dirty code, `-am`, both UNVERIFIED: block names BOTH.
+    writeFileSync(join(repo, "README.md"), "r2\n");
+    git(repo, "add README.md");
+    writeFileSync(join(repo, "src", "app.ts"), "a2\n"); // dirty — NOT staged
+    const legA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: 'git commit -am "x"', cwd: repo },
+    });
+    ok(legA && legA.block === true, "Leg A: -am with staged docs + dirty code must block");
+    ok(/Unverified files[\s\S]*README\.md/.test(legA.reason), "Leg A: staged docs read as UNVERIFIED (never hash-mismatch — no prior PASS in this fresh repo root)");
+    ok(/Unverified files[\s\S]*src\/app\.ts/.test(legA.reason), "Leg A: the swept dirty code file is VGATE-required — block names src/app.ts (pre-fix: names only README.md)");
+    ok(!/Hash mismatch/.test(legA.reason), "Leg A: no hash-mismatch section (both files UNVERIFIED — deterministic for a fresh repo root)");
+    // Leg B — hole closer (red pre-fix): a docs-only PASS must NOT unlock the sweep.
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: README.md. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "README.md"), hash: sha("r2\n") }],
+      }) }],
+    });
+    const legB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: 'git commit -am "x"', cwd: repo },
+    });
+    ok(legB && legB.block === true, "Leg B: docs-only PASS must NOT unlock the -a sweep — code still blocks (pre-fix: ALLOWED → code ships unverified)");
+    ok(legB.reason.includes("src/app.ts"), "Leg B: block names the swept dirty code file (VGATE-required)");
+    ok(!legB.reason.includes("README.md"), "Leg B: the verified docs file is NOT re-blocked — the docs PASS is honored (only the swept code blocks)");
+    ok(!/Hash mismatch/.test(legB.reason), "Leg B: no hash-mismatch section — README's registration matches disk (deterministic)");
+    // Leg C — code PASS → allow → real sweep commits BOTH (both verified).
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/app.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "src/app.ts"), hash: sha("a2\n") }],
+      }) }],
+    });
+    const legC = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: 'git commit -am "x"', cwd: repo },
+    });
+    equal(legC, undefined, "Leg C: -am ALLOWED after both files verified");
+    git(repo, 'commit -am "x"'); // execute the allowed sweep for real
+    const cCommit = execSync("git diff HEAD^ --name-only", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    ok(cCommit.includes("README.md") && cCommit.includes("src/app.ts"),
+       "Leg C: the allowed -a sweep committed BOTH the staged docs and the dirty code (correct — both verified)");
+    equal(execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim(), "",
+       "Leg C: real -a sweep committed both files — porcelain clean");
+    // Leg D — bare docs commit stays shape-exempt (T3); dirty code untouched.
+    writeFileSync(join(repo, "README.md"), "r3\n");
+    git(repo, "add README.md");
+    writeFileSync(join(repo, "src", "app.ts"), "a3\n"); // dirty — NOT staged
+    const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const legD = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m x", cwd: repo },
+    });
+    equal(legD, undefined, "Leg D: bare commit over ONLY staged docs is shape-exempt (unchanged — T2/T3)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
+       "Leg D: bare docs commit audited content_shape_exempt");
+    git(repo, "commit -m x"); // execute the allowed bare docs commit for real
+    const porcelainD = execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    equal(porcelainD, " M src/app.ts\n",
+       "Leg D: bare docs commit committed README.md only — raw porcelain exactly ' M src/app.ts' (dirty code untouched)");
+    // Leg E — empty-index sweep (purest variant): dirty code + NOTHING staged blocks.
+    await fire("session_start", {});
+    writeFileSync(join(repo, "src", "app.ts"), "a4\n"); // dirty — nothing staged
+    const legE = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -a -m sweep", cwd: repo },
+    });
+    ok(legE && legE.block === true, "Leg E: empty-index -a over dirty code must block (pre-fix: empty staged diff → ALLOWED → code swept unverified)");
+    ok(legE.reason.includes("src/app.ts"), "Leg E: block names the dirty code file");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/app.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "src/app.ts"), hash: sha("a4\n") }],
+      }) }],
+    });
+    const legE2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -a -m sweep", cwd: repo },
+    });
+    equal(legE2, undefined, "Leg E: -a ALLOWED after the code file verified");
+    git(repo, "commit -a -m sweep"); // execute for real
+    equal(execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim(), "",
+       "Leg E: real -a sweep committed the code file — porcelain clean");
+    // Leg F — docs-only empty-index -a: fail-closed friction pin (allow→block flip).
+    await fire("session_start", {});
+    writeFileSync(join(repo, "README.md"), "r5\n"); // dirty docs — NOT staged, no code changes
+    const legF = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -a -m docs", cwd: repo },
+    });
+    ok(legF && legF.block === true,
+       "Leg F: docs-only empty-index -a now blocks as UNVERIFIED docs (post-fix WT scope is non-empty; sweep never exempt (D2) — pre-fix: empty staged diff → ALLOWED). Intentional fail-closed allow→block flip");
+    ok(legF.reason.includes("README.md"), "Leg F: block names the docs file");
+    // Leg G — MIXED chain (`-m` bare + `-a` sweep in ONE command) → union scope
+    // (staged ∪ worktree). Red-under-regression discriminator: an index-only
+    // staged file whose disk content equals HEAD is invisible to `git diff HEAD`
+    // (a WT-only scope would name only app.ts) and a staged-only scope would
+    // name only README — the union names BOTH (the bare half records the staged
+    // README; the sweep half records the dirty app.ts). Fresh content r7/r8 is
+    // used because the Leg-D rehash + Leg-E PASS blessed README sha("r3\n") into
+    // the DURABLE bridge — restoring disk to the old HEAD r3 would re-bless it
+    // via bridge recovery at the fire (disk==registered → verified → only the
+    // WT file blocks). A raw commit first advances HEAD to never-registered r7,
+    // so the disk-restored file's hash matches nothing in the bridge.
+    await fire("session_start", {});
+    writeFileSync(join(repo, "README.md"), "r7\n");
+    git(repo, "add README.md");
+    git(repo, 'commit -m "g-base"');            // raw real commit — HEAD README r7 (never PASS-registered)
+    writeFileSync(join(repo, "README.md"), "r8\n");
+    git(repo, "add README.md");                  // staged r8 — index-only
+    writeFileSync(join(repo, "README.md"), "r7\n"); // disk back to HEAD r7 → WT-invisible (never-blessed hash)
+    writeFileSync(join(repo, "src", "app.ts"), "a5\n"); // dirty WT code (unverified)
+    const legG = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: 'git commit -m "docs" && git commit -am "x"', cwd: repo },
+    });
+    ok(legG && legG.block === true, "Leg G: mixed bare+sweep chain must block — the union scope names BOTH files");
+    ok(/Unverified files[\s\S]*README\.md/.test(legG.reason), "Leg G: the index-only staged docs (disk==HEAD) are VGATE-required via the UNION (a WT-only scope would name only app.ts)");
+    ok(/Unverified files[\s\S]*src\/app\.ts/.test(legG.reason), "Leg G: the swept dirty code file is VGATE-required (a staged-only scope would name only README.md)");
+    ok(!/Hash mismatch/.test(legG.reason), "Leg G: no hash-mismatch section (both files unverified — deterministic: r7/a5 never registered)");
+    // PASS both (README at its DISK content r7 — the staged r8 is never on disk;
+    // the union is name-scoped, see the #489 plan) → allow → real mixed chain.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: README.md src/app.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [
+          { path: join(repo, "README.md"), hash: sha("r7\n") },
+          { path: join(repo, "src/app.ts"), hash: sha("a5\n") },
+        ],
+      }) }],
+    });
+    const legG2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: 'git commit -m "docs" && git commit -am "x"', cwd: repo },
+    });
+    equal(legG2, undefined, "Leg G: mixed chain ALLOWED after both files verified (union scope)");
+    git(repo, 'commit -m "docs"'); // bare half for real — commits the staged README r8 (docs-only bare → shape-exempt)
+    git(repo, 'commit -am "x"');   // sweep half for real — sweeps README disk r7 + app.ts a5
+    const gSweep = execSync("git diff HEAD^ --name-only", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    ok(gSweep.includes("README.md") && gSweep.includes("src/app.ts"),
+       "Leg G: the real mixed chain committed the bare half (README r8) then swept both files in the -a half");
+    equal(execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim(), "",
+       "Leg G: real mixed chain committed both halves — porcelain clean");
+  });
+
+  test("scenario 49 (#489): unborn-HEAD sweep fallback + deleted-tracked sweep edges", async () => {
+    // Sub-case (a): unborn HEAD — `git commit -a` records only the index and `git diff
+    // HEAD` errors; the fallback must return the STAGED set (a naive error→[] would
+    // under-gate to allow). GREEN pre-fix too (a staged set on unborn already blocks via
+    // the staged scope) — this is a fallback REGRESSION GUARD; the red pin for the
+    // empty-index sweep is scenario 48 Leg E.
+    const repoA = join(TEST_ROOT, "repo-489-49a");
+    mkdirSync(repoA, { recursive: true });
+    git(repoA, "init -b main");
+    git(repoA, "config user.email e2e@test");
+    git(repoA, "config user.name e2e");
+    writeFileSync(join(repoA, "README.md"), "r\n");
+    mkdirSync(join(repoA, "src"), { recursive: true });
+    writeFileSync(join(repoA, "src", "app.ts"), "a\n");
+    git(repoA, "add README.md src/app.ts"); // staged — NO baseline commit (unborn)
+    await fire("session_start", {});
+    const resA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -a -m first", cwd: repoA },
+    });
+    ok(resA && resA.block === true, "49a: unborn -a with staged files must block (unborn fallback returns the staged set, not [])");
+    ok(resA.reason.includes("README.md") && resA.reason.includes("src/app.ts"), "49a: block names both staged files");
+    // PASS both → allowed → real commit creates the first commit.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: README.md src/app.ts. Classification: backend. Project root: ${repoA}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [
+          { path: join(repoA, "README.md"), hash: sha("r\n") },
+          { path: join(repoA, "src/app.ts"), hash: sha("a\n") },
+        ],
+      }) }],
+    });
+    const resA2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -a -m first", cwd: repoA },
+    });
+    equal(resA2, undefined, "49a: -a ALLOWED after both staged files verified");
+    git(repoA, "commit -a -m first");
+    ok(execSync("git rev-parse HEAD", { cwd: repoA, encoding: "utf-8", timeout: 20000 }).trim().length === 40,
+       "49a: real unborn -a commit created");
+    // Sub-case (b): staged deletion under -a — deletions are content-free (verify loop
+    // skips unhashable/deleted files) and must never name-block or forever-block.
+    const repoB = join(TEST_ROOT, "repo-489-49b");
+    mkdirSync(repoB, { recursive: true });
+    git(repoB, "init -b main");
+    git(repoB, "config user.email e2e@test");
+    git(repoB, "config user.name e2e");
+    writeFileSync(join(repoB, "src.ts"), "s1\n");
+    writeFileSync(join(repoB, "notes.txt"), "n\n");
+    git(repoB, "add src.ts notes.txt");
+    git(repoB, "commit -m base");
+    await fire("session_start", {});
+    git(repoB, "rm src.ts");          // staged deletion
+    writeFileSync(join(repoB, "notes.txt"), "n2\n"); // dirty — NOT staged
+    git(repoB, "add notes.txt");      // staged dirty (unverified)
+    const resB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -a -m del", cwd: repoB },
+    });
+    ok(resB && resB.block === true, "49b: -a with a staged deletion + dirty staged file must block on the CONTENT file");
+    ok(resB.reason.includes("notes.txt"), "49b: block names the dirty content file");
+    ok(!resB.reason.includes("src.ts"), "49b: the deleted file is content-free — never named, never forever-blocks (hashFile catch → skip)");
+    // Verify the deletion path does not stale-hash: PASS the content file → allowed →
+    // real commit removes src.ts and commits notes.txt.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: notes.txt. Classification: backend. Project root: ${repoB}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repoB, "notes.txt"), hash: sha("n2\n") }],
+      }) }],
+    });
+    const resB2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -a -m del", cwd: repoB },
+    });
+    equal(resB2, undefined, "49b: -a ALLOWED after the content file verified");
+    git(repoB, "commit -a -m del");
+    const delCommit = execSync("git diff HEAD^ --name-only", { cwd: repoB, encoding: "utf-8", timeout: 20000 });
+    ok(delCommit.includes("notes.txt") && !existsSync(join(repoB, "src.ts")),
+       "49b: real -a commit deleted src.ts and committed notes.txt");
+  });
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()
