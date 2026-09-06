@@ -332,9 +332,12 @@ advancing the deepseek root on another account's evidence.
   venice leg ignore it, so cold venice routing stays ACTIVE with NO automatic
   recovery (a venice 402 then strands the dispatch; and because the
   marker→`blockedLegs` conversion runs inside the #476 decision loop, NO
-  durable auth-block can form either — a 401/403 venice child is re-attempted
-  on every dispatch, bounded only by the retry policy). Full revert requires
-  unsetting `COLD_CLASS_PROVIDER` (and removing `VENICE_API_KEY`).
+  NEW durable auth-block can form either — a 401/403 venice child is
+  re-attempted on every dispatch, bounded only by the retry policy; the one
+  exception is a PRE-EXISTING block written before FAILOVER_DISABLE was set
+  (within its 24h TTL), which the alternate-leg gate still honors). Full
+  revert requires unsetting `COLD_CLASS_PROVIDER` (and removing
+  `VENICE_API_KEY`).
 
 ### Measurement (the 0a gate)
 

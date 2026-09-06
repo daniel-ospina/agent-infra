@@ -3594,6 +3594,32 @@ test("recordVeniceRoute never throws on an unwritable ledger dir (audit-only con
   }
 });
 
+test("#512 review round-3 P2-1: the execute-path nonce hoist is UNCONDITIONAL and precedes the venice-route append (source-order pin)", () => {
+  // Regression guard for the round-2 P2-1 fix: if the hoist is re-gated to
+  // `if (failoverActive && family)` or moved AFTER the append, the
+  // FAILOVER_DISABLE + cold-seam config silently regresses to unjoinable
+  // ledger rows (route row dispatchId=null, usage row auto-nonce) with ALL
+  // integration tests still green (the P2-3 pin exercises the writer
+  // contract, not the execute path). Lock the source shape:
+  //   1. the hoist assignment exists and is NOT inside a conditional
+  //   2. it appears textually BEFORE the recordVeniceRoute( call site
+  //   3. the route-row dispatchId arg no longer depends on failoverActive
+  const hoistIdx = source.indexOf("subAgentEnv.TASK_HEARTBEAT_NONCE = randomBytes(6).toString(\"hex\");");
+  ok(hoistIdx > 0, "unconditional hoist assignment present in source");
+  // execute-path call site is the LAST recordVeniceRoute( occurrence (the
+  // first is the exported function definition at the top of the file)
+  const routeCallIdx = source.lastIndexOf("recordVeniceRoute(");
+  ok(routeCallIdx > 0, "recordVeniceRoute call site present");
+  ok(hoistIdx < routeCallIdx, "hoist runs BEFORE the venice-route append");
+  ok(
+    !source.slice(0, hoistIdx).includes("if (failoverActive && family)") ||
+      source.indexOf("if (failoverActive && family)") > hoistIdx,
+    "hoist is not gated on failoverActive (round-2 P2-1)",
+  );
+  const argIdx = source.indexOf("subAgentEnv.TASK_HEARTBEAT_NONCE ?? null");
+  ok(argIdx > routeCallIdx && argIdx < routeCallIdx + 400, "route-row dispatchId arg is the hoisted nonce, not a failoverActive conditional");
+});
+
 // ── #512 per-dispatch usage capture — parent-side parse/scan ──
 
 section("#512 usage capture — parseTaskUsageLine / scanStderrForUsage (parent side)");
