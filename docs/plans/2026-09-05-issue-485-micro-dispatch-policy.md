@@ -2,7 +2,7 @@
 title: "Plan: #485 — review-enforcer micro-tier dispatch policy (hard-require ≥1 dispatch)"
 type: engineering
 domain: operations
-doc_status: draft
+doc_status: live
 subjects.team: epistemic-team
 created: 2026-09-06
 aboutSubjects: epistemic-team
@@ -17,7 +17,7 @@ aboutObjects: agent-infra, issue-485, review-enforcer, commit-workflow, issue-47
 
 **Team:** epistemic-team
 **Issue:** #485 (complexity:standard, Level: project)
-**Status:** implemented — PR #518 in code-review; plan-review clean (cycles=5, second-model gate NO P0/P1); test-review CLEAN (3 cycles, NO ISSUES FOUND cycle 3); doc_status stays `draft` until merge per 05-cleanup convention
+**Status:** implemented and merged — PR #518 (merge a4af902b, 2026-09-06); plan-review clean (cycles=5, second-model gate NO P0/P1); test-review CLEAN (3 cycles, NO ISSUES FOUND cycle 3); code-review converged clean (6 cycles + 2 second-model gate runs)
 
 ## Decision + Rationale (the issue's T1)
 
