@@ -253,7 +253,7 @@ Mechanism separation: the VGATE content-shape skip is extension-side and shape-b
 
 | Gate | Micro Behavior |
 |------|---------------|
-| Review-enforcer | **BLOCK at 0 dispatches — ≥1 task dispatch required at EVERY tier, micro included (#485).** The VGATE docs/CSS/static skip removed the backstop that made the pre-#485 micro leniency safe. Code sets satisfy the dispatch via VGATE's own [VGATE] verification dispatch; docs-only sets dispatch a lightweight reviewer (even a trivial one-line review counts). The marker read (/tmp/agent-issue-complexity = micro) selects the micro remediation message only |
+| Review-enforcer | **BLOCK at 0 dispatches — ≥1 sub-agent dispatch required at EVERY tier, micro included (#485)** (the gate counts any sub-agent dispatch — the `task` or `subagent` tool). The VGATE docs/CSS/static skip removed the backstop that made the pre-#485 micro leniency safe. Code sets satisfy the dispatch via VGATE's own [VGATE] verification dispatch; docs-only sets dispatch a lightweight reviewer (even a trivial one-line review counts). The marker read (/tmp/agent-issue-complexity = micro) selects the micro remediation message only |
 | Verification-gate (VGATE) | **shape-gated, not tier-gated** — docs/CSS/static-only sets skip regardless of tier; code sets never skip (see Pi Extension Gates → Verification Gate below) |
 | Lint/Typecheck | **KEPT** — runs in pre-commit hooks, zero agent overhead |
 | Code review (Step 3) | **SKIPPED** — per commit-workflow/03-code-review.md |
@@ -293,7 +293,9 @@ These checks are enforced by Pi extensions — each with per-gate scoping rather
 
 ### Review Enforcer Gate
 
-The `review-enforcer` extension blocks git operations unless at least one `task` sub-agent was dispatched this session — **at every tier, micro included** (0 dispatches block; pre-#485 the micro branch let a 0-dispatch session through — the VGATE docs/CSS/static skip removed the backstop that made that leniency safe. The extension reads `/tmp/agent-issue-complexity` only to select the micro-specific remediation message below; it never selects allow/block).
+The `review-enforcer` extension blocks git operations unless at least one sub-agent was dispatched this session — the gate counts ANY sub-agent dispatch (the `task` tool or the specialized-agent `subagent` tool; content-free floor — see the micro rationale below) — **at every tier, micro included** (0 dispatches block; pre-#485 the micro branch let a 0-dispatch session through — the VGATE docs/CSS/static skip removed the backstop that made that leniency safe. The extension reads `/tmp/agent-issue-complexity` only to select the micro-specific remediation message below; it never selects allow/block).
+
+> **Task sub-agents are exempt from the commit-time dispatch floor** (#285/#825): their review DISPATCH is parent-enforced — the parent session runs the review ceremony, so a task sub-agent's own git ops do not re-trigger the floor. The merge-registry gate still requires a recorded clean review before merge. The "every tier blocks at 0 dispatches" uniform floor describes the tier dimension; the sub-agent session shape is this documented carve-out.
 
 ```bash
 # This gate fires ON the git commit/push command itself — not as a separate check.
@@ -302,9 +304,9 @@ The `review-enforcer` extension blocks git operations unless at least one `task`
 ```
 
 **How to satisfy:**
-1. Before `git commit`, dispatch a `task` sub-agent to review your changes
+1. Before `git commit`, dispatch a `task` sub-agent (or `subagent`-tool agent) to review your changes
 2. The reviewer must return a result (even "NO ISSUES FOUND")
-3. The gate counts task dispatches — 1 is enough
+3. The gate counts any sub-agent dispatch (task or subagent tool) — 1 is enough
 4. **Micro tier:** code sets satisfy the dispatch via VGATE's own [VGATE] verification dispatch; docs-only micro sets (VGATE content-shape exempt) dispatch a lightweight reviewer naming the diff — the multi-agent code-review gate stays skipped per 03-code-review.md
 
 **Failure:** "No reviewers were dispatched in this session before the git operation." (micro tier receives a micro-specific message directing a lightweight docs reviewer).  

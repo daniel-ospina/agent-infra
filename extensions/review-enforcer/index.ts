@@ -634,7 +634,7 @@ export const MICRO_BLOCK_MESSAGE = [
   "   → Micro skips the multi-agent code-review GATE (commit-workflow 03-code-review.md) — the review-enforcer ≥1-dispatch rule still applies (#485).",
   "   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch naming the diff — even a trivial one-line review counts:",
   "   →   task(prompt='[REVIEW] docs-only change — verify claims/consistency against the docs diff; return NO ISSUES FOUND or list issues')",
-  "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required task dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any task dispatch.",
+  "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 
@@ -836,9 +836,16 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason: BLOCK_MESSAGE };
     });
 
-    // ── tool_result: count task dispatches ─────────
+    // ── tool_result: count sub-agent dispatches ────
     pi.on("tool_result", async (event, _ctx) => {
-      if (event.toolName !== "task") return undefined;
+      // The gate counts ANY sub-agent dispatch: the `task` tool or the
+      // specialized-agent `subagent` tool (extensions/subagent). Both are
+      // sub-agent dispatches — the content-free floor (#485 F2) makes no
+      // quality distinction, and #825 second-model review flagged that a
+      // docs-only micro change reviewed via the `subagent` tool must not
+      // false-block post-flip (micro relies on this counter as its only gate;
+      // VGATE is shape-exempt and code review is skipped at micro).
+      if (event.toolName !== "task" && event.toolName !== "subagent") return undefined;
       // #285 P2: task sub-agents never count dispatches — review DISPATCH is
       // parent-enforced (#825), and their own in-band [VGATE] dispatches must
       // not be counted/audited as review dispatches. (Today they never reach

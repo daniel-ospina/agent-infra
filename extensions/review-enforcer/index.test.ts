@@ -1344,6 +1344,16 @@ testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MES
         await fire("tool_result", { toolName: "task" });
         const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         equal(allowed, undefined, "micro + ≥1 dispatch must allow the git op (dispatch supersedes the marker)");
+        // Second-model gate P2 (2026-09-06): the counter must ALSO count the
+        // pi `subagent` tool (extensions/subagent) — a docs-only micro change
+        // reviewed via a subagent dispatch must not false-block post-flip
+        // (micro relies on this counter as its only gate). Reset via
+        // session_start, keep the marker, dispatch ONE subagent-tool result →
+        // the git op must allow.
+        await fire("session_start"); // resets dispatchCount to 0
+        await fire("tool_result", { toolName: "subagent" });
+        const subagentAllowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(subagentAllowed, undefined, "micro + 1 subagent-tool dispatch must allow the git op (any sub-agent dispatch counts)");
       } finally {
         if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       }
@@ -1441,9 +1451,15 @@ function isSourceCheckout(): boolean {
 // "warn-only" and all-caps "WARN-ONLY", so case-mutants are in the historical
 // vocabulary), with a single carve-out: the legitimate on-demand-gates line in
 // 01-preflight.md ("Quality gates available on-demand (WARN only, do not block)")
-// — a line that carries that exact anchor is removed before the scan, so the
+// — a line that carries that exact anchor is stripped before the scan, so the
 // legitimate uppercase phrase never false-positives while a re-drift using it
-// anywhere else is caught.
+// anywhere else is caught. DOCUMENTED BLANKET CONTRACT (second-model gate,
+// 2026-09-06): the tokens are generic warn-phrases, not review-enforcer-scoped
+// — any FUTURE legitimate "warn-only"-vocabulary prose about ANOTHER gate in
+// 01/02/03 must be reworded (or this list scoped) rather than adding a token;
+// the one-time acceptance grep is the floor, this pin is deliberately broader
+// (adds the space-form "warn only") so CI can never green a claim the grep
+// would have caught.
 const MICRO_WARN_ANTI_TOKENS = [
   "warn-only",
   "warn only",
