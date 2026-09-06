@@ -1506,6 +1506,22 @@ test("#485 T2: REVIEW-ENFORCER-TIER-RULE fence == TIER_RULE + no micro-warn clai
     "01-preflight.md REVIEW-ENFORCER-TIER-RULE fence drifted from TIER_RULE — every tier must map to block (#485)"
   );
 
+  // Producer-vocabulary pin (closes the writer→reader coupling the T1/T1b
+  // marker strings mirror): a literal rename in 01-preflight Tier Detection
+  // that leaves the fence/TIER_RULE untouched would silently send real micro
+  // sessions the generic BLOCK_MESSAGE (losing the micro docs-only [REVIEW]
+  // remediation) with CI green — these asserts red on that class.
+  ok(
+    docText.includes("echo \"$TIER\" > /tmp/agent-issue-complexity"),
+    "01-preflight.md must contain the marker emission line the T1/T1b marker strings mirror"
+  );
+  for (const literal of ["Micro", "Standard", "Complex", "unknown"]) {
+    ok(
+      docText.includes(`**TIER = ${literal}**`),
+      `01-preflight.md Tier Detection must emit TIER literal ${JSON.stringify(literal)} (mirrored by the T1/T1b producer-format markers)`
+    );
+  }
+
   // Anti-token pin across the three swept docs (vacuous-pass guard: a missing
   // doc fails loudly instead of silently passing).
   for (const rel of SWEPT_DOC_RELS) {
@@ -1606,9 +1622,14 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
   const srcLower = src.toLowerCase();
   // Code-side absence set DERIVED from the T2 docs pin's shared vocabulary so
   // the two re-drift backstops can never silently diverge, plus the two
-  // code-only tokens (the docs corpus never carries "allows bypass" /
-  // "proportional" — index.ts is their only re-drift surface). Case-insensitive
-  // (WARN-ONLY is covered via "warn-only").
+  // code-only tokens. "proportional" is code-only because the docs corpus
+  // LEGITIMATELY carries it (01-preflight.md L41 "Pre-flight Verification
+  // (proportional — from proportional-gates v1.0.0)") — adding it to the
+  // shared MICRO_WARN_ANTI_TOKENS would false-positive T2's docs scan on that
+  // product-version header; index.ts is its only re-drift surface. "allows
+  // bypass" is genuinely absent from the docs corpus and is kept code-only for
+  // symmetry with "proportional". Case-insensitive (WARN-ONLY is covered via
+  // "warn-only").
   const codeAntiTokens = [...MICRO_WARN_ANTI_TOKENS, "allows bypass", "proportional"];
   for (const token of codeAntiTokens) {
     ok(!srcLower.includes(token), `index.ts must not contain ${JSON.stringify(token)} — a micro warn/proportional re-label re-drifted (#486/#493 class)`);
