@@ -2402,6 +2402,136 @@ test("tier B emits whatever base the resolver chose — NON-ORIGIN base flows th
   );
 });
 
+// ── #490 T2: head-anchored git-global-option parse + shared verb scanner ──
+// Group A = RED pins (fail on the pre-fix regex family — write-first, each
+// confirmed failing before the scanner landed). Group B = green guards
+// (hold before AND after — regressions would break them).
+
+section("#490 T2 — interception widening: cwd-neutral git globals (RED pins)");
+
+test("RED: -c commit.gpgsign=false spellings were un-intercepted (the #490 hole)", () => {
+  // Legacy GIT_COMMIT_PATTERN's `(^|\s)git\s+(commit|push)` needs DIRECT
+  // adjacency — `git -c commit.gpgsign=false commit` never fired → the commit
+  // rode the gate silently. The -c value's `commit` prefix is what made the
+  // legacy findGitCommit regex mis-bind (value consumed as a bare commit).
+  ok(isGitOp("git -c commit.gpgsign=false commit -am x"), "-c commit spellings must intercept");
+  ok(isGitOp("git -c commit.gpgsign=false push origin main"), "-c push spellings must intercept");
+});
+
+test("RED: no-value globals (--no-pager) were un-intercepted", () => {
+  ok(isGitOp("git --no-pager commit -m x"), "--no-pager between git and commit must intercept");
+  ok(isGitCommit("git --no-pager commit -m x"), "commit-only scan sees the --no-pager form");
+});
+
+test("RED: quoted -c value consumed atomically", () => {
+  ok(isGitOp('git -c "user.name=A B" commit -am x'), "quoted -c value (spaces) must not break the parse");
+  ok(isGitCommit('git -c "user.name=A B" commit -m x'), "quoted-value commit-only interception");
+});
+
+test("RED: metachar/quote/backslash abutments newly fire (both sides)", () => {
+  ok(isGitOp("git commit&&git push origin main"), "verb-side metachar split (&&)");
+  ok(isGitOp("cd /repo&&git commit -am x"), "git-side abutting: cd /repo&&git commit");
+  ok(isGitOp("(git commit -m x)"), "git-side abutting: subshell parens");
+  ok(isGitOp("sh -c 'git commit'"), "quote-abutting (verb side — closing quote)");
+  ok(isGitOp("sh -c 'git commit -am x'"), "quote-abutting (git side — opening quote before git)");
+  ok(isGitOp("git 'commit' -am x"), "quoted verb");
+  ok(isGitOp("git \\\ncommit -am x"), "backslash-newline continuation between git and verb");
+});
+
+test("RED: unknown-dash + -c composition (--no-color must not swallow the -c)", () => {
+  ok(isGitOp("git --no-color -c x=y commit -am z"), "unknown dash never consumes a following dash token");
+});
+
+test("RED: classifier mis-binds fixed — -c/-C value tokens never parse as the verb", () => {
+  ok(isBareCommitShape("git -c commit.gpgsign=false commit -m x"), "real commit behind -c value named commit… → bare");
+  ok(isBareCommitShape("git -C commit commit -m x"), "-C path named commit consumed as the redirect value → bare");
+  ok(isBareCommitShape("git -c commit.gpgsign=false -c x=y commit -m z"), "consecutive -c: atomic value consumption (legacy mis-bind → non-bare)");
+});
+
+test("RED: -c push spellings route via the verb-scan (pure-delete + range-eligible)", () => {
+  ok(isDeletionPush("git -c commit.gpgsign=false push origin --delete feat/x"), "-c delete push classifies pure (legacy: value mis-bind → false)");
+  const p = parsePushRefSpecs("git -c commit.gpgsign=false push origin main");
+  ok(p.eligible === true, "-c content push is range-eligible (legacy: has_commit via mis-bind)");
+  if (p.eligible) {
+    equal(p.remote, "origin");
+    equal(p.bare, false);
+    deepEqual(p.refspecs, [{ src: "main", dst: "main", colon: false }]);
+  }
+  const q = parsePushRefSpecs("git -c commit.gpgsign=false push origin");
+  ok(q.eligible === true && q.bare === true && q.remote === "origin", "-c bare push (remote fixed) stays range-eligible");
+});
+
+test("RED (#490 T2 round-2): out-of-table no-value global before verb + abutting-quote -c values", () => {
+  // P1-1: an unknown no-value global DIRECTLY before the verb — the round-1
+  // `break` abandoned the candidate (invocation invisible → sweep misclassified
+  // → compound pushes swept the WT unverified).
+  ok(isGitOp("git --no-optional-locks commit -am x"), "no-value global before verb must intercept");
+  equal(commitSweepClass("git --no-optional-locks commit -am x"), "sweep", "...classifies sweep");
+  equal(isBareCommitShape("git --no-optional-locks commit -am x"), false, "...non-bare");
+  equal(commitSweepClass("git --no-optional-locks commit -am x && git push origin main"), "sweep", "compound keeps sweep scope (round-1: sweep=none regression)");
+  const p1 = parsePushRefSpecs("git --no-optional-locks commit -am x && git push origin main");
+  ok(!p1.eligible, "compound must NOT be range-eligible (the sweep half is a commit — P0 guard)");
+  // P1-2: bash word-concatenation in -c VALUES — `core.editor='vim -w'` is ONE
+  // bash word; the round-1 quote-abutting rule split it → invocation invisible.
+  ok(isGitOp("git -c core.editor='vim -w' commit -am x"), "abutting-quote -c value must intercept");
+  equal(commitSweepClass("git -c core.editor='vim -w' commit -am x"), "sweep", "...sweep");
+  equal(isBareCommitShape("git -c core.editor='commit x' commit -am y"), false, "verb-like word inside a value never binds as the verb");
+  equal(commitSweepClass("git -c core.editor='vim -w' commit -am x && git push origin main"), "sweep", "compound with abutting-quote value keeps sweep");
+  // GREEN-ON-BOTH guards (round-1 code also passed — kept for regression, not RED):
+  equal(isBareCommitShape("git -c core.editor='commit x' commit -am y"), false, "verb-like word inside a token-start-quote value never binds as the verb (green-on-both)");
+  ok(isGitOp("git --no-pager commit -m x"), "in-table boolean regression guard (green-on-both)");
+});
+
+test("RED (#490 T2 round-3): wrapper-contained global+verb followed by && git push must intercept", () => {
+  // The round-2 join-mode peek swallowed a wrapper's closing quote + the rest of
+  // the command when the verb was the LAST token inside the quote → candidate
+  // abandoned → isGitOp false → the trailing push sailed unverified (P1, r3).
+  ok(isGitOp("sh -c 'git --no-optional-locks commit' && git push origin main"), "wrapped no-value-global commit + trailing push must intercept");
+  ok(isGitOp("echo \"git --no-optional-locks commit\" && git push origin main"), "prose-wrapped + trailing push must intercept");
+  ok(isGitOp("sh -c 'git --no-optional-locks commit' && echo hi && git push origin main"), "wrapped + interposed echo + push must intercept");
+  equal(commitSweepClass("sh -c 'git --no-optional-locks commit -am x' && git push origin main"), "none", "wrapper-contained sweep stays 'none'/staged per #489 semantics (wrapper-alone → staged scope — documented residual #539); the interception pins above are the r3 regression guards");
+});
+
+section("#490 T2 — cwd-neutral boundary + containment guards (group B)");
+
+test("GREEN: repo-redirecting globals stay UN-INTERCEPTED (foreign boundary)", () => {
+  equal(isGitOp("git -C /tmp/x commit -m x"), false, "-C commit → other checkout — hook cannot scope it");
+  equal(isGitOp("git --git-dir=/x commit -am y"), false, "attached --git-dir= commit stays un-intercepted");
+  equal(isGitOp("git -c commit.gpgsign=false pull --rebase origin main"), false, "pull is not a gated verb");
+  equal(isGitOp("gitcommit"), false);
+  equal(isGitOp("somegit commit"), false);
+  equal(isGitCommit("git push origin main"), false, "push never arms pendingRehash (#7574)");
+});
+
+test("GREEN: env-form redirects REMAIN intercepted (status quo — inline assignment)", () => {
+  ok(isGitOp("GIT_DIR=/x git commit -am y"), "GIT_DIR= git commit stays intercepted");
+  ok(isGitOp("GIT_WORK_TREE=/x git push origin main"), "GIT_WORK_TREE= git push stays intercepted");
+});
+
+test("GREEN: classifier containment unchanged (foreign commits still count for the P0 guard)", () => {
+  equal(isBareCommitShape("git -C repo commit -am x"), false, "-a sweep behind -C stays non-bare");
+  equal(isBareCommitShape("git -C commit commit -m x"), true, "-C path consumed → real commit is bare");
+  equal(commitSweepClass("git -C repo commit -am x"), "sweep", "sweep behind -C (pre-existing pin)");
+  equal(commitSweepClass("git -c commit.gpgsign=false commit -am x"), "sweep", "-c sweep (guard holds both ways)");
+  equal(isBareCommitShape("git -c commit.gpgsign=false commit -am x"), false, "-c sweep stays non-bare");
+  const p = parsePushRefSpecs("git --git-dir=/x commit -am y && git push origin main");
+  ok(!p.eligible && p.reason === "has_commit", "attached redirect commit stays visible to the P0 guard (containment chain)");
+  const q = parsePushRefSpecs("git -C /x push origin main");
+  ok(!q.eligible, "foreign redirect push alone → not this scope (scaffolding → no_push)");
+});
+
+test("GREEN: composition guards (unknown-dash never swallows a -c)", () => {
+  equal(commitSweepClass("git --no-color -c x=y commit -am z"), "sweep", "--no-color + -c + -am → sweep");
+  equal(isBareCommitShape("git --no-color -c x=y commit -am z"), false, "same shape stays non-bare");
+  equal(commitSweepClass("git --shallow-file /x commit -am y"), "sweep", "unknown value-taking global keeps legacy breadth");
+});
+
+test("GREEN: existing negative spans stay clean (#5571 heredoc / inline-string semantics)", () => {
+  equal(isGitOp("cat << 'EOF'\necho done\nEOF"), false);
+  ok(isGitOp("gh issue create --body 'run git commit after'"), "inline-string prose containment unchanged (fires)");
+  equal(commitSweepClass("gh pr create --body 'git commit -am x'"), "none", "prose never classifies");
+  equal(commitSweepClass("git status"), "none", "status is not a commit");
+});
 // ── Results ───────────────────────────────────────────
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

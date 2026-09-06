@@ -2714,6 +2714,126 @@ async function main() {
     ok(block2.reason.includes("wip59b.ts"),
       "59b: the block names the STAGED file (whole-command tier-C null; a per-refspec-union regression would allow via the verified content59m range)");
   });
+
+  // ── #490 T2 e2e legs (60-63): interception widening on the LIVE hook ──
+  // Each leg is self-contained (own repo) and RED pre-fix: pre-fix the hook
+  // never fired for these spellings (no audit / silent allow / no block).
+
+  test("scenario 60 (#490 T2): -c commit.gpgsign=false docs commit → content_shape_exempt (audit present) + D1 sentinel untouched", async () => {
+    const repo = join(TEST_ROOT, "repo-490-60");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base60.txt"), "b\n");
+    git(repo, "add base60.txt");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "docs.md"), "# docs\n");
+    git(repo, "add docs.md");
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    seedD1Sentinel(bridgePath);
+    await fire("session_start", {});
+    const before = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git -c commit.gpgsign=false commit -m docs", cwd: repo },
+    });
+    equal(res, undefined, "60: -c-spelled bare docs commit ALLOWED via content-shape exemption (pre-fix: hook never fired → red)");
+    const after = readAuditLines();
+    ok(after.length > before, "60: the exemption must leave a durable audit entry (pre-fix: no audit → red)");
+    const last = after[after.length - 1];
+    ok(last.reason === "content_shape_exempt", `60: the newest audit line is the content_shape_exempt gate_skip (got ${last.reason})`);
+    equal(realpathSync(last.target_cwd), realpathSync(repo), "60: the audit's target_cwd resolves to this repo");
+    assertD1BridgeUntouched(bridgePath, repo, "scenario 60");
+  });
+
+  test("scenario 61 (#490 T2): -c commit.gpgsign=false + -am sweep over dirty code → BLOCKED naming the code file", async () => {
+    const repo = join(TEST_ROOT, "repo-490-61");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "code61.ts"), "v1\n");
+    git(repo, "add code61.ts");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "docs.md"), "# docs\n");
+    git(repo, "add docs.md"); // staged docs — would be exempt alone
+    writeFileSync(join(repo, "code61.ts"), "v2\n"); // dirty tracked CODE (never verified)
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git -c commit.gpgsign=false commit -am sweep", cwd: repo },
+    });
+    ok(res && res.block === true, "61: -c-spelled -am sweep over dirty code must BLOCK (pre-fix: un-intercepted silent allow → red)");
+    ok(res.reason.includes("code61.ts"), "61: the block names the swept CODE file (WT scope — a staged-only regression would name only docs.md)");
+  });
+
+  test("scenario 62 (#490 T2): --no-pager commit spelling — blocked unverified, ALLOWED after a real VGATE PASS", async () => {
+    const repo = join(TEST_ROOT, "repo-490-62");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base62.txt"), "b\n");
+    git(repo, "add base62.txt");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "code62.ts"), "v2\n");
+    git(repo, "add code62.ts");
+    await fire("session_start", {});
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git --no-pager commit -m c62", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "62: --no-pager commit over unverified code must BLOCK (pre-fix: un-intercepted → red)");
+    ok(blocked.reason.includes("code62.ts"), "62: the block names the staged code file");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: code62.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "code62.ts"), hash: sha("v2\n") }],
+      }) }],
+    });
+    await fire("session_start", {});
+    const allowed = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git --no-pager commit -m c62", cwd: repo },
+    });
+    equal(allowed, undefined, "62: --no-pager commit ALLOWED after a real VGATE PASS (gate ceremony works on the widened surface)");
+    git(repo, "commit -m c62"); // real commit — leaves the repo clean for the teardown
+  });
+
+  test("scenario 63 (#490 T2): task sub-agent + -c spelling has NO #7591 auto-bypass — 4th attempt still blocked", async () => {
+    const repo = join(TEST_ROOT, "repo-490-63");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base63.txt"), "b\n");
+    git(repo, "add base63.txt");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "code63.ts"), "u\n");
+    git(repo, "add code63.ts");
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print"; // builtin-tools task-child markers (#172/#825)
+    process.env.TASK_HEARTBEAT = "1";
+    try {
+      await fire("session_start", {});
+      for (let i = 0; i < 4; i++) {
+        const res = await fire("tool_call", {
+          type: "tool_call", toolName: "bash",
+          input: { command: "git -c commit.gpgsign=false commit -m sub", cwd: repo },
+        });
+        ok(res && res.block === true, `63: attempt ${i + 1} must block in sub-agent mode (no auto-bypass on the -c surface)`);
+        ok(res.reason.includes("This session is a task sub-agent"), "63: the block carries the sub-agent marker");
+        ok(/Dispatch your own VGATE verification/.test(res.reason), "63: the block instructs the child to self-satisfy the gate in-band");
+      }
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+  });
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()
