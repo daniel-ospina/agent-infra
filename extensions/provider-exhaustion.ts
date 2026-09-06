@@ -209,7 +209,14 @@ let usageModel = "";
 let usageProvider = "";
 
 function accumulateMessageUsage(message: unknown, ctxModel?: unknown): void {
-  if (process.env[TASK_USAGE_CAPTURE] !== "1") return;
+  // #512 round-2 P2 (code-review): capture is eligible ONLY in a task-tool
+  // child — same contract as the sibling exhaustion-marker emission
+  // (childMarkerEligible). TASK_USAGE_CAPTURE is an operator-exported shell
+  // var that reaches EVERY print/json pi process under the env; a non-task
+  // child (swarm-daemon worker, ad-hoc pi -p) has no authenticating parent
+  // reader (no TASK_HEARTBEAT_NONCE) and must neither accumulate nor emit
+  // [task-usage] lines.
+  if (process.env[TASK_USAGE_CAPTURE] !== "1" || !childMarkerEligible()) return;
   const msg = message as {
     role?: string;
     model?: string | null;
@@ -513,7 +520,9 @@ export default function (pi: ExtensionAPI) {
     }
     // #512: emit the accumulated [task-usage] line (opt-in capture) after the
     // exhaustion marker — same channel, authenticated by the parent via nonce.
-    if (usageTotals !== null && process.env[TASK_USAGE_CAPTURE] === "1") {
+    // Emission mirrors the marker's eligibility contract (round-2 P2): only a
+    // task-tool child (TASK_HEARTBEAT=1 + nonce) has an authenticating reader.
+    if (usageTotals !== null && process.env[TASK_USAGE_CAPTURE] === "1" && childMarkerEligible()) {
       try {
         writeStderr(
           renderUsageMarker(usageTotals, {

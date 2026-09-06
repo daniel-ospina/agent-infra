@@ -427,6 +427,27 @@ test("capture OFF (default): no [task-usage] line, byte-identical behavior", asy
   }
 });
 
+test("round-2 P2: TASK_USAGE_CAPTURE WITHOUT a task-child identity (no TASK_HEARTBEAT/nonce) → never accumulates or emits", async () => {
+  // Code-review round-2 P2: TASK_USAGE_CAPTURE is an operator-exported shell
+  // var that reaches EVERY print/json pi process under the env (swarm-daemon
+  // workers, ad-hoc pi -p) — not just task-tool children. Only a task child
+  // has an authenticating parent reader (TASK_HEARTBEAT=1 + nonce), so a
+  // non-task child must neither accumulate nor emit [task-usage] lines.
+  const { env, cleanup, captured } = hermetic();
+  applyEnv(env, { TASK_USAGE_CAPTURE: "1" }); // NO TASK_HEARTBEAT, NO nonce
+  try {
+    const pi = makeFakePi();
+    extension(pi as any);
+    await pi.emit("message_end", { message: usageMsg1 }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    equal(_usageTotalsForTests(), null, "non-task child never accumulates");
+    await pi.emit("session_shutdown", { reason: "quit" }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    equal(captured.filter((l) => l.startsWith("[task-usage]")).length, 0, "non-task child never emits");
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
 test("provider attribution follows the CLI leg (ctx.model), NOT the bare message id — a venice cold-class child reports provider=venice (P1-1 regression pin)", async () => {
   const { env, cleanup, captured } = hermetic();
   applyEnv(env, { TASK_HEARTBEAT: "1", TASK_HEARTBEAT_NONCE: "usage-nonce-v", TASK_USAGE_CAPTURE: "1" });
