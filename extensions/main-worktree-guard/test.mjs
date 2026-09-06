@@ -191,6 +191,21 @@ expectBranches("git push origin --delete 'feat/x'", ["feat/x"]);
 expectBranches("git push origin :feat/x", ["feat/x"]);
 expectBranches("git push origin :refs/heads/feat/x", ["feat/x"]);
 expectBranches("git push origin --delete feat/x; git push origin --delete feat/y", ["feat/x", "feat/y"]);
+// #443 clean-hub parity: the raw extractor covers the -d/--del spelling family
+// (feeds the degradation-fallback #73 coordinated-delete check).
+expectBranches("git push origin -d feat/x", ["feat/x"]);
+expectBranches("git push origin --del feat/x", ["feat/x"]);
+expectBranches("git push origin -dq feat/x", ["feat/x"]);
+expectBranches("git push origin -d refs/heads/feat/x", ["feat/x"]);
+expectBranches("git push origin --delete feat/x; git push origin -d feat/y", ["feat/x", "feat/y"]);
+expectBranches("git push origin main && git push origin -d old-feat", ["old-feat"]); // delete in a LATER push segment
+expectBranches("git push origin -do draft feat/x", ["feat/x"]); // -do draft = -d -o draft — value skipped
+expectBranches("git push origin -o draft -d feat/x", ["feat/x"]); // standalone -o value skipped
+expectBranches("git push origin -d", null); // no target — invalid in git
+// Non-delete coloned refspecs (src:dst) are NOT deletes — never extracted.
+expectBranches("git push origin main:feature", null);
+expectBranches("git push origin HEAD:refs/heads/feat/x", null);
+expectBranches("git push origin --d feat/x", null); // ambiguous --d → git rejects
 expectBranches("git push origin main", null);
 expectBranches("git push", null);
 expectBranches("", null);
@@ -396,6 +411,28 @@ dexpect("push --force-if-includes → NOT force", `git push --force-if-includes 
 const del2 = classifyGitCommandDetailed(`git push origin --delete feat/x other`);
 dexpect("push --delete multi → isPushDelete + all targets", `git push origin --delete feat/x other`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x", "other"] });
 dexpect("push --delete colon form", `git push origin :feat/x`, { verdict: "block:push-delete", pushTargets: ["feat/x"] });
+// #443 clean-hub parity: git's other push-delete spellings (probe-verified to
+// delete) must classify block:push-delete so the #73 sibling-checked-out
+// coordinated block fires exactly as for --delete/:branch.
+dexpect("push -d short → isPushDelete + targets", `git push origin -d feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push -d flag-first → targets (first positional = the remote)", `git push -d origin feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push -dq cluster → delete", `git push origin -dq feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push -d refs target → short name", `git push origin -d refs/heads/feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push --del abbrev → delete", `git push origin --del feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push --dele abbrev → delete", `git push origin --dele feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push --delet abbrev → delete", `git push origin --delet feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push --de abbrev → delete", `git push origin --de feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+// Merged cluster where the arg-taking -o (push-option) FOLLOWS the delete
+// short (`-do draft b` = -d -o draft b — probe-verified to delete b).
+dexpect("push -do push-option cluster → delete", `git push origin -do draft feat/x`, { verdict: "block:push-delete", isPushDelete: true });
+// -odraft: the o comes FIRST so d is part of -o's VALUE, not an option — a
+// normal push (git parses no delete).
+dexpect("push -odraft (o first) → NOT delete", `git push origin -odraft feat/x`, { verdict: "block:push", isPushDelete: false });
+// --d is AMBIGUOUS with --dry-run — git rejects it (rc 129, probe-verified);
+// it never deletes, so it stays a plain block:push (never block:push-delete).
+dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d feat/x`, { verdict: "block:push", isPushDelete: false });
+// --dry-run stays a normal push (no false delete).
+dexpect("push --dry-run NOT delete", `git push origin --dry-run feat/x`, { verdict: "block:push", isPushDelete: false });
 
 // sync-source extraction (ownership allowance)
 dexpect("pull --rebase origin main → syncSource main", `git -c commit.gpgsign=false pull --rebase origin main`, { verdict: "block:pull", syncSource: "main" });

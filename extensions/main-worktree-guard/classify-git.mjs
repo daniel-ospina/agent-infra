@@ -1267,15 +1267,41 @@ export function classifyGitCommandDetailed(command) {
     const legacyVerdict = out.verdict;
     const args = pushInv.args;
     const joined = `git push ${args.join(" ")}`;
-    const deleteIdx = args.findIndex((a) => a === "--delete" || a.startsWith("--delete="));
-    const colonTargets = args.filter((a) => /^:/.test(a));
-    if (deleteIdx !== -1 || colonTargets.length > 0 || legacyVerdict === "block:push-delete") {
+    // #443 clean-hub parity (mirrors the #439 disordered-hub closure): delete
+    // detection was exact-only (`--delete` / `:branch`), so the documented
+    // `-d` short form, merged no-arg short clusters containing `d` (`-dq`), and
+    // git's unambiguous long-option abbreviations (`--del`, `--dele`, `--delet`,
+    // `--de`) classified as plain pushes and skipped the #73
+    // sibling-checked-out-anywhere block. All of those spellings delete
+    // (probe-verified); `--d` is ambiguous with `--dry-run` and git REJECTS it
+    // (probe-verified rc 129) — not a delete, matching `_isPushDeleteFlagToken`.
+    const deleteIdx = args.findIndex((a) => _isPushDeleteFlagToken(a));
+    const hasColonTargets = args.some((a) => /^:/.test(a));
+    if (deleteIdx !== -1 || hasColonTargets || legacyVerdict === "block:push-delete") {
       out.isPushDelete = true;
       out.verdict = "block:push-delete";
-      out.pushTargets = [...(deleteIdx !== -1 ? args.slice(deleteIdx + 1) : []), ...colonTargets]
-        .filter((x) => !x.startsWith("-"))
+      // git treats the FIRST positional as the repository and every further
+      // positional as a delete refspec when a delete form is present
+      // (`git push --delete origin a b` deletes a AND b — probe-verified;
+      // `git push --delete origin a` likewise). A lone positional is kept as a
+      // target only when it is an empty-source `:branch` delete (implicit
+      // origin); a lone BARE positional makes git error ("--delete doesn't make
+      // sense without any refs") — the keep is a harmless over-capture that
+      // matches today's `git push --delete feat/x` classification.
+      const positionals = args.filter((x) => !x.startsWith("-"));
+      const rawTargets = positionals.length > 1 ? positionals.slice(1) : positionals;
+      out.pushTargets = rawTargets
         .map((x) => _stripQuotes(x).replace(/^:/, "").replace(/^refs\/heads\//, ""))
         .filter(Boolean);
+      // KNOWN IMPRECISION (parity-preserving, safe direction): a push-option
+      // VALUE consumed by `-o`/`--push-option` that appears as a standalone arg
+      // (`git push origin -do draft feat/x` → git deletes only feat/x; `draft`
+      // is -o's value) over-captures into pushTargets (here ["draft",
+      // "feat/x"]). Identical imprecision predates #443 for `--delete` +
+      // `-o`, errs toward BLOCKING (never toward a bypass), and the phantom
+      // target only matters if a branch literally named after the option value
+      // is checked out in a sibling. Not value-parsed to stay in the #439/#443
+      // mirror scope.
     } else if (legacyVerdict === "allow" || legacyVerdict === "block:force-push") {
       out.verdict = "block:push";
       // git push [remote] [refspec...] — the FIRST positional is the REMOTE
@@ -1370,23 +1396,107 @@ export function isWorktreeCwd(cwd) {
 }
 
 /**
+ * #443 (clean-hub parity, mirrors #439): is this arg a `git push` delete
+ * spelling? git accepts — all probe-verified to delete remote branches:
+ *   - `-d` (the documented short form of `--delete`)
+ *   - merged no-arg short-flag clusters containing `d` (`-dq` = -d --quiet);
+ *     git merges only push's no-arg short alphabet (v q n u 4 6 d f — the #439
+ *     M4 set), so `-odraft`/`-uofoo` (attached option VALUES) are NOT clusters
+ *   - merged clusters where the arg-taking `-o` (push-option) follows the
+ *     delete short (`-do draft b` = -d -o draft b — git consumes the rest of
+ *     the token / next argv as -o's value; probe-verified to delete). A `d`
+ *     AFTER the first `o` is part of -o's VALUE, never an option.
+ *   - `--delete` and its unambiguous long-option PREFIX abbreviations
+ *     (`--de`, `--del`, `--dele`, `--delet`)
+ * `--d` is NOT a delete: it is ambiguous with `--dry-run` and git REJECTS it
+ * (rc 129, probe-verified) — it never deletes anything.
+ */
+function _isPushDeleteFlagToken(a) {
+  if (a === "-d" || a === "--delete" || a.startsWith("--delete=")) return true;
+  // `-dq`/`-qd`/`-df` … merged short clusters containing the delete short.
+  if (/^-[vqnu46df]{2,}$/.test(a) && a.includes("d")) return true;
+  // `-do`/`-dqo draft …` — the delete short merged BEFORE the arg-taking `-o`
+  // (only chars before the first `o` are parsed options; the rest is -o's
+  // value). `-odraft` never matches: there the `d` is inside -o's value.
+  if (/^-[vqnu46df]*d[vqnu46df]*o/.test(a)) return true;
+  // Unambiguous `--delete` prefix abbreviations (`--de`|`--del`|`--dele`|`--delet`).
+  if (/^--de(l(?:e(?:t)?)?)?$/.test(a)) return true;
+  return false;
+}
+
+/** Short-name a raw delete target token (`:refs/heads/feat/x` → `feat/x`). */
+function _cleanDeleteTarget(x) {
+  return x
+    .replace(/^["']|["']$/g, "")   // strip surrounding quotes
+    .replace(/^:+/, "")             // leading empty-source colon(s)
+    .replace(/^refs\/heads\//, "") // full ref
+    .replace(/^heads\//, "");       // git dst-inference (`:heads/main`)
+}
+
+/**
  * Extract the branch name from `git push [remote] --delete <branch>`.
  * Handles both short names ("feat/x") and full refs ("refs/heads/feat/x").
+ * #443: the legacy raw-string regex was exact-only (`--delete`/`:branch`), so
+ * `-d`/`--del`(-prefix) spellings returned null and the degradation-fallback
+ * #73 sibling-checked-out check never fired for them. Rewritten token-based to
+ * cover the full delete spelling family AND to stop false-positive captures of
+ * non-delete coloned refspecs (`git push origin main:feature` has a SOURCE so
+ * it is a normal push, not a delete — the empty-source form starts the token
+ * with `:`).
  * @param {string} command
  * @returns {string|null} branch name (short form) or null
  */
 export function extractPushDeleteBranch(command) {
   const c = String(command ?? "").trim();
-  // Match both --delete <branch> (preferred) and :branch (old-style).
-  // Branch names: alphanumeric + / - _ . only (no ; & |)
-  const re = /\bgit\s+push\b[^;&|]*(?:--delete\s+([^\s;&|]+)|:([^\s;&|]+)(?!\S))/g;
+  if (!/\bgit\s+push\b/.test(c)) return null;
+  // Compound commands carry several `git push` segments (`a && git push … ;
+  // git push …`) — detect deletes per segment, stopping at shell operators
+  // (the original regex's [^;&|]* contract).
   const branches = [];
-  let m;
-  while ((m = re.exec(c)) !== null) {
-    const raw = (m[1] || m[2]).replace(/^["']|["']$/g, ""); // strip quotes
-    branches.push(raw.replace(/^refs\/heads\//, ""));
+  const segRe = /\bgit\s+push\b([^;&|]*)/g;
+  let sm;
+  while ((sm = segRe.exec(c)) !== null) {
+    const tokens = sm[1].trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) continue;
+    // Arg-taking options consume a value (`-o draft`, `--push-option draft`,
+    // merged `-do draft` = -d -o draft; inline `-doDraft`/`--push-option=x`
+    // carry their value in-token). A consumed value is NOT a flag and NOT a
+    // delete target — without this, `-do draft old-feat` would capture the -o
+    // VALUE `draft` as the target and lose the real `old-feat` (probe-verified:
+    // git deletes only old-feat). Mark value slots so the scans below skip
+    // them. Mirrors git's parse-options short-flag merging.
+    const valueSlot = new Array(tokens.length).fill(false);
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      const mergedOAfterD = /^-[vqnu46df]*d[vqnu46df]*o/.test(t); // delete short BEFORE arg-taking -o
+      if (t === "-o" || t === "--push-option") {
+        if (i + 1 < tokens.length) valueSlot[i + 1] = true; // value = next argv
+      } else if (mergedOAfterD && /o$/.test(t) && !/^--/.test(t)) {
+        if (i + 1 < tokens.length) valueSlot[i + 1] = true; // `-do draft`: value = next argv
+      }
+      // Inline values (`-doDraft`, `--push-option=x`) need no slot.
+    }
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (valueSlot[i]) continue; // consumed as an option VALUE — never a flag/target
+      if (_isPushDeleteFlagToken(t)) {
+        // The FIRST following non-option token is the delete target (git's
+        // `--delete origin a b` deletes a and b; the single-target contract
+        // matches the original extractor).
+        for (let j = i + 1; j < tokens.length; j++) {
+          if (tokens[j].startsWith("-") || valueSlot[j]) continue;
+          branches.push(_cleanDeleteTarget(tokens[j]));
+          break;
+        }
+      } else if (/^:/.test(t)) {
+        // Empty-source colon refspec (`:feat/x`) = a delete. src:dst refspecs
+        // (`main:feature`) never start with `:` — they stay plain pushes.
+        branches.push(_cleanDeleteTarget(t));
+      }
+    }
   }
-  return branches.length > 0 ? branches : null;
+  const out = branches.filter(Boolean);
+  return out.length > 0 ? out : null;
 }
 
 /**

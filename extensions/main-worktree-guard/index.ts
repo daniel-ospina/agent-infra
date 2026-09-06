@@ -232,6 +232,43 @@ function _mainTopLevel(): string | null {
   }
 }
 
+// #73: coordinated remote-branch-delete block — a push-delete of a branch that
+// ANY session still has checked out (the hub or a sibling worktree) destroys
+// that session's upstream (incident 2026-08-06). Shared by the degradation-
+// fallback arms below: the exact legacy verdict AND the #443 -d/--del spelling
+// arm. Returns null (allow) when none of the deleted branches is checked out
+// anywhere — foreign deletes with no checked-out targets are allowed.
+function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: string } | null {
+  if (!branchNames || branchNames.length === 0) return null;
+  const worktreeBranches = getWorktreeBranches();
+  const blockedBranches: string[] = [];
+  for (const branchName of branchNames) {
+    const branchRef = `refs/heads/${branchName}`;
+    const checkedOutPaths = [...(worktreeBranches.get(branchRef) || [])];
+    if (isBranchInMainCheckout(branchName)) {
+      const mainTopLevel = _mainTopLevel();
+      const mainLabel = mainTopLevel || "main checkout";
+      if (!checkedOutPaths.includes(mainLabel)) checkedOutPaths.push(mainLabel);
+    }
+    if (checkedOutPaths.length > 0) {
+      blockedBranches.push(`"${branchName}" — checked out in: ${checkedOutPaths.join(", ")}`);
+    }
+  }
+  if (blockedBranches.length === 0) return null;
+  return {
+    block: true,
+    reason: [
+      `⛔ Cannot delete — the following branches are currently checked out:`,
+      ...blockedBranches.map((b: string) => `   • ${b}`),
+      "",
+      "   Why: deleting a remote branch while another session has it",
+      "   checked out destroys that session's upstream (incident 2026-08-06).",
+      "   → Switch those worktrees/main to another branch first, then retry.",
+      "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
+    ].join("\n"),
+  };
+}
+
 // ── M4: hub-state gate (#1484) ─────────────────────────────────────────────
 // The hub's only legal states are main+clean. When the session cwd IS the hub
 // main checkout (non-infra) and the hub is off-main or dirty, every git op is
@@ -975,41 +1012,34 @@ export default function (pi: ExtensionAPI) {
         if (isAgentInfraRepo()) return undefined;
         if (_isAllowMainEdits()) return undefined;
         const verdict = classifyGitCommand(command);
+        // #443 clean-hub parity: the FROZEN legacy classifier reports
+        // `block:push-delete` for the exact `--delete`/`:branch` spellings
+        // only, so the documented `-d` short form and `--del`-style
+        // abbreviations classify "allow" and used to skip the #73
+        // sibling-checked-out block below. `extractPushDeleteBranch` is now
+        // whole-command and spelling-aware (all `-d`/`--del`/cluster forms,
+        // multi-segment compounds, `-o` value consumption) — it is the single
+        // target source here, exactly as the pre-#443 arm consumed it. The
+        // detailed classifier is deliberately NOT consulted: its pushTargets
+        // describe only the FIRST push invocation, so a raw `--delete` verdict
+        // originating from a later segment would mis-attribute phantoms (e.g.
+        // `git push origin main && git push origin --delete b` — "main" is not
+        // a delete target; cycle-4 review). Gate the extra arm to legacy
+        // NON-block verdicts ONLY: a legacy `block:*` (reset/clean/pull/…) must
+        // keep its existing generic block below — an unrelated legacy block
+        // must never be swallowed by the coordinated-delete arm's
+        // allow-when-no-sibling-checkout return.
+        const rawDeleteNames = extractPushDeleteBranch(command) ?? [];
+        // `allow-non-git` is intentionally absent: a non-empty extractor
+        // requires a literal `git push` token, so the legacy verdict for any
+        // such command is `allow` or a `block:*` — never `allow-non-git`.
+        if (verdict === "block:push-delete" ||
+            (verdict === "allow" && rawDeleteNames.length > 0)) {
+          const blocked = _coordinatedDeleteBlock(rawDeleteNames);
+          if (blocked) return blocked;
+          return undefined;
+        }
         if (verdict.startsWith("block:")) {
-          if (verdict === "block:push-delete") {
-            const branchNames = extractPushDeleteBranch(command);
-            if (branchNames && branchNames.length > 0) {
-              const worktreeBranches = getWorktreeBranches();
-              const blockedBranches: string[] = [];
-              for (const branchName of branchNames) {
-                const branchRef = `refs/heads/${branchName}`;
-                const checkedOutPaths = [...(worktreeBranches.get(branchRef) || [])];
-                if (isBranchInMainCheckout(branchName)) {
-                  const mainTopLevel = _mainTopLevel();
-                  const mainLabel = mainTopLevel || "main checkout";
-                  if (!checkedOutPaths.includes(mainLabel)) checkedOutPaths.push(mainLabel);
-                }
-                if (checkedOutPaths.length > 0) {
-                  blockedBranches.push(`"${branchName}" — checked out in: ${checkedOutPaths.join(", ")}`);
-                }
-              }
-              if (blockedBranches.length > 0) {
-                return {
-                  block: true,
-                  reason: [
-                    `⛔ Cannot delete — the following branches are currently checked out:`,
-                    ...blockedBranches.map((b: string) => `   • ${b}`),
-                    "",
-                    "   Why: deleting a remote branch while another session has it",
-                    "   checked out destroys that session's upstream (incident 2026-08-06).",
-                    "   → Switch those worktrees/main to another branch first, then retry.",
-                    "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
-                  ].join("\n"),
-                };
-              }
-            }
-            return undefined;
-          }
           let inWorktree = true;
           try {
             inWorktree = isWorktreeCwd(resolve(process.cwd()));
