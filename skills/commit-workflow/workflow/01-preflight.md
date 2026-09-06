@@ -422,15 +422,16 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 
 **When:** Standard+Complex tier commits where staged files include `.ts`, `.tsx`, `.py`, `.sql`, `.js`, or `.jsx`.
 
-**Skip:** Micro tier commits (tier-gated — the Mechanism below greps the issue BODY for `complexity:micro`, a third, separate micro channel from the review-enforcer's `/tmp/agent-issue-complexity` marker; VGATE is shape-gated, never micro-gated), or commits with no matching file extensions.
+**Skip:** Micro tier commits (tier-gated — the Mechanism below reads the issue's `complexity:*` LABEL, the same canonical channel Tier Detection above uses; #515 removed the earlier body-substring grep, which false-skipped Standard issues whose bodies merely mention `complexity:micro` in prose — prose mentions are not a tier signal, and the Standard PR class most likely to name the tier is pipeline-policy edits like this file. VGATE remains shape-gated, never micro-gated), or commits with no matching file extensions.
 
 **Mechanism:**
 
 ```bash
-# Skip for micro tier
-ISSUE_BODY=$(gh issue view <N> --json body -q '.body')
-IS_COMPLEXITY_MICRO=$(echo "$ISSUE_BODY" | grep -q 'complexity:micro' && echo true || echo false)
-[ "$IS_COMPLEXITY_MICRO" = "true" ] && exit 0
+# Skip for micro tier — the complexity LABEL is the canonical tier source (Tier Detection
+# above reads the same label); a body-substring grep would false-positive on Standard issue
+# bodies that mention 'complexity:micro' in prose, silently skipping the gate (#515)
+IS_MICRO=$(gh issue view <N> --json labels --jq '.labels[].name' | grep -q '^complexity:micro$' && echo true || echo false)
+[ "$IS_MICRO" = "true" ] && exit 0
 
 # Check for testable files
 STAGED=$(git diff --cached --name-only)
