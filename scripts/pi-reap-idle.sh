@@ -33,14 +33,15 @@
 #                   [--probe-jsonl FILE...] [--help]
 # Env seams: PS_BIN KILL_BIN DATE_BIN CMUX_STATE_DIR PI_SESSIONS_DIR
 #   REAP_IDLE_HOURS REAP_DRY_RUN REAP_GRACE_SECONDS REAP_NOW_EPOCH
-#   REAP_LOCK_STALE_SECONDS REAP_LOG (default /tmp/pi-reap-idle.log).
+#   REAP_LOCK_STALE_SECONDS REAP_LOG (default $HOME/.pi/agent/state/
+#   pi-reap-idle.log).
 # Exit codes: 0 completed passes, 2 usage, 3 fail-closed (store/lock abort).
 
 set -uo pipefail
 
 SCRIPT_NAME="pi-reap-idle.sh"
 ISSUE_REF="#469"
-REAP_LOG="${REAP_LOG:-/tmp/pi-reap-idle.log}"
+REAP_LOG="${REAP_LOG:-$HOME/.pi/agent/state/pi-reap-idle.log}"
 PS_BIN="${PS_BIN:-/bin/ps}"
 KILL_BIN="${KILL_BIN:-/bin/kill}"
 DATE_BIN="${DATE_BIN:-/bin/date}"
@@ -52,6 +53,10 @@ REAP_GRACE_SECONDS="${REAP_GRACE_SECONDS:-5}"
 REAP_LOCK_STALE_SECONDS="${REAP_LOCK_STALE_SECONDS:-1800}"
 STATE_DIR="$HOME/.pi/agent/state"
 LOCK_DIR="$STATE_DIR/pi-reap-idle.lock"
+# Disarm valve: touch $STATE_DIR/pi-reap-idle.disabled to make every pass
+# (even --apply) log a MODE=disabled footer and exit 0 without signaling.
+# Survives re-syncs that re-install the launchd job (#469).
+DISABLED_SENTINEL="$STATE_DIR/pi-reap-idle.disabled"
 FENCE_TOLERANCE_SECONDS=3
 
 MODE=unknown
@@ -341,11 +346,16 @@ def last_entry(path):
                 continue
             try:
                 obj = json.loads(line)
-                ep = parse_ts(obj.get("timestamp"))
-                if ep is not None:
-                    return ep, "ok"
             except Exception:
+                # torn / partial trailing write — keep scanning older lines
                 continue
+            ep = parse_ts(obj.get("timestamp"))
+            if ep is None:
+                # newest COMPLETE line is undatable — a write we cannot age;
+                # fail-closed: abstain rather than date the session by an
+                # older entry (policy: missing/unparseable => never idle).
+                return None, "unparseable"
+            return ep, "ok"
         return None, "unparseable"
     finally:
         fh.close()
@@ -475,8 +485,13 @@ classify_candidates() {
             if [ -z "$rf" ] || [ ! -s "$rf" ]; then abstain=$((abstain+1)); continue; fi
             le="$(jsonl_epoch_for "$rf")"
             if [ -z "$le" ]; then abstain=$((abstain+1)); continue; fi
-            vote=$((vote+1)); sid="$rsid"; sfile="$rf"
-            if [ -z "$youngest" ] || [ "$le" -gt "$youngest" ]; then youngest="$le"; fi
+            vote=$((vote+1))
+            # sid/sfile stay in lockstep with the MAX-epoch (age-setting)
+            # record — settle-3 re-probes exactly the file that decided
+            # eligibility, never a younger sibling.
+            if [ -z "$youngest" ] || [ "$le" -gt "$youngest" ]; then
+                youngest="$le"; sid="$rsid"; sfile="$rf"
+            fi
         done <<<"$matched"
         if [ "$vote" -eq 0 ]; then
             [ "$emit" = 1 ] && say "$pid tty=$tty SKIP no-jsonl-proof (${abstain} abstain(s) — fail-closed)"
@@ -519,6 +534,14 @@ reap_one() { # <cand-line> <now>
     idle_h="$(printf '%s' "$cand" | cut -d'|' -f6)"
     class_epoch="$(printf '%s' "$cand" | cut -d'|' -f7)"
     class_lstart="$(printf '%s' "$cand" | cut -d'|' -f8)"
+    # fail-closed: a corrupted candidate row (store value containing the
+    # unescaped field separator, etc.) must SUPPRESS, never proceed.
+    case "$class_epoch" in
+        ''|*[!0-9]*) log "SETTLE-SKIP $pid corrupt cand class_epoch — suppress"; return 0 ;;
+    esac
+    case "$class_lstart" in
+        ''|*[!0-9]*) log "SETTLE-SKIP $pid corrupt cand class_lstart — suppress"; return 0 ;;
+    esac
     # settle 1: still self/ancestor?
     is_self_like "$pid" && { log "SETTLE-SKIP $pid now-self — suppress"; return 0; }
     # settle 2: FRESH probe — lstart changed (pid died + reused)?
@@ -538,9 +561,26 @@ reap_one() { # <cand-line> <now>
     signal_target "$pid" "$pgid2" TERM
     log "SIGNAL pid=$pid pgid=$pgid2 SIGTERM rss=${rss:-0} idle_h=${idle_h}h session=$sid jsonl=$sfile"
     sleep "$REAP_GRACE_SECONDS"
-    # survivor re-check = fresh probe (kill -0 would ESRCH on fake pids)
+    # survivor re-check = fresh probe (kill -0 would ESRCH on fake pids).
+    # The same incarnation fence applies BEFORE SIGKILL: if the pid was
+    # recycled during the grace window the fresh lstart differs from
+    # class_lstart and the group is NOT provably the reaped session —
+    # suppress the KILL (the TERM already achieved the reap). Zombie rows
+    # are skipped too (TERM landed; the parent has not reaped yet).
     if detail="$(candidate_detail "$pid")"; then
+        epoch3="$(printf '%s' "$detail" | awk '{print $1}')"
         pgid3="$(printf '%s' "$detail" | awk '{print $2}')"
+        stat3="$(printf '%s' "$detail" | awk '{print $3}')"
+        if [ -n "$class_lstart" ] && [ -n "$epoch3" ] && [ "$epoch3" != "$class_lstart" ]; then
+            log "SETTLE-SKIP $pid pid reused after TERM (lstart ${class_lstart} -> ${epoch3}) — no SIGKILL"
+            KILLED=$((KILLED+1)); YIELD_RSS=$((YIELD_RSS + ${rss:-0}))
+            return 0
+        fi
+        case "$stat3" in
+            Z*) log "SIGNAL pid=$pid SIGKILL skipped (zombie after TERM)"
+                KILLED=$((KILLED+1)); YIELD_RSS=$((YIELD_RSS + ${rss:-0}))
+                return 0 ;;
+        esac
         signal_target "$pid" "$pgid3" KILL
         log "SIGNAL pid=$pid pgid=$pgid3 SIGKILL (survived TERM)"
     fi
@@ -619,11 +659,22 @@ run() {
         exit 3
     fi
     trap 'rm -f "$PS_TABLE" "$STORE_TSV" "$DESC_MAP"; lock_release' EXIT
-    # log size guard: keep last ~200 lines
+    # log size guard: keep last ~200 lines. Truncation temp is mktemp'd in
+    # the log's own directory (never a predictable sibling name — a local
+    # attacker could pre-seed a symlink at a fixed path).
+    mkdir -p "${REAP_LOG%/*}" 2>/dev/null || true
     if [ -f "$REAP_LOG" ]; then
-        tail -n 200 "$REAP_LOG" >"$REAP_LOG.tmp" 2>/dev/null && mv "$REAP_LOG.tmp" "$REAP_LOG"
+        trunc="$(mktemp "${REAP_LOG%/*}/pi-reap-log-trunc.XXXXXX" 2>/dev/null)" || trunc=""
+        if [ -n "$trunc" ]; then
+            tail -n 200 "$REAP_LOG" >"$trunc" 2>/dev/null && mv "$trunc" "$REAP_LOG" 2>/dev/null || rm -f "$trunc"
+        fi
     fi
 
+    if [ -f "$DISABLED_SENTINEL" ]; then
+        log "MODE=disabled NOW=$now THRESHOLD=$REAP_IDLE_HOURS sentinel=$DISABLED_SENTINEL KILLED=0 YIELD=0"
+        echo "disabled by sentinel ($DISABLED_SENTINEL) — exiting without signal"
+        exit 0
+    fi
     log "==== pi-reap-idle pass: MODE=$MODE THRESHOLD=$REAP_IDLE_HOURS now=$now ===="
     ps_enumeration
     self_ancestors_from_table

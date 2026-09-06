@@ -94,8 +94,9 @@ mkfakehome() { # $1 = home dir
     touch "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
     chmod +x "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
     chmod +x "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
-    # #373 fleet-cadence farm (setup.sh copies these to the scripts root): the
-    # weekly plist's driver + its sibling report/watch/parser must resolve at
+    # #373 fleet-cadence farm + #469 pi-session-reaper (setup.sh copies these
+    # to the scripts root): the weekly plist's driver + its sibling
+    # report/watch/parser AND the reaper plist's driver must resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
     for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh; do

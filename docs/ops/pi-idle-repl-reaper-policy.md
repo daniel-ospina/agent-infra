@@ -66,8 +66,11 @@ RSS/process measurement.
    twin abstains but does NOT veto).
 7. **Settle re-verify immediately before each signal:** a FRESH per-pid ps
    probe (lstart changed ⇒ pid died+reused ⇒ suppress) and a fresh JSONL
-   re-probe (activity advanced ⇒ suppress). Post-TERM survivor re-check is the
-   same fresh probe (`kill -0` is never the oracle); survivors get SIGKILL
+   re-probe (activity advanced ⇒ suppress). The re-probed file is the
+   age-setting (max-epoch) record's file. Post-TERM survivor re-check is the
+   same fresh probe (`kill -0` is never the oracle) WITH the incarnation fence
+   re-applied: a pid recycled in the grace window suppresses the SIGKILL;
+   zombies skip it. Survivors (same lstart) get SIGKILL
    after `REAP_GRACE_SECONDS` (5).
 
 Signals always go through `${KILL_BIN:-/bin/kill}` (never the bare shell
@@ -106,8 +109,12 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
 
 ## Ops contract
 
-- **Log:** `/tmp/pi-reap-idle.log` (launchd stdout/stderr →
-  `/tmp/pi-reap-idle.out.log`). Every pass writes a footer
+- **Log:** `$HOME/.pi/agent/state/pi-reap-idle.log` (per-user; the plist sets no
+  StandardOutPath/StandardErrorPath — launchd capture of the same output would
+  grow an unbounded twin of the capped log and put session ids in a
+  world-readable /tmp file; the capped footer is authoritative).
+  Truncation uses a `mktemp`-ed sibling in the log's own directory — never a
+  predictable `/tmp` name (a local symlink-truncation surface). Every pass writes a footer
   `MODE=<dry-run|apply> NOW=… THRESHOLD=… CANDIDATES=… PRE=… POST=… RESIDUAL=… KILLED=… YIELD=…`:
   MODE distinguishes armed vs dry passes (an armed pass with zero kills must
   not read as a disarmed job); zero-candidate runs still write the footer
@@ -161,6 +168,11 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
   ~6–9s dry / ~44s armed (6 × 5s grace serialized) — the single-pass-awk +
   precomputed descendant-map rewrite (was >100s on the real 814-row ps
   table).
+
+- **Disarm valve:** `touch $HOME/.pi/agent/state/pi-reap-idle.disabled` makes
+  every pass (even `--apply`) log a `MODE=disabled` footer and exit without
+  signaling — survives the re-syncs that re-install the launchd job after an
+  operator deliberately disarms it.
 
 ## Limitations + residuals
 

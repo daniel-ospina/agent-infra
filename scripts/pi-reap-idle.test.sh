@@ -7,9 +7,10 @@
 # REAP_LOG — never signals a real process, never touches real ~/.cmuxterm or
 # ~/.pi. Coverage (plan Task 5 fixture packs A/B/C, CI-safe subset):
 #   pack A  parser: giant ~150KB lines, trailing partial, empty/whitespace/
-#           garbage/missing files, .228Z / +00:00 / numeric timestamps,
-#           fresh, threshold boundary incl. exact 24h (strict >) via
-#           REAP_NOW_EPOCH, JSON shape
+#           garbage/missing files, newest-undatable-line abstain, .228Z /
+#           +00:00 / numeric timestamps, JSON shape (probe is parser-only:
+#           idle_proven = "a parseable last entry exists"; the strict->
+#           24h boundary incl. exact-24h lives at classify — C15)
 #   pack B  join/veto/resolution: fake-ps row sets (self tty/ancestors,
 #           non-pi, headless `??` pi), --list contract, 2-records-per-pid,
 #           allowlist veto vocabulary on BOTH keys + AND, stale-sibling
@@ -87,13 +88,26 @@ if [ "${1:-}" = "-axo" ]; then
     BEST="$SELF_PID"
     i=0
     while [ "$i" -lt 8 ]; do
-        CMD="$(/bin/ps -o command= -p "$SELF_PID" 2>/dev/null | tr -d '\n')"
+        # ps reads race empty when a frame exits mid-walk (suite runs
+        # concurrently / under load): retry before trusting the result — a
+        # stranded walk emits the self row at the WRONG pid and the reaper's
+        # real \$\$ row is missing, silently disabling B9's self-tty/ancestor
+        # skips.
+        CMD=""; t=0
+        while [ -z "$CMD" ] && [ "$t" -lt 3 ]; do
+            CMD="$(/bin/ps -o command= -p "$SELF_PID" 2>/dev/null | tr -d '\n')"
+            [ -z "$CMD" ] && sleep 0.05; t=$((t+1))
+        done
         if [ -n "$CMD" ]; then
             case "$CMD" in
                 *pi-reap-idle.sh*) BEST="$SELF_PID" ;;   # keep walking up: the
             esac                                            # OUT=$(...) subshell also
         fi                                                  # carries the script argv
-        NEXT="$(/bin/ps -o ppid= -p "$SELF_PID" 2>/dev/null | tr -d ' ')"
+        NEXT=""; t=0
+        while [ -z "$NEXT" ] && [ "$t" -lt 3 ]; do
+            NEXT="$(/bin/ps -o ppid= -p "$SELF_PID" 2>/dev/null | tr -d ' ')"
+            [ -z "$NEXT" ] && sleep 0.05; t=$((t+1))
+        done
         [ -n "$NEXT" ] || break
         [ "$NEXT" = "$SELF_PID" ] && break
         SELF_PID="$NEXT"; i=$((i+1))
@@ -291,6 +305,17 @@ for V in Z OFFSET NUM; do
     assert_eq "$(field_of "$OUT" last_timestamp)" "$E_SEP3_2000" "A4 timestamp variant $V -> $E_SEP3_2000"
 done
 rm -rf "$T/A4"
+
+# A5: newest line COMPLETE but undatable -> abstain (fail-closed), never date
+# the session by an older entry (policy: missing/unparseable => never idle)
+mk_env A5; mkdir -p "$T/A5/sessions"
+G="$T/A5/sessions/u.jsonl"
+printf '%s\n' '{"timestamp":"2026-09-03T20:00:00.000Z","x":1}' > "$G"
+printf '%s\n' '{"type":"activity","note":"no timestamp field"}' >> "$G"
+OUT="$(REAP_NOW_EPOCH=$NOW REAP_LOG="$T/A5/r.log" bash "$REAPER" --probe-jsonl "$G")"
+assert_eq "$(field_of "$OUT" idle_proven)" "False" "A5 undatable newest line abstains (no older-line fallback)"
+assert_eq "$(field_of "$OUT" reason)" "unparseable" "A5 reason=unparseable"
+rm -rf "$T/A5"
 
 echo "fixture pack B: cmux join + vetoes + resolution (dry-run verdicts)"
 mk_env B
@@ -698,21 +723,80 @@ OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 run_reaper C21 --dry-run 2>&1)"
 assert_reap_eligible "$OUT" "C21 BSD date branch forced + epoch correct (macOS production branch)"
 rm -rf "$T/C21/sessions"
 
-# C22: REAL macOS /bin/date + REAL ps day-first lstart order
+# C22: REAL /bin/date + REAL ps day-first lstart order
 # ("Mon 31 Aug 03:52:07 2026" = %a %e %b …) end-to-end through the true
 # production date binary — the month-first fixture format masked the order
-# difference (Sep 3 == 3 Sep under lenient parsing).
+# difference (Sep 3 == 3 Sep under lenient parsing). GNU coreutils date has
+# no -j: the legs are capability-gated (skip cleanly where the BSD shape is
+# absent — ubuntu CI); the C21 shim forces the BSD parse branch anywhere.
 mk_env C22
 make_lookup "$T/C22/date.lookup"
-E_MON31AUG="$(LC_ALL=C /bin/date -j -f '%a %e %b %H:%M:%S %Y' 'Mon 31 Aug 03:52:07 2026' +%s)"
-printf '%s\n' "$(psrow 20221 400000 20221 ttys333 "Mon 31 Aug 03:52:07 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/c22")" > "$T/C22/ps-source"
-printf '%s' '{"c22s":{"pid":20221,"pidStartSeconds":'$E_MON31AUG',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/c22"}}' | cmux_store C22
-session_jsonl C22 /Users/t/c22 c22s 1788166327 "2026-08-31T03:52:07.000Z"
-OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 DATE_BIN=/bin/date run_reaper C22 --dry-run 2>&1)"
-assert_reap_eligible "$OUT" "C22 real /bin/date + day-first lstart parses (macOS production shape)"
-OUT2="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 DATE_BIN=/bin/date run_reaper C22 --apply 2>&1)"
-assert_contains "$OUT2" "KILLED=1" "C22 armed pass kills under real date binary"
+if LC_ALL=C /bin/date -j -f '%a %e %b %H:%M:%S %Y' 'Mon 31 Aug 03:52:07 2026' +%s >/dev/null 2>&1; then
+    E_MON31AUG="$(LC_ALL=C /bin/date -j -f '%a %e %b %H:%M:%S %Y' 'Mon 31 Aug 03:52:07 2026' +%s)"
+    printf '%s\n' "$(psrow 20221 400000 20221 ttys333 "Mon 31 Aug 03:52:07 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/c22")" > "$T/C22/ps-source"
+    printf '%s' '{"c22s":{"pid":20221,"pidStartSeconds":'$E_MON31AUG',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/c22"}}' | cmux_store C22
+    session_jsonl C22 /Users/t/c22 c22s 1788166327 "2026-08-31T03:52:07.000Z"
+    OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 DATE_BIN=/bin/date run_reaper C22 --dry-run 2>&1)"
+    assert_reap_eligible "$OUT" "C22 real /bin/date + day-first lstart parses (macOS production shape)"
+    OUT2="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 DATE_BIN=/bin/date run_reaper C22 --apply 2>&1)"
+    assert_contains "$OUT2" "KILLED=1" "C22 armed pass kills under real date binary"
+else
+    echo "  → C22 real-date legs skipped (no BSD date on this platform) — C21 shim covers the BSD branch"
+fi
 rm -rf "$T/C22/sessions"
+
+# C23: disarm sentinel — pi-reap-idle.disabled suppresses even --apply
+mk_env C23
+make_lookup "$T/C23/date.lookup"
+idle30h_fixture C23 20231 ttys334 c23 /Users/t/c23
+mkdir -p "$T/C23/home/.pi/agent/state"
+touch "$T/C23/home/.pi/agent/state/pi-reap-idle.disabled"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 run_reaper C23 --apply 2>&1)"
+assert_not_contains "$OUT" "SIGNAL" "C23 sentinel suppresses all signaling"
+assert_contains "$(cat "$T/C23/reap.log")" "MODE=disabled" "C23 sentinel footer logged"
+assert_eq "$(cat "$T/C23/kill.log" 2>/dev/null | wc -l | tr -d ' ')" "0" "C23 no kill issued"
+rm -rf "$T/C23"
+
+# C24: launchd default-mode seam — REAP_DRY_RUN=0 with no mode flag arms;
+# an explicit --dry-run still wins over REAP_DRY_RUN=0
+mk_env C24
+make_lookup "$T/C24/date.lookup"
+idle30h_fixture C24 20241 ttys335 c24 /Users/t/c24
+: > "$T/C24/kill.log"
+OUT="$(REAP_DRY_RUN=0 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=tts900 run_reaper C24 2>&1)"
+assert_contains "$(cat "$T/C24/kill.log")" "kill -TERM" "C24 REAP_DRY_RUN=0 + no flag -> armed TERM"
+assert_contains "$(cat "$T/C24/reap.log")" "MODE=apply" "C24 default-mode footer MODE=apply"
+rm -rf "$T/C24/sessions"
+mk_env C24b
+make_lookup "$T/C24b/date.lookup"
+idle30h_fixture C24b 20242 ttys336 c24b /Users/t/c24b
+: > "$T/C24b/kill.log"
+OUT="$(REAP_DRY_RUN=0 REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=tts900 run_reaper C24b --dry-run 2>&1)"
+assert_not_contains "$(cat "$T/C24b/kill.log")" "kill" "C24b explicit --dry-run beats REAP_DRY_RUN=0"
+assert_contains "$(cat "$T/C24b/reap.log")" "MODE=dry-run" "C24b flag-wins footer MODE=dry-run"
+rm -rf "$T/C24b"
+
+# C25: pid recycled AFTER TERM (grace window) -> incarnation fence suppresses
+# the SIGKILL (fresh lstart differs from class_lstart); KILLED still counts
+# the achieved TERM.
+mk_env C25
+make_lookup "$T/C25/date.lookup"
+idle30h_fixture C25 20251 ttys337 c25 /Users/t/c25
+cat > "$T/C25/reuse-side.sh" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+    -TERM) awk '$1!=20251' "$FAKE_PS_SOURCE" > "$FAKE_PS_SOURCE.new" && \
+           printf '%s\n' "20251 400000 20251 ttys337 Sat Sep  5 01:00:00 2026 S 30000 /usr/local/bin/pi --cwd /Users/t/c25" >> "$FAKE_PS_SOURCE.new" && \
+           mv "$FAKE_PS_SOURCE.new" "$FAKE_PS_SOURCE" ;;
+esac
+SH
+chmod +x "$T/C25/reuse-side.sh"
+: > "$T/C25/kill.log"
+OUT="$(FAKE_KILL_SIDE="$T/C25/reuse-side.sh" REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=tts900 run_reaper C25 --apply 2>&1)"
+assert_contains "$(cat "$T/C25/kill.log")" "kill -TERM -20251" "C25 TERM issued"
+assert_not_contains "$(cat "$T/C25/kill.log")" "KILL" "C25 SIGKILL suppressed on pid reuse after TERM"
+assert_contains "$(cat "$T/C25/reap.log")" "pid reused after TERM" "C25 reuse-after-TERM suppress reason logged"
+rm -rf "$T/C25"
 
 echo "════════════════════════════════════════════════════════════════"
 echo "PASS=$PASS FAIL=$FAIL"

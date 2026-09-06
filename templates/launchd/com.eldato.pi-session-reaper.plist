@@ -18,7 +18,12 @@
          — the sacrificial real-signal test and the dry-run/apply verification
          MUST run pre-merge (see docs/plans/2026-09-05-issue-469-*.md). Ships
          ARMED (REAP_DRY_RUN=0) by design: interactive runs still default to
-         dry-run; only this launchd env arms the hourly pass. -->
+         dry-run; only this launchd env arms the hourly pass. Naming rationale:
+         deliberately NOT "session-lifecycle" (#341/#365 priced that token-cost
+         family) — this job is pure hygiene, keep the labels distinct. No
+         StandardOutPath/StandardErrorPath: every pass writes a capped footer
+         to ~/.pi/agent/state/pi-reap-idle.log (world-writable /tmp siblings
+         are a symlink-truncation surface + unbounded-launchd-capture twin). -->
     <key>Label</key>
     <string>com.eldato.pi-session-reaper</string>
     <key>ProgramArguments</key>
@@ -36,9 +41,5 @@
     </dict>
     <key>StartInterval</key>
     <integer>3600</integer>
-    <key>StandardOutPath</key>
-    <string>/tmp/pi-reap-idle.out.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/pi-reap-idle.out.log</string>
 </dict>
 </plist>
