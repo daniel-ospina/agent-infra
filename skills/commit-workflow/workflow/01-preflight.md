@@ -355,7 +355,8 @@ repos (no commits yet) fall back to the staged set — `git commit -a` on an unb
 HEAD records only the index. `gh pr` ops are unchanged (branch diff scope).
 
 **Content-shape exemption (docs/CSS/static-only — extension-side, tier-independent):**
-when the op's relevant file set (staged diff for commit/push; branch diff for
+when the op's relevant file set (staged diff for commit; pushed-range diff for
+content push — see below; branch diff for
 `gh pr create`/merge) is ENTIRELY docs/CSS/static AND no file sits under a
 build-output directory, VGATE skips the op (audited `gate_skip:
 content_shape_exempt`). Code-bearing or mixed sets are NEVER exempt; among
@@ -376,7 +377,14 @@ merge ops with no commit invocation qualify on file shape alone).
 Delete-shaped pushes (`git push origin --delete <branch>`, `git push --delete
 origin <branch>`, `git push origin :<branch>`) ship no local file content and
 skip VGATE before any diff computation (audited `gate_skip:
-delete_push_no_content`). Content pushes keep the staged check. `git branch -D`
+delete_push_no_content`). Content pushes verify the PUSHED RANGE — the files
+the push actually ships — not the whole index: `git diff
+refs/remotes/<remote>/<branch> <src>` when the remote-tracking ref exists
+(2-dot), or 3-dot against the remote's main on a first push
+(`refs/remotes/<remote>/main` when that ref exists, else the
+`refs/remotes/origin/main` fallback). A parked-WIP index from another session
+must not block an unrelated push of already-verified committed HEAD; an
+up-to-date push is audited `gate_skip: push_range_empty`. `git branch -D`
 / `git worktree remove` are not VGATE-intercepted.
 
 **How to satisfy:**

@@ -887,6 +887,10 @@ async function main() {
       // A non-commit git op triggers mid-session bridge recovery while the file
       // still matches the stored hash (m2) — the entry enters verifiedSet.
       // (push, not commit: no #7574 pendingRehash re-blessing on the next op.)
+      // #487 tier-C-tied: this repo is base-less (no refs/remotes/origin/* — no
+      // remote configured, no update-ref) → post-#487 the push resolves tier C
+      // (no usable base) → status-quo staged scope; the comment's "push-scope
+      // check" wording predates #487's range scoping and stays green unchanged.
       const allowed = await fire("tool_call", {
         type: "tool_call", toolName: "bash",
         input: { command: "git push origin main", cwd: repo },
@@ -1747,6 +1751,11 @@ async function main() {
     git(repo, "remote add origin git@github.com:daniel-ospina/agent-infra.git");
     // Legs 1-3: parked WIP premise (staged unverified file); session_start per
     // leg keeps each block at attempt 1 (#7591 threshold never reached).
+    // #487 tier-C-tied: legs 1-3 run BEFORE leg 4's update-ref — no
+    // refs/remotes/origin/main exists yet, so post-#487 each push resolves tier C
+    // (no usable base) → status-quo staged scope. Legs 2-3 additionally carry a
+    // delete segment → the #487 classifier's mixed_delete whole-command rule
+    // nulls to tier C staged. Behavior is byte-identical pre/post #487.
     for (let leg = 1; leg <= 3; leg++) {
       await fire("session_start", {});
       writeFileSync(join(repo, "wip44.ts"), `wip leg ${leg}\n`);
@@ -1914,6 +1923,10 @@ async function main() {
     git(repo, "commit -m base");
     writeFileSync(join(repo, "README.md"), "# docs\n");
     git(repo, "add README.md");
+    // #487 tier-C-tied: this repo is base-less (no refs/remotes/origin/*) →
+    // post-#487 the push resolves tier C → staged scope; the content-shape
+    // exemption here fires on the STAGED docs set. The RANGE-set docs
+    // exemption (committed docs on a real push range) is scenario 56's pin.
     await fire("session_start", {});
     const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
     const res = await fire("tool_call", {
@@ -2193,6 +2206,334 @@ async function main() {
     const delCommit = execSync("git diff HEAD^ --name-only", { cwd: repoB, encoding: "utf-8", timeout: 20000 });
     ok(delCommit.includes("notes.txt") && !existsSync(join(repoB, "src.ts")),
        "49b: real -a commit deleted src.ts and committed notes.txt");
+  });
+
+  // ── #487 — content pushes verify the PUSHED RANGE, not the whole index ──
+  // T1/T2/T3 pins. Pre-fix every push below computes git diff --cached (whole-
+  // index staged scope) so parked WIP false-blocks a push of already-committed
+  // HEAD. Post-fix an eligible content push resolves tier A (2-dot vs the
+  // remote-tracking ref) / tier B (3-dot vs the first-push base) / tier C
+  // (status-quo staged fallback). Fixtures mirror scenario 44's plumbing
+  // (update-ref'd refs/remotes/origin/main as the tier-A/B base; `fire` never
+  // runs a real push — interception returns first; git() runs only plumbing +
+  // allowed commits).
+  section("Issue #487 — push-range scope for content pushes (tiers A/B/C)");
+
+  test("scenario 50 (#487 T3 allow): committed-HEAD push over parked WIP unblocked via range scope — RED pre-fix", async () => {
+    const repo = join(TEST_ROOT, "repo-487-50");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base50.txt"), "b\n");
+    git(repo, "add base50.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    // content50.ts: staged → PASS-verified → commit-ALLOWED → REAL commit (HEAD
+    // now ahead of the base). Temp repos have no pre-commit hooks and git() is
+    // raw execSync → disk == committed == verified hash (no #7574 reliance).
+    writeFileSync(join(repo, "content50.ts"), "c50\n");
+    git(repo, "add content50.ts");
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: content50.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "content50.ts"), hash: sha("c50\n") }],
+      }) }],
+    });
+    const allowCommit = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m c50", cwd: repo },
+    });
+    equal(allowCommit, undefined, "50: content50.ts commit ALLOWED after the PASS (staged scope)");
+    git(repo, "commit -m c50");
+    // Parked WIP from another session (staged, unverified, never committed).
+    writeFileSync(join(repo, "wip50.ts"), "w\n");
+    git(repo, "add wip50.ts");
+    // Tier-A base: origin/main at the ANCESTOR base commit.
+    git(repo, `update-ref refs/remotes/origin/main ${baseSha}`);
+    await fire("session_start", {});
+    const push = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main", cwd: repo },
+    });
+    equal(push, undefined,
+      "50: push of ALREADY-VERIFIED committed HEAD over parked WIP must be ALLOWED post-fix (tier A range [content50.ts]); RED pre-fix: whole-index staged scope [wip50.ts] blocks");
+    // The push blessed NOTHING: committing the still-parked WIP still blocks.
+    const commit = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m wip", cwd: repo },
+    });
+    ok(commit && commit.block === true, "50: parked WIP commit must STILL block after the range-allow (nothing blessed)");
+    ok(commit.reason.includes("wip50.ts"), "50: block reason names the parked WIP file");
+  });
+
+  test("scenario 51 (#487): range names the pushed file, never the WIP — block + verify→unblock round-trip", async () => {
+    const repo = join(TEST_ROOT, "repo-487-51");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base51.txt"), "b\n");
+    git(repo, "add base51.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    // RAW commit (scenario 44-leg-4 precedent): committed-but-NEVER-verified
+    // content ahead of the base.
+    writeFileSync(join(repo, "content51.ts"), "c51\n");
+    git(repo, "add content51.ts");
+    git(repo, "commit -m c51 -- content51.ts");
+    git(repo, `update-ref refs/remotes/origin/main ${baseSha}`); // ancestor — tier A
+    writeFileSync(join(repo, "wip51.ts"), "w\n");
+    git(repo, "add wip51.ts"); // parked WIP — staged, unverified, never committed
+    await fire("session_start", {});
+    const push = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main", cwd: repo },
+    });
+    ok(push && push.block === true, "51: push of unverified committed content must block");
+    ok(push.reason.includes("content51.ts"),
+       "51: block reason names the PUSHED RANGE file content51.ts (RED pre-fix: staged scope names wip51.ts, never content51.ts)");
+    ok(!push.reason.includes("wip51.ts"),
+       "51: block reason must NOT name the parked WIP (RED pre-fix: staged scope names wip51.ts)");
+    // Verify→unblock round-trip: a PASS naming the committed range file (which
+    // NEVER appears in git diff --cached) merges via the block context —
+    // lastBlockedFiles = [content51.ts] → scopeFiles' blockedSet path — and
+    // unblocks the retry push. This is the merge side's ONLY acceptance path
+    // for the committed-range file class the new push-block introduces.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: content51.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "content51.ts"), hash: sha("c51\n") }],
+      }) }],
+    });
+    const retry = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main", cwd: repo },
+    });
+    equal(retry, undefined,
+      "51: retry push ALLOWED after the range file is verified (wip51.ts stays unverified but is OUT of the range)");
+  });
+
+  test("scenario 52 (#487 tier B): first push — no tracking ref, origin/main present → 3-dot range", async () => {
+    const repo = join(TEST_ROOT, "repo-487-52");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base52.txt"), "b\n");
+    git(repo, "add base52.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/main ${baseSha}`);
+    git(repo, "checkout -b feat"); // feat == base; NO refs/remotes/origin/feat
+    writeFileSync(join(repo, "content52.ts"), "c52\n");
+    git(repo, "add content52.ts");
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: content52.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "content52.ts"), hash: sha("c52\n") }],
+      }) }],
+    });
+    const allowCommit = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m c52", cwd: repo },
+    });
+    equal(allowCommit, undefined, "52: content52.ts commit ALLOWED after the PASS");
+    git(repo, "commit -m c52");
+    writeFileSync(join(repo, "wip52.ts"), "w\n");
+    git(repo, "add wip52.ts"); // parked WIP
+    await fire("session_start", {});
+    const push = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push -u origin feat", cwd: repo },
+    });
+    equal(push, undefined,
+      "52: tier-B first push over parked WIP ALLOWED post-fix (3-dot origin/main...feat range [content52.ts] verified); RED pre-fix: staged [wip52.ts] blocks; a tier-C regression would also block → allow proves tier B engaged");
+  });
+
+  test("scenario 53 (#487 tier C guard): no usable base keeps the staged check — green pre/post", async () => {
+    const repo = join(TEST_ROOT, "repo-487-53");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base53.txt"), "b\n");
+    git(repo, "add base53.txt");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "wip53.ts"), "w\n");
+    git(repo, "add wip53.ts"); // parked WIP — NO remote, NO update-ref anywhere
+    await fire("session_start", {});
+    const push = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main", cwd: repo },
+    });
+    ok(push && push.block === true,
+       "53: base-less push must keep the staged check (tier C, fail-closed) — regression guard: an error→[] resolver bug would flip this to allow");
+    ok(push.reason.includes("wip53.ts"), "53: block names the parked WIP (status-quo staged scope)");
+  });
+
+  test("scenario 54 (#487): up-to-date push — empty resolved range audited push_range_empty, then allow — RED pre-fix", async () => {
+    const repo = join(TEST_ROOT, "repo-487-54");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base54.txt"), "b\n");
+    git(repo, "add base54.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/main ${baseSha}`); // AT HEAD — up to date, nothing ships
+    writeFileSync(join(repo, "wip54.ts"), "w\n");
+    git(repo, "add wip54.ts"); // parked WIP — in NO range
+    await fire("session_start", {});
+    const before = readAuditLines().length;
+    const push = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main", cwd: repo },
+    });
+    equal(push, undefined,
+      "54: up-to-date push must ALLOW (resolved range is empty — nothing ships); RED pre-fix: staged [wip54.ts] blocks");
+    const fresh = readAuditLines().slice(before);
+    ok(fresh.some((l) => l.event === "gate_skip" && l.reason === "push_range_empty"),
+       "54: empty resolved range must be audited push_range_empty INSIDE the resolver, before the shared silent empty-allow");
+  });
+
+  test("scenario 55 (#487): bare-push upstream ceremony + force-push legs — tier A / tier C fallback / 2-dot D-row", async () => {
+    const repo = join(TEST_ROOT, "repo-487-55");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base55.txt"), "b\n");
+    git(repo, "add base55.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/main ${baseSha}`);
+    git(repo, "config branch.main.remote origin");
+    git(repo, "config branch.main.merge refs/heads/main");
+    writeFileSync(join(repo, "content55.ts"), "c55\n");
+    git(repo, "add content55.ts");
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: content55.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "content55.ts"), hash: sha("c55\n") }],
+      }) }],
+    });
+    const allowCommit = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m c55", cwd: repo },
+    });
+    equal(allowCommit, undefined, "55: content55.ts commit ALLOWED after the PASS");
+    git(repo, "commit -m c55");
+    writeFileSync(join(repo, "wip55.ts"), "w\n");
+    git(repo, "add wip55.ts"); // parked WIP — staged through all three legs
+    await fire("session_start", {});
+    // Leg (a): the 04-merge-deploy.md ceremony — BARE push with upstream config.
+    // This is the ONLY pin on the bare-push config-probe I/O path
+    // (branch.<cur>.remote/.merge reads; src = current branch).
+    const legA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease", cwd: repo },
+    });
+    equal(legA, undefined,
+      "55a: bare push of verified committed HEAD over parked WIP ALLOWED (tier A range [content55.ts]); RED pre-fix: staged [wip55.ts] blocks");
+    // Leg (b) negative: no upstream merge config → resolver null → tier C
+    // staged → the parked WIP blocks again (fail-closed fallback pinned).
+    git(repo, "config --unset branch.main.merge");
+    const legB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease", cwd: repo },
+    });
+    ok(legB && legB.block === true, "55b: bare push WITHOUT upstream merge config keeps the staged check (fail-closed tier C)");
+    ok(legB.reason.includes("wip55.ts"), "55b: block names the parked WIP");
+    // Leg (c): force-push 2-dot over a DIVERGED origin/main — the D-row comes
+    // from the REF tree (a remote-side-only file), never from a local git rm.
+    // The sibling commit is PATHSpec-limited (scenario 44-leg-4 precedent) so
+    // the still-staged wip55.ts is NOT swept into the sibling tree — a plain
+    // add+commit would empty the main index and kill this leg's RED.
+    git(repo, `switch -c remote55 ${baseSha}`); // sibling off the ORIGINAL base
+    writeFileSync(join(repo, "remote55.ts"), "r\n");
+    git(repo, "add remote55.ts");
+    git(repo, "commit -m sibling55 -- remote55.ts");
+    const siblingSha = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/main ${siblingSha}`); // DIVERGED sibling tree
+    git(repo, "switch main"); // wip55.ts still staged in the index (in neither tree)
+    const legC = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force origin main", cwd: repo },
+    });
+    equal(legC, undefined,
+      "55c: force push over diverged origin/main ALLOWED — 2-dot range = content55.ts (A-row, verified from leg a) + remote55.ts (D-row, ENOENT-skipped); wip55.ts is in NEITHER tree; never a forever-block on the deleted row");
+  });
+
+  test("scenario 56 (#487): content-shape exemption on the RANGE set — mixed committed range blocks; docs-only committed range exempt — RED pre-fix", async () => {
+    // Fixture 1: MIXED committed range (code + docs, both raw-committed and
+    // never verified, NOTHING staged) — never exempt: the exemption at the
+    // hook is whole-set only; the block names every unverified range file.
+    const repo = join(TEST_ROOT, "repo-487-56a");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base56.txt"), "b\n");
+    git(repo, "add base56.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    writeFileSync(join(repo, "code56.ts"), "c56\n");
+    git(repo, "add code56.ts");
+    git(repo, "commit -m c56 -- code56.ts"); // raw commit — never verified
+    writeFileSync(join(repo, "README56.md"), "# docs\n");
+    git(repo, "add README56.md");
+    git(repo, "commit -m d56 -- README56.md"); // raw commit — never verified
+    git(repo, `update-ref refs/remotes/origin/main ${baseSha}`); // ancestor
+    await fire("session_start", {});
+    const exemptBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const resA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main", cwd: repo },
+    });
+    ok(resA && resA.block === true,
+       "56a: MIXED committed range must block (never exempt on a mixed set); RED pre-fix: empty staged index silently allows");
+    ok(resA.reason.includes("code56.ts") && resA.reason.includes("README56.md"),
+       "56a: block names BOTH unverified range files (mirror scenario 40's both-named asserts — the exemption is whole-set only)");
+    equal(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length, exemptBefore,
+          "56a: mixed range must NOT add a content_shape_exempt skip");
+    // Fixture 2: docs-ONLY committed range — the exemption fires on the RANGE
+    // set (isBareCommitShape vacuous for pushes; scenario 47 pins only the
+    // STAGED-set exemption — this closes the range-set gap).
+    const repoB = join(TEST_ROOT, "repo-487-56b");
+    mkdirSync(repoB, { recursive: true });
+    git(repoB, "init -b main");
+    git(repoB, "config user.email e2e@test");
+    git(repoB, "config user.name e2e");
+    writeFileSync(join(repoB, "baseB.txt"), "b\n");
+    git(repoB, "add baseB.txt");
+    git(repoB, "commit -m base");
+    const baseShaB = git(repoB, "rev-parse HEAD");
+    writeFileSync(join(repoB, "docs56.md"), "# docs-only\n");
+    git(repoB, "add docs56.md");
+    git(repoB, "commit -m d56b -- docs56.md"); // raw commit — never verified
+    git(repoB, `update-ref refs/remotes/origin/main ${baseShaB}`);
+    await fire("session_start", {});
+    const exemptBeforeB = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const resB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main", cwd: repoB },
+    });
+    equal(resB, undefined, "56b: docs-only committed range push ALLOWED (content-shape exemption on the RANGE set)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > exemptBeforeB,
+       "56b: audit records content_shape_exempt for the range-scoped docs push (RED pre-fix: silent empty-index allow records nothing)");
   });
 } // main: plugin loaded; tests run sequentially via runAll()
 
