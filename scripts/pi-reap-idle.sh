@@ -35,7 +35,8 @@
 #   REAP_IDLE_HOURS REAP_DRY_RUN REAP_GRACE_SECONDS REAP_NOW_EPOCH
 #   REAP_LOCK_STALE_SECONDS REAP_LOG (default $HOME/.pi/agent/state/
 #   pi-reap-idle.log).
-# Exit codes: 0 completed passes, 2 usage, 3 fail-closed (store/lock abort).
+# Exit codes: 0 completed passes, 2 usage, 3 fail-closed (store / lock /
+#   log-unwritable abort).
 
 set -uo pipefail
 
@@ -45,13 +46,13 @@ REAP_LOG="${REAP_LOG:-${HOME:-}/.pi/agent/state/pi-reap-idle.log}"
 PS_BIN="${PS_BIN:-/bin/ps}"
 KILL_BIN="${KILL_BIN:-/bin/kill}"
 DATE_BIN="${DATE_BIN:-/bin/date}"
-CMUX_STATE_DIR="${CMUX_STATE_DIR:-$HOME/.cmuxterm}"
+CMUX_STATE_DIR="${CMUX_STATE_DIR:-${HOME:-}/.cmuxterm}"
 CMUX_STORE="$CMUX_STATE_DIR/pi-hook-sessions.json"
-PI_SESSIONS_DIR="${PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
+PI_SESSIONS_DIR="${PI_SESSIONS_DIR:-${HOME:-}/.pi/agent/sessions}"
 REAP_IDLE_HOURS="${REAP_IDLE_HOURS:-24}"
 REAP_GRACE_SECONDS="${REAP_GRACE_SECONDS:-5}"
 REAP_LOCK_STALE_SECONDS="${REAP_LOCK_STALE_SECONDS:-1800}"
-STATE_DIR="$HOME/.pi/agent/state"
+STATE_DIR="${HOME:-}/.pi/agent/state"
 LOCK_DIR="$STATE_DIR/pi-reap-idle.lock"
 # Disarm valve: touch $STATE_DIR/pi-reap-idle.disabled to make every pass
 # (even --apply) log a MODE=disabled footer and exit 0 without signaling.
@@ -498,12 +499,15 @@ classify_candidates() {
             vote=$((vote+1))
             # sid/sfile track the MAX-epoch (age-setting) record — settle-3
             # re-probes exactly the file(s) that decided eligibility. TIED
-            # equal-max twins are unioned (colon-joined) so a resumed twin is
-            # never invisible to the settle gate (arbitrary-twin re-probe).
+            # equal-max twins are unioned (\x1f unit-separator joined — the
+            # separator never appears in session-file paths, unlike ':') so a
+            # resumed twin is never invisible to the settle gate
+            # (arbitrary-twin re-probe).
             if [ -z "$youngest" ] || [ "$le" -gt "$youngest" ]; then
                 youngest="$le"; sid="$rsid"; sfile="$rf"
             elif [ "$le" = "$youngest" ]; then
-                case ":$sfile:" in *":$rf:"*) ;; *) sfile="$sfile:$rf" ;; esac
+                US="$(printf '\037')"  # unit separator — never in file paths
+                case "$sfile$US" in *"$rf$US"*) ;; *) sfile="$sfile$US$rf" ;; esac
             fi
         done <<<"$matched"
         if [ "$vote" -eq 0 ]; then
@@ -574,7 +578,7 @@ reap_one() { # <cand-line> <now>
             log "SETTLE-SKIP $pid activity advanced ($sf ${class_epoch} -> ${fresh_epoch}) — suppress"
             return 0
         fi
-    done <<<"$(printf '%s' "$sfile" | tr ':' '\n')"
+    done <<<"$(printf '%s' "$sfile" | tr "$(printf '\037')" '\n')"
     # (single-file case: one iteration, identical semantics to round 1)
     signal_target "$pid" "$pgid2" TERM
     log "SIGNAL pid=$pid pgid=$pgid2 SIGTERM rss=${rss:-0} idle_h=${idle_h}h session=$sid jsonl=$sfile"
@@ -681,9 +685,13 @@ run() {
     # the log's own directory (never a predictable sibling name — a local
     # attacker could pre-seed a symlink at a fixed path).
     mkdir -p "${REAP_LOG%/*}" 2>/dev/null || true
-    # fail-closed: an armed pass must never run with no audit trail — if the
-    # log cannot be created/appended, abort (exit 3) before any signal.
-    if ! : >>"$REAP_LOG" 2>/dev/null; then
+    # fail-closed (ARMED passes only): an armed pass must never run with no
+    # audit trail — if the log cannot be created/appended, abort (exit 3)
+    # before any signal. Dry-run / --list keep best-effort logging (their
+    # verdict surfaces are stdout, warn-first). Runs BEFORE the sentinel:
+    # an unwritable log aborts exit 3 even when disarmed (no silent
+    # no-trail hourly exit-3s beyond the documented class).
+    if [ "$MODE" = apply ] && ! : >>"$REAP_LOG" 2>/dev/null; then
         echo "FAIL-CLOSED abort: REAP_LOG unwritable ($REAP_LOG) (exit 3)" >&2
         exit 3
     fi

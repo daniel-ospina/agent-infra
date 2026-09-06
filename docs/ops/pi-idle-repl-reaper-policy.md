@@ -172,7 +172,10 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
 - **Disarm valve:** `touch $HOME/.pi/agent/state/pi-reap-idle.disabled` makes
   every pass (even `--apply`) log a `MODE=disabled` footer and exit without
   signaling — survives the re-syncs that re-install the launchd job after an
-  operator deliberately disarms it.
+  operator deliberately disarms it. Precedence: the ARMED log-writable probe
+  runs before the sentinel check — an unwritable log aborts exit 3 even when
+  disarmed (the documented no-trail failure class; dry-run/`--list` keep
+  best-effort logging since their verdict surfaces are stdout).
 
 ## Limitations + residuals
 
