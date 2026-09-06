@@ -142,8 +142,10 @@ gh pr merge <PR_NUMBER> --auto --merge
 # which advances on ANY concurrent merge (a false "done" sends Step B to delete
 # the head branch of a still-armed PR, closing it unmerged). Poll the REST pulls
 # endpoint (per #192 the GraphQL pool exhausts mid-ceremony under parallel
-# sessions). Bounded: a paused arm (mergeStateStatus BEHIND) or a failed required
-# check NEVER resolves itself — break after the window and run pause recovery:
+# sessions). Bounded: a paused arm (mergeStateStatus BEHIND) NEVER resolves
+# itself — break after the window and run the pause-recovery block BELOW.
+# (A genuinely FAILED required check is different: investigate/fix the check
+# first — pause recovery cannot clear a red check.)
 STATE=""
 for _ in $(seq 1 60); do            # 60 × 10s = 10 min max
   STATE=$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>" --jq .state 2>/dev/null || echo OPEN)
@@ -152,7 +154,8 @@ for _ in $(seq 1 60); do            # 60 × 10s = 10 min max
 done
 if [ "$STATE" != "MERGED" ]; then
   echo "⚠️ not merged within the poll window — inspect mergeStateStatus / autoMergeRequest:"
-  echo "   BEHIND → the branch fell behind while armed → run the pause-recovery block above."
+  echo "   BEHIND → the branch fell behind while armed → run the pause-recovery block below."
+  echo "   BLOCKED (failed required check) → investigate/fix the check, then re-arm."
   echo "   mergeable + unarmed → re-arm (gh pr merge <PR_NUMBER> --auto --merge)."
 fi
 # (Default-branch resolution when the default is not main:
@@ -167,6 +170,9 @@ review at the new head (condition 6 — the sha moved), then re-arm:
 ```bash
 DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
 [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
+git fetch origin "$DEFAULT_BRANCH" --quiet   # refresh the tracking ref FIRST — in the
+# BEHIND case the local origin/<default> ref is definitionally stale (the base
+# advanced after the last fetch); rebasing onto it absorbs nothing and re-pauses.
 git -c commit.gpgsign=false rebase "origin/$DEFAULT_BRANCH"   # or: git merge origin/$DEFAULT_BRANCH per condition 5
 # RE-RUN the affected pre-flight regression tests here
 git push --force-with-lease
@@ -179,6 +185,9 @@ git push --force-with-lease
 # the rebase changed the verified files' hashes (docs-only sets are shape-exempt).
 # Then re-arm:
 gh pr merge <PR_NUMBER> --auto --merge
+# Bounded: MAX 2 pause-recovery cycles, then escalate to the user (mirrors the
+# Stale-Merge ladder's cap below — on high-cadence repos consecutive pauses are
+# the expected failure mode, not the exception).
 ```
 
 **Fallbacks:** if arming fails with NOT_MERGEABLE (literal conflict), resolve per
