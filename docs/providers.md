@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-14
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, builtin-tools, custom-provider-qwen, issue-284
+aboutObjects: agent-infra, builtin-tools, custom-provider-qwen, custom-provider-openrouter, provider-failover, issue-284, issue-476
 ---
 
 # Provider reliability guide — qwen + the task tool
@@ -229,3 +229,47 @@ scripts/patch-pi-retry.sh --check
 
 Upstream gap (no configurable agent-level retry delay cap) is drafted in
 `docs/upstream-pi-bugs.md` as Issue D.
+
+## 7. Provider-exhaustion failover (#476)
+
+DeepSeek-official prepaid credit drains to `402 {"message":"Insufficient Balance"}`
+repeatedly (25× in 30d, Sep 2026 census — including an 11-concurrent-session kill
+in ~94s). pi has no re-drive-after-terminal-error API, so agent-infra ships a
+role-guarded hop to independent balances serving name-compatible deepseek models,
+with automatic return after balance restore.
+
+### Components
+
+- `extensions/shared/provider-failover.ts` — the latch single-source-of-truth:
+  durable state at `~/.pi/agent/state/provider-exhaustion.json`
+  (`{version: 1, epoch, updatedAt, primaries, blockedLegs}`), alias-family chain
+  table, exhaustion signature classifier (canonical 402 + "credit balance too
+  low"; 401/healthy never latch), O_EXCL pidfile lock + epoch CAS + atomic
+  writes. Ships a CLI: `npx tsx extensions/shared/provider-failover.ts --status | --clear <primary|*>`.
+- `extensions/builtin-tools` — resolveProviderModel/dispatch wiring: pre-tool-call
+  re-dispatch onto the next chain leg, per-leg circuit breaker, structured HALT
+  when every leg is blocked (never a silent fallthrough to a latched default).
+- `extensions/provider-exhaustion.ts` — session extension: child (print/json)
+  marker emission on `session_shutdown`, interactive (tui-only) latch + hop
+  (`pi.setModel`) + restore, session_start pre-prompt hop for latched families.
+- `scripts/checkout-hygiene/deepseek-balance-watch.sh` + `deepseek-balance-latch.py`
+  — the SINGLE restore authority (launchd, 15 min): zero-token probes
+  (`/user/balance`, openrouter `/auth/key`), SET at balance ≤ LOW, CLEAR only on
+  verified positive balance AND a 5-token chat probe, hysteresis band, 401/403
+  never latch, defer+escalate after 3 consecutive failures.
+- `scripts/checkout-hygiene/deepseek-balance-latch.py` mirrors the TS module's
+  durable JSON contract so poller + sessions interoperate on one state file.
+
+### Behavior contract
+
+- Marker-only latch trigger (fail-closed nonce auth on the child marker).
+- Alias-family hop chains: `deepseek-v4-flash → qwen-tp/deepseek-v4-flash-0731
+  → openrouter/deepseek/deepseek-v4-flash` (qwen-tp is env-blocked until its
+  401 remediation; default chain while blocked: deepseek → openrouter).
+- Env knobs: `PROVIDER_FAILOVER_DISABLE=1` (kill switch), `PI_FAILOVER_NO_HOP=1`
+  (must-stay), `PROVIDER_EXHAUSTION_TTL_MS` (latch TTL, default 24h — the poller
+  is the real clear authority; a stale latch self-heals in one TTL),
+  `PROVIDER_FAILOVER_BLOCKED` (provider block list; empty string = re-enable),
+  `TASK_EXHAUSTION_BLOCK=1` (fail fast instead of hopping).
+- Hop cost metadata is honest (catalog-authority rates in `models-store.json`),
+  or the leg is `costUnknown` and FLAGS.

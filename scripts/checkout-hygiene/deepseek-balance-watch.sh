@@ -88,7 +88,7 @@ if [ -z "$DEEPSEEK_KEY" ]; then
 fi
 
 # ── simulated-curl seam (DBW_CURL_STATE dir) ─────────────────────────────────
-slug_of() { printf '%s' "$1" | shasum -a 1 | cut -c1-12; }
+slug_of() { printf '%s' "$1" | { command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum; } | cut -c1-12; }
 dbw_curl() { # <url> <extra-curl-args...> → prints body + trailing http_code + time_total
   local url="$1"; shift
   if [ -n "${DBW_CURL_STATE+x}" ]; then

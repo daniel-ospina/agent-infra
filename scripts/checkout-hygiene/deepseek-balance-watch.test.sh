@@ -34,9 +34,9 @@ assert_not_contains() { # <haystack> <needle> <label>
 }
 
 # Canned-probe helpers (write the balance/chat/openrouter response files).
-BSLUG="$(printf '%s' "https://api.deepseek.com/user/balance" | shasum -a 1 | cut -c1-12)"
-CSLUG="$(printf '%s' "https://api.deepseek.com/chat/completions" | shasum -a 1 | cut -c1-12)"
-OSLUG="$(printf '%s' "https://openrouter.ai/api/v1/auth/key" | shasum -a 1 | cut -c1-12)"
+BSLUG="$(printf '%s' "https://api.deepseek.com/user/balance" | { command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum; } | cut -c1-12)"
+CSLUG="$(printf '%s' "https://api.deepseek.com/chat/completions" | { command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum; } | cut -c1-12)"
+OSLUG="$(printf '%s' "https://openrouter.ai/api/v1/auth/key" | { command -v sha1sum >/dev/null 2>&1 && sha1sum || shasum; } | cut -c1-12)"
 bal()   { printf '%s\n200\n0.8\n' "$1" > "$SIM/out.$BSLUG"; }
 resp()  { printf '%s\n%s\n0.8\n' "$2" "$1" > "$SIM/out.$BSLUG"; }  # resp <code> <body>
 chat()  { printf '%s\n200\n1.1\n' "$1" > "$SIM/out.$CSLUG"; }
