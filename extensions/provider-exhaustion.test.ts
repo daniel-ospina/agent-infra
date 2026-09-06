@@ -345,8 +345,7 @@ test("child healthy / quoted / user-tool turns → NO marker, NO pending state",
 
 section("extension — interactive (tui) message_end → durable latch + hop");
 
-test("interactive 402: durable latch + notice + setModel hop onto the chain leg", async () => {
-  const { env, cleanup } = hermetic();
+test("interactive 402: durable latch + notice + setModel hop onto the chain leg", async () => {  const { env, cleanup } = hermetic();
   applyEnv(env);
   try {
     const pi = makeFakePi();
@@ -412,6 +411,31 @@ test("interactive healthy turn → nothing latched, no hop", async () => {
     equal(pi.setModelCalls.length, 0);
     const state = readLatchState(env);
     deepEqual(state.primaries, {});
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
+test("interactive 402 with registry MISS on the hop target → latch durable, NO fabricated setModel, no-hop notice (deep-review P2)", async () => {
+  const { env, cleanup } = hermetic();
+  applyEnv(env);
+  try {
+    // registry that resolves deepseek but NOT the openrouter hop target
+    const partialReg = {
+      find: (provider: string, modelId: string) =>
+        provider === "deepseek" ? REG.find(provider, modelId) : undefined,
+    };
+    const pi = makeFakePi();
+    extension(pi as any);
+    const ctxMiss = { mode: "tui", model: modelObj("deepseek", "deepseek-v4-flash"), modelRegistry: partialReg };
+    await pi.emit("message_end", { message: canonical402 }, ctxMiss);
+    // latch IS durable (marker-less interactive path never depended on setModel)
+    const rec = readLatchState(env).primaries.deepseek;
+    ok(rec && rec.status === "exhausted", "root latched despite the registry miss");
+    // no fabricated {id, provider} object was pushed to pi.setModel — a bare
+    // object for an unconfigured provider would break the very next request
+    equal(pi.setModelCalls.length, 0, "registry miss → no setModel call (never fabricate)");
   } finally {
     restoreEnv();
     cleanup();

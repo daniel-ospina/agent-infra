@@ -274,5 +274,14 @@ with automatic return after balance restore.
   poller clears — TTL expiry alone does not yank the session back),
   `PROVIDER_FAILOVER_BLOCKED` (provider block list; empty string = re-enable),
   `TASK_EXHAUSTION_BLOCK=1` (fail fast instead of hopping).
+- Account-of-record (deep-review): a drain records under the family ROOT only
+  when it continues an in-flight root exhaustion (root latch FRESH at write)
+  or IS the root leg; a hop-leg drain with the root stale/absent records under
+  the DRAINED provider's own entry (its independent balance drained) so a
+  healthy root is never re-latched on another account's evidence. Consequence:
+  a hop-own record is NOT cleared by the deepseek-only poller — it self-heals
+  by TTL, or `latch clear --primary <hop>` removes it immediately.
+  Auth-blocks (blockedLegs) are likewise read-side TTL-bounded (self-heal on
+  key remediation; a still-broken key is re-armed fresh by the next 401/403).
 - Hop cost metadata is honest (catalog-authority rates in `models-store.json`),
   or the leg is `costUnknown` and FLAGS.

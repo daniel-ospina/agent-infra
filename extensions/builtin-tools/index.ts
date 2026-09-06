@@ -60,6 +60,7 @@ import {
   familyOf,
   failoverDisabled,
   isLatched,
+  latchTtlMs,
   scanStderrForExhaustion,
 } from "../shared/provider-failover.js";
 import type {
@@ -757,7 +758,13 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
     // 401/403-blocked markers are annotation-only (excluded-with-alert).
     if (marker.reason === "blocked") {
       const blockState = markLegBlocked(dispatched.provider, `marker:${marker.reason}`, { env });
-      const landed = blockState.blockedLegs?.[dispatched.provider] !== undefined;
+      // Fresh-block verification (not mere presence): a STALE blockedLegs
+      // entry already stopped excluding (read-side TTL bound) — if only a
+      // stale entry exists the re-stamp write failed and the provider is NOT
+      // excluded, so the annotation must not claim it is.
+      const rec = blockState.blockedLegs?.[dispatched.provider];
+      const at = rec && typeof rec.at === "string" ? Date.parse(rec.at) : NaN;
+      const landed = rec !== undefined && Number.isFinite(at) && Date.now() - at <= latchTtlMs(env);
       return {
         action: "return",
         nextLeg: null,
@@ -819,15 +826,21 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
     // possibly-dead account AND lying to the caller about the latch. The
     // latch must be verifiably durable before any annotation or advance.
     //
-    // Verify against BOTH possible record targets: the drained leg's own
-    // provider (stale/absent root — drain recorded under the drained
-    // provider) and the family root (in-flight root exhaustion — drain
-    // recorded under the root). A fresh record on either means the write
-    // landed (or a pre-existing fresh latch covers the same drain).
+    // Verify against ALL possible record targets, aligned with setExhausted's
+    // account-of-record placement: the WRITE target is primaryProvider =
+    // marker.provider || dispatched.provider when the root is stale/absent
+    // (drain recorded under that provider's own entry), else the family root
+    // (in-flight root exhaustion). Check marker.provider FIRST (the write
+    // target), then dispatched.provider (when the marker carries no separate
+    // provider, marker.provider IS dispatched.provider), then the family
+    // root. A fresh record on any means the write landed (or a pre-existing
+    // fresh latch covers the same drain).
     const drainRoot = rootPrimaryOfFamily(family);
+    const writeTarget = marker.provider || dispatched.provider;
     const latchLanded =
-      isLatched(dispatched.provider, latchedState, { env }) ||
-      (drainRoot !== undefined && drainRoot !== dispatched.provider && isLatched(drainRoot, latchedState, { env }));
+      isLatched(writeTarget, latchedState, { env }) ||
+      (dispatched.provider !== writeTarget && isLatched(dispatched.provider, latchedState, { env })) ||
+      (drainRoot !== undefined && drainRoot !== writeTarget && drainRoot !== dispatched.provider && isLatched(drainRoot, latchedState, { env }));
     if (!latchLanded) {
       return {
         action: "return",

@@ -2780,7 +2780,8 @@ test("decidePostDispatch: marker with NO heartbeat markers (sawToolsUnknown) →
   }
 });
 
-test("decidePostDispatch: blocked marker (401 auth-permanent) → annotation-only, never latch-exhaustion", () => {  const { env, cleanup } = freshFailoverEnv();
+test("decidePostDispatch: blocked marker (401 auth-permanent) → annotation-only, never latch-exhaustion", () => {
+  const { env, cleanup } = freshFailoverEnv();
   try {
     const decision = decidePostDispatch({
       result: connErrResult(),
@@ -2796,6 +2797,29 @@ test("decidePostDispatch: blocked marker (401 auth-permanent) → annotation-onl
     ok(state.blockedLegs.openrouter, "auth block recorded top-level (survives clear)");
     ok(!state.primaries.openrouter, "blocked ≠ exhaustion — no primary latch record");
   } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: blocked marker with UNWRITABLE state dir → failoverLatchFailed, never claims exclusion (deep-review P2-4)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const stateDir = resolve(env.PI_CODING_AGENT_DIR!, "state");
+    mkdirSync(stateDir, { recursive: true });
+    chmodSync(stateDir, 0o555);
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: OPENROUTER_FLASH,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: mkMarker({ reason: "blocked", provider: "openrouter", hop: "openrouter->x" }),
+      env,
+    });
+    equal(decision.action, "return");
+    ok(decision.annotations.failoverBlocked !== true, "never claim exclusion without a durable fresh block");
+    equal(decision.annotations.failoverLatchFailed, true, "write failure surfaced");
+  } finally {
+    chmodSync(resolve(env.PI_CODING_AGENT_DIR!, "state"), 0o755);
     cleanup();
   }
 });

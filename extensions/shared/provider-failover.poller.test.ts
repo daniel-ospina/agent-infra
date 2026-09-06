@@ -75,7 +75,6 @@ function freshEnv(overrides: Record<string, string> = {}): { dir: string; env: R
   return { dir, env };
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Synchronous sleep (the parity harness is sync — no async test fn). */
 const sleepSync = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);

@@ -145,7 +145,7 @@ test("generic gateway auth wording WITHOUT key context → null (never auth_perm
   equal(classifyExhaustionText("403 Access denied").kind, null);
 });
 
-test("402 + quota/balance WITHOUT credit-exhaustion window words → audit_only, never exhaustion", () => {
+test("402 + quota / bare balance / non-exhaustion wording → NEVER exhaustion (audit_only or null)", () => {
   // The SIG_402_CREDIT window is credit-scoped (insufficient | credit balance |
   // too low | exhausted) — bare quota/balance pairing with a 402 on another
   // line must never latch (review R2 + deep-review).
@@ -598,6 +598,29 @@ test("second-leg exhaustion advances to halt (chain bounded)", () => {
   const outcome = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
   equal(outcome.halted, true, "chain exhausted → halt");
   equal(outcome.reason, "halt");
+});
+
+test("hopCount contract: first active-leg set = 1; re-advance from active leg = 2", () => {
+  // qwen-tp UNBLOCKED so the flash chain has three usable legs:
+  // deepseek → qwen-tp/deepseek-v4-flash-0731 → openrouter
+  const env = { PI_CODING_AGENT_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "pf-hopcnt-")), PROVIDER_FAILOVER_BLOCKED: "" };
+  // FIRST marker (deepseek root drains) → chain engages, hopCount 1
+  setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: FLASH_PRIMARY, env });
+  let fam = readLatchState(env).primaries.deepseek.families["deepseek-v4-flash"];
+  equal(fam.activeLeg?.provider, "qwen-tp", "first advance onto qwen-tp");
+  equal(fam.hopCount, 1, "first active-leg set counts 1 (off-by-one fixed)");
+  // RE-ADVANCE: the ACTIVE qwen-tp leg drains (in-flight root latch) → 2
+  setExhausted({
+    primaryProvider: "qwen-tp",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: { provider: "qwen-tp", model: "deepseek-v4-flash-0731" },
+    env,
+  });
+  fam = readLatchState(env).primaries.deepseek.families["deepseek-v4-flash"];
+  equal(fam.activeLeg?.provider, "openrouter", "re-advance onto openrouter");
+  equal(fam.hopCount, 2, "marker from the CURRENT active leg counts a re-advance");
 });
 
 // ── Review-fix regressions (Phase-1 review P1/P2/P3) ────────────────

@@ -196,6 +196,17 @@ let pendingMarker: string | null = null;
  * "Provider balance restored" banner would be wrong (deep-review P2). */
 const latchSeenFamilies = new Set<string>();
 
+/** Families where THIS session drained a HOP leg (not the root) while the
+ * root was never latched / already stale — i.e. the hop provider's OWN
+ * account ran out (e.g. the user explicitly chose openrouter and openrouter's
+ * independent credits drained) rather than a root-exhaustion chain event.
+ * Banner distinction only (deep-review P2-7): the next-turn restore to the
+ * primary is correct in BOTH cases, but "the balance poller is the restore
+ * path" / "Provider balance restored" are misleading for a hop-own drain —
+ * the poller never monitors the hop leg's balance and the primary was never
+ * low. Tracked so the terminal + restore banners say what actually happened. */
+const hopDrainSeenFamilies = new Set<string>();
+
 /** States already alerted in this session (terminal/blocked banners are shown
  * ONCE per state, not per failing turn — review round-1 P3-3). */
 const alertedStates = new Set<string>();
@@ -215,6 +226,7 @@ export function _resetPendingMarkerForTests(): void {
 
 export function _resetLatchSeenFamiliesForTests(): void {
   latchSeenFamilies.clear();
+  hopDrainSeenFamilies.clear();
 }
 
 export function _pendingMarkerForTests(): string | null {
@@ -316,6 +328,16 @@ export default function (pi: ExtensionAPI) {
     });
     if (fam) latchSeenFamilies.add(fam); // this session IS on a drained family — restore gate (deep-review P2)
     notifyOnce(`exhausted:${fam ?? provider}`, "Provider credit exhausted — failover latch set", detail);
+    // Banner context (deep-review P2-7): is this drain the HOP leg's OWN
+    // account event (root never latched / not in-flight) — e.g. the user
+    // explicitly chose openrouter and openrouter's credits drained — or a
+    // continuation of a ROOT exhaustion (chain hop)? Both recover by moving
+    // off the drained leg; the wording must not blame the poller/root.
+    const root = fam ? rootPrimaryOfFamily(fam) : undefined;
+    const rootRec = root ? state.primaries?.[root] : undefined;
+    const rootFresh = rootRec !== undefined && isLatched(root, state);
+    const hopOwnDrain = fam !== undefined && root !== undefined && provider !== root && !rootFresh;
+    if (hopOwnDrain) hopDrainSeenFamilies.add(fam);
     // Hop the NEXT turn onto the chain's next available leg.
     const target = interactiveHopTarget({ provider, model }, state);
     if (target) {
@@ -324,8 +346,19 @@ export default function (pi: ExtensionAPI) {
           notifyOnce(`nohop:${target.provider}/${target.model}`, "Failover model switch unavailable", `no configured auth for ${target.provider} — next turn continues on ${provider}/${model}`);
           return;
         }
-        notifyOnce(`hop:${target.provider}/${target.model}`, "Auto-switching provider", `${provider}/${model} → ${target.provider}/${target.model} (next turn; the balance poller restores the primary on verified funds)`);
+        const banner = hopOwnDrain
+          ? {
+              title: "Auto-switching provider (hop account drained)",
+              body: `${provider}/${model} (hop leg) drained its own credits → ${target.provider}/${target.model} (next turn)`,
+            }
+          : {
+              title: "Auto-switching provider",
+              body: `${provider}/${model} → ${target.provider}/${target.model} (next turn; the balance poller restores the primary on verified funds)`,
+            };
+        notifyOnce(`hop:${target.provider}/${target.model}`, banner.title, banner.body);
       });
+    } else if (hopOwnDrain) {
+      notifyOnce(`terminal:${fam ?? provider}`, "Hop provider drained — returning to the primary", `no other hop leg available for family ${fam ?? provider} — next turn returns to the primary ${root}/${(familyLegs(fam as string)?.[0])?.model ?? ""} (its account was never exhausted)`);
     } else {
       notifyOnce(`terminal:${fam ?? provider}`, "All failover legs unavailable", `family ${fam ?? provider} has no available hop leg — the balance poller is the restore path`);
     }
@@ -388,7 +421,19 @@ export default function (pi: ExtensionAPI) {
     if (target) {
       await switchModel(ctx, target, (ok) => {
         if (ok) {
-          notifyOnce(`restore:${target.provider}/${target.model}`, "Provider balance restored", `returning to the primary ${target.provider}/${target.model}`);
+          // Banner accuracy (deep-review P2-7): a hop-OWN drain (openrouter's
+          // credits ran out under a healthy/never-latched root) is not a
+          // poller-restored root — say what actually happened.
+          const banner = hopDrainSeenFamilies.has(fam)
+            ? {
+                title: "Returning to the primary provider",
+                body: `hop leg ${parts.provider}/${parts.model} drained its own credits — continuing on the primary ${target.provider}/${target.model}`,
+              }
+            : {
+                title: "Provider balance restored",
+                body: `returning to the primary ${target.provider}/${target.model}`,
+              };
+          notifyOnce(`restore:${target.provider}/${target.model}`, banner.title, banner.body);
         }
       });
     }

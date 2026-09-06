@@ -147,12 +147,15 @@ export interface FamilyLatch {
 
 export interface PrimaryLatch {
   /** Account-level status — the primary provider's balance is exhausted.
-   * NOTE (review P2-3, designed residual): a hop-leg exhaustion marker also
-   * records under the family ROOT — the root record is best read as "this
-   * account's chain is not fully available; per-family state below". The
-   * conservative direction (halt the family until the poller verifies a
-   * positive root balance) is deliberate: re-dispatching a dead hop leg is
-   * strictly worse than a bounded halt. */
+   * NOTE (deep-review, qualified): a drain records under the family ROOT only
+   * when it continues an IN-FLIGHT root exhaustion (root latch FRESH at write
+   * time) or IS the root leg; a hop-leg drain with the root stale/absent
+   * records under the DRAINED provider's own entry (see setExhausted — a
+   * healthy root must not be re-latched on another account's evidence). The
+   * root record's per-family state is authoritative for chain resolution;
+   * resolution HALTS the family only when the root record itself is fresh and
+   * terminal/chain-exhausted (the conservative direction — re-dispatching a
+   * dead hop leg is strictly worse than a bounded halt). */
   status: LatchStatus;
   reason: LatchReason;
   source: LatchSource;
