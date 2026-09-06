@@ -46,6 +46,26 @@ import { retry, createCircuitBreaker } from "../shared/retry.js";
 import { register } from "../shared/health.js";
 import { treeKill } from "../shared/tree-kill.js";
 import { getPgid, sweepProcessGroup } from "../shared/process-sweep.js";
+// #476 provider-exhaustion failover — shared latch/chain/signature engine
+// (extensions/shared/provider-failover.ts; NOT an extension).
+import {
+  readLatchState,
+  setExhausted,
+  markLegBlocked,
+  resolveWithChain,
+  nextLegAfter,
+  rootPrimaryOfFamily,
+  noHop,
+  blockOnExhaustion,
+  familyOf,
+  failoverDisabled,
+  scanStderrForExhaustion,
+} from "../shared/provider-failover.js";
+import type {
+  ExhaustionMarker,
+  LatchState,
+  LegRef,
+} from "../shared/provider-failover.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -541,6 +561,505 @@ export function shouldFallback(d: FallbackDecision): boolean {
   const provider = (d.provider ?? "").toLowerCase();
   if (!provider.startsWith("qwen")) return false;
   return connectionErrorDetected(d.result);
+}
+
+// ── #476 Provider-exhaustion failover: dispatch resolution + decision table ──
+//
+// The task tool's family dispatch (deepseek-v4-flash/-pro) goes through the
+// shared latch + alias-family chain (extensions/shared/provider-failover.ts):
+//   - resolveDispatchLeg(): BEFORE spawning, exclude latched-out/blocked legs
+//     via resolveWithChain (chain-first, so a latched primary is never
+//     re-dispatched and ambiguity between providers is resolved AFTER the
+//     latch exclusion — plan A-); a halted chain returns the structured halt
+//     class so the caller fails the dispatch (epic-executor suspends+polls).
+//   - decidePostDispatch(): AFTER a defined child result, the result-class
+//     decision table:
+//       (a) exhaustion marker (nonce-valid) → durable setExhausted
+//           (sync-write-before-retry) + advance along the chain; pre-first-
+//           tool-call re-dispatch only (side-effect replay guard); a marker
+//           AFTER tool calls → annotate + return (mid-run halt-with-alert —
+//           the next dispatch hops; TASK_EXHAUSTION_RERUN_AFTER_TOOLS=1 opts
+//           in to the re-dispatch)
+//       (b) markerless connection-error death on a HOP leg → advance along
+//           the chain, bounded by chain length + a per-leg in-process
+//           circuit breaker (2 strikes / 60s)
+//       (c) anything else (bug-crash markerless death, healthy exit) →
+//           normal result — NEVER latch, NEVER advance (falsification pins)
+//
+// Env: PROVIDER_FAILOVER_DISABLE / PI_FAILOVER_NO_HOP / TASK_EXHAUSTION_BLOCK
+// are read by the shared module; TASK_EXHAUSTION_RERUN_AFTER_TOOLS=1 enables
+// mid-run auto re-dispatch (opt-in; default off).
+
+/** True when mid-run (post-tool-call) exhaustion re-dispatch is opted in. */
+export function rerunAfterToolsAllowed(env: Record<string, string | undefined> = process.env): boolean {
+  return env.TASK_EXHAUSTION_RERUN_AFTER_TOOLS === "1";
+}
+
+/** Default max auto-advances within ONE dispatch chain (bounded — the chain
+ * table itself is the outer bound; this caps markerless connection-error
+ * storms at 2 advances so a pathological leg set can't loop forever). */
+export const MAX_FAILOVER_HOPS = 2;
+
+/** The structured all-legs-halt / block-on-exhaustion dispatch result the task
+ * tool returns (epic-executor suspends+polls on the failoverHalt class).
+ * `attempted: true` marks a halt AFTER a leg actually dispatched (mid-loop) —
+ * the text then reports the leg that ran instead of claiming no dispatch. */
+export function haltDispatchResult(input: {
+  family: string;
+  provider: string;
+  model: string;
+  reason: "halt" | "blocked";
+  state: LatchState;
+  attempted?: boolean;
+}): { content: Array<{ type: string; text: string }>; details: Record<string, unknown> } {
+  const blockedIds = Object.keys(input.state.blockedLegs ?? {});
+  const detail =
+    input.reason === "blocked"
+      ? "TASK_EXHAUSTION_BLOCK=1 is set — a dispatch that would hop to another leg is blocked (fail-fast)."
+      : `All failover legs for alias family "${input.family}" are exhausted or auth-blocked.`;
+  const blockedNote = blockedIds.length ? ` Durable auth-blocked providers: ${blockedIds.join(", ")}.` : "";
+  const attemptedNote = input.attempted
+    ? `The dispatch ran on ${input.provider}/${input.model} and exhausted it before the halt decision.`
+    : `No dispatch was attempted (provider=${input.provider}, model=${input.model}).`;
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          `❌ [provider-failover-halt] ${detail}${blockedNote}\n\n` +
+          `${attemptedNote} ` +
+          `The balance poller clears the latch on verified positive balance — suspend and poll, do not retry in a loop.`,
+      },
+    ],
+    details: {
+      model: input.model,
+      provider: input.provider,
+      failoverHalt: true,
+      haltReason: input.reason,
+      family: input.family,
+      haltAttempted: input.attempted === true,
+    },
+  };
+}
+
+/** Pre-spawn failover resolution (pure wrt the latch state). Returns the leg
+ * to dispatch or the halt outcome. Chain-first: when the family is latched,
+ * the chain outcome REPLACES the requested leg BEFORE spawn (latched-out
+ * exclusion; ambiguity between providers resolved after exclusion). */
+export interface DispatchLegOutcome {
+  leg: LegRef;
+  halted: boolean;
+  haltReason?: "halt" | "blocked";
+  hop: string | null;
+  family: string | undefined;
+}
+
+export function resolveDispatchLeg(
+  requested: LegRef,
+  state: LatchState,
+  opts: { env?: Record<string, string | undefined>; now?: number } = {},
+): DispatchLegOutcome {
+  const env = opts.env ?? process.env;
+  const family = familyOf(requested.model, requested.provider);
+  if (!family || failoverDisabled(env)) {
+    return { leg: requested, halted: false, hop: null, family };
+  }
+  const outcome = resolveWithChain(family, requested, state, { env, now: opts.now });
+  if (outcome.halted) {
+    const reason = env.TASK_EXHAUSTION_BLOCK === "1" ? "blocked" : "halt";
+    return { leg: requested, halted: true, haltReason: reason, hop: null, family };
+  }
+  if (outcome.leg && (outcome.leg.provider !== requested.provider || outcome.leg.model !== requested.model)) {
+    return { leg: outcome.leg, halted: false, hop: outcome.hop, family };
+  }
+  return { leg: requested, halted: false, hop: null, family };
+}
+
+// ── In-process per-leg circuit breaker (markerless connection-error storms) ──
+// Module-level map: provider/model -> consecutive connection-error count.
+// A leg with >= 2 strikes inside 60s is excluded from hop candidates by
+// decidePostDispatch (this process only; the durable latch is the
+// cross-process authority for genuine exhaustion).
+const LEG_STRIKE_WINDOW_MS = 60_000;
+const LEG_STRIKE_MAX = 2;
+const legStrikes = new Map<string, { count: number; at: number }>();
+
+function legKey(leg: LegRef): string {
+  return `${leg.provider}\u0000${leg.model}`;
+}
+
+/** Record a connection-error strike for a leg. Returns true when the leg is
+ * now breaker-open (>= LEG_STRIKE_MAX within the window). */
+export function recordLegStrike(leg: LegRef, now: number = Date.now()): boolean {
+  const key = legKey(leg);
+  const prev = legStrikes.get(key);
+  const entry = prev && now - prev.at < LEG_STRIKE_WINDOW_MS ? { count: prev.count + 1, at: now } : { count: 1, at: now };
+  legStrikes.set(key, entry);
+  return entry.count >= LEG_STRIKE_MAX;
+}
+
+/** Is the leg currently breaker-open (>= 2 connection-error strikes / 60s)? */
+export function legBreakerOpen(leg: LegRef, now: number = Date.now()): boolean {
+  const prev = legStrikes.get(legKey(leg));
+  if (!prev || now - prev.at >= LEG_STRIKE_WINDOW_MS) {
+    if (prev) legStrikes.delete(legKey(leg));
+    return false;
+  }
+  return prev.count >= LEG_STRIKE_MAX;
+}
+
+/** Test seam — clear breaker state. */
+export function resetLegBreakers(): void {
+  legStrikes.clear();
+}
+
+/** Result-class decision table. The durable latch write happens inside via
+ * setExhausted (sync-write-before-retry) against the env-authoritative state
+ * (readLatchState(env)) — the table is NOT pure over a passed-in snapshot;
+ * env is the single authority (review round-5 P3-2). See the header contract.
+ * Returns the action + the next leg to dispatch. Never throws. */
+export interface PostDispatchInput {
+  /** Composed child result (result.value from the retry wrapper). */
+  result: { content?: Array<{ type?: string; text?: string }>; details?: Record<string, unknown> } | undefined;
+  /** The leg that was dispatched and produced this result. */
+  dispatched: LegRef;
+  /** Family key of the dispatched model (undefined = not a chain member). */
+  family: string | undefined;
+  /** Whether the child ran at least one tool before dying (side-effect replay
+   * guard — re-dispatch only pre-first-tool-call). */
+  sawTools: boolean;
+  /** True when the heartbeat marker stream was ABSENT for the whole dispatch
+   * (TASK_HEARTBEAT_DISABLE=1 / emitter failure) so tool activity is UNKNOWN
+   * — the replay guard defaults to the conservative no-auto-rerun (review
+   * round-5 P2-2). Only consulted alongside a marker. */
+  sawToolsUnknown: boolean;
+  /** Marker attached by spawnSubAgent (nonce-validated at capture). */
+  marker: ExhaustionMarker | null;
+  env?: Record<string, string | undefined>;
+}
+
+export interface PostDispatchDecision {
+  action: "return" | "advance" | "halt";
+  nextLeg: LegRef | null;
+  /** Extra detail fields the caller should merge into the returned result. */
+  annotations: Record<string, unknown>;
+}
+
+export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecision {
+  const env = input.env ?? process.env;
+  const marker = input.marker;
+  const dispatched = input.dispatched;
+  const family = input.family;
+
+  // (a) EXHAUSTION MARKER — the ONLY exhaustion latch trigger.
+  if (marker) {
+    // 401/403-blocked markers are annotation-only (excluded-with-alert).
+    if (marker.reason === "blocked") {
+      markLegBlocked(dispatched.provider, `marker:${marker.reason}`, { env });
+      return {
+        action: "return",
+        nextLeg: null,
+        annotations: {
+          failoverBlocked: true,
+          failoverMarker: marker.hop,
+          failoverNote: `provider ${dispatched.provider} reported an auth-block marker — excluded from hop candidates`,
+        },
+      };
+    }
+    if (!family) {
+      // No chain for this model — account-level latch only (next family
+      // dispatch re-reads the state and hops).
+      setExhausted({
+        primaryProvider: marker.provider || dispatched.provider,
+        reason: marker.reason === "402" ? "402" : "low_balance",
+        source: "marker",
+        env,
+      });
+      return {
+        action: "return",
+        nextLeg: null,
+        annotations: { failoverLatched: true, failoverMarker: marker.hop, failoverHop: null },
+      };
+    }
+    // Durable latch BEFORE any retry (sync-write-before-retry). Accepted
+    // conservative direction (review round-5 P3-1): the marker rides any
+    // settled result, so a completed-session-with-marker latches too — a 402
+    // marker means the provider account failed mid-session; re-dispatching a
+    // possibly-dead account is strictly worse than a TTL-bounded halt.
+    setExhausted({
+      primaryProvider: marker.provider || dispatched.provider,
+      reason: marker.reason === "402" ? "402" : "low_balance",
+      source: "marker",
+      family,
+      fromLeg: dispatched,
+      env,
+    });
+    const toolsKnownOrNone = !input.sawToolsUnknown && !input.sawTools;
+    if (!toolsKnownOrNone && !rerunAfterToolsAllowed(env)) {
+      // Mid-run death after tool calls (or tool activity UNKNOWN — marker
+      // stream absent, e.g. TASK_HEARTBEAT_DISABLE=1): side-effect replay
+      // guard — annotate + return (halt-with-alert). The latch is durable, so
+      // the NEXT dispatch resolves onto the hop leg. Explicit opt-in
+      // (TASK_EXHAUSTION_RERUN_AFTER_TOOLS=1) re-enables the re-dispatch.
+      return {
+        action: "return",
+        nextLeg: null,
+        annotations: {
+          failoverLatched: true,
+          failoverMarker: marker.hop,
+          failoverMidRun: true,
+          failoverToolActivityKnown: !input.sawToolsUnknown,
+          failoverNote:
+            input.sawToolsUnknown
+              ? "exhaustion marker with NO heartbeat markers (stream absent) — tool activity unknown; not auto re-run (conservative replay guard); next dispatch hops"
+              : "exhaustion after tool calls — not auto re-run (side-effect replay guard); next dispatch hops",
+        },
+      };
+    }
+    const after = readLatchState(env);
+    const outcome = resolveWithChain(family, dispatched, after, { env });
+    if (outcome.halted) {
+      return { action: "halt", nextLeg: null, annotations: { failoverLatched: true, failoverMarker: marker.hop } };
+    }
+    if (outcome.leg && (outcome.leg.provider !== dispatched.provider || outcome.leg.model !== dispatched.model)) {
+      return {
+        action: "advance",
+        nextLeg: outcome.leg,
+        annotations: { failoverLatched: true, failoverMarker: marker.hop, failoverHop: outcome.hop },
+      };
+    }
+    return {
+      action: "return",
+      nextLeg: null,
+      annotations: { failoverLatched: true, failoverMarker: marker.hop, failoverHop: null },
+    };
+  }
+
+  // (b) MARKERLESS CONNECTION-ERROR on a HOP leg → advance (bounded).
+  // The #152 storm signature; never on the primary leg (deepseek connection
+  // flakiness is NOT exhaustion — legacy behavior preserved), never on a
+  // breaker-open leg, never on a non-family model. Advance walks PAST the
+  // dead leg via nextLegAfter (never re-resolve onto the same serving leg).
+  // Env gates are honored like branch (a): PI_FAILOVER_NO_HOP (must-stay) and
+  // TASK_EXHAUSTION_BLOCK (a hop would happen → halt class) (review round-5
+  // P2-3).
+  if (family && connectionErrorDetected(input.result)) {
+    if (noHop(env)) {
+      return {
+        action: "return",
+        nextLeg: null,
+        annotations: {
+          failoverNote: "PI_FAILOVER_NO_HOP=1 (must-stay) — no advance on markerless connection-error",
+        },
+      };
+    }
+    if (blockOnExhaustion(env)) {
+      return {
+        action: "halt",
+        nextLeg: null,
+        annotations: {
+          failoverBlockedEnv: true,
+          failoverNote: "TASK_EXHAUSTION_BLOCK=1 — a markerless hop advance is blocked (fail-fast)",
+        },
+      };
+    }
+    const isHop = dispatched.provider !== familyRootOf(family);
+    if (!isHop) {
+      return {
+        action: "return",
+        nextLeg: null,
+        annotations: {
+          failoverNote:
+            "connection-error on the primary/root leg — no advance (legacy behavior preserved; the retry wrapper is the bounded backstop)",
+        },
+      };
+    }
+    if (legBreakerOpen(dispatched)) {
+      return {
+        action: "return",
+        nextLeg: null,
+        annotations: {
+          failoverNote: `leg ${dispatched.provider}/${dispatched.model} is breaker-open (2 connection-error strikes/60s) — no advance`,
+        },
+      };
+    }
+    const open = recordLegStrike(dispatched);
+    const step = nextLegAfter(family, dispatched, readLatchState(env), { env });
+    if (!step.halted && step.leg) {
+      return {
+        action: "advance",
+        nextLeg: step.leg,
+        annotations: {
+          failoverConnectionAdvance: true,
+          failoverHop: `${dispatched.provider}->${step.leg.provider}`,
+          failoverLegOpen: open,
+          failoverNote: "markerless connection-error on a hop leg — advanced past it along the chain (bounded)",
+        },
+      };
+    }
+    return {
+      action: "return",
+      nextLeg: null,
+      annotations: {
+        failoverNote:
+          "terminal hop leg — no leg after it along the chain; no advance (normal failure, never re-walk past exhausted legs)",
+      },
+    };
+  }
+
+  // (c) DEFAULT — healthy exit, bug-crash markerless death, non-family:
+  // normal result. NEVER latch, NEVER advance.
+  return { action: "return", nextLeg: null, annotations: {} };
+}
+
+/** Family root provider (first leg of the chain) — delegates to the shared
+ * module's rootPrimaryOfFamily so the alias-family table stays the SINGLE
+ * source of truth (a new family added to ALIAS_FAMILIES is automatically
+ * classified; review round-5 P2-6). */
+export function familyRootOf(family: string | undefined): string | undefined {
+  return rootPrimaryOfFamily(family);
+}
+
+// ── #476 execute-level decision loop (extracted for direct test coverage; a
+// fake spawn function exercises hop re-spawn, the caps, and the halt class
+// without the real child process — review round-5 P2-5). ──────────────────
+
+export interface FailoverSpawnResult {
+  status: string;
+  value?: { content?: any[]; details?: Record<string, unknown> } | undefined;
+}
+
+export interface FailoverLoopResult {
+  result: FailoverSpawnResult;
+  dispatchLeg: LegRef;
+  /** Structured halt outcome (caller renders haltDispatchResult). */
+  halted: { family: string; provider: string; model: string; reason: "halt" | "blocked" } | null;
+  hops: number;
+}
+
+/** Post-dispatch decision loop extracted from execute(): runs the result-class
+ * decision table (decidePostDispatch) to convergence — marker/connection
+ * advances re-dispatch on the next chain leg (bounded: markerless advances
+ * cap at MAX_FAILOVER_HOPS; marker advances are chain-bounded — review
+ * round-5 P2-4), halts return the structured outcome, everything else
+ * returns with the decision's annotations merged into details. A non-family
+ * exhaustion marker gets the account-level single-shot latch. */
+export async function runFailoverDecisionLoop(input: {
+  family: string | undefined;
+  failoverActive: boolean;
+  dispatchLeg: LegRef;
+  result: FailoverSpawnResult | undefined;
+  spawn: (leg: LegRef) => Promise<FailoverSpawnResult | undefined>;
+  env?: Record<string, string | undefined>;
+  onHop?: (leg: LegRef, hopCount: number, annotations: Record<string, unknown>) => void;
+}): Promise<FailoverLoopResult> {
+  const env = input.env ?? process.env;
+  let { dispatchLeg, result } = input;
+  let hops = 0;
+  // The retry wrapper result is { status, value: V, retries... } — the marker
+  // and tool-activity flags ride on V.details (attached at spawnSubAgent
+  // settle). decisionFor UNWRAPS the inner value before the decision table
+  // (review round-2 P0): decidePostDispatch reads result.content/details.
+  const markerOnResult = (v: FailoverSpawnResult | undefined): ExhaustionMarker | null =>
+    ((v?.value?.details?.exhaustionMarker as ExhaustionMarker | undefined) ?? null);
+  const mergeAnnotations = (decision: PostDispatchDecision) => {
+    if (result && Object.keys(decision.annotations).length > 0 && result.value?.details) {
+      result = {
+        ...result,
+        value: { ...result.value, details: { ...result.value.details, ...decision.annotations } },
+      };
+    }
+  };
+  const decisionFor = (value: FailoverSpawnResult | undefined): PostDispatchDecision => {
+    const inner = value?.value;
+    return decidePostDispatch({
+      result: inner,
+      dispatched: dispatchLeg,
+      family: input.family,
+      sawTools: inner?.details?.sawTools === true,
+      sawToolsUnknown: inner?.details?.sawToolsUnknown === true,
+      marker: ((inner?.details?.exhaustionMarker as ExhaustionMarker | undefined) ?? null),
+      env,
+    });
+  };
+  const halted = (): FailoverLoopResult["halted"] => ({
+    family: input.family!,
+    provider: dispatchLeg.provider,
+    model: dispatchLeg.model,
+    reason: env.TASK_EXHAUSTION_BLOCK === "1" ? "blocked" : "halt",
+  });
+
+  // Non-family single-shot: an exhaustion marker on a non-chain model still
+  // latches the provider account-level (never advance — no chain), so the
+  // interactive extension + the poller see it. Only runs when a marker is
+  // actually present (no per-dispatch latch read otherwise).
+  if (
+    input.failoverActive &&
+    !input.family &&
+    result &&
+    result.status === "success" &&
+    markerOnResult(result)
+  ) {
+    mergeAnnotations(decisionFor(result));
+    return { result, dispatchLeg, halted: null, hops };
+  }
+
+  while (input.failoverActive && input.family && result && result.status === "success") {
+    const decision = decisionFor(result);
+    if (decision.action === "halt") {
+      return { result, dispatchLeg, halted: halted(), hops };
+    }
+    const isMarkerAdvance = decision.annotations.failoverMarker !== undefined;
+    const capOk = isMarkerAdvance || hops < MAX_FAILOVER_HOPS;
+    if (decision.action === "advance" && decision.nextLeg) {
+      if (!capOk) {
+        // FUTURE-PROOFING GUARD (review round-3 P2-1): with the current 3-leg
+        // chains the markerless cap (MAX_FAILOVER_HOPS=2) can never bind — a
+        // markerless advance request only originates from a non-terminal hop
+        // leg (terminal legs return the no-advance note), so hops < 2 is
+        // always true when requested. Longer chains would hit this branch:
+        // DO NOT merge the advance-claiming annotations (the hop did not
+        // happen); merge a distinct capped note instead and stop.
+        if (result.value?.details) {
+          result = {
+            ...result,
+            value: {
+              ...result.value,
+              details: {
+                ...result.value.details,
+                failoverHopCapped: true,
+                failoverNote: `markerless advance cap (${MAX_FAILOVER_HOPS}) reached — no further hop`, 
+              },
+            },
+          };
+        }
+        return { result, dispatchLeg, halted: null, hops };
+      }
+      hops += 1;
+      dispatchLeg = decision.nextLeg;
+      const prior = result.value;
+      input.onHop?.(dispatchLeg, hops, decision.annotations);
+      const legResult = await input.spawn(dispatchLeg);
+      if (legResult && legResult.status === "success" && legResult.value) {
+        result = legResult;
+        continue;
+      }
+      // The hop leg itself never produced a defined result — annotate the
+      // prior value with the failure and stop (no infinite hop loops).
+      result = {
+        ...result,
+        value: {
+          ...prior,
+          details: { ...(prior.details ?? {}), ...decision.annotations, failoverHopSpawnFailed: true },
+        },
+      };
+      return { result, dispatchLeg, halted: null, hops };
+    }
+    // return (or non-advancing decision): merge annotations into the details.
+    mergeAnnotations(decision);
+    return { result, dispatchLeg, halted: null, hops };
+  }
+  return { result: result as FailoverSpawnResult, dispatchLeg, halted: null, hops };
 }
 
 // ── Sub-agent heartbeat: alive signals, not output bytes (#176) ────────
@@ -1398,8 +1917,12 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // #176 code-review: per-dispatch marker nonce — the child echoes it in
     // every [task-heartbeat] marker; markers without it are foreign (MCP
     // servers inherit the child's fd 2) and fall back to ordinary stderr.
+    // #476: a caller-managed TASK_HEARTBEAT_NONCE in subAgentEnv is REUSED
+    // (the task tool generates one and shares it with the decision table for
+    // [provider-exhaustion] marker authentication); absent one, a fresh nonce
+    // is generated here (legacy behavior).
     const hbEnabled = subAgentEnv.TASK_HEARTBEAT === "1";
-    const hbNonce = hbEnabled ? randomBytes(6).toString("hex") : "";
+    const hbNonce = hbEnabled ? subAgentEnv.TASK_HEARTBEAT_NONCE || randomBytes(6).toString("hex") : "";
     const spawnEnv = hbEnabled
       ? { ...subAgentEnv, TASK_HEARTBEAT_NONCE: hbNonce }
       : subAgentEnv;
@@ -1511,6 +2034,19 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       ingestHeartbeatChunk(data.toString(), hbCtx);
     });
 
+    // #476: exhaustion-marker capture + tool-activity flag — attached to
+    // EVERY settled result's details so the post-dispatch decision table can
+    // (a) latch on a nonce-valid [provider-exhaustion] marker and (b) apply
+    // the side-effect replay guard (re-dispatch only pre-first-tool-call).
+    let exhaustionMarker: ExhaustionMarker | null | undefined;
+    const detectExhaustionMarker = (): ExhaustionMarker | null => {
+      if (exhaustionMarker !== undefined) return exhaustionMarker;
+      exhaustionMarker = hbEnabled
+        ? scanStderrForExhaustion(stderr, hbNonce, { requireNonce: true })
+        : null;
+      return exhaustionMarker;
+    };
+
     const doResolve = (value: { content: any[]; details: Record<string, unknown> } | undefined, opts?: { keepCompletionWatchdog?: boolean; sweep?: boolean }) => {
       if (settled) return;
       settled = true;
@@ -1519,6 +2055,26 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       if (hardCapTimer) clearTimeout(hardCapTimer);
       if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
       if (backstopTimer) { clearTimeout(backstopTimer); backstopTimer = undefined; }
+      // #476 attach: marker + everSawTool (truthy only) ride on the result.
+      // sawToolsUnknown = the heartbeat marker stream carried ZERO markers
+      // for the whole dispatch (TASK_HEARTBEAT_DISABLE=1 / emitter failure) —
+      // tool activity is UNKNOWN, and the decision table's replay guard
+      // defaults to the conservative no-auto-rerun (review round-5 P2-2).
+      // Accepted residual (P3-4): a marker written by the child in the SAME
+      // tick as a parent-initiated kill (heartbeat-kill/backstop/hard-cap)
+      // can land after this snapshot and be missed — fail-closed (no latch),
+      // one bounded retry-cycle cost; genuine exhaustion deaths settle via
+      // the exit/close paths where stderr has fully drained.
+      if (value && typeof value === "object") {
+        const marker = detectExhaustionMarker();
+        const details: Record<string, unknown> = { ...(value.details ?? {}) };
+        if (marker) details.exhaustionMarker = marker;
+        if (hbCtx.state.everSawTool) details.sawTools = true;
+        else if (hbEnabled && hbCtx.state.markerCount === 0) details.sawToolsUnknown = true;
+        if (Object.keys(details).length > 0) {
+          value = { ...value, details };
+        }
+      }
       // #271 settle-path sweep hook (round-3 F2): runs whenever the exit-settle
       // path resolved (close didn't fire within grace — a live pipe-holder
       // keeps the pgid alive, so recycle risk doesn't apply) OR an abnormal
@@ -2352,8 +2908,6 @@ export default function (pi: ExtensionAPI) {
       // explicitly via the mcp_servers param or mid-run mcp_load.
       subAgentEnv.PI_MCP_SERVERS = params.mcp_servers?.trim() || "none"; // #286 P2: "" (empty string) must not fall through to eager-load-all
 
-      const args = ["-p", "--provider", provider, "--model", model, "--no-session", params.prompt];
-
       // Retry on zero-output failures (model/network hang) with backoff + circuit breaker.
       // Does NOT retry when sub-agent produces partial output — those go to the caller.
       const retryOptions = {
@@ -2365,21 +2919,82 @@ export default function (pi: ExtensionAPI) {
           console.log(`[task] retry ${attempt}/${3} — waiting ${delayMs}ms`);
         },
       };
-      let result = await retry(
-        () => spawnSubAgent(model, provider, subAgentEnv, args, signal),
-        retryOptions,
-      );
+      // #476 provider-exhaustion failover — pre-dispatch chain resolution
+      // (latched-out exclusion BEFORE spawn; a halted chain fails the
+      // dispatch fast with the structured halt class). Family detection is
+      // exact (provider/model identity via the shared alias-family table).
+      // The latch file is read lazily — only family dispatches ever touch it.
+      const failoverActive = !failoverDisabled(subAgentEnv);
+      const failoverResolution = familyOf(model, provider)
+        ? resolveDispatchLeg({ provider, model }, readLatchState(subAgentEnv), {
+            env: subAgentEnv,
+          })
+        : { leg: { provider, model }, halted: false, hop: null, family: undefined };
+      if (failoverResolution.halted) {
+        return haltDispatchResult({
+          family: failoverResolution.family!,
+          provider,
+          model,
+          reason: failoverResolution.haltReason ?? "halt",
+          state: readLatchState(subAgentEnv),
+        });
+      }
+      const family = failoverResolution.family; // undefined = not a chain member
+      let dispatchLeg: LegRef = failoverResolution.leg;
+      // #476: one dispatch-chain nonce shared by the child's marker stream
+      // and this decision table (spawnSubAgent REUSES a caller-set
+      // TASK_HEARTBEAT_NONCE instead of generating its own).
+      if (failoverActive && family) subAgentEnv.TASK_HEARTBEAT_NONCE = randomBytes(6).toString("hex");
+      const buildArgs = (leg: LegRef): string[] =>
+        ["-p", "--provider", leg.provider, "--model", leg.model, "--no-session", params.prompt];
+      const spawnLeg = (leg: LegRef) => spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal);
 
-      // #152: provider auto-fallback — the retry wrapper only re-runs on
-      // zero-output; a connection-error death returns a DEFINED result
-      // (non-zero exit + error text) so it exits as "success". Detect that
-      // signature on a qwen provider and dispatch ONCE on the fallback model
-      // (TASK_FALLBACK_MODEL, default deepseek-v4-pro). Max 1 fallback — the
-      // fallback dispatch's own result is never re-checked, so no loop.
+      let result = await retry(() => spawnLeg(dispatchLeg), retryOptions);
+
+      // #476 post-dispatch decision loop — extracted runner (unit-tested with
+      // a scripted spawn; the real spawn fn is injected here). Bounded:
+      // markerless connection-error advances cap at MAX_FAILOVER_HOPS; marker
+      // advances are chain-bounded. A halt class (all legs exhausted/blocked)
+      // returns the structured halt result (attempted=true — a leg ran).
+      const loopOut = await runFailoverDecisionLoop({
+        family,
+        failoverActive,
+        dispatchLeg,
+        result,
+        env: subAgentEnv,
+        spawn: async (leg) => {
+          const legResult = await retry(() => spawnLeg(leg), retryOptions);
+          return legResult;
+        },
+        onHop: (leg, hopCount, annotations) => {
+          console.log(
+            `[builtin-tools] provider-exhaustion failover: exhausted/error leg → ${leg.provider}/${leg.model} (hop ${hopCount}${annotations.failoverMarker ? `, marker=${annotations.failoverMarker}` : ""})`,
+          );
+        },
+      });
+      if (loopOut.halted) {
+        return haltDispatchResult({
+          family: loopOut.halted.family,
+          provider: loopOut.halted.provider,
+          model: loopOut.halted.model,
+          reason: loopOut.halted.reason,
+          state: readLatchState(subAgentEnv),
+          attempted: true,
+        });
+      }
+      result = loopOut.result;
+      dispatchLeg = loopOut.dispatchLeg;
+
+      // #152: provider auto-fallback — legacy qwen connection-error storm
+      // path, kept for NON-family models AND when the #476 kill switch is set
+      // (PROVIDER_FAILOVER_DISABLE=1 restores the pre-476 must-stay legacy
+      // behavior — review round-5 P3-3). A family's hop legs route through
+      // the #476 decision loop instead, so no double fallback.
       const fallbackDisabled = process.env.TASK_FALLBACK_DISABLE === "1";
       const fallbackModel = getFallbackModel();
       if (
         !fallbackDisabled &&
+        (!family || !failoverActive) &&
         result.status === "success" &&
         result.value &&
         shouldFallback({
