@@ -519,9 +519,14 @@ const SCHEME_FRONTED_LOCAL = /https?:\/\/[^\s]*(?:localhost|127\.0\.0\.1|0\.0\.0
  * parent). */
 const DUMP_CONTINUATION = /^\s+(?:at |caused by:|cause:?|\[cause\]:?|errno:?|code:?|syscall:?|address:?|port:?)/i;
 
-/** Connection-family signatures — when they address a LOOPBACK target the death
- * is local (a refused/dropped connection TO a loopback address is never a
- * provider proxy hop worth re-dispatching). */
+/** Connection-family signatures — co-located with a loopback target on the same
+ * (folded) line, the death is LOCAL: a refused/dropped connection whose text
+ * names a loopback address is local-dependency noise (doomed re-dispatch cannot
+ * help), and genuine provider deaths never carry loopback text in real
+ * node/pi stderr. This is a conservative co-location heuristic (accepted
+ * tradeoff: exhaustion/provider evidence co-occurring with a loopback token on
+ * the same line is also dropped — verified unreachable in realistic pi-child
+ * output, round-6). */
 const CONNECTION_SIG = /(?:connection error|connection lost|other side closed|stream ended|terminated|econnreset|econnrefused|enotfound|etimedout|epipe|socket hang up|network error|connect timed out|fetch failed)/i;
 
 /** Anchor window (chars, either direction) for phrase matches on the
@@ -585,10 +590,12 @@ export function stripLocalLines(text: string): string {
 	return folded
 		.filter((line) => {
 			if (!LOCAL_TARGET.test(line)) return true;
-			// A connection-family signature addressing a loopback target is a
-			// local-dependency death, never a proxy hop — drop regardless of any
-			// preceding strong token (round-5: "Error: Local API request failed\n
-			// cause: connect ECONNREFUSED 127.0.0.1" must stay none).
+			// Co-location heuristic: any connection-family token on a line that
+			// bears a loopback target drops — a refused connection whose text
+			// names loopback is a local-dependency death (round-5: "Error: Local
+			// API request failed\n cause: connect ECONNREFUSED 127.0.0.1" must
+			// stay none). Genuine provider deaths never carry loopback text
+			// (round-6: verified against real node/pi dumps + proxy sim).
 			if (CONNECTION_SIG.test(line)) return false;
 			// Remove scheme-fronted local URLs (their own path/scheme can carry
 			// api/http tokens that must not read as a provider transport).
