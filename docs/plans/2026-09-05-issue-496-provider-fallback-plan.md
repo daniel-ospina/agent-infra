@@ -57,13 +57,15 @@ Gating (all must hold or → `"none"`):
 3. **TWO-PASS SCAN over each scanned field** (`errorMessage`, stderr-TAIL, and output when
    scanned):
    - **TEXT PRE-CLEAN** (both passes) — `stripLocalLines` drops WHOLE lines that
-     reference loopback/unix targets UNLESS the line also carries a strong
-     transport token (`https?|api|provider|upstream`): a down localhost DB /
-     docker daemon is local-dependency noise, but a line naming BOTH a loopback
-     hop AND a provider transport ("402 from https://api.deepseek.com via
-     localhost:8080" — a proxy fronting the provider) keeps its signature
-     (round-3 refinement: the round-2 whole-line drop missed proxy-fronted
-     provider lines).
+     reference loopback/unix targets UNLESS the line reads as a provider transport
+     with a local proxy HOP: a scheme-fronted loopback authority
+     (`http://localhost:8000/api` — the /api is the LOCAL url's own path) is always
+     local; otherwise the line survives only when a strong transport token
+     (`https?|api|provider|upstream`) PRECEDES the loopback reference (a
+     "via/through <loopback>" hop reads after the provider host — "402 from
+     https://api.deepseek.com via localhost:8080"). Round-3: the round-2
+     any-token-on-line refinement re-admitted pure-local lines whose local URL
+     carried /api tokens — now closed.
    - **PHRASE scan on STRIPPED text** — first remove stack-frame tails
      (`[\w$@./:-]+:\d+(?::\d+)?` — `index.ts:402:11`, `loader:507:10`,
      `lib/api/request.js:402:11`, `src/provider.ts:507:10`), then match the text phrases
@@ -102,8 +104,11 @@ Gating (all must hold or → `"none"`):
    (`PHRASE_COLOCATION_WINDOW`), so bare or remote-topic "terminated"/"no
    credits"/"rate limit" prose never re-runs the task (round-3: co-location
    replaced the round-2 anywhere-in-field anchor test, which still latched
-   transport-adjacent topic prose). A clean exit whose output merely MENTIONS a
-   phrase is not a provider failure. `stopReason === "cut"` classifies
+   transport-adjacent topic prose). Numeric matches on the transcript channel
+   likewise require the STRONG anchor inside the ≤25-char window (the loose
+   request/message tokens never qualify on prose — round-3 closure). A clean exit
+   whose output merely MENTIONS a phrase is not a provider failure.
+   `stopReason === "cut"` classifies
    via the always-scanned `errorMessage`/stderr-TAIL fields ONLY (a cut's exitCode stays 0
    — its output content is NOT scanned; a marker-less cut = no signature in either field =
    bug-crash/backstop/OOM — the #476 "bug-crash must not latch" analog; a cut that
@@ -132,9 +137,11 @@ transport token, duration/measurement shapes (`api responded in 512ms`,
 `{"message":"done","elapsed":"500ms"}`, `upstream ok in 500ms`, AND the
 space-delimited/decimal/spelled/uppercase forms `api responded in 500 ms`,
 `request took 402 ms to complete`, `upstream latency 402.5 ms`, `500 msec`,
-`402 seconds`, `500 SEC`, `500 MB` — code-review rounds), loopback-only local
+`402 seconds`, `500 SEC`, `500 MB`, throughput/binary `500 Kbps`, `500 MiB`
+— code-review rounds), loopback-only local
 dependency failures (`Error: connect ECONNREFUSED 127.0.0.1:5432`, docker daemon
-`unix://` line), composed-output prose without/remote from a transport anchor ("The
+`unix://` line, `http://localhost:8000/api` scheme-fronted URLs, token-after-hop
+lines), composed-output prose without/remote from a transport anchor ("The
 background process was terminated by the supervisor.", a budget/status note about
 no credits), and a stale early blip >8KB before a non-provider terminal error —
 including one whose terminal frame carries transport-ish tokens
@@ -367,5 +374,11 @@ extension-farm CI wiring). New + existing suites run locally via the repo recipe
   loopback-line drops now spare proxy-fronted provider lines; the exhaustion gate reads
   the child's RESOLVED model (`result.model ?? agent.model`) so model-less qwen-default
   sessions still get cross-account 402 recovery; the stderr window gets a 128B overlap.
-  Final suite counts: index.test.ts 105/105, provider-fallback.test.ts 13/13, real-pi
+  **Round-3 closures:** scheme-fronted local URLs (`http://localhost:8000/api` — the
+  local path's own tokens) are dropped again (strong token must PRECEDE the loopback
+  hop); UNIT_RE covers compound/binary forms (`Kbps`, `MiB`); transcript numerics
+  require the STRONG anchor inside the 25-char window (loose `request`/`message` prose
+  never re-runs); `msg.model` fill is typeof-string guarded (unvalidated child JSON can
+  never crash the family resolver).
+  Final suite counts: index.test.ts 107/107, provider-fallback.test.ts 13/13, real-pi
   suites green.

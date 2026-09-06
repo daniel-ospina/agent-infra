@@ -505,6 +505,10 @@ const OUTPUT_PHRASE_ANCHOR = /(?:https?|api|provider|upstream)/i;
 /** Loopback/unix targets — local-dependency lines, never provider evidence. */
 const LOCAL_TARGET = /(?:127\.0\.0\.1|localhost|::1|unix:|0\.0\.0\.0)/i;
 
+/** A scheme-fronted loopback authority (`http://localhost:8000/api`) — the local
+ * URL's own path may carry strong tokens; the target is still local. */
+const SCHEME_FRONTED_LOCAL = /https?:\/\/[^/\s]*(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])/i;
+
 /** Anchor window (chars, either direction) for phrase matches on the
  * composed-output channel (round-3: co-location, not anywhere-in-field). */
 const PHRASE_COLOCATION_WINDOW = 40;
@@ -517,9 +521,11 @@ const PHRASE_COLOCATION_WINDOW = 40;
  * while `HTTP 429` and `402 {` keep matching. */
 const NUMERIC_STATUS = /(?<![\w$@./:-])(402|429|5\d\d)(?![a-zA-Z])/g;
 
-/** Unit tokens (case-insensitive) that mark a measurement/duration context when
- * they follow a numeric candidate (optional space/decimal between). */
-const UNIT_RE = /^(?:ms|us|ns|mb|kb|gb|b|s|m|h|msec|sec|bytes?|milliseconds?|seconds?|minutes?|hours?)$/i;
+/** Unit tokens (case-insensitive) that mark a measurement/throughput context when
+ * they follow a numeric candidate (optional space/decimal between): durations
+ * (ms/us/ns/sec/min/hr + spelled), bytes/binary (b/kb/mb/gb/KiB/MiB), and bit
+ * rates (bps/Kbps/Mbps…). */
+const UNIT_RE = /^(?:ms|us|ns|msec|sec|bytes?|milliseconds?|seconds?|minutes?|hours?|[kmgt]?bps|[kmgt]i?b|s|m|h|b)$/i;
 
 function unitSuffixFollows(text: string, from: number): boolean {
 	const m = /^\s*\.?\d*\s*([a-z]+)/i.exec(text.slice(from));
@@ -540,16 +546,26 @@ export function stripStackFrames(text: string): string {
 	return text.replace(/[\w$@./:-]+:\d+(?::\d+)?/g, "");
 }
 
-/** #496: strip LINES that reference loopback/unix targets UNLESS the line also
- * carries a strong transport token — a down localhost DB / docker daemon is
- * local-dependency noise (a doomed re-dispatch cannot help it), but a line
- * naming BOTH a loopback hop AND a provider transport ("402 from
- * https://api.deepseek.com via localhost:8080" — dev/corporate proxies fronting
- * the provider) keeps its genuine signature. */
+/** #496: strip LINES that reference loopback/unix targets UNLESS the line reads
+ * as a provider transport with a local proxy HOP — a down localhost DB / docker
+ * daemon / local MCP server is local-dependency noise (a doomed re-dispatch
+ * cannot help it), but "402 from https://api.deepseek.com via localhost:8080"
+ * (provider host FIRST, loopback hop after) keeps its genuine signature.
+ * Whole-line drop rules (round-3): a scheme-fronted loopback authority
+ * (`http://localhost:8000/api` — the /api is the LOCAL url's own path) is always
+ * local; otherwise the line survives only when a strong transport token
+ * PRECEDES the loopback reference (a "via/through <loopback>" hop reads after
+ * the provider host in real proxy copy). */
 export function stripLocalLines(text: string): string {
 	return text
 		.split("\n")
-		.filter((line) => !(LOCAL_TARGET.test(line) && !OUTPUT_PHRASE_ANCHOR.test(line)))
+		.filter((line) => {
+			if (!LOCAL_TARGET.test(line)) return true;
+			if (SCHEME_FRONTED_LOCAL.test(line)) return false;
+			const localIdx = line.search(LOCAL_TARGET);
+			const strongIdx = line.search(OUTPUT_PHRASE_ANCHOR);
+			return strongIdx !== -1 && strongIdx < localIdx;
+		})
 		.join("\n");
 }
 
@@ -594,7 +610,12 @@ export function scanForProviderFailure(text: string, requireTransportAnchor = fa
 		if (unitSuffixFollows(cleaned, (m.index ?? 0) + m[0].length)) continue;
 		const before = cleaned.slice(Math.max(0, (m.index ?? 0) - 25), m.index ?? 0);
 		const after = cleaned.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 25);
-		if (NUMERIC_ANCHOR.test(before) || NUMERIC_ANCHOR.test(after)) return cls;
+		// Evidence channels (errorMessage/stderr) use the loose NUMERIC_ANCHOR;
+		// the composed-output (transcript) channel requires the STRONG anchor
+		// inside the window — a bug-crash transcript "the request failed with 500"
+		// (loose request/message words only) must not re-run the task (round-3).
+		const anchor = requireTransportAnchor ? OUTPUT_PHRASE_ANCHOR : NUMERIC_ANCHOR;
+		if (anchor.test(before) || anchor.test(after)) return cls;
 	}
 	return "none";
 }
@@ -1050,7 +1071,7 @@ export async function runSingleAgent(
 								currentResult.usage.cost += usage.cost?.total || 0;
 								currentResult.usage.contextTokens = usage.totalTokens || 0;
 							}
-							if (!currentResult.model && msg.model) currentResult.model = msg.model;
+							if (!currentResult.model && typeof msg.model === "string" && msg.model) currentResult.model = msg.model;
 							if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 							if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 						}

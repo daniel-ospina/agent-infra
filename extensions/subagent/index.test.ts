@@ -572,6 +572,15 @@ test("remote topic prose farther than the co-location window → none", () => {
 	equal(classifyProviderFailure(r), "none");
 });
 
+test("transcript numerics need the STRONG anchor inside the window (round-3)", () => {
+	// Loose request/message words in a bug-crash transcript must not re-run.
+	const loose = makeResult({ exitCode: 1, stopReason: "error", messages: [assistantMsg("the request failed with 500 and then my regex crashed")] });
+	equal(classifyProviderFailure(loose), "none");
+	// Genuine transport-adjacent numeric copy on the transcript still classifies.
+	const strong = makeResult({ exitCode: 1, stopReason: "error", messages: [assistantMsg("the api returned 500 for our request")] });
+	equal(classifyProviderFailure(strong), "provider");
+});
+
 test("stderr trailing-window: a stale early provider blip does not latch a later death", () => {
 	// A RECOVERED blip sits >8KB before the end (benign agent logs fill the gap);
 	// the terminal text is unrelated → the blip must not latch a bug crash —
@@ -655,6 +664,8 @@ test("space-delimited duration shapes → none (unit-suffix guard, code-review r
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "request took 402 seconds to complete" })), "none");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "upstream latency 500 SEC" })), "none", "uppercase unit forms excluded (case-insensitive guard)");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "response buffered in 500 MB" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "upstream throughput 500 Kbps" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "api downloaded 500 MiB" })), "none");
 });
 
 section("scanForProviderFailure / stripStackFrames — #496 two-pass scan");
@@ -673,6 +684,14 @@ test("stripLocalLines removes loopback-targeted lines only", () => {
 	equal(stripLocalLines("Connection error.\nrefused by localhost db\n402 from api.deepseek.com:443"), "Connection error.\n402 from api.deepseek.com:443");
 });
 
+test("stripLocalLines drops scheme-fronted local URLs and post-loopback tokens (round-3)", () => {
+	// The local URL's own /api path is NOT provider evidence.
+	equal(stripLocalLines("connection error to localhost:8080 api down"), "");
+	equal(stripLocalLines("request to http://localhost:8000/api failed, reason: connect ECONNREFUSED 127.0.0.1:8000"), "");
+	equal(stripLocalLines("fetch failed: connect ECONNREFUSED 127.0.0.1:3000/api/v1/health"), "");
+	equal(stripLocalLines("127.0.0.1:5432 down\n402 from api.deepseek.com:443"), "402 from api.deepseek.com:443");
+});
+
 // #496 mid-stream socket vocabulary aligned with pi's own retry.js (code-review
 // round: these terminal texts were empirically-verified misses).
 test("mid-stream socket/transport deaths classify as connection", () => {
@@ -687,6 +706,8 @@ test("loopback-only local-dependency failures → none (doomed re-dispatch must 
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "connect ECONNREFUSED localhost:5432" })), "none");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" })), "none");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Connection error. retrying localhost db" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "connection error to localhost:8080 api down" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "fetch failed: connect ECONNREFUSED 127.0.0.1:3000/api/v1/health" })), "none");
 });
 
 test("genuine provider transport line survives local-line stripping", () => {
