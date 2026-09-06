@@ -423,11 +423,16 @@ session_file_for() { # <sessionId> <cwd> -> first matching JSONL ("" if none)
     local sid="$1" cwd="$2" enc dir hit
     enc="$(printf '%s' "$cwd" | sed 's|^/||; s|/|-|g')"
     dir="$PI_SESSIONS_DIR/--${enc}--"
+    # Sid-token boundary match only (`_<sid>_` or `_<sid>.jsonl`): an open
+    # `*<sid>*.jsonl` glob could widen to a sibling session whose sid has
+    # this one as a substring and bind ITS idle proof (and settle re-probe
+    # file) to a candidate whose own session is active — foreign files never
+    # advance, so an active session could be TERM'd on stale proof.
     if [ -d "$dir" ]; then
-        hit="$(find "$dir" -maxdepth 1 \( -name "*_${sid}*.jsonl" -o -name "*${sid}*.jsonl" \) 2>/dev/null | head -1)"
+        hit="$(find "$dir" -maxdepth 1 \( -name "*_${sid}_*.jsonl" -o -name "*_${sid}.jsonl" \) 2>/dev/null | head -1)"
         [ -n "$hit" ] && { printf '%s\n' "$hit"; return 0; }
     fi
-    hit="$(find "$PI_SESSIONS_DIR" -name "*${sid}*.jsonl" -type f 2>/dev/null | head -1)"
+    hit="$(find "$PI_SESSIONS_DIR" \( -name "*_${sid}_*.jsonl" -o -name "*_${sid}.jsonl" \) -type f 2>/dev/null | head -1)"
     [ -n "$hit" ] && printf '%s\n' "$hit"
 }
 
@@ -497,6 +502,10 @@ classify_candidates() {
             [ -n "$rec" ] || continue
             rsid="$(printf '%s' "$rec" | awk -F'\t' '{print $6}')"
             rcwd="$(printf '%s' "$rec" | awk -F'\t' '{print $7}')"
+            # a sid carrying glob metachars would WIDEN the find match to
+            # arbitrary files — abstain (garbage store input never selects
+            # proof); real pi sids are 36-char hex+dash UUIDs
+            case "$rsid" in *[*?[]*) abstain=$((abstain+1)); continue ;; esac
             rf="$(session_file_for "$rsid" "$rcwd")"
             if [ -z "$rf" ] || [ ! -s "$rf" ]; then abstain=$((abstain+1)); continue; fi
             # framing byte in the REAL on-disk path (esc neutralizes store
@@ -707,8 +716,9 @@ run() {
     mkdir -p "${REAP_LOG%/*}" 2>/dev/null || true
     # fail-closed (ARMED passes only): an armed pass must never run with no
     # audit trail — if the log cannot be created/appended, abort (exit 3)
-    # before any signal. Dry-run / --list keep best-effort logging (their
-    # verdict surfaces are stdout, warn-first). Runs BEFORE the sentinel:
+    # before any signal. Dry-run — and --list when mode resolves to dry-run
+    # — keep best-effort logging (their verdict surfaces are stdout,
+    # warn-first). Runs BEFORE the sentinel:
     # an unwritable log aborts exit 3 even when disarmed (no silent
     # no-trail hourly exit-3s beyond the documented class).
     if [ "$MODE" = apply ] && ! : >>"$REAP_LOG" 2>/dev/null; then

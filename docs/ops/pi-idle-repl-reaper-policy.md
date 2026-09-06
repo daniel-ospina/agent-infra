@@ -84,8 +84,9 @@ leaders); per-pid fallback otherwise — documented limitation below.
   registry. Zero tty'd pi candidates skip the store read entirely (exit 0,
   footer written) so cmux-less machines never emit hourly ⚠️ noise.
 - Single-instance mkdir-lock (`~/.pi/agent/state/pi-reap-idle.lock`; macOS
-  has no flock). Stale rules: live owner older than
-  `REAP_LOCK_STALE_SECONDS` blocks the pass; dead owner / aged lock breaks.
+  has no flock). Stale rules: a live owner whose lock is younger than
+  `REAP_LOCK_STALE_SECONDS` (=1800) blocks the pass (exit 3); a dead owner
+  or a lock aged past the threshold is broken and the pass proceeds.
 - **Never touch:** the caller's own session or tty; any active session
   (sub-threshold or JSONL-moving); orchestrating marathons; headless pi;
   ghost records with no JSONL proof; session **files** (only processes are
