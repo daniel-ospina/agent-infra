@@ -174,8 +174,14 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
   signaling — survives the re-syncs that re-install the launchd job after an
   operator deliberately disarms it. Precedence: the ARMED log-writable probe
   runs before the sentinel check — an unwritable log aborts exit 3 even when
-  disarmed (the documented no-trail failure class; dry-run/`--list` keep
-  best-effort logging since their verdict surfaces are stdout).
+  disarmed (the documented no-trail failure class; dry-run — and `--list`
+  when mode resolves to dry-run — keep best-effort logging since their
+  verdict surfaces are stdout).
+
+- **Separator-byte fail-closed (round 4):** store-derived values strip the
+  0x1f unit separator (esc), and a deciding file that still carries it is
+  SETTLE-SKIPped (never signaled — what cannot be atomically re-probed is
+  never killed).
 
 ## Limitations + residuals
 

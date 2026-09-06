@@ -813,6 +813,44 @@ assert_not_contains "$(cat "$T/C26/kill.log")" "kill -TERM -20261" "C26 tied-twi
 assert_contains "$(cat "$T/C26/reap.log")" "activity advanced" "C26 tied-twin advance suppress reason logged"
 rm -rf "$T/C26"
 
+# C27a: dry-run + unwritable REAP_LOG -> exit 0, stdout verdict (no audit abort)
+mk_env C27a
+make_lookup "$T/C27a/date.lookup"
+idle30h_fixture C27a 20271 ttys339 c27a /Users/t/c27a
+mkdir "$T/C27a/reap.log"   # run_reaper hard-sets REAP_LOG=$T/C27a/reap.log
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 run_reaper C27a --dry-run 2>&1)"
+assert_eq "$?" "0" "C27a dry-run + unwritable log exits 0"
+assert_reap_eligible "$OUT" "C27a dry-run verdict still on stdout"
+rm -rf "$T/C27a"
+
+# C27b: --apply + sentinel + unwritable REAP_LOG -> exit 3 (probe precedes
+# sentinel; no silent no-trail armed pass)
+mk_env C27b
+make_lookup "$T/C27b/date.lookup"
+idle30h_fixture C27b 20272 ttys340 c27b /Users/t/c27b
+mkdir -p "$T/C27b/home/.pi/agent/state"
+touch "$T/C27b/home/.pi/agent/state/pi-reap-idle.disabled"
+mkdir "$T/C27b/reap.log"   # run_reaper hard-sets REAP_LOG=$T/C27b/reap.log
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 run_reaper C27b --apply 2>&1)"
+assert_eq "$?" "3" "C27b apply + sentinel + unwritable log exits 3 (probe first)"
+assert_contains "$OUT" "FAIL-CLOSED abort: REAP_LOG unwritable" "C27b stderr names the log abort"
+rm -rf "$T/C27b"
+
+# C27c: --apply + unwritable REAP_LOG -> exit 3 with stderr message
+mk_env C27c
+make_lookup "$T/C27c/date.lookup"
+idle30h_fixture C27c 20273 ttys341 c27c /Users/t/c27c
+mkdir "$T/C27c/reap.log"   # run_reaper hard-sets REAP_LOG=$T/C27c/reap.log
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 run_reaper C27c --apply 2>&1)"
+assert_eq "$?" "3" "C27c apply + unwritable log exits 3"
+assert_eq "$(cat "$T/C27c/kill.log" 2>/dev/null | wc -l | tr -d ' ')" "0" "C27c no signal before the abort"
+rm -rf "$T/C27c"
+
+# C27d: HOME unset survives (no set -u unbound crash); fail-closed exit
+OUT="$(env -u HOME REAP_LOG="/tmp/c27d-$$.log" bash "$REAPER" --help 2>&1)"
+assert_eq "$?" "0" "C27d env -u HOME --help exits 0 (no unbound crash)"
+rm -f "/tmp/c27d-$$.log"
+
 echo "════════════════════════════════════════════════════════════════"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -281,7 +281,9 @@ rows = []
 def esc(v):
     if v is None:
         return ""
-    return str(v).replace("\t", " ").replace("\n", " ")
+    # 0x1f (the settle tie-separator byte) is legal in APFS names — strip it
+    # from store-derived values so no deciding path can carry the separator.
+    return str(v).replace("\t", " ").replace("\n", " ").replace("\x1f", " ")
 for sid, rec in data.items():
     if not isinstance(rec, dict) or rec.get("pid") is None:
         continue
@@ -572,6 +574,13 @@ reap_one() { # <cand-line> <now>
     # settle 3: JSONL activity advanced since classification? Every deciding
     # (max-epoch) file is re-probed — an advance on ANY tied twin suppresses.
     while IFS= read -r sf; do
+        # fail-closed: a deciding file carrying a literal US byte cannot be
+        # re-probed atomically (esc() strips 0x1f from store values, so a
+        # fragment with US is a residual non-store path) — suppress rather
+        # than signal what cannot be re-verified.
+        case "$sf" in *"$(printf '\037')"*)
+            log "SETTLE-SKIP $pid deciding file contains separator byte — suppress"; return 0 ;;
+        esac
         [ -n "$sf" ] || continue
         fresh_epoch="$(jsonl_epoch_for "$sf")"
         if [ -n "$class_epoch" ] && [ -n "$fresh_epoch" ] && [ "$fresh_epoch" -gt "$class_epoch" ]; then
@@ -677,6 +686,7 @@ run() {
     fi
 
     if ! lock_acquire; then
+        echo "FAIL-CLOSED abort: lock held (exit 3)" >&2
         log "FAIL-CLOSED abort: lock (exit 3)"
         exit 3
     fi
@@ -725,6 +735,7 @@ run() {
             log "STORE read failed (attempt 1) — retrying once"
             sleep 1
             if ! store_read; then
+                echo "FAIL-CLOSED abort: cmux store missing/corrupt (attempt 2, exit 3)" >&2
                 log "FAIL-CLOSED abort: cmux store missing/corrupt (attempt 2, exit 3)"
                 log "MODE=$MODE NOW=$now THRESHOLD=$REAP_IDLE_HOURS CANDIDATES=$pre_count KILLED=0 YIELD=0"
                 exit 3
