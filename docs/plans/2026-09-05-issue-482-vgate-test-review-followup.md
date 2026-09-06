@@ -51,7 +51,10 @@ verified green: unit suite `197 passed / 0 failed` (worktree run), e2e suite has
 - **T3** — drop the post-block porcelain assert; KEEP the hook-decision pins (sweep1/sweep2
   `block===true` + reason names README.md + no-hash-mismatch + attached `-am"x"` block);
   after the ALLOWED bare `git commit -m x` verdict, execute it FOR REAL (Leg-A pattern) then
-  assert EXACT porcelain `equal(git(repo,"status --porcelain"), " M src/app.ts")`.
+  assert EXACT porcelain from RAW bytes: `equal(execSync("git status --porcelain", { cwd: repo,
+  encoding: "utf-8" }), " M src/app.ts\n")` — the `git()` helper trims, which would eat the
+  leading column space of the two-column status (" M " = worktree-modified, not "M " staged), so
+  raw bytes are REQUIRED (the trimmed form could never equal `" M src/app.ts"` — code-review F1).
 - **T4** — hoist the inline Step B delete literal into a shared UPPER_SNAKE const beside
   `FULL_05_CLEANUP_BLOCK` (L1386-1402); add a drift-guard test mirroring the 05 guard:
   source-checkout skip → `resolveRepoDoc` (same 3-path form) → doc-null `ok(false)` hard
@@ -147,7 +150,10 @@ single-slot-overwrite semantics — the least machinery with the same guarantee.
 
 ### T3 — **Option (1): minimal agreed shape (no new scenario, no index-object plumbing)**
 
-Selected: drop the tautological post-block porcelain assert after sweep1; after the ALLOWED
+Selected: drop the vacuous-but-green post-block porcelain assert after sweep1 (a blocked
+`-am` never executes, so it could only ever pass regardless of verdict — not provable tree
+invariance; it still guarded the Leg-A exemption/porcelain state at sweep time, but the
+hook-decision pins cover the rejection); after the ALLOWED
 bare `git commit -m x` verdict, execute `git(repo, "commit -m x")` for real (the Leg-A
 pattern at L1544/L1565) and assert exact porcelain. Why: the real commit turns a
 harness-only verdict into real index state, so the exact-porcelain assert now proves the
@@ -412,7 +418,7 @@ function isUnderOrAt(root: string, agentHome: string): boolean {
   // prefix-collision (~/.pi/agent2) cases): root IS the agent home, or lives under it.
   return root === agentHome || root.startsWith(agentHome + sep);
 }
-function isPiHomeLayout(): boolean {
+function isPiHomeLayout(agentHomeArg?: string): boolean {
   // Location probe: is this module's AGENT ROOT (= two hops up from the file, i.e. the .git
   // sibling that isSourceCheckout probes) the pi agent home? import.meta.url resolves
   // symlinks by default, so a canonical SYMLINKED install reports the real agent-infra path
@@ -422,10 +428,14 @@ function isPiHomeLayout(): boolean {
   // strictly under it), so the compare needs the exact-match arm isUnderOrAt(real, agentHome)
   // (real === agentHome OR startsWith(agentHome + sep)) — a bare startsWith(agentHome + sep)
   // misses the equal case ([SECOND-MODEL-GATE] P0 — verified in Node).
+  // Optional agentHomeArg (code-review F3, test-only): the module root is immutable
+  // in-process, so the classifier-test rows drive the REAL URL/realpath plumbing with
+  // synthetic agent-home inputs — default behavior (real homedir()) is unchanged and every
+  // existing call site (probeGuardLayout) is unaffected.
   try {
     const moduleDir = fileURLToPath(new URL("../../", import.meta.url)); // agent root
     const real = realpathSync(moduleDir);
-    const agentHome = realpathSync(join(homedir(), ".pi", "agent"));
+    const agentHome = realpathSync(agentHomeArg ?? join(homedir(), ".pi", "agent"));
     return isUnderOrAt(real, agentHome);
   } catch { return false; }
 }
@@ -457,7 +467,8 @@ function probeGuardLayout(fenceMarker: string, relFromHere: string, ...cwdRels: 
 ```
 
 U6 also needs import additions at the top of the file (with the existing `node:fs` /
-`node:path` imports): `fileURLToPath` from `node:url`; `sep` from `node:path`; `homedir`
+`node:path` imports): `fileURLToPath` from `node:url`; `sep` and `dirname` (code-review F3 —
+the parameterized `isPiHomeLayout` rows call it) from `node:path`; `homedir`
 from `node:os` (already imports `tmpdir`). The `section("doc drift test — 01-preflight
 VGATE-SHAPE-RULE fence ↔ exports")` header AFTER the block stays (content anchors are
 primary — the header sits at L1663/L1665, outside the replaced range).
@@ -502,6 +513,63 @@ test("classifyGuardLayout: 32-row decision table — git → source; pi-home →
   equal(isUnderOrAt("/Users/x/.pi/agent2", "/Users/x/.pi/agent"), false, "prefix collision (~/.pi/agent2) is NOT under ~/.pi/agent");
   equal(isUnderOrAt("/Users/x/.pi/agentsibling", "/Users/x/.pi/agent"), false, "sibling name is not under the agent home");
   equal(isUnderOrAt("/Users/x/repo", "/Users/x/.pi/agent"), false, "source checkout is not under the agent home");
+  // isPiHomeLayout real-plumbing TRUE-branch rows (code-review F3 — added post-implementation):
+  // the module root is immutable in-process, so these drive the REAL URL/realpath plumbing
+  // with SYNTHETIC agent-home inputs — the same philosophy as the isUnderOrAt rows above but
+  // one level up (exercising realpathSync + the arg plumbing + the compare). No committed
+  // context otherwise reaches the TRUE branch of the deployed discriminator: every committed
+  // run (source checkout, CI with actions/checkout, deployed pre-#482 copy) exercises the
+  // default-branch false path. Default-branch coverage stays sim-B (a physical copy under
+  // ~/.pi/agent — R4-F4): the module root cannot be moved in-process and a machine-dependent
+  // default assert (equal(isPiHomeLayout(), false)) was deliberately dropped (R4-F4).
+  const moduleRootReal = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
+  equal(isPiHomeLayout(moduleRootReal), true, "exact-match arm: agent home IS the module root (realpath plumbing live, TRUE branch)");
+  equal(isPiHomeLayout(dirname(moduleRootReal)), true, "module root under its parent → TRUE branch via realpathSync");
+  equal(isPiHomeLayout(realpathSync(join(moduleRootReal, "extensions"))), false, "existing child of the module root as agent home → not an ancestor → false via the real compare (extensions/ always exists where this suite runs)");
+  equal(isPiHomeLayout(join(moduleRootReal, "__no_such_dir__")), false, "nonexistent agent-home arg → realpathSync throws → catch arm returns false");
+  // isCIEnv pure env-parsing rows (code-review F8) — mirror the isUnderOrAt literal-row
+  // pattern on the pure env-parse surface (GITHUB_ACTIONS === "true" wins outright; CI parses
+  // as truthy = length>0, not "0", not case-insensitive "false"). Exact save/restore of the
+  // two vars (presence + value) in a finally-style tail — the harness is synchronous/
+  // sequential so mid-test mutation is safe, but the tail ALWAYS restores.
+  const hadGA = Object.prototype.hasOwnProperty.call(process.env, "GITHUB_ACTIONS");
+  const hadCI = Object.prototype.hasOwnProperty.call(process.env, "CI");
+  const savedGA = process.env.GITHUB_ACTIONS;
+  const savedCI = process.env.CI;
+  const setEnv = (ga: string | undefined, ci: string | undefined): void => {
+    if (ga === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = ga;
+    if (ci === undefined) delete process.env.CI; else process.env.CI = ci;
+  };
+  try {
+    setEnv("true", undefined);
+    equal(isCIEnv(), true, "GITHUB_ACTIONS=true, CI unset → true");
+    setEnv(undefined, "");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"\" → false (empty string is not a CI marker)");
+    setEnv(undefined, undefined);
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI unset → false");
+    setEnv(undefined, "0");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"0\" → false");
+    setEnv(undefined, "false");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"false\" → false");
+    setEnv(undefined, "FALSE");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"FALSE\" → false (case-insensitive)");
+    setEnv(undefined, "False");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"False\" → false (case-insensitive)");
+    setEnv(undefined, "1");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"1\" → true");
+    setEnv(undefined, "true");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"true\" → true");
+    setEnv(undefined, "TRUE");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"TRUE\" → true");
+    setEnv(undefined, "yes");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"yes\" → true");
+    setEnv("true", "false");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS=\"true\" AND CI=\"false\" → true (GITHUB_ACTIONS arm wins)");
+  } finally {
+    // Restore the original env EXACTLY (presence + value) even if a row above redded.
+    if (hadGA) process.env.GITHUB_ACTIONS = savedGA; else delete process.env.GITHUB_ACTIONS;
+    if (hadCI) process.env.CI = savedCI; else delete process.env.CI;
+  }
   // Exhaustive sweep over the 5-boolean probe tuple (32 rows). The expected-value function
   // below mirrors the 6-rule spec — see the LITERAL named rows above this sweep for the
   // binding decisions; the sweep's job is 32-row COVERAGE (classifier ↔ spec divergence on
@@ -554,23 +622,33 @@ test("#482 activation canary: drift-guard gate classifies an enforcement run (gi
   );
   // Consistency arm: reachable ONLY when the gate fired, i.e. !git AND ci AND !piHome — a
   // pi-home copy inheriting CI env is already skipped AT THE GATE (the `!isCIEnv() ||
-  // isPiHomeLayout()` arm) and never reaches here, so `deployed` here can only mean rule 5
-  // (CI env + resolvable FENCE-LESS doc — CI defers to the doc's fence state, R2-1). The
-  // guards soft-skip in agreement — a consistency outcome, NOT a wiring failure. (Cycle-3
-  // R4-2 reviewed and retained: the message is accurate for every REACHABLE state; a rule-2
-  // pi-home verdict cannot reach this arm — the gate above it already skipped. Noted so
-  // future refactors keep the gate above this arm.)
-  if (!isSourceCheckout() && layout === "deployed") {
+  // isPiHomeLayout()` arm) and never reaches here. The arm agrees+returns ONLY when the
+  // deployed verdict rests on a genuinely FENCE-LESS sibling doc (rule 5 — CI defers to the
+  // doc's fence state, R2-1; the guards soft-skip in agreement — a consistency outcome, NOT
+  // a wiring failure). The fencePresent === false premise is load-bearing (code-review F5):
+  // a FENCED doc misclassified deployed (a rule-4-under-CI regression) must NOT return here
+  // — it falls through so the equal(layout, "source") below reds it.
+  if (!isSourceCheckout() && layout === "deployed" && probe.fencePresent === false) {
     console.log("  ↪ canary consistency: CI env + fence-less sibling doc classifies deployed (rule 5) — guards soft-skip in agreement; no enforcement expected");
     return;
   }
+  // Reachable semantics of the equal below, stated honestly (code-review F5): in GIT runs
+  // rule 1 forces "source" before rules 2-6, so the assert cannot fail there — its teeth in
+  // git runs are the fence-precondition assert and the git-removal pin further down. The
+  // equal's genuine failing surface is the GIT-LESS CI run (the #482 headline layout for
+  // future tarball runs): there it detects a rule-4 regression (a FENCED doc classified
+  // deployed — the consistency arm above refused to return on fencePresent === true) or a
+  // rule-3 regression (CI + doc-null classified unknown/deployed instead of source). A
+  // deployed/unknown verdict in an enforcement layout means the drift guards are not
+  // enforcing.
   equal(layout, "source",
-    "drift-guard gate must classify THIS run as source (git marker present, or CI env + doc-null/fence-carrying doc) — a deployed/unknown verdict here means all three drift guards are not enforcing in an enforcement layout");
+    "drift-guard gate must classify THIS run as source (git marker present — rule 1; git-less CI + doc-null — rule 3; git-less CI + fence-carrying doc — rule 4) — a deployed verdict with a FENCED doc (rule-4 regression) or doc-null (rule-3 regression → unknown), or an unknown verdict, means all three drift guards are not enforcing in an enforcement layout");
   // No-doc arm: an enforcement layout with NO resolvable doc (rule 3 under CI, or rule 1 in
-  // a git checkout whose doc is missing) — the guards' doc-null hard-fail arms own the red
-  // (already proven by equal(layout,"source") → the guard proceeds to its doc-null ok(false));
-  // there is no fence to pin (canary-false-red fix, cycle-2 R1-2/R2-6/R4-F1 — the old
-  // unconditional fence assert redded exactly this layout, contradicting sim C-prime).
+  // a git checkout whose doc is missing) — reaching here means the equal above PASSED, i.e.
+  // the doc-null state classified source correctly (a rule-3 regression reds at the equal);
+  // the guards' doc-null hard-fail arms own the red; there is no fence to pin (canary-
+  // false-red fix, cycle-2 R1-2/R2-6/R4-F1 — the old unconditional fence assert redded
+  // exactly this layout, contradicting sim C-prime).
   if (docText === null) {
     console.log("  ↪ canary consistency: enforcement layout, no resolvable sibling doc — guards' doc-null arms fail closed; fence-precondition asserts skipped (no fence exists)");
     return;
@@ -588,7 +666,7 @@ test("#482 activation canary: drift-guard gate classifies an enforcement run (gi
     // home (git-removal → rule 2 deployed — exotic dev layout; rule 1 still enforces; the
     // cycle-1 equal(isPiHomeLayout(),false) pin is DROPPED — it protected nothing rule 1
     // doesn't already guarantee for git runs; location regression coverage = isUnderOrAt
-    // literal rows + sim B).
+    // literal rows + sim B + the parameterized isPiHomeLayout(agentHomeArg) rows, F3).
     equal(classifyGuardLayout({ ...probe, gitMarker: false }), "source",
       "removing THIS run's .git marker must still classify source via the fence OR-arm (rule 4) — real-probe wiring pin for the #482 headline layout");
   }
@@ -671,19 +749,32 @@ function seedD1Sentinel(bridgePath: string): void {
 }
 function assertD1BridgeUntouched(bridgePath: string, repoRoot: string, label: string): void {
   const after = existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null;
-  // Byte-identity is the PRIMARY detector (throws BEFORE the parse below — when the
-  // byte-equal passes, the content IS the sentinel, so the parse loop is defense-in-depth
-  // that can only ever see the sentinel's own foreign-root entry; it exists to catch a
-  // FUTURE loosening of the byte check to a per-field compare). Keep the parse AFTER the
-  // throwing equal — never reorder.
+  // ORDER (code-review F4): the repo-root scan runs FIRST on FOREIGN content; the throwing
+  // byte-equal LAST. Byte-identity remains the AUTHORITATIVE allow-only detector (null /
+  // non-JSON / different-shape contamination still reds there with the allow-only message
+  // below); the parse+root-scan that precedes it is diagnostics-only, restricted to foreign
+  // bytes — when the byte-equal passes, the content IS the sentinel, so a parse loop after
+  // it could only ever see the sentinel's own foreign-root entry (vacuous). Scanning first
+  // makes the loop LIVE: a self-blessing / real PASS write carrying an entry keyed under the
+  // scenario repo root reds with the precise "would survive recovery" diagnostic instead of
+  // a generic byte diff. Never drop the byte-equal (it is the gate); never reorder it
+  // before the scan (the scan is diagnostic, the equal decides).
+  const repoReal = realpathSync(repoRoot);
+  if (after !== null && after !== D1_SENTINEL_JSON) {
+    try {
+      const parsed = JSON.parse(after) as unknown;
+      if (parsed !== null && typeof parsed === "object" && Array.isArray((parsed as { verified_files?: unknown[] }).verified_files)) {
+        for (const vf of (parsed as { verified_files: { path: string }[] }).verified_files) {
+          const sepIdx = vf.path.indexOf("::");
+          if (sepIdx !== -1 && vf.path.slice(0, sepIdx) === repoReal) {
+            ok(false, `${label} — bridge contamination keyed under the scenario repo root (${repoReal}): ${vf.path} would survive recovery`);
+          }
+        }
+      }
+    } catch { /* not JSON — the byte-equal below owns the red */ }
+  }
   equal(after, D1_SENTINEL_JSON,
     `${label} — exempt op must leave the deterministic D1 sentinel bridge byte-identical (allow-only: no verifiedSet/bridge writes)`);
-  const repoReal = realpathSync(repoRoot);
-  for (const vf of (JSON.parse(after as string).verified_files ?? [])) {
-    const sepIdx = vf.path.indexOf("::");
-    ok(sepIdx === -1 || vf.path.slice(0, sepIdx) !== repoReal,
-      `${label} — no verified_files entry may be keyed under the scenario repo root (${repoReal}): ${vf.path} would survive recovery`);
-  }
 }
 ```
 
@@ -734,21 +825,31 @@ Keep the mixed-branch denial leg and its asserts untouched.
 
 ### E4 — Scenario 41 Leg B (L1570-1590): real commit + exact porcelain
 
-(a) DELETE the tautological sweep1-era assert
+(a) DELETE the sweep1-era porcelain assert — it was vacuous-but-green, not provably
+invariant: a blocked `-am` never executes, so the assert could only ever pass regardless of
+verdict (it still guarded the Leg-A exemption/porcelain state at sweep time, but the
+hook-verdict pins below already prove the sweep is rejected — code-review F9 wording).
+Historical deleted line:
 `ok(git(repo, "status --porcelain").includes(" M src/app.ts"), "the -a sweep did NOT commit the dirty code file (working tree still dirty)");`
-(blocked `-am` can never execute → invariant). Keep the sweep1/sweep2 hook-decision pins.
+Keep the sweep1/sweep2 hook-decision pins.
 
 (b) Replace the final block:
 
 ```ts
     equal(bare, undefined, "bare git commit -m over ONLY staged docs is exempt");
     // #482: make the allowed bare docs commit REAL (Leg-A pattern) and pin the exact
-    // porcelain — the old post-block porcelain assert was tautological (a blocked -am can
-    // never execute, so the tree was invariant). The real commit proves the docs exemption
-    // committed README.md ONLY and left the dirty UNSTAGED src/app.ts untouched.
+    // porcelain — the old post-block porcelain assert was vacuous-but-green: a blocked -am
+    // never executes, so it could only ever pass regardless of verdict. The real commit
+    // proves the docs exemption committed README.md ONLY and left the dirty UNSTAGED
+    // src/app.ts untouched (D2: -a sweeps and bundles never ride the docs exemption).
     git(repo, "commit -m x"); // execute the allowed docs commit for real
-    equal(git(repo, "status --porcelain"), " M src/app.ts",
-       "real bare docs commit must commit README.md only — porcelain exactly ' M src/app.ts' (dirty unstaged src/app.ts untouched; D2: -a sweeps and bundles never ride the docs exemption)");
+    // Raw porcelain read — the git() helper trims, which would eat the leading column
+    // space of the two-column status (" M " = worktree-modified, not "M " staged); the
+    // exact-porcelain pin needs the RAW bytes: exactly one line, no staged entries, no
+    // untracked files.
+    const porcelain = execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    equal(porcelain, " M src/app.ts\n",
+       "real bare docs commit must commit README.md only — raw porcelain exactly ' M src/app.ts' (dirty unstaged src/app.ts untouched; D2: -a sweeps and bundles never ride the docs exemption)");
   });
 ```
 
@@ -823,13 +924,21 @@ body and this plan instead of the workflow comment.
   checkout under `~/.pi/agent` keeps enforcing via rule 1 without a false-red (cycle-2
   R4-F3/F4). The cycle-1 `equal(isPiHomeLayout(), false)` location pin (R2-3) is DROPPED — it
   protected nothing rule 1 doesn't already guarantee for git runs; location regression
-  coverage lives in the pure `isUnderOrAt` rows + sim B. A CI-without-git run whose doc is
+  coverage lives in the pure `isUnderOrAt` rows, the parameterized `isPiHomeLayout(agentHomeArg)`
+  real-plumbing TRUE-branch rows folded into the classifier test (code-review F3: exact-match /
+  parent / existing-child-false / nonexistent-catch — the module root is immutable in-process,
+  so synthetic agent-home args drive the real URL/realpath plumbing), and sim B (the
+  default-branch, real-homedir path — still not committed: a machine-dependent default assert
+  stays deliberately dropped). A CI-without-git run whose doc is
   fence-less classifies `deployed` (rule 5) — the canary logs a consistency line and returns
-  (guards soft-skip in agreement; R2-1). In deployed/unknown runs it skips with an explicit
+  (guards soft-skip in agreement; R2-1) — now gated on `probe.fencePresent === false`
+  (code-review F5): a deployed verdict with a FENCED doc (rule-4-under-CI regression) falls
+  through and reds the `equal(layout, "source")` instead of being masked by the log. In deployed/unknown runs it skips with an explicit
   activation-gate log line (never red). Rules 2/5/6 REAL-wiring paths remain sim-B/C-verified
   (not CI-reachable in-repo: pi-home and doc-less layouts cannot be staged from a git checkout
   — documented residual); the location decision is additionally pinned by the classifier's
-  literal rows and the pure `isUnderOrAt` boundary rows (Phase-7 ISSUE-2).
+  literal rows, the pure `isUnderOrAt` boundary rows, and the parameterized `isPiHomeLayout`
+  rows (Phase-7 ISSUE-2 + code-review F3).
 
 ---
 
@@ -877,7 +986,7 @@ the captured output (a load crash must never be misread as a verdict); ④ `rm -
 | T1 deployed layout | **/tmp simulation B** (location probe — the headline rule-2 behavior): stage the extension copy under a FAKE pi-home (`HOME=/tmp/vg482-home`, tree at `/tmp/vg482-home/.pi/agent/extensions/{verification-gate,shared}/` + `/tmp/vg482-home/.pi/agent/skills/commit-workflow/` with the REAL deployed fence-less 01-preflight.md AND the fenced 04/05 docs, no `.git`) → suite green; EVERY guard logs the deployed skip (05/04 soft-skip by LOCATION even with fenced docs — proves the P1 fix). Variant B′: same tree with 01-preflight.md ALSO fenced → still deployed skips (rule 2 beats doc generation and CI). Variant B″ (plan-review R4-4 — reverse-HOME direction): same fake-pi-home tree run with `HOME=/tmp/vg482-third` (tree present, HOME FOREIGN, no CI env) → tuple git=F, ci=F, piHome=F, doc=T, fence=T → rule 4 → `source` → the fenced 04/05 guards ENFORCE (green — copied docs match fixtures; a mutated doc would RED) while the fence-less 01 → rule 5 → deployed skip: split-brain verdicts are a TESTED decision, not an emergent one (documented residual §6(d)). |
 | T1 unknown fail-closed | **/tmp simulation C**: extensions/verification-gate + shared copy ONLY (import closure — NO skills tree, no `.git`, no CI env per recipe step ②) → unit suite RED; evidence = the `⚠️ drift guard layout UNKNOWN` warn + the `ok(false)` failure (grep the red `❌`/`ok(false)` — do NOT require the UNKNOWN string alone, R4-2). **C-prime** (rule-3 arm evidence, cycle-2 canary fix verified): same doc-less tree with `CI=1` exported → suite RED via the guards' per-doc doc-null `ok(false)` messages (`…unreachable from the agent-infra source tree…`); the canary RUNS (CI outside pi-home → gate fires), `equal(layout,"source")` passes (rule 3), then it logs its no-doc consistency line (`↪ canary consistency: enforcement layout, no resolvable sibling doc…`) and returns GREEN — no false-red (cycle-2 R1-2/R2-6/R4-F1). |
 | T2 sentinel determinism | e2e green `50/0`; scenarios 38/39 output the byte-identical + parse asserts; run the e2e suite twice → identical results (sentinel write makes the D1 assertions ordering-independent). |
-| T3 real-commit porcelain | Scenario 41 green with the exact `equal(porcelain, " M src/app.ts")` after the REAL `git commit -m x`; the tautological sweep1 porcelain assert is gone. |
+| T3 real-commit porcelain | Scenario 41 green with the exact RAW-BYTE `equal(porcelain, " M src/app.ts\n")` (`execSync("git status --porcelain", { cwd: repo, encoding: "utf-8" })` — the `git()` helper's trim would eat the leading column space, so raw bytes are required) after the REAL `git commit -m x`; the vacuous-but-green sweep1 porcelain assert is gone (code-review F1). |
 | T4 const + drift guard | Unit green incl. `#482 drift guard: MERGE_DEPLOY_STEP_B_DELETE == …` (executes in this worktree); simulation-A mutation above proves it reds on doc drift while 05/01 stay green. |
 | Canary | `✅ #482 activation canary…` present in the worktree run and under `GITHUB_ACTIONS=true`; absent-as-skip in simulations A/B/C (no git/CI → logs its own skip line). |
 | CI wiring | `npx tsx` runs of both files green (the ci-main.yml command shape, run locally). |
@@ -889,7 +998,7 @@ Acceptance criteria (all must hold):
    deployed layout (fake pi-home, fenced 04/05 docs) soft-skips informatively by LOCATION,
    code-only archive fails closed loudly.
 4. `MERGE_DEPLOY_STEP_B_DELETE` used by the TRUE fixture test AND pinned by its drift guard.
-5. Scenario 41 executes the allowed docs commit and asserts exact porcelain ` M src/app.ts`.
+5. Scenario 41 executes the allowed docs commit and asserts exact RAW-BYTE porcelain `equal(porcelain, " M src/app.ts\n")` (raw `execSync` read — the `git()` helper's trim would eat the leading column space; code-review F1).
 6. No production file (`index.ts`) changed; no repo `.git` state touched by any verification.
 7. KNOWN OPEN GAP (rule 5, accepted, env-independent — R2-1): a `.git`-less, non-pi-home
    artifact in ANY env (CI-without-git doc-carrying runs included — rule 3 fires only for
@@ -971,7 +1080,7 @@ plan as scoped. Result: 1×P1 + 8×P2, ALL plan-doc issues (no design reversal),
 | R1-1 | P2 | U8 under-specifies the replaced range — L1668-1672 preamble comment ("enforcement runs only from isSourceCheckout") goes FALSE under the tri-state gate → **fixed**: comment included in U8's replaced range + replacement snippet given |
 | R1-2 | P2 | `DRIFT_GUARD_05_FENCE_MARKER` claimed single-source while the 05 guard's extraction keeps a second inline copy (L1518) with divergent slicing → **fixed**: U5 reuses the const in the extraction; U1 const comment documents the `bodyStart` slicing asymmetry |
 | R2-1 | P2 | Rule-3 `ci → source` fires before rule 5 → a CI+fence-less-doc tuple (vendored pre-#472 snapshot) hard-reds the structural arm, contradicting the deployed-skip contract; no literal table row pinned it → **fixed**: rule 3 restricted to `ci && !docResolvable` (doc present ⇒ CI defers to fence state); 3 new literal rows (`CI+doc+fence → source`, `CI+fence-less doc → deployed`, `CI+doc-null → source`); contract language made env-independent |
-| R2-2 | P2 | Canary in git runs proves only rule 1 — §3 claim "one canary + one table test cover all three guards' decision surfaces" overstates → **fixed**: honest coverage statement + canary consistency arm (CI+fence-less → deployed logs and returns) |
+| R2-2 | P2 | Canary in git runs proves only rule 1 — §3 claim "one canary + one table test cover all three guards' decision surfaces" overstates → **fixed**: honest coverage statement + canary consistency arm (CI+fence-less → deployed logs and returns). Code-review follow-up (F5): the arm's return is additionally gated on `probe.fencePresent === false` — a deployed verdict with a FENCED doc (rule-4-under-CI regression) falls through so `equal(layout,"source")` reds instead of the consistency log masking it |
 | R2-3 | P2 | `isPiHomeLayout` two-hop URL/realpath plumbing untested in any standard run → **fixed**: canary pins `equal(isPiHomeLayout(), false)` in git runs (guarded comment) |
 | R4-2 | P2 | Sim C's UNKNOWN evidence fires only without CI env; a shell exporting CI/GITHUB_ACTIONS yields rule-3 doc-null reds instead → **fixed**: env-unset in the recipe + evidence greps the red; C-prime variant (CI=1 → doc-null reds) exercises rule 3 |
 | R4-3 | P2 | Rule-4 real-probe wiring is CI-invisible (rule 1 shadows it; sim A manual-only) → **fixed**: canary git-removal pin (re-classify measured probe tuple with `gitMarker:false` → must stay `source`) + `probeGuardLayout` returns the probe tuple; committed-sim-script option documented as future work, not adopted (scope: test files only) |
@@ -989,7 +1098,7 @@ Cycle 1 exit: P1 fixed, 8×P2 fixed in-plan. Re-review (cycle 2) dispatched fres
 | R1-F2 | P2 | U6 preamble + U5 replacement comment overstate the CI arm ("CI env present → enforcement") vs the R2-1-restricted rule 3 (needs doc-null) — the code/comment drift class #482 exists to kill, in new comments → **fixed**: both comments carry the doc-resolvability qualifier |
 | R1-F3 | P2 | U8 introduces a second inline copy of the 01 fence opener (probe arg + parse `indexOf`) → **fixed**: local `const vgateOpen` shared by probe and parse (part-2 micro-edit swaps the parse line) |
 | R4-F3 | P2 | Canary git-removal pin/fence assert misattribute doc-missing/fence-less git-run states to wiring regressions (guards already red those with correct messages) → **fixed**: no-doc arm returns before the pins; git-removal pin gated on `probe.fencePresent === true`; fence-assert message names both readings (doc-drift OR regression) |
-| R4-F4 | P2 | `equal(isPiHomeLayout(), false)` + git-removal pin false-red an exotic legit layout (agent-infra cloned under `~/.pi/agent` — rule 1 still enforces; location pin protects nothing rule 1 doesn't already guarantee for git runs) → **fixed**: location pin DROPPED (cycle-1 R2-3 superseded; regression coverage = `isUnderOrAt` rows + sim B); pin block gated on `!probe.piHomeLayout` |
+| R4-F4 | P2 | `equal(isPiHomeLayout(), false)` + git-removal pin false-red an exotic legit layout (agent-infra cloned under `~/.pi/agent` — rule 1 still enforces; location pin protects nothing rule 1 doesn't already guarantee for git runs) → **fixed**: location pin DROPPED (cycle-1 R2-3 superseded; regression coverage = `isUnderOrAt` rows + sim B); pin block gated on `!probe.piHomeLayout`. Code-review follow-up (F3): committed TRUE-branch coverage ADDED via the parameterized `isPiHomeLayout(agentHomeArg)` real-plumbing rows folded into the classifier test (exact-match / parent / existing-child-false / nonexistent-catch); default-branch stays sim-B — no machine-dependent default assert |
 | R2-F2 | P2 | Canary skip log labels sim A — the #482 headline enforcement layout — "deployed/unknown run" (wrong diagnosis in the exact layout T1 exists to enforce) → **fixed**: skip log describes the activation GATE, not the layout verdict; sim-A evidence row updated |
 
 Cycle-2 exit: 2×P1 + 4×P2 fixed in-plan. Re-review (cycle 3) dispatched fresh.
@@ -1001,7 +1110,7 @@ Result: 0×P0/P1, 3×P2 — two real, one declined-with-reason:
 |---|---|---|
 | R1-1 | P2 | RANGE BOUNDARY notes + U8 part-2 carry off-by-one baseline citations (05 arm is L1512-1515 not L1511-1514; 01 arm L1682-1685 not L1683-1686; parse opener L1688 — "~L1689" points at the PROTECTED closer-search line) → **fixed**: three citations corrected to the verified baseline; part-2 now names the closer line explicitly as untouched |
 | R4-1 | P2 | Boundary notes cover only under-inclusion (placeholder); OVER-inclusion (selection swallows the kept doc-null arm) ships green in healthy runs and degrades doc-missing runs to a bare `TypeError` → **fixed**: over-inclusion warning added to both U5/U8 notes |
-| R4-2 | P2 | Consistency-arm log attributes rule 5 / "fence-less" for all deployed verdicts — claimed wrong for the pi-home-inherited-CI corner → **DECLINED**: the canary gate (`!isSourceCheckout() && (!isCIEnv() || isPiHomeLayout())` → skip) already returns pi-home+CI runs BEFORE the consistency arm, so `deployed` there is reachable only via rule 5 and the message is accurate for every reachable state; added a reachability note to the arm's comment so future refactors keep the gate above it |
+| R4-2 | P2 | Consistency-arm log attributes rule 5 / "fence-less" for all deployed verdicts — claimed wrong for the pi-home-inherited-CI corner → **DECLINED**: the canary gate (`!isSourceCheckout() && (!isCIEnv() || isPiHomeLayout())` → skip) already returns pi-home+CI runs BEFORE the consistency arm, so `deployed` there is reachable only via rule 5 and the message is accurate for every reachable state; added a reachability note to the arm's comment so future refactors keep the gate above it. Code-review follow-up (F5): the DECLINED rationale REMAINS TRUE and is now additionally ENFORCED — the arm's return also requires `probe.fencePresent === false`, so a rule-4 regression (deployed with a FENCED doc under CI) falls through and reds the `equal(layout,"source")` instead of being masked by the consistency log |
 
 Cycle-3 exit: real findings fixed, one declined with documented reasoning. Re-review (cycle 4)
 dispatched fresh for final verification.

@@ -65,19 +65,33 @@ function seedD1Sentinel(bridgePath: string): void {
 }
 function assertD1BridgeUntouched(bridgePath: string, repoRoot: string, label: string): void {
   const after = existsSync(bridgePath) ? readFileSync(bridgePath, "utf8") : null;
-  // Byte-identity is the PRIMARY detector (throws BEFORE the parse below — when the
-  // byte-equal passes, the content IS the sentinel, so the parse loop is defense-in-depth
-  // that can only ever see the sentinel's own foreign-root entry; it exists to catch a
-  // FUTURE loosening of the byte check to a per-field compare). Keep the parse AFTER the
-  // throwing equal — never reorder.
+  // ORDER: the repo-root scan runs FIRST on FOREIGN content; the throwing byte-equal LAST.
+  // Byte-identity remains the AUTHORITATIVE allow-only detector — null / non-JSON /
+  // different-shape contamination still reds there with the allow-only message below. The
+  // parse+root-scan that precedes it is diagnostics-only, restricted to foreign bytes:
+  // when the byte-equal passes, the content IS the sentinel, so a parse loop running AFTER
+  // it could only ever see the sentinel's own foreign-root entry (vacuous — contradicting
+  // this PR's no-vacuous-tests mandate). Scanning first makes the loop LIVE: the real
+  // contamination shape — a self-blessing / real PASS write that carries an entry keyed
+  // under the scenario repo root — now reds with the precise "would survive recovery"
+  // diagnostic instead of a generic byte diff. Never drop the byte-equal (it is the gate);
+  // never reorder it before the scan (the scan is diagnostic, the equal decides).
+  const repoReal = realpathSync(repoRoot);
+  if (after !== null && after !== D1_SENTINEL_JSON) {
+    try {
+      const parsed = JSON.parse(after) as unknown;
+      if (parsed !== null && typeof parsed === "object" && Array.isArray((parsed as { verified_files?: unknown[] }).verified_files)) {
+        for (const vf of (parsed as { verified_files: { path: string }[] }).verified_files) {
+          const sepIdx = vf.path.indexOf("::");
+          if (sepIdx !== -1 && vf.path.slice(0, sepIdx) === repoReal) {
+            ok(false, `${label} — bridge contamination keyed under the scenario repo root (${repoReal}): ${vf.path} would survive recovery`);
+          }
+        }
+      }
+    } catch { /* not JSON — the byte-equal below owns the red */ }
+  }
   equal(after, D1_SENTINEL_JSON,
     `${label} — exempt op must leave the deterministic D1 sentinel bridge byte-identical (allow-only: no verifiedSet/bridge writes)`);
-  const repoReal = realpathSync(repoRoot);
-  for (const vf of (JSON.parse(after as string).verified_files ?? [])) {
-    const sepIdx = vf.path.indexOf("::");
-    ok(sepIdx === -1 || vf.path.slice(0, sepIdx) !== repoReal,
-      `${label} — no verified_files entry may be keyed under the scenario repo root (${repoReal}): ${vf.path} would survive recovery`);
-  }
 }
 
 // #285: audit-trail reader (HOME is redirected to TEST_ROOT at load, so the
@@ -1611,8 +1625,10 @@ async function main() {
     ok(sweep1.reason.includes("README.md"), "-am block reason names the staged docs (unverified)");
     ok(!/Hash mismatch/.test(sweep1.reason),
        "re-edited staged docs must read as UNVERIFIED, never hash-mismatch — if the Leg-A exemption had registered README.md (D1 contamination), the r2 edit would stale-hash against it");
-    // #482: the sweep1 porcelain assert is DELETED — a BLOCKED -am can never execute, so
-    // the working tree was invariant regardless of verdict (tautological). The real
+    // #482: the sweep1 porcelain assert is DELETED — it was vacuous-but-green, not
+    // provably invariant: a blocked -am never executes, so the assert could only ever pass
+    // regardless of verdict (it still guarded the Leg-A exemption/porcelain state at sweep
+    // time, but the hook-verdict pins above already prove the sweep is rejected). The real
     // porcelain evidence now lives on the ALLOWED bare commit below (which executes).
     const sweep2 = await fire("tool_call", {
       type: "tool_call", toolName: "bash",
@@ -1625,10 +1641,10 @@ async function main() {
     });
     equal(bare, undefined, "bare git commit -m over ONLY staged docs is exempt");
     // #482: make the allowed bare docs commit REAL (Leg-A pattern) and pin the exact
-    // porcelain — the old post-block porcelain assert was tautological (a blocked -am can
-    // never execute, so the tree was invariant). The real commit proves the docs exemption
-    // committed README.md ONLY and left the dirty UNSTAGED src/app.ts untouched (D2: -a
-    // sweeps and bundles never ride the docs exemption).
+    // porcelain — the old post-block porcelain assert was vacuous-but-green: a blocked -am
+    // never executes, so it could only ever pass regardless of verdict. The real commit
+    // proves the docs exemption committed README.md ONLY and left the dirty UNSTAGED
+    // src/app.ts untouched (D2: -a sweeps and bundles never ride the docs exemption).
     git(repo, "commit -m x"); // execute the allowed docs commit for real
     // Raw porcelain read — the git() helper trims, which would eat the leading column
     // space of the two-column status (" M " = worktree-modified, not "M " staged); the

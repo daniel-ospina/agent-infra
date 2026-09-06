@@ -11,7 +11,7 @@ import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, r
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
-import { join, sep } from "node:path";
+import { join, sep, dirname } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -1535,7 +1535,9 @@ test("#472 fixture drift guard: FULL_05_CLEANUP_BLOCK == the live 05-cleanup.md 
   );
   if (layout === "deployed") { console.log(DRIFT_GUARD_SKIP_DEPLOYED); return; }
   if (layout === "unknown") { console.warn(DRIFT_GUARD_UNKNOWN_WARN); ok(false, DRIFT_GUARD_UNKNOWN_FAIL); return; }
-  // (doc-null hard-fail arm kept verbatim below — layout is source here, so the doc MUST be present)
+  // (doc-null hard-fail arm kept verbatim below — layout "source" does NOT imply the doc
+  // exists: rule 1 (doc deleted in a git checkout) and rule 3 (CI + no sibling doc) both
+  // reach this arm — the ok(false) below is the fail-closed red for those states, not dead code)
   if (docText === null) {
     ok(false, "05-cleanup.md unreachable from the agent-infra source tree — FULL_05_CLEANUP_BLOCK fixture drift guard would pass vacuously; restore the doc or fix the resolution");
     return;
@@ -1772,7 +1774,7 @@ function isUnderOrAt(root: string, agentHome: string): boolean {
   // covers a module tree AT the agent home — a bare startsWith(agentHome + sep) misses it).
   return root === agentHome || root.startsWith(agentHome + sep);
 }
-function isPiHomeLayout(): boolean {
+function isPiHomeLayout(agentHomeArg?: string): boolean {
   // Location probe: is this module's AGENT ROOT (= two hops up from the file — the .git
   // sibling that isSourceCheckout probes) the pi agent home? import.meta.url resolves
   // symlinks by default, so a canonical SYMLINKED install reports the real agent-infra path
@@ -1780,10 +1782,14 @@ function isPiHomeLayout(): boolean {
   // new URL("../../", import.meta.url) from …/extensions/verification-gate/index.test.ts
   // resolves to the AGENT ROOT (~/.pi/agent for the deployed copy — EQUAL to agentHome, not
   // strictly under it), so the compare needs isUnderOrAt's exact-match arm.
+  // Optional agentHomeArg (review F3, test-only): the module root is immutable in-process,
+  // so the classifier-test rows drive the REAL URL/realpath plumbing with synthetic
+  // agent-home inputs — default behavior (real homedir()) is unchanged and every existing
+  // call site (probeGuardLayout) is unaffected.
   try {
     const moduleDir = fileURLToPath(new URL("../../", import.meta.url)); // agent root
     const real = realpathSync(moduleDir);
-    const agentHome = realpathSync(join(homedir(), ".pi", "agent"));
+    const agentHome = realpathSync(agentHomeArg ?? join(homedir(), ".pi", "agent"));
     return isUnderOrAt(real, agentHome);
   } catch { return false; }
 }
@@ -1850,6 +1856,65 @@ test("classifyGuardLayout: 32-row decision table — git → source; pi-home →
   equal(isUnderOrAt("/Users/x/.pi/agent2", "/Users/x/.pi/agent"), false, "prefix collision (~/.pi/agent2) is NOT under ~/.pi/agent");
   equal(isUnderOrAt("/Users/x/.pi/agentsibling", "/Users/x/.pi/agent"), false, "sibling name is not under the agent home");
   equal(isUnderOrAt("/Users/x/repo", "/Users/x/.pi/agent"), false, "source checkout is not under the agent home");
+  // isPiHomeLayout real-plumbing TRUE-branch rows (review F3): the module root is immutable
+  // in-process, so these drive the REAL URL/realpath plumbing with SYNTHETIC agent-home
+  // inputs — the same philosophy as the isUnderOrAt rows above but one level up (exercising
+  // realpathSync + the arg plumbing + the compare). No committed context otherwise reaches
+  // the TRUE branch of the deployed discriminator: every committed run (source checkout, CI
+  // with actions/checkout, deployed pre-#482 copy) exercises the default-branch false path.
+  // Default-branch coverage stays sim-B (a physical copy under ~/.pi/agent — plan R4-F4):
+  // the module root cannot be moved in-process and a machine-dependent default assert
+  // (equal(isPiHomeLayout(), false)) was deliberately dropped (R4-F4) — these rows pin the
+  // realpath+compare+arg plumbing of the deployed discriminator's TRUE branch instead.
+  const moduleRootReal = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
+  equal(isPiHomeLayout(moduleRootReal), true, "exact-match arm: agent home IS the module root (realpath plumbing live, TRUE branch)");
+  equal(isPiHomeLayout(dirname(moduleRootReal)), true, "module root under its parent → TRUE branch via realpathSync");
+  equal(isPiHomeLayout(realpathSync(join(moduleRootReal, "extensions"))), false, "existing child of the module root as agent home → not an ancestor → false via the real compare (extensions/ always exists where this suite runs)");
+  equal(isPiHomeLayout(join(moduleRootReal, "__no_such_dir__")), false, "nonexistent agent-home arg → realpathSync throws → catch arm returns false");
+  // isCIEnv pure env-parsing rows (review F8) — mirror the isUnderOrAt literal-row pattern
+  // on the pure env-parse surface (GITHUB_ACTIONS === "true" wins outright; CI parses as
+  // truthy = length>0, not "0", not case-insensitive "false"). Exact save/restore of the
+  // two vars (presence + value): the harness is synchronous/sequential so mid-test mutation
+  // is safe, but the tail ALWAYS restores so subsequent suite sections see the original env.
+  const hadGA = Object.prototype.hasOwnProperty.call(process.env, "GITHUB_ACTIONS");
+  const hadCI = Object.prototype.hasOwnProperty.call(process.env, "CI");
+  const savedGA = process.env.GITHUB_ACTIONS;
+  const savedCI = process.env.CI;
+  const setEnv = (ga: string | undefined, ci: string | undefined): void => {
+    if (ga === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = ga;
+    if (ci === undefined) delete process.env.CI; else process.env.CI = ci;
+  };
+  try {
+    setEnv("true", undefined);
+    equal(isCIEnv(), true, "GITHUB_ACTIONS=true, CI unset → true");
+    setEnv(undefined, "");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"\" → false (empty string is not a CI marker)");
+    setEnv(undefined, undefined);
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI unset → false");
+    setEnv(undefined, "0");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"0\" → false");
+    setEnv(undefined, "false");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"false\" → false");
+    setEnv(undefined, "FALSE");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"FALSE\" → false (case-insensitive)");
+    setEnv(undefined, "False");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"False\" → false (case-insensitive)");
+    setEnv(undefined, "1");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"1\" → true");
+    setEnv(undefined, "true");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"true\" → true");
+    setEnv(undefined, "TRUE");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"TRUE\" → true");
+    setEnv(undefined, "yes");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"yes\" → true");
+    setEnv("true", "false");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS=\"true\" AND CI=\"false\" → true (GITHUB_ACTIONS arm wins)");
+  } finally {
+    // Restore the original env EXACTLY (presence + value) even if a row above redded —
+    // subsequent suite sections must see the original env.
+    if (hadGA) process.env.GITHUB_ACTIONS = savedGA; else delete process.env.GITHUB_ACTIONS;
+    if (hadCI) process.env.CI = savedCI; else delete process.env.CI;
+  }
   // Exhaustive sweep over the 5-boolean probe tuple (32 rows). The expected-value function
   // below mirrors the 6-rule spec — see the LITERAL named rows above this sweep for the
   // binding decisions; the sweep's job is 32-row COVERAGE (classifier ↔ spec divergence on
@@ -1902,18 +1967,30 @@ test("#482 activation canary: drift-guard gate classifies an enforcement run (gi
   );
   // Consistency arm: reachable ONLY when the gate fired, i.e. !git AND ci AND !piHome — a
   // pi-home copy inheriting CI env is already skipped AT THE GATE (the `!isCIEnv() ||
-  // isPiHomeLayout()` arm) and never reaches here, so `deployed` here can only mean rule 5
-  // (CI env + resolvable FENCE-LESS doc — CI defers to the doc's fence state). The guards
-  // soft-skip in agreement — a consistency outcome, NOT a wiring failure.
-  if (!isSourceCheckout() && layout === "deployed") {
+  // isPiHomeLayout()` arm) and never reaches here. The arm agrees+returns ONLY when the
+  // deployed verdict rests on a genuinely FENCE-LESS sibling doc (rule 5 — CI defers to the
+  // doc's fence state; the guards soft-skip in agreement — a consistency outcome, NOT a
+  // wiring failure). The fencePresent === false premise is load-bearing: a FENCED doc
+  // misclassified deployed (a rule-4-under-CI regression) must NOT return here — it falls
+  // through so the equal(layout, "source") below reds it.
+  if (!isSourceCheckout() && layout === "deployed" && probe.fencePresent === false) {
     console.log("  ↪ canary consistency: CI env + fence-less sibling doc classifies deployed (rule 5) — guards soft-skip in agreement; no enforcement expected");
     return;
   }
+  // Reachable semantics of the equal below, stated honestly: in GIT runs rule 1 forces
+  // "source" before rules 2-6, so the assert cannot fail there — its teeth in git runs are
+  // the fence-precondition assert and the git-removal pin further down. The equal's genuine
+  // failing surface is the GIT-LESS CI run (the #482 headline layout for future tarball
+  // runs): there it detects a rule-4 regression (a FENCED doc classified deployed — the
+  // consistency arm above refused to return on fencePresent === true) or a rule-3 regression
+  // (CI + doc-null classified unknown/deployed instead of source). A deployed/unknown
+  // verdict in an enforcement layout means the drift guards are not enforcing.
   equal(layout, "source",
-    "drift-guard gate must classify THIS run as source (git marker present, or CI env + doc-null/fence-carrying doc) — a deployed/unknown verdict here means all three drift guards are not enforcing in an enforcement layout");
+    "drift-guard gate must classify THIS run as source (git marker present — rule 1; git-less CI + doc-null — rule 3; git-less CI + fence-carrying doc — rule 4) — a deployed verdict with a FENCED doc (rule-4 regression) or doc-null (rule-3 regression → unknown), or an unknown verdict, means all three drift guards are not enforcing in an enforcement layout");
   // No-doc arm: an enforcement layout with NO resolvable doc (rule 3 under CI, or rule 1 in
-  // a git checkout whose doc is missing) — the guards' doc-null hard-fail arms own the red;
-  // there is no fence to pin.
+  // a git checkout whose doc is missing) — reaching here means the equal above PASSED, i.e.
+  // the doc-null state classified source correctly (a rule-3 regression reds at the equal);
+  // the guards' doc-null hard-fail arms own the red; there is no fence to pin.
   if (docText === null) {
     console.log("  ↪ canary consistency: enforcement layout, no resolvable sibling doc — guards' doc-null arms fail closed; fence-precondition asserts skipped (no fence exists)");
     return;
@@ -1954,7 +2031,9 @@ test("#472 drift guard: 01-preflight VGATE-SHAPE-RULE fence == SHAPE_EXEMPT_EXTE
   );
   if (layout === "deployed") { console.log(DRIFT_GUARD_SKIP_DEPLOYED); return; }
   if (layout === "unknown") { console.warn(DRIFT_GUARD_UNKNOWN_WARN); ok(false, DRIFT_GUARD_UNKNOWN_FAIL); return; }
-  // (doc-null hard-fail arm kept verbatim below — layout is source here, so the doc MUST be present)
+  // (doc-null hard-fail arm kept verbatim below — layout "source" does NOT imply the doc
+  // exists: rule 1 (doc deleted in a git checkout) and rule 3 (CI + no sibling doc) both
+  // reach this arm — the ok(false) below is the fail-closed red for those states, not dead code)
   if (docText === null) {
     ok(false, "01-preflight.md unreachable from the agent-infra source tree — VGATE-SHAPE-RULE drift guard would pass vacuously; restore the doc or fix the resolution");
     return;
