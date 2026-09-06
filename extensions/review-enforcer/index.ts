@@ -841,7 +841,7 @@ export default function (pi: ExtensionAPI) {
       // The gate counts ANY sub-agent dispatch: the `task` tool or the
       // specialized-agent `subagent` tool (extensions/subagent). Both are
       // sub-agent dispatches — the content-free floor (#485 F2) makes no
-      // quality distinction, and #825 second-model review flagged that a
+      // quality distinction, and the #485 second-model gate flagged that a
       // docs-only micro change reviewed via the `subagent` tool must not
       // false-block post-flip (micro relies on this counter as its only gate;
       // VGATE is shape-exempt and code review is skipped at micro).
