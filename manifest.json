@@ -21,6 +21,7 @@
         "repo-freshness.ts",
         "task-heartbeat.ts",
         "session-checks.ts",
+        "provider-exhaustion.ts",
         "carousel-designer.ts",
         "cmux-session.ts",
         "custom-provider-openrouter/",

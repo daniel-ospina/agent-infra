@@ -26,8 +26,20 @@ import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
-import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import {
+  resolveDispatchLeg,
+  decidePostDispatch,
+  haltDispatchResult,
+  resetLegBreakers,
+  recordLegStrike,
+  legBreakerOpen,
+  familyRootOf,
+  runFailoverDecisionLoop,
+} from "./index.js";
+import { readLatchState, setExhausted } from "../shared/provider-failover.js";
+import type { ExhaustionMarker, LegRef } from "../shared/provider-failover.js";
 import { dirname, resolve } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -431,7 +443,10 @@ test("task tool keeps legacy default provider for unresolvable models (#154)", (
       source.includes("startsWith(\"claude\") ? \"anthropic\" : \"deepseek\""),
     "unresolvable models must keep the legacy claude→anthropic / else→deepseek default",
   );
-  ok(source.includes("\"-p\", \"--provider\", provider, \"--model\", model"), "args must still pass --provider/--model explicitly");
+  ok(
+    source.includes("\"--provider\", leg.provider") && source.includes("\"--model\", leg.model"),
+    "#476 buildArgs must still pass --provider/--model explicitly per dispatch leg",
+  );
 });
 
 // ── loadModelRegistry / getModelsJsonPath (#154) ──────
@@ -2413,7 +2428,6 @@ test("session_end edge arms the completion watchdog; close composes via composeT
 // ── Results ───────────────────────────────────────────
 
 (async () => {
-  for (const t of asyncTests) await t();
 
 // ── #272: per-tick load scaling + monotonic latch (E15, E15b, E16) ────────
 function mkFirstMsg(streamAgeMs: number): HeartbeatState {
@@ -2478,6 +2492,664 @@ testAsync("E16: loop-level wiring — per-tick getLoad1() read + latched bound t
   ok(builtinSource.includes("const load1 = getLoad1()"), "#272 loop reads load1 fresh per tick");
 });
 
+
+// ── #476 provider-exhaustion failover — dispatch resolution + decision table ──
+
+section("#476 provider-exhaustion failover — resolveDispatchLeg / decidePostDispatch");
+
+/** Fresh hermetic agent dir (latch writes land here, never the live latch). */
+function freshFailoverEnv(): { env: Record<string, string | undefined>; cleanup: () => void } {
+  const dir = resolve(__dirname, `.tmp-failover-476-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(dir, { recursive: true });
+  const env: Record<string, string | undefined> = { ...process.env, PI_CODING_AGENT_DIR: dir };
+  delete env.PI_FAILOVER_NO_HOP;
+  delete env.TASK_EXHAUSTION_BLOCK;
+  delete env.TASK_EXHAUSTION_RERUN_AFTER_TOOLS;
+  delete env.PROVIDER_FAILOVER_DISABLE;
+  // default blocked set (qwen-tp) applies unless overridden per-test
+  return {
+    env,
+    cleanup: () => {
+      rmSync(dir, { recursive: true, force: true });
+      resetLegBreakers();
+    },
+  };
+}
+
+const FLASH_ROOT: LegRef = { provider: "deepseek", model: "deepseek-v4-flash" };
+const OPENROUTER_FLASH: LegRef = { provider: "openrouter", model: "deepseek/deepseek-v4-flash" };
+const QWENTP_FLASH: LegRef = { provider: "qwen-tp", model: "deepseek-v4-flash-0731" };
+
+function mkMarker(over: Partial<ExhaustionMarker>): ExhaustionMarker {
+  return {
+    kind: "provider-exhaustion",
+    hop: "deepseek->openrouter",
+    model: "deepseek-v4-flash",
+    reason: "402",
+    provider: "deepseek",
+    nonce: "deadbeef",
+    ...over,
+  };
+}
+
+function connErrResult(text = "[task] connection error: socket hang up"): {
+  content: Array<{ type: string; text: string }>;
+  details: Record<string, unknown>;
+} {
+  return { content: [{ type: "text", text }], details: { exitCode: 1 } };
+}
+
+test("familyRootOf maps the deepseek alias families to their root provider", () => {
+  equal(familyRootOf("deepseek-v4-flash"), "deepseek");
+  equal(familyRootOf("deepseek-v4-pro"), "deepseek");
+  equal(familyRootOf("not-a-family"), undefined);
+});
+
+test("resolveDispatchLeg: non-family + disabled env never hop (requested leg preserved)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // non-family
+    let out = resolveDispatchLeg(
+      { provider: "qwen", model: "qwen3.8-max" },
+      { version: 1, epoch: 0, updatedAt: "", primaries: {}, blockedLegs: {} },
+      { env },
+    );
+    equal(out.halted, false);
+    equal(out.hop, null);
+    deepEqual(out.leg, { provider: "qwen", model: "qwen3.8-max" });
+    equal(out.family, undefined);
+    // PROVIDER_FAILOVER_DISABLE=1 kill switch
+    env.PROVIDER_FAILOVER_DISABLE = "1";
+    out = resolveDispatchLeg(
+      FLASH_ROOT,
+      { version: 1, epoch: 0, updatedAt: "", primaries: {}, blockedLegs: {} },
+      { env },
+    );
+    equal(out.halted, false);
+    deepEqual(out.leg, FLASH_ROOT, "disabled → no hop");
+    delete env.PROVIDER_FAILOVER_DISABLE;
+  } finally {
+    cleanup();
+  }
+});
+
+test("resolveDispatchLeg: clear state → primary requested (no hop)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const out = resolveDispatchLeg(
+      FLASH_ROOT,
+      { version: 1, epoch: 0, updatedAt: "", primaries: {}, blockedLegs: {} },
+      { env },
+    );
+    equal(out.halted, false);
+    equal(out.hop, null);
+    deepEqual(out.leg, FLASH_ROOT);
+    equal(out.family, "deepseek-v4-flash");
+  } finally {
+    cleanup();
+  }
+});
+
+test("resolveDispatchLeg: latched root → resolves onto the first AVAILABLE chain leg (qwen-tp blocked → openrouter)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    setExhausted({
+      primaryProvider: "deepseek",
+      reason: "402",
+      source: "marker",
+      family: "deepseek-v4-flash",
+      fromLeg: FLASH_ROOT,
+      env,
+    });
+    const state = readLatchState(env);
+    equal(state.primaries.deepseek.status, "exhausted", "root record latched");
+    const out = resolveDispatchLeg(FLASH_ROOT, state, { env });
+    equal(out.halted, false);
+    // default blocked set excludes qwen-tp (401-blocked, sC2) → openrouter
+    deepEqual(out.leg, OPENROUTER_FLASH);
+    ok(out.hop!.includes("deepseek->"), "hop metadata present");
+  } finally {
+    cleanup();
+  }
+});
+
+test("resolveDispatchLeg: qwen-tp re-enabled via empty PROVIDER_FAILOVER_BLOCKED → resolves to qwen-tp leg", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    env.PROVIDER_FAILOVER_BLOCKED = ""; // config-only re-enable
+    setExhausted({
+      primaryProvider: "deepseek",
+      reason: "low_balance",
+      source: "marker",
+      family: "deepseek-v4-flash",
+      fromLeg: FLASH_ROOT,
+      env,
+    });
+    const out = resolveDispatchLeg(FLASH_ROOT, readLatchState(env), { env });
+    deepEqual(out.leg, QWENTP_FLASH, "qwen-tp leg first in chain when not blocked");
+  } finally {
+    cleanup();
+  }
+});
+
+test("resolveDispatchLeg: TASK_EXHAUSTION_BLOCK=1 + latched family → halt class (blocked)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    env.TASK_EXHAUSTION_BLOCK = "1";
+    setExhausted({
+      primaryProvider: "deepseek",
+      reason: "402",
+      source: "marker",
+      family: "deepseek-v4-flash",
+      fromLeg: FLASH_ROOT,
+      env,
+    });
+    const out = resolveDispatchLeg(FLASH_ROOT, readLatchState(env), { env });
+    equal(out.halted, true);
+    equal(out.haltReason, "blocked");
+    deepEqual(out.leg, FLASH_ROOT, "halt keeps the requested leg for reporting");
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: 402 marker pre-tool-call → durable latch + ADVANCE to chain leg", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: FLASH_ROOT,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: mkMarker({}),
+      env,
+    });
+    equal(decision.action, "advance");
+    deepEqual(decision.nextLeg, OPENROUTER_FLASH);
+    equal(decision.annotations.failoverLatched, true);
+    equal(decision.annotations.failoverMarker, "deepseek->openrouter");
+    // durable latch written BEFORE the decision returned (sync-write-before-retry)
+    const state = readLatchState(env);
+    const rec = state.primaries.deepseek;
+    ok(rec && rec.status === "exhausted" && rec.reason === "402" && rec.source === "marker");
+    deepEqual(rec.families["deepseek-v4-flash"].activeLeg, OPENROUTER_FLASH);
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: marker with UNWRITABLE state dir → failoverLatchFailed, never a false failoverLatched/advance (deep-review)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // read-only state dir: every latch write fails (EACCES) — the durable
+    // latch can NOT land. decidePostDispatch must not annotate
+    // failoverLatched:true (lie) nor advance/halt (resolveWithChain against an
+    // unlatched state would re-dispatch the possibly-dead account).
+    const stateDir = resolve(env.PI_CODING_AGENT_DIR!, "state");
+    mkdirSync(stateDir, { recursive: true });
+    chmodSync(stateDir, 0o555);
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: FLASH_ROOT,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: mkMarker({}),
+      env,
+    });
+    equal(decision.action, "return", "no durable latch → no advance");
+    equal(decision.nextLeg, null);
+    equal(decision.annotations.failoverLatched, false, "never claim a latch that did not land");
+    equal(decision.annotations.failoverLatchFailed, true, "write failure surfaced on the annotation");
+    const state = readLatchState(env);
+    ok(!state.primaries.deepseek, "no latch record durably written");
+  } finally {
+    chmodSync(resolve(env.PI_CODING_AGENT_DIR!, "state"), 0o755);
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: 402 marker AFTER tool calls → latch + RETURN (side-effect replay guard)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: FLASH_ROOT,
+      family: "deepseek-v4-flash",
+      sawTools: true,
+      marker: mkMarker({}),
+      env,
+    });
+    equal(decision.action, "return", "mid-run marker must NOT auto re-run by default");
+    equal(decision.nextLeg, null);
+    equal(decision.annotations.failoverMidRun, true);
+    // latch IS durable — the next dispatch resolves onto the hop leg
+    const state = readLatchState(env);
+    deepEqual(state.primaries.deepseek.families["deepseek-v4-flash"].activeLeg, OPENROUTER_FLASH);
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: TASK_EXHAUSTION_RERUN_AFTER_TOOLS=1 opts IN to the mid-run re-dispatch", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    env.TASK_EXHAUSTION_RERUN_AFTER_TOOLS = "1";
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: FLASH_ROOT,
+      family: "deepseek-v4-flash",
+      sawTools: true,
+      marker: mkMarker({}),
+      env,
+    });
+    equal(decision.action, "advance", "opt-in env re-enables the pre-tool-call behavior");
+    deepEqual(decision.nextLeg, OPENROUTER_FLASH);
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: marker with NO heartbeat markers (sawToolsUnknown) → conservative no-auto-rerun (review round-3 P2-2)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // TASK_HEARTBEAT_DISABLE=1 / emitter-failure class: the exhaustion marker
+    // arrived but the heartbeat marker stream carried ZERO markers → tool
+    // activity is UNKNOWN — never auto-rerun (side-effect replay guard).
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: FLASH_ROOT,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      sawToolsUnknown: true,
+      marker: mkMarker({}),
+      env,
+    });
+    equal(decision.action, "return", "unknown tool activity → no auto re-run");
+    equal(decision.nextLeg, null);
+    equal(decision.annotations.failoverMidRun, true);
+    equal(decision.annotations.failoverToolActivityKnown, false);
+    ok(
+      String(decision.annotations.failoverNote).includes("tool activity unknown"),
+      "note explains the unknown-activity conservative default",
+    );
+    // the latch IS durable — next dispatch hops
+    const state = readLatchState(env);
+    deepEqual(state.primaries.deepseek.families["deepseek-v4-flash"].activeLeg, OPENROUTER_FLASH);
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: blocked marker (401 auth-permanent) → annotation-only, never latch-exhaustion", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: OPENROUTER_FLASH,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: mkMarker({ reason: "blocked", provider: "openrouter", hop: "openrouter->x" }),
+      env,
+    });
+    equal(decision.action, "return");
+    equal(decision.annotations.failoverBlocked, true);
+    const state = readLatchState(env);
+    ok(state.blockedLegs.openrouter, "auth block recorded top-level (survives clear)");
+    ok(!state.primaries.openrouter, "blocked ≠ exhaustion — no primary latch record");
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: blocked marker with UNWRITABLE state dir → failoverLatchFailed, never claims exclusion (deep-review P2-4)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const stateDir = resolve(env.PI_CODING_AGENT_DIR!, "state");
+    mkdirSync(stateDir, { recursive: true });
+    chmodSync(stateDir, 0o555);
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: OPENROUTER_FLASH,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: mkMarker({ reason: "blocked", provider: "openrouter", hop: "openrouter->x" }),
+      env,
+    });
+    equal(decision.action, "return");
+    ok(decision.annotations.failoverBlocked !== true, "never claim exclusion without a durable fresh block");
+    equal(decision.annotations.failoverLatchFailed, true, "write failure surfaced");
+  } finally {
+    chmodSync(resolve(env.PI_CODING_AGENT_DIR!, "state"), 0o755);
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: healthy exit → return, no annotations, NEVER latch", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const decision = decidePostDispatch({
+      result: { content: [{ type: "text", text: "done" }], details: {} },
+      dispatched: FLASH_ROOT,
+      family: "deepseek-v4-flash",
+      sawTools: true,
+      marker: null,
+      env,
+    });
+    equal(decision.action, "return");
+    deepEqual(decision.annotations, {});
+    deepEqual(readLatchState(env), {
+      version: 1,
+      epoch: 0,
+      updatedAt: "",
+      primaries: {},
+      blockedLegs: {},
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: markerless bug-crash death → return (normal failure, no advance, no latch)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const decision = decidePostDispatch({
+      result: connErrResult("[task] sub-agent crashed with SIGSEGV — no output"),
+      dispatched: FLASH_ROOT,
+      family: "deepseek-v4-flash",
+      sawTools: true,
+      marker: null,
+      env,
+    });
+    equal(decision.action, "return", "markerless death on the PRIMARY leg → normal failure (legacy behavior)");
+    deepEqual(decision.annotations, {});
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: markerless connection-error on a HOP leg → advance to the NEXT chain leg (bounded)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    env.PROVIDER_FAILOVER_BLOCKED = ""; // qwen-tp is the FIRST hop leg; openrouter is next
+    // root exhausted → chain ACTIVE leg = qwen-tp (serving hop leg)
+    setExhausted({
+      primaryProvider: "deepseek",
+      reason: "402",
+      source: "marker",
+      family: "deepseek-v4-flash",
+      fromLeg: FLASH_ROOT,
+      env,
+    });
+    equal(readLatchState(env).primaries.deepseek.families["deepseek-v4-flash"].activeLeg.provider, "qwen-tp");
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: QWENTP_FLASH,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: null,
+      env,
+    });
+    equal(decision.action, "advance", "#152 storm signature routed through the chain");
+    deepEqual(decision.nextLeg, OPENROUTER_FLASH);
+    equal(decision.annotations.failoverConnectionAdvance, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: terminal hop leg connection-error → return (never re-walk past exhausted legs)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    setExhausted({
+      primaryProvider: "deepseek",
+      reason: "402",
+      source: "marker",
+      family: "deepseek-v4-flash",
+      fromLeg: FLASH_ROOT,
+      env,
+    });
+    // active leg is openrouter (terminal — last in chain when qwen-tp blocked)
+    equal(readLatchState(env).primaries.deepseek.families["deepseek-v4-flash"].activeLeg.provider, "openrouter");
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: OPENROUTER_FLASH,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: null,
+      env,
+    });
+    equal(decision.action, "return", "no leg after the terminal hop → normal failure");
+    ok(String(decision.annotations.failoverNote).includes("no advance"), "non-advance note present");
+  } finally {
+    cleanup();
+  }
+});
+
+test("leg circuit breaker: 2 connection-error strikes / 60s open the leg; open leg never advances", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    env.PROVIDER_FAILOVER_BLOCKED = "";
+    setExhausted({
+      primaryProvider: "deepseek",
+      reason: "402",
+      source: "marker",
+      family: "deepseek-v4-flash",
+      fromLeg: FLASH_ROOT,
+      env,
+    });
+    equal(recordLegStrike(QWENTP_FLASH), false, "strike 1 — count 1, not yet open");
+    equal(recordLegStrike(QWENTP_FLASH), true, "strike 2 — leg opens");
+    ok(legBreakerOpen(QWENTP_FLASH), "breaker open");
+    // fresh env (cleanup reset on a separate tmp dir is per-test) — re-check open leg via decision
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: QWENTP_FLASH,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: null,
+      env,
+    });
+    equal(decision.action, "return", "breaker-open leg → no advance");
+    ok(String(decision.annotations.failoverNote).includes("breaker-open"), "breaker-open note present");
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: non-family 402 marker → account-level latch only (no chain)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: { provider: "some-other", model: "legacy-model" },
+      family: undefined,
+      sawTools: false,
+      marker: mkMarker({ provider: "some-other", hop: "some-other->x" }),
+      env,
+    });
+    equal(decision.action, "return");
+    equal(decision.annotations.failoverLatched, true);
+    const state = readLatchState(env);
+    equal(state.primaries["some-other"].status, "exhausted");
+  } finally {
+    cleanup();
+  }
+});
+
+test("haltDispatchResult: structured halt class — content + failoverHalt details", () => {
+  const halt = haltDispatchResult({
+    family: "deepseek-v4-flash",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    reason: "halt",
+    state: { version: 1, epoch: 0, updatedAt: "", primaries: {}, blockedLegs: {} },
+  });
+  equal(halt.details.failoverHalt, true);
+  equal(halt.details.haltReason, "halt");
+  equal(halt.details.haltAttempted, false);
+  equal(halt.details.family, "deepseek-v4-flash");
+  ok(halt.content[0].text.includes("[provider-failover-halt]"), "halt class is human-identifiable");
+  ok(halt.content[0].text.includes("No dispatch was attempted"), "pre-dispatch halt says no dispatch");
+  const blocked = haltDispatchResult({
+    family: "deepseek-v4-flash",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    reason: "blocked",
+    state: {
+      version: 1,
+      epoch: 0,
+      updatedAt: "",
+      primaries: {},
+      blockedLegs: { "qwen-tp": { reason: "marker:blocked", at: "" } },
+    },
+  });
+  ok(blocked.content[0].text.includes("TASK_EXHAUSTION_BLOCK"), "blocked halt names the fail-fast env");
+  ok(blocked.content[0].text.includes("qwen-tp"), "blockedLegs surfaced in the halt text");
+  const attempted = haltDispatchResult({
+    family: "deepseek-v4-flash",
+    provider: "openrouter",
+    model: "deepseek/deepseek-v4-flash",
+    reason: "halt",
+    state: { version: 1, epoch: 0, updatedAt: "", primaries: {}, blockedLegs: {} },
+    attempted: true,
+  });
+  equal(attempted.details.haltAttempted, true);
+  ok(
+    attempted.content[0].text.includes("ran on openrouter/deepseek/deepseek-v4-flash and exhausted it"),
+    "mid-loop halt reports the leg that ran",
+  );
+});
+
+
+// ── runFailoverDecisionLoop (execute-level wiring, review round-5 P2-5) ──
+
+/** One runFailoverDecisionLoop invocation with a scripted spawn. envPatch is
+ * applied to the hermetic loop env BEFORE running (e.g. unblocking qwen-tp
+ * via PROVIDER_FAILOVER_BLOCKED=""). The INITIAL result carries the first
+ * leg's outcome — loop spawns happen only for hop legs (like execute()). */
+async function loopWith(
+  opts: {
+    scenario: "marker-walk-halt" | "blocked-halt" | "healthy" | "non-family-marker";
+    envPatch?: Record<string, string>;
+    initial?: { status: string; value?: { content?: any[]; details?: Record<string, unknown> } };
+  },
+): Promise<{ out: any; env: Record<string, string | undefined>; cleanup: () => void; spawned: LegRef[] }> {
+  const { env, cleanup } = freshFailoverEnv();
+  Object.assign(env, opts.envPatch ?? {});
+  const spawned: LegRef[] = [];
+  let call = 0;
+  const mk = (reason: string, provider: string, hop: string) => ({
+    kind: "provider-exhaustion",
+    hop,
+    model: "deepseek-v4-flash",
+    reason,
+    provider,
+    nonce: "loop-nonce",
+  });
+  const initial = opts.initial ?? { status: "success", value: { content: [], details: {} } };
+  if (opts.scenario === "marker-walk-halt") {
+    initial.value!.details!.exhaustionMarker = mk("402", "deepseek", "deepseek->qwen-tp");
+  }
+  if (opts.scenario === "blocked-halt") {
+    initial.value!.details!.exhaustionMarker = mk("402", "deepseek", "deepseek->qwen-tp");
+  }
+  if (opts.scenario === "non-family-marker") {
+    initial.value!.details!.exhaustionMarker = mk("402", "deepseek", "deepseek->deepseek");
+  }
+  const spawn = async (leg: LegRef) => {
+    spawned.push(leg);
+    call += 1;
+    if (opts.scenario === "marker-walk-halt") {
+      // hop legs die with authentic markers too — walk the WHOLE chain:
+      // root marker → qwen-tp → marker → openrouter → marker (terminal halt)
+      if (leg.provider === "qwen-tp") {
+        return { status: "success", value: { content: [], details: { exhaustionMarker: mk("402", "qwen-tp", "qwen-tp->openrouter") } } };
+      }
+      return { status: "success", value: { content: [], details: { exhaustionMarker: mk("402", "openrouter", "openrouter->terminal") } } };
+    }
+    if (opts.scenario === "blocked-halt") {
+      return { status: "success", value: { content: [], details: {} } };
+    }
+    return { status: "success", value: { content: [{ type: "text", text: "done" }], details: {} } };
+  };
+  const out = await runFailoverDecisionLoop({
+    family: opts.scenario === "non-family-marker" ? undefined : "deepseek-v4-flash",
+    failoverActive: true,
+    dispatchLeg: { provider: "deepseek", model: "deepseek-v4-flash" },
+    result: initial,
+    spawn,
+    env,
+  });
+  return { out, env, cleanup, spawned };
+}
+
+testAsync("runFailoverDecisionLoop: marker death on the root walks the WHOLE chain then halts on the terminal leg", async () => {
+  const t = await loopWith({
+    scenario: "marker-walk-halt",
+    envPatch: { PROVIDER_FAILOVER_BLOCKED: "" }, // qwen-tp hop enabled (default blocked)
+  });
+  try {
+    const { out, spawned, env: e } = t;
+    equal(spawned.length, 2, "hop legs spawned: qwen-tp then openrouter");
+    equal(spawned[0].provider, "qwen-tp");
+    equal(spawned[1].provider, "openrouter");
+    equal(out.hops, 2, "marker advances are chain-bounded (deepseek→qwen-tp→openrouter)");
+    ok(out.halted, "terminal openrouter marker → structured halt outcome");
+    equal(out.halted.reason, "halt");
+    equal(out.halted.provider, "openrouter", "halt reports the leg that exhausted");
+    // durable latch advanced all the way (sync-write-before-retry)
+    const state = readLatchState(e);
+    equal(state.primaries.deepseek.status, "exhausted");
+    ok(state.primaries.deepseek.families["deepseek-v4-flash"].terminal === true, "terminal flag set on full-chain walk");
+  } finally {
+    t.cleanup();
+  }
+});
+
+testAsync("runFailoverDecisionLoop: TASK_EXHAUSTION_BLOCK=1 mid-loop halt carries reason blocked", async () => {
+  const t = await loopWith({
+    scenario: "blocked-halt",
+    envPatch: { TASK_EXHAUSTION_BLOCK: "1", PROVIDER_FAILOVER_BLOCKED: "" },
+  });
+  try {
+    const { out } = t;
+    ok(out.halted, "halt outcome returned (a hop WOULD happen)");
+    equal(out.halted.reason, "blocked", "review P2-1: mid-loop halt reason derives from the env gate");
+    equal(out.halted.provider, "deepseek", "halt reports the leg that exhausted");
+  } finally {
+    t.cleanup();
+  }
+});
+
+testAsync("runFailoverDecisionLoop: non-family exhaustion marker → account latch single-shot, no hop loop", async () => {
+  const t = await loopWith({ scenario: "non-family-marker" });
+  try {
+    const { out, spawned, env: e } = t;
+    equal(spawned.length, 0, "no hop re-dispatch for a non-family model");
+    equal(out.halted, null);
+    ok(out.result.value.details.failoverLatched === true, "account-level latch annotation merged");
+    const state = readLatchState(e);
+    equal(state.primaries.deepseek.status, "exhausted", "marker.provider account latched");
+  } finally {
+    t.cleanup();
+  }
+});
+
+testAsync("runFailoverDecisionLoop: healthy result returns untouched (no annotations, no latch, no spawn)", async () => {
+  const t = await loopWith({ scenario: "healthy" });
+  try {
+    const { out, spawned, env: e } = t;
+    equal(spawned.length, 0);
+    equal(out.halted, null);
+    equal(out.result.value.details.failoverLatched, undefined, "healthy → no latch annotation");
+    const state = readLatchState(e);
+    deepEqual(state.primaries, {}, "healthy → latch file untouched");
+  } finally {
+    t.cleanup();
+  }
+});
+
+  for (const t of asyncTests) await t();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   if (failed > 0) {
     console.log("❌ SOME TESTS FAILED");

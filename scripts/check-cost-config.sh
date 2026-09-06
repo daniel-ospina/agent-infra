@@ -1,5 +1,5 @@
 #!/bin/bash
-# check-cost-config.sh — #341 drift guard: deepseek context clamp @400K.
+# check-cost-config.sh — #341 drift guard: deepseek context clamp @300K (shipped w/ #476 guard-sync).
 #
 # Config-as-authority: models.json is the runtime clamp surface (pi's
 # provider-composer resolves override.contextWindow ?? model.contextWindow —
@@ -8,7 +8,7 @@
 #
 # Semantics (detect-not-block for the catalog class — a hard red on the store
 # would break auto-sync when pi's refresh legitimately reverts it):
-#   models.json    drift (any deepseek-served id > 400000)  → BLOCK (exit 1)
+#   models.json    drift (any deepseek-served id > 300000)  → BLOCK (exit 1)
 #   settings.json  drift (compaction block / retry contract) → BLOCK (exit 1)
 #   models-store.json drift                                   → WARN (detected)
 #   MISSING shipped models.json / settings.json              → BLOCK (the
@@ -38,7 +38,7 @@ set -uo pipefail
 # python3 previously produced a PASS on an unparsed config).
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 required (stdlib only) — present on ubuntu-latest + macOS" >&2; exit 2; }
 
-CLAMP=400000
+CLAMP=300000
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SHIPPED_DIR="$ROOT/pi-bootstrap/pi-config"
 LIVE_DIR="${HOME}/.pi/agent"
@@ -149,15 +149,15 @@ except Exception as e:
 comp = d.get("compaction")
 if not isinstance(comp, dict):
     issues.append("compaction.reserveTokens expected 16384, got 'missing'")
-    issues.append("compaction.keepRecentTokens expected 20000, got 'missing'")
+    issues.append("compaction.keepRecentTokens expected 12000, got 'missing'")
     issues.append("compaction.enabled expected true, got 'missing'")
 else:
     if comp.get("enabled") is not True:
         issues.append(f"compaction.enabled expected true, got {q(comp.get('enabled'))}")
     if comp.get("reserveTokens") != 16384:
         issues.append(f"compaction.reserveTokens expected 16384, got {q(comp.get('reserveTokens'))}")
-    if comp.get("keepRecentTokens") != 20000:
-        issues.append(f"compaction.keepRecentTokens expected 20000, got {q(comp.get('keepRecentTokens'))}")
+    if comp.get("keepRecentTokens") != 12000:
+        issues.append(f"compaction.keepRecentTokens expected 12000, got {q(comp.get('keepRecentTokens'))}")
 
 retry = d.get("retry")
 mr = retry.get("maxRetries") if isinstance(retry, dict) else None
@@ -226,7 +226,7 @@ check_settings_file() {
       block "$label — $i"
     done <<< "$issues"
   else
-    ok "$label — compaction block (enabled + 16384/20000) + retry.maxRetries 10000"
+    ok "$label — compaction block (enabled + 16384/12000) + retry.maxRetries 10000"
   fi
 }
 

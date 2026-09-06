@@ -1863,6 +1863,12 @@ const HUB_READONLY_VERBS = new Set([
   "merge-one-file", "mergetool", "check-ref-format", "var", "hash-object",
   "count-objects", "verify-pack", "verify-commit", "verify-tag", "config",
   "reflog", "whatchanged", "cherry", "fsck",
+  // #444: check-ignore is a PURE QUERY (evaluates gitignore rules, writes
+  // nothing) — unknown-verb fail-closed previously false-blocked both the
+  // direct surface and hub-worktree.sh's `.worktrees/`-ignored check (the real
+  // hub-worktree.sh content must gate ALLOW once extractScriptPath resolves
+  // arg-taking scripts).
+  "check-ignore",
 ]);
 
 /** Mutating git verbs with NO sanctioned recovery form — always blocked. */
@@ -4560,19 +4566,38 @@ export function extractScriptPath(command) {
   if (i >= tokens.length) return null;
   const t = tokens[i];
   if (SHELL_INTERPRETERS.has(t)) {
-    // Round-19 (final gate P1): the script file is the LAST positional
-    // (non-flag, non-redirect) token before a boundary — `bash --rcfile decoy
-    // evil.sh`, `bash -O extglob evil.sh`, `bash < /dev/null -x evil.sh` all
-    // execute evil.sh (the old scan broke at the first flag-operand and gated
-    // the WRONG file — probe: evil.sh ran ungated). If no positional exists,
-    // a stdin redirect's operand IS the script (`bash < evil.sh`); `-c`/
-    // `--command` means an inline (return null — gated by the normal
-    // classifier); process substitution `<( … )` is an FD, not a file (null —
-    // _unverifiableGitContent fails closed on the content).
+    // (#444) The script operand is the FIRST non-flag, non-redirect positional
+    // after the interpreter — NOT the last. `bash script.sh <arg>...` hands
+    // the trailing tokens to the script as $1… (probe-verified against real
+    // bash), so the old last-positional rule resolved a trailing ARG (usually
+    // a non-file) and scriptGitVerdict never ran on the real script — the M4
+    // script-content closure (#1484 Slice E) was bypassed for argument-taking
+    // scripts (`bash hub-worktree.sh feat/x <repo>` gated <repo>). Round-19
+    // (final gate P1) semantics are preserved: `bash --rcfile decoy evil.sh`,
+    // `bash -O extglob evil.sh`, `bash < /dev/null -x evil.sh` all execute
+    // evil.sh — the FIRST positional IS evil.sh in each. Once the script
+    // operand is found the scan STOPS: later tokens are the script's own
+    // arguments, never parsed as bash flags.
+    //
+    // Stdin-program modes: `-s` (and any single-dash letter run CONTAINING s —
+    // bash parses -se/-es/-xs char-by-char) demotes every positional to
+    // $0/$1; the program then comes from stdin — a `< f` operand's file (f)
+    // or a heredoc body (#437 round-13 VGATE sub-case). `-c`/`--command` (and
+    // runs CONTAINING c — -ec/-sc/-cs; c consumes the next word as the
+    // command string) means an inline → return null (gated by the normal
+    // classifier). `--` ends option parsing: the NEXT operand is the script
+    // even when dash-leading (`bash -- x.sh -x aaa` → x.sh). Option operands:
+    // --rcfile/--init-file/-O/-o (space and `=`-attached forms) and the o/O
+    // run letters consume the following word. POSIX `+`-toggles mirror the
+    // letter runs (`bash +e evil.sh` runs evil.sh — +x/+e/+eu, bare `+`;
+    // +o/+O take an operand, +c is an inline, +s demotes like -s). Process
+    // substitution `<( … )` is an FD, not a file (null —
+    // _unverifiableGitContent fails closed).
     let j = i + 1;
-    let sawInline = false;
+    let sawInline = false;      // -c/--command → inline string (null)
+    let sawDashS = false;       // -s → positionals are $0/$1; program is stdin
+    let sawDoubleDash = false;  // -- → option parsing is over
     let stdinOperand = null;
-    let lastPositional = null;
     let sawProcessSub = false;
     while (j < tokens.length) {
       const n = tokens[j];
@@ -4583,31 +4608,49 @@ export function extractScriptPath(command) {
       if (n === "<(" || n.startsWith("<(")) { sawProcessSub = true; j++; continue; } // process substitution FD
       if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n)) {
         if (n === "<" || n === "<<" || n === "0<" || n === "0<<") {
-          stdinOperand = tokens[j + 1]; // the stdin file (script only if no positional follows)
+          stdinOperand = tokens[j + 1]; // the stdin file — the program only with -s, or without a script positional
         }
         j += 2;
         continue;
       }
       if (_isShellBoundary(n)) break;
-      if (n.startsWith("-")) {
-        // Round-20 (security P1): skip flag OPERANDS for operand-taking flags
-        // (`bash --rcfile decoy -c 'git commit'` broke at `decoy` and never
-        // walked the inline — probe committed to the hub). -c/--command handled
-        // above; --rcfile/--init-file/-O/-o take an operand; simple flags (-x,
-        // -e, -i) don't — conservatively skip the next token for all but known
-        // operand-less flags.
-        if (n === "-c" || n === "--command") { sawInline = true; j++; continue; }
-        j++;
-        if (n === "--rcfile" || n === "--init-file" || n === "-O" || n === "-o") j++;
+      if (sawDoubleDash) return n; // after `--` ANY operand is the script (dash-leading too)
+      if (n === "--") { sawDoubleDash = true; j++; continue; }
+      if (n === "-c" || n === "--command" || n.startsWith("--command=")) {
+        sawInline = true;
+        j++; // the command string (next word / attached value) is never a file
         continue;
       }
-      lastPositional = n;
-      j++;
+      if (n === "--rcfile" || n === "--init-file") { j += 2; continue; } // space-form operand
+      if (n.startsWith("--rcfile=") || n.startsWith("--init-file=")) { j++; continue; } // attached value
+      if (/^[+-][a-zA-Z]+$/.test(n)) {
+        // single-dash flag/letter-run (plus the POSIX `+` toggle twin: bash
+        // +e/+x/+eu x.sh runs x.sh; +o/+O take an operand, +c is an inline
+        // command, +s demotes like -s) — bash parses the run char-by-char:
+        // c → inline command string (consumes the next word) → null; o/O →
+        // the option value is the next word; s → stdin-program mode; every
+        // other letter is an operand-less flag. Probes: -ec/-sc/-cs / +c run
+        // the payload inline; -se/-es/-xs / +s set stdin mode; -so posix /
+        // -sO extglob consume posix/extglob AND set stdin mode.
+        const run = n.slice(1);
+        if (run.includes("c")) { sawInline = true; j++; continue; }
+        if (run.includes("o") || run.includes("O")) j++; // consume the operand word
+        if (run.includes("s")) sawDashS = true;
+        j++;
+        continue;
+      }
+      if (n.startsWith("-") || n === "+") { j++; continue; } // other operand-less -flag/--option / bare + toggle
+      // A non-flag, non-redirect operand:
+      if (sawInline) { j++; continue; } // -c: $0/$1 args — never a script file
+      if (sawDashS) { j++; continue; }  // -s: $0/$1 — the program is stdin (redirect seen above)
+      return n;                         // THE script — later tokens are its args ($1…)
     }
     if (sawInline) return null; // `-c 'inline'` — gated by the normal classifier
     if (sawProcessSub) return null; // `bash <(echo 'git …')` — FD, not a file (fail-closed via _unverifiableGitContent)
-    if (lastPositional !== null) return lastPositional; // the script ARGUMENT (last positional)
-    return stdinOperand && !stdinOperand.startsWith("-") ? stdinOperand : null; // the stdin file IS the script
+    // No script positional: a stdin redirect's operand IS the program —
+    // `bash < evil.sh`, and with -s the ONLY program source (`bash -s < f
+    // arg1` → f; arg1 is $1, #437 round-13 VGATE sub-case).
+    return stdinOperand && !stdinOperand.startsWith("-") ? stdinOperand : null;
   }
   if (t === ".") { // `. script`
     const next = tokens[i + 1];
