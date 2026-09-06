@@ -2,7 +2,7 @@
 title: "#496 — subagent-tool #152-class provider-failure fallback"
 type: engineering
 domain: platform
-doc_status: draft
+doc_status: live
 subjects.team: epistemic-team
 aboutSubjects: [agent-infra, epistemic-team]
 aboutObjects: [issue-496, issue-476, issue-152]
