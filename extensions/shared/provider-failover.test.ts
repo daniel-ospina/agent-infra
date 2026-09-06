@@ -58,7 +58,7 @@ function test(name: string, fn: () => void) {
     console.log(`  ✅ ${name}`);
   } catch (err: any) {
     failed++;
-    console.log(`  ❌ ${name}: ${err.message}`);
+    console.log(`  ❌ ${name}: ${err.message}\n${err.stack?.split('\n').slice(0,4).join('\n')}`);
   }
 }
 
@@ -84,7 +84,7 @@ function testAsync(name: string, fn: () => Promise<void>) {
       console.log(`  ✅ ${name}`);
     } catch (err: any) {
       failed++;
-      console.log(`  ❌ ${name}: ${err.message}`);
+      console.log(`  ❌ ${name}: ${err.message}\n${err.stack?.split('\n').slice(0,4).join('\n')}`);
     }
   });
 }
@@ -335,12 +335,18 @@ test("oversized state file self-heals (size guard)", () => {
 
 section("alias-family chain — rename, blocked skip, halt");
 
-test("familyOf: default-flash rename + openrouter slug + pro identity + unknown", () => {
+test("familyOf: default-flash rename + openrouter slug + pro identity + unknown + variant exclusion", () => {
   equal(familyOf("deepseek-v4-flash"), "deepseek-v4-flash");
   equal(familyOf("deepseek-v4-flash-0731"), "deepseek-v4-flash");
   equal(familyOf("deepseek-v4-pro"), "deepseek-v4-pro");
   equal(familyOf("deepseek/deepseek-v4-flash", "openrouter"), "deepseek-v4-flash");
   equal(familyOf("deepseek/deepseek-v4-pro", "openrouter"), "deepseek-v4-pro");
+  // review R4: variants must NOT map onto the base family (silent model
+  // substitution under a latch) — they resolve to no family (must-stay)
+  equal(familyOf("deepseek-v4-flash-vision-exp"), undefined);
+  equal(familyOf("deepseek-v4-pro-0813"), undefined);
+  equal(familyOf("deepseek/deepseek-v4-flash-vision-exp", "openrouter"), undefined);
+  equal(familyOf("deepseek/deepseek-v4-pro-0813", "openrouter"), undefined);
   equal(familyOf("glm-5.2"), undefined);
   equal(familyOf(null), undefined);
 });
@@ -445,18 +451,84 @@ test("no latch / stale / disabled / no-hop → requested leg (must-stay semantic
   equal(unknown.leg?.model, "glm-5.2");
 });
 
-test("markLegBlocked / clearLegBlocked lifecycle + TTL override env", () => {
+test("markLegBlocked / clearLegBlocked lifecycle + TTL override env + block survives primary clear", () => {
   const { env } = makeEnv("blocked");
   setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", env });
   markLegBlocked("openrouter", "401-invalid", { env });
   let state = readLatchState(env);
-  equal(state.primaries.deepseek.blockedLegs.openrouter.reason, "401-invalid");
-  equal(state.primaries.deepseek.blockedLegs["qwen-tp"], undefined, "default blocked not in durable state");
+  equal(state.blockedLegs.openrouter.reason, "401-invalid");
+  equal(state.blockedLegs["qwen-tp"], undefined, "default blocked not in durable state");
+  // TOP-LEVEL blocks survive a primary balance-restore clear (review P2 — the
+  // poller must not wipe a still-true auth block on restore)
+  clearExhaustion("deepseek", { env });
+  state = readLatchState(env);
+  equal(state.blockedLegs.openrouter.reason, "401-invalid", "auth block survives the primary clear");
   clearLegBlocked("openrouter", { env });
   state = readLatchState(env);
-  ok(state.primaries.deepseek.blockedLegs.openrouter === undefined, "cleared");
+  ok(state.blockedLegs.openrouter === undefined, "cleared");
+  // markLegBlocked works with NO primary records (pre-emptive block)
+  markLegBlocked("moonshot", "401", { env });
+  equal(readLatchState(env).blockedLegs.moonshot.reason, "401");
+  clearLegBlocked("moonshot", { env });
   equal(latchTtlMs({ PROVIDER_EXHAUSTION_TTL_MS: "5000" }), 5000);
   equal(latchTtlMs({ PROVIDER_EXHAUSTION_TTL_MS: "-1" }), 24 * 60 * 60 * 1000, "invalid env → default");
+});
+
+test("OpenRouter 402 body text (SDK omits status) → exhaustion (review P2)", () => {
+  const c = classifyExhaustionText("Insufficient credits. Add more using https://openrouter.ai/credits");
+  equal(c.kind, "exhaustion");
+  equal(c.reason, "low_balance");
+  equal(c.matched, "insufficient-credit");
+});
+
+test("credit-card 402 text never latches (review R2 — payment method, not balance)", () => {
+  equal(classifyExhaustionText("402 credit card declined").kind, null);
+  // "update billing" → audit_only at worst; NEVER exhaustion
+  equal(classifyExhaustionText("HTTP 402: the credit card on file was declined, update billing").kind, "audit_only");
+});
+
+test("READ-side root fallback: hop-leg direct request honors the root terminal (review P2)", () => {
+  const { env } = makeEnv("readfb");
+  // exhaust the whole flash chain: deepseek -> openrouter; then openrouter dead
+  setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: FLASH_PRIMARY, env });
+  markLegBlocked("openrouter", "401", { env });
+  const state = readLatchState(env);
+  // a dispatch that asks for the openrouter leg DIRECTLY (provider-qualified)
+  const direct = resolveWithChain("deepseek-v4-flash", { provider: "openrouter", model: "deepseek/deepseek-v4-flash" }, state, { env });
+  equal(direct.halted, true, "root terminal respected — never re-dispatch the dead hop leg as 'clear'");
+  // and the deepseek-rooted ask agrees
+  const rooted = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
+  equal(rooted.halted, true);
+});
+
+test("READ-side root preference: stale own record at the hop provider never shadows a fresh root terminal (review R2)", () => {
+  const { env } = makeEnv("shadow");
+  // root terminal for flash (deepseek + openrouter both dead)
+  setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: FLASH_PRIMARY, env });
+  markLegBlocked("openrouter", "401", { env });
+  // STALE own no-family record at the hop provider (e.g. an old interactive latch)
+  setExhausted({ primaryProvider: "openrouter", reason: "402", source: "interactive", env: { ...env, PROVIDER_EXHAUSTION_TTL_MS: "1" } });
+  const state = readLatchState(env);
+  const latchedAt = Date.parse(state.primaries.openrouter.latchedAt);
+  const hopAsk = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    state,
+    { env, now: latchedAt + 5000 }, // own record now stale; root still fresh
+  );
+  equal(hopAsk.halted, true, "fresh root terminal wins over the stale shadow record");
+  equal(hopAsk.leg, null);
+});
+
+test("advance/serve never hops INTO a provider with a fresh own exhaustion record (review R2)", () => {
+  const { env } = makeEnv("freshcand");
+  // root account latched (no family advance yet) + openrouter's OWN account freshly exhausted
+  setExhausted({ primaryProvider: "deepseek", reason: "402", source: "poller", env });
+  setExhausted({ primaryProvider: "openrouter", reason: "402", source: "interactive", env });
+  const state = readLatchState(env);
+  const outcome = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
+  equal(outcome.halted, true, "openrouter skipped (fresh own record) → nothing left → halt");
+  equal(outcome.reason, "halt");
 });
 
 test("second-leg exhaustion advances to halt (chain bounded)", () => {
