@@ -326,7 +326,27 @@ The `review-enforcer` extension blocks git operations unless at least one sub-ag
 
 ### Verification Gate
 
-The `verification-gate` extension blocks `git commit` unless every staged file has been verified by a `[VGATE]` sub-agent — except where the content-shape exemption below applies.
+The `verification-gate` extension blocks `git commit` unless every file the commit
+will record has been verified by a `[VGATE]` sub-agent — for bare commits that is
+"every staged file", but `-a`/`--all` sweep commits also record never-staged dirty
+tracked files, so the verified set is the command's full diff scope (see the #489
+paragraph below) — except where the content-shape exemption below applies.
+
+**#489 — auto-sweep (`-a`/`--all`) commits are NOT index-scoped:** `git commit -a` /
+`--all` record the tracked WORKING TREE, not just the staged index. When the
+command is a pure sweep (`-a`/`--all` on every commit invocation, e.g. `git commit
+-am x`, `git commit -a -m x`, `git -C repo commit --all`), VGATE verifies the
+HEAD-vs-working-tree file set (`git diff HEAD --name-only` — exactly what the
+sweep records) instead of the staged diff; a mixed command (sweep + bare commit in
+one op) verifies the union of staged + working-tree files. The verification prompt
+for a sweep therefore lists WORKING-TREE files — `[VGATE] verify files: <dirty
+code>. Classification: …` — even when only docs are staged: a docs-only PASS must
+not unlock a sweep that would ship dirty, never-verified code. Bare/pathspec/
+`--amend`-alone commits keep the staged (index) scope (#489 T2); pathspec commits
+(`git commit -m x f.txt`) keep that same staged index scope — a known under-gate
+for pathspec WT-path commits, tracked as residual #538. Unborn-HEAD
+repos (no commits yet) fall back to the staged set — `git commit -a` on an unborn
+HEAD records only the index. `gh pr` ops are unchanged (branch diff scope).
 
 **Content-shape exemption (docs/CSS/static-only — extension-side, tier-independent):**
 when the op's relevant file set (staged diff for commit/push; branch diff for
@@ -355,8 +375,11 @@ delete_push_no_content`). Content pushes keep the staged check. `git branch -D`
 
 **How to satisfy:**
 ```bash
-# Dispatch a verifier sub-agent:
+# Dispatch a verifier sub-agent (bare commit — staged scope):
 task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|backend|doc>. Project root: <repo root>.', ...)
+# For `git commit -a`/`--all` (sweep) commands the block lists the WORKING-TREE file
+# set (`git diff HEAD`) — dirty tracked files that may never have been staged; list
+# them in the prompt exactly as the gate named them.
 ```
 
 **Format requirements (CRITICAL):**
