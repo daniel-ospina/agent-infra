@@ -211,8 +211,7 @@ const latchSeenFamilies = new Set<string>();
  * wording. */
 const lastDrain: Map<string, { kind: "root" } | { kind: "hop-own"; provider: string; model: string }> = new Map();
 
-/** States already alerted in this session (terminal/blocked banners are shown
- * ONCE per state, not per failing turn — review round-1 P3-3). */
+/** Banner dedupe — one alert per state key per session (P3-3). */
 const alertedStates = new Set<string>();
 
 /** stderr sink — swapped by tests to capture the writeSync bytes. */
@@ -220,8 +219,19 @@ let writeStderr = (line: string): void => {
   fs.writeSync(2, line);
 };
 
+/** Banner sink — swapped by tests to capture interactive notices (round-4
+ * P2-1: the drain/restore banner rendering had zero automated coverage — no
+ * sink seam existed to assert it). Defaults to console.error. */
+let writeBanner = (title: string, body: string): void => {
+  console.error(`\n⚠️  ${title}\n    ${body}\n`);
+};
+
 export function _setMarkerSinkForTests(sink: (line: string) => void): void {
   writeStderr = sink;
+}
+
+export function _setBannerSinkForTests(sink: (title: string, body: string) => void): void {
+  writeBanner = sink;
 }
 
 export function _resetPendingMarkerForTests(): void {
@@ -231,6 +241,7 @@ export function _resetPendingMarkerForTests(): void {
 export function _resetLatchSeenFamiliesForTests(): void {
   latchSeenFamilies.clear();
   lastDrain.clear();
+  alertedStates.clear(); // per-test isolation — banner dedupe is session-scoped
 }
 
 export function _pendingMarkerForTests(): string | null {
@@ -245,11 +256,12 @@ export default function (pi: ExtensionAPI) {
   /** Best-effort operator-visible banner (interactive runs). */
   const notify = (title: string, body: string) => {
     try {
-      console.error(`\n⚠️  ${title}\n    ${body}\n`);
+      writeBanner(title, body);
     } catch {
       // never break the session on a banner failure
     }
   };
+
   /** Banner dedupe — one alert per state key per session (P3-3). */
   const notifyOnce = (key: string, title: string, body: string) => {
     if (alertedStates.has(key)) return;

@@ -36,6 +36,7 @@ import extension, {
   _resetLatchSeenFamiliesForTests,
   _pendingMarkerForTests,
   _setMarkerSinkForTests,
+  _setBannerSinkForTests,
 } from "./provider-exhaustion.js";
 import { readLatchState, setExhausted, clearExhaustion } from "./shared/provider-failover.js";
 
@@ -128,8 +129,13 @@ function applyEnv(env: Record<string, string | undefined>, extra: Record<string,
   Object.assign(process.env, env, extra);
 }
 
-/** Hermetic env: fresh agent dir + a stderr capture sink. */
-function hermetic(): { env: Record<string, string | undefined>; cleanup: () => void; captured: string[] } {
+/** Hermetic env: fresh agent dir + stderr capture + banner capture sinks. */
+function hermetic(): {
+  env: Record<string, string | undefined>;
+  cleanup: () => void;
+  captured: string[];
+  banners: Array<{ title: string; body: string }>;
+} {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-pext-"));
   const env: Record<string, string | undefined> = { ...process.env, PI_CODING_AGENT_DIR: dir };
   delete env.PROVIDER_FAILOVER_DISABLE;
@@ -138,7 +144,9 @@ function hermetic(): { env: Record<string, string | undefined>; cleanup: () => v
   delete env.TASK_HEARTBEAT;
   delete env.TASK_HEARTBEAT_NONCE;
   const captured: string[] = [];
+  const banners: Array<{ title: string; body: string }> = [];
   _setMarkerSinkForTests((line) => captured.push(line));
+  _setBannerSinkForTests((title, body) => banners.push({ title, body }));
   _resetPendingMarkerForTests();
   _resetLatchSeenFamiliesForTests();
   return {
@@ -146,10 +154,12 @@ function hermetic(): { env: Record<string, string | undefined>; cleanup: () => v
     cleanup: () => {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
       _setMarkerSinkForTests((line: string) => fs.writeSync(2, line));
+      _setBannerSinkForTests((title: string, body: string) => console.error(`\n⚠️  ${title}\n    ${body}\n`));
       _resetPendingMarkerForTests();
       _resetLatchSeenFamiliesForTests();
     },
     captured,
+    banners,
   };
 }
 
@@ -439,6 +449,52 @@ test("HOP-OWN drain under a healthy root: own record + DIRECT return to the prim
     const n = pi.setModelCalls.length;
     await pi.emit("turn_start", { turnIndex: 1 }, ctx("tui", modelObj("deepseek", "deepseek-v4-flash")));
     equal(pi.setModelCalls.length, n, "already on the primary → no further restore");
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
+test("banner accuracy (round-4 P2-1): hop-own drain says 'drained its own credits' — never poller wording", async () => {
+  const { env, cleanup, banners } = hermetic();
+  applyEnv(env);
+  try {
+    const pi = makeFakePi();
+    extension(pi as any);
+    // hop-own drain on openrouter under a healthy (absent) root
+    await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
+    const drainBanner = banners.find((b) => b.title.startsWith("Hop provider drained"));
+    ok(drainBanner, "hop-own drain banner fired");
+    ok(drainBanner!.title.includes("Hop provider drained"), "title names the hop-own cause");
+    ok(drainBanner!.body.includes("drained its own credits"), "body explains the independent-account drain");
+    ok(drainBanner!.body.includes("deepseek/deepseek-v4-flash") || drainBanner!.body.includes("deepseek-v4-flash"), "body names the returning-to primary");
+    ok(!banners.some((b) => b.title.includes("balance poller restores")), "never claims the poller is the restore path for a hop-own drain");
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
+test("banner accuracy (round-4 P2-1): genuine root drain + poller clear restores with 'Provider balance restored' (lastDrain reset)", async () => {
+  const { env, cleanup, banners } = hermetic();
+  applyEnv(env);
+  try {
+    const pi = makeFakePi();
+    extension(pi as any);
+    // hop-own drain first (session on openrouter, healthy root) → lastDrain hop-own
+    await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
+    const afterHopOwn = banners.length;
+    // genuine ROOT drain: session (now restored to the primary) exhausts on deepseek
+    // → lastDrain must RESET to kind:root
+    await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("deepseek", "deepseek-v4-flash")));
+    // chain hop happened (root drained → openrouter); the poller then clears the root
+    clearExhaustion("deepseek", { env });
+    // next turn on the openrouter hop leg → restore fires with the ROOT wording
+    await pi.emit("turn_start", { turnIndex: 1 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
+    const restore = banners.find((b) => b.title.includes("Provider balance restored") || b.title.includes("Returning to the primary"));
+    ok(restore, "restore banner fired after the root-clear");
+    ok(restore!.title.includes("Provider balance restored"), `genuine root-clear restore says 'Provider balance restored' (got: ${restore!.title})`);
+    ok(!restore!.body.includes("drained its own credits"), "hop-own wording NOT reused for a genuine root restore");
   } finally {
     restoreEnv();
     cleanup();
