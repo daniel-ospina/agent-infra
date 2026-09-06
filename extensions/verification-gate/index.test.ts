@@ -2461,6 +2461,25 @@ test("RED: -c push spellings route via the verb-scan (pure-delete + range-eligib
   ok(q.eligible === true && q.bare === true && q.remote === "origin", "-c bare push (remote fixed) stays range-eligible");
 });
 
+test("RED (#490 T2 round-2): out-of-table no-value global before verb + abutting-quote -c values", () => {
+  // P1-1: an unknown no-value global DIRECTLY before the verb — the round-1
+  // `break` abandoned the candidate (invocation invisible → sweep misclassified
+  // → compound pushes swept the WT unverified).
+  ok(isGitOp("git --no-optional-locks commit -am x"), "no-value global before verb must intercept");
+  equal(commitSweepClass("git --no-optional-locks commit -am x"), "sweep", "...classifies sweep");
+  equal(isBareCommitShape("git --no-optional-locks commit -am x"), false, "...non-bare");
+  equal(commitSweepClass("git --no-optional-locks commit -am x && git push origin main"), "sweep", "compound keeps sweep scope (round-1: sweep=none regression)");
+  const p1 = parsePushRefSpecs("git --no-optional-locks commit -am x && git push origin main");
+  ok(!p1.eligible, "compound must NOT be range-eligible (the sweep half is a commit — P0 guard)");
+  // P1-2: bash word-concatenation in -c VALUES — `core.editor='vim -w'` is ONE
+  // bash word; the round-1 quote-abutting rule split it → invocation invisible.
+  ok(isGitOp("git -c core.editor='vim -w' commit -am x"), "abutting-quote -c value must intercept");
+  equal(commitSweepClass("git -c core.editor='vim -w' commit -am x"), "sweep", "...sweep");
+  equal(isBareCommitShape("git -c core.editor='commit x' commit -am y"), false, "verb-like word inside a value never binds as the verb");
+  equal(commitSweepClass("git -c core.editor='vim -w' commit -am x && git push origin main"), "sweep", "compound with abutting-quote value keeps sweep");
+  ok(isGitOp("git --no-pager commit -m x"), "in-table boolean regression guard");
+});
+
 section("#490 T2 — cwd-neutral boundary + containment guards (group B)");
 
 test("GREEN: repo-redirecting globals stay UN-INTERCEPTED (foreign boundary)", () => {

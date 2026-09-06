@@ -440,7 +440,7 @@ interface ShellToken {
 // accumulated chars ENDS the word so `commit'` (the closing quote of a
 // wrapper like `sh -c 'git commit'`) normalizes to `commit`. Returns null at
 // end of text.
-function readShellToken(text: string, from: number): ShellToken | null {
+function readShellToken(text: string, from: number, joinQuoted = false): ShellToken | null {
   const len = text.length;
   let p = from;
   while (p < len && (isSpaceChar(text[p]) || isTokenSeparator(text[p]))) p++;
@@ -455,11 +455,14 @@ function readShellToken(text: string, from: number): ShellToken | null {
         if (p + 1 < len) { content += text[p + 1]; p += 2; continue; }
         p++; continue;
       }
-      if (ch === quote) { quote = null; p++; break; } // closing quote ends the word
+      if (ch === quote) { quote = null; p++; if (!joinQuoted) break; continue; } // closing quote: default ends the word; joinQuoted continues (bash concatenation)
       content += ch; p++; continue;
     }
     if (ch === "'" || ch === '"') {
-      if (content.length > 0) { p++; break; } // quote abutting chars — end the word (verb normalization)
+      if (content.length > 0) {
+        if (joinQuoted) { quote = ch; p++; continue; } // bash: an abutting quote JOINS the current word (option values)
+        p++; break; // quote abutting chars — end the word (verb normalization)
+      }
       quote = ch; p++; continue;              // word starts with a quote
     }
     if (isSpaceChar(ch) || isTokenSeparator(ch)) break;
@@ -503,15 +506,15 @@ function findGitVerbInvocation(
       p = tok.rawEnd;
       const t = tok.content;
       if (t.startsWith("-")) {
-        if (t === "-c") { // session-value: consume the ONE atomic value token
-          const val = readShellToken(text, p);
+        if (t === "-c") { // session-value: consume the ONE atomic value token (bash word-concat — #490 T2)
+          const val = readShellToken(text, p, true);
           if (val !== null) p = val.rawEnd;
           continue;
         }
         if (GIT_SESSION_BOOL.has(t)) continue;
         if (GIT_REDIRECT.has(t)) {
           foreign = true;
-          const val = readShellToken(text, p); // space form consumes its value
+          const val = readShellToken(text, p, true); // space form consumes its value (bash word-concat — #490 T2)
           if (val !== null) p = val.rawEnd;
           if (foreignRedirect === "skip") break; // other checkout — abandon candidate
           continue;
@@ -527,9 +530,9 @@ function findGitVerbInvocation(
         // token is never a value (do not swallow a following -c). Attached
         // `=` unknowns carry their value and consume nothing.
         if (t.includes("=")) continue;
-        const nxt = readShellToken(text, p);
+        const nxt = readShellToken(text, p, true); // peek join-mode: a VALUE may carry abutting quotes; the verb itself is unaffected (trailing wrapper quote still strips)
         if (nxt === null) break;
-        if (verbs.has(nxt.content)) break; // verb wins → this dash is a boolean
+        if (verbs.has(nxt.content)) continue; // verb wins → this dash is a boolean; CONTINUE so the next iteration returns the verb (break here abandoned the candidate — #490 T2 P1)
         if (nxt.content.startsWith("-")) { p = nxt.rawStart; continue; } // never a value — re-process the dash token next
         p = nxt.rawEnd; // consume the value token
         continue;
