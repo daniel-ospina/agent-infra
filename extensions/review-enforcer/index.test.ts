@@ -1354,11 +1354,12 @@ testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MES
 // T1b: standard/complex/unknown markers → BLOCK with the generic BLOCK_MESSAGE,
 // plus the unlabeled (no-marker) key's reason pinned directly, plus the full
 // policy-matrix allow complement (≥1 dispatch → allowed at every marker value).
-// Markers mirror the producer format (capitalized TIER values from 01-preflight
-// Tier Detection via echo "$TIER"). The direction pins anchor on the path TAIL
-// "code-review/SKILL.md" — not the full "operations/skills/…" prefix, which is
-// the stale consumer-repo layout tracked by follow-up #517: the tail survives
-// that fix in both repo and installed forms and still discriminates
+// Markers mirror the producer format (01-preflight Tier Detection via
+// echo "$TIER" — capitalized Micro/Standard/Complex and lowercase unknown,
+// matching each emitted literal's exact case). The direction pins anchor on the
+// path TAIL "code-review/SKILL.md" — not the full "operations/skills/…" prefix,
+// which is the stale consumer-repo layout tracked by follow-up #517: the tail
+// survives that fix in both repo and installed forms and still discriminates
 // (MICRO_BLOCK_MESSAGE references only 03-code-review.md, never
 // "code-review/SKILL.md").
 testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispatches", async () => {
@@ -1510,17 +1511,29 @@ test("#485 T2: REVIEW-ENFORCER-TIER-RULE fence == TIER_RULE + no micro-warn clai
   // marker strings mirror): a literal rename in 01-preflight Tier Detection
   // that leaves the fence/TIER_RULE untouched would silently send real micro
   // sessions the generic BLOCK_MESSAGE (losing the micro docs-only [REVIEW]
-  // remediation) with CI green — these asserts red on that class.
+  // remediation) with CI green — these asserts red on that class. Anchored on
+  // SEMANTIC content (markup-tolerant: `TIER = Micro` must survive a de-bold /
+  // table conversion — a literal rename changes the text either way, so
+  // format-insensitive checks catch every rename without cosmetic-noise reds).
+  const preflightLines = docText.split("\n");
   ok(
-    docText.includes("echo \"$TIER\" > /tmp/agent-issue-complexity"),
+    preflightLines.some((l) => l.includes("echo") && l.includes("$TIER") && l.includes("agent-issue-complexity")),
     "01-preflight.md must contain the marker emission line the T1/T1b marker strings mirror"
   );
-  for (const literal of ["Micro", "Standard", "Complex", "unknown"]) {
+  for (const [label, literal] of [
+    ["micro", "Micro"],
+    ["standard", "Standard"],
+    ["complex", "Complex"],
+  ] as Array<[string, string]>) {
     ok(
-      docText.includes(`**TIER = ${literal}**`),
-      `01-preflight.md Tier Detection must emit TIER literal ${JSON.stringify(literal)} (mirrored by the T1/T1b producer-format markers)`
+      preflightLines.some((l) => l.includes(`complexity:${label}`) && l.includes(`TIER = ${literal}`)),
+      `01-preflight.md Tier Detection must map complexity:${label} to TIER literal ${JSON.stringify(literal)} (mirrored by the T1/T1b producer-format markers)`
     );
   }
+  ok(
+    preflightLines.some((l) => l.includes("TIER = unknown")),
+    "01-preflight.md Tier Detection must emit the lowercase unknown literal (no-label bullet; mirrored by T1b's producer-format marker)"
+  );
 
   // Anti-token pin across the three swept docs (vacuous-pass guard: a missing
   // doc fails loudly instead of silently passing).
