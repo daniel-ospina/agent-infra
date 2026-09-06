@@ -285,3 +285,69 @@ with automatic return after balance restore.
   key remediation; a still-broken key is re-armed fresh by the next 401/403).
 - Hop cost metadata is honest (catalog-authority rates in `models-store.json`),
   or the leg is `costUnknown` and FLAGS.
+
+## 8. Venice cold-class routing — cache-cold verification traffic (#512)
+
+Cache-cold **test/verification** traffic (fresh-context reviewer/eval dispatches
+that would otherwise burn deepseek-official credits on a cold prompt cache) can
+be routed through the **venice** leg — same model id (`deepseek-v4-flash`),
+served by api.venice.ai at venice list pricing, with prompt-cache reads served
+to cold traffic (live sample 2026-09-06: a first-ever curl to a short prompt
+reported `cache_read_input_tokens=1536` of 1721 prompt tokens).
+
+### The seam (default OFF — inert)
+
+**`COLD_CLASS_PROVIDER`** is an OPERATOR-exported env convention read by
+reviewer/eval dispatch-site texts (code-review, plan-review, test-review,
+issue-scoping, subagent-driven-development skills). Unset (the default) the
+seam is inert — no dispatch ever routes venice. When an operator exports
+`COLD_CLASS_PROVIDER=venice`, eligible cache-cold one-shot dispatches MAY
+launch through the venice leg (`--provider venice --model deepseek-v4-flash`).
+Interactive/default traffic NEVER routes venice (warm sessions keep their
+cache; only explicitly-opt-in cold-class dispatches burn venice credits).
+
+The seam is **per-dispatch**, never a family-table edit: `ALIAS_FAMILIES`
+(the #476 chain table) has NO venice leg (drift-pinned), so warm traffic and
+family resolution are untouched. venice is an independent provider — a drain
+on its account records under `primaries["venice"]`, never re-latching or
+advancing the deepseek root on another account's evidence.
+
+### Fallback + kill switches
+
+- **Exhaustion fallback** (venice 402/`low_balance`/auth-blocked): the #476
+  machinery hops venice → deepseek official → openrouter via the
+  independent-provider discriminator — a canceled/empty venice account never
+  strands the dispatch.
+- Kill switches, in order: unset `COLD_CLASS_PROVIDER` (full revert),
+  remove/unset `VENICE_API_KEY` (missing-key → the task-tool gate resolves the
+  dispatch to the default deepseek leg BEFORE any spawn), or
+  `PROVIDER_FAILOVER_DISABLE=1` (note: this combo also disables the
+  deepseek→openrouter fallback — A1 P3). Durable venice auth-blocks
+  (`blockedLegs["venice"]`, 24h TTL) also gate subsequent cold dispatches to
+  the default leg; the block self-heals on key remediation.
+
+### Measurement (the 0a gate)
+
+Production cold-class routing stays OFF until a ≥2-week prospective usage
+window validates the burn economics. Per-dispatch measurement is
+**default-off**:
+
+- `TASK_USAGE_CAPTURE=1` (child env): the child accumulates message_end usage
+  across healthy turns and emits ONE `[task-usage]` stderr line at
+  session_shutdown (nonce-authenticated; provider attribution from the CLI
+  leg — a venice child never mislabels itself deepseek).
+- `TASK_USAGE_LEDGER=1` (parent env): the task tool attaches
+  `details.dispatchUsage` and appends an `event=dispatch-usage` row to
+  `audit/provider-failover.jsonl`.
+- A real venice dispatch appends an `event=venice-route` row to the same
+  audit file (attributable credit burn without scraping session files).
+
+### Registry
+
+Venice is registered flash-ONLY in `pi-bootstrap/pi-config/models.json`
+(`baseUrl https://api.venice.ai/api/v1`, `$VENICE_API_KEY`,
+cost 0.14/0.28 input/output + 0.03 cacheRead, contextWindow 300000). The
+**#284 carve-out**: `COLD_CLASS_PROVIDER` is an operator override SEPARATE
+from `$SECOND_MODEL` — second-model gates never route venice unless
+`$SECOND_MODEL` itself says so; cold-class applies only to the default-leg
+(flash) reviewer/eval dispatches an operator has explicitly opted in.

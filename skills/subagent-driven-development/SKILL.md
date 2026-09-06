@@ -15,6 +15,8 @@ allowed-tools: read write edit bash web_search web_fetch todo_write task grep fi
 # Subagent-Driven Development
 Execute plan by dispatching fresh subagent per task, with two-stage review after each: spec compliance review first, then code quality review.
 
+> **Cold-class seam (#512):** the two-stage spec/code reviewers are cache-cold one-shot eval dispatches — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id). **Unset (default) = inert.** Implementer dispatches and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
+
 **Why subagents:** You delegate tasks to specialized agents with isolated context. By precisely crafting their instructions and context, you ensure they stay focused and succeed at their task. They should never inherit your session's context or history — you construct exactly what they need. This also preserves your own context for coordination work.
 
 **Core principle:** Fresh subagent per task + two-stage review (spec then quality) = high quality, fast iteration

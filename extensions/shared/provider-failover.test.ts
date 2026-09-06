@@ -16,6 +16,7 @@
 
 import {
   EMPTY_LATCH,
+  ALIAS_FAMILIES,
   classifyExhaustionText,
   familyOf,
   rootPrimaryOfFamily,
@@ -437,6 +438,25 @@ test("familyOf: default-flash rename + openrouter slug + pro identity + unknown 
   equal(familyOf("deepseek/deepseek-v4-pro-0813", "openrouter"), undefined);
   equal(familyOf("glm-5.2"), undefined);
   equal(familyOf(null), undefined);
+});
+
+test("#512 DRIFT: venice never enters ALIAS_FAMILIES — the chain table stays venice-free", () => {
+  // Warm/chain traffic must NEVER route venice: #512 routes the cold class
+  // through a per-dispatch env seam (COLD_CLASS_PROVIDER), NOT a family-table
+  // edit. This pin fails the moment a venice leg appears in any alias family
+  // (global family routing would contaminate warm dispatches).
+  const allLegs = Object.values(ALIAS_FAMILIES).flatMap((f) => f.legs);
+  equal(
+    allLegs.filter((l) => l.provider === "venice").length,
+    0,
+    "no alias family may list a venice leg (drift guard)",
+  );
+  // Model-keyed families mean venice/deepseek-v4-flash IS family-defined...
+  equal(familyOf("deepseek-v4-flash", "venice"), "deepseek-v4-flash");
+  // ...but venice is NOT a member leg — the discriminator gates off-table
+  // cold asks without touching the chain (the gate is membership-keyed).
+  equal(legIsFamilyMember("deepseek-v4-flash", "venice"), false);
+  equal(legIsFamilyMember("deepseek-v4-flash", "deepseek"), true);
 });
 
 test("blockedProviders: default qwen-tp when env absent; env-empty re-enables", () => {
