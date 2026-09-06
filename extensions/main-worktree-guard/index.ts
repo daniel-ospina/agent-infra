@@ -87,6 +87,7 @@ let classifyGitCommandDetailed: (cmd: string) => any = () => ({ verdict: "allow"
 let isWorktreeCwd: (cwd: string) => boolean = () => true;      // bash path: fail-open
 let isWorktreeCwdWrite: (cwd: string) => boolean = () => false; // write/edit: fail-closed
 let extractPushDeleteBranch: (cmd: string) => string[] | null = () => null;
+let wholeCommandDeleteTargets: (verdict: string, command: string) => string[] = () => [];
 let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
 let getMainCheckoutBranch: () => string | null = () => null;
@@ -130,7 +131,7 @@ let isAllowMarkerRealpath: (path: string) => boolean = () => false;
 let readAllowMarkerState: (path: string, sessionId: string | null | undefined, nowMs?: number, ttlMs?: number) => boolean = () => false;
 try {
   ({ classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd,
-     extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout,
+     extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,
      getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS,
      isAllowMarkerActive, isAllowMarkerPath, isAllowMarkerCommand,
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
@@ -230,6 +231,43 @@ function _mainTopLevel(): string | null {
   } catch {
     return null;
   }
+}
+
+// #73: coordinated remote-branch-delete block — a push-delete of a branch that
+// ANY session still has checked out (the hub or a sibling worktree) destroys
+// that session's upstream (incident 2026-08-06). Shared by the degradation-
+// fallback arms below: the exact legacy verdict AND the #443 -d/--del spelling
+// arm. Returns null (allow) when none of the deleted branches is checked out
+// anywhere — foreign deletes with no checked-out targets are allowed.
+function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: string } | null {
+  if (!branchNames || branchNames.length === 0) return null;
+  const worktreeBranches = getWorktreeBranches();
+  const blockedBranches: string[] = [];
+  for (const branchName of branchNames) {
+    const branchRef = `refs/heads/${branchName}`;
+    const checkedOutPaths = [...(worktreeBranches.get(branchRef) || [])];
+    if (isBranchInMainCheckout(branchName)) {
+      const mainTopLevel = _mainTopLevel();
+      const mainLabel = mainTopLevel || "main checkout";
+      if (!checkedOutPaths.includes(mainLabel)) checkedOutPaths.push(mainLabel);
+    }
+    if (checkedOutPaths.length > 0) {
+      blockedBranches.push(`"${branchName}" — checked out in: ${checkedOutPaths.join(", ")}`);
+    }
+  }
+  if (blockedBranches.length === 0) return null;
+  return {
+    block: true,
+    reason: [
+      `⛔ Cannot delete — the following branches are currently checked out:`,
+      ...blockedBranches.map((b: string) => `   • ${b}`),
+      "",
+      "   Why: deleting a remote branch while another session has it",
+      "   checked out destroys that session's upstream (#73 / incident 2026-08-06).",
+      "   → Switch those worktrees/main to another branch first, then retry.",
+      "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
+    ].join("\n"),
+  };
 }
 
 // ── M4: hub-state gate (#1484) ─────────────────────────────────────────────
@@ -975,41 +1013,47 @@ export default function (pi: ExtensionAPI) {
         if (isAgentInfraRepo()) return undefined;
         if (_isAllowMainEdits()) return undefined;
         const verdict = classifyGitCommand(command);
+        // #443 clean-hub parity: the FROZEN legacy classifier reports
+        // `block:push-delete` for the exact `--delete`/`:branch` spellings
+        // only, so the documented `-d` short form and `--del`-style
+        // abbreviations classify "allow" and used to skip the #73
+        // sibling-checked-out block below. `extractPushDeleteBranch` is now
+        // whole-command and spelling-aware (all `-d`/`--del`/cluster forms,
+        // multi-segment compounds, `-o` value consumption) — it is the single
+        // target source here, exactly as the pre-#443 arm consumed it. The
+        // detailed classifier is deliberately NOT consulted: its pushTargets
+        // describe only the FIRST push invocation, so a raw `--delete` verdict
+        // originating from a later segment would mis-attribute phantoms (e.g.
+        // `git push origin main && git push origin --delete b` — "main" is not
+        // a delete target; cycle-4 review). Gate the extra arm to legacy
+        // NON-block verdicts ONLY: a legacy `block:*` (reset/clean/pull/…) must
+        // keep its existing generic block below — an unrelated legacy block
+        // must never be swallowed by the coordinated-delete arm's
+        // allow-when-no-sibling-checkout return.
+        const rawDeleteNames = extractPushDeleteBranch(command) ?? [];
+        // `allow-non-git` is intentionally absent: a non-empty extractor
+        // requires a literal `git push` token, so the legacy verdict for any
+        // such command is `allow` or a `block:*` — never `allow-non-git`.
+        // The extractor is string-matched, so a command that merely MENTIONS a
+        // delete push (`echo git push origin -d b`, comments) is conservatively
+        // over-matched — a false-block only when the target is checked out
+        // elsewhere; identical safe-direction over-match exists for the frozen
+        // `--delete` spelling (DESTRUCTIVE_GIT_PATTERNS echo precedent).
+        // A `block:force-push` verdict that ALSO carries a delete spelling
+        // (`git push --force origin --delete b` / `-d b` — the force-less twin
+        // is caught via the allow path) runs the coordinated check too; when
+        // no sibling holds the target, it FALLS THROUGH to the generic block
+        // arm below so the main-checkout force-push block is preserved.
+        const pushDeleteVerdict = verdict === "block:push-delete" ||
+          (verdict === "allow" && rawDeleteNames.length > 0) ||
+          (verdict === "block:force-push" && rawDeleteNames.length > 0);
+        if (pushDeleteVerdict) {
+          const blocked = _coordinatedDeleteBlock(rawDeleteNames);
+          if (blocked) return blocked;
+          if (verdict === "block:push-delete" || verdict === "allow") return undefined;
+          // verdict === block:force-push: fall through to the generic arm.
+        }
         if (verdict.startsWith("block:")) {
-          if (verdict === "block:push-delete") {
-            const branchNames = extractPushDeleteBranch(command);
-            if (branchNames && branchNames.length > 0) {
-              const worktreeBranches = getWorktreeBranches();
-              const blockedBranches: string[] = [];
-              for (const branchName of branchNames) {
-                const branchRef = `refs/heads/${branchName}`;
-                const checkedOutPaths = [...(worktreeBranches.get(branchRef) || [])];
-                if (isBranchInMainCheckout(branchName)) {
-                  const mainTopLevel = _mainTopLevel();
-                  const mainLabel = mainTopLevel || "main checkout";
-                  if (!checkedOutPaths.includes(mainLabel)) checkedOutPaths.push(mainLabel);
-                }
-                if (checkedOutPaths.length > 0) {
-                  blockedBranches.push(`"${branchName}" — checked out in: ${checkedOutPaths.join(", ")}`);
-                }
-              }
-              if (blockedBranches.length > 0) {
-                return {
-                  block: true,
-                  reason: [
-                    `⛔ Cannot delete — the following branches are currently checked out:`,
-                    ...blockedBranches.map((b: string) => `   • ${b}`),
-                    "",
-                    "   Why: deleting a remote branch while another session has it",
-                    "   checked out destroys that session's upstream (incident 2026-08-06).",
-                    "   → Switch those worktrees/main to another branch first, then retry.",
-                    "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to override.",
-                  ].join("\n"),
-                };
-              }
-            }
-            return undefined;
-          }
           let inWorktree = true;
           try {
             inWorktree = isWorktreeCwd(resolve(process.cwd()));
@@ -1121,40 +1165,56 @@ export default function (pi: ExtensionAPI) {
           targets,
           syncSource: det.syncSource,
         })) {
-          return undefined;
+          // #443: det.pushTargets describe ONLY the first push invocation. A
+          // delete in a LATER compound segment of the -d/--del family (no
+          // frozen legacy evidence) is invisible to them, so an own-baseline
+          // first push (`git push origin main && git push origin -d b` from a
+          // baseline-main hub session) must NOT let this allowance swallow the
+          // whole command — a sibling-held `b` would delete unguarded (the
+          // `--delete` twin classifies block:push-delete targets ["b"] and
+          // DOES block). Skip the allowance whenever the whole-command
+          // extractor reveals a delete target that is not the session's own
+          // baseline; own-branch ceremonies (extractor targets ⊆ baseline,
+          // e.g. `… && git push origin -d feat` while on feat) still allow.
+          // PUSH-FAMILY ONLY (wholeCommandDeleteTargets gates on the verdict):
+          // non-push allowance kinds (pull/merge/rebase/branch -D) keep their
+          // base decision — a `git pull origin main && git push origin -d b`
+          // compound is an origin/main parity gap (the pull allowance already
+          // swallowed it before #443), out of this push-spelling scope.
+          const wcDeletes = wholeCommandDeleteTargets(det.verdict, command);
+          const baselineBranch = baseline?.branch ?? null;
+          // Unknown baseline (no way to tell own from foreign) → keep the
+          // allowance's base decision exactly as before.
+          const foreignDelete = baselineBranch !== null && wcDeletes.some((b) => b !== baselineBranch);
+          if (!foreignDelete) return undefined;
+          // foreign later-segment delete present → fall through to the #73 arms.
         }
       }
 
       // ── push --delete: retained #73 coordinated check (foreign targets) ──
+      // The matcher is per-FIRST-push-invocation; a delete spelling in a LATER
+      // compound segment is attributed via the whole-command extractor (matcher
+      // fold-in for legacy-evidenced `--delete`/`:b` — verdict block:push-delete
+      // — and here for the #443 `-d`/`--del` family, which carries NO frozen
+      // legacy evidence so the verdict is block:push). A plain-push verdict
+      // whose command contains real delete targets elsewhere must still run the
+      // sibling-coordinated check; when nothing is held it FALLS THROUGH to M2
+      // below, so the first segment's push stays gated exactly as origin/main
+      // gated it. String-evidence echo/comment over-match is the documented
+      // safe-direction class shared with the degradation arm.
       if (det.verdict === "block:push-delete" && det.pushTargets.length > 0) {
-        const worktreeBranches = getWorktreeBranches();
-        const blockedBranches: string[] = [];
-        for (const branchName of det.pushTargets) {
-          const branchRef = `refs/heads/${branchName}`;
-          const checkedOutPaths = [...(worktreeBranches.get(branchRef) || [])];
-          if (isBranchInMainCheckout(branchName)) {
-            const mainTopLevel = _mainTopLevel();
-            const mainLabel = mainTopLevel || "main checkout";
-            if (!checkedOutPaths.includes(mainLabel)) checkedOutPaths.push(mainLabel);
-          }
-          if (checkedOutPaths.length > 0) {
-            blockedBranches.push(`"${branchName}" — checked out in: ${checkedOutPaths.join(", ")}`);
-          }
-        }
-        if (blockedBranches.length > 0) {
-          return {
-            block: true,
-            reason: [
-              `⛔ Cannot delete — the following branches are currently checked out:`,
-              ...blockedBranches.map((b: string) => `   • ${b}`),
-              "",
-              "   Why: deleting a remote branch while another session has it",
-              "   checked out destroys that session's upstream (#73 / incident 2026-08-06).",
-              "   → Switch those worktrees/main to another branch first, then retry.",
-            ].join("\n"),
-          };
-        }
+        const blocked = _coordinatedDeleteBlock(det.pushTargets);
+        if (blocked) return blocked;
         return undefined; // foreign deletes with no checked-out targets — allowed (today's behavior)
+      }
+      if (det.verdict === "block:push" || det.verdict === "block:force-push") {
+        const laterDeletes = wholeCommandDeleteTargets(det.verdict, command);
+        if (laterDeletes.length > 0) {
+          const blocked = _coordinatedDeleteBlock(laterDeletes);
+          if (blocked) return blocked;
+          // no sibling holds the target(s) → fall through to M2 below (the
+          // first segment's push stays gated exactly as origin/main gated it).
+        }
       }
 
       // ── M2: commit/push ownership (block off-baseline) ──
