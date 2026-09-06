@@ -714,10 +714,12 @@ const WHY = [
 // Keyed by process.pid (one pi process == one session; SessionStartEvent
 // carries no sessionId). Baseline = { repoKey, branch, head, original } of the
 // shared MAIN checkout at session_start. M1 dedupe: Set of "from→to" deviations.
-// `original` = the branch recorded at the FIRST record (session start) and is
+// `original` = the branch recorded at an UNCONTENDED session_start and is
 // IMMUTABLE — create-new/rename re-baselines update only `.branch` (#376: the
 // ceremony return-to-main carve-out switches back to `original`, provably the
-// session's own starting state).
+// session's own starting state). A lock-contended start (pendingBaseline →
+// first-tool_call record) sets original null → the #376 carve-out fails closed
+// (the tree may already sit on ANOTHER session's branch — not provably own).
 const baselines = new Map<number, { repoKey: string; branch: string | null; head: string; original: string | null }>();
 const warnedDeviations = new Map<number, Set<string>>();
 const pendingBaseline = new Set<number>(); // lock contended at session_start → record on first tool_call
@@ -731,7 +733,10 @@ function _recordBaseline(pid: number) {
     const key = branchOwnership.repoKey(cwd);
     if (!key) return;
     if (!baselines.has(pid)) {
-      baselines.set(pid, { repoKey: key, branch: state.branch, head: state.head, original: state.branch });
+      // Contended-start fallback (pendingBaseline): the tree may already sit on
+      // another session's branch → do NOT claim an original (#376 review fold-in:
+      // the carve-out needs a provable own start, so it fails closed here).
+      baselines.set(pid, { repoKey: key, branch: state.branch, head: state.head, original: null });
     }
   } catch { /* degrade silently — M1/M2 skip without a baseline */ }
 }
@@ -1108,6 +1113,11 @@ export default function (pi: ExtensionAPI) {
             const m3 = branchOwnership.decideM3({
               branchOp, isAgentInfra: isInfra, baseline,
               currentBranch: eff.currentBranch,
+              // #376 review fold-in: the return-to-original carve-out is scoped
+              // to the repo that recorded the baseline (repoKey equality — M2
+              // semantics); a baseline owned by another checkout must not
+              // authorize a switch here.
+              repoKey: eff.repoKey,
             });
             if (m3?.block) return { block: true, reason: m3.reason };
             if (m3?.reBaseline) {

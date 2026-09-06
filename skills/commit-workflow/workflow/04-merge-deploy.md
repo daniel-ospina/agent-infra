@@ -116,6 +116,8 @@ touching the default-branch worktree. If Step B's remote delete reports
 
 **Step C — return to the session's ORIGINAL baseline (#376, agent-infra main only):**
 
+Applies ONLY to ceremonies run directly in the **agent-infra main checkout** (the #99/#265 in-main flow). Sessions working in an isolated worktree — infra or not — skip Step C; their worktree teardown (05-cleanup.md Step 3.8) handles the return.
+
 ```bash
 # The ceremony session started on main, so `main` is its ORIGINAL baseline (the
 # branch recorded at session_start BEFORE the create-new re-baseline to the PR
@@ -124,14 +126,18 @@ touching the default-branch worktree. If Step B's remote delete reports
 # stranded on the deleted feature branch for the rest of its life.
 git checkout main
 # #376: allowed — M3's return-to-original-baseline carve-out lets the session
-# switch back to the branch it provably started on (agent-infra main only); the
-# guard re-adopts main as the baseline, so no M1 deviation warning fires. Non-
-# infra repos still block switch-existing: worktrees only there (no return step).
+# switch back to the branch it provably started on. Agent-infra main ONLY, and
+# ONLY in the checkout that recorded that baseline (repoKey scoping); the guard
+# re-adopts main as the baseline, so no M1 deviation warning fires. Non-infra
+# repos and other checkouts still block switch-existing.
+
+# Step B may have deferred the merged branch's LOCAL delete while it was checked
+# out here; the return to main releases that lock. 05-cleanup.md's merged-branch
+# cleanup resolves the PR branch via `gh pr view` headRefName (never the current
+# branch), so it deletes the released local branch correctly from main.
 ```
 
-Non-agent-infra sessions skip Step C entirely — after the merge ceremony their
-feature work lives in an isolated worktree, and the main checkout is never theirs
-to return to.
+Non-agent-infra sessions and agent-infra **worktree** sessions skip Step C — after the merge ceremony their feature work lives in an isolated worktree, and 05-cleanup's teardown returns them to their base.
 
 ## Auto-merge for strict up-to-date protection (#500 — merge-race ladder)
 

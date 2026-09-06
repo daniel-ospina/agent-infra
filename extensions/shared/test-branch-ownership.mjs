@@ -157,6 +157,12 @@ ok("branchOp: checkout -B", op("checkout", ["-B", "feat/x"]) === "force-create")
 ok("branchOp: checkout --orphan", op("checkout", ["--orphan", "x"]) === "orphan");
 ok("branchOp: checkout -f", op("checkout", ["-f", "main"]) === "force");
 ok("branchOp: checkout main", op("checkout", ["main"]) === "switch-existing");
+ok("branchOp: switch main", op("switch", ["main"]) === "switch-existing");
+// #376 security fold-in: tree-ish + pathspec WITHOUT `--` is a PATH-RESTORE
+// (git silently discards uncommitted changes) — never a branch switch.
+ok("branchOp: checkout main . (restore) → other", op("checkout", ["main", "."]) === "other");
+ok("branchOp: checkout main f.txt (restore) → other", op("checkout", ["main", "f.txt"]) === "other");
+ok("branchOp: checkout -b x origin/main → create-new (start-point is NOT a pathspec)", op("checkout", ["-b", "feat/x", "origin/main"]) === "create-new");
 ok("branchOp: checkout -", op("checkout", ["-"]) === "switch-existing");
 ok("branchOp: checkout .", op("checkout", ["."]) === "other");
 ok("branchOp: checkout -- path", op("checkout", ["--", "tortoise/sdk.py"]) === "other");
@@ -218,46 +224,56 @@ ok("M3: foreign rename blocks", (() => { const d = decideM3({ branchOp: { op: "r
 // hazard doesn't apply. Non-infra repos and foreign targets stay blocked.
 const ceremony = { repoKey: mainKey, branch: "feat/2", original: "main" };
 ok("M3 #376: agent-infra switch-existing to ORIGINAL baseline → allowed (reBaseline)", (() => {
-  const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: ceremony });
+  const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
   return d?.reBaseline === "main" && !d?.block;
 })());
 ok("M3 #376: foreign target (≠ original) still blocks in agent-infra", (() => {
-  const d = decideM3({ branchOp: { op: "switch-existing", target: "feat/other" }, isAgentInfra: true, baseline: ceremony });
+  const d = decideM3({ branchOp: { op: "switch-existing", target: "feat/other" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
   return d?.block === true;
 })());
 ok("M3 #376: ORIGINAL-baseline switch still blocks in NON-infra repos (worktrees only)", (() => {
-  const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline: ceremony });
+  const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline: ceremony, repoKey: mainKey });
+  return d?.block === true;
+})());
+ok("M3 #376: original-baseline switch in a DIFFERENT repo (repoKey mismatch) blocks", (() => {
+  const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: ceremony, repoKey: "other-repo-key" });
   return d?.block === true;
 })());
 ok("M3 #376: no recorded original → switch-existing blocks (fail-closed)", (() => {
-  const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: "feat/2" } });
+  const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: "feat/2" }, repoKey: mainKey });
   return d?.block === true;
 })());
 ok("M3 #376: detached start (original null) → switch-existing blocks", (() => {
-  const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: "feat/2", original: null } });
+  const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: "feat/2", original: null }, repoKey: mainKey });
+  return d?.block === true;
+})());
+ok("M3 #376: contended-start record (original null fallback) → switch-existing blocks", (() => {
+  // _recordBaseline (pendingBaseline path) stores original: null — the tree may
+  // already sit on another session's branch, so the return must fail closed.
+  const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: "feat/2", head: "x", original: null }, repoKey: mainKey });
   return d?.block === true;
 })());
 ok("M3 #376: target-less switch-existing (symbolic-ref/update-ref) still blocks", (() => {
-  const d = decideM3({ branchOp: { op: "switch-existing" }, isAgentInfra: true, baseline: ceremony });
+  const d = decideM3({ branchOp: { op: "switch-existing" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
   return d?.block === true;
 })());
 ok("M3 #376: prev-branch '-' never equals the original → blocks", (() => {
-  const d = decideM3({ branchOp: { op: "switch-existing", target: "-" }, isAgentInfra: true, baseline: ceremony });
+  const d = decideM3({ branchOp: { op: "switch-existing", target: "-" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
   return d?.block === true;
 })());
 ok("M3 #376: other branch-state ops stay blocked (agent-infra, force/orphan/detach/force-create)", (() => {
   return ["force", "orphan", "detach", "force-create"]
-    .every((op) => decideM3({ branchOp: { op }, isAgentInfra: true, baseline: ceremony })?.block === true);
+    .every((op) => decideM3({ branchOp: { op }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey })?.block === true);
 })());
 ok("M3 #376: sanctioned return does NOT fire M1 deviation (re-baseline silences next M1)", (() => {
-  let s = { repoKey: mainKey, branch: "main", original: "main" }; // session_start on main
+  let s = { repoKey: mainKey, branch: "main", original: "main" }; // uncontended session_start on main
   // create-new re-baseline (agent-infra carve-out) → baseline.branch = feat/2
-  const c = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: true, baseline: s });
+  const c = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: true, baseline: s, repoKey: mainKey });
   if (c?.reBaseline !== "feat/2") return false;
   s = { ...s, branch: c.reBaseline };
   if (decideM1("feat/2", s.branch) !== null) return false; // on own branch: no warn
   // sanctioned return to the ORIGINAL baseline → re-baseline back to main
-  const r = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: s });
+  const r = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: s, repoKey: mainKey });
   if (r?.reBaseline !== "main" || r?.block) return false;
   s = { ...s, branch: r.reBaseline };
   // post-return: baseline.branch == main == current; original untouched → no M1 warn
@@ -265,7 +281,7 @@ ok("M3 #376: sanctioned return does NOT fire M1 deviation (re-baseline silences 
 })());
 ok("M3 #376: original is preserved across re-baselines (immutable)", (() => {
   let s = { repoKey: mainKey, branch: "feat/2", original: "main" };
-  const r = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: s });
+  const r = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: s, repoKey: mainKey });
   s = { ...s, branch: r.reBaseline }; // spread-style re-baseline mirrors _rebaseline
   return s.branch === "main" && s.original === "main";
 })());

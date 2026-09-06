@@ -505,6 +505,12 @@ expectBool("detailed+shared: branch -m own → rename", co(`git branch -m feat/a
 expectBool("detailed+shared: checkout -- path → other", co(`git checkout -- tortoise/sdk.py`)?.op === "other", true);
 expectBool("detailed+shared: checkout . → other", co(`git checkout .`)?.op === "other", true);
 expectBool("detailed+shared: checkout - → switch-existing", co(`git checkout -`)?.op === "switch-existing", true);
+// #376 security fold-in: tree-ish + pathspec WITHOUT `--` is a PATH-RESTORE
+// (never a branch switch) → classifyBranchOp "other" → M3 not entered → the
+// legacy block:checkout-branch verdict still blocks in the main checkout.
+expectBool("detailed+shared: checkout main . (restore) → other", co(`git checkout main .`)?.op === "other", true);
+expectBool("detailed+shared: checkout main f.txt (restore) → other", co(`git checkout main f.txt`)?.op === "other", true);
+dexpect("restore-from-branch verdict stays block:checkout-branch", `git checkout main .`, { verdict: "block:checkout-branch", branchState: true });
 
 // ── #376: M3 ceremony return-to-baseline pins ─────────────────────────────
 // A ceremony session started on main (original baseline, immutable), re-based
@@ -517,7 +523,7 @@ expectBool("detailed+shared: checkout - → switch-existing", co(`git checkout -
   const m3 = (cmd) => {
     const d = classifyGitCommandDetailed(cmd);
     const op = d.branchState ? sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs) : { op: "other" };
-    return sharedDecideM3({ branchOp: op, isAgentInfra: true, baseline: ceremonyBaseline, currentBranch: "feat/2" });
+    return sharedDecideM3({ branchOp: op, isAgentInfra: true, baseline: ceremonyBaseline, currentBranch: "feat/2", repoKey: "k" });
   };
   const retMain = m3(`git checkout main`);
   expectBool("#376: git checkout main → sanctioned return (reBaseline main)", retMain?.reBaseline === "main" && !retMain?.block, true);
@@ -529,8 +535,55 @@ expectBool("detailed+shared: checkout - → switch-existing", co(`git checkout -
   expectBool("#376: git checkout feat/other (≠ original) → blocked", foreign?.block === true, true);
   const prev = m3(`git checkout -`);
   expectBool("#376: git checkout - (prev-branch, ambiguous) → blocked", prev?.block === true, true);
-  const nonInfra = sharedDecideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline: ceremonyBaseline, currentBranch: "feat/2" });
+  const nonInfra = sharedDecideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline: ceremonyBaseline, currentBranch: "feat/2", repoKey: "k" });
   expectBool("#376: non-infra repo return-to-original STILL blocked", nonInfra?.block === true, true);
+}
+
+// ── #376: real-repo adapter pin (the index.ts M3 sequence on a live repo) ──
+// index.ts is not importable in tests (pi-extension TS), so replicate its exact
+// M3 adapter: classifyGitCommandDetailed → resolveEffectiveRepo →
+// isAgentInfraRepo(eff) → decideM3; assert the allow/reBaseline outcome that
+// makes index.ts `_rebaseline` + early `return undefined` beat the legacy
+// `block:checkout-branch` verdict — the crux guard-level property of #376.
+let m376Tmp = null;
+try {
+  m376Tmp = realpathSync(execSync("mktemp -d", { encoding: "utf-8" }).trim());
+  const infraR = `${m376Tmp}/infra`;
+  const nonInfraR = `${m376Tmp}/plain`;
+  for (const r of [infraR, nonInfraR]) {
+    execSync(`mkdir -p "${r}" && git init -q -b main "${r}"`, { stdio: "ignore" });
+    execSync("git config user.email t@t && git config user.name t", { cwd: r, stdio: "ignore" });
+    execSync("touch a.txt && git add . && git commit -qm init", { cwd: r, stdio: "ignore" });
+    execSync("git branch feat/2", { cwd: r, stdio: "ignore" });
+  }
+  // agent-infra fingerprint (manifest.json + pi-bootstrap/setup.sh at toplevel):
+  execSync(`mkdir -p "${infraR}/pi-bootstrap"`, { stdio: "ignore" });
+  writeFileSync(`${infraR}/manifest.json`, "{}");
+  writeFileSync(`${infraR}/pi-bootstrap/setup.sh`, "#!/bin/sh\n");
+  expectBool("#376 fixture: fingerprinted repo is agent-infra", isAgentInfraRepo(infraR) === true, true);
+  expectBool("#376 fixture: plain repo is NOT agent-infra", isAgentInfraRepo(nonInfraR) === false, true);
+  const adapter = (cmd, r, infra) => {
+    const d = classifyGitCommandDetailed(cmd);
+    const eff = sharedResolveEffectiveRepo(cmd, r, d.stateVerb ?? d.verb);
+    if (!eff) return { resolveFailed: true };
+    const op = d.branchState ? sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs) : { op: "other" };
+    // mirrors index.ts: baseline of a ceremony session whose original was main
+    const baseline = { repoKey: eff.repoKey, branch: "feat/2", original: "main" };
+    return sharedDecideM3({ branchOp: op, isAgentInfra: isAgentInfraRepo(eff.effectiveCwd), baseline, currentBranch: eff.currentBranch, repoKey: eff.repoKey });
+  };
+  const rIn = adapter(`git checkout main`, infraR, true);
+  expectBool("#376 adapter: real agent-infra repo → return-to-original allowed (reBaseline, NOT block)", rIn?.reBaseline === "main" && !rIn?.block, true);
+  const rPlain = adapter(`git checkout main`, nonInfraR, false);
+  expectBool("#376 adapter: real non-infra repo → return-to-original BLOCKED", rPlain?.block === true, true);
+  const rForeign = adapter(`git checkout feat/2`, infraR, true);
+  expectBool("#376 adapter: agent-infra repo, foreign target → BLOCKED", rForeign?.block === true, true);
+} catch (e) {
+  console.error(`❌ #376 adapter fixture FAILED to provision: ${String(e.message).slice(0, 120)}`);
+  fail++;
+} finally {
+  if (m376Tmp) {
+    try { execSync(`rm -rf "${m376Tmp}"`, { stdio: "ignore" }); } catch {}
+  }
 }
 
 // ── P1-A regression: compound commands gate on the STATE invocation ────────

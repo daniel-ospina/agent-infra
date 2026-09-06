@@ -300,6 +300,13 @@ export function classifyBranchOp(subcmd, args) {
     const pos = a.filter((x) => !x.startsWith("-"));
     if (pos.length === 0) return { op: "other" };
     if (pos[0] === "." || pos[0] === "--") return { op: "other" }; // discard-all
+    // #376 security fold-in (review P1): >1 non-flag positional = tree-ish +
+    // pathspec WITHOUT `--` — git treats this as a PATH-RESTORE, not a branch
+    // switch (`git checkout main .` discards uncommitted tree changes). Must
+    // NOT reach the M3 switch-existing carve-out (which would allow it when the
+    // target equals the original baseline). Classify "other" → the legacy
+    // block:checkout-branch / block:checkout-discard-all verdict still blocks.
+    if (pos.length > 1) return { op: "other" }; // path-restore form
     return { op: "switch-existing", target: pos[0] };
   }
   if (subcmd === "symbolic-ref") {
@@ -425,9 +432,11 @@ export function decideM2({
  *     synchronous re-baseline keeps the next tool_call's M1 warn silent.
  *   everything else (switch-existing to any OTHER branch / force / force-create
  *   / orphan / detach / symbolic-ref HEAD / update-ref refs/heads / branch -f)
- *   → block.
+ *   → block. The #376 return arm additionally requires repoKey === baseline.repoKey
+ *   (the resolved repo is the ONE where the original baseline was recorded — a
+ *   cd into a DIFFERENT agent-infra clone must not authorize a switch there).
  */
-export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch }) {
+export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey }) {
   if (!branchOp) return null;
   const op = branchOp.op;
   if (op === "create-new") {
@@ -461,11 +470,16 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch }) {
   // #376 carve-out: sanctioned ceremony return-to-baseline — switch back to the
   // branch this session STARTED on (before any create-new re-baseline), allowed
   // in agent-infra main only. No original recorded (session never proved its own
-  // start state) → fail-closed block, matching the pre-#376 behavior.
+  // start state) → fail-closed block. The resolved repo must be the SAME repo
+  // that recorded the original baseline (repoKey equality — M2 semantics); a
+  // baseline owned by another agent-infra checkout must not authorize a switch
+  // in this one (review fold-in, #376).
   if (
     op === "switch-existing"
     && isAgentInfra
     && baseline?.original
+    && baseline?.repoKey != null
+    && baseline.repoKey === repoKey
     && branchOp.target === baseline.original
   ) {
     return { reBaseline: branchOp.target };
