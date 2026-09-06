@@ -345,7 +345,8 @@ test("child healthy / quoted / user-tool turns → NO marker, NO pending state",
 
 section("extension — interactive (tui) message_end → durable latch + hop");
 
-test("interactive 402: durable latch + notice + setModel hop onto the chain leg", async () => {  const { env, cleanup } = hermetic();
+test("interactive 402: durable latch + notice + setModel hop onto the chain leg", async () => {
+  const { env, cleanup } = hermetic();
   applyEnv(env);
   try {
     const pi = makeFakePi();
@@ -411,6 +412,33 @@ test("interactive healthy turn → nothing latched, no hop", async () => {
     equal(pi.setModelCalls.length, 0);
     const state = readLatchState(env);
     deepEqual(state.primaries, {});
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
+test("HOP-OWN drain under a healthy root: own record + DIRECT return to the primary (no dead intermediate hop, round-3 P2-1)", async () => {
+  const { env, cleanup } = hermetic();
+  applyEnv(env);
+  try {
+    // Session explicitly on the openrouter hop leg; deepseek root NEVER
+    // latched (healthy). openrouter's OWN credits drain (independent account).
+    const pi = makeFakePi();
+    extension(pi as any);
+    await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
+    const state = readLatchState(env);
+    ok(state.primaries.openrouter !== undefined, "drain recorded under the DRAINED hop provider's own entry");
+    ok(state.primaries.deepseek === undefined, "healthy root NOT latched on another account's evidence");
+    equal(pi.setModelCalls.length, 1, "one model switch");
+    equal(pi.setModelCalls[0].provider, "deepseek", "switch goes DIRECTLY to the family primary");
+    equal(pi.setModelCalls[0].id, "deepseek-v4-flash");
+    // No dead intermediate hop to a deeper leg, and the next turn_start must
+    // NOT fire a restore (already on the primary — interactiveRestoreTarget
+    // returns null when the session is already on the root leg).
+    const n = pi.setModelCalls.length;
+    await pi.emit("turn_start", { turnIndex: 1 }, ctx("tui", modelObj("deepseek", "deepseek-v4-flash")));
+    equal(pi.setModelCalls.length, n, "already on the primary → no further restore");
   } finally {
     restoreEnv();
     cleanup();
