@@ -3149,6 +3149,103 @@ testAsync("runFailoverDecisionLoop: healthy result returns untouched (no annotat
   }
 });
 
+// ── #512 venice cold-class — off-table leg through the DECISION LOOP ──
+// Mechanism exercise (amendment-3 P2 fallback): the scripted-fake-child
+// precedent asserts the classifier→marker→latch→hop WIRING for an off-table
+// venice dispatch. The classifier itself is pinned at the unit level
+// (provider-failover.test.ts) on docs-anchored venice bodies; the REAL venice
+// 402 body capture stays OPEN (#512 P1-4/0b) — these fixtures are mechanism
+// fixtures, not real-body proof.
+
+section("#512 venice — off-table leg through resolveDispatchLeg + the decision loop");
+
+test("resolveDispatchLeg: venice ask with clear state → venice (must-stay, never hops to the table)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const out = resolveDispatchLeg(
+      { provider: "venice", model: "deepseek-v4-flash" },
+      { version: 1, epoch: 0, updatedAt: "", primaries: {}, blockedLegs: {} },
+      { env },
+    );
+    equal(out.halted, false);
+    equal(out.family, "deepseek-v4-flash", "familyOf is id-based — venice/flash IS a family dispatch");
+    deepEqual(out.leg, { provider: "venice", model: "deepseek-v4-flash" });
+  } finally {
+    cleanup();
+  }
+});
+
+testAsync("venice walk: venice 402 → deepseek official 402 → openrouter (full cold-chain)", async () => {
+  const { env, cleanup } = freshFailoverEnv();
+  const spawned: LegRef[] = [];
+  const mk = (reason: string, provider: string, hop: string): ExhaustionMarker => ({
+    kind: "provider-exhaustion",
+    hop,
+    model: "deepseek-v4-flash",
+    reason,
+    provider,
+    nonce: "v-nonce",
+  });
+  try {
+    const initial = {
+      status: "success" as const,
+      value: { content: [] as any[], details: { exhaustionMarker: mk("402", "venice", "venice->venice") } },
+    };
+    const out = await runFailoverDecisionLoop({
+      family: "deepseek-v4-flash",
+      failoverActive: true,
+      dispatchLeg: { provider: "venice", model: "deepseek-v4-flash" },
+      result: initial,
+      env,
+      spawn: async (leg: LegRef) => {
+        spawned.push(leg);
+        // every hop leg ALSO dies with an authentic 402 marker → the walk
+        // continues to the next chain leg (marker advances are chain-bounded)
+        return {
+          status: "success",
+          value: { content: [] as any[], details: { exhaustionMarker: mk("402", leg.provider, `${leg.provider}->x`) } },
+        };
+      },
+    });
+    // venice latched under its OWN record (never the deepseek root)
+    const state = readLatchState(env);
+    equal(state.primaries.venice.status, "exhausted", "venice drain records under venice");
+    equal(state.primaries.venice.families["deepseek-v4-flash"].activeLeg?.provider, "deepseek", "venice record advances onto deepseek official (root was healthy at write time)");
+    // deepseek latched only via its OWN subsequent drain (the hop target 402'd)
+    equal(state.primaries.deepseek.status, "exhausted", "deepseek root latched by its own marker (legit root drain)");
+    equal(state.primaries.deepseek.families["deepseek-v4-flash"].terminal, true, "openrouter drain terminalized the chain");
+    // hop order: venice 402 → deepseek official → openrouter (qwen-tp blocked)
+    ok(spawned.length >= 2, `expected ≥2 re-dispatches, got ${spawned.length}`);
+    equal(spawned[0].provider, "deepseek", "first hop after venice = deepseek official");
+    equal(spawned[1].provider, "openrouter", "second hop after deepseek = openrouter");
+    ok(out.halted === null || out.halted.family === "deepseek-v4-flash", "walk terminates (chain-bounded)");
+  } finally {
+    cleanup();
+  }
+});
+
+test("decidePostDispatch: blocked venice marker (401) → markLegBlocked under venice; NOT exhaustion", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    const decision = decidePostDispatch({
+      result: { content: [{ type: "text", text: "err" }], details: { exitCode: 1 } },
+      dispatched: { provider: "venice", model: "deepseek-v4-flash" },
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      sawToolsUnknown: false,
+      marker: mkMarker({ reason: "blocked", provider: "venice", hop: "venice->venice" }),
+      env,
+    });
+    equal(decision.action, "return");
+    equal(decision.annotations.failoverBlocked, true);
+    const state = readLatchState(env);
+    equal(state.blockedLegs.venice.reason, "marker:blocked", "401 evidence blocks the venice leg (durable)");
+    ok(!state.primaries["venice"], "auth-block is NOT an exhaustion latch");
+  } finally {
+    cleanup();
+  }
+});
+
   for (const t of asyncTests) await t();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
   if (failed > 0) {

@@ -35,6 +35,7 @@ import {
   scanStderrForExhaustion,
   latchStateFile,
   PF_LOCK_WAIT_MS,
+  legIsFamilyMember,
 } from "./provider-failover.js";
 
 import * as fs from "node:fs";
@@ -131,6 +132,58 @@ test("aliyun 401 blocked body → auth_permanent (never exhaustion)", () => {
 
 test("'API-key is blocked' 401 → auth_permanent", () => {
   equal(classifyExhaustionText("401 API-key is blocked").kind, "auth_permanent");
+});
+
+section("classifyExhaustionText — venice 402 patterns (#512 amendment-3 P1, docs-anchored)");
+
+test("venice INSUFFICIENT_BALANCE 'Insufficient USD or Diem balance…' → exhaustion/low_balance", () => {
+  const cls = classifyExhaustionText(
+    "Insufficient USD or Diem balance to complete request. Please top up your account or wait for balance replenishment.",
+  );
+  equal(cls.kind, "exhaustion");
+  equal(cls.reason, "low_balance");
+  equal(cls.matched, "venice-insufficient-usd-or-diem");
+});
+
+test("venice 402 status + 'USD or Diem' body → exhaustion/402", () => {
+  const cls = classifyExhaustionText(
+    'HTTP 402: {"error":{"code":"INSUFFICIENT_BALANCE","message":"Insufficient USD or Diem balance to complete request"}}',
+  );
+  equal(cls.kind, "exhaustion");
+  equal(cls.reason, "402");
+});
+
+test("venice API_KEY_USD_SPEND_LIMIT_EXCEEDED code → exhaustion (code-token anchor)", () => {
+  const cls = classifyExhaustionText(
+    '{"error":{"code":"API_KEY_USD_SPEND_LIMIT_EXCEEDED","message":"API key spend limit exceeded for the current month"}}',
+  );
+  equal(cls.kind, "exhaustion");
+  equal(cls.matched, "venice-spend-limit-code");
+});
+
+test("venice API_KEY_DIEM_SPEND_LIMIT_EXCEEDED code → exhaustion", () => {
+  const cls = classifyExhaustionText('{"error":{"code":"API_KEY_DIEM_SPEND_LIMIT_EXCEEDED","message":"Diem spend limit exceeded"}}');
+  equal(cls.kind, "exhaustion");
+});
+
+test("FALSIFICATION: bare 'spend limit exceeded' prose WITHOUT the code token → null (never exhaustion)", () => {
+  const cls = classifyExhaustionText("Spend limit exceeded for this request. Contact your administrator.");
+  ok(cls.kind === null || cls.kind === "audit_only", `bare spend-limit prose must not latch (got ${cls.kind})`);
+});
+
+test("FALSIFICATION: venice PRO_ONLY_MODEL / model-tier error → null (not balance/auth)", () => {
+  const cls = classifyExhaustionText('{"error":{"code":"PRO_ONLY_MODEL","message":"This model requires a Pro subscription"}}');
+  equal(cls.kind, null);
+  const cls2 = classifyExhaustionText('{"error":{"code":"MODEL_NOT_FOUND","message":"The model you requested does not exist"}}');
+  equal(cls2.kind, null);
+});
+
+test("FALSIFICATION: venice AUTHENTICATION_FAILED 401 with key wording → auth_permanent (never exhaustion)", () => {
+  const cls = classifyExhaustionText(
+    '{"error":{"code":"AUTHENTICATION_FAILED","message":"API key is invalid or has expired. Check https://docs.venice.ai for details"}}',
+  );
+  equal(cls.kind, "auth_permanent");
+  equal(cls.reason, "blocked");
 });
 
 section("classifier narrowing pins (deep-review) — generic fragments never false-block");
@@ -621,6 +674,217 @@ test("hopCount contract: first active-leg set = 1; re-advance from active leg = 
   fam = readLatchState(env).primaries.deepseek.families["deepseek-v4-flash"];
   equal(fam.activeLeg?.provider, "openrouter", "re-advance onto openrouter");
   equal(fam.hopCount, 2, "marker from the CURRENT active leg counts a re-advance");
+});
+
+// ── #512 venice cold-class routing — independent-provider discriminator ──
+// The venice leg (off-table per-dispatch request) must never be root-shadowed
+// on the read side and never absorbed into the root record on the write side.
+// Table-leg asks stay byte-identical (existing pins above are the parity
+// proof — this section asserts the discriminator helper + the two divergence
+// cases + the TTL self-heal cadence + byte-parity guard pairs).
+
+section("#512 venice — independent-provider discriminator (read+write)");
+
+test("legIsFamilyMember: table legs true; off-table (venice) false; no family false", () => {
+  ok(legIsFamilyMember("deepseek-v4-flash", "deepseek"), "root leg is a member");
+  ok(legIsFamilyMember("deepseek-v4-flash", "qwen-tp"), "rename hop leg is a member");
+  ok(legIsFamilyMember("deepseek-v4-flash", "openrouter"), "openrouter hop leg is a member");
+  ok(legIsFamilyMember("deepseek-v4-pro", "openrouter"), "pro family openrouter leg is a member");
+  ok(!legIsFamilyMember("deepseek-v4-flash", "venice"), "venice is NOT a family member (off-table)");
+  ok(!legIsFamilyMember("deepseek-v4-flash", "zai"), "any off-table provider is independent");
+  ok(!legIsFamilyMember(undefined, "venice"), "no family → not a member");
+});
+
+const VENICE_FLASH = { provider: "venice", model: "deepseek-v4-flash" };
+
+test("READ parity: venice-ask with NO latch anywhere → clear (dispatches venice)", () => {
+  const { env } = makeEnv("v-read-clear");
+  const state = readLatchState(env);
+  const out = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, state, { env });
+  equal(out.reason, "clear");
+  equal(out.halted, false);
+  equal(out.leg?.provider, "venice", "must-stay on the explicitly requested leg");
+  equal(out.leg?.model, "deepseek-v4-flash");
+});
+
+test("READ P2-1 pin: venice-ask under a FRESH deepseek-root latch → dispatches venice (no root-shadow)", () => {
+  const { env } = makeEnv("v-read-shadow");
+  // in-flight deepseek root exhaustion (root FRESH, activeLeg=openrouter)
+  setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: FLASH_PRIMARY,
+    env,
+  });
+  const state = readLatchState(env);
+  ok(isLatched("deepseek", state, { env }), "root is freshly latched (setup)");
+  // a cold-class venice ask must NOT resolve onto the root's active leg or halt
+  const out = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, state, { env });
+  equal(out.reason, "clear", "venice is its own account — root latch is irrelevant");
+  equal(out.leg?.provider, "venice");
+  equal(out.halted, false);
+  // table-leg parity under the SAME state: the deepseek root ask still hops
+  // (byte-parity — the discriminator only changed the off-table path)
+  const rootAsk = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
+  equal(rootAsk.reason, "latched-active");
+  equal(rootAsk.leg?.provider, "openrouter");
+});
+
+test("WRITE P2-1 pin: venice-402 under a FRESH deepseek-root latch → records under venice, root untouched", () => {
+  const { env } = makeEnv("v-write-shadow");
+  setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: FLASH_PRIMARY,
+    env,
+  });
+  const before = readLatchState(env);
+  const rootFamBefore = JSON.stringify(before.primaries.deepseek.families["deepseek-v4-flash"]);
+  // venice drains while the deepseek root is still freshly latched
+  const state = setExhausted({
+    primaryProvider: "venice",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: VENICE_FLASH,
+    env,
+  });
+  ok(isLatched("venice", state, { env }), "venice has its own fresh record");
+  // the ROOT record is byte-identical (family state NOT re-advanced/re-written)
+  equal(
+    JSON.stringify(state.primaries.deepseek.families["deepseek-v4-flash"]),
+    rootFamBefore,
+    "deepseek root family state untouched by venice evidence",
+  );
+  ok(!isLatched("qwen-tp", state, { env }) && !state.primaries["qwen-tp"], "no stray record");
+  // venice own record carries the chain advance: off-table fromLeg → next is
+  // the first AVAILABLE family leg. Under this fixture the deepseek root is
+  // freshly latched (in-flight exhaustion) → unavailableProviders skips it →
+  // the advance lands on openrouter. (With a healthy root the advance lands
+  // on legs[0] = deepseek official — asserted by the no-root-latch pins
+  // below.) Either way the #512 chain venice→deepseek→openrouter holds.
+  const fam = state.primaries.venice.families["deepseek-v4-flash"];
+  ok(fam, "venice record carries family state");
+  equal(fam.activeLeg?.provider, "openrouter", "off-table drain advances onto the first AVAILABLE family leg (root latched → skip deepseek)");
+  equal(fam.hopCount, 1);
+});
+
+test("WRITE: venice-402 with NO root latch → venice own record advances onto deepseek official (legs[0])", () => {
+  const { env } = makeEnv("v-write-noroot");
+  const state = setExhausted({
+    primaryProvider: "venice",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: VENICE_FLASH,
+    env,
+  });
+  ok(isLatched("venice", state, { env }), "venice own record");
+  ok(!state.primaries["deepseek"], "healthy root never latched on venice evidence");
+  const fam = state.primaries.venice.families["deepseek-v4-flash"];
+  equal(fam.activeLeg?.provider, "deepseek", "venice→deepseek official (legs[0]) with a healthy root");
+  equal(fam.activeLeg?.model, "deepseek-v4-flash");
+});
+
+test("WRITE parity: hop-leg (openrouter) drain under fresh root still records under the root (byte-parity)", () => {
+  const { env } = makeEnv("v-write-parity");
+  setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: FLASH_PRIMARY,
+    env,
+  });
+  // openrouter drains as a continuation of the in-flight root exhaustion
+  const state = setExhausted({
+    primaryProvider: "openrouter",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    env,
+  });
+  ok(isLatched("deepseek", state, { env }), "record continues under the root (in-flight continuation)");
+  equal(state.primaries.deepseek.families["deepseek-v4-flash"].activeLeg, null, "terminal — nothing after openrouter");
+  ok(!state.primaries["openrouter"], "no own openrouter record — absorbed by the root (unchanged #476 semantics)");
+});
+
+test("READ: next venice ask after a venice own-latch → hops onto the own record's active leg (deepseek official)", () => {
+  const { env } = makeEnv("v-read-hop");
+  setExhausted({
+    primaryProvider: "venice",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: VENICE_FLASH,
+    env,
+  });
+  const state = readLatchState(env);
+  const out = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, state, { env });
+  equal(out.reason, "latched-active");
+  equal(out.leg?.provider, "deepseek", "venice latched → resolution hops to deepseek official");
+  equal(out.leg?.model, "deepseek-v4-flash");
+  equal(out.hop, "venice->deepseek");
+});
+
+test("chain continuation: deepseek official also 402s after a venice drain → openrouter emerges", () => {
+  const { env } = makeEnv("v-chain");
+  // 1) venice drains → own record, activeLeg=deepseek official
+  setExhausted({
+    primaryProvider: "venice",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: VENICE_FLASH,
+    env,
+  });
+  // 2) deepseek official drains (the hop target from venice) — a REAL root
+  // drain (fromLeg IS the root) → records under the root, activeLeg=openrouter
+  setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: FLASH_PRIMARY,
+    env,
+  });
+  const state = readLatchState(env);
+  // 3) the venice own record's activeLeg (deepseek) is now unavailable → the
+  // next venice ask advances past it to openrouter (unavailableProviders)
+  const out = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, state, { env });
+  equal(out.reason, "latched-advance");
+  equal(out.leg?.provider, "openrouter", "venice→deepseek→openrouter fallback chain");
+  equal(out.leg?.model, "deepseek/deepseek-v4-flash");
+  ok(isLatched("venice", state, { env }), "venice record persists");
+});
+
+test("per-TTL cadence pin: a venice own-latch self-heals after one TTL (no venice poller — TTL-only restore)", () => {
+  const { env } = makeEnv("v-ttl");
+  const shortEnv = { ...env, PROVIDER_EXHAUSTION_TTL_MS: "200" };
+  setExhausted({
+    primaryProvider: "venice",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: VENICE_FLASH,
+    env: shortEnv,
+  });
+  const t0 = Date.now();
+  // within TTL → latched → hops off venice
+  const latched = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, readLatchState(shortEnv), { env: shortEnv, now: t0 });
+  ok(latched.reason.startsWith("latched"), "within TTL the venice latch governs");
+  // after TTL → stale → clear → venice re-probed (bounded re-probe cadence)
+  const healed = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, readLatchState(shortEnv), {
+    env: shortEnv,
+    now: t0 + 250,
+  });
+  equal(healed.reason, "clear");
+  equal(healed.leg?.provider, "venice", "stale latch self-heals → venice re-probed at most once per TTL");
 });
 
 // ── Review-fix regressions (Phase-1 review P1/P2/P3) ────────────────

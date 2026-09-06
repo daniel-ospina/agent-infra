@@ -277,6 +277,25 @@ export function familyLegs(family: string): LegRef[] | undefined {
   return ALIAS_FAMILIES[family]?.legs;
 }
 
+/** Is `provider` a member of the family's chain table (root + hop legs)?
+ * Providers NOT in the table are INDEPENDENT accounts for that family
+ * (#512): a request for them is an explicit per-dispatch choice (the cold-
+ * class venice seam), not a chain hop — so their resolution and exhaustion
+ * records must never be absorbed by the family root's latch state (no
+ * root-shadow; own-account write placement).
+ *
+ * The discriminator is used identically on BOTH the read side
+ * (resolveWithChain) and the write side (setExhausted) so the root-shadow
+ * and the account-of-record placement cannot disagree. A provider in
+ * ({root} ∪ family legs) keeps the #476 semantics byte-for-byte — this
+ * helper returns true for every existing table leg (deepseek/qwen-tp/
+ * openrouter), so existing pins are the byte-parity proof. */
+export function legIsFamilyMember(family: string | undefined, provider: string): boolean {
+  if (!family) return false;
+  const legs = familyLegs(family);
+  return legs !== undefined && legs.some((l) => l.provider === provider);
+}
+
 // ── Exhaustion signature (text classifier) ──────────────────────────────────
 
 export type ExhaustionKind = "exhaustion" | "auth_permanent" | "audit_only" | null;
@@ -307,6 +326,33 @@ const SIG_402_CREDIT = /402[^\n]{0,160}(insufficient|credit\s+balance|too\s+low|
 /** Fuzzy billing wording WITHOUT 402 → audit-only (never latches). */
 const SIG_FUZZY = /(insufficient_quota|insufficient quota|billing|usage limit reached|monthly usage|quota exceeded|credit balance)/i;
 const SIG_AUTH_KEY = /(invalid\s+x-api-key|invalid\s+api[_-]?key|api[_-]?key.{0,40}(invalid|incorrect|blocked)|api\s+key.{0,40}(invalid|incorrect|blocked)|incorrect\s+api\s+key|invalid_api_key|apikey-error)/i;
+/** Venice 402/exhaustion patterns (#512, docs-anchored — docs.venice.ai
+ * /api-reference/error-codes; amendment-3 P1). The published schema:
+ *   - error.code INSUFFICIENT_BALANCE, message "Insufficient USD or Diem
+ *     balance to complete request…" — the "USD or Diem" interjection breaks
+ *     SIG_INSUFFICIENT_BALANCE (contiguous "insufficient balance" only); no
+ *     credit/402 token → every pre-extension signature missed it → null →
+ *     no marker → no latch → the exact event #512 exists for silently fails
+ *     reviews.
+ *   - error.code API_KEY_DIEM_SPEND_LIMIT_EXCEEDED /
+ *     API_KEY_USD_SPEND_LIMIT_EXCEEDED, message "…spend limit exceeded…" —
+ *     contains NO (insufficient|credit|too low|exhausted) token, so the
+ *     spend-limit wording alone must not classify; the snake-case CODE token
+ *     is the anchor (OpenAI-compatible bodies carry code next to message).
+ *   - 401-class: AUTHENTICATION_FAILED bodies carry key wording ("API key …
+ *     invalid") → SIG_AUTH_KEY above fires first; PRO_ONLY_MODEL is a
+ *     model-tier error (NOT balance/auth) → stays null (audit-only).
+ * NOTE (residual, #512 P1-4/0b): fixtures are docs-anchored/assumed — the
+ * classifier link is MECHANISM-verified via the mock-endpoint test; a REAL
+ * venice 402 body is an OPEN operator gate until a drained second account
+ * or go-live capture lands. If a real body later misses, extend these
+ * signatures (same route as OpenRouter's body forcing SIG_CREDIT_LOW). */
+const SIG_VENICE_INSUFFICIENT = /insufficient\s+USD\s+or\s+Diem\s+balance/i;
+/** Snake-case balance/spend code tokens (OpenAI-compatible error.code field). */
+const SIG_VENICE_BALANCE_CODE = /\b(?:INSUFFICIENT_BALANCE|API_KEY_(?:USD|DIEM)_SPEND_LIMIT_EXCEEDED)\b/;
+/** Spend-limit prose co-occurring with the code token (prose alone never
+ * classifies — no balance/credit semantic without the code). */
+const SIG_SPEND_LIMIT_PROSE = /spend\s+limit\s+exceeded/i;
 
 /**
  * Classify a provider error/status text against the exhaustion signature.
@@ -340,6 +386,31 @@ export function classifyExhaustionText(text: string | null | undefined): Exhaust
       kind: "exhaustion",
       reason: has402 ? "402" : "low_balance",
       matched: "insufficient-balance",
+    };
+  }
+  // Venice (#512, amendment-3 P1): the published "Insufficient USD or Diem
+  // balance" message — the "USD or Diem" interjection sits between
+  // "insufficient" and "balance", so the contiguous signature above cannot
+  // match it. Classified AFTER the canonical contiguous form (exact-match
+  // precedence), with the same 402/low_balance reason split on the status.
+  if (SIG_VENICE_INSUFFICIENT.test(t)) {
+    return {
+      kind: "exhaustion",
+      reason: has402 ? "402" : "low_balance",
+      matched: "venice-insufficient-usd-or-diem",
+    };
+  }
+  // Venice spend-limit class: the code token (INSUFFICIENT_BALANCE /
+  // API_KEY_*_SPEND_LIMIT_EXCEEDED) is the anchor — the prose alone
+  // ("spend limit exceeded") carries no balance/credit semantic and must not
+  // classify. An OpenAI-compatible 402 body ships the snake code next to the
+  // message, so code-token co-occurrence with the prose (or the code token
+  // alone — the message may not repeat it) is the exhaustion signal.
+  if (SIG_VENICE_BALANCE_CODE.test(t)) {
+    return {
+      kind: "exhaustion",
+      reason: has402 ? "402" : "low_balance",
+      matched: SIG_SPEND_LIMIT_PROSE.test(t) ? "venice-spend-limit-code" : "venice-balance-code",
     };
   }
   if (SIG_CREDIT_LOW.test(t)) {
@@ -864,9 +935,21 @@ export function resolveWithChain(
   const own = state.primaries[requested.provider];
   const rootRec = rootPrimary ? state.primaries[rootPrimary] : undefined;
   const isRootAsk = rootPrimary === undefined || requested.provider === rootPrimary;
+  // #512 independent-provider rule (read side): a requested provider that is
+  // NOT a member of the family chain table (e.g. venice — the cold-class
+  // per-dispatch seam) is its OWN account. Its resolution must NEVER consult
+  // the family root record — while the deepseek root is freshly latched
+  // (in-flight exhaustion), an off-table venice ask must still resolve to
+  // venice ("clear" when venice has no own record), not get root-shadowed
+  // onto the root's active leg (openrouter) or halted. Table-leg asks
+  // (deepseek root / qwen-tp / openrouter hops) keep the #476 root-shadow
+  // semantics byte-for-byte (legIsFamilyMember is true for every table leg).
+  const independentAsk = !isRootAsk && !legIsFamilyMember(family, requested.provider);
   let primary: PrimaryLatch | undefined;
   if (isRootAsk) {
     primary = own ?? rootRec;
+  } else if (independentAsk) {
+    primary = own;
   } else {
     const rootFresh = rootRec ? recordFresh(rootRec, now, ttl) : false;
     const ownFresh = own ? recordFresh(own, now, ttl) : false;
@@ -936,7 +1019,24 @@ export function setExhausted(input: LatchInput): LatchState {
     const fromIsRoot = input.fromLeg ? root !== undefined && input.fromLeg.provider === root : input.primaryProvider === root;
     const rootRec = root ? cur.primaries?.[root] : undefined;
     const rootFresh = rootRec ? recordFresh(rootRec, now, ttl) : false;
-    const primaryProvider = root && (fromIsRoot || rootFresh) ? root : input.primaryProvider;
+    // #512 independent-provider rule (write side): a drain on an OFF-TABLE
+    // leg (provider not in the family chain — e.g. venice) is that provider's
+    // OWN account event ALWAYS. Even under a FRESH root latch (in-flight
+    // deepseek exhaustion), venice's drain evidence must record under
+    // primaries["venice"] — never re-latch/advance the deepseek root on
+    // another account's evidence — so the next cold dispatch resolves the
+    // fresh venice record and hops off venice itself. Mirrors the read side
+    // (resolveWithChain independentAsk): the discriminator is identical, so
+    // root-shadow and write placement cannot disagree. Table-leg drains keep
+    // the #476 account-of-record placement (root when in-flight/root leg).
+    const fromIsIndependent =
+      input.fromLeg !== undefined &&
+      !legIsFamilyMember(input.family, input.fromLeg.provider);
+    const primaryProvider = fromIsIndependent
+      ? input.primaryProvider
+      : root && (fromIsRoot || rootFresh)
+        ? root
+        : input.primaryProvider;
     const existing = cur.primaries[primaryProvider];
     const fam = input.family;
     const families: Record<string, FamilyLatch> = { ...(existing?.families ?? {}) };
