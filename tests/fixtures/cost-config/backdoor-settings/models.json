@@ -28,7 +28,7 @@
           "input": [
             "text"
           ],
-          "contextWindow": 400000,
+          "contextWindow": 300000,
           "maxTokens": 384000,
           "thinkingLevelMap": {
             "minimal": null,
@@ -51,7 +51,7 @@
           "input": [
             "text"
           ],
-          "contextWindow": 400000,
+          "contextWindow": 300000,
           "maxTokens": 384000,
           "thinkingLevelMap": {
             "minimal": null,
@@ -70,7 +70,7 @@
       ],
       "modelOverrides": {
         "deepseek-v4-flash-vision-exp": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         }
       }
     },
@@ -101,7 +101,7 @@
           "input": [
             "text"
           ],
-          "contextWindow": 400000,
+          "contextWindow": 300000,
           "maxTokens": 384000,
           "thinkingLevelMap": {
             "minimal": null,
@@ -112,6 +112,12 @@
           },
           "compat": {
             "thinkingFormat": "deepseek"
+          },
+          "cost": {
+            "input": 0.2608,
+            "output": 0.7825,
+            "cacheRead": 0.0083,
+            "cacheWrite": 0
           }
         },
         {
@@ -121,7 +127,7 @@
           "input": [
             "text"
           ],
-          "contextWindow": 400000,
+          "contextWindow": 300000,
           "maxTokens": 384000,
           "thinkingLevelMap": {
             "minimal": null,
@@ -132,6 +138,12 @@
           },
           "compat": {
             "thinkingFormat": "deepseek"
+          },
+          "cost": {
+            "input": 0.7825,
+            "output": 2.3475,
+            "cacheRead": 0.0261,
+            "cacheWrite": 0
           }
         }
       ]
@@ -175,70 +187,70 @@
     "openrouter": {
       "modelOverrides": {
         "deepseek/deepseek-v4-flash": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek/deepseek-v4-flash-0731": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek/deepseek-v4-flash-vision-exp": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek/deepseek-v4-pro": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek/deepseek-v4-pro-0813": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "~deepseek/deepseek-v4-flash-latest": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         }
       }
     },
     "qwen-token-plan": {
       "modelOverrides": {
         "deepseek-v4-flash": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek-v4-flash-0731": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro-0813": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         }
       }
     },
     "qwen-token-plan-cn": {
       "modelOverrides": {
         "deepseek-v4-flash": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek-v4-flash-0731": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro-0813": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         }
       }
     },
     "qwen-token-plan-individual": {
       "modelOverrides": {
         "deepseek-v4-flash": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek-v4-flash-0731": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         },
         "deepseek-v4-pro-0813": {
-          "contextWindow": 400000
+          "contextWindow": 300000
         }
       }
     }
