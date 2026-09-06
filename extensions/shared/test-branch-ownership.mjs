@@ -156,6 +156,8 @@ ok("branchOp: switch -c", op("switch", ["-c", "feat/x"]) === "create-new");
 ok("branchOp: checkout -B", op("checkout", ["-B", "feat/x"]) === "force-create");
 ok("branchOp: checkout --orphan", op("checkout", ["--orphan", "x"]) === "orphan");
 ok("branchOp: checkout -f", op("checkout", ["-f", "main"]) === "force");
+ok("branchOp: checkout --force → force", op("checkout", ["--force", "main"]) === "force");
+ok("branchOp: switch --discard-changes → force (never the #376 return)", op("switch", ["--discard-changes", "main"]) === "force");
 ok("branchOp: checkout main", op("checkout", ["main"]) === "switch-existing");
 ok("branchOp: switch main", op("switch", ["main"]) === "switch-existing");
 // #376 security fold-in: tree-ish + pathspec WITHOUT `--` is a PATH-RESTORE

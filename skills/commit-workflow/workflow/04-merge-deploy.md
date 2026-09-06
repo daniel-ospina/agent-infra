@@ -126,10 +126,11 @@ Applies ONLY to ceremonies run directly in the **agent-infra main checkout** (th
 # stranded on the deleted feature branch for the rest of its life.
 git checkout main
 # #376: allowed — M3's return-to-original-baseline carve-out lets the session
-# switch back to the branch it provably started on. Agent-infra main ONLY, and
-# ONLY in the checkout that recorded that baseline (repoKey scoping); the guard
-# re-adopts main as the baseline, so no M1 deviation warning fires. Non-infra
-# repos and other checkouts still block switch-existing.
+# switch back to the branch recorded at its session_start (its de-facto baseline;
+# the lock serializes concurrent starts only). Agent-infra main ONLY, and ONLY in
+# the checkout that recorded that baseline (repoKey scoping); the guard re-adopts
+# main as the baseline, so no M1 deviation warning fires. Non-infra repos and
+# other checkouts still block switch-existing.
 
 # Step B may have deferred the merged branch's LOCAL delete while it was checked
 # out here; the return to main releases that lock. Deleting it now is own-branch

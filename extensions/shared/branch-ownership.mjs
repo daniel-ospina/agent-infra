@@ -294,7 +294,7 @@ export function classifyBranchOp(subcmd, args) {
     if (flag("--orphan")) return { op: "orphan" };
     if (flag("-B")) return { op: "force-create", branch: _branchAfter(a, "-B") };
     if (flag("-b") || flag("-c")) return { op: "create-new", branch: _branchAfter(a, flag("-b") ? "-b" : "-c") };
-    if (flag("-f") || flag("--force")) return { op: "force" };
+    if (flag("-f") || flag("--force") || flag("--discard-changes")) return { op: "force" }; // --discard-changes is git's force-switch alias (throws away local modifications — second-model gate fold-in)
     if (flag("--detach")) return { op: "detach" };
     if (a.includes("-")) return { op: "switch-existing", target: "-" }; // prev branch
     const pos = a.filter((x) => !x.startsWith("-"));
@@ -427,8 +427,11 @@ export function decideM2({
  *   switch-existing to the session's ORIGINAL baseline branch (baseline.original
  *     — the branch recorded at session_start BEFORE any create-new re-baseline):
  *     allowed in agent-infra main → { reBaseline: <target> } — the sanctioned
- *     post-ceremony return-to-main (#376). The target is provably the session's
- *     OWN starting state, so the #265 parallel-agent hazard doesn't apply; the
+ *     post-ceremony return-to-main (#376). The target is the session's de-facto
+ *     own baseline: the branch the shared tree was on when THIS session started
+ *     (the lock serializes concurrent starts only — a resumed/overlapping start
+ *     records whatever branch was current). Harm is bounded exactly like the
+ *     create-new carve-out: M2 still blocks off-baseline commits. The
  *     synchronous re-baseline keeps the next tool_call's M1 warn silent.
  *   everything else (switch-existing to any OTHER branch / force / force-create
  *   / orphan / detach / symbolic-ref HEAD / update-ref refs/heads / branch -f)
@@ -469,11 +472,11 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
   }
   // #376 carve-out: sanctioned ceremony return-to-baseline — switch back to the
   // branch this session STARTED on (before any create-new re-baseline), allowed
-  // in agent-infra main only. No original recorded (session never proved its own
-  // start state) → fail-closed block. The resolved repo must be the SAME repo
-  // that recorded the original baseline (repoKey equality — M2 semantics); a
-  // baseline owned by another agent-infra checkout must not authorize a switch
-  // in this one (review fold-in, #376).
+  // in agent-infra main only. No original recorded (contended/detached start —
+  // the tree may already sit on ANOTHER session's branch) → fail-closed block.
+  // The resolved repo must be the SAME repo that recorded the original baseline
+  // (repoKey equality — M2 semantics); a baseline owned by another agent-infra
+  // checkout must not authorize a switch in this one (review fold-in, #376).
   if (
     op === "switch-existing"
     && isAgentInfra

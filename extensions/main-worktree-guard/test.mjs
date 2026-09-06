@@ -498,6 +498,7 @@ expectBool("detailed+shared: checkout -b → create-new", co(`git checkout -b fe
 expectBool("detailed+shared: switch -c → create-new", co(`git switch -c feat/x`)?.op === "create-new", true);
 expectBool("detailed+shared: -C x checkout main → switch-existing", co(`git -C /x checkout main`)?.op === "switch-existing", true);
 expectBool("detailed+shared: checkout --orphan → orphan", co(`git checkout --orphan b`)?.op === "orphan", true);
+expectBool("detailed+shared: switch --discard-changes main → force (never the #376 return)", co(`git switch --discard-changes main`)?.op === "force", true);
 expectBool("detailed+shared: symbolic-ref HEAD → switch-existing", co(`git symbolic-ref HEAD refs/heads/x`)?.op === "switch-existing", true);
 expectBool("detailed+shared: update-ref refs/heads → switch-existing", co(`git update-ref refs/heads/x HEAD`)?.op === "switch-existing", true);
 expectBool("detailed+shared: branch -f → force", co(`git branch -f x main`)?.op === "force", true);
@@ -529,6 +530,8 @@ dexpect("restore-from-branch verdict stays block:checkout-branch", `git checkout
   expectBool("#376: git checkout main → sanctioned return (reBaseline main)", retMain?.reBaseline === "main" && !retMain?.block, true);
   const retSwitch = m3(`git switch main`);
   expectBool("#376: git switch main → sanctioned return (reBaseline main)", retSwitch?.reBaseline === "main" && !retSwitch?.block, true);
+  const forceAlias = m3(`git switch --discard-changes main`);
+  expectBool("#376: git switch --discard-changes main → force → BLOCKED (discards uncommitted work)", forceAlias?.block === true, true);
   const retCompound = m3(`git pull && git checkout main`);
   expectBool("#376: compound pull && checkout main → sanctioned return", retCompound?.reBaseline === "main" && !retCompound?.block, true);
   const foreign = m3(`git checkout feat/other`);
