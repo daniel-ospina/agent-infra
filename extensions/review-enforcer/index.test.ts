@@ -1331,7 +1331,7 @@ testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MES
           "micro remediation must direct docs-only sets to a lightweight [REVIEW] dispatch"
         );
         ok(
-          !blocked.reason.includes("operations/skills/code-review/SKILL.md"),
+          !blocked.reason.includes("code-review/SKILL.md"),
           "micro remediation must NOT point at the skipped multi-agent code-review gate"
         );
         // Complement cell: micro marker + ≥1 dispatch → ALLOWED (the #485
@@ -1352,10 +1352,16 @@ testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MES
 });
 
 // T1b: standard/complex/unknown markers → BLOCK with the generic BLOCK_MESSAGE,
-// plus the unlabeled (no-marker) key's reason pinned directly. Markers mirror
-// the producer format (capitalized TIER values from 01-preflight Tier
-// Detection).
-testAsync("#485 T1b: standard + complex + unknown + unlabeled markers → blocked with BLOCK_MESSAGE", async () => {
+// plus the unlabeled (no-marker) key's reason pinned directly, plus the full
+// policy-matrix allow complement (≥1 dispatch → allowed at every marker value).
+// Markers mirror the producer format (capitalized TIER values from 01-preflight
+// Tier Detection via echo "$TIER"). The direction pins anchor on the path TAIL
+// "code-review/SKILL.md" — not the full "operations/skills/…" prefix, which is
+// the stale consumer-repo layout tracked by follow-up #517: the tail survives
+// that fix in both repo and installed forms and still discriminates
+// (MICRO_BLOCK_MESSAGE references only 03-code-review.md, never
+// "code-review/SKILL.md").
+testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispatches", async () => {
   await withTempHome(async () => {
     await withMarkerIsolated(async () => {
       const prevMode = process.env.PI_MODE;
@@ -1364,17 +1370,17 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled markers → blocke
       (reviewEnforcerFactory as any)(pi);
       try {
         await fire("session_start");
-        for (const producerValue of ["Standard\n", "Complex\n", "unknown\n"]) {
+        const producerValues = ["Standard\n", "Complex\n", "unknown\n"];
+        // Pass A — 0 dispatches: every non-micro marker blocks with the generic
+        // message + direction pins (all asserted while dispatchCount is still
+        // 0 — the allow pass below must not precede these).
+        for (const producerValue of producerValues) {
           fs.writeFileSync("/tmp/agent-issue-complexity", producerValue);
           const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
           ok(blocked && blocked.block === true, `${producerValue.trim()} at 0 dispatches must block (#485)`);
           equal(blocked.reason, BLOCK_MESSAGE, `${producerValue.trim()} block must carry the generic BLOCK_MESSAGE`);
-          // Direction pin on the generic message (mirrors T1's remediation
-          // pins): standard/complex agents must be pointed at the multi-agent
-          // code-review dispatch protocol — and must NOT receive micro-specific
-          // content (the code-review gate is NOT skipped for them).
           ok(
-            blocked.reason.includes("operations/skills/code-review/SKILL.md"),
+            blocked.reason.includes("code-review/SKILL.md"),
             "generic remediation must direct the agent to the code-review dispatch protocol"
           );
           ok(
@@ -1388,6 +1394,15 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled markers → blocke
         const unlabeled = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         ok(unlabeled && unlabeled.block === true, "unlabeled (no marker) at 0 dispatches must block");
         equal(unlabeled.reason, BLOCK_MESSAGE, "unlabeled (no marker) block must carry the generic BLOCK_MESSAGE");
+        // Pass B — ≥1 dispatch: dispatch supersedes the marker at every tier
+        // (closes the standard/complex/unknown × ≥1 matrix cells; micro × ≥1 is
+        // pinned in T1).
+        for (const producerValue of producerValues) {
+          fs.writeFileSync("/tmp/agent-issue-complexity", producerValue);
+          await fire("tool_result", { toolName: "task" });
+          const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+          equal(allowed, undefined, `${producerValue.trim()} + ≥1 dispatch must allow the git op`);
+        }
       } finally {
         if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       }
@@ -1573,6 +1588,16 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
   ok(genericReturn !== -1 && genericReturn > microCheck, "generic block return must follow the micro arm");
   const region = src.slice(microCheck, genericReturn);
   ok(!region.includes("return undefined"), "micro arm region must not contain a warn-allow return undefined (#485)");
+  // Absence scan (closes the code-side re-drift hole the plan's Task 3 step 6
+  // specifies): a future micro CODE commit re-labeling the branch
+  // 'warn-only'/'proportional'/'micro tier allows bypass' in comments or prose
+  // fails CI even if the block logic is untouched. Case-insensitive on the
+  // full source (the swept section header is "uniform ≥1-dispatch, all tiers"
+  // — no legit 'proportional' remains anywhere in index.ts).
+  const srcLower = src.toLowerCase();
+  for (const token of ["warn-only", "warn only", "allows bypass", "warn but do not block", "warn instead of block", "micro tier allows bypass", "proportional"]) {
+    ok(!srcLower.includes(token), `index.ts must not contain ${JSON.stringify(token)} — a micro warn/proportional re-label re-drifted (#486/#493 class)`);
+  }
 });
 
 // ── Summary ───────────────────────────────────────────
