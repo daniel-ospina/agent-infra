@@ -1057,6 +1057,333 @@ export function commitSweepClass(command: string): CommitSweepClass {
   return sawNonSweepCommit ? "mixed" : "sweep";
 }
 
+// ── #487 — content-push RANGE scoping (T1: a content push verifies the pushed
+// range, never the whole index) ───────────────────────
+// Pure layer: classifier → tier resolver → argv builder (present state; the
+// TDD stub round that RED-pinned the unit sections is long landed).
+// Mirror of the evaluateMergeScope pure-decision + e2e-orchestration split:
+// shape/tier tables are unit-tested subprocess-free; the I/O orchestrator
+// resolvePushRangeFiles probes the repo and is e2e-only (same
+// no-unit-import choice as resolveMergeScope). Design record + accepted
+// residuals: docs/plans/2026-09-06-issue-487-vgate-push-range.md.
+//
+// FAIL-CLOSED CONTRACT (whole command): ANY unmappable shape (tag push,
+// --all/--tags/--mirror, wrapper push, URL remote, delete+content mix, any
+// non-whitelisted push flag), ANY git commit or gh pr create|merge presence
+// (the P0 guard — findGitCommit substring containment, wrapper-inclusive), or
+// ANY probe failure → resolvePushRangeFiles returns null → the caller's
+// status-quo staged scope (computeStagedDiff). NEVER error→[] (the
+// computeBranchDiff catch→[] fail-open precedent is the
+// cautionary inversion). An empty RESOLVED range is audited push_range_empty
+// and allowed (an up-to-date push ships nothing).
+
+// src/dst are PLAIN ref names (no colon), validated by regex; colon = the
+// refspec had an explicit `:` (src:dst split) vs the bare same-name form — the
+// resolver's dst=HEAD guard keys off it (a bare `HEAD` positional derives dst
+// from the current branch; `HEAD:HEAD` must fall to tier C).
+export interface PushRefSpec { src: string; dst: string; colon: boolean; }
+
+export type PushParseResult =
+  | { eligible: true; refspecs: PushRefSpec[]; bare: boolean; remote: string | null }
+  | { eligible: false; reason: "has_commit" | "has_gh" | "no_push" | "mixed_delete" | "unmappable" | "wrapper" };
+
+// Fail-closed flag whitelist (bare-token equality ONLY): any other `-` token,
+// including an ATTACHED value (`--force-with-lease=<val>`), → unmappable.
+const PUSH_FLAG_WHITELIST = new Set(["-u", "--set-upstream", "-f", "--force", "--force-with-lease"]);
+const PUSH_REFNAME = /^[A-Za-z0-9_][A-Za-z0-9_./-]*$/;
+// Remote NAME (never a URL): shared by the classifier (explicit positionals) and
+// the resolver's git-state guard (config branch.<cur>.remote VALUE) so the two
+// can never drift apart (review cycle-2 P2).
+const PUSH_REMOTE_NAME = /^[A-Za-z0-9_.-]+$/;
+const GH_PR_OP = /\bgh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+(?:create|merge)\b/;
+
+function parsePushRefspecToken(token: string): PushRefSpec | null {
+  if (token.includes(":")) {
+    if (token.split(":").length > 2) return null;              // >1 colon
+    const parts = token.split(":");
+    const src = parts[0];
+    const dst = parts[1];
+    // An EMPTY src is git's delete-colon form (`:feat/x`) — handled by
+    // isPureDeletionPushSegment BEFORE this content parse ever sees it; if one
+    // reaches here inside a content segment it must fail closed (not map).
+    if (src.length === 0) return null;
+    if (!PUSH_REFNAME.test(src) || !PUSH_REFNAME.test(dst)) return null;
+    if (src.startsWith("refs/tags/") || dst.startsWith("refs/tags/")) return null; // tag push
+    return { src, dst, colon: true };
+  }
+  if (!PUSH_REFNAME.test(token)) return null;
+  if (token.startsWith("refs/tags/")) return null;               // tag push
+  return { src: token, dst: token, colon: false };
+}
+
+// PURE — splitCommandSegments/stripSegmentHead/tokenizePushArgs/findGitCommit
+// + isPureDeletionPushSegment only. Whole-command semantics (isDeletionPush
+// mirror): eligible iff ≥1 head-anchored CONTENT push segment exists AND every
+// gated segment mapped (delete segments in a content chain → mixed_delete;
+// commit/gh anywhere → has_commit/has_gh — P0 guard FIRST, wrapper-inclusive).
+export function parsePushRefSpecs(command: string): PushParseResult {
+  const refspecs: PushRefSpec[] = [];
+  let remote: string | null = null;
+  let bare = false;
+  let pushCount = 0;
+  let sawPureDelete = false;
+  for (const segment of splitCommandSegments(command)) {
+    const stripped = stripSegmentHead(segment);
+    // P0 guard (containment — substring, wrapper-inclusive, symmetric with the
+    // gate's own interception surface): any commit ANYWHERE flips the whole
+    // command to the status-quo staged scope. Checked before everything else.
+    if (findGitCommit(stripped) !== null) return { eligible: false, reason: "has_commit" };
+    if (GH_PR_OP.test(stripped)) return { eligible: false, reason: "has_gh" };
+    if (/^git\s+push(?=\s|$)/.test(stripped)) {
+      if (isPureDeletionPushSegment(segment)) { sawPureDelete = true; continue; }
+      pushCount++;
+      const rest = stripped.replace(/^git\s+push\s*/, "");
+      const tokens = tokenizePushArgs(rest);
+      const positionals: string[] = [];
+      for (const token of tokens) {
+        if (isRedirectToken(token)) continue;
+        if (PUSH_FLAG_WHITELIST.has(token)) continue;
+        if (token.startsWith("-")) return { eligible: false, reason: "unmappable" }; // any non-whitelisted flag
+        positionals.push(token);
+      }
+      if (positionals.length === 0) {
+        // No positionals → bare push candidate (config-upstream ceremony).
+        if (pushCount > 1 || bare || refspecs.length > 0) return { eligible: false, reason: "unmappable" }; // bare mixed with other pushes
+        bare = true;
+        continue;
+      }
+      const [first, ...restPos] = positionals;
+      // URL remote (contains `/`, `@`, `:` outside the ref regex) → unmappable.
+      if (!PUSH_REMOTE_NAME.test(first)) return { eligible: false, reason: "unmappable" };
+      if (restPos.length === 0) {
+        // Remote + no refspecs → bare with remote fixed (git pushes the current
+        // branch to its configured upstream under that remote).
+        if (pushCount > 1 || bare || refspecs.length > 0) return { eligible: false, reason: "unmappable" };
+        bare = true;
+        if (remote === null) remote = first; else if (remote !== first) return { eligible: false, reason: "unmappable" };
+        continue;
+      }
+      const segRefspecs: PushRefSpec[] = [];
+      for (const rs of restPos) {
+        const parsedRs = parsePushRefspecToken(rs);
+        if (parsedRs === null) return { eligible: false, reason: "unmappable" };
+        segRefspecs.push(parsedRs);
+      }
+      if (remote === null) remote = first; else if (remote !== first) return { eligible: false, reason: "unmappable" }; // multi-remote content push
+      refspecs.push(...segRefspecs);
+      continue;
+    }
+    if (/\bgit\s+push\b/.test(stripped)) return { eligible: false, reason: "wrapper" }; // wrapper push — cannot prove shape
+    // else: scaffolding (pull/rebase/checkout/echo/assignments) — ignored
+  }
+  if (pushCount === 0) return { eligible: false, reason: "no_push" };
+  if (sawPureDelete) return { eligible: false, reason: "mixed_delete" }; // delete + content chain → whole-command staged
+  // Order-independent mixing guard: a bare push + an explicit-refspec push in one
+  // command cannot be represented (the bare half needs config resolution, the
+  // explicit half needs the refspec) — a bare-first command must NOT silently
+  // drop the explicit refspecs at the return below (review cycle-2 P1).
+  if (bare && refspecs.length > 0) return { eligible: false, reason: "unmappable" };
+  if (bare) return { eligible: true, refspecs: [], bare: true, remote };
+  return { eligible: true, refspecs, bare: false, remote };
+}
+
+// PURE 4-combo — second arg = "tier-B base ref resolves" (the preference is
+// applied by the I/O resolver BEFORE the call, so this is a 2×2 boolean).
+export function resolvePushTier(trackingExists: boolean, baseMainExists: boolean): "A" | "B" | "C" {
+  if (trackingExists) return "A";
+  return baseMainExists ? "B" : "C";
+}
+
+// PURE argv builder — baseRef is the FULLY RESOLVED base ref (never DWIM);
+// src is the resolved local ref (refs/heads/<x> or HEAD). Tier A = 2-dot
+// (space form — the remote branch also LOSES remote-side-only files on a
+// diverged/force push); tier B = 3-dot first-push base. Injection safety:
+// every value that reaches the argv is whitelist-validated before it is
+// interpolated — classifier tokens by PUSH_REFNAME/remote regex, and
+// git-state-derived values (checked-out branch name, config remote) by the
+// GIT_STATE guards in resolvePushRangeFiles — so no shell metachars can reach
+// the execSync string (execSync runs /bin/sh -c; nothing here sets shell:false).
+export function buildPushRangeDiffCommand(tier: "A" | "B", baseRef: string, src: string): string {
+  if (tier === "A") return `git diff --name-only ${baseRef} ${src}`;
+  return `git diff --name-only ${baseRef}...${src}`;
+}
+
+// ── #487 — I/O orchestration (Task 4): repo probes + per-refspec range diff ──
+// Exported like resolveMergeScope (e2e-only — NOT unit-imported, mirroring the
+// resolveMergeScope no-unit-import choice). Returns the pushed-range file set
+// or null → the caller's status-quo staged scope. Fail-closed contract above.
+
+function gitProbe(cwd: string, args: string): string | null {
+  try {
+    return execSync(`git ${args}`, { cwd, encoding: "utf-8", timeout: 5000 }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function refExists(cwd: string, ref: string): boolean {
+  return gitProbe(cwd, `rev-parse --verify --quiet ${ref}`) !== null;
+}
+
+function gitConfigGet(cwd: string, key: string): string | null {
+  const v = gitProbe(cwd, `config --get ${key}`);
+  return v === null || v === "" ? null : v;
+}
+
+function symbolicRefShort(cwd: string): string | null {
+  const v = gitProbe(cwd, "symbolic-ref --short HEAD");
+  return v === null || v === "" ? null : v;
+}
+
+// Refname/remote validation for GIT-STATE-DERIVED values before they reach an
+// execSync string. execSync runs /bin/sh -c (NO shell:false anywhere in this
+// file), so ANY interpolated value must pass a strict whitelist: git refnames
+// legally allow shell metachars (`;`, `|`, `$`, …) — a checked-out branch or a
+// config `branch.<cur>.remote` value from a hostile repo is arbitrary shell
+// input until validated. Classifier-validated tokens (PUSH_REFNAME /
+// PUSH_REMOTE_NAME) are already safe; these guards close the resolver's two
+// unvalidated inputs (security review P1). Validation failure → null (tier C).
+// Accepted tier-C residuals of the guards (fail-closed, documented — review
+// cycle-2): a hierarchical config remote name (`org/team`) or a non-ASCII
+// branch name is rejected by the whitelist even though neither carries shell
+// metachars → bare pushes over parked WIP keep the staged check (status-quo,
+// pre-#487 behavior).
+export function resolvePushRangeFiles(command: string, cwd: string): string[] | null {
+  const parsed = parsePushRefSpecs(command);
+  if (!parsed.eligible) return null; // commit/gh/unmappable/wrapper/no_push — zero subprocess on bare commits
+  // Bare push (no refspecs): derive remote + dst + src from the branch config
+  // (04-merge-deploy.md L208/L247 `git push --force-with-lease` ceremony — the
+  // earlier `git push -u` in 02-commit-pr.md set branch.<cur>.remote/.merge).
+  let { refspecs, remote } = parsed;
+  if (parsed.bare) {
+    const current = symbolicRefShort(cwd);
+    if (current === null) return null; // detached/unborn — cannot map
+    // ⛔ Injection guard: `current` (a git-state value, user-writable via
+    // symbolic-ref/checkout) is interpolated into config keys and refs — it
+    // must pass the refname whitelist BEFORE any execSync string is built
+    // (security review P1; refnames allow `;`/`|`/`$`).
+    if (!PUSH_REFNAME.test(current)) return null;
+    if (remote === null) {
+      remote = gitConfigGet(cwd, `branch.${current}.remote`);
+      if (remote === null) return null;
+    }
+    // ⛔ Injection guard: the config VALUE branch.<cur>.remote is user-writable
+    // repo state — validate before it reaches refs/remotes/… strings.
+    if (!PUSH_REMOTE_NAME.test(remote)) return null;
+    const mergeCfg = gitConfigGet(cwd, `branch.${current}.merge`);
+    const m = mergeCfg !== null ? /^refs\/heads\/([A-Za-z0-9_.\/-]+)$/.exec(mergeCfg) : null;
+    if (m === null) return null; // no/odd upstream config → tier C (push.default=current residual)
+    refspecs = [{ src: current, dst: m[1], colon: false }];
+  }
+  if (refspecs.length === 0) return null; // defensive
+  const allFiles = new Set<string>();
+  let sawTierA = false;
+  for (const rs of refspecs) {
+    let { src, dst } = rs;
+    // src = HEAD special-case — NO-COLON ONLY (a positional `HEAD` pushes to
+    // the current branch's same-name remote branch; real git never targets a
+    // branch literally named HEAD). COLON src=HEAD (`HEAD:main`, `HEAD:HEAD`)
+    // falls to the generic probes below → refs/heads/HEAD unresolvable → null.
+    let srcIsHead = false;
+    if (src === "HEAD" && !rs.colon) {
+      const current = symbolicRefShort(cwd);
+      if (current === null) return null;
+      // Injection guard: `current` is interpolated into dst/tracking strings.
+      if (!PUSH_REFNAME.test(current)) return null;
+      if (gitProbe(cwd, "rev-parse --verify HEAD") === null) return null; // unborn
+      dst = current;
+      srcIsHead = true;
+    }
+    // dst normalization + dst=HEAD guard. ⛔ The guard sits BEFORE src
+    // resolution, so a COLON `HEAD:HEAD` (src=dst=HEAD, no-colon derivation
+    // skipped) is nulled HERE — the src probe below never sees it (second-model
+    // gate: the plan's "HEAD:HEAD nulls at the src probe" wording was wrong;
+    // the guard is the nulling site for every dst=HEAD colon form). A real
+    // clone's refs/remotes/origin/HEAD is the DEFAULT-branch symbolic ref — it
+    // must never become a tier-A base for a remote branch literally named HEAD.
+    if (dst.startsWith("refs/heads/")) dst = dst.slice("refs/heads/".length);
+    if (dst === "HEAD") return null;
+    // src resolution (local side of the diff).
+    let srcRef: string | null = null;
+    if (srcIsHead) {
+      srcRef = "HEAD";
+    } else if (src.startsWith("refs/heads/")) {
+      if (!refExists(cwd, src)) return null;
+      srcRef = src;
+    } else if (src === "HEAD") {
+      // COLON src=HEAD with a NON-HEAD dst (`HEAD:main` — HEAD:HEAD already
+      // nulled by the dst guard above): refs/heads/HEAD is never a real branch,
+      // so this probe fails → null → tier C (accepted residual — the dst=HEAD
+      // guard covers colon dst forms; a tag literally named HEAD is not probed
+      // here, the probe just fails on refs/heads/HEAD).
+      if (!refExists(cwd, "refs/heads/HEAD")) return null;
+      srcRef = "refs/heads/HEAD";
+    } else {
+      const branch = `refs/heads/${src}`;
+      const tag = `refs/tags/${src}`;
+      const bOk = refExists(cwd, branch);
+      const tOk = refExists(cwd, tag);
+      if (bOk && tOk) return null; // git ambiguity — cannot prove shape
+      if (tOk) return null;        // tag push → whole-command staged
+      if (!bOk) return null;       // unresolvable src
+      srcRef = branch;
+    }
+    if (remote === null) return null; // defensive — explicit refspecs always carry a remote
+    // Tier decision. baseMainExists is fed AFTER the tier-B base preference:
+    // <remote>/main when remote ≠ origin and that ref exists, else the house
+    // origin/main (computeBranchDiff precedent) — the pure table stays a 2×2.
+    const tracking = `refs/remotes/${remote}/${dst}`;
+    const trackingExists = refExists(cwd, tracking);
+    let baseMain = "refs/remotes/origin/main";
+    if (remote !== "origin" && refExists(cwd, `refs/remotes/${remote}/main`)) {
+      baseMain = `refs/remotes/${remote}/main`;
+    }
+    const baseMainExists = refExists(cwd, baseMain);
+    const tier = resolvePushTier(trackingExists, baseMainExists);
+    if (tier === "C") return null; // whole-command rule: ANY tier C → staged
+    const baseRef = tier === "A" ? tracking : baseMain;
+    if (tier === "A") sawTierA = true;
+    // 2-dot (A) / 3-dot (B) name-only diff. The builder emits the FULL `git
+    // diff …` argv (unit-pinned) — run it directly (NOT through gitProbe,
+    // which would double the `git` prefix). ANY throw → null (staged) — NEVER
+    // error→[] (the computeBranchDiff catch→[] fail-open precedent inverted).
+    let diffOut: string | null = null;
+    try {
+      diffOut = execSync(buildPushRangeDiffCommand(tier, baseRef, srcRef), {
+        cwd, encoding: "utf-8", timeout: 5000,
+      }).trim();
+    } catch {
+      diffOut = null;
+    }
+    if (diffOut === null) return null;
+    for (const line of diffOut.split("\n")) {
+      const f = line.trim();
+      if (f.length > 0) allFiles.add(f);
+    }
+  }
+  if (allFiles.size === 0) {
+    // Up-to-date push ships nothing — audited INSIDE the resolver so the
+    // caller's shared silent empty-allow never hides the range decision.
+    // Note: with multi-refspec commands the tier payload is "A" iff ANY
+    // refspec resolved tier A (order-independent any-A-wins — second-model
+    // gate wording fix; mixed A+B empty ranges label "A"); cosmetic audit
+    // metadata only — the allow + audit reason are identical in every ordering.
+    // ⛔ Trust boundary (security review P2, documented): tier A reads LOCAL
+    // remote-tracking refs — same-user-writable repo state (git update-ref is
+    // not a gated verb) that can steer an empty range → audited allow. The
+    // gate's contract is same-user verification, not local-state hardening:
+    // the index was equally trusted pre-#487 and the bypass here is AUDITED
+    // (push_range_empty) where the old silent empty-allow was not. A stale
+    // tracking ref BEHIND the live remote under-scopes a --force push in the
+    // same trust class (the gate never saw remote-side-only files — identical
+    // to computeBranchDiff's origin/main staleness); the pull --rebase
+    // pre-push ceremony (01-preflight) refreshes it.
+    logGateSkip("push_range_empty", command, cwd, { tier: sawTierA ? "A" : "B" });
+    return [];
+  }
+  return Array.from(allFiles);
+}
+
 // ── Diff computation ──────────────────────────────────
 
 function resolveGitRoot(cwd: string): string {
@@ -1563,7 +1890,9 @@ export default function (pi: ExtensionAPI) {
     // have re-hashed + written the bridge above — content-neutral, no new
     // blessings). Purity-gated (isDeletionPush): any content refspec / git
     // commit / gh pr op in the command falls back to today's gating
-    // (fail-closed).
+    // (fail-closed). #487: the CONTENT half of a push is now range-scoped
+    // (resolvePushRangeFiles below — pushed range vs the whole index); the
+    // delete short-circuit itself is untouched and still fires first.
     if (isDeletionPush(command)) {
       console.log("[verification-gate] ⏭️ Skipping VGATE — delete-shaped push: no local content ships");
       logGateSkip("delete_push_no_content", command, cwd);
@@ -1612,7 +1941,20 @@ export default function (pi: ExtensionAPI) {
       }
       changedFiles = computeBranchDiff(cwd);
     } else {
-      changedFiles = computeStagedDiff(cwd);
+      // #487 T1: a content push (no git commit anywhere in the command) verifies
+      // the PUSHED RANGE — HEAD vs the remote-tracking ref (tier A, 2-dot) or
+      // the first-push base (tier B, 3-dot) — never the whole index, so another
+      // session's parked WIP in the index cannot false-block `git push origin
+      // main` of already-committed HEAD. Commit-time behavior is UNCHANGED:
+      // commit-bearing commands resolve null fast inside (classifier, zero
+      // subprocess) → the staged scope below. resolvePushRangeFiles is
+      // fail-closed — null (→ staged) on EVERY fallback: unmappable shape
+      // (tags/--all/--mirror/wrapper/URL remote), mixed delete+content chains
+      // (scenario 44 legs 2-3), commit/gh presence (the P0 backstop,
+      // wrapper-inclusive), no usable base (tier C), any git failure — NEVER []
+      // on error (the computeBranchDiff catch→[] fail-open
+      // precedent). An empty RESOLVED range is audited push_range_empty inside.
+      changedFiles = resolvePushRangeFiles(command, cwd) ?? computeStagedDiff(cwd);
     }
 
     if (changedFiles.length === 0) {
@@ -1629,12 +1971,17 @@ export default function (pi: ExtensionAPI) {
     // (docs included). Commit-form guard (isBareCommitShape): among `git
     // commit` invocations only the bare form qualifies — `-a`/`--all`/`--amend`/
     // pathspec anywhere re-gates the whole command (D2); push / gh pr
-    // create|merge ops with no commit invocation qualify on file shape alone.
+    // create|merge ops with no commit invocation qualify on file shape alone
+    // (isBareCommitShape is vacuous on pure pushes — e2e scenarios 47/56 pin
+    // the exemption on BOTH the staged set and the #487 RANGE set).
     // Exempt files are not registered here, so a post-exempt lint-staged
     // rewrite cannot stale-hash a future block via THIS op — but a bare
     // exempt COMMIT still arms the #7574 re-hash (review deep-P2): the file
     // may already be registered from an EARLIER mixed VGATE PASS, and the
     // pre-commit hook's rewrite would otherwise go stale with no safety net.
+    // #487: the file set this exemption reads is range-scoped for content
+    // pushes (tier A/B) with a tier-C staged fallback — the check is
+    // identical regardless of which source produced changedFiles.
     if (changedFiles.length > 0 && isBareCommitShape(command) && changedFiles.every((file) => isShapeExemptFile(file))) {
       console.log(`[verification-gate] ⏭️ Skipping VGATE — ${changedFiles.length} docs/static file(s): content-shape exemption (tier-independent)`);
       logGateSkip("content_shape_exempt", command, cwd, { files: changedFiles.length });

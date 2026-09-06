@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
@@ -2215,6 +2215,190 @@ test("#472 drift guard: 01-preflight VGATE-SHAPE-RULE fence == SHAPE_EXEMPT_EXTE
     fenceSegList,
     segExports,
     `fence segments {${fenceSegList.join(", ")}} != exports {${segExports.join(", ")}} — 01-preflight.md VGATE-SHAPE-RULE drifted from BUILD_OUTPUT_SEGMENTS`
+  );
+});
+
+// ── #487: parsePushRefSpecs / resolvePushTier / buildPushRangeDiffCommand ──
+// Pure content-push classifier (whole-command, isDeletionPush-section mirror),
+// 4-combo tier resolver, and exact-argv builder. Stub-first (Task 2) so the
+// suite never ESM-crashes on missing exports — bodies land in Task 3.
+
+section("parsePushRefSpecs — content-push classifier (#487)");
+
+// ── Eligible (content push) pins ──
+
+test("simple explicit-refspec push → eligible", () => {
+  const p = parsePushRefSpecs("git push origin main");
+  ok(p.eligible === true, "must classify as eligible");
+  if (p.eligible) {
+    equal(p.remote, "origin");
+    equal(p.bare, false);
+    deepEqual(p.refspecs, [{ src: "main", dst: "main", colon: false }]);
+  }
+});
+
+test("-u upstream ceremony spelling → eligible", () => {
+  const p = parsePushRefSpecs("git push -u origin feat/487");
+  ok(p.eligible === true && p.remote === "origin" && p.bare === false, "-u is whitelisted");
+  if (p.eligible) deepEqual(p.refspecs, [{ src: "feat/487", dst: "feat/487", colon: false }]);
+});
+
+test("whitelisted flag set (bare-token equality)", () => {
+  for (const flag of ["-u", "--set-upstream", "-f", "--force", "--force-with-lease"]) {
+    const p = parsePushRefSpecs(`git push origin ${flag} main`);
+    ok(p.eligible === true, `${flag} must be whitelisted`);
+  }
+});
+
+test("remote + no refspecs → bare with remote fixed", () => {
+  const p = parsePushRefSpecs("git push origin --force-with-lease");
+  ok(p.eligible === true && p.bare === true && p.remote === "origin", "remote-fixed bare");
+});
+
+test("no positionals → bare with null remote", () => {
+  const p = parsePushRefSpecs("git push --force-with-lease");
+  ok(p.eligible === true && p.bare === true && p.remote === null, "config-upstream bare (04-merge-deploy ceremony)");
+});
+
+test("colon refspec split → colon: true", () => {
+  const p = parsePushRefSpecs("git push origin main:feat");
+  ok(p.eligible === true);
+  if (p.eligible) deepEqual(p.refspecs, [{ src: "main", dst: "feat", colon: true }]);
+});
+
+test("HEAD accepted syntactically on either side", () => {
+  const p = parsePushRefSpecs("git push origin HEAD");
+  ok(p.eligible === true);
+  if (p.eligible) deepEqual(p.refspecs, [{ src: "HEAD", dst: "HEAD", colon: false }]);
+  const q = parsePushRefSpecs("git push origin main:HEAD");
+  ok(q.eligible === true, "syntax-only: REF SEMANTICS are the resolver's probe job");
+});
+
+test("refs/heads/ spelling accepted", () => {
+  const p = parsePushRefSpecs("git push origin refs/heads/main:refs/heads/feat");
+  ok(p.eligible === true);
+  if (p.eligible) deepEqual(p.refspecs, [{ src: "refs/heads/main", dst: "refs/heads/feat", colon: true }]);
+});
+
+test("prefix-verb and cd forms normalize (stripSegmentHead)", () => {
+  ok(parsePushRefSpecs("sudo git push origin main").eligible === true);
+  ok(parsePushRefSpecs("cd /tmp/x && git push origin main").eligible === true);
+});
+
+test("refspecs accumulate across multi-push segments", () => {
+  const p = parsePushRefSpecs("git push origin a && git push origin b");
+  ok(p.eligible === true && p.remote === "origin");
+  if (p.eligible) deepEqual(p.refspecs, [
+    { src: "a", dst: "a", colon: false },
+    { src: "b", dst: "b", colon: false },
+  ]);
+});
+
+test("bare + explicit-refspec mixing is order-independent → unmappable (review cycle-2: bare-first must not drop refspecs)", () => {
+  const bareFirst = parsePushRefSpecs("git push && git push origin main");
+  ok(!bareFirst.eligible && bareFirst.reason === "unmappable", "bare-first mixing must null the whole command, never silently drop the explicit refspec");
+  const explicitFirst = parsePushRefSpecs("git push origin main && git push");
+  ok(!explicitFirst.eligible && explicitFirst.reason === "unmappable", "explicit-first mixing must null identically (order-independent)");
+  const remoteBareFirst = parsePushRefSpecs("git push origin --force-with-lease && git push origin main");
+  ok(!remoteBareFirst.eligible && remoteBareFirst.reason === "unmappable", "remote-fixed bare + explicit mixing nulls too");
+});
+
+// ── Ineligible (fail-closed) pins ──
+
+test("P0 guard: any git commit anywhere (bare, wrapper, chained) → has_commit", () => {
+  const a = parsePushRefSpecs("git push origin main && git commit -m x");
+  ok(!a.eligible && a.reason === "has_commit", "chained commit flips has_commit");
+  const b = parsePushRefSpecs("sh -c 'git push origin main && git commit -am x'");
+  ok(!b.eligible && b.reason === "has_commit", "wrapper commit containment (findGitCommit substring)");
+  const c = parsePushRefSpecs("git commit -m x");
+  ok(!c.eligible && c.reason === "has_commit", "commit-only command → has_commit (else-branch staged scope preserved)");
+});
+
+test("gh pr create|merge anywhere → has_gh", () => {
+  const p = parsePushRefSpecs("gh pr create --title x && git push origin main");
+  ok(!p.eligible && p.reason === "has_gh");
+});
+
+test("tag / --all / --tags / --mirror shapes → unmappable", () => {
+  ok(parsePushRefSpecs("git push origin refs/tags/v1.0").reason === "unmappable");
+  ok(parsePushRefSpecs("git push origin --tags").reason === "unmappable");
+  ok(parsePushRefSpecs("git push --all").reason === "unmappable");
+  ok(parsePushRefSpecs("git push --mirror origin").reason === "unmappable");
+  ok(parsePushRefSpecs("git push origin main:refs/tags/v1.0").reason === "unmappable");
+});
+
+test("URL remote → unmappable", () => {
+  const p = parsePushRefSpecs("git push git@github.com:o/r.git main");
+  ok(!p.eligible && p.reason === "unmappable");
+});
+
+test("any non-whitelisted flag → unmappable (attached value included)", () => {
+  for (const flag of ["--porcelain", "-q", "--prune", "--force-with-lease=expiry"]) {
+    const p = parsePushRefSpecs(`git push origin ${flag} main`);
+    ok(!p.eligible && p.reason === "unmappable", `${flag} must be unmappable (fail-closed)`);
+  }
+});
+
+test("wrapper push (git push at offset > 0, no commit/gh) → wrapper", () => {
+  const p = parsePushRefSpecs("sh -c 'git push origin main'");
+  ok(!p.eligible && p.reason === "wrapper", "cannot prove shape — fail-closed, symmetric with isDeletionPush");
+});
+
+test("delete + content chain → mixed_delete (whole-command rule, scenario 44 legs 2-3)", () => {
+  const p = parsePushRefSpecs("git push origin --delete a && git push origin main");
+  ok(!p.eligible && p.reason === "mixed_delete", "mixed delete+content nulls the whole command → staged scope");
+  const q = parsePushRefSpecs("git push origin --delete a & git push origin main");
+  ok(!q.eligible && q.reason === "mixed_delete", "single-& background chain classifies identically");
+});
+
+test("pure scaffolding (no gated verb) → no_push", () => {
+  const p = parsePushRefSpecs("echo hello");
+  ok(!p.eligible && p.reason === "no_push");
+});
+
+// ── resolvePushTier 4-combo table ──
+
+section("resolvePushTier — A/B/C decision table (#487)");
+
+test("4-combo table: (T,·)→A, (F,T)→B, (F,F)→C", () => {
+  equal(resolvePushTier(true, true), "A");
+  equal(resolvePushTier(true, false), "A");
+  equal(resolvePushTier(false, true), "B");
+  equal(resolvePushTier(false, false), "C");
+});
+
+test("never undefined for any input (evaluateMergeScope-style fuzz)", () => {
+  const inputs: [boolean, boolean][] = [
+    [false, false], [false, true], [true, false], [true, true],
+  ];
+  for (const [t, b] of inputs) {
+    const tier = resolvePushTier(t, b);
+    ok(tier === "A" || tier === "B" || tier === "C", `must always return a tier, got ${tier}`);
+  }
+});
+
+// ── buildPushRangeDiffCommand exact argv pins ──
+
+section("buildPushRangeDiffCommand — exact argv (#487)");
+
+test("tier A emits the 2-dot space form with the FULL tracking-ref base", () => {
+  equal(
+    buildPushRangeDiffCommand("A", "refs/remotes/origin/main", "feat/487"),
+    "git diff --name-only refs/remotes/origin/main feat/487"
+  );
+});
+
+test("tier B emits the 3-dot form against the origin main base", () => {
+  equal(
+    buildPushRangeDiffCommand("B", "refs/remotes/origin/main", "feat/487"),
+    "git diff --name-only refs/remotes/origin/main...feat/487"
+  );
+});
+
+test("tier B emits whatever base the resolver chose — NON-ORIGIN base flows through", () => {
+  equal(
+    buildPushRangeDiffCommand("B", "refs/remotes/upstream/main", "feat/487"),
+    "git diff --name-only refs/remotes/upstream/main...feat/487"
   );
 });
 
