@@ -178,13 +178,15 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
   when mode resolves to dry-run — keep best-effort logging since their
   verdict surfaces are stdout).
 
-- **Framing-byte fail-closed (round 4):** the reaper's internal framing
-  bytes (tab, newline, the `|` cand-row delimiter, and the 0x1f settle
-  tie-separator) are all APFS-legal in names. `esc()` strips them from
-  store-derived values; a matched record whose REAL on-disk session file
-  still carries a framing byte (surfaced by the find fallback, not the
-  store) abstains at classify — no-jsonl-proof, never eligible, never
-  signaled. Deciding-file re-probe failure at settle (deleted/truncated/
+- **Framing-byte fail-closed (round 4):** the `|` cand-row delimiter and
+  the 0x1f settle tie-separator are APFS-legal in names. `esc()` strips
+  them (plus tab/newline) from store-derived values; a matched record
+  whose REAL on-disk session file still carries `|` or 0x1f (surfaced by
+  the find fallback, not the store) abstains at classify — no-jsonl-proof,
+  never eligible, never signaled. (Tab-carrying real paths round-trip
+  safely and stay eligible; newline-carrying paths never resolve — find's
+  line framing truncates them, so the truncated path fails `-s` and
+  abstains.) Deciding-file re-probe failure at settle (deleted/truncated/
   undatable since classify) suppresses the kill — what cannot be
   re-verified is never signaled.
 

@@ -872,8 +872,14 @@ def env_fixture(name, pid, tty, sid, cwd_bytes, marker):
     sdir = os.path.join(env, "sessions", "--%s--" % enc)
     os.makedirs(sdir, exist_ok=True)
     with open(os.path.join(sdir, "%d_%s.jsonl" % (SEP3, sid)), "w") as f:
-        for ts in (1000000000, 1003600000, 1007200000):
-            f.write('{"ts":%d,"type":"event","data":{"type":"session_command"}}\n' % ts)
+        for ts in ("2026-09-03T20:00:00.000Z", "2026-09-03T20:30:00.000Z",
+                   "2026-09-03T21:00:00.000Z"):
+            f.write('{"timestamp":"%s","x":"t"}\n' % ts)
+        # three datable lines => max epoch Sep 3 21:00 (~29h before NOW):
+        # when the framing-byte guard is absent this session IS reap-eligible,
+        # so the assert_not_contains REAP-ELIGIBLE below is a true regression
+        # test of the round-4b abstain (verified: guard-stripped run prints
+        # REAP-ELIGIBLE + RESIDUAL=1)
     store = {"version": 1, "agentHookFailureReportTimestamps": {}, "sessions": {
         sid: {"pid": pid, "pidStartSeconds": SEP3, "pidStartMicroseconds": 0,
               "agentLifecycle": "idle", "runtimeStatus": "idle",
@@ -896,6 +902,31 @@ assert_not_contains "$OUT" "REAP-ELIGIBLE" "C28b |-path session never eligible"
 assert_contains "$OUT" "SKIP no-jsonl-proof" "C28b |-path session abstains (framing byte)"
 assert_eq "$(cat "$T/C28b/kill.log" 2>/dev/null | wc -l | tr -d ' ')" "0" "C28b no signal for |-path"
 rm -rf "$T/C28a" "$T/C28b"
+
+# C29: settle-3 re-probe fail-closed — A's TERM side effect DELETES B's
+# deciding JSONL between classify and settle => B's re-probe returns empty
+# and must SUPPRESS (round-4b: "cannot re-probe deciding file"), never
+# treat empty as no-advance and signal.
+mk_env C29
+make_lookup "$T/C29/date.lookup"
+printf '%s\n' "$(psrow 12126 400000 12126 ttys305 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/c29a")" \
+               "$(psrow 12129 400000 12129 ttys305 "Thu Sep  3 20:00:00 2026" S 30000 "/usr/local/bin/pi --cwd /Users/t/c29b")" > "$T/C29/ps-source"
+printf '%s' '{"c29a":{"pid":12126,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/c29a"},"c29b":{"pid":12129,"pidStartSeconds":'$E_SEP3_2000',"agentLifecycle":"idle","runtimeStatus":"idle","cwd":"/Users/t/c29b"}}' | cmux_store C29
+session_jsonl C29 /Users/t/c29a c29a "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+session_jsonl C29 /Users/t/c29b c29b "$E_SEP3_2000" "2026-09-03T20:00:00.000Z"
+cat > "$T/C29/del-side.sh" <<SH
+#!/usr/bin/env bash
+case "\$1" in
+    -TERM) rm -f "$T/C29/sessions/--Users-t-c29b--/${E_SEP3_2000}_c29b.jsonl" ;;
+esac
+SH
+chmod +x "$T/C29/del-side.sh"
+: > "$T/C29/kill.log"
+OUT="$(FAKE_KILL_SIDE="$T/C29/del-side.sh" REAP_NOW_EPOCH=$NOW REAP_IDLE_HOURS=24 REAP_GRACE_SECONDS=0 FAKE_SELF_TTY=$FAKE_SELF_TTY run_reaper C29 --apply 2>&1)"
+assert_contains "$(cat "$T/C29/kill.log")" "kill -TERM -12126" "C29 candidate A TERM'd normally"
+assert_not_contains "$(cat "$T/C29/kill.log")" "kill -TERM -12129" "C29 candidate B suppressed (no TERM) when deciding file deleted"
+assert_contains "$(cat "$T/C29/reap.log")" "cannot re-probe deciding file" "C29 re-probe-failure suppress reason logged"
+rm -rf "$T/C29"
 
 echo "════════════════════════════════════════════════════════════════"
 echo "PASS=$PASS FAIL=$FAIL"
