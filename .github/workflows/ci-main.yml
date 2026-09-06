@@ -94,8 +94,14 @@ jobs:
         # spawns python3 (ubuntu runners ship it).
         echo "== extensions/provider-exhaustion.test.ts =="
         npx tsx extensions/provider-exhaustion.test.ts || failures=$((failures+1))
+        # #533 — builtin-tools: the three suites below import index.ts, which
+        # imports typebox (real runtime dep declared in package.json
+        # dependencies): npm ci once (same route as review-enforcer/verification-
+        # gate above), then run all three — the install persists in the step and
+        # Node resolves node_modules up-tree from the importing file.
         echo "== extensions/builtin-tools/builtin-tools.test.ts =="
-        npx tsx extensions/builtin-tools/builtin-tools.test.ts || failures=$((failures+1))
+        (cd extensions/builtin-tools && npm ci --no-audit --no-fund --loglevel=error) && \
+          npx tsx extensions/builtin-tools/builtin-tools.test.ts || failures=$((failures+1))
         echo "== extensions/builtin-tools/provider-failover.integration.test.ts =="
         npx tsx extensions/builtin-tools/provider-failover.integration.test.ts || failures=$((failures+1))
         echo "== extensions/builtin-tools/cut-resume.integration.test.ts =="
