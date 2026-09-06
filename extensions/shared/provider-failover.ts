@@ -325,7 +325,7 @@ const SIG_CREDIT_LOW = /(credit\s+balance\s+(?:is\s+)?too\s+low|insufficient\s+c
 const SIG_402_CREDIT = /402[^\n]{0,160}(insufficient|credit\s+balance|too\s+low|exhausted)|(insufficient|credit\s+balance|too\s+low|exhausted)[^\n]{0,160}402/i;
 /** Fuzzy billing wording WITHOUT 402 → audit-only (never latches). */
 const SIG_FUZZY = /(insufficient_quota|insufficient quota|billing|usage limit reached|monthly usage|quota exceeded|credit balance)/i;
-const SIG_AUTH_KEY = /(invalid\s+x-api-key|invalid\s+api[_-]?key|api[_-]?key.{0,40}(invalid|incorrect|blocked)|api\s+key.{0,40}(invalid|incorrect|blocked)|incorrect\s+api\s+key|invalid_api_key|apikey-error)/i;
+const SIG_AUTH_KEY = /(invalid\s+x-api-key|invalid\s+api[_-]?key|api[_-]?key.{0,40}(invalid|incorrect|blocked)|api\s+key.{0,40}(invalid|incorrect|blocked)|incorrect\s+api\s+key|invalid_api_key|apikey-error|authentication\s+failed)/i;
 /** Venice 402/exhaustion patterns (#512, docs-anchored — docs.venice.ai
  * /api-reference/error-codes; amendment-3 P1). The published schema:
  *   - error.code INSUFFICIENT_BALANCE, message "Insufficient USD or Diem
@@ -1178,12 +1178,19 @@ export function manualClear(primaryOrAll: string, env: Record<string, string | u
 }
 
 /** Ledger append (durable JSONL audit — same fail-safe semantics as
- * shared/audit-log.ts). Never throws. */
-export function appendLedger(entry: Record<string, unknown>, env: Record<string, string | undefined> = process.env): void {
+ * shared/audit-log.ts). Never throws. The event name defaults to
+ * "provider-failover" for the #476 hop/marker ledger; #512 adds the
+ * "venice-route" routing-ledger event to the SAME audit file so credit burn
+ * is attributable per cold-class dispatch (event names distinguish rows). */
+export function appendLedger(
+  entry: Record<string, unknown>,
+  eventName: string = "provider-failover",
+  env: Record<string, string | undefined> = process.env,
+): void {
   try {
     const file = auditLedgerFile(env);
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const line = JSON.stringify({ ts: new Date().toISOString(), event: "provider-failover", ...entry }) + "\n";
+    const line = JSON.stringify({ ts: new Date().toISOString(), event: eventName, ...entry }) + "\n";
     fs.appendFileSync(file, line);
   } catch {
     /* audit must never break the gate path */

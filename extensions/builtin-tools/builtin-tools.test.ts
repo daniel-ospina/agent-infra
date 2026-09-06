@@ -37,10 +37,15 @@ import {
   legBreakerOpen,
   familyRootOf,
   runFailoverDecisionLoop,
+  gateOffTableRequest,
+  altGateEligible,
+  recordVeniceRoute,
+  parseTaskUsageLine,
+  scanStderrForUsage,
 } from "./index.js";
 import { readLatchState, setExhausted } from "../shared/provider-failover.js";
 import type { ExhaustionMarker, LegRef } from "../shared/provider-failover.js";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(resolve(__dirname, "index.ts"), "utf-8");
@@ -3245,6 +3250,297 @@ test("decidePostDispatch: blocked venice marker (401) → markLegBlocked under v
     cleanup();
   }
 });
+
+// ── #512 alternate-leg gate (missing-key + auth-block, code over text) ──
+
+section("#512 cold-class gate — gateOffTableRequest (missing key / auth-block)");
+
+const VENICE_FLASH_LEG: LegRef = { provider: "venice", model: "deepseek-v4-flash" };
+const REG_WITH_VENICE = {
+  providers: {
+    deepseek: { apiKey: "$DEEPSEEK_API_KEY", models: [{ id: "deepseek-v4-flash" }] },
+    venice: { apiKey: "$VENICE_API_KEY", models: [{ id: "deepseek-v4-flash" }] },
+    openrouter: { models: [] }, // modelOverrides-only row — no apiKey declared
+  },
+};
+const EMPTY_STATE = { version: 1 as const, epoch: 0, updatedAt: "", primaries: {}, blockedLegs: {} };
+
+test("venice ask + VENICE_API_KEY present + no block → NOT gated (route proceeds)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    env.VENICE_API_KEY = "vk-test";
+    const out = gateOffTableRequest(VENICE_FLASH_LEG, EMPTY_STATE, { env, registry: REG_WITH_VENICE as any });
+    equal(out.gated, false);
+    deepEqual(out.leg, VENICE_FLASH_LEG);
+  } finally {
+    cleanup();
+  }
+});
+
+test("venice ask + MISSING VENICE_API_KEY → gated to default deepseek (kill switch #2, code over text)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    delete env.VENICE_API_KEY;
+    const out = gateOffTableRequest(VENICE_FLASH_LEG, EMPTY_STATE, { env, registry: REG_WITH_VENICE as any });
+    equal(out.gated, true);
+    equal(out.gate, "missing-key");
+    equal(out.leg.provider, "deepseek", "gated leg = the bare-id default (deepseek official)");
+    equal(out.leg.model, "deepseek-v4-flash");
+  } finally {
+    cleanup();
+  }
+});
+
+test("venice ask + durable venice auth-block → gated to default deepseek (never spawns a doomed child)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    env.VENICE_API_KEY = "vk-test";
+    const state = {
+      ...EMPTY_STATE,
+      blockedLegs: { venice: { reason: "marker:blocked", at: new Date().toISOString() } },
+    };
+    const out = gateOffTableRequest(VENICE_FLASH_LEG, state, { env, registry: REG_WITH_VENICE as any });
+    equal(out.gated, true);
+    equal(out.gate, "auth-blocked");
+    equal(out.leg.provider, "deepseek");
+  } finally {
+    cleanup();
+  }
+});
+
+test("STALE durable block (past one latch TTL) does NOT gate — venice re-probed (TTL self-heal)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    env.VENICE_API_KEY = "vk-test";
+    const stale = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(); // > 24h default TTL
+    const state = { ...EMPTY_STATE, blockedLegs: { venice: { reason: "marker:blocked", at: stale } } };
+    const out = gateOffTableRequest(VENICE_FLASH_LEG, state, { env, registry: REG_WITH_VENICE as any });
+    equal(out.gated, false, "stale block stopped excluding — the gate must not fire");
+  } finally {
+    cleanup();
+  }
+});
+
+test("table legs + the family root are NEVER gated (#476 semantics byte-identical)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // openrouter table-leg ask under a durable openrouter block → NOT gated
+    const st = {
+      ...EMPTY_STATE,
+      blockedLegs: { openrouter: { reason: "marker:blocked", at: new Date().toISOString() } },
+    };
+    const or = gateOffTableRequest(
+      { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+      st,
+      { env, registry: REG_WITH_VENICE as any },
+    );
+    equal(or.gated, false, "a chain hop leg keeps #476 resolution (block filters hop candidates, not the requested leg)");
+    // deepseek root ask under a missing deepseek key → NOT gated (default leg)
+    const ds = gateOffTableRequest(
+      { provider: "deepseek", model: "deepseek-v4-flash" },
+      EMPTY_STATE,
+      { env, registry: REG_WITH_VENICE as any },
+    );
+    equal(ds.gated, false, "the family root/primary is never gated");
+    // family-less ask on a provider with NO declared apiKey (openrouter) → NOT gated
+    const famless = gateOffTableRequest(
+      { provider: "openrouter", model: "qwen/qwen3.8-max" },
+      EMPTY_STATE,
+      { env, registry: REG_WITH_VENICE as any },
+    );
+    equal(famless.gated, false, "providers without a declared models.json apiKey pass through (no behavior change)");
+  } finally {
+    cleanup();
+  }
+});
+
+test("gate is INERT for the default surface: bare deepseek-v4-flash default ask never consults the gate", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // A bare default dispatch resolves provider=deepseek (a family member) —
+    // simulate the resolved leg the execute path would pass
+    const out = gateOffTableRequest({ provider: "deepseek", model: "deepseek-v4-flash" }, EMPTY_STATE, {
+      env,
+      registry: REG_WITH_VENICE as any,
+    });
+    equal(out.gated, false);
+    deepEqual(out.leg, { provider: "deepseek", model: "deepseek-v4-flash" });
+  } finally {
+    cleanup();
+  }
+});
+
+test("EXCLUSIVE-host ask (no alternative leg) is never 'gated to itself': missing key + same-provider default → NOT gated (P2-2 byte parity)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // venice hosts a model NOT co-hosted by deepseek — the bare-id default
+    // resolves back to venice, so a 'reroute' would be a no-op with a
+    // misleading log. The gate must return ungated and let the pre-#512
+    // resolution path behave byte-identically (doomed spawn is the
+    // operator-owned outcome for an unservable exclusive id, exactly as
+    // before the gate existed).
+    const REG_EXCLUSIVE = {
+      ...REG_WITH_VENICE,
+      providers: {
+        ...REG_WITH_VENICE.providers,
+        venice: { apiKey: "$VENICE_API_KEY", models: [{ id: "deepseek-v4-flash" }, { id: "venice-only-model" }] },
+      },
+    };
+    delete env.VENICE_API_KEY;
+    const out = gateOffTableRequest(
+      { provider: "venice", model: "venice-only-model" },
+      EMPTY_STATE,
+      { env, registry: REG_EXCLUSIVE as any },
+    );
+    equal(out.gated, false, "no alternative leg → nothing to gate to");
+    deepEqual(out.leg, { provider: "venice", model: "venice-only-model" });
+    // and a durable block on the exclusive provider must ALSO not fabricate a
+    // reroute that cannot exist
+    const state = {
+      ...EMPTY_STATE,
+      blockedLegs: { venice: { reason: "marker:blocked", at: new Date().toISOString() } },
+    };
+    env.VENICE_API_KEY = "vk-test";
+    const out2 = gateOffTableRequest(
+      { provider: "venice", model: "venice-only-model" },
+      state,
+      { env, registry: REG_EXCLUSIVE as any },
+    );
+    equal(out2.gated, false, "auth-blocked exclusive id → ungated (same-leg no-op rejected)");
+  } finally {
+    cleanup();
+  }
+});
+
+// ── #512 execute-path gate WIRING (altGateEligible) ──
+
+section("#512 gate wiring — altGateEligible (execute path membership contract)");
+
+test("venice/deepseek-v4-flash is ELIGIBLE: family-defined by model id but NOT a member leg, key declared (round-2 P1-1 pin)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // alias families are keyed by MODEL id — this leg IS family-defined yet
+    // venice is off-table by non-membership; the eligibility test must be
+    // membership, never family-lessness (the round-2 bug gated nothing).
+    equal(altGateEligible(VENICE_FLASH_LEG, { registry: REG_WITH_VENICE as any }), true);
+    // full wiring composition: eligible → gate fires on missing key → default leg
+    delete env.VENICE_API_KEY;
+    const g = gateOffTableRequest(VENICE_FLASH_LEG, EMPTY_STATE, { env, registry: REG_WITH_VENICE as any });
+    ok(g.gated, "wiring: eligible venice ask with missing key gates");
+    equal(g.leg.provider, "deepseek");
+  } finally {
+    cleanup();
+  }
+});
+
+test("chain member / root legs and key-less providers are NOT eligible (latch stays lazy)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // deepseek root/member: family member + key declared → member → NOT eligible
+    equal(
+      altGateEligible({ provider: "deepseek", model: "deepseek-v4-flash" }, { registry: REG_WITH_VENICE as any }),
+      false,
+      "family member leg never eligible",
+    );
+    // openrouter: key-less provider row → NOT eligible even family-less
+    equal(
+      altGateEligible({ provider: "openrouter", model: "qwen/qwen3.8-max" }, { registry: REG_WITH_VENICE as any }),
+      false,
+      "key-less provider never eligible",
+    );
+    // openrouter table-leg ask (member of the deepseek family via modelOverrides): NOT eligible
+    equal(
+      altGateEligible(
+        { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+        { registry: REG_WITH_VENICE as any },
+      ),
+      false,
+      "chain hop leg never eligible",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+section("#512 venice-route ledger — recordVeniceRoute append site (round-4 P2 pin)");
+
+test("recordVeniceRoute: a real venice dispatch appends the audit row with kind/class/family/hop", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    recordVeniceRoute({ provider: "venice", model: "deepseek-v4-flash" }, "deepseek-v4-flash", null, env);
+    const file = join(env.PI_CODING_AGENT_DIR!, "audit", "provider-failover.jsonl");
+    ok(existsSync(file), "audit ledger file created");
+    const lines = readFileSync(file, "utf-8").trim().split("\n");
+    equal(lines.length, 1);
+    const row = JSON.parse(lines[0]);
+    equal(row.event, "venice-route");
+    equal(row.kind, "venice-route");
+    equal(row.provider, "venice");
+    equal(row.model, "deepseek-v4-flash");
+    equal(row.class, "cold");
+    equal(row.family, "deepseek-v4-flash");
+    equal(row.hop, null);
+    ok(typeof row.ts === "string" && !Number.isNaN(Date.parse(row.ts)), "ISO timestamp");
+  } finally {
+    cleanup();
+  }
+});
+
+test("recordVeniceRoute never throws on an unwritable ledger dir (audit-only contract)", () => {
+  const { cleanup } = freshFailoverEnv();
+  try {
+    const bad: Record<string, string | undefined> = { PI_CODING_AGENT_DIR: "/dev/null/nope" };
+    recordVeniceRoute({ provider: "venice", model: "deepseek-v4-flash" }, null, null, bad);
+    ok(true, "append failure swallowed — gate path never breaks");
+  } finally {
+    cleanup();
+  }
+});
+
+// ── #512 per-dispatch usage capture — parent-side parse/scan ──
+
+section("#512 usage capture — parseTaskUsageLine / scanStderrForUsage (parent side)");
+
+test("parseTaskUsageLine: well-formed [task-usage] line → structured usage", () => {
+  const u = parseTaskUsageLine(
+    "[task-usage] input=3000 output=800 cacheRead=15000 cacheWrite=200 cost=0.001734 model=deepseek-v4-flash provider=deepseek nonce=abc123",
+  );
+  ok(u, "parses");
+  equal(u!.input, 3000);
+  equal(u!.output, 800);
+  equal(u!.cacheRead, 15000);
+  equal(u!.cacheWrite, 200);
+  equal(u!.cost, 0.001734);
+  equal(u!.model, "deepseek-v4-flash");
+  equal(u!.provider, "deepseek");
+});
+
+test("parseTaskUsageLine rejects non-usage lines (heartbeat, exhaustion, prose)", () => {
+  equal(parseTaskUsageLine("[task-heartbeat] turn_start nonce=x 1"), null);
+  equal(parseTaskUsageLine("[provider-exhaustion] hop=a->b model=m reason=402 provider=p nonce=n"), null);
+  equal(parseTaskUsageLine("some random stderr text"), null);
+  equal(parseTaskUsageLine("[task-usage] garbage"), null);
+});
+
+test("scanStderrForUsage: line-anchored + nonce-validated; LAST occurrence wins", () => {
+  const blob =
+    "[task-usage] input=1 output=1 cacheRead=0 cacheWrite=0 cost=0.000001 model=deepseek-v4-flash provider=deepseek nonce=n1\n" +
+    "some other stderr\n" +
+    "[task-usage] input=9 output=9 cacheRead=3 cacheWrite=0 cost=0.000009 model=deepseek-v4-flash provider=deepseek nonce=n1\n";
+  const u = scanStderrForUsage(blob, "n1");
+  ok(u && u.input === 9, "last line wins");
+  // forged / wrong nonce → dropped (fail closed — an MCP server sharing fd 2
+  // cannot forge the dispatch's usage)
+  const forged = blob + "[task-usage] input=999 output=0 cacheRead=0 cacheWrite=0 cost=9 model=x provider=y nonce=EVIL\n";
+  const f = scanStderrForUsage(forged, "n1");
+  equal(f!.input, 9, "foreign-nonce line rejected");
+  // no expected nonce available → lines pass through unauthenticated (legacy
+  // parse shape for non-heartbeat children)
+  const raw = scanStderrForUsage(blob, undefined);
+  equal(raw!.input, 9);
+});
+
+
 
   for (const t of asyncTests) await t();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

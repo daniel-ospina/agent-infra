@@ -36,6 +36,8 @@ import {
   latchStateFile,
   PF_LOCK_WAIT_MS,
   legIsFamilyMember,
+  appendLedger,
+  auditLedgerFile,
 } from "./provider-failover.js";
 
 import * as fs from "node:fs";
@@ -184,6 +186,18 @@ test("FALSIFICATION: venice AUTHENTICATION_FAILED 401 with key wording → auth_
   );
   equal(cls.kind, "auth_permanent");
   equal(cls.reason, "blocked");
+});
+
+test("REAL venice 401 body (0b probe capture, 2026-09-06): '{\"error\":\"Authentication failed\"}' → auth_permanent", () => {
+  // Live probe with an intentionally-invalid VENICE_API_KEY returned exactly
+  // this body with HTTP 401 — NO key wording, NO code token. Pre-extension
+  // this missed every auth signature → null → no durable block → every
+  // canceled-sub dispatch spawned a doomed venice child. The observed
+  // wording now anchors SIG_AUTH_KEY (authentication failed).
+  const cls = classifyExhaustionText('{"error":"Authentication failed"}');
+  equal(cls.kind, "auth_permanent");
+  equal(cls.reason, "blocked");
+  equal(cls.matched, "auth-key-wording");
 });
 
 section("classifier narrowing pins (deep-review) — generic fragments never false-block");
@@ -890,7 +904,6 @@ test("per-TTL cadence pin: a venice own-latch self-heals after one TTL (no venic
 // ── Review-fix regressions (Phase-1 review P1/P2/P3) ────────────────
 
 section("review fixes — root-primary mapping, block gate, TTL env, lock, FS failure");
-
 test("root-primary mapping: hop-leg drain with NO root latch records under the DRAINED leg; root stays clear", () => {
   const { env } = makeEnv("rootmap");
   equal(rootPrimaryOfFamily("deepseek-v4-flash"), "deepseek");
@@ -1063,6 +1076,35 @@ testAsync("two simultaneous child processes write disjoint families; both surviv
   const fams = Object.keys(finalRaw.primaries.deepseek?.families ?? {});
   ok(fams.includes("deepseek-v4-flash") && fams.includes("deepseek-v4-pro"),
     `both families eventually present (got: ${fams.join(",")})`);
+});
+
+// ── #512 routing ledger ─────────────────────────────────────────────
+
+section("#512 routing ledger — appendLedger event rows (venice-route)");
+
+test("appendLedger writes venice-route rows with the event field; default rows unchanged", () => {
+  const { env } = makeEnv("ledger");
+  appendLedger(
+    { kind: "venice-route", family: "deepseek-v4-flash", model: "deepseek-v4-flash", provider: "venice", class: "cold" },
+    "venice-route",
+    env,
+  );
+  appendLedger({ kind: "marker", hop: "deepseek->openrouter", provider: "deepseek" }, "provider-failover", env);
+  appendLedger({ kind: "marker", hop: "deepseek->openrouter" }, undefined as any, env); // default event name
+  const file = auditLedgerFile(env);
+  const rows = fs
+    .readFileSync(file, "utf-8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l));
+  equal(rows.length, 3);
+  equal(rows[0].event, "venice-route");
+  equal(rows[0].kind, "venice-route");
+  equal(rows[0].provider, "venice");
+  equal(rows[0].class, "cold");
+  equal(rows[1].event, "provider-failover");
+  equal(rows[2].event, "provider-failover", "default event name preserved when omitted");
+  for (const r of rows) ok(typeof r.ts === "string" && r.ts.length > 0, "every row carries a timestamp");
 });
 
 // ── Results ───────────────────────────────────────────────────────────
