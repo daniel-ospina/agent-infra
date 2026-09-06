@@ -132,7 +132,11 @@ export interface LegRef {
 export interface FamilyLatch {
   /** The leg currently serving this family (null = the primary is serving). */
   activeLeg: LegRef | null;
-  /** How many times this family has advanced along its chain in this latch. */
+  /** Number of marker-driven chain re-advances recorded for this family in
+   * the CURRENT latch record (each marker from the serving leg that moves the
+   * active leg counts; the very first marker that SETS the active leg counts
+   * 1, re-advances increment). Inert today — no read site — but part of the
+   * durable JSON contract mirrored by deepseek-balance-latch.py. */
   hopCount: number;
   /** Last exhaustion reason observed on the CURRENT leg. */
   lastReason: string | null;
@@ -165,9 +169,15 @@ export interface LatchState {
   epoch: number;
   updatedAt: string;
   primaries: Record<string, PrimaryLatch>;
-  /** Provider-level permanent-auth blocks (401/403) discovered at runtime
-   * (poller/probes) — top-level so a primary clear (balance restore) never
-   * wipes a still-true auth block (review P2). */
+  /** Provider-level runtime auth-blocks (401/403 markers/probes) — top-level
+   * so a primary clear (balance restore) never wipes a still-true auth block
+   * (review P2). Blocks are READ-SIDE TTL-bounded at exclusion time (see
+   * blockedLegSet): an unrenewed block stops excluding its provider after one
+   * latch TTL (self-heal on key remediation); a still-blocked provider is
+   * re-stamped fresh by the next real 401/403 observation (markLegBlocked
+   * re-arms stale blocks). The env-list (PROVIDER_FAILOVER_BLOCKED) is the
+   * config-permanent mechanism — durable blocks are runtime evidence with a
+   * self-heal bound, not a config lockout. */
   blockedLegs: Record<string, { reason: string; at: string }>;
 }
 
@@ -281,16 +291,19 @@ const SIG_INSUFFICIENT_BALANCE = /(insufficient\s+balance|balance\s+insufficient
 /** Credit-exhaustion variants: "credit balance too low" (observed) and
  * OpenRouter's actual 402 body text "Insufficient credits. Add more using
  * https://openrouter.ai/credits" (SDK path omits the status — review P2). */
-const SIG_CREDIT_LOW = /(credit\s+balance\s+too\s+low|insufficient\s+credit)/i;
-/** 402 co-occurring with a credit-semantics word within a bounded line-local
- * window (review P2 — a distant balance/credit word on another line must not
- * pair with an unrelated 402 token). Bare `credit` is EXCLUDED (review R2 —
- * "402 credit card declined" is payment-method text, not balance exhaustion;
- * genuine "Insufficient credits…" is caught by SIG_CREDIT_LOW earlier). */
-const SIG_402_CREDIT = /402[^\n]{0,160}(insufficient|balance|quota)|(insufficient|balance|quota)[^\n]{0,160}402/i;
+const SIG_CREDIT_LOW = /(credit\s+balance\s+(?:is\s+)?too\s+low|insufficient\s+credit)/i;
+/** 402 co-occurring with a credit-exhaustion phrase within a bounded
+ * line-local window (review P2 — a distant balance/credit word on another
+ * line must not pair with an unrelated 402 token). Bare `credit`, bare
+ * `balance`, and bare `quota` are EXCLUDED (review R2 — "402 credit card
+ * declined" is payment-method text; "402 … quota report" is not balance
+ * exhaustion; genuine "Insufficient credits…" is caught by SIG_CREDIT_LOW
+ * earlier). `insufficient` alone is kept: SDK-wrapped OpenAI-style bodies
+ * carry the literal type `insufficient_quota` next to the status. */
+const SIG_402_CREDIT = /402[^\n]{0,160}(insufficient|credit\s+balance|too\s+low|exhausted)|(insufficient|credit\s+balance|too\s+low|exhausted)[^\n]{0,160}402/i;
 /** Fuzzy billing wording WITHOUT 402 → audit-only (never latches). */
 const SIG_FUZZY = /(insufficient_quota|insufficient quota|billing|usage limit reached|monthly usage|quota exceeded|credit balance)/i;
-const SIG_AUTH_KEY = /(invalid\s+x-api-key|invalid\s+api[_-]?key|api[_-]?key.{0,40}(invalid|incorrect|blocked)|incorrect\s+api\s+key|authentication\s+fails|authentication_error|invalid_api_key|is\s+blocked|access\s+denied|apikey-error)/i;
+const SIG_AUTH_KEY = /(invalid\s+x-api-key|invalid\s+api[_-]?key|api[_-]?key.{0,40}(invalid|incorrect|blocked)|api\s+key.{0,40}(invalid|incorrect|blocked)|incorrect\s+api\s+key|invalid_api_key|apikey-error)/i;
 
 /**
  * Classify a provider error/status text against the exhaustion signature.
@@ -592,7 +605,18 @@ function tryWriteLatchState(next: LatchState, env: Record<string, string | undef
     if (next.epoch !== cur.epoch + 1) return false; // lost CAS — caller re-reads
     const hash = contentHash(next);
     if (lastWrittenEpoch === next.epoch && lastWrittenHash === hash) {
-      return true; // this process already durably wrote this exact state
+      // once-per-process-per-epoch cap — only reachable after a corrupt-file
+      // self-heal reset the durable epoch backward. Verify on-disk before
+      // returning true: a reset between our write and now means the durable
+      // file no longer carries this state (review P2 — never report a durable
+      // write that a self-heal since erased).
+      try {
+        const onDisk = fs.readFileSync(file, "utf-8");
+        if (onDisk.trim() === JSON.stringify(next, null, 2)) return true;
+      } catch {
+        return false; // file gone/reset → fall through to a real write
+      }
+      // fall through: on-disk diverged → write again below
     }
     const dir = path.dirname(file);
     fs.mkdirSync(dir, { recursive: true });
@@ -616,7 +640,11 @@ function tryWriteLatchState(next: LatchState, env: Record<string, string | undef
     lastWrittenEpoch = next.epoch;
     lastWrittenHash = hash;
     return true;
-  } catch {
+  } catch (err: any) {
+    // Header contract: write failures are surfaced with an audit-only warn
+    // (never thrown — dispatch must not break on a state-dir problem). The
+    // caller degrades to an in-memory decision; the next process/write retries.
+    console.warn(`[provider-failover] latch write failed — ${err?.message ?? String(err)}`);
     return false; // never throw; callers degrade to in-memory decision
   }
 }
@@ -690,9 +718,20 @@ export function isLatched(
   return recordFresh(p, now, ttl);
 }
 
-function blockedLegSet(state: LatchState, env: Record<string, string | undefined>): Set<string> {
+function blockedLegSet(state: LatchState, env: Record<string, string | undefined>, now: number, ttl: number): Set<string> {
   const s = new Set<string>(blockedProviders(env));
-  for (const id of Object.keys(state.blockedLegs ?? {})) s.add(id);
+  // Durable auth-blocks (blockedLegs) are read-side TTL-bounded: a block
+  // older than one latch TTL stops excluding its provider from hop candidates
+  // (self-heal — a remediated key/leg becomes retryable without a manual
+  // unblock; a still-blocked leg is re-recorded fresh by the next real 401/403
+  // marker or probe). Without this bound a FALSE block (e.g. a transient
+  // gateway body misclassified pre-narrowing) would exclude a healthy hop
+  // provider forever (review P2).
+  for (const [id, rec] of Object.entries(state.blockedLegs ?? {})) {
+    const at = rec && typeof rec.at === "string" ? Date.parse(rec.at) : NaN;
+    if (Number.isFinite(at) && now - at > ttl) continue;
+    s.add(id);
+  }
   return s;
 }
 
@@ -715,7 +754,7 @@ function unavailableProviders(
   now: number,
   ttl: number,
 ): Set<string> {
-  const s = blockedLegSet(state, env);
+  const s = blockedLegSet(state, env, now, ttl);
   for (const [prov, rec] of Object.entries(state.primaries)) {
     if (rec.status === "exhausted" && recordFresh(rec, now, ttl)) s.add(prov);
   }
@@ -724,10 +763,15 @@ function unavailableProviders(
 
 /** The ROOT (account-of-record) provider of an alias family — the provider
  * whose balance drain the chain hop recovers from. Every family's root is its
- * first (primary official) leg's provider; hop-leg exhaustion markers are
- * recorded under the root, never under a per-leg primary (review P2 fix — a
- * primaries["openrouter"] record would never be consulted by deepseek-rooted
- * resolution). */
+ * first (primary official) leg's provider. DRAIN ACCOUNT-OF-RECORD (deep-*re-
+ * view): a drain is recorded under the root only when it continues an IN-FLIGHT
+ * root exhaustion (root latch FRESH at write time) or IS the root leg; a hop-
+ * leg drain with the root stale/absent records under the drained provider's
+ * OWN entry (see setExhausted) so a healthy root is never re-latched on
+ * another account's evidence — and a primaries["openrouter"] own record IS
+ * consulted: unavailableProviders() excludes the drained provider from hop
+ * candidates, and resolution's root-ask reads the (absent) root record as
+ * clear. */
 export function rootPrimaryOfFamily(family: string | undefined): string | undefined {
   if (!family) return undefined;
   return familyLegs(family)?.[0]?.provider;
@@ -871,33 +915,42 @@ export function setExhausted(input: LatchInput): LatchState {
   const ttl = input.ttlMs ?? latchTtlMs(env);
   const expiry = freshExpiry(ttl, now);
   return updateLatchState((cur) => {
-    // NORMALIZE the primary to the family ROOT when a family is given: an
-    // exhaustion on a hop leg (e.g. openrouter) is an account-of-record event
-    // for the family root (deepseek), never a new primaries["openrouter"]
-    // record that deepseek-rooted resolution would ignore (review P2 fix).
+    // ACCOUNT-OF-RECORD selection (review P2 + deep-review fix): a drain is
+    // recorded under the family ROOT only when it is a continuation of an
+    // IN-FLIGHT root exhaustion (the root record is FRESH at write time — the
+    // hop-leg drain happened under an active root latch) or the drain IS the
+    // root leg itself (first exhaustion of the primary). A hop-leg drain
+    // observed while the root record is stale/absent is the HOP PROVIDER's own
+    // account event (its credits drained — e.g. openrouter's independent
+    // balance), NOT evidence about the root balance: recording it under the
+    // root would re-latch a possibly-healthy primary for a full TTL and mark
+    // the family terminal on evidence about the wrong account (deep finding
+    // P2). Such drains record under the drained provider's own primaries
+    // entry — unavailableProviders() then excludes that provider from hop
+    // candidates (fresh own record) while the root family stays resolvable on
+    // the primary.
     const root = input.family ? rootPrimaryOfFamily(input.family) : undefined;
-    const primaryProvider = root ?? input.primaryProvider;
+    const fromIsRoot = input.fromLeg ? root !== undefined && input.fromLeg.provider === root : input.primaryProvider === root;
+    const rootRec = root ? cur.primaries?.[root] : undefined;
+    const rootFresh = rootRec ? recordFresh(rootRec, now, ttl) : false;
+    const primaryProvider = root && (fromIsRoot || rootFresh) ? root : input.primaryProvider;
     const existing = cur.primaries[primaryProvider];
     const fam = input.family;
     const families: Record<string, FamilyLatch> = { ...(existing?.families ?? {}) };
-    let hopCount = 0;
-    if (fam) {
-      const prev = families[fam];
-      if (prev) {
-        hopCount = prev.hopCount;
-        // same leg exhausted again (no chain progress) → keep hopCount; a
-        // marker from the ACTIVE leg advances it below.
-        const fromLeg = input.fromLeg;
-        if (fromLeg && prev.activeLeg && prev.activeLeg.provider === fromLeg.provider && prev.activeLeg.model === fromLeg.model) {
-          hopCount = prev.hopCount + 1;
-        } else if (fromLeg && !prev.activeLeg) {
-          hopCount = prev.hopCount + 1;
-        }
-      }
-    }
     if (fam && input.fromLeg) {
       const step = nextLegAfter(fam, input.fromLeg, cur, { env, now, ttlMs: ttl });
+      const prev = families[fam];
       if (!step.halted && step.leg) {
+        // Chain (re-)engagement: a marker-driven write that SETS an active
+        // leg counts 1 when the family record didn't exist or had no active
+        // leg (first latch, or re-arm after a terminal/cleared record), and
+        // re-advances count when the marker came from the CURRENT active leg.
+        // A stale marker from a NON-active leg (out-of-band drain) does not
+        // advance the count — the chain did not move from its position.
+        const noActiveLeg = !prev?.activeLeg;
+        const fromCurrentActive =
+          !!prev?.activeLeg && prev.activeLeg.provider === input.fromLeg.provider && prev.activeLeg.model === input.fromLeg.model;
+        const hopCount = (prev?.hopCount ?? 0) + (noActiveLeg || fromCurrentActive ? 1 : 0);
         families[fam] = {
           activeLeg: step.leg,
           hopCount,
@@ -909,7 +962,7 @@ export function setExhausted(input: LatchInput): LatchState {
         // resolution must not re-walk from the primary past these legs)
         families[fam] = {
           activeLeg: null,
-          hopCount,
+          hopCount: prev?.hopCount ?? 0,
           lastReason: input.reason,
           terminal: true,
         };
@@ -918,7 +971,7 @@ export function setExhausted(input: LatchInput): LatchState {
       const prev = families[fam];
       families[fam] = {
         activeLeg: prev?.activeLeg ?? null,
-        hopCount: prev?.hopCount ?? hopCount,
+        hopCount: prev?.hopCount ?? 0,
         lastReason: prev?.lastReason ?? input.reason,
         terminal: prev?.terminal ?? false,
       };
@@ -943,10 +996,16 @@ export function setExhausted(input: LatchInput): LatchState {
   }, env);
 }
 
-/** Mark a leg/provider permanently auth-blocked (401/403) — excluded-with-
- * alert; NOT exhaustion (never latches the balance). Blocks are TOP-LEVEL
- * state (provider-level), so a primary balance-restore clear never wipes a
+/** Mark a leg/provider auth-blocked (401/403) — excluded-with-alert; NOT
+ * exhaustion (never latches the balance). Blocks are TOP-LEVEL state
+ * (provider-level), so a primary balance-restore clear never wipes a
  * still-true auth block (review P2).
+ *
+ * DURATION: blocks exclude at read time while FRESH (blockedLegSet bounds
+ * them at one latch TTL — self-heal on key remediation). Re-observed 401/403
+ * evidence re-arms a stale block (below), so a still-broken key stays
+ * excluded without a manual unblock; a remediated key silently returns to
+ * hop-candidate rotation once its block ages past the TTL.
  *
  * SCOPE (review R4 P2): blocking filters HOP CANDIDATES only — resolution's
  * 'clear' path still dispatches a requested leg that is itself blocked (no
@@ -954,9 +1013,21 @@ export function setExhausted(input: LatchInput): LatchState {
  * block must pre-check state.blockedLegs / blockedProviders() themselves. */
 export function markLegBlocked(providerId: string, reason: string, opts: { env?: Record<string, string | undefined> } = {}): LatchState {
   const env = opts.env ?? process.env;
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   return updateLatchState((cur) => {
-    if (cur.blockedLegs?.[providerId]) return cur;
+    const existing = cur.blockedLegs?.[providerId];
+    if (existing) {
+      // Fresh double-block = no-op (byte-identical parity with the python
+      // mirror op_block — the poller parity contract). A STALE block (older
+      // than one latch TTL — read-side bound in blockedLegSet already stopped
+      // excluding it) re-arms on fresh evidence: a re-observed 401/403 means
+      // the key is STILL broken, so the block must exclude for another TTL;
+      // without the re-stamp a still-blocked leg churns one doomed dispatch
+      // per TTL forever after its first expiry.
+      const at = typeof existing.at === "string" ? Date.parse(existing.at) : NaN;
+      if (Number.isFinite(at) && nowMs - at <= latchTtlMs(env)) return cur;
+    }
     return { ...cur, blockedLegs: { ...(cur.blockedLegs ?? {}), [providerId]: { reason, at: now } } };
   }, env);
 }

@@ -68,6 +68,30 @@ def iso_now() -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
+def latch_ttl_ms() -> int:
+    """Mirror of the TS latchTtlMs: PROVIDER_EXHAUSTION_TTL_MS env, default
+    24h. Invalid/negative → default (TS module clamps the same way)."""
+    raw = os.environ.get("PROVIDER_EXHAUSTION_TTL_MS", "")
+    try:
+        v = int(raw)
+        if v > 0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return 24 * 60 * 60 * 1000
+
+
+def iso_age_ms(iso_at: str) -> Optional[int]:
+    """Milliseconds elapsed since an ISO-8601 timestamp; None when unparseable."""
+    if not isinstance(iso_at, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int((datetime.now(timezone.utc) - dt).total_seconds() * 1000)
+
+
 def state_file() -> str:
     if os.environ.get("DBW_STATE_FILE"):
         return os.environ["DBW_STATE_FILE"]
@@ -308,11 +332,21 @@ def op_clear(primary: str, reason: str):
 
 def op_block(provider: str, reason: str):
     now = iso_now()
+    ttl_ms = latch_ttl_ms()
 
     def mut(cur):
         blocked = cur.get("blockedLegs") or {}
-        if provider in blocked:
-            return None  # already recorded (markLegBlocked mirror)
+        existing = blocked.get(provider)
+        if existing is not None:
+            # Fresh double-block = no-op (byte-identical parity with the TS
+            # markLegBlocked). A STALE block (older than one latch TTL — the
+            # TS read-side bound already stopped excluding it) re-arms on
+            # fresh evidence: a re-observed 401/403 means the key is STILL
+            # broken, so the block must exclude for another TTL (mirror of the
+            # TS markLegBlocked re-stamp).
+            age = iso_age_ms(existing.get("at")) if isinstance(existing, dict) else None
+            if age is not None and age <= ttl_ms:
+                return None  # already freshly recorded
         blocked = dict(blocked)
         blocked[provider] = {"reason": reason, "at": now}
         return {**cur, "blockedLegs": blocked}

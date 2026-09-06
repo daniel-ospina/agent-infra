@@ -29,8 +29,10 @@
  *      next request onward per sC3). `session_start` hops a latched family
  *      before the first prompt (interactive-only; print children leave the
  *      CLI model untouched); `turn_start` returns to the family primary once
- *      the poller clears the latch (verified positive balance). Interactive
- *      never emits markers (no nonce, no parent reader).
+ *      the poller clears a latch that THIS session observed (verified
+ *      positive balance — a never-latched hop leg chosen explicitly by the
+ *      user is never yanked; see latchSeenFamilies). Interactive never emits
+ *      markers (no nonce, no parent reader).
  *
  * Gating: the whole extension is inert under PROVIDER_FAILOVER_DISABLE=1
  * (matches the Phase-2 dispatch kill switch). Everything below is exported
@@ -46,6 +48,8 @@ import {
   resolveWithChain,
   familyOf,
   familyLegs,
+  rootPrimaryOfFamily,
+  isLatched,
   failoverDisabled,
   renderExhaustionMarker,
 } from "./shared/provider-failover.js";
@@ -181,6 +185,17 @@ export function interactiveRestoreTarget(
 /** Set when a child latched an in-session signal — emitted at shutdown. */
 let pendingMarker: string | null = null;
 
+/** Families this process observed an EXHAUSTION LATCH for (interactive only).
+ * Added on (a) an interactive message_end setExhausted and (b) session_start
+ * finding the session's family root latched. turn_start RESTORE is gated on
+ * this set: a hop-leg session whose root record is absent is a poller-clear
+ * ONLY when a latch existed in this session — when the root was never latched
+ * (user EXPLICITLY chose the hop leg, e.g. `pi --provider openrouter --model
+ * deepseek/deepseek-v4-pro`) an absent root means "no exhaustion history",
+ * not "restored balance", and yanking the session back with a misleading
+ * "Provider balance restored" banner would be wrong (deep-review P2). */
+const latchSeenFamilies = new Set<string>();
+
 /** States already alerted in this session (terminal/blocked banners are shown
  * ONCE per state, not per failing turn — review round-1 P3-3). */
 const alertedStates = new Set<string>();
@@ -196,6 +211,10 @@ export function _setMarkerSinkForTests(sink: (line: string) => void): void {
 
 export function _resetPendingMarkerForTests(): void {
   pendingMarker = null;
+}
+
+export function _resetLatchSeenFamiliesForTests(): void {
+  latchSeenFamilies.clear();
 }
 
 export function _pendingMarkerForTests(): string | null {
@@ -224,8 +243,12 @@ export default function (pi: ExtensionAPI) {
 
   /** Best-effort model switch to a target leg (round-2 P0): ctx.modelRegistry
    * is the runner's ModelRegistry (find(provider, modelId) → Model object);
-   * pi.setModel REQUIRES a Model object, not a bare id string. Falls back to
-   * a minimal {id, provider} object when the registry can't resolve. */
+   * pi.setModel REQUIRES a Model object, not a bare id string. A registry
+   * MISS (target provider/model not configured in models.json) reports
+   * ok=false — the caller's no-hop notice fires and the session stays put.
+   * NEVER fabricate a bare {id, provider} object: pi.setModel on an
+   * unconfigured provider would break the very next request, and the hop
+   * banner would lie (deep-review P2 — silent break on registry miss). */
   const switchModel = async (
     ctx: any,
     target: { provider: string; model: string },
@@ -237,9 +260,12 @@ export default function (pi: ExtensionAPI) {
     } catch {
       resolved = undefined;
     }
-    const model = (resolved as { id?: string; provider?: string }) ?? { id: target.model, provider: target.provider };
+    if (!resolved) {
+      onResult(false);
+      return;
+    }
     try {
-      const ok = await pi.setModel(model);
+      const ok = await pi.setModel(resolved);
       onResult(ok === false ? false : true);
     } catch {
       onResult(false);
@@ -288,6 +314,7 @@ export default function (pi: ExtensionAPI) {
       notice: { title: "Provider credit exhausted", body: detail },
       env: process.env,
     });
+    if (fam) latchSeenFamilies.add(fam); // this session IS on a drained family — restore gate (deep-review P2)
     notifyOnce(`exhausted:${fam ?? provider}`, "Provider credit exhausted — failover latch set", detail);
     // Hop the NEXT turn onto the chain's next available leg.
     const target = interactiveHopTarget({ provider, model }, state);
@@ -324,6 +351,17 @@ export default function (pi: ExtensionAPI) {
     if (!ctx || ctx.mode !== "tui") return; // print/json children: CLI authoritative (sC3)
     const parts = modelParts(ctx.model);
     const state = readLatchState();
+    // RESTORE gate: record the family when its ROOT is observed latched at
+    // session start — the session is on (or about to hop to) a hop leg in
+    // response to a real exhaustion. An explicitly-chosen hop leg under a
+    // HEALTHY root (no latch anywhere) stays unrecorded: when the poller
+    // later "clears" nothing for it, turn_start must not yank it back with a
+    // false "balance restored" banner (deep-review P2).
+    const fam = familyOf(parts.model, parts.provider);
+    if (fam) {
+      const root = rootPrimaryOfFamily(fam);
+      if (root && state.primaries?.[root] && isLatched(root, state)) latchSeenFamilies.add(fam);
+    }
     const target = interactiveHopTarget(parts, state);
     if (target) {
       await switchModel(ctx, target, (ok) => {
@@ -334,11 +372,17 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // turn_start — INTERACTIVE only: when the poller cleared the latch, return
-  // to the family primary (restore path). Print children never hop (no-op).
+  // turn_start — INTERACTIVE only: when the poller cleared a latch that
+  // existed THIS session, return to the family primary (restore path). Print
+  // children never hop (no-op). Gated on latchSeenFamilies: an absent root
+  // only means "poller cleared it" when the family was latched during this
+  // process — an explicitly-chosen hop leg (root never latched) must NOT be
+  // yanked back (deep-review P2).
   pi.on("turn_start", async (_event, ctx: any) => {
     if (!ctx || ctx.mode !== "tui") return;
     const parts = modelParts(ctx.model);
+    const fam = familyOf(parts.model, parts.provider);
+    if (!fam || !latchSeenFamilies.has(fam)) return; // no exhaustion history this session → stay put
     const state = readLatchState();
     const target = interactiveRestoreTarget(parts, state);
     if (target) {

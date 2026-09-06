@@ -178,6 +178,12 @@ assert_contains "$(cat "$FLEET_INSTALLED")" "agent-infra-plist-version: 0.1.0" "
 assert_contains "$(cat "$FLEET_INSTALLED")" "StartCalendarInterval" "fleet job is calendar-scheduled (weekly)"
 assert_contains "$(cat "$DBW_INSTALLED")" "$HOME1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh" "balance-watch plist rendered with fake HOME (#476)"
 assert_contains "$(cat "$DBW_INSTALLED")" "agent-infra-plist-version: 0.1.0" "balance-watch template carries version marker"
+# #476 — the balance poller is the SINGLE restore authority: must run every
+# 15min (StartInterval 900, not calendar) and carry the installer PATH (launchd
+# default PATH lacks python3/curl used by the poller).
+assert_contains "$(cat "$DBW_INSTALLED")" "<integer>900</integer>" "balance-watch runs every 15min (StartInterval 900)"
+assert_not_contains "$(cat "$DBW_INSTALLED")" "StartCalendarInterval" "balance-watch is interval-scheduled, not calendar"
+assert_contains "$(cat "$DBW_INSTALLED")" "<key>PATH</key>" "balance-watch plist carries an explicit PATH env"
 # #432 — hub-state-check + skill-lint-oracle are RETIRED from launchd (their
 # work moved to extensions/session-checks.ts — macOS TCC blocks launchd from
 # ~/Documents, so they run from pi's session_start instead).

@@ -33,10 +33,11 @@ import extension, {
   interactiveHopTarget,
   interactiveRestoreTarget,
   _resetPendingMarkerForTests,
+  _resetLatchSeenFamiliesForTests,
   _pendingMarkerForTests,
   _setMarkerSinkForTests,
 } from "./provider-exhaustion.js";
-import { readLatchState, setExhausted } from "./shared/provider-failover.js";
+import { readLatchState, setExhausted, clearExhaustion } from "./shared/provider-failover.js";
 
 let passed = 0;
 let failed = 0;
@@ -139,12 +140,14 @@ function hermetic(): { env: Record<string, string | undefined>; cleanup: () => v
   const captured: string[] = [];
   _setMarkerSinkForTests((line) => captured.push(line));
   _resetPendingMarkerForTests();
+  _resetLatchSeenFamiliesForTests();
   return {
     env,
     cleanup: () => {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
       _setMarkerSinkForTests((line: string) => fs.writeSync(2, line));
       _resetPendingMarkerForTests();
+      _resetLatchSeenFamiliesForTests();
     },
     captured,
   };
@@ -444,17 +447,23 @@ test("session_start on a latched family hops BEFORE the first prompt (tui); prin
   }
 });
 
-test("turn_start restores to the primary only after the poller cleared the latch", async () => {
+test("turn_start restores to the primary only after the poller cleared a latch SEEN this session", async () => {
   const { env, cleanup } = hermetic();
   applyEnv(env);
   try {
     const pi = makeFakePi();
     extension(pi as any);
-    // Session on the openrouter hop leg; root record ABSENT (poller cleared it)
+    // Session latches the family (interactive 402) → the drain is recorded and
+    // the session is now failover-managed (latch seen).
+    await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("deepseek", "deepseek-v4-flash")));
+    ok(pi.setModelCalls.length >= 1, "interactive 402 hopped onto the chain leg");
+    // poller clears the root latch (verified positive balance)
+    clearExhaustion("deepseek", { env });
+    // next turn_start on the HOP leg, root record now absent → back to primary
     await pi.emit("turn_start", { turnIndex: 2 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
-    equal(pi.setModelCalls.length, 1, "cleared root → back to primary");
-    equal(pi.setModelCalls[0].provider, "deepseek");
-    equal(pi.setModelCalls[0].id, "deepseek-v4-flash");
+    const last = pi.setModelCalls[pi.setModelCalls.length - 1];
+    ok(last && last.provider === "deepseek" && last.id === "deepseek-v4-flash", "cleared root (latch seen this session) → back to primary");
+
     // Root record still present (fresh latch) → stay on the hop leg
     setExhausted({
       primaryProvider: "deepseek",
@@ -465,16 +474,39 @@ test("turn_start restores to the primary only after the poller cleared the latch
       env,
     });
     const pi2 = makeFakePi();
+    await pi2.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
+    const n2 = pi2.setModelCalls.length;
     await pi2.emit("turn_start", { turnIndex: 3 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
-    equal(pi2.setModelCalls.length, 0, "still-latched root → no restore");
+    equal(pi2.setModelCalls.length, n2, "still-latched root → no restore");
     // Already on the primary → no restore
-    const pi3 = makeFakePi();
-    await pi3.emit("turn_start", { turnIndex: 4 }, ctx("tui", modelObj("deepseek", "deepseek-v4-flash")));
-    equal(pi3.setModelCalls.length, 0);
+    await pi2.emit("turn_start", { turnIndex: 4 }, ctx("tui", modelObj("deepseek", "deepseek-v4-flash")));
+    equal(pi2.setModelCalls.length, n2, "already on primary → no restore");
     // print children never restore
-    const pi4 = makeFakePi();
-    await pi4.emit("turn_start", { turnIndex: 5 }, ctx("print", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
-    equal(pi4.setModelCalls.length, 0);
+    await pi2.emit("turn_start", { turnIndex: 5 }, ctx("print", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
+    equal(pi2.setModelCalls.length, n2, "print children never restore");
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
+test("EXPLICIT hop-leg session (root NEVER latched) is never yanked back by turn_start", async () => {
+  const { env, cleanup } = hermetic();
+  applyEnv(env);
+  try {
+    // User starts the session explicitly on the openrouter hop leg (e.g.
+    // `pi --provider openrouter --model deepseek/deepseek-v4-pro`) with a
+    // HEALTHY root — no latch has EVER existed for this family.
+    const pi = makeFakePi();
+    extension(pi as any);
+    await pi.emit("session_start", { reason: "startup" }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
+    equal(pi.setModelCalls.length, 0, "healthy root → no hop at session start");
+    // turn_start fires every turn; the root record is absent (never latched —
+    // not poller-cleared). The session must NOT be yanked to the primary with
+    // a misleading "Provider balance restored" banner (deep-review P2).
+    await pi.emit("turn_start", { turnIndex: 1 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
+    await pi.emit("turn_start", { turnIndex: 2 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
+    equal(pi.setModelCalls.length, 0, "never-latched explicit hop leg → session stays put");
   } finally {
     restoreEnv();
     cleanup();

@@ -268,7 +268,10 @@ with automatic return after balance restore.
   401 remediation; default chain while blocked: deepseek → openrouter).
 - Env knobs: `PROVIDER_FAILOVER_DISABLE=1` (kill switch), `PI_FAILOVER_NO_HOP=1`
   (must-stay), `PROVIDER_EXHAUSTION_TTL_MS` (latch TTL, default 24h — the poller
-  is the real clear authority; a stale latch self-heals in one TTL),
+  is the real clear authority; a stale latch self-heals in one TTL at the
+  DISPATCH level (resolution returns the primary once the record is stale),
+  but an interactive TUI session already on a hop leg stays put until the
+  poller clears — TTL expiry alone does not yank the session back),
   `PROVIDER_FAILOVER_BLOCKED` (provider block list; empty string = re-enable),
   `TASK_EXHAUSTION_BLOCK=1` (fail fast instead of hopping).
 - Hop cost metadata is honest (catalog-authority rates in `models-store.json`),

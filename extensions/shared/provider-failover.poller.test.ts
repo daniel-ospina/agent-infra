@@ -60,7 +60,7 @@ function test(name: string, fn: () => void) {
 }
 
 /** Fresh isolated agent dir + env for one scenario. */
-function freshEnv(): { dir: string; env: Record<string, string> } {
+function freshEnv(overrides: Record<string, string> = {}): { dir: string; env: Record<string, string> } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-poller-parity-"));
   const stateFile = path.join(dir, "state", "provider-exhaustion.json");
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
@@ -71,8 +71,15 @@ function freshEnv(): { dir: string; env: Record<string, string> } {
   delete env.TASK_HEARTBEAT_NONCE;
   env.PI_CODING_AGENT_DIR = dir;
   env.PFW_STATE_FILE = stateFile;
+  for (const [k, v] of Object.entries(overrides)) env[k] = v;
   return { dir, env };
 }
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Synchronous sleep (the parity harness is sync — no async test fn). */
+const sleepSync = (ms: number): void => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
 
 /** Run the python helper with the scenario env; returns {status, stdout}. */
 function py(args: string[], env: Record<string, string>): { status: number; stdout: string } {
@@ -180,6 +187,38 @@ test("no-op parity: clear-without-record and double-block do not bump epoch", ()
   equal(tsState(a.env).epoch, ea + 1, "ts no-op clear does not bump epoch");
   equal(pyState(b.env).epoch, eb + 1, "python no-op clear does not bump epoch");
   equal(tsState(a.env).epoch, pyState(b.env).epoch, "epochs converge");
+  // FRESH double-block is also a no-op on BOTH writers (byte-identical parity)
+  markLegBlocked("openrouter", "401", { env: a.env as any });
+  py(["block", "--provider", "openrouter", "--reason", "401"], b.env);
+  const e2a = tsState(a.env).epoch;
+  const e2b = pyState(b.env).epoch;
+  equal(e2a, e2b, "epochs converge after first block");
+  markLegBlocked("openrouter", "401", { env: a.env as any }); // fresh re-block → no-op
+  py(["block", "--provider", "openrouter", "--reason", "401"], b.env); // no-op
+  equal(tsState(a.env).epoch, e2a, "ts fresh double-block does not bump epoch");
+  equal(pyState(b.env).epoch, e2b, "python fresh double-block does not bump epoch");
+});
+
+test("STALE re-block parity: both writers re-stamp an aged block (TTL env honored)", () => {
+  const a = freshEnv({ PROVIDER_EXHAUSTION_TTL_MS: "50" });
+  const b = freshEnv({ PROVIDER_EXHAUSTION_TTL_MS: "50" });
+  markLegBlocked("openrouter", "401", { env: a.env as any });
+  py(["block", "--provider", "openrouter", "--reason", "401"], b.env);
+  const at0a = tsState(a.env).blockedLegs.openrouter.at;
+  ok(/^\d{4}-\d{2}-\d{2}T/.test(at0a), "ts block stamped ISO at");
+  sleepSync(60); // age past the 50ms TTL
+  markLegBlocked("openrouter", "401", { env: a.env as any }); // stale → re-stamp
+  py(["block", "--provider", "openrouter", "--reason", "401"], b.env); // stale → re-stamp
+  const at1a = tsState(a.env).blockedLegs.openrouter.at;
+  const at1b = pyState(b.env).blockedLegs.openrouter.at;
+  ok(at1a !== at0a, "ts re-stamped the aged block");
+  ok(at1b !== at0a, "python re-stamped the aged block (mirror)");
+  // semantic parity (each writer stamps its own ms — compare shape, not bytes)
+  deepEqual(
+    dropNoise(tsState(a.env)),
+    dropNoise(pyState(b.env)),
+    "both writers agree on the re-stamped block shape",
+  );
 });
 
 // ── interleaved writers: monotonic epoch, no lost updates ───────────────────

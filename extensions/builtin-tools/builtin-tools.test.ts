@@ -26,7 +26,7 @@ import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
-import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   resolveDispatchLeg,
@@ -2678,6 +2678,36 @@ test("decidePostDispatch: 402 marker pre-tool-call → durable latch + ADVANCE t
   }
 });
 
+test("decidePostDispatch: marker with UNWRITABLE state dir → failoverLatchFailed, never a false failoverLatched/advance (deep-review)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // read-only state dir: every latch write fails (EACCES) — the durable
+    // latch can NOT land. decidePostDispatch must not annotate
+    // failoverLatched:true (lie) nor advance/halt (resolveWithChain against an
+    // unlatched state would re-dispatch the possibly-dead account).
+    const stateDir = resolve(env.PI_CODING_AGENT_DIR!, "state");
+    mkdirSync(stateDir, { recursive: true });
+    chmodSync(stateDir, 0o555);
+    const decision = decidePostDispatch({
+      result: connErrResult(),
+      dispatched: FLASH_ROOT,
+      family: "deepseek-v4-flash",
+      sawTools: false,
+      marker: mkMarker({}),
+      env,
+    });
+    equal(decision.action, "return", "no durable latch → no advance");
+    equal(decision.nextLeg, null);
+    equal(decision.annotations.failoverLatched, false, "never claim a latch that did not land");
+    equal(decision.annotations.failoverLatchFailed, true, "write failure surfaced on the annotation");
+    const state = readLatchState(env);
+    ok(!state.primaries.deepseek, "no latch record durably written");
+  } finally {
+    chmodSync(resolve(env.PI_CODING_AGENT_DIR!, "state"), 0o755);
+    cleanup();
+  }
+});
+
 test("decidePostDispatch: 402 marker AFTER tool calls → latch + RETURN (side-effect replay guard)", () => {
   const { env, cleanup } = freshFailoverEnv();
   try {
@@ -2750,8 +2780,7 @@ test("decidePostDispatch: marker with NO heartbeat markers (sawToolsUnknown) →
   }
 });
 
-test("decidePostDispatch: blocked marker (401 auth-permanent) → annotation-only, never latch-exhaustion", () => {
-  const { env, cleanup } = freshFailoverEnv();
+test("decidePostDispatch: blocked marker (401 auth-permanent) → annotation-only, never latch-exhaustion", () => {  const { env, cleanup } = freshFailoverEnv();
   try {
     const decision = decidePostDispatch({
       result: connErrResult(),

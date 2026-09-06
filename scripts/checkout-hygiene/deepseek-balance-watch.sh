@@ -191,7 +191,7 @@ RAW="$(dbw_curl "$DS_URL" -H "Authorization: Bearer $DEEPSEEK_KEY")"
 probe_triple "$RAW"
 
 if [ "$CODE" = "200" ]; then
-  read -r USD_TOTAL USD_GRANTED USD_TOP CYN_TOTAL <<<"$(parse_deepseek_balance "$BODY")" || true
+  read -r USD_TOTAL USD_GRANTED USD_TOP CNY_TOTAL <<<"$(parse_deepseek_balance "$BODY")" || true
   if [ "${USD_TOTAL:-}" = "unavailable" ]; then
     # is_available=false — account unusable (frozen/blocked/disabled). NOT a
     # balance verdict: defer + escalate (no latch change; session 402 markers
@@ -213,7 +213,7 @@ if [ "$CODE" = "200" ]; then
       if [ "$CODE" = "200" ]; then
         if latch clear --primary deepseek --reason poller; then
           latch ledger --event poller-clear --provider deepseek --detail "balance USD ${USD_TOTAL} >= clear ${DBW_CLEAR_USD} + probe 200"
-          log "$TS CLEAR balance=USD ${USD_TOTAL} (granted ${USD_GRANTED} / topped ${USD_TOP}) probe=200 — exhaustion latch cleared"
+          log "$TS CLEAR balance=USD ${USD_TOTAL} (granted ${USD_GRANTED} / topped ${USD_TOP}${CNY_TOTAL:+/ CNY ${CNY_TOTAL}}) probe=200 — exhaustion latch cleared"
           ACTION="pass"
         else
           log "$TS LATCH-CLEAR-FAILED balance=USD ${USD_TOTAL} probe=200 — durable clear write failed; latch kept (fail-closed)"

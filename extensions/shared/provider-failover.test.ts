@@ -133,6 +133,27 @@ test("'API-key is blocked' 401 → auth_permanent", () => {
   equal(classifyExhaustionText("401 API-key is blocked").kind, "auth_permanent");
 });
 
+section("classifier narrowing pins (deep-review) — generic fragments never false-block");
+
+test("generic gateway auth wording WITHOUT key context → null (never auth_permanent block)", () => {
+  // Pre-narrowing these matched bare `access denied` / `is blocked` /
+  // `authentication_error` fragments — a transient gateway body with no key
+  // involvement could durably exclude a HEALTHY hop provider forever.
+  equal(classifyExhaustionText('{"error":{"message":"Access denied by gateway policy"}}').kind, null);
+  equal(classifyExhaustionText('{"error":{"type":"authentication_error","message":"Request failed"}}').kind, null);
+  equal(classifyExhaustionText("Account is blocked. Contact support.").kind, null);
+  equal(classifyExhaustionText("403 Access denied").kind, null);
+});
+
+test("402 + quota/balance WITHOUT credit-exhaustion window words → audit_only, never exhaustion", () => {
+  // The SIG_402_CREDIT window is credit-scoped (insufficient | credit balance |
+  // too low | exhausted) — bare quota/balance pairing with a 402 on another
+  // line must never latch (review R2 + deep-review).
+  equal(classifyExhaustionText("402 quota exceeded").kind, "audit_only");
+  equal(classifyExhaustionText('{"error":{"code":402,"message":"Your balance inquiry failed"}}').kind, null, "bare balance (no fuzzy word) + 402 → null");
+  equal(classifyExhaustionText("balance 402 — report").kind, null, "bare balance + distant 402 → null (no fuzzy word, no window match)");
+});
+
 section("classifyExhaustionText — healthy / non-exhaustion negatives");
 
 test("healthy provider text → null", () => {
@@ -474,6 +495,25 @@ test("markLegBlocked / clearLegBlocked lifecycle + TTL override env + block surv
   equal(latchTtlMs({ PROVIDER_EXHAUSTION_TTL_MS: "-1" }), 24 * 60 * 60 * 1000, "invalid env → default");
 });
 
+test("blockedLegs read-side TTL bound: stale block stops excluding; fresh re-arm re-excludes (deep-review)", () => {
+  const { env } = makeEnv("blkttl");
+  // set a short TTL so the block ages quickly
+  const shortEnv = { ...env, PROVIDER_EXHAUSTION_TTL_MS: "200" };
+  setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: FLASH_PRIMARY, env: shortEnv });
+  markLegBlocked("openrouter", "401", { env: shortEnv });
+  const t0 = Date.now();
+  const fresh = nextLegAfter("deepseek-v4-flash", FLASH_PRIMARY, readLatchState(shortEnv), { env: shortEnv, now: t0 });
+  ok(fresh.skipped.map((l) => l.provider).includes("openrouter"), "fresh block excludes openrouter from hop candidates");
+  // let the block age past one TTL → openrouter re-enters rotation (self-heal)
+  const stale = nextLegAfter("deepseek-v4-flash", FLASH_PRIMARY, readLatchState(shortEnv), { env: shortEnv, now: t0 + 500 });
+  ok(!stale.skipped.map((l) => l.provider).includes("openrouter"), "stale block stops excluding (self-heal after one TTL)");
+  // a FRESH 401 re-observation re-arms the block (still-broken key stays excluded)
+  markLegBlocked("openrouter", "401", { env: shortEnv });
+  const t1 = Date.now();
+  const rearmed = nextLegAfter("deepseek-v4-flash", FLASH_PRIMARY, readLatchState(shortEnv), { env: shortEnv, now: t1 });
+  ok(rearmed.skipped.map((l) => l.provider).includes("openrouter"), "re-observed 401 re-stamps → excluded again for another TTL");
+});
+
 test("OpenRouter 402 body text (SDK omits status) → exhaustion (review P2)", () => {
   const c = classifyExhaustionText("Insufficient credits. Add more using https://openrouter.ai/credits");
   equal(c.kind, "exhaustion");
@@ -564,13 +604,17 @@ test("second-leg exhaustion advances to halt (chain bounded)", () => {
 
 section("review fixes — root-primary mapping, block gate, TTL env, lock, FS failure");
 
-test("root-primary mapping: hop-leg marker (openrouter) records under the deepseek root", () => {
+test("root-primary mapping: hop-leg drain with NO root latch records under the DRAINED leg; root stays clear", () => {
   const { env } = makeEnv("rootmap");
   equal(rootPrimaryOfFamily("deepseek-v4-flash"), "deepseek");
   equal(rootPrimaryOfFamily("glm-5.2"), undefined);
   // exhaustion marker arrives from the OPENROUTER hop leg (provider=openrouter)
+  // while the ROOT has NO fresh latch (stale / cleared mid-run / never latched
+  // this epoch). The drain is OPENROUTER's own account event — recording it
+  // under the root would re-latch a possibly-healthy deepseek for a full TTL
+  // and halt the family on evidence about the wrong account (deep-review P2).
   setExhausted({
-    primaryProvider: "openrouter", // caller passed the marker's provider — module must normalize
+    primaryProvider: "openrouter", // caller passed the marker's provider — module must NOT normalize to root
     reason: "402",
     source: "marker",
     family: "deepseek-v4-flash",
@@ -578,8 +622,36 @@ test("root-primary mapping: hop-leg marker (openrouter) records under the deepse
     env,
   });
   const state = readLatchState(env);
-  ok(state.primaries.openrouter === undefined, "NO primaries[openrouter] record (would be ignored by resolution)");
-  ok(state.primaries.deepseek !== undefined, "record landed under the family ROOT (deepseek)");
+  ok(state.primaries.deepseek === undefined, "NO primaries[deepseek] record — healthy root NOT falsely re-latched");
+  ok(state.primaries.openrouter !== undefined, "record landed under the DRAINED provider (openrouter own entry)");
+  ok(isLatched("openrouter", state, { env }), "drained provider carries a FRESH own exhaustion record");
+  // deepseek-rooted resolution sees a CLEAR root → dispatches the healthy primary
+  const outcome = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
+  equal(outcome.reason, "clear", "root latch absent → resolution returns the primary (never a silent re-dispatch to the dead openrouter leg)");
+  ok(outcome.leg !== null && outcome.leg.provider === "deepseek");
+  // ...and the drained provider is excluded from hop candidates by its fresh own record
+  const step = nextLegAfter("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
+  ok(step.skipped.map((l) => l.provider).includes("openrouter"), "openrouter own-drain excludes it from hop candidates");
+});
+
+test("root-primary mapping: hop-leg drain UNDER a fresh root latch records under the root (chain continuation)", () => {
+  const { env } = makeEnv("rootmap2");
+  // deepseek root latched FIRST (real chain hop: root exhausted → dispatch moved to openrouter)
+  setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: FLASH_PRIMARY, env });
+  ok(isLatched("deepseek", readLatchState(env), { env }), "root latched before the hop");
+  // the OPENROUTER hop leg then drains mid-chain — continuation of the SAME root
+  // exhaustion event → normalized to the root (families advance under the root record)
+  setExhausted({
+    primaryProvider: "openrouter",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    env,
+  });
+  const state = readLatchState(env);
+  ok(state.primaries.openrouter === undefined, "NO per-leg openrouter record — chain state lives under the root");
+  ok(isLatched("deepseek", state, { env }), "root record still latched (chain continuation)");
   const fam = state.primaries.deepseek.families["deepseek-v4-flash"];
   ok(fam.terminal === true || fam.activeLeg !== null, "family advanced/halted under the root");
   // deepseek-rooted resolution now CONSULTS that state → halt or advance, never a silent re-dispatch to the dead openrouter leg

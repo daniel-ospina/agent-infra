@@ -59,6 +59,7 @@ import {
   blockOnExhaustion,
   familyOf,
   failoverDisabled,
+  isLatched,
   scanStderrForExhaustion,
 } from "../shared/provider-failover.js";
 import type {
@@ -755,15 +756,22 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
   if (marker) {
     // 401/403-blocked markers are annotation-only (excluded-with-alert).
     if (marker.reason === "blocked") {
-      markLegBlocked(dispatched.provider, `marker:${marker.reason}`, { env });
+      const blockState = markLegBlocked(dispatched.provider, `marker:${marker.reason}`, { env });
+      const landed = blockState.blockedLegs?.[dispatched.provider] !== undefined;
       return {
         action: "return",
         nextLeg: null,
-        annotations: {
-          failoverBlocked: true,
-          failoverMarker: marker.hop,
-          failoverNote: `provider ${dispatched.provider} reported an auth-block marker — excluded from hop candidates`,
-        },
+        annotations: landed
+          ? {
+              failoverBlocked: true,
+              failoverMarker: marker.hop,
+              failoverNote: `provider ${dispatched.provider} reported an auth-block marker — excluded from hop candidates`,
+            }
+          : {
+              failoverLatchFailed: true,
+              failoverMarker: marker.hop,
+              failoverNote: `auth-block marker received but the durable block write FAILED (state dir?) — provider ${dispatched.provider} NOT excluded`,
+            },
       };
     }
     if (!family) {
@@ -775,10 +783,18 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
         source: "marker",
         env,
       });
+      const landed = isLatched(marker.provider || dispatched.provider, readLatchState(env), { env });
       return {
         action: "return",
         nextLeg: null,
-        annotations: { failoverLatched: true, failoverMarker: marker.hop, failoverHop: null },
+        annotations: landed
+          ? { failoverLatched: true, failoverMarker: marker.hop, failoverHop: null }
+          : {
+              failoverLatched: false,
+              failoverLatchFailed: true,
+              failoverMarker: marker.hop,
+              failoverNote: "exhaustion marker received but the durable latch write FAILED (state dir?) — no latch; next dispatch re-attempts the primary",
+            },
       };
     }
     // Durable latch BEFORE any retry (sync-write-before-retry). Accepted
@@ -786,7 +802,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
     // settled result, so a completed-session-with-marker latches too — a 402
     // marker means the provider account failed mid-session; re-dispatching a
     // possibly-dead account is strictly worse than a TTL-bounded halt.
-    setExhausted({
+    const latchedState = setExhausted({
       primaryProvider: marker.provider || dispatched.provider,
       reason: marker.reason === "402" ? "402" : "low_balance",
       source: "marker",
@@ -794,6 +810,37 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
       fromLeg: dispatched,
       env,
     });
+    // DURABILITY VERIFICATION (deep-review finding): setExhausted returns the
+    // durable state read back after its CAS loop — when every write attempt
+    // failed (state dir read-only / ENOSPC / CAS starved), it returns the
+    // UNCHANGED durable state and no latch landed. The old code annotated
+    // failoverLatched:true unconditionally and resolved the chain against a
+    // latch that never existed — silently continuing to re-dispatch a
+    // possibly-dead account AND lying to the caller about the latch. The
+    // latch must be verifiably durable before any annotation or advance.
+    //
+    // Verify against BOTH possible record targets: the drained leg's own
+    // provider (stale/absent root — drain recorded under the drained
+    // provider) and the family root (in-flight root exhaustion — drain
+    // recorded under the root). A fresh record on either means the write
+    // landed (or a pre-existing fresh latch covers the same drain).
+    const drainRoot = rootPrimaryOfFamily(family);
+    const latchLanded =
+      isLatched(dispatched.provider, latchedState, { env }) ||
+      (drainRoot !== undefined && drainRoot !== dispatched.provider && isLatched(drainRoot, latchedState, { env }));
+    if (!latchLanded) {
+      return {
+        action: "return",
+        nextLeg: null,
+        annotations: {
+          failoverLatched: false,
+          failoverLatchFailed: true,
+          failoverMarker: marker.hop,
+          failoverNote:
+            "exhaustion marker received but the durable latch write FAILED (state dir?) — no latch, no hop; next dispatch re-attempts the primary",
+        },
+      };
+    }
     const toolsKnownOrNone = !input.sawToolsUnknown && !input.sawTools;
     if (!toolsKnownOrNone && !rerunAfterToolsAllowed(env)) {
       // Mid-run death after tool calls (or tool activity UNKNOWN — marker
@@ -816,8 +863,7 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
         },
       };
     }
-    const after = readLatchState(env);
-    const outcome = resolveWithChain(family, dispatched, after, { env });
+    const outcome = resolveWithChain(family, dispatched, latchedState, { env });
     if (outcome.halted) {
       return { action: "halt", nextLeg: null, annotations: { failoverLatched: true, failoverMarker: marker.hop } };
     }
