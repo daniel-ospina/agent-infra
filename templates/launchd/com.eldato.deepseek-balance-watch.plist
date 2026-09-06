@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- deepseek-balance-watch (#476): every 15min read the DeepSeek-official
+         prepaid balance (/user/balance, zero-token) and the openrouter hop-leg
+         credit (/auth/key). The poller is the SINGLE restore authority for the
+         provider-exhaustion latch: it SETS the shared latch at balance
+         at/below-low and CLEARS only on verified positive balance + a 5-token
+         chat probe (fail-closed; 401/403 = SKIP, never latch on auth failure;
+         5xx/timeout = defer + escalate after 3 consecutive). Latch state
+         written via deepseek-balance-latch.py which mirrors the session
+         extension's state contract, so poller + pi sessions interoperate on
+         ~/.pi/agent/state/provider-exhaustion.json. PASS/SKIP runs are quiet
+         (line appended to /tmp/deepseek-balance-watch.log). Keys resolved at
+         runtime from ~/pi-keys.env (launchd does not inherit the shell
+         profile).
+         Canonical script: agent-infra/scripts/checkout-hygiene/
+         deepseek-balance-watch.sh (copied to ~/.pi/agent/scripts/
+         checkout-hygiene/ by pi-bootstrap/setup.sh — real copies, #427).
+         Rendered by scripts/install-launchd.sh (#304) — placeholders only. -->
+    <key>Label</key>
+    <string>com.eldato.deepseek-balance-watch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/deepseek-balance-watch.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/deepseek-balance-watch.out.log</string>
+</dict>
+</plist>
