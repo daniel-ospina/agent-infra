@@ -34,9 +34,12 @@ the default branch is worktree-locked; the merge ceremony in 04-merge-deploy.md 
 handled deletion separately).
 
 ```bash
-# BRANCH = the merged PR branch (from the session's worktree, or resolve via gh):
-BRANCH=$(git branch --show-current)
-[ -n "$BRANCH" ] || BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
+# BRANCH = the merged PR branch — resolve via gh FIRST. Deriving from the current
+# branch is ambiguous after the #376 Step C return: an in-main ceremony session
+# now sits on main, and `git branch --show-current` would target the default
+# branch. gh knows the PR's head branch regardless of local checkout state.
+BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null)
+[ -n "$BRANCH" ] || BRANCH=$(git branch --show-current)
 
 # Remote delete — server-side, always possible after merge; "remote ref does not
 # exist" means deleteBranchOnMerge already removed it = success.
@@ -49,7 +52,7 @@ if git worktree list --porcelain | grep -q "branch refs/heads/$BRANCH"; then
   echo "⚠️ branch $BRANCH is still checked out in a worktree — local delete deferred."
   echo "   TEARDOWN NOTE: remove the worktree and run: git branch -D $BRANCH"
 else
-  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH could not be deleted — delete manually: git branch -D $BRANCH"
+  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH not found or could not be deleted — delete manually: git branch -D $BRANCH"
 fi
 ```
 

@@ -4,10 +4,13 @@
 // The shared checkout is a multi-actor resource: parallel pi sessions share ONE
 // working tree, and branch state mutates under live sessions (auto-sync's
 // session_start force-switch, unguarded `git checkout` from any session). This
-// module records a per-session baseline {repoKey, branch, head} and provides
-// pure decision functions for the guard's M1 (warn on branch deviation),
-// M2 (block commit/push off-baseline), M3 (gate branch-state mutations), and
-// the ownership allowance (own-branch hygiene ops in agent-infra main).
+// module records a per-session baseline {repoKey, branch, head, original} and
+// provides pure decision functions for the guard's M1 (warn on branch
+// deviation), M2 (block commit/push off-baseline), M3 (gate branch-state
+// mutations), and the ownership allowance (own-branch hygiene ops in
+// agent-infra main). `original` = the branch recorded at session_start BEFORE
+// any create-new re-baseline — immutable; M3's #376 ceremony return-to-main
+// carve-out lets a session switch back to it.
 //
 // Deliberately self-contained: it must NOT import classify-git.mjs (keeps the
 // destructive-git classifier dependency-free for jiti loading, per the #99
@@ -291,12 +294,19 @@ export function classifyBranchOp(subcmd, args) {
     if (flag("--orphan")) return { op: "orphan" };
     if (flag("-B")) return { op: "force-create", branch: _branchAfter(a, "-B") };
     if (flag("-b") || flag("-c")) return { op: "create-new", branch: _branchAfter(a, flag("-b") ? "-b" : "-c") };
-    if (flag("-f") || flag("--force")) return { op: "force" };
+    if (flag("-f") || flag("--force") || flag("--discard-changes")) return { op: "force" }; // --discard-changes is git's force-switch alias (throws away local modifications — second-model gate fold-in)
     if (flag("--detach")) return { op: "detach" };
     if (a.includes("-")) return { op: "switch-existing", target: "-" }; // prev branch
     const pos = a.filter((x) => !x.startsWith("-"));
     if (pos.length === 0) return { op: "other" };
     if (pos[0] === "." || pos[0] === "--") return { op: "other" }; // discard-all
+    // #376 security fold-in (review P1): >1 non-flag positional = tree-ish +
+    // pathspec WITHOUT `--` — git treats this as a PATH-RESTORE, not a branch
+    // switch (`git checkout main .` discards uncommitted tree changes). Must
+    // NOT reach the M3 switch-existing carve-out (which would allow it when the
+    // target equals the original baseline). Classify "other" → the legacy
+    // block:checkout-branch / block:checkout-discard-all verdict still blocks.
+    if (pos.length > 1) return { op: "other" }; // path-restore form
     return { op: "switch-existing", target: pos[0] };
   }
   if (subcmd === "symbolic-ref") {
@@ -414,10 +424,22 @@ export function decideM2({
  *     SYNCHRONOUSLY (the allowed carve-out must never trigger a spurious M1
  *     warn on the next tool_call).
  *   rename of the session's OWN baseline branch → { reBaseline: <to> }.
- *   everything else (switch-existing / force / force-create / orphan / detach
- *   / symbolic-ref HEAD / update-ref refs/heads / branch -f) → block.
+ *   switch-existing to the session's ORIGINAL baseline branch (baseline.original
+ *     — the branch recorded at session_start BEFORE any create-new re-baseline):
+ *     allowed in agent-infra main → { reBaseline: <target> } — the sanctioned
+ *     post-ceremony return-to-main (#376). The target is the session's de-facto
+ *     own baseline: the branch the shared tree was on when THIS session started
+ *     (the lock serializes concurrent starts only — a resumed/overlapping start
+ *     records whatever branch was current). Harm is bounded exactly like the
+ *     create-new carve-out: M2 still blocks off-baseline commits. The
+ *     synchronous re-baseline keeps the next tool_call's M1 warn silent.
+ *   everything else (switch-existing to any OTHER branch / force / force-create
+ *   / orphan / detach / symbolic-ref HEAD / update-ref refs/heads / branch -f)
+ *   → block. The #376 return arm additionally requires repoKey === baseline.repoKey
+ *   (the resolved repo is the ONE where the original baseline was recorded — a
+ *   cd into a DIFFERENT agent-infra clone must not authorize a switch there).
  */
-export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch }) {
+export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey }) {
   if (!branchOp) return null;
   const op = branchOp.op;
   if (op === "create-new") {
@@ -448,6 +470,23 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch }) {
       ].join("\n"),
     };
   }
+  // #376 carve-out: sanctioned ceremony return-to-baseline — switch back to the
+  // branch this session STARTED on (before any create-new re-baseline), allowed
+  // in agent-infra main only. No original recorded (contended/detached start —
+  // the tree may already sit on ANOTHER session's branch) → fail-closed block.
+  // The resolved repo must be the SAME repo that recorded the original baseline
+  // (repoKey equality — M2 semantics); a baseline owned by another agent-infra
+  // checkout must not authorize a switch in this one (review fold-in, #376).
+  if (
+    op === "switch-existing"
+    && isAgentInfra
+    && baseline?.original
+    && baseline?.repoKey != null
+    && baseline.repoKey === repoKey
+    && branchOp.target === baseline.original
+  ) {
+    return { reBaseline: branchOp.target };
+  }
   return {
     block: true,
     reason: [
@@ -457,6 +496,8 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch }) {
       `   commits land on the wrong branch (#265).`,
       `   → Work in an isolated worktree: invoke the using-git-worktrees skill.`,
       `   → Agent-infra create-new: git checkout -b <branch> is allowed.`,
+      `   → Agent-infra ceremony return: git checkout back to the branch your`,
+      `     session STARTED on (its original baseline) is allowed (#376).`,
     ].join("\n"),
   };
 }
@@ -466,12 +507,20 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch }) {
  *   merge/pull/rebase → current branch == baseline branch suffices (the
  *     mutation only ever advances the session's OWN branch; syncSource
  *     presence is not required — bare `git pull` pulls the own upstream).
- *   push / force-push / push-delete / branch-force-delete → EVERY named
- *     target == baseline branch (all-targets semantics — a multi-refspec
- *     `git push origin feat/1 other/2` must never slip a foreign target
- *     past the gate; symmetric with the delete case).
+ *   push / force-push / push-delete → EVERY named target == baseline branch
+ *     (all-targets semantics — a multi-refspec `git push origin feat/1 other/2`
+ *     must never slip a foreign target past the gate; symmetric with the
+ *     delete case).
+ *   branch-force-delete (LOCAL `git branch -D`) → every named target ==
+ *     baseline branch OR a branch THIS session itself created via the M3
+ *     create-new/rename carve-outs (ownedBranches — #376 review fold-in: after
+ *     the sanctioned ceremony return-to-baseline the baseline is main again,
+ *     but deleting the session's OWN merged ceremony branch locally must still
+ *     pass; git already refuses deleting a branch checked out in ANY worktree,
+ *     so a pid-owned local delete is collision-free). Remote pushes/deletes of
+ *     owned branches stay baseline-only.
  */
-export function ownershipAllowed({ opKind, currentBranch, baselineBranch, targets, syncSource }) {
+export function ownershipAllowed({ opKind, currentBranch, baselineBranch, targets, syncSource, ownedBranches }) {
   if (!baselineBranch) return false;
   if (currentBranch !== baselineBranch) return false;
   switch (opKind) {
@@ -484,7 +533,12 @@ export function ownershipAllowed({ opKind, currentBranch, baselineBranch, target
     case "push-delete":
     case "branch-force-delete": {
       const t = (targets || []).map((x) => (x === "HEAD" ? currentBranch : x)).filter(Boolean);
-      return t.length > 0 && t.every((x) => x === baselineBranch);
+      if (t.length === 0) return false;
+      if (opKind === "branch-force-delete") {
+        const own = (ownedBranches || []).filter((b) => b !== "main" && b !== "master");
+        return t.every((x) => x === baselineBranch || own.includes(x));
+      }
+      return t.every((x) => x === baselineBranch);
     }
     default:
       return false;
