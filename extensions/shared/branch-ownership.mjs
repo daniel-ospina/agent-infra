@@ -4,10 +4,13 @@
 // The shared checkout is a multi-actor resource: parallel pi sessions share ONE
 // working tree, and branch state mutates under live sessions (auto-sync's
 // session_start force-switch, unguarded `git checkout` from any session). This
-// module records a per-session baseline {repoKey, branch, head} and provides
-// pure decision functions for the guard's M1 (warn on branch deviation),
-// M2 (block commit/push off-baseline), M3 (gate branch-state mutations), and
-// the ownership allowance (own-branch hygiene ops in agent-infra main).
+// module records a per-session baseline {repoKey, branch, head, original} and
+// provides pure decision functions for the guard's M1 (warn on branch
+// deviation), M2 (block commit/push off-baseline), M3 (gate branch-state
+// mutations), and the ownership allowance (own-branch hygiene ops in
+// agent-infra main). `original` = the branch recorded at session_start BEFORE
+// any create-new re-baseline — immutable; M3's #376 ceremony return-to-main
+// carve-out lets a session switch back to it.
 //
 // Deliberately self-contained: it must NOT import classify-git.mjs (keeps the
 // destructive-git classifier dependency-free for jiti loading, per the #99
@@ -414,8 +417,15 @@ export function decideM2({
  *     SYNCHRONOUSLY (the allowed carve-out must never trigger a spurious M1
  *     warn on the next tool_call).
  *   rename of the session's OWN baseline branch → { reBaseline: <to> }.
- *   everything else (switch-existing / force / force-create / orphan / detach
- *   / symbolic-ref HEAD / update-ref refs/heads / branch -f) → block.
+ *   switch-existing to the session's ORIGINAL baseline branch (baseline.original
+ *     — the branch recorded at session_start BEFORE any create-new re-baseline):
+ *     allowed in agent-infra main → { reBaseline: <target> } — the sanctioned
+ *     post-ceremony return-to-main (#376). The target is provably the session's
+ *     OWN starting state, so the #265 parallel-agent hazard doesn't apply; the
+ *     synchronous re-baseline keeps the next tool_call's M1 warn silent.
+ *   everything else (switch-existing to any OTHER branch / force / force-create
+ *   / orphan / detach / symbolic-ref HEAD / update-ref refs/heads / branch -f)
+ *   → block.
  */
 export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch }) {
   if (!branchOp) return null;
@@ -448,6 +458,18 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch }) {
       ].join("\n"),
     };
   }
+  // #376 carve-out: sanctioned ceremony return-to-baseline — switch back to the
+  // branch this session STARTED on (before any create-new re-baseline), allowed
+  // in agent-infra main only. No original recorded (session never proved its own
+  // start state) → fail-closed block, matching the pre-#376 behavior.
+  if (
+    op === "switch-existing"
+    && isAgentInfra
+    && baseline?.original
+    && branchOp.target === baseline.original
+  ) {
+    return { reBaseline: branchOp.target };
+  }
   return {
     block: true,
     reason: [
@@ -457,6 +479,8 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch }) {
       `   commits land on the wrong branch (#265).`,
       `   → Work in an isolated worktree: invoke the using-git-worktrees skill.`,
       `   → Agent-infra create-new: git checkout -b <branch> is allowed.`,
+      `   → Agent-infra ceremony return: git checkout back to the branch your`,
+      `     session STARTED on (its original baseline) is allowed (#376).`,
     ].join("\n"),
   };
 }

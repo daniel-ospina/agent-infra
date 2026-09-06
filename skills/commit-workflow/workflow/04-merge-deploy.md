@@ -114,6 +114,25 @@ touching the default-branch worktree. If Step B's remote delete reports
 > ownership violated", the shared checkout was switched mid-ceremony — `git
 > checkout -b <fresh-branch>` (M3 carve-out re-baselines) and re-run the ceremony.
 
+**Step C — return to the session's ORIGINAL baseline (#376, agent-infra main only):**
+
+```bash
+# The ceremony session started on main, so `main` is its ORIGINAL baseline (the
+# branch recorded at session_start BEFORE the create-new re-baseline to the PR
+# branch). The merge-ceremony flow is: start on main → checkout -b feat/N →
+# merge → delete feat/N → RETURN to main. Without this step the session is
+# stranded on the deleted feature branch for the rest of its life.
+git checkout main
+# #376: allowed — M3's return-to-original-baseline carve-out lets the session
+# switch back to the branch it provably started on (agent-infra main only); the
+# guard re-adopts main as the baseline, so no M1 deviation warning fires. Non-
+# infra repos still block switch-existing: worktrees only there (no return step).
+```
+
+Non-agent-infra sessions skip Step C entirely — after the merge ceremony their
+feature work lives in an isolated worktree, and the main checkout is never theirs
+to return to.
+
 ## Auto-merge for strict up-to-date protection (#500 — merge-race ladder)
 
 **On repos with "Require branches to be up to date before merging", ARM AUTO-MERGE as

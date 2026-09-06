@@ -712,9 +712,13 @@ const WHY = [
 
 // ── #265 per-session baseline state ────────────────────────────────────────
 // Keyed by process.pid (one pi process == one session; SessionStartEvent
-// carries no sessionId). Baseline = { repoKey, branch, head } of the shared
-// MAIN checkout at session_start. M1 dedupe: Set of "from→to" deviations.
-const baselines = new Map<number, { repoKey: string; branch: string | null; head: string }>();
+// carries no sessionId). Baseline = { repoKey, branch, head, original } of the
+// shared MAIN checkout at session_start. M1 dedupe: Set of "from→to" deviations.
+// `original` = the branch recorded at the FIRST record (session start) and is
+// IMMUTABLE — create-new/rename re-baselines update only `.branch` (#376: the
+// ceremony return-to-main carve-out switches back to `original`, provably the
+// session's own starting state).
+const baselines = new Map<number, { repoKey: string; branch: string | null; head: string; original: string | null }>();
 const warnedDeviations = new Map<number, Set<string>>();
 const pendingBaseline = new Set<number>(); // lock contended at session_start → record on first tool_call
 
@@ -727,7 +731,7 @@ function _recordBaseline(pid: number) {
     const key = branchOwnership.repoKey(cwd);
     if (!key) return;
     if (!baselines.has(pid)) {
-      baselines.set(pid, { repoKey: key, branch: state.branch, head: state.head });
+      baselines.set(pid, { repoKey: key, branch: state.branch, head: state.head, original: state.branch });
     }
   } catch { /* degrade silently — M1/M2 skip without a baseline */ }
 }
@@ -784,7 +788,7 @@ export default function (pi: ExtensionAPI) {
             if (lock.held) {
               const state = branchOwnership.readBranchState(process.cwd());
               if (state && !baselines.has(pid)) {
-                baselines.set(pid, { repoKey: key, branch: state.branch, head: state.head });
+                baselines.set(pid, { repoKey: key, branch: state.branch, head: state.head, original: state.branch });
               }
               branchOwnership.releaseRepoLock(key, pid);
             } else {

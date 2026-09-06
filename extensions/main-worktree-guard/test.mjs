@@ -487,7 +487,7 @@ dexpect("merge origin/main → syncSource", `git fetch origin && git merge origi
 dexpect("rebase origin/main → syncSource", `git rebase origin/main`, { verdict: "block:rebase", syncSource: "origin/main" });
 
 // M3 subclassification surfaces (branchOp via shared classifyBranchOp)
-import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, extractGitInvocation as sharedExtractGitInvocation } from "../shared/branch-ownership.mjs";
+import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, extractGitInvocation as sharedExtractGitInvocation, decideM3 as sharedDecideM3 } from "../shared/branch-ownership.mjs";
 const co = (cmd) => {
   const d = classifyGitCommandDetailed(cmd);
   // P1-A: classify the STATE-mutating invocation (compound commands must gate
@@ -505,6 +505,33 @@ expectBool("detailed+shared: branch -m own → rename", co(`git branch -m feat/a
 expectBool("detailed+shared: checkout -- path → other", co(`git checkout -- tortoise/sdk.py`)?.op === "other", true);
 expectBool("detailed+shared: checkout . → other", co(`git checkout .`)?.op === "other", true);
 expectBool("detailed+shared: checkout - → switch-existing", co(`git checkout -`)?.op === "switch-existing", true);
+
+// ── #376: M3 ceremony return-to-baseline pins ─────────────────────────────
+// A ceremony session started on main (original baseline, immutable), re-based
+// to feat/2 via the agent-infra create-new carve-out, then merges. The guard
+// path classify → classifyBranchOp → decideM3 must ALLOW `git checkout main`
+// back to the ORIGINAL baseline in agent-infra, block foreign targets, and
+// keep non-infra repos fully blocked (worktrees only).
+{
+  const ceremonyBaseline = { repoKey: "k", branch: "feat/2", original: "main" };
+  const m3 = (cmd) => {
+    const d = classifyGitCommandDetailed(cmd);
+    const op = d.branchState ? sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs) : { op: "other" };
+    return sharedDecideM3({ branchOp: op, isAgentInfra: true, baseline: ceremonyBaseline, currentBranch: "feat/2" });
+  };
+  const retMain = m3(`git checkout main`);
+  expectBool("#376: git checkout main → sanctioned return (reBaseline main)", retMain?.reBaseline === "main" && !retMain?.block, true);
+  const retSwitch = m3(`git switch main`);
+  expectBool("#376: git switch main → sanctioned return (reBaseline main)", retSwitch?.reBaseline === "main" && !retSwitch?.block, true);
+  const retCompound = m3(`git pull && git checkout main`);
+  expectBool("#376: compound pull && checkout main → sanctioned return", retCompound?.reBaseline === "main" && !retCompound?.block, true);
+  const foreign = m3(`git checkout feat/other`);
+  expectBool("#376: git checkout feat/other (≠ original) → blocked", foreign?.block === true, true);
+  const prev = m3(`git checkout -`);
+  expectBool("#376: git checkout - (prev-branch, ambiguous) → blocked", prev?.block === true, true);
+  const nonInfra = sharedDecideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline: ceremonyBaseline, currentBranch: "feat/2" });
+  expectBool("#376: non-infra repo return-to-original STILL blocked", nonInfra?.block === true, true);
+}
 
 // ── P1-A regression: compound commands gate on the STATE invocation ────────
 expectBool("P1-A: pull && checkout main → switch-existing", co(`git pull && git checkout main`)?.op === "switch-existing", true);
