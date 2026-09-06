@@ -386,5 +386,16 @@ extension-farm CI wiring). New + existing suites run locally via the repo recipe
   require the STRONG anchor inside the 25-char window (loose `request`/`message` prose
   never re-runs); `msg.model` fill is typeof-string guarded (unvalidated child JSON can
   never crash the family resolver).
-  Final suite counts: index.test.ts 107/107, provider-fallback.test.ts 13/13, real-pi
+  **Round-4 closures:** `stripLocalLines` folds indented continuation lines (node's
+  real error+cause dumps) into their parent before the drop; bare docker socket paths
+  count as local targets; scheme-fronted local URLs are removed WHOLE
+  (host+port+path); sibling event fills + transcript text parts typeof-guarded; §4
+  pseudocode uses the resolved-model gate input.
+  **Round-5 closure:** the fold is scoped to dump-vocabulary continuations
+  (`at |cause:|errno:|code:|syscall:|address:|port:`) — arbitrary indented prose is
+  never merged; a connection-family signature addressing a loopback target drops
+  regardless of any preceding strong word (a refused connection TO a loopback address
+  is a local-dependency death, never a proxy hop); the strong-precedes-local keep
+  applies to exhaustion/provider signatures only.
+  Final suite counts: index.test.ts 108/108, provider-fallback.test.ts 14/14, real-pi
   suites green.

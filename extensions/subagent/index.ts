@@ -510,6 +510,20 @@ const LOCAL_TARGET = /(?:127\.0\.0\.1|localhost|::1|unix:|0\.0\.0\.0|\/var\/run\
  * still local, so the WHOLE spelling is removed before the precede check. */
 const SCHEME_FRONTED_LOCAL = /https?:\/\/[^\s]*(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])[^\s]*/gi;
 
+/** Indented continuation lines that belong to a node-style error dump (stack
+ * frames, `cause:` / `errno:` / `code:` / `syscall:` / `address:` / `port:`
+ * properties) — folded into their parent so the dump's local association
+ * survives the whole-line drop. Arbitrary indented prose/JSON is NOT folded
+ * (round-5: over-breadth folding let a strong word in the parent line keep an
+ * indented loopback cause alive, and folded a genuine signature under a local
+ * parent). */
+const DUMP_CONTINUATION = /^\s+(?:at |caused by:|cause:?|\[cause\]:?|errno:?|code:?|syscall:?|address:?|port:?)/i;
+
+/** Connection-family signatures — when they address a LOOPBACK target the death
+ * is local (a refused/dropped connection TO a loopback address is never a
+ * provider proxy hop worth re-dispatching). */
+const CONNECTION_SIG = /(?:connection error|connection lost|other side closed|stream ended|terminated|econnreset|econnrefused|enotfound|etimedout|epipe|socket hang up|network error|connect timed out|fetch failed)/i;
+
 /** Anchor window (chars, either direction) for phrase matches on the
  * composed-output channel (round-3: co-location, not anywhere-in-field). */
 const PHRASE_COLOCATION_WINDOW = 40;
@@ -562,7 +576,7 @@ export function stripStackFrames(text: string): string {
 export function stripLocalLines(text: string): string {
 	const folded: string[] = [];
 	for (const rawLine of text.split("\n")) {
-		if (/^\s+/.test(rawLine) && folded.length > 0) {
+		if (DUMP_CONTINUATION.test(rawLine) && folded.length > 0) {
 			folded[folded.length - 1] += " " + rawLine.trim();
 		} else {
 			folded.push(rawLine);
@@ -571,6 +585,11 @@ export function stripLocalLines(text: string): string {
 	return folded
 		.filter((line) => {
 			if (!LOCAL_TARGET.test(line)) return true;
+			// A connection-family signature addressing a loopback target is a
+			// local-dependency death, never a proxy hop — drop regardless of any
+			// preceding strong token (round-5: "Error: Local API request failed\n
+			// cause: connect ECONNREFUSED 127.0.0.1" must stay none).
+			if (CONNECTION_SIG.test(line)) return false;
 			// Remove scheme-fronted local URLs (their own path/scheme can carry
 			// api/http tokens that must not read as a provider transport).
 			const cleaned = line.replace(SCHEME_FRONTED_LOCAL, " ");

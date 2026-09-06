@@ -703,7 +703,8 @@ test("stripLocalLines folds indented error+cause dumps; keeps scheme-full proxy 
 		"      at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1)\n" +
 		"      errno: -61, code: 'ECONNREFUSED', syscall: 'connect', address: '127.0.0.1', port: 5432\n" +
 		"    }\n";
-	equal(stripLocalLines(nodeDump), "");
+	equal(stripLocalLines(nodeDump).includes("ECONNREFUSED"), false);
+	equal(stripLocalLines(nodeDump).includes("fetch failed"), false);
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: nodeDump })), "none");
 	// node's docker-daemon-down http form (bare socket path).
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Error: connect ECONNREFUSED /var/run/docker.sock, retrying" })), "none");
@@ -729,6 +730,10 @@ test("loopback-only local-dependency failures → none (doomed re-dispatch must 
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Connection error. retrying localhost db" })), "none");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "connection error to localhost:8080 api down" })), "none");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "fetch failed: connect ECONNREFUSED 127.0.0.1:3000/api/v1/health" })), "none");
+	// A connection-family signature addressing a loopback target is local even
+	// when a strong word sits in the parent line (round-5 fold-scope fix).
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Error: Local API request failed\n  cause: Error: connect ECONNREFUSED 127.0.0.1:5432" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Upstream connect error\n  cause: connect ECONNREFUSED 127.0.0.1:3306" })), "none");
 });
 
 test("genuine provider transport line survives local-line stripping", () => {
@@ -736,6 +741,9 @@ test("genuine provider transport line survives local-line stripping", () => {
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "docker daemon down\nConnection error." })), "connection");
 	// Same line: a local proxy fronts the provider — the genuine signature is kept.
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "402 from https://api.deepseek.com via localhost:8080" })), "exhaustion");
+	// Arbitrary indented prose is NOT folded: a genuine signature under a local
+	// parent line survives on its own line (round-5 fold-scope fix).
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "tried 127.0.0.1:8080\n  api returned: insufficient balance" })), "exhaustion");
 });
 
 test("scanForProviderFailure: phrase on stripped text; numeric anchored on original", () => {
