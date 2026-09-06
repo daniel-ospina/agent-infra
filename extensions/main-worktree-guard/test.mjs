@@ -4,9 +4,10 @@
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
 import { resolve, dirname, relative, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -822,6 +823,26 @@ scriptPath("git add ./foo → null", `git add ./foo`, null);
 scriptPath("python3 → null", `python3 x.py`, null);
 scriptPath("plain command → null", `ls -la`, null);
 scriptPath("empty → null", "", null);
+// #444: the script operand is the FIRST non-flag positional after the
+// interpreter — trailing tokens are the SCRIPT's own args (bash $1…). The old
+// last-positional rule resolved a trailing arg (a non-file) and skipped content
+// gating for argument-taking scripts.
+scriptPath("#444 arg-taking script → script file", `bash script.sh aaa bbb`, "script.sh");
+scriptPath("#444 hub-worktree.sh salvage → script file", `bash hub-worktree.sh salvage feat/x /Users/me/repo`, "hub-worktree.sh");
+scriptPath("#444 flags-then-args → script file", `bash -x script.sh aaa bbb`, "script.sh");
+scriptPath("#444 source args → script file", `source x.sh aaa bbb`, "x.sh");
+scriptPath("#444 dot args → script file", `. x.sh aaa bbb`, "x.sh");
+// #444 stdin-program modes: -s demotes every positional to $0/$1 — the stdin
+// redirect's file IS the program (VGATE sub-case); single-dash letter runs
+// CONTAINING s (-se/-es/-xs) behave as -s.
+scriptPath("#444 -s stdin+arg → stdin file", `bash -s < f arg1`, "f");
+scriptPath("#444 -se stdin+arg → stdin file", `bash -se < f arg1`, "f");
+scriptPath("#444 -s arg (no stdin file) → null", `bash -s x.sh aaa`, null);
+scriptPath("#444 -s arg then stdin → stdin file", `bash -s arg1 < f`, "f");
+// #444: -- ends option parsing — the NEXT operand is the script even when it
+// looks like a flag (`bash -- x.sh -x aaa` runs x.sh with args -x aaa).
+scriptPath("#444 -- then script+flags → script file", `bash -- x.sh -x aaa`, "x.sh");
+scriptPath("#444 -c payload + trailing args → null", `bash -c "echo hi" x.sh aaa`, null);
 
 // scriptGitVerdict: a script's git content is gated by the SAME allowlist —
 // recovery scripts (hub-worktree.sh: fetch + worktree add) keep working, the
@@ -862,6 +883,39 @@ try {
 } finally {
   if (scriptTmp) {
     try { execSync(`rm -rf "${scriptTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+}
+
+// #444 real-file probe: scriptGitVerdict on the ACTUAL scripts/checkout-hygiene/
+// hub-worktree.sh — once extractScriptPath resolves arg-taking invocations
+// (`bash hub-worktree.sh salvage feat/x <repo>`), this file's OWN content is
+// gated, so its real surface must match the sanctioned verb list: create =
+// fetch + worktree add (recovery) + check-ignore warning (readonly); salvage =
+// + status/show/ls-files redirects + the WT capture commit/push, which are
+// DELEGATED to the internal hub-worktree-salvage-commit.sh sub-script (the
+// static walker cannot prove a runtime $WT_PATH is worktree-local). The pin
+// resolves the CURRENT checkout's copy (the worktree under test), falling back
+// to the repo-root cwd / the main checkout so the suite can run anywhere.
+{
+  const candidates = [
+    fileURLToPath(new URL("../../scripts/checkout-hygiene/hub-worktree.sh", import.meta.url)),
+    resolve(PROJECT_CWD, "scripts/checkout-hygiene/hub-worktree.sh"),
+    resolve(MAIN, "scripts/checkout-hygiene/hub-worktree.sh"),
+  ];
+  const realHubWorktreeSh = candidates.find((p) => existsSync(p));
+  if (!realHubWorktreeSh) {
+    console.log("⏭️  real-file probe skipped — no scripts/checkout-hygiene/hub-worktree.sh in this checkout");
+  } else {
+    const verdict = scriptGitVerdict(realHubWorktreeSh, "main", MAIN, MAIN);
+    const argTakingResolves = extractScriptPath(`bash hub-worktree.sh salvage feat/x ${resolve(MAIN, "some/repo")}`) === "hub-worktree.sh";
+    const verdictOk = verdict === "allow";
+    console.log(`${verdictOk && argTakingResolves ? "✅" : "❌"} #444 real hub-worktree.sh verdict → allow (content surface is sanctioned; arg-taking invocation resolves the file)`);
+    if (!verdictOk) console.log(`  verdict=${verdict} file=${realHubWorktreeSh}`);
+    if (!argTakingResolves) console.log(`  extractScriptPath resolved wrong file`);
+    (verdictOk && argTakingResolves) ? pass++ : fail++;
+    // check-ignore must classify read-only (hub-worktree.sh's .worktrees warn).
+    const ci = isHubRecoveryInvocation("check-ignore", ["-q", ".worktrees"], "main");
+    expectBool("#444 check-ignore → readonly (hub-worktree.sh surface)", ci === "readonly", true);
   }
 }
 
@@ -1638,6 +1692,26 @@ try {
   expectBool("B38: digit-less fd-dup / stdin+arg / spawner-prefix → the script path (round-17)", extractScriptPath(`bash <&0 /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash <&- /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /dev/null /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`exec bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`env bash /tmp/evil.sh`) === "/tmp/evil.sh", true);
   expectBool("B39: spawner-flag → the interpreter's script path (round-18)", extractScriptPath(`env -i bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`sudo -u root bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`timeout 5 bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /dev/null -c "git commit"`) === null, true);
   expectBool("B40: flag-with-operand + stdin-flag → the script path (round-19)", extractScriptPath(`bash < /dev/null -x /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash --rcfile /tmp/decoy.sh /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash -O extglob /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  // #444 (arg-taking closure): the script operand is the FIRST positional —
+  // trailing tokens are the script's own args. Malicious content in an
+  // arg-taking script must now BLOCK (the pre-fix last-positional rule gated a
+  // non-file arg → fail-open); sanctioned recovery content still passes.
+  expectBool("B42: arg-taking invocation → the script file (#444)", (() => {
+    const p = mkS("arg-evil.sh", `git reset --hard\n`);
+    return extractScriptPath(`bash ${p} feat/x ${hubR}`) === p && extractScriptPath(`bash hub-worktree.sh feat/x ${hubR}`) === "hub-worktree.sh" && extractScriptPath(`bash /tmp/evil.sh aaa bbb`) === "/tmp/evil.sh";
+  })(), true);
+  expectBool("B43: -s stdin file + positional → the stdin file (#444 VGATE sub-case)", (() => {
+    const p = mkS("stdin-arg.sh", `git reset --hard\n`);
+    return extractScriptPath(`bash -s < ${p} arg1`) === p && extractScriptPath(`bash -se < ${p} arg1`) === p;
+  })(), true);
+  expectBool("B44: arg-taking MALICIOUS script content → block (#444 backdoor closure)", (() => {
+    const p = mkS("arg-evil2.sh", `git reset --hard\ngit commit -m x\n`);
+    return extractScriptPath(`bash ${p} feat/x ${hubR}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "block";
+  })(), true);
+  expectBool("B45: arg-taking SANCTIONED recovery script content → allow (#444 no regression)", (() => {
+    const p = mkS("arg-rec.sh", `git fetch origin main\ngit worktree add ../.worktrees/x -b feat/x origin/main\n`);
+    return extractScriptPath(`bash ${p} feat/x ${hubR}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "allow";
+  })(), true);
   expectBool("B41: script checkout/switch main-protection (round-20)", (() => {
     const mk = (c) => { const p = `${m4Tmp}/s${Date.now()}${Math.random().toString(36).slice(2)}.sh`; writeFileSync(p, c); return p; };
     return scriptGitVerdict(mk("git checkout main\n"), "hub/off", wtR, hubR) === "block" &&
