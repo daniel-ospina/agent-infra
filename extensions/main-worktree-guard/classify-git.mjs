@@ -1566,6 +1566,25 @@ export function extractPushDeleteBranch(command) {
 }
 
 /**
+ * Pure decision helper for the full-path compound-delete glue (#443 R6/R7):
+ * the detailed matcher describes only the FIRST push invocation, so a delete
+ * spelling in a LATER compound segment of the -d/--del family (which carries NO
+ * frozen legacy evidence) is invisible to its pushTargets. Given the matcher
+ * verdict for that first invocation and the raw command, return the whole-
+ * command delete targets a push-family verdict must additionally protect — or
+ * [] when the verdict is not push-family (block:push-delete already carries its
+ * targets via the fold-in, and non-push verdicts are unrelated). Kept pure and
+ * exported so the index.ts orchestration glue is unit-testable here.
+ * @param {string} verdict detailed matcher verdict for the first invocation
+ * @param {string} command raw command text
+ * @returns {string[]}
+ */
+export function wholeCommandDeleteTargets(verdict, command) {
+  if (verdict !== "block:push" && verdict !== "block:force-push") return [];
+  return extractPushDeleteBranch(command) ?? [];
+}
+
+/**
  * Get a map of branch ref → worktree paths (from git worktree list --porcelain).
  * Works from any checkout (main or worktree).
  * @returns {Map<string, string[]>} key: "refs/heads/<name>", value: [worktree paths]

@@ -87,6 +87,7 @@ let classifyGitCommandDetailed: (cmd: string) => any = () => ({ verdict: "allow"
 let isWorktreeCwd: (cwd: string) => boolean = () => true;      // bash path: fail-open
 let isWorktreeCwdWrite: (cwd: string) => boolean = () => false; // write/edit: fail-closed
 let extractPushDeleteBranch: (cmd: string) => string[] | null = () => null;
+let wholeCommandDeleteTargets: (verdict: string, command: string) => string[] = () => [];
 let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
 let getMainCheckoutBranch: () => string | null = () => null;
@@ -130,7 +131,7 @@ let isAllowMarkerRealpath: (path: string) => boolean = () => false;
 let readAllowMarkerState: (path: string, sessionId: string | null | undefined, nowMs?: number, ttlMs?: number) => boolean = () => false;
 try {
   ({ classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd,
-     extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout,
+     extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,
      getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS,
      isAllowMarkerActive, isAllowMarkerPath, isAllowMarkerCommand,
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
@@ -1164,15 +1165,56 @@ export default function (pi: ExtensionAPI) {
           targets,
           syncSource: det.syncSource,
         })) {
-          return undefined;
+          // #443: det.pushTargets describe ONLY the first push invocation. A
+          // delete in a LATER compound segment of the -d/--del family (no
+          // frozen legacy evidence) is invisible to them, so an own-baseline
+          // first push (`git push origin main && git push origin -d b` from a
+          // baseline-main hub session) must NOT let this allowance swallow the
+          // whole command — a sibling-held `b` would delete unguarded (the
+          // `--delete` twin classifies block:push-delete targets ["b"] and
+          // DOES block). Skip the allowance whenever the whole-command
+          // extractor reveals a delete target that is not the session's own
+          // baseline; own-branch ceremonies (extractor targets ⊆ baseline,
+          // e.g. `… && git push origin -d feat` while on feat) still allow.
+          // PUSH-FAMILY ONLY (wholeCommandDeleteTargets gates on the verdict):
+          // non-push allowance kinds (pull/merge/rebase/branch -D) keep their
+          // base decision — a `git pull origin main && git push origin -d b`
+          // compound is an origin/main parity gap (the pull allowance already
+          // swallowed it before #443), out of this push-spelling scope.
+          const wcDeletes = wholeCommandDeleteTargets(det.verdict, command);
+          const baselineBranch = baseline?.branch ?? null;
+          // Unknown baseline (no way to tell own from foreign) → keep the
+          // allowance's base decision exactly as before.
+          const foreignDelete = baselineBranch !== null && wcDeletes.some((b) => b !== baselineBranch);
+          if (!foreignDelete) return undefined;
+          // foreign later-segment delete present → fall through to the #73 arms.
         }
       }
 
       // ── push --delete: retained #73 coordinated check (foreign targets) ──
+      // The matcher is per-FIRST-push-invocation; a delete spelling in a LATER
+      // compound segment is attributed via the whole-command extractor (matcher
+      // fold-in for legacy-evidenced `--delete`/`:b` — verdict block:push-delete
+      // — and here for the #443 `-d`/`--del` family, which carries NO frozen
+      // legacy evidence so the verdict is block:push). A plain-push verdict
+      // whose command contains real delete targets elsewhere must still run the
+      // sibling-coordinated check; when nothing is held it FALLS THROUGH to M2
+      // below, so the first segment's push stays gated exactly as origin/main
+      // gated it. String-evidence echo/comment over-match is the documented
+      // safe-direction class shared with the degradation arm.
       if (det.verdict === "block:push-delete" && det.pushTargets.length > 0) {
         const blocked = _coordinatedDeleteBlock(det.pushTargets);
         if (blocked) return blocked;
         return undefined; // foreign deletes with no checked-out targets — allowed (today's behavior)
+      }
+      if (det.verdict === "block:push" || det.verdict === "block:force-push") {
+        const laterDeletes = wholeCommandDeleteTargets(det.verdict, command);
+        if (laterDeletes.length > 0) {
+          const blocked = _coordinatedDeleteBlock(laterDeletes);
+          if (blocked) return blocked;
+          // no sibling holds the target(s) → fall through to M2 below (the
+          // first segment's push stays gated exactly as origin/main gated it).
+        }
       }
 
       // ── M2: commit/push ownership (block off-baseline) ──

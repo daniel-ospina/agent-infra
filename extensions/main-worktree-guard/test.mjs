@@ -6,7 +6,7 @@ import { execSync } from "node:child_process";
 import { resolve, dirname, relative, join } from "node:path";
 import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -457,6 +457,23 @@ dexpect("push -o -o -o -d → odd chain consumes -d (no delete)", `git push orig
 // ordinary push refspecs, never delete targets (#504 fold-in fallback).
 dexpect("compound later-segment --delete → real target only", `git push origin main && git push origin --delete b`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
 dexpect("compound later-segment colon delete → real target only", `git push origin feat/x && git push origin :b`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
+// wholeCommandDeleteTargets — pure seam consumed by the index.ts full-path glue
+// (R6/R7): a push-family verdict must additionally protect later-segment
+// -d/--del-family deletes (invisible to the per-first-invocation matcher).
+function wcdt(name, verdict, command, expectedArray) {
+  const got = wholeCommandDeleteTargets(verdict, command);
+  const ok = JSON.stringify(got) === JSON.stringify(expectedArray);
+  console.log(`${ok ? "✅" : "❌"} wcdt ${name}: ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(expectedArray)})`}`);
+  ok ? pass++ : fail++;
+}
+wcdt("later-segment -d under block:push", "block:push", "git push origin main && git push origin -d b", ["b"]);
+wcdt("later-segment --del under block:push", "block:push", "git push origin main && git push origin --del b", ["b"]);
+wcdt("later-segment -d under block:force-push", "block:force-push", "git push -f origin main && git push origin -d b", ["b"]);
+wcdt("plain push → none", "block:push", "git push origin main", []);
+wcdt("src:dst refspec → none", "block:push", "git push origin main && git push origin main:feature", []);
+wcdt("push-delete verdict → none (fold-in already carries targets)", "block:push-delete", "git push origin main && git push origin --delete b", []);
+wcdt("allow verdict → none", "allow", "git push origin main && git push origin -d b", []);
+wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -d b", []);
 // --d is AMBIGUOUS with --dry-run — git rejects it (rc 129, probe-verified);
 // it never deletes, so it stays a plain block:push (never block:push-delete).
 dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d feat/x`, { verdict: "block:push", isPushDelete: false });
