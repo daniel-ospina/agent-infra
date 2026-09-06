@@ -1294,9 +1294,13 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
       dst = current;
       srcIsHead = true;
     }
-    // dst normalization + dst=HEAD guard (COLON forms with NON-HEAD src: a real
+    // dst normalization + dst=HEAD guard. ⛔ The guard sits BEFORE src
+    // resolution, so a COLON `HEAD:HEAD` (src=dst=HEAD, no-colon derivation
+    // skipped) is nulled HERE — the src probe below never sees it (second-model
+    // gate: the plan's "HEAD:HEAD nulls at the src probe" wording was wrong;
+    // the guard is the nulling site for every dst=HEAD colon form). A real
     // clone's refs/remotes/origin/HEAD is the DEFAULT-branch symbolic ref — it
-    // must never become a tier-A base for a remote branch literally named HEAD).
+    // must never become a tier-A base for a remote branch literally named HEAD.
     if (dst.startsWith("refs/heads/")) dst = dst.slice("refs/heads/".length);
     if (dst === "HEAD") return null;
     // src resolution (local side of the diff).
@@ -1307,9 +1311,11 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
       if (!refExists(cwd, src)) return null;
       srcRef = src;
     } else if (src === "HEAD") {
-      // COLON src=HEAD → generic probes: refs/heads/HEAD is never a real
-      // branch; refs/tags/HEAD would be a tag push. Unresolvable → tier C
-      // (accepted residual — the dst=HEAD guard covers colon dst forms).
+      // COLON src=HEAD with a NON-HEAD dst (`HEAD:main` — HEAD:HEAD already
+      // nulled by the dst guard above): refs/heads/HEAD is never a real branch,
+      // so this probe fails → null → tier C (accepted residual — the dst=HEAD
+      // guard covers colon dst forms; a tag literally named HEAD is not probed
+      // here, the probe just fails on refs/heads/HEAD).
       if (!refExists(cwd, "refs/heads/HEAD")) return null;
       srcRef = "refs/heads/HEAD";
     } else {
@@ -1358,9 +1364,10 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
   if (allFiles.size === 0) {
     // Up-to-date push ships nothing — audited INSIDE the resolver so the
     // caller's shared silent empty-allow never hides the range decision.
-    // Note: with multi-refspec commands the tier payload is first-A-wins
-    // (mixed A+B empty ranges label "A") — cosmetic audit metadata only; the
-    // allow + audit reason are identical either way (cycle-4 P2).
+    // Note: with multi-refspec commands the tier payload is "A" iff ANY
+    // refspec resolved tier A (order-independent any-A-wins — second-model
+    // gate wording fix; mixed A+B empty ranges label "A"); cosmetic audit
+    // metadata only — the allow + audit reason are identical in every ordering.
     // ⛔ Trust boundary (security review P2, documented): tier A reads LOCAL
     // remote-tracking refs — same-user-writable repo state (git update-ref is
     // not a gated verb) that can steer an empty range → audited allow. The

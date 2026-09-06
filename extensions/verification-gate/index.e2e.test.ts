@@ -2606,6 +2606,114 @@ async function main() {
     git(repo, "config --unset branch.main.merge");
     git(repo, "config --unset branch.main.remote");
   });
+
+  test("scenario 58 (#487 second-model gate): non-origin remote — resolver picks the upstream/main tier-B base, not origin/main", async () => {
+    const repo = join(TEST_ROOT, "repo-487-58");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base58.txt"), "b\n");
+    git(repo, "add base58.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    // NON-origin upstream tracking ref present; deliberately NO refs/remotes/origin/*
+    // at all — a resolver regression that always falls back to origin/main gets
+    // a missing base → tier C → staged block (RED), so the allow below proves
+    // the non-origin branch of the base-preference code fired.
+    git(repo, `update-ref refs/remotes/upstream/main ${baseSha}`);
+    git(repo, "checkout -b feat"); // feat == upstream/main
+    writeFileSync(join(repo, "content58.ts"), "c58\n");
+    git(repo, "add content58.ts");
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: content58.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "content58.ts"), hash: sha("c58\n") }],
+      }) }],
+    });
+    const allowCommit = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m c58", cwd: repo },
+    });
+    equal(allowCommit, undefined, "58: content58.ts commit ALLOWED after the PASS");
+    git(repo, "commit -m c58");
+    writeFileSync(join(repo, "wip58.ts"), "w\n");
+    git(repo, "add wip58.ts"); // parked WIP
+    await fire("session_start", {});
+    const push = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push -u upstream feat", cwd: repo },
+    });
+    equal(push, undefined,
+      "58: non-origin first push ALLOWED post-fix (tier B vs the upstream/main base the resolver must prefer; range [content58.ts]); an origin/main-fallback regression nulls the base → tier C staged block → RED");
+    const originMain = join(repo, ".git/refs/remotes/origin/main");
+    equal(existsSync(originMain), false, "58: fixture purity — no origin refs were created");
+  });
+
+  test("scenario 59 (#487 second-model gate): multi-refspec union names BOTH ranges; an unresolvable refspec nulls the WHOLE command to staged", async () => {
+    const repo = join(TEST_ROOT, "repo-487-59");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base59.txt"), "b\n");
+    git(repo, "add base59.txt");
+    git(repo, "commit -m base");
+    const baseSha = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/main ${baseSha}`);
+    writeFileSync(join(repo, "content59m.ts"), "c59m\n");
+    git(repo, "add content59m.ts");
+    git(repo, "commit -m c59m"); // raw commits — the gate's commit path is not this scenario's target
+    git(repo, "checkout -b feat");
+    writeFileSync(join(repo, "content59f.ts"), "c59f\n");
+    git(repo, "add content59f.ts");
+    git(repo, "commit -m c59f");
+    writeFileSync(join(repo, "wip59.ts"), "w\n");
+    git(repo, "add wip59.ts"); // parked WIP
+    await fire("session_start", {});
+    const block = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main feat", cwd: repo },
+    });
+    ok(block && block.block === true, "59: unverified multi-refspec push BLOCKS");
+    ok(block.reason.includes("content59m.ts") && block.reason.includes("content59f.ts"),
+      "59: the block names BOTH refspec ranges (union of tier-A origin/main...main and tier-B origin/main...feat) — NOT the staged wip (a staged-scope regression would name wip59.ts only)");
+    equal(block.reason.includes("wip59.ts"), false, "59: the parked WIP is out of scope for a pure range union");
+    // Verify both range files → the same command must now ALLOW.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: content59m.ts content59f.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [
+          { path: join(repo, "content59m.ts"), hash: sha("c59m\n") },
+          { path: join(repo, "content59f.ts"), hash: sha("c59f\n") },
+        ],
+      }) }],
+    });
+    await fire("session_start", {});
+    const allow = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main feat", cwd: repo },
+    });
+    equal(allow, undefined, "59: multi-refspec push ALLOWED once BOTH ranges are verified (wip still parked — a tier-C regression would block)");
+    // ANY tier-C refspec nulls the WHOLE command → staged scope. `nonexist` has
+    // no local ref, so its refspec is unresolvable → null cascades: the command
+    // must NOT get the tier-A [content59m] allow (content59m is already verified).
+    writeFileSync(join(repo, "wip59b.ts"), "w\n");
+    git(repo, "add wip59b.ts");
+    await fire("session_start", {});
+    const block2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main nonexist", cwd: repo },
+    });
+    ok(block2 && block2.block === true, "59b: an unresolvable refspec nulls the whole command → BLOCK");
+    ok(block2.reason.includes("wip59b.ts"),
+      "59b: the block names the STAGED file (whole-command tier-C null; a per-refspec-union regression would allow via the verified content59m range)");
+  });
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()
