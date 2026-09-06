@@ -40,12 +40,16 @@ import {
   getPrHeadShaViaRest,
   getPrHeadSha,
   _setRunGhOverride,
+  BLOCK_MESSAGE,
+  MICRO_BLOCK_MESSAGE,
+  TIER_RULE,
   default as reviewEnforcerFactory,
   type ReviewRecord,
 } from "./index.js";
-import { ok, equal } from "node:assert/strict";
+import { ok, equal, deepEqual } from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { resolve as resolvePath } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import * as fs from "node:fs";
 import * as os from "node:os";
 
@@ -829,9 +833,13 @@ async function withTempHome(fn: () => Promise<void>): Promise<void> {
   }
 }
 
-// The 0-dispatch block path reads /tmp/agent-issue-complexity (micro tier →
-// warn instead of block). Save/restore so a stale real-session marker cannot
-// flip this test's expectation.
+// The 0-dispatch block path reads /tmp/agent-issue-complexity — since #485 the
+// marker selects ONLY the remediation message (micro → MICRO_BLOCK_MESSAGE,
+// which must not reference the skipped code-review gate; every tier blocks).
+// Save/restore so a stale real-session marker cannot flip expectations — and
+// remove the marker the test body wrote when none pre-existed (bidirectional,
+// mirroring withTempHome: a leaked "micro" file would misdirect a REAL session's
+// subsequent 0-dispatch git op into the micro remediation message).
 async function withMarkerIsolated(fn: () => Promise<void>): Promise<void> {
   const marker = "/tmp/agent-issue-complexity";
   const had = fs.existsSync(marker);
@@ -841,6 +849,7 @@ async function withMarkerIsolated(fn: () => Promise<void>): Promise<void> {
     await fn();
   } finally {
     if (had && saved !== null) fs.writeFileSync(marker, saved);
+    else if (fs.existsSync(marker)) fs.unlinkSync(marker);
   }
 }
 
@@ -1288,6 +1297,372 @@ testAsync("interactive bypass unchanged — gh pr merge also ungated (escape hat
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
   });
+});
+
+// ── #485 — micro-tier dispatch policy: uniform ≥1-dispatch block ──
+
+section("extension factory — micro tier blocks at 0 dispatches (#485)");
+
+// T1: marker = micro → BLOCK with the micro-specific remediation message. The
+// pre-#485 arm logged a warning and allowed the op; the marker read now exists
+// ONLY for message selection. The marker is written in the real producer's
+// format (01-preflight Tier Detection echoes the capitalized TIER via
+// `echo "$TIER" > /tmp/agent-issue-complexity` → "Micro\n") so the code's
+// .trim().toLowerCase() normalization is pinned against removal.
+testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MESSAGE", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start"); // no skip env → gate enabled
+        fs.writeFileSync("/tmp/agent-issue-complexity", "Micro\n");
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "micro at 0 dispatches must block (#485)");
+        equal(blocked.reason, MICRO_BLOCK_MESSAGE, "micro block must carry the micro-specific remediation");
+        // Positive remediation-outcome pins (not just self-referential equality
+        // to the exported const): the blocked micro agent must be told docs-only
+        // sets need a lightweight [REVIEW] dispatch and that it must NOT go read
+        // the skipped multi-agent code-review skill.
+        ok(
+          blocked.reason.includes("[REVIEW]") && blocked.reason.includes("docs-only"),
+          "micro remediation must direct docs-only sets to a lightweight [REVIEW] dispatch"
+        );
+        ok(
+          !blocked.reason.includes("code-review/SKILL.md"),
+          "micro remediation must NOT point at the skipped multi-agent code-review gate"
+        );
+        // Complement cell: micro marker + ≥1 dispatch → ALLOWED (the #485
+        // uniform policy is ≥1-dispatch, not "micro always blocks"). The
+        // dispatch-count early return must precede the marker read — a reorder
+        // that reads the tier first, or an over-broad unconditional micro arm,
+        // would silently block every dispatched micro session (the core #485
+        // workflow: code sets satisfy the dispatch via VGATE's own [VGATE]
+        // dispatch). Marker still present — only the dispatch state changed.
+        await fire("tool_result", { toolName: "task" });
+        const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(allowed, undefined, "micro + ≥1 dispatch must allow the git op (dispatch supersedes the marker)");
+        // Second-model gate P2 (2026-09-06): the counter must ALSO count the
+        // pi `subagent` tool (extensions/subagent) — a docs-only micro change
+        // reviewed via a subagent dispatch must not false-block post-flip
+        // (micro relies on this counter as its only gate). Reset via
+        // session_start, keep the marker, dispatch ONE subagent-tool result →
+        // the git op must allow.
+        await fire("session_start"); // resets dispatchCount to 0
+        await fire("tool_result", { toolName: "subagent" });
+        const subagentAllowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(subagentAllowed, undefined, "micro + 1 subagent-tool dispatch must allow the git op (any sub-agent dispatch counts)");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+// T1b: standard/complex/unknown markers → BLOCK with the generic BLOCK_MESSAGE,
+// plus the unlabeled (no-marker) key's reason pinned directly, plus the full
+// policy-matrix allow complement (≥1 dispatch → allowed at every marker value).
+// Markers mirror the producer format (01-preflight Tier Detection via
+// echo "$TIER" — capitalized Micro/Standard/Complex and lowercase unknown,
+// matching each emitted literal's exact case). The direction pins anchor on the
+// path TAIL "code-review/SKILL.md" — not the full "operations/skills/…" prefix,
+// which is the stale consumer-repo layout tracked by follow-up #517: the tail
+// survives that fix in both repo and installed forms and still discriminates
+// (MICRO_BLOCK_MESSAGE references only 03-code-review.md, never
+// "code-review/SKILL.md").
+testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispatches", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        const producerValues = ["Standard\n", "Complex\n", "unknown\n"];
+        // Pass A — 0 dispatches: every non-micro marker blocks with the generic
+        // message + direction pins (all asserted while dispatchCount is still
+        // 0 — the allow pass below must not precede these).
+        for (const producerValue of producerValues) {
+          fs.writeFileSync("/tmp/agent-issue-complexity", producerValue);
+          const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+          ok(blocked && blocked.block === true, `${producerValue.trim()} at 0 dispatches must block (#485)`);
+          equal(blocked.reason, BLOCK_MESSAGE, `${producerValue.trim()} block must carry the generic BLOCK_MESSAGE`);
+          ok(
+            blocked.reason.includes("code-review/SKILL.md"),
+            "generic remediation must direct the agent to the code-review dispatch protocol"
+          );
+          ok(
+            !blocked.reason.includes("micro tier") && !blocked.reason.includes("03-code-review.md"),
+            "generic remediation must not carry micro-specific content"
+          );
+        }
+        // unlabeled key: marker ABSENT → same generic block + message (the
+        // pre-existing no-marker test pins block===true; this pins the reason).
+        fs.unlinkSync("/tmp/agent-issue-complexity");
+        const unlabeled = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(unlabeled && unlabeled.block === true, "unlabeled (no marker) at 0 dispatches must block");
+        equal(unlabeled.reason, BLOCK_MESSAGE, "unlabeled (no marker) block must carry the generic BLOCK_MESSAGE");
+        // Pass B — ≥1 dispatch: dispatch supersedes the marker at every tier
+        // (closes the standard/complex/unknown × ≥1 matrix cells; micro × ≥1 is
+        // pinned in T1).
+        for (const producerValue of producerValues) {
+          fs.writeFileSync("/tmp/agent-issue-complexity", producerValue);
+          await fire("tool_result", { toolName: "task" });
+          const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+          equal(allowed, undefined, `${producerValue.trim()} + ≥1 dispatch must allow the git op`);
+        }
+        // unlabeled × ≥1: marker ABSENT + a dispatch → still allowed (pins that
+        // the ≥1 allow is marker-INDEPENDENT — a regression making the allow
+        // condition require marker presence fails here; the pre-existing
+        // no-marker allow test covers the same cell, this keeps the full matrix
+        // self-contained in the #485 test).
+        fs.unlinkSync("/tmp/agent-issue-complexity");
+        await fire("tool_result", { toolName: "task" });
+        const unlabeledAllowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(unlabeledAllowed, undefined, "unlabeled (no marker) + ≥1 dispatch must allow the git op");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+// ── #485 T2 — drift pin: REVIEW-ENFORCER-TIER-RULE fence ↔ TIER_RULE export ──
+
+section("drift pin — 01-preflight REVIEW-ENFORCER-TIER-RULE fence ↔ TIER_RULE");
+
+// Enforcement target: the agent-infra SOURCE CHECKOUT (mirrors the
+// verification-gate VGATE-SHAPE-RULE drift test). A deployed extension copy
+// (~/.pi/agent/extensions/…) has no .git marker above it and its sibling
+// skills/ doc is an independently-synced artifact — comparing that pair would
+// be a spurious red, not drift detection.
+function isSourceCheckout(): boolean {
+  return existsSync(new URL("../../.git", import.meta.url)); // dir in a clone, file in a worktree
+}
+
+// The one-time acceptance grep ("no review-enforcer micro 'warn' claim may
+// remain in 01/02/03") must never silently re-drift (#486/#493 class): these
+// tokens make it a CI-enforced pin that runs in ci-main's post-merge
+// extension-tests job. The scan is CASE-INSENSITIVE (a re-drift may use
+// "WARN-ONLY"/"Warn-only"/"WARN only" — the pre-#485 docs used both lowercase
+// "warn-only" and all-caps "WARN-ONLY", so case-mutants are in the historical
+// vocabulary), with a single carve-out: the legitimate on-demand-gates line in
+// 01-preflight.md ("Quality gates available on-demand (WARN only, do not block)")
+// — a line that carries that exact anchor is stripped before the scan, so the
+// legitimate uppercase phrase never false-positives while a re-drift using it
+// anywhere else is caught. DOCUMENTED BLANKET CONTRACT (second-model gate,
+// 2026-09-06): the tokens are generic warn-phrases, not review-enforcer-scoped
+// — any FUTURE legitimate "warn-only"-vocabulary prose about ANOTHER gate in
+// 01/02/03 must be reworded (or this list scoped) rather than adding a token;
+// the one-time acceptance grep is the floor, this pin is deliberately broader
+// (adds the space-form "warn only") so CI can never green a claim the grep
+// would have caught.
+const MICRO_WARN_ANTI_TOKENS = [
+  "warn-only",
+  "warn only",
+  "warn but do not block",
+  "warn instead of block",
+  "micro tier allows bypass",
+] as const;
+
+// The on-demand-gates line is the only legitimate review-enforcer-adjacent
+// "warn" in the swept docs (it describes optional nightly quality gates, not
+// the review-enforcer dispatch rule). Anchored by its full prefix so an edit to
+// that line stops matching and the CI reds loudly until the anchor is updated.
+const LEGIT_ON_DEMAND_LINE = "Quality gates available on-demand (WARN only, do not block)";
+
+const SWEPT_DOC_RELS = [
+  "../../skills/commit-workflow/workflow/01-preflight.md",
+  "../../skills/commit-workflow/workflow/02-commit-pr.md",
+  "../../skills/commit-workflow/workflow/03-code-review.md",
+] as const;
+
+test("#485 T2: REVIEW-ENFORCER-TIER-RULE fence == TIER_RULE + no micro-warn claim in 01/02/03", () => {
+  if (!isSourceCheckout()) {
+    console.log("  ↪ skip (deployed copy — not an agent-infra source checkout)");
+    return;
+  }
+  // Fence parse (01-preflight). Anchor the separator row by POSITION so a
+  // cosmetic header reword cannot break the parse; every data row must be
+  // exactly 2 populated cells or the test FAILS loudly (prose never silently
+  // ignored inside a machine-read fence).
+  const docText = readFileSync(
+    new URL("../../skills/commit-workflow/workflow/01-preflight.md", import.meta.url),
+    "utf8"
+  );
+  const open = docText.indexOf("<!-- REVIEW-ENFORCER-TIER-RULE");
+  const close = docText.indexOf("<!-- /REVIEW-ENFORCER-TIER-RULE", open);
+  ok(open !== -1, "01-preflight.md must contain the REVIEW-ENFORCER-TIER-RULE opener comment");
+  ok(close !== -1 && close > open, "01-preflight.md must contain the REVIEW-ENFORCER-TIER-RULE closer comment");
+
+  const rows = docText
+    .slice(open, close)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith("|"));
+  ok(rows.length === 7, `fence must have header + separator + 5 data rows, found ${rows.length}`);
+  ok(/^\|[\s:|-]+\|$/.test(rows[1]), `row 1 must be the --- separator: ${rows[1]}`);
+  const cellSplit = (rawLine: string): string[] =>
+    rawLine.split("|").map((c) => c.trim()).filter((c) => c.length > 0);
+  const fencePairs: Array<[string, string]> = [];
+  for (const rawLine of rows.slice(2)) {
+    const cells = cellSplit(rawLine);
+    ok(cells.length === 2, `malformed data row (must be exactly 2 populated cells): ${rawLine}`);
+    fencePairs.push([cells[0], cells[1]]);
+  }
+  // Order-insensitive symmetric compare: a cosmetic reorder of fence rows or
+  // TIER_RULE keys must not fail CI (mirrors the VGATE precedent's sort-based
+  // robustness).
+  const sortPairs = (pairs: Array<[string, string]>) => pairs.sort((a, b) => a[0].localeCompare(b[0]));
+  deepEqual(
+    sortPairs(fencePairs),
+    sortPairs(Object.entries(TIER_RULE) as Array<[string, string]>),
+    "01-preflight.md REVIEW-ENFORCER-TIER-RULE fence drifted from TIER_RULE — every tier must map to block (#485)"
+  );
+
+  // Producer-vocabulary pin (closes the writer→reader coupling the T1/T1b
+  // marker strings mirror): a literal rename in 01-preflight Tier Detection
+  // that leaves the fence/TIER_RULE untouched would silently send real micro
+  // sessions the generic BLOCK_MESSAGE (losing the micro docs-only [REVIEW]
+  // remediation) with CI green — these asserts red on that class. Anchored on
+  // SEMANTIC content (markup-tolerant: `TIER = Micro` must survive a de-bold /
+  // table conversion — a literal rename changes the text either way, so
+  // format-insensitive checks catch every rename without cosmetic-noise reds).
+  const preflightLines = docText.split("\n");
+  ok(
+    preflightLines.some((l) => l.includes("echo") && l.includes("$TIER") && l.includes("agent-issue-complexity")),
+    "01-preflight.md must contain the marker emission line the T1/T1b marker strings mirror"
+  );
+  for (const [label, literal] of [
+    ["micro", "Micro"],
+    ["standard", "Standard"],
+    ["complex", "Complex"],
+  ] as Array<[string, string]>) {
+    ok(
+      preflightLines.some((l) => l.includes(`complexity:${label}`) && l.includes(`TIER = ${literal}`)),
+      `01-preflight.md Tier Detection must map complexity:${label} to TIER literal ${JSON.stringify(literal)} (mirrored by the T1/T1b producer-format markers)`
+    );
+  }
+  ok(
+    preflightLines.some((l) => l.includes("TIER = unknown")),
+    "01-preflight.md Tier Detection must emit the lowercase unknown literal (no-label bullet; mirrored by T1b's producer-format marker)"
+  );
+
+  // Anti-token pin across the three swept docs (vacuous-pass guard: a missing
+  // doc fails loudly instead of silently passing).
+  for (const rel of SWEPT_DOC_RELS) {
+    const url = new URL(rel, import.meta.url);
+    if (!existsSync(url)) {
+      ok(false, `${rel} unreachable from the agent-infra source tree — anti-token pin would pass vacuously; restore the doc or fix the resolution`);
+      return;
+    }
+    const text = readFileSync(url, "utf8");
+    // Case-insensitive scan with the legitimate-line carve-out: strip only the
+    // anchor SUBSTRING per line (never the whole line) so the residue of the
+    // legit bullet — and any re-drift sharing its physical line — stays subject
+    // to the token scan.
+    const sanitized = text
+      .split("\n")
+      .map((l) => l.replace(LEGIT_ON_DEMAND_LINE, ""))
+      .join("\n")
+      .toLowerCase();
+    for (const token of MICRO_WARN_ANTI_TOKENS) {
+      equal(
+        sanitized.includes(token),
+        false,
+        `${rel} must not contain ${JSON.stringify(token)} (case-insensitive) — a review-enforcer micro warn claim re-drifted; reword historical references instead of re-adding the phrase (the CI backstop must never disagree with the acceptance grep)`
+      );
+    }
+    // The carve-out anchor must appear exactly once total across the swept
+    // docs (the 01-preflight on-demand bullet) — a duplicated or renamed legit
+    // line reds loudly instead of silently widening the exemption.
+    const anchorCount = (text.match(new RegExp(LEGIT_ON_DEMAND_LINE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) ?? []).length;
+    const expectedCount = rel.includes("01-preflight.md") ? 1 : 0;
+    equal(anchorCount, expectedCount, `${rel} must contain the legit on-demand line ${expectedCount} time(s) (found ${anchorCount})`);
+  }
+});
+
+// ── #485 T3 — source-shape pin: the flip is anchored in code, not just docs ──
+
+test("#485 T3: micro arm implements block (index.ts shape guard + region no-allow check)", () => {
+  // Source-checkout-only, mirroring T2: a deployed extension copy is the synced
+  // artifact; pinning ITS shape adds no drift signal (and its index.ts lives
+  // beside an independently-synced skills/ tree).
+  if (!isSourceCheckout()) {
+    console.log("  ↪ skip (deployed copy — not an agent-infra source checkout)");
+    return;
+  }
+  const src = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  // Discriminator tokens anchor the uniform-block implementation. Each one is
+  // absent from the pre-#485 HEAD (verified: the old micro arm logged a warning
+  // and returned undefined; MICRO_BLOCK_MESSAGE, TIER_RULE, and the #485
+  // comments did not exist), so ANY functional revert removes ≥1 token — the
+  // test fails the moment the flip is undone, even if the docs were reworded to
+  // match. The all-5-keys "block" literals also pin the declared policy
+  // independent of T2's symmetric fence compare (a coordinated fence+export
+  // co-drift to "warn" fails here even though T2 compares like-with-like).
+  const tokens = [
+    "// #485: uniform ≥1-dispatch block",
+    "reason: MICRO_BLOCK_MESSAGE",
+    "export const TIER_RULE",
+    'micro: "block"',
+    'standard: "block"',
+    'complex: "block"',
+    'unknown: "block"',
+    'unlabeled: "block"',
+  ];
+  for (const t of tokens) {
+    ok(src.includes(t), `index.ts must contain ${JSON.stringify(t)} — the #485 uniform-block implementation drifted`);
+  }
+  // Ordering invariant: the #285 task-sub-agent carve-out and the
+  // dispatch-count early return must sit ABOVE the micro tier block — a revert
+  // that hoists the micro block above them would block dispatched micro
+  // sessions. Anchored on a string UNIQUE to the early-return region (its
+  // allow-path log, line ~812) — NOT the generic "parent-enforced" word, which
+  // also appears in the session_start handler ~150 lines earlier and would make
+  // this assertion vacuous. The behavioral complement (T1: micro marker + ≥1
+  // dispatch → allowed) independently pins the same invariant.
+  const earlyReturn = src.indexOf("the merge-registry gate protects merges");
+  const microCheck = src.indexOf('if (tier === "micro")');
+  ok(earlyReturn !== -1 && earlyReturn < microCheck, "the dispatch-count / task-sub-agent early return must precede the micro tier block");
+  // Region slice: between the micro check and the generic block return there
+  // must be NO `return undefined` (the pre-#485 warn-allow) — the only exits
+  // are the micro block return and the generic block return below it.
+  // The generic return is the file's FINAL `return { block: true, reason:
+  // BLOCK_MESSAGE }` (merge-gate paths return mergeGateBlockReason, not the
+  // BLOCK_MESSAGE constant): if a revert collapses the micro arm onto the
+  // generic return, a first-occurrence-after-microCheck anchor would bind to
+  // the micro arm's own copy and empty the region vacuously — the full-file
+  // lastIndexOf keeps the slice meaningful.
+  ok(microCheck !== -1, "micro arm must exist");
+  const genericReturn = src.lastIndexOf("return { block: true, reason: BLOCK_MESSAGE }");
+  ok(genericReturn !== -1 && genericReturn > microCheck, "generic block return must follow the micro arm");
+  const region = src.slice(microCheck, genericReturn);
+  ok(!region.includes("return undefined"), "micro arm region must not contain a warn-allow return undefined (#485)");
+  // Absence scan (closes the code-side re-drift hole the plan's Task 3 step 6
+  // specifies): a future micro CODE commit re-labeling the branch
+  // 'warn-only'/'proportional'/'micro tier allows bypass' in comments or prose
+  // fails CI even if the block logic is untouched. Case-insensitive on the
+  // full source (the swept section header is "uniform ≥1-dispatch, all tiers"
+  // — no legit 'proportional' remains anywhere in index.ts).
+  const srcLower = src.toLowerCase();
+  // Code-side absence set DERIVED from the T2 docs pin's shared vocabulary so
+  // the two re-drift backstops can never silently diverge, plus the two
+  // code-only tokens. "proportional" is code-only because the docs corpus
+  // LEGITIMATELY carries it (01-preflight.md L41 "Pre-flight Verification
+  // (proportional — from proportional-gates v1.0.0)") — adding it to the
+  // shared MICRO_WARN_ANTI_TOKENS would false-positive T2's docs scan on that
+  // product-version header; index.ts is its only re-drift surface. "allows
+  // bypass" is genuinely absent from the docs corpus and is kept code-only for
+  // symmetry with "proportional". Case-insensitive (WARN-ONLY is covered via
+  // "warn-only").
+  const codeAntiTokens = [...MICRO_WARN_ANTI_TOKENS, "allows bypass", "proportional"];
+  for (const token of codeAntiTokens) {
+    ok(!srcLower.includes(token), `index.ts must not contain ${JSON.stringify(token)} — a micro warn/proportional re-label re-drifted (#486/#493 class)`);
+  }
 });
 
 // ── Summary ───────────────────────────────────────────

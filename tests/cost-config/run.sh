@@ -2,26 +2,31 @@
 # #341 — cost-config drift-guard tests.
 #
 # Exercises scripts/check-cost-config.sh semantics:
-#   1. clean 400K fixture                          → PASS (exit 0)
-#   2. models.json drift (deepseek id > 400K)      → BLOCK (exit 1)
+#   1. clean fixture (deepseek ids @300K clamp)    → PASS (exit 0)
+#   2. models.json drift (deepseek id > 300K)      → BLOCK (exit 1)
 #   3. models-store.json drift                     → WARN (exit 0, DETECTED —
 #      catalog class must not fail sync; the weekly report + tripwire alert)
+#      (also: matcher negatives kimi-k3 + deepseek-chat-v3.2 never flagged;
+#      `~deepseek` alias + vision-exp covered)
 #   4. settings.json missing compaction block      → BLOCK (exit 1)
 #   5. settings.json retry.maxRetries != 10000     → BLOCK (exit 1)
 #   6. COST_CLAMP_OVERRIDE=1                       → exit 0 + loud notice
 #   7. --shipped-only                              → exit 0, no live-dir access
-#   8. matcher negatives: kimi-k3 (excluded by decision) never flagged
-#   9. `~deepseek` alias + vision-exp covered (present in fixture output)
-#  10. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
+#   8. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
 #      format-independent detection (P1 regression pin)
-#  11. MINIFIED clean 400K models.json              → PASS (exit 0)
-#  12. missing SHIPPED models.json                  → BLOCK (exit 1, authority
-#      deleted = clamp gone); missing LIVE models.json → WARN (first-install)
-#  13. compaction.enabled=false                     → BLOCK (exit 1)
+#   9. MINIFIED clean models.json (300K clamp)     → PASS (exit 0)
+#  10. missing SHIPPED models.json                  → BLOCK (exit 1, authority
+#      deleted = clamp gone)
+#  11. missing LIVE models.json (first-install)     → WARN (exit 0)
+#  12. compaction.enabled=false                     → BLOCK (exit 1)
 #
 # Fixtures under tests/fixtures/cost-config/ are regenerated from the LIVE
-# store at implementation time (backdoor-* hold the pre-clamp 1M values; the
-# guard's canonical matcher must catch exactly the deepseek-served family).
+# store at implementation time; clean + clean-minified mirror the shipped
+# tree byte-for-byte, and each backdoor-* tree re-introduces exactly one
+# defect (backdoor-models/backdoor-minified models.json hold 1M deepseek ids;
+# backdoor-store/models-store.json holds the pre-#476 curated snapshot with
+# the alias + vision-exp rows at 1M; the guard's canonical matcher must catch
+# exactly the deepseek-served family).
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -68,7 +73,7 @@ done
 [ "$ok" = 1 ] && pass "all fixture JSON files parse"
 
 echo ""
-echo "1. Clean 400K fixture → PASS"
+echo "1. Clean fixture (300K clamp) → PASS"
 run_guard 0 "clean fixture" --live-dir "$FIX/clean"
 if grep -q "✅ cost-config guard: PASS" "$OUT"; then pass "summary PASS"; else fail "expected PASS summary"; tail -20 "$OUT"; fi
 
@@ -116,7 +121,7 @@ if grep -q "BLOCK-level violation" "$OUT"; then pass "BLOCK summary present"; el
 if grep -q "deepseek-v4-pro contextWindow=1000000" "$OUT"; then pass "minified deepseek-v4-pro flagged"; else fail "minified deepseek-v4-pro not flagged"; sed -n '1,30p' "$OUT"; fi
 
 echo ""
-echo "9. MINIFIED clean 400K models.json → PASS, exit 0"
+echo "9. MINIFIED clean models.json (300K clamp) → PASS, exit 0"
 run_guard 0 "clean-minified" --live-dir "$FIX/clean-minified"
 if grep -q "✅ cost-config guard: PASS" "$OUT"; then pass "summary PASS"; else fail "expected PASS summary"; tail -20 "$OUT"; fi
 

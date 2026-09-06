@@ -16,6 +16,11 @@ import { runSingleAgent, type SingleResult } from "./index.js";
 import type { AgentConfig } from "./agents.js";
 import { ok, notEqual } from "node:assert/strict";
 
+// #496: real-pi suite — provider-fallback kill-switch ON (see
+// timeout-integration.test.ts header for the rationale; fallback coverage lives
+// in the hermetic provider-fallback.test.ts).
+process.env.SUBAGENT_FALLBACK_DISABLE = "1";
+
 if (!process.env.DEEPSEEK_API_KEY) {
 	console.log("⏭️  No DEEPSEEK_API_KEY — skipping abort-resilience integration (pi -p cannot complete)");
 	process.exit(0);

@@ -11,8 +11,9 @@ import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, r
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { join, sep, dirname } from "node:path";
+import { tmpdir, homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 let passed = 0;
 let failed = 0;
@@ -1401,6 +1402,31 @@ else
   git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH could not be deleted — delete manually: git branch -D $BRANCH"
 fi`;
 
+// ── #482 — shared drift-guard skip-arm messaging for the THREE guards (01-preflight,
+// 05-cleanup, 04-merge-deploy) ──
+// Declared here (before the guards that execute at module load) — consts are TDZ until
+// initialized; the classifier FUNCTIONS below hoist instead. The deployed message covers
+// both soft-skip shapes (rule 2 pi-home location, rule 5 fence-less sibling doc); the
+// unknown message is LOUD + fail-closed (rule 6 — a code-only archive must never pass
+// silently).
+const DRIFT_GUARD_SKIP_DEPLOYED =
+  "  ↪ skip (deployed pi-home layout or fence-less sibling doc — doc↔fixture enforcement requires a source checkout, CI, or a fence-carrying doc artifact; comparing against an independently-synced skills pair is meaningless)";
+const DRIFT_GUARD_UNKNOWN_WARN =
+  "  ⚠️ drift guard layout UNKNOWN (no .git marker, not under the pi home, no CI env, sibling skills doc unresolvable) — this looks like a code-only archive; refusing to pass vacuously (fail-closed). Run from an agent-infra source checkout or an artifact that carries the skills/ tree.";
+const DRIFT_GUARD_UNKNOWN_FAIL =
+  "drift guard layout UNKNOWN (no .git marker, not under the pi home, no CI env, sibling skills doc unresolvable) — code-only archive must not soft-skip the drift guards; run where the sibling skills doc is present";
+// #482: shared 05-ceremony fence marker — SINGLE source of truth, consumed by the guard
+// probe (fencePresent), the 05 guard's fence extraction, AND the activation canary
+// (triplication drift class #482 removes). ⚠️ Slicing asymmetry: block BODY comparisons
+// start at fenceOpen + "```bash\n".length, NOT at marker.length — the marker includes the
+// "# BRANCH…" comment LINE, and the FULL_05_CLEANUP_BLOCK body starts AT that comment line.
+const DRIFT_GUARD_05_FENCE_MARKER = "```bash\n# BRANCH = the merged PR branch";
+// 04-merge-deploy.md Step B remote-delete line — the single classification-relevant line
+// of the ceremony (skills/commit-workflow/workflow/04-merge-deploy.md:91), VERBATIM.
+// Shared by the TRUE-fixture pin below and the #482 drift guard. Line-only surface: prose
+// edits elsewhere in Step B (worktree-defer comments/echoes) must NOT red the guard.
+const MERGE_DEPLOY_STEP_B_DELETE = `git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete failed — delete manually: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"`;
+
 test("TRUE: delete-shaped forms (flag either position, :refspec, -d, multi-target, redirects, cd-prefix)", () => {
   const truePins = [
     "git push origin --delete feat/x",
@@ -1478,9 +1504,10 @@ test("non-interception pins: git branch -D / git worktree remove / gh pr view ar
 });
 
 test("04-merge-deploy.md Step B literal (TRUE ceremony fixture — 2>&1 drop, gh api prose, quote-strip)", () => {
-  // Copied VERBATIM from skills/commit-workflow/workflow/04-merge-deploy.md:91.
-  const literal = `git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete failed — delete manually: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"`;
-  ok(isDeletionPush(literal), "merge-deploy ceremony delete must classify pure");
+  // MERGE_DEPLOY_STEP_B_DELETE — VERBATIM from
+  // skills/commit-workflow/workflow/04-merge-deploy.md:91 (declared beside
+  // FULL_05_CLEANUP_BLOCK above; pinned by the #482 drift guard below).
+  ok(isDeletionPush(MERGE_DEPLOY_STEP_B_DELETE), "merge-deploy ceremony delete must classify pure");
 });
 
 test("05-cleanup.md FULL fenced block (TRUE fixture — whole-ceremony paste, #470 shape)", () => {
@@ -1493,29 +1520,31 @@ test("05-cleanup.md FULL fenced block (TRUE fixture — whole-ceremony paste, #4
 });
 
 test("#472 fixture drift guard: FULL_05_CLEANUP_BLOCK == the live 05-cleanup.md ceremony block", () => {
-  // FULL_05_CLEANUP_BLOCK claims VERBATIM fidelity to
-  // skills/commit-workflow/workflow/05-cleanup.md but is a hand-maintained
-  // copy — a doc edit (e.g. a maintainer adding a content push or a commit
-  // invocation to the ceremony) would silently desync the pinned
-  // classification surface from the command agents actually run. Mirror the
-  // 01-preflight drift guard: enforce from an agent-infra source checkout,
-  // soft-skip deployed copies (isSourceCheckout).
-  if (!isSourceCheckout()) {
-    console.log("  ↪ skip (deployed copy — not an agent-infra source checkout)");
-    return;
-  }
-  const docText = resolveRepoDoc(
+  // #482: gate on the tri-state layout. .git governance is PRIMARY (rule 1); the pi-home
+  // LOCATION rule (rule 2) soft-skips deployed copies regardless of doc generation — a
+  // deployed pi-home copy whose sibling doc is present AND fenced is still deployed (content
+  // alone cannot separate it from a .git-less source artifact); CI + doc-unresolvable (rule
+  // 3) and fence-carrying sibling docs (rule 4) route .git-less source artifacts into
+  // enforcement — a doc PRESENT under CI defers to its fence state (fence-less → rule 5
+  // deployed soft-skip); doc-less code-only archives FAIL CLOSED (unknown, loud).
+  const { layout, docText } = probeGuardLayout(
+    DRIFT_GUARD_05_FENCE_MARKER, // shared const — single source of truth with the extraction + canary
     "../../skills/commit-workflow/workflow/05-cleanup.md",
     "../../skills/commit-workflow/workflow/05-cleanup.md",
     "skills/commit-workflow/workflow/05-cleanup.md",
   );
+  if (layout === "deployed") { console.log(DRIFT_GUARD_SKIP_DEPLOYED); return; }
+  if (layout === "unknown") { console.warn(DRIFT_GUARD_UNKNOWN_WARN); ok(false, DRIFT_GUARD_UNKNOWN_FAIL); return; }
+  // (doc-null hard-fail arm kept verbatim below — layout "source" does NOT imply the doc
+  // exists: rule 1 (doc deleted in a git checkout) and rule 3 (CI + no sibling doc) both
+  // reach this arm — the ok(false) below is the fail-closed red for those states, not dead code)
   if (docText === null) {
     ok(false, "05-cleanup.md unreachable from the agent-infra source tree — FULL_05_CLEANUP_BLOCK fixture drift guard would pass vacuously; restore the doc or fix the resolution");
     return;
   }
   // Extract the merged-branch ceremony ```bash fence (starts with the BRANCH
   // resolution line; closes at the ``` after the branch -D fallback).
-  const fenceOpen = docText.indexOf("```bash\n# BRANCH = the merged PR branch");
+  const fenceOpen = docText.indexOf(DRIFT_GUARD_05_FENCE_MARKER);
   ok(fenceOpen !== -1, "05-cleanup.md must contain the merged-branch ceremony ```bash fence");
   const bodyStart = fenceOpen + "```bash\n".length;
   const fenceClose = docText.indexOf("\n```", bodyStart);
@@ -1524,6 +1553,44 @@ test("#472 fixture drift guard: FULL_05_CLEANUP_BLOCK == the live 05-cleanup.md 
     docText.slice(bodyStart, fenceClose).trimEnd(),
     FULL_05_CLEANUP_BLOCK,
     "05-cleanup.md ceremony block drifted from FULL_05_CLEANUP_BLOCK — re-copy VERBATIM (isDeletionPush and isBareCommitShape both pin it)"
+  );
+});
+
+test("#482 drift guard: MERGE_DEPLOY_STEP_B_DELETE == the live 04-merge-deploy.md Step B delete line", () => {
+  // Mirror the 05-cleanup drift guard for the 04-merge-deploy Step B delete line
+  // (the fixture behind the TRUE pin). Same #482 tri-state gate. The anchor is the
+  // Step B fence opener (PR_BRANCH resolution line) — UNIQUE to the fence: the
+  // spoofable partial prose mention at doc L110 sits AFTER the fence close and is
+  // never inside the bounded search region.
+  const fenceMarker = "```bash\nPR_BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')";
+  const { layout, docText } = probeGuardLayout(
+    fenceMarker,
+    "../../skills/commit-workflow/workflow/04-merge-deploy.md",
+    "../../skills/commit-workflow/workflow/04-merge-deploy.md",
+    "skills/commit-workflow/workflow/04-merge-deploy.md",
+  );
+  if (layout === "deployed") { console.log(DRIFT_GUARD_SKIP_DEPLOYED); return; }
+  if (layout === "unknown") { console.warn(DRIFT_GUARD_UNKNOWN_WARN); ok(false, DRIFT_GUARD_UNKNOWN_FAIL); return; }
+  if (docText === null) {
+    ok(false, "04-merge-deploy.md unreachable from the agent-infra source tree — MERGE_DEPLOY_STEP_B_DELETE fixture drift guard would pass vacuously; restore the doc or fix the resolution");
+    return;
+  }
+  const fenceOpen = docText.indexOf(fenceMarker);
+  ok(fenceOpen !== -1, "04-merge-deploy.md must contain the Step B ```bash fence (PR_BRANCH anchor)");
+  const bodyStart = fenceOpen + fenceMarker.length;
+  const fenceClose = docText.indexOf("\n```", bodyStart);
+  ok(fenceClose !== -1, "04-merge-deploy.md Step B fence must close");
+  // Locate the delete invocation inside the fence by its stable verb+target prefix
+  // (a partial edit like 2>&1 → 2>/dev/null must still find the line, then fail the
+  // FULL-LINE compare below with a readable diff); compare the full line (trimEnd).
+  const delStart = docText.indexOf('git push origin --delete "$PR_BRANCH"', bodyStart);
+  ok(delStart !== -1 && delStart < fenceClose, "04-merge-deploy.md Step B fence must contain the remote-delete push line");
+  const lineStart = docText.lastIndexOf("\n", delStart) + 1;
+  const lineEnd = docText.indexOf("\n", delStart);
+  equal(
+    docText.slice(lineStart, lineEnd === -1 ? undefined : lineEnd).trimEnd(),
+    MERGE_DEPLOY_STEP_B_DELETE,
+    "04-merge-deploy.md Step B delete line drifted from MERGE_DEPLOY_STEP_B_DELETE — re-copy VERBATIM (the isDeletionPush TRUE fixture pins it)"
   );
 });
 
@@ -1641,15 +1708,91 @@ test("05-cleanup.md fenced block (TRUE fixture — no commit invocations → vac
   ok(isBareCommitShape(FULL_05_CLEANUP_BLOCK), "ceremony block with no commit invocations is vacuously bare");
 });
 
-// ── Shared doc-resolution for the two #472 drift guards ──
-// Enforcement target: the agent-infra SOURCE CHECKOUT. A deployed extension
-// copy (~/.pi/agent/extensions/… — the pi agent layout) has no .git marker
-// above it, and the skills/ tree next to it is an INDEPENDENTLY-SYNCED
-// artifact: doc↔exports enforcement against that pair is meaningless (a doc
-// that predates the fence would red-flag as drift). Source runs resolve the
-// doc and fail loudly if it is missing or drifted; deployed runs soft-skip.
+// ── #482 — shared drift-guard layout gate (replaces the two-#472-guard isSourceCheckout
+// enforce-vs-skip decision). Enforcement target: the agent-infra SOURCE CHECKOUT plus any
+// .git-less source artifact OUTSIDE the pi-home layout — CI env with an UNRESOLVABLE
+// sibling doc (rule 3), or a sibling skills doc that still carries this guard's fence
+// marker (rule 4; a doc present under CI defers to its fence state). A DEPLOYED extension
+// copy (~/.pi/agent/extensions/… — the pi agent layout) is identified by LOCATION (module
+// under join(homedir(), ".pi", "agent")) — content alone cannot separate it from a .git-less
+// source artifact (a deployed skills tree can sync to a fenced rev, making the pair
+// content-identical): ALL guards soft-skip there, regardless of doc generation
+// (enforcement against the independently-synced pair is meaningless, not drift). A doc-less
+// code-only archive (no git, no CI, not pi-home) is UNKNOWN and FAILS CLOSED (never
+// silent). ──
+
+type GuardLayout = "source" | "deployed" | "unknown";
+interface GuardLayoutProbe {
+  gitMarker: boolean;     // .git dir (clone) or file (worktree) above this module
+  ci: boolean;            // CI env present (GITHUB_ACTIONS / CI)
+  piHomeLayout: boolean;  // module lives under join(homedir(), ".pi", "agent") — deployed copy
+  docResolvable: boolean; // sibling skills doc reachable via resolveRepoDoc
+  fencePresent: boolean;  // sibling doc contains THIS guard's fence marker
+}
+
+// Pure decision core — table-tested exhaustively (32 rows). Rule order (binding — the
+// pi-home LOCATION rule beats CI so a deployed copy soft-skips even in a shell that
+// inherits CI=true/GITHUB_ACTIONS):
+//   1. gitMarker → source          (git governance PRIMARY — fence-removal drift in a real
+//                                   checkout still reaches the guards' hard-fail arms; a
+//                                   fence-less doc in a git checkout REDS via the structural
+//                                   asserts, never reaching rule 5)
+//   2. piHomeLayout → deployed     (deployed physical copy — soft-skip unconditionally, any
+//                                   doc generation, even under inherited CI env)
+//   3. ci && !docResolvable → source   (CI + NO sibling doc — code-only archive under CI
+//                                       fails closed on the guards' doc-null arms; never
+//                                       under the pi home (rule 2). With a doc PRESENT, CI
+//                                       DEFERS to the doc's fence state (rules 4-5): a
+//                                       fence-less doc under CI is a pre-#472-generation
+//                                       artifact — uncheckable, not a defect)
+//   4. docResolvable && fencePresent → source   (.git-less source artifact — #482 headline;
+//                                       also the CI+doc+fence tuple — rule 3 needs doc-null)
+//   5. docResolvable → deployed    (fence-less doc — pre-#472-generation artifact for 01;
+//                                  for 04/05 a fence-less doc means the ceremony block is
+//                                  absent — soft-skip is defensible: a missing fence cannot
+//                                  be drift-checked; env-independent contract)
+//   6. else → unknown              (doc-less code-only archive — LOUD fail-closed)
+function classifyGuardLayout(p: GuardLayoutProbe): GuardLayout {
+  if (p.gitMarker) return "source";
+  if (p.piHomeLayout) return "deployed";
+  if (p.ci && !p.docResolvable) return "source";
+  if (p.docResolvable && p.fencePresent) return "source";
+  if (p.docResolvable) return "deployed";
+  return "unknown";
+}
+
+function isCIEnv(): boolean {
+  return process.env.GITHUB_ACTIONS === "true"
+    || (typeof process.env.CI === "string" && process.env.CI.length > 0
+        && process.env.CI !== "0" && process.env.CI.toLowerCase() !== "false");
+}
 function isSourceCheckout(): boolean {
   return existsSync(new URL("../../.git", import.meta.url)); // dir in a clone, file in a worktree
+}
+function isUnderOrAt(root: string, agentHome: string): boolean {
+  // Pure boundary compare: root IS the agent home, or lives under it (exact-match arm
+  // covers a module tree AT the agent home — a bare startsWith(agentHome + sep) misses it).
+  return root === agentHome || root.startsWith(agentHome + sep);
+}
+function isPiHomeLayout(agentHomeArg?: string): boolean {
+  // Location probe: is this module's AGENT ROOT (= two hops up from the file — the .git
+  // sibling that isSourceCheckout probes) the pi agent home? import.meta.url resolves
+  // symlinks by default, so a canonical SYMLINKED install reports the real agent-infra path
+  // (→ git marker present → source); a physical copy stays under ~/.pi/agent → deployed.
+  // new URL("../../", import.meta.url) from …/extensions/verification-gate/index.test.ts
+  // resolves to the AGENT ROOT (~/.pi/agent for the deployed copy — EQUAL to agentHome, not
+  // strictly under it), so the compare needs isUnderOrAt's exact-match arm.
+  // Optional agentHomeArg (review F3, test-only): the module root is immutable in-process,
+  // so the classifier-test rows drive the REAL URL/realpath plumbing with synthetic
+  // agent-home inputs — default behavior (real homedir()) is unchanged and every existing
+  // call site (probeGuardLayout and the canary activation gate — both no-arg) is
+  // unaffected.
+  try {
+    const moduleDir = fileURLToPath(new URL("../../", import.meta.url)); // agent root
+    const real = realpathSync(moduleDir);
+    const agentHome = realpathSync(agentHomeArg ?? join(homedir(), ".pi", "agent"));
+    return isUnderOrAt(real, agentHome);
+  } catch { return false; }
 }
 function resolveRepoDoc(relFromHere: string, ...cwdRels: string[]): string | null {
   const viaUrl = new URL(relFromHere, import.meta.url);
@@ -1660,32 +1803,255 @@ function resolveRepoDoc(relFromHere: string, ...cwdRels: string[]): string | nul
   return null;
 }
 
+// Real-probe wrapper for ONE guard: resolves the doc FIRST (the fence OR-arm needs the
+// doc text pre-decision), then classifies over the guard-specific fence marker. Returns
+// the measured PROBE tuple too — the activation canary re-classifies it with gitMarker
+// removed to pin rule 4's real wiring in git runs where rule 1 would otherwise shadow it.
+// Guard call-sites destructure { layout, docText } — unaffected.
+function probeGuardLayout(fenceMarker: string, relFromHere: string, ...cwdRels: string[]): { layout: GuardLayout; docText: string | null; probe: GuardLayoutProbe } {
+  const docText = resolveRepoDoc(relFromHere, ...cwdRels);
+  const probe: GuardLayoutProbe = {
+    gitMarker: isSourceCheckout(),
+    ci: isCIEnv(),
+    piHomeLayout: isPiHomeLayout(),
+    docResolvable: docText !== null,
+    fencePresent: docText !== null && docText.includes(fenceMarker),
+  };
+  return { layout: classifyGuardLayout(probe), docText, probe };
+}
+
+section("drift-guard layout gate — classifyGuardLayout (#482)");
+
+test("classifyGuardLayout: 32-row decision table — git → source; pi-home → deployed (beats CI/fence/doc); CI+doc-null → source fail-closed; fence-carrying doc → source; fence-less doc → deployed; doc-less → unknown", () => {
+  // LITERAL named rows pin the BINDING decisions (a mirror-only table would pass if
+  // classifier AND spec changed together): git governance dominance, the pi-home location
+  // beats CI + doc generation, the #482 .git-less-source-artifact headline, CI's deferral
+  // to a present doc's fence state, fence-less doc → deployed, doc-less → unknown.
+  equal(classifyGuardLayout({ gitMarker: true, ci: false, piHomeLayout: false, docResolvable: false, fencePresent: false }), "source",
+    "git marker alone → source (governance PRIMARY — a doc-less git checkout still reaches the guards' doc-null hard-fail arms)");
+  equal(classifyGuardLayout({ gitMarker: true, ci: true, piHomeLayout: true, docResolvable: true, fencePresent: true }), "source",
+    "git marker dominates every other signal (source worktree in CI, even under a pi-home-shaped path)");
+  equal(classifyGuardLayout({ gitMarker: false, ci: true, piHomeLayout: true, docResolvable: true, fencePresent: true }), "deployed",
+    "pi-home LOCATION beats inherited CI env (a deployed copy must soft-skip even in a shell exporting CI=true)");
+  equal(classifyGuardLayout({ gitMarker: false, ci: false, piHomeLayout: true, docResolvable: true, fencePresent: true }), "deployed",
+    "pi-home beats the fence (deployed fenced 04/05 pair → soft-skip, not enforce)");
+  equal(classifyGuardLayout({ gitMarker: false, ci: false, piHomeLayout: true, docResolvable: false, fencePresent: false }), "deployed",
+    "pi-home with a MISSING sibling doc is still deployed → green (never a spurious unknown-red)");
+  equal(classifyGuardLayout({ gitMarker: false, ci: false, piHomeLayout: false, docResolvable: true, fencePresent: true }), "source",
+    "#482 headline: .git-less SOURCE ARTIFACT outside pi-home with a fence-carrying doc → source (enforce)");
+  equal(classifyGuardLayout({ gitMarker: false, ci: true, piHomeLayout: false, docResolvable: true, fencePresent: true }), "source",
+    "CI + fence-carrying doc → source (rule 4 — rule 3 needs doc-null; a vendored fenced artifact under CI enforces)");
+  equal(classifyGuardLayout({ gitMarker: false, ci: true, piHomeLayout: false, docResolvable: true, fencePresent: false }), "deployed",
+    "CI + FENCE-LESS doc → deployed (rule 5 — CI defers to the doc's fence state; a pre-#472 fence-less doc under CI soft-skips like any other)");
+  equal(classifyGuardLayout({ gitMarker: false, ci: true, piHomeLayout: false, docResolvable: false, fencePresent: false }), "source",
+    "CI + doc-NULL code-only archive → source (rule 3 — the guards' doc-null arms red it; fail-closed under CI)");
+  equal(classifyGuardLayout({ gitMarker: false, ci: false, piHomeLayout: false, docResolvable: true, fencePresent: false }), "deployed",
+    "fence-less doc outside pi-home → deployed informative soft-skip (rule 5 — env-independent contract)");
+  equal(classifyGuardLayout({ gitMarker: false, ci: false, piHomeLayout: false, docResolvable: false, fencePresent: false }), "unknown",
+    "doc-less code-only archive (no git/CI/pi-home) → unknown (LOUD fail-closed)");
+  // Pure boundary-compare rows for the location helper (the location signal is the one
+  // discriminator that separates content-identical layouts; its compare must be
+  // table-tested with synthetic paths, not only exercised by the manual sim).
+  equal(isUnderOrAt("/Users/x/.pi/agent", "/Users/x/.pi/agent"), true, "exact agent-home match (deployed copy agent root)");
+  equal(isUnderOrAt("/Users/x/.pi/agent/extensions", "/Users/x/.pi/agent"), true, "under the agent home");
+  equal(isUnderOrAt("/Users/x/.pi/agent2", "/Users/x/.pi/agent"), false, "prefix collision (~/.pi/agent2) is NOT under ~/.pi/agent");
+  equal(isUnderOrAt("/Users/x/.pi/agentsibling", "/Users/x/.pi/agent"), false, "sibling name is not under the agent home");
+  equal(isUnderOrAt("/Users/x/repo", "/Users/x/.pi/agent"), false, "source checkout is not under the agent home");
+  // isPiHomeLayout real-plumbing TRUE-branch rows (review F3): the module root is immutable
+  // in-process, so these drive the REAL URL/realpath plumbing with SYNTHETIC agent-home
+  // inputs — the same philosophy as the isUnderOrAt rows above but one level up (exercising
+  // realpathSync + the arg plumbing + the compare). Every committed run of this suite
+  // (source checkout, CI with actions/checkout) exercises the default-branch FALSE path; a
+  // deployed physical copy (sim B) exercises the default TRUE path and is unpinnable in
+  // committed runs — the machine-dependent default assert (equal(isPiHomeLayout(), false))
+  // was deliberately dropped (R4-F4); these rows pin the realpath+compare+arg plumbing of
+  // the deployed discriminator's TRUE branch instead.
+  const moduleRootReal = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
+  equal(isPiHomeLayout(moduleRootReal), true, "exact-match arm: agent home IS the module root (realpath plumbing live, TRUE branch)");
+  equal(isPiHomeLayout(dirname(moduleRootReal)), true, "module root under its parent → TRUE branch via realpathSync");
+  equal(isPiHomeLayout(realpathSync(join(moduleRootReal, "extensions"))), false, "existing child of the module root as agent home → not an ancestor → false via the real compare (extensions/ always exists where this suite runs)");
+  equal(isPiHomeLayout(join(moduleRootReal, "__no_such_dir__")), false, "nonexistent agent-home arg → realpathSync throws → catch arm returns false");
+  // isCIEnv pure env-parsing rows (review F8) — mirror the isUnderOrAt literal-row pattern
+  // on the pure env-parse surface (GITHUB_ACTIONS === "true" wins outright; CI parses as
+  // truthy = length>0, not "0", not case-insensitive "false"). Exact save/restore of the
+  // two vars (presence + value): the harness is synchronous/sequential so mid-test mutation
+  // is safe, but the tail ALWAYS restores so subsequent suite sections see the original env.
+  const hadGA = Object.prototype.hasOwnProperty.call(process.env, "GITHUB_ACTIONS");
+  const hadCI = Object.prototype.hasOwnProperty.call(process.env, "CI");
+  const savedGA = process.env.GITHUB_ACTIONS;
+  const savedCI = process.env.CI;
+  const setEnv = (ga: string | undefined, ci: string | undefined): void => {
+    if (ga === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = ga;
+    if (ci === undefined) delete process.env.CI; else process.env.CI = ci;
+  };
+  try {
+    setEnv("true", undefined);
+    equal(isCIEnv(), true, "GITHUB_ACTIONS=true, CI unset → true");
+    setEnv(undefined, "");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"\" → false (empty string is not a CI marker)");
+    setEnv(undefined, undefined);
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI unset → false");
+    setEnv(undefined, "0");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"0\" → false");
+    setEnv(undefined, "false");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"false\" → false");
+    setEnv(undefined, "FALSE");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"FALSE\" → false (case-insensitive)");
+    setEnv(undefined, "False");
+    equal(isCIEnv(), false, "GITHUB_ACTIONS unset, CI=\"False\" → false (case-insensitive)");
+    setEnv(undefined, "1");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"1\" → true");
+    setEnv(undefined, "true");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"true\" → true");
+    setEnv(undefined, "TRUE");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"TRUE\" → true");
+    setEnv(undefined, "yes");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS unset, CI=\"yes\" → true");
+    setEnv("true", "false");
+    equal(isCIEnv(), true, "GITHUB_ACTIONS=\"true\" AND CI=\"false\" → true (GITHUB_ACTIONS arm wins)");
+  } finally {
+    // Restore the original env EXACTLY (presence + value) even if a row above redded —
+    // subsequent suite sections must see the original env.
+    if (hadGA) process.env.GITHUB_ACTIONS = savedGA; else delete process.env.GITHUB_ACTIONS;
+    if (hadCI) process.env.CI = savedCI; else delete process.env.CI;
+  }
+  // Exhaustive sweep over the 5-boolean probe tuple (32 rows). The expected-value function
+  // below mirrors the 6-rule spec — see the LITERAL named rows above this sweep for the
+  // binding decisions; the sweep's job is 32-row COVERAGE (classifier ↔ spec divergence on
+  // the named rows is caught by the literals, not by this mirror).
+  const spec = (gitMarker: boolean, ci: boolean, piHomeLayout: boolean, docResolvable: boolean, fencePresent: boolean): GuardLayout => {
+    if (gitMarker) return "source";
+    if (piHomeLayout) return "deployed";
+    if (ci && !docResolvable) return "source";   // rule 3 — CI + doc-null (doc present ⇒ CI defers to fence state)
+    if (docResolvable && fencePresent) return "source";  // rule 4 — .git-less source artifact
+    if (docResolvable) return "deployed";         // rule 5 — fence-less doc (pre-#472 artifact)
+    return "unknown";                              // rule 6 — code-only archive, fail-closed
+  };
+  let checked = 0;
+  for (const gitMarker of [false, true])
+  for (const ci of [false, true])
+  for (const piHomeLayout of [false, true])
+  for (const docResolvable of [false, true])
+  for (const fencePresent of [false, true]) {
+    const key = `${gitMarker ? 1 : 0}${ci ? 1 : 0}${piHomeLayout ? 1 : 0}${docResolvable ? 1 : 0}${fencePresent ? 1 : 0}`;
+    const want = spec(gitMarker, ci, piHomeLayout, docResolvable, fencePresent);
+    equal(classifyGuardLayout({ gitMarker, ci, piHomeLayout, docResolvable, fencePresent }), want,
+      `row ${key} (git=${gitMarker}, ci=${ci}, piHome=${piHomeLayout}, doc=${docResolvable}, fence=${fencePresent}) must classify ${want}`);
+    checked++;
+  }
+  equal(checked, 32, "all 32 probe tuples exercised");
+});
+
+test("#482 activation canary: drift-guard gate classifies an enforcement run (git marker ∥ CI env) as source and the real probe resolves the fence", () => {
+  // Fires only in an ENFORCEMENT layout (git marker present, or CI env outside the pi
+  // home) — never reds a legitimate deployed run. Gate: skip when NOT git AND (no CI OR
+  // pi-home) — the pi-home arm covers a deployed physical copy running in a shell that
+  // inherits CI=true/GITHUB_ACTIONS (classifier rule 2 classifies it deployed; the canary
+  // must not contradict the guards' soft-skip). Uses the SAME real probes as the guards
+  // (probeGuardLayout), so a wiring regression that routes enforcement layouts into a skip
+  // arm (silent drift-coverage death) reds here.
+  // Additionally asserts the REAL probe's fence OR-arm preconditions (doc resolved AND
+  // fencePresent computed true) so a doc-path or marker-string regression in the fence arm
+  // is caught in every git/CI run whose doc resolves — not just by the synthetic table
+  // test (enforcement layouts with NO resolvable doc log a consistency line instead — the
+  // guards' doc-null arms own the red).
+  if (!isSourceCheckout() && (!isCIEnv() || isPiHomeLayout())) {
+    console.log("  ↪ canary skip (activation gate: no .git marker and no CI env outside the pi home — guards still classify by doc/fence (rules 4-6) and MAY enforce; the canary's asserts fire only on git/CI runs)");
+    return;
+  }
+  const { layout, docText, probe } = probeGuardLayout(
+    DRIFT_GUARD_05_FENCE_MARKER, // shared const — single source of truth with the 05 guard
+    "../../skills/commit-workflow/workflow/05-cleanup.md",
+    "../../skills/commit-workflow/workflow/05-cleanup.md",
+    "skills/commit-workflow/workflow/05-cleanup.md",
+  );
+  // Consistency arm: reachable ONLY when the gate fired, i.e. !git AND ci AND !piHome — a
+  // pi-home copy inheriting CI env is already skipped AT THE GATE (the `!isCIEnv() ||
+  // isPiHomeLayout()` arm) and never reaches here. The arm agrees+returns ONLY when the
+  // deployed verdict rests on a genuinely FENCE-LESS RESOLVABLE sibling doc (rule 5 — CI
+  // defers to the doc's fence state; the guards soft-skip in agreement — a consistency
+  // outcome, NOT a wiring failure). Both premises are load-bearing: the docText !== null
+  // premise keeps a doc-NULL tuple in rule 3's territory — a doc-null deployed verdict is
+  // ALWAYS a rule-3 regression (rule 5 requires a resolvable doc; rule 2 is false after
+  // the gate) and must fall through so the equal(layout, "source") below reds it; the
+  // fencePresent === false premise keeps a FENCED doc misclassified deployed (a
+  // rule-4-under-CI regression) from returning here — it falls through so the
+  // equal(layout, "source") below reds it too.
+  if (!isSourceCheckout() && layout === "deployed" && docText !== null && probe.fencePresent === false) {
+    console.log("  ↪ canary consistency: CI env + fence-less sibling doc classifies deployed (rule 5) — guards soft-skip in agreement; no enforcement expected");
+    return;
+  }
+  // Reachable semantics of the equal below, stated honestly: in GIT runs rule 1 forces
+  // "source" before rules 2-6, so the assert cannot fail there — its teeth in git runs are
+  // the fence-precondition assert and the git-removal pin further down. The equal's genuine
+  // failing surface is the GIT-LESS CI run (the #482 headline layout for future tarball
+  // runs): there it detects a rule-4 regression (a FENCED doc classified deployed — the
+  // consistency arm above refused to return on fencePresent === true) or a rule-3 regression
+  // (CI + doc-null classified unknown instead of source — a doc-null tuple can never
+  // classify deployed: rule 5 requires the doc to resolve and rule 2 is false after the
+  // gate, so deployed is the fenced-doc rule-4 regression's surface and unknown is rule
+  // 3's). A deployed/unknown verdict in an enforcement layout means the drift guards are
+  // not enforcing.
+  equal(layout, "source",
+    "drift-guard gate must classify THIS run as source (git marker present — rule 1; git-less CI + doc-null — rule 3; git-less CI + fence-carrying doc — rule 4) — a deployed verdict with a FENCED doc (rule-4 regression) or doc-null (rule-3 regression → unknown), or an unknown verdict, means all three drift guards are not enforcing in an enforcement layout");
+  // No-doc arm: an enforcement layout with NO resolvable doc (rule 3 under CI, or rule 1 in
+  // a git checkout whose doc is missing) — reaching here means the equal above PASSED, i.e.
+  // the doc-null state classified source correctly (a rule-3 regression reds at the equal);
+  // the guards' doc-null hard-fail arms own the red; there is no fence to pin.
+  if (docText === null) {
+    console.log("  ↪ canary consistency: enforcement layout, no resolvable sibling doc — guards' doc-null arms fail closed; fence-precondition asserts skipped (no fence exists)");
+    return;
+  }
+  ok(probe.fencePresent === true,
+    "fence OR-arm preconditions must hold when the doc resolves in an enforcement layout: the real probe must compute fencePresent=true (either the doc lost its fence — the guards' structural asserts also red it — or a path/marker/tuple-key regression silently disabled the .git-less-source-artifact arm)");
+  if (isSourceCheckout() && !probe.piHomeLayout && probe.fencePresent === true) {
+    // Git-removal pin (rule-4 real wiring — rule 1 would otherwise shadow it in git runs):
+    // re-classify THIS run's REAL measured tuple with the .git marker removed — with the
+    // doc resolved AND fenced, rules 3-5 must still route it to source via the fence arm
+    // (rule 4). The pin's own red surface is a CLASSIFIER-side rule-4 regression on a
+    // correctly-measured fenced probe (a fenced doc re-classified deployed or unknown with
+    // the git marker removed). A path/marker/tuple-key regression that makes the probe
+    // ITSELF fencePresent-falsy (tsx strips types — no typecheck catches it) never reaches
+    // this assert: it reds EARLIER at the fence-precondition ok(probe.fencePresent ===
+    // true) above, whose message already names the path/marker/tuple-key surface.
+    // Gate: skip when the doc is fence-less or missing (the guards red those states via
+    // their own correctly-worded arms) or the checkout lives under the pi home (git-removal
+    // → rule 2 deployed — exotic dev layout; rule 1 still enforces).
+    equal(classifyGuardLayout({ ...probe, gitMarker: false }), "source",
+      "removing THIS run's .git marker must still classify source via the fence OR-arm (rule 4) — real-probe wiring pin for the #482 headline layout");
+  }
+});
+
 // ── #472 — doc drift test: 01-preflight VGATE-SHAPE-RULE fence ↔ exports ──
 
 section("doc drift test — 01-preflight VGATE-SHAPE-RULE fence ↔ exports");
 
 test("#472 drift guard: 01-preflight VGATE-SHAPE-RULE fence == SHAPE_EXEMPT_EXTENSIONS + BUILD_OUTPUT_SEGMENTS", () => {
-  // Enforcement runs only from an agent-infra source checkout (isSourceCheckout
-  // — .git marker above this file). Deployed extension copies soft-skip: their
-  // sibling skills/ doc is an independently-synced artifact, and comparing this
-  // copy's exports against a doc that may simply predate the fence would be a
-  // spurious red, not drift detection.
-  if (!isSourceCheckout()) {
-    console.log("  ↪ skip (deployed copy — not an agent-infra source checkout)");
-    return;
-  }
-  const docText = resolveRepoDoc(
+  // #482: gate on the tri-state layout. .git governance is PRIMARY (rule 1 — a fence-less
+  // doc in a git checkout REDS via the structural asserts below); the pi-home LOCATION rule
+  // (rule 2) soft-skips deployed copies regardless of doc generation; CI + doc-unresolvable
+  // fails closed (rule 3); a .git-less artifact whose sibling doc carries this guard's fence
+  // enforces (rule 4); a fence-less doc soft-skips (rule 5 — cannot be drift-checked); a
+  // doc-less code-only archive FAILS CLOSED (unknown, loud — rule 6).
+  const vgateOpen = "<!-- VGATE-SHAPE-RULE"; // 01 fence opener — LOCAL const, sole source of truth for this test (probe AND parse extraction share it)
+  const { layout, docText } = probeGuardLayout(
+    vgateOpen,
     "../../skills/commit-workflow/workflow/01-preflight.md",
     "../../skills/commit-workflow/workflow/01-preflight.md",
     "skills/commit-workflow/workflow/01-preflight.md",
   );
+  if (layout === "deployed") { console.log(DRIFT_GUARD_SKIP_DEPLOYED); return; }
+  if (layout === "unknown") { console.warn(DRIFT_GUARD_UNKNOWN_WARN); ok(false, DRIFT_GUARD_UNKNOWN_FAIL); return; }
+  // (doc-null hard-fail arm kept verbatim below — layout "source" does NOT imply the doc
+  // exists: rule 1 (doc deleted in a git checkout) and rule 3 (CI + no sibling doc) both
+  // reach this arm — the ok(false) below is the fail-closed red for those states, not dead code)
   if (docText === null) {
     ok(false, "01-preflight.md unreachable from the agent-infra source tree — VGATE-SHAPE-RULE drift guard would pass vacuously; restore the doc or fix the resolution");
     return;
   }
 
   // Extract rows between the opener and closer comment lines.
-  const open = docText.indexOf("<!-- VGATE-SHAPE-RULE");
+  const open = docText.indexOf(vgateOpen);
   const close = docText.indexOf("<!-- /VGATE-SHAPE-RULE", open);
   ok(open !== -1, "01-preflight.md must contain the VGATE-SHAPE-RULE opener comment");
   ok(close !== -1 && close > open, "01-preflight.md must contain the VGATE-SHAPE-RULE closer comment");

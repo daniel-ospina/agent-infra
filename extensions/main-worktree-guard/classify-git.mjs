@@ -1267,15 +1267,66 @@ export function classifyGitCommandDetailed(command) {
     const legacyVerdict = out.verdict;
     const args = pushInv.args;
     const joined = `git push ${args.join(" ")}`;
-    const deleteIdx = args.findIndex((a) => a === "--delete" || a.startsWith("--delete="));
-    const colonTargets = args.filter((a) => /^:/.test(a));
-    if (deleteIdx !== -1 || colonTargets.length > 0 || legacyVerdict === "block:push-delete") {
+    // #443 clean-hub parity (mirrors the #439 disordered-hub closure): delete
+    // detection was exact-only (`--delete` / `:branch`), so the documented
+    // `-d` short form, merged no-arg short clusters containing `d` (`-dq`), and
+    // git's unambiguous long-option abbreviations (`--del`, `--dele`, `--delet`,
+    // `--de`) classified as plain pushes and skipped the #73
+    // sibling-checked-out-anywhere block. All of those spellings delete
+    // (probe-verified); `--d` is ambiguous with `--dry-run` and git REJECTS it
+    // (probe-verified rc 129) — not a delete, matching `_isPushDeleteFlagToken`.
+    // Value-slot aware: a delete-shaped token consumed as `-o`/`--push-option`'s
+    // VALUE (`git push origin -o -d feat/x` — the `-d` is -o's value, a normal
+    // push) must not count, and an empty-source colon swallowed as a value
+    // (`-qo :tag`) must not either. Same slot model the whole-command
+    // extractor uses, so the two #443 surfaces stay in parity.
+    const optSlots = _markOptionValueSlots(args);
+    const deleteIdx = args.findIndex((a, i) => !optSlots[i] && _isPushDeleteFlagToken(a));
+    const hasColonTargets = args.some((a, i) => !optSlots[i] && /^:/.test(a));
+    if (deleteIdx !== -1 || hasColonTargets || legacyVerdict === "block:push-delete") {
       out.isPushDelete = true;
       out.verdict = "block:push-delete";
-      out.pushTargets = [...(deleteIdx !== -1 ? args.slice(deleteIdx + 1) : []), ...colonTargets]
-        .filter((x) => !x.startsWith("-"))
+      // git treats the FIRST positional as the repository and every further
+      // positional as a delete refspec when a delete form is present
+      // (`git push --delete origin a b` deletes a AND b — probe-verified;
+      // `git push --delete origin a` likewise). A lone positional is kept as a
+      // target only when it is an empty-source `:branch` delete (implicit
+      // origin); a lone BARE positional makes git error ("--delete doesn't make
+      // sense without any refs") — the keep is a harmless over-capture that
+      // matches today's `git push --delete feat/x` classification.
+      const positionals = args.filter((x) => !x.startsWith("-"));
+      const rawTargets = positionals.length > 1 ? positionals.slice(1) : positionals;
+      out.pushTargets = rawTargets
         .map((x) => _stripQuotes(x).replace(/^:/, "").replace(/^refs\/heads\//, ""))
         .filter(Boolean);
+      // LATER-SEGMENT fold-in (#504): when NO delete form is present in this
+      // (first) push invocation yet the FROZEN raw legacy verdict is
+      // block:push-delete, the delete spelling lives in a LATER segment of a
+      // compound (`git push origin main && git push origin --delete b`). This
+      // invocation's positionals are ordinary PUSH refspecs, NOT delete
+      // targets — labeling them as such produces a phantom "main" that
+      // false-fires the #73 coordinated check in the full path (a regression
+      // vs origin/main's empty pushTargets). Fall back to the whole-command
+      // extractor, exactly as the degraded arm does, so the real target(s)
+      // across every later segment are attributed. NOTE — the extractor is
+      // string-matched, so this now shares the degraded arm's documented
+      // echo/comment over-match (a text that merely MENTIONS a complete
+      // `git push … --delete <target>` also populates targets; sibling-
+      // conditional safe-direction, consistent with the frozen --delete
+      // echo precedent). Parenthesized later segments (`(git push … -d c)`) are
+      // a tracked residual (token-level paren suffix).
+      if (deleteIdx === -1 && !hasColonTargets) {
+        out.pushTargets = extractPushDeleteBranch(String(command)) ?? [];
+      }
+      // KNOWN IMPRECISION (parity-preserving, safe direction): a push-option
+      // VALUE consumed by `-o`/`--push-option` that appears as a standalone arg
+      // (`git push origin -do draft feat/x` → git deletes only feat/x; `draft`
+      // is -o's value) over-captures into pushTargets (here ["draft",
+      // "feat/x"]). Identical imprecision predates #443 for `--delete` +
+      // `-o`, errs toward BLOCKING (never toward a bypass), and the phantom
+      // target only matters if a branch literally named after the option value
+      // is checked out in a sibling. Not value-parsed to stay in the #439/#443
+      // mirror scope.
     } else if (legacyVerdict === "allow" || legacyVerdict === "block:force-push") {
       out.verdict = "block:push";
       // git push [remote] [refspec...] — the FIRST positional is the REMOTE
@@ -1370,23 +1421,167 @@ export function isWorktreeCwd(cwd) {
 }
 
 /**
+ * #443 (clean-hub parity, mirrors #439): is this arg a `git push` delete
+ * spelling? git accepts — all probe-verified to delete remote branches:
+ *   - `-d` (the documented short form of `--delete`)
+ *   - merged no-arg short-flag clusters containing `d` (`-dq` = -d --quiet);
+ *     git merges only push's no-arg short alphabet (v q n u 4 6 d f — the #439
+ *     M4 set), so `-odraft`/`-uofoo` (attached option VALUES) are NOT clusters
+ *   - merged clusters where the arg-taking `-o` (push-option) follows the
+ *     delete short (`-do draft b` = -d -o draft b — git consumes the rest of
+ *     the token / next argv as -o's value; probe-verified to delete). A `d`
+ *     AFTER the first `o` is part of -o's VALUE, never an option.
+ *   - `--delete` and its unambiguous long-option PREFIX abbreviations
+ *     (`--de`, `--del`, `--dele`, `--delet`)
+ * `--d` is NOT a delete: it is ambiguous with `--dry-run` and git REJECTS it
+ * (rc 129, probe-verified) — it never deletes anything.
+ */
+
+/**
+ * Mark option-VALUE slots across a token array for push's arg-taking option.
+ * git's parse-options consumes the NEXT argv as the value of a standalone
+ * `-o`/`--push-option`, and of ANY merged no-arg short cluster terminated by
+ * `o` (`-do`, `-qo`, `-fo`, `-dqo` …; `-o` alone is the degenerate case) —
+ * probe-verified (`git push origin -d -qo msg b` deletes only b, and
+ * `git push origin -o -d feat/x` consumes the `-d` as -o's VALUE, so nothing
+ * is deleted). The consumed token must never be mistaken for a delete flag,
+ * an empty-source colon refspec, or a delete target. Inline attached values
+ * (`-doDraft`, `-odraft`, `--push-option=x`) carry their value in-token
+ * (chars trail the `o` → no match) — no slot. Consecutive arg-takers PAIR
+ * OFF (git parse-options never re-parses a consumed value as an option): in
+ * `-o -o -d b` the first `-o` consumes the second `-o`, so `-d` is a REAL
+ * delete flag — already-consumed slots are skipped in the scan. The
+ * valueSlot index is TRUE at the slot position (i+1), so callers check
+ * `valueSlot[i]` before treating token[i] as a flag/target.
+ * @param {string[]} tokens
+ * @returns {boolean[]}
+ */
+function _markOptionValueSlots(tokens) {
+  const valueSlot = new Array(tokens.length).fill(false);
+  for (let i = 0; i < tokens.length; i++) {
+    if (valueSlot[i]) continue; // already consumed as a value — never an option
+    const t = tokens[i];
+    const oTerminatedCluster = /^-[vqnu46df]*o$/.test(t);
+    if (t === "--push-option" || oTerminatedCluster) {
+      if (i + 1 < tokens.length) valueSlot[i + 1] = true; // value = next argv
+    }
+  }
+  return valueSlot;
+}
+
+function _isPushDeleteFlagToken(a) {
+  if (a === "-d" || a === "--delete" || a.startsWith("--delete=")) return true;
+  // `-dq`/`-qd`/`-df` … merged short clusters containing the delete short.
+  if (/^-[vqnu46df]{2,}$/.test(a) && a.includes("d")) return true;
+  // `-do`/`-dqo draft …` — the delete short merged BEFORE the arg-taking `-o`
+  // (only chars before the first `o` are parsed options; the rest is -o's
+  // value). `-odraft` never matches: there the `d` is inside -o's value.
+  if (/^-[vqnu46df]*d[vqnu46df]*o/.test(a)) return true;
+  // Unambiguous `--delete` prefix abbreviations (`--de`|`--del`|`--dele`|`--delet`).
+  if (/^--de(l(?:e(?:t)?)?)?$/.test(a)) return true;
+  return false;
+}
+
+/** Short-name a raw delete target token (`:refs/heads/feat/x` → `feat/x`). */
+function _cleanDeleteTarget(x) {
+  return x
+    .replace(/^["']|["']$/g, "")   // strip surrounding quotes
+    .replace(/^:+/, "")             // leading empty-source colon(s)
+    .replace(/^refs\/heads\//, "") // full ref
+    .replace(/^heads\//, "");       // git dst-inference (`:heads/main`)
+}
+
+/**
  * Extract the branch name from `git push [remote] --delete <branch>`.
  * Handles both short names ("feat/x") and full refs ("refs/heads/feat/x").
+ * #443: the legacy raw-string regex was exact-only (`--delete`/`:branch`), so
+ * `-d`/`--del`(-prefix) spellings returned null and the degradation-fallback
+ * #73 sibling-checked-out check never fired for them. Rewritten token-based to
+ * cover the full delete spelling family AND to stop false-positive captures of
+ * non-delete coloned refspecs (`git push origin main:feature` has a SOURCE so
+ * it is a normal push, not a delete — the empty-source form starts the token
+ * with `:`).
  * @param {string} command
  * @returns {string|null} branch name (short form) or null
  */
 export function extractPushDeleteBranch(command) {
   const c = String(command ?? "").trim();
-  // Match both --delete <branch> (preferred) and :branch (old-style).
-  // Branch names: alphanumeric + / - _ . only (no ; & |)
-  const re = /\bgit\s+push\b[^;&|]*(?:--delete\s+([^\s;&|]+)|:([^\s;&|]+)(?!\S))/g;
+  if (!/\bgit\s+push\b/.test(c)) return null;
+  // Compound commands carry several `git push` segments (`a && git push … ;
+  // git push …`) — detect deletes per segment, stopping at shell operators
+  // (the original regex's [^;&|]* contract).
   const branches = [];
-  let m;
-  while ((m = re.exec(c)) !== null) {
-    const raw = (m[1] || m[2]).replace(/^["']|["']$/g, ""); // strip quotes
-    branches.push(raw.replace(/^refs\/heads\//, ""));
+  const segRe = /\bgit\s+push\b([^;&|]*)/g;
+  let sm;
+  while ((sm = segRe.exec(c)) !== null) {
+    const tokens = sm[1].trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) continue;
+    // Arg-taking options consume a value (`-o draft`, `--push-option draft`,
+    // merged `-do draft` = -d -o draft; inline `-doDraft`/`--push-option=x`
+    // carry their value in-token). A consumed value is NOT a flag and NOT a
+    // delete target — without this, `-do draft old-feat` would capture the -o
+    // VALUE `draft` as the target and lose the real `old-feat` (probe-verified:
+    // git deletes only old-feat). Mark value slots so the scans below skip
+    // them. Mirrors git's parse-options short-flag merging.
+    const valueSlot = _markOptionValueSlots(tokens);
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (valueSlot[i]) continue; // consumed as an option VALUE — never a flag/target
+      // Shell quoting is stripped before git sees an arg, so detect flags and
+      // empty-source colons on the quote-stripped token (`':feat/x'` is a
+      // delete; a pre-#443 quote-aware extractor handled it, keep that).
+      const tq = t.replace(/^["']|["']$/g, "");
+      if (_isPushDeleteFlagToken(tq)) {
+        // git's positional model: when a delete flag is present and ≥2
+        // positionals follow it with none BEFORE it, the FIRST is the
+        // REPOSITORY (`git push --delete origin c` deletes c on origin —
+        // probe-verified; `git push --delete origin a b` deletes a AND b).
+        // When the repo precedes the flag (`git push origin --delete a b`)
+        // every following positional is a delete refspec. The extractor's
+        // documented single-target contract keeps the first real refspec, so
+        // a repo that TRAILS the flag is dropped. (A lone positional after
+        // the flag with no repo anywhere is git-invalid — kept as a harmless
+        // over-capture matching the original extractor.)
+        const before = [];
+        const following = [];
+        for (let j = 0; j < tokens.length; j++) {
+          if (j === i || tokens[j].startsWith("-") || valueSlot[j]) continue;
+          (j < i ? before : following).push(tokens[j]);
+        }
+        if (following.length === 0) continue; // no refspec after the flag → git errors, nothing deleted
+        const targetTok = following.length >= 2 && before.length === 0 ? following[1] : following[0];
+        branches.push(_cleanDeleteTarget(targetTok));
+      } else if (/^:/.test(tq)) {
+        // Empty-source colon refspec (`:feat/x`) = a delete. src:dst refspecs
+        // (`main:feature`) never start with `:` — they stay plain pushes.
+        branches.push(_cleanDeleteTarget(tq));
+      }
+    }
   }
-  return branches.length > 0 ? branches : null;
+  const out = branches.filter(Boolean);
+  // Dedupe: `-d :old/x` is counted by the flag path AND the colon path for
+  // the SAME refspec (git deletes it once). Distinct targets stay distinct.
+  const uniq = [...new Set(out)];
+  return uniq.length > 0 ? uniq : null;
+}
+
+/**
+ * Pure decision helper for the full-path compound-delete glue (#443 R6/R7):
+ * the detailed matcher describes only the FIRST push invocation, so a delete
+ * spelling in a LATER compound segment of the -d/--del family (which carries NO
+ * frozen legacy evidence) is invisible to its pushTargets. Given the matcher
+ * verdict for that first invocation and the raw command, return the whole-
+ * command delete targets a push-family verdict must additionally protect — or
+ * [] when the verdict is not push-family (block:push-delete already carries its
+ * targets via the fold-in, and non-push verdicts are unrelated). Kept pure and
+ * exported so the index.ts orchestration glue is unit-testable here.
+ * @param {string} verdict detailed matcher verdict for the first invocation
+ * @param {string} command raw command text
+ * @returns {string[]}
+ */
+export function wholeCommandDeleteTargets(verdict, command) {
+  if (verdict !== "block:push" && verdict !== "block:force-push") return [];
+  return extractPushDeleteBranch(command) ?? [];
 }
 
 /**
@@ -1668,6 +1863,12 @@ const HUB_READONLY_VERBS = new Set([
   "merge-one-file", "mergetool", "check-ref-format", "var", "hash-object",
   "count-objects", "verify-pack", "verify-commit", "verify-tag", "config",
   "reflog", "whatchanged", "cherry", "fsck",
+  // #444: check-ignore is a PURE QUERY (evaluates gitignore rules, writes
+  // nothing) — unknown-verb fail-closed previously false-blocked both the
+  // direct surface and hub-worktree.sh's `.worktrees/`-ignored check (the real
+  // hub-worktree.sh content must gate ALLOW once extractScriptPath resolves
+  // arg-taking scripts).
+  "check-ignore",
 ]);
 
 /** Mutating git verbs with NO sanctioned recovery form — always blocked. */
@@ -4365,19 +4566,38 @@ export function extractScriptPath(command) {
   if (i >= tokens.length) return null;
   const t = tokens[i];
   if (SHELL_INTERPRETERS.has(t)) {
-    // Round-19 (final gate P1): the script file is the LAST positional
-    // (non-flag, non-redirect) token before a boundary — `bash --rcfile decoy
-    // evil.sh`, `bash -O extglob evil.sh`, `bash < /dev/null -x evil.sh` all
-    // execute evil.sh (the old scan broke at the first flag-operand and gated
-    // the WRONG file — probe: evil.sh ran ungated). If no positional exists,
-    // a stdin redirect's operand IS the script (`bash < evil.sh`); `-c`/
-    // `--command` means an inline (return null — gated by the normal
-    // classifier); process substitution `<( … )` is an FD, not a file (null —
-    // _unverifiableGitContent fails closed on the content).
+    // (#444) The script operand is the FIRST non-flag, non-redirect positional
+    // after the interpreter — NOT the last. `bash script.sh <arg>...` hands
+    // the trailing tokens to the script as $1… (probe-verified against real
+    // bash), so the old last-positional rule resolved a trailing ARG (usually
+    // a non-file) and scriptGitVerdict never ran on the real script — the M4
+    // script-content closure (#1484 Slice E) was bypassed for argument-taking
+    // scripts (`bash hub-worktree.sh feat/x <repo>` gated <repo>). Round-19
+    // (final gate P1) semantics are preserved: `bash --rcfile decoy evil.sh`,
+    // `bash -O extglob evil.sh`, `bash < /dev/null -x evil.sh` all execute
+    // evil.sh — the FIRST positional IS evil.sh in each. Once the script
+    // operand is found the scan STOPS: later tokens are the script's own
+    // arguments, never parsed as bash flags.
+    //
+    // Stdin-program modes: `-s` (and any single-dash letter run CONTAINING s —
+    // bash parses -se/-es/-xs char-by-char) demotes every positional to
+    // $0/$1; the program then comes from stdin — a `< f` operand's file (f)
+    // or a heredoc body (#437 round-13 VGATE sub-case). `-c`/`--command` (and
+    // runs CONTAINING c — -ec/-sc/-cs; c consumes the next word as the
+    // command string) means an inline → return null (gated by the normal
+    // classifier). `--` ends option parsing: the NEXT operand is the script
+    // even when dash-leading (`bash -- x.sh -x aaa` → x.sh). Option operands:
+    // --rcfile/--init-file/-O/-o (space and `=`-attached forms) and the o/O
+    // run letters consume the following word. POSIX `+`-toggles mirror the
+    // letter runs (`bash +e evil.sh` runs evil.sh — +x/+e/+eu, bare `+`;
+    // +o/+O take an operand, +c is an inline, +s demotes like -s). Process
+    // substitution `<( … )` is an FD, not a file (null —
+    // _unverifiableGitContent fails closed).
     let j = i + 1;
-    let sawInline = false;
+    let sawInline = false;      // -c/--command → inline string (null)
+    let sawDashS = false;       // -s → positionals are $0/$1; program is stdin
+    let sawDoubleDash = false;  // -- → option parsing is over
     let stdinOperand = null;
-    let lastPositional = null;
     let sawProcessSub = false;
     while (j < tokens.length) {
       const n = tokens[j];
@@ -4388,31 +4608,49 @@ export function extractScriptPath(command) {
       if (n === "<(" || n.startsWith("<(")) { sawProcessSub = true; j++; continue; } // process substitution FD
       if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n)) {
         if (n === "<" || n === "<<" || n === "0<" || n === "0<<") {
-          stdinOperand = tokens[j + 1]; // the stdin file (script only if no positional follows)
+          stdinOperand = tokens[j + 1]; // the stdin file — the program only with -s, or without a script positional
         }
         j += 2;
         continue;
       }
       if (_isShellBoundary(n)) break;
-      if (n.startsWith("-")) {
-        // Round-20 (security P1): skip flag OPERANDS for operand-taking flags
-        // (`bash --rcfile decoy -c 'git commit'` broke at `decoy` and never
-        // walked the inline — probe committed to the hub). -c/--command handled
-        // above; --rcfile/--init-file/-O/-o take an operand; simple flags (-x,
-        // -e, -i) don't — conservatively skip the next token for all but known
-        // operand-less flags.
-        if (n === "-c" || n === "--command") { sawInline = true; j++; continue; }
-        j++;
-        if (n === "--rcfile" || n === "--init-file" || n === "-O" || n === "-o") j++;
+      if (sawDoubleDash) return n; // after `--` ANY operand is the script (dash-leading too)
+      if (n === "--") { sawDoubleDash = true; j++; continue; }
+      if (n === "-c" || n === "--command" || n.startsWith("--command=")) {
+        sawInline = true;
+        j++; // the command string (next word / attached value) is never a file
         continue;
       }
-      lastPositional = n;
-      j++;
+      if (n === "--rcfile" || n === "--init-file") { j += 2; continue; } // space-form operand
+      if (n.startsWith("--rcfile=") || n.startsWith("--init-file=")) { j++; continue; } // attached value
+      if (/^[+-][a-zA-Z]+$/.test(n)) {
+        // single-dash flag/letter-run (plus the POSIX `+` toggle twin: bash
+        // +e/+x/+eu x.sh runs x.sh; +o/+O take an operand, +c is an inline
+        // command, +s demotes like -s) — bash parses the run char-by-char:
+        // c → inline command string (consumes the next word) → null; o/O →
+        // the option value is the next word; s → stdin-program mode; every
+        // other letter is an operand-less flag. Probes: -ec/-sc/-cs / +c run
+        // the payload inline; -se/-es/-xs / +s set stdin mode; -so posix /
+        // -sO extglob consume posix/extglob AND set stdin mode.
+        const run = n.slice(1);
+        if (run.includes("c")) { sawInline = true; j++; continue; }
+        if (run.includes("o") || run.includes("O")) j++; // consume the operand word
+        if (run.includes("s")) sawDashS = true;
+        j++;
+        continue;
+      }
+      if (n.startsWith("-") || n === "+") { j++; continue; } // other operand-less -flag/--option / bare + toggle
+      // A non-flag, non-redirect operand:
+      if (sawInline) { j++; continue; } // -c: $0/$1 args — never a script file
+      if (sawDashS) { j++; continue; }  // -s: $0/$1 — the program is stdin (redirect seen above)
+      return n;                         // THE script — later tokens are its args ($1…)
     }
     if (sawInline) return null; // `-c 'inline'` — gated by the normal classifier
     if (sawProcessSub) return null; // `bash <(echo 'git …')` — FD, not a file (fail-closed via _unverifiableGitContent)
-    if (lastPositional !== null) return lastPositional; // the script ARGUMENT (last positional)
-    return stdinOperand && !stdinOperand.startsWith("-") ? stdinOperand : null; // the stdin file IS the script
+    // No script positional: a stdin redirect's operand IS the program —
+    // `bash < evil.sh`, and with -s the ONLY program source (`bash -s < f
+    // arg1` → f; arg1 is $1, #437 round-13 VGATE sub-case).
+    return stdinOperand && !stdinOperand.startsWith("-") ? stdinOperand : null;
   }
   if (t === ".") { // `. script`
     const next = tokens[i + 1];

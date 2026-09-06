@@ -4,9 +4,10 @@
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
 import { resolve, dirname, relative, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -185,12 +186,41 @@ function expectBranches(command, expectedArray) {
 expectBranches("git push origin --delete feat/x", ["feat/x"]);
 expectBranches("git push --delete feat/x", ["feat/x"]);
 expectBranches("git push origin --delete refs/heads/feat/x", ["feat/x"]);
-expectBranches("git push --delete chore/old-branch origin", ["chore/old-branch"]);
+// Flag BEFORE the remote: git treats the first positional as the REPOSITORY
+// when ≥2 positionals follow the flag (`--delete origin c` deletes c on
+// origin — probe-verified). The first following positional is dropped.
+expectBranches("git push --delete origin c", ["c"]);
+expectBranches("git push origin main && git push --delete origin c", ["c"]); // later-segment flag-before-remote
+expectBranches("git push --delete chore/old-branch origin", ["origin"]); // git-invalid (chore/old-branch is not a repo) — repo-drop still applied
+expectBranches("git push origin --delete a b", ["a"]); // repo precedes flag — a and b are BOTH refspecs; single-target contract keeps a
 expectBranches('git push origin --delete "feat/x"', ["feat/x"]);
 expectBranches("git push origin --delete 'feat/x'", ["feat/x"]);
 expectBranches("git push origin :feat/x", ["feat/x"]);
 expectBranches("git push origin :refs/heads/feat/x", ["feat/x"]);
 expectBranches("git push origin --delete feat/x; git push origin --delete feat/y", ["feat/x", "feat/y"]);
+// #443 clean-hub parity: the raw extractor covers the -d/--del spelling family
+// (feeds the degradation-fallback #73 coordinated-delete check).
+expectBranches("git push origin -d feat/x", ["feat/x"]);
+expectBranches("git push origin --del feat/x", ["feat/x"]);
+expectBranches("git push origin -dq feat/x", ["feat/x"]);
+expectBranches("git push origin -d refs/heads/feat/x", ["feat/x"]);
+expectBranches("git push origin --delete feat/x; git push origin -d feat/y", ["feat/x", "feat/y"]);
+expectBranches("git push origin main && git push origin -d old-feat", ["old-feat"]); // delete in a LATER push segment
+expectBranches("git push origin -do draft feat/x", ["feat/x"]); // -do draft = -d -o draft — value skipped
+expectBranches("git push origin -o draft -d feat/x", ["feat/x"]); // standalone -o value skipped
+expectBranches("git push origin -d -qo draft feat/x", ["feat/x"]); // d-less cluster ending in -o still consumes its value
+expectBranches("git push origin ':feat/x'", ["feat/x"]); // quoted empty-source colon = a delete (quote-aware)
+expectBranches("git push origin -qo :tag feat/x", null); // -o consumes :tag as its VALUE — no delete refspec
+// -o value that looks like a flag is consumed, never a delete:
+expectBranches("git push origin -o -d feat/x", null);
+// Consecutive arg-takers pair off → trailing -d is a REAL delete:
+expectBranches("git push origin -o -o -d feat/x", ["feat/x"]);
+expectBranches("git push origin -o -o -o -d feat/x", null); // odd chain consumes -d
+expectBranches("git push origin -d", null); // no target — invalid in git
+// Non-delete coloned refspecs (src:dst) are NOT deletes — never extracted.
+expectBranches("git push origin main:feature", null);
+expectBranches("git push origin HEAD:refs/heads/feat/x", null);
+expectBranches("git push origin --d feat/x", null); // ambiguous --d → git rejects
 expectBranches("git push origin main", null);
 expectBranches("git push", null);
 expectBranches("", null);
@@ -396,6 +426,60 @@ dexpect("push --force-if-includes → NOT force", `git push --force-if-includes 
 const del2 = classifyGitCommandDetailed(`git push origin --delete feat/x other`);
 dexpect("push --delete multi → isPushDelete + all targets", `git push origin --delete feat/x other`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x", "other"] });
 dexpect("push --delete colon form", `git push origin :feat/x`, { verdict: "block:push-delete", pushTargets: ["feat/x"] });
+// #443 clean-hub parity: git's other push-delete spellings (probe-verified to
+// delete) must classify block:push-delete so the #73 sibling-checked-out
+// coordinated block fires exactly as for --delete/:branch.
+dexpect("push -d short → isPushDelete + targets", `git push origin -d feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push -d flag-first → targets (first positional = the remote)", `git push -d origin feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push -dq cluster → delete", `git push origin -dq feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push -d refs target → short name", `git push origin -d refs/heads/feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push --del abbrev → delete", `git push origin --del feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push --dele abbrev → delete", `git push origin --dele feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push --delet abbrev → delete", `git push origin --delet feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push --de abbrev → delete", `git push origin --de feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+// Merged cluster where the arg-taking -o (push-option) FOLLOWS the delete
+// short (`-do draft b` = -d -o draft b — probe-verified to delete b).
+dexpect("push -do push-option cluster → delete", `git push origin -do draft feat/x`, { verdict: "block:push-delete", isPushDelete: true });
+// -odraft: the o comes FIRST so d is part of -o's VALUE, not an option — a
+// normal push (git parses no delete).
+dexpect("push -odraft (o first) → NOT delete", `git push origin -odraft feat/x`, { verdict: "block:push", isPushDelete: false });
+// A delete-shaped token consumed as `-o`/`--push-option`'s VALUE is a normal
+// push, never a delete (probe-verified: git deletes nothing) — the matcher is
+// value-slot aware, mirroring the whole-command extractor.
+dexpect("push -o consumes -d → normal push", `git push origin -o -d feat/x`, { verdict: "block:push", isPushDelete: false });
+dexpect("push -qo consumes -d → normal push", `git push origin -qo -d feat/x`, { verdict: "block:push", isPushDelete: false });
+dexpect("push --push-option consumes -d → normal push", `git push origin --push-option -d feat/x`, { verdict: "block:push", isPushDelete: false });
+// Consecutive arg-takers PAIR OFF: the first -o consumes the second as its
+// value, so a trailing -d is a REAL delete (probe-verified remote delete).
+dexpect("push -o -o pairs → trailing -d deletes", `git push origin -o -o -d feat/x`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["feat/x"] });
+dexpect("push -qo -o pairs → trailing -d deletes", `git push origin -qo -o -d feat/x`, { verdict: "block:push-delete", isPushDelete: true });
+dexpect("push -o -o -o -d → odd chain consumes -d (no delete)", `git push origin -o -o -o -d feat/x`, { verdict: "block:push", isPushDelete: false });
+// Later-segment delete in a compound: the FIRST invocation's positionals are
+// ordinary push refspecs, never delete targets (#504 fold-in fallback).
+dexpect("compound later-segment --delete → real target only", `git push origin main && git push origin --delete b`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
+dexpect("compound later-segment colon delete → real target only", `git push origin feat/x && git push origin :b`, { verdict: "block:push-delete", isPushDelete: true, pushTargets: ["b"] });
+// wholeCommandDeleteTargets — pure seam consumed by the index.ts full-path glue
+// (R6/R7): a push-family verdict must additionally protect later-segment
+// -d/--del-family deletes (invisible to the per-first-invocation matcher).
+function wcdt(name, verdict, command, expectedArray) {
+  const got = wholeCommandDeleteTargets(verdict, command);
+  const ok = JSON.stringify(got) === JSON.stringify(expectedArray);
+  console.log(`${ok ? "✅" : "❌"} wcdt ${name}: ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(expectedArray)})`}`);
+  ok ? pass++ : fail++;
+}
+wcdt("later-segment -d under block:push", "block:push", "git push origin main && git push origin -d b", ["b"]);
+wcdt("later-segment --del under block:push", "block:push", "git push origin main && git push origin --del b", ["b"]);
+wcdt("later-segment -d under block:force-push", "block:force-push", "git push -f origin main && git push origin -d b", ["b"]);
+wcdt("plain push → none", "block:push", "git push origin main", []);
+wcdt("src:dst refspec → none", "block:push", "git push origin main && git push origin main:feature", []);
+wcdt("push-delete verdict → none (fold-in already carries targets)", "block:push-delete", "git push origin main && git push origin --delete b", []);
+wcdt("allow verdict → none", "allow", "git push origin main && git push origin -d b", []);
+wcdt("unrelated destructive verdict → none", "block:reset", "git push origin -d b", []);
+// --d is AMBIGUOUS with --dry-run — git rejects it (rc 129, probe-verified);
+// it never deletes, so it stays a plain block:push (never block:push-delete).
+dexpect("push --d ambiguous → NOT delete (git rejects)", `git push origin --d feat/x`, { verdict: "block:push", isPushDelete: false });
+// --dry-run stays a normal push (no false delete).
+dexpect("push --dry-run NOT delete", `git push origin --dry-run feat/x`, { verdict: "block:push", isPushDelete: false });
 
 // sync-source extraction (ownership allowance)
 dexpect("pull --rebase origin main → syncSource main", `git -c commit.gpgsign=false pull --rebase origin main`, { verdict: "block:pull", syncSource: "main" });
@@ -739,6 +823,38 @@ scriptPath("git add ./foo → null", `git add ./foo`, null);
 scriptPath("python3 → null", `python3 x.py`, null);
 scriptPath("plain command → null", `ls -la`, null);
 scriptPath("empty → null", "", null);
+// #444: the script operand is the FIRST non-flag positional after the
+// interpreter — trailing tokens are the SCRIPT's own args (bash $1…). The old
+// last-positional rule resolved a trailing arg (a non-file) and skipped content
+// gating for argument-taking scripts.
+scriptPath("#444 arg-taking script → script file", `bash script.sh aaa bbb`, "script.sh");
+scriptPath("#444 hub-worktree.sh salvage → script file", `bash hub-worktree.sh salvage feat/x /Users/me/repo`, "hub-worktree.sh");
+scriptPath("#444 flags-then-args → script file", `bash -x script.sh aaa bbb`, "script.sh");
+scriptPath("#444 source args → script file", `source x.sh aaa bbb`, "x.sh");
+scriptPath("#444 dot args → script file", `. x.sh aaa bbb`, "x.sh");
+// #444 stdin-program modes: -s demotes every positional to $0/$1 — the stdin
+// redirect's file IS the program (VGATE sub-case); single-dash letter runs
+// CONTAINING s (-se/-es/-xs) behave as -s.
+scriptPath("#444 -s stdin+arg → stdin file", `bash -s < f arg1`, "f");
+scriptPath("#444 -se stdin+arg → stdin file", `bash -se < f arg1`, "f");
+scriptPath("#444 -s arg (no stdin file) → null", `bash -s x.sh aaa`, null);
+scriptPath("#444 -s arg then stdin → stdin file", `bash -s arg1 < f`, "f");
+// #444: -- ends option parsing — the NEXT operand is the script even when it
+// looks like a flag (`bash -- x.sh -x aaa` runs x.sh with args -x aaa).
+scriptPath("#444 -- then script+flags → script file", `bash -- x.sh -x aaa`, "x.sh");
+scriptPath("#444 -c payload + trailing args → null", `bash -c "echo hi" x.sh aaa`, null);
+// #444 review P1 (regression + closure): POSIX `+`-toggle option words must
+// be skipped, not resolved as the script — real bash runs x.sh for
+// `bash +e/+x/+eu x.sh` and bare `bash + x.sh` (the old last-positional rule
+// gated the arg-less `bash +x evil.sh`; the first-positional rewrite must
+// preserve that). +o/+O take an operand, +c is an inline, +s demotes like -s.
+scriptPath("#444 +toggle → script file", `bash +x evil.sh`, "evil.sh");
+scriptPath("#444 +toggle arg-taking → script file", `bash +x script.sh aaa bbb`, "script.sh");
+scriptPath("#444 bare + → script file", `bash + evil.sh`, "evil.sh");
+scriptPath("#444 +o operand → script file", `bash +o emacs evil.sh`, "evil.sh");
+scriptPath("#444 +c inline + args → null", `bash +c "echo hi" x.sh aaa`, null);
+scriptPath("#444 +s stdin+arg → stdin file", `bash +s < f arg1`, "f");
+scriptPath("#444 +run interleaved with -flags → script file", `bash -e +x x.sh aaa`, "x.sh");
 
 // scriptGitVerdict: a script's git content is gated by the SAME allowlist —
 // recovery scripts (hub-worktree.sh: fetch + worktree add) keep working, the
@@ -779,6 +895,39 @@ try {
 } finally {
   if (scriptTmp) {
     try { execSync(`rm -rf "${scriptTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+}
+
+// #444 real-file probe: scriptGitVerdict on the ACTUAL scripts/checkout-hygiene/
+// hub-worktree.sh — once extractScriptPath resolves arg-taking invocations
+// (`bash hub-worktree.sh salvage feat/x <repo>`), this file's OWN content is
+// gated, so its real surface must match the sanctioned verb list: create =
+// fetch + worktree add (recovery) + check-ignore warning (readonly); salvage =
+// + status/show/ls-files redirects + the WT capture commit/push, which are
+// DELEGATED to the internal hub-worktree-salvage-commit.sh sub-script (the
+// static walker cannot prove a runtime $WT_PATH is worktree-local). The pin
+// resolves the CURRENT checkout's copy (the worktree under test), falling back
+// to the repo-root cwd / the main checkout so the suite can run anywhere.
+{
+  const candidates = [
+    fileURLToPath(new URL("../../scripts/checkout-hygiene/hub-worktree.sh", import.meta.url)),
+    resolve(PROJECT_CWD, "scripts/checkout-hygiene/hub-worktree.sh"),
+    resolve(MAIN, "scripts/checkout-hygiene/hub-worktree.sh"),
+  ];
+  const realHubWorktreeSh = candidates.find((p) => existsSync(p));
+  if (!realHubWorktreeSh) {
+    console.log("⏭️  real-file probe skipped — no scripts/checkout-hygiene/hub-worktree.sh in this checkout");
+  } else {
+    const verdict = scriptGitVerdict(realHubWorktreeSh, "main", MAIN, MAIN);
+    const argTakingResolves = extractScriptPath(`bash hub-worktree.sh salvage feat/x ${resolve(MAIN, "some/repo")}`) === "hub-worktree.sh";
+    const verdictOk = verdict === "allow";
+    console.log(`${verdictOk && argTakingResolves ? "✅" : "❌"} #444 real hub-worktree.sh verdict → allow (content surface is sanctioned; arg-taking invocation resolves the file)`);
+    if (!verdictOk) console.log(`  verdict=${verdict} file=${realHubWorktreeSh}`);
+    if (!argTakingResolves) console.log(`  extractScriptPath resolved wrong file`);
+    (verdictOk && argTakingResolves) ? pass++ : fail++;
+    // check-ignore must classify read-only (hub-worktree.sh's .worktrees warn).
+    const ci = isHubRecoveryInvocation("check-ignore", ["-q", ".worktrees"], "main");
+    expectBool("#444 check-ignore → readonly (hub-worktree.sh surface)", ci === "readonly", true);
   }
 }
 
@@ -1555,6 +1704,33 @@ try {
   expectBool("B38: digit-less fd-dup / stdin+arg / spawner-prefix → the script path (round-17)", extractScriptPath(`bash <&0 /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash <&- /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /dev/null /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`exec bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`env bash /tmp/evil.sh`) === "/tmp/evil.sh", true);
   expectBool("B39: spawner-flag → the interpreter's script path (round-18)", extractScriptPath(`env -i bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`sudo -u root bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`timeout 5 bash /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /dev/null -c "git commit"`) === null, true);
   expectBool("B40: flag-with-operand + stdin-flag → the script path (round-19)", extractScriptPath(`bash < /dev/null -x /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash --rcfile /tmp/decoy.sh /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash -O extglob /tmp/evil.sh`) === "/tmp/evil.sh" && extractScriptPath(`bash < /tmp/evil.sh`) === "/tmp/evil.sh", true);
+  // #444 (arg-taking closure): the script operand is the FIRST positional —
+  // trailing tokens are the script's own args. Malicious content in an
+  // arg-taking script must now BLOCK (the pre-fix last-positional rule gated a
+  // non-file arg → fail-open); sanctioned recovery content still passes.
+  expectBool("B42: arg-taking invocation → the script file (#444)", (() => {
+    const p = mkS("arg-evil.sh", `git reset --hard\n`);
+    return extractScriptPath(`bash ${p} feat/x ${hubR}`) === p && extractScriptPath(`bash hub-worktree.sh feat/x ${hubR}`) === "hub-worktree.sh" && extractScriptPath(`bash /tmp/evil.sh aaa bbb`) === "/tmp/evil.sh";
+  })(), true);
+  expectBool("B43: -s stdin file + positional → the stdin file (#444 VGATE sub-case)", (() => {
+    const p = mkS("stdin-arg.sh", `git reset --hard\n`);
+    return extractScriptPath(`bash -s < ${p} arg1`) === p && extractScriptPath(`bash -se < ${p} arg1`) === p;
+  })(), true);
+  expectBool("B44: arg-taking MALICIOUS script content → block (#444 backdoor closure)", (() => {
+    const p = mkS("arg-evil2.sh", `git reset --hard\ngit commit -m x\n`);
+    return extractScriptPath(`bash ${p} feat/x ${hubR}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "block";
+  })(), true);
+  expectBool("B45: arg-taking SANCTIONED recovery script content → allow (#444 no regression)", (() => {
+    const p = mkS("arg-rec.sh", `git fetch origin main\ngit worktree add ../.worktrees/x -b feat/x origin/main\n`);
+    return extractScriptPath(`bash ${p} feat/x ${hubR}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "allow";
+  })(), true);
+  // #444 review P1 closure: POSIX `+`-toggle words (`bash +x evil.sh`) must
+  // resolve the script (real bash runs evil.sh), NOT the toggle token — the
+  // arg-less form was gated pre-PR and must stay gated.
+  expectBool("B46: +-toggle arg-taking MALICIOUS content → block (#444 P1 closure)", (() => {
+    const p = mkS("arg-plus.sh", `git reset --hard\n`);
+    return extractScriptPath(`bash +x ${p} feat/x ${hubR}`) === p && extractScriptPath(`bash +e ${p}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "block";
+  })(), true);
   expectBool("B41: script checkout/switch main-protection (round-20)", (() => {
     const mk = (c) => { const p = `${m4Tmp}/s${Date.now()}${Math.random().toString(36).slice(2)}.sh`; writeFileSync(p, c); return p; };
     return scriptGitVerdict(mk("git checkout main\n"), "hub/off", wtR, hubR) === "block" &&
