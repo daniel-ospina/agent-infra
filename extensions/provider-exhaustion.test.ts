@@ -468,7 +468,15 @@ test("banner accuracy (round-4 P2-1): hop-own drain says 'drained its own credit
     ok(drainBanner!.title.includes("Hop provider drained"), "title names the hop-own cause");
     ok(drainBanner!.body.includes("drained its own credits"), "body explains the independent-account drain");
     ok(drainBanner!.body.includes("deepseek/deepseek-v4-flash") || drainBanner!.body.includes("deepseek-v4-flash"), "body names the returning-to primary");
-    ok(!banners.some((b) => b.title.includes("balance poller restores")), "never claims the poller is the restore path for a hop-own drain");
+    // round-5 P2-2: scan TITLE+BODY — poller wording lives in banner bodies
+    // ("the balance poller restores the primary on verified funds", "the
+    // balance poller is the restore path"), never in titles. A hop-own drain
+    // is an independent-account event the poller never monitors: its banners
+    // must be poller-free end to end.
+    ok(
+      !banners.some((b) => `${b.title} ${b.body}`.includes("poller")),
+      "hop-own drain banners never attribute the restore to the balance poller",
+    );
   } finally {
     restoreEnv();
     cleanup();
@@ -481,20 +489,25 @@ test("banner accuracy (round-4 P2-1): genuine root drain + poller clear restores
   try {
     const pi = makeFakePi();
     extension(pi as any);
-    // hop-own drain first (session on openrouter, healthy root) → lastDrain hop-own
+    // 1) hop-own drain first (session on openrouter, healthy root) → lastDrain hop-own
     await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
-    const afterHopOwn = banners.length;
-    // genuine ROOT drain: session (now restored to the primary) exhausts on deepseek
-    // → lastDrain must RESET to kind:root
+    ok(banners.some((b) => b.title.startsWith("Hop provider drained")), "step 1: hop-own drain banner");
+    // 2) genuine ROOT drain on the family primary — lastDrain must RESET to
+    //    kind:root. NOTE (round-5 P2-1): this does NOT chain-hop to openrouter:
+    //    openrouter's own record from step 1 (TTL) excludes it from hop
+    //    candidates, so the family terminalizes ("All failover legs
+    //    unavailable") — the hop-own record self-shadows until it self-heals.
+    const switchesAfterHopOwn = pi.setModelCalls.length;
     await pi.emit("message_end", { message: canonical402 }, ctx("tui", modelObj("deepseek", "deepseek-v4-flash")));
-    // chain hop happened (root drained → openrouter); the poller then clears the root
+    equal(pi.setModelCalls.length, switchesAfterHopOwn, "root drain does not switch onto the shadowed openrouter hop leg");
+    ok(banners.some((b) => b.title.includes("All failover legs unavailable")), "root drain terminalizes while the hop leg is shadowed");
+    // 3) the poller clears the root → next turn on the hop leg restores to the
+    //    primary with the ROOT wording (lastDrain was reset in step 2)
     clearExhaustion("deepseek", { env });
-    // next turn on the openrouter hop leg → restore fires with the ROOT wording
     await pi.emit("turn_start", { turnIndex: 1 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
-    const restore = banners.find((b) => b.title.includes("Provider balance restored") || b.title.includes("Returning to the primary"));
-    ok(restore, "restore banner fired after the root-clear");
-    ok(restore!.title.includes("Provider balance restored"), `genuine root-clear restore says 'Provider balance restored' (got: ${restore!.title})`);
-    ok(!restore!.body.includes("drained its own credits"), "hop-own wording NOT reused for a genuine root restore");
+    const restore = banners.find((b) => b.title.includes("Provider balance restored"));
+    ok(restore, `restore banner fired after the root-clear (got: ${banners.map((b) => b.title).join(" | ")})`);
+    ok(restore!.body.includes("returning to the primary") && !restore!.body.includes("drained its own credits"), "hop-own wording NOT reused for a genuine root restore");
   } finally {
     restoreEnv();
     cleanup();
