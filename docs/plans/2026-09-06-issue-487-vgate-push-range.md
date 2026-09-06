@@ -276,3 +276,11 @@ Placement invariants (verify at implementation): the edit sits AFTER the #472 me
 Exit conditions met: last reviewer response "NO ISSUES FOUND" verbatim; cycle 1 issues → 4 re-review cycles; cycle log posted (this table).
 
 <!-- plan-review: PASS 2026-09-06 — 5 cycles, fresh reviewers each cycle, convergence on cycle 5 ("NO ISSUES FOUND"). Complexity: standard-tier parallel review. Gate: plan is APPROVED for execution (Tasks 1-5). -->
+
+## Post-plan fold-ins (code-review cycles landed after plan approval — durable record)
+
+- **Scenario 57 (hostile git-state refs regression pin)** — added in the review fixer loop. e2e: a metachar checked-out BRANCH name and a hostile config `branch.<cur>.remote` VALUE (both legal git state carrying `;`/`$` payloads) must fall back to the staged block with NO shell side-effect. Markers retargeted to the ACTUAL payload landing files (config-key sink completes `pwned57a.remote`; refs/remotes/… probe lands `pwned57b/main`) and empirically verified to red when either guard is deleted.
+- **Injection guards (code-review cycle-1 P1, commit 6b807a5)** — `resolvePushRangeFiles` validates the two GIT-STATE-DERIVED inputs before execSync interpolation: checked-out branch name (`symbolic-ref --short HEAD`) against PUSH_REFNAME, config remote VALUE against the shared PUSH_REMOTE_NAME. Rationale: execSync runs /bin/sh -c (no shell:false anywhere); git refnames legally allow shell metachars. Failure → null → tier C.
+- **Order-independent bare-mixing rule (commit 712df6b)** — `parsePushRefSpecs` returns unmappable when `bare && refspecs.length > 0` at the end (a bare-first command previously SILENTLY DROPPED a later explicit refspec — under-scope). Unit-pinned both orderings.
+- **Guard strictness residuals (accepted, tier C)** — hierarchical config remote names (`org/team`) and non-ASCII branch names fail the whitelists → staged check (fail-closed, pre-#487 status quo; neither carries shell metachars but the conservative whitelist is deliberate).
+- **Scenario 50 negative discriminator** — the plan's "assert no `delete_push_no_content` skip" audit read shipped in the fixer loop (distinguishes a tier-A range allow from a false-green delete-short-circuit bypass).

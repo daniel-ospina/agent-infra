@@ -1059,12 +1059,13 @@ export function commitSweepClass(command: string): CommitSweepClass {
 
 // ── #487 — content-push RANGE scoping (T1: a content push verifies the pushed
 // range, never the whole index) ───────────────────────
-// Pure layer: classifier → tier resolver → argv builder (Task 3 bodies;
-// Task 2 stubs below RED the unit pins before the real implementations land).
+// Pure layer: classifier → tier resolver → argv builder (present state; the
+// TDD stub round that RED-pinned the unit sections is long landed).
 // Mirror of the evaluateMergeScope pure-decision + e2e-orchestration split:
 // shape/tier tables are unit-tested subprocess-free; the I/O orchestrator
-// resolvePushRangeFiles (Task 4) probes the repo and is e2e-only (same
-// no-unit-import choice as resolveMergeScope).
+// resolvePushRangeFiles probes the repo and is e2e-only (same
+// no-unit-import choice as resolveMergeScope). Design record + accepted
+// residuals: docs/plans/2026-09-06-issue-487-vgate-push-range.md.
 //
 // FAIL-CLOSED CONTRACT (whole command): ANY unmappable shape (tag push,
 // --all/--tags/--mirror, wrapper push, URL remote, delete+content mix, any
@@ -1357,6 +1358,9 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
   if (allFiles.size === 0) {
     // Up-to-date push ships nothing — audited INSIDE the resolver so the
     // caller's shared silent empty-allow never hides the range decision.
+    // Note: with multi-refspec commands the tier payload is first-A-wins
+    // (mixed A+B empty ranges label "A") — cosmetic audit metadata only; the
+    // allow + audit reason are identical either way (cycle-4 P2).
     // ⛔ Trust boundary (security review P2, documented): tier A reads LOCAL
     // remote-tracking refs — same-user-writable repo state (git update-ref is
     // not a gated verb) that can steer an empty range → audited allow. The

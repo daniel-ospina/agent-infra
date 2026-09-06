@@ -2255,12 +2255,15 @@ async function main() {
     // Tier-A base: origin/main at the ANCESTOR base commit.
     git(repo, `update-ref refs/remotes/origin/main ${baseSha}`);
     await fire("session_start", {});
+    const auditBefore50 = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "delete_push_no_content").length;
     const push = await fire("tool_call", {
       type: "tool_call", toolName: "bash",
       input: { command: "git push origin main", cwd: repo },
     });
     equal(push, undefined,
       "50: push of ALREADY-VERIFIED committed HEAD over parked WIP must be ALLOWED post-fix (tier A range [content50.ts]); RED pre-fix: whole-index staged scope [wip50.ts] blocks");
+    equal(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "delete_push_no_content").length, auditBefore50,
+      "50: the allow must NOT ride the delete-push short-circuit (no delete_push_no_content skip — the plan-pinned negative discriminator between a tier-A range allow and a false-green delete bypass)");
     // The push blessed NOTHING: committing the still-parked WIP still blocks.
     const commit = await fire("tool_call", {
       type: "tool_call", toolName: "bash",
