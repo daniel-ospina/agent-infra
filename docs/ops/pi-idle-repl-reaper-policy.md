@@ -178,10 +178,15 @@ carries `REAP_DRY_RUN=0` (armed). Threshold override: `--idle-hours N` /
   when mode resolves to dry-run — keep best-effort logging since their
   verdict surfaces are stdout).
 
-- **Separator-byte fail-closed (round 4):** store-derived values strip the
-  0x1f unit separator (esc), and a deciding file that still carries it is
-  SETTLE-SKIPped (never signaled — what cannot be atomically re-probed is
-  never killed).
+- **Framing-byte fail-closed (round 4):** the reaper's internal framing
+  bytes (tab, newline, the `|` cand-row delimiter, and the 0x1f settle
+  tie-separator) are all APFS-legal in names. `esc()` strips them from
+  store-derived values; a matched record whose REAL on-disk session file
+  still carries a framing byte (surfaced by the find fallback, not the
+  store) abstains at classify — no-jsonl-proof, never eligible, never
+  signaled. Deciding-file re-probe failure at settle (deleted/truncated/
+  undatable since classify) suppresses the kill — what cannot be
+  re-verified is never signaled.
 
 ## Limitations + residuals
 

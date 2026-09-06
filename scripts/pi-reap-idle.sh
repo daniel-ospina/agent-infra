@@ -281,9 +281,12 @@ rows = []
 def esc(v):
     if v is None:
         return ""
-    # 0x1f (the settle tie-separator byte) is legal in APFS names — strip it
-    # from store-derived values so no deciding path can carry the separator.
-    return str(v).replace("\t", " ").replace("\n", " ").replace("\x1f", " ")
+    # The reaper's internal framing bytes (\t \n, the '|' cand-row
+    # delimiter, and 0x1f the settle tie-separator) are all APFS-legal in
+    # names — strip them from store-derived values. Paths that STILL carry a
+    # framing byte after this (resolved from real on-disk names by the find
+    # fallback, never via the store) are abstained at classify below.
+    return str(v).replace("\t", " ").replace("\n", " ").replace("|", " ").replace("\x1f", " ")
 for sid, rec in data.items():
     if not isinstance(rec, dict) or rec.get("pid") is None:
         continue
@@ -496,15 +499,23 @@ classify_candidates() {
             rcwd="$(printf '%s' "$rec" | awk -F'\t' '{print $7}')"
             rf="$(session_file_for "$rsid" "$rcwd")"
             if [ -z "$rf" ] || [ ! -s "$rf" ]; then abstain=$((abstain+1)); continue; fi
+            # framing byte in the REAL on-disk path (esc neutralizes store
+            # values; the find fallback can surface a raw name): a '|' would
+            # shift the cand row, a 0x1f would shred the settle split — such
+            # a file can never round-trip the pipeline, so abstain.
+            case "$rf" in
+                *'|'*|*"$(printf '\037')"*)
+                    abstain=$((abstain+1)); continue ;;
+            esac
             le="$(jsonl_epoch_for "$rf")"
             if [ -z "$le" ]; then abstain=$((abstain+1)); continue; fi
             vote=$((vote+1))
             # sid/sfile track the MAX-epoch (age-setting) record — settle-3
             # re-probes exactly the file(s) that decided eligibility. TIED
-            # equal-max twins are unioned (\x1f unit-separator joined — the
-            # separator never appears in session-file paths, unlike ':') so a
-            # resumed twin is never invisible to the settle gate
-            # (arbitrary-twin re-probe).
+            # equal-max twins are unioned (\x1f unit-separator joined — only
+            # clean paths reach the union; framing-byte paths abstained above,
+            # so 0x1f is unambiguous) so a resumed twin is never invisible to
+            # the settle gate (arbitrary-twin re-probe).
             if [ -z "$youngest" ] || [ "$le" -gt "$youngest" ]; then
                 youngest="$le"; sid="$rsid"; sfile="$rf"
             elif [ "$le" = "$youngest" ]; then
@@ -573,17 +584,16 @@ reap_one() { # <cand-line> <now>
     fi
     # settle 3: JSONL activity advanced since classification? Every deciding
     # (max-epoch) file is re-probed — an advance on ANY tied twin suppresses.
+    # Decide-file re-probe failure (deleted/truncated/undatable since classify)
+    # is FAIL-CLOSED: what cannot be re-verified is never signaled.
     while IFS= read -r sf; do
-        # fail-closed: a deciding file carrying a literal US byte cannot be
-        # re-probed atomically (esc() strips 0x1f from store values, so a
-        # fragment with US is a residual non-store path) — suppress rather
-        # than signal what cannot be re-verified.
-        case "$sf" in *"$(printf '\037')"*)
-            log "SETTLE-SKIP $pid deciding file contains separator byte — suppress"; return 0 ;;
-        esac
         [ -n "$sf" ] || continue
         fresh_epoch="$(jsonl_epoch_for "$sf")"
-        if [ -n "$class_epoch" ] && [ -n "$fresh_epoch" ] && [ "$fresh_epoch" -gt "$class_epoch" ]; then
+        if [ -z "$fresh_epoch" ]; then
+            log "SETTLE-SKIP $pid cannot re-probe deciding file ($sf) — suppress"
+            return 0
+        fi
+        if [ -n "$class_epoch" ] && [ "$fresh_epoch" -gt "$class_epoch" ]; then
             log "SETTLE-SKIP $pid activity advanced ($sf ${class_epoch} -> ${fresh_epoch}) — suppress"
             return 0
         fi

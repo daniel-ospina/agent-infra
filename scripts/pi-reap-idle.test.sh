@@ -851,6 +851,52 @@ OUT="$(env -u HOME REAP_LOG="/tmp/c27d-$$.log" bash "$REAPER" --help 2>&1)"
 assert_eq "$?" "0" "C27d env -u HOME --help exits 0 (no unbound crash)"
 rm -f "/tmp/c27d-$$.log"
 
+# C28: framing bytes in the REAL on-disk session-dir name. esc() neutralizes
+# them in store values, so the reaper's encoded dir-glob misses and the find
+# fallback surfaces the raw byte-bearing path — round-4 fail-closed: that
+# record abstains at classify (never eligible, never signaled). The store is
+# written via json.dumps because raw 0x1f is invalid JSON.
+python3 - "$T" "$NOW" "$E_SEP3_2000" <<'PY'
+import json, os, sys
+T, NOW, SEP3 = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+def env_fixture(name, pid, tty, sid, cwd_bytes, marker):
+    env = os.path.join(T, name)
+    os.makedirs(os.path.join(env, "home"), exist_ok=True)
+    os.makedirs(os.path.join(env, "state"), exist_ok=True)
+    # ps-source row (lstart Thu Sep 3 20:00:00 2026 -> SEP3 epoch via lookup)
+    with open(os.path.join(env, "ps-source"), "w") as f:
+        f.write("%s 400000 %s %s Thu Sep  3 20:00:00 2026 S 30000 /usr/local/bin/pi --cwd %s\n"
+                % (pid, pid, tty, cwd_bytes.decode("latin1")))
+    # real sessions dir named with the RAW cwd encoding (byte preserved)
+    enc = cwd_bytes.decode("latin1").lstrip("/").replace("/", "-")
+    sdir = os.path.join(env, "sessions", "--%s--" % enc)
+    os.makedirs(sdir, exist_ok=True)
+    with open(os.path.join(sdir, "%d_%s.jsonl" % (SEP3, sid)), "w") as f:
+        for ts in (1000000000, 1003600000, 1007200000):
+            f.write('{"ts":%d,"type":"event","data":{"type":"session_command"}}\n' % ts)
+    store = {"version": 1, "agentHookFailureReportTimestamps": {}, "sessions": {
+        sid: {"pid": pid, "pidStartSeconds": SEP3, "pidStartMicroseconds": 0,
+              "agentLifecycle": "idle", "runtimeStatus": "idle",
+              "cwd": cwd_bytes.decode("utf-8")}}}
+    os.makedirs(os.path.join(env, "cmux"), exist_ok=True)
+    with open(os.path.join(env, "cmux", "pi-hook-sessions.json"), "w") as f:
+        json.dump(store, f)
+    return env
+env_fixture("C28a", 20281, "ttys341", "c28a", b"/tmp/foo\x1fbar", 1)
+env_fixture("C28b", 20282, "ttys342", "c28b", b"/tmp/p|q", 2)
+PY
+make_lookup "$T/C28a/date.lookup"
+make_lookup "$T/C28b/date.lookup"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 run_reaper C28a --apply 2>&1)"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "C28a 0x1f-path session never eligible"
+assert_contains "$OUT" "SKIP no-jsonl-proof" "C28a 0x1f-path session abstains (framing byte)"
+assert_eq "$(cat "$T/C28a/kill.log" 2>/dev/null | wc -l | tr -d ' ')" "0" "C28a no signal for 0x1f path"
+OUT="$(REAP_NOW_EPOCH=$NOW FAKE_SELF_TTY=tts900 run_reaper C28b --apply 2>&1)"
+assert_not_contains "$OUT" "REAP-ELIGIBLE" "C28b |-path session never eligible"
+assert_contains "$OUT" "SKIP no-jsonl-proof" "C28b |-path session abstains (framing byte)"
+assert_eq "$(cat "$T/C28b/kill.log" 2>/dev/null | wc -l | tr -d ' ')" "0" "C28b no signal for |-path"
+rm -rf "$T/C28a" "$T/C28b"
+
 echo "════════════════════════════════════════════════════════════════"
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
