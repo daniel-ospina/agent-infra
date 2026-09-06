@@ -1465,6 +1465,36 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
   });
 });
 
+// ── #517 — BLOCK_MESSAGE repo-layout pin ─────────────
+
+section("message content pin — BLOCK_MESSAGE repo-agnostic layout (#517)");
+
+test("#517: BLOCK_MESSAGE points at the agent-infra skills/ path and notes the consumer operations/skills layout", () => {
+  // #517: agent-infra keeps skills at skills/code-review/SKILL.md; consumer
+  // repos sync them to operations/skills/code-review/SKILL.md (hardlink
+  // location). The OLD message led with the consumer-repo prefix alone — an
+  // agent-infra session hitting the 0-dispatch block was directed to a
+  // nonexistent path. The message is repo-agnostic (the extension runs in
+  // both layouts and in deployed copies), so it must name BOTH forms: the
+  // agent-infra repo-relative path first, the consumer layout parenthetically.
+  ok(
+    BLOCK_MESSAGE.includes("Read skills/code-review/SKILL.md"),
+    "generic remediation must lead with the repo-relative skills/ path (agent-infra layout)"
+  );
+  ok(
+    BLOCK_MESSAGE.includes("operations/skills/code-review/SKILL.md in consumer repos"),
+    "generic remediation must note the consumer-repo operations/skills layout"
+  );
+  // Anti-regression: the stale form (consumer prefix as the ONLY pointer) must
+  // not come back — anchored on the exact lead phrase so a re-drift fails
+  // loudly. The parenthetical above legitimately contains the operations/skills
+  // prefix, so this pins the LEAD (Read …) only.
+  ok(
+    !BLOCK_MESSAGE.includes("Read operations/skills/code-review/SKILL.md"),
+    "generic remediation must not lead with the stale consumer-repo prefix (#517)"
+  );
+});
+
 // ── #485 T2 — drift pin: REVIEW-ENFORCER-TIER-RULE fence ↔ TIER_RULE export ──
 
 section("drift pin — 01-preflight REVIEW-ENFORCER-TIER-RULE fence ↔ TIER_RULE");

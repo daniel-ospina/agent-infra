@@ -612,10 +612,17 @@ export function logMergeGateDecision(
 
 // ── Block message ─────────────────────────────────────
 
+// #517: the code-review-skill path is repo-layout-dependent — agent-infra
+// keeps skills at skills/, consumer repos sync them to operations/skills/
+// (the consumer-repo hardlink location). The extension is repo-agnostic
+// (runs in both layouts and in deployed copies), so BLOCK_MESSAGE names BOTH
+// layouts rather than doing runtime repo detection: the blocked agent reads
+// whichever path exists in their repo. Pinned by index.test.ts #517 + T1b
+// (tail-anchored, so the pin survives both forms).
 const BLOCK_MESSAGE = [
   "✅ Review enforcement gate is working correctly.",
   "❌ No reviewers were dispatched in this session before the git operation.",
-  "   → Read operations/skills/code-review/SKILL.md for the review dispatch protocol.",
+  "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
