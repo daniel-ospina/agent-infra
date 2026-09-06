@@ -151,15 +151,17 @@ jobs:
         run: bash scripts/check-cost-config.sh --shipped-only
 
   pi-config-extensions-guard:
-    # #498 — post-merge re-check of the pi-config extension-farm parity gate
+    # #498/#502 — post-merge re-check of the pi-config extension-farm parity gate
     # (issue #95 invariant): every extensions/ top-level entry except
-    # *.test.ts must be farm-wired into pi-bootstrap/pi-config/extensions.
+    # *.test.ts must be farm-wired into pi-bootstrap/pi-config/extensions AND
+    # listed in manifest.json files.extensions.entries (consumer ship-list —
+    # #502 closes the manifest↔tree drift class; #498 fixed one stale row).
     # Catches the "PR merged without wiring" drift class that per-PR CI cannot
     # see when the farm edit and the extension land on different branches.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Extension-farm parity gate (symlink farm into extensions/)
+      - name: Extension-farm parity gate (symlink farm + manifest.json into extensions/)
         run: bash scripts/check-pi-config-extensions.sh
 
   python-ci:
