@@ -142,13 +142,14 @@ gh pr merge <PR_NUMBER> --auto --merge
 # which advances on ANY concurrent merge (a false "done" sends Step B to delete
 # the head branch of a still-armed PR, closing it unmerged). Poll the REST pulls
 # endpoint (per #192 the GraphQL pool exhausts mid-ceremony under parallel
-# sessions). Bounded: a paused arm (mergeStateStatus BEHIND) NEVER resolves
+# sessions) — REST .state is only open|closed, so map .merged to MERGED:
+STATE=$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>" --jq 'if .merged then "MERGED" else "OPEN" end' 2>/dev/null || echo OPEN)
+# Bounded: a paused arm (mergeStateStatus BEHIND) NEVER resolves
 # itself — break after the window and run the pause-recovery block BELOW.
 # (A genuinely FAILED required check is different: investigate/fix the check
 # first — pause recovery cannot clear a red check.)
-STATE=""
 for _ in $(seq 1 60); do            # 60 × 10s = 10 min max
-  STATE=$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>" --jq .state 2>/dev/null || echo OPEN)
+  STATE=$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>" --jq 'if .merged then "MERGED" else "OPEN" end' 2>/dev/null || echo OPEN)
   [ "$STATE" = "MERGED" ] && break
   sleep 10
 done
