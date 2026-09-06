@@ -140,8 +140,21 @@ gh pr merge <PR_NUMBER> --auto --merge
 # gh version; a non-zero exit is the only failure signal).
 # Poll until the auto-merge APPLIES — never infer completion from origin/main,
 # which advances on ANY concurrent merge (a false "done" sends Step B to delete
-# the head branch of a still-armed PR, closing it unmerged):
-gh pr view <PR_NUMBER> --json state,mergedAt -q .state   # loop until "MERGED"
+# the head branch of a still-armed PR, closing it unmerged). Poll the REST pulls
+# endpoint (per #192 the GraphQL pool exhausts mid-ceremony under parallel
+# sessions). Bounded: a paused arm (mergeStateStatus BEHIND) or a failed required
+# check NEVER resolves itself — break after the window and run pause recovery:
+STATE=""
+for _ in $(seq 1 60); do            # 60 × 10s = 10 min max
+  STATE=$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>" --jq .state 2>/dev/null || echo OPEN)
+  [ "$STATE" = "MERGED" ] && break
+  sleep 10
+done
+if [ "$STATE" != "MERGED" ]; then
+  echo "⚠️ not merged within the poll window — inspect mergeStateStatus / autoMergeRequest:"
+  echo "   BEHIND → the branch fell behind while armed → run the pause-recovery block above."
+  echo "   mergeable + unarmed → re-arm (gh pr merge <PR_NUMBER> --auto --merge)."
+fi
 # (Default-branch resolution when the default is not main:
 # DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@'); [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main")
 ```
@@ -152,14 +165,19 @@ rebase the branch, RE-RUN the affected pre-flight regression tests, re-record th
 review at the new head (condition 6 — the sha moved), then re-arm:
 
 ```bash
-git -c commit.gpgsign=false rebase origin/main   # or: git merge origin/main per condition 5
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
+git -c commit.gpgsign=false rebase "origin/$DEFAULT_BRANCH"   # or: git merge origin/$DEFAULT_BRANCH per condition 5
 # RE-RUN the affected pre-flight regression tests here
 git push --force-with-lease
 # The head sha moved → run the `code-review` skill at the new head (fresh review;
 # it auto-records on clean convergence). Do NOT re-record via record-review.sh
 # alone — condition 6 forbids recording a moved head without a fresh review, and
 # the ai-review-gate full-sha freshness check keeps the arm red until evidence is
-# genuinely refreshed. Then re-arm:
+# genuinely refreshed.
+# Code-bearing PRs: also dispatch a fresh [VGATE] at the new head (condition 3) —
+# the rebase changed the verified files' hashes (docs-only sets are shape-exempt).
+# Then re-arm:
 gh pr merge <PR_NUMBER> --auto --merge
 ```
 
