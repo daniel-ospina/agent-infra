@@ -561,16 +561,26 @@ test("exit 0 + stopReason error with in-band 'bad gateway' message → provider 
 test("composed-output prose without a transport anchor → none (content must not latch)", () => {
 	const r = makeResult({ exitCode: 1, stopReason: "error", messages: [assistantMsg("The background process was terminated by the supervisor.")] });
 	equal(classifyProviderFailure(r), "none");
-	const r2 = makeResult({ exitCode: 1, stopReason: "error", messages: [assistantMsg("the docs mention no credits and rate limits for the v2 API")] });
-	equal(classifyProviderFailure(r2), "exhaustion", "transport-anchored prose still classifies (no credits → exhaustion)");
+	const r2 = makeResult({ exitCode: 1, stopReason: "error", messages: [assistantMsg("the docs mention rate limits for the v2 API and we retried ok")] });
+	equal(classifyProviderFailure(r2), "provider", "rate-limit phrase is transport-adjacent to 'api' → co-located prose still classifies");
+});
+
+test("remote topic prose farther than the co-location window → none", () => {
+	// The anchor is >40 chars from every phrase: prose ABOUT a provider subject,
+	// not provider-failure copy, must not re-run the task.
+	const r = makeResult({ exitCode: 1, stopReason: "error", messages: [assistantMsg("we documented the api integration; the budget review found no credits remaining this quarter and our status board shows terminated accounts")] });
+	equal(classifyProviderFailure(r), "none");
 });
 
 test("stderr trailing-window: a stale early provider blip does not latch a later death", () => {
 	// A RECOVERED blip sits >8KB before the end (benign agent logs fill the gap);
-	// the terminal text is unrelated → the blip must not latch a bug crash.
+	// the terminal text is unrelated → the blip must not latch a bug crash —
+	// even when the terminal frame carries transport-ish tokens (round-2
+	// finding: the composed-output channel used to re-scan FULL stderr via
+	// getResultOutput's fallback, silently bypassing the window).
 	const stale = "Connection error. retrying...\n".repeat(50);
 	const filler = "agent step ok\n".repeat(1000); // ~13KB benign tail context
-	const r = makeResult({ exitCode: 1, stderr: stale + filler + "TypeError: x is not a function\n at run (app.ts:3:1)" });
+	const r = makeResult({ exitCode: 1, stderr: stale + filler + "TypeError: x is not a function\n at getProvider (src/provider.ts:402:11)" });
 	equal(classifyProviderFailure(r), "none");
 	const r2 = makeResult({ exitCode: 1, stderr: stale + filler + "Connection error. retrying..." });
 	equal(classifyProviderFailure(r2), "connection", "a terminal provider signature within the window classifies");
@@ -641,6 +651,10 @@ test("space-delimited duration shapes → none (unit-suffix guard, code-review r
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "retrying api call after 500 ms" })), "none");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "upstream latency 402.5 ms" })), "none");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "cached in 500 mb of ram" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "api responded in 500 msec" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "request took 402 seconds to complete" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "upstream latency 500 SEC" })), "none", "uppercase unit forms excluded (case-insensitive guard)");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "response buffered in 500 MB" })), "none");
 });
 
 section("scanForProviderFailure / stripStackFrames — #496 two-pass scan");
@@ -652,6 +666,10 @@ test("stripStackFrames removes path:line[:col] tails", () => {
 test("stripLocalLines removes loopback-targeted lines only", () => {
 	equal(stripLocalLines("Error: connect ECONNREFUSED 127.0.0.1:5432"), "");
 	equal(stripLocalLines("unix:///var/run/docker.sock: permission denied"), "");
+	// A loopback line that ALSO carries a strong transport token (proxy fronting
+	// the provider) is KEPT — round-3: whole-line drops only for pure
+	// local-dependency noise.
+	equal(stripLocalLines("402 from https://api.deepseek.com via localhost:8080"), "402 from https://api.deepseek.com via localhost:8080");
 	equal(stripLocalLines("Connection error.\nrefused by localhost db\n402 from api.deepseek.com:443"), "Connection error.\n402 from api.deepseek.com:443");
 });
 
@@ -668,11 +686,14 @@ test("loopback-only local-dependency failures → none (doomed re-dispatch must 
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Error: connect ECONNREFUSED 127.0.0.1:5432" })), "none");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "connect ECONNREFUSED localhost:5432" })), "none");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "Connection error. retrying localhost db" })), "none");
 });
 
 test("genuine provider transport line survives local-line stripping", () => {
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "localhost:5432 down\n402 from api.deepseek.com:443" })), "exhaustion");
 	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "docker daemon down\nConnection error." })), "connection");
+	// Same line: a local proxy fronts the provider — the genuine signature is kept.
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "402 from https://api.deepseek.com via localhost:8080" })), "exhaustion");
 });
 
 test("scanForProviderFailure: phrase on stripped text; numeric anchored on original", () => {

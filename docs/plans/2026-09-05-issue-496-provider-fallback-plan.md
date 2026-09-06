@@ -56,43 +56,54 @@ Gating (all must hold or → `"none"`):
    productive; abort must be honored).
 3. **TWO-PASS SCAN over each scanned field** (`errorMessage`, stderr-TAIL, and output when
    scanned):
-   - **TEXT PRE-CLEAN** (both passes) — `stripLocalLines` removes WHOLE lines that
-     reference loopback/unix targets (`127.0.0.1|localhost|::1|unix:|0.0.0.0`): a down
-     localhost DB / docker daemon is local-dependency noise, not provider evidence, and a
-     doomed re-dispatch cannot help it. Provider transport lines never reference loopback
-     → no genuine signature is lost (code-review round: reproduced latch `Error: connect
-     ECONNREFUSED 127.0.0.1:5432`).
+   - **TEXT PRE-CLEAN** (both passes) — `stripLocalLines` drops WHOLE lines that
+     reference loopback/unix targets UNLESS the line also carries a strong
+     transport token (`https?|api|provider|upstream`): a down localhost DB /
+     docker daemon is local-dependency noise, but a line naming BOTH a loopback
+     hop AND a provider transport ("402 from https://api.deepseek.com via
+     localhost:8080" — a proxy fronting the provider) keeps its signature
+     (round-3 refinement: the round-2 whole-line drop missed proxy-fronted
+     provider lines).
    - **PHRASE scan on STRIPPED text** — first remove stack-frame tails
      (`[\w$@./:-]+:\d+(?::\d+)?` — `index.ts:402:11`, `loader:507:10`,
      `lib/api/request.js:402:11`, `src/provider.ts:507:10`), then match the text phrases
      below.
    - **NUMERIC scan on the cleaned (unstripped) text** — numerics are left-delimited
-     `(?<![\w$@./:-])(402|429|5\d\d)(?![a-z])` (a glued `:402` in a frame path is
-     excluded by the left guard; a letter/unit suffix is excluded by the right guards:
-     `512ms`, the SPACE-DELIMITED latency log `500 ms`, and the decimal `402.5 ms` all
-     stay out — duration/measurement shapes → none; the code-review round found the
-     original `(?![a-z])` guard missed space-delimited `500 ms`/`402.5 ms` forms) AND
+     `(?<![\w$@./:-])(402|429|5\d\d)(?![a-zA-Z])` (a glued `:402` in a frame path is
+     excluded by the left guard; a glued unit `512ms`/`500MB` by the right guard) plus
+     a post-filter (`unitSuffixFollows`) excluding measurement/duration contexts
+     (`500 ms`, `402.5 ms`, `500 msec`, `402 seconds`, `500 SEC` — code-review rounds
+     found the space-delimited, decimal, spelled and uppercase forms slipped the
+     original `(?![a-z])` guard) AND
      adjacent (≤25 chars, either direction) to a transport/API token
      (`http|status|response|request|api|provider|upstream|message`). This keeps genuine
      port-bearing/gateway shapes (`402 from api.deepseek.com:443`, `error 402 from
      https://api.deepseek.com:443`, `504 from https://proxy:8443` — transport word
      survives in the cleaned text even though the strip would delete the glued host)
      while no stack frame or measurement shape can match.
-   Then the always-scanned fields are `errorMessage` (FULL) + the **stderr TAIL — last
-   8KB** (`stderr.slice(-8192)`) for EVERY stopReason, including a "cut" whose in-band
-   `errorMessage` still carries the provider signature from a `message_end` error event
-   before signal-death. The stderr window bounds the classifier to the terminal death
-   context: a RECOVERED early provider blip (pi retries internally) or MCP/local-tool
-   noise farther than 8KB from the end can no longer latch a later non-provider death
-   (code-review round: full-buffer scanning let an early blip latch a bug crash); the
-   composed result output (`getResultOutput`) is additionally scanned ONLY when
-   `exitCode !== 0 || stopReason === "error"` AND the field carries a strong transport
-   anchor (`OUTPUT_PHRASE_ANCHOR = https?|api|provider|upstream|status|response` —
-   deliberately excludes the loose prose words request/message). Composed output is
-   AGENT/LLM prose — content, not provider evidence: bare "terminated"/"no credits" prose
-   must never re-run the task (code-review round: reproduced content latch "The
-   background process was terminated by the supervisor."). A clean exit whose output
-   merely MENTIONS the phrase is not a provider failure. `stopReason === "cut"` classifies
+   Then the always-scanned fields are `errorMessage` (FULL) + the **stderr TAIL —
+   last ~8KB** (`stderr.slice(-(8192+128))`; the 128B overlap ensures a signature
+   straddling the window edge is never split) for EVERY stopReason, including a
+   "cut" whose in-band `errorMessage` still carries the provider signature from a
+   `message_end` error event before signal-death. The stderr window bounds the
+   classifier to the terminal death context: a RECOVERED early provider blip (pi
+   retries internally) or MCP/local-tool noise farther than 8KB from the end can
+   no longer latch a later non-provider death (code-review rounds: full-buffer
+   scanning let an early blip latch a bug crash). The composed result output is
+   additionally scanned ONLY when `exitCode !== 0 || stopReason === "error"` —
+   and the channel is the agent's final TRANSCRIPT text
+   (`getFinalOutput(result.messages)`) ONLY: never the errorMessage/stderr
+   fallbacks of `getResultOutput`, which are already scanned above (round-3
+   finding: routing full stderr through the transcript channel silently bypassed
+   the 8KB window). Transcript prose is agent/LLM content, not provider evidence:
+   a phrase match needs a strong transport token
+   (`OUTPUT_PHRASE_ANCHOR = https?|api|provider|upstream` — status/response are
+   deliberately excluded prose words) CO-LOCATED within ±40 chars
+   (`PHRASE_COLOCATION_WINDOW`), so bare or remote-topic "terminated"/"no
+   credits"/"rate limit" prose never re-runs the task (round-3: co-location
+   replaced the round-2 anywhere-in-field anchor test, which still latched
+   transport-adjacent topic prose). A clean exit whose output merely MENTIONS a
+   phrase is not a provider failure. `stopReason === "cut"` classifies
    via the always-scanned `errorMessage`/stderr-TAIL fields ONLY (a cut's exitCode stays 0
    — its output content is NOT scanned; a marker-less cut = no signature in either field =
    bug-crash/backstop/OOM — the #476 "bug-crash must not latch" analog; a cut that
@@ -107,7 +118,7 @@ cannot match. Text phrases are loose. Case-insensitive; ordered for reporting pr
 
 | class | patterns |
 |---|---|
-| `exhaustion` | phrases: `insufficient balance`, `credit balance too low`, `out of credits`, `insufficient credits`, `no credits`, `payment required`; numeric `402`: ≤25-char transport adjacency either direction (token list below) — ALL numerics carry the §1 gate-3 guards `(?<![\w$@./:-])`…`(?![a-z])(?!\s*\.?\d*\s*(?:ms|us|ns|mb|kb|gb|bytes?|b|s|m|h)\b)` (the table shows the adjacency shape only; never match a bare numeric without the guards) |
+| `exhaustion` | phrases: `insufficient balance`, `credit balance too low`, `out of credits`, `insufficient credits`, `no credits`, `payment required`; numeric `402`: ≤25-char transport adjacency either direction (token list below) — ALL numerics carry the §1 gate-3 guards `(?<![\w$@./:-])`…`(?![a-zA-Z])` + a post-filter excluding measurement suffixes (`unitSuffixFollows`: optional space/decimal + a unit token `ms|us|ns|mb|kb|gb|b|s|m|h|msec|sec|bytes?|milliseconds?|seconds?|minutes?|hours?`, case-insensitive — `512ms`, `500 ms`, `402.5 ms`, `500 SEC`, `500 MB` all stay out) (the table shows the adjacency shape only; never match a bare numeric without the guards) |
 | `connection` | `connection error`, `connection lost`, `other side closed`, `stream ended`, `terminated`, `econnreset`, `econnrefused`, `enotfound`, `etimedout`, `epipe`, `socket hang up`, `network error`, `connect timed out`, `fetch failed` — the added mid-stream/socket family (`connection lost`, `other side closed`, `stream ended`, `fetch failed`) aligns with pi's OWN runtime retry vocabulary (pi-ai `RETRYABLE_PROVIDER_ERROR_PATTERN`): a run that DIED after pi exhausted its internal provider retries carrying these terminal texts is high-signal provider death (code-review round: empirically-verified misses on the mid-stream socket family) |
 | `provider` | phrases: `rate limit`, `too many requests`, `upstream error`, `provider error`, `internal server error`, `bad gateway`, `service unavailable`; numerics `429`/`5\d\d`: same transport-adjacency + §1 guards |
 
@@ -119,12 +130,17 @@ frames (`.../node_modules/undici/lib/api/request.js:402:11`, `.../src/provider.t
 `Disk quota exceeded` (ENOSPC), an error-object dump containing `code: 429` with no
 transport token, duration/measurement shapes (`api responded in 512ms`,
 `{"message":"done","elapsed":"500ms"}`, `upstream ok in 500ms`, AND the
-space-delimited/decimal forms `api responded in 500 ms`, `request took 402 ms to
-complete`, `upstream latency 402.5 ms` — code-review round), loopback-only local
+space-delimited/decimal/spelled/uppercase forms `api responded in 500 ms`,
+`request took 402 ms to complete`, `upstream latency 402.5 ms`, `500 msec`,
+`402 seconds`, `500 SEC`, `500 MB` — code-review rounds), loopback-only local
 dependency failures (`Error: connect ECONNREFUSED 127.0.0.1:5432`, docker daemon
-`unix://` line), composed-output prose without a transport anchor ("The background
-process was terminated by the supervisor."), and a stale early blip >8KB before a
-non-provider terminal error (stderr trailing-window) — each asserting `"none"`.
+`unix://` line), composed-output prose without/remote from a transport anchor ("The
+background process was terminated by the supervisor.", a budget/status note about
+no credits), and a stale early blip >8KB before a non-provider terminal error —
+including one whose terminal frame carries transport-ish tokens
+(`at getProvider (src/provider.ts:402:11)` — the transcript channel is
+TRANSCRIPT-only, so the full-stderr fallback can never bypass the window) — each
+asserting `"none"`.
 
 ### 2. Decision — `shouldFallbackDispatch(...)` (exported, unit-tested)
 
@@ -157,8 +173,16 @@ will slot in here) authoritative. The default-config same-provider residual is n
 HANDLED at the decision gate (§2): a default-config 402 no longer pays a doomed
 duplicate run — recovery value requires `SUBAGENT_FALLBACK_MODEL` to point at a
 provider-diverse model, or #476's latch-aware alias-chain (the actual exhaustion fix).
-NOTE: the operator's env choice is trusted — an EXPLICIT same-family fallback still
-falls back (their informed choice).
+NOTE: the operator's env choice is trusted with one codified exception — an EXPLICIT
+same-family fallback IS suppressed when attempt 0's model is pinned/known-equal
+(families provably equal), and is allowed only when attempt 0 reported no model at
+all (account not provable). The gate's attempt-0 input is the child's RESOLVED model
+(`result.model ?? agent.model` — filled from the attempt-0 `message_end`), so a
+model-less dispatch under a qwen-default session still resolves qwen → a default
+deepseek fallback is cross-account and fires (round-3). Family inference is name-based
+(`modelProviderFamily`); operator aliases that dodge the prefixes resolve null → not
+provably same → the fallback fires (bounded by max-1; #476's latch-aware alias-chain
+resolution owns the exact-account case).
 
 ### 4. Orchestration — `runSingleAgent` (public signature UNCHANGED)
 
@@ -334,5 +358,14 @@ extension-farm CI wiring). New + existing suites run locally via the repo recipe
   `connection lost` / `other side closed` / `stream ended` / `fetch failed`) were both
   closed with regression rows; the default-config exhaustion 402 no longer pays a doomed
   same-account duplicate run (§2 gate + honest-failure log); the hermetic abort test's
-  leaked 15s guard timer is cleared (suite wall 20.8s → 9.7s). Final suite counts:
-  index.test.ts 104/104, provider-fallback.test.ts 13/13, real-pi suites green.
+  leaked 15s guard timer is cleared (suite wall 20.8s → 9.7s). **Rounds 2-3 re-review**
+  (fresh reviewers on the fix commit) found and closed: the composed-output channel
+  silently re-scanning FULL stderr via `getResultOutput`'s fallback (bypassing the 8KB
+  window) — the channel is now transcript-only; phrase anchoring tightened from
+  anywhere-in-field to ±40-char co-location with a strong token set that excludes
+  status/response; spelled/uppercase duration units (`msec`, `seconds`, `MB`, `SEC`);
+  loopback-line drops now spare proxy-fronted provider lines; the exhaustion gate reads
+  the child's RESOLVED model (`result.model ?? agent.model`) so model-less qwen-default
+  sessions still get cross-account 402 recovery; the stderr window gets a 128B overlap.
+  Final suite counts: index.test.ts 105/105, provider-fallback.test.ts 13/13, real-pi
+  suites green.

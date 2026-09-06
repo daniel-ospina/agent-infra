@@ -495,18 +495,36 @@ const PROVIDER_PHRASE_PATTERNS: Array<[ProviderFailureClass, RegExp]> = [
 /** Transport/API tokens that may anchor a numeric status code within 25 chars. */
 const NUMERIC_ANCHOR = /(?:http|status|response|request|api|provider|upstream|message)/i;
 
-/** Strong transport tokens that must co-occur for a PHRASE match to count on the
- * composed-output channel (agent prose). Deliberately excludes the loose prose
- * words request/message — a composed "the request was terminated" must not
- * latch. */
-const OUTPUT_PHRASE_ANCHOR = /(?:https?|api|provider|upstream|status|response)/i;
+/** Strong transport tokens that must co-occur NEAR (PHRASE_COLOCATION_WINDOW,
+ * either direction) a PHRASE match on the composed-output channel (agent prose —
+ * content, not provider evidence). Deliberately excludes the loose prose words
+ * request/message/status/response: a composed "the request was terminated" or
+ * "our status update: no credits left" must never latch. */
+const OUTPUT_PHRASE_ANCHOR = /(?:https?|api|provider|upstream)/i;
+
+/** Loopback/unix targets — local-dependency lines, never provider evidence. */
+const LOCAL_TARGET = /(?:127\.0\.0\.1|localhost|::1|unix:|0\.0\.0\.0)/i;
+
+/** Anchor window (chars, either direction) for phrase matches on the
+ * composed-output channel (round-3: co-location, not anywhere-in-field). */
+const PHRASE_COLOCATION_WINDOW = 40;
 
 /** Numeric status candidates: left-delimited (a glued `:402` inside a frame path
- * `request.js:402:11` is excluded) and right-delimited against a letter AND an
- * optional-space/decimal unit suffix — `512ms`, the space-delimited latency log
- * `500 ms`, and `402.5 ms` all stay out (duration/measurement shapes → none),
+ * `request.js:402:11` is excluded) and right-delimited against a letter (a glued
+ * unit `512ms`/`500MB` never matches). Space-delimited/decimal unit suffixes
+ * (`500 ms`, `402.5 ms`, `500 SEC`, `402 seconds`) are excluded by
+ * unitSuffixFollows after each candidate — duration/measurement shapes → none,
  * while `HTTP 429` and `402 {` keep matching. */
-const NUMERIC_STATUS = /(?<![\w$@./:-])(402|429|5\d\d)(?![a-z])(?!\s*\.?\d*\s*(?:ms|us|ns|mb|kb|gb|bytes?|b|s|m|h)\b)/g;
+const NUMERIC_STATUS = /(?<![\w$@./:-])(402|429|5\d\d)(?![a-zA-Z])/g;
+
+/** Unit tokens (case-insensitive) that mark a measurement/duration context when
+ * they follow a numeric candidate (optional space/decimal between). */
+const UNIT_RE = /^(?:ms|us|ns|mb|kb|gb|b|s|m|h|msec|sec|bytes?|milliseconds?|seconds?|minutes?|hours?)$/i;
+
+function unitSuffixFollows(text: string, from: number): boolean {
+	const m = /^\s*\.?\d*\s*([a-z]+)/i.exec(text.slice(from));
+	return m !== null && UNIT_RE.test(m[1]);
+}
 
 function numericClassFor(code: string): ProviderFailureClass | null {
 	if (code === "402") return "exhaustion";
@@ -522,36 +540,58 @@ export function stripStackFrames(text: string): string {
 	return text.replace(/[\w$@./:-]+:\d+(?::\d+)?/g, "");
 }
 
-/** #496: strip LINES that reference loopback/unix targets — local-dependency
- * noise (a down localhost DB / docker daemon / local MCP server) is NOT provider
- * evidence and a doomed re-dispatch cannot help it. Provider transport lines
- * never reference loopback, so no genuine signature is lost. */
+/** #496: strip LINES that reference loopback/unix targets UNLESS the line also
+ * carries a strong transport token — a down localhost DB / docker daemon is
+ * local-dependency noise (a doomed re-dispatch cannot help it), but a line
+ * naming BOTH a loopback hop AND a provider transport ("402 from
+ * https://api.deepseek.com via localhost:8080" — dev/corporate proxies fronting
+ * the provider) keeps its genuine signature. */
 export function stripLocalLines(text: string): string {
 	return text
 		.split("\n")
-		.filter((line) => !/(?:127\.0\.0\.1|localhost|::1|unix:|0\.0\.0\.0)/i.test(line))
+		.filter((line) => !(LOCAL_TARGET.test(line) && !OUTPUT_PHRASE_ANCHOR.test(line)))
 		.join("\n");
 }
 
 /** #496: two-pass signature scan over ONE field. Pass 1 — text phrases on the
- * stack-frame-stripped, loopback-noise-free text. Pass 2 — guarded numeric
- * status codes on the same cleaned text (port-glued transport hosts like
- * `api.deepseek.com:443` survive — only whole loopback lines are removed),
- * adjacent (≤25 chars, either direction) to a transport/API token. Returns the
- * class or "none". `requireTransportAnchor` is for the COMPOSED-OUTPUT channel
- * (agent/LLM prose is content, not provider evidence): when set, both passes run
- * only if the field carries a transport/API token at all. */
+ * stack-frame-stripped, loopback-noise-free text (on the requireTransportAnchor
+ * channel: a phrase additionally needs an OUTPUT_PHRASE_ANCHOR token within
+ * PHRASE_COLOCATION_WINDOW chars either side — remote topic prose about APIs
+ * never latches). Pass 2 — guarded numeric status codes on the same cleaned
+ * text (port-glued transport hosts like `api.deepseek.com:443` survive — only
+ * whole loopback lines are removed), adjacent (≤25 chars, either direction) to
+ * a transport/API token. Returns the class or "none". `requireTransportAnchor`
+ * marks the COMPOSED-OUTPUT channel: agent/LLM prose is content, not provider
+ * evidence. */
 export function scanForProviderFailure(text: string, requireTransportAnchor = false): ProviderFailureClass {
 	if (!text) return "none";
 	const cleaned = stripLocalLines(text);
-	if (requireTransportAnchor && !OUTPUT_PHRASE_ANCHOR.test(cleaned)) return "none";
 	const stripped = stripStackFrames(cleaned);
-	for (const [cls, re] of PROVIDER_PHRASE_PATTERNS) {
-		if (re.test(stripped)) return cls;
+	if (requireTransportAnchor) {
+		// Phrase matches on the transcript channel must be co-located with a
+		// strong transport token. Uses the CLEANED text (transcript prose
+		// rarely carries frames; index-mapping across the strip is not worth
+		// the risk). Numeric pass below is shared (self-anchored ≤25 chars).
+		for (const [cls, re] of PROVIDER_PHRASE_PATTERNS) {
+			const g = new RegExp(re.source, "ig");
+			let m: RegExpExecArray | null;
+			while ((m = g.exec(cleaned)) !== null) {
+				const ctx = cleaned.slice(
+					Math.max(0, m.index - PHRASE_COLOCATION_WINDOW),
+					m.index + m[0].length + PHRASE_COLOCATION_WINDOW,
+				);
+				if (OUTPUT_PHRASE_ANCHOR.test(ctx)) return cls;
+			}
+		}
+	} else {
+		for (const [cls, re] of PROVIDER_PHRASE_PATTERNS) {
+			if (re.test(stripped)) return cls;
+		}
 	}
 	for (const m of cleaned.matchAll(NUMERIC_STATUS)) {
 		const cls = numericClassFor(m[0]);
 		if (!cls) continue;
+		if (unitSuffixFollows(cleaned, (m.index ?? 0) + m[0].length)) continue;
 		const before = cleaned.slice(Math.max(0, (m.index ?? 0) - 25), m.index ?? 0);
 		const after = cleaned.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 25);
 		if (NUMERIC_ANCHOR.test(before) || NUMERIC_ANCHOR.test(after)) return cls;
@@ -569,27 +609,35 @@ export function scanForProviderFailure(text: string, requireTransportAnchor = fa
  * 0 so its output content is not scanned; a marker-less cut (no signature in
  * errorMessage/stderr) is a bug-crash/backstop/OOM and returns "none". */
 /** #496: terminal-context window for the always-scanned stderr channel (bytes
- * from the END). stderr accumulates the child's ENTIRE session — MCP/local-tool
- * noise and RECOVERED early provider blips (pi retries internally before this
- * run's terminal failure). Only the trailing region is the death context: a
- * genuine provider death prints its terminal error last (code-review round:
- * full-buffer scanning let a recovered early blip latch a later non-provider
- * death). */
+ * from the END, +STDERR_OVERLAP so a signature straddling the boundary is never
+ * split). stderr accumulates the child's ENTIRE session — MCP/local-tool noise
+ * and RECOVERED early provider blips (pi retries internally before this run's
+ * terminal failure). Only the trailing region is the death context: a genuine
+ * provider death prints its terminal error last (code-review rounds: full-buffer
+ * scanning let a recovered early blip latch a later non-provider death). */
 const STDERR_TERMINAL_WINDOW = 8 * 1024;
+const STDERR_OVERLAP = 128;
 
 export function classifyProviderFailure(result: SingleResult): ProviderFailureClass {
 	if (!isFailedResult(result)) return "none";
 	if (result.stopReason === "timeout" || result.stopReason === "aborted") return "none";
-	const stderr = (result.stderr ?? "").slice(-STDERR_TERMINAL_WINDOW);
+	const stderr = (result.stderr ?? "").slice(-(STDERR_TERMINAL_WINDOW + STDERR_OVERLAP));
 	for (const field of [result.errorMessage ?? "", stderr]) {
 		const cls = scanForProviderFailure(field);
 		if (cls !== "none") return cls;
 	}
-	// Composed output is agent/LLM prose — scanned only with a transport anchor
-	// (bare "terminated"/"no credits" prose must never re-run the task).
+	// Composed output = the agent's final TRANSCRIPT text ONLY (getFinalOutput —
+	// NEVER the errorMessage/stderr fallbacks of getResultOutput: those channels
+	// are already scanned above, full + windowed, and routing full stderr
+	// through here would silently bypass the terminal window — round-2 finding).
+	// Transcript prose scans with co-located transport anchoring: bare or remote
+	// "terminated"/"no credits" text must never re-run the task.
 	if (result.exitCode !== 0 || result.stopReason === "error") {
-		const cls = scanForProviderFailure(getResultOutput(result), true);
-		if (cls !== "none") return cls;
+		const transcript = getFinalOutput(result.messages);
+		if (transcript) {
+			const cls = scanForProviderFailure(transcript, true);
+			if (cls !== "none") return cls;
+		}
 	}
 	return "none";
 }
@@ -601,8 +649,9 @@ export interface FallbackDispatchDecision {
 	fallbackDisabled: boolean;
 	/** Orchestrator re-checks the abort signal before spawning attempt 1. */
 	signalAborted: boolean;
-	/** The model attempt 0 dispatched (agent.model; undefined → the child rides
-	 * pi's own default model). Feeds the exhaustion same-account gate. */
+	/** The model attempt 0 actually ran (result.model — the child's message_end
+	 * resolution — falling back to agent.model; undefined only when the child
+	 * died before reporting a model). Feeds the exhaustion same-account gate. */
 	attempt0Model?: string;
 	/** The resolved fallback model id (getSubagentFallbackModel()). */
 	fallbackModel: string;
@@ -629,19 +678,23 @@ export function modelProviderFamily(model: string | undefined): string | null {
  * duplicate? 402 is account-scoped (#476): re-running the full task on the same
  * exhausted account cannot recover, yet re-executes side effects at ~2× cost —
  * the exact harm #497 documents for 402-after-tool-calls. Doomed when attempt 0
- * rode pi's default model and the fallback env is unset (both resolve to the
- * same default family), OR both model families are known-equal. When the
- * fallback model is explicitly set to a DIFFERENT family (qwen/kimi/…) the
- * exhaustion fallback stays on — cross-account recovery is the only 402 fix. */
+ * reported NO model (hard cut before any message_end) and the fallback env is
+ * unset (both ride pi's default family), OR both model families are
+ * known-equal. attempt0Model is the child's RESOLVED model (result.model ??
+ * agent.model), so a model-less dispatch under a qwen-default session still
+ * resolves qwen → a default deepseek fallback is cross-account and fires.
+ * Family inference is name-based (modelProviderFamily) — operator aliases that
+ * dodge the prefixes resolve null → not provably same → the fallback fires
+ * (bounded by max-1; #476's latch-aware alias-chain resolution owns this). */
 export function exhaustionFallbackDoomed(o: {
 	attempt0Model: string | undefined;
 	fallbackModel: string;
 	fallbackModelExplicit: boolean;
 }): boolean {
 	if (o.attempt0Model === undefined || o.attempt0Model === "") {
-		// attempt 0 rides pi's default model; an UNSET fallback env rides the
-		// same default family → provably same account. An explicit fallback is
-		// the operator's informed choice — its account is not provable here.
+		// No model reported by attempt 0 (hard cut); an UNSET fallback env rides
+		// the same default family → provably same account. An explicit fallback
+		// is the operator's informed choice — its account is not provable here.
 		return !o.fallbackModelExplicit;
 	}
 	const a = modelProviderFamily(o.attempt0Model);
@@ -1132,7 +1185,7 @@ export async function runSingleAgent(
 		providerFailureClass: failureClass,
 		fallbackDisabled,
 		signalAborted: signal?.aborted ?? false,
-		attempt0Model: agent.model,
+		attempt0Model: result.model ?? agent.model,
 		fallbackModel,
 		fallbackModelExplicit,
 	});

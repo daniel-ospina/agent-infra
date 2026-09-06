@@ -72,8 +72,13 @@ if (logPath) {
 }
 const writeEvent = (msg) => { fs.writeSync(1, JSON.stringify({ type: "message_end", message: msg }) + "\\n"); };
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, totalTokens: 2 };
-const successMsg = { role: "assistant", content: [{ type: "text", text: "recovered output" }], api: "stub", provider: "stub", model: "stub-model", usage, stopReason: "end", timestamp: 0 };
-const failMsg = { role: "assistant", content: [], api: "stub", provider: "stub", model: "stub-model", usage: {}, stopReason: "error", errorMessage: "Insufficient Balance (402)", timestamp: 0 };
+// The in-band message_end reports the RESOLVED model like real pi: the --model
+// value when one was passed, else the default-family id the child would run
+// (model-less attempt-0 dispatches ride pi's default → deepseek family here;
+// the exhaustion same-account gate reads result.model ?? agent.model).
+const resolvedModel = modelIdx >= 0 ? argv[modelIdx + 1] : "deepseek-v4-flash";
+const successMsg = { role: "assistant", content: [{ type: "text", text: "recovered output" }], api: "stub", provider: "stub", model: resolvedModel, usage, stopReason: "end", timestamp: 0 };
+const failMsg = { role: "assistant", content: [], api: "stub", provider: "stub", model: resolvedModel, usage: {}, stopReason: "error", errorMessage: "Insufficient Balance (402)", timestamp: 0 };
 const succeed = () => { writeEvent(successMsg); process.exitCode = 0; };
 const failExhaustion = () => { writeEvent(failMsg); fs.writeSync(2, '402 {"message":"Insufficient Balance"}\\n'); process.exitCode = 1; };
 const failConnection = () => { fs.writeSync(2, "Connection error.\\n"); process.exitCode = 1; };
