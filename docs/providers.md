@@ -323,14 +323,17 @@ advancing the deepseek root on another account's evidence.
   the default leg pre-spawn (next bullet).
 - Kill switches, in order: unset `COLD_CLASS_PROVIDER` (full revert),
   remove/unset `VENICE_API_KEY` (missing-key → the task-tool gate resolves the
-  dispatch to the default deepseek leg BEFORE any spawn), and — for a durable
-  venice auth-block (`blockedLegs["venice"]`, 24h TTL) — the same gate sends
-  subsequent cold dispatches to the default leg; the block self-heals on key
-  remediation.
+  dispatch to the default deepseek leg BEFORE any spawn), and — while the #476
+  machinery is ACTIVE — a durable venice auth-block (`blockedLegs["venice"]`,
+  24h TTL) makes the same gate send subsequent cold dispatches to the default
+  leg; the block self-heals on key remediation.
 - ⛔ `PROVIDER_FAILOVER_DISABLE=1` is NOT a cold-class kill switch (A1 P3): it
   only disables the #476 fallback machinery — the alternate-leg gate and the
   venice leg ignore it, so cold venice routing stays ACTIVE with NO automatic
-  recovery (a venice 402 then strands the dispatch). Full revert requires
+  recovery (a venice 402 then strands the dispatch; and because the
+  marker→`blockedLegs` conversion runs inside the #476 decision loop, NO
+  durable auth-block can form either — a 401/403 venice child is re-attempted
+  on every dispatch, bounded only by the retry policy). Full revert requires
   unsetting `COLD_CLASS_PROVIDER` (and removing `VENICE_API_KEY`).
 
 ### Measurement (the 0a gate)
