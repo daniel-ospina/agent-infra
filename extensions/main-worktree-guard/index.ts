@@ -712,11 +712,34 @@ const WHY = [
 
 // ── #265 per-session baseline state ────────────────────────────────────────
 // Keyed by process.pid (one pi process == one session; SessionStartEvent
-// carries no sessionId). Baseline = { repoKey, branch, head } of the shared
-// MAIN checkout at session_start. M1 dedupe: Set of "from→to" deviations.
-const baselines = new Map<number, { repoKey: string; branch: string | null; head: string }>();
+// carries no sessionId). Baseline = { repoKey, branch, head, original } of the
+// shared MAIN checkout at session_start. M1 dedupe: Set of "from→to" deviations.
+// `original` = the branch recorded at an UNCONTENDED session_start and is
+// IMMUTABLE — create-new/rename re-baselines update only `.branch` (#376: the
+// ceremony return-to-main carve-out switches back to `original`, provably the
+// session's own starting state). A lock-contended start (pendingBaseline →
+// first-tool_call record) sets original null → the #376 carve-out fails closed
+// (the tree may already sit on ANOTHER session's branch — not provably own).
+const baselines = new Map<number, { repoKey: string; branch: string | null; head: string; original: string | null }>();
 const warnedDeviations = new Map<number, Set<string>>();
 const pendingBaseline = new Set<number>(); // lock contended at session_start → record on first tool_call
+// Branches THIS pid created via the M3 create-new/rename carve-outs, scoped by
+// repoKey (#376 review fold-in): their LOCAL deletion stays allowed after the
+// ceremony return re-bases the baseline to main (git refuses deleting a branch
+// checked out anywhere, so a pid-owned local delete is collision-free). Scoped
+// per repo and marked only in the BASELINE repo, so an owned name from one
+// agent-infra checkout can never authorize a delete in another (review fold-in).
+// Never seeded from session state.
+const ownedBranches = new Map<number, Map<string, Set<string>>>();
+
+function _markOwned(pid: number, repoKey: string | null | undefined, branch: string) {
+  if (!repoKey || !branch) return;
+  let byRepo = ownedBranches.get(pid);
+  if (!byRepo) { byRepo = new Map(); ownedBranches.set(pid, byRepo); }
+  let set = byRepo.get(repoKey);
+  if (!set) { set = new Set(); byRepo.set(repoKey, set); }
+  set.add(branch);
+}
 
 function _recordBaseline(pid: number) {
   if (!branchOwnership) return;
@@ -727,7 +750,10 @@ function _recordBaseline(pid: number) {
     const key = branchOwnership.repoKey(cwd);
     if (!key) return;
     if (!baselines.has(pid)) {
-      baselines.set(pid, { repoKey: key, branch: state.branch, head: state.head });
+      // Contended-start fallback (pendingBaseline): the tree may already sit on
+      // another session's branch → do NOT claim an original (#376 review fold-in:
+      // the carve-out needs a provable own start, so it fails closed here).
+      baselines.set(pid, { repoKey: key, branch: state.branch, head: state.head, original: null });
     }
   } catch { /* degrade silently — M1/M2 skip without a baseline */ }
 }
@@ -784,7 +810,7 @@ export default function (pi: ExtensionAPI) {
             if (lock.held) {
               const state = branchOwnership.readBranchState(process.cwd());
               if (state && !baselines.has(pid)) {
-                baselines.set(pid, { repoKey: key, branch: state.branch, head: state.head });
+                baselines.set(pid, { repoKey: key, branch: state.branch, head: state.head, original: state.branch });
               }
               branchOwnership.releaseRepoLock(key, pid);
             } else {
@@ -1104,12 +1130,29 @@ export default function (pi: ExtensionAPI) {
             const m3 = branchOwnership.decideM3({
               branchOp, isAgentInfra: isInfra, baseline,
               currentBranch: eff.currentBranch,
+              // #376 review fold-in: the return-to-original carve-out is scoped
+              // to the repo that recorded the baseline (repoKey equality — M2
+              // semantics); a baseline owned by another checkout must not
+              // authorize a switch here.
+              repoKey: eff.repoKey,
             });
             if (m3?.block) return { block: true, reason: m3.reason };
             if (m3?.reBaseline) {
               // Synchronous re-baseline: the allowed carve-out / own rename
               // adopts the new branch NOW — the next tool_call emits ZERO M1
-              // warns (AC3).
+              // warns (AC3). Record branches this pid CREATED (create-new) or
+              // renamed its own baseline to — scoped to the BASELINE repo — so
+              // their post-ceremony LOCAL delete is still allowed after the #376
+              // return re-baselines to the original (#376 review fold-in).
+              if (branchOp.op === "create-new" && branchOp.branch) {
+                if (!baseline || (eff.repoKey != null && baseline.repoKey === eff.repoKey)) {
+                  _markOwned(pid, baseline?.repoKey ?? eff.repoKey, branchOp.branch);
+                }
+              } else if (branchOp.op === "rename" && branchOp.to) {
+                if (!baseline || (eff.repoKey != null && baseline.repoKey === eff.repoKey)) {
+                  _markOwned(pid, baseline?.repoKey ?? eff.repoKey, branchOp.to);
+                }
+              }
               _rebaseline(pid, m3.reBaseline);
               return undefined;
             }
@@ -1164,6 +1207,10 @@ export default function (pi: ExtensionAPI) {
           baselineBranch: baseline?.branch ?? null,
           targets,
           syncSource: det.syncSource,
+          // #376 review fold-in: branches this pid created (scoped to THIS
+          // repo) stay locally deletable after the ceremony return re-bases the
+          // baseline (own-branch hygiene).
+          ownedBranches: ownedBranches.get(pid)?.get(eff.repoKey ?? ""),
         })) {
           // #443: det.pushTargets describe ONLY the first push invocation. A
           // delete in a LATER compound segment of the -d/--del family (no
