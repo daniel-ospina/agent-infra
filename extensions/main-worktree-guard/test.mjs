@@ -843,6 +843,18 @@ scriptPath("#444 -s arg then stdin → stdin file", `bash -s arg1 < f`, "f");
 // looks like a flag (`bash -- x.sh -x aaa` runs x.sh with args -x aaa).
 scriptPath("#444 -- then script+flags → script file", `bash -- x.sh -x aaa`, "x.sh");
 scriptPath("#444 -c payload + trailing args → null", `bash -c "echo hi" x.sh aaa`, null);
+// #444 review P1 (regression + closure): POSIX `+`-toggle option words must
+// be skipped, not resolved as the script — real bash runs x.sh for
+// `bash +e/+x/+eu x.sh` and bare `bash + x.sh` (the old last-positional rule
+// gated the arg-less `bash +x evil.sh`; the first-positional rewrite must
+// preserve that). +o/+O take an operand, +c is an inline, +s demotes like -s.
+scriptPath("#444 +toggle → script file", `bash +x evil.sh`, "evil.sh");
+scriptPath("#444 +toggle arg-taking → script file", `bash +x script.sh aaa bbb`, "script.sh");
+scriptPath("#444 bare + → script file", `bash + evil.sh`, "evil.sh");
+scriptPath("#444 +o operand → script file", `bash +o emacs evil.sh`, "evil.sh");
+scriptPath("#444 +c inline + args → null", `bash +c "echo hi" x.sh aaa`, null);
+scriptPath("#444 +s stdin+arg → stdin file", `bash +s < f arg1`, "f");
+scriptPath("#444 +run interleaved with -flags → script file", `bash -e +x x.sh aaa`, "x.sh");
 
 // scriptGitVerdict: a script's git content is gated by the SAME allowlist —
 // recovery scripts (hub-worktree.sh: fetch + worktree add) keep working, the
@@ -1711,6 +1723,13 @@ try {
   expectBool("B45: arg-taking SANCTIONED recovery script content → allow (#444 no regression)", (() => {
     const p = mkS("arg-rec.sh", `git fetch origin main\ngit worktree add ../.worktrees/x -b feat/x origin/main\n`);
     return extractScriptPath(`bash ${p} feat/x ${hubR}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "allow";
+  })(), true);
+  // #444 review P1 closure: POSIX `+`-toggle words (`bash +x evil.sh`) must
+  // resolve the script (real bash runs evil.sh), NOT the toggle token — the
+  // arg-less form was gated pre-PR and must stay gated.
+  expectBool("B46: +-toggle arg-taking MALICIOUS content → block (#444 P1 closure)", (() => {
+    const p = mkS("arg-plus.sh", `git reset --hard\n`);
+    return extractScriptPath(`bash +x ${p} feat/x ${hubR}`) === p && extractScriptPath(`bash +e ${p}`) === p && scriptGitVerdict(p, "main", hubR, hubR) === "block";
   })(), true);
   expectBool("B41: script checkout/switch main-protection (round-20)", (() => {
     const mk = (c) => { const p = `${m4Tmp}/s${Date.now()}${Math.random().toString(36).slice(2)}.sh`; writeFileSync(p, c); return p; };

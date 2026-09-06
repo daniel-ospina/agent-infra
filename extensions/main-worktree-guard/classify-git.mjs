@@ -4588,8 +4588,11 @@ export function extractScriptPath(command) {
     // classifier). `--` ends option parsing: the NEXT operand is the script
     // even when dash-leading (`bash -- x.sh -x aaa` → x.sh). Option operands:
     // --rcfile/--init-file/-O/-o (space and `=`-attached forms) and the o/O
-    // run letters consume the following word. Process substitution `<( … )`
-    // is an FD, not a file (null — _unverifiableGitContent fails closed).
+    // run letters consume the following word. POSIX `+`-toggles mirror the
+    // letter runs (`bash +e evil.sh` runs evil.sh — +x/+e/+eu, bare `+`;
+    // +o/+O take an operand, +c is an inline, +s demotes like -s). Process
+    // substitution `<( … )` is an FD, not a file (null —
+    // _unverifiableGitContent fails closed).
     let j = i + 1;
     let sawInline = false;      // -c/--command → inline string (null)
     let sawDashS = false;       // -s → positionals are $0/$1; program is stdin
@@ -4620,13 +4623,15 @@ export function extractScriptPath(command) {
       }
       if (n === "--rcfile" || n === "--init-file") { j += 2; continue; } // space-form operand
       if (n.startsWith("--rcfile=") || n.startsWith("--init-file=")) { j++; continue; } // attached value
-      if (/^-[a-zA-Z]+$/.test(n)) {
-        // single-dash flag/letter-run — bash parses the run char-by-char:
+      if (/^[+-][a-zA-Z]+$/.test(n)) {
+        // single-dash flag/letter-run (plus the POSIX `+` toggle twin: bash
+        // +e/+x/+eu x.sh runs x.sh; +o/+O take an operand, +c is an inline
+        // command, +s demotes like -s) — bash parses the run char-by-char:
         // c → inline command string (consumes the next word) → null; o/O →
         // the option value is the next word; s → stdin-program mode; every
-        // other letter is an operand-less flag. Probes: -ec/-sc/-cs run the
-        // payload inline; -se/-es/-xs set stdin mode; -so posix / -sO
-        // extglob consume posix/extglob AND set stdin mode.
+        // other letter is an operand-less flag. Probes: -ec/-sc/-cs / +c run
+        // the payload inline; -se/-es/-xs / +s set stdin mode; -so posix /
+        // -sO extglob consume posix/extglob AND set stdin mode.
         const run = n.slice(1);
         if (run.includes("c")) { sawInline = true; j++; continue; }
         if (run.includes("o") || run.includes("O")) j++; // consume the operand word
@@ -4634,7 +4639,7 @@ export function extractScriptPath(command) {
         j++;
         continue;
       }
-      if (n.startsWith("-")) { j++; continue; } // other operand-less -flag / --option
+      if (n.startsWith("-") || n === "+") { j++; continue; } // other operand-less -flag/--option / bare + toggle
       // A non-flag, non-redirect operand:
       if (sawInline) { j++; continue; } // -c: $0/$1 args — never a script file
       if (sawDashS) { j++; continue; }  // -s: $0/$1 — the program is stdin (redirect seen above)
