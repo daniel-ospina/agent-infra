@@ -114,8 +114,96 @@ touching the default-branch worktree. If Step B's remote delete reports
 > ownership violated", the shared checkout was switched mid-ceremony — `git
 > checkout -b <fresh-branch>` (M3 carve-out re-baselines) and re-run the ceremony.
 
+## Auto-merge for strict up-to-date protection (#500 — merge-race ladder)
+
+**On repos with "Require branches to be up to date before merging", ARM AUTO-MERGE as
+the DEFAULT merge step** instead of racing the base with manual `gh pr merge` calls.
+
+**Why (observed deadlock, tortoise #2314, 2026-09-05):** when the full CI matrix takes
+longer than the repo's main-merge cadence (parallel agent sessions land commits every
+few minutes), a manually-rebased branch can NEVER be simultaneously green AND
+up-to-date — every rebase restarts CI, and main moves again before it finishes. The
+result is a structural stale-merge loop (5 rebase cycles / ~2h in #2314) that maxes
+out the Stale-Merge Recovery ladder below without ever landing.
+
+**The ceremony (after ALL of conditions 1-6 hold — review recorded at the final head,
+branch reconciled, checks green):**
+
+```bash
+# Arm GitHub's server-side auto-merge: merges the INSTANT all required checks are
+# green AND the branch is up-to-date — no agent reaction latency, no rebase race.
+# No local branch juggling; safe in worktree-heavy repos (never pairs with
+# --delete-branch; use Step B for cleanup after the merge lands).
+gh pr merge <PR_NUMBER> --auto --merge
+# Expected: "✓ Pull request <owner/repo>#<N> will be automatically merged when
+# all requirements are met" — exit 0 is the true signal (the string varies by
+# gh version; a non-zero exit is the only failure signal).
+# Poll until the auto-merge APPLIES — never infer completion from origin/main,
+# which advances on ANY concurrent merge (a false "done" sends Step B to delete
+# the head branch of a still-armed PR, closing it unmerged). Poll the REST pulls
+# endpoint (per #192 the GraphQL pool exhausts mid-ceremony under parallel
+# sessions) — REST .state is only open|closed, so map .merged to MERGED:
+STATE=$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>" --jq 'if .merged then "MERGED" else "OPEN" end' 2>/dev/null || echo OPEN)
+# Bounded: a paused arm (mergeStateStatus BEHIND) NEVER resolves
+# itself — break after the window and run the pause-recovery block BELOW.
+# (A genuinely FAILED required check is different: investigate/fix the check
+# first — pause recovery cannot clear a red check.)
+for _ in $(seq 1 60); do            # 60 × 10s = 10 min max
+  STATE=$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>" --jq 'if .merged then "MERGED" else "OPEN" end' 2>/dev/null || echo OPEN)
+  [ "$STATE" = "MERGED" ] && break
+  sleep 10
+done
+if [ "$STATE" != "MERGED" ]; then
+  echo "⚠️ not merged within the poll window — inspect mergeStateStatus / autoMergeRequest:"
+  echo "   BEHIND → the branch fell behind while armed → run the pause-recovery block below."
+  echo "   BLOCKED (failed required check) → investigate/fix the check, then re-arm."
+  echo "   mergeable + unarmed → re-arm (gh pr merge <PR_NUMBER> --auto --merge)."
+fi
+# (Default-branch resolution when the default is not main:
+# DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@'); [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main")
+```
+
+**If auto-merge PAUSES** (branch went behind while armed — GitHub reports the PR as
+"auto-merge paused", NOT failed): the review record sha is still the armed head;
+rebase the branch, RE-RUN the affected pre-flight regression tests, re-record the
+review at the new head (condition 6 — the sha moved), then re-arm:
+
+```bash
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
+git fetch origin "$DEFAULT_BRANCH" --quiet   # refresh the tracking ref FIRST — in the
+# BEHIND case the local origin/<default> ref is definitionally stale (the base
+# advanced after the last fetch); rebasing onto it absorbs nothing and re-pauses.
+git -c commit.gpgsign=false rebase "origin/$DEFAULT_BRANCH"   # or: git merge origin/$DEFAULT_BRANCH per condition 5
+# RE-RUN the affected pre-flight regression tests here
+git push --force-with-lease
+# The head sha moved → run the `code-review` skill at the new head (fresh review;
+# it auto-records on clean convergence). Do NOT re-record via record-review.sh
+# alone — condition 6 forbids recording a moved head without a fresh review, and
+# the ai-review-gate full-sha freshness check keeps the arm red until evidence is
+# genuinely refreshed.
+# Code-bearing PRs: also dispatch a fresh [VGATE] at the new head (condition 3) —
+# the rebase changed the verified files' hashes (docs-only sets are shape-exempt).
+# Then re-arm:
+gh pr merge <PR_NUMBER> --auto --merge
+# Bounded: MAX 2 pause-recovery cycles, then escalate to the user (mirrors the
+# Stale-Merge ladder's cap below — on high-cadence repos consecutive pauses are
+# the expected failure mode, not the exception).
+```
+
+**Fallbacks:** if arming fails with NOT_MERGEABLE (literal conflict), resolve per
+condition 4/5 and re-arm. If the repo does NOT require up-to-date (no race), the plain
+Step A merge is fine — auto-merge is for strict-protection repos with CI windows longer
+than the merge cadence. Manual `gh pr merge` after a successful auto-merge arm is
+harmless (idempotent), but unnecessary — and NEVER the first move on an active repo.
+
 
 ## Stale-Merge Recovery (#178/#181 — strict up-to-date ladder)
+
+> Prefer the **Auto-merge step** above on active repos: if the repo's CI window exceeds
+> the main-merge cadence, the recovery ladder below deadlocks structurally (#500) —
+> arm auto-merge instead. Use this ladder when auto-merge is unavailable (repo
+> settings) or the arm failed and a one-shot manual merge can still win.
 
 On repos with "Require branches to be up to date before merging", another merge
 can land between the last reconciliation and `gh pr merge` — the merge is then
