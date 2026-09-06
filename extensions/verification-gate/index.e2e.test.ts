@@ -2555,12 +2555,13 @@ async function main() {
     git(repo, "commit -m base");
     // Vector (a): hostile CHECKED-OUT BRANCH name (metachars are legal git
     // refnames — created via plumbing with quoting so the fixture's own shell
-    // never expands them). Payload runs `touch pwned57a.remote` if the guard
-    // is missing (the config-key string `branch.<current>.remote` splits on
-    // the `;` and ${IFS} expands to a space in /bin/sh).
+    // never expands them). Guard-less, the branch name is first interpolated
+    // into the CONFIG KEY `branch.<current>.remote` — the template's `.remote`
+    // suffix completes the payload's touch target to exactly `pwned57a.remote`
+    // (`git config --get branch.x` fails, then `touch pwned57a.remote` runs).
     const markerA = join(repo, "pwned57a.remote");
     rmSync(markerA, { force: true });
-    const hostileBranch = "x;touch${IFS}pwned57a.remote";
+    const hostileBranch = "x;touch${IFS}pwned57a";
     git(repo, `update-ref 'refs/heads/${hostileBranch}' HEAD`);
     git(repo, `symbolic-ref HEAD 'refs/heads/${hostileBranch}'`);
     writeFileSync(join(repo, "wip57.ts"), "w\n");
@@ -2573,12 +2574,17 @@ async function main() {
     ok(resA && resA.block === true, "57a: bare push on a metachar branch must fall back to the staged check (guard → null → tier C)");
     ok(resA.reason.includes("wip57.ts"), "57a: block names the parked WIP (staged scope)");
     equal(existsSync(markerA), false,
-      "57a: NO shell side-effect — the hostile branch name never reached an execSync string (guard fires before interpolation)");
+      "57a: NO shell side-effect — the hostile branch name never reached an execSync string (guard fires before interpolation; guard-less, the config-key sink lands pwned57a.remote)");
     // Vector (b): hostile config VALUE branch.<cur>.remote (with the merge
     // config present so a guard-less resolver would reach the refs/remotes/…
-    // probe). Payload: `touch pwned57b` if the remote guard is missing.
+    // probe). Guard-less, the value is interpolated into
+    // `refs/remotes/${remote}/${dst}` — the template appends `/main`, so the
+    // payload's touch target is the FILE pwned57b/main (the dir must pre-exist
+    // or the guard-less touch fails and the marker can never exist).
     git(repo, "symbolic-ref HEAD refs/heads/main");
-    const markerB = join(repo, "pwned57b");
+    const markerBDir = join(repo, "pwned57b");
+    mkdirSync(markerBDir, { recursive: true }); // fixture pre-creates the landing DIR so the guard-less touch succeeds
+    const markerB = join(markerBDir, "main");
     rmSync(markerB, { force: true });
     git(repo, "reset -q"); // drop wip57 from the index (block-state isolation)
     writeFileSync(join(repo, "wip57b.ts"), "w\n");
@@ -2593,7 +2599,7 @@ async function main() {
     ok(resB && resB.block === true, "57b: bare push with a hostile config remote must fall back to the staged check (guard → null → tier C)");
     ok(resB.reason.includes("wip57b.ts"), "57b: block names the parked WIP");
     equal(existsSync(markerB), false,
-      "57b: NO shell side-effect — the hostile config VALUE never reached an execSync string");
+      "57b: NO shell side-effect — the hostile config VALUE never reached an execSync string (guard-less, the refs/remotes/… probe lands pwned57b/main)");
     git(repo, "config --unset branch.main.merge");
     git(repo, "config --unset branch.main.remote");
   });
