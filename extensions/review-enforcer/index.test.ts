@@ -1403,6 +1403,15 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
           const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
           equal(allowed, undefined, `${producerValue.trim()} + ≥1 dispatch must allow the git op`);
         }
+        // unlabeled × ≥1: marker ABSENT + a dispatch → still allowed (pins that
+        // the ≥1 allow is marker-INDEPENDENT — a regression making the allow
+        // condition require marker presence fails here; the pre-existing
+        // no-marker allow test covers the same cell, this keeps the full matrix
+        // self-contained in the #485 test).
+        fs.unlinkSync("/tmp/agent-issue-complexity");
+        await fire("tool_result", { toolName: "task" });
+        const unlabeledAllowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(unlabeledAllowed, undefined, "unlabeled (no marker) + ≥1 dispatch must allow the git op");
       } finally {
         if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       }
@@ -1595,7 +1604,13 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
   // full source (the swept section header is "uniform ≥1-dispatch, all tiers"
   // — no legit 'proportional' remains anywhere in index.ts).
   const srcLower = src.toLowerCase();
-  for (const token of ["warn-only", "warn only", "allows bypass", "warn but do not block", "warn instead of block", "micro tier allows bypass", "proportional"]) {
+  // Code-side absence set DERIVED from the T2 docs pin's shared vocabulary so
+  // the two re-drift backstops can never silently diverge, plus the two
+  // code-only tokens (the docs corpus never carries "allows bypass" /
+  // "proportional" — index.ts is their only re-drift surface). Case-insensitive
+  // (WARN-ONLY is covered via "warn-only").
+  const codeAntiTokens = [...MICRO_WARN_ANTI_TOKENS, "allows bypass", "proportional"];
+  for (const token of codeAntiTokens) {
     ok(!srcLower.includes(token), `index.ts must not contain ${JSON.stringify(token)} — a micro warn/proportional re-label re-drifted (#486/#493 class)`);
   }
 });
