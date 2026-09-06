@@ -13,6 +13,11 @@
  * Run: npx tsx extensions/subagent/cache-integration.test.ts
  */
 
+// #496: real-pi suite — provider-fallback kill-switch ON (see
+// timeout-integration.test.ts header for the rationale; fallback coverage lives
+// in the hermetic provider-fallback.test.ts).
+process.env.SUBAGENT_FALLBACK_DISABLE = "1";
+
 import { runSingleAgent, getCacheDir, type SingleResult } from "./index.js";
 import type { AgentConfig } from "./agents.js";
 import * as fs from "node:fs";

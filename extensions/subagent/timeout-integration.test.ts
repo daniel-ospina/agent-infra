@@ -14,6 +14,14 @@
  * Run: npx tsx extensions/subagent/timeout-integration.test.ts
  */
 
+// #496: this real-pi suite runs with the provider-fallback kill-switch ON — the
+// external-SIGKILL cut test runs with SUBAGENT_TASK_TIMEOUT_MS=0 (backstop =
+// fixed 6h30m), and a real pi child's ambient stderr could carry a provider
+// signature before the SIGKILL (a provider 429 logged during retry, a local MCP
+// "connection error") that would trigger a fallback attempt and hang the suite.
+// The fallback path is covered by the hermetic provider-fallback.test.ts instead.
+process.env.SUBAGENT_FALLBACK_DISABLE = "1";
+
 import { runSingleAgent, isFailedResult, type SingleResult } from "./index.js";
 import type { AgentConfig } from "./agents.js";
 import { execSync } from "node:child_process";

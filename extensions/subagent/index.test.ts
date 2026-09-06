@@ -25,6 +25,13 @@ import {
 	getSubagentBackstopFreshMs,
 	backstopShouldFire,
 	DEFAULT_SUBAGENT_BACKSTOP_MARGIN_MS,
+	classifyProviderFailure,
+	shouldFallbackDispatch,
+	getSubagentFallbackModel,
+	DEFAULT_SUBAGENT_FALLBACK_MODEL,
+	stripStackFrames,
+	scanForProviderFailure,
+	type ProviderFailureClass,
 	type SingleResult,
 } from "./index.js";
 import { augmentPath, getSubAgentPath, getPiInvocation } from "../builtin-tools/index.js";
@@ -480,6 +487,217 @@ test("#208: byte-freshness-gated backstop wired (round-3 F1 option a)", () => {
 	ok(source.includes("backstopFired = true"), "backstop fire flag latched");
 	ok(source.includes('killTree("SIGTERM")'), "backstop kills the tree");
 	ok(source.includes("stopReason: reason"), "backstop resolves with stopReason (cut)");
+});
+
+// ── #496 provider-failure classification ────────────────
+
+section("classifyProviderFailure — #496 provider-failure classes");
+
+test("success result → none", () => {
+	ok(!isFailedResult(makeResult({})), "sanity: success is not failed");
+	equal(classifyProviderFailure(makeResult({})), "none");
+});
+
+test("unknown-agent stderr → none", () => {
+	const r = makeResult({
+		exitCode: 1,
+		stderr: 'Unknown agent: "foo". Available agents: none.',
+	});
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("agent-task error text (TypeError, no signature) → none", () => {
+	const r = makeResult({ exitCode: 1, stopReason: "error", errorMessage: "TypeError: x is not a function", stderr: "at foo (bar.js:1:2)" });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("exitCode 0 output merely mentions a phrase → none (not scanned)", () => {
+	const r = makeResult({ exitCode: 0, messages: [assistantMsg("the docs mention 429 rate limits and 500 errors")] });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("stopReason timeout → none (our kill, not a provider death)", () => {
+	ok(isFailedResult(makeResult({ stopReason: "timeout" })), "sanity: timeout is failed");
+	equal(classifyProviderFailure(makeResult({ stopReason: "timeout" })), "none");
+});
+
+test("stopReason aborted → none (user kill)", () => {
+	equal(classifyProviderFailure(makeResult({ stopReason: "aborted" })), "none");
+});
+
+test("marker-less cut → none (bug-crash/backstop/OOM must not latch)", () => {
+	const r = makeResult({ exitCode: 0, stopReason: "cut", stderr: "some marker-less stderr" });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("cut whose OUTPUT-only mentions a phrase → none (output is NOT scanned for cut)", () => {
+	const r = makeResult({ exitCode: 0, stopReason: "cut", messages: [assistantMsg("agent was mid-answer: connection error on upstream retry")] });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("errorMessage 'Connection error.' → connection", () => {
+	const r = makeResult({ exitCode: 1, stopReason: "error", errorMessage: "Connection error." });
+	equal(classifyProviderFailure(r), "connection");
+});
+
+test("stderr 'Insufficient Balance' + exit 1 → exhaustion (always-scanned stderr)", () => {
+	const r = makeResult({ exitCode: 1, stderr: '402 {"message":"Insufficient Balance"}' });
+	equal(classifyProviderFailure(r), "exhaustion");
+});
+
+test("stderr 'HTTP 429 rate limit' + exit 1 → provider", () => {
+	const r = makeResult({ exitCode: 1, stderr: "HTTP 429 rate limit exceeded" });
+	equal(classifyProviderFailure(r), "provider");
+});
+
+test("exit 0 + stopReason error with in-band 'bad gateway' message → provider (output scanned)", () => {
+	const r = makeResult({ exitCode: 0, stopReason: "error", messages: [assistantMsg("internal server error from the upstream api")] });
+	equal(classifyProviderFailure(r), "provider");
+});
+
+test("cut with stderr connection signature → connection (always-scanned stderr)", () => {
+	const r = makeResult({ exitCode: 0, stopReason: "cut", stderr: "Connection error. retrying..." });
+	equal(classifyProviderFailure(r), "connection");
+});
+
+test("cut carrying an in-band errorMessage exhaustion signature → exhaustion", () => {
+	const r = makeResult({ exitCode: 0, stopReason: "cut", errorMessage: "Insufficient Balance (402)" });
+	equal(classifyProviderFailure(r), "exhaustion");
+});
+
+test("port-bearing transport shapes classify (strip must not delete the anchor)", () => {
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "402 from api.deepseek.com:443" })), "exhaustion");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "error 402 from https://api.deepseek.com:443" })), "exhaustion");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "504 from https://proxy:8443" })), "provider");
+});
+
+section("classifyProviderFailure — realistic non-provider stderr never latches (#496)");
+
+test("JS stack frame with :402: line tail → none", () => {
+	const r = makeResult({ exitCode: 1, stderr: "Error: boom\n    at run (/repo/extensions/index.ts:402:11)" });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("node-internal frame (loader:507:10) → none", () => {
+	const r = makeResult({ exitCode: 1, stderr: "node:internal/modules/cjs/loader:507:10" });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("token-bearing module frame (undici lib/api/request.js:402:11) → none", () => {
+	const r = makeResult({ exitCode: 1, stderr: "    at fetch (.../node_modules/undici/lib/api/request.js:402:11)" });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("token-bearing module frame (src/provider.ts:507:10) → none", () => {
+	const r = makeResult({ exitCode: 1, stderr: "    at retry (.../src/provider.ts:507:10)" });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("token-bearing frame (at getProvider (src/provider.ts:402:11)) → none", () => {
+	const r = makeResult({ exitCode: 1, stderr: "    at getProvider (src/provider.ts:402:11)" });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("ENOSPC 'Disk quota exceeded' → none", () => {
+	const r = makeResult({ exitCode: 1, stderr: "Error: ENOSPC: no space left on device, write\nDisk quota exceeded" });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("error-object dump '{ code: 429 }' without transport token → none", () => {
+	const r = makeResult({ exitCode: 1, stderr: 'Error: something failed { code: 429 }' });
+	equal(classifyProviderFailure(r), "none");
+});
+
+test("duration/measurement shapes → none (numeric right-guard)", () => {
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: "api responded in 512ms" })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: '{"message":"done","elapsed":"500ms"}' })), "none");
+	equal(classifyProviderFailure(makeResult({ exitCode: 1, stderr: 'level=info msg="upstream ok in 500ms"' })), "none");
+});
+
+section("scanForProviderFailure / stripStackFrames — #496 two-pass scan");
+
+test("stripStackFrames removes path:line[:col] tails", () => {
+	equal(stripStackFrames("boom at /a/b/index.ts:402:11 done"), "boom at  done");
+});
+
+test("scanForProviderFailure: phrase on stripped text; numeric anchored on original", () => {
+	equal(scanForProviderFailure("Connection error"), "connection");
+	equal(scanForProviderFailure("Insufficient Balance"), "exhaustion");
+	equal(scanForProviderFailure("HTTP 429"), "provider");
+	equal(scanForProviderFailure("api responded in 512ms"), "none");
+	equal(scanForProviderFailure("at foo (x.ts:402:11)"), "none");
+});
+
+// ── #496 fallback decision + model getters ──────────────
+
+section("shouldFallbackDispatch — #496 decision matrix");
+
+test("provider class + enabled + not aborted → true", () => {
+	ok(shouldFallbackDispatch({ providerFailureClass: "connection", fallbackDisabled: false, signalAborted: false }));
+	ok(shouldFallbackDispatch({ providerFailureClass: "exhaustion", fallbackDisabled: false, signalAborted: false }));
+	ok(shouldFallbackDispatch({ providerFailureClass: "provider", fallbackDisabled: false, signalAborted: false }));
+});
+
+test("class none → false", () => {
+	equal(shouldFallbackDispatch({ providerFailureClass: "none", fallbackDisabled: false, signalAborted: false }), false);
+});
+
+test("fallbackDisabled → false even for a provider class", () => {
+	equal(shouldFallbackDispatch({ providerFailureClass: "connection", fallbackDisabled: true, signalAborted: false }), false);
+});
+
+test("signalAborted → false even for a provider class", () => {
+	equal(shouldFallbackDispatch({ providerFailureClass: "connection", fallbackDisabled: false, signalAborted: true }), false);
+});
+
+section("getSubagentFallbackModel — #496 env resolution");
+
+test("default mirrors builtin TASK_FALLBACK_MODEL (deepseek-v4-pro)", () => {
+	equal(DEFAULT_SUBAGENT_FALLBACK_MODEL, "deepseek-v4-pro");
+});
+
+test("unset → default", () => {
+	withEnv({ SUBAGENT_FALLBACK_MODEL: undefined }, () => {
+		equal(getSubagentFallbackModel(), "deepseek-v4-pro");
+	});
+});
+
+test("env override wins", () => {
+	withEnv({ SUBAGENT_FALLBACK_MODEL: "qwen3.8-max" }, () => {
+		equal(getSubagentFallbackModel(), "qwen3.8-max");
+	});
+});
+
+test("empty env → default", () => {
+	withEnv({ SUBAGENT_FALLBACK_MODEL: "" }, () => {
+		equal(getSubagentFallbackModel(), "deepseek-v4-pro");
+	});
+});
+
+section("#496 — dispatch contract source-drift asserts");
+
+test("#496: per-attempt closure + orchestrator wiring pins", () => {
+	ok(source.includes("const runAttempt = async (isFallback: boolean): Promise<SingleResult> => {"), "per-attempt closure exists");
+	ok(source.includes("const effectiveModel = isFallback ? fallbackModel : agent.model;"), "model slot: agent.model on attempt 0, fallback on attempt 1");
+	ok(source.includes("let result = await runAttempt(false);"), "orchestrator runs attempt 0 first");
+	ok(source.includes("result = await runAttempt(true);"), "orchestrator runs at most one fallback attempt");
+	ok(source.includes("classifyProviderFailure(result)"), "attempt-0 result is classified");
+	ok(source.includes("shouldFallbackDispatch({"), "decision function gates the fallback");
+	ok(source.includes("signal?.aborted"), "abort signal re-checked before the fallback");
+});
+
+test("#496: SUBAGENT_ATTEMPT per-level marker + annotation-before-cache pins", () => {
+	ok(source.includes('if (isFallback) childEnv.SUBAGENT_ATTEMPT = "1";'), "fallback child gets SUBAGENT_ATTEMPT=1");
+	ok(source.includes("delete childEnv.SUBAGENT_ATTEMPT"), "attempt-0 childEnv deletes the marker (per-level — nested fallback parents cannot leak it)");
+	ok(source.includes("currentResult.fallbackFrom = agent.model ?? \"(default)\";"), "fallbackFrom annotation set before cacheResult");
+	ok(source.includes("currentResult.fallbackTo = fallbackModel;"), "fallbackTo annotation set before cacheResult");
+	ok(source.includes("if (isFallback) {"), "annotation is fallback-attempt-only");
+});
+
+test("#496: classifier negatives gate + settle hygiene pins", () => {
+	ok(source.includes('result.stopReason === "timeout" || result.stopReason === "aborted"'), "timeout/aborted results never classify (our kills)");
+	ok(source.includes("signal?.removeEventListener(\"abort\", signalListener)"), "abort listener removed at settle (no session leak)");
+	ok(source.includes("const cacheDir = getCacheDir(agentName, task);"), "per-attempt cache dir inside the closure");
 });
 
 // ── Results ───────────────────────────────────────────

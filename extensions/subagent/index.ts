@@ -174,6 +174,12 @@ export interface SingleResult {
 	step?: number;
 	/** #137: directory where this result was cached (see getCacheDir). */
 	cachePath?: string;
+	/** #496: provider-failure fallback annotation — the primary model id (or "(default)"
+	 * when the agent had no explicit model). Set on the fallback attempt's result only. */
+	fallbackFrom?: string;
+	/** #496: provider-failure fallback annotation — the fallback model used for the
+	 * re-dispatch. Set on the fallback attempt's result only. */
+	fallbackTo?: string;
 }
 
 interface SubagentDetails {
@@ -447,6 +453,132 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
+// ── #496: provider-failure classification + fallback decision ────────────
+//
+// The builtin task tool recovers from #152-class connection-error storms by
+// re-dispatching ONCE on a fallback model (TASK_FALLBACK_MODEL) when a
+// connection-error signature is detected — but gated to qwen providers only.
+// This generalizes that recovery to ANY provider-failure class (connection /
+// 402-exhaustion per #476 / provider 5xx + rate-limit) for the subagent tool:
+// a provider failure mid-run must not kill single/parallel/chain batches.
+//
+// Failure classification is deliberately CONSERVATIVE: only genuine provider
+// signatures trigger a fallback. Agent-task errors, unknown agents, our own
+// timeout/abort kills and marker-less cuts never do — a fallback would mask
+// real agent bugs or duplicate expensive work (#476 "bug-crash must not latch"
+// analog). Max ONE fallback per dispatch (structural — the orchestrator never
+// re-classifies attempt 1's result).
+//
+// Env surface:
+//   SUBAGENT_FALLBACK_MODEL    fallback model id (default "deepseek-v4-pro",
+//                              mirroring builtin TASK_FALLBACK_MODEL)
+//   SUBAGENT_FALLBACK_DISABLE  "1" turns the fallback OFF (kill-switch)
+//   SUBAGENT_ATTEMPT           child-env marker: "1" on fallback dispatches
+//                              only (per-level observability + test seam)
+
+export type ProviderFailureClass = "none" | "connection" | "exhaustion" | "provider";
+
+/** Text-phrase signatures per class (case-insensitive). Numeric status codes are
+ * handled separately (see NUMERIC_STATUS) — bare numerics never match. */
+const PROVIDER_PHRASE_PATTERNS: Array<[ProviderFailureClass, RegExp]> = [
+	["exhaustion", /insufficient balance|credit balance too low|out of credits|insufficient credits|no credits|payment required/i],
+	["connection", /connection error|terminated|econnreset|econnrefused|enotfound|etimedout|epipe|socket hang up|network error|connect timed out/i],
+	["provider", /rate limit|too many requests|upstream error|provider error|internal server error|bad gateway|service unavailable/i],
+];
+
+/** Transport/API tokens that may anchor a numeric status code within 25 chars. */
+const NUMERIC_ANCHOR = /(?:http|status|response|request|api|provider|upstream|message)/i;
+
+/** Numeric status candidates: left-delimited (a glued `:402` inside a frame path
+ * `request.js:402:11` is excluded) and right-delimited (a unit-suffixed duration
+ * `512ms` is excluded). */
+const NUMERIC_STATUS = /(?<![\w$@./:-])(402|429|5\d\d)(?![a-z])/g;
+
+function numericClassFor(code: string): ProviderFailureClass | null {
+	if (code === "402") return "exhaustion";
+	if (code === "429" || /^5\d\d$/.test(code)) return "provider";
+	return null;
+}
+
+/** #496: remove stack-frame tails (`path:line[:col]`) so phrase patterns can never
+ * match module paths in stack traces. The numeric pass uses the ORIGINAL text
+ * instead (a stack-frame strip would delete port-glued hosts like
+ * `api.deepseek.com:443` that carry the only transport token). */
+export function stripStackFrames(text: string): string {
+	return text.replace(/[\w$@./:-]+:\d+(?::\d+)?/g, "");
+}
+
+/** #496: two-pass signature scan over ONE field. Pass 1 — text phrases on the
+ * stack-frame-stripped text. Pass 2 — guarded numeric status codes on the
+ * ORIGINAL text, adjacent (≤25 chars, either direction) to a transport/API
+ * token. Returns the class or "none". */
+export function scanForProviderFailure(text: string): ProviderFailureClass {
+	if (!text) return "none";
+	const stripped = stripStackFrames(text);
+	for (const [cls, re] of PROVIDER_PHRASE_PATTERNS) {
+		if (re.test(stripped)) return cls;
+	}
+	for (const m of text.matchAll(NUMERIC_STATUS)) {
+		const cls = numericClassFor(m[0]);
+		if (!cls) continue;
+		const before = text.slice(Math.max(0, (m.index ?? 0) - 25), m.index ?? 0);
+		const after = text.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 25);
+		if (NUMERIC_ANCHOR.test(before) || NUMERIC_ANCHOR.test(after)) return cls;
+	}
+	return "none";
+}
+
+/** #496: classify a COMPLETED dispatch result for provider failure. All must hold
+ * to return a class: the result is failed (isFailedResult); the stopReason is not
+ * one of OUR kills (timeout/aborted — a worker we killed was not provider-dead);
+ * and a signature matches the always-scanned errorMessage+stderr fields (and the
+ * composed output when exitCode !== 0 || stopReason === "error" — an exit-0 run
+ * whose final message_end carries stopReason "error" IS a failure). A "cut"
+ * (signal-death) classifies ONLY via the always-scanned fields: its exitCode stays
+ * 0 so its output content is not scanned; a marker-less cut (no signature in
+ * errorMessage/stderr) is a bug-crash/backstop/OOM and returns "none". */
+export function classifyProviderFailure(result: SingleResult): ProviderFailureClass {
+	if (!isFailedResult(result)) return "none";
+	if (result.stopReason === "timeout" || result.stopReason === "aborted") return "none";
+	const fields: string[] = [result.errorMessage ?? "", result.stderr ?? ""];
+	if (result.exitCode !== 0 || result.stopReason === "error") {
+		fields.push(getResultOutput(result));
+	}
+	for (const field of fields) {
+		const cls = scanForProviderFailure(field);
+		if (cls !== "none") return cls;
+	}
+	return "none";
+}
+
+export interface FallbackDispatchDecision {
+	/** Classification of the attempt-0 result. */
+	providerFailureClass: ProviderFailureClass;
+	/** SUBAGENT_FALLBACK_DISABLE=1 turns the fallback off. */
+	fallbackDisabled: boolean;
+	/** Orchestrator re-checks the abort signal before spawning attempt 1. */
+	signalAborted: boolean;
+}
+
+/** #496: should attempt 0 be re-dispatched ONCE on the fallback model? All must
+ * hold: fallback enabled (not SUBAGENT_FALLBACK_DISABLE), no abort in progress,
+ * and the result is a genuine provider-failure class. Mirrors the builtin #152
+ * shouldFallback shape minus the qwen-only provider gate (generalized). Max ONE
+ * fallback is structural — the orchestrator never re-classifies attempt 1. */
+export function shouldFallbackDispatch(d: FallbackDispatchDecision): boolean {
+	if (d.fallbackDisabled) return false;
+	if (d.signalAborted) return false;
+	return d.providerFailureClass !== "none";
+}
+
+/** #496: fallback model for provider-failure re-dispatches. Mirrors builtin
+ * TASK_FALLBACK_MODEL (default deepseek-v4-pro). */
+export const DEFAULT_SUBAGENT_FALLBACK_MODEL = "deepseek-v4-pro";
+
+export function getSubagentFallbackModel(): string {
+	return process.env.SUBAGENT_FALLBACK_MODEL || DEFAULT_SUBAGENT_FALLBACK_MODEL;
+}
+
 export async function runSingleAgent(
 	defaultCwd: string,
 	agents: AgentConfig[],
@@ -474,374 +606,448 @@ export async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (agent.model) args.push("--model", agent.model);
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	// #496: provider-failure fallback — resolved once per dispatch. Attempt 0 is
+	// byte-identical to pre-#496 behavior; a classified provider failure
+	// (connection / exhaustion / provider 5xx) re-dispatches AT MOST ONCE on the
+	// fallback model. Per-attempt state (currentResult, cacheDir, settle
+	// machinery, args, tmp-prompt lifecycle) is created fresh inside runAttempt —
+	// a fallback is a fully independent spawn with its own settle-exactly-once
+	// state machine (#208) and its own cache entry (#137 F6).
+	const fallbackModel = getSubagentFallbackModel();
+	const fallbackDisabled = process.env.SUBAGENT_FALLBACK_DISABLE === "1";
 
-	let tmpPromptDir: string | null = null;
-	let tmpPromptPath: string | null = null;
+	const runAttempt = async (isFallback: boolean): Promise<SingleResult> => {
+		// #496: the model slot — agent.model on attempt 0; the fallback model on
+		// attempt 1. Exactly ONE --model pair in the same position the pre-#496
+		// args used (never appended after the Task positional — pi's parser
+		// silently drops a value-less trailing --model).
+		const effectiveModel = isFallback ? fallbackModel : agent.model;
+		const args: string[] = ["--mode", "json", "-p", "--no-session"];
+		if (effectiveModel) args.push("--model", effectiveModel);
+		if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
-	const currentResult: SingleResult = {
-		agent: agentName,
-		agentSource: agent.source,
-		task,
-		exitCode: 0,
-		messages: [],
-		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
-		step,
-	};
+		let tmpPromptDir: string | null = null;
+		let tmpPromptPath: string | null = null;
 
-	// #137 F6: every completed dispatch (success/failure/timeout/abort) is
-	// cached to disk so the orchestrator can recover the worker's output.
-	const cacheDir = getCacheDir(agentName, task);
-	const emitUpdate = () => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
-				details: makeDetails([currentResult]),
-			});
+		const currentResult: SingleResult = {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			exitCode: 0,
+			messages: [],
+			stderr: "",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			// #496: attempt-1's result truthfully reports the fallback model (the
+			// message_end handler only fills msg.model when the field is falsy).
+			model: effectiveModel,
+			step,
+		};
+
+		// #496: annotation on the fallback attempt ONLY, set BEFORE cacheResult so
+		// the on-disk result.json and the live result are identical (the
+		// orchestrator reads the cache after an abort — it must see the fallback).
+		// Attempt-0's cache + live result carry NO fallback fields.
+		if (isFallback) {
+			currentResult.fallbackFrom = agent.model ?? "(default)";
+			currentResult.fallbackTo = fallbackModel;
 		}
-	};
 
-	try {
-		if (agent.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
-			tmpPromptDir = tmp.dir;
-			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
-		}
+		// #137 F6: every completed dispatch (success/failure/timeout/abort) is
+		// cached to disk so the orchestrator can recover the worker's output.
+		// #496: per-attempt dir — the timestamped digest differs across attempts,
+		// so attempt 1 never overwrites attempt 0's cache entry.
+		const cacheDir = getCacheDir(agentName, task);
+		const emitUpdate = () => {
+			if (onUpdate) {
+				onUpdate({
+					content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
+					details: makeDetails([currentResult]),
+				});
+			}
+		};
 
-		args.push(`Task: ${task}`);
-		let wasAborted = false;
-		let timedOut = false;
-
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			// #36: Ensure sub-agent PATH includes common python3 locations
-			// so MCP servers using bare `python3` resolve.
-			const augmentedPath = getSubAgentPath();
-			// #137 F8: detached spawn gives the sub-agent its own process group,
-			// so treeKill can signal it (and its MCP server children) without
-			// ever signalling the orchestrator. Opt out via SUBAGENT_DETACHED=0.
-			const detached = process.env.SUBAGENT_DETACHED !== "0";
-			// #285 P1-2: subagent-tool children get the task-sub-agent identity
-			// markers (TASK_HEARTBEAT=1 + PI_MODE=print — the pair that
-			// verification-gate / review-enforcer / task-heartbeat discriminate
-			// on) so the fail-closed gates apply uniformly across BOTH
-			// dispatchers (builtin-tools task tool + this tool). The emitter is
-			// kept inert via TASK_HEARTBEAT_DISABLE=1 (this tool has no
-			// per-dispatch nonce and no parent marker parser — a live emitter
-			// would pollute every dispatch result with empty-nonce noise). The
-			// parent's inherited review-gate bypass env (ELDATO_SKIP_VGATE /
-			// ELDATO_SKIP_REVIEW_GATE / AGENT_SKIP_REVIEW_GATE) is stripped;
-			// AGENT_SKIP_REVIEW_GATE is then FORCED to "1" (#825: review
-			// DISPATCH stays parent-enforced — the child must never self-
-			// satisfy the review-enforcer; the merge-registry gate stays
-			// ACTIVE, #285 P1-2b).
-			const childEnv: Record<string, string | undefined> = {
-				...process.env,
-				PATH: augmentedPath,
-				TASK_HEARTBEAT: "1",
-				PI_MODE: "print",
-				TASK_HEARTBEAT_DISABLE: "1",
-				AGENT_SKIP_REVIEW_GATE: "1",
-			};
-			// #285 Fix A: key-specific strip of the inherited bypass vars.
-			delete childEnv.ELDATO_SKIP_VGATE;
-			delete childEnv.ELDATO_SKIP_REVIEW_GATE;
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
-				shell: false,
-				detached,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: childEnv,
-			});
-			// #208: pgid captured at spawn — for a detached spawn this is the
-			// child's OWN group (setsid); the shared sweep helper's runtime
-			// guard skips + warns when SUBAGENT_DETACHED=0 (the child shares
-			// the orchestrator's pgid — never signal it; implies
-			// SUBAGENT_SWEEP=0).
-			const childPgid: number | null = getPgid(proc.pid ?? 0) ?? proc.pid ?? null;
-			// #208 F1: settle-exactly-once — `settled` gates EVERY settle path
-			// (exit-settle, close, backstop, error); `swept` gates the
-			// fire-and-forget settle-path sweep. graceTimer is cleared when
-			// close fires first (a stale timer can never re-fire into a
-			// recycled pgid); backstopTimer is cleared on settle and never
-			// re-armed after settle.
-			let settled = false;
-			let swept = false;
-			let graceTimer: NodeJS.Timeout | null = null;
-			let backstopTimer: NodeJS.Timeout | undefined;
-			let backstopFired = false;
-			const startedAt = Date.now();
-			let lastOutputAt = 0;
-
-			// Heartbeat: prevent silence timeout during long tool calls (review dispatches, batch reads).
-			// Research: 30s interval balances false-positives (<5s jitter risk) vs detection speed (>30s misses crashes).
-			// Uses stdout empty line — processLine skips whitespace-only lines (#6539).
-			const HEARTBEAT_MS = 30_000;
-			const heartbeat = setInterval(() => {
-				if (proc.exitCode === null && !proc.killed) {
-					process.stdout.write("\n");
-					emitUpdate();
-				}
-			}, HEARTBEAT_MS);
-
-			// #137 F1: per-task hard cap for hung workers. When it fires the
-			// process tree is killed (SIGTERM → 5s → SIGKILL) and the result is
-			// returned with stopReason "timeout". 0 disables (backward compat).
-			const taskTimeoutMs = getTaskTimeoutMs();
-			let taskTimeout: NodeJS.Timeout | undefined;
-			if (taskTimeoutMs > 0) {
-				taskTimeout = setTimeout(() => {
-					if (wasAborted) return; // abort already in progress — it owns the kill
-					if (proc.exitCode !== null || proc.killed) return; // already exited
-					timedOut = true;
-					killTree("SIGTERM");
-				}, taskTimeoutMs);
+		try {
+			if (agent.systemPrompt.trim()) {
+				const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
+				tmpPromptDir = tmp.dir;
+				tmpPromptPath = tmp.filePath;
+				args.push("--append-system-prompt", tmpPromptPath);
 			}
 
-			// #137 F8: recursive process-group kill — children (MCP servers)
-			// die before the sub-agent itself, so aborted sessions leave no
-			// orphans. SIGKILL fallback after 5s mirrors the old kill sequence.
-			const killTree = (signal: NodeJS.Signals) => {
-				const pid = proc.pid;
-				if (pid !== undefined) {
-					treeKill(pid, signal);
-				} else {
-					proc.kill(signal);
-				}
-				const sigkillTimer = setTimeout(() => {
+			args.push(`Task: ${task}`);
+			let wasAborted = false;
+			let timedOut = false;
+
+			const exitCode = await new Promise<number>((resolve) => {
+				const invocation = getPiInvocation(args);
+				// #36: Ensure sub-agent PATH includes common python3 locations
+				// so MCP servers using bare `python3` resolve.
+				const augmentedPath = getSubAgentPath();
+				// #137 F8: detached spawn gives the sub-agent its own process group,
+				// so treeKill can signal it (and its MCP server children) without
+				// ever signalling the orchestrator. Opt out via SUBAGENT_DETACHED=0.
+				const detached = process.env.SUBAGENT_DETACHED !== "0";
+				// #285 P1-2: subagent-tool children get the task-sub-agent identity
+				// markers (TASK_HEARTBEAT=1 + PI_MODE=print — the pair that
+				// verification-gate / review-enforcer / task-heartbeat discriminate
+				// on) so the fail-closed gates apply uniformly across BOTH
+				// dispatchers (builtin-tools task tool + this tool). The emitter is
+				// kept inert via TASK_HEARTBEAT_DISABLE=1 (this tool has no
+				// per-dispatch nonce and no parent marker parser — a live emitter
+				// would pollute every dispatch result with empty-nonce noise). The
+				// parent's inherited review-gate bypass env (ELDATO_SKIP_VGATE /
+				// ELDATO_SKIP_REVIEW_GATE / AGENT_SKIP_REVIEW_GATE) is stripped;
+				// AGENT_SKIP_REVIEW_GATE is then FORCED to "1" (#825: review
+				// DISPATCH stays parent-enforced — the child must never self-
+				// satisfy the review-enforcer; the merge-registry gate stays
+				// ACTIVE, #285 P1-2b).
+				const childEnv: Record<string, string | undefined> = {
+					...process.env,
+					PATH: augmentedPath,
+					TASK_HEARTBEAT: "1",
+					PI_MODE: "print",
+					TASK_HEARTBEAT_DISABLE: "1",
+					AGENT_SKIP_REVIEW_GATE: "1",
+				};
+				// #285 Fix A: key-specific strip of the inherited bypass vars.
+				delete childEnv.ELDATO_SKIP_VGATE;
+				delete childEnv.ELDATO_SKIP_REVIEW_GATE;
+				// #496: per-level dispatch-attempt marker. Set to "1" on the fallback
+				// child ONLY; attempt-0 EXPLICITLY deletes it (key-specific strip,
+				// mirroring the ELDATO strips above) so a nested fallback parent's
+				// marker never leaks into a grandchild PRIMARY dispatch. The marker is
+				// observability + test-seam only — never read by enforcers/gates.
+				if (isFallback) childEnv.SUBAGENT_ATTEMPT = "1";
+				else delete childEnv.SUBAGENT_ATTEMPT;
+				const proc = spawn(invocation.command, invocation.args, {
+					cwd: cwd ?? defaultCwd,
+					shell: false,
+					detached,
+					stdio: ["ignore", "pipe", "pipe"],
+					env: childEnv,
+				});
+				// #208: pgid captured at spawn — for a detached spawn this is the
+				// child's OWN group (setsid); the shared sweep helper's runtime
+				// guard skips + warns when SUBAGENT_DETACHED=0 (the child shares
+				// the orchestrator's pgid — never signal it; implies
+				// SUBAGENT_SWEEP=0).
+				const childPgid: number | null = getPgid(proc.pid ?? 0) ?? proc.pid ?? null;
+				// #208 F1: settle-exactly-once — `settled` gates EVERY settle path
+				// (exit-settle, close, backstop, error); `swept` gates the
+				// fire-and-forget settle-path sweep. graceTimer is cleared when
+				// close fires first (a stale timer can never re-fire into a
+				// recycled pgid); backstopTimer is cleared on settle and never
+				// re-armed after settle.
+				// #496: per-attempt abort-listener holder — removed at settle so a
+				// late abort after the process is gone cannot re-kill a recycled
+				// pgid and the killProc closure tree is not leaked for the session
+				// (amplified by 2 attempts × N parallel tasks during a storm).
+				let signalListener: (() => void) | undefined;
+				let settled = false;
+				let swept = false;
+				let graceTimer: NodeJS.Timeout | null = null;
+				let backstopTimer: NodeJS.Timeout | undefined;
+				let backstopFired = false;
+				const startedAt = Date.now();
+				let lastOutputAt = 0;
+
+				// Heartbeat: prevent silence timeout during long tool calls (review dispatches, batch reads).
+				// Research: 30s interval balances false-positives (<5s jitter risk) vs detection speed (>30s misses crashes).
+				// Uses stdout empty line — processLine skips whitespace-only lines (#6539).
+				const HEARTBEAT_MS = 30_000;
+				const heartbeat = setInterval(() => {
 					if (proc.exitCode === null && !proc.killed) {
-						if (pid !== undefined) treeKill(pid, "SIGKILL");
-						else proc.kill("SIGKILL");
+						process.stdout.write("\n");
+						emitUpdate();
 					}
-				}, 5000);
-				sigkillTimer.unref?.();
-				proc.once("close", () => clearTimeout(sigkillTimer));
-			};
+				}, HEARTBEAT_MS);
 
-			// #208 F1/F2: settle-exactly-once + settle-path sweep hook.
-			// doResolve wraps resolve(code ?? 0) — the settle + the sweep run
-			// EXACTLY ONCE per dispatch. Sweep gating (round-3 F2): whenever
-			// the exit-settle path resolved (close didn't fire within grace —
-			// a live pipe-holder keeps the pgid alive, so pgid-recycle risk
-			// does not apply there) OR an abnormal reason resolved via the
-			// close path (stopReason ∈ {timeout, aborted, cut} — incl. the
-			// backstop, which maps to "cut" — or a non-zero exit); no-sweep
-			// ONLY for close-within-grace with code 0 and no kill stopReason.
-			// Fire-and-forget AFTER resolve — sweep latency never counts
-			// against the resolve indicator (F3). Safety valve (D2):
-			// SUBAGENT_SWEEP=0 disables the settle-path sweep ENTIRELY; a
-			// non-detached spawn (SUBAGENT_DETACHED=0) is skipped + warned by
-			// the shared guard — the orchestrator's own group is never
-			// signaled (implies SUBAGENT_SWEEP=0).
-			const doResolve = (code: number | null, opts?: { settlePath?: "close" | "exit"; stopReason?: string }) => {
-				if (settled) return;
-				settled = true;
-				if (graceTimer) {
-					clearTimeout(graceTimer);
-					graceTimer = null;
+				// #137 F1: per-task hard cap for hung workers. When it fires the
+				// process tree is killed (SIGTERM → 5s → SIGKILL) and the result is
+				// returned with stopReason "timeout". 0 disables (backward compat).
+				const taskTimeoutMs = getTaskTimeoutMs();
+				let taskTimeout: NodeJS.Timeout | undefined;
+				if (taskTimeoutMs > 0) {
+					taskTimeout = setTimeout(() => {
+						if (wasAborted) return; // abort already in progress — it owns the kill
+						if (proc.exitCode !== null || proc.killed) return; // already exited
+						timedOut = true;
+						killTree("SIGTERM");
+					}, taskTimeoutMs);
 				}
-				if (backstopTimer) {
-					clearTimeout(backstopTimer);
-					backstopTimer = undefined;
-				}
-				const shouldSweep =
-					opts?.settlePath === "exit" ||
-					(opts?.stopReason !== undefined && opts.stopReason !== "completed_before_abort") ||
-					(code !== null && code !== 0);
-				if (shouldSweep && process.env.SUBAGENT_SWEEP !== "0" && childPgid !== null && !swept) {
-					swept = true;
-					void sweepProcessGroup(childPgid, { detached });
-				}
-				resolve(code ?? 0);
-			};
 
-			// #208 D4/round-3 F1 (option a — byte-freshness proxy): backstop
-			// timer — the last-resort parent-await bound (the ext has no marker
-			// stream, so no stateFresh analog beyond output activity). ONE-SHOT
-			// per dispatch: armed at spawn, fires at backstopMs (taskTimeout +
-			// 15min, or fixed 6h30m when timeout=0), re-armed for another
-			// interval when the freshness gate passes (bytes within the fresh
-			// window — healthy agent); fires ONCE per cut when the gate is
-			// failing (emitting-then-silent class stays bounded); cleared on
-			// settle; never re-armed after settle. SUBAGENT_BACKSTOP_MS
-			// overrides; 0 = off (deliberate unbounded-wait config).
-			const backstopMs = getSubagentBackstopMs(taskTimeoutMs);
-			const backstopFreshWindowMs = getSubagentBackstopFreshMs();
-			if (backstopMs > 0) {
-				const backstopFire = () => {
+				// #137 F8: recursive process-group kill — children (MCP servers)
+				// die before the sub-agent itself, so aborted sessions leave no
+				// orphans. SIGKILL fallback after 5s mirrors the old kill sequence.
+				const killTree = (signal: NodeJS.Signals) => {
+					const pid = proc.pid;
+					if (pid !== undefined) {
+						treeKill(pid, signal);
+					} else {
+						proc.kill(signal);
+					}
+					const sigkillTimer = setTimeout(() => {
+						if (proc.exitCode === null && !proc.killed) {
+							if (pid !== undefined) treeKill(pid, "SIGKILL");
+							else proc.kill("SIGKILL");
+						}
+					}, 5000);
+					sigkillTimer.unref?.();
+					proc.once("close", () => clearTimeout(sigkillTimer));
+				};
+
+				// #208 F1/F2: settle-exactly-once + settle-path sweep hook.
+				// doResolve wraps resolve(code ?? 0) — the settle + the sweep run
+				// EXACTLY ONCE per dispatch. Sweep gating (round-3 F2): whenever
+				// the exit-settle path resolved (close didn't fire within grace —
+				// a live pipe-holder keeps the pgid alive, so pgid-recycle risk
+				// does not apply there) OR an abnormal reason resolved via the
+				// close path (stopReason ∈ {timeout, aborted, cut} — incl. the
+				// backstop, which maps to "cut" — or a non-zero exit); no-sweep
+				// ONLY for close-within-grace with code 0 and no kill stopReason.
+				// Fire-and-forget AFTER resolve — sweep latency never counts
+				// against the resolve indicator (F3). Safety valve (D2):
+				// SUBAGENT_SWEEP=0 disables the settle-path sweep ENTIRELY; a
+				// non-detached spawn (SUBAGENT_DETACHED=0) is skipped + warned by
+				// the shared guard — the orchestrator's own group is never
+				// signaled (implies SUBAGENT_SWEEP=0).
+				const doResolve = (code: number | null, opts?: { settlePath?: "close" | "exit"; stopReason?: string }) => {
 					if (settled) return;
-					if (proc.exitCode !== null || proc.killed) return; // already exited — close will settle
-					if (!backstopShouldFire({ now: Date.now(), startedAt, lastOutputAt, backstopMs, freshWindowMs: backstopFreshWindowMs })) {
-						// healthy (bytes within the fresh window) — re-arm for
-						// another interval; the backstop is not a total dispatch cap.
-						backstopTimer = setTimeout(backstopFire, backstopMs);
+					settled = true;
+					if (graceTimer) {
+						clearTimeout(graceTimer);
+						graceTimer = null;
+					}
+					if (backstopTimer) {
+						clearTimeout(backstopTimer);
+						backstopTimer = undefined;
+					}
+					// #496: remove the attempt's abort listener at settle — every
+					// settle path funnels through doResolve, so the listener stays
+					// live through the full attempt (incl. the exit-settle grace
+					// window where an abort legitimately flips cut→aborted) and is
+					// removed exactly once the attempt is done.
+					if (signalListener) {
+						signal?.removeEventListener("abort", signalListener);
+						signalListener = undefined;
+					}
+					const shouldSweep =
+						opts?.settlePath === "exit" ||
+						(opts?.stopReason !== undefined && opts.stopReason !== "completed_before_abort") ||
+						(code !== null && code !== 0);
+					if (shouldSweep && process.env.SUBAGENT_SWEEP !== "0" && childPgid !== null && !swept) {
+						swept = true;
+						void sweepProcessGroup(childPgid, { detached });
+					}
+					resolve(code ?? 0);
+				};
+
+				// #208 D4/round-3 F1 (option a — byte-freshness proxy): backstop
+				// timer — the last-resort parent-await bound (the ext has no marker
+				// stream, so no stateFresh analog beyond output activity). ONE-SHOT
+				// per dispatch: armed at spawn, fires at backstopMs (taskTimeout +
+				// 15min, or fixed 6h30m when timeout=0), re-armed for another
+				// interval when the freshness gate passes (bytes within the fresh
+				// window — healthy agent); fires ONCE per cut when the gate is
+				// failing (emitting-then-silent class stays bounded); cleared on
+				// settle; never re-armed after settle. SUBAGENT_BACKSTOP_MS
+				// overrides; 0 = off (deliberate unbounded-wait config).
+				const backstopMs = getSubagentBackstopMs(taskTimeoutMs);
+				const backstopFreshWindowMs = getSubagentBackstopFreshMs();
+				if (backstopMs > 0) {
+					const backstopFire = () => {
+						if (settled) return;
+						if (proc.exitCode !== null || proc.killed) return; // already exited — close will settle
+						if (!backstopShouldFire({ now: Date.now(), startedAt, lastOutputAt, backstopMs, freshWindowMs: backstopFreshWindowMs })) {
+							// healthy (bytes within the fresh window) — re-arm for
+							// another interval; the backstop is not a total dispatch cap.
+							backstopTimer = setTimeout(backstopFire, backstopMs);
+							return;
+						}
+						backstopFired = true;
+						killTree("SIGTERM");
+						// resolve IMMEDIATELY — never wait on close (the child may
+						// be wedged / a pipe-holder alive).
+						if (buffer.trim()) processLine(buffer);
+						const reason = resolveStopReason(null, { timedOut, wasAborted, backstopFired });
+						if (reason) currentResult.stopReason = reason;
+						emitUpdate();
+						doResolve(null, { settlePath: "close", stopReason: reason });
+					};
+					backstopTimer = setTimeout(backstopFire, backstopMs);
+				}
+
+				let buffer = "";
+
+				const processLine = (line: string) => {
+					if (!line.trim()) return;
+					let event: any;
+					try {
+						event = JSON.parse(line);
+					} catch {
 						return;
 					}
-					backstopFired = true;
-					killTree("SIGTERM");
-					// resolve IMMEDIATELY — never wait on close (the child may
-					// be wedged / a pipe-holder alive).
-					if (buffer.trim()) processLine(buffer);
-					const reason = resolveStopReason(null, { timedOut, wasAborted, backstopFired });
-					if (reason) currentResult.stopReason = reason;
-					emitUpdate();
-					doResolve(null, { settlePath: "close", stopReason: reason });
-				};
-				backstopTimer = setTimeout(backstopFire, backstopMs);
-			}
 
-			let buffer = "";
+					if (event.type === "message_end" && event.message) {
+						const msg = event.message as Message;
+						currentResult.messages.push(msg);
 
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
+						if (msg.role === "assistant") {
+							currentResult.usage.turns++;
+							const usage = msg.usage;
+							if (usage) {
+								currentResult.usage.input += usage.input || 0;
+								currentResult.usage.output += usage.output || 0;
+								currentResult.usage.cacheRead += usage.cacheRead || 0;
+								currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+								currentResult.usage.cost += usage.cost?.total || 0;
+								currentResult.usage.contextTokens = usage.totalTokens || 0;
+							}
+							if (!currentResult.model && msg.model) currentResult.model = msg.model;
+							if (msg.stopReason) currentResult.stopReason = msg.stopReason;
+							if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+						emitUpdate();
 					}
-					emitUpdate();
-				}
 
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
+					if (event.type === "tool_result_end" && event.message) {
+						currentResult.messages.push(event.message as Message);
+						emitUpdate();
+					}
+				};
 
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				lastOutputAt = Date.now(); // #208: byte-freshness proxy (backstop gate)
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
+				proc.stdout.on("data", (data) => {
+					buffer += data.toString();
+					lastOutputAt = Date.now(); // #208: byte-freshness proxy (backstop gate)
+					const lines = buffer.split("\n");
+					buffer = lines.pop() || "";
+					for (const line of lines) processLine(line);
+				});
 
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
-				lastOutputAt = Date.now(); // #208: byte-freshness proxy (backstop gate)
-			});
+				proc.stderr.on("data", (data) => {
+					currentResult.stderr += data.toString();
+					lastOutputAt = Date.now(); // #208: byte-freshness proxy (backstop gate)
+				});
 
-			proc.on("close", (code) => {
-				clearInterval(heartbeat);
-				if (taskTimeout) clearTimeout(taskTimeout);
-				if (graceTimer) {
-					clearTimeout(graceTimer);
-					graceTimer = null;
-				}
-				if (buffer.trim()) processLine(buffer);
-				// #137 + #208: settle stopReason from the RAW close code via the
-				// shared mapping (same taxonomy as the exit-settle fallback —
-				// the grace race must not lose the branches). null (killed by
-				// signal) is distinct from 0 (clean exit); resolve() below
-				// collapses null → 0 for the exitCode field. #208 cut contract
-				// (D6): signal-death maps to stopReason "cut" with exitCode
-				// staying 0 (the raw code was null — do not fabricate).
-				// Documented limitation: the ext has no tool state, so a CLEAN
-				// mid-tool exit is undetectable here — only signal-death maps
-				// to cut.
-				const reason = resolveStopReason(code, { timedOut, wasAborted, backstopFired });
-				if (reason === "aborted") {
-					currentResult.errorMessage = `Subagent was aborted (user-initiated). Result cache: ${cacheDir}`;
-				}
-				if (reason) currentResult.stopReason = reason;
-				// F2: one final update after close so the core's streaming display
-				// receives a terminal state instead of an endless spinner.
-				emitUpdate();
-				doResolve(code, { settlePath: "close", stopReason: reason });
-			});
-
-			proc.on("exit", (code: number | null) => {
-				// #208 F1: grace-race exit-settle — `exit` fires BEFORE `close`,
-				// and the final-output composition lives in the close path.
-				// Defer settle by 2s: if `close` fires within the grace the
-				// NORMAL path is unchanged; only when an orphan holds the pipes
-				// (close never fires) does the exit-settle run (replicating the
-				// finalize composition incl. the stopReason branches). The grace
-				// timer is CLEARED when close fires first (F1) — a stale timer
-				// can never re-fire into a recycled pgid.
-				clearInterval(heartbeat);
-				if (taskTimeout) clearTimeout(taskTimeout);
-				graceTimer = setTimeout(() => {
-					graceTimer = null;
+				proc.on("close", (code) => {
+					clearInterval(heartbeat);
+					if (taskTimeout) clearTimeout(taskTimeout);
+					if (graceTimer) {
+						clearTimeout(graceTimer);
+						graceTimer = null;
+					}
 					if (buffer.trim()) processLine(buffer);
+					// #137 + #208: settle stopReason from the RAW close code via the
+					// shared mapping (same taxonomy as the exit-settle fallback —
+					// the grace race must not lose the branches). null (killed by
+					// signal) is distinct from 0 (clean exit); resolve() below
+					// collapses null → 0 for the exitCode field. #208 cut contract
+					// (D6): signal-death maps to stopReason "cut" with exitCode
+					// staying 0 (the raw code was null — do not fabricate).
+					// Documented limitation: the ext has no tool state, so a CLEAN
+					// mid-tool exit is undetectable here — only signal-death maps
+					// to cut.
 					const reason = resolveStopReason(code, { timedOut, wasAborted, backstopFired });
 					if (reason === "aborted") {
 						currentResult.errorMessage = `Subagent was aborted (user-initiated). Result cache: ${cacheDir}`;
 					}
 					if (reason) currentResult.stopReason = reason;
+					// F2: one final update after close so the core's streaming display
+					// receives a terminal state instead of an endless spinner.
 					emitUpdate();
-					doResolve(code, { settlePath: "exit", stopReason: reason });
-				}, DEFAULT_EXIT_SETTLE_GRACE_MS);
+					doResolve(code, { settlePath: "close", stopReason: reason });
+				});
+
+				proc.on("exit", (code: number | null) => {
+					// #208 F1: grace-race exit-settle — `exit` fires BEFORE `close`,
+					// and the final-output composition lives in the close path.
+					// Defer settle by 2s: if `close` fires within the grace the
+					// NORMAL path is unchanged; only when an orphan holds the pipes
+					// (close never fires) does the exit-settle run (replicating the
+					// finalize composition incl. the stopReason branches). The grace
+					// timer is CLEARED when close fires first (F1) — a stale timer
+					// can never re-fire into a recycled pgid.
+					clearInterval(heartbeat);
+					if (taskTimeout) clearTimeout(taskTimeout);
+					graceTimer = setTimeout(() => {
+						graceTimer = null;
+						if (buffer.trim()) processLine(buffer);
+						const reason = resolveStopReason(code, { timedOut, wasAborted, backstopFired });
+						if (reason === "aborted") {
+							currentResult.errorMessage = `Subagent was aborted (user-initiated). Result cache: ${cacheDir}`;
+						}
+						if (reason) currentResult.stopReason = reason;
+						emitUpdate();
+						doResolve(code, { settlePath: "exit", stopReason: reason });
+					}, DEFAULT_EXIT_SETTLE_GRACE_MS);
+				});
+
+				proc.on("error", () => {
+					clearInterval(heartbeat);
+					if (taskTimeout) clearTimeout(taskTimeout);
+					doResolve(1, { settlePath: "close" });
+				});
+
+				if (signal) {
+					// #137 F3: abort is a no-op when the process already exited or a
+					// timeout already killed it. F4: after close we return a result
+					// record instead of throwing, so completed work is never lost.
+					const killProc = () => {
+						if (timedOut) return;
+						if (shouldAbortBeNoop(proc.exitCode, wasAborted)) return;
+						wasAborted = true;
+						killTree("SIGTERM");
+					};
+					signalListener = killProc;
+					if (signal.aborted) killProc();
+					else signal.addEventListener("abort", killProc, { once: true });
+				}
 			});
 
-			proc.on("error", () => {
-				clearInterval(heartbeat);
-				if (taskTimeout) clearTimeout(taskTimeout);
-				doResolve(1, { settlePath: "close" });
-			});
+			currentResult.exitCode = exitCode;
+			currentResult.cachePath = cacheDir;
+			// F6: persist the result (success, failure, timeout, or abort) before
+			// returning — the orchestrator can recover it from disk if needed.
+			cacheResult(cacheDir, currentResult);
+			return currentResult;
+		} finally {
+			if (tmpPromptPath)
+				try {
+					fs.unlinkSync(tmpPromptPath);
+				} catch {
+					/* ignore */
+				}
+			if (tmpPromptDir)
+				try {
+					fs.rmdirSync(tmpPromptDir);
+				} catch {
+					/* ignore */
+				}
+		}
+	};
 
-			if (signal) {
-				// #137 F3: abort is a no-op when the process already exited or a
-				// timeout already killed it. F4: after close we return a result
-				// record instead of throwing, so completed work is never lost.
-				const killProc = () => {
-					if (timedOut) return;
-					if (shouldAbortBeNoop(proc.exitCode, wasAborted)) return;
-					wasAborted = true;
-					killTree("SIGTERM");
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
-		});
-
-		currentResult.exitCode = exitCode;
-		currentResult.cachePath = cacheDir;
-		// F6: persist the result (success, failure, timeout, or abort) before
-		// returning — the orchestrator can recover it from disk if needed.
-		cacheResult(cacheDir, currentResult);
-		return currentResult;
-	} finally {
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
-			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
+	// #496: attempt 0, then AT MOST ONE provider-failure fallback on the
+	// fallback model. classify/shouldFallback gate every attempt-1 spawn: only
+	// genuine provider-failure signatures qualify; agent bugs, unknown agents,
+	// our own timeout/abort kills and marker-less cuts never do. Attempt 1's
+	// result is FINAL (never re-classified → no fallback loop); the abort signal
+	// is re-checked so a user abort between attempts never spawns attempt 1.
+	let result = await runAttempt(false);
+	const failureClass = classifyProviderFailure(result);
+	if (
+		shouldFallbackDispatch({
+			providerFailureClass: failureClass,
+			fallbackDisabled,
+			signalAborted: signal?.aborted ?? false,
+		})
+	) {
+		console.error(
+			`[subagent] provider fallback: ${agent.model ?? "(default)"} → ${fallbackModel} (${failureClass}) after ${result.stopReason ?? `exit ${result.exitCode}`}`,
+		);
+		result = await runAttempt(true);
 	}
-}
+	return result;
+};
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
