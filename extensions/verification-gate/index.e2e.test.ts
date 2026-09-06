@@ -73,22 +73,27 @@ function assertD1BridgeUntouched(bridgePath: string, repoRoot: string, label: st
   // it could only ever see the sentinel's own foreign-root entry (vacuous — contradicting
   // this PR's no-vacuous-tests mandate). Scanning first makes the loop LIVE: the real
   // contamination shape — a self-blessing / real PASS write that carries an entry keyed
-  // under the scenario repo root — now reds with the precise "would survive recovery"
-  // diagnostic instead of a generic byte diff. Never drop the byte-equal (it is the gate);
+  // under the scenario repo root — reds with the precise "would survive recovery"
+  // diagnostic instead of a generic byte diff. The try is scoped to JSON.parse ALONE (a
+  // non-JSON write must not abort the scan — the byte-equal below owns that red); the
+  // shape check and the scan loop run OUTSIDE the try so the scan's ok(false) PROPAGATES
+  // instead of being swallowed by the parse guard (a swallowed scan red would degrade the
+  // diagnostic back to the generic byte diff). Never drop the byte-equal (it is the gate);
   // never reorder it before the scan (the scan is diagnostic, the equal decides).
   const repoReal = realpathSync(repoRoot);
   if (after !== null && after !== D1_SENTINEL_JSON) {
-    try {
-      const parsed = JSON.parse(after) as unknown;
-      if (parsed !== null && typeof parsed === "object" && Array.isArray((parsed as { verified_files?: unknown[] }).verified_files)) {
-        for (const vf of (parsed as { verified_files: { path: string }[] }).verified_files) {
-          const sepIdx = vf.path.indexOf("::");
-          if (sepIdx !== -1 && vf.path.slice(0, sepIdx) === repoReal) {
-            ok(false, `${label} — bridge contamination keyed under the scenario repo root (${repoReal}): ${vf.path} would survive recovery`);
-          }
+    let parsed: unknown = null;
+    try { parsed = JSON.parse(after); } catch { /* not JSON — the byte-equal below owns the red */ }
+    if (parsed !== null && typeof parsed === "object" && Array.isArray((parsed as { verified_files?: unknown }).verified_files)) {
+      for (const vf of (parsed as { verified_files: unknown[] }).verified_files) {
+        if (typeof vf === "object" && vf !== null && typeof (vf as { path?: unknown }).path === "string") {
+          const p = (vf as { path: string }).path;
+          const sepIdx = p.indexOf("::");
+          ok(sepIdx === -1 || p.slice(0, sepIdx) !== repoReal,
+            `${label} — bridge contamination keyed under the scenario repo root (${repoReal}): ${p} would survive recovery`);
         }
       }
-    } catch { /* not JSON — the byte-equal below owns the red */ }
+    }
   }
   equal(after, D1_SENTINEL_JSON,
     `${label} — exempt op must leave the deterministic D1 sentinel bridge byte-identical (allow-only: no verifiedSet/bridge writes)`);

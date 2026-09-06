@@ -1785,7 +1785,8 @@ function isPiHomeLayout(agentHomeArg?: string): boolean {
   // Optional agentHomeArg (review F3, test-only): the module root is immutable in-process,
   // so the classifier-test rows drive the REAL URL/realpath plumbing with synthetic
   // agent-home inputs — default behavior (real homedir()) is unchanged and every existing
-  // call site (probeGuardLayout) is unaffected.
+  // call site (probeGuardLayout and the canary activation gate — both no-arg) is
+  // unaffected.
   try {
     const moduleDir = fileURLToPath(new URL("../../", import.meta.url)); // agent root
     const real = realpathSync(moduleDir);
@@ -1859,13 +1860,12 @@ test("classifyGuardLayout: 32-row decision table — git → source; pi-home →
   // isPiHomeLayout real-plumbing TRUE-branch rows (review F3): the module root is immutable
   // in-process, so these drive the REAL URL/realpath plumbing with SYNTHETIC agent-home
   // inputs — the same philosophy as the isUnderOrAt rows above but one level up (exercising
-  // realpathSync + the arg plumbing + the compare). No committed context otherwise reaches
-  // the TRUE branch of the deployed discriminator: every committed run (source checkout, CI
-  // with actions/checkout, deployed pre-#482 copy) exercises the default-branch false path.
-  // Default-branch coverage stays sim-B (a physical copy under ~/.pi/agent — plan R4-F4):
-  // the module root cannot be moved in-process and a machine-dependent default assert
-  // (equal(isPiHomeLayout(), false)) was deliberately dropped (R4-F4) — these rows pin the
-  // realpath+compare+arg plumbing of the deployed discriminator's TRUE branch instead.
+  // realpathSync + the arg plumbing + the compare). Every committed run of this suite
+  // (source checkout, CI with actions/checkout) exercises the default-branch FALSE path; a
+  // deployed physical copy (sim B) exercises the default TRUE path and is unpinnable in
+  // committed runs — the machine-dependent default assert (equal(isPiHomeLayout(), false))
+  // was deliberately dropped (R4-F4); these rows pin the realpath+compare+arg plumbing of
+  // the deployed discriminator's TRUE branch instead.
   const moduleRootReal = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
   equal(isPiHomeLayout(moduleRootReal), true, "exact-match arm: agent home IS the module root (realpath plumbing live, TRUE branch)");
   equal(isPiHomeLayout(dirname(moduleRootReal)), true, "module root under its parent → TRUE branch via realpathSync");
@@ -1968,12 +1968,16 @@ test("#482 activation canary: drift-guard gate classifies an enforcement run (gi
   // Consistency arm: reachable ONLY when the gate fired, i.e. !git AND ci AND !piHome — a
   // pi-home copy inheriting CI env is already skipped AT THE GATE (the `!isCIEnv() ||
   // isPiHomeLayout()` arm) and never reaches here. The arm agrees+returns ONLY when the
-  // deployed verdict rests on a genuinely FENCE-LESS sibling doc (rule 5 — CI defers to the
-  // doc's fence state; the guards soft-skip in agreement — a consistency outcome, NOT a
-  // wiring failure). The fencePresent === false premise is load-bearing: a FENCED doc
-  // misclassified deployed (a rule-4-under-CI regression) must NOT return here — it falls
-  // through so the equal(layout, "source") below reds it.
-  if (!isSourceCheckout() && layout === "deployed" && probe.fencePresent === false) {
+  // deployed verdict rests on a genuinely FENCE-LESS RESOLVABLE sibling doc (rule 5 — CI
+  // defers to the doc's fence state; the guards soft-skip in agreement — a consistency
+  // outcome, NOT a wiring failure). Both premises are load-bearing: the docText !== null
+  // premise keeps a doc-NULL tuple in rule 3's territory — a doc-null deployed verdict is
+  // ALWAYS a rule-3 regression (rule 5 requires a resolvable doc; rule 2 is false after
+  // the gate) and must fall through so the equal(layout, "source") below reds it; the
+  // fencePresent === false premise keeps a FENCED doc misclassified deployed (a
+  // rule-4-under-CI regression) from returning here — it falls through so the
+  // equal(layout, "source") below reds it too.
+  if (!isSourceCheckout() && layout === "deployed" && docText !== null && probe.fencePresent === false) {
     console.log("  ↪ canary consistency: CI env + fence-less sibling doc classifies deployed (rule 5) — guards soft-skip in agreement; no enforcement expected");
     return;
   }
@@ -1983,8 +1987,11 @@ test("#482 activation canary: drift-guard gate classifies an enforcement run (gi
   // failing surface is the GIT-LESS CI run (the #482 headline layout for future tarball
   // runs): there it detects a rule-4 regression (a FENCED doc classified deployed — the
   // consistency arm above refused to return on fencePresent === true) or a rule-3 regression
-  // (CI + doc-null classified unknown/deployed instead of source). A deployed/unknown
-  // verdict in an enforcement layout means the drift guards are not enforcing.
+  // (CI + doc-null classified unknown instead of source — a doc-null tuple can never
+  // classify deployed: rule 5 requires the doc to resolve and rule 2 is false after the
+  // gate, so deployed is the fenced-doc rule-4 regression's surface and unknown is rule
+  // 3's). A deployed/unknown verdict in an enforcement layout means the drift guards are
+  // not enforcing.
   equal(layout, "source",
     "drift-guard gate must classify THIS run as source (git marker present — rule 1; git-less CI + doc-null — rule 3; git-less CI + fence-carrying doc — rule 4) — a deployed verdict with a FENCED doc (rule-4 regression) or doc-null (rule-3 regression → unknown), or an unknown verdict, means all three drift guards are not enforcing in an enforcement layout");
   // No-doc arm: an enforcement layout with NO resolvable doc (rule 3 under CI, or rule 1 in
@@ -2001,8 +2008,12 @@ test("#482 activation canary: drift-guard gate classifies an enforcement run (gi
     // Git-removal pin (rule-4 real wiring — rule 1 would otherwise shadow it in git runs):
     // re-classify THIS run's REAL measured tuple with the .git marker removed — with the
     // doc resolved AND fenced, rules 3-5 must still route it to source via the fence arm
-    // (rule 4). A probeGuardLayout tuple-key typo (tsx strips types — no typecheck catches
-    // it) would make fencePresent falsy → this assert flips to unknown and REDS here.
+    // (rule 4). The pin's own red surface is a CLASSIFIER-side rule-4 regression on a
+    // correctly-measured fenced probe (a fenced doc re-classified deployed or unknown with
+    // the git marker removed). A path/marker/tuple-key regression that makes the probe
+    // ITSELF fencePresent-falsy (tsx strips types — no typecheck catches it) never reaches
+    // this assert: it reds EARLIER at the fence-precondition ok(probe.fencePresent ===
+    // true) above, whose message already names the path/marker/tuple-key surface.
     // Gate: skip when the doc is fence-less or missing (the guards red those states via
     // their own correctly-worded arms) or the checkout lives under the pi home (git-removal
     // → rule 2 deployed — exotic dev layout; rule 1 still enforces).

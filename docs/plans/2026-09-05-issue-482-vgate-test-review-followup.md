@@ -431,7 +431,8 @@ function isPiHomeLayout(agentHomeArg?: string): boolean {
   // Optional agentHomeArg (code-review F3, test-only): the module root is immutable
   // in-process, so the classifier-test rows drive the REAL URL/realpath plumbing with
   // synthetic agent-home inputs — default behavior (real homedir()) is unchanged and every
-  // existing call site (probeGuardLayout) is unaffected.
+  // existing call site (probeGuardLayout and the canary activation gate — both no-arg) is
+  // unaffected (cycle-2 fixer A1: the activation gate is a second existing no-arg call site).
   try {
     const moduleDir = fileURLToPath(new URL("../../", import.meta.url)); // agent root
     const real = realpathSync(moduleDir);
@@ -516,12 +517,14 @@ test("classifyGuardLayout: 32-row decision table — git → source; pi-home →
   // isPiHomeLayout real-plumbing TRUE-branch rows (code-review F3 — added post-implementation):
   // the module root is immutable in-process, so these drive the REAL URL/realpath plumbing
   // with SYNTHETIC agent-home inputs — the same philosophy as the isUnderOrAt rows above but
-  // one level up (exercising realpathSync + the arg plumbing + the compare). No committed
-  // context otherwise reaches the TRUE branch of the deployed discriminator: every committed
-  // run (source checkout, CI with actions/checkout, deployed pre-#482 copy) exercises the
-  // default-branch false path. Default-branch coverage stays sim-B (a physical copy under
-  // ~/.pi/agent — R4-F4): the module root cannot be moved in-process and a machine-dependent
-  // default assert (equal(isPiHomeLayout(), false)) was deliberately dropped (R4-F4).
+  // one level up (exercising realpathSync + the arg plumbing + the compare). Every committed
+  // run of this suite (source checkout, CI with actions/checkout) exercises the default-branch
+  // FALSE path; a deployed physical copy (sim B) exercises the default TRUE path and is
+  // unpinnable in committed runs — the machine-dependent default assert
+  // (equal(isPiHomeLayout(), false)) was deliberately dropped (R4-F4); these rows pin the
+  // realpath+compare+arg plumbing of the deployed discriminator's TRUE branch instead
+  // (cycle-2 fixer C3+A2: the earlier "deployed pre-#482 copy exercises the false path"
+  // enumeration was wrong — a physical copy under ~/.pi/agent makes the DEFAULT return TRUE).
   const moduleRootReal = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
   equal(isPiHomeLayout(moduleRootReal), true, "exact-match arm: agent home IS the module root (realpath plumbing live, TRUE branch)");
   equal(isPiHomeLayout(dirname(moduleRootReal)), true, "module root under its parent → TRUE branch via realpathSync");
@@ -623,12 +626,17 @@ test("#482 activation canary: drift-guard gate classifies an enforcement run (gi
   // Consistency arm: reachable ONLY when the gate fired, i.e. !git AND ci AND !piHome — a
   // pi-home copy inheriting CI env is already skipped AT THE GATE (the `!isCIEnv() ||
   // isPiHomeLayout()` arm) and never reaches here. The arm agrees+returns ONLY when the
-  // deployed verdict rests on a genuinely FENCE-LESS sibling doc (rule 5 — CI defers to the
-  // doc's fence state, R2-1; the guards soft-skip in agreement — a consistency outcome, NOT
-  // a wiring failure). The fencePresent === false premise is load-bearing (code-review F5):
-  // a FENCED doc misclassified deployed (a rule-4-under-CI regression) must NOT return here
-  // — it falls through so the equal(layout, "source") below reds it.
-  if (!isSourceCheckout() && layout === "deployed" && probe.fencePresent === false) {
+  // deployed verdict rests on a genuinely FENCE-LESS RESOLVABLE sibling doc (rule 5 — CI
+  // defers to the doc's fence state, R2-1; the guards soft-skip in agreement — a
+  // consistency outcome, NOT a wiring failure). Both premises are load-bearing (cycle-2
+  // fixer B2 adds the doc-resolvable premise to code-review F5's fence premise): the
+  // docText !== null premise keeps a doc-NULL tuple in rule 3's territory — a doc-null
+  // deployed verdict is ALWAYS a rule-3 regression (rule 5 requires a resolvable doc; rule
+  // 2 is false after the gate) and falls through so the equal(layout, "source") below reds
+  // it; the fencePresent === false premise (code-review F5) keeps a FENCED doc
+  // misclassified deployed (a rule-4-under-CI regression) from returning here — it falls
+  // through so the equal(layout, "source") below reds it too.
+  if (!isSourceCheckout() && layout === "deployed" && docText !== null && probe.fencePresent === false) {
     console.log("  ↪ canary consistency: CI env + fence-less sibling doc classifies deployed (rule 5) — guards soft-skip in agreement; no enforcement expected");
     return;
   }
@@ -638,9 +646,11 @@ test("#482 activation canary: drift-guard gate classifies an enforcement run (gi
   // equal's genuine failing surface is the GIT-LESS CI run (the #482 headline layout for
   // future tarball runs): there it detects a rule-4 regression (a FENCED doc classified
   // deployed — the consistency arm above refused to return on fencePresent === true) or a
-  // rule-3 regression (CI + doc-null classified unknown/deployed instead of source). A
-  // deployed/unknown verdict in an enforcement layout means the drift guards are not
-  // enforcing.
+  // rule-3 regression (CI + doc-null classified unknown instead of source — a doc-null
+  // tuple can never classify deployed: rule 5 requires the doc to resolve and rule 2 is
+  // false after the gate, so deployed is the fenced-doc rule-4 regression's surface and
+  // unknown is rule 3's — cycle-2 fixer C1). A deployed/unknown verdict in an enforcement
+  // layout means the drift guards are not enforcing.
   equal(layout, "source",
     "drift-guard gate must classify THIS run as source (git marker present — rule 1; git-less CI + doc-null — rule 3; git-less CI + fence-carrying doc — rule 4) — a deployed verdict with a FENCED doc (rule-4 regression) or doc-null (rule-3 regression → unknown), or an unknown verdict, means all three drift guards are not enforcing in an enforcement layout");
   // No-doc arm: an enforcement layout with NO resolvable doc (rule 3 under CI, or rule 1 in
@@ -659,8 +669,14 @@ test("#482 activation canary: drift-guard gate classifies an enforcement run (gi
     // Git-removal pin (rule-4 real wiring — rule 1 would otherwise shadow it in git runs):
     // re-classify THIS run's REAL measured tuple with the .git marker removed — with the
     // doc resolved AND fenced, rules 3-5 must still route it to source via the fence arm
-    // (rule 4). A probeGuardLayout tuple-key typo (tsx strips types — no typecheck catches
-    // it) would make fencePresent falsy → this assert flips to unknown and REDS here.
+    // (rule 4). The pin's own red surface is a CLASSIFIER-side rule-4 regression on a
+    // correctly-measured fenced probe (a fenced doc re-classified deployed or unknown with
+    // the git marker removed). A path/marker/tuple-key regression that makes the probe
+    // ITSELF fencePresent-falsy (tsx strips types — no typecheck catches it) never reaches
+    // this assert: it reds EARLIER at the fence-precondition ok(probe.fencePresent ===
+    // true) above, whose message already names the path/marker/tuple-key surface (cycle-2
+    // fixer C2 — the earlier "tuple-key typo → this assert flips to unknown" claim was
+    // wrong on both halves).
     // Gate (cycle-2 R4-F3/F4): skip when the doc is fence-less or missing (the guards red
     // those states via their own correctly-worded arms) or the checkout lives under the pi
     // home (git-removal → rule 2 deployed — exotic dev layout; rule 1 still enforces; the
@@ -757,21 +773,26 @@ function assertD1BridgeUntouched(bridgePath: string, repoRoot: string, label: st
   // it could only ever see the sentinel's own foreign-root entry (vacuous). Scanning first
   // makes the loop LIVE: a self-blessing / real PASS write carrying an entry keyed under the
   // scenario repo root reds with the precise "would survive recovery" diagnostic instead of
-  // a generic byte diff. Never drop the byte-equal (it is the gate); never reorder it
+  // a generic byte diff. The try is scoped to JSON.parse ALONE (a non-JSON write must not
+  // abort the scan — the byte-equal owns that red); the shape check and the scan loop run
+  // OUTSIDE the try so the scan's ok(false) PROPAGATES instead of being swallowed by the
+  // parse guard (cycle-2 fixer B1 — a swallowed scan red degraded the diagnostic back to
+  // the generic byte diff). Never drop the byte-equal (it is the gate); never reorder it
   // before the scan (the scan is diagnostic, the equal decides).
   const repoReal = realpathSync(repoRoot);
   if (after !== null && after !== D1_SENTINEL_JSON) {
-    try {
-      const parsed = JSON.parse(after) as unknown;
-      if (parsed !== null && typeof parsed === "object" && Array.isArray((parsed as { verified_files?: unknown[] }).verified_files)) {
-        for (const vf of (parsed as { verified_files: { path: string }[] }).verified_files) {
-          const sepIdx = vf.path.indexOf("::");
-          if (sepIdx !== -1 && vf.path.slice(0, sepIdx) === repoReal) {
-            ok(false, `${label} — bridge contamination keyed under the scenario repo root (${repoReal}): ${vf.path} would survive recovery`);
-          }
+    let parsed: unknown = null;
+    try { parsed = JSON.parse(after); } catch { /* not JSON — the byte-equal below owns the red */ }
+    if (parsed !== null && typeof parsed === "object" && Array.isArray((parsed as { verified_files?: unknown }).verified_files)) {
+      for (const vf of (parsed as { verified_files: unknown[] }).verified_files) {
+        if (typeof vf === "object" && vf !== null && typeof (vf as { path?: unknown }).path === "string") {
+          const p = (vf as { path: string }).path;
+          const sepIdx = p.indexOf("::");
+          ok(sepIdx === -1 || p.slice(0, sepIdx) !== repoReal,
+            `${label} — bridge contamination keyed under the scenario repo root (${repoReal}): ${p} would survive recovery`);
         }
       }
-    } catch { /* not JSON — the byte-equal below owns the red */ }
+    }
   }
   equal(after, D1_SENTINEL_JSON,
     `${label} — exempt op must leave the deterministic D1 sentinel bridge byte-identical (allow-only: no verifiedSet/bridge writes)`);
