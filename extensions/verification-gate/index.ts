@@ -1072,7 +1072,7 @@ export function commitSweepClass(command: string): CommitSweepClass {
 // (the P0 guard — findGitCommit substring containment, wrapper-inclusive), or
 // ANY probe failure → resolvePushRangeFiles returns null → the caller's
 // status-quo staged scope (computeStagedDiff). NEVER error→[] (the
-// computeBranchDiff catch→[] fail-open precedent at index.ts L1121-1123 is the
+// computeBranchDiff catch→[] fail-open precedent is the
 // cautionary inversion). An empty RESOLVED range is audited push_range_empty
 // and allowed (an up-to-date push ships nothing).
 
@@ -1187,9 +1187,12 @@ export function resolvePushTier(trackingExists: boolean, baseMainExists: boolean
 // PURE argv builder — baseRef is the FULLY RESOLVED base ref (never DWIM);
 // src is the resolved local ref (refs/heads/<x> or HEAD). Tier A = 2-dot
 // (space form — the remote branch also LOSES remote-side-only files on a
-// diverged/force push); tier B = 3-dot first-push base. Both sides are
-// regex-whitelisted (PUSH_REFNAME + full refs), so no shell metachars can
-// reach the argv.
+// diverged/force push); tier B = 3-dot first-push base. Injection safety:
+// every value that reaches the argv is whitelist-validated before it is
+// interpolated — classifier tokens by PUSH_REFNAME/remote regex, and
+// git-state-derived values (checked-out branch name, config remote) by the
+// GIT_STATE guards in resolvePushRangeFiles — so no shell metachars can reach
+// the execSync string (execSync runs /bin/sh -c; nothing here sets shell:false).
 export function buildPushRangeDiffCommand(tier: "A" | "B", baseRef: string, src: string): string {
   if (tier === "A") return `git diff --name-only ${baseRef} ${src}`;
   return `git diff --name-only ${baseRef}...${src}`;
@@ -1222,6 +1225,16 @@ function symbolicRefShort(cwd: string): string | null {
   return v === null || v === "" ? null : v;
 }
 
+// Refname/remote validation for GIT-STATE-DERIVED values before they reach an
+// execSync string. execSync runs /bin/sh -c (NO shell:false anywhere in this
+// file), so ANY interpolated value must pass a strict whitelist: git refnames
+// legally allow shell metachars (`;`, `|`, `$`, …) — a checked-out branch or a
+// config `branch.<cur>.remote` value from a hostile repo is arbitrary shell
+// input until validated. Classifier-validated tokens (PUSH_REFNAME / the
+// remote regex) are already safe; these guards close the resolver's two
+// unvalidated inputs (security review P1). Validation failure → null (tier C).
+const GIT_STATE_REMOTE = /^[A-Za-z0-9_.-]+$/; // mirror of the classifier's remote regex
+
 export function resolvePushRangeFiles(command: string, cwd: string): string[] | null {
   const parsed = parsePushRefSpecs(command);
   if (!parsed.eligible) return null; // commit/gh/unmappable/wrapper/no_push — zero subprocess on bare commits
@@ -1232,10 +1245,18 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
   if (parsed.bare) {
     const current = symbolicRefShort(cwd);
     if (current === null) return null; // detached/unborn — cannot map
+    // ⛔ Injection guard: `current` (a git-state value, user-writable via
+    // symbolic-ref/checkout) is interpolated into config keys and refs — it
+    // must pass the refname whitelist BEFORE any execSync string is built
+    // (security review P1; refnames allow `;`/`|`/`$`).
+    if (!PUSH_REFNAME.test(current)) return null;
     if (remote === null) {
       remote = gitConfigGet(cwd, `branch.${current}.remote`);
       if (remote === null) return null;
     }
+    // ⛔ Injection guard: the config VALUE branch.<cur>.remote is user-writable
+    // repo state — validate before it reaches refs/remotes/… strings.
+    if (!GIT_STATE_REMOTE.test(remote)) return null;
     const mergeCfg = gitConfigGet(cwd, `branch.${current}.merge`);
     const m = mergeCfg !== null ? /^refs\/heads\/([A-Za-z0-9_.\/-]+)$/.exec(mergeCfg) : null;
     if (m === null) return null; // no/odd upstream config → tier C (push.default=current residual)
@@ -1254,6 +1275,8 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
     if (src === "HEAD" && !rs.colon) {
       const current = symbolicRefShort(cwd);
       if (current === null) return null;
+      // Injection guard: `current` is interpolated into dst/tracking strings.
+      if (!PUSH_REFNAME.test(current)) return null;
       if (gitProbe(cwd, "rev-parse --verify HEAD") === null) return null; // unborn
       dst = current;
       srcIsHead = true;
@@ -1304,7 +1327,7 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
     // 2-dot (A) / 3-dot (B) name-only diff. The builder emits the FULL `git
     // diff …` argv (unit-pinned) — run it directly (NOT through gitProbe,
     // which would double the `git` prefix). ANY throw → null (staged) — NEVER
-    // error→[] (the computeBranchDiff catch→[] at L1121-1123 inverted).
+    // error→[] (the computeBranchDiff catch→[] fail-open precedent inverted).
     let diffOut: string | null = null;
     try {
       diffOut = execSync(buildPushRangeDiffCommand(tier, baseRef, srcRef), {
@@ -1322,6 +1345,16 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
   if (allFiles.size === 0) {
     // Up-to-date push ships nothing — audited INSIDE the resolver so the
     // caller's shared silent empty-allow never hides the range decision.
+    // ⛔ Trust boundary (security review P2, documented): tier A reads LOCAL
+    // remote-tracking refs — same-user-writable repo state (git update-ref is
+    // not a gated verb) that can steer an empty range → audited allow. The
+    // gate's contract is same-user verification, not local-state hardening:
+    // the index was equally trusted pre-#487 and the bypass here is AUDITED
+    // (push_range_empty) where the old silent empty-allow was not. A stale
+    // tracking ref BEHIND the live remote under-scopes a --force push in the
+    // same trust class (the gate never saw remote-side-only files — identical
+    // to computeBranchDiff's origin/main staleness); the pull --rebase
+    // pre-push ceremony (01-preflight) refreshes it.
     logGateSkip("push_range_empty", command, cwd, { tier: sawTierA ? "A" : "B" });
     return [];
   }
@@ -1896,7 +1929,7 @@ export default function (pi: ExtensionAPI) {
       // (tags/--all/--mirror/wrapper/URL remote), mixed delete+content chains
       // (scenario 44 legs 2-3), commit/gh presence (the P0 backstop,
       // wrapper-inclusive), no usable base (tier C), any git failure — NEVER []
-      // on error (the computeBranchDiff catch→[] at L1121-1123 fail-open
+      // on error (the computeBranchDiff catch→[] fail-open
       // precedent). An empty RESOLVED range is audited push_range_empty inside.
       changedFiles = resolvePushRangeFiles(command, cwd) ?? computeStagedDiff(cwd);
     }

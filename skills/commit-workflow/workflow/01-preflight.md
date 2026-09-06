@@ -356,7 +356,7 @@ HEAD records only the index. `gh pr` ops are unchanged (branch diff scope).
 
 **Content-shape exemption (docs/CSS/static-only — extension-side, tier-independent):**
 when the op's relevant file set (staged diff for commit; pushed-range diff for
-content push — see below; branch diff for
+content push where a base resolves — staged otherwise; branch diff for
 `gh pr create`/merge) is ENTIRELY docs/CSS/static AND no file sits under a
 build-output directory, VGATE skips the op (audited `gate_skip:
 content_shape_exempt`). Code-bearing or mixed sets are NEVER exempt; among
@@ -384,7 +384,14 @@ refs/remotes/<remote>/<branch> <src>` when the remote-tracking ref exists
 (`refs/remotes/<remote>/main` when that ref exists, else the
 `refs/remotes/origin/main` fallback). A parked-WIP index from another session
 must not block an unrelated push of already-verified committed HEAD; an
-up-to-date push is audited `gate_skip: push_range_empty`. `git branch -D`
+up-to-date push is audited `gate_skip: push_range_empty`. ⛔ Fail-closed
+fallbacks (the range scope is a best-effort resolution, never a widening):
+when NO usable base exists (no tracking ref AND no `refs/remotes/origin/main`
+— e.g. a fresh `git init` first push) the push keeps the staged (index) check
+and can still block over parked WIP; a whole command that contains a `git
+commit`, a tag/`--all`/`--tags`/`--mirror` push, a delete+content chain, an
+unmappable refspec shape, or any probe failure likewise keeps the staged
+check. `git branch -D`
 / `git worktree remove` are not VGATE-intercepted.
 
 **How to satisfy:**
