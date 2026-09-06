@@ -235,7 +235,23 @@ test("no abort → false regardless of code", () => {
 section("getTaskTimeoutMs — SUBAGENT_TASK_TIMEOUT_MS parsing");
 
 test("unset → default 30 min (1_800_000)", () => {
-	equal(getTaskTimeoutMs(undefined), 1_800_000);
+	// #507 hermeticity: getTaskTimeoutMs(undefined) triggers the default
+	// parameter (which re-reads the ambient SUBAGENT_TASK_TIMEOUT_MS at call
+	// time), so an ambient export would break the "unset → default" assertion.
+	// Scope the env deterministically — never rely on the shell's env.
+	withEnv({ SUBAGENT_TASK_TIMEOUT_MS: undefined }, () => {
+		equal(getTaskTimeoutMs(undefined), 1_800_000);
+	});
+});
+
+test("env set + raw undefined → env wins (ambient-export contract)", () => {
+	// The default-parameter env fallback IS the production contract (call
+	// sites invoke getTaskTimeoutMs() with no arg) — an ambient export must
+	// win over the 30-min default. Pinned explicitly so the "unset" row above
+	// can never be misread as permission to drop the env fallback.
+	withEnv({ SUBAGENT_TASK_TIMEOUT_MS: "7200000" }, () => {
+		equal(getTaskTimeoutMs(undefined), 7_200_000);
+	});
 });
 
 test("'5000' → 5000", () => {
