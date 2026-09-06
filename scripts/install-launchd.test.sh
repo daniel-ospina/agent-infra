@@ -96,11 +96,13 @@ mkfakehome() { # $1 = home dir
     chmod +x "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
     chmod +x "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
     chmod +x "$1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh"
-    # #373 fleet-cadence farm (setup.sh copies these to the scripts root): the
-    # weekly plist's driver + its sibling report/watch/parser must resolve at
+    # #373 fleet-cadence farm + #469 pi-session-reaper + #476 balance-watch
+    # (setup.sh copies these to the scripts root): the weekly plist's driver +
+    # its sibling report/watch/parser AND the reaper/balance-watch drivers must
+    # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -160,10 +162,12 @@ assert_eq "$RC" "0" "fresh install exits 0"
 assert_contains "$OUT" "corruption-canary: installed + loaded" "corruption-canary installed on fresh machine"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider-latency-tripwire installed on fresh machine"
 assert_contains "$OUT" "fleet-cost-weekly: installed + loaded" "fleet-cost-weekly installed on fresh machine (#373)"
+assert_contains "$OUT" "pi-session-reaper: installed + loaded" "pi-session-reaper installed on fresh machine (#469)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
 CANARY_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.corruption-canary.plist"
 TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
 FLEET_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.fleet-cost-weekly.plist"
+REAPER_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-session-reaper.plist"
 DBW_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.deepseek-balance-watch.plist"
 HUB_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 ORACLE_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
@@ -176,6 +180,14 @@ assert_contains "$(cat "$FLEET_INSTALLED")" "$HOME1/.pi/agent/scripts/fleet-cost
 assert_contains "$(cat "$FLEET_INSTALLED")" "agent-infra-plist-version: 0.1.0" "fleet template carries version marker"
 # #373 — fleet-cost-weekly must run WEEKLY (StartCalendarInterval, not interval)
 assert_contains "$(cat "$FLEET_INSTALLED")" "StartCalendarInterval" "fleet job is calendar-scheduled (weekly)"
+# #469 — pi-session-reaper rendered-plist content asserts (farmed path,
+# ARMED REAP_DRY_RUN=0, hourly StartInterval 3600)
+assert_contains "$(cat "$REAPER_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-reap-idle.sh" "reaper plist rendered with fake HOME (farmed path)"
+assert_contains "$(cat "$REAPER_INSTALLED")" "REAP_DRY_RUN" "reaper plist carries REAP_DRY_RUN env"
+assert_contains "$(cat "$REAPER_INSTALLED")" "<string>0</string>" "reaper plist ARMED (REAP_DRY_RUN=0)"
+assert_contains "$(cat "$REAPER_INSTALLED")" "StartInterval" "reaper job is interval-scheduled"
+assert_contains "$(cat "$REAPER_INSTALLED")" "<integer>3600</integer>" "reaper job hourly (StartInterval 3600)"
+assert_contains "$(cat "$REAPER_INSTALLED")" "agent-infra-plist-version: 0.1.0" "reaper template carries version marker"
 assert_contains "$(cat "$DBW_INSTALLED")" "$HOME1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh" "balance-watch plist rendered with fake HOME (#476)"
 assert_contains "$(cat "$DBW_INSTALLED")" "agent-infra-plist-version: 0.1.0" "balance-watch template carries version marker"
 # #476 — the balance poller is the SINGLE restore authority: must run every
@@ -192,7 +204,7 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "4" "fresh install bootstraps only active jobs (canary + tripwire + fleet + balance-watch)"
+assert_eq "$BOOTSTRAP_COUNT1" "5" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

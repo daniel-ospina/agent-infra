@@ -143,6 +143,12 @@ jobs:
           done
           bash scripts/checkout-hygiene/deepseek-balance-watch.test.sh || errors=$((errors+1))
           bash scripts/install-launchd.test.sh || errors=$((errors+1))
+          # #469 — pi-session-reaper hermetic suite (fake PS/KILL/DATE shims +
+          # temp HOME/cmux store/sessions; never signals real processes). Runs
+          # POST-merge here by family precedent (script-validate is main-push
+          # only); real-tty assertions are dev-box verification steps in the
+          # #469 plan, not CI.
+          bash scripts/pi-reap-idle.test.sh || errors=$((errors+1))
           bash scripts/record-review.test.sh || errors=$((errors+1))
           # #449 — pi-bootstrap setup regression suite (no-nesting #93, active-refresh,
           # farm-link preservation, extensions/ content parity = #447 ship-list drift

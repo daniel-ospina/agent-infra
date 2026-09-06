@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- pi-session-reaper (#469): hourly reap of provably-idle interactive pi
+         REPL sessions. Idle proof is pi session JSONL only (last parseable
+         entry strictly older than REAP_IDLE_HOURS=24); cmux lifecycle is a
+         veto-only gate; every false-positive class is structurally blocked
+         (allowlist union veto, ±3s incarnation fence, settle re-verify via
+         fresh ps probes, own-session/own-tty/ancestor skips, orchestrating-
+         marathon skip). Canonical script: agent-infra/scripts/pi-reap-idle.sh
+         (COPIED to ~/.pi/agent/scripts/ by pi-bootstrap/setup.sh scripts
+         farm; #427: launchd cannot read ~/Documents repos under macOS TCC).
+         Rendered by scripts/install-launchd.sh (#304) — placeholders only.
+         ⚠️ SEQUENCING: this plist auto-installs on ANY pi session start after
+         it lands on main (sync.sh/auto-sync run setup.sh + install-launchd.sh)
+         — the sacrificial real-signal test and the dry-run/apply verification
+         MUST run pre-merge (see docs/plans/2026-09-05-issue-469-*.md). Ships
+         ARMED (REAP_DRY_RUN=0) by design: interactive runs still default to
+         dry-run; only this launchd env arms the hourly pass. Naming rationale:
+         deliberately NOT "session-lifecycle" (#341/#365 priced that token-cost
+         family) — this job is pure hygiene, keep the labels distinct. No
+         StandardOutPath/StandardErrorPath: every pass writes a capped footer
+         to ~/.pi/agent/state/pi-reap-idle.log (world-writable /tmp siblings
+         are a symlink-truncation surface + unbounded-launchd-capture twin). -->
+    <key>Label</key>
+    <string>com.eldato.pi-session-reaper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/pi-reap-idle.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>REAP_DRY_RUN</key>
+        <string>0</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+</dict>
+</plist>
