@@ -1090,6 +1090,10 @@ export type PushParseResult =
 // including an ATTACHED value (`--force-with-lease=<val>`), → unmappable.
 const PUSH_FLAG_WHITELIST = new Set(["-u", "--set-upstream", "-f", "--force", "--force-with-lease"]);
 const PUSH_REFNAME = /^[A-Za-z0-9_][A-Za-z0-9_./-]*$/;
+// Remote NAME (never a URL): shared by the classifier (explicit positionals) and
+// the resolver's git-state guard (config branch.<cur>.remote VALUE) so the two
+// can never drift apart (review cycle-2 P2).
+const PUSH_REMOTE_NAME = /^[A-Za-z0-9_.-]+$/;
 const GH_PR_OP = /\bgh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+(?:create|merge)\b/;
 
 function parsePushRefspecToken(token: string): PushRefSpec | null {
@@ -1149,7 +1153,7 @@ export function parsePushRefSpecs(command: string): PushParseResult {
       }
       const [first, ...restPos] = positionals;
       // URL remote (contains `/`, `@`, `:` outside the ref regex) → unmappable.
-      if (!/^[A-Za-z0-9_.-]+$/.test(first)) return { eligible: false, reason: "unmappable" };
+      if (!PUSH_REMOTE_NAME.test(first)) return { eligible: false, reason: "unmappable" };
       if (restPos.length === 0) {
         // Remote + no refspecs → bare with remote fixed (git pushes the current
         // branch to its configured upstream under that remote).
@@ -1173,6 +1177,11 @@ export function parsePushRefSpecs(command: string): PushParseResult {
   }
   if (pushCount === 0) return { eligible: false, reason: "no_push" };
   if (sawPureDelete) return { eligible: false, reason: "mixed_delete" }; // delete + content chain → whole-command staged
+  // Order-independent mixing guard: a bare push + an explicit-refspec push in one
+  // command cannot be represented (the bare half needs config resolution, the
+  // explicit half needs the refspec) — a bare-first command must NOT silently
+  // drop the explicit refspecs at the return below (review cycle-2 P1).
+  if (bare && refspecs.length > 0) return { eligible: false, reason: "unmappable" };
   if (bare) return { eligible: true, refspecs: [], bare: true, remote };
   return { eligible: true, refspecs, bare: false, remote };
 }
@@ -1230,11 +1239,14 @@ function symbolicRefShort(cwd: string): string | null {
 // file), so ANY interpolated value must pass a strict whitelist: git refnames
 // legally allow shell metachars (`;`, `|`, `$`, …) — a checked-out branch or a
 // config `branch.<cur>.remote` value from a hostile repo is arbitrary shell
-// input until validated. Classifier-validated tokens (PUSH_REFNAME / the
-// remote regex) are already safe; these guards close the resolver's two
+// input until validated. Classifier-validated tokens (PUSH_REFNAME /
+// PUSH_REMOTE_NAME) are already safe; these guards close the resolver's two
 // unvalidated inputs (security review P1). Validation failure → null (tier C).
-const GIT_STATE_REMOTE = /^[A-Za-z0-9_.-]+$/; // mirror of the classifier's remote regex
-
+// Accepted tier-C residuals of the guards (fail-closed, documented — review
+// cycle-2): a hierarchical config remote name (`org/team`) or a non-ASCII
+// branch name is rejected by the whitelist even though neither carries shell
+// metachars → bare pushes over parked WIP keep the staged check (status-quo,
+// pre-#487 behavior).
 export function resolvePushRangeFiles(command: string, cwd: string): string[] | null {
   const parsed = parsePushRefSpecs(command);
   if (!parsed.eligible) return null; // commit/gh/unmappable/wrapper/no_push — zero subprocess on bare commits
@@ -1256,7 +1268,7 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
     }
     // ⛔ Injection guard: the config VALUE branch.<cur>.remote is user-writable
     // repo state — validate before it reaches refs/remotes/… strings.
-    if (!GIT_STATE_REMOTE.test(remote)) return null;
+    if (!PUSH_REMOTE_NAME.test(remote)) return null;
     const mergeCfg = gitConfigGet(cwd, `branch.${current}.merge`);
     const m = mergeCfg !== null ? /^refs\/heads\/([A-Za-z0-9_.\/-]+)$/.exec(mergeCfg) : null;
     if (m === null) return null; // no/odd upstream config → tier C (push.default=current residual)

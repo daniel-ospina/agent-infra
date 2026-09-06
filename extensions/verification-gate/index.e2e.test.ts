@@ -2535,6 +2535,68 @@ async function main() {
     ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > exemptBeforeB,
        "56b: audit records content_shape_exempt for the range-scoped docs push (RED pre-fix: silent empty-index allow records nothing)");
   });
+
+  test("scenario 57 (#487 review P1 regression pin): hostile git-state ref names fail closed with NO shell side-effect", async () => {
+    // Code-review cycle-1 P1: execSync runs /bin/sh -c and the resolver
+    // interpolates git-state-derived values (checked-out branch name, config
+    // branch.<cur>.remote VALUE) — git refnames legally allow shell metachars
+    // (`;`, `|`, `$`), so without the PUSH_REFNAME/PUSH_REMOTE_NAME guards a
+    // hostile branch/config executed arbitrary shell on the first bare push.
+    // Guards present → null → tier C staged. Behavioral pin: STAGED block (not
+    // allow) + NO marker file — a regression that deletes or reorders either
+    // guard ships green on the block assert but reds the marker assert.
+    const repo = join(TEST_ROOT, "repo-487-57");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base57.txt"), "b\n");
+    git(repo, "add base57.txt");
+    git(repo, "commit -m base");
+    // Vector (a): hostile CHECKED-OUT BRANCH name (metachars are legal git
+    // refnames — created via plumbing with quoting so the fixture's own shell
+    // never expands them). Payload runs `touch pwned57a.remote` if the guard
+    // is missing (the config-key string `branch.<current>.remote` splits on
+    // the `;` and ${IFS} expands to a space in /bin/sh).
+    const markerA = join(repo, "pwned57a.remote");
+    rmSync(markerA, { force: true });
+    const hostileBranch = "x;touch${IFS}pwned57a.remote";
+    git(repo, `update-ref 'refs/heads/${hostileBranch}' HEAD`);
+    git(repo, `symbolic-ref HEAD 'refs/heads/${hostileBranch}'`);
+    writeFileSync(join(repo, "wip57.ts"), "w\n");
+    git(repo, "add wip57.ts"); // parked WIP — staged scope is the fail-closed fallback
+    await fire("session_start", {});
+    const resA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease", cwd: repo },
+    });
+    ok(resA && resA.block === true, "57a: bare push on a metachar branch must fall back to the staged check (guard → null → tier C)");
+    ok(resA.reason.includes("wip57.ts"), "57a: block names the parked WIP (staged scope)");
+    equal(existsSync(markerA), false,
+      "57a: NO shell side-effect — the hostile branch name never reached an execSync string (guard fires before interpolation)");
+    // Vector (b): hostile config VALUE branch.<cur>.remote (with the merge
+    // config present so a guard-less resolver would reach the refs/remotes/…
+    // probe). Payload: `touch pwned57b` if the remote guard is missing.
+    git(repo, "symbolic-ref HEAD refs/heads/main");
+    const markerB = join(repo, "pwned57b");
+    rmSync(markerB, { force: true });
+    git(repo, "reset -q"); // drop wip57 from the index (block-state isolation)
+    writeFileSync(join(repo, "wip57b.ts"), "w\n");
+    git(repo, "add wip57b.ts");
+    git(repo, "config branch.main.remote 'origin;touch${IFS}pwned57b'");
+    git(repo, "config branch.main.merge refs/heads/main");
+    await fire("session_start", {});
+    const resB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease", cwd: repo },
+    });
+    ok(resB && resB.block === true, "57b: bare push with a hostile config remote must fall back to the staged check (guard → null → tier C)");
+    ok(resB.reason.includes("wip57b.ts"), "57b: block names the parked WIP");
+    equal(existsSync(markerB), false,
+      "57b: NO shell side-effect — the hostile config VALUE never reached an execSync string");
+    git(repo, "config --unset branch.main.merge");
+    git(repo, "config --unset branch.main.remote");
+  });
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

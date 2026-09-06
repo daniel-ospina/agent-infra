@@ -2294,6 +2294,15 @@ test("refspecs accumulate across multi-push segments", () => {
   ]);
 });
 
+test("bare + explicit-refspec mixing is order-independent → unmappable (review cycle-2: bare-first must not drop refspecs)", () => {
+  const bareFirst = parsePushRefSpecs("git push && git push origin main");
+  ok(!bareFirst.eligible && bareFirst.reason === "unmappable", "bare-first mixing must null the whole command, never silently drop the explicit refspec");
+  const explicitFirst = parsePushRefSpecs("git push origin main && git push");
+  ok(!explicitFirst.eligible && explicitFirst.reason === "unmappable", "explicit-first mixing must null identically (order-independent)");
+  const remoteBareFirst = parsePushRefSpecs("git push origin --force-with-lease && git push origin main");
+  ok(!remoteBareFirst.eligible && remoteBareFirst.reason === "unmappable", "remote-fixed bare + explicit mixing nulls too");
+});
+
 // ── Ineligible (fail-closed) pins ──
 
 test("P0 guard: any git commit anywhere (bare, wrapper, chained) → has_commit", () => {

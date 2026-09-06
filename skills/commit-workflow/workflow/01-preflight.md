@@ -389,7 +389,8 @@ fallbacks (the range scope is a best-effort resolution, never a widening):
 when NO usable base exists (no tracking ref AND no `refs/remotes/origin/main`
 — e.g. a fresh `git init` first push) the push keeps the staged (index) check
 and can still block over parked WIP; a whole command that contains a `git
-commit`, a tag/`--all`/`--tags`/`--mirror` push, a delete+content chain, an
+commit`, a tag/`--all`/`--tags`/`--mirror` push, a delete+content chain, a
+`gh pr create`/merge anywhere in the command, an
 unmappable refspec shape, or any probe failure likewise keeps the staged
 check. `git branch -D`
 / `git worktree remove` are not VGATE-intercepted.
