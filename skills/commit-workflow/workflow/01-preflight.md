@@ -335,10 +335,14 @@ paragraph below) — except where the content-shape exemption below applies.
 **#489 — auto-sweep (`-a`/`--all`) commits are NOT index-scoped:** `git commit -a` /
 `--all` record the tracked WORKING TREE, not just the staged index. When the
 command is a pure sweep (`-a`/`--all` on every commit invocation, e.g. `git commit
--am x`, `git commit -a -m x`, `git -C repo commit --all`), VGATE verifies the
+-am x`, `git commit -a -m x`), VGATE verifies the
 HEAD-vs-working-tree file set (`git diff HEAD --name-only` — exactly what the
 sweep records) instead of the staged diff; a mixed command (sweep + bare commit in
-one op) verifies the union of staged + working-tree files. The verification prompt
+one op, including a sweep preceded by a wrapper/negated commit such as
+`sh -c 'git commit -m y' && git commit -am x`) verifies the union of staged +
+working-tree files. ⚠️ Global-option spellings (`git -C repo commit --all`,
+`git --no-pager commit …`) are NOT yet intercepted by the hook at all — always
+invoke `git commit` directly in the repo root so VGATE fires (open #490). The verification prompt
 for a sweep therefore lists WORKING-TREE files — `[VGATE] verify files: <dirty
 code>. Classification: …` — even when only docs are staged: a docs-only PASS must
 not unlock a sweep that would ship dirty, never-verified code. Bare/pathspec/

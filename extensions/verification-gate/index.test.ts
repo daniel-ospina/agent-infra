@@ -1774,6 +1774,12 @@ test("MIXED (sweep + non-sweep commit in one command) → \"mixed\"", () => {
     "git commit -m x && git commit --all -m y",   // bare then sweep
     "git commit -am x && git commit -m y",         // sweep then bare
     "git commit -m x f.txt && git commit -a -m y", // pathspec then sweep
+    // wrapper/negation commit + head-anchored sweep: the wrapper's bare half ships
+    // the whole index (staged-only content invisible to `git diff HEAD`) → must be
+    // MIXED (union scope), never pure-sweep (reviewer finding, #489 round 2):
+    "sh -c 'git commit -m y' && git commit -am x",
+    "! git commit -m y && git commit --all -m x",
+    "bash -lc 'git commit -m y' && git commit -am x",
   ];
   for (const c of pins) equal(commitSweepClass(c), "mixed", `must be mixed: ${c}`);
 });

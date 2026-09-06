@@ -1036,7 +1036,17 @@ export function commitSweepClass(command: string): CommitSweepClass {
     const stripped = stripSegmentHead(segment);
     const commitMatch = findGitCommit(stripped); // substring scan — head-anchored OR wrapper form
     if (commitMatch === null) continue;          // no commit invocation — vacuous segment
-    if (commitMatch.index !== 0) continue;       // wrapper/negation/prose — NOT classified ("none" contribution; residual #539)
+    if (commitMatch.index !== 0) {
+      // wrapper/negation/prose commit invocation — its (bare) commit half ships
+      // the WHOLE index (staged-only content whose disk state == HEAD is
+      // invisible to `git diff HEAD`), so a composite that ALSO contains a
+      // head-anchored sweep must classify "mixed" → union(staged, WT) scope.
+      // Fail-closed: treating wrappers as invisible here let
+      // `sh -c 'git commit -m y' && git commit -am x` ship staged-only code
+      // unverified (reviewer finding, #489 round 2).
+      sawNonSweepCommit = true;
+      continue;
+    }
     if (scanCommitInvocationForSweep(stripped.slice(commitMatch.end))) {
       sawSweep = true;
     } else {
