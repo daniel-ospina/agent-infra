@@ -1797,6 +1797,8 @@ test("SWEEP → \"sweep\" (single pure-sweep invocation)", () => {
     "FOO='it'\\''s' git commit -am x",             // concatenated single-quote escapes in the value
     "bash --rcfile /dev/null -c 'git commit -am x'", // long option value consumed, -c position unchanged
     "! eval \"bash -c 'git commit -am x'\"",       // composed wrappers peel recursively
+    "sh -c 'echo \"use git -C to switch\" && git commit -am x'", // prose git -C mention in payload — NOT a repo switch; real sweep classifies (cycle-4 P1 fix)
+    "sh -c 'echo \"git --git-dir decoy\"; git commit -am x'",
     "sh -c 'git commit -am x' && git push origin main", // wrapper sweep + push (vacuous) — THE #489 residual flip
     "sh -c 'git --no-optional-locks commit -am x' && git push origin main", // wrapped no-value-global + push (r3 regression flip)
     "bash -aec 'git commit -am x'",               // extended no-arg cluster chars (allexport+errexit)
@@ -1872,6 +1874,8 @@ test("NONE (bare / amend-alone / pathspec / value-swallowed / vacuous) → \"non
     'FOO="bar baz" git commit -m x',      // quoted env + bare
     "bash foo.sh",                       // script shell — no -c payload, never unwraps
     "sh -c 'cd /tmp/x && git commit -am y'",  // nested repo-switch payload — unwrap refused (wrong-repo guard)
+    "sh -c 'echo hi; git -C /other commit -am y'", // boundary-anchored real git -C — unwrap refused
+    "! (git commit -am x)",                    // subshell negation — documented residual (review cycle-4 P2)
     "git push origin main",              // vacuous — no commit invocation
     "gh pr create --body 'git commit -am x'",  // prose — never classified
     "gh pr create --body 'sh -c \"git commit -am x\"'", // wrapper-in-prose — never unwrapped (head is gh)

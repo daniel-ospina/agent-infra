@@ -1471,14 +1471,16 @@ function normalizeCommitSegment(segment: string): string {
 
 // A peeled payload whose executed text can switch the repo the commit runs in
 // (a nested `cd` command at a command boundary, or a repo-redirecting git
-// global) is a DIFFERENT checkout — this hook can only scope the session cwd
-// (#490 foreign boundary). Refuse the unwrap so the segment keeps today's
-// fail-closed wrapper handling instead of WT-scoping THIS repo for a commit
-// that runs in ANOTHER. Boundary-anchored cd (start / after ; & | newline) —
-// a `cd` inside a message or arg is not a repo switch.
+// global at a command boundary) is a DIFFERENT checkout — this hook can only
+// scope the session cwd (#490 foreign boundary). Refuse the unwrap so the
+// segment keeps today's fail-closed wrapper handling instead of WT-scoping
+// THIS repo for a commit that runs in ANOTHER. BOTH arms are command-boundary
+// anchored (start / after ; & | newline) so prose that merely MENTIONS the
+// words (`echo "use git -C to switch"`, a message arg) never refuses the
+// unwrap and hides a REAL sweep in the same payload (review cycle-4 P1).
 function wrapperPayloadSwitchesRepo(payload: string): boolean {
   if (/(?:^|[;&|\n]+)\s*cd(?=\s|$)/.test(payload)) return true;
-  return /\bgit\b[^;&|\n]*(?:\s-C\b|--git-dir|--work-tree|--namespace|--super-prefix)/.test(payload);
+  return /(?:^|[;&|\n]+)\s*git\b[^;&|\n]*(?:\s-C\b|--git-dir|--work-tree|--namespace|--super-prefix)/.test(payload);
 }
 
 // Peel PROVABLY-executing wrapper prefixes from a normalized segment head and
