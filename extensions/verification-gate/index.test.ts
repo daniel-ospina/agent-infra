@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, applyScopeGate, routeScopeGate, combineScopes } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, applyScopeGate, routeScopeGate, combineScopes } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
@@ -527,6 +527,7 @@ test("exported functions are callable (#5527 regression)", () => {
   const callables = [
     extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot,
     isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass,
+    wtPathCommitInfo,
   ] as const;
   for (const fn of callables) ok(typeof fn === "function", "export must be callable");
   equal(extractJson('{"status":"PASS","failures":[],"verified_files":[]}')!.status, "PASS", "extractJson smoke");
@@ -536,6 +537,9 @@ test("exported functions are callable (#5527 regression)", () => {
   ok(isDeletionPush("git push origin --delete feat/x"), "isDeletionPush smoke");
   ok(isBareCommitShape("git commit -m x"), "isBareCommitShape smoke");
   ok(typeof commitSweepClass === "function", "commitSweepClass smoke (callable)");
+  ok(typeof wtPathCommitInfo === "function", "wtPathCommitInfo smoke (callable)");
+  equal(wtPathCommitInfo("git commit -m x"), null, "wtPathCommitInfo smoke: bare commit → null");
+  deepEqual(wtPathCommitInfo("git commit -m x src/app.ts"), { pathspecs: ["src/app.ts"], pathspecFromFile: false }, "wtPathCommitInfo smoke: pathspec named");
 });
 
 // ── normalizeRegistryPath (#7595) ────────────────────
@@ -1818,6 +1822,79 @@ test("NONE (bare / amend-alone / pathspec / value-swallowed / vacuous) → \"non
     "gh pr create --body 'git commit -am x'",  // prose — never classified
   ];
   for (const c of pins) equal(commitSweepClass(c), "none", `must be none: ${c}`);
+});
+
+// ── #538 — WT-path commit classification (T2 carve-out follow-up to #489) ──
+// commitSweepClass answers "does the command auto-sweep the FULL tree (-a/--all)?";
+// wtPathCommitInfo answers "does the command commit NAMED paths' WORKING-TREE state
+// (pathspec / -o/--only / -i/--include)?" — a PARTIAL sweep whose recorded file set is
+// the named paths' HEAD-vs-WT diff, invisible to a staged-diff scope. Null when no
+// head-anchored commit invocation carries a pathspec; otherwise the union of named
+// pathspecs (verbatim — globs expand at diff time) plus a pathspecFromFile flag for
+// --pathspec-from-file (names live in a file — caller falls back to the full WT scope).
+// Token model mirrors the #489 scanner (shared scanCommitInvocation): required-value
+// shorts m/F/C/c/t and required-value longs consume the NEXT token; optional-value
+// shorts S/u attached-only; `--` makes every remaining token a pathspec; git permutes
+// options and positionals (flags after a pathspec still parse). HEAD-ANCHORED-ONLY:
+// wrapper/negation/prose commit invocations stay null (unchanged staged scope — the
+// #539 wrapper-residual family owns that gap). NOTE: sweep-only forms (-a/--all, no
+// pathspec) return null — the sweep-first routing gives them the full-WT branch.
+
+section("wtPathCommitInfo — WT-path commit classification (#538)");
+
+test("PRESENT (pathspec / -o / --only / -i / --include / --pathspec-from-file) → named paths", () => {
+  const cases: [string, { pathspecs: string[]; pathspecFromFile: boolean }][] = [
+    ["git commit -m x src/app.ts", { pathspecs: ["src/app.ts"], pathspecFromFile: false }],            // bare positional pathspec (git defaults to only-mode)
+    ["git commit -m x -- code.ts", { pathspecs: ["code.ts"], pathspecFromFile: false }],               // pathspec after the -- terminator
+    ["git commit src/app.ts -m x", { pathspecs: ["src/app.ts"], pathspecFromFile: false }],            // option AFTER the positional (git permutes)
+    ["git commit -o code.ts -m x", { pathspecs: ["code.ts"], pathspecFromFile: false }],               // -o is a NOARG boolean — the path arrives as a positional
+    ["git commit --only code.ts -m x", { pathspecs: ["code.ts"], pathspecFromFile: false }],
+    ["git commit -i code.ts -m x", { pathspecs: ["code.ts"], pathspecFromFile: false }],               // -i include — same named-path WT recording + staged index
+    ["git commit --include code.ts -m x", { pathspecs: ["code.ts"], pathspecFromFile: false }],
+    ["git commit -m x f.txt g.txt", { pathspecs: ["f.txt", "g.txt"], pathspecFromFile: false }],      // multiple named pathspecs
+    ["git commit -am x f.txt", { pathspecs: ["f.txt"], pathspecFromFile: false }],                     // sweep+pathspec — routing gives the sweep branch precedence
+    ["git commit -m x -- -a", { pathspecs: ["-a"], pathspecFromFile: false }],                         // after --, "-a" is a PATH not a flag (sweep stays none)
+    ["git commit --author \"Jane <j@d>\" -m x f.txt", { pathspecs: ["f.txt"], pathspecFromFile: false }], // required-value long consumed, then pathspec
+    ["git commit -m x f.txt && git commit -m y", { pathspecs: ["f.txt"], pathspecFromFile: false }],   // only the wt-path segment contributes
+    ["git -c commit.gpgsign=false commit -m x src/app.ts", { pathspecs: ["src/app.ts"], pathspecFromFile: false }], // cwd-neutral globals tolerated (#490)
+    ["sudo git commit -m x f.txt", { pathspecs: ["f.txt"], pathspecFromFile: false }],                 // stripSegmentHead normalizes prefix verbs
+    ["git commit --pathspec-from-file=p.txt -m x", { pathspecs: [], pathspecFromFile: true }],          // SPACE spelling — names in the file
+    ["git commit --pathspec-from-file p.txt -m x", { pathspecs: [], pathspecFromFile: true }],          // space spelling — file value consumed, not a pathspec
+    ["git commit -m x f.txt --pathspec-from-file=p.txt", { pathspecs: ["f.txt"], pathspecFromFile: true }], // both — fromFile wins the routing fallback
+  ];
+  for (const [c, expected] of cases) {
+    deepEqual(wtPathCommitInfo(c), expected, `wt-path info must match: ${c}`);
+  }
+});
+
+test("ABSENT (bare / amend / value-swallowed / sweep-only / wrapper / prose) → null", () => {
+  const pins = [
+    "git commit -m x",                       // bare — no named paths
+    "git commit -m x -s",
+    "git commit -m src/app.ts",              // message is "src/app.ts" — a VALUE, not a pathspec
+    "git commit --message src/app.ts",        // required-value long swallows the token
+    "git commit --message=--amend",           // attached value
+    "git commit -F msg.txt",                  // -F consumes its file value
+    "git commit -C HEAD -m x",                // -C / -c consume their commit value
+    "git commit -c HEAD -m x",
+    "git commit -t tpl.txt -m x",             // -t consumes its template value
+    "git commit -S -m x",                     // optional-value -S never consumes the next token — no positional
+    "git commit -m --amend",                  // message "--amend" — value, not a flag
+    "git commit --message -a",                // subject "-a" — value
+    "git commit --fixup HEAD",                // --fixup consumes HEAD
+    "git commit -a -m x",                     // sweep-only — full-WT branch owns it (null here)
+    "git commit --all -m x",
+    "git commit --amend -m x",                // amend-alone — staged scope, unchanged (#489 T2)
+    "git commit -m x --only",                 // -o/--only with NO paths — git errors pre-hook; stays staged scope
+    "git commit -o",
+    "sh -c 'git commit -m x f.txt'",          // wrapper — non-head-anchored → null (#539 family)
+    "! git commit -m x f.txt",
+    "bash -c 'git commit f.txt -m x' && git commit -m y", // wrapper half never parsed
+    "gh pr create --body 'git commit -m x f.txt'",  // prose — never classified
+    "git push origin main",                   // vacuous — no commit invocation
+    "git status",
+  ];
+  for (const c of pins) equal(wtPathCommitInfo(c), null, `must be null: ${c}`);
 });
 
 // ── #482 — shared drift-guard layout gate (replaces the two-#472-guard isSourceCheckout

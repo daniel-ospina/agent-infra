@@ -3343,6 +3343,142 @@ async function main() {
     ok(resB && resB.block === true, "68b: gh pr create over a branch code→docs rename must BLOCK (RED pre-fix: branch name-only exempt)");
     ok(resB.reason.includes("docs/code.md"), "68b: block names the branch rename's new docs path");
   });
+
+  test("scenario 70 (#538): WT-path commit forms — pathspec/-o/-i record NAMED paths' working-tree state — union scope (T2 carve-out follow-up to #489)", async () => {
+    // The #538 residual: `git commit <pathspec>` / `-o`/`--only` / `-i`/`--include`
+    // record the NAMED paths' WORKING-TREE state, not just the staged index (git
+    // defaults to only-mode when paths are given — the named paths' DISK content is
+    // committed, staged-for-other content ignored; empirically verified: only-mode
+    // commits unstaged dirty code, -i include adds the whole staged index). A gate
+    // scoped to `git diff --cached` lets a staged-docs verifier PASS unlock
+    // `git commit -m x src/app.ts` while the commit ships src/app.ts's never-verified
+    // dirty WT content (deployed main-level gate reproduced: the block named only the
+    // staged README; src/app.ts was invisible). Post-fix the file set is the UNION of
+    // the staged diff and the named paths' HEAD-vs-WT diff (`git diff HEAD -- <paths>`
+    // — exactly what the form records).
+    const repo = join(TEST_ROOT, "repo-538-70");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "r1\n");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "app.ts"), "a1\n");
+    git(repo, "add README.md src/app.ts");
+    git(repo, "commit -m base");
+    // Session layout mirrors scenario 48: session_start before Leg A (fresh root) and
+    // before Leg E (clears the Leg-D exempt commit's armed pendingRehash — otherwise
+    // the E fire's top-of-op re-hash would bless README from disk and drop it from the
+    // E block's Unverified set, breaking the both-named assert). NO session_start
+    // between Leg B's PASS and Leg C's allow — the README + app.ts registrations must
+    // survive verifiedSet.clear() into Leg C's allow. Every block-expecting leg edits
+    // its files to NEVER-registered content first (deterministic Unverified blocks, no
+    // hash-mismatch section).
+    await fire("session_start", {});
+    // Leg A — bare pathspec over UNVERIFIED staged docs + dirty code, union names BOTH.
+    writeFileSync(join(repo, "README.md"), "r2\n");
+    git(repo, "add README.md");
+    writeFileSync(join(repo, "src", "app.ts"), "a2\n"); // dirty — NOT staged
+    const legA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m wtpathA -- src/app.ts", cwd: repo },
+    });
+    ok(legA && legA.block === true, "Leg A: pathspec commit with staged docs + dirty code must block");
+    ok(/Unverified files[\s\S]*README\.md/.test(legA.reason), "Leg A: the staged docs are VGATE-required (union keeps the staged arm — non-bare D2, no exemption)");
+    ok(/Unverified files[\s\S]*src\/app\.ts/.test(legA.reason), "Leg A: the NAMED pathspec's dirty code is VGATE-required — block names src/app.ts (pre-fix: names only README.md)");
+    ok(!/Hash mismatch/.test(legA.reason), "Leg A: no hash-mismatch section (both files UNVERIFIED — deterministic for a fresh repo root)");
+    // Leg B — the hole closer (red pre-fix): a docs-only PASS must NOT unlock the
+    // pathspec commit — the named code file still blocks after the staged docs verify.
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: README.md. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "README.md"), hash: sha("r2\n") }],
+      }) }],
+    });
+    const legB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m wtpathB -- src/app.ts", cwd: repo },
+    });
+    ok(legB && legB.block === true, "Leg B: docs-only PASS must NOT unlock the pathspec commit — code still blocks (pre-fix: ALLOWED → dirty code ships unverified)");
+    ok(legB.reason.includes("src/app.ts"), "Leg B: block names the named-path dirty code file (VGATE-required)");
+    ok(!legB.reason.includes("README.md"), "Leg B: the verified docs file is NOT re-blocked — the docs PASS is honored (only the named-path code blocks)");
+    ok(!/Hash mismatch/.test(legB.reason), "Leg B: no hash-mismatch section — README's registration matches disk (deterministic)");
+    // Leg C — code PASS → allow → the real pathspec commit records ONLY the named path
+    // (only-mode): the staged README stays staged — the union's staged arm must not
+    // confuse what the form actually commits.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/app.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "src/app.ts"), hash: sha("a2\n") }],
+      }) }],
+    });
+    const legC = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m wtpathC -- src/app.ts", cwd: repo },
+    });
+    equal(legC, undefined, "Leg C: pathspec commit ALLOWED after the named code file verified");
+    git(repo, "commit -m wtpathC -- src/app.ts"); // execute the allowed pathspec commit for real
+    const cStat = execSync("git diff HEAD^ HEAD --name-only", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    equal(cStat.trim(), "src/app.ts", "Leg C: the real pathspec commit recorded ONLY src/app.ts (only-mode — staged README untouched)");
+    const porcelainC = execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    ok(porcelainC.includes("README.md") && !porcelainC.includes("app.ts"), "Leg C: README.md still staged after the only-mode commit; app.ts clean at HEAD");
+    // Leg D — bare docs commit stays shape-exempt as today (T2 carve-out regression
+    // guard); dirty code untouched.
+    writeFileSync(join(repo, "README.md"), "r3\n");
+    git(repo, "add README.md");
+    const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const legD = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m docsD", cwd: repo },
+    });
+    equal(legD, undefined, "Leg D: bare commit over ONLY staged docs is shape-exempt (unchanged — #489 T2 carve-out preserved)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
+       "Leg D: bare docs commit audited content_shape_exempt");
+    git(repo, "commit -m docsD"); // execute the allowed bare docs commit for real
+    equal(execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim(), "",
+       "Leg D: bare docs commit committed README.md only — porcelain clean (code committed at Leg C, untouched since)");
+    // Leg E — -i INCLUDE form: union names the STAGED docs AND the named dirty code
+    // (include records the whole staged index PLUS the named paths' WT state).
+    await fire("session_start", {});
+    writeFileSync(join(repo, "README.md"), "r4\n");
+    git(repo, "add README.md");
+    writeFileSync(join(repo, "src", "app.ts"), "a5\n"); // dirty — NOT staged
+    const legE = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -i src/app.ts -m wtpathE", cwd: repo },
+    });
+    ok(legE && legE.block === true, "Leg E: -i include with staged docs + dirty named code must block (union scope)");
+    ok(/Unverified files[\s\S]*README\.md/.test(legE.reason), "Leg E: the staged docs are VGATE-required via the union (include records the whole staged index)");
+    ok(/Unverified files[\s\S]*src\/app\.ts/.test(legE.reason), "Leg E: the named dirty code file is VGATE-required (a staged-only scope would name only README.md)");
+    ok(!/Hash mismatch/.test(legE.reason), "Leg E: no hash-mismatch section (r4/a5 never registered — deterministic)");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: README.md src/app.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [
+          { path: join(repo, "README.md"), hash: sha("r4\n") },
+          { path: join(repo, "src/app.ts"), hash: sha("a5\n") },
+        ],
+      }) }],
+    });
+    const legE2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -i src/app.ts -m wtpathE", cwd: repo },
+    });
+    equal(legE2, undefined, "Leg E: -i include ALLOWED after both files verified (union scope)");
+    git(repo, "commit -i src/app.ts -m wtpathE"); // execute for real
+    const eStat = execSync("git diff HEAD^ HEAD --name-only", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    ok(eStat.includes("README.md") && eStat.includes("src/app.ts"),
+       "Leg E: the real -i include commit recorded BOTH the staged README and the named-path app.ts WT content");
+    equal(execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim(), "",
+       "Leg E: real -i include commit — porcelain clean");
+  });
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

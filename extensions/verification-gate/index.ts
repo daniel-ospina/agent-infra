@@ -1253,38 +1253,55 @@ export function isBareCommitShape(command: string): boolean {
 // spellings ARE intercepted via the shared scanner — closed #490).
 export type CommitSweepClass = "sweep" | "mixed" | "none";
 
-// #489: required-value LONG options on `git commit` — each consumes the NEXT token as
-// its value (even dash-leading: `git commit --message -a` is a bare commit with subject
-// "-a"). --encoding is NOT a git commit option (verified empirically: "error: unknown
-// option `encoding'") and must NOT be added — a wrongly-included boolean would skipNext
-// over a real `-a` → false negative.
-const SWEEP_VALUE_LONGS = new Set([
+// #489/#538 SHARED token model: required-value LONG options on `git commit` — each
+// consumes the NEXT token as its value (even dash-leading: `git commit --message -a` is
+// a bare commit with subject "-a"). --encoding is NOT a git commit option (verified
+// empirically: "error: unknown option `encoding'") and must NOT be added — a
+// wrongly-included boolean would skipNext over a real `-a` → false negative. Shared by
+// BOTH post-verb scanners (sweep + WT-path) so the git option-value model can never
+// drift between them (#538).
+const COMMIT_VALUE_LONGS = new Set([
   "--message", "--file", "--reedit-message", "--reuse-message", "--author",
   "--date", "--template", "--cleanup", "--fixup", "--squash", "--trailer",
   "--pathspec-from-file",
 ]);
 
-// Scan ONE commit invocation's post-verb token stream for a sweep flag, mirroring git's
-// option parser token order. Required-value shorts m/F/C/c/t consume rest-of-cluster or
-// the NEXT token; optional-value shorts S/u consume ATTACHED cluster chars only (never
-// the next token); scanning continues past positional/pathspec + unknown tokens — only
-// `--` and end-of-stream terminate. Returns true on the first `-a` char or `--all`.
-function scanCommitInvocationForSweep(rest: string): boolean {
+// Scan ONE commit invocation's post-verb token stream for BOTH diff-scope signals,
+// mirroring git's option parser token order. Required-value shorts m/F/C/c/t consume
+// rest-of-cluster or the NEXT token; optional-value shorts S/u consume ATTACHED cluster
+// chars only (never the next token); required-value longs (COMMIT_VALUE_LONGS) consume
+// the next token; scanning continues past positional/pathspec + unknown tokens — only
+// `--` (pathspec terminator) and end-of-stream end flag parsing. A positional token IS a
+// pathspec (git commit takes no non-path positional argument); after `--` every
+// remaining token is a pathspec. Callers: commitSweepClass reads .sweep (#489 — the
+// full-tree `-a`/`--all` auto-sweep); wtPathCommitInfo reads .pathspecs/.pathspecFromFile
+// (#538 — the named-path WT-commit forms).
+interface CommitInvocationScan {
+  sweep: boolean;             // `-a` short char (bundle member: -am, -vam, -qa, ...) or `--all`
+  pathspecs: string[];        // positional tokens — the NAMED pathspecs (globs verbatim)
+  pathspecFromFile: boolean;  // --pathspec-from-file (space OR `=` spelling) — names live in a file
+}
+function scanCommitInvocation(rest: string): CommitInvocationScan {
   const tokens = tokenizePushArgs(rest);
+  const res: CommitInvocationScan = { sweep: false, pathspecs: [], pathspecFromFile: false };
   let skipNext = false;
+  let afterDashDash = false;
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i];
     if (skipNext) { skipNext = false; continue; }
-    if (tok === "--") return false;          // pathspec terminator — nothing after is a flag
-    if (tok === "--all") return true;
+    if (afterDashDash) { res.pathspecs.push(tok); continue; } // everything after `--` is a pathspec
+    if (tok === "--") { afterDashDash = true; continue; }
+    if (tok === "--all") { res.sweep = true; continue; }
     if (tok.startsWith("--")) {
-      if (SWEEP_VALUE_LONGS.has(tok)) skipNext = true; // required-value long consumes next token
-      continue;                              // boolean/unknown longs are not sweep forms
+      if (tok === "--pathspec-from-file") { res.pathspecFromFile = true; skipNext = true; continue; }
+      if (tok.startsWith("--pathspec-from-file=")) { res.pathspecFromFile = true; continue; }
+      if (COMMIT_VALUE_LONGS.has(tok)) skipNext = true; // required-value long consumes next token
+      continue;                              // boolean/unknown longs are not sweep/pathspec forms
     }
     if (tok.startsWith("-") && tok.length > 1) {
       for (let j = 1; j < tok.length; j++) {
         const c = tok[j];
-        if (c === "a") return true;          // -a sweep (bundle member: -am, -vam, -qa, ...)
+        if (c === "a") res.sweep = true;     // -a sweep (latch — keep scanning the cluster)
         if (c === "m" || c === "F" || c === "C" || c === "c" || c === "t") {
           // required-value short: attached rest is the value; bare form takes the NEXT token
           if (j + 1 < tok.length) break;
@@ -1299,9 +1316,11 @@ function scanCommitInvocationForSweep(rest: string): boolean {
       }
       continue;
     }
-    // positional token (pathspec): git parses flags AFTER positionals — keep scanning
+    // positional token — a NAMED pathspec (git permutes options and positionals, so
+    // keep scanning for flags AFTER a positional too)
+    res.pathspecs.push(tok);
   }
-  return false;
+  return res;
 }
 
 export function commitSweepClass(command: string): CommitSweepClass {
@@ -1322,7 +1341,7 @@ export function commitSweepClass(command: string): CommitSweepClass {
       sawNonSweepCommit = true;
       continue;
     }
-    if (scanCommitInvocationForSweep(stripped.slice(commitMatch.end))) {
+    if (scanCommitInvocation(stripped.slice(commitMatch.end)).sweep) {
       sawSweep = true;
     } else {
       sawNonSweepCommit = true;
@@ -1330,6 +1349,58 @@ export function commitSweepClass(command: string): CommitSweepClass {
   }
   if (!sawSweep) return "none";
   return sawNonSweepCommit ? "mixed" : "sweep";
+}
+
+// ── #538 — WT-path commit classification (diff-scope mirror extension, T2 carve-out) ──
+// `git commit <pathspec>` / `git commit -o|--only <path>` / `-i|--include <path>` record
+// the NAMED paths' WORKING-TREE state, not just the staged index: git defaults to
+// only-mode whenever pathspecs are given (`-o`/`-i` are NOARG booleans — the paths arrive
+// as positionals), and only-mode takes the named paths' DISK content, ignoring content
+// staged for OTHER paths (empirically verified: `git commit -qm cA -- src/app.ts` with a
+// staged docs file + dirty src/app.ts committed the code's dirty WT content and left the
+// docs staged; `-i`/`--include` additionally records the whole staged index). A gate
+// scoped to `git diff --cached` lets a staged-docs verifier PASS unlock
+// `git commit -m x src/app.ts` while the commit ships src/app.ts's never-verified dirty
+// WT content — the #489 T2 carve-out residual (#489's commitSweepClass covers only the
+// FULL-tree `-a`/`--all` sweep; these forms are a PARTIAL sweep over the named paths).
+// The hook's scope for a WT-path command must therefore be union(staged, named-path WT)
+// — the named paths' HEAD-vs-working-tree state (`git diff HEAD -- <paths>`) is exactly
+// what the form records. This classifier returns null when the command has NO WT-path
+// commit invocation (bare / amend / sweep-only / vacuous) and otherwise the union of
+// named pathspecs across every head-anchored WT-path invocation. Wrapper/negation/prose
+// commit invocations (non-head-anchored) are never parsed here — unchanged staged scope,
+// the #539 wrapper-residual family owns that gap. HEAD-ANCHORED-ONLY mirrors
+// commitSweepClass; a composite that ALSO contains a sweep is handled by the sweep-first
+// routing (the sweep's full-WT scope ⊇ any named-path scope).
+export interface WtPathCommitInfo {
+  // Union of the NAMED pathspec tokens across every WT-path commit invocation (globs and
+  // pathspec magic kept verbatim — git expands them when the caller passes them to
+  // `git diff HEAD -- <pathspecs>`). Empty only when pathspecFromFile is true.
+  pathspecs: string[];
+  // true when a WT-path invocation reads its pathspecs via --pathspec-from-file — the
+  // names live in a FILE, not the command text, so the caller cannot enumerate them here
+  // and must fall back to the FULL working-tree scope (the only statically-known
+  // superset; fail-closed — only-mode records ⊆ the full WT set).
+  pathspecFromFile: boolean;
+}
+
+export function wtPathCommitInfo(command: string): WtPathCommitInfo | null {
+  let sawWtPath = false;
+  let pathspecFromFile = false;
+  const pathspecs: string[] = [];
+  for (const segment of splitCommandSegments(command)) {
+    const stripped = stripSegmentHead(segment);
+    const commitMatch = findGitCommit(stripped); // substring scan — head-anchored OR wrapper form
+    if (commitMatch === null) continue;          // no commit invocation — vacuous segment
+    if (commitMatch.index !== 0) continue;       // wrapper/negation/prose — #539 family, never parsed
+    const scan = scanCommitInvocation(stripped.slice(commitMatch.end));
+    if (scan.pathspecs.length === 0 && !scan.pathspecFromFile) continue; // no named WT content
+    sawWtPath = true;
+    for (const p of scan.pathspecs) pathspecs.push(p);
+    if (scan.pathspecFromFile) pathspecFromFile = true;
+  }
+  if (!sawWtPath) return null;
+  return { pathspecs, pathspecFromFile };
 }
 
 // ── #487 — content-push RANGE scoping (T1: a content push verifies the pushed
@@ -1804,6 +1875,40 @@ function runWorktreeScope(cwd: string): DiffScope {
   const out = execDiffStatusZ(cwd, "git diff HEAD --name-status -z");
   if (out === null) {
     console.error("[verification-gate] ⚠️ git diff HEAD failed — falling back to staged scope:");
+    return runStagedScope(cwd);
+  }
+  return parseDiffNameStatus(out);
+}
+
+// #538: the file set a WT-path commit (`git commit <pathspec>` / `-o`/`--only` /
+// `-i`/`--include` — see wtPathCommitInfo) actually records: the NAMED paths'
+// WORKING-TREE state vs HEAD. `git diff HEAD --name-status -z -- <pathspecs>` passes the
+// raw pathspecs (verbatim globs/magic) to git's own pathspec machinery — single source
+// of expansion truth. Shell-single-quote each pathspec first: tokenizePushArgs already
+// STRIPPED the user's quoting, so a name containing spaces would otherwise re-split
+// (execSync spawns a shell). Unborn HEAD: only-mode on an unborn branch requires the
+// pathspec to match a file KNOWN TO GIT (empirically: untracked files error "pathspec
+// did not match"), and records the staged file's disk content — the staged set is a
+// SOUND SUPERSET of what the commit can record there, so the staged fallback mirrors
+// runWorktreeScope with no under-gate. Any OTHER diff failure is logged and falls back
+// to the staged scope (status-quo semantics — a repo broken enough to fail pathspec
+// diffing fails at `git commit` time anyway; same accepted residual as
+// runWorktreeScope). Parse anomalies inside the NUL stream stay fail-closed via
+// parseDiffNameStatus (clean=false).
+function shellQuoteSingle(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+function runWtPathScope(cwd: string, pathspecs: string[]): DiffScope {
+  try {
+    execSync("git rev-parse --verify HEAD", { encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore" });
+  } catch {
+    return runStagedScope(cwd); // unborn HEAD — staged set ⊇ what only-mode can record
+  }
+  const cmd = `git diff HEAD --name-status -z -- ${pathspecs.map(shellQuoteSingle).join(" ")}`;
+  const out = execDiffStatusZ(cwd, cmd);
+  if (out === null) {
+    console.error("[verification-gate] ⚠️ git diff HEAD -- <pathspecs> failed — falling back to staged scope:");
     return runStagedScope(cwd);
   }
   return parseDiffNameStatus(out);
@@ -2441,6 +2546,14 @@ export default function (pi: ExtensionAPI) {
     // Leg-A allowed commit's armed pendingRehash executing before the block
     // check).
     const sweepClass = commitSweepClass(command);
+    // #538: WT-path commit forms (pathspec / `-o`/`--only` / `-i`/`--include` — see
+    // wtPathCommitInfo) record the NAMED paths' WORKING-TREE state, not just the staged
+    // index — the same hole class as #489's `-a` sweep, over a PARTIAL (named) file set.
+    // Consulted only when the sweep classifier says "none": a sweep command is already
+    // handled by the sweep-first branch below (its full-WT scope ⊇ any named-path
+    // scope), and gh chains keep the gh branch path (#540 owns that interplay).
+    // Pure detector (zero subprocess) — commit-bearing commands still resolve fast.
+    const wtPath = wtPathCommitInfo(command);
     let scope: DiffScope;
     if (sweepClass !== "none" && !GH_PR_PATTERN.test(command)) {
       const worktree = runWorktreeScope(cwd);
@@ -2464,6 +2577,22 @@ export default function (pi: ExtensionAPI) {
         }
       }
       scope = runBranchScope(cwd);
+    } else if (wtPath !== null) {
+      // #538: WT-path commit → union(staged, named-path WT). The named paths'
+      // HEAD-vs-working-tree diff (`git diff HEAD -- <pathspecs>`, git-expanded —
+      // runWtPathScope) is EXACTLY what the form records: only-mode takes the named
+      // paths' disk content (staged-for-others ignored, empirically verified) and
+      // include-mode additionally records the whole staged index — the union is the
+      // sound over-approximation for every form, mirroring the #489 "mixed" union.
+      // A --pathspec-from-file form cannot be enumerated from the command text →
+      // union(staged, FULL worktree), the statically-known superset (fail-closed:
+      // only-mode records ⊆ the full WT set). The staged union arm is never a NEW
+      // over-gate vs today: WT-path forms are already non-bare (D2), so staged files
+      // in the same command were already gate-verified pre-#538.
+      const namedWt = wtPath.pathspecFromFile
+        ? runWorktreeScope(cwd)
+        : runWtPathScope(cwd, wtPath.pathspecs);
+      scope = combineScopes(runStagedScope(cwd), namedWt);
     } else {
       // #487 T1: a content push (no git commit anywhere in the command) verifies
       // the PUSHED RANGE — HEAD vs the remote-tracking ref (tier A, 2-dot) or
