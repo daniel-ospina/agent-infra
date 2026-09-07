@@ -14,7 +14,75 @@
 # --force-stale (any position): record a head_sha that is NOT the PR's
 # current head. Off by default — the stale-sha guard (#2133) refuses such
 # records with exit 3 because the ai-review-gate rejects them anyway.
+#
+# Verdicts (issue #513):
+#   clean       — a code-review skill convergence recorded its clean verdict
+#                 (standard/complex tiers). Never tier-guarded.
+#   clean-micro — the micro-tier PROCESS verdict: micro skips the code-review
+#                 skill, so its merge record certifies the micro flow
+#                 (complexity:micro linked issue + pre-flight per risk tier +
+#                 the #485 ≥1-dispatch floor), NOT a multi-agent review. The
+#                 clean-micro tier guard below verifies the linked same-repo
+#                 issue carries the complexity:micro label at record time and
+#                 REFUSES (exit 4, no write) when any same-repo closing ref
+#                 is a non-micro complexity:* issue. Clean verdicts make zero
+#                 extra gh calls.
 set -euo pipefail
+
+# ── closing_issue_refs <text> ─────────────────────────────────────────────
+# Print EVERY issue reference resolved by a closing keyword in <text>, one
+# "owner/repo#num" per line, deduplicated. Mirrors check-pipeline-compliance.sh
+# parse_issue_ref's accepted forms + per-ref form priority (a. full URL
+# https://github.com/<o>/<r>/issues/<n> — never /pull/<n>; b. owner/repo#<n>;
+# c. bare #<n> → repo = $REPO) but returns ALL refs — parse_issue_ref is
+# first-ref-only, while the tier guard needs ANY-ref semantics (a PR closing
+# two same-repo issues of different tiers has no single tier identity).
+# Keyword class: fix(es|ed)?|close(s|d)?|resolve(s|d)? directly followed by
+# the reference (so "resolves SLACK_APPROVAL_FILE" is not an issue ref).
+# Top-level + guarded main below: this function is source-reachable by tests.
+closing_issue_refs() {
+  local text="$1" kw
+  kw='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
+  # a. full URLs.
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    local repo num
+    repo="$(printf '%s' "$m" | tr 'A-Z' 'a-z' | grep -oE 'https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+' | sed -E 's#https://github.com/([^/]+/[^/]+)/issues/[0-9]+.*#\1#' | head -1 || true)"
+    num="$(printf '%s' "$m" | grep -oE '/issues/[0-9]+$' | grep -oE '[0-9]+' | head -1 || true)"
+    if [ -n "$repo" ] && [ -n "$num" ]; then
+      printf '%s#%s\n' "$repo" "$num"
+    fi
+  done < <(printf '%s\n' "$text" | grep -ioE "${kw}[[:space:]]*https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+" || true)
+  # b. owner/repo#<n> (exclude the URL class already matched in (a): the
+  # owner/repo pattern requires the ref to START the token — URLs carry
+  # https:// before the repo so they cannot match [^/[:space:],;)]+/
+  # from token start after the keyword... guard by dropping any match whose
+  # token contains "/issues/").
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    case "$m" in
+      *issues/*) continue ;;
+    esac
+    local repo num
+    repo="$(printf '%s' "$m" | grep -oE '[^/[:space:],;)]+/[^/[:space:],;)]+#[0-9]+$' | cut -d'#' -f1 || true)"
+    num="$(printf '%s' "$m" | grep -oE '#[0-9]+$' | tr -d '#' || true)"
+    if [ -n "$repo" ] && [ -n "$num" ]; then
+      printf '%s#%s\n' "$repo" "$num"
+    fi
+  done < <(printf '%s\n' "$text" | grep -ioE "${kw}[[:space:]]*[^/[:space:],;)]+/[^/[:space:],;)]+#[0-9]+" || true)
+  # c. bare #<n> → repo = $REPO.
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    local num
+    num="$(printf '%s' "$m" | grep -oE '#[0-9]+$' | tr -d '#' || true)"
+    if [ -n "$num" ]; then
+      printf '%s#%s\n' "$REPO" "$num"
+    fi
+  done < <(printf '%s\n' "$text" | grep -ioE "${kw}[[:space:]]*#[0-9]+" || true)
+}
+
+# ── main (guarded — executable when run, inert when sourced for tests) ────
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 # Scan args for --force-stale (any position); everything else stays
 # positional.
 FORCE_STALE=0
@@ -84,6 +152,79 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     echo "⚠️ --force-stale passed: recording stale sha $SHA anyway — the ai-review-gate will keep rejecting until re-recorded at the current head" >&2
   fi
 fi
+
+# ── Clean-micro tier guard (#513) ──────────────────────────────────────────
+# clean-micro certifies the MICRO process: the linked same-repo issue must
+# carry the complexity:micro label at record time. Standard/complex/complexity
+# issues are never recorded clean-micro (run the code-review skill and record
+# clean instead). Clean verdicts skip this guard entirely (zero extra gh
+# calls). Arms:
+#   (a) ≥1 same-repo closing ref carries complexity:micro and none is
+#       non-micro → allow.
+#   (b) ANY same-repo closing ref carries a complexity:* label ≠ micro →
+#       REFUSE exit 4, NO write (qualified + legacy keys untouched; a
+#       pre-existing valid record survives).
+#   (c) undeterminable — repo-less / gh missing / body unreadable / no
+#       closing ref / only cross-repo refs / label fetch failed / fetched
+#       labels carry no complexity:* → loud warning + record proceeds
+#       (fail-open: a transient gh/API failure must not block a legitimate
+#       record; the warning names the unverified tier).
+if [ "$VERDICT" = "clean-micro" ]; then
+  if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
+    echo "⚠️ clean-micro tier guard: repo undetectable or gh missing — tier attestation UNVERIFIED (record proceeds; a non-micro linked issue should never be recorded clean-micro)" >&2
+  else
+    BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
+    [ "$BODY" = "null" ] && BODY=""
+    if [ -z "$BODY" ]; then
+      echo "⚠️ clean-micro tier guard: could not read the PR body of $REPO#$PR (gh/API failure or empty body?) — tier attestation UNVERIFIED (record proceeds)" >&2
+    else
+      # Collect same-repo closing refs (dedupe via awk; preserve order).
+      REFS="$(closing_issue_refs "$BODY" | awk -F'#' 'tolower($1) == tolower("'"$REPO"'") { seen[$0]++; if (seen[$0] == 1) print }')"
+      if [ -z "$REFS" ]; then
+        echo "⚠️ clean-micro tier guard: no same-repo closing-issue ref found in the PR body of $REPO#$PR — tier attestation UNVERIFIED (record proceeds; body refs: $(printf '%s' "$BODY" | grep -oE '(fix(es|ed)?|close(s|d)?|resolve(s|d)?)[[:space:]]*[^[:space:],;)]*' | head -c 200 || true))" >&2
+      else
+        # Per-ref label fetch. A fetch failure marks THAT ref undeterminable —
+        # never refuse on a failed fetch (mirrors the stale-sha fail-open).
+        REFUSED=""
+        MICRO_SEEN=""
+        while IFS= read -r ref; do
+          [ -z "$ref" ] && continue
+          num="${ref##*#}"
+          LABELS="$(gh api "repos/$REPO/issues/$num/labels" --jq '.[].name' 2>/dev/null || true)"
+          # A failed/filtered fetch yields nothing — undeterminable ref.
+          if [ -z "$LABELS" ]; then
+            echo "⚠️ clean-micro tier guard: could not fetch labels of $ref — that ref is undeterminable (record proceeds unless another ref is non-micro)" >&2
+            continue
+          fi
+          if printf '%s\n' "$LABELS" | grep -q '^complexity:micro$'; then
+            MICRO_SEEN=1
+            continue
+          fi
+          if printf '%s\n' "$LABELS" | grep -qE '^complexity:' ; then
+            OFFENDING_LABEL="$(printf '%s\n' "$LABELS" | grep -E '^complexity:' | head -1)"
+            REFUSED=1
+            echo "❌ clean-micro tier guard: $REPO#$PR closes $ref, whose complexity label is \"$OFFENDING_LABEL\" — clean-micro certifies the MICRO process only and is REFUSED for a non-micro linked issue." >&2
+            echo "   → Run the code-review skill on the current head and record clean:" >&2
+            echo "   →   record-review.sh $PR <head-sha> clean $REPO" >&2
+            echo "   → If the issue's tier is genuinely micro, correct its label (issue-creation: relabel complexity:micro), then re-record clean-micro." >&2
+            break
+          fi
+          # Labels fetched but no complexity:* label → undeterminable ref.
+          echo "⚠️ clean-micro tier guard: $ref carries no complexity:* label — that ref is undeterminable (record proceeds unless another ref is non-micro)" >&2
+        done <<EOF
+$REFS
+EOF
+        if [ -n "$REFUSED" ]; then
+          exit 4
+        fi
+        if [ -z "$MICRO_SEEN" ]; then
+          echo "⚠️ clean-micro tier guard: no same-repo closing ref resolved to complexity:micro — tier attestation UNVERIFIED (record proceeds)" >&2
+        fi
+      fi
+    fi
+  fi
+fi
+
 DIR="$HOME/.pi/agent/reviews"
 mkdir -p "$DIR"
 # #426: registry key is repo-qualified when the repo is known — PR numbers
@@ -180,3 +321,4 @@ ${MARKER}"
 else
   echo "⚠️ record-review: evidence post skipped (gh CLI missing or REPO undetectable) — the record is saved, but the ai-review-gate required check will fail until evidence is posted manually." >&2
 fi
+fi # /main guard (#513)

@@ -42,11 +42,31 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    churn). Literal conflicts surface here and remain blocked by condition 4.
 6. **Review record at the final head (ai-review-gate, #2058)** — a clean review record
    (`~/.pi/agent/reviews/<PR>.json`, verdict `clean`/`clean-micro`) exists at the CURRENT head
-   sha. The `code-review` skill records automatically on clean convergence (Step 10). If the
-   head moved after the record (fix commits, merge of main): re-run the `code-review` skill on
-   the new head, then re-record —
-   `~/.pi/agent/scripts/record-review.sh <PR> <full-head-sha> clean <owner/repo>` (the script
-   is not on PATH — use the explicit path).
+   sha. Verdict by tier: **standard/complex** PRs record `clean` — the
+   `code-review` skill records automatically on clean convergence (Step 10).
+   **Micro-tier PRs** (linked issue `complexity:micro`) record `clean-micro`
+   via the micro flow (03-code-review.md Step 2) — the code-review skill is
+   SKIPPED at micro, so the micro flow's record is `clean-micro`, and the
+   merge ceremony never self-certifies a record. (`clean` is never REFUSED at
+   any tier — a micro session that actually ran the code-review skill and
+   records `clean` is a stronger claim, not a false one.) One PR closes one issue: a PR
+   whose body closing-keyword references a non-closed issue auto-closes it on
+   merge — reference non-closed issues as `Related:` prose instead, or the
+   refusal (exit 4) will correctly stop the `clean-micro` record. `clean-micro` certifies the micro
+   PROCESS: `record-review.sh` verifies the linked same-repo issue's
+   `complexity:micro` label at record time and REFUSES (exit 4) a
+   `clean-micro` record whose linked issue is not micro; pre-flight per risk
+   tier and the #485 ≥1-dispatch floor are enforced by their own gates. Where
+   the linked ref's complexity label cannot be read (label-fetch failure,
+   absent label, no closing ref, or only cross-repo refs) record-review.sh
+   WARNS and proceeds — tier attestation UNVERIFIED at mint. If
+   the head moved after the record (fix commits, merge of main): re-run the
+   review appropriate to the tier (the `code-review` skill at
+   standard/complex; the micro flow at micro) on the new head, then re-record
+   at the SAME verdict —
+   `~/.pi/agent/scripts/record-review.sh <PR> <full-head-sha> clean
+   <owner/repo>` (standard/complex) or `… clean-micro <owner/repo>` (micro)
+   (the script is not on PATH — use the explicit path).
    NEVER re-record a moved head without a fresh review: the `ai-review-gate` required check
    verifies signature + full-sha freshness, and the review-enforcer blocks the merge command
    without a matching record, so the ceremony stays red until evidence is genuinely refreshed.

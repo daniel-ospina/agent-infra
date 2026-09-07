@@ -139,7 +139,7 @@ parse_issue_ref() {
   # a. full URL — /issues/<n> explicitly, never /pull/<n>.
   m="$(printf '%s\n' "$text" | grep -ioE "${kw}[[:space:]]*https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+" | head -1 || true)"
   if [[ -n "$m" ]]; then
-    repo="$(printf '%s' "$m" | grep -oE 'https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+' | sed -E 's#https://github.com/([^/]+/[^/]+)/issues/[0-9]+.*#\1#' | head -1 || true)"
+    repo="$(printf '%s' "$m" | tr 'A-Z' 'a-z' | grep -oE 'https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+' | sed -E 's#https://github.com/([^/]+/[^/]+)/issues/[0-9]+.*#\1#' | head -1 || true)"
     num="$(printf '%s' "$m" | grep -oE '/issues/[0-9]+$' | grep -oE '[0-9]+' | head -1 || true)"
     if [[ -n "$repo" && -n "$num" ]]; then printf '%s#%s' "$repo" "$num"; return; fi
   fi
@@ -249,8 +249,26 @@ run_checks() {
     fi
 
     # c. CODE-REVIEW EVIDENCE — PR body or any PR commit message.
-    if printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS" | grep -qiE 'code-review|reviewer|\[review\]|VGATE|review[[:space:]]+recorded|review-enforcer'; then
-      pass c "code-review evidence in PR body/commits (review dispatch marker)"
+    EVID_TEXT="$(printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS")"
+    if printf '%s' "$EVID_TEXT" | grep -qiE 'code-review|reviewer|\[review\]|VGATE|review[[:space:]]+recorded|review-enforcer'; then
+      # #513 verdict-tier binding (Approach B): clean-micro certifies the
+      # MICRO process only (record-review.sh verifies the linked issue's
+      # complexity:micro label at mint; micro skips checks b–e, so reaching
+      # this branch means the issue is NOT micro). A non-micro PR whose
+      # body/commits claim verdict=clean-micro is a false certification —
+      # the record-review.sh marker carries the verdict verbatim. Remediation
+      # includes the stale-marker removal step: record-review.sh APPENDS
+      # markers and never removes them, so re-recording clean leaves the old
+      # clean-micro line behind and this binding keeps firing.
+      # Precision (#513 self-review catch): the binding must match the
+      # record-review.sh MARKER shape (verdict=… @ <40-hex sha>) — never bare
+      # prose mentioning the marker text (this PR's own description tripped
+      # the bare-substring grep on the first pipeline-compliance run).
+      if printf '%s' "$EVID_TEXT" | grep -qE 'verdict=clean-micro @ [0-9a-f]{40}'; then
+        fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
+      else
+        pass c "code-review evidence in PR body/commits (review dispatch marker)"
+      fi
     else
       fail c "no code-review evidence — PR body or a commit message must reference review dispatch."
       echo "      Accepts: code-review | reviewer | [review] | VGATE | review recorded | review-enforcer."
@@ -337,7 +355,7 @@ fi
 # ── Failure simulation (offline test of failure output paths) ───────────────
 if [[ "$FAIL_ALL" == "1" ]]; then
   # Pass 1: no linked issue → a fails, b–e skipped.
-  echo "== SIMULATION: all-failures pass 1 of 3 (no linked issue) =="
+  echo "== SIMULATION: all-failures pass 1 of 5 (no linked issue) =="
   PR_BODY=""; LABELS=""; SCOPING_COMMENT=""; COMMIT_MSGS=""; FILES=""
   FAILURES=0
   run_checks || true
@@ -347,7 +365,7 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   # parser exercised), b/c/d/e fail. FILES includes a runtime-code change so
   # check e runs (and fails) rather than being skipped.
   echo ""
-  echo "== SIMULATION: all-failures pass 2 of 3 (standard/complex issue, no evidence) =="
+  echo "== SIMULATION: all-failures pass 2 of 5 (standard/complex issue, no evidence) =="
   PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""; COMMIT_MSGS=""
   FILES=$'added\textensions/example/sample.ts'
   FAILURES=0
@@ -360,11 +378,15 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   # Assert the parse directly (pure shell, no gh) and exercise run_checks
   # with the cross-repo body (a passes and displays the full owner/repo#N ref).
   echo ""
-  echo "== SIMULATION: pass 3 of 3 (cross-repo issue reference) =="
+  echo "== SIMULATION: pass 3 of 5 (cross-repo issue reference) =="
   ref="$(parse_issue_ref 'Fixes daniel-ospina/swarm#2492')"
   [[ "$ref" == "daniel-ospina/swarm#2492" ]] || { echo "❌ SELF-TEST FAIL: parse_issue_ref('Fixes daniel-ospina/swarm#2492') = '$ref', expected 'daniel-ospina/swarm#2492'." >&2; exit 2; }
   ref="$(parse_issue_ref 'Closes https://github.com/daniel-ospina/swarm/issues/2492')"
   [[ "$ref" == "daniel-ospina/swarm#2492" ]] || { echo "❌ SELF-TEST FAIL: full-URL parse = '$ref', expected 'daniel-ospina/swarm#2492'." >&2; exit 2; }
+  # Host-axis casing (#513 review r3): GitHub identity is case-insensitive on
+  # the HOST too — an uppercase-host URL must resolve, not drop to arm (c).
+  ref="$(parse_issue_ref 'Closes https://GITHUB.com/Daniel-Ospina/Agent-Infra/issues/2492')"
+  [[ "$ref" == "daniel-ospina/agent-infra#2492" ]] || { echo "❌ SELF-TEST FAIL: mixed-case-host URL parse = '$ref', expected 'daniel-ospina/agent-infra#2492'." >&2; exit 2; }
   ref="$(parse_issue_ref 'Resolves https://github.com/daniel-ospina/agent-infra/pull/171')"
   [[ -z "$ref" ]] || { echo "❌ SELF-TEST FAIL: pull-request URL must NOT parse as an issue, got '$ref'." >&2; exit 2; }
   ref="$(parse_issue_ref 'Fixes #7')"
@@ -378,6 +400,78 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   FAILURES=0
   run_checks || true
   summarize || true
+
+  # Pass 4 (#513): #513 verdict-tier binding — a NON-micro issue whose
+  # body/commits claim verdict=clean-micro (the record-review.sh marker text)
+  # must FAIL check (c) with the binding message, even though the generic
+  # evidence grep matches the marker. RED pre-#513 (the generic grep passed
+  # the marker); GREEN post-binding. FAILURES alone is NOT discriminating
+  # here (checks b/d/e also fail in this scenario) — assert the binding
+  # message text in check (c)'s output.
+  echo ""
+  echo "== SIMULATION: pass 4 of 5 (#513 binding: clean-micro marker on a standard issue fails c) =="
+  PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""
+  COMMIT_MSGS="review recorded: reviews/1.json verdict=clean-micro @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra)"
+  FILES=$'added\textensions/example/sample.ts'
+  FAILURES=0
+  P4LOG="$(mktemp /tmp/pipeline-pass4.XXXXXX)"
+  run_checks > "$P4LOG" 2>&1 || true
+  cat "$P4LOG"
+  B4="$FAILURES"
+  if [[ "$B4" -ge 1 ]] && grep -q 'clean-micro verdict marker' "$P4LOG"; then
+    echo "  ✅ pass 4: binding fired — check (c) named the clean-micro marker on the standard issue"
+    rm -f "$P4LOG"
+  else
+    echo "  ❌ pass 4: binding did NOT fire — clean-micro marker passed check (c) on a standard issue (failures=$B4)" >&2
+    rm -f "$P4LOG"
+    exit 2
+  fi
+  summarize || true
+
+  # Pass 4b (#513 regression pin — self-review catch): a NON-micro PR whose
+  # body/commits merely MENTION "verdict=clean-micro" in prose (describing the
+  # marker contract, e.g. this PR's own description) must NOT trip the binding
+  # — only the record-review.sh marker shape (verdict=… @ <40-hex sha>) is a
+  # real certification. RED pre-tightening (bare-substring grep matched the
+  # prose); GREEN now.
+  echo ""
+  echo "== SIMULATION: pass 4b (#513 binding precision: prose mention must NOT fire) =="
+  PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""
+  COMMIT_MSGS="code-review dispatched; the binding rejects body/commits claiming verdict=clean-micro (marker shape only)"
+  FILES=$'added\textensions/example/sample.ts'
+  FAILURES=0
+  P4BLOG="$(mktemp /tmp/pipeline-pass4b.XXXXXX)"
+  run_checks > "$P4BLOG" 2>&1 || true
+  if grep -q 'clean-micro verdict marker' "$P4BLOG"; then
+    echo "  ❌ pass 4b: prose mention fired the binding — check (c) must match only the marker shape (verdict=… @ <40-hex>)" >&2
+    rm -f "$P4BLOG"
+    exit 2
+  else
+    echo "  ✅ pass 4b: prose mention did NOT fire — binding precision holds"
+    rm -f "$P4BLOG"
+  fi
+  summarize || true
+
+  # Pass 5 (#513): micro-exemption pin — a MICRO issue with the same
+  # clean-micro marker must produce ZERO failures (a passes; b–e skipped by
+  # the micro exemption; the binding must never leak into the micro branch).
+  # Green pre- AND post-#513 by design — a placement-leak guard, not evidence
+  # the binding exists (pass 4 carries that proof).
+  echo ""
+  echo "== SIMULATION: pass 5 of 5 (#513 micro exemption: clean-micro marker on a micro issue → 0 failures) =="
+  PR_BODY="Fixes #1"; LABELS="complexity:micro"; SCOPING_COMMENT=""
+  COMMIT_MSGS="review recorded: reviews/1.json verdict=clean-micro @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra)"
+  FILES=$'added\tdocs/plans/2026-09-06-issue-513-clean-micro-verdict.md'
+  FAILURES=0
+  run_checks || true
+  B5="$FAILURES"
+  summarize || true
+  if [[ "$B5" -eq 0 ]]; then
+    echo "  ✅ pass 5: micro exemption held — 0 failures (b–e skipped, binding did not leak)"
+  else
+    echo "  ❌ pass 5: micro exemption violated — binding leaked into the micro branch ($B5 failures)" >&2
+    exit 2
+  fi
   exit 1
 fi
 
@@ -399,6 +493,7 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   }
   expect_ref 'Fixes daniel-ospina/swarm#2492' 'daniel-ospina/swarm#2492'
   expect_ref 'Closes https://github.com/daniel-ospina/swarm/issues/2492' 'daniel-ospina/swarm#2492'
+  expect_ref 'Closes https://GITHUB.com/Daniel-Ospina/Agent-Infra/issues/2492' 'daniel-ospina/agent-infra#2492'
   expect_ref 'Resolves #7' "$GH_REPO#7"
   expect_ref 'FIXES #9' "$GH_REPO#9"
   expect_ref 'Fixes https://github.com/daniel-ospina/agent-infra/pull/171' ''
