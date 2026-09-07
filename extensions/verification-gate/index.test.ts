@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
@@ -526,7 +526,7 @@ test("exported functions are callable (#5527 regression)", () => {
   // drops an export fails here with a named diagnostic.
   const callables = [
     extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot,
-    isShapeExemptFile, isDeletionPush, isBareCommitShape,
+    isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass,
   ] as const;
   for (const fn of callables) ok(typeof fn === "function", "export must be callable");
   equal(extractJson('{"status":"PASS","failures":[],"verified_files":[]}')!.status, "PASS", "extractJson smoke");
@@ -535,6 +535,7 @@ test("exported functions are callable (#5527 regression)", () => {
   ok(isShapeExemptFile("README.md"), "isShapeExemptFile smoke");
   ok(isDeletionPush("git push origin --delete feat/x"), "isDeletionPush smoke");
   ok(isBareCommitShape("git commit -m x"), "isBareCommitShape smoke");
+  ok(typeof commitSweepClass === "function", "commitSweepClass smoke (callable)");
 });
 
 // ── normalizeRegistryPath (#7595) ────────────────────
@@ -1384,9 +1385,12 @@ section("isDeletionPush — delete-shaped push classification (#472 mechanism b)
 // fallbacks, and if/fi blocks. Shared by BOTH predicates so the full-block
 // fixture stays in sync across the isDeletionPush and isBareCommitShape
 // classification surfaces.
-const FULL_05_CLEANUP_BLOCK = `# BRANCH = the merged PR branch (from the session's worktree, or resolve via gh):
-BRANCH=$(git branch --show-current)
-[ -n "$BRANCH" ] || BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
+const FULL_05_CLEANUP_BLOCK = `# BRANCH = the merged PR branch — resolve via gh FIRST. Deriving from the current
+# branch is ambiguous after the #376 Step C return: an in-main ceremony session
+# now sits on main, and \`git branch --show-current\` would target the default
+# branch. gh knows the PR's head branch regardless of local checkout state.
+BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null)
+[ -n "$BRANCH" ] || BRANCH=$(git branch --show-current)
 
 # Remote delete — server-side, always possible after merge; "remote ref does not
 # exist" means deleteBranchOnMerge already removed it = success.
@@ -1399,7 +1403,7 @@ if git worktree list --porcelain | grep -q "branch refs/heads/$BRANCH"; then
   echo "⚠️ branch $BRANCH is still checked out in a worktree — local delete deferred."
   echo "   TEARDOWN NOTE: remove the worktree and run: git branch -D $BRANCH"
 else
-  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH could not be deleted — delete manually: git branch -D $BRANCH"
+  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH not found or could not be deleted — delete manually: git branch -D $BRANCH"
 fi`;
 
 // ── #482 — shared drift-guard skip-arm messaging for the THREE guards (01-preflight,
@@ -1706,6 +1710,114 @@ test("05-cleanup.md fenced block (TRUE fixture — no commit invocations → vac
   // isDeletionPush section above; the identical full-block literal is pinned
   // on BOTH predicates so they cannot drift apart).
   ok(isBareCommitShape(FULL_05_CLEANUP_BLOCK), "ceremony block with no commit invocations is vacuously bare");
+});
+
+// ── #489 — auto-sweep commit classification (diff-scope mirror of the D2 guard) ──
+// isBareCommitShape decides the content-shape EXEMPTION; commitSweepClass decides the
+// DIFF SURFACE. `git commit -a` / `--all` record the tracked WORKING TREE, not just the
+// staged index — a gate scoped to `git diff --cached` lets a staged-docs verifier PASS
+// unlock a commit that then sweeps dirty, never-verified code (the #489 hole). The
+// classifier detects sweep-form commit invocations so the hook can diff `git diff HEAD`
+// instead. Values: "sweep" (every head-anchored commit invocation in the command sweeps),
+// "mixed" (≥1 sweep + ≥1 non-sweep head-anchored invocation — the non-sweep commit records
+// index-only content, so the hook must verify staged ∪ worktree), "none" (no sweep —
+// staged/index scope unchanged, #489 T2). Token model mirrors git's parser: required-value
+// shorts m/F/C/c/t consume rest-of-cluster or the NEXT token (even dash-leading —
+// `git commit -m --amend` is message "--amend", not an amend); optional-value shorts S/u
+// consume ATTACHED cluster chars only, never the next token (`-Sa` = gpg keyid a,
+// `-uall` = untracked mode all — neither sweeps; `-S -a` DOES sweep); required-value longs
+// (--message --file --reedit-message --reuse-message --author --date --template --cleanup
+// --fixup --squash --trailer --pathspec-from-file — --encoding is NOT a git commit option,
+// verified) consume the next token; scanning continues past positional/pathspec and unknown
+// tokens — only `--` (pathspec terminator) and end-of-stream end flag parsing; only
+// HEAD-ANCHORED commit invocations classify (wrappers/prose stay "none" — unchanged staged
+// scope, no under-gate, residual #539).
+
+section("commitSweepClass — auto-sweep commit classification (#489)");
+
+test("SWEEP → \"sweep\" (single pure-sweep invocation)", () => {
+  const pins = [
+    "git commit -a",
+    "git commit --all -m x",
+    "git commit -am x",
+    'git commit -am "x"',
+    "git commit -amx",                       // -a + -m(x attached)
+    "git commit -vam x",                     // -v -a -m(x)
+    "git commit -qam x",
+    "git -C repo commit -am x",              // sweep behind git global flags (PURE-PREDICATE pin — hook interception gap tracked by #490)
+    "git --no-pager commit -am x",
+    "git commit --author \"Jane <j@d>\" -a -m x",  // scan continues past required-value longs
+    "git commit --date 2024-01-01 -a -m x",
+    "git commit --trailer \"A=b\" -a -m x",   // required-value long consumes its value, then -a
+    "git commit --message=msg -a -m x",   // ATTACHED-equals value long must NOT swallow the trailing -a
+    "git commit --file msg.txt -a",       // value-long member pin (--file)
+    "git commit --cleanup strip -a -m x", // value-long member pin (--cleanup)
+    "git commit --template tpl.txt -a",   // value-long member pin (--template)
+    "git commit --reuse-message HEAD -a", // value-long member pin (--reuse-message)
+    "git commit --fixup HEAD -a",         // value-long member pin (--fixup)
+    "git commit --squash HEAD -a",        // value-long member pin (--squash)
+    "git commit --no-verify -a -m x",     // BOOLEAN long before -a must NOT swallow it (guards against a wrongful SWEEP_VALUE_LONGS addition)
+    "git commit --encoding -a -m x",      // --encoding is NOT a git commit option (verified: "error: unknown option `encoding'") — a wrongful SWEEP_VALUE_LONGS addition would swallow the -a → false-negative guard
+    "git commit -t tpl.txt -a -m x",
+    "git commit -S -a -m x",                  // optional-value -S never consumes the NEXT token → -a is real
+    "git commit -u -a -m x",                  // same for -u
+    "git commit --amend -a",                  // via the -a arm
+    "git commit -a --amend",
+    "git commit -a -m x && git commit --all -m y", // every head-anchored invocation sweeps → sweep
+    "git commit -am x && git push origin main",    // push segment is vacuous (no commit invocation)
+  ];
+  for (const c of pins) equal(commitSweepClass(c), "sweep", `must be sweep: ${c}`);
+});
+
+test("MIXED (sweep + non-sweep commit in one command) → \"mixed\"", () => {
+  const pins = [
+    "git commit -m x && git commit --all -m y",   // bare then sweep
+    "git commit -am x && git commit -m y",         // sweep then bare
+    "git commit -m x f.txt && git commit -a -m y", // pathspec then sweep
+    // wrapper/negation commit + head-anchored sweep: the wrapper's bare half ships
+    // the whole index (staged-only content invisible to `git diff HEAD`) → must be
+    // MIXED (union scope), never pure-sweep (reviewer finding, #489 round 2):
+    "sh -c 'git commit -m y' && git commit -am x",
+    "! git commit -m y && git commit --all -m x",
+    "bash -lc 'git commit -m y' && git commit -am x",
+  ];
+  for (const c of pins) equal(commitSweepClass(c), "mixed", `must be mixed: ${c}`);
+});
+
+test("NONE (bare / amend-alone / pathspec / value-swallowed / vacuous) → \"none\"", () => {
+  const pins = [
+    "git commit -m x",
+    "git commit -m x -s",
+    "git commit -F msg.txt",
+    "git commit -c HEAD -m x",
+    "git commit -C HEAD -m x",
+    "git commit -S -m x",
+    "git commit -m -a",                  // message "-a"
+    "git commit -m --amend",             // message "--amend"
+    "git commit --message -a",           // subject "-a"
+    "git commit --message --all",
+    "git commit --message=--amend",      // attached value
+    "git commit --message=-a",           // attached value never scanned for '-a' chars
+    "git commit --reuse-message -a",      // required-value long consumes the dash-leading "-a" as its value (membership-observable pin)
+    "git commit --file -a",               // same — --file value "-a" (membership-observable pin)
+    "git commit --template -a",           // same — --template value "-a" (membership-observable pin)
+    "git commit -ma x",                  // -m value "a" + pathspec x
+    "git commit -mx",                    // -m value x
+    "git commit -Sa -m x",               // -S optional keyid "a" (attached) — NOT a sweep
+    "git commit -uall -m x",             // -u optional mode "all" (attached)
+    "git commit -ta x",                  // -t template "a" + pathspec x
+    "git commit --amend -m x",           // amend alone — index scope (#489 T1 letter; T2)
+    "git commit -m x f.txt",             // pathspec
+    "git commit -o code.ts -m x",        // only-mode pathspec
+    "git commit -m x --only",
+    "git commit -m x -- -a",             // `--` pathspec terminator → "-a" is a path, not a flag
+    "git commit --all=true",             // invalid attached spelling — not the flag
+    "sh -c 'git commit -am x'",          // wrapper — non-head-anchored → none (staged scope, unchanged; #539)
+    "! git commit -am x",
+    "git push origin main",              // vacuous — no commit invocation
+    "gh pr create --body 'git commit -am x'",  // prose — never classified
+  ];
+  for (const c of pins) equal(commitSweepClass(c), "none", `must be none: ${c}`);
 });
 
 // ── #482 — shared drift-guard layout gate (replaces the two-#472-guard isSourceCheckout
@@ -2106,6 +2218,320 @@ test("#472 drift guard: 01-preflight VGATE-SHAPE-RULE fence == SHAPE_EXEMPT_EXTE
   );
 });
 
+// ── #487: parsePushRefSpecs / resolvePushTier / buildPushRangeDiffCommand ──
+// Pure content-push classifier (whole-command, isDeletionPush-section mirror),
+// 4-combo tier resolver, and exact-argv builder. Stub-first (Task 2) so the
+// suite never ESM-crashes on missing exports — bodies land in Task 3.
+
+section("parsePushRefSpecs — content-push classifier (#487)");
+
+// ── Eligible (content push) pins ──
+
+test("simple explicit-refspec push → eligible", () => {
+  const p = parsePushRefSpecs("git push origin main");
+  ok(p.eligible === true, "must classify as eligible");
+  if (p.eligible) {
+    equal(p.remote, "origin");
+    equal(p.bare, false);
+    deepEqual(p.refspecs, [{ src: "main", dst: "main", colon: false }]);
+  }
+});
+
+test("-u upstream ceremony spelling → eligible", () => {
+  const p = parsePushRefSpecs("git push -u origin feat/487");
+  ok(p.eligible === true && p.remote === "origin" && p.bare === false, "-u is whitelisted");
+  if (p.eligible) deepEqual(p.refspecs, [{ src: "feat/487", dst: "feat/487", colon: false }]);
+});
+
+test("whitelisted flag set (bare-token equality)", () => {
+  for (const flag of ["-u", "--set-upstream", "-f", "--force", "--force-with-lease"]) {
+    const p = parsePushRefSpecs(`git push origin ${flag} main`);
+    ok(p.eligible === true, `${flag} must be whitelisted`);
+  }
+});
+
+test("remote + no refspecs → bare with remote fixed", () => {
+  const p = parsePushRefSpecs("git push origin --force-with-lease");
+  ok(p.eligible === true && p.bare === true && p.remote === "origin", "remote-fixed bare");
+});
+
+test("no positionals → bare with null remote", () => {
+  const p = parsePushRefSpecs("git push --force-with-lease");
+  ok(p.eligible === true && p.bare === true && p.remote === null, "config-upstream bare (04-merge-deploy ceremony)");
+});
+
+test("colon refspec split → colon: true", () => {
+  const p = parsePushRefSpecs("git push origin main:feat");
+  ok(p.eligible === true);
+  if (p.eligible) deepEqual(p.refspecs, [{ src: "main", dst: "feat", colon: true }]);
+});
+
+test("HEAD accepted syntactically on either side", () => {
+  const p = parsePushRefSpecs("git push origin HEAD");
+  ok(p.eligible === true);
+  if (p.eligible) deepEqual(p.refspecs, [{ src: "HEAD", dst: "HEAD", colon: false }]);
+  const q = parsePushRefSpecs("git push origin main:HEAD");
+  ok(q.eligible === true, "syntax-only: REF SEMANTICS are the resolver's probe job");
+});
+
+test("refs/heads/ spelling accepted", () => {
+  const p = parsePushRefSpecs("git push origin refs/heads/main:refs/heads/feat");
+  ok(p.eligible === true);
+  if (p.eligible) deepEqual(p.refspecs, [{ src: "refs/heads/main", dst: "refs/heads/feat", colon: true }]);
+});
+
+test("prefix-verb and cd forms normalize (stripSegmentHead)", () => {
+  ok(parsePushRefSpecs("sudo git push origin main").eligible === true);
+  ok(parsePushRefSpecs("cd /tmp/x && git push origin main").eligible === true);
+});
+
+test("refspecs accumulate across multi-push segments", () => {
+  const p = parsePushRefSpecs("git push origin a && git push origin b");
+  ok(p.eligible === true && p.remote === "origin");
+  if (p.eligible) deepEqual(p.refspecs, [
+    { src: "a", dst: "a", colon: false },
+    { src: "b", dst: "b", colon: false },
+  ]);
+});
+
+test("bare + explicit-refspec mixing is order-independent → unmappable (review cycle-2: bare-first must not drop refspecs)", () => {
+  const bareFirst = parsePushRefSpecs("git push && git push origin main");
+  ok(!bareFirst.eligible && bareFirst.reason === "unmappable", "bare-first mixing must null the whole command, never silently drop the explicit refspec");
+  const explicitFirst = parsePushRefSpecs("git push origin main && git push");
+  ok(!explicitFirst.eligible && explicitFirst.reason === "unmappable", "explicit-first mixing must null identically (order-independent)");
+  const remoteBareFirst = parsePushRefSpecs("git push origin --force-with-lease && git push origin main");
+  ok(!remoteBareFirst.eligible && remoteBareFirst.reason === "unmappable", "remote-fixed bare + explicit mixing nulls too");
+});
+
+// ── Ineligible (fail-closed) pins ──
+
+test("P0 guard: any git commit anywhere (bare, wrapper, chained) → has_commit", () => {
+  const a = parsePushRefSpecs("git push origin main && git commit -m x");
+  ok(!a.eligible && a.reason === "has_commit", "chained commit flips has_commit");
+  const b = parsePushRefSpecs("sh -c 'git push origin main && git commit -am x'");
+  ok(!b.eligible && b.reason === "has_commit", "wrapper commit containment (findGitCommit substring)");
+  const c = parsePushRefSpecs("git commit -m x");
+  ok(!c.eligible && c.reason === "has_commit", "commit-only command → has_commit (else-branch staged scope preserved)");
+});
+
+test("gh pr create|merge anywhere → has_gh", () => {
+  const p = parsePushRefSpecs("gh pr create --title x && git push origin main");
+  ok(!p.eligible && p.reason === "has_gh");
+});
+
+test("tag / --all / --tags / --mirror shapes → unmappable", () => {
+  ok(parsePushRefSpecs("git push origin refs/tags/v1.0").reason === "unmappable");
+  ok(parsePushRefSpecs("git push origin --tags").reason === "unmappable");
+  ok(parsePushRefSpecs("git push --all").reason === "unmappable");
+  ok(parsePushRefSpecs("git push --mirror origin").reason === "unmappable");
+  ok(parsePushRefSpecs("git push origin main:refs/tags/v1.0").reason === "unmappable");
+});
+
+test("URL remote → unmappable", () => {
+  const p = parsePushRefSpecs("git push git@github.com:o/r.git main");
+  ok(!p.eligible && p.reason === "unmappable");
+});
+
+test("any non-whitelisted flag → unmappable (attached value included)", () => {
+  for (const flag of ["--porcelain", "-q", "--prune", "--force-with-lease=expiry"]) {
+    const p = parsePushRefSpecs(`git push origin ${flag} main`);
+    ok(!p.eligible && p.reason === "unmappable", `${flag} must be unmappable (fail-closed)`);
+  }
+});
+
+test("wrapper push (git push at offset > 0, no commit/gh) → wrapper", () => {
+  const p = parsePushRefSpecs("sh -c 'git push origin main'");
+  ok(!p.eligible && p.reason === "wrapper", "cannot prove shape — fail-closed, symmetric with isDeletionPush");
+});
+
+test("delete + content chain → mixed_delete (whole-command rule, scenario 44 legs 2-3)", () => {
+  const p = parsePushRefSpecs("git push origin --delete a && git push origin main");
+  ok(!p.eligible && p.reason === "mixed_delete", "mixed delete+content nulls the whole command → staged scope");
+  const q = parsePushRefSpecs("git push origin --delete a & git push origin main");
+  ok(!q.eligible && q.reason === "mixed_delete", "single-& background chain classifies identically");
+});
+
+test("pure scaffolding (no gated verb) → no_push", () => {
+  const p = parsePushRefSpecs("echo hello");
+  ok(!p.eligible && p.reason === "no_push");
+});
+
+// ── resolvePushTier 4-combo table ──
+
+section("resolvePushTier — A/B/C decision table (#487)");
+
+test("4-combo table: (T,·)→A, (F,T)→B, (F,F)→C", () => {
+  equal(resolvePushTier(true, true), "A");
+  equal(resolvePushTier(true, false), "A");
+  equal(resolvePushTier(false, true), "B");
+  equal(resolvePushTier(false, false), "C");
+});
+
+test("never undefined for any input (evaluateMergeScope-style fuzz)", () => {
+  const inputs: [boolean, boolean][] = [
+    [false, false], [false, true], [true, false], [true, true],
+  ];
+  for (const [t, b] of inputs) {
+    const tier = resolvePushTier(t, b);
+    ok(tier === "A" || tier === "B" || tier === "C", `must always return a tier, got ${tier}`);
+  }
+});
+
+// ── buildPushRangeDiffCommand exact argv pins ──
+
+section("buildPushRangeDiffCommand — exact argv (#487)");
+
+test("tier A emits the 2-dot space form with the FULL tracking-ref base", () => {
+  equal(
+    buildPushRangeDiffCommand("A", "refs/remotes/origin/main", "feat/487"),
+    "git diff --name-only refs/remotes/origin/main feat/487"
+  );
+});
+
+test("tier B emits the 3-dot form against the origin main base", () => {
+  equal(
+    buildPushRangeDiffCommand("B", "refs/remotes/origin/main", "feat/487"),
+    "git diff --name-only refs/remotes/origin/main...feat/487"
+  );
+});
+
+test("tier B emits whatever base the resolver chose — NON-ORIGIN base flows through", () => {
+  equal(
+    buildPushRangeDiffCommand("B", "refs/remotes/upstream/main", "feat/487"),
+    "git diff --name-only refs/remotes/upstream/main...feat/487"
+  );
+});
+
+// ── #490 T2: head-anchored git-global-option parse + shared verb scanner ──
+// Group A = RED pins (fail on the pre-fix regex family — write-first, each
+// confirmed failing before the scanner landed). Group B = green guards
+// (hold before AND after — regressions would break them).
+
+section("#490 T2 — interception widening: cwd-neutral git globals (RED pins)");
+
+test("RED: -c commit.gpgsign=false spellings were un-intercepted (the #490 hole)", () => {
+  // Legacy GIT_COMMIT_PATTERN's `(^|\s)git\s+(commit|push)` needs DIRECT
+  // adjacency — `git -c commit.gpgsign=false commit` never fired → the commit
+  // rode the gate silently. The -c value's `commit` prefix is what made the
+  // legacy findGitCommit regex mis-bind (value consumed as a bare commit).
+  ok(isGitOp("git -c commit.gpgsign=false commit -am x"), "-c commit spellings must intercept");
+  ok(isGitOp("git -c commit.gpgsign=false push origin main"), "-c push spellings must intercept");
+});
+
+test("RED: no-value globals (--no-pager) were un-intercepted", () => {
+  ok(isGitOp("git --no-pager commit -m x"), "--no-pager between git and commit must intercept");
+  ok(isGitCommit("git --no-pager commit -m x"), "commit-only scan sees the --no-pager form");
+});
+
+test("RED: quoted -c value consumed atomically", () => {
+  ok(isGitOp('git -c "user.name=A B" commit -am x'), "quoted -c value (spaces) must not break the parse");
+  ok(isGitCommit('git -c "user.name=A B" commit -m x'), "quoted-value commit-only interception");
+});
+
+test("RED: metachar/quote/backslash abutments newly fire (both sides)", () => {
+  ok(isGitOp("git commit&&git push origin main"), "verb-side metachar split (&&)");
+  ok(isGitOp("cd /repo&&git commit -am x"), "git-side abutting: cd /repo&&git commit");
+  ok(isGitOp("(git commit -m x)"), "git-side abutting: subshell parens");
+  ok(isGitOp("sh -c 'git commit'"), "quote-abutting (verb side — closing quote)");
+  ok(isGitOp("sh -c 'git commit -am x'"), "quote-abutting (git side — opening quote before git)");
+  ok(isGitOp("git 'commit' -am x"), "quoted verb");
+  ok(isGitOp("git \\\ncommit -am x"), "backslash-newline continuation between git and verb");
+});
+
+test("RED: unknown-dash + -c composition (--no-color must not swallow the -c)", () => {
+  ok(isGitOp("git --no-color -c x=y commit -am z"), "unknown dash never consumes a following dash token");
+});
+
+test("RED: classifier mis-binds fixed — -c/-C value tokens never parse as the verb", () => {
+  ok(isBareCommitShape("git -c commit.gpgsign=false commit -m x"), "real commit behind -c value named commit… → bare");
+  ok(isBareCommitShape("git -C commit commit -m x"), "-C path named commit consumed as the redirect value → bare");
+  ok(isBareCommitShape("git -c commit.gpgsign=false -c x=y commit -m z"), "consecutive -c: atomic value consumption (legacy mis-bind → non-bare)");
+});
+
+test("RED: -c push spellings route via the verb-scan (pure-delete + range-eligible)", () => {
+  ok(isDeletionPush("git -c commit.gpgsign=false push origin --delete feat/x"), "-c delete push classifies pure (legacy: value mis-bind → false)");
+  const p = parsePushRefSpecs("git -c commit.gpgsign=false push origin main");
+  ok(p.eligible === true, "-c content push is range-eligible (legacy: has_commit via mis-bind)");
+  if (p.eligible) {
+    equal(p.remote, "origin");
+    equal(p.bare, false);
+    deepEqual(p.refspecs, [{ src: "main", dst: "main", colon: false }]);
+  }
+  const q = parsePushRefSpecs("git -c commit.gpgsign=false push origin");
+  ok(q.eligible === true && q.bare === true && q.remote === "origin", "-c bare push (remote fixed) stays range-eligible");
+});
+
+test("RED (#490 T2 round-2): out-of-table no-value global before verb + abutting-quote -c values", () => {
+  // P1-1: an unknown no-value global DIRECTLY before the verb — the round-1
+  // `break` abandoned the candidate (invocation invisible → sweep misclassified
+  // → compound pushes swept the WT unverified).
+  ok(isGitOp("git --no-optional-locks commit -am x"), "no-value global before verb must intercept");
+  equal(commitSweepClass("git --no-optional-locks commit -am x"), "sweep", "...classifies sweep");
+  equal(isBareCommitShape("git --no-optional-locks commit -am x"), false, "...non-bare");
+  equal(commitSweepClass("git --no-optional-locks commit -am x && git push origin main"), "sweep", "compound keeps sweep scope (round-1: sweep=none regression)");
+  const p1 = parsePushRefSpecs("git --no-optional-locks commit -am x && git push origin main");
+  ok(!p1.eligible, "compound must NOT be range-eligible (the sweep half is a commit — P0 guard)");
+  // P1-2: bash word-concatenation in -c VALUES — `core.editor='vim -w'` is ONE
+  // bash word; the round-1 quote-abutting rule split it → invocation invisible.
+  ok(isGitOp("git -c core.editor='vim -w' commit -am x"), "abutting-quote -c value must intercept");
+  equal(commitSweepClass("git -c core.editor='vim -w' commit -am x"), "sweep", "...sweep");
+  equal(isBareCommitShape("git -c core.editor='commit x' commit -am y"), false, "verb-like word inside a value never binds as the verb");
+  equal(commitSweepClass("git -c core.editor='vim -w' commit -am x && git push origin main"), "sweep", "compound with abutting-quote value keeps sweep");
+  // GREEN-ON-BOTH guards (round-1 code also passed — kept for regression, not RED):
+  equal(isBareCommitShape("git -c core.editor='commit x' commit -am y"), false, "verb-like word inside a token-start-quote value never binds as the verb (green-on-both)");
+  ok(isGitOp("git --no-pager commit -m x"), "in-table boolean regression guard (green-on-both)");
+});
+
+test("RED (#490 T2 round-3): wrapper-contained global+verb followed by && git push must intercept", () => {
+  // The round-2 join-mode peek swallowed a wrapper's closing quote + the rest of
+  // the command when the verb was the LAST token inside the quote → candidate
+  // abandoned → isGitOp false → the trailing push sailed unverified (P1, r3).
+  ok(isGitOp("sh -c 'git --no-optional-locks commit' && git push origin main"), "wrapped no-value-global commit + trailing push must intercept");
+  ok(isGitOp("echo \"git --no-optional-locks commit\" && git push origin main"), "prose-wrapped + trailing push must intercept");
+  ok(isGitOp("sh -c 'git --no-optional-locks commit' && echo hi && git push origin main"), "wrapped + interposed echo + push must intercept");
+  equal(commitSweepClass("sh -c 'git --no-optional-locks commit -am x' && git push origin main"), "none", "wrapper-contained sweep stays 'none'/staged per #489 semantics (wrapper-alone → staged scope — documented residual #539); the interception pins above are the r3 regression guards");
+});
+
+section("#490 T2 — cwd-neutral boundary + containment guards (group B)");
+
+test("GREEN: repo-redirecting globals stay UN-INTERCEPTED (foreign boundary)", () => {
+  equal(isGitOp("git -C /tmp/x commit -m x"), false, "-C commit → other checkout — hook cannot scope it");
+  equal(isGitOp("git --git-dir=/x commit -am y"), false, "attached --git-dir= commit stays un-intercepted");
+  equal(isGitOp("git -c commit.gpgsign=false pull --rebase origin main"), false, "pull is not a gated verb");
+  equal(isGitOp("gitcommit"), false);
+  equal(isGitOp("somegit commit"), false);
+  equal(isGitCommit("git push origin main"), false, "push never arms pendingRehash (#7574)");
+});
+
+test("GREEN: env-form redirects REMAIN intercepted (status quo — inline assignment)", () => {
+  ok(isGitOp("GIT_DIR=/x git commit -am y"), "GIT_DIR= git commit stays intercepted");
+  ok(isGitOp("GIT_WORK_TREE=/x git push origin main"), "GIT_WORK_TREE= git push stays intercepted");
+});
+
+test("GREEN: classifier containment unchanged (foreign commits still count for the P0 guard)", () => {
+  equal(isBareCommitShape("git -C repo commit -am x"), false, "-a sweep behind -C stays non-bare");
+  equal(isBareCommitShape("git -C commit commit -m x"), true, "-C path consumed → real commit is bare");
+  equal(commitSweepClass("git -C repo commit -am x"), "sweep", "sweep behind -C (pre-existing pin)");
+  equal(commitSweepClass("git -c commit.gpgsign=false commit -am x"), "sweep", "-c sweep (guard holds both ways)");
+  equal(isBareCommitShape("git -c commit.gpgsign=false commit -am x"), false, "-c sweep stays non-bare");
+  const p = parsePushRefSpecs("git --git-dir=/x commit -am y && git push origin main");
+  ok(!p.eligible && p.reason === "has_commit", "attached redirect commit stays visible to the P0 guard (containment chain)");
+  const q = parsePushRefSpecs("git -C /x push origin main");
+  ok(!q.eligible, "foreign redirect push alone → not this scope (scaffolding → no_push)");
+});
+
+test("GREEN: composition guards (unknown-dash never swallows a -c)", () => {
+  equal(commitSweepClass("git --no-color -c x=y commit -am z"), "sweep", "--no-color + -c + -am → sweep");
+  equal(isBareCommitShape("git --no-color -c x=y commit -am z"), false, "same shape stays non-bare");
+  equal(commitSweepClass("git --shallow-file /x commit -am y"), "sweep", "unknown value-taking global keeps legacy breadth");
+});
+
+test("GREEN: existing negative spans stay clean (#5571 heredoc / inline-string semantics)", () => {
+  equal(isGitOp("cat << 'EOF'\necho done\nEOF"), false);
+  ok(isGitOp("gh issue create --body 'run git commit after'"), "inline-string prose containment unchanged (fires)");
+  equal(commitSweepClass("gh pr create --body 'git commit -am x'"), "none", "prose never classifies");
+  equal(commitSweepClass("git status"), "none", "status is not a commit");
+});
 // ── Results ───────────────────────────────────────────
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

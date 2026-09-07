@@ -238,10 +238,9 @@ gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep '^complex
 - `complexity:complex` → **TIER = Complex**
 - No label found or `ISSUE_NUMBER = 'none'` → **TIER = unknown** (classify from diff in Step 1.5 / `02-commit-pr.md`)
 
-Store as `TIER` for subsequent steps. Export as `AGENT_ISSUE_COMPLEXITY` (legacy annotation — the extension never consults this env var for gate decisions; the review-enforcer session_start handler reads it only to warn that it has no effect (~index.ts L670); #493 owns dropping the export. The marker write below IS read, for message selection only since #485):
+Store as `TIER` for subsequent steps. Write the marker file — the only channel the review-enforcer reads (a bash-exported `AGENT_ISSUE_COMPLEXITY` env var has no effect: the extension's session_start handler reads it only to warn that it is dead — `extensions/review-enforcer/index.ts` ~L670; the vestigial export was dropped in #493). Since #485 the marker selects only the micro-specific remediation message, never allow/block:
 
 ```bash
-export AGENT_ISSUE_COMPLEXITY=$TIER
 echo "$TIER" > /tmp/agent-issue-complexity
 ```
 
@@ -257,8 +256,11 @@ Mechanism separation: the VGATE content-shape skip is extension-side and shape-b
 | Verification-gate (VGATE) | **shape-gated, not tier-gated** — docs/CSS/static-only sets skip regardless of tier; code sets never skip (see Pi Extension Gates → Verification Gate below) |
 | Lint/Typecheck | **KEPT** — runs in pre-commit hooks, zero agent overhead |
 | Code review (Step 3) | **SKIPPED** — per commit-workflow/03-code-review.md |
+| Pipeline-compliance CI gate (check a) | **KEPT — issue link required at EVERY tier, docs-only micro included (#488)** — the script's micro exemption skips checks b–e (scoping/review/plan evidence), and the docs-only shape exemption covers only check e (test evidence); no carve-out exists or is planned for the linked-issue requirement. See the #488 note below. |
 
 **Rationale:** Micro-tier CODE commits keep full VGATE (shape-gated — the extension skips only docs/CSS/static sets, never code), and VGATE's own [VGATE] verification dispatch satisfies the review-enforcer ≥1-dispatch rule before the commit — micro code sets clear the gate with no extra ceremony. The residual case the uniform block closes is the docs-only micro commit: VGATE shape-exempts it and the multi-agent code-review gate is skipped at micro, so the ≥1 dispatch must come from a lightweight reviewer dispatch (even a trivial one-line review counts).
+
+**#488 decision — the pipeline-compliance issue-link requirement (check a) is KEPT for docs-only shape-exempt commits, as a deliberate audit invariant.** The audit (scripts/check-pipeline-compliance.sh): check a is unconditional — it runs at every tier and every file shape; `complexity:micro` skips checks b–e (scoping comment, code-review evidence, plan doc) and the docs/skills/templates/config-only shape exemption covers only check e (test coverage — it exempts nothing about the linked issue). No docs-only carve-out exists in the script or the workflow. KEEP rationale: (1) a docs-only commit now skips VGATE (#472 shape exemption) and the multi-agent code-review gate (micro), so check a is the only deterministic, CI-enforced content gate left on it — the review-enforcer ≥1-dispatch floor is content-free by design (#485); (2) the #485 audit documented that the "docs are low-consequence" premise fails for the contract-doc subclass (skills/*.md edits encode agent behavior for every future session — #475/#492), so docs-only commits are exactly the class that must keep tracing to a deliberate issue; (3) friction is negligible for pipeline-shaped work — Issue Detection above resolves an issue before every PR-opening commit (the permitted `'none'` answer leaves no PR that check a would pass — a no-issue docs change must go through issue-creation first, which is the intended remedy, not a gate exemption). Relaxing would reopen a no-content-gate path for contract-doc changes and break the gate's "every PR traces to an issue" audit claim. No script or test change — this is a documented-rationale decision (#488).
 
 ## Wiring-Gap Check (canary-fix PRs only)
 
@@ -326,10 +328,35 @@ The `review-enforcer` extension blocks git operations unless at least one sub-ag
 
 ### Verification Gate
 
-The `verification-gate` extension blocks `git commit` unless every staged file has been verified by a `[VGATE]` sub-agent — except where the content-shape exemption below applies.
+The `verification-gate` extension blocks `git commit` unless every file the commit
+will record has been verified by a `[VGATE]` sub-agent — for bare commits that is
+"every staged file", but `-a`/`--all` sweep commits also record never-staged dirty
+tracked files, so the verified set is the command's full diff scope (see the #489
+paragraph below) — except where the content-shape exemption below applies.
+
+**#489 — auto-sweep (`-a`/`--all`) commits are NOT index-scoped:** `git commit -a` /
+`--all` record the tracked WORKING TREE, not just the staged index. When the
+command is a pure sweep (`-a`/`--all` on every commit invocation, e.g. `git commit
+-am x`, `git commit -a -m x`), VGATE verifies the
+HEAD-vs-working-tree file set (`git diff HEAD --name-only` — exactly what the
+sweep records) instead of the staged diff; a mixed command (sweep + bare commit in
+one op, including a sweep preceded by a wrapper/negated commit such as
+`sh -c 'git commit -m y' && git commit -am x`) verifies the union of staged +
+working-tree files. ⚠️ Global-option spellings (`git -C repo commit --all`,
+`git --no-pager commit …`) are NOT yet intercepted by the hook at all — always
+invoke `git commit` directly in the repo root so VGATE fires (open #490). The verification prompt
+for a sweep therefore lists WORKING-TREE files — `[VGATE] verify files: <dirty
+code>. Classification: …` — even when only docs are staged: a docs-only PASS must
+not unlock a sweep that would ship dirty, never-verified code. Bare/pathspec/
+`--amend`-alone commits keep the staged (index) scope (#489 T2); pathspec commits
+(`git commit -m x f.txt`) keep that same staged index scope — a known under-gate
+for pathspec WT-path commits, tracked as residual #538. Unborn-HEAD
+repos (no commits yet) fall back to the staged set — `git commit -a` on an unborn
+HEAD records only the index. `gh pr` ops are unchanged (branch diff scope).
 
 **Content-shape exemption (docs/CSS/static-only — extension-side, tier-independent):**
-when the op's relevant file set (staged diff for commit/push; branch diff for
+when the op's relevant file set (staged diff for commit; pushed-range diff for
+content push where a base resolves — staged otherwise; branch diff for
 `gh pr create`/merge) is ENTIRELY docs/CSS/static AND no file sits under a
 build-output directory, VGATE skips the op (audited `gate_skip:
 content_shape_exempt`). Code-bearing or mixed sets are NEVER exempt; among
@@ -350,13 +377,31 @@ merge ops with no commit invocation qualify on file shape alone).
 Delete-shaped pushes (`git push origin --delete <branch>`, `git push --delete
 origin <branch>`, `git push origin :<branch>`) ship no local file content and
 skip VGATE before any diff computation (audited `gate_skip:
-delete_push_no_content`). Content pushes keep the staged check. `git branch -D`
+delete_push_no_content`). Content pushes verify the PUSHED RANGE — the files
+the push actually ships — not the whole index: `git diff
+refs/remotes/<remote>/<branch> <src>` when the remote-tracking ref exists
+(2-dot), or 3-dot against the remote's main on a first push
+(`refs/remotes/<remote>/main` when that ref exists, else the
+`refs/remotes/origin/main` fallback). A parked-WIP index from another session
+must not block an unrelated push of already-verified committed HEAD; an
+up-to-date push is audited `gate_skip: push_range_empty`. ⛔ Fail-closed
+fallbacks (the range scope is a best-effort resolution, never a widening):
+when NO usable base exists (no tracking ref AND no `refs/remotes/origin/main`
+— e.g. a fresh `git init` first push) the push keeps the staged (index) check
+and can still block over parked WIP; a whole command that contains a `git
+commit`, a tag/`--all`/`--tags`/`--mirror` push, a delete+content chain, a
+`gh pr create`/merge anywhere in the command, an
+unmappable refspec shape, or any probe failure likewise keeps the staged
+check. `git branch -D`
 / `git worktree remove` are not VGATE-intercepted.
 
 **How to satisfy:**
 ```bash
-# Dispatch a verifier sub-agent:
+# Dispatch a verifier sub-agent (bare commit — staged scope):
 task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|backend|doc>. Project root: <repo root>.', ...)
+# For `git commit -a`/`--all` (sweep) commands the block lists the WORKING-TREE file
+# set (`git diff HEAD`) — dirty tracked files that may never have been staged; list
+# them in the prompt exactly as the gate named them.
 ```
 
 **Format requirements (CRITICAL):**
@@ -367,7 +412,7 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 **Gotchas:**
 - If staged files change after verification, hashes won't match — re-verify
 - The gate extracts file paths from the prompt, not the response — make sure paths are correct
-- `AGENT_SKIP_VGATE=1` at session start disables this gate entirely (`AGENT_ALLOW_MAIN_EDITS=1` no longer does — #7470)
+- `ELDATO_SKIP_VGATE=1` at session start disables this gate entirely (`AGENT_ALLOW_MAIN_EDITS=1` no longer does — #7470)
 
 ---
 
@@ -377,15 +422,16 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 
 **When:** Standard+Complex tier commits where staged files include `.ts`, `.tsx`, `.py`, `.sql`, `.js`, or `.jsx`.
 
-**Skip:** Micro tier commits (tier-gated — the Mechanism below greps the issue BODY for `complexity:micro`, a third, separate micro channel from the review-enforcer's `/tmp/agent-issue-complexity` marker; VGATE is shape-gated, never micro-gated), or commits with no matching file extensions.
+**Skip:** Micro tier commits (tier-gated — the Mechanism below reads the issue's `complexity:*` LABEL, the same canonical channel Tier Detection above uses; #515 removed the earlier body-substring grep, which false-skipped Standard issues whose bodies merely mention `complexity:micro` in prose — prose mentions are not a tier signal, and the Standard PR class most likely to name the tier is pipeline-policy edits like this file. VGATE remains shape-gated, never micro-gated), or commits with no matching file extensions.
 
 **Mechanism:**
 
 ```bash
-# Skip for micro tier
-ISSUE_BODY=$(gh issue view <N> --json body -q '.body')
-IS_COMPLEXITY_MICRO=$(echo "$ISSUE_BODY" | grep -q 'complexity:micro' && echo true || echo false)
-[ "$IS_COMPLEXITY_MICRO" = "true" ] && exit 0
+# Skip for micro tier — the complexity LABEL is the canonical tier source (Tier Detection
+# above reads the same label); a body-substring grep would false-positive on Standard issue
+# bodies that mention 'complexity:micro' in prose, silently skipping the gate (#515)
+IS_MICRO=$(gh issue view <N> --json labels --jq '.labels[].name' | grep -q '^complexity:micro$' && echo true || echo false)
+[ "$IS_MICRO" = "true" ] && exit 0
 
 # Check for testable files
 STAGED=$(git diff --cached --name-only)

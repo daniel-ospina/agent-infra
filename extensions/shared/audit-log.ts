@@ -8,9 +8,9 @@
  *
  * Schema per line: { ts, event, extension, reason?, session_cwd, ...extra }
  *   ts          — ISO-8601 timestamp (stamped here)
- *   event       — "gate_bypass" | "review_dispatch" | "merge_gate_block" | "merge_gate_pass" | "review_record_collision"
+ *   event       — "gate_bypass" | "review_dispatch" | "merge_gate_block" | "merge_gate_pass" | "review_record_collision" | "gate_block"
  *   extension   — name of the extension that emitted the event
- *   reason      — short tag (escape_hatch, per_command_escape_hatch, no_review_record, ...)
+ *   reason      — short tag (escape_hatch, per_command_escape_hatch, no_review_record, no_reviewers_dispatch, ...)
  *   session_cwd — process.cwd() at emit time (the session's working directory)
  *
  * Fail-safe semantics: appendJsonl NEVER throws into the gate path. A write
@@ -31,7 +31,8 @@ export type GateEventName =
   | "review_dispatch"
   | "merge_gate_block"
   | "merge_gate_pass"
-  | "review_record_collision"; // #426: cross-repo PR-number registry collision (readReviewRecord)
+  | "review_record_collision" // #426: cross-repo PR-number registry collision (readReviewRecord)
+  | "gate_block"; // #516: review-enforcer dispatch-count block at 0 dispatches (uniform ≥1-dispatch floor, #485)
 
 // Resolved lazily per call (not at module load) so a $HOME change — tests,
 // alternate agent dirs — takes effect. Uses os.homedir(); never hardcoded.

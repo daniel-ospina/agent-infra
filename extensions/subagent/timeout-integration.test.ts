@@ -129,9 +129,16 @@ test("spawned process tree is gone after the timeout kill", async () => {
 		process.argv[1] = savedArgv1;
 		delete process.env.SUBAGENT_TASK_TIMEOUT_MS;
 	}
+	// Linux procps pgrep self-matches the execSync `/bin/sh -c` wrapper — the
+	// pattern text sits in the wrapper's OWN argv, so a plain
+	// 'pgrep -f "sleep 120 && echo done"' never observes "gone" there (the
+	// identical defect fixed in cut-resume #541/#536). Char-class the first
+	// char: "[s]leep …" matches the real child's bare "sleep …" argv but not
+	// the wrapper's literal "[s]leep …" argv. BSD/macOS pgrep doesn't
+	// self-match, but this suite must pass on Linux CI too.
 	let matches = "";
 	try {
-		matches = execSync('pgrep -f "sleep 120 && echo done"', { timeout: 2000, encoding: "utf-8" }).trim();
+		matches = execSync('pgrep -f "[s]leep 120 && echo done"', { timeout: 2000, encoding: "utf-8" }).trim();
 	} catch {
 		// no matches (or pgrep unavailable) — expected
 	}
@@ -155,7 +162,7 @@ test("external SIGKILL mid-task → stopReason 'cut', isFailedResult true, sweep
 		while (Date.now() - started < 20_000) {
 			let pids = "";
 			try {
-				pids = execSync('pgrep -f "sleep 120 && echo done"', { timeout: 2000, encoding: "utf-8" }).trim();
+				pids = execSync('pgrep -f "[s]leep 120 && echo done"', { timeout: 2000, encoding: "utf-8" }).trim();
 			} catch {
 				// not up yet — poll again
 			}
@@ -207,7 +214,7 @@ test("external SIGKILL mid-task → stopReason 'cut', isFailedResult true, sweep
 	const deadline = Date.now() + 15_000;
 	while (Date.now() < deadline) {
 		try {
-			matches = execSync('pgrep -f "sleep 120 && echo done"', { timeout: 2000, encoding: "utf-8" }).trim();
+			matches = execSync('pgrep -f "[s]leep 120 && echo done"', { timeout: 2000, encoding: "utf-8" }).trim();
 		} catch {
 			matches = ""; // no matches — expected
 		}

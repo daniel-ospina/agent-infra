@@ -95,7 +95,7 @@ ISSUE:
 
 **Skip only when:** No code files were changed. **Micro fix fast-path (#6699):** For complexity:micro fixes (1 file, <20 lines, no schema changes), skip verifier sub-agent dispatch.
 
-**Micro fix in-session commit:** Set `AGENT_SKIP_VGATE=1` and `AGENT_SKIP_REVIEW_GATE=1` before session start, run typecheck + affected tests, commit normally.
+**Micro fix in-session commit:** Set `ELDATO_SKIP_VGATE=1` and `AGENT_SKIP_REVIEW_GATE=1` before session start, run typecheck + affected tests, commit normally.
 
 </HARD-GATE>
 

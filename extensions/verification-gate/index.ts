@@ -324,28 +324,268 @@ function recoverBridgeForRoot(normRoot: string): number {
   return recovered;
 }
 
-// ── Git operation patterns ────────────────────────────
-
-// (?=\s|$) lookahead: real commands have whitespace/end after the verb.
-// Prevents false positives from documentation text like "git commit/push"
-// appearing in heredoc bodies or --body string args (#5571).
-const GIT_COMMIT_PATTERN = /(^|\s)git\s+(commit|push)(?=\s|$)/;
-// #7574: commit-only pattern for pendingRehash. lint-staged runs as a pre-commit hook,
-// not pre-push. Setting pendingRehash on push wastes I/O — the next git op re-hashes
-// all verifiedSet entries from disk unnecessarily.
-const GIT_COMMIT_ONLY_PATTERN = /(^|\s)git\s+commit(?=\s|$)/;
-const GH_PR_PATTERN = /(^|\s)gh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+(create|merge)(?=\s|$)/;
+// ── Git operation detection — shared verb-invocation scanner (#490 T2) ──
+// Replaces the lookahead-mis-binding regex family (GIT_COMMIT_PATTERN /
+// GIT_COMMIT_ONLY_PATTERN deleted here — the findGitVerbInvocation scanner
+// below is the single source for both the INTERCEPTION surface (isGitOp /
+// isGitCommit) and the classifier containment (findGitCommit → the P0 guard
+// and the D2/sweep wrappers). #487 P0-guard coupling: findGitCommit stays a
+// thin `{"commit"}` wrapper over the same scanner so containment can never
+// drift from interception.
+//
+// Model: a git subcommand INVOCATION is `git` + zero or more GLOBAL options
+// + a verb (commit/push/…). We scan for candidate `git` words (quote-UNAWARE
+// `\bgit\b` — the legacy `(^|\s)git` anchor let quote/metachar-abutting git
+// words slip, e.g. `sh -c 'git commit'`, `cd /repo&&git commit`; the \b scan
+// is the interception-widening surface of #490 T2), then tokenize the text
+// AFTER the candidate with a fresh bash-argv-style tokenizer (whitespace +
+// unquoted `;&|()<>` split, backslash escapes + backslash-newline join,
+// quoted regions = one token, a quote abutting accumulated chars ends the
+// word so `commit'` normalizes to the verb `commit`). The first token that is
+// not a global option must be the verb; anything else ends the candidate
+// (git requires the subcommand directly after globals — `git status` is not
+// a commit even if `commit` appears later).
+//
+// Global-option KIND table (atomic, head-anchored — git parses globals
+// before the subcommand, so a candidate is only ever walking its own head):
+//   session-value  — `-c <name>=<value>` EXACT (space form only; git rejects
+//                    attached `-cNAME=VALUE` — verified "unknown option", so
+//                    no attached arm) consumes ONE atomic value token. This
+//                    closes the legacy mis-bind where the regex lookahead
+//                    bound the VERB inside the `-c` VALUE
+//                    (`git -c commit.gpgsign=false commit -m x` mis-parsed
+//                    as a bare commit at the value's `commit` word → the
+//                    real command was un-intercepted).
+//   session-bool   — no-value globals (`--no-pager`, `-p`, `-P`, `--paginate`,
+//                    `--bare`, `--no-replace-objects`, …) consume nothing.
+//   redirect       — `-C <path>` / `--git-dir <d>` / `--work-tree <w>` /
+//                    `--namespace <ns>` / `--super-prefix <p>` mark the
+//                    invocation FOREIGN (its repo checkout differs from the
+//                    session cwd — the hook cannot scope it). Space form
+//                    consumes the ONE value token; ATTACHED `=` form
+//                    (`--git-dir=/x`) carries its own value and consumes
+//                    NOTHING (the value token follows independently).
+//   unknown dash   — verb wins (next token IS the verb → treat as boolean);
+//                    otherwise consume ONE following NON-dash token as its
+//                    value (`--shallow-file /x`); a following dash token is
+//                    never consumed (`git --no-color -c x=y commit` must not
+//                    swallow the `-c` — the legacy regex backtracked here,
+//                    the naive one-token heuristic would lose the verb).
+//                    Attached `--foo=bar` unknowns carry their value and
+//                    consume nothing. Mirrors the legacy regex's generic
+//                    breadth for future git globals (no narrowing
+//                    regression).
+//
+// FOREIGN boundary (the reason redirects are flagged, not aborted): the
+// interception surface (isGitOp/isGitCommit — `foreignRedirect: "skip"`)
+// treats a redirect as "this candidate targets another checkout" → skip it
+// and keep scanning (a LATER cwd-scoped `git …` in the same command still
+// fires; the -C/--git-dir/--work-tree ceremony spellings of the fixer loop
+// and docs stay un-intercepted exactly as today — skills/code-review/
+// references/fixer-loop.md L122/L130 rely on it). The CLASSIFIERS
+// (findGitCommit and the push recognizers — `foreignRedirect: "tolerate"`)
+// keep parsing past redirects so containment inside an already-gated command
+// is unchanged: `git -C repo commit` IS a commit for the P0 guard, while the
+// push recognizers treat a FOREIGN head push as scaffolding (a different
+// checkout's push is not this scope's op — today's adjacency regexes
+// classified it the same way).
 // #204 review P2-1: gh's merge verb with the optional global -R/--repo flag
 // between `gh` and `pr` — `gh -R owner/name pr merge 123` is a valid spelling
 // and must route into the merge-scope path like the post-verb flag form.
 const GH_PR_MERGE_VERB = /(?:^|\s)gh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+merge(?=\s|$)/;
 
+export interface GitVerbInvocation {
+  /** byte offset of the candidate `git` word in the scanned text */
+  index: number;
+  /** byte offset AFTER the verb token (incl. a closing quote — callers slice the rest) */
+  end: number;
+  /** matched verb ("commit" | "push") */
+  verb: string;
+  /** a repo-redirecting global (-C/--git-dir/--work-tree/--namespace/--super-prefix) appeared */
+  foreign: boolean;
+}
+
+type ForeignMode = "skip" | "tolerate";
+
+// Exact-token match ONLY (space form). `-c` rejects attached values (verified).
+const GIT_SESSION_VALUE = new Set(["-c"]);
+// No-value git globals (cwd-neutral). Unknown dashes behave the same via the
+// verb-wins heuristic; these are listed for documentation + exactness.
+const GIT_SESSION_BOOL = new Set(["--no-pager", "-p", "-P", "--paginate", "--bare", "--no-replace-objects", "--no-replace-objects=1"]);
+// Repo-redirecting globals → foreign invocation.
+const GIT_REDIRECT = new Set(["-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix"]);
+
+function isSpaceChar(ch: string): boolean {
+  return ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f";
+}
+
+function isTokenSeparator(ch: string): boolean {
+  return ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === ")" || ch === "<" || ch === ">";
+}
+
+interface ShellToken {
+  /** decoded content (quotes stripped, escapes resolved) */
+  content: string;
+  /** byte offset of the first decoded char */
+  rawStart: number;
+  /** byte offset just past the token's last RAW char (incl. a trailing quote) */
+  rawEnd: number;
+}
+
+// Read one bash-argv-style token starting at `from` (skipping separators/
+// whitespace first). Bash word model: unquoted whitespace and the metachar
+// set `;&|()<>` end a word; a backslash escapes the next char (a
+// backslash-newline pair is dropped — line continuation); a quoted region is
+// part of the current word with the quotes stripped; a quote that abuts
+// accumulated chars ENDS the word so `commit'` (the closing quote of a
+// wrapper like `sh -c 'git commit'`) normalizes to `commit`. Returns null at
+// end of text.
+function readShellToken(text: string, from: number, joinQuoted = false): ShellToken | null {
+  const len = text.length;
+  let p = from;
+  while (p < len && (isSpaceChar(text[p]) || isTokenSeparator(text[p]))) p++;
+  if (p >= len) return null;
+  const rawStart = p;
+  let content = "";
+  let quote: string | null = null;
+  while (p < len) {
+    const ch = text[p];
+    if (quote !== null) {
+      if (ch === "\\") {
+        if (p + 1 < len) { content += text[p + 1]; p += 2; continue; }
+        p++; continue;
+      }
+      if (ch === quote) { quote = null; p++; if (!joinQuoted) break; continue; } // closing quote: default ends the word; joinQuoted continues (bash concatenation)
+      content += ch; p++; continue;
+    }
+    if (ch === "'" || ch === '"') {
+      if (content.length > 0) {
+        if (joinQuoted) { quote = ch; p++; continue; } // bash: an abutting quote JOINS the current word (option values)
+        p++; break; // quote abutting chars — end the word (verb normalization)
+      }
+      quote = ch; p++; continue;              // word starts with a quote
+    }
+    if (isSpaceChar(ch) || isTokenSeparator(ch)) break;
+    if (ch === "\\") {
+      if (p + 1 < len && text[p + 1] === "\n") { p += 2; continue; } // line continuation
+      if (p + 1 < len) { content += text[p + 1]; p += 2; continue; }  // escaped char
+      p++; continue;
+    }
+    content += ch; p++;
+  }
+  // EOF with an open quote or plain content: the accumulated word still flushes.
+  if (content.length === 0 && rawStart === p) return null;
+  return { content, rawStart, rawEnd: p };
+}
+
+// Head-anchored atomic scan: tokenize the text AFTER a candidate `git` word
+// and walk the global-option table until the first non-option token. Returns
+// the verb invocation (first match in scan order) or null. When
+// foreignRedirect = "skip", a redirect abandons the candidate (continue
+// scanning later candidates) — the interception surface must not fire on
+// other-checkout invocations. When "tolerate", the candidate keeps parsing
+// and the match carries `foreign: true` — classifier containment.
+function findGitVerbInvocation(
+  text: string,
+  verbs: ReadonlySet<string>,
+  foreignRedirect: ForeignMode,
+): GitVerbInvocation | null {
+  const gitWord = /\bgit\b/g;
+  let searchFrom = 0;
+  while (searchFrom <= text.length) {
+    gitWord.lastIndex = searchFrom;
+    const m = gitWord.exec(text);
+    if (m === null || m.index === undefined) return null;
+    const candStart = m.index;
+    searchFrom = candStart + m[0].length; // resume AFTER this candidate if it yields nothing
+    let foreign = false;
+    let p = searchFrom;
+    for (;;) {
+      const tok = readShellToken(text, p);
+      if (tok === null) break; // candidate exhausted without a verb
+      p = tok.rawEnd;
+      const t = tok.content;
+      if (t.startsWith("-")) {
+        if (t === "-c") { // session-value: consume the ONE atomic value token (bash word-concat — #490 T2)
+          const val = readShellToken(text, p, true);
+          if (val !== null) p = val.rawEnd;
+          continue;
+        }
+        if (GIT_SESSION_BOOL.has(t)) continue;
+        if (GIT_REDIRECT.has(t)) {
+          foreign = true;
+          const val = readShellToken(text, p, true); // space form consumes its value (bash word-concat — #490 T2)
+          if (val !== null) p = val.rawEnd;
+          if (foreignRedirect === "skip") break; // other checkout — abandon candidate
+          continue;
+        }
+        // Redirect ATTACHED `=` form (`--git-dir=/x`, `--work-tree=/x`): value
+        // embedded — consumes nothing, still foreign.
+        if (t.includes("=") && (t.startsWith("--git-dir=") || t.startsWith("--work-tree=") || t.startsWith("--namespace=") || t.startsWith("--super-prefix="))) {
+          foreign = true;
+          if (foreignRedirect === "skip") break;
+          continue;
+        }
+        // Unknown dash: verb wins; else consume ONE non-dash token; a dash
+        // token is never a value (do not swallow a following -c). Attached
+        // `=` unknowns carry their value and consume nothing.
+        if (t.includes("=")) continue;
+        // Verb-wins probe in DEFAULT mode: a verb is always a plain word, and the
+        // default-mode quote-abutting rule terminates cleanly at a wrapper's
+        // closing quote (`sh -c 'git --no-optional-locks commit' && git push` —
+        // the quote ends the word, the verb matches, the candidate survives).
+        // Join mode here would treat the closing quote as an opening
+        // concatenation quote and swallow the rest of the command (P1, #490 T2 r3).
+        const verbProbe = readShellToken(text, p);
+        if (verbProbe === null) break;
+        if (verbs.has(verbProbe.content)) continue; // verb wins → this dash is a boolean; CONTINUE so the next iteration returns the verb (break here abandoned the candidate — #490 T2 P1)
+        if (verbProbe.content.startsWith("-")) { p = verbProbe.rawStart; continue; } // never a value — re-process the dash token next
+        // Not the verb → it is the option's VALUE: consume it in join mode (bash
+        // word-concatenation — an abutting quote is part of the value).
+        const val = readShellToken(text, p, true);
+        if (val === null) break;
+        p = val.rawEnd;
+        continue;
+      }
+      // First non-option token: must be the verb.
+      if (verbs.has(t)) {
+        return { index: candStart, end: tok.rawEnd, verb: t, foreign };
+      }
+      break; // non-verb positional (status/branch/…) — not an invocation
+    }
+    // Candidate yielded no invocation. Resume scanning AFTER the head region
+    // this candidate consumed (its option names/values) — otherwise `\bgit\b`
+    // re-scans inside option tokens like `--git-dir=/x` (the `git` inside the
+    // option name is a word boundary) and fabricates a candidate whose globals
+    // start mid-option.
+    if (p > searchFrom) searchFrom = p;
+  }
+  return null;
+}
+
+const GIT_VERB_SET = { commit: new Set(["commit"]), push: new Set(["push"]), commitPush: new Set(["commit", "push"]) };
+
+// findGitCommit — the thin `{commit}` wrapper over this scanner — lives with
+// its detailed contract comment beside the containment consumers (~L1079).
+
+const GH_PR_PATTERN = /(^|\s)gh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+(create|merge)(?=\s|$)/;
+// #7574: pendingRehash must arm only on COMMITS (lint-staged runs pre-commit,
+// not pre-push). The commit-only scan below replaces GIT_COMMIT_ONLY_PATTERN;
+// the cwd-neutral-global spelling (`git -c x=y commit`) now arms correctly
+// (#490 T2).
+
 export function isGitOp(command: string): boolean {
-  return GIT_COMMIT_PATTERN.test(command) || GH_PR_PATTERN.test(command);
+  // Interception surface: cwd-neutral invocations only (foreign redirects =
+  // other checkouts — the hook cannot scope them; the -C ceremony of the
+  // fixer loop stays un-intercepted). Env-form redirects (GIT_DIR=x git …)
+  // are NOT git globals — the inline assignment precedes the candidate and
+  // the invocation stays cwd-scoped exactly as today (status-quo pin).
+  const git = findGitVerbInvocation(command, GIT_VERB_SET.commitPush, "skip");
+  return git !== null || GH_PR_PATTERN.test(command);
 }
 
 export function isGitCommit(command: string): boolean {
-  return GIT_COMMIT_ONLY_PATTERN.test(command);
+  return findGitVerbInvocation(command, GIT_VERB_SET.commit, "skip") !== null;
 }
 
 // ── Content-shape exemption (#472 mechanism a) ───────
@@ -782,14 +1022,20 @@ function isRedirectToken(token: string): boolean {
   return /^(?:\d+)?(?:>>?|<<?|&>|>&)/.test(token);
 }
 
-// True when segment is `git push` whose args are a remote PLUS deletion forms
-// ONLY. Requires an explicit ∃-deletion marker (D4) — bare `git push origin`
+// True when segment is `git … push` (cwd-scoped, head-anchored after
+// stripSegmentHead; cwd-neutral globals like `-c x=y` / `--no-pager` between
+// `git` and `push` are tolerated via the shared verb scanner — #490 T2
+// mechanism d) whose args are a remote PLUS deletion forms ONLY. Requires an
+// explicit ∃-deletion marker (D4) — bare `git push origin`
 // (no marker) is NOT pure (vacuous-truth guard). Any other flag, a second
 // remote, a bare content refspec, or an unknown shape → false (fail-closed).
+// A redirect-global (`-C`/`--git-dir`/…) push is a DIFFERENT checkout's op →
+// false (callers treat it as scaffolding).
 function isPureDeletionPushSegment(segment: string): boolean {
   const stripped = stripSegmentHead(segment);
-  if (!/^git\s+push(?=\s|$)/.test(stripped)) return false;
-  const rest = stripped.replace(/^git\s+push\s*/, "");
+  const inv = findGitVerbInvocation(stripped, GIT_VERB_SET.push, "tolerate");
+  if (inv === null || inv.index !== 0 || inv.foreign) return false;
+  const rest = stripped.slice(inv.end);
   const tokens = tokenizePushArgs(rest);
   let sawRemote = false;
   let sawDeletionMarker = false;
@@ -834,59 +1080,66 @@ function isPureDeletionPushSegment(segment: string): boolean {
 // Matches a `git … commit` subcommand invocation anywhere in a segment,
 // tolerating git global options between `git` and `commit` (`-C repo`,
 // `-c k=v`, `--no-pager`, `--git-dir=…`). Returns `{ index, end }` — the
-// match's start offset AND the byte offset AFTER the `commit` verb — or null
-// when the segment holds no commit invocation. Used by BOTH predicates as
-// fail-closed containment — `git -C repo commit -am x` must register as a
-// commit or the `-a` sweep rides the docs exemption (review P2-1).
-// Head-anchored OR wrapper-prefixed: substring scan symmetric with
-// GIT_COMMIT_ONLY_PATTERN's `(^|\s)` (the `\b` at the start also catches
-// `! git commit`, `sh -c 'git commit …'`, `sudo … git commit`). Callers
-// decide how to treat offset: isDeletionPush only needs presence (`!== null`,
-// any commit anywhere flips purity); isBareCommitShape requires a
-// HEAD-ANCHORED match (`index === 0` — stripSegmentHead already normalized
-// prefix verbs, so a nonzero offset means a wrapper/negation form that is not
-// provably bare, resolution A).
+// match's start offset AND the byte offset AFTER the `commit` verb (incl. a
+// closing quote) — or null when the segment holds no commit invocation. Used
+// by BOTH predicates as fail-closed containment — `git -C repo commit -am x`
+// must register as a commit or the `-a` sweep rides the docs exemption
+// (review P2-1). Head-anchored OR wrapper-prefixed: substring scan symmetric
+// with the interception surface (the quote-UNAWARE `\bgit\b` candidate scan
+// also catches `! git commit`, `sh -c 'git commit …'`, `sudo … git commit`;
+// the shared scanner's containment can never drift from isGitOp — #490 T2
+// single-source invariant). Callers decide how to treat offset: isDeletionPush
+// only needs presence (`!== null`, any commit anywhere flips purity);
+// isBareCommitShape requires a HEAD-ANCHORED match (`index === 0` —
+// stripSegmentHead already normalized prefix verbs, so a nonzero offset means
+// a wrapper/negation form that is not provably bare, resolution A).
 function findGitCommit(stripped: string): { index: number; end: number } | null {
-  const m = stripped.match(/\bgit(?:\s+-[^\s]+(?:\s+(?!commit\b)(?:'[^']*'|"[^"]*"|\S+))?)*\s+commit\b/);
-  if (!m || m.index === undefined) return null;
-  return { index: m.index, end: m.index + m[0].length };
+  const inv = findGitVerbInvocation(stripped, GIT_VERB_SET.commit, "tolerate");
+  return inv === null ? null : { index: inv.index, end: inv.end };
 }
 
 // Whole-command purity (D5): true iff the command has ≥1 push op AND every
-// gated op (git commit|push per GIT_COMMIT_PATTERN; gh pr create|merge per
-// GH_PR_PATTERN — INCLUDING the global -R/--repo spelling) is a delete-shaped
-// push. Scaffolding segments (assignments, gh pr view, git branch -D,
-// full-line comments, if/fi, $(…)) never flip purity — FULL-LINE `#` comments
-// are stripped quote-aware in splitCommandSegments before this scan (an
-// apostrophe in a comment must not open a quote state). An INLINE comment
-// carrying a literal gated-verb string after real code (`echo hi # then: git
-// commit -am x`) is not stripped and DOES flip purity: fail-closed, symmetric
-// with the gate's own substring interception patterns (both see the raw
-// text).
+// gated op (a git commit|push invocation per the shared verb scanner; gh pr
+// create|merge per GH_PR_PATTERN — INCLUDING the global -R/--repo spelling)
+// is a delete-shaped push. Scaffolding segments (assignments, gh pr view, git
+// branch -D, full-line comments, if/fi, $(…)) never flip purity — FULL-LINE
+// `#` comments are stripped quote-aware in splitCommandSegments before this
+// scan (an apostrophe in a comment must not open a quote state). An INLINE
+// comment carrying a literal gated-verb string after real code (`echo hi #
+// then: git commit -am x`) is not stripped and DOES flip purity: fail-closed,
+// symmetric with the gate's own substring interception patterns (both see the
+// raw text).
 export function isDeletionPush(command: string): boolean {
   let sawPush = false;
   for (const segment of splitCommandSegments(command)) {
     const stripped = stripSegmentHead(segment);
     // CONTAINMENT BACKSTOP (fail-closed, symmetric with the interception
-    // surface): the gate's GIT_COMMIT_PATTERN / GH_PR_PATTERN are SUBSTRING
-    // scans — they fire on `sh -c 'git commit …'`, `! git commit …`,
+    // surface): the gate's interception + gh patterns are SUBSTRING scans —
+    // they fire on `sh -c 'git commit …'`, `! git commit …`,
     // wrapper-prefixed forms etc. Head-anchored checks alone would treat such
     // wrapper segments as scaffolding and let mechanism (b) short-circuit a
     // command that really contains a commit/merge.
     //   1. gh pr create|merge anywhere (bare, -R/--repo, or wrapper) → false
     //   2. git commit anywhere (bare or wrapper) → false
-    //   3. head-anchored `git push` → isPureDeletionPushSegment decides
+    //   3. head-anchored cwd-scoped `git … push` → isPureDeletionPushSegment
+    //      decides (the verb-scan tolerates cwd-neutral globals: `-c x=y`,
+    //      `--no-pager` between `git` and `push` classify like the bare form)
     //   4. git push in a WRAPPER form → cannot prove purity → false
-    //   5. no gated verb → scaffolding, ignored (D5)
+    //   5. git push behind a repo redirect (-C/--git-dir/…) → a DIFFERENT
+    //      checkout's op — scaffolding, never this scope's purity (today's
+    //      adjacency regexes classified it the same way)
+    //   6. no gated verb → scaffolding, ignored (D5)
     const ghOp = /\bgh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+(?:create|merge)\b/;
     if (ghOp.test(stripped)) return false;
     if (findGitCommit(stripped) !== null) return false;
-    if (/^git\s+push(?=\s|$)/.test(stripped)) {
+    const pushInv = findGitVerbInvocation(stripped, GIT_VERB_SET.push, "tolerate");
+    if (pushInv !== null) {
+      if (pushInv.foreign) continue;        // other checkout's push — scaffolding (5)
+      if (pushInv.index !== 0) return false; // wrapper push — not provably pure (4)
       sawPush = true;
       if (!isPureDeletionPushSegment(segment)) return false;
       continue;
     }
-    if (/\bgit\s+push\b/.test(stripped)) return false; // wrapper push — not provably pure
     // else: scaffolding — ignored (D5)
   }
   return sawPush;
@@ -913,8 +1166,8 @@ export function isBareCommitShape(command: string): boolean {
   for (const segment of splitCommandSegments(command)) {
     const stripped = stripSegmentHead(segment);
     // CONTAINMENT (fail-closed): wrapper-prefixed commits count as commit
-    // segments (substring scan symmetric with GIT_COMMIT_ONLY_PATTERN) so the
-    // -a sweep can never ride a docs-only staged set to an exemption.
+    // segments (the shared scanner is symmetric with the interception surface)
+    // so the -a sweep can never ride a docs-only staged set to an exemption.
     const commitMatch = findGitCommit(stripped); // head-anchored OR global-flag form — fail-closed containment (review P2-1)
     if (commitMatch === null) continue;          // no commit invocation → vacuous segment
     // HEAD-ANCHORED ONLY (review resolution A): stripSegmentHead already
@@ -957,6 +1210,440 @@ export function isBareCommitShape(command: string): boolean {
   return true; // no commit segment, or every commit bare → guard satisfied
 }
 
+// ── #489 — auto-sweep commit classification (diff-scope mirror of the D2 guard) ──
+// isBareCommitShape decides the content-shape EXEMPTION; commitSweepClass decides the
+// DIFF SURFACE. `git commit -a` / `--all` record the tracked WORKING TREE, not just the
+// staged index — a gate scoped to `git diff --cached` lets a staged-docs verifier PASS
+// unlock a commit that then sweeps dirty, never-verified code (the #489 hole). Values:
+// "sweep" (every head-anchored commit invocation in the command sweeps → hook diffs
+// `git diff HEAD`, exactly what the sweep records); "mixed" (≥1 sweep + ≥1 non-sweep
+// head-anchored invocation → hook verifies staged ∪ worktree — the non-sweep commit
+// records index-only content invisible to a WT-only scope); "none" (no sweep — staged/
+// index scope unchanged, #489 T2). Token model mirrors git's parser: required-value
+// shorts m/F/C/c/t consume rest-of-cluster or the NEXT token (even dash-leading —
+// `git commit -m --amend` is message "--amend", not an amend); optional-value shorts S/u
+// consume ATTACHED cluster chars only, never the next token (`-Sa` = gpg keyid a,
+// `-uall` = untracked mode all — neither sweeps; `-S -a` DOES sweep); required-value
+// longs consume the next token; scanning continues past positional/pathspec and unknown
+// tokens — only `--` (pathspec terminator) and end-of-stream end flag parsing; only
+// HEAD-ANCHORED commit invocations classify (wrapper/negation/prose forms stay "none" —
+// unchanged staged scope, no new under-gate; the wrapper-hidden sweep variant is
+// residual #539, and the git-global-option interception gap is residual #490).
+export type CommitSweepClass = "sweep" | "mixed" | "none";
+
+// #489: required-value LONG options on `git commit` — each consumes the NEXT token as
+// its value (even dash-leading: `git commit --message -a` is a bare commit with subject
+// "-a"). --encoding is NOT a git commit option (verified empirically: "error: unknown
+// option `encoding'") and must NOT be added — a wrongly-included boolean would skipNext
+// over a real `-a` → false negative.
+const SWEEP_VALUE_LONGS = new Set([
+  "--message", "--file", "--reedit-message", "--reuse-message", "--author",
+  "--date", "--template", "--cleanup", "--fixup", "--squash", "--trailer",
+  "--pathspec-from-file",
+]);
+
+// Scan ONE commit invocation's post-verb token stream for a sweep flag, mirroring git's
+// option parser token order. Required-value shorts m/F/C/c/t consume rest-of-cluster or
+// the NEXT token; optional-value shorts S/u consume ATTACHED cluster chars only (never
+// the next token); scanning continues past positional/pathspec + unknown tokens — only
+// `--` and end-of-stream terminate. Returns true on the first `-a` char or `--all`.
+function scanCommitInvocationForSweep(rest: string): boolean {
+  const tokens = tokenizePushArgs(rest);
+  let skipNext = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (skipNext) { skipNext = false; continue; }
+    if (tok === "--") return false;          // pathspec terminator — nothing after is a flag
+    if (tok === "--all") return true;
+    if (tok.startsWith("--")) {
+      if (SWEEP_VALUE_LONGS.has(tok)) skipNext = true; // required-value long consumes next token
+      continue;                              // boolean/unknown longs are not sweep forms
+    }
+    if (tok.startsWith("-") && tok.length > 1) {
+      for (let j = 1; j < tok.length; j++) {
+        const c = tok[j];
+        if (c === "a") return true;          // -a sweep (bundle member: -am, -vam, -qa, ...)
+        if (c === "m" || c === "F" || c === "C" || c === "c" || c === "t") {
+          // required-value short: attached rest is the value; bare form takes the NEXT token
+          if (j + 1 < tok.length) break;
+          skipNext = true;
+          break;
+        }
+        if (c === "S" || c === "u") {
+          // optional-value short: consumes ATTACHED rest only (`-Sa` keyid a, `-uall` mode)
+          break;
+        }
+        // booleans (e/i/n/o/q/s/v) and unknown chars: continue scanning the cluster
+      }
+      continue;
+    }
+    // positional token (pathspec): git parses flags AFTER positionals — keep scanning
+  }
+  return false;
+}
+
+export function commitSweepClass(command: string): CommitSweepClass {
+  let sawSweep = false;
+  let sawNonSweepCommit = false;
+  for (const segment of splitCommandSegments(command)) {
+    const stripped = stripSegmentHead(segment);
+    const commitMatch = findGitCommit(stripped); // substring scan — head-anchored OR wrapper form
+    if (commitMatch === null) continue;          // no commit invocation — vacuous segment
+    if (commitMatch.index !== 0) {
+      // wrapper/negation/prose commit invocation — its (bare) commit half ships
+      // the WHOLE index (staged-only content whose disk state == HEAD is
+      // invisible to `git diff HEAD`), so a composite that ALSO contains a
+      // head-anchored sweep must classify "mixed" → union(staged, WT) scope.
+      // Fail-closed: treating wrappers as invisible here let
+      // `sh -c 'git commit -m y' && git commit -am x` ship staged-only code
+      // unverified (reviewer finding, #489 round 2).
+      sawNonSweepCommit = true;
+      continue;
+    }
+    if (scanCommitInvocationForSweep(stripped.slice(commitMatch.end))) {
+      sawSweep = true;
+    } else {
+      sawNonSweepCommit = true;
+    }
+  }
+  if (!sawSweep) return "none";
+  return sawNonSweepCommit ? "mixed" : "sweep";
+}
+
+// ── #487 — content-push RANGE scoping (T1: a content push verifies the pushed
+// range, never the whole index) ───────────────────────
+// Pure layer: classifier → tier resolver → argv builder (present state; the
+// TDD stub round that RED-pinned the unit sections is long landed).
+// Mirror of the evaluateMergeScope pure-decision + e2e-orchestration split:
+// shape/tier tables are unit-tested subprocess-free; the I/O orchestrator
+// resolvePushRangeFiles probes the repo and is e2e-only (same
+// no-unit-import choice as resolveMergeScope). Design record + accepted
+// residuals: docs/plans/2026-09-06-issue-487-vgate-push-range.md.
+//
+// FAIL-CLOSED CONTRACT (whole command): ANY unmappable shape (tag push,
+// --all/--tags/--mirror, wrapper push, URL remote, delete+content mix, any
+// non-whitelisted push flag), ANY git commit or gh pr create|merge presence
+// (the P0 guard — findGitCommit substring containment, wrapper-inclusive), or
+// ANY probe failure → resolvePushRangeFiles returns null → the caller's
+// status-quo staged scope (computeStagedDiff). NEVER error→[] (the
+// computeBranchDiff catch→[] fail-open precedent is the
+// cautionary inversion). An empty RESOLVED range is audited push_range_empty
+// and allowed (an up-to-date push ships nothing).
+
+// src/dst are PLAIN ref names (no colon), validated by regex; colon = the
+// refspec had an explicit `:` (src:dst split) vs the bare same-name form — the
+// resolver's dst=HEAD guard keys off it (a bare `HEAD` positional derives dst
+// from the current branch; `HEAD:HEAD` must fall to tier C).
+export interface PushRefSpec { src: string; dst: string; colon: boolean; }
+
+export type PushParseResult =
+  | { eligible: true; refspecs: PushRefSpec[]; bare: boolean; remote: string | null }
+  | { eligible: false; reason: "has_commit" | "has_gh" | "no_push" | "mixed_delete" | "unmappable" | "wrapper" };
+
+// Fail-closed flag whitelist (bare-token equality ONLY): any other `-` token,
+// including an ATTACHED value (`--force-with-lease=<val>`), → unmappable.
+const PUSH_FLAG_WHITELIST = new Set(["-u", "--set-upstream", "-f", "--force", "--force-with-lease"]);
+const PUSH_REFNAME = /^[A-Za-z0-9_][A-Za-z0-9_./-]*$/;
+// Remote NAME (never a URL): shared by the classifier (explicit positionals) and
+// the resolver's git-state guard (config branch.<cur>.remote VALUE) so the two
+// can never drift apart (review cycle-2 P2).
+const PUSH_REMOTE_NAME = /^[A-Za-z0-9_.-]+$/;
+const GH_PR_OP = /\bgh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+(?:create|merge)\b/;
+
+function parsePushRefspecToken(token: string): PushRefSpec | null {
+  if (token.includes(":")) {
+    if (token.split(":").length > 2) return null;              // >1 colon
+    const parts = token.split(":");
+    const src = parts[0];
+    const dst = parts[1];
+    // An EMPTY src is git's delete-colon form (`:feat/x`) — handled by
+    // isPureDeletionPushSegment BEFORE this content parse ever sees it; if one
+    // reaches here inside a content segment it must fail closed (not map).
+    if (src.length === 0) return null;
+    if (!PUSH_REFNAME.test(src) || !PUSH_REFNAME.test(dst)) return null;
+    if (src.startsWith("refs/tags/") || dst.startsWith("refs/tags/")) return null; // tag push
+    return { src, dst, colon: true };
+  }
+  if (!PUSH_REFNAME.test(token)) return null;
+  if (token.startsWith("refs/tags/")) return null;               // tag push
+  return { src: token, dst: token, colon: false };
+}
+
+// PURE — splitCommandSegments/stripSegmentHead/tokenizePushArgs/findGitCommit
+// + isPureDeletionPushSegment only. Whole-command semantics (isDeletionPush
+// mirror): eligible iff ≥1 head-anchored CONTENT push segment exists AND every
+// gated segment mapped (delete segments in a content chain → mixed_delete;
+// commit/gh anywhere → has_commit/has_gh — P0 guard FIRST, wrapper-inclusive).
+export function parsePushRefSpecs(command: string): PushParseResult {
+  const refspecs: PushRefSpec[] = [];
+  let remote: string | null = null;
+  let bare = false;
+  let pushCount = 0;
+  let sawPureDelete = false;
+  for (const segment of splitCommandSegments(command)) {
+    const stripped = stripSegmentHead(segment);
+    // P0 guard (containment — substring, wrapper-inclusive, symmetric with the
+    // gate's own interception surface): any commit ANYWHERE flips the whole
+    // command to the status-quo staged scope. Checked before everything else.
+    if (findGitCommit(stripped) !== null) return { eligible: false, reason: "has_commit" };
+    if (GH_PR_OP.test(stripped)) return { eligible: false, reason: "has_gh" };
+    const pushInv = findGitVerbInvocation(stripped, GIT_VERB_SET.push, "tolerate");
+    if (pushInv !== null) {
+      // Redirect-global push → a DIFFERENT checkout's op — scaffolding (the
+      // hook can never intercept it, so no scope decision is needed; today's
+      // adjacency regexes classified it the same way).
+      if (pushInv.foreign) continue;
+      // Wrapper push (index > 0) → cannot prove shape (mirrors the
+      // isDeletionPush wrapper arm).
+      if (pushInv.index !== 0) return { eligible: false, reason: "wrapper" };
+      if (isPureDeletionPushSegment(segment)) { sawPureDelete = true; continue; }
+      pushCount++;
+      const rest = stripped.slice(pushInv.end);
+      const tokens = tokenizePushArgs(rest);
+      const positionals: string[] = [];
+      for (const token of tokens) {
+        if (isRedirectToken(token)) continue;
+        if (PUSH_FLAG_WHITELIST.has(token)) continue;
+        if (token.startsWith("-")) return { eligible: false, reason: "unmappable" }; // any non-whitelisted flag
+        positionals.push(token);
+      }
+      if (positionals.length === 0) {
+        // No positionals → bare push candidate (config-upstream ceremony).
+        if (pushCount > 1 || bare || refspecs.length > 0) return { eligible: false, reason: "unmappable" }; // bare mixed with other pushes
+        bare = true;
+        continue;
+      }
+      const [first, ...restPos] = positionals;
+      // URL remote (contains `/`, `@`, `:` outside the ref regex) → unmappable.
+      if (!PUSH_REMOTE_NAME.test(first)) return { eligible: false, reason: "unmappable" };
+      if (restPos.length === 0) {
+        // Remote + no refspecs → bare with remote fixed (git pushes the current
+        // branch to its configured upstream under that remote).
+        if (pushCount > 1 || bare || refspecs.length > 0) return { eligible: false, reason: "unmappable" };
+        bare = true;
+        if (remote === null) remote = first; else if (remote !== first) return { eligible: false, reason: "unmappable" };
+        continue;
+      }
+      const segRefspecs: PushRefSpec[] = [];
+      for (const rs of restPos) {
+        const parsedRs = parsePushRefspecToken(rs);
+        if (parsedRs === null) return { eligible: false, reason: "unmappable" };
+        segRefspecs.push(parsedRs);
+      }
+      if (remote === null) remote = first; else if (remote !== first) return { eligible: false, reason: "unmappable" }; // multi-remote content push
+      refspecs.push(...segRefspecs);
+      continue;
+    }
+    // else: scaffolding (pull/rebase/checkout/echo/assignments) — ignored
+  }
+  if (pushCount === 0) return { eligible: false, reason: "no_push" };
+  if (sawPureDelete) return { eligible: false, reason: "mixed_delete" }; // delete + content chain → whole-command staged
+  // Order-independent mixing guard: a bare push + an explicit-refspec push in one
+  // command cannot be represented (the bare half needs config resolution, the
+  // explicit half needs the refspec) — a bare-first command must NOT silently
+  // drop the explicit refspecs at the return below (review cycle-2 P1).
+  if (bare && refspecs.length > 0) return { eligible: false, reason: "unmappable" };
+  if (bare) return { eligible: true, refspecs: [], bare: true, remote };
+  return { eligible: true, refspecs, bare: false, remote };
+}
+
+// PURE 4-combo — second arg = "tier-B base ref resolves" (the preference is
+// applied by the I/O resolver BEFORE the call, so this is a 2×2 boolean).
+export function resolvePushTier(trackingExists: boolean, baseMainExists: boolean): "A" | "B" | "C" {
+  if (trackingExists) return "A";
+  return baseMainExists ? "B" : "C";
+}
+
+// PURE argv builder — baseRef is the FULLY RESOLVED base ref (never DWIM);
+// src is the resolved local ref (refs/heads/<x> or HEAD). Tier A = 2-dot
+// (space form — the remote branch also LOSES remote-side-only files on a
+// diverged/force push); tier B = 3-dot first-push base. Injection safety:
+// every value that reaches the argv is whitelist-validated before it is
+// interpolated — classifier tokens by PUSH_REFNAME/remote regex, and
+// git-state-derived values (checked-out branch name, config remote) by the
+// GIT_STATE guards in resolvePushRangeFiles — so no shell metachars can reach
+// the execSync string (execSync runs /bin/sh -c; nothing here sets shell:false).
+export function buildPushRangeDiffCommand(tier: "A" | "B", baseRef: string, src: string): string {
+  if (tier === "A") return `git diff --name-only ${baseRef} ${src}`;
+  return `git diff --name-only ${baseRef}...${src}`;
+}
+
+// ── #487 — I/O orchestration (Task 4): repo probes + per-refspec range diff ──
+// Exported like resolveMergeScope (e2e-only — NOT unit-imported, mirroring the
+// resolveMergeScope no-unit-import choice). Returns the pushed-range file set
+// or null → the caller's status-quo staged scope. Fail-closed contract above.
+
+function gitProbe(cwd: string, args: string): string | null {
+  try {
+    return execSync(`git ${args}`, { cwd, encoding: "utf-8", timeout: 5000 }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function refExists(cwd: string, ref: string): boolean {
+  return gitProbe(cwd, `rev-parse --verify --quiet ${ref}`) !== null;
+}
+
+function gitConfigGet(cwd: string, key: string): string | null {
+  const v = gitProbe(cwd, `config --get ${key}`);
+  return v === null || v === "" ? null : v;
+}
+
+function symbolicRefShort(cwd: string): string | null {
+  const v = gitProbe(cwd, "symbolic-ref --short HEAD");
+  return v === null || v === "" ? null : v;
+}
+
+// Refname/remote validation for GIT-STATE-DERIVED values before they reach an
+// execSync string. execSync runs /bin/sh -c (NO shell:false anywhere in this
+// file), so ANY interpolated value must pass a strict whitelist: git refnames
+// legally allow shell metachars (`;`, `|`, `$`, …) — a checked-out branch or a
+// config `branch.<cur>.remote` value from a hostile repo is arbitrary shell
+// input until validated. Classifier-validated tokens (PUSH_REFNAME /
+// PUSH_REMOTE_NAME) are already safe; these guards close the resolver's two
+// unvalidated inputs (security review P1). Validation failure → null (tier C).
+// Accepted tier-C residuals of the guards (fail-closed, documented — review
+// cycle-2): a hierarchical config remote name (`org/team`) or a non-ASCII
+// branch name is rejected by the whitelist even though neither carries shell
+// metachars → bare pushes over parked WIP keep the staged check (status-quo,
+// pre-#487 behavior).
+export function resolvePushRangeFiles(command: string, cwd: string): string[] | null {
+  const parsed = parsePushRefSpecs(command);
+  if (!parsed.eligible) return null; // commit/gh/unmappable/wrapper/no_push — zero subprocess on bare commits
+  // Bare push (no refspecs): derive remote + dst + src from the branch config
+  // (04-merge-deploy.md L208/L247 `git push --force-with-lease` ceremony — the
+  // earlier `git push -u` in 02-commit-pr.md set branch.<cur>.remote/.merge).
+  let { refspecs, remote } = parsed;
+  if (parsed.bare) {
+    const current = symbolicRefShort(cwd);
+    if (current === null) return null; // detached/unborn — cannot map
+    // ⛔ Injection guard: `current` (a git-state value, user-writable via
+    // symbolic-ref/checkout) is interpolated into config keys and refs — it
+    // must pass the refname whitelist BEFORE any execSync string is built
+    // (security review P1; refnames allow `;`/`|`/`$`).
+    if (!PUSH_REFNAME.test(current)) return null;
+    if (remote === null) {
+      remote = gitConfigGet(cwd, `branch.${current}.remote`);
+      if (remote === null) return null;
+    }
+    // ⛔ Injection guard: the config VALUE branch.<cur>.remote is user-writable
+    // repo state — validate before it reaches refs/remotes/… strings.
+    if (!PUSH_REMOTE_NAME.test(remote)) return null;
+    const mergeCfg = gitConfigGet(cwd, `branch.${current}.merge`);
+    const m = mergeCfg !== null ? /^refs\/heads\/([A-Za-z0-9_.\/-]+)$/.exec(mergeCfg) : null;
+    if (m === null) return null; // no/odd upstream config → tier C (push.default=current residual)
+    refspecs = [{ src: current, dst: m[1], colon: false }];
+  }
+  if (refspecs.length === 0) return null; // defensive
+  const allFiles = new Set<string>();
+  let sawTierA = false;
+  for (const rs of refspecs) {
+    let { src, dst } = rs;
+    // src = HEAD special-case — NO-COLON ONLY (a positional `HEAD` pushes to
+    // the current branch's same-name remote branch; real git never targets a
+    // branch literally named HEAD). COLON src=HEAD (`HEAD:main`, `HEAD:HEAD`)
+    // falls to the generic probes below → refs/heads/HEAD unresolvable → null.
+    let srcIsHead = false;
+    if (src === "HEAD" && !rs.colon) {
+      const current = symbolicRefShort(cwd);
+      if (current === null) return null;
+      // Injection guard: `current` is interpolated into dst/tracking strings.
+      if (!PUSH_REFNAME.test(current)) return null;
+      if (gitProbe(cwd, "rev-parse --verify HEAD") === null) return null; // unborn
+      dst = current;
+      srcIsHead = true;
+    }
+    // dst normalization + dst=HEAD guard. ⛔ The guard sits BEFORE src
+    // resolution, so a COLON `HEAD:HEAD` (src=dst=HEAD, no-colon derivation
+    // skipped) is nulled HERE — the src probe below never sees it (second-model
+    // gate: the plan's "HEAD:HEAD nulls at the src probe" wording was wrong;
+    // the guard is the nulling site for every dst=HEAD colon form). A real
+    // clone's refs/remotes/origin/HEAD is the DEFAULT-branch symbolic ref — it
+    // must never become a tier-A base for a remote branch literally named HEAD.
+    if (dst.startsWith("refs/heads/")) dst = dst.slice("refs/heads/".length);
+    if (dst === "HEAD") return null;
+    // src resolution (local side of the diff).
+    let srcRef: string | null = null;
+    if (srcIsHead) {
+      srcRef = "HEAD";
+    } else if (src.startsWith("refs/heads/")) {
+      if (!refExists(cwd, src)) return null;
+      srcRef = src;
+    } else if (src === "HEAD") {
+      // COLON src=HEAD with a NON-HEAD dst (`HEAD:main` — HEAD:HEAD already
+      // nulled by the dst guard above): refs/heads/HEAD is never a real branch,
+      // so this probe fails → null → tier C (accepted residual — the dst=HEAD
+      // guard covers colon dst forms; a tag literally named HEAD is not probed
+      // here, the probe just fails on refs/heads/HEAD).
+      if (!refExists(cwd, "refs/heads/HEAD")) return null;
+      srcRef = "refs/heads/HEAD";
+    } else {
+      const branch = `refs/heads/${src}`;
+      const tag = `refs/tags/${src}`;
+      const bOk = refExists(cwd, branch);
+      const tOk = refExists(cwd, tag);
+      if (bOk && tOk) return null; // git ambiguity — cannot prove shape
+      if (tOk) return null;        // tag push → whole-command staged
+      if (!bOk) return null;       // unresolvable src
+      srcRef = branch;
+    }
+    if (remote === null) return null; // defensive — explicit refspecs always carry a remote
+    // Tier decision. baseMainExists is fed AFTER the tier-B base preference:
+    // <remote>/main when remote ≠ origin and that ref exists, else the house
+    // origin/main (computeBranchDiff precedent) — the pure table stays a 2×2.
+    const tracking = `refs/remotes/${remote}/${dst}`;
+    const trackingExists = refExists(cwd, tracking);
+    let baseMain = "refs/remotes/origin/main";
+    if (remote !== "origin" && refExists(cwd, `refs/remotes/${remote}/main`)) {
+      baseMain = `refs/remotes/${remote}/main`;
+    }
+    const baseMainExists = refExists(cwd, baseMain);
+    const tier = resolvePushTier(trackingExists, baseMainExists);
+    if (tier === "C") return null; // whole-command rule: ANY tier C → staged
+    const baseRef = tier === "A" ? tracking : baseMain;
+    if (tier === "A") sawTierA = true;
+    // 2-dot (A) / 3-dot (B) name-only diff. The builder emits the FULL `git
+    // diff …` argv (unit-pinned) — run it directly (NOT through gitProbe,
+    // which would double the `git` prefix). ANY throw → null (staged) — NEVER
+    // error→[] (the computeBranchDiff catch→[] fail-open precedent inverted).
+    let diffOut: string | null = null;
+    try {
+      diffOut = execSync(buildPushRangeDiffCommand(tier, baseRef, srcRef), {
+        cwd, encoding: "utf-8", timeout: 5000,
+      }).trim();
+    } catch {
+      diffOut = null;
+    }
+    if (diffOut === null) return null;
+    for (const line of diffOut.split("\n")) {
+      const f = line.trim();
+      if (f.length > 0) allFiles.add(f);
+    }
+  }
+  if (allFiles.size === 0) {
+    // Up-to-date push ships nothing — audited INSIDE the resolver so the
+    // caller's shared silent empty-allow never hides the range decision.
+    // Note: with multi-refspec commands the tier payload is "A" iff ANY
+    // refspec resolved tier A (order-independent any-A-wins — second-model
+    // gate wording fix; mixed A+B empty ranges label "A"); cosmetic audit
+    // metadata only — the allow + audit reason are identical in every ordering.
+    // ⛔ Trust boundary (security review P2, documented): tier A reads LOCAL
+    // remote-tracking refs — same-user-writable repo state (git update-ref is
+    // not a gated verb) that can steer an empty range → audited allow. The
+    // gate's contract is same-user verification, not local-state hardening:
+    // the index was equally trusted pre-#487 and the bypass here is AUDITED
+    // (push_range_empty) where the old silent empty-allow was not. A stale
+    // tracking ref BEHIND the live remote under-scopes a --force push in the
+    // same trust class (the gate never saw remote-side-only files — identical
+    // to computeBranchDiff's origin/main staleness); the pull --rebase
+    // pre-push ceremony (01-preflight) refreshes it.
+    logGateSkip("push_range_empty", command, cwd, { tier: sawTierA ? "A" : "B" });
+    return [];
+  }
+  return Array.from(allFiles);
+}
+
 // ── Diff computation ──────────────────────────────────
 
 function resolveGitRoot(cwd: string): string {
@@ -981,6 +1668,32 @@ function computeStagedDiff(cwd: string): string[] {
     return out ? out.split("\n").filter(Boolean) : [];
   } catch {
     return [];
+  }
+}
+
+// #489: the file set a sweep commit (`git commit -a`/`--all`) actually records — the
+// tracked WORKING TREE vs HEAD. Unborn HEAD (no commits yet): `git commit -a` records
+// only the index (verified empirically), and `git diff HEAD` errors — the staged-diff
+// fallback is the exact `-a` set for that state. Any OTHER diff failure (corrupt index,
+// permission) is logged and falls back to the staged scope (status-quo semantics; a
+// genuinely broken repo fails at `git commit` time anyway) — accepted residual, see the
+// #489 plan surface-map row 2.
+function computeWorktreeDiff(cwd: string): string[] {
+  try {
+    execSync("git rev-parse --verify HEAD", { encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore" });
+  } catch {
+    return computeStagedDiff(cwd); // unborn HEAD
+  }
+  try {
+    const out = execSync("git diff HEAD --name-only", {
+      encoding: "utf-8",
+      cwd,
+      timeout: 5000,
+    }).trim();
+    return out ? out.split("\n").filter(Boolean) : [];
+  } catch (e) {
+    console.error("[verification-gate] ⚠️ git diff HEAD failed — falling back to staged scope:", (e as Error).message);
+    return computeStagedDiff(cwd);
   }
 }
 
@@ -1437,22 +2150,47 @@ export default function (pi: ExtensionAPI) {
     // have re-hashed + written the bridge above — content-neutral, no new
     // blessings). Purity-gated (isDeletionPush): any content refspec / git
     // commit / gh pr op in the command falls back to today's gating
-    // (fail-closed).
+    // (fail-closed). #487: the CONTENT half of a push is now range-scoped
+    // (resolvePushRangeFiles below — pushed range vs the whole index); the
+    // delete short-circuit itself is untouched and still fires first.
     if (isDeletionPush(command)) {
       console.log("[verification-gate] ⏭️ Skipping VGATE — delete-shaped push: no local content ships");
       logGateSkip("delete_push_no_content", command, cwd);
       return undefined;
     }
 
-    // Compute diff
+    // Compute diff — #489: auto-sweep commits (`-a`/`--all`) record the
+    // working tree, not just the index; their verification file set must be
+    // HEAD-vs-working-tree (`git diff HEAD` — exactly what the sweep commits)
+    // or the staged-docs verifier PASS lets the swept code ride unverified
+    // (D2 forces the gate to run but cannot widen the file set). Classifier:
+    // "sweep" (pure-sweep command) → WT diff only (no wasted staged
+    // subprocess); "mixed" (sweep + non-sweep commit in one command) →
+    // deduped union(staged, WT) — a WT-only scope would blind the gate to
+    // index-only content a BARE commit in the chain records (NAME-scoped:
+    // disk-hash verification cannot verify staged-only content whose disk
+    // state equals HEAD — pre-existing limitation of the disk-based verifier,
+    // not introduced here); "none" → today's staged scope. Mixed sweep+gh-pr
+    // chains keep the gh branch path (unchanged; #540). ⛔ This block sits
+    // AFTER the top-of-op pendingRehash loop + recoverBridgeForRoot — do not
+    // move it above them (scenario 41's post-fix greenness depends on the
+    // Leg-A allowed commit's armed pendingRehash executing before the block
+    // check).
+    const sweepClass = commitSweepClass(command);
     let changedFiles: string[];
-    if (GH_PR_PATTERN.test(command)) {
+    if (sweepClass !== "none" && !GH_PR_PATTERN.test(command)) {
+      const worktree = computeWorktreeDiff(cwd);
+      changedFiles = sweepClass === "sweep" ? worktree
+        : Array.from(new Set([...computeStagedDiff(cwd), ...worktree]));
+    } else if (GH_PR_PATTERN.test(command)) {
       // #204: `gh pr merge` merges REMOTELY. Only the PR's own repo+head can
       // be verified locally; anything else is unrelated branch residue that
       // must neither block nor reach verifiedSet/bridge (drift contamination).
       // `gh pr create` is NOT scoped — its diff IS this branch's files. The
       // merge-vs-create split is verb-anchored (isMergeCommand), so a create
       // whose --body merely MENTIONS "gh pr merge <n>" is never routed here.
+      // ⛔ PRESERVE VERBATIM — the merge-scope skip below returns undefined
+      // (console.log + logGateSkip) and must not be dropped (scenario 19).
       if (isMergeCommand(command)) {
         const decision = resolveMergeScope(command, cwd);
         if (!decision.verify) {
@@ -1463,7 +2201,20 @@ export default function (pi: ExtensionAPI) {
       }
       changedFiles = computeBranchDiff(cwd);
     } else {
-      changedFiles = computeStagedDiff(cwd);
+      // #487 T1: a content push (no git commit anywhere in the command) verifies
+      // the PUSHED RANGE — HEAD vs the remote-tracking ref (tier A, 2-dot) or
+      // the first-push base (tier B, 3-dot) — never the whole index, so another
+      // session's parked WIP in the index cannot false-block `git push origin
+      // main` of already-committed HEAD. Commit-time behavior is UNCHANGED:
+      // commit-bearing commands resolve null fast inside (classifier, zero
+      // subprocess) → the staged scope below. resolvePushRangeFiles is
+      // fail-closed — null (→ staged) on EVERY fallback: unmappable shape
+      // (tags/--all/--mirror/wrapper/URL remote), mixed delete+content chains
+      // (scenario 44 legs 2-3), commit/gh presence (the P0 backstop,
+      // wrapper-inclusive), no usable base (tier C), any git failure — NEVER []
+      // on error (the computeBranchDiff catch→[] fail-open
+      // precedent). An empty RESOLVED range is audited push_range_empty inside.
+      changedFiles = resolvePushRangeFiles(command, cwd) ?? computeStagedDiff(cwd);
     }
 
     if (changedFiles.length === 0) {
@@ -1480,12 +2231,17 @@ export default function (pi: ExtensionAPI) {
     // (docs included). Commit-form guard (isBareCommitShape): among `git
     // commit` invocations only the bare form qualifies — `-a`/`--all`/`--amend`/
     // pathspec anywhere re-gates the whole command (D2); push / gh pr
-    // create|merge ops with no commit invocation qualify on file shape alone.
+    // create|merge ops with no commit invocation qualify on file shape alone
+    // (isBareCommitShape is vacuous on pure pushes — e2e scenarios 47/56 pin
+    // the exemption on BOTH the staged set and the #487 RANGE set).
     // Exempt files are not registered here, so a post-exempt lint-staged
     // rewrite cannot stale-hash a future block via THIS op — but a bare
     // exempt COMMIT still arms the #7574 re-hash (review deep-P2): the file
     // may already be registered from an EARLIER mixed VGATE PASS, and the
     // pre-commit hook's rewrite would otherwise go stale with no safety net.
+    // #487: the file set this exemption reads is range-scoped for content
+    // pushes (tier A/B) with a tier-C staged fallback — the check is
+    // identical regardless of which source produced changedFiles.
     if (changedFiles.length > 0 && isBareCommitShape(command) && changedFiles.every((file) => isShapeExemptFile(file))) {
       console.log(`[verification-gate] ⏭️ Skipping VGATE — ${changedFiles.length} docs/static file(s): content-shape exemption (tier-independent)`);
       logGateSkip("content_shape_exempt", command, cwd, { files: changedFiles.length });

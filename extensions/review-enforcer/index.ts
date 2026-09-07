@@ -612,10 +612,17 @@ export function logMergeGateDecision(
 
 // ── Block message ─────────────────────────────────────
 
+// #517: the code-review-skill path is repo-layout-dependent — agent-infra
+// keeps skills at skills/, consumer repos sync them to operations/skills/
+// (the consumer-repo hardlink location). The extension is repo-agnostic
+// (runs in both layouts and in deployed copies), so BLOCK_MESSAGE names BOTH
+// layouts rather than doing runtime repo detection: the blocked agent reads
+// whichever path exists in their repo. Pinned by index.test.ts #517 + T1b
+// (tail-anchored, so the pin survives both forms).
 const BLOCK_MESSAGE = [
   "✅ Review enforcement gate is working correctly.",
   "❌ No reviewers were dispatched in this session before the git operation.",
-  "   → Read operations/skills/code-review/SKILL.md for the review dispatch protocol.",
+  "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
@@ -827,12 +834,23 @@ export default function (pi: ExtensionAPI) {
           tier = fs.readFileSync(ISSUE_COMPLEXITY_FILE, "utf8").trim().toLowerCase();
         }
       } catch (_err) { /* best-effort */ }
+      // #516: BOTH block returns below must emit a durable audit entry — the
+      // pre-#516 dispatch-count block wrote console only (no appendJsonl),
+      // unlike the merge-registry gate's logMergeGateDecision trail, so
+      // blocked-op frequency/attribution was unreconstructible from
+      // gate-events.jsonl. Emit gate_block + reason no_reviewers_dispatch + the
+      // TIER_RULE-vocabulary tier (micro | standard | complex | unknown |
+      // unlabeled; marker-absent maps to "unlabeled") so the tier of every
+      // blocked op — the docs-only micro class (#485) included — is
+      // reconstructible. Pinned by index.test.ts T1 (micro) + T1b (others).
       if (tier === "micro") {
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
+        logGateEvent("gate_block", { reason: "no_reviewers_dispatch", tier: "micro" }); // #516: durable audit
         return { block: true, reason: MICRO_BLOCK_MESSAGE };
       }
 
       console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched");
+      logGateEvent("gate_block", { reason: "no_reviewers_dispatch", tier: tier === "" ? "unlabeled" : tier }); // #516: durable audit
       return { block: true, reason: BLOCK_MESSAGE };
     });
 
