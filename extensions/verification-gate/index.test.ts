@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, applyScopeGate, routeScopeGate, combineScopes } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, applyScopeGate, routeScopeGate, combineScopes } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
@@ -527,7 +527,7 @@ test("exported functions are callable (#5527 regression)", () => {
   const callables = [
     extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot,
     isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass,
-    wtPathCommitInfo,
+    wtPathCommitInfo, commitChainMutationClass, commandRunsCommit,
   ] as const;
   for (const fn of callables) ok(typeof fn === "function", "export must be callable");
   equal(extractJson('{"status":"PASS","failures":[],"verified_files":[]}')!.status, "PASS", "extractJson smoke");
@@ -540,6 +540,13 @@ test("exported functions are callable (#5527 regression)", () => {
   ok(typeof wtPathCommitInfo === "function", "wtPathCommitInfo smoke (callable)");
   equal(wtPathCommitInfo("git commit -m x"), null, "wtPathCommitInfo smoke: bare commit → null");
   deepEqual(wtPathCommitInfo("git commit -m x src/app.ts"), { pathspecs: ["src/app.ts"], pathspecFromFile: false }, "wtPathCommitInfo smoke: pathspec named");
+  ok(typeof commitChainMutationClass === "function", "commitChainMutationClass smoke (callable)");
+  ok(typeof commandRunsCommit === "function", "commandRunsCommit smoke (callable)");
+  equal(commitChainMutationClass("git commit -m x"), "none", "commitChainMutationClass smoke: bare commit → none");
+  equal(commitChainMutationClass('echo "x" > f.ts && git commit -am y'), "in-batch-mutation", "commitChainMutationClass smoke: in-batch write+sweep → refusal");
+  equal(commandRunsCommit("git commit -m x"), true, "commandRunsCommit smoke: bare commit runs a commit");
+  equal(commandRunsCommit("gh pr create -t x"), false, "commandRunsCommit smoke: pure gh runs no commit");
+  equal(commandRunsCommit("git commit -m x && gh pr create -t y"), true, "commandRunsCommit smoke: commit+gh runs a commit");
 });
 
 // ── normalizeRegistryPath (#7595) ────────────────────
@@ -2367,6 +2374,140 @@ test("#472 drift guard: 01-preflight VGATE-SHAPE-RULE fence == SHAPE_EXEMPT_EXTE
     segExports,
     `fence segments {${fenceSegList.join(", ")}} != exports {${segExports.join(", ")}} — 01-preflight.md VGATE-SHAPE-RULE drifted from BUILD_OUTPUT_SEGMENTS`
   );
+});
+
+// ── #540: commitChainMutationClass / commandRunsCommit — in-batch mutation chains ──
+// M1 (refusal) + M2 (gh-widening trigger) classifiers. commitChainMutationClass returns
+// "in-batch-mutation" iff a non-neutral segment EXECUTES BEFORE a commit invocation in the
+// same tool_call — content created/staged in-batch is invisible to the hook-time snapshot,
+// so the shape is refused instead of scope-verified. commandRunsCommit = ≥1 PROVABLY
+// executed commit (head-anchored after wrapper peel — prose NEVER counts), the M2 trigger
+// for the gh-pr-create scope widening. Table-driven pins mirror the #489/#538 sections.
+
+section("commitChainMutationClass — in-batch mutation chains (#540)");
+
+// ── In-batch mutation → "in-batch-mutation" (REFUSE) ──
+
+test("in-batch file write + commit in one tool_call → refusal", () => {
+  const pins = [
+    "echo 'export const x=1' > f.ts && git add f.ts && git commit -m y", // the issue repro
+    "echo 'export const x=1' > f.ts && git commit -am y",                // write + sweep
+    "printf 'x\\n' > f.ts && git add f.ts && git commit -m y",
+    "echo x > f.ts && git commit -m y",                                   // bare commit after tracked-file overwrite
+    "cat <<'EOF' > f.ts\ncontent\nEOF\ngit commit -am y",              // heredoc write (real newlines — bash terminates heredocs at a delimiter LINE)
+    "tee f.ts < /dev/null && git commit -am y",
+    "sed -i s/a/b/ f.ts && git commit -am y",
+    "python3 -c \"open('f.ts','w').write('x')\" && git commit -am y",    // arbitrary program before a commit
+    "node -e 'require(\"fs\").writeFileSync(\"f.ts\",\"x\")' && git commit -am y",
+    "sh -c 'echo x > f.ts && git commit -am y'",                          // wrapper payload splices in order
+    "bash -c 'echo x > f.ts && git add f.ts && git commit -m y'",
+    "! echo x > f.ts && git commit -am y",
+    "eval \"echo x > f.ts && git commit -am y\"",
+  ];
+  for (const c of pins) equal(commitChainMutationClass(c), "in-batch-mutation", `must refuse: ${c}`);
+});
+
+test("in-batch git stage/checkout/reset/restore/rm + commit → refusal (issue I-section families)", () => {
+  const pins = [
+    "git add f.ts && git commit -m y",
+    "git add -A && git commit -m y",
+    "git add . && git commit -am y",
+    "git add src/ && git commit -m y",
+    "git checkout -- f.ts && git commit -am y",
+    "git restore f.ts && git commit -am y",
+    "git reset f.ts && git commit -am y",
+    "git rm f.ts && git commit -am y",
+    "git mv a.ts b.ts && git commit -am y",
+    "git commit -m x && git add g.ts && git commit -m y", // add BETWEEN two commits
+    "sh -c 'git add f.ts && git commit -m y'",             // wrapper-hidden stage+commit
+    "echo x > f.ts && git add f.ts && git commit -m y && git push origin main", // push AFTER doesn't rescue it
+    "git status > src/app.ts && git commit -am y",          // redirecting READ output over a tracked file
+  ];
+  for (const c of pins) equal(commitChainMutationClass(c), "in-batch-mutation", `must refuse: ${c}`);
+});
+
+test("gh-before-commit ordering → refusal; stage+gh with NO commit stays none", () => {
+  const refuse = [
+    "gh pr create -t x && git commit -am y",
+    "echo hi && gh pr create -t x && git commit -m y",
+  ];
+  for (const c of refuse) equal(commitChainMutationClass(c), "in-batch-mutation", `must refuse: ${c}`);
+  equal(commitChainMutationClass("git add f.ts && gh pr create -t x"), "none", "stage+gh with NO commit is not a chain (none)");
+});
+
+// ── Neutral pre-commit content → "none" (LEGAL — unchanged behavior) ──
+
+test("pure / read-only / scaffolding pre-commit content stays legal", () => {
+  const pins = [
+    "git commit -m x",
+    "git commit -am x",
+    "git commit -m x && git commit -am y",                  // scenario 48 Leg G — commit+commit stays legal
+    "git status && git commit -m x",
+    "git diff HEAD --name-only && git commit -am x",
+    "git log --oneline -3 && git commit -m x",
+    "git rev-parse HEAD && git commit -m x",
+    "git status > /dev/null && git commit -m x",
+    "cd /tmp/wt && git commit -am x",
+    "cd /tmp/wt && git status && git commit -m x",
+    "FOO=bar git commit -am x",
+    "FOO=bar && git commit -m x",
+    "export GIT_SSH_COMMAND=\"ssh -o BatchMode=yes\" && git push origin --delete foo", // no commit → none
+    "echo done && git commit -m x",
+    "printf 'progress\\n' && git commit -m x",
+    ": && git commit -m x",
+    "true && git commit -m x",
+    "git commit -m x && git add y",                          // stage AFTER the commit = future op (unchanged posture)
+    "git commit -m x && echo done",
+    "git commit -am x && gh pr create -t y",                 // M2 shape — commit then gh stays legal (widened scope)
+    "git commit -m x && git push origin main",               // push after commit
+    "git push origin --delete a && git push origin main",    // delete+content chain — no commit
+    "git push origin main && gh pr create -t y",             // no commit
+    "gh pr create -t y",
+    "gh pr merge 123",
+    "git commit -m \"run git commit -am x\"",               // prose in the message value — single commit segment
+    "sh -c 'git commit -am x'",                               // pure wrapper sweep
+    "! git commit -am x",
+    "eval \"git commit -am x\"",
+    'FOO="bar baz" git commit -am x',
+    "sudo git commit -am x",
+    "bash -lc 'git commit -am x'",
+  ];
+  for (const c of pins) equal(commitChainMutationClass(c), "none", `must be legal (none): ${c}`);
+});
+
+test("commit-free mutation commands → none (pushes/gh cannot record in-batch content)", () => {
+  const pins = [
+    "echo x > f.ts && git push origin main",          // write + push: push ships committed HEAD only
+    "git add f.ts && gh pr create -t y",              // stage + gh: gh pushes committed HEAD only
+    "echo x > f.ts && echo y > g.ts",
+  ];
+  for (const c of pins) equal(commitChainMutationClass(c), "none", `must be none: ${c}`);
+});
+
+// ── commandRunsCommit (M2 gh-widening trigger) ──
+
+test("commandRunsCommit — head-anchored executed commits only; prose never counts", () => {
+  const runs = [
+    "git commit -m x",
+    "git commit -m x && gh pr create -t y",
+    "git commit -am x && gh pr create -t y",
+    "git commit -m x src/app.ts && gh pr create -t y",
+    "sh -c 'git commit -am x' && gh pr create -t y",
+    "! git commit -m x",
+    'FOO="bar baz" git commit -am x',
+    "git commit -m docs && git commit -am x",
+    "sudo git commit -m x && echo done",
+  ];
+  for (const c of runs) ok(commandRunsCommit(c) === true, `must run a commit: ${c}`);
+  const notRuns = [
+    "gh pr create -t x",
+    "gh pr create --body \"see: git commit -am x\"",       // prose in --body
+    "gh pr merge 123",
+    "echo \"run git commit -am x\" && gh pr create -t y",   // echo prose segment
+    "git push origin main && gh pr create -t y",
+    "cd /tmp && gh pr create -t y",
+  ];
+  for (const c of notRuns) ok(commandRunsCommit(c) === false, `must NOT run a commit: ${c}`);
 });
 
 // ── #487: parsePushRefSpecs / resolvePushTier / buildPushRangeDiffCommand ──
