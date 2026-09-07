@@ -26,6 +26,12 @@ measured 9 low-threshold compactions ≈ $0.16 vs 7 ceiling ≈ $0.70. The clamp
 cuts that amplifier: at 400K the trigger is ~383K and marathon-session cache
 share stays in the cache-read area instead of collapsing.
 
+**Sibling policy (#365):** this file pins the *config* clamp + drift guard;
+the *behavioral* cap on the marathon class (one-issue-per-session, handoff-size
+budget, compaction-trigger expectation, max-call guidance, and the
+pre-committed output+reasoning escalation with its calibration-pending
+threshold) is `docs/ops/session-lifecycle-contract.md`.
+
 ---
 
 ## 1. The conditioned savings claim (honest framing)
