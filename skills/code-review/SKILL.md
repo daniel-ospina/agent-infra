@@ -1123,7 +1123,11 @@ flow. Before recording, ALL of these must hold:
    time. `record-review.sh` verifies this itself and REFUSES (exit 4, no
    write) any `clean-micro` record whose linked same-repo issue is NOT micro —
    a standard/complex issue is never recorded `clean-micro`: run THIS skill
-   and record `clean` (Step 10).
+   and record `clean` (Step 10). Where the linked ref's complexity label
+   cannot be read (label-fetch failure, absent label, no closing ref, or
+   only cross-repo refs) record-review.sh WARNS and proceeds — tier
+   attestation UNVERIFIED at mint; do not overread this record as
+   micro-certified.
 2. **Pre-flight passed per risk tier** (01-preflight.md: typecheck/tests on
    code-bearing micro sets; Low-risk docs/CSS/static sets exempt).
 3. **The #485 ≥1-dispatch floor was met.** Code-bearing micro sets satisfy it

@@ -256,6 +256,23 @@ printf 'complexity:micro\n' > "$T/labels/424313"
 )
 rm -rf "$T/labels"
 
+# 8.9b mixed-case slug: GitHub repo identity is case-INSENSITIVE — a
+# same-repo closing ref written with differing casing (DANIEL-OSPINA/… or a
+# mixed-case full URL) must still bind the tier (refuse clean-micro for a
+# standard-linked issue), never drop to arm (c) fail-open. RED pre-fix (the
+# same-repo filter compared $1 == "$REPO" case-sensitively).
+mkdir -p "$T/labels"
+printf 'complexity:standard\n' > "$T/labels/424316"
+(
+    export STUB_LABELS_DIR="$T/labels"
+    export STUB_LABELS=""   # per-issue map takes precedence in the stub
+    STUB_BODY="Fixes DANIEL-OSPINA/Agent-Infra#424316" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424317 "$SHA"
+    [ "$RECORD_RC" = "4" ] && ok "mixed-case slug: same-repo ref with different casing still refuses (rc 4)" || bad "mixed-case slug: casing bypassed the tier bind (rc=$RECORD_RC, err=$RECORD_ERR)"
+    STUB_BODY="Fixes https://github.com/Daniel-Ospina/Agent-Infra/issues/424316" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424318 "$SHA"
+    [ "$RECORD_RC" = "4" ] && ok "mixed-case URL: full-URL casing still refuses (rc 4)" || bad "mixed-case URL: casing bypassed the tier bind (rc=$RECORD_RC, err=$RECORD_ERR)"
+)
+rm -rf "$T/labels"
+
 # 8.10 clean verdict: ZERO extra gh calls (no labels query in the log).
 run_record "daniel-ospina/agent-infra" 424315
 if grep -q "labels" "$LOG"; then

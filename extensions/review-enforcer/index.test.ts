@@ -1440,21 +1440,34 @@ section("#513 — clean-micro contract docs presence pins (source-checkout guard
 // while keeping the tier tokens fails CI.
 const CONTRACT_DOC_PINS: Array<{
   rel: string;
+  regionFrom: string;
+  regionTo: string;
   tierTokens: string[];
   negationTokens: string[];
 }> = [
   {
     rel: "skills/code-review/SKILL.md",
+    // Plan Task 5.6 anchored region: the Step 10a block only — a token
+    // relocated to a wrong section must not vacuously satisfy the pin.
+    regionFrom: "### Step 10a",
+    regionTo: "## Standard-Tier Review",
     tierTokens: ["clean-micro", "complexity:micro", "exit 4"],
     negationTokens: ["not multi-agent"],
   },
   {
     rel: "skills/commit-workflow/workflow/04-merge-deploy.md",
+    // Condition-6 block: numbered list item 6 through the Merge Ceremony
+    // heading (the list has no item 7).
+    regionFrom: "6. **Review record at the final head",
+    regionTo: "## Merge Ceremony",
     tierTokens: ["clean-micro", "03-code-review.md Step 2", "refuses"],
     negationTokens: ["never refused at any tier"],
   },
   {
     rel: "skills/commit-workflow/workflow/03-code-review.md",
+    // Step-2 micro paragraph (up to the next step heading).
+    regionFrom: "## Step 2 — Code-Review Gate",
+    regionTo: "## Step 2.5 — Migration Review Gate",
     tierTokens: ["clean-micro", "record-review.sh"],
     negationTokens: ["not a multi-agent"],
   },
@@ -1465,19 +1478,24 @@ test("#513: contract docs carry the clean-micro definition + negation tokens", (
     console.log("#513 docs-presence pins: soft-skip — not a source checkout (deployed extension copy)");
     return;
   }
-  for (const { rel, tierTokens, negationTokens } of CONTRACT_DOC_PINS) {
+  for (const { rel, regionFrom, regionTo, tierTokens, negationTokens } of CONTRACT_DOC_PINS) {
     const url = new URL(`../../${rel}`, import.meta.url);
     ok(existsSync(url), `doc reachable: ${rel} (vacuous-pass guard)`);
-    const text = fs.readFileSync(url, "utf8").replace(/\s+/g, " ").toLowerCase();
+    const normalized = fs.readFileSync(url, "utf8").replace(/\s+/g, " ").toLowerCase();
+    const fromIdx = normalized.indexOf(regionFrom.toLowerCase());
+    const toIdx = normalized.indexOf(regionTo.toLowerCase());
+    ok(fromIdx !== -1 && toIdx !== -1 && toIdx > fromIdx, `#513 region anchors found in order: ${rel} (from "${regionFrom}" → to "${regionTo}")`);
+    const text = normalized.slice(fromIdx, toIdx);
     // whitespace-normalized: the appendix prose is re-wrapped at ~78 cols, so a
     // negation token may legally straddle a newline ("NOT\nmulti-agent") — a
-    // line-break move must not red the pin.
+    // line-break move must not red the pin. Region-bound: tokens must sit in
+    // the anchored block, not anywhere in the file.
     for (const t of tierTokens) {
-      ok(text.includes(t.toLowerCase()), `#513 doc pin: ${rel} contains "${t}"`);
+      ok(text.includes(t.toLowerCase()), `#513 doc pin: ${rel} [${regionFrom}…${regionTo}] contains "${t}"`);
     }
     ok(
       negationTokens.some((n) => text.includes(n.toLowerCase())),
-      `#513 negation pin: ${rel} contains one of ${negationTokens.join(" | ")}`
+      `#513 negation pin: ${rel} [${regionFrom}…${regionTo}] contains one of ${negationTokens.join(" | ")}`
     );
   }
 });

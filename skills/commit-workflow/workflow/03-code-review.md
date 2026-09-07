@@ -33,7 +33,10 @@ Pass these ratings to code-review Step 4 dispatch logic. When all empty, the 6 a
 `~/.pi/agent/scripts/record-review.sh <PR> <head-sha> clean-micro
 <owner/repo>` — the script verifies the linked issue's `complexity:micro`
 label and REFUSES (exit 4) a clean-micro record whose linked same-repo issue
-is not micro. `clean-micro` certifies this micro process (pre-flight + the
+is not micro. Where the linked ref's complexity label cannot be read
+(label-fetch failure, absent label, no closing ref, or only cross-repo refs)
+record-review.sh WARNS and proceeds — tier attestation UNVERIFIED at mint.
+`clean-micro` certifies this micro process (pre-flight + the
 ≥1-dispatch floor above), NOT a multi-agent review — by the standard micro
 flow the record is `clean-micro`, and `clean` is never refused at any tier (a
 micro session that ran the code-review skill and records `clean` is a

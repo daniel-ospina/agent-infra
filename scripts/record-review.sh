@@ -179,7 +179,7 @@ if [ "$VERDICT" = "clean-micro" ]; then
       echo "⚠️ clean-micro tier guard: could not read the PR body of $REPO#$PR (gh/API failure or empty body?) — tier attestation UNVERIFIED (record proceeds)" >&2
     else
       # Collect same-repo closing refs (dedupe via awk; preserve order).
-      REFS="$(closing_issue_refs "$BODY" | awk -F'#' '$1 == "'"$REPO"'" { seen[$0]++; if (seen[$0] == 1) print }')"
+      REFS="$(closing_issue_refs "$BODY" | awk -F'#' 'tolower($1) == tolower("'"$REPO"'") { seen[$0]++; if (seen[$0] == 1) print }')"
       if [ -z "$REFS" ]; then
         echo "⚠️ clean-micro tier guard: no same-repo closing-issue ref found in the PR body of $REPO#$PR — tier attestation UNVERIFIED (record proceeds; body refs: $(printf '%s' "$BODY" | grep -oE '(fix(es|ed)?|close(s|d)?|resolve(s|d)?)[[:space:]]*[^[:space:],;)]*' | head -c 200 || true))" >&2
       else

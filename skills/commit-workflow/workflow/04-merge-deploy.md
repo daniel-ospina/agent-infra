@@ -56,7 +56,10 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    PROCESS: `record-review.sh` verifies the linked same-repo issue's
    `complexity:micro` label at record time and REFUSES (exit 4) a
    `clean-micro` record whose linked issue is not micro; pre-flight per risk
-   tier and the #485 ≥1-dispatch floor are enforced by their own gates. If
+   tier and the #485 ≥1-dispatch floor are enforced by their own gates. Where
+   the linked ref's complexity label cannot be read (label-fetch failure,
+   absent label, no closing ref, or only cross-repo refs) record-review.sh
+   WARNS and proceeds — tier attestation UNVERIFIED at mint. If
    the head moved after the record (fix commits, merge of main): re-run the
    review appropriate to the tier (the `code-review` skill at
    standard/complex; the micro flow at micro) on the new head, then re-record
