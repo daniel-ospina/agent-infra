@@ -6,9 +6,23 @@
  * `~/.pi/agent/task-results/<sha256>/result.json` and the file content
  * matches the returned result.
  *
- * Deterministic and API-key-free: the timeout kill is used (a hung worker
- * always completes the dispatch via the #137 timeout path, and every
- * completion — success/failure/timeout/abort — is cached).
+ * #574 — hermetic via a PATH-shadowing fake `pi` (the #573
+ * timeout-integration.test.ts pattern): pi 0.84.3 keyless exits fast (~2-6s,
+ * stopReason "error") instead of stalling, so a real pi can never satisfy the
+ * timeout-path assertion hermetic. The fake `pi` is a temp-dir shell script
+ * prepended to PATH that hangs (sleep 120) — the 5s task timeout kills it
+ * deterministically. This suite is the runSingleAgent CACHE-PATH analog of
+ * timeout-integration: it is the ONLY hermetic coverage of the combined
+ * timeout→cache scenario (a timeout-killed child whose result is still cached
+ * with stopReason "timeout").
+ *
+ * Fake-pi body (V2 — minimal): `sleep 120`, no pipe-holder grandchild, no
+ * holder pid file. The grandchild exists in timeout-integration ONLY to make
+ * the settle-path sweep OBSERVABLE in the external-SIGKILL cut scenario;
+ * cache-integration asserts the cache contract only (no pgrep / orphan-reap
+ * assertions), and treeKill's pgid SIGTERM closes the pipes so settle
+ * completes via the close path regardless. The single-command body's shell
+ * exec-optimization is irrelevant here (no pgrep-marker assertions).
  *
  * Run: npx tsx extensions/subagent/cache-integration.test.ts
  */
@@ -65,7 +79,50 @@ const makeDetails = (mode: "single") => (results: SingleResult[]) => ({
 	results,
 });
 
-const savedArgv1 = process.argv[1];
+// ── Fake pi harness (#574, pattern from #573 timeout-integration) ────────
+//
+// getPiInvocation falls back to bare "pi" when argv[1] is missing — the tsx
+// test runner's own entry script must not be re-spawned as a sub-agent. With
+// argv[1] undefined AND a fake `pi` first on PATH, the child spawned by
+// runSingleAgent IS our shell stub (the real pi lives in the runtime bin dir
+// appended LAST by getSubAgentPath; the stub dir sits at the FRONT of the
+// inherited PATH — safe because the prepended python3 dirs and the homebrew
+// dirs never contain a `pi` binary).
+//
+// V2 body (minimal — no grandchild/holder): `sleep 120` hangs long enough
+// that the 5s task timeout always fires. This suite has NO pgrep / orphan-reap
+// assertions, so the pipe-holder grandchild timeout-integration forks (and the
+// FAKE_PI_HOLDER_PID_FILE observability) would be dead weight here — see the
+// header note. Dash/bash may exec-optimize the single-command body into
+// `sleep 120` directly; irrelevant without pgrep-marker assertions.
+const FAKE_PI_SCRIPT = `#!/bin/sh
+sleep 120
+`;
+
+let tmpDir: string;
+let savedPath: string;
+let savedArgv1: string;
+
+function setup() {
+	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cache-"));
+	const fakePi = path.join(tmpDir, "pi");
+	fs.writeFileSync(fakePi, FAKE_PI_SCRIPT, { mode: 0o755 });
+	savedPath = process.env.PATH ?? "";
+	process.env.PATH = `${tmpDir}:${savedPath}`;
+	savedArgv1 = process.argv[1] as string;
+	process.argv[1] = undefined as unknown as string;
+}
+
+function teardown() {
+	process.env.PATH = savedPath;
+	process.argv[1] = savedArgv1;
+	try {
+		fs.rmSync(tmpDir, { recursive: true, force: true });
+	} catch {
+		/* ignore */
+	}
+}
+
 const resultsRoot = path.join(os.homedir(), ".pi", "agent", "task-results");
 
 function listCacheDirs(): string[] {
@@ -97,7 +154,7 @@ test("timeout dispatch result is cached to disk and matches the returned result"
 	const before = new Set(listCacheDirs());
 
 	process.env.SUBAGENT_TASK_TIMEOUT_MS = "5000";
-	process.argv[1] = undefined as unknown as string;
+	const started = Date.now();
 	let result: SingleResult | undefined;
 	try {
 		result = await runSingleAgent(
@@ -112,11 +169,17 @@ test("timeout dispatch result is cached to disk and matches the returned result"
 			makeDetails("single"),
 		);
 	} finally {
-		process.argv[1] = savedArgv1;
 		delete process.env.SUBAGENT_TASK_TIMEOUT_MS;
 	}
 
+	const elapsed = Date.now() - started;
 	ok(result, "dispatch must return a result");
+	// Anti-vacuous (#574): the fake pi lives 120s, so the timeout ALWAYS fires
+	// — elapsed >= 4500 proves the timeout path genuinely ran, not an
+	// incidental fast-exit pass.
+	ok(elapsed >= 4500, `dispatch resolved too early (${elapsed}ms) — timeout did not fire`);
+	// SIGTERM → close/exit-settle → settle. CI-safe bound.
+	ok(elapsed < 30_000, `dispatch took too long (${elapsed}ms) — process was not reaped`);
 	equal(result!.stopReason, "timeout", "dispatch should be the timeout path");
 	ok(result!.cachePath, "result must carry cachePath");
 
@@ -144,7 +207,12 @@ test("timeout dispatch result is cached to disk and matches the returned result"
 // ── Results ───────────────────────────────────────────
 
 async function run() {
-	for (const t of tests) await t();
+	setup();
+	try {
+		for (const t of tests) await t();
+	} finally {
+		teardown();
+	}
 	console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
 	if (failed > 0) {
 		console.log("❌ SOME TESTS FAILED");
