@@ -131,3 +131,22 @@ swarm base byte-for-byte from the repo root.
   (#357 h) — the operator writes it by hand from a shell with no session id; the
   new-session unlink hazard is the documented cost, and a per-session force
   suffix would need an operator-visible id (deferred).
+- **No-board predicate re-probe cadence (#384):** the `_is_no_board` predicate's
+  efficacy against REAL consumer environments is **time-bounded** — consumer
+  shells change as pi/consumer versions bump (new env names exported, existing
+  names repurposed). Its pin = the committed consumer-env fixtures
+  (`scripts/testdata/consumer-env-tortoise.{env,names}` +
+  `consumer-env-dmeer.{env,names}`, asserted by B21) + the B27 new-signal name
+  constant (baked from the fixtures' key set; a B-test asserts baked set ==
+  union of fixture `.names` inventories, so a new board-signal-shaped name in a
+  consumer env trips CI until the constant is regenerated). **Re-probe trigger:
+  re-run the Task 1 Step 6 live capture (fresh pi session inside tortoise +
+  DMeer checkouts; values redacted, names verbatim) on ANY pi version bump, ANY
+  consumer (tortoise/DMeer) version bump, or QUARTERLY (calendar: Q3 2026 — 1
+  Sep 2026 baseline), whichever comes first.** On re-probe: regenerate the
+  `.env` (redacted) + `.names` (raw) fixtures (redact-then-diff + allowlist +
+  ≥2 distinct-origin gates stay green), regenerate the B27 constant from the
+  union, and keep `scripts/check-vendor-drift.sh --manifest` exit 0. A
+  newly-exported generic signal (`SUPABASE_URL`, `AGENT_ID`, …) in a consumer
+  env fires the human decision fork — narrowing requires explicit approval
+  (S1/Q15 contingency), never a silent narrowing.
