@@ -383,6 +383,10 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   [[ "$ref" == "daniel-ospina/swarm#2492" ]] || { echo "❌ SELF-TEST FAIL: parse_issue_ref('Fixes daniel-ospina/swarm#2492') = '$ref', expected 'daniel-ospina/swarm#2492'." >&2; exit 2; }
   ref="$(parse_issue_ref 'Closes https://github.com/daniel-ospina/swarm/issues/2492')"
   [[ "$ref" == "daniel-ospina/swarm#2492" ]] || { echo "❌ SELF-TEST FAIL: full-URL parse = '$ref', expected 'daniel-ospina/swarm#2492'." >&2; exit 2; }
+  # Host-axis casing (#513 review r3): GitHub identity is case-insensitive on
+  # the HOST too — an uppercase-host URL must resolve, not drop to arm (c).
+  ref="$(parse_issue_ref 'Closes https://GITHUB.com/Daniel-Ospina/Agent-Infra/issues/2492')"
+  [[ "$ref" == "daniel-ospina/agent-infra#2492" ]] || { echo "❌ SELF-TEST FAIL: mixed-case-host URL parse = '$ref', expected 'daniel-ospina/agent-infra#2492'." >&2; exit 2; }
   ref="$(parse_issue_ref 'Resolves https://github.com/daniel-ospina/agent-infra/pull/171')"
   [[ -z "$ref" ]] || { echo "❌ SELF-TEST FAIL: pull-request URL must NOT parse as an issue, got '$ref'." >&2; exit 2; }
   ref="$(parse_issue_ref 'Fixes #7')"
@@ -489,6 +493,7 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   }
   expect_ref 'Fixes daniel-ospina/swarm#2492' 'daniel-ospina/swarm#2492'
   expect_ref 'Closes https://github.com/daniel-ospina/swarm/issues/2492' 'daniel-ospina/swarm#2492'
+  expect_ref 'Closes https://GITHUB.com/Daniel-Ospina/Agent-Infra/issues/2492' 'daniel-ospina/agent-infra#2492'
   expect_ref 'Resolves #7' "$GH_REPO#7"
   expect_ref 'FIXES #9' "$GH_REPO#9"
   expect_ref 'Fixes https://github.com/daniel-ospina/agent-infra/pull/171' ''
