@@ -103,7 +103,7 @@ for vf in files:
             disk = "missing"
     print(f"  - {path}")
     print(f"      stored: {h}")
-    print(f"      disk:   {disk}   ({'match' if disk not in ('n/a','missing','unreadable') and disk == h else 'NO MATCH — recovery drops this entry (fail-closed)' if disk != 'n/a' else ''})")
+    print(f"      disk:   {disk}   ({'match' if disk not in ('n/a','missing','unreadable') and disk == h.lower() else 'NO MATCH — recovery drops this entry (fail-closed)' if disk != 'n/a' else ''})")
 PYEOF
   # Explicit exit 0: the final [ -f "$AUDIT" ] && { … } short-circuits to exit
   # 1 under set -euo pipefail when the audit file has never been created — a
