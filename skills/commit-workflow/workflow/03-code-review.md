@@ -28,7 +28,20 @@ Pass these ratings to code-review Step 4 dispatch logic. When all empty, the 6 a
 
 ## Step 2 — Code-Review Gate
 
-**Micro tier: skip entirely.** No code-review agents are dispatched for Micro — the code-review gate is skipped by design. The review-enforcer ≥1-dispatch rule still applies at micro (blocks at 0 dispatches since #485; code-bearing micro sets satisfy it via VGATE's own [VGATE] verification dispatch, docs-only sets via a lightweight reviewer dispatch naming the diff — `extensions/review-enforcer/index.ts`; the tier read from `/tmp/agent-issue-complexity` selects only the micro remediation message). The safety net at Micro is pre-flight per risk tier (typecheck/tests on code-bearing sets, skipped for Low docs/CSS/static per 01-preflight.md) plus VGATE (content-shape gated — runs on code sets at any tier, exempts docs/CSS/static-only sets) plus the review-enforcer dispatch block (uniform, micro included). Proceed directly to Step 3 (`04-merge-deploy.md`).
+**Micro tier: skip entirely.** No code-review agents are dispatched for Micro — the code-review gate is skipped by design. The review-enforcer ≥1-dispatch rule still applies at micro (blocks at 0 dispatches since #485; code-bearing micro sets satisfy it via VGATE's own [VGATE] verification dispatch, docs-only sets via a lightweight reviewer dispatch naming the diff — `extensions/review-enforcer/index.ts`; the tier read from `/tmp/agent-issue-complexity` selects only the micro remediation message). The safety net at Micro is pre-flight per risk tier (typecheck/tests on code-bearing sets, skipped for Low docs/CSS/static per 01-preflight.md) plus VGATE (content-shape gated — runs on code sets at any tier, exempts docs/CSS/static-only sets) plus the review-enforcer dispatch block (uniform, micro included). Before Step 3, record the merge-registry record at the current head
+(04-merge-deploy.md condition 6): micro PRs record verdict `clean-micro` via
+`~/.pi/agent/scripts/record-review.sh <PR> <head-sha> clean-micro
+<owner/repo>` — the script verifies the linked issue's `complexity:micro`
+label and REFUSES (exit 4) a clean-micro record whose linked same-repo issue
+is not micro. Where the linked ref's complexity label cannot be read
+(label-fetch failure, absent label, no closing ref, or only cross-repo refs)
+record-review.sh WARNS and proceeds — tier attestation UNVERIFIED at mint.
+`clean-micro` certifies this micro process (pre-flight + the
+≥1-dispatch floor above), NOT a multi-agent review — by the standard micro
+flow the record is `clean-micro`, and `clean` is never refused at any tier (a
+micro session that ran the code-review skill and records `clean` is a
+stronger claim, not a false one). Proceed directly to
+Step 3 (`04-merge-deploy.md`).
 
 **Standard tier:** Invoke `code-review` with the 6-agent review (guidance, bug scan, security):
 

@@ -253,6 +253,36 @@
           "contextWindow": 300000
         }
       }
+    },
+    "venice": {
+      "baseUrl": "https://api.venice.ai/api/v1",
+      "api": "openai-completions",
+      "apiKey": "$VENICE_API_KEY",
+      "models": [
+        {
+          "id": "deepseek-v4-flash",
+          "name": "DeepSeek V4 Flash (Venice)",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "contextWindow": 300000,
+          "maxTokens": 384000,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "max": "max"
+          },
+          "cost": {
+            "input": 0.14,
+            "output": 0.28,
+            "cacheRead": 0.03,
+            "cacheWrite": 0
+          }
+        }
+      ]
     }
   }
 }

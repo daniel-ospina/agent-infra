@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, applyScopeGate, routeScopeGate, combineScopes } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
@@ -1744,7 +1744,7 @@ test("SWEEP → \"sweep\" (single pure-sweep invocation)", () => {
     "git commit -amx",                       // -a + -m(x attached)
     "git commit -vam x",                     // -v -a -m(x)
     "git commit -qam x",
-    "git -C repo commit -am x",              // sweep behind git global flags (PURE-PREDICATE pin — hook interception gap tracked by #490)
+    "git -C repo commit -am x",              // sweep behind git global flags (PURE-PREDICATE pin — -C redirect is foreign/un-gated BY DESIGN post-#490: a `-C` commit targets another checkout, never verified from this root; env/cwd-neutral globals ARE intercepted via the shared scanner)
     "git --no-pager commit -am x",
     "git commit --author \"Jane <j@d>\" -a -m x",  // scan continues past required-value longs
     "git commit --date 2024-01-01 -a -m x",
@@ -2673,6 +2673,207 @@ test("buildSubAgentBlockMessage never emits ceremony diagnostics (call-site appe
   } finally {
     recordDispatchSuccess();
   }
+});
+// ── #559 T1 — rename-source plumbing: --name-status -z parser ──
+
+section("parseDiffNameStatus — NUL-contract grammar (G1)");
+
+test("G1: empty string → clean, no rows", () => {
+  const r = parseDiffNameStatus("");
+  deepEqual(r, { files: [], renameOldPaths: [], clean: true });
+});
+
+test("G1: A/M/D single-path 2-NUL rows", () => {
+  deepEqual(parseDiffNameStatus("A\0docs/new.md\0"), { files: ["docs/new.md"], renameOldPaths: [], clean: true });
+  deepEqual(parseDiffNameStatus("M\0src/app.ts\0"), { files: ["src/app.ts"], renameOldPaths: [], clean: true });
+  deepEqual(parseDiffNameStatus("D\0src/old.ts\0"), { files: ["src/old.ts"], renameOldPaths: [], clean: true });
+});
+
+test("G1: multi-row trailing-NUL stream → full set, clean", () => {
+  const r = parseDiffNameStatus("M\0a.ts\0A\0docs/b.md\0D\0c.ts\0");
+  deepEqual(r, { files: ["a.ts", "docs/b.md", "c.ts"], renameOldPaths: [], clean: true });
+});
+
+test("G1: R100 3-NUL row → files=[new], renameOldPaths=[old]", () => {
+  const r = parseDiffNameStatus("R100\0src/app.ts\0docs/code.md\0");
+  deepEqual(r, { files: ["docs/code.md"], renameOldPaths: ["src/app.ts"], clean: true });
+});
+
+test("G1: C075 copy row → same split (copies config can surface C)", () => {
+  const r = parseDiffNameStatus("C075\0src/base.ts\0docs/copy.md\0");
+  deepEqual(r, { files: ["docs/copy.md"], renameOldPaths: ["src/base.ts"], clean: true });
+});
+
+test("G1: score variants R050/R083 parse clean", () => {
+  ok(parseDiffNameStatus("R050\0a.ts\0b.md\0").clean);
+  ok(parseDiffNameStatus("R083\0a.ts\0b.md\0").clean);
+  deepEqual(parseDiffNameStatus("R050\0a.ts\0b.md\0").files, ["b.md"]);
+});
+
+test("G1: U (conflicted-merge staged), X, B, T rows parse clean as single-path", () => {
+  ok(parseDiffNameStatus("U\0f.txt\0").clean, "U is real git output in conflicted-merge staged diffs — must parse clean");
+  deepEqual(parseDiffNameStatus("U\0f.txt\0").files, ["f.txt"]);
+  ok(parseDiffNameStatus("X\0f.txt\0").clean, "X legal (unreachable) — closed alphabet keeps it clean");
+  ok(parseDiffNameStatus("B\0f.txt\0").clean, "B legal (unreachable) — closed alphabet keeps it clean");
+  deepEqual(parseDiffNameStatus("T\0f.txt\0").files, ["f.txt"], "typechange T is a single-path row");
+});
+
+test("G1: R projection parity on ordinary paths (files == name-only set)", () => {
+  const r = parseDiffNameStatus("R100\0src/app.ts\0docs/code.md\0");
+  deepEqual(r.files, ["docs/code.md"], "files projection = new path only (name-only parity on ordinary paths)");
+});
+
+test("G1: trailing-space path survives (no trim corruption)", () => {
+  const r = parseDiffNameStatus("A\0src/app.ts \0");
+  deepEqual(r.files, ["src/app.ts "]);
+});
+
+test("G1: multi-row desync — path token that looks like a status letter stays clean", () => {
+  // Positional validation: after a valid row's path, a path named "M" is
+  // consumed as a path (its row already validated its status slot).
+  const r = parseDiffNameStatus("A\0M\0M\0real.ts\0");
+  ok(r.clean, "status slots validated positionally; path-looking tokens stay paths");
+  deepEqual(r.files.sort(), ["M", "real.ts"].sort());
+});
+
+test("G1: interior consecutive NUL → clean=false", () => {
+  equal(parseDiffNameStatus("A\0a.ts\0\0M\0b.ts\0").clean, false);
+});
+
+test("G1: final token lacking terminator NUL → clean=false", () => {
+  equal(parseDiffNameStatus("A\0a.ts").clean, false, "final token has no trailing NUL terminator");
+});
+
+test("G1: bare R without score → clean=false", () => {
+  equal(parseDiffNameStatus("R\0old.ts\0new.md\0").clean, false);
+});
+
+test("G1: truncated R row (status + 1 path) → clean=false", () => {
+  equal(parseDiffNameStatus("R100\0old.ts\0").clean, false);
+});
+
+test("G1: empty path token → clean=false", () => {
+  equal(parseDiffNameStatus("A\0\0").clean, false);
+});
+
+test("G1: R row with empty OLD path column → clean=false (#559 T1 defensive symmetry)", () => {
+  equal(parseDiffNameStatus("R100\0\0new.md\0").clean, false, "empty rename-source column");
+});
+
+test("G1: R row with empty NEW path column → clean=false (#559 T1 defensive symmetry)", () => {
+  equal(parseDiffNameStatus("R100\0old.ts\0\0").clean, false, "empty rename-destination column");
+});
+
+test("G1: unknown status letter Q → clean=false (closed alphabet)", () => {
+  equal(parseDiffNameStatus("Q\0f.ts\0").clean, false);
+});
+
+test("G1: diff.renames=false equivalence note — D+A rows keep old path in files", () => {
+  // A+D split (renames disabled) surfaces the old path as a D row → gates.
+  const r = parseDiffNameStatus("A\0docs/code.md\0D\0src/app.ts\0");
+  deepEqual(r.files.sort(), ["docs/code.md", "src/app.ts"].sort());
+  deepEqual(r.renameOldPaths, []);
+});
+
+// ── #559 T1 — pure gate decision (G2) ──
+
+section("applyScopeGate + routeScopeGate — 4-way decision (G2)");
+
+const exempt = (p: string) => isShapeExemptFile(p);
+
+test("G2: empty files + clean → empty-allow (bare irrelevant)", () => {
+  equal(applyScopeGate([], [], true, false, exempt).kind, "empty-allow");
+  equal(applyScopeGate([], [], true, true, exempt).kind, "empty-allow");
+});
+
+test("G2: empty files + !clean → parse-block (the vacuous-allow pin)", () => {
+  const d = applyScopeGate([], [], false, false, exempt);
+  equal(d.kind, "parse-block");
+});
+
+test("G2: exempt files + clean + bare → exempt-allow", () => {
+  equal(applyScopeGate(["docs/a.md"], [], true, true, exempt).kind, "exempt-allow");
+});
+
+test("G2: non-exempt file → verify", () => {
+  equal(applyScopeGate(["src/app.ts"], [], true, true, exempt).kind, "verify");
+});
+
+test("G2: RENAME HOLE — code→docs rename (docs file + code old path) → verify", () => {
+  const d = applyScopeGate(["docs/code.md"], ["src/app.ts"], true, true, exempt);
+  equal(d.kind, "verify", "non-exempt rename OLD path forces gate ON");
+});
+
+test("G2: docs→docs rename (both exempt) → exempt-allow", () => {
+  equal(applyScopeGate(["docs/b.md"], ["docs/a.md"], true, true, exempt).kind, "exempt-allow");
+});
+
+test("G2: !clean + exempt files → parse-block (precedence over exemption)", () => {
+  equal(applyScopeGate(["docs/a.md"], [], false, true, exempt).kind, "parse-block");
+});
+
+test("G2: !clean + verified-shaped file → parse-block (never verifies past malformed content)", () => {
+  equal(applyScopeGate(["src/app.ts"], [], false, true, exempt).kind, "parse-block");
+});
+
+test("G2: non-bare + exempt files → verify (D2 form guard)", () => {
+  equal(applyScopeGate(["docs/a.md"], [], true, false, exempt).kind, "verify");
+});
+
+test("G2: parse-block is stateless — 3 identical calls all parse-block (no vacuous bypass)", () => {
+  for (let i = 0; i < 3; i++) {
+    equal(applyScopeGate([], [], false, false, exempt).kind, "parse-block", `attempt ${i + 1} still parse-blocks`);
+  }
+});
+
+test("G2: parse-block return shape — event + static reason, no verifier-dispatch template", () => {
+  const d = applyScopeGate([], [], false, false, exempt);
+  if (d.kind !== "parse-block") throw new Error("expected parse-block");
+  equal(d.event, "gate_block_parse_failure");
+  ok(d.block.block === true);
+  ok(d.block.reason.includes("parse anomaly"), "static anomaly reason");
+  ok(!d.block.reason.includes("Dispatch the verifier"), "no verifier-dispatch template — a dispatch cannot clear a parse-block");
+  ok(d.block.reason.includes("ELDATO_SKIP_VGATE"), "names the only escape");
+});
+
+test("G2: routeScopeGate routes all four kinds", () => {
+  equal(routeScopeGate({ kind: "empty-allow" }, []).action, "empty-allow");
+  const pb = routeScopeGate(applyScopeGate([], [], false, false, exempt), []);
+  equal(pb.action, "parse-block");
+  if (pb.action === "parse-block") {
+    equal(pb.event, "gate_block_parse_failure");
+    ok(pb.block.block);
+  }
+  const ex = routeScopeGate({ kind: "exempt-allow" }, ["docs/a.md"]);
+  equal(ex.action, "exempt-allow");
+  if (ex.action === "exempt-allow") deepEqual(ex.files, ["docs/a.md"]);
+  const vf = routeScopeGate({ kind: "verify" }, ["src/app.ts"]);
+  equal(vf.action, "verify");
+  if (vf.action === "verify") deepEqual(vf.files, ["src/app.ts"]);
+});
+
+// ── #559 T1 — argv builder -z forms + combineScopes (G3/G4) ──
+
+section("buildPushRangeDiffCommand -z argv + combineScopes (G3/G4)");
+
+test("G3: -z argv forms are exact (tier A 2-dot / tier B 3-dot)", () => {
+  equal(buildPushRangeDiffCommand("A", "refs/remotes/origin/main", "feat/487", true), "git diff --name-status -z refs/remotes/origin/main feat/487");
+  equal(buildPushRangeDiffCommand("B", "refs/remotes/origin/main", "HEAD", true), "git diff --name-status -z refs/remotes/origin/main...HEAD");
+});
+
+test("G3: 3-arg call ≡ 4-arg false (default preserves name-only pins)", () => {
+  equal(buildPushRangeDiffCommand("A", "refs/remotes/origin/main", "feat/487"), buildPushRangeDiffCommand("A", "refs/remotes/origin/main", "feat/487", false));
+  equal(buildPushRangeDiffCommand("A", "refs/remotes/origin/main", "feat/487"), "git diff --name-only refs/remotes/origin/main feat/487");
+});
+
+test("G4: combineScopes — files dedup, renameOldPaths union, clean AND", () => {
+  const a = { files: ["a.ts", "docs/x.md"], renameOldPaths: ["src/old.ts"], clean: true };
+  const b = { files: ["a.ts", "b.ts"], renameOldPaths: ["docs/old.md"], clean: true };
+  const u = combineScopes(a, b);
+  deepEqual(u.files.sort(), ["a.ts", "b.ts", "docs/x.md"].sort());
+  deepEqual(u.renameOldPaths.sort(), ["docs/old.md", "src/old.ts"].sort());
+  ok(u.clean);
+  equal(combineScopes(a, { ...b, clean: false }).clean, false, "clean is AND");
 });
 // ── Results ───────────────────────────────────────────
 

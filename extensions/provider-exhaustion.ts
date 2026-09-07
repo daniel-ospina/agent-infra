@@ -185,6 +185,110 @@ export function interactiveRestoreTarget(
 /** Set when a child latched an in-session signal — emitted at shutdown. */
 let pendingMarker: string | null = null;
 
+// ── #512 per-dispatch usage capture (child side, TASK_USAGE_CAPTURE=1) ──
+// The task tool's children run --no-session (no persisted session file), so
+// per-dispatch token usage for the 0a cache-fraction gate has NO existing
+// data source. When the parent opts in (TASK_USAGE_CAPTURE=1 flows to the
+// child env), the child accumulates message_end usage and emits ONE
+// [task-usage] stderr line at session_shutdown (same writeSync channel + nonce
+// as the exhaustion marker — the parent authenticates and appends its
+// dispatch-usage ledger). Default OFF → byte-identical behavior.
+export const TASK_USAGE_CAPTURE = "TASK_USAGE_CAPTURE";
+const USAGE_MARKER_PREFIX = "[task-usage]";
+
+interface UsageTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+}
+
+let usageTotals: UsageTotals | null = null;
+let usageModel = "";
+let usageProvider = "";
+
+function accumulateMessageUsage(message: unknown, ctxModel?: unknown): void {
+  // #512 round-2 P2 (code-review): capture is eligible ONLY in a task-tool
+  // child — same contract as the sibling exhaustion-marker emission
+  // (childMarkerEligible). TASK_USAGE_CAPTURE is an operator-exported shell
+  // var that reaches EVERY print/json pi process under the env; a non-task
+  // child (swarm-daemon worker, ad-hoc pi -p) has no authenticating parent
+  // reader (no TASK_HEARTBEAT_NONCE) and must neither accumulate nor emit
+  // [task-usage] lines.
+  if (process.env[TASK_USAGE_CAPTURE] !== "1" || !childMarkerEligible()) return;
+  const msg = message as {
+    role?: string;
+    model?: string | null;
+    usage?: {
+      input?: number;
+      output?: number;
+      cacheRead?: number;
+      cacheWrite?: number;
+      cost?: number | { total?: number };
+    } | null;
+  } | null;
+  if (!msg || msg.role !== "assistant" || !msg.usage) return;
+  const u = msg.usage;
+  const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const cost = typeof u.cost === "number" ? u.cost : num(u.cost?.total);
+  const t = usageTotals ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  t.input += num(u.input);
+  t.output += num(u.output);
+  t.cacheRead += num(u.cacheRead);
+  t.cacheWrite += num(u.cacheWrite);
+  t.cost += cost;
+  usageTotals = t;
+  // Last-reported model id wins (the id is a bare string on the message).
+  // Provider attribution is NOT derived from msg.model: a print-mode child's
+  // CLI --provider is the ONLY authoritative leg (ctx.model is a Model
+  // object), and a bare id like "deepseek-v4-flash" cannot distinguish
+  // deepseek-official from a venice cold-class spawn — splitSessionModel's
+  // legacy default would mislabel every venice burn as deepseek (P1-1).
+  const ctxParts = ctxModel ? modelParts(ctxModel) : { provider: "", model: "" };
+  if (typeof msg.model === "string" && msg.model) {
+    const parts = modelParts(msg.model);
+    usageModel = parts.model || usageModel;
+  } else if (ctxParts.model) {
+    usageModel = ctxParts.model;
+  }
+  if (ctxParts.provider) usageProvider = ctxParts.provider;
+}
+
+/** Render the [task-usage] line (sB1 charset discipline: single line, ASCII
+ * key=value tokens, no spaces in values). cost is emitted at micro-dollar
+ * precision (6dp) — enough for class-level burn attribution. */
+export function renderUsageMarker(
+  t: UsageTotals,
+  opts: { model: string; provider: string; nonce: string },
+): string {
+  const cost = t.cost.toFixed(6);
+  return (
+    `${USAGE_MARKER_PREFIX} input=${t.input} output=${t.output} ` +
+    `cacheRead=${t.cacheRead} cacheWrite=${t.cacheWrite} cost=${cost} ` +
+    `model=${opts.model} provider=${opts.provider} nonce=${opts.nonce}\n`
+  );
+}
+
+export function _usageTotalsForTests(): UsageTotals | null {
+  return usageTotals;
+}
+
+export function _resetUsageForTests(): void {
+  usageTotals = null;
+  usageModel = "";
+  usageProvider = "";
+}
+
+export function _usageMarkerForTests(): string | null {
+  if (usageTotals === null) return null;
+  return renderUsageMarker(usageTotals, {
+    model: usageModel || "unknown",
+    provider: usageProvider || "unknown",
+    nonce: process.env.TASK_HEARTBEAT_NONCE ?? "",
+  });
+}
+
 /** Families this process observed an EXHAUSTION LATCH for (interactive only).
  * Added on (a) an interactive message_end setExhausted and (b) session_start
  * finding the session's family root latched. turn_start RESTORE is gated on
@@ -302,6 +406,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("message_end", async (event, ctx: any) => {
     if (!ctx || !ctx.model) return;
+    // #512 usage capture: accumulate message_end usage on EVERY assistant
+    // turn when the parent opted in (TASK_USAGE_CAPTURE=1) — runs BEFORE the
+    // exhaustion classification so healthy turns count too. Emitted once at
+    // session_shutdown as [task-usage] (see the shutdown hook below).
+    if (isChildMode(ctx.mode)) {
+      accumulateMessageUsage((event as { message?: unknown })?.message, ctx.model);
+    }
     const cls = classifySessionTurn((event as { message?: unknown })?.message);
     if (!cls.kind) return; // audit_only / healthy / quoted — never act
     if (isChildMode(ctx.mode)) {
@@ -406,6 +517,26 @@ export default function (pi: ExtensionAPI) {
         // stderr EPIPE to a dead parent — the latch simply isn't seen
       }
       pendingMarker = null;
+    }
+    // #512: emit the accumulated [task-usage] line (opt-in capture) after the
+    // exhaustion marker — same channel, authenticated by the parent via nonce.
+    // Emission mirrors the marker's eligibility contract (round-2 P2): only a
+    // task-tool child (TASK_HEARTBEAT=1 + nonce) has an authenticating reader.
+    if (usageTotals !== null && process.env[TASK_USAGE_CAPTURE] === "1" && childMarkerEligible()) {
+      try {
+        writeStderr(
+          renderUsageMarker(usageTotals, {
+            model: usageModel || "unknown",
+            provider: usageProvider || "unknown",
+            nonce: process.env.TASK_HEARTBEAT_NONCE ?? "",
+          }),
+        );
+      } catch {
+        // EPIPE — the dispatch-usage row simply isn't seen
+      }
+      usageTotals = null;
+      usageModel = "";
+      usageProvider = "";
     }
   });
 

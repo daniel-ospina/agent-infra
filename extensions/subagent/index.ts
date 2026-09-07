@@ -18,7 +18,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 // #36: shared sub-agent PATH augmentation (python3 resolution for MCP servers)
-import { getSubAgentPath, DEFAULT_TOOL_STALL_MS } from "../builtin-tools/index.js";
+import { getSubAgentPath, DEFAULT_TOOL_STALL_MS, resolveProviderModel } from "../builtin-tools/index.js";
 
 // #208: local constants (the builtin-tools equivalents live on the builtin
 // task tool; the ext keeps its own copies so it stays self-contained).
@@ -784,6 +784,42 @@ export function getSubagentFallbackModel(): string {
 	return process.env.SUBAGENT_FALLBACK_MODEL || DEFAULT_SUBAGENT_FALLBACK_MODEL;
 }
 
+/**
+ * #512 (P1-B) — provider-qualify a BARE agent-config model before the child
+ * spawn. pi's OWN CLI resolver (unlike the task tool's #154 resolver)
+ * REJECTS ambiguous bare ids ("Model X is ambiguous across providers") the
+ * moment MORE THAN ONE matching provider is authenticated. A venice row
+ * registered alongside deepseek (and, live on this machine, the store-
+ * derived opencode-go/opencode/qwen-token-plan/qwen-token-plan-cn rows)
+ * makes every bare `deepseek-v4-flash` subagent spawn hard-error at child
+ * startup. Passing an explicit `--provider` (mirroring the task tool's
+ * buildArgs) disambiguates for the child.
+ *
+ * Rules (amendment-2 P1-B + amendment-3 P2):
+ *   - attempt-0 model ONLY — the #496 fallback (bare deepseek-v4-pro) stays
+ *     byte-identical to pre-#512 state (deepseek+qwen-tp same-id, unchanged;
+ *     a fallback-pro ambiguity fixture exists only as defense-in-depth if a
+ *     pro row is ever registered);
+ *   - slash-free bare ids only — an already-qualified "provider/model" is
+ *     never double-split;
+ *   - no-model agents and unresolvable models spawn byte-identically
+ *     unchanged (no --provider appended).
+ *
+ * Pure (registry injectable for tests). Returns the model plus the provider
+ * to pass as --provider (undefined = leave the legacy spawn untouched).
+ */
+export function qualifyBareModel(
+	model: string | undefined,
+	registry?: Parameters<typeof resolveProviderModel>[1],
+): { model: string | undefined; provider: string | undefined } {
+	if (!model) return { model, provider: undefined };
+	const trimmed = model.trim();
+	if (!trimmed || trimmed.includes("/")) return { model, provider: undefined };
+	const resolved = resolveProviderModel(trimmed, registry);
+	if (!resolved.provider) return { model, provider: undefined };
+	return { model: resolved.model, provider: resolved.provider };
+}
+
 export async function runSingleAgent(
 	defaultCwd: string,
 	agents: AgentConfig[],
@@ -829,7 +865,17 @@ export async function runSingleAgent(
 		// silently drops a value-less trailing --model).
 		const effectiveModel = isFallback ? fallbackModel : agent.model;
 		const args: string[] = ["--mode", "json", "-p", "--no-session"];
-		if (effectiveModel) args.push("--model", effectiveModel);
+		// #512 (P1-B): provider-qualify the attempt-0 BARE model so the child's
+		// OWN resolver never sees an ambiguous bare id (pi hard-errors the moment
+		// two authenticated providers host the id — e.g. deepseek + venice once
+		// the venice row registers, or today's live store-derived rows). The
+		// fallback model stays byte-identical (amendment-3 P2). Already-qualified
+		// ("provider/model") and unresolvable models pass through unchanged.
+		const qualified: { model?: string; provider?: string } = isFallback
+			? { model: effectiveModel }
+			: qualifyBareModel(effectiveModel);
+		if (qualified.model) args.push("--model", qualified.model);
+		if (qualified.provider) args.push("--provider", qualified.provider);
 		if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 		let tmpPromptDir: string | null = null;

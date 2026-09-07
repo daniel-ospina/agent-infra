@@ -2898,7 +2898,7 @@ async function main() {
       if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
   });
-  test("scenario 64 (#561): state-bearing retry guidance — recovery on first guidance, escalation at 3, judgment interleave, reset-proof (indicator-1 proof)", async () => {
+  test("scenario 69 (#561): state-bearing retry guidance — recovery on first guidance, escalation at 3, judgment interleave, reset-proof (indicator-1 proof)", async () => {
     const repo = join(TEST_ROOT, "repo-561-s64");
     mkdirSync(repo, { recursive: true });
     git(repo, "init -b main");
@@ -3089,6 +3089,259 @@ async function main() {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
+  });
+
+  // ── #559 T1 e2e legs (64-68): rename-source shape detection ──
+
+  test("scenario 64 (#559 T1): staged code→docs rename BLOCKED (rename old path forces gate ON) — RED pre-fix", async () => {
+    const repo = join(TEST_ROOT, "repo-559-64");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "config diff.renames true"); // gitconfig isolation — host config must not collapse R rows
+    writeFileSync(join(repo, "base64.txt"), "b\n");
+    git(repo, "add base64.txt");
+    git(repo, "commit -m base");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src/app.ts"), "export const a = 1;\n");
+    git(repo, "add src/app.ts");
+    git(repo, "commit -m src");
+    mkdirSync(join(repo, "docs"), { recursive: true });
+    git(repo, "mv src/app.ts docs/code.md");
+    // Discriminators (fixture self-check BEFORE the verdict assert): the -z
+    // staged diff MUST contain an R row (source in HEAD) and name-only MUST
+    // collapse to the new path only — proving the fixture exercises the hole.
+    const zOut = execSync("git diff --cached --name-status -z", { cwd: repo, encoding: "utf-8" });
+    ok(zOut.includes("R100\0src/app.ts\0docs/code.md\0"), `64: -z staged diff must carry the R100 row (got ${JSON.stringify(zOut)})`);
+    const nameOnly = execSync("git diff --cached --name-only", { cwd: repo, encoding: "utf-8" }).trim();
+    equal(nameOnly, "docs/code.md", "64: name-only collapses the rename to the new path (the hole being closed)");
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    seedD1Sentinel(bridgePath);
+    await fire("session_start", {});
+    const exemptBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m rename", cwd: repo },
+    });
+    ok(res && res.block === true, "64: code→docs rename must BLOCK (RED pre-fix: name-only exempt-allow → silent ride)");
+    ok(res.reason.includes("docs/code.md"), "64: block names the new docs path (the content shipped is the moved code)");
+    equal(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length, exemptBefore,
+          "64: a rename block must NOT add a content_shape_exempt skip");
+    assertD1BridgeUntouched(bridgePath, repo, "scenario 64");
+    // Ceremony half: a real VGATE PASS on the renamed file → commit allowed.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: docs/code.md. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "docs/code.md"), hash: sha("export const a = 1;\n") }],
+      }) }],
+    });
+    await fire("session_start", {});
+    const allowed = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m rename", cwd: repo },
+    });
+    equal(allowed, undefined, "64: commit ALLOWED after VGATE PASS on the renamed file (gate ceremony works)");
+    git(repo, "commit -m rename"); // real commit — clean state for teardown
+  });
+
+  test("scenario 65 (#559 T1): docs→docs rename stays EXEMPT (exempt source) — GUARD green pre+post", async () => {
+    const repo = join(TEST_ROOT, "repo-559-65");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "config diff.renames true");
+    writeFileSync(join(repo, "base65.txt"), "b\n");
+    git(repo, "add base65.txt");
+    git(repo, "commit -m base");
+    mkdirSync(join(repo, "docs"), { recursive: true });
+    writeFileSync(join(repo, "docs/a.md"), "# docs a\n");
+    git(repo, "add docs/a.md");
+    git(repo, "commit -m docsa");
+    git(repo, "mv docs/a.md docs/b.md");
+    const zOut = execSync("git diff --cached --name-status -z", { cwd: repo, encoding: "utf-8" });
+    ok(zOut.includes("R100\0docs/a.md\0docs/b.md\0"), `65: -z staged diff must carry the R100 row (got ${JSON.stringify(zOut)})`);
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    seedD1Sentinel(bridgePath);
+    await fire("session_start", {});
+    const exemptBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m rename", cwd: repo },
+    });
+    equal(res, undefined, "65: BARE docs→docs rename commit ALLOWED (exempt source → exemption stands)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > exemptBefore,
+       "65: docs→docs rename records content_shape_exempt");
+    assertD1BridgeUntouched(bridgePath, repo, "scenario 65");
+    git(repo, "commit -m rename"); // real commit — clean state
+  });
+
+  test("scenario 66 (#559 T1): RANGE rename — source in the base tree → push BLOCKED (RED pre-fix); docs→docs range half exempt", async () => {
+    // Range-rename fixture: the rename source must EXIST IN THE COMPARED BASE
+    // TREE for an R row to fire (in-range create+mv cancels to plain A and the
+    // leg would silently pass). Commit src/app.ts, then update-ref
+    // refs/remotes/origin/main to the SOURCE sha before the mv+commit.
+    const repo = join(TEST_ROOT, "repo-559-66");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "config diff.renames true");
+    writeFileSync(join(repo, "base66.txt"), "b\n");
+    git(repo, "add base66.txt");
+    git(repo, "commit -m base");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src/app.ts"), "export const a = 1;\n");
+    git(repo, "add src/app.ts");
+    git(repo, "commit -m src");
+    const srcSha = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/main ${srcSha}`); // source now in the compared base tree
+    mkdirSync(join(repo, "docs"), { recursive: true });
+    git(repo, "mv src/app.ts docs/code.md");
+    git(repo, "commit -m rename"); // raw helper — the rename commit is un-gated setup (firing it through the hook would block at the staged arm first)
+    const zRange = execSync("git diff refs/remotes/origin/main HEAD --name-status -z", { cwd: repo, encoding: "utf-8" });
+    ok(zRange.includes("R100\0src/app.ts\0docs/code.md\0"), `66: range -z diff must carry the R100 row (got ${JSON.stringify(zRange)})`);
+    await fire("session_start", {});
+    const exemptBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main", cwd: repo },
+    });
+    ok(res && res.block === true, "66: range push of a code→docs rename must BLOCK (RED pre-fix: name-only range exempt)");
+    ok(res.reason.includes("docs/code.md"), "66: block names the range rename's new docs path");
+    equal(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length, exemptBefore,
+          "66: rename range block must NOT add content_shape_exempt");
+    // docs→docs range half: same base placement, exempt source → push allowed.
+    const repoB = join(TEST_ROOT, "repo-559-66b");
+    mkdirSync(repoB, { recursive: true });
+    git(repoB, "init -b main");
+    git(repoB, "config user.email e2e@test");
+    git(repoB, "config user.name e2e");
+    git(repoB, "config diff.renames true");
+    writeFileSync(join(repoB, "base66b.txt"), "b\n");
+    git(repoB, "add base66b.txt");
+    git(repoB, "commit -m base");
+    mkdirSync(join(repoB, "docs"), { recursive: true });
+    writeFileSync(join(repoB, "docs/a.md"), "# docs a\n");
+    git(repoB, "add docs/a.md");
+    git(repoB, "commit -m docsa");
+    const srcShaB = git(repoB, "rev-parse HEAD");
+    git(repoB, `update-ref refs/remotes/origin/main ${srcShaB}`);
+    git(repoB, "mv docs/a.md docs/b.md");
+    git(repoB, "commit -m rename");
+    await fire("session_start", {});
+    const exemptBeforeB = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const resB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin main", cwd: repoB },
+    });
+    equal(resB, undefined, "66b: docs→docs range rename push ALLOWED (exempt source → R-row exemption proof)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > exemptBeforeB,
+       "66b: docs→docs range rename records content_shape_exempt");
+  });
+
+  test("scenario 67 (#559 T1): SWEEP -am over staged code→docs rename + dirty code — BLOCKED naming both — GUARD green pre+post", async () => {
+    // Sweeps never exempt (D2 — isBareCommitShape false for -am): a code→docs
+    // mv in a sweep is blocked pre- AND post-fix. Regression guard: asserts the
+    // -z WT scope + union wiring did not regress sweep naming, AND asserts NO
+    // gate_block_parse_failure audit (a broken -z grammar would parse-block
+    // every sweep — legs 61/62 + this assert form the net). Staged-only mv:
+    // source stays in HEAD so the WT diff carries the R row automatically (no
+    // update-ref needed — that is leg 66's requirement).
+    const repo = join(TEST_ROOT, "repo-559-67");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "config diff.renames true");
+    writeFileSync(join(repo, "base67.txt"), "b\n");
+    git(repo, "add base67.txt");
+    git(repo, "commit -m base");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src/app.ts"), "export const a = 1;\n");
+    git(repo, "add src/app.ts");
+    git(repo, "commit -m src");
+    mkdirSync(join(repo, "docs"), { recursive: true });
+    git(repo, "mv src/app.ts docs/code.md"); // staged-only mv (R row fires in the WT diff)
+    writeFileSync(join(repo, "src/other.ts"), "export const b = 2;\n");
+    git(repo, "add src/other.ts");
+    writeFileSync(join(repo, "src/other.ts"), "export const b = 3;\n"); // dirty working tree (never staged-verified)
+    const parseBefore = readAuditLines().filter((l) => l.event === "gate_block_parse_failure").length;
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -am sweep", cwd: repo },
+    });
+    ok(res && res.block === true, "67: -am sweep over rename + dirty code must BLOCK (fixed verdict — sweeps never exempt)");
+    ok(res.reason.includes("docs/code.md"), "67: block names the docs rename path (WT scope -z wiring)");
+    ok(res.reason.includes("src/other.ts"), "67: block names the dirty code file");
+    equal(readAuditLines().filter((l) => l.event === "gate_block_parse_failure").length, parseBefore,
+          "67: clean -z sweep must NOT parse-block (no gate_block_parse_failure audit)");
+  });
+
+  test("scenario 68 (#559 T1): C-quote raw-path round-trip BLOCKED naming the REAL path (68a) + gh-branch rename BLOCKED (68b) — RED pre-fix", async () => {
+    // 68a: a double-quote filename is C-quoted by name-only under ANY
+    // core.quotepath (quotepath governs only ≥0x80 bytes) — pre-fix the quoted
+    // literal makes hashFile throw → catch{continue} → silent "✅ verified"
+    // allow. Post-fix -z parses raw → ordinary unverified block naming the
+    // REAL path. NOT a non-ASCII-only name: under quotepath=false it renders
+    // raw pre-fix → hashFile works → the leg would be green before the fix.
+    const repoA = join(TEST_ROOT, "repo-559-68a");
+    mkdirSync(repoA, { recursive: true });
+    git(repoA, "init -b main");
+    git(repoA, "config user.email e2e@test");
+    git(repoA, "config user.name e2e");
+    writeFileSync(join(repoA, "base68a.txt"), "b\n");
+    git(repoA, "add base68a.txt");
+    git(repoA, "commit -m base");
+    mkdirSync(join(repoA, "src"), { recursive: true });
+    writeFileSync(join(repoA, 'src/quote"name.ts'), 'export const q = 1;\n');
+    git(repoA, "add 'src/quote\"name.ts'");
+    const zA = execSync("git diff --cached --name-status -z", { cwd: repoA, encoding: "utf-8" });
+    ok(zA.includes('src/quote"name.ts'), `68a: -z staged diff must carry the RAW quoted path (got ${JSON.stringify(zA)})`);
+    await fire("session_start", {});
+    const resA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m qname", cwd: repoA },
+    });
+    ok(resA && resA.block === true, "68a: quote-named code commit must BLOCK (RED pre-fix: C-quote silent-allow)");
+    ok(resA.reason.includes('src/quote"name.ts'), `68a: block names the REAL raw path (got ${JSON.stringify(resA.reason)})`);
+
+    // 68b: gh-branch rename — branch scope merge-base is origin/main...HEAD;
+    // an in-range source is A-only so update-ref origin/main to the SOURCE sha
+    // (NOT scenario-39's pre-branch baseSha placement) so the R row fires.
+    const repoB = join(TEST_ROOT, "repo-559-68b");
+    mkdirSync(repoB, { recursive: true });
+    git(repoB, "init -b main");
+    git(repoB, "config user.email e2e@test");
+    git(repoB, "config user.name e2e");
+    git(repoB, "config diff.renames true");
+    writeFileSync(join(repoB, "base68b.txt"), "b\n");
+    git(repoB, "add base68b.txt");
+    git(repoB, "commit -m base");
+    git(repoB, "remote add origin git@github.com:e2e/self.git"); // sandbox remote (scenario 19/20 mechanics)
+    git(repoB, "checkout -b feat");
+    mkdirSync(join(repoB, "src"), { recursive: true });
+    writeFileSync(join(repoB, "src/app.ts"), "export const a = 1;\n");
+    git(repoB, "add src/app.ts");
+    git(repoB, "commit -m src");
+    const srcShaB = git(repoB, "rev-parse HEAD");
+    git(repoB, `update-ref refs/remotes/origin/main ${srcShaB}`); // source sha — R row fires in the 3-dot branch diff
+    mkdirSync(join(repoB, "docs"), { recursive: true });
+    git(repoB, "mv src/app.ts docs/code.md");
+    git(repoB, "commit -m rename"); // raw helper (un-gated setup)
+    const zBranch = execSync("git diff origin/main...HEAD --name-status -z", { cwd: repoB, encoding: "utf-8" });
+    ok(zBranch.includes("R100\0src/app.ts\0docs/code.md\0"), `68b: branch 3-dot -z diff must carry the R100 row (got ${JSON.stringify(zBranch)})`);
+    await fire("session_start", {});
+    const resB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "gh pr create --title x --body y", cwd: repoB },
+    });
+    ok(resB && resB.block === true, "68b: gh pr create over a branch code→docs rename must BLOCK (RED pre-fix: branch name-only exempt)");
+    ok(resB.reason.includes("docs/code.md"), "68b: block names the branch rename's new docs path");
   });
 } // main: plugin loaded; tests run sequentially via runAll()
 

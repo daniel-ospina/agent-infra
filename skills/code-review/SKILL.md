@@ -46,6 +46,8 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
+> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
+
 
 > **Canonical:** `agent-infra/skills/code-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
@@ -1107,6 +1109,53 @@ fi
   gate red: re-run `record-review.sh` to retry the post (the script warns and
   exits 0 on transient failures).
 - If `record-review.sh` is unavailable (repo without the gate), skip silently.
+
+### Step 10a — Micro-tier recording: verdict `clean-micro` (#513)
+
+Micro tier SKIPS this skill entirely (commit-workflow `03-code-review.md`
+Step 2) — the Step 10 auto-record above NEVER fires at micro, yet the merge
+gate demands a review record at EVERY tier (04-merge-deploy.md condition 6).
+Micro PRs therefore record the PROCESS verdict `clean-micro` via the micro
+flow. Before recording, ALL of these must hold:
+
+1. **The linked issue is `complexity:micro`.** The PR body's closing keyword
+   resolves a same-repo issue carrying the `complexity:micro` label at record
+   time. `record-review.sh` verifies this itself and REFUSES (exit 4, no
+   write) any `clean-micro` record whose linked same-repo issue is NOT micro —
+   a standard/complex issue is never recorded `clean-micro`: run THIS skill
+   and record `clean` (Step 10). Where the linked ref's complexity label
+   cannot be read (label-fetch failure, absent label, no closing ref, or
+   only cross-repo refs) record-review.sh WARNS and proceeds — tier
+   attestation UNVERIFIED at mint; do not overread this record as
+   micro-certified.
+2. **Pre-flight passed per risk tier** (01-preflight.md: typecheck/tests on
+   code-bearing micro sets; Low-risk docs/CSS/static sets exempt).
+3. **The #485 ≥1-dispatch floor was met.** Code-bearing micro sets satisfy it
+   via VGATE's own `[VGATE]` verification dispatch (naming the diff);
+   docs-only sets dispatch a lightweight reviewer naming the diff — a
+   one-line "NO ISSUES FOUND" check counts (the floor is deliberately
+   content-free).
+
+`clean-micro` certifies the MICRO PROCESS — tier verified against the linked
+issue's label, pre-flight per risk tier, the #485 dispatch floor — NOT
+multi-agent code review and NOT code quality. Record at the current head only:
+
+**One PR closes one issue.** A closing keyword in the PR body auto-closes
+that issue on merge. record-review.sh therefore refuses (exit 4) a
+`clean-micro` record whose body closes ANY same-repo issue that is not
+`complexity:micro`. If the body references an issue the PR does NOT close,
+write `Related: #N` prose instead of a closing keyword — or run THIS skill
+and record `clean` for a standard/complex-linked change.
+
+```bash
+# ~/.pi/agent/scripts/record-review.sh is not on PATH — use the explicit path.
+~/.pi/agent/scripts/record-review.sh <PR_NUMBER> <FULL_HEAD_SHA> clean-micro
+```
+
+Recorder = the micro flow (03-code-review.md Step 2). The merge ceremony must
+NOT self-certify a fresh record: if the gate blocks, run the review
+appropriate to the tier (this skill at standard/complex; the micro flow at
+micro), then record.
 
 ## Standard-Tier Review (`--standard-tier`)
 

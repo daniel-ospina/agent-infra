@@ -37,6 +37,8 @@ import extension, {
   _pendingMarkerForTests,
   _setMarkerSinkForTests,
   _setBannerSinkForTests,
+  _usageTotalsForTests,
+  _resetUsageForTests,
 } from "./provider-exhaustion.js";
 import { readLatchState, setExhausted, clearExhaustion } from "./shared/provider-failover.js";
 
@@ -105,6 +107,7 @@ const MANAGED_ENV_KEYS = [
   "PI_FAILOVER_NO_HOP",
   "TASK_EXHAUSTION_BLOCK",
   "PROVIDER_FAILOVER_BLOCKED",
+  "TASK_USAGE_CAPTURE",
 ] as const;
 
 /** Ambient values at import time (the harness may itself run inside a task
@@ -149,6 +152,7 @@ function hermetic(): {
   _setBannerSinkForTests((title, body) => banners.push({ title, body }));
   _resetPendingMarkerForTests();
   _resetLatchSeenFamiliesForTests();
+  _resetUsageForTests();
   return {
     env,
     cleanup: () => {
@@ -157,6 +161,7 @@ function hermetic(): {
       _setBannerSinkForTests((title: string, body: string) => console.error(`\n⚠️  ${title}\n    ${body}\n`));
       _resetPendingMarkerForTests();
       _resetLatchSeenFamiliesForTests();
+      _resetUsageForTests();
     },
     captured,
     banners,
@@ -352,6 +357,135 @@ test("child healthy / quoted / user-tool turns → NO marker, NO pending state",
     cleanup();
   }
 });
+
+// ── #512 per-dispatch usage capture (TASK_USAGE_CAPTURE=1, child side) ──
+
+section("#512 usage capture — child message_end accumulation → [task-usage] at shutdown");
+
+const usageMsg1 = {
+  role: "assistant",
+  stopReason: "end",
+  content: "ok",
+  model: "deepseek-v4-flash",
+  usage: { input: 1000, output: 500, cacheRead: 6000, cacheWrite: 200, cost: { total: 0.001234 } },
+};
+const usageMsg2 = {
+  role: "assistant",
+  stopReason: "end",
+  content: "more",
+  model: "deepseek-v4-flash",
+  usage: { input: 2000, output: 300, cacheRead: 9000, cacheWrite: 0, cost: { total: 0.0005 } },
+};
+
+test("opt-in capture: healthy turns accumulate; ONE [task-usage] line at shutdown with totals + nonce", async () => {
+  const { env, cleanup, captured } = hermetic();
+  applyEnv(env, { TASK_HEARTBEAT: "1", TASK_HEARTBEAT_NONCE: "usage-nonce-1", TASK_USAGE_CAPTURE: "1" });
+  try {
+    const pi = makeFakePi();
+    extension(pi as any);
+    // healthy turns with usage ride the SAME message_end path (the exhaustion
+    // classifier sees no signal — the accumulation runs before it)
+    await pi.emit("message_end", { message: usageMsg1 }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    await pi.emit("message_end", { message: usageMsg2 }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    equal(_pendingMarkerForTests(), null, "healthy turns never latch an exhaustion marker");
+    await pi.emit("session_shutdown", { reason: "quit" }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    const usageLines = captured.filter((l) => l.startsWith("[task-usage] "));
+    equal(usageLines.length, 1, "exactly one usage line");
+    const line = usageLines[0];
+    ok(line.includes("input=3000"), "input totals accumulate (1000+2000)");
+    ok(line.includes("output=800"), "output totals accumulate (500+300)");
+    ok(line.includes("cacheRead=15000"), "cacheRead totals accumulate (6000+9000)");
+    ok(line.includes("cacheWrite=200"));
+    ok(line.includes("cost=0.001734"), "cost totals accumulate (micro-dollar precision)");
+    ok(line.includes("model=deepseek-v4-flash"), "last-reported model");
+    ok(line.includes("provider=deepseek"));
+    ok(line.includes("nonce=usage-nonce-1"), "authentic nonce");
+    ok(line.endsWith("\n"));
+    for (const tok of line.trim().split(/\s+/)) {
+      ok(/^[A-Za-z0-9_\[\].:/\->+=-]+$/.test(tok), `sB1 per-token charset: ${tok}`);
+    }
+    equal(_usageTotalsForTests(), null, "accumulator reset after emission");
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
+test("capture OFF (default): no [task-usage] line, byte-identical behavior", async () => {
+  const { env, cleanup, captured } = hermetic();
+  applyEnv(env, { TASK_HEARTBEAT: "1", TASK_HEARTBEAT_NONCE: "n-u2" });
+  try {
+    const pi = makeFakePi();
+    extension(pi as any);
+    await pi.emit("message_end", { message: usageMsg1 }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    await pi.emit("session_shutdown", { reason: "quit" }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    equal(captured.filter((l) => l.startsWith("[task-usage]")).length, 0, "no usage line without the opt-in");
+    equal(_usageTotalsForTests(), null);
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
+test("round-2 P2: TASK_USAGE_CAPTURE WITHOUT a task-child identity (no TASK_HEARTBEAT/nonce) → never accumulates or emits", async () => {
+  // Code-review round-2 P2: TASK_USAGE_CAPTURE is an operator-exported shell
+  // var that reaches EVERY print/json pi process under the env (swarm-daemon
+  // workers, ad-hoc pi -p) — not just task-tool children. Only a task child
+  // has an authenticating parent reader (TASK_HEARTBEAT=1 + nonce), so a
+  // non-task child must neither accumulate nor emit [task-usage] lines.
+  const { env, cleanup, captured } = hermetic();
+  applyEnv(env, { TASK_USAGE_CAPTURE: "1" }); // NO TASK_HEARTBEAT, NO nonce
+  try {
+    const pi = makeFakePi();
+    extension(pi as any);
+    await pi.emit("message_end", { message: usageMsg1 }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    equal(_usageTotalsForTests(), null, "non-task child never accumulates");
+    await pi.emit("session_shutdown", { reason: "quit" }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    equal(captured.filter((l) => l.startsWith("[task-usage]")).length, 0, "non-task child never emits");
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
+test("provider attribution follows the CLI leg (ctx.model), NOT the bare message id — a venice cold-class child reports provider=venice (P1-1 regression pin)", async () => {
+  const { env, cleanup, captured } = hermetic();
+  applyEnv(env, { TASK_HEARTBEAT: "1", TASK_HEARTBEAT_NONCE: "usage-nonce-v", TASK_USAGE_CAPTURE: "1" });
+  try {
+    const pi = makeFakePi();
+    extension(pi as any);
+    // venice cold-class spawn: --provider venice --model deepseek-v4-flash.
+    // The message model is a BARE id — splitSessionModel's legacy default
+    // would say deepseek for it; only ctx.model knows the truth (P1-1).
+    await pi.emit("message_end", { message: usageMsg1 }, ctx("print", modelObj("venice", "deepseek-v4-flash")));
+    await pi.emit("session_shutdown", { reason: "quit" }, ctx("print", modelObj("venice", "deepseek-v4-flash")));
+    const line = captured.find((l) => l.startsWith("[task-usage] ")) as string;
+    ok(line, "usage line emitted");
+    ok(line.includes("provider=venice"), "venice leg reported, not the bare-id default");
+    ok(line.includes("model=deepseek-v4-flash"));
+    ok(!line.includes("provider=deepseek"), "deepseek never misattributed for a venice child");
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
+test("usage-less healthy turns (no usage field) never emit a usage line", async () => {
+  const { env, cleanup, captured } = hermetic();
+  applyEnv(env, { TASK_HEARTBEAT: "1", TASK_HEARTBEAT_NONCE: "n-u3", TASK_USAGE_CAPTURE: "1" });
+  try {
+    const pi = makeFakePi();
+    extension(pi as any);
+    await pi.emit("message_end", { message: healthyMsg }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    await pi.emit("session_shutdown", { reason: "quit" }, ctx("print", modelObj("deepseek", "deepseek-v4-flash")));
+    equal(captured.filter((l) => l.startsWith("[task-usage]")).length, 0, "no usage → no line");
+    equal(_usageTotalsForTests(), null);
+  } finally {
+    restoreEnv();
+    cleanup();
+  }
+});
+
 
 section("extension — interactive (tui) message_end → durable latch + hop");
 

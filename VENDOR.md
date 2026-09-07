@@ -131,3 +131,30 @@ swarm base byte-for-byte from the repo root.
   (#357 h) — the operator writes it by hand from a shell with no session id; the
   new-session unlink hazard is the documented cost, and a per-session force
   suffix would need an operator-visible id (deferred).
+- **No-board predicate re-probe cadence (#384):** the `_is_no_board` predicate's
+  efficacy against REAL consumer environments is **time-bounded** — consumer
+  shells change as pi/consumer versions bump (new env names exported, existing
+  names repurposed). Its pin = the committed consumer-env fixtures
+  (`scripts/testdata/consumer-env-tortoise.{env,names}` +
+  `consumer-env-dmeer.{env,names}`, asserted by B21) + the B27 new-signal name
+  constant (baked from the fixtures' key set; the B27 parity test asserts baked
+  set == the fixtures' `.names` inventory union **∩ the board-signal families**
+  (`_BOARD_NAMES`) — NOT the raw union (today the inventories hold 87 unique
+  names while the baked constant is empty), so a genuinely novel alias outside
+  the known families trips neither B27 nor B21; a new member of the known board
+  URL/key families in a consumer env trips CI until the constant is
+  regenerated). **Re-probe trigger:
+  re-run the Task 1 Step 6 live capture (fresh pi session inside tortoise +
+  DMeer checkouts; values redacted, names verbatim) on ANY pi version bump, ANY
+  consumer (tortoise/DMeer) version bump, or QUARTERLY — next quarterly due
+  2026-12-01 from the 2026-08-30 fixture baseline (commit 7d92312), whichever
+  comes first.** On re-probe: regenerate the
+  `.env` (redacted) + `.names` (raw) fixtures (redact-then-diff + allowlist +
+  ≥2 distinct-origin gates stay green), regenerate the B27 constant from the
+  fixtures' inventory union ∩ board-signal families, and keep
+  `scripts/check-vendor-drift.sh --manifest` exit 0. A
+  newly-exported board-family signal in a consumer env trips the parity/predicate
+  pins (B27 for board URL/key-family names regardless of value; B21 for any
+  non-empty five-family signal) and fires the human decision fork — narrowing
+  requires explicit approval
+  (S1/Q15 contingency), never a silent narrowing.

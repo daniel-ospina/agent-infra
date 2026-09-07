@@ -98,6 +98,27 @@ tests.push(test("sub-agent computes SHA-256 and returns correct hash", async () 
   equal(r.hash, EXPECTED_HASH, `hash mismatch: got ${r.hash}, expected ${EXPECTED_HASH}`);
 }));
 
+// #512: venice cold-class variant — same task through the venice leg
+// (deepseek-v4-flash served by api.venice.ai). Gated on VENICE_API_KEY AND
+// COLD_CLASS_PROVIDER=venice (operator opt-in): default-off — normal CI and
+// un-wired machines skip this case, never pass/fail. This is the ONLY e2e
+// that exercises a real venice dispatch end-to-end; the routing-ledger + gate
+// machinery around it is covered by the hermetic suites.
+tests.push(test("#512 venice cold-class: SHA-256 through the venice leg (COLD_CLASS_PROVIDER opt-in)", async () => {
+  if (!process.env.VENICE_API_KEY) throw new SkipError("no VENICE_API_KEY — venice leg not provisioned");
+  if (process.env.COLD_CLASS_PROVIDER !== "venice")
+    throw new SkipError("COLD_CLASS_PROVIDER!=venice — cold-class venice e2e is operator opt-in (#512)");
+  const prompt = `Read ${TEST_FILE}, compute SHA-256, return JSON: {"hash":"<hex>"}. ONLY the JSON.`;
+  const { stdout, code } = await spawnPi(
+    ["-p", "--provider", "venice", "--model", "deepseek-v4-flash", "--no-session", prompt],
+    { ...SKIP_ENV, VENICE_API_KEY: process.env.VENICE_API_KEY },
+  );
+  ok(code === 0 || code === null, `exit: ${code}`);
+  const r = extractJson(stdout);
+  ok(r !== null, `no JSON in: ${stdout.slice(0, 300)}`);
+  equal(r.hash, EXPECTED_HASH, `hash mismatch: got ${r.hash}, expected ${EXPECTED_HASH}`);
+}));
+
 // #176 E4: a long-running tool call with ZERO output must no longer be killed
 // at the silence threshold. Discriminating: old code byte-silence-kills the
 // sub-agent mid-sleep ("silence threshold" partial result) or zero-output

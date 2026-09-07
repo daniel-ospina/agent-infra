@@ -479,19 +479,25 @@ export function evaluateMergeGate(
     // skip flag is already forced on them (#825) and the merge-registry gate
     // stays ACTIVE (#285 P1-2b), so the line would instruct an action that
     // cannot unlock the merge. Shape-aware: the parent session must record the
-    // review instead.
+    // review instead. #513: the remediation is TWO-PATH (micro records
+    // clean-micro via the micro flow; standard/complex runs the code-review
+    // skill and records clean) — the gate has no tier read, so both paths are
+    // named statically.
     const lines = taskSubAgent
       ? [
           "✅ Review enforcement (merge registry) gate is working correctly.",
           `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
-          "   → The parent session must record the review:",
-          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+          "   → The parent session must record the review for the PR's tier:",
+          "   →   Micro issue (complexity:micro): record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
+          "   →   Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
           "   → The bypass flag does NOT unlock sub-agent merges (#285).",
         ]
       : [
           "✅ Review enforcement (merge registry) gate is working correctly.",
           `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
-          "   → Run the code-review skill, then record the verdict:",
+          "   → Micro issue (complexity:micro): complete the micro flow (pre-flight + a review dispatch naming the diff), then",
+          "   →   record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
+          "   → Standard/complex issue: run the code-review skill (Step 10 records clean on convergence), then",
           "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
           "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
         ];
@@ -501,11 +507,14 @@ export function evaluateMergeGate(
     };
   }
   if (record.verdict !== "clean" && record.verdict !== "clean-micro") {
+    // #513: two-path remediation — the record's tier is not readable from the
+    // record (only the verdict), so both paths are named statically.
     return {
       status: "block",
       reason: [
         `❌ Review record for PR #${pr} has verdict "${record.verdict}" — only "clean" or "clean-micro" unlocks a merge.`,
-        "   → Re-run the code-review skill on the current head and re-record: record-review.sh <PR> <head_sha> clean [owner/repo]",
+        "   → Micro issue (complexity:micro): re-record via the micro flow: record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
+        "   → Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
       ].join("\n"),
     };
   }
@@ -524,7 +533,7 @@ export function evaluateMergeGate(
           `❌ Could not verify head of PR #${pr} via gh (repo context: ${ctx.source}) — head verification is mandatory for sub-agent merges.`,
           "   → The sub-agent cannot complete the merge ceremony here.",
           "   → Return to the parent session: it records the review and runs the merge interactively.",
-          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+          `   →   record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo]`,
           "   → The #138 fail-open (merge without head verification) is interactive-only; sub-agent merges are fail-closed (#285).",
         ].join("\n"),
       };
@@ -532,12 +541,15 @@ export function evaluateMergeGate(
     // Fail-open with a loud warning: transient gh errors (network etc.) or an
     // unresolvable repo must never strand a cross-repo merge — blocking is
     // exactly the bug #138 fixes. Tell the user how to make it resolvable.
+    // #513: re-record at the SAME verdict the record holds (re-recording
+    // `clean` over a clean-micro record would falsely certify a multi-agent
+    // review at micro; the reverse would downgrade a real review).
     const advice =
       ctx.source === "fallback" && !ctx.repo
         ? "The repo could not be resolved (no --repo/GH_REPO/cd, and the session cwd is not a GitHub worktree). If this PR is in " +
-          "another repo, re-record with repo info — record-review.sh <PR> <head_sha> clean owner/repo — " +
+          `another repo, re-record with repo info — record-review.sh <PR> <head_sha> ${record.verdict} owner/repo — ` +
           "or pass --repo owner/repo to gh pr merge."
-        : "If this persists, re-record with repo info — record-review.sh <PR> <head_sha> clean owner/repo — " +
+        : `If this persists, re-record with repo info — record-review.sh <PR> <head_sha> ${record.verdict} owner/repo — ` +
           "or pass --repo owner/repo to gh pr merge.";
     return {
       status: "failopen",
@@ -547,12 +559,15 @@ export function evaluateMergeGate(
     };
   }
   if (record.head_sha !== currentHead) {
+    // #513: re-record at the SAME verdict the record holds (a micro PR's
+    // re-record is clean-micro via the micro flow; a standard/complex PR's is
+    // clean via the code-review skill) — never a hardcoded `clean`.
     return {
       status: "block",
       reason: [
         `❌ PR #${pr} head has advanced since the review was recorded.`,
         `   Recorded: ${record.head_sha.slice(0, 12)}   Current: ${currentHead.slice(0, 12)}`,
-        "   → The branch moved — re-review the new head and re-record: record-review.sh <PR> <head_sha> clean [owner/repo]",
+        `   → The branch moved — re-review the new head and re-record at the same verdict: record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo]`,
       ].join("\n"),
     };
   }
@@ -560,7 +575,7 @@ export function evaluateMergeGate(
     status: "allow",
     message:
       `[review-enforcer] ✅ Merge registry gate passed for PR #${pr} ` +
-      `(clean review, head ${currentHead.slice(0, 12)} matches) — allowing merge`,
+      `(${record.verdict} review, head ${currentHead.slice(0, 12)} matches) — allowing merge`,
   };
 }
 
@@ -599,12 +614,22 @@ export function logMergeGateDecision(
   record: ReviewRecord | null,
   file?: string
 ): void {
+  // #513: carry the recorded verdict on pass AND block entries (null-safe —
+  // the record is null on the unattributable-cd path) so the audit trail can
+  // reconstruct WHICH verdict unlocked WHICH merge: merge_gate_pass {pr,
+  // verdict} + the record's reviewed_at is the only joinable dispatch→merge
+  // trail (review_dispatch events carry no PR identity).
+  const verdict = record ? { verdict: record.verdict } : {};
   if (result.status === "block") {
-    logGateEvent("merge_gate_block", { pr, reason: mergeGateBlockReason(record) }, file);
+    logGateEvent(
+      "merge_gate_block",
+      { pr, ...verdict, reason: mergeGateBlockReason(record) },
+      file
+    );
   } else {
     logGateEvent(
       "merge_gate_pass",
-      { pr, ...(result.status === "failopen" ? { reason: "failopen" } : {}) },
+      { pr, ...verdict, ...(result.status === "failopen" ? { reason: "failopen" } : {}) },
       file
     );
   }

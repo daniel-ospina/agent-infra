@@ -19,7 +19,7 @@
  * Run: npx tsx extensions/subagent/provider-fallback.test.ts
  */
 
-import ext from "./index.js";
+import ext, { qualifyBareModel } from "./index.js";
 import { ok, equal } from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -28,6 +28,48 @@ import * as path from "node:path";
 let passed = 0;
 let failed = 0;
 const tests: Array<() => Promise<void>> = [];
+
+// #512 P1-B regression suite — provider qualification of bare agent models
+// (the ambiguity class that hard-errors at child startup once a second
+// authenticated provider hosts the id — e.g. deepseek + venice).
+
+function makeRegistry(models: Record<string, string[]>): {
+	providers: Record<string, { models: Array<{ id: string }> }>;
+} {
+	const providers: Record<string, { models: Array<{ id: string }> }> = {};
+	for (const [name, ids] of Object.entries(models)) {
+		providers[name] = { models: ids.map((id) => ({ id })) };
+	}
+	return { providers };
+}
+
+const VENICE_DS_REGISTRY = makeRegistry({ deepseek: ["deepseek-v4-flash", "deepseek-v4-pro"], venice: ["deepseek-v4-flash"] });
+
+section("qualifyBareModel — #512 provider qualification (#154 rules)");
+
+test("two-provider registry (deepseek + venice): bare deepseek-v4-flash → provider deepseek (family-prefix winner)", async () => {
+	const q = qualifyBareModel("deepseek-v4-flash", VENICE_DS_REGISTRY);
+	equal(q.model, "deepseek-v4-flash");
+	equal(q.provider, "deepseek", "the #154 family-prefix winner keeps the default on deepseek");
+});
+
+test("venice-only registry: bare deepseek-v4-flash → provider venice", async () => {
+	const q = qualifyBareModel("deepseek-v4-flash", makeRegistry({ venice: ["deepseek-v4-flash"] }));
+	equal(q.provider, "venice");
+});
+
+test("already-qualified provider/model never double-split", async () => {
+	const q = qualifyBareModel("venice/deepseek-v4-flash", VENICE_DS_REGISTRY);
+	equal(q.model, "venice/deepseek-v4-flash");
+	equal(q.provider, undefined, "slash ids pass through unchanged");
+});
+
+test("unknown + empty + undefined models spawn byte-identically (no --provider)", async () => {
+	equal(qualifyBareModel("not-a-real-model", VENICE_DS_REGISTRY).provider, undefined);
+	equal(qualifyBareModel("", VENICE_DS_REGISTRY).provider, undefined);
+	equal(qualifyBareModel(undefined, VENICE_DS_REGISTRY).provider, undefined);
+	equal(qualifyBareModel("pinned-primary-model", VENICE_DS_REGISTRY).provider, undefined, "unresolvable → legacy spawn");
+});
 
 function test(name: string, fn: () => Promise<void>) {
 	tests.push(async () => {
@@ -62,12 +104,15 @@ const mode = process.env.SUBAGENT_STUB_MODE || "exhaustion";
 const attempt = process.env.SUBAGENT_ATTEMPT || "0";
 const argv = process.argv.slice(2);
 const modelIdx = argv.indexOf("--model");
+const providerIdx = argv.indexOf("--provider");
 const taskArg = argv.find((a) => typeof a === "string" && a.startsWith("Task: ")) || "";
 if (logPath) {
   try {
     fs.appendFileSync(logPath, JSON.stringify({ attempt, task: taskArg,
       modelFlags: argv.filter((a) => a === "--model").length,
-      model: modelIdx >= 0 ? argv[modelIdx + 1] : null }) + "\\n");
+      model: modelIdx >= 0 ? argv[modelIdx + 1] : null,
+      providerFlags: argv.filter((a) => a === "--provider").length,
+      provider: providerIdx >= 0 ? argv[providerIdx + 1] : null }) + "\\n");
   } catch {}
 }
 const writeEvent = (msg) => { fs.writeSync(1, JSON.stringify({ type: "message_end", message: msg }) + "\\n"); };
@@ -154,7 +199,7 @@ function runTool(params: any, opts: { signal?: AbortSignal; cwd: string; mode?: 
 	});
 }
 
-function readSpawnLog(logPath: string): Array<{ attempt: string; task: string; modelFlags: number; model: string | null }> {
+function readSpawnLog(logPath: string): Array<{ attempt: string; task: string; modelFlags: number; model: string | null; providerFlags: number; provider: string | null }> {
 	try {
 		return fs
 			.readFileSync(logPath, "utf-8")
@@ -220,7 +265,72 @@ const singleParams = (cwd: string, task: string, agent = "test-agent") => ({
  * dirs from the shared ~/.pi/agent/task-results tree. */
 const PFX = "pfbt-";
 
-// ── Tests ─────────────────────────────────────────────
+// ── #512 P1-B spawn-shape tests ─────────────────────────────
+// A bare-model agent must spawn with an explicit --provider (pi's own child
+// resolver hard-errors on ambiguity once TWO authenticated providers host the
+// id). The parent-side registry is controlled via PI_CODING_AGENT_DIR.
+
+function withRegistry(models: Record<string, string[]>, fn: () => Promise<void>): Promise<void> {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-registry-"));
+	fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify({ providers: {} }));
+	const providers: Record<string, { models: Array<{ id: string }> }> = {};
+	for (const [name, ids] of Object.entries(models)) providers[name] = { models: ids.map((id) => ({ id })) };
+	fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify({ providers }));
+	const prev = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = dir;
+	return fn().finally(() => {
+		if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = prev;
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+}
+
+section("#512 P1-B — provider qualification at spawn (two-provider registry)");
+
+test("bare-model agent under deepseek+venice registry → attempt-0 spawns --provider deepseek --model deepseek-v4-flash", async () => {
+	const cwd = makeProjectCwd([{ name: "test-agent", model: "deepseek-v4-flash" }]);
+	const logPath = path.join(tmpRoot, `log-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+	await withRegistry({ deepseek: ["deepseek-v4-flash"], venice: ["deepseek-v4-flash"] }, async () => {
+		const resp = await runTool(singleParams(cwd, `pfbt-qual-${Date.now()}`), { cwd, logPath, mode: "always-success" });
+		ok(!resp.isError, `qualified dispatch must not error: ${resp.content?.[0]?.text}`);
+	});
+	const lines = readSpawnLog(logPath);
+	equal(lines.length, 1, "success → exactly one spawn");
+	equal(lines[0].attempt, "0");
+	equal(lines[0].modelFlags, 1, "exactly one --model flag");
+	equal(lines[0].model, "deepseek-v4-flash");
+	equal(lines[0].providerFlags, 1, "--provider IS passed for the bare id");
+	equal(lines[0].provider, "deepseek", "#154 family-prefix winner keeps the default on deepseek");
+});
+
+test("fallback attempt-1 stays byte-identical (bare fallback model, NO --provider — amendment-3 P2)", async () => {
+	const cwd = makeProjectCwd([{ name: "test-agent", model: "deepseek-v4-flash" }]);
+	const logPath = path.join(tmpRoot, `log-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+	await withRegistry({ deepseek: ["deepseek-v4-flash", "deepseek-v4-pro"], venice: ["deepseek-v4-flash"] }, async () => {
+		// default stub mode: attempt-0 fails with exhaustion → fallback fires
+		const resp = await runTool(singleParams(cwd, `pfbt-qual-fb-${Date.now()}`), { cwd, logPath });
+		ok(!resp.isError, `recovered dispatch must not error: ${resp.content?.[0]?.text}`);
+	});
+	const lines = readSpawnLog(logPath);
+	equal(lines.length, 2, "2 attempts (exhaustion → fallback)");
+	equal(lines[0].provider, "deepseek", "attempt-0 qualified");
+	equal(lines[1].attempt, "1");
+	equal(lines[1].model, FALLBACK_MODEL, "fallback model on attempt-1");
+	equal(lines[1].providerFlags, 0, "fallback spawn unchanged (no --provider) — byte-identical #496 path");
+	equal(lines[1].provider, null);
+});
+
+test("model-less agent spawns unchanged (no --model, no --provider)", async () => {
+	const cwd = makeProjectCwd([{ name: "test-agent" }]);
+	const logPath = path.join(tmpRoot, `log-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+	await withRegistry({ deepseek: ["deepseek-v4-flash"], venice: ["deepseek-v4-flash"] }, async () => {
+		const resp = await runTool(singleParams(cwd, `pfbt-qual-none-${Date.now()}`), { cwd, logPath, mode: "always-success" });
+		ok(!resp.isError, `dispatch must not error: ${resp.content?.[0]?.text}`);
+	});
+	const lines = readSpawnLog(logPath);
+	equal(lines[0].model, null, "no model pinned");
+	equal(lines[0].providerFlags, 0, "no --provider for a model-less agent");
+});
 
 section("#496 — single-mode provider-failure recovery");
 
