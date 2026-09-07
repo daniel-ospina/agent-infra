@@ -374,7 +374,13 @@ staged files → the staged set; auto-sweep forms (`-a`/`--all`, #489) → the t
 working tree (`git diff HEAD` — the sweep records the working tree, not just the
 index); WT-path forms (`git commit <pathspec>`, `-o`/`--only`, `-i`/`--include`,
 #538) → staged set UNION the named paths' working-tree state (these forms record
-the NAMED files' disk content, not the staged index). For `-a`/pathspec/`-o`/`-i`
+the NAMED files' disk content, not the staged index). Wrapper/negation/quoted-env
+spellings of these forms classify identically to the bare command (#539): `sh -c
+'git commit -am x'`, `bash -c …`, `! git commit -am x`, `eval "git commit -am x"`,
+and quoted multi-word env prefixes (`FOO="bar baz" git commit -am x`) execute the
+same sweep and get the same working-tree scope; prose that merely mentions a git
+command (`gh pr create --body "…"`, `echo …`, a commit message) never reroutes.
+For `-a`/pathspec/`-o`/`-i`
 blocks, `verify files:` may name dirty tracked files that were never staged —
 verify them from disk; the disk hash is exactly what the commit records.
 **Rename-source rule (closed #559):** a rename/copy row's exemption is decided on

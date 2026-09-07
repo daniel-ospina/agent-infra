@@ -3479,6 +3479,148 @@ async function main() {
     equal(execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim(), "",
        "Leg E: real -i include commit — porcelain clean");
   });
+
+  test("scenario 71 (#539): wrapper/negation/quoted-env-hidden -a/--all sweeps classify as sweeps — WT diff scope (residual closure)", async () => {
+    // The #539 residual: commitSweepClass (#489) only classified HEAD-ANCHORED commit
+    // invocations, so the wrapper/negation/quoted-env families — `sh -c 'git commit -am
+    // x'`, `bash -c …`, `! git commit -am x`, `eval "git commit -am x"`,
+    // `FOO="bar baz" git commit -am x` — hid the executed `-a` sweep at index > 0 →
+    // "none" → STAGED scope. With staged docs verified + dirty code the wrapper
+    // executes and the sweep ships never-verified code (identical symptom to #489;
+    // empirically confirmed: each family commits the dirty content). Post-fix the
+    // executed sweeps classify "sweep" → `git diff HEAD` scope → dirty code is
+    // VGATE-required. Wrapper BARE commits stay index-scoped (no over-gate); prose
+    // mentioning git commit never reroutes.
+    const repo = join(TEST_ROOT, "repo-539-71");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "r1\n");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "app.ts"), "a1\n");
+    git(repo, "add README.md src/app.ts");
+    git(repo, "commit -m base");
+    // Session layout mirrors scenario 48: session_start before every leg (clears
+    // verifiedSet + #7591 counters — each leg's fresh content keeps blocks
+    // deterministic, no bridge re-blessing). NO session_start between Leg A's code
+    // PASS and its allow (registration must survive verifiedSet.clear()). Every
+    // block-expecting leg edits its files to NEVER-registered content first.
+    await fire("session_start", {});
+    // Leg A — sh -c wrapper sweep, full cycle (mirrors scenario 48 Legs A–C).
+    writeFileSync(join(repo, "README.md"), "r2\n");
+    git(repo, "add README.md");
+    writeFileSync(join(repo, "src", "app.ts"), "a2\n"); // dirty — NOT staged
+    const legA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "sh -c 'git commit -am \"x\"'", cwd: repo },
+    });
+    ok(legA && legA.block === true, "Leg A: sh -c -am over staged docs + dirty code must block");
+    ok(/Unverified files[\s\S]*README\.md/.test(legA.reason), "Leg A: the staged docs read as UNVERIFIED (WT scope — never PASSed in this fresh root)");
+    ok(/Unverified files[\s\S]*src\/app\.ts/.test(legA.reason), "Leg A: the wrapper-swept dirty code file is VGATE-required — block names src/app.ts (pre-fix: staged scope named only README.md)");
+    ok(!/Hash mismatch/.test(legA.reason), "Leg A: no hash-mismatch section (both files UNVERIFIED — deterministic for a fresh repo root)");
+    // Leg A2 — hole closer (red pre-fix): a docs-only PASS must NOT unlock the sh -c sweep.
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: README.md. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "README.md"), hash: sha("r2\n") }],
+      }) }],
+    });
+    const legA2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "sh -c 'git commit -am \"x\"'", cwd: repo },
+    });
+    ok(legA2 && legA2.block === true, "Leg A2: docs-only PASS must NOT unlock the sh -c sweep — code still blocks (pre-fix: ALLOWED → dirty code ships unverified)");
+    ok(legA2.reason.includes("src/app.ts"), "Leg A2: block names the swept dirty code file (VGATE-required)");
+    ok(!legA2.reason.includes("README.md"), "Leg A2: the verified docs file is NOT re-blocked — the docs PASS is honored");
+    ok(!/Hash mismatch/.test(legA2.reason), "Leg A2: no hash-mismatch section (deterministic)");
+    // Leg A3 — code PASS → allow → the real wrapper executes and sweeps BOTH.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/app.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "src/app.ts"), hash: sha("a2\n") }],
+      }) }],
+    });
+    const legA3 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "sh -c 'git commit -am \"x\"'", cwd: repo },
+    });
+    equal(legA3, undefined, "Leg A3: sh -c sweep ALLOWED after both files verified");
+    git(repo, "commit -am x"); // execute the allowed wrapper sweep for real (sh -c ≡ git commit -am here)
+    const aCommit = execSync("git diff HEAD^ --name-only", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    ok(aCommit.includes("README.md") && aCommit.includes("src/app.ts"),
+       "Leg A3: the allowed wrapper sweep committed BOTH the staged docs and the dirty code (correct — both verified)");
+    equal(execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim(), "",
+       "Leg A3: real wrapper sweep committed both files — porcelain clean");
+    // Legs B–E — per-family discriminator: docs-only PASS must NOT unlock the sweep
+    // for bash -lc / ! negation / eval / quoted-env — each blocks naming the code.
+    async function wrapperSweepStillBlocks(label: string, command: string, readmeBody: string, codeBody: string): Promise<void> {
+      await fire("session_start", {});
+      writeFileSync(join(repo, "README.md"), readmeBody);
+      git(repo, "add README.md");
+      writeFileSync(join(repo, "src", "app.ts"), codeBody); // dirty — NOT staged
+      await fire("tool_result", {
+        toolName: "task",
+        input: { prompt: `[VGATE] verify files: README.md. Classification: backend. Project root: ${repo}` },
+        content: [{ type: "text", text: JSON.stringify({
+          status: "PASS", failures: [],
+          verified_files: [{ path: join(repo, "README.md"), hash: sha(readmeBody) }],
+        }) }],
+      });
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command, cwd: repo },
+      });
+      ok(res && res.block === true, `${label}: docs-only PASS must NOT unlock the wrapper sweep — block (pre-fix: ALLOWED → dirty code ships unverified)`);
+      ok(res.reason.includes("src/app.ts"), `${label}: block names the swept dirty code file (VGATE-required)`);
+      ok(!res.reason.includes("README.md"), `${label}: the verified docs file is NOT re-blocked — the docs PASS is honored`);
+      ok(!/Hash mismatch/.test(res.reason), `${label}: no hash-mismatch section (deterministic)`);
+    }
+    await wrapperSweepStillBlocks("Leg B (bash -lc)", "bash -lc 'git commit -am \"x\"'", "r3\n", "a3\n");
+    await wrapperSweepStillBlocks("Leg C (! negation)", "! git commit -am x", "r4\n", "a4\n");
+    await wrapperSweepStillBlocks("Leg D (eval)", 'eval "git commit -am x"', "r5\n", "a5\n");
+    await wrapperSweepStillBlocks("Leg E (quoted env)", 'FOO="bar baz" git commit -am x', "r6\n", "a6\n");
+    // Leg F — wrapper BARE commit stays INDEX-scoped (regression guard): the dirty
+    // code file must NOT enter scope — docs PASS alone allows the wrapper bare commit.
+    await fire("session_start", {});
+    writeFileSync(join(repo, "README.md"), "r7\n");
+    git(repo, "add README.md");
+    writeFileSync(join(repo, "src", "app.ts"), "a7\n"); // dirty — NOT staged
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: README.md. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "README.md"), hash: sha("r7\n") }],
+      }) }],
+    });
+    const legF = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "sh -c 'git commit -m x'", cwd: repo },
+    });
+    equal(legF, undefined, "Leg F: wrapper BARE commit over verified staged docs is ALLOWED — stays index-scoped (dirty code never enters scope)");
+    git(repo, "commit -m x"); // execute the allowed wrapper bare commit for real
+    equal(execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 }), " M src/app.ts\n",
+       "Leg F: wrapper bare commit recorded README.md only — raw porcelain exactly ' M src/app.ts' (dirty code untouched — index scope, no over-gate)");
+    // Leg G — prose in the commit MESSAGE mentioning a sweep never reroutes (regression
+    // guard: the message value is consumed; the bare docs commit stays shape-exempt).
+    await fire("session_start", {});
+    writeFileSync(join(repo, "README.md"), "r8\n");
+    git(repo, "add README.md");
+    const skipBeforeG = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const legG = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: 'git commit -m "run git commit -am x"', cwd: repo },
+    });
+    equal(legG, undefined, "Leg G: commit whose MESSAGE mentions 'git commit -am' stays exempt (message consumed — never a sweep reroute)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBeforeG,
+       "Leg G: prose-message bare docs commit audited content_shape_exempt");
+  });
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()
