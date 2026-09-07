@@ -342,9 +342,14 @@ HEAD-vs-working-tree file set (`git diff HEAD --name-only` — exactly what the
 sweep records) instead of the staged diff; a mixed command (sweep + bare commit in
 one op, including a sweep preceded by a wrapper/negated commit such as
 `sh -c 'git commit -m y' && git commit -am x`) verifies the union of staged +
-working-tree files. ⚠️ Global-option spellings (`git -C repo commit --all`,
-`git --no-pager commit …`) are NOT yet intercepted by the hook at all — always
-invoke `git commit` directly in the repo root so VGATE fires (open #490). The verification prompt
+working-tree files. ⚠️ Repo-redirecting global spellings (`git -C repo commit
+--all`, `git --git-dir=… commit …`, `git --work-tree=… commit …`) target ANOTHER
+checkout — VGATE deliberately does not intercept them (verifying a foreign
+checkout's files from this root is wrong; the fixer-loop ceremony spellings rely
+on it). Cwd-neutral globals (`-c key=val`, `--no-pager`, env redirects) ARE
+intercepted — the shared scanner fires for `git --no-pager commit`, `git -c
+commit.gpgsign=false commit`, etc. (closed #490). Always invoke `git commit`
+directly in the repo root so VGATE fires with the right scope. The verification prompt
 for a sweep therefore lists WORKING-TREE files — `[VGATE] verify files: <dirty
 code>. Classification: …` — even when only docs are staged: a docs-only PASS must
 not unlock a sweep that would ship dirty, never-verified code. Bare/pathspec/
@@ -363,6 +368,14 @@ content_shape_exempt`). Code-bearing or mixed sets are NEVER exempt; among
 `git commit` invocations only the bare form qualifies — `-a`/`--all`/`--amend`/
 pathspec anywhere in the op re-gates the whole command (push / `gh pr create`/
 merge ops with no commit invocation qualify on file shape alone).
+**Rename-source rule (closed #559):** a rename/copy row's exemption is decided on
+BOTH paths — the new path's shape AND the OLD path's shape (the gate is forced ON
+when the rename SOURCE is code: `git mv src/app.ts docs/code.md` BLOCKS even
+though the new path is docs-shaped — content-shape exemption never lets a rename
+smuggle code into an exempt-typed name). A docs→docs rename (exempt source) stays
+exempt. Exemption requires the whole file set (new paths AND rename old paths) to
+be docs/CSS/static; the old-path list exists only for that decision — VGATE
+verifies (and hashes) new paths on disk only.
 
 <!-- VGATE-SHAPE-RULE: machine-read by extensions/verification-gate/index.test.ts drift test — keep in sync with SHAPE_EXEMPT_EXTENSIONS + BUILD_OUTPUT_SEGMENTS in extensions/verification-gate/index.ts -->
 | Exempt extension | Build-output path segments (any depth — NOT exempt) |
