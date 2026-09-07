@@ -368,6 +368,15 @@ content_shape_exempt`). Code-bearing or mixed sets are NEVER exempt; among
 `git commit` invocations only the bare form qualifies — `-a`/`--all`/`--amend`/
 pathspec anywhere in the op re-gates the whole command (push / `gh pr create`/
 merge ops with no commit invocation qualify on file shape alone).
+
+**Diff scope mirrors what the commit actually records:** bare `git commit` over
+staged files → the staged set; auto-sweep forms (`-a`/`--all`, #489) → the tracked
+working tree (`git diff HEAD` — the sweep records the working tree, not just the
+index); WT-path forms (`git commit <pathspec>`, `-o`/`--only`, `-i`/`--include`,
+#538) → staged set UNION the named paths' working-tree state (these forms record
+the NAMED files' disk content, not the staged index). For `-a`/pathspec/`-o`/`-i`
+blocks, `verify files:` may name dirty tracked files that were never staged —
+verify them from disk; the disk hash is exactly what the commit records.
 **Rename-source rule (closed #559):** a rename/copy row's exemption is decided on
 BOTH paths — the new path's shape AND the OLD path's shape (the gate is forced ON
 when the rename SOURCE is code: `git mv src/app.ts docs/code.md` BLOCKS even
