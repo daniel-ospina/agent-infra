@@ -54,6 +54,7 @@ import {
   markLegBlocked,
   resolveWithChain,
   nextLegAfter,
+  familyLegs,
   rootPrimaryOfFamily,
   noHop,
   blockOnExhaustion,
@@ -61,6 +62,9 @@ import {
   failoverDisabled,
   isLatched,
   latchTtlMs,
+  blockedProviders,
+  legIsFamilyMember,
+  appendLedger,
   scanStderrForExhaustion,
 } from "../shared/provider-failover.js";
 import type {
@@ -190,7 +194,10 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 // first provider in registry order.
 
 export interface ModelRegistry {
-  providers?: Record<string, { baseUrl?: string; models?: Array<{ id: string }> }>;
+  providers?: Record<
+    string,
+    { baseUrl?: string; apiKey?: string; models?: Array<{ id: string }> }
+  >;
 }
 
 export interface ProviderModelResolution {
@@ -677,6 +684,186 @@ export function resolveDispatchLeg(
   return { leg: requested, halted: false, hop: null, family };
 }
 
+// ── #512 cold-class alternate-leg gate (kill switch #2, code over text) ──
+//
+// The cold-class seam dispatches explicit `venice/deepseek-v4-flash` requests
+// through this task-tool execute path. Before that dispatch spawns a child,
+// the requested OFF-TABLE provider must be able to serve — two gates resolve
+// to the DEFAULT (deepseek official) leg instead of spawning a doomed venice
+// child (amendment-1 P1-1 + amendment-3 P2):
+//   (a) MISSING KEY: the provider's models.json apiKey env ref
+//       ($VENICE_API_KEY) is absent from the dispatch env — the seam is set
+//       but no key exists;
+//   (b) AUTH-BLOCKED: the provider holds a DURABLE auth block (a venice 401
+//       observed by a prior dispatch → markLegBlocked) or is on the
+//       PROVIDER_FAILOVER_BLOCKED env list — a canceled/blocked account.
+//
+// Membership-keyed (amendment-3 P2): the gates fire ONLY for OFF-TABLE asks
+// — a requested provider NOT in its family's chain table (venice) or a
+// family-less ask whose models.json row DECLARES an apiKey ref. Family chain
+// legs (qwen-tp/openrouter — even blocked ones) and the family root keep the
+// #476 semantics byte-for-byte (openrouter declares no models.json apiKey
+// row, so a family-less openrouter ask is never gated). When gated, the
+// dispatch resolves to the model's bare-id default (#154 rules —
+// deepseek-v4-flash → deepseek official), byte-identical to an unseamed
+// default dispatch. Pure over (state, registry); env-scoped for tests.
+
+export interface AlternateGateResult {
+  gated: boolean;
+  gate?: "missing-key" | "auth-blocked";
+  /** The leg to dispatch — the requested leg when ungated, the default leg
+   * when gated. */
+  leg: LegRef;
+}
+
+/** The apiKey env var a provider row references ("$VENICE_API_KEY" →
+ * "VENICE_API_KEY"), or undefined when the row declares none. */
+export function providerApiKeyEnvRef(
+  provider: string | undefined,
+  registry: ModelRegistry = loadModelRegistry(),
+): string | undefined {
+  const raw = provider ? registry.providers?.[provider]?.apiKey : undefined;
+  if (typeof raw !== "string" || !raw.trim()) return undefined;
+  const trimmed = raw.trim();
+  return trimmed.startsWith("$") ? trimmed.slice(1) : trimmed;
+}
+
+/** Durable auth-block freshness check (mirrors blockedLegSet's read-side TTL
+ * bound — a stale block stopped excluding and must not gate). */
+export function hasFreshDurableBlock(
+  provider: string,
+  state: LatchState,
+  opts: { env?: Record<string, string | undefined>; now?: number } = {},
+): boolean {
+  const env = opts.env ?? process.env;
+  const now = opts.now ?? Date.now();
+  const ttl = latchTtlMs(env);
+  const rec = state.blockedLegs?.[provider];
+  if (!rec || typeof rec.at !== "string") return false;
+  const at = Date.parse(rec.at);
+  return Number.isFinite(at) && now - at <= ttl;
+}
+
+export function gateOffTableRequest(
+  requested: LegRef,
+  state: LatchState,
+  opts: { env?: Record<string, string | undefined>; registry?: ModelRegistry; now?: number } = {},
+): AlternateGateResult {
+  const env = opts.env ?? process.env;
+  const now = opts.now ?? Date.now();
+  const family = familyOf(requested.model, requested.provider);
+  // Family chain legs + the family root: #476 semantics, never gated.
+  if (family !== undefined && legIsFamilyMember(family, requested.provider)) {
+    return { gated: false, leg: requested };
+  }
+  // The gate is membership-keyed to OFF-TABLE asks whose provider row
+  // declares an apiKey env ref (venice). Providers WITHOUT a declared key
+  // (openrouter's modelOverrides-only row, pi-native anthropic) pass through
+  // UNCONDITIONALLY — env-blocked or not, the pre-#512 baseline had no
+  // consultation for key-less family-less asks, and byte parity for every
+  // non-seam surface is the contract (P2-1/P2-2).
+  const keyEnv = providerApiKeyEnvRef(requested.provider, opts.registry ?? loadModelRegistry());
+  if (keyEnv === undefined) {
+    return { gated: false, leg: requested };
+  }
+  const envListed = blockedProviders(env).includes(requested.provider);
+  const durableBlocked = hasFreshDurableBlock(requested.provider, state, { env, now });
+  const blocked = envListed || durableBlocked;
+  const keyMissing = !env[keyEnv];
+  if (blocked || keyMissing) {
+    // Resolve the default leg: re-resolve the BARE model id (#154 rules —
+    // bare deepseek-v4-flash wins provider=deepseek by family prefix even
+    // with venice registered). Unresolvable bare ids keep the legacy
+    // claude→anthropic / else→deepseek default.
+    const bare = resolveProviderModel(requested.model, opts.registry ?? loadModelRegistry());
+    const defaultProvider =
+      bare.provider ?? (requested.model.startsWith("claude") ? "anthropic" : "deepseek");
+    const defaultLeg = { provider: defaultProvider, model: bare.model || requested.model };
+    if (defaultLeg.provider === requested.provider && defaultLeg.model === requested.model) {
+      // No alternative host: the bare id resolves back to the SAME provider
+      // (e.g. a venice-exclusive / qwen-exclusive family-less id). Gating to
+      // the "default" leg is a no-op with a misleading log — return ungated
+      // and let the pre-#512 resolution path behave byte-identically (the
+      // doomed-spawn case is operator-owned, not a reroute this gate can
+      // fix). P2-2.
+      return { gated: false, leg: requested };
+    }
+    return {
+      gated: true,
+      gate: blocked ? "auth-blocked" : "missing-key",
+      leg: defaultLeg,
+    };
+  }
+  return { gated: false, leg: requested };
+}
+
+/** #512 cold-class gate ELIGIBILITY (execute-path wiring decision). Mirrors
+ * gateOffTableRequest's membership early-return contract exactly: only
+ * OFF-TABLE asks (NOT a chain leg member of their own alias family) whose
+ * provider row declares a models.json apiKey env ref (venice) can gate.
+ * Chain legs, the family root, and key-less providers (openrouter) are never
+ * eligible → the execute path skips the latch read for them (lazy-read
+ * parity). NOTE: alias families are keyed by MODEL id (provider-agnostic) —
+ * venice/deepseek-v4-flash IS family-defined ("deepseek-v4-flash") yet
+ * venice is NOT a member leg, so eligibility is membership-tested, never
+ * family-lessness-tested (round-2 P1-1). Reroute-impossibility guard
+ * (round-4 P2): a family-less ask whose bare-id default resolves to the SAME
+ * provider (qwen3.8-max→qwen-tp, kimi-k3→moonshot, unresolvable ids falling
+ * back to deepseek) can never gate (gateOffTableRequest's exclusive-host
+ * no-op), so eligibility excludes it and the latch stays unread — restoring
+ * the pre-#512 lazy-read parity for every family-less dispatch. Exported for
+ * wiring pins. */
+export function altGateEligible(requested: LegRef, opts: { registry?: ModelRegistry } = {}): boolean {
+  const family = familyOf(requested.model, requested.provider);
+  if (family !== undefined && legIsFamilyMember(family, requested.provider)) return false;
+  const registry = opts.registry ?? loadModelRegistry();
+  if (providerApiKeyEnvRef(requested.provider, registry) === undefined) return false;
+  // Can gating ever reroute? The gate's default leg is the model's bare-id
+  // default (#154). When that default is the requested provider itself, the
+  // gated outcome would be a no-op — skip the latch read entirely (only
+  // asks whose default DIFFERS, e.g. venice/deepseek-v4-flash → deepseek
+  // official, read it).
+  const bare = resolveProviderModel(requested.model, registry);
+  const defaultProvider =
+    bare.provider ?? (requested.model.startsWith("claude") ? "anthropic" : "deepseek");
+  return defaultProvider !== requested.provider;
+}
+
+/** #512: append the venice-route audit row for a REAL cold-class venice
+ * dispatch (audit/provider-failover.jsonl; event=venice-route). Extracted
+ * from the execute path so the append site is directly pinnable (round-4
+ * P2). Audit-only — never throws (appendLedger).
+ *
+ * dispatchId (round-1 P2): the per-dispatch TASK_HEARTBEAT_NONCE hex — the
+ * SAME id the child usage rows carry (each spawn appends its own
+ * event=dispatch-usage row with the reused nonce), so venice-route and
+ * dispatch-usage rows are joinable per dispatch for the 0a burn window.
+ * Null only when the CALLER supplies none (direct/legacy call sites); the
+ * task-tool execute path always sets it BEFORE the append (round-2 P2-1:
+ * unconditional — a task child always runs a heartbeat nonce, so the route
+ * row shares it in every config, PROVIDER_FAILOVER_DISABLE included). */
+export function recordVeniceRoute(
+  dispatchLeg: LegRef,
+  family: string | null,
+  hop: string | null,
+  env: Record<string, string | undefined> = process.env,
+  dispatchId: string | null = null,
+): void {
+  appendLedger(
+    {
+      kind: "venice-route",
+      family,
+      model: dispatchLeg.model,
+      provider: dispatchLeg.provider,
+      class: "cold",
+      hop,
+      ...(dispatchId ? { dispatchId } : {}),
+    },
+    "venice-route",
+    env,
+  );
+}
+
 // ── In-process per-leg circuit breaker (markerless connection-error storms) ──
 // Module-level map: provider/model -> consecutive connection-error count.
 // A leg with >= 2 strikes inside 60s is excluded from hop candidates by
@@ -922,6 +1109,53 @@ export function decidePostDispatch(input: PostDispatchInput): PostDispatchDecisi
         },
       };
     }
+    // #512 off-table discriminator on the MARKERLESS path (round-1 P2): a
+    // connection-error on an OFF-TABLE dispatched leg (venice — the cold-class
+    // seam) is NOT a chain-hop event. Venice is not a member of the family's
+    // chain table; a transport error on it is its OWN availability problem,
+    // not evidence about the deepseek family's legs. The chain-walk below
+    // would re-dispatch cold traffic onto the family chain and — under a
+    // FRESH deepseek root latch — land on OPENROUTER (real-cost) on evidence
+    // about nothing but a venice transport error. Instead: re-dispatch ONCE
+    // on the family's DEFAULT leg (legs[0] = deepseek official — the same
+    // default the kill-switch gate resolves to), never walking past it. When
+    // the default is unavailable/latched, return (no advance) — cold traffic
+    // never rides the family chain on an off-table leg's transport evidence.
+    if (!legIsFamilyMember(family, dispatched.provider)) {
+      const famLegs = familyLegs(family);
+      const defaultLeg = famLegs?.[0];
+      const step = nextLegAfter(family, dispatched, readLatchState(env), { env });
+      // nextLegAfter from a NON-table position walks legs[0..] (findIndex -1
+      // → first available). Accept ONLY when the first available leg IS the
+      // family default (deepseek official) — a deeper first-available leg
+      // means the default itself is latched/blocked, and the off-table leg's
+      // transport error must not skip the default for a deeper chain leg.
+      if (
+        defaultLeg &&
+        step.leg &&
+        step.leg.provider === defaultLeg.provider &&
+        step.leg.model === defaultLeg.model
+      ) {
+        return {
+          action: "advance",
+          nextLeg: step.leg,
+          annotations: {
+            failoverConnectionAdvance: true,
+            failoverHop: `${dispatched.provider}->${step.leg.provider}`,
+            failoverNote:
+              "connection-error on an off-table cold-class leg — re-dispatching on the family default (deepseek official); no chain walk",
+          },
+        };
+      }
+      return {
+        action: "return",
+        nextLeg: null,
+        annotations: {
+          failoverNote:
+            "connection-error on an off-table cold-class leg — default leg unavailable/latched; no advance (cold traffic never rides the family chain on off-table transport evidence)",
+        },
+      };
+    }
     const isHop = dispatched.provider !== familyRootOf(family);
     if (!isHop) {
       return {
@@ -1119,6 +1353,69 @@ export async function runFailoverDecisionLoop(input: {
     return { result, dispatchLeg, halted: null, hops };
   }
   return { result: result as FailoverSpawnResult, dispatchLeg, halted: null, hops };
+}
+
+// ── #512 per-dispatch usage capture (parent side, TASK_USAGE_LEDGER=1) ──
+// The 0a economic gate (does the cold class stay cache-cold enough for venice
+// to be cheaper?) needs per-dispatch input-vs-cacheRead fractions for the
+// reviewer/eval dispatch class. Builtin-task children run --no-session, so
+// the child (provider-exhaustion ext, TASK_USAGE_CAPTURE=1) emits ONE
+// [task-usage] stderr line at shutdown; this parent parses it, attaches
+// details.dispatchUsage to the settled result, and — when TASK_USAGE_LEDGER=1
+// — appends a durable dispatch-usage ledger row (event=dispatch-usage) for
+// the ≥2-week prospective collection window.
+
+const USAGE_LINE =
+  /^\[task-usage\]\s+input=(\d+)\s+output=(\d+)\s+cacheRead=(\d+)\s+cacheWrite=(\d+)\s+cost=([0-9.]+)\s+model=(\S+)\s+provider=(\S+)(?:\s+nonce=(\S+))?/;
+
+export interface DispatchUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+  model: string;
+  provider: string;
+}
+
+/** Parse a [task-usage] line. Returns null for anything that is not a usage
+ * line. The CALLER decides nonce policy (authenticate when the child was
+ * spawned with TASK_HEARTBEAT=1 — a matching nonce proves the line came from
+ * the dispatched child, not an MCP server sharing fd 2). */
+export function parseTaskUsageLine(line: string): DispatchUsage | null {
+  const m = USAGE_LINE.exec(line.trim());
+  if (!m) return null;
+  return {
+    input: Number(m[1]),
+    output: Number(m[2]),
+    cacheRead: Number(m[3]),
+    cacheWrite: Number(m[4]),
+    cost: Number(m[5]),
+    model: m[6],
+    provider: m[7],
+  };
+}
+
+/** Scan a stderr blob for the [task-usage] line, line-anchored + nonce-
+ * validated (mirrors scanStderrForExhaustion). Returns the LAST occurrence's
+ * parsed usage (or null). */
+export function scanStderrForUsage(
+  stderr: string | undefined | null,
+  expectedNonce?: string,
+): DispatchUsage | null {
+  if (!stderr) return null;
+  let found: DispatchUsage | null = null;
+  for (const raw of stderr.split("\n")) {
+    const line = raw.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").trim();
+    const usage = parseTaskUsageLine(line);
+    if (!usage) continue;
+    if (expectedNonce !== undefined) {
+      const nm = line.match(/nonce=(\S+)/);
+      if (!nm || nm[1] !== expectedNonce) continue;
+    }
+    found = usage;
+  }
+  return found;
 }
 
 // ── Sub-agent heartbeat: alive signals, not output bytes (#176) ────────
@@ -2128,6 +2425,38 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         const marker = detectExhaustionMarker();
         const details: Record<string, unknown> = { ...(value.details ?? {}) };
         if (marker) details.exhaustionMarker = marker;
+        // #512: per-dispatch usage — the child's [task-usage] line (emitted
+        // when TASK_USAGE_CAPTURE=1 reached the child) rides the settled
+        // result as details.dispatchUsage; when the PARENT also opts into the
+        // durable ledger (TASK_USAGE_LEDGER=1), the row is appended for the
+        // 0a prospective collection window. Never throws; ledger failures are
+        // audit-only. dispatchId = the per-dispatch TASK_HEARTBEAT_NONCE hex
+        // (round-1 P2): decision-loop hops reuse the caller-set nonce, so
+        // every leg row of ONE dispatch shares the id and joins the
+        // event=venice-route row recorded at dispatch resolution.
+        if (hbEnabled) {
+          const usage = scanStderrForUsage(stderr, hbNonce);
+          if (usage) {
+            details.dispatchUsage = usage;
+            if (process.env.TASK_USAGE_LEDGER === "1") {
+              appendLedger(
+                {
+                  kind: "dispatch-usage",
+                  model: usage.model,
+                  provider: usage.provider,
+                  input: usage.input,
+                  output: usage.output,
+                  cacheRead: usage.cacheRead,
+                  cacheWrite: usage.cacheWrite,
+                  cost: usage.cost,
+                  ...(hbNonce ? { dispatchId: hbNonce } : {}),
+                },
+                "dispatch-usage",
+                subAgentEnv,
+              );
+            }
+          }
+        }
         if (hbCtx.state.everSawTool) details.sawTools = true;
         else if (hbEnabled && hbCtx.state.markerCount === 0) details.sawToolsUnknown = true;
         if (Object.keys(details).length > 0) {
@@ -2892,8 +3221,11 @@ export default function (pi: ExtensionAPI) {
       // (~/.pi/agent/models.json). Unresolvable models keep the legacy
       // claude→anthropic / else→deepseek default so nothing regresses.
       const resolved = resolveProviderModel(modelParam);
-      const model = resolved.model || modelParam;
-      const provider =
+      // #512: model/provider are MUTABLE below — the alternate-leg gate may
+      // resolve a gated cold-class venice request onto the default leg before
+      // the #476 resolution runs.
+      let model = resolved.model || modelParam;
+      let provider =
         resolved.provider ??
         (model.startsWith("claude") ? "anthropic" : "deepseek");
 
@@ -2982,8 +3314,35 @@ export default function (pi: ExtensionAPI) {
       // (latched-out exclusion BEFORE spawn; a halted chain fails the
       // dispatch fast with the structured halt class). Family detection is
       // exact (provider/model identity via the shared alias-family table).
-      // The latch file is read lazily — only family dispatches ever touch it.
+      // #512: the cold-class gate below is membership-keyed, so the latch
+      // file stays lazy — chain legs/roots and key-less providers never
+      // touch it (only gate-eligible off-table asks read the latch).
       const failoverActive = !failoverDisabled(subAgentEnv);
+      // #512 cold-class alternate-leg gate (kill switch #2, code over text):
+      // an OFF-TABLE requested provider (venice) that cannot serve — models.json
+      // apiKey env ref missing from the child env, or durably auth-blocked —
+      // resolves to the DEFAULT (deepseek official) leg BEFORE any spawn. A
+      // requested chain leg or the family root is never gated (#476 semantics
+      // byte-for-byte). The COLD_CLASS_PROVIDER seam is the ONLY surface that
+      // requests venice, so with the seam unset this gate is inert.
+      const requestedLeg: LegRef = { provider, model };
+      // gate eligibility mirrors altGateEligible (gateOffTableRequest's own
+      // membership contract): only OFF-TABLE asks with a models.json apiKey
+      // env ref (venice) can gate — chain legs/roots and key-less providers
+      // never read the latch. Family-keyed by model id: venice/deepseek-v4-
+      // flash is family-defined but NOT a member leg, so membership (not
+      // family-lessness) decides (round-2 P1-1).
+      const gateEligible = altGateEligible(requestedLeg);
+      const altGate = gateEligible
+        ? gateOffTableRequest(requestedLeg, readLatchState(subAgentEnv), { env: subAgentEnv })
+        : { gated: false, leg: requestedLeg };
+      if (altGate.gated) {
+        console.log(
+          `[task] cold-class provider ${provider}/${model} gated (${altGate.gate}) → default ${altGate.leg.provider}/${altGate.leg.model}`,
+        );
+        provider = altGate.leg.provider;
+        model = altGate.leg.model;
+      }
       const failoverResolution = familyOf(model, provider)
         ? resolveDispatchLeg({ provider, model }, readLatchState(subAgentEnv), {
             env: subAgentEnv,
@@ -3000,15 +3359,51 @@ export default function (pi: ExtensionAPI) {
       }
       const family = failoverResolution.family; // undefined = not a chain member
       let dispatchLeg: LegRef = failoverResolution.leg;
-      // #476: one dispatch-chain nonce shared by the child's marker stream
-      // and this decision table (spawnSubAgent REUSES a caller-set
-      // TASK_HEARTBEAT_NONCE instead of generating its own).
-      if (failoverActive && family) subAgentEnv.TASK_HEARTBEAT_NONCE = randomBytes(6).toString("hex");
+      // #476: one dispatch-chain nonce shared by the child's marker stream,
+      // this decision table, and the ledger rows (spawnSubAgent REUSES a
+      // caller-set TASK_HEARTBEAT_NONCE instead of generating its own).
+      // Generated BEFORE the venice-route append (round-1 P2): the route row
+      // and every per-leg dispatch-usage row carry the same dispatchId, so
+      // cold-class burn is joinable per dispatch. Deliberately NOT
+      // conditional on failoverActive (round-2 P2-1): a task child ALWAYS
+      // runs TASK_HEARTBEAT=1 (set below) and spawnSubAgent auto-generates a
+      // nonce when the caller leaves it unset — so under
+      // PROVIDER_FAILOVER_DISABLE=1 the child's dispatch-usage row would
+      // carry an AUTO nonce the venice-route row could never join. The
+      // shared id is set in every config; the child simply reuses it.
+      subAgentEnv.TASK_HEARTBEAT_NONCE = randomBytes(6).toString("hex");
       const buildArgs = (leg: LegRef): string[] =>
         ["-p", "--provider", leg.provider, "--model", leg.model, "--no-session", params.prompt];
       const spawnLeg = (leg: LegRef) => spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal);
 
       let result = await retry(() => spawnLeg(dispatchLeg), retryOptions);
+
+      // #512 proof-of-routing ledger: an ACTUAL venice dispatch (the cold-class
+      // seam resolved to the venice leg and no kill switch gated it) appends a
+      // venice-route audit row so credit burn is attributable per dispatch
+      // WITHOUT scraping session files (audit/provider-failover.jsonl;
+      // event=venice-route). Append-only + never throws (appendLedger).
+      // Appended AFTER the first spawn attempt (second-model P2): a route row
+      // may only claim a venice dispatch that actually ran. "Never spawned" is
+      // precisely breaker-open-with-zero-attempts — circuit_open with
+      // retries===0 (the shared task breaker was open at entry and the cooldown
+      // had not elapsed, so retry() never called spawnLeg). Any other terminal
+      // means the venice leg WAS dispatched: circuit_open with retries>0
+      // follows the half-open path (attempt 1 called spawnLeg, then the breaker
+      // re-opened on its failure — a real child ran), and success/timeout/
+      // failed all had ≥1 real spawn. The dispatchId (the hoisted nonce above)
+      // is unchanged — still shared with the child's dispatch-usage rows.
+      const breakerNeverSpawned = result.status === "circuit_open" && result.retries === 0;
+      if (dispatchLeg.provider === "venice" && !breakerNeverSpawned) {
+        recordVeniceRoute(
+          dispatchLeg,
+          family ?? null,
+          failoverResolution.hop ?? null,
+          subAgentEnv,
+          subAgentEnv.TASK_HEARTBEAT_NONCE ?? null,
+        );
+        console.log(`[task] cold-class route → ${dispatchLeg.provider}/${dispatchLeg.model} (venice-route ledger)`);
+      }
 
       // #476 post-dispatch decision loop — extracted runner (unit-tested with
       // a scripted spawn; the real spawn fn is injected here). Bounded:

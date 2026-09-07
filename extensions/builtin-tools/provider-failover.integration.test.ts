@@ -32,7 +32,7 @@
  * Run: npx tsx extensions/builtin-tools/provider-failover.integration.test.ts
  */
 
-import { spawnSubAgent } from "./index.js";
+import { spawnSubAgent, recordVeniceRoute } from "./index.js";
 import { readLatchState } from "../shared/provider-failover.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -107,6 +107,14 @@ case "$SCENARIO" in
   healthy)
     m "turn_start nonce=$NONCE 1"
     echo "FAKE-PI-HEALTHY-OUTPUT"
+    exit 0
+    ;;
+  usage)
+    # #512: opt-in usage capture — emit the [task-usage] line at the end of a
+    # HEALTHY child session (the real child emits it from session_shutdown)
+    m "turn_start nonce=$NONCE 1"
+    echo "FAKE-PI-USAGE-OUTPUT"
+    echo "[task-usage] input=1000 output=200 cacheRead=5000 cacheWrite=0 cost=0.000123 model=deepseek-v4-flash provider=deepseek nonce=$NONCE" >&2
     exit 0
     ;;
   *)
@@ -240,6 +248,104 @@ test("nonce reuse: a caller-set TASK_HEARTBEAT_NONCE is REUSED (not regenerated)
 	const marker = markerOf(value);
 	ok(marker, "exhaustionMarker attached");
 	equal(marker.nonce, callerNonce, "captured marker authenticates against the reused nonce");
+});
+
+test("usage: a [task-usage] child line → details.dispatchUsage on the settled result (nonce-authenticated)", async () => {
+	const { value, childNonce } = await dispatch("usage", { TASK_USAGE_CAPTURE: "1" });
+	ok(value, "defined result expected");
+	const u = value!.details!.dispatchUsage as any;
+	ok(u, "dispatchUsage attached to details");
+	equal(u.input, 1000);
+	equal(u.output, 200);
+	equal(u.cacheRead, 5000);
+	equal(u.cacheWrite, 0);
+	equal(u.cost, 0.000123);
+	equal(u.model, "deepseek-v4-flash");
+	equal(u.provider, "deepseek");
+	ok(childNonce.length >= 6, "authenticated against the shared dispatch nonce");
+	const state = readLatchState();
+	deepEqualKeys(state.primaries, [], "usage capture never writes the latch");
+});
+
+test("usage falsification: healthy child WITHOUT a usage line → no dispatchUsage detail", async () => {
+	const { value } = await dispatch("healthy", { TASK_USAGE_CAPTURE: "1" });
+	ok(value, "defined result expected");
+	equal(value!.details!.dispatchUsage, undefined, "no [task-usage] line → no detail");
+});
+
+test("usage ledger: TASK_USAGE_LEDGER=1 appends the event=dispatch-usage audit row (round-4 P2 pin)", async () => {
+	const savedLedger = process.env.TASK_USAGE_LEDGER;
+	process.env.TASK_USAGE_LEDGER = "1";
+	try {
+		const { value, childNonce } = await dispatch("usage", { TASK_USAGE_CAPTURE: "1" });
+		ok(value, "defined result expected");
+		const u = value!.details!.dispatchUsage as any;
+		ok(u, "detail attached");
+		const file = path.join(process.env.PI_CODING_AGENT_DIR!, "audit", "provider-failover.jsonl");
+		const content = fs.readFileSync(file, "utf-8").trim();
+		const rows = content.split("\n").map((l) => JSON.parse(l));
+		const row = rows[rows.length - 1];
+		equal(row.event, "dispatch-usage");
+		equal(row.kind, "dispatch-usage");
+		equal(row.provider, "deepseek");
+		equal(row.model, "deepseek-v4-flash");
+		equal(row.input, 1000);
+		equal(row.output, 200);
+		equal(row.cacheRead, 5000);
+		equal(row.cacheWrite, 0);
+		equal(row.cost, 0.000123);
+		ok(childNonce.length >= 6, "child nonce present");
+		equal(row.dispatchId, childNonce, "dispatch-usage row carries the per-dispatch nonce (round-1 P2 join key)");
+	} finally {
+		if (savedLedger === undefined) delete process.env.TASK_USAGE_LEDGER;
+		else process.env.TASK_USAGE_LEDGER = savedLedger;
+	}
+});
+
+test("usage ledger round-2 P2-3: venice-route + dispatch-usage rows SHARE the pre-set dispatchId (joinable per dispatch)", async () => {
+	// Simulates the execute path exactly: the parent hoists ONE shared nonce
+	// into subAgentEnv BEFORE the venice-route append and the spawn (now
+	// unconditional — round-2 P2-1). dispatch() carries that nonce through to
+	// spawnSubAgent, which REUSES it (no auto-generation); the usage-emitting
+	// child authenticates against it, so the dispatch-usage row and the
+	// route row appended with the SAME nonce join on dispatchId.
+	const sharedNonce = "deadbeef0123";
+	const savedLedger = process.env.TASK_USAGE_LEDGER;
+	process.env.TASK_USAGE_LEDGER = "1";
+	try {
+		const { value, childNonce } = await dispatch("usage", {
+			TASK_USAGE_CAPTURE: "1",
+			TASK_HEARTBEAT_NONCE: sharedNonce,
+		});
+		ok(value, "defined result expected");
+		ok(value!.details!.dispatchUsage, "detail attached");
+		// route row — appended by the execute path with the SAME shared nonce
+		// (recordVeniceRoute is called BEFORE the spawn with that nonce; we
+		// replay the call here with the identical value the hoist produced)
+		recordVeniceRoute(
+			{ provider: "venice", model: "deepseek-v4-flash" },
+			"deepseek-v4-flash",
+			null,
+			process.env as Record<string, string | undefined>,
+			sharedNonce,
+		);
+		const file = path.join(process.env.PI_CODING_AGENT_DIR!, "audit", "provider-failover.jsonl");
+		const rows = fs
+			.readFileSync(file, "utf-8")
+			.trim()
+			.split("\n")
+			.map((l) => JSON.parse(l));
+		const usageRow = [...rows].reverse().find((r) => r.event === "dispatch-usage");
+		const routeRow = [...rows].reverse().find((r) => r.event === "venice-route");
+		ok(usageRow && routeRow, "both ledger rows present (this dispatch's last-appended rows)");
+		equal(childNonce, sharedNonce, "child authenticated against the PRE-SET nonce — spawnSubAgent reused it (no auto-gen)");
+		equal(routeRow.dispatchId, sharedNonce, "venice-route row carries the shared dispatchId");
+		equal(usageRow.dispatchId, sharedNonce, "dispatch-usage row carries the shared dispatchId");
+		equal(routeRow.dispatchId, usageRow.dispatchId, "rows JOIN on dispatchId (round-1 P2 fix — joinable per dispatch)");
+	} finally {
+		if (savedLedger === undefined) delete process.env.TASK_USAGE_LEDGER;
+		else process.env.TASK_USAGE_LEDGER = savedLedger;
+	}
 });
 
 function deepEqualKeys(obj: Record<string, unknown>, keys: string[], msg: string) {

@@ -277,6 +277,25 @@ export function familyLegs(family: string): LegRef[] | undefined {
   return ALIAS_FAMILIES[family]?.legs;
 }
 
+/** Is `provider` a member of the family's chain table (root + hop legs)?
+ * Providers NOT in the table are INDEPENDENT accounts for that family
+ * (#512): a request for them is an explicit per-dispatch choice (the cold-
+ * class venice seam), not a chain hop — so their resolution and exhaustion
+ * records must never be absorbed by the family root's latch state (no
+ * root-shadow; own-account write placement).
+ *
+ * The discriminator is used identically on BOTH the read side
+ * (resolveWithChain) and the write side (setExhausted) so the root-shadow
+ * and the account-of-record placement cannot disagree. A provider in
+ * ({root} ∪ family legs) keeps the #476 semantics byte-for-byte — this
+ * helper returns true for every existing table leg (deepseek/qwen-tp/
+ * openrouter), so existing pins are the byte-parity proof. */
+export function legIsFamilyMember(family: string | undefined, provider: string): boolean {
+  if (!family) return false;
+  const legs = familyLegs(family);
+  return legs !== undefined && legs.some((l) => l.provider === provider);
+}
+
 // ── Exhaustion signature (text classifier) ──────────────────────────────────
 
 export type ExhaustionKind = "exhaustion" | "auth_permanent" | "audit_only" | null;
@@ -295,6 +314,16 @@ const SIG_INSUFFICIENT_BALANCE = /(insufficient\s+balance|balance\s+insufficient
  * OpenRouter's actual 402 body text "Insufficient credits. Add more using
  * https://openrouter.ai/credits" (SDK path omits the status — review P2). */
 const SIG_CREDIT_LOW = /(credit\s+balance\s+(?:is\s+)?too\s+low|insufficient\s+credit)/i;
+/** Bare "authentication failed" phrase with NO key wording — the real venice
+ * 401 body (`{"error":"Authentication failed"}`). Deliberately NOT in
+ * SIG_AUTH_KEY (see classifyExhaustionText ordering): checked after the
+ * exhaustion signatures so a 402/exhaustion body containing the phrase
+ * (wrapper prefix, key-scoped spend-limit codes) classifies exhaustion, and
+ * AFTER SIG_FUZZY (round-4 code-review P2) so a body carrying both the
+ * phrase and billing-fuzzy wording stays audit_only (never a durable block
+ * from one ambiguous observation) — only phrase-only bodies (no exhaustion
+ * token, no fuzzy-billing token) classify auth_permanent. */
+const SIG_AUTH_FAILED = /authentication\s+failed/i;
 /** 402 co-occurring with a credit-exhaustion phrase within a bounded
  * line-local window (review P2 — a distant balance/credit word on another
  * line must not pair with an unrelated 402 token). Bare `credit`, bare
@@ -307,6 +336,37 @@ const SIG_402_CREDIT = /402[^\n]{0,160}(insufficient|credit\s+balance|too\s+low|
 /** Fuzzy billing wording WITHOUT 402 → audit-only (never latches). */
 const SIG_FUZZY = /(insufficient_quota|insufficient quota|billing|usage limit reached|monthly usage|quota exceeded|credit balance)/i;
 const SIG_AUTH_KEY = /(invalid\s+x-api-key|invalid\s+api[_-]?key|api[_-]?key.{0,40}(invalid|incorrect|blocked)|api\s+key.{0,40}(invalid|incorrect|blocked)|incorrect\s+api\s+key|invalid_api_key|apikey-error)/i;
+/** Venice 402/exhaustion patterns (#512, docs-anchored — docs.venice.ai
+ * /api-reference/error-codes; amendment-3 P1). The published schema:
+ *   - error.code INSUFFICIENT_BALANCE, message "Insufficient USD or Diem
+ *     balance to complete request…" — the "USD or Diem" interjection breaks
+ *     SIG_INSUFFICIENT_BALANCE (contiguous "insufficient balance" only); no
+ *     credit/402 token → every pre-extension signature missed it → null →
+ *     no marker → no latch → the exact event #512 exists for silently fails
+ *     reviews.
+ *   - error.code API_KEY_DIEM_SPEND_LIMIT_EXCEEDED /
+ *     API_KEY_USD_SPEND_LIMIT_EXCEEDED, message "…spend limit exceeded…" —
+ *     contains NO (insufficient|credit|too low|exhausted) token, so the
+ *     spend-limit wording alone must not classify; the snake-case CODE token
+ *     is the anchor (OpenAI-compatible bodies carry code next to message).
+ *   - 401-class: AUTHENTICATION_FAILED bodies carry key wording ("API key …
+ *     invalid") → SIG_AUTH_KEY fires first; a phrase-only body (the real
+ *     venice 401 `{"error":"Authentication failed"}`, no key wording) hits
+ *     the LATE bare-auth check (SIG_AUTH_FAILED, after the exhaustion
+ *     signatures — round-1 P2, so an exhaustion body containing the phrase
+ *     still classifies exhaustion); PRO_ONLY_MODEL is a model-tier error
+ *     (NOT balance/auth) → stays null (audit-only).
+ * NOTE (residual, #512 P1-4/0b): fixtures are docs-anchored/assumed — the
+ * classifier link is MECHANISM-verified via the mock-endpoint test; a REAL
+ * venice 402 body is an OPEN operator gate until a drained second account
+ * or go-live capture lands. If a real body later misses, extend these
+ * signatures (same route as OpenRouter's body forcing SIG_CREDIT_LOW). */
+const SIG_VENICE_INSUFFICIENT = /insufficient\s+USD\s+or\s+Diem\s+balance/i;
+/** Snake-case balance/spend code tokens (OpenAI-compatible error.code field). */
+const SIG_VENICE_BALANCE_CODE = /\b(?:INSUFFICIENT_BALANCE|API_KEY_(?:USD|DIEM)_SPEND_LIMIT_EXCEEDED)\b/;
+/** Spend-limit prose co-occurring with the code token (prose alone never
+ * classifies — no balance/credit semantic without the code). */
+const SIG_SPEND_LIMIT_PROSE = /spend\s+limit\s+exceeded/i;
 
 /**
  * Classify a provider error/status text against the exhaustion signature.
@@ -326,10 +386,14 @@ export function classifyExhaustionText(text: string | null | undefined): Exhaust
   if (!text) return { kind: null, reason: null, matched: null };
   const t = text.slice(0, 2000); // bounded — status bodies are short
 
-  // Permanent auth class FIRST (401/403 + key wording, OR key wording alone —
-  // real 401 bodies often omit the status number in the message text, e.g.
-  // DeepSeek's `Authentication Fails, Your api key: **** is invalid` and
-  // Aliyun's `Incorrect API key provided ... apikey-error`). Never exhaustion.
+  // Permanent auth class FIRST — KEY-WORDING only (401/403 + key wording,
+  // OR key wording alone — real 401 bodies often omit the status number in
+  // the message text, e.g. DeepSeek's `Authentication Fails, Your api key:
+  // **** is invalid` and Aliyun's `Incorrect API key provided ...
+  // apikey-error`). Never exhaustion. NOTE (round-1 P2): the bare phrase
+  // `authentication failed` is NOT here — it lives in a LATE check after the
+  // exhaustion signatures (SIG_AUTH_FAILED below) so an exhaustion body
+  // containing the phrase still classifies exhaustion.
   if (SIG_AUTH_KEY.test(t)) {
     return { kind: "auth_permanent", reason: "blocked", matched: "auth-key-wording" };
   }
@@ -340,6 +404,31 @@ export function classifyExhaustionText(text: string | null | undefined): Exhaust
       kind: "exhaustion",
       reason: has402 ? "402" : "low_balance",
       matched: "insufficient-balance",
+    };
+  }
+  // Venice (#512, amendment-3 P1): the published "Insufficient USD or Diem
+  // balance" message — the "USD or Diem" interjection sits between
+  // "insufficient" and "balance", so the contiguous signature above cannot
+  // match it. Classified AFTER the canonical contiguous form (exact-match
+  // precedence), with the same 402/low_balance reason split on the status.
+  if (SIG_VENICE_INSUFFICIENT.test(t)) {
+    return {
+      kind: "exhaustion",
+      reason: has402 ? "402" : "low_balance",
+      matched: "venice-insufficient-usd-or-diem",
+    };
+  }
+  // Venice spend-limit class: the code token (INSUFFICIENT_BALANCE /
+  // API_KEY_*_SPEND_LIMIT_EXCEEDED) is the anchor — the prose alone
+  // ("spend limit exceeded") carries no balance/credit semantic and must not
+  // classify. An OpenAI-compatible 402 body ships the snake code next to the
+  // message, so code-token co-occurrence with the prose (or the code token
+  // alone — the message may not repeat it) is the exhaustion signal.
+  if (SIG_VENICE_BALANCE_CODE.test(t)) {
+    return {
+      kind: "exhaustion",
+      reason: has402 ? "402" : "low_balance",
+      matched: SIG_SPEND_LIMIT_PROSE.test(t) ? "venice-spend-limit-code" : "venice-balance-code",
     };
   }
   if (SIG_CREDIT_LOW.test(t)) {
@@ -356,8 +445,30 @@ export function classifyExhaustionText(text: string | null | undefined): Exhaust
     return { kind: "exhaustion", reason: "402", matched: "402+credit-near" };
   }
   if (SIG_FUZZY.test(t)) {
-    // fuzzy billing wording without 402 — audit-only (never latch) per plan
+    // fuzzy billing wording without 402 — audit-only (never latch) per plan.
+    // Checked BEFORE the bare-auth phrase (round-4 code-review P2): a body
+    // carrying BOTH billing-fuzzy wording and the bare "authentication
+    // failed" phrase ("Authentication failed: quota exceeded…") is
+    // ambiguous — a transient quota/usage event behind an auth-flavored
+    // wrapper is far more likely than a permanently dead key (dead keys
+    // return clean 401 bodies, which the phrase-only check below still
+    // blocks). audit_only never latches; classifying auth_permanent here
+    // would write a DURABLE 24h provider block on one ambiguous observation
+    // for EVERY provider (the phrase is provider-agnostic). Pre-#512 these
+    // bodies were audit_only — semantics preserved.
     return { kind: "audit_only", reason: null, matched: "billing-fuzzy" };
+  }
+  // Bare "authentication failed" (no key wording) — checked AFTER the
+  // exhaustion signatures (code-review round-1 P2) AND after SIG_FUZZY
+  // (round-4 code-review P2): an exhaustion-class body that CONTAINS the
+  // phrase (a wrapper prefix, or venice's key-scoped spend-limit codes whose
+  // message can open with "API key …") classifies exhaustion first; a body
+  // with billing-fuzzy wording classifies audit_only. ONLY phrase-only
+  // bodies (the real venice 401 `{"error":"Authentication failed"}` — no
+  // key wording, no fuzzy-billing token) reach here and classify
+  // auth_permanent.
+  if (SIG_AUTH_FAILED.test(t)) {
+    return { kind: "auth_permanent", reason: "blocked", matched: "auth-failed-wording" };
   }
   return { kind: null, reason: null, matched: null };
 }
@@ -864,9 +975,21 @@ export function resolveWithChain(
   const own = state.primaries[requested.provider];
   const rootRec = rootPrimary ? state.primaries[rootPrimary] : undefined;
   const isRootAsk = rootPrimary === undefined || requested.provider === rootPrimary;
+  // #512 independent-provider rule (read side): a requested provider that is
+  // NOT a member of the family chain table (e.g. venice — the cold-class
+  // per-dispatch seam) is its OWN account. Its resolution must NEVER consult
+  // the family root record — while the deepseek root is freshly latched
+  // (in-flight exhaustion), an off-table venice ask must still resolve to
+  // venice ("clear" when venice has no own record), not get root-shadowed
+  // onto the root's active leg (openrouter) or halted. Table-leg asks
+  // (deepseek root / qwen-tp / openrouter hops) keep the #476 root-shadow
+  // semantics byte-for-byte (legIsFamilyMember is true for every table leg).
+  const independentAsk = !isRootAsk && !legIsFamilyMember(family, requested.provider);
   let primary: PrimaryLatch | undefined;
   if (isRootAsk) {
     primary = own ?? rootRec;
+  } else if (independentAsk) {
+    primary = own;
   } else {
     const rootFresh = rootRec ? recordFresh(rootRec, now, ttl) : false;
     const ownFresh = own ? recordFresh(own, now, ttl) : false;
@@ -888,6 +1011,30 @@ export function resolveWithChain(
     return { leg: null, halted: true, reason: "halt", hop: null };
   }
   if (fam?.activeLeg && !unavailable.has(fam.activeLeg.provider)) {
+    // #512 second-model P2: an OFF-TABLE record (venice) froze its family
+    // activeLeg at drain time. Under a double-exhaustion (the deepseek root
+    // was ALSO freshly latched when venice drained), that frozen leg is a
+    // DEEPER chain leg (openrouter — the write side skipped the unavailable
+    // default). Off-table records have no poller-clear path (only TTL
+    // self-heal), so the root can recover while the frozen leg persists — a
+    // subsequent cold ask would ride openrouter (real-cost markup) instead of
+    // the recovered default. Retreat to the family DEFAULT (legs[0] =
+    // deepseek official — the documented venice→deepseek→openrouter fallback)
+    // whenever it is now available; keep the frozen deeper leg only when the
+    // default is still out. Table-leg records keep the #476 static-activeLeg
+    // semantics byte-for-byte.
+    if (independentAsk) {
+      const famLegs = familyLegs(family);
+      const defaultLeg = famLegs?.[0];
+      if (
+        defaultLeg &&
+        (defaultLeg.provider !== fam.activeLeg.provider || defaultLeg.model !== fam.activeLeg.model) &&
+        !unavailable.has(defaultLeg.provider)
+      ) {
+        const hop = activeHop(requested, defaultLeg);
+        return { leg: defaultLeg, halted: false, reason: "latched-active", hop };
+      }
+    }
     const hop = activeHop(requested, fam.activeLeg);
     return { leg: fam.activeLeg, halted: false, reason: "latched-active", hop };
   }
@@ -936,7 +1083,32 @@ export function setExhausted(input: LatchInput): LatchState {
     const fromIsRoot = input.fromLeg ? root !== undefined && input.fromLeg.provider === root : input.primaryProvider === root;
     const rootRec = root ? cur.primaries?.[root] : undefined;
     const rootFresh = rootRec ? recordFresh(rootRec, now, ttl) : false;
-    const primaryProvider = root && (fromIsRoot || rootFresh) ? root : input.primaryProvider;
+    // #512 independent-provider rule (write side): a drain on an OFF-TABLE
+    // leg (provider not in the family chain — e.g. venice) is that provider's
+    // OWN account event ALWAYS. Even under a FRESH root latch (in-flight
+    // deepseek exhaustion), venice's drain evidence must record under
+    // primaries["venice"] — never re-latch/advance the deepseek root on
+    // another account's evidence — so the next cold dispatch resolves the
+    // fresh venice record and hops off venice itself. Mirrors the read side
+    // (resolveWithChain independentAsk): the discriminator is identical, so
+    // root-shadow and write placement cannot disagree. Table-leg drains keep
+    // the #476 account-of-record placement (root when in-flight/root leg).
+    //
+    // Discriminator derived from the EFFECTIVE provider (fromLeg when given,
+    // else the drain's primaryProvider — code-review round-1 P2): a
+    // fromLeg-less drain on an off-table provider is that provider's own
+    // account event too, so the write-side rule cannot disagree with the
+    // read side for fromLeg-less writes (the comment above is unconditional;
+    // the code must be as well). legIsFamilyMember(undefined, …) is false,
+    // so a family-less drain of an off-table provider also lands on its own
+    // entry — matching the read side's early must-stay.
+    const drainProvider = input.fromLeg?.provider ?? input.primaryProvider;
+    const fromIsIndependent = !legIsFamilyMember(input.family, drainProvider);
+    const primaryProvider = fromIsIndependent
+      ? input.primaryProvider
+      : root && (fromIsRoot || rootFresh)
+        ? root
+        : input.primaryProvider;
     const existing = cur.primaries[primaryProvider];
     const fam = input.family;
     const families: Record<string, FamilyLatch> = { ...(existing?.families ?? {}) };
@@ -1078,12 +1250,19 @@ export function manualClear(primaryOrAll: string, env: Record<string, string | u
 }
 
 /** Ledger append (durable JSONL audit — same fail-safe semantics as
- * shared/audit-log.ts). Never throws. */
-export function appendLedger(entry: Record<string, unknown>, env: Record<string, string | undefined> = process.env): void {
+ * shared/audit-log.ts). Never throws. The event name defaults to
+ * "provider-failover" for the #476 hop/marker ledger; #512 adds the
+ * "venice-route" routing-ledger event to the SAME audit file so credit burn
+ * is attributable per cold-class dispatch (event names distinguish rows). */
+export function appendLedger(
+  entry: Record<string, unknown>,
+  eventName: string = "provider-failover",
+  env: Record<string, string | undefined> = process.env,
+): void {
   try {
     const file = auditLedgerFile(env);
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const line = JSON.stringify({ ts: new Date().toISOString(), event: "provider-failover", ...entry }) + "\n";
+    const line = JSON.stringify({ ts: new Date().toISOString(), event: eventName, ...entry }) + "\n";
     fs.appendFileSync(file, line);
   } catch {
     /* audit must never break the gate path */

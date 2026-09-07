@@ -285,3 +285,106 @@ with automatic return after balance restore.
   key remediation; a still-broken key is re-armed fresh by the next 401/403).
 - Hop cost metadata is honest (catalog-authority rates in `models-store.json`),
   or the leg is `costUnknown` and FLAGS.
+
+## 8. Venice cold-class routing — cache-cold verification traffic (#512)
+
+Cache-cold **test/verification** traffic (fresh-context reviewer/eval dispatches
+that would otherwise burn deepseek-official credits on a cold prompt cache) can
+be routed through the **venice** leg — same model id (`deepseek-v4-flash`),
+served by api.venice.ai at venice list pricing, with prompt-cache reads served
+to cold traffic (live sample 2026-09-06: a first-ever curl to a short prompt
+reported `cache_read_input_tokens=1536` of 1721 prompt tokens).
+
+### The seam (default OFF — inert)
+
+**`COLD_CLASS_PROVIDER`** is an OPERATOR-exported env convention read by
+reviewer/eval dispatch-site texts (code-review, plan-review, test-review,
+issue-scoping, subagent-driven-development skills) — extension code NEVER
+reads it. Unset (the default) the seam is inert — no seam dispatch site
+routes venice. When an operator exports
+`COLD_CLASS_PROVIDER=venice`, eligible cache-cold one-shot dispatches MAY
+launch through the venice leg (`--provider venice --model deepseek-v4-flash`).
+Interactive/default traffic NEVER routes venice (warm sessions keep their
+cache; only explicitly-opt-in cold-class dispatches burn venice credits).
+Note the code-level truth: an EXPLICIT `venice/…` provider/model ask at the
+task tool (a manual dispatch or a future extension — the seam texts are the
+only in-repo askers today, and they are COLD_CLASS_PROVIDER-gated) routes
+venice whenever `VENICE_API_KEY` is present AND venice is neither listed in
+`PROVIDER_FAILOVER_BLOCKED` nor durably auth-blocked — `COLD_CLASS_PROVIDER`
+does not stop that ask; removing the key does (kill switch #2 below), as
+does listing venice in `PROVIDER_FAILOVER_BLOCKED` (kill-switch note below).
+
+The seam is **per-dispatch**, never a family-table edit: `ALIAS_FAMILIES`
+(the #476 chain table) has NO venice leg (drift-pinned), so warm traffic and
+family resolution are untouched. venice is an independent provider — a drain
+on its account records under `primaries["venice"]`, never re-latching or
+advancing the deepseek root on another account's evidence.
+
+### Fallback + kill switches
+
+- **Exhaustion fallback** (venice 402/`low_balance`): the #476 machinery hops
+  venice → deepseek official → openrouter via the independent-provider
+  discriminator (account-of-record: the drain records under `primaries["venice"]`,
+  never re-latching the deepseek root). A canceled/empty venice account does
+  NOT auto-hop in-dispatch (401/403 = annotation-only `return` + durable
+  block, amendment-1 P1-1); the block then gates SUBSEQUENT cold dispatches to
+  the default leg pre-spawn (next bullet).
+- Kill switches, in order: unset `COLD_CLASS_PROVIDER` (full revert of the
+  SEAM — every dispatch-site text stops asking venice; note this env is read
+  by the skill texts, not by extension code, so an explicit `venice/…` ask
+  at the task tool still routes on key presence — for code-level
+  enforcement use the next bullet), remove/unset `VENICE_API_KEY`
+  (missing-key → the task-tool gate resolves the dispatch to the default
+  deepseek leg BEFORE any spawn), and — while the #476
+  machinery is ACTIVE — a durable venice auth-block (`blockedLegs["venice"]`,
+  24h TTL) makes the same gate send subsequent cold dispatches to the default
+  leg; the block self-heals on key remediation. One more code-level stop,
+  INDEPENDENT of the #476 machinery: listing `venice` in
+  `PROVIDER_FAILOVER_BLOCKED` env (the alternate-leg gate's env-list arm reads
+  it UNCONDITIONALLY — no `failoverActive` guard, so it fires even under
+  `PROVIDER_FAILOVER_DISABLE=1`) gates every venice ask to the default leg
+  pre-spawn, same as the durable-block arm.
+- ⛔ `PROVIDER_FAILOVER_DISABLE=1` is NOT a cold-class kill switch (A1 P3): it
+  only disables the #476 fallback machinery — the alternate-leg gate and the
+  venice leg ignore it, so cold venice routing stays ACTIVE with NO automatic
+  recovery (a venice 402 then strands the dispatch; and because the
+  marker→`blockedLegs` conversion runs inside the #476 decision loop, NO
+  NEW durable auth-block can form either — a 401/403 venice child is
+  re-attempted on every dispatch, bounded only by the retry policy; the one
+  exception is a PRE-EXISTING block written before FAILOVER_DISABLE was set
+  (within its 24h TTL), which the alternate-leg gate still honors). Full
+  revert requires unsetting `COLD_CLASS_PROVIDER` (and removing
+  `VENICE_API_KEY`).
+
+### Measurement (the 0a gate)
+
+Production cold-class routing stays OFF until a ≥2-week prospective usage
+window validates the burn economics. Per-dispatch measurement is
+**default-off**:
+
+- `TASK_USAGE_CAPTURE=1` must reach the CHILD env (task children inherit it;
+  a non-task `pi -p` process with the var exported never emits — the
+  emission requires a task identity, `TASK_HEARTBEAT=1` + nonce, round-2 P2).
+  The child accumulates message_end usage across healthy turns and emits ONE
+  `[task-usage]` stderr line at session_shutdown (nonce-authenticated;
+  provider attribution from the CLI leg — a venice child never mislabels
+  itself deepseek).
+- The parent attaches `details.dispatchUsage` to the settled result whenever
+  the child emitted (CAPTURE reached the child). `TASK_USAGE_LEDGER=1`
+  (parent env) ADDITIONALLY appends the durable `event=dispatch-usage` row to
+  `audit/provider-failover.jsonl` (the 0a window reads the ledger).
+- A real venice dispatch appends an `event=venice-route` row to the same
+  audit file (attributable credit burn without scraping session files).
+  `venice-route` and `dispatch-usage` rows share the per-dispatch
+  `dispatchId` (the TASK_HEARTBEAT_NONCE hex), so route rows and per-leg
+  usage rows are joinable per dispatch.
+
+### Registry
+
+Venice is registered flash-ONLY in `pi-bootstrap/pi-config/models.json`
+(`baseUrl https://api.venice.ai/api/v1`, `$VENICE_API_KEY`,
+cost 0.14/0.28 input/output + 0.03 cacheRead, contextWindow 300000). The
+**#284 carve-out**: `COLD_CLASS_PROVIDER` is an operator override SEPARATE
+from `$SECOND_MODEL` — second-model gates never route venice unless
+`$SECOND_MODEL` itself says so; cold-class applies only to the default-leg
+(flash) reviewer/eval dispatches an operator has explicitly opted in.
