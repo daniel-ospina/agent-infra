@@ -369,9 +369,15 @@ async function main() {
     });
     // #561 review r2: the single-fire invariant needs an exact pin — capture the
     // audit count before the 4th dispatch (the one that trips the latch) and
-    // assert EXACTLY +1 after, so a revert of the extensionEnabled guard (which
-    // would append a 2nd record on this dispatch) goes RED.
+    // assert EXACTLY +1 after.
     const disableAuditsBefore = readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length;
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: [] });
+    // #561 review r3: a latch-trip dispatch alone does NOT discriminate the
+    // extensionEnabled guard (guarded and unguarded both append exactly one
+    // record when vf reaches 3 once). Fire one POST-LATCH dispatch: guarded code
+    // skips it (extensionEnabled=false → no 2nd append → +1); a guard revert
+    // re-enters the threshold block (vf=4, no extensionEnabled check) and appends
+    // a 2nd record → +2 → genuinely RED.
     await fire("tool_result", { toolName: "task", input: { prompt }, content: [] });
     const res = await fire("tool_call", {
       type: "tool_call", toolName: "bash",
@@ -379,7 +385,7 @@ async function main() {
     });
     equal(res, undefined, "gate must DISABLE after 3 real failures despite interleaved zero-merge PASS");
     const disableAuditsAfter = readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length;
-    equal(disableAuditsAfter, disableAuditsBefore + 1, "scenario 8: exactly ONE threshold-disable audit per enabled→disabled transition (single-fire, #561 review r2)");
+    equal(disableAuditsAfter, disableAuditsBefore + 1, "scenario 8: exactly ONE threshold-disable audit per enabled→disabled transition even with a post-latch malformed dispatch (single-fire, #561 review r2/r3)");
     await fire("session_start", {});
   });
 
