@@ -35,7 +35,13 @@ stays undetected. Blockers: no `pi` binary on runners, no reproducible dep tree
 
 ## Verification (corrected after review r1)
 - subagent-integration 11/0 and subagent-e2e-smoke exit 0 hermetic (empty HOME,
-  no provider keys).
+  no provider keys). Coverage breakdown: 5 env-contract + source-assert tests are
+  the meaningful hermetic signal (deterministic, catch the #285/#286 regression
+  classes); the startup-stderr assertions (guarded skips + incidental keyless
+  passes) need a finishing startup + deployed farm and run on dev machines.
+  Review r2: the 3 unguarded spawn tests (LOOP/VISION/no-ParseError) gained the
+  same keyless guard (they passed vacuously + burned ~65s dead windows);
+  runAll(tests) moved below the last pushes (the 11/0 count is now load-bearing).
 - timeout-integration FAILS hermetic (2/1): pi 0.84.3 exits ~2s with "No API
   key found" instead of stalling keyless, so the 5s-timeout assertion
   (`elapsed >= 4500`) fails deterministically — the earlier "3/0 keyless"

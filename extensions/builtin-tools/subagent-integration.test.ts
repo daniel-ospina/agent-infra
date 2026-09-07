@@ -99,12 +99,15 @@ tests.push(test("pi -p process starts and produces stderr", async () => {
 
 section("Extension skip env vars (#6087 regression)");
 tests.push(test("LOOP_ENFORCER_DISABLED=1 skips loop-enforcer init", async () => {
+  // Needs a finishing startup + deployed farm — keyless pi stalls/never emits; same guard as the startup tests (#553 review r2).
+  if (!process.env.DEEPSEEK_API_KEY) { console.log("  ⏭️ no DEEPSEEK_API_KEY — pi won't finish startup; skip-suppression stderr assertions need a deployed farm (dev-machine suite)"); return; }
   const stderr = await spawnAndCapture({ LOOP_ENFORCER_DISABLED: "1" });
   ok(stderr.includes("[loop-enforcer] ⏭️  Disabled") || !stderr.includes("[loop-enforcer] ✅ Loaded"),
      `loop-enforcer should be skipped. stderr: ${stderr.slice(0, 300)}`);
 }));
 
 tests.push(test("VISION_INTERCEPTOR_DISABLED=1 skips vision-interceptor init", async () => {
+  if (!process.env.DEEPSEEK_API_KEY) { console.log("  ⏭️ no DEEPSEEK_API_KEY — pi won't finish startup (dev-machine suite)"); return; }
   const stderr = await spawnAndCapture({ VISION_INTERCEPTOR_DISABLED: "1" });
   ok(stderr.includes("[vision-interceptor] ⏭️  Disabled") || !stderr.includes("[vision-interceptor] Loaded"),
      `vision-interceptor should be skipped. stderr: ${stderr.slice(0, 300)}`);
@@ -146,13 +149,13 @@ tests.push(test("PI_MCP_SERVERS limits loaded servers", async () => {
 
 section("Extension loading integrity (ParseError regression)");
 tests.push(test("no ParseError in extension loading", async () => {
+  if (!process.env.DEEPSEEK_API_KEY) { console.log("  ⏭️ no DEEPSEEK_API_KEY — pi won't finish startup; ParseError assertions need a real extension load (dev-machine suite)"); return; }
   const stderr = await spawnAndCapture({}, 25_000);
   ok(!stderr.includes("ParseError"), `ParseError found in extension loading: ${stderr.slice(0, 500)}`);
   ok(!stderr.includes("'return' outside of function"), `'return' outside function in extension loading`);
   ok(!stderr.includes("Missing catch or finally clause"), `Missing catch/finally in extension loading`);
 }));
 
-runAll(tests);
 
 tests.push(test("PI_MCP_SERVERS defaults to 'none' when mcp_servers param absent (#286)", async () => {
   // The subAgentEnv MCP wiring must DEFAULT the allowlist instead of only
@@ -190,3 +193,5 @@ tests.push(test("subagent tool child env carries task-sub-agent markers + TASK_H
   ok(src.includes("delete childEnv.ELDATO_SKIP_VGATE"), "ELDATO_SKIP_VGATE must be stripped from the subagent-tool child env (#285 Fix A)");
   ok(src.includes("delete childEnv.ELDATO_SKIP_REVIEW_GATE"), "ELDATO_SKIP_REVIEW_GATE must be stripped from the subagent-tool child env (#285 Fix A)");
 }));
+
+runAll(tests);
