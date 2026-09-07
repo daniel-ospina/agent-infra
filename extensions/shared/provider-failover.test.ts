@@ -970,6 +970,59 @@ test("chain continuation: deepseek official also 402s after a venice drain → o
   ok(isLatched("venice", state, { env }), "venice record persists");
 });
 
+test("second-model P2 (SM1): off-table activeLeg RETREATS to the recovered family default after a double-exhaustion drain", () => {
+  const { env } = makeEnv("v-sm1-retreat");
+  // deepseek root freshly latched (in-flight exhaustion at venice drain time)
+  setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: FLASH_PRIMARY,
+    env,
+  });
+  // venice drains under the root latch → its OWN record freezes activeLeg to
+  // openrouter (the write side skips the unavailable deepseek default)
+  const st1 = setExhausted({
+    primaryProvider: "venice",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: VENICE_FLASH,
+    env,
+  });
+  equal(
+    st1.primaries.venice.families["deepseek-v4-flash"].activeLeg?.provider,
+    "openrouter",
+    "frozen leg under the double-exhaustion window (write-side pin unchanged)",
+  );
+  // deepseek RECOVERS (poller clear removes the root record; off-table records
+  // have no clear path — TTL only)
+  const st2 = clearExhaustion("deepseek", { env });
+  ok(!isLatched("deepseek", st2, { env }), "deepseek root recovered");
+  // a cold venice ask must RETREAT to the recovered default (deepseek official
+  // — legs[0]), never keep riding the frozen openrouter leg at real cost
+  const out = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, st2, { env });
+  equal(out.reason, "latched-active");
+  equal(out.leg?.provider, "deepseek", "retreat to the recovered family default");
+  equal(out.leg?.model, "deepseek-v4-flash");
+  // while the default stays unavailable, the frozen deeper leg is still honored
+  // (no retreat past a still-latched default — same openrouter leg the chain
+  // advance would produce, labeled latched-active because the frozen leg is
+  // itself available)
+  const st3 = setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: FLASH_PRIMARY,
+    env,
+  });
+  const out3 = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, st3, { env });
+  equal(out3.reason, "latched-active");
+  equal(out3.leg?.provider, "openrouter", "default still latched → frozen deeper leg honored (no retreat past a latched default)");
+});
+
 test("per-TTL cadence pin: a venice own-latch self-heals after one TTL (no venice poller — TTL-only restore)", () => {
   const { env } = makeEnv("v-ttl");
   const shortEnv = { ...env, PROVIDER_EXHAUSTION_TTL_MS: "200" };

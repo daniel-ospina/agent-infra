@@ -3372,12 +3372,26 @@ export default function (pi: ExtensionAPI) {
       // carry an AUTO nonce the venice-route row could never join. The
       // shared id is set in every config; the child simply reuses it.
       subAgentEnv.TASK_HEARTBEAT_NONCE = randomBytes(6).toString("hex");
-      // #512 proof-of-routing ledger: an actual venice dispatch (the cold-class
+      const buildArgs = (leg: LegRef): string[] =>
+        ["-p", "--provider", leg.provider, "--model", leg.model, "--no-session", params.prompt];
+      const spawnLeg = (leg: LegRef) => spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal);
+
+      let result = await retry(() => spawnLeg(dispatchLeg), retryOptions);
+
+      // #512 proof-of-routing ledger: an ACTUAL venice dispatch (the cold-class
       // seam resolved to the venice leg and no kill switch gated it) appends a
       // venice-route audit row so credit burn is attributable per dispatch
       // WITHOUT scraping session files (audit/provider-failover.jsonl;
       // event=venice-route). Append-only + never throws (appendLedger).
-      if (dispatchLeg.provider === "venice") {
+      // Appended AFTER the first spawn attempt (second-model P2): a
+      // breaker-open first retry returns circuit_open WITHOUT ever calling
+      // spawnLeg — no venice child ran, so no venice credits could burn and no
+      // route row may claim one (a row with no matching dispatch-usage row
+      // would overstate routing volume in the 0a ledger). Any other terminal
+      // (success/timeout/failed) means the venice leg WAS dispatched, so the
+      // row records a real route. The dispatchId (the hoisted nonce above) is
+      // unchanged — still shared with the child's dispatch-usage rows.
+      if (dispatchLeg.provider === "venice" && result.status !== "circuit_open") {
         recordVeniceRoute(
           dispatchLeg,
           family ?? null,
@@ -3387,11 +3401,6 @@ export default function (pi: ExtensionAPI) {
         );
         console.log(`[task] cold-class route → ${dispatchLeg.provider}/${dispatchLeg.model} (venice-route ledger)`);
       }
-      const buildArgs = (leg: LegRef): string[] =>
-        ["-p", "--provider", leg.provider, "--model", leg.model, "--no-session", params.prompt];
-      const spawnLeg = (leg: LegRef) => spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal);
-
-      let result = await retry(() => spawnLeg(dispatchLeg), retryOptions);
 
       // #476 post-dispatch decision loop — extracted runner (unit-tested with
       // a scripted spawn; the real spawn fn is injected here). Bounded:

@@ -1011,6 +1011,30 @@ export function resolveWithChain(
     return { leg: null, halted: true, reason: "halt", hop: null };
   }
   if (fam?.activeLeg && !unavailable.has(fam.activeLeg.provider)) {
+    // #512 second-model P2: an OFF-TABLE record (venice) froze its family
+    // activeLeg at drain time. Under a double-exhaustion (the deepseek root
+    // was ALSO freshly latched when venice drained), that frozen leg is a
+    // DEEPER chain leg (openrouter — the write side skipped the unavailable
+    // default). Off-table records have no poller-clear path (only TTL
+    // self-heal), so the root can recover while the frozen leg persists — a
+    // subsequent cold ask would ride openrouter (real-cost markup) instead of
+    // the recovered default. Retreat to the family DEFAULT (legs[0] =
+    // deepseek official — the documented venice→deepseek→openrouter fallback)
+    // whenever it is now available; keep the frozen deeper leg only when the
+    // default is still out. Table-leg records keep the #476 static-activeLeg
+    // semantics byte-for-byte.
+    if (independentAsk) {
+      const famLegs = familyLegs(family);
+      const defaultLeg = famLegs?.[0];
+      if (
+        defaultLeg &&
+        (defaultLeg.provider !== fam.activeLeg.provider || defaultLeg.model !== fam.activeLeg.model) &&
+        !unavailable.has(defaultLeg.provider)
+      ) {
+        const hop = activeHop(requested, defaultLeg);
+        return { leg: defaultLeg, halted: false, reason: "latched-active", hop };
+      }
+    }
     const hop = activeHop(requested, fam.activeLeg);
     return { leg: fam.activeLeg, halted: false, reason: "latched-active", hop };
   }

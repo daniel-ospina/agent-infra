@@ -3668,6 +3668,27 @@ test("#512 review round-3 P2-1: the execute-path nonce hoist is UNCONDITIONAL an
   ok(argIdx > routeCallIdx && argIdx < routeCallIdx + 400, "route-row dispatchId arg is the hoisted nonce, not a failoverActive conditional");
 });
 
+test("#512 second-model P2 (SM2): the venice-route append runs AFTER the first spawn attempt, guarded on the retry status (source-shape pin)", () => {
+  // Regression guard for the second-model finding: the route row used to be
+  // appended BEFORE the spawn — a breaker-open first retry returns
+  // circuit_open WITHOUT ever calling spawnLeg, so a route row would claim a
+  // venice dispatch that never ran (no burn, no usage row → 0a routing-volume
+  // overcount). Lock the source shape:
+  //   1. the first-spawn retry exists
+  //   2. the recordVeniceRoute call site sits AFTER it
+  //   3. the call is guarded on the retry status (circuit_open → no row)
+  const spawnRetryIdx = source.indexOf("let result = await retry(() => spawnLeg(dispatchLeg), retryOptions);");
+  ok(spawnRetryIdx > 0, "first-spawn retry present in source");
+  const routeCallIdx = source.lastIndexOf("recordVeniceRoute(");
+  ok(spawnRetryIdx < routeCallIdx, "venice-route append runs AFTER the first spawn attempt (no row for a never-spawned dispatch)");
+  const circuitGuardIdx = source.indexOf("result.status !== \"circuit_open\"");
+  ok(circuitGuardIdx > 0, "circuit_open guard present");
+  ok(
+    circuitGuardIdx > spawnRetryIdx && circuitGuardIdx < routeCallIdx + 120,
+    "the guard sits between the spawn retry and the route-row append (breaker-open first retry → no route row)",
+  );
+});
+
 // ── #512 per-dispatch usage capture — parent-side parse/scan ──
 
 section("#512 usage capture — parseTaskUsageLine / scanStderrForUsage (parent side)");
