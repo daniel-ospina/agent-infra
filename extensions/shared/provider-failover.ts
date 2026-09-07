@@ -319,7 +319,10 @@ const SIG_CREDIT_LOW = /(credit\s+balance\s+(?:is\s+)?too\s+low|insufficient\s+c
  * SIG_AUTH_KEY (see classifyExhaustionText ordering): checked after the
  * exhaustion signatures so a 402/exhaustion body containing the phrase
  * (wrapper prefix, key-scoped spend-limit codes) classifies exhaustion, and
- * only phrase-only bodies classify auth_permanent. */
+ * AFTER SIG_FUZZY (round-4 code-review P2) so a body carrying both the
+ * phrase and billing-fuzzy wording stays audit_only (never a durable block
+ * from one ambiguous observation) — only phrase-only bodies (no exhaustion
+ * token, no fuzzy-billing token) classify auth_permanent. */
 const SIG_AUTH_FAILED = /authentication\s+failed/i;
 /** 402 co-occurring with a credit-exhaustion phrase within a bounded
  * line-local window (review P2 — a distant balance/credit word on another
@@ -441,21 +444,31 @@ export function classifyExhaustionText(text: string | null | undefined): Exhaust
     // invoices pending" (audit-only) can never latch (review P3).
     return { kind: "exhaustion", reason: "402", matched: "402+credit-near" };
   }
+  if (SIG_FUZZY.test(t)) {
+    // fuzzy billing wording without 402 — audit-only (never latch) per plan.
+    // Checked BEFORE the bare-auth phrase (round-4 code-review P2): a body
+    // carrying BOTH billing-fuzzy wording and the bare "authentication
+    // failed" phrase ("Authentication failed: quota exceeded…") is
+    // ambiguous — a transient quota/usage event behind an auth-flavored
+    // wrapper is far more likely than a permanently dead key (dead keys
+    // return clean 401 bodies, which the phrase-only check below still
+    // blocks). audit_only never latches; classifying auth_permanent here
+    // would write a DURABLE 24h provider block on one ambiguous observation
+    // for EVERY provider (the phrase is provider-agnostic). Pre-#512 these
+    // bodies were audit_only — semantics preserved.
+    return { kind: "audit_only", reason: null, matched: "billing-fuzzy" };
+  }
   // Bare "authentication failed" (no key wording) — checked AFTER the
-  // exhaustion signatures (code-review round-1 P2): an exhaustion-class body
-  // that CONTAINS the phrase (a wrapper prefix, or venice's key-scoped
-  // spend-limit codes whose message can open with "API key …") must classify
-  // exhaustion, not a durable auth block. Phrase-only bodies (the real venice
-  // 401 `{"error":"Authentication failed"}`) still classify auth_permanent
-  // here — the observed 401 has NO key wording, so it cannot match SIG_AUTH_KEY.
-  // Checked BEFORE SIG_FUZZY: auth is the more conservative class than
-  // audit_only when a body carries both billing-fuzzy and auth wording.
+  // exhaustion signatures (code-review round-1 P2) AND after SIG_FUZZY
+  // (round-4 code-review P2): an exhaustion-class body that CONTAINS the
+  // phrase (a wrapper prefix, or venice's key-scoped spend-limit codes whose
+  // message can open with "API key …") classifies exhaustion first; a body
+  // with billing-fuzzy wording classifies audit_only. ONLY phrase-only
+  // bodies (the real venice 401 `{"error":"Authentication failed"}` — no
+  // key wording, no fuzzy-billing token) reach here and classify
+  // auth_permanent.
   if (SIG_AUTH_FAILED.test(t)) {
     return { kind: "auth_permanent", reason: "blocked", matched: "auth-failed-wording" };
-  }
-  if (SIG_FUZZY.test(t)) {
-    // fuzzy billing wording without 402 — audit-only (never latch) per plan
-    return { kind: "audit_only", reason: null, matched: "billing-fuzzy" };
   }
   return { kind: null, reason: null, matched: null };
 }

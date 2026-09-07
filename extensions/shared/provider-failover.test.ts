@@ -219,6 +219,31 @@ test("falsification (round-1 P2): exhaustion bodies containing 'authentication f
   equal(c3.kind, "exhaustion", "insufficient-balance + auth phrase → exhaustion");
 });
 
+test("falsification (round-4 P2): auth-phrase + fuzzy-billing wording → audit_only, NEVER a durable auth block", () => {
+  // Code-review round-4 P2: SIG_AUTH_FAILED (the bare "authentication
+  // failed" phrase) is checked AFTER SIG_FUZZY. A body carrying BOTH the
+  // phrase and a billing-fuzzy token (quota exceeded / usage limit reached /
+  // monthly usage / billing) is ambiguous — a transient quota/usage event
+  // behind an auth-flavored wrapper — and pre-#512 classified audit_only
+  // (never latches). Before this pin, the phrase (checked before SIG_FUZZY)
+  // escalated the same body to auth_permanent → a DURABLE 24h provider
+  // block on ONE ambiguous observation for EVERY provider.
+  const q1 = classifyExhaustionText("Authentication failed: quota exceeded for the current month");
+  equal(q1.kind, "audit_only", "auth phrase + quota exceeded → audit_only, never block");
+  equal(q1.matched, "billing-fuzzy", "fuzzy-billing match reported");
+  const q2 = classifyExhaustionText("authentication failed — monthly usage limit reached");
+  equal(q2.kind, "audit_only", "auth phrase + usage limit → audit_only");
+  const q3 = classifyExhaustionText('{"error":"Authentication failed","detail":"billing cycle closed"}');
+  equal(q3.kind, "audit_only", "auth phrase + billing wording → audit_only");
+  // Phrase-only bodies (the real venice 401) still block — ordering change
+  // must not have moved them.
+  const p1 = classifyExhaustionText('{"error":"Authentication failed"}');
+  equal(p1.kind, "auth_permanent", "phrase-only body still auth_permanent (round-4 regression pin)");
+  equal(p1.reason, "blocked");
+  const p2 = classifyExhaustionText("Authentication failed. Check https://docs.venice.ai for details");
+  equal(p2.kind, "auth_permanent", "phrase-only with URL suffix still auth_permanent");
+});
+
 section("classifier narrowing pins (deep-review) — generic fragments never false-block");
 
 test("generic gateway auth wording WITHOUT key context → null (never auth_permanent block)", () => {

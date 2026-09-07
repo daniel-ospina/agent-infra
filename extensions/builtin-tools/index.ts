@@ -806,11 +806,27 @@ export function gateOffTableRequest(
  * parity). NOTE: alias families are keyed by MODEL id (provider-agnostic) —
  * venice/deepseek-v4-flash IS family-defined ("deepseek-v4-flash") yet
  * venice is NOT a member leg, so eligibility is membership-tested, never
- * family-lessness-tested (round-2 P1-1). Exported for wiring pins. */
+ * family-lessness-tested (round-2 P1-1). Reroute-impossibility guard
+ * (round-4 P2): a family-less ask whose bare-id default resolves to the SAME
+ * provider (qwen3.8-max→qwen-tp, kimi-k3→moonshot, unresolvable ids falling
+ * back to deepseek) can never gate (gateOffTableRequest's exclusive-host
+ * no-op), so eligibility excludes it and the latch stays unread — restoring
+ * the pre-#512 lazy-read parity for every family-less dispatch. Exported for
+ * wiring pins. */
 export function altGateEligible(requested: LegRef, opts: { registry?: ModelRegistry } = {}): boolean {
   const family = familyOf(requested.model, requested.provider);
   if (family !== undefined && legIsFamilyMember(family, requested.provider)) return false;
-  return providerApiKeyEnvRef(requested.provider, opts.registry ?? loadModelRegistry()) !== undefined;
+  const registry = opts.registry ?? loadModelRegistry();
+  if (providerApiKeyEnvRef(requested.provider, registry) === undefined) return false;
+  // Can gating ever reroute? The gate's default leg is the model's bare-id
+  // default (#154). When that default is the requested provider itself, the
+  // gated outcome would be a no-op — skip the latch read entirely (only
+  // asks whose default DIFFERS, e.g. venice/deepseek-v4-flash → deepseek
+  // official, read it).
+  const bare = resolveProviderModel(requested.model, registry);
+  const defaultProvider =
+    bare.provider ?? (requested.model.startsWith("claude") ? "anthropic" : "deepseek");
+  return defaultProvider !== requested.provider;
 }
 
 /** #512: append the venice-route audit row for a REAL cold-class venice

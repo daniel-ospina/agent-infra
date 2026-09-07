@@ -299,12 +299,19 @@ reported `cache_read_input_tokens=1536` of 1721 prompt tokens).
 
 **`COLD_CLASS_PROVIDER`** is an OPERATOR-exported env convention read by
 reviewer/eval dispatch-site texts (code-review, plan-review, test-review,
-issue-scoping, subagent-driven-development skills). Unset (the default) the
-seam is inert — no dispatch ever routes venice. When an operator exports
+issue-scoping, subagent-driven-development skills) — extension code NEVER
+reads it. Unset (the default) the seam is inert — no seam dispatch site
+routes venice. When an operator exports
 `COLD_CLASS_PROVIDER=venice`, eligible cache-cold one-shot dispatches MAY
 launch through the venice leg (`--provider venice --model deepseek-v4-flash`).
 Interactive/default traffic NEVER routes venice (warm sessions keep their
 cache; only explicitly-opt-in cold-class dispatches burn venice credits).
+Note the code-level truth: an EXPLICIT `venice/…` provider/model ask at the
+task tool (a manual dispatch or a future extension — the seam texts are the
+only in-repo askers today, and they are COLD_CLASS_PROVIDER-gated) routes
+venice whenever `VENICE_API_KEY` is present and venice is not durably
+auth-blocked — `COLD_CLASS_PROVIDER` does not stop that ask; removing the
+key does (kill switch #2 below).
 
 The seam is **per-dispatch**, never a family-table edit: `ALIAS_FAMILIES`
 (the #476 chain table) has NO venice leg (drift-pinned), so warm traffic and
@@ -321,9 +328,13 @@ advancing the deepseek root on another account's evidence.
   NOT auto-hop in-dispatch (401/403 = annotation-only `return` + durable
   block, amendment-1 P1-1); the block then gates SUBSEQUENT cold dispatches to
   the default leg pre-spawn (next bullet).
-- Kill switches, in order: unset `COLD_CLASS_PROVIDER` (full revert),
-  remove/unset `VENICE_API_KEY` (missing-key → the task-tool gate resolves the
-  dispatch to the default deepseek leg BEFORE any spawn), and — while the #476
+- Kill switches, in order: unset `COLD_CLASS_PROVIDER` (full revert of the
+  SEAM — every dispatch-site text stops asking venice; note this env is read
+  by the skill texts, not by extension code, so an explicit `venice/…` ask
+  at the task tool still routes on key presence — for code-level
+  enforcement use the next bullet), remove/unset `VENICE_API_KEY`
+  (missing-key → the task-tool gate resolves the dispatch to the default
+  deepseek leg BEFORE any spawn), and — while the #476
   machinery is ACTIVE — a durable venice auth-block (`blockedLegs["venice"]`,
   24h TTL) makes the same gate send subsequent cold dispatches to the default
   leg; the block self-heals on key remediation.
