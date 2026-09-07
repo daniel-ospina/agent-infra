@@ -20,8 +20,8 @@ stays undetected. Blockers: no `pi` binary on runners, no reproducible dep tree
 - **Keyless hermeticity** (empirically chosen over farm-provisioning): the job
   env exports NO provider keys. Verified keyless-CI-equivalent local runs
   (empty HOME, `env -u *API_KEY`):
-  - timeout-integration 3/0 (relies on keylessness — with a key the children
-    make billed calls),
+  - timeout-integration is NOT wired (see below — its keyless-stall premise
+    is false on pi 0.84.3); tracked in #573,
   - subagent-e2e-smoke exit 0 (self-skips the LLM e2e without DEEPSEEK_API_KEY),
   - subagent-integration 11/0 — 8 env-construction assertions run; the 3
     startup-stderr assertions need a pi that finishes startup + a deployed
@@ -33,10 +33,15 @@ stays undetected. Blockers: no `pi` binary on runners, no reproducible dep tree
   startup-stderr assertions in CI — fragile (replicates the deploy surface),
   and the assertions' value is in the dev-machine loop where the farm is real.
 
-## Verification
-- All three suites green in keyless-CI-equivalent conditions (empty HOME, no
-  provider keys): timeout-integration 3/0, subagent-integration 11/0,
-  subagent-e2e-smoke exit 0.
+## Verification (corrected after review r1)
+- subagent-integration 11/0 and subagent-e2e-smoke exit 0 hermetic (empty HOME,
+  no provider keys).
+- timeout-integration FAILS hermetic (2/1): pi 0.84.3 exits ~2s with "No API
+  key found" instead of stalling keyless, so the 5s-timeout assertion
+  (`elapsed >= 4500`) fails deterministically — the earlier "3/0 keyless"
+  claim in this doc was wrong (that run must have reached real auth). The
+  suite's timeout/cut semantics cannot be exercised in hermetic CI without a
+  deterministic stall; tracked in #573. DELIBERATELY NOT WIRED here.
 - YAML parses; ci-main.yml is not a template-materialized workflow (drift gate
   covers python/node/docs-ci only). actionlint runs in CI.
 - ci-main extension-tests runs all pre-existing suites + the three new ones to
