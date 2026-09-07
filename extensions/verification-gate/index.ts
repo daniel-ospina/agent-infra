@@ -125,6 +125,22 @@ const verifiedSet = new Map<string, string>(); // path → sha256 hash
 let extensionEnabled = true;
 let vgateFailures = 0;
 const VGATE_FAILURE_THRESHOLD = 3;
+
+// #561: ceremony-diagnostics state — the retried block message names the prior
+// dispatch failure class + remedy + attempt count so a blocked agent fixes the
+// dispatch instead of re-dispatching an identical verifier (6+ sub-agent run
+// deaths, 2026-09-05/06 sweep). Classified per #132: DISPATCH-FORMAT classes
+// (empty-content, no-text, unparseable, fail-open-refused) move dispatchStreak
+// — messaging ONLY; this counter NEVER feeds any disable/bypass path (the
+// vgateFailures latch and the #7591 auto-bypass keep their exact semantics).
+// JUDGMENT (fail-verdict) and zero-merge-pass classes record the class for
+// remedy text WITHOUT moving the streak (a FAIL is a successful dispatch; a
+// zero-merge proves nothing about dispatch health). Any merged>0 dispatch
+// resets both. Session-scoped (reset at session_start) — the streak dies with
+// the process; durable state lives in the bridge + audit log.
+type DispatchFailureClass = "empty-content" | "no-text" | "unparseable" | "fail-open-refused" | "fail-verdict" | "zero-merge-pass";
+let lastDispatchClass: DispatchFailureClass | null = null;
+let dispatchStreak = 0;
 // ponytail: single-variable stash assumes one block→verify→merge flow per session turn.
 // Pi sessions are separate Node processes (module state does not cross processes); within
 // a session the agent loop is sequential. If concurrent verifier flows are ever needed, key by toolCallId.
@@ -1958,6 +1974,75 @@ export function isValidResult(obj: any): obj is VerificationResult {
   );
 }
 
+// #561: ceremony-diagnostics helpers (module-level for the pure-export unit
+// suite). The tool_result handler records dispatch outcomes; the NEXT blocked
+// git op reads them and names the failure class + remedy, escalating at the
+// 3-strike threshold. Messaging only — see the state-block comment for the
+// #132 class taxonomy (dispatch-format classes move the streak; judgment /
+// zero-merge classes record remedy text only; any merge resets).
+const DISPATCH_CLASS_REMEDIES: Record<DispatchFailureClass, string> = {
+  "empty-content": "the verifier returned empty content — its response must contain PASS on its own line, or the exact JSON {status, failures, verified_files}. The dispatch prompt must say `verify files:` (PLURAL) naming the repo-relative paths from the block message.",
+  "no-text": "the verifier returned no text content — same requirement: PASS on its own line or the exact JSON {status, failures, verified_files} shape.",
+  unparseable: "the verifier response was not parseable — it must contain PASS on its own line, or exact JSON {status, failures, verified_files}. Re-dispatch with the prompt exactly as printed above.",
+  "fail-open-refused": "the verifier response was unparseable and the fail-open merge was REFUSED for this task sub-agent (#285) — files were NOT recorded. Re-dispatch a verifier whose response is PASS on its own line or the exact JSON shape.",
+  "fail-verdict": "the verifier judged the files NOT ready — do NOT re-dispatch blindly; address the failures it listed, fix the files, then re-dispatch.",
+  "zero-merge-pass": "the verifier PASSed but nothing was recorded (its file list matched no block/diff scope). Re-dispatch naming the EXACT blocked files printed above.",
+};
+
+/**
+ * #561: state-bearing diagnostics appended to a blocked git op after a failed
+ * [VGATE] dispatch. Empty state (lastDispatchClass null) appends nothing —
+ * fresh-session messages are byte-identical, keeping all pinned message tests
+ * intact. `audience` splits the escalation copy: an interactive session has no
+ * parent to return to; a task-capable sub-agent is told to stop and surface the
+ * block when it cannot produce a compliant verifier response.
+ *
+ * Escalation fires only when the LAST dispatch was a dispatch-FORMAT class —
+ * the streak counts format failures, and a judgment/zero-merge outcome that
+ * lands at streak ≥ 3 must never render the "malformed dispatches" header
+ * (it would mislabel a healthy FAIL verdict as a format failure, #132).
+ */
+const FORMAT_CLASSES: ReadonlySet<DispatchFailureClass> = new Set(["empty-content", "no-text", "unparseable", "fail-open-refused"]);
+export function formatCeremonyDiagnostics(klass: DispatchFailureClass, streak: number, audience: "interactive" | "capable" = "capable"): string {
+  const remedy = `  ${DISPATCH_CLASS_REMEDIES[klass]}`;
+  if (streak >= VGATE_FAILURE_THRESHOLD && FORMAT_CLASSES.has(klass)) {
+    const escalation =
+      audience === "interactive"
+        ? "The gate stays ACTIVE and will NOT auto-bypass. Fix the dispatch to satisfy the format requirements above, then retry the git operation."
+        : "The gate stays ACTIVE and will NOT auto-bypass (#285). Fix the dispatch to satisfy the format requirements above, then retry the git operation. If you cannot produce a compliant verifier response, stop and return to the parent session with this block message.";
+    return [
+      "",
+      `⛔ Escalation: ${streak} consecutive malformed VGATE dispatches (last: ${klass}).`,
+      "  STOP re-dispatching the same verifier shape.",
+      remedy,
+      escalation,
+    ].join("\n");
+  }
+  return ["", `⚠️ Previous VGATE dispatch did not verify these files (${klass} — attempt ${streak}):`, remedy].join("\n");
+}
+
+/** #561: a dispatch-FORMAT failure (empty/no-text/unparseable/refused) — moves the streak. */
+export function recordDispatchFailure(klass: DispatchFailureClass): void {
+  lastDispatchClass = klass;
+  dispatchStreak++;
+}
+
+/** #561: a judgment/zero-merge outcome — remedy text only, NEVER moves the streak (#132). */
+export function recordDispatchJudgment(klass: DispatchFailureClass): void {
+  lastDispatchClass = klass;
+}
+
+/** #561: any merged>0 dispatch proves dispatch health — reset class + streak. */
+export function recordDispatchSuccess(): void {
+  lastDispatchClass = null;
+  dispatchStreak = 0;
+}
+
+/** #561: read-only state accessor — lets the pure-export unit suite pin the taxonomy post-conditions (record fns return void). */
+export function dispatchState(): { klass: DispatchFailureClass | null; streak: number } {
+  return { klass: lastDispatchClass, streak: dispatchStreak };
+}
+
 /**
  * #285 P1-A Surface 1: the sub-agent block message, task-tool-aware. The old
  * text unconditionally claimed "This session HAS the task tool" — false for
@@ -2041,6 +2126,8 @@ export default function (pi: ExtensionAPI) {
     pendingRehash = null;
     pendingRehashFiles = [];
     blockAttempts.clear();
+    lastDispatchClass = null; // #561: ceremony diagnostics are session-scoped
+    dispatchStreak = 0;
 
     // Detect: disabled when no write/edit capability or opt-out
     // ponytail: dedicated escape hatch — ELDATO_ALLOW_MAIN_EDITS is the worktree
@@ -2347,6 +2434,10 @@ export default function (pi: ExtensionAPI) {
         reasons.push(`    - ${m.file}`);
         reasons.push(`      expected: ${m.expected}`);
         reasons.push(`      actual:   ${m.actual}`);
+        // #561: dual-cause remedy — a mismatch is EITHER a genuine post-PASS
+        // edit OR a verifier hash-transcription error; name both + the fix so
+        // the agent re-verifies current bytes instead of re-dispatching blindly.
+        reasons.push(`      remedy: file edited after verification OR verifier hash typo — never hand-type sha256: run sha256sum ${m.file} and re-dispatch the exact hash`);
       });
     }
 
@@ -2361,8 +2452,9 @@ export default function (pi: ExtensionAPI) {
     // message is now task-tool-aware (buildSubAgentBlockMessage branches for
     // task-restricted agents — the old text unconditionally claimed the task
     // tool).
+    const ceremonyDiag = lastDispatchClass ? formatCeremonyDiagnostics(lastDispatchClass, dispatchStreak, isTaskSubAgent() ? "capable" : "interactive") : ""; // #561: append at the CALL SITE only — buildSubAgentBlockMessage stays hermetic for its pinned tests
     const reason = isTaskSubAgent()
-      ? buildSubAgentBlockMessage(reasons, cwd, allBlocked)
+      ? buildSubAgentBlockMessage(reasons, cwd, allBlocked) + ceremonyDiag
       : [
           "⛔ Verification gate — blocking git operation.",
           "",
@@ -2372,7 +2464,7 @@ export default function (pi: ExtensionAPI) {
           `    task(prompt='[VGATE] verify files: ${allBlocked.join(' ')}. Classification: <UI|backend|both>. Project root: ${cwd}. Return ONLY JSON: {"status":"PASS","failures":[],"verified_files":[{"path":"<repo-relative>","hash":"<sha256>"}]}.', ...)`,
           "",
           "  → Or set ELDATO_SKIP_VGATE=1 to bypass (emergency only).",
-        ].join("\n");
+        ].join("\n") + ceremonyDiag;
 
     console.log(`[verification-gate] 🚫 Blocked: ${unverified.length} unverified, ${mismatched.length} mismatched`);
     lastBlockedCwd = cwd; // stash authoritative cwd for the merge path (#5607)
@@ -2399,11 +2491,15 @@ export default function (pi: ExtensionAPI) {
     const content = event.content;
     if (!content || content.length === 0) {
       console.error("[verification-gate] ⚠️ Verifier sub-agent returned empty content. Format: prompt must say 'verify files:' (plural); response must contain 'PASS' or valid JSON {status, failures, verified_files}.");
+      recordDispatchFailure("empty-content"); // #561
       vgateFailures++;
       // #285 P1-1: a task sub-agent never auto-disables on repeated dispatch
       // failures — the threshold disable is refused (WARN + audit, gate stays
       // ACTIVE → still blocking).
       if (vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
+        // #561: the latch is one-way and in-process — audit it so a silently
+        // disabled interactive gate leaves a durable forensic record.
+        appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "vgate_failure_threshold_disable", session_cwd: process.cwd() });
         extensionEnabled = false;
         console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures");
       }
@@ -2417,10 +2513,13 @@ export default function (pi: ExtensionAPI) {
 
     if (!textContent) {
       console.error("[verification-gate] ⚠️ Verifier sub-agent returned no text content. Format: response must contain 'PASS' or valid JSON {status, failures, verified_files}.");
+      recordDispatchFailure("no-text"); // #561
       vgateFailures++;
       // #285 P1-1: no threshold auto-disable for task sub-agents (see the
       // empty-content site — same refusal).
       if (vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
+        // #561: audited one-way latch (see the empty-content site).
+        appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "vgate_failure_threshold_disable", session_cwd: process.cwd() });
         extensionEnabled = false;
         console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures");
       }
@@ -2455,6 +2554,7 @@ export default function (pi: ExtensionAPI) {
         || /(?:^|[^\w])['"]?status['"]?\s*[:=]\s*['"]?FAIL['"]?/i.test(textContent);
       if (hasFail) {
         console.error("[verification-gate] ❌ Verifier FAILED (unparseable verdict): keep blocking, no merge");
+        recordDispatchJudgment("fail-verdict"); // #561: judgment class — remedy text only, streak unchanged (#132)
         lastBlockedCwd = null;   // consume stale block state (#5607)
         lastBlockedFiles = [];
         return undefined;
@@ -2532,12 +2632,14 @@ export default function (pi: ExtensionAPI) {
         if (merged > 0) {
           console.log(`[verification-gate] ✅ Plain-text PASS — merged ${merged}/${mergeFiles.length} files from prompt${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
           writeBridge(projectRoot, Array.from(verifiedSet.keys()));
+          recordDispatchSuccess(); // #561: a merge proves dispatch health — reset streak here too (deliberate: the vgateFailures latch does NOT reset on plain-text PASS; this is messaging-only and does not touch the latch)
           lastBlockedCwd = null; // consume on successful merge (#5607)
         } else {
           // #190: zero-merge does NOT consume the block context — a retry
           // dispatch still needs lastBlockedCwd/lastBlockedFiles (a malformed
           // first dispatch must not erase the state the retry depends on).
           console.error(`[verification-gate] ⚠️ Plain-text PASS but could not hash any files (${mergeFiles.length} in scope)`);
+          recordDispatchJudgment("zero-merge-pass"); // #561
         }
         return undefined;
       }
@@ -2573,6 +2675,7 @@ export default function (pi: ExtensionAPI) {
         if (isTaskSubAgent()) {
           console.warn("[verification-gate] ⚠️ Verifier unparseable — fail-open REFUSED for task sub-agent; files NOT recorded; re-dispatch with the required JSON format (#285)");
           appendJsonl({ event: "gate_bypass_refused", extension: "verification-gate", subagent: true, reason: "fail_open_refused", session_cwd: process.cwd() });
+          recordDispatchFailure("fail-open-refused"); // #561: dispatch-format class — moves the streak (latch divergence: vgateFailures does NOT count this class; the streak is messaging-only)
           return undefined;
         }
         const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
@@ -2593,14 +2696,18 @@ export default function (pi: ExtensionAPI) {
           console.log(`[verification-gate] ⚠️ Verifier unparseable — fail-open: merged ${merged}/${promptFiles.size} files from prompt`);
           writeBridge(projectRoot, Array.from(verifiedSet.keys()));
           vgateFailures = 0;
+          recordDispatchSuccess(); // #561
           lastBlockedCwd = null;
           return undefined;
         }
       }
+      recordDispatchFailure("unparseable"); // #561
       vgateFailures++;
       // #285 P1-1: no threshold auto-disable for task sub-agents (refused —
       // gate stays ACTIVE → still blocking).
       if (vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
+        // #561: audited one-way latch (see the empty-content site).
+        appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "vgate_failure_threshold_disable", session_cwd: process.cwd() });
         extensionEnabled = false;
         console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures");
       }
@@ -2619,6 +2726,7 @@ export default function (pi: ExtensionAPI) {
 
     if (result.status !== "PASS") {
       console.error(`[verification-gate] ❌ Verifier returned FAIL: ${result.failures.join("; ")}`);
+      recordDispatchJudgment("fail-verdict"); // #561: judgment class — remedy text only, streak unchanged (#132)
       // #132: a FAIL is a SUCCESSFUL dispatch — the verifier ran and judged the
       // files unready. Keep blocking (nothing to merge) but do NOT count it as a
       // dispatch failure: 3 legitimate FAIL verdicts must not silently disable the
@@ -2648,6 +2756,7 @@ export default function (pi: ExtensionAPI) {
       const fallbackMerged = hashAndMergeFiles(verifiedSet, blockAttempts, lastBlockedFiles, projectRoot);
       if (fallbackMerged > 0) {
         vgateFailures = 0;
+        recordDispatchSuccess(); // #561
         console.log(`[verification-gate] ✅ PASS (empty verified_files) — recorded ${fallbackMerged} blocked files from disk (${verifiedSet.size} total)`);
         writeBridge(projectRoot, Array.from(verifiedSet.keys()));
         lastBlockedCwd = null; // consume on successful merge (#5607)
@@ -2655,6 +2764,7 @@ export default function (pi: ExtensionAPI) {
         // #190: zero-merge does NOT consume the block context — a retry
         // dispatch still needs lastBlockedCwd/lastBlockedFiles.
         console.error(`[verification-gate] ⚠️ PASS with empty verified_files and no block context — zero-merge, failure streak NOT reset (#132)`);
+        recordDispatchJudgment("zero-merge-pass"); // #561
       }
       return undefined;
     }
@@ -2674,6 +2784,7 @@ export default function (pi: ExtensionAPI) {
     // streak — it would mask a broken verifier. Precedent: index.ts:642/686.
     if (merged > 0) {
       vgateFailures = 0;
+      recordDispatchSuccess(); // #561: a merge proves dispatch health
       console.log(`[verification-gate] ✅ Merged ${merged} verified files${totalSkipped > 0 ? ` (skipped ${totalSkipped} not in diff)` : ''} (${verifiedSet.size} total)`);
       // Write bridge file so future sessions/sub-agents can see verification status
       const verifiedPaths = Array.from(verifiedSet.keys());
@@ -2685,6 +2796,7 @@ export default function (pi: ExtensionAPI) {
       // #190: zero-merge does NOT consume the block context — a retry dispatch
       // still needs lastBlockedCwd/lastBlockedFiles.
       console.error(`[verification-gate] ⚠️ PASS but merged 0 files${totalSkipped > 0 ? ` (${totalSkipped} skipped as not in diff)` : ' (empty verified_files)'} — failure streak NOT reset (#132)`);
+      recordDispatchJudgment("zero-merge-pass"); // #561
     }
     return undefined;
   });

@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
@@ -2531,6 +2531,147 @@ test("GREEN: existing negative spans stay clean (#5571 heredoc / inline-string s
   ok(isGitOp("gh issue create --body 'run git commit after'"), "inline-string prose containment unchanged (fires)");
   equal(commitSweepClass("gh pr create --body 'git commit -am x'"), "none", "prose never classifies");
   equal(commitSweepClass("git status"), "none", "status is not a commit");
+});
+
+// ── #561 ceremony diagnostics ──────────────────────────
+
+section("formatCeremonyDiagnostics — state-bearing retry guidance (#561)");
+
+test("below threshold: names the failure class + remedy without escalation", () => {
+  const d = formatCeremonyDiagnostics("unparseable", 1, "capable");
+  ok(d.includes("unparseable"), "names the prior dispatch class");
+  ok(d.includes("attempt 1"), "carries the attempt count");
+  ok(!d.includes("Escalation"), "no escalation below the threshold");
+  ok(!d.includes("STOP re-dispatching"), "no STOP wording below the threshold");
+});
+
+test("escalation at the 3-strike threshold (task-capable copy returns to parent)", () => {
+  const d = formatCeremonyDiagnostics("empty-content", 3, "capable");
+  ok(d.includes("3 consecutive malformed VGATE dispatches"), "escalation names the streak");
+  ok(d.includes("STOP re-dispatching the same verifier shape"), "escalation stops the blind loop");
+  ok(d.includes("will NOT auto-bypass (#285)"), "#285 invariant stated");
+  ok(d.includes("return to the parent session"), "capable sub-agent may surface the block to the parent");
+});
+
+test("escalation at the 3-strike threshold (interactive copy has no return-to-parent)", () => {
+  // Pure-fn contract note (#561 test-review P2): the interactive escalation copy
+  // is DEFENSIVE — at the real call site an interactive session's 3rd dispatch-
+  // format failure fires the one-way vgateFailures disable latch INSIDE the same
+  // tool_result (vgateFailures and dispatchStreak move 1:1 on format classes), so
+  // a streak-3 block never renders interactively; guidance stops at attempt 2, then
+  // the #132 latch (unchanged semantics) takes over. The copy stays audience-safe
+  // for any world in which it does render (no "return to parent" for interactives).
+  const d = formatCeremonyDiagnostics("no-text", 3, "interactive");
+  ok(d.includes("Escalation"), "escalation fires interactively too");
+  ok(!d.includes("return to the parent"), "an interactive session has no parent to return to");
+  ok(d.includes("will NOT auto-bypass"), "no bypass implied interactively");
+});
+
+test("fail-open-refused remedy names the refusal + no-record outcome", () => {
+  const d = formatCeremonyDiagnostics("fail-open-refused", 1, "capable");
+  ok(d.includes("fail-open merge was REFUSED"), "refusal named");
+  ok(d.includes("files were NOT recorded"), "no-record outcome named");
+  ok(!d.includes("Escalation"), "no escalation below the threshold");
+});
+
+test("empty-content remedy names the PASS/JSON requirement + plural verify files", () => {
+  const d = formatCeremonyDiagnostics("empty-content", 1, "capable");
+  ok(d.includes("must contain PASS on its own line"), "PASS-on-own-line requirement named");
+  ok(d.includes("verify files:"), "plural verify-files requirement named");
+});
+
+test("no-text remedy names the no-text cause", () => {
+  const d = formatCeremonyDiagnostics("no-text", 1, "capable");
+  ok(d.includes("no text content"), "no-text cause named");
+});
+
+test("judgment class at streak 3 never renders the malformed-dispatches header (#132)", () => {
+  const d = formatCeremonyDiagnostics("fail-verdict", 3, "capable");
+  ok(!d.includes("malformed VGATE dispatches"), "a FAIL verdict must not be labeled a format failure");
+  ok(!d.includes("STOP re-dispatching"), "no stop instruction after a healthy judgment");
+  ok(d.includes("judged the files NOT ready"), "judgment remedy still rendered");
+  const z3 = formatCeremonyDiagnostics("zero-merge-pass", 3, "capable");
+  ok(!z3.includes("malformed VGATE dispatches"), "a zero-merge PASS must not be labeled a format failure");
+  ok(!z3.includes("Escalation"), "zero-merge never escalates (#132)");
+});
+
+test("escalation boundary: a format class at streak 2 renders guidance, not escalation", () => {
+  const d = formatCeremonyDiagnostics("unparseable", 2, "capable");
+  ok(!d.includes("Escalation"), "no escalation at streak 2");
+  ok(!d.includes("STOP re-dispatching"), "no STOP wording at streak 2");
+  ok(d.includes("attempt 2"), "streak 2 renders the non-escalation template (discriminates a threshold regression to 2)");
+});
+
+test("attempt-0 boundary: a judgment on a clean streak renders attempt 0", () => {
+  const d = formatCeremonyDiagnostics("zero-merge-pass", 0, "capable");
+  ok(d.includes("attempt 0"), "zero prior format failures renders attempt 0");
+});
+
+test("escalation copy never contains the pinned negative phrases — all 4 format classes (plan hygiene promise)", () => {
+  // #561 test-review r1 P2: iterate EVERY dispatch-format class at the escalation
+  // threshold — a future class whose escalation copy drifts toward a pinned
+  // buildSubAgentBlockMessage phrase must be caught by class, not just by sample.
+  for (const klass of ["empty-content", "no-text", "unparseable", "fail-open-refused"] as const) {
+    for (const audience of ["interactive", "capable"] as const) {
+      const d = formatCeremonyDiagnostics(klass, 3, audience);
+      ok(!d.includes("Dispatch the verifier sub-agent"), `${klass}/${audience}: pinned phrase 1 absent`);
+      ok(!d.includes("Report this block"), `${klass}/${audience}: pinned phrase 2 absent`);
+      ok(!d.includes("This session has the task tool"), `${klass}/${audience}: pinned phrase 3 absent`);
+      ok(!d.includes("Dispatch your own VGATE verification"), `${klass}/${audience}: pinned phrase 4 absent`);
+    }
+  }
+});
+
+test("zero-merge remedy names the exact-blocked-file fix", () => {
+  const d = formatCeremonyDiagnostics("zero-merge-pass", 1, "capable");
+  ok(d.includes("EXACT blocked files"), "zero-merge remedy re-targets the dispatch");
+});
+
+test("record-fn taxonomy post-conditions: format classes move the streak; judgment/zero-merge do not; success resets", () => {
+  // These tests mutate module state — the harness runs all tests in one process;
+  // reset in finally so a mid-test throw cannot leak state into later tests.
+  try {
+    recordDispatchSuccess();
+    deepEqual(dispatchState(), { klass: null, streak: 0 }, "clean slate");
+    recordDispatchFailure("unparseable");
+    recordDispatchFailure("empty-content");
+    deepEqual(dispatchState().streak, 2, "dispatch-format classes advance the streak");
+    equal(dispatchState().klass, "empty-content", "last class recorded");
+    recordDispatchJudgment("fail-verdict");
+    deepEqual(dispatchState().streak, 2, "judgment class does NOT move the streak (#132)");
+    equal(dispatchState().klass, "fail-verdict", "judgment class recorded for remedy text");
+    // #561 test-review r1 P2: interpolate the RECORDED class rather than a
+    // hardcoded literal — a recording regression (wrong class persisted) must
+    // fail the formatting assertion, not be masked by the test's own constant.
+    const jd = formatCeremonyDiagnostics(dispatchState().klass!, dispatchState().streak, "capable");
+    ok(jd.includes("judged the files NOT ready"), "judgment remedy directs fix-then-verify");
+    ok(!jd.includes("Escalation"), "judgment never escalates the dispatch streak (#132)");
+    ok(jd.includes("attempt 2"), "below-threshold template interpolates the streak (attempt 2 rendered)");
+    recordDispatchJudgment("zero-merge-pass");
+    deepEqual(dispatchState().streak, 2, "zero-merge class does NOT move the streak (#132)");
+    equal(dispatchState().klass, "zero-merge-pass", "zero-merge class recorded for remedy text");
+    recordDispatchSuccess();
+    deepEqual(dispatchState(), { klass: null, streak: 0 }, "any merge resets class + streak");
+    const d2 = formatCeremonyDiagnostics("unparseable", dispatchState().streak, "capable");
+    ok(!d2.includes("Escalation"), "post-reset formatting has nothing to escalate");
+  } finally {
+    recordDispatchSuccess();
+  }
+});
+
+test("buildSubAgentBlockMessage never emits ceremony diagnostics (call-site append guard)", () => {
+  // #561: the diagnostics append happens at the block-assembly CALL SITE, never
+  // inside this exported builder — its pinned tests must not depend on module
+  // state (which the pure-export suite mutates above).
+  try {
+    recordDispatchFailure("unparseable");
+    equal(dispatchState().streak, 1, "state armed for the hermeticity probe");
+    const msg = buildSubAgentBlockMessage(["  Unverified files:"], "/repo", ["a.ts"], ["pi", "-p", "--tools", "read,bash,edit,write,task"]);
+    ok(msg.includes("[VGATE] verify files: a.ts"), "template still present");
+    ok(!msg.includes("Previous VGATE dispatch"), "builder output is state-independent");
+  } finally {
+    recordDispatchSuccess();
+  }
 });
 // ── Results ───────────────────────────────────────────
 

@@ -373,6 +373,7 @@ async function main() {
       input: { command: "git commit -m 'c8'", cwd: repo },
     });
     equal(res, undefined, "gate must DISABLE after 3 real failures despite interleaved zero-merge PASS");
+    ok(readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length >= 1, "one-way interactive disable must leave a durable audit record (#561)");
     await fire("session_start", {});
   });
 
@@ -908,6 +909,8 @@ async function main() {
         ok(res && res.block === true, `mismatch attempt ${i + 1} must block in sub-agent mode (no auto-bypass)`);
         if (i === 0) {
           ok(/Hash mismatch/.test(res.reason), "block reason must carry the hash-mismatch diagnostic");
+          ok(res.reason.includes("remedy: file edited after verification OR verifier hash typo"), "mismatch reason must name BOTH causes (#561 dual-cause remedy)");
+          ok(res.reason.includes("sha256sum"), "mismatch reason must name the never-hand-type-sha256 fix (#561)");
           ok(res.reason.includes("This session is a task sub-agent"), "mismatch block must still carry the sub-agent marker");
           ok(/Dispatch your own VGATE verification/.test(res.reason), "mismatch block must instruct the child to self-satisfy the gate in-band");
           ok(res.reason.includes("task(prompt="), "mismatch block must show the self-dispatch task(...) template");
@@ -2829,6 +2832,198 @@ async function main() {
         ok(res.reason.includes("This session is a task sub-agent"), "63: the block carries the sub-agent marker");
         ok(/Dispatch your own VGATE verification/.test(res.reason), "63: the block instructs the child to self-satisfy the gate in-band");
       }
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+  });
+  test("scenario 64 (#561): state-bearing retry guidance — recovery on first guidance, escalation at 3, judgment interleave, reset-proof (indicator-1 proof)", async () => {
+    const repo = join(TEST_ROOT, "repo-561-s64");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "f64.txt"), "v1\n");
+    git(repo, "add f64.txt");
+    git(repo, "commit -m baseline");
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    const prosePrompt = (p: string) => `[VGATE] check the staged changes. Classification: backend. Project root: ${p}`;
+    const goodPrompt = (p: string) => `[VGATE] verify files: f64.txt. Classification: backend. Project root: ${p}`;
+    const prose = [{ type: "text", text: "I reviewed the files; everything looks good." }];
+    const passJson = (p: string, content: string) => JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(p, "f64.txt"), hash: sha(content) }] });
+    const commitCmd = "git commit -m 's64'";
+    try {
+      // LEG A — recovery on the FIRST guidance message (primary #561 mode) +
+      // fresh-state no-append guard (the byte-identity property that keeps the
+      // 65 pre-existing scenarios' pinned messages intact).
+      writeFileSync(join(repo, "f64.txt"), "v2\n");
+      git(repo, "add f64.txt");
+      await fire("session_start", {});
+      const first = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(first && first.block === true, "64A: must be blocked first");
+      ok(!first.reason.includes("Previous VGATE dispatch"), "64A: fresh-state block carries NO diagnostics (append-only guard)");
+      await fire("tool_result", { toolName: "task", input: { prompt: prosePrompt(repo) }, content: prose });
+      const guided = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(guided && guided.block === true, "64A: still blocked after the 1st unparseable dispatch");
+      ok(guided.reason.includes("Previous VGATE dispatch did not verify these files (unparseable — attempt 1"), "64A: retry #1 names the failure class + attempt count (state-bearing)");
+      ok(guided.reason.includes("must contain PASS on its own line, or exact JSON"), "64A: retry #1 names the exact fix");
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [{ type: "text", text: passJson(repo, "v2\n") }] }); // #561 test-review r1 P2: no discarded return value — the merge post-condition is asserted by landed1 below
+      const landed1 = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      equal(landed1, undefined, "64A: recovery on the first guidance message (≤2 retries, indicator 1)");
+      git(repo, "commit -m s64");
+      // Sub-agent never-write invariant (#561): crossing the 3-strike threshold in a
+      // capable session must NOT emit vgate_failure_threshold_disable audit records
+      // (the #285 refusal keeps the gate ACTIVE — the audit must not claim a disable).
+      const disableAuditsBefore = readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length;
+      // LEG B — session-scoped reset isolation micro-leg, then the stubborn loop
+      // escalates at 3. (Legs are session-scoped to avoid the #7574 pendingRehash
+      // cross-commit interaction; recordDispatchSuccess reset post-conditions are
+      // pinned at unit level via dispatchState().)
+      await fire("session_start", {}); // clears the #7574 pendingRehash armed by LEG A's allowed commit + the session registry
+      writeFileSync(join(repo, "f64.txt"), "v3\n");
+      git(repo, "add f64.txt");
+      const fresh2 = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(fresh2 && fresh2.block === true, "64B: re-block after LEG A success");
+      ok(!fresh2.reason.includes("Previous VGATE dispatch"), "64B: post-merge session_start leaves a clean session (no stale diagnostics; the recordDispatchSuccess reset post-conditions are pinned at unit level via dispatchState())");
+      await fire("tool_result", { toolName: "task", input: { prompt: prosePrompt(repo) }, content: prose }); // arm the diagnostics state
+      const armed = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(armed && armed.block === true, "64B: still blocked after the armed dispatch");
+      ok(armed.reason.includes("attempt 1"), "64B: armed state renders on the next block (proves the arm)");
+      await fire("session_start", {}); // session-scoped reset: armed -> clean
+      const cleared = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(cleared && cleared.block === true, "64B: still blocked after session_start (fresh session, files unverified)");
+      ok(!cleared.reason.includes("Previous VGATE dispatch"), "64B: session_start cleared the armed diagnostics (armed->clean direction pinned)");
+      await fire("tool_result", { toolName: "task", input: { prompt: prosePrompt(repo) }, content: prose });
+      await fire("tool_result", { toolName: "task", input: { prompt: prosePrompt(repo) }, content: prose });
+      const retry2 = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(retry2 && retry2.block === true, "64B: retry #2 still blocks");
+      ok(retry2.reason.includes("attempt 2"), "64B: retry #2 advances the attempt count");
+      await fire("tool_result", { toolName: "task", input: { prompt: prosePrompt(repo) }, content: prose });
+      const escalated = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(escalated && escalated.block === true, "64B: escalation still blocks (never auto-disables for a sub-agent)");
+      ok(escalated.reason.includes("Escalation: 3 consecutive malformed VGATE dispatches"), "64B: escalation fires at the 3-strike threshold");
+      ok(escalated.reason.includes("STOP re-dispatching the same verifier shape"), "64B: escalation names the stop action");
+      ok(escalated.reason.includes("will NOT auto-bypass (#285)"), "64B: #285 invariant stated in the escalation");
+      ok(escalated.reason.includes("return to the parent session"), "64B: capable escalation names the surface-to-parent exit");
+      // Escalation renders on the block following the 3rd consecutive format failure
+      // (= ≤2 further malformed re-dispatches after the first guidance message —
+      // the indicator-1 count semantics, decision (b) threshold-3).
+      // Post-escalation continuation: the gate NEVER auto-disables for a sub-agent.
+      await fire("tool_result", { toolName: "task", input: { prompt: prosePrompt(repo) }, content: prose });
+      const beyond = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(beyond && beyond.block === true, "64B: a 4th format failure past escalation still blocks (no disable for sub-agents)");
+      ok(beyond.reason.includes("4 consecutive malformed VGATE dispatches"), "64B: the streak keeps counting past escalation");
+      ok(beyond.reason.includes("will NOT auto-bypass (#285)"), "64B: #285 no-bypass restated past escalation");
+      const disableAuditsAfter = readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length;
+      equal(disableAuditsAfter, disableAuditsBefore, "64B: sub-agent threshold crossings write ZERO vgate_failure_threshold_disable records (refusal keeps the gate ACTIVE)");
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [{ type: "text", text: passJson(repo, "v3\n") }] });
+      const landed2 = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      equal(landed2, undefined, "64B: compliant re-dispatch after escalation unblocks the commit");
+      git(repo, "commit -m s64");
+      // LEG C — judgment interleave (#132): a FAIL verdict records remedy text
+      // but does NOT move the dispatch streak, so no escalation can fire from it.
+      await fire("session_start", {});
+      writeFileSync(join(repo, "f64.txt"), "v4\n");
+      git(repo, "add f64.txt");
+      const fresh3 = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(fresh3 && fresh3.block === true, "64C: re-block after LEG B success");
+      await fire("tool_result", { toolName: "task", input: { prompt: prosePrompt(repo) }, content: prose });
+      await fire("tool_result", { toolName: "task", input: { prompt: prosePrompt(repo) }, content: prose });
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [{ type: "text", text: JSON.stringify({ status: "FAIL", failures: ["f64.txt has a lint issue"], verified_files: [] }) }] });
+      const afterJudgment = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(afterJudgment && afterJudgment.block === true, "64C: still blocked after 2 format failures + 1 FAIL verdict");
+      ok(afterJudgment.reason.includes("attempt 2"), "64C: FAIL verdict did NOT advance the streak (judgment class, #132)");
+      ok(!afterJudgment.reason.includes("Escalation"), "64C: 3 legitimate judgments/format mix below the dispatch streak does not escalate");
+      ok(afterJudgment.reason.includes("fail-verdict"), "64C: the FAIL verdict class is named for remedy text");
+      ok(afterJudgment.reason.includes("judged the files NOT ready"), "64C: the disambiguating remedy (FAIL is a judgment, not a format failure) renders on the real block");
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [{ type: "text", text: passJson(repo, "v4\n") }] });
+      const landed3 = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      equal(landed3, undefined, "64C: compliant re-dispatch after the judgment leg unblocks");
+      git(repo, "commit -m s64");
+      // LEG D — zero-merge-pass + fail-open-refused rendered-message wiring. (The
+      // record-sites themselves are also reached by scenarios 8/36; what is unique
+      // here is asserting the RENDERED ceremony message for these two classes.)
+      await fire("session_start", {});
+      // zero-merge record-site #2 (~2767): schema-valid PASS with EMPTY
+      // verified_files and NO block context — the disk fallback has nothing to
+      // hash. Dispatched BEFORE staging so lastBlockedCwd is still null.
+      // (#561 test-review r2 P2: pin this site's rendered class, not just ~2799.)
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [] }) }] });
+      writeFileSync(join(repo, "f64.txt"), "v5\n");
+      git(repo, "add f64.txt");
+      const fresh4 = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(fresh4 && fresh4.block === true, "64D: blocked first");
+      ok(fresh4.reason.includes("zero-merge-pass — attempt 0"), "64D: empty-verified_files zero-merge (~2767) renders its class on the next block");
+      ok(!fresh4.reason.includes("Escalation"), "64D: zero-merge never escalates (#132)");
+      // zero-merge record-site #1 (~2642): PLAIN-TEXT PASS (unparseable, PASS on
+      // its own line) whose prompt names only an OUT-OF-SCOPE file -> scope skip
+      // -> zero-merge on the plain-text merge path. (#561 test-review r2 P2.)
+      await fire("tool_result", { toolName: "task", input: { prompt: `[VGATE] verify files: other.txt. Classification: backend. Project root: ${repo}` }, content: [{ type: "text", text: "PASS: I reviewed the files." }] });
+      const pt = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(pt && pt.block === true, "64D: plain-text zero-merge still blocks (nothing recorded)");
+      ok(pt.reason.includes("zero-merge-pass — attempt 0"), "64D: plain-text zero-merge (~2642) renders its class on the next block");
+      // zero-merge record-site #3 (~2799): schema-valid PASS naming an OUT-OF-SCOPE file -> scope skip -> zero-merge.
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repo, "other.txt"), hash: sha("x") }] }) }] });
+      const zm = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(zm && zm.block === true, "64D: zero-merge PASS still blocks (nothing recorded)");
+      ok(zm.reason.includes("zero-merge-pass"), "64D: zero-merge class named on the next block");
+      ok(zm.reason.includes("zero-merge-pass — attempt 0"), "64D: attempt-0 lower boundary renders after the session_start clean streak");
+      ok(!zm.reason.includes("Escalation"), "64D: zero-merge never escalates (#132)");
+      // fail-open-refused: unparseable prose WITH the verify-files prompt (sub-agent refusal).
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: prose });
+      const refused = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(refused && refused.block === true, "64D: fail-open-refused still blocks (files NOT recorded)");
+      ok(refused.reason.includes("fail-open-refused — attempt 1"), "64D: fail-open-refused advances the streak in the integration path (#561 test-review r1 P2)");
+      ok(refused.reason.includes("fail-open merge was REFUSED"), "64D: refusal remedy named on the next block");
+      ok(refused.reason.includes("files were NOT recorded"), "64D: no-record outcome named");
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [{ type: "text", text: passJson(repo, "v5\n") }] });
+      const landed4 = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      equal(landed4, undefined, "64D: compliant re-dispatch lands");
+      git(repo, "commit -m s64");
+      // LEG E — empty-content / no-text / prose-FAIL record-site wiring (the
+      // remaining arms whose record-site → rendered-message chain was unpinned).
+      await fire("session_start", {});
+      writeFileSync(join(repo, "f64.txt"), "v6\n");
+      git(repo, "add f64.txt");
+      const fresh5 = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(fresh5 && fresh5.block === true, "64E: blocked first");
+      // empty-content arm (content: [] — recordDispatchFailure fires before any prompt parsing).
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [] });
+      const ec = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(ec && ec.block === true && ec.reason.includes("empty-content — attempt 1"), "64E: empty-content class + attempt render on the next block");
+      ok(ec.reason.includes("must contain PASS on its own line"), "64E: empty-content remedy renders");
+      await fire("session_start", {});
+      // no-text arm (non-empty content, zero text members).
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [{ type: "image", text: "" }] });
+      const nt = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(nt && nt.block === true && nt.reason.includes("no-text — attempt 1"), "64E: no-text class + attempt render on the next block");
+      ok(nt.reason.includes("no text content"), "64E: no-text remedy renders");
+      await fire("session_start", {});
+      // prose-FAIL arm (line-anchored FAIL verdict via plain text — judgment class).
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [{ type: "text", text: "FAIL: staged file has a problem" }] });
+      const pf = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(pf && pf.block === true && pf.reason.includes("fail-verdict"), "64E: prose-FAIL judgment class renders on the next block");
+      ok(pf.reason.includes("judged the files NOT ready"), "64E: prose-FAIL disambiguating remedy renders");
+      ok(!pf.reason.includes("Escalation"), "64E: prose-FAIL never escalates (#132)");
+      await fire("tool_result", { toolName: "task", input: { prompt: goodPrompt(repo) }, content: [{ type: "text", text: passJson(repo, "v6\n") }] });
+      const landed5 = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      equal(landed5, undefined, "64E: compliant re-dispatch lands");
+      git(repo, "commit -m s64");
+      // Same-session success-reset proof (recordDispatchSuccess, NO session_start):
+      // a merge clears the diagnostics state, so the NEXT block on a new file in the
+      // SAME session carries no ceremony diagnostics. (#561 test-review r2 P2: the
+      // reset was pinned at unit level via dispatchState() and via session_start in
+      // LEG B; this closes the same-session, no-session_start gap.)
+      writeFileSync(join(repo, "probe561.txt"), "p\n");
+      git(repo, "add probe561.txt");
+      const afterReset = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: commitCmd, cwd: repo } });
+      ok(afterReset && afterReset.block === true, "64E: a new unverified file still blocks after a same-session merge");
+      ok(!afterReset.reason.includes("Previous VGATE dispatch"), "64E: the same-session merge reset the diagnostics state (no stale ceremony message)");
+      git(repo, "rm --cached -q probe561.txt");
+      rmSync(join(repo, "probe561.txt"));
     } finally {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
