@@ -427,6 +427,22 @@ task(prompt='[VGATE] verify files: <list staged files>. Classification: <UI|back
 - The gate extracts file paths from the prompt, not the response — make sure paths are correct
 - `ELDATO_SKIP_VGATE=1` at session start disables this gate entirely (`AGENT_ALLOW_MAIN_EDITS=1` no longer does — #7470)
 
+### VGATE ceremony diagnostics & recovery (#561)
+
+> Behavior change: after a [VGATE] dispatch that did NOT verify your files, the NEXT blocked git op appends a state-bearing diagnostics block naming the prior failure class + remedy + attempt count, escalating at the 3-strike threshold. If you see `⚠️ Previous VGATE dispatch did not verify these files (…)` or `⛔ Escalation: N consecutive malformed VGATE dispatches`, READ the remedy line — it tells you exactly what to fix; do NOT re-dispatch the same verifier shape blindly.
+
+| Failure class (as printed) | Meaning | Remedy |
+|---|---|---|
+| `empty-content` / `no-text` / `unparseable` | Verifier response was not parseable | Response must contain `PASS` on its own line OR exact JSON `{"status":"PASS","failures":[],"verified_files":[…]}`; prompt must say `verify files:` (PLURAL) with the repo-relative paths from the block message |
+| `fail-open-refused` | Unparseable response in a task sub-agent — fail-open merge refused (#285) | Files were NOT recorded; re-dispatch a verifier that returns PASS/JSON per above |
+| `fail-verdict` | Verifier judged the files NOT ready | Do NOT re-dispatch blindly — address the failures the verifier listed, fix the files, then re-dispatch |
+| `zero-merge-pass` | Verifier PASSed but nothing matched the block/diff scope | Re-dispatch naming the EXACT blocked files printed in the block message |
+| Hash mismatch remedy line | Verifier-recorded hash ≠ disk | Either the file changed after verification OR the verifier mis-transcribed the hash — **never hand-type sha256**: run `sha256sum <file>` and re-dispatch the exact hash |
+
+**Threshold semantics (#561):** `dispatchStreak` counts only dispatch-FORMAT failures (empty/no-text/unparseable/refused) and escalates MESSAGING at 3 — it never disables or bypasses anything. The gate NEVER auto-disables for task sub-agents (#285). FAIL verdicts and zero-merge PASSes are successful dispatches (#132) — they add a remedy line but do not move the streak. Any successful merge resets the streak. In an interactive session only, 3 consecutive format failures still auto-disable the gate (unchanged), now recorded to the audit log.
+
+**Observing / clearing bridge state (#561):** `$AGENT_INFRA_PATH/scripts/vgate.sh status` prints the bridge file (`~/.pi/agent/verification/latest.json`) with per-entry root/file/stored-hash + disk match-or-drop preview and the audit tail. `vgate.sh clear` drops the CURRENT worktree root's entries; `clear --root <R>` and `clear --all` target other scopes. Fail-closed: clearing only removes verified state — the next git op re-blocks until re-verified; it is never a bypass. A live session's in-session registry is process-local (not affected by the CLI) — a stuck block inside a running session is cured by the gate's own diagnostics + escalation above, not by the CLI.
+
 ---
 
 ### Test-Review Hash Backstop Gate
