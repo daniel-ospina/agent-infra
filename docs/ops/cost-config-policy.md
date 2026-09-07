@@ -1,5 +1,5 @@
 ---
-title: "Cost-Config Policy — deepseek context clamp @400K & drift guard (#341)"
+title: "Cost-Config Policy — deepseek context clamp @300K & drift guard (#341)"
 type: engineering
 domain: operations
 doc_status: live
@@ -9,11 +9,11 @@ aboutSubjects: organisation-design-team
 aboutObjects: agent-infra, issue-341, pi-config, cost-config-policy
 ---
 
-# Cost-Config Policy — deepseek context clamp @400K & drift guard (#341)
+# Cost-Config Policy — deepseek context clamp @300K & drift guard (#341)
 
 One place that pins the agent-infra fleet's **token-cost guardrail contract**:
-what the 400K deepseek context clamp means, why the guard's classes are
-BLOCK-vs-WARN, and how a deliberate revert (rollback) is done. Delivered by
+what the shipped 300K deepseek context clamp means, why the guard's classes
+are BLOCK-vs-WARN, and how a deliberate revert (rollback) is done. Delivered by
 issue #341 PR-A (config-as-authority); scope/plan:
 `docs/scoping/2026-08-28-issue-341-token-cost-driver-solution-diverge.md` +
 `docs/plans/2026-08-28-issue-341-session-lifecycle.md`.
@@ -23,8 +23,9 @@ issue #341 PR-A (config-as-authority); scope/plan:
 1M that is ~983K — but pi caches the conversation prefix, so a **ceiling
 compaction re-ingests 629–821K fresh tokens at full price** (cacheRead ≈ 0):
 measured 9 low-threshold compactions ≈ $0.16 vs 7 ceiling ≈ $0.70. The clamp
-cuts that amplifier: at 400K the trigger is ~383K and marathon-session cache
-share stays in the cache-read area instead of collapsing.
+cuts that amplifier: at 300K the trigger is **~283,616** (300,000 − 16,384
+`reserveTokens`) and marathon-session cache share stays in the cache-read
+area instead of collapsing.
 
 **Sibling policy (#365):** this file pins the *config* clamp + drift guard;
 the *behavioral* cap on the marathon class (one-issue-per-session, handoff-size
@@ -32,12 +33,22 @@ budget, compaction-trigger expectation, max-call guidance, and the
 pre-committed output+reasoning escalation with its calibration-pending
 threshold) is `docs/ops/session-lifecycle-contract.md`.
 
+**Shipped regime (the #511 dial):** this policy pins the LIVE config numbers —
+clamp **300K**, compaction trigger **~283,616** (= 300,000 − 16,384
+`reserveTokens`), `keepRecentTokens` **12000**. Dialed 400K→300K by #476's
+Compaction fix / PR #511 (commit `3211574`, 2026-09-05): pi-config/models.json
+(23 deepseek entries 400000→300000), settings.json (`keepRecentTokens`
+20000→12000), and the guard `CLAMP` 400000→300000
+(`scripts/check-cost-config.sh`). The 400K-selected-at-#341 context in §3 is
+history; the pin below is the shipped 300K regime.
+
 ---
 
 ## 1. The conditioned savings claim (honest framing)
 
-- The clamp only changes behavior for sessions whose context crosses **~383K**
-  — **marathon sessions**. The 85–87% cache-share figure is marathon-derived;
+- The clamp only changes behavior for sessions whose context crosses
+  **~283.6K** (the shipped 300K-clamp trigger, 283,616) — **marathon
+  sessions**. The 85–87% cache-share figure is marathon-derived;
   the fleet median cache-share is 30%.
 - The pre-registered win is over **COMPACTING sessions**, not fleet-wide: the
   cache-read area (cacheRead $0.0028/M on flash) is retained where a 1M
@@ -64,9 +75,10 @@ data-source-discovery task — no persisted retry records exist to analyze yet.)
   the proof — NOT the shipped 16384) and was silently reverted. That window is
   the existence proof that the compaction trigger fires early and cheaply when
   the clamp is in place, and that live-config writes can silently drift back.
-- The clamp target of **400K** (user-selected over 200K) is deliberately
-  conservative: it keeps headroom for the p95 45–64KB multi-tool reads near
-  the trigger while still avoiding the 1M ceiling.
+- The clamp target of **300K** (dialed 400K→300K by #476's Compaction fix /
+  PR #511, 2026-09-05; #341 originally selected 400K over 200K) is
+  deliberately conservative: it keeps headroom for the p95 45–64KB multi-tool
+  reads near the trigger while still avoiding the 1M ceiling.
 
 ## 4. The qwen-ha decision (excluded from the clamp)
 
@@ -96,8 +108,9 @@ data-source-discovery task — no persisted retry records exist to analyze yet.)
   4h refresh may re-write the live store back to 1M, and that is **DETECTED,
   not blocked**.
 - **Guard classes** (`scripts/check-cost-config.sh`):
-  - `models.json` drift (any deepseek-served id > 400K) → **BLOCK (exit 1)**.
-  - `settings.json` drift (compaction block / `retry.maxRetries != 10000`) →
+  - `models.json` drift (any deepseek-served id > 300K) → **BLOCK (exit 1)**.
+  - `settings.json` drift (compaction block: enabled + `reserveTokens` 16384 +
+    `keepRecentTokens` 12000; or `retry.maxRetries != 10000`) →
     **BLOCK (exit 1)**.
   - **Missing shipped `models.json` / `settings.json` → BLOCK (exit 1)**:
     deletion of the clamp authority is itself terminal drift (clamp gone while
@@ -107,8 +120,8 @@ data-source-discovery task — no persisted retry records exist to analyze yet.)
     moment pi's refresh legitimately reverts the store — the verifier P0).
     The alert path is the **weekly report** (`fleet-cost-report.sh`, PR-B) and
     the **tripwire**: any compaction record with `tokensBefore ≥ 900K`
-    (0.9 × 1M — NOT 0.9 × 400K, which would misclassify every post-clamp
-    compaction as a ceiling).
+    (0.9 × 1M — NOT 0.9 × 300K, which sits at 270K — below the 283,616
+    trigger — and would misclassify every post-clamp compaction as a ceiling).
   - **PR-A ships a detect-only store-drift signal**: the store WARN goes to
     stdout and the sync log only — there is **no escalation recipient yet**
     (no email/Slack/ticket) until PR-B lands `fleet-cost-report.sh` (weekly)
@@ -132,7 +145,7 @@ data-source-discovery task — no persisted retry records exist to analyze yet.)
 
 - The only true escape from the clamp is a **deliberate revert commit**:
   context windows back to 1M **and the guard's `CLAMP` constant updated in
-  the SAME commit** — a reverted clamp with a stale 400K guard would block
+  the SAME commit** — a reverted clamp with a stale 300K guard would block
   every sync/commit (or force override usage indefinitely, which is exactly
   the drift the guard exists to surface).
 - Trigger (pre-committed, owner = weekly report reader): re-read volume or

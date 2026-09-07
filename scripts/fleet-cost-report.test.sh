@@ -6,12 +6,14 @@
 # PI_SESSIONS_DIR / SPM_SH seams so it runs hermetically in CI.
 #
 # Coverage:
-#   CLEAN       3 compacting sessions at the clamp regime, cache-share 70%
-#               (≥ floor 0.65, n≥3) → exit 0, no ESCALATION banner
+#   CLEAN       3 compacting sessions at 290K (in the shipped 300K-clamp
+#               trigger band 283.6–300K), cache-share 70% (≥ floor 0.65,
+#               n≥3) → exit 0, no ESCALATION banner
 #   CEILING     one 996K compaction → exit 1 with 1M-drift escalation
 #   FLOOR       3 clamp-regime sessions at cache-share 40% → exit 1
-#   sub-regime  compacting session with tokensBefore < regime_tb (300K) is
-#               excluded from (b) — a lone sub-regime session does not escalate
+#   sub-regime  compacting session with tokensBefore < regime_tb (283,616 =
+#               the 300K-clamp trigger) is excluded from (b) — a lone
+#               sub-regime session does not escalate
 #   env seam    FLEET_CACHE_FLOOR override changes the (b) band
 
 set -euo pipefail
@@ -64,31 +66,35 @@ PY
 
 echo "── fleet-cost-report thresholds ─────────────────────────────"
 
-# CLEAN: 3 clamp-regime sessions, cache-share 70% each (pooled 70%)
-D="$T/clean"; for i in 1 2 3; do mk_session "$D" "$i" 383000 0.70; done
+# CLEAN: 3 clamp-regime sessions at 290K (283.6–300K trigger band — a
+# pre-dial sub-300K floor would misclassify these as legacy), cache-share 70%
+# each (pooled 70%)
+D="$T/clean"; for i in 1 2 3; do mk_session "$D" "$i" 290000 0.70; done
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi; }
 assert_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
 assert_eq "$RC" "0" "clean fixture exits 0"
 assert_contains "$OUT" "## ✅ CLEAN" "clean fixture reports CLEAN"
 assert_contains "$OUT" "3 compacting" "clean fixture counts 3 compacting sessions"
-assert_contains "$OUT" "✓ in 400K regime" "cache-share 70% ≥ floor 65%"
+assert_contains "$OUT" "3 in the shipped 300K-clamp regime" "290K in-band sessions count as clamp-regime (not legacy)"
+assert_contains "$OUT" "✓ in 300K-clamp regime" "cache-share 70% ≥ floor 65%"
 
 # CEILING: 996K compaction → 1M drift escalation
-D="$T/ceiling"; for i in 1 2; do mk_session "$D" "$i" 383000 0.70; done; mk_session "$D" 9 996000 0.70
+D="$T/ceiling"; for i in 1 2; do mk_session "$D" "$i" 290000 0.70; done; mk_session "$D" 9 996000 0.70
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "1" "ceiling fixture exits 1"
 assert_contains "$OUT" "## ❌ ESCALATION" "ceiling fixture escalates"
 assert_contains "$OUT" "ceiling-compaction count 1 > 0" "escalation names 1M drift"
 
 # FLOOR: 3 clamp-regime sessions at 40% cache-share → escalation
-D="$T/floor"; for i in 1 2 3; do mk_session "$D" "$i" 383000 0.40; done
+D="$T/floor"; for i in 1 2 3; do mk_session "$D" "$i" 290000 0.40; done
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "1" "floor fixture exits 1"
 assert_contains "$OUT" "✗ BELOW FLOOR" "floor fixture flags below-floor share"
 
-# sub-regime: 3 compacting sessions BELOW regime_tb (200K) with 55% share →
-# small-window legacy sessions excluded → not escalated (n_clamp=0)
+# sub-regime: 3 compacting sessions BELOW regime_tb (200K = the pre-clamp
+# 200K-transient legacy band ~196–205K) with 55% share → small-window legacy
+# sessions excluded → not escalated (n_clamp=0)
 D="$T/small"; for i in 1 2 3; do mk_session "$D" "$i" 200000 0.55; done
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "0" "sub-regime only fixture exits 0 (legacy excluded)"
@@ -103,7 +109,7 @@ assert_contains "$OUT" "floor: 80%" "raised floor reflected in report"
 # SMALL-N GUARD: 3 clamp-regime sessions but only ONE carries message cost data
 # (others no-cost). Pooled share 40% < floor, but n_with_cost=1 < 3 → the
 # guard's "single-session share is noise" rationale applies → NOT escalated.
-D="$T/costless"; mk_session "$D" 1 383000 0.40 0; mk_session "$D" 2 383000 0.70 1; mk_session "$D" 3 383000 0.70 1
+D="$T/costless"; mk_session "$D" 1 290000 0.40 0; mk_session "$D" 2 290000 0.70 1; mk_session "$D" 3 290000 0.70 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "0" "cost-less sessions do not pad n to escalate (n_with_cost=1)"
 assert_contains "$OUT" "(n<3 with cost data" "small-n guard message shown"
@@ -118,7 +124,7 @@ assert_eq "$RC" "2" "malformed --since exits 2 (usage error)"
 # DATA-ABSENCE GATE: an unreadable session in the window must NOT silently
 # vanish into a CLEAN pass — the parser error-tags it and the report must
 # surface it as rc=2 (env/data error), never CLEAN rc=0.
-D="$T/absent"; mk_session "$D" 1 383000 0.70 0; mk_session "$D" 2 383000 0.70 0
+D="$T/absent"; mk_session "$D" 1 290000 0.70 0; mk_session "$D" 2 290000 0.70 0
 UNREAD="$D/sessions/$(date +%Y-%m-%d)T19-00-00-000Z_s9.jsonl"
 touch "$UNREAD"; chmod 000 "$UNREAD"
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
@@ -127,7 +133,7 @@ assert_contains "$OUT" "failed to parse and were EXCLUDED" "data-absence names t
 
 # DATA-ABSENCE GATE (corrupt-but-readable): all-bad JSON lines must error-tag
 # (no healthy zero row) → rc=2, never CLEAN.
-D="$T/corrupt"; mk_session "$D" 1 383000 0.70 0; mk_session "$D" 2 383000 0.70 0
+D="$T/corrupt"; mk_session "$D" 1 290000 0.70 0; mk_session "$D" 2 290000 0.70 0
 BADF="$D/sessions/$(date +%Y-%m-%d)T19-30-00-000Z_s8.jsonl"
 printf 'not json\nstill not json\n' > "$BADF"
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
@@ -139,7 +145,7 @@ RC=0; OUT="$(PI_SESSIONS_DIR="$T/does-not-exist" bash "$REPORT" --days 1 2>&1)" 
 assert_eq "$RC" "2" "missing sessions dir exits 2"
 
 # CLEAN regression: no cost data at all across 3 sessions → undefined, not escalated
-D="$T/nocostall"; mk_session "$D" 1 383000 0.40 1; mk_session "$D" 2 383000 0.40 1; mk_session "$D" 3 383000 0.40 1
+D="$T/nocostall"; mk_session "$D" 1 290000 0.40 1; mk_session "$D" 2 290000 0.40 1; mk_session "$D" 3 290000 0.40 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "0" "all-no-cost sessions exit 0 (undefined share, not escalated)"
 assert_contains "$OUT" "no message cost data" "no-cost pool reports undefined"

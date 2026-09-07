@@ -76,7 +76,7 @@ echo "── fleet-cost-weekly driver ──────────────
 
 # CLEAN: 3 clamp-regime sessions, healthy cache-share, no length stops
 D="$T/clean"
-mk_sess "$D" 1 383000 0; mk_sess "$D" 2 383000 0; mk_sess "$D" 3 383000 0
+mk_sess "$D" 1 290000 0; mk_sess "$D" 2 290000 0; mk_sess "$D" 3 290000 0
 rm -f "$T/gh.log"; GH_LOG="$T/gh.log"
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WEEKLY" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "0" "clean fixture exits 0"
@@ -84,7 +84,7 @@ assert_contains "$OUT" "PASS window=1d" "clean fixture logs PASS"
 [ ! -s "$T/gh.log" ] && ok "clean fixture makes no gh call" || bad "clean fixture called gh: $(cat "$T/gh.log")"
 
 # WATCH-only trigger (length) → create
-D="$T/len"; mk_sess "$D" 9 383000 1
+D="$T/len"; mk_sess "$D" 9 290000 1
 rm -f "$T/gh.log"; unset GH_EXISTING
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WEEKLY" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "1" "watch-trigger fixture exits 1"
