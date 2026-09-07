@@ -1357,10 +1357,10 @@ function scanCommitInvocation(rest: string): CommitInvocationScan {
 //      errors on the trailing -o before running anything, so a value-taking
 //      char in the cluster stays unprovable → no unwrap); trailing words are
 //      $0.. positional params and never execute → cut (no ghost sweeps from
-//      arg text). Long options with values (--rcfile/--init-file) or a
-//      value-taking cluster char (bash -O, -o) make the -c position
-//      unprovable → no unwrap. A script-file / -s / stdin shell (no -c) never
-//      unwraps.
+//      arg text). Long options with values (--rcfile/--init-file) are consumed
+//      and scanning continues (they never move the -c position); a value-taking
+//      SHORT char (bash -O, zsh/ksh -o) makes the -c position unprovable → no
+//      unwrap. A script-file / -s / stdin shell (no -c) never unwraps.
 //   3. `eval args` — the builtin concatenates its argv words (quotes already
 //      stripped by the outer shell) with spaces and parses+executes the
 //      result → content-join and re-run.
@@ -1376,13 +1376,20 @@ const SHELL_C_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 // -xec / -aec / -Cec … → the NEXT token is the command string). UNION of the
 // shells' no-value short startup options (bash -a -b -C -e -f -h -i -l -m -n -p
 // -r -s -t -u -v -x -c; dash/zsh/ksh subsets). VALUE-taking options are
-// deliberately absent — bash -O takes a value, zsh/ksh -o take a value, and
-// shells' long --rcfile/--init-file consume a word — all abort the unwrap
-// (unprovable -c position → documented residual).
+// deliberately absent — bash -O takes a value and zsh/ksh -o take a value — a
+// value-taking char in the cluster makes the -c position unprovable → no
+// unwrap (documented residual). LONG options are handled separately below:
+// --rcfile/--init-file consume their value word and scanning CONTINUES (they
+// do not move the -c position — `bash --rcfile /dev/null -c '…'` still runs
+// the payload); other no-value longs are skipped.
 const SHELL_C_CLUSTER_NOARG = new Set(["c", "a", "b", "C", "e", "f", "h", "i", "l", "m", "n", "p", "r", "s", "t", "u", "v", "x"]);
 // cd&& chains + prefix-verb strip — stripSegmentHead minus its env regex (the
 // classifier's env peel must run FIRST so quoted values are never mangled).
-const COMMIT_SEGMENT_HEAD = /^(?:cd\s+(?:['"][^'"]+['"]|[^\s;&|]+)\s*&&\s*)+|^(?:(?:env|sudo|nohup|time|command)\s+)+/;
+// Prefix verbs: env/sudo/nohup/time/command (stripSegmentHead parity) PLUS exec
+// — `exec git commit -am x` replaces the shell with the git command, so the
+// sweep executes (review cycle-3 P0); bare exec with only a redirect (`exec
+// 3<f`, `exec >log`) leaves a non-git remainder → vacuous, harmless.
+const COMMIT_SEGMENT_HEAD = /^(?:cd\s+(?:['"][^'"]+['"]|[^\s;&|]+)\s*&&\s*)+|^(?:(?:exec|env|sudo|nohup|time|command)\s+)+/;
 
 // Peel ONE bash env-assignment prefix (`NAME=value`), quote-aware: the value is
 // the REST OF THE BASH WORD — quoted regions ('…' verbatim; "…" honoring \"

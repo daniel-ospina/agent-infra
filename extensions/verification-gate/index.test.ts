@@ -1790,8 +1790,12 @@ test("SWEEP → \"sweep\" (single pure-sweep invocation)", () => {
     "FOO=\"bar baz\" B=\"p q\" git commit -am x",   // chained quoted env prefixes
     "sudo FOO=\"x y\" git commit -am z",           // env revealed after prefix-verb strip
     "sudo git commit -am x",                      // bare prefix verb (stripSegmentHead parity)
+    "exec git commit -am x",                      // exec replaces the shell with git — the sweep executes (review cycle-3 P0)
+    "exec sh -c 'git commit -am x'",              // exec + wrapper compose
+    "exec env FOO=bar git commit -am x",          // exec + env + env-value chains peel in the fixpoint
     'FOO="x"bar git commit -am x',                // quote-CONCATENATION env value — whole-word peel (pre-#539 stripSegmentHead parity)
     "FOO='it'\\''s' git commit -am x",             // concatenated single-quote escapes in the value
+    "bash --rcfile /dev/null -c 'git commit -am x'", // long option value consumed, -c position unchanged
     "! eval \"bash -c 'git commit -am x'\"",       // composed wrappers peel recursively
     "sh -c 'git commit -am x' && git push origin main", // wrapper sweep + push (vacuous) — THE #489 residual flip
     "sh -c 'git --no-optional-locks commit -am x' && git push origin main", // wrapped no-value-global + push (r3 regression flip)
