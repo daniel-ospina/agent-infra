@@ -1244,10 +1244,12 @@ export function isBareCommitShape(command: string): boolean {
 // consume ATTACHED cluster chars only, never the next token (`-Sa` = gpg keyid a,
 // `-uall` = untracked mode all — neither sweeps; `-S -a` DOES sweep); required-value
 // longs consume the next token; scanning continues past positional/pathspec and unknown
-// tokens — only `--` (pathspec terminator) and end-of-stream end flag parsing; only
-// HEAD-ANCHORED commit invocations classify (wrapper/negation/prose forms stay "none" —
-// unchanged staged scope, no new under-gate; the wrapper-hidden sweep variant is
-// residual #539; repo-redirecting globals (`-C`/`--git-dir`/`--work-tree`) stay
+// tokens — only `--` (pathspec terminator) and end-of-stream end flag parsing. The
+// head-anchor gate is now the scanCommitCommandAgg walker (#539): PROVABLY-executing
+// wrapper/negation/quoted-env prefixes are peeled and the payload re-run through the
+// full segment pipeline (the #489 wrapper/negation/prose "none" carve-out is closed
+// for the sh/bash -c / ! / eval / quoted-env families — scanCommitSegmentText below);
+// repo-redirecting globals (`-C`/`--git-dir`/`--work-tree`) stay
 // recognized-but-un-gated BY DESIGN post-#490: a `-C` commit targets another
 // checkout whose files this root must never verify (cwd-neutral env/-c/--no-pager
 // spellings ARE intercepted via the shared scanner — closed #490).
@@ -1323,32 +1325,283 @@ function scanCommitInvocation(rest: string): CommitInvocationScan {
   return res;
 }
 
-export function commitSweepClass(command: string): CommitSweepClass {
-  let sawSweep = false;
-  let sawNonSweepCommit = false;
-  for (const segment of splitCommandSegments(command)) {
-    const stripped = stripSegmentHead(segment);
-    const commitMatch = findGitCommit(stripped); // substring scan — head-anchored OR wrapper form
-    if (commitMatch === null) continue;          // no commit invocation — vacuous segment
-    if (commitMatch.index !== 0) {
-      // wrapper/negation/prose commit invocation — its (bare) commit half ships
-      // the WHOLE index (staged-only content whose disk state == HEAD is
-      // invisible to `git diff HEAD`), so a composite that ALSO contains a
-      // head-anchored sweep must classify "mixed" → union(staged, WT) scope.
-      // Fail-closed: treating wrappers as invisible here let
-      // `sh -c 'git commit -m y' && git commit -am x` ship staged-only code
-      // unverified (reviewer finding, #489 round 2).
-      sawNonSweepCommit = true;
+// ── #539 — wrapper/negation/quoted-env commit invocation normalization ──
+// #489/#538 classify ONLY head-anchored commit invocations. stripSegmentHead
+// normalizes prefix verbs + cd&& + UNQUOTED env assignments but NOT the
+// wrapper/negation/quoted-env families, so a real executed sweep hides at
+// index > 0 and classifies "none" → staged scope → with staged docs verified
+// the wrapper's `-a`/`--all` sweep ships dirty never-verified code (the #489
+// hole, empirically confirmed for every family below). This residual (named in
+// the #538 scoping table) is closed HERE, in the COMMIT classifiers only:
+// isDeletionPush / parsePushRefSpecs / isBareCommitShape keep stripSegmentHead
+// byte-identical — the #472 plan doc pins `GIT_SSH_COMMAND="ssh -o
+// BatchMode=yes" git push origin --delete foo` as a documented no-fix over-gate
+// (quoted env values must stay OPAQUE to the push purity decision).
+//
+// Wrapper model — scanCommitCommandAgg drives BOTH classifiers over a shared
+// per-invocation scan. For each segment, normalizeCommitSegment normalizes the
+// head (quote-aware env peel + cd&&/prefix verbs, WITHOUT stripSegmentHead's
+// env regex which mangles quoted values), then unwrapExecutingHead peels
+// PROVABLY-executing prefixes (true command position only — prose segments
+// never unwrap) and re-runs the peeled payload through the FULL segment
+// pipeline: a `-c` payload / eval arg is parsed by a shell, so nested
+// separators (`sh -c 'a && git commit -am x'`) execute and must split again.
+// Peel families (each bounded by the depth cap below):
+//   1. `! cmd` negation — the pipeline after ! IS executed (status inverted).
+//   2. shell -c payload — bash/sh/zsh/dash/ksh (path-qualified basename,
+//      SHELL_INTERPRETERS parity with main-worktree-guard's classifier) plus
+//      no-arg option clusters (`-lc`/`-ec`/`-xc` …): the command string is the
+//      NEXT argv word after -c (empirics: an attached payload `-c'echo hi'` or
+//      mid-cluster `-cecho` is REJECTED by bash — next-token only); trailing
+//      words are $0.. positional params and never execute → cut (no ghost
+//      sweeps from arg text). Long options with values (--rcfile/--init-file)
+//      or a value-taking cluster char (bash -O) make the -c position
+//      unprovable → no unwrap. A script-file / -s / stdin shell (no -c) never
+//      unwraps.
+//   3. `eval args` — the builtin concatenates its argv words (quotes already
+//      stripped by the outer shell) with spaces and parses+executes the
+//      result → content-join and re-run.
+//   4. quoted env prefixes — `FOO="bar baz" git commit -am x`: the executed
+//      git sits at the true head once the assignment peels.
+// Anything unprovable (script shells, option-carrying sudo/env, prose,
+// nested repo-switching payloads — see wrapperPayloadSwitchesRepo) falls
+// through to today's fail-closed handling (unparsed wrapper commit →
+// non-sweep; coexisting sweep → "mixed" — the #489 round-2 reviewer
+// finding, preserved verbatim).
+const SHELL_C_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
+// No-arg option-cluster chars allowed BEFORE a trailing -c (bash -lc / -ec /
+// -xec … → the NEXT token is the command string). bash -O takes a value and
+// shells' long --rcfile/--init-file consume a word — both abort the unwrap.
+const SHELL_C_CLUSTER_NOARG = new Set(["c", "e", "f", "i", "l", "m", "n", "r", "s", "v", "x"]);
+// cd&& chains + prefix-verb strip — stripSegmentHead minus its env regex (the
+// classifier's env peel must run FIRST so quoted values are never mangled).
+const COMMIT_SEGMENT_HEAD = /^(?:cd\s+(?:['"][^'"]+['"]|[^\s;&|]+)\s*&&\s*)+|^(?:(?:env|sudo|nohup|time|command)\s+)+/;
+
+// Peel ONE bash env-assignment prefix (`NAME=value`), quote-aware: single- /
+// double-quoted values (double quotes honor \" escapes), unquoted values, empty
+// values. Returns the text AFTER the assignment + trailing whitespace, or null
+// when the head is not an assignment or the assignment consumes the whole text
+// (a bare `FOO=bar` runs no command). Quote-CONCATENATION (`FOO="x"bar`) leaves
+// a non-space char after the closing quote → null (the value holds no
+// whitespace, so the verb regex cannot mangle it — safe to leave).
+function stripEnvAssignmentPrefix(s: string): string | null {
+  const n = s.length;
+  let i = 0;
+  if (i >= n || !/[A-Za-z_]/.test(s[i])) return null;
+  i++;
+  while (i < n && /[A-Za-z0-9_]/.test(s[i])) i++;
+  if (i >= n || s[i] !== "=") return null;
+  i++;
+  if (i >= n) return null;
+  const q = s[i];
+  if (q === "'") {
+    i++;
+    const close = s.indexOf("'", i);
+    if (close === -1) return null;
+    i = close + 1;
+  } else if (q === '"') {
+    i++;
+    while (i < n && s[i] !== '"') {
+      if (s[i] === "\\" && i + 1 < n) i += 2;
+      else i++;
+    }
+    if (i >= n) return null;
+    i++;
+  } else {
+    while (i < n && !/\s/.test(s[i])) i++;
+  }
+  if (i >= n) return null;
+  if (!/\s/.test(s[i])) return null; // value abuts non-space — concat form, not a clean boundary
+  while (i < n && /\s/.test(s[i])) i++;
+  const rest = s.slice(i);
+  return rest.length === 0 ? null : rest;
+}
+
+function stripEnvAssignmentPrefixes(s: string): string {
+  for (let i = 0; i < 16; i++) {
+    const next = stripEnvAssignmentPrefix(s);
+    if (next === null) break;
+    s = next;
+  }
+  return s;
+}
+
+// Segment-head normalization for the COMMIT classifiers: stripSegmentHead-
+// equivalent (cd&& chains + prefix verbs) BUT with the env assignment handled
+// quote-aware BEFORE the regexes — stripSegmentHead's `NAME=\S+` regex consumes
+// `FOO="bar ` out of `FOO="bar baz" git …` and leaves a mangled `baz" git …`
+// head (the #539 quoted-env-hidden variant). Fixpoint so env heads REVEALED by
+// prefix-verb stripping (`sudo FOO="x y" git commit …`) peel next iteration.
+function normalizeCommitSegment(segment: string): string {
+  let s = segment.trim();
+  for (let i = 0; i < 6; i++) {
+    const before = s;
+    s = stripEnvAssignmentPrefixes(s);
+    s = s.replace(COMMIT_SEGMENT_HEAD, "");
+    if (s === before) break;
+  }
+  return s;
+}
+
+// A peeled payload whose executed text can switch the repo the commit runs in
+// (a nested `cd` command at a command boundary, or a repo-redirecting git
+// global) is a DIFFERENT checkout — this hook can only scope the session cwd
+// (#490 foreign boundary). Refuse the unwrap so the segment keeps today's
+// fail-closed wrapper handling instead of WT-scoping THIS repo for a commit
+// that runs in ANOTHER. Boundary-anchored cd (start / after ; & | newline) —
+// a `cd` inside a message or arg is not a repo switch.
+function wrapperPayloadSwitchesRepo(payload: string): boolean {
+  if (/(?:^|[;&|\n]+)\s*cd(?=\s|$)/.test(payload)) return true;
+  return /\bgit\b[^;&|\n]*(?:\s-C\b|--git-dir|--work-tree|--namespace|--super-prefix)/.test(payload);
+}
+
+// Peel PROVABLY-executing wrapper prefixes from a normalized segment head and
+// return the payload text to re-run through the FULL pipeline, or null when
+// the head is not a provably-unwrappable wrapper. Depth-bounded loop so
+// wrapper chains compose (`! eval "bash -c 'git commit -am x'"`); a peel that
+// hits an unprovable or repo-switching payload aborts the WHOLE unwrap (null)
+// → today's unparsed-wrapper handling.
+function unwrapExecutingHead(text: string): string | null {
+  let cur = text;
+  let peeledAny = false;
+  for (let depth = 0; depth < 6; depth++) {
+    const head = readShellToken(cur, 0);
+    if (head === null) break;
+    // (1) `!` negation — the following pipeline executes (exit status inverted).
+    if (head.content === "!" && /\s/.test(cur[head.rawEnd] ?? " ")) {
+      cur = cur.slice(head.rawEnd).trim();
+      peeledAny = true;
       continue;
     }
-    if (scanCommitInvocation(stripped.slice(commitMatch.end)).sweep) {
-      sawSweep = true;
-    } else {
-      sawNonSweepCommit = true;
+    // (2) eval — concatenates its argv words with spaces, then parses+executes.
+    if (head.content === "eval") {
+      const words: string[] = [];
+      let p = head.rawEnd;
+      for (;;) {
+        const w = readShellToken(cur, p);
+        if (w === null) break;
+        words.push(w.content);
+        p = w.rawEnd;
+      }
+      if (words.length === 0) break; // bare `eval` — no-op
+      const joined = words.join(" ");
+      if (wrapperPayloadSwitchesRepo(joined)) return null;
+      cur = joined;
+      peeledAny = true;
+      continue;
     }
+    // (3) shell interpreter -c payload.
+    const base = head.content.slice(head.content.lastIndexOf("/") + 1);
+    if (SHELL_C_INTERPRETERS.has(base)) {
+      let payload: string | null = null;
+      let p = head.rawEnd;
+      for (;;) {
+        const w = readShellToken(cur, p);
+        if (w === null) break;
+        const t = w.content;
+        if (!t.startsWith("-")) break; // script file / -s stdin / non-option — no provable -c
+        if (t === "--") break;          // end of shell options → script path follows
+        if (t === "-c") {
+          const pl = readShellToken(cur, w.rawEnd);
+          payload = pl === null ? "" : pl.content;
+          break; // trailing words are $0.. positional params — CUT
+        }
+        if (t.startsWith("--")) {
+          if (t === "--rcfile" || t === "--init-file") {
+            const val = readShellToken(cur, w.rawEnd);
+            if (val === null) break;
+            p = val.rawEnd;
+          } else {
+            p = w.rawEnd; // no-value long option — keep walking
+          }
+          continue;
+        }
+        const chars = t.slice(1).split("");
+        const endsC = chars[chars.length - 1] === "c";
+        const allNoArg = chars.every((ch) => SHELL_C_CLUSTER_NOARG.has(ch));
+        if (chars.includes("c")) {
+          // trailing c in an all-no-arg cluster → next token is the command string.
+          if (!endsC || !allNoArg) break; // mid-cluster c or value-taking char — unprovable
+          const pl = readShellToken(cur, w.rawEnd);
+          if (pl === null) break;
+          payload = pl.content;
+          break;
+        }
+        if (!allNoArg) break; // value-taking short option — unprovable
+        p = w.rawEnd;         // no-value cluster (-l/-e/-x …) — keep walking
+      }
+      if (payload === null) break; // shell without a provable -c → stop the peel
+      if (payload.length > 0 && wrapperPayloadSwitchesRepo(payload)) return null;
+      cur = payload;
+      peeledAny = true;
+      continue;
+    }
+    break; // head is not a wrapper — stop peeling
   }
-  if (!sawSweep) return "none";
-  return sawNonSweepCommit ? "mixed" : "sweep";
+  return peeledAny ? cur : null;
+}
+
+// Aggregated diff-scope signals across every EXECUTED commit invocation in a
+// command (recursive through provably-executing wrappers).
+interface CommitInvocationAgg {
+  sweep: boolean;            // ≥1 executed commit invocation sweeps (-a/--all)
+  nonSweepCommit: boolean;   // ≥1 executed commit invocation is a non-sweep commit
+  pathspecs: string[];       // named pathspecs of executed WT-path invocations
+  pathspecFromFile: boolean; // --pathspec-from-file seen (names unreadable from text)
+}
+
+const EMPTY_COMMIT_AGG: CommitInvocationAgg = { sweep: false, nonSweepCommit: false, pathspecs: [], pathspecFromFile: false };
+
+function scanCommitCommandAgg(command: string, depth: number): CommitInvocationAgg {
+  const agg: CommitInvocationAgg = { sweep: false, nonSweepCommit: false, pathspecs: [], pathspecFromFile: false };
+  for (const segment of splitCommandSegments(command)) {
+    const inner = scanCommitSegmentText(normalizeCommitSegment(segment), depth);
+    agg.sweep = agg.sweep || inner.sweep;
+    agg.nonSweepCommit = agg.nonSweepCommit || inner.nonSweepCommit;
+    agg.pathspecFromFile = agg.pathspecFromFile || inner.pathspecFromFile;
+    agg.pathspecs.push(...inner.pathspecs);
+  }
+  return agg;
+}
+
+function scanCommitSegmentText(stripped: string, depth: number): CommitInvocationAgg {
+  if (stripped.length === 0) return EMPTY_COMMIT_AGG;
+  const unwrapped = unwrapExecutingHead(stripped);
+  if (unwrapped !== null) {
+    if (depth >= 8) {
+      // nesting cap — cannot see inside; today's fail-closed wrapper posture
+      // (an unparsed wrapper commit may ship the whole index → non-sweep).
+      return { sweep: false, nonSweepCommit: true, pathspecs: [], pathspecFromFile: false };
+    }
+    return scanCommitCommandAgg(unwrapped, depth + 1);
+  }
+  const commitMatch = findGitCommit(stripped); // substring scan — head-anchored OR wrapper form
+  if (commitMatch === null) return EMPTY_COMMIT_AGG; // no commit invocation — vacuous segment
+  if (commitMatch.index !== 0) {
+    // UNPARSED wrapper/negation/prose commit invocation — cannot prove its
+    // flags; its (bare) commit half ships the WHOLE index (staged-only content
+    // whose disk state == HEAD is invisible to `git diff HEAD`), so a
+    // composite that ALSO contains a head-anchored sweep must classify "mixed"
+    // → union(staged, WT) scope. Fail-closed: treating wrappers as invisible
+    // let `sh -c 'git commit -m y' && git commit -am x` ship staged-only code
+    // unverified (reviewer finding, #489 round 2). #539 peeled wrappers never
+    // reach this arm — only genuinely unprovable shapes (prose, script shells)
+    // do.
+    return { sweep: false, nonSweepCommit: true, pathspecs: [], pathspecFromFile: false };
+  }
+  const scan = scanCommitInvocation(stripped.slice(commitMatch.end));
+  return {
+    sweep: scan.sweep,
+    nonSweepCommit: !scan.sweep,
+    pathspecs: scan.pathspecs,
+    pathspecFromFile: scan.pathspecFromFile,
+  };
+}
+
+export function commitSweepClass(command: string): CommitSweepClass {
+  const agg = scanCommitCommandAgg(command, 0);
+  if (!agg.sweep) return "none";
+  return agg.nonSweepCommit ? "mixed" : "sweep";
 }
 
 // ── #538 — WT-path commit classification (diff-scope mirror extension, T2 carve-out) ──
@@ -1367,11 +1620,13 @@ export function commitSweepClass(command: string): CommitSweepClass {
 // — the named paths' HEAD-vs-working-tree state (`git diff HEAD -- <paths>`) is exactly
 // what the form records. This classifier returns null when the command has NO WT-path
 // commit invocation (bare / amend / sweep-only / vacuous) and otherwise the union of
-// named pathspecs across every head-anchored WT-path invocation. Wrapper/negation/prose
-// commit invocations (non-head-anchored) are never parsed here — unchanged staged scope,
-// the #539 wrapper-residual family owns that gap. HEAD-ANCHORED-ONLY mirrors
-// commitSweepClass; a composite that ALSO contains a sweep is handled by the sweep-first
-// routing (the sweep's full-WT scope ⊇ any named-path scope).
+// named pathspecs across every WT-path commit invocation. #539 EXTENSION: the shared
+// scanCommitCommandAgg walker peels provably-executing wrappers, so a wrapper-hidden
+// WT-path form (`sh -c 'git commit -m x f.ts'`, `eval "git commit f.ts -m x"`) now
+// contributes its named pathspecs (the #538 scoping table's "wrapper-hidden sweep +
+// wt-path variants" residual). Unparsed wrappers (prose / script shells) still
+// contribute nothing. A composite that ALSO contains a sweep is handled by the
+// sweep-first routing (the sweep's full-WT scope ⊇ any named-path scope).
 export interface WtPathCommitInfo {
   // Union of the NAMED pathspec tokens across every WT-path commit invocation (globs and
   // pathspec magic kept verbatim — git expands them when the caller passes them to
@@ -1385,22 +1640,9 @@ export interface WtPathCommitInfo {
 }
 
 export function wtPathCommitInfo(command: string): WtPathCommitInfo | null {
-  let sawWtPath = false;
-  let pathspecFromFile = false;
-  const pathspecs: string[] = [];
-  for (const segment of splitCommandSegments(command)) {
-    const stripped = stripSegmentHead(segment);
-    const commitMatch = findGitCommit(stripped); // substring scan — head-anchored OR wrapper form
-    if (commitMatch === null) continue;          // no commit invocation — vacuous segment
-    if (commitMatch.index !== 0) continue;       // wrapper/negation/prose — #539 family, never parsed
-    const scan = scanCommitInvocation(stripped.slice(commitMatch.end));
-    if (scan.pathspecs.length === 0 && !scan.pathspecFromFile) continue; // no named WT content
-    sawWtPath = true;
-    for (const p of scan.pathspecs) pathspecs.push(p);
-    if (scan.pathspecFromFile) pathspecFromFile = true;
-  }
-  if (!sawWtPath) return null;
-  return { pathspecs, pathspecFromFile };
+  const agg = scanCommitCommandAgg(command, 0);
+  if (agg.pathspecs.length === 0 && !agg.pathspecFromFile) return null;
+  return { pathspecs: agg.pathspecs, pathspecFromFile: agg.pathspecFromFile };
 }
 
 // ── #487 — content-push RANGE scoping (T1: a content push verifies the pushed

@@ -1722,20 +1722,23 @@ test("05-cleanup.md fenced block (TRUE fixture — no commit invocations → vac
 // staged index — a gate scoped to `git diff --cached` lets a staged-docs verifier PASS
 // unlock a commit that then sweeps dirty, never-verified code (the #489 hole). The
 // classifier detects sweep-form commit invocations so the hook can diff `git diff HEAD`
-// instead. Values: "sweep" (every head-anchored commit invocation in the command sweeps),
-// "mixed" (≥1 sweep + ≥1 non-sweep head-anchored invocation — the non-sweep commit records
+// instead. Values: "sweep" (every executed commit invocation in the command sweeps),
+// "mixed" (≥1 sweep + ≥1 non-sweep executed invocation — the non-sweep commit records
 // index-only content, so the hook must verify staged ∪ worktree), "none" (no sweep —
 // staged/index scope unchanged, #489 T2). Token model mirrors git's parser: required-value
 // shorts m/F/C/c/t consume rest-of-cluster or the NEXT token (even dash-leading —
 // `git commit -m --amend` is message "--amend", not an amend); optional-value shorts S/u
 // consume ATTACHED cluster chars only, never the next token (`-Sa` = gpg keyid a,
-// `-uall` = untracked mode all — neither sweeps; `-S -a` DOES sweep); required-value longs
-// (--message --file --reedit-message --reuse-message --author --date --template --cleanup
+// `-uall` = untracked mode all — neither sweeps; `-S -a` DOES sweep); required-value
+// longs (--message --file --reedit-message --reuse-message --author --date --template --cleanup
 // --fixup --squash --trailer --pathspec-from-file — --encoding is NOT a git commit option,
 // verified) consume the next token; scanning continues past positional/pathspec and unknown
-// tokens — only `--` (pathspec terminator) and end-of-stream end flag parsing; only
-// HEAD-ANCHORED commit invocations classify (wrappers/prose stay "none" — unchanged staged
-// scope, no under-gate, residual #539).
+// tokens — only `--` (pathspec terminator) and end-of-stream end flag parsing. The head
+// anchor is the scanCommitCommandAgg walker (#539): PROVABLY-executing wrapper/negation/
+// quoted-env prefixes (`sh -c`/`bash -c` -c payloads, `!`, `eval`, quoted env values) are
+// peeled and their payload re-run through the full pipeline — those forms classify like
+// the bare form (sweeps → "sweep"/"mixed", bare → "none"); unparsed wrappers/prose
+// (gh pr --body, echo, script shells) stay "none" unchanged.
 
 section("commitSweepClass — auto-sweep commit classification (#489)");
 
@@ -1767,8 +1770,29 @@ test("SWEEP → \"sweep\" (single pure-sweep invocation)", () => {
     "git commit -u -a -m x",                  // same for -u
     "git commit --amend -a",                  // via the -a arm
     "git commit -a --amend",
-    "git commit -a -m x && git commit --all -m y", // every head-anchored invocation sweeps → sweep
+    "git commit -a -m x && git commit --all -m y", // every executed invocation sweeps → sweep
     "git commit -am x && git push origin main",    // push segment is vacuous (no commit invocation)
+    // ── #539 — wrapper/negation/quoted-env-hidden sweeps classify like the bare form ──
+    "sh -c 'git commit -am x'",                   // shell -c payload (single-quoted)
+    "bash -c \"git commit -am x\"",                // shell -c payload (double-quoted)
+    "bash -lc 'git commit -am x'",                // option cluster before -c (login)
+    "bash -ec 'git commit -am x'",                // option cluster before -c (errexit)
+    "zsh -c 'git commit --all -m x'",
+    "dash -c 'git commit -am x'",
+    "/usr/bin/bash -c 'git commit -am x'",       // path-qualified interpreter basename
+    "! git commit -am x",                         // negation — the command after ! executes
+    "! git commit -am x && git push origin main", // negation + vacuous push segment
+    "eval \"git commit -am x\"",
+    "eval 'git commit --all -m x'",
+    "eval \"git commit -am 'x'\"",                 // quotes preserved inside the eval payload
+    'FOO="bar baz" git commit -am x',             // quoted multi-word env prefix
+    "FOO='bar baz' git commit -am x",
+    "FOO=\"bar baz\" B=\"p q\" git commit -am x",   // chained quoted env prefixes
+    "sudo FOO=\"x y\" git commit -am z",           // env revealed after prefix-verb strip
+    "sudo git commit -am x",                      // bare prefix verb (stripSegmentHead parity)
+    "! eval \"bash -c 'git commit -am x'\"",       // composed wrappers peel recursively
+    "sh -c 'git commit -am x' && git push origin main", // wrapper sweep + push (vacuous) — THE #489 residual flip
+    "sh -c 'git --no-optional-locks commit -am x' && git push origin main", // wrapped no-value-global + push (r3 regression flip)
   ];
   for (const c of pins) equal(commitSweepClass(c), "sweep", `must be sweep: ${c}`);
 });
@@ -1784,6 +1808,13 @@ test("MIXED (sweep + non-sweep commit in one command) → \"mixed\"", () => {
     "sh -c 'git commit -m y' && git commit -am x",
     "! git commit -m y && git commit --all -m x",
     "bash -lc 'git commit -m y' && git commit -am x",
+    // #539 — wrapper SWEEP + wrapper bare / bare + wrapper sweep both mix (the
+    // non-sweep executed commit records index-only content):
+    "sh -c 'git commit -am x' && sh -c 'git commit -m y'",  // both wrappers — sweep half now visible
+    "sh -c 'git commit -m y' && ! git commit -am x",
+    "eval \"git commit -am x\" && bash -c 'git commit -m y'",
+    "FOO=\"x y\" git commit -am x && git commit -m z",        // quoted-env sweep + bare
+    "sh -c 'git commit -am x && git commit -m y'",            // nested compound inside one payload
   ];
   for (const c of pins) equal(commitSweepClass(c), "mixed", `must be mixed: ${c}`);
 });
@@ -1816,10 +1847,20 @@ test("NONE (bare / amend-alone / pathspec / value-swallowed / vacuous) → \"non
     "git commit -m x --only",
     "git commit -m x -- -a",             // `--` pathspec terminator → "-a" is a path, not a flag
     "git commit --all=true",             // invalid attached spelling — not the flag
-    "sh -c 'git commit -am x'",          // wrapper — non-head-anchored → none (staged scope, unchanged; #539)
-    "! git commit -am x",
+    // #539 — wrapper BARE commits stay index-scoped (no sweep inside); unparsed
+    // wrappers + prose never classify:
+    "sh -c 'git commit -m x'",           // wrapper bare — non-sweep executed commit
+    "bash -c 'git commit -m y'",
+    "eval \"git commit -m x\"",
+    "! git commit -m x",
+    'FOO="bar baz" git commit -m x',      // quoted env + bare
+    "bash foo.sh",                       // script shell — no -c payload, never unwraps
+    "sh -c 'cd /tmp/x && git commit -am y'",  // nested repo-switch payload — unwrap refused (wrong-repo guard)
     "git push origin main",              // vacuous — no commit invocation
     "gh pr create --body 'git commit -am x'",  // prose — never classified
+    "gh pr create --body 'sh -c \"git commit -am x\"'", // wrapper-in-prose — never unwrapped (head is gh)
+    "echo 'git commit -am x'",           // prose — head is echo
+    "echo bash -c 'git commit -am x'",   // interpreter in ARG position — never unwrapped
   ];
   for (const c of pins) equal(commitSweepClass(c), "none", `must be none: ${c}`);
 });
@@ -1829,15 +1870,16 @@ test("NONE (bare / amend-alone / pathspec / value-swallowed / vacuous) → \"non
 // wtPathCommitInfo answers "does the command commit NAMED paths' WORKING-TREE state
 // (pathspec / -o/--only / -i/--include)?" — a PARTIAL sweep whose recorded file set is
 // the named paths' HEAD-vs-WT diff, invisible to a staged-diff scope. Null when no
-// head-anchored commit invocation carries a pathspec; otherwise the union of named
+// executed commit invocation carries a pathspec; otherwise the union of named
 // pathspecs (verbatim — globs expand at diff time) plus a pathspecFromFile flag for
 // --pathspec-from-file (names live in a file — caller falls back to the full WT scope).
 // Token model mirrors the #489 scanner (shared scanCommitInvocation): required-value
 // shorts m/F/C/c/t and required-value longs consume the NEXT token; optional-value
 // shorts S/u attached-only; `--` makes every remaining token a pathspec; git permutes
-// options and positionals (flags after a pathspec still parse). HEAD-ANCHORED-ONLY:
-// wrapper/negation/prose commit invocations stay null (unchanged staged scope — the
-// #539 wrapper-residual family owns that gap). NOTE: sweep-only forms (-a/--all, no
+// options and positionals (flags after a pathspec still parse). #539: provably-
+// executing wrappers (sh/bash -c payloads, !, eval, quoted env) contribute their named
+// pathspecs via the shared scanCommitCommandAgg walker; unparsed wrappers/prose
+// (gh pr --body, echo, script shells) stay null. NOTE: sweep-only forms (-a/--all, no
 // pathspec) return null — the sweep-first routing gives them the full-WT branch.
 
 section("wtPathCommitInfo — WT-path commit classification (#538)");
@@ -1861,6 +1903,12 @@ test("PRESENT (pathspec / -o / --only / -i / --include / --pathspec-from-file) �
     ["git commit --pathspec-from-file=p.txt -m x", { pathspecs: [], pathspecFromFile: true }],          // SPACE spelling — names in the file
     ["git commit --pathspec-from-file p.txt -m x", { pathspecs: [], pathspecFromFile: true }],          // space spelling — file value consumed, not a pathspec
     ["git commit -m x f.txt --pathspec-from-file=p.txt", { pathspecs: ["f.txt"], pathspecFromFile: true }], // both — fromFile wins the routing fallback
+    // #539 — wrapper/negation/quoted-env WT-path forms now contribute their pathspecs:
+    ["sh -c 'git commit -m x f.txt'", { pathspecs: ["f.txt"], pathspecFromFile: false }],              // shell -c payload
+    ["! git commit -m x f.txt", { pathspecs: ["f.txt"], pathspecFromFile: false }],                    // negation
+    ["eval \"git commit f.txt -m x\"", { pathspecs: ["f.txt"], pathspecFromFile: false }],
+    ["bash -c 'git commit f.txt -m x' && git commit -m y", { pathspecs: ["f.txt"], pathspecFromFile: false }], // wrapper half parsed; bare half contributes nothing
+    ["FOO=\"bar baz\" git commit -m x src/app.ts", { pathspecs: ["src/app.ts"], pathspecFromFile: false }], // quoted-env prefix
   ];
   for (const [c, expected] of cases) {
     deepEqual(wtPathCommitInfo(c), expected, `wt-path info must match: ${c}`);
@@ -1887,10 +1935,16 @@ test("ABSENT (bare / amend / value-swallowed / sweep-only / wrapper / prose) →
     "git commit --amend -m x",                // amend-alone — staged scope, unchanged (#489 T2)
     "git commit -m x --only",                 // -o/--only with NO paths — git errors pre-hook; stays staged scope
     "git commit -o",
-    "sh -c 'git commit -m x f.txt'",          // wrapper — non-head-anchored → null (#539 family)
-    "! git commit -m x f.txt",
-    "bash -c 'git commit f.txt -m x' && git commit -m y", // wrapper half never parsed
+    // #539 — wrapper BARE / unparsed wrapper / prose contribute no pathspecs:
+    "sh -c 'git commit -m x'",                // wrapper bare — no named path
+    "! git commit -m x",
+    "bash -c 'git commit -m y'",
+    "eval \"git commit -m x\"",
+    "bash foo.sh",                           // script shell — never unwraps
+    "sh -c 'cd /tmp/x && git commit -m y f.txt'", // nested repo-switch payload — unwrap refused
     "gh pr create --body 'git commit -m x f.txt'",  // prose — never classified
+    "gh pr create --body 'bash -c \"git commit f.txt -m x\"'", // wrapper-in-prose
+    "echo bash -c 'git commit f.txt -m x'",  // interpreter in ARG position — never unwrapped
     "git push origin main",                   // vacuous — no commit invocation
     "git status",
   ];
@@ -2566,7 +2620,7 @@ test("RED (#490 T2 round-3): wrapper-contained global+verb followed by && git pu
   ok(isGitOp("sh -c 'git --no-optional-locks commit' && git push origin main"), "wrapped no-value-global commit + trailing push must intercept");
   ok(isGitOp("echo \"git --no-optional-locks commit\" && git push origin main"), "prose-wrapped + trailing push must intercept");
   ok(isGitOp("sh -c 'git --no-optional-locks commit' && echo hi && git push origin main"), "wrapped + interposed echo + push must intercept");
-  equal(commitSweepClass("sh -c 'git --no-optional-locks commit -am x' && git push origin main"), "none", "wrapper-contained sweep stays 'none'/staged per #489 semantics (wrapper-alone → staged scope — documented residual #539); the interception pins above are the r3 regression guards");
+  equal(commitSweepClass("sh -c 'git --no-optional-locks commit -am x' && git push origin main"), "sweep", "wrapper-contained sweep now classifies sweep (#539 — the wrapper's -a sweep is executed, so the hook must diff the WT; pre-#539 this was 'none'/staged — the documented residual #539 closes here); the interception pins above are the r3 regression guards");
 });
 
 section("#490 T2 — cwd-neutral boundary + containment guards (group B)");
