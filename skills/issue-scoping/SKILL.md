@@ -213,7 +213,7 @@ CHECK FOUR DIMENSIONS + DIMENSION 5:
    - Edge cases, error states, failure modes not accounted for?
    - Stakeholders or downstream systems not mentioned?
    - Dependencies assumed but not verified?
-   - **Deferred/gated scope:** if the scope defers any work pending data, prove-out, approval, or a future event, a REAL re-check mechanism must exist (scheduled job, dated gate, automated trip, named owner + trigger). "Defer until X" with no mechanism = silent rot; flag as P1.
+   - **Deferred/gated scope:** if the scope defers any work pending data, prove-out, approval, or a future event, a REAL re-check mechanism must exist — a scheduled job, a dated gate, an automated trip, or a named owner + concrete trigger. "Defer until X" with no mechanism = silent rot; flag as P1.
 
 5. RESEARCH ARTIFACT (Phase 1.5 — external best-practice research):
    - Is the `### Axis Research` block present in the scoping output, OR a justified-skip trigger assessment (axes all low + no deps + no novel pattern)?
@@ -383,6 +383,7 @@ CHECK ACROSS ALL PHASES:
 3. SOLUTION DIVERGE: Distinct approaches? Tradeoffs documented?
 4. SOLUTION CONVERGE: Quality over convenience? Rejected alternatives documented?
 5. COMPLETENESS: States covered? Edge cases? Prerequisites? Acceptance Criteria?
+   - **Deferred/gated work:** if the scope defers any work pending data, prove-out, approval, or a future event, a REAL re-check mechanism must exist (scheduled job, dated gate, automated trip, named owner + trigger). "Defer until X" with no mechanism = silent rot; flag as P1.
 6. WIRING: Integration surfaces accounted for?
 7. HYPOTHESIS RULE: If the issue body prescribes a solution ("the fix is X"), was it treated as a hypothesis to verify — not the settled plan?
 
