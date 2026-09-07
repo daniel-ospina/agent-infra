@@ -19,8 +19,9 @@ with a calibration-pending threshold** — no fabricated numbers). Sibling
 policy: `docs/ops/cost-config-policy.md` (the deepseek context clamp + drift
 guard). NOTE: this contract states the LIVE clamp regime (300K, since #476's
 Compaction fix / PR #511, 2026-09-05); cost-config-policy.md and
-fleet-cost-report.sh's prose/constants still carry the pre-dial 400K regime —
-tracked as issue #570, not restated here.
+fleet-cost-report.sh's prose/constants are re-anchored from the pre-dial 400K
+regime to the shipped 300K clamp by issue #570 — this doc restates only the
+shipped regime.
 
 **Driver vs amplifier (honest framing):** #341's postmortem named two
 different cost problems. The **amplifier** is cold compaction at the 1M
@@ -208,7 +209,7 @@ waits on data.**
   *pays*; this contract
   reduces how *bloated* a session *gets*. They are complementary: the clamp's
   savings are measured over compacting sessions only (cost-config-policy §1,
-  pre-dial 400K prose — see #570),
+  re-anchored to the shipped 300K clamp at #570),
   and the cheapest compacting session is the one that never needed the
   context that triggered compaction — which is §1 + §2's job.
 - **#363 (6h cap) amplifies the marathon shape** — longer sanctioned runs
@@ -243,7 +244,8 @@ evaporate. Measured anchors (no new claims): marathon band 1,000–3,800 calls,
 100+ KB handoff seeds, 500–800K pre-clamp context — #341 issue body + #340
 plan (docs/plans/2026-09-05-issue-340-session-cost-guardrail-plan.md); the
 live clamp regime (300K / trigger 283,616 / keepRecentTokens 12K) — the
-SHIPPED pi-bootstrap/pi-config config + guard (the #511 dial; the
-400K-era docs that still say otherwise are issue #570); the (c) 58%
+SHIPPED pi-bootstrap/pi-config config + guard (the #511 dial;
+cost-config-policy.md + fleet-cost-report.sh carry the 400K-era prose
+re-anchored by issue #570); the (c) 58%
 pre-registration — #341 plan Task B7 + fleet-cost-report.sh; #373 cadence +
 dedup — #373 issue + fleet-cost-weekly.sh; #363 6h cap — issue #363.
