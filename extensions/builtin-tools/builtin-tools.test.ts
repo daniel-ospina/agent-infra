@@ -3539,6 +3539,54 @@ test("chain member / root legs and key-less providers are NOT eligible (latch st
   }
 });
 
+test("round-4 P2 pin: SAME-HOST family-less asks (bare default == requested provider) are NOT eligible — latch stays unread", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // Registry with additional KEYED single-host rows (qwen-tp, moonshot). A
+    // family-less qwen3.8-max/kimi-k3 ask resolves its bare default back to
+    // the SAME provider — gateOffTableRequest's exclusive-host no-op would
+    // return ungated every time — so eligibility must be false and the
+    // always-on task path never reads the latch for them (round-4 P2:
+    // pre-#512 lazy-read parity). Unresolvable ids falling back to their
+    // requested provider (deepseek/vision-exp) are excluded the same way.
+    // Cross-host asks (venice/deepseek-v4-flash → deepseek official) stay
+    // eligible — the kill-switch surface is intact (pinned below).
+    const REG_KEYED = {
+      providers: {
+        deepseek: { apiKey: "$DEEPSEEK_API_KEY", models: [{ id: "deepseek-v4-flash" }] },
+        venice: { apiKey: "$VENICE_API_KEY", models: [{ id: "deepseek-v4-flash" }] },
+        "qwen-tp": { apiKey: "$QWEN_TOKEN_PLAN_API_KEY", models: [{ id: "qwen3.8-max" }] },
+        moonshot: { apiKey: "$MOONSHOT_API_KEY", models: [{ id: "kimi-k3" }] },
+      },
+    };
+    equal(
+      altGateEligible({ provider: "qwen-tp", model: "qwen3.8-max" }, { registry: REG_KEYED as any }),
+      false,
+      "qwen-tp/qwen3.8-max same-host default → NOT eligible (would never reroute)",
+    );
+    equal(
+      altGateEligible({ provider: "moonshot", model: "kimi-k3" }, { registry: REG_KEYED as any }),
+      false,
+      "moonshot/kimi-k3 same-host default → NOT eligible",
+    );
+    equal(
+      altGateEligible(
+        { provider: "deepseek", model: "deepseek-v4-flash-vision-exp" },
+        { registry: REG_KEYED as any },
+      ),
+      false,
+      "unresolvable id falling back to its own requested provider (deepseek) → NOT eligible",
+    );
+    equal(
+      altGateEligible({ provider: "venice", model: "deepseek-v4-flash" }, { registry: REG_KEYED as any }),
+      true,
+      "venice cross-host default → still eligible (kill-switch surface intact)",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 section("#512 venice-route ledger — recordVeniceRoute append site (round-4 P2 pin)");
 
 test("recordVeniceRoute: a real venice dispatch appends the audit row with kind/class/family/hop", () => {
