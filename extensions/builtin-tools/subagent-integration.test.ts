@@ -86,6 +86,12 @@ tests.push(test("escape hatch flags still honored when set explicitly (classifie
 
 section("Sub-agent spawns (startup check)");
 tests.push(test("pi -p process starts and produces stderr", async () => {
+  // Needs a pi that finishes startup + a deployed extension farm — in CI (no
+  // DEEPSEEK_API_KEY, empty runner ~/.pi) pi stalls during provider/MCP init
+  // and the extension-load messages never arrive (#553 wiring: hermetic CI
+  // must not export provider keys). Same guard as the sibling startup tests;
+  // runs on dev machines (keys + deployed farm present).
+  if (!process.env.DEEPSEEK_API_KEY) { console.log("  ⏭️ no DEEPSEEK_API_KEY — pi won't finish startup; extension-load stderr assertions need a deployed farm (dev-machine suite)"); return; }
   const stderr = await spawnAndCapture({});
   ok(stderr.length > 0, "stderr should not be empty (extension load messages)");
   ok(stderr.includes("[builtin-tools]") || stderr.includes("Loaded"), `should have extension messages. stderr: ${stderr.slice(0, 200)}`);
