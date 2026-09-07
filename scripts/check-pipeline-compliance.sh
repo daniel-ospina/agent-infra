@@ -260,7 +260,11 @@ run_checks() {
       # includes the stale-marker removal step: record-review.sh APPENDS
       # markers and never removes them, so re-recording clean leaves the old
       # clean-micro line behind and this binding keeps firing.
-      if printf '%s' "$EVID_TEXT" | grep -q 'verdict=clean-micro'; then
+      # Precision (#513 self-review catch): the binding must match the
+      # record-review.sh MARKER shape (verdict=… @ <40-hex sha>) — never bare
+      # prose mentioning the marker text (this PR's own description tripped
+      # the bare-substring grep on the first pipeline-compliance run).
+      if printf '%s' "$EVID_TEXT" | grep -qE 'verdict=clean-micro @ [0-9a-f]{40}'; then
         fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
       else
         pass c "code-review evidence in PR body/commits (review dispatch marker)"
@@ -417,6 +421,30 @@ if [[ "$FAIL_ALL" == "1" ]]; then
     echo "  ❌ pass 4: binding did NOT fire — clean-micro marker passed check (c) on a standard issue (failures=$B4)" >&2
     rm -f "$P4LOG"
     exit 2
+  fi
+  summarize || true
+
+  # Pass 4b (#513 regression pin — self-review catch): a NON-micro PR whose
+  # body/commits merely MENTION "verdict=clean-micro" in prose (describing the
+  # marker contract, e.g. this PR's own description) must NOT trip the binding
+  # — only the record-review.sh marker shape (verdict=… @ <40-hex sha>) is a
+  # real certification. RED pre-tightening (bare-substring grep matched the
+  # prose); GREEN now.
+  echo ""
+  echo "== SIMULATION: pass 4b (#513 binding precision: prose mention must NOT fire) =="
+  PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""
+  COMMIT_MSGS="code-review dispatched; the binding rejects body/commits claiming verdict=clean-micro (marker shape only)"
+  FILES=$'added\textensions/example/sample.ts'
+  FAILURES=0
+  P4BLOG="$(mktemp /tmp/pipeline-pass4b.XXXXXX)"
+  run_checks > "$P4BLOG" 2>&1 || true
+  if grep -q 'clean-micro verdict marker' "$P4BLOG"; then
+    echo "  ❌ pass 4b: prose mention fired the binding — check (c) must match only the marker shape (verdict=… @ <40-hex>)" >&2
+    rm -f "$P4BLOG"
+    exit 2
+  else
+    echo "  ✅ pass 4b: prose mention did NOT fire — binding precision holds"
+    rm -f "$P4BLOG"
   fi
   summarize || true
 
