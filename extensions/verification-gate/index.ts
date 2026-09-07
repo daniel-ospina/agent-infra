@@ -139,6 +139,9 @@ const VGATE_FAILURE_THRESHOLD = 3;
 // resets both. Session-scoped (reset at session_start) — the streak dies with
 // the process; durable state lives in the bridge + audit log.
 type DispatchFailureClass = "empty-content" | "no-text" | "unparseable" | "fail-open-refused" | "fail-verdict" | "zero-merge-pass";
+// #561 review r1 P2: narrow the streak-mover's API so a judgment class cannot
+// type-check into the streak (the #132 invariant becomes compile-time).
+type DispatchFormatClass = Exclude<DispatchFailureClass, "fail-verdict" | "zero-merge-pass">;
 let lastDispatchClass: DispatchFailureClass | null = null;
 let dispatchStreak = 0;
 // ponytail: single-variable stash assumes one block→verify→merge flow per session turn.
@@ -2022,7 +2025,7 @@ export function formatCeremonyDiagnostics(klass: DispatchFailureClass, streak: n
 }
 
 /** #561: a dispatch-FORMAT failure (empty/no-text/unparseable/refused) — moves the streak. */
-export function recordDispatchFailure(klass: DispatchFailureClass): void {
+export function recordDispatchFailure(klass: DispatchFormatClass): void {
   lastDispatchClass = klass;
   dispatchStreak++;
 }
@@ -2496,7 +2499,10 @@ export default function (pi: ExtensionAPI) {
       // #285 P1-1: a task sub-agent never auto-disables on repeated dispatch
       // failures — the threshold disable is refused (WARN + audit, gate stays
       // ACTIVE → still blocking).
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
+      // #561 review r1 P2: extensionEnabled guard — the audit + disable fire
+      // ONCE per enabled→disabled transition; a malformed dispatch after the
+      // latch is down must not append duplicate forensic records.
+      if (extensionEnabled && vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
         // #561: the latch is one-way and in-process — audit it so a silently
         // disabled interactive gate leaves a durable forensic record.
         appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "vgate_failure_threshold_disable", session_cwd: process.cwd() });
@@ -2517,7 +2523,8 @@ export default function (pi: ExtensionAPI) {
       vgateFailures++;
       // #285 P1-1: no threshold auto-disable for task sub-agents (see the
       // empty-content site — same refusal).
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
+      // #561 review r1 P2: extensionEnabled guard (single-fire audit, see 2499).
+      if (extensionEnabled && vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
         // #561: audited one-way latch (see the empty-content site).
         appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "vgate_failure_threshold_disable", session_cwd: process.cwd() });
         extensionEnabled = false;
@@ -2705,7 +2712,8 @@ export default function (pi: ExtensionAPI) {
       vgateFailures++;
       // #285 P1-1: no threshold auto-disable for task sub-agents (refused —
       // gate stays ACTIVE → still blocking).
-      if (vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
+      // #561 review r1 P2: extensionEnabled guard (single-fire audit, see 2499).
+      if (extensionEnabled && vgateFailures >= VGATE_FAILURE_THRESHOLD && !refuseAutoBypassForSubAgent()) {
         // #561: audited one-way latch (see the empty-content site).
         appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "vgate_failure_threshold_disable", session_cwd: process.cwd() });
         extensionEnabled = false;

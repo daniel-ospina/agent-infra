@@ -41,11 +41,17 @@ usage() {
 audit() { # $1=reason $2=root(optional)
   local reason="$1" root="${2:-}"
   mkdir -p "$(dirname "$AUDIT")"
-  local extra=""
-  [ -n "$root" ] && extra=", \"root\": \"$root\""
-  # macOS/BSD date has no %N — second precision is sufficient for an audit stamp.
-  printf '{"ts":"%s","event":"bridge_clear","extension":"verification-gate","reason":"%s","session_cwd":"%s"%s}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" "$(pwd)" "$extra" >> "$AUDIT" 2>/dev/null || true
+  # JSON-escaped via python3 (#561 review r1 P2): shell printf cannot escape
+  # quotes/backslashes legal in macOS/Linux paths — an unescaped root/session_cwd
+  # would corrupt gate-events.jsonl for any strict JSONL consumer.
+  python3 - "$reason" "$root" "$(pwd)" <<'PYEOF' >> "$AUDIT" 2>/dev/null || true
+import datetime, json, sys
+reason, root, cwd = sys.argv[1], sys.argv[2], sys.argv[3]
+rec = {"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "event": "bridge_clear", "extension": "verification-gate", "reason": reason, "session_cwd": cwd}
+if root:
+    rec["root"] = root
+print(json.dumps(rec))
+PYEOF
 }
 
 git_root() { # best-effort; empty when not in a repo
@@ -97,9 +103,12 @@ PYEOF
   [ -f "$AUDIT" ] && { echo "audit tail (gate-events.jsonl):"; tail -n 5 "$AUDIT"; }
 }
 
-clear() { # $1=ALL or a root scope
+clear() { # $1=ALL or a root scope; stdout sentinel: "removed" | count | "noop" | "unreadable"
   local scope="$1"
-  [ -f "$BRIDGE" ] || { echo "vgate: no bridge at $BRIDGE — nothing to clear"; exit 0; }
+  if [ ! -f "$BRIDGE" ]; then
+    echo "noop"   # nothing to clear — caller must NOT audit (#561 review r1 P2)
+    return
+  fi
   if [ "$scope" = "ALL" ]; then
     rm -f "$BRIDGE"
     echo "removed"
@@ -147,16 +156,12 @@ case "${1:-}" in
       echo "  entries for this root; the next commit will re-block and need a fresh [VGATE] dispatch."
     fi
     cleared=$(clear "$scope")
-    if [ "$scope" = "ALL" ]; then
-      audit "bridge_clear_all"
-    else
-      audit "bridge_clear_root" "$scope"
-    fi
-    if [ "$cleared" = "removed" ]; then
-      echo "vgate: bridge file removed (scope: ALL) — next git op re-blocks until re-verified (fail-closed)"
-    else
-      echo "vgate: cleared $cleared entries (scope: $scope) — next git op re-blocks until re-verified (fail-closed)"
-    fi
+    case "$cleared" in
+      noop) echo "vgate: no bridge at $BRIDGE — nothing to clear (no audit recorded)" ;;
+      unreadable) echo "vgate: bridge at $BRIDGE unreadable — nothing cleared (no audit recorded); inspect/corrupt state left in place" ;;
+      removed) audit "bridge_clear_all"; echo "vgate: bridge file removed (scope: ALL) — next git op re-blocks until re-verified (fail-closed)" ;;
+      *) audit "bridge_clear_root" "$scope"; echo "vgate: cleared $cleared entries (scope: $scope) — next git op re-blocks until re-verified (fail-closed)" ;;
+    esac
     ;;
   *) usage ;;
 esac
