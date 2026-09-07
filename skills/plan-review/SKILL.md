@@ -132,6 +132,7 @@ CHECK THESE DIMENSIONS:
    - Does the plan address every requirement in the issue spec?
    - Are there gaps — requirements in the issue but absent from the plan?
    - Are there extras — plan tasks that go beyond what the issue requested?
+   - **Deferred/gated work:** if the plan (or its scope record) defers any task pending data, prove-out, approval, or a future event, a REAL re-check mechanism must exist — a scheduled job, a dated gate, an automated trip, or a named owner + concrete trigger. "Defer until X" with no mechanism = the work silently rots; flag it (P1).
 
 2. STEP COHERENCE:
    - Do any steps contradict each other?
