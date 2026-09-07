@@ -108,6 +108,27 @@ jobs:
         npx tsx extensions/builtin-tools/cut-resume.integration.test.ts || failures=$((failures+1))
         # provider-failover*.test.ts under extensions/shared are auto-picked by
         # the shared glob above (incl. the python3-spawning parity suite).
+        # #553 — real-pi subagent suites: each spawns a real `pi -p --no-session`
+        # child via getPiInvocation (bare `pi` on PATH). Two prerequisites, both
+        # handled here:
+        #  (1) deps — extensions/subagent imports FOUR @earendil-works packages
+        #      (pi-coding-agent/pi-ai/pi-agent-core/pi-tui, devDep'd + npm ci once;
+        #      the runtime import surface needs the full tree);
+        #  (2) the `pi` CLI — pi-coding-agent's bin provides it; npm ci once in
+        #      extensions/subagent (also brings the dep tree) and add its
+        #      node_modules/.bin to PATH for the child spawns.
+        # Keys: hermetic by design — the job env has NO provider keys; the suites
+        # self-skip the key-dependent startup/LLM assertions (their guards check
+        # DEEPSEEK_API_KEY). NOTE: timeout-integration is deliberately NOT wired —
+        # pi 0.84.3 exits fast ("No API key found") instead of stalling keyless,
+        # so the 5s-timeout/cut semantics cannot be exercised hermetic (see #573).
+        (cd extensions/subagent && npm ci --no-audit --no-fund --loglevel=error) || failures=$((failures+1))
+        echo "== extensions/builtin-tools/subagent-integration.test.ts =="
+        PATH="$PWD/extensions/subagent/node_modules/.bin:$PATH" \
+          npx tsx extensions/builtin-tools/subagent-integration.test.ts || failures=$((failures+1))
+        echo "== extensions/builtin-tools/subagent-e2e-smoke.test.ts =="
+        PATH="$PWD/extensions/subagent/node_modules/.bin:$PATH" \
+          npx tsx extensions/builtin-tools/subagent-e2e-smoke.test.ts || failures=$((failures+1))
         if [ $failures -gt 0 ]; then
           echo "❌ $failures extension test file(s) failed"
           exit 1
