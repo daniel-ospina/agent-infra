@@ -389,6 +389,55 @@ async function main() {
     await fire("session_start", {});
   });
 
+  test("scenario 8a (#561 review r4): no-text arm single-fire — 3 strikes + post-latch dispatch → exactly ONE audit", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileD2.txt"), "d2\n");
+    git(repo, "add fileD2.txt");
+    const prompt = `[VGATE] verify files: fileD2.txt. Classification: UI. Project root: ${repo}`;
+    const noText = { type: "image", text: "" }; // non-empty content, ZERO text members → no-text class
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: [noText] });
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: [noText] });
+    const disableAuditsBefore = readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length;
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: [noText] }); // 3rd → latch
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: [noText] }); // post-latch → guard must suppress a 2nd record
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c8a'", cwd: repo },
+    });
+    equal(res, undefined, "8a: gate must DISABLE after 3 no-text failures");
+    const disableAuditsAfter = readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length;
+    equal(disableAuditsAfter, disableAuditsBefore + 1, "8a: no-text arm — exactly ONE audit even with a post-latch dispatch (single-fire at the no-text latch site)");
+    await fire("session_start", {});
+  });
+
+  test("scenario 8b (#561 review r4): unparseable arm single-fire — 3 strikes + post-latch dispatch → exactly ONE audit", async () => {
+    const repo = join(TEST_ROOT, "repo");
+    git(repo, "reset -q");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "fileD3.txt"), "d3\n");
+    git(repo, "add fileD3.txt");
+    // Prompt WITHOUT the `verify files:` literal → no prompt files → the
+    // interactive fail-open merges ZERO → the unparseable latch path runs
+    // (mirrors scenario 35's dispatch shape, but INTERACTIVE so the latch fires).
+    const prompt = `[VGATE] check the staged changes. Classification: UI. Project root: ${repo}`;
+    const prose = [{ type: "text", text: "Verifier output was not parseable." }]; // non-JSON, no PASS/FAIL
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: prose });
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: prose });
+    const disableAuditsBefore = readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length;
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: prose }); // 3rd → latch
+    await fire("tool_result", { toolName: "task", input: { prompt }, content: prose }); // post-latch → guard must suppress a 2nd record
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'c8b'", cwd: repo },
+    });
+    equal(res, undefined, "8b: gate must DISABLE after 3 unparseable failures");
+    const disableAuditsAfter = readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length;
+    equal(disableAuditsAfter, disableAuditsBefore + 1, "8b: unparseable arm — exactly ONE audit even with a post-latch dispatch (single-fire at the unparseable latch site)");
+    await fire("session_start", {});
+  });
+
   test("scenario 9 (#132 A.3b): schema-incomplete FAIL JSON keeps commit blocked, gate never disables", async () => {
     const repo = join(TEST_ROOT, "repo");
     git(repo, "reset -q");
