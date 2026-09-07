@@ -73,6 +73,7 @@ status() {
   echo "  entries:"
   python3 - "$BRIDGE" "$root" <<'PYEOF'
 import json, os, sys, hashlib
+
 bridge, root = sys.argv[1], (sys.argv[2] or "")
 try:
     data = json.load(open(bridge))
@@ -91,7 +92,11 @@ for vf in files:
         r, rel = path.split("::", 1)
         if os.path.isfile(os.path.join(r, rel)):
             try:
-                disk = hashlib.sha256(open(os.path.join(r, rel), "rb").read()).hexdigest()
+                # Length-branch sha1/sha256 like the extension's hashMatchesDisk
+                # (#320: verifier-submitted hashes stored verbatim — 40-hex sha1
+                # entries legitimately reach the bridge; #561 review r5 P2).
+                algo = hashlib.sha1 if len(h) == 40 else hashlib.sha256
+                disk = algo(open(os.path.join(r, rel), "rb").read()).hexdigest()
             except Exception:
                 disk = "unreadable"
         else:
@@ -100,7 +105,14 @@ for vf in files:
     print(f"      stored: {h}")
     print(f"      disk:   {disk}   ({'match' if disk not in ('n/a','missing','unreadable') and disk == h else 'NO MATCH — recovery drops this entry (fail-closed)' if disk != 'n/a' else ''})")
 PYEOF
-  [ -f "$AUDIT" ] && { echo "audit tail (gate-events.jsonl):"; tail -n 5 "$AUDIT"; }
+  # Explicit exit 0: the final [ -f "$AUDIT" ] && { … } short-circuits to exit
+  # 1 under set -euo pipefail when the audit file has never been created — a
+  # healthy status must not read as failure (#561 review r5 P2).
+  if [ -f "$AUDIT" ]; then
+    echo "audit tail (gate-events.jsonl):"
+    tail -n 5 "$AUDIT"
+  fi
+  exit 0
 }
 
 clear() { # $1=ALL or a root scope; stdout sentinel: "removed" | count | "noop" | "unreadable"
