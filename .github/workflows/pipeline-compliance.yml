@@ -36,6 +36,20 @@ on:
   pull_request:
     branches:
       - main
+    # #513: `types` is REQUIRED for the check-(c) verdict binding to fire at
+    # all — record-review.sh PATCHes the review marker into the PR body at
+    # record time (an `edited` activity), which happens AFTER the last push.
+    # Without `edited`, the default opened/synchronize/reopened types never
+    # re-run the gate post-marker, so a forged `verdict=clean-micro` marker
+    # would ride a stale green check to merge. With `edited`, a merge
+    # attempted AFTER the re-run settles red is blocked by branch protection.
+    # Note: fast same-ceremony first-attempt merges inside the webhook-dispatch
+    # race are not deterministically caught (see #513 plan Risk Register).
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
 
 permissions:
   contents: read

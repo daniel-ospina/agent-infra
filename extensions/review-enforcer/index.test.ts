@@ -624,6 +624,7 @@ test("fail-open → merge_gate_pass with reason failopen (auditable allow-withou
   const [e] = readAuditLines(file);
   equal(e.event, "merge_gate_pass");
   equal(e.reason, "failopen");
+  equal(e.verdict, "clean", "#513: failopen entry carries the verdict (only allow-without-verification site)");
 });
 
 test("mergeGateBlockReason tags mirror evaluateMergeGate block branches", () => {
@@ -1297,6 +1298,188 @@ testAsync("interactive bypass unchanged — gh pr merge also ungated (escape hat
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
   });
+});
+
+// ── #513 — clean-micro merge verdict: two-path remediation, verdict       ──
+// interpolation, audit-verdict field, and the contract-doc presence pins.
+
+section("#513 — evaluateMergeGate message honesty (two-path remediation + verdict interpolation)");
+
+const CM_RECORD: ReviewRecord = { ...cleanRecord, verdict: "clean-micro" };
+
+function assertHasDisambiguatedPair(reason: string): void {
+  // Never prefix-collide: `clean [owner/repo]` is NOT a prefix of
+  // `clean-micro [owner/repo]` when the bracket form is asserted.
+  ok(reason.includes("record-review.sh <PR> <head_sha> clean-micro [owner/repo]"), "two-path remediation names the clean-micro invocation");
+  ok(reason.includes("record-review.sh <PR> <head_sha> clean [owner/repo]"), "two-path remediation names the clean invocation");
+}
+
+test("#513: task-sub-agent no-record reason is two-path (micro + standard) with no emergency line", () => {
+  const r = evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" }, true);
+  equal(r.status, "block");
+  const reason = (r as any).reason as string;
+  assertHasDisambiguatedPair(reason);
+  ok(reason.includes("does NOT unlock sub-agent merges (#285)"), "#285 line preserved");
+  ok(reason.includes("The parent session must record the review"), "parent-records shape preserved");
+  ok(!reason.includes("Emergency: set AGENT_SKIP_REVIEW_GATE"), "no false emergency-bypass line for task sub-agents");
+});
+
+test("#513: interactive no-record reason is two-path + keeps the escape hatch", () => {
+  const r = evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" });
+  equal(r.status, "block");
+  const reason = (r as any).reason as string;
+  assertHasDisambiguatedPair(reason);
+  ok(reason.includes("Emergency: set AGENT_SKIP_REVIEW_GATE"), "interactive escape-hatch line preserved");
+});
+
+test("#513: verdict-not-clean reason interpolates the actual verdict + two-path remediation", () => {
+  const rec = { ...cleanRecord, verdict: "fail" };
+  const r = evaluateMergeGate(138, rec, "a".repeat(40), { source: "record", repo: "owner/repo" });
+  equal(r.status, "block");
+  const reason = (r as any).reason as string;
+  ok(reason.includes('verdict "fail"'), "failure line interpolates the recorded verdict");
+  assertHasDisambiguatedPair(reason);
+});
+
+test("#513: head-advanced reason re-records at the RECORDED verdict (clean-micro → clean-micro, never clean)", () => {
+  const r = evaluateMergeGate(138, CM_RECORD, "b".repeat(40), { source: "record", repo: "owner/repo" });
+  equal(r.status, "block");
+  const reason = (r as any).reason as string;
+  ok(reason.includes("record-review.sh <PR> <head_sha> clean-micro [owner/repo]"), "clean-micro record re-records clean-micro");
+  ok(!reason.includes("head_sha> clean [owner/repo]"), "never instructs re-recording clean over a clean-micro record");
+});
+
+test("#513: head-advanced reason re-records at the RECORDED verdict (clean → clean)", () => {
+  const r = evaluateMergeGate(138, cleanRecord, "b".repeat(40), { source: "record", repo: "owner/repo" });
+  equal(r.status, "block");
+  const reason = (r as any).reason as string;
+  ok(reason.includes("record-review.sh <PR> <head_sha> clean [owner/repo]"), "clean record re-records clean");
+  ok(!reason.includes("clean-micro [owner/repo]"), "never re-records clean-micro over a clean record");
+});
+
+test("#513: allow message names the ACTUAL verdict (clean-micro ≠ hardcoded clean review)", () => {
+  const r = evaluateMergeGate(138, CM_RECORD, "a".repeat(40), { source: "record", repo: "owner/repo" });
+  equal(r.status, "allow");
+  ok((r as any).message.includes("(clean-micro review, head"), "allow message renders the clean-micro verdict");
+});
+
+test("#513: allow message names the ACTUAL verdict (clean)", () => {
+  const r = evaluateMergeGate(138, cleanRecord, "a".repeat(40), { source: "record", repo: "owner/repo" });
+  equal(r.status, "allow");
+  ok((r as any).message.includes("(clean review, head"), "allow message renders the clean verdict");
+});
+
+test("#513: head-unverifiable sub-agent block re-records at the recorded verdict", () => {
+  const r = evaluateMergeGate(138, CM_RECORD, null, { source: "record", repo: "owner/repo" }, true);
+  equal(r.status, "block");
+  ok((r as any).reason.includes("record-review.sh <PR> <head_sha> clean-micro [owner/repo]"), "sub-agent re-record line uses the recorded verdict");
+});
+
+test("#513: head-unverifiable sub-agent CLEAN cell — re-records clean, never clean-micro (downgrade guard)", () => {
+  const r = evaluateMergeGate(138, cleanRecord, null, { source: "record", repo: "owner/repo" }, true);
+  equal(r.status, "block");
+  const reason = (r as any).reason as string;
+  ok(reason.includes("record-review.sh <PR> <head_sha> clean [owner/repo]"), "clean record re-records clean");
+  ok(!reason.includes("clean-micro [owner/repo]"), "never re-records clean-micro over a clean record");
+});
+
+test("#513: interactive fail-open warning interpolates the verdict — fallback ctx variant (bracketless form)", () => {
+  const r = evaluateMergeGate(138, CM_RECORD, null, { source: "fallback" });
+  equal(r.status, "failopen");
+  const w = (r as any).warning as string;
+  ok(w.includes("record-review.sh <PR> <head_sha> clean-micro owner/repo"), "fail-open advice names the recorded clean-micro verdict");
+  ok(!w.includes("<head_sha> clean owner/repo"), "never advises re-recording clean over a clean-micro record");
+});
+
+test("#513: interactive fail-open warning interpolates the verdict — resolved-repo ctx variant + clean cell", () => {
+  const r = evaluateMergeGate(138, cleanRecord, null, { source: "record", repo: "owner/repo" });
+  equal(r.status, "failopen");
+  const w = (r as any).warning as string;
+  ok(w.includes("record-review.sh <PR> <head_sha> clean owner/repo"), "fail-open advice names the recorded clean verdict");
+  const r2 = evaluateMergeGate(138, CM_RECORD, null, { source: "record", repo: "owner/repo" });
+  equal(r2.status, "failopen");
+  ok(((r2 as any).warning as string).includes("record-review.sh <PR> <head_sha> clean-micro owner/repo"), "resolved-repo variant interpolates clean-micro too");
+});
+
+test("#513: merge_gate_pass audit entry carries the record verdict (joinable trail)", () => {
+  const file = tempAuditFile();
+  const r = evaluateMergeGate(138, CM_RECORD, "a".repeat(40), { source: "record", repo: "owner/repo" });
+  ok(r.status === "allow");
+  logMergeGateDecision(138, r as any, CM_RECORD, file);
+  const [e] = readAuditLines(file);
+  equal(e.event, "merge_gate_pass");
+  equal(e.pr, 138);
+  equal(e.verdict, "clean-micro", "pass entry carries which verdict unlocked the merge");
+});
+
+test("#513: merge_gate_block audit entry carries the record verdict; no-record block omits it (null-safe)", () => {
+  const file = tempAuditFile();
+  const r = evaluateMergeGate(138, cleanRecord, "b".repeat(40), { source: "record", repo: "owner/repo" });
+  ok(r.status === "block");
+  logMergeGateDecision(138, r as any, cleanRecord, file);
+  equal(readAuditLines(file)[0].verdict, "clean", "block entry carries the verdict");
+  const file2 = tempAuditFile();
+  const r2 = evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" });
+  ok(r2.status === "block");
+  logMergeGateDecision(138, r2 as any, null, file2);
+  equal(readAuditLines(file2)[0].verdict, undefined, "no-record block omits verdict (null-safe)");
+});
+
+// ── #513 contract-doc presence pins (Task 6) ──
+
+section("#513 — clean-micro contract docs presence pins (source-checkout guarded)");
+
+// The clean-micro contract is PROSE in three docs; these pins assert the
+// required sentences exist so the definition cannot silently re-drift (a
+// machine fence has no code export to compare against — the #485
+// REVIEW-ENFORCER-TIER-RULE fence pins TIER_RULE, which clean-micro prose has
+// no analogue of). Case-INSENSITIVE scan (the appendix prose renders REFUSES
+// uppercase). Soft-skips on deployed copies (isSourceCheckout), vacuous-pass
+// guarded (existsSync) per the #485 T2 pattern. Negation tokens carry the
+// operative definitional claim ("NOT multi-agent") so an editor deleting it
+// while keeping the tier tokens fails CI.
+const CONTRACT_DOC_PINS: Array<{
+  rel: string;
+  tierTokens: string[];
+  negationTokens: string[];
+}> = [
+  {
+    rel: "skills/code-review/SKILL.md",
+    tierTokens: ["clean-micro", "complexity:micro", "exit 4"],
+    negationTokens: ["not multi-agent"],
+  },
+  {
+    rel: "skills/commit-workflow/workflow/04-merge-deploy.md",
+    tierTokens: ["clean-micro", "03-code-review.md Step 2", "refuses"],
+    negationTokens: ["never refused at any tier"],
+  },
+  {
+    rel: "skills/commit-workflow/workflow/03-code-review.md",
+    tierTokens: ["clean-micro", "record-review.sh"],
+    negationTokens: ["not a multi-agent"],
+  },
+];
+
+test("#513: contract docs carry the clean-micro definition + negation tokens", () => {
+  if (!isSourceCheckout()) {
+    console.log("#513 docs-presence pins: soft-skip — not a source checkout (deployed extension copy)");
+    return;
+  }
+  for (const { rel, tierTokens, negationTokens } of CONTRACT_DOC_PINS) {
+    const url = new URL(`../../${rel}`, import.meta.url);
+    ok(existsSync(url), `doc reachable: ${rel} (vacuous-pass guard)`);
+    const text = fs.readFileSync(url, "utf8").replace(/\s+/g, " ").toLowerCase();
+    // whitespace-normalized: the appendix prose is re-wrapped at ~78 cols, so a
+    // negation token may legally straddle a newline ("NOT\nmulti-agent") — a
+    // line-break move must not red the pin.
+    for (const t of tierTokens) {
+      ok(text.includes(t.toLowerCase()), `#513 doc pin: ${rel} contains "${t}"`);
+    }
+    ok(
+      negationTokens.some((n) => text.includes(n.toLowerCase())),
+      `#513 negation pin: ${rel} contains one of ${negationTokens.join(" | ")}`
+    );
+  }
 });
 
 // ── #485 — micro-tier dispatch policy: uniform ≥1-dispatch block ──
