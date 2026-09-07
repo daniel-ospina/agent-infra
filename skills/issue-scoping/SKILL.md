@@ -213,6 +213,7 @@ CHECK FOUR DIMENSIONS + DIMENSION 5:
    - Edge cases, error states, failure modes not accounted for?
    - Stakeholders or downstream systems not mentioned?
    - Dependencies assumed but not verified?
+   - **Deferred/gated scope:** if the scope defers any work pending data, prove-out, approval, or a future event, a REAL re-check mechanism must exist (scheduled job, dated gate, automated trip, named owner + trigger). "Defer until X" with no mechanism = silent rot; flag as P1.
 
 5. RESEARCH ARTIFACT (Phase 1.5 — external best-practice research):
    - Is the `### Axis Research` block present in the scoping output, OR a justified-skip trigger assessment (axes all low + no deps + no novel pattern)?
