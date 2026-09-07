@@ -309,9 +309,10 @@ cache; only explicitly-opt-in cold-class dispatches burn venice credits).
 Note the code-level truth: an EXPLICIT `venice/…` provider/model ask at the
 task tool (a manual dispatch or a future extension — the seam texts are the
 only in-repo askers today, and they are COLD_CLASS_PROVIDER-gated) routes
-venice whenever `VENICE_API_KEY` is present and venice is not durably
-auth-blocked — `COLD_CLASS_PROVIDER` does not stop that ask; removing the
-key does (kill switch #2 below).
+venice whenever `VENICE_API_KEY` is present AND venice is neither listed in
+`PROVIDER_FAILOVER_BLOCKED` nor durably auth-blocked — `COLD_CLASS_PROVIDER`
+does not stop that ask; removing the key does (kill switch #2 below), as
+does listing venice in `PROVIDER_FAILOVER_BLOCKED` (kill-switch note below).
 
 The seam is **per-dispatch**, never a family-table edit: `ALIAS_FAMILIES`
 (the #476 chain table) has NO venice leg (drift-pinned), so warm traffic and
@@ -337,7 +338,12 @@ advancing the deepseek root on another account's evidence.
   deepseek leg BEFORE any spawn), and — while the #476
   machinery is ACTIVE — a durable venice auth-block (`blockedLegs["venice"]`,
   24h TTL) makes the same gate send subsequent cold dispatches to the default
-  leg; the block self-heals on key remediation.
+  leg; the block self-heals on key remediation. One more code-level stop,
+  INDEPENDENT of the #476 machinery: listing `venice` in
+  `PROVIDER_FAILOVER_BLOCKED` env (the alternate-leg gate's env-list arm reads
+  it UNCONDITIONALLY — no `failoverActive` guard, so it fires even under
+  `PROVIDER_FAILOVER_DISABLE=1`) gates every venice ask to the default leg
+  pre-spawn, same as the durable-block arm.
 - ⛔ `PROVIDER_FAILOVER_DISABLE=1` is NOT a cold-class kill switch (A1 P3): it
   only disables the #476 fallback machinery — the alternate-leg gate and the
   venice leg ignore it, so cold venice routing stays ACTIVE with NO automatic
