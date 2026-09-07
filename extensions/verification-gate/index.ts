@@ -1350,12 +1350,15 @@ function scanCommitInvocation(rest: string): CommitInvocationScan {
 //   1. `! cmd` negation — the pipeline after ! IS executed (status inverted).
 //   2. shell -c payload — bash/sh/zsh/dash/ksh (path-qualified basename,
 //      SHELL_INTERPRETERS parity with main-worktree-guard's classifier) plus
-//      no-arg option clusters (`-lc`/`-ec`/`-xc` …): the command string is the
-//      NEXT argv word after -c (empirics: an attached payload `-c'echo hi'` or
-//      mid-cluster `-cecho` is REJECTED by bash — next-token only); trailing
-//      words are $0.. positional params and never execute → cut (no ghost
-//      sweeps from arg text). Long options with values (--rcfile/--init-file)
-//      or a value-taking cluster char (bash -O) make the -c position
+//      no-arg option clusters: the command string is the NEXT argv word after
+//      a cluster containing c (`-c`, `-ce`, `-ec`, `-cae`, `-cx` … —
+//      empirically the payload is always the next WORD, never cluster text:
+//      chars after c are ordinary options that still apply; `bash -cecho hi`
+//      errors on the trailing -o before running anything, so a value-taking
+//      char in the cluster stays unprovable → no unwrap); trailing words are
+//      $0.. positional params and never execute → cut (no ghost sweeps from
+//      arg text). Long options with values (--rcfile/--init-file) or a
+//      value-taking cluster char (bash -O, -o) make the -c position
 //      unprovable → no unwrap. A script-file / -s / stdin shell (no -c) never
 //      unwraps.
 //   3. `eval args` — the builtin concatenates its argv words (quotes already
@@ -1533,18 +1536,24 @@ function unwrapExecutingHead(text: string): string | null {
           continue;
         }
         const chars = t.slice(1).split("");
-        const endsC = chars[chars.length - 1] === "c";
         const allNoArg = chars.every((ch) => SHELL_C_CLUSTER_NOARG.has(ch));
         if (chars.includes("c")) {
-          // trailing c in an all-no-arg cluster → next token is the command string.
-          if (!endsC || !allNoArg) break; // mid-cluster c or value-taking char — unprovable
+          // ANY all-no-arg cluster containing c (`-c`, `-ce`, `-ec`, `-cae`,
+          // `-cx`, `-cCe` …) takes the command string as the NEXT argv word —
+          // verified empirically across bash/dash/zsh/ksh: `bash -ce 'echo
+          // hi'` runs the payload with -e still applied (chars after c are
+          // ordinary options; they never consume the payload word). A cluster
+          // with a VALUE-taking char (-Oc, or -cecho whose trailing o needs an
+          // option-name arg) is unprovable → break (bash itself errors on
+          // those before running anything).
+          if (!allNoArg) break;
           const pl = readShellToken(cur, w.rawEnd);
           if (pl === null) break;
           payload = pl.content;
           break;
         }
         if (!allNoArg) break; // value-taking short option — unprovable
-        p = w.rawEnd;         // no-value cluster (-l/-e/-x …) — keep walking
+        p = w.rawEnd;         // no-value cluster (-l/-e/-x/-a …) — keep walking
       }
       if (payload === null) break; // shell without a provable -c → stop the peel
       if (payload.length > 0 && wrapperPayloadSwitchesRepo(payload)) return null;

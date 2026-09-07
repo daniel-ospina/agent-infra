@@ -1798,6 +1798,13 @@ test("SWEEP → \"sweep\" (single pure-sweep invocation)", () => {
     "bash -aec 'git commit -am x'",               // extended no-arg cluster chars (allexport+errexit)
     "bash -Cec 'git commit -am x'",               // extended no-arg cluster chars (noclobber)
     "bash -abuCec 'git commit -am x'",            // extended no-arg cluster chars (notify+nounset+allexport)
+    "bash -ce 'git commit -am x'",                // c mid-cluster — payload is still the NEXT word (bash/dash/zsh verified)
+    "bash -cae 'git commit -am x'",               // c mid-cluster, options after c still apply
+    "bash -cx 'git commit -am x'",
+    "bash -cCe 'git commit -am x'",
+    "dash -ce 'git commit -am x'",
+    "zsh -ce 'git commit -am x'",
+    "sh -ce 'git commit -am x'",
   ];
   for (const c of pins) equal(commitSweepClass(c), "sweep", `must be sweep: ${c}`);
 });
