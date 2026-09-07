@@ -367,13 +367,19 @@ async function main() {
       toolName: "task", input: { prompt },
       content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repo, "somewhere-else.txt"), hash: "deadbeef" }] }) }],
     });
+    // #561 review r2: the single-fire invariant needs an exact pin — capture the
+    // audit count before the 4th dispatch (the one that trips the latch) and
+    // assert EXACTLY +1 after, so a revert of the extensionEnabled guard (which
+    // would append a 2nd record on this dispatch) goes RED.
+    const disableAuditsBefore = readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length;
     await fire("tool_result", { toolName: "task", input: { prompt }, content: [] });
     const res = await fire("tool_call", {
       type: "tool_call", toolName: "bash",
       input: { command: "git commit -m 'c8'", cwd: repo },
     });
     equal(res, undefined, "gate must DISABLE after 3 real failures despite interleaved zero-merge PASS");
-    ok(readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length >= 1, "one-way interactive disable must leave a durable audit record (#561)");
+    const disableAuditsAfter = readAuditLines().filter(l => l.event === "gate_bypass" && l.reason === "vgate_failure_threshold_disable").length;
+    equal(disableAuditsAfter, disableAuditsBefore + 1, "scenario 8: exactly ONE threshold-disable audit per enabled→disabled transition (single-fire, #561 review r2)");
     await fire("session_start", {});
   });
 

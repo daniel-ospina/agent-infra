@@ -2553,18 +2553,19 @@ test("escalation at the 3-strike threshold (task-capable copy returns to parent)
   ok(d.includes("return to the parent session"), "capable sub-agent may surface the block to the parent");
 });
 
-test("escalation at the 3-strike threshold (interactive copy has no return-to-parent)", () => {
-  // Pure-fn contract note (#561 test-review P2): the interactive escalation copy
-  // is DEFENSIVE — at the real call site an interactive session's 3rd dispatch-
-  // format failure fires the one-way vgateFailures disable latch INSIDE the same
-  // tool_result (vgateFailures and dispatchStreak move 1:1 on format classes), so
-  // a streak-3 block never renders interactively; guidance stops at attempt 2, then
-  // the #132 latch (unchanged semantics) takes over. The copy stays audience-safe
-  // for any world in which it does render (no "return to parent" for interactives).
+test("escalation at the 3-strike threshold (interactive copy names the latch semantics)", () => {
+  // #561 review r2: the interactive escalation copy is HONEST — it renders at
+  // the three latch-disable sites (console.error after the ⏸️ Auto-bypassed
+  // log), the only output an interactive session receives at the threshold
+  // (the next git op early-returns on the !extensionEnabled guard). It must
+  // name the real state: the gate HAS auto-disabled for this session, and
+  // identical re-dispatches also trip the #7591 block-attempt auto-bypass.
   const d = formatCeremonyDiagnostics("no-text", 3, "interactive");
   ok(d.includes("Escalation"), "escalation fires interactively too");
   ok(!d.includes("return to the parent"), "an interactive session has no parent to return to");
-  ok(d.includes("will NOT auto-bypass"), "no bypass implied interactively");
+  ok(d.includes("auto-disables the gate for this session"), "interactive copy names the one-way latch truthfully (no 'stays ACTIVE' claim)");
+  ok(!d.includes("stays ACTIVE"), "the interactive copy must not claim the gate stays ACTIVE (review r2)");
+  ok(d.includes("#7591"), "interactive copy names the block-attempt auto-bypass too");
 });
 
 test("fail-open-refused remedy names the refusal + no-record outcome", () => {

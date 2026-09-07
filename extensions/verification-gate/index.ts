@@ -2011,7 +2011,7 @@ export function formatCeremonyDiagnostics(klass: DispatchFailureClass, streak: n
   if (streak >= VGATE_FAILURE_THRESHOLD && FORMAT_CLASSES.has(klass)) {
     const escalation =
       audience === "interactive"
-        ? "The gate stays ACTIVE and will NOT auto-bypass. Fix the dispatch to satisfy the format requirements above, then retry the git operation."
+        ? "A 3rd consecutive malformed dispatch auto-disables the gate for this session (one-way latch, #132) — fix the dispatch to satisfy the format requirements above and re-run the session; do NOT re-dispatch the same verifier shape (identical re-dispatches also trip the #7591 block-attempt auto-bypass)."
         : "The gate stays ACTIVE and will NOT auto-bypass (#285). Fix the dispatch to satisfy the format requirements above, then retry the git operation. If you cannot produce a compliant verifier response, stop and return to the parent session with this block message.";
     return [
       "",
@@ -2508,6 +2508,11 @@ export default function (pi: ExtensionAPI) {
         appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "vgate_failure_threshold_disable", session_cwd: process.cwd() });
         extensionEnabled = false;
         console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures");
+        // #561 review r2: surface the STOP-and-fix escalation HERE — the only
+        // output an interactive session actually receives at the latch (the
+        // next git op early-returns on the !extensionEnabled guard before any
+        // block message assembles). Honest copy: the gate HAS auto-disabled.
+        console.error(formatCeremonyDiagnostics(lastDispatchClass ?? "unparseable", dispatchStreak, "interactive"));
       }
       return undefined;
     }
@@ -2529,6 +2534,7 @@ export default function (pi: ExtensionAPI) {
         appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "vgate_failure_threshold_disable", session_cwd: process.cwd() });
         extensionEnabled = false;
         console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures");
+        console.error(formatCeremonyDiagnostics(lastDispatchClass ?? "unparseable", dispatchStreak, "interactive")); // #561 review r2: surface the escalation at the latch (see the empty-content site)
       }
       return undefined;
     }
@@ -2718,6 +2724,7 @@ export default function (pi: ExtensionAPI) {
         appendJsonl({ event: "gate_bypass", extension: "verification-gate", reason: "vgate_failure_threshold_disable", session_cwd: process.cwd() });
         extensionEnabled = false;
         console.log("[verification-gate] ⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures");
+        console.error(formatCeremonyDiagnostics(lastDispatchClass ?? "unparseable", dispatchStreak, "interactive")); // #561 review r2: surface the escalation at the latch (see the empty-content site)
       }
       return undefined;
     }
