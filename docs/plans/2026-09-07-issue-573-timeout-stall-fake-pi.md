@@ -73,15 +73,19 @@ wait
      undefined` (per-test holder pid file via `FAKE_PI_HOLDER_PID_FILE`)
    - `teardown()`: restore PATH + argv[1], `rmSync` tmp dir, SIGKILL leftover holder pids
    - helper: `markerPattern()` (char-class first char — #542 Linux procps self-match),
-     `findPid()`, `readHolder()`, `isAlive()`, `pollDead()`
+     `findPid()`, `readHolder()`, `isAlive()`, `waitDead()`
    - tests 1 & 3 assertions byte-identical (stopReason / elapsed >= 4500 / < 30000 /
      isFailedResult / pgrep-empty) + holder-death poll (`ok(holder > 0)` first)
    - test 2: keep pgrep-empty-after assertion + anti-vacuous `spawned > 0` guard
    - header comment updated (no longer claims real-pi keyless stall premise)
 2. `.github/workflows/ci-main.yml` — flip the #553 "deliberately NOT wired" comment (~111-124);
-   add after subagent-e2e-smoke (~130):
+   add the invocation immediately after the subagent `npm ci` (~125), BEFORE the two
+   real-pi suites:
    `npx tsx extensions/subagent/timeout-integration.test.ts || failures=$((failures+1))`
-   No PATH prefix needed (fake pi via the test's own temp dir; npm ci at ~125 covers deps).
+   No PATH prefix needed (fake pi via the test's own temp dir; npm ci covers deps).
+   (Review r1 correction: the landed edit sits before subagent-integration, not after
+   subagent-e2e-smoke — each suite is a separate npx tsx process, ordering has no
+   functional effect.)
 3. `docs/plans/2026-09-07-issue-573-*.md` — this doc.
 
 ## Testing / Verification
