@@ -1790,9 +1790,14 @@ test("SWEEP → \"sweep\" (single pure-sweep invocation)", () => {
     "FOO=\"bar baz\" B=\"p q\" git commit -am x",   // chained quoted env prefixes
     "sudo FOO=\"x y\" git commit -am z",           // env revealed after prefix-verb strip
     "sudo git commit -am x",                      // bare prefix verb (stripSegmentHead parity)
+    'FOO="x"bar git commit -am x',                // quote-CONCATENATION env value — whole-word peel (pre-#539 stripSegmentHead parity)
+    "FOO='it'\\''s' git commit -am x",             // concatenated single-quote escapes in the value
     "! eval \"bash -c 'git commit -am x'\"",       // composed wrappers peel recursively
     "sh -c 'git commit -am x' && git push origin main", // wrapper sweep + push (vacuous) — THE #489 residual flip
     "sh -c 'git --no-optional-locks commit -am x' && git push origin main", // wrapped no-value-global + push (r3 regression flip)
+    "bash -aec 'git commit -am x'",               // extended no-arg cluster chars (allexport+errexit)
+    "bash -Cec 'git commit -am x'",               // extended no-arg cluster chars (noclobber)
+    "bash -abuCec 'git commit -am x'",            // extended no-arg cluster chars (notify+nounset+allexport)
   ];
   for (const c of pins) equal(commitSweepClass(c), "sweep", `must be sweep: ${c}`);
 });

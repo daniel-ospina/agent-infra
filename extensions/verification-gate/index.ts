@@ -1370,20 +1370,27 @@ function scanCommitInvocation(rest: string): CommitInvocationScan {
 // finding, preserved verbatim).
 const SHELL_C_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 // No-arg option-cluster chars allowed BEFORE a trailing -c (bash -lc / -ec /
-// -xec … → the NEXT token is the command string). bash -O takes a value and
-// shells' long --rcfile/--init-file consume a word — both abort the unwrap.
-const SHELL_C_CLUSTER_NOARG = new Set(["c", "e", "f", "i", "l", "m", "n", "r", "s", "v", "x"]);
+// -xec / -aec / -Cec … → the NEXT token is the command string). UNION of the
+// shells' no-value short startup options (bash -a -b -C -e -f -h -i -l -m -n -p
+// -r -s -t -u -v -x -c; dash/zsh/ksh subsets). VALUE-taking options are
+// deliberately absent — bash -O takes a value, zsh/ksh -o take a value, and
+// shells' long --rcfile/--init-file consume a word — all abort the unwrap
+// (unprovable -c position → documented residual).
+const SHELL_C_CLUSTER_NOARG = new Set(["c", "a", "b", "C", "e", "f", "h", "i", "l", "m", "n", "p", "r", "s", "t", "u", "v", "x"]);
 // cd&& chains + prefix-verb strip — stripSegmentHead minus its env regex (the
 // classifier's env peel must run FIRST so quoted values are never mangled).
 const COMMIT_SEGMENT_HEAD = /^(?:cd\s+(?:['"][^'"]+['"]|[^\s;&|]+)\s*&&\s*)+|^(?:(?:env|sudo|nohup|time|command)\s+)+/;
 
-// Peel ONE bash env-assignment prefix (`NAME=value`), quote-aware: single- /
-// double-quoted values (double quotes honor \" escapes), unquoted values, empty
-// values. Returns the text AFTER the assignment + trailing whitespace, or null
-// when the head is not an assignment or the assignment consumes the whole text
-// (a bare `FOO=bar` runs no command). Quote-CONCATENATION (`FOO="x"bar`) leaves
-// a non-space char after the closing quote → null (the value holds no
-// whitespace, so the verb regex cannot mangle it — safe to leave).
+// Peel ONE bash env-assignment prefix (`NAME=value`), quote-aware: the value is
+// the REST OF THE BASH WORD — quoted regions ('…' verbatim; "…" honoring \"
+// escapes) and unquoted chars concatenate (`FOO="x"bar` → FOO=xbar;
+// `FOO='it'\''s'` → FOO=it's) and the word ends at the first UNQUOTED
+// whitespace. Returns the text AFTER the assignment + trailing whitespace, or
+// null when the head is not an assignment or the assignment consumes the whole
+// text (a bare `FOO=bar` runs no command). ⛔ The whole-word scan is REQUIRED,
+// not a nicety: pre-#539 stripSegmentHead's `NAME=\S+` regex stripped the
+// no-space concat form (`FOO="x"bar git commit -am x` → head-anchored sweep),
+// so peeling only clean-boundary values would REGRESS that form to a wrapper.
 function stripEnvAssignmentPrefix(s: string): string | null {
   const n = s.length;
   let i = 0;
@@ -1393,25 +1400,34 @@ function stripEnvAssignmentPrefix(s: string): string | null {
   if (i >= n || s[i] !== "=") return null;
   i++;
   if (i >= n) return null;
-  const q = s[i];
-  if (q === "'") {
-    i++;
-    const close = s.indexOf("'", i);
-    if (close === -1) return null;
-    i = close + 1;
-  } else if (q === '"') {
-    i++;
-    while (i < n && s[i] !== '"') {
-      if (s[i] === "\\" && i + 1 < n) i += 2;
-      else i++;
+  // Value: the rest of the bash word, quote-aware, until unquoted whitespace.
+  while (i < n) {
+    const c = s[i];
+    if (c === "'") {
+      i++;
+      while (i < n && s[i] !== "'") i++;
+      if (i >= n) return null; // unterminated quote — not a clean assignment
+      i++;
+      continue;
     }
-    if (i >= n) return null;
+    if (c === '"') {
+      i++;
+      while (i < n && s[i] !== '"') {
+        if (s[i] === "\\" && i + 1 < n) i += 2;
+        else i++;
+      }
+      if (i >= n) return null;
+      i++;
+      continue;
+    }
+    if (c === "\\" && i + 1 < n) {
+      i += 2; // escaped char — part of the value
+      continue;
+    }
+    if (/\s/.test(c)) break;
     i++;
-  } else {
-    while (i < n && !/\s/.test(s[i])) i++;
   }
-  if (i >= n) return null;
-  if (!/\s/.test(s[i])) return null; // value abuts non-space — concat form, not a clean boundary
+  if (i >= n) return null; // assignment consumed the whole text — no command follows
   while (i < n && /\s/.test(s[i])) i++;
   const rest = s.slice(i);
   return rest.length === 0 ? null : rest;
