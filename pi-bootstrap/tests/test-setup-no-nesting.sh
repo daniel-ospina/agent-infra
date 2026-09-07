@@ -137,6 +137,22 @@ check_fix_markers() {
     || fail "$label: installed builtin-tools missing #36 PATH augmentation"
 }
 
+# #562 — merge-gate scripts farm parity: record-review.sh must be farmed to
+# $DEST/scripts/ and byte-match the repo copy (the repo copy is CI-tested;
+# production mints execute the ~/.pi copy — drift is a silent partial
+# deployment of an enforcement-critical script).
+check_record_review_farmed() {
+  local label="$1"
+  local dest="$DEST/scripts/record-review.sh"
+  [ -f "$dest" ] \
+    || { fail "$label: record-review.sh not farmed into scripts/ (merge-gate farm missing)"; return; }
+  if diff -q "$ROOT/scripts/record-review.sh" "$dest" >/dev/null 2>&1; then
+    echo "ok: $label farmed record-review.sh == repo copy (#562)"
+  else
+    fail "$label: farmed record-review.sh differs from scripts/record-review.sh (stale copy!)"
+  fi
+}
+
 run_setup() {
   echo "---- setup.sh run (HOME=$HOME_DIR) ----" >> "$RUNS_LOG"
   bash "$CLONE/pi-bootstrap/setup.sh" >> "$RUNS_LOG" 2>&1
@@ -179,12 +195,16 @@ grep -q "farm symlinks kept" "$RUNS_LOG" \
   || fail "run 1 did not report kept farm links"
 check_content_matches "$DEST/extensions" "run1" mcp-client shared
 check_fix_markers "$DEST/extensions" "run1"
+check_record_review_farmed "run1"
+grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
+  || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
 
 # --- run 2: re-run must refresh the ACTIVE files --------------------------
 # (a) a dest mutation must be overwritten by the source (content-merge);
 # (b) a NEW source file must propagate to the active dir.
 echo "== run 2: re-run refresh"
 echo "# machine-local mutation" >> "$DEST/agents/verifier.md"
+echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm refresh
 SRC_MARKER="$ROOT/pi-bootstrap/pi-config/agents/zz-setup-test-marker.md"
 echo "# issue-93 test marker" > "$SRC_MARKER"
 
@@ -199,6 +219,12 @@ if grep -q "machine-local mutation" "$DEST/agents/verifier.md"; then
   fail "dest mutation survived re-run (active file was not refreshed)"
 else
   echo "ok: dest mutation reverted by source on re-run"
+fi
+check_record_review_farmed "run2"
+if grep -q "stale farm mutation" "$DEST/scripts/record-review.sh"; then
+  fail "stale farm mutation survived re-run (farmed record-review.sh was not refreshed)"
+else
+  echo "ok: farmed record-review.sh refreshed on re-run (#562)"
 fi
 [ ! -d "$DEST/agents/agents" ] || fail "nesting appeared after re-run"
 check_no_nesting "$DEST" "dest-after-rerun"

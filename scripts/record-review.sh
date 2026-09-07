@@ -4,8 +4,11 @@
 # consumed by the review-enforcer merge registry gate
 # (extensions/review-enforcer/index.ts, issue #138).
 #
-# Canonical copy — production lives at ~/.pi/agent/scripts/record-review.sh.
-# Keep both in sync when changing this file.
+# Canonical copy — production lives at ~/.pi/agent/scripts/record-review.sh,
+# refreshed from this repo copy by the pi-bootstrap/setup.sh merge-gate
+# scripts farm (#562) on every sync (auto-sync at session_start / sync.sh).
+# Edit THIS file; do NOT hand-edit the ~/.pi copy — setup.sh re-copies it.
+# The repo copy is what CI tests (ci-main.yml script-validate).
 #
 # <repo> is optional (owner/name). When omitted it is auto-detected via
 # GH_REPO env or `gh repo view` when run inside a git repo. The merge gate
