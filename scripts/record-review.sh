@@ -47,7 +47,7 @@ closing_issue_refs() {
   while IFS= read -r m; do
     [ -z "$m" ] && continue
     local repo num
-    repo="$(printf '%s' "$m" | grep -oE 'https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+' | sed -E 's#https://github.com/([^/]+/[^/]+)/issues/[0-9]+.*#\1#' | head -1 || true)"
+    repo="$(printf '%s' "$m" | tr 'A-Z' 'a-z' | grep -oE 'https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+' | sed -E 's#https://github.com/([^/]+/[^/]+)/issues/[0-9]+.*#\1#' | head -1 || true)"
     num="$(printf '%s' "$m" | grep -oE '/issues/[0-9]+$' | grep -oE '[0-9]+' | head -1 || true)"
     if [ -n "$repo" ] && [ -n "$num" ]; then
       printf '%s#%s\n' "$repo" "$num"

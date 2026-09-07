@@ -246,14 +246,16 @@ printf 'complexity:micro\n' > "$T/labels/424310"
 printf 'complexity:standard\n' > "$T/labels/424311"
 printf 'complexity:micro\n' > "$T/labels/424312"
 printf 'complexity:micro\n' > "$T/labels/424313"
-(
-    export STUB_LABELS_DIR="$T/labels"
-    export STUB_LABELS=""   # per-issue map takes precedence in the stub
-    STUB_BODY="Fixes #424310 and also closes #424311" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424309 "$SHA"
-    [ "$RECORD_RC" = "4" ] && ok "multi-ref: any same-repo non-micro ref refuses (rc 4)" || bad "multi-ref: any non-micro refuses (rc=$RECORD_RC, err=$RECORD_ERR)"
-    STUB_BODY="Fixes #424312 and Closes #424313" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424314 "$SHA"
-    [ "$RECORD_RC" = "0" ] && ok "multi-ref: all-micro refs allow (rc 0)" || bad "multi-ref: all-micro allows (rc=$RECORD_RC, err=$RECORD_ERR)"
-)
+# NOTE (#513 review r2): ok/bad MUST run in the counting shell — a
+# subshell would discard the PASS/FAIL increments and the suite would exit 0
+# even when these pins fail (the only failure gate is top-level FAIL=0).
+export STUB_LABELS_DIR="$T/labels"
+export STUB_LABELS=""   # per-issue map takes precedence in the stub
+STUB_BODY="Fixes #424310 and also closes #424311" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424309 "$SHA"
+[ "$RECORD_RC" = "4" ] && ok "multi-ref: any same-repo non-micro ref refuses (rc 4)" || bad "multi-ref: any non-micro refuses (rc=$RECORD_RC, err=$RECORD_ERR)"
+STUB_BODY="Fixes #424312 and Closes #424313" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424314 "$SHA"
+[ "$RECORD_RC" = "0" ] && ok "multi-ref: all-micro refs allow (rc 0)" || bad "multi-ref: all-micro allows (rc=$RECORD_RC, err=$RECORD_ERR)"
+unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
 
 # 8.9b mixed-case slug: GitHub repo identity is case-INSENSITIVE — a
@@ -263,14 +265,13 @@ rm -rf "$T/labels"
 # same-repo filter compared $1 == "$REPO" case-sensitively).
 mkdir -p "$T/labels"
 printf 'complexity:standard\n' > "$T/labels/424316"
-(
-    export STUB_LABELS_DIR="$T/labels"
-    export STUB_LABELS=""   # per-issue map takes precedence in the stub
-    STUB_BODY="Fixes DANIEL-OSPINA/Agent-Infra#424316" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424317 "$SHA"
-    [ "$RECORD_RC" = "4" ] && ok "mixed-case slug: same-repo ref with different casing still refuses (rc 4)" || bad "mixed-case slug: casing bypassed the tier bind (rc=$RECORD_RC, err=$RECORD_ERR)"
-    STUB_BODY="Fixes https://github.com/Daniel-Ospina/Agent-Infra/issues/424316" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424318 "$SHA"
-    [ "$RECORD_RC" = "4" ] && ok "mixed-case URL: full-URL casing still refuses (rc 4)" || bad "mixed-case URL: casing bypassed the tier bind (rc=$RECORD_RC, err=$RECORD_ERR)"
-)
+export STUB_LABELS_DIR="$T/labels"
+export STUB_LABELS=""   # per-issue map takes precedence in the stub
+STUB_BODY="Fixes DANIEL-OSPINA/Agent-Infra#424316" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424317 "$SHA"
+[ "$RECORD_RC" = "4" ] && ok "mixed-case slug: same-repo ref with different casing still refuses (rc 4)" || bad "mixed-case slug: casing bypassed the tier bind (rc=$RECORD_RC, err=$RECORD_ERR)"
+STUB_BODY="Fixes https://github.com/Daniel-Ospina/Agent-Infra/issues/424316" run_record_verdict clean-micro "daniel-ospina/agent-infra" 424318 "$SHA"
+[ "$RECORD_RC" = "4" ] && ok "mixed-case URL: full-URL casing still refuses (rc 4)" || bad "mixed-case URL: casing bypassed the tier bind (rc=$RECORD_RC, err=$RECORD_ERR)"
+unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
 
 # 8.10 clean verdict: ZERO extra gh calls (no labels query in the log).
