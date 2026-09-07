@@ -218,7 +218,7 @@ Free tier: $10/mo credits (~1.4K searches/mo). Catches what keyword search misse
 **Brave MCP** — independent index verification (47% HLE):
 ```json
 // Add to .mcp.json:
-{"brave": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-brave-search"], "env": {"BRAVE_API_KEY": "<key>"}}}
+{"brave-search": {"command": "npx", "args": ["-y", "@brave/brave-search-mcp-server"], "env": {"BRAVE_API_KEY": "<key>"}}}
 ```
 $1/mo for 200 queries. Independent index — cross-source fact-checking.
 
