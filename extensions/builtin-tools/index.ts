@@ -3383,15 +3383,18 @@ export default function (pi: ExtensionAPI) {
       // venice-route audit row so credit burn is attributable per dispatch
       // WITHOUT scraping session files (audit/provider-failover.jsonl;
       // event=venice-route). Append-only + never throws (appendLedger).
-      // Appended AFTER the first spawn attempt (second-model P2): a
-      // breaker-open first retry returns circuit_open WITHOUT ever calling
-      // spawnLeg — no venice child ran, so no venice credits could burn and no
-      // route row may claim one (a row with no matching dispatch-usage row
-      // would overstate routing volume in the 0a ledger). Any other terminal
-      // (success/timeout/failed) means the venice leg WAS dispatched, so the
-      // row records a real route. The dispatchId (the hoisted nonce above) is
-      // unchanged — still shared with the child's dispatch-usage rows.
-      if (dispatchLeg.provider === "venice" && result.status !== "circuit_open") {
+      // Appended AFTER the first spawn attempt (second-model P2): a route row
+      // may only claim a venice dispatch that actually ran. "Never spawned" is
+      // precisely breaker-open-with-zero-attempts — circuit_open with
+      // retries===0 (the shared task breaker was open at entry and the cooldown
+      // had not elapsed, so retry() never called spawnLeg). Any other terminal
+      // means the venice leg WAS dispatched: circuit_open with retries>0
+      // follows the half-open path (attempt 1 called spawnLeg, then the breaker
+      // re-opened on its failure — a real child ran), and success/timeout/
+      // failed all had ≥1 real spawn. The dispatchId (the hoisted nonce above)
+      // is unchanged — still shared with the child's dispatch-usage rows.
+      const breakerNeverSpawned = result.status === "circuit_open" && result.retries === 0;
+      if (dispatchLeg.provider === "venice" && !breakerNeverSpawned) {
         recordVeniceRoute(
           dispatchLeg,
           family ?? null,

@@ -3668,25 +3668,31 @@ test("#512 review round-3 P2-1: the execute-path nonce hoist is UNCONDITIONAL an
   ok(argIdx > routeCallIdx && argIdx < routeCallIdx + 400, "route-row dispatchId arg is the hoisted nonce, not a failoverActive conditional");
 });
 
-test("#512 second-model P2 (SM2): the venice-route append runs AFTER the first spawn attempt, guarded on the retry status (source-shape pin)", () => {
-  // Regression guard for the second-model finding: the route row used to be
-  // appended BEFORE the spawn — a breaker-open first retry returns
-  // circuit_open WITHOUT ever calling spawnLeg, so a route row would claim a
-  // venice dispatch that never ran (no burn, no usage row → 0a routing-volume
-  // overcount). Lock the source shape:
+test("#512 second-model P2 (SM2): the venice-route append runs AFTER the first spawn attempt, suppressed only when the breaker NEVER spawned (source-shape pin)", () => {
+  // Regression guard for the second-model finding + its cycle-2 refinement: the
+  // route row used to be appended BEFORE the spawn; after the first fix it was
+  // guarded on `status !== "circuit_open"`, but the shared task breaker can
+  // return circuit_open AFTER a real spawn (half-open path: attempt 1 calls
+  // spawnLeg, fails, breaker re-opens, attempt 2 returns circuit_open with
+  // retries=1) — suppressing the row then UNDERCOUNTS routing. "Never
+  // spawned" is precisely circuit_open with retries===0 (breaker open at
+  // entry, cooldown not elapsed). Lock the source shape:
   //   1. the first-spawn retry exists
   //   2. the recordVeniceRoute call site sits AFTER it
-  //   3. the call is guarded on the retry status (circuit_open → no row)
+  //   3. the never-spawned discriminator (circuit_open && retries === 0) sits
+  //      between them and gates the append
   const spawnRetryIdx = source.indexOf("let result = await retry(() => spawnLeg(dispatchLeg), retryOptions);");
   ok(spawnRetryIdx > 0, "first-spawn retry present in source");
   const routeCallIdx = source.lastIndexOf("recordVeniceRoute(");
   ok(spawnRetryIdx < routeCallIdx, "venice-route append runs AFTER the first spawn attempt (no row for a never-spawned dispatch)");
-  const circuitGuardIdx = source.indexOf("result.status !== \"circuit_open\"");
-  ok(circuitGuardIdx > 0, "circuit_open guard present");
+  const neverSpawnedIdx = source.indexOf("result.status === \"circuit_open\" && result.retries === 0");
+  ok(neverSpawnedIdx > 0, "breaker-never-spawned discriminator present (circuit_open && retries === 0)");
   ok(
-    circuitGuardIdx > spawnRetryIdx && circuitGuardIdx < routeCallIdx + 120,
-    "the guard sits between the spawn retry and the route-row append (breaker-open first retry → no route row)",
+    neverSpawnedIdx > spawnRetryIdx && neverSpawnedIdx < routeCallIdx,
+    "the discriminator sits between the spawn retry and the route-row append",
   );
+  const guardIdx = source.indexOf("!breakerNeverSpawned");
+  ok(guardIdx > neverSpawnedIdx && guardIdx < routeCallIdx + 120, "the append is gated on !breakerNeverSpawned");
 });
 
 // ── #512 per-dispatch usage capture — parent-side parse/scan ──
