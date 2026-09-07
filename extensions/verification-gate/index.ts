@@ -1713,6 +1713,7 @@ export function parseDiffNameStatus(output: string): DiffScope {
     if (letter === "R" || letter === "C") {
       // 3-field row: OLD path then NEW path.
       if (m[2] === "" || i + 1 >= tokens.length) { clean = false; break; } // bare R/C without score, or truncated
+      if (tokens[i] === "" || tokens[i + 1] === "") { clean = false; break; } // empty path column — defensive symmetry with the name-only branch (fail-closed)
       renameOldPaths.push(tokens[i]);
       files.push(tokens[i + 1]);
       i += 2;
@@ -2413,28 +2414,28 @@ export default function (pi: ExtensionAPI) {
     if (route.action === "exempt-allow") {
       const changedFiles = route.files;
       // #472 mechanism (a): content-shape exemption — docs/CSS/static-only
-    // sets (no build-output paths) skip VGATE (01-preflight.md "Verification Gate";
-    // mirrors 02-commit-pr.md Step 1.5's Micro content class). TIER-INDEPENDENT:
-    // content shape decides, never the complexity label. ALLOW-ONLY: no NEW
-    // verifiedSet/bridge entries originate from the exempt op — the registry
-    // stays verifier-authoritative; a later MIXED op verifies everything fresh
-    // (docs included). Commit-form guard (isBareCommitShape): among `git
-    // commit` invocations only the bare form qualifies — `-a`/`--all`/`--amend`/
-    // pathspec anywhere re-gates the whole command (D2); push / gh pr
-    // create|merge ops with no commit invocation qualify on file shape alone
-    // (isBareCommitShape is vacuous on pure pushes — e2e scenarios 47/56 pin
-    // the exemption on BOTH the staged set and the #487 RANGE set).
-    // Exempt files are not registered here, so a post-exempt lint-staged
-    // rewrite cannot stale-hash a future block via THIS op — but a bare
-    // exempt COMMIT still arms the #7574 re-hash (review deep-P2): the file
-    // may already be registered from an EARLIER mixed VGATE PASS, and the
-    // pre-commit hook's rewrite would otherwise go stale with no safety net.
-    // #487: the file set this exemption reads is range-scoped for content
-    // pushes (tier A/B) with a tier-C staged fallback — the check is
-    // identical regardless of which source produced changedFiles.
-    // #559 T1: the gate's rename-source check (renameOldPaths.every exempt)
-    // already ran in applyScopeGate — this branch is reachable only when
-    // every changed file AND every R/C old path is shape-exempt.
+      // sets (no build-output paths) skip VGATE (01-preflight.md "Verification Gate";
+      // mirrors 02-commit-pr.md Step 1.5's Micro content class). TIER-INDEPENDENT:
+      // content shape decides, never the complexity label. ALLOW-ONLY: no NEW
+      // verifiedSet/bridge entries originate from the exempt op — the registry
+      // stays verifier-authoritative; a later MIXED op verifies everything fresh
+      // (docs included). Commit-form guard (isBareCommitShape): among `git
+      // commit` invocations only the bare form qualifies — `-a`/`--all`/`--amend`/
+      // pathspec anywhere re-gates the whole command (D2); push / gh pr
+      // create|merge ops with no commit invocation qualify on file shape alone
+      // (isBareCommitShape is vacuous on pure pushes — e2e scenarios 47/56 pin
+      // the exemption on BOTH the staged set and the #487 RANGE set).
+      // Exempt files are not registered here, so a post-exempt lint-staged
+      // rewrite cannot stale-hash a future block via THIS op — but a bare
+      // exempt COMMIT still arms the #7574 re-hash (review deep-P2): the file
+      // may already be registered from an EARLIER mixed VGATE PASS, and the
+      // pre-commit hook's rewrite would otherwise go stale with no safety net.
+      // #487: the file set this exemption reads is range-scoped for content
+      // pushes (tier A/B) with a tier-C staged fallback — the check is
+      // identical regardless of which source produced changedFiles.
+      // #559 T1: the gate's rename-source check (renameOldPaths.every exempt)
+      // already ran in applyScopeGate — this branch is reachable only when
+      // every changed file AND every R/C old path is shape-exempt.
       console.log(`[verification-gate] ⏭️ Skipping VGATE — ${changedFiles.length} docs/static file(s): content-shape exemption (tier-independent)`);
       logGateSkip("content_shape_exempt", command, cwd, { files: changedFiles.length });
       // deep-review P2: mirror the verified-allow branch — a bare exempt

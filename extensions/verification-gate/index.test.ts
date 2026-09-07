@@ -2615,6 +2615,14 @@ test("G1: empty path token → clean=false", () => {
   equal(parseDiffNameStatus("A\0\0").clean, false);
 });
 
+test("G1: R row with empty OLD path column → clean=false (#559 T1 defensive symmetry)", () => {
+  equal(parseDiffNameStatus("R100\0\0new.md\0").clean, false, "empty rename-source column");
+});
+
+test("G1: R row with empty NEW path column → clean=false (#559 T1 defensive symmetry)", () => {
+  equal(parseDiffNameStatus("R100\0old.ts\0\0").clean, false, "empty rename-destination column");
+});
+
 test("G1: unknown status letter Q → clean=false (closed alphabet)", () => {
   equal(parseDiffNameStatus("Q\0f.ts\0").clean, false);
 });
