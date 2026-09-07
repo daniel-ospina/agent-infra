@@ -75,7 +75,7 @@ export function scopeFiles(
       skipped++;
       continue;
     }
-    if (staged === null) staged = new Set(computeStagedDiff(projectRoot));
+    if (staged === null) staged = new Set(runStagedScope(projectRoot).files);
     if (staged.has(rel)) { kept.push(f); continue; }
     skipped++;
   }
@@ -1228,7 +1228,10 @@ export function isBareCommitShape(command: string): boolean {
 // tokens — only `--` (pathspec terminator) and end-of-stream end flag parsing; only
 // HEAD-ANCHORED commit invocations classify (wrapper/negation/prose forms stay "none" —
 // unchanged staged scope, no new under-gate; the wrapper-hidden sweep variant is
-// residual #539, and the git-global-option interception gap is residual #490).
+// residual #539; repo-redirecting globals (`-C`/`--git-dir`/`--work-tree`) stay
+// recognized-but-un-gated BY DESIGN post-#490: a `-C` commit targets another
+// checkout whose files this root must never verify (cwd-neutral env/-c/--no-pager
+// spellings ARE intercepted via the shared scanner — closed #490).
 export type CommitSweepClass = "sweep" | "mixed" | "none";
 
 // #489: required-value LONG options on `git commit` — each consumes the NEXT token as
@@ -1316,7 +1319,7 @@ export function commitSweepClass(command: string): CommitSweepClass {
 // TDD stub round that RED-pinned the unit sections is long landed).
 // Mirror of the evaluateMergeScope pure-decision + e2e-orchestration split:
 // shape/tier tables are unit-tested subprocess-free; the I/O orchestrator
-// resolvePushRangeFiles probes the repo and is e2e-only (same
+// resolvePushRangeScope probes the repo and is e2e-only (same
 // no-unit-import choice as resolveMergeScope). Design record + accepted
 // residuals: docs/plans/2026-09-06-issue-487-vgate-push-range.md.
 //
@@ -1324,9 +1327,9 @@ export function commitSweepClass(command: string): CommitSweepClass {
 // --all/--tags/--mirror, wrapper push, URL remote, delete+content mix, any
 // non-whitelisted push flag), ANY git commit or gh pr create|merge presence
 // (the P0 guard — findGitCommit substring containment, wrapper-inclusive), or
-// ANY probe failure → resolvePushRangeFiles returns null → the caller's
-// status-quo staged scope (computeStagedDiff). NEVER error→[] (the
-// computeBranchDiff catch→[] fail-open precedent is the
+// ANY probe failure → resolvePushRangeScope returns null → the caller's
+// status-quo staged scope (runStagedScope). NEVER error→[] (the
+// runBranchScope catch→clean-empty fail-open precedent is the
 // cautionary inversion). An empty RESOLVED range is audited push_range_empty
 // and allowed (an up-to-date push ships nothing).
 
@@ -1461,11 +1464,12 @@ export function resolvePushTier(trackingExists: boolean, baseMainExists: boolean
 // every value that reaches the argv is whitelist-validated before it is
 // interpolated — classifier tokens by PUSH_REFNAME/remote regex, and
 // git-state-derived values (checked-out branch name, config remote) by the
-// GIT_STATE guards in resolvePushRangeFiles — so no shell metachars can reach
+// GIT_STATE guards in resolvePushRangeScope — so no shell metachars can reach
 // the execSync string (execSync runs /bin/sh -c; nothing here sets shell:false).
-export function buildPushRangeDiffCommand(tier: "A" | "B", baseRef: string, src: string): string {
-  if (tier === "A") return `git diff --name-only ${baseRef} ${src}`;
-  return `git diff --name-only ${baseRef}...${src}`;
+export function buildPushRangeDiffCommand(tier: "A" | "B", baseRef: string, src: string, nameStatusZ = false): string {
+  const arg = nameStatusZ ? "--name-status -z" : "--name-only";
+  if (tier === "A") return `git diff ${arg} ${baseRef} ${src}`;
+  return `git diff ${arg} ${baseRef}...${src}`;
 }
 
 // ── #487 — I/O orchestration (Task 4): repo probes + per-refspec range diff ──
@@ -1508,7 +1512,7 @@ function symbolicRefShort(cwd: string): string | null {
 // branch name is rejected by the whitelist even though neither carries shell
 // metachars → bare pushes over parked WIP keep the staged check (status-quo,
 // pre-#487 behavior).
-export function resolvePushRangeFiles(command: string, cwd: string): string[] | null {
+export function resolvePushRangeScope(command: string, cwd: string): DiffScope | null {
   const parsed = parsePushRefSpecs(command);
   if (!parsed.eligible) return null; // commit/gh/unmappable/wrapper/no_push — zero subprocess on bare commits
   // Bare push (no refspecs): derive remote + dst + src from the branch config
@@ -1536,7 +1540,9 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
     refspecs = [{ src: current, dst: m[1], colon: false }];
   }
   if (refspecs.length === 0) return null; // defensive
-  const allFiles = new Set<string>();
+  // Multi-refspec union: files dedup, renameOldPaths dedup, clean = AND over
+  // the refspec parses (mixed-union rule).
+  const union: DiffScope = { files: [], renameOldPaths: [], clean: true };
   let sawTierA = false;
   for (const rs of refspecs) {
     let { src, dst } = rs;
@@ -1603,25 +1609,26 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
     if (tier === "C") return null; // whole-command rule: ANY tier C → staged
     const baseRef = tier === "A" ? tracking : baseMain;
     if (tier === "A") sawTierA = true;
-    // 2-dot (A) / 3-dot (B) name-only diff. The builder emits the FULL `git
-    // diff …` argv (unit-pinned) — run it directly (NOT through gitProbe,
-    // which would double the `git` prefix). ANY throw → null (staged) — NEVER
-    // error→[] (the computeBranchDiff catch→[] fail-open precedent inverted).
+    // 2-dot (A) / 3-dot (B) `--name-status -z` diff. The builder emits the
+    // FULL `git diff …` argv (unit-pinned) — run it directly (NOT through
+    // gitProbe, which would double the `git` prefix). ANY throw → null
+    // (staged) — NEVER error→[] (the computeBranchDiff catch→[] fail-open
+    // precedent inverted). No trim: -z rows are NUL-delimited raw path bytes.
     let diffOut: string | null = null;
     try {
-      diffOut = execSync(buildPushRangeDiffCommand(tier, baseRef, srcRef), {
-        cwd, encoding: "utf-8", timeout: 5000,
-      }).trim();
+      diffOut = execSync(buildPushRangeDiffCommand(tier, baseRef, srcRef, true), {
+        cwd, encoding: "utf-8", timeout: 5000, maxBuffer: 64 * 1024 * 1024,
+      });
     } catch {
       diffOut = null;
     }
     if (diffOut === null) return null;
-    for (const line of diffOut.split("\n")) {
-      const f = line.trim();
-      if (f.length > 0) allFiles.add(f);
-    }
+    const parsed = parseDiffNameStatus(diffOut);
+    union.files.push(...parsed.files);
+    union.renameOldPaths.push(...parsed.renameOldPaths);
+    union.clean = union.clean && parsed.clean;
   }
-  if (allFiles.size === 0) {
+  if (union.files.length === 0 && union.renameOldPaths.length === 0 && union.clean) {
     // Up-to-date push ships nothing — audited INSIDE the resolver so the
     // caller's shared silent empty-allow never hides the range decision.
     // Note: with multi-refspec commands the tier payload is "A" iff ANY
@@ -1639,12 +1646,107 @@ export function resolvePushRangeFiles(command: string, cwd: string): string[] | 
     // to computeBranchDiff's origin/main staleness); the pull --rebase
     // pre-push ceremony (01-preflight) refreshes it.
     logGateSkip("push_range_empty", command, cwd, { tier: sawTierA ? "A" : "B" });
-    return [];
+    return { files: [], renameOldPaths: [], clean: true };
   }
-  return Array.from(allFiles);
+  return {
+    files: Array.from(new Set(union.files)),
+    renameOldPaths: Array.from(new Set(union.renameOldPaths)),
+    clean: union.clean,
+  };
 }
 
-// ── Diff computation ──────────────────────────────────
+// ── Diff computation (#559 T1: rename-source plumbing) ──
+// All diff scopes switch to `git diff --name-status -z` (NUL-separated
+// porcelain). git emits path columns RAW in -z mode (no C-quoting — control
+// chars/quotes/tabs and non-ASCII names parse raw and hash correctly), and
+// rename/copy rows carry the OLD path: `R100\0<old>\0<new>\0` vs name-only's
+// collapsed `docs/code.md`. The OLD path is what the content-shape gate must
+// measure — `git mv src/app.ts docs/code.md` must NOT ride the docs exemption
+// (issue #559 T1). A defensive `clean` flag stays on the parse (unreachable
+// from real git output — the allow sites must be fail-closed against future
+// format drift) and routes an unconditional parse-block (applyScopeGate).
+
+export interface DiffScope {
+  /** changed paths — rename/copy rows contribute the NEW path (name-only parity) */
+  files: string[];
+  /** rename/copy SOURCE paths (the old side of R/C rows) */
+  renameOldPaths: string[];
+  /** NUL-stream parsed without anomaly (false ⇒ parse-block, never allow) */
+  clean: boolean;
+}
+
+// Pure `--name-status -z` parser. Row grammar (byte-exact, verified against
+// git): a one-letter status + optional similarity score, NUL, then the path
+// column(s) — one path for A/M/D/T/U/X/B (`A\0<path>\0`), TWO for R/C rows
+// (`R100\0<old>\0<new>\0` — old first). Every row's last path ends with a
+// trailing NUL — that final empty token is the terminator, not an anomaly.
+// NUL contract (unit-pinned): `parseDiffNameStatus("")` → clean with no
+// rows; a trailing-NUL multi-row stream → clean with the full file set; an
+// interior-consecutive-NUL / unknown-status / truncated-row stream →
+// `clean=false` (fail-closed: the caller must parse-block, never allow).
+// `diff.renames=false` equivalence: git then emits D+A split rows instead of
+// R — the OLD path lands in `files` (D row) and gates normally; renameOldPaths
+// stays empty (no regression, the old path still surfaces). No quoting/
+// decoding anywhere — paths raw. Exec-failure and parse-anomaly never share a
+// channel: the producers' catch → clean-empty preserves today's error
+// semantics (documented residual, #559 plan §1); only a NUL-stream anomaly is
+// newly fail-closed.
+export function parseDiffNameStatus(output: string): DiffScope {
+  const files: string[] = [];
+  const renameOldPaths: string[] = [];
+  if (output === "") return { files, renameOldPaths, clean: true };
+  // NUL contract: every git -z stream is NUL-terminated (each row's last
+  // path column ends with NUL). A non-empty stream lacking the final
+  // terminator is truncated → anomaly (fail-closed).
+  if (!output.endsWith("\0")) return { files, renameOldPaths, clean: false };
+  const tokens = output.split("\0");
+  // Trailing NUL terminator: git ends every row's last path column with NUL.
+  if (tokens.length > 0 && tokens[tokens.length - 1] === "") tokens.pop();
+  let clean = true;
+  const statusRe = /^([AMDRCTUXB])(\d*)$/; // status letter + optional similarity score
+  let i = 0;
+  while (i < tokens.length) {
+    const m = statusRe.exec(tokens[i]);
+    if (m === null) { clean = false; break; } // interior NUL / unknown status → anomaly
+    const letter = m[1];
+    i++;
+    if (letter === "R" || letter === "C") {
+      // 3-field row: OLD path then NEW path.
+      if (m[2] === "" || i + 1 >= tokens.length) { clean = false; break; } // bare R/C without score, or truncated
+      if (tokens[i] === "" || tokens[i + 1] === "") { clean = false; break; } // empty path column — defensive symmetry with the name-only branch (fail-closed)
+      renameOldPaths.push(tokens[i]);
+      files.push(tokens[i + 1]);
+      i += 2;
+    } else {
+      if (i >= tokens.length) { clean = false; break; }
+      if (tokens[i] === "") { clean = false; break; } // empty path token
+      files.push(tokens[i]);
+      i++;
+    }
+  }
+  return { files, renameOldPaths, clean };
+}
+
+function execDiffStatusZ(cwd: string, cmd: string): string | null {
+  try {
+    // NO trim: -z output is NUL-terminated raw path bytes — trimming could
+    // strip legitimate leading/trailing whitespace in file names.
+    return execSync(cmd, { cwd, encoding: "utf-8", timeout: 5000, maxBuffer: 64 * 1024 * 1024 });
+  } catch {
+    return null;
+  }
+}
+
+// DEDUPE ∪ helper for mixed sweep unions (files dedup, renameOldPaths dedup,
+// clean AND over the members). Pure + exported (unit-pinned — the mixed arm's
+// combination rule is otherwise comment-only).
+export function combineScopes(a: DiffScope, b: DiffScope): DiffScope {
+  return {
+    files: Array.from(new Set([...a.files, ...b.files])),
+    renameOldPaths: Array.from(new Set([...a.renameOldPaths, ...b.renameOldPaths])),
+    clean: a.clean && b.clean,
+  };
+}
 
 function resolveGitRoot(cwd: string): string {
   try {
@@ -1658,17 +1760,13 @@ function resolveGitRoot(cwd: string): string {
   }
 }
 
-function computeStagedDiff(cwd: string): string[] {
-  try {
-    const out = execSync("git diff --cached --name-only", {
-      encoding: "utf-8",
-      cwd,
-      timeout: 5000,
-    }).trim();
-    return out ? out.split("\n").filter(Boolean) : [];
-  } catch {
-    return [];
-  }
+// Staged scope — `git diff --cached`. A git-level failure (missing repo,
+// corrupt index) keeps the legacy catch→empty status quo (the op itself will
+// fail at git commit time); parse ANOMALIES inside the NUL stream are the
+// fail-closed layer and set clean=false.
+function runStagedScope(cwd: string): DiffScope {
+  const out = execDiffStatusZ(cwd, "git diff --cached --name-status -z");
+  return out === null ? { files: [], renameOldPaths: [], clean: true } : parseDiffNameStatus(out);
 }
 
 // #489: the file set a sweep commit (`git commit -a`/`--all`) actually records — the
@@ -1678,35 +1776,111 @@ function computeStagedDiff(cwd: string): string[] {
 // permission) is logged and falls back to the staged scope (status-quo semantics; a
 // genuinely broken repo fails at `git commit` time anyway) — accepted residual, see the
 // #489 plan surface-map row 2.
-function computeWorktreeDiff(cwd: string): string[] {
+function runWorktreeScope(cwd: string): DiffScope {
   try {
     execSync("git rev-parse --verify HEAD", { encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore" });
   } catch {
-    return computeStagedDiff(cwd); // unborn HEAD
+    return runStagedScope(cwd); // unborn HEAD
   }
-  try {
-    const out = execSync("git diff HEAD --name-only", {
-      encoding: "utf-8",
-      cwd,
-      timeout: 5000,
-    }).trim();
-    return out ? out.split("\n").filter(Boolean) : [];
-  } catch (e) {
-    console.error("[verification-gate] ⚠️ git diff HEAD failed — falling back to staged scope:", (e as Error).message);
-    return computeStagedDiff(cwd);
+  const out = execDiffStatusZ(cwd, "git diff HEAD --name-status -z");
+  if (out === null) {
+    console.error("[verification-gate] ⚠️ git diff HEAD failed — falling back to staged scope:");
+    return runStagedScope(cwd);
   }
+  return parseDiffNameStatus(out);
 }
 
-function computeBranchDiff(cwd: string): string[] {
-  try {
-    const out = execSync("git diff origin/main...HEAD --name-only", {
-      encoding: "utf-8",
-      cwd,
-      timeout: 5000,
-    }).trim();
-    return out ? out.split("\n").filter(Boolean) : [];
-  } catch {
-    return [];
+// Branch scope (`gh pr create` + the merge-scope verify path) — origin/main...HEAD.
+// Exec failure → clean-empty preserves the documented status-quo catch→[] fail-open
+// precedent (#559 plan §1 residual; availability rationale — non-main-default repos and
+// transient timeouts must not hard-block).
+function runBranchScope(cwd: string): DiffScope {
+  const out = execDiffStatusZ(cwd, "git diff origin/main...HEAD --name-status -z");
+  return out === null ? { files: [], renameOldPaths: [], clean: true } : parseDiffNameStatus(out);
+}
+
+// ── Pure gate decision (#559 T1) ─────────────────────
+// Single post-resolution routing site for the hook: routes the four outcomes
+// of a resolved scope — parse-block (NUL anomaly: unconditional, BEFORE the
+// whole allow chain — no #7591 counter, no lastBlockedFiles; a format drift
+// must never silently allow), empty-allow, exempt-allow (the content-shape
+// exemption now measures rename SOURCES too: a docs-shaped file set is exempt
+// only when EVERY rename/copy OLD path is also shape-exempt — `git mv
+// src/app.ts docs/code.md` gates ON), verify.
+// ⛔ Ordering is load-bearing: the hook must call this BEFORE the #7591
+// auto-bypass region — a refactor routing parse-block after the blockAttempts
+// increment re-opens vacuous auto-bypass.
+
+export type ScopeGateDecision =
+  | { kind: "parse-block"; block: { block: true; reason: string }; event: "gate_block_parse_failure" }
+  | { kind: "empty-allow" }
+  | { kind: "exempt-allow" }
+  | { kind: "verify" };
+
+export function applyScopeGate(
+  changedFiles: string[],
+  renameOldPaths: string[],
+  clean: boolean,
+  bare: boolean,
+  isExempt: (p: string) => boolean,
+): ScopeGateDecision {
+  // Parse-block FIRST — an anomaly is never allowed, even when the file set
+  // is empty (a drift that swallows rows must block, not ride the empty or
+  // the #7591 path).
+  if (!clean) {
+    return {
+      kind: "parse-block",
+      event: "gate_block_parse_failure",
+      block: {
+        block: true,
+        reason: [
+          "⛔ Verification gate — diff parse anomaly (name-status -z format drift).",
+          "  The git diff output could not be parsed cleanly; nothing was allowed.",
+          "  → Re-run the operation; if it persists, the gate's diff parser needs a format update.",
+          "  (No verifier dispatch can clear this — only ELDATO_SKIP_VGATE escapes.)",
+        ].join("\n"),
+      },
+    };
+  }
+  if (changedFiles.length === 0) return { kind: "empty-allow" };
+  // Content-shape exemption. Commit-form guard (bare) + destination shape +
+  // RENAME-SOURCE shape (issue #559 T1): a rename/copy whose OLD path is not
+  // shape-exempt forces the gate ON even when every listed file is docs-/
+  // css-shaped. Tree-observability limit (documented): R rows fire only when
+  // the rename source exists in a compared tree (base/HEAD/index) — code
+  // content whose path is docs-shaped at EVERY observable tree (in-session
+  // add→mv, in-range add→mv) is structurally indistinguishable from a docs
+  // create and remains the accepted residual; the copying-code-into-fresh-
+  // `.md` residual is the same class.
+  if (bare && changedFiles.every((f) => isExempt(f)) && renameOldPaths.every((p) => isExempt(p))) {
+    return { kind: "exempt-allow" };
+  }
+  return { kind: "verify" };
+}
+
+// Pure consumption helper for the hook's routing site. The hook's diff+gate
+// region is e2e-unreachable for parse-block (real git cannot emit a NUL
+// anomaly), so the four routes are unit-pinned here — parse-block carries the
+// event name + block shape with NO lastBlockedFiles/blockAttempts side
+// effects (the hook emits the audit + returns block; it never writes block
+// state, so #7591 auto-bypass is structurally unreachable for parse-blocks).
+
+export type ScopeGateRoute =
+  | { action: "parse-block"; event: "gate_block_parse_failure"; block: { block: true; reason: string } }
+  | { action: "empty-allow" }
+  | { action: "exempt-allow"; files: string[] }
+  | { action: "verify"; files: string[] };
+
+export function routeScopeGate(gate: ScopeGateDecision, files: string[]): ScopeGateRoute {
+  switch (gate.kind) {
+    case "parse-block":
+      return { action: "parse-block", event: gate.event, block: gate.block };
+    case "empty-allow":
+      return { action: "empty-allow" };
+    case "exempt-allow":
+      return { action: "exempt-allow", files };
+    case "verify":
+      return { action: "verify", files };
   }
 }
 
@@ -2151,7 +2325,7 @@ export default function (pi: ExtensionAPI) {
     // blessings). Purity-gated (isDeletionPush): any content refspec / git
     // commit / gh pr op in the command falls back to today's gating
     // (fail-closed). #487: the CONTENT half of a push is now range-scoped
-    // (resolvePushRangeFiles below — pushed range vs the whole index); the
+    // (resolvePushRangeScope below — pushed range vs the whole index); the
     // delete short-circuit itself is untouched and still fires first.
     if (isDeletionPush(command)) {
       console.log("[verification-gate] ⏭️ Skipping VGATE — delete-shaped push: no local content ships");
@@ -2177,11 +2351,11 @@ export default function (pi: ExtensionAPI) {
     // Leg-A allowed commit's armed pendingRehash executing before the block
     // check).
     const sweepClass = commitSweepClass(command);
-    let changedFiles: string[];
+    let scope: DiffScope;
     if (sweepClass !== "none" && !GH_PR_PATTERN.test(command)) {
-      const worktree = computeWorktreeDiff(cwd);
-      changedFiles = sweepClass === "sweep" ? worktree
-        : Array.from(new Set([...computeStagedDiff(cwd), ...worktree]));
+      const worktree = runWorktreeScope(cwd);
+      scope = sweepClass === "sweep" ? worktree
+        : combineScopes(runStagedScope(cwd), worktree);
     } else if (GH_PR_PATTERN.test(command)) {
       // #204: `gh pr merge` merges REMOTELY. Only the PR's own repo+head can
       // be verified locally; anything else is unrelated branch residue that
@@ -2199,7 +2373,7 @@ export default function (pi: ExtensionAPI) {
           return undefined; // before computeBranchDiff: no files, no block, no registry/bridge writes
         }
       }
-      changedFiles = computeBranchDiff(cwd);
+      scope = runBranchScope(cwd);
     } else {
       // #487 T1: a content push (no git commit anywhere in the command) verifies
       // the PUSHED RANGE — HEAD vs the remote-tracking ref (tier A, 2-dot) or
@@ -2207,42 +2381,61 @@ export default function (pi: ExtensionAPI) {
       // session's parked WIP in the index cannot false-block `git push origin
       // main` of already-committed HEAD. Commit-time behavior is UNCHANGED:
       // commit-bearing commands resolve null fast inside (classifier, zero
-      // subprocess) → the staged scope below. resolvePushRangeFiles is
+      // subprocess) → the staged scope below. resolvePushRangeScope is
       // fail-closed — null (→ staged) on EVERY fallback: unmappable shape
       // (tags/--all/--mirror/wrapper/URL remote), mixed delete+content chains
       // (scenario 44 legs 2-3), commit/gh presence (the P0 backstop,
       // wrapper-inclusive), no usable base (tier C), any git failure — NEVER []
       // on error (the computeBranchDiff catch→[] fail-open
       // precedent). An empty RESOLVED range is audited push_range_empty inside.
-      changedFiles = resolvePushRangeFiles(command, cwd) ?? computeStagedDiff(cwd);
+      scope = resolvePushRangeScope(command, cwd) ?? runStagedScope(cwd);
     }
 
-    if (changedFiles.length === 0) {
+    // ⛔ #559 T1 single routing site — load-bearing ordering: applyScopeGate
+    // decides parse-block FIRST (unconditional on !clean), so a NUL-stream
+    // anomaly can never ride the empty-allow / exemption / verify / #7591
+    // chain below. Do NOT move this routing after the blockAttempts increment
+    // region — a refactor routing parse-block after it re-opens vacuous
+    // auto-bypass (accepted-unpinned, pinned on the pure gate instead).
+    const gate = applyScopeGate(scope.files, scope.renameOldPaths, scope.clean, isBareCommitShape(command), isShapeExemptFile);
+    const route = routeScopeGate(gate, scope.files);
+    if (route.action === "parse-block") {
+      // No lastBlockedFiles write, no blockAttempts feed — parse-block never
+      // auto-bypasses; only ELDATO_SKIP_VGATE escapes. The audit is explicit
+      // (the block return itself does not audit).
+      appendJsonl({ event: "gate_block_parse_failure", extension: "verification-gate", reason: "name_status_z_anomaly", session_cwd: process.cwd(), command: redactCommand(command), target_cwd: cwd });
+      console.log("[verification-gate] 🚫 Blocked — diff parse anomaly (name-status -z format drift)");
+      return route.block;
+    }
+    if (route.action === "empty-allow") {
       // No changed files — allow
       return undefined;
     }
-
-    // #472 mechanism (a): content-shape exemption — docs/CSS/static-only sets
-    // (no build-output paths) skip VGATE (01-preflight.md "Verification Gate";
-    // mirrors 02-commit-pr.md Step 1.5's Micro content class). TIER-INDEPENDENT:
-    // content shape decides, never the complexity label. ALLOW-ONLY: no NEW
-    // verifiedSet/bridge entries originate from the exempt op — the registry
-    // stays verifier-authoritative; a later MIXED op verifies everything fresh
-    // (docs included). Commit-form guard (isBareCommitShape): among `git
-    // commit` invocations only the bare form qualifies — `-a`/`--all`/`--amend`/
-    // pathspec anywhere re-gates the whole command (D2); push / gh pr
-    // create|merge ops with no commit invocation qualify on file shape alone
-    // (isBareCommitShape is vacuous on pure pushes — e2e scenarios 47/56 pin
-    // the exemption on BOTH the staged set and the #487 RANGE set).
-    // Exempt files are not registered here, so a post-exempt lint-staged
-    // rewrite cannot stale-hash a future block via THIS op — but a bare
-    // exempt COMMIT still arms the #7574 re-hash (review deep-P2): the file
-    // may already be registered from an EARLIER mixed VGATE PASS, and the
-    // pre-commit hook's rewrite would otherwise go stale with no safety net.
-    // #487: the file set this exemption reads is range-scoped for content
-    // pushes (tier A/B) with a tier-C staged fallback — the check is
-    // identical regardless of which source produced changedFiles.
-    if (changedFiles.length > 0 && isBareCommitShape(command) && changedFiles.every((file) => isShapeExemptFile(file))) {
+    if (route.action === "exempt-allow") {
+      const changedFiles = route.files;
+      // #472 mechanism (a): content-shape exemption — docs/CSS/static-only
+      // sets (no build-output paths) skip VGATE (01-preflight.md "Verification Gate";
+      // mirrors 02-commit-pr.md Step 1.5's Micro content class). TIER-INDEPENDENT:
+      // content shape decides, never the complexity label. ALLOW-ONLY: no NEW
+      // verifiedSet/bridge entries originate from the exempt op — the registry
+      // stays verifier-authoritative; a later MIXED op verifies everything fresh
+      // (docs included). Commit-form guard (isBareCommitShape): among `git
+      // commit` invocations only the bare form qualifies — `-a`/`--all`/`--amend`/
+      // pathspec anywhere re-gates the whole command (D2); push / gh pr
+      // create|merge ops with no commit invocation qualify on file shape alone
+      // (isBareCommitShape is vacuous on pure pushes — e2e scenarios 47/56 pin
+      // the exemption on BOTH the staged set and the #487 RANGE set).
+      // Exempt files are not registered here, so a post-exempt lint-staged
+      // rewrite cannot stale-hash a future block via THIS op — but a bare
+      // exempt COMMIT still arms the #7574 re-hash (review deep-P2): the file
+      // may already be registered from an EARLIER mixed VGATE PASS, and the
+      // pre-commit hook's rewrite would otherwise go stale with no safety net.
+      // #487: the file set this exemption reads is range-scoped for content
+      // pushes (tier A/B) with a tier-C staged fallback — the check is
+      // identical regardless of which source produced changedFiles.
+      // #559 T1: the gate's rename-source check (renameOldPaths.every exempt)
+      // already ran in applyScopeGate — this branch is reachable only when
+      // every changed file AND every R/C old path is shape-exempt.
       console.log(`[verification-gate] ⏭️ Skipping VGATE — ${changedFiles.length} docs/static file(s): content-shape exemption (tier-independent)`);
       logGateSkip("content_shape_exempt", command, cwd, { files: changedFiles.length });
       // deep-review P2: mirror the verified-allow branch — a bare exempt
@@ -2251,16 +2444,36 @@ export default function (pi: ExtensionAPI) {
       // registered by an earlier MIXED pass); pushes/gh ops leave it unset
       // (lint-staged runs on commit, not push — same as the verified-allow
       // branch below).
-      // Trust boundary (review 2a-1, documented): the shape check measures
-      // rename DESTINATIONS (`git mv src/app.ts docs/code.md` lists only the
-      // new path) — a deliberate code→docs rename rides the exemption, same
-      // class as copying code into a fresh `.md` (inherent to the Z-NARROW
-      // extension-keyed design, accepted in plan D1; rename-source plumbing
-      // is a follow-up).
+      // Trust boundary (rewritten for #559): the exemption measures rename/
+      // copy SOURCE paths alongside destinations — an R/C row whose OLD path
+      // is not shape-exempt forces the gate ON even when the new path is
+      // docs-shaped (`git mv src/app.ts docs/code.md` no longer rides the
+      // docs exemption). Detection is tree-observable, not total: R rows fire
+      // only while the source exists in a COMPARED tree (index/HEAD/range
+      // base); C rows fire only when the copied content duplicates the
+      // PRE-IMAGE of a file modified/deleted in the same diff (no -C is
+      // passed; diff.renames=copies can still surface C) — a copy of an
+      // UNTOUCHED source emits a plain A row. Accepted residuals, no
+      // total-closure claim: (1) copying code into a fresh `.md` (plain A —
+      // indistinguishable from a docs create); (2) code content whose path is
+      // docs-shaped at EVERY observable tree — an in-session/in-range add→mv
+      // cancels to a plain A row because the source never exists in a
+      // compared tree (tree-observability limit); (3) valid-UTF-8 path bytes
+      // only — invalid-UTF-8 names (Linux-only) still decode-loss
+      // ENOENT→skip (narrowed residual of the C-quote class); (4) producer
+      // exec-failure keeps status-quo semantics (#559 plan §1 residual list).
       if (isGitCommit(command)) {
         pendingRehash = cwd;
         pendingRehashFiles = [...changedFiles];
       }
+      return undefined;
+    }
+
+    // verify path — renameOldPaths never reach verify/hash/naming (consumed
+    // only by the gate); changedFiles stays the new-path projection.
+    const changedFiles = route.files;
+    if (changedFiles.length === 0) {
+      // (unreachable — empty-allow handled above; defensive)
       return undefined;
     }
 
