@@ -4,12 +4,12 @@
 #
 # Scans session JSONLs for stopReason:"length" — the real truncation marker.
 # Compaction is checked on agent_end, so multi-tool turns can exceed the
-# compaction trigger mid-turn (383,616 @400K / 983,616 @1M) and hit the
+# compaction trigger mid-turn (283,616 @300K / 983,616 @1M) and hit the
 # window's generation budget → the response is truncated (stopReason:length).
-# Verified against the real corpus at #373: every corpus length record sits at
-# its session's own ceiling (ctx ≥ 0.92 × max observed context), i.e. there is
-# NO benign mid-context output-cap class in pi's 400K/1M windows — a length
-# stop IS a window-ceiling truncation.
+# Verified against the real corpus at #373 (400K/1M-era windows — historical):
+# every corpus length record sat at its session's own ceiling (ctx ≥ 0.92 ×
+# max observed context), i.e. there was NO benign mid-context output-cap class
+# in pi's 400K/1M windows — a length stop IS a window-ceiling truncation.
 #
 # Pre-committed rollback trigger (policy §7 / #341 plan Task C8):
 #   A) re-read volume OR LLM call count per compacting session > 2× the
@@ -21,13 +21,15 @@
 #     the printed procedure is the escalation — the instrument does NOT
 #     auto-revert; a revert is a deliberate committed change).
 #
-# Note on the length leg (expected week-1 behavior): the 400K clamp DOES
-# produce mid-turn overruns in the real fleet (91 post-clamp records across 28
-# sessions at 383–406K context). A clean instrument therefore fires on the
-# first weekly run against a clamped fleet — that is the pre-committed design
-# (≥1 length record → revert), not a defect. The report prints the event
-# context distribution so the owner can triage 200K-regime vs 400K-regime
-# records before executing the rollback.
+# Note on the length leg (expected week-1 behavior): the clamp DOES produce
+# mid-turn overruns in the real fleet — measured under the 400K clamp (91
+# post-clamp records across 28 sessions at 383–406K context; historical, pre-
+# #511). The shipped 300K clamp has the same compaction-on-agent_end geometry
+# with its trigger at 283,616, so the analogous band is ~283.6–300K. A clean
+# instrument therefore fires on the first weekly run against a clamped fleet —
+# that is the pre-committed design (≥1 length record → revert), not a defect.
+# The report prints the event context distribution so the owner can triage
+# small-window vs clamp-regime records before executing the rollback.
 #
 # Regenerated Aug baseline (fixed parser, #373): 8 pre-clamp compacting
 # sessions — calls mean 1867, re-read volume mean 1,969,341 tokens. Trigger =
@@ -172,7 +174,14 @@ for r in rows:
         # tokensBefore) — a length stop in a session that never compacted must
         # still land in the right regime, not a bogus "small-window(<0)".
         tb = max(r["max_ctx"], r["max_tokensBefore"])
-        bucket = "400K-clamp(383-406K)" if 300000 <= tb < 900000 else \
+        # shipped 300K-clamp band: floor = the clamp's compaction trigger
+        # 283,616 (= 300,000 − 16,384 reserveTokens; the same dial #570
+        # applied to fleet-cost-report's regime floor). A length stop in the
+        # 283.6–300K band IS a 300K-clamp session — it must NOT fall to
+        # small-window (which would tell the owner to exclude a clamp-era
+        # record from the revert decision). Pre-clamp legacy/200K-transient
+        # sessions (~196–205K) stay below the floor.
+        bucket = "300K-clamp(283.6-300K)" if 283616 <= tb < 900000 else \
                  ("1M-era(≥900K)" if tb >= 900000 else f"small-window(<{tb:,})")
         len_ctx_buckets[bucket] += gl
 
@@ -236,15 +245,15 @@ for t in trig:
     print(f"- {t}")
 print("")
 print("Pre-committed procedure (policy §7 — the weekly report reader is the owner):")
-print("  1. Revert the clamp: models.json contextWindow 400000 → 1000000 for every")
+print("  1. Revert the clamp: models.json contextWindow 300000 → 1000000 for every")
 print("     deepseek-served id (and models-store.json checkedAt bump, defense-in-depth).")
 print("  2. Update the guard threshold scripts/check-cost-config.sh in the SAME commit")
-print("     (the revert must not leave the drift guard asserting ≤400K).")
+print("     (the revert must not leave the drift guard asserting ≤300K).")
 print("  3. Window: COST_CLAMP_OVERRIDE=1 silences the guard for the rollback run;")
 print("     it never enables a live 1M session past the window.")
-print("  4. Re-clamping to 400K afterwards requires re-approval (policy §7).")
+print("  4. Re-clamping to 300K afterwards requires re-approval (policy §7).")
 print("")
-print("Owner triage (this run): length records at the 400K-clamp regime are the")
+print("Owner triage (this run): length records at the 300K-clamp regime are the")
 print("predicted C8 mid-turn-overrun class; records in small-window sessions are")
 print("not clamp-related — exclude them from the revert decision.")
 sys.exit(1)

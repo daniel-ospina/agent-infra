@@ -39,7 +39,7 @@ mk_sess() { # $1 dir $2 idx $3 dayoffset $4 input $5 cacheRead $6 length
 import json, sys
 fp, inp, cache, length = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 recs = [
-    {"type": "compaction", "timestamp": "x", "tokensBefore": 383000,
+    {"type": "compaction", "timestamp": "x", "tokensBefore": 290000,
      "usage": {"input": inp, "output": 2000, "cacheRead": 3, "cacheWrite": 0,
                "reasoning": 1000, "cost": {"input": 0.01, "total": 0.0105}}},
     {"type": "message", "message": {"role": "assistant",
@@ -64,12 +64,15 @@ assert_eq "$RC" "0" "clean fixture exits 0"
 assert_contains "$OUT" "## ✅ CLEAN" "clean fixture reports no trigger"
 assert_contains "$OUT" "(window-ceiling truncation) records: 0" "clean fixture has no length records"
 
-# LENGTH: 1 session today with a genuine ceiling length stop → exit 1
-D="$T/length"; mk_sess "$D" 9 0 50000 383000 1
+# LENGTH: 1 session today with a genuine ceiling length stop at 290K ctx —
+# in the shipped 300K-clamp trigger band (283,616–300K), so it MUST classify
+# as a 300K-clamp session (not fall through to small-window → exit 1)
+D="$T/length"; mk_sess "$D" 9 0 50000 290000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
 assert_eq "$RC" "1" "length-record fixture exits 1"
 assert_contains "$OUT" "❌ TRIGGERED" "length fixture prints TRIGGERED"
 assert_contains "$OUT" "pre-committed rollback" "length fixture prints rollback procedure"
+assert_contains "$OUT" "'300K-clamp(283.6-300K)': 1" "290K length record buckets as 300K-clamp-regime, not small-window"
 
 # LEG-B: 3 consecutive days each exceeding 2× re-read baseline
 #   reread/session = msg_input + comp_input; want > 3,938,682 → use 4.5M each
@@ -85,7 +88,7 @@ assert_eq "$RC" "0" "non-sustained over-baseline does not trigger"
 
 # --dry-run with a length fixture: still exit 1 (this IS the escalation);
 # the driver passes --dry-run through only to suppress issue filing upstream.
-D="$T/dryrun"; mk_sess "$D" 9 0 50000 383000 1
+D="$T/dryrun"; mk_sess "$D" 9 0 50000 290000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 --dry-run 2>&1)" || RC=$?
 assert_eq "$RC" "1" "--dry-run still exits 1 on a genuine trigger"
 assert_contains "$OUT" "pre-committed rollback" "--dry-run prints the procedure"
