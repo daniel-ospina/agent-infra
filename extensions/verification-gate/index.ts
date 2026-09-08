@@ -588,6 +588,11 @@ const GIT_VERB_SET = { commit: new Set(["commit"]), push: new Set(["push"]), com
 // its detailed contract comment beside the containment consumers (~L1079).
 
 const GH_PR_PATTERN = /(^|\s)gh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+(create|merge)(?=\s|$)/;
+// #540 M2 — create-only member of GH_PR_PATTERN. The gh+commit widening fires ONLY for
+// `gh pr create` (the op that ships THIS branch's commits); `gh pr merge` merges REMOTELY
+// and stays on the #204 merge-scope machinery (a local commit in the same command never
+// widens a merge's branch scope — verb-anchored, symmetric with isMergeCommand).
+const GH_PR_CREATE = /(^|\s)gh(?:\s+(?:--repo|-R)(?:=|\s+)[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?\s+pr\s+create(?=\s|$)/;
 // #7574: pendingRehash must arm only on COMMITS (lint-staged runs pre-commit,
 // not pre-push). The commit-only scan below replaces GIT_COMMIT_ONLY_PATTERN;
 // the cwd-neutral-global spelling (`git -c x=y commit`) now arms correctly
@@ -1679,6 +1684,238 @@ export function wtPathCommitInfo(command: string): WtPathCommitInfo | null {
   return { pathspecs: agg.pathspecs, pathspecFromFile: agg.pathspecFromFile };
 }
 
+// ── #540 — in-batch mutation-chain classification (residual closure) ──────
+// VGATE's tool_call hook computes its diff ONCE from the repo state BEFORE the
+// command executes. A single tool_call that mutates state IN-BATCH — `echo x >
+// f.ts && git add f.ts && git commit -m y` (or `… && git commit -am x`) — shows
+// an EMPTY diff at hook time (neither the write nor the add has run) →
+// "no changed files — allow" → unverified content lands in HEAD (the #540 hole;
+// pre-existing since #38, documented residual of #489). The fix is a SHAPE
+// REFUSAL, not a wider scope: for an in-batch file WRITE the content does not
+// exist at hook time — there is nothing a pre-verification scope could verify —
+// so the only sound pre-execution action is to refuse the compound and require
+// the mutation and the commit to be SEPARATE tool_calls (each intermediate
+// state then sits in the hook-time snapshot the normal scopes read).
+//
+// Classifier contract — commitChainMutationClass returns "in-batch-mutation"
+// when the command executes a commit AND some executed segment BEFORE that
+// commit is not provably content-neutral. Segment classes (in ORDER):
+//   "commit"   — a head-anchored `git … commit` invocation after normalizeCommitSegment
+//                (wrapper-peeled payloads classify at their true head; a commit only
+//                CONSUMES staged/WT content the hook snapshot already contains — it can
+//                never CREATE file content a later commit records invisibly, so commit+
+//                commit chains stay legal — scenario 48 Leg G pin).
+//   "neutral"  — the normalize fixpoint emptied the segment (cd&&/env/prefix verbs/
+//                comments); a bare `cd`/`:`/`true`; a git READ-only verb; an stdout-only
+//                echo/printf (no unquoted file redirect); a pure env assignment. These
+//                cannot change the file set an executed commit records.
+//   "mutating" — EVERYTHING else: file redirects, git add/checkout/reset/restore/rm/mv/
+//                push/fetch/merge, arbitrary programs (python/node/tee/cat/sed/scripts),
+//                gh ops, and wrapper payloads at the nesting cap. Fail-closed: an unknown
+//                verb/program is assumed able to mutate repo content.
+// Ordering across segments matters (a mutating op AFTER the last commit — `git commit -m
+// x && git add y` — stages for a FUTURE op exactly like a separate non-intercepted `git
+// add` tool_call and is NOT refused); wrapper expansion preserves order by splicing the
+// payload's own segment classes into the sequence (`sh -c 'git add x && git commit -m y'`
+// → [mutating, commit] → refused; `sh -c 'git commit -am x'` → [commit] → legal). The
+// nesting cap expands a wrapper to [mutating, commit] (fail-closed: cannot see inside —
+// it may both mutate and commit).
+//
+// SOUNDNESS (cannot be gamed by re-arrangement): only provably content-neutral shapes
+// may precede a commit; none of them can change what the commit records, so every legal
+// commit's record-set is fully described by the hook-time snapshot → the existing scope
+// producers bound it → the verify/block loop is sound. Any attempt to combine mutation
+// + commit in one tool_call is refused REGARDLESS of how the mutation is spelled; the
+// refusal feeds NO #7591 blockAttempts / lastBlockedFiles (mirror of the parse-block
+// posture — an unverifiable shape must never auto-bypass on repetition).
+
+// Closed set of git verbs that provably cannot change the index / working tree / refs
+// of the repo whose commit the classifier is guarding (reads + pure queries only).
+// Unknown git verbs are NOT in the set → the enclosing segment classifies "mutating"
+// (fail-closed). Keep deliberately conservative: a read verb listed here that git later
+// gives write semantics would reopen the refusal's soundness claim.
+const GIT_READ_ONLY_VERBS = new Set([
+  "status", "log", "diff", "show", "rev-parse", "branch", "remote", "config",
+  "ls-files", "ls-tree", "cat-file", "rev-list", "describe", "name-rev",
+  "merge-base", "blame", "grep", "shortlog", "whatchanged", "count-objects",
+  "for-each-ref", "symbolic-ref", "check-attr", "check-ignore", "diff-tree",
+  "diff-index", "diff-files", "tag", "help", "version", "var", "cherry",
+  "fmt-merge-msg", "rerere", "verify-commit", "verify-tag", "mailinfo",
+  "check-mailmap", "credential-fill", "hash-object", "mktree", "mktag", "archive",
+]);
+
+// Quote-aware probe: does the text carry an UNQUOTED `>`/`>>` file redirect
+// (anything that writes a file from the shell's perspective)? Bash operators:
+// `&>file` redirects BOTH streams to file (a file write); `>&fd` / `N>&M`
+// (`2>&1`, `>&2`) duplicate a descriptor (NOT a file write); `/dev/null`
+// targets write nothing we gate. Only used to split stdout-only echo/printf
+// (neutral) from redirecting echo/printf (mutating: `echo x > f.ts` can
+// overwrite a TRACKED file a later sweep records).
+type ChainClass = "commit" | "neutral" | "mutating";
+
+function segmentWritesFile(text: string): boolean {
+  let quote: string | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote !== null) {
+      if (ch === "\\" && i + 1 < text.length) { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === "\"") { quote = ch; continue; }
+    if (ch === ">") {
+      // `>&fd` / `N>&M` fd-dup/close forms have `&` NEXT (`2>&1`, `>&2`, `>&-`).
+      // ⛔ review-r1 P1 + review-r2 P2-1: a `>` whose PREVIOUS char is `&` is the `&>file`
+      // redirect-BOTH operator (a FILE WRITE) — and `>&word` with a NON-descriptor target
+      // is ALSO redirect-both to a file (`echo x >& f.ts`). Only skip when the token after
+      // `&` is a descriptor (all digits, or `-` for fd-close).
+      if (i + 1 < text.length && text[i + 1] === "&") {
+        let k = i + 2;
+        while (k < text.length && (text[k] === " " || text[k] === "\t")) k++;
+        const isFdTarget = k < text.length && text[k] === "-" ? true
+          : (() => {
+              if (k >= text.length || !/\d/.test(text[k])) return false;
+              let d = k;
+              while (d < text.length && /\d/.test(text[d])) d++;
+              return d === text.length || /[\s;&|<>\n]/.test(text[d]);
+            })();
+        if (isFdTarget) continue; // descriptor dup/close — no file write
+        // `>&word` (non-descriptor) / `&>file` — a file write: fall through to the
+        // /dev/null tolerance below (i stays on the `>`, j resumes right after it).
+      }
+      // /dev/null targets write nothing we gate (incl. `>/dev/null`, `2>/dev/null`, `&>/dev/null`).
+      let j = i + 1;
+      while (j < text.length && (text[j] === " " || text[j] === "\t")) j++;
+      if (text.startsWith("/dev/null", j)) {
+        i = j + "/dev/null".length - 1;
+        continue;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+function chainCommandClasses(command: string, depth: number): ChainClass[] {
+  const out: ChainClass[] = [];
+  for (const segment of splitCommandSegments(command)) {
+    out.push(...chainSegmentClass(normalizeCommitSegment(segment), depth));
+  }
+  return out;
+}
+
+// review-r2 P2-2 + review-r3 P1 — pure EXECUTION MODIFIERS. COMMIT_SEGMENT_HEAD strips a
+// BARE prefix verb (`sudo git commit`, `env FOO=1 git commit`) but NOT verbs with args
+// (`timeout 5 git commit`, `nice -n 5 git commit`, `sudo -u me git commit` — the bare
+// `sudo` strips, leaving a `-u me` dash remnant; `timeout`/`nice`/`stdbuf`/`ionice`/`chrt`
+// are not stripped at all). The FALLBACK below therefore recognizes execution modifiers as
+// commit-CARRIERS: any segment whose head is a known modifier (or a dash remnant of a
+// stripped prefix verb) with bare `git … commit` text after its args executes that commit
+// VERBATIM (modifiers mutate nothing themselves) → classify ["commit"] so M1's ordering
+// refusal still catches an in-batch mutation in an EARLIER segment (`echo x > f.ts &&
+// timeout -s KILL 10 git commit -am x` → refuse) and M2's widening still fires. review-r3
+// P1 specifically: option VALUES after a modifier (`timeout -s KILL 10 …`) must not lose
+// the commit class — this head-based classification is value-agnostic and cannot.
+// ⛔ Deliberately NO attempt to parse modifier option values into "the command position":
+// the earlier peelCommandModifier did and its value-taking handling was wrong (the commit
+// class vanished for `timeout -s KILL 10 git commit`, re-opening the M1/M2 bypass). The
+// cost: a PURE shell payload under a modifier (`timeout 5 sh -c 'git commit -am x'`)
+// carries the shell-carrier marker below → refuses (over-refusal, recoverable by dropping
+// the sh -c wrapper) — an accepted exotic corner (documented in the plan doc).
+const MODIFIER_VERBS = new Set([
+  "timeout", "ionice", "chrt", "stdbuf", "nice", "nohup", "time", "command",
+  "sudo", "env", "exec",
+]);
+
+function chainSegmentClass(stripped: string, depth: number): ChainClass[] {
+  if (stripped.length === 0) return ["neutral"];
+  // Provably-executing wrapper → its payload executes IN PLACE: splice the payload's
+  // own segment classes into the sequence (order preserved across the wrapper).
+  const unwrapped = unwrapExecutingHead(stripped);
+  if (unwrapped !== null) {
+    if (depth >= 8) return ["mutating", "commit"]; // nesting cap — may mutate AND commit (fail-closed)
+    const inner = chainCommandClasses(unwrapped, depth + 1);
+    return inner.length > 0 ? inner : ["neutral"];
+  }
+  // Head-anchored executed commit (index 0 after normalize; a match at index > 0 is
+  // prose/script text that does NOT execute a commit in this segment — `echo "run git
+  // commit -am x"` is a neutral stdout line, never a reroute).
+  const commitMatch = findGitCommit(stripped);
+  if (commitMatch !== null && commitMatch.index === 0) return ["commit"];
+  const head = readShellToken(stripped, 0);
+  if (head === null) return ["neutral"];
+  const t = head.content;
+  // Pure env assignment (its own segment after an `&&` split) + export declarations set
+  // shell state only — never repo content.
+  if (/^[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*$/.test(stripped)) return ["neutral"];
+  if (/^export\s+[A-Za-z_][A-Za-z0-9_]*\s*$/.test(stripped) || /^export\s+[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*$/.test(stripped)) return ["neutral"];
+  if (t === "cd" || t === ":" || t === "true" || t === "false" || t === "exit") return ["neutral"];
+  if (t === "echo" || t === "printf") return segmentWritesFile(stripped) ? ["mutating"] : ["neutral"];
+  if (t === "git") {
+    // Read-only verb carve-out: a git READ cannot stage/commit/move content itself — but its
+    // OUTPUT can be redirected over a TRACKED file (`git status > src/app.ts`), which a later
+    // sweep would record → a redirecting read is a mutation candidate, not neutral.
+    const readInv = findGitVerbInvocation(stripped, GIT_READ_ONLY_VERBS, "tolerate");
+    if (readInv !== null && readInv.index === 0 && !segmentWritesFile(stripped)) return ["neutral"];
+    return ["mutating"]; // git add/checkout/reset/restore/rm/mv/push/fetch/… or an unknown verb
+  }
+  // Fallback — arbitrary program / script shell / execution modifier: assumed able to
+  // mutate. review-r1 P2: a segment whose text carries a git-commit invocation at a NON-head
+  // offset may EXECUTE that commit inside an unwrappable program (`env -S "… && git commit
+  // …"`, `xargs … sh -c "…"`, `find … -exec sh -c "…"`) — emit the [mutating, commit] pair
+  // (cap-wrapper parity) so M1/M2 fire on the self-contained mutation+commit. review-r2
+  // P2-2 REFINEMENT: the pair fires only when an EXECUTING SHELL-CARRIER sits before the git
+  // text — a shell interpreter `-c` payload or a separator (`&&`/`||`/`;`/`|`/newline).
+  // review-r3 P1: WITHOUT a shell carrier, a segment whose head is a known execution modifier
+  // (timeout/nice/stdbuf/ionice/chrt — never stripped by normalize) or a dash REMNANT of a
+  // stripped prefix verb (`sudo -u me git commit` → normalize leaves `-u me …`) runs the
+  // following `git … commit` VERBATIM and mutates nothing itself → classify ["commit"] (the
+  // commit class must survive modifier option VALUES — `timeout -s KILL 10 git commit` — so
+  // M1's ordering refusal still fires for an earlier in-batch mutation and M2's widening
+  // still fires; value-agnostic by construction). A dash-headed segment always traces to a
+  // stripped prefix verb (a literal bash command cannot start with `-`), so its bare git
+  // text is executed, never prose. `gh` stays carved out: gh executes NO local shell —
+  // git-commit-looking text inside its option values (--body/--title/--comment) is inert
+  // prose and refusing a pure gh op for it is NOT split-recoverable over-refusal
+  // (scenario 39/68b parity).
+  if (t !== "gh") {
+    const nonHeadCommit = findGitCommit(stripped);
+    if (nonHeadCommit !== null && nonHeadCommit.index > 0) {
+      const before = stripped.slice(0, nonHeadCommit.index);
+      const shellCarrier = /\b(?:sh|bash|zsh|dash|ksh)\b[^;&|\n]*(?:-[A-Za-z]*)?\s-c\b/.test(before)
+        || /(?:&&|\|\||;|\||\n)/.test(before);
+      if (shellCarrier) return ["mutating", "commit"];
+      if (MODIFIER_VERBS.has(t) || t.startsWith("-")) return ["commit"];
+    }
+  }
+  return ["mutating"];
+}
+
+// M1 — the hook's refusal signal. "in-batch-mutation" iff a mutating segment precedes an
+// executed commit in command order (a mutating entry that ALSO carries a commit — the cap
+// wrapper expansion — trivially precedes its own "commit" twin). Commit-free commands
+// (pure pushes / gh ops / delete chains) return "none" regardless of their mutation
+// content — a push cannot record content created in the same command (it ships committed
+// HEAD; the write only touches disk).
+export function commitChainMutationClass(command: string): "in-batch-mutation" | "none" {
+  const seq = chainCommandClasses(command, 0);
+  for (let i = 0; i < seq.length; i++) {
+    if (seq[i] !== "mutating") continue;
+    for (let j = i + 1; j < seq.length; j++) {
+      if (seq[j] === "commit") return "in-batch-mutation";
+    }
+  }
+  return "none";
+}
+
+// M2 trigger — did the command PROVABLY execute a commit (head-anchored after wrapper
+// peel)? Prose that merely MENTIONS `git commit` (echo/gh --body values) never counts —
+// such segments classify by their HEAD (echo/gh → neutral/mutating, not "commit"). Used
+// by the gh arm to widen the routing scope (see ghCommitRecordScope below).
+export function commandRunsCommit(command: string): boolean {
+  return chainCommandClasses(command, 0).some((c) => c === "commit");
+}
+
 // ── #487 — content-push RANGE scoping (T1: a content push verifies the pushed
 // range, never the whole index) ───────────────────────
 // Pure layer: classifier → tier resolver → argv builder (present state; the
@@ -2197,6 +2434,28 @@ function runWtPathScope(cwd: string, pathspecs: string[]): DiffScope {
 function runBranchScope(cwd: string): DiffScope {
   const out = execDiffStatusZ(cwd, "git diff origin/main...HEAD --name-status -z");
   return out === null ? { files: [], renameOldPaths: [], clean: true } : parseDiffNameStatus(out);
+}
+
+// #540 M2 — the record-set a command's EXECUTED commits will add to the branch when a
+// `gh pr create` follows them in the SAME tool_call. The gh arm's branch scope
+// (`git diff origin/main...HEAD`) is computed BEFORE the in-command commits run, so a
+// sweep/bare/pathspec commit's content (dirty WT code, staged code) is invisible to it →
+// empty-branch allow → the PR ships unverified content. The record scope mirrors the
+// non-gh routing EXACTLY (#489/#538 classifiers, same producers): pure sweep → WT;
+// mixed → union(staged, WT); WT-path forms → union(staged, named-path WT) with the
+// full-WT fallback for --pathspec-from-file; otherwise (bare/amend/vacuous) → staged.
+// The caller unions this with runBranchScope — never replaces it (pre-existing branch
+// commits not recorded by THIS command stay in scope).
+function ghCommitRecordScope(command: string, cwd: string): DiffScope {
+  const scls = commitSweepClass(command);
+  if (scls === "sweep") return runWorktreeScope(cwd);
+  if (scls === "mixed") return combineScopes(runStagedScope(cwd), runWorktreeScope(cwd));
+  const wp = wtPathCommitInfo(command);
+  if (wp !== null) {
+    const namedWt = wp.pathspecFromFile ? runWorktreeScope(cwd) : runWtPathScope(cwd, wp.pathspecs);
+    return combineScopes(runStagedScope(cwd), namedWt);
+  }
+  return runStagedScope(cwd);
 }
 
 // ── Pure gate decision (#559 T1) ─────────────────────
@@ -2804,6 +3063,39 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
+    // #540 M1 — in-batch mutation-chain REFUSAL (state mutation + commit in ONE tool_call).
+    // The hook snapshot is taken BEFORE the command runs; a command that writes/stages
+    // content in-batch and then commits it (echo > f.ts && git add f.ts && git commit,
+    // git add x && git commit, … && git commit -am y) shows an EMPTY diff at hook time →
+    // the empty-allow would let unverified content land in HEAD (the #540 residual,
+    // pre-existing since #38). Refuse the SHAPE — the only sound pre-execution action for
+    // content that does not exist at hook time — and require the mutation + commit to be
+    // separate tool_calls so the pure commit's record-set sits in the hook snapshot and
+    // the normal scopes bound it. ⛔ Load-bearing placement: AFTER recoverBridgeForRoot +
+    // the top-of-op pendingRehash loop + the delete-push short-circuit (scenario 41's
+    // post-fix greenness depends on the Leg-A allowed commit's armed pendingRehash
+    // executing before ANY block return) and BEFORE the sweep/WT/gh scope computation
+    // (a refusal after empty-allow is reachable would re-open the hole). No
+    // blockAttempts / lastBlockedFiles writes — an unverifiable SHAPE must never
+    // auto-bypass on repetition (parse-block parity): only ELDATO_SKIP_VGATE escapes.
+    if (commitChainMutationClass(command) === "in-batch-mutation") {
+      appendJsonl({ event: "gate_block_in_batch_chain", extension: "verification-gate", reason: "state_mutation_before_commit_same_tool_call", session_cwd: process.cwd(), command: redactCommand(command), target_cwd: cwd });
+      console.log("[verification-gate] 🚫 Blocked — in-batch mutation chain (state mutation + commit in one command)");
+      return {
+        block: true,
+        reason: [
+          "⛔ Verification gate — in-batch mutation chain: this command both MUTATES repo state and COMMITS in a single tool_call.",
+          "  The gate verifies the state that exists BEFORE the command runs; content created or staged inside the same",
+          "  command (file writes, git add/checkout/reset/restore/rm, program output) is invisible to it — an empty",
+          "  pre-state would ride the 'no changed files' allow and commit unverified content.",
+          "  → Split the operation: run the file write / staging as its OWN tool_call, then commit separately.",
+          "    The pure commit is then gated against the real staged/working-tree state (this refusal does NOT",
+          "    auto-bypass — a repeated identical chain is refused every time).",
+          "  → Or set ELDATO_SKIP_VGATE=1 to bypass (emergency only).",
+        ].join("\n"),
+      };
+    }
+
     // Compute diff — #489: auto-sweep commits (`-a`/`--all`) record the
     // working tree, not just the index; their verification file set must be
     // HEAD-vs-working-tree (`git diff HEAD` — exactly what the sweep commits)
@@ -2816,7 +3108,10 @@ export default function (pi: ExtensionAPI) {
     // disk-hash verification cannot verify staged-only content whose disk
     // state equals HEAD — pre-existing limitation of the disk-based verifier,
     // not introduced here); "none" → today's staged scope. Mixed sweep+gh-pr
-    // chains keep the gh branch path (unchanged; #540). ⛔ This block sits
+    // chains fall to the gh arm below, which widens the branch scope to
+    // union(branch, commit-record-scope) when the command executes a commit
+    // (#540 M2 — the in-command commit's record-set is invisible to the gh
+    // branch diff computed at hook time). ⛔ This block sits
     // AFTER the top-of-op pendingRehash loop + recoverBridgeForRoot — do not
     // move it above them (scenario 41's post-fix greenness depends on the
     // Leg-A allowed commit's armed pendingRehash executing before the block
@@ -2827,7 +3122,8 @@ export default function (pi: ExtensionAPI) {
     // index — the same hole class as #489's `-a` sweep, over a PARTIAL (named) file set.
     // Consulted only when the sweep classifier says "none": a sweep command is already
     // handled by the sweep-first branch below (its full-WT scope ⊇ any named-path
-    // scope), and gh chains keep the gh branch path (#540 owns that interplay).
+    // scope), and gh chains route through the gh arm whose commit+gh widening unions
+    // the named-path record-set when a commit executes (#540 M2).
     // Pure detector (zero subprocess) — commit-bearing commands still resolve fast.
     const wtPath = wtPathCommitInfo(command);
     let scope: DiffScope;
@@ -2852,7 +3148,24 @@ export default function (pi: ExtensionAPI) {
           return undefined; // before computeBranchDiff: no files, no block, no registry/bridge writes
         }
       }
-      scope = runBranchScope(cwd);
+      // #540 M2 — gh+commit chains: `git commit -am x && gh pr create` (or a bare/pathspec
+      // commit followed by gh pr create) computes the branch scope BEFORE the in-command
+      // commit runs — the commit's own record-set (dirty WT for a sweep, staged for a bare
+      // commit, named-path WT for pathspec forms) is invisible to `git diff
+      // origin/main...HEAD` → an empty branch → empty-allow → unverified content ships in
+      // the PR. When the command PROVABLY executes a commit (commandRunsCommit — prose in
+      // --body/echo NEVER counts) AND contains `gh pr create` (create-only: the op that
+      // ships THIS branch; a same-command `gh pr merge` keeps the #204 machinery above),
+      // widen to union(branch, ghCommitRecordScope) — the record scope mirrors the
+      // #489/#538 routing exactly. `gh pr create && git commit` shapes never reach here
+      // (M1's ordering refusal fires first — the gh op is a mutation candidate preceding
+      // the commit). Pure gh pr create (no executed commit) keeps the branch scope below
+      // unchanged (scenarios 39/68b pins).
+      if (commandRunsCommit(command) && GH_PR_CREATE.test(command)) {
+        scope = combineScopes(runBranchScope(cwd), ghCommitRecordScope(command, cwd));
+      } else {
+        scope = runBranchScope(cwd);
+      }
     } else if (wtPath !== null) {
       // #538: WT-path commit → union(staged, named-path WT). The named paths'
       // HEAD-vs-working-tree diff (`git diff HEAD -- <pathspecs>`, git-expanded —

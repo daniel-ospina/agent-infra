@@ -359,6 +359,22 @@ for pathspec WT-path commits, tracked as residual #538. Unborn-HEAD
 repos (no commits yet) fall back to the staged set — `git commit -a` on an unborn
 HEAD records only the index. `gh pr` ops are unchanged (branch diff scope).
 
+**#540 — the hook snapshot is PRE-execution: mutate-then-commit in ONE tool_call is
+refused, and gh+commit chains widen to the commit's record-set.** VGATE computes its
+diff from the state that exists BEFORE the command runs, so a single tool_call that
+both MUTATES repo state and COMMITS (`echo x > f.ts && git add f.ts && git commit`,
+`git add x && git commit`, `… && git commit -am y`) shows an empty diff at hook time
+and would empty-allow. The gate REFUSES that shape (audited `gate_block_in_batch_chain`)
+and requires the write/stage and the commit to be SEPARATE tool_calls — the pure
+commit is then gated against the real staged/working-tree state (the refusal never
+auto-bypasses on repetition). Read-only/scaffolding segments (git status/log/diff,
+cd/env, stdout-only echo) and commit+commit chains stay legal. When a command
+executes a commit AND `gh pr create` (`git commit -am x && gh pr create`), the gh
+branch scope — computed before the in-command commit runs — cannot see the commit's
+record-set, so the scope widens to union(branch, commit-record-set): dirty WT for a
+sweep, staged for a bare commit, named-path WT for pathspec forms. Pure `gh pr
+create` (no executed commit) and `gh pr merge` are unchanged.
+
 **Content-shape exemption (docs/CSS/static-only — extension-side, tier-independent):**
 when the op's relevant file set (staged diff for commit; pushed-range diff for
 content push where a base resolves — staged otherwise; branch diff for

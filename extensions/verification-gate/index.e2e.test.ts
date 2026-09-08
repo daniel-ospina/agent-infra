@@ -3621,6 +3621,296 @@ async function main() {
     ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBeforeG,
        "Leg G: prose-message bare docs commit audited content_shape_exempt");
   });
+
+  section("Issue #540 — in-batch mutation chains + sweep/gh chains (pre-execution single-state residual)");
+
+  test("scenario 72 (#540 repro): in-batch write+stage+commit chain REFUSED at hook time — repeat stays refused; split second pass gates normally", async () => {
+    // The #540 hole: `echo … > f.ts && git add f.ts && git commit -m y` shows an EMPTY diff at
+    // hook time (the write + add have not run) → pre-fix empty-allow → unverified content lands
+    // in HEAD. Post-fix M1 REFUSES the SHAPE (state mutation before a commit in one tool_call) —
+    // the hook cannot verify content that does not exist yet; the refusal feeds NO #7591
+    // counters (no auto-bypass on repetition). The remedy is the ceremony: split the write/add
+    // into real steps, then fire the PURE commit — the gate verifies the actual staged state.
+    const repo = join(TEST_ROOT, "repo-540-72");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "r1\n");
+    git(repo, "add README.md");
+    git(repo, "commit -m base");
+    await fire("session_start", {});
+    // Leg A — the issue repro chain (code written IN the tool_call) → REFUSED, never empty-allowed.
+    const chain = 'echo "export const x=1" > f.ts && git add f.ts && git commit -m y';
+    const auditBefore = readAuditLines().filter((l) => l.event === "gate_block_in_batch_chain").length;
+    const legA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: chain, cwd: repo },
+    });
+    ok(legA && legA.block === true, "Leg A: in-batch write+add+commit must be REFUSED (pre-fix: empty-allow → code ships unverified)");
+    ok(/in-batch mutation chain/.test(legA.reason), "Leg A: block reason names the in-batch chain class");
+    ok(/Split the operation/.test(legA.reason), "Leg A: block reason instructs the split ceremony (write/stage as its own tool_call)");
+    ok(!/fileA\.txt|f\.ts/.test(legA.reason.split("in-batch mutation chain")[0]), "Leg A: refusal precedes any file-scope naming (no diff was computed)");
+    ok(readAuditLines().filter((l) => l.event === "gate_block_in_batch_chain").length > auditBefore,
+       "Leg A: refusal audited gate_block_in_batch_chain (durable record)");
+    // Leg B — repetition stays refused (NO #7591 auto-bypass: an unverifiable SHAPE never
+    // auto-allow-bypasses; only ELDATO_SKIP_VGATE escapes).
+    const legB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: chain, cwd: repo },
+    });
+    ok(legB && legB.block === true, "Leg B: a REPEATED identical in-batch chain is refused again (no auto-bypass on the shape)");
+    // Leg C — second pass: write + stage for REAL (separate steps — the sanctioned ceremony),
+    // then the PURE commit fires the normal gate: the file is in the hook snapshot → unverified
+    // block naming f.ts → VGATE PASS → allow → the real commit lands. Content commits only
+    // AFTER verification.
+    writeFileSync(join(repo, "f.ts"), 'export const x = 1;\n');
+    git(repo, "add f.ts");
+    const legC = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m c72", cwd: repo },
+    });
+    ok(legC && legC.block === true, "Leg C: the PURE commit over the really-staged code blocks as unverified (second pass — gate sees the real state)");
+    ok(legC.reason.includes("f.ts"), "Leg C: block names the staged code file");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: f.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "f.ts"), hash: sha("export const x = 1;\n") }],
+      }) }],
+    });
+    const legC2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m c72", cwd: repo },
+    });
+    equal(legC2, undefined, "Leg C: pure commit ALLOWED after the VGATE PASS (split ceremony resolves the refusal)");
+    git(repo, "commit -m c72"); // execute for real
+    const c72 = execSync("git diff HEAD^ HEAD --name-only", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    ok(c72.includes("f.ts"), "Leg C: the code file landed in HEAD ONLY after verification");
+    equal(execSync("git status --porcelain", { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim(), "",
+       "Leg C: real commit — porcelain clean");
+  });
+
+  test("scenario 73 (#540 M1): sweep / stage / wrapper in-batch mutation families all refused pre-scope", async () => {
+    const repo = join(TEST_ROOT, "repo-540-73");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "r1\n");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "app.ts"), "a1\n");
+    git(repo, "add README.md src/app.ts");
+    git(repo, "commit -m base");
+    await fire("session_start", {});
+    // Each family: a mutation executes before a commit in ONE tool_call → REFUSED at hook
+    // time. Pre-fix each showed an empty staged/WT diff (nothing run yet) → empty-allow.
+    const chains = [
+      "echo x > src/app.ts && git commit -am y",          // in-batch write + sweep
+      "echo x &> src/app.ts && git commit -am y",         // `&>` redirect-both file write (review-r1 P1)
+      "git add src/app.ts && git commit -m y",            // issue I-section: git add + commit
+      "git checkout -- src/app.ts && git commit -am y",   // issue I-section: git checkout + commit
+      "sh -c 'echo x > src/app.ts && git commit -am y'",  // wrapper payload splice
+      "env -S 'echo x > src/app.ts && git commit -am y'", // env -S executes its string (review-r1 P2)
+    ];
+    for (const chain of chains) {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: chain, cwd: repo },
+      });
+      ok(res && res.block === true, `must refuse: ${chain}`);
+      ok(/in-batch mutation chain/.test(res.reason), `reason names the class: ${chain}`);
+    }
+    // Negative: staged docs + pure -am sweep (no in-batch mutation) is NOT refused — the
+    // #489 WT-scope gate owns it (block naming the dirty code, not a shape refusal).
+    writeFileSync(join(repo, "README.md"), "r2\n");
+    git(repo, "add README.md");
+    writeFileSync(join(repo, "src", "app.ts"), "a2\n"); // dirty — NOT staged
+    const sweep = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -am x", cwd: repo },
+    });
+    ok(sweep && sweep.block === true, "pure -am sweep over pre-dirtied WT still blocks via the #489 WT scope (not a #540 refusal — mutation happened in a prior tool_call)");
+    ok(sweep.reason.includes("src/app.ts"), "pure sweep block names the dirty code file (WT scope)");
+  });
+
+  test("scenario 74 (#540 M2): sweep + gh pr create — the gh branch scope misses the in-command sweep's WT content — union(branch, WT) blocks it", async () => {
+    // `git commit -am x && gh pr create` routes to the gh arm whose branch scope
+    // (origin/main...HEAD) is computed BEFORE the in-command sweep runs — the sweep's dirty
+    // WT content is invisible → pre-fix empty-branch allow → unverified code ships in the PR.
+    // Post-fix M2 widens to union(branch, WT) when the command executes a commit AND contains
+    // gh pr create → the sweep's content is VGATE-required. No origin/main exists in the
+    // fixture → branch scope is clean-empty → the union resolves to the WT scope (the
+    // discriminator: files come from the sweep's record-set, never from an empty branch).
+    const repo = join(TEST_ROOT, "repo-540-74");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "r1\n");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "app.ts"), "a1\n");
+    git(repo, "add README.md src/app.ts");
+    git(repo, "commit -m base");
+    await fire("session_start", {});
+    // Leg A — dirty code + staged docs + sweep+gh chain: block names BOTH (union arm).
+    writeFileSync(join(repo, "README.md"), "r2\n");
+    git(repo, "add README.md");
+    writeFileSync(join(repo, "src", "app.ts"), "a2\n"); // dirty — NOT staged
+    const chain = 'git commit -am "x" && gh pr create --title sweep74';
+    const legA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: chain, cwd: repo },
+    });
+    ok(legA && legA.block === true, "Leg A: sweep+gh over dirty code + staged docs must block (union branch+WT — pre-fix: empty-branch allow → code ships in the PR)");
+    ok(/Unverified files[\s\S]*src\/app\.ts/.test(legA.reason), "Leg A: block names the swept dirty code file (the commit's record-set is VGATE-required)");
+    ok(!/in-batch mutation chain/.test(legA.reason), "Leg A: this is a real verification block (dirtying happened in a PRIOR tool_call), not the #540 shape refusal");
+    // Leg B — docs-only PASS must NOT unlock the chain: the code file still blocks.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: README.md. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "README.md"), hash: sha("r2\n") }],
+      }) }],
+    });
+    const legB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: chain, cwd: repo },
+    });
+    ok(legB && legB.block === true, "Leg B: docs-only PASS must NOT unlock sweep+gh — code still blocks");
+    ok(legB.reason.includes("src/app.ts"), "Leg B: block names the code file");
+    ok(!legB.reason.includes("README.md"), "Leg B: verified docs NOT re-blocked");
+    // Leg C — code PASS → allow → real sweep commits both (the gh pr create half is not
+    // executed — no network; the commit half is the state change the chain would perform).
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/app.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "src/app.ts"), hash: sha("a2\n") }],
+      }) }],
+    });
+    const legC = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: chain, cwd: repo },
+    });
+    equal(legC, undefined, "Leg C: sweep+gh ALLOWED after both files verified");
+    git(repo, "commit -am x"); // execute the allowed sweep half for real
+    const c74 = execSync("git diff HEAD^ HEAD --name-only", { cwd: repo, encoding: "utf-8", timeout: 20000 });
+    ok(c74.includes("README.md") && c74.includes("src/app.ts"), "Leg C: the real sweep committed BOTH the staged docs and the dirty code (both verified)");
+  });
+
+  test("scenario 75 (#540 M2): bare commit + gh pr create over staged code blocks (union staged); docs stays exempt; pure gh unchanged", async () => {
+    // `git commit -m x && gh pr create` over STAGED code: the gh branch scope computed before
+    // the in-command bare commit misses the staged content → pre-fix empty-branch allow.
+    // Post-fix M2 unions branch + staged for the executed-commit record-set.
+    const repo = join(TEST_ROOT, "repo-540-75");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "r1\n");
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "app.ts"), "a1\n");
+    git(repo, "add README.md src/app.ts");
+    git(repo, "commit -m base");
+    await fire("session_start", {});
+    // Leg A — staged CODE + bare-commit+gh: block names the code.
+    writeFileSync(join(repo, "src", "app.ts"), "a2\n");
+    git(repo, "add src/app.ts");
+    const chainA = "git commit -m c75 && gh pr create --title p75";
+    const legA = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: chainA, cwd: repo },
+    });
+    ok(legA && legA.block === true, "Leg A: bare-commit+gh over staged code must block (union branch+staged — pre-fix: empty-branch allow)");
+    ok(legA.reason.includes("src/app.ts"), "Leg A: block names the staged code file");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/app.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [{ path: join(repo, "src/app.ts"), hash: sha("a2\n") }],
+      }) }],
+    });
+    const legA2 = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: chainA, cwd: repo },
+    });
+    equal(legA2, undefined, "Leg A: bare-commit+gh ALLOWED after the staged code verified");
+    git(repo, "commit -m c75"); // execute the allowed commit half for real
+    // Leg B — staged DOCS + bare-commit+gh: shape-exempt (docs), audited (no new gate friction).
+    await fire("session_start", {});
+    writeFileSync(join(repo, "README.md"), "r2\n");
+    git(repo, "add README.md");
+    const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const legB = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m docs75 && gh pr create --title p75b", cwd: repo },
+    });
+    equal(legB, undefined, "Leg B: bare docs commit + gh stays shape-exempt (docs-only file set — no over-gate)");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
+       "Leg B: docs commit+gh audited content_shape_exempt");
+    git(repo, "commit -m docs75"); // execute for real
+    // Leg C — PURE gh pr create (no commit in the command): branch scope unchanged (no origin
+    // → empty-branch allow). Behavioral regression guard for scenarios 39/68b.
+    await fire("session_start", {});
+    writeFileSync(join(repo, "README.md"), "r3\n");
+    git(repo, "add README.md");
+    const skipBeforeC = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const legC = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "gh pr create --title p75c", cwd: repo },
+    });
+    equal(legC, undefined, "Leg C: PURE gh pr create over staged docs stays ALLOWED (branch scope — no executed commit, no widening)");
+    equal(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length, skipBeforeC,
+       "Leg C: pure gh pr create (no origin/main → clean-empty branch scope) is an empty-allow, NOT a shape-exempt audit (branch scope unchanged — scenario 39 parity)");
+  });
+
+  test("scenario 76 (#540 regression guard): message-prose containing a mutating chain never refuses; pure wrapper sweeps never refuse", async () => {
+    // Over-refusal guard: the classifier must only judge EXECUTED segments — text INSIDE a
+    // commit's -m value is consumed data, never a command. A message that mentions the full
+    // mutating-chain shape (`echo x > f.ts && git commit -am y`) must not trip M1, and the
+    // bare docs commit stays shape-exempt exactly as before.
+    const repo = join(TEST_ROOT, "repo-540-76");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "README.md"), "r1\n");
+    writeFileSync(join(repo, "f76.ts"), "v1\n");
+    git(repo, "add README.md f76.ts");
+    git(repo, "commit -m base");
+    await fire("session_start", {});
+    writeFileSync(join(repo, "README.md"), "r2\n");
+    git(repo, "add README.md");
+    const auditBefore = readAuditLines().filter((l) => l.event === "gate_block_in_batch_chain").length;
+    const skipBefore = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length;
+    const prose = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: 'git commit -m "echo x > f.ts && git commit -am y"', cwd: repo },
+    });
+    equal(prose, undefined, "message-prose mentioning the mutating-chain shape is a single commit segment — ALLOWED (exempt docs), never refused");
+    equal(readAuditLines().filter((l) => l.event === "gate_block_in_batch_chain").length, auditBefore,
+       "message-prose fires NO in-batch refusal audit");
+    ok(readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "content_shape_exempt").length > skipBefore,
+       "message-prose bare docs commit audited content_shape_exempt");
+    git(repo, "commit -m 'echo x > f.ts && git commit -am y'"); // execute for real
+    // Wrapper pure sweep regression guard (post-#540 neutrality): `sh -c 'git commit -am x'`
+    // is NOT a #540 shape (no mutation before the commit) — the #539 WT-scope gate owns it.
+    await fire("session_start", {});
+    writeFileSync(join(repo, "README.md"), "r3\n");
+    git(repo, "add README.md");
+    writeFileSync(join(repo, "f76.ts"), "v2\n"); // dirty TRACKED file (sweep records tracked WT only)
+    const sweep = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "sh -c 'git commit -am \"x\"'", cwd: repo },
+    });
+    ok(sweep && sweep.block === true, "wrapper pure sweep still blocks via the WT scope (not refused, not mis-scoped)");
+    ok(sweep.reason.includes("f76.ts"), "wrapper pure sweep block names the dirty tracked code file");
+  });
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()
