@@ -1744,12 +1744,13 @@ const GIT_READ_ONLY_VERBS = new Set([
   "check-mailmap", "credential-fill", "hash-object", "mktree", "mktag", "archive",
 ]);
 
-// Quote-aware probe: does the text carry an UNQUOTED `>`/`>>`/`&>` file redirect
-// (anything that writes a file from the shell's perspective)? `>&` fd-dup forms
-// (`2>&1`, `echo x >&2`) and `/dev/null` targets do not touch repo content and are
-// tolerated — only used to split stdout-only echo/printf (neutral) from redirecting
-// echo/printf (mutating: `echo x > f.ts` can overwrite a TRACKED file a later sweep
-// records).
+// Quote-aware probe: does the text carry an UNQUOTED `>`/`>>` file redirect
+// (anything that writes a file from the shell's perspective)? Bash operators:
+// `&>file` redirects BOTH streams to file (a file write); `>&fd` / `N>&M`
+// (`2>&1`, `>&2`) duplicate a descriptor (NOT a file write); `/dev/null`
+// targets write nothing we gate. Only used to split stdout-only echo/printf
+// (neutral) from redirecting echo/printf (mutating: `echo x > f.ts` can
+// overwrite a TRACKED file a later sweep records).
 type ChainClass = "commit" | "neutral" | "mutating";
 
 function segmentWritesFile(text: string): boolean {
@@ -1763,8 +1764,11 @@ function segmentWritesFile(text: string): boolean {
     }
     if (ch === "'" || ch === "\"") { quote = ch; continue; }
     if (ch === ">") {
-      if (i > 0 && text[i - 1] === "&") continue;          // `>&` fd-dup (`2>&1`, `>&2`)
-      if (i + 1 < text.length && text[i + 1] === "&") continue; // `&>` redirect-to-fd form
+      // `N>&M` / `>&fd` fd-DUP forms — the NEXT char is `&` (`2>&1`, `>&2`).
+      // ⛔ A `>` whose PREVIOUS char is `&` is the `&>file` redirect-BOTH
+      // operator — a FILE WRITE, never a descriptor dup (review-r1 P1: skipping
+      // it let `echo x &> f.ts && git commit -am y` bypass M1 as "neutral").
+      if (i + 1 < text.length && text[i + 1] === "&") continue;
       // /dev/null targets write nothing we gate (incl. `>/dev/null`, `2>/dev/null`).
       let j = i + 1;
       while (j < text.length && (text[j] === " " || text[j] === "\t")) j++;
@@ -1818,7 +1822,16 @@ function chainSegmentClass(stripped: string, depth: number): ChainClass[] {
     if (readInv !== null && readInv.index === 0 && !segmentWritesFile(stripped)) return ["neutral"];
     return ["mutating"]; // git add/checkout/reset/restore/rm/mv/push/fetch/… or an unknown verb
   }
-  return ["mutating"]; // arbitrary program / gh op / script shell — assumed able to mutate
+  // Fallback — arbitrary program / script shell: assumed able to mutate. review-r1 P2: a
+  // segment whose text carries a git-commit invocation at a NON-head offset may EXECUTE
+  // that commit inside an unwrappable program (`env -S "… git commit …"`, `xargs … sh -c
+  // …`, `find … -exec …`, a depth-capped wrapper) — emit the [mutating, commit] pair
+  // (cap-wrapper parity) so M1/M2 fire on the self-contained mutation+commit. `gh` is the
+  // carve-out: gh executes NO local shell — git-commit-looking text inside its option
+  // values (--body/--title/--comment) is inert prose and refusing a pure gh op for it is
+  // NOT split-recoverable over-refusal (scenario 39/68b parity).
+  if (t !== "gh" && findGitCommit(stripped) !== null) return ["mutating", "commit"];
+  return ["mutating"];
 }
 
 // M1 — the hook's refusal signal. "in-batch-mutation" iff a mutating segment precedes an

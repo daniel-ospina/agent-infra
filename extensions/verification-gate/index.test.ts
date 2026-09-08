@@ -2397,12 +2397,15 @@ test("in-batch file write + commit in one tool_call → refusal", () => {
     "cat <<'EOF' > f.ts\ncontent\nEOF\ngit commit -am y",              // heredoc write (real newlines — bash terminates heredocs at a delimiter LINE)
     "tee f.ts < /dev/null && git commit -am y",
     "sed -i s/a/b/ f.ts && git commit -am y",
+    "echo x &> f.ts && git commit -am y",                    // `&>` redirect-BOTH to a file — a file write, never an fd-dup (review-r1 P1)
     "python3 -c \"open('f.ts','w').write('x')\" && git commit -am y",    // arbitrary program before a commit
     "node -e 'require(\"fs\").writeFileSync(\"f.ts\",\"x\")' && git commit -am y",
     "sh -c 'echo x > f.ts && git commit -am y'",                          // wrapper payload splices in order
     "bash -c 'echo x > f.ts && git add f.ts && git commit -m y'",
     "! echo x > f.ts && git commit -am y",
     "eval \"echo x > f.ts && git commit -am y\"",
+    "env -S 'echo x > f.ts && git commit -am y'",             // env -S executes its string — unwrappable mutation+commit (review-r1 P2)
+    "printf 'f.ts\\n' | xargs -I{} sh -c \"echo x > {} && git add {} && git commit -m y\"", // xargs payload (review-r1 P2)
   ];
   for (const c of pins) equal(commitChainMutationClass(c), "in-batch-mutation", `must refuse: ${c}`);
 });
@@ -2454,8 +2457,11 @@ test("pure / read-only / scaffolding pre-commit content stays legal", () => {
     "export GIT_SSH_COMMAND=\"ssh -o BatchMode=yes\" && git push origin --delete foo", // no commit → none
     "echo done && git commit -m x",
     "printf 'progress\\n' && git commit -m x",
+    "echo x 2>&1 && git commit -m x",                        // `2>&1` fd-dup — never a file write
+    "echo x >&2 && git commit -m x",                         // `>&2` fd-dup
     ": && git commit -m x",
     "true && git commit -m x",
+    "gh pr create --body \"see: git commit -am x\"",          // gh option-value prose is inert (review-r1 P2 carve-out — head gh never emits the pair)
     "git commit -m x && git add y",                          // stage AFTER the commit = future op (unchanged posture)
     "git commit -m x && echo done",
     "git commit -am x && gh pr create -t y",                 // M2 shape — commit then gh stays legal (widened scope)

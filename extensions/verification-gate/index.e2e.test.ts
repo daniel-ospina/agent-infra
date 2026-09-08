@@ -3708,9 +3708,11 @@ async function main() {
     // time. Pre-fix each showed an empty staged/WT diff (nothing run yet) → empty-allow.
     const chains = [
       "echo x > src/app.ts && git commit -am y",          // in-batch write + sweep
+      "echo x &> src/app.ts && git commit -am y",         // `&>` redirect-both file write (review-r1 P1)
       "git add src/app.ts && git commit -m y",            // issue I-section: git add + commit
       "git checkout -- src/app.ts && git commit -am y",   // issue I-section: git checkout + commit
       "sh -c 'echo x > src/app.ts && git commit -am y'",  // wrapper payload splice
+      "env -S 'echo x > src/app.ts && git commit -am y'", // env -S executes its string (review-r1 P2)
     ];
     for (const chain of chains) {
       const res = await fire("tool_call", {
