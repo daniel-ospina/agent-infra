@@ -145,3 +145,11 @@ real state.
 - `git diff --output=<tracked-file>` (a file write NOT expressed as a shell `>` redirect)
   before a sweep commit is outside the shell-shape detection — documented accepted corner
   of the shape-refusal model (any real evasion eventually requires ELDATO_SKIP_VGATE).
+- review-r2/r3 corners (review-cycle adjudicated): a PURE shell payload under an execution
+  modifier (`timeout 5 sh -c 'git commit -am x'`) carries the shell-carrier marker and is
+  refused (over-refusal — recoverable by running the plain commit; no value-parsing of
+  modifier options is attempted because the earlier peel misparsed `timeout -s KILL 10`
+  and lost the commit class, re-opening the M1/M2 bypass — head-based classification is
+  value-agnostic and cannot). A git READ behind a stripped prefix verb with args
+  (`sudo -u me git status && git commit`) classifies the read remnant as mutating and
+  refuses (over-refusal of an exotic combo).

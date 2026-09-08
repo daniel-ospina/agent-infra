@@ -2408,6 +2408,7 @@ test("in-batch file write + commit in one tool_call → refusal", () => {
     "eval \"echo x > f.ts && git commit -am y\"",
     "env -S 'echo x > f.ts && git commit -am y'",             // env -S executes its string — unwrappable mutation+commit (review-r1 P2)
     "printf 'f.ts\\n' | xargs -I{} sh -c \"echo x > {} && git add {} && git commit -m y\"", // xargs payload (review-r1 P2)
+    "timeout 5 sh -c 'echo x > f.ts && git commit -am y'", // shell payload under a modifier (review-r2 P2-2 refusal side)
   ];
   for (const c of pins) equal(commitChainMutationClass(c), "in-batch-mutation", `must refuse: ${c}`);
 });
@@ -2435,6 +2436,7 @@ test("gh-before-commit ordering → refusal; stage+gh with NO commit stays none"
   const refuse = [
     "gh pr create -t x && git commit -am y",
     "echo hi && gh pr create -t x && git commit -m y",
+    "echo x > f.ts && timeout -s KILL 10 git commit -am y", // in-batch write + modifier-sweep: M1 ordering refuses (review-r3 P1)
   ];
   for (const c of refuse) equal(commitChainMutationClass(c), "in-batch-mutation", `must refuse: ${c}`);
   equal(commitChainMutationClass("git add f.ts && gh pr create -t x"), "none", "stage+gh with NO commit is not a chain (none)");
@@ -2464,8 +2466,10 @@ test("pure / read-only / scaffolding pre-commit content stays legal", () => {
     "echo x >&- && git commit -m x",                         // `>&-` fd-close
     "echo x &>/dev/null && git commit -m x",                 // `&>` to /dev/null writes nothing we gate
     "timeout 5 git commit -am x",                            // pure execution modifier — runs git verbatim, mutates nothing (review-r2 P2-2)
+    "timeout -s KILL 10 git commit -am x",                    // modifier with a value-taking option (review-r3 P1 — commit class must survive)
+    "ionice -c 3 -t 10 git commit -am x",                     // ionice options + positional
+    "nice -n 5 git commit -am x",                             // nice (stripped by normalize → `-n 5` dash remnant)
     "sudo -u me git commit -am x",                           // sudo with args — same (review-r2 P2-2)
-    "timeout 5 sh -c 'git commit -am x'",                    // modifier + pure shell commit — no mutation before the commit
     ": && git commit -m x",
     "true && git commit -m x",
     "gh pr create --body \"see: git commit -am x\"",          // gh option-value prose is inert (review-r1 P2 carve-out — head gh never emits the pair)
