@@ -608,6 +608,41 @@ dexpect("P1-B: branch -D own → newBranch set", `git branch -D feat/1`, { verdi
 // -d is a SOFT delete: legacy verdict stays allow (M3 still gates it via
 // branchState=true + newBranch — the allowance target list must be non-empty).
 dexpect("P1-B: branch -d own → branchState + newBranch (allow)", `git branch -d feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1" });
+// ── #543 regression: branch -D MULTI-TARGET all-targets capture ────────────
+// git branch -D deletes EACH target independently, only stopping at the first
+// refusal (`git branch -D main feat/other` refuses the checked-out main but
+// deletes feat/other, rc=1 — probe-verified). newBranch (the FIRST name) is
+// insufficient: the classifier must capture EVERY delete target so the
+// ownership allowance can require all ⊆ baseline∪owned (#443 parity).
+dexpect("#543: branch -D multi → ALL delete targets captured", `git branch -D feat/1 other/2`, { verdict: "block:branch-force-delete", newBranch: "feat/1", deleteTargets: ["feat/1", "other/2"] });
+dexpect("#543: branch -D issue scenario → baseline + foreign both captured", `git branch -D main feat/other`, { verdict: "block:branch-force-delete", deleteTargets: ["main", "feat/other"] });
+dexpect("#543: branch -d multi → ALL soft-delete targets captured", `git branch -d feat/1 other/2`, { verdict: "allow", branchState: true, deleteTargets: ["feat/1", "other/2"] });
+dexpect("#543: branch --delete multi → ALL targets captured", `git branch --delete a b`, { branchState: true, deleteTargets: ["a", "b"] });
+dexpect("#543: branch -f force-create → NOT a delete (no targets)", `git branch -f feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
+// Guard-adapter pin: replicate index.ts's ownership-allowance target wiring
+// (pushTargets → deleteTargets → newBranch fallback) + shared ownershipAllowed
+// branch-force-delete. index.ts is not importable in tests (pi-extension TS),
+// so the exact calc is mirrored here (same pattern as the #376 adapter).
+{
+  const allowance = (cmd, { currentBranch, baselineBranch, ownedBranches }) => {
+    const d = classifyGitCommandDetailed(cmd);
+    const targets = d.pushTargets && d.pushTargets.length > 0
+      ? d.pushTargets
+      : ((d.deleteTargets && d.deleteTargets.length > 0)
+        ? d.deleteTargets
+        : (d.newBranch ? [d.newBranch] : []));
+    return sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch, baselineBranch, targets, ownedBranches });
+  };
+  // post-return state (#376): baseline re-based to main, session owns feat/2
+  expectBool("#543: own single-branch ceremony still allowed", allowance(`git branch -D feat/2`, { currentBranch: "main", baselineBranch: "main", ownedBranches: ["feat/2"] }) === true, true);
+  expectBool("#543: own+foreign multi → BLOCKED (foreign trailing target)", allowance(`git branch -D feat/2 feat/other`, { currentBranch: "main", baselineBranch: "main", ownedBranches: ["feat/2"] }) === false, true);
+  // THE issue scenario: first target == baseline (main), trailing foreign —
+  // pre-fix the first-target-only capture allowed this and git deleted feat/other.
+  expectBool("#543: baseline+foreign multi → BLOCKED (partial-delete gap)", allowance(`git branch -D main feat/other`, { currentBranch: "main", baselineBranch: "main", ownedBranches: [] }) === false, true);
+  expectBool("#543: all-own multi → allowed", allowance(`git branch -D feat/2 feat/2`, { currentBranch: "main", baselineBranch: "main", ownedBranches: ["feat/2"] }) === true, true);
+  expectBool("#543: single foreign → BLOCKED (unchanged)", allowance(`git branch -D feat/other`, { currentBranch: "main", baselineBranch: "main", ownedBranches: ["feat/2"] }) === false, true);
+}
 // ── P2 (cycle 2) regression: subshell-paren compounds ───────────────────────
 dexpect("P2: add && (commit) → block:commit", `git add . && (git commit -m x)`, { verdict: "block:commit" });
 expectBool("P2: commit && (checkout main) → branchState", classifyGitCommandDetailed(`git commit -m x && (git checkout main)`).branchState, true);
