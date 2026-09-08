@@ -43,12 +43,30 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   // `-Dqv`) and separated-flag form bypassed. Widen to a run-scan (force-push
   // precedent): a single-dash short cluster containing uppercase D ANYWHERE in
   // the branch option run is a force delete. Case distinguishes HARD -D from
-  // SOFT -d/--delete (lowercase stays allow — P1-B merged-only design). The
-  // `(?![A-Za-z]*u)` guard stops `-u<value>` (set-upstream-to's ATTACHED value
-  // — the ONLY arg-taking short among branch's flags, e.g. `-uDevel`) from
-  // false-matching as a delete cluster; `--long` tokens can't match (`[A-Za-z]*`
-  // cannot cross the second dash), and name tokens lack a leading dash.
+  // SOFT -d/--delete — lowercase stays allow (P1-B merged-only, git-enforced)
+  // UNLESS composed with force (next entry). The `(?![A-Za-z]*u)` guard stops
+  // `-u<value>` (set-upstream-to's ATTACHED value — the ONLY arg-taking short
+  // among branch's flags, e.g. `-uDevel`) from false-matching as a delete
+  // cluster; `--long` tokens can't match (`[A-Za-z]*` cannot cross the second
+  // dash), and name tokens lack a leading dash. The guard is deliberately
+  // BROADER than -u alone: it rejects any cluster whose letter run contains u
+  // (incl. `-Du<value>` / `-qDu<value>` mixes) — safe because delete +
+  // set-upstream-to is a git MODE CONFLICT (probe-verified rc 129, nothing
+  // deleted), so no real force-delete is ever masked.
   { name: "branch-force-delete", re: /\bgit\s+branch\b[^;&|]*\s+-(?![A-Za-z]*u)[A-Za-z]*D/ },
+  // #587 review fold-in: -D is documented as `--delete --force`, and git
+  // accepts the SOFT spellings composed with force as HARD deletes of UNMERGED
+  // branches — `git branch -d -f x`, `-df x`, `-fd x`, `-d --force x`,
+  // `--delete --force x` all delete unmerged branches rc=0 (probe-verified),
+  // defeating the P1-B "merged-only, git-enforced" premise that keeps bare
+  // -d/--delete on the allow list. So a branch option run that contains BOTH a
+  // delete spelling (`--delete`, or a single-dash cluster whose letters
+  // include d/D — u-guarded) AND a force spelling (`--force`, or a
+  // single-dash cluster including f) is a force delete. The D-cluster entry
+  // above already covers pure -D forms; this one is the d+force composition.
+  // Force-CREATE (`git branch -f x main` — no delete token) is untouched:
+  // the M3 force arm gates it as the sanctioned ceremony.
+  { name: "branch-force-delete", re: /\bgit\s+branch\b(?=[^;&|]*(?:\s+--delete\b|\s+-(?![A-Za-z]*u)[A-Za-z]*[dD]))(?=[^;&|]*(?:\s+--force\b|\s+-(?![A-Za-z]*u)[A-Za-z]*f))[^;&|]*/ },
   { name: "force-push", re: /\bgit\s+push\b[^;&|]*(-f|--force)\b/ },
   { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
   { name: "force-checkout", re: /\bgit\s+(checkout|switch)\s+(-f|--force)\b/ },
@@ -2099,8 +2117,14 @@ export function branchDeleteNames(verb, args) {
     return names.length > 0 ? names : null;
   }
   if (verb === "branch") {
-    const hasDelete = a.some((x) => x === "-d" || x === "-D" || x === "--delete" ||
-      /^-[dD]./.test(x) && !x.startsWith("--"));
+    // #587 (review fold-in): git merges NOARG shorts into ONE token, so the
+    // delete short can sit ANYWHERE in a single-dash cluster (`-Dq`, `-dq`,
+    // `-qD`, `-qd`, `-qvD`) — not just first — mirroring the push family's
+    // `_isPushDeleteFlagToken` any-position detection (#443). The `u`-prefix
+    // exclusion mirrors the regex guard: `-u<value>` (set-upstream-to) is not
+    // a delete. `--delete` is the only long form.
+    const hasDelete = a.some((x) => x === "--delete" ||
+      /^-(?![A-Za-z]*u)[A-Za-z]*[dD]/.test(x));
     if (!hasDelete) return null;
     const names = [];
     for (const x of a) {

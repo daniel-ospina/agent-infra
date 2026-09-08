@@ -61,10 +61,20 @@ expect("branch -Dq cluster", "git branch -Dq chore/old", "block:branch-force-del
 expect("branch -Dv cluster", "git branch -Dv chore/old", "block:branch-force-delete");
 expect("branch -Dqv cluster", "git branch -Dqv chore/old", "block:branch-force-delete");
 expect("branch -qD cluster", "git branch -qD chore/old", "block:branch-force-delete");
+// #587 review fold-in: -D is `--delete --force`; the SOFT spellings composed
+// with force are HARD deletes of UNMERGED branches (rc=0 probe-verified) and
+// must block. Bare -f (force-CREATE, M3 ceremony) stays allow.
+expect("branch -d -f force-composed", "git branch -d -f chore/old", "block:branch-force-delete");
+expect("branch -df force-composed cluster", "git branch -df chore/old", "block:branch-force-delete");
+expect("branch -fd force-composed cluster", "git branch -fd chore/old", "block:branch-force-delete");
+expect("branch -d --force force-composed", "git branch -d --force chore/old", "block:branch-force-delete");
+expect("branch --delete --force force-composed", "git branch --delete --force chore/old", "block:branch-force-delete");
+expect("branch --force --delete force-composed", "git branch --force --delete chore/old", "block:branch-force-delete");
 expect("branch -q -D separated", "git branch -q -D chore/old", "block:branch-force-delete");
 expect("branch --quiet -D separated", "git branch --quiet -D chore/old", "block:branch-force-delete");
 expect("branch -Dq compound segment", "git add . && git branch -Dq chore/old", "block:branch-force-delete");
 expect("branch -d soft (allow)", "git branch -d chore/old", "allow");
+expect("branch -f force-create (allow)", "git branch -f feat/1 main", "allow");
 expect("branch -dq soft cluster (allow)", "git branch -dq chore/old", "allow");
 expect("branch --delete soft (allow)", "git branch --delete chore/old", "allow");
 // #587: -u takes an ATTACHED value (set-upstream-to); a D-leading value must
@@ -645,6 +655,14 @@ dexpect("#543: branch list → no delete capture", `git branch -a`, { branchStat
 // following POSITIONAL — NOT a phantom attached "q" (git has no attached-name
 // form). `-dq` ≡ `-d -q` is a SOFT delete: allow + state + real targets.
 dexpect("#587: branch -Dq cluster → block, target is positional", `git branch -Dq feat/1`, { verdict: "block:branch-force-delete", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
+// d/D NOT first in the cluster is also reachable (`-qD` ≡ `-D -q`); the
+// any-position hasDelete must still extract the positional target.
+dexpect("#587: branch -qD cluster (D mid-cluster) → block + targets", `git branch -qD feat/1`, { verdict: "block:branch-force-delete", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
+dexpect("#587: branch -qd soft cluster (d mid-cluster) → allow + targets", `git branch -qd feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
+// #587 review fold-in: -d/--delete composed with -f/--force hard-deletes
+// UNMERGED branches — same ownership gate as -D.
+dexpect("#587: branch -df force-composed → block + target", `git branch -df feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+dexpect("#587: branch --delete --force force-composed → block", `git branch --delete --force feat/1`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1"] });
 dexpect("#587: branch -Dqv multi-letter cluster → block", `git branch -Dqv feat/1`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1"] });
 dexpect("#587: branch -Dqv multi-TARGET cluster → ALL positionals", `git branch -Dqv feat/1 other/2`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1", "other/2"] });
 dexpect("#587: branch -q -D separated → block", `git branch -q -D feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
@@ -851,6 +869,10 @@ bdNames("bdNames branch -d", "branch", ["-d", "old"], ["old"]);
 // form; `-Dold` is unknown-switch rc 129 and deletes nothing).
 bdNames("#587: -Dold cluster → null (no attached name exists)", "branch", ["-Dold"], null);
 bdNames("#587: -Dq cluster + positional → positional only", "branch", ["-Dq", "feat/1"], ["feat/1"]);
+bdNames("#587: -qD cluster (D mid) + positional → positional only", "branch", ["-qD", "feat/1"], ["feat/1"]);
+bdNames("#587: -qd soft cluster (d mid) + positional → positional only", "branch", ["-qd", "feat/1"], ["feat/1"]);
+bdNames("#587: -df force-composed cluster + positional → positional", "branch", ["-df", "feat/1"], ["feat/1"]);
+bdNames("#587: -uDevel attached upstream → not a delete", "branch", ["-uDevel"], null);
 bdNames("#587: -dq soft cluster + positional → positional only", "branch", ["-dq", "feat/1"], ["feat/1"]);
 bdNames("#587: -Dq cluster alone → null (git: branch name required)", "branch", ["-Dq"], null);
 bdNames("bdNames branch list → null", "branch", ["-a"], null);
