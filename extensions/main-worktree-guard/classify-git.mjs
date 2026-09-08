@@ -1560,12 +1560,18 @@ export function classifyGitCommandDetailed(command) {
   // block restores pre-#591 compound parity.
   out.stateOpCount = invocations.filter((v) =>
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb)).length;
-  // #591 (round-3 fold): a shell substitution ($(…)/backticks/eval) may hide a
-  // branch-state git invocation from the count above (collapse to one opaque
-  // token → stateOpCount undercounts). Exposed here so index.ts can refuse the
-  // M3 benign-force carve-out when hidden state mutation is present — see
-  // _hasHiddenStateSubst for the scan + why non-mutating payloads pass.
-  out.hiddenStateSubst = _hasHiddenStateSubst(String(command ?? ""));
+  // #591 (round-3→5 fold): a shell construct may hide a branch-state git
+  // invocation from the count above (collapse to opaque tokens → stateOpCount
+  // undercounts). Exposed here so index.ts can refuse the M3 benign-force
+  // carve-out when hidden state mutation is present. The scan ORs the
+  // branch-state-mutating substitution scan (_hasHiddenStateSubst) with the
+  // hub-gate's hardened unverifiable-git shape set (_unverifiableGitContent:
+  // piped-stdin shells, process substitution, heredocs, alias/function
+  // definitions, spawner $VARs — round-6→19 review-hardened; the carve-out
+  // bound reuses it so the construct coverage cannot drift).
+  out.hiddenStateSubst =
+    _hasHiddenStateSubst(String(command ?? "")) ||
+    _unverifiableGitContent(String(command ?? ""));
 
   return out;
 }
@@ -2286,32 +2292,37 @@ export function isBranchForceCreateTokenNarrow(a) {
 }
 
 /**
- * #591 (round-3/4 fold): does `raw` HIDE a branch-STATE-MUTATING git invocation
+ * #591 (round-3→5 fold): does `raw` HIDE a branch-STATE-MUTATING git invocation
  * in content allGitInvocations cannot see per-invocation? allGitInvocations
- * collapses `$(…)`/backticks/eval/alias payloads to ONE opaque token, so
- * `git branch -fq own old ; echo "$(git branch -fq victim old)"` reports
+ * collapses `$(…)`/backticks/eval/alias/piped-shell payloads to opaque tokens,
+ * so `git branch -fq own old ; echo "$(git branch -fq victim old)"` reports
  * stateOpCount 1 (only the visible segment) and the M3 benign carve-out on the
  * own-branch segment would let the hidden FOREIGN force-create execute
- * (pre-#591 the exact-force own segment blocked the whole command). Scan:
- *   - every PAREN-BALANCED substitution span ($(…) and backticks — a naive
- *     `[^)]*` regex truncated at the FIRST `)` and NESTED substitutions
- *     evaded detection entirely: round-4 reviewer P1, probe-verified rc 0),
- *     recursing into nested spans;
- *   - each span re-tokenized and scanned for a MUTATING branch invocation:
- *     checkout/switch/symbolic-ref/update-ref always, git branch only with a
- *     rename/delete/force spelling — non-mutating branch READS
- *     (`--show-current`, `--list`, rev-parse payloads) stay benign-eligible so
- *     `git branch -fq own $(git rev-parse HEAD)` isn't a false block;
- *   - a top-level `__unverifiable__` segment (eval/alias/`$VAR` indirection
- *     whose expansion cannot be classified — round-4 reviewer P2, probe-verified
- *     `EV="git branch -fq victim main"; eval $EV` moves a foreign ref rc 0):
- *     fail closed — content that cannot be PROVEN free of another state
- *     mutation must refuse the carve-out (same rationale as M4's fail-closed
- *     `__unverifiable__` block; a benign ceremony that also runs an
- *     unverifiable `$VAR` segment is the accepted safe-direction false block).
- * Any hit → true → index.ts refuses the benign carve-out (decideM3 bound).
- * Exported for cross-layer pins (test.mjs); the raw-text scan lives here so
- * the substitution SHAPES stay single-sourced.
+ * (pre-#591 the exact-force own segment blocked the whole command). The scan
+ * covers, with a QUOTE-AWARE paren walk (a `)` inside quotes must not close a
+ * `$(…)` span early — round-5 reviewer P1, probe-verified rc 0):
+ *   - `$(…)` spans and backticks, recursing into nested spans;
+ *   - ANSI-C `$'…'` literals (`sh -c $'git branch -fq victim main'` — the
+ *     tokenizer reads the ANSI form as an unresolvable `$VAR`, missing the
+ *     inline; round-5 reviewer P1);
+ *   - static `eval "…"/'…'` literals;
+ *   - a top-level `__unverifiable__` segment (eval/alias/`$VAR` command
+ *     indirection whose expansion cannot be classified — round-4 reviewer P2,
+ *     probe-verified `EV="git branch -fq victim main"; eval $EV` moves a
+ *     foreign ref rc 0): fail closed — content that cannot be PROVEN free of
+ *     another state mutation must refuse the carve-out (same rationale as M4's
+ *     fail-closed `__unverifiable__` block);
+ *   - escaped backticks (`\``) signal NESTED backtick content — unparseable →
+ *     fail closed.
+ * Each payload is re-tokenized and scanned for a MUTATING branch invocation:
+ * checkout/switch/symbolic-ref/update-ref always, git branch only with a
+ * rename/delete/force spelling — non-mutating branch READS (`--show-current`,
+ * `--list`, rev-parse payloads) stay benign-eligible so `git branch -fq own
+ * $(git rev-parse HEAD)` isn't a false block. index.ts ORs this with the
+ * hub-gate's _unverifiableGitContent (piped-stdin shells, process
+ * substitution, heredocs, alias/function definitions, spawner `$VAR`s — the
+ * round-6→19 hardened shape set) before refusing the carve-out (decideM3's
+ * hiddenStateSubst bound). Exported for cross-layer pins (test.mjs).
  * @param {string} raw
  * @returns {boolean}
  */
@@ -2324,48 +2335,90 @@ export function _hasHiddenStateSubst(raw) {
       branchDeleteNames("branch", inv.args) !== null ||
       inv.args.some(isBranchForceCreateTokenNarrow));
   };
+  // Quote-aware payload collector: `$(…)`/`<(…)`/`>(…)` spans close only on a
+  // paren OUTSIDE quotes/escapes; ANSI-C `$'…'` literals; backticks pair to
+  // the next (top-level escaping already fails closed above the collector).
+  const collect = (src) => {
+    const spans = [];
+    let i = 0;
+    const n = src.length;
+    while (i < n) {
+      const c = src[i];
+      if (c === "$" && src[i + 1] === "'") {
+        let j = i + 2;
+        while (j < n && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
+        spans.push(src.slice(i + 2, j));
+        i = j < n ? j + 1 : n;
+        continue;
+      }
+      if ((c === "$" || c === "<" || c === ">") && src[i + 1] === "(") {
+        let depth = 1;
+        let q = null; // null | '"' | "'"
+        let j = i + 2;
+        while (j < n && depth > 0) {
+          const d = src[j];
+          if (q !== null) {
+            if (d === "\\") j++;
+            else if (d === q) q = null;
+          } else if (d === "\"" || d === "'") q = d;
+          else if (d === "(") depth++;
+          else if (d === ")") depth--;
+          j++;
+        }
+        spans.push(src.slice(i + 2, Math.max(i + 2, j - 1)));
+        i = j;
+        continue;
+      }
+      if (c === "`") {
+        const j = src.indexOf("`", i + 1);
+        spans.push(src.slice(i + 1, j > -1 ? j : src.length));
+        i = j > -1 ? j + 1 : src.length;
+        continue;
+      }
+      i++;
+    }
+    return spans;
+  };
   // Top-level unverifiable segment (eval/alias/$VAR command indirection) —
   // its expansion is unclassifiable, so it may hide a second state mutation.
   if (allGitInvocations(source).some((inv) => inv.verb === "__unverifiable__")) return true;
-  // Escaped backticks (\`) signal NESTED backtick content — the shell resolves
-  // the inner backticks before the outer span; a plain first-backtick-to-next-
-  // backtick pairing misreads the escapes (round-4 reviewer P1 evidence).
-  // Cannot parse reliably → fail closed (a legit escaped backtick inside a
-  // substitution is rare; over-refusal is the safe direction).
-  if (/\\`/.test(source)) return true;
-  // Paren-balanced spans from the raw string AND from each token (an UNQUOTED
-  // `$( … )` splits into separate tokens on the walk; the raw scan covers
-  // quoted whole spans). Recurse: a span may itself contain nested spans.
+  if (/\\`/.test(source)) return true; // nested-backtick escaping — fail closed
   const seen = new Set();
-  const scan = (inner) => {
+  const scan = (inner, isProcSubst) => {
     if (inner === undefined || inner.length === 0 || seen.has(inner)) return false;
     seen.add(inner);
+    if (isProcSubst && /\bgit\b/.test(inner)) return true; // executable text fed to a shell (round-19 parity)
     for (const inv of allGitInvocations(inner)) {
       if (inv.verb === "__unverifiable__") return true;
       if (mutates(inv)) return true;
     }
-    for (const sub of _extractSubstitutionSpans(inner)) {
-      if (scan(sub)) return true;
+    for (const sub of collect(inner)) {
+      if (scan(sub, false)) return true;
     }
     return false;
   };
-  for (const inner of _extractSubstitutionSpans(source)) {
-    if (scan(inner)) return true;
+  for (const inner of collect(source)) {
+    if (scan(inner, false)) return true;
+  }
+  // process substitution `<(…)`/`>(…)`: its body is executable text the
+  // classifier cannot evaluate (bash <(echo 'git branch …') runs it) — the
+  // content is scanned separately so a git word ANYWHERE is a risk.
+  const procRe = /[<>]\(([^)]*)\)/g;
+  let pm;
+  while ((pm = procRe.exec(source)) !== null) {
+    if (scan(pm[1] ?? "", true)) return true;
   }
   for (const t of _tokenize(source)) {
-    for (const inner of _extractSubstitutionSpans(t)) {
-      if (scan(inner)) return true;
+    for (const inner of collect(t)) {
+      if (scan(inner, false)) return true;
     }
   }
-  // eval "…"/'…' with a STATIC literal payload: the span extractor does not
-  // cover eval (it is a builtin word, not a substitution); scan the payload
-  // directly (a non-static eval argument — `eval $EV` — hits the top-level
-  // __unverifiable__ fail-closed above, round-4 reviewer P2).
+  // static eval "…"/'…' literals (non-static `eval $EV` → __unverifiable__ above)
   const evalRe = /eval\s+(?:"([^"]*)"|'([^']*)')/g;
   let m;
   while ((m = evalRe.exec(source)) !== null) {
     const payload = m[1] ?? m[2] ?? "";
-    if (payload.length > 0 && scan(payload)) return true;
+    if (payload.length > 0 && scan(payload, false)) return true;
   }
   return false;
 }

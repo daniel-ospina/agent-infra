@@ -846,6 +846,25 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
   expectBool("#591 fold: escaped-backtick nesting → hiddenStateSubst (fail closed)", escBt.hiddenStateSubst === true, true);
   const evalVarDeny = sharedDecideM3({ branchOp: evalVar.branchState ? sharedClassifyBranchOp(evalVar.stateVerb, evalVar.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: evalVar.stateOpCount ?? 1, hiddenStateSubst: evalVar.hiddenStateSubst === true });
   expectBool("#591 fold: eval-var launder → M3 default block (carve-out refused)", evalVarDeny?.block === true, true);
+  // Round-5 fold-in (cycle-2 reviewers P1/P2): DEEPER hiding constructs must
+  // fail closed — piped-stdin shells, process substitution fed to a shell,
+  // ANSI-C-quoted -c inlines, alias indirection, heredoc+sh, and a QUOTED-paren
+  // inside $() that used to truncate the span at the first ')'. Each hides a
+  // foreign force-create beside the benign own-branch segment.
+  const pipeSh = classifyGitCommandDetailed(`git branch -fq feat/1 main ; printf 'git branch -fq feat/other main' | sh`);
+  expectBool("#591 fold: piped-stdin shell foreign force-create → hiddenStateSubst", pipeSh.hiddenStateSubst === true, true);
+  const procSub = classifyGitCommandDetailed(`git branch -fq feat/1 main ; bash <(echo 'git branch -fq feat/other main')`);
+  expectBool("#591 fold: process-substitution foreign force-create → hiddenStateSubst", procSub.hiddenStateSubst === true, true);
+  const ansiC = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'git branch -fq feat/other main'`);
+  expectBool("#591 fold: ANSI-C-quoted -c foreign force-create → hiddenStateSubst", ansiC.hiddenStateSubst === true, true);
+  const aliasX = classifyGitCommandDetailed(`git branch -fq feat/1 main ; shopt -s expand_aliases\nalias x="git branch -fq feat/other main"\nx`);
+  expectBool("#591 fold: alias-indirection foreign force-create → hiddenStateSubst", aliasX.hiddenStateSubst === true, true);
+  const heredoc = classifyGitCommandDetailed("git branch -fq feat/1 main ; sh <<EOF\ngit branch -fq feat/other main\nEOF");
+  expectBool("#591 fold: heredoc+sh foreign force-create → hiddenStateSubst", heredoc.hiddenStateSubst === true, true);
+  const quotedParen = classifyGitCommandDetailed(`git branch -fq feat/1 main ; echo "$(echo ')' && git branch -fq feat/other main)"`);
+  expectBool("#591 fold: quoted-paren span truncation → hiddenStateSubst", quotedParen.hiddenStateSubst === true, true);
+  const procDeny = sharedDecideM3({ branchOp: procSub.branchState ? sharedClassifyBranchOp(procSub.stateVerb, procSub.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: procSub.stateOpCount ?? 1, hiddenStateSubst: procSub.hiddenStateSubst === true });
+  expectBool("#591 fold: process-substitution launder → M3 default block", procDeny?.block === true, true);
   // Benign-eligibility: NON-mutating payloads (rev-parse / branch --show-
   // current) do NOT trip the bound, so the own-branch ceremony with a
   // substitution start-point keeps its carve-out.
