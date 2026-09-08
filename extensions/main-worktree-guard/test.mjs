@@ -52,6 +52,26 @@ expect("merge; push compound", "git merge;git push origin main", "block:merge");
 expect("merge&& push compound", "git merge&&git push origin main", "block:merge");
 expect("rebase", "git rebase main", "block:rebase");
 expect("branch -D", "git branch -D chore/old", "block:branch-force-delete");
+// #587: git's parse-options merges NOARG short flags into ONE cluster and
+// accepts them as SEPARATE tokens too — `-Dq` ≡ `-D -q`, and
+// `git branch -q -D x` ≡ `git branch --quiet -D x` — all hard-delete rc=0
+// and must block (the branch name is the following positional). Soft
+// -d/--delete spellings stay allow (P1-B merged-only, git-enforced).
+expect("branch -Dq cluster", "git branch -Dq chore/old", "block:branch-force-delete");
+expect("branch -Dv cluster", "git branch -Dv chore/old", "block:branch-force-delete");
+expect("branch -Dqv cluster", "git branch -Dqv chore/old", "block:branch-force-delete");
+expect("branch -qD cluster", "git branch -qD chore/old", "block:branch-force-delete");
+expect("branch -q -D separated", "git branch -q -D chore/old", "block:branch-force-delete");
+expect("branch --quiet -D separated", "git branch --quiet -D chore/old", "block:branch-force-delete");
+expect("branch -Dq compound segment", "git add . && git branch -Dq chore/old", "block:branch-force-delete");
+expect("branch -d soft (allow)", "git branch -d chore/old", "allow");
+expect("branch -dq soft cluster (allow)", "git branch -dq chore/old", "allow");
+expect("branch --delete soft (allow)", "git branch --delete chore/old", "allow");
+// #587: -u takes an ATTACHED value (set-upstream-to); a D-leading value must
+// NOT false-positive as a force-delete cluster, and reads stay allow.
+expect("branch -u upstream (allow)", "git branch -u origin/main", "allow");
+expect("branch -uDevel attached upstream (allow)", "git branch -uDevel", "allow");
+expect("branch --merged read (allow)", "git branch --merged main", "allow");
 expect("force push", "git push -f origin main", "block:force-push");
 expect("force push --force", "git push --force origin main", "block:force-push");
 expect("restore", "git restore .", "block:restore");
@@ -620,6 +640,20 @@ dexpect("#543: branch -d multi → ALL soft-delete targets captured", `git branc
 dexpect("#543: branch --delete multi → ALL targets captured", `git branch --delete a b`, { branchState: true, deleteTargets: ["a", "b"] });
 dexpect("#543: branch -f force-create → NOT a delete (no targets)", `git branch -f feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
 dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
+// ── #587 regression: merged NOARG flag-clusters ─────────────────────────────
+// `-Dq` ≡ `-D -q` (hard delete, quiet): block, and the target is the
+// following POSITIONAL — NOT a phantom attached "q" (git has no attached-name
+// form). `-dq` ≡ `-d -q` is a SOFT delete: allow + state + real targets.
+dexpect("#587: branch -Dq cluster → block, target is positional", `git branch -Dq feat/1`, { verdict: "block:branch-force-delete", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
+dexpect("#587: branch -Dqv multi-letter cluster → block", `git branch -Dqv feat/1`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1"] });
+dexpect("#587: branch -Dqv multi-TARGET cluster → ALL positionals", `git branch -Dqv feat/1 other/2`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1", "other/2"] });
+dexpect("#587: branch -q -D separated → block", `git branch -q -D feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+dexpect("#587: branch --quiet -D separated → block", `git branch --quiet -D feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+dexpect("#587: branch -dq soft cluster → allow + real targets", `git branch -dq feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
+// `-Dold` is NOT an attached-name delete — unknown switch 'o', rc 129, git
+// deletes NOTHING; a following REAL positional is still captured.
+dexpect("#587: branch -Dold + positional → block, no phantom name", `git branch -Dold feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+dexpect("#587: branch -uDevel attached upstream → NOT a delete", `git branch -uDevel`, { verdict: "allow", branchState: false });
 // Guard-adapter pin: replicate index.ts's ownership-allowance target wiring
 // (pushTargets → deleteTargets → newBranch fallback) + shared ownershipAllowed
 // branch-force-delete. index.ts is not importable in tests (pi-extension TS),
@@ -812,7 +846,13 @@ bdNames("bdNames push --delete heads/main → main (P1)", "push", ["origin", "--
 bdNames("bdNames push colon heads/feat/x → feat/x (P1)", "push", ["origin", ":heads/feat/x"], ["feat/x"]);
 bdNames("bdNames branch -D", "branch", ["-D", "old"], ["old"]);
 bdNames("bdNames branch -d", "branch", ["-d", "old"], ["old"]);
-bdNames("bdNames branch merged -Dx", "branch", ["-Dold"], ["old"]);
+// #587: cluster suffixes are FLAGS, never an attached branch name — the old
+// slice(2) capture read `-Dq` as a phantom name "q" (real git: no attached
+// form; `-Dold` is unknown-switch rc 129 and deletes nothing).
+bdNames("#587: -Dold cluster → null (no attached name exists)", "branch", ["-Dold"], null);
+bdNames("#587: -Dq cluster + positional → positional only", "branch", ["-Dq", "feat/1"], ["feat/1"]);
+bdNames("#587: -dq soft cluster + positional → positional only", "branch", ["-dq", "feat/1"], ["feat/1"]);
+bdNames("#587: -Dq cluster alone → null (git: branch name required)", "branch", ["-Dq"], null);
 bdNames("bdNames branch list → null", "branch", ["-a"], null);
 bdNames("bdNames non-delete verb → null", "commit", ["-m", "x"], null);
 bdAllow("bdAllow current branch blocked", ["main"], "main", new Set(), false);

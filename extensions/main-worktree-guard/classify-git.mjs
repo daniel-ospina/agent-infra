@@ -34,7 +34,21 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "merge", re: /\bgit\s+merge\b(?!-)/ },
   { name: "rebase", re: /\bgit\s+rebase\b/ },
   { name: "pull", re: /\bgit\s+pull\b/ },
-  { name: "branch-force-delete", re: /\bgit\s+branch\s+-\w*D\b/ },
+  // #587: git's parse-options MERGES NOARG short flags into ONE cluster, so
+  // `-Dq` ≡ `-D -q` and `git branch -q -D x` / `--quiet -D x` all HARD-delete
+  // (probe-verified rc=0); the branch name is always the following POSITIONAL
+  // (git has no attached-name form — `-Dold` is unknown-switch rc 129). The
+  // old `-\w*D\b` required the D TERMINAL at a word boundary AND the cluster
+  // immediately after `branch\s`, so every trailing-flag cluster (`-Dq`, `-Dv`,
+  // `-Dqv`) and separated-flag form bypassed. Widen to a run-scan (force-push
+  // precedent): a single-dash short cluster containing uppercase D ANYWHERE in
+  // the branch option run is a force delete. Case distinguishes HARD -D from
+  // SOFT -d/--delete (lowercase stays allow — P1-B merged-only design). The
+  // `(?![A-Za-z]*u)` guard stops `-u<value>` (set-upstream-to's ATTACHED value
+  // — the ONLY arg-taking short among branch's flags, e.g. `-uDevel`) from
+  // false-matching as a delete cluster; `--long` tokens can't match (`[A-Za-z]*`
+  // cannot cross the second dash), and name tokens lack a leading dash.
+  { name: "branch-force-delete", re: /\bgit\s+branch\b[^;&|]*\s+-(?![A-Za-z]*u)[A-Za-z]*D/ },
   { name: "force-push", re: /\bgit\s+push\b[^;&|]*(-f|--force)\b/ },
   { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
   { name: "force-checkout", re: /\bgit\s+(checkout|switch)\s+(-f|--force)\b/ },
@@ -1393,7 +1407,9 @@ export function classifyGitCommandDetailed(command) {
         // feat/other, rc=1). newBranch (the first name) alone would let
         // `<baseline|own> <foreign>` slip the trailing foreign target past the
         // ownership allowance, so the branch-delete extraction must capture
-        // EVERY -d/-D/--delete name (incl. merged `-Dname` cluster forms) via
+        // EVERY -d/-D/--delete name (merged NOARG flag-clusters like `-Dq` ≡
+        // `-D -q` contribute NO name — #587: the suffix is flags, never an
+        // attached branch name — the target is the following positional) via
         // branchDeleteNames — the all-targets discipline pushTargets already
         // gives the push family (#443). newBranch stays the FIRST name for
         // back-compat (single-target callers/tests); index.ts prefers
@@ -2047,7 +2063,10 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
  *     probe-verified, #439 P1-1); local-path/URL/`.`/other-name remotes are
  *     refused (a `git push . --delete main` removes the local trunk with no
  *     server gate — #439 P1-2).
- *   branch forms: `git branch -d|-D|--delete <b>...` (merged `-Db` accepted).
+ *   branch forms: `git branch -d|-D|--delete <b>...` plus merged NOARG
+ *     flag-clusters containing the delete short (`-Dq` = -D --quiet, `-dq` =
+ *     -d --quiet — #587); cluster suffixes are FLAGS, never attached names,
+ *     so targets are the following positionals only.
  * Main/master targets are NOT filtered here — branchDeleteAllowance blocks
  * them unconditionally.
  * @param {string} verb
@@ -2085,8 +2104,17 @@ export function branchDeleteNames(verb, args) {
     if (!hasDelete) return null;
     const names = [];
     for (const x of a) {
-      if (/^-[dD][^-]/.test(x)) { names.push(x.slice(2)); continue; }
-      if (x === "-d" || x === "-D" || x === "--delete") continue;
+      // #587: git's parse-options merges NOARG shorts into one token, so any
+      // single-dash d/D token (`-Dq`, `-dq`, `-D`, `-Dold`) is a delete-flag
+      // CLUSTER — the suffix is more flags (or, for invalid letters like the
+      // `o` in `-Dold`, an rc-129 error that deletes nothing), NEVER an
+      // attached branch name. The old `/^-[dD][^-]/ → slice(2)` capture read
+      // `-Dq` as a phantom name "q" — an over-capture that poisoned
+      // deleteTargets (own-branch `-Dq feat/x` listed ["q","feat/x"] and
+      // false-blocked the ceremony once -Dq classifies block). Targets are
+      // the following positionals only.
+      if (/^-[dD]/.test(x)) continue;
+      if (x === "--delete") continue;
       if (x.startsWith("-") || x === "--") continue;
       names.push(x);
     }
