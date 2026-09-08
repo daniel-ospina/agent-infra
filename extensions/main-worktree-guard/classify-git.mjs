@@ -100,13 +100,18 @@ export function classifyGitCommand(command) {
 }
 
 // ── Detailed classifier (#265) ────────────────────────────────────────────
-// classifyGitCommand above is FROZEN byte-identical (back-compat — test.mjs's
-// existing string assertions + external importers depend on it; it carries NO
-// new matchers). classifyGitCommandDetailed is the NEW object-returning
-// classifier that index.ts consumes EXCLUSIVELY (call-site contract, plan
-// deviation 8 / cycle-3 fold-in). It verb-anchors the SAME legacy patterns on
-// the SKIMMED command (`git -c k=v checkout main` ≡ `git checkout main`) and
-// adds commit / push / branch-state classification for the ownership gates.
+// classifyGitCommand's function TEXT above is FROZEN byte-identical
+// (back-compat — test.mjs's existing string assertions + external importers
+// depend on the exact body). New destructive matchers are added to the SHARED
+// DESTRUCTIVE_GIT_PATTERNS array that both it and classifyGitCommandDetailed
+// iterate — which DOES extend string-level blocking for new command shapes
+// (#587 adds the branch -D cluster + delete+force entries). What is frozen is
+// the function body itself, not the pattern set it consumes.
+// classifyGitCommandDetailed is the NEW object-returning classifier that
+// index.ts consumes EXCLUSIVELY (call-site contract, plan deviation 8 /
+// cycle-3 fold-in). It verb-anchors the SAME legacy patterns on the SKIMMED
+// command (`git -c k=v checkout main` ≡ `git checkout main`) and adds
+// commit / push / branch-state classification for the ownership gates.
 
 /** Quote-aware tokenizer (mirrors branch-ownership.mjs; kept local so
  * classify-git stays dependency-free for jiti loading — the two are
@@ -1277,17 +1282,27 @@ export function classifyGitCommandDetailed(command) {
 
   // ── verb-anchored legacy destructive patterns ──
   // Run on the RAW command (compound chains: `git pull && git merge`), and if
-  // that misses, on the SKIMMED first invocation (`git -C x checkout main` ≡
-  // `git checkout main` — the -C/-c/GIT_DIR prefixes defeat the raw regexes,
-  // which is exactly why they were verified bypasses).
+  // that misses, on EVERY invocation's SKIMMED reconstruction (`git -C x
+  // checkout main` ≡ `git checkout main` — the -C/-c/GIT_DIR prefixes defeat
+  // the raw regexes' `git\s+branch` adjacency, which is exactly why they were
+  // verified bypasses). #587 (review fold-in): the re-test covers every
+  // invocation, not just the first — a prefixed destructive verb in a LATER
+  // compound segment (`git fetch origin && git -C . branch -Dq x`) previously
+  // escaped both passes. index.ts resolves the effective repo from the STATE
+  // invocation, so worktree/foreign-targeted deletes stay exempt downstream.
   const raw = String(command ?? "").trim();
-  const skimmedFirst = `git ${invocations[0].verb ?? ""} ${(invocations[0].args || []).join(" ")}`.trim();
   for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
     if (re.test(raw)) { out.verdict = `block:${name}`; break; }
   }
-  if (out.verdict === "allow" && skimmedFirst !== "git") {
-    for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
-      if (re.test(skimmedFirst)) { out.verdict = `block:${name}`; break; }
+  if (out.verdict === "allow") {
+    for (const inv of invocations) {
+      const skimmed = `git ${inv.verb ?? ""} ${(inv.args || []).join(" ")}`.trim();
+      if (skimmed === "git") continue;
+      let hit = false;
+      for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
+        if (re.test(skimmed)) { out.verdict = `block:${name}`; hit = true; break; }
+      }
+      if (hit) break;
     }
   }
 

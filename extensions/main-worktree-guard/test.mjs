@@ -680,6 +680,10 @@ dexpect("#587: branch -qDuDevel u-mid cluster → NOT a delete", `git branch -qD
 dexpect("#587: branch -Dqv multi-letter cluster → block", `git branch -Dqv feat/1`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1"] });
 dexpect("#587: branch -Dqv multi-TARGET cluster → ALL positionals", `git branch -Dqv feat/1 other/2`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1", "other/2"] });
 dexpect("#587: branch -q -D separated → block", `git branch -q -D feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+// A prefixed destructive branch delete in a LATER compound segment previously
+// escaped both legacy passes (raw regex adjacency broken by -C; the skimmed
+// re-test only rebuilt invocation[0]).
+dexpect("#587: branch -Dq in later -C-prefixed compound segment → block", `git fetch origin && git -C . branch -Dq feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
 dexpect("#587: branch --quiet -D separated → block", `git branch --quiet -D feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
 dexpect("#587: branch -dq soft cluster → allow + real targets", `git branch -dq feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
 // `-Dold` is NOT an attached-name delete — unknown switch 'o', rc 129, git
