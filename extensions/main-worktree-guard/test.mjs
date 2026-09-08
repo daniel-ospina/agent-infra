@@ -694,7 +694,12 @@ dexpect("#591 fold: branch -lf LIST-mode cluster → NOT branchState", `git bran
 dexpect("#591 fold: branch -fa list/remotes cluster → NOT branchState", `git branch -fa feat/1 main`, { branchState: false });
 dexpect("#591 fold: branch -tf t-value dead → NOT branchState", `git branch -tf feat/1 main`, { branchState: false });
 dexpect("#591 fold: branch -tfoo t-value dead → NOT branchState", `git branch -tfoo feat/1`, { branchState: false });
-dexpect("#591 fold: branch -fC copy-cluster → NOT force-create (no exact -f)", `git branch -fC feat/1 main`, { branchState: false });
+// #592 (supersedes the #591-fold pin): -fC IS a force-COPY (git's mode
+// letters win over -f — c/C = copy mode, uppercase C = --copy --force; the
+// #591-fold "NOT force-create" assertion only excluded it from the FORCE-CREATE
+// arm, and #592 now gates the copy family itself: -fC/-C/-Cq/-cf clobber a free
+// dst rc 0 → branchState true → M3).
+dexpect("#592: branch -fC force-copy cluster → branchState + dst", `git branch -fC feat/1 main`, { branchState: true, newBranch: "main", deleteTargets: [] });
 // A TERMINAL t composes with force-create (`-ft`/`-fvt` = -f -v -t, rc 0).
 dexpect("#591 fold: branch -ft (terminal t) force-create → branchState + target", `git branch -ft feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
 dexpect("#591 fold: branch -fvt (terminal t) force-create → branchState + target", `git branch -fvt feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
@@ -709,6 +714,51 @@ dexpect("#591 fold: branch -fit (i + terminal t) force-create → branchState", 
 dexpect("#591 fold: branch -fiv force-create → branchState", `git branch -fiv feat/1 main`, { branchState: true, newBranch: "feat/1" });
 // -i ALONE is a plain (non-force) create — git creates rc 0, no -f involved.
 dexpect("#591 fold: branch -i alone → plain create, NOT force", `git branch -i feat/1 main`, { branchState: false });
+// ── #592 regression: rename/move flag-clusters + long forms ───────────────
+// git merges NOARG shorts into ONE token (`-Mq` ≡ `-M -q`, `-mv` ≡ `-m -v` —
+// probe-verified renames rc 0) and accepts the long form + unambiguous prefix
+// abbrevs (--move/--mov/--mo). All set branchState exactly like the exact
+// -m/-M forms they are byte-identical to in git — before #592 they fell
+// through to verdict allow + branchState false → M3 never entered. The 1-pos
+// form renames the CURRENT branch (renameFrom null → classifyBranchOp from
+// null → decideM3 substitutes currentBranch for the #265 carve-out).
+dexpect("#592: branch -Mq cluster rename → branchState", `git branch -Mq feat/1 rnX`, { branchState: true, deleteTargets: [] });
+dexpect("#592: branch -Mq cluster 2-pos → renameFrom/To captured", `git branch -Mq feat/1 rnX`, { renameFrom: "feat/1", renameTo: "rnX" });
+dexpect("#592: branch -Mq 1-pos (rename current) → renameTo only", `git branch -Mq rnX`, { renameFrom: null, renameTo: "rnX" });
+dexpect("#592: branch -mv cluster rename → branchState", `git branch -mv feat/1 rnX`, { branchState: true, deleteTargets: [] });
+dexpect("#592: branch -qM reversed cluster rename → branchState", `git branch -qM feat/1 rnX`, { branchState: true });
+dexpect("#592: branch --move long rename → branchState", `git branch --move feat/1 rnX`, { branchState: true, renameFrom: "feat/1", renameTo: "rnX" });
+dexpect("#592: branch --mov abbrev rename → branchState", `git branch --mov feat/1 rnX`, { branchState: true });
+dexpect("#592: branch --mo abbrev rename → branchState", `git branch --mo feat/1 rnX`, { branchState: true });
+dexpect("#592: branch --m ambiguous → NOT branchState (rc 129)", `git branch --m feat/1 rnX`, { branchState: false });
+dexpect("#592: branch --movefoo unknown → NOT branchState (rc 129)", `git branch --movefoo feat/1 rnX`, { branchState: false });
+// exact -m/-M forms stay branchState (unchanged by #592)
+dexpect("#592: branch -m exact → branchState (unchanged)", `git branch -m feat/1 rnX`, { branchState: true, renameFrom: "feat/1", renameTo: "rnX" });
+dexpect("#592: branch -M exact → branchState (unchanged)", `git branch -M feat/1 rnX`, { branchState: true, renameFrom: "feat/1", renameTo: "rnX" });
+// ── #592 regression: copy family (-c/-C) branch-state tracking ────────────
+// FORCE copy (uppercase C in a copy-mode cluster = git's --copy --force, or
+// any force composition) OVERWRITES an existing free dst rc 0 — the same
+// shared-ref mutation M3 gates for `branch -f` (probe-verified) — so every
+// force-copy spelling sets branchState + exposes the DESTINATION (2nd
+// positional; 1st for the 1-pos form, which copies the current branch).
+dexpect("#592: branch -Cq cluster force-copy → branchState + dst", `git branch -Cq feat/1 cpY`, { branchState: true, newBranch: "cpY", deleteTargets: [] });
+dexpect("#592: branch -C exact force-copy → branchState + dst", `git branch -C feat/1 side`, { branchState: true, newBranch: "side", deleteTargets: [] });
+dexpect("#592: branch -C 1-pos force-copy → dst = new name", `git branch -C cpY`, { branchState: true, newBranch: "cpY" });
+dexpect("#592: branch -cf force-copy cluster → branchState", `git branch -cf feat/1 side`, { branchState: true, newBranch: "side" });
+dexpect("#592: branch -fC force-copy cluster → branchState", `git branch -fC feat/1 side`, { branchState: true, newBranch: "side" });
+dexpect("#592: branch --copy soft → NOT branchState (new-ref-only create)", `git branch --copy feat/1 cpX`, { branchState: false });
+dexpect("#592: branch --cop soft abbrev → NOT branchState", `git branch --cop feat/1 cpX`, { branchState: false });
+// SOFT copy (lowercase c, no force): git refuses an existing dst rc 128 and
+// only ever creates a NEW ref — like `git branch <name>` (allow today), so no
+// branchState. Mixed-mode single tokens (-mc/-mD/-Dc …) are rc-129 no-ops →
+// no branchState. -cDq (copy+delete mix) keeps the delete path (D wins, #587).
+dexpect("#592: branch -c soft copy → NOT branchState (allow)", `git branch -c feat/1 cpX`, { branchState: false });
+dexpect("#592: branch -cq soft cluster → NOT branchState", `git branch -cq cpY`, { branchState: false });
+dexpect("#592: branch -mc mixed-mode → NOT branchState (rc 129)", `git branch -mc feat/1 bad`, { branchState: false });
+// -mD mixes delete (D) + move (m) letters — rc-129 no-op in git, but the #587
+// delete arm keeps D-wins semantics (any d/D letter = delete mode): the
+// conservative delete path blocks the no-op rather than the mixed-run exclusion.
+dexpect("#592: branch -mD mixed-mode → delete path (D wins, block)", `git branch -mD feat/1 bad`, { branchState: true, deleteTargets: ["feat/1", "bad"] });
 // ── #591 round-3 fold: tracking-directive family ───────────────────────────
 // A NON-TERMINAL t consumes the token REST as its --track directive value; git
 // accepts exactly "direct"/"inherit" (rc-0 force-CREATEs, probe-verified — the
@@ -774,11 +824,17 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
   const listFp = classifyGitCommandDetailed(`git branch -fl feat/other main`);
   expectBool("#591 fold: -fl LIST-mode cluster → NOT branchState (list runs rc 0)", listFp.branchState === false, true);
   const copyComp = classifyGitCommandDetailed(`git branch -f -c feat/1 side`);
-  expectBool("#591 fold: force+copy → branchState but NO carve-out branch (dest mutates)", copyComp.branchState === true, true);
+  expectBool("#592: force+copy → branchState (dest mutates)", copyComp.branchState === true, true);
   const copyOp = copyComp.branchState
     ? sharedClassifyBranchOp(copyComp.stateVerb, copyComp.stateArgs)
     : { op: "other" };
-  expectBool("#591 fold: force+copy → op force WITHOUT branch (M3 default block)", copyOp.op === "force" && copyOp.branch == null, true);
+  // #592 supersedes the #591-fold null-branch guard: the mutation target of a
+  // force-composed copy is the DESTINATION (2nd positional), and the op now
+  // carries branch = dst so the #591 benign carve-out keys on the REAL target
+  // — a foreign dst (side ≠ feat/1) still M3-blocks (below) and a dst ==
+  // currentBranch would pass through to git's rc-128 refusal (git refuses
+  // force-updating the branch used by the worktree).
+  expectBool("#592: force+copy → op force + dst branch (M3 default block)", copyOp.op === "force" && copyOp.branch === "side", true);
   const bareDeny = sharedDecideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", isBare: true });
   expectBool("#591 fold: BARE repo own-branch force-create → still blocked (git succeeds)", bareDeny?.block === true, true);
   const multiDeny = sharedDecideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: 2 });
@@ -789,6 +845,57 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
     ? sharedClassifyBranchOp(multiCount.stateVerb, multiCount.stateArgs)
     : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: multiCount.stateOpCount ?? 1 });
   expectBool("#591 fold: compound launder → M3 default block", compDeny?.block === true, true);
+  // ── #592: M3 gate outcomes for rename clusters + the copy family ─────────
+  // (classify → classifyBranchOp → decideM3 — the exact index.ts sequence).
+  // Rename clusters/long forms ride the SAME decideM3 rename arm as exact
+  // -m/-M: renaming the session's OWN baseline (from === baseline, incl. the
+  // 1-pos form where from is null → currentBranch) → reBaseline carve-out
+  // (#265); any other from → M3 block. Force-copies classify op force +
+  // branch = DST so the #591 benign carve-out applies on dst == currentBranch
+  // (git refuses rc 128) and foreign/non-checked-out dsts block. Soft copies
+  // never set branchState (new-ref-only) → allowed like branch create.
+  const m3c = (cmd, currentBranch, baselineBranch = currentBranch) => {
+    const d = classifyGitCommandDetailed(cmd);
+    // index.ts's exact M3 adapter: branchState false OR an op-other
+    // classification skips decideM3 entirely (verdict allow → allowed).
+    if (!d.branchState) return null;
+    const op = sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs);
+    if (!op || op.op === "other") return null;
+    return sharedDecideM3({ branchOp: op, isAgentInfra: true, baseline: { repoKey: "k", branch: baselineBranch }, currentBranch, repoKey: "k", stateOpCount: d.stateOpCount ?? 1 });
+  };
+  const ownRen = m3c(`git branch -Mq feat/1 rnX`, "feat/1");
+  expectBool("#592: -Mq own-baseline cluster rename → reBaseline (carve-out)", ownRen?.reBaseline === "rnX" && !ownRen?.block, true);
+  const ownRen1 = m3c(`git branch -Mq rnX`, "feat/1", "feat/1");
+  expectBool("#592: -Mq 1-pos own-baseline rename → reBaseline (from null → current)", ownRen1?.reBaseline === "rnX" && !ownRen1?.block, true);
+  const forRen = m3c(`git branch -Mq feat/other rnX`, "feat/1");
+  expectBool("#592: -Mq FOREIGN rename → M3 block", forRen?.block === true, true);
+  const longOwn = m3c(`git branch --move feat/1 rnY`, "feat/1");
+  expectBool("#592: --move own-baseline rename → reBaseline", longOwn?.reBaseline === "rnY" && !longOwn?.block, true);
+  const mvFor = m3c(`git branch -mv feat/other rnY`, "feat/1");
+  expectBool("#592: -mv FOREIGN rename → M3 block", mvFor?.block === true, true);
+  const exactOwn = m3c(`git branch -M feat/1 rnZ`, "feat/1");
+  expectBool("#592: exact -M own-baseline rename → reBaseline (unchanged)", exactOwn?.reBaseline === "rnZ" && !exactOwn?.block, true);
+  const exactFor = m3c(`git branch -m feat/other rnZ`, "feat/1");
+  expectBool("#592: exact -m FOREIGN rename → block (unchanged)", exactFor?.block === true, true);
+  const ownBaseline2pos = m3c(`git branch -M feat/1 rnW`, "feat/1", "feat/1");
+  expectBool("#592: 2-pos own-baseline exact -M → reBaseline", ownBaseline2pos?.reBaseline === "rnW", true);
+  // copy family M3 outcomes
+  const cqFor = m3c(`git branch -Cq feat/other cpY`, "feat/1");
+  expectBool("#592: -Cq FOREIGN dst force-copy → M3 block", cqFor?.block === true, true);
+  const cOwn = m3c(`git branch -Cq feat/other feat/1`, "feat/1");
+  expectBool("#592: -Cq dst == current → ALLOWED (git refuses rc 128)", cOwn === null, true);
+  const cExactOwn = m3c(`git branch -C feat/other feat/1`, "feat/1");
+  expectBool("#592: exact -C dst == current → ALLOWED (git refuses rc 128)", cExactOwn === null, true);
+  const cExactFor = m3c(`git branch -C feat/other cpY`, "feat/1");
+  expectBool("#592: exact -C FOREIGN dst → M3 block", cExactFor?.block === true, true);
+  const cfFor = m3c(`git branch -cf feat/other cpY`, "feat/1");
+  expectBool("#592: -cf FOREIGN dst force-copy → M3 block", cfFor?.block === true, true);
+  const curSrc2 = m3c(`git branch -C feat/1 cpY`, "feat/1");
+  expectBool("#592: -C src==current dst=cpY → M3 block (dst is the mutation)", curSrc2?.block === true, true);
+  const soft = m3c(`git branch -c feat/other cpX`, "feat/1");
+  expectBool("#592: soft -c → no branchState → allowed (create-only)", soft === null, true);
+  const mixed = m3c(`git branch -mc feat/1 bad`, "feat/1");
+  expectBool("#592: mixed-mode -mc rc-129 no-op → no branchState → allowed", mixed === null, true);
   // Round-3 fold-in: long-option ABBREVIATIONS of copy/move (--cop → --copy,
   // --mo/--mov → --move) must null the branch like their exact/cluster twins —
   // a force-composed copy/move mutates the DESTINATION rc 0 (`-f --cop main
@@ -801,14 +908,27 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
   const copOp = copAbbrev.branchState
     ? sharedClassifyBranchOp(copAbbrev.stateVerb, copAbbrev.stateArgs)
     : { op: "other" };
-  expectBool("#591 fold: -f --cop abbrev → op force WITHOUT branch (M3 block)", copOp.op === "force" && copOp.branch == null, true);
+  // #592: -f --cop = force-COPY (source main STAYS) → op force branch=dst side.
+  expectBool("#592: -f --cop abbrev → force + dst branch (M3 block)", copOp.op === "force" && copOp.branch === "side", true);
   const movAbbrev = classifyGitCommandDetailed(`git branch -f --mov main side`);
   const movOp = movAbbrev.branchState
     ? sharedClassifyBranchOp(movAbbrev.stateVerb, movAbbrev.stateArgs)
     : { op: "other" };
-  expectBool("#591 fold: -f --mov abbrev → op force WITHOUT branch (M3 block)", movOp.op === "force" && movOp.branch == null, true);
+  // #592: -f --mov ≡ -M (force MOVE) → the rename arm (own-baseline from →
+  // #265 reBaseline carve-out; foreign → block) — NOT the force arm.
+  expectBool("#592: -f --mov abbrev → op rename (force move, #265 arm)", movOp.op === "rename" && movOp.from === "main" && movOp.to === "side", true);
   const copM3 = sharedDecideM3({ branchOp: copOp, isAgentInfra: true, baseline: { repoKey: "k", branch: "main" }, currentBranch: "main", repoKey: "k", stateOpCount: copAbbrev.stateOpCount ?? 1 });
-  expectBool("#591 fold: -f --cop under current-branch source → still M3 block (no carve-out)", copM3?.block === true, true);
+  expectBool("#592: -f --cop foreign dst → still M3 block (no carve-out)", copM3?.block === true, true);
+  const movM3 = sharedDecideM3({ branchOp: movOp, isAgentInfra: true, baseline: { repoKey: "k", branch: "main" }, currentBranch: "main", repoKey: "k", stateOpCount: movAbbrev.stateOpCount ?? 1 });
+  expectBool("#592: -f --mov own-baseline move → reBaseline (own rename ceremony)", movM3?.reBaseline === "side" && !movM3?.block, true);
+  // The pure copy-against-current shape #591 guarded (branch field = src ==
+  // current would have misfired the benign carve-out): -C main side clobbers
+  // side rc 0 under current main — dst-keyed branch = side → M3 block.
+  const curSrc = classifyGitCommandDetailed(`git branch -C main side`);
+  const curSrcOp = curSrc.branchState ? sharedClassifyBranchOp(curSrc.stateVerb, curSrc.stateArgs) : { op: "other" };
+  expectBool("#592: -C src==current dst=side → force + dst branch", curSrcOp.op === "force" && curSrcOp.branch === "side", true);
+  const curSrcM3 = sharedDecideM3({ branchOp: curSrcOp, isAgentInfra: true, baseline: { repoKey: "k", branch: "main" }, currentBranch: "main", repoKey: "k", stateOpCount: curSrc.stateOpCount ?? 1 });
+  expectBool("#592: -C main side (current source) → M3 block (dst foreign)", curSrcM3?.block === true, true);
   // Round-3 fold-in: the tracking-directive family rides the SAME M3 force
   // path as -fq — own-branch → benign carve-out (git rc-128 refusal), foreign
   // → default block. No string-verdict bypass, no delete-misroute.

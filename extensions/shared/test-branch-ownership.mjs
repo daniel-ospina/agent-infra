@@ -209,19 +209,34 @@ ok("branchOp: branch --forcfoo unknown → NOT force", op("branch", ["--forcfoo"
 ok("branchOp: branch -ufoo u-value → NOT force", op("branch", ["-ufoo", "x"]) === "other");
 ok("branchOp: branch -fuDevel conflict → NOT force", op("branch", ["-fuDevel", "x", "main"]) === "other");
 // #591 round-2 (mode resolution + carve-out bounds): git's mode letters win
-// over -f, so delete/list/move-composed clusters are NOT the force-create op;
-// force composed with COPY/MOVE mutates the DESTINATION (2nd positional) so
-// the op carries NO branch field (the benign carve-out keys branch ==
-// currentBranch and must not fire).
+// over -f, so delete/list-composed clusters are NOT the force-create op.
+// #592 supersedes the round-2/3 copyOrMove branch-nulling (see below):
+// force-composed copy/move mutates the DESTINATION (2nd positional), and #592
+// now keys the op on the real mutation target — moves ride the rename arm,
+// force-copies classify op "force" with branch = the DST (never the source), so
+// the benign carve-out (branch === currentBranch) can misfire on neither a
+// current-branch SOURCE (`-f -c main side` clobbers side rc 0 — branch field =
+// side → block) nor a foreign dst under a current-branch source.
 ok("branchOp: branch -Df delete-composed → other (#587/#543 verdict path)", op("branch", ["-Df", "feat/x"]) === "other");
 ok("branchOp: branch -df delete-composed → other", op("branch", ["-df", "feat/x"]) === "other");
 ok("branchOp: branch -d --force separated delete → other", op("branch", ["-d", "--force", "feat/x"]) === "other");
 ok("branchOp: branch -fl list-mode cluster → other (no false block)", op("branch", ["-fl", "feat/x", "main"]) === "other");
 ok("branchOp: branch -lf list-mode cluster → other", op("branch", ["-lf", "feat/x", "main"]) === "other");
 ok("branchOp: branch -tf dead (t-value) → other", op("branch", ["-tf", "feat/x", "main"]) === "other");
-ok("branchOp: branch -fC copy-cluster → other (no exact force; #592 family)", op("branch", ["-fC", "feat/x", "main"]) === "other");
-ok("branchOp: branch -f -c src dst (force+copy) → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["-f", "-c", "main", "side"]); return r.op === "force" && r.branch == null; })());
-ok("branchOp: branch --force -C src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["--force", "-C", "main", "side"]); return r.op === "force" && r.branch == null; })());
+// #592: the copy family is branch-state tracked (the -fC cluster was the
+// #591-deferred #592 bypass — git's -C/-Cq/-cf/-fC all clobber a free dst rc
+// 0). -fC = force-copy → op force with branch = the DST (2nd positional).
+ok("branchOp: branch -fC force-copy cluster → force + dst branch", (() => { const r = classifyBranchOp("branch", ["-fC", "feat/x", "main"]); return r.op === "force" && r.branch === "main"; })());
+ok("branchOp: branch -f -c src dst (force+copy) → force + dst branch", (() => { const r = classifyBranchOp("branch", ["-f", "-c", "main", "side"]); return r.op === "force" && r.branch === "side"; })());
+ok("branchOp: branch --force -C src dst → force + dst branch", (() => { const r = classifyBranchOp("branch", ["--force", "-C", "main", "side"]); return r.op === "force" && r.branch === "side"; })());
+ok("branchOp: branch -Cq cluster → force + dst", (() => { const r = classifyBranchOp("branch", ["-Cq", "feat/x", "cpY"]); return r.op === "force" && r.branch === "cpY"; })());
+ok("branchOp: branch -C 1-pos (copy current) → force + dst = new name", (() => { const r = classifyBranchOp("branch", ["-C", "cpY"]); return r.op === "force" && r.branch === "cpY"; })());
+ok("branchOp: branch -c soft copy → other (new-ref-only create)", op("branch", ["-c", "feat/x", "cpX"]) === "other");
+ok("branchOp: branch -cq soft cluster → other", op("branch", ["-cq", "cpY"]) === "other");
+ok("branchOp: branch --copy soft → other", op("branch", ["--copy", "feat/x", "cpX"]) === "other");
+ok("branchOp: branch --cop soft abbrev → other", op("branch", ["--cop", "feat/x", "cpX"]) === "other");
+ok("branchOp: branch -mc mixed-mode → other (rc-129 no-op)", op("branch", ["-mc", "feat/x", "bad"]) === "other");
+ok("branchOp: branch -mD mixed-mode → other (rc-129 no-op)", op("branch", ["-mD", "feat/x", "bad"]) === "other");
 ok("branchOp: branch -ft (terminal t) → force + target", (() => { const r = classifyBranchOp("branch", ["-ft", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
 ok("branchOp: branch -fvt (terminal t) → force + target", (() => { const r = classifyBranchOp("branch", ["-fvt", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
 // #591 round-3: CREATE-mode NOARG letters are {f,v,q,i} (i does NOT force
@@ -230,11 +245,26 @@ ok("branchOp: branch -fi (i in cluster) → force + target", (() => { const r = 
 ok("branchOp: branch -if → force + target", (() => { const r = classifyBranchOp("branch", ["-if", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
 ok("branchOp: branch -ff repeatable-f → force + target", (() => { const r = classifyBranchOp("branch", ["-ff", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
 ok("branchOp: branch -i alone (plain create) → other", op("branch", ["-i", "feat/x", "main"]) === "other");
-// #591 round-3: long-option ABBREVIATIONS of copy/move (--cop/--mo/--mov)
-// mutate the DESTINATION under force — branch field must stay null.
-ok("branchOp: branch -f --cop src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["-f", "--cop", "main", "side"]); return r.op === "force" && r.branch == null; })());
-ok("branchOp: branch -f --mov src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["-f", "--mov", "main", "side"]); return r.op === "force" && r.branch == null; })());
-ok("branchOp: branch --force --cop src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["--force", "--cop", "main", "side"]); return r.op === "force" && r.branch == null; })());
+// #592 supersedes the #591 round-3 copy/move long-abbrev nulling: moves now
+// ride the rename arm (own-baseline-from → decideM3 reBaseline carve-out;
+// foreign → block) and force-copies classify force + dst branch — see the
+// mode-resolution comment above. `-f --mov main side` (≡ -M) is op rename
+// from=main to=side; `-f --cop main side` is a force-COPY (source stays) → op
+// force branch=side.
+ok("branchOp: branch -f --mov src dst → rename (force move, #592)", (() => { const r = classifyBranchOp("branch", ["-f", "--mov", "main", "side"]); return r.op === "rename" && r.from === "main" && r.to === "side"; })());
+ok("branchOp: branch -f --cop src dst → force + dst branch (#592)", (() => { const r = classifyBranchOp("branch", ["-f", "--cop", "main", "side"]); return r.op === "force" && r.branch === "side"; })());
+ok("branchOp: branch --force --cop src dst → force + dst branch", (() => { const r = classifyBranchOp("branch", ["--force", "--cop", "main", "side"]); return r.op === "force" && r.branch === "side"; })());
+// #592: rename/move cluster + long-form closure (mode letter anywhere in the
+// NOARG cluster; --move/--mo/--mov git-valid; --m ambiguous rc 129 excluded).
+ok("branchOp: branch -Mq cluster → rename", (() => { const r = classifyBranchOp("branch", ["-Mq", "feat/a", "feat/b"]); return r.op === "rename" && r.from === "feat/a" && r.to === "feat/b"; })());
+ok("branchOp: branch -mv cluster → rename", (() => { const r = classifyBranchOp("branch", ["-mv", "feat/a", "feat/b"]); return r.op === "rename" && r.from === "feat/a" && r.to === "feat/b"; })());
+ok("branchOp: branch -Mq 1-pos (rename current) → rename from null", (() => { const r = classifyBranchOp("branch", ["-Mq", "feat/b"]); return r.op === "rename" && r.from === null && r.to === "feat/b"; })());
+ok("branchOp: branch --move long → rename", (() => { const r = classifyBranchOp("branch", ["--move", "feat/a", "feat/b"]); return r.op === "rename" && r.from === "feat/a" && r.to === "feat/b"; })());
+ok("branchOp: branch --mov abbrev → rename", op("branch", ["--mov", "feat/a", "feat/b"]) === "rename");
+ok("branchOp: branch --mo abbrev → rename", op("branch", ["--mo", "feat/a", "feat/b"]) === "rename");
+ok("branchOp: branch --m ambiguous → other (rc 129)", op("branch", ["--m", "feat/a", "feat/b"]) === "other");
+ok("branchOp: branch --movefoo unknown → other (rc 129)", op("branch", ["--movefoo", "feat/a", "feat/b"]) === "other");
+ok("branchOp: branch --co ambiguous → other (rc 129)", op("branch", ["--co", "feat/a", "cpX"]) === "other");
 // #591 round-3 fold: a NON-TERMINAL t consumes the token REST as its --track
 // directive VALUE — git accepts exactly direct/inherit (rc-0 force-CREATEs, so
 // these are op force with the FIRST positional as target), while value letters

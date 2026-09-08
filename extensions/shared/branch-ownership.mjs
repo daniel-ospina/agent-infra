@@ -362,6 +362,60 @@ function _narrowForceCreate(x) {
   return /^[qvif]*f[qvif]*t?$/.test(tok.run);
 }
 
+/**
+ * #592: mode-family reader for a single-dash branch token — EXACT duplicate
+ * of classify-git.mjs's _branchMode (cross-pinned; a drift between the layers
+ * would set branchState in one and op "other" in the other — silently
+ * skipping M3). git's MODE letters are MUTUALLY EXCLUSIVE: d/D (delete),
+ * m/M (move/rename), c/C (copy) — any token whose value-aware run mixes ≥2
+ * families is a parse-conflict rc-129 no-op (probe-verified: -mc/-cm/-mD/-cD/
+ * -dm/-dc/-Dm/-Dc/-DC/-DM/-Md/-Cm ALL usage-error rc 129 and mutate NOTHING),
+ * so mixed runs never classify as any mode. The force letter f and the NOARG
+ * q/v/i/t compose (they are NOT mode families — `-df x` hard-deletes, `-cf`
+ * is a force-copy, #587/#591 probes). Case = FORCE within a family: uppercase
+ * M ≡ --move --force (`-M` clobbers an existing dst rc 0 where soft `-m`
+ * refuses rc 128), C ≡ --copy --force (probe-verified).
+ * @returns {{family: "delete"|"move"|"copy", force: boolean}|null}
+ */
+function _branchMode(x) {
+  const tok = _branchToken(x);
+  if (!tok) return null;
+  const run = tok.run;
+  const hasD = /[dD]/.test(run), hasM = /[mM]/.test(run), hasC = /[cC]/.test(run);
+  const families = (hasD ? 1 : 0) + (hasM ? 1 : 0) + (hasC ? 1 : 0);
+  if (families !== 1) return null; // no mode / mixed-mode rc-129 no-op
+  if (hasD) return { family: "delete", force: /D/.test(run) };
+  if (hasM) return { family: "move", force: /M/.test(run) };
+  return { family: "copy", force: /C/.test(run) };
+}
+
+/**
+ * #592: copy-family state — EXACT duplicate of classify-git.mjs's
+ * isBranchForceCopyArgs semantics (cross-pinned). copyMode = a token whose
+ * value-aware run is the COPY family (mixed-mode runs excluded above) OR the
+ * git-valid long form/abbreviation `--copy`/`--cop` (--co is ambiguous with
+ * --column/--contains/--color, rc 129 → excluded; --copfoo unknown-option rc
+ * 129 → excluded — git-valid spellings only, #591 --forc/--forcfoo parity).
+ * forceCopy = copyMode AND (an uppercase C in a copy run — git's -C is
+ * --copy --force — OR a force spelling anywhere in the args: exact
+ * --force/--forc or a u-guarded `f` in a value-aware run). Probe-verified:
+ * -C/-Cq/-cf/-fC/-f -c/--force --copy/--force --cop ALL clobber an existing
+ * FREE dst rc 0 (the shared-ref mutation M3 gates), while SOFT copy (-c/-cq/
+ * --copy, no force) refuses an existing dst rc 128 and only ever creates a
+ * NEW ref (git branch <name> parity — allow today).
+ * @returns {{copyMode: boolean, forceCopy: boolean}}
+ */
+function _branchCopyState(args) {
+  const mode = (x) => (/^-[A-Za-z]+$/.test(x) ? _branchMode(x) : null);
+  const copyMode = args.some((x) => x === "--copy" || x === "--cop") ||
+    args.some((x) => mode(x)?.family === "copy");
+  if (!copyMode) return { copyMode: false, forceCopy: false };
+  const cForce = args.some((x) => mode(x)?.family === "copy" && mode(x).force === true);
+  const fForce = args.some((x) => x === "--force" || x === "--forc" ||
+    (/^-[A-Za-z]+$/.test(x) && /f/.test((_branchToken(x)?.run) ?? "")));
+  return { copyMode: true, forceCopy: cForce || fForce };
+}
+
 export function classifyBranchOp(subcmd, args) {
   const a = args || [];
   if (subcmd === "checkout" || subcmd === "switch") {
@@ -398,16 +452,30 @@ export function classifyBranchOp(subcmd, args) {
     return { op: "other" }; // tags / notes / etc.
   }
   if (subcmd === "branch") {
-    if (a.includes("-m") || a.includes("-M")) {
+    // #592: rename/move arm widened from EXACT-token (-m/-M) to git's full
+    // spelling surface (the sibling-closure family: #587 delete clusters,
+    // #591 force-create clusters). git merges NOARG shorts into ONE token, so
+    // the move letter can sit anywhere in a cluster (`-Mq` ≡ `-M -q`, `-mv` ≡
+    // `-m -v` — both rename rc 0, probe-verified), and git accepts the
+    // documented long form plus its UNAMBIGUOUS prefix abbreviations
+    // (`--move`/`--mov`/`--mo`; --m is ambiguous with --merged rc 129). Mode
+    // letters WIN over -f (#591), so a move-composed cluster is a rename, not
+    // a force-create. 1-positional git semantics: `(-m|-M) [<old>] <new>` — a
+    // SINGLE positional renames the CURRENT branch (old omitted → from null →
+    // decideM3 substitutes currentBranch for the #265 own-baseline carve-out;
+    // two positionals are old new).
+    if (a.includes("-m") || a.includes("-M") ||
+        a.some((x) => (x === "--move" || x === "--mo" || x === "--mov") ||
+          (/^-[A-Za-z]+$/.test(x) && _branchMode(x)?.family === "move"))) {
       const pos = a.filter((x) => !x.startsWith("-"));
       return {
         op: "rename",
-        from: pos[0] ?? null,   // null → rename CURRENT branch
-        to: pos[1] ?? null,
+        from: pos.length > 1 ? (pos[0] ?? null) : null, // null → rename CURRENT branch
+        to: pos.length > 1 ? (pos[1] ?? null) : (pos[0] ?? null),
       };
     }
     // #591 (round-2/3 review fold-ins): classify git-branch invocations by
-    // git's OWN mode resolution, not token shape. Three forces interact:
+    // git's OWN mode resolution, not token shape. Two forces interact:
     //   (a) FORCE-CREATE detection is token-level — git merges NOARG shorts
     //       into one cluster (`-fq` ≡ `-f -q`); branch's CREATE-mode NOARG
     //       letters are {f,v,q,i} with f repeatable (`-ff`, `-fi`, `-if`,
@@ -421,17 +489,6 @@ export function classifyBranchOp(subcmd, args) {
     //       must stay op "other" so they flow to the #587/#543 verdict +
     //       ownership-allowance gate (a pid's post-ceremony local delete of
     //       its OWN merged branch stays allowed; op force would M3-block it).
-    //   (c) COPY/MOVE composed with force (`git branch -f -c src dst`, `-C`,
-    //       `--cop`/`--mo` long abbreviations) mutate the DESTINATION — the
-    //       SECOND positional — while the benign M3 carve-out (#591) keys on
-    //       branch == currentBranch. Returning a branch field there would let
-    //       the carve-out bless a foreign-ref overwrite (reviewer P1,
-    //       probe-verified rc 0: `-f -c main side` and `-f --cop main side`
-    //       move `side`). Omit the branch → decideM3's default block
-    //       (pre-#591 parity: the exact `-f`/`--force` in such compositions
-    //       always M3-blocked). Cluster copies/moves (-cf/-fC/-mf, no exact
-    //       force token) fall to "other" — byte-identical to pre-#591 (#592's
-    //       family).
     if (a.some((x) => /^--d/.test(x) ||
         // #591 (round-3 fold): value-aware flag run (see _branchToken) — a
         // tracking-directive VALUE's letters (`-ftdirect`'s "direct", a real
@@ -440,26 +497,44 @@ export function classifyBranchOp(subcmd, args) {
         (/^-[A-Za-z]+$/.test(x) && /[dD]/.test((_branchToken(x)?.run) ?? "")))) {
       return { op: "other" }; // delete mode → #587/#543 verdict + ownership path
     }
-    if (a.some(_narrowForceCreate)) {
-      const copyOrMove = a.some((x) =>
-        // #591 round 3: git accepts UNAMBIGUOUS long-prefix abbreviations —
-        // `--cop` → --copy (branch's only --cop* option; --co is ambiguous
-        // with --column/--contains/--color, rc 129), `--mo`/`--mov` → --move
-        // (--m is ambiguous with --merged, rc 129). A force-composed copy/move
-        // under ANY of these spellings mutates the DESTINATION, so the branch
-        // field must stay null (see (c)).
-        /^--cop/.test(x) || /^--mo/.test(x) ||
-        // #591 (round-3 fold): value-aware flag run — a tracking-directive
-        // VALUE's letters (`-ftdirect`'s "direct") never read as copy/move.
-        (/^-[A-Za-z]+$/.test(x) && /[cC]/.test((_branchToken(x)?.run) ?? "")) ||
-        (/^-[A-Za-z]+$/.test(x) && /[mM]/.test((_branchToken(x)?.run) ?? "")));
-      const pos = a.filter((x) => !x.startsWith("-"));
-      // (c): force+copy/move mutates the destination, not pos[0] → no branch
-      // field, so the #591 benign carve-out (branch === currentBranch) cannot
-      // fire and M3 default-blocks (pre-#591 parity for exact-force forms).
-      return { op: "force", branch: copyOrMove ? null : (pos[0] ?? null) };
+    // #592: COPY family (-c/-C/--copy/--cop) — added whole (pre-#592 the copy
+    // family was not branch-state tracked AT ALL: even the exact `-C` fell to
+    // op "other" → verdict allow → M3 never entered from the shared main
+    // checkout, while `git branch -C src dst` OVERWRITES an existing free dst
+    // rc 0 — the same shared-ref mutation M3 gates for `branch -f`). SOFT
+    // copy (lowercase c, no force letter) only ever CREATES a NEW ref — an
+    // existing dst is refused rc 128 — so it is benign like `git branch
+    // <name>` (op "other" → allow; no M3). FORCE copy (uppercase C = git's
+    // --copy --force, or any force composition — probe-verified -C/-Cq/-cf/
+    // -fC/-f -c/--force --copy all clobber a free dst rc 0) mutates the
+    // DESTINATION ref: classified op "force" with branch = the DST (the
+    // SECOND positional of `-C src dst`, the FIRST of 1-positional `-C dst`
+    // which copies the current branch) — dst == currentBranch is git-REFUSED
+    // rc 128 ("cannot force update the branch '…' used by worktree") and dst
+    // checked out in a sibling worktree likewise, so the #591 benign-force
+    // carve-out (branch === currentBranch) applies unchanged; foreign /
+    // non-checked-out overwrite targets hit the M3 default block.
+    const { copyMode, forceCopy } = _branchCopyState(a);
+    if (copyMode) {
+      if (forceCopy) {
+        const pos = a.filter((x) => !x.startsWith("-"));
+        return { op: "force", branch: (pos[1] ?? pos[0]) ?? null };
+      }
+      return { op: "other" }; // soft copy — new-ref-only create (git refuses existing dst)
     }
-    return { op: "other" }; // create/list/rename-cluster/delete-without-D — not the force-create M3 path
+    if (a.some(_narrowForceCreate)) {
+      // #592: copy/move compositions never reach here (the rename arm above
+      // and the copy arm above intercept every m/M/c/C spelling and the
+      // --move/--mo/--mov/--copy/--cop long forms), so a narrow-force token at
+      // this point is a PURE force-create whose mutation target is the FIRST
+      // positional (the #591 round-2 copyOrMove branch-nulling guard is
+      // superseded — the destination-mutation frame now lives in the copy arm,
+      // keyed on the real DST so the benign carve-out can never misfire on a
+      // current-branch SOURCE).
+      const pos = a.filter((x) => !x.startsWith("-"));
+      return { op: "force", branch: pos[0] ?? null };
+    }
+    return { op: "other" }; // create/list/soft-copy/delete/mixed-mode — not the force-create M3 path
   }
   return { op: "other" };
 }
@@ -564,7 +639,12 @@ export function decideM2({
  *   a force-create whose target IS the branch currently checked out is
  *   git-refused rc 128, so the benign own-branch ceremony passes through to
  *   git's refusal, but only in a NON-bare repo whose command has exactly one
- *   state mutation (isBare false + stateOpCount 1; see the carve-out)) →
+ *   state mutation (isBare false + stateOpCount 1; see the carve-out) / #592
+ *   force-COPY (`git branch -C src dst` and every force-copy spelling — -Cq,
+ *   -cf, -fC, -f -c, --force --copy: op "force" with branch = the DST) — same
+ *   refusal premise: a dst equal to the checkout's OWN current branch is
+ *   git-refused rc 128, so the same benign carve-out gates it, while foreign /
+ *   non-checked-out overwrite targets block) →
  *   block. The #376 return arm additionally requires repoKey === baseline.repoKey
  *   (the resolved repo is the ONE where the original baseline was recorded — a
  *   cd into a DIFFERENT agent-infra clone must not authorize a switch there).
@@ -586,6 +666,9 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     };
   }
   if (op === "rename") {
+    // #592: the rename arm now also receives cluster/long-form renames
+    // (-Mq/--move/--mov/--mo — identical decideM3 semantics as the exact
+    // -m/-M they are byte-identical to in git; see classifyBranchOp).
     const from = branchOp.from ?? currentBranch;
     if (baseline && from === baseline.branch && branchOp.to) {
       return { reBaseline: branchOp.to };
@@ -593,18 +676,20 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     return {
       block: true,
       reason: [
-        `⛔ git branch -m/-M blocked in the MAIN checkout.`,
+        `⛔ git branch -m/-M/-Mq/--move blocked in the MAIN checkout.`,
         `   Why: renaming a branch mutates branch state in the shared tree (#265).`,
         `   → Renaming the session's OWN baseline branch is allowed; this rename`,
         `     targets "${from ?? "(current)"}" which is not this session's baseline.`,
       ].join("\n"),
     };
   }
-  // #591 benign-force carve-out: force-create (`git branch -f <b> [<start>]`
-  // — and its merged-cluster / --forc spellings, all of which classify op
-  // "force" with branch = first positional) mutates the TARGET ref, so foreign
-  // / stale targets hit the default block below. But when the target IS the
-  // branch currently checked out in the effective repo (branchOp.branch ===
+  // #591 benign-force carve-out (extended to force-COPY by #592): force-create
+  // (`git branch -f <b> [<start>]` — and its merged-cluster / --forc spellings,
+  // all of which classify op "force" with branch = first positional) and
+  // force-copy (`git branch -C src dst` / every force-copy spelling — op
+  // "force" with branch = the DST) mutate the TARGET ref, so foreign / stale
+  // targets hit the default block below. But when the target IS the branch
+  // currently checked out in the effective repo (branchOp.branch ===
   // currentBranch — "the current checkout's own branch"), git itself REFUSES
   // the update: "cannot force update the branch '<b>' used by worktree at
   // '<path>'" (probe-verified rc 128 for `--force <own>` and `-fq <own>`
