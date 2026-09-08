@@ -915,6 +915,18 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
   expectBool("#591 fold: greedy \\u3b semicolon escape → hiddenStateSubst", ansiU3b.hiddenStateSubst === true, true);
   const ansiBigU = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'echo \\U00110000x; git branch -fq feat/other main'`);
   expectBool("#591 fold: \\U>0x10FFFF clamps without crashing → hiddenStateSubst", ansiBigU.hiddenStateSubst === true, true);
+  // Round-10 fold-in (cycle-6b reviewer P1): bash spells the control escape
+  // \\cX but zsh — the agent shell — spells \\C-X / \\Cx (uppercase). A real
+  // zsh `sh -c $'echo hi\\C-Jgit branch -fq victim HEAD'` splits the ANSI
+  // payload at \\C-J (= LF) and force-creates a FOREIGN ref rc 0 (probe-
+  // verified); the lowercase-only closure missed it and the carve-out wrongly
+  // allowed it.
+  const ansiCJup = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'echo hi\\C-Jgit branch -fq feat/other main'`);
+  expectBool("#591 fold: zsh \\C-J control escape → hiddenStateSubst", ansiCJup.hiddenStateSubst === true, true);
+  const ansiCJupDeny = sharedDecideM3({ branchOp: ansiCJup.branchState ? sharedClassifyBranchOp(ansiCJup.stateVerb, ansiCJup.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: ansiCJup.stateOpCount ?? 1, hiddenStateSubst: ansiCJup.hiddenStateSubst === true });
+  expectBool("#591 fold: zsh \\C-J launder → M3 default block", ansiCJupDeny?.block === true, true);
+  const ansiCglued = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'echo hi\\CJgit branch -fq feat/other main'`);
+  expectBool("#591 fold: zsh \\CJ glued form → hiddenStateSubst", ansiCglued.hiddenStateSubst === true, true);
   // Benign-eligibility: NON-mutating payloads (rev-parse / branch --show-
   // current) do NOT trip the bound, so the own-branch ceremony with a
   // substitution start-point keeps its carve-out.

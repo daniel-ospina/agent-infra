@@ -2328,8 +2328,9 @@ export function isBranchForceCreateTokenNarrow(a) {
  */
 /**
  * #591 (round-7/8): ANSI-C $'…' escape translation — \n \t \r \a \b \f \v \\ \'
- * \" \$ \e/\E \cX (char & 0x1f: \cJ = LF) \xHH \uHHHH (1-4 hex digits,
- * greedy — \uA = LF, cycle-5 P1) \UHHHHHHHH (1-8 digits) and octal. Code points
+ * \" \$ \e/\E \cX and zsh's \C-X/\Cx (char & 0x1f: \cJ/\C-J = LF) \xHH
+ * \uHHHH (1-4 hex digits,
+ * greedy — \uA = LF, cycle-5 P1) \UHHHHHHHH (1-8 digits, greedy) and octal. Code points
  * above 0x10FFFF clamp to U+FFFD (cycle-5 P2) rather than throwing.
  * Applied to ANSI-C payloads BEFORE scanning: an untranslated multiline payload
  * (`sh -c $'echo a\ngit branch -fq victim main'`) tokenizes as ONE glued word
@@ -2340,7 +2341,7 @@ export function isBranchForceCreateTokenNarrow(a) {
  */
 function _ansiTranslate(s) {
   const ansiMap = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"', $: "$", a: "\u0007", b: "\b", f: "\f", v: "\v", e: "\u001b", E: "\u001b" };
-  return s.replace(/\\(c[A-Za-z]|x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|[eE\\'"$ntrabvf])/g, (mm, e) => {
+  return s.replace(/\\((?:c|C-?)[A-Za-z]|x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|[eE\\'"$ntrabvf])/g, (mm, e) => {
     if (e[0] === "x") return String.fromCharCode(parseInt(e.slice(1), 16));
     if (e[0] === "u" || e[0] === "U") {
       // bash/zsh decode \u with 1-4 hex digits and \U with 1-8, greedily
@@ -2350,7 +2351,14 @@ function _ansiTranslate(s) {
       const cp = parseInt(e.slice(1), 16);
       return cp > 0x10FFFF ? "\uFFFD" : String.fromCodePoint(cp);
     }
-    if (e[0] === "c") return String.fromCharCode((e.charCodeAt(1) ?? 0) & 0x1f);
+    if (e[0] === "c" || e[0] === "C") {
+      // bash spells \cX, zsh (the agent shell) spells \C-X / \Cx — both decode
+      // to char & 0x1f (\C-J = LF, re-splits the payload — round-9 cycle-6b
+      // reviewer P1, probe-verified rc 0 in real zsh). Optional hyphen: "C-X"
+      // -> e[2], "CJ"/"cJ" -> e[1].
+      const ch = e.length > 2 ? e[2] : e[1];
+      return String.fromCharCode(((ch ?? "").charCodeAt(0) ?? 0) & 0x1f);
+    }
     if (/^[0-7]+$/.test(e)) return String.fromCharCode(parseInt(e, 8));
     return ansiMap[e] ?? mm;
   });
