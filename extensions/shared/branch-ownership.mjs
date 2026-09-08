@@ -430,11 +430,17 @@ function _branchCopyState(args) {
  * `--sort` — --so is minimal: --show-current diverges at --sh, --s is
  * ambiguous with --show-current rc 129; `--form`/`--forma`/`--format` — --fo/
  * --for are ambiguous with --force rc 129). Other branch value-takers never
- * land a value in the branch-name slot of a MUTATING invocation: in copy/move/
- * delete arms --points-at/--contains/-u/--set-upstream-to error rc 129 and
- * --merged/--no-merged/--column/--color/--abbrev rc 128 (probe-verified), and
- * under `-f` the filter options FLIP git to rc-0 no-mutation LIST mode;
- * attached `--sort=x` never consumes the next argv. A `--` terminator ends
+ * land a value in the branch-name slot of an rc-0 MUTATING invocation: the
+ * list-filter options --points-at/--contains/--no-contains/-u/--set-upstream-to
+ * and --merged/--no-merged error rc 128/129 (usage) BEFORE mutating in
+ * copy/move/delete arms (probe-verified), while --column/--color/--abbrev/--track
+ * are OPTARG options that only ever take an ATTACHED `=` value — a following
+ * word is a positional in git and here alike (`-C --color always main t2` is
+ * "too many branches" rc 128); under `-f` the LIST-printing filters
+ * (--points-at/--contains/--merged/...) flip git to rc-0 no-mutation LIST
+ * mode, while --sort/--format are ACCEPTED and still force-create rc 0 (hence
+ * the swallow modeled above). Attached `--sort=x` never consumes the next
+ * argv. A `--` terminator ends
  * flag parsing (everything after is a positional).
  * @param {string[]} args
  * @returns {string[]} the true positional (branch-name) argv slots
