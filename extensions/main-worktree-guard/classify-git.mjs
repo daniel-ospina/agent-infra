@@ -1269,7 +1269,7 @@ export function allGitInvocations(command, seedVars = {}) {
  * @param {string[]} args
  * @returns {boolean}
  */
-function _branchInvMutatesBranchState(args) {
+export function _branchInvMutatesBranchState(args) {
   if (args.includes("-m") || args.includes("-M") ||
       args.some((x) => (x === "--move" || x === "--mo" || x === "--mov") ||
         (/^-[A-Za-z]+$/.test(x) && _branchMode(x)?.family === "move"))) {
@@ -1297,9 +1297,13 @@ function _branchInvMutatesBranchState(args) {
  * - stateVerb/stateArgs: the FIRST state-MUTATING invocation's verb/args (M3
  *   must classify the invocation that changes branch state, not invocations[0]
  *   — P1-A; #596: selection skips benign branch leads, see classifyGitCommand-
- *   Detailed). stateOpCount: TOTAL branch-state invocations in the command — the
- *   #591 benign-force carve-out requires exactly 1 (a later compound segment's
- *   foreign force-create is invisible to the first-invocation M3 gate).
+ *   Detailed). stateVerbOccurrence: the 0-based ordinal of that invocation
+ *   among same-verb invocations (repo-hint attribution for later-segment
+ *   mutations). stateOpCount: TOTAL branch-state invocations in the command —
+ *   the #591 benign-force carve-out requires exactly 1 (the gate classifies
+ *   only the FIRST mutating invocation; a second own-branch force segment
+ *   must not grant the carve-out a foreign later segment could launder
+ *   through).
  * - force-push hygiene: `--force-with-lease` / `--force-if-includes` are NOT
  *   force (the legacy `--force\b` regex false-matches them); a force-with-lease
  *   push classifies `block:push` (ownership path), not `block:force-push`.
@@ -1653,6 +1657,20 @@ export function classifyGitCommandDetailed(command) {
     // the invocation that changes branch state, not invocations[0] (a compound
     // `git pull && git checkout main` would otherwise classify "pull" and skip
     // the gate, or false-block the sanctioned create-new carve-out).
+    // #596 (round-2 reviewer): stateVerbOccurrence — the 0-based ordinal of
+    // stateInv among the command's invocations with the SAME verb. index.ts
+    // resolves the effective repo with preferVerb = stateVerb, which picks the
+    // FIRST same-verb invocation; when the mutation is a LATER segment the
+    // repo layer must attribute hints (-C/--git-dir/cd) from THAT invocation,
+    // not the benign lead (a `-C <wt>` lead would wrongly worktree-exempt a
+    // MAIN force-create, and a main lead would wrongly main-gate a `-C <wt>`
+    // mutation — probe-verified both). The ordinal is 0 whenever stateInv is
+    // the first same-verb invocation (every pre-#596 shape).
+    out.stateVerbOccurrence = 0;
+    for (const v of stateInvs) {
+      if (v === stateInv) break;
+      if (v.verb === stateInv.verb) out.stateVerbOccurrence++;
+    }
     out.stateVerb = verb;
     out.stateArgs = args;
   }
@@ -1660,10 +1678,10 @@ export function classifyGitCommandDetailed(command) {
   // invocation in the command. The M3 benign-force carve-out (a force-create
   // whose target is the checkout's OWN branch) must only fire for a command
   // whose sole branch-state mutation is that own-branch attempt — in a `;`
-  // compound (`git branch -f own ; git branch -fq foreign x`) the later
-  // segments are invisible to the per-FIRST-state-invocation M3 gate, and the
-  // benign carve-out on segment 1 would otherwise let segment 2's FOREIGN
-  // force-create execute (pre-#591 the exact-force segment 1 blocked the whole
+  // compound (`git branch -f own ; git branch -fq foreign x`) the carve-out
+  // on segment 1 would otherwise let segment 2's FOREIGN force-create execute
+  // even though the M3 gate classifies only ONE invocation (the first
+  // mutating one — #596; pre-#591 the exact-force segment 1 blocked the whole
   // command). stateOpCount ≥ 2 → decideM3 refuses the carve-out → default
   // block restores pre-#591 compound parity.
   out.stateOpCount = invocations.filter((v) =>
@@ -2515,10 +2533,14 @@ function _branchPositionals(args) {
  *   - escaped backticks (`\``) signal NESTED backtick content — unparseable →
  *     fail closed.
  * Each payload is re-tokenized and scanned for a MUTATING branch invocation:
- * checkout/switch/symbolic-ref/update-ref always, git branch only with a
- * rename/delete/force spelling — non-mutating branch READS (`--show-current`,
- * `--list`, rev-parse payloads) stay benign-eligible so `git branch -fq own
- * $(git rev-parse HEAD)` isn't a false block. index.ts ORs this with the
+ * checkout/switch/symbolic-ref/update-ref always, git branch via the
+ * arm-exact _branchInvMutatesBranchState mirror (rename incl. #592 clusters /
+ * long forms, delete, force-create, force-copy — #596 round-2 consolidation;
+ * the scan previously recognized only exact -m/-M + delete + narrow-force, so
+ * a hidden `-Mq`/`--move`/`-Cq` payload laundered the benign-force carve-out)
+ * — non-mutating branch READS (`--show-current`, `--list`, rev-parse
+ * payloads) stay benign-eligible so `git branch -fq own $(git rev-parse
+ * HEAD)` isn't a false block. index.ts ORs this with the
  * hub-gate's _unverifiableGitContent (piped-stdin shells, process
  * substitution, heredocs, alias/function definitions, spawner `$VAR`s — the
  * round-6→19 hardened shape set) before refusing the carve-out (decideM3's
@@ -2568,10 +2590,12 @@ export function _hasHiddenStateSubst(raw) {
   const source = String(raw ?? "");
   const mutates = (inv) => {
     if (["checkout", "switch", "symbolic-ref", "update-ref"].includes(inv.verb)) return true;
-    return inv.verb === "branch" && (
-      inv.args.includes("-m") || inv.args.includes("-M") ||
-      branchDeleteNames("branch", inv.args) !== null ||
-      inv.args.some(isBranchForceCreateTokenNarrow));
+    // #596 (round-2 reviewer F1): consolidate on the arm-exact mirror — the
+    // stale inline copy only knew exact -m/-M + delete + narrow-force, so the
+    // #592 rename-cluster/long-form and force-COPY spellings (-Mq/--move/
+    // -Cq/…) were invisible here and a hidden payload of that surface
+    // laundered the #591 benign-force carve-out (probe-verified rc 0).
+    return inv.verb === "branch" && _branchInvMutatesBranchState(inv.args);
   };
   // Quote-aware payload collector: `$(…)`/`<(…)`/`>(…)` spans close only on a
   // paren OUTSIDE quotes/escapes; ANSI-C `$'…'` literals; backticks pair to

@@ -1106,7 +1106,11 @@ export default function (pi: ExtensionAPI) {
       // P2 (cycle 3): resolve the effective repo against the STATE-mutating
       // invocation — `git -C <wt> status && git checkout main` must gate on the
       // main checkout, not the worktree the first invocation pointed at.
-      const eff = branchOwnership.resolveEffectiveRepo(command, process.cwd(), det.stateVerb ?? det.verb);
+      // #596 (round-2): stateVerbOccurrence makes the resolution follow the
+      // MUTATING branch-state invocation even when it is a LATER compound
+      // segment — a benign first segment's hints (-C/--git-dir) must not
+      // worktree-exempt a main mutation (or main-gate a worktree-scoped one).
+      const eff = branchOwnership.resolveEffectiveRepo(command, process.cwd(), det.stateVerb ?? det.verb, det.stateVerbOccurrence ?? 0);
       const allowActive = _isAllowMainEdits();
 
       // M3: branch-state gate — applies in ANY main checkout (resolved,

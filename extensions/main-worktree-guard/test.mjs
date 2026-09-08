@@ -616,7 +616,9 @@ try {
   expectBool("#376 fixture: plain repo is NOT agent-infra", isAgentInfraRepo(nonInfraR) === false, true);
   const adapter = (cmd, r, infra) => {
     const d = classifyGitCommandDetailed(cmd);
-    const eff = sharedResolveEffectiveRepo(cmd, r, d.stateVerb ?? d.verb);
+    // mirrors index.ts's exact repo resolution (preferVerb = stateVerb + the
+    // #596 stateVerbOccurrence so a later-segment mutation's -C hints win).
+    const eff = sharedResolveEffectiveRepo(cmd, r, d.stateVerb ?? d.verb, d.stateVerbOccurrence ?? 0);
     if (!eff) return { resolveFailed: true };
     const op = d.branchState ? sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs) : { op: "other" };
     // mirrors index.ts: baseline of a ceremony session whose original was main
@@ -1152,13 +1154,13 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
 // (#587). #596 fixes the SELECTION: the state arm runs on the first
 // state-MUTATING invocation wherever it sits; stateVerb/stateArgs point at it
 // so index.ts's classifyBranchOp(stateVerb, stateArgs) classifies the mutation.
-dexpect("#596: benign-lead ';' rename → branchState + stateInv = the -Mq", `git branch side ; git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX", deleteTargets: [], stateOpCount: 2 });
-dexpect("#596: benign-lead '&&' rename → same mutating selection", `git branch side && git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX", stateOpCount: 2 });
-dexpect("#596: soft-copy-lead rename → mutating invocation selected", `git branch -c a b ; git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX" });
-dexpect("#596: list-lead rename → mutating invocation selected", `git branch -a ; git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX" });
-dexpect("#596: benign-lead later force-create → branchState + target", `git branch side && git branch -fq feat/other main`, { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "feat/other", "main"], newBranch: "feat/other", deleteTargets: [] });
-dexpect("#596: benign-lead later checkout → M3 gates the checkout (P1-A parity)", `git branch side ; git checkout main`, { branchState: true, stateVerb: "checkout", stateArgs: ["main"] });
-dexpect("#596: all-benign compound → still NOT branchState", `git branch side && git branch feat/other`, { branchState: false, stateOpCount: 2 });
+dexpect("#596: benign-lead ';' rename → branchState + stateInv = the -Mq", `git branch side ; git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX", deleteTargets: [], stateOpCount: 2, stateVerbOccurrence: 1 });
+dexpect("#596: benign-lead '&&' rename → same mutating selection", `git branch side && git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX", stateOpCount: 2, stateVerbOccurrence: 1 });
+dexpect("#596: soft-copy-lead rename → mutating invocation selected", `git branch -c a b ; git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX", stateVerbOccurrence: 1 });
+dexpect("#596: list-lead rename → mutating invocation selected", `git branch -a ; git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX", stateVerbOccurrence: 1 });
+dexpect("#596: benign-lead later force-create → branchState + target", `git branch side && git branch -fq feat/other main`, { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "feat/other", "main"], newBranch: "feat/other", deleteTargets: [], stateVerbOccurrence: 1 });
+dexpect("#596: benign-lead later checkout → M3 gates the checkout (P1-A parity)", `git branch side ; git checkout main`, { branchState: true, stateVerb: "checkout", stateArgs: ["main"], stateVerbOccurrence: 0 });
+dexpect("#596: all-benign compound → still NOT branchState", `git branch side && git branch feat/other`, { branchState: false, stateOpCount: 2, stateVerbOccurrence: 0 });
 // Delete-in-later-segment: the delete arm now runs on the MUTATING invocation
 // (deleteTargets captured from the later segment) while the verdict/ownership
 // path is untouched — the block:branch-force-delete verdict comes from the
@@ -1166,9 +1168,9 @@ dexpect("#596: all-benign compound → still NOT branchState", `git branch side 
 dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targets", `git branch side && git branch -Dq stale`, { verdict: "block:branch-force-delete", branchState: true, stateArgs: ["-Dq", "stale"], newBranch: "stale", deleteTargets: ["stale"] });
 // M3-outcome adapter (mirror of index.ts: branchState → classifyBranchOp →
 // decideM3 with the classifier's stateOpCount — the #591 bounds stay enforced
-// for the LATER segment): a benign lead must NOT change the M3 decision vs the
-// single-invocation spelling (own-baseline rename → reBaseline carve-out;
-// foreign rename / force-create / force-copy → default block).
+// for the LATER segment): the M3 decision for a mutation with a benign lead is
+// the single-invocation decision EXCEPT where a bound (stateOpCount) exists to
+// refuse a carve-out the compound would otherwise launder (fcOwn below).
 {
   const idxM3 = (cmd, currentBranch) => {
     const d = classifyGitCommandDetailed(cmd);
@@ -1214,6 +1216,27 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
   expectBool("#596: later-segment delete of pid-owned branch → allowed (ceremony)", delOwn === true, true);
   const delFor = sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: delD.deleteTargets, ownedBranches: [] });
   expectBool("#596: later-segment delete of FOREIGN branch → not allowed (verdict block stands)", delFor === false, true);
+  // Round-2 (reviewer F1): _hasHiddenStateSubst's hidden-payload scan must
+  // recognize the SAME mutating-branch surface as the arm (it was stale for
+  // the #592 rename-cluster/long-form + force-COPY families — exact -m/-M
+  // only), else a hidden `sh -c $'git branch -Mq …'` payload collapses
+  // stateOpCount to 1 and launders the #591 benign-force carve-out (real git
+  // renames/copies the foreign ref rc 0 — probe-verified). Each now flags
+  // hiddenStateSubst → decideM3 refuses the carve-out → default block.
+  const hiddenRen = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'git branch -Mq feat/x rnX'`);
+  expectBool("#596 r2: hidden -Mq rename payload → hiddenStateSubst", hiddenRen.hiddenStateSubst === true && hiddenRen.stateOpCount === 1, true);
+  const hiddenRenDeny = sharedDecideM3({ branchOp: hiddenRen.branchState ? sharedClassifyBranchOp(hiddenRen.stateVerb, hiddenRen.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: hiddenRen.stateOpCount ?? 1, hiddenStateSubst: hiddenRen.hiddenStateSubst === true });
+  expectBool("#596 r2: hidden -Mq launder → M3 block (carve-out refused)", hiddenRenDeny?.block === true, true);
+  const hiddenLong = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'git branch --move feat/x rnX'`);
+  expectBool("#596 r2: hidden --move payload → hiddenStateSubst", hiddenLong.hiddenStateSubst === true, true);
+  const hiddenCpy = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'git branch -Cq feat/x feat/cpy'`);
+  expectBool("#596 r2: hidden -Cq force-copy payload → hiddenStateSubst", hiddenCpy.hiddenStateSubst === true, true);
+  const hiddenCpyDeny = sharedDecideM3({ branchOp: hiddenCpy.branchState ? sharedClassifyBranchOp(hiddenCpy.stateVerb, hiddenCpy.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: hiddenCpy.stateOpCount ?? 1, hiddenStateSubst: hiddenCpy.hiddenStateSubst === true });
+  expectBool("#596 r2: hidden -Cq launder → M3 block (carve-out refused)", hiddenCpyDeny?.block === true, true);
+  // benign READ payloads stay benign-eligible under the widened scan
+  // (non-mutating branch reads must not trip the carve-out bound).
+  const hiddenRead = classifyGitCommandDetailed(`git branch -fq feat/1 main $(git branch --show-current)`);
+  expectBool("#596 r2: benign branch READ payload stays benign (no hidden mutation)", hiddenRead.hiddenStateSubst === false, true);
 }
 dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
 // ── #587 regression: merged NOARG flag-clusters ─────────────────────────────

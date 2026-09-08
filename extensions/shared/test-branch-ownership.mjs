@@ -142,6 +142,29 @@ ok("resolveEffectiveRepo: multi -C chain", (() => {
   return r && r.effectiveCwd === MAIN;
 })(), "-C chain");
 
+// #596 (round-2): repo-hint attribution for LATER-segment mutations — the
+// preferVerbOccurrence ordinal selects the MUTATING branch-state invocation's
+// OWN hints when a benign same-verb lead precedes it (the classifier's
+// stateVerbOccurrence). A `-C <wt>` LEAD must not worktree-exempt a MAIN
+// mutation (would skip the M3 gate on a shared-checkout force-create/rename),
+// and a main lead must not main-gate a `-C <wt>`-scoped mutation (a false
+// block on the worktree exemption the single-invocation form enjoys).
+ok("resolveEffectiveRepo: -C wt lead + main mutation → occurrence 1 resolves MAIN", (() => {
+  const r = resolveEffectiveRepo(`git -C "${WT}" branch side ; git branch -fq feat/other main`, MAIN, "branch", 1);
+  return r && r.isWorktree === false && r.currentBranch === "main";
+})(), "wt-lead/mutation-main");
+ok("resolveEffectiveRepo: main lead + -C wt mutation → occurrence 1 resolves the WORKTREE", (() => {
+  const r = resolveEffectiveRepo(`git branch side ; git -C "${WT}" branch -fq feat/other main`, MAIN, "branch", 1);
+  return r && r.isWorktree === true && r.currentBranch === "feat/wt";
+})(), "main-lead/mutation-wt");
+ok("resolveEffectiveRepo: occurrence 0 = the FIRST same-verb invocation (pre-#596 shape)", (() => {
+  const r = resolveEffectiveRepo(`git -C "${WT}" branch side ; git branch -fq feat/other main`, MAIN, "branch", 0);
+  return r && r.isWorktree === true; // the lead's -C wt — unchanged default
+})(), "occ-0 first");
+const invOcc = extractGitInvocation(`git -C "${WT}" branch side ; git branch -fq feat/other main`, "branch", 1);
+ok("extract: occurrence 1 same-verb → the LATER invocation's hints (no -C)", invOcc && invOcc.cHints.length === 0 && (invOcc.rest[1] ?? "") === "-fq", String(invOcc?.cHints));
+ok("extract: occurrence beyond matches → null", extractGitInvocation(`git branch side`, "branch", 1) === null);
+
 // non-git command → null
 ok("resolveEffectiveRepo: non-git → null", resolveEffectiveRepo("npm test", MAIN) === null);
 // #591 round-2: bare repos expose isBare so decideM3's benign-force carve-out

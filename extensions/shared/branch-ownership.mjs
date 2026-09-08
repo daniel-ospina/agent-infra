@@ -165,8 +165,17 @@ export function tokenize(command) {
  * - gitDirHint: from --git-dir[=]<path> or a leading GIT_DIR=<path> env prefix.
  * - cHints: every `-C <path>` in order (multi -C chains resolve sequentially).
  * - verb/rest: tokens from the first non-flag token after `git` onward.
+ * @param {string} command
+ * @param {string|null} [preferVerb]
+ * @param {number} [preferVerbOccurrence] 0-based ordinal of the same-verb
+ *   invocation to return (#596 round-2): when preferVerb matches multiple
+ *   invocations, the caller may select a LATER one — the M3-relevant
+ *   branch-state invocation can be a later compound segment (benign leads are
+ *   skipped by the classifier) and repo hints (-C/--git-dir/cd) must be
+ *   attributed to THAT invocation, not the first same-verb one. Default 0 = the
+ *   first match (every pre-#596 caller).
  */
-export function extractGitInvocation(command, preferVerb = null) {
+export function extractGitInvocation(command, preferVerb = null, preferVerbOccurrence = 0) {
   const tokens = tokenize(command);
   let cdChain = [];
   let i = 0;
@@ -174,11 +183,15 @@ export function extractGitInvocation(command, preferVerb = null) {
   // in bash). When preferVerb is set, we scan ALL invocations and return the
   // one whose verb matches (review P2, cycle 3: `git -C <wt> status && git
   // checkout main` — the branch-state gate must resolve the repo for the
-  // CHECKOUT, whose -C/hints differ from the first invocation).
+  // CHECKOUT, whose -C/hints differ from the first invocation). #596
+  // round-2: the preferVerbOccurrence-th same-verb match wins (see the
+  // signature JSDoc); earlier same-verb matches are skipped but their cd
+  // effects still accumulate (bash cd persists).
   // #337: also collect same-command `VAR=value` assignments so a `cd $WT`
   // (or `cd "${WT}"`) can be resolved against them by resolveEffectiveRepo.
   let envGitDir = null;
   const vars = {};
+  let verbMatches = 0;
   while (i < tokens.length) {
     const t = tokens[i];
     if (/^GIT_DIR=(.*)$/.test(t)) { envGitDir = t.slice("GIT_DIR=".length).replace(/^["']|["']$/g, ""); i++; continue; }
@@ -209,6 +222,7 @@ export function extractGitInvocation(command, preferVerb = null) {
     }
     const verb = tokens[j] ?? null;
     if (preferVerb && verb !== preferVerb) { i = j; continue; } // not the target — keep scanning
+    if (preferVerb && verbMatches < preferVerbOccurrence) { verbMatches++; i = j; continue; } // earlier same-verb match — skip (cd effects already accumulated)
     return { cdChain: [...cdChain], gitDirHint, cHints, verb, rest: tokens.slice(j), vars };
   }
   return null;
@@ -229,9 +243,15 @@ export function extractGitInvocation(command, preferVerb = null) {
  * Returns null when git fails (caller applies fail-closed policy).
  * @param {string} command
  * @param {string} sessionCwd
+ * @param {string|null} [preferVerb]
+ * @param {number} [preferVerbOccurrence] 0-based ordinal among same-verb
+ *   invocations (#596 round-2: when the M3-relevant branch-state invocation is
+ *   a LATER compound segment — benign leads are skipped — the repo hints must
+ *   come from THAT invocation, not the first same-verb one; a `-C <wt>` lead
+ *   would wrongly worktree-exempt a main mutation and vice versa).
  */
-export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null) {
-  const inv = extractGitInvocation(command, preferVerb);
+export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null, preferVerbOccurrence = 0) {
+  const inv = extractGitInvocation(command, preferVerb, preferVerbOccurrence);
   if (!inv) return null;
   let cwd = sessionCwd ? resolve(sessionCwd) : process.cwd();
   for (const cd of inv.cdChain) {
