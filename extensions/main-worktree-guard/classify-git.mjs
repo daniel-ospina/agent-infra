@@ -1465,7 +1465,7 @@ export function classifyGitCommandDetailed(command) {
       if (args.includes("-m") || args.includes("-M") ||
           args.some((x) => (x === "--move" || x === "--mo" || x === "--mov") ||
             (/^-[A-Za-z]+$/.test(x) && _branchMode(x)?.family === "move"))) {
-        const pos = args.filter((x) => !x.startsWith("-"));
+        const pos = _branchPositionals(args);
         out.branchState = true;
         out.renameFrom = pos.length > 1 ? (pos[0] ?? null) : null;
         out.renameTo = pos.length > 1 ? (pos[1] ?? null) : (pos[0] ?? null);
@@ -1509,7 +1509,19 @@ export function classifyGitCommandDetailed(command) {
           out.deleteTargets = delNames;
           out.newBranch = delNames[0] ?? null;
         } else {
-          out.newBranch = args.filter((x) => !x.startsWith("-"))[0] ?? null;
+          // #592 (round-2 fold): newBranch = the real mutation target — for a
+          // pure force-create the FIRST positional; for a force-composed COPY
+          // (an exact -f/--force beside a copy spelling — `-f -c main side`)
+          // the narrow-force token fired this arm before the force-copy arm,
+          // so capture the DESTINATION (2nd positional) to stay consistent
+          // with classifyBranchOp's op:force branch=dst (M3 keys on that, but
+          // the field must not advertise the SOURCE). Value-aware extraction
+          // (--sort/--format swallow the next argv) in both cases.
+          const pos = _branchPositionals(args);
+          const cp = _branchCopyState(args);
+          out.newBranch = cp.copyMode
+            ? ((pos[1] ?? pos[0]) ?? null)
+            : (pos[0] ?? null);
         }
         // #587 (review fold-in, TOKEN-level hard-delete verdict): the legacy
         // patterns scan the raw/skimmed STRING, where a `[^;&|]*` run boundary
@@ -1556,7 +1568,7 @@ export function classifyGitCommandDetailed(command) {
               branchDeleteNames("branch", v.args) !== null)) {
           out.verdict = "allow";
         }
-      } else if (isBranchForceCopyArgs(args)) {
+      } else if (_branchCopyState(args).forceCopy) {
         // #592: FORCE-COPY family (-C/-Cq/-cf/-fC/-f -c/--force --copy) — the
         // copy family was not branch-state tracked AT ALL before #592 (even
         // the exact `-C` fell through to verdict allow + branchState false
@@ -1573,7 +1585,7 @@ export function classifyGitCommandDetailed(command) {
         // branchState (allow); mixed-mode single tokens (-mc/-mD/-Dc — rc-129
         // no-ops) fall through the same way.
         out.branchState = true;
-        const pos = args.filter((x) => !x.startsWith("-"));
+        const pos = _branchPositionals(args);
         out.newBranch = pos.length > 1 ? (pos[1] ?? pos[0]) : (pos[0] ?? null);
       }
     }
@@ -2355,28 +2367,57 @@ function _branchMode(x) {
 }
 
 /**
- * #592: copy-family force trigger — EXACT duplicate of
- * branch-ownership.mjs's _branchCopyState (cross-pinned). See there for the
- * git semantics: SOFT copy (-c/-cq/--copy, no force) only creates a NEW ref
- * (existing dst refused rc 128) → allow like `git branch <name>` — NOT a
- * branch-state trigger; FORCE copy (uppercase C in a copy run = git's
- * --copy --force, or any force spelling — -Cq/-cf/-fC/-f -c/--force --copy,
- * all probe-verified to clobber a free dst rc 0) mutates the DESTINATION ref
- * → branchState true so M3 gates it (dst == currentBranch passes through to
- * git's rc-128 refusal via the #591 carve-out; foreign/non-checked-out
- * overwrite targets block).
+ * #592: copy-family state — EXACT duplicate of branch-ownership.mjs's
+ * _branchCopyState (cross-pinned). See there for the git semantics: SOFT copy
+ * (-c/-cq/--copy, no force) only creates a NEW ref (existing dst refused rc
+ * 128) → allow like `git branch <name>` — NOT a branch-state trigger; FORCE
+ * copy (uppercase C in a copy run = git's --copy --force, or any force
+ * spelling — -Cq/-cf/-fC/-f -c/--force --copy, all probe-verified to clobber a
+ * free dst rc 0) mutates the DESTINATION ref → branchState true so M3 gates it
+ * (dst == currentBranch passes through to git's rc-128 refusal via the #591
+ * carve-out; foreign/non-checked-out overwrite targets block).
  * @param {string[]} args
- * @returns {boolean} true when the invocation is a FORCE copy
+ * @returns {{copyMode: boolean, forceCopy: boolean}}
  */
-function isBranchForceCopyArgs(args) {
+function _branchCopyState(args) {
   const mode = (x) => (/^-[A-Za-z]+$/.test(x) ? _branchMode(x) : null);
   const copyMode = args.some((x) => x === "--copy" || x === "--cop") ||
     args.some((x) => mode(x)?.family === "copy");
-  if (!copyMode) return false;
+  if (!copyMode) return { copyMode: false, forceCopy: false };
   const cForce = args.some((x) => mode(x)?.family === "copy" && mode(x).force === true);
   const fForce = args.some((x) => x === "--force" || x === "--forc" ||
     (/^-[A-Za-z]+$/.test(x) && /f/.test((_branchToken(x)?.run) ?? "")));
-  return cForce || fForce;
+  return { copyMode: true, forceCopy: cForce || fForce };
+}
+
+/**
+ * #592 (round-2 review fold-in): branch positional extraction — EXACT
+ * duplicate of branch-ownership.mjs's _branchPositionals (cross-pinned). See
+ * there for the git semantics: --sort/--format and their unambiguous prefixes
+ * --sor/--form consume the SEPARATE next argv as their REQUIRED value even in
+ * copy/move/force-create mode (probe-verified rc 0 + real ref mutation), so
+ * the naive non-dash filter would count that value as a branch-name
+ * positional and corrupt the M3 dst/from/to extraction. Options git REJECTS in
+ * mutating modes (--points-at/--contains/--merged/--no-merged/-u/--set-
+ * upstream-to — rc 128/129, no mutation) never consume a value into the
+ * branch-name slot; attached `--sort=x` never consumes the next argv; `--`
+ * terminates flag parsing.
+ * @param {string[]} args
+ * @returns {string[]} the true positional (branch-name) argv slots
+ */
+function _branchPositionals(args) {
+  const pos = [];
+  let flagsDone = false;
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i];
+    if (!flagsDone && x === "--") { flagsDone = true; continue; }
+    if (!flagsDone && x.startsWith("-")) {
+      if (/^--sor(?:t)?$/.test(x) || /^--form(?:at)?$/.test(x)) i++; // consumes the next argv as its value
+      continue;
+    }
+    pos.push(x);
+  }
+  return pos;
 }
 
 /**

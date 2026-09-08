@@ -416,6 +416,39 @@ function _branchCopyState(args) {
   return { copyMode: true, forceCopy: cForce || fForce };
 }
 
+/**
+ * #592 (round-2 review fold-in): branch positional extraction — EXACT
+ * duplicate of classify-git.mjs's _branchPositionals (cross-pinned). The
+ * naive `args.filter(x => !x.startsWith("-"))` counts an option VALUE consumed
+ * from the next argv as a branch-name positional, corrupting dst/from/to
+ * extraction for the M3 gate. git's parse-options lets a mutating-mode
+ * invocation carry LIST options whose REQUIRED value is consumed from the
+ * SEPARATE next argv (probe-verified rc 0 + real ref mutation): `--sort`/
+ * `--format` and their unambiguous prefixes `--sor`/`--form` (--so/--fo/--for
+ * are ambiguous with --show-current/--force/--format rc 129; a value never
+ * lands in the branch-name slot for an option git REJECTS in copy/move/
+ * force-create mode — --points-at/--contains/--merged/--no-merged/-u/
+ * --set-upstream-to all error rc 128/129 there, probe-verified, so they are
+ * NOT modeled; attached `--sort=x` never consumes the next argv). A `--`
+ * terminator ends flag parsing (everything after is a positional).
+ * @param {string[]} args
+ * @returns {string[]} the true positional (branch-name) argv slots
+ */
+function _branchPositionals(args) {
+  const pos = [];
+  let flagsDone = false;
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i];
+    if (!flagsDone && x === "--") { flagsDone = true; continue; }
+    if (!flagsDone && x.startsWith("-")) {
+      if (/^--sor(?:t)?$/.test(x) || /^--form(?:at)?$/.test(x)) i++; // consumes the next argv as its value
+      continue;
+    }
+    pos.push(x);
+  }
+  return pos;
+}
+
 export function classifyBranchOp(subcmd, args) {
   const a = args || [];
   if (subcmd === "checkout" || subcmd === "switch") {
@@ -467,7 +500,7 @@ export function classifyBranchOp(subcmd, args) {
     if (a.includes("-m") || a.includes("-M") ||
         a.some((x) => (x === "--move" || x === "--mo" || x === "--mov") ||
           (/^-[A-Za-z]+$/.test(x) && _branchMode(x)?.family === "move"))) {
-      const pos = a.filter((x) => !x.startsWith("-"));
+      const pos = _branchPositionals(a);
       return {
         op: "rename",
         from: pos.length > 1 ? (pos[0] ?? null) : null, // null → rename CURRENT branch
@@ -517,7 +550,7 @@ export function classifyBranchOp(subcmd, args) {
     const { copyMode, forceCopy } = _branchCopyState(a);
     if (copyMode) {
       if (forceCopy) {
-        const pos = a.filter((x) => !x.startsWith("-"));
+        const pos = _branchPositionals(a);
         return { op: "force", branch: (pos[1] ?? pos[0]) ?? null };
       }
       return { op: "other" }; // soft copy — new-ref-only create (git refuses existing dst)
@@ -531,7 +564,7 @@ export function classifyBranchOp(subcmd, args) {
       // superseded — the destination-mutation frame now lives in the copy arm,
       // keyed on the real DST so the benign carve-out can never misfire on a
       // current-branch SOURCE).
-      const pos = a.filter((x) => !x.startsWith("-"));
+      const pos = _branchPositionals(a);
       return { op: "force", branch: pos[0] ?? null };
     }
     return { op: "other" }; // create/list/soft-copy/delete/mixed-mode — not the force-create M3 path

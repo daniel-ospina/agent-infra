@@ -193,6 +193,7 @@ const envPathMatch = { AGENT_INFRA_PATH: INFRA_ROOT };
 const envRootMatch = { AGENT_INFRA_ROOT: INFRA_ROOT };
 const envPointsElsewhere = { AGENT_INFRA_PATH: "/nonexistent/other-repo" };
 function expectBool(name, got, expected) {
+  if (got !== expected) console.error(`FAIL-BOOL: ${name} got=${got} expected=${expected}`);
   const ok = got === expected;
   console.log(`${ok ? "✅" : "❌"} ${name}: ${got}${ok ? "" : ` (expected ${expected})`}`);
   ok ? pass++ : fail++;
@@ -759,6 +760,26 @@ dexpect("#592: branch -mc mixed-mode → NOT branchState (rc 129)", `git branch 
 // delete arm keeps D-wins semantics (any d/D letter = delete mode): the
 // conservative delete path blocks the no-op rather than the mixed-run exclusion.
 dexpect("#592: branch -mD mixed-mode → delete path (D wins, block)", `git branch -mD feat/1 bad`, { branchState: true, deleteTargets: ["feat/1", "bad"] });
+// ── #592 round-2 fold: value-swallow of --sort/--format (review P0/P1) ─────
+// git's parse-options accepts the LIST options --sort/--format in copy/move/
+// force-create mode rc 0 and consumes the SEPARATE next argv as their REQUIRED
+// value (probe-verified: `-C --sort key main topic2` clobbers topic2 rc 0).
+// The naive non-dash positional filter counted that value as a branch name
+// (dst/from/to misparse → carve-out misfire on a foreign ref overwrite).
+// Value-aware extraction (drop the consumed argv) restores the true dst/src.
+dexpect("#592 fold: -C --sort <v> swallow → dst is the LAST positional", `git branch -C --sort key main topic2`, { branchState: true, newBranch: "topic2" });
+dexpect("#592 fold: -C --format <v> swallow → dst correct", `git branch -C --format zz main topic2`, { branchState: true, newBranch: "topic2" });
+dexpect("#592 fold: -C dst --sort <v> (flag after pos) → dst correct", `git branch -C topic2 --sort main`, { branchState: true, newBranch: "topic2" });
+dexpect("#592 fold: rename -m --sort <v> old new → from/to correct", `git branch -m --sort main victim topic2new`, { branchState: true, renameFrom: "victim", renameTo: "topic2new" });
+dexpect("#592 fold: force-create -f --sort <v> target → target correct", `git branch -f --sort key victim`, { branchState: true, newBranch: "victim" });
+dexpect("#592 fold: attached --sort=x does NOT swallow the next argv", `git branch -C --sort=key main topic2`, { branchState: true, newBranch: "topic2" });
+// remaining f-composed spellings (review P2-1): reversed-letter clusters
+// -fc/-Cf (force-copy) and -mf/-fm/-fM/-Mf (force-move) all mutate rc 0.
+dexpect("#592 fold: branch -fc reversed copy cluster → branchState", `git branch -fc feat/1 side`, { branchState: true, newBranch: "side" });
+dexpect("#592 fold: branch -Cf reversed force-copy → branchState", `git branch -Cf feat/1 side`, { branchState: true, newBranch: "side" });
+dexpect("#592 fold: branch -mf force-move cluster → branchState", `git branch -mf feat/1 rnX`, { branchState: true, renameFrom: "feat/1", renameTo: "rnX" });
+dexpect("#592 fold: branch -fM force-move cluster → branchState", `git branch -fM feat/1 rnX`, { branchState: true, renameFrom: "feat/1", renameTo: "rnX" });
+dexpect("#592 fold: branch -Mf force-move cluster → branchState", `git branch -Mf feat/1 rnX`, { branchState: true, renameFrom: "feat/1", renameTo: "rnX" });
 // ── #591 round-3 fold: tracking-directive family ───────────────────────────
 // A NON-TERMINAL t consumes the token REST as its --track directive value; git
 // accepts exactly "direct"/"inherit" (rc-0 force-CREATEs, probe-verified — the
@@ -896,6 +917,42 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
   expectBool("#592: soft -c → no branchState → allowed (create-only)", soft === null, true);
   const mixed = m3c(`git branch -mc feat/1 bad`, "feat/1");
   expectBool("#592: mixed-mode -mc rc-129 no-op → no branchState → allowed", mixed === null, true);
+  // Round-2 review fold-in (adversarial P0/P1): --sort/--format value-swallow
+  // must NOT let a foreign-ref overwrite/rename ride the benign carve-out or
+  // the own-baseline rename arm. Real git rc 0 on each (probe-verified).
+  const swCopy = m3c(`git branch -C --sort key main topic2`, "main");
+  expectBool("#592 fold: -C --sort swallow dst=topic2 FOREIGN → M3 block", swCopy?.block === true, true);
+  const swCopy2 = m3c(`git branch -C --sort main topic2`, "main");
+  expectBool("#592 fold: -C --sort <baseline-name> swallow → still block (dst foreign)", swCopy2?.block === true, true);
+  const swFlagAfter = m3c(`git branch -C topic2 --sort main`, "main");
+  expectBool("#592 fold: -C dst --sort <v> FOREIGN → M3 block", swFlagAfter?.block === true, true);
+  const swRen = m3c(`git branch -m --sort main victim topic2new`, "main");
+  expectBool("#592 fold: rename --sort swallow (from=victim foreign) → M3 block", swRen?.block === true, true);
+  const swFc = m3c(`git branch -f --sort key victim`, "main");
+  expectBool("#592 fold: force-create --sort swallow (target=victim foreign) → M3 block", swFc?.block === true, true);
+  const swOwn = m3c(`git branch -Mq --form zz feat/1 rnX`, "feat/1", "feat/1");
+  expectBool("#592 fold: own-baseline rename with swallow → reBaseline (dst parses)", swOwn?.reBaseline === "rnX" && !swOwn?.block, true);
+  // Cross-layer parity sweep (review P2-3): every #592 spelling corpus entry
+  // must agree that branchState ⟺ classifyBranchOp op ∈ {rename,force} (a
+  // drift would silently skip M3). Delete-composed / list / checkout forms are
+  // out of this invariant (verdict path covers them).
+  const corpus = [
+    `git branch -Mq feat/1 rnX`, `git branch -mv feat/1 rnX`, `git branch -qM feat/1 rnX`,
+    `git branch -mf feat/1 rnX`, `git branch -fM feat/1 rnX`, `git branch -Mf feat/1 rnX`,
+    `git branch --move feat/1 rnX`, `git branch --mov feat/1 rnX`, `git branch --mo feat/1 rnX`,
+    `git branch -Cq feat/1 cpY`, `git branch -C feat/1 side`, `git branch -cf feat/1 side`,
+    `git branch -fC feat/1 side`, `git branch -fc feat/1 side`, `git branch -Cf feat/1 side`,
+    `git branch -f -c feat/1 side`, `git branch --force --copy feat/1 side`, `git branch -C --sort key feat/1 side`,
+    `git branch -c feat/1 cpX`, `git branch -cq cpY`, `git branch --copy feat/1 cpX`, `git branch --cop feat/1 cpX`,
+    `git branch -mc feat/1 bad`, `git branch feat/1 main`,
+  ];
+  const parityOk = corpus.every((c) => {
+    const d = classifyGitCommandDetailed(c);
+    const op = d.branchState ? sharedClassifyBranchOp(d.stateVerb, d.stateArgs) : { op: "other" };
+    const mut = op.op === "rename" || op.op === "force";
+    return d.branchState === mut;
+  });
+  expectBool("#592 fold: cross-layer parity — branchState ⟺ op∈{rename,force} over the #592 corpus", parityOk, true);
   // Round-3 fold-in: long-option ABBREVIATIONS of copy/move (--cop → --copy,
   // --mo/--mov → --move) must null the branch like their exact/cluster twins —
   // a force-composed copy/move mutates the DESTINATION rc 0 (`-f --cop main

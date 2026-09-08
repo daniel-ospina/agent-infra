@@ -265,6 +265,24 @@ ok("branchOp: branch --mo abbrev → rename", op("branch", ["--mo", "feat/a", "f
 ok("branchOp: branch --m ambiguous → other (rc 129)", op("branch", ["--m", "feat/a", "feat/b"]) === "other");
 ok("branchOp: branch --movefoo unknown → other (rc 129)", op("branch", ["--movefoo", "feat/a", "feat/b"]) === "other");
 ok("branchOp: branch --co ambiguous → other (rc 129)", op("branch", ["--co", "feat/a", "cpX"]) === "other");
+// #592 round-2 (adversarial review fold-in): --sort/--format consume the NEXT
+// argv as their value in copy/move/force-create mode rc 0, so the dst/from/to
+// extraction must drop the consumed value (a naive non-dash filter would read
+// branch="key"/from="key" and misfire the benign carve-out on a foreign ref
+// overwrite).
+ok("branchOp: branch -C --sort <v> src dst → force + dst (value swallowed)", (() => { const r = classifyBranchOp("branch", ["-C", "--sort", "key", "main", "topic2"]); return r.op === "force" && r.branch === "topic2"; })());
+ok("branchOp: branch -C --format <v> src dst → force + dst", (() => { const r = classifyBranchOp("branch", ["-C", "--format", "zz", "main", "topic2"]); return r.op === "force" && r.branch === "topic2"; })());
+ok("branchOp: branch -C dst --sort <v> (flag after pos) → force + dst", (() => { const r = classifyBranchOp("branch", ["-C", "topic2", "--sort", "main"]); return r.op === "force" && r.branch === "topic2"; })());
+ok("branchOp: branch -C --sort <baseline> dst → force + dst (no carve-out misfire)", (() => { const r = classifyBranchOp("branch", ["-C", "--sort", "main", "topic2"]); return r.op === "force" && r.branch === "topic2"; })());
+ok("branchOp: branch -m --sort <v> old new → rename old→new", (() => { const r = classifyBranchOp("branch", ["-m", "--sort", "main", "victim", "topic2new"]); return r.op === "rename" && r.from === "victim" && r.to === "topic2new"; })());
+ok("branchOp: branch -f --sort <v> target → force + target (value swallowed)", (() => { const r = classifyBranchOp("branch", ["-f", "--sort", "key", "victim"]); return r.op === "force" && r.branch === "victim"; })());
+ok("branchOp: branch -C --sort=x attached → force + dst (no next-argv swallow)", (() => { const r = classifyBranchOp("branch", ["-C", "--sort=key", "main", "topic2"]); return r.op === "force" && r.branch === "topic2"; })());
+// remaining f-composed spellings (review P2-1)
+ok("branchOp: branch -fc reversed copy cluster → force + dst", (() => { const r = classifyBranchOp("branch", ["-fc", "feat/x", "side"]); return r.op === "force" && r.branch === "side"; })());
+ok("branchOp: branch -Cf reversed force-copy → force + dst", (() => { const r = classifyBranchOp("branch", ["-Cf", "feat/x", "side"]); return r.op === "force" && r.branch === "side"; })());
+ok("branchOp: branch -mf force-move cluster → rename", (() => { const r = classifyBranchOp("branch", ["-mf", "feat/a", "feat/b"]); return r.op === "rename" && r.from === "feat/a" && r.to === "feat/b"; })());
+ok("branchOp: branch -fM force-move cluster → rename", op("branch", ["-fM", "feat/a", "feat/b"]) === "rename");
+ok("branchOp: branch -Mf force-move cluster → rename", op("branch", ["-Mf", "feat/a", "feat/b"]) === "rename");
 // #591 round-3 fold: a NON-TERMINAL t consumes the token REST as its --track
 // directive VALUE — git accepts exactly direct/inherit (rc-0 force-CREATEs, so
 // these are op force with the FIRST positional as target), while value letters
@@ -363,8 +381,7 @@ ok("M3 #591: force+copy composition (no branch field) still blocks", (() => { co
   ok("M3 #591 real-git: force+copy moves destination rc 0 (why branch field is null)", copyComp.status === 0 && git(OTHER, "rev-parse dest") === git(OTHER, "rev-parse main"), String(copyComp.status));
   // round-2 FP guard: list-mode cluster with f mutates nothing (rc 0 list).
   const listFp = spawnSync("git", ["branch", "-fl"], { cwd: MAIN, encoding: "utf-8" });
-  ok("M3 #591 real-git: -fl LIST-mode runs rc 0 (no ref mutation → not force-create)", listFp.status === 0, String(listFp.status));
-  // round-3: i-cluster and repeatable-f force-creates are REAL (rc 0 moves a
+  ok("M3 #591 real-git: -fl LIST-mode runs rc 0 (no ref mutation → not force-create)", listFp.status === 0, String(listFp.status));  // round-3: i-cluster and repeatable-f force-creates are REAL (rc 0 moves a
   // non-checked-out branch) — the M3 block is why they must classify force.
   const iForce = spawnSync("git", ["branch", "-fi", "side", "main"], { cwd: MAIN, encoding: "utf-8" });
   ok("M3 #591 real-git: -fi force-creates rc 0 (why i ∈ create-mode letters)", iForce.status === 0, String(iForce.status));
@@ -390,6 +407,22 @@ ok("M3 #591: force+copy composition (no branch field) still blocks", (() => { co
   ok("M3 #591 real-git: -ftq invalid directive dead rc 129 (nothing created)", tDead.status === 129, String(tDead.status));
   const tDead2 = spawnSync("git", ["branch", "-tfoo", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
   ok("M3 #591 real-git: -tfoo invalid directive dead rc 129", tDead2.status === 129, String(tDead2.status));
+  // #592 round-2 (adversarial fold-in): --sort/--format swallow the NEXT argv
+  // as their REQUIRED value even in copy/move/force-create mode (rc 0 + real
+  // ref mutation) — the M3 block is why the positional extraction must be
+  // value-aware (a naive non-dash filter would read the value as dst/src and
+  // misfire the benign carve-out on a foreign overwrite).
+  git(OTHER, "branch -D victim 2>/dev/null; git branch victim HEAD~1");
+  const swSort = spawnSync("git", ["branch", "-C", "--sort", "key", "main", "victim"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #592 real-git: -C --sort <v> swallows the value and CLOBBERS the free dst rc 0", swSort.status === 0 && git(OTHER, "rev-parse victim") === git(OTHER, "rev-parse main"), String(swSort.status));
+  git(OTHER, "branch -D victim 2>/dev/null; git branch victim HEAD~1");
+  const swFormat = spawnSync("git", ["branch", "-C", "--format", "zz", "main", "victim"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #592 real-git: -C --format <v> swallows and clobbers rc 0", swFormat.status === 0 && git(OTHER, "rev-parse victim") === git(OTHER, "rev-parse main"), String(swFormat.status));
+  git(OTHER, "branch -D victim 2>/dev/null; git branch victim HEAD~1");
+  const swFlagAfter = spawnSync("git", ["branch", "-C", "victim", "--sort", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #592 real-git: -C dst --sort <v> (flag after pos) clobbers rc 0", swFlagAfter.status === 0 && git(OTHER, "rev-parse victim") === git(OTHER, "rev-parse main"), String(swFlagAfter.status));
+  const swOwn = spawnSync("git", ["branch", "-C", "--sort", "key", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #592 real-git: -C --sort <v> onto CURRENT branch refused rc 128 (carve-out premise holds)", swOwn.status === 128, String(swOwn.status));
 }
 ok("M3: orphan blocks", (() => { const d = decideM3({ branchOp: { op: "orphan" }, isAgentInfra: true, baseline }); return d?.block === true; })());
 ok("M3: own rename re-baselines", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/2" }, isAgentInfra: false, baseline, currentBranch: "feat/1" }); return d?.reBaseline === "feat/2"; })());
