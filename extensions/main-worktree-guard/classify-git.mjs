@@ -1447,11 +1447,28 @@ export function classifyGitCommandDetailed(command) {
         out.branchState = true;
       }
     } else if (verb === "branch") {
-      if (args.includes("-m") || args.includes("-M")) {
-        const pos = args.filter((x) => !x.startsWith("-"));
+      // #592: rename/move arm widened from EXACT-token (-m/-M) to git's full
+      // spelling surface (sibling closure: #587 delete clusters, #591
+      // force-create clusters). git merges NOARG shorts into ONE token, so the
+      // move letter can sit anywhere in a cluster (`-Mq` ≡ `-M -q`, `-mv` ≡
+      // `-m -v` — both rename rc 0, probe-verified) and git accepts the
+      // documented long form plus its UNAMBIGUOUS prefix abbreviations
+      // (`--move`/`--mov`/`--mo`; --m is ambiguous with --merged rc 129).
+      // Mode letters WIN over -f (#591), so a move-composed cluster is a
+      // rename, not a force-create. These set branchState exactly like the
+      // exact `-m`/`-M` forms they are byte-identical to in git (before #592
+      // they fell through to verdict allow + branchState false → M3 never
+      // entered from the shared main checkout). 1-positional git semantics:
+      // `(-m|-M) [<old>] <new>` — a SINGLE positional renames the CURRENT
+      // branch (renameFrom null → renameTo = the new name; decideM3
+      // substitutes currentBranch via classifyBranchOp's from:null).
+      if (args.includes("-m") || args.includes("-M") ||
+          args.some((x) => (x === "--move" || x === "--mo" || x === "--mov") ||
+            (/^-[A-Za-z]+$/.test(x) && _branchMode(x)?.family === "move"))) {
+        const pos = _branchPositionals(args);
         out.branchState = true;
-        out.renameFrom = pos[0] ?? null;
-        out.renameTo = pos[1] ?? null;
+        out.renameFrom = pos.length > 1 ? (pos[0] ?? null) : null;
+        out.renameTo = pos.length > 1 ? (pos[1] ?? null) : (pos[0] ?? null);
       } else if (branchDeleteNames("branch", args) ||
                  args.some(isBranchForceCreateTokenNarrow)) {
         // #591: the branch arm's force-create trigger is TOKEN-level (any
@@ -1492,7 +1509,19 @@ export function classifyGitCommandDetailed(command) {
           out.deleteTargets = delNames;
           out.newBranch = delNames[0] ?? null;
         } else {
-          out.newBranch = args.filter((x) => !x.startsWith("-"))[0] ?? null;
+          // #592 (round-2 fold): newBranch = the real mutation target — for a
+          // pure force-create the FIRST positional; for a force-composed COPY
+          // (an exact -f/--force beside a copy spelling — `-f -c main side`)
+          // the narrow-force token fired this arm before the force-copy arm,
+          // so capture the DESTINATION (2nd positional) to stay consistent
+          // with classifyBranchOp's op:force branch=dst (M3 keys on that, but
+          // the field must not advertise the SOURCE). Value-aware extraction
+          // (--sort/--format swallow the next argv) in both cases.
+          const pos = _branchPositionals(args);
+          const cp = _branchCopyState(args);
+          out.newBranch = cp.copyMode
+            ? ((pos[1] ?? pos[0]) ?? null)
+            : (pos[0] ?? null);
         }
         // #587 (review fold-in, TOKEN-level hard-delete verdict): the legacy
         // patterns scan the raw/skimmed STRING, where a `[^;&|]*` run boundary
@@ -1539,6 +1568,25 @@ export function classifyGitCommandDetailed(command) {
               branchDeleteNames("branch", v.args) !== null)) {
           out.verdict = "allow";
         }
+      } else if (_branchCopyState(args).forceCopy) {
+        // #592: FORCE-COPY family (-C/-Cq/-cf/-fC/-f -c/--force --copy) — the
+        // copy family was not branch-state tracked AT ALL before #592 (even
+        // the exact `-C` fell through to verdict allow + branchState false
+        // while git OVERWRITES an existing free dst rc 0 — the same
+        // shared-ref mutation M3 gates for `branch -f`). Set branchState +
+        // expose the DESTINATION as newBranch (2nd positional of `-C src dst`;
+        // 1st of a 1-positional `-C dst`, which copies the current branch) —
+        // mirroring the force-create arm's target capture. M3 keys on
+        // classifyBranchOp's op:"force" branch=dst: a dst equal to the
+        // checkout's own current branch is git-refused rc 128 (benign → #591
+        // carve-out); foreign / non-checked-out overwrite targets block. SOFT
+        // copy (-c/-cq/--copy, no force) only ever creates a NEW ref (git
+        // refuses an existing dst rc 128) → like `git branch <name>`: NO
+        // branchState (allow); mixed-mode single tokens (-mc/-mD/-Dc — rc-129
+        // no-ops) fall through the same way.
+        out.branchState = true;
+        const pos = _branchPositionals(args);
+        out.newBranch = pos.length > 1 ? (pos[1] ?? pos[0]) : (pos[0] ?? null);
       }
     }
     // P1-A: expose the STATE-mutating invocation's verb/args — M3 must classify
@@ -2289,6 +2337,98 @@ export function isBranchForceCreateTokenNarrow(a) {
     return false;
   }
   return /^[qvif]*f[qvif]*t?$/.test(tok.run);
+}
+
+/**
+ * #592: mode-family reader for a single-dash branch token — EXACT duplicate
+ * of branch-ownership.mjs's _branchMode (cross-pinned; a drift between the
+ * layers would set branchState in one and op "other" in the other — silently
+ * skipping M3). git's MODE letters are MUTUALLY EXCLUSIVE: d/D (delete),
+ * m/M (move/rename), c/C (copy) — any token whose value-aware run mixes ≥2
+ * families is a parse-conflict rc-129 no-op (probe-verified: -mc/-cm/-mD/-cD/
+ * -dm/-dc/-Dm/-Dc/-DC/-DM/-Md/-Cm ALL usage-error rc 129 and mutate NOTHING),
+ * so mixed runs never classify as any mode. The force letter f and the NOARG
+ * q/v/i/t compose (they are NOT mode families — `-df x` hard-deletes, `-cf`
+ * is a force-copy, #587/#591 probes). Case = FORCE within a family: uppercase
+ * M ≡ --move --force (`-M` clobbers an existing dst rc 0 where soft `-m`
+ * refuses rc 128), C ≡ --copy --force (probe-verified).
+ * @returns {{family: "delete"|"move"|"copy", force: boolean}|null}
+ */
+function _branchMode(x) {
+  const tok = _branchToken(x);
+  if (!tok) return null;
+  const run = tok.run;
+  const hasD = /[dD]/.test(run), hasM = /[mM]/.test(run), hasC = /[cC]/.test(run);
+  const families = (hasD ? 1 : 0) + (hasM ? 1 : 0) + (hasC ? 1 : 0);
+  if (families !== 1) return null; // no mode / mixed-mode rc-129 no-op
+  if (hasD) return { family: "delete", force: /D/.test(run) };
+  if (hasM) return { family: "move", force: /M/.test(run) };
+  return { family: "copy", force: /C/.test(run) };
+}
+
+/**
+ * #592: copy-family state — EXACT duplicate of branch-ownership.mjs's
+ * _branchCopyState (cross-pinned). See there for the git semantics: SOFT copy
+ * (-c/-cq/--copy, no force) only creates a NEW ref (existing dst refused rc
+ * 128) → allow like `git branch <name>` — NOT a branch-state trigger; FORCE
+ * copy (uppercase C in a copy run = git's --copy --force, or any force
+ * spelling — -Cq/-cf/-fC/-f -c/--force --copy, all probe-verified to clobber a
+ * free dst rc 0) mutates the DESTINATION ref → branchState true so M3 gates it
+ * (dst == currentBranch passes through to git's rc-128 refusal via the #591
+ * carve-out; foreign/non-checked-out overwrite targets block).
+ * @param {string[]} args
+ * @returns {{copyMode: boolean, forceCopy: boolean}}
+ */
+function _branchCopyState(args) {
+  const mode = (x) => (/^-[A-Za-z]+$/.test(x) ? _branchMode(x) : null);
+  const copyMode = args.some((x) => x === "--copy" || x === "--cop") ||
+    args.some((x) => mode(x)?.family === "copy");
+  if (!copyMode) return { copyMode: false, forceCopy: false };
+  const cForce = args.some((x) => mode(x)?.family === "copy" && mode(x).force === true);
+  const fForce = args.some((x) => x === "--force" || x === "--forc" ||
+    (/^-[A-Za-z]+$/.test(x) && /f/.test((_branchToken(x)?.run) ?? "")));
+  return { copyMode: true, forceCopy: cForce || fForce };
+}
+
+/**
+ * #592 (round-2 review fold-in): branch positional extraction — EXACT
+ * duplicate of branch-ownership.mjs's _branchPositionals (cross-pinned). See
+ * there for the git semantics: --sort/--format under every UNAMBIGUOUS prefix
+ * git accepts (--so/--sor/--sort — --so is minimal: --show-current diverges
+ * at --sh, --s is ambiguous with --show-current rc 129; --form/--forma/
+ * --format — --fo/--for are ambiguous with --force rc 129) consume the
+ * SEPARATE next argv as their REQUIRED value even in copy/move/force-create
+ * mode (probe-verified rc 0 + real ref mutation), so the naive non-dash filter
+ * would count that value as a branch-name positional and corrupt the M3
+ * dst/from/to extraction. Other branch value-takers never land a value in the
+ * branch-name slot of an rc-0 MUTATING invocation: the list-filter options
+ * --points-at/--contains/--no-contains/-u/--set-upstream-to and
+ * --merged/--no-merged error rc 128/129 (usage) BEFORE mutating in
+ * copy/move/delete arms (probe-verified), while --column/--color/--abbrev/--track
+ * are OPTARG options that only ever take an ATTACHED `=` value — a following
+ * word is a positional in git and here alike (`-C --color always main t2` is
+ * "too many branches" rc 128); under `-f` the LIST-printing filters
+ * (--points-at/--contains/--merged/...) flip git to rc-0 no-mutation LIST
+ * mode, while --sort/--format are ACCEPTED and still force-create rc 0 (hence
+ * the swallow modeled above). Attached `--sort=x` never consumes the next
+ * argv; `--` terminates flag
+ * parsing.
+ * @param {string[]} args
+ * @returns {string[]} the true positional (branch-name) argv slots
+ */
+function _branchPositionals(args) {
+  const pos = [];
+  let flagsDone = false;
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i];
+    if (!flagsDone && x === "--") { flagsDone = true; continue; }
+    if (!flagsDone && x.startsWith("-")) {
+      if (/^--so(?:rt?)?$/.test(x) || /^--form(?:at?)?$/.test(x)) i++; // consumes the next argv as its value
+      continue;
+    }
+    pos.push(x);
+  }
+  return pos;
 }
 
 /**
