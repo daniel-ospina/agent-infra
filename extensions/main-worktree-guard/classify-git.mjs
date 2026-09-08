@@ -1202,8 +1202,8 @@ export function allGitInvocations(command, seedVars = {}) {
  * Detailed classification of a shell command (consumed EXCLUSIVELY by
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
- *     newBranch, pushDst, pushTargets, isPushDelete, renameFrom, renameTo,
- *     syncSource }
+ *     newBranch, deleteTargets, pushDst, pushTargets, isPushDelete,
+ *     renameFrom, renameTo, syncSource }
  * - verdict: legacy `block:*` strings for destructive patterns (verb-anchored),
  *   plus NEW `block:commit` / `block:push` / `block:force-push`; `allow` /
  *   `allow-non-git` otherwise.
@@ -1220,7 +1220,7 @@ export function classifyGitCommandDetailed(command) {
   const out = {
     verdict: "allow", repoHint, gitDirHint, verb: invocations[0]?.verb ?? null,
     verbArgs: invocations[0]?.args ?? [], branchState: false, newBranch: null,
-    pushDst: null, pushTargets: [], isPushDelete: false,
+    deleteTargets: [], pushDst: null, pushTargets: [], isPushDelete: false,
     renameFrom: null, renameTo: null, syncSource: null,
   };
   if (invocations.length === 0) {
@@ -1382,13 +1382,32 @@ export function classifyGitCommandDetailed(command) {
         out.branchState = true;
         out.renameFrom = pos[0] ?? null;
         out.renameTo = pos[1] ?? null;
-      } else if (args.includes("-f") || args.includes("--force") ||
-                 args.includes("-D") || args.includes("-d")) {
+      } else if (branchDeleteNames("branch", args) ||
+                 args.includes("-f") || args.includes("--force")) {
         // P1-B: -D/-d delete must set newBranch so the allowance target list is
         // non-empty (a ceremony `git branch -D $PR_BRANCH` on the own branch is
         // allowed; without this, ownershipAllowed([]) is false -> false-block).
+        // #543: `git branch -D a b` is a MULTI-TARGET delete — git deletes each
+        // target independently and only stops at the first refusal (`git branch
+        // -D main feat/other` refuses the checked-out main but deletes
+        // feat/other, rc=1). newBranch (the first name) alone would let
+        // `<baseline|own> <foreign>` slip the trailing foreign target past the
+        // ownership allowance, so the branch-delete extraction must capture
+        // EVERY -d/-D/--delete name (incl. merged `-Dname` cluster forms) via
+        // branchDeleteNames — the all-targets discipline pushTargets already
+        // gives the push family (#443). newBranch stays the FIRST name for
+        // back-compat (single-target callers/tests); index.ts prefers
+        // deleteTargets. `-f`/`--force` (force-create, M3 force arm) is NOT a
+        // delete — branchDeleteNames returns null for it and newBranch keeps
+        // the first positional.
         out.branchState = true;
-        out.newBranch = args.filter((x) => !x.startsWith("-"))[0] ?? null;
+        const delNames = branchDeleteNames("branch", args);
+        if (delNames) {
+          out.deleteTargets = delNames;
+          out.newBranch = delNames[0] ?? null;
+        } else {
+          out.newBranch = args.filter((x) => !x.startsWith("-"))[0] ?? null;
+        }
       }
     }
     // P1-A: expose the STATE-mutating invocation's verb/args — M3 must classify

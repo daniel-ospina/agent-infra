@@ -1198,9 +1198,20 @@ export default function (pi: ExtensionAPI) {
       const allowanceKind = ALLOWANCE[det.verdict];
       if (allowanceKind && eff) {
         const baseline = baselines.get(pid);
+        // #543: branch -D multi-target — the classifier's deleteTargets carries
+        // EVERY -d/-D/--delete name (mirror of pushTargets' all-targets
+        // semantics). git performs PARTIAL deletes on multi-target `-D`
+        // (`git branch -D main feat/other` refuses the checked-out main but
+        // deletes feat/other, rc=1), so the allowance must validate ALL names
+        // ⊆ baseline∪owned — a first-target-only list (the old newBranch
+        // capture) would let `<baseline|own> <foreign>` slip the trailing
+        // foreign branch past the gate. Prefer deleteTargets over the single
+        // newBranch fallback whenever present.
         const targets = det.pushTargets && det.pushTargets.length > 0
           ? det.pushTargets
-          : (det.newBranch ? [det.newBranch] : []);
+          : ((det.deleteTargets && det.deleteTargets.length > 0)
+            ? det.deleteTargets
+            : (det.newBranch ? [det.newBranch] : []));
         if (branchOwnership.ownershipAllowed({
           opKind: allowanceKind,
           currentBranch: eff.currentBranch,

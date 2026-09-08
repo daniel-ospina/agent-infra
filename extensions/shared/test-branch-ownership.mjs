@@ -304,6 +304,15 @@ ok("allow: branch -D foreign false", ownershipAllowed({ opKind: "branch-force-de
 ok("allow: branch -D pid-owned post-return", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === true);
 ok("allow: branch -D not-owned post-return false", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"] }) === false);
 ok("allow: branch -D owned+baseline mixed all-own", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["main", "feat/2"], ownedBranches: ["feat/2"] }) === true);
+// #543: multi-target -D all-targets discipline — git performs PARTIAL deletes
+// (`git branch -D main feat/other` refuses the checked-out main but deletes
+// feat/other, rc=1), so EVERY target must be ⊆ baseline∪owned: a list whose
+// FIRST target is baseline/owned but whose TRAILING target is foreign must
+// deny (pre-fix the classifier fed only the first target, letting the foreign
+// trailing branch delete unguarded).
+ok("allow: branch -D first=baseline trailing=foreign false", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["main", "feat/other"] }) === false);
+ok("allow: branch -D first=owned trailing=foreign false", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2", "feat/other"], ownedBranches: ["feat/2"] }) === false);
+ok("allow: branch -D multi all-owned allowed", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "feat/1", baselineBranch: "feat/1", targets: ["feat/1", "feat/1"] }) === true);
 ok("allow: branch -D master protected even if listed owned (never trunk)", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["master"], ownedBranches: ["master"] }) === false);
 ok("allow: branch -D owned off-baseline false", ownershipAllowed({ opKind: "branch-force-delete", currentBranch: "feat/1", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === false);
 ok("allow: push of owned branch stays baseline-only", ownershipAllowed({ opKind: "push", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === false);
