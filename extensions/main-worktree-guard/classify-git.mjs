@@ -1258,13 +1258,18 @@ export function allGitInvocations(command, seedVars = {}) {
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
  *     newBranch, deleteTargets, pushDst, pushTargets, isPushDelete,
- *     renameFrom, renameTo, syncSource }
+ *     renameFrom, renameTo, syncSource, stateVerb, stateArgs, stateOpCount }
  * - verdict: legacy `block:*` strings for destructive patterns (verb-anchored),
  *   plus NEW `block:commit` / `block:push` / `block:force-push`; `allow` /
  *   `allow-non-git` otherwise.
  * - branchState: true for checkout/switch/symbolic-ref/update-ref/branch ops
  *   that mutate the checkout's branch (M3 gate runs on these regardless of
  *   verdict — symbolic-ref/update-ref/branch -f have NO legacy pattern).
+ * - stateVerb/stateArgs: the FIRST state-mutating invocation's verb/args (M3
+ *   must classify the invocation that changes branch state, not invocations[0]
+ *   — P1-A). stateOpCount: TOTAL branch-state invocations in the command — the
+ *   #591 benign-force carve-out requires exactly 1 (a later compound segment's
+ *   foreign force-create is invisible to the first-invocation M3 gate).
  * - force-push hygiene: `--force-with-lease` / `--force-if-includes` are NOT
  *   force (the legacy `--force\b` regex false-matches them); a force-with-lease
  *   push classifies `block:push` (ownership path), not `block:force-push`.
@@ -1448,7 +1453,7 @@ export function classifyGitCommandDetailed(command) {
         out.renameFrom = pos[0] ?? null;
         out.renameTo = pos[1] ?? null;
       } else if (branchDeleteNames("branch", args) ||
-                 args.some(isBranchForceCreateToken)) {
+                 args.some(isBranchForceCreateTokenNarrow)) {
         // #591: the branch arm's force-create trigger is TOKEN-level (any
         // spelling git force-creates with — see isBranchForceCreateToken), so
         // merged NOARG clusters (`-fq` ≡ `-f -q`) and the unambiguous
@@ -1456,7 +1461,13 @@ export function classifyGitCommandDetailed(command) {
         // plain `-f`/`--force` forms they are byte-identical to in git
         // (probe-verified rc 0). Before #591 they fell through to verdict
         // allow + branchState false → M3 never entered from the shared main
-        // checkout.
+        // checkout. Review fold-in (#591 round 2): the trigger uses the NARROW
+        // pure-force-create predicate — git's MODE letters win over -f
+        // (`-fl x main` LISTs rc 0, `-cf a b` copies, `-Df x` deletes — a
+        // mode-composed f-cluster is NOT a force-create, probe-verified), so
+        // list/copy/move/delete-composed clusters stay out of the M3 force
+        // path (deletes take the delNames verdict arm above; copy/move
+        // clusters are #592's family, byte-identical to pre-#591).
         // P1-B: -D/-d delete must set newBranch so the allowance target list is
         // non-empty (a ceremony `git branch -D $PR_BRANCH` on the own branch is
         // allowed; without this, ownershipAllowed([]) is false -> false-block).
@@ -1515,6 +1526,18 @@ export function classifyGitCommandDetailed(command) {
     out.stateVerb = verb;
     out.stateArgs = args;
   }
+  // #591 (review fold-in, compound-launder guard): count EVERY branch-state
+  // invocation in the command. The M3 benign-force carve-out (a force-create
+  // whose target is the checkout's OWN branch) must only fire for a command
+  // whose sole branch-state mutation is that own-branch attempt — in a `;`
+  // compound (`git branch -f own ; git branch -fq foreign x`) the later
+  // segments are invisible to the per-FIRST-state-invocation M3 gate, and the
+  // benign carve-out on segment 1 would otherwise let segment 2's FOREIGN
+  // force-create execute (pre-#591 the exact-force segment 1 blocked the whole
+  // command). stateOpCount ≥ 2 → decideM3 refuses the carve-out → default
+  // block restores pre-#591 compound parity.
+  out.stateOpCount = invocations.filter((v) =>
+    ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb)).length;
 
   return out;
 }
@@ -2134,30 +2157,51 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
 }
 
 /**
- * #591: is this token a git-branch FORCE-CREATE spelling? git's parse-options
- * MERGES NOARG short flags into ONE cluster, so `-fq` ≡ `-f -q` and the force
- * short can sit ANYWHERE in a single-dash cluster (`-fq`, `-qf`, `-fvq`,
- * `-vqf`) — probe-verified rc 0, byte-identical to `git branch -f x main`.
- * Long form: `--force` accepts its UNAMBIGUOUS prefix abbreviations — `--forc`
- * is force; `--for` is AMBIGUOUS with `--format` (rc 129, nothing created) and
- * `--forcfoo` is an unknown option (rc 129) — both excluded, so the long set is
- * EXACT `--force`/`--forc` (parity with the #587 delete-composition force set).
- * The `(?![A-Za-z]*u)` guard mirrors #587's delete side: branch's ONLY
- * arg-taking short is `-u<value>` (set-upstream-to), which consumes the rest of
- * the token as its ATTACHED value, so a u-containing letter run is set-upstream
- * mode, never force-create — probe-verified: `-ufoo`, `-fuDevel … main`
- * error (mode/arg conflict, rc 128/129) and create NOTHING, so no real
- * force-create is ever masked. `--long` tokens cannot match (a letter run
- * cannot cross the second dash) and branch names lack a leading dash. Shared
- * shape with classifyBranchOp in branch-ownership.mjs (cross-pinned by
- * test-branch-ownership.mjs); both layers MUST agree or a spelling bypasses
- * the M3 gate (branchState true but op "other" skips it).
+ * #591 (round 2): the BROAD force-token test — ANY git-branch force spelling:
+ * the exact long `--force`/`--forc` (unambiguous prefix abbreviations; `--for`
+ * is ambiguous with `--format` rc 129, `--forcfoo` unknown rc 129 → excluded)
+ * or a single-dash short cluster whose letter run contains `f` (git merges
+ * NOARG shorts, so `-Df`/`-df`/`-fq` … all carry force). Used by the
+ * delete+force composition check (#587) where force is mode-blind — with a
+ * delete token present git IS deleting (`-Df x` = hard delete), so every
+ * f-bearing cluster counts. The `(?![A-Za-z]*u)` guard mirrors #587's delete
+ * side: branch's only arg-taking short is `-u<value>` (set-upstream-to), which
+ * consumes the token rest as its value, so a u-containing letter run is
+ * set-upstream mode — probe-verified: `-ufoo`, `-fuDevel … main` error (rc
+ * 128/129) and create/delete NOTHING, so no real force op is masked.
  * @param {string} a
  * @returns {boolean}
  */
 export function isBranchForceCreateToken(a) {
   return a === "--force" || a === "--forc" ||
     /^-(?![A-Za-z]*u)[A-Za-z]*f/.test(a);
+}
+
+/**
+ * #591 (round 2): the NARROW pure-force-create test — a force-create ONLY when
+ * git is actually in CREATE mode. git's mode letters WIN over -f (probe-
+ * verified): `-fl x main`/`-lf` LIST rc 0 (no ref moves), `-cf a b`/`-fC a b`
+ * COPY the destination, `-Df x` DELETEs, `-mf a b` moves — none is a
+ * force-create, and flagging them as one false-blocks benign list commands or
+ * misroutes copy/move mutations to the force-create M3 path. git merges only
+ * the NOARG shorts; branch's create-mode NOARG alphabet is {f,v,q} plus a
+ * TERMINAL `t` (track — `-ft`/`-fvt` create rc 0, but a mid-run t consumes the
+ * rest as its value: `-tf` rc 129 dead, probe-verified). So a pure force-create
+ * short cluster is `-[qv]*f[qv]*t?` — letters from {q,v} around f, optional
+ * trailing t. Every other letter (a/c/C/d/D/i/l/m/M/r/u …) is a mode letter or
+ * an arg-taking short → not create-mode → not a force-create (long-list
+ * compositions with an EXACT `--force` stay branchState by the long-form clause
+ * below — pre-#591 parity: the exact `--force` token always triggered M3, and
+ * an agent writing `git branch --force --list` is a nonsense no-op).
+ * Shared shape with classifyBranchOp in branch-ownership.mjs (cross-pinned);
+ * both layers MUST agree or a spelling bypasses the M3 gate (branchState true
+ * but op "other" skips it).
+ * @param {string} a
+ * @returns {boolean}
+ */
+export function isBranchForceCreateTokenNarrow(a) {
+  return a === "--force" || a === "--forc" ||
+    /^-[qv]*f[qv]*t?$/.test(a);
 }
 
 /**

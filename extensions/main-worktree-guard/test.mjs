@@ -684,6 +684,20 @@ dexpect("#591: branch --for ambiguous → NOT force-create", `git branch --for f
 dexpect("#591: branch --forcfoo unknown → NOT force-create", `git branch --forcfoo feat/1 main`, { branchState: false });
 dexpect("#591: branch -ufoo u-attached value → NOT force-create", `git branch -ufoo feat/1`, { branchState: false });
 dexpect("#591: branch -fuDevel force+upstream conflict → NOT force-create", `git branch -fuDevel feat/1 main`, { branchState: false, deleteTargets: [] });
+// Round-2 review fold-in: git's MODE letters WIN over -f — a mode-composed
+// f-cluster is NOT a force-create. `-fl`/`-lf`/`-fa` LIST rc 0 (no ref moves),
+// `-tf`/`-tfoo` are rc-129 no-ops (mid-run t consumes the rest as its value),
+// and `-fC`/`-cf` COPY (destination mutation — #592's cluster family,
+// byte-identical to pre-#591). Probe-verified none force-creates.
+dexpect("#591 fold: branch -fl LIST-mode cluster → NOT branchState", `git branch -fl feat/1 main`, { branchState: false });
+dexpect("#591 fold: branch -lf LIST-mode cluster → NOT branchState", `git branch -lf feat/1 main`, { branchState: false });
+dexpect("#591 fold: branch -fa list/remotes cluster → NOT branchState", `git branch -fa feat/1 main`, { branchState: false });
+dexpect("#591 fold: branch -tf t-value dead → NOT branchState", `git branch -tf feat/1 main`, { branchState: false });
+dexpect("#591 fold: branch -tfoo t-value dead → NOT branchState", `git branch -tfoo feat/1`, { branchState: false });
+dexpect("#591 fold: branch -fC copy-cluster → NOT force-create (no exact -f)", `git branch -fC feat/1 main`, { branchState: false });
+// A TERMINAL t composes with force-create (`-ft`/`-fvt` = -f -v -t, rc 0).
+dexpect("#591 fold: branch -ft (terminal t) force-create → branchState + target", `git branch -ft feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591 fold: branch -fvt (terminal t) force-create → branchState + target", `git branch -fvt feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
 // ── #591: M3 gate outcomes for force-create (classify → classifyBranchOp →
 // decideM3 — the exact index.ts sequence on the branch-state invocation) ────
 // Foreign force-create targets (∉ the current checkout's own branch) hit the
@@ -697,7 +711,9 @@ dexpect("#591: branch -fuDevel force+upstream conflict → NOT force-create", `g
     const op = d.branchState
       ? sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs)
       : { op: "other" };
-    return sharedDecideM3({ branchOp: op, isAgentInfra: true, baseline: { repoKey: "k", branch: currentBranch }, currentBranch, repoKey: "k" });
+    // mirrors index.ts's M3 adapter (repoKey "k", non-bare, classifier's
+    // stateOpCount — the #591 benign-force carve-out bounds).
+    return sharedDecideM3({ branchOp: op, isAgentInfra: true, baseline: { repoKey: "k", branch: currentBranch }, currentBranch, repoKey: "k", isBare: false, stateOpCount: d.stateOpCount ?? 1 });
   };
   const foreignCluster = fcM3(`git branch -fq feat/other main`, "feat/1");
   expectBool("#591: -fq FOREIGN force-create → M3 block", foreignCluster?.block === true, true);
@@ -711,6 +727,30 @@ dexpect("#591: branch -fuDevel force+upstream conflict → NOT force-create", `g
   expectBool("#591: own-branch --forc → ALLOWED (git refuses rc 128)", ownAbbrev === null, true);
   const ownSpace = fcM3(`git branch --force feat/1 main`, "feat/1");
   expectBool("#591: own-branch --force → ALLOWED (git refuses rc 128)", ownSpace === null, true);
+  // Round-2 review fold-ins (mode resolution, bare/compound bounds):
+  // git's MODE letters win over -f, and the carve-out only holds when a real
+  // worktree protects the branch AND the command's only state mutation is the
+  // own-branch attempt — otherwise the M3 default block applies (foreign
+  // force-create, `;`-compound laundering, bare-repo force-create all move
+  // refs rc 0).
+  const listFp = classifyGitCommandDetailed(`git branch -fl feat/other main`);
+  expectBool("#591 fold: -fl LIST-mode cluster → NOT branchState (list runs rc 0)", listFp.branchState === false, true);
+  const copyComp = classifyGitCommandDetailed(`git branch -f -c feat/1 side`);
+  expectBool("#591 fold: force+copy → branchState but NO carve-out branch (dest mutates)", copyComp.branchState === true, true);
+  const copyOp = copyComp.branchState
+    ? sharedClassifyBranchOp(copyComp.stateVerb, copyComp.stateArgs)
+    : { op: "other" };
+  expectBool("#591 fold: force+copy → op force WITHOUT branch (M3 default block)", copyOp.op === "force" && copyOp.branch == null, true);
+  const bareDeny = sharedDecideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", isBare: true });
+  expectBool("#591 fold: BARE repo own-branch force-create → still blocked (git succeeds)", bareDeny?.block === true, true);
+  const multiDeny = sharedDecideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: 2 });
+  expectBool("#591 fold: multi-state compound own-branch force-create → blocked (no launder)", multiDeny?.block === true, true);
+  const multiCount = classifyGitCommandDetailed(`git branch -fq feat/1 main ; git branch -fq feat/other main`);
+  expectBool("#591 fold: `;` compound → stateOpCount 2 (later segment counted)", multiCount.stateOpCount === 2 && multiCount.branchState === true, true);
+  const compDeny = sharedDecideM3({ branchOp: multiCount.branchState
+    ? sharedClassifyBranchOp(multiCount.stateVerb, multiCount.stateArgs)
+    : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: multiCount.stateOpCount ?? 1 });
+  expectBool("#591 fold: compound launder → M3 default block", compDeny?.block === true, true);
 }
 dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
 // ── #587 regression: merged NOARG flag-clusters ─────────────────────────────

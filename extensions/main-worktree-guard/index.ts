@@ -1135,6 +1135,14 @@ export default function (pi: ExtensionAPI) {
               // semantics); a baseline owned by another checkout must not
               // authorize a switch here.
               repoKey: eff.repoKey,
+              // #591: the benign-force carve-out (own-branch force-create
+              // passes through to git's rc-128 refusal) requires a NON-bare
+              // repo (bare repos have no worktree protecting the branch) and a
+              // command whose ONLY branch-state mutation is that own-branch
+              // attempt (later `;`-compound segments are invisible to this
+              // first-invocation gate — stateOpCount from the classifier).
+              isBare: eff.isBare === true,
+              stateOpCount: det.stateOpCount ?? 1,
             });
             if (m3?.block) return { block: true, reason: m3.reason };
             if (m3?.reBaseline) {

@@ -258,8 +258,28 @@ export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null) {
     effectiveCwd: cwd,
     isWorktree:
       state.gitDir.includes("/worktrees/") || state.gitDir.endsWith("/worktrees"),
+    // #591 (review fold-in): BARE repos have no worktree, so git's symbolic
+    // HEAD branch is NOT checked out anywhere and `git branch -f <that>`
+    // SUCCEEDS rc 0 — the decideM3 benign-force carve-out (premise: git
+    // refuses to touch the checked-out branch) must not fire there.
+    isBare: _isBareGitDir(state.gitDir),
     currentBranch: state.branch,
   };
+}
+
+/** Is `<gitDir>` the admin dir of a BARE repository (no worktree can exist)?
+ * Probe: `git rev-parse --is-bare-repository` with the resolved admin dir.
+ * Failure → true (conservative: the benign-force carve-out needs certainty
+ * that a worktree protects the branch). */
+function _isBareGitDir(gitDir) {
+  try {
+    return execSync(
+      `git --git-dir="${gitDir}" rev-parse --is-bare-repository`,
+      { encoding: "utf-8", timeout: 5000 },
+    ).trim() === "true";
+  } catch {
+    return true;
+  }
 }
 
 /** Expand `$VAR` / `${VAR}` in a cd target against same-command assignments.
@@ -330,23 +350,41 @@ export function classifyBranchOp(subcmd, args) {
         to: pos[1] ?? null,
       };
     }
-    // #591: force-create detection is TOKEN-level, not exact-match — git's
-    // parse-options merges NOARG shorts into one cluster (`-fq` ≡ `-f -q`;
-    // the f can sit anywhere: `-qf`, `-fvq` … probe-verified rc 0) and
-    // `--force` accepts its unambiguous prefix abbreviation `--forc`.
-    // classify-git.mjs's branch arm (branchState trigger) uses the SAME
-    // predicate — if this op classifier lagged, branchState true + op "other"
-    // would skip the M3 gate entirely (index.ts only enters M3 for op ≠
-    // "other"). Shape is duplicated from classify-git.mjs's
-    // isBranchForceCreateToken (cross-pinned by test-branch-ownership.mjs);
-    // the u-guard keeps -u<value> (set-upstream-to consumes the token rest)
-    // out, and --for/--forcfoo (rc-129 no-ops) are not force.
-    if (a.some((x) => x === "--force" || x === "--forc" ||
-      /^-(?![A-Za-z]*u)[A-Za-z]*f/.test(x))) {
-      const pos = a.filter((x) => !x.startsWith("-"));
-      return { op: "force", branch: pos[0] ?? null };
+    // #591 (round-2 review fold-ins): classify git-branch invocations by git's
+    // OWN mode resolution, not token shape. Three forces interact:
+    //   (a) FORCE-CREATE detection is token-level — git merges NOARG shorts
+    //       into one cluster (`-fq` ≡ `-f -q`; f anywhere in {f,v,q} with an
+    //       optional terminal t: `-qf`, `-fvq`, `-fvt` … probe-verified rc 0)
+    //       and `--force` accepts its unambiguous prefix abbreviation `--forc`.
+    //   (b) MODE letters WIN over -f (probe-verified): a d/D letter = DELETE
+    //       mode (`-df x` deletes), c/C = COPY, m/M = MOVE, a/i/l/r = LIST
+    //       (`-fl x main` lists rc 0, no ref moves) — none is a force-create.
+    //       Deletes must stay op "other" so they flow to the #587/#543 verdict
+    //       + ownership-allowance gate (a pid's post-ceremony local delete of
+    //       its OWN merged branch stays allowed; op force would M3-block it).
+    //   (c) COPY/MOVE composed with force (`git branch -f -c src dst`, `-C`)
+    //       mutate the DESTINATION — the SECOND positional — while the benign
+    //       M3 carve-out (#591) keys on branch == currentBranch. Returning a
+    //       branch field there would let the carve-out bless a foreign-ref
+    //       overwrite (round-2 reviewer P1, probe-verified rc 0: `-f -c main
+    //       side` moves `side`). Omit the branch → decideM3's default block
+    //       (pre-#591 parity: the exact `-f`/`--force` in such compositions
+    //       always M3-blocked). Cluster copies/moves (-cf/-fC/-mf, no exact
+    //       force token) fall to "other" — byte-identical to pre-#591 (#592's
+    //       family).
+    if (a.some((x) => /^--d/.test(x) || /^-(?![A-Za-z]*u)[A-Za-z]*[dD]/.test(x))) {
+      return { op: "other" }; // delete mode → #587/#543 verdict + ownership path
     }
-    return { op: "other" }; // create/list/delete-without-D — not checkout state
+    if (a.some((x) => x === "--force" || x === "--forc" || /^-[qv]*f[qv]*t?$/.test(x))) {
+      const copyOrMove = a.some((x) => x === "--copy" || x === "--move" ||
+        /^-(?![A-Za-z]*u)[A-Za-z]*[cC]/.test(x) || /^-(?![A-Za-z]*u)[A-Za-z]*[mM]/.test(x));
+      const pos = a.filter((x) => !x.startsWith("-"));
+      // (c): force+copy/move mutates the destination, not pos[0] → no branch
+      // field, so the #591 benign carve-out (branch === currentBranch) cannot
+      // fire and M3 default-blocks (pre-#591 parity for exact-force forms).
+      return { op: "force", branch: copyOrMove ? null : (pos[0] ?? null) };
+    }
+    return { op: "other" }; // create/list/rename-cluster/delete-without-D — not the force-create M3 path
   }
   return { op: "other" };
 }
@@ -450,11 +488,13 @@ export function decideM2({
  *   targeting a branch other than the checkout's OWN current branch — #591:
  *   a force-create whose target IS the branch currently checked out is
  *   git-refused rc 128, so the benign own-branch ceremony passes through to
- *   git's refusal) → block. The #376 return arm additionally requires repoKey === baseline.repoKey
+ *   git's refusal, but only in a NON-bare repo whose command has exactly one
+ *   state mutation (isBare false + stateOpCount 1; see the carve-out)) →
+ *   block. The #376 return arm additionally requires repoKey === baseline.repoKey
  *   (the resolved repo is the ONE where the original baseline was recorded — a
  *   cd into a DIFFERENT agent-infra clone must not authorize a switch there).
  */
-export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey }) {
+export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey, stateOpCount = 1, isBare = false }) {
   if (!branchOp) return null;
   const op = branchOp.op;
   if (op === "create-new") {
@@ -488,20 +528,36 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
   // #591 benign-force carve-out: force-create (`git branch -f <b> [<start>]`
   // — and its merged-cluster / --forc spellings, all of which classify op
   // "force" with branch = first positional) mutates the TARGET ref, so foreign
-  // / stale / detached targets hit the default block below. But when the
-  // target IS the branch currently checked out in the effective repo
-  // (branchOp.branch === currentBranch — "the current checkout's own branch"),
-  // git itself REFUSES the update: "cannot force update the branch '<b>' used
-  // by worktree at '<path>'" (probe-verified rc 128 for `--force <own>` and
-  // `-fq <own>` alike). No shared ref can ever move, so blocking would be a
-  // needless false positive on a legitimate ceremony step (e.g. an own-branch
-  // fast-forward attempt) — allow it through to git's natural rc-128 refusal.
-  // Checkout-force (`git checkout -f <t>` / `switch --discard-changes`) never
-  // matches: classifyBranchOp returns op "force" WITHOUT a branch field there
-  // (it discards uncommitted work rather than merely resetting a ref) —
-  // `branchOp.branch != null` keeps those blocked. Detached main-checkout
-  // starts (currentBranch null) can never equal a named target → still blocked.
-  if (op === "force" && branchOp.branch != null && branchOp.branch === currentBranch) {
+  // / stale targets hit the default block below. But when the target IS the
+  // branch currently checked out in the effective repo (branchOp.branch ===
+  // currentBranch — "the current checkout's own branch"), git itself REFUSES
+  // the update: "cannot force update the branch '<b>' used by worktree at
+  // '<path>'" (probe-verified rc 128 for `--force <own>` and `-fq <own>`
+  // alike). No shared ref can ever move, so blocking would be a needless false
+  // positive on a legitimate ceremony step (e.g. an own-branch fast-forward
+  // attempt) — allow it through to git's natural rc-128 refusal. Round-2
+  // review fold-ins bound the carve-out:
+  //   (a) CHECKOUT-force (`git checkout -f <t>` / `switch --discard-changes`)
+  //       never matches: classifyBranchOp returns op "force" WITHOUT a branch
+  //       field there (it discards uncommitted work rather than merely
+  //       resetting a ref) — `branchOp.branch != null` keeps those blocked.
+  //   (b) copy/move-composed force (classifyBranchOp omits branch for those —
+  //       the mutation target is the SECOND positional, not pos[0]) never
+  //       matches; detached main-checkout starts (currentBranch null) can
+  //       never equal a named target → blocked.
+  //   (c) isBare: a BARE effective repo has NO worktree to protect the branch
+  //       git reports as its symbolic HEAD — `git branch -fq main HEAD` in a
+  //       bare repo moves the ref rc 0 (probe-verified), so the carve-out's
+  //       "git refuses it" premise fails there → refuse the carve-out
+  //       (round-1 reviewer P2).
+  //   (d) stateOpCount > 1: the M3 gate classifies only the FIRST state
+  //       invocation; a `;`-compound whose later segment force-creates a
+  //       FOREIGN branch would otherwise launder through a benign first
+  //       segment (pre-#591 the exact-force first segment blocked the whole
+  //       command) → refuse the carve-out for multi-state commands (round-2
+  //       reviewer P1).
+  if (op === "force" && branchOp.branch != null && branchOp.branch === currentBranch
+      && (stateOpCount ?? 1) === 1 && !isBare) {
     return null;
   }
   // #376 carve-out: sanctioned ceremony return-to-baseline — switch back to the
