@@ -1510,12 +1510,34 @@ export function classifyGitCommandDetailed(command) {
         // arms (`git commit -m x && git branch -Dq y` blocks as
         // branch-force-delete), so a metachar-truncated twin must not downgrade
         // to block:commit/block:push (review fold-in round 4).
-        const hardUpperD = args.some((x) => /^-(?![A-Za-z]*u)[A-Za-z]*D/.test(x));
+        const hardUpperD = args.some((x) =>
+          // #591 (round-3 fold): value-aware flag run — a tracking-directive
+          // VALUE's letters never read as mode letters (`-Dftdirect`'s D is in
+          // the run and IS a hard delete; `-ftdirect`'s value "direct" carries
+          // no D and delNames is null there anyway).
+          /^-[A-Za-z]+$/.test(x) && /D/.test((_branchToken(x)?.run) ?? ""));
         const hardForce = delNames && args.some(isBranchForceCreateToken);
         const overridable = out.verdict === "allow" || out.verdict === "block:commit" ||
           out.verdict === "block:push" || out.verdict === "block:force-push";
         if (overridable && (hardUpperD || hardForce)) {
           out.verdict = "block:branch-force-delete";
+        }
+        // #591 (round-3 fold): the raw/skimmed STRING pass reads delete and
+        // force letters from the whole letter run, so a pure force-create's
+        // tracking-directive VALUE letters trip it (`-ftdirect victim base` is
+        // `-f --track=direct` — a real force-CREATE rc 0, but the "d" in
+        // "direct" makes the line-87 branch-force-delete pattern fire with
+        // phantom delete intent). The token-level read here is authoritative
+        // (delNames null = no delete token in THIS invocation), so when no
+        // other branch invocation in the command is a real delete either,
+        // downgrade the misfire to allow and let the M3 force arm gate the
+        // force-create (own-branch ceremony → benign carve-out; foreign → M3
+        // block). A genuine compound delete elsewhere (`git branch -fq x y &&
+        // git branch -Dq z`) has a branch-delete invocation → no downgrade.
+        if (delNames === null && out.verdict === "block:branch-force-delete" &&
+            !invocations.some((v) => v.verb === "branch" &&
+              branchDeleteNames("branch", v.args) !== null)) {
+          out.verdict = "allow";
         }
       }
     }
@@ -1538,6 +1560,12 @@ export function classifyGitCommandDetailed(command) {
   // block restores pre-#591 compound parity.
   out.stateOpCount = invocations.filter((v) =>
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb)).length;
+  // #591 (round-3 fold): a shell substitution ($(…)/backticks/eval) may hide a
+  // branch-state git invocation from the count above (collapse to one opaque
+  // token → stateOpCount undercounts). Exposed here so index.ts can refuse the
+  // M3 benign-force carve-out when hidden state mutation is present — see
+  // _hasHiddenStateSubst for the scan + why non-mutating payloads pass.
+  out.hiddenStateSubst = _hasHiddenStateSubst(String(command ?? ""));
 
   return out;
 }
@@ -2178,33 +2206,123 @@ export function isBranchForceCreateToken(a) {
 }
 
 /**
- * #591 (round 3): the NARROW pure-force-create test — a force-create ONLY when
- * git is actually in CREATE mode. git's mode letters WIN over -f (probe-
- * verified): `-fl x main`/`-lf`/`-fa` LIST rc 0 (no ref moves — `-l`/`-a`/`-r`
- * force list mode), `-cf a b`/`-fC a b` COPY the destination, `-Df x`
- * DELETEs, `-mf a b` moves — none is a force-create, and flagging one as such
- * false-blocks benign list commands or misroutes copy/move mutations to the
- * force-create M3 path. git merges only the NOARG shorts; branch's CREATE-mode
- * NOARG letters are {f,v,q,i} (probe-verified rc 0: `-i` does NOT force list
- * mode — `git branch -i x main` creates like `-i` were absent; only l/a/r do)
- * and `f` is REPEATABLE (`-ff`, `-fqf` ≡ `-f -q -f` — probe rc 0), with an
- * OPTIONAL TERMINAL `t` (track — `-ft`/`-fvt` create rc 0, but a mid-run t
- * consumes the rest as its value: `-tf`/`-ftq` rc 129 dead). So a pure
- * force-create short cluster is `-[qvif]*f[qvif]*t?` — letters from {q,v,i,f}
- * around at least one f, optional trailing t (the u-guard is implicit: u∉ the
- * class — `-u<value>` consumes the token rest as set-upstream mode). Long
- * compositions with an EXACT `--force` stay branchState by the long-form
- * clause — pre-#591 parity (the exact `--force` token always triggered M3;
- * `git branch --force --list` is a nonsense no-op, documented residual).
- * Shared shape with classifyBranchOp in branch-ownership.mjs (cross-pinned);
- * both layers MUST agree or a spelling bypasses the M3 gate (branchState true
- * but op "other" skips it).
+ * #591 (round 3 + fold): parse a single-dash git-branch token the way git's
+ * parse-options does — NOARG shorts merge into ONE run scanned LEFT→RIGHT, and
+ * an ARG-VALUE-TAKING short stops the run and consumes the REST of the token
+ * as its attached value. branch's value-takers: `u` (set-upstream-to — a
+ * REQUIRED value; the #587 u-guard excludes ANY u-containing token from
+ * delete/force/copy/move wholesale, since those modes conflict with
+ * set-upstream rc 129 and delete/create nothing) and `t` (--track,
+ * PARSE_OPT_OPTARG — a NON-TERMINAL t consumes the rest of the token as its
+ * tracking DIRECTIVE; a TERMINAL t is a plain NOARG flag = --track default).
+ * Letters inside an attached value are VALUE, never mode letters (round-3
+ * fold): `-ftdirect` parses `-f --track=direct` (a force-CREATE rc 0 —
+ * probe-verified victim moved) and its "direct" must NOT read as delete/copy
+ * letters, while `-Dftdirect` (`-D -f --track=direct`) IS a hard delete whose
+ * D/f sit in the run. Returns { run, tValue }: run = the NOARG flag letters
+ * before the first value-taker; tValue = the directive a mid-run t consumed
+ * (null when no mid-run t). Returns null when x is not a single-dash letter
+ * token or contains u.
+ * @param {string} x
+ * @returns {{ run: string, tValue: string|null }|null}
+ */
+function _branchToken(x) {
+  if (typeof x !== "string" || !/^-[A-Za-z]+$/.test(x)) return null;
+  const s = x.slice(1);
+  let run = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "u") return null; // set-upstream value-taker — mode-conflict rc129 (u-guard parity)
+    if (c === "t" && i < s.length - 1) {
+      // mid-run t: parse-options OPTARG consumes the token rest as its
+      // --track directive value — remaining letters are VALUE, not flags.
+      return { run, tValue: s.slice(i + 1) };
+    }
+    run += c;
+  }
+  return { run, tValue: null };
+}
+
+/**
+ * #591 (round 3 + fold): the NARROW pure-force-create test — a force-create
+ * ONLY when git is actually in CREATE mode. git's mode letters WIN over -f
+ * (probe-verified): `-fl x main`/`-lf`/`-fa` LIST rc 0 (no ref moves —
+ * `-l`/`-a`/`-r` force list mode), `-cf a b`/`-fC a b` COPY the destination,
+ * `-Df x` DELETEs, `-mf a b` moves — none is a force-create, and flagging one
+ * as such false-blocks benign list commands or misroutes copy/move mutations
+ * to the force-create M3 path. git merges only the NOARG shorts; branch's
+ * CREATE-mode NOARG letters are {f,v,q,i} (probe-verified rc 0: `-i` does NOT
+ * force list mode — `git branch -i x main` creates like `-i` were absent;
+ * only l/a/r do) and `f` is REPEATABLE (`-ff`, `-fqf` ≡ `-f -q -f` — probe
+ * rc 0). Letters are read VALUE-AWARELY via _branchToken (see there): the run
+ * holds the NOARG letters before the first value-taker, so a TERMINAL `t`
+ * (`-ft`/`-fvt` create rc 0) sits in the run while a NON-TERMINAL t consumes
+ * the rest of the token as its --track directive VALUE — git accepts exactly
+ * "direct"/"inherit" there (`-ftinherit`, `-fitinherit`, `-fqtdirect`,
+ * `-qftinherit` … all force-create rc 0 — round-3 reviewer P1, the
+ * tracking-directive ceremony family), and any other remainder is a parse
+ * error (`-tf`/`-ftq`/`-tqf`/`-ftVerbose`/`-ftdirectx` rc 129, creates
+ * nothing → excluded). So a pure force-create short cluster is a run matching
+ * `[qvif]*f[qvif]*t?` (the u-guard is implicit: _branchToken returns null for
+ * u). Long compositions with an EXACT `--force` stay branchState by the
+ * long-form clause — pre-#591 parity (the exact `--force` token always
+ * triggered M3; `git branch --force --list` is a nonsense no-op, documented
+ * residual). Shared shape with classifyBranchOp in branch-ownership.mjs
+ * (cross-pinned); both layers MUST agree or a spelling bypasses the M3 gate
+ * (branchState true but op "other" skips it).
  * @param {string} a
  * @returns {boolean}
  */
 export function isBranchForceCreateTokenNarrow(a) {
-  return a === "--force" || a === "--forc" ||
-    /^-[qvif]*f[qvif]*t?$/.test(a);
+  if (a === "--force" || a === "--forc") return true;
+  const tok = _branchToken(a);
+  if (!tok) return false;
+  // A mid-run t consumed a tracking directive: only git's two VALID --track
+  // values force-create rc 0; any other remainder is a parse error rc 129.
+  if (tok.tValue !== null && tok.tValue !== "direct" && tok.tValue !== "inherit") {
+    return false;
+  }
+  return /^[qvif]*f[qvif]*t?$/.test(tok.run);
+}
+
+/**
+ * #591 (round-3 fold): does `raw` HIDE a branch-STATE-MUTATING git invocation
+ * inside a shell substitution? allGitInvocations collapses `$(…)`/backticks/
+ * eval payloads to ONE opaque token, so `git branch -fq own old ; echo "$(git
+ * branch -fq victim old)"` reports stateOpCount 1 (only the visible segment)
+ * and the M3 benign carve-out on the own-branch segment would let the hidden
+ * FOREIGN force-create execute (pre-#591 the exact-force own segment blocked
+ * the whole command). Each substitution payload is re-tokenized and scanned
+ * for a MUTATING branch invocation: checkout/switch/symbolic-ref/update-ref
+ * always, git branch only with a rename/delete/force spelling — non-mutating
+ * branch READS (`--show-current`, `--list`, rev-parse payloads) stay benign-
+ * eligible so `git branch -fq own $(git rev-parse HEAD)` isn't a false block.
+ * Any hit → true → index.ts refuses the benign carve-out (decideM3 bound).
+ * Exported for cross-layer pins (test.mjs); the raw-text scan lives here so
+ * the substitution SHAPES stay single-sourced.
+ * @param {string} raw
+ * @returns {boolean}
+ */
+export function _hasHiddenStateSubst(raw) {
+  const source = String(raw ?? "");
+  const payloads = [];
+  const re = /\$\(([^()]*)\)|`([^`]*)`|eval\s+(?:"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = re.exec(source)) !== null) {
+    payloads.push(m[1] ?? m[2] ?? m[3] ?? m[4] ?? "");
+  }
+  for (const payload of payloads) {
+    for (const inv of allGitInvocations(payload)) {
+      if (["checkout", "switch", "symbolic-ref", "update-ref"].includes(inv.verb)) return true;
+      if (inv.verb === "branch" && (
+        inv.args.includes("-m") || inv.args.includes("-M") ||
+        branchDeleteNames("branch", inv.args) !== null ||
+        inv.args.some(isBranchForceCreateTokenNarrow))) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /**
@@ -2263,8 +2381,13 @@ export function branchDeleteNames(verb, args) {
     // a delete. Long form: `--delete` with its unambiguous `--d*` prefix
     // abbreviations (`--d`, `--de`, `--del`, … — branch's only `--d*` option;
     // parity with #443's push `--del` handling).
+    // #591 (round-3 fold): delete letters are read from the token's VALUE-
+    // AWARE flag run only (see _branchToken) — letters an arg-taking short
+    // consumed as an attached VALUE (`-ftdirect`'s "direct" — a real force-
+    // CREATE rc 0) must not read as delete letters. Non-u/non-mid-t tokens
+    // keep the whole-run semantics (`-Dq`, `-qD`, `-Dold` still delete-flag).
     const hasDelete = a.some((x) => /^--d/.test(x) ||
-      /^-(?![A-Za-z]*u)[A-Za-z]*[dD]/.test(x));
+      (/^-[A-Za-z]+$/.test(x) && /[dD]/.test((_branchToken(x)?.run) ?? "")));
     if (!hasDelete) return null;
     const names = [];
     for (const x of a) {

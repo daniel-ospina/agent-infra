@@ -306,6 +306,62 @@ function _expandCdVars(token, vars) {
 //   detach | other
 // `other` covers path-restore / discard-all / tag refs / non-HEAD refs — NOT
 // a checkout branch-state mutation.
+
+/**
+ * #591 (round-3 fold): value-aware single-dash branch-token parse — the
+ * EXACT duplicate of classify-git.mjs's _branchToken (cross-pinned; both
+ * layers MUST agree or a spelling bypasses the M3 gate). git's parse-options
+ * merges NOARG shorts into ONE run scanned left→right; an ARG-VALUE-TAKING
+ * short stops the run and consumes the token REST as its attached value.
+ * branch's value-takers: `u` (set-upstream-to — REQUIRED value; the #587
+ * u-guard excludes ANY u-containing token from delete/force/copy/move
+ * wholesale, since those modes conflict with set-upstream rc 129) and `t`
+ * (--track, PARSE_OPT_OPTARG — a NON-TERMINAL t consumes the rest as its
+ * tracking DIRECTIVE; a TERMINAL t is a plain NOARG flag). Value letters
+ * never read as mode letters: `-ftdirect` = `-f --track=direct` (a force-
+ * CREATE rc 0) — its "direct" must not read as delete/copy; `-Dftdirect` IS a
+ * delete (`-D -f --track=direct`, D/f in the run). Returns { run, tValue }
+ * or null (non-token / u).
+ * @param {string} x
+ * @returns {{ run: string, tValue: string|null }|null}
+ */
+function _branchToken(x) {
+  if (typeof x !== "string" || !/^-[A-Za-z]+$/.test(x)) return null;
+  const s = x.slice(1);
+  let run = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "u") return null; // set-upstream value-taker — mode-conflict rc129 (u-guard parity)
+    if (c === "t" && i < s.length - 1) {
+      // mid-run t: parse-options OPTARG consumes the token rest as its
+      // --track directive value — remaining letters are VALUE, not flags.
+      return { run, tValue: s.slice(i + 1) };
+    }
+    run += c;
+  }
+  return { run, tValue: null };
+}
+
+/**
+ * #591 (round-3 fold): pure-force-create token test — EXACT duplicate of
+ * classify-git.mjs's isBranchForceCreateTokenNarrow semantics (cross-pinned;
+ * branch-ownership must not import classify-git). See the classify-git doc:
+ * create-mode NOARG letters {f,v,q,i} with repeatable f, optional TERMINAL t
+ * in the run, and a NON-TERMINAL t must consume exactly "direct"/"inherit"
+ * (rc-0 force-creates); any other remainder is a parse error rc 129.
+ * @param {string} x
+ * @returns {boolean}
+ */
+function _narrowForceCreate(x) {
+  if (x === "--force" || x === "--forc") return true;
+  const tok = _branchToken(x);
+  if (!tok) return false;
+  if (tok.tValue !== null && tok.tValue !== "direct" && tok.tValue !== "inherit") {
+    return false;
+  }
+  return /^[qvif]*f[qvif]*t?$/.test(tok.run);
+}
+
 export function classifyBranchOp(subcmd, args) {
   const a = args || [];
   if (subcmd === "checkout" || subcmd === "switch") {
@@ -376,10 +432,15 @@ export function classifyBranchOp(subcmd, args) {
     //       always M3-blocked). Cluster copies/moves (-cf/-fC/-mf, no exact
     //       force token) fall to "other" — byte-identical to pre-#591 (#592's
     //       family).
-    if (a.some((x) => /^--d/.test(x) || /^-(?![A-Za-z]*u)[A-Za-z]*[dD]/.test(x))) {
+    if (a.some((x) => /^--d/.test(x) ||
+        // #591 (round-3 fold): value-aware flag run (see _branchToken) — a
+        // tracking-directive VALUE's letters (`-ftdirect`'s "direct", a real
+        // force-CREATE) never read as delete letters; the u-guard is inside
+        // _branchToken (null on u).
+        (/^-[A-Za-z]+$/.test(x) && /[dD]/.test((_branchToken(x)?.run) ?? "")))) {
       return { op: "other" }; // delete mode → #587/#543 verdict + ownership path
     }
-    if (a.some((x) => x === "--force" || x === "--forc" || /^-[qvif]*f[qvif]*t?$/.test(x))) {
+    if (a.some(_narrowForceCreate)) {
       const copyOrMove = a.some((x) =>
         // #591 round 3: git accepts UNAMBIGUOUS long-prefix abbreviations —
         // `--cop` → --copy (branch's only --cop* option; --co is ambiguous
@@ -388,7 +449,10 @@ export function classifyBranchOp(subcmd, args) {
         // under ANY of these spellings mutates the DESTINATION, so the branch
         // field must stay null (see (c)).
         /^--cop/.test(x) || /^--mo/.test(x) ||
-        /^-(?![A-Za-z]*u)[A-Za-z]*[cC]/.test(x) || /^-(?![A-Za-z]*u)[A-Za-z]*[mM]/.test(x));
+        // #591 (round-3 fold): value-aware flag run — a tracking-directive
+        // VALUE's letters (`-ftdirect`'s "direct") never read as copy/move.
+        (/^-[A-Za-z]+$/.test(x) && /[cC]/.test((_branchToken(x)?.run) ?? "")) ||
+        (/^-[A-Za-z]+$/.test(x) && /[mM]/.test((_branchToken(x)?.run) ?? "")));
       const pos = a.filter((x) => !x.startsWith("-"));
       // (c): force+copy/move mutates the destination, not pos[0] → no branch
       // field, so the #591 benign carve-out (branch === currentBranch) cannot
@@ -505,7 +569,7 @@ export function decideM2({
  *   (the resolved repo is the ONE where the original baseline was recorded — a
  *   cd into a DIFFERENT agent-infra clone must not authorize a switch there).
  */
-export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey, stateOpCount = 1, isBare = false }) {
+export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey, stateOpCount = 1, isBare = false, hiddenStateSubst = false }) {
   if (!branchOp) return null;
   const op = branchOp.op;
   if (op === "create-new") {
@@ -567,8 +631,15 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
   //       segment (pre-#591 the exact-force first segment blocked the whole
   //       command) → refuse the carve-out for multi-state commands (round-2
   //       reviewer P1).
+  //   (e) hiddenStateSubst: a shell substitution ($(…)/backticks/eval) may
+  //       hide a branch-state git invocation the tokenizer collapsed to one
+  //       opaque token — stateOpCount then undercounts (`git branch -fq own
+  //       old ; echo "$(git branch -fq victim old)"` reports 1) and the
+  //       carve-out on the own-branch segment would let the hidden FOREIGN
+  //       force-create execute → refuse when the classifier detected one
+  //       (round-3 reviewer P2; classify-git._hasHiddenStateSubst).
   if (op === "force" && branchOp.branch != null && branchOp.branch === currentBranch
-      && (stateOpCount ?? 1) === 1 && !isBare) {
+      && (stateOpCount ?? 1) === 1 && !isBare && !hiddenStateSubst) {
     return null;
   }
   // #376 carve-out: sanctioned ceremony return-to-baseline — switch back to the

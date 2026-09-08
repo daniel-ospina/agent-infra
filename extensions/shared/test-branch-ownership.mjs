@@ -235,6 +235,21 @@ ok("branchOp: branch -i alone (plain create) → other", op("branch", ["-i", "fe
 ok("branchOp: branch -f --cop src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["-f", "--cop", "main", "side"]); return r.op === "force" && r.branch == null; })());
 ok("branchOp: branch -f --mov src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["-f", "--mov", "main", "side"]); return r.op === "force" && r.branch == null; })());
 ok("branchOp: branch --force --cop src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["--force", "--cop", "main", "side"]); return r.op === "force" && r.branch == null; })());
+// #591 round-3 fold: a NON-TERMINAL t consumes the token REST as its --track
+// directive VALUE — git accepts exactly direct/inherit (rc-0 force-CREATEs, so
+// these are op force with the FIRST positional as target), while value letters
+// never read as mode letters (-ftdirect's "direct" is NOT a delete/copy) and
+// invalid remainders (-ftq, -tqf, -tfoo, -ftVerbose) are rc-129 no-ops → other.
+ok("branchOp: branch -ftinherit → force + target", (() => { const r = classifyBranchOp("branch", ["-ftinherit", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -fitinherit → force + target", (() => { const r = classifyBranchOp("branch", ["-fitinherit", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -fqtdirect → force + target (no delete misroute)", (() => { const r = classifyBranchOp("branch", ["-fqtdirect", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -ftdirect → force + target (value 'direct' not delete/copy)", (() => { const r = classifyBranchOp("branch", ["-ftdirect", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -qftdirect → force + target", (() => { const r = classifyBranchOp("branch", ["-qftdirect", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -ftq dead → other (not force)", (() => classifyBranchOp("branch", ["-ftq", "feat/x", "main"]).op === "other")());
+ok("branchOp: branch -tqf dead → other", (() => classifyBranchOp("branch", ["-tqf", "feat/x", "main"]).op === "other")());
+ok("branchOp: branch -ftVerbose dead → other", (() => classifyBranchOp("branch", ["-ftVerbose", "feat/x", "main"]).op === "other")());
+ok("branchOp: branch -Dftdirect → other (delete mode, D in flag run)", (() => classifyBranchOp("branch", ["-Dftdirect", "stale"]).op === "other")());
+ok("branchOp: branch -Dt → other (delete + terminal track)", (() => classifyBranchOp("branch", ["-Dt", "stale"]).op === "other")());
 ok("branchOp: branch -m", op("branch", ["-m", "feat/a", "feat/b"]) === "rename");
 ok("branchOp: branch -M bare rename", op("branch", ["-M", "feat/b"]) === "rename");
 ok("branchOp: branch create", op("branch", ["feat/c"]) === "other");
@@ -292,6 +307,7 @@ ok("M3 #591: checkout-force (no branch field) still blocks", (() => { const d = 
 // force-create would launder through the benign first segment.
 ok("M3 #591: BARE repo own-branch force-create → still blocked (git succeeds rc 0)", (() => { const d = decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1", isBare: true }); return d?.block === true; })());
 ok("M3 #591: multi-state compound own-branch force-create → blocked (no launder)", (() => { const d = decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1", stateOpCount: 2 }); return d?.block === true; })());
+ok("M3 #591: own-branch force-create + hiddenStateSubst → blocked (substitution launder)", (() => { const d = decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1", stateOpCount: 1, hiddenStateSubst: true }); return d?.block === true; })());
 ok("M3 #591: force+copy composition (no branch field) still blocks", (() => { const d = decideM3({ branchOp: { op: "force" }, isAgentInfra: true, baseline, currentBranch: "feat/1" }); return d?.block === true; })());
 // Real-git property backing the carve-out's safety: git refuses force-updating
 // the branch checked out in the current repo (rc 128 — nothing can move), while
@@ -330,6 +346,20 @@ ok("M3 #591: force+copy composition (no branch field) still blocks", (() => { co
   git(OTHER, "branch dst2 HEAD~1");
   const copComp = spawnSync("git", ["branch", "-f", "--cop", "main", "dst2"], { cwd: OTHER, encoding: "utf-8" });
   ok("M3 #591 real-git: -f --cop moves destination rc 0 (why branch field is null)", copComp.status === 0 && git(OTHER, "rev-parse dst2") === git(OTHER, "rev-parse main"), String(copComp.status));
+  // round-3 fold: the tracking-directive family force-creates rc 0 (a NON-
+  // TERMINAL t consumes the token rest as --track's directive; only
+  // direct/inherit are valid) — the M3 block is why they must classify force,
+  // and value letters must not misroute them to delete/copy. victim starts at
+  // HEAD~1 so a move is discriminating.
+  git(OTHER, "branch victim HEAD~1");
+  const tDirect = spawnSync("git", ["branch", "-ftdirect", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: -ftdirect force-creates rc 0 (t consumes directive)", tDirect.status === 0 && git(OTHER, "rev-parse victim") === git(OTHER, "rev-parse main"), String(tDirect.status));
+  const tInherit = spawnSync("git", ["branch", "-qftinherit", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: -qftinherit force-creates rc 0", tInherit.status === 0 && git(OTHER, "rev-parse victim") === git(OTHER, "rev-parse main"), String(tInherit.status));
+  const tDead = spawnSync("git", ["branch", "-ftq", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: -ftq invalid directive dead rc 129 (nothing created)", tDead.status === 129, String(tDead.status));
+  const tDead2 = spawnSync("git", ["branch", "-tfoo", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: -tfoo invalid directive dead rc 129", tDead2.status === 129, String(tDead2.status));
 }
 ok("M3: orphan blocks", (() => { const d = decideM3({ branchOp: { op: "orphan" }, isAgentInfra: true, baseline }); return d?.block === true; })());
 ok("M3: own rename re-baselines", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/2" }, isAgentInfra: false, baseline, currentBranch: "feat/1" }); return d?.reBaseline === "feat/2"; })());

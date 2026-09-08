@@ -1143,6 +1143,11 @@ export default function (pi: ExtensionAPI) {
               // first-invocation gate — stateOpCount from the classifier).
               isBare: eff.isBare === true,
               stateOpCount: det.stateOpCount ?? 1,
+              // #591 (round-3 fold): a shell substitution may hide another
+              // branch-state invocation from stateOpCount (collapse to one
+              // opaque token) — refuse the benign carve-out when the
+              // classifier detected one (_hasHiddenStateSubst).
+              hiddenStateSubst: det.hiddenStateSubst === true,
             });
             if (m3?.block) return { block: true, reason: m3.reason };
             if (m3?.reBaseline) {

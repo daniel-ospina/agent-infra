@@ -709,6 +709,33 @@ dexpect("#591 fold: branch -fit (i + terminal t) force-create → branchState", 
 dexpect("#591 fold: branch -fiv force-create → branchState", `git branch -fiv feat/1 main`, { branchState: true, newBranch: "feat/1" });
 // -i ALONE is a plain (non-force) create — git creates rc 0, no -f involved.
 dexpect("#591 fold: branch -i alone → plain create, NOT force", `git branch -i feat/1 main`, { branchState: false });
+// ── #591 round-3 fold: tracking-directive family ───────────────────────────
+// A NON-TERMINAL t consumes the token REST as its --track directive value; git
+// accepts exactly "direct"/"inherit" (rc-0 force-CREATEs, probe-verified — the
+// reviewers' round-3 P1: -ftinherit/-fitinherit/-fqtdirect … bypassed the M3
+// gate as {verdict:allow, branchState:false}). Value letters ("direct") must
+// NOT read as delete/copy letters — each form below is a pure force-create
+// with the FIRST positional as target and NO delete targets (no phantom
+// branch-force-delete verdict: the arm downgrades the raw value-letter misfire
+// and lets M3 gate the force-create).
+dexpect("#591 fold: branch -ftinherit force-create → branchState + target", `git branch -ftinherit feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591 fold: branch -fitinherit force-create → branchState + target", `git branch -fitinherit feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591 fold: branch -fqtinherit force-create → branchState + target", `git branch -fqtinherit feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591 fold: branch -qftdirect force-create → branchState + target", `git branch -qftdirect feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591 fold: branch -fqtdirect force-create → branchState + target (no phantom deletes)", `git branch -fqtdirect feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591 fold: branch -ivftinherit force-create → branchState + target", `git branch -ivftinherit feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+// track composed with DELETE stays a delete (mode letters in the flag run win):
+// -Dftdirect ≡ -D -f --track=direct — probe rc 0 hard delete of the target.
+dexpect("#591 fold: branch -Dftdirect track-delete → block + target (mode letters win)", `git branch -Dftdirect stale`, { verdict: "block:branch-force-delete", branchState: true, newBranch: "stale", deleteTargets: ["stale"] });
+dexpect("#591 fold: branch -Dt track-delete → block + target", `git branch -Dt stale`, { verdict: "block:branch-force-delete", branchState: true, newBranch: "stale", deleteTargets: ["stale"] });
+dexpect("#591 fold: branch -Dtdirect track-directive delete → block + target", `git branch -Dtdirect stale`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["stale"] });
+// INVALID directive remainders stay dead (rc 129, creates nothing) → NOT
+// force-create (branchState false). A d-bearing invalid value (-ftdirectx) can
+// still raw-block as branch-force-delete — the accepted over-block of an rc-129
+// no-op, exact pre-fold parity with -Dold.
+dexpect("#591 fold: branch -ftq invalid directive → NOT branchState", `git branch -ftq feat/1 main`, { branchState: false });
+dexpect("#591 fold: branch -tqf invalid directive → NOT branchState", `git branch -tqf feat/1 main`, { branchState: false });
+dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `git branch -ftVerbose feat/1 main`, { branchState: false });
 // ── #591: M3 gate outcomes for force-create (classify → classifyBranchOp →
 // decideM3 — the exact index.ts sequence on the branch-state invocation) ────
 // Foreign force-create targets (∉ the current checkout's own branch) hit the
@@ -782,6 +809,36 @@ dexpect("#591 fold: branch -i alone → plain create, NOT force", `git branch -i
   expectBool("#591 fold: -f --mov abbrev → op force WITHOUT branch (M3 block)", movOp.op === "force" && movOp.branch == null, true);
   const copM3 = sharedDecideM3({ branchOp: copOp, isAgentInfra: true, baseline: { repoKey: "k", branch: "main" }, currentBranch: "main", repoKey: "k", stateOpCount: copAbbrev.stateOpCount ?? 1 });
   expectBool("#591 fold: -f --cop under current-branch source → still M3 block (no carve-out)", copM3?.block === true, true);
+  // Round-3 fold-in: the tracking-directive family rides the SAME M3 force
+  // path as -fq — own-branch → benign carve-out (git rc-128 refusal), foreign
+  // → default block. No string-verdict bypass, no delete-misroute.
+  const tOwn = fcM3(`git branch -ftdirect feat/1 main`, "feat/1");
+  expectBool("#591 fold: own-branch -ftdirect → ALLOWED (git refuses rc 128)", tOwn === null, true);
+  const tForeign = fcM3(`git branch -ftinherit feat/other main`, "feat/1");
+  expectBool("#591 fold: -ftinherit FOREIGN force-create → M3 block", tForeign?.block === true, true);
+  const tDirForeign = fcM3(`git branch -fqtdirect feat/other main`, "feat/1");
+  expectBool("#591 fold: -fqtdirect FOREIGN force-create → M3 block", tDirForeign?.block === true, true);
+  // Round-3 fold-in (reviewer P2): a shell substitution ($(…)/backtick/eval)
+  // collapses to ONE opaque token, so a hidden FOREIGN force-create beside a
+  // benign own-branch segment reports stateOpCount 1 — the carve-out must
+  // refuse via hiddenStateSubst (else the hidden force-create executes).
+  const launder = classifyGitCommandDetailed(`git branch -fq feat/1 main ; echo "$(git branch -fq feat/other main)"`);
+  expectBool("#591 fold: substitution-hidden foreign force-create → hiddenStateSubst", launder.hiddenStateSubst === true, true);
+  expectBool("#591 fold: substitution launder keeps stateOpCount 1 (collapse)", launder.stateOpCount === 1 && launder.branchState === true, true);
+  const launderDeny = sharedDecideM3({ branchOp: launder.branchState ? sharedClassifyBranchOp(launder.stateVerb, launder.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: launder.stateOpCount ?? 1, hiddenStateSubst: launder.hiddenStateSubst === true });
+  expectBool("#591 fold: substitution launder → M3 default block (carve-out refused)", launderDeny?.block === true, true);
+  const btLaunder = classifyGitCommandDetailed(`git branch -fq feat/1 main ; echo \`git branch -fq feat/other main\``);
+  expectBool("#591 fold: backtick-hidden foreign force-create → hiddenStateSubst", btLaunder.hiddenStateSubst === true, true);
+  // Benign-eligibility: NON-mutating payloads (rev-parse / branch --show-
+  // current) do NOT trip the bound, so the own-branch ceremony with a
+  // substitution start-point keeps its carve-out.
+  const benignSub = classifyGitCommandDetailed(`git branch -fq feat/1 main $(git rev-parse HEAD)`);
+  expectBool("#591 fold: rev-parse payload NOT a hidden mutation", benignSub.hiddenStateSubst === false, true);
+  const benignSubShow = classifyGitCommandDetailed(`git branch -fq feat/1 main $(git branch --show-current)`);
+  expectBool("#591 fold: branch READ payload NOT a hidden mutation", benignSubShow.hiddenStateSubst === false, true);
+  const ownBenign = classifyGitCommandDetailed(`git branch -fq feat/1 main $(git rev-parse HEAD)`);
+  const ownBenignM3 = sharedDecideM3({ branchOp: ownBenign.branchState ? sharedClassifyBranchOp(ownBenign.stateVerb, ownBenign.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: ownBenign.stateOpCount ?? 1, hiddenStateSubst: ownBenign.hiddenStateSubst === true });
+  expectBool("#591 fold: own-branch + rev-parse payload → carve-out HOLDS", ownBenignM3 === null, true);
 }
 dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
 // ── #587 regression: merged NOARG flag-clusters ─────────────────────────────
