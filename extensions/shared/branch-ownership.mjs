@@ -350,24 +350,28 @@ export function classifyBranchOp(subcmd, args) {
         to: pos[1] ?? null,
       };
     }
-    // #591 (round-2 review fold-ins): classify git-branch invocations by git's
-    // OWN mode resolution, not token shape. Three forces interact:
+    // #591 (round-2/3 review fold-ins): classify git-branch invocations by
+    // git's OWN mode resolution, not token shape. Three forces interact:
     //   (a) FORCE-CREATE detection is token-level — git merges NOARG shorts
-    //       into one cluster (`-fq` ≡ `-f -q`; f anywhere in {f,v,q} with an
-    //       optional terminal t: `-qf`, `-fvq`, `-fvt` … probe-verified rc 0)
-    //       and `--force` accepts its unambiguous prefix abbreviation `--forc`.
-    //   (b) MODE letters WIN over -f (probe-verified): a d/D letter = DELETE
-    //       mode (`-df x` deletes), c/C = COPY, m/M = MOVE, a/i/l/r = LIST
-    //       (`-fl x main` lists rc 0, no ref moves) — none is a force-create.
-    //       Deletes must stay op "other" so they flow to the #587/#543 verdict
-    //       + ownership-allowance gate (a pid's post-ceremony local delete of
+    //       into one cluster (`-fq` ≡ `-f -q`); branch's CREATE-mode NOARG
+    //       letters are {f,v,q,i} with f repeatable (`-ff`, `-fi`, `-if`,
+    //       `-fqf` … probe rc 0; `-i` alone even creates — only l/a/r force
+    //       LIST mode) plus an optional TERMINAL `t` (track — `-ft`/`-fvt` rc
+    //       0; a mid-run t consumes the rest: `-tf` rc 129) — and `--force`
+    //       accepts its unambiguous prefix abbreviation `--forc`.
+    //   (b) MODE letters WIN over -f (probe-verified): d/D = DELETE mode
+    //       (`-df x` deletes), c/C = COPY, m/M = MOVE, l/a/r = LIST (`-fl x
+    //       main` lists rc 0, no ref moves) — none is a force-create. Deletes
+    //       must stay op "other" so they flow to the #587/#543 verdict +
+    //       ownership-allowance gate (a pid's post-ceremony local delete of
     //       its OWN merged branch stays allowed; op force would M3-block it).
-    //   (c) COPY/MOVE composed with force (`git branch -f -c src dst`, `-C`)
-    //       mutate the DESTINATION — the SECOND positional — while the benign
-    //       M3 carve-out (#591) keys on branch == currentBranch. Returning a
-    //       branch field there would let the carve-out bless a foreign-ref
-    //       overwrite (round-2 reviewer P1, probe-verified rc 0: `-f -c main
-    //       side` moves `side`). Omit the branch → decideM3's default block
+    //   (c) COPY/MOVE composed with force (`git branch -f -c src dst`, `-C`,
+    //       `--cop`/`--mo` long abbreviations) mutate the DESTINATION — the
+    //       SECOND positional — while the benign M3 carve-out (#591) keys on
+    //       branch == currentBranch. Returning a branch field there would let
+    //       the carve-out bless a foreign-ref overwrite (reviewer P1,
+    //       probe-verified rc 0: `-f -c main side` and `-f --cop main side`
+    //       move `side`). Omit the branch → decideM3's default block
     //       (pre-#591 parity: the exact `-f`/`--force` in such compositions
     //       always M3-blocked). Cluster copies/moves (-cf/-fC/-mf, no exact
     //       force token) fall to "other" — byte-identical to pre-#591 (#592's
@@ -375,8 +379,15 @@ export function classifyBranchOp(subcmd, args) {
     if (a.some((x) => /^--d/.test(x) || /^-(?![A-Za-z]*u)[A-Za-z]*[dD]/.test(x))) {
       return { op: "other" }; // delete mode → #587/#543 verdict + ownership path
     }
-    if (a.some((x) => x === "--force" || x === "--forc" || /^-[qv]*f[qv]*t?$/.test(x))) {
-      const copyOrMove = a.some((x) => x === "--copy" || x === "--move" ||
+    if (a.some((x) => x === "--force" || x === "--forc" || /^-[qvif]*f[qvif]*t?$/.test(x))) {
+      const copyOrMove = a.some((x) =>
+        // #591 round 3: git accepts UNAMBIGUOUS long-prefix abbreviations —
+        // `--cop` → --copy (branch's only --cop* option; --co is ambiguous
+        // with --column/--contains/--color, rc 129), `--mo`/`--mov` → --move
+        // (--m is ambiguous with --merged, rc 129). A force-composed copy/move
+        // under ANY of these spellings mutates the DESTINATION, so the branch
+        // field must stay null (see (c)).
+        /^--cop/.test(x) || /^--mo/.test(x) ||
         /^-(?![A-Za-z]*u)[A-Za-z]*[cC]/.test(x) || /^-(?![A-Za-z]*u)[A-Za-z]*[mM]/.test(x));
       const pos = a.filter((x) => !x.startsWith("-"));
       // (c): force+copy/move mutates the destination, not pos[0] → no branch

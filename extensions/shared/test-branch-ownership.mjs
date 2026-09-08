@@ -224,6 +224,17 @@ ok("branchOp: branch -f -c src dst (force+copy) → force WITHOUT branch", (() =
 ok("branchOp: branch --force -C src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["--force", "-C", "main", "side"]); return r.op === "force" && r.branch == null; })());
 ok("branchOp: branch -ft (terminal t) → force + target", (() => { const r = classifyBranchOp("branch", ["-ft", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
 ok("branchOp: branch -fvt (terminal t) → force + target", (() => { const r = classifyBranchOp("branch", ["-fvt", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+// #591 round-3: CREATE-mode NOARG letters are {f,v,q,i} (i does NOT force
+// list — only l/a/r do) and f is repeatable — all probe-verified rc 0.
+ok("branchOp: branch -fi (i in cluster) → force + target", (() => { const r = classifyBranchOp("branch", ["-fi", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -if → force + target", (() => { const r = classifyBranchOp("branch", ["-if", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -ff repeatable-f → force + target", (() => { const r = classifyBranchOp("branch", ["-ff", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -i alone (plain create) → other", op("branch", ["-i", "feat/x", "main"]) === "other");
+// #591 round-3: long-option ABBREVIATIONS of copy/move (--cop/--mo/--mov)
+// mutate the DESTINATION under force — branch field must stay null.
+ok("branchOp: branch -f --cop src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["-f", "--cop", "main", "side"]); return r.op === "force" && r.branch == null; })());
+ok("branchOp: branch -f --mov src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["-f", "--mov", "main", "side"]); return r.op === "force" && r.branch == null; })());
+ok("branchOp: branch --force --cop src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["--force", "--cop", "main", "side"]); return r.op === "force" && r.branch == null; })());
 ok("branchOp: branch -m", op("branch", ["-m", "feat/a", "feat/b"]) === "rename");
 ok("branchOp: branch -M bare rename", op("branch", ["-M", "feat/b"]) === "rename");
 ok("branchOp: branch create", op("branch", ["feat/c"]) === "other");
@@ -307,6 +318,18 @@ ok("M3 #591: force+copy composition (no branch field) still blocks", (() => { co
   // round-2 FP guard: list-mode cluster with f mutates nothing (rc 0 list).
   const listFp = spawnSync("git", ["branch", "-fl"], { cwd: MAIN, encoding: "utf-8" });
   ok("M3 #591 real-git: -fl LIST-mode runs rc 0 (no ref mutation → not force-create)", listFp.status === 0, String(listFp.status));
+  // round-3: i-cluster and repeatable-f force-creates are REAL (rc 0 moves a
+  // non-checked-out branch) — the M3 block is why they must classify force.
+  const iForce = spawnSync("git", ["branch", "-fi", "side", "main"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: -fi force-creates rc 0 (why i ∈ create-mode letters)", iForce.status === 0, String(iForce.status));
+  const ffForce = spawnSync("git", ["branch", "-ff", "side", "main"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: -ff repeatable-f force-creates rc 0", ffForce.status === 0, String(ffForce.status));
+  // round-3: --cop long-abbreviation copy under force mutates the destination
+  // rc 0 (carve-out must not fire on the source==current case). Create dst2 at
+  // main's PARENT so the copy is discriminating.
+  git(OTHER, "branch dst2 HEAD~1");
+  const copComp = spawnSync("git", ["branch", "-f", "--cop", "main", "dst2"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: -f --cop moves destination rc 0 (why branch field is null)", copComp.status === 0 && git(OTHER, "rev-parse dst2") === git(OTHER, "rev-parse main"), String(copComp.status));
 }
 ok("M3: orphan blocks", (() => { const d = decideM3({ branchOp: { op: "orphan" }, isAgentInfra: true, baseline }); return d?.block === true; })());
 ok("M3: own rename re-baselines", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/2" }, isAgentInfra: false, baseline, currentBranch: "feat/1" }); return d?.reBaseline === "feat/2"; })());

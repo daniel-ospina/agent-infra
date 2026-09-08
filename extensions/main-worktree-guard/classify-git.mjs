@@ -2178,21 +2178,24 @@ export function isBranchForceCreateToken(a) {
 }
 
 /**
- * #591 (round 2): the NARROW pure-force-create test — a force-create ONLY when
+ * #591 (round 3): the NARROW pure-force-create test — a force-create ONLY when
  * git is actually in CREATE mode. git's mode letters WIN over -f (probe-
- * verified): `-fl x main`/`-lf` LIST rc 0 (no ref moves), `-cf a b`/`-fC a b`
- * COPY the destination, `-Df x` DELETEs, `-mf a b` moves — none is a
- * force-create, and flagging them as one false-blocks benign list commands or
- * misroutes copy/move mutations to the force-create M3 path. git merges only
- * the NOARG shorts; branch's create-mode NOARG alphabet is {f,v,q} plus a
- * TERMINAL `t` (track — `-ft`/`-fvt` create rc 0, but a mid-run t consumes the
- * rest as its value: `-tf` rc 129 dead, probe-verified). So a pure force-create
- * short cluster is `-[qv]*f[qv]*t?` — letters from {q,v} around f, optional
- * trailing t. Every other letter (a/c/C/d/D/i/l/m/M/r/u …) is a mode letter or
- * an arg-taking short → not create-mode → not a force-create (long-list
- * compositions with an EXACT `--force` stay branchState by the long-form clause
- * below — pre-#591 parity: the exact `--force` token always triggered M3, and
- * an agent writing `git branch --force --list` is a nonsense no-op).
+ * verified): `-fl x main`/`-lf`/`-fa` LIST rc 0 (no ref moves — `-l`/`-a`/`-r`
+ * force list mode), `-cf a b`/`-fC a b` COPY the destination, `-Df x`
+ * DELETEs, `-mf a b` moves — none is a force-create, and flagging one as such
+ * false-blocks benign list commands or misroutes copy/move mutations to the
+ * force-create M3 path. git merges only the NOARG shorts; branch's CREATE-mode
+ * NOARG letters are {f,v,q,i} (probe-verified rc 0: `-i` does NOT force list
+ * mode — `git branch -i x main` creates like `-i` were absent; only l/a/r do)
+ * and `f` is REPEATABLE (`-ff`, `-fqf` ≡ `-f -q -f` — probe rc 0), with an
+ * OPTIONAL TERMINAL `t` (track — `-ft`/`-fvt` create rc 0, but a mid-run t
+ * consumes the rest as its value: `-tf`/`-ftq` rc 129 dead). So a pure
+ * force-create short cluster is `-[qvif]*f[qvif]*t?` — letters from {q,v,i,f}
+ * around at least one f, optional trailing t (the u-guard is implicit: u∉ the
+ * class — `-u<value>` consumes the token rest as set-upstream mode). Long
+ * compositions with an EXACT `--force` stay branchState by the long-form
+ * clause — pre-#591 parity (the exact `--force` token always triggered M3;
+ * `git branch --force --list` is a nonsense no-op, documented residual).
  * Shared shape with classifyBranchOp in branch-ownership.mjs (cross-pinned);
  * both layers MUST agree or a spelling bypasses the M3 gate (branchState true
  * but op "other" skips it).
@@ -2201,7 +2204,7 @@ export function isBranchForceCreateToken(a) {
  */
 export function isBranchForceCreateTokenNarrow(a) {
   return a === "--force" || a === "--forc" ||
-    /^-[qv]*f[qv]*t?$/.test(a);
+    /^-[qvif]*f[qvif]*t?$/.test(a);
 }
 
 /**

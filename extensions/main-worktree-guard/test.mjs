@@ -698,6 +698,17 @@ dexpect("#591 fold: branch -fC copy-cluster → NOT force-create (no exact -f)",
 // A TERMINAL t composes with force-create (`-ft`/`-fvt` = -f -v -t, rc 0).
 dexpect("#591 fold: branch -ft (terminal t) force-create → branchState + target", `git branch -ft feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
 dexpect("#591 fold: branch -fvt (terminal t) force-create → branchState + target", `git branch -fvt feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+// Round-3 review fold-in: branch's CREATE-mode NOARG letters are {f,v,q,i} —
+// `-i` (ignore-case) does NOT force list mode (only l/a/r do) — and f is
+// REPEATABLE (`-ff` ≡ -f -f, rc 0). -fi/-if/-ff/-fqf/-fiv/-fit all force-create.
+dexpect("#591 fold: branch -fi (i in cluster) force-create → branchState + target", `git branch -fi feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591 fold: branch -if force-create → branchState + target", `git branch -if feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591 fold: branch -ff repeatable-f force-create → branchState + target", `git branch -ff feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591 fold: branch -fqf repeatable-f force-create → branchState + target", `git branch -fqf feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591 fold: branch -fit (i + terminal t) force-create → branchState", `git branch -fit feat/1 main`, { branchState: true, newBranch: "feat/1" });
+dexpect("#591 fold: branch -fiv force-create → branchState", `git branch -fiv feat/1 main`, { branchState: true, newBranch: "feat/1" });
+// -i ALONE is a plain (non-force) create — git creates rc 0, no -f involved.
+dexpect("#591 fold: branch -i alone → plain create, NOT force", `git branch -i feat/1 main`, { branchState: false });
 // ── #591: M3 gate outcomes for force-create (classify → classifyBranchOp →
 // decideM3 — the exact index.ts sequence on the branch-state invocation) ────
 // Foreign force-create targets (∉ the current checkout's own branch) hit the
@@ -751,6 +762,26 @@ dexpect("#591 fold: branch -fvt (terminal t) force-create → branchState + targ
     ? sharedClassifyBranchOp(multiCount.stateVerb, multiCount.stateArgs)
     : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: multiCount.stateOpCount ?? 1 });
   expectBool("#591 fold: compound launder → M3 default block", compDeny?.block === true, true);
+  // Round-3 fold-in: long-option ABBREVIATIONS of copy/move (--cop → --copy,
+  // --mo/--mov → --move) must null the branch like their exact/cluster twins —
+  // a force-composed copy/move mutates the DESTINATION rc 0 (`-f --cop main
+  // side` clobbers side while branch field = main → carve-out would fire).
+  const iForeign = fcM3(`git branch -fi feat/other main`, "feat/1");
+  expectBool("#591 fold: -fi (i-cluster) FOREIGN force-create → M3 block", iForeign?.block === true, true);
+  const ffForeign = fcM3(`git branch -ff feat/other main`, "feat/1");
+  expectBool("#591 fold: -ff repeatable-f FOREIGN force-create → M3 block", ffForeign?.block === true, true);
+  const copAbbrev = classifyGitCommandDetailed(`git branch -f --cop main side`);
+  const copOp = copAbbrev.branchState
+    ? sharedClassifyBranchOp(copAbbrev.stateVerb, copAbbrev.stateArgs)
+    : { op: "other" };
+  expectBool("#591 fold: -f --cop abbrev → op force WITHOUT branch (M3 block)", copOp.op === "force" && copOp.branch == null, true);
+  const movAbbrev = classifyGitCommandDetailed(`git branch -f --mov main side`);
+  const movOp = movAbbrev.branchState
+    ? sharedClassifyBranchOp(movAbbrev.stateVerb, movAbbrev.stateArgs)
+    : { op: "other" };
+  expectBool("#591 fold: -f --mov abbrev → op force WITHOUT branch (M3 block)", movOp.op === "force" && movOp.branch == null, true);
+  const copM3 = sharedDecideM3({ branchOp: copOp, isAgentInfra: true, baseline: { repoKey: "k", branch: "main" }, currentBranch: "main", repoKey: "k", stateOpCount: copAbbrev.stateOpCount ?? 1 });
+  expectBool("#591 fold: -f --cop under current-branch source → still M3 block (no carve-out)", copM3?.block === true, true);
 }
 dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
 // ── #587 regression: merged NOARG flag-clusters ─────────────────────────────
