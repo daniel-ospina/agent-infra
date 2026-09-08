@@ -39,8 +39,8 @@ check_version
 
 # AGENTS.md materialization gate (#600) — AGENTS.md must contain the full base
 # rules inline, never a URL-inheritance stub (pi reads only local files).
-# Stage-guard BEFORE spawning the checker: one git call (~10ms) on commits that
-# don't touch AGENTS.md; full check (~50ms) only when AGENTS.md is staged.
+# Stage-guard BEFORE spawning the checker: one cheap git call on commits that
+# don't touch AGENTS.md; the full check runs only when AGENTS.md is staged.
 # Resolve the checker through scripts/ symlink (consumer repos) OR the
 # AGENT_INFRA_PATH fallback (repos whose real scripts/ dir lacks the checker,
 # e.g. swarm — a real-dir scripts/ is preserved at link time).

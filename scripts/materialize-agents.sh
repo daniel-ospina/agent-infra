@@ -3,8 +3,8 @@
 #   [full current AGENTS.base.md verbatim] + [repo-specific tail]
 #
 # The repo-specific tail is the portion of the consumer's existing AGENTS.md
-# after the BASE-END marker (`<!-- AGENTS-BASE-END -->`). On first run the
-# marker does not exist yet, so the script operates in one of two modes:
+# after the BASE-END marker (`<!-- AGENTS-BASE-END -->`). The script has
+# three modes:
 #
 #   --check <repo>   Verify base markers present (all universal rules reach pi).
 #                    Exit 0 = materialized, 1 = stub/missing (authoring-time gate).
@@ -70,15 +70,19 @@ if [ "$MODE" = "--check" ]; then
     # Materialized. Optionally surface base-head drift vs the canonical
     # template (non-blocking warning — rules still reach the model; drift
     # means the file predates newer base sections and --merge would refresh).
-    # Requires BOTH a resolvable template AND the BASE-END marker: without
-    # the marker the head region is undefined (whole file incl. repo tail
-    # would be compared — false positive on pre-marker repos like DMeer/
-    # eldato/agent-infra).
+    # Requires BOTH a resolvable template AND a canonical BASE-END marker
+    # (anchored, same rule as extraction — a lenient substring guard here
+    # would open the same guard/extract mismatch bug class fixed in --merge,
+    # producing a false drift warning on a byte-current file). Without the
+    # marker the head region is undefined (pre-marker repos like DMeer/
+    # eldato/agent-infra are exempt — their whole file incl. tail would
+    # otherwise be compared). EOLs are normalized (tr -d '\r') so a CRLF
+    # checkout doesn't trip a spurious drift warning.
     if [ -n "${AGENT_INFRA_PATH:-}" ] \
        && [ -f "$AGENT_INFRA_PATH/templates/AGENTS.base.md" ] \
-       && grep -qF "$MARKER" "$f"; then
-      HEAD=$(sed -n "1,/^${MARKER}[[:space:]]*$/p" "$f" | sed '$d')
-      TEMPLATE="$(cat "$AGENT_INFRA_PATH/templates/AGENTS.base.md")"
+       && grep -qE "^${MARKER}[[:space:]]*$" "$f"; then
+      HEAD=$(sed -n "1,/^${MARKER}[[:space:]]*$/p" "$f" | sed '$d' | tr -d '\r')
+      TEMPLATE="$(cat "$AGENT_INFRA_PATH/templates/AGENTS.base.md" | tr -d '\r')"
       # Compare only the pre-marker head (base-owned region) — repo edits in
       # the head region count as drift (base is mechanical, base-owned).
       if [ "$HEAD" != "$TEMPLATE" ]; then
@@ -118,13 +122,15 @@ if [ "$MODE" = "--merge" ]; then
   # trailing space or CRLF on the marker line made the guard pass but the sed
   # range match nothing → TAIL_BODY empty → silent tail truncation (#600
   # review P1). Use an anchored grep with [[:space:]]*$ that tolerates
-  # trailing whitespace/CRLF, and back up the file before overwriting.
+  # trailing whitespace/CRLF.
   if ! grep -qE "^${MARKER}[[:space:]]*$" "$f"; then
     echo "⛔ $REPO has no BASE-END marker — cannot auto-merge. First materialize with --new."
     exit 1
   fi
-  # Tail = everything after the marker line (marker line itself included once)
-  TAIL_BODY=$(sed -n "/^${MARKER}[[:space:]]*$/,\$p" "$f")
+  # Tail = everything after the marker line (marker line itself included once),
+  # CR-normalized so the LF template head and CRLF tail don't produce a
+  # mixed-EOL file (#600 review P2).
+  TAIL_BODY=$(sed -n "/^${MARKER}[[:space:]]*$/,\$p" "$f" | tr -d '\r')
   # Safety: refuse a merge that would lose the tail (extraction produced
   # nothing below the marker but the file is longer than the marker alone).
   # The original is untouched until the new file is fully built + mv'd, so no

@@ -52,8 +52,8 @@ if [ -f scripts/check-cost-config.sh ]; then
 fi
 
 # AGENTS.md materialization gate (#600): stage-guard BEFORE spawning the
-# checker — one git call (~10ms) unless AGENTS.md is staged, then full
-# check (~50ms). Resolve checker via scripts/ symlink OR $AGENT_INFRA_PATH
+# checker — one cheap git call unless AGENTS.md is staged, then the full
+# check. Resolve checker via scripts/ symlink OR $AGENT_INFRA_PATH
 # (repos whose real scripts/ dir lacks it, e.g. swarm).
 if git diff --cached --name-only -- AGENTS.md 2>/dev/null | grep -q .; then
   CHECKER="scripts/check-agents-materialized.sh"
