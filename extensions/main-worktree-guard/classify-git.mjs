@@ -2327,8 +2327,10 @@ export function isBranchForceCreateTokenNarrow(a) {
  * @returns {boolean}
  */
 /**
- * #591 (round-7): ANSI-C $'…' escape translation — \n \t \r \a \b \f \v \\ \'
- * \" \$ \e/\E \cX (char & 0x1f: \cJ = LF) \xHH \uHHHH \UHHHHHHHH and octal.
+ * #591 (round-7/8): ANSI-C $'…' escape translation — \n \t \r \a \b \f \v \\ \'
+ * \" \$ \e/\E \cX (char & 0x1f: \cJ = LF) \xHH \uHHHH (1-4 hex digits,
+ * greedy — \uA = LF, cycle-5 P1) \UHHHHHHHH (1-8 digits) and octal. Code points
+ * above 0x10FFFF clamp to U+FFFD (cycle-5 P2) rather than throwing.
  * Applied to ANSI-C payloads BEFORE scanning: an untranslated multiline payload
  * (`sh -c $'echo a\ngit branch -fq victim main'`) tokenizes as ONE glued word
  * and the hidden git invocation is invisible (round-6/7 reviewers P1, probe-
@@ -2338,9 +2340,16 @@ export function isBranchForceCreateTokenNarrow(a) {
  */
 function _ansiTranslate(s) {
   const ansiMap = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"', $: "$", a: "\u0007", b: "\b", f: "\f", v: "\v", e: "\u001b", E: "\u001b" };
-  return s.replace(/\\(c[A-Za-z]|x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3}|[eE\\'"$ntrabvf])/g, (mm, e) => {
+  return s.replace(/\\(c[A-Za-z]|x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|[eE\\'"$ntrabvf])/g, (mm, e) => {
     if (e[0] === "x") return String.fromCharCode(parseInt(e.slice(1), 16));
-    if (e[0] === "u" || e[0] === "U") return String.fromCodePoint(parseInt(e.slice(1), 16));
+    if (e[0] === "u" || e[0] === "U") {
+      // bash/zsh decode \u with 1-4 hex digits and \U with 1-8, greedily
+      // (`\uA` = LF — round-7 cycle-4 reviewer P1, probe-verified rc 0), and
+      // reject code points > 0x10FFFF (round-8 cycle-5 P2: String.fromCodePoint
+      // would throw a RangeError on valid shell input — clamp instead).
+      const cp = parseInt(e.slice(1), 16);
+      return cp > 0x10FFFF ? "\uFFFD" : String.fromCodePoint(cp);
+    }
     if (e[0] === "c") return String.fromCharCode((e.charCodeAt(1) ?? 0) & 0x1f);
     if (/^[0-7]+$/.test(e)) return String.fromCharCode(parseInt(e, 8));
     return ansiMap[e] ?? mm;

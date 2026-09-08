@@ -901,6 +901,20 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
   expectBool("#591 fold: ANSI-decoded \\x24\\x3c file-read → hiddenStateSubst", ansiHex.hiddenStateSubst === true, true);
   const ansiHexDeny = sharedDecideM3({ branchOp: ansiHex.branchState ? sharedClassifyBranchOp(ansiHex.stateVerb, ansiHex.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: ansiHex.stateOpCount ?? 1, hiddenStateSubst: ansiHex.hiddenStateSubst === true });
   expectBool("#591 fold: ANSI-decoded launder → M3 default block", ansiHexDeny?.block === true, true);
+  // Round-9 fold-in (cycle-5 reviewer P1/P2): bash/zsh decode \u with 1-4 hex
+  // digits and \U with 1-8, greedily — `\uA` = LF splits the ANSI payload
+  // into a second command (`sh -c $'echo hi\uAgit branch -fq victim main'`
+  // force-creates a FOREIGN ref rc 0 in real zsh; the fixed-width {4}/{8}
+  // round-8 regex missed every short form). >0x10FFFF clamps to U+FFFD rather
+  // than throwing a String.fromCodePoint RangeError (ordinary-input DoS).
+  const ansiUa = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'echo hi\\uAgit branch -fq feat/other main'`);
+  expectBool("#591 fold: greedy \\uA short-digit escape → hiddenStateSubst", ansiUa.hiddenStateSubst === true, true);
+  const ansiUaDeny = sharedDecideM3({ branchOp: ansiUa.branchState ? sharedClassifyBranchOp(ansiUa.stateVerb, ansiUa.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: ansiUa.stateOpCount ?? 1, hiddenStateSubst: ansiUa.hiddenStateSubst === true });
+  expectBool("#591 fold: greedy short-digit launder → M3 default block", ansiUaDeny?.block === true, true);
+  const ansiU3b = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'echo a\\u3bgit branch -fq feat/other main'`);
+  expectBool("#591 fold: greedy \\u3b semicolon escape → hiddenStateSubst", ansiU3b.hiddenStateSubst === true, true);
+  const ansiBigU = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'echo \\U00110000x; git branch -fq feat/other main'`);
+  expectBool("#591 fold: \\U>0x10FFFF clamps without crashing → hiddenStateSubst", ansiBigU.hiddenStateSubst === true, true);
   // Benign-eligibility: NON-mutating payloads (rev-parse / branch --show-
   // current) do NOT trip the bound, so the own-branch ceremony with a
   // substitution start-point keeps its carve-out.
