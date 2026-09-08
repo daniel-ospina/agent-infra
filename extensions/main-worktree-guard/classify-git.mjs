@@ -2286,17 +2286,29 @@ export function isBranchForceCreateTokenNarrow(a) {
 }
 
 /**
- * #591 (round-3 fold): does `raw` HIDE a branch-STATE-MUTATING git invocation
- * inside a shell substitution? allGitInvocations collapses `$(…)`/backticks/
- * eval payloads to ONE opaque token, so `git branch -fq own old ; echo "$(git
- * branch -fq victim old)"` reports stateOpCount 1 (only the visible segment)
- * and the M3 benign carve-out on the own-branch segment would let the hidden
- * FOREIGN force-create execute (pre-#591 the exact-force own segment blocked
- * the whole command). Each substitution payload is re-tokenized and scanned
- * for a MUTATING branch invocation: checkout/switch/symbolic-ref/update-ref
- * always, git branch only with a rename/delete/force spelling — non-mutating
- * branch READS (`--show-current`, `--list`, rev-parse payloads) stay benign-
- * eligible so `git branch -fq own $(git rev-parse HEAD)` isn't a false block.
+ * #591 (round-3/4 fold): does `raw` HIDE a branch-STATE-MUTATING git invocation
+ * in content allGitInvocations cannot see per-invocation? allGitInvocations
+ * collapses `$(…)`/backticks/eval/alias payloads to ONE opaque token, so
+ * `git branch -fq own old ; echo "$(git branch -fq victim old)"` reports
+ * stateOpCount 1 (only the visible segment) and the M3 benign carve-out on the
+ * own-branch segment would let the hidden FOREIGN force-create execute
+ * (pre-#591 the exact-force own segment blocked the whole command). Scan:
+ *   - every PAREN-BALANCED substitution span ($(…) and backticks — a naive
+ *     `[^)]*` regex truncated at the FIRST `)` and NESTED substitutions
+ *     evaded detection entirely: round-4 reviewer P1, probe-verified rc 0),
+ *     recursing into nested spans;
+ *   - each span re-tokenized and scanned for a MUTATING branch invocation:
+ *     checkout/switch/symbolic-ref/update-ref always, git branch only with a
+ *     rename/delete/force spelling — non-mutating branch READS
+ *     (`--show-current`, `--list`, rev-parse payloads) stay benign-eligible so
+ *     `git branch -fq own $(git rev-parse HEAD)` isn't a false block;
+ *   - a top-level `__unverifiable__` segment (eval/alias/`$VAR` indirection
+ *     whose expansion cannot be classified — round-4 reviewer P2, probe-verified
+ *     `EV="git branch -fq victim main"; eval $EV` moves a foreign ref rc 0):
+ *     fail closed — content that cannot be PROVEN free of another state
+ *     mutation must refuse the carve-out (same rationale as M4's fail-closed
+ *     `__unverifiable__` block; a benign ceremony that also runs an
+ *     unverifiable `$VAR` segment is the accepted safe-direction false block).
  * Any hit → true → index.ts refuses the benign carve-out (decideM3 bound).
  * Exported for cross-layer pins (test.mjs); the raw-text scan lives here so
  * the substitution SHAPES stay single-sourced.
@@ -2305,22 +2317,55 @@ export function isBranchForceCreateTokenNarrow(a) {
  */
 export function _hasHiddenStateSubst(raw) {
   const source = String(raw ?? "");
-  const payloads = [];
-  const re = /\$\(([^()]*)\)|`([^`]*)`|eval\s+(?:"([^"]*)"|'([^']*)')/g;
-  let m;
-  while ((m = re.exec(source)) !== null) {
-    payloads.push(m[1] ?? m[2] ?? m[3] ?? m[4] ?? "");
-  }
-  for (const payload of payloads) {
-    for (const inv of allGitInvocations(payload)) {
-      if (["checkout", "switch", "symbolic-ref", "update-ref"].includes(inv.verb)) return true;
-      if (inv.verb === "branch" && (
-        inv.args.includes("-m") || inv.args.includes("-M") ||
-        branchDeleteNames("branch", inv.args) !== null ||
-        inv.args.some(isBranchForceCreateTokenNarrow))) {
-        return true;
-      }
+  const mutates = (inv) => {
+    if (["checkout", "switch", "symbolic-ref", "update-ref"].includes(inv.verb)) return true;
+    return inv.verb === "branch" && (
+      inv.args.includes("-m") || inv.args.includes("-M") ||
+      branchDeleteNames("branch", inv.args) !== null ||
+      inv.args.some(isBranchForceCreateTokenNarrow));
+  };
+  // Top-level unverifiable segment (eval/alias/$VAR command indirection) —
+  // its expansion is unclassifiable, so it may hide a second state mutation.
+  if (allGitInvocations(source).some((inv) => inv.verb === "__unverifiable__")) return true;
+  // Escaped backticks (\`) signal NESTED backtick content — the shell resolves
+  // the inner backticks before the outer span; a plain first-backtick-to-next-
+  // backtick pairing misreads the escapes (round-4 reviewer P1 evidence).
+  // Cannot parse reliably → fail closed (a legit escaped backtick inside a
+  // substitution is rare; over-refusal is the safe direction).
+  if (/\\`/.test(source)) return true;
+  // Paren-balanced spans from the raw string AND from each token (an UNQUOTED
+  // `$( … )` splits into separate tokens on the walk; the raw scan covers
+  // quoted whole spans). Recurse: a span may itself contain nested spans.
+  const seen = new Set();
+  const scan = (inner) => {
+    if (inner === undefined || inner.length === 0 || seen.has(inner)) return false;
+    seen.add(inner);
+    for (const inv of allGitInvocations(inner)) {
+      if (inv.verb === "__unverifiable__") return true;
+      if (mutates(inv)) return true;
     }
+    for (const sub of _extractSubstitutionSpans(inner)) {
+      if (scan(sub)) return true;
+    }
+    return false;
+  };
+  for (const inner of _extractSubstitutionSpans(source)) {
+    if (scan(inner)) return true;
+  }
+  for (const t of _tokenize(source)) {
+    for (const inner of _extractSubstitutionSpans(t)) {
+      if (scan(inner)) return true;
+    }
+  }
+  // eval "…"/'…' with a STATIC literal payload: the span extractor does not
+  // cover eval (it is a builtin word, not a substitution); scan the payload
+  // directly (a non-static eval argument — `eval $EV` — hits the top-level
+  // __unverifiable__ fail-closed above, round-4 reviewer P2).
+  const evalRe = /eval\s+(?:"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = evalRe.exec(source)) !== null) {
+    const payload = m[1] ?? m[2] ?? "";
+    if (payload.length > 0 && scan(payload)) return true;
   }
   return false;
 }

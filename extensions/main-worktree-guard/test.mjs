@@ -829,6 +829,23 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
   expectBool("#591 fold: substitution launder → M3 default block (carve-out refused)", launderDeny?.block === true, true);
   const btLaunder = classifyGitCommandDetailed(`git branch -fq feat/1 main ; echo \`git branch -fq feat/other main\``);
   expectBool("#591 fold: backtick-hidden foreign force-create → hiddenStateSubst", btLaunder.hiddenStateSubst === true, true);
+  // Round-4 fold-in (reviewer P1): NESTED substitutions evade the naive
+  // first-')' payload regex (only the inner benign rev-parse span was seen) —
+  // paren-balanced extraction must surface the OUTER mutating invocation, and
+  // escaped-backtick nesting + `eval $VAR` indirection must fail closed.
+  const nested = classifyGitCommandDetailed(`git branch -fq feat/1 main ; echo "$(git branch -fq feat/other $(git rev-parse HEAD))"`);
+  expectBool("#591 fold: NESTED \$( ) foreign force-create → hiddenStateSubst", nested.hiddenStateSubst === true, true);
+  expectBool("#591 fold: nested substitution keeps stateOpCount 1 (collapse)", nested.stateOpCount === 1, true);
+  const nestedDeny = sharedDecideM3({ branchOp: nested.branchState ? sharedClassifyBranchOp(nested.stateVerb, nested.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: nested.stateOpCount ?? 1, hiddenStateSubst: nested.hiddenStateSubst === true });
+  expectBool("#591 fold: nested-substitution launder → M3 default block", nestedDeny?.block === true, true);
+  const evalVar = classifyGitCommandDetailed(`git branch -fq feat/1 main ; EV="git branch -fq feat/other main"; eval $EV`);
+  expectBool("#591 fold: eval \$VAR hidden foreign force-create → hiddenStateSubst", evalVar.hiddenStateSubst === true, true);
+  const evalQuoted = classifyGitCommandDetailed(`git branch -fq feat/1 main ; eval "git branch -fq feat/other main"`);
+  expectBool("#591 fold: eval quoted hidden foreign force-create → hiddenStateSubst", evalQuoted.hiddenStateSubst === true, true);
+  const escBt = classifyGitCommandDetailed(`git branch -fq feat/1 main ; echo \`echo \\\`git branch -fq feat/other main\\\`\``);
+  expectBool("#591 fold: escaped-backtick nesting → hiddenStateSubst (fail closed)", escBt.hiddenStateSubst === true, true);
+  const evalVarDeny = sharedDecideM3({ branchOp: evalVar.branchState ? sharedClassifyBranchOp(evalVar.stateVerb, evalVar.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: evalVar.stateOpCount ?? 1, hiddenStateSubst: evalVar.hiddenStateSubst === true });
+  expectBool("#591 fold: eval-var launder → M3 default block (carve-out refused)", evalVarDeny?.block === true, true);
   // Benign-eligibility: NON-mutating payloads (rev-parse / branch --show-
   // current) do NOT trip the bound, so the own-branch ceremony with a
   // substitution start-point keeps its carve-out.
@@ -836,6 +853,9 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
   expectBool("#591 fold: rev-parse payload NOT a hidden mutation", benignSub.hiddenStateSubst === false, true);
   const benignSubShow = classifyGitCommandDetailed(`git branch -fq feat/1 main $(git branch --show-current)`);
   expectBool("#591 fold: branch READ payload NOT a hidden mutation", benignSubShow.hiddenStateSubst === false, true);
+  // Round-4: benign NON-mutating payloads stay benign even when NESTED.
+  const benignNested = classifyGitCommandDetailed(`git branch -fq feat/1 main $(echo "$(git rev-parse HEAD)")`);
+  expectBool("#591 fold: nested rev-parse payload NOT a hidden mutation", benignNested.hiddenStateSubst === false, true);
   const ownBenign = classifyGitCommandDetailed(`git branch -fq feat/1 main $(git rev-parse HEAD)`);
   const ownBenignM3 = sharedDecideM3({ branchOp: ownBenign.branchState ? sharedClassifyBranchOp(ownBenign.stateVerb, ownBenign.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: ownBenign.stateOpCount ?? 1, hiddenStateSubst: ownBenign.hiddenStateSubst === true });
   expectBool("#591 fold: own-branch + rev-parse payload → carve-out HOLDS", ownBenignM3 === null, true);
