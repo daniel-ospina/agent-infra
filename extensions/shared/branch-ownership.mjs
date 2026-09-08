@@ -391,7 +391,9 @@ function _branchMode(x) {
 
 /**
  * #592: copy-family state — EXACT duplicate of classify-git.mjs's
- * isBranchForceCopyArgs semantics (cross-pinned). copyMode = a token whose
+ * _branchCopyState (cross-pinned; a drift between the layers would set
+ * branchState in one and op "other" in the other — silently skipping M3).
+ * copyMode = a token whose
  * value-aware run is the COPY family (mixed-mode runs excluded above) OR the
  * git-valid long form/abbreviation `--copy`/`--cop` (--co is ambiguous with
  * --column/--contains/--color, rc 129 → excluded; --copfoo unknown-option rc
@@ -423,14 +425,17 @@ function _branchCopyState(args) {
  * from the next argv as a branch-name positional, corrupting dst/from/to
  * extraction for the M3 gate. git's parse-options lets a mutating-mode
  * invocation carry LIST options whose REQUIRED value is consumed from the
- * SEPARATE next argv (probe-verified rc 0 + real ref mutation): `--sort`/
- * `--format` and their unambiguous prefixes `--sor`/`--form` (--so/--fo/--for
- * are ambiguous with --show-current/--force/--format rc 129; a value never
- * lands in the branch-name slot for an option git REJECTS in copy/move/
- * force-create mode — --points-at/--contains/--merged/--no-merged/-u/
- * --set-upstream-to all error rc 128/129 there, probe-verified, so they are
- * NOT modeled; attached `--sort=x` never consumes the next argv). A `--`
- * terminator ends flag parsing (everything after is a positional).
+ * SEPARATE next argv (probe-verified rc 0 + real ref mutation): `--sort` and
+ * `--format` under every UNAMBIGUOUS prefix git accepts (`--so`/`--sor`/
+ * `--sort` — --so is minimal: --show-current diverges at --sh, --s is
+ * ambiguous with --show-current rc 129; `--form`/`--forma`/`--format` — --fo/
+ * --for are ambiguous with --force rc 129). Other branch value-takers never
+ * land a value in the branch-name slot of a MUTATING invocation: in copy/move/
+ * delete arms --points-at/--contains/-u/--set-upstream-to error rc 129 and
+ * --merged/--no-merged/--column/--color/--abbrev rc 128 (probe-verified), and
+ * under `-f` the filter options FLIP git to rc-0 no-mutation LIST mode;
+ * attached `--sort=x` never consumes the next argv. A `--` terminator ends
+ * flag parsing (everything after is a positional).
  * @param {string[]} args
  * @returns {string[]} the true positional (branch-name) argv slots
  */
@@ -441,7 +446,7 @@ function _branchPositionals(args) {
     const x = args[i];
     if (!flagsDone && x === "--") { flagsDone = true; continue; }
     if (!flagsDone && x.startsWith("-")) {
-      if (/^--sor(?:t)?$/.test(x) || /^--form(?:at)?$/.test(x)) i++; // consumes the next argv as its value
+      if (/^--so(?:rt?)?$/.test(x) || /^--form(?:at?)?$/.test(x)) i++; // consumes the next argv as its value
       continue;
     }
     pos.push(x);

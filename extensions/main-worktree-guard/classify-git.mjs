@@ -2393,15 +2393,20 @@ function _branchCopyState(args) {
 /**
  * #592 (round-2 review fold-in): branch positional extraction — EXACT
  * duplicate of branch-ownership.mjs's _branchPositionals (cross-pinned). See
- * there for the git semantics: --sort/--format and their unambiguous prefixes
- * --sor/--form consume the SEPARATE next argv as their REQUIRED value even in
- * copy/move/force-create mode (probe-verified rc 0 + real ref mutation), so
- * the naive non-dash filter would count that value as a branch-name
- * positional and corrupt the M3 dst/from/to extraction. Options git REJECTS in
- * mutating modes (--points-at/--contains/--merged/--no-merged/-u/--set-
- * upstream-to — rc 128/129, no mutation) never consume a value into the
- * branch-name slot; attached `--sort=x` never consumes the next argv; `--`
- * terminates flag parsing.
+ * there for the git semantics: --sort/--format under every UNAMBIGUOUS prefix
+ * git accepts (--so/--sor/--sort — --so is minimal: --show-current diverges
+ * at --sh, --s is ambiguous with --show-current rc 129; --form/--forma/
+ * --format — --fo/--for are ambiguous with --force rc 129) consume the
+ * SEPARATE next argv as their REQUIRED value even in copy/move/force-create
+ * mode (probe-verified rc 0 + real ref mutation), so the naive non-dash filter
+ * would count that value as a branch-name positional and corrupt the M3
+ * dst/from/to extraction. Other branch value-takers never land a value in the
+ * branch-name slot of a MUTATING invocation: in copy/move/delete arms
+ * --points-at/--contains/-u/--set-upstream-to error rc 129 and
+ * --merged/--no-merged/--column/--color/--abbrev rc 128 (probe-verified), and
+ * under `-f` the filter options FLIP git to rc-0 no-mutation LIST mode;
+ * attached `--sort=x` never consumes the next argv; `--` terminates flag
+ * parsing.
  * @param {string[]} args
  * @returns {string[]} the true positional (branch-name) argv slots
  */
@@ -2412,7 +2417,7 @@ function _branchPositionals(args) {
     const x = args[i];
     if (!flagsDone && x === "--") { flagsDone = true; continue; }
     if (!flagsDone && x.startsWith("-")) {
-      if (/^--sor(?:t)?$/.test(x) || /^--form(?:at)?$/.test(x)) i++; // consumes the next argv as its value
+      if (/^--so(?:rt?)?$/.test(x) || /^--form(?:at?)?$/.test(x)) i++; // consumes the next argv as its value
       continue;
     }
     pos.push(x);

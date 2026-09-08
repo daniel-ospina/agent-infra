@@ -277,6 +277,13 @@ ok("branchOp: branch -C --sort <baseline> dst → force + dst (no carve-out misf
 ok("branchOp: branch -m --sort <v> old new → rename old→new", (() => { const r = classifyBranchOp("branch", ["-m", "--sort", "main", "victim", "topic2new"]); return r.op === "rename" && r.from === "victim" && r.to === "topic2new"; })());
 ok("branchOp: branch -f --sort <v> target → force + target (value swallowed)", (() => { const r = classifyBranchOp("branch", ["-f", "--sort", "key", "victim"]); return r.op === "force" && r.branch === "victim"; })());
 ok("branchOp: branch -C --sort=x attached → force + dst (no next-argv swallow)", (() => { const r = classifyBranchOp("branch", ["-C", "--sort=key", "main", "topic2"]); return r.op === "force" && r.branch === "topic2"; })());
+// Round-3 fold (review P0): git accepts ANY unambiguous long prefix — --so
+// (minimal; --show-current diverges at --sh) and --forma swallow identically.
+ok("branchOp: branch -C --so <v> src dst → force + dst (value swallowed)", (() => { const r = classifyBranchOp("branch", ["-C", "--so", "key", "main", "topic2"]); return r.op === "force" && r.branch === "topic2"; })());
+ok("branchOp: branch -C --forma <v> src dst → force + dst", (() => { const r = classifyBranchOp("branch", ["-C", "--forma", "zz", "main", "topic2"]); return r.op === "force" && r.branch === "topic2"; })());
+ok("branchOp: branch -M --so <v> old new → rename old→new", (() => { const r = classifyBranchOp("branch", ["-M", "--so", "key", "victim", "rnX"]); return r.op === "rename" && r.from === "victim" && r.to === "rnX"; })());
+ok("branchOp: branch -f --so <v> target → force + target", (() => { const r = classifyBranchOp("branch", ["-f", "--so", "key", "victim"]); return r.op === "force" && r.branch === "victim"; })());
+ok("branchOp: branch -C --s ambiguous → NOT modeled (rc 129)", (() => { const r = classifyBranchOp("branch", ["-C", "--s", "key", "main", "topic2"]); return r.op === "force" && r.branch === "main"; })());
 // remaining f-composed spellings (review P2-1)
 ok("branchOp: branch -fc reversed copy cluster → force + dst", (() => { const r = classifyBranchOp("branch", ["-fc", "feat/x", "side"]); return r.op === "force" && r.branch === "side"; })());
 ok("branchOp: branch -Cf reversed force-copy → force + dst", (() => { const r = classifyBranchOp("branch", ["-Cf", "feat/x", "side"]); return r.op === "force" && r.branch === "side"; })());
@@ -423,6 +430,18 @@ ok("M3 #591: force+copy composition (no branch field) still blocks", (() => { co
   ok("M3 #592 real-git: -C dst --sort <v> (flag after pos) clobbers rc 0", swFlagAfter.status === 0 && git(OTHER, "rev-parse victim") === git(OTHER, "rev-parse main"), String(swFlagAfter.status));
   const swOwn = spawnSync("git", ["branch", "-C", "--sort", "key", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
   ok("M3 #592 real-git: -C --sort <v> onto CURRENT branch refused rc 128 (carve-out premise holds)", swOwn.status === 128, String(swOwn.status));
+  // Round-3 fold (review P0): the unambiguous-prefix spellings --so/--forma
+  // swallow identically (rc 0 + clobber) — the block above is why the prefix
+  // closure must be modeled, and the current-branch refusal still holds.
+  git(OTHER, "branch -D victim 2>/dev/null; git branch victim HEAD~1");
+  const swSo = spawnSync("git", ["branch", "-C", "--so", "key", "main", "victim"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #592 real-git: -C --so <v> swallows and CLOBBERS rc 0", swSo.status === 0 && git(OTHER, "rev-parse victim") === git(OTHER, "rev-parse main"), String(swSo.status));
+  git(OTHER, "branch -D victim 2>/dev/null; git branch victim HEAD~1");
+  const swForma = spawnSync("git", ["branch", "-C", "--forma", "zz", "main", "victim"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #592 real-git: -C --forma <v> swallows and CLOBBERS rc 0", swForma.status === 0 && git(OTHER, "rev-parse victim") === git(OTHER, "rev-parse main"), String(swForma.status));
+  git(OTHER, "branch -D victim 2>/dev/null; git branch victim HEAD~1");
+  const swSoOwn = spawnSync("git", ["branch", "-C", "--so", "key", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #592 real-git: -C --so <v> onto CURRENT refused rc 128 (premise holds)", swSoOwn.status === 128, String(swSoOwn.status));
 }
 ok("M3: orphan blocks", (() => { const d = decideM3({ branchOp: { op: "orphan" }, isAgentInfra: true, baseline }); return d?.block === true; })());
 ok("M3: own rename re-baselines", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/2" }, isAgentInfra: false, baseline, currentBranch: "feat/1" }); return d?.reBaseline === "feat/2"; })());
