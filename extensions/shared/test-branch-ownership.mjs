@@ -46,7 +46,15 @@ ok("repoKey: worktree shares common dir → same key", mainKey === wtKey, `${mai
 const OTHER = join(ROOT, "other");
 execSync(`mkdir -p "${OTHER}"`, { stdio: "ignore" });
 execSync("git init -q -b main", { cwd: OTHER, stdio: "ignore" });
+execSync("git config user.email t@bo.local", { cwd: OTHER, stdio: "ignore" });
+execSync("git config user.name bo-test", { cwd: OTHER, stdio: "ignore" });
+git(OTHER, "commit --allow-empty -qm seed"); // real HEAD for the #591 copy probe
 const otherKey = repoKey(OTHER);
+// bare repo fixture (#591 round-2: resolveEffectiveRepo must expose bareness so
+// decideM3's benign-force carve-out — premise: a worktree protects the branch —
+// is refused where git would actually move the ref rc 0).
+const BARE = join(ROOT, "bare.git");
+execSync(`git clone -q --bare "${MAIN}" "${BARE}"`, { stdio: "ignore" });
 ok("repoKey: same-basename different repo → different key", otherKey !== mainKey, `${otherKey} vs ${mainKey}`);
 ok("repoKey: non-git dir → null", repoKey("/nonexistent/xyz") === null);
 
@@ -136,6 +144,16 @@ ok("resolveEffectiveRepo: multi -C chain", (() => {
 
 // non-git command → null
 ok("resolveEffectiveRepo: non-git → null", resolveEffectiveRepo("npm test", MAIN) === null);
+// #591 round-2: bare repos expose isBare so decideM3's benign-force carve-out
+// (premise: a worktree protects the current branch) is refused there.
+ok("resolveEffectiveRepo: --git-dir=bare → isBare true, not a worktree", (() => {
+  const r = resolveEffectiveRepo(`git --git-dir="${BARE}" status`, MAIN);
+  return r && r.isBare === true && r.isWorktree === false && r.currentBranch === "main";
+})(), "bare");
+ok("resolveEffectiveRepo: main checkout → isBare false", (() => {
+  const r = resolveEffectiveRepo("git commit -m x", MAIN);
+  return r && r.isBare === false;
+})(), "main checkout");
 
 // ── extractGitInvocation / tokenize ────────────────────────────────────────
 ok("tokenize: quotes", JSON.stringify(tokenize(`git -C "my repo" checkout main`)) === JSON.stringify(["git", "-C", "my repo", "checkout", "main"]), tokenize(`git -C "my repo" checkout main`).join("|"));
@@ -175,6 +193,63 @@ ok("branchOp: symbolic-ref origin", op("symbolic-ref", ["refs/remotes/origin/HEA
 ok("branchOp: update-ref refs/heads", op("update-ref", ["refs/heads/x", "HEAD"]) === "switch-existing");
 ok("branchOp: update-ref tag", op("update-ref", ["refs/tags/v1", "HEAD"]) === "other");
 ok("branchOp: branch -f", op("branch", ["-f", "x", "main"]) === "force");
+// #591: git merges NOARG shorts into one cluster (`-fq` ≡ `-f -q`; force short
+// anywhere in the run) and --force accepts its unambiguous abbreviation --forc.
+// classify-git's branch arm (branchState trigger) uses the SAME predicate — a
+// lag here would give branchState true + op "other" → index.ts skips M3.
+ok("branchOp: branch -fq cluster → force", op("branch", ["-fq", "x", "main"]) === "force");
+ok("branchOp: branch -qf cluster (f mid) → force", op("branch", ["-qf", "x", "main"]) === "force");
+ok("branchOp: branch -fvq cluster → force", op("branch", ["-fvq", "x", "main"]) === "force");
+ok("branchOp: branch -vqf cluster → force", op("branch", ["-vqf", "x", "main"]) === "force");
+ok("branchOp: branch --forc abbrev → force", op("branch", ["--forc", "x", "main"]) === "force");
+ok("branchOp: branch --force → force", op("branch", ["--force", "x", "main"]) === "force");
+ok("branchOp: branch -fq target = first positional", (() => { const r = classifyBranchOp("branch", ["-fq", "x", "main"]); return r.op === "force" && r.branch === "x"; })());
+ok("branchOp: branch --for ambiguous → NOT force", op("branch", ["--for", "x", "main"]) === "other");
+ok("branchOp: branch --forcfoo unknown → NOT force", op("branch", ["--forcfoo", "x", "main"]) === "other");
+ok("branchOp: branch -ufoo u-value → NOT force", op("branch", ["-ufoo", "x"]) === "other");
+ok("branchOp: branch -fuDevel conflict → NOT force", op("branch", ["-fuDevel", "x", "main"]) === "other");
+// #591 round-2 (mode resolution + carve-out bounds): git's mode letters win
+// over -f, so delete/list/move-composed clusters are NOT the force-create op;
+// force composed with COPY/MOVE mutates the DESTINATION (2nd positional) so
+// the op carries NO branch field (the benign carve-out keys branch ==
+// currentBranch and must not fire).
+ok("branchOp: branch -Df delete-composed → other (#587/#543 verdict path)", op("branch", ["-Df", "feat/x"]) === "other");
+ok("branchOp: branch -df delete-composed → other", op("branch", ["-df", "feat/x"]) === "other");
+ok("branchOp: branch -d --force separated delete → other", op("branch", ["-d", "--force", "feat/x"]) === "other");
+ok("branchOp: branch -fl list-mode cluster → other (no false block)", op("branch", ["-fl", "feat/x", "main"]) === "other");
+ok("branchOp: branch -lf list-mode cluster → other", op("branch", ["-lf", "feat/x", "main"]) === "other");
+ok("branchOp: branch -tf dead (t-value) → other", op("branch", ["-tf", "feat/x", "main"]) === "other");
+ok("branchOp: branch -fC copy-cluster → other (no exact force; #592 family)", op("branch", ["-fC", "feat/x", "main"]) === "other");
+ok("branchOp: branch -f -c src dst (force+copy) → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["-f", "-c", "main", "side"]); return r.op === "force" && r.branch == null; })());
+ok("branchOp: branch --force -C src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["--force", "-C", "main", "side"]); return r.op === "force" && r.branch == null; })());
+ok("branchOp: branch -ft (terminal t) → force + target", (() => { const r = classifyBranchOp("branch", ["-ft", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -fvt (terminal t) → force + target", (() => { const r = classifyBranchOp("branch", ["-fvt", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+// #591 round-3: CREATE-mode NOARG letters are {f,v,q,i} (i does NOT force
+// list — only l/a/r do) and f is repeatable — all probe-verified rc 0.
+ok("branchOp: branch -fi (i in cluster) → force + target", (() => { const r = classifyBranchOp("branch", ["-fi", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -if → force + target", (() => { const r = classifyBranchOp("branch", ["-if", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -ff repeatable-f → force + target", (() => { const r = classifyBranchOp("branch", ["-ff", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -i alone (plain create) → other", op("branch", ["-i", "feat/x", "main"]) === "other");
+// #591 round-3: long-option ABBREVIATIONS of copy/move (--cop/--mo/--mov)
+// mutate the DESTINATION under force — branch field must stay null.
+ok("branchOp: branch -f --cop src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["-f", "--cop", "main", "side"]); return r.op === "force" && r.branch == null; })());
+ok("branchOp: branch -f --mov src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["-f", "--mov", "main", "side"]); return r.op === "force" && r.branch == null; })());
+ok("branchOp: branch --force --cop src dst → force WITHOUT branch", (() => { const r = classifyBranchOp("branch", ["--force", "--cop", "main", "side"]); return r.op === "force" && r.branch == null; })());
+// #591 round-3 fold: a NON-TERMINAL t consumes the token REST as its --track
+// directive VALUE — git accepts exactly direct/inherit (rc-0 force-CREATEs, so
+// these are op force with the FIRST positional as target), while value letters
+// never read as mode letters (-ftdirect's "direct" is NOT a delete/copy) and
+// invalid remainders (-ftq, -tqf, -tfoo, -ftVerbose) are rc-129 no-ops → other.
+ok("branchOp: branch -ftinherit → force + target", (() => { const r = classifyBranchOp("branch", ["-ftinherit", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -fitinherit → force + target", (() => { const r = classifyBranchOp("branch", ["-fitinherit", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -fqtdirect → force + target (no delete misroute)", (() => { const r = classifyBranchOp("branch", ["-fqtdirect", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -ftdirect → force + target (value 'direct' not delete/copy)", (() => { const r = classifyBranchOp("branch", ["-ftdirect", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -qftdirect → force + target", (() => { const r = classifyBranchOp("branch", ["-qftdirect", "feat/x", "main"]); return r.op === "force" && r.branch === "feat/x"; })());
+ok("branchOp: branch -ftq dead → other (not force)", (() => classifyBranchOp("branch", ["-ftq", "feat/x", "main"]).op === "other")());
+ok("branchOp: branch -tqf dead → other", (() => classifyBranchOp("branch", ["-tqf", "feat/x", "main"]).op === "other")());
+ok("branchOp: branch -ftVerbose dead → other", (() => classifyBranchOp("branch", ["-ftVerbose", "feat/x", "main"]).op === "other")());
+ok("branchOp: branch -Dftdirect → other (delete mode, D in flag run)", (() => classifyBranchOp("branch", ["-Dftdirect", "stale"]).op === "other")());
+ok("branchOp: branch -Dt → other (delete + terminal track)", (() => classifyBranchOp("branch", ["-Dt", "stale"]).op === "other")());
 ok("branchOp: branch -m", op("branch", ["-m", "feat/a", "feat/b"]) === "rename");
 ok("branchOp: branch -M bare rename", op("branch", ["-M", "feat/b"]) === "rename");
 ok("branchOp: branch create", op("branch", ["feat/c"]) === "other");
@@ -214,6 +289,78 @@ ok("M3: create-new agent-infra → reBaseline", (() => { const d = decideM3({ br
 ok("M3: create-new non-infra blocks", (() => { const d = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: false, baseline }); return d?.block === true; })());
 ok("M3: switch-existing blocks", (() => { const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline }); return d?.block === true; })());
 ok("M3: force blocks", (() => { const d = decideM3({ branchOp: { op: "force" }, isAgentInfra: true, baseline }); return d?.block === true; })());
+// #591: force-CREATE (branch -f family) mutates the TARGET ref — foreign / stale
+// / detached targets block; a target equal to the checkout's OWN current branch
+// is git-refused ("cannot force update the branch '…' used by worktree", rc 128
+// — real-git pins below) so the benign own-branch ceremony passes through to
+// git's refusal instead of a guard block. Checkout-force (op "force", no branch
+// field) stays blocked — it discards uncommitted work.
+ok("M3 #591: foreign force-create (target ≠ own branch) blocks", (() => { const d = decideM3({ branchOp: { op: "force", branch: "other" }, isAgentInfra: true, baseline, currentBranch: "feat/1" }); return d?.block === true; })());
+ok("M3 #591: force-create of checkout's OWN branch → allowed (git refuses it)", decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1" }) === null);
+ok("M3 #591: own-branch force-create in NON-infra → allowed (git refuses it)", decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: false, baseline, currentBranch: "feat/1" }) === null);
+ok("M3 #591: detached main (currentBranch null) → force-create blocks", (() => { const d = decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline, currentBranch: null }); return d?.block === true; })());
+ok("M3 #591: checkout-force (no branch field) still blocks", (() => { const d = decideM3({ branchOp: { op: "force" }, isAgentInfra: true, baseline, currentBranch: "feat/1" }); return d?.block === true; })());
+// #591 round-2 bounds (review fold-ins): the benign own-branch carve-out
+// requires a worktree-protected (non-bare) repo and a command whose ONLY state
+// mutation is the own-branch attempt — in a bare repo git moves the ref rc 0
+// (no worktree refuses it), and in a `;`-compound a later segment's foreign
+// force-create would launder through the benign first segment.
+ok("M3 #591: BARE repo own-branch force-create → still blocked (git succeeds rc 0)", (() => { const d = decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1", isBare: true }); return d?.block === true; })());
+ok("M3 #591: multi-state compound own-branch force-create → blocked (no launder)", (() => { const d = decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1", stateOpCount: 2 }); return d?.block === true; })());
+ok("M3 #591: own-branch force-create + hiddenStateSubst → blocked (substitution launder)", (() => { const d = decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1", stateOpCount: 1, hiddenStateSubst: true }); return d?.block === true; })());
+ok("M3 #591: force+copy composition (no branch field) still blocks", (() => { const d = decideM3({ branchOp: { op: "force" }, isAgentInfra: true, baseline, currentBranch: "feat/1" }); return d?.block === true; })());
+// Real-git property backing the carve-out's safety: git refuses force-updating
+// the branch checked out in the current repo (rc 128 — nothing can move), while
+// a NON-checked-out target force-resets rc 0 (the dangerous case M3 blocks).
+{
+  const own = spawnSync("git", ["branch", "-fq", "main"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: force-create of own checked-out branch refused (rc 128)", own.status === 128, String(own.status));
+  const ownLong = spawnSync("git", ["branch", "--force", "main"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: --force own checked-out branch refused (rc 128)", ownLong.status === 128, String(ownLong.status));
+  const foreign = spawnSync("git", ["branch", "-fq", "side", "main"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: NON-checked-out force-create succeeds rc 0 (why M3 blocks)", foreign.status === 0, String(foreign.status));
+  // round-2: in a BARE repo there is no worktree to refuse the update, so git
+  // moves the (symbolic-HEAD) branch rc 0 — the carve-out must be refused.
+  const bareOwn = spawnSync("git", ["branch", "-fq", "main", "HEAD"], { cwd: BARE, encoding: "utf-8" });
+  ok("M3 #591 real-git: BARE own-HEAD force-create succeeds rc 0 (why carve-out needs isBare)", bareOwn.status === 0, String(bareOwn.status));
+  // round-2: force composed with copy mutates the DESTINATION rc 0 — the
+  // benign carve-out (branch === currentBranch on the SOURCE) must not fire.
+  // Run in OTHER (single-branch repo): advance main, force-copy main→dest,
+  // assert dest was force-overwritten to main's new hash.
+  git(OTHER, "branch dest HEAD");
+  git(OTHER, "commit --allow-empty -qm bump");
+  const copyComp = spawnSync("git", ["branch", "-f", "-c", "main", "dest"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: force+copy moves destination rc 0 (why branch field is null)", copyComp.status === 0 && git(OTHER, "rev-parse dest") === git(OTHER, "rev-parse main"), String(copyComp.status));
+  // round-2 FP guard: list-mode cluster with f mutates nothing (rc 0 list).
+  const listFp = spawnSync("git", ["branch", "-fl"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: -fl LIST-mode runs rc 0 (no ref mutation → not force-create)", listFp.status === 0, String(listFp.status));
+  // round-3: i-cluster and repeatable-f force-creates are REAL (rc 0 moves a
+  // non-checked-out branch) — the M3 block is why they must classify force.
+  const iForce = spawnSync("git", ["branch", "-fi", "side", "main"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: -fi force-creates rc 0 (why i ∈ create-mode letters)", iForce.status === 0, String(iForce.status));
+  const ffForce = spawnSync("git", ["branch", "-ff", "side", "main"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: -ff repeatable-f force-creates rc 0", ffForce.status === 0, String(ffForce.status));
+  // round-3: --cop long-abbreviation copy under force mutates the destination
+  // rc 0 (carve-out must not fire on the source==current case). Create dst2 at
+  // main's PARENT so the copy is discriminating.
+  git(OTHER, "branch dst2 HEAD~1");
+  const copComp = spawnSync("git", ["branch", "-f", "--cop", "main", "dst2"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: -f --cop moves destination rc 0 (why branch field is null)", copComp.status === 0 && git(OTHER, "rev-parse dst2") === git(OTHER, "rev-parse main"), String(copComp.status));
+  // round-3 fold: the tracking-directive family force-creates rc 0 (a NON-
+  // TERMINAL t consumes the token rest as --track's directive; only
+  // direct/inherit are valid) — the M3 block is why they must classify force,
+  // and value letters must not misroute them to delete/copy. victim starts at
+  // HEAD~1 so a move is discriminating.
+  git(OTHER, "branch victim HEAD~1");
+  const tDirect = spawnSync("git", ["branch", "-ftdirect", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: -ftdirect force-creates rc 0 (t consumes directive)", tDirect.status === 0 && git(OTHER, "rev-parse victim") === git(OTHER, "rev-parse main"), String(tDirect.status));
+  const tInherit = spawnSync("git", ["branch", "-qftinherit", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: -qftinherit force-creates rc 0", tInherit.status === 0 && git(OTHER, "rev-parse victim") === git(OTHER, "rev-parse main"), String(tInherit.status));
+  const tDead = spawnSync("git", ["branch", "-ftq", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: -ftq invalid directive dead rc 129 (nothing created)", tDead.status === 129, String(tDead.status));
+  const tDead2 = spawnSync("git", ["branch", "-tfoo", "victim", "main"], { cwd: OTHER, encoding: "utf-8" });
+  ok("M3 #591 real-git: -tfoo invalid directive dead rc 129", tDead2.status === 129, String(tDead2.status));
+}
 ok("M3: orphan blocks", (() => { const d = decideM3({ branchOp: { op: "orphan" }, isAgentInfra: true, baseline }); return d?.block === true; })());
 ok("M3: own rename re-baselines", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/2" }, isAgentInfra: false, baseline, currentBranch: "feat/1" }); return d?.reBaseline === "feat/2"; })());
 ok("M3: foreign rename blocks", (() => { const d = decideM3({ branchOp: { op: "rename", from: "other", to: "x" }, isAgentInfra: false, baseline }); return d?.block === true; })());

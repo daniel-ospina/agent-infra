@@ -1258,13 +1258,18 @@ export function allGitInvocations(command, seedVars = {}) {
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
  *     newBranch, deleteTargets, pushDst, pushTargets, isPushDelete,
- *     renameFrom, renameTo, syncSource }
+ *     renameFrom, renameTo, syncSource, stateVerb, stateArgs, stateOpCount }
  * - verdict: legacy `block:*` strings for destructive patterns (verb-anchored),
  *   plus NEW `block:commit` / `block:push` / `block:force-push`; `allow` /
  *   `allow-non-git` otherwise.
  * - branchState: true for checkout/switch/symbolic-ref/update-ref/branch ops
  *   that mutate the checkout's branch (M3 gate runs on these regardless of
  *   verdict — symbolic-ref/update-ref/branch -f have NO legacy pattern).
+ * - stateVerb/stateArgs: the FIRST state-mutating invocation's verb/args (M3
+ *   must classify the invocation that changes branch state, not invocations[0]
+ *   — P1-A). stateOpCount: TOTAL branch-state invocations in the command — the
+ *   #591 benign-force carve-out requires exactly 1 (a later compound segment's
+ *   foreign force-create is invisible to the first-invocation M3 gate).
  * - force-push hygiene: `--force-with-lease` / `--force-if-includes` are NOT
  *   force (the legacy `--force\b` regex false-matches them); a force-with-lease
  *   push classifies `block:push` (ownership path), not `block:force-push`.
@@ -1448,7 +1453,21 @@ export function classifyGitCommandDetailed(command) {
         out.renameFrom = pos[0] ?? null;
         out.renameTo = pos[1] ?? null;
       } else if (branchDeleteNames("branch", args) ||
-                 args.includes("-f") || args.includes("--force")) {
+                 args.some(isBranchForceCreateTokenNarrow)) {
+        // #591: the branch arm's force-create trigger is TOKEN-level (any
+        // spelling git force-creates with — see isBranchForceCreateToken), so
+        // merged NOARG clusters (`-fq` ≡ `-f -q`) and the unambiguous
+        // long-prefix abbreviation (`--forc`) set branchState exactly like the
+        // plain `-f`/`--force` forms they are byte-identical to in git
+        // (probe-verified rc 0). Before #591 they fell through to verdict
+        // allow + branchState false → M3 never entered from the shared main
+        // checkout. Review fold-in (#591 round 2): the trigger uses the NARROW
+        // pure-force-create predicate — git's MODE letters win over -f
+        // (`-fl x main` LISTs rc 0, `-cf a b` copies, `-Df x` deletes — a
+        // mode-composed f-cluster is NOT a force-create, probe-verified), so
+        // list/copy/move/delete-composed clusters stay out of the M3 force
+        // path (deletes take the delNames verdict arm above; copy/move
+        // clusters are #592's family, byte-identical to pre-#591).
         // P1-B: -D/-d delete must set newBranch so the allowance target list is
         // non-empty (a ceremony `git branch -D $PR_BRANCH` on the own branch is
         // allowed; without this, ownershipAllowed([]) is false -> false-block).
@@ -1464,9 +1483,9 @@ export function classifyGitCommandDetailed(command) {
         // branchDeleteNames — the all-targets discipline pushTargets already
         // gives the push family (#443). newBranch stays the FIRST name for
         // back-compat (single-target callers/tests); index.ts prefers
-        // deleteTargets. `-f`/`--force` (force-create, M3 force arm) is NOT a
-        // delete — branchDeleteNames returns null for it and newBranch keeps
-        // the first positional.
+        // deleteTargets. Force-create (M3 force arm — `-f`/`--force`/clusters/
+        // `--forc`) is NOT a delete — branchDeleteNames returns null for it and
+        // newBranch keeps the first positional (the force-create target).
         out.branchState = true;
         const delNames = branchDeleteNames("branch", args);
         if (delNames) {
@@ -1491,14 +1510,34 @@ export function classifyGitCommandDetailed(command) {
         // arms (`git commit -m x && git branch -Dq y` blocks as
         // branch-force-delete), so a metachar-truncated twin must not downgrade
         // to block:commit/block:push (review fold-in round 4).
-        const hardUpperD = args.some((x) => /^-(?![A-Za-z]*u)[A-Za-z]*D/.test(x));
-        const hardForce = delNames && args.some((x) =>
-          x === "--force" || x === "--forc" ||
-          /^-(?![A-Za-z]*u)[A-Za-z]*f/.test(x));
+        const hardUpperD = args.some((x) =>
+          // #591 (round-3 fold): value-aware flag run — a tracking-directive
+          // VALUE's letters never read as mode letters (`-Dftdirect`'s D is in
+          // the run and IS a hard delete; `-ftdirect`'s value "direct" carries
+          // no D and delNames is null there anyway).
+          /^-[A-Za-z]+$/.test(x) && /D/.test((_branchToken(x)?.run) ?? ""));
+        const hardForce = delNames && args.some(isBranchForceCreateToken);
         const overridable = out.verdict === "allow" || out.verdict === "block:commit" ||
           out.verdict === "block:push" || out.verdict === "block:force-push";
         if (overridable && (hardUpperD || hardForce)) {
           out.verdict = "block:branch-force-delete";
+        }
+        // #591 (round-3 fold): the raw/skimmed STRING pass reads delete and
+        // force letters from the whole letter run, so a pure force-create's
+        // tracking-directive VALUE letters trip it (`-ftdirect victim base` is
+        // `-f --track=direct` — a real force-CREATE rc 0, but the "d" in
+        // "direct" makes the line-87 branch-force-delete pattern fire with
+        // phantom delete intent). The token-level read here is authoritative
+        // (delNames null = no delete token in THIS invocation), so when no
+        // other branch invocation in the command is a real delete either,
+        // downgrade the misfire to allow and let the M3 force arm gate the
+        // force-create (own-branch ceremony → benign carve-out; foreign → M3
+        // block). A genuine compound delete elsewhere (`git branch -fq x y &&
+        // git branch -Dq z`) has a branch-delete invocation → no downgrade.
+        if (delNames === null && out.verdict === "block:branch-force-delete" &&
+            !invocations.some((v) => v.verb === "branch" &&
+              branchDeleteNames("branch", v.args) !== null)) {
+          out.verdict = "allow";
         }
       }
     }
@@ -1509,6 +1548,30 @@ export function classifyGitCommandDetailed(command) {
     out.stateVerb = verb;
     out.stateArgs = args;
   }
+  // #591 (review fold-in, compound-launder guard): count EVERY branch-state
+  // invocation in the command. The M3 benign-force carve-out (a force-create
+  // whose target is the checkout's OWN branch) must only fire for a command
+  // whose sole branch-state mutation is that own-branch attempt — in a `;`
+  // compound (`git branch -f own ; git branch -fq foreign x`) the later
+  // segments are invisible to the per-FIRST-state-invocation M3 gate, and the
+  // benign carve-out on segment 1 would otherwise let segment 2's FOREIGN
+  // force-create execute (pre-#591 the exact-force segment 1 blocked the whole
+  // command). stateOpCount ≥ 2 → decideM3 refuses the carve-out → default
+  // block restores pre-#591 compound parity.
+  out.stateOpCount = invocations.filter((v) =>
+    ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb)).length;
+  // #591 (round-3→5 fold): a shell construct may hide a branch-state git
+  // invocation from the count above (collapse to opaque tokens → stateOpCount
+  // undercounts). Exposed here so index.ts can refuse the M3 benign-force
+  // carve-out when hidden state mutation is present. The scan ORs the
+  // branch-state-mutating substitution scan (_hasHiddenStateSubst) with the
+  // hub-gate's hardened unverifiable-git shape set (_unverifiableGitContent:
+  // piped-stdin shells, process substitution, heredocs, alias/function
+  // definitions, spawner $VARs — round-6→19 review-hardened; the carve-out
+  // bound reuses it so the construct coverage cannot drift).
+  out.hiddenStateSubst =
+    _hasHiddenStateSubst(String(command ?? "")) ||
+    _unverifiableGitContent(String(command ?? ""));
 
   return out;
 }
@@ -2128,6 +2191,337 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
 }
 
 /**
+ * #591 (round 2): the BROAD force-token test — ANY git-branch force spelling:
+ * the exact long `--force`/`--forc` (unambiguous prefix abbreviations; `--for`
+ * is ambiguous with `--format` rc 129, `--forcfoo` unknown rc 129 → excluded)
+ * or a single-dash short cluster whose letter run contains `f` (git merges
+ * NOARG shorts, so `-Df`/`-df`/`-fq` … all carry force). Used by the
+ * delete+force composition check (#587) where force is mode-blind — with a
+ * delete token present git IS deleting (`-Df x` = hard delete), so every
+ * f-bearing cluster counts. The `(?![A-Za-z]*u)` guard mirrors #587's delete
+ * side: branch's only arg-taking short is `-u<value>` (set-upstream-to), which
+ * consumes the token rest as its value, so a u-containing letter run is
+ * set-upstream mode — probe-verified: `-ufoo`, `-fuDevel … main` error (rc
+ * 128/129) and create/delete NOTHING, so no real force op is masked.
+ * @param {string} a
+ * @returns {boolean}
+ */
+export function isBranchForceCreateToken(a) {
+  return a === "--force" || a === "--forc" ||
+    /^-(?![A-Za-z]*u)[A-Za-z]*f/.test(a);
+}
+
+/**
+ * #591 (round 3 + fold): parse a single-dash git-branch token the way git's
+ * parse-options does — NOARG shorts merge into ONE run scanned LEFT→RIGHT, and
+ * an ARG-VALUE-TAKING short stops the run and consumes the REST of the token
+ * as its attached value. branch's value-takers: `u` (set-upstream-to — a
+ * REQUIRED value; the #587 u-guard excludes ANY u-containing token from
+ * delete/force/copy/move wholesale, since those modes conflict with
+ * set-upstream rc 129 and delete/create nothing) and `t` (--track,
+ * PARSE_OPT_OPTARG — a NON-TERMINAL t consumes the rest of the token as its
+ * tracking DIRECTIVE; a TERMINAL t is a plain NOARG flag = --track default).
+ * Letters inside an attached value are VALUE, never mode letters (round-3
+ * fold): `-ftdirect` parses `-f --track=direct` (a force-CREATE rc 0 —
+ * probe-verified victim moved) and its "direct" must NOT read as delete/copy
+ * letters, while `-Dftdirect` (`-D -f --track=direct`) IS a hard delete whose
+ * D/f sit in the run. Returns { run, tValue }: run = the NOARG flag letters
+ * before the first value-taker; tValue = the directive a mid-run t consumed
+ * (null when no mid-run t). Returns null when x is not a single-dash letter
+ * token or contains u.
+ * @param {string} x
+ * @returns {{ run: string, tValue: string|null }|null}
+ */
+function _branchToken(x) {
+  if (typeof x !== "string" || !/^-[A-Za-z]+$/.test(x)) return null;
+  const s = x.slice(1);
+  let run = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "u") return null; // set-upstream value-taker — mode-conflict rc129 (u-guard parity)
+    if (c === "t" && i < s.length - 1) {
+      // mid-run t: parse-options OPTARG consumes the token rest as its
+      // --track directive value — remaining letters are VALUE, not flags.
+      return { run, tValue: s.slice(i + 1) };
+    }
+    run += c;
+  }
+  return { run, tValue: null };
+}
+
+/**
+ * #591 (round 3 + fold): the NARROW pure-force-create test — a force-create
+ * ONLY when git is actually in CREATE mode. git's mode letters WIN over -f
+ * (probe-verified): `-fl x main`/`-lf`/`-fa` LIST rc 0 (no ref moves —
+ * `-l`/`-a`/`-r` force list mode), `-cf a b`/`-fC a b` COPY the destination,
+ * `-Df x` DELETEs, `-mf a b` moves — none is a force-create, and flagging one
+ * as such false-blocks benign list commands or misroutes copy/move mutations
+ * to the force-create M3 path. git merges only the NOARG shorts; branch's
+ * CREATE-mode NOARG letters are {f,v,q,i} (probe-verified rc 0: `-i` does NOT
+ * force list mode — `git branch -i x main` creates like `-i` were absent;
+ * only l/a/r do) and `f` is REPEATABLE (`-ff`, `-fqf` ≡ `-f -q -f` — probe
+ * rc 0). Letters are read VALUE-AWARELY via _branchToken (see there): the run
+ * holds the NOARG letters before the first value-taker, so a TERMINAL `t`
+ * (`-ft`/`-fvt` create rc 0) sits in the run while a NON-TERMINAL t consumes
+ * the rest of the token as its --track directive VALUE — git accepts exactly
+ * "direct"/"inherit" there (`-ftinherit`, `-fitinherit`, `-fqtdirect`,
+ * `-qftinherit` … all force-create rc 0 — round-3 reviewer P1, the
+ * tracking-directive ceremony family), and any other remainder is a parse
+ * error (`-tf`/`-ftq`/`-tqf`/`-ftVerbose`/`-ftdirectx` rc 129, creates
+ * nothing → excluded). So a pure force-create short cluster is a run matching
+ * `[qvif]*f[qvif]*t?` (the u-guard is implicit: _branchToken returns null for
+ * u). Long compositions with an EXACT `--force` stay branchState by the
+ * long-form clause — pre-#591 parity (the exact `--force` token always
+ * triggered M3; `git branch --force --list` is a nonsense no-op, documented
+ * residual). Shared shape with classifyBranchOp in branch-ownership.mjs
+ * (cross-pinned); both layers MUST agree or a spelling bypasses the M3 gate
+ * (branchState true but op "other" skips it).
+ * @param {string} a
+ * @returns {boolean}
+ */
+export function isBranchForceCreateTokenNarrow(a) {
+  if (a === "--force" || a === "--forc") return true;
+  const tok = _branchToken(a);
+  if (!tok) return false;
+  // A mid-run t consumed a tracking directive: only git's two VALID --track
+  // values force-create rc 0; any other remainder is a parse error rc 129.
+  if (tok.tValue !== null && tok.tValue !== "direct" && tok.tValue !== "inherit") {
+    return false;
+  }
+  return /^[qvif]*f[qvif]*t?$/.test(tok.run);
+}
+
+/**
+ * #591 (round-3→5 fold): does `raw` HIDE a branch-STATE-MUTATING git invocation
+ * in content allGitInvocations cannot see per-invocation? allGitInvocations
+ * collapses `$(…)`/backticks/eval/alias/piped-shell payloads to opaque tokens,
+ * so `git branch -fq own old ; echo "$(git branch -fq victim old)"` reports
+ * stateOpCount 1 (only the visible segment) and the M3 benign carve-out on the
+ * own-branch segment would let the hidden FOREIGN force-create execute
+ * (pre-#591 the exact-force own segment blocked the whole command). The scan
+ * covers, with a QUOTE-AWARE paren walk (a `)` inside quotes must not close a
+ * `$(…)` span early — round-5 reviewer P1, probe-verified rc 0):
+ *   - `$(…)` spans and backticks, recursing into nested spans;
+ *   - ANSI-C `$'…'` literals (`sh -c $'git branch -fq victim main'` — the
+ *     tokenizer reads the ANSI form as an unresolvable `$VAR`, missing the
+ *     inline; round-5 reviewer P1);
+ *   - static `eval "…"/'…'` literals;
+ *   - a top-level `__unverifiable__` segment (eval/alias/`$VAR` command
+ *     indirection whose expansion cannot be classified — round-4 reviewer P2,
+ *     probe-verified `EV="git branch -fq victim main"; eval $EV` moves a
+ *     foreign ref rc 0): fail closed — content that cannot be PROVEN free of
+ *     another state mutation must refuse the carve-out (same rationale as M4's
+ *     fail-closed `__unverifiable__` block);
+ *   - escaped backticks (`\``) signal NESTED backtick content — unparseable →
+ *     fail closed.
+ * Each payload is re-tokenized and scanned for a MUTATING branch invocation:
+ * checkout/switch/symbolic-ref/update-ref always, git branch only with a
+ * rename/delete/force spelling — non-mutating branch READS (`--show-current`,
+ * `--list`, rev-parse payloads) stay benign-eligible so `git branch -fq own
+ * $(git rev-parse HEAD)` isn't a false block. index.ts ORs this with the
+ * hub-gate's _unverifiableGitContent (piped-stdin shells, process
+ * substitution, heredocs, alias/function definitions, spawner `$VAR`s — the
+ * round-6→19 hardened shape set) before refusing the carve-out (decideM3's
+ * hiddenStateSubst bound). Exported for cross-layer pins (test.mjs).
+ * @param {string} raw
+ * @returns {boolean}
+ */
+/**
+ * #591 (round-7/8): ANSI-C $'…' escape translation — \n \t \r \a \b \f \v \\ \'
+ * \" \$ \e/\E \cX and zsh's \C-X/\Cx (char & 0x1f: \cJ/\C-J = LF) \xHH
+ * \uHHHH (1-4 hex digits,
+ * greedy — \uA = LF, cycle-5 P1) \UHHHHHHHH (1-8 digits, greedy) and octal. Code points
+ * above 0x10FFFF clamp to U+FFFD (cycle-5 P2) rather than throwing.
+ * Applied to ANSI-C payloads BEFORE scanning: an untranslated multiline payload
+ * (`sh -c $'echo a\ngit branch -fq victim main'`) tokenizes as ONE glued word
+ * and the hidden git invocation is invisible (round-6/7 reviewers P1, probe-
+ * verified rc 0). Identity for non-ANSI text.
+ * @param {string} s
+ * @returns {string}
+ */
+function _ansiTranslate(s) {
+  const ansiMap = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"', $: "$", a: "\u0007", b: "\b", f: "\f", v: "\v", e: "\u001b", E: "\u001b" };
+  return s.replace(/\\((?:c|C-?)[A-Za-z]|x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|[eE\\'"$ntrabvf])/g, (mm, e) => {
+    if (e[0] === "x") return String.fromCharCode(parseInt(e.slice(1), 16));
+    if (e[0] === "u" || e[0] === "U") {
+      // bash/zsh decode \u with 1-4 hex digits and \U with 1-8, greedily
+      // (`\uA` = LF — round-7 cycle-4 reviewer P1, probe-verified rc 0), and
+      // reject code points > 0x10FFFF (round-8 cycle-5 P2: String.fromCodePoint
+      // would throw a RangeError on valid shell input — clamp instead).
+      const cp = parseInt(e.slice(1), 16);
+      return cp > 0x10FFFF ? "\uFFFD" : String.fromCodePoint(cp);
+    }
+    if (e[0] === "c" || e[0] === "C") {
+      // bash spells \cX, zsh (the agent shell) spells \C-X / \Cx — both decode
+      // to char & 0x1f (\C-J = LF, re-splits the payload — round-9 cycle-6b
+      // reviewer P1, probe-verified rc 0 in real zsh). Optional hyphen: "C-X"
+      // -> e[2], "CJ"/"cJ" -> e[1].
+      const ch = e.length > 2 ? e[2] : e[1];
+      return String.fromCharCode(((ch ?? "").charCodeAt(0) ?? 0) & 0x1f);
+    }
+    if (/^[0-7]+$/.test(e)) return String.fromCharCode(parseInt(e, 8));
+    return ansiMap[e] ?? mm;
+  });
+}
+
+export function _hasHiddenStateSubst(raw) {
+  const source = String(raw ?? "");
+  const mutates = (inv) => {
+    if (["checkout", "switch", "symbolic-ref", "update-ref"].includes(inv.verb)) return true;
+    return inv.verb === "branch" && (
+      inv.args.includes("-m") || inv.args.includes("-M") ||
+      branchDeleteNames("branch", inv.args) !== null ||
+      inv.args.some(isBranchForceCreateTokenNarrow));
+  };
+  // Quote-aware payload collector: `$(…)`/`<(…)`/`>(…)` spans close only on a
+  // paren OUTSIDE quotes/escapes; ANSI-C `$'…'` literals; backticks pair to
+  // the next (top-level escaping already fails closed above the collector).
+  const collect = (src) => {
+    const spans = [];
+    let i = 0;
+    const n = src.length;
+    while (i < n) {
+      const c = src[i];
+      if (c === "$" && src[i + 1] === "'") {
+        let j = i + 2;
+        while (j < n && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
+        // ANSI-C $'…' escapes translate BEFORE scanning: a multiline payload
+        // (`sh -c $'echo a\ngit branch -fq victim main'`) carries the real
+        // newline as \n — without translation the payload tokenizes as ONE
+        // glued word and the hidden git invocation is invisible (round-6
+        // cycle-3 reviewer P1, probe-verified rc 0).
+        // Round-7 (cycle-4 reviewers P1): ANSI-C escapes translate BEFORE
+        // scanning (see _ansiTranslate) — \cJ = a real newline re-splits the
+        // payload into a second command; without translation the payload
+        // tokenizes as ONE glued word and the hidden git invocation is
+        // invisible (probe-verified rc 0).
+        spans.push(_ansiTranslate(src.slice(i + 2, j)));
+        i = j < n ? j + 1 : n;
+        continue;
+      }
+      if ((c === "$" || c === "<" || c === ">") && src[i + 1] === "(") {
+        let depth = 1;
+        let q = null; // null | '"' | "'"
+        let j = i + 2;
+        while (j < n && depth > 0) {
+          const d = src[j];
+          if (q !== null) {
+            if (d === "\\") j++;
+            else if (d === q) q = null;
+          } else if (d === "\"" || d === "'") q = d;
+          else if (d === "(") depth++;
+          else if (d === ")") depth--;
+          j++;
+        }
+        spans.push(src.slice(i + 2, Math.max(i + 2, j - 1)));
+        i = j;
+        continue;
+      }
+      if (c === "`") {
+        const j = src.indexOf("`", i + 1);
+        spans.push(src.slice(i + 1, j > -1 ? j : src.length));
+        i = j > -1 ? j + 1 : src.length;
+        continue;
+      }
+      i++;
+    }
+    return spans;
+  };
+  // Top-level unverifiable segment (eval/alias/$VAR command indirection) —
+  // its expansion is unclassifiable, so it may hide a second state mutation.
+  if (allGitInvocations(source).some((inv) => inv.verb === "__unverifiable__")) return true;
+  if (/\\`/.test(source)) return true; // nested-backtick escaping — fail closed
+  // $(<file) bash file-read substitution: the content is opaque file text fed
+  // to the shell (`eval "$(< /tmp/payload)"` runs whatever the file holds —
+  // round-6 cycle-3 reviewer P2, probe-verified rc 0). Also checked per-span in
+  // scan() because ANSI-C translation can REVEAL a decoded `$(<` (\x24\x3c).
+  if (/\$\(</.test(source)) return true;
+  const seen = new Set();
+  const scan = (inner, isProcSubst) => {
+    if (inner === undefined || inner.length === 0 || seen.has(inner)) return false;
+    seen.add(inner);
+    if (/\$\(</.test(inner)) return true; // decoded file-read substitution inside a span (\x24\x3c …)
+    if (isProcSubst && /\bgit\b/.test(inner)) return true; // executable text fed to a shell (round-19 parity)
+    for (const inv of allGitInvocations(inner)) {
+      if (inv.verb === "__unverifiable__") return true;
+      if (mutates(inv)) return true;
+    }
+    for (const sub of collect(inner)) {
+      if (scan(sub, false)) return true;
+    }
+    return false;
+  };
+  for (const inner of collect(source)) {
+    if (scan(inner, false)) return true;
+  }
+  // process substitution `<(…)`/`>(…)`: its body is executable text the
+  // classifier cannot evaluate (bash <(echo 'git branch …') runs it) — the
+  // content is scanned separately so a git word ANYWHERE is a risk.
+  const procRe = /[<>]\(([^)]*)\)/g;
+  let pm;
+  while ((pm = procRe.exec(source)) !== null) {
+    if (scan(pm[1] ?? "", true)) return true;
+  }
+  for (const t of _tokenize(source)) {
+    for (const inner of collect(t)) {
+      if (scan(inner, false)) return true;
+    }
+  }
+  // static eval literals (non-static `eval $EV` → __unverifiable__ above):
+  // plain "…"/'…' scan raw; ANSI-C $'…' payloads translate FIRST (an eval'd
+  // $'…' can smuggle a decoded `$(<` or newline-split git — round-7 cycle-4
+  // reviewer P1, probe-verified rc 0).
+  const evalRe = /eval\s+(?:\$'([^']*)'|"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = evalRe.exec(source)) !== null) {
+    const ansi = m[1];
+    const payload = ansi !== undefined ? _ansiTranslate(ansi) : (m[2] ?? m[3] ?? "");
+    if (payload.length > 0 && scan(payload, false)) return true;
+  }
+  // git-level alias indirection (round-6/7 cycles, reviewers P1, probe-verified
+  // rc 0): `git branch -fq own main ; git -c alias.br='git branch -fq victim
+  // main' br` hides the real command behind the alias NAME — the invocation walk
+  // sees verb "br" and stateOpCount stays 1, so the benign carve-out would fire
+  // while the alias force-creates a FOREIGN branch. Refuse when a statically-
+  // visible config alias VALUE (a) carries a state-mutating git spelling via
+  // scan(), (b) starts with '!' — git's shell-command alias marker, the WHOLE
+  // value is arbitrary shell text (`alias.br='!git branch -fq victim main'`,
+  // round-7 cycle-4 P1, probe-verified rc 0), or (c) whose first word is a
+  // branch-state verb (args are appended at the call site: `alias.x=branch x
+  // -fq victim main`). Whole-value-quoted `-c "alias.br=…"` and the
+  // GIT_CONFIG_PARAMETERS env form are separate passes below. Benign values
+  // (status/log/diff) pass. (STANDALONE alias invocation after configuration
+  // and the same-command `git config --add alias.x … && git x` persist+invoke
+  // are the pre-existing gap → issue #594.)
+  const cfgAlias = /(?:\-c|\-\-config)(?:\s+["']?alias\.|=alias\.)([A-Za-z0-9_.\/-]+)=(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+  let cm;
+  while ((cm = cfgAlias.exec(source)) !== null) {
+    const val = cm[2] ?? cm[3] ?? cm[4] ?? "";
+    if (val.startsWith("!")) return true; // shell-command alias — unverifiable shell text
+    const firstWord = val.trim().split(/\s+/)[0];
+    if (["branch", "checkout", "switch", "symbolic-ref", "update-ref"].includes(firstWord)) return true;
+    if (val.length > 0 && scan(val, false)) return true;
+  }
+  // whole-value-quoted -c "alias.x=…" / -c 'alias.x=…' (the quote sits BEFORE
+  // the config name — the pass above only tolerates a quote right after the
+  // space; round-7 cycle-4 reviewer P1, probe-verified rc 0).
+  const cfgAliasQ = /(?:\-c|\-\-config)\s+(["'])(alias\.[A-Za-z0-9_.\/-]+)=([^"']*)\1/g;
+  let cq;
+  while ((cq = cfgAliasQ.exec(source)) !== null) {
+    const val = cq[3] ?? "";
+    if (val.startsWith("!")) return true;
+    const firstWord = val.trim().split(/\s+/)[0];
+    if (["branch", "checkout", "switch", "symbolic-ref", "update-ref"].includes(firstWord)) return true;
+    if (val.length > 0 && scan(val, false)) return true;
+  }
+  // opaque env-backed aliases: --config-env=alias.x=ENV, GIT_CONFIG_KEY_n\d+=
+  // alias.x, and GIT_CONFIG_PARAMETERS (git's internal -c env — round-7 cycle-4
+  // reviewer P1, probe-verified rc 0) all refuse the carve-out.
+  if (/(?:\-\-config\-env[=\s]+\S*alias\.|GIT_CONFIG_KEY_\d+=alias\.|GIT_CONFIG_PARAMETERS=[^;]*alias\.)/.test(source)) return true;
+  return false;
+}
+
+/**
  * #436 (B carve-out): extract the deleted branch SHORT names from a branch /
  * push-delete git invocation, or null when the invocation is not a ref-delete
  * OR is outside the MINIMAL SAFE SHAPE SET (fail-closed on ambiguity):
@@ -2183,8 +2577,13 @@ export function branchDeleteNames(verb, args) {
     // a delete. Long form: `--delete` with its unambiguous `--d*` prefix
     // abbreviations (`--d`, `--de`, `--del`, … — branch's only `--d*` option;
     // parity with #443's push `--del` handling).
+    // #591 (round-3 fold): delete letters are read from the token's VALUE-
+    // AWARE flag run only (see _branchToken) — letters an arg-taking short
+    // consumed as an attached VALUE (`-ftdirect`'s "direct" — a real force-
+    // CREATE rc 0) must not read as delete letters. Non-u/non-mid-t tokens
+    // keep the whole-run semantics (`-Dq`, `-qD`, `-Dold` still delete-flag).
     const hasDelete = a.some((x) => /^--d/.test(x) ||
-      /^-(?![A-Za-z]*u)[A-Za-z]*[dD]/.test(x));
+      (/^-[A-Za-z]+$/.test(x) && /[dD]/.test((_branchToken(x)?.run) ?? "")));
     if (!hasDelete) return null;
     const names = [];
     for (const x of a) {
