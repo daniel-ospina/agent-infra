@@ -52,6 +52,48 @@ expect("merge; push compound", "git merge;git push origin main", "block:merge");
 expect("merge&& push compound", "git merge&&git push origin main", "block:merge");
 expect("rebase", "git rebase main", "block:rebase");
 expect("branch -D", "git branch -D chore/old", "block:branch-force-delete");
+// #587: git's parse-options merges NOARG short flags into ONE cluster and
+// accepts them as SEPARATE tokens too — `-Dq` ≡ `-D -q`, and
+// `git branch -q -D x` ≡ `git branch --quiet -D x` — all hard-delete rc=0
+// and must block (the branch name is the following positional). Soft
+// -d/--delete spellings stay allow (P1-B merged-only, git-enforced).
+expect("branch -Dq cluster", "git branch -Dq chore/old", "block:branch-force-delete");
+// quoted flag tokens — the string path's degradation fallback must still block
+// (quote-adjacency tolerance; echo/string-literal over-match is accepted).
+expect("branch quoted -Dq cluster", "git branch \"-Dq\" chore/old", "block:branch-force-delete");
+expect("branch -Dv cluster", "git branch -Dv chore/old", "block:branch-force-delete");
+expect("branch -Dqv cluster", "git branch -Dqv chore/old", "block:branch-force-delete");
+expect("branch -qD cluster", "git branch -qD chore/old", "block:branch-force-delete");
+// #587 review fold-in: -D is `--delete --force`; the SOFT spellings composed
+// with force are HARD deletes of UNMERGED branches (rc=0 probe-verified) and
+// must block. Bare -f (force-CREATE, M3 ceremony) stays allow.
+expect("branch -d -f force-composed", "git branch -d -f chore/old", "block:branch-force-delete");
+expect("branch -df force-composed cluster", "git branch -df chore/old", "block:branch-force-delete");
+expect("branch -fd force-composed cluster", "git branch -fd chore/old", "block:branch-force-delete");
+expect("branch -d --force force-composed", "git branch -d --force chore/old", "block:branch-force-delete");
+expect("branch --delete --force force-composed", "git branch --delete --force chore/old", "block:branch-force-delete");
+expect("branch --force --delete force-composed", "git branch --force --delete chore/old", "block:branch-force-delete");
+expect("branch quoted --delete --force", "git branch '--delete' '--force' chore/old", "block:branch-force-delete");
+// #587: git accepts UNAMBIGUOUS long-option prefix abbreviations (--d..
+// --delete, --forc/--force — branch's only --d*/--forc* options; --for is
+// ambiguous with --format, rc 129) — the abbreviation compositions are the
+// same hard deletes and must block too.
+expect("branch --del --forc abbreviated", "git branch --del --forc chore/old", "block:branch-force-delete");
+expect("branch -d --forc abbreviated", "git branch -d --forc chore/old", "block:branch-force-delete");
+expect("branch --d --force abbreviated", "git branch --d --force chore/old", "block:branch-force-delete");
+expect("branch -q -D separated", "git branch -q -D chore/old", "block:branch-force-delete");
+expect("branch --quiet -D separated", "git branch --quiet -D chore/old", "block:branch-force-delete");
+expect("branch -Dq compound segment", "git add . && git branch -Dq chore/old", "block:branch-force-delete");
+expect("branch -d soft (allow)", "git branch -d chore/old", "allow");
+expect("branch -f force-create (allow)", "git branch -f feat/1 main", "allow");
+expect("branch -dq soft cluster (allow)", "git branch -dq chore/old", "allow");
+expect("branch --delete soft (allow)", "git branch --delete chore/old", "allow");
+// #587: -u takes an ATTACHED value (set-upstream-to); a D-leading value must
+// NOT false-positive as a force-delete cluster, and reads stay allow.
+expect("branch -u upstream (allow)", "git branch -u origin/main", "allow");
+expect("branch -uDevel attached upstream (allow)", "git branch -uDevel", "allow");
+expect("branch -qDuDevel u-mid cluster (allow)", "git branch -qDuDevel feat/1", "allow");
+expect("branch --merged read (allow)", "git branch --merged main", "allow");
 expect("force push", "git push -f origin main", "block:force-push");
 expect("force push --force", "git push --force origin main", "block:force-push");
 expect("restore", "git restore .", "block:restore");
@@ -620,6 +662,46 @@ dexpect("#543: branch -d multi → ALL soft-delete targets captured", `git branc
 dexpect("#543: branch --delete multi → ALL targets captured", `git branch --delete a b`, { branchState: true, deleteTargets: ["a", "b"] });
 dexpect("#543: branch -f force-create → NOT a delete (no targets)", `git branch -f feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
 dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
+// ── #587 regression: merged NOARG flag-clusters ─────────────────────────────
+// `-Dq` ≡ `-D -q` (hard delete, quiet): block, and the target is the
+// following POSITIONAL — NOT a phantom attached "q" (git has no attached-name
+// form). `-dq` ≡ `-d -q` is a SOFT delete: allow + state + real targets.
+dexpect("#587: branch -Dq cluster → block, target is positional", `git branch -Dq feat/1`, { verdict: "block:branch-force-delete", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
+// d/D NOT first in the cluster is also reachable (`-qD` ≡ `-D -q`); the
+// any-position hasDelete must still extract the positional target.
+dexpect("#587: branch -qD cluster (D mid-cluster) → block + targets", `git branch -qD feat/1`, { verdict: "block:branch-force-delete", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
+dexpect("#587: branch -qd soft cluster (d mid-cluster) → allow + targets", `git branch -qd feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
+// #587 review fold-in: -d/--delete composed with -f/--force hard-deletes
+// UNMERGED branches — same ownership gate as -D.
+dexpect("#587: branch -df force-composed → block + target", `git branch -df feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+dexpect("#587: branch --delete --force force-composed → block", `git branch --delete --force feat/1`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1"] });
+// Unambiguous long-prefix abbreviations (--d..--delete, --forc/--force).
+dexpect("#587: branch --del --forc abbreviated → block + target", `git branch --del --forc feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+// u-guard breadth (reviewer pin): a u MID/LATE cluster (-qDuDevel — delete +
+// set-upstream mode conflict, rc 129) must stay allow — a narrowing edit to
+// the guard would flip this pin red.
+dexpect("#587: branch -qDuDevel u-mid cluster → NOT a delete", `git branch -qDuDevel feat/1`, { verdict: "allow", branchState: false, deleteTargets: [] });
+dexpect("#587: branch -Dqv multi-letter cluster → block", `git branch -Dqv feat/1`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1"] });
+dexpect("#587: branch -Dqv multi-TARGET cluster → ALL positionals", `git branch -Dqv feat/1 other/2`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1", "other/2"] });
+dexpect("#587: branch -q -D separated → block", `git branch -q -D feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+// A prefixed destructive branch delete in a LATER compound segment previously
+// escaped both legacy passes (raw regex adjacency broken by -C; the skimmed
+// re-test only rebuilt invocation[0]).
+dexpect("#587: branch -Dq in later -C-prefixed compound segment → block", `git fetch origin && git -C . branch -Dq feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+// Token-level derivation closes name-first + QUOTED-metachar-name spellings
+// (`git branch "feat&x" -Dq` hard-deletes rc=0; the string-level `[^;&|]*` run
+// truncates at the bare metachar but the quote-stripped token is inert).
+dexpect("#587: branch name-first quoted-metachar -Dq → block (token-level)", `git branch "feat&x" -Dq`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat&x"] });
+// Raw-pass parity: a commit/push compound's branch hard-delete must not
+// downgrade to block:commit/block:push when the string pass was truncated by
+// the quoted metachar (the untruncated twin blocks as branch-force-delete).
+dexpect("#587: commit && metachar-name -Dq → branch-force-delete wins", `git commit -m x && git branch "feat&x" -Dq`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat&x"] });
+dexpect("#587: branch --quiet -D separated → block", `git branch --quiet -D feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+dexpect("#587: branch -dq soft cluster → allow + real targets", `git branch -dq feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
+// `-Dold` is NOT an attached-name delete — unknown switch 'o', rc 129, git
+// deletes NOTHING; a following REAL positional is still captured.
+dexpect("#587: branch -Dold + positional → block, no phantom name", `git branch -Dold feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+dexpect("#587: branch -uDevel attached upstream → NOT a delete", `git branch -uDevel`, { verdict: "allow", branchState: false });
 // Guard-adapter pin: replicate index.ts's ownership-allowance target wiring
 // (pushTargets → deleteTargets → newBranch fallback) + shared ownershipAllowed
 // branch-force-delete. index.ts is not importable in tests (pi-extension TS),
@@ -812,7 +894,17 @@ bdNames("bdNames push --delete heads/main → main (P1)", "push", ["origin", "--
 bdNames("bdNames push colon heads/feat/x → feat/x (P1)", "push", ["origin", ":heads/feat/x"], ["feat/x"]);
 bdNames("bdNames branch -D", "branch", ["-D", "old"], ["old"]);
 bdNames("bdNames branch -d", "branch", ["-d", "old"], ["old"]);
-bdNames("bdNames branch merged -Dx", "branch", ["-Dold"], ["old"]);
+// #587: cluster suffixes are FLAGS, never an attached branch name — the old
+// slice(2) capture read `-Dq` as a phantom name "q" (real git: no attached
+// form; `-Dold` is unknown-switch rc 129 and deletes nothing).
+bdNames("#587: -Dold cluster → null (no attached name exists)", "branch", ["-Dold"], null);
+bdNames("#587: -Dq cluster + positional → positional only", "branch", ["-Dq", "feat/1"], ["feat/1"]);
+bdNames("#587: -qD cluster (D mid) + positional → positional only", "branch", ["-qD", "feat/1"], ["feat/1"]);
+bdNames("#587: -qd soft cluster (d mid) + positional → positional only", "branch", ["-qd", "feat/1"], ["feat/1"]);
+bdNames("#587: -df force-composed cluster + positional → positional", "branch", ["-df", "feat/1"], ["feat/1"]);
+bdNames("#587: --del abbreviated long → positional", "branch", ["--del", "feat/1"], ["feat/1"]);
+bdNames("#587: -dq soft cluster + positional → positional only", "branch", ["-dq", "feat/1"], ["feat/1"]);
+bdNames("#587: -Dq cluster alone → null (git: branch name required)", "branch", ["-Dq"], null);
 bdNames("bdNames branch list → null", "branch", ["-a"], null);
 bdNames("bdNames non-delete verb → null", "commit", ["-m", "x"], null);
 bdAllow("bdAllow current branch blocked", ["main"], "main", new Set(), false);

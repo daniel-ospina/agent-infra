@@ -34,7 +34,57 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   { name: "merge", re: /\bgit\s+merge\b(?!-)/ },
   { name: "rebase", re: /\bgit\s+rebase\b/ },
   { name: "pull", re: /\bgit\s+pull\b/ },
-  { name: "branch-force-delete", re: /\bgit\s+branch\s+-\w*D\b/ },
+  // #587: git's parse-options MERGES NOARG short flags into ONE cluster, so
+  // `-Dq` ≡ `-D -q` and `git branch -q -D x` / `--quiet -D x` all HARD-delete
+  // (probe-verified rc=0); the branch name is always the following POSITIONAL
+  // (git has no attached-name form — `-Dold` is unknown-switch rc 129). The
+  // old `-\w*D\b` required the D TERMINAL at a word boundary AND the cluster
+  // immediately after `branch\s`, so every trailing-flag cluster (`-Dq`, `-Dv`,
+  // `-Dqv`) and separated-flag form bypassed. Widen to a run-scan (force-push
+  // precedent): a single-dash short cluster containing uppercase D ANYWHERE in
+  // the branch option run is a force delete. Case distinguishes HARD -D from
+  // SOFT -d/--delete — lowercase stays allow (P1-B merged-only, git-enforced)
+  // UNLESS composed with force (next entry). The `(?![A-Za-z]*u)` guard stops
+  // `-u<value>` (set-upstream-to's ATTACHED value — the ONLY arg-taking short
+  // among branch's flags, e.g. `-uDevel`) from false-matching as a delete
+  // cluster; `--long` tokens can't match (`[A-Za-z]*` cannot cross the second
+  // dash), and name tokens lack a leading dash. The guard is deliberately
+  // BROADER than -u alone: it rejects any cluster whose letter run contains u
+  // (incl. `-Du<value>` / `-qDu<value>` mixes) — safe because delete +
+  // set-upstream-to is a git MODE CONFLICT (probe-verified rc 129, nothing
+  // deleted), so no real force-delete is ever masked. The leading `["']?`
+  // tolerates a quoted flag token (`git branch "-Dq" x`) for the FROZEN string
+  // path's degradation fallback (echo/string-literal over-match is the
+  // documented accepted class). The token boundary is a SINGLE `[ \t]`
+  // (shell-token semantics: options are space/tab-separated on one line) — a
+  // `\s+` after the `[^;&|]*` run would re-scan the same whitespace it already
+  // consumed, giving quadratic blowup on a long whitespace run (measured: 20KB
+  // spaces → seconds; review fold-in #587). KNOWN STRING-LEVEL RESIDUAL: a
+  // metachar inside a QUOTED branch name placed BEFORE the flags
+  // (`git branch "feat&x" -Dq`) truncates the `[^;&|]*` run at the string
+  // level — the detailed path closes it via the token-level hard-delete verdict
+  // in the branch-state arm (quote-stripped args), which index.ts consumes
+  // EXCLUSIVELY.
+  { name: "branch-force-delete", re: /\bgit\s+branch\b[^;&|]*[ \t]["']?-(?![A-Za-z]*u)[A-Za-z]*D/ },
+  // #587 review fold-in: -D is documented as `--delete --force`, and git
+  // accepts the SOFT spellings composed with force as HARD deletes of UNMERGED
+  // branches — `git branch -d -f x`, `-df x`, `-fd x`, `-d --force x`,
+  // `--delete --force x` all delete unmerged branches rc=0 (probe-verified),
+  // defeating the P1-B "merged-only, git-enforced" premise that keeps bare
+  // -d/--delete on the allow list. So a branch option run that contains BOTH a
+  // delete spelling AND a force spelling is a force delete: delete = the
+  // `--delete` long form with its UNAMBIGUOUS prefix abbreviations (`--d`..
+  // `--delete` — branch's only `--d*` option, probe-verified; parity with the
+  // push family's `--del` handling, #443) or a single-dash cluster whose
+  // letters include d/D (u-guarded); force = `--force`/`--forc` (unambiguous —
+  // `--for` is ambiguous with `--format`, rc 129; anchored `(?![A-Za-z0-9])` so
+  // `--forcfoo` — an unknown-option rc-129 no-op — is NOT force, keeping both
+  // layers' force sets identical to the token arm) or a single-dash cluster
+  // including f (u-guarded). The D-cluster entry above already covers pure -D
+  // forms; this one is the d+force composition. Force-CREATE (`git branch -f x
+  // main` — no delete token) never reaches this pattern: the M3 force arm
+  // classifies it separately (branch-state mutation, ownership-gated).
+  { name: "branch-force-delete", re: /\bgit\s+branch\b(?=[^;&|]*[ \t](?:["']?--d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|["']?-(?![A-Za-z]*u)[A-Za-z]*[dD]))(?=[^;&|]*[ \t](?:["']?--forc(?:e)?(?![A-Za-z0-9])|["']?-(?![A-Za-z]*u)[A-Za-z]*f))[^;&|]*/ },
   { name: "force-push", re: /\bgit\s+push\b[^;&|]*(-f|--force)\b/ },
   { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
   { name: "force-checkout", re: /\bgit\s+(checkout|switch)\s+(-f|--force)\b/ },
@@ -64,13 +114,18 @@ export function classifyGitCommand(command) {
 }
 
 // ── Detailed classifier (#265) ────────────────────────────────────────────
-// classifyGitCommand above is FROZEN byte-identical (back-compat — test.mjs's
-// existing string assertions + external importers depend on it; it carries NO
-// new matchers). classifyGitCommandDetailed is the NEW object-returning
-// classifier that index.ts consumes EXCLUSIVELY (call-site contract, plan
-// deviation 8 / cycle-3 fold-in). It verb-anchors the SAME legacy patterns on
-// the SKIMMED command (`git -c k=v checkout main` ≡ `git checkout main`) and
-// adds commit / push / branch-state classification for the ownership gates.
+// classifyGitCommand's function TEXT above is FROZEN byte-identical
+// (back-compat — test.mjs's existing string assertions + external importers
+// depend on the exact body). New destructive matchers are added to the SHARED
+// DESTRUCTIVE_GIT_PATTERNS array that both it and classifyGitCommandDetailed
+// iterate — which DOES extend string-level blocking for new command shapes
+// (#587 adds the branch -D cluster + delete+force entries). What is frozen is
+// the function body itself, not the pattern set it consumes.
+// classifyGitCommandDetailed is the NEW object-returning classifier that
+// index.ts consumes EXCLUSIVELY (call-site contract, plan deviation 8 /
+// cycle-3 fold-in). It verb-anchors the SAME legacy patterns on the SKIMMED
+// command (`git -c k=v checkout main` ≡ `git checkout main`) and adds
+// commit / push / branch-state classification for the ownership gates.
 
 /** Quote-aware tokenizer (mirrors branch-ownership.mjs; kept local so
  * classify-git stays dependency-free for jiti loading — the two are
@@ -1241,17 +1296,27 @@ export function classifyGitCommandDetailed(command) {
 
   // ── verb-anchored legacy destructive patterns ──
   // Run on the RAW command (compound chains: `git pull && git merge`), and if
-  // that misses, on the SKIMMED first invocation (`git -C x checkout main` ≡
-  // `git checkout main` — the -C/-c/GIT_DIR prefixes defeat the raw regexes,
-  // which is exactly why they were verified bypasses).
+  // that misses, on EVERY invocation's SKIMMED reconstruction (`git -C x
+  // checkout main` ≡ `git checkout main` — the -C/-c/GIT_DIR prefixes defeat
+  // the raw regexes' `git\s+branch` adjacency, which is exactly why they were
+  // verified bypasses). #587 (review fold-in): the re-test covers every
+  // invocation, not just the first — a prefixed destructive verb in a LATER
+  // compound segment (`git fetch origin && git -C . branch -Dq x`) previously
+  // escaped both passes. index.ts resolves the effective repo from the STATE
+  // invocation, so worktree/foreign-targeted deletes stay exempt downstream.
   const raw = String(command ?? "").trim();
-  const skimmedFirst = `git ${invocations[0].verb ?? ""} ${(invocations[0].args || []).join(" ")}`.trim();
   for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
     if (re.test(raw)) { out.verdict = `block:${name}`; break; }
   }
-  if (out.verdict === "allow" && skimmedFirst !== "git") {
-    for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
-      if (re.test(skimmedFirst)) { out.verdict = `block:${name}`; break; }
+  if (out.verdict === "allow") {
+    for (const inv of invocations) {
+      const skimmed = `git ${inv.verb ?? ""} ${(inv.args || []).join(" ")}`.trim();
+      if (skimmed === "git") continue;
+      let hit = false;
+      for (const { name, re } of DESTRUCTIVE_GIT_PATTERNS) {
+        if (re.test(skimmed)) { out.verdict = `block:${name}`; hit = true; break; }
+      }
+      if (hit) break;
     }
   }
 
@@ -1393,7 +1458,9 @@ export function classifyGitCommandDetailed(command) {
         // feat/other, rc=1). newBranch (the first name) alone would let
         // `<baseline|own> <foreign>` slip the trailing foreign target past the
         // ownership allowance, so the branch-delete extraction must capture
-        // EVERY -d/-D/--delete name (incl. merged `-Dname` cluster forms) via
+        // EVERY -d/-D/--delete name (merged NOARG flag-clusters like `-Dq` ≡
+        // `-D -q` contribute NO name — #587: the suffix is flags, never an
+        // attached branch name — the target is the following positional) via
         // branchDeleteNames — the all-targets discipline pushTargets already
         // gives the push family (#443). newBranch stays the FIRST name for
         // back-compat (single-target callers/tests); index.ts prefers
@@ -1407,6 +1474,31 @@ export function classifyGitCommandDetailed(command) {
           out.newBranch = delNames[0] ?? null;
         } else {
           out.newBranch = args.filter((x) => !x.startsWith("-"))[0] ?? null;
+        }
+        // #587 (review fold-in, TOKEN-level hard-delete verdict): the legacy
+        // patterns scan the raw/skimmed STRING, where a `[^;&|]*` run boundary
+        // is truncated by metachars inside QUOTED branch names placed BEFORE
+        // the flags (`git branch "feat&x" -Dq` — real git hard-deletes rc=0),
+        // and quoted flag tokens break the token adjacency. The quote-aware
+        // tokenizer already stripped both classes down to plain args here, so
+        // derive the HARD verdict from the tokens (mirror of the push family's
+        // token-level `_isPushDeleteFlagToken`, #443): hard = an uppercase-D
+        // cluster (u-guarded) OR a delete + force composition. Soft -d/--delete
+        // (no force, no D) keeps the allow verdict; force-CREATE (`-f x main` —
+        // delNames null) is untouched (M3 force arm). The upgrade applies when
+        // the legacy/commit/push passes left an overridable verdict — the raw
+        // string pass gives branch-force-delete precedence over the commit/push
+        // arms (`git commit -m x && git branch -Dq y` blocks as
+        // branch-force-delete), so a metachar-truncated twin must not downgrade
+        // to block:commit/block:push (review fold-in round 4).
+        const hardUpperD = args.some((x) => /^-(?![A-Za-z]*u)[A-Za-z]*D/.test(x));
+        const hardForce = delNames && args.some((x) =>
+          x === "--force" || x === "--forc" ||
+          /^-(?![A-Za-z]*u)[A-Za-z]*f/.test(x));
+        const overridable = out.verdict === "allow" || out.verdict === "block:commit" ||
+          out.verdict === "block:push" || out.verdict === "block:force-push";
+        if (overridable && (hardUpperD || hardForce)) {
+          out.verdict = "block:branch-force-delete";
         }
       }
     }
@@ -2047,7 +2139,10 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
  *     probe-verified, #439 P1-1); local-path/URL/`.`/other-name remotes are
  *     refused (a `git push . --delete main` removes the local trunk with no
  *     server gate — #439 P1-2).
- *   branch forms: `git branch -d|-D|--delete <b>...` (merged `-Db` accepted).
+ *   branch forms: `git branch -d|-D|--delete <b>...` plus merged NOARG
+ *     flag-clusters containing the delete short (`-Dq` = -D --quiet, `-dq` =
+ *     -d --quiet — #587); cluster suffixes are FLAGS, never attached names,
+ *     so targets are the following positionals only.
  * Main/master targets are NOT filtered here — branchDeleteAllowance blocks
  * them unconditionally.
  * @param {string} verb
@@ -2080,13 +2175,30 @@ export function branchDeleteNames(verb, args) {
     return names.length > 0 ? names : null;
   }
   if (verb === "branch") {
-    const hasDelete = a.some((x) => x === "-d" || x === "-D" || x === "--delete" ||
-      /^-[dD]./.test(x) && !x.startsWith("--"));
+    // #587 (review fold-in): git merges NOARG shorts into ONE token, so the
+    // delete short can sit ANYWHERE in a single-dash cluster (`-Dq`, `-dq`,
+    // `-qD`, `-qd`, `-qvD`) — not just first — mirroring the push family's
+    // `_isPushDeleteFlagToken` any-position detection (#443). The `u`-prefix
+    // exclusion mirrors the regex guard: `-u<value>` (set-upstream-to) is not
+    // a delete. Long form: `--delete` with its unambiguous `--d*` prefix
+    // abbreviations (`--d`, `--de`, `--del`, … — branch's only `--d*` option;
+    // parity with #443's push `--del` handling).
+    const hasDelete = a.some((x) => /^--d/.test(x) ||
+      /^-(?![A-Za-z]*u)[A-Za-z]*[dD]/.test(x));
     if (!hasDelete) return null;
     const names = [];
     for (const x of a) {
-      if (/^-[dD][^-]/.test(x)) { names.push(x.slice(2)); continue; }
-      if (x === "-d" || x === "-D" || x === "--delete") continue;
+      // #587: git's parse-options merges NOARG shorts into one token, so any
+      // single-dash d/D token (`-Dq`, `-dq`, `-D`, `-Dold`) is a delete-flag
+      // CLUSTER — the suffix is more flags (or, for invalid letters like the
+      // `o` in `-Dold`, an rc-129 error that deletes nothing), NEVER an
+      // attached branch name. The old `/^-[dD][^-]/ → slice(2)` capture read
+      // `-Dq` as a phantom name "q" — an over-capture that poisoned
+      // deleteTargets (own-branch `-Dq feat/x` listed ["q","feat/x"] and
+      // false-blocked the ceremony once -Dq classifies block). Targets are
+      // the following positionals only.
+      if (/^-[dD]/.test(x)) continue;
+      if (x === "--delete") continue;
       if (x.startsWith("-") || x === "--") continue;
       names.push(x);
     }
