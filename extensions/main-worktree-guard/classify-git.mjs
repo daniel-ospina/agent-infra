@@ -2347,7 +2347,19 @@ export function _hasHiddenStateSubst(raw) {
       if (c === "$" && src[i + 1] === "'") {
         let j = i + 2;
         while (j < n && src[j] !== "'") { if (src[j] === "\\") j++; j++; }
-        spans.push(src.slice(i + 2, j));
+        // ANSI-C $'…' escapes translate BEFORE scanning: a multiline payload
+        // (`sh -c $'echo a\ngit branch -fq victim main'`) carries the real
+        // newline as \n — without translation the payload tokenizes as ONE
+        // glued word and the hidden git invocation is invisible (round-6
+        // cycle-3 reviewer P1, probe-verified rc 0).
+        const rawA = src.slice(i + 2, j);
+        const ansiMap = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"', $: "$", a: "\u0007", b: "\b", f: "\f", v: "\v" };
+        const translated = rawA.replace(/\\([\\'"$ntrabvf]|x[0-9a-fA-F]{1,2}|[0-7]{1,3})/g, (mm, e) => {
+          if (e[0] === "x") return String.fromCharCode(parseInt(e.slice(1), 16));
+          if (/^[0-7]+$/.test(e)) return String.fromCharCode(parseInt(e, 8));
+          return ansiMap[e] ?? mm;
+        });
+        spans.push(translated);
         i = j < n ? j + 1 : n;
         continue;
       }
@@ -2383,6 +2395,10 @@ export function _hasHiddenStateSubst(raw) {
   // its expansion is unclassifiable, so it may hide a second state mutation.
   if (allGitInvocations(source).some((inv) => inv.verb === "__unverifiable__")) return true;
   if (/\\`/.test(source)) return true; // nested-backtick escaping — fail closed
+  // $(<file) bash file-read substitution: the content is opaque file text fed
+  // to the shell (`eval "$(< /tmp/payload)"` runs whatever the file holds —
+  // round-6 cycle-3 reviewer P2, probe-verified rc 0).
+  if (/\$\(</.test(source)) return true;
   const seen = new Set();
   const scan = (inner, isProcSubst) => {
     if (inner === undefined || inner.length === 0 || seen.has(inner)) return false;
@@ -2420,6 +2436,26 @@ export function _hasHiddenStateSubst(raw) {
     const payload = m[1] ?? m[2] ?? "";
     if (payload.length > 0 && scan(payload, false)) return true;
   }
+  // git-level alias indirection (round-6 cycle-3 reviewers P1, probe-verified
+  // rc 0): `git branch -fq own main ; git -c alias.br='branch -fq victim main'
+  // br` hides the real command behind the alias NAME — the invocation walk sees
+  // verb "br" and stateOpCount stays 1, so the benign carve-out would fire
+  // while the alias force-creates a FOREIGN branch. A config alias whose VALUE
+  // carries a state-mutating git spelling — or whose first word is a branch-
+  // state verb (args are appended at the call site: `alias.x=branch x -fq
+  // victim main`) — refuses the carve-out; benign values (status/log/diff)
+  // pass. Opaque env-backed aliases (--config-env=alias.x=ENV /
+  // GIT_CONFIG_KEY_n=alias.x) also refuse. (STANDALONE alias invocation after
+  // configuration is a separate pre-existing gap beyond #591 → sibling issue.)
+  const cfgAlias = /(?:\-c|\-\-config)(?:\s+alias\.|=alias\.)([A-Za-z0-9_.\/-]+)=(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+  let cm;
+  while ((cm = cfgAlias.exec(source)) !== null) {
+    const val = cm[2] ?? cm[3] ?? cm[4] ?? "";
+    const firstWord = val.trim().split(/\s+/)[0];
+    if (["branch", "checkout", "switch", "symbolic-ref", "update-ref"].includes(firstWord)) return true;
+    if (val.length > 0 && scan(val, false)) return true;
+  }
+  if (/(?:\-\-config\-env[=\s]+\S*alias\.|GIT_CONFIG_KEY_\d+=alias\.)/.test(source)) return true;
   return false;
 }
 

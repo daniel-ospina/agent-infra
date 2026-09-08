@@ -865,6 +865,25 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
   expectBool("#591 fold: quoted-paren span truncation → hiddenStateSubst", quotedParen.hiddenStateSubst === true, true);
   const procDeny = sharedDecideM3({ branchOp: procSub.branchState ? sharedClassifyBranchOp(procSub.stateVerb, procSub.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: procSub.stateOpCount ?? 1, hiddenStateSubst: procSub.hiddenStateSubst === true });
   expectBool("#591 fold: process-substitution launder → M3 default block", procDeny?.block === true, true);
+  // Round-6 fold-in (cycle-3 reviewers P1/P2): git-level alias config
+  // (git -c alias.x='branch …' x — the alias NAME hides the real command),
+  // ANSI-C MULTILINE $'…\n…' payloads (escapes must translate before scan),
+  // and $(<file) file-read substitution (opaque file text) all refuse the
+  // carve-out; benign alias values (status) and plain -c user.name stay clear.
+  const aliasCfg = classifyGitCommandDetailed(`git branch -fq feat/1 main ; git -c alias.br='git branch -fq feat/other main' br`);
+  expectBool("#591 fold: git -c alias indirection → hiddenStateSubst", aliasCfg.hiddenStateSubst === true, true);
+  const aliasCfg2 = classifyGitCommandDetailed(`git branch -fq feat/1 main ; git -c alias.x=branch x -fq feat/other main`);
+  expectBool("#591 fold: -c alias subcommand-only value → hiddenStateSubst", aliasCfg2.hiddenStateSubst === true, true);
+  const aliasEnv = classifyGitCommandDetailed(`git branch -fq feat/1 main ; GIT_CONFIG_KEY_0=alias.br GIT_CONFIG_VALUE_0='git branch -fq feat/other main' git br`);
+  expectBool("#591 fold: GIT_CONFIG_KEY alias env → hiddenStateSubst", aliasEnv.hiddenStateSubst === true, true);
+  const ansiMulti = classifyGitCommandDetailed(`git branch -fq feat/1 main ; sh -c $'echo a\ngit branch -fq feat/other main'`);
+  expectBool("#591 fold: ANSI-C multiline $'…' payload → hiddenStateSubst", ansiMulti.hiddenStateSubst === true, true);
+  const fileSub = classifyGitCommandDetailed(`git branch -fq feat/1 main ; eval "$(< /tmp/payload.txt)"`);
+  expectBool("#591 fold: eval $(<file) → hiddenStateSubst", fileSub.hiddenStateSubst === true, true);
+  const aliasBenign = classifyGitCommandDetailed(`git branch -fq feat/1 main ; git -c alias.st=status st`);
+  expectBool("#591 fold: benign -c alias read value stays clear", aliasBenign.hiddenStateSubst === false, true);
+  const aliasCfgDeny = sharedDecideM3({ branchOp: aliasCfg.branchState ? sharedClassifyBranchOp(aliasCfg.stateVerb, aliasCfg.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: aliasCfg.stateOpCount ?? 1, hiddenStateSubst: aliasCfg.hiddenStateSubst === true });
+  expectBool("#591 fold: git -c alias launder → M3 default block", aliasCfgDeny?.block === true, true);
   // Benign-eligibility: NON-mutating payloads (rev-parse / branch --show-
   // current) do NOT trip the bound, so the own-branch ceremony with a
   // substitution start-point keeps its carve-out.
