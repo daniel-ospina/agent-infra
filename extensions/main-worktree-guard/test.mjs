@@ -58,6 +58,9 @@ expect("branch -D", "git branch -D chore/old", "block:branch-force-delete");
 // and must block (the branch name is the following positional). Soft
 // -d/--delete spellings stay allow (P1-B merged-only, git-enforced).
 expect("branch -Dq cluster", "git branch -Dq chore/old", "block:branch-force-delete");
+// quoted flag tokens — the string path's degradation fallback must still block
+// (quote-adjacency tolerance; echo/string-literal over-match is accepted).
+expect("branch quoted -Dq cluster", "git branch \"-Dq\" chore/old", "block:branch-force-delete");
 expect("branch -Dv cluster", "git branch -Dv chore/old", "block:branch-force-delete");
 expect("branch -Dqv cluster", "git branch -Dqv chore/old", "block:branch-force-delete");
 expect("branch -qD cluster", "git branch -qD chore/old", "block:branch-force-delete");
@@ -70,6 +73,7 @@ expect("branch -fd force-composed cluster", "git branch -fd chore/old", "block:b
 expect("branch -d --force force-composed", "git branch -d --force chore/old", "block:branch-force-delete");
 expect("branch --delete --force force-composed", "git branch --delete --force chore/old", "block:branch-force-delete");
 expect("branch --force --delete force-composed", "git branch --force --delete chore/old", "block:branch-force-delete");
+expect("branch quoted --delete --force", "git branch '--delete' '--force' chore/old", "block:branch-force-delete");
 // #587: git accepts UNAMBIGUOUS long-option prefix abbreviations (--d..
 // --delete, --forc/--force — branch's only --d*/--forc* options; --for is
 // ambiguous with --format, rc 129) — the abbreviation compositions are the
@@ -684,6 +688,10 @@ dexpect("#587: branch -q -D separated → block", `git branch -q -D feat/1`, { v
 // escaped both legacy passes (raw regex adjacency broken by -C; the skimmed
 // re-test only rebuilt invocation[0]).
 dexpect("#587: branch -Dq in later -C-prefixed compound segment → block", `git fetch origin && git -C . branch -Dq feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+// Token-level derivation closes name-first + QUOTED-metachar-name spellings
+// (`git branch "feat&x" -Dq` hard-deletes rc=0; the string-level `[^;&|]*` run
+// truncates at the bare metachar but the quote-stripped token is inert).
+dexpect("#587: branch name-first quoted-metachar -Dq → block (token-level)", `git branch "feat&x" -Dq`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat&x"] });
 dexpect("#587: branch --quiet -D separated → block", `git branch --quiet -D feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
 dexpect("#587: branch -dq soft cluster → allow + real targets", `git branch -dq feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
 // `-Dold` is NOT an attached-name delete — unknown switch 'o', rc 129, git

@@ -52,8 +52,15 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   // BROADER than -u alone: it rejects any cluster whose letter run contains u
   // (incl. `-Du<value>` / `-qDu<value>` mixes) — safe because delete +
   // set-upstream-to is a git MODE CONFLICT (probe-verified rc 129, nothing
-  // deleted), so no real force-delete is ever masked.
-  { name: "branch-force-delete", re: /\bgit\s+branch\b[^;&|]*\s+-(?![A-Za-z]*u)[A-Za-z]*D/ },
+  // deleted), so no real force-delete is ever masked. The leading `["']?`
+  // tolerates a quoted flag token (`git branch "-Dq" x`) for the FROZEN string
+  // path's degradation fallback (echo/string-literal over-match is the
+  // documented accepted class). KNOWN STRING-LEVEL RESIDUAL: a metachar inside
+  // a QUOTED branch name placed BEFORE the flags (`git branch "feat&x" -Dq`)
+  // truncates the `[^;&|]*` run at the string level — the detailed path closes
+  // it via the token-level hard-delete verdict in the branch-state arm
+  // (quote-stripped args), which index.ts consumes EXCLUSIVELY.
+  { name: "branch-force-delete", re: /\bgit\s+branch\b[^;&|]*\s+["']?-(?![A-Za-z]*u)[A-Za-z]*D/ },
   // #587 review fold-in: -D is documented as `--delete --force`, and git
   // accepts the SOFT spellings composed with force as HARD deletes of UNMERGED
   // branches — `git branch -d -f x`, `-df x`, `-fd x`, `-d --force x`,
@@ -70,7 +77,7 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   // forms; this one is the d+force composition. Force-CREATE (`git branch -f x
   // main` — no delete token) is untouched: the M3 force arm gates it as the
   // sanctioned ceremony.
-  { name: "branch-force-delete", re: /\bgit\s+branch\b(?=[^;&|]*(?:\s+--d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|\s+-(?![A-Za-z]*u)[A-Za-z]*[dD]))(?=[^;&|]*(?:\s+--forc(?:e)?|\s+-(?![A-Za-z]*u)[A-Za-z]*f))[^;&|]*/ },
+  { name: "branch-force-delete", re: /\bgit\s+branch\b(?=[^;&|]*(?:\s+["']?--d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|\s+["']?-(?![A-Za-z]*u)[A-Za-z]*[dD]))(?=[^;&|]*(?:\s+["']?--forc(?:e)?|\s+["']?-(?![A-Za-z]*u)[A-Za-z]*f))[^;&|]*/ },
   { name: "force-push", re: /\bgit\s+push\b[^;&|]*(-f|--force)\b/ },
   { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
   { name: "force-checkout", re: /\bgit\s+(checkout|switch)\s+(-f|--force)\b/ },
@@ -1460,6 +1467,24 @@ export function classifyGitCommandDetailed(command) {
           out.newBranch = delNames[0] ?? null;
         } else {
           out.newBranch = args.filter((x) => !x.startsWith("-"))[0] ?? null;
+        }
+        // #587 (review fold-in, TOKEN-level hard-delete verdict): the legacy
+        // patterns scan the raw/skimmed STRING, where a `[^;&|]*` run boundary
+        // is truncated by metachars inside QUOTED branch names placed BEFORE
+        // the flags (`git branch "feat&x" -Dq` — real git hard-deletes rc=0),
+        // and quoted flag tokens break the `\s+-` adjacency. The quote-aware
+        // tokenizer already stripped both classes down to plain args here, so
+        // derive the HARD verdict from the tokens (mirror of the push family's
+        // token-level `_isPushDeleteFlagToken`, #443): hard = an uppercase-D
+        // cluster (u-guarded) OR a delete + force composition. Soft -d/--delete
+        // (no force, no D) keeps the allow verdict; force-CREATE (`-f x main` —
+        // delNames null) is untouched (M3 force arm).
+        const hardUpperD = args.some((x) => /^-(?![A-Za-z]*u)[A-Za-z]*D/.test(x));
+        const hardForce = delNames && args.some((x) =>
+          x === "--force" || x === "--forc" ||
+          /^-(?![A-Za-z]*u)[A-Za-z]*f/.test(x));
+        if (out.verdict === "allow" && (hardUpperD || hardForce)) {
+          out.verdict = "block:branch-force-delete";
         }
       }
     }
