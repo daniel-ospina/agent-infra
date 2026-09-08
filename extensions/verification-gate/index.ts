@@ -1764,12 +1764,26 @@ function segmentWritesFile(text: string): boolean {
     }
     if (ch === "'" || ch === "\"") { quote = ch; continue; }
     if (ch === ">") {
-      // `N>&M` / `>&fd` fd-DUP forms — the NEXT char is `&` (`2>&1`, `>&2`).
-      // ⛔ A `>` whose PREVIOUS char is `&` is the `&>file` redirect-BOTH
-      // operator — a FILE WRITE, never a descriptor dup (review-r1 P1: skipping
-      // it let `echo x &> f.ts && git commit -am y` bypass M1 as "neutral").
-      if (i + 1 < text.length && text[i + 1] === "&") continue;
-      // /dev/null targets write nothing we gate (incl. `>/dev/null`, `2>/dev/null`).
+      // `>&fd` / `N>&M` fd-dup/close forms have `&` NEXT (`2>&1`, `>&2`, `>&-`).
+      // ⛔ review-r1 P1 + review-r2 P2-1: a `>` whose PREVIOUS char is `&` is the `&>file`
+      // redirect-BOTH operator (a FILE WRITE) — and `>&word` with a NON-descriptor target
+      // is ALSO redirect-both to a file (`echo x >& f.ts`). Only skip when the token after
+      // `&` is a descriptor (all digits, or `-` for fd-close).
+      if (i + 1 < text.length && text[i + 1] === "&") {
+        let k = i + 2;
+        while (k < text.length && (text[k] === " " || text[k] === "\t")) k++;
+        const isFdTarget = k < text.length && text[k] === "-" ? true
+          : (() => {
+              if (k >= text.length || !/\d/.test(text[k])) return false;
+              let d = k;
+              while (d < text.length && /\d/.test(text[d])) d++;
+              return d === text.length || /[\s;&|<>\n]/.test(text[d]);
+            })();
+        if (isFdTarget) continue; // descriptor dup/close — no file write
+        // `>&word` (non-descriptor) / `&>file` — a file write: fall through to the
+        // /dev/null tolerance below (i stays on the `>`, j resumes right after it).
+      }
+      // /dev/null targets write nothing we gate (incl. `>/dev/null`, `2>/dev/null`, `&>/dev/null`).
       let j = i + 1;
       while (j < text.length && (text[j] === " " || text[j] === "\t")) j++;
       if (text.startsWith("/dev/null", j)) {
@@ -1790,8 +1804,74 @@ function chainCommandClasses(command: string, depth: number): ChainClass[] {
   return out;
 }
 
+// review-r2 P2-2 — pure EXECUTION MODIFIERS run a following command verbatim and mutate
+// nothing themselves (`timeout 5 git commit`, `nice -n 5 git commit`, `sudo -u me git
+// commit`, `ionice -c 3 git commit`). COMMIT_SEGMENT_HEAD strips only a BARE verb
+// (`sudo git commit`), not verbs with args, so without a peel those shapes hit the
+// unwrappable-program fallback and its [mutating, commit] pair → false refusal. Peel the
+// modifier + its option/arg tokens until the first non-option token (the real program):
+// timeout/ionice/chrt take a leading POSITIONAL (duration/class/priority) after their
+// options; sudo/nice/stdbuf/nohup/time/command/env/exec do not (their first positional IS
+// the command). If the peel is inconclusive (head not a modifier, or nothing follows) the
+// text is returned unchanged and the caller's fallback logic still applies (e.g. `env -S
+// '…'` loses `env` to normalize and its `-S` head is handled by the pair rule).
+const MODIFIER_WITH_POSITIONAL = new Set(["timeout", "ionice", "chrt"]);
+const MODIFIER_VERBS = new Set([
+  "timeout", "ionice", "chrt", "stdbuf", "nice", "nohup", "time", "command",
+  "sudo", "env", "exec",
+]);
+
+function peelCommandModifier(s: string): string {
+  let cur = s.trim();
+  const commandIsh = (w: string): boolean =>
+    w === "git" || SHELL_C_INTERPRETERS.has(w) || MODIFIER_VERBS.has(w);
+  for (let round = 0; round < 4; round++) {
+    const head = readShellToken(cur, 0);
+    if (head === null || !MODIFIER_VERBS.has(head.content)) return cur;
+    let p = head.rawEnd;
+    // Skip option tokens only (never their values here — values are disambiguated below
+    // by the command-lookahead, so no-value options like `time -p` can never eat the
+    // command).
+    for (;;) {
+      const tok = readShellToken(cur, p);
+      if (tok === null) return s; // modifier consumed everything — nothing executable (inconclusive)
+      if (!tok.content.startsWith("-")) { p = tok.rawStart; break; }
+      p = tok.rawEnd;
+    }
+    const first = readShellToken(cur, p);
+    if (first === null) return s;
+    // timeout/ionice/chrt take a leading POSITIONAL (duration/class/priority) after their
+    // options — consume it; the NEXT token is the real program.
+    if (MODIFIER_WITH_POSITIONAL.has(head.content)) {
+      const second = readShellToken(cur, first.rawEnd);
+      if (second === null) return s;
+      p = second.rawStart;
+    } else {
+      // sudo/nice/stdbuf/nohup/time/command/env/exec: the first non-option token IS the
+      // command — UNLESS it is the detached value of a value-taking option (`sudo -u me
+      // git commit`: `-u me` → me is a value) and a command-like head follows it.
+      const second = readShellToken(cur, first.rawEnd);
+      if (second !== null && commandIsh(second.content) && !commandIsh(first.content)) {
+        p = second.rawStart; // first was the option's value — the command follows
+      } else {
+        p = first.rawStart;
+      }
+    }
+    const rest = cur.slice(p).trim();
+    if (rest.length === 0 || rest === cur) return s;
+    cur = rest;
+  }
+  return cur;
+}
+
 function chainSegmentClass(stripped: string, depth: number): ChainClass[] {
   if (stripped.length === 0) return ["neutral"];
+  // review-r2 P2-2: peel pure execution modifiers (timeout/nice/sudo -u me/…) so their
+  // command classifies at its TRUE head (`timeout 5 git commit -am x` → ["commit"]), then
+  // recurse. Wrapper payloads under a modifier (`timeout 5 sh -c 'echo x > f && git commit
+  // -am y'`) unwrap and refuse like the bare form.
+  const peeled = peelCommandModifier(stripped);
+  if (peeled !== stripped) return chainSegmentClass(peeled, depth);
   // Provably-executing wrapper → its payload executes IN PLACE: splice the payload's
   // own segment classes into the sequence (order preserved across the wrapper).
   const unwrapped = unwrapExecutingHead(stripped);
@@ -1822,15 +1902,27 @@ function chainSegmentClass(stripped: string, depth: number): ChainClass[] {
     if (readInv !== null && readInv.index === 0 && !segmentWritesFile(stripped)) return ["neutral"];
     return ["mutating"]; // git add/checkout/reset/restore/rm/mv/push/fetch/… or an unknown verb
   }
-  // Fallback — arbitrary program / script shell: assumed able to mutate. review-r1 P2: a
-  // segment whose text carries a git-commit invocation at a NON-head offset may EXECUTE
-  // that commit inside an unwrappable program (`env -S "… git commit …"`, `xargs … sh -c
-  // …`, `find … -exec …`, a depth-capped wrapper) — emit the [mutating, commit] pair
-  // (cap-wrapper parity) so M1/M2 fire on the self-contained mutation+commit. `gh` is the
-  // carve-out: gh executes NO local shell — git-commit-looking text inside its option
-  // values (--body/--title/--comment) is inert prose and refusing a pure gh op for it is
-  // NOT split-recoverable over-refusal (scenario 39/68b parity).
-  if (t !== "gh" && findGitCommit(stripped) !== null) return ["mutating", "commit"];
+  // Fallback — arbitrary program / script shell: assumed able to mutate. review-r1 P2:
+  // a segment whose text carries a git-commit invocation at a NON-head offset may EXECUTE
+  // that commit inside an unwrappable program (`env -S "… && git commit …"`, `xargs … sh
+  // -c "…"`, `find … -exec sh -c "…"`) — emit the [mutating, commit] pair (cap-wrapper
+  // parity) so M1/M2 fire on the self-contained mutation+commit. review-r2 P2-2 REFINEMENT:
+  // the pair fires only when an EXECUTING SHELL-CARRIER sits before the git text — a shell
+  // interpreter `-c` payload or a separator (`&&`/`||`/`;`/`|`/newline) — so pure execution
+  // modifiers that run a following git VERBATIM (`timeout 5 git commit -am x`, `sudo -u me
+  // git commit -am x`) classify plain mutating (never refused — they mutate nothing
+  // themselves). `gh` stays carved out: gh executes NO local shell — git-commit-looking
+  // text inside its option values (--body/--title/--comment) is inert prose and refusing a
+  // pure gh op for it is NOT split-recoverable over-refusal (scenario 39/68b parity).
+  if (t !== "gh") {
+    const nonHeadCommit = findGitCommit(stripped);
+    if (nonHeadCommit !== null && nonHeadCommit.index > 0) {
+      const before = stripped.slice(0, nonHeadCommit.index);
+      const shellCarrier = /\b(?:sh|bash|zsh|dash|ksh)\b[^;&|\n]*(?:-[A-Za-z]*)?\s-c\b/.test(before)
+        || /(?:&&|\|\||;|\||\n)/.test(before);
+      if (shellCarrier) return ["mutating", "commit"];
+    }
+  }
   return ["mutating"];
 }
 

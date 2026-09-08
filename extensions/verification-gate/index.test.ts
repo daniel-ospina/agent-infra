@@ -2398,6 +2398,8 @@ test("in-batch file write + commit in one tool_call → refusal", () => {
     "tee f.ts < /dev/null && git commit -am y",
     "sed -i s/a/b/ f.ts && git commit -am y",
     "echo x &> f.ts && git commit -am y",                    // `&>` redirect-BOTH to a file — a file write, never an fd-dup (review-r1 P1)
+    "echo x >& f.ts && git commit -am y",                    // `>&word` NON-descriptor target = POSIX redirect-both to a file (review-r2 P2-1)
+    "echo x &>> f.ts && git commit -am y",                    // `&>>` append-both to a file
     "python3 -c \"open('f.ts','w').write('x')\" && git commit -am y",    // arbitrary program before a commit
     "node -e 'require(\"fs\").writeFileSync(\"f.ts\",\"x\")' && git commit -am y",
     "sh -c 'echo x > f.ts && git commit -am y'",                          // wrapper payload splices in order
@@ -2458,7 +2460,12 @@ test("pure / read-only / scaffolding pre-commit content stays legal", () => {
     "echo done && git commit -m x",
     "printf 'progress\\n' && git commit -m x",
     "echo x 2>&1 && git commit -m x",                        // `2>&1` fd-dup — never a file write
-    "echo x >&2 && git commit -m x",                         // `>&2` fd-dup
+    "echo x >&2 && git commit -m x",                         // `>&2` fd-dup (descriptor target)
+    "echo x >&- && git commit -m x",                         // `>&-` fd-close
+    "echo x &>/dev/null && git commit -m x",                 // `&>` to /dev/null writes nothing we gate
+    "timeout 5 git commit -am x",                            // pure execution modifier — runs git verbatim, mutates nothing (review-r2 P2-2)
+    "sudo -u me git commit -am x",                           // sudo with args — same (review-r2 P2-2)
+    "timeout 5 sh -c 'git commit -am x'",                    // modifier + pure shell commit — no mutation before the commit
     ": && git commit -m x",
     "true && git commit -m x",
     "gh pr create --body \"see: git commit -am x\"",          // gh option-value prose is inert (review-r1 P2 carve-out — head gh never emits the pair)
