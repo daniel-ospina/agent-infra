@@ -107,6 +107,30 @@ if [ "$MODE" = "--new" ]; then
     echo "⛔ $REPO already materialized (marker present). Use --merge to refresh."
     exit 1
   fi
+  # Clobber guard: refuse --new when the existing AGENTS.md is NOT a
+  # recognizable stub/empty — a marker-less file with substantial content
+  # (the DMeer/eldato/agent-infra pre-marker layout) would be silently
+  # overwritten by base + tail-file, dropping content the human forgot to
+  # include in the tail (#600 review). Stub signature: SHORT (≤1500B, below
+  # the pre-marker content files this guard protects) AND references the
+  # base document by name/URL — NOT bare prose mention of the org (a
+  # "belongs to the agent-infra org" note is content, not a stub).
+  # Whitespace-only files count as empty (always safe); a stray BOM-only
+  # remnant false-refuses fail-closed (remove the 3-byte file to proceed).
+  STUB_SIG='AGENTS\.base\.md|AGENTS_BASE|github\.com/[-A-Za-z0-9_.]*/agent-infra'
+  if [ -f "$REPO/AGENTS.md" ] && [ -s "$REPO/AGENTS.md" ] \
+     && grep -q '[^[:space:]]' "$REPO/AGENTS.md"; then
+    EXISTING_BYTES=$(wc -c < "$REPO/AGENTS.md")
+    if [ "$EXISTING_BYTES" -gt 1500 ] \
+       || ! grep -qE "$STUB_SIG" "$REPO/AGENTS.md"; then
+      echo "⛔ $REPO/AGENTS.md already has content without a BASE-END marker —"
+      echo "   refusing --new (would overwrite it). If it is a real stub, remove it"
+      echo "   first or pass the existing file as the tail base for curation."
+      exit 1
+    fi
+    echo "⚠️ overwriting existing marker-less AGENTS.md (stub heuristic: ≤1500B"
+    echo "   + AGENTS.base.md reference) — ensure its content is in <tail-file>."
+  fi
   { cat "$BASE_TEMPLATE"; echo; echo "$MARKER"; echo; cat "$TAIL"; } > "$REPO/AGENTS.md.new"
   mv "$REPO/AGENTS.md.new" "$REPO/AGENTS.md"
   echo "✅ $REPO: AGENTS.md materialized (base + repo tail). Review then commit."

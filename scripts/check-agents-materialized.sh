@@ -34,10 +34,13 @@ if git diff --cached --name-only --diff-filter=D -- AGENTS.md 2>/dev/null | grep
 fi
 
 # ── Resolve the materializer. Physical pwd: scripts/ may be a symlink to
-# agent-infra (consumer repos). Logical pwd would keep HERE under the consumer
-# and the AGENT_INFRA_PATH fallback would resolve to the CONSUMER root → base
-# template lookup fails → false "STUB" block on a materialized repo
-# (P1-1, #600 review).
+# agent-infra (consumer repos). Physical pwd keeps the default AGENT_INFRA_PATH
+# (= HERE/..) pointing at the real agent-infra install so (a) the drift
+# warning resolves the canonical base template and (b) the materializer is the
+# agent-infra copy even when invoked via symlink. A logical pwd would default
+# AGENT_INFRA_PATH to the consumer root — harmless for the marker gate (--check
+# never reads the template; lazy resolution), but it would silently disable the
+# best-effort drift warning when the env var is unset.
 HERE="$(cd -P "$(dirname "$0")" && pwd -P)"
 MATERIALIZER="$HERE/materialize-agents.sh"
 
@@ -59,8 +62,11 @@ if ! git show :AGENTS.md > "$STAGE_DIR/AGENTS.md" 2>/dev/null; then
   exit 1
 fi
 
-OUTPUT="$(bash "$MATERIALIZER" --check "$STAGE_DIR" 2>&1 || true)"
-if [ $? -ne 0 ] || ! echo "$OUTPUT" | grep -q 'materialized (all base markers present)'; then
+# Run the materializer gate. The exit code is authoritative (0 = materialized,
+# 1 = stub/missing, 2 = usage); assignment-inside-if is safe under set -e and
+# preserves the real status (no `|| true` — it would mask the code and make
+# this a dead branch).
+if ! OUTPUT="$(bash "$MATERIALIZER" --check "$STAGE_DIR" 2>&1)"; then
   echo ""
   echo "⛔ [agent-infra] AGENTS.md is a STUB — universal rules never reach the model."
   echo "   The file references AGENTS.base.md by URL, but pi only reads LOCAL files."
