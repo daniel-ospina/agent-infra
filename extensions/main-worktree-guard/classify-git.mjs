@@ -1254,6 +1254,35 @@ export function allGitInvocations(command, seedVars = {}) {
 }
 
 /**
+ * #596: does a `git branch` invocation MUTATE branch state (per the branch
+ * arm's OWN triggers — exact mirror, reusing the SAME helpers, so selection
+ * and arm cannot drift)? TRUE for rename/move (exact -m/-M, merged clusters
+ * -Mq/-mv/…, the --move/--mo/--mov long forms), hard OR soft delete
+ * (branchDeleteNames), pure force-create (narrow token test incl. clusters /
+ * --forc), and force-copy (destination mutation). FALSE for the arm's benign
+ * classes: plain create (`git branch <name>`), list forms (-l/-a/-r and the
+ * list-mode f-clusters -fl/-lf/-fa), SOFT copy (-c/-cq/--copy/--cop — a
+ * new-ref-only create), and the mixed-mode / u-guarded / rc-129 no-op
+ * spellings — none of which sets branchState in the arm. This predicate is
+ * what lets classifyGitCommandDetailed skip a benign LEADING branch segment
+ * when selecting the invocation the M3 gate must classify (#596).
+ * @param {string[]} args
+ * @returns {boolean}
+ */
+function _branchInvMutatesBranchState(args) {
+  if (args.includes("-m") || args.includes("-M") ||
+      args.some((x) => (x === "--move" || x === "--mo" || x === "--mov") ||
+        (/^-[A-Za-z]+$/.test(x) && _branchMode(x)?.family === "move"))) {
+    return true;
+  }
+  if (branchDeleteNames("branch", args) !== null ||
+      args.some(isBranchForceCreateTokenNarrow)) {
+    return true;
+  }
+  return _branchCopyState(args).forceCopy;
+}
+
+/**
  * Detailed classification of a shell command (consumed EXCLUSIVELY by
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
@@ -1265,9 +1294,10 @@ export function allGitInvocations(command, seedVars = {}) {
  * - branchState: true for checkout/switch/symbolic-ref/update-ref/branch ops
  *   that mutate the checkout's branch (M3 gate runs on these regardless of
  *   verdict — symbolic-ref/update-ref/branch -f have NO legacy pattern).
- * - stateVerb/stateArgs: the FIRST state-mutating invocation's verb/args (M3
+ * - stateVerb/stateArgs: the FIRST state-MUTATING invocation's verb/args (M3
  *   must classify the invocation that changes branch state, not invocations[0]
- *   — P1-A). stateOpCount: TOTAL branch-state invocations in the command — the
+ *   — P1-A; #596: selection skips benign branch leads, see classifyGitCommand-
+ *   Detailed). stateOpCount: TOTAL branch-state invocations in the command — the
  *   #591 benign-force carve-out requires exactly 1 (a later compound segment's
  *   foreign force-create is invisible to the first-invocation M3 gate).
  * - force-push hygiene: `--force-with-lease` / `--force-if-includes` are NOT
@@ -1327,8 +1357,38 @@ export function classifyGitCommandDetailed(command) {
 
   const commitInv = invocations.find((v) => v.verb === "commit");
   const pushInv = invocations.find((v) => v.verb === "push");
-  const stateInv = invocations.find((v) =>
+  // #596: stateInv SELECTION — the FIRST branch-state verb in command order is
+  // NOT necessarily the state-MUTATING one. A benign leading branch segment
+  // (`git branch side`, `git branch -c a b`, list forms) sets NO branchState in
+  // the arm, and the arm inspects ONLY stateInv's args — so every LATER
+  // rename/copy/force-create (the M3-ONLY families: no legacy verdict) escaped
+  // M3 while git executed them rc 0 (`git branch side ; git branch -Mq feat/x
+  // rnX` force-renames the current branch; `git branch side && git branch -fq
+  // feat/other main` force-creates a foreign ref — probe-verified). Deletes
+  // survived only because the invocation-blind legacy string pass skims every
+  // segment (#587 fold-in); rename/copy/force-create have NO legacy verdict →
+  // M3 is their only gate → the positional shadowing was a full bypass.
+  // Fix: scan ALL branch-state invocations and select the first the arm would
+  // classify as MUTATING (checkout/switch unconditionally — the arm sets
+  // branchState for any; a HEAD/refs-heads symbolic-ref/update-ref — the arm's
+  // conditional; a git branch whose args the branch arm mutates on — exact
+  // helper mirror below), falling back to the FIRST state-verb invocation when
+  // NONE mutates (all-benign commands keep today's stateVerb/stateArgs exposure
+  // and the arm leaves branchState false). branchState is then true iff the
+  // command CONTAINS a branch-state mutation, regardless of segment position;
+  // stateVerb/stateArgs point at the mutation the M3 gate must classify.
+  const stateInvs = invocations.filter((v) =>
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb));
+  const stateInv = stateInvs.find((v) => {
+    if (v.verb === "checkout" || v.verb === "switch") return true;
+    if (v.verb === "symbolic-ref" || v.verb === "update-ref") {
+      const pos = (v.args || []).filter((x) => !x.startsWith("-"));
+      return (v.verb === "symbolic-ref" && pos[0] === "HEAD") ||
+        (v.verb === "update-ref" && pos[0] &&
+          (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD"));
+    }
+    return v.verb === "branch" && _branchInvMutatesBranchState(v.args);
+  }) ?? stateInvs[0] ?? null;
   const syncInv = invocations.find((v) => ["merge", "pull", "rebase"].includes(v.verb));
 
   // ── push: refspec targets + force-push hygiene (highest priority — a

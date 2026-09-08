@@ -1139,6 +1139,82 @@ dexpect("#591 fold: branch -ftVerbose invalid directive → NOT branchState", `g
   const ownBenignM3 = sharedDecideM3({ branchOp: ownBenign.branchState ? sharedClassifyBranchOp(ownBenign.stateVerb, ownBenign.stateArgs) : { op: "other" }, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: "feat/1", repoKey: "k", stateOpCount: ownBenign.stateOpCount ?? 1, hiddenStateSubst: ownBenign.hiddenStateSubst === true });
   expectBool("#591 fold: own-branch + rev-parse payload → carve-out HOLDS", ownBenignM3 === null, true);
 }
+// ── #596: benign-lead compound segments — LATER branch-state mutations must
+// reach M3 (stateInv selection) ────────────────────────────────────────────
+// classifyGitCommandDetailed's stateInv used to be the FIRST branch-state verb
+// in command order, and the branch arm inspected ONLY its args — a benign lead
+// (`git branch side`, `git branch -c a b`, lists) set no branchState and
+// shadowed every LATER rename/copy/force-create (the M3-ONLY families: no
+// legacy verdict; real git executes them rc 0 — probe-verified `-Mq` renames
+// the current branch and `-fq` force-creates a foreign ref after a `side`
+// segment), a full M3 bypass from the shared main checkout. Deletes survived
+// only because the invocation-blind legacy string pass skims every segment
+// (#587). #596 fixes the SELECTION: the state arm runs on the first
+// state-MUTATING invocation wherever it sits; stateVerb/stateArgs point at it
+// so index.ts's classifyBranchOp(stateVerb, stateArgs) classifies the mutation.
+dexpect("#596: benign-lead ';' rename → branchState + stateInv = the -Mq", `git branch side ; git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX", deleteTargets: [], stateOpCount: 2 });
+dexpect("#596: benign-lead '&&' rename → same mutating selection", `git branch side && git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX", stateOpCount: 2 });
+dexpect("#596: soft-copy-lead rename → mutating invocation selected", `git branch -c a b ; git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX" });
+dexpect("#596: list-lead rename → mutating invocation selected", `git branch -a ; git branch -Mq feat/x rnX`, { branchState: true, stateVerb: "branch", stateArgs: ["-Mq", "feat/x", "rnX"], renameFrom: "feat/x", renameTo: "rnX" });
+dexpect("#596: benign-lead later force-create → branchState + target", `git branch side && git branch -fq feat/other main`, { branchState: true, stateVerb: "branch", stateArgs: ["-fq", "feat/other", "main"], newBranch: "feat/other", deleteTargets: [] });
+dexpect("#596: benign-lead later checkout → M3 gates the checkout (P1-A parity)", `git branch side ; git checkout main`, { branchState: true, stateVerb: "checkout", stateArgs: ["main"] });
+dexpect("#596: all-benign compound → still NOT branchState", `git branch side && git branch feat/other`, { branchState: false, stateOpCount: 2 });
+// Delete-in-later-segment: the delete arm now runs on the MUTATING invocation
+// (deleteTargets captured from the later segment) while the verdict/ownership
+// path is untouched — the block:branch-force-delete verdict comes from the
+// invocation-blind string pass, and classifyBranchOp op "other" keeps M3 out.
+dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targets", `git branch side && git branch -Dq stale`, { verdict: "block:branch-force-delete", branchState: true, stateArgs: ["-Dq", "stale"], newBranch: "stale", deleteTargets: ["stale"] });
+// M3-outcome adapter (mirror of index.ts: branchState → classifyBranchOp →
+// decideM3 with the classifier's stateOpCount — the #591 bounds stay enforced
+// for the LATER segment): a benign lead must NOT change the M3 decision vs the
+// single-invocation spelling (own-baseline rename → reBaseline carve-out;
+// foreign rename / force-create / force-copy → default block).
+{
+  const idxM3 = (cmd, currentBranch) => {
+    const d = classifyGitCommandDetailed(cmd);
+    if (!d.branchState) return { skip: true };
+    const op = sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs);
+    if (!op || op.op === "other") return { skip: true };
+    return sharedDecideM3({ branchOp: op, isAgentInfra: true, baseline: { repoKey: "k", branch: currentBranch }, currentBranch, repoKey: "k", stateOpCount: d.stateOpCount ?? 1 });
+  };
+  const renOwn = idxM3(`git branch side ; git branch -Mq feat/1 rnX`, "feat/1");
+  expectBool("#596: benign-lead own-baseline rename → reBaseline (carve-out)", renOwn?.reBaseline === "rnX" && !renOwn?.block, true);
+  const renFor = idxM3(`git branch side && git branch -Mq feat/other rnX`, "feat/1");
+  expectBool("#596: benign-lead FOREIGN rename → M3 block", renFor?.block === true, true);
+  const listRenOwn = idxM3(`git branch -a ; git branch -Mq feat/1 rnX`, "feat/1");
+  expectBool("#596: list-lead own-baseline rename → reBaseline", listRenOwn?.reBaseline === "rnX" && !listRenOwn?.block, true);
+  const fcFor = idxM3(`git branch side && git branch -fq feat/other main`, "feat/1");
+  expectBool("#596: benign-lead FOREIGN force-create → M3 block", fcFor?.block === true, true);
+  // stateOpCount counts the benign lead too (#591 bound) → the benign-force
+  // carve-out (own-branch attempt — git would refuse rc 128) is REFUSED for
+  // the compound, exactly as for the all-force `;` launder: the #591
+  // anti-launder bound stays enforced when the mutation is in the LATER
+  // segment.
+  const fcOwn = idxM3(`git branch side && git branch -fq feat/1 main`, "feat/1");
+  expectBool("#596: benign-lead own-branch force-create → M3 block (stateOpCount 2 refuses carve-out)", fcOwn?.block === true, true);
+  const scRenOwn = idxM3(`git branch -c a b ; git branch -Mq feat/1 rnX`, "feat/1");
+  expectBool("#596: soft-copy-lead own rename → reBaseline", scRenOwn?.reBaseline === "rnX" && !scRenOwn?.block, true);
+  const scRenFor = idxM3(`git branch -c a b ; git branch -Mq feat/other rnX`, "feat/1");
+  expectBool("#596: soft-copy-lead FOREIGN rename → M3 block", scRenFor?.block === true, true);
+  const cpFor = idxM3(`git branch side ; git branch -Cq feat/other cpY`, "feat/1");
+  expectBool("#596: benign-lead FOREIGN force-copy → M3 block", cpFor?.block === true, true);
+  const coFor = idxM3(`git branch side ; git checkout feat/other`, "feat/1");
+  expectBool("#596: benign-lead later-segment checkout (foreign) → M3 block", coFor?.block === true, true);
+  const allBenign = idxM3(`git branch side && git branch feat/other`, "feat/1");
+  expectBool("#596: all-benign compound → no branchState → no M3 (allowed)", allBenign?.skip === true, true);
+  // Delete-in-later-segment stays on the VERDICT + ownership path (requirement
+  // 3 — "keep that working"): op "other" skips decideM3; the block verdict +
+  // all-targets ownership allowance gate it exactly like the single-invocation
+  // delete (deleteTargets now captured from the later segment, so the own/
+  // owned-branch ceremony allowance is reachable and foreign deletes block).
+  const delD = classifyGitCommandDetailed(`git branch side && git branch -Dq stale`);
+  const delOp = sharedClassifyBranchOp(delD.stateVerb ?? delD.verb, delD.stateArgs ?? delD.verbArgs);
+  expectBool("#596: later-segment delete → op other (M3 skipped, verdict path)", delD.branchState === true && delOp.op === "other", true);
+  const delOwn = sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: delD.deleteTargets, ownedBranches: ["stale"] });
+  expectBool("#596: later-segment delete of pid-owned branch → allowed (ceremony)", delOwn === true, true);
+  const delFor = sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: delD.deleteTargets, ownedBranches: [] });
+  expectBool("#596: later-segment delete of FOREIGN branch → not allowed (verdict block stands)", delFor === false, true);
+}
 dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
 // ── #587 regression: merged NOARG flag-clusters ─────────────────────────────
 // `-Dq` ≡ `-D -q` (hard delete, quiet): block, and the target is the
