@@ -692,6 +692,10 @@ dexpect("#587: branch -Dq in later -C-prefixed compound segment → block", `git
 // (`git branch "feat&x" -Dq` hard-deletes rc=0; the string-level `[^;&|]*` run
 // truncates at the bare metachar but the quote-stripped token is inert).
 dexpect("#587: branch name-first quoted-metachar -Dq → block (token-level)", `git branch "feat&x" -Dq`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat&x"] });
+// Raw-pass parity: a commit/push compound's branch hard-delete must not
+// downgrade to block:commit/block:push when the string pass was truncated by
+// the quoted metachar (the untruncated twin blocks as branch-force-delete).
+dexpect("#587: commit && metachar-name -Dq → branch-force-delete wins", `git commit -m x && git branch "feat&x" -Dq`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat&x"] });
 dexpect("#587: branch --quiet -D separated → block", `git branch --quiet -D feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
 dexpect("#587: branch -dq soft cluster → allow + real targets", `git branch -dq feat/1`, { verdict: "allow", branchState: true, newBranch: "feat/1", deleteTargets: ["feat/1"] });
 // `-Dold` is NOT an attached-name delete — unknown switch 'o', rc 129, git
@@ -898,13 +902,7 @@ bdNames("#587: -Dq cluster + positional → positional only", "branch", ["-Dq", 
 bdNames("#587: -qD cluster (D mid) + positional → positional only", "branch", ["-qD", "feat/1"], ["feat/1"]);
 bdNames("#587: -qd soft cluster (d mid) + positional → positional only", "branch", ["-qd", "feat/1"], ["feat/1"]);
 bdNames("#587: -df force-composed cluster + positional → positional", "branch", ["-df", "feat/1"], ["feat/1"]);
-bdNames("#587: -uDevel attached upstream → not a delete", "branch", ["-uDevel"], null);
 bdNames("#587: --del abbreviated long → positional", "branch", ["--del", "feat/1"], ["feat/1"]);
-// NOTE: the -uDevel bdNames case above is a DOCUMENTATION pin — it returns
-// null with OR without the u-guard (the names loop skips all dash tokens), so
-// it cannot detect a guard regression; the discriminating guards for the u
-// lookahead live at the VERDICT level (string `expect("branch -uDevel…")` and
-// the -qDuDevel dexpect above).
 bdNames("#587: -dq soft cluster + positional → positional only", "branch", ["-dq", "feat/1"], ["feat/1"]);
 bdNames("#587: -Dq cluster alone → null (git: branch name required)", "branch", ["-Dq"], null);
 bdNames("bdNames branch list → null", "branch", ["-a"], null);
