@@ -60,13 +60,17 @@ export const DESTRUCTIVE_GIT_PATTERNS = [
   // `--delete --force x` all delete unmerged branches rc=0 (probe-verified),
   // defeating the P1-B "merged-only, git-enforced" premise that keeps bare
   // -d/--delete on the allow list. So a branch option run that contains BOTH a
-  // delete spelling (`--delete`, or a single-dash cluster whose letters
-  // include d/D — u-guarded) AND a force spelling (`--force`, or a
-  // single-dash cluster including f) is a force delete. The D-cluster entry
-  // above already covers pure -D forms; this one is the d+force composition.
-  // Force-CREATE (`git branch -f x main` — no delete token) is untouched:
-  // the M3 force arm gates it as the sanctioned ceremony.
-  { name: "branch-force-delete", re: /\bgit\s+branch\b(?=[^;&|]*(?:\s+--delete\b|\s+-(?![A-Za-z]*u)[A-Za-z]*[dD]))(?=[^;&|]*(?:\s+--force\b|\s+-(?![A-Za-z]*u)[A-Za-z]*f))[^;&|]*/ },
+  // delete spelling AND a force spelling is a force delete: delete = the
+  // `--delete` long form with its UNAMBIGUOUS prefix abbreviations (`--d`..
+  // `--delete` — branch's only `--d*` option, probe-verified; parity with the
+  // push family's `--del` handling, #443) or a single-dash cluster whose
+  // letters include d/D (u-guarded); force = `--force`/`--forc` (unambiguous —
+  // `--for` is ambiguous with `--format`, rc 129) or a single-dash cluster
+  // including f (u-guarded). The D-cluster entry above already covers pure -D
+  // forms; this one is the d+force composition. Force-CREATE (`git branch -f x
+  // main` — no delete token) is untouched: the M3 force arm gates it as the
+  // sanctioned ceremony.
+  { name: "branch-force-delete", re: /\bgit\s+branch\b(?=[^;&|]*(?:\s+--d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|\s+-(?![A-Za-z]*u)[A-Za-z]*[dD]))(?=[^;&|]*(?:\s+--forc(?:e)?|\s+-(?![A-Za-z]*u)[A-Za-z]*f))[^;&|]*/ },
   { name: "force-push", re: /\bgit\s+push\b[^;&|]*(-f|--force)\b/ },
   { name: "push-delete", re: /\bgit\s+push\b[^;&|]*(--delete\b|\s:\S+)/ },
   { name: "force-checkout", re: /\bgit\s+(checkout|switch)\s+(-f|--force)\b/ },
@@ -2122,8 +2126,10 @@ export function branchDeleteNames(verb, args) {
     // `-qD`, `-qd`, `-qvD`) — not just first — mirroring the push family's
     // `_isPushDeleteFlagToken` any-position detection (#443). The `u`-prefix
     // exclusion mirrors the regex guard: `-u<value>` (set-upstream-to) is not
-    // a delete. `--delete` is the only long form.
-    const hasDelete = a.some((x) => x === "--delete" ||
+    // a delete. Long form: `--delete` with its unambiguous `--d*` prefix
+    // abbreviations (`--d`, `--de`, `--del`, … — branch's only `--d*` option;
+    // parity with #443's push `--del` handling).
+    const hasDelete = a.some((x) => /^--d/.test(x) ||
       /^-(?![A-Za-z]*u)[A-Za-z]*[dD]/.test(x));
     if (!hasDelete) return null;
     const names = [];

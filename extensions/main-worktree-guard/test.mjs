@@ -70,6 +70,13 @@ expect("branch -fd force-composed cluster", "git branch -fd chore/old", "block:b
 expect("branch -d --force force-composed", "git branch -d --force chore/old", "block:branch-force-delete");
 expect("branch --delete --force force-composed", "git branch --delete --force chore/old", "block:branch-force-delete");
 expect("branch --force --delete force-composed", "git branch --force --delete chore/old", "block:branch-force-delete");
+// #587: git accepts UNAMBIGUOUS long-option prefix abbreviations (--d..
+// --delete, --forc/--force — branch's only --d*/--forc* options; --for is
+// ambiguous with --format, rc 129) — the abbreviation compositions are the
+// same hard deletes and must block too.
+expect("branch --del --forc abbreviated", "git branch --del --forc chore/old", "block:branch-force-delete");
+expect("branch -d --forc abbreviated", "git branch -d --forc chore/old", "block:branch-force-delete");
+expect("branch --d --force abbreviated", "git branch --d --force chore/old", "block:branch-force-delete");
 expect("branch -q -D separated", "git branch -q -D chore/old", "block:branch-force-delete");
 expect("branch --quiet -D separated", "git branch --quiet -D chore/old", "block:branch-force-delete");
 expect("branch -Dq compound segment", "git add . && git branch -Dq chore/old", "block:branch-force-delete");
@@ -81,6 +88,7 @@ expect("branch --delete soft (allow)", "git branch --delete chore/old", "allow")
 // NOT false-positive as a force-delete cluster, and reads stay allow.
 expect("branch -u upstream (allow)", "git branch -u origin/main", "allow");
 expect("branch -uDevel attached upstream (allow)", "git branch -uDevel", "allow");
+expect("branch -qDuDevel u-mid cluster (allow)", "git branch -qDuDevel feat/1", "allow");
 expect("branch --merged read (allow)", "git branch --merged main", "allow");
 expect("force push", "git push -f origin main", "block:force-push");
 expect("force push --force", "git push --force origin main", "block:force-push");
@@ -663,6 +671,12 @@ dexpect("#587: branch -qd soft cluster (d mid-cluster) → allow + targets", `gi
 // UNMERGED branches — same ownership gate as -D.
 dexpect("#587: branch -df force-composed → block + target", `git branch -df feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
 dexpect("#587: branch --delete --force force-composed → block", `git branch --delete --force feat/1`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1"] });
+// Unambiguous long-prefix abbreviations (--d..--delete, --forc/--force).
+dexpect("#587: branch --del --forc abbreviated → block + target", `git branch --del --forc feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
+// u-guard breadth (reviewer pin): a u MID/LATE cluster (-qDuDevel — delete +
+// set-upstream mode conflict, rc 129) must stay allow — a narrowing edit to
+// the guard would flip this pin red.
+dexpect("#587: branch -qDuDevel u-mid cluster → NOT a delete", `git branch -qDuDevel feat/1`, { verdict: "allow", branchState: false, deleteTargets: [] });
 dexpect("#587: branch -Dqv multi-letter cluster → block", `git branch -Dqv feat/1`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1"] });
 dexpect("#587: branch -Dqv multi-TARGET cluster → ALL positionals", `git branch -Dqv feat/1 other/2`, { verdict: "block:branch-force-delete", deleteTargets: ["feat/1", "other/2"] });
 dexpect("#587: branch -q -D separated → block", `git branch -q -D feat/1`, { verdict: "block:branch-force-delete", branchState: true, deleteTargets: ["feat/1"] });
@@ -873,6 +887,12 @@ bdNames("#587: -qD cluster (D mid) + positional → positional only", "branch", 
 bdNames("#587: -qd soft cluster (d mid) + positional → positional only", "branch", ["-qd", "feat/1"], ["feat/1"]);
 bdNames("#587: -df force-composed cluster + positional → positional", "branch", ["-df", "feat/1"], ["feat/1"]);
 bdNames("#587: -uDevel attached upstream → not a delete", "branch", ["-uDevel"], null);
+bdNames("#587: --del abbreviated long → positional", "branch", ["--del", "feat/1"], ["feat/1"]);
+// NOTE: the -uDevel bdNames case above is a DOCUMENTATION pin — it returns
+// null with OR without the u-guard (the names loop skips all dash tokens), so
+// it cannot detect a guard regression; the discriminating guards for the u
+// lookahead live at the VERDICT level (string `expect("branch -uDevel…")` and
+// the -qDuDevel dexpect above).
 bdNames("#587: -dq soft cluster + positional → positional only", "branch", ["-dq", "feat/1"], ["feat/1"]);
 bdNames("#587: -Dq cluster alone → null (git: branch name required)", "branch", ["-Dq"], null);
 bdNames("bdNames branch list → null", "branch", ["-a"], null);
