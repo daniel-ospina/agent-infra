@@ -175,6 +175,20 @@ ok("branchOp: symbolic-ref origin", op("symbolic-ref", ["refs/remotes/origin/HEA
 ok("branchOp: update-ref refs/heads", op("update-ref", ["refs/heads/x", "HEAD"]) === "switch-existing");
 ok("branchOp: update-ref tag", op("update-ref", ["refs/tags/v1", "HEAD"]) === "other");
 ok("branchOp: branch -f", op("branch", ["-f", "x", "main"]) === "force");
+// #591: git merges NOARG shorts into one cluster (`-fq` ≡ `-f -q`; force short
+// anywhere in the run) and --force accepts its unambiguous abbreviation --forc.
+// classify-git's branch arm (branchState trigger) uses the SAME predicate — a
+// lag here would give branchState true + op "other" → index.ts skips M3.
+ok("branchOp: branch -fq cluster → force", op("branch", ["-fq", "x", "main"]) === "force");
+ok("branchOp: branch -qf cluster (f mid) → force", op("branch", ["-qf", "x", "main"]) === "force");
+ok("branchOp: branch -fvq cluster → force", op("branch", ["-fvq", "x", "main"]) === "force");
+ok("branchOp: branch --forc abbrev → force", op("branch", ["--forc", "x", "main"]) === "force");
+ok("branchOp: branch --force → force", op("branch", ["--force", "x", "main"]) === "force");
+ok("branchOp: branch -fq target = first positional", (() => { const r = classifyBranchOp("branch", ["-fq", "x", "main"]); return r.op === "force" && r.branch === "x"; })());
+ok("branchOp: branch --for ambiguous → NOT force", op("branch", ["--for", "x", "main"]) === "other");
+ok("branchOp: branch --forcfoo unknown → NOT force", op("branch", ["--forcfoo", "x", "main"]) === "other");
+ok("branchOp: branch -ufoo u-value → NOT force", op("branch", ["-ufoo", "x"]) === "other");
+ok("branchOp: branch -fuDevel conflict → NOT force", op("branch", ["-fuDevel", "x", "main"]) === "other");
 ok("branchOp: branch -m", op("branch", ["-m", "feat/a", "feat/b"]) === "rename");
 ok("branchOp: branch -M bare rename", op("branch", ["-M", "feat/b"]) === "rename");
 ok("branchOp: branch create", op("branch", ["feat/c"]) === "other");
@@ -214,6 +228,28 @@ ok("M3: create-new agent-infra → reBaseline", (() => { const d = decideM3({ br
 ok("M3: create-new non-infra blocks", (() => { const d = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: false, baseline }); return d?.block === true; })());
 ok("M3: switch-existing blocks", (() => { const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline }); return d?.block === true; })());
 ok("M3: force blocks", (() => { const d = decideM3({ branchOp: { op: "force" }, isAgentInfra: true, baseline }); return d?.block === true; })());
+// #591: force-CREATE (branch -f family) mutates the TARGET ref — foreign / stale
+// / detached targets block; a target equal to the checkout's OWN current branch
+// is git-refused ("cannot force update the branch '…' used by worktree", rc 128
+// — real-git pins below) so the benign own-branch ceremony passes through to
+// git's refusal instead of a guard block. Checkout-force (op "force", no branch
+// field) stays blocked — it discards uncommitted work.
+ok("M3 #591: foreign force-create (target ≠ own branch) blocks", (() => { const d = decideM3({ branchOp: { op: "force", branch: "other" }, isAgentInfra: true, baseline, currentBranch: "feat/1" }); return d?.block === true; })());
+ok("M3 #591: force-create of checkout's OWN branch → allowed (git refuses it)", decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1" }) === null);
+ok("M3 #591: own-branch force-create in NON-infra → allowed (git refuses it)", decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: false, baseline, currentBranch: "feat/1" }) === null);
+ok("M3 #591: detached main (currentBranch null) → force-create blocks", (() => { const d = decideM3({ branchOp: { op: "force", branch: "feat/1" }, isAgentInfra: true, baseline, currentBranch: null }); return d?.block === true; })());
+ok("M3 #591: checkout-force (no branch field) still blocks", (() => { const d = decideM3({ branchOp: { op: "force" }, isAgentInfra: true, baseline, currentBranch: "feat/1" }); return d?.block === true; })());
+// Real-git property backing the carve-out's safety: git refuses force-updating
+// the branch checked out in the current repo (rc 128 — nothing can move), while
+// a NON-checked-out target force-resets rc 0 (the dangerous case M3 blocks).
+{
+  const own = spawnSync("git", ["branch", "-fq", "main"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: force-create of own checked-out branch refused (rc 128)", own.status === 128, String(own.status));
+  const ownLong = spawnSync("git", ["branch", "--force", "main"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: --force own checked-out branch refused (rc 128)", ownLong.status === 128, String(ownLong.status));
+  const foreign = spawnSync("git", ["branch", "-fq", "side", "main"], { cwd: MAIN, encoding: "utf-8" });
+  ok("M3 #591 real-git: NON-checked-out force-create succeeds rc 0 (why M3 blocks)", foreign.status === 0, String(foreign.status));
+}
 ok("M3: orphan blocks", (() => { const d = decideM3({ branchOp: { op: "orphan" }, isAgentInfra: true, baseline }); return d?.block === true; })());
 ok("M3: own rename re-baselines", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/2" }, isAgentInfra: false, baseline, currentBranch: "feat/1" }); return d?.reBaseline === "feat/2"; })());
 ok("M3: foreign rename blocks", (() => { const d = decideM3({ branchOp: { op: "rename", from: "other", to: "x" }, isAgentInfra: false, baseline }); return d?.block === true; })());

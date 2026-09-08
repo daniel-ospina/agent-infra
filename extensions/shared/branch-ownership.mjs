@@ -330,7 +330,19 @@ export function classifyBranchOp(subcmd, args) {
         to: pos[1] ?? null,
       };
     }
-    if (a.includes("-f") || a.includes("--force")) {
+    // #591: force-create detection is TOKEN-level, not exact-match — git's
+    // parse-options merges NOARG shorts into one cluster (`-fq` ≡ `-f -q`;
+    // the f can sit anywhere: `-qf`, `-fvq` … probe-verified rc 0) and
+    // `--force` accepts its unambiguous prefix abbreviation `--forc`.
+    // classify-git.mjs's branch arm (branchState trigger) uses the SAME
+    // predicate — if this op classifier lagged, branchState true + op "other"
+    // would skip the M3 gate entirely (index.ts only enters M3 for op ≠
+    // "other"). Shape is duplicated from classify-git.mjs's
+    // isBranchForceCreateToken (cross-pinned by test-branch-ownership.mjs);
+    // the u-guard keeps -u<value> (set-upstream-to consumes the token rest)
+    // out, and --for/--forcfoo (rc-129 no-ops) are not force.
+    if (a.some((x) => x === "--force" || x === "--forc" ||
+      /^-(?![A-Za-z]*u)[A-Za-z]*f/.test(x))) {
       const pos = a.filter((x) => !x.startsWith("-"));
       return { op: "force", branch: pos[0] ?? null };
     }
@@ -434,8 +446,11 @@ export function decideM2({
  *     create-new carve-out: M2 still blocks off-baseline commits. The
  *     synchronous re-baseline keeps the next tool_call's M1 warn silent.
  *   everything else (switch-existing to any OTHER branch / force / force-create
- *   / orphan / detach / symbolic-ref HEAD / update-ref refs/heads / branch -f)
- *   → block. The #376 return arm additionally requires repoKey === baseline.repoKey
+ *   / orphan / detach / symbolic-ref HEAD / update-ref refs/heads / branch -f
+ *   targeting a branch other than the checkout's OWN current branch — #591:
+ *   a force-create whose target IS the branch currently checked out is
+ *   git-refused rc 128, so the benign own-branch ceremony passes through to
+ *   git's refusal) → block. The #376 return arm additionally requires repoKey === baseline.repoKey
  *   (the resolved repo is the ONE where the original baseline was recorded — a
  *   cd into a DIFFERENT agent-infra clone must not authorize a switch there).
  */
@@ -469,6 +484,25 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
         `     targets "${from ?? "(current)"}" which is not this session's baseline.`,
       ].join("\n"),
     };
+  }
+  // #591 benign-force carve-out: force-create (`git branch -f <b> [<start>]`
+  // — and its merged-cluster / --forc spellings, all of which classify op
+  // "force" with branch = first positional) mutates the TARGET ref, so foreign
+  // / stale / detached targets hit the default block below. But when the
+  // target IS the branch currently checked out in the effective repo
+  // (branchOp.branch === currentBranch — "the current checkout's own branch"),
+  // git itself REFUSES the update: "cannot force update the branch '<b>' used
+  // by worktree at '<path>'" (probe-verified rc 128 for `--force <own>` and
+  // `-fq <own>` alike). No shared ref can ever move, so blocking would be a
+  // needless false positive on a legitimate ceremony step (e.g. an own-branch
+  // fast-forward attempt) — allow it through to git's natural rc-128 refusal.
+  // Checkout-force (`git checkout -f <t>` / `switch --discard-changes`) never
+  // matches: classifyBranchOp returns op "force" WITHOUT a branch field there
+  // (it discards uncommitted work rather than merely resetting a ref) —
+  // `branchOp.branch != null` keeps those blocked. Detached main-checkout
+  // starts (currentBranch null) can never equal a named target → still blocked.
+  if (op === "force" && branchOp.branch != null && branchOp.branch === currentBranch) {
+    return null;
   }
   // #376 carve-out: sanctioned ceremony return-to-baseline — switch back to the
   // branch this session STARTED on (before any create-new re-baseline), allowed

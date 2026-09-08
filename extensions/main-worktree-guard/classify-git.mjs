@@ -1448,7 +1448,15 @@ export function classifyGitCommandDetailed(command) {
         out.renameFrom = pos[0] ?? null;
         out.renameTo = pos[1] ?? null;
       } else if (branchDeleteNames("branch", args) ||
-                 args.includes("-f") || args.includes("--force")) {
+                 args.some(isBranchForceCreateToken)) {
+        // #591: the branch arm's force-create trigger is TOKEN-level (any
+        // spelling git force-creates with — see isBranchForceCreateToken), so
+        // merged NOARG clusters (`-fq` ≡ `-f -q`) and the unambiguous
+        // long-prefix abbreviation (`--forc`) set branchState exactly like the
+        // plain `-f`/`--force` forms they are byte-identical to in git
+        // (probe-verified rc 0). Before #591 they fell through to verdict
+        // allow + branchState false → M3 never entered from the shared main
+        // checkout.
         // P1-B: -D/-d delete must set newBranch so the allowance target list is
         // non-empty (a ceremony `git branch -D $PR_BRANCH` on the own branch is
         // allowed; without this, ownershipAllowed([]) is false -> false-block).
@@ -1464,9 +1472,9 @@ export function classifyGitCommandDetailed(command) {
         // branchDeleteNames — the all-targets discipline pushTargets already
         // gives the push family (#443). newBranch stays the FIRST name for
         // back-compat (single-target callers/tests); index.ts prefers
-        // deleteTargets. `-f`/`--force` (force-create, M3 force arm) is NOT a
-        // delete — branchDeleteNames returns null for it and newBranch keeps
-        // the first positional.
+        // deleteTargets. Force-create (M3 force arm — `-f`/`--force`/clusters/
+        // `--forc`) is NOT a delete — branchDeleteNames returns null for it and
+        // newBranch keeps the first positional (the force-create target).
         out.branchState = true;
         const delNames = branchDeleteNames("branch", args);
         if (delNames) {
@@ -1492,9 +1500,7 @@ export function classifyGitCommandDetailed(command) {
         // branch-force-delete), so a metachar-truncated twin must not downgrade
         // to block:commit/block:push (review fold-in round 4).
         const hardUpperD = args.some((x) => /^-(?![A-Za-z]*u)[A-Za-z]*D/.test(x));
-        const hardForce = delNames && args.some((x) =>
-          x === "--force" || x === "--forc" ||
-          /^-(?![A-Za-z]*u)[A-Za-z]*f/.test(x));
+        const hardForce = delNames && args.some(isBranchForceCreateToken);
         const overridable = out.verdict === "allow" || out.verdict === "block:commit" ||
           out.verdict === "block:push" || out.verdict === "block:force-push";
         if (overridable && (hardUpperD || hardForce)) {
@@ -2125,6 +2131,33 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
   }
   if (HUB_READONLY_VERBS.has(verb)) return "readonly";
   return "block"; // fail-closed: unknown git verb is not sanctioned recovery
+}
+
+/**
+ * #591: is this token a git-branch FORCE-CREATE spelling? git's parse-options
+ * MERGES NOARG short flags into ONE cluster, so `-fq` ≡ `-f -q` and the force
+ * short can sit ANYWHERE in a single-dash cluster (`-fq`, `-qf`, `-fvq`,
+ * `-vqf`) — probe-verified rc 0, byte-identical to `git branch -f x main`.
+ * Long form: `--force` accepts its UNAMBIGUOUS prefix abbreviations — `--forc`
+ * is force; `--for` is AMBIGUOUS with `--format` (rc 129, nothing created) and
+ * `--forcfoo` is an unknown option (rc 129) — both excluded, so the long set is
+ * EXACT `--force`/`--forc` (parity with the #587 delete-composition force set).
+ * The `(?![A-Za-z]*u)` guard mirrors #587's delete side: branch's ONLY
+ * arg-taking short is `-u<value>` (set-upstream-to), which consumes the rest of
+ * the token as its ATTACHED value, so a u-containing letter run is set-upstream
+ * mode, never force-create — probe-verified: `-ufoo`, `-fuDevel … main`
+ * error (mode/arg conflict, rc 128/129) and create NOTHING, so no real
+ * force-create is ever masked. `--long` tokens cannot match (a letter run
+ * cannot cross the second dash) and branch names lack a leading dash. Shared
+ * shape with classifyBranchOp in branch-ownership.mjs (cross-pinned by
+ * test-branch-ownership.mjs); both layers MUST agree or a spelling bypasses
+ * the M3 gate (branchState true but op "other" skips it).
+ * @param {string} a
+ * @returns {boolean}
+ */
+export function isBranchForceCreateToken(a) {
+  return a === "--force" || a === "--forc" ||
+    /^-(?![A-Za-z]*u)[A-Za-z]*f/.test(a);
 }
 
 /**

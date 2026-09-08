@@ -661,6 +661,57 @@ dexpect("#543: branch -D issue scenario → baseline + foreign both captured", `
 dexpect("#543: branch -d multi → ALL soft-delete targets captured", `git branch -d feat/1 other/2`, { verdict: "allow", branchState: true, deleteTargets: ["feat/1", "other/2"] });
 dexpect("#543: branch --delete multi → ALL targets captured", `git branch --delete a b`, { branchState: true, deleteTargets: ["a", "b"] });
 dexpect("#543: branch -f force-create → NOT a delete (no targets)", `git branch -f feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+// ── #591 regression: force-create flag-clusters + long-abbrevs ────────────
+// git merges NOARG short flags into ONE cluster, so `-fq` ≡ `-f -q` (and the
+// force short can sit anywhere: `-qf`, `-fvq` …); `--force` accepts its
+// unambiguous prefix abbreviation `--forc`. All are probe-verified rc 0
+// force-creates — each must set branchState + the first-positional target
+// (M3 gate), exactly like the space-form `-f` they are byte-identical to. The
+// pre-fix code required the EXACT `-f`/`--force` token, so every cluster /
+// abbreviation fell through to verdict allow + branchState FALSE → M3 bypass.
+expectBool("#591: branch -fq cluster → force (co)", co(`git branch -fq feat/1 main`)?.op === "force", true);
+expectBool("#591: branch --forc abbrev → force (co)", co(`git branch --forc feat/1 main`)?.op === "force", true);
+dexpect("#591: branch -fq cluster force-create → branchState + target", `git branch -fq feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591: branch -qf cluster (f mid) force-create → branchState + target", `git branch -qf feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591: branch -fvq multi-letter cluster force-create → branchState + target", `git branch -fvq feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591: branch -vqf multi-letter cluster force-create → branchState + target", `git branch -vqf feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591: branch --forc long-abbrev force-create → branchState + target", `git branch --forc feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+dexpect("#591: branch --force long force-create → branchState + target (unchanged)", `git branch --force feat/1 main`, { branchState: true, newBranch: "feat/1", deleteTargets: [] });
+// NOT force-create (git rejects each: --for is ambiguous with --format rc 129,
+// --forcfoo is an unknown option rc 129, -u<value> is set-upstream mode — the
+// u-guard shared with #587's delete side; probe-verified none creates).
+dexpect("#591: branch --for ambiguous → NOT force-create", `git branch --for feat/1 main`, { branchState: false });
+dexpect("#591: branch --forcfoo unknown → NOT force-create", `git branch --forcfoo feat/1 main`, { branchState: false });
+dexpect("#591: branch -ufoo u-attached value → NOT force-create", `git branch -ufoo feat/1`, { branchState: false });
+dexpect("#591: branch -fuDevel force+upstream conflict → NOT force-create", `git branch -fuDevel feat/1 main`, { branchState: false, deleteTargets: [] });
+// ── #591: M3 gate outcomes for force-create (classify → classifyBranchOp →
+// decideM3 — the exact index.ts sequence on the branch-state invocation) ────
+// Foreign force-create targets (∉ the current checkout's own branch) hit the
+// M3 default block; force-create whose target IS the checkout's own branch is
+// git-REFUSED ("cannot force update the branch '…' used by worktree", rc 128
+// — probe-verified) so no shared ref can move and the benign own-branch
+// ceremony passes through to git's refusal instead of a guard block.
+{
+  const fcM3 = (cmd, currentBranch) => {
+    const d = classifyGitCommandDetailed(cmd);
+    const op = d.branchState
+      ? sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs)
+      : { op: "other" };
+    return sharedDecideM3({ branchOp: op, isAgentInfra: true, baseline: { repoKey: "k", branch: currentBranch }, currentBranch, repoKey: "k" });
+  };
+  const foreignCluster = fcM3(`git branch -fq feat/other main`, "feat/1");
+  expectBool("#591: -fq FOREIGN force-create → M3 block", foreignCluster?.block === true, true);
+  const foreignAbbrev = fcM3(`git branch --forc feat/other main`, "feat/1");
+  expectBool("#591: --forc FOREIGN force-create → M3 block", foreignAbbrev?.block === true, true);
+  const foreignSpace = fcM3(`git branch -f feat/other main`, "feat/1");
+  expectBool("#591: space-form -f FOREIGN force-create → M3 block (unchanged)", foreignSpace?.block === true, true);
+  const ownCluster = fcM3(`git branch -fq feat/1 main`, "feat/1");
+  expectBool("#591: own-branch -fq fast-forward → ALLOWED (git refuses rc 128)", ownCluster === null, true);
+  const ownAbbrev = fcM3(`git branch --forc feat/1 main`, "feat/1");
+  expectBool("#591: own-branch --forc → ALLOWED (git refuses rc 128)", ownAbbrev === null, true);
+  const ownSpace = fcM3(`git branch --force feat/1 main`, "feat/1");
+  expectBool("#591: own-branch --force → ALLOWED (git refuses rc 128)", ownSpace === null, true);
+}
 dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
 // ── #587 regression: merged NOARG flag-clusters ─────────────────────────────
 // `-Dq` ≡ `-D -q` (hard delete, quiet): block, and the target is the
