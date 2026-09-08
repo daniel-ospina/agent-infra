@@ -2326,6 +2326,27 @@ export function isBranchForceCreateTokenNarrow(a) {
  * @param {string} raw
  * @returns {boolean}
  */
+/**
+ * #591 (round-7): ANSI-C $'…' escape translation — \n \t \r \a \b \f \v \\ \'
+ * \" \$ \e/\E \cX (char & 0x1f: \cJ = LF) \xHH \uHHHH \UHHHHHHHH and octal.
+ * Applied to ANSI-C payloads BEFORE scanning: an untranslated multiline payload
+ * (`sh -c $'echo a\ngit branch -fq victim main'`) tokenizes as ONE glued word
+ * and the hidden git invocation is invisible (round-6/7 reviewers P1, probe-
+ * verified rc 0). Identity for non-ANSI text.
+ * @param {string} s
+ * @returns {string}
+ */
+function _ansiTranslate(s) {
+  const ansiMap = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"', $: "$", a: "\u0007", b: "\b", f: "\f", v: "\v", e: "\u001b", E: "\u001b" };
+  return s.replace(/\\(c[A-Za-z]|x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3}|[eE\\'"$ntrabvf])/g, (mm, e) => {
+    if (e[0] === "x") return String.fromCharCode(parseInt(e.slice(1), 16));
+    if (e[0] === "u" || e[0] === "U") return String.fromCodePoint(parseInt(e.slice(1), 16));
+    if (e[0] === "c") return String.fromCharCode((e.charCodeAt(1) ?? 0) & 0x1f);
+    if (/^[0-7]+$/.test(e)) return String.fromCharCode(parseInt(e, 8));
+    return ansiMap[e] ?? mm;
+  });
+}
+
 export function _hasHiddenStateSubst(raw) {
   const source = String(raw ?? "");
   const mutates = (inv) => {
@@ -2352,14 +2373,12 @@ export function _hasHiddenStateSubst(raw) {
         // newline as \n — without translation the payload tokenizes as ONE
         // glued word and the hidden git invocation is invisible (round-6
         // cycle-3 reviewer P1, probe-verified rc 0).
-        const rawA = src.slice(i + 2, j);
-        const ansiMap = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"', $: "$", a: "\u0007", b: "\b", f: "\f", v: "\v" };
-        const translated = rawA.replace(/\\([\\'"$ntrabvf]|x[0-9a-fA-F]{1,2}|[0-7]{1,3})/g, (mm, e) => {
-          if (e[0] === "x") return String.fromCharCode(parseInt(e.slice(1), 16));
-          if (/^[0-7]+$/.test(e)) return String.fromCharCode(parseInt(e, 8));
-          return ansiMap[e] ?? mm;
-        });
-        spans.push(translated);
+        // Round-7 (cycle-4 reviewers P1): ANSI-C escapes translate BEFORE
+        // scanning (see _ansiTranslate) — \cJ = a real newline re-splits the
+        // payload into a second command; without translation the payload
+        // tokenizes as ONE glued word and the hidden git invocation is
+        // invisible (probe-verified rc 0).
+        spans.push(_ansiTranslate(src.slice(i + 2, j)));
         i = j < n ? j + 1 : n;
         continue;
       }
@@ -2397,12 +2416,14 @@ export function _hasHiddenStateSubst(raw) {
   if (/\\`/.test(source)) return true; // nested-backtick escaping — fail closed
   // $(<file) bash file-read substitution: the content is opaque file text fed
   // to the shell (`eval "$(< /tmp/payload)"` runs whatever the file holds —
-  // round-6 cycle-3 reviewer P2, probe-verified rc 0).
+  // round-6 cycle-3 reviewer P2, probe-verified rc 0). Also checked per-span in
+  // scan() because ANSI-C translation can REVEAL a decoded `$(<` (\x24\x3c).
   if (/\$\(</.test(source)) return true;
   const seen = new Set();
   const scan = (inner, isProcSubst) => {
     if (inner === undefined || inner.length === 0 || seen.has(inner)) return false;
     seen.add(inner);
+    if (/\$\(</.test(inner)) return true; // decoded file-read substitution inside a span (\x24\x3c …)
     if (isProcSubst && /\bgit\b/.test(inner)) return true; // executable text fed to a shell (round-19 parity)
     for (const inv of allGitInvocations(inner)) {
       if (inv.verb === "__unverifiable__") return true;
@@ -2429,33 +2450,57 @@ export function _hasHiddenStateSubst(raw) {
       if (scan(inner, false)) return true;
     }
   }
-  // static eval "…"/'…' literals (non-static `eval $EV` → __unverifiable__ above)
-  const evalRe = /eval\s+(?:"([^"]*)"|'([^']*)')/g;
+  // static eval literals (non-static `eval $EV` → __unverifiable__ above):
+  // plain "…"/'…' scan raw; ANSI-C $'…' payloads translate FIRST (an eval'd
+  // $'…' can smuggle a decoded `$(<` or newline-split git — round-7 cycle-4
+  // reviewer P1, probe-verified rc 0).
+  const evalRe = /eval\s+(?:\$'([^']*)'|"([^"]*)"|'([^']*)')/g;
   let m;
   while ((m = evalRe.exec(source)) !== null) {
-    const payload = m[1] ?? m[2] ?? "";
+    const ansi = m[1];
+    const payload = ansi !== undefined ? _ansiTranslate(ansi) : (m[2] ?? m[3] ?? "");
     if (payload.length > 0 && scan(payload, false)) return true;
   }
-  // git-level alias indirection (round-6 cycle-3 reviewers P1, probe-verified
-  // rc 0): `git branch -fq own main ; git -c alias.br='branch -fq victim main'
-  // br` hides the real command behind the alias NAME — the invocation walk sees
-  // verb "br" and stateOpCount stays 1, so the benign carve-out would fire
-  // while the alias force-creates a FOREIGN branch. A config alias whose VALUE
-  // carries a state-mutating git spelling — or whose first word is a branch-
-  // state verb (args are appended at the call site: `alias.x=branch x -fq
-  // victim main`) — refuses the carve-out; benign values (status/log/diff)
-  // pass. Opaque env-backed aliases (--config-env=alias.x=ENV /
-  // GIT_CONFIG_KEY_n=alias.x) also refuse. (STANDALONE alias invocation after
-  // configuration is a separate pre-existing gap beyond #591 → sibling issue.)
-  const cfgAlias = /(?:\-c|\-\-config)(?:\s+alias\.|=alias\.)([A-Za-z0-9_.\/-]+)=(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+  // git-level alias indirection (round-6/7 cycles, reviewers P1, probe-verified
+  // rc 0): `git branch -fq own main ; git -c alias.br='git branch -fq victim
+  // main' br` hides the real command behind the alias NAME — the invocation walk
+  // sees verb "br" and stateOpCount stays 1, so the benign carve-out would fire
+  // while the alias force-creates a FOREIGN branch. Refuse when a statically-
+  // visible config alias VALUE (a) carries a state-mutating git spelling via
+  // scan(), (b) starts with '!' — git's shell-command alias marker, the WHOLE
+  // value is arbitrary shell text (`alias.br='!git branch -fq victim main'`,
+  // round-7 cycle-4 P1, probe-verified rc 0), or (c) whose first word is a
+  // branch-state verb (args are appended at the call site: `alias.x=branch x
+  // -fq victim main`). Whole-value-quoted `-c "alias.br=…"` and the
+  // GIT_CONFIG_PARAMETERS env form are separate passes below. Benign values
+  // (status/log/diff) pass. (STANDALONE alias invocation after configuration
+  // and the same-command `git config --add alias.x … && git x` persist+invoke
+  // are the pre-existing gap → issue #594.)
+  const cfgAlias = /(?:\-c|\-\-config)(?:\s+["']?alias\.|=alias\.)([A-Za-z0-9_.\/-]+)=(?:"([^"]*)"|'([^']*)'|(\S+))/g;
   let cm;
   while ((cm = cfgAlias.exec(source)) !== null) {
     const val = cm[2] ?? cm[3] ?? cm[4] ?? "";
+    if (val.startsWith("!")) return true; // shell-command alias — unverifiable shell text
     const firstWord = val.trim().split(/\s+/)[0];
     if (["branch", "checkout", "switch", "symbolic-ref", "update-ref"].includes(firstWord)) return true;
     if (val.length > 0 && scan(val, false)) return true;
   }
-  if (/(?:\-\-config\-env[=\s]+\S*alias\.|GIT_CONFIG_KEY_\d+=alias\.)/.test(source)) return true;
+  // whole-value-quoted -c "alias.x=…" / -c 'alias.x=…' (the quote sits BEFORE
+  // the config name — the pass above only tolerates a quote right after the
+  // space; round-7 cycle-4 reviewer P1, probe-verified rc 0).
+  const cfgAliasQ = /(?:\-c|\-\-config)\s+(["'])(alias\.[A-Za-z0-9_.\/-]+)=([^"']*)\1/g;
+  let cq;
+  while ((cq = cfgAliasQ.exec(source)) !== null) {
+    const val = cq[3] ?? "";
+    if (val.startsWith("!")) return true;
+    const firstWord = val.trim().split(/\s+/)[0];
+    if (["branch", "checkout", "switch", "symbolic-ref", "update-ref"].includes(firstWord)) return true;
+    if (val.length > 0 && scan(val, false)) return true;
+  }
+  // opaque env-backed aliases: --config-env=alias.x=ENV, GIT_CONFIG_KEY_n\d+=
+  // alias.x, and GIT_CONFIG_PARAMETERS (git's internal -c env — round-7 cycle-4
+  // reviewer P1, probe-verified rc 0) all refuse the carve-out.
+  if (/(?:\-\-config\-env[=\s]+\S*alias\.|GIT_CONFIG_KEY_\d+=alias\.|GIT_CONFIG_PARAMETERS=[^;]*alias\.)/.test(source)) return true;
   return false;
 }
 
