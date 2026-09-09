@@ -22,8 +22,7 @@
 // stdlib-only, no pi-runtime imports (extensions/shared/ convention).
 
 import { createHash } from "node:crypto";
-import { hostname as osHostname } from "node:os";
-import { userInfo } from "node:os";
+import { homedir, hostname as osHostname, userInfo } from "node:os";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -57,29 +56,62 @@ export function machineIdFrom(hostname: string, username: string): string {
 
 let _cached: string | undefined;
 
+/** Injectable OS reads (test seam) — each defaults to the real node:os calls. */
+export interface MachineIdDeps {
+  hostname: () => string;
+  username: () => string;
+  homedir: () => string;
+}
+
+/**
+ * Resolve a machine_id from OS identity, never throwing.
+ *
+ * Every OS read is individually wrapped: if hostname, userInfo, or homedir
+ * throws (containers, sandboxes, CI without a passwd entry), the failing read
+ * degrades to a documented placeholder — the surrounding durable JSONL
+ * fallback write is never blocked by a machine-identity lookup failure.
+ *
+ * Exported for tests with throwing deps; production uses `machineId()`.
+ */
+export function resolveMachineId(deps: MachineIdDeps): string {
+  let host: string;
+  try {
+    host = deps.hostname();
+  } catch {
+    host = "unknown-host";
+  }
+  let user: string;
+  try {
+    user = deps.username();
+  } catch {
+    try {
+      user = deps.homedir().split("/").filter(Boolean).pop() ?? "unknown";
+    } catch {
+      user = "unknown";
+    }
+  }
+  return machineIdFrom(host, user);
+}
+
 /**
  * Resolve the machine_id for this process.
  *
  * Memoized per process (module-level cache). First call reads OS hostname + user,
  * derives sha256 hex. Subsequent calls return the cached value.
  *
- * Non-throwing: if `os.userInfo()` fails (containers, sandboxes, CI), falls back
- * to `os.hostname()` + `os.homedir()` last-segment so the durable JSONL fallback
- * record is never blocked by a machine-identity lookup failure.
+ * Non-throwing: every OS read is guarded (see resolveMachineId) so the durable
+ * JSONL fallback record is never blocked by a machine-identity lookup failure.
  *
  * @param parts - Optional test seam (hostname, username). When provided, NOT memoized.
  */
 export function machineId(parts?: { hostname: string; username: string }): string {
   if (parts) return machineIdFrom(parts.hostname, parts.username);
   if (_cached) return _cached;
-  let username: string;
-  try {
-    username = userInfo().username;
-  } catch {
-    // Fallback for containers/CI where userInfo() throws: use homedir basename
-    username = homedir().split("/").filter(Boolean).pop() ?? "unknown";
-  }
-  _cached = machineIdFrom(osHostname(), username);
+  _cached = resolveMachineId({
+    hostname: osHostname,
+    username: () => userInfo().username,
+    homedir,
+  });
   return _cached;
 }
 

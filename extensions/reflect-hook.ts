@@ -204,9 +204,22 @@ async function captureToHosted(
     }
     throw new Error(detail);
   } catch (err: unknown) {
-    const reason = err instanceof Error ? err.message : String(err);
+    // #131 P2: surface the real cause (undici wraps network failures in
+    // err.cause) and name timeouts explicitly instead of "This operation was
+    // aborted". The JSONL record is a manual-recovery artifact — nothing auto-
+    // syncs it, so say what it actually is.
+    let reason: string;
+    if (err instanceof Error && err.name === "AbortError") {
+      reason = "timed out after 10s";
+    } else if (err instanceof Error && err.cause instanceof Error) {
+      reason = err.cause.message;
+    } else if (err instanceof Error) {
+      reason = err.message;
+    } else {
+      reason = String(err);
+    }
     console.error(
-      `[reflect-hook] Hosted capture FAILED (${reason}) — session saved to ${localRecordPath} for later sync`,
+      `[reflect-hook] Hosted capture FAILED (${reason}) — a manual-recovery JSONL record was kept at ${localRecordPath}`,
     );
   } finally {
     clearTimeout(timer);
@@ -253,12 +266,26 @@ export default function reflectHook(pi: ExtensionAPI): void {
 
       const sessionId = ctx.sessionManager.getSessionId?.() ?? `session_${Date.now()}`;
 
-    // Resolve model from session entry stream (first model_change), cached per session_id
-    // The ctx.model fallback is folded into the cache so mid-session switches never leak.
-    const entries = ctx.sessionManager.getEntries?.() ?? [];
-    const model = sessionModels.resolve(sessionId, () => entries, modelFromContext(ctx.model));
-    const attribution = resolveAttribution(model);
-    const payload = buildQuitPayload({
+      // Resolve attribution — isolated in try/catch so the durable JSONL
+      // fallback (writeFallback below) is NEVER blocked by an attribution
+      // failure. On failure, a best-effort attribution is used so the session
+      // record survives with missing fields (server treats absent as unattributed).
+      let attribution: SessionAttribution;
+      try {
+        const entries = ctx.sessionManager.getEntries?.() ?? [];
+        const model = sessionModels.resolve(sessionId, () => entries, modelFromContext(ctx.model));
+        attribution = resolveAttribution(model);
+        if (!attribution.machine_id) {
+          attribution = { harness: "pi", machine_id: "" };
+        }
+      } catch (err) {
+        console.error(
+          `[reflect-hook] Attribution resolution failed — recording session un-attributed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        attribution = { harness: "pi", machine_id: "" };
+      }
+
+      const payload = buildQuitPayload({
         sessionId,
         turns,
         meta: {

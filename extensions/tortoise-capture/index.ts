@@ -591,11 +591,25 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
         // POST is fire-and-forget with a bounded 30s timeout, never awaited so
         // the capture lock releases immediately for active sessions.
         const { apiUrl, apiKey } = cloudConfig(config);
-        // Resolve model from session entry stream (first model_change), cached per session_id
-        // The ctx.model fallback is folded into the cache so mid-session model switches never leak.
-        const entries = ctx.sessionManager.getEntries?.() ?? [];
-        const model = sessionModels.resolve(sessionId, () => entries, modelFromContext(ctx.model));
-        const attribution = resolveAttribution(model);
+        // Resolve attribution — isolated in try/catch so the durable cloud
+        // JSONL fallback (writeCloudFallback below) is NEVER blocked by an
+        // attribution failure. On failure, a best-effort attribution is used
+        // so the record survives with missing fields (server treats absent as
+        // unattributed).
+        let attribution: SessionAttribution;
+        try {
+          const entries = ctx.sessionManager.getEntries?.() ?? [];
+          const model = sessionModels.resolve(sessionId, () => entries, modelFromContext(ctx.model));
+          attribution = resolveAttribution(model);
+          if (!attribution.machine_id) {
+            attribution = { harness: "pi", machine_id: "" };
+          }
+        } catch (err) {
+          console.error(
+            `[tortoise-capture] Attribution resolution failed — recording session un-attributed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          attribution = { harness: "pi", machine_id: "" };
+        }
         const payload = buildCloudPayload({ sessionId, conversation, filePath, attribution });
         const localRecordPath = writeCloudFallback(payload);
         void captureToHosted(apiUrl, apiKey, payload, localRecordPath);

@@ -12,6 +12,7 @@ import {
   SessionModelCache,
   resolveAttribution,
   stampSessionPayload,
+  resolveMachineId,
   HARNESS,
   MACHINE_ID_MAX,
   MODEL_MAX,
@@ -88,6 +89,36 @@ describe("machineId", () => {
     ok(/^[0-9a-f]{64}$/.test(id));
     ok(!id.includes("container"));
     ok(!id.includes("data"));
+  });
+
+  test("resolveMachineId returns 64-hex even when all deps throw", () => {
+    const m = resolveMachineId({
+      hostname: () => { throw new Error("no hostname"); },
+      username: () => { throw new Error("no user"); },
+      homedir: () => { throw new Error("no homedir"); },
+    });
+    ok(/^[0-9a-f]{64}$/.test(m), "must return 64 hex chars even when all deps throw");
+  });
+
+  test("resolveMachineId falls back to homedir basename when username throws", () => {
+    const m = resolveMachineId({
+      hostname: () => "myhost",
+      username: () => { throw new Error("no user"); },
+      homedir: () => "/home/containeruser",
+    });
+    ok(/^[0-9a-f]{64}$/.test(m));
+    ok(!m.includes("myhost"));
+    ok(!m.includes("containeruser"));
+  });
+
+  test("resolveMachineId uses hostname+username when both available", () => {
+    const m = resolveMachineId({
+      hostname: () => "myhost",
+      username: () => "myuser",
+      homedir: () => "/home/myuser",
+    });
+    const expected = machineIdFrom("myhost", "myuser");
+    equal(m, expected);
   });
 });
 

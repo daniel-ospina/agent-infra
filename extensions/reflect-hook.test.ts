@@ -188,6 +188,74 @@ async function testLoadConfig() {
   });
 }
 
+// ── Tests: extractTurns (export seam) ──────────────────────────────────────
+
+async function testExtractTurns() {
+  console.log("\n# extractTurns");
+
+  await test("extracts user and assistant turns from session entries", () => {
+    const ctx = {
+      sessionManager: {
+        getEntries: () => [
+          { type: "message", message: { role: "user", content: "hello" } },
+          { type: "message", message: { role: "assistant", content: "hi" } },
+        ],
+      },
+    };
+    const turns = reflectMod.extractTurns(ctx);
+    equal(turns.length, 2);
+    equal(turns[0].role, "user");
+    equal(turns[0].content, "hello");
+    equal(turns[1].role, "assistant");
+    equal(turns[1].content, "hi");
+  });
+
+  await test("skips system/tool roles and empty content", () => {
+    const ctx = {
+      sessionManager: {
+        getEntries: () => [
+          { type: "message", message: { role: "system", content: "sys" } },
+          { type: "message", message: { role: "user", content: "" } },
+          { type: "message", message: { role: "user", content: "  " } },
+          { type: "message", message: { role: "user", content: "real" } },
+        ],
+      },
+    };
+    const turns = reflectMod.extractTurns(ctx);
+    equal(turns.length, 1);
+    equal(turns[0].role, "user");
+    equal(turns[0].content, "real");
+  });
+
+  await test("handles array content blocks", () => {
+    const ctx = {
+      sessionManager: {
+        getEntries: () => [
+          {
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [
+                { type: "text", text: "Part one." },
+                { type: "text", text: "Part two." },
+              ],
+            },
+          },
+        ],
+      },
+    };
+    const turns = reflectMod.extractTurns(ctx);
+    equal(turns.length, 1);
+    equal(turns[0].content, "Part one.\nPart two.");
+  });
+
+  await test("returns empty for empty entries", () => {
+    const ctx = { sessionManager: { getEntries: () => [] } };
+    const turns = reflectMod.extractTurns(ctx);
+    equal(turns.length, 0);
+  });
+}
+
 // ── Run all suites ──────────────────────────────────────────────────────────
 
 (async () => {
@@ -196,6 +264,7 @@ async function testLoadConfig() {
     await testBuildQuitPayload();
     await testExtractPrs();
     await testLoadConfig();
+    await testExtractTurns();
 
     console.log(`\n# tests ${passed + failed}`);
     console.log(`# pass ${passed}`);
