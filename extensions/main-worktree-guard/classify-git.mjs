@@ -2041,8 +2041,13 @@ export function getMainCheckoutBranch() {
 
 /**
  * Is `cwd` inside the agent-infra repo itself (the infrastructure repo)?
- * The guard skips enforcement for agent-infra because it is a small infra repo
- * whose main checkout is where infra fixes land (#99).
+ * Identification only — NOT an enforcement exemption. The #99 carve-out is
+ * removed (#615): agent-infra's main checkout gets the same hub discipline as
+ * every other repo (M4 disorder gates + write/edit block + hub-state checks).
+ * The flag still feeds branch-ownership M2/M3 ceremony semantics (own-baseline
+ * work in agent-infra worktrees; create-new → reBaseline), and repo-freshness
+ * (auto-sync owns the repo). Shared-state edits (MEMORY.md, skills, config,
+ * extension code) land via worktrees → merge → sync, never direct in-hub.
  *
  * Detection order — no single source of truth, no env var required:
  *   1. Env exact-match: canonical `AGENT_INFRA_PATH` (exported to ~/.zshrc by
@@ -5328,13 +5333,12 @@ export function classifyUntrackedWip(porcelain) {
  * Resolves the MAIN checkout via git-common-dir semantics (getMainCheckoutBranch
  * pattern) so it works from a worktree too (D5) — pass the session cwd.
  * @param {string} cwd
- * @param {{ skipWorktree?: boolean, skipInfra?: boolean, env?: object }} [opts]
+ * @param {{ skipWorktree?: boolean, env?: object }} [opts]
  * @returns {{ disorder: string|null, branch: string|null }}
  */
-export function readHubDisorder(cwd, { skipWorktree = true, skipInfra = true, env } = {}) {
+export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
   try {
     if (skipWorktree && isWorktreeCwd(cwd)) return { disorder: null, branch: null };
-    if (skipInfra && isAgentInfraRepo(cwd, env)) return { disorder: null, branch: null }; // #99
     const gitDir = execSync("git rev-parse --git-dir", {
       encoding: "utf-8", cwd, timeout: 5000,
     }).trim();
