@@ -1487,7 +1487,7 @@ dexpect("#543: branch list → no delete capture", `git branch -a`, { branchStat
       const eff = sharedResolveEffectiveRepo(cmd, r598, d.verb, 0);
       if (!eff) return { noRepo: true };
       const dstExists = (op.op === "rename" && op.to != null)
-        ? sharedLocalBranchExists(eff.effectiveCwd, op.to) !== false
+        ? sharedLocalBranchExists(eff.effectiveCwd, op.to, eff.gitDir) !== false
         : false;
       return sharedDecideM3({
         branchOp: op, isAgentInfra: true,

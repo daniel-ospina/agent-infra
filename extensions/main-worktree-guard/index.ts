@@ -1178,11 +1178,13 @@ export default function (pi: ExtensionAPI) {
           // #598: a forced rename of the session's own baseline onto an
           // EXISTING branch this session does not own clobbers that foreign
           // ref rc 0 — probe whether the rename DST already exists in the
-          // resolved repo (tri-state: a failed probe is treated as exists →
-          // block — fail-closed). Only the decideM3 rename arm consumes it
-          // (the force/create/switch arms key on branch/currentBranch alone).
+          // repo git will write (tri-state: a failed probe is treated as
+          // exists → block — fail-closed). gitDir-anchored so a
+          // `--git-dir=<other>` mutation is never checked against the cwd
+          // repo's refs. Only the decideM3 rename arm consumes it (the
+          // force/create/switch arms key on branch/currentBranch alone).
           const dstExists = (branchOp.op === "rename" && branchOp.to != null)
-            ? branchOwnership.localBranchExists(muEff.effectiveCwd, branchOp.to) !== false
+            ? branchOwnership.localBranchExists(muEff.effectiveCwd, branchOp.to, muEff.gitDir) !== false
             : false;
           const m3 = branchOwnership.decideM3({
             branchOp, isAgentInfra: isInfra, baseline,
@@ -1193,12 +1195,15 @@ export default function (pi: ExtensionAPI) {
             // authorize a switch here.
             repoKey: muEff.repoKey,
             // #598: branches this pid CREATED (create-new) or renamed its own
-            // baseline to are owned (the #543/#588 ownership check, keyed like
-            // the _markOwned calls below — baseline?.repoKey ?? muEff.repoKey):
-            // the own-baseline rename carve-out still holds when the dst is
-            // one of the session's OWN refs (renaming onto a foreign ref
-            // blocks above).
-            ownedBranches: ownedBranches.get(pid)?.get(baseline?.repoKey ?? muEff.repoKey ?? ""),
+            // baseline to are owned (the #543/#588 ownership check, keyed on
+            // the MUTATION's repo — _markOwned writes under baseline.repoKey
+            // when the baseline repo IS the mutation repo, else muEff.repoKey,
+            // and the rename arm below requires baseline.repoKey === repoKey,
+            // so muEff.repoKey is the write-key in every reachable case): the
+            // own-baseline rename carve-out still holds when the dst is one of
+            // the session's OWN refs (renaming onto a foreign ref blocks
+            // above).
+            ownedBranches: ownedBranches.get(pid)?.get(muEff.repoKey ?? ""),
             // #598: whether the rename DST ref already exists (probed above
             // for rename ops only; the carve-out's free-name case stays
             // allowed).

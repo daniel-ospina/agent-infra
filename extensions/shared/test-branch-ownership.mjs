@@ -536,7 +536,7 @@ ok("M3 #591: force+copy composition (no branch field) still blocks", (() => { co
   ok("M3 #592 real-git: -C --so <v> onto CURRENT refused rc 128 (premise holds)", swSoOwn.status === 128, String(swSoOwn.status));
 }
 ok("M3: orphan blocks", (() => { const d = decideM3({ branchOp: { op: "orphan" }, isAgentInfra: true, baseline }); return d?.block === true; })());
-ok("M3: own rename re-baselines", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/2" }, isAgentInfra: false, baseline, currentBranch: "feat/1" }); return d?.reBaseline === "feat/2"; })());
+ok("M3: own rename re-baselines", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/2" }, isAgentInfra: false, baseline, currentBranch: "feat/1", repoKey: mainKey }); return d?.reBaseline === "feat/2"; })());
 ok("M3: foreign rename blocks", (() => { const d = decideM3({ branchOp: { op: "rename", from: "other", to: "x" }, isAgentInfra: false, baseline }); return d?.block === true; })());
 // ── decideM3 #598: forced-rename dst-clobber gate ──────────────────────────
 // The #265/#592 own-baseline rename carve-out (from === baseline.branch →
@@ -549,15 +549,23 @@ ok("M3: foreign rename blocks", (() => { const d = decideM3({ branchOp: { op: "r
 // current: from null → currentBranch substitution below) runs the old-name
 // check against the CURRENT branch. Real-git clobber/refusal backing pins
 // follow.
-ok("M3 #598: own-baseline rename onto FREE dst → reBaseline (carve-out intact)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/new" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: false }); return d?.reBaseline === "feat/new" && !d?.block; })());
-ok("M3 #598: own-baseline rename onto EXISTING foreign dst → BLOCK (no clobber)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true }); return d?.block === true; })());
-ok("M3 #598: 1-pos own rename (from null → current) onto EXISTING foreign → BLOCK", (() => { const d = decideM3({ branchOp: { op: "rename", from: null, to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true }); return d?.block === true; })());
-ok("M3 #598: 1-pos own rename onto FREE dst → reBaseline (1-pos carve-out intact)", (() => { const d = decideM3({ branchOp: { op: "rename", from: null, to: "feat/new" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: false }); return d?.reBaseline === "feat/new" && !d?.block; })());
-ok("M3 #598: existing dst OWNED (Set) → reBaseline (session consolidates own refs)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true, ownedBranches: new Set(["victim"]) }); return d?.reBaseline === "victim" && !d?.block; })());
-ok("M3 #598: existing dst OWNED (array form) → reBaseline", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true, ownedBranches: ["victim"] }); return d?.reBaseline === "victim" && !d?.block; })());
-ok("M3 #598: dst == branch being renamed (self-rename) → reBaseline (no second ref; git no-ops rc 0)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true }); return d?.reBaseline === "feat/1" && !d?.block; })());
-ok("M3 #598: FOREIGN-from rename onto existing dst → still blocks (unchanged)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "other", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true }); return d?.block === true; })());
-ok("M3 #598: own-baseline rename onto existing dst in NON-infra → still blocks", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: false, baseline, currentBranch: "feat/1", renameDstExists: true }); return d?.block === true; })());
+ok("M3 #598: own-baseline rename onto FREE dst → reBaseline (carve-out intact)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/new" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: mainKey, renameDstExists: false }); return d?.reBaseline === "feat/new" && !d?.block; })());
+ok("M3 #598: own-baseline rename onto EXISTING foreign dst → BLOCK (no clobber)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: mainKey, renameDstExists: true }); return d?.block === true; })());
+ok("M3 #598: 1-pos own rename (from null → current) onto EXISTING foreign → BLOCK", (() => { const d = decideM3({ branchOp: { op: "rename", from: null, to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: mainKey, renameDstExists: true }); return d?.block === true; })());
+ok("M3 #598: 1-pos own rename onto FREE dst → reBaseline (1-pos carve-out intact)", (() => { const d = decideM3({ branchOp: { op: "rename", from: null, to: "feat/new" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: mainKey, renameDstExists: false }); return d?.reBaseline === "feat/new" && !d?.block; })());
+ok("M3 #598: existing dst OWNED (Set) → reBaseline (session consolidates own refs)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: mainKey, renameDstExists: true, ownedBranches: new Set(["victim"]) }); return d?.reBaseline === "victim" && !d?.block; })());
+ok("M3 #598: existing dst OWNED (array form) → reBaseline", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: mainKey, renameDstExists: true, ownedBranches: ["victim"] }); return d?.reBaseline === "victim" && !d?.block; })());
+ok("M3 #598: dst == branch being renamed (self-rename) → reBaseline (no second ref; git no-ops rc 0)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: mainKey, renameDstExists: true }); return d?.reBaseline === "feat/1" && !d?.block; })());
+ok("M3 #598: FOREIGN-from rename onto existing dst → still blocks (unchanged)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "other", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: mainKey, renameDstExists: true }); return d?.block === true; })());
+ok("M3 #598: own-baseline rename onto existing dst in NON-infra → still blocks", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: false, baseline, currentBranch: "feat/1", repoKey: mainKey, renameDstExists: true }); return d?.block === true; })());
+// Round-1 review fold-in (both reviewers): the own-baseline carve-out is
+// scoped to the repo that recorded the baseline (baseline.repoKey === repoKey
+// — the #376 discipline). A rename in a DIFFERENT clone whose checked-out
+// branch merely shares the baseline NAME must not re-baseline the session
+// (name-collision), nor consult the baseline repo's owned set against another
+// repo's refs (cross-clone false-ownership on a clobber dst).
+ok("M3 #598: rename in a DIFFERENT repo (repoKey mismatch) → blocks (no cross-clone reBaseline)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/new" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: otherKey, renameDstExists: false }); return d?.block === true; })());
+ok("M3 #598: cross-clone rename onto EXISTING dst → blocks (owned set of the other repo never consulted)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: otherKey, renameDstExists: true, ownedBranches: new Set(["victim"]) }); return d?.block === true; })());
 // ── localBranchExists tri-state probe ──────────────────────────────────────
 ok("M3 #598: localBranchExists existing branch → true", localBranchExists(MAIN, "side") === true, String(localBranchExists(MAIN, "side")));
 ok("M3 #598: localBranchExists free name → false", localBranchExists(MAIN, "no-such-598") === false, String(localBranchExists(MAIN, "no-such-598")));
@@ -614,6 +622,12 @@ ok("M3 #598: localBranchExists empty name → null", localBranchExists(MAIN, "")
   spawnSync("git", ["branch", "-M", "brandnew", "own/1"], { cwd: D, encoding: "utf-8" }); // restore
   const swallow2 = spawnSync("git", ["branch", "-M", "--so", "key", "own/1", "victim2"], { cwd: D, encoding: "utf-8" });
   ok("M3 #598 real-git: -M --so <v> <own> <existing> (2-pos swallow) CLOBBERS rc 0", swallow2.status === 0 && git(D, "rev-parse victim2") === OWN_D, String(swallow2.status));
+  // Round-1 reviewer P2 (gitDir anchoring): the probe must read the repo git
+  // will WRITE (the mutation's resolved gitDir), never the cwd repo — a
+  // `--git-dir=<other>` mutation must not be checked against local refs.
+  // victim2 exists ONLY in D; probing from A's cwd with D's gitDir must
+  // resolve it (A's own refs do not contain it).
+  ok("M3 #598 real-git: gitDir-anchored probe reads the --git-dir repo (not the cwd repo)", localBranchExists(A, "victim2") === false && localBranchExists(A, "victim2", join(D, ".git")) === true, String(localBranchExists(A, "victim2")));
 }
 
 // ── decideM3 #376: ceremony return-to-original-baseline carve-out ──────────

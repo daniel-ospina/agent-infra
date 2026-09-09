@@ -129,17 +129,25 @@ export function readBranchState(cwd, gitDir) {
  * resolved repo answers what `git branch -M <src> <dst>` would overwrite.
  * Returns true (exists) / false (cleanly absent) / null (git failure —
  * unknown; callers must map null fail-CLOSED). argv-based (execFileSync) so a
- * refname can never reach a shell. `git rev-parse --verify --quiet` exits 0
- * when the ref exists and 1 when it does not (probe-verified; any other exit
- * — bad repo rc 128 etc. — is unknown, never a clean not-found).
+ * refname can never reach a shell. When `gitDir` is given (the mutation's
+ * RESOLVED admin dir), the probe runs with `--git-dir` so it interrogates the
+ * exact repo git will write — a `--git-dir=<other>` mutation must never be
+ * checked against the cwd repo's refs (round-1 reviewer P2).
+ * `git rev-parse --verify --quiet` exits 0 when the ref exists and 1 when it
+ * does not (probe-verified; any other exit — bad repo rc 128 etc. — is
+ * unknown, never a clean not-found).
  * @param {string} cwd
  * @param {string} name local branch name (no refs/heads/ prefix)
+ * @param {string} [gitDir] resolved git dir override (--git-dir)
  * @returns {boolean|null}
  */
-export function localBranchExists(cwd, name) {
+export function localBranchExists(cwd, name, gitDir) {
   if (!cwd || typeof name !== "string" || name.length === 0) return null;
+  const args = gitDir
+    ? [`--git-dir=${gitDir}`, "rev-parse", "--verify", "--quiet", `refs/heads/${name}`]
+    : ["rev-parse", "--verify", "--quiet", `refs/heads/${name}`];
   try {
-    execFileSync("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${name}`], {
+    execFileSync("git", args, {
       encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore",
     });
     return true;
@@ -874,9 +882,22 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     // old-name check runs against the CURRENT checkout branch (a classifier-
     // visible old name is impossible there). ownedBranches (this session's
     // created/renamed-to branches in this repo — the #543/#588 ownership
-    // check) still allows overwriting the session's OWN refs.
+    // check) still allows overwriting the session's OWN refs. Round-1 review
+    // fold-in: the carve-out is scoped to the repo that recorded the baseline
+    // (baseline.repoKey === repoKey — the #376 discipline): a rename in a
+    // DIFFERENT agent-infra clone whose checked-out branch merely shares the
+    // baseline NAME must not re-baseline the session or consult the baseline
+    // repo's owned set against another repo's refs (cross-clone name-collision
+    // false-ownership; index.ts also probes — and _markOwned writes — only
+    // within the mutation's own repo).
     const from = branchOp.from ?? currentBranch;
-    if (baseline && from === baseline.branch && branchOp.to) {
+    if (
+      baseline
+      && baseline.repoKey != null
+      && baseline.repoKey === repoKey
+      && from === baseline.branch
+      && branchOp.to
+    ) {
       const dst = branchOp.to;
       const owned = !!ownedBranches
         && (typeof ownedBranches.has === "function"
@@ -887,11 +908,11 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
           block: true,
           reason: [
             `⛔ git branch -m/-M/-Mq/--move blocked in the MAIN checkout.`,
-            `   Why: renaming "${from}" to "${dst}" would OVERWRITE the`,
-            `   existing branch "${dst}", which this session does not own — a`,
-            `   forced rename destroys the destination ref rc 0 (#598).`,
-            `   → Rename onto a name that is free, or onto one of this`,
-            `     session's own branches.`,
+            `   Why: "${dst}" already exists as a branch this session does not`,
+            `   own — a forced rename would destroy that foreign ref rc 0;`,
+            `   git refuses the soft form rc 128 either way (#598).`,
+            `   → Rename onto a free name, or onto one of this session's`,
+            `     own branches.`,
           ].join("\n"),
         };
       }
