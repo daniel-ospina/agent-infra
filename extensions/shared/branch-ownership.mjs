@@ -157,6 +157,22 @@ export function tokenize(command) {
   return tokens;
 }
 
+// Shell redirect-operator token shapes the SHARED tokenizer can emit as a
+// standalone token (space-separated / fd-prefixed; `&` always splits, so
+// `2>&1` → ["2>","1"] and `&> f` → [">","f"] never appear glued): bare `>`
+// `>>` `<` `<<`, here-string `<<<`, and digit-prefixed forms `2>` `2>>` …
+// (mirror of classify-git's redirect regexes modulo the shared `&` boundary).
+// A glued `>out` / `2>err` / `>>git` token is NOT an operator here — its
+// operand is glued in and can never be a standalone `git` phantom.
+function isShellRedirectOp(t) {
+  return /^(?:[0-9]+)?[<>]{1,3}$/.test(t);
+}
+
+// Interpreter words classify-git's _walkShell recognizes (classify-git.mjs
+// SHELL_INTERPRETERS — duplicated deliberately; branch-ownership must stay
+// import-free of classify-git per the #99 degradation contract).
+const SHELL_INTERP_WORDS = new Set(["bash", "sh", "zsh", "dash", "ksh", "source"]);
+
 /**
  * Extract the git invocation from a command string:
  *   { cdCwd, gitDirHint, cHints, verb, rest } | null
@@ -165,8 +181,17 @@ export function tokenize(command) {
  * - gitDirHint: from --git-dir[=]<path> or a leading GIT_DIR=<path> env prefix.
  * - cHints: every `-C <path>` in order (multi -C chains resolve sequentially).
  * - verb/rest: tokens from the first non-flag token after `git` onward.
+ * @param {string} command
+ * @param {string|null} [preferVerb]
+ * @param {number} [preferVerbOccurrence] 0-based ordinal of the same-verb
+ *   invocation to return (#596 round-2): when preferVerb matches multiple
+ *   invocations, the caller may select a LATER one — the M3-relevant
+ *   branch-state invocation can be a later compound segment (benign leads are
+ *   skipped by the classifier) and repo hints (-C/--git-dir/cd) must be
+ *   attributed to THAT invocation, not the first same-verb one. Default 0 = the
+ *   first match (every pre-#596 caller).
  */
-export function extractGitInvocation(command, preferVerb = null) {
+export function extractGitInvocation(command, preferVerb = null, preferVerbOccurrence = 0) {
   const tokens = tokenize(command);
   let cdChain = [];
   let i = 0;
@@ -174,11 +199,15 @@ export function extractGitInvocation(command, preferVerb = null) {
   // in bash). When preferVerb is set, we scan ALL invocations and return the
   // one whose verb matches (review P2, cycle 3: `git -C <wt> status && git
   // checkout main` — the branch-state gate must resolve the repo for the
-  // CHECKOUT, whose -C/hints differ from the first invocation).
+  // CHECKOUT, whose -C/hints differ from the first invocation). #596
+  // round-2: the preferVerbOccurrence-th same-verb match wins (see the
+  // signature JSDoc); earlier same-verb matches are skipped but their cd
+  // effects still accumulate (bash cd persists).
   // #337: also collect same-command `VAR=value` assignments so a `cd $WT`
   // (or `cd "${WT}"`) can be resolved against them by resolveEffectiveRepo.
   let envGitDir = null;
   const vars = {};
+  let verbMatches = 0;
   while (i < tokens.length) {
     const t = tokens[i];
     if (/^GIT_DIR=(.*)$/.test(t)) { envGitDir = t.slice("GIT_DIR=".length).replace(/^["']|["']$/g, ""); i++; continue; }
@@ -190,6 +219,57 @@ export function extractGitInvocation(command, preferVerb = null) {
       continue;
     }
     if (t === "cd") { cdChain.push(tokens[i + 1] ?? null); i += 2; continue; }
+    // #596 round-4 (F1 — phantom-token ordinal asymmetry): a shell REDIRECT
+    // operator + operand never starts a command (classify-git's _walkShell
+    // skips both: `echo x > git branch side` runs echo, never `git branch`).
+    // When the operand is a literal `git`, counting it here as a branch-state
+    // invocation shifts the stateVerbOccurrence ordinal OFF the real mutation
+    // (a phantom lead ahead of a `-C <wt>` benign segment makes occurrence 1
+    // land on the WORKTREE invocation → the main `-Mq` is worktree-exempt —
+    // the round-4 reviewer F1 bypass). Operand = exactly the next token; the
+    // token after it stays the command word (`> /dev/null git commit`). The
+    // shared tokenizer never emits an fd-redirect as ONE token (`2>&1` →
+    // ["2>", "1"]; `&` is always a boundary) so op + operand is always 2.
+    if (isShellRedirectOp(t)) { i += 2; continue; }
+    // Same F1 class via the interpreter-inline shape: classify-git walks a
+    // `bash -c <payload>` by treating the payload as ONE opaque nested command
+    // whose git words are cmdVisible:false (round-3) — they must never shift
+    // the ordinal. An UNQUOTED `sh -c git branch side` payload is a literal
+    // `git` token here; consume interpreter + flags + the `-c`/`--command`
+    // payload (exactly one token, per bash -c semantics) and resume AFTER it
+    // (payload positionals stay walked by BOTH layers → parity preserved).
+    // Scope is deliberately the `-c` payload ONLY, never the interpreter's
+    // script-FILE path: in this boundary-less token stream `bash evil.sh ;
+    // git commit` and `git status bash ; git commit` are indistinguishable
+    // from `bash evil.sh git …` (the `;` is dropped), and classify-git does
+    // NOT fire interpreter handling inside a preceding git invocation's args
+    // (round-4 probes C7–C9) — consuming a non-`-c` first token as a script
+    // path could eat a real later `git` (round-4 reviewer P1 follow-up: it
+    // shifted the ordinal onto a trailing `-C <wt>` invocation and
+    // worktree-exempted a MAIN mutation). The script-file spelling
+    // (`bash git -C <wt> branch …`) is closed at the index.ts M3/M2 repo
+    // resolution instead: classify-git exposes the SELECTED mutation's OWN
+    // boundary-aware hints (stateHints / commitHints) and the gates resolve
+    // from those — never from this replay's occurrence arithmetic.
+    if (SHELL_INTERP_WORDS.has(t)) {
+      let j = i + 1;
+      let resume = null;
+      while (j < tokens.length) {
+        const n = tokens[j];
+        if (isShellRedirectOp(n)) { j += 2; continue; } // `bash < /dev/null -c '…'` (round-18 mirror)
+        if (n === "-c" || n === "--command") {
+          let m = j + 1;
+          while (m < tokens.length && tokens[m].startsWith("-")) m++; // `bash -c -x '…'` (round-5 mirror)
+          resume = m < tokens.length ? m + 1 : tokens.length; // payload consumed — resume AFTER it
+          break;
+        }
+        if (!n.startsWith("-")) break; // script path / plain word — do NOT consume (see above)
+        j++;
+        if (n === "--rcfile" || n === "--init-file" || n === "-O" || n === "-o") j++; // flag operands (round-20 mirror)
+      }
+      i = resume ?? i + 1; // no auto-increment — every branch advances i explicitly
+      continue;
+    }
     if (t !== "git") { i++; continue; }
     // ── candidate git invocation ──
     let gitDirHint = envGitDir;   // GIT_DIR env applies to all invocations
@@ -209,6 +289,7 @@ export function extractGitInvocation(command, preferVerb = null) {
     }
     const verb = tokens[j] ?? null;
     if (preferVerb && verb !== preferVerb) { i = j; continue; } // not the target — keep scanning
+    if (preferVerb && verbMatches < preferVerbOccurrence) { verbMatches++; i = j; continue; } // earlier same-verb match — skip (cd effects already accumulated)
     return { cdChain: [...cdChain], gitDirHint, cHints, verb, rest: tokens.slice(j), vars };
   }
   return null;
@@ -229,12 +310,49 @@ export function extractGitInvocation(command, preferVerb = null) {
  * Returns null when git fails (caller applies fail-closed policy).
  * @param {string} command
  * @param {string} sessionCwd
+ * @param {string|null} [preferVerb]
+ * @param {number} [preferVerbOccurrence] 0-based ordinal among same-verb
+ *   invocations (#596 round-2: when the M3-relevant branch-state invocation is
+ *   a LATER compound segment — benign leads are skipped — the repo hints must
+ *   come from THAT invocation, not the first same-verb one; a `-C <wt>` lead
+ *   would wrongly worktree-exempt a main mutation and vice versa).
  */
-export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null) {
-  const inv = extractGitInvocation(command, preferVerb);
+export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null, preferVerbOccurrence = 0) {
+  const inv = extractGitInvocation(command, preferVerb, preferVerbOccurrence);
+  if (!inv) return null;
+  return resolveRepoFromInv(inv, sessionCwd);
+}
+
+/**
+ * Resolve the effective repo from a git invocation's OWN resolution hints
+ * ({ cdChain, cHints, gitDirHint, vars }) — no command re-tokenization.
+ * #596 round-4 (reviewer follow-up): index.ts resolves the M3/M2 repo from
+ * the classifier's boundary-aware walk of the SELECTED mutation/commit
+ * invocation (exposed as stateHints / commitHints / pushHints by
+ * classifyGitCommandDetailed) instead of replaying the occurrence ordinal
+ * through branch-ownership's boundary-less tokenizer. Replay
+ * mis-attributions (interpreter-inline / script-file / redirect-operand
+ * phantoms, or an interpreter word used as a git ARG whose next token the
+ * extractor consumes) landed the ordinal on a DIFFERENT invocation whose -C
+ * hints wrongly worktree-exempted a mutation running at the shell cwd
+ * (round-4 reviewer P1). classify-git's walk is boundary-aware, so its
+ * per-invocation hints are the reference truth for the exemption decision.
+ * Same git-faithful resolution as resolveEffectiveRepo's tail:
+ *   (1) cd-chain resolves to a final cwd (sequential, last-wins);
+ *   (2) each -C <path> resolves relative to the current cwd, in order;
+ *   (3) gitDir = resolved --git-dir hint / GIT_DIR env (resolved against the
+ *       FINAL cwd), else <finalCwd>/.git;
+ *   (4) repoKey = git-common-dir of the RESOLVED gitDir; isWorktree = resolved
+ *       gitDir contains "/worktrees/" (NEVER cwd-derived);
+ *   (5) currentBranch read FROM the resolved repo.
+ * Returns null when git fails (caller applies fail-closed policy).
+ * @param {{cdChain?: Array<string|null>, cHints?: string[], gitDirHint?: string|null, vars?: object}|null} inv
+ * @param {string} [sessionCwd]
+ */
+export function resolveRepoFromInv(inv, sessionCwd = process.cwd()) {
   if (!inv) return null;
   let cwd = sessionCwd ? resolve(sessionCwd) : process.cwd();
-  for (const cd of inv.cdChain) {
+  for (const cd of inv.cdChain || []) {
     if (!cd) continue;
     const expanded = _expandCdVars(cd, inv.vars);
     // #337: an unresolvable `$VAR` cd target (no same-command assignment) must
@@ -245,7 +363,7 @@ export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null) {
     if (expanded === null) continue;
     cwd = resolve(cwd, expanded); // bash: `cd a && cd b` ends in b, relative to a
   }
-  for (const c of inv.cHints) {
+  for (const c of inv.cHints || []) {
     if (!c) continue;
     cwd = resolve(cwd, c); // -C resolves relative to the current cwd, in order
   }
