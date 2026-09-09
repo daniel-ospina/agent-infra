@@ -18,11 +18,11 @@
 // here (cd/-C/--git-dir extraction) is cross-checked against classify-git's
 // skimmer by test-branch-ownership.mjs (T2 cross-consistency matrix).
 
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import {
   mkdirSync, writeFileSync, readFileSync, rmSync, openSync, writeSync, closeSync,
-  realpathSync,
+  realpathSync, existsSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -119,6 +119,72 @@ export function readBranchState(cwd, gitDir) {
     };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Does a LOCAL branch ref exist in the repo at `cwd`? Tri-state probe used by
+ * the M3 rename gate (#598): git's branch refs are repo-global (shared across
+ * worktrees of the same common dir), so probing from any worktree cwd of the
+ * resolved repo answers what `git branch -M <src> <dst>` would overwrite.
+ * Returns true (exists) / false (cleanly absent) / null (git failure —
+ * unknown; callers must map null fail-CLOSED). argv-based (execFileSync) so a
+ * refname can never reach a shell. When `gitDir` is given (the mutation's
+ * RESOLVED admin dir), the probe runs with `--git-dir` so it interrogates the
+ * exact repo git will write — a `--git-dir=<other>` mutation must never be
+ * checked against the cwd repo's refs (round-1 reviewer P2).
+ * `git rev-parse --verify --quiet` exits 0 when the ref resolves; when it
+ * exits 1 the ref does NOT resolve — that covers both a cleanly ABSENT ref
+ * AND a broken-present loose ref (a DANGLING symref, or loose content that is
+ * not a valid object name — both make rev-parse exit 1 while git branch -M
+ * would still clobber the ref file rc 0). NOTE: a loose ref holding a VALID
+ * sha whose object is missing still RESOLVES (rc 0 → EXISTS via the primary
+ * probe — the safe direction), so only the dangling-symref / invalid-content
+ * forms reach the rc-1 fallback. The rc-1 fallback checks the loose-ref file
+ * (git rev-parse --git-path refs/heads/<name> + existsSync) so a
+ * broken-but-present foreign ref is treated as EXISTS (block), never as a
+ * free name (round-2 reviewer P2 — pre-fallback a dangling symref dst read
+ * as free and the carve-out let a real rc-0 clobber through). Packed refs
+ * resolve rc 0 and never reach the fallback. Any other exit (bad repo rc 128
+ * etc.) stays null — unknown, never a clean not-found.
+ * @param {string} cwd
+ * @param {string} name local branch name (no refs/heads/ prefix)
+ * @param {string} [gitDir] resolved git dir override (--git-dir)
+ * @returns {boolean|null}
+ */
+export function localBranchExists(cwd, name, gitDir) {
+  if (!cwd || typeof name !== "string" || name.length === 0) return null;
+  const prefix = gitDir ? [`--git-dir=${gitDir}`] : [];
+  const probe = (args) => {
+    try {
+      execFileSync("git", [...prefix, ...args], {
+        encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore",
+      });
+      return true;
+    } catch (e) {
+      return e && e.status;
+    }
+  };
+  const rc = probe(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`]);
+  if (rc === true) return true;
+  if (rc !== 1) return null; // any other exit = unknown (callers map null fail-CLOSED)
+  // rc 1: the ref does not RESOLVE. Distinguish a cleanly ABSENT ref from a
+  // broken-but-present one (dangling symref, or loose content that is not a
+  // valid object name — a valid-sha missing-object ref resolves rc 0 above)
+  // via the loose-ref file, which exists for every loose ref whether or not it
+  // resolves (--git-path only maps the path; packed refs resolved rc 0 above
+  // and never reach here).
+  try {
+    const refPath = execFileSync("git", [...prefix, "rev-parse", "--git-path", `refs/heads/${name}`], {
+      encoding: "utf-8", cwd, timeout: 5000,
+    }).trim();
+    if (!refPath) return null;
+    // --git-path prints cwd-relative when the gitdir is implied; resolve
+    // against the probe cwd (absolute gitdirs print absolute paths — resolve
+    // passes them through unchanged).
+    return existsSync(resolve(cwd, refPath));
+  } catch {
+    return null; // --git-path failed → unknown (fail-closed at callers)
   }
 }
 
@@ -785,7 +851,15 @@ export function decideM2({
  *     returns { reBaseline: <branch> } so the guard re-adopts the baseline
  *     SYNCHRONOUSLY (the allowed carve-out must never trigger a spurious M1
  *     warn on the next tool_call).
- *   rename of the session's OWN baseline branch → { reBaseline: <to> }.
+ *   rename of the session's OWN baseline branch → { reBaseline: <to> } — but
+ *     NOT onto an EXISTING branch that is neither the branch being renamed
+ *     nor owned by this session (#598: renameDstExists + ownedBranches — that
+ *     forced rename clobbers a foreign ref rc 0 → block). The carve-out also
+ *     requires the rename to run in the repo that recorded the baseline
+ *     (baseline.repoKey === repoKey — the #376 discipline; a name collision
+ *     in another clone never re-baselines) and a non-null renamed branch
+ *     (a detached 1-pos rename — from null — passes through to git's rc-128
+ *     refusal, never a phantom reBaseline).
  *   switch-existing to the session's ORIGINAL baseline branch (baseline.original
  *     — the branch recorded at session_start BEFORE any create-new re-baseline):
  *     allowed in agent-infra main → { reBaseline: <target> } — the sanctioned
@@ -811,7 +885,7 @@ export function decideM2({
  *   (the resolved repo is the ONE where the original baseline was recorded — a
  *   cd into a DIFFERENT agent-infra clone must not authorize a switch there).
  */
-export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey, stateOpCount = 1, isBare = false, hiddenStateSubst = false }) {
+export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey, stateOpCount = 1, isBare = false, hiddenStateSubst = false, renameDstExists = false, ownedBranches }) {
   if (!branchOp) return null;
   const op = branchOp.op;
   if (op === "create-new") {
@@ -831,9 +905,91 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     // #592: the rename arm now also receives cluster/long-form renames
     // (-Mq/--move/--mov/--mo — identical decideM3 semantics as the exact
     // -m/-M they are byte-identical to in git; see classifyBranchOp).
+    // #598: the #265/#592 own-baseline carve-out (from === baseline.branch →
+    // reBaseline) is only SAFE for a rename onto a FREE name — git renames the
+    // own checkout branch rc 0 without touching any second ref. A FORCED
+    // rename onto an EXISTING ref (renameDstExists — the index.ts adapter
+    // probes the resolved repo) that is NOT the branch being renamed and NOT
+    // owned by this session CLOBBERS that foreign ref rc 0 (probe-verified
+    // for `-M <baseline> <existing>`, the 1-pos `-M <existing>` rename-current
+    // form, and the --so/--sort value-swallow shapes; git self-refuses only
+    // when the dst is checked out in a worktree, rc 128). The branch being
+    // renamed is `from`; for the 1-pos form classifyBranchOp returns from:null
+    // and the substitution below resolves it to currentBranch, so the
+    // old-name check runs against the CURRENT checkout branch (a classifier-
+    // visible old name is impossible there). ownedBranches (this session's
+    // created/renamed-to branches in this repo — the #543/#588 ownership
+    // check) still allows overwriting the session's OWN refs. Round-1 review
+    // fold-in: the carve-out is scoped to the repo that recorded the baseline
+    // (baseline.repoKey === repoKey — the #376 discipline): a rename in a
+    // DIFFERENT agent-infra clone whose checked-out branch merely shares the
+    // baseline NAME must not re-baseline the session or consult the baseline
+    // repo's owned set against another repo's refs (cross-clone name-collision
+    // false-ownership; index.ts also probes — and _markOwned writes — only
+    // within the mutation's own repo). Round-3/4 review fold-in: the arm also
+    // requires from != null — a DETACHED session (currentBranch null) with a
+    // 1-pos rename would otherwise collide null into the name checks; git
+    // REFUSES a detached rename rc 128, so the null-from case passes through
+    // below instead of re-baselining onto a phantom name.
     const from = branchOp.from ?? currentBranch;
-    if (baseline && from === baseline.branch && branchOp.to) {
+    if (
+      from != null
+      && baseline
+      && baseline.repoKey != null
+      && baseline.repoKey === repoKey
+      && from === baseline.branch
+      && branchOp.to
+    ) {
+      const dst = branchOp.to;
+      const owned = !!ownedBranches
+        && (typeof ownedBranches.has === "function"
+          ? ownedBranches.has(dst)
+          : (Array.isArray(ownedBranches) && ownedBranches.includes(dst)));
+      if (renameDstExists && dst !== from && !owned) {
+        return {
+          block: true,
+          reason: [
+            `⛔ git branch -m/-M/-Mq/--move blocked in the MAIN checkout.`,
+            `   Why: "${dst}" already exists as a branch this session does not`,
+            `   own — a forced rename would overwrite that foreign ref (git`,
+            `   refuses rc 128 if it is checked out in any worktree, and the`,
+            `   soft form refuses rc 128 either way) (#598).`,
+            `   → Rename onto a free name, or onto one of this session's`,
+            `     own branches.`,
+          ].join("\n"),
+        };
+      }
       return { reBaseline: branchOp.to };
+    }
+    if (branchOp.to && from == null) {
+      // Round-3/4 review fold-in: a 1-pos rename (rename current — from is
+      // null because classifyBranchOp could not see an old name) on a
+      // DETACHED main checkout (currentBranch null) is git-REFUSED rc 128
+      // ("cannot rename the current branch while not on any") — no ref can
+      // ever move, so pass through benignly (the #591/#592 pass-to-git-
+      // refusal carve-out class) instead of re-baselining onto a phantom name
+      // (the pre-#598 null===null collision) or blocking with a wrong reason.
+      // A 2-pos rename always carries a non-null from, so this branch is
+      // exactly the detached 1-pos form.
+      return null;
+    }
+    if (baseline && branchOp.to && from === baseline.branch) {
+      // Round-2 reviewer P2: the rename's from IS the baseline branch name but
+      // the resolved repo is NOT the repo that recorded the baseline (a
+      // cross-clone name collision, or a degraded repo) — the generic
+      // "not this session's baseline" text below would mislead a user whose
+      // branch name IS the baseline; the carve-out is repo-scoped (#598).
+      return {
+        block: true,
+        reason: [
+          `⛔ git branch -m/-M/-Mq/--move blocked in the MAIN checkout.`,
+          `   Why: this rename runs in a different checkout than the one that`,
+          `   recorded this session's baseline "${baseline.branch}" — the`,
+          `   own-baseline rename carve-out is repo-scoped (#598).`,
+          `   → Run the rename in the repo where this session started, or`,
+          `     work in an isolated worktree (using-git-worktrees skill).`,
+        ].join("\n"),
+      };
     }
     return {
       block: true,
