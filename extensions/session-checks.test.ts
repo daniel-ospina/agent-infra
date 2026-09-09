@@ -21,6 +21,7 @@ import {
   HUB_SIBLING_DEFAULT_NAMES,
   POLL_MIN_DEFAULT,
   POLL_MIN_FLOOR,
+  POLL_MIN_MAX,
   type ExecFn,
   type ExecResult,
 } from "./session-checks.js";
@@ -505,18 +506,21 @@ async function waitFor(pred: () => boolean, timeoutMs = 3000): Promise<boolean> 
   }
   return true;
 }
-await test("clampPollMinutes: default on junk, floor at 5", () => {
+await test("clampPollMinutes: default on junk, floor at 5, cap at max", () => {
   equal(clampPollMinutes(NaN), POLL_MIN_DEFAULT);
   equal(clampPollMinutes(0), POLL_MIN_DEFAULT);
   equal(clampPollMinutes(-3), POLL_MIN_DEFAULT);
   equal(clampPollMinutes(2), POLL_MIN_FLOOR, "below-floor clamps UP to the floor");
   equal(clampPollMinutes(17), 17);
+  equal(clampPollMinutes(100_000), POLL_MIN_MAX, "runaway knob clamps DOWN to the max (review #635 P2)");
+  equal(clampPollMinutes(POLL_MIN_MAX), POLL_MIN_MAX, "exactly at the cap passes through");
 });
-await test("getPollIntervalMs: env knob (minutes) → ms; default 30 min", () => {
+await test("getPollIntervalMs: env knob (minutes) → ms; default 30 min; over-cap clamped", () => {
   equal(getPollIntervalMs({}), POLL_MIN_DEFAULT * 60_000);
   equal(getPollIntervalMs({ SESSION_CHECKS_POLL_MIN: "10" }), 10 * 60_000);
   equal(getPollIntervalMs({ SESSION_CHECKS_POLL_MIN: "2" }), POLL_MIN_FLOOR * 60_000, "clamped to floor");
   equal(getPollIntervalMs({ SESSION_CHECKS_POLL_MIN: "junk" }), POLL_MIN_DEFAULT * 60_000, "invalid → default");
+  equal(getPollIntervalMs({ SESSION_CHECKS_POLL_MIN: "600000" }), POLL_MIN_MAX * 60_000, "ms-unit input (600000) clamps to 6h max — no 1ms hot loop");
 });
 await test("hook: interactive session registers an unref'd cadence poll (timer lifecycle)", async () => {
   const { d, state, infra } = tmp();
