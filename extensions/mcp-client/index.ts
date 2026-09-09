@@ -22,12 +22,278 @@ import { Type, type TSchema } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type {
+  OAuthClientProvider,
+  OAuthClientMetadata,
+  OAuthClientInformationMixed,
+  OAuthTokens,
+  OAuthDiscoveryState,
+} from "@modelcontextprotocol/sdk/client/auth.js";
+import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { execSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { existsSync, realpathSync, mkdirSync } from "node:fs";
+import { readFile, writeFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { isPrintMode } from "../shared/print-mode.js";
+
+// ── OAuth config (#595) ────────────────────────────────────────────
+
+/**
+ * OAuth configuration for remote HTTP MCP servers.
+ *
+ * `oauth: true` → auto-discovery: fetch `/.well-known/oauth-protected-resource/<transport-scope>`
+ *   metadata; DCR if the server supports dynamic registration; fall back to a config-provided
+ *   client_id if `clientId` is supplied.
+ *
+ * `oauth: { clientId: "..." }` → same auto-discovery path, but uses the provided client_id
+ *   instead of (or falling back from) DCR.
+ */
+export type OAuthConfig = true | { clientId?: string };
+
+/** Server origin → token file path under ~/.pi/mcp-tokens/<origin>/. */
+function mcpTokenDir(origin: string): string {
+  return join(homedir(), ".pi", "mcp-tokens", origin);
+}
+
+/**
+ * Read a JSON file from the token store directory, returning `undefined` if missing.
+ */
+async function readStoreJson<T>(dir: string, file: string): Promise<T | undefined> {
+  try {
+    const raw = await readFile(join(dir, file), "utf-8");
+    return JSON.parse(raw) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Write a JSON file to the token store directory, creating the dir and setting chmod 600.
+ */
+async function writeStoreJson(dir: string, file: string, data: unknown): Promise<void> {
+  mkdirSync(dir, { recursive: true });
+  const fpath = join(dir, file);
+  await writeFile(fpath, JSON.stringify(data, null, 2), { mode: 0o600 });
+}
+
+/** Delete a store file (ignore if missing). */
+async function deleteStoreFile(dir: string, file: string): Promise<void> {
+  try {
+    const fpath = join(dir, file);
+    await rm(fpath, { force: true });
+  } catch {
+    /* best effort */
+  }
+}
+
+/**
+ * OAuthClientProvider for pi's mcp-client.
+ *
+ * Implements RFC 9728 discovery → DCR → PKCE authorization-code flow, with
+ * rotating refresh tokens stored per-server under ~/.pi/mcp-tokens/<origin>/.
+ *
+ * This provider is designed for a CLI environment where:
+ *   1. Redirect URLs are printed for the user to open in a browser
+ *   2. Authorization codes are provided via the calling code (not an HTTP callback)
+ *   3. Token refresh happens transparently on expiry
+ *   4. Failed refresh surfaces a clear signal (logged error with re-auth URL)
+ */
+export class McpOAuthClientProvider implements OAuthClientProvider {
+  /** Base URL of the MCP server (used for origin and discovery). */
+  private serverUrl: URL;
+  /** Optional pre-configured client_id (public client). */
+  private configuredClientId?: string;
+  /** Path to the token store directory for this server. */
+  private storeDir: string;
+  /** Cached discovery state. */
+  private _discoveryState?: OAuthDiscoveryState;
+  /** PKCE code verifier for the current authorization flow. */
+  private _codeVerifier?: string;
+  /** Token information, cached in-memory during a session. */
+  private _tokens?: OAuthTokens;
+  /** Cached client information (from DCR or config). */
+  private _clientInfo?: OAuthClientInformationMixed;
+  /** The authorization URL last emitted. */
+  private _pendingAuthUrl?: URL;
+  /** Whether we've already logged the re-auth message. */
+  private _reauthLogged = false;
+
+  constructor(serverUrl: URL, config: OAuthConfig, storeDir?: string) {
+    this.serverUrl = serverUrl;
+    const origin = serverUrl.origin.replace(/[^a-zA-Z0-9._-]/g, "_");
+    this.storeDir = storeDir ?? mcpTokenDir(origin);
+    if (typeof config === "object" && config.clientId) {
+      this.configuredClientId = config.clientId;
+    }
+  }
+
+  // ── OAuthClientProvider implementation ────────────────────────────
+
+  /**
+   * The redirect URL presented to the authorization server.
+   * For CLI use, we use a loopback URL. The user will be redirected there
+   * and we instruct them to copy the authorization code from the URL.
+   */
+  get redirectUrl(): string | URL {
+    return new URL("http://127.0.0.1:24080/callback");
+  }
+
+  /** Client metadata describing this MCP client (pi). */
+  get clientMetadata(): OAuthClientMetadata {
+    return {
+      redirect_uris: [String(this.redirectUrl)],
+      token_endpoint_auth_method: "none", // public client
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      client_name: "pi-mcp-client",
+    };
+  }
+
+  /** Load previously registered client information. */
+  async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
+    if (this._clientInfo) return this._clientInfo;
+    const saved = await readStoreJson<OAuthClientInformationMixed>(
+      this.storeDir,
+      "client-info.json"
+    );
+    if (saved) this._clientInfo = saved;
+    return saved;
+  }
+
+  /** Save client information after DCR (or pre-set a configured client_id). */
+  async saveClientInformation(info: OAuthClientInformationMixed): Promise<void> {
+    this._clientInfo = info;
+    await writeStoreJson(this.storeDir, "client-info.json", info);
+  }
+
+  /** Load existing tokens for the current session. */
+  async tokens(): Promise<OAuthTokens | undefined> {
+    if (this._tokens) return this._tokens;
+    const saved = await readStoreJson<OAuthTokens>(this.storeDir, "tokens.json");
+    if (saved) this._tokens = saved;
+    return saved;
+  }
+
+  /** Store new tokens after a successful authorization or refresh. */
+  async saveTokens(tokens: OAuthTokens): Promise<void> {
+    this._tokens = tokens;
+    this._reauthLogged = false; // reset re-auth flag on successful token save
+    await writeStoreJson(this.storeDir, "tokens.json", tokens);
+  }
+
+  /**
+   * Redirect the user to the authorization URL.
+   * For CLI, we log the URL and store it for the user to open in a browser.
+   */
+  async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    this._pendingAuthUrl = authorizationUrl;
+    console.log(
+      `[mcp-client] 🔐 OAuth authorization required for '${this.serverUrl.origin}'`
+    );
+    console.log(
+      `[mcp-client] Open this URL in your browser to authorize:\n` +
+      `  ${authorizationUrl.href}\n` +
+      `After authorizing, you will be redirected to ${this.redirectUrl}?code=...`
+    );
+    console.log(
+      `[mcp-client] To complete authorization, call mcp_finish_auth with the \"code\" parameter from the redirect URL.`
+    );
+  }
+
+  /** Store the PKCE code verifier before redirecting. */
+  async saveCodeVerifier(codeVerifier: string): Promise<void> {
+    this._codeVerifier = codeVerifier;
+    await writeStoreJson(this.storeDir, "code-verifier.json", { codeVerifier });
+  }
+
+  /** Load the PKCE code verifier for the current session. */
+  async codeVerifier(): Promise<string> {
+    if (this._codeVerifier) return this._codeVerifier;
+    const saved = await readStoreJson<{ codeVerifier: string }>(
+      this.storeDir,
+      "code-verifier.json"
+    );
+    if (saved?.codeVerifier) {
+      this._codeVerifier = saved.codeVerifier;
+      return saved.codeVerifier;
+    }
+    throw new Error(
+      `[mcp-client] No PKCE code verifier found for '${this.serverUrl.origin}'. Re-authorization required.`
+    );
+  }
+
+  /**
+   * Invalidate credentials on server-issued token expiry (invalid_grant).
+   * Clears tokens, client info, and code verifier so the next connection
+   * attempt starts fresh with discovery + re-authorization.
+   */
+  async invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
+    if (scope === "tokens" || scope === "all") {
+      this._tokens = undefined;
+      await deleteStoreFile(this.storeDir, "tokens.json");
+    }
+    if (scope === "client" || scope === "all") {
+      this._clientInfo = undefined;
+      await deleteStoreFile(this.storeDir, "client-info.json");
+    }
+    if (scope === "verifier" || scope === "all") {
+      this._codeVerifier = undefined;
+      await deleteStoreFile(this.storeDir, "code-verifier.json");
+    }
+    if (scope === "discovery" || scope === "all") {
+      this._discoveryState = undefined;
+      await deleteStoreFile(this.storeDir, "discovery-state.json");
+    }
+
+    if (!this._reauthLogged) {
+      this._reauthLogged = true;
+      console.log(
+        `[mcp-client] 🔐 Token expired for '${this.serverUrl.origin}' — re-authorization required.`
+      );
+      if (this._pendingAuthUrl) {
+        console.log(
+          `[mcp-client] Open the authorization URL in your browser:\n` +
+          `  ${this._pendingAuthUrl.href}`
+        );
+      }
+    }
+  }
+
+  // ── Discovery persistence ───────────────────────────────────────────
+
+  async saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
+    this._discoveryState = state;
+    await writeStoreJson(this.storeDir, "discovery-state.json", state);
+  }
+
+  async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
+    if (this._discoveryState) return this._discoveryState;
+    const saved = await readStoreJson<OAuthDiscoveryState>(
+      this.storeDir,
+      "discovery-state.json"
+    );
+    if (saved) this._discoveryState = saved;
+    return saved;
+  }
+
+  // ── Helpers for finishAuth ──────────────────────────────────────────
+
+  /** The pending authorization URL, if any. */
+  get pendingAuthUrl(): URL | undefined {
+    return this._pendingAuthUrl;
+  }
+
+  /** Clear pending auth state (after successful finishAuth). */
+  clearPendingAuth(): void {
+    this._pendingAuthUrl = undefined;
+  }
+
+  /** The server URL (for transport lookup). */
+  get serverOrigin(): string {
+    return this.serverUrl.origin;
+  }
+}
 
 // ── Lifecycle constants (#199) ─────────────────────────────────────
 
@@ -58,6 +324,12 @@ interface McpServerConfig {
   purpose?: string;
   whenToLoad?: string;
   cost?: string;
+  // ── OAuth (#595) ────────────────────────────────────────────────
+  // Enable OAuth 2.1 authorization-code PKCE flow for remote HTTP MCP servers.
+  // `oauth: true` = auto-discovery with DCR; `oauth: { clientId: "..." }` uses a
+  // pre-configured public client. Requires `url` to be set. Tokens are stored in
+  // ~/.pi/mcp-tokens/<origin>/ and NEVER written to .mcp.json or env.
+  oauth?: import("./index.js").OAuthConfig;
 }
 
 interface McpJson {
@@ -116,6 +388,8 @@ interface McpConnection {
   lazy: boolean;
   idleTimeoutMs: number;
   lastUsed: number;
+  /** OAuth provider, if the server uses OAuth (#595). */
+  oauthProvider?: McpOAuthClientProvider;
 }
 
 // ── MCP Server Manager ──────────────────────────────────────────────
@@ -441,15 +715,24 @@ export class McpServerManager {
     );
 
     let transport: StdioClientTransport | StreamableHTTPClientTransport;
+    let oauthProvider: McpOAuthClientProvider | undefined;
 
     if (config.url) {
       // URL-based transport (e.g., Supabase MCP, remote servers)
       const headers = config.headers ? expandEnvVars(config.headers) : undefined;
+      const opts: ConstructorParameters<typeof StreamableHTTPClientTransport>[1] = {
+        requestInit: headers ? { headers } : undefined,
+      };
+
+      if (config.oauth) {
+        // OAuth 2.1 authorization-code PKCE flow (#595)
+        oauthProvider = new McpOAuthClientProvider(new URL(config.url), config.oauth);
+        opts.authProvider = oauthProvider;
+      }
+
       transport = new StreamableHTTPClientTransport(
         new URL(config.url),
-        {
-          requestInit: headers ? { headers } : undefined,
-        }
+        opts
       );
     } else if (config.command) {
       // Stdio transport (local process)
@@ -493,6 +776,7 @@ export class McpServerManager {
       lazy: config.lazy === true,
       idleTimeoutMs: config.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
       lastUsed: Date.now(),
+      oauthProvider,
     });
   }
 
@@ -615,6 +899,21 @@ export class McpServerManager {
                 details: { serverName, toolName: tool.name },
               };
             } catch (err: any) {
+              if (err instanceof UnauthorizedError) {
+                const msg = err.message ?? `MCP server '${serverName}' requires re-authorization`;
+                console.log(`[mcp-client] 🔐 Re-authorization needed for '${serverName}': ${msg}`);
+                // #595: surface a clear re-auth signal in the error return. The
+                // session coordinator can read this message to prompt the user.
+                return {
+                  content: [
+                    {
+                      type: "text" as const,
+                      text: `🔐 OAuth re-authorization needed for '${serverName}'. The access token has expired or was revoked. To re-authorize, you may need to connect again. Error: ${msg}`,
+                    },
+                  ],
+                  details: { serverName, toolName: tool.name, isError: true, reauthNeeded: true },
+                };
+              }
               return {
                 content: [
                   {
@@ -796,6 +1095,70 @@ export class McpServerManager {
           return {
             content: [
               { type: "text" as const, text: `mcp_load failed for '${serverName}': ${err.message}` },
+            ],
+          };
+        }
+      },
+    });
+
+    // #595: OAuth finish-auth tool — lets the session complete the PKCE flow
+    // after the user authorizes in their browser.
+    pi.registerTool({
+      name: "mcp_finish_auth",
+      label: "Complete OAuth authorization",
+      description:
+        "Complete the OAuth authorization flow for an MCP server. Call this after " +
+        "opening the authorization URL in your browser and pasting the 'code' parameter " +
+        "from the redirect URL. The transport will then exchange the code for tokens and reconnect.",
+      parameters: Type.Object({
+        server: Type.String({ description: "MCP server name to complete authorization for" }),
+        authorizationCode: Type.String({ description: "The 'code' parameter from the redirect URL after authorizing in the browser" }),
+      }),
+      execute: async (_toolCallId, params) => {
+        const serverName = String(params.server ?? "").trim();
+        const authCode = String(params.authorizationCode ?? "").trim();
+        if (!serverName || !authCode) {
+          return {
+            content: [{ type: "text" as const, text: "mcp_finish_auth: both 'server' and 'authorizationCode' are required." }],
+          };
+        }
+        const conn = this.findConnection(serverName);
+        if (!conn) {
+          return {
+            content: [{ type: "text" as const, text: `Server '${serverName}' is not connected. Run mcp_load first if it is lazy, or check mcp_catalog.` }],
+          };
+        }
+        // Use the client's transport if it implements finishAuth.
+        // The StreamableHTTPClientTransport has a finishAuth method (the
+        // SDK's Client itself does NOT — review P1, PR #604).
+        const client = conn.client as any;
+        const transport = client?.transport as any;
+        if (typeof transport?.finishAuth !== "function") {
+          return {
+            content: [{ type: "text" as const, text: `Server '${serverName}' does not support OAuth finish-auth (transport may not be OAuth-capable).` }],
+          };
+        }
+        try {
+          await transport.finishAuth(authCode);
+          // After finishAuth, clear the pending auth state on the provider.
+          if (conn.oauthProvider) {
+            conn.oauthProvider.clearPendingAuth();
+          }
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Authorization completed for '${serverName}'. Tokens exchanged successfully. You can now use ${serverName}'s tools.`,
+              },
+            ],
+          };
+        } catch (err: any) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Authorization failed for '${serverName}': ${err.message}. You may need to re-authorize by calling mcp_load again.`,
+              },
             ],
           };
         }
