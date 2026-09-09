@@ -3266,8 +3266,9 @@ export default function (pi: ExtensionAPI) {
   SLACK_BRIDGE_DISABLE: "1",
   VISION_INTERCEPTOR_DISABLED: "1",
   // #617: NO AGENT/ELDATO_ALLOW_MAIN_EDITS injection — the sub-agent runs the
-  // SAME main-worktree-guard as its controller (M4 hub discipline + M2/M3 +
-  // write/edit main block). The hatch was originally injected (#6091) to also
+  // SAME main-worktree-guard gates as its controller (M4 hub discipline + M2/M3
+  // + write/edit main block — the same surfaces an unhatched controller faces;
+  // bash-write/new-file carve-outs are controller-parity, unchanged). The hatch was originally injected (#6091) to also
   // disable verification-gate for one-shot children; #825 obsoleted that half
   // (VGATE stays ACTIVE via the verified-file-registry bridge), and the guard
   // rationale ("branch-ownership M1/M2/M3 protects the shared checkout") is
