@@ -332,38 +332,51 @@ ${MARKER}"
   # ── Stale gate-run remediation (#633) ──────────────────────────────────
   # A completed pre-evidence FAILURE (the push-triggered run that evaluated
   # the body before this marker existed) does not durably block a merge once
-  # a later SUCCESS for the same head exists (verified empirically, #633: a
-  # merge attempt with a FAILURE+SUCCESS pair on the head succeeds, while a
-  # FAILURE-only head is rejected) — but the FAILURE keeps showing a red
-  # ai-review-gate row in the rollup until something re-evaluates. When the
-  # most recent gate run on the head FAILED, the documented remedy — "re-run
-  # record-review.sh to retry" — used to be a silent no-op: the marker is
-  # already in the body, so no PATCH fires, no `edited` event, and no fresh
-  # gate run (tortoise PR #2698 thrashed on this for 40 min). User tokens
-  # cannot rewrite the stale run's conclusion (PATCH /check-runs/{id} → 403,
-  # GitHub-App-only) nor re-request it (POST /check-runs/{id}/rerequest →
-  # 404 for Actions runs), but CAN re-run the Actions job
-  # (POST /actions/jobs/{id}/rerun — verified #633). Re-run each
-  # completed-FAILURE gate check run for the recorded head here: the re-run
-  # re-reads the PR body live, so with the signed marker present it replaces
-  # the stale FAILURE attempt with a fresh run (for GitHub Actions the
-  # check-run id IS the job id). The gate's check-run name is repo-specific —
-  # override AI_REVIEW_GATE_CHECK_NAME for consumers that renamed their
-  # required check. Best-effort — NEVER fails the record.
-  if [ "${MARKER_PRESENT:-0}" = "1" ]; then
+  # a later SUCCESS for the same head exists (verified empirically, #633) —
+  # but the FAILURE keeps showing a red ai-review-gate row in the rollup
+  # until something re-evaluates, and when the gate's NEWEST completed run on
+  # the head is red the documented remedy — "re-run record-review.sh to
+  # retry" — used to be a silent no-op: the marker is already in the body, so
+  # no PATCH fires, no `edited` event, and no fresh gate run (tortoise PR
+  # #2698 thrashed on this for 40 min). User tokens cannot rewrite the stale
+  # run's conclusion (PATCH /check-runs/{id} → 403, GitHub-App-only) nor
+  # re-request it (POST /check-runs/{id}/rerequest → 404 for Actions runs),
+  # but CAN re-run the Actions job (POST /actions/jobs/{id}/rerun — verified
+  # #633). So when the recorded head's NEWEST completed gate run is red, re-run
+  # it here: the re-run re-reads the PR body live, so with the signed marker
+  # present it replaces the stale red attempt with a fresh run (for GitHub
+  # Actions the check-run id IS the job id). A newer SUCCESS for the name is
+  # the normal green end-state (no rerun — would just churn Actions jobs); a
+  # deliberately stale record (--force-stale) is never remediated (its gate
+  # state is unresolvable by design and a rerun in the PR's concurrency group
+  # could cancel the real head's in-flight gate run). The gate's check-run
+  # name is repo-specific — override AI_REVIEW_GATE_CHECK_NAME for consumers
+  # that renamed their required check. Best-effort — NEVER fails the record.
+  if [ "${MARKER_PRESENT:-0}" = "1" ] && [ "$FORCE_STALE" -ne 1 ]; then
     GATE_CHECK="${AI_REVIEW_GATE_CHECK_NAME:-ai-review-gate}"
-    FAILED_IDS="$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
-        --jq "[.check_runs[] | select(.name == \"$GATE_CHECK\") | select(.status == \"completed\") | select(.conclusion == \"failure\") | .id] | .[]" \
+    NEWEST_RED_ID=""
+    # The commit check-runs payload is read RAW so a query failure is
+    # distinguishable from "no red run" (the #405 convention: a transient
+    # API failure must warn loudly and skip, never read as nothing-to-do).
+    if GATE_JSON="$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" 2>/dev/null)"; then
+      # Newest completed run for the gate check name; remediate only when its
+      # conclusion is red (success/skipped/neutral satisfy the required
+      # check). $gate comes via --arg — no jq-program interpolation.
+      NEWEST_RED_ID="$(printf '%s' "$GATE_JSON" \
+        | jq -r --arg gate "$GATE_CHECK" \
+          '[.check_runs[] | select(.name == $gate) | select(.status == "completed")] | sort_by(.id) | reverse | .[0] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required") | .id' \
         2>/dev/null || true)"
-    if [ -n "$FAILED_IDS" ]; then
-      while IFS= read -r id; do
-        [ -z "$id" ] && continue
-        if gh api -X POST "repos/$REPO/actions/jobs/$id/rerun" >/dev/null 2>&1; then
-          echo "re-ran stale $GATE_CHECK FAILURE (job $id) — the fresh run re-evaluates the body with the recorded marker"
-        else
-          echo "note: could not re-run stale $GATE_CHECK job $id (permissions/state?) — record saved; the gate re-evaluates on the next push/edit anyway" >&2
-        fi
-      done <<< "$FAILED_IDS"
+    else
+      echo "⚠️ could not read check runs for $SHA (gh/API failure?) — stale-run re-run skipped; record still saved. Re-run record-review.sh to retry." >&2
+    fi
+    # Shape-guard the id before it reaches gh argv (ids come from GitHub
+    # JSON .id fields, but an errored query must never read as a job id).
+    if [ -n "$NEWEST_RED_ID" ] && [[ "$NEWEST_RED_ID" =~ ^[0-9]+$ ]]; then
+      if gh api -X POST "repos/$REPO/actions/jobs/$NEWEST_RED_ID/rerun" >/dev/null 2>&1; then
+        echo "re-ran stale $GATE_CHECK run (job $NEWEST_RED_ID) — the fresh run re-evaluates the body with the recorded marker"
+      else
+        echo "note: could not re-run stale $GATE_CHECK job $NEWEST_RED_ID (permissions/state?) — record saved; the gate re-evaluates only on the next push or PR-body edit, so push a commit or re-record to retry" >&2
+      fi
     fi
   fi
 else
