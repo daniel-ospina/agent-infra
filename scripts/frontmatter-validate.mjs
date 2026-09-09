@@ -3,7 +3,7 @@
  * frontmatter-validate.mjs — dep-free SKILL.md frontmatter validator (#254)
  *
  * Replaces check-skill-lint.mjs's regex-presence fallback with a tokenizer +
- * stateless rule engine that mirrors pi's loader grammar (pi v0.84.3,
+ * stateless rule engine that mirrors pi's loader grammar (pi v0.85.1,
  * yaml 2.9.0 — see docs/plans/2026-08-28-issue-254-skill-lint-yaml.md §2 for
  * the probe-derived fact table; reproducible via
  * scripts/probe-frontmatter-fixtures.mjs).
@@ -127,7 +127,7 @@ export function extractFrontmatter(content) {
 // ── Mini core-schema resolver (§5.2 — yaml-2.9.0 core schema scalars) ─────
 /**
  * Classifies a plain scalar the way yaml 2.9.0's core schema does, for the
- * key-scoped string-type gate (D4). Probe-confirmed (pi v0.84.3):
+ * key-scoped string-type gate (D4). Probe-confirmed (pi v0.85.1):
  *   - `1_000`, `190:20:30`, `0b101`, `1,000,000` are STRINGS
  *   - `yes`/`on` are STRINGS (YAML 1.2 core schema — no 1.1 bool spellings)
  *   - `0123` → int 123, `1e3` → float, `.inf`/`.nan` → float, `0x1A`/`0o17` → int
@@ -493,7 +493,7 @@ export function tokenizeFrontmatter(yamlString) {
       // yaml permits ONLY a `#`-prefixed comment
       // (or bare trailing whitespace) after a block-scalar header on the same
       // line. Any other token — `| comment`, `| 0`, `> text`, `|1 token` — is
-      // a lex error ("Not a YAML token: <tok>"; probe pi 0.84.3 / yaml 2.9.0)
+      // a lex error ("Not a YAML token: <tok>"; probe pi 0.85.1 / yaml 2.9.0)
       // and pi DROPS the skill. The previous trailing `[ \t].*` matched ANY
       // text as a "comment", so these emitted a valid header + block body →
       // typed as string → gate passed → validator clean while pi dropped.

@@ -19,10 +19,10 @@
  * gives the task-tool fallback work (#152/#154) an explicit target:
  * `TASK_FALLBACK_MODEL=qwen-ha/qwen3.8-max` or provider `qwen-ha`.
  *
- * ── How the fetch override works (verified against pi-ai 0.84.1 dist) ───────
+ * ── How the fetch override works (verified against pi-ai 0.85.1 dist) ───────
  * `api/openai-completions.js` calls `createClient(model, ctx, apiKey,
- * options?.headers, options?.fetch, ...)` (line 128) and passes `fetch` into
- * `new OpenAI({ apiKey, baseURL, fetch, ... })` (line 514). `StreamOptions`
+ * options?.headers, options?.fetch, ...)` (line 202) and passes `fetch` into
+ * `new OpenAI({ apiKey, baseURL, fetch, ... })` (line 577). `StreamOptions`
  * (`ProviderRequestOptions`) declares `fetch?: FetchFunction`. So wrapping the
  * real stream with `{ ...options, fetch: tunedFetch }` is sufficient — the
  * OpenAI SDK will route every qwen-ha HTTP request through our fetch.

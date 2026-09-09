@@ -159,11 +159,11 @@ its own `undici@8.9.0` copy — the same version pi ships):
 Tradeoff: every turn pays a fresh TCP+TLS handshake (~100–300 ms on this
 route) — noise against LLM streaming time, bought for #152 immunity.
 
-### Verified against pi 0.84.1 internals (Q1)
+### Verified against pi 0.85.1 internals (Q1)
 
 `dist/api/openai-completions.js`: `stream()` passes `options?.fetch` into
-`createClient()` (line 128) → `new OpenAI({ apiKey, baseURL, fetch, … })`
-(line 514); `StreamOptions.fetch?: FetchFunction` is part of the public type.
+`createClient()` (line 202) → `new OpenAI({ apiKey, baseURL, fetch, … })`
+(line 577); `StreamOptions.fetch?: FetchFunction` is part of the public type.
 So `{ ...options, fetch: tunedFetch }` in a wrapped `ProviderStreams` is all
 that is needed — no upstream change. The extension factory is
 failure-contained: it never throws (any setup error → warn + no registration),

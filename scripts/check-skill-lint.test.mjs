@@ -85,7 +85,7 @@ section("fixture verdict classes match expected");
 
 test(`FIXTURES module loads (${FIXTURES.length} fixtures, pi pin ${PI_VERSION_PIN})`, () => {
   assert.ok(FIXTURES.length >= 100, "matrix should cover every enumerated class");
-  assert.equal(PI_VERSION_PIN, "0.84.3");
+  assert.equal(PI_VERSION_PIN, "0.85.1");
 });
 
 for (const fx of FIXTURES) {

@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.3"
+    "@earendil-works/pi-coding-agent": "0.85.1"
   }
 }
