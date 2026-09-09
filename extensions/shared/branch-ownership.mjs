@@ -857,7 +857,9 @@ export function decideM2({
  *     forced rename clobbers a foreign ref rc 0 → block). The carve-out also
  *     requires the rename to run in the repo that recorded the baseline
  *     (baseline.repoKey === repoKey — the #376 discipline; a name collision
- *     in another clone never re-baselines).
+ *     in another clone never re-baselines) and a non-null renamed branch
+ *     (a detached 1-pos rename — from null — passes through to git's rc-128
+ *     refusal, never a phantom reBaseline).
  *   switch-existing to the session's ORIGINAL baseline branch (baseline.original
  *     — the branch recorded at session_start BEFORE any create-new re-baseline):
  *     allowed in agent-infra main → { reBaseline: <target> } — the sanctioned
@@ -924,12 +926,11 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     // baseline NAME must not re-baseline the session or consult the baseline
     // repo's owned set against another repo's refs (cross-clone name-collision
     // false-ownership; index.ts also probes — and _markOwned writes — only
-    // within the mutation's own repo). Round-3 review fold-in: the arm also
-    // requires from != null — a DETACHED session (currentBranch null, and a
-    // baseline recorded while detached has branch null) makes the null-null
-    // substitution collide with a detached 1-pos rename, which git REFUSES rc
-    // 128 ("cannot rename the current branch while not on any"); re-baselining
-    // onto a name git never creates would leave a phantom baseline.
+    // within the mutation's own repo). Round-3/4 review fold-in: the arm also
+    // requires from != null — a DETACHED session (currentBranch null) with a
+    // 1-pos rename would otherwise collide null into the name checks; git
+    // REFUSES a detached rename rc 128, so the null-from case passes through
+    // below instead of re-baselining onto a phantom name.
     const from = branchOp.from ?? currentBranch;
     if (
       from != null
@@ -950,14 +951,27 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
           reason: [
             `⛔ git branch -m/-M/-Mq/--move blocked in the MAIN checkout.`,
             `   Why: "${dst}" already exists as a branch this session does not`,
-            `   own — a forced rename would destroy that foreign ref rc 0;`,
-            `   git refuses the soft form rc 128 either way (#598).`,
+            `   own — a forced rename would overwrite that foreign ref (git`,
+            `   refuses rc 128 if it is checked out in any worktree, and the`,
+            `   soft form refuses rc 128 either way) (#598).`,
             `   → Rename onto a free name, or onto one of this session's`,
             `     own branches.`,
           ].join("\n"),
         };
       }
       return { reBaseline: branchOp.to };
+    }
+    if (branchOp.to && from == null) {
+      // Round-3/4 review fold-in: a 1-pos rename (rename current — from is
+      // null because classifyBranchOp could not see an old name) on a
+      // DETACHED main checkout (currentBranch null) is git-REFUSED rc 128
+      // ("cannot rename the current branch while not on any") — no ref can
+      // ever move, so pass through benignly (the #591/#592 pass-to-git-
+      // refusal carve-out class) instead of re-baselining onto a phantom name
+      // (the pre-#598 null===null collision) or blocking with a wrong reason.
+      // A 2-pos rename always carries a non-null from, so this branch is
+      // exactly the detached 1-pos form.
+      return null;
     }
     if (baseline && branchOp.to && from === baseline.branch) {
       // Round-2 reviewer P2: the rename's from IS the baseline branch name but

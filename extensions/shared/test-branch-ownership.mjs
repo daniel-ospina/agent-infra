@@ -566,12 +566,14 @@ ok("M3 #598: own-baseline rename onto existing dst in NON-infra → still blocks
 // repo's refs (cross-clone false-ownership on a clobber dst).
 ok("M3 #598: rename in a DIFFERENT repo (repoKey mismatch) → blocks (no cross-clone reBaseline)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/new" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: otherKey, renameDstExists: false }); return d?.block === true; })());
 ok("M3 #598: cross-clone rename onto EXISTING dst → blocks (owned set of the other repo never consulted)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: otherKey, renameDstExists: true, ownedBranches: new Set(["victim"]) }); return d?.block === true; })());
-// Round-3 reviewer B P2: a DETACHED session (baseline.branch null recorded
-// while detached + currentBranch null) makes the 1-pos from-substitution
-// collide null === null and enter the own-baseline arm — git REFUSES a
-// detached rename rc 128, so re-baselining onto the name git never creates
-// would leave a phantom baseline. The arm now requires from != null.
-ok("M3 #598: detached 1-pos rename (baseline.branch null, currentBranch null) → blocks (no phantom reBaseline)", (() => { const d = decideM3({ branchOp: { op: "rename", from: null, to: "freeX" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: null }, currentBranch: null, repoKey: mainKey, renameDstExists: false }); return d?.block === true; })());
+// Round-3/4 review fold-in: a DETACHED session makes a 1-pos rename's
+// from-substitution null — git REFUSES any detached rename rc 128 ("cannot
+// rename the current branch while not on any"), so decideM3 passes through
+// benignly (null — the #591 pass-to-git-refusal class) instead of
+// re-baselining onto a phantom name (the pre-#598 null===null collision) or
+// blocking with a misleading reason.
+ok("M3 #598: detached 1-pos rename (free dst) → pass-through null (git refuses rc 128; no phantom reBaseline)", decideM3({ branchOp: { op: "rename", from: null, to: "freeX" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: null }, currentBranch: null, repoKey: mainKey, renameDstExists: false }) === null);
+ok("M3 #598: detached 1-pos rename (existing dst) → pass-through null (git refuses rc 128 either way)", decideM3({ branchOp: { op: "rename", from: null, to: "victim" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: null }, currentBranch: null, repoKey: mainKey, renameDstExists: true }) === null);
 // ── localBranchExists tri-state probe ──────────────────────────────────────
 ok("M3 #598: localBranchExists existing branch → true", localBranchExists(MAIN, "side") === true, String(localBranchExists(MAIN, "side")));
 ok("M3 #598: localBranchExists free name → false", localBranchExists(MAIN, "no-such-598") === false, String(localBranchExists(MAIN, "no-such-598")));

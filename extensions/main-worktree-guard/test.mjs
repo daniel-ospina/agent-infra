@@ -1535,12 +1535,16 @@ dexpect("#543: branch list → no delete capture", `git branch -a`, { branchStat
     expectBool("#598: soft -m <baseline> <free-name> → reBaseline (soft rename unchanged)", b10?.reBaseline === "rnS" && !b10?.block, true);
     const b11 = m3idx(`git --git-dir="${r2}/.git" branch -M feat/1 r2only`);
     expectBool("#598: --git-dir=<other> rename — adapter passes muEff.gitDir to the probe (block)", b11?.block === true, true);
-    // Round-3 reviewer B P2: the REACHABLE index.ts geometry for the gitDir
-    // anchor — session baseline repo = r2 (sessCwd r2), shell -C's into r598
-    // while --git-dir stays at r2 (a `cd`-into-foreign-repo + --git-dir-back
-    // spell). muEff.repoKey == baseline.repoKey (r2) so the repo-scope gate
-    // passes and the PROBE decides; a cwd-anchored probe (r598 — no r2only)
-    // would read free → reBaseline and let the clobber through.
+    // Round-3 reviewer B P2 follow-up: the REACHABLE index.ts geometry for the
+    // gitDir anchor — session baseline repo = r2 (sessCwd r2 models the
+    // baseline repo = session cwd repo), shell -C's into r598 while --git-dir
+    // stays at r2. muEff.repoKey == baseline.repoKey (r2) so the repo-scope
+    // gate passes and the PROBE decides; a cwd-anchored probe (r598 — no
+    // r2only) would read free → reBaseline and let the clobber through, so
+    // dropping the muEff.gitDir arg at the index.ts call site fails this pin.
+    // (sessCwd makes the baseline repo model-correct here; the pins use
+    // absolute paths so they do not themselves discriminate the sessCwd
+    // parameter.)
     const b13 = m3idx(`git -C "${r598}" --git-dir="${r2}/.git" branch -M feat/1 r2only`, [], r2);
     expectBool("#598: -C <foreign> --git-dir=<baseline> rename onto baseline-repo-only dst → BLOCK (gitDir anchor load-bearing)", b13?.block === true, true);
     const b13b = m3idx(`git branch -M feat/1 freeZ`, [], r2);
