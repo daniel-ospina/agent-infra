@@ -3,7 +3,7 @@
 Guards the **SHARED main checkout** of a project against two classes of
 collision between parallel agents:
 
-1. **write/edit tool calls** targeting the main checkout (parallel agents
+1. **write/edit tool calls** targeting a repo's main checkout (parallel agents
    editing main could silently overwrite each other's uncommitted changes),
    and
 2. **destructive/state-changing git commands** via the bash tool — `git reset
@@ -11,9 +11,22 @@ collision between parallel agents:
    `branch -D`, restore, stash pop (incident 2026-08-06: a `git reset --hard
    origin/main` mid-PR yanked the working tree out from under another agent).
 
-**Worktrees are ISOLATED** — none of this applies inside a linked worktree.
-The guard blocks only in the shared main checkout, where branch-state changes
-and hard resets silently destroy other agents' work.
+**Worktrees are ISOLATED** — none of this applies to writes INSIDE a linked
+worktree. The guard blocks only hub-main-checkout writes and destructive git
+in the shared main checkout, where branch-state changes and hard resets
+silently destroy other agents' work.
+
+**#618/#621 — hub-write gating is TARGET-aware:** the write/edit gate and the
+tracked-file bash gate resolve the WRITE TARGET's repo checkout
+(`resolveTargetCheckout` — git toplevel + MAIN-vs-worktree, realpath-normalized,
+cached), never the session cwd. A tracked-file write into ANY repo's MAIN
+checkout is gated wherever the session sits: worktree sessions (previously
+exempt wholesale), foreign/non-git cwds (previously invisible — no toplevel to
+compare), and other repos' sessions (an agent-infra-rooted controller writing
+tortoise/premise-labs/DMeer/eldato main after the #615 removal). Own-worktree
+writes stay free (their targets resolve to the worktree's checkout, never a
+main checkout — epic-529 preserved structurally). NEW/untracked files into a
+hub main stay additive: they WARN on the #350 WIP patterns only.
 
 There is **NO auto-bypass**: the guard blocks every time, so a rogue or
 parallel agent cannot retry its way past it. Escapes are deliberate and
@@ -90,9 +103,11 @@ session start, deliberate solo session) disables M4. The sanctioned terminal
 one-liner (`cd <repo> && git checkout main && git pull --ff-only`) is
 touched only by humans and is unaffected.
 
-**Scope (#347):** M4 fires only when the session cwd IS the hub's main checkout
-and the hub is off-main/dirty. Worktree sessions are exempt (they are isolated
-by construction). Agent-infra is NOT exempt (#615 — the #99 carve-out is
+**Scope (#347/#618/#621):** M4 fires only when the session cwd IS the hub's main checkout
+and the hub is off-main/dirty. Worktree sessions are exempt from the M4 git-verb gates (they are isolated
+by construction); the write gates are TARGET-aware (#618/#621) — a worktree or
+foreign session's tracked-file write into a hub main checkout is gated by the
+TARGET repo even though M4 never fires on the session cwd. Agent-infra is NOT exempt (#615 — the #99 carve-out is
 removed: its main checkout is a pure hub too, so it gets the same M4 discipline
 as every other repo). **Worktree-
 TARGETED git ops are exempt per-invocation:** M4 resolves each git invocation's
@@ -250,22 +265,33 @@ isolated worktree. The write/edit tool blocks main-checkout edits, but
 unguarded** — so the discipline violation silently accumulates, marks the hub
 dirty, and trips M4's freeze. Surfaces:
 
-1. **Write/edit-gate warning:** a write/edit target inside the hub main
+1. **Write/edit-gate warning:** a write/edit target inside a hub main
    checkout matching the WIP patterns (`docs/plans/` segment pair, any
    `migrations/` segment, scratch suffixes `.tmp`/`.bak`/`.scratch`/`~`) emits a
    prominent `HUB WIP — PUT IT IN A WORKTREE` banner instead of silently
-   passing. Relevant where the write is NOT already blocked: worktree sessions
-   writing into the hub via an absolute
-   path. For main-checkout writes (already blocked), the block reason
+   passing. Relevant where the write is NOT already blocked: NEW-file writes by
+   worktree/foreign sessions into a hub via an absolute
+   path (target-aware since #618/#621 — the banner fires against the TARGET
+   hub, not the session's own cached main). For main-checkout writes (already blocked), the block reason
    now names the amplifier pattern.
-2. **Bash-write GATE for tracked files in a DISORDERED hub (#437):** while the
-   hub is OFF-MAIN or DIRTY, a bash write (`>`/`>>` redirect, `tee`, python
-   `open(…, "w"|"a")`) whose target is an INDEX-TRACKED file in the hub is
-   **blocked** — the same freeze the write/edit tools apply, on the bash route
+2. **Bash-write GATE for TRACKED files in hub MAIN checkouts (#437 +
+   #618/#621):** the gate is TARGET-aware — each write candidate's containing
+   checkout is resolved, and hub discipline applies per target. When the shell
+   executing the write is ROOTED in that main (a hub-rooted session, or a
+   `cd` into a hub), a bash write (`>`/`>>` redirect, `tee`, python
+   `open(…, "w"|"a")`) whose target is an INDEX-TRACKED file is
+   **blocked while that hub is OFF-MAIN or DIRTY** —
+   the same freeze the write/edit tools apply, on the bash route
    that previously landed the tracked-file dirt of the 2026-08-31 tortoise
-   session (write/edit blocked → python-heredoc fallback → landed). Tracked-ness
+   session (write/edit blocked → python-heredoc fallback → landed). When the
+   write target is a hub main the session shell is NOT rooted in (a worktree
+   session → its own repo's main, a foreign/non-git cwd, or another repo's
+   session), the write is a DELIBERATE cross-checkout hub write and a TRACKED
+   target blocks REGARDLESS of hub state — the vector behind the 2026-09-08
+   mass `.husky/pre-commit` rewrite from the GitHub parent dir and the
+   wt-session python open() probes. Tracked-ness
    is exact (`git ls-files --error-unmatch`, one bounded call for all
-   candidates, only while disordered); hub-equality is realpath-normalized.
+   candidates per target repo); hub-equality is realpath-normalized.
    Block message states the single coherent rule: bash writes respect the same
    hub gate as the tools; only the session-start host env bypasses — a
    mid-command `export` cannot. The gate resolves redirect operands that the
@@ -282,7 +308,10 @@ dirty, and trips M4's freeze. Surfaces:
    covered by any guard: the write/edit freeze only intercepts tool events,
    and M4 classifies these as non-git (allowed). Documented residual: only
    write PRIMITIVES are gated on the bash route (verb overwrites via the
-   write/edit tools stay frozen, and git-verb overwrites stay M4-gated).
+   write/edit tools stay frozen, and git-verb overwrites stay M4-gated), and a
+   main-rooted session's same-checkout tracked write into its own CLEAN main
+   stays ungated (build/formatter/npm-install side effects must never
+   false-block — #437's disorder scope).
    NEW-file and untracked-WIP targets are NOT this gate's concern (see 3;
    the #436 collision-free carve-out semantics apply).
 3. **Bash-write warning (untracked WIP — still warn-only):** hub-targeted
@@ -310,12 +339,18 @@ session-start banner, which fires under the marker). All warnings dedupe per
 (surface, pattern, path) per session — the write-gate and bash surfaces keep
 separate dedupe namespaces, and the inventory dedupes per path.
 
-**Design deviations (documented):** the bash-write heuristic resolves targets
-against the session cwd — `cd`-prefixed writes into the hub are false-negatives
-(a warning is cheap, a missed one is not an incident); a failed hub-toplevel
-cache resolution disables the three surfaces for up to 30s (then retries —
-never terminally); hub-equality assumes the session stays in one repo (M4's
-blocks use fresh per-call resolution and are unaffected); the python `open()`
+**Design deviations (documented):** the bash-write WARN heuristic resolves
+write targets against the session cwd — `cd`-prefixed writes into the hub are
+false-negatives on the WARN surface (a warning is cheap, a missed one is not
+an incident); the #618/#621 bash GATE runs the cd-aware per-write-site walker
+so its same-vs-cross-checkout decisions resolve where the write executes (a
+`cd`-hidden write into a hub main from a clean same-checkout shell stays #437's
+documented residual; a `cd`-hidden write from a foreign/worktree session whose
+hub is CLEAN is a cheap-extractor false-negative only when the command also
+has no top-level write candidate — accepted, same class); a failed hub-toplevel
+cache resolution disables the warn surfaces for up to 30s (then retries —
+never terminally); hub-equality is realpath-normalized (M4's blocks use fresh
+per-call resolution and are unaffected); the python `open()`
 regex only fires when a python interpreter token is present (bare, versioned
 like `python3.11`, or path-qualified like `venv/bin/python`; commands over
 64KB skip the scan) — prose that mixes an unquoted python token with a quoted
@@ -337,7 +372,10 @@ so the agent moves the work to a worktree
 the next M4 freeze. The #437 tracked-write gate is the exception that DOES
 block: writing an index-tracked hub file via bash while the hub is disordered
 destroys the very dirty delta the freeze protects (and is the mechanism that
-created the 2026-08-31 tortoise dirt). Its tracked-ness test is exact
+created the 2026-08-31 tortoise dirt) — and since #618/#621 a DELIBERATE
+cross-checkout tracked write into ANY hub main (worktree/foreign session) is
+blocked regardless of hub state, matching the write/edit tool's target-aware
+gate. Its tracked-ness test is exact
 (`git ls-files`), so the heuristic deviations below (false-positives on
 heredoc bodies, cd-prefix false-negatives, symlink aliases) apply to the
 WARN surface only — the block fires only on a real tracked hub file.

@@ -3950,6 +3950,76 @@ export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
   }
 }
 
+/**
+ * #618/#621 — the TARGET-aware checkout classification for a write/edit path
+ * (the shared mechanism both hub-write issues consume). Resolves the git
+ * checkout CONTAINING a target path (walking up to the nearest existing
+ * ancestor so writes into not-yet-created dirs still resolve) and classifies
+ * it MAIN-checkout vs linked-worktree:
+ *   - top    = resolve-normalized git toplevel of the containing checkout (or
+ *              null when the path is outside any git repo)
+ *   - isMain = true when the containing checkout is the repo's MAIN checkout
+ *              (git-dir NOT under .git/worktrees/) — a "hub main" path whose
+ *              tracked files must be gated no matter where the session sits.
+ * Worktree targets return { top, isMain:false } — isolated by construction, so
+ * callers let them through (epic-529: a worktree session's own edits resolve
+ * to ITS worktree checkout, never a main checkout).
+ * @param {string} targetPath — write/edit target (relative to cwd or absolute)
+ * @param {string} [cwd]
+ * @returns {{ top: string, isMain: boolean } | null}
+ */
+export function resolveTargetCheckout(targetPath, cwd = process.cwd()) {
+  try {
+    let dir = resolve(cwd, targetPath ?? "");
+    // A DIRECTORY input IS the checkout dir to classify (session cwds,
+    // already-created target dirs); a FILE input classifies via its parent
+    // dir; a not-yet-existing path walks up to the nearest existing dir.
+    if (existsSync(dir) && !statSync(dir).isDirectory()) dir = dirname(dir);
+    while (!existsSync(dir)) {
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    const gitDir = execSync("git rev-parse --git-dir", {
+      encoding: "utf-8", cwd: dir, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!gitDir) return null;
+    const top = execSync("git rev-parse --show-toplevel", {
+      encoding: "utf-8", cwd: dir, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!top) return null;
+    const isWorktree = gitDir.includes("/worktrees/") || gitDir.endsWith("/worktrees");
+    return { top: resolve(top), isMain: !isWorktree };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #618/#621 — ONE bounded index query for candidate rels in a repo checkout:
+ * `git ls-files --error-unmatch` prints exactly the TRACKED rels (exit≠0 when
+ * any path is untracked — stdout still carries the tracked matches). Returns
+ * the tracked subset (empty array when none). Callers pair it with
+ * firstHubTrackedWrite to pick the first tracked candidate.
+ * @param {string} repoTop — the checkout's git toplevel (cwd for the query)
+ * @param {string[]} rels — repo-relative candidate paths
+ * @returns {string[]}
+ */
+export function trackedRelsIn(repoTop, rels) {
+  if (!repoTop || !Array.isArray(rels) || rels.length === 0) return [];
+  let out = "";
+  try {
+    out = execFileSync("git", ["ls-files", "--error-unmatch", "--", ...rels], {
+      cwd: repoTop, encoding: "utf-8", timeout: 5000,
+    }).toString();
+  } catch (e) {
+    // execFileSync throws on exit≠0 but stdout still carries the tracked
+    // matches — read the captured stdout (same pattern as index.ts #437).
+    out = (e && typeof e === "object" && "stdout" in e && e.stdout ? String(e.stdout) : "");
+  }
+  return out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+}
+
 // ── #350: hub-WIP hygiene — write-gate WARNING + hub-hygiene check ──────────
 // The #347 amplifier: agents write WIP (plan docs to docs/plans/, migrations,
 // scratch files) directly in the hub main checkout instead of an isolated
@@ -4197,7 +4267,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     const key = `${via}:${resolved}`;
     if (seen.has(key)) return;
     seen.add(key);
-    out.push({ resolvedPath: resolved, via, site });
+    // #618/#621: carry the SITE cwd (the dir the write executes from) so the
+    // caller can classify same-checkout vs deliberate cross-checkout writes
+    // (a candidate whose resolved target sits in a DIFFERENT checkout than
+    // its site cwd is a hub write the session shell is not rooted in).
+    out.push({ resolvedPath: resolved, via, site, cwd: resolve(cwd) });
   };
   // Bash cwd semantics (probe-verified):
   //  - cd applies to FOLLOWING commands (at the next &&/;/||/newline/`)`/end),

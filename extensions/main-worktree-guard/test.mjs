@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync, existsSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -133,7 +133,13 @@ try {
   // Write/edit worktree-session early-return (mirror of index.ts fix):
   check("own file, worktree session", `${wtPath}/AGENTS.md`, "ALLOW (worktree session)", wtPath);
   check("deep own file, worktree session", `${wtPath}/extensions/main-worktree-guard/index.ts`, "ALLOW (worktree session)", wtPath);
-  check("main file, temp worktree session", `${MAIN}/AGENTS.md`, "ALLOW (worktree session)", wtPath);
+  // #618 pins (worktree session writing THIS repo's hub main — the wtPath
+  // worktree above is a linked worktree of the MAIN checkout this suite runs
+  // against): tracked hub-main files now BLOCK (were "ALLOW (worktree session)"
+  // via the epic-529 early-return); NEW hub-main files stay additive/warn-only.
+  check("#618: main tracked AGENTS.md, worktree session → BLOCK (hub tracked)", `${MAIN}/AGENTS.md`, "BLOCK (hub tracked)", wtPath);
+  check("#618: main tracked extension file, worktree session → BLOCK (hub tracked)", `${MAIN}/extensions/main-worktree-guard/index.ts`, "BLOCK (hub tracked)", wtPath);
+  check("#618: main NEW file (docs/plans), worktree session → ALLOW (hub new file)", `${MAIN}/docs/plans/_pin-618-never-created.md`, "ALLOW (hub new file)", wtPath);
 } catch (e) {
   console.log(`⏭️  worktree case skipped (could not provision: ${String(e.message).slice(0, 60)})`);
 } finally {
@@ -146,26 +152,42 @@ try {
 // sessionCwd mirrors the pi extension-host cwd (the project root the guard
 // protects). Passed explicitly so the suite works from any checkout.
 function guardDecision(targetPath, sessionCwd = PROJECT_CWD) {
-  // Worktrees are ISOLATED: a session rooted in a linked worktree edits freely
-  // (mirrors index.ts write/edit early-return).
-  if (isWorktreeCwd(resolve(sessionCwd))) return "ALLOW (worktree session)";
-  let mainTopLevel;
-  try {
-    mainTopLevel = resolve(execSync("git rev-parse --show-toplevel", { encoding: "utf-8", cwd: resolve(sessionCwd), timeout: 5000 }).trim());
-  } catch { return "BLOCK (Git unavailable)"; }
-  const resolvedTarget = resolve(PROJECT_CWD, targetPath ?? "");
-  const insideProject = resolvedTarget === mainTopLevel || resolvedTarget.startsWith(mainTopLevel + "/");
-  if (!insideProject) return "ALLOW (outside project)";
-  const targetCwd = targetPath ? dirname(resolvedTarget) : PROJECT_CWD;
-  let resolvedCwd = targetCwd;
-  try { if (existsSync(targetCwd)) resolvedCwd = realpathSync(targetCwd); } catch {}
-  let topLevel;
-  try {
-    execSync("git rev-parse --git-common-dir", { encoding: "utf-8", cwd: resolvedCwd, timeout: 5000 }).trim();
-    topLevel = execSync("git rev-parse --show-toplevel", { encoding: "utf-8", cwd: resolvedCwd, timeout: 5000 }).trim();
-  } catch { return "BLOCK (Git unavailable)"; }
-  if (topLevel === mainTopLevel) return "BLOCK (main checkout)";
-  return "ALLOW (worktree)";
+  // #618/#621 mirror of the index.ts TARGET-aware write gate: the decision
+  // resolves the WRITE TARGET's containing checkout (resolveTargetCheckout —
+  // git toplevel + MAIN-vs-worktree), never the session cwd. Verdicts:
+  //   BLOCK (main checkout)  — session rooted in that main; any file (today's
+  //                            permanent gate, agent-infra included since #615)
+  //   BLOCK (hub tracked)    — cross-cwd tracked-file write into a hub main
+  //                            (worktree session / foreign non-git cwd / other
+  //                            repo session — #618/#621)
+  //   ALLOW (hub new file)   — cross-cwd NEW/untracked write into a hub main
+  //                            (additive + visible; #350 warn-only surface)
+  //   ALLOW (worktree session) — target inside ANY worktree checkout (own
+  //                            worktree edits — epic-529 preserved structurally)
+  //   ALLOW (outside project) — target outside any git repo (/tmp, ~/.pi)
+  const resolvedTarget = resolve(sessionCwd, targetPath ?? "");
+  const real = (p) => {
+    let d = resolve(p); let tail = "";
+    while (!existsSync(d)) {
+      const parent = dirname(d);
+      if (parent === d) break;
+      tail = d.slice(parent.length) + tail;
+      d = parent;
+    }
+    try { return realpathSync(d) + tail; } catch { return p; }
+  };
+  const ck = resolveTargetCheckout(real(resolvedTarget));
+  if (!ck) return "ALLOW (outside project)";
+  if (!ck.isMain) return "ALLOW (worktree session)";
+  const sessionCk = resolveTargetCheckout(real(sessionCwd));
+  const sessionOwnsThisMain = !!sessionCk && sessionCk.isMain && sessionCk.top === ck.top;
+  if (sessionOwnsThisMain) return "BLOCK (main checkout)";
+  const tgtReal = real(resolvedTarget);
+  if (tgtReal.startsWith(ck.top + "/")) {
+    const rel = tgtReal.slice(ck.top.length + 1);
+    if (rel && trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (hub tracked)";
+  }
+  return "ALLOW (hub new file)";
 }
 function check(name, path, expectedContains, sessionCwd) {
   const got = guardDecision(path, sessionCwd);
@@ -188,10 +210,101 @@ check("#615: agent-infra main MEMORY.md (hub session) → BLOCK", `${MAIN}/MEMOR
 check("#615: agent-infra main extension file (hub session) → BLOCK", `${MAIN}/extensions/main-worktree-guard/index.ts`, "BLOCK (main checkout)", MAIN);
 check("/tmp file", "/tmp/foo.md", "ALLOW (outside project)", MAIN);
 check("~/.pi extension", "/home/user/.pi/agent/extensions/x.ts", "ALLOW (outside project)", MAIN);
-// Session rooted in a worktree: main-checkout paths are outside its project → allowed.
-// Only meaningful when the suite itself runs from a worktree.
+// Session rooted in a worktree: writing the hub main's TRACKED files is now
+// BLOCKED (the #618 target-aware gate); only meaningful when the suite itself
+// runs from a worktree.
 if (!RUN_IS_MAIN) {
-  check("main file, worktree session", `${MAIN}/AGENTS.md`, "ALLOW (worktree session)", PROJECT_CWD);
+  check("#618: main tracked file, worktree-rooted session → BLOCK (hub tracked)", `${MAIN}/AGENTS.md`, "BLOCK (hub tracked)", PROJECT_CWD);
+}
+
+// ── #618/#621: TARGET-aware hub-write pins (hermetic) ────────────────────
+// The write gate resolves the WRITE TARGET's checkout (not the session cwd):
+// a tracked-file write into ANY repo's MAIN checkout blocks from a worktree
+// session (#618 i1), a foreign non-git cwd (#618 i2 — the mass-hook-rewrite
+// parent-dir vector), or another repo's session (#621 — an infra-rooted
+// controller writing a tortoise-like hub). Own-worktree writes stay free;
+// NEW-file writes into a hub main stay additive/warn-only.
+let taTmp = null;
+const provisionGitRepo = (base, name, files) => {
+  const r = `${base}/${name}`;
+  execSync(`git init -q -b main "${r}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: r, stdio: "ignore" });
+  for (const f of files) writeFileSync(`${r}/${f}`, `${f} content\n`);
+  execSync("git add . && git commit -qm init", { cwd: r, stdio: "ignore" });
+  return r;
+};
+try {
+  taTmp = realpathSync(execSync("mktemp -d", { encoding: "utf-8" }).trim());
+  // hub: a tortoise-like repo main checkout; wt: its linked worktree;
+  // parent: a NON-GIT dir above hub (the /Users/…/GitHub geometry);
+  // infra: an agent-infra-fingerprinted repo (manifest.json + pi-bootstrap/
+  // setup.sh) with its own worktree infraWt.
+  const hub = provisionGitRepo(taTmp, "hub", ["AGENTS.md", "tracked.txt"]);
+  const wt = `${taTmp}/hub-wt`;
+  execSync(`git worktree add -q "${wt}" -b wt/feat HEAD`, { cwd: hub, stdio: "ignore" });
+  writeFileSync(`${wt}/wt-own.txt`, "wt file\n");
+  execSync("git add wt-own.txt && git commit -qm wtfile", { cwd: wt, stdio: "ignore" });
+  const parent = `${taTmp}/parent`;
+  mkdirSync(parent);
+  const infra = provisionGitRepo(taTmp, "infra", ["tracked.md"]);
+  mkdirSync(`${infra}/pi-bootstrap`, { recursive: true });
+  writeFileSync(`${infra}/manifest.json`, "{}");
+  writeFileSync(`${infra}/pi-bootstrap/setup.sh`, "#!/bin/sh\n");
+  execSync("git add . && git commit -qm infra", { cwd: infra, stdio: "ignore" });
+  const infraWt = `${taTmp}/infra-wt`;
+  execSync(`git worktree add -q "${infraWt}" -b wt/infra HEAD`, { cwd: infra, stdio: "ignore" });
+  // classify-level: resolveTargetCheckout main-ness + tracked intersect.
+  expectBool("TAC: hub main file → { top: hub, isMain: true }", (() => {
+    const c = resolveTargetCheckout(`${hub}/AGENTS.md`);
+    return c && c.isMain === true && c.top === resolve(hub);
+  })(), true);
+  expectBool("TAC: hub worktree file → { top: wt, isMain: false }", (() => {
+    const c = resolveTargetCheckout(`${wt}/wt-own.txt`);
+    return c && c.isMain === false && c.top === resolve(wt);
+  })(), true);
+  expectBool("TAC: non-git parent file → null", resolveTargetCheckout(`${parent}/x.md`) === null, true);
+  expectBool("TAC: trackedRelsIn keeps only the tracked subset", (() => {
+    const got = trackedRelsIn(hub, ["AGENTS.md", "nope.md", "tracked.txt"]);
+    return got.length === 2 && got.includes("AGENTS.md") && got.includes("tracked.txt");
+  })(), true);
+  expectBool("TAC: bashWriteTargetsResolved candidates carry the site cwd", (() => {
+    const cands = bashWriteTargetsResolved(`echo x > ${hub}/AGENTS.md`, parent);
+    const c = cands.find((x) => x.resolvedPath);
+    return !!c && typeof c.cwd === "string" && c.cwd === resolve(parent);
+  })(), true);
+  // Tool-gate pins (guardDecision = the index.ts write/edit gate mirror).
+  check("#618: worktree session → own-repo hub TRACKED file → BLOCK", `${hub}/AGENTS.md`, "BLOCK (hub tracked)", wt);
+  check("#618: worktree session → own worktree file → ALLOW (worktree session)", `${wt}/wt-own.txt`, "ALLOW (worktree session)", wt);
+  check("#618: worktree session → own-repo hub NEW file → ALLOW (hub new file)", `${hub}/docs/plans/_pin-618-new.md`, "ALLOW (hub new file)", wt);
+  check("#618: foreign non-git parent cwd → hub TRACKED file → BLOCK", `${hub}/AGENTS.md`, "BLOCK (hub tracked)", parent);
+  check("#618: foreign non-git parent cwd → hub NEW file → ALLOW (hub new file)", `${hub}/scratch/new-file.md`, "ALLOW (hub new file)", parent);
+  check("#618: foreign non-git parent cwd → hub worktree file → ALLOW (worktree session)", `${wt}/wt-own.txt`, "ALLOW (worktree session)", parent);
+  check("#621: infra-rooted session → tortoise-like hub TRACKED file → BLOCK", `${hub}/AGENTS.md`, "BLOCK (hub tracked)", infra);
+  check("#621: infra-rooted session → agent-infra WORKTREE file → ALLOW (worktree session)", `${infraWt}/tracked.md`, "ALLOW (worktree session)", infra);
+  check("#621: hub-rooted session → own hub TRACKED file → BLOCK (main checkout)", `${hub}/AGENTS.md`, "BLOCK (main checkout)", hub);
+  check("#621: hub-rooted session → own hub NEW file → BLOCK (main checkout)", `${hub}/docs/new.md`, "BLOCK (main checkout)", hub);
+  check("#621: hub-rooted session → sibling worktree file → ALLOW (worktree session)", `${wt}/wt-own.txt`, "ALLOW (worktree session)", hub);
+  check("#621: wt-of-infra session → agent-infra hub TRACKED file → BLOCK", `${infra}/tracked.md`, "BLOCK (hub tracked)", infraWt);
+  // Bash-route primitives (the index.ts _hubBashTrackedWrite gate consumes
+  // resolveTargetCheckout + trackedRelsIn + the site cwd — pin the pieces the
+  // hermetic mirror can exercise; index.ts itself is not importable).
+  const pyProbe = `python3 -c "open('${hub}/AGENTS.md','w')"`;
+  const pyCands = bashWriteTargetsResolved(pyProbe, wt);
+  expectBool("C618: wt-session python open() into own-repo hub main surfaces a candidate", pyCands.some((c) => c.resolvedPath === `${hub}/AGENTS.md`), true);
+  const hubCk = resolveTargetCheckout(`${hub}/AGENTS.md`);
+  expectBool("C618: that candidate's checkout is the hub MAIN (tracked gate applies)", !!hubCk && hubCk.isMain && hubCk.top === resolve(hub), true);
+  expectBool("C618: the target is TRACKED in that hub (gate hits)", trackedRelsIn(hub, ["AGENTS.md"]).includes("AGENTS.md"), true);
+  const wtCk = resolveTargetCheckout(`${wt}/wt-own.txt`);
+  expectBool("C618: a worktree-own write stays a WORKTREE checkout (gate skips)", !!wtCk && wtCk.isMain === false, true);
+} catch (e) {
+  console.error(`❌ #618/#621 hermetic pins FAILED to provision: ${String(e.message).slice(0, 160)}`);
+  fail++;
+} finally {
+  if (taTmp) {
+    try { execSync(`git worktree remove --force "${taTmp}/hub-wt"`, { stdio: "ignore" }); } catch {}
+    try { execSync(`git worktree remove --force "${taTmp}/infra-wt"`, { stdio: "ignore" }); } catch {}
+    try { execSync(`rm -rf "${taTmp}"`, { stdio: "ignore" }); } catch {}
+  }
 }
 
 // ── Infra-repo detection ───────────────────────────────────────────────────
@@ -291,6 +404,23 @@ const m3AssignIdx = pinSrc.indexOf("isInfra = isAgentInfraRepo(muEff.effectiveCw
 expectBool("#615 source pin: the surviving call is the M3 isInfra assignment", m3AssignIdx !== -1, true);
 const afterM3 = m3AssignIdx !== -1 ? pinSrc.slice(m3AssignIdx, m3AssignIdx + 2500) : "";
 expectBool("#615 source pin: isInfra feeds decideM3 (isAgentInfra: isInfra) — not an exemption guard", afterM3.includes("isAgentInfra: isInfra"), true);
+
+// ── #618/#621 source pins: the write gate must resolve the TARGET checkout ─
+// The target-aware mechanism cannot be a behavioral pin from here (index.ts is
+// not importable — the guardDecision mirror above is the behavior pin), so
+// pin the index.ts MECHANISM at the source level (comment-stripped): the old
+// worktree-session full early-return (the epic-529 blanket allow that let
+// worktree sessions write hub tracked files) must be GONE from the write/edit
+// tail, and the target-aware classifier must be wired in. TRIPWIRE, NOT PROOF
+// — same caveat as the #615 pins above (a deliberate reverter can delete
+// these); they catch accidental/merge-confusion reverts.
+expectBool("#618 source pin: old blanket worktree-session write early-return is gone (no early isWorktreeCwdWrite return in the write tail)", !pinSrc.includes("if (isWorktreeCwdWrite(resolve(process.cwd()))) {"), true);
+expectBool("#618 source pin: the session-cwd insideProject scoping of the old write gate is gone", !pinSrc.includes("const insideProject"), true);
+expectBool("#618 source pin: write gate imports resolveTargetCheckout", pinSrc.includes("resolveTargetCheckout"), true);
+expectBool("#618 source pin: write gate classifies the target checkout (_checkoutOf)", pinSrc.includes("_checkoutOf(tgtReal)"), true);
+expectBool("#618 source pin: cross-cwd tracked-hub block wired (_targetTrackedAt)", pinSrc.includes("_targetTrackedAt(tgtCheck.top, tgtReal)"), true);
+expectBool("#618 source pin: cross-cwd block reason helper exists (_hubTargetWriteBlockReason)", pinSrc.includes("_hubTargetWriteBlockReason"), true);
+expectBool("#621 source pin: no isAgentInfraRepo gate in the write tail (stays ONE M3 ceremony call site)", infraCallSites === 1, true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
 function expectBranches(command, expectedArray) {
