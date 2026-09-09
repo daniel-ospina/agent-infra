@@ -1475,13 +1475,11 @@ dexpect("#543: branch list → no delete capture", `git branch -a`, { branchStat
     // (ownX doubles as the owned-dst fixture — it EXISTS but is only
     // overwrite-allowed when this pid's ownedBranches set contains it):
     execSync("git branch victim && git branch victim2 && git branch feat/other && git branch ownX", { cwd: r598, stdio: "ignore" });
-    // second repo (r2): a `--git-dir=<r2>` mutation from the session cwd runs
-    // IN r2 — its refs are the ones a rename would clobber. The gitDir-
-    // anchored probe must see r2's r2only branch (r598 does NOT have it, so a
-    // cwd-repo probe would read free → reBaseline), and the baseline (built
-    // from eff = r2) matches r2's repoKey so the rename arm's repo-scope gate
-    // lets the probe decide (round-2 reviewer B P4 call-site pin: dropping the
-    // muEff.gitDir arg at the index.ts call site would fail exactly this pin).
+    // second repo (r2): the gitDir-anchored probe's load-bearing geometry — a
+    // rename whose RESOLVED repo (gitDir) is the session's baseline repo while
+    // the shell sits elsewhere must be checked against the baseline repo's
+    // refs. r2only exists ONLY in r2 (a cwd-repo probe from r598 reads free →
+    // reBaseline, so these pins discriminate the muEff.gitDir pass-through).
     execSync(`git init -q -b feat/1 "${p598}/r2"`, { stdio: "ignore" });
     const r2 = `${p598}/r2`;
     execSync("git config user.email t@t && git config user.name t", { cwd: r2, stdio: "ignore" });
@@ -1492,16 +1490,16 @@ dexpect("#543: branch list → no delete capture", `git branch -a`, { branchStat
     // → session repo) → probe the rename DST (localBranchExists !== false on
     // the mutation's repo — a failed probe fails closed to exists) → decideM3
     // with ownedBranches (this pid's set, repo-scoped).
-    const m3idx = (cmd, owned = []) => {
+    const m3idx = (cmd, owned = [], sessCwd = r598) => {
       const d = classifyGitCommandDetailed(cmd);
       if (!d.branchState) return { skip: true };
       const op = sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs);
       if (!op || op.op === "other") return { skip: true };
       const eff = d.stateVerb && d.stateInvVisible === false
-        ? sharedResolveEffectiveRepo("git status", r598)
+        ? sharedResolveEffectiveRepo("git status", sessCwd)
         : (d.stateVerb && d.stateHints
-          ? sharedResolveRepoFromInv(d.stateHints, r598)
-          : sharedResolveEffectiveRepo(cmd, r598, d.verb, 0));
+          ? sharedResolveRepoFromInv(d.stateHints, sessCwd)
+          : sharedResolveEffectiveRepo(cmd, sessCwd, d.verb, 0));
       if (!eff) return { noRepo: true };
       const dstExists = (op.op === "rename" && op.to != null)
         ? sharedLocalBranchExists(eff.effectiveCwd, op.to, eff.gitDir) !== false
@@ -1536,7 +1534,17 @@ dexpect("#543: branch list → no delete capture", `git branch -a`, { branchStat
     const b10 = m3idx(`git branch -m feat/1 rnS`);
     expectBool("#598: soft -m <baseline> <free-name> → reBaseline (soft rename unchanged)", b10?.reBaseline === "rnS" && !b10?.block, true);
     const b11 = m3idx(`git --git-dir="${r2}/.git" branch -M feat/1 r2only`);
-    expectBool("#598: --git-dir=<other> rename onto <other>'s existing dst → M3 BLOCK (gitDir-anchored probe)", b11?.block === true, true);
+    expectBool("#598: --git-dir=<other> rename — adapter passes muEff.gitDir to the probe (block)", b11?.block === true, true);
+    // Round-3 reviewer B P2: the REACHABLE index.ts geometry for the gitDir
+    // anchor — session baseline repo = r2 (sessCwd r2), shell -C's into r598
+    // while --git-dir stays at r2 (a `cd`-into-foreign-repo + --git-dir-back
+    // spell). muEff.repoKey == baseline.repoKey (r2) so the repo-scope gate
+    // passes and the PROBE decides; a cwd-anchored probe (r598 — no r2only)
+    // would read free → reBaseline and let the clobber through.
+    const b13 = m3idx(`git -C "${r598}" --git-dir="${r2}/.git" branch -M feat/1 r2only`, [], r2);
+    expectBool("#598: -C <foreign> --git-dir=<baseline> rename onto baseline-repo-only dst → BLOCK (gitDir anchor load-bearing)", b13?.block === true, true);
+    const b13b = m3idx(`git branch -M feat/1 freeZ`, [], r2);
+    expectBool("#598: control — baseline-repo free-name rename from the session cwd → reBaseline", b13b?.reBaseline === "freeZ" && !b13b?.block, true);
     const b12 = m3idx(`git branch -M feat/1 freeY`);
     expectBool("#598: control — same-repo free-name rename still reBaselines (no over-block from the r2 fixture)", b12?.reBaseline === "freeY" && !b12?.block, true);
   } catch (e) {

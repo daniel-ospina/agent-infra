@@ -135,9 +135,12 @@ export function readBranchState(cwd, gitDir) {
  * checked against the cwd repo's refs (round-1 reviewer P2).
  * `git rev-parse --verify --quiet` exits 0 when the ref resolves; when it
  * exits 1 the ref does NOT resolve — that covers both a cleanly ABSENT ref
- * AND a broken-present one (a dangling symref or a ref whose target object is
- * missing — both make rev-parse exit 1 while git branch -M would still
- * clobber the ref file rc 0). The rc-1 fallback checks the loose-ref file
+ * AND a broken-present loose ref (a DANGLING symref, or loose content that is
+ * not a valid object name — both make rev-parse exit 1 while git branch -M
+ * would still clobber the ref file rc 0). NOTE: a loose ref holding a VALID
+ * sha whose object is missing still RESOLVES (rc 0 → EXISTS via the primary
+ * probe — the safe direction), so only the dangling-symref / invalid-content
+ * forms reach the rc-1 fallback. The rc-1 fallback checks the loose-ref file
  * (git rev-parse --git-path refs/heads/<name> + existsSync) so a
  * broken-but-present foreign ref is treated as EXISTS (block), never as a
  * free name (round-2 reviewer P2 — pre-fallback a dangling symref dst read
@@ -166,11 +169,11 @@ export function localBranchExists(cwd, name, gitDir) {
   if (rc === true) return true;
   if (rc !== 1) return null; // any other exit = unknown (callers map null fail-CLOSED)
   // rc 1: the ref does not RESOLVE. Distinguish a cleanly ABSENT ref from a
-  // broken-but-present one (dangling symref / corrupt target object — both
-  // make rev-parse --verify exit 1 while git branch -M would still clobber
-  // the ref rc 0) via the loose-ref file, which exists for every loose ref
-  // whether or not it resolves (--git-path only maps the path; packed refs
-  // resolved rc 0 above and never reach here).
+  // broken-but-present one (dangling symref, or loose content that is not a
+  // valid object name — a valid-sha missing-object ref resolves rc 0 above)
+  // via the loose-ref file, which exists for every loose ref whether or not it
+  // resolves (--git-path only maps the path; packed refs resolved rc 0 above
+  // and never reach here).
   try {
     const refPath = execFileSync("git", [...prefix, "rev-parse", "--git-path", `refs/heads/${name}`], {
       encoding: "utf-8", cwd, timeout: 5000,
@@ -921,10 +924,16 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     // baseline NAME must not re-baseline the session or consult the baseline
     // repo's owned set against another repo's refs (cross-clone name-collision
     // false-ownership; index.ts also probes — and _markOwned writes — only
-    // within the mutation's own repo).
+    // within the mutation's own repo). Round-3 review fold-in: the arm also
+    // requires from != null — a DETACHED session (currentBranch null, and a
+    // baseline recorded while detached has branch null) makes the null-null
+    // substitution collide with a detached 1-pos rename, which git REFUSES rc
+    // 128 ("cannot rename the current branch while not on any"); re-baselining
+    // onto a name git never creates would leave a phantom baseline.
     const from = branchOp.from ?? currentBranch;
     if (
-      baseline
+      from != null
+      && baseline
       && baseline.repoKey != null
       && baseline.repoKey === repoKey
       && from === baseline.branch

@@ -566,6 +566,12 @@ ok("M3 #598: own-baseline rename onto existing dst in NON-infra → still blocks
 // repo's refs (cross-clone false-ownership on a clobber dst).
 ok("M3 #598: rename in a DIFFERENT repo (repoKey mismatch) → blocks (no cross-clone reBaseline)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/new" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: otherKey, renameDstExists: false }); return d?.block === true; })());
 ok("M3 #598: cross-clone rename onto EXISTING dst → blocks (owned set of the other repo never consulted)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", repoKey: otherKey, renameDstExists: true, ownedBranches: new Set(["victim"]) }); return d?.block === true; })());
+// Round-3 reviewer B P2: a DETACHED session (baseline.branch null recorded
+// while detached + currentBranch null) makes the 1-pos from-substitution
+// collide null === null and enter the own-baseline arm — git REFUSES a
+// detached rename rc 128, so re-baselining onto the name git never creates
+// would leave a phantom baseline. The arm now requires from != null.
+ok("M3 #598: detached 1-pos rename (baseline.branch null, currentBranch null) → blocks (no phantom reBaseline)", (() => { const d = decideM3({ branchOp: { op: "rename", from: null, to: "freeX" }, isAgentInfra: true, baseline: { repoKey: mainKey, branch: null }, currentBranch: null, repoKey: mainKey, renameDstExists: false }); return d?.block === true; })());
 // ── localBranchExists tri-state probe ──────────────────────────────────────
 ok("M3 #598: localBranchExists existing branch → true", localBranchExists(MAIN, "side") === true, String(localBranchExists(MAIN, "side")));
 ok("M3 #598: localBranchExists free name → false", localBranchExists(MAIN, "no-such-598") === false, String(localBranchExists(MAIN, "no-such-598")));
@@ -640,6 +646,11 @@ ok("M3 #598: localBranchExists empty name → null", localBranchExists(MAIN, "")
   ok("M3 #598 real-git: git -M current → dangling-symref dst clobbers rc 0 (why EXISTS must block)", dangleClobber.status === 0, String(dangleClobber.status));
   writeFileSync(join(D, ".git", "refs", "heads", "corruptT"), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n");
   ok("M3 #598 real-git: corrupt-target loose ref resolves (rc 0) → reads EXISTS", localBranchExists(D, "corruptT") === true, String(localBranchExists(D, "corruptT")));
+  // A loose ref whose CONTENT is not a valid object name is the other rc-1
+  // broken-present form (only dangling symrefs and this reach the fallback —
+  // the fallback-discriminating pin: pre-fallback this read FREE → allow).
+  writeFileSync(join(D, ".git", "refs", "heads", "garbageT"), "not-a-valid-sha\n");
+  ok("M3 #598 real-git: invalid-content loose ref reads EXISTS (rc-1 loose-ref fallback)", localBranchExists(D, "garbageT") === true, String(localBranchExists(D, "garbageT")));
 }
 
 // ── decideM3 #376: ceremony return-to-original-baseline carve-out ──────────
