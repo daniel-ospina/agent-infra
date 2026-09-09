@@ -283,7 +283,7 @@ comment), but the corruption is author-invisible: no diagnostic, no warning,
 and the skill loads — only the DESCRIPTION is wrong.
 
 ### Evidence
-- Probe (pi v0.84.3, yaml 2.9.0): `description: foo # bar` → `loadSkillsFromDir`
+- Probe (pi v0.84.3, yaml 2.9.0; re-verified pi v0.85.1 — zero drift): `description: foo # bar` → `loadSkillsFromDir`
   loads the skill with `description: "foo"`. `foo#bar` (no space) → intact
   `"foo#bar"`. `foo #bar` (space before #) → `"foo"`.
 - Whitespace-precedence rule verbatim: ` #` preceded by whitespace starts a
