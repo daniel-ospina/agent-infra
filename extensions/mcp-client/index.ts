@@ -32,7 +32,7 @@ import type {
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import { execSync } from "node:child_process";
 import { existsSync, realpathSync, mkdirSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { isPrintMode } from "../shared/print-mode.js";
@@ -81,7 +81,7 @@ async function writeStoreJson(dir: string, file: string, data: unknown): Promise
 async function deleteStoreFile(dir: string, file: string): Promise<void> {
   try {
     const fpath = join(dir, file);
-    await import("node:fs/promises").then((m) => m.rm(fpath, { force: true }));
+    await rm(fpath, { force: true });
   } catch {
     /* best effort */
   }
@@ -1128,16 +1128,18 @@ export class McpServerManager {
             content: [{ type: "text" as const, text: `Server '${serverName}' is not connected. Run mcp_load first if it is lazy, or check mcp_catalog.` }],
           };
         }
-        // Use client's transport if it implements finishAuth.
-        // The StreamableHTTPClientTransport has a finishAuth method.
+        // Use the client's transport if it implements finishAuth.
+        // The StreamableHTTPClientTransport has a finishAuth method (the
+        // SDK's Client itself does NOT — review P1, PR #604).
         const client = conn.client as any;
-        if (typeof client?.finishAuth !== "function") {
+        const transport = client?.transport as any;
+        if (typeof transport?.finishAuth !== "function") {
           return {
             content: [{ type: "text" as const, text: `Server '${serverName}' does not support OAuth finish-auth (transport may not be OAuth-capable).` }],
           };
         }
         try {
-          await client.finishAuth(authCode);
+          await transport.finishAuth(authCode);
           // After finishAuth, clear the pending auth state on the provider.
           if (conn.oauthProvider) {
             conn.oauthProvider.clearPendingAuth();
