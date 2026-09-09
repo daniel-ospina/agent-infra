@@ -69,10 +69,10 @@ function extractJson(text: string): any | null {
 const SKIP_ENV = {
   LOOP_ENFORCER_DISABLED: "1", VISION_INTERCEPTOR_DISABLED: "1",
   SKILL_ENFORCER_DISABLED: "1", SLACK_BRIDGE_DISABLE: "1",
-  // #265: AGENT/ELDATO_ALLOW_MAIN_EDITS is NO LONGER set by subAgentEnv; it is
-  // kept here as an EXPLICIT fixture choice (this spawned sub-agent only reads
-  // a file in tmp/, outside any repo — the guard never sees a main checkout).
-  ELDATO_ALLOW_MAIN_EDITS: "1",
+  // #617: AGENT/ELDATO_ALLOW_MAIN_EDITS is NOT set by subAgentEnv (the #265 env
+  // pivot is in force) and is deliberately absent here too — this spawned
+  // sub-agent only reads a file in tmp/, outside any repo, so it needs no hatch
+  // (and the fixture now mirrors a real unhatched task child).
 };
 
 // Test data — use cwd-relative path the sub-agent can reach

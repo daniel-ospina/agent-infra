@@ -56,16 +56,16 @@ async function runAll(tests: Array<() => Promise<void>>) {
 const tests: Array<() => Promise<void>> = [];
 
 section("#265 env pivot wiring");
-tests.push(test("subAgentEnv sets dual-support ALLOW_MAIN_EDITS (ELDATO + AGENT) with no ELDATO_SKIP_VGATE injection", async () => {
+tests.push(test("subAgentEnv does NOT set ALLOW_MAIN_EDITS (either variant) and injects no ELDATO_SKIP_VGATE (#617)", async () => {
   const src = readFileSync(join(process.cwd(), "extensions", "builtin-tools", "index.ts"), "utf-8");
   const start = src.indexOf("const subAgentEnv");
   ok(start !== -1, "subAgentEnv block not found");
   const blockEnd = src.indexOf("\n};", start);
   const block = src.slice(start, blockEnd === -1 ? start + 4000 : blockEnd);
-  // #7549 dual-support: the #825 verified-file-registry bridge re-enabled the
-  // hatch — sub-agents get BOTH the ELDATO_ and AGENT_ ALLOW_MAIN_EDITS flags.
-  ok(block.includes("ELDATO_ALLOW_MAIN_EDITS"), "ELDATO_ALLOW_MAIN_EDITS set for sub-agents (dual-support, #7549)");
-  ok(block.includes("AGENT_ALLOW_MAIN_EDITS"), "AGENT_ALLOW_MAIN_EDITS set for sub-agents (dual-support, #7549)");
+  // #617: the #265 env pivot is now in force — sub-agents run the SAME
+  // main-worktree-guard as their controller (M4/M2/M3 apply). No forced hatch.
+  ok(!/ELDATO_ALLOW_MAIN_EDITS\s*:/.test(block), "no ELDATO_ALLOW_MAIN_EDITS assignment in subAgentEnv (#617)");
+  ok(!/AGENT_ALLOW_MAIN_EDITS\s*:/.test(block), "no AGENT_ALLOW_MAIN_EDITS assignment in subAgentEnv (#617)");
   // #825: VGATE stays ACTIVE for sub-agents — assert the ASSIGNMENT is absent
   // (comments legitimately mention the name, so bare includes() is not enough).
   ok(!/ELDATO_SKIP_VGATE\s*:/.test(block), "no ELDATO_SKIP_VGATE assignment in subAgentEnv (#825)");
