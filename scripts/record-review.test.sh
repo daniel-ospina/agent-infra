@@ -500,6 +500,22 @@ else
     ok "9.10 no rerun without a posted marker"
 fi
 
+# 9.11 gh-200 whose payload fails the LOCAL jq stage (shape drift, broken
+#      jq): the parse failure warns loudly and skips — record saved, rc 0,
+#      no rerun. (9.8 pins the transport-failure stage; this pins the parse
+#      stage, which a bare `2>/dev/null || true` or a dropped `if !` guard
+#      would silently swallow or turn into an errexit kill after the save.)
+STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
+STUB_CHECK_RUNS='{"check_runs": [BROKEN' AI_REVIEW_GATE_KEY="testkey" run_record_verdict clean "daniel-ospina/agent-infra" 424326
+[ "$RECORD_RC" = "0" ] && ok "9.11 unparseable payload fails soft (rc 0)" || bad "9.11 unparseable payload fails soft (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424326.json" ] && ok "9.11 record written despite parse failure" || bad "9.11 record written despite parse failure"
+assert_contains "$RECORD_ERR" "could not parse the check-runs payload" "9.11 parse failure warns loudly on stderr"
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.11 no rerun on parse failure (log: $(cat "$LOG"))"
+else
+    ok "9.11 no rerun on parse failure"
+fi
+
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
