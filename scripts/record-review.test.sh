@@ -44,8 +44,11 @@ SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 #                                   file ${STUB_LABELS_DIR}/<issue-num> when it
 #                                   exists; exit 1 when STUB_LABELS_FAIL=1
 #   check-runs  (URL has /check-runs) → {"check_runs": ${STUB_CHECK_RUNS:-[]}}
-#                                   (RAW payload — the script applies its own
-#                                   local jq; exit 1 when STUB_CHECK_RUNS_FAIL=1)
+#                                   (RAW payload for ANY /check-runs call —
+#                                   ignores the script's -f check_name filter,
+#                                   so the LOCAL belt name filter in the
+#                                   script stays genuinely exercised; exit 1
+#                                   when STUB_CHECK_RUNS_FAIL=1)
 #   PATCH (-X PATCH … --input -)    → swallow stdin; exit 1 when
 #                                     STUB_PATCH_FAIL=1
 #   POST rerun (-X POST … /rerun)   → swallow stdin (201); exit 1 when
@@ -406,15 +409,18 @@ else
 fi
 grep -qF -- "-X PATCH" "$LOG" && ok "9.3 marker still posted" || bad "9.3 marker still posted"
 
-# 9.4 A failed run of a DIFFERENT check name is never re-run (name filter).
+# 9.4 A failed run of a DIFFERENT check name is never re-run (name filter) —
+#     and the zero-match case fires the loud rename hint on stderr: a wrong
+#     AI_REVIEW_GATE_CHECK_NAME must not read as "nothing to remediate".
 STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
 STUB_CHECK_RUNS='[{"name":"other-gate","status":"completed","conclusion":"failure","id":779}]' \
-AI_REVIEW_GATE_KEY="testkey" run_record "daniel-ospina/agent-infra" 424320
+AI_REVIEW_GATE_KEY="testkey" run_record_verdict clean "daniel-ospina/agent-infra" 424320
 if grep -qF -- "actions/jobs/" "$LOG"; then
     bad "9.4 foreign check name not re-run (log: $(cat "$LOG"))"
 else
     ok "9.4 foreign check name not re-run"
 fi
+assert_contains "$RECORD_ERR" "no check run named 'ai-review-gate'" "9.4 zero-match fires the loud rename hint"
 
 # 9.5 Rerun API refusal → fail-soft: record saved, exit 0, loud warning.
 STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \

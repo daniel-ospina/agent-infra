@@ -361,7 +361,10 @@ ${MARKER}"
     # The commit check-runs payload is read RAW so a query failure is
     # distinguishable from "no red run" (the #405 convention: a transient
     # API failure must warn loudly and skip, never read as nothing-to-do).
-    if GATE_JSON="$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" 2>/dev/null)"; then
+    # The server-side check_name filter keeps the payload to the gate's own
+    # runs (a commit can carry >100 check runs across a big CI matrix — an
+    # unfiltered page could push the true newest gate run out of view).
+    if GATE_JSON="$(gh api "repos/$REPO/commits/$SHA/check-runs" -f check_name="$GATE_CHECK" -f per_page=100 2>/dev/null)"; then
       # Newest run for the gate check name across ALL statuses; remediate only
       # when that newest run is COMPLETED and red (failure/cancelled/
       # timed_out/action_required — success/skipped/neutral satisfy the
@@ -370,7 +373,8 @@ ${MARKER}"
       # itself fired, or the `edited` run a fresh PATCH just started) is
       # already re-evaluating the body, and re-running the older completed
       # red behind it would start a second job whose per-PR cancel-in-progress
-      # cancels the in-flight fresh run — forever. $gate comes via --arg — no
+      # cancels the in-flight fresh run — forever. The local name filter is a
+      # belt over the server filter, and $gate arrives via --arg — no
       # jq-program interpolation.
       if ! NEWEST_RED_ID="$(printf '%s' "$GATE_JSON" \
         | jq -r --arg gate "$GATE_CHECK" \
@@ -379,16 +383,20 @@ ${MARKER}"
         # A gh-200 whose body fails the jq stage is its own failure class
         # (payload shape change, broken jq) — warn loudly, never read as
         # "no red run" (#405 applies to every stage of the read).
-        echo "⚠️ could not parse the check-runs payload for $SHA — stale-run re-run skipped; record still saved. Re-run record-review.sh to retry." >&2
+        echo "⚠️ could not parse the check-runs payload for $SHA (check_name=$GATE_CHECK) — stale-run re-run skipped; record still saved. Re-run record-review.sh to retry." >&2
         NEWEST_RED_ID=""
-      else
-        # Loud rename/typo hint: the name matches NO run on the head while
-        # other checks exist — otherwise a wrong AI_REVIEW_GATE_CHECK_NAME
-        # is indistinguishable from "nothing to remediate".
-        NAMED_TOTAL="$(printf '%s' "$GATE_JSON" | jq -r --arg gate "$GATE_CHECK" '[.check_runs[] | select(.name == $gate)] | length' 2>/dev/null || echo 0)"
-        TOTAL_RUNS="$(printf '%s' "$GATE_JSON" | jq -r '.check_runs | length' 2>/dev/null || echo 0)"
-        if [ "$NAMED_TOTAL" = "0" ] && [ "$TOTAL_RUNS" -gt 0 ]; then
-          echo "⚠️ no check run named '$GATE_CHECK' found on $SHA ($TOTAL_RUNS checks total) — verify AI_REVIEW_GATE_CHECK_NAME; stale-run re-run skipped" >&2
+      elif [ "$(printf '%s' "$GATE_JSON" | jq -r --arg gate "$GATE_CHECK" '[.check_runs[] | select(.name == $gate)] | length' 2>/dev/null || echo 0)" = "0" ]; then
+        # The gate has NO runs on this head (the server already filtered to
+        # the name, so an empty payload means the workflow never ran here OR
+        # AI_REVIEW_GATE_CHECK_NAME is wrong). One cheap unfiltered count
+        # query tells the two apart — other checks exist → loud rename hint
+        # (a wrong override must never read as "nothing to remediate");
+        # no checks at all → stay silent (nothing has run yet).
+        if ALL_JSON="$(gh api "repos/$REPO/commits/$SHA/check-runs" -f per_page=1 2>/dev/null)"; then
+          TOTAL_RUNS="$(printf '%s' "$ALL_JSON" | jq -r '(.total_count // (.check_runs | length))' 2>/dev/null || echo 0)"
+          if [ "$TOTAL_RUNS" -gt 0 ]; then
+            echo "⚠️ no check run named '$GATE_CHECK' found on $SHA ($TOTAL_RUNS checks total) — verify AI_REVIEW_GATE_CHECK_NAME; stale-run re-run skipped" >&2
+          fi
         fi
       fi
     else
