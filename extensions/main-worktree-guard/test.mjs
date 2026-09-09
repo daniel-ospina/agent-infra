@@ -265,6 +265,18 @@ try {
   }
 }
 
+// ── #615 source pins: index.ts removals cannot silently regress ────────────
+// index.ts is not importable in tests (pi-extension TS), so pin the REMOVALS
+// at the SOURCE level: the #99 carve-out strings must not reappear, and the
+// only remaining isAgentInfraRepo( call site must be the M3 ceremony flag.
+const guardIndexSrc = readFileSync(
+  join(PROJECT_CWD, "extensions", "main-worktree-guard", "index.ts"), "utf8");
+for (const banned of ["// #99 carve-out", "// #99 write/edit exemption", "Downgraded agent-infra", "isAgentInfraRepo()) return undefined", "isAgentInfraRepo()) return null"]) {
+  expectBool(`#615 source pin: index.ts has no ${JSON.stringify(banned)}`, !guardIndexSrc.includes(banned), true);
+}
+const infraCallSites = (guardIndexSrc.match(/isAgentInfraRepo\(/g) ?? []).length;
+expectBool("#615 source pin: only the M3 ceremony isAgentInfraRepo( call remains (index.ts)", infraCallSites === 1, true);
+
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
 function expectBranches(command, expectedArray) {
   const got = extractPushDeleteBranch(command);

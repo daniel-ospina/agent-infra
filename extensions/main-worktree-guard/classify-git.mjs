@@ -5333,7 +5333,7 @@ export function classifyUntrackedWip(porcelain) {
  * Resolves the MAIN checkout via git-common-dir semantics (getMainCheckoutBranch
  * pattern) so it works from a worktree too (D5) — pass the session cwd.
  * @param {string} cwd
- * @param {{ skipWorktree?: boolean, env?: object }} [opts]
+ * @param {{ skipWorktree?: boolean }} [opts]
  * @returns {{ disorder: string|null, branch: string|null }}
  */
 export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
