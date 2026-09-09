@@ -10,10 +10,12 @@
 #   migration      → supersedes a legacy <PR>.json that belongs to this repo
 #   collision-safe → does NOT delete a legacy <PR>.json from ANOTHER repo
 #   repo-less      → legacy <PR>.json (backward compat, no repo field)
-#   #633 stale-run → a re-record on an already-marker'd body re-runs each
-#                    completed-FAILURE gate check run on the head (so the
-#                    red rollup row is replaced by a SUCCESS attempt);
-#                    fail-soft when nothing to re-run / the API refuses
+#   #633 stale-run → a re-record on an already-marker'd body re-runs the
+#                    head's NEWEST completed-RED gate check run (singular,
+#                    id-for-id with the rerun POST — the recency/livelock
+#                    guards in record-review.sh decide it), so the stale red
+#                    rollup row is replaced by a fresh attempt; fail-soft
+#                    when nothing to re-run / the API refuses
 
 set -euo pipefail
 
