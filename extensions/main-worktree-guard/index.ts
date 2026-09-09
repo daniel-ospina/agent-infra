@@ -58,7 +58,15 @@
 //     main-rooted session writing another hub via bash is gated too — review
 //     fold-in); same-vs-cross-checkout is judged by the SESSION's checkout,
 //     never a command `cd`-site; cross-checkout tracked AND `.git/`-metadata
-//     writes block regardless of hub state. Worktree sessions still write
+//     writes block regardless of hub state. Cycle-2 fold-ins: main checkouts
+//     NESTED under the session's own checkout tree (submodules / vendored /
+//     private copies) are not shared hubs and are not frozen; `.git/`-metadata
+//     writes freeze in every state except a same-rooted CLEAN main (never a
+//     build side-effect); a TTL marker bypasses the cross-checkout bash gate
+//     exactly like the write/edit route (M4 D3's disordered-own-hub freeze
+//     stays); the write/edit gate also blocks cross-cwd overwrites of EXISTING
+//     untracked hub files (another session's hub WIP) — only genuinely NEW
+//     files are additive. Worktree sessions still write
 //     their OWN worktree freely — its targets resolve to that worktree's
 //     checkout, never a main checkout. Main-ness and worktree-ness are judged
 //     STRUCTURALLY (gitdir vs commondir realpaths — the path-substring test
@@ -125,6 +133,7 @@ let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null =
 // import NEVER false-blocks — the write gates degrade to today's behavior.
 let resolveTargetCheckout: (targetPath: string, cwd?: string) => { top: string; isMain: boolean } | null = () => null;
 let trackedRelsIn: (repoTop: string, rels: string[]) => string[] = () => [];
+let hasDotGitAncestor: (p: string) => boolean = () => false;
 let extractScriptPath: (command: string) => string | null = () => null;
 let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string) => "allow" | "block" = () => "allow";
 // #350: hub-WIP hygiene helpers (warn-only). Fail-safe defaults: inert
@@ -164,7 +173,7 @@ try {
      extractScriptPath, scriptGitVerdict, evaluateHubGateWithTargets,
      commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern,
      extractBashWriteTargets, classifyUntrackedWip, branchDeleteAllowance, newFileWriteCollisionFree,
-     bashWriteTargetsResolved, resolveTargetCheckout, trackedRelsIn } =
+     bashWriteTargetsResolved, resolveTargetCheckout, trackedRelsIn, hasDotGitAncestor } =
     await import("./classify-git.mjs"));
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
@@ -470,6 +479,29 @@ function _targetTrackedAt(top: string, tgtReal: string): boolean {
   }
 }
 
+// Cycle-2 F4-a: a hub whose `.git` is a SYMLINK to an external gitdir loses
+// its `.git` path segment once realpath'd — the realpath-based classify then
+// finds no checkout (the external gitdir's ancestors are not a work tree) and
+// the target looks "outside any git repo". Test the UNREALPATH'd SPELLING
+// too (cheap `.git`-segment gate first, then a RAW resolveTargetCheckout —
+// never the realpath cache, which would destroy the segment). Returns the
+// owning MAIN + the .git-metadata rel (exact ".git" pointer or ".git/…"),
+// or null.
+function _gitMetaSpellingTop(rawAbs: string): { top: string; rel: string } | null {
+  try {
+    if (!hasDotGitAncestor(rawAbs)) return null;
+    const ck = resolveTargetCheckout(rawAbs);
+    if (!ck || !ck.isMain) return null;
+    const rel = rawAbs.startsWith(ck.top + "/")
+      ? rawAbs.slice(ck.top.length).replace(/^[/\\]+/, "")
+      : "";
+    if (!rel || (rel !== ".git" && !rel.startsWith(".git/"))) return null;
+    return { top: ck.top, rel };
+  } catch {
+    return null;
+  }
+}
+
 // #618/#621: the write/edit block reason for a cross-cwd write into a hub
 // MAIN checkout (the session is NOT rooted in that main — worktree session,
 // foreign/non-git cwd, or another repo's session). Names the TARGET repo's
@@ -478,7 +510,7 @@ function _targetTrackedAt(top: string, tgtReal: string): boolean {
 // a cross-cwd write into them is the same deliberate-hub-write vector
 // (adversarial-review F4).
 function _hubTargetWriteBlockReason(rel: string, top: string, wipHint: string): string {
-  const gitMeta = rel.startsWith(".git/");
+  const gitMeta = rel === ".git" || rel.startsWith(".git/");
   return [
     `⛔ File write to a hub ${gitMeta ? "git-metadata file" : "tracked file"} blocked (${rel}).`,
     ...(wipHint ? [wipHint] : []),
@@ -694,7 +726,7 @@ function _maybeWarnBashWrite(command: string) {
 // (adversarial-review F3). Fail-safe: any git/parse error → null (never
 // false-block). One bounded `git ls-files` per distinct target top for all
 // its candidates.
-function _hubBashTrackedWrite(command: string, sessionDisorder: string | null): { resolvedPath: string; rel: string } | null {
+function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, markerOn: boolean): { resolvedPath: string; rel: string; kind?: "script-depth" } | null {
   try {
     if (!classifierLoaded) return null;
     const base = resolve(process.cwd());
@@ -715,36 +747,65 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null): 
     // comparison demoted `cd <hub> && echo x > AGENTS.md` to "same-checkout"
     // and let a clean hub's tracked file be overwritten from any cwd).
     const sessionCheck = _checkoutOf(base);
+    const sessionTop = sessionCheck ? sessionCheck.top : null;
     const sessionOwnHub = sessionCheck && sessionCheck.isMain ? sessionCheck.top : null;
     const grouped = new Map<string, { tPath: string; rel: string }[]>();
-    let gitInternalHit: { resolvedPath: string; rel: string } | null = null; // cross-checkout write into a hub's .git/ metadata
+    let gitInternalHit: { resolvedPath: string; rel: string } | null = null; // a hub-main .git-metadata write (hooks/config/pointer)
     // Classify ONE write candidate (top-level write or script-content write):
     // resolve its containing checkout; skip non-main (worktree/non-git)
-    // targets; same-checkout candidates gate only on the SESSION's hub
-    // disorder (== that main's — the session IS rooted there); cross-checkout
-    // candidates (session shell NOT rooted in the target main) are deliberate
-    // hub writes — any tracked target blocks, and so does any target under
-    // the hub's `.git/` (never tracked — must still freeze). Candidates that
-    // pass are grouped per top so the tracked query stays ONE bounded
-    // `git ls-files` per repo.
+    // targets and any main checkout NESTED under the session's own tree (a
+    // private repo / submodule / vendored copy the session owns — not a
+    // shared-hub write; cycle-2 correctness F1b); same-checkout candidates
+    // gate only on the SESSION's hub disorder (== that main's — the session IS
+    // rooted there); cross-checkout candidates (session shell NOT rooted in
+    // the target main) are deliberate hub writes — any tracked target blocks,
+    // and so does any `.git/`-metadata target (never index-tracked — must
+    // still freeze). Under an active TTL marker the gate keeps ONLY M4 D3's
+    // disordered-OWN-hub freeze (parity with the write/edit route, whose #618
+    // gate the marker return precedes; cycle-2 P2). Candidates that pass are
+    // grouped per top so the tracked query stays ONE bounded `git ls-files`.
     const classify = (t: { resolvedPath?: string; cwd?: string }) => {
       const tPath = t.resolvedPath;
       if (!tPath) return;
       const tReal = _realpathNearest(tPath);
       const ck = _checkoutOf(tReal);
-      if (!ck || !ck.isMain) return; // worktree/foreign non-main target — isolated
+      if (!ck || !ck.isMain) {
+        // Symlinked/external-gitdir spelling: realpath resolved a symlinked
+        // `.git` dir to an EXTERNAL gitdir whose ancestors are no work tree,
+        // so the realpath classify found nothing — but the SPELLING
+        // (`<hub>/.git/hooks/pre-commit`) still carries the `.git` segment and
+        // classifies to the owning main (cycle-2 F4-a). Test it before
+        // declaring the target isolated.
+        const meta = _gitMetaSpellingTop(tPath);
+        if (meta) { gitInternalHit = { resolvedPath: tPath, rel: meta.rel }; }
+        return;
+      }
       const rel = tReal.slice(ck.top.length).replace(/^[/\\]+/, "");
       if (!rel || tReal === ck.top) return;
+      // A main checkout strictly NESTED under the session's own checkout tree
+      // is the session's private working subtree (never a shared hub whose
+      // other sessions sit elsewhere) — the cross-checkout freeze does not
+      // reach inside the session's own tree (cycle-2 correctness F1b).
+      if (sessionTop && sessionTop !== ck.top && ck.top.startsWith(sessionTop + "/")) {
+        return;
+      }
       const sameCheckout = sessionOwnHub !== null && sessionOwnHub === ck.top;
-      if (sameCheckout) {
-        if (sessionDisorder === null) return; // clean same-checkout main — documented residual (#437)
-      } else if (rel.startsWith(".git/")) {
-        // Cross-checkout write into this main's git-internal metadata: never
-        // an index-tracked file, so the tracked intersect below cannot see it
-        // — block directly (a foreign session planting a hub's
-        // .git/hooks/pre-commit must not be free; adversarial-review F4).
+      // .git-metadata rel (exact ".git" pointer file OR ".git/..." internals):
+      // never index-tracked and never a build side-effect — a same-rooted
+      // CLEAN main is #437-open, every other geometry (cross-checkout any
+      // state, disordered own main — incl. under a TTL marker via M4 D3)
+      // blocks, mirroring the write/edit tool's freeze of the same spelling
+      // (cycle-2 F4 rel-exact + P1).
+      const gitMeta = rel === ".git" || rel.startsWith(".git/");
+      if (markerOn) {
+        if (!sameCheckout) return; // marker bypasses the #618 cross gate (tool parity)
+        if (sessionDisorder === null) return; // clean own main under the marker — open recovery window
+        if (gitMeta) { gitInternalHit = { resolvedPath: tPath, rel }; return; } // M4 D3 freeze
+      } else if (gitMeta) {
         gitInternalHit = { resolvedPath: tPath, rel };
         return;
+      } else if (sameCheckout) {
+        if (sessionDisorder === null) return; // clean same-checkout main — documented residual (#437)
       }
       // reached → disordered-same-checkout OR deliberate cross-checkout: the
       // tracked test decides.
@@ -762,7 +823,12 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null): 
     const scriptToks = (extracted as { scriptToks?: { path: string; cwd: string }[] }).scriptToks ?? [];
     const seenScripts = new Set<string>();
     const pendingScripts = scriptToks.slice();
-    let depthBudget = 8;
+    // 64-iteration budget (was 8): a fan-out of sourced helpers is common, and
+    // a chain deeper than the budget is unverifiable — cycle-2 P2 hardened the
+    // old depth-8 exhaustion (a write at depth ≥9 was never walked) to FAIL
+    // CLOSED (mirror the git-side _unverifiableGitContent doctrine) instead of
+    // silently letting a deep chain's hub write through.
+    let depthBudget = 64;
     while (pendingScripts.length > 0 && depthBudget-- > 0) {
       const st = pendingScripts.shift()!;
       const stKey = `${st.cwd || base}\u0000${st.path}`;
@@ -786,6 +852,14 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null): 
       } catch { /* never false-block */ }
     }
     if (gitInternalHit) return gitInternalHit;
+    if (pendingScripts.length > 0) {
+      // Budget exhausted with script tokens still unprocessed — their write
+      // content is UNVERIFIABLE. Fail closed (the git-side script gate does
+      // the same for unreadable content): a >64-level script chain is
+      // pathological/obfuscated; blocking beats silently letting its hub
+      // write through (cycle-2 P2).
+      return { resolvedPath: base, rel: "script-chain", kind: "script-depth" };
+    }
     if (grouped.size === 0) return null;
     // ONE bounded index query per DISTINCT target top: `git ls-files
     // --error-unmatch` prints exactly the TRACKED rels (exit≠0 when any path
@@ -809,15 +883,27 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null): 
 // cross-checkout write into a hub's `.git/` metadata freezes too; only
 // session-start host env bypasses; a mid-command `export` cannot) plus the
 // sanctioned ways forward (salvage / worktree).
-function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string }): string {
-  const gitMeta = hit.rel.startsWith(".git/");
+function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind?: "script-depth" }): string {
+  if (hit.kind === "script-depth") {
+    return [
+      "⛔ Bash script execution blocked — script chain exceeds the verify budget.",
+      `   A script/source chain deeper than the guard's walk budget was detected;`,
+      `   its writes into hub-main checkouts are UNVERIFIABLE and the guard fails`,
+      `   closed rather than risk a tracked hub file write (cycle-2 P2).`, 
+      `   → Run the shell commands directly (in a worktree), or flatten the chain.`,
+      `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
+      `     override (deliberate solo sessions only).`,
+    ].join("\n");
+  }
+  const gitMeta = hit.rel === ".git" || hit.rel.startsWith(".git/");
   return [
     `⛔ Bash write to a hub ${gitMeta ? "git-metadata file" : "tracked file"} blocked (${hit.rel}).`,
     `   The write target's repo is a shared MAIN checkout (#618/#621) — bash`,
     `   write primitives respect the SAME gate as the write/edit tools: a`,
     `   DELIBERATE cross-checkout write (your session is not rooted in that`,
-    `   repo) freezes regardless of hub state, and a session rooted in a`,
-    `   DISORDERED main freezes on tracked overwrites.`, 
+    `   repo) freezes regardless of hub state, a session rooted in a`,
+    `   DISORDERED main freezes on tracked overwrites, and hub .git-metadata`,
+    `   writes (hooks/, config) freeze in every state but a same-rooted clean main.`,
     `   Untracked/new-file writes stay allowed. Only session-start host env`,
     `   (AGENT_ALLOW_MAIN_EDITS=1) bypasses — a mid-command export cannot.`,
     `   → Work in a worktree of the TARGET repo (using-git-worktrees skill,`,
@@ -1101,8 +1187,13 @@ export default function (pi: ExtensionAPI) {
         // !_sessionIsMainRooted()` guard skipped it because the SESSION's OWN hub
         // was clean. Same-checkout clean-main writes stay free INSIDE the gate
         // (#437's residual — classify returns null), so running unconditionally
-        // costs only the pure string walk on write-free commands.
-        const bashWrite = _hubBashTrackedWrite(command, st.disorder);
+        // costs only the pure string walk on write-free commands. Under an active
+        // TTL marker only M4 D3's disordered-own-hub freeze remains (parity with
+        // the write/edit route, whose #618 gate the marker return precedes — the
+        // marker is an audited solo-session recovery hatch, not a license to
+        // write other hubs).
+        const markerOn = readAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
+        const bashWrite = _hubBashTrackedWrite(command, st.disorder, markerOn);
         if (bashWrite) return { block: true, reason: _hubBashWriteBlockReason(bashWrite) };
         if (st.disorder) {
           // #437 (C): bash writes to TRACKED hub files while the hub is
@@ -1639,13 +1730,23 @@ export default function (pi: ExtensionAPI) {
     // Classify the TARGET's checkout (cached per realpath-normalized path).
     // Not in a git repo, or in a linked WORKTREE → isolated by construction:
     // own worktree, sibling/foreign worktree, /tmp, ~/.pi — free (the old
-    // "outside project" / "worktree session" allows).
+    // "outside project" / "worktree session" allows). Symlinked/external-
+    // gitdir spellings: their realpath loses the `.git` segment, so test the
+    // SPELLING before declaring an unclassified target isolated (cycle-2 F4).
     const tgtReal = _realpathNearest(resolvedTarget);
     const tgtCheck = _checkoutOf(tgtReal);
     if (!tgtCheck || !tgtCheck.isMain) {
+      const meta = _gitMetaSpellingTop(resolvedTarget);
+      if (meta) {
+        return {
+          block: true,
+          reason: _hubTargetWriteBlockReason(meta.rel, meta.top, ""),
+        };
+      }
       return undefined;
     }
     const sessionCheck = _checkoutOf(resolve(process.cwd()));
+    const sessionTop = sessionCheck ? sessionCheck.top : null;
     const sessionOwnsThisMain = !!sessionCheck && sessionCheck.isMain && sessionCheck.top === tgtCheck.top;
     const wipPattern = matchHubWipPattern(targetPath ?? "");
     const wipHint = wipPattern
@@ -1668,24 +1769,55 @@ export default function (pi: ExtensionAPI) {
         ].join("\n"),
       };
     }
+    // A main checkout strictly NESTED under the session's own checkout tree
+    // (private repo / submodule / vendored copy inside the session's work
+    // area) is not a shared hub — the session owns that subtree, so the
+    // cross-checkout freeze does not reach it (cycle-2 correctness F1b; the
+    // real sibling-hub vectors — the GitHub parent dir, other repos' main
+    // checkouts — are never under the session's own tree).
+    if (sessionTop && tgtCheck.top.startsWith(sessionTop + "/")) {
+      return undefined;
+    }
     // Cross-cwd write into a hub main (worktree session / foreign non-git
     // cwd / another repo's session): TRACKED-file overwrites block — the
     // silent-destruction vector (#618 mass-hook rewrite from the GitHub
-    // parent dir; #621 infra-rooted cross-repo leak).
-    // `.git/`-metadata targets (hooks/, config) are NEVER index-tracked, so
-    // the tracked intersect below cannot see them — a cross-cwd write into a
-    // hub's .git is the same deliberate-hub-write vector and blocks too
-    // (adversarial-review F4; resolveTargetCheckout now resolves .git-
-    // internal targets up to the owning main).
+    // parent dir; #621 infra-rooted cross-repo leak). `.git/`-metadata
+    // targets (hooks/, config, the .git pointer file) are NEVER index-tracked
+    // — a cross-cwd write into a hub's .git is the same deliberate-hub-write
+    // vector and blocks too (adversarial-review F4 + cycle-2 rel-exact). An
+    // EXISTING UNTRACKED hub file is also an overwrite, not an additive new
+    // file: cross-session it silently destroys another session's uncommitted
+    // hub WIP, so it blocks (cycle-2 P2); only genuinely NEW files stay free.
     if (targetPath) {
       const rel0 = tgtReal.startsWith(tgtCheck.top + "/")
         ? tgtReal.slice(tgtCheck.top.length + 1)
         : "";
-      if (rel0.startsWith(".git/") || _targetTrackedAt(tgtCheck.top, tgtReal)) {
+      const gitMeta = rel0 === ".git" || rel0.startsWith(".git/");
+      const tracked = _targetTrackedAt(tgtCheck.top, tgtReal);
+      let existsFile = false;
+      try { existsFile = existsSync(tgtReal) && statSync(tgtReal).isFile(); } catch { /* treat as nonexistent */ }
+      if (gitMeta || tracked || existsFile) {
         const rel = rel0 || tgtReal.slice(tgtCheck.top.length).replace(/^[/\\]+/, "") || tgtReal;
+        if (gitMeta || tracked) {
+          return {
+            block: true,
+            reason: _hubTargetWriteBlockReason(rel, tgtCheck.top, wipHint),
+          };
+        }
+        // existing-untracked overwrite: destructive of another session's hub WIP.
         return {
           block: true,
-          reason: _hubTargetWriteBlockReason(rel, tgtCheck.top, wipHint),
+          reason: [
+            `⛔ File write blocked — overwriting an existing UNTRACKED file in a hub main (${rel}).`,
+            ...(wipHint ? [wipHint] : []),
+            `   The target resolves to ${tgtCheck.top} — that repo's shared MAIN checkout`,
+            `   (#618/#621). Cross-session overwrites are destructive: an existing`,
+            `   untracked file in a hub main is another session's uncommitted WIP.`,
+            `   Only genuinely NEW files (additive + visible) are allowed cross-cwd.`,
+            `   → Work in a worktree of that repo: invoke the using-git-worktrees skill.`,
+            `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
+            `     override (deliberate solo sessions only).`,
+          ].join("\n"),
         };
       }
     }

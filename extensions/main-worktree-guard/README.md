@@ -272,7 +272,11 @@ dirty, and trips M4's freeze. Surfaces:
    passing. Relevant where the write is NOT already blocked: NEW-file writes by
    worktree/foreign sessions into a hub via an absolute
    path (target-aware since #618/#621 — the banner fires against the TARGET
-   hub, not the session's own cached main). For main-checkout writes (already blocked), the block reason
+   hub, not the session's own cached main). Cross-cwd writes into a hub main
+   block when they are TRACKED, `.git/`-metadata, or an overwrite of an
+   EXISTING untracked file (another session's uncommitted hub WIP — only
+   genuinely NEW files are additive; cycle-2 P2); genuinely-new files are
+   warned on the WIP patterns. For main-checkout writes (already blocked), the block reason
    now names the amplifier pattern.
 2. **Bash-write GATE for TRACKED files in hub MAIN checkouts (#437 +
    #618/#621):** the gate is TARGET-aware — each write candidate's containing
@@ -292,7 +296,8 @@ dirty, and trips M4's freeze. Surfaces:
    session — whether the path is absolute or reached by `cd`-ing into the
    hub), the write is a DELIBERATE cross-checkout hub write: a TRACKED
    target blocks REGARDLESS of hub state, and so does any target under that
-   main's `.git/` metadata (`.git/hooks/*`, `.git/config` — never
+   main's `.git/` metadata (`.git/hooks/*`, `.git/config`, the `.git`
+   pointer — never
    index-tracked, so a cross-checkout session cannot plant a hub hook) —
    the vectors behind the 2026-09-08
    mass `.husky/pre-commit` rewrite from the GitHub parent dir and the
@@ -301,7 +306,21 @@ dirty, and trips M4's freeze. Surfaces:
    candidates per target repo); hub-equality is realpath-normalized;
    main-vs-worktree is judged STRUCTURALLY (gitdir vs commondir realpaths —
    a main checkout whose path contains a `worktrees` segment is not
-   misread as a linked worktree).
+   misread as a linked worktree), and a symlinked/external `.git` dir is
+   caught by testing the UNREALPATH'd spelling too (cycle-2 F4).
+   Two scoped relaxations (cycle-2 fold-ins): (a) a main checkout strictly
+   NESTED under the session's own checkout tree (a private submodule /
+   vendored / experiment copy inside the session's work area) is NOT a
+   shared hub — the cross-checkout freeze does not reach the session's own
+   tree (the sibling-hub vectors — GitHub-parent foreign cwds, other repos'
+   canonical main checkouts — are never under the session's tree); (b)
+   under an active TTL marker the bash gate keeps only M4 D3's
+   disordered-OWN-hub freeze, mirroring the write/edit route whose #618 gate
+   the marker return precedes (the marker is an audited solo-session hatch).
+   Hub `.git/`-metadata writes block for ANY session in ANY hub state except
+   a same-rooted CLEAN main and the marker's own-main window — hooks/config
+   are never a build side-effect, so the #437 clean-main residual (tracked
+   files only) does not extend to them (cycle-2 P1).
    Block message states the single coherent rule: bash writes respect the same
    hub gate as the tools; only the session-start host env bypasses — a
    mid-command `export` cannot. The gate resolves redirect operands that the

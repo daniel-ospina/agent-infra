@@ -3976,10 +3976,13 @@ export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
 }
 
 // Does any ancestor of `p` (p itself included) carry the exact name `.git`?
-// Drives the git-internal walk in resolveTargetCheckout: a target under a
-// repo's `.git/` metadata dir must keep walking up to the OWNING checkout;
-// a genuinely non-git path has no `.git` ancestry and stops after one probe.
-function _hasDotGitAncestor(p) {
+// Drives the git-internal walk in resolveTargetCheckout (a target under a
+// repo's `.git/` metadata dir must keep walking up to the OWNING checkout; a
+// genuinely non-git path has no `.git` ancestry and stops after one probe).
+// Exported so index.ts can cheaply decide whether a SYMLINKED/external-gitdir
+// SPELLING (whose realpath lost the `.git` segment) still deserves a
+// spelling-based classify pass (cycle-2 F4-a).
+export function hasDotGitAncestor(p) {
   let cur = resolve(p);
   for (;;) {
     if (basename(cur) === ".git") return true;
@@ -3988,6 +3991,7 @@ function _hasDotGitAncestor(p) {
     cur = parent;
   }
 }
+const _hasDotGitAncestor = hasDotGitAncestor;
 
 /**
  * #618/#621 — the TARGET-aware checkout classification for a write/edit path
