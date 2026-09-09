@@ -613,12 +613,15 @@ shared main checkout of a project with the guard active:
    only `fetch`/`worktree add`/`status` → runs.
 10. `bash scripts/checkout-hygiene/hub-state-check.sh --repo <hub>` → exit 0
     on main+clean, exit 1 + recovery command on off-main/dirty.
-11. **#350 WIP hygiene:** from the hub main checkout — `cat >
-    docs/plans/wip.md` (bash, disordered hub) or `write docs/plans/wip.md`
-    (write/edit tool, any hub) → **blocked** (the WIP block reason names the
-    `docs/plans/` pattern — #615 removed the agent-infra warn-only
-    exemption); a WORKTREE session writing `docs/plans/wip.md` into the hub
-    via an absolute path → `HUB WIP — PUT IT IN A WORKTREE` warning, command
-    still runs (never blocked); `echo x > /tmp/foo.tmp` → no warning (outside
-    the hub); the session-start banner lists untracked
+11. **#350 WIP hygiene:** from the hub main checkout — an OVERWRITE of an
+    existing/tracked file (`cat > docs/plans/wip.md` in a DISORDERED hub —
+    the #437 tracked-write gate — or `write docs/plans/wip.md` in any hub
+    state) → **blocked**; the write/edit block reason names the `docs/plans/`
+    pattern on the main+clean gate (#615 removed the agent-infra warn-only
+    exemption). A NEW untracked file in a disordered hub passes the #436
+    collision-free new-file carve-out (hub stays dirty — tracked by #628); a
+    WORKTREE session writing `docs/plans/wip.md` into the hub via an absolute
+    path → `HUB WIP — PUT IT IN A WORKTREE` warning, command still runs
+    (never blocked); `echo x > /tmp/foo.tmp` → no warning (outside the hub);
+    the session-start banner lists untracked
     `docs/plans/`/`migrations/`/scratch files when present.
