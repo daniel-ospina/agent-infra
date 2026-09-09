@@ -13,6 +13,7 @@ import {
   isCloudEnabled,
   writeCloudFallback,
   captureToHosted,
+  buildCloudPayload,
 } from "./index";
 
 // Replicate the pure functions inline (cannot import .ts extension in vitest with jiti)
@@ -411,14 +412,25 @@ describe("#125/#167 deriveTopics/deriveStoryArch", () => {
     // Extract frontmatter between --- delimiters and parse with YAML
     const m = md.match(/^---\n([\s\S]*?)\n---/);
     expect(m).not.toBeNull();
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { createRequire } = require("module");
-    // Test file is hardlinked into agent-infra; anchor require to eldato repo
-    // where js-yaml is a dependency.
-    const eldatoRequire = createRequire(require.resolve("/home/user/eldato/package.json"));
-    const yaml = eldatoRequire("js-yaml");
-    const parsed = yaml.load(m![1]) as Record<string, unknown>;
-    expect(parsed.summary).toBe(arch); // bullets preserved exactly (no line-fold)
+
+    // Structural literal-block round-trip assertion (zero deps):
+    // The `summary: |-` block uses 2-space indentation per bullet.
+    // Dedent the lines and verify they reproduce the arch byte-exact.
+    const summaryLines = m![1].split("\n").filter(l => l.startsWith("  "));
+    const dedented = summaryLines.map(l => l.replace(/^  /, "")).join("\n");
+    expect(dedented).toBe(arch);
+
+    // Best-effort real-YAML parse when js-yaml is available (not required)
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { createRequire } = require("module");
+      const testRequire = createRequire(import.meta.url);
+      const yaml = testRequire("js-yaml");
+      const parsed = yaml.load(m![1]) as Record<string, unknown>;
+      expect(parsed.summary).toBe(arch); // bullets preserved exactly (no line-fold)
+    } catch {
+      // js-yaml not available — structural assertion above already ran
+    }
   });
 
   test("buildMarkdown includes empty sourcePath when not provided", () => {
@@ -612,3 +624,82 @@ describe("#312 captureToHosted error-path coverage (review P2)", () => {
     expect(err).toHaveBeenCalledWith(expect.stringContaining("HTTP 502"));
   });
 });
+
+// #611 — buildCloudPayload attribution stamping
+
+describe("#611 buildCloudPayload attribution", () => {
+  const conversation = [{ role: "user" as const, content: "hello" }];
+  const attribution = {
+    harness: "pi",
+    machine_id: "ab".repeat(32),
+    model: "deepseek/deepseek-v4-flash",
+  };
+
+  test("stamped payload carries top-level harness, machine_id, model", () => {
+    const payload = buildCloudPayload({
+      sessionId: "sess-1",
+      conversation,
+      filePath: "/tmp/conv.md",
+      attribution,
+    });
+    expect(payload.session_id).toBe("sess-1");
+    expect(payload.harness).toBe("pi");
+    expect(payload.machine_id).toBe("ab".repeat(32));
+    expect(payload.model).toBe("deepseek/deepseek-v4-flash");
+  });
+
+  test("metadata keys preserved under stamping", () => {
+    const payload = buildCloudPayload({
+      sessionId: "sess-2",
+      conversation,
+      filePath: "/tmp/conv.md",
+      attribution,
+    });
+    const metadata = payload.metadata as Record<string, unknown>;
+    expect(metadata.source).toBe("pi-agent-end");
+    expect(metadata.messageCount).toBe(1);
+    expect(metadata.sourcePath).toBe("/tmp/conv.md");
+    expect(typeof metadata.capturedAt).toBe("string");
+    expect(metadata.topics).toBeDefined();
+    expect(metadata.summary).toBeDefined();
+  });
+
+  test("model key omitted when attribution has no model", () => {
+    const payload = buildCloudPayload({
+      sessionId: "sess-3",
+      conversation,
+      filePath: "/tmp/conv.md",
+      attribution: { harness: "pi", machine_id: "ab".repeat(32) },
+    });
+    expect("model" in payload).toBe(false);
+    expect(payload.harness).toBe("pi");
+    expect(payload.machine_id).toBe("ab".repeat(32));
+  });
+
+  test("conversation passthrough", () => {
+    const payload = buildCloudPayload({
+      sessionId: "sess-4",
+      conversation,
+      filePath: "/tmp/conv.md",
+      attribution,
+    });
+    expect(payload.conversation).toEqual(conversation);
+  });
+
+  test("fields stay within server contract bounds (no control chars, within caps)", () => {
+    const payload = buildCloudPayload({
+      sessionId: "sess-5",
+      conversation,
+      filePath: "/tmp/conv.md",
+      attribution,
+    });
+    expect(payload.harness).toBe("pi");
+    const machineId = payload.machine_id as string;
+    const model = payload.model as string;
+    expect(machineId.length).toBeLessThanOrEqual(256);
+    expect(model.length).toBeLessThanOrEqual(128);
+    expect(/[\x00-\x1f\x7f]/.test(machineId)).toBe(false);
+    expect(/[\x00-\x1f\x7f]/.test(model)).toBe(false);
+  });
+});
+

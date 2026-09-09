@@ -32,8 +32,18 @@ import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import {
+  resolveAttribution,
+  SessionModelCache,
+  stampSessionPayload,
+  modelFromContext,
+  type SessionAttribution,
+} from "../shared/capture-attribution.js";
 
 // ── Config ──────────────────────────────────────────────
+
+/** Per-session model cache (per-process instance per extension). */
+const sessionModels = new SessionModelCache();
 
 interface TortoiseConfig {
   autoCapture: boolean;
@@ -247,6 +257,34 @@ function countMessageBlocks(filePath: string): number {
 }
 
 // ── Hosted-cloud capture (#312, mirrors reflect-hook) ────
+
+/**
+ * Build the attributed cloud capture payload for an agent_end.
+ *
+ * Pure builder, exported for testing. Returns the complete payload object
+ * (with attribution stamped) that should be passed to both writeCloudFallback
+ * and captureToHosted — the JSONL record and POST body are byte-identical.
+ */
+export function buildCloudPayload(args: {
+  sessionId: string;
+  conversation: Array<{ role: "user" | "assistant"; content: string }>;
+  filePath: string;
+  attribution: SessionAttribution;
+}): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    session_id: args.sessionId,
+    conversation: args.conversation,
+    metadata: {
+      source: "pi-agent-end",
+      topics: deriveTopics(args.conversation),
+      summary: deriveStoryArch(args.conversation),
+      messageCount: args.conversation.length,
+      sourcePath: args.filePath,
+      capturedAt: new Date().toISOString(),
+    },
+  };
+  return stampSessionPayload(payload, args.attribution);
+}
 
 const DEFAULT_API_URL = "https://api.premiselabs.co";
 /** #312 scope v3: the /v1/sessions sync endpoint needs more than reflect-hook's 10s. */
@@ -553,18 +591,26 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
         // POST is fire-and-forget with a bounded 30s timeout, never awaited so
         // the capture lock releases immediately for active sessions.
         const { apiUrl, apiKey } = cloudConfig(config);
-        const payload = {
-          session_id: sessionId,
-          conversation,
-          metadata: {
-            source: "pi-agent-end",
-            topics: deriveTopics(conversation),
-            summary: deriveStoryArch(conversation),
-            messageCount: conversation.length,
-            sourcePath: filePath,
-            capturedAt: new Date().toISOString(),
-          },
-        };
+        // Resolve attribution — isolated in try/catch so the durable cloud
+        // JSONL fallback (writeCloudFallback below) is NEVER blocked by an
+        // attribution failure. On failure, a best-effort attribution is used
+        // so the record survives with missing fields (server treats absent as
+        // unattributed).
+        let attribution: SessionAttribution;
+        try {
+          const entries = ctx.sessionManager.getEntries?.() ?? [];
+          const model = sessionModels.resolve(sessionId, () => entries, modelFromContext(ctx.model));
+          attribution = resolveAttribution(model);
+          if (!attribution.machine_id) {
+            attribution = { harness: "pi", machine_id: "" };
+          }
+        } catch (err) {
+          console.error(
+            `[tortoise-capture] Attribution resolution failed — recording session un-attributed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          attribution = { harness: "pi", machine_id: "" };
+        }
+        const payload = buildCloudPayload({ sessionId, conversation, filePath, attribution });
         const localRecordPath = writeCloudFallback(payload);
         void captureToHosted(apiUrl, apiKey, payload, localRecordPath);
       } else {
