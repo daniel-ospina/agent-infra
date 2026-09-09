@@ -3265,8 +3265,18 @@ export default function (pi: ExtensionAPI) {
   TASK_HEARTBEAT: "1",
   SLACK_BRIDGE_DISABLE: "1",
   VISION_INTERCEPTOR_DISABLED: "1",
-  ELDATO_ALLOW_MAIN_EDITS: "1",  // dual-support: also set AGENT_ variant (#7549)
-  AGENT_ALLOW_MAIN_EDITS: "1",
+  // #617: NO AGENT/ELDATO_ALLOW_MAIN_EDITS injection — the sub-agent runs the
+  // SAME main-worktree-guard gates as its controller (M4 hub discipline + M2/M3
+  // + write/edit main block — the same surfaces an unhatched controller faces;
+  // bash-write/new-file carve-outs are controller-parity, unchanged). The hatch was originally injected (#6091) to also
+  // disable verification-gate for one-shot children; #825 obsoleted that half
+  // (VGATE stays ACTIVE via the verified-file-registry bridge), and the guard
+  // rationale ("branch-ownership M1/M2/M3 protects the shared checkout") is
+  // wrong — the hatch ALSO disables M4, so a hub-rooted controller dispatched
+  // an entire parallel fleet that could write/flip the shared hub freely. A
+  // controller DELIBERATELY launched with the hatch still propagates it to
+  // children via the ...process.env spread below (parent-authorized solo
+  // escape); it is never forced here.
   // #825: NO ELDATO_SKIP_VGATE injection. The sub-agent runs with the
   // verification-gate ACTIVE and inherits the parent's verified-file registry
   // via the bridge (~/.pi/agent/verification/latest.json, worktree-scoped
@@ -3283,14 +3293,21 @@ export default function (pi: ExtensionAPI) {
   // swarm follow-up); the ...process.env spread above would otherwise leak
   // them into every task child, silently defeating the #825 contract
   // ("VGATE stays ACTIVE for sub-agents"). Key-specific ONLY:
-  // AGENT_SKIP_REVIEW_GATE stays forced to "1" (#825) and the
-  // ALLOW_MAIN_EDITS branch-ownership variants (#7470/#7549) must survive —
-  // never a prefix sweep.
+  // AGENT_SKIP_REVIEW_GATE stays forced to "1" (#825) and a parent-SET
+  // ALLOW_MAIN_EDITS hatch (a deliberately hatched solo controller dispatching
+  // children for its own in-main work, #617) must survive the strip — never a
+  // prefix sweep.
   delete subAgentEnv.ELDATO_SKIP_VGATE;
   delete subAgentEnv.ELDATO_SKIP_REVIEW_GATE;
-// #265/#825 resolution: sub-agents DO get the hatch (verified-file registry
-// bridge, #825) — the branch-ownership guard (M1/M2/M3) is the layer that
-// protects the shared checkout, not env removal.
+// #617: sub-agents NO LONGER inherit the hatch by default. #265's env pivot
+// (remove ALLOW_MAIN_EDITS from subAgentEnv) was the intended design but the
+// squash-merged result reverted it with a wrong rationale ("the branch-
+// ownership guard protects the shared checkout") — the hatch ALSO disables M4
+// hub discipline + M2/M3, so hub-rooted task children could flip/dirty the
+// shared hub (observed: tortoise main → feat/2688 + 5 uncommitted files).
+// M4/M2/M3 now apply to task children exactly as to controllers; the #265
+// skills contract (epic-executor/issue-workflow worktree-first) already
+// documented this state.
       // #286: children default to PI_MCP_SERVERS=none — a missing allowlist
       // makes mcp-client eagerly connect ALL non-lazy servers
       // (classifyServers treats undefined as "load all"), and cold connects

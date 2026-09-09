@@ -49,12 +49,15 @@
 //     warnings dedupe per pattern/path and are suppressed under the env hatch.
 //
 // Worktrees are ISOLATED — none of this applies inside a worktree. The only
-// escape hatch is AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) or
-// the TTL'd file marker (#207) for deliberate solo sessions; under the hatch
-// M2/M3 are inactive (escape-hatch contract preserved) but M1 detection stays
-// ACTIVE and M4 stays ACTIVE (a stranded lane recovers with the marker but
-// cannot resume feature work in the hub). There is NO auto-bypass: the guard
-// blocks every time, so a rogue/parallel agent cannot retry its way past it.
+// escape hatches are AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1,
+// the env hatch set at session start) and the TTL'd file marker (#207), both
+// for deliberate solo sessions. Their M-gate effects DIFFER: under the ENV
+// hatch M2/M3/M4 are all inactive (the M4 hub-state block is wrapped in
+// `if (!_isAllowMainEdits())`) and M1 detection stays ACTIVE; under the TTL
+// MARKER only M2/M3 are inactive while M4 stays ACTIVE (D3 — a stranded lane
+// recovers with the marker but cannot resume feature work in the hub). There
+// is NO auto-bypass: the guard blocks every time, so a rogue/parallel agent
+// cannot retry its way past it.
 //
 // Degradation contract:
 //  - classify-git.mjs load failure → bash git guard degrades to warn-only

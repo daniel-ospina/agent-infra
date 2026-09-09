@@ -266,9 +266,16 @@ test("sub-agent env strips inherited ELDATO_SKIP_VGATE / ELDATO_SKIP_REVIEW_GATE
   ok(!/subAgentEnv\.ELDATO_SKIP_REVIEW_GATE\s*=/.test(source), "no line may re-assign ELDATO_SKIP_REVIEW_GATE after the strip");
 });
 
-test("key-specific strip: BOTH ALLOW_MAIN_EDITS variants survive (#285/#7470/#7549)", () => {
-  ok(source.includes('ELDATO_ALLOW_MAIN_EDITS: "1"'), "ELDATO_ALLOW_MAIN_EDITS must remain set (branch-ownership escape hatch, #7470)");
-  ok(source.includes('AGENT_ALLOW_MAIN_EDITS: "1"'), "AGENT_ALLOW_MAIN_EDITS must remain set (dual-support, #7549)");
+test("key-specific strip deletes ONLY the two skip vars — a parent-set ALLOW_MAIN_EDITS hatch survives (#285/#617)", () => {
+  // #617: subAgentEnv no longer ASSIGNS the hatch (forced injection removed).
+  ok(!/ELDATO_ALLOW_MAIN_EDITS\s*:/.test(source), "no forced ELDATO_ALLOW_MAIN_EDITS assignment in subAgentEnv (#617)");
+  ok(!/AGENT_ALLOW_MAIN_EDITS\s*:/.test(source), "no forced AGENT_ALLOW_MAIN_EDITS assignment in subAgentEnv (#617)");
+  // The #285 key-specific strip must delete ONLY the two inherited review-gate
+  // bypass vars — a controller deliberately launched with the hatch (#7470/#7549)
+  // still propagates it via the ...process.env spread; never a prefix sweep.
+  ok(/delete subAgentEnv\.ELDATO_SKIP_VGATE/.test(source), "strip deletes ELDATO_SKIP_VGATE (#285)");
+  ok(/delete subAgentEnv\.ELDATO_SKIP_REVIEW_GATE/.test(source), "strip deletes ELDATO_SKIP_REVIEW_GATE (#285)");
+  ok(!/delete subAgentEnv\.(?:AGENT|ELDATO)_ALLOW_MAIN_EDITS/.test(source), "strip must NOT delete a parent-inherited ALLOW_MAIN_EDITS hatch (#617)");
 });
 
 // ── PATH augmentation (#36) ───────────────────────────
