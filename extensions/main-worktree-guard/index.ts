@@ -230,8 +230,10 @@ function _currentSessionId(ctx?: { sessionManager?: { getSessionId?: () => strin
   return process.env.PI_SESSION_ID ?? ctx?.sessionManager?.getSessionId?.() ?? null;
 }
 // Guard-stamping at creation-observation: write the stamp BEFORE allowing the
-// touch command. try/catch fail-silent (F7) — on failure the marker stays
-// absent → block; a failed stamp never weakens the gate.
+// touch command. try/catch fail-silent (F7) — when the stamp write FAILS no
+// stamp exists, so the shell `touch` then leaves an EMPTY (unparseable →
+// inert) marker: readAllowMarkerState stays false → blocked. A failed stamp
+// never weakens the gate (and a later guard-observed touch re-stamps over it).
 function _stampMarker(path: string, sessionId: string | null, reason: string | null): void {
   try {
     // P2 (review): ensure ~/.pi/agent exists — a missing dir made the stamp
@@ -1335,6 +1337,43 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // ── Escape marker (#207): the guard-stamped bash route is the ONLY
+    // minting path (#620) ──
+    // Runs BEFORE the hatch/marker bypass so a marker touch from ANY session
+    // — the AGENT_ALLOW_MAIN_EDITS=1 env hatch included — is guard-stamped
+    // {session_id, reason, ts} + audited here instead of minting an
+    // un-stamped, un-audited marker file (the 2026-09-08 evidence: a 3-line
+    // plain-text marker outside the gate_bypass audit trail). M4 ran above and
+    // a bare `touch <marker>` is pure non-git → never M4-blocked, so F10c (a
+    // BLOCKED command never stamps) still holds; a compound
+    // `touch … && git …` is not a marker command (single-command contract)
+    // and stays git-classified first.
+    if (isBash) {
+      const command = (event.input as { command?: string }).command ?? "";
+      if (isAllowMarkerCommand(command, homedir())) {
+        _stampMarker(_markerPath(), _currentSessionId(_ctx), extractMarkerReason(command));
+        return undefined;
+      }
+    }
+    // The write/edit tool can never mint the marker either — a write to the
+    // marker path is blocked in EVERY session state (hatch / active-marker /
+    // worktree / agent-infra): an agent could `write` a stamped-looking JSON
+    // straight to the file with no gate_bypass audit event. Route creation
+    // through the bash touch path (guard-stamped + audited).
+    if (isWrite || isEdit) {
+      const targetPath = (event.input as { path?: string }).path ?? "";
+      if (resolve(process.cwd(), targetPath) === resolve(_markerPath())) {
+        return {
+          block: true,
+          reason: [
+            "⛔ The escape-marker file must be created via a bash `touch` command,",
+            "   not the write/edit tool — the guard stamps {session_id, reason, ts}",
+            "   and audits the creation only on the bash route (#207).",
+          ].join("\n"),
+        };
+      }
+    }
+
     // ── bash: branch-ownership + destructive git ──
     // Marker OR branch covers bash + write + edit in one check point (#266).
     if (_isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx))) {
@@ -1565,22 +1604,11 @@ export default function (pi: ExtensionAPI) {
 
       // Under the escape hatch, M2/M3 are inactive (contract preserved) but M1
       // above stays active. Legacy destructive blocks are also bypassed (today's
-      // semantics — the hatch is a full bypass).
+      // semantics — the hatch is a full bypass). Marker-command stamping moved
+      // ABOVE this point (the pre-bypass section, #620): a marker touch from any
+      // session — env hatch included — is stamped + audited there, so a bare
+      // `touch <marker>` can never fall through to mint un-stamped here.
       if (allowActive) return undefined;
-
-      // ── Escape marker (#207): stamp + audit at creation-observation ──
-      // ORDERING FIX (#1484): the stamp must run BEFORE the allow/allow-non-git
-      // early return — a bare `touch <marker>` classifies "allow-non-git" and
-      // was silently swallowed by that return, so the guard NEVER stamped and
-      // the marker was inert in production (the 2026-08-18 incident's empty
-      // unscoped marker file is exactly this bug's evidence). Git classification
-      // ran FIRST (M3 above), so a blocked command NEVER stamps — `touch ... &&
-      // git checkout main` is blocked and the touch never runs (F10c). Only an
-      // ALLOWED bare `touch <marker>` (own command) reaches here.
-      if (isAllowMarkerCommand(command, homedir())) {
-        _stampMarker(_markerPath(), _currentSessionId(_ctx), extractMarkerReason(command));
-        return undefined;
-      }
 
       if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return undefined;
 
@@ -1771,20 +1799,9 @@ export default function (pi: ExtensionAPI) {
 
     const resolvedTarget = resolve(process.cwd(), targetPath ?? "");
 
-    // P2 (review): the write/edit tool is an UNAUDITED marker-creation path —
-    // an agent could `write` a stamped JSON straight to the marker file,
-    // bypassing the audited touch->stamp route (no gate_bypass audit event).
-    // Force creation through the bash touch path (guard-stamped + audited).
-    if (resolvedTarget === resolve(_markerPath())) {
-      return {
-        block: true,
-        reason: [
-          "⛔ The escape-marker file must be created via a bash `touch` command,",
-          "   not the write/edit tool — the guard stamps {session_id, reason, ts}",
-          "   and audits the creation only on the bash route (#207).",
-        ].join("\n"),
-      };
-    }
+    // (Marker-path write/edit block moved to the pre-bypass section above —
+    // #620: the write tool can never mint the escape marker in ANY session
+    // state; the audited bash touch route is the only mint.)
 
     // Classify the TARGET's checkout (cached per realpath-normalized path).
     // Not in a git repo, or in a linked WORKTREE → isolated by construction:

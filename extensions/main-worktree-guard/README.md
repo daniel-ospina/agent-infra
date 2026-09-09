@@ -600,6 +600,18 @@ The marker is **per-process-session-scoped**, not machine-wide:
   `{"session_id", "reason", "ts"}` — it stamps when it observes an allowed
   `touch` of the marker path, BEFORE allowing the command. `touch` then
   refreshes mtime and preserves the content (no ordering race).
+- **The stamp runs in EVERY session state (#620)** — the env hatch
+  (`AGENT_ALLOW_MAIN_EDITS=1`) cannot mint an un-stamped, un-audited marker:
+  a bash `touch` of the marker path is guard-stamped + audited even under the
+  hatch. Writing the marker file via the write/edit tool is blocked in every
+  session state (hatch / active-marker / worktree / agent-infra) — the audited
+  bash touch is the only route the GUARD stamps.
+- **Trust-model limit:** the guard stamps only what it OBSERVES as a bare
+  `touch`. An out-of-band write (a `printf`/`echo`/redirect in a tool call or
+  a human terminal that puts stamped-SHAPE JSON on the path) is not
+  distinguishable from a legitimately-stamped file and carries no `gate_bypass`
+  audit event — this residual predates #620 and is outside the guard's audit
+  surface; unparseable out-of-band content is inert → blocked (fail-safe).
 - The window is active ⟺ mtime fresh AND content parses AND
   `session_id` matches the current session's id (`PI_SESSION_ID`, with the
   extension-context session manager as fallback).
