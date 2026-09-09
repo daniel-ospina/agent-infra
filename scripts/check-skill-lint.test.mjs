@@ -15,6 +15,7 @@
  *       missing-closing/empty) — verdict + extraction-mirror assertions
  *   (f) name≠dir with quoted-name regression (quote-aware data)
  *   (g) 121-tree sweep: validator over skills/ → ZERO findings
+ *   (h) pin lockstep: every extension @earendil-works/pi-* pin == PI_VERSION_PIN
  *
  * Repo-convention harness: node:assert, custom test() with ✅/❌ markers,
  * process.exit(1) on failure (load-gate.test.mjs pattern). Assertion markers
@@ -86,36 +87,6 @@ section("fixture verdict classes match expected");
 test(`FIXTURES module loads (${FIXTURES.length} fixtures, pi pin ${PI_VERSION_PIN})`, () => {
   assert.ok(FIXTURES.length >= 100, "matrix should cover every enumerated class");
   assert.equal(PI_VERSION_PIN, "0.85.1");
-});
-
-// ── (h) pin lockstep (#640 review) ──────────────────────────────────────
-// The pi runtime version is hand-synced across PI_VERSION_PIN + every
-// extension devDep pin; before this tripwire nothing asserted they agree, so a
-// partial bump (fixtures updated, one package.json missed) stayed CI-green.
-// Guard the class, not just this instance: any @earendil-works/pi-* devDep in
-// extensions/*/package.json must equal PI_VERSION_PIN.
-section("extension devDep pins lockstep with PI_VERSION_PIN");
-
-test("extensions/*/package.json @earendil-works/pi-* devDeps match PI_VERSION_PIN", () => {
-  const extDir = path.join(REPO_ROOT, "extensions");
-  const offenders = [];
-  for (const entry of fs.readdirSync(extDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const pkgPath = path.join(extDir, entry.name, "package.json");
-    if (!fs.existsSync(pkgPath)) continue;
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-    for (const [name, ver] of Object.entries(pkg.devDependencies ?? {})) {
-      if (!name.startsWith("@earendil-works/pi-")) continue;
-      if (ver !== PI_VERSION_PIN) {
-        offenders.push(`extensions/${entry.name}/package.json: ${name}@${ver}`);
-      }
-    }
-  }
-  assert.equal(
-    offenders.length,
-    0,
-    `devDep pin drift vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
-  );
 });
 
 for (const fx of FIXTURES) {
@@ -355,6 +326,46 @@ test("CLI over the live tree → '0 issue(s). Clean.' exit 0", () => {
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /0 issue\(s\)\./);
   assert.match(r.stdout, /Clean\./);
+});
+
+// ── (h) pin lockstep (#640 review) ──────────────────────────────────────────
+// The pi runtime version is hand-synced across PI_VERSION_PIN + every extension
+// pi-package pin; before this tripwire nothing asserted they agree, so a partial
+// bump (fixtures updated, one package.json missed) stayed CI-green. Guard the
+// CLASS, not just this instance: every @earendil-works/pi-* pin under
+// extensions/*/package.json — in `dependencies` OR `devDependencies` — must
+// equal PI_VERSION_PIN, AND at least one pin must be found (a zero-match run is
+// a vacuous pass, i.e. the guard silently disabled).
+section("extension pi-package pins lockstep with PI_VERSION_PIN");
+
+test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN", () => {
+  const extDir = path.join(REPO_ROOT, "extensions");
+  const offenders = [];
+  let matched = 0;
+  for (const entry of fs.readdirSync(extDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const pkgPath = path.join(extDir, entry.name, "package.json");
+    if (!fs.existsSync(pkgPath)) continue;
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    for (const field of ["dependencies", "devDependencies"]) {
+      for (const [name, ver] of Object.entries(pkg[field] ?? {})) {
+        if (!name.startsWith("@earendil-works/pi-")) continue;
+        matched++;
+        if (ver !== PI_VERSION_PIN) {
+          offenders.push(`extensions/${entry.name}/package.json (${field}): ${name}@${ver}`);
+        }
+      }
+    }
+  }
+  assert.ok(
+    matched > 0,
+    "no @earendil-works/pi-* pins found under extensions/*/package.json — the tripwire would pass vacuously"
+  );
+  assert.equal(
+    offenders.length,
+    0,
+    `pin drift vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
+  );
 });
 
 console.log(`\ncheck-skill-lint.test.mjs: ${passed} passed, ${failed} failed`);
