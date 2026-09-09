@@ -72,7 +72,7 @@ export function loadConfig(opts?: {
   return { apiUrl: apiUrl.replace(/\/+$/, ""), apiKey: apiKey.trim(), team };
 }
 
-/** Per-session model cache (shared across both extensions in-process). */
+/** Per-session model cache (per-process instance per extension). */
 const sessionModels = new SessionModelCache();
 
 // ── Session extraction (same pattern as before) ────────────────
@@ -253,11 +253,12 @@ export default function reflectHook(pi: ExtensionAPI): void {
 
       const sessionId = ctx.sessionManager.getSessionId?.() ?? `session_${Date.now()}`;
 
-      // Resolve model from session entry stream (first model_change), cached per session_id
-      const entries = ctx.sessionManager.getEntries?.() ?? [];
-      const model = sessionModels.resolve(sessionId, () => entries) ?? modelFromContext(ctx.model);
-      const attribution = resolveAttribution(model);
-      const payload = buildQuitPayload({
+    // Resolve model from session entry stream (first model_change), cached per session_id
+    // The ctx.model fallback is folded into the cache so mid-session switches never leak.
+    const entries = ctx.sessionManager.getEntries?.() ?? [];
+    const model = sessionModels.resolve(sessionId, () => entries, modelFromContext(ctx.model));
+    const attribution = resolveAttribution(model);
+    const payload = buildQuitPayload({
         sessionId,
         turns,
         meta: {

@@ -63,12 +63,23 @@ let _cached: string | undefined;
  * Memoized per process (module-level cache). First call reads OS hostname + user,
  * derives sha256 hex. Subsequent calls return the cached value.
  *
+ * Non-throwing: if `os.userInfo()` fails (containers, sandboxes, CI), falls back
+ * to `os.hostname()` + `os.homedir()` last-segment so the durable JSONL fallback
+ * record is never blocked by a machine-identity lookup failure.
+ *
  * @param parts - Optional test seam (hostname, username). When provided, NOT memoized.
  */
 export function machineId(parts?: { hostname: string; username: string }): string {
   if (parts) return machineIdFrom(parts.hostname, parts.username);
   if (_cached) return _cached;
-  _cached = machineIdFrom(osHostname(), userInfo().username);
+  let username: string;
+  try {
+    username = userInfo().username;
+  } catch {
+    // Fallback for containers/CI where userInfo() throws: use homedir basename
+    username = homedir().split("/").filter(Boolean).pop() ?? "unknown";
+  }
+  _cached = machineIdFrom(osHostname(), username);
   return _cached;
 }
 
@@ -142,32 +153,40 @@ export function modelFromContext(
 // ── Per-session model cache ────────────────────────────────────────────────
 
 /**
- * Per-process cache that pins the FIRST model resolution per session_id.
+ * Per-process cache that pins the FIRST model resolution per session_id,
+ * including the ctx.model fallback leg.
  *
  * Prevents drift when tortoise-capture re-POSTs the full conversation on
  * every agent_end — the model value is resolved once and cached, so
  * mid-session model switches never leak into the stamped payload.
  *
+ * The `ctxModelFallback` parameter is resolved ONCE on first cache miss and
+ * folded into the cached value. Subsequent calls return the pinned value even
+ * if ctx.model changes mid-session.
+ *
  * FIFO eviction at MODEL_CACHE_MAX (512) entries. Null values are cached
- * (a session with no model_change will consistently report no model).
+ * (a session with no model_change or ctx.model will consistently report no model).
  */
 export class SessionModelCache {
   private _cache = new Map<string, string | null>();
 
   /**
-   * Resolve the model for `sessionId`.
+   * Resolve the model for `sessionId`, including the ctx.model fallback.
    *
-   * On first call, invokes `entriesFn` to scan the entry stream and caches the
-   * result. Subsequent calls return the cached value without re-invoking `entriesFn`.
+   * On first call, invokes `entriesFn` to scan the entry stream and applies
+   * `ctxModelFallback` if no model_change is found. The composed result is
+   * cached. Subsequent calls return the cached value without re-invoking
+   * `entriesFn` or re-reading `ctxModelFallback`.
    */
   resolve(
     sessionId: string,
     entriesFn: () => readonly ModelChangeLike[],
+    ctxModelFallback?: string | null,
   ): string | null {
     const cached = this._cache.get(sessionId);
     if (cached !== undefined) return cached;
 
-    const model = initialModelFromEntries(entriesFn());
+    const model = initialModelFromEntries(entriesFn()) ?? ctxModelFallback ?? null;
 
     // FIFO eviction: if at capacity, delete the oldest entry
     if (this._cache.size >= MODEL_CACHE_MAX) {

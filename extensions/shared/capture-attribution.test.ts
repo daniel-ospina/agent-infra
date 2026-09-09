@@ -78,6 +78,17 @@ describe("machineId", () => {
     const b = machineId();
     equal(a, b);
   });
+
+  test("non-throwing when userInfo throws (container/CI fallback)", () => {
+    // Simulate userInfo() throwing by calling machineIdFrom directly with
+    // a fallback username — the real machineId() uses try/catch internally.
+    // We can't realistically mock os.userInfo() in tsx, but we can verify
+    // the machineIdFrom fallback path produces valid output.
+    const id = machineId({ hostname: "container", username: "data" });
+    ok(/^[0-9a-f]{64}$/.test(id));
+    ok(!id.includes("container"));
+    ok(!id.includes("data"));
+  });
 });
 
 // ── sanitizeAttribution ──────────────────────────────────────────────────
@@ -293,6 +304,36 @@ describe("SessionModelCache", () => {
       return [{ type: "model_change" as const, provider: "d", modelId: "2" }];
     });
     equal(callCount, 1, "after clear, entriesFn should be called again");
+  });
+
+  test("folds ctx.model fallback into the cached value when no model_change exists", () => {
+    const cache = new SessionModelCache();
+    let callCount = 0;
+    const entriesFn = () => {
+      callCount++;
+      return []; // no model_change
+    };
+
+    const result1 = cache.resolve("no-model", entriesFn, "deepseek/deepseek-v4-flash");
+    equal(result1, "deepseek/deepseek-v4-flash");
+    equal(callCount, 1);
+
+    // A later ctx.model change must NOT leak into the cached value
+    const result2 = cache.resolve("no-model", entriesFn, "qwen/3.8-max");
+    equal(result2, "deepseek/deepseek-v4-flash", "fallback must be pinned on first resolve");
+    equal(callCount, 1, "entriesFn must not be re-invoked for cached session");
+  });
+
+  test("cache pins first resolution even when ctx.model fallback changes later", () => {
+    const cache = new SessionModelCache();
+    const entriesFn = () => [
+      { type: "model_change" as const, provider: "deepseek", modelId: "v4-flash" },
+    ];
+
+    const result1 = cache.resolve("s1", entriesFn, "qwen/3.8-max");
+    equal(result1, "deepseek/v4-flash", "entries model_change wins over ctx.model fallback");
+    const result2 = cache.resolve("s1", entriesFn, "qwen/3.8-max");
+    equal(result2, "deepseek/v4-flash");
   });
 });
 

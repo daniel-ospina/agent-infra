@@ -42,7 +42,7 @@ import {
 
 // ── Config ──────────────────────────────────────────────
 
-/** Per-session model cache (shared with reflect-hook via the shared module). */
+/** Per-session model cache (per-process instance per extension). */
 const sessionModels = new SessionModelCache();
 
 interface TortoiseConfig {
@@ -592,8 +592,9 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
         // the capture lock releases immediately for active sessions.
         const { apiUrl, apiKey } = cloudConfig(config);
         // Resolve model from session entry stream (first model_change), cached per session_id
+        // The ctx.model fallback is folded into the cache so mid-session model switches never leak.
         const entries = ctx.sessionManager.getEntries?.() ?? [];
-        const model = sessionModels.resolve(sessionId, () => entries) ?? modelFromContext(ctx.model);
+        const model = sessionModels.resolve(sessionId, () => entries, modelFromContext(ctx.model));
         const attribution = resolveAttribution(model);
         const payload = buildCloudPayload({ sessionId, conversation, filePath, attribution });
         const localRecordPath = writeCloudFallback(payload);
