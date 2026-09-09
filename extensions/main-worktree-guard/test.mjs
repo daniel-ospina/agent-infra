@@ -1475,16 +1475,33 @@ dexpect("#543: branch list → no delete capture", `git branch -a`, { branchStat
     // (ownX doubles as the owned-dst fixture — it EXISTS but is only
     // overwrite-allowed when this pid's ownedBranches set contains it):
     execSync("git branch victim && git branch victim2 && git branch feat/other && git branch ownX", { cwd: r598, stdio: "ignore" });
+    // second repo (r2): a `--git-dir=<r2>` mutation from the session cwd runs
+    // IN r2 — its refs are the ones a rename would clobber. The gitDir-
+    // anchored probe must see r2's r2only branch (r598 does NOT have it, so a
+    // cwd-repo probe would read free → reBaseline), and the baseline (built
+    // from eff = r2) matches r2's repoKey so the rename arm's repo-scope gate
+    // lets the probe decide (round-2 reviewer B P4 call-site pin: dropping the
+    // muEff.gitDir arg at the index.ts call site would fail exactly this pin).
+    execSync(`git init -q -b feat/1 "${p598}/r2"`, { stdio: "ignore" });
+    const r2 = `${p598}/r2`;
+    execSync("git config user.email t@t && git config user.name t", { cwd: r2, stdio: "ignore" });
+    execSync("echo a > f && git add . && git commit -qm init && git branch r2only", { cwd: r2, stdio: "ignore" });
     // index.ts's exact M3 adapter for a single main-resolving mutation:
-    // branchState → classifyBranchOp → resolve repo → probe the rename DST
-    // (localBranchExists !== false — a failed probe fails closed to exists) →
-    // decideM3 with ownedBranches (this pid's set, repo-scoped).
+    // branchState → classifyBranchOp → resolve repo (round-4: from the
+    // classifier's OWN stateHints via resolveRepoFromInv; invisible payloads
+    // → session repo) → probe the rename DST (localBranchExists !== false on
+    // the mutation's repo — a failed probe fails closed to exists) → decideM3
+    // with ownedBranches (this pid's set, repo-scoped).
     const m3idx = (cmd, owned = []) => {
       const d = classifyGitCommandDetailed(cmd);
       if (!d.branchState) return { skip: true };
       const op = sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs);
       if (!op || op.op === "other") return { skip: true };
-      const eff = sharedResolveEffectiveRepo(cmd, r598, d.verb, 0);
+      const eff = d.stateVerb && d.stateInvVisible === false
+        ? sharedResolveEffectiveRepo("git status", r598)
+        : (d.stateVerb && d.stateHints
+          ? sharedResolveRepoFromInv(d.stateHints, r598)
+          : sharedResolveEffectiveRepo(cmd, r598, d.verb, 0));
       if (!eff) return { noRepo: true };
       const dstExists = (op.op === "rename" && op.to != null)
         ? sharedLocalBranchExists(eff.effectiveCwd, op.to, eff.gitDir) !== false
@@ -1518,6 +1535,10 @@ dexpect("#543: branch list → no delete capture", `git branch -a`, { branchStat
     expectBool("#598: -M <foreign-from> <existing> → still M3 BLOCK (unchanged path)", b9?.block === true, true);
     const b10 = m3idx(`git branch -m feat/1 rnS`);
     expectBool("#598: soft -m <baseline> <free-name> → reBaseline (soft rename unchanged)", b10?.reBaseline === "rnS" && !b10?.block, true);
+    const b11 = m3idx(`git --git-dir="${r2}/.git" branch -M feat/1 r2only`);
+    expectBool("#598: --git-dir=<other> rename onto <other>'s existing dst → M3 BLOCK (gitDir-anchored probe)", b11?.block === true, true);
+    const b12 = m3idx(`git branch -M feat/1 freeY`);
+    expectBool("#598: control — same-repo free-name rename still reBaselines (no over-block from the r2 fixture)", b12?.reBaseline === "freeY" && !b12?.block, true);
   } catch (e) {
     console.error(`❌ #598 fixture FAILED to provision: ${String(e.message).slice(0, 120)}`);
     fail++;

@@ -22,7 +22,7 @@ import { execFileSync, execSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import {
   mkdirSync, writeFileSync, readFileSync, rmSync, openSync, writeSync, closeSync,
-  realpathSync,
+  realpathSync, existsSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
@@ -133,9 +133,17 @@ export function readBranchState(cwd, gitDir) {
  * RESOLVED admin dir), the probe runs with `--git-dir` so it interrogates the
  * exact repo git will write — a `--git-dir=<other>` mutation must never be
  * checked against the cwd repo's refs (round-1 reviewer P2).
- * `git rev-parse --verify --quiet` exits 0 when the ref exists and 1 when it
- * does not (probe-verified; any other exit — bad repo rc 128 etc. — is
- * unknown, never a clean not-found).
+ * `git rev-parse --verify --quiet` exits 0 when the ref resolves; when it
+ * exits 1 the ref does NOT resolve — that covers both a cleanly ABSENT ref
+ * AND a broken-present one (a dangling symref or a ref whose target object is
+ * missing — both make rev-parse exit 1 while git branch -M would still
+ * clobber the ref file rc 0). The rc-1 fallback checks the loose-ref file
+ * (git rev-parse --git-path refs/heads/<name> + existsSync) so a
+ * broken-but-present foreign ref is treated as EXISTS (block), never as a
+ * free name (round-2 reviewer P2 — pre-fallback a dangling symref dst read
+ * as free and the carve-out let a real rc-0 clobber through). Packed refs
+ * resolve rc 0 and never reach the fallback. Any other exit (bad repo rc 128
+ * etc.) stays null — unknown, never a clean not-found.
  * @param {string} cwd
  * @param {string} name local branch name (no refs/heads/ prefix)
  * @param {string} [gitDir] resolved git dir override (--git-dir)
@@ -143,16 +151,37 @@ export function readBranchState(cwd, gitDir) {
  */
 export function localBranchExists(cwd, name, gitDir) {
   if (!cwd || typeof name !== "string" || name.length === 0) return null;
-  const args = gitDir
-    ? [`--git-dir=${gitDir}`, "rev-parse", "--verify", "--quiet", `refs/heads/${name}`]
-    : ["rev-parse", "--verify", "--quiet", `refs/heads/${name}`];
+  const prefix = gitDir ? [`--git-dir=${gitDir}`] : [];
+  const probe = (args) => {
+    try {
+      execFileSync("git", [...prefix, ...args], {
+        encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore",
+      });
+      return true;
+    } catch (e) {
+      return e && e.status;
+    }
+  };
+  const rc = probe(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`]);
+  if (rc === true) return true;
+  if (rc !== 1) return null; // any other exit = unknown (callers map null fail-CLOSED)
+  // rc 1: the ref does not RESOLVE. Distinguish a cleanly ABSENT ref from a
+  // broken-but-present one (dangling symref / corrupt target object — both
+  // make rev-parse --verify exit 1 while git branch -M would still clobber
+  // the ref rc 0) via the loose-ref file, which exists for every loose ref
+  // whether or not it resolves (--git-path only maps the path; packed refs
+  // resolved rc 0 above and never reach here).
   try {
-    execFileSync("git", args, {
-      encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore",
-    });
-    return true;
-  } catch (e) {
-    return (e && e.status === 1) ? false : null;
+    const refPath = execFileSync("git", [...prefix, "rev-parse", "--git-path", `refs/heads/${name}`], {
+      encoding: "utf-8", cwd, timeout: 5000,
+    }).trim();
+    if (!refPath) return null;
+    // --git-path prints cwd-relative when the gitdir is implied; resolve
+    // against the probe cwd (absolute gitdirs print absolute paths — resolve
+    // passes them through unchanged).
+    return existsSync(resolve(cwd, refPath));
+  } catch {
+    return null; // --git-path failed → unknown (fail-closed at callers)
   }
 }
 
@@ -820,9 +849,12 @@ export function decideM2({
  *     SYNCHRONOUSLY (the allowed carve-out must never trigger a spurious M1
  *     warn on the next tool_call).
  *   rename of the session's OWN baseline branch → { reBaseline: <to> } — but
- *     ONLY onto a FREE name (#598): a forced rename onto an EXISTING branch
- *     that is neither the branch being renamed nor owned by this session
- *     (renameDstExists + ownedBranches) clobbers that foreign ref rc 0 → block.
+ *     NOT onto an EXISTING branch that is neither the branch being renamed
+ *     nor owned by this session (#598: renameDstExists + ownedBranches — that
+ *     forced rename clobbers a foreign ref rc 0 → block). The carve-out also
+ *     requires the rename to run in the repo that recorded the baseline
+ *     (baseline.repoKey === repoKey — the #376 discipline; a name collision
+ *     in another clone never re-baselines).
  *   switch-existing to the session's ORIGINAL baseline branch (baseline.original
  *     — the branch recorded at session_start BEFORE any create-new re-baseline):
  *     allowed in agent-infra main → { reBaseline: <target> } — the sanctioned
@@ -917,6 +949,24 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
         };
       }
       return { reBaseline: branchOp.to };
+    }
+    if (baseline && branchOp.to && from === baseline.branch) {
+      // Round-2 reviewer P2: the rename's from IS the baseline branch name but
+      // the resolved repo is NOT the repo that recorded the baseline (a
+      // cross-clone name collision, or a degraded repo) — the generic
+      // "not this session's baseline" text below would mislead a user whose
+      // branch name IS the baseline; the carve-out is repo-scoped (#598).
+      return {
+        block: true,
+        reason: [
+          `⛔ git branch -m/-M/-Mq/--move blocked in the MAIN checkout.`,
+          `   Why: this rename runs in a different checkout than the one that`,
+          `   recorded this session's baseline "${baseline.branch}" — the`,
+          `   own-baseline rename carve-out is repo-scoped (#598).`,
+          `   → Run the rename in the repo where this session started, or`,
+          `     work in an isolated worktree (using-git-worktrees skill).`,
+        ].join("\n"),
+      };
     }
     return {
       block: true,

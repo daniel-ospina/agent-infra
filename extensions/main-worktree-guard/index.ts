@@ -1195,11 +1195,14 @@ export default function (pi: ExtensionAPI) {
             // authorize a switch here.
             repoKey: muEff.repoKey,
             // #598: branches this pid CREATED (create-new) or renamed its own
-            // baseline to are owned (the #543/#588 ownership check, keyed on
-            // the MUTATION's repo — _markOwned writes under baseline.repoKey
-            // when the baseline repo IS the mutation repo, else muEff.repoKey,
-            // and the rename arm below requires baseline.repoKey === repoKey,
-            // so muEff.repoKey is the write-key in every reachable case): the
+            // baseline to are owned (the #543/#588 ownership check). The read
+            // is keyed on the MUTATION's repo (muEff.repoKey): _markOwned
+            // writes under baseline.repoKey when the baseline repo IS the
+            // mutation repo; with NO baseline, under muEff.repoKey; a baseline
+            // in a DIFFERENT repo records nothing (repo-scoped — the create-
+            // new/rename _markOwned calls below guard on repoKey equality).
+            // The rename arm requires baseline.repoKey === repoKey, so for the
+            // rename allow-path the muEff.repoKey read is the write key — the
             // own-baseline rename carve-out still holds when the dst is one of
             // the session's OWN refs (renaming onto a foreign ref blocks
             // above).

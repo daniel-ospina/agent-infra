@@ -628,6 +628,18 @@ ok("M3 #598: localBranchExists empty name → null", localBranchExists(MAIN, "")
   // victim2 exists ONLY in D; probing from A's cwd with D's gitDir must
   // resolve it (A's own refs do not contain it).
   ok("M3 #598 real-git: gitDir-anchored probe reads the --git-dir repo (not the cwd repo)", localBranchExists(A, "victim2") === false && localBranchExists(A, "victim2", join(D, ".git")) === true, String(localBranchExists(A, "victim2")));
+  // Round-2 reviewer P2 (broken-but-present refs): a DANGLING symref makes
+  // rev-parse --verify exit 1 — a naive rc-1→absent mapping would read the
+  // dst as FREE and let the carve-out clobber a real (already-broken) foreign
+  // ref rc 0. The rc-1 loose-ref fallback must report EXISTS → the gate
+  // blocks; a corrupt-TARGET loose ref (valid sha, missing object) actually
+  // resolves rc 0 → EXISTS via the primary probe.
+  spawnSync("git", ["symbolic-ref", "refs/heads/symDangle", "refs/heads/ghost"], { cwd: D, encoding: "utf-8" });
+  ok("M3 #598 real-git: dangling-symref dst reads EXISTS (rc-1 loose-ref fallback)", localBranchExists(D, "symDangle") === true, String(localBranchExists(D, "symDangle")));
+  const dangleClobber = spawnSync("git", ["branch", "-M", "symDangle"], { cwd: D, encoding: "utf-8" });
+  ok("M3 #598 real-git: git -M current → dangling-symref dst clobbers rc 0 (why EXISTS must block)", dangleClobber.status === 0, String(dangleClobber.status));
+  writeFileSync(join(D, ".git", "refs", "heads", "corruptT"), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n");
+  ok("M3 #598 real-git: corrupt-target loose ref resolves (rc 0) → reads EXISTS", localBranchExists(D, "corruptT") === true, String(localBranchExists(D, "corruptT")));
 }
 
 // ── decideM3 #376: ceremony return-to-original-baseline carve-out ──────────
