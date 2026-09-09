@@ -8,7 +8,7 @@
 // default = inactive → block).
 
 import { execSync, execFileSync } from "node:child_process";
-import { resolve, join, dirname, relative } from "node:path";
+import { resolve, join, dirname, relative, basename } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, statSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 
@@ -1795,14 +1795,40 @@ export function classifyGitCommandDetailed(command) {
  * Main checkout: git-common-dir is ".git" (or the real .git path).
  * Worktree:      git-common-dir resolves into <main>/.git/worktrees/<name>.
  */
+// -- STRUCTURAL linked-worktree test (#618/#621 adversarial-review F1) ------
+// Distinguishes a repo's MAIN checkout from a LINKED WORKTREE by comparing the
+// realpath of `git rev-parse --git-dir` against `--git-common-dir`: in the
+// MAIN checkout both resolve to the SAME real directory (`<top>/.git`); in a
+// linked worktree `--git-dir` points UNDER the common dir
+// (`<common>/.git/worktrees/<name>`). The historical path-substring test
+// (`gitDir.includes("/worktrees/")`) was path-STRING dependent and failed
+// OPEN for a MAIN checkout whose OWN path contained a `worktrees` segment:
+// from a subdirectory git prints the ABSOLUTE gitdir (`~/worktrees/repo/.git`),
+// the substring matched, and the repo was misread as a linked worktree
+// (isMain:false → the #618/#621 hub-write gate silently lifted for every
+// target under that repo's subdirectories — probe-verified 2026-09-09).
+// git prints repo-relative paths when cwd is under the gitdir's parent and
+// absolute otherwise; resolve() against cwd normalizes BOTH spellings, and
+// realpathSync canonicalizes a symlinked `.git`.
+// Not a git repo → throws (callers catch — isWorktreeCwd degrades to false =
+// treat as main, the safe/block default).
+export function gitCheckoutIsLinkedWorktree(cwd) {
+  const gitDir = execSync("git rev-parse --git-dir", {
+    encoding: "utf-8", cwd, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+  const commonDir = execSync("git rev-parse --git-common-dir", {
+    encoding: "utf-8", cwd, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+  if (!gitDir || !commonDir) return false;
+  const g = resolve(cwd, gitDir);
+  const c = resolve(cwd, commonDir);
+  if (g === c) return false; // same spelling (main at its toplevel: both ".git")
+  return realpathSync(g) !== realpathSync(c);
+}
+
 export function isWorktreeCwd(cwd) {
   try {
-    // --git-dir in a linked worktree resolves into <main>/.git/worktrees/<name>;
-    // in the main checkout it is just ".git" (or the real .git path).
-    const gitDir = execSync("git rev-parse --git-dir", {
-      encoding: "utf-8", cwd, timeout: 5000,
-    }).trim();
-    return gitDir.includes("/worktrees/") || gitDir.endsWith("/worktrees");
+    return gitCheckoutIsLinkedWorktree(cwd);
   } catch {
     return false; // not a git repo — treat as main (safe default: block)
   }
@@ -2023,12 +2049,11 @@ export function isBranchInMainCheckout(branch) {
  */
 export function getMainCheckoutBranch() {
   try {
-    const gitDir = execSync("git rev-parse --git-dir", {
-      encoding: "utf-8", timeout: 5000,
-    }).trim();
-    // If git-dir resolves into worktrees/, we're in a worktree — the main
-    // checkout is a separate entity, so return null.
-    if (gitDir.includes("/worktrees/") || gitDir.endsWith("/worktrees")) {
+    // In a linked worktree the main checkout is a separate entity — null
+    // (structural test: gitdir vs commondir realpaths — see
+    // gitCheckoutIsLinkedWorktree; path-substring matching misread main
+    // checkouts whose own path contains a `worktrees` segment).
+    if (gitCheckoutIsLinkedWorktree(process.cwd())) {
       return null;
     }
     return execSync("git branch --show-current", {
@@ -3950,6 +3975,20 @@ export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
   }
 }
 
+// Does any ancestor of `p` (p itself included) carry the exact name `.git`?
+// Drives the git-internal walk in resolveTargetCheckout: a target under a
+// repo's `.git/` metadata dir must keep walking up to the OWNING checkout;
+// a genuinely non-git path has no `.git` ancestry and stops after one probe.
+function _hasDotGitAncestor(p) {
+  let cur = resolve(p);
+  for (;;) {
+    if (basename(cur) === ".git") return true;
+    const parent = dirname(cur);
+    if (parent === cur) return false;
+    cur = parent;
+  }
+}
+
 /**
  * #618/#621 — the TARGET-aware checkout classification for a write/edit path
  * (the shared mechanism both hub-write issues consume). Resolves the git
@@ -3959,8 +3998,18 @@ export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
  *   - top    = resolve-normalized git toplevel of the containing checkout (or
  *              null when the path is outside any git repo)
  *   - isMain = true when the containing checkout is the repo's MAIN checkout
- *              (git-dir NOT under .git/worktrees/) — a "hub main" path whose
- *              tracked files must be gated no matter where the session sits.
+ *              — judged STRUCTURALLY (gitCheckoutIsLinkedWorktree realpath
+ *              comparison; the old git-dir path-substring test misread a
+ *              main checkout whose own path contains a `worktrees` segment)
+ *              — a "hub main" path whose tracked files must be gated no
+ *              matter where the session sits.
+ * Git-internal targets (a path INSIDE a repo's `.git` metadata dir — hooks/,
+ * config, worktrees/) fail `rev-parse --show-toplevel` from within `.git`;
+ * the walk continues PAST the nearest `.git` directory to the OWNING checkout
+ * so `<hub>/.git/hooks/pre-commit` resolves to the hub MAIN (never to "outside
+ * any git repo" — the write gates must be able to gate it). For a genuinely
+ * non-git path (no `.git` segment in the ancestry) the loop exits after ONE
+ * failed probe — no unbounded ancestor scanning on the hot path.
  * Worktree targets return { top, isMain:false } — isolated by construction, so
  * callers let them through (epic-529: a worktree session's own edits resolve
  * to ITS worktree checkout, never a main checkout).
@@ -3970,7 +4019,8 @@ export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
  */
 export function resolveTargetCheckout(targetPath, cwd = process.cwd()) {
   try {
-    let dir = resolve(cwd, targetPath ?? "");
+    const abs = resolve(cwd, targetPath ?? "");
+    let dir = abs;
     // A DIRECTORY input IS the checkout dir to classify (session cwds,
     // already-created target dirs); a FILE input classifies via its parent
     // dir; a not-yet-existing path walks up to the nearest existing dir.
@@ -3980,16 +4030,26 @@ export function resolveTargetCheckout(targetPath, cwd = process.cwd()) {
       if (parent === dir) break;
       dir = parent;
     }
-    const gitDir = execSync("git rev-parse --git-dir", {
-      encoding: "utf-8", cwd: dir, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    if (!gitDir) return null;
-    const top = execSync("git rev-parse --show-toplevel", {
-      encoding: "utf-8", cwd: dir, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    if (!top) return null;
-    const isWorktree = gitDir.includes("/worktrees/") || gitDir.endsWith("/worktrees");
-    return { top: resolve(top), isMain: !isWorktree };
+    for (let hops = 0; hops < 64; hops++) {
+      try {
+        const top = execSync("git rev-parse --show-toplevel", {
+          encoding: "utf-8", cwd: dir, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+        if (top) {
+          return { top: resolve(top), isMain: !gitCheckoutIsLinkedWorktree(dir) };
+        }
+      } catch { /* not a checkout from `dir` — try the relevant ancestor */ }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      // Walk up ONLY while the probe still sits under a `.git` DIRECTORY in
+      // its ancestry (a git-internal target whose owner checkout sits above
+      // the topmost .git). A non-git path (no .git segment) or an ordinary
+      // repo path that already resolved breaks here — one failed probe total
+      // on the hot path (cost control), never an unbounded ancestor scan.
+      if (!_hasDotGitAncestor(dir)) break;
+      dir = parent;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -5412,13 +5472,12 @@ export function classifyUntrackedWip(porcelain) {
  */
 export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
   try {
-    if (skipWorktree && isWorktreeCwd(cwd)) return { disorder: null, branch: null };
-    const gitDir = execSync("git rev-parse --git-dir", {
-      encoding: "utf-8", cwd, timeout: 5000,
-    }).trim();
-    if (gitDir.includes("/worktrees/") || gitDir.endsWith("/worktrees")) {
-      return { disorder: null, branch: null };
-    }
+    // Linked worktrees never report hub disorder (D5 — isolated by
+    // construction; a worktree gitdir/`.git/worktrees/…` cwd included). The
+    // test is STRUCTURAL (gitdir vs commondir realpaths) — the old
+    // path-substring test misread a main checkout whose own path contains a
+    // `worktrees` segment as a worktree and silently skipped its disorder.
+    if (gitCheckoutIsLinkedWorktree(cwd)) return { disorder: null, branch: null };
     const branch = execSync("git branch --show-current", {
       encoding: "utf-8", cwd, timeout: 5000,
     }).trim() || null;

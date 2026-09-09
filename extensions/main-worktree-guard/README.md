@@ -276,22 +276,32 @@ dirty, and trips M4's freeze. Surfaces:
    now names the amplifier pattern.
 2. **Bash-write GATE for TRACKED files in hub MAIN checkouts (#437 +
    #618/#621):** the gate is TARGET-aware — each write candidate's containing
-   checkout is resolved, and hub discipline applies per target. When the shell
-   executing the write is ROOTED in that main (a hub-rooted session, or a
-   `cd` into a hub), a bash write (`>`/`>>` redirect, `tee`, python
+   checkout is resolved, and hub discipline applies per target. The gate runs
+   for EVERY bash command (a CLEAN main-rooted controller writing another
+   repo's hub via python/heredoc/tee is gated exactly like the write/edit
+   tool — the #621 channel). Same-vs-cross-checkout is judged by the SESSION's
+   own checkout, never by a command `cd`-site: when the SESSION is rooted in
+   the target main, a bash write (`>`/`>>` redirect, `tee`, python
    `open(…, "w"|"a")`) whose target is an INDEX-TRACKED file is
    **blocked while that hub is OFF-MAIN or DIRTY** —
    the same freeze the write/edit tools apply, on the bash route
    that previously landed the tracked-file dirt of the 2026-08-31 tortoise
    session (write/edit blocked → python-heredoc fallback → landed). When the
-   write target is a hub main the session shell is NOT rooted in (a worktree
+   write target is a hub main the SESSION is NOT rooted in (a worktree
    session → its own repo's main, a foreign/non-git cwd, or another repo's
-   session), the write is a DELIBERATE cross-checkout hub write and a TRACKED
-   target blocks REGARDLESS of hub state — the vector behind the 2026-09-08
+   session — whether the path is absolute or reached by `cd`-ing into the
+   hub), the write is a DELIBERATE cross-checkout hub write: a TRACKED
+   target blocks REGARDLESS of hub state, and so does any target under that
+   main's `.git/` metadata (`.git/hooks/*`, `.git/config` — never
+   index-tracked, so a cross-checkout session cannot plant a hub hook) —
+   the vectors behind the 2026-09-08
    mass `.husky/pre-commit` rewrite from the GitHub parent dir and the
    wt-session python open() probes. Tracked-ness
    is exact (`git ls-files --error-unmatch`, one bounded call for all
-   candidates per target repo); hub-equality is realpath-normalized.
+   candidates per target repo); hub-equality is realpath-normalized;
+   main-vs-worktree is judged STRUCTURALLY (gitdir vs commondir realpaths —
+   a main checkout whose path contains a `worktrees` segment is not
+   misread as a linked worktree).
    Block message states the single coherent rule: bash writes respect the same
    hub gate as the tools; only the session-start host env bypasses — a
    mid-command `export` cannot. The gate resolves redirect operands that the
@@ -303,7 +313,10 @@ dirty, and trips M4's freeze. Surfaces:
    `tee`, and python `open(…,"w"/"a")` — NOT in-place overwrite VERBS
    (`sed -i`, `perl -pi`, `cp`/`mv` onto a tracked file, `install`, `dd
    of=`, `tar -x`/`unzip -o` into the hub, `patch -p1`); those contain no
-   write-primitive construct and are outside this mechanism's scope. NOTE —
+   write-primitive construct and are outside this mechanism's scope (the
+   block message does NOT coach them as an alternative — they are an explicit
+   documented residual, and the same verb overwrite via the write/edit tools
+   or as a git-verb stays frozen by the other gates). NOTE —
    a raw bash verb overwrite of a tracked hub file while disordered is NOT
    covered by any guard: the write/edit freeze only intercepts tool events,
    and M4 classifies these as non-git (allowed). Documented residual: only
@@ -342,12 +355,14 @@ separate dedupe namespaces, and the inventory dedupes per path.
 **Design deviations (documented):** the bash-write WARN heuristic resolves
 write targets against the session cwd — `cd`-prefixed writes into the hub are
 false-negatives on the WARN surface (a warning is cheap, a missed one is not
-an incident); the #618/#621 bash GATE runs the cd-aware per-write-site walker
-so its same-vs-cross-checkout decisions resolve where the write executes (a
-`cd`-hidden write into a hub main from a clean same-checkout shell stays #437's
-documented residual; a `cd`-hidden write from a foreign/worktree session whose
-hub is CLEAN is a cheap-extractor false-negative only when the command also
-has no top-level write candidate — accepted, same class); a failed hub-toplevel
+an incident); the #618/#621 bash GATE is a target-aware cd-resolving walker
+with NO cheap pre-bail (a write-free command costs only the pure string walk;
+`bash -c '…'` / sudo-tee / spawner-wrapped payloads are walked, never
+pre-filtered away), and its same-vs-cross-checkout decision is SESSION-rooted
+(a worktree/foreign session that `cd`s into a hub and writes is still a
+cross-checkout write and blocks — review fold-in on the old command-site
+comparison); a clean same-checkout shell's tracked writes into its own main
+stays #437's documented residual; a failed hub-toplevel
 cache resolution disables the warn surfaces for up to 30s (then retries —
 never terminally); hub-equality is realpath-normalized (M4's blocks use fresh
 per-call resolution and are unaffected); the python `open()`

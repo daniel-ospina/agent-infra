@@ -54,9 +54,16 @@
 //     epic-529 early-return), foreign/non-git cwds (were invisible to
 //     readHubDisorder / _mainTopLevel), and other repos' sessions
 //     (agent-infra-rooted controllers writing tortoise/premise-labs main after
-//     the #615 removal). Worktree sessions still write their OWN worktree
-//     freely — its targets resolve to that worktree's checkout, never a main
-//     checkout. Env hatch + TTL marker bypass the clean-hub write gate; M4's
+//     the #615 removal). The bash gate runs for EVERY command (a clean
+//     main-rooted session writing another hub via bash is gated too — review
+//     fold-in); same-vs-cross-checkout is judged by the SESSION's checkout,
+//     never a command `cd`-site; cross-checkout tracked AND `.git/`-metadata
+//     writes block regardless of hub state. Worktree sessions still write
+//     their OWN worktree freely — its targets resolve to that worktree's
+//     checkout, never a main checkout. Main-ness and worktree-ness are judged
+//     STRUCTURALLY (gitdir vs commondir realpaths — the path-substring test
+//     misread a main checkout under a `worktrees/` directory as a linked
+//     worktree). Env hatch + TTL marker bypass the clean-hub write gate; M4's
 //     disordered-hub freeze stays active under the marker.
 //
 // Worktrees are ISOLATED — none of this applies inside a worktree. The only
@@ -432,7 +439,11 @@ function _checkoutOf(p: string): { top: string; isMain: boolean } | null {
     }
     let r: { top: string; isMain: boolean } | null = null;
     try { r = resolveTargetCheckout(key); } catch { r = null; }
-    if (r === null && targetCheckoutCache.size >= TARGET_CHECKOUT_CACHE_MAX) {
+    if (targetCheckoutCache.size >= TARGET_CHECKOUT_CACHE_MAX) {
+      // Bound enforced on EVERY insert (positive entries included — the old
+      // null-only eviction let positive keys grow past the cap unboundedly
+      // on a many-file batch; oldest-evicted is fine — a re-request just
+      // re-resolves, and positive stickiness only matters under the cap).
       const oldest = targetCheckoutCache.keys().next().value as string | undefined;
       if (oldest !== undefined) { targetCheckoutCache.delete(oldest); targetCheckoutNullAt.delete(oldest); }
     }
@@ -459,28 +470,23 @@ function _targetTrackedAt(top: string, tgtReal: string): boolean {
   }
 }
 
-// #618/#621: is the SESSION rooted in a hub MAIN checkout (vs a worktree or a
-// non-git/foreign cwd)? The bash tracked-write gate runs for non-main-rooted
-// sessions even when their own cwd's repo is clean, because any hub-main
-// write they issue is a deliberate cross-checkout write. Cached (_checkoutOf).
-function _sessionIsMainRooted(): boolean {
-  const ck = _checkoutOf(resolve(process.cwd()));
-  return !!ck && ck.isMain;
-}
-
 // #618/#621: the write/edit block reason for a cross-cwd write into a hub
 // MAIN checkout (the session is NOT rooted in that main — worktree session,
 // foreign/non-git cwd, or another repo's session). Names the TARGET repo's
-// hub discipline and the sanctioned routes.
+// hub discipline and the sanctioned routes. `.git/`-metadata targets
+// (hooks/, config) get the same freeze — they are never index-tracked but
+// a cross-cwd write into them is the same deliberate-hub-write vector
+// (adversarial-review F4).
 function _hubTargetWriteBlockReason(rel: string, top: string, wipHint: string): string {
+  const gitMeta = rel.startsWith(".git/");
   return [
-    `⛔ File write to a tracked hub file blocked (${rel}).`,
+    `⛔ File write to a hub ${gitMeta ? "git-metadata file" : "tracked file"} blocked (${rel}).`,
     ...(wipHint ? [wipHint] : []),
     `   The target resolves to ${top} — that repo's shared MAIN checkout`,
     `   (#618/#621). Hub writes are gated by the TARGET repo wherever the`,
     `   session sits: worktree, foreign/non-git cwd, and other-repo sessions`,
     `   get the same freeze as a hub-rooted session. Only new-file writes`,
-    `   stay allowed (additive/visible); tracked-file overwrites block.`,
+    `   stay allowed (additive/visible); tracked-file and ${gitMeta ? ".git/" : ""}overwrites block.`,
     `   → Work in a worktree of that repo: invoke the using-git-worktrees skill.`,
     `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
     `     override (deliberate solo sessions only).`,
@@ -659,39 +665,39 @@ function _maybeWarnBashWrite(command: string) {
 // blocked; the #350 bash-write path was warn-only). Since #618/#621 the gate
 // is TARGET-aware: each write candidate's CONTAINING CHECKOUT is resolved via
 // resolveTargetCheckout (not the session cwd), and hub discipline is applied
-// per target:
-//   - same-checkout (the shell executing the write is rooted in that main):
-//     #437 semantics — block tracked overwrites ONLY while that main is
-//     DISORDERED (build/formatter/npm-install side effects on a clean main
-//     must never false-block; tracked-ness is exact via `git ls-files`).
-//   - cross-checkout (a DELIBERATE write into a hub main the session shell is
-//     NOT rooted in — a worktree session writing its own repo's main, a
-//     foreign/non-git cwd, or another repo's session): block TRACKED
-//     overwrites regardless of hub state — the vector behind the 2026-09-08
+// per target. The gate runs for EVERY non-hatched bash command (no
+// session-hub-state precondition — a CLEAN main-rooted controller writing
+// ANOTHER repo's hub via python/heredoc/tee is the #621 channel too), and the
+// per-candidate semantics are:
+//   - SAME-checkout — the SESSION's own checkout IS that main (judged by the
+//     session cwd's checkout, NEVER by the command's transient cd-site: a
+//     worktree/foreign session that `cd`s into a hub and writes is still a
+//     deliberate cross-checkout session): #437 semantics — block tracked
+//     overwrites ONLY while that main is DISORDERED (build/formatter/
+//     npm-install side effects on a clean main must never false-block;
+//     tracked-ness is exact via `git ls-files`).
+//   - CROSS-checkout — session shell NOT rooted in the target main (a
+//     worktree session writing its own repo's main, a foreign/non-git cwd, or
+//     another repo's session, incl. a clean agent-infra main): block TRACKED
+//     overwrites regardless of hub state, PLUS any write into that main's
+//     `.git/` metadata (hooks/, config — never index-tracked, so the tracked
+//     intersect cannot see them). These are the vectors behind the 2026-09-08
 //     mass `.husky/pre-commit` rewrite from the GitHub parent dir and the
 //     wt-session python open() probes into premise-labs/tortoise AGENTS.md.
 // NEW-file writes and untracked WIP keep the warn-only treatment (#350 / the
 // #436 collision-free carve-out). Script-file content (`bash /tmp/x.sh`) is
-// walked with the SAME per-candidate classifier (bounded depth). Fail-safe:
-// any git/parse error → null (never false-block). One bounded `git ls-files`
-// per distinct target top for all its candidates. Uses the PER-WRITE-SITE
-// extractor (bashWriteTargetsResolved — cd-aware, -c/eval recursion,
-// heredoc-body/escaped-\> exclusion; candidates carry their SITE cwd so
-// same-vs-cross-checkout is resolved where the write executes).
+// walked with the SAME per-candidate classifier (bounded depth). There is NO
+// cheap pre-bail: bashWriteTargetsResolved is a PURE string walk (zero git
+// spawns on a write-free command), and the earlier bail fired exactly for
+// worktree/foreign sessions (their hub disorder reads null) — letting
+// `bash -c '…'` / sudo-tee / spawner-wrapped payloads past the walker
+// (adversarial-review F3). Fail-safe: any git/parse error → null (never
+// false-block). One bounded `git ls-files` per distinct target top for all
+// its candidates.
 function _hubBashTrackedWrite(command: string, sessionDisorder: string | null): { resolvedPath: string; rel: string } | null {
   try {
     if (!classifierLoaded) return null;
     const base = resolve(process.cwd());
-    // Cheap no-candidate bail for the CLEAN path only: the pure quote-aware
-    // scan costs a fraction of the full walker — a write-free command needs no
-    // gate. When the session's OWN hub is DISORDERED (sessionDisorder set) the
-    // full-walker semantics are preserved exactly (a `bash /tmp/x.sh` whose
-    // SCRIPT writes a tracked hub file is walked even when the top command has
-    // no visible write target — extractScriptPath catches the script token
-    // cheaply here too).
-    if (sessionDisorder === null
-      && extractBashWriteTargets(command, base).length === 0
-      && extractScriptPath(command) === null) return null;
     // cycle-27 P2: the base MUST be the session cwd — bashWriteTargetsResolved
     // applies the command's OWN cd chain from its session base (script tokens
     // carry their site cwd). Passing a pre-consumed execCwd (already cd'd by
@@ -701,36 +707,26 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null): 
     const extracted = bashWriteTargetsResolved(command, base);
     const targets = extracted.filter((t) => (t as { resolvedPath?: string }).resolvedPath);
     if (targets.length === 0 && !(extracted as { scriptToks?: unknown[] }).scriptToks?.length) return null;
-    // The session's own checkout (cached). For same-checkout candidates whose
-    // top IS the session's main, the caller's sessionDisorder is reused (no
-    // re-read); other same-checkout tops (a `cd` into a different main) and
-    // cross-checkout tops are resolved per distinct repo with a per-command
-    // disorder cache (readHubDisorder on the top).
+    // The session's OWN checkout (cached) is the same-vs-cross reference.
+    // sameCheckout is TRUE only when the SESSION is rooted in the candidate's
+    // main; the candidate's transient command-site cwd (a `cd` into the hub)
+    // is deliberately NOT consulted — a `cd` by a foreign/worktree session is
+    // still a cross-checkout write (adversarial-review F1: the old site-cwd
+    // comparison demoted `cd <hub> && echo x > AGENTS.md` to "same-checkout"
+    // and let a clean hub's tracked file be overwritten from any cwd).
     const sessionCheck = _checkoutOf(base);
     const sessionOwnHub = sessionCheck && sessionCheck.isMain ? sessionCheck.top : null;
     const grouped = new Map<string, { tPath: string; rel: string }[]>();
-    const siteCheckCache = new Map<string, { top: string; isMain: boolean } | null>();
-    const siteCheckOf = (cwd: string) => {
-      const k = resolve(cwd || base);
-      if (!siteCheckCache.has(k)) siteCheckCache.set(k, _checkoutOf(k));
-      return siteCheckCache.get(k) ?? null;
-    };
-    const hubDisorderCache = new Map<string, string | null>();
-    const hubDisorderOf = (top: string): string | null => {
-      if (!hubDisorderCache.has(top)) {
-        let d: string | null = null;
-        try { d = readHubDisorder(top).disorder; } catch { d = null; }
-        hubDisorderCache.set(top, d);
-      }
-      return hubDisorderCache.get(top) ?? null;
-    };
+    let gitInternalHit: { resolvedPath: string; rel: string } | null = null; // cross-checkout write into a hub's .git/ metadata
     // Classify ONE write candidate (top-level write or script-content write):
     // resolve its containing checkout; skip non-main (worktree/non-git)
-    // targets; same-checkout candidates gate only on THAT main's disorder;
-    // cross-checkout candidates (session shell NOT rooted in the target main)
-    // are deliberate hub writes — any tracked target blocks. Candidates that
-    // pass the classifier are grouped per top so the tracked query stays ONE
-    // bounded `git ls-files` per repo.
+    // targets; same-checkout candidates gate only on the SESSION's hub
+    // disorder (== that main's — the session IS rooted there); cross-checkout
+    // candidates (session shell NOT rooted in the target main) are deliberate
+    // hub writes — any tracked target blocks, and so does any target under
+    // the hub's `.git/` (never tracked — must still freeze). Candidates that
+    // pass are grouped per top so the tracked query stays ONE bounded
+    // `git ls-files` per repo.
     const classify = (t: { resolvedPath?: string; cwd?: string }) => {
       const tPath = t.resolvedPath;
       if (!tPath) return;
@@ -739,12 +735,16 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null): 
       if (!ck || !ck.isMain) return; // worktree/foreign non-main target — isolated
       const rel = tReal.slice(ck.top.length).replace(/^[/\\]+/, "");
       if (!rel || tReal === ck.top) return;
-      const siteCk = siteCheckOf(t.cwd ?? base);
-      const sameCheckout = !!siteCk && siteCk.top === ck.top;
+      const sameCheckout = sessionOwnHub !== null && sessionOwnHub === ck.top;
       if (sameCheckout) {
-        // shell rooted in this main → #437 disorder-scoped gate.
-        const dis = sessionOwnHub === ck.top ? sessionDisorder : hubDisorderOf(ck.top);
-        if (dis === null) return; // clean same-checkout main — documented residual
+        if (sessionDisorder === null) return; // clean same-checkout main — documented residual (#437)
+      } else if (rel.startsWith(".git/")) {
+        // Cross-checkout write into this main's git-internal metadata: never
+        // an index-tracked file, so the tracked intersect below cannot see it
+        // — block directly (a foreign session planting a hub's
+        // .git/hooks/pre-commit must not be free; adversarial-review F4).
+        gitInternalHit = { resolvedPath: tPath, rel };
+        return;
       }
       // reached → disordered-same-checkout OR deliberate cross-checkout: the
       // tracked test decides.
@@ -785,6 +785,7 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null): 
         }
       } catch { /* never false-block */ }
     }
+    if (gitInternalHit) return gitInternalHit;
     if (grouped.size === 0) return null;
     // ONE bounded index query per DISTINCT target top: `git ls-files
     // --error-unmatch` prints exactly the TRACKED rels (exit≠0 when any path
@@ -802,24 +803,27 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null): 
 
 // #437 (C) + #618/#621: the block reason for a tracked-hub bash write — states
 // the coherent rule (bash writes respect the same hub gate as the write/edit
-// tools, resolved against the WRITE TARGET's repo — the session shell rooted
-// in a disordered main freezes on tracked overwrites, and a DELIBERATE
-// cross-checkout write into any hub main freezes too; only session-start host
-// env bypasses; a mid-command `export` cannot) plus the sanctioned ways
-// forward (salvage / worktree).
+// tools, resolved against the WRITE TARGET's repo — a DELIBERATE cross-
+// checkout write into any hub main freezes regardless of hub state, a session
+// shell rooted in a disordered main freezes on tracked overwrites, and a
+// cross-checkout write into a hub's `.git/` metadata freezes too; only
+// session-start host env bypasses; a mid-command `export` cannot) plus the
+// sanctioned ways forward (salvage / worktree).
 function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string }): string {
+  const gitMeta = hit.rel.startsWith(".git/");
   return [
-    `⛔ Bash write to a tracked hub file blocked (${hit.rel}).`,
-    `   The shared main checkout is OFF-MAIN or DIRTY (#1484) — bash WRITE`,
-    `   PRIMITIVES to tracked files respect the SAME gate as the tools:`,
-    `   >/>>/&> redirects, tee, and python open(...,"w"/"a").`,
-    `   Untracked/new-file writes stay allowed; only session-start host env`,
+    `⛔ Bash write to a hub ${gitMeta ? "git-metadata file" : "tracked file"} blocked (${hit.rel}).`,
+    `   The write target's repo is a shared MAIN checkout (#618/#621) — bash`,
+    `   write primitives respect the SAME gate as the write/edit tools: a`,
+    `   DELIBERATE cross-checkout write (your session is not rooted in that`,
+    `   repo) freezes regardless of hub state, and a session rooted in a`,
+    `   DISORDERED main freezes on tracked overwrites.`, 
+    `   Untracked/new-file writes stay allowed. Only session-start host env`,
     `   (AGENT_ALLOW_MAIN_EDITS=1) bypasses — a mid-command export cannot.`,
-    `   (In-place overwrite VERBS like sed -i / cp are not a write primitive;`,
-    `   prefer the salvage/worktree routes below for those.)`,
-    `   → Capture the dirty set first (hub returns to main+CLEAN):`,
-    `     bash scripts/checkout-hygiene/hub-worktree.sh salvage <branch> <repo>`,
-    `   → Or write into a worktree (using-git-worktrees skill).`,
+    `   → Work in a worktree of the TARGET repo (using-git-worktrees skill,`,
+    `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
+    `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
+    `     override (deliberate solo sessions only).`,
   ].join("\n");
 }
 
@@ -1088,19 +1092,18 @@ export default function (pi: ExtensionAPI) {
         const backdoor = _backdoorBlock(command, execCwd);
         if (backdoor) return { block: true, reason: backdoor };
         const st = _hubState();
-        // #618/#621: the tracked bash-write gate is TARGET-aware — evaluated
-        // when the SESSION hub is disordered (the #437 trigger — a hub-rooted
-        // session cannot freeze-bypass via python/heredoc/tee) OR when the
-        // session is NOT rooted in a hub main (worktree / foreign / non-git
-        // cwds — the sessions the target-aware gate now sees; their tracked
-        // writes into ANY hub main are deliberate cross-checkout writes). A
-        // main-rooted session on a CLEAN hub skips the gate (same-checkout
-        // clean-main writes are #437's documented residual — build/formatter
-        // side effects must not false-block).
-        if (st.disorder || !_sessionIsMainRooted()) {
-          const bashWrite = _hubBashTrackedWrite(command, st.disorder);
-          if (bashWrite) return { block: true, reason: _hubBashWriteBlockReason(bashWrite) };
-        }
+        // #618/#621: the tracked bash-write gate runs for EVERY non-hatched bash
+        // command, resolving each write TARGET's checkout (review fold-in on the
+        // caller precondition). A CLEAN main-rooted session (the #621 controller
+        // geometry — agent-infra on main+clean) writing another repo's hub via
+        // python/heredoc/tee is a deliberate cross-checkout write and must block
+        // exactly like the write/edit tool does; the old `st.disorder ||
+        // !_sessionIsMainRooted()` guard skipped it because the SESSION's OWN hub
+        // was clean. Same-checkout clean-main writes stay free INSIDE the gate
+        // (#437's residual — classify returns null), so running unconditionally
+        // costs only the pure string walk on write-free commands.
+        const bashWrite = _hubBashTrackedWrite(command, st.disorder);
+        if (bashWrite) return { block: true, reason: _hubBashWriteBlockReason(bashWrite) };
         if (st.disorder) {
           // #437 (C): bash writes to TRACKED hub files while the hub is
           // disordered — the dirty-hub inflow closure (the write/edit gate
@@ -1669,12 +1672,22 @@ export default function (pi: ExtensionAPI) {
     // cwd / another repo's session): TRACKED-file overwrites block — the
     // silent-destruction vector (#618 mass-hook rewrite from the GitHub
     // parent dir; #621 infra-rooted cross-repo leak).
-    if (targetPath && _targetTrackedAt(tgtCheck.top, tgtReal)) {
-      const rel = tgtReal.slice(tgtCheck.top.length).replace(/^[/\\]+/, "") || tgtReal;
-      return {
-        block: true,
-        reason: _hubTargetWriteBlockReason(rel, tgtCheck.top, wipHint),
-      };
+    // `.git/`-metadata targets (hooks/, config) are NEVER index-tracked, so
+    // the tracked intersect below cannot see them — a cross-cwd write into a
+    // hub's .git is the same deliberate-hub-write vector and blocks too
+    // (adversarial-review F4; resolveTargetCheckout now resolves .git-
+    // internal targets up to the owning main).
+    if (targetPath) {
+      const rel0 = tgtReal.startsWith(tgtCheck.top + "/")
+        ? tgtReal.slice(tgtCheck.top.length + 1)
+        : "";
+      if (rel0.startsWith(".git/") || _targetTrackedAt(tgtCheck.top, tgtReal)) {
+        const rel = rel0 || tgtReal.slice(tgtCheck.top.length).replace(/^[/\\]+/, "") || tgtReal;
+        return {
+          block: true,
+          reason: _hubTargetWriteBlockReason(rel, tgtCheck.top, wipHint),
+        };
+      }
     }
     // New/untracked targets into a hub main: additive + visible → #350
     // warn-only when the WIP patterns match (never block).
