@@ -1106,11 +1106,23 @@ export default function (pi: ExtensionAPI) {
       // P2 (cycle 3): resolve the effective repo against the STATE-mutating
       // invocation — `git -C <wt> status && git checkout main` must gate on the
       // main checkout, not the worktree the first invocation pointed at.
-      // #596 (round-2): stateVerbOccurrence makes the resolution follow the
-      // MUTATING branch-state invocation even when it is a LATER compound
-      // segment — a benign first segment's hints (-C/--git-dir) must not
-      // worktree-exempt a main mutation (or main-gate a worktree-scoped one).
-      const eff = branchOwnership.resolveEffectiveRepo(command, process.cwd(), det.stateVerb ?? det.verb, det.stateVerbOccurrence ?? 0);
+      // #596: stateVerbOccurrence makes the resolution follow the MUTATING
+      // branch-state invocation even when it is a LATER compound segment — a
+      // benign first segment's hints (-C/--git-dir) must not worktree-exempt a
+      // main mutation (or main-gate a worktree-scoped one). Round-3: when the
+      // selected mutation is EXTRACTOR-INVISIBLE (stateInvVisible false — an
+      // interpreter-inline `sh -c 'git branch …'` payload, a `$VAR`-resolved
+      // command word, or an absolute-path git), branch-ownership's tokenizer
+      // cannot attribute its hints at all; the payload runs at the shell cwd,
+      // so resolve the M3 repo at the SESSION cwd (conservative — the
+      // main-checkout gates apply; fail-closed, never a worktree exemption the
+      // repo layer cannot verify).
+      let eff;
+      if (det.stateVerb && det.stateInvVisible === false) {
+        eff = branchOwnership.resolveEffectiveRepo("git status", process.cwd());
+      } else {
+        eff = branchOwnership.resolveEffectiveRepo(command, process.cwd(), det.stateVerb ?? det.verb, det.stateVerbOccurrence ?? 0);
+      }
       const allowActive = _isAllowMainEdits();
 
       // M3: branch-state gate — applies in ANY main checkout (resolved,
@@ -1294,7 +1306,19 @@ export default function (pi: ExtensionAPI) {
 
       // ── M2: commit/push ownership (block off-baseline) ──
       if (det.verdict === "block:commit" || det.verdict === "block:push" || det.verdict === "block:force-push") {
-        if (!eff) {
+        // #596 (round-3 reviewer P2-2): M2 must gate the COMMIT/PUSH's own
+        // repo, not the M3 state-invocation repo — a compound with an
+        // off-baseline MAIN commit and a later `-C <wt>`-scoped branch
+        // mutation would otherwise reuse the worktree-exempt eff and let the
+        // off-baseline commit through (the pre-#596 single-eff conflation
+        // predates this PR for 2-segment forms; the 3-segment benign-lead form
+        // flipped block→allow in round-2). preferVerb = the verdict's verb
+        // resolves the commit/push invocation's own repo.
+        const gateVerb = det.verdict === "block:commit" ? "commit" : "push";
+        const m2Eff = eff && det.stateVerb == null
+          ? eff // no branch-state invocation in the command — the shared eff already is the commit/push repo
+          : branchOwnership.resolveEffectiveRepo(command, process.cwd(), gateVerb);
+        if (!m2Eff) {
           return {
             block: true,
             reason: "⛔ git commit/push blocked — could not verify repo ownership (git read failed; fail-closed, #265).",
@@ -1302,7 +1326,7 @@ export default function (pi: ExtensionAPI) {
         }
         const baseline = baselines.get(pid);
         const m2 = branchOwnership.decideM2({
-          effectiveRepo: eff, baseline, currentBranch: eff.currentBranch,
+          effectiveRepo: m2Eff, baseline, currentBranch: m2Eff.currentBranch,
           pushDst: det.pushDst, pushTargets: det.pushTargets,
           verdict: det.verdict, allowActive: false,
         });

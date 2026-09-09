@@ -530,7 +530,7 @@ dexpect("merge origin/main → syncSource", `git fetch origin && git merge origi
 dexpect("rebase origin/main → syncSource", `git rebase origin/main`, { verdict: "block:rebase", syncSource: "origin/main" });
 
 // M3 subclassification surfaces (branchOp via shared classifyBranchOp)
-import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, extractGitInvocation as sharedExtractGitInvocation, decideM3 as sharedDecideM3, ownershipAllowed as sharedOwnershipAllowed } from "../shared/branch-ownership.mjs";
+import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, extractGitInvocation as sharedExtractGitInvocation, decideM2 as sharedDecideM2, decideM3 as sharedDecideM3, ownershipAllowed as sharedOwnershipAllowed } from "../shared/branch-ownership.mjs";
 const co = (cmd) => {
   const d = classifyGitCommandDetailed(cmd);
   // P1-A: classify the STATE-mutating invocation (compound commands must gate
@@ -617,8 +617,11 @@ try {
   const adapter = (cmd, r, infra) => {
     const d = classifyGitCommandDetailed(cmd);
     // mirrors index.ts's exact repo resolution (preferVerb = stateVerb + the
-    // #596 stateVerbOccurrence so a later-segment mutation's -C hints win).
-    const eff = sharedResolveEffectiveRepo(cmd, r, d.stateVerb ?? d.verb, d.stateVerbOccurrence ?? 0);
+    // #596 stateVerbOccurrence so a later-segment mutation's -C hints win;
+    // extractor-invisible mutations resolve at the session cwd).
+    const eff = d.stateVerb && d.stateInvVisible === false
+      ? sharedResolveEffectiveRepo("git status", r)
+      : sharedResolveEffectiveRepo(cmd, r, d.stateVerb ?? d.verb, d.stateVerbOccurrence ?? 0);
     if (!eff) return { resolveFailed: true };
     const op = d.branchState ? sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs) : { op: "other" };
     // mirrors index.ts: baseline of a ceremony session whose original was main
@@ -1237,6 +1240,93 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
   // (non-mutating branch reads must not trip the carve-out bound).
   const hiddenRead = classifyGitCommandDetailed(`git branch -fq feat/1 main $(git branch --show-current)`);
   expectBool("#596 r2: benign branch READ payload stays benign (no hidden mutation)", hiddenRead.hiddenStateSubst === false, true);
+  // Round-3 (reviewer A P1 — round-2 regression): repo-hint attribution must
+  // not let an EXTRACTOR-INVISIBLE mutation (interpreter-inline payload) shift
+  // the occurrence ordinal onto a LATER visible `-C <wt>` invocation. The
+  // payload -Mq runs at the shell cwd (main) and must gate there — the
+  // classifier tags it stateInvVisible:false so index.ts resolves the session
+  // repo instead of asking the repo layer to place an invocation it cannot see.
+  const pay1 = classifyGitCommandDetailed(`git branch side ; sh -c "git branch -Mq feat/x rnX" ; git -C /wt branch -fq zz main`);
+  expectBool("#596 r3: payload mutation between visible segments → stateInvVisible false (session-repo gate)", pay1.branchState === true && pay1.stateInvVisible === false && pay1.stateVerb === "branch" && pay1.stateArgs[0] === "-Mq", true);
+  const pay2 = classifyGitCommandDetailed(`git branch side ; bash -c 'git branch -Mq feat/x rnX'`);
+  expectBool("#596 r3: bash -c payload mutation → stateInvVisible false", pay2.stateInvVisible === false, true);
+  // Round-3 (reviewer B P2-1 — round-2 freeze): wrapper-spelled BENIGN leads
+  // ($VAR command word / absolute-path git / payload create) are invisible to
+  // the repo layer and must NOT shift the ordinal — the visible mutation keeps
+  // occurrence 0 so resolveEffectiveRepo lands on it (no fail-closed freeze).
+  const wrap1 = classifyGitCommandDetailed(`sh -c 'git branch side' && git branch -Mq feat/x rnX`);
+  expectBool("#596 r3: payload benign lead excluded from ordinal → visible mutation occ 0", wrap1.stateVerbOccurrence === 0 && wrap1.stateInvVisible === true && wrap1.branchState === true, true);
+  const wrap2 = classifyGitCommandDetailed(`/usr/bin/git branch side ; git branch -Mq feat/x rnX`);
+  expectBool("#596 r3: abs-path-git benign lead excluded → occ 0", wrap2.stateVerbOccurrence === 0, true);
+  const wrap3 = classifyGitCommandDetailed(`G=git; $G branch side ; git branch -Mq feat/x rnX`);
+  expectBool("#596 r3: $VAR-git benign lead excluded → occ 0", wrap3.stateVerbOccurrence === 0, true);
+  // Full-path pin (index.ts mirror with REAL repos): the payload mutation in a
+  // main-checkout session M3-blocks (foreign rename), the wrapper-lead visible
+  // mutation resolves and blocks, and the visible `-C <wt>`-scoped mutation
+  // keeps the worktree exemption (no false block).
+  {
+    let pTmp = null;
+    try {
+      pTmp = realpathSync(execSync("mktemp -d", { encoding: "utf-8" }).trim());
+      const mainR = `${pTmp}/main`; const wtR = `${pTmp}/wt`;
+      execSync(`git init -q -b feat/1 "${mainR}"`, { stdio: "ignore" });
+      execSync("git config user.email t@t && git config user.name t", { cwd: mainR, stdio: "ignore" });
+      execSync("echo a > f && git add . && git commit -qm init && git branch feat/x && git branch feat/other", { cwd: mainR, stdio: "ignore" });
+      execSync(`git worktree add -q "${wtR}" -b wtmain`, { cwd: mainR, stdio: "ignore" });
+      const idxGate = (cmd) => {
+        const d = classifyGitCommandDetailed(cmd);
+        const eff = d.stateVerb && d.stateInvVisible === false
+          ? sharedResolveEffectiveRepo("git status", mainR)
+          : sharedResolveEffectiveRepo(cmd, mainR, d.stateVerb ?? d.verb, d.stateVerbOccurrence ?? 0);
+        if (!eff) return "no-eff";
+        if (eff.isWorktree) return "wt-exempt";
+        const op = d.branchState ? sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs) : { op: "other" };
+        if (!d.branchState || op.op === "other") return "no-m3";
+        const m3 = sharedDecideM3({ branchOp: op, isAgentInfra: true, baseline: { repoKey: "k", branch: "feat/1" }, currentBranch: eff.currentBranch, repoKey: "k", stateOpCount: d.stateOpCount ?? 1 });
+        return m3?.block ? "block" : (m3?.reBaseline ? `reBaseline:${m3.reBaseline}` : "allow");
+      };
+      const g1 = idxGate(`git branch side ; sh -c "git branch -Mq feat/x rnX" ; git -C "${wtR}" branch -fq zz main`);
+      expectBool("#596 r3: payload rename between visible segs → M3 block in the main checkout", g1, "block");
+      const g2 = idxGate(`sh -c 'git branch side' && git branch -Mq feat/other rnX`);
+      expectBool("#596 r3: wrapper-lead + visible foreign rename → M3 block (no freeze)", g2, "block");
+      const g3 = idxGate(`git branch side && git -C "${wtR}" branch -fq feat/other main`);
+      expectBool("#596 r3: visible -C wt mutation after main lead → worktree-exempt (no false block)", g3, "wt-exempt");
+      const g4 = idxGate(`git branch side ; sh -c "git branch -Mq feat/1 rnX"`);
+      expectBool("#596 r3: own-baseline payload rename → reBaseline carve-out", g4, "reBaseline:rnX");
+      // Round-3 (reviewer B P2-2): the M2 commit/push gate must gate the
+      // COMMIT's own repo, not the M3 state-invocation repo — an off-baseline
+      // MAIN commit with a later `-C <wt>`-scoped branch mutation must NOT be
+      // worktree-exempted (index.ts M2 arm now re-resolves via the commit/push
+      // verb when a state invocation exists). Switch the main checkout
+      // off-baseline (feat/1 → feat/other) and mirror the M2 arm.
+      execSync("git checkout -q feat/other", { cwd: mainR, stdio: "ignore" });
+      const mainKey = sharedResolveEffectiveRepo("git status", mainR)?.repoKey;
+      const m2Gate = (cmd) => {
+        const d = classifyGitCommandDetailed(cmd);
+        const effMain = d.stateVerb && d.stateInvVisible === false
+          ? sharedResolveEffectiveRepo("git status", mainR)
+          : sharedResolveEffectiveRepo(cmd, mainR, d.stateVerb ?? d.verb, d.stateVerbOccurrence ?? 0);
+        const gateVerb = d.verdict === "block:commit" ? "commit" : "push";
+        const m2Eff = effMain && d.stateVerb == null ? effMain : sharedResolveEffectiveRepo(cmd, mainR, gateVerb);
+        if (!m2Eff) return "no-eff";
+        if (m2Eff.isWorktree) return "wt-exempt";
+        const m2 = sharedDecideM2({ effectiveRepo: m2Eff, baseline: { repoKey: mainKey, branch: "feat/1" }, currentBranch: m2Eff.currentBranch, pushDst: d.pushDst, pushTargets: d.pushTargets, verdict: d.verdict, allowActive: false });
+        return m2?.block ? "block" : "allow";
+      };
+      const m2a = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
+      expectBool("#596 r3: off-baseline main commit + -C wt mutation tail → M2 BLOCK (commit repo)", m2a, "block");
+      const m2b = m2Gate(`git commit -m x`);
+      expectBool("#596 r3: plain off-baseline commit → M2 block (control)", m2b, "block");
+      execSync("git checkout -q feat/1", { cwd: mainR, stdio: "ignore" });
+      const m2c = m2Gate(`git branch side && git commit -m x && git -C "${wtR}" branch -Mq a b`);
+      expectBool("#596 r3: on-baseline main commit + -C wt tail → M2 allow (ceremony)", m2c, "allow");
+    } catch (e) {
+      console.error(`❌ #596 r3 fixture FAILED to provision: ${String(e.message).slice(0, 120)}`);
+      fail++;
+    } finally {
+      if (pTmp) { try { execSync(`rm -rf "${pTmp}"`, { stdio: "ignore" }); } catch {} }
+    }
+  }
 }
 dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
 // ── #587 regression: merged NOARG flag-clusters ─────────────────────────────

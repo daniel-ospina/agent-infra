@@ -1055,6 +1055,11 @@ function _walkShell(command, h = {}, seedVars = {}) {
                 ...ni,
                 cdChain: [...base, ...ni.cdChain],
                 cHints: [...(frame().pipeActive ? frame().chain.slice(0, frame().baseLen) : []), ...ni.cHints],
+                // #596 round-3: an interpreter-inline (`sh -c '…'`) payload is
+                // ONE opaque token to branch-ownership's tokenizer — its git
+                // invocations are invisible there, so they must never shift the
+                // stateVerbOccurrence ordinal the repo layer resolves with.
+                cmdVisible: false,
               });
             }
             sawInline = true;
@@ -1122,6 +1127,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
             h.onGitEnd?.({
               verb: "__unverifiable__", args: [], cdChain: [...frame().chain], cHints: [],
               gitDirHint: null, workTreeHint: null, indexFileHint: null, objDirsHint: null, configOverrides: [], configEnvOverrides: [], envPrefixes: [], vars: { ...frame().vars },
+              cmdVisible: false,
             });
             i++;
             prevWasBoundary = false;
@@ -1148,6 +1154,14 @@ function _walkShell(command, h = {}, seedVars = {}) {
     }
     spawnerPending = false; // a git-resolving token ends the spawner window
     // ── git invocation ──
+    // #596 round-3: cmdVisible = this git invocation was spelled with the
+    // LITERAL token `git` (vs a $VAR-resolved word `G=git; $G branch …` or an
+    // absolute path `/usr/bin/git branch …`) — the only spellings
+    // branch-ownership's extractGitInvocation can see. Extractor-invisible
+    // invocations must never shift the stateVerbOccurrence ordinal the repo
+    // layer resolves with, and a SELECTED mutation that is invisible resolves
+    // its M3 repo at the session cwd (index.ts).
+    const cmdVisible = t === "git";
     i++;
     const f = frame();
     const cHints = [];
@@ -1228,6 +1242,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
       configOverrides, configEnvOverrides, envPrefixes,
       cdChain: f.pipeActive ? f.chain.slice(0, f.baseLen) : [...f.chain],
       vars: { ...f.vars },
+      cmdVisible,
     });
     prevWasBoundary = false;
   }
@@ -1298,8 +1313,11 @@ export function _branchInvMutatesBranchState(args) {
  *   must classify the invocation that changes branch state, not invocations[0]
  *   — P1-A; #596: selection skips benign branch leads, see classifyGitCommand-
  *   Detailed). stateVerbOccurrence: the 0-based ordinal of that invocation
- *   among same-verb invocations (repo-hint attribution for later-segment
- *   mutations). stateOpCount: TOTAL branch-state invocations in the command —
+ *   among EXTRACTOR-VISIBLE same-verb invocations (repo-hint attribution for
+ *   later-segment mutations). stateInvVisible: false when the selected
+ *   mutation is invisible to branch-ownership's tokenizer (interpreter-inline
+ *   payload / $VAR / abs-path git — the M3 repo then resolves at the session
+ *   cwd). stateOpCount: TOTAL branch-state invocations in the command —
  *   the #591 benign-force carve-out requires exactly 1 (the gate classifies
  *   only the FIRST mutating invocation; a second own-branch force segment
  *   must not grant the carve-out a foreign later segment could launder
@@ -1657,20 +1675,24 @@ export function classifyGitCommandDetailed(command) {
     // the invocation that changes branch state, not invocations[0] (a compound
     // `git pull && git checkout main` would otherwise classify "pull" and skip
     // the gate, or false-block the sanctioned create-new carve-out).
-    // #596 (round-2 reviewer): stateVerbOccurrence — the 0-based ordinal of
-    // stateInv among the command's invocations with the SAME verb. index.ts
-    // resolves the effective repo with preferVerb = stateVerb, which picks the
-    // FIRST same-verb invocation; when the mutation is a LATER segment the
-    // repo layer must attribute hints (-C/--git-dir/cd) from THAT invocation,
-    // not the benign lead (a `-C <wt>` lead would wrongly worktree-exempt a
-    // MAIN force-create, and a main lead would wrongly main-gate a `-C <wt>`
-    // mutation — probe-verified both). The ordinal is 0 whenever stateInv is
-    // the first same-verb invocation (every pre-#596 shape).
+    // #596 (round-2 reviewer, refined round-3): stateVerbOccurrence — the
+    // 0-based ordinal of stateInv among the command's EXTRACTOR-VISIBLE
+    // invocations with the SAME verb (cmdVisible — spelled with the literal
+    // `git` token; interpreter-inline / $VAR / abs-path-git spellings are ONE
+    // opaque token to branch-ownership's tokenizer and must not shift the
+    // ordinal — a quoted `sh -c "git branch -Mq …"` mutation between visible
+    // segments used to land the ordinal on a LATER `-C <wt>` invocation,
+    // wrongly worktree-exempting the payload). index.ts resolves the effective
+    // repo with preferVerb = stateVerb, which picks the preferVerbOccurrence-th
+    // same-verb invocation; when the MUTATING invocation is itself
+    // extractor-invisible (stateInvVisible false — a quoted-payload mutation
+    // runs at the shell cwd), index.ts resolves the M3 repo at the session cwd.
     out.stateVerbOccurrence = 0;
     for (const v of stateInvs) {
       if (v === stateInv) break;
-      if (v.verb === stateInv.verb) out.stateVerbOccurrence++;
+      if (v.verb === stateInv.verb && v.cmdVisible !== false) out.stateVerbOccurrence++;
     }
+    out.stateInvVisible = stateInv.cmdVisible !== false;
     out.stateVerb = verb;
     out.stateArgs = args;
   }
