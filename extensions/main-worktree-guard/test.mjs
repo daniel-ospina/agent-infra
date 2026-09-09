@@ -175,12 +175,14 @@ function check(name, path, expectedContains, sessionCwd) {
 }
 check("main checkout file", `${MAIN}/extensions/main-worktree-guard/index.ts`, "BLOCK (main checkout)", MAIN);
 check("AGENTS.md", `${MAIN}/AGENTS.md`, "BLOCK (main checkout)", MAIN);
-// #615 regression pins (write/edit gate, mirror of index.ts): the #99 write/edit
-// exemption for the infra repo is removed — the MAIN checkout here IS agent-infra
-// (this suite runs inside it), so a hub session's write/edit to agent-infra main
-// files must be BLOCKED exactly like any other repo's hub. The mirror has no
-// agent-infra carve-out — index.ts must match it (a re-introduced #99 exemption
-// in index.ts would silently diverge from these pins).
+// #615 regression pins (write/edit gate mirror): the #99 write/edit exemption
+// for the infra repo is removed — the MAIN checkout here IS agent-infra (this
+// suite runs inside it), so the mirror's path-scoping contract must show a hub
+// session's write/edit to agent-infra main files as BLOCKED like any other
+// repo. These are PARITY guardrails only: the mirror never modeled the index.ts
+// #99 carve-out, so it cannot by itself detect a reintroduced exemption in
+// index.ts — the source pins below (banned carve-out strings + single
+// isAgentInfraRepo( call site) are the tripwire that catches index.ts regressions.
 check("#615: agent-infra main AGENTS.md (hub session) → BLOCK", `${MAIN}/AGENTS.md`, "BLOCK (main checkout)", MAIN);
 check("#615: agent-infra main MEMORY.md (hub session) → BLOCK", `${MAIN}/MEMORY.md`, "BLOCK (main checkout)", MAIN);
 check("#615: agent-infra main extension file (hub session) → BLOCK", `${MAIN}/extensions/main-worktree-guard/index.ts`, "BLOCK (main checkout)", MAIN);
@@ -267,15 +269,22 @@ try {
 
 // ── #615 source pins: index.ts removals cannot silently regress ────────────
 // index.ts is not importable in tests (pi-extension TS), so pin the REMOVALS
-// at the SOURCE level: the #99 carve-out strings must not reappear, and the
-// only remaining isAgentInfraRepo( call site must be the M3 ceremony flag.
+// at the SOURCE level. Whitespace/alias evasions are bounded: the call-site
+// count is whitespace-tolerant, and the semantic-context check pins the ONE
+// surviving call to its M3 ceremony role (any added exemption guard — spaced
+// spelling included — pushes the count past 1 and fails). A legitimate future
+// second call site must consciously update this pin (see its comment).
 const guardIndexSrc = readFileSync(
   join(PROJECT_CWD, "extensions", "main-worktree-guard", "index.ts"), "utf8");
 for (const banned of ["// #99 carve-out", "// #99 write/edit exemption", "Downgraded agent-infra", "isAgentInfraRepo()) return undefined", "isAgentInfraRepo()) return null"]) {
   expectBool(`#615 source pin: index.ts has no ${JSON.stringify(banned)}`, !guardIndexSrc.includes(banned), true);
 }
-const infraCallSites = (guardIndexSrc.match(/isAgentInfraRepo\(/g) ?? []).length;
+const infraCallSites = (guardIndexSrc.match(/isAgentInfraRepo\s*\(/g) ?? []).length;
 expectBool("#615 source pin: only the M3 ceremony isAgentInfraRepo( call remains (index.ts)", infraCallSites === 1, true);
+const m3AssignIdx = guardIndexSrc.indexOf("isInfra = isAgentInfraRepo(muEff.effectiveCwd)");
+expectBool("#615 source pin: the surviving call is the M3 isInfra assignment", m3AssignIdx !== -1, true);
+const afterM3 = m3AssignIdx !== -1 ? guardIndexSrc.slice(m3AssignIdx, m3AssignIdx + 2500) : "";
+expectBool("#615 source pin: isInfra feeds decideM3 (isAgentInfra: isInfra) — not an exemption guard", afterM3.includes("isAgentInfra: isInfra"), true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
 function expectBranches(command, expectedArray) {

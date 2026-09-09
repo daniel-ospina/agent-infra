@@ -26,7 +26,8 @@ any failure — a failed import or stamp never silently allows.
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
-The **hub** (the shared main checkout of a non-infra repo) has exactly two
+The **hub** (the shared main checkout of a guarded repo — agent-infra included
+since #615) has exactly two
 legal states: checked out on `main`/`master` and a clean working tree
 (`git status --porcelain` empty — **untracked files count as dirty**). M4
 enforces this at runtime: **when the session cwd IS the hub and it is off-main
@@ -327,7 +328,8 @@ spelling (warn-only false-negative — the perf constraint keeps the pure patter
 filter first).
 
 **Why warning, not block (untracked WIP):** the write/edit block for
-main-checkout edits is a deliberate permanent gate for non-infra repos; the
+main-checkout edits is a deliberate permanent gate in every guarded repo
+(agent-infra included since #615); the
 untracked-WIP patterns are a hygiene signal, and an agent may legitimately
 need a scratch file briefly. The warning surfaces the violation at write time
 so the agent moves the work to a worktree

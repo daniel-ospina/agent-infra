@@ -275,7 +275,8 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
 
 // ── M4: hub-state gate (#1484) ─────────────────────────────────────────────
 // The hub's only legal states are main+clean. When the session cwd IS the hub
-// main checkout (non-infra) and the hub is off-main or dirty, every git op is
+// main checkout (agent-infra included since #615) and the hub is off-main or
+// dirty, every git op is
 // gated by the recovery allowlist (classify-git evaluateHubGateWithTargets) and
 // write/edit in the hub is blocked. #347: each git invocation's EFFECTIVE
 // target is resolved — invocations targeting an isolated worktree (worktree-
