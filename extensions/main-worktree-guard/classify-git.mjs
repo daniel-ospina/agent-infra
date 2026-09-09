@@ -970,8 +970,19 @@ function _walkShell(command, h = {}, seedVars = {}) {
     // (and their operand) WITHOUT clearing prevWasBoundary, so a redirect-led
     // command word is still recognized: `> /dev/null cd <wt> && git commit` runs
     // the cd (round-4 bug reviewer R4-11).
-    if (t === ">" || t === ">>" || t === "<" || t === "<<" || t === "&>" || t === ">&" || t === "&>>" || /^(?:[0-9]+)?[<>]/.test(t) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(t)) {
-      const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(t); // 2>&1 — no separate operand
+    // Round-4 F1 (post-fix reviewer P2): the fdSingle forms are ONLY the
+    // GLUED fd-dup/close operators with digits or a dash (`2>&1`, `2>&-`,
+    // `>&1`, `<&0`, `>&-`) — a BARE `>&`/`<&` (zero digits, no dash) takes a
+    // word OPERAND like any redirect (`>& git` dups stdout+stderr to the FILE
+    // `git`; `<& file` dups stdin from the file) and must skip op+operand, or
+    // the operand word is walked as a command and phantom-counted (the same
+    // phantom-token ordinal drift the extractor now skips). Also `<<<`
+    // here-strings: _tokenize splits `<<<` into `<<` + `<` + word — consume
+    // the split `<` with the operator and the WORD as the operand (real bash:
+    // `<<< git` feeds `git` to stdin, never executes it).
+    if (t === "<<" && tokens[i + 1] === "<") { i += 3; continue; } // <<< word (here-string)
+    if (t === ">" || t === ">>" || t === "<" || t === "<<" || t === "&>" || t === ">&" || t === "&>>" || /^(?:[0-9]+)?[<>]/.test(t) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(t)) {
+      const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(t); // 2>&1 — no separate operand
       i += fdSingle ? 1 : 2;
       continue;
     }
@@ -1031,13 +1042,16 @@ function _walkShell(command, h = {}, seedVars = {}) {
         const n = tokens[j];
         // Round-16 (final gate P1): skip operand-less fd redirects (`2<&1`,
         // `2<&-`) when scanning for -c / the script path — `bash 2<&1 -c
-        // 'git reset'` ran the inline (probe moved HEAD).
-        if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(n)) { j++; continue; }
+        // 'git reset'` ran the inline (probe moved HEAD). Round-4 F1 (post-fix
+        // reviewer P2): fdSingle requires digits or a dash — bare `>&`/`<&`
+        // take a word operand (`>& git` = stdout+stderr to the FILE `git`).
+        if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(n)) { j++; continue; }
         // Round-18 (final gate P1): skip redirect operators + operands too
         // (`bash < /dev/null -c 'git commit'` broke at the bare `<` and never
         // walked the inline — probe; the inline committed to the hub).
         if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n)) {
-          j += 2;
+          if (n === "<<" && tokens[j + 1] === "<") j += 3; // <<< here-string (round-4 F1)
+          else j += 2;
           continue;
         }
         if (n === "-c" || n === "--command") {          // Round-5 (security F3): skip flags AFTER -c too — `bash -c -x 'git
@@ -1226,9 +1240,12 @@ function _walkShell(command, h = {}, seedVars = {}) {
         // Round-5 (security P2): redirects (+ operands) do NOT terminate a
         // simple command's args — only `; & | && || ( )` do (`git push > /tmp/l
         // origin main:main` must keep its refspec args; truncating them would
-        // classify as a bare push of the current branch).
-        if (g === ">" || g === ">>" || g === "<" || g === "<<" || g === "&>" || g === ">&" || g === "&>>" || /^(?:[0-9]+)?[<>]/.test(g) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(g)) {
-          const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(g); // 2>&1 — no separate operand
+        // classify as a bare push of the current branch). fdSingle forms need
+        // digits or a dash (bare `>&`/`<&` take a word operand — round-4 F1
+        // post-fix reviewer P2); `<<<` here-strings are `<<` + split `<` + word.
+        if (g === "<<" && tokens[i + 1] === "<") { i += 3; continue; }
+        if (g === ">" || g === ">>" || g === "<" || g === "<<" || g === "&>" || g === ">&" || g === "&>>" || /^(?:[0-9]+)?[<>]/.test(g) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(g)) {
+          const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(g); // 2>&1 — no separate operand
           i += fdSingle ? 1 : 2;
           continue;
         }
@@ -1401,7 +1418,11 @@ export function classifyGitCommandDetailed(command) {
   // stateVerb/stateArgs point at the mutation the M3 gate must classify.
   const stateInvs = invocations.filter((v) =>
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb));
-  const stateInv = stateInvs.find((v) => {
+  // Round-4 (reviewer P1b follow-up): the MUTATING predicate is reused both
+  // for the single selection below AND for stateMutations (every mutating
+  // branch-state invocation) — index.ts gates EVERY main-resolving mutation
+  // so a leading `-C <wt>` mutation can't blanket-exempt a later MAIN one.
+  const _isStateMutating = (v) => {
     if (v.verb === "checkout" || v.verb === "switch") return true;
     if (v.verb === "symbolic-ref" || v.verb === "update-ref") {
       const pos = (v.args || []).filter((x) => !x.startsWith("-"));
@@ -1410,7 +1431,9 @@ export function classifyGitCommandDetailed(command) {
           (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD"));
     }
     return v.verb === "branch" && _branchInvMutatesBranchState(v.args);
-  }) ?? stateInvs[0] ?? null;
+  };
+  const stateMutations = stateInvs.filter(_isStateMutating);
+  const stateInv = stateMutations[0] ?? stateInvs[0] ?? null;
   const syncInv = invocations.find((v) => ["merge", "pull", "rebase"].includes(v.verb));
 
   // ── push: refspec targets + force-push hygiene (highest priority — a
@@ -1695,6 +1718,30 @@ export function classifyGitCommandDetailed(command) {
     out.stateInvVisible = stateInv.cmdVisible !== false;
     out.stateVerb = verb;
     out.stateArgs = args;
+    // #596 round-4 (reviewer follow-up): the SELECTED mutating invocation's
+    // OWN resolution hints (cdChain/cHints/gitDirHint/vars), captured
+    // boundary-aware by _walkShell. index.ts resolves the M3 repo from THESE
+    // instead of replaying the stateVerbOccurrence ordinal through
+    // branch-ownership's boundary-less tokenizer — a replay mis-attribution
+    // (interpreter-inline / script-file / redirect-operand phantoms, or an
+    // interpreter word used as a git ARG whose next token the extractor
+    // consumes) landed the ordinal on a DIFFERENT invocation whose -C hints
+    // wrongly worktree-exempted a mutation that runs at the shell cwd.
+    out.stateHints = stateInv && stateInv.cmdVisible !== false
+      ? { cdChain: stateInv.cdChain, cHints: stateInv.cHints, gitDirHint: stateInv.gitDirHint, vars: stateInv.vars }
+      : null; // extractor-invisible mutation → index.ts resolves at the session cwd (stateInvVisible false path)
+    // Round-4 (reviewer P1b follow-up): EVERY mutating branch-state invocation
+    // (visible → its own boundary-aware hints; invisible payload → null hints,
+    // resolved at the shell cwd). index.ts M3 gates each main-resolving one so
+    // a leading worktree mutation cannot exempt a later MAIN mutation.
+    out.stateMutations = stateMutations.map((v) => ({
+      verb: v.verb,
+      args: v.args,
+      invVisible: v.cmdVisible !== false,
+      hints: v.cmdVisible !== false
+        ? { cdChain: v.cdChain, cHints: v.cHints, gitDirHint: v.gitDirHint, vars: v.vars }
+        : null,
+    }));
   }
   // #591 (review fold-in, compound-launder guard): count EVERY branch-state
   // invocation in the command. The M3 benign-force carve-out (a force-create
@@ -1720,6 +1767,25 @@ export function classifyGitCommandDetailed(command) {
   out.hiddenStateSubst =
     _hasHiddenStateSubst(String(command ?? "")) ||
     _unverifiableGitContent(String(command ?? ""));
+
+  // #596 round-4 (reviewer P1a follow-up): the M2 commit/push repo must come
+  // from the classifier's boundary-aware walk of the commit/push invocation,
+  // but commitHints/pushHints must describe the FIRST EXTRACTOR-VISIBLE
+  // commit/push (cmdVisible — literal `git` spelling). The old replay only
+  // ever saw visible invocations; an invisible interpreter-inline payload
+  // (`sh -c "git -C <wt> commit -m z"`) precedes the real main commit in
+  // invocation order, and using ITS `-C <wt>` hints exempted the real
+  // OFF-baseline MAIN commit (round-4 regression). commitInv/pushInv (any
+  // commit/push incl. invisible) still drive the VERDICT; the hints feed the
+  // repo resolution only for the visible first one.
+  const commitVisInv = invocations.find((v) => v.verb === "commit" && v.cmdVisible !== false);
+  const pushVisInv = invocations.find((v) => v.verb === "push" && v.cmdVisible !== false);
+  out.commitHints = commitVisInv
+    ? { cdChain: commitVisInv.cdChain, cHints: commitVisInv.cHints, gitDirHint: commitVisInv.gitDirHint, vars: commitVisInv.vars }
+    : null;
+  out.pushHints = pushVisInv
+    ? { cdChain: pushVisInv.cdChain, cHints: pushVisInv.cHints, gitDirHint: pushVisInv.gitDirHint, vars: pushVisInv.vars }
+    : null;
 
   return out;
 }

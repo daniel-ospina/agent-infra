@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import {
   repoKey, readBranchState, tokenize, extractGitInvocation, resolveEffectiveRepo,
+  resolveRepoFromInv,
   classifyBranchOp, parseRefspecDst, decideM1, decideM2, decideM3, ownershipAllowed,
   acquireRepoLock, releaseRepoLock, lockDir,
 } from "./branch-ownership.mjs";
@@ -164,6 +165,74 @@ ok("resolveEffectiveRepo: occurrence 0 = the FIRST same-verb invocation (pre-#59
 const invOcc = extractGitInvocation(`git -C "${WT}" branch side ; git branch -fq feat/other main`, "branch", 1);
 ok("extract: occurrence 1 same-verb → the LATER invocation's hints (no -C)", invOcc && invOcc.cHints.length === 0 && (invOcc.rest[1] ?? "") === "-fq", String(invOcc?.cHints));
 ok("extract: occurrence beyond matches → null", extractGitInvocation(`git branch side`, "branch", 1) === null);
+
+// #596 round-4 (F1 — phantom-token ordinal asymmetry): a redirect OPERAND or an
+// interpreter `-c` PAYLOAD that is a literal `git` never starts a command
+// (classify-git's _walkShell skips redirect op+operand and walks `-c` payloads
+// as one opaque nested command, cmdVisible:false). Counting it here as a
+// same-verb branch invocation shifts the classifier's stateVerbOccurrence off
+// the REAL mutation — a phantom lead ahead of a benign `-C <wt>` segment makes
+// occurrence 1 land on the WORKTREE invocation and worktree-exempt a MAIN
+// branch-state mutation (round-4 reviewer F1 bypass). Both resolveEffectiveRepo
+// occurrences below must land on the MAIN mutation (isWorktree false).
+ok("r4 F1: redirect-operand phantom doesn't shift ordinal → occurrence 1 resolves MAIN", (() => {
+  const r = resolveEffectiveRepo(`echo x > git branch side ; git -C "${WT}" branch side ; git branch -fq feat/other main`, MAIN, "branch", 1);
+  return r && r.isWorktree === false && r.currentBranch === "main";
+})(), "redirect-phantom");
+ok("r4 F1: unquoted `sh -c git branch side` payload phantom doesn't shift → occurrence 1 resolves MAIN", (() => {
+  const r = resolveEffectiveRepo(`sh -c git branch side ; git -C "${WT}" branch side ; git branch -fq feat/other main`, MAIN, "branch", 1);
+  return r && r.isWorktree === false && r.currentBranch === "main";
+})(), "interp-payload-phantom");
+ok("r4 F1: `sh -c git branch side` alone → no visible branch invocation (extractor null at occ 0)", extractGitInvocation(`sh -c git branch side`, "branch", 0) === null, "payload-invisible");
+// Round-4 reviewer P1 (post-fix finding) + round-4 reviewer follow-up P1:
+// the interpreter's SCRIPT-FILE spelling (`bash git -C <wt> branch side`)
+// and the interpreter-word-as-git-ARG spelling (`git add bash ; git branch
+// -Mq`) cannot be told apart by branch-ownership's boundary-less tokenizer
+// (the `;` is dropped) — ANY extractor rule either phantom-counts the
+// script-file words (`bash git` is a script-FILE attempt — bash executing
+// the git BINARY errors rc 126, the words never run as `git -C … branch`)
+// or consumes a real later git (round-4 reviewer P1 follow-up: shifted the
+// ordinal onto a trailing `-C <wt>` invocation → worktree exemption for a
+// MAIN mutation). The gates therefore resolve the M3/M2 repo from the
+// CLASSIFIER's own boundary-aware walk of the SELECTED invocation
+// (stateHints / commitHints / pushHints → resolveRepoFromInv), never from
+// this replay's occurrence arithmetic. These pins cover the hints-based
+// resolver the exemption decision actually uses.
+ok("r4 P1: hints-bridge — selected mutation with NO hints resolves at the session cwd (MAIN)", (() => {
+  const r = resolveRepoFromInv({ cdChain: [], cHints: [], gitDirHint: null }, MAIN);
+  return r && r.isWorktree === false && r.currentBranch === "main";
+})(), "hints-empty-session");
+ok("r4 P1: hints-bridge — a -C <wt>-scoped mutation resolves the WORKTREE", (() => {
+  const r = resolveRepoFromInv({ cdChain: [], cHints: [WT], gitDirHint: null }, MAIN);
+  return r && r.isWorktree === true;
+})(), "hints-wt");
+ok("r4 P1: hints-bridge — cd into the worktree resolves the WORKTREE", (() => {
+  const r = resolveRepoFromInv({ cdChain: [WT], cHints: [], gitDirHint: null }, MAIN);
+  return r && r.isWorktree === true;
+})(), "hints-cd-wt");
+ok("r4 P1: hints-bridge — null hints → null (fail-closed)", resolveRepoFromInv(null, MAIN) === null, "hints-null");
+// Documented replay limitation (why the gates no longer use the replay for
+// the exemption): `bash git -C <wt> branch side` phantom-counts here.
+ok("r4 P1: replay limitation documented — script-file words still phantom-count here", (() => {
+  const inv = extractGitInvocation(`bash git -C "${WT}" branch side ; git branch -fq feat/other main`, "branch", 0);
+  return inv && inv.cHints[0] === WT; // the phantom -C <wt> invocation — NOT the mutation
+})(), "replay-script-file-phantom");
+// Interpreter-word-as-git-ARG (`git status bash ; git commit`): classify-git
+// does NOT fire interpreter handling inside a preceding git invocation's args
+// (probes C7–C9) and this replay walks `bash` as a plain arg, so the real
+// commit stays findable for the replay's remaining (no-state-verb) callers.
+ok("r4 P1: interpreter as a git ARG never consumes a later real git", (() => {
+  const inv = extractGitInvocation(`git status bash ; git commit -m x`, "commit", 0);
+  return inv && (inv.rest[0] ?? "") === "commit";
+})(), "arg-interp-not-consumed");
+// P2 freeze guard (classifier mirror): the classifier's bare-`>&`/`<&` and
+// `<<<` operand words are skipped exactly like the extractor skips them (real
+// bash: `>& git` = stdout+stderr to the FILE git, `<<< git` = stdin) — so a
+// legit own-baseline mutation after such a lead keeps occurrence 0 in BOTH
+// layers (no null → no fail-closed block).
+ok("r4 P2: bare >& operand not counted → occurrence 0 is the real -fq", extractGitInvocation(`echo x >& git branch side ; git branch -fq feat/other main`, "branch", 0) !== null, ">& operand");
+ok("r4 P2: bare <& operand not counted → occurrence 0 is the real -fq", extractGitInvocation(`echo x <& git branch side ; git branch -fq feat/other main`, "branch", 0) !== null, "<& operand");
+ok("r4 P2: here-string operand not counted → occurrence 0 is the real -fq", extractGitInvocation(`echo x <<< git branch side ; git branch -fq feat/other main`, "branch", 0) !== null, "<<< operand");
 
 // non-git command → null
 ok("resolveEffectiveRepo: non-git → null", resolveEffectiveRepo("npm test", MAIN) === null);
