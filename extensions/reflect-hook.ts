@@ -21,6 +21,13 @@ import { execSync } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import {
+  resolveAttribution,
+  SessionModelCache,
+  stampSessionPayload,
+  modelFromContext,
+  type SessionAttribution,
+} from "./shared/capture-attribution.js";
 
 // ── Config ─────────────────────────────────────────────────────
 
@@ -40,25 +47,33 @@ interface ReflectConfig {
   team: string;
 }
 
-function loadConfig(): ReflectConfig {
+/** Export seam: loadConfig with optional injectable config path/env for tests (#611). */
+export function loadConfig(opts?: {
+  configPath?: string;
+  env?: NodeJS.ProcessEnv;
+}): ReflectConfig {
+  const env = opts?.env ?? process.env;
   const fromFile: Record<string, unknown> = {};
   try {
-    fromFile["_"] = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+    fromFile["_"] = JSON.parse(readFileSync(opts?.configPath ?? CONFIG_PATH, "utf-8"));
   } catch {
     // config file absent/unreadable — env vars or defaults apply
   }
   const file = (fromFile["_"] as Record<string, unknown>) ?? {};
   const apiKey =
-    process.env.TORTOISE_API_KEY ||
+    env.TORTOISE_API_KEY ||
     (typeof file.apiKey === "string" ? (file.apiKey as string) : "");
   const apiUrl =
-    process.env.TORTOISE_API_URL ||
+    env.TORTOISE_API_URL ||
     (typeof file.apiUrl === "string" ? (file.apiUrl as string) : "") ||
     DEFAULT_API_URL;
   const team =
     (typeof file.team === "string" ? (file.team as string) : "") || DEFAULT_TEAM;
   return { apiUrl: apiUrl.replace(/\/+$/, ""), apiKey: apiKey.trim(), team };
 }
+
+/** Per-session model cache (shared across both extensions in-process). */
+const sessionModels = new SessionModelCache();
 
 // ── Session extraction (same pattern as before) ────────────────
 
@@ -67,7 +82,8 @@ interface Turn {
   content: string;
 }
 
-function extractTurns(ctx: any): Turn[] {
+/** Export seam: extract turns from session context for tests (#611). */
+export function extractTurns(ctx: any): Turn[] {
   const entries = ctx.sessionManager.getEntries();
   const turns: Turn[] = [];
   for (const entry of entries) {
@@ -93,12 +109,47 @@ function extractTurns(ctx: any): Turn[] {
 }
 
 /** Extract PR numbers from session text (kept for metadata/provenance). */
-function extractPrs(sessionText: string): string[] {
+export function extractPrs(sessionText: string): string[] {
   const prPattern = /(?:created|opened|merged|shipped|PR|pull request)\s*#(\d+)/gi;
   const prs = new Set<string>();
   let match: RegExpExecArray | null;
   while ((match = prPattern.exec(sessionText)) !== null) prs.add(match[1]);
   return [...prs];
+}
+
+/**
+ * Build the attributed quit payload for a session shutdown.
+ *
+ * Pure builder, exported for testing. Returns the complete payload object
+ * (with attribution stamped) that should be passed to both writeFallback
+ * and captureToHosted — the JSONL record and POST body are byte-identical.
+ */
+export function buildQuitPayload(args: {
+  sessionId: string;
+  turns: Turn[];
+  meta: {
+    team: string;
+    projectRoot: string;
+    prs: string[];
+    charCount: number;
+    source?: string;
+    capturedAt?: string;
+  };
+  attribution: SessionAttribution;
+}): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    session_id: args.sessionId,
+    conversation: args.turns,
+    metadata: {
+      source: args.meta.source ?? "pi-session-quit",
+      team: args.meta.team,
+      projectRoot: args.meta.projectRoot,
+      prs: args.meta.prs,
+      charCount: args.meta.charCount,
+      capturedAt: args.meta.capturedAt ?? new Date().toISOString(),
+    },
+  };
+  return stampSessionPayload(payload, args.attribution);
 }
 
 // ── Local JSONL fallback (durable record for a future hosted sync) ──
@@ -201,18 +252,22 @@ export default function reflectHook(pi: ExtensionAPI): void {
       }
 
       const sessionId = ctx.sessionManager.getSessionId?.() ?? `session_${Date.now()}`;
-      const payload = {
-        session_id: sessionId,
-        conversation: turns,
-        metadata: {
-          source: "pi-session-quit",
+
+      // Resolve model from session entry stream (first model_change), cached per session_id
+      const entries = ctx.sessionManager.getEntries?.() ?? [];
+      const model = sessionModels.resolve(sessionId, () => entries) ?? modelFromContext(ctx.model);
+      const attribution = resolveAttribution(model);
+      const payload = buildQuitPayload({
+        sessionId,
+        turns,
+        meta: {
           team: config.team,
           projectRoot,
           prs,
           charCount: sessionText.length,
-          capturedAt: new Date().toISOString(),
         },
-      };
+        attribution,
+      });
 
       // Durable local record FIRST (synchronous) — a quit teardown mid-fetch
       // must never lose the session silently. Hosted capture rides on top.
