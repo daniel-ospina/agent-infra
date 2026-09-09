@@ -251,8 +251,8 @@ async function runGated(
       // NOT run (system too loaded). Do NOT burn the epoch: it stays due and is
       // retried at the next session_start OR cadence-poll tick (#619) — bounded
       // by SESSION_CHECKS_POLL_MIN, so a loaded machine yields at most one
-      // DEFERRED line per poll interval instead of a spin.
-      summary.lines.push(`${name}: DEFERRED (load gate — retry next session)${tail ? ` — ${tail}` : ""}`);
+      // DEFERRED line per check per poll interval instead of a spin.
+      summary.lines.push(`${name}: DEFERRED (load gate — retries on next session_start / poll tick)${tail ? ` — ${tail}` : ""}`);
     } else {
       // Record the ATTEMPT (not just success) so a failing check re-probes on
       // cadence instead of every session start.

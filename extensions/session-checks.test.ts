@@ -418,6 +418,7 @@ await test("oracle DEFERRED (load gate rc=3) → no epoch burn; re-probes next s
   equal(oracleCalls, 1, "oracle attempted");
   equal(oracleEnv?.LOAD_GATE_MAX_WAIT_MIN, "0", "defer-immediately env passed (no 10-min inline poll)");
   ok(s.lines.some((l) => l.startsWith("skill-lint-oracle: DEFERRED")), "DEFERRED label (not FAIL)");
+  ok(s.lines.some((l) => l.includes("retries on next session_start / poll tick")), "DEFERRED message states per-tick retry (#619 cadence)");
   equal(s.ran.includes("skill-lint-oracle"), true, "attempt listed");
   equal(lastRunEpoch(state, "skill-lint-oracle"), 0, "NO epoch recorded — deferral burns nothing");
   const s2 = await runSessionChecks({ infraPath: infra, state, nowSec: now + 60, hubHours: 6, oracleHours: 24, exec });
