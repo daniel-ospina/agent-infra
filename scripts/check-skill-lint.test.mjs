@@ -88,6 +88,36 @@ test(`FIXTURES module loads (${FIXTURES.length} fixtures, pi pin ${PI_VERSION_PI
   assert.equal(PI_VERSION_PIN, "0.85.1");
 });
 
+// ── (h) pin lockstep (#640 review) ──────────────────────────────────────
+// The pi runtime version is hand-synced across PI_VERSION_PIN + every
+// extension devDep pin; before this tripwire nothing asserted they agree, so a
+// partial bump (fixtures updated, one package.json missed) stayed CI-green.
+// Guard the class, not just this instance: any @earendil-works/pi-* devDep in
+// extensions/*/package.json must equal PI_VERSION_PIN.
+section("extension devDep pins lockstep with PI_VERSION_PIN");
+
+test("extensions/*/package.json @earendil-works/pi-* devDeps match PI_VERSION_PIN", () => {
+  const extDir = path.join(REPO_ROOT, "extensions");
+  const offenders = [];
+  for (const entry of fs.readdirSync(extDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const pkgPath = path.join(extDir, entry.name, "package.json");
+    if (!fs.existsSync(pkgPath)) continue;
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    for (const [name, ver] of Object.entries(pkg.devDependencies ?? {})) {
+      if (!name.startsWith("@earendil-works/pi-")) continue;
+      if (ver !== PI_VERSION_PIN) {
+        offenders.push(`extensions/${entry.name}/package.json: ${name}@${ver}`);
+      }
+    }
+  }
+  assert.equal(
+    offenders.length,
+    0,
+    `devDep pin drift vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
+  );
+});
+
 for (const fx of FIXTURES) {
   test(`fixture ${fx.id} → [${fx.expected.join(", ") || "PASS"}]`, () => {
     const got = findingsOf(fx.content);
