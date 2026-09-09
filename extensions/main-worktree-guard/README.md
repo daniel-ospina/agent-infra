@@ -445,7 +445,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 
 | Escape | How | Consequence (what you are opting into) |
 |---|---|---|
-| env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass — M1/M2/M3/M4 all off. Nothing automated flags agent-infra main dirt (hub-state-check is tortoise-only — agent-infra is #99-exempt); sibling sessions in the hub are unprotected and will be disrupted. Prefer `hub-worktree.sh <branch>` instead. |
+| env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated flags agent-infra main dirt (hub-state-check is tortoise-only — agent-infra is #99-exempt); sibling sessions in the hub are unprotected and will be disrupted. Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
 | script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. It was the most likely vector for the 2026-08-18 incident; it no longer exists. |
 | terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | THE sanctioned recovery (#206). Terminals are never intercepted; this is how a stranded hub gets un-stranded. |
