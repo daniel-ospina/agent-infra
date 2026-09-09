@@ -8,11 +8,19 @@
 // the same scripts work from session_start. Age gates preserve the former
 // cadence (hub 6h, oracle 24h) while pi runs; silent when fresh.
 //
-// Hub repo surface = TORTOISE_REPO / sibling tortoise / AGENT_INFRA_PATH —
-// #615: agent-infra JOINED the checked repos (the #99 hub-discipline exemption
-// is removed — its main checkout is a pure hub too, and hub-state-check now
-// flags in-hub dirt exactly like tortoise). Add extra repos via
-// SESSION_CHECKS_REPOS.
+// Hub repo surface (#619) = AGENT_INFRA_PATH (always — #615 removed the #99
+// hub-discipline exemption; agent-infra's main checkout is a pure hub too) +
+// the sibling-hub default list (tortoise, premise-labs, DMeer, eldato) resolved
+// under dirname(AGENT_INFRA_PATH) when present + TORTOISE_REPO env (non-sibling
+// layouts) + SESSION_CHECKS_REPOS extras. Dir-existence-gated: a machine that
+// lacks a repo's directory silently skips it (a non-git dir matching a default
+// name is NOT silently skipped — hub-state-check fails it loudly, which is the
+// point: operator attention, not silence).
+//
+// Cadence (#619): checks run on the session_start age gates (hub 6h, oracle
+// 24h) AND on a poll timer while the session stays alive (SESSION_CHECKS_POLL_MIN,
+// default 30) so a long-running controller re-probes without a new session_start.
+// Sub-agents (print mode) skip both the start pass and the timer.
 //
 // Safety:
 //   - never crashes session startup (all errors swallowed → log line)
@@ -28,6 +36,7 @@
 //   SESSION_CHECKS_HUB_H      hub staleness window in hours (default 6; 0 = never auto-run)
 //   SESSION_CHECKS_ORACLE_H   oracle staleness window in hours (default 24; 0 = never auto-run)
 //   SESSION_CHECKS_REPOS      extra hub repos (space-separated, absolute)
+//   SESSION_CHECKS_POLL_MIN   poll interval while a session lives (default 30; floor 5)
 //   SESSION_CHECKS_STATE      state dir (default ~/.pi/agent/state)
 //   LOAD_GATE_MAX_WAIT_MIN=0  (set by us) oracle defers immediately on a
 //                             loaded machine instead of polling 10 min inline
@@ -45,6 +54,18 @@ import { isPrintMode } from "./shared/print-mode.js";
 
 export const HUB_H_DEFAULT = 6;
 export const ORACLE_H_DEFAULT = 24;
+/**
+ * Sibling hub repos checked by default (#619), resolved under the directory
+ * that contains AGENT_INFRA_PATH (~/Documents/GitHub in the standard layout).
+ * Dir-existence-gated in resolveHubRepos — a machine without a repo's
+ * directory skips it. (A non-git dir that exists is passed to the check and
+ * fails loudly — deliberate: it signals operator attention, never silence.)
+ */
+export const HUB_SIBLING_DEFAULT_NAMES = ["tortoise", "premise-labs", "DMeer", "eldato"] as const;
+export const POLL_MIN_DEFAULT = 30;
+export const POLL_MIN_FLOOR = 5;
+/** Upper bound so a runaway knob can never arm a sub-minute poll (review #635 P2). */
+export const POLL_MIN_MAX = 360; // 6h — the poll must stay under the hub window to be useful
 const LOCK_STALE_MS = 30 * 60 * 1000; // > oracle budget (900s) so a live run is never stolen
 const HUB_TIMEOUT_MS = 120_000;
 const ORACLE_TIMEOUT_MS = 900_000; // > the oracle's own load-gate poll ceiling (~600s) + run
@@ -69,15 +90,22 @@ export function lastRunEpoch(dir: string, name: string): number {
 
 /**
  * Default hub repos: AGENT_INFRA_PATH (its own main checkout — #615, the #99
- * exemption is removed), then TORTOISE_REPO env → sibling tortoise → extras.
+ * exemption is removed), TORTOISE_REPO env (non-sibling layouts), the sibling
+ * hub defaults under dirname(infraPath) (#619), then SESSION_CHECKS_REPOS
+ * extras. Dir-existence-gated + deduped; a machine lacking a repo's directory
+ * silently skips it (a non-git dir that exists is passed through and the check
+ * fails it loudly — never silent).
  */
 export function resolveHubRepos(infraPath: string): string[] {
   const repos: string[] = [];
   if (infraPath && existsSync(infraPath)) repos.push(infraPath);
   const envRepo = process.env.TORTOISE_REPO;
   if (envRepo && existsSync(envRepo)) repos.push(envRepo);
-  const sibling = join(dirname(infraPath), "tortoise");
-  if (existsSync(sibling)) repos.push(sibling);
+  const base = dirname(infraPath);
+  for (const name of HUB_SIBLING_DEFAULT_NAMES) {
+    const p = join(base, name);
+    if (existsSync(p)) repos.push(p);
+  }
   const extra = process.env.SESSION_CHECKS_REPOS;
   if (extra) {
     for (const r of extra.split(/\s+/)) {
@@ -85,6 +113,24 @@ export function resolveHubRepos(infraPath: string): string[] {
     }
   }
   return [...new Set(repos)];
+}
+
+// ── poll-cadence helpers (#619: long-running controllers) ───────────────
+
+/**
+ * Clamp the poll interval: non-finite/<=0 → default; below the floor → floor;
+ * above POLL_MIN_MAX → max. The upper bound keeps a runaway env knob from
+ * arming a sub-minute poll (Node clamps setInterval delays > 2^31−1 ms to 1 ms
+ * — a hot loop — so the clamp must land well below that ceiling).
+ */
+export function clampPollMinutes(raw: number): number {
+  if (!Number.isFinite(raw) || raw <= 0) return POLL_MIN_DEFAULT;
+  return Math.min(POLL_MIN_MAX, Math.max(POLL_MIN_FLOOR, raw));
+}
+
+/** Poll interval in ms from SESSION_CHECKS_POLL_MIN (minutes). */
+export function getPollIntervalMs(env: Record<string, string | undefined> = process.env): number {
+  return clampPollMinutes(Number(env.SESSION_CHECKS_POLL_MIN)) * 60_000;
 }
 
 // ── exec seam ───────────────────────────────────────────────────────────
@@ -202,8 +248,11 @@ async function runGated(
       summary.lines.push(`${name}: PASS (${elapsedS.toFixed(1)}s)`);
     } else if (code === 3) {
       // cron-quality-gates convention: 3 = load-gate DEFERRED — the check did
-      // NOT run (system too loaded). Do NOT burn the epoch: retry next session.
-      summary.lines.push(`${name}: DEFERRED (load gate — retry next session)${tail ? ` — ${tail}` : ""}`);
+      // NOT run (system too loaded). Do NOT burn the epoch: it stays due and is
+      // retried at the next session_start OR cadence-poll tick (#619) — bounded
+      // by SESSION_CHECKS_POLL_MIN, so a loaded machine yields at most one
+      // DEFERRED line per check per poll interval instead of a spin.
+      summary.lines.push(`${name}: DEFERRED (load gate — retries on next session_start / poll tick)${tail ? ` — ${tail}` : ""}`);
     } else {
       // Record the ATTEMPT (not just success) so a failing check re-probes on
       // cadence instead of every session start.
@@ -253,7 +302,8 @@ export async function runSessionChecks(opts: SessionChecksOptions): Promise<Sess
       cwd: infra,
       // Defer-immediately on a loaded machine: cron-quality-gates' inline
       // load-gate poll (default 10 min) would otherwise freeze session
-      // start; rc=3 DEFERRED retries next session with no epoch burn.
+      // start; rc=3 DEFERRED stays due (no epoch burn) and re-probes on the
+      // next session_start or cadence-poll tick (#619).
       env: { ...process.env, LOAD_GATE_MAX_WAIT_MIN: "0" },
       timeoutMs: ORACLE_TIMEOUT_MS,
     });
@@ -274,23 +324,54 @@ function numEnv(name: string, fallback: number): number {
   return Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 
+/** All gates for the checks + cadence poll: configured, interactive, enabled. */
+function sessionChecksEnabled(): boolean {
+  if (!process.env.AGENT_INFRA_PATH) return false; // not configured — silent
+  if (isPrintMode()) return false; // sub-agents: no checks, no noise, no timer
+  if (process.env.SESSION_CHECKS_OFF === "1") return false;
+  return true;
+}
+
 export default function (pi: ExtensionAPI) {
-  pi.on("session_start", async () => {
-    const infra = process.env.AGENT_INFRA_PATH;
-    if (!infra) return; // not configured — silent
-    if (isPrintMode()) return; // sub-agents: no checks, no noise
-    if (process.env.SESSION_CHECKS_OFF === "1") return;
+  // #619 cadence for long-running controllers: the age-gated run below fires
+  // at session_start; a controller that stays alive for hours would otherwise
+  // never see a new session_start and hub-state-check would go stale (the
+  // 2026-09-09 >17h-stale incident). An unref'd poll re-runs the same
+  // age-gated checks on SESSION_CHECKS_POLL_MIN while the session lives — the
+  // repo-freshness.ts timer pattern (#178). NOT launchd: macOS TCC blocks
+  // launchd-spawned processes from reading ~/Documents (#427/#432).
+  let poll: ReturnType<typeof setInterval> | null = null;
+
+  async function runChecks(): Promise<void> {
+    if (!sessionChecksEnabled()) return; // re-checked per tick — env can flip mid-session
     try {
       const summary = await runSessionChecks({
-        infraPath: infra,
+        infraPath: process.env.AGENT_INFRA_PATH as string,
         state: process.env.SESSION_CHECKS_STATE || undefined, // advertised knob (unset → default)
         hubHours: numEnv("SESSION_CHECKS_HUB_H", HUB_H_DEFAULT),
         oracleHours: numEnv("SESSION_CHECKS_ORACLE_H", ORACLE_H_DEFAULT),
       });
       for (const line of summary.lines) console.log(`[session-checks] ${line}`);
     } catch (err) {
-      // A session_start hook must never take pi down.
+      // A session hook/timer must never take pi down.
       console.warn(`[session-checks] hook error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  pi.on("session_start", async () => {
+    if (!sessionChecksEnabled()) return; // unconfigured/print/OFF → no run, no timer
+    await runChecks();
+    // Start/re-arm the cadence poll for this session.
+    if (poll) clearInterval(poll);
+    poll = setInterval(() => void runChecks(), getPollIntervalMs());
+    poll.unref?.(); // never hold the event loop (#153 class — repo-freshness precedent)
+  });
+
+  // pi extension rules: timers start in session_start, clear in session_shutdown.
+  pi.on("session_shutdown", async () => {
+    if (poll) {
+      clearInterval(poll);
+      poll = null;
     }
   });
 }

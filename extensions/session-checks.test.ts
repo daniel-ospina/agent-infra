@@ -11,7 +11,20 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from "node:
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
-import { due, lastRunEpoch, resolveHubRepos, runSessionChecks, type ExecFn, type ExecResult } from "./session-checks.js";
+import {
+  due,
+  lastRunEpoch,
+  resolveHubRepos,
+  runSessionChecks,
+  clampPollMinutes,
+  getPollIntervalMs,
+  HUB_SIBLING_DEFAULT_NAMES,
+  POLL_MIN_DEFAULT,
+  POLL_MIN_FLOOR,
+  POLL_MIN_MAX,
+  type ExecFn,
+  type ExecResult,
+} from "./session-checks.js";
 import sessionChecksHook from "./session-checks.js"; // default export = pi registration fn
 
 let passed = 0;
@@ -29,12 +42,21 @@ async function test(name: string, fn: () => void | Promise<void>) {
 
 function tmp() {
   const d = mkdtempSync(join(tmpdir(), "session-checks-test-"));
-  // Default hub resolution finds agent-infra (its own path) + the tortoise
-  // SIBLING — #615: agent-infra is no longer #99-exempt. Tests exercise the
-  // same default the live extension sees (env unset in CI; ambient env is
-  // harmless — exec is faked).
+  // Default hub resolution finds agent-infra (its own path) + the sibling hub
+  // repos under the same parent dir — #615: agent-infra is no longer #99-exempt;
+  // #619: the default list is tortoise/premise-labs/DMeer/eldato (existence-gated).
+  // Tests exercise the same default the live extension sees (env unset in CI;
+  // ambient env is harmless — exec is faked). tmp() seeds the tortoise sibling
+  // only; tests that need more siblings call makeHubSiblings().
   mkdirSync(join(d, "tortoise"), { recursive: true });
   return { d, state: join(d, "state"), infra: join(d, "agent-infra") };
+}
+
+/** Seed the full #619 sibling-hub default set under the fixture root. */
+function makeHubSiblings(d: string): void {
+  for (const name of HUB_SIBLING_DEFAULT_NAMES) {
+    mkdirSync(join(d, name), { recursive: true });
+  }
 }
 
 /** Removes ambient repo env vars so a resolution test sees only its own setup. */
@@ -77,15 +99,57 @@ interface FakePi {
   on: (event: string, cb: () => Promise<void>) => void;
 }
 
-const HOOK_ENV_KEYS = ["AGENT_INFRA_PATH", "SESSION_CHECKS_OFF", "SESSION_CHECKS_STATE", "SESSION_CHECKS_HUB_H", "SESSION_CHECKS_ORACLE_H", "TORTOISE_REPO", "SESSION_CHECKS_REPOS"] as const;
+const HOOK_ENV_KEYS = ["AGENT_INFRA_PATH", "SESSION_CHECKS_OFF", "SESSION_CHECKS_STATE", "SESSION_CHECKS_HUB_H", "SESSION_CHECKS_ORACLE_H", "SESSION_CHECKS_POLL_MIN", "TORTOISE_REPO", "SESSION_CHECKS_REPOS"] as const;
 
-async function runHook(env: Record<string, string | undefined>): Promise<string[]> {
+/**
+ * Full hook harness (#619): runs the real registration fn with a fake pi,
+ * capturing session_start/session_shutdown handlers and the cadence poll
+ * timer (setInterval/clearInterval stubbed) so tests can (a) assert timer
+ * lifecycle and (b) fire a tick manually to prove the long-controller
+ * re-check. Call cleanup() when done — restores console/env/timer globals.
+ */
+interface HookHandle {
+  lines: string[];
+  shutdownCb: (() => Promise<void>) | null;
+  /** Registered cadence poll: { ms, cleared, tick } — tick fires the interval body. */
+  timer: { ms: number; cleared: boolean; tick: () => Promise<void> } | null;
+  cleanup: () => void;
+}
+
+async function runHookFull(env: Record<string, string | undefined>, opts: { print?: boolean } = {}): Promise<HookHandle> {
   const lines: string[] = [];
   const origLog = console.log;
   console.log = (msg?: unknown) => lines.push(String(msg));
   const saved: Record<string, string | undefined> = {};
   let startCb: (() => Promise<void>) | null = null;
-  const pi: FakePi = { on: (event, cb) => { if (event === "session_start") startCb = cb; } };
+  let shutdownCb: (() => Promise<void>) | null = null;
+  const timer: { ms: number; cleared: boolean; tick: () => Promise<void> } = { ms: 0, cleared: false, tick: async () => {} };
+  const origSetInterval = globalThis.setInterval;
+  const origClearInterval = globalThis.clearInterval;
+  (globalThis as any).setInterval = (fn: () => void, ms: number) => {
+    timer.ms = ms;
+    timer.tick = async () => { await fn(); };
+    return { unref: () => {}, ref: () => {} } as unknown as ReturnType<typeof setInterval>;
+  };
+  (globalThis as any).clearInterval = () => { timer.cleared = true; };
+  const pi: FakePi = {
+    on: (event, cb) => {
+      if (event === "session_start") startCb = cb;
+      else if (event === "session_shutdown") shutdownCb = cb;
+    },
+  };
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    console.log = origLog;
+    (globalThis as any).setInterval = origSetInterval;
+    (globalThis as any).clearInterval = origClearInterval;
+    for (const k of HOOK_ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  };
   try {
     for (const k of HOOK_ENV_KEYS) {
       saved[k] = process.env[k];
@@ -93,15 +157,23 @@ async function runHook(env: Record<string, string | undefined>): Promise<string[
       else process.env[k] = env[k];
     }
     delete process.env.PI_MODE; // interactive-equivalent (pi never sets it)
+    if (opts.print) process.env.PI_MODE = "print"; // sub-agent class
     sessionChecksHook(pi as never);
     if (startCb) await startCb();
-    return lines;
+    return { lines, shutdownCb, timer: timer.ms > 0 ? timer : null, cleanup };
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
+}
+
+/** Convenience wrapper: lines only, auto-cleanup (pre-#619 hook tests). */
+async function runHook(env: Record<string, string | undefined>): Promise<string[]> {
+  const h = await runHookFull(env);
+  try {
+    return h.lines;
   } finally {
-    console.log = origLog;
-    for (const k of HOOK_ENV_KEYS) {
-      if (saved[k] === undefined) delete process.env[k];
-      else process.env[k] = saved[k];
-    }
+    h.cleanup();
   }
 }
 
@@ -152,14 +224,31 @@ await test("lastRunEpoch: reads epoch + ignores garbage", () => {
 });
 
 // ── 3. repo resolution ─────────────────────────────────────────────────
-await test("resolveHubRepos: agent-infra + sibling tortoise by default (#615)", () => {
+await test("resolveHubRepos: agent-infra + sibling tortoise; absent siblings skipped (#615/#619)", () => {
   withCleanRepoEnv(() => {
     const { d, infra } = tmp();
     makeInfra(infra); // sibling tortoise already created by tmp()
     const repos = resolveHubRepos(infra);
-    equal(repos.length, 2, "default = agent-infra + sibling tortoise");
+    equal(repos.length, 2, "default = agent-infra + the one present sibling (tortoise)");
     ok(repos.includes(infra), "agent-infra included (hub discipline exemption #99 removed, #615)");
     ok(repos.includes(join(dirname(infra), "tortoise")), "sibling tortoise resolved");
+    for (const name of ["premise-labs", "DMeer", "eldato"]) {
+      ok(!repos.includes(join(dirname(infra), name)), `${name} absent → not checked (existence-gated, #619)`);
+    }
+    rmSync(d, { recursive: true, force: true });
+  });
+});
+await test("resolveHubRepos: all sibling hub defaults resolve when present (#619)", () => {
+  withCleanRepoEnv(() => {
+    const { d, infra } = tmp();
+    makeInfra(infra);
+    makeHubSiblings(d); // tortoise + premise-labs + DMeer + eldato
+    const repos = resolveHubRepos(infra);
+    equal(repos.length, 1 + HUB_SIBLING_DEFAULT_NAMES.length, "agent-infra + all 4 sibling hubs");
+    for (const name of HUB_SIBLING_DEFAULT_NAMES) {
+      ok(repos.includes(join(dirname(infra), name)), `sibling ${name} resolved (#619)`);
+    }
+    ok(repos.includes(infra), "agent-infra first (#615)");
     rmSync(d, { recursive: true, force: true });
   });
 });
@@ -329,6 +418,7 @@ await test("oracle DEFERRED (load gate rc=3) → no epoch burn; re-probes next s
   equal(oracleCalls, 1, "oracle attempted");
   equal(oracleEnv?.LOAD_GATE_MAX_WAIT_MIN, "0", "defer-immediately env passed (no 10-min inline poll)");
   ok(s.lines.some((l) => l.startsWith("skill-lint-oracle: DEFERRED")), "DEFERRED label (not FAIL)");
+  ok(s.lines.some((l) => l.includes("retries on next session_start / poll tick")), "DEFERRED message states per-tick retry (#619 cadence)");
   equal(s.ran.includes("skill-lint-oracle"), true, "attempt listed");
   equal(lastRunEpoch(state, "skill-lint-oracle"), 0, "NO epoch recorded — deferral burns nothing");
   const s2 = await runSessionChecks({ infraPath: infra, state, nowSec: now + 60, hubHours: 6, oracleHours: 24, exec });
@@ -405,6 +495,113 @@ await test("hook: SESSION_CHECKS_HUB_H=0 disables the hub window", async () => {
   const lines = await runHook({ AGENT_INFRA_PATH: infra, SESSION_CHECKS_STATE: state, SESSION_CHECKS_HUB_H: "0", TORTOISE_REPO: infra });
   ok(!lines.some((l) => l.includes("hub-state-check:")), "hub never auto-runs at 0");
   rmSync(d, { recursive: true, force: true });
+});
+
+// ── 5. cadence poll for long-running controllers (#619) ────────────────
+/** Poll a predicate until true or timeout (the interval body fires-and-forgets runChecks). */
+async function waitFor(pred: () => boolean, timeoutMs = 3000): Promise<boolean> {
+  const start = Date.now();
+  while (!pred()) {
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return true;
+}
+await test("clampPollMinutes: default on junk, floor at 5, cap at max", () => {
+  equal(clampPollMinutes(NaN), POLL_MIN_DEFAULT);
+  equal(clampPollMinutes(0), POLL_MIN_DEFAULT);
+  equal(clampPollMinutes(-3), POLL_MIN_DEFAULT);
+  equal(clampPollMinutes(2), POLL_MIN_FLOOR, "below-floor clamps UP to the floor");
+  equal(clampPollMinutes(17), 17);
+  equal(clampPollMinutes(100_000), POLL_MIN_MAX, "runaway knob clamps DOWN to the max (review #635 P2)");
+  equal(clampPollMinutes(POLL_MIN_MAX), POLL_MIN_MAX, "exactly at the cap passes through");
+});
+await test("getPollIntervalMs: env knob (minutes) → ms; default 30 min; over-cap clamped", () => {
+  equal(getPollIntervalMs({}), POLL_MIN_DEFAULT * 60_000);
+  equal(getPollIntervalMs({ SESSION_CHECKS_POLL_MIN: "10" }), 10 * 60_000);
+  equal(getPollIntervalMs({ SESSION_CHECKS_POLL_MIN: "2" }), POLL_MIN_FLOOR * 60_000, "clamped to floor");
+  equal(getPollIntervalMs({ SESSION_CHECKS_POLL_MIN: "junk" }), POLL_MIN_DEFAULT * 60_000, "invalid → default");
+  equal(getPollIntervalMs({ SESSION_CHECKS_POLL_MIN: "600000" }), POLL_MIN_MAX * 60_000, "ms-unit input (600000) clamps to 6h max — no 1ms hot loop");
+});
+await test("hook: interactive session registers an unref'd cadence poll (timer lifecycle)", async () => {
+  const { d, state, infra } = tmp();
+  makeInfra(infra);
+  mkdirSync(state, { recursive: true });
+  const nowSec = Math.floor(Date.now() / 1000);
+  writeFileSync(join(state, "hub-state-check.last"), String(nowSec - 60)); // fresh → silent start pass
+  writeFileSync(join(state, "skill-lint-oracle.last"), String(nowSec - 60));
+  const h = await runHookFull({ AGENT_INFRA_PATH: infra, SESSION_CHECKS_STATE: state, TORTOISE_REPO: infra });
+  try {
+    equal(h.lines.length, 0, "fresh start pass stays silent");
+    ok(h.timer !== null, "cadence poll registered on interactive session_start");
+    equal(h.timer?.ms, POLL_MIN_DEFAULT * 60_000, "default poll = 30 min");
+    equal(h.timer?.cleared, false, "not cleared before shutdown");
+    await h.shutdownCb?.();
+    equal(h.timer?.cleared, true, "poll cleared on session_shutdown");
+  } finally {
+    h.cleanup();
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+await test("hook: SESSION_CHECKS_POLL_MIN knob sets the poll interval", async () => {
+  const { d, state, infra } = tmp();
+  makeInfra(infra);
+  const h = await runHookFull({ AGENT_INFRA_PATH: infra, SESSION_CHECKS_STATE: state, SESSION_CHECKS_POLL_MIN: "7", TORTOISE_REPO: infra });
+  try {
+    equal(h.timer?.ms, 7 * 60_000, "poll honors the knob");
+  } finally {
+    h.cleanup();
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+await test("hook: print mode (sub-agent) registers NO timer and runs nothing", async () => {
+  const { d, state, infra } = tmp();
+  makeInfra(infra);
+  const h = await runHookFull({ AGENT_INFRA_PATH: infra, SESSION_CHECKS_STATE: state, TORTOISE_REPO: infra }, { print: true });
+  try {
+    equal(h.lines.length, 0, "no output in print mode");
+    equal(h.timer, null, "no cadence poll in print mode (sub-agents stay silent)");
+  } finally {
+    h.cleanup();
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+await test("hook: disabled (SESSION_CHECKS_OFF=1) registers NO timer", async () => {
+  const { d, state, infra } = tmp();
+  makeInfra(infra);
+  const h = await runHookFull({ AGENT_INFRA_PATH: infra, SESSION_CHECKS_STATE: state, SESSION_CHECKS_OFF: "1", TORTOISE_REPO: infra });
+  try {
+    equal(h.lines.length, 0, "OFF silences the start pass");
+    equal(h.timer, null, "OFF → no cadence poll");
+  } finally {
+    h.cleanup();
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+await test("hook: poll tick re-checks on cadence after the window lapses (long-running controller)", async () => {
+  const { d, state, infra } = tmp();
+  makeInfra(infra);
+  mkdirSync(state, { recursive: true });
+  const nowSec = Math.floor(Date.now() / 1000);
+  writeFileSync(join(state, "hub-state-check.last"), String(nowSec - 8 * HOUR)); // hub due (6h window)
+  writeFileSync(join(state, "skill-lint-oracle.last"), String(nowSec - 60)); // oracle fresh
+  const h = await runHookFull({ AGENT_INFRA_PATH: infra, SESSION_CHECKS_STATE: state, TORTOISE_REPO: infra });
+  try {
+    const hubCount = () => h.lines.filter((l) => l.includes("hub-state-check:")).length;
+    equal(hubCount(), 1, "start pass ran the due hub check");
+    // Simulate the 6h window lapsing again while the SAME session lives.
+    writeFileSync(join(state, "hub-state-check.last"), String(Math.floor(Date.now() / 1000) - 8 * HOUR));
+    await h.timer?.tick();
+    ok(await waitFor(() => hubCount() >= 2), "poll tick re-probed the hub check on cadence (#619)");
+    // Fresh again → a tick stays silent (no epoch burn, no output).
+    const linesBefore = h.lines.length;
+    await h.timer?.tick();
+    await new Promise((r) => setTimeout(r, 150)); // give a would-be run time to surface
+    equal(h.lines.length, linesBefore, "fresh poll tick stays silent");
+  } finally {
+    h.cleanup();
+    rmSync(d, { recursive: true, force: true });
+  }
 });
 
   console.log("");
