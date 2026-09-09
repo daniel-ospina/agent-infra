@@ -58,15 +58,22 @@
 //     main-rooted session writing another hub via bash is gated too — review
 //     fold-in); same-vs-cross-checkout is judged by the SESSION's checkout,
 //     never a command `cd`-site; cross-checkout tracked AND `.git/`-metadata
-//     writes block regardless of hub state. Cycle-2 fold-ins: main checkouts
-//     NESTED under the session's own checkout tree (submodules / vendored /
-//     private copies) are not shared hubs and are not frozen; `.git/`-metadata
-//     writes freeze in every state except a same-rooted CLEAN main (never a
-//     build side-effect); a TTL marker bypasses the cross-checkout bash gate
-//     exactly like the write/edit route (M4 D3's disordered-own-hub freeze
-//     stays); the write/edit gate also blocks cross-cwd overwrites of EXISTING
-//     untracked hub files (another session's hub WIP) — only genuinely NEW
-//     files are additive. Worktree sessions still write
+//     writes block regardless of hub state. Cycle-2/3 fold-ins: main checkouts
+//     NESTED under a session's own checkout tree are private subtrees (not
+//     shared hubs) and are not frozen ONLY when the session itself is a
+//     NON-main checkout — a worktree/private checkout owns its tree; a
+//     MAIN-rooted session's nested checkouts (submodules under a hub) stay
+//     frozen (an ancestor MAIN over sibling hubs must not lift the freeze,
+//     cycle-3 B-1); `.git/`-metadata writes freeze for every session in every
+//     state except an active TTL marker's own-rooted clean recovery window
+//     (never a build side-effect); a TTL marker bypasses the cross-checkout
+//     bash gate exactly like the write/edit route (M4 D3's disordered-own-hub
+//     freeze stays); the write/edit gate and the bash route both block
+//     cross-checkout overwrites of EXISTING untracked hub files (another
+//     session's hub WIP) — only genuinely NEW files are additive (cycle-3
+//     A-2 bash parity); script-chain budget exhaustion fails closed ONLY on
+//     hub-proximity evidence (a >64-token hub-free fan-out must not
+//     false-block, cycle-3 A-1). Worktree sessions still write
 //     their OWN worktree freely — its targets resolve to that worktree's
 //     checkout, never a main checkout. Main-ness and worktree-ness are judged
 //     STRUCTURALLY (gitdir vs commondir realpaths — the path-substring test
@@ -713,20 +720,24 @@ function _maybeWarnBashWrite(command: string) {
 //     another repo's session, incl. a clean agent-infra main): block TRACKED
 //     overwrites regardless of hub state, PLUS any write into that main's
 //     `.git/` metadata (hooks/, config — never index-tracked, so the tracked
-//     intersect cannot see them). These are the vectors behind the 2026-09-08
+//     intersect cannot see them), PLUS any overwrite of an EXISTING untracked
+//     hub file (destroys another session's uncommitted hub WIP — only
+//     genuinely NEW files are additive; cycle-3 A-2 parity with the tool
+//     route). These are the vectors behind the 2026-09-08
 //     mass `.husky/pre-commit` rewrite from the GitHub parent dir and the
 //     wt-session python open() probes into premise-labs/tortoise AGENTS.md.
-// NEW-file writes and untracked WIP keep the warn-only treatment (#350 / the
-// #436 collision-free carve-out). Script-file content (`bash /tmp/x.sh`) is
-// walked with the SAME per-candidate classifier (bounded depth). There is NO
-// cheap pre-bail: bashWriteTargetsResolved is a PURE string walk (zero git
-// spawns on a write-free command), and the earlier bail fired exactly for
-// worktree/foreign sessions (their hub disorder reads null) — letting
-// `bash -c '…'` / sudo-tee / spawner-wrapped payloads past the walker
-// (adversarial-review F3). Fail-safe: any git/parse error → null (never
-// false-block). One bounded `git ls-files` per distinct target top for all
-// its candidates.
-function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, markerOn: boolean): { resolvedPath: string; rel: string; kind?: "script-depth" } | null {
+// NEW-file writes keep the warn-only treatment (#350 / the #436
+// collision-free carve-out; a session's OWN disordered-main untracked writes
+// stay allowed — build/formatter side effects, #437). Script-file content
+// (`bash /tmp/x.sh`) is walked with the SAME per-candidate classifier
+// (bounded depth). There is NO cheap pre-bail: bashWriteTargetsResolved is a
+// PURE string walk (zero git spawns on a write-free command), and the earlier
+// bail fired exactly for worktree/foreign sessions (their hub disorder reads
+// null) — letting `bash -c '…'` / sudo-tee / spawner-wrapped payloads past
+// the walker (adversarial-review F3). Fail-safe: any git/parse error → null
+// (never false-block). One bounded `git ls-files` per distinct target top for
+// all its candidates.
+function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, markerOn: boolean): { resolvedPath: string; rel: string; kind?: "script-depth" | "untracked-existing" } | null {
   try {
     if (!classifierLoaded) return null;
     const base = resolve(process.cwd());
@@ -783,19 +794,25 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
       const rel = tReal.slice(ck.top.length).replace(/^[/\\]+/, "");
       if (!rel || tReal === ck.top) return;
       // A main checkout strictly NESTED under the session's own checkout tree
-      // is the session's private working subtree (never a shared hub whose
-      // other sessions sit elsewhere) — the cross-checkout freeze does not
-      // reach inside the session's own tree (cycle-2 correctness F1b).
-      if (sessionTop && sessionTop !== ck.top && ck.top.startsWith(sessionTop + "/")) {
+      // is the session's private working subtree ONLY when the SESSION ITSELF
+      // is a NON-main checkout (a worktree/private checkout — its tree is
+      // session-private by construction). A MAIN-rooted session has no
+      // private subtree: that main (a hub) is shared with every other session
+      // of the repo, so a submodule/vendored checkout nested under it is
+      // shared too and stays frozen (cycle-3 B-1: the pure path-containment
+      // exemption let an ancestor MAIN — a parent repo over sibling hubs —
+      // lift every cross-hub freeze; cap the exemption at non-main sessions,
+      // which closes the ancestor vector since that session is main-rooted).
+      if (sessionCheck && !sessionCheck.isMain && sessionTop && sessionTop !== ck.top && ck.top.startsWith(sessionTop + "/")) {
         return;
       }
       const sameCheckout = sessionOwnHub !== null && sessionOwnHub === ck.top;
       // .git-metadata rel (exact ".git" pointer file OR ".git/..." internals):
-      // never index-tracked and never a build side-effect — a same-rooted
-      // CLEAN main is #437-open, every other geometry (cross-checkout any
-      // state, disordered own main — incl. under a TTL marker via M4 D3)
-      // blocks, mirroring the write/edit tool's freeze of the same spelling
-      // (cycle-2 F4 rel-exact + P1).
+      // never index-tracked and never a build side-effect — every session in
+      // every state blocks it EXCEPT an active TTL marker's same-rooted CLEAN
+      // main (its open recovery window; disordered own main still freezes via
+      // M4 D3 under the marker), mirroring the write/edit tool's freeze of the
+      // same spelling (cycle-2 F4 rel-exact + P1; cycle-3 B-2 doc parity).
       const gitMeta = rel === ".git" || rel.startsWith(".git/");
       if (markerOn) {
         if (!sameCheckout) return; // marker bypasses the #618 cross gate (tool parity)
@@ -824,10 +841,9 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
     const seenScripts = new Set<string>();
     const pendingScripts = scriptToks.slice();
     // 64-iteration budget (was 8): a fan-out of sourced helpers is common, and
-    // a chain deeper than the budget is unverifiable — cycle-2 P2 hardened the
-    // old depth-8 exhaustion (a write at depth ≥9 was never walked) to FAIL
-    // CLOSED (mirror the git-side _unverifiableGitContent doctrine) instead of
-    // silently letting a deep chain's hub write through.
+    // a chain deeper than the budget is unverifiable. Exhaustion fails closed
+    // ONLY on hub-proximity evidence (grouped candidates or a disordered
+    // own-main session); a hub-free chain must not false-block (cycle-3 A-1).
     let depthBudget = 64;
     while (pendingScripts.length > 0 && depthBudget-- > 0) {
       const st = pendingScripts.shift()!;
@@ -854,10 +870,17 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
     if (gitInternalHit) return gitInternalHit;
     if (pendingScripts.length > 0) {
       // Budget exhausted with script tokens still unprocessed — their write
-      // content is UNVERIFIABLE. Fail closed (the git-side script gate does
-      // the same for unreadable content): a >64-level script chain is
-      // pathological/obfuscated; blocking beats silently letting its hub
-      // write through (cycle-2 P2).
+      // content is UNVERIFIABLE. Fail closed ONLY on hub-proximity evidence:
+      // the walk already placed a candidate under the block-or-block-if-
+      // tracked tests (grouped) or the session shell is rooted in a DISORDERED
+      // hub main (the classic chain-write incident shape). A >64-token chain
+      // that never resolved a target into a hub-main candidate (non-git /tmp
+      // cwd, a CLEAN own-main build fan-out of sourced helpers) is NO evidence
+      // of a hub write — failing closed there false-blocks legit wide source
+      // fan-outs (cycle-3 A-1). Residual: a >64-token foreign chain whose hub
+      // write sits in the unprocessed tail slips (documented; tool route is
+      // authoritative and the write gate is marker/tool-checked).
+      if (grouped.size === 0 && !(sessionOwnHub !== null && sessionDisorder !== null)) return null;
       return { resolvedPath: base, rel: "script-chain", kind: "script-depth" };
     }
     if (grouped.size === 0) return null;
@@ -868,6 +891,22 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
       const rels = [...new Set(recs.map((r) => r.rel))];
       const tracked = new Set(trackedRelsIn(top, rels));
       for (const r of recs) if (tracked.has(r.rel)) return { resolvedPath: r.tPath, rel: r.rel };
+      // cycle-3 A-2: a CROSS-checkout rec that EXISTS but is NOT tracked is an
+      // existing-untracked overwrite — the bash route mirrored the tool
+      // route's tracked + .git freezes but not its existing-untracked one;
+      // freeze it here (bash untracked surface otherwise unchanged: a
+      // same-rooted-disordered session's own-main untracked writes stay
+      // allowed — build/formatter side effects, #437). Under an active marker
+      // no cross-checkout rec ever reaches grouping (marker branch returns
+      // early), so no markerOn guard is needed here.
+      const crossTop = sessionOwnHub === null || sessionOwnHub !== top;
+      if (crossTop) {
+        for (const r of recs) {
+          try {
+            if (existsSync(r.tPath) && statSync(r.tPath).isFile()) return { resolvedPath: r.tPath, rel: r.rel, kind: "untracked-existing" as const };
+          } catch { /* keep walking */ }
+        }
+      }
     }
     return null;
   } catch {
@@ -883,7 +922,21 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
 // cross-checkout write into a hub's `.git/` metadata freezes too; only
 // session-start host env bypasses; a mid-command `export` cannot) plus the
 // sanctioned ways forward (salvage / worktree).
-function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind?: "script-depth" }): string {
+function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind?: "script-depth" | "untracked-existing" }): string {
+  if (hit.kind === "untracked-existing") {
+    return [
+      `⛔ Bash write to an existing UNTRACKED file in a hub main blocked (${hit.rel}).`,
+      `   The write target's repo is a shared MAIN checkout (#618/#621); a`,
+      `   cross-checkout overwrite of an EXISTING untracked hub file destroys`,
+      `   another session's uncommitted hub WIP. Only genuinely NEW files`,
+      `   (additive + visible) are allowed cross-checkout (cycle-3 A-2 — the`,
+      `   bash route mirrors the write/edit tool's existing-untracked freeze).`,
+      `   → Work in a worktree of the TARGET repo (using-git-worktrees skill,`,
+      `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
+      `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
+      `     override (deliberate solo sessions only).`,
+    ].join("\n");
+  }
   if (hit.kind === "script-depth") {
     return [
       "⛔ Bash script execution blocked — script chain exceeds the verify budget.",
@@ -903,9 +956,11 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
     `   DELIBERATE cross-checkout write (your session is not rooted in that`,
     `   repo) freezes regardless of hub state, a session rooted in a`,
     `   DISORDERED main freezes on tracked overwrites, and hub .git-metadata`,
-    `   writes (hooks/, config) freeze in every state but a same-rooted clean main.`,
-    `   Untracked/new-file writes stay allowed. Only session-start host env`,
-    `   (AGENT_ALLOW_MAIN_EDITS=1) bypasses — a mid-command export cannot.`,
+    `   writes (hooks/, config) freeze for every session in every state except`,
+    `   an active escape-marker's own-rooted clean recovery window.`,
+    `   NEW-file writes and own-main untracked writes stay allowed. Only`,
+    `   session-start host env (AGENT_ALLOW_MAIN_EDITS=1) bypasses — a`,
+    `   mid-command export cannot.`,
     `   → Work in a worktree of the TARGET repo (using-git-worktrees skill,`,
     `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
     `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
@@ -1770,12 +1825,16 @@ export default function (pi: ExtensionAPI) {
       };
     }
     // A main checkout strictly NESTED under the session's own checkout tree
-    // (private repo / submodule / vendored copy inside the session's work
-    // area) is not a shared hub — the session owns that subtree, so the
-    // cross-checkout freeze does not reach it (cycle-2 correctness F1b; the
-    // real sibling-hub vectors — the GitHub parent dir, other repos' main
-    // checkouts — are never under the session's own tree).
-    if (sessionTop && tgtCheck.top.startsWith(sessionTop + "/")) {
+    // is the session's private working subtree ONLY when the SESSION is a
+    // NON-main checkout (worktree/private — tree is session-private by
+    // construction). A MAIN-rooted session's nested checkouts (submodule /
+    // vendored copy under a hub) are shared with every other session of that
+    // hub and stay frozen — the exemption is capped at non-main sessions so an
+    // ancestor MAIN (a parent repo over sibling hubs) can never lift the
+    // cross-hub freeze (cycle-3 B-1; the real sibling-hub vectors — the
+    // GitHub parent dir, other repos' main checkouts — are never under a
+    // worktree's private tree either).
+    if (sessionCheck && !sessionCheck.isMain && sessionTop && tgtCheck.top.startsWith(sessionTop + "/")) {
       return undefined;
     }
     // Cross-cwd write into a hub main (worktree session / foreign non-git

@@ -25,8 +25,10 @@ exempt wholesale), foreign/non-git cwds (previously invisible — no toplevel to
 compare), and other repos' sessions (an agent-infra-rooted controller writing
 tortoise/premise-labs/DMeer/eldato main after the #615 removal). Own-worktree
 writes stay free (their targets resolve to the worktree's checkout, never a
-main checkout — epic-529 preserved structurally). NEW/untracked files into a
-hub main stay additive: they WARN on the #350 WIP patterns only.
+main checkout — epic-529 preserved structurally). New ADDITIVE files into a
+hub main stay free: they WARN on the #350 WIP patterns only — but an
+overwrite of any EXISTING hub-main file (tracked, `.git/`-metadata, or
+untracked WIP) is a destructive cross-session write and blocks.
 
 There is **NO auto-bypass**: the guard blocks every time, so a rogue or
 parallel agent cannot retry its way past it. Escapes are deliberate and
@@ -308,19 +310,32 @@ dirty, and trips M4's freeze. Surfaces:
    a main checkout whose path contains a `worktrees` segment is not
    misread as a linked worktree), and a symlinked/external `.git` dir is
    caught by testing the UNREALPATH'd spelling too (cycle-2 F4).
-   Two scoped relaxations (cycle-2 fold-ins): (a) a main checkout strictly
+   Two scoped relaxations (cycle-2/3 fold-ins): (a) a main checkout strictly
    NESTED under the session's own checkout tree (a private submodule /
    vendored / experiment copy inside the session's work area) is NOT a
-   shared hub — the cross-checkout freeze does not reach the session's own
-   tree (the sibling-hub vectors — GitHub-parent foreign cwds, other repos'
-   canonical main checkouts — are never under the session's tree); (b)
+   shared hub ONLY when the SESSION ITSELF is a NON-main checkout — a
+   worktree/private checkout owns its tree, so the cross-checkout freeze
+   does not reach it (the sibling-hub vectors — GitHub-parent foreign cwds,
+   other repos' canonical main checkouts — are never under a worktree's
+   private tree either); a MAIN-rooted session's nested checkouts (a
+   submodule under a hub) stay frozen — the exemption is capped at non-main
+   sessions so an ancestor MAIN over sibling hubs cannot lift the freeze
+   (cycle-3 B-1); (b)
    under an active TTL marker the bash gate keeps only M4 D3's
    disordered-OWN-hub freeze, mirroring the write/edit route whose #618 gate
    the marker return precedes (the marker is an audited solo-session hatch).
-   Hub `.git/`-metadata writes block for ANY session in ANY hub state except
-   a same-rooted CLEAN main and the marker's own-main window — hooks/config
-   are never a build side-effect, so the #437 clean-main residual (tracked
-   files only) does not extend to them (cycle-2 P1).
+   Hub `.git/`-metadata writes block for ANY session in ANY hub state EXCEPT
+   an active marker's same-rooted CLEAN main (its open recovery window) —
+   hooks/config are never a build side-effect, so the #437 clean-main
+   residual (tracked files only) does not extend to them (cycle-2 P1;
+   cycle-3 B-2 reconciled the message/docs with the operative rule). A
+   cross-checkout bash overwrite of an EXISTING untracked hub file blocks
+   exactly like the write/edit tool route — only genuinely NEW files are
+   additive (cycle-3 A-2). Script-chain content is walked to a bounded
+   budget; on budget exhaustion the gate fails closed ONLY when the walk
+   already saw hub-main candidates (or the session shell is rooted in a
+   DISORDERED hub main) — a >64-token hub-free fan-out of sourced helpers
+   must not false-block (cycle-3 A-1).
    Block message states the single coherent rule: bash writes respect the same
    hub gate as the tools; only the session-start host env bypasses — a
    mid-command `export` cannot. The gate resolves redirect operands that the
