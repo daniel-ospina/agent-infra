@@ -334,16 +334,16 @@ ${MARKER}"
   # the body before this marker existed) does not durably block a merge once
   # a later SUCCESS for the same head exists (verified empirically, #633) —
   # but the FAILURE keeps showing a red ai-review-gate row in the rollup
-  # until something re-evaluates, and when the gate's NEWEST completed run on
-  # the head is red the documented remedy — "re-run record-review.sh to
+  # until something re-evaluates, and when the gate's NEWEST run on the head
+  # is completed and red the documented remedy — "re-run record-review.sh to
   # retry" — used to be a silent no-op: the marker is already in the body, so
   # no PATCH fires, no `edited` event, and no fresh gate run (tortoise PR
   # #2698 thrashed on this for 40 min). User tokens cannot rewrite the stale
   # run's conclusion (PATCH /check-runs/{id} → 403, GitHub-App-only) nor
   # re-request it (POST /check-runs/{id}/rerequest → 404 for Actions runs),
   # but CAN re-run the Actions job (POST /actions/jobs/{id}/rerun — verified
-  # #633). So when the recorded head's NEWEST completed gate run is red, re-run
-  # it here: the re-run re-reads the PR body live, so with the signed marker
+  # #633). So when the head's newest gate run is completed AND red, re-run it
+  # here: the re-run re-reads the PR body live, so with the signed marker
   # present it replaces the stale red attempt with a fresh run (for GitHub
   # Actions the check-run id IS the job id). A newer SUCCESS for the name is
   # the normal green end-state (no rerun — would just churn Actions jobs); a
@@ -353,19 +353,44 @@ ${MARKER}"
   # name is repo-specific — override AI_REVIEW_GATE_CHECK_NAME for consumers
   # that renamed their required check. Best-effort — NEVER fails the record.
   if [ "${MARKER_PRESENT:-0}" = "1" ] && [ "$FORCE_STALE" -ne 1 ]; then
-    GATE_CHECK="${AI_REVIEW_GATE_CHECK_NAME:-ai-review-gate}"
+    # Normalize like the GATE_KEY read (line ~281): a file/env override may
+    # carry stray whitespace that would silently zero out the name match.
+    GATE_CHECK="$(printf '%s' "${AI_REVIEW_GATE_CHECK_NAME:-ai-review-gate}" | tr -d '[:space:]')"
+    : "${GATE_CHECK:=ai-review-gate}"
     NEWEST_RED_ID=""
     # The commit check-runs payload is read RAW so a query failure is
     # distinguishable from "no red run" (the #405 convention: a transient
     # API failure must warn loudly and skip, never read as nothing-to-do).
     if GATE_JSON="$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" 2>/dev/null)"; then
-      # Newest completed run for the gate check name; remediate only when its
-      # conclusion is red (success/skipped/neutral satisfy the required
-      # check). $gate comes via --arg — no jq-program interpolation.
-      NEWEST_RED_ID="$(printf '%s' "$GATE_JSON" \
+      # Newest run for the gate check name across ALL statuses; remediate only
+      # when that newest run is COMPLETED and red (failure/cancelled/
+      # timed_out/action_required — success/skipped/neutral satisfy the
+      # required check). Demanding the newest run be completed is also the
+      # livelock guard: a queued/in_progress run (a rerun the remediation
+      # itself fired, or the `edited` run a fresh PATCH just started) is
+      # already re-evaluating the body, and re-running the older completed
+      # red behind it would start a second job whose per-PR cancel-in-progress
+      # cancels the in-flight fresh run — forever. $gate comes via --arg — no
+      # jq-program interpolation.
+      if ! NEWEST_RED_ID="$(printf '%s' "$GATE_JSON" \
         | jq -r --arg gate "$GATE_CHECK" \
-          '[.check_runs[] | select(.name == $gate) | select(.status == "completed")] | sort_by(.id) | reverse | .[0] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required") | .id' \
-        2>/dev/null || true)"
+          '[.check_runs[] | select(.name == $gate)] | sort_by(.id) | reverse | .[0] | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required") | .id' \
+      )"; then
+        # A gh-200 whose body fails the jq stage is its own failure class
+        # (payload shape change, broken jq) — warn loudly, never read as
+        # "no red run" (#405 applies to every stage of the read).
+        echo "⚠️ could not parse the check-runs payload for $SHA — stale-run re-run skipped; record still saved. Re-run record-review.sh to retry." >&2
+        NEWEST_RED_ID=""
+      else
+        # Loud rename/typo hint: the name matches NO run on the head while
+        # other checks exist — otherwise a wrong AI_REVIEW_GATE_CHECK_NAME
+        # is indistinguishable from "nothing to remediate".
+        NAMED_TOTAL="$(printf '%s' "$GATE_JSON" | jq -r --arg gate "$GATE_CHECK" '[.check_runs[] | select(.name == $gate)] | length' 2>/dev/null || echo 0)"
+        TOTAL_RUNS="$(printf '%s' "$GATE_JSON" | jq -r '.check_runs | length' 2>/dev/null || echo 0)"
+        if [ "$NAMED_TOTAL" = "0" ] && [ "$TOTAL_RUNS" -gt 0 ]; then
+          echo "⚠️ no check run named '$GATE_CHECK' found on $SHA ($TOTAL_RUNS checks total) — verify AI_REVIEW_GATE_CHECK_NAME; stale-run re-run skipped" >&2
+        fi
+      fi
     else
       echo "⚠️ could not read check runs for $SHA (gh/API failure?) — stale-run re-run skipped; record still saved. Re-run record-review.sh to retry." >&2
     fi

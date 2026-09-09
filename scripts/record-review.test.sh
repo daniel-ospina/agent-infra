@@ -46,7 +46,8 @@ SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 #   check-runs  (URL has /check-runs) → {"check_runs": ${STUB_CHECK_RUNS:-[]}}
 #                                   (RAW payload — the script applies its own
 #                                   local jq; exit 1 when STUB_CHECK_RUNS_FAIL=1)
-#   PATCH (-X PATCH … --input -)    → swallow stdin
+#   PATCH (-X PATCH … --input -)    → swallow stdin; exit 1 when
+#                                     STUB_PATCH_FAIL=1
 #   POST rerun (-X POST … /rerun)   → swallow stdin (201); exit 1 when
 #                                     STUB_RERUN_FAIL=1
 mkdir -p "$T/bin"
@@ -54,12 +55,15 @@ cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "${GH_STUB_LOG:?}"
 if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
-    # PATCH body / job rerun POST. Fail the rerun on demand (#633 fail-soft
-    # pin). Consume piped stdin (PATCH feeds it via --input -) WITHOUT
-    # blocking on an inherited terminal/stdin — the rerun POST pipes nothing,
-    # so a bare `cat` would hang the suite when run interactively.
+    # PATCH body / job rerun POST. Fail the evidence PATCH or the rerun on
+    # demand (#633 fail-soft + no-marker pins). Consume piped stdin (PATCH
+    # feeds it via --input -) WITHOUT blocking on an inherited terminal/stdin
+    # — the rerun POST pipes nothing, so a bare `cat` would hang the suite
+    # when run interactively.
     if printf '%s' "$*" | grep -qF -- "/rerun"; then
         [ "${STUB_RERUN_FAIL:-0}" = "1" ] && exit 1
+    elif printf '%s' "$*" | grep -qF -- "-X PATCH"; then
+        [ "${STUB_PATCH_FAIL:-0}" = "1" ] && exit 1
     fi
     if [ -t 0 ]; then :; else cat >/dev/null; fi
     exit 0
@@ -378,6 +382,11 @@ if grep -qF -- "-X PATCH" "$LOG"; then
 else
     ok "9.1 re-record leaves the marker'd body untouched (no PATCH)"
 fi
+if grep -qF -- "commits/$SHA/check-runs" "$LOG"; then
+    ok "9.1 remediation queries the RECORDED head's check runs"
+else
+    bad "9.1 remediation queries the RECORDED head's check runs (log: $(cat "$LOG"))"
+fi
 
 # 9.2 Fresh record (marker absent) with a stale FAILURE on the head: posts
 #     the marker AND re-runs the failed gate job in the same call.
@@ -459,6 +468,36 @@ if grep -qF -- "actions/jobs/" "$LOG"; then
     bad "9.8 no rerun on query failure (log: $(cat "$LOG"))"
 else
     ok "9.8 no rerun on query failure"
+fi
+
+# 9.9 Livelock guard: when the newest run for the gate name is queued/
+#     in_progress (a rerun the remediation itself fired, or the `edited` run
+#     a fresh PATCH just started), the OLDER completed red run is NOT re-run —
+#     firing a second job would cancel the in-flight fresh run through the
+#     PR's per-PR concurrency group (cancel-in-progress) and self-perpetuate.
+STUB_BODY="$(signed_marker 424320 daniel-ospina/agent-infra)" \
+STUB_CHECK_RUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":100},{"name":"ai-review-gate","status":"in_progress","conclusion":null,"id":900}]' \
+AI_REVIEW_GATE_KEY="testkey" run_record "daniel-ospina/agent-infra" 424320
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.9 in-flight gate run suppresses the rerun (log: $(cat "$LOG"))"
+else
+    ok "9.9 in-flight gate run suppresses the rerun"
+fi
+
+# 9.10 No signed marker posted (evidence PATCH API failure) → remediation
+#      MUST NOT fire: a rerun of a marker-less body re-evaluates to a
+#      guaranteed red, churning Actions for nothing. Record still saves
+#      (best-effort).
+STUB_BODY="PR body — no review evidence yet" \
+STUB_CHECK_RUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":500}]' \
+STUB_PATCH_FAIL=1 AI_REVIEW_GATE_KEY="testkey" run_record_verdict clean "daniel-ospina/agent-infra" 424325
+[ "$RECORD_RC" = "0" ] && ok "9.10 PATCH failure still saves the record (rc 0)" || bad "9.10 PATCH failure saves record (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424325.json" ] && ok "9.10 record written despite PATCH failure" || bad "9.10 record written despite PATCH failure"
+assert_contains "$RECORD_ERR" "could not post review evidence" "9.10 PATCH failure notes on stderr"
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "9.10 no rerun without a posted marker (log: $(cat "$LOG"))"
+else
+    ok "9.10 no rerun without a posted marker"
 fi
 
 echo ""
