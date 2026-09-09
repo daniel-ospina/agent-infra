@@ -970,8 +970,19 @@ function _walkShell(command, h = {}, seedVars = {}) {
     // (and their operand) WITHOUT clearing prevWasBoundary, so a redirect-led
     // command word is still recognized: `> /dev/null cd <wt> && git commit` runs
     // the cd (round-4 bug reviewer R4-11).
-    if (t === ">" || t === ">>" || t === "<" || t === "<<" || t === "&>" || t === ">&" || t === "&>>" || /^(?:[0-9]+)?[<>]/.test(t) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(t)) {
-      const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(t); // 2>&1 — no separate operand
+    // Round-4 F1 (post-fix reviewer P2): the fdSingle forms are ONLY the
+    // GLUED fd-dup/close operators with digits or a dash (`2>&1`, `2>&-`,
+    // `>&1`, `<&0`, `>&-`) — a BARE `>&`/`<&` (zero digits, no dash) takes a
+    // word OPERAND like any redirect (`>& git` dups stdout+stderr to the FILE
+    // `git`; `<& file` dups stdin from the file) and must skip op+operand, or
+    // the operand word is walked as a command and phantom-counted (the same
+    // phantom-token ordinal drift the extractor now skips). Also `<<<`
+    // here-strings: _tokenize splits `<<<` into `<<` + `<` + word — consume
+    // the split `<` with the operator and the WORD as the operand (real bash:
+    // `<<< git` feeds `git` to stdin, never executes it).
+    if (t === "<<" && tokens[i + 1] === "<") { i += 3; continue; } // <<< word (here-string)
+    if (t === ">" || t === ">>" || t === "<" || t === "<<" || t === "&>" || t === ">&" || t === "&>>" || /^(?:[0-9]+)?[<>]/.test(t) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(t)) {
+      const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(t); // 2>&1 — no separate operand
       i += fdSingle ? 1 : 2;
       continue;
     }
@@ -1031,13 +1042,16 @@ function _walkShell(command, h = {}, seedVars = {}) {
         const n = tokens[j];
         // Round-16 (final gate P1): skip operand-less fd redirects (`2<&1`,
         // `2<&-`) when scanning for -c / the script path — `bash 2<&1 -c
-        // 'git reset'` ran the inline (probe moved HEAD).
-        if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(n)) { j++; continue; }
+        // 'git reset'` ran the inline (probe moved HEAD). Round-4 F1 (post-fix
+        // reviewer P2): fdSingle requires digits or a dash — bare `>&`/`<&`
+        // take a word operand (`>& git` = stdout+stderr to the FILE `git`).
+        if (/^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(n)) { j++; continue; }
         // Round-18 (final gate P1): skip redirect operators + operands too
         // (`bash < /dev/null -c 'git commit'` broke at the bare `<` and never
         // walked the inline — probe; the inline committed to the hub).
         if (n === ">" || n === ">>" || n === "<" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n)) {
-          j += 2;
+          if (n === "<<" && tokens[j + 1] === "<") j += 3; // <<< here-string (round-4 F1)
+          else j += 2;
           continue;
         }
         if (n === "-c" || n === "--command") {          // Round-5 (security F3): skip flags AFTER -c too — `bash -c -x 'git
@@ -1055,6 +1069,11 @@ function _walkShell(command, h = {}, seedVars = {}) {
                 ...ni,
                 cdChain: [...base, ...ni.cdChain],
                 cHints: [...(frame().pipeActive ? frame().chain.slice(0, frame().baseLen) : []), ...ni.cHints],
+                // #596 round-3: an interpreter-inline (`sh -c '…'`) payload is
+                // ONE opaque token to branch-ownership's tokenizer — its git
+                // invocations are invisible there, so they must never shift the
+                // stateVerbOccurrence ordinal the repo layer resolves with.
+                cmdVisible: false,
               });
             }
             sawInline = true;
@@ -1122,6 +1141,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
             h.onGitEnd?.({
               verb: "__unverifiable__", args: [], cdChain: [...frame().chain], cHints: [],
               gitDirHint: null, workTreeHint: null, indexFileHint: null, objDirsHint: null, configOverrides: [], configEnvOverrides: [], envPrefixes: [], vars: { ...frame().vars },
+              cmdVisible: false,
             });
             i++;
             prevWasBoundary = false;
@@ -1148,6 +1168,14 @@ function _walkShell(command, h = {}, seedVars = {}) {
     }
     spawnerPending = false; // a git-resolving token ends the spawner window
     // ── git invocation ──
+    // #596 round-3: cmdVisible = this git invocation was spelled with the
+    // LITERAL token `git` (vs a $VAR-resolved word `G=git; $G branch …` or an
+    // absolute path `/usr/bin/git branch …`) — the only spellings
+    // branch-ownership's extractGitInvocation can see. Extractor-invisible
+    // invocations must never shift the stateVerbOccurrence ordinal the repo
+    // layer resolves with, and a SELECTED mutation that is invisible resolves
+    // its M3 repo at the session cwd (index.ts).
+    const cmdVisible = t === "git";
     i++;
     const f = frame();
     const cHints = [];
@@ -1212,9 +1240,12 @@ function _walkShell(command, h = {}, seedVars = {}) {
         // Round-5 (security P2): redirects (+ operands) do NOT terminate a
         // simple command's args — only `; & | && || ( )` do (`git push > /tmp/l
         // origin main:main` must keep its refspec args; truncating them would
-        // classify as a bare push of the current branch).
-        if (g === ">" || g === ">>" || g === "<" || g === "<<" || g === "&>" || g === ">&" || g === "&>>" || /^(?:[0-9]+)?[<>]/.test(g) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(g)) {
-          const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&[0-9]*-?$|^[<>]&-$/.test(g); // 2>&1 — no separate operand
+        // classify as a bare push of the current branch). fdSingle forms need
+        // digits or a dash (bare `>&`/`<&` take a word operand — round-4 F1
+        // post-fix reviewer P2); `<<<` here-strings are `<<` + split `<` + word.
+        if (g === "<<" && tokens[i + 1] === "<") { i += 3; continue; }
+        if (g === ">" || g === ">>" || g === "<" || g === "<<" || g === "&>" || g === ">&" || g === "&>>" || /^(?:[0-9]+)?[<>]/.test(g) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(g)) {
+          const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(g); // 2>&1 — no separate operand
           i += fdSingle ? 1 : 2;
           continue;
         }
@@ -1228,6 +1259,7 @@ function _walkShell(command, h = {}, seedVars = {}) {
       configOverrides, configEnvOverrides, envPrefixes,
       cdChain: f.pipeActive ? f.chain.slice(0, f.baseLen) : [...f.chain],
       vars: { ...f.vars },
+      cmdVisible,
     });
     prevWasBoundary = false;
   }
@@ -1254,6 +1286,35 @@ export function allGitInvocations(command, seedVars = {}) {
 }
 
 /**
+ * #596: does a `git branch` invocation MUTATE branch state (per the branch
+ * arm's OWN triggers — exact mirror, reusing the SAME helpers, so selection
+ * and arm cannot drift)? TRUE for rename/move (exact -m/-M, merged clusters
+ * -Mq/-mv/…, the --move/--mo/--mov long forms), hard OR soft delete
+ * (branchDeleteNames), pure force-create (narrow token test incl. clusters /
+ * --forc), and force-copy (destination mutation). FALSE for the arm's benign
+ * classes: plain create (`git branch <name>`), list forms (-l/-a/-r and the
+ * list-mode f-clusters -fl/-lf/-fa), SOFT copy (-c/-cq/--copy/--cop — a
+ * new-ref-only create), and the mixed-mode / u-guarded / rc-129 no-op
+ * spellings — none of which sets branchState in the arm. This predicate is
+ * what lets classifyGitCommandDetailed skip a benign LEADING branch segment
+ * when selecting the invocation the M3 gate must classify (#596).
+ * @param {string[]} args
+ * @returns {boolean}
+ */
+export function _branchInvMutatesBranchState(args) {
+  if (args.includes("-m") || args.includes("-M") ||
+      args.some((x) => (x === "--move" || x === "--mo" || x === "--mov") ||
+        (/^-[A-Za-z]+$/.test(x) && _branchMode(x)?.family === "move"))) {
+    return true;
+  }
+  if (branchDeleteNames("branch", args) !== null ||
+      args.some(isBranchForceCreateTokenNarrow)) {
+    return true;
+  }
+  return _branchCopyState(args).forceCopy;
+}
+
+/**
  * Detailed classification of a shell command (consumed EXCLUSIVELY by
  * main-worktree-guard/index.ts). Shape:
  *   { verdict, repoHint, gitDirHint, verb, verbArgs, branchState,
@@ -1265,11 +1326,19 @@ export function allGitInvocations(command, seedVars = {}) {
  * - branchState: true for checkout/switch/symbolic-ref/update-ref/branch ops
  *   that mutate the checkout's branch (M3 gate runs on these regardless of
  *   verdict — symbolic-ref/update-ref/branch -f have NO legacy pattern).
- * - stateVerb/stateArgs: the FIRST state-mutating invocation's verb/args (M3
+ * - stateVerb/stateArgs: the FIRST state-MUTATING invocation's verb/args (M3
  *   must classify the invocation that changes branch state, not invocations[0]
- *   — P1-A). stateOpCount: TOTAL branch-state invocations in the command — the
- *   #591 benign-force carve-out requires exactly 1 (a later compound segment's
- *   foreign force-create is invisible to the first-invocation M3 gate).
+ *   — P1-A; #596: selection skips benign branch leads, see classifyGitCommand-
+ *   Detailed). stateVerbOccurrence: the 0-based ordinal of that invocation
+ *   among EXTRACTOR-VISIBLE same-verb invocations (repo-hint attribution for
+ *   later-segment mutations). stateInvVisible: false when the selected
+ *   mutation is invisible to branch-ownership's tokenizer (interpreter-inline
+ *   payload / $VAR / abs-path git — the M3 repo then resolves at the session
+ *   cwd). stateOpCount: TOTAL branch-state invocations in the command —
+ *   the #591 benign-force carve-out requires exactly 1 (the gate classifies
+ *   only the FIRST mutating invocation; a second own-branch force segment
+ *   must not grant the carve-out a foreign later segment could launder
+ *   through).
  * - force-push hygiene: `--force-with-lease` / `--force-if-includes` are NOT
  *   force (the legacy `--force\b` regex false-matches them); a force-with-lease
  *   push classifies `block:push` (ownership path), not `block:force-push`.
@@ -1327,8 +1396,44 @@ export function classifyGitCommandDetailed(command) {
 
   const commitInv = invocations.find((v) => v.verb === "commit");
   const pushInv = invocations.find((v) => v.verb === "push");
-  const stateInv = invocations.find((v) =>
+  // #596: stateInv SELECTION — the FIRST branch-state verb in command order is
+  // NOT necessarily the state-MUTATING one. A benign leading branch segment
+  // (`git branch side`, `git branch -c a b`, list forms) sets NO branchState in
+  // the arm, and the arm inspects ONLY stateInv's args — so every LATER
+  // rename/copy/force-create (the M3-ONLY families: no legacy verdict) escaped
+  // M3 while git executed them rc 0 (`git branch side ; git branch -Mq feat/x
+  // rnX` force-renames the current branch; `git branch side && git branch -fq
+  // feat/other main` force-creates a foreign ref — probe-verified). Deletes
+  // survived only because the invocation-blind legacy string pass skims every
+  // segment (#587 fold-in); rename/copy/force-create have NO legacy verdict →
+  // M3 is their only gate → the positional shadowing was a full bypass.
+  // Fix: scan ALL branch-state invocations and select the first the arm would
+  // classify as MUTATING (checkout/switch unconditionally — the arm sets
+  // branchState for any; a HEAD/refs-heads symbolic-ref/update-ref — the arm's
+  // conditional; a git branch whose args the branch arm mutates on — exact
+  // helper mirror below), falling back to the FIRST state-verb invocation when
+  // NONE mutates (all-benign commands keep today's stateVerb/stateArgs exposure
+  // and the arm leaves branchState false). branchState is then true iff the
+  // command CONTAINS a branch-state mutation, regardless of segment position;
+  // stateVerb/stateArgs point at the mutation the M3 gate must classify.
+  const stateInvs = invocations.filter((v) =>
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb));
+  // Round-4 (reviewer P1b follow-up): the MUTATING predicate is reused both
+  // for the single selection below AND for stateMutations (every mutating
+  // branch-state invocation) — index.ts gates EVERY main-resolving mutation
+  // so a leading `-C <wt>` mutation can't blanket-exempt a later MAIN one.
+  const _isStateMutating = (v) => {
+    if (v.verb === "checkout" || v.verb === "switch") return true;
+    if (v.verb === "symbolic-ref" || v.verb === "update-ref") {
+      const pos = (v.args || []).filter((x) => !x.startsWith("-"));
+      return (v.verb === "symbolic-ref" && pos[0] === "HEAD") ||
+        (v.verb === "update-ref" && pos[0] &&
+          (/^refs\/heads\//.test(pos[0]) || pos[0] === "HEAD"));
+    }
+    return v.verb === "branch" && _branchInvMutatesBranchState(v.args);
+  };
+  const stateMutations = stateInvs.filter(_isStateMutating);
+  const stateInv = stateMutations[0] ?? stateInvs[0] ?? null;
   const syncInv = invocations.find((v) => ["merge", "pull", "rebase"].includes(v.verb));
 
   // ── push: refspec targets + force-push hygiene (highest priority — a
@@ -1593,17 +1698,59 @@ export function classifyGitCommandDetailed(command) {
     // the invocation that changes branch state, not invocations[0] (a compound
     // `git pull && git checkout main` would otherwise classify "pull" and skip
     // the gate, or false-block the sanctioned create-new carve-out).
+    // #596 (round-2 reviewer, refined round-3): stateVerbOccurrence — the
+    // 0-based ordinal of stateInv among the command's EXTRACTOR-VISIBLE
+    // invocations with the SAME verb (cmdVisible — spelled with the literal
+    // `git` token; interpreter-inline / $VAR / abs-path-git spellings are ONE
+    // opaque token to branch-ownership's tokenizer and must not shift the
+    // ordinal — a quoted `sh -c "git branch -Mq …"` mutation between visible
+    // segments used to land the ordinal on a LATER `-C <wt>` invocation,
+    // wrongly worktree-exempting the payload). index.ts resolves the effective
+    // repo with preferVerb = stateVerb, which picks the preferVerbOccurrence-th
+    // same-verb invocation; when the MUTATING invocation is itself
+    // extractor-invisible (stateInvVisible false — a quoted-payload mutation
+    // runs at the shell cwd), index.ts resolves the M3 repo at the session cwd.
+    out.stateVerbOccurrence = 0;
+    for (const v of stateInvs) {
+      if (v === stateInv) break;
+      if (v.verb === stateInv.verb && v.cmdVisible !== false) out.stateVerbOccurrence++;
+    }
+    out.stateInvVisible = stateInv.cmdVisible !== false;
     out.stateVerb = verb;
     out.stateArgs = args;
+    // #596 round-4 (reviewer follow-up): the SELECTED mutating invocation's
+    // OWN resolution hints (cdChain/cHints/gitDirHint/vars), captured
+    // boundary-aware by _walkShell. index.ts resolves the M3 repo from THESE
+    // instead of replaying the stateVerbOccurrence ordinal through
+    // branch-ownership's boundary-less tokenizer — a replay mis-attribution
+    // (interpreter-inline / script-file / redirect-operand phantoms, or an
+    // interpreter word used as a git ARG whose next token the extractor
+    // consumes) landed the ordinal on a DIFFERENT invocation whose -C hints
+    // wrongly worktree-exempted a mutation that runs at the shell cwd.
+    out.stateHints = stateInv && stateInv.cmdVisible !== false
+      ? { cdChain: stateInv.cdChain, cHints: stateInv.cHints, gitDirHint: stateInv.gitDirHint, vars: stateInv.vars }
+      : null; // extractor-invisible mutation → index.ts resolves at the session cwd (stateInvVisible false path)
+    // Round-4 (reviewer P1b follow-up): EVERY mutating branch-state invocation
+    // (visible → its own boundary-aware hints; invisible payload → null hints,
+    // resolved at the shell cwd). index.ts M3 gates each main-resolving one so
+    // a leading worktree mutation cannot exempt a later MAIN mutation.
+    out.stateMutations = stateMutations.map((v) => ({
+      verb: v.verb,
+      args: v.args,
+      invVisible: v.cmdVisible !== false,
+      hints: v.cmdVisible !== false
+        ? { cdChain: v.cdChain, cHints: v.cHints, gitDirHint: v.gitDirHint, vars: v.vars }
+        : null,
+    }));
   }
   // #591 (review fold-in, compound-launder guard): count EVERY branch-state
   // invocation in the command. The M3 benign-force carve-out (a force-create
   // whose target is the checkout's OWN branch) must only fire for a command
   // whose sole branch-state mutation is that own-branch attempt — in a `;`
-  // compound (`git branch -f own ; git branch -fq foreign x`) the later
-  // segments are invisible to the per-FIRST-state-invocation M3 gate, and the
-  // benign carve-out on segment 1 would otherwise let segment 2's FOREIGN
-  // force-create execute (pre-#591 the exact-force segment 1 blocked the whole
+  // compound (`git branch -f own ; git branch -fq foreign x`) the carve-out
+  // on segment 1 would otherwise let segment 2's FOREIGN force-create execute
+  // even though the M3 gate classifies only ONE invocation (the first
+  // mutating one — #596; pre-#591 the exact-force segment 1 blocked the whole
   // command). stateOpCount ≥ 2 → decideM3 refuses the carve-out → default
   // block restores pre-#591 compound parity.
   out.stateOpCount = invocations.filter((v) =>
@@ -1620,6 +1767,25 @@ export function classifyGitCommandDetailed(command) {
   out.hiddenStateSubst =
     _hasHiddenStateSubst(String(command ?? "")) ||
     _unverifiableGitContent(String(command ?? ""));
+
+  // #596 round-4 (reviewer P1a follow-up): the M2 commit/push repo must come
+  // from the classifier's boundary-aware walk of the commit/push invocation,
+  // but commitHints/pushHints must describe the FIRST EXTRACTOR-VISIBLE
+  // commit/push (cmdVisible — literal `git` spelling). The old replay only
+  // ever saw visible invocations; an invisible interpreter-inline payload
+  // (`sh -c "git -C <wt> commit -m z"`) precedes the real main commit in
+  // invocation order, and using ITS `-C <wt>` hints exempted the real
+  // OFF-baseline MAIN commit (round-4 regression). commitInv/pushInv (any
+  // commit/push incl. invisible) still drive the VERDICT; the hints feed the
+  // repo resolution only for the visible first one.
+  const commitVisInv = invocations.find((v) => v.verb === "commit" && v.cmdVisible !== false);
+  const pushVisInv = invocations.find((v) => v.verb === "push" && v.cmdVisible !== false);
+  out.commitHints = commitVisInv
+    ? { cdChain: commitVisInv.cdChain, cHints: commitVisInv.cHints, gitDirHint: commitVisInv.gitDirHint, vars: commitVisInv.vars }
+    : null;
+  out.pushHints = pushVisInv
+    ? { cdChain: pushVisInv.cdChain, cHints: pushVisInv.cHints, gitDirHint: pushVisInv.gitDirHint, vars: pushVisInv.vars }
+    : null;
 
   return out;
 }
@@ -2455,10 +2621,14 @@ function _branchPositionals(args) {
  *   - escaped backticks (`\``) signal NESTED backtick content — unparseable →
  *     fail closed.
  * Each payload is re-tokenized and scanned for a MUTATING branch invocation:
- * checkout/switch/symbolic-ref/update-ref always, git branch only with a
- * rename/delete/force spelling — non-mutating branch READS (`--show-current`,
- * `--list`, rev-parse payloads) stay benign-eligible so `git branch -fq own
- * $(git rev-parse HEAD)` isn't a false block. index.ts ORs this with the
+ * checkout/switch/symbolic-ref/update-ref always, git branch via the
+ * arm-exact _branchInvMutatesBranchState mirror (rename incl. #592 clusters /
+ * long forms, delete, force-create, force-copy — #596 round-2 consolidation;
+ * the scan previously recognized only exact -m/-M + delete + narrow-force, so
+ * a hidden `-Mq`/`--move`/`-Cq` payload laundered the benign-force carve-out)
+ * — non-mutating branch READS (`--show-current`, `--list`, rev-parse
+ * payloads) stay benign-eligible so `git branch -fq own $(git rev-parse
+ * HEAD)` isn't a false block. index.ts ORs this with the
  * hub-gate's _unverifiableGitContent (piped-stdin shells, process
  * substitution, heredocs, alias/function definitions, spawner `$VAR`s — the
  * round-6→19 hardened shape set) before refusing the carve-out (decideM3's
@@ -2508,10 +2678,12 @@ export function _hasHiddenStateSubst(raw) {
   const source = String(raw ?? "");
   const mutates = (inv) => {
     if (["checkout", "switch", "symbolic-ref", "update-ref"].includes(inv.verb)) return true;
-    return inv.verb === "branch" && (
-      inv.args.includes("-m") || inv.args.includes("-M") ||
-      branchDeleteNames("branch", inv.args) !== null ||
-      inv.args.some(isBranchForceCreateTokenNarrow));
+    // #596 (round-2 reviewer F1): consolidate on the arm-exact mirror — the
+    // stale inline copy only knew exact -m/-M + delete + narrow-force, so the
+    // #592 rename-cluster/long-form and force-COPY spellings (-Mq/--move/
+    // -Cq/…) were invisible here and a hidden payload of that surface
+    // laundered the #591 benign-force carve-out (probe-verified rc 0).
+    return inv.verb === "branch" && _branchInvMutatesBranchState(inv.args);
   };
   // Quote-aware payload collector: `$(…)`/`<(…)`/`>(…)` spans close only on a
   // paren OUTSIDE quotes/escapes; ANSI-C `$'…'` literals; backticks pair to

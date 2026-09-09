@@ -1106,69 +1106,116 @@ export default function (pi: ExtensionAPI) {
       // P2 (cycle 3): resolve the effective repo against the STATE-mutating
       // invocation — `git -C <wt> status && git checkout main` must gate on the
       // main checkout, not the worktree the first invocation pointed at.
-      const eff = branchOwnership.resolveEffectiveRepo(command, process.cwd(), det.stateVerb ?? det.verb);
+      // #596: stateVerbOccurrence makes the resolution follow the MUTATING
+      // branch-state invocation even when it is a LATER compound segment — a
+      // benign first segment's hints (-C/--git-dir) must not worktree-exempt a
+      // main mutation (or main-gate a worktree-scoped one). Round-3: when the
+      // selected mutation is EXTRACTOR-INVISIBLE (stateInvVisible false — an
+      // interpreter-inline `sh -c 'git branch …'` payload, a `$VAR`-resolved
+      // command word, or an absolute-path git), branch-ownership's tokenizer
+      // cannot attribute its hints at all; the payload runs at the shell cwd,
+      // so resolve the M3 repo at the SESSION cwd (conservative — the
+      // main-checkout gates apply; fail-closed, never a worktree exemption the
+      // repo layer cannot verify).
+      let eff;
+      if (det.stateVerb && det.stateInvVisible === false) {
+        eff = branchOwnership.resolveEffectiveRepo("git status", process.cwd());
+      } else if (det.stateVerb && det.stateHints) {
+        // #596 round-4 (reviewer follow-up): resolve the M3 repo from the
+        // CLASSIFIER's own boundary-aware walk of the SELECTED mutating
+        // invocation (stateHints = its cdChain/cHints/gitDirHint/vars) instead
+        // of replaying the stateVerbOccurrence ordinal through
+        // branch-ownership's boundary-less tokenizer. Replay
+        // mis-attributions (interpreter-inline / script-file / redirect-
+        // operand phantoms, or an interpreter word used as a git ARG whose
+        // next token the extractor consumed) landed the ordinal on a DIFFERENT
+        // invocation and wrongly worktree-exempted a mutation running at the
+        // shell cwd (round-4 reviewer P1 bypass). classify-git's walk is
+        // boundary-aware → its hints are the reference truth.
+        eff = branchOwnership.resolveRepoFromInv(det.stateHints, process.cwd());
+      } else {
+        eff = branchOwnership.resolveEffectiveRepo(command, process.cwd(), det.verb, 0);
+      }
       const allowActive = _isAllowMainEdits();
 
       // M3: branch-state gate — applies in ANY main checkout (resolved,
       // target-aware). Worktree-effective commands are exempt (cycle-4
       // verified: -C <wt> --git-dir=<main>/.git checkout operates on MAIN →
-      // eff.isWorktree is false → NOT exempt).
+      // eff.isWorktree is false → NOT exempt). #596 round-4 (reviewer P1b
+      // follow-up): a command is exempt only when EVERY mutating branch-state
+      // invocation is worktree-scoped — a leading `-C <wt>` mutation must not
+      // blanket-exempt a LATER MAIN mutation in the same compound (round-4
+      // spellings like `echo x &> git branch side ; git -C <wt> branch -fq … ;
+      // git branch -Mq <foreign>` flipped block→allow when the phantom operand
+      // stopped being counted; the phantom-free twin was the same gap). Each
+      // main-resolving mutation runs the decideM3 gate; the first
+      // block/reBaseline decides.
       if (det && det.branchState && !allowActive) {
-        // P1-A: classify the STATE-mutating invocation (compound commands like
-        // `git pull && git checkout main` must gate on the checkout, not the pull).
-        const branchOp = branchOwnership.classifyBranchOp(det.stateVerb ?? det.verb, det.stateArgs ?? det.verbArgs);
-        if (branchOp && branchOp.op !== "other") {
-          if (!eff) {
+        const mutations = (det.stateMutations && det.stateMutations.length > 0)
+          ? det.stateMutations
+          : [{ verb: det.stateVerb, args: det.stateArgs, invVisible: det.stateInvVisible !== false, hints: det.stateHints }];
+        for (const mu of mutations) {
+          const branchOp = branchOwnership.classifyBranchOp(mu.verb ?? det.verb, mu.args ?? det.verbArgs);
+          if (!branchOp || branchOp.op === "other") continue;
+          // Resolve THIS mutation's repo: the classifier's own boundary-aware
+          // hints (visible spellings); extractor-invisible spellings
+          // (interpreter-inline payloads) execute at the shell cwd → session
+          // repo (round-3 stateInvVisible-false policy).
+          let muEff = mu.hints
+            ? branchOwnership.resolveRepoFromInv(mu.hints, process.cwd())
+            : (mu.invVisible === false
+              ? branchOwnership.resolveEffectiveRepo("git status", process.cwd())
+              : null);
+          if (!muEff) {
             return {
               block: true,
               reason: "⛔ Branch-state command blocked — could not resolve the effective repo (fail-closed; #265).",
             };
           }
-          if (!eff.isWorktree) {
-            const baseline = baselines.get(pid);
-            const isInfra = isAgentInfraRepo(eff.effectiveCwd);
-            const m3 = branchOwnership.decideM3({
-              branchOp, isAgentInfra: isInfra, baseline,
-              currentBranch: eff.currentBranch,
-              // #376 review fold-in: the return-to-original carve-out is scoped
-              // to the repo that recorded the baseline (repoKey equality — M2
-              // semantics); a baseline owned by another checkout must not
-              // authorize a switch here.
-              repoKey: eff.repoKey,
-              // #591: the benign-force carve-out (own-branch force-create
-              // passes through to git's rc-128 refusal) requires a NON-bare
-              // repo (bare repos have no worktree protecting the branch) and a
-              // command whose ONLY branch-state mutation is that own-branch
-              // attempt (later `;`-compound segments are invisible to this
-              // first-invocation gate — stateOpCount from the classifier).
-              isBare: eff.isBare === true,
-              stateOpCount: det.stateOpCount ?? 1,
-              // #591 (round-3 fold): a shell substitution may hide another
-              // branch-state invocation from stateOpCount (collapse to one
-              // opaque token) — refuse the benign carve-out when the
-              // classifier detected one (_hasHiddenStateSubst).
-              hiddenStateSubst: det.hiddenStateSubst === true,
-            });
-            if (m3?.block) return { block: true, reason: m3.reason };
-            if (m3?.reBaseline) {
-              // Synchronous re-baseline: the allowed carve-out / own rename
-              // adopts the new branch NOW — the next tool_call emits ZERO M1
-              // warns (AC3). Record branches this pid CREATED (create-new) or
-              // renamed its own baseline to — scoped to the BASELINE repo — so
-              // their post-ceremony LOCAL delete is still allowed after the #376
-              // return re-baselines to the original (#376 review fold-in).
-              if (branchOp.op === "create-new" && branchOp.branch) {
-                if (!baseline || (eff.repoKey != null && baseline.repoKey === eff.repoKey)) {
-                  _markOwned(pid, baseline?.repoKey ?? eff.repoKey, branchOp.branch);
-                }
-              } else if (branchOp.op === "rename" && branchOp.to) {
-                if (!baseline || (eff.repoKey != null && baseline.repoKey === eff.repoKey)) {
-                  _markOwned(pid, baseline?.repoKey ?? eff.repoKey, branchOp.to);
-                }
+          if (muEff.isWorktree) continue; // THIS mutation is wt-scoped — exempt
+          const baseline = baselines.get(pid);
+          const isInfra = isAgentInfraRepo(muEff.effectiveCwd);
+          const m3 = branchOwnership.decideM3({
+            branchOp, isAgentInfra: isInfra, baseline,
+            currentBranch: muEff.currentBranch,
+            // #376 review fold-in: the return-to-original carve-out is scoped
+            // to the repo that recorded the baseline (repoKey equality — M2
+            // semantics); a baseline owned by another checkout must not
+            // authorize a switch here.
+            repoKey: muEff.repoKey,
+            // #591: the benign-force carve-out (own-branch force-create
+            // passes through to git's rc-128 refusal) requires a NON-bare
+            // repo (bare repos have no worktree protecting the branch) and a
+            // command whose ONLY branch-state mutation is that own-branch
+            // attempt (later `;`-compound segments — stateOpCount from the
+            // classifier).
+            isBare: muEff.isBare === true,
+            stateOpCount: det.stateOpCount ?? 1,
+            // #591 (round-3 fold): a shell substitution may hide another
+            // branch-state invocation from stateOpCount (collapse to one
+            // opaque token) — refuse the benign carve-out when the
+            // classifier detected one (_hasHiddenStateSubst).
+            hiddenStateSubst: det.hiddenStateSubst === true,
+          });
+          if (m3?.block) return { block: true, reason: m3.reason };
+          if (m3?.reBaseline) {
+            // Synchronous re-baseline: the allowed carve-out / own rename
+            // adopts the new branch NOW — the next tool_call emits ZERO M1
+            // warns (AC3). Record branches this pid CREATED (create-new) or
+            // renamed its own baseline to — scoped to the BASELINE repo — so
+            // their post-ceremony LOCAL delete is still allowed after the #376
+            // return re-baselines to the original (#376 review fold-in).
+            if (branchOp.op === "create-new" && branchOp.branch) {
+              if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
+                _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.branch);
               }
-              _rebaseline(pid, m3.reBaseline);
-              return undefined;
+            } else if (branchOp.op === "rename" && branchOp.to) {
+              if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
+                _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.to);
+              }
             }
+            _rebaseline(pid, m3.reBaseline);
+            return undefined;
           }
         }
       }
@@ -1290,7 +1337,40 @@ export default function (pi: ExtensionAPI) {
 
       // ── M2: commit/push ownership (block off-baseline) ──
       if (det.verdict === "block:commit" || det.verdict === "block:push" || det.verdict === "block:force-push") {
-        if (!eff) {
+        // #596 (round-3 reviewer P2-2): M2 must gate the COMMIT/PUSH's own
+        // repo, not the M3 state-invocation repo — a compound with an
+        // off-baseline MAIN commit and a later `-C <wt>`-scoped branch
+        // mutation would otherwise reuse the worktree-exempt eff and let the
+        // off-baseline commit through (the pre-#596 single-eff conflation
+        // predates this PR for 2-segment forms; the 3-segment benign-lead form
+        // flipped block→allow in round-2). preferVerb = the verdict's verb
+        // resolves the commit/push invocation's own repo.
+        const gateVerb = det.verdict === "block:commit" ? "commit" : "push";
+        // #596 round-4 (reviewer P1 follow-up): the commit/push repo ALWAYS
+        // comes from the classifier's boundary-aware commit/push invocation
+        // hints (commitHints/pushHints — a block:commit/block:push verdict
+        // implies the invocation exists; hint-less commits resolve at the
+        // session cwd). The extractor replay phantom-counted script-file
+        // attempts (`bash git -C <wt> commit -m z` — consumed by the
+        // classifier as interpreter+path) and the no-stateVerb path
+        // (eff = replay of det.verb) wrongly worktree-exempted the REAL main
+        // commit.
+        let m2Eff = branchOwnership.resolveRepoFromInv(
+          gateVerb === "commit" ? det.commitHints : det.pushHints, process.cwd());
+        // #596 round-4 (F2): null m2Eff under a block:commit/block:push
+        // verdict means the hints-based read failed (git read error, or the
+        // invocation was extractor-invisible — an interpreter-inline payload
+        // is ONE opaque token to the repo layer). Mirror the M3
+        // stateInvVisible===false round-3 policy: the payload executes at the
+        // shell cwd, so resolve the commit/push repo at the SESSION cwd.
+        // Fail-closed is preserved — session-cwd gates apply, never a silent
+        // pass; an OFF-baseline session still blocks, while the round-4
+        // regression (blocking an ON-baseline invisible commit that
+        // pre-round-3 allowed) is undone.
+        if (!m2Eff) {
+          m2Eff = branchOwnership.resolveEffectiveRepo("git status", process.cwd());
+        }
+        if (!m2Eff) {
           return {
             block: true,
             reason: "⛔ git commit/push blocked — could not verify repo ownership (git read failed; fail-closed, #265).",
@@ -1298,7 +1378,7 @@ export default function (pi: ExtensionAPI) {
         }
         const baseline = baselines.get(pid);
         const m2 = branchOwnership.decideM2({
-          effectiveRepo: eff, baseline, currentBranch: eff.currentBranch,
+          effectiveRepo: m2Eff, baseline, currentBranch: m2Eff.currentBranch,
           pushDst: det.pushDst, pushTargets: det.pushTargets,
           verdict: det.verdict, allowActive: false,
         });
