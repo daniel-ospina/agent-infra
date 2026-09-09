@@ -739,6 +739,10 @@ expect("combined one-liner classifies block BEFORE stamping", "touch ~/.pi/agent
     parsed !== null && typeof parsed === "object" && parsed.session_id === "s1" && parsed.reason === "recovery" && typeof parsed.ts === "string", true);
   expectBool("parseMarkerContent garbage/empty → null",
     parseMarkerContent("not json {") === null && parseMarkerContent("") === null, true);
+  // #620: the un-stamped incident shape (3 plain-text reason lines, never
+  // guard-stamped) does NOT parse → inert on the read side → rejected.
+  expectBool("parseMarkerContent un-stamped 3-line plain text → null (#620)",
+    parseMarkerContent("recovery: stranded main\nreason line two\nreason line three") === null, true);
 }
 
 // Group B — content/session (readAllowMarkerState, real fs in a tmp dir) +
@@ -769,6 +773,20 @@ try {
   expectBool("marker unparseable content → inactive", readAllowMarkerState(markerPath, "sess-1"), false);
   writeFileSync(markerPath, "");
   expectBool("marker empty content → inactive", readAllowMarkerState(markerPath, "sess-1"), false);
+
+  // #620 — an UN-STAMPED/UN-AUDITED marker is REJECTED (inert), even with a
+  // fresh mtime. Live-incident shape (2026-09-08): 3 plain-text reason lines,
+  // mtime-fresh but never guard-stamped (no {session_id, reason, ts} JSON, no
+  // matching gate_bypass audit event). Fresh mtime alone must NOT activate the
+  // marker — only the guard-stamped contract may; everything else is treated
+  // as absent → block. (The read side cannot see the audit log — the stamped-
+  // JSON contract is its proxy: absent/foreign session_id ⇒ un-audited ⇒ inert.)
+  writeFileSync(markerPath, [
+    "recovery: stranded main recovery marker",
+    "reason line two (plain text)",
+    "reason line three (plain text)",
+  ].join("\n"));
+  expectBool("#620 un-stamped plain-text marker (3 reason lines, fresh mtime) → inactive", readAllowMarkerState(markerPath, "sess-1"), false);
 
   // 11 — valid JSON without reason → still active (reason is audit-only)
   writeFileSync(markerPath, stamp("sess-1") + "\n");
