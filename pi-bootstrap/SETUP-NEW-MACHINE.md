@@ -54,9 +54,10 @@ repos there (#427/#431). They are RETIRED from launchd
 (`templates/launchd/RETIRED`, #432) and instead run from
 `extensions/session-checks.ts` at every pi session start, age-gated
 (hub >6h, oracle >24h, ~/.pi/agent/state) — i.e. they run while you work,
-not on a headless 24/7 timer. Hub surface = the tortoise checkout only
-(TORTOISE_REPO env / sibling), parity with the retired job — agent-infra's
-main checkout stays #99-exempt from hub flags; `SESSION_CHECKS_REPOS` adds
+not on a headless 24/7 timer. Hub surface = agent-infra (its own path) +
+the tortoise checkout (TORTOISE_REPO env / sibling) — #615 removed the
+agent-infra #99 hub-discipline exemption, so its main checkout is checked
+like every other hub; `SESSION_CHECKS_REPOS` adds
 more. `SESSION_CHECKS_OFF=1` disables; windows via
 `SESSION_CHECKS_HUB_H` / `SESSION_CHECKS_ORACLE_H` (0 = never auto-run).
 First run after setup: no state epochs exist yet → the first session start

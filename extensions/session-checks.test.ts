@@ -29,9 +29,10 @@ async function test(name: string, fn: () => void | Promise<void>) {
 
 function tmp() {
   const d = mkdtempSync(join(tmpdir(), "session-checks-test-"));
-  // Default hub resolution finds the tortoise SIBLING (tortoise-only policy —
-  // agent-infra is #99-exempt). Tests exercise the same default the live
-  // extension sees (env unset in CI; ambient env is harmless — exec is faked).
+  // Default hub resolution finds agent-infra (its own path) + the tortoise
+  // SIBLING — #615: agent-infra is no longer #99-exempt. Tests exercise the
+  // same default the live extension sees (env unset in CI; ambient env is
+  // harmless — exec is faked).
   mkdirSync(join(d, "tortoise"), { recursive: true });
   return { d, state: join(d, "state"), infra: join(d, "agent-infra") };
 }
@@ -151,14 +152,14 @@ await test("lastRunEpoch: reads epoch + ignores garbage", () => {
 });
 
 // ── 3. repo resolution ─────────────────────────────────────────────────
-await test("resolveHubRepos: sibling tortoise only — agent-infra NOT included (#99 exempt)", () => {
+await test("resolveHubRepos: agent-infra + sibling tortoise by default (#615)", () => {
   withCleanRepoEnv(() => {
     const { d, infra } = tmp();
     makeInfra(infra); // sibling tortoise already created by tmp()
     const repos = resolveHubRepos(infra);
-    equal(repos.length, 1, "default = tortoise only");
-    ok(!repos.includes(infra), "agent-infra excluded (hub discipline exemption #99)");
-    equal(repos[0], join(dirname(infra), "tortoise"), "sibling tortoise resolved");
+    equal(repos.length, 2, "default = agent-infra + sibling tortoise");
+    ok(repos.includes(infra), "agent-infra included (hub discipline exemption #99 removed, #615)");
+    ok(repos.includes(join(dirname(infra), "tortoise")), "sibling tortoise resolved");
     rmSync(d, { recursive: true, force: true });
   });
 });
@@ -171,12 +172,12 @@ await test("resolveHubRepos: TORTOISE_REPO env + extras, dedupe, skip nonexisten
     process.env.SESSION_CHECKS_REPOS = `${join(dirname(infra), "extra-repo")} /nonexistent ${join(dirname(infra), "env-tortoise")}`;
     mkdirSync(join(dirname(infra), "extra-repo"), { recursive: true });
     const repos = resolveHubRepos(infra);
-    // env tortoise + sibling tortoise + extra — nonexistent skipped, env duplicate deduped
-    equal(repos.length, 3, "env + sibling + extra");
+    // agent-infra + env tortoise + sibling tortoise + extra — nonexistent skipped, env duplicate deduped
+    equal(repos.length, 4, "infra + env + sibling + extra");
+    ok(repos.includes(infra), "agent-infra included (#615)");
     ok(repos.includes(process.env.TORTOISE_REPO));
     ok(repos.includes(join(dirname(infra), "tortoise")));
     ok(repos.includes(join(dirname(infra), "extra-repo")));
-    ok(!repos.includes(infra), "still no agent-infra");
     rmSync(d, { recursive: true, force: true });
   });
 });
@@ -185,7 +186,8 @@ await test("resolveHubRepos: nothing found → empty (orchestrator skips hub leg
     const { d, infra } = tmp();
     makeInfra(infra);
     rmSync(join(dirname(infra), "tortoise"), { recursive: true, force: true });
-    equal(resolveHubRepos(infra).length, 0, "no repos when no sibling/env");
+    rmSync(infra, { recursive: true, force: true }); // no agent-infra either (#615)
+    equal(resolveHubRepos(infra).length, 0, "no repos when no infra/sibling/env");
     rmSync(d, { recursive: true, force: true });
   });
 });
@@ -298,15 +300,14 @@ await test("oracle FAIL tail surfaced + bounded", async () => {
 await test("no repos resolved → hub leg skipped loudly, oracle still runs", async () => {
   const { d, state, infra } = tmp();
   makeInfra(infra);
-  rmSync(join(dirname(infra), "tortoise"), { recursive: true, force: true }); // no sibling either
   const calls: Array<{ name: string; cmd: string; args: string[] }> = [];
   const now = 1_000_000;
   const s = await runSessionChecks({
     infraPath: infra, state, nowSec: now, hubHours: 6, oracleHours: 24, exec: recordingExec(calls),
-    repos: withCleanRepoEnv(() => resolveHubRepos(infra)), // hermetic: no ambient env repos
+    repos: [], // explicit empty (defaults always include agent-infra now, #615)
   });
   equal(calls.filter((c) => c.name === "hub").length, 0, "hub never invoked without a repo");
-  ok(s.lines.some((l) => l.includes("no tortoise repo")), "skip note surfaced");
+  ok(s.lines.some((l) => l.includes("no repos")), "skip note surfaced");
   equal(calls.filter((c) => c.name === "oracle").length, 1, "oracle unaffected");
   equal(lastRunEpoch(state, "skill-lint-oracle"), now, "oracle epoch recorded");
   rmSync(d, { recursive: true, force: true });

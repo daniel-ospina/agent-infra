@@ -39,10 +39,10 @@
 //     unresolvable targets keep today's gating.
 //  6. (#350) HUB-WIP HYGIENE WARNINGS (never blocks): agents write WIP (plan
 //     docs to docs/plans/, migrations, scratch files) directly in the hub main
-//     checkout — the #347 amplifier. Three warn-only surfaces: (a) the
-//     write/edit gate warns (agent-infra exemption + worktree-session
-//     absolute-path writes into the hub) when the target matches the WIP
-//     patterns; (b) bash-write detection warns on hub-targeted heredoc/tee/
+//     checkout — the #347 amplifier. Three surfaces: (a) the write/edit gate
+//     BLOCKS hub-targeted main-checkout edits (agent-infra included, #615) and
+//     warns on WORKTREE-session absolute-path writes into the hub matching the
+//     WIP patterns; (b) bash-write detection warns on hub-targeted heredoc/tee/
 //     python open() writes (heuristic, never blocks); (c) the session-start
 //     hub-discipline check gains an untracked-WIP inventory (docs/plans/,
 //     migrations/, scratch) + a throttled (5 min) periodic re-scan. All
@@ -64,8 +64,8 @@
 //    (fail-safe, never false-blocks) while the write/edit guard stays fully
 //    enforced.
 //  - branch-ownership.mjs load failure → M1/M2/M3 are OFF (one-time warn) and
-//    the guard falls back to TODAY's behavior (agent-infra exempt); write/edit
-//    never depends on either module.
+//    the guard falls back to the frozen-legacy classifier for EVERY repo — no
+//    agent-infra exemption (#615); write/edit never depends on either module.
 //  - isWorktreeCwd defaults are SPLIT: the bash path fails OPEN (() => true —
 //    a worktree lookalike is treated as isolated), the write/edit path fails
 //    CLOSED (() => false — an unverifiable target is treated as main and
@@ -98,7 +98,7 @@ let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) =
 // #1484 M4 hub-state gate + script-backdoor closure. Fail-safe defaults: every
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
-let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean; skipInfra?: boolean; env?: Record<string, string | undefined> }) => { disorder: string | null; branch: string | null } = () => ({ disorder: null, branch: null });
+let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disorder: string | null; branch: string | null } = () => ({ disorder: null, branch: null });
 let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
@@ -275,7 +275,8 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
 
 // ── M4: hub-state gate (#1484) ─────────────────────────────────────────────
 // The hub's only legal states are main+clean. When the session cwd IS the hub
-// main checkout (non-infra) and the hub is off-main or dirty, every git op is
+// main checkout (agent-infra included since #615) and the hub is off-main or
+// dirty, every git op is
 // gated by the recovery allowlist (classify-git evaluateHubGateWithTargets) and
 // write/edit in the hub is blocked. #347: each git invocation's EFFECTIVE
 // target is resolved — invocations targeting an isolated worktree (worktree-
@@ -285,7 +286,9 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
 // the TTL marker (D3 — mirrors M1's detect-stays-active contract): a stranded
 // lane can recover with the marker but cannot resume feature work in the hub.
 // Only AGENT_ALLOW_MAIN_EDITS=1 (env, session start) is a full bypass. Worktree
-// sessions and agent-infra are exempt (D5 / #99).
+// sessions are exempt (D5 — isolated by construction). Agent-infra is NOT
+// exempt: the #99 carve-out is removed (#615) — its main checkout gets the
+// same M4 discipline as every other hub.
 function _hubState(): { disorder: string | null; branch: string | null } {
   try {
     return readHubDisorder(resolve(process.cwd()));
@@ -322,10 +325,10 @@ function _hubNewFileWriteAllowed(targetPath: string): boolean {
 // ── #350: hub-WIP hygiene (write-gate WARNING + hub-hygiene check) ─────────
 // The #347 amplifier: agents write WIP (plan docs to docs/plans/, migrations,
 // scratch files) directly in the hub main checkout instead of a worktree,
-// either via the write/edit tool (agent-infra is exempt from the block) or via
-// bash heredoc/tee/python (unguarded). All three surfaces below WARN — never
-// block: the write/edit block for main-checkout edits is unchanged; these are
-// discipline prompts surfacing the violation at write time.
+// either via the write/edit tool (agent-infra included in the block since
+// #615) or via bash heredoc/tee/python (unguarded). All three surfaces below
+// WARN — never block: the write/edit block for main-checkout edits is
+// unchanged; these are discipline prompts surfacing the violation at write time.
 const HUB_HYGIENE_THROTTLE_MS = 5 * 60 * 1000; // periodic scan: at most once per 5 min
 const MAIN_TOP_RETRY_MS = 30 * 1000;          // failed cache resolution: retry after 30s (never per-command)
 const WIP_PATTERN_LABEL: Record<string, string> = {
@@ -675,7 +678,6 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string }): s
 function _backdoorBlock(command: string, execCwd?: string): string | null {
   try {
     if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktree sessions are isolated
-    if (isAgentInfraRepo()) return null; // #99 carve-out
     const scriptPath = extractScriptPath(command);
     if (!scriptPath) return null;
     // #347: resolve the script path + content gating against the command's
@@ -850,17 +852,9 @@ export default function (pi: ExtensionAPI) {
       const onNonMain = currentBranch && currentBranch !== "main" && currentBranch !== "master";
       const dirty = porcelain.length > 0;
 
-      if (isAgentInfraRepo()) {
-        // Downgraded agent-infra variant: branch deviation is the NORM in the
-        // infra repo (in-main feature work per #99) — warn on dirty tree only,
-        // plus the #350 untracked-WIP inventory (the #347 amplifier lives in
-        // the infra hub too: plan docs in docs/plans/, migrations, scratch).
-        if (dirty) {
-          console.warn(`[main-worktree-guard] ⚠️ agent-infra main checkout is DIRTY (${porcelain.split("\n").length} change(s)) — parallel sessions may collide; commit or stash before other agents start.`);
-        }
-        _maybeWarnHubWipInventory(_wipFromPorcelain(porcelain));
-        return;
-      }
+      // #615: the downgraded agent-infra branch is REMOVED — agent-infra gets
+      // the same hub-discipline warn as every other repo (main+clean is the
+      // hub's only legal state; shared-state edits land via worktrees).
       if (onNonMain || dirty) {
         const issues: string[] = [];
         if (onNonMain) issues.push(`on branch "${currentBranch}" (not main/master)`);
@@ -930,8 +924,8 @@ export default function (pi: ExtensionAPI) {
     // ── M4: hub-state gate + script-backdoor closure (#1484) ──
     // Runs BEFORE the marker/flag bypass: M4 stays ACTIVE under the TTL marker
     // (D3 — a stranded lane recovers with the marker but cannot resume feature
-    // work in the hub); only the env flag disables it. Read-only ops, worktree
-    // sessions, and agent-infra stay exempt.
+    // work in the hub); only the env flag disables it. Read-only ops and
+    // worktree sessions stay exempt — agent-infra is NOT exempt (#615).
     if (!_isAllowMainEdits()) {
       if (isBash) {
         const command = (event.input as { command?: string }).command ?? "";
@@ -1036,10 +1030,9 @@ export default function (pi: ExtensionAPI) {
       _periodicHubHygieneCheck();
 
       // ── Degradation fallback (branch-ownership OR detailed classifier
-      // unavailable): behave exactly like today — agent-infra exempt,
-      // string-verdict destructive blocks for non-infra main, marker bypass. ──
+      // unavailable): string-verdict destructive blocks for main, marker
+      // bypass. No repo exemption — agent-infra degrades identically (#615). ──
       if (!branchOwnership || !classifierLoaded) {
-        if (isAgentInfraRepo()) return undefined;
         if (_isAllowMainEdits()) return undefined;
         const verdict = classifyGitCommand(command);
         // #443 clean-hub parity: the FROZEN legacy classifier reports
@@ -1454,15 +1447,11 @@ export default function (pi: ExtensionAPI) {
 
     const targetPath = (event.input as { path?: string }).path;
 
-    // #99 write/edit exemption for the infra repo itself (retained): agent-infra
-    // is where infra fixes land; the branch-ownership gates (M1/M2/M3) now cover
-    // its bash git surface instead.
-    if (isAgentInfraRepo()) {
-      // #350: agent-infra is exempt from the write/edit BLOCK (#99), so the WIP
-      // warning is the only signal for WIP written straight into the infra hub.
-      _maybeWarnHubWipWrite(targetPath);
-      return undefined;
-    }
+    // #615: the #99 write/edit exemption for the infra repo is REMOVED —
+    // agent-infra's main checkout is a pure hub like every other repo.
+    // Shared-state edits (MEMORY.md, skills, config, extension code) land via
+    // worktrees (commit → merge → sync); the worktree-session early-return
+    // above and the env hatch below remain the sanctioned paths.
     if (_isAllowMainEdits()) {
       return undefined;
     }
@@ -1549,12 +1538,14 @@ export default function (pi: ExtensionAPI) {
   // ── Session-start hub discipline check (#73) ──
   // In the main checkout: warn if on a non-main branch or dirty working tree.
   // Non-blocking — the write/edit guard still protects; this is a discipline prompt.
-  // Marker parity: an active escape marker also suppresses the warning. Documented
+  // #615: agent-infra is INCLUDED (the #99 exemption is removed — its main
+  // checkout is a pure hub too). Marker parity: an active escape marker also
+  // suppresses the warning. Documented
   // limitation: at module load ctx is unavailable, so this degrades to the
   // env-only session id — for interactive sessions where the extension host
   // lacks PI_SESSION_ID the read is false and the warning shows (fail-safe; the
   // per-tool_call check is authoritative).
-  if (!isAgentInfraRepo() && !_isAllowMainEdits() && !readAllowMarkerState(_markerPath(), _currentSessionId(undefined))) {
+  if (!_isAllowMainEdits() && !readAllowMarkerState(_markerPath(), _currentSessionId(undefined))) {
     try {
       const inWorktree = isWorktreeCwd(resolve(process.cwd()));
       if (!inWorktree) {

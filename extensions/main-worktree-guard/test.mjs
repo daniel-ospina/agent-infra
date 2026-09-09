@@ -175,6 +175,17 @@ function check(name, path, expectedContains, sessionCwd) {
 }
 check("main checkout file", `${MAIN}/extensions/main-worktree-guard/index.ts`, "BLOCK (main checkout)", MAIN);
 check("AGENTS.md", `${MAIN}/AGENTS.md`, "BLOCK (main checkout)", MAIN);
+// #615 regression pins (write/edit gate mirror): the #99 write/edit exemption
+// for the infra repo is removed — the MAIN checkout here IS agent-infra (this
+// suite runs inside it), so the mirror's path-scoping contract must show a hub
+// session's write/edit to agent-infra main files as BLOCKED like any other
+// repo. These are PARITY guardrails only: the mirror never modeled the index.ts
+// #99 carve-out, so it cannot by itself detect a reintroduced exemption in
+// index.ts — the source pins below (banned carve-out strings + single
+// isAgentInfraRepo( call site) are the tripwire that catches index.ts regressions.
+check("#615: agent-infra main AGENTS.md (hub session) → BLOCK", `${MAIN}/AGENTS.md`, "BLOCK (main checkout)", MAIN);
+check("#615: agent-infra main MEMORY.md (hub session) → BLOCK", `${MAIN}/MEMORY.md`, "BLOCK (main checkout)", MAIN);
+check("#615: agent-infra main extension file (hub session) → BLOCK", `${MAIN}/extensions/main-worktree-guard/index.ts`, "BLOCK (main checkout)", MAIN);
 check("/tmp file", "/tmp/foo.md", "ALLOW (outside project)", MAIN);
 check("~/.pi extension", "/home/user/.pi/agent/extensions/x.ts", "ALLOW (outside project)", MAIN);
 // Session rooted in a worktree: main-checkout paths are outside its project → allowed.
@@ -183,7 +194,10 @@ if (!RUN_IS_MAIN) {
   check("main file, worktree session", `${MAIN}/AGENTS.md`, "ALLOW (worktree session)", PROJECT_CWD);
 }
 
-// ── Infra-repo detection (#99) ─────────────────────────────────────────────
+// ── Infra-repo detection ───────────────────────────────────────────────────
+// Detection only — #615 removed the #99 enforcement exemption: isAgentInfraRepo
+// now feeds full M4 discipline (via readHubDisorder, pinned below) + branch-
+// ownership M2/M3 ceremony semantics; it no longer short-circuits any gate.
 // The test runs inside an agent-infra checkout (worktree root), so MAIN is an
 // infra repo: fingerprint alone must detect it, and env vars must never disable
 // detection (fingerprint is the safety net when the env var is unset/mismatched).
@@ -216,6 +230,67 @@ try {
   }
 }
 expectBool("non-git cwd, no env", isAgentInfraRepo("/nonexistent/dir", noEnv), false);
+
+// ── #615 regression pin: readHubDisorder includes agent-infra ───────────────
+// The #99 exemption made readHubDisorder default `skipInfra: true`, so an
+// agent-infra hub could never be "disordered" and M4 stayed silent. Pin removed:
+// a fingerprinted agent-infra repo (manifest.json + pi-bootstrap/setup.sh) now
+// reports disorder exactly like any other hub. Hermetic (temp repo, no live-hub
+// state dependence — the real shared hub is dirty with OTHER sessions' work).
+let infraPinTmp = null;
+const provisionInfraRepo = (base, name) => {
+  const r = `${base}/${name}`;
+  execSync(`git init -q -b main "${r}"`, { stdio: "ignore" });
+  execSync("git config user.email t@t && git config user.name t", { cwd: r, stdio: "ignore" });
+  execSync("mkdir -p pi-bootstrap", { cwd: r, stdio: "ignore" });
+  writeFileSync(`${r}/manifest.json`, "{}");
+  writeFileSync(`${r}/pi-bootstrap/setup.sh`, "#!/bin/sh\n");
+  execSync("git add . && git commit -qm init", { cwd: r, stdio: "ignore" });
+  return r;
+};
+try {
+  infraPinTmp = execSync("mktemp -d", { encoding: "utf-8" }).trim();
+  const infraPin = provisionInfraRepo(infraPinTmp, "infra");
+  expectBool("#615 pin: fingerprinted repo detected as agent-infra", isAgentInfraRepo(infraPin) === true, true);
+  expectBool("#615 pin: agent-infra main+clean → null disorder", readHubDisorder(infraPin).disorder === null, true);
+  execSync("touch stray.txt", { cwd: infraPin, stdio: "ignore" });
+  expectBool("#615 pin: agent-infra dirty → disorder (was silent under skipInfra)", readHubDisorder(infraPin).disorder === "dirty", true);
+  execSync("rm stray.txt && git checkout -qb feat/own", { cwd: infraPin, stdio: "ignore" });
+  expectBool("#615 pin: agent-infra off-main clean → off_main", readHubDisorder(infraPin).disorder === "off_main", true);
+  execSync("touch stray2.txt", { cwd: infraPin, stdio: "ignore" });
+  expectBool("#615 pin: agent-infra off-main + dirty → both", readHubDisorder(infraPin).disorder === "both", true);
+} catch (e) {
+  console.error(`❌ #615 infra-disorder pins FAILED to provision: ${String(e.message).slice(0, 120)}`); fail++;
+} finally {
+  if (infraPinTmp) {
+    try { execSync(`rm -rf "${infraPinTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+}
+
+// ── #615 source pins: index.ts removals cannot silently regress ────────────
+// index.ts is not importable in tests (pi-extension TS), so pin the REMOVALS
+// at the SOURCE level (comment text stripped first — a doc mention must not
+// false-trip). TRIPWIRE, NOT PROOF: naive/spaced/literal reintroductions of
+// the #99 carve-outs are caught (banned strings + whitespace-tolerant
+// call-site count + the surviving call pinned to its M3 decideM3 role), but
+// deliberate rewrites (alias indirection, comment-split spellings, a guard
+// inserted between the isInfra assignment and decideM3, or restoring a
+// skipInfra option in classify-git) can evade source pins — index.ts is not
+// importable, so behavioral pins on it are impossible. A deliberate reverter
+// can delete the pins anyway; these exist to catch accidental/merge-confusion
+// reverts (verified: literal reverts of every removed hunk fail the suite).
+const guardIndexSrc = readFileSync(
+  join(PROJECT_CWD, "extensions", "main-worktree-guard", "index.ts"), "utf8");
+const pinSrc = guardIndexSrc.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+for (const banned of ["Downgraded agent-infra", "isAgentInfraRepo()) return undefined", "isAgentInfraRepo()) return null"]) {
+  expectBool(`#615 source pin: index.ts has no ${JSON.stringify(banned)}`, !pinSrc.includes(banned), true);
+}
+const infraCallSites = (pinSrc.match(/isAgentInfraRepo\s*\(/g) ?? []).length;
+expectBool("#615 source pin: only the M3 ceremony isAgentInfraRepo( call remains (index.ts)", infraCallSites === 1, true);
+const m3AssignIdx = pinSrc.indexOf("isInfra = isAgentInfraRepo(muEff.effectiveCwd)");
+expectBool("#615 source pin: the surviving call is the M3 isInfra assignment", m3AssignIdx !== -1, true);
+const afterM3 = m3AssignIdx !== -1 ? pinSrc.slice(m3AssignIdx, m3AssignIdx + 2500) : "";
+expectBool("#615 source pin: isInfra feeds decideM3 (isAgentInfra: isInfra) — not an exemption guard", afterM3.includes("isAgentInfra: isInfra"), true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
 function expectBranches(command, expectedArray) {

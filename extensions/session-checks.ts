@@ -8,10 +8,11 @@
 // the same scripts work from session_start. Age gates preserve the former
 // cadence (hub 6h, oracle 24h) while pi runs; silent when fresh.
 //
-// Hub repo surface = TORTOISE_REPO / sibling tortoise ONLY — parity with the
-// retired launchd job, which was deliberately tortoise-only: agent-infra is
-// #99-exempt from hub discipline (its in-main dirt is sanctioned work;
-// main-worktree-guard warns, never flags). Add repos via SESSION_CHECKS_REPOS.
+// Hub repo surface = TORTOISE_REPO / sibling tortoise / AGENT_INFRA_PATH —
+// #615: agent-infra JOINED the checked repos (the #99 hub-discipline exemption
+// is removed — its main checkout is a pure hub too, and hub-state-check now
+// flags in-hub dirt exactly like tortoise). Add extra repos via
+// SESSION_CHECKS_REPOS.
 //
 // Safety:
 //   - never crashes session startup (all errors swallowed → log line)
@@ -67,13 +68,12 @@ export function lastRunEpoch(dir: string, name: string): number {
 }
 
 /**
- * Default hub repos: TORTOISE_REPO env → sibling tortoise → extra repos.
- * Deliberately NOT agent-infra: the retired launchd hub job was tortoise-only
- * — agent-infra is #99-exempt from hub discipline (its in-main dirt is
- * sanctioned, normal work; main-worktree-guard warns rather than flags).
+ * Default hub repos: AGENT_INFRA_PATH (its own main checkout — #615, the #99
+ * exemption is removed), then TORTOISE_REPO env → sibling tortoise → extras.
  */
 export function resolveHubRepos(infraPath: string): string[] {
   const repos: string[] = [];
+  if (infraPath && existsSync(infraPath)) repos.push(infraPath);
   const envRepo = process.env.TORTOISE_REPO;
   if (envRepo && existsSync(envRepo)) repos.push(envRepo);
   const sibling = join(dirname(infraPath), "tortoise");
@@ -232,10 +232,10 @@ export async function runSessionChecks(opts: SessionChecksOptions): Promise<Sess
   const repos = opts.repos ?? resolveHubRepos(infra);
   const hubArgs = [];
   if (repos.length === 0) {
-    // Parity with the retired launchd job: tortoise-only surface by default.
-    // Nothing resolved → skip the hub leg loudly rather than fall back to the
-    // script's $PWD default (which could check agent-infra — #99-exempt).
-    summary.lines.push("hub-state-check: skipped (no tortoise repo — set TORTOISE_REPO)");
+    // #615: agent-infra is included by default now; nothing resolved means no
+    // infra + no tortoise + no extras — skip the hub leg loudly rather than
+    // fall back to the script's $PWD default.
+    summary.lines.push("hub-state-check: skipped (no repos — set AGENT_INFRA_PATH/TORTOISE_REPO)");
   } else {
     for (const r of repos) hubArgs.push("--repo", r);
     hubArgs.push("--gh-report");

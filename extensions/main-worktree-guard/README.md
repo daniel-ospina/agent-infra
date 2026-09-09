@@ -26,7 +26,8 @@ any failure — a failed import or stamp never silently allows.
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
-The **hub** (the shared main checkout of a non-infra repo) has exactly two
+The **hub** (the shared main checkout of a guarded repo — agent-infra included
+since #615) has exactly two
 legal states: checked out on `main`/`master` and a clean working tree
 (`git status --porcelain` empty — **untracked files count as dirty**). M4
 enforces this at runtime: **when the session cwd IS the hub and it is off-main
@@ -91,8 +92,9 @@ touched only by humans and is unaffected.
 
 **Scope (#347):** M4 fires only when the session cwd IS the hub's main checkout
 and the hub is off-main/dirty. Worktree sessions are exempt (they are isolated
-by construction); agent-infra is exempt (#99 — in-main feature work is its
-norm; its hub-discipline check is downgraded to a dirty-warn). **Worktree-
+by construction). Agent-infra is NOT exempt (#615 — the #99 carve-out is
+removed: its main checkout is a pure hub too, so it gets the same M4 discipline
+as every other repo). **Worktree-
 TARGETED git ops are exempt per-invocation:** M4 resolves each git invocation's
 EFFECTIVE target (cd-chains, `-C`, `GIT_DIR`/`--git-dir`, subshell/pipe/`&`
 scoping, `git worktree list` membership derived from the worktrees' reverse-
@@ -221,7 +223,8 @@ out the TTL-marker path). The consequences, all of which M4 now prevents:
 
 **The age-gated hub-state check (`hub-state-check.sh`, run at pi session start by
 `extensions/session-checks.ts` — #432; launchd can't read ~/Documents under TCC)
-watches the tortoise main checkout (agent-infra main is #99-exempt)**: it fails
+watches the main checkouts of tortoise AND agent-infra (#615 — the #99
+exemption is removed)**: it fails
 loudly with the recovery command and opens one deduped GitHub issue when the
 hub goes bad. Day 0 validation: the live `pr1467` hub fails the check — that is
 the point.
@@ -231,26 +234,29 @@ the point.
 - **Not a worktree blocker:** `git worktree add/list/prune` stay allowed.
 - **Not a read blocker:** `git status`, `git log`, `git diff`, `git fetch`,
   `git show`, etc. remain available.
-- **Not an agent-infra gate:** the infra repo's in-main feature work (#99) is
-  untouched.
+- **Not an agent-infra carve-out (anymore):** the infra repo's in-main feature
+  work was #99-exempt; the exemption is removed (#615) — agent-infra feature
+  work happens in worktrees and its main checkout gets the same gate as every
+  other hub. Shared-state edits (MEMORY.md, skills, config) land via worktree
+  → merge → sync, or the commit-workflow micro fast-path.
 - **Not a terminal gate:** humans in a terminal can always run the one-liner.
 
 ## Hub-WIP hygiene warnings — put WIP in a worktree (#350) + #437 tracked-write gate
 
 The **#347 amplifier**: agents write WIP (plan docs to `docs/plans/`,
 migrations, scratch files) directly in the hub main checkout instead of an
-isolated worktree. The write/edit tool blocks non-infra main edits, but
-**agent-infra is exempt** (#99) and **bash heredoc/tee/python writes were
+isolated worktree. The write/edit tool blocks main-checkout edits, but
+**bash heredoc/tee/python writes were
 unguarded** — so the discipline violation silently accumulates, marks the hub
-dirty, and trips M4's freeze. Surfaces (in a NON-infra repo):
+dirty, and trips M4's freeze. Surfaces:
 
 1. **Write/edit-gate warning:** a write/edit target inside the hub main
    checkout matching the WIP patterns (`docs/plans/` segment pair, any
    `migrations/` segment, scratch suffixes `.tmp`/`.bak`/`.scratch`/`~`) emits a
    prominent `HUB WIP — PUT IT IN A WORKTREE` banner instead of silently
-   passing. Relevant where the write is NOT already blocked: agent-infra
-   sessions (exempt) and worktree sessions writing into the hub via an absolute
-   path. For non-infra main-checkout writes (already blocked), the block reason
+   passing. Relevant where the write is NOT already blocked: worktree sessions
+   writing into the hub via an absolute
+   path. For main-checkout writes (already blocked), the block reason
    now names the amplifier pattern.
 2. **Bash-write GATE for tracked files in a DISORDERED hub (#437):** while the
    hub is OFF-MAIN or DIRTY, a bash write (`>`/`>>` redirect, `tee`, python
@@ -322,7 +328,8 @@ spelling (warn-only false-negative — the perf constraint keeps the pure patter
 filter first).
 
 **Why warning, not block (untracked WIP):** the write/edit block for
-main-checkout edits is a deliberate permanent gate for non-infra repos; the
+main-checkout edits is a deliberate permanent gate in every guarded repo
+(agent-infra included since #615); the
 untracked-WIP patterns are a hygiene signal, and an agent may legitimately
 need a scratch file briefly. The warning surfaces the violation at write time
 so the agent moves the work to a worktree
@@ -445,7 +452,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 
 | Escape | How | Consequence (what you are opting into) |
 |---|---|---|
-| env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated flags agent-infra main dirt (hub-state-check is tortoise-only — agent-infra is #99-exempt); sibling sessions in the hub are unprotected and will be disrupted. Prefer `hub-worktree.sh <branch>` instead. |
+| env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated exempts agent-infra main dirt anymore (#615 — hub-state-check now includes agent-infra; sibling sessions in the hub are unprotected and will be disrupted). Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
 | script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. It was the most likely vector for the 2026-08-18 incident; it no longer exists. |
 | terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | THE sanctioned recovery (#206). Terminals are never intercepted; this is how a stranded hub gets un-stranded. |
@@ -606,9 +613,15 @@ shared main checkout of a project with the guard active:
    only `fetch`/`worktree add`/`status` → runs.
 10. `bash scripts/checkout-hygiene/hub-state-check.sh --repo <hub>` → exit 0
     on main+clean, exit 1 + recovery command on off-main/dirty.
-11. **#350 WIP hygiene:** from the hub main checkout — `cat >
-    docs/plans/wip.md` (bash) or `write docs/plans/wip.md` (agent-infra) →
-    `HUB WIP — PUT IT IN A WORKTREE` warning, command still runs (never
-    blocked); `echo x > /tmp/foo.tmp` → no warning (outside the hub); the
-    session-start banner lists untracked `docs/plans/`/`migrations/`/scratch
-    files when present.
+11. **#350 WIP hygiene:** from the hub main checkout — an OVERWRITE of an
+    existing/tracked file (`cat > docs/plans/wip.md` in a DISORDERED hub —
+    the #437 tracked-write gate — or `write docs/plans/wip.md` in any hub
+    state) → **blocked**; the write/edit block reason names the `docs/plans/`
+    pattern on the main+clean gate (#615 removed the agent-infra warn-only
+    exemption). A NEW untracked file in a disordered hub passes the #436
+    collision-free new-file carve-out (hub stays dirty — tracked by #628); a
+    WORKTREE session writing `docs/plans/wip.md` into the hub via an absolute
+    path → `HUB WIP — PUT IT IN A WORKTREE` warning, command still runs
+    (never blocked); `echo x > /tmp/foo.tmp` → no warning (outside the hub);
+    the session-start banner lists untracked
+    `docs/plans/`/`migrations/`/scratch files when present.
