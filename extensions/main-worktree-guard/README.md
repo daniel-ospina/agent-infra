@@ -240,8 +240,8 @@ out the TTL-marker path). The consequences, all of which M4 now prevents:
 
 **The age-gated hub-state check (`hub-state-check.sh`, run at pi session start by
 `extensions/session-checks.ts` — #432; launchd can't read ~/Documents under TCC)
-watches the main checkouts of tortoise AND agent-infra (#615 — the #99
-exemption is removed)**: it fails
+watches the main checkouts of agent-infra (#615 — the #99 exemption is removed)
+and its sibling hub repos tortoise, premise-labs, DMeer, eldato (#619)**: it fails
 loudly with the recovery command and opens one deduped GitHub issue when the
 hub goes bad. Day 0 validation: the live `pr1467` hub fails the check — that is
 the point.
@@ -543,7 +543,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 
 | Escape | How | Consequence (what you are opting into) |
 |---|---|---|
-| env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated exempts agent-infra main dirt anymore (#615 — hub-state-check now includes agent-infra; sibling sessions in the hub are unprotected and will be disrupted). Prefer `hub-worktree.sh <branch>` instead. |
+| env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated exempts agent-infra main dirt anymore (#615/#619 — hub-state-check now includes agent-infra + the sibling hub repos tortoise/premise-labs/DMeer/eldato; sibling sessions in the hub are unprotected and will be disrupted). Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
 | script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. It was the most likely vector for the 2026-08-18 incident; it no longer exists. |
 | terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | THE sanctioned recovery (#206). Terminals are never intercepted; this is how a stranded hub gets un-stranded. |
