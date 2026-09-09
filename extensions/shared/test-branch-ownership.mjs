@@ -9,7 +9,7 @@ import { mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import {
-  repoKey, readBranchState, tokenize, extractGitInvocation, resolveEffectiveRepo,
+  repoKey, readBranchState, localBranchExists, tokenize, extractGitInvocation, resolveEffectiveRepo,
   resolveRepoFromInv,
   classifyBranchOp, parseRefspecDst, decideM1, decideM2, decideM3, ownershipAllowed,
   acquireRepoLock, releaseRepoLock, lockDir,
@@ -538,6 +538,83 @@ ok("M3 #591: force+copy composition (no branch field) still blocks", (() => { co
 ok("M3: orphan blocks", (() => { const d = decideM3({ branchOp: { op: "orphan" }, isAgentInfra: true, baseline }); return d?.block === true; })());
 ok("M3: own rename re-baselines", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/2" }, isAgentInfra: false, baseline, currentBranch: "feat/1" }); return d?.reBaseline === "feat/2"; })());
 ok("M3: foreign rename blocks", (() => { const d = decideM3({ branchOp: { op: "rename", from: "other", to: "x" }, isAgentInfra: false, baseline }); return d?.block === true; })());
+// ── decideM3 #598: forced-rename dst-clobber gate ──────────────────────────
+// The #265/#592 own-baseline rename carve-out (from === baseline.branch →
+// reBaseline) is SAFE only onto a FREE name — git renames the own checkout
+// branch rc 0 without touching a second ref. A forced rename onto an EXISTING
+// branch (renameDstExists — the index.ts adapter probes the resolved repo via
+// localBranchExists) that is NOT the branch being renamed and NOT owned by
+// this session (ownedBranches — the #543/#588 ownership check) CLOBBERS that
+// foreign ref rc 0 → refuse the reBaseline, block. The 1-pos form (rename
+// current: from null → currentBranch substitution below) runs the old-name
+// check against the CURRENT branch. Real-git clobber/refusal backing pins
+// follow.
+ok("M3 #598: own-baseline rename onto FREE dst → reBaseline (carve-out intact)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/new" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: false }); return d?.reBaseline === "feat/new" && !d?.block; })());
+ok("M3 #598: own-baseline rename onto EXISTING foreign dst → BLOCK (no clobber)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true }); return d?.block === true; })());
+ok("M3 #598: 1-pos own rename (from null → current) onto EXISTING foreign → BLOCK", (() => { const d = decideM3({ branchOp: { op: "rename", from: null, to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true }); return d?.block === true; })());
+ok("M3 #598: 1-pos own rename onto FREE dst → reBaseline (1-pos carve-out intact)", (() => { const d = decideM3({ branchOp: { op: "rename", from: null, to: "feat/new" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: false }); return d?.reBaseline === "feat/new" && !d?.block; })());
+ok("M3 #598: existing dst OWNED (Set) → reBaseline (session consolidates own refs)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true, ownedBranches: new Set(["victim"]) }); return d?.reBaseline === "victim" && !d?.block; })());
+ok("M3 #598: existing dst OWNED (array form) → reBaseline", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true, ownedBranches: ["victim"] }); return d?.reBaseline === "victim" && !d?.block; })());
+ok("M3 #598: dst == branch being renamed (self-rename) → reBaseline (no second ref; git refuses rc 128)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "feat/1" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true }); return d?.reBaseline === "feat/1" && !d?.block; })());
+ok("M3 #598: FOREIGN-from rename onto existing dst → still blocks (unchanged)", (() => { const d = decideM3({ branchOp: { op: "rename", from: "other", to: "victim" }, isAgentInfra: true, baseline, currentBranch: "feat/1", renameDstExists: true }); return d?.block === true; })());
+ok("M3 #598: own-baseline rename onto existing dst in NON-infra → still blocks", (() => { const d = decideM3({ branchOp: { op: "rename", from: "feat/1", to: "victim" }, isAgentInfra: false, baseline, currentBranch: "feat/1", renameDstExists: true }); return d?.block === true; })());
+// ── localBranchExists tri-state probe ──────────────────────────────────────
+ok("M3 #598: localBranchExists existing branch → true", localBranchExists(MAIN, "side") === true, String(localBranchExists(MAIN, "side")));
+ok("M3 #598: localBranchExists free name → false", localBranchExists(MAIN, "no-such-598") === false, String(localBranchExists(MAIN, "no-such-598")));
+ok("M3 #598: localBranchExists non-repo cwd → null (unknown — caller fails closed)", localBranchExists("/nonexistent/xyz", "main") === null);
+ok("M3 #598: localBranchExists empty name → null", localBranchExists(MAIN, "") === null);
+// Real-git backing for the gate's premises (dedicated scratch repos so ref
+// state never entangles the MAIN/OTHER fixtures). Each repo: on own/1 (the
+// would-be session baseline) with main advanced past it and a FOREIGN victim/
+// victim2 branch sitting at main's newer commit — a discriminating setup.
+{
+  // Each repo: own/1 (the would-be session baseline) holds a commit main
+  // never saw; the FOREIGN names are created at main's NEWER commit while
+  // main is checked out (in fresh598) — a discriminating setup where a
+  // clobber observably moves the foreign ref, and a soft -m refusal leaves
+  // both refs at their own commits.
+  const fresh598 = (name, foreign = []) => {
+    const p = join(ROOT, name);
+    execSync(`mkdir -p "${p}"`, { stdio: "ignore" });
+    execSync("git init -q -b main", { cwd: p, stdio: "ignore" });
+    execSync("git config user.email t@bo.local", { cwd: p, stdio: "ignore" });
+    execSync("git config user.name bo-test", { cwd: p, stdio: "ignore" });
+    git(p, "commit --allow-empty -qm m0");
+    git(p, "branch own/1");
+    git(p, "checkout -q own/1");
+    git(p, "commit --allow-empty -qm own1");
+    git(p, "checkout -q main");
+    git(p, "commit --allow-empty -qm m1");
+    for (const f of foreign) git(p, `branch ${f}`); // foreign refs @ m1 ≠ own/1
+    git(p, "checkout -q own/1");
+    return p;
+  };
+  const A = fresh598("r598-a", ["victim"]);
+  const OWN_A = git(A, "rev-parse own/1");
+  const softM = spawnSync("git", ["branch", "-m", "own/1", "victim"], { cwd: A, encoding: "utf-8" });
+  ok("M3 #598 real-git: soft -m onto EXISTING dst refused rc 128 (no clobber possible)", softM.status === 128, String(softM.status));
+  ok("M3 #598 real-git: soft refusal leaves both refs intact", git(A, "rev-parse own/1") === OWN_A && git(A, "rev-parse victim") !== OWN_A, "state");
+  const clobber = spawnSync("git", ["branch", "-M", "own/1", "victim"], { cwd: A, encoding: "utf-8" });
+  ok("M3 #598 real-git: -M <own-current> <existing-foreign> CLOBBERS rc 0 (why it must block)", clobber.status === 0 && git(A, "rev-parse victim") === OWN_A, String(clobber.status));
+  ok("M3 #598 real-git: clobber moved HEAD onto the dst (own/1 gone)", git(A, "branch --show-current") === "victim", "head");
+  ok("M3 #598 real-git: localBranchExists true after clobber / false for the consumed name", localBranchExists(A, "victim") === true && localBranchExists(A, "own/1") === false, String(localBranchExists(A, "own/1")));
+  const B = fresh598("r598-b", ["victim"]);
+  const OWN_B = git(B, "rev-parse own/1");
+  const onePos = spawnSync("git", ["branch", "-M", "victim"], { cwd: B, encoding: "utf-8" });
+  ok("M3 #598 real-git: 1-pos -M <existing-foreign> (rename current) CLOBBERS rc 0", onePos.status === 0 && git(B, "rev-parse victim") === OWN_B, String(onePos.status));
+  const C = fresh598("r598-c", ["victim"]);
+  const OWN_C = git(C, "rev-parse own/1");
+  const swallow = spawnSync("git", ["branch", "-M", "--so", "key", "victim"], { cwd: C, encoding: "utf-8" });
+  ok("M3 #598 real-git: -M --so <v> <existing-foreign> (value-swallow 1-pos) CLOBBERS rc 0", swallow.status === 0 && git(C, "rev-parse victim") === OWN_C, String(swallow.status));
+  const D = fresh598("r598-d", ["victim2"]);
+  const OWN_D = git(D, "rev-parse own/1");
+  // free-name carve-out control first (rename there and back — brandnew is free)
+  const freeRen = spawnSync("git", ["branch", "-M", "own/1", "brandnew"], { cwd: D, encoding: "utf-8" });
+  ok("M3 #598 real-git: -M <own-current> <FREE name> renames rc 0 (the safe carve-out case)", freeRen.status === 0 && git(D, "rev-parse brandnew") === OWN_D && git(D, "branch --show-current") === "brandnew", String(freeRen.status));
+  spawnSync("git", ["branch", "-M", "brandnew", "own/1"], { cwd: D, encoding: "utf-8" }); // restore
+  const swallow2 = spawnSync("git", ["branch", "-M", "--so", "key", "own/1", "victim2"], { cwd: D, encoding: "utf-8" });
+  ok("M3 #598 real-git: -M --so <v> <own> <existing> (2-pos swallow) CLOBBERS rc 0", swallow2.status === 0 && git(D, "rev-parse victim2") === OWN_D, String(swallow2.status));
+}
 
 // ── decideM3 #376: ceremony return-to-original-baseline carve-out ──────────
 // Post-ceremony session state: started on main (baseline.original — IMMUTABLE),

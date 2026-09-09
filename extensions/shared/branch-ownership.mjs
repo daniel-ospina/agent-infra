@@ -18,7 +18,7 @@
 // here (cd/-C/--git-dir extraction) is cross-checked against classify-git's
 // skimmer by test-branch-ownership.mjs (T2 cross-consistency matrix).
 
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { resolve, join } from "node:path";
 import {
   mkdirSync, writeFileSync, readFileSync, rmSync, openSync, writeSync, closeSync,
@@ -119,6 +119,32 @@ export function readBranchState(cwd, gitDir) {
     };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Does a LOCAL branch ref exist in the repo at `cwd`? Tri-state probe used by
+ * the M3 rename gate (#598): git's branch refs are repo-global (shared across
+ * worktrees of the same common dir), so probing from any worktree cwd of the
+ * resolved repo answers what `git branch -M <src> <dst>` would overwrite.
+ * Returns true (exists) / false (cleanly absent) / null (git failure —
+ * unknown; callers must map null fail-CLOSED). argv-based (execFileSync) so a
+ * refname can never reach a shell. `git rev-parse --verify --quiet` exits 0
+ * when the ref exists and 1 when it does not (probe-verified; any other exit
+ * — bad repo rc 128 etc. — is unknown, never a clean not-found).
+ * @param {string} cwd
+ * @param {string} name local branch name (no refs/heads/ prefix)
+ * @returns {boolean|null}
+ */
+export function localBranchExists(cwd, name) {
+  if (!cwd || typeof name !== "string" || name.length === 0) return null;
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "--quiet", `refs/heads/${name}`], {
+      encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore",
+    });
+    return true;
+  } catch (e) {
+    return (e && e.status === 1) ? false : null;
   }
 }
 
@@ -785,7 +811,10 @@ export function decideM2({
  *     returns { reBaseline: <branch> } so the guard re-adopts the baseline
  *     SYNCHRONOUSLY (the allowed carve-out must never trigger a spurious M1
  *     warn on the next tool_call).
- *   rename of the session's OWN baseline branch → { reBaseline: <to> }.
+ *   rename of the session's OWN baseline branch → { reBaseline: <to> } — but
+ *     ONLY onto a FREE name (#598): a forced rename onto an EXISTING branch
+ *     that is neither the branch being renamed nor owned by this session
+ *     (renameDstExists + ownedBranches) clobbers that foreign ref rc 0 → block.
  *   switch-existing to the session's ORIGINAL baseline branch (baseline.original
  *     — the branch recorded at session_start BEFORE any create-new re-baseline):
  *     allowed in agent-infra main → { reBaseline: <target> } — the sanctioned
@@ -811,7 +840,7 @@ export function decideM2({
  *   (the resolved repo is the ONE where the original baseline was recorded — a
  *   cd into a DIFFERENT agent-infra clone must not authorize a switch there).
  */
-export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey, stateOpCount = 1, isBare = false, hiddenStateSubst = false }) {
+export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repoKey, stateOpCount = 1, isBare = false, hiddenStateSubst = false, renameDstExists = false, ownedBranches }) {
   if (!branchOp) return null;
   const op = branchOp.op;
   if (op === "create-new") {
@@ -831,8 +860,41 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     // #592: the rename arm now also receives cluster/long-form renames
     // (-Mq/--move/--mov/--mo — identical decideM3 semantics as the exact
     // -m/-M they are byte-identical to in git; see classifyBranchOp).
+    // #598: the #265/#592 own-baseline carve-out (from === baseline.branch →
+    // reBaseline) is only SAFE for a rename onto a FREE name — git renames the
+    // own checkout branch rc 0 without touching any second ref. A FORCED
+    // rename onto an EXISTING ref (renameDstExists — the index.ts adapter
+    // probes the resolved repo) that is NOT the branch being renamed and NOT
+    // owned by this session CLOBBERS that foreign ref rc 0 (probe-verified
+    // for `-M <baseline> <existing>`, the 1-pos `-M <existing>` rename-current
+    // form, and the --so/--sort value-swallow shapes; git self-refuses only
+    // when the dst is checked out in a worktree, rc 128). The branch being
+    // renamed is `from`; for the 1-pos form classifyBranchOp returns from:null
+    // and the substitution below resolves it to currentBranch, so the
+    // old-name check runs against the CURRENT checkout branch (a classifier-
+    // visible old name is impossible there). ownedBranches (this session's
+    // created/renamed-to branches in this repo — the #543/#588 ownership
+    // check) still allows overwriting the session's OWN refs.
     const from = branchOp.from ?? currentBranch;
     if (baseline && from === baseline.branch && branchOp.to) {
+      const dst = branchOp.to;
+      const owned = !!ownedBranches
+        && (typeof ownedBranches.has === "function"
+          ? ownedBranches.has(dst)
+          : (Array.isArray(ownedBranches) && ownedBranches.includes(dst)));
+      if (renameDstExists && dst !== from && !owned) {
+        return {
+          block: true,
+          reason: [
+            `⛔ git branch -m/-M/-Mq/--move blocked in the MAIN checkout.`,
+            `   Why: renaming "${from}" to "${dst}" would OVERWRITE the`,
+            `   existing branch "${dst}", which this session does not own — a`,
+            `   forced rename destroys the destination ref rc 0 (#598).`,
+            `   → Rename onto a name that is free, or onto one of this`,
+            `     session's own branches.`,
+          ].join("\n"),
+        };
+      }
       return { reBaseline: branchOp.to };
     }
     return {

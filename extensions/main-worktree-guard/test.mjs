@@ -530,7 +530,7 @@ dexpect("merge origin/main → syncSource", `git fetch origin && git merge origi
 dexpect("rebase origin/main → syncSource", `git rebase origin/main`, { verdict: "block:rebase", syncSource: "origin/main" });
 
 // M3 subclassification surfaces (branchOp via shared classifyBranchOp)
-import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, resolveRepoFromInv as sharedResolveRepoFromInv, extractGitInvocation as sharedExtractGitInvocation, decideM2 as sharedDecideM2, decideM3 as sharedDecideM3, ownershipAllowed as sharedOwnershipAllowed } from "../shared/branch-ownership.mjs";
+import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, resolveRepoFromInv as sharedResolveRepoFromInv, extractGitInvocation as sharedExtractGitInvocation, decideM2 as sharedDecideM2, decideM3 as sharedDecideM3, localBranchExists as sharedLocalBranchExists, ownershipAllowed as sharedOwnershipAllowed } from "../shared/branch-ownership.mjs";
 const co = (cmd) => {
   const d = classifyGitCommandDetailed(cmd);
   // P1-A: classify the STATE-mutating invocation (compound commands must gate
@@ -1448,6 +1448,83 @@ dexpect("#596: benign-lead later -Dq delete → verdict block + all delete targe
   }
 }
 dexpect("#543: branch list → no delete capture", `git branch -a`, { branchState: false, deleteTargets: [] });
+// ── #598 regression: forced rename of the OWN baseline onto an EXISTING ────
+// foreign ref must BLOCK (the #265/#592 carve-out only covers FREE names) ──
+// `git branch -M <own> <existing-foreign>` CLOBBERS the foreign ref rc 0 (real
+// git — probe-verified in test-branch-ownership.mjs) — pre-fix decideM3's
+// rename arm re-baselined it. The 1-pos form (rename CURRENT: from null →
+// decideM3 substitutes currentBranch, so the old-name check runs against the
+// CURRENT checkout branch) and the --so/--sort value-swallow shapes clobber
+// identically. Full index.ts M3 mirror on REAL repos (classify →
+// classifyBranchOp → resolveEffectiveRepo → localBranchExists probe on the
+// rename dst → decideM3 with the pid's ownedBranches + renameDstExists):
+//   - `-M <baseline> <existing-foreign>`            → BLOCK
+//   - 1-pos `-M <existing-foreign>`                 → BLOCK (vs currentBranch)
+//   - `-M <baseline> <unused-name>`                 → reBaseline (carve-out)
+//   - `-M --so key <existing-foreign>` (swallow)    → BLOCK
+//   - `-M <baseline> <owned-name>`                  → reBaseline (own ref)
+{
+  let p598 = null;
+  try {
+    p598 = realpathSync(execSync("mktemp -d", { encoding: "utf-8" }).trim());
+    const r598 = `${p598}/r`;
+    execSync(`git init -q -b feat/1 "${r598}"`, { stdio: "ignore" });
+    execSync("git config user.email t@t && git config user.name t", { cwd: r598, stdio: "ignore" });
+    execSync("echo a > f && git add . && git commit -qm init", { cwd: r598, stdio: "ignore" });
+    // foreign refs the forced-rename dsts must not be allowed to clobber
+    // (ownX doubles as the owned-dst fixture — it EXISTS but is only
+    // overwrite-allowed when this pid's ownedBranches set contains it):
+    execSync("git branch victim && git branch victim2 && git branch feat/other && git branch ownX", { cwd: r598, stdio: "ignore" });
+    // index.ts's exact M3 adapter for a single main-resolving mutation:
+    // branchState → classifyBranchOp → resolve repo → probe the rename DST
+    // (localBranchExists !== false — a failed probe fails closed to exists) →
+    // decideM3 with ownedBranches (this pid's set, repo-scoped).
+    const m3idx = (cmd, owned = []) => {
+      const d = classifyGitCommandDetailed(cmd);
+      if (!d.branchState) return { skip: true };
+      const op = sharedClassifyBranchOp(d.stateVerb ?? d.verb, d.stateArgs ?? d.verbArgs);
+      if (!op || op.op === "other") return { skip: true };
+      const eff = sharedResolveEffectiveRepo(cmd, r598, d.verb, 0);
+      if (!eff) return { noRepo: true };
+      const dstExists = (op.op === "rename" && op.to != null)
+        ? sharedLocalBranchExists(eff.effectiveCwd, op.to) !== false
+        : false;
+      return sharedDecideM3({
+        branchOp: op, isAgentInfra: true,
+        baseline: { repoKey: eff.repoKey, branch: "feat/1" },
+        currentBranch: eff.currentBranch, repoKey: eff.repoKey,
+        stateOpCount: d.stateOpCount ?? 1,
+        ownedBranches: new Set(owned),
+        renameDstExists: dstExists,
+      });
+    };
+    const b1 = m3idx(`git branch -M feat/1 victim`);
+    expectBool("#598: -M <baseline> <existing-foreign> → M3 BLOCK (no foreign clobber)", b1?.block === true, true);
+    const b2 = m3idx(`git branch -M victim`);
+    expectBool("#598: 1-pos -M <existing-foreign> (rename current) → M3 BLOCK (vs currentBranch)", b2?.block === true, true);
+    const b3 = m3idx(`git branch -M feat/1 freeX`);
+    expectBool("#598: -M <baseline> <unused-name> → reBaseline (carve-out intact)", b3?.reBaseline === "freeX" && !b3?.block, true);
+    const b4 = m3idx(`git branch -Mq feat/1 victim`);
+    expectBool("#598: -Mq cluster <baseline> <existing-foreign> → M3 BLOCK", b4?.block === true, true);
+    const b5 = m3idx(`git branch -M --so key victim`);
+    expectBool("#598: -M --so key <existing-foreign> (value-swallow) → M3 BLOCK", b5?.block === true, true);
+    const b6 = m3idx(`git branch -M --so key feat/1 victim2`);
+    expectBool("#598: -M --so key <baseline> <existing-foreign> (2-pos swallow) → M3 BLOCK", b6?.block === true, true);
+    const b7 = m3idx(`git branch -M feat/1 ownX`, ["ownX"]);
+    expectBool("#598: -M <baseline> <OWNED branch> → reBaseline (session own ref)", b7?.reBaseline === "ownX" && !b7?.block, true);
+    const b8 = m3idx(`git branch -M feat/1 ownX`, []);
+    expectBool("#598: -M <baseline> <NOT-owned branch> → M3 BLOCK (no owned set entry)", b8?.block === true, true);
+    const b9 = m3idx(`git branch -M feat/other victim`);
+    expectBool("#598: -M <foreign-from> <existing> → still M3 BLOCK (unchanged path)", b9?.block === true, true);
+    const b10 = m3idx(`git branch -m feat/1 rnS`);
+    expectBool("#598: soft -m <baseline> <free-name> → reBaseline (soft rename unchanged)", b10?.reBaseline === "rnS" && !b10?.block, true);
+  } catch (e) {
+    console.error(`❌ #598 fixture FAILED to provision: ${String(e.message).slice(0, 120)}`);
+    fail++;
+  } finally {
+    if (p598) { try { execSync(`rm -rf "${p598}"`, { stdio: "ignore" }); } catch {} }
+  }
+}
 // ── #587 regression: merged NOARG flag-clusters ─────────────────────────────
 // `-Dq` ≡ `-D -q` (hard delete, quiet): block, and the target is the
 // following POSITIONAL — NOT a phantom attached "q" (git has no attached-name
