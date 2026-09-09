@@ -37,6 +37,23 @@ check_version() {
 
 check_version
 
+# AGENTS.md materialization gate (#600) — AGENTS.md must contain the full base
+# rules inline, never a URL-inheritance stub (pi reads only local files).
+# Stage-guard BEFORE spawning the checker: one cheap git call on commits that
+# don't touch AGENTS.md; the full check runs only when AGENTS.md is staged.
+# Resolve the checker through scripts/ symlink (consumer repos) OR the
+# AGENT_INFRA_PATH fallback (repos whose real scripts/ dir lacks the checker,
+# e.g. swarm — a real-dir scripts/ is preserved at link time).
+if git diff --cached --name-only -- AGENTS.md 2>/dev/null | grep -q .; then
+  CHECKER="scripts/check-agents-materialized.sh"
+  if [ ! -f "$CHECKER" ] && [ -n "${AGENT_INFRA_PATH:-}" ] && [ -f "$AGENT_INFRA_PATH/scripts/check-agents-materialized.sh" ]; then
+    CHECKER="$AGENT_INFRA_PATH/scripts/check-agents-materialized.sh"
+  fi
+  if [ -f "$CHECKER" ]; then
+    bash "$CHECKER" || exit 1
+  fi
+fi
+
 # Only run lint-staged if this is a Node.js project (has package.json)
 if [ -f package.json ] && command -v npx >/dev/null 2>&1; then
   npx lint-staged

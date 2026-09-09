@@ -51,6 +51,20 @@ if [ -f scripts/check-cost-config.sh ]; then
   bash scripts/check-cost-config.sh --shipped-only || exit 1
 fi
 
+# AGENTS.md materialization gate (#600): stage-guard BEFORE spawning the
+# checker — one cheap git call unless AGENTS.md is staged, then the full
+# check. Resolve checker via scripts/ symlink OR $AGENT_INFRA_PATH
+# (repos whose real scripts/ dir lacks it, e.g. swarm).
+if git diff --cached --name-only -- AGENTS.md 2>/dev/null | grep -q .; then
+  CHECKER="scripts/check-agents-materialized.sh"
+  if [ ! -f "$CHECKER" ] && [ -n "${AGENT_INFRA_PATH:-}" ] && [ -f "$AGENT_INFRA_PATH/scripts/check-agents-materialized.sh" ]; then
+    CHECKER="$AGENT_INFRA_PATH/scripts/check-agents-materialized.sh"
+  fi
+  if [ -f "$CHECKER" ]; then
+    bash "$CHECKER" || exit 1
+  fi
+fi
+
 # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
 # every extensions/ top-level entry except *.test.ts must be farm-wired into
 # pi-bootstrap/pi-config/extensions (single source of truth) AND listed in
