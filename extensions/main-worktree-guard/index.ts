@@ -764,9 +764,11 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
     let gitInternalHit: { resolvedPath: string; rel: string } | null = null; // a hub-main .git-metadata write (hooks/config/pointer)
     // Classify ONE write candidate (top-level write or script-content write):
     // resolve its containing checkout; skip non-main (worktree/non-git)
-    // targets and any main checkout NESTED under the session's own tree (a
-    // private repo / submodule / vendored copy the session owns — not a
-    // shared-hub write; cycle-2 correctness F1b); same-checkout candidates
+    // targets and any main checkout NESTED under the session's own tree when
+    // the SESSION is a NON-main checkout (a private repo / submodule /
+    // vendored copy under a worktree the session owns — not a shared-hub
+    // write; cycle-2 F1b + cycle-3 B-1 cap: a MAIN-rooted session's nested
+    // checkouts stay frozen); same-checkout candidates
     // gate only on the SESSION's hub disorder (== that main's — the session IS
     // rooted there); cross-checkout candidates (session shell NOT rooted in
     // the target main) are deliberate hub writes — any tracked target blocks,
@@ -940,9 +942,11 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
   if (hit.kind === "script-depth") {
     return [
       "⛔ Bash script execution blocked — script chain exceeds the verify budget.",
-      `   A script/source chain deeper than the guard's walk budget was detected;`,
-      `   its writes into hub-main checkouts are UNVERIFIABLE and the guard fails`,
-      `   closed rather than risk a tracked hub file write (cycle-2 P2).`, 
+      `   A script/source chain deeper than the guard's walk budget was detected`,
+      `   with hub-main candidates already in view (or the session shell rooted`,
+      `   in a disordered hub main); its tail writes into hub-main checkouts are`,
+      `   UNVERIFIABLE and the guard fails closed rather than risk a tracked hub`,
+      `   file write. A chain with NO hub proximity is not blocked (cycle-3 A-1).`,
       `   → Run the shell commands directly (in a worktree), or flatten the chain.`,
       `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
       `     override (deliberate solo sessions only).`,

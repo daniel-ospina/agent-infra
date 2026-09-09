@@ -359,14 +359,18 @@ dirty, and trips M4's freeze. Surfaces:
    main-rooted session's same-checkout tracked write into its own CLEAN main
    stays ungated (build/formatter/npm-install side effects must never
    false-block — #437's disorder scope).
-   NEW-file and untracked-WIP targets are NOT this gate's concern (see 3;
-   the #436 collision-free carve-out semantics apply).
+   NEW-file (nonexistent) targets and own-main untracked writes are NOT this
+   gate's concern (see 3; the #436 collision-free carve-out semantics apply) —
+   a CROSS-checkout overwrite of an EXISTING untracked hub file blocks (A-2,
+   above).
 3. **Bash-write warning (untracked WIP — still warn-only):** hub-targeted
    non-git bash writes whose target matches a WIP pattern emit the same banner
    with a `(via bash …)` note. Heuristic and conservative: `/tmp` scratch-ish
    targets are excluded (hub-equality), false-positive warnings are acceptable,
-   false-blocks are not. Untracked WIP stays warn-only (#437 keeps this — the
-   gate covers only index-tracked files).
+   false-blocks are not. Own-main untracked writes stay warn-only (#437 keeps
+   this — the gate's tracked/existing-untracked freezes never cover a
+   same-rooted session's own hub; only CROSS-checkout overwrites of existing
+   untracked hub files block, A-2).
 4. **Hub-hygiene inventory:** the session-start hub-discipline check (#73) now
    also lists untracked WIP files (`git status --porcelain=v1
    --untracked-files=all`, bounded — the per-file expansion runs only when
