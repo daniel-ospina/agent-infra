@@ -361,8 +361,12 @@ dirty, and trips M4's freeze. Surfaces:
    command substitution (the `$( )` form IS walked), arbitrary interpreter
    writers (`node -e`, `ruby -e`, `php -r`), a bare `rm` of a tracked file,
    an rsync option that takes a separate operand but is neither in the
-   operand list nor an unambiguous prefix of an entry (and the same class for
-   sort), and `N>file` inside an interpreter pre-scan (`bash 2> f`). Own-main UNTRACKED/NEW writes stay free (build/formatter/npm-install
+   arity table nor an unambiguous prefix of an entry (and the same class for
+   sort), rsync options whose operand is itself a WRITTEN file
+   (`--log-file`, `--write-batch`, `--only-write-batch`, `--backup-dir`),
+   `N>file` inside an interpreter pre-scan (`bash 2> f script.sh`), and
+   path-identity indirection the gate cannot see pre-execution (a hardlink to
+   a hub file, or a symlink the same command creates). Own-main UNTRACKED/NEW writes stay free (build/formatter/npm-install
    side effects on genuinely new files must not false-block); a TRACKED
    own-main write blocks clean OR disordered (#625 removed the #437 clean-hub
    residual — it let a compound `printf … >> MEMORY.md && git add && git

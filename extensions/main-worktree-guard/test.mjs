@@ -649,7 +649,7 @@ expectBool("#625 source pin: sed/perl in-place flag detected", classifySrc.inclu
 expectBool("#625 source pin: cp/mv -t target-directory handled", classifySrc.includes("--target-directory="), true);
 expectBool("#625 source pin: dd of= operand surfaced", classifySrc.includes("w.startsWith(\"of=\")"), true);
 expectBool("#625 source pin: mv surfaces its sources (removal is a tracked mutation)", classifySrc.includes("const alsoSources = v === \"mv\""), true);
-expectBool("#625 source pin: rsync/ln destination handled (operand-aware)", classifySrc.includes("v === \"rsync\" || v === \"ln\"") && classifySrc.includes("OPERAND_FLAGS"), true);
+expectBool("#625 source pin: rsync/ln destination handled (operand-aware)", classifySrc.includes("v === \"rsync\" || v === \"ln\"") && classifySrc.includes("isRsyncOperand") && classifySrc.includes("RSYNC_LONG"), true);
 expectBool("#625 source pin: directory destination expands per-source (dstIsDir/emitDst)", classifySrc.includes("const dstIsDir = (dst) => {") && classifySrc.includes("const emitDst = (dst, sources, alsoSources) => {"), true);
 expectBool("#625 source pin: verbTargets receives the site cwd (dir-expansion resolves)", classifySrc.includes("verbTargets(verbBase, i, cwd)") && classifySrc.includes("const verbTargets = (verb, k0, siteCwd) => {"), true);
 expectBool("#625 source pin: fd-prefixed redirects consumed before readWord", classifySrc.includes("if (rk < n && (s[rk] === \">\" || s[rk] === \"<\")) {"), true);
@@ -4351,6 +4351,13 @@ try {
     none("cat 0< tracked.md", "0< is a read, not a write");
     none("cat 1< tracked.md", "1< is a read, not a write");
     none("cat x 2>&1 tracked.md", "2>&1 is a dup, not a write");
+    // #625 review cycle-4: rsync boolean-prefix regression + list mode + scanner escapes + trap
+    has("rsync -a src.md --checksum tracked.md", "rsync:H/tracked.md", "--checksum is a complete boolean option, not --checksum-seed");
+    has("rsync -a src.md --partial tracked.md", "rsync:H/tracked.md", "--partial is boolean, not --partial-dir");
+    has("rsync -a src.md --backup tracked.md", "rsync:H/tracked.md", "--backup is boolean, not --backup-dir");
+    has("rsync -a src.md --group tracked.md", "rsync:H/tracked.md", "--group is boolean, not --groupmap");
+    none("rsync -a tracked.md -v", "single-operand rsync is list-only, not a write");
+    has("truncate -s 0 $(echo \\( ) tracked.md", "truncate:H/tracked.md", "escaped paren inside $( ) does not over-skip");
     // truncate / dd
     has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
     has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");

@@ -4512,7 +4512,8 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       let d = 0, q = null;
       for (let j = j0; j < n; j++) {
         const c = s[j];
-        if (q) { if (c === "\\") { j++; continue; } if (c === q) q = null; continue; }
+        if (c === "\\") { j++; continue; }   // `\(` / `\)` are literals, not nesting (#625 cycle-4 B1)
+        if (q) { if (c === q) q = null; continue; }
         if (c === '"' || c === "'" || c === "`") { q = c; continue; }
         if (c === "(") d++;
         else if (c === ")" && --d === 0) return j + 1;
@@ -4761,21 +4762,53 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // option remains a documented residual — a prev-positional fail-safe was
       // tried and caused false blocks on read-only exports
       // (`rsync -a tracked.md -v /tmp/dst`), so it is gone.
-      const RSYNC_OP_LONG = ["--rsh", "--filter", "--exclude", "--include", "--exclude-from", "--include-from",
-        "--files-from", "--log-file", "--log-file-format", "--temp-dir", "--block-size", "--remote-option",
-        "--partial-dir", "--compare-dest", "--copy-dest", "--link-dest", "--rsync-path", "--chmod", "--chown",
-        "--usermap", "--groupmap", "--timeout", "--out-format", "--suffix", "--max-size", "--min-size",
-        "--bwlimit", "--compress-level", "--skip-compress", "--address", "--port", "--sockopts",
-        "--password-file", "--modify-window", "--checksum-seed", "--backup-dir", "--log-format", "--contimeout",
-        "--stop-after", "--iconv", "--early-input", "--write-batch", "--only-write-batch", "--read-batch",
-        "--protocol", "--compress-choice", "--max-delete", "--max-alloc"];
+      // A full arity table (name → takes a separate operand) for rsync's long
+      // options. Prefix matching MUST consider the BOOLEAN options too: an
+      // operand-only list made `--checksum` (a complete boolean option that
+      // prefixes `--checksum-seed`) consume the destination — a real bypass and
+      // a false block (#625 cycle-4 P1). `null` = ambiguous/unknown → not an
+      // operand (the safe direction for a read).
+      const RSYNC_LONG = [
+        ["--verbose", 0], ["--quiet", 0], ["--no-motd", 0], ["--checksum", 0], ["--archive", 0],
+        ["--recursive", 0], ["--relative", 0], ["--no-implied-dirs", 0], ["--backup", 0], ["--update", 0],
+        ["--inplace", 0], ["--append", 0], ["--append-verify", 0], ["--dirs", 0], ["--old-dirs", 0],
+        ["--mkpath", 0], ["--links", 0], ["--copy-links", 0], ["--copy-unsafe-links", 0], ["--safe-links", 0],
+        ["--munge-links", 0], ["--copy-dirlinks", 0], ["--keep-dirlinks", 0], ["--hard-links", 0],
+        ["--perms", 0], ["--executability", 0], ["--acls", 0], ["--xattrs", 0], ["--chmod", 1],
+        ["--owner", 0], ["--group", 0], ["--devices", 0], ["--specials", 0], ["--times", 0],
+        ["--atimes", 0], ["--open-noatime", 0], ["--omit-dir-times", 0], ["--omit-link-times", 0],
+        ["--super", 0], ["--fake-super", 0], ["--sparse", 0], ["--preallocate", 0], ["--dry-run", 0],
+        ["--whole-file", 0], ["--checksum-choice", 1], ["--one-file-system", 0], ["--block-size", 1],
+        ["--rsh", 1], ["--existing", 0], ["--ignore-existing", 0], ["--remove-source-files", 0],
+        ["--delete", 0], ["--delete-before", 0], ["--delete-during", 0], ["--delete-delay", 0],
+        ["--delete-after", 0], ["--delete-excluded", 0], ["--ignore-errors", 0], ["--force", 0],
+        ["--max-delete", 1], ["--max-size", 1], ["--min-size", 1], ["--max-alloc", 1], ["--partial", 0],
+        ["--partial-dir", 1], ["--backup-dir", 1], ["--checksum-seed", 1], ["--checkpoint-action", 1],
+        ["--copy-devices", 0], ["--write-devices", 0], ["--delay-updates", 0], ["--prune-empty-dirs", 0], ["--numeric-ids", 0],
+        ["--usermap", 1], ["--groupmap", 1], ["--chown", 1], ["--timeout", 1], ["--contimeout", 1],
+        ["--ignore-times", 0], ["--size-only", 0], ["--modify-window", 1], ["--temp-dir", 1], ["--fuzzy", 0],
+        ["--compare-dest", 1], ["--copy-dest", 1], ["--link-dest", 1], ["--compress", 0],
+        ["--compress-choice", 1], ["--compress-level", 1], ["--skip-compress", 1], ["--cvs-exclude", 0],
+        ["--filter", 1], ["--exclude", 1], ["--exclude-from", 1], ["--include", 1], ["--include-from", 1],
+        ["--files-from", 1], ["--from0", 0], ["--protect-args", 0], ["--secluded-args", 0], ["--trust-sender", 0],
+        ["--address", 1], ["--port", 1], ["--sockopts", 1], ["--password-file", 1], ["--early-input", 1],
+        ["--blocking-io", 0], ["--stats", 0], ["--human-readable", 0], ["--progress", 0],
+        ["--itemize-changes", 0], ["--remote-option", 1], ["--out-format", 1], ["--log-file", 1],
+        ["--log-file-format", 1], ["--log-format", 1], ["--list-only", 0], ["--bwlimit", 1],
+        ["--stop-after", 1], ["--fsync", 0], ["--write-batch", 1], ["--only-write-batch", 1],
+        ["--read-batch", 1], ["--protocol", 1], ["--iconv", 1], ["--ipv4", 0], ["--ipv6", 0],
+        ["--version", 0], ["--help", 0], ["--daemon", 0], ["--no-detach", 0], ["--old-args", 0],
+        ["--rsync-path", 1], ["--msgs2stderr", 0],
+      ];
       const RSYNC_OP_SHORT = new Set(["-e", "-f", "-B", "-T", "-M"]);
       const isRsyncOperand = (w) => {
         const eq = w.indexOf("=");
         const name = eq === -1 ? w : w.slice(0, eq);
         if (RSYNC_OP_SHORT.has(name)) return true;
-        if (RSYNC_OP_LONG.includes(name)) return true;
-        return name.length > 2 && RSYNC_OP_LONG.filter((f) => f.startsWith(name)).length === 1;
+        const exact = RSYNC_LONG.find(([nm]) => nm === name);
+        if (exact) return exact[1] === 1;
+        const hits = RSYNC_LONG.filter(([nm]) => nm.startsWith(name));
+        return hits.length === 1 && hits[0][1] === 1;   // ambiguous/unknown → not an operand
       };
       const LN_OPERAND_FLAGS = new Set(["-t", "--target-directory", "-S", "--suffix"]);
       let expectOperand = false;
@@ -4823,6 +4856,9 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (v === "ln" && positionals.length === 1) {
           // `ln TARGET` (2nd form) creates CWD/basename(TARGET) (#625 A1).
           emitDst(siteCwd, [last], false);
+        } else if (v === "rsync" && positionals.length === 1) {
+          // Single-operand rsync is a LIST-only invocation — writes nothing
+          // (#625 cycle-4 B5).
         } else {
           emitDst(last, positionals.slice(0, -1), false);
         }
@@ -5842,9 +5878,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // and chained-spawner routes both re-pend it, so this block was dead code.
     // exec-driven interpreter/tee/script scanning runs via the standard chain.
 
-    if (w0.w === "eval") {
-      // quoted eval ('echo x > f') — the STANDARD form — must recurse on the
-      // UNQUOTED payload; bare eval collects words until a boundary/newline.
+    if (w0.w === "eval" || w0.w === "trap") {
+      // quoted eval/trap ('echo x > f') — the STANDARD form — must recurse on
+      // the UNQUOTED payload; bare eval collects words until a boundary/newline.
+      // `trap` runs its first operand as code in the same shell, so its payload
+      // is walked the same way (#625 cycle-4 B2).
       let k = skipWs(i);
       const qd = s[k] === "'" || s[k] === '"' ? s[k] : null;
       if (qd) {
