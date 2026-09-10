@@ -1,7 +1,105 @@
 #!/usr/bin/env sh
-. "$(dirname -- "$0")/_/husky.sh"
+# husky bootstrap — guarded: hooks are not installed in every checkout (#672,
+# core.hooksPath unset), and this file is also invoked DIRECTLY by
+# scripts/commit-msg-check.test.sh. Sourcing husky.sh unconditionally would
+# make direct invocation fail with "no such file" before the checks below run.
+if [ -f "$(dirname -- "$0")/_/husky.sh" ]; then
+  . "$(dirname -- "$0")/_/husky.sh"
+fi
 
-# Skip if no Node.js tooling (repo is Python — commitlint requires package.json)
-if [ -f package.json ] && command -v npx >/dev/null 2>&1; then
+# ─────────────────────────────────────────────────────────────────────────
+# #668 — heuristic guard against shell-substitution-mangled commit messages.
+#
+# WHY: `git commit -m "…"` and heredocs both pass the message through the
+# shell BEFORE git ever sees it. Inside double quotes, `…` is command
+# substitution, `$VAR`/`$(…)` expand, `${…}` and `{{ }}` break. The
+# substitution usually yields an empty string, so git happily commits a
+# message with a silent hole — e.g. "…which tolerates  — and anchors…" (the
+# backticked span was eaten) or "bash: key: command not found" (the
+# substitution ran). The commit succeeds; only a human reading the log sees
+# the loss, and repairing it after push costs an amend + force-push.
+#
+# DETECTED SIGNATURES (a lost substitution leaves one of these):
+#   1. an ODD number of backticks in the message — an unmatched `…` span was
+#      consumed by the shell; and
+#   2. a doubled space between two non-space characters that is NOT after
+#      sentence-ending punctuation (`.`, `!`, `?`) — the hole the erased
+#      inline-code span leaves behind ("tolerates  — and anchors").
+#
+# WARN-ONLY by default. Both signatures have realistic false positives:
+#   • a message may legitimately contain a lone backtick (odd count), and
+#   • aligned text / code blocks legitimately use runs of spaces
+#     (`name    value`).
+# Rejecting on either would block legitimate commits, so the hit is surfaced
+# and the commit proceeds. `COMMIT_MSG_MANGLE_STRICT=1` makes a hit fatal for
+# operators who want the hard gate. There is no reliable "is an agent"
+# signal inside a commit-msg hook, so the check applies to every committer.
+# ─────────────────────────────────────────────────────────────────────────
+
+commit_msg_mangle_check() {
+  msg_file="${1:-}"
+  [ -n "$msg_file" ] && [ -f "$msg_file" ] || return 0
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/commit-msg-mangle.XXXXXX")" || return 0
+  # Strip CRLF and git comment lines (git's own template is full of backticks
+  # and is not part of the message).
+  sed -e 's/\r$//' "$msg_file" 2>/dev/null | grep -v '^[[:space:]]*#' > "$tmp" 2>/dev/null
+
+  backticks="$(tr -cd '`' < "$tmp" | wc -c | tr -d '[:space:]')"
+  [ -n "$backticks" ] || backticks=0
+  odd_backticks=0
+  if [ $((backticks % 2)) -ne 0 ]; then
+    odd_backticks=1
+  fi
+
+  gaps="$(grep -nE '[^[:space:].!?][[:space:]]{2,}[^[:space:]]' "$tmp" 2>/dev/null || true)"
+
+  if [ "$odd_backticks" -eq 0 ] && [ -z "$gaps" ]; then
+    rm -f "$tmp"
+    return 0
+  fi
+
+  {
+    echo ""
+    echo "⚠️  [commit-msg] Possible shell-substitution mangling in the commit message."
+    if [ "$odd_backticks" -eq 1 ]; then
+      echo "   • unbalanced backticks: $backticks found (an odd count usually means a"
+      echo "     backticked span was eaten by the shell)."
+    fi
+    if [ -n "$gaps" ]; then
+      echo "   • doubled space(s) where inline code should be:"
+      printf '%s\n' "$gaps" | sed 's/^/       /'
+    fi
+    echo ""
+    echo "   A \`git commit -m \"…\"\` message (or a heredoc) passes through the shell first:"
+    echo "   backticked spans run as command substitution, \$VAR/\$(…) expand, \${…} and"
+    echo "   {{ }} break — and the substitution is SILENT, so git just commits the hole."
+    echo "   Always author with:  git commit -F /tmp/commit-msg-<branch>.md"
+    echo ""
+    echo "   Not pushed yet?  Repair it:"
+    echo "       git commit --amend -F /tmp/commit-msg-<branch>.md"
+    echo "   Already pushed and the branch is under review?  Do NOT silently force-push —"
+    echo "   post a correction note on the PR/issue first (a corrected record beats a"
+    echo "   silently rewritten one; this is what went wrong twice while landing #640)."
+    echo ""
+    echo "   (warn-only: set COMMIT_MSG_MANGLE_STRICT=1 to make this fatal)"
+    echo ""
+  } >&2
+
+  rm -f "$tmp"
+
+  if [ "${COMMIT_MSG_MANGLE_STRICT:-0}" = "1" ]; then
+    return 1
+  fi
+  return 0
+}
+
+commit_msg_mangle_check "$1" || exit 1
+
+# Skip if no Node.js tooling (repo is Python — commitlint requires package.json).
+# Guard on an actually-installed local commitlint: a bare `npx --no-install`
+# call errors (and prints) when the package is absent, which would make every
+# commit noisy in repos that have a package.json but no commitlint.
+if [ -f package.json ] && [ -x node_modules/.bin/commitlint ]; then
   npx --no-install -- commitlint --edit "$1"
 fi

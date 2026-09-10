@@ -224,6 +224,16 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
 - **Never use sed for multi-line code changes.**
 - **Never use `git add -A`** — always stage specific files.
 - **Prefer the `edit` tool over `write`** for targeted changes to existing files.
+- **Commit messages: always `git commit -F <file>` — never `-m`, never a heredoc.** Write the
+  message with the `write` tool to `/tmp/commit-msg-<branch>.md`, then
+  `git commit -F /tmp/commit-msg-<branch>.md`. Both `-m "…"` and heredocs pass the message
+  through the shell first — backticked spans run as command substitution, `$VAR`/`$(…)` expand,
+  `${…}`/`{{ }}` break — and the failure is **silent**: the substitution yields an empty string,
+  git accepts the mangled result, and only a human reading the log sees the hole. The
+  `commit-msg` hook warns on the signature (unbalanced backticks, or a doubled space where inline
+  code should be) when husky hooks are installed — do not rely on it running (#672). On a hit:
+  amend **before** pushing; if it is already pushed, post a correction note instead of silently
+  force-pushing. Worked example: `skills/commit-workflow/workflow/02-commit-pr.md`.
 
 ## Tool Quality & Retirement
 
