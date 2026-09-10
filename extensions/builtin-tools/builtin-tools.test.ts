@@ -266,16 +266,32 @@ test("sub-agent env strips inherited ELDATO_SKIP_VGATE / ELDATO_SKIP_REVIEW_GATE
   ok(!/subAgentEnv\.ELDATO_SKIP_REVIEW_GATE\s*=/.test(source), "no line may re-assign ELDATO_SKIP_REVIEW_GATE after the strip");
 });
 
-test("key-specific strip deletes ONLY the two skip vars — a parent-set ALLOW_MAIN_EDITS hatch survives (#285/#617)", () => {
-  // #617: subAgentEnv no longer ASSIGNS the hatch (forced injection removed).
+test("key-specific strip keeps ONLY the two skip vars + the #623 hatch strip — a hatched controller's task children are UNHATCHED by default (#285/#617/#623)", () => {
+  // #617: subAgentEnv never ASSIGNS the hatch in the object literal (forced
+  // injection removed); #623 additionally strips a parent-inherited hatch.
   ok(!/ELDATO_ALLOW_MAIN_EDITS\s*:/.test(source), "no forced ELDATO_ALLOW_MAIN_EDITS assignment in subAgentEnv (#617)");
   ok(!/AGENT_ALLOW_MAIN_EDITS\s*:/.test(source), "no forced AGENT_ALLOW_MAIN_EDITS assignment in subAgentEnv (#617)");
-  // The #285 key-specific strip must delete ONLY the two inherited review-gate
-  // bypass vars — a controller deliberately launched with the hatch (#7470/#7549)
-  // still propagates it via the ...process.env spread; never a prefix sweep.
+  // The #285 key-specific strip deletes the two inherited review-gate bypass
+  // vars; never a prefix sweep.
   ok(/delete subAgentEnv\.ELDATO_SKIP_VGATE/.test(source), "strip deletes ELDATO_SKIP_VGATE (#285)");
   ok(/delete subAgentEnv\.ELDATO_SKIP_REVIEW_GATE/.test(source), "strip deletes ELDATO_SKIP_REVIEW_GATE (#285)");
-  ok(!/delete subAgentEnv\.(?:AGENT|ELDATO)_ALLOW_MAIN_EDITS/.test(source), "strip must NOT delete a parent-inherited ALLOW_MAIN_EDITS hatch (#617)");
+  // #623: the ALLOW_MAIN_EDITS hatch is ALSO deleted (default-strip) — a
+  // controller whose OWN launch env carries the hatch (ambient launcher
+  // contamination) must NOT silently propagate it to its task fleet. The
+  // deletes appear AFTER the ...process.env spread and AFTER the #285 deletes.
+  const spreadIdx = source.indexOf("...process.env");
+  const delVgate = source.indexOf("delete subAgentEnv.ELDATO_SKIP_VGATE");
+  const delHatch = source.indexOf("delete subAgentEnv.AGENT_ALLOW_MAIN_EDITS");
+  const delHatchEldato = source.indexOf("delete subAgentEnv.ELDATO_ALLOW_MAIN_EDITS");
+  ok(delHatch !== -1 && delHatch > spreadIdx && delHatch > delVgate, "delete subAgentEnv.AGENT_ALLOW_MAIN_EDITS must appear AFTER the spread and the #285 strip (#623)");
+  ok(delHatchEldato !== -1 && delHatchEldato > spreadIdx && delHatchEldato > delVgate, "delete subAgentEnv.ELDATO_ALLOW_MAIN_EDITS must appear AFTER the spread and the #285 strip (#623)");
+  // #623 opt-in: re-injection is allowed ONLY under the explicit per-dispatch
+  // allow_main_edits param — never unconditional. The env handshake option was
+  // rejected: a process.env-read opt-in would re-create the fleet hatch.
+  ok(/allow_main_edits\s*:/.test(source), "task tool schema declares the allow_main_edits opt-in param (#623)");
+  ok(source.indexOf("params.allow_main_edits") !== -1, "the opt-in is consumed per-dispatch via params.allow_main_edits (#623)");
+  ok(!/if \(!params\.allow_main_edits\)[\s\S]{0,200}?delete subAgentEnv\.(?:AGENT|ELDATO)_ALLOW_MAIN_EDITS/.test(source), "strip must NOT be skippable by an absent param (default = strip) (#623)");
+  ok(/if \(params\.allow_main_edits\)[\s\S]{0,400}?subAgentEnv\.AGENT_ALLOW_MAIN_EDITS\s*=\s*"1"/.test(source), "opt-in restore is guarded by params.allow_main_edits (#623)");
 });
 
 // ── PATH augmentation (#36) ───────────────────────────

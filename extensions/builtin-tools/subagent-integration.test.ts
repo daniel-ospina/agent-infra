@@ -66,11 +66,10 @@ tests.push(test("subAgentEnv does NOT set ALLOW_MAIN_EDITS (either variant) and 
   // main-worktree-guard as their controller (M4/M2/M3 apply). No forced hatch.
   ok(!/ELDATO_ALLOW_MAIN_EDITS\s*:/.test(block), "no ELDATO_ALLOW_MAIN_EDITS assignment in subAgentEnv (#617)");
   ok(!/AGENT_ALLOW_MAIN_EDITS\s*:/.test(block), "no AGENT_ALLOW_MAIN_EDITS assignment in subAgentEnv (#617)");
-  // #825: VGATE stays ACTIVE for sub-agents — assert the ASSIGNMENT is absent
-  // (comments legitimately mention the name, so bare includes() is not enough).
+  // #823: the block slice (literal only) cannot contain a hatch ASSIGNMENT;
+  // the #623 default-strip lives AFTER the block close (post-spread deletes) —
+  // children are unhatched by default even when the controller env is hatched.
   ok(!/ELDATO_SKIP_VGATE\s*:/.test(block), "no ELDATO_SKIP_VGATE assignment in subAgentEnv (#825)");
-  // Review DISPATCH stays parent-enforced (#825): sub-agents don't run the
-  // parent's review ceremony, so the gate-override flag is set.
   ok(block.includes("SKILL_ENFORCER_DISABLED"), "SKILL_ENFORCER_DISABLED still set for sub-agents");
   ok(block.includes("AGENT_SKIP_REVIEW_GATE"), "AGENT_SKIP_REVIEW_GATE still set for sub-agents");
 }));
@@ -184,6 +183,22 @@ tests.push(test("builtin-tools subAgentEnv deletes inherited ELDATO_SKIP_VGATE/E
   ok(delVgateReview !== -1 && delVgateReview > spreadIdx, "ELDATO_SKIP_REVIEW_GATE delete must sit after the ...process.env spread");
 }));
 
+tests.push(test("builtin-tools subAgentEnv default-strips the ALLOW_MAIN_EDITS hatch after the spread — a hatched controller's fleet is UNHATCHED (#623)", async () => {
+  // #623 (option a): the hatch must NOT propagate from a hatched controller's
+  // env into task children. Both deletes sit after the ...process.env spread
+  // (a pre-spread delete would be overwritten by the inherited value).
+  const src = readFileSync(join(process.cwd(), "extensions", "builtin-tools", "index.ts"), "utf-8");
+  const spreadIdx = src.indexOf("...process.env");
+  const delAgent = src.indexOf("delete subAgentEnv.AGENT_ALLOW_MAIN_EDITS");
+  const delEldato = src.indexOf("delete subAgentEnv.ELDATO_ALLOW_MAIN_EDITS");
+  ok(delAgent !== -1 && delAgent > spreadIdx, "AGENT_ALLOW_MAIN_EDITS delete must sit after the ...process.env spread (#623)");
+  ok(delEldato !== -1 && delEldato > spreadIdx, "ELDATO_ALLOW_MAIN_EDITS delete must sit after the ...process.env spread (#623)");
+  // #623 opt-in: only the explicit per-dispatch allow_main_edits param may
+  // restore the hatch — and only when the controller env actually carries it.
+  ok(/if \(params\.allow_main_edits\)/.test(src), "restore is guarded by the per-dispatch allow_main_edits param (#623)");
+  ok(/process\.env\.AGENT_ALLOW_MAIN_EDITS === "1"[\s\S]{0,200}?subAgentEnv\.AGENT_ALLOW_MAIN_EDITS = "1"/.test(src), "opt-in restores only a hatch the controller env actually carries (#623)");
+}));
+
 tests.push(test("subagent tool child env carries task-sub-agent markers + TASK_HEARTBEAT_DISABLE=1 + AGENT_SKIP_REVIEW_GATE=1, bypass vars stripped (#285 P1-2)", async () => {
   const src = readFileSync(join(process.cwd(), "extensions", "subagent", "index.ts"), "utf-8");
   ok(src.includes('TASK_HEARTBEAT: "1"'), "subagent-tool children must get TASK_HEARTBEAT=1 (task-sub-agent identity, #285 P1-2)");
@@ -192,6 +207,19 @@ tests.push(test("subagent tool child env carries task-sub-agent markers + TASK_H
   ok(src.includes('AGENT_SKIP_REVIEW_GATE: "1"'), "review DISPATCH stays parent-enforced (#825)");
   ok(src.includes("delete childEnv.ELDATO_SKIP_VGATE"), "ELDATO_SKIP_VGATE must be stripped from the subagent-tool child env (#285 Fix A)");
   ok(src.includes("delete childEnv.ELDATO_SKIP_REVIEW_GATE"), "ELDATO_SKIP_REVIEW_GATE must be stripped from the subagent-tool child env (#285 Fix A)");
+  // #623: the hatch must ALSO be default-stripped at this second dispatch
+  // boundary (a hatched controller's subagent-tool children stay unhatched).
+  ok(src.includes("delete childEnv.AGENT_ALLOW_MAIN_EDITS"), "AGENT_ALLOW_MAIN_EDITS must be stripped from the subagent-tool child env (#623)");
+  ok(src.includes("delete childEnv.ELDATO_ALLOW_MAIN_EDITS"), "ELDATO_ALLOW_MAIN_EDITS must be stripped from the subagent-tool child env (#623)");
+  ok(src.includes("allow_main_edits"), "subagent tool exposes the per-dispatch allow_main_edits opt-in (#623)");
+  // #623 escalation guard: the opt-in may re-add a hatch var ONLY when the
+  // controller env ACTUALLY carries it — an unhatched controller must never be
+  // able to hatch a child through this dispatcher. Pin the parent-env guard
+  // directly ON each restore assignment (a bare `if (allowMainEdits)` restore
+  // would silently re-open the unhatched-parent escalation this PR closes).
+  ok(/if \(allowMainEdits\)/.test(src), "subagent-tool restore is gated by the per-dispatch allowMainEdits opt-in (#623)");
+  ok(/if \(process\.env\.AGENT_ALLOW_MAIN_EDITS === "1"\)\s*childEnv\.AGENT_ALLOW_MAIN_EDITS = "1"/.test(src), "subagent-tool AGENT restore requires the controller env to carry the hatch (#623)");
+  ok(/if \(process\.env\.ELDATO_ALLOW_MAIN_EDITS === "1"\)\s*childEnv\.ELDATO_ALLOW_MAIN_EDITS = "1"/.test(src), "subagent-tool ELDATO restore requires the controller env to carry the hatch (#623)");
 }));
 
 runAll(tests);
