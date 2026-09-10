@@ -153,6 +153,16 @@ the predicate is load-bearing:
      `periodEnd` is null or `today < periodEnd`), the one with the **latest `effectiveFrom`** wins. `renderedAt`
      is irrelevant to this key.
   3. If every row for an id is a tombstone, the tombstone row is emitted as-is.
+  4. **Precedence when an id carries both kinds of row (rule 4 exists because the fleet's live default does
+     exactly this).** If an id has **any** tombstone row, that tombstone row **is** the id's rendered row;
+     every other row for that id is **historical-only** — it exists so `render(ts)` can attribute past calls,
+     and it is **never** selected by `renderNow()`. An id therefore renders **exactly one** row, never two. So
+     for `…expires-on-0910`: the tombstone row (which is also its HEAD row) is what renders; the pre-correction
+     `0.22/0.66/0.007` row is historical-only.
+
+  `today` means the **current UTC instant at render time**; `effectiveFrom` and `periodEnd` are full ISO-8601
+  timestamps and the comparisons are timestamp-vs-timestamp (`periodEnd` exclusive). A date-only reading would
+  land the 2026-09-14 re-route up to a day late and would raise on a `date`/`datetime` mismatch in Python.
 
   **`periodEnd` bounds a period; `expiresOn` retires an id.** They are different fields precisely so the
   selection predicate above can be stated without ambiguity. This is the key the **generator** uses and
@@ -467,7 +477,8 @@ rather than renumbered, so earlier review cycles' references stay traceable.)
     `renderedAt` derived as that triple's **first-seen corpus timestamp** and recorded in `note`. The
     concurrent `0.2608/0.7825/0.0083` stamps get **no** competing row — they are an open divergence (§2).
   - 1.2 `render.py`: the **4** rendered surfaces + the 2 assertions + `--check` with the **mode-tagged** assertion
-    table (§3.2) + `--write-in-use-fixture`.
+    table (§3.2) + `--write-in-use-fixture`, **and the creation of
+    `extensions/custom-provider-openrouter/index.test.ts`** (the artifact; #702 owns only its CI invocation).
   - 1.3 id migration: explicit `deepseek-flash` own row; **shipped** `defaultModel` → `deepseek-flash`
     (propagates via `merge_settings`, which is `{**dst, **src}` — there is no separate live edit); **one**
     tombstone — `expiresOn` on `…expires-on-0910` **only** (`deepseek-v4-flash` keeps its own row with
