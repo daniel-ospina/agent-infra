@@ -13,7 +13,7 @@
  *     settle-path sweep reaps the pipe-holding orphan
  *
  * #573 — hermetic via a PATH-shadowing fake `pi` (cut-resume.integration.test.ts
- * precedent): pi 0.84.3 keyless exits fast (~2-6s, stopReason "error") instead
+ * precedent): a keyless pi exits fast (~2-6s, stopReason "error") instead
  * of stalling, so the real pi can never satisfy `elapsed >= 4500` in CI. The
  * fake `pi` is a temp-dir shell script prepended to PATH that simply hangs
  * (sleep 120) — the 5s timeout / external SIGKILL kill it deterministically.

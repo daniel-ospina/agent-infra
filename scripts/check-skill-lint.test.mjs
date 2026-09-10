@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 /**
- * check-skill-lint.test.mjs — CI fixture-regression test for the #254
- * frontmatter validator. No pi import (the dev oracle test owns pi parity).
+ * check-skill-lint.test.mjs — CI suite for the #254 frontmatter validator PLUS
+ * the #637 pi-pin lockstep tripwires (h)/(i)/(j). No pi import (the dev oracle
+ * test owns pi parity). One file, not two: the pin guards ride the suite that
+ * is already wired into the per-PR path (see (j)), so they cannot be left
+ * unwired by accident. Plan alternative F (extracting them into
+ * scripts/check-pi-pin-lockstep.mjs) is the durable fix once the guards keep
+ * growing.
  *
  * Run: node scripts/check-skill-lint.test.mjs
  *
@@ -14,7 +19,21 @@
  *   (e) extraction-edge fixtures (BOM/CRLF/`---abc`/indented-`---`/
  *       missing-closing/empty) — verdict + extraction-mirror assertions
  *   (f) name≠dir with quoted-name regression (quote-aware data)
- *   (g) 121-tree sweep: validator over skills/ → ZERO findings
+ *   (g) 122-tree sweep: validator over skills/ → ZERO findings
+ *   (h) pin lockstep: every extension @earendil-works/pi-* pin == PI_VERSION_PIN,
+ *       and the per-extension pin COUNT matches the expected map (coverage, not
+ *       mere presence)
+ *   (i) mirror version stamps: every <major>.<minor>.<patch> literal in the four
+ *       hand-synced mirror surfaces is PI_VERSION_PIN or a listed dep version,
+ *       with a per-surface stamp-count map (a lost surface OR a dropped stamp
+ *       is red) — the #637 escape class
+ *   (j) per-PR wiring cannot be silently unplugged: ci.yml still triggers on
+ *       `pull_request` with no paths/branches filter, self-calls node-ci.yml at
+ *       @main, binds test-command with EXACTLY the suite invocation (no
+ *       `|| true`), the CALLER `ci:` job and the callee `unit-test` job carry no
+ *       `if:`/`continue-on-error:`, node-ci.yml declares the input, both the job
+ *       and custom-step `if:` are exactly the known-good predicates, and the
+ *       step `run:`s the input
  *
  * Repo-convention harness: node:assert, custom test() with ✅/❌ markers,
  * process.exit(1) on failure (load-gate.test.mjs pattern). Assertion markers
@@ -85,7 +104,7 @@ section("fixture verdict classes match expected");
 
 test(`FIXTURES module loads (${FIXTURES.length} fixtures, pi pin ${PI_VERSION_PIN})`, () => {
   assert.ok(FIXTURES.length >= 100, "matrix should cover every enumerated class");
-  assert.equal(PI_VERSION_PIN, "0.84.3");
+  assert.equal(PI_VERSION_PIN, "0.85.1");
 });
 
 for (const fx of FIXTURES) {
@@ -296,8 +315,8 @@ test("missing continuity directive → P0 mandatory-blocks (Continue following),
   assert.match(r.stdout, /\[P0\] mandatory-blocks: missing 'Continue following the workflow' continuity directive/);
 });
 
-// ── (g) 121-tree sweep — zero false positives ───────────────────────────────
-section("121-tree sweep — zero findings (zero false positives)");
+// ── (g) 122-tree sweep — zero false positives ───────────────────────────────
+section("122-tree sweep — zero findings (zero false positives)");
 
 test(`validator over ${SKILLS_DIR} → zero findings`, () => {
   assert.ok(fs.existsSync(SKILLS_DIR), "skills tree exists");
@@ -311,7 +330,7 @@ test(`validator over ${SKILLS_DIR} → zero findings`, () => {
     }
   };
   walk(SKILLS_DIR);
-  assert.ok(files.length >= 120, `expected the 121-file corpus, found ${files.length}`);
+  assert.ok(files.length >= 122, `expected the 122-file corpus, found ${files.length}`);
   const offenders = [];
   for (const f of files) {
     const r = validateFrontmatter(fs.readFileSync(f, "utf8"));
@@ -325,6 +344,428 @@ test("CLI over the live tree → '0 issue(s). Clean.' exit 0", () => {
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /0 issue\(s\)\./);
   assert.match(r.stdout, /Clean\./);
+});
+
+// ── (h) pin lockstep (#640 review) ──────────────────────────────────────────
+// The pi runtime version is hand-synced across PI_VERSION_PIN + every extension
+// pi-package pin; before this tripwire nothing asserted they agree, so a partial
+// bump (fixtures updated, one package.json missed) stayed CI-green. Guard the
+// CLASS, not just this instance: every @earendil-works/pi-* pin under
+// extensions/*/package.json — in `dependencies` OR `devDependencies` OR
+// `peerDependencies` / `optionalDependencies` / `overrides` / `resolutions` (a
+// plugin runtime pinned in peerDependencies drifts just as silently) — must
+// equal PI_VERSION_PIN, and the per-extension PIN COUNT must match the
+// expected map (a bare `matched > 0` presence check stayed green when coverage
+// collapsed 6 pins → 1, i.e. the guard silently weakened).
+//
+// Known scope bound: this reads the direct extensions/*/package.json manifests
+// only. A nested package.json (e.g. extensions/*/vendor/package.json) and a
+// repo-root manifest are NOT walked — see #643.
+const PIN_FIELDS = [
+  "dependencies",
+  "devDependencies",
+  "peerDependencies",
+  "optionalDependencies",
+  "overrides",
+  "resolutions",
+];
+section("extension pi-package pins lockstep with PI_VERSION_PIN");
+
+test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN", () => {
+  const extDir = path.join(REPO_ROOT, "extensions");
+  const offenders = [];
+  const pinCounts = {};
+  for (const entry of fs.readdirSync(extDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const pkgPath = path.join(extDir, entry.name, "package.json");
+    if (!fs.existsSync(pkgPath)) continue;
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    let hits = 0;
+    for (const field of PIN_FIELDS) {
+      for (const [name, ver] of Object.entries(pkg[field] ?? {})) {
+        if (!name.startsWith("@earendil-works/pi-")) continue;
+        hits++;
+        if (ver !== PI_VERSION_PIN) {
+          offenders.push(`extensions/${entry.name}/package.json (${field}): ${name}@${ver}`);
+        }
+      }
+    }
+    if (hits > 0) pinCounts[entry.name] = hits;
+  }
+  // Counts, not just a name roster: the roster alone stayed green when 3 of
+  // subagent's 4 pins were deleted (6 pins → 3). Assert the full map so both a
+  // lost extension and a lost pin within an extension are red. Update
+  // deliberately when the pi-package-pinning set changes.
+  assert.deepEqual(
+    pinCounts,
+    { "review-enforcer": 1, subagent: 4, "verification-gate": 1 },
+    "the set (or per-extension count) of @earendil-works/pi-* pins changed — the " +
+      "tripwire's coverage moved (update this map only after confirming every pin " +
+      "is pinned to PI_VERSION_PIN)"
+  );
+  assert.equal(
+    offenders.length,
+    0,
+    `pin drift vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
+  );
+});
+
+// ── (i) mirror provenance stamps (#637 escape class) ───────────────────────
+// The 2026-08-10 escape was a hand-synced *provenance stamp*, not a pin:
+// docs/providers.md and extensions/custom-provider-qwen/index.ts asserted verification against a pi
+// release the repo had already moved past while PI_VERSION_PIN had moved on, and the claim stayed
+// wrong for 12 days. (h) cannot see those files.
+//
+// Guard the whole stamp SET, not a phrase. A per-file phrase pattern was tried first and missed 2 of
+// the 5 pi stamps (frontmatter-validate's "probe pi X" and ci-main's "devDep pinned X") — the same
+// silent-staleness class this guard exists to close. Instead: every `<major>.<minor>.<patch>` literal
+// in these four hand-synced surfaces must be either PI_VERSION_PIN or a listed non-pi dependency
+// version, and each surface's stamp COUNT must match an expected map so a wholesale rewording OR a
+// single dropped stamp is red (a bare `≥1 per file` presence check, like the `matched > 0` variant
+// retired in (h), stayed green when a surface lost one of three).
+//
+// Known scope bounds: 3-component literals only (a `pi 0.86` stamp is invisible), the allowlist is
+// keyed by version STRING rather than occurrence, and version-specific LINE REFERENCES are
+// deliberately not asserted — they move within a version and must be re-derived by hand (see #651).
+section("mirror version stamps match PI_VERSION_PIN");
+
+test("every version literal in the mirror surfaces is the pin or a listed dep version", () => {
+  const MIRRORS = [
+    "docs/providers.md",
+    "extensions/custom-provider-qwen/index.ts",
+    "scripts/frontmatter-validate.mjs",
+    ".github/workflows/ci-main.yml",
+  ];
+  // Non-pi dependency versions legitimately quoted in a surface (so they are not
+  // mistaken for stamps). Adding an entry here is a deliberate, reviewed act.
+  const ALLOWED_NON_PI = {
+    "scripts/frontmatter-validate.mjs": ["2.9.0"], // yaml
+    "docs/providers.md": ["8.9.0"], // undici
+  };
+  const offenders = [];
+  const stampCounts = {};
+  for (const file of MIRRORS) {
+    const src = fs.readFileSync(path.join(REPO_ROOT, file), "utf8");
+    const allowed = ALLOWED_NON_PI[file] ?? [];
+    const stamps = [...src.matchAll(/\d+\.\d+\.\d+/g)]
+      .map((m) => m[0])
+      .filter((v) => !allowed.includes(v));
+    stampCounts[file] = stamps.length;
+    for (const v of stamps) if (v !== PI_VERSION_PIN) offenders.push(`${file}: ${v}`);
+  }
+  // Counts, not just presence: a `≥1 per file` check stayed green when
+  // frontmatter-validate.mjs lost one of its 3 stamps. Update deliberately.
+  assert.deepEqual(
+    stampCounts,
+    {
+      "docs/providers.md": 1,
+      "extensions/custom-provider-qwen/index.ts": 1,
+      "scripts/frontmatter-validate.mjs": 3,
+      ".github/workflows/ci-main.yml": 2,
+    },
+    "the set (or per-surface count) of version stamps changed — the tripwire's " +
+      "coverage moved, or a stamp was silently dropped (update this map only after " +
+      "confirming every stamp is PI_VERSION_PIN)"
+  );
+  assert.deepEqual(
+    offenders,
+    [],
+    `stale version stamps vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
+  );
+});
+
+// ── (j) per-PR wiring is not silently unplugged ────────────────────────────
+// #637 wires the suite into the PR path with `with: test-command:` → the reusable node-ci.yml, whose
+// unit-test job is SKIPPED when that input is empty. The silently-green paths guarded here are:
+//   (1) the `with:` binding on the node-ci.yml call is removed or emptied — the input falls back to
+//       '', the job's `if:` is false, and every PR is green with zero pin check;
+//   (2) the `unit-test` job or its activation predicate stops consuming `inputs.test-command`;
+//   (3) an added conjunct makes a predicate unsatisfiable (`&& false`, or a push-only event guard on a
+//       pull_request-only workflow) — the predicate is present but the job never runs;
+//   (4) the step runs the input but swallows its failure (`|| true`, `continue-on-error: true`), so
+//       the job is green even when the suite fails; and
+//   (5) the CALLER job gets its own `if:`/`continue-on-error:` — the most natural way to "temporarily"
+//       disable a workflow, and invisible to a callee-only check; and
+//   (6) the WORKFLOW TRIGGER gains a filter, or stops being `pull_request` — the outermost bypass:
+//       the job block is never evaluated, so every job-level guard above stays green while the gate
+//       is skipped for exactly the PRs it guards (`paths-ignore: ['extensions/**']`).
+// The `test-command` value must be EXACTLY the suite invocation: a `|| true` suffix would leave every
+// assertion in this file passing while the gate can never go red.
+// NOT guarded: a typo'd/renamed input name fails LOUDLY on GitHub (undeclared workflow_call inputs
+// are rejected), and the callee read here is the BRANCH-LOCAL node-ci.yml while ci.yml executes @main
+// — so a main-side change to a stale branch is invisible. The real proof of the @main binding is the
+// live per-PR run (plan Verification step 4: `ci / unit-test` must show "run", not "skipping").
+section("per-PR pin gate is wired (not silently skipped)");
+
+const EXPECTED_TEST_COMMAND = "node scripts/check-skill-lint.test.mjs";
+// Anchored to a real `uses:` ENTRY: an unanchored substring match is satisfied by a decoy elsewhere
+// on a line (`name: "uses: …/node-ci.yml@main"`), leaving `uses:` pointed at another workflow.
+const SELF_CALLER_RE = /^\s+uses\s*:\s*\S*\/\.github\/workflows\/node-ci\.yml@main\s*$/m;
+
+// ── YAML normalization ─────────────────────────────────────────────────────
+// These guards read YAML as text, so they must be insensitive to the syntactic freedom YAML grants —
+// otherwise the gate is defeated (or the guard false-REDs) by semantics-preserving edits. Both were
+// reproduced during review:
+//   GREEN while unplugged: `"paths-ignore":` / `'paths-ignore':` (quoted keys), `continue-on-error :`
+//     and `if : false` (space before the colon), `run: ${{ inputs.test-command }} || true`, and a
+//     decoy `# historical: run: ${{ … }}` comment line carrying the match.
+//   RED on healthy files: trailing comments on `uses:`/`test-command:`/`on:`/`jobs:`/`pull_request:`/
+//     the callee `if:`s, and a quoted `test-command: "node …"` scalar.
+
+// Drop a trailing `# …` comment, respecting quotes. A `#` only starts a comment when preceded by
+// whitespace (YAML rule) and outside a quoted scalar.
+function stripComment(line) {
+  let q = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) {
+      if (c === q) q = null;
+    } else if (c === '"' || c === "'") {
+      q = c;
+    } else if (c === "#" && i > 0 && /\s/.test(line[i - 1])) {
+      return line.slice(0, i).replace(/\s+$/, "");
+    }
+  }
+  return line;
+}
+
+// Normalize a workflow for structural matching: drop full-line comments, strip trailing comments, and
+// dequote keys (`"paths-ignore":` → `paths-ignore:`). Values are left alone.
+function normYaml(src) {
+  return src
+    .split("\n")
+    .map((l) => (/^\s*#/.test(l) ? "" : stripComment(l)))
+    .map((l) => l.replace(/^(\s+(?:-\s+)?)(["'])([A-Za-z_][A-Za-z0-9_-]*)\2(\s*:)/, "$1$3$4"))
+    .join("\n");
+}
+
+// A key at any indent (and as a sequence item), tolerating `key :` spacing.
+function keyRe(name, indent = "\\s+") {
+  return new RegExp(`^${indent}(?:-\\s+)?${name}\\s*:`, "m");
+}
+
+// Unquote a scalar value (`"node x"` / `'node x'` → `node x`).
+function unquote(v) {
+  return v.replace(/^(["'])(.*)\1$/, "$2").trim();
+}
+
+// Slice a top-level job's block out of a workflow: from its 2-space-indented key to the next such key.
+// The key charset deliberately excludes `#` and `:` so a 2-space-indented COMMENT ending in a colon
+// (legal YAML, used throughout these workflows) cannot be mistaken for the next job — which would
+// truncate the block and produce a false RED with a misleading message.
+function jobBlockOf(workflowLines, jobName) {
+  // Only job keys AFTER the top-level `jobs:` mapping count. A 2-space-indented `ci:` inside an
+  // EARLIER block scalar (e.g. `run-name: |`) is textually indistinguishable from a job key and would
+  // be found FIRST — the guard would then validate the decoy and never see the real job. Reproduced
+  // during review: an injected `ci:` in a block scalar left the gate unplugged at 163/163.
+  const jobsIdx = workflowLines.findIndex((l) => /^jobs\s*:\s*$/.test(l));
+  assert.ok(jobsIdx >= 0, "workflow no longer declares a top-level `jobs:` mapping");
+  // Derive the job-key indent from the mapping's first entry rather than hard-coding 2 spaces: a
+  // whole-file reindent is valid YAML, and a hard-coded indent would report "no such job" for a
+  // workflow whose jobs are all present.
+  const firstJob = workflowLines.slice(jobsIdx + 1).find((l) => l.trim() !== "");
+  const jobIndent = firstJob.match(/^\s*/)[0].length;
+  const jobKeyRe = new RegExp(`^ {${jobIndent}}[A-Za-z_][A-Za-z0-9_-]*\\s*:\\s*$`);
+  const keyIdx = [];
+  for (let i = jobsIdx + 1; i < workflowLines.length; i++) {
+    if (jobKeyRe.test(workflowLines[i])) keyIdx.push(i);
+  }
+  // Compare on the normalized key (`ci :` is valid YAML for the key `ci`).
+  const start = keyIdx.find(
+    (i) => workflowLines[i].trim().replace(/\s*:\s*$/, "") === jobName
+  );
+  assert.ok(
+    start !== undefined,
+    `workflow no longer defines a \`${jobName}:\` job in its \`jobs:\` mapping`
+  );
+  const next = keyIdx.find((i) => i > start);
+  return workflowLines.slice(start, next ?? workflowLines.length).join("\n");
+}
+
+test("ci.yml binds a non-empty test-command that node-ci.yml declares and consumes", () => {
+  const caller = normYaml(
+    fs.readFileSync(path.join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8")
+  );
+  const callee = normYaml(
+    fs.readFileSync(path.join(REPO_ROOT, ".github", "workflows", "node-ci.yml"), "utf8")
+  );
+  const callerLines = caller.split("\n");
+  // The ref is asserted, not globbed: the guard reads the BRANCH-LOCAL node-ci.yml while the live run
+  // resolves the callee FROM this ref, so `@main` is a locked decision (D2), not an incidental value.
+  assert.ok(
+    callerLines.some((l) => SELF_CALLER_RE.test(l)),
+    "ci.yml no longer calls the node-ci.yml reusable workflow at @main"
+  );
+  // Trigger guard FIRST: the outermost bypass is `on:` itself. `pull_request.paths-ignore` (or
+  // `paths`/`branches` filters, or switching to workflow_dispatch) skips the whole run for exactly the
+  // PRs this gate exists to catch, and the job block below is never evaluated — so every other
+  // assertion in this test stays green. Verified: adding paths-ignore left the suite at 163/163.
+  const onIdx = callerLines.findIndex((l) => /^on\s*:\s*$/.test(l));
+  assert.ok(onIdx >= 0, "ci.yml no longer declares a top-level `on:` trigger");
+  const jobsIdx = callerLines.findIndex((l) => /^jobs\s*:\s*$/.test(l));
+  assert.ok(jobsIdx > onIdx, "ci.yml must declare `on:` before `jobs:`");
+  const triggerBlock = callerLines.slice(onIdx, jobsIdx).join("\n");
+  assert.match(
+    triggerBlock,
+    /^  pull_request\s*:\s*$/m,
+    "ci.yml must still run on `pull_request` — otherwise the per-PR pin gate never fires"
+  );
+  // Scope the filter check to the `pull_request:` SUB-block: over the whole trigger block, an
+  // unrelated key (`workflow_dispatch.inputs.paths:`) would false-RED. A flow-mapped
+  // `pull_request: {paths-ignore: […]}` needs no flow-aware matcher here — it removes the bare
+  // `pull_request:` line, so the assertion above already fails closed.
+  const prLines = [];
+  for (let i = onIdx + 1; i < jobsIdx; i++) {
+    const l = callerLines[i];
+    if (l.trim() === "") continue;
+    if (/^  \S/.test(l)) {
+      if (!/^  pull_request\s*:\s*$/.test(l) && prLines.length) break;
+      if (/^  pull_request\s*:\s*$/.test(l)) { prLines.push(l); continue; }
+      if (!prLines.length) continue;
+      break;
+    }
+    if (prLines.length) prLines.push(l);
+  }
+  const prBlock = prLines.join("\n");
+  for (const filter of ["paths", "paths-ignore", "branches", "branches-ignore", "types"]) {
+    assert.ok(
+      !keyRe(filter).test(prBlock),
+      `ci.yml's \`pull_request:\` gained \`${filter}:\` — \`paths-ignore: ['extensions/**']\` would ` +
+        "skip the per-PR pin gate for exactly the PRs it guards (#637)"
+    );
+  }
+  // Scope to the CALLER JOB block (not a fixed line window, which false-REDs as soon as a comment
+  // block is inserted before the binding — and reports it as a missing binding).
+  const callerJob = normYaml(jobBlockOf(callerLines, "ci"));
+  assert.ok(
+    SELF_CALLER_RE.test(callerJob),
+    "the `ci:` job block in ci.yml no longer calls the node-ci.yml reusable workflow at @main"
+  );
+  // A caller-level `if:`/`continue-on-error:` skips or excuses the whole call with the callee
+  // untouched — the reuse-workflow equivalent of unplugging the gate.
+  assert.ok(
+    !keyRe("if").test(callerJob),
+    "the `ci:` job in ci.yml gained an `if:` — that can skip the reusable-workflow call " +
+      "entirely (e.g. on pull_request), leaving every PR green with zero pin check"
+  );
+  assert.ok(
+    !keyRe("continue-on-error").test(callerJob),
+    "the `ci:` job in ci.yml gained `continue-on-error:` — the pin gate could fail silently"
+  );
+  // A dependent job is skipped when a needed job is skipped, so `needs:` on the gate job unplugs it
+  // just as effectively as an `if:`.
+  assert.ok(
+    !keyRe("needs").test(callerJob),
+    "the `ci:` job in ci.yml gained `needs:` — a skipped dependency skips this job too, " +
+      "silently unplugging the pin gate"
+  );
+  // The binding must be inside the job's `with:` MAPPING. Indentation alone is not enough: a job-level
+  // block scalar at the same indent (`name: |` with a 6-space body) also yields a 6-space
+  // `test-command:` line, and `find()` would return that decoy first — leaving the real input set to
+  // `… || true` while the guard read the decoy. Reproduced GREEN at 163/163 on a valid, actionlint-clean
+  // workflow, so the `with:` mapping is collected and asserted by key set.
+  const callerJobLines = callerJob.split("\n");
+  const withIdx = callerJobLines.findIndex((l) => /^ {4}with\s*:\s*$/.test(l));
+  assert.ok(
+    withIdx >= 0,
+    "the `ci:` job in ci.yml no longer passes a `with:` mapping to the node-ci.yml reusable workflow"
+  );
+  const withIndent = callerJobLines[withIdx].match(/^\s*/)[0].length;
+  const withLines = [];
+  for (let i = withIdx + 1; i < callerJobLines.length; i++) {
+    const l = callerJobLines[i];
+    if (l.trim() === "") continue;
+    if (l.match(/^\s*/)[0].length <= withIndent) break; // dedented out of the mapping
+    withLines.push(l);
+  }
+  // Derive the child indent from the mapping's own entries — hard-coding 6 spaces would report a
+  // "key set changed" for a correctly-reindented workflow.
+  const childIndent = Math.min(...withLines.map((l) => l.match(/^\s*/)[0].length));
+  const childKeyRe = new RegExp(`^ {${childIndent}}([A-Za-z_][A-Za-z0-9_-]*)\\s*:`);
+  assert.deepEqual(
+    withLines
+      .map((l) => l.match(childKeyRe))
+      .filter(Boolean)
+      .map((m) => m[1]),
+    ["test-command"],
+    "the `ci:` job's `with:` key set changed — the pin gate's only input is `test-command` " +
+      "(update deliberately, after confirming the suite still runs per-PR)"
+  );
+  const binding = withLines.find((l) =>
+    new RegExp(`^ {${childIndent}}test-command\\s*:\\s*\\S`).test(l)
+  );
+  assert.ok(
+    binding && unquote(binding.replace(/^\s*test-command\s*:\s*/, "")) !== "",
+    "the node-ci.yml call in ci.yml no longer passes a non-empty `test-command` — the " +
+      "input would fall back to '' and the unit-test job would be silently skipped"
+  );
+  const cmd = unquote(binding.replace(/^\s*test-command\s*:\s*/, ""));
+  assert.equal(
+    cmd,
+    EXPECTED_TEST_COMMAND,
+    "ci.yml `test-command` must be exactly \"" +
+      EXPECTED_TEST_COMMAND +
+      "\" — a suffix or shell wrapper (e.g. `|| true`) leaves the job green even " +
+      `when the suite fails: ${cmd}`
+  );
+  assert.ok(
+    keyRe("test-command").test(callee),
+    "node-ci.yml no longer declares a `test-command` workflow_call input — the " +
+      "caller's binding would be ignored and the unit-test job skipped"
+  );
+  // The callee's `unit-test` job, scoped the same way (see jobBlockOf).
+  const jobBlock = normYaml(jobBlockOf(callee.split("\n"), "unit-test"));
+  assert.ok(
+    !keyRe("continue-on-error").test(jobBlock),
+    "the `unit-test` job (or its custom-test step) gained `continue-on-error:` — the suite " +
+      "could fail while the job reports success"
+  );
+  assert.ok(
+    !keyRe("needs").test(jobBlock),
+    "the `unit-test` job gained `needs:` — a skipped dependency skips the gate"
+  );
+  // The step bodies must be EXACTLY the two known ones. Asserting "some line matches" lets a dead
+  // second step (`- if: false` carrying `run: ${{ inputs.test-command }}`) satisfy the step `if:` and
+  // `run:` checks while the real step keeps `|| true` — reproduced at 163/163 during review.
+  assert.deepEqual(
+    jobBlock
+      .split("\n")
+      .filter((l) => /^\s{8}run\s*:/.test(l))
+      .map((l) => l.trim())
+      .sort(),
+    [
+      "run: ${{ inputs.test-command }}",
+      "run: node --test ${{ inputs.test-glob }}",
+    ].sort(),
+    "the `unit-test` job's step-level `run:` set changed — either the gate's step was altered or a " +
+      "new step was added (update this list deliberately, after confirming the suite still runs)"
+  );
+  // BOTH predicates must consume the input, and EXACTLY in the known-good shape.
+  // A conjunct that can never hold (`if: inputs.test-command != '' && false`, or
+  // `&& github.event_name == 'push'` on a pull_request-only workflow) leaves the
+  // counts intact while the job never runs, so presence alone is not enough.
+  assert.match(
+    jobBlock,
+    /^\s{4}if:\s*inputs\.test-command != '' \|\| inputs\.test-glob != ''\s*$/m,
+    "the `unit-test` JOB's activation predicate must be exactly " +
+      "`inputs.test-command != '' || inputs.test-glob != ''` — an added conjunct can " +
+      "make the job unsatisfiable while every check stays green"
+  );
+  assert.match(
+    jobBlock,
+    /^\s{8}if:\s*inputs\.test-command != ''\s*$/m,
+    "the custom-test STEP's `if:` must be exactly `inputs.test-command != ''` — " +
+      "otherwise the step can be skipped silently"
+  );
+  // And the step must actually RUN the input, not just be guarded by it — anchored to the step's own
+  // indentation and end-of-line, so `run: ${{ inputs.test-command }} || true` (swallows the failure)
+  // and a decoy `# historical: run: ${{ … }}` comment line (satisfies an unanchored match) are RED.
+  assert.match(
+    jobBlock,
+    /^\s{8}run:\s*\$\{\{\s*inputs\.test-command\s*\}\}\s*$/m,
+    "the custom-test step must run exactly `${{ inputs.test-command }}` — otherwise the job " +
+      "reports green without executing the suite, or runs it and swallows the failure"
+  );
 });
 
 console.log(`\ncheck-skill-lint.test.mjs: ${passed} passed, ${failed} failed`);

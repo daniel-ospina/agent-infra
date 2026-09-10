@@ -7,7 +7,7 @@
  * matches the returned result.
  *
  * #574 — hermetic via a PATH-shadowing fake `pi` (the #573
- * timeout-integration.test.ts pattern): pi 0.84.3 keyless exits fast (~2-6s,
+ * timeout-integration.test.ts pattern): a keyless pi exits fast (~2-6s,
  * stopReason "error") instead of stalling, so a real pi can never satisfy the
  * timeout-path assertion hermetic. The fake `pi` is a temp-dir shell script
  * prepended to PATH that hangs (sleep 120) — the 5s task timeout kills it

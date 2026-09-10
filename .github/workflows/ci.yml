@@ -7,6 +7,12 @@ name: CI
 on:
   pull_request:
 
+# #637 — the per-PR pin gate below adds one runner per PR; cancel superseded
+# runs so rapid pushes don't queue (ci.yml header budget note).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci:
     # node-ci.yml is a real committed file (materialized via
@@ -15,6 +21,17 @@ jobs:
     # no tag-before-merge problem).
     uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
     secrets: inherit
+    with:
+      # #637 — the pin-lockstep tripwire (check-skill-lint.test.mjs sections
+      # (h)/(i)/(j)) was enforced only by the post-merge ci-main.yml leg, so a
+      # partial pin bump — PI_VERSION_PIN moved, one extensions/*/package.json
+      # pin missed — would have merged before any gate read it. Run the suite
+      # per-PR so pin drift reports on the PR that introduces it. The suite is
+      # node-stdlib-only (no npm ci, no extension devDeps): ~4s of work plus one
+      # ubuntu-latest runner per PR.
+      # NOTE: this makes the check CI-VISIBLE on every PR, not merge-blocking —
+      # the repo's only required status check is pipeline-compliance (#646).
+      test-command: node scripts/check-skill-lint.test.mjs
 
   drift-check:
     # #305 — self-test of the drift-check CI gate. agent-infra's own checkout
