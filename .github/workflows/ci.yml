@@ -22,20 +22,26 @@ jobs:
     uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
     secrets: inherit
     with:
-      # #637 — the pin-lockstep tripwire (check-skill-lint.test.mjs sections
-      # (h)/(i)/(j)) was enforced only by the post-merge ci-main.yml leg, so a
-      # partial pin bump — PI_VERSION_PIN moved, one extensions/*/package.json
-      # pin missed — would have merged before any gate read it. Run the suite
-      # per-PR so pin drift reports on the PR that introduces it. The suite is
-      # node-stdlib-only (no npm ci, no extension devDeps): ~4s of work plus one
-      # ubuntu-latest runner per PR.
-      # NOTE: this makes the check CI-VISIBLE on every PR, not merge-blocking —
+      # #637 — the pin-lockstep tripwires ((h) pin lockstep, (i) mirror
+      # version stamps, (j) this wiring) were enforced only by the post-merge
+      # ci-main.yml leg, so a partial pin bump — PI_VERSION_PIN moved, one
+      # extensions/*/package.json pin missed — would have merged before any gate
+      # read it. Run the suites per-PR so pin drift reports on the PR that
+      # introduces it. Both suites are node-stdlib-only (no npm ci, no extension
+      # devDeps): ~4s of work plus one ubuntu-latest runner per PR.
+      # #666 split the pin guards into their own suite (scripts/
+      # check-pi-pin-lockstep.mjs) so a pin-drift failure and a #254 frontmatter
+      # regression get separate red signals; both are chained here so the split
+      # cannot leave the pin guards unwired by accident. `&&` (not a second
+      # input) keeps the `with:` key set at exactly one input — guard (j)
+      # asserts both the key set and this exact command string.
+      # NOTE: this makes the checks CI-VISIBLE on every PR, not merge-blocking —
       # the repo's only required status check is pipeline-compliance (#646).
-      # ⚠️ This value is PINNED by check-skill-lint.test.mjs (section j):
-      # it must be EXACTLY this invocation — a suffix or shell wrapper fails the
-      # pin gate. The #744 module-load suite therefore runs as its own step in
-      # the `verify` job below, not here.
-      test-command: node scripts/check-skill-lint.test.mjs
+      # ⚠️ This value is PINNED by check-pi-pin-lockstep.mjs (guard (j)): it must
+      # be EXACTLY this invocation — a suffix or shell wrapper fails the pin
+      # gate. The #744 module-load suite therefore runs as its own step in the
+      # `verify` job below, not here.
+      test-command: node scripts/check-skill-lint.test.mjs && node scripts/check-pi-pin-lockstep.mjs
 
   drift-check:
     # #305 — self-test of the drift-check CI gate. agent-infra's own checkout
