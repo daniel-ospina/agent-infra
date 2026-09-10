@@ -74,7 +74,8 @@ block() { echo "  ❌ $1"; BLOCKS=$((BLOCKS + 1)); }
 # `provider/` and `~provider/` prefixes) and flags deepseek-served family ids
 # (canonical `deepseek-flash`, its `deepseek-v4-flash` legacy alias, and the
 # `deepseek-v4-pro` / future bare `deepseek-pro` family — every variant: dotted
-# `v4.1` ids, -0731, -vision-exp, -0813, -latest, :batch. Deliberately NOT
+# `v4.1` ids, -0731, -vision-exp, -0813, -latest, and any `:`-suffixed routing
+# shape (e.g. the `:batch` control in the fixture suite). Deliberately NOT
 # matched: non-family ids such as `deepseek-proxy` / `deepseek-flashlight`)
 # whose effective contextWindow exceeds CLAMP. Emits one
 # `id contextWindow=N` line per violation; PARSE_ERROR line + exit 1 on

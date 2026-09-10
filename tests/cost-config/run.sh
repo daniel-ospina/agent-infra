@@ -5,9 +5,10 @@
 #   1. clean fixture (deepseek ids @300K clamp)    → PASS (exit 0)
 #   2. models.json drift (deepseek id > 300K)      → BLOCK (exit 1)
 #      (positive controls: the v4-pro family, the legacy v4-flash alias, the
-#      canonical deepseek-flash id + its bare `deepseek-pro` counterpart,
-#      dotted deepseek-v4.1 ids, `:batch` terminators; negative controls:
-#      deepseek-proxy / deepseek-flashlight — V4.1 Flash adoption 2026-09-10)
+#      canonical deepseek-flash id + its future bare `deepseek-pro`
+#      counterpart, dotted deepseek-v4.1 ids, provider-suffixed `:` shapes;
+#      negative controls: deepseek-proxy / deepseek-flashlight — V4.1 Flash
+#      adoption 2026-09-10)
 #   3. models-store.json drift                     → WARN (exit 0, DETECTED —
 #      catalog class must not fail sync; the weekly report + tripwire alert)
 #      (also: matcher negatives kimi-k3 + deepseek-chat-v3.2 never flagged;
@@ -35,6 +36,10 @@
 #      three config files) and the four backdoor trees whose defect lives
 #      outside models.json keep clean's models.json → parity pin so the #630
 #      review's mirror invariant cannot rot silently.
+#  14. fixture invariants: each backdoor tree differs from clean in exactly
+#      its one documented defect (bounded delta), and the near-miss negative
+#      controls are PRESENT in the fixtures — so an absence assertion can
+#      never become vacuous.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -90,6 +95,7 @@ echo "2. models.json drift (deepseek id at 1M) → BLOCK, exit 1"
 run_guard 1 "backdoor-models" --live-dir "$FIX/backdoor-models"
 if grep -q "BLOCK-level violation" "$OUT"; then pass "BLOCK summary present"; else fail "expected BLOCK summary"; tail -20 "$OUT"; fi
 if grep -q "deepseek-v4-pro contextWindow=1000000" "$OUT"; then pass "deepseek-v4-pro flagged"; else fail "deepseek-v4-pro not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-v4-flash contextWindow=1000000" "$OUT"; then pass "legacy v4-flash alias flagged"; else fail "legacy v4-flash alias not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-flash contextWindow=1000000" "$OUT"; then pass "canonical deepseek-flash flagged"; else fail "canonical deepseek-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash contextWindow=1000000" "$OUT"; then pass "dotted v4.1 family flagged"; else fail "deepseek-v4.1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash-expires-on-0910 contextWindow=1000000" "$OUT"; then pass "dotted beta id flagged"; else fail "dotted beta id not flagged"; sed -n '1,30p' "$OUT"; fi
@@ -135,6 +141,7 @@ echo "8. MINIFIED models.json (1M backdoor) → BLOCK, exit 1 (P1 regression pin
 run_guard 1 "backdoor-minified" --live-dir "$FIX/backdoor-minified"
 if grep -q "BLOCK-level violation" "$OUT"; then pass "BLOCK summary present"; else fail "expected BLOCK summary"; tail -20 "$OUT"; fi
 if grep -q "deepseek-v4-pro contextWindow=1000000" "$OUT"; then pass "minified deepseek-v4-pro flagged"; else fail "minified deepseek-v4-pro not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-v4-flash contextWindow=1000000" "$OUT"; then pass "minified legacy v4-flash alias flagged"; else fail "minified legacy v4-flash alias not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-flash contextWindow=1000000" "$OUT"; then pass "minified canonical deepseek-flash flagged"; else fail "minified canonical deepseek-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash contextWindow=1000000" "$OUT"; then pass "minified dotted v4.1 family flagged"; else fail "minified deepseek-v4.1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash-expires-on-0910 contextWindow=1000000" "$OUT"; then pass "minified dotted beta id flagged"; else fail "minified dotted beta id not flagged"; sed -n '1,30p' "$OUT"; fi
@@ -199,6 +206,97 @@ sys.exit(0 if json.load(open(sys.argv[1])) == json.load(open(sys.argv[2])) else 
 PY
   if [ $? -eq 0 ]; then pass "$d models.json untouched (its defect lives elsewhere)"; else fail "$d models.json drifted from clean — its one injected defect must live in settings.json/models-store.json"; fi
 done
+
+echo ""
+echo "14. fixture invariants: bounded per-tree delta + non-vacuous controls"
+python3 - "$FIX" <<'PY' >"$OUT" 2>&1
+import json, sys, os
+fix = sys.argv[1]
+
+# Each backdoor tree must differ from clean in EXACTLY its one injected defect.
+EXPECTED = {
+    "backdoor-settings": ({'.compaction.enabled', '.compaction.keepRecentTokens',
+                           '.compaction.reserveTokens'}, 0),
+    "backdoor-retry": ({'.retry.maxRetries'}, 0),
+    "backdoor-compaction-disabled": ({'.compaction.enabled'}, 0),
+    "backdoor-store": (set(), -1),  # defect = pre-#476 curated snapshot (store must differ)
+}
+
+def leaves(o, p=""):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield from leaves(v, f"{p}.{k}")
+    elif isinstance(o, list):
+        for i, v in enumerate(o):
+            yield from leaves(v, f"{p}[{i}]")
+    else:
+        yield p, o
+
+def load(p):
+    return dict(leaves(json.load(open(p))))
+
+fails = 0
+clean = {f: load(os.path.join(fix, "clean", f))
+         for f in ("models.json", "settings.json", "models-store.json")}
+for tree, (exp_settings, exp_store) in EXPECTED.items():
+    d = {f: load(os.path.join(fix, tree, f))
+         for f in ("models.json", "settings.json", "models-store.json")}
+    bad = []
+    if d["models.json"] != clean["models.json"]:
+        bad.append("models.json differs")
+    keys = set(d["settings.json"]) | set(clean["settings.json"])
+    got = {k for k in keys
+           if d["settings.json"].get(k, "<missing>") != clean["settings.json"].get(k, "<missing>")}
+    if got != exp_settings:
+        bad.append(f"settings.json delta {sorted(got)}")
+    keys = set(d["models-store.json"]) | set(clean["models-store.json"])
+    nst = sum(1 for k in keys
+              if d["models-store.json"].get(k, "<missing>") != clean["models-store.json"].get(k, "<missing>"))
+    if (nst > 0) != (exp_store == -1) or (exp_store >= 0 and nst != exp_store):
+        bad.append(f"models-store.json delta {nst}")
+    if bad:
+        print(f"FAIL {tree} differs from clean outside its single injected defect: {'; '.join(bad)}")
+        fails += 1
+    else:
+        print(f"PASS {tree} differs from clean only in its documented defect")
+
+# Near-miss negative controls must be PRESENT, else the absence assertions are vacuous.
+REQUIRED = {
+    "backdoor-models": ["deepseek-proxy", "deepseek-flashlight", "deepseek-pro",
+                        "deepseek-v4-flash", "deepseek-flash", "deepseek-v4.1-flash",
+                        "deepseek-v4.1-flash-expires-on-0910", "deepseek-v4-pro",
+                        "deepseek-v4-pro:batch", "deepseek-flash:batch"],
+    "backdoor-minified": ["deepseek-proxy", "deepseek-flashlight", "deepseek-pro",
+                          "deepseek-v4-flash", "deepseek-flash", "deepseek-v4.1-flash",
+                          "deepseek-v4.1-flash-expires-on-0910", "deepseek-v4-pro",
+                          "deepseek-v4-pro:batch", "deepseek-flash:batch"],
+}
+for tree, ids in REQUIRED.items():
+    blob = json.dumps(json.load(open(os.path.join(fix, tree, "models.json"))))
+    missing = [i for i in ids if json.dumps(i) not in blob]
+    if missing:
+        print(f"FAIL {tree} is missing control id(s) {missing} — its assertions are vacuous")
+        fails += 1
+    else:
+        print(f"PASS {tree} carries all {len(ids)} positive + negative control ids")
+
+store = json.dumps(json.load(open(os.path.join(fix, "backdoor-store", "models-store.json"))))
+for ctl in ("deepseek-chat-v3.2", "kimi-k3", "~deepseek/deepseek-v4-flash-latest",
+            "deepseek-v4-flash-vision-exp"):
+    if ctl in store:
+        print(f"PASS backdoor-store carries control {ctl}")
+    else:
+        print(f"FAIL backdoor-store is missing control {ctl} — test 3's absence assertion is vacuous")
+        fails += 1
+sys.exit(1 if fails else 0)
+PY
+while IFS= read -r line; do
+  case "$line" in
+    PASS\ *) pass "${line#PASS }" ;;
+    FAIL\ *) fail "${line#FAIL }" ;;
+    *) [ -n "$line" ] && echo "      $line" ;;
+  esac
+done <"$OUT"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

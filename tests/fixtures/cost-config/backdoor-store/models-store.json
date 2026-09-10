@@ -672,5 +672,15 @@
       }
     ],
     "checkedAt": 1787922321295
+  },
+  "moonshot": {
+    "models": [
+      {
+        "id": "kimi-k3",
+        "name": "Kimi K3",
+        "contextWindow": 1048576
+      }
+    ],
+    "checkedAt": "2026-07-01T00:00:00Z"
   }
 }

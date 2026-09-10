@@ -184,7 +184,7 @@
         },
         {
           "id": "deepseek-pro",
-          "name": "bare canonical pro control",
+          "name": "future bare deepseek-pro control",
           "reasoning": true,
           "input": [
             "text"
