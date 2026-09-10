@@ -110,8 +110,11 @@ tripwire wired into the per-PR path.
      check — stayed green when a surface lost one of three). **This is the
      class that actually escaped on 2026-08-10.** Accepted residuals: the allowlist is keyed by version
      string (not occurrence) and only 3-component literals are scanned.
-   - **`(j)` per-PR wiring self-check** — asserts `ci.yml` still binds `test-command` on the `node-ci.yml`
-     call, that the value is **exactly** `node scripts/check-skill-lint.test.mjs` (a `|| true` suffix
+   - **`(j)` per-PR wiring self-check** — asserts `ci.yml` still triggers on `pull_request` with no
+     `paths`/`paths-ignore`/`branches` filter (the outermost bypass: `paths-ignore: ['extensions/**']`
+     skips the whole run for exactly the PRs the gate guards, and the job block is never evaluated),
+     that it self-calls `node-ci.yml@main` (the ref is a locked decision D2, not incidental), that it
+     binds `test-command` on that call, that the value is **exactly** `node scripts/check-skill-lint.test.mjs` (a `|| true` suffix
      would leave the job green while the gate can never go red), that `node-ci.yml` declares that input,
      that the `unit-test` job exists, that BOTH the job and custom-step `if:` are exactly the known-good
      predicates (an added conjunct can make the job unsatisfiable while every check stays green), that

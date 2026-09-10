@@ -27,11 +27,13 @@
  *       hand-synced mirror surfaces is PI_VERSION_PIN or a listed dep version,
  *       with a per-surface stamp-count map (a lost surface OR a dropped stamp
  *       is red) — the #637 escape class
- *   (j) per-PR wiring cannot be silently unplugged: ci.yml binds test-command
- *       with EXACTLY the suite invocation (no `|| true`), the CALLER `ci:` job
- *       and the callee `unit-test` job carry no `if:`/`continue-on-error:`,
- *       node-ci.yml declares the input, both the job and custom-step `if:` are
- *       exactly the known-good predicates, and the step `run:`s the input
+ *   (j) per-PR wiring cannot be silently unplugged: ci.yml still triggers on
+ *       `pull_request` with no paths/branches filter, self-calls node-ci.yml at
+ *       @main, binds test-command with EXACTLY the suite invocation (no
+ *       `|| true`), the CALLER `ci:` job and the callee `unit-test` job carry no
+ *       `if:`/`continue-on-error:`, node-ci.yml declares the input, both the job
+ *       and custom-step `if:` are exactly the known-good predicates, and the
+ *       step `run:`s the input
  *
  * Repo-convention harness: node:assert, custom test() with ✅/❌ markers,
  * process.exit(1) on failure (load-gate.test.mjs pattern). Assertion markers
@@ -483,7 +485,10 @@ test("every version literal in the mirror surfaces is the pin or a listed dep ve
 //   (4) the step runs the input but swallows its failure (`|| true`, `continue-on-error: true`), so
 //       the job is green even when the suite fails; and
 //   (5) the CALLER job gets its own `if:`/`continue-on-error:` — the most natural way to "temporarily"
-//       disable a workflow, and invisible to a callee-only check.
+//       disable a workflow, and invisible to a callee-only check; and
+//   (6) the WORKFLOW TRIGGER gains a filter, or stops being `pull_request` — the outermost bypass:
+//       the job block is never evaluated, so every job-level guard above stays green while the gate
+//       is skipped for exactly the PRs it guards (`paths-ignore: ['extensions/**']`).
 // The `test-command` value must be EXACTLY the suite invocation: a `|| true` suffix would leave every
 // assertion in this file passing while the gate can never go red.
 // NOT guarded: a typo'd/renamed input name fails LOUDLY on GitHub (undeclared workflow_call inputs
@@ -493,6 +498,7 @@ test("every version literal in the mirror surfaces is the pin or a listed dep ve
 section("per-PR pin gate is wired (not silently skipped)");
 
 const EXPECTED_TEST_COMMAND = "node scripts/check-skill-lint.test.mjs";
+const REF_RE = /uses:\s*\S*\/\.github\/workflows\/node-ci\.yml@main\s*$/m;
 
 // Slice a top-level job's block out of a workflow: from its 2-space-indented key to the next such key.
 // The key charset deliberately excludes `#` and `:` so a 2-space-indented COMMENT ending in a colon
@@ -518,16 +524,35 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares and consum
     "utf8"
   );
   const callerLines = caller.split("\n");
-  const usesIdx = callerLines.findIndex((l) =>
-    /uses:\s*\S*\/\.github\/workflows\/node-ci\.yml@/.test(l)
+  // The ref is asserted, not globbed: the guard reads the BRANCH-LOCAL node-ci.yml while the live run
+  // resolves the callee FROM this ref, so `@main` is a locked decision (D2), not an incidental value.
+  const usesIdx = callerLines.findIndex((l) => REF_RE.test(l));
+  assert.ok(usesIdx >= 0, "ci.yml no longer calls the node-ci.yml reusable workflow at @main");
+  // Trigger guard FIRST: the outermost bypass is `on:` itself. `pull_request.paths-ignore` (or
+  // `paths`/`branches` filters, or switching to workflow_dispatch) skips the whole run for exactly the
+  // PRs this gate exists to catch, and the job block below is never evaluated — so every other
+  // assertion in this test stays green. Verified: adding paths-ignore left the suite at 163/163.
+  const onIdx = callerLines.findIndex((l) => /^on:\s*$/.test(l));
+  assert.ok(onIdx >= 0, "ci.yml no longer declares a top-level `on:` trigger");
+  const jobsIdx = callerLines.findIndex((l) => /^jobs:\s*$/.test(l));
+  assert.ok(jobsIdx > onIdx, "ci.yml must declare `on:` before `jobs:`");
+  const triggerBlock = callerLines.slice(onIdx, jobsIdx).join("\n");
+  assert.match(
+    triggerBlock,
+    /^  pull_request:\s*$/m,
+    "ci.yml must still run on `pull_request` — otherwise the per-PR pin gate never fires"
   );
-  assert.ok(usesIdx >= 0, "ci.yml no longer calls the node-ci.yml reusable workflow");
+  assert.ok(
+    !/^\s+(?:paths|paths-ignore|branches|branches-ignore|types):/m.test(triggerBlock),
+    "ci.yml's `pull_request:` gained a filter — `paths-ignore: ['extensions/**']` would skip the " +
+      "per-PR pin gate for exactly the PRs it guards (#637)"
+  );
   // Scope to the CALLER JOB block (not a fixed line window, which false-REDs as soon as a comment
   // block is inserted before the binding — and reports it as a missing binding).
   const callerJob = jobBlockOf(callerLines, "ci");
   assert.ok(
-    /uses:\s*\S*\/\.github\/workflows\/node-ci\.yml@/.test(callerJob),
-    "the `ci:` job block in ci.yml no longer calls the node-ci.yml reusable workflow"
+    REF_RE.test(callerJob),
+    "the `ci:` job block in ci.yml no longer calls the node-ci.yml reusable workflow at @main"
   );
   // A caller-level `if:`/`continue-on-error:` skips or excuses the whole call with the callee
   // untouched — the reuse-workflow equivalent of unplugging the gate.
