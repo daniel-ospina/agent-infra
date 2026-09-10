@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-11
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, pi-coding-agent, pi-ai
+aboutObjects: agent-infra, pi-coding-agent, pi-ai, issue-637
 ---
 
 # Upstream pi bug reports — drafts awaiting filing
@@ -17,6 +17,12 @@ aboutObjects: agent-infra, pi-coding-agent, pi-ai
 > the qwen-reliability work; they remain ready to file manually — via the
 > browser UI, or with an account that has issue-create permission on the repo.
 > Keep the draft bodies intact.
+>
+> **Re-verification (2026-09-09, #637):** the `#`-comment finding below was re-probed against
+> pi v0.85.1 + yaml 2.9.0 during the pi 0.84.3 → 0.85.1 bump — **zero drift** (identical
+> `loadSkillsFromDir` results). Recorded HERE rather than inside the draft body, so the drafts
+> stay byte-intact and no new hand-synced version stamp enters an unguarded draft body; this file
+> is a deliberately-excluded residual in #643.
 
 ---
 
@@ -283,7 +289,7 @@ comment), but the corruption is author-invisible: no diagnostic, no warning,
 and the skill loads — only the DESCRIPTION is wrong.
 
 ### Evidence
-- Probe (pi v0.84.3, yaml 2.9.0; re-verified pi v0.85.1 — zero drift): `description: foo # bar` → `loadSkillsFromDir`
+- Probe (pi v0.84.3, yaml 2.9.0): `description: foo # bar` → `loadSkillsFromDir`
   loads the skill with `description: "foo"`. `foo#bar` (no space) → intact
   `"foo#bar"`. `foo #bar` (space before #) → `"foo"`.
 - Whitespace-precedence rule verbatim: ` #` preceded by whitespace starts a

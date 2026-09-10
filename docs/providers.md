@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-14
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, builtin-tools, custom-provider-qwen, custom-provider-openrouter, provider-failover, issue-284, issue-476
+aboutObjects: agent-infra, builtin-tools, custom-provider-qwen, custom-provider-openrouter, provider-failover, issue-284, issue-476, issue-637
 ---
 
 # Provider reliability guide — qwen + the task tool

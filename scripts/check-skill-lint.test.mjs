@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 /**
- * check-skill-lint.test.mjs — CI fixture-regression test for the #254
- * frontmatter validator. No pi import (the dev oracle test owns pi parity).
+ * check-skill-lint.test.mjs — CI suite for the #254 frontmatter validator PLUS
+ * the #637 pi-pin lockstep tripwires (h)/(i)/(j). No pi import (the dev oracle
+ * test owns pi parity). One file, not two: the pin guards ride the suite that
+ * is already wired into the per-PR path (see (j)), so they cannot be left
+ * unwired by accident. Plan alternative F (extracting them into
+ * scripts/check-pi-pin-lockstep.mjs) is the durable fix once the guards keep
+ * growing.
  *
  * Run: node scripts/check-skill-lint.test.mjs
  *
@@ -19,10 +24,14 @@
  *       and the per-extension pin COUNT matches the expected map (coverage, not
  *       mere presence)
  *   (i) mirror version stamps: every <major>.<minor>.<patch> literal in the four
- *       hand-synced mirror surfaces is PI_VERSION_PIN or a listed dep version
- *       (the #637 escape class)
- *   (j) per-PR wiring: ci.yml binds a non-empty test-command to an input that
- *       node-ci.yml declares AND consumes in the unit-test job's `if:`
+ *       hand-synced mirror surfaces is PI_VERSION_PIN or a listed dep version,
+ *       with a per-surface stamp-count map (a lost surface OR a dropped stamp
+ *       is red) — the #637 escape class
+ *   (j) per-PR wiring cannot be silently unplugged: ci.yml binds test-command
+ *       with EXACTLY the suite invocation (no `|| true`), the CALLER `ci:` job
+ *       and the callee `unit-test` job carry no `if:`/`continue-on-error:`,
+ *       node-ci.yml declares the input, both the job and custom-step `if:` are
+ *       exactly the known-good predicates, and the step `run:`s the input
  *
  * Repo-convention harness: node:assert, custom test() with ✅/❌ markers,
  * process.exit(1) on failure (load-gate.test.mjs pattern). Assertion markers

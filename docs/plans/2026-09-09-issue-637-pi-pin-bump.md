@@ -198,16 +198,19 @@ than restating literals, because these numbers have already moved once inside th
 
 ### Acceptance criteria
 
-- [ ] Zero fixture-consequence diffs across 135 fixtures on `--write` (see Testing-strategy table).
-- [ ] Oracle, `check-skill-lint.test.mjs` (incl. `(h)`), review-enforcer, verification-gate, subagent and
-      custom-provider-qwen results match the Testing-strategy table.
-- [ ] `(h)` is non-vacuous — it asserts the per-extension pin-count map (`review-enforcer` 1,
-      `subagent` 4, `verification-gate` 1) — and runs **per-PR** (`ci.yml`) **and** post-merge
-      (`ci-main.yml`).
-- [ ] `patch-pi-retry.sh --check` exit 0 against the installed 0.85.1 (shape probe).
-- [ ] The Verification-plan step-6 stale-literal scan returns **0** lines.
-- [ ] `ci / unit-test` appears as **run** (not skipped) on PR #640.
-- [ ] `pipeline-compliance` green on PR #640.
+Every criterion below was re-run at the final head unless marked otherwise.
+
+- [x] Zero fixture-consequence diffs across 135 fixtures on `--write` (see Testing-strategy table).
+- [x] Oracle (146/146, fuzz 0/1000), `check-skill-lint.test.mjs` (163/163, incl. `(h)`/`(i)`/`(j)`),
+      review-enforcer (113/113), verification-gate (296 unit + 81 e2e), subagent timeout+cache, and
+      custom-provider-qwen (13/13) all match the Testing-strategy table.
+- [x] `(h)` is non-vacuous — per-extension pin-count map (`review-enforcer` 1, `subagent` 4,
+      `verification-gate` 1) — `(i)` is non-vacuous (per-surface stamp-count map), and both run
+      **per-PR** (`ci.yml`) **and** post-merge (`ci-main.yml`).
+- [x] `patch-pi-retry.sh --check` exit 0 against the installed 0.85.1 (shape probe).
+- [x] The Verification-plan step-6 stale-literal scan returns **0** lines.
+- [x] `ci / unit-test` appears as **run** (not skipped) on PR #640.
+- [x] `pipeline-compliance` green on PR #640.
 
 ### Runtime prerequisites
 
@@ -321,7 +324,7 @@ merge-blocking until #646 lands.
 | code-review (PR #640) | 1 | issues fixed — version-agnostic reword of subagent test comments; pin-lockstep tripwire added |
 | code-review (PR #640) | 2 | issues fixed — tripwire moved to end of file + legend; zero-match guard added; scans both `dependencies` and `devDependencies` |
 | code-review (PR #640) | 3 (second-model gate) | issue fixed — `docs/upstream-pi-bugs.md` probe line annotated with 0.85.1 re-verification |
-| code-review (PR #640) | 4 (second-model gate) | **NO ISSUES FOUND** @ `9999bc7` (superseded — 12 commits behind the head; see cycle 5) |
+| code-review (PR #640) | 4 (second-model gate) | **NO ISSUES FOUND** @ `9999bc7` (superseded — see cycle 5; this verdict predates 13 commits) |
 | problem-verify | 1 | `NEEDS-FIX` (P1: "make the vacuous indicator honest" scoped but unimplemented) |
 | problem-verify | 2 | **SOUND** ×2 verifiers |
 | solution-verify | 1 | `NEEDS-FIX` (2×P1: per-PR promotion rejected on a process-cost argument; shipped tripwire guards the class that never drifted; deferrals had no owner/trigger) |
@@ -336,29 +339,7 @@ merge-blocking until #646 lands.
 | code-review (PR #640) | 5 (bug scan at `6fb9df4`) | **ISSUES FOUND** — 2×P2 (guard `(j)` blind to a caller-level `if:`/`continue-on-error:`; `test-command`/step could swallow failure) + 2×P3 `(i)` presence-check non-vacuity, fixed 20-line caller window + 2×P4 misleading job-boundary anchor, `(h)` scope vs claim — all fixed in `e1a75b8`, all negative-tested |
 | code-review (PR #640) | 6 (final, at head) | pending |
 
-### Fix round — parallel review gates cycle 4 → 5
-
-- **P2 (gate #4)** — the unmet criterion is recorded but not structurally gated: the PR carries
-  `Closes #637` and GitHub reports CLEAN, so it could merge with the acceptance criterion still open.
-  Surfaced as a **human decision** in §Unmet Criterion (accept the advisory gate and let #646 land the
-  enforcement, or hold #637 until it does). Not resolved unilaterally: `Closes` vs `Refs` is a scope
-  decision, not a code fix.
-- **P3 (gate #2/#4)** — `(j)` still missed two silent-unplug paths: neutering the step's `run:` binding,
-  and adding a conjunct that makes the predicate unsatisfiable (`&& false`,
-  `&& github.event_name == 'push'` on a pull_request-only workflow). It now asserts the **exact** known-good
-  job and step predicates plus the `run: ${{ inputs.test-command }}` binding. All five mutations RED.
-- **P4 (gate #4)** — `(j)`'s 20-line job window would false-RED once a step is inserted; the block is now
-  anchored to the next top-level job key.
-- **P3 (gate #1)** — the oracle's own corpus floor was still `>= 120` while its header said 122; raised.
-- **P3/P4 (gates #1/#2/#3)** — plan wiring row still advertised the removed roster mechanism; row 8 still
-  said the required check was red; a garbled phrase ("s+run` binding"); item 7 understated `(i)`/`(j)`.
-  All corrected. The `(i)` allowlist's accepted residuals are now stated in the guard and the plan.
-- **P3 (gate #3)** — `#643`'s body predated guard `(i)` and still claimed the escaped class was entirely
-  unguarded; re-scoped to the residual surfaces. `#642`'s objective and gap-2 example corrected
-  (`chord` is lockfile-only, outside `(h)`'s scope). `#651`'s "currently unowned" corrected. `#637`
-  gained an explicit Unmet-Criterion block and the missing `check-skill-lint.oracle.test.mjs` component.
-- **P3 (gate #4)** — the `@main` proof **expires** at the next main-side `node-ci.yml` change; recorded
-  next to the wiring row with alternative F as the durable fix.
+### Fix-round history
 
 ### Fix round — solution-verify cycle 1 → 2
 
@@ -370,33 +351,6 @@ merge-blocking until #646 lands.
   "main is broken" framing (the outage was dev-machine-local; `main` CI was green).
 - **P2** — added the missing mirror surfaces to the Components/wiring set.
 - **P3** — recorded the generation alternative (E) and the split-`(h)` alternative (F).
-
-### Fix round — code-review cycle 5 (bug scan at `6fb9df4`) → `e1a75b8`
-
-Six reproducible issues, all fixed and negative-tested (each reproduced RED, then restored):
-
-- **P2** — guard `(j)` never inspected the **caller** job. A job-level `if:` (or `continue-on-error:`) on
-  `ci:` skips or excuses the whole reusable-workflow call with the callee untouched — and it left the
-  suite at 163/163. `(j)` now slices the `ci:` block and rejects both.
-- **P2** — the step could run the input and swallow its failure: `test-command: … || true` and
-  `continue-on-error: true` on the custom-test step (both the `- key:` and nested-key forms) stayed
-  green while the gate could never go red. `(j)` now requires exact equality with the suite invocation
-  and rejects `continue-on-error:` anywhere in the `unit-test` job block.
-- **P3** — the caller search used a fixed 20-line window, so a comment block before the binding produced
-  a false RED reporting the binding as missing. Both sides now use a shared `jobBlockOf()` helper.
-- **P3** — `(i)`'s non-vacuity check was a `>= 1 per surface` presence check, the exact weakness `(h)`
-  had already retired (a surface lost 1 of 3 stamps and stayed green). Replaced with a per-surface
-  stamp-count map.
-- **P4** — the job-boundary anchor `^  \S[^:]*:\s*$` false-matched any 2-space comment ending in a colon
-  (legal YAML, used in these workflows), truncating the block and reporting a phantom "added conjunct".
-  The key charset is now `[A-Za-z_][A-Za-z0-9_-]*`.
-- **P4** — `(h)` claimed "every pi-* pin" while scanning only two fields; a stale `peerDependencies` pin
-  stayed green. Now six fields, with the nested/root-manifest bound stated in the guard header.
-
-Negative tests at `e1a75b8`: caller `if:`, caller `continue-on-error:` (job + step), `|| true` command,
-callee job and step `continue-on-error:`, stale `peerDependencies` pin, dropped mirror stamp — all RED.
-False-red regressions (a comment ending in a colon inside a job; a comment block before the binding)
-stay GREEN. Suite 163/163.
 
 ### Fix round — parallel review gates cycle 1 → 2
 
@@ -424,17 +378,30 @@ stay GREEN. Suite 163/163.
   row statuses anchored; cost of the extra runner stated; `pi-tui` added to the engines enumeration;
   `docs/plans/*` header note added.
 
-## Complexity
+### Fix round — parallel review gates cycle 2 → 3
 
-| Domain | Rating |
-|---|---|
-| Config | standard |
-| Org Infra | standard |
-
-The fix rounds absorbed a separately-rated `standard` scope (per-PR wiring, #642's indicator 1) — not a
-tier change. Repo rubric: overall = highest rated domain; both touched domains are `standard`, and
-`complex` requires new patterns, cross-system work, security surface, or uncharted territory, none of
-which this mechanical bump introduces.
+- **P0** — the only required check (`pipeline-compliance`) was red: the scoping comment was missing while
+  implementation row 7 claimed it shipped. Row split (plan doc done / comment pending) and step 8 now
+  records the blocking state.
+- **P1 (gate #4 + second-model)** — "CI-enforced" had been reworded to "runs in CI and reports on the PR"
+  in the Confirmed Problem restatement. Restored verbatim, marked **UNMET**, and escalated as a human
+  decision (see "Unmet Criterion").
+- **P1 (gate #4)** — the step-6 acceptance criterion was unsatisfiable (its regex also matched the
+  `0.85.1` values the bump had just written: 98 hits, not one). Replaced with a stale-only predicate
+  expecting 0 lines, and re-run before writing the expectation.
+- **P1 (gate #4)** — the escaped mirror class was unguarded: **guard `(i)` added** (provenance stamps +
+  per-surface stamp-count map), negative-tested.
+- **P1 (gate #4)** — the per-PR wiring could silently unplug: **guard `(j)` added**, negative-tested.
+- **P2 (gate #4)** — presence-only non-vacuity: **`(h)` roster assertion added**, negative-tested.
+- **P2 (gate #1/#3)** — line refs were "unowned": filed **#651** with an assignee and a bump-time trigger.
+- **P2 (gate #2/#3/every gate)** — `#642` still said "fails the PR"; corrected to "reports on the PR".
+- **P2 (second-model)** — Alternative F's rework trigger made explicit (extract a single-purpose job when
+  #646 lands or the suite grows).
+- **P3 (gate #3)** — the `ci.yml` comment asserted history ("reached main") that no artifact supports;
+  reworded as a hazard.
+- **P3/P4** — `pi-tui`/`chord` engines classification corrected; the volatile `161-test` literal and the
+  unsubstantiable "8 CLI cases" replaced with references to the evidence table; `#637`'s Config row
+  "two lockfiles" corrected to three; the docs/plans `research-path` header added.
 
 ### Fix round — parallel review gates cycle 3 → 4
 
@@ -464,6 +431,69 @@ which this mechanical bump introduces.
 - **P4 (gate #3)** — PR #640's body predated every fix round; refreshed with the new counts, the guards,
   and the Unmet-Criterion pointer.
 
+### Fix round — parallel review gates cycle 4 → 5
+
+- **P2 (gate #4)** — the unmet criterion is recorded but not structurally gated: the PR carries
+  `Closes #637` and GitHub reports CLEAN, so it could merge with the acceptance criterion still open.
+  Surfaced as a **human decision** in §Unmet Criterion (accept the advisory gate and let #646 land the
+  enforcement, or hold #637 until it does). Not resolved unilaterally: `Closes` vs `Refs` is a scope
+  decision, not a code fix.
+- **P3 (gate #2/#4)** — `(j)` still missed two silent-unplug paths: neutering the step's `run:` binding,
+  and adding a conjunct that makes the predicate unsatisfiable (`&& false`,
+  `&& github.event_name == 'push'` on a pull_request-only workflow). It now asserts the **exact** known-good
+  job and step predicates plus the `run: ${{ inputs.test-command }}` binding. All five mutations RED.
+- **P4 (gate #4)** — `(j)`'s 20-line job window would false-RED once a step is inserted; the block is now
+  anchored to the next top-level job key.
+- **P3 (gate #1)** — the oracle's own corpus floor was still `>= 120` while its header said 122; raised.
+- **P3/P4 (gates #1/#2/#3)** — plan wiring row still advertised the removed roster mechanism; row 8 still
+  said the required check was red; a garbled phrase ("s+run` binding"); item 7 understated `(i)`/`(j)`.
+  All corrected. The `(i)` allowlist's accepted residuals are now stated in the guard and the plan.
+- **P3 (gate #3)** — `#643`'s body predated guard `(i)` and still claimed the escaped class was entirely
+  unguarded; re-scoped to the residual surfaces. `#642`'s objective and gap-2 example corrected
+  (`chord` is lockfile-only, outside `(h)`'s scope). `#651`'s "currently unowned" corrected. `#637`
+  gained an explicit Unmet-Criterion block and the missing `check-skill-lint.oracle.test.mjs` component.
+- **P3 (gate #4)** — the `@main` proof **expires** at the next main-side `node-ci.yml` change; recorded
+  next to the wiring row with alternative F as the durable fix.
+
+### Fix round — code-review cycle 5 (bug scan at `6fb9df4`) → `e1a75b8`
+
+Six reproducible issues, all fixed and negative-tested (each reproduced RED, then restored):
+
+- **P2** — guard `(j)` never inspected the **caller** job. A job-level `if:` (or `continue-on-error:`) on
+  `ci:` skips or excuses the whole reusable-workflow call with the callee untouched — and it left the
+  suite at 163/163. `(j)` now slices the `ci:` block and rejects both.
+- **P2** — the step could run the input and swallow its failure: `test-command: … || true` and
+  `continue-on-error: true` on the custom-test step (both the `- key:` and nested-key forms) stayed
+  green while the gate could never go red. `(j)` now requires exact equality with the suite invocation
+  and rejects `continue-on-error:` anywhere in the `unit-test` job block.
+- **P3** — the caller search used a fixed 20-line window, so a comment block before the binding produced
+  a false RED reporting the binding as missing. Both sides now use a shared `jobBlockOf()` helper.
+- **P3** — `(i)`'s non-vacuity check was a `>= 1 per surface` presence check, the exact weakness `(h)`
+  had already retired (a surface lost 1 of 3 stamps and stayed green). Replaced with a per-surface
+  stamp-count map.
+- **P4** — the job-boundary anchor `^  \S[^:]*:\s*$` false-matched any 2-space comment ending in a colon
+  (legal YAML, used in these workflows), truncating the block and reporting a phantom "added conjunct".
+  The key charset is now `[A-Za-z_][A-Za-z0-9_-]*`.
+- **P4** — `(h)` claimed "every pi-* pin" while scanning only two fields; a stale `peerDependencies` pin
+  stayed green. Now six fields, with the nested/root-manifest bound stated in the guard header.
+
+Negative tests at `e1a75b8`: caller `if:`, caller `continue-on-error:` (job + step), `|| true` command,
+callee job and step `continue-on-error:`, stale `peerDependencies` pin, dropped mirror stamp — all RED.
+False-red regressions (a comment ending in a colon inside a job; a comment block before the binding)
+stay GREEN. Suite 163/163.
+
+## Complexity
+
+| Domain | Rating |
+|---|---|
+| Config | standard |
+| Org Infra | standard |
+
+The fix rounds absorbed a separately-rated `standard` scope (per-PR wiring, #642's indicator 1) — not a
+tier change. Repo rubric: overall = highest rated domain; both touched domains are `standard`, and
+`complex` requires new patterns, cross-system work, security surface, or uncharted territory, none of
+which this mechanical bump introduces.
+
 ## Unmet Criterion (human decision required)
 
 The confirmed problem required **at least one CI-enforced, non-vacuous alignment tripwire**. Delivered: a
@@ -481,28 +511,3 @@ and the full oracle in CI → **#642** (a pointer for the oracle row, not an own
 as-is). Mirror-literal sweep + removal of the tautological test literal + CI coverage for the unpinned
 importers → **#643**. Version-specific **line refs** → **#651**. Making code CI merge-blocking → **#646**
 (see "Unmet Criterion" above).
-
-### Fix round — parallel review gates cycle 2 → 3
-
-- **P0** — the only required check (`pipeline-compliance`) was red: the scoping comment was missing while
-  implementation row 7 claimed it shipped. Row split (plan doc done / comment pending) and step 8 now
-  records the blocking state.
-- **P1 (gate #4 + second-model)** — "CI-enforced" had been reworded to "runs in CI and reports on the PR"
-  in the Confirmed Problem restatement. Restored verbatim, marked **UNMET**, and escalated as a human
-  decision (see "Unmet Criterion").
-- **P1 (gate #4)** — the step-6 acceptance criterion was unsatisfiable (its regex also matched the
-  `0.85.1` values the bump had just written: 98 hits, not one). Replaced with a stale-only predicate
-  expecting 0 lines, and re-run before writing the expectation.
-- **P1 (gate #4)** — the escaped mirror class was unguarded: **guard `(i)` added** (provenance stamps +
-  per-surface stamp-count map), negative-tested.
-- **P1 (gate #4)** — the per-PR wiring could silently unplug: **guard `(j)` added**, negative-tested.
-- **P2 (gate #4)** — presence-only non-vacuity: **`(h)` roster assertion added**, negative-tested.
-- **P2 (gate #1/#3)** — line refs were "unowned": filed **#651** with an assignee and a bump-time trigger.
-- **P2 (gate #2/#3/every gate)** — `#642` still said "fails the PR"; corrected to "reports on the PR".
-- **P2 (second-model)** — Alternative F's rework trigger made explicit (extract a single-purpose job when
-  #646 lands or the suite grows).
-- **P3 (gate #3)** — the `ci.yml` comment asserted history ("reached main") that no artifact supports;
-  reworded as a hazard.
-- **P3/P4** — `pi-tui`/`chord` engines classification corrected; the volatile `161-test` literal and the
-  unsubstantiable "8 CLI cases" replaced with references to the evidence table; `#637`'s Config row
-  "two lockfiles" corrected to three; the docs/plans `research-path` header added.
