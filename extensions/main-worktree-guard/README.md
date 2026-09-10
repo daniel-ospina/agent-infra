@@ -333,7 +333,7 @@ dirty, and trips M4's freeze. Surfaces:
    additive (cycle-3 A-2). Script-chain content is walked to a bounded
    budget; on budget exhaustion the gate fails closed ONLY when the walk
    already saw hub-main candidates (or the session shell is rooted in a
-   hub main — clean or disordered, #625) — a >64-token hub-free fan-out of sourced helpers
+   DISORDERED hub main) — a >64-token hub-free fan-out of sourced helpers
    must not false-block (cycle-3 A-1).
    Block message states the single coherent rule: bash writes respect the same
    hub gate as the tools; only the session-start host env bypasses — a
@@ -348,7 +348,10 @@ dirty, and trips M4's freeze. Surfaces:
    `perl -pi`, `awk -i inplace`, the `cp`/`mv`/`install`/`rsync`/`ln`
    destination — a directory destination expands per-source to
    `dir/<basename(src)>` — `truncate`, `dd of=`, `sort -o`, `sponge`,
-   `ed`/`ex`). Still outside this mechanism's scope (documented residuals):
+   `ed`/`ex`/`vi`/`vim`/`nvi`; a bundled `-t` (`cp -ft dir`, `install -Dt`);
+   and an rsync option-operand fail-safe — an unlisted operand-taking option
+   re-emits the PREVIOUS positional as a destination so a drifting rsync flag
+   list cannot hide the real dst). Still outside this mechanism's scope (documented residuals):
    verb-in-ARG fan-outs (`find -exec`, `xargs`), archive/member writers
    (`tar -x`, `unzip -o`, `patch`), directory-TREE copies whose per-file
    targets are not in the command string (`cp -R src/ dst/`), backtick

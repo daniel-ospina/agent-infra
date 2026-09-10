@@ -897,16 +897,15 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
       // content is UNVERIFIABLE. Fail closed ONLY on hub-proximity evidence:
       // the walk already placed a candidate under the block-or-block-if-
       // tracked tests (grouped) or the session shell is rooted in a hub main
-      // (the classic chain-write incident shape). #625: the session-rooted arm
-      // covers a CLEAN own hub too (its tracked surface is now gated, so an
-      // unverifiable chain there is the same evidence). A >64-token chain that
+      // (the classic chain-write incident shape). A >64-token chain that
       // never resolved any target into a hub-main candidate AND is not rooted
-      // in a hub (non-git /tmp cwd, a worktree fan-out of sourced helpers)
-      // stays NO evidence of a hub write — failing closed there false-blocks
-      // legit wide source fan-outs (cycle-3 A-1). Residual: a >64-token chain
+      // in a DISORDERED hub (non-git /tmp cwd, a worktree fan-out of sourced
+      // helpers, or a clean own hub) stays NO evidence of a hub write —
+      // failing closed there false-blocks legit wide source fan-outs
+      // (cycle-3 A-1). Residual: a >64-token chain
       // whose hub write sits in the unprocessed tail slips (documented; the
       // tool route is authoritative and the write gate is marker/tool-checked).
-      if (grouped.size === 0 && sessionOwnHub === null) return null;
+      if (grouped.size === 0 && !(sessionOwnHub !== null && sessionDisorder !== null)) return null;
       return { resolvedPath: base, rel: "script-chain", kind: "script-depth" };
     }
     if (grouped.size === 0) return null;
@@ -968,7 +967,7 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
       "⛔ Bash script execution blocked — script chain exceeds the verify budget.",
       `   A script/source chain deeper than the guard's walk budget was detected`,
       `   with hub-main candidates already in view (or the session shell rooted`,
-      `   in a hub main — clean OR disordered); its tail writes into hub-main`,
+      `   in a DISORDERED hub main); its tail writes into hub-main`,
       `   checkouts are UNVERIFIABLE and the guard fails closed rather than risk`,
       `   a tracked hub file write. A chain with NO hub proximity is not blocked`,
       `   (cycle-3 A-1).`,

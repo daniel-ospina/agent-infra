@@ -4374,7 +4374,9 @@ export function firstHubTrackedWrite(candidates, trackedRels) {
  * #625 the in-place OVERWRITE VERBS ARE gated too (`sed -i`, `perl -pi`,
  * `awk -i inplace`, the `cp`/`mv`/`install`/`rsync`/`ln` destination (a
  * DIRECTORY destination resolves per-source to `dir/<basename(src)>`),
- * `truncate`, `dd of=`, `gsed`, `sort -o`, `sponge`, `ed`/`ex`) at COMMAND
+ * `truncate`, `dd of=`, `gsed`, `sort -o` (bundled `-ro` too), `sponge`,
+ * `ed`/`ex`/`vi`/`vim`/`nvi`, a bundled `-t` target-directory (`cp -ft dir`),
+ * and a noclobber-override `>|` redirect) at COMMAND
  * position — `git mv a b` / `echo cp a b` stay ARG positions. Remaining
  * residuals (tracked separately): verb-in-ARG fan-outs (`find -exec`, `xargs`),
  * archive/member writers (`tar -x`, `unzip -o`, `patch`), DIRECTORY-TREE copies
@@ -4390,7 +4392,7 @@ export function firstHubTrackedWrite(candidates, trackedRels) {
 // `cp`/`mv`/`install`/`truncate`/`dd` always write an operand.
 const INPLACE_WRITE_VERBS = new Set([
   "sed", "gsed", "perl", "awk", "gawk", "mawk", "cp", "mv", "install", "truncate", "dd",
-  "rsync", "ln", "sort", "sponge", "ed", "ex",
+  "rsync", "ln", "sort", "sponge", "ed", "ex", "vi", "vim", "nvi",
 ]);
 
 export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
@@ -4514,7 +4516,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         while (rk < n && /[0-9]/.test(s[rk])) rk++;
         if (rk < n && (s[rk] === ">" || s[rk] === "<")) {
           const opStart = rk;
-          while (rk < n && "<>&".includes(s[rk])) rk++;
+          while (rk < n && "<>&|".includes(s[rk])) rk++; // `|` for the `>|` noclobber-override form
           const op = s.slice(opStart, rk);
           rk = skipWs(rk);
           const opnd = readWord(rk);
@@ -4570,8 +4572,13 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       let expectOperand = false;
       let endOpts = false;
       const positionals = [];
-      for (const w of words) {
+      for (let wi = 0; wi < words.length; wi++) {
+        const w = words[wi];
         if (expectOperand) { expectOperand = false; continue; }
+        // BSD `sed -i ''` — the empty quoted word is the in-place SUFFIX, not a
+        // positional (leaving it in the list makes the sed script the "file",
+        // a spurious candidate — #625 review A3).
+        if (w === "" && wi > 0 && (words[wi - 1] === "--in-place" || /^-[a-zA-Z]*i$/.test(words[wi - 1]))) continue;
         if (!endOpts && w === "--") { endOpts = true; continue; }
         if (!endOpts && isFlag(w) && w !== "-") {
           if (w.startsWith("--")) {
@@ -4648,7 +4655,18 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (!endOpts && isFlag(w) && w !== "-") {
           if (w === "-t" || w === "--target-directory") { expectTarget = true; continue; }
           if (w.startsWith("--target-directory=")) { targetDir = w.slice("--target-directory=".length); continue; }
-          if (/^-t./.test(w)) { targetDir = w.slice(2); continue; }
+          if (!w.startsWith("--") && /^-[a-zA-Z]/.test(w)) {
+            // `-t` may be BUNDLED (`cp -ft dir`, `install -Dt dir`); a lowercase
+            // `t` is target-directory for cp/mv/install, so everything after it
+            // is the attached dir (else the next word is). GNU-only; BSD cp has
+            // no -t (#625 review B3).
+            const ti = w.indexOf("t", 1);
+            if (ti !== -1) {
+              const rest = w.slice(ti + 1);
+              if (rest) targetDir = rest; else expectTarget = true;
+              continue;
+            }
+          }
           if (w === "-S" || w === "--suffix") { expectOperand = true; continue; }
           if (v === "install" && (w === "-m" || w === "-o" || w === "-g")) { expectOperand = true; continue; }
           continue;
@@ -4693,26 +4711,61 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
            "-M", "--remote-option", "--partial-dir", "--compare-dest", "--copy-dest", "--link-dest",
            "--rsync-path", "--chmod", "--chown", "--usermap", "--groupmap", "--timeout", "--out-format",
            "--suffix", "--max-size", "--min-size", "--bwlimit", "--compress-level", "--skip-compress",
-           "--address", "--port", "--sockopts", "--password-file"]
+           "--address", "--port", "--sockopts", "--password-file",
+           // rsync-3.x / openrsync operand-taking options (#625 review B2 — the
+           // denylist drifted; the prev-positional fail-safe below is the net).
+           "--modify-window", "--checksum-seed", "--backup-dir", "--log-format", "--contimeout",
+           "--stop-after", "--info", "--iconv", "--early-input", "--write-batch", "--only-write-batch",
+           "--read-batch", "--outbuf", "--stderr", "--group", "--owner", "--protocol",
+           "--compress-choice", "--debug", "--msgs2stderr", "--itemize-changes"]
         : ["-t", "--target-directory", "-S", "--suffix"]);
       let expectOperand = false;
       let expectTarget = false;
       let targetDir = null;
       let endOpts = false;
+      let prevWasFlag = false;
+      let lastPrecededByFlag = false;
       const positionals = [];
       for (const w of words) {
-        if (expectTarget) { targetDir = w; expectTarget = false; continue; }
-        if (expectOperand) { expectOperand = false; continue; }
-        if (!endOpts && w === "--") { endOpts = true; continue; }
+        if (expectTarget) { targetDir = w; expectTarget = false; prevWasFlag = false; continue; }
+        if (expectOperand) { expectOperand = false; prevWasFlag = false; continue; }
+        if (!endOpts && w === "--") { endOpts = true; prevWasFlag = false; continue; }
         if (!endOpts && isFlag(w) && w !== "-") {
-          if (v === "ln" && (w === "-t" || w === "--target-directory")) { expectTarget = true; continue; }
-          if (OPERAND_FLAGS.has(w)) { expectOperand = true; continue; }
+          if (v === "ln" && (w === "-t" || w === "--target-directory")) { expectTarget = true; prevWasFlag = true; continue; }
+          if (v === "ln" && !w.startsWith("--") && /^-[a-zA-Z]/.test(w)) {
+            const ti = w.indexOf("t", 1);   // `ln -ft dir` (bundled -t)
+            if (ti !== -1) {
+              const rest = w.slice(ti + 1);
+              if (rest) targetDir = rest; else expectTarget = true;
+              prevWasFlag = true;
+              continue;
+            }
+          }
+          if (OPERAND_FLAGS.has(w)) { expectOperand = true; prevWasFlag = true; continue; }
+          prevWasFlag = true;
           continue;
         }
+        lastPrecededByFlag = prevWasFlag;
+        prevWasFlag = false;
         positionals.push(w);
       }
-      if (targetDir) emitDst(targetDir, positionals, false);
-      else if (positionals.length > 0) emitDst(positionals[positionals.length - 1], positionals.slice(0, -1), false);
+      if (targetDir) {
+        emitDst(targetDir, positionals, false);
+      } else if (positionals.length > 0) {
+        const last = positionals[positionals.length - 1];
+        if (lastPrecededByFlag && positionals.length >= 2) {
+          // The trailing positional is the bare operand of an UNLISTED
+          // operand-taking option — the real destination is the one before it
+          // (#625 review B2 fail-safe). Emit both; over-match is inert.
+          emitDst(last, [], false);
+          emitDst(positionals[positionals.length - 2], [], false);
+        } else if (v === "ln" && positionals.length === 1) {
+          // `ln TARGET` (2nd form) creates CWD/basename(TARGET) (#625 A1).
+          emitDst(siteCwd, [last], false);
+        } else {
+          emitDst(last, positionals.slice(0, -1), false);
+        }
+      }
       return out;
     }
     if (v === "dd") {
@@ -4721,20 +4774,30 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     }
     if (v === "sort") {
       // `sort -o FILE` writes FILE (attached `-oFILE`/`--output=FILE` or the
-      // next word). A plain `sort file` is read-only → no target.
+      // next word). A plain `sort file` is read-only → no target. `-o` may be
+      // BUNDLED behind other letters (`sort -ro out`) (#625 review A2); a
+      // digit/dot before the `o` means a -k/-t operand, not a flag cluster.
       let expectOperand = false;
       for (const w of words) {
         if (expectOperand) { out.push(w); expectOperand = false; continue; }
         if (w === "-o" || w === "--output") { expectOperand = true; continue; }
         if (w.startsWith("--output=")) out.push(w.slice("--output=".length));
-        else if (/^-o./.test(w)) out.push(w.slice(2));
+        else if (w.startsWith("-") && !w.startsWith("--")) {
+          const m = /^-[a-zA-Z]*o/.exec(w);
+          if (m) {
+            const rest = w.slice(m[0].length);
+            if (rest) out.push(rest); else expectOperand = true;
+          }
+        }
       }
       return out;
     }
-    if (v === "sponge" || v === "ed" || v === "ex") {
-      // `sponge FILE` writes FILE; `ed`/`ex FILE` edit FILE in place. Consume
-      // the `-c/--command` operand for ed/ex, then the last positional is the
-      // file (the writable surface).
+    if (v === "sponge" || v === "ed" || v === "ex" || v === "vi" || v === "vim" || v === "nvi") {
+      // `sponge FILE` writes FILE; `ed`/`ex`/`vi`/`vim` edit FILE in place.
+      // Consume option operands (`-c/--command` for ed/ex; `-c/--cmd`, `-u`,
+      // `-S`, `-i`, `-T`, `-W` for the vi family), then the last positional is
+      // the file (the writable surface). `+cmd` tokens are positionals and
+      // always precede the file, so the last-positional rule still holds.
       let expectOperand = false;
       let endOpts = false;
       const positionals = [];
@@ -4743,6 +4806,10 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (!endOpts && w === "--") { endOpts = true; continue; }
         if (!endOpts && isFlag(w) && w !== "-") {
           if ((v === "ed" || v === "ex") && (w === "-c" || w === "--command")) { expectOperand = true; continue; }
+          if ((v === "vi" || v === "vim" || v === "nvi") &&
+              (w === "-c" || w === "--cmd" || w === "-u" || w === "--rcfile" || w === "-S" ||
+               w === "--session" || w === "-i" || w === "-T" || w === "-W" ||
+               w === "--startuptime" || w === "--servername")) { expectOperand = true; continue; }
           continue;
         }
         positionals.push(w);

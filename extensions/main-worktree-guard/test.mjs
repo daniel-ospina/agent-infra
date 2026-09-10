@@ -632,7 +632,7 @@ expectBool("rev2: script budget hardened to 64 + fail-closed kind", pinSrc.inclu
 expectBool("rev2: .git rel-exact also in the block-reason fn", pinSrc.includes("hit.rel === \".git\" || hit.rel.startsWith(\".git/\")"), true);
 expectBool("rev3: containment capped at NON-main sessions (ancestor-main cannot lift the freeze)", pinSrc.includes("!sessionCheck.isMain && sessionTop"), true);
 expectBool("rev3: bash route existing-untracked overwrite freeze (kind + crossTop)", pinSrc.includes("kind: \"untracked-existing\"") && pinSrc.includes("crossTop"), true);
-expectBool("rev3: script exhaustion fails closed on hub-proximity evidence (#625: any own-hub session)", pinSrc.includes("grouped.size === 0 && sessionOwnHub === null"), true);
+expectBool("rev3: script exhaustion fails closed on hub-proximity evidence (cycle-3 A-1: own-hub arm needs a DISORDERED hub)", pinSrc.includes("grouped.size === 0 && !(sessionOwnHub !== null && sessionDisorder !== null)"), true);
 expectBool("rev3: .git doctrine reconciled (block reason names the marker window as the only open state)", pinSrc.includes("an active escape-marker's own-rooted clean recovery window"), true);
 
 // ── #625 source pins (index.ts + classify-git.mjs) ────────────────────────
@@ -655,7 +655,7 @@ expectBool("#625 source pin: verbTargets receives the site cwd (dir-expansion re
 expectBool("#625 source pin: fd-prefixed redirects consumed before readWord", classifySrc.includes("if (rk < n && (s[rk] === \">\" || s[rk] === \"<\")) {"), true);
 expectBool("#625 source pin: empty quoted operand advances via w.k (BSD sed -i '')", classifySrc.includes("if (w.w === \"\" && w.k <= k)"), true);
 expectBool("#625 source pin: sed/perl in-place flag parsed letter-by-letter", classifySrc.includes("if (ch === \"i\") { inPlace = true; ci = cluster.length; continue; }"), true);
-expectBool("#625 source pin: gsed/awk attached-inplace/sort/sponge/ed/ex in the verb set", classifySrc.includes("\"gsed\", \"perl\"") && classifySrc.includes("-iinplace") && classifySrc.includes("\"sort\", \"sponge\", \"ed\", \"ex\""), true);
+expectBool("#625 source pin: gsed/awk attached-inplace/sort/sponge/ed/ex in the verb set", classifySrc.includes("\"gsed\", \"perl\"") && classifySrc.includes("-iinplace") && classifySrc.includes("\"sort\", \"sponge\", \"ed\", \"ex\", \"vi\", \"vim\", \"nvi\""), true);
 expectBool("#625 source pin: block reason names verb coverage", pinSrc.includes("in-place overwrite verbs"), true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
@@ -4296,6 +4296,23 @@ try {
     has("rsync -a --delete src/ mid/ tracked.md", "rsync:H/tracked.md", "rsync dst is the last positional");
     lacks("rsync -a src/ host:dest", "rsync:H/src/", "rsync remote dst is not a local hub target");
     has("ln -sf /tmp/x tracked.md", "ln:H/tracked.md", "ln link target");
+    // #625 review cycle-1: adversarial + correctness findings
+    has("cp src.md tracked.md >| /tmp/log.txt", "cp:H/tracked.md", "cp dst survives a >| noclobber-override redirect");
+    has("cp src.md tracked.md 2>|/tmp/log.txt", "cp:H/tracked.md", "cp dst survives a 2>| redirect");
+    has("ed -s tracked.md >| /tmp/log.txt", "ed:H/tracked.md", "ed target survives a >| redirect");
+    has("rsync -a src.md tracked.md --modify-window 2", "rsync:H/tracked.md", "rsync unlisted operand flag (--modify-window)");
+    has("rsync -a src.md tracked.md --backup-dir /tmp/bk", "rsync:H/tracked.md", "rsync unlisted operand flag (--backup-dir)");
+    has("rsync -a src.md tracked.md --log-format X", "rsync:H/tracked.md", "rsync unlisted operand flag (--log-format)");
+    has("cp -ft subdir src.md", "cp:H/subdir/src.md", "cp bundled -ft target-directory");
+    has("cp -rt subdir src.md", "cp:H/subdir/src.md", "cp bundled -rt target-directory");
+    has("install -Dt subdir src.md", "install:H/subdir/src.md", "install bundled -Dt target-directory");
+    has("ln -sf /tmp/evil/AGENTS.md", "ln:H/AGENTS.md", "ln 2nd form (single operand) links into the CWD");
+    has("sort -ro tracked.md in.txt", "sort:H/tracked.md", "sort bundled -ro output");
+    has("sort -uo tracked.md in.txt", "sort:H/tracked.md", "sort bundled -uo output");
+    none("sort -k1.2o in.txt", "sort -k operand modifier is not an -o output");
+    has("vim -es +'%s/a/b/' +wq tracked.md", "vim:H/tracked.md", "vim ex-mode in-place file");
+    has("vi -c 'normal x' tracked.md", "vi:H/tracked.md", "vi -c operand skipped, file is the target");
+    lacks("sed -i '' 's/a/b/' tracked.md", "sed:H/s/a/b/", "BSD empty -i suffix is not emitted as a file");
     // truncate / dd
     has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
     has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");
