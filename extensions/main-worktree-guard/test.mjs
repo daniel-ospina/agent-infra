@@ -4313,6 +4313,22 @@ try {
     has("vim -es +'%s/a/b/' +wq tracked.md", "vim:H/tracked.md", "vim ex-mode in-place file");
     has("vi -c 'normal x' tracked.md", "vi:H/tracked.md", "vi -c operand skipped, file is the target");
     lacks("sed -i '' 's/a/b/' tracked.md", "sed:H/s/a/b/", "BSD empty -i suffix is not emitted as a file");
+    // #625 review cycle-2: regressions from the cycle-1 fail-safe + cluster scans
+    has("rsync -a src.md --owner tracked.md", "rsync:H/tracked.md", "rsync no-arg flag (--owner) must not swallow the dst");
+    has("rsync -a src.md --itemize-changes tracked.md", "rsync:H/tracked.md", "rsync no-arg flag (--itemize-changes) must not swallow the dst");
+    has("rsync -a src.md -v subdir", "rsync:H/subdir/src.md", "rsync dir dst behind a no-arg flag still expands");
+    has("rsync -a src.md tracked.md --modify-window 2", "rsync:H/tracked.md", "rsync listed operand flag keeps the real dst");
+    lacks("rsync -a tracked.md -v /tmp/dst", "rsync:H/tracked.md", "rsync read-only export of a tracked file must not be a target");
+    has("cp -St src.md tracked.md", "cp:H/tracked.md", "cp -St is a suffix operand, not -t");
+    has("install -gtty src.md tracked.md", "install:H/tracked.md", "install -gtty is a group operand, not -t");
+    has("install -B.tmp src.md tracked.md", "install:H/tracked.md", "install -B.tmp is a backup operand, not -t");
+    has("cp -b -S.tmp src.md tracked.md", "cp:H/tracked.md", "cp -S.tmp is a suffix operand, not -t");
+    has("cp -ft subdir src.md", "cp:H/subdir/src.md", "cp bundled -ft still works after the cluster rewrite");
+    none("sort -to out in.txt", "sort -to is the -t separator 'o', not -o output");
+    has("vim -es +wq tracked.md +q", "vim:H/tracked.md", "vim trailing +cmd is not the file");
+    has("vim -es +wq tracked.md /tmp/decoy.md", "vim:H/tracked.md", "vim multi-file emits the first file");
+    has("ex -s +wq tracked.md +q", "ex:H/tracked.md", "ex trailing +cmd is not the file");
+    has("sponge one.md two.md", "sponge:H/two.md", "sponge multi-file emits every operand");
     // truncate / dd
     has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
     has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");

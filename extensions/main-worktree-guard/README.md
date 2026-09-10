@@ -348,16 +348,16 @@ dirty, and trips M4's freeze. Surfaces:
    `perl -pi`, `awk -i inplace`, the `cp`/`mv`/`install`/`rsync`/`ln`
    destination — a directory destination expands per-source to
    `dir/<basename(src)>` — `truncate`, `dd of=`, `sort -o`, `sponge`,
-   `ed`/`ex`/`vi`/`vim`/`nvi`; a bundled `-t` (`cp -ft dir`, `install -Dt`);
-   and an rsync option-operand fail-safe — an unlisted operand-taking option
-   re-emits the PREVIOUS positional as a destination so a drifting rsync flag
-   list cannot hide the real dst). Still outside this mechanism's scope (documented residuals):
+   `ed`/`ex`/`vi`/`vim`/`nvi` (every file operand); a bundled `-t` (`cp -ft
+   dir`, `install -Dt`); and `sort -ro`/`-uo`). Still outside this mechanism's scope (documented residuals):
    verb-in-ARG fan-outs (`find -exec`, `xargs`), archive/member writers
    (`tar -x`, `unzip -o`, `patch`), directory-TREE copies whose per-file
    targets are not in the command string (`cp -R src/ dst/`), backtick
    command substitution (the `$( )` form IS walked), arbitrary interpreter
-   writers (`node -e`, `ruby -e`, `php -r`), and a bare `rm` of a tracked
-   file. Own-main UNTRACKED/NEW writes stay free (build/formatter/npm-install
+   writers (`node -e`, `ruby -e`, `php -r`), a bare `rm` of a tracked file,
+   and an rsync option that takes a separate operand but is not in the
+   operand list (the list carries every documented rsync/opensync option that
+   does; `--flag=value` forms are self-delimiting). Own-main UNTRACKED/NEW writes stay free (build/formatter/npm-install
    side effects on genuinely new files must not false-block); a TRACKED
    own-main write blocks clean OR disordered (#625 removed the #437 clean-hub
    residual — it let a compound `printf … >> MEMORY.md && git add && git
