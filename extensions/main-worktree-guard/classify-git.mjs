@@ -302,14 +302,7 @@ export function skimGitGlobalFlags(command) {
   return { rest: tokens.slice(i), repoHint, gitDirHint };
 }
 
-function _stripQuotes(s) {
-  const t = String(s ?? "");
-  // ANSI-C `$'…'` / `$"…"` are lexically-fixed strings — decode so the real
-  // path (not the literal `$…`) is tested (#625 cycle-7).
-  if (t.length > 3 && t.startsWith("$'") && t.endsWith("'")) return _ansiTranslate(t.slice(2, -1));
-  if (t.length > 3 && t.startsWith('$"') && t.endsWith('"')) return t.slice(2, -1);
-  return t.replace(/^["']|["']$/g, "");
-}
+function _stripQuotes(s) { return String(s ?? "").replace(/^["']|["']$/g, ""); }
 
 function _refspecDst(refspec) {
   if (!refspec || refspec === "") return null;
@@ -4496,9 +4489,13 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     while (k < n && !(q === null && (/\s/.test(s[k]) || ";|&()".includes(s[k]) || s[k] === ">" || s[k] === "<"))) {
       const ch = s[k];
       if (q) {
-        // Inside double quotes, `\"` / `\\` / `\$` are literals (bash dq
-        // escapes); inside single quotes a backslash is literal.
-        if (q === '"' && ch === "\\" && k + 1 < n) { w += s[k + 1]; k += 2; continue; }
+        // Inside double quotes bash treats `\` as an escape ONLY before
+        // `$` / `` ` `` / `"` / `\` / newline; before any other char it is
+        // literal (cycle-8 P2/P3: over-stripping false-positived on paths
+        // like "MEMORY\.md").
+        if (q === '"' && ch === "\\" && k + 1 < n && "\"\\$`\n".includes(s[k + 1])) {
+          w += s[k + 1]; k += 2; continue;
+        }
         if (ch === q) q = null; else w += ch; k++;
         continue;
       }
@@ -5929,28 +5926,32 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       }
       if (w0.w === "trap") {
         // `trap -p`/`-l`: the remaining operands are signal specs, never an
-        // action (false-positive fix, cycle-7 P3). An UNQUOTED action is left
-        // for the normal scan so a top-level `>` redirect is still seen.
+        // action (false-positive fix, cycle-7 P3).
         if (sawList) { i = k; continue; }
-        const quoted = s[k] === "'" || s[k] === '"' ||
-          (s[k] === "$" && (s[k + 1] === "'" || s[k + 1] === '"'));
-        if (!quoted) { continue; }   // i unchanged → the operand is scanned normally
-        const a = readShellArg(k);
-        const payload = a.w.trim();
-        if (payload) { const _ip = { payload, cwd }; inlinePays.push(_ip, ...forkTwins(_ip)); }
-        i = a.k;
+        // The action is trap's FIRST operand. A quoted one is read with shell
+        // semantics; an UNQUOTED one still needs one level of unescaping
+        // (`trap echo\ x\ \>tracked.md EXIT` really writes the file at signal
+        // time) — cycle-8 P1.
+        const a = readWord(k);
+        if (a.w && a.k > k) {
+          const _ip = { payload: a.w, cwd }; inlinePays.push(_ip, ...forkTwins(_ip));
+          i = a.k;
+        }
         continue;
       }
       // `eval` concatenates ALL its arguments into ONE command — read every
       // argument with shell quote semantics (ANSI-C `$'…'` decoded per arg) and
-      // join (#625 cycle-6 B4, cycle-7 P1).
+      // join (#625 cycle-6 B4, cycle-7 P1). Advance over spaces/tabs ONLY (not
+      // `\n`) so the loop's newline terminator fires and the following line is
+      // not swallowed (#625 cycle-8 P1).
       const parts = [];
       let j = k;
       while (j < n && !";|&()\n".includes(s[j])) {
-        const a = readShellArg(j);
+        const a = readWord(j);
         if (a.k <= j) break;
         parts.push(a.w);
-        j = skipWs(a.k);
+        j = a.k;
+        while (j < n && (s[j] === " " || s[j] === "\t" || s[j] === "\r")) j++;
       }
       const payload = parts.join(" ").trim();
       if (payload) { const _ip = { payload, cwd }; inlinePays.push(_ip, ...forkTwins(_ip)); }
@@ -5982,7 +5983,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // slice from the END of the tee word (a quote-led or path-qualified tee
     // starts earlier than +3 — cycle-30 P2-1/P2-2)
     const teeWordEnd = t.end ?? t.idx + 3;
-    const rawWords = _tokenize(s.slice(teeWordEnd, lim));
+    const rawWords = _tokenize(s.slice(teeWordEnd, lim).replace(/\$'((?:[^'\\]|\\.)*)'/g, (mm, inner) => _ansiTranslate(inner)));
     // ALL non-flag positionals are write targets (echo x | tee a.md b.md).
     // cycle-16 P2 + cycle-29 (review): a heredoc header `tee f <<EOF` feeds
     // tee from the BODY — drop `<<` and the DELIMITER word only; positionals

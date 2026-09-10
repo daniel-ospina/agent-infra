@@ -4378,6 +4378,13 @@ try {
     has("bash -c $'printf x \\x3e tracked.md'", "redirect:H/tracked.md", "interpreter -c ANSI-C payload decodes");
     none("trap -p 'printf x > tracked.md' EXIT", "trap -p has no action operand");
     lacks("tee /tmp/out.txt < tracked.md", "tee:H/tracked.md", "tee input redirect is not a write target");
+    // #625 review cycle-8: eval newline, tee ANSI-C, trap escaped action, dq escapes
+    has("eval true\ntee tracked.md", "tee:H/tracked.md", "eval does not swallow the next line");
+    has("eval true\ncp src.md tracked.md", "cp:H/tracked.md", "multi-line eval keeps the next line's verb");
+    has("tee $'tracked.md'", "tee:H/tracked.md", "tee ANSI-C target decodes");
+    has("printf y | tee $'tracked.md'", "tee:H/tracked.md", "tee ANSI-C target in a pipeline");
+    has("trap echo\\ x\\ \\>tracked.md EXIT", "redirect:H/tracked.md", "trap escaped unquoted action is walked");
+    lacks("echo x > \"MEMORY\\.md\"", "redirect:H/MEMORY.md", "dq backslash before a non-special char stays literal");
     // truncate / dd
     has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
     has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");
