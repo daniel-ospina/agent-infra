@@ -72,9 +72,11 @@ block() { echo "  ❌ $1"; BLOCKS=$((BLOCKS + 1)); }
 # providers.*.models[]), (2) modelOverrides map keys (the key IS the model id,
 # the value dict holds `contextWindow`). Normalizes each id (strips
 # `provider/` and `~provider/` prefixes) and flags deepseek-served family ids
-# (canonical `deepseek-flash` + legacy `deepseek-v4-flash`/`deepseek-v4-pro`
-# and every variant: dotted `v4.1` ids, -0731, -vision-exp, -0813, -latest,
-# :batch) whose effective contextWindow exceeds CLAMP. Emits one
+# (canonical `deepseek-flash`, its `deepseek-v4-flash` legacy alias, and the
+# `deepseek-v4-pro` / future bare `deepseek-pro` family — every variant: dotted
+# `v4.1` ids, -0731, -vision-exp, -0813, -latest, :batch. Deliberately NOT
+# matched: non-family ids such as `deepseek-proxy` / `deepseek-flashlight`)
+# whose effective contextWindow exceeds CLAMP. Emits one
 # `id contextWindow=N` line per violation; PARSE_ERROR line + exit 1 on
 # unparseable input (a file we cannot assert on must never read green).
 deepseek_violations() {

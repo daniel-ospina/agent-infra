@@ -23,7 +23,7 @@
       "models": [
         {
           "id": "deepseek-v4-pro",
-          "name": "DeepSeek V4 Pro",
+          "name": "DeepSeek V4 Pro (routes to V4.1 Flash 2026-09-14)",
           "reasoning": true,
           "input": [
             "text"
@@ -46,7 +46,7 @@
         },
         {
           "id": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash (legacy alias)",
+          "name": "DeepSeek V4.1 Flash (legacy alias)",
           "reasoning": true,
           "input": [
             "text"
@@ -93,7 +93,13 @@
       ],
       "modelOverrides": {
         "deepseek-v4-flash-vision-exp": {
-          "contextWindow": 300000
+          "contextWindow": 300000,
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cacheRead": 0.003,
+            "cacheWrite": 0
+          }
         }
       }
     },

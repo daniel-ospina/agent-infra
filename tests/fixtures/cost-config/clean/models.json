@@ -23,7 +23,7 @@
       "models": [
         {
           "id": "deepseek-v4-pro",
-          "name": "DeepSeek V4 Pro",
+          "name": "DeepSeek V4 Pro (routes to V4.1 Flash 2026-09-14)",
           "reasoning": true,
           "input": [
             "text"
@@ -38,15 +38,15 @@
             "max": "max"
           },
           "cost": {
-            "input": 0.435,
-            "output": 0.87,
-            "cacheRead": 0.003625,
+            "input": 0.66,
+            "output": 1.98,
+            "cacheRead": 0.022,
             "cacheWrite": 0
           }
         },
         {
           "id": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash",
+          "name": "DeepSeek V4.1 Flash (legacy alias)",
           "reasoning": true,
           "input": [
             "text"
@@ -89,34 +89,17 @@
             "cacheRead": 0.003,
             "cacheWrite": 0
           }
-        },
-        {
-          "id": "deepseek-v4.1-flash",
-          "name": "DeepSeek V4.1 Flash (dotted)",
-          "reasoning": true,
-          "input": [
-            "text"
-          ],
+        }
+      ],
+      "modelOverrides": {
+        "deepseek-v4-flash-vision-exp": {
           "contextWindow": 300000,
-          "maxTokens": 384000,
-          "thinkingLevelMap": {
-            "minimal": null,
-            "low": null,
-            "medium": null,
-            "high": "high",
-            "max": "max"
-          },
           "cost": {
             "input": 0.15,
             "output": 0.6,
             "cacheRead": 0.003,
             "cacheWrite": 0
           }
-        }
-      ],
-      "modelOverrides": {
-        "deepseek-v4-flash-vision-exp": {
-          "contextWindow": 300000
         }
       }
     },

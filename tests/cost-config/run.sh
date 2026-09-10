@@ -5,7 +5,8 @@
 #   1. clean fixture (deepseek ids @300K clamp)    → PASS (exit 0)
 #   2. models.json drift (deepseek id > 300K)      → BLOCK (exit 1)
 #      (positive controls: legacy v4-pro/v4-flash, canonical deepseek-flash,
-#      dotted deepseek-v4.1-flash — V4.1 Flash adoption 2026-09-10)
+#      dotted deepseek-v4.1 ids, `:batch` terminators; negative controls:
+#      deepseek-proxy / deepseek-flashlight — V4.1 Flash adoption 2026-09-10)
 #   3. models-store.json drift                     → WARN (exit 0, DETECTED —
 #      catalog class must not fail sync; the weekly report + tripwire alert)
 #      (also: matcher negatives kimi-k3 + deepseek-chat-v3.2 never flagged;
@@ -29,6 +30,8 @@
 # backdoor-store/models-store.json holds the pre-#476 curated snapshot with
 # the alias + vision-exp rows at 1M; the guard's canonical matcher must catch
 # exactly the deepseek-served family).
+#  13. clean/clean-minified mirror the shipped tree (canonical JSON) → parity
+#      pin so the #630 review's mirror invariant cannot rot silently.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -86,6 +89,11 @@ if grep -q "BLOCK-level violation" "$OUT"; then pass "BLOCK summary present"; el
 if grep -q "deepseek-v4-pro contextWindow=1000000" "$OUT"; then pass "deepseek-v4-pro flagged"; else fail "deepseek-v4-pro not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-flash contextWindow=1000000" "$OUT"; then pass "canonical deepseek-flash flagged"; else fail "canonical deepseek-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash contextWindow=1000000" "$OUT"; then pass "dotted v4.1 family flagged"; else fail "deepseek-v4.1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-v4.1-flash-expires-on-0910 contextWindow=1000000" "$OUT"; then pass "dotted beta id flagged"; else fail "dotted beta id not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-v4-pro:batch contextWindow=1000000" "$OUT"; then pass ":batch terminator flagged"; else fail ":batch terminator not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-flash:batch contextWindow=1000000" "$OUT"; then pass "canonical :batch flagged"; else fail "canonical :batch not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-proxy" "$OUT"; then fail "negative control deepseek-proxy was flagged"; else pass "deepseek-proxy (non-family) not flagged"; fi
+if grep -q "deepseek-flashlight" "$OUT"; then fail "negative control deepseek-flashlight was flagged"; else pass "deepseek-flashlight (non-family) not flagged"; fi
 
 echo ""
 echo "3. models-store.json drift → WARN, exit 0 (DETECTED, not blocked)"
@@ -125,6 +133,10 @@ if grep -q "BLOCK-level violation" "$OUT"; then pass "BLOCK summary present"; el
 if grep -q "deepseek-v4-pro contextWindow=1000000" "$OUT"; then pass "minified deepseek-v4-pro flagged"; else fail "minified deepseek-v4-pro not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-flash contextWindow=1000000" "$OUT"; then pass "minified canonical deepseek-flash flagged"; else fail "minified canonical deepseek-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash contextWindow=1000000" "$OUT"; then pass "minified dotted v4.1 family flagged"; else fail "minified deepseek-v4.1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-v4.1-flash-expires-on-0910 contextWindow=1000000" "$OUT"; then pass "minified dotted beta id flagged"; else fail "minified dotted beta id not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-flash:batch contextWindow=1000000" "$OUT"; then pass "minified canonical :batch flagged"; else fail "minified canonical :batch not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-proxy" "$OUT"; then fail "minified negative control deepseek-proxy was flagged"; else pass "minified deepseek-proxy (non-family) not flagged"; fi
+if grep -q "deepseek-flashlight" "$OUT"; then fail "minified negative control deepseek-flashlight was flagged"; else pass "minified deepseek-flashlight (non-family) not flagged"; fi
 
 echo ""
 echo "9. MINIFIED clean models.json (300K clamp) → PASS, exit 0"
@@ -154,6 +166,21 @@ echo ""
 echo "12. compaction.enabled=false → BLOCK, exit 1"
 run_guard 1 "backdoor-compaction-disabled" --live-dir "$FIX/backdoor-compaction-disabled"
 if grep -q "compaction.enabled expected true" "$OUT"; then pass "compaction.enabled drift flagged"; else fail "expected enabled message"; tail -20 "$OUT"; fi
+
+echo ""
+echo "13. clean fixtures mirror the shipped tree (parity pin)"
+python3 - "$ROOT/pi-bootstrap/pi-config/models.json" "$FIX/clean/models.json" "$ROOT/pi-bootstrap/pi-config/settings.json" "$FIX/clean/settings.json" <<'PY'
+import json, sys
+a, b, c, d = (json.load(open(p)) for p in sys.argv[1:5])
+sys.exit(0 if a == b and c == d else 1)
+PY
+if [ $? -eq 0 ]; then pass "clean models.json + settings.json mirror shipped"; else fail "clean fixtures diverge from shipped — regenerate them"; fi
+python3 - "$FIX/clean/models.json" "$FIX/clean-minified/models.json" "$FIX/clean/settings.json" "$FIX/clean-minified/settings.json" <<'PY'
+import json, sys
+a, b, c, d = (json.load(open(p)) for p in sys.argv[1:5])
+sys.exit(0 if a == b and c == d else 1)
+PY
+if [ $? -eq 0 ]; then pass "clean-minified mirrors clean (canonical JSON)"; else fail "clean-minified diverges from clean"; fi
 
 echo ""
 if [ "$failures" -eq 0 ]; then
