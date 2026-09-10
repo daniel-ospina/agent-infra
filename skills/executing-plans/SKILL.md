@@ -210,7 +210,7 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
 
 | Risk | Isolation |
 |------|-----------|
-| Low (docs, config, 1-2 files) | Plain branch acceptable. No worktree needed. |
+| Low (docs, config, 1-2 files) | Plain branch inside a worktree; in a hub, create the worktree first (#626). |
 | Medium (3+ files, shared infrastructure) | Worktree recommended. Plain branch OK for single-file. |
 | High (multi-system, migrations, auth) | Worktree required. Stash uncommitted changes first. |
 
@@ -225,7 +225,7 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
 > only when you are ALREADY inside a worktree; in a hub, create an isolated worktree first
 > (using-git-worktrees skill; agent-infra: `bash scripts/checkout-hygiene/hub-worktree.sh feat/issue-<N>-<slug>`).
 1. Run `git status --porcelain` to check for uncommitted changes
-2. If changes exist on main: `git stash push -m "pre-<branch>-wip"` (optional for Low risk with no TS changes)
+2. If the HUB is dirty (uncommitted changes on main): `git stash push` is BLOCKED there — the M4 hub-disorder gate sanctions only recovery verbs, and `stash` is not one. Use the dirty-hub salvage path instead: `bash scripts/checkout-hygiene/hub-worktree.sh salvage feat/issue-{N}-{slug}` (README #435). Inside a worktree there is no "changes on main" to stash.
 3. Create the branch INSIDE a worktree — invoke `using-git-worktrees` (agent-infra:
    `bash scripts/checkout-hygiene/hub-worktree.sh feat/issue-<N>-<slug>`). Do NOT run
    `git checkout -b` in a hub — it is BLOCKED (#626).

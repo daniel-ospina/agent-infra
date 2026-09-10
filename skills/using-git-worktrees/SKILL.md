@@ -29,7 +29,7 @@ The main checkout is a **SHARED HUB** that stays on `main`. Feature work happens
 
 ## Escaping the main-checkout guard (deliberate mid-session escalation)
 
-If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the recovery git ops needed to un-strand (`git checkout main`, `git pull`, branch recovery) — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
+If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the ops needed to un-strand (in-hub `checkout -b`, `commit`, foreign pushes, edits) — note `git checkout main` and `git pull --ff-only` are M4-sanctioned and need no window — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
 
 ```bash
 # must be its OWN bash tool call inside a guard-loaded session

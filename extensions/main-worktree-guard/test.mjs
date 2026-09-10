@@ -997,7 +997,7 @@ dexpect("restore-from-branch verdict stays block:checkout-branch", `git checkout
   // #626 review round-2 (P1): attached/cluster/long create spellings must NOT
   // slip the #376 return-to-original arm (they previously classified
   // switch-existing with target "main" → reBaseline while git created a branch).
-  for (const cmd of [`git checkout -bfoo main`, `git checkout -Bfoo main`, `git switch -cfoo main`, `git switch -Cfoo main`, `git switch --create=foo main`, `git switch --force-create=foo main`, `git checkout -fb foo main`]) {
+  for (const cmd of [`git checkout -bfoo main`, `git checkout -Bfoo main`, `git switch -cfoo main`, `git switch -Cfoo main`, `git switch --create=foo main`, `git switch --force-create=foo main`, `git checkout -fb foo main`, `git switch --cre=foo main`, `git switch --crea foo main`, `git switch --force-c=foo main`, `git switch --force-creat main`, `git checkout --orph=v`, `git checkout --orp v`]) {
     const d = m3(cmd);
     expectBool(`#626: ${cmd} → BLOCKED (no #376 reBaseline)`, d?.block === true && !d?.reBaseline, true);
   }

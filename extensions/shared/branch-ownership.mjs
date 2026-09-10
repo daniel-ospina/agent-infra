@@ -660,7 +660,7 @@ export function classifyBranchOp(subcmd, args) {
     // `main`, and when that equals baseline.original the #376 return-to-original
     // arm re-baselined (allow) while git actually CREATED a branch and flipped
     // the shared hub — re-opening the #99 hole #626 removed.
-    const opt = _checkoutCreateOpt(a);
+    const opt = _checkoutCreateOpt(subcmd, a);
     if (opt) return { op: opt.kind, branch: opt.branch };
     if (flag("-f") || flag("--force") || flag("--discard-changes")) return { op: "force" }; // --discard-changes is git's force-switch alias (throws away local modifications — second-model gate fold-in)
     if (flag("--detach")) return { op: "detach" };
@@ -778,25 +778,52 @@ export function classifyBranchOp(subcmd, args) {
 }
 
 /**
+ * #626: resolve a checkout/switch long option NAME to its create kind using
+ * git's parse-options UNAMBIGUOUS-PREFIX rules (probe-verified git 2.50.1).
+ * VERB-AWARE — the two verbs have different option tables:
+ *   git switch  : --create, --force-create, --orphan
+ *                 (`--cre=foo` ≡ `--create=foo`, `--force-c` ≡ `--force-create`)
+ *   git checkout: --orphan ONLY — it has NO --create/--force-create, so its
+ *                 `--c*` resolves to --conflict and `--f*` to --force. Those are
+ *                 VALID commands and must NOT classify as creates.
+ * `--force` (and for checkout `--f`/`--fo`/`--for`/`--forc`) is the force flag,
+ * not force-create → null. Ambiguous prefixes git itself rejects (switch `--c`,
+ * `--f`..`--forc`, `--o`; checkout `--o`) are still classified as their create
+ * kind — fail-closed on an rc-129 command is harmless.
+ * Returns "create-new" | "force-create" | "orphan" | null.
+ */
+function _longCreateKind(verb, name) {
+  if (!name) return null;
+  if ("orphan".startsWith(name)) return "orphan"; // both verbs have --orphan
+  if (verb === "switch") {
+    if (name === "force") return null; // --force: the force flag, not --force-create
+    if ("create".startsWith(name)) return "create-new";
+    if ("force-create".startsWith(name)) return "force-create";
+  }
+  return null;
+}
+
+/**
  * #626: parse the create / force-create / orphan option from a checkout/switch
  * argv, accepting git's FULL spelling surface:
  *   - short cluster with the value ATTACHED (`checkout -bfoo` / `switch -cfoo` /
  *     `-Cfoo`) or the value as the NEXT argv (`checkout -fb foo`);
- *   - long forms `--create[=v]` / `--force-create[=v]` / `--orphan[=v]`.
+ *   - long forms `--create[=v]` / `--force-create[=v]` / `--orphan[=v]` AND
+ *     their unambiguous prefixes (`switch --cre=foo`, `switch --force-c main`,
+ *     `checkout --orph v`).
  * Short letters: b/c → create-new, B/C → force-create. Scanning stops at a `--`
  * terminator (path-restore form — never a branch option). Returns
  * { kind, branch } or null. Fail-safe: a plausible create letter classifies as
  * create/force-create → M3 blocks (git refuses invalid spellings anyway).
  */
-function _checkoutCreateOpt(args) {
+function _checkoutCreateOpt(subcmd, args) {
   for (let i = 0; i < args.length; i++) {
     const x = args[i];
     if (x === "--") return null;
-    const long = /^--(orphan|create|force-create)(?:=(.*))?$/.exec(x);
+    const long = /^--([^=]+)(?:=(.*))?$/.exec(x);
     if (long) {
-      const kind = long[1] === "orphan" ? "orphan"
-        : long[1] === "create" ? "create-new" : "force-create";
-      return { kind, branch: long[2] !== undefined ? long[2] : (args[i + 1] ?? null) };
+      const kind = _longCreateKind(subcmd, long[1]);
+      if (kind) return { kind, branch: long[2] !== undefined ? long[2] : (args[i + 1] ?? null) };
     }
     const sc = /^-(?!-)([A-Za-z]+)(.*)$/.exec(x);
     if (sc) {

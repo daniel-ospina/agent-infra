@@ -1542,7 +1542,7 @@ export function classifyGitCommandDetailed(command) {
       out.branchState = true;
       // #626: capture the branch across git's FULL create/force-create/orphan
       // surface (attached shorts + long forms), not just exact `-b`/`-B` tokens.
-      out.newBranch = _checkoutCreateBranch(args);
+      out.newBranch = _checkoutCreateBranch(verb, args);
     } else if (verb === "symbolic-ref" || verb === "update-ref") {
       const pos = args.filter((x) => !x.startsWith("-"));
       if ((verb === "symbolic-ref" && pos[0] === "HEAD") ||
@@ -2627,19 +2627,50 @@ function _branchPositionals(args) {
 }
 
 /**
+ * #626: resolve a checkout/switch long option NAME to its create kind using
+ * git's parse-options UNAMBIGUOUS-PREFIX rules (probe-verified git 2.50.1).
+ * VERB-AWARE — the two verbs have different option tables:
+ *   git switch  : --create, --force-create, --orphan
+ *                 (`--cre=foo` ≡ `--create=foo`, `--force-c` ≡ `--force-create`)
+ *   git checkout: --orphan ONLY — it has NO --create/--force-create, so its
+ *                 `--c*` resolves to --conflict and `--f*` to --force. Those are
+ *                 VALID commands and must NOT classify as creates.
+ * `--force` (and for checkout `--f`/`--fo`/`--for`/`--forc`) is the force flag,
+ * not force-create → null. Ambiguous prefixes git itself rejects (switch `--c`,
+ * `--f`..`--forc`, `--o`; checkout `--o`) are still classified as their create
+ * kind — fail-closed on an rc-129 command is harmless.
+ * Duplicated from branch-ownership's _longCreateKind (classify-git must not
+ * import branch-ownership — test pin C2/D2). Keep the two in sync.
+ */
+function _longCreateKind(verb, name) {
+  if (!name) return null;
+  if ("orphan".startsWith(name)) return "orphan"; // both verbs have --orphan
+  if (verb === "switch") {
+    if (name === "force") return null; // --force: the force flag, not --force-create
+    if ("create".startsWith(name)) return "create-new";
+    if ("force-create".startsWith(name)) return "force-create";
+  }
+  return null;
+}
+
+/**
  * #626: the branch NAME created (or force-created/an orphan) by a checkout/switch
  * argv, across git's full spelling surface — attached short clusters
- * (`-bfoo`, `-fb foo`, `-cfoo`, `-Cfoo`) and long forms `--create[=v]` /
- * `--force-create[=v]` / `--orphan[=v]`. Mirrors branch-ownership's
- * _checkoutCreateOpt (kept duplicated — classify-git must not import
- * branch-ownership, test pin C2/D2). Returns null when no create option is present.
+ * (`-bfoo`, `-fb foo`, `-cfoo`, `-Cfoo`) and the long forms
+ * `--create[=v]` / `--force-create[=v]` / `--orphan[=v]` plus their unambiguous
+ * verb-specific prefixes (`switch --cre=foo`, `switch --force-c main`,
+ * `checkout --orph v`). Mirrors branch-ownership's _checkoutCreateOpt (kept
+ * duplicated — classify-git must not import branch-ownership, test pin C2/D2).
+ * Returns null when no create option is present.
  */
-function _checkoutCreateBranch(args) {
+function _checkoutCreateBranch(verb, args) {
   for (let i = 0; i < args.length; i++) {
     const x = args[i];
     if (x === "--") return null;
-    const long = /^--(orphan|create|force-create)(?:=(.*))?$/.exec(x);
-    if (long) return long[2] !== undefined ? long[2] : (args[i + 1] ?? null);
+    const long = /^--([^=]+)(?:=(.*))?$/.exec(x);
+    if (long && _longCreateKind(verb, long[1])) {
+      return long[2] !== undefined ? long[2] : (args[i + 1] ?? null);
+    }
     const sc = /^-(?!-)([A-Za-z]+)(.*)$/.exec(x);
     if (sc) {
       const k = sc[1].search(/[bBcC]/);

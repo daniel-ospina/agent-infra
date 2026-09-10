@@ -57,7 +57,7 @@ Before deciding what gates to run, classify the change:
 
 | Risk | Isolation |
 |------|-----------|
-| Low | Plain branch acceptable. No worktree needed. |
+| Low | Plain branch inside a worktree; in a hub, create the worktree first (#626). |
 | Medium | Worktree recommended if 3+ files or shared infrastructure. Plain branch OK for single-file. |
 | High | Worktree required. Stash uncommitted changes first. |
 

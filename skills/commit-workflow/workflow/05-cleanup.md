@@ -42,8 +42,11 @@ handled deletion separately).
 BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=$(git branch --show-current)
 
-# Remote delete — server-side, always possible after merge; "remote ref does not
-# exist" means deleteBranchOnMerge already removed it = success.
+# Remote delete — server-side; run it AFTER the teardown above. The #73
+# coordinated-delete guard blocks deleting a branch still checked out in ANY
+# worktree, but it matches the LITERAL ref in the command text, so this
+# shell-variable form is not guard-matched (the teardown ordering makes it moot).
+# "remote ref does not exist" means deleteBranchOnMerge already removed it = success.
 git push origin --delete "$BRANCH" 2>/dev/null \
   || echo "ℹ️ remote branch $BRANCH already deleted or unavailable"
 
@@ -51,7 +54,9 @@ git push origin --delete "$BRANCH" 2>/dev/null \
 # longer checked out, but the HUB's main-checkout branch-force-delete gate still
 # blocks a branch that is not the session's baseline or pid-owned (a `git worktree
 # add -b` branch is never recorded as owned — create-new is blocked, #626). A block
-# or git refusal is a WARN — never fail the ceremony; leave a teardown note.
+# or git refusal is a WARN — never fail the ceremony. A GUARD block rejects the bash
+# call before the shell runs, so the `||` echo below never fires on it: the agent
+# must surface the teardown note itself.
 if git worktree list --porcelain | grep -q "branch refs/heads/$BRANCH"; then
   echo "⚠️ branch $BRANCH is still checked out in a worktree — local delete deferred."
   echo "   TEARDOWN NOTE: remove the worktree and run: git branch -D $BRANCH"

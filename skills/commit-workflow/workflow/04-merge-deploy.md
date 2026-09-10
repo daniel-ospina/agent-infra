@@ -130,29 +130,34 @@ touching the default-branch worktree. If Step B's remote delete reports
 
 > **#265/#615 ceremony posture:** run the ceremony from the session's WORKTREE —
 > agent-infra included (the #99 in-main-work exemption was removed in #615, so
-> the agent-infra hub is main+clean like every hub). In a worktree the guard's
-> M2/M3 gates are worktree-exempt (they apply only to MAIN-checkout-effective
-> mutations), so these pass: condition-5 `git merge origin/main`. Stale-Merge's
-> `rebase` + bare `git push --force-with-lease`. Running the ceremony from the
+> the agent-infra hub is main+clean like every hub). In a worktree BOTH the
+> M2/M3 gates and the legacy destructive-block arm are worktree-exempt
+> (`eff.isWorktree`; M2/M3 apply only to MAIN-checkout-effective mutations, and
+> the legacy arm carries its own exemption), so these pass: condition-5
+> `git merge origin/main`, Stale-Merge's `rebase` + bare
+> `git push --force-with-lease`. Running the ceremony from the
 > HUB is not an option: in-hub `checkout -b` is blocked (#626) and the hub is the
 > shared tree.
 >
-> ⛔ **The remote delete is NOT worktree-exempt.** `git push origin --delete
-> "$PR_BRANCH"` hits the #73 coordinated-delete guard, which blocks deleting any
-> branch checked out in ANY worktree — including the caller's own (a worktree
-> session that holds $PR_BRANCH therefore blocks its own remote delete). Run it
-> AFTER the worktree teardown (05-cleanup.md Step 3.8 → merged-branch cleanup,
-> which orders teardown first), or via `gh api -X DELETE
-> repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH`.
+> ⛔ **The remote delete is #73-gated — and NOT worktree-exempt.** `git push
+> origin --delete <branch>` hits the #73 coordinated-delete guard, which blocks
+> deleting any branch checked out in ANY worktree — including the caller's own (a
+> worktree session that holds the branch therefore blocks its own remote delete).
+> The guard matches the LITERAL ref, so the shell-variable form `git push origin
+> --delete "$PR_BRANCH"` is NOT resolved by the classifier and is not
+> guard-matched. Run the cleanup AFTER the worktree teardown (05-cleanup.md
+> Step 3.8 → merged-branch cleanup, which orders teardown first), or delete the
+> remote ref via `gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/<branch>`.
 >
 > The local `git branch -D "$PR_BRANCH"` is best-effort: git itself refuses it
 > while the branch is checked out in this worktree (the guard's branch-force-delete
 > arm is worktree-exempt, but the git refusal stands), and after teardown the
 > HUB's main-checkout `block:branch-force-delete` gate blocks a branch that is
 > neither the session's baseline nor pid-owned — a branch created via `git worktree
-> add -b` is never recorded as owned (create-new is blocked, #626). Treat a block
-> as a WARN and leave the teardown note (05-cleanup's `||` fallback), or delete the
-> stale local ref manually (human terminal / `AGENT_ALLOW_MAIN_EDITS=1`).
+> add -b` is never recorded as owned (create-new is blocked, #626). A guard block
+> rejects the bash call BEFORE the shell runs, so the `||` echo in 05-cleanup never
+> fires on it — write the teardown note yourself, or delete the stale local ref
+> manually (human terminal / `AGENT_ALLOW_MAIN_EDITS=1`).
 
 **Step C — obsolete (#376 ceremony return applied only to the #99 in-main flow):**
 

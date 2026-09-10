@@ -279,6 +279,29 @@ ok("branchOp #626: switch --force-create=foo → force-create", (() => { const r
 ok("branchOp #626: checkout -fb foo (cluster, value = next argv) → create-new foo", (() => { const r = classifyBranchOp("checkout", ["-fb", "foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
 ok("branchOp #626: checkout --orphan=foo → orphan branch foo", (() => { const r = classifyBranchOp("checkout", ["--orphan=foo"]); return r.op === "orphan" && r.branch === "foo"; })());
 ok("branchOp #626: switch -d (detach) stays other (no false create)", op("switch", ["-d"]) === "other");
+// #626 review round-3 (P0): git's parse-options accepts UNAMBIGUOUS long-option
+// PREFIXES (`--cre` ≡ `--create`, `--force-c` ≡ `--force-create`, `--orph` ≡
+// `--orphan`; probe-verified git 2.50.1). Matching only the exact names left the
+// whole abbreviation family as a bypass.
+ok("branchOp #626: switch --cre=foo → create-new (long prefix)", (() => { const r = classifyBranchOp("switch", ["--cre=foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: switch --crea foo → create-new (long prefix, space form)", (() => { const r = classifyBranchOp("switch", ["--crea", "foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: switch --force-c=foo → force-create (long prefix)", (() => { const r = classifyBranchOp("switch", ["--force-c=foo", "main"]); return r.op === "force-create" && r.branch === "foo"; })());
+ok("branchOp #626: switch --force-creat main → force-create main", (() => { const r = classifyBranchOp("switch", ["--force-creat", "main"]); return r.op === "force-create" && r.branch === "main"; })());
+ok("branchOp #626: checkout --orph=v → orphan branch v", (() => { const r = classifyBranchOp("checkout", ["--orph=v"]); return r.op === "orphan" && r.branch === "v"; })());
+ok("branchOp #626: checkout --orp v → orphan branch v", (() => { const r = classifyBranchOp("checkout", ["--orp", "v"]); return r.op === "orphan" && r.branch === "v"; })());
+// ...while the EXACT --force flag is the force-switch, NOT force-create.
+ok("branchOp #626: switch --force main → force (exact --force is not --force-create)", op("switch", ["--force", "main"]) === "force");
+// ...and non-create long options that merely start with c/o stay non-create.
+ok("branchOp #626: checkout --conflict=merge main → not create", op("checkout", ["--conflict=merge", "main"]) !== "create-new");
+ok("branchOp #626: checkout --no-guess → other (not create)", op("checkout", ["--no-guess"]) === "other");
+// #626 review-round-4: the resolver is VERB-AWARE — `git checkout` has NO
+// --create/--force-create, so `--f`/`--fo`/`--for`/`--forc` are prefixes of the
+// VALID --force and `--c`/`--c=style` resolve to --conflict. Those must NOT be
+// classified as creates (git rc 0), or the guard blocks valid commands.
+ok("branchOp #626: checkout --f main → not create (git: --force, rc 0)", op("checkout", ["--f", "main"]) !== "create-new" && op("checkout", ["--f", "main"]) !== "force-create");
+ok("branchOp #626: checkout --forc main → not create (git: --force, rc 0)", op("checkout", ["--forc", "main"]) !== "create-new" && op("checkout", ["--forc", "main"]) !== "force-create");
+ok("branchOp #626: checkout --c=merge main → not create (git: --conflict, rc 0)", op("checkout", ["--c=merge", "main"]) !== "create-new" && op("checkout", ["--c=merge", "main"]) !== "force-create");
+ok("branchOp #626: checkout --orph / --orp still orphan (both verbs have --orphan)", op("checkout", ["--orph", "v"]) === "orphan" && op("switch", ["--orp", "v"]) === "orphan");
 ok("branchOp: checkout -f", op("checkout", ["-f", "main"]) === "force");
 ok("branchOp: checkout --force → force", op("checkout", ["--force", "main"]) === "force");
 ok("branchOp: switch --discard-changes → force (never the #376 return)", op("switch", ["--discard-changes", "main"]) === "force");

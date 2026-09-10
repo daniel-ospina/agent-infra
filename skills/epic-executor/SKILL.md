@@ -22,7 +22,7 @@ Execute all issues of an epic in dependency order by dispatching each issue as a
 
 This skill reads files (epic docs, plans) but does NOT write code directly — it dispatches to task sub-agents. No worktree needed for the dispatcher itself. Skip isolation for the dispatcher.
 
-**#265/#615 — implementer sub-agents need isolation:** sub-agents no longer inherit `AGENT_ALLOW_MAIN_EDITS` (env pivot). A WRITE-capable implementer sub-agent dispatched with `cwd` = a main checkout is blocked on write/edit + destructive git. Therefore: write-capable implementer sub-agents MUST be dispatched with a per-issue worktree `cwd` (issue-workflow Worktree Gate, record-first per #195) — **in every repo, agent-infra included** (the #99 in-main-work exemption was removed by #615: the agent-infra hub now carries the same M4 discipline as any other hub). Read-only sub-agents (reviewers, researchers) need no worktree — the guard only blocks writes.
+**#265/#615 — implementer sub-agents need isolation:** an unhatched controller's sub-agents carry no `AGENT_ALLOW_MAIN_EDITS` (#617 — a hatched controller's children DO inherit it via the env spread, so never rely on the child env; always pass a worktree `cwd`). A WRITE-capable implementer sub-agent dispatched with `cwd` = a main checkout is blocked on write/edit + destructive git. Therefore: write-capable implementer sub-agents MUST be dispatched with a per-issue worktree `cwd` (issue-workflow Worktree Gate, record-first per #195) — **in every repo, agent-infra included** (the #99 in-main-work exemption was removed by #615: the agent-infra hub now carries the same M4 discipline as any other hub). Read-only sub-agents (reviewers, researchers) need no worktree — the guard only blocks writes.
 
 ## The Process
 

@@ -282,7 +282,7 @@ Final reviewer: All requirements met, ready to merge
 
 **Never:**
 - Launch an unbounded nested `pi` — every nested/background pi launch carries the bounded template (TASK_HEARTBEAT=1 + PI_MODE=print, `mktemp` log, `sleep 1800` + `kill -0` watchdog, abort on no-marker) per the `## Never-Unbounded-Launch Rule` section.
-- Start implementation on main/master branch without explicit user consent
+- Start implementation on main/master at all — every implementation runs in an isolated worktree (#615/#626); the hub stays main + clean.
 - Skip reviews (spec compliance OR code quality)
 - Proceed with unfixed issues
 - Dispatch multiple implementation subagents in parallel (conflicts)
