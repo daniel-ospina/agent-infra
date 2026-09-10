@@ -560,9 +560,15 @@ function jobBlockOf(workflowLines, jobName) {
   // during review: an injected `ci:` in a block scalar left the gate unplugged at 163/163.
   const jobsIdx = workflowLines.findIndex((l) => /^jobs\s*:\s*$/.test(l));
   assert.ok(jobsIdx >= 0, "workflow no longer declares a top-level `jobs:` mapping");
+  // Derive the job-key indent from the mapping's first entry rather than hard-coding 2 spaces: a
+  // whole-file reindent is valid YAML, and a hard-coded indent would report "no such job" for a
+  // workflow whose jobs are all present.
+  const firstJob = workflowLines.slice(jobsIdx + 1).find((l) => l.trim() !== "");
+  const jobIndent = firstJob.match(/^\s*/)[0].length;
+  const jobKeyRe = new RegExp(`^ {${jobIndent}}[A-Za-z_][A-Za-z0-9_-]*\\s*:\\s*$`);
   const keyIdx = [];
   for (let i = jobsIdx + 1; i < workflowLines.length; i++) {
-    if (/^  [A-Za-z_][A-Za-z0-9_-]*\s*:\s*$/.test(workflowLines[i])) keyIdx.push(i);
+    if (jobKeyRe.test(workflowLines[i])) keyIdx.push(i);
   }
   // Compare on the normalized key (`ci :` is valid YAML for the key `ci`).
   const start = keyIdx.find(
@@ -664,23 +670,30 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares and consum
     withIdx >= 0,
     "the `ci:` job in ci.yml no longer passes a `with:` mapping to the node-ci.yml reusable workflow"
   );
+  const withIndent = callerJobLines[withIdx].match(/^\s*/)[0].length;
   const withLines = [];
   for (let i = withIdx + 1; i < callerJobLines.length; i++) {
     const l = callerJobLines[i];
     if (l.trim() === "") continue;
-    if (/^ {0,4}\S/.test(l)) break; // dedented back to the job level — end of the `with:` mapping
+    if (l.match(/^\s*/)[0].length <= withIndent) break; // dedented out of the mapping
     withLines.push(l);
   }
+  // Derive the child indent from the mapping's own entries — hard-coding 6 spaces would report a
+  // "key set changed" for a correctly-reindented workflow.
+  const childIndent = Math.min(...withLines.map((l) => l.match(/^\s*/)[0].length));
+  const childKeyRe = new RegExp(`^ {${childIndent}}([A-Za-z_][A-Za-z0-9_-]*)\\s*:`);
   assert.deepEqual(
     withLines
-      .map((l) => l.match(/^ {6}([A-Za-z_][A-Za-z0-9_-]*)\s*:/))
+      .map((l) => l.match(childKeyRe))
       .filter(Boolean)
       .map((m) => m[1]),
     ["test-command"],
     "the `ci:` job's `with:` key set changed — the pin gate's only input is `test-command` " +
       "(update deliberately, after confirming the suite still runs per-PR)"
   );
-  const binding = withLines.find((l) => /^ {6}test-command\s*:\s*\S/.test(l));
+  const binding = withLines.find((l) =>
+    new RegExp(`^ {${childIndent}}test-command\\s*:\\s*\\S`).test(l)
+  );
   assert.ok(
     binding && unquote(binding.replace(/^\s*test-command\s*:\s*/, "")) !== "",
     "the node-ci.yml call in ci.yml no longer passes a non-empty `test-command` — the " +
