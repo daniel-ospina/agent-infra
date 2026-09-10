@@ -432,7 +432,7 @@ ok("M2: allowActive bypasses", decideM2({ effectiveRepo: effMain, baseline, curr
 ok("M2: different repo allows", decideM2({ effectiveRepo: (() => { const r = resolveEffectiveRepo(`git -C "${OTHER}" commit`, MAIN); return r; })(), baseline, currentBranch: "main", verdict: "block:commit" }) === null);
 
 // ── decideM3 ───────────────────────────────────────────────────────────────
-ok("M3: create-new agent-infra → reBaseline", (() => { const d = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: true, baseline }); return d?.reBaseline === "feat/2"; })());
+ok("M3: create-new agent-infra BLOCKS in main (#626)", (() => { const d = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: true, baseline }); return d?.block === true && d.reason.includes("worktree"); })());
 ok("M3: create-new non-infra blocks", (() => { const d = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: false, baseline }); return d?.block === true; })());
 ok("M3: switch-existing blocks", (() => { const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline }); return d?.block === true; })());
 ok("M3: force blocks", (() => { const d = decideM3({ branchOp: { op: "force" }, isAgentInfra: true, baseline }); return d?.block === true; })());
@@ -656,11 +656,14 @@ ok("M3 #598: localBranchExists empty name → null", localBranchExists(MAIN, "")
 }
 
 // ── decideM3 #376: ceremony return-to-original-baseline carve-out ──────────
-// Post-ceremony session state: started on main (baseline.original — IMMUTABLE),
-// then created feat/2 via the agent-infra create-new carve-out (baseline re-based
-// to feat/2). `git checkout main` is the sanctioned return-to-main: the target is
-// provably the session's OWN recorded starting state, so #265's parallel-agent
-// hazard doesn't apply. Non-infra repos and foreign targets stay blocked.
+// Post-ceremony session state: started on main (baseline.original — IMMUTABLE).
+// In the #615 worktree model the create-new re-baseline no longer happens in
+// the hub (in-hub create-new is blocked since #626); the mid-ceremony state
+// (baseline re-based off main) arises from a RENAME of the session's own
+// baseline or a legacy/hatch ceremony. `git checkout main` remains the
+// sanctioned return-to-original: the target is provably the session's OWN
+// recorded starting state, so #265's parallel-agent hazard doesn't apply.
+// Non-infra repos and foreign targets stay blocked.
 const ceremony = { repoKey: mainKey, branch: "feat/2", original: "main" };
 ok("M3 #376: agent-infra switch-existing to ORIGINAL baseline → allowed (reBaseline)", (() => {
   const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
@@ -705,11 +708,10 @@ ok("M3 #376: other branch-state ops stay blocked (agent-infra, force/orphan/deta
     .every((op) => decideM3({ branchOp: { op }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey })?.block === true);
 })());
 ok("M3 #376: sanctioned return does NOT fire M1 deviation (re-baseline silences next M1)", (() => {
-  let s = { repoKey: mainKey, branch: "main", original: "main" }; // uncontended session_start on main
-  // create-new re-baseline (agent-infra carve-out) → baseline.branch = feat/2
-  const c = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: true, baseline: s, repoKey: mainKey });
-  if (c?.reBaseline !== "feat/2") return false;
-  s = { ...s, branch: c.reBaseline };
+  // Mid-ceremony state built directly (create-new can no longer re-baseline in
+  // the hub — #626 blocks it; the re-based state now arises from an own-baseline
+  // rename or a legacy/hatch ceremony): baseline.branch = feat/2, original = main.
+  let s = { repoKey: mainKey, branch: "feat/2", original: "main" };
   if (decideM1("feat/2", s.branch) !== null) return false; // on own branch: no warn
   // sanctioned return to the ORIGINAL baseline → re-baseline back to main
   const r = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: s, repoKey: mainKey });

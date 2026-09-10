@@ -1581,17 +1581,14 @@ export default function (pi: ExtensionAPI) {
           });
           if (m3?.block) return { block: true, reason: m3.reason };
           if (m3?.reBaseline) {
-            // Synchronous re-baseline: the allowed carve-out / own rename
+            // Synchronous re-baseline: the own-baseline RENAME (create-new
+            // never re-baselines since #626 — in-hub create-new is blocked)
             // adopts the new branch NOW — the next tool_call emits ZERO M1
-            // warns (AC3). Record branches this pid CREATED (create-new) or
-            // renamed its own baseline to — scoped to the BASELINE repo — so
-            // their post-ceremony LOCAL delete is still allowed after the #376
-            // return re-baselines to the original (#376 review fold-in).
-            if (branchOp.op === "create-new" && branchOp.branch) {
-              if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
-                _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.branch);
-              }
-            } else if (branchOp.op === "rename" && branchOp.to) {
+            // warns (AC3). Record the renamed-to branch — scoped to the
+            // BASELINE repo — so its post-ceremony LOCAL delete is still
+            // allowed after the #376 return re-baselines to the original
+            // (#376 review fold-in).
+            if (branchOp.op === "rename" && branchOp.to) {
               if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
                 _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.to);
               }

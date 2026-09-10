@@ -1697,7 +1697,7 @@ export function classifyGitCommandDetailed(command) {
     // P1-A: expose the STATE-mutating invocation's verb/args — M3 must classify
     // the invocation that changes branch state, not invocations[0] (a compound
     // `git pull && git checkout main` would otherwise classify "pull" and skip
-    // the gate, or false-block the sanctioned create-new carve-out).
+    // the gate, or false-block the #376 ceremony return-to-original carve-out).
     // #596 (round-2 reviewer, refined round-3): stateVerbOccurrence — the
     // 0-based ordinal of stateInv among the command's EXTRACTOR-VISIBLE
     // invocations with the SAME verb (cmdVisible — spelled with the literal
@@ -2070,7 +2070,8 @@ export function getMainCheckoutBranch() {
  * removed (#615): agent-infra's main checkout gets the same hub discipline as
  * every other repo (M4 disorder gates + write/edit block + hub-state checks).
  * The flag still feeds branch-ownership M2/M3 ceremony semantics (own-baseline
- * work in agent-infra worktrees; create-new → reBaseline), and repo-freshness
+ * work in agent-infra worktrees; the #376 ceremony return-to-original arm —
+ * in-hub create-new is blocked since #626), and repo-freshness
  * (auto-sync owns the repo). Shared-state edits (MEMORY.md, skills, config,
  * extension code) land via worktrees → merge → sync, never direct in-hub.
  *

@@ -969,11 +969,12 @@ expectBool("detailed+shared: checkout main f.txt (restore) → other", co(`git c
 dexpect("restore-from-branch verdict stays block:checkout-branch", `git checkout main .`, { verdict: "block:checkout-branch", branchState: true });
 
 // ── #376: M3 ceremony return-to-baseline pins ─────────────────────────────
-// A ceremony session started on main (original baseline, immutable), re-based
-// to feat/2 via the agent-infra create-new carve-out, then merges. The guard
-// path classify → classifyBranchOp → decideM3 must ALLOW `git checkout main`
-// back to the ORIGINAL baseline in agent-infra, block foreign targets, and
-// keep non-infra repos fully blocked (worktrees only).
+// A ceremony session started on main (original baseline, immutable) and is
+// mid-ceremony off main (baseline re-based — via own-baseline rename or a
+// legacy/hatch ceremony; in-hub create-new itself has been blocked since
+// #626). The guard path classify → classifyBranchOp → decideM3 must ALLOW
+// `git checkout main` back to the ORIGINAL baseline in agent-infra, block
+// foreign targets, and keep non-infra repos fully blocked (worktrees only).
 {
   const ceremonyBaseline = { repoKey: "k", branch: "feat/2", original: "main" };
   const m3 = (cmd) => {
@@ -996,9 +997,10 @@ dexpect("restore-from-branch verdict stays block:checkout-branch", `git checkout
   const nonInfra = sharedDecideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline: ceremonyBaseline, currentBranch: "feat/2", repoKey: "k" });
   expectBool("#376: non-infra repo return-to-original STILL blocked", nonInfra?.block === true, true);
   // Post-return local delete of the session's OWN merged branch: the index.ts
-  // wiring records create-new branches per pid (ownedBranches), so once the
-  // baseline re-based to main the branch-force-delete allowance still accepts
-  // the merged ceremony branch (git refuses deleting a checked-out branch).
+  // wiring records pid-owned ceremony branches (ownedBranches — rename/_markOwned;
+  // legacy create-new), so once the baseline re-based to main the branch-force-
+  // delete allowance still accepts the merged ceremony branch (git refuses
+  // deleting a checked-out branch).
   expectBool("#376: post-return branch -D of pid-owned merged branch → allowed", sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === true, true);
   expectBool("#376: post-return branch -D of foreign branch → blocked (not owned)", sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/other"] }) === false, true);
 }

@@ -35,9 +35,10 @@ handled deletion separately).
 
 ```bash
 # BRANCH = the merged PR branch — resolve via gh FIRST. Deriving from the current
-# branch is ambiguous after the #376 Step C return: an in-main ceremony session
-# now sits on main, and `git branch --show-current` would target the default
-# branch. gh knows the PR's head branch regardless of local checkout state.
+# branch is ambiguous after the ceremony: a worktree session returns to its base
+# (or is torn down) and its current checkout is no longer the PR head — and
+# `git branch --show-current` would target the wrong branch. gh knows the PR's
+# head branch regardless of local checkout state.
 BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=$(git branch --show-current)
 

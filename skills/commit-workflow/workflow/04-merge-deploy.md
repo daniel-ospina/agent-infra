@@ -125,43 +125,29 @@ touching the default-branch worktree. If Step B's remote delete reports
 `remote ref does not exist`, the branch was already deleted server-side
 (deleteBranchOnMerge) — that is success, not an error.
 
-> **#265 branch-ownership allowance:** in agent-infra main, the main-worktree-guard
-> allows this ceremony's commands when the session is on its OWN baseline branch:
-> condition-5 `git merge origin/main`, Step B `git push origin --delete "$PR_BRANCH"`
-> and `git branch -D "$PR_BRANCH"`, and Stale-Merge's `rebase` + bare
-> `git push --force-with-lease` (the bare push compares the CURRENT branch — push
-> `--force-with-lease` is NOT classified as `--force`). If the guard reports "branch
-> ownership violated", the shared checkout was switched mid-ceremony — `git
-> checkout -b <fresh-branch>` (M3 carve-out re-baselines) and re-run the ceremony.
+> **#265/#615 ceremony posture:** ceremonies run from the session's WORKTREE —
+> agent-infra included (the #99 in-main-work exemption was removed in #615, so
+> the agent-infra hub is main+clean like every hub). In a worktree the guard's
+> branch-ownership gates are worktree-exempt (M2/M3 apply only to MAIN-checkout-
+> effective mutations), so the ceremony's own-branch hygiene ops run ungated:
+> condition-5 `git merge origin/main`, Step B `git push origin --delete
+> "$PR_BRANCH"` and `git branch -D "$PR_BRANCH"`, and Stale-Merge's `rebase` +
+> bare `git push --force-with-lease`. In the HUB, the same commands are gated by
+> the ownership allowance (own baseline branch) — do not run the ceremony from
+> the hub; run it from the worktree that holds the PR branch.
 
-**Step C — return to the session's ORIGINAL baseline (#376, agent-infra main only):**
+**Step C — obsolete (#376 ceremony return applied only to the #99 in-main flow):**
 
-Applies ONLY to ceremonies run directly in the **agent-infra main checkout** (the #99/#265 in-main flow). Sessions working in an isolated worktree — infra or not — skip Step C; their worktree teardown (05-cleanup.md Step 3.8) handles the return.
-
-```bash
-# The ceremony session started on main, so `main` is its ORIGINAL baseline (the
-# branch recorded at session_start BEFORE the create-new re-baseline to the PR
-# branch). The merge-ceremony flow is: start on main → checkout -b feat/N →
-# merge → delete feat/N → RETURN to main. Without this step the session is
-# stranded on the deleted feature branch for the rest of its life.
-git checkout main
-# #376: allowed — M3's return-to-original-baseline carve-out lets the session
-# switch back to the branch recorded at its session_start (its de-facto baseline;
-# the lock serializes concurrent starts only). Agent-infra main ONLY, and ONLY in
-# the checkout that recorded that baseline (repoKey scoping); the guard re-adopts
-# main as the baseline, so no M1 deviation warning fires. Non-infra repos and
-# other checkouts still block switch-existing.
-
-# Step B may have deferred the merged branch's LOCAL delete while it was checked
-# out here; the return to main releases that lock. Deleting it now is own-branch
-# hygiene: the guard allows a LOCAL `git branch -D` of a branch this session
-# created via the M3 create-new carve-out (pid-owned), even after the baseline
-# re-based to main (#376). 05-cleanup.md's merged-branch cleanup resolves the PR
-# branch via `gh pr view` headRefName (never the current branch) and runs that
-# delete from main.
-```
-
-Non-agent-infra sessions and agent-infra **worktree** sessions skip Step C — after the merge ceremony their feature work lives in an isolated worktree, and 05-cleanup's teardown returns them to their base.
+Step C existed for ceremonies run directly in the **agent-infra main checkout**
+(start on main → `checkout -b feat/N` → merge → return to main) — the #99/#265
+in-main flow. #615 removed that flow: agent-infra implementers now work in
+isolated worktrees like every repo, and the guard BLOCKS in-hub `checkout -b`
+in agent-infra too (the M3 create-new carve-out was removed in #626). Worktree
+sessions need no return step — their teardown (05-cleanup.md Step 3.8) removes
+the worktree and returns the session to its base. The guard's #376
+return-to-original-baseline arm remains in code as a recovery path (a hub
+session switched out from under it may `git checkout` back to the branch it
+STARTED on — its recorded original) but no skill ceremony uses it.
 
 ## Auto-merge for strict up-to-date protection (#500 — merge-race ladder)
 
