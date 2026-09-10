@@ -4784,7 +4784,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         ["--delete-after", 0], ["--delete-excluded", 0], ["--ignore-errors", 0], ["--force", 0],
         ["--max-delete", 1], ["--max-size", 1], ["--min-size", 1], ["--max-alloc", 1], ["--partial", 0],
         ["--partial-dir", 1], ["--backup-dir", 1], ["--suffix", 1], ["--checksum-seed", 1],
-        ["--checkpoint-action", 1], ["--info", 0], ["--debug", 0], ["--stderr", 1], ["--outbuf", 1],
+        ["--checkpoint-action", 1], ["--info", 1], ["--debug", 1], ["--stderr", 1], ["--outbuf", 1],
         ["--config", 1], ["--dparam", 1], ["--copy-as", 1],
         ["--copy-devices", 0], ["--write-devices", 0], ["--delete-missing-args", 0], ["--delay-updates", 0], ["--prune-empty-dirs", 0], ["--numeric-ids", 0],
         ["--usermap", 1], ["--groupmap", 1], ["--chown", 1], ["--timeout", 1], ["--contimeout", 1],
@@ -4802,7 +4802,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         ["--version", 0], ["--help", 0], ["--daemon", 0], ["--no-detach", 0], ["--old-args", 0],
         ["--rsync-path", 1], ["--msgs2stderr", 0],
       ];
-      const RSYNC_OP_SHORT = new Set(["-e", "-f", "-B", "-T", "-M", "-S"]);
+      const RSYNC_OP_SHORT = new Set(["-e", "-f", "-B", "-T", "-M"]);   // rsync `-S` is --sparse, NOT --suffix
       const isRsyncOperand = (w) => {
         const eq = w.indexOf("=");
         const name = eq === -1 ? w : w.slice(0, eq);
@@ -5896,35 +5896,46 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (!isOpt || opt.k <= k) break;
         k = skipWs(opt.k);
       }
-      let qd = null;
-      if (s[k] === "$" && (s[k + 1] === "'" || s[k + 1] === '"')) { qd = s[k + 1]; k++; }
-      else if (s[k] === "'" || s[k] === '"') qd = s[k];
+      // ANSI-C `$'…'` / `$"…"` quoting — decode escapes with the canonical
+      // translator. A decode that PRODUCES `>` (`\x3e`, `\076`) must be seen
+      // as a redirect (#625 cycle-6 P2/P3).
+      const ansi = s[k] === "$" && (s[k + 1] === "'" || s[k + 1] === '"');
+      if (ansi) k++;
+      const qd = s[k] === "'" || s[k] === '"' ? s[k] : null;
+      let pl = "";
+      let j = k;
       if (qd) {
-        k++;
-        let pl = "";
-        while (k < n && s[k] !== qd && pl.length < 4096) {
-          if (qd === '"' && s[k] === "\\" && k + 1 < n) {
+        j++;
+        while (j < n && s[j] !== qd && pl.length < 4096) {
+          if (qd === '"' && s[j] === "\\" && j + 1 < n) {
             // dq escape (cycle-15 D2): \" / \\ / \$ → the literal next char
-            pl += s[k + 1];
-            k += 2;
+            pl += s[j + 1];
+            j += 2;
             continue;
           }
-          if (qd === "'" && s[k] === "\\" && k + 1 < n && (s[k + 1] === "'" || s[k + 1] === "\\")) {
-            // ANSI-C `$'…'` escapes (approximate): unescape \' and \\
-            pl += s[k + 1];
-            k += 2;
-            continue;
-          }
-          pl += s[k]; k++;
+          pl += s[j]; j++;
         }
-        const _ip4 = { payload: pl, cwd }; inlinePays.push(_ip4, ...forkTwins(_ip4));
-        i = k + 1;
+        j++;
+        if (w0.w === "eval") {
+          // `eval` concatenates ALL its arguments into ONE command — append the
+          // remaining words (one level of shell quote/backslash removal) so a
+          // metacharacter passed as a separate argument is seen (#625 cycle-6
+          // B4: `eval 'printf x' '> MEMORY.md'`).
+          let e = j;
+          while (e < n && !";|&()\n".includes(s[e])) e++;
+          const tail = s.slice(j, e).replace(/'([^']*)'/g, "$1").replace(/"([^"]*)"/g, "$1").replace(/\\(.)/g, "$1");
+          if (tail.trim()) pl += " " + tail.trim();
+          j = e;
+        }
       } else {
-        let pl = "";
-        while (k < n && !";|&()\n".includes(s[k]) && pl.length < 4096) { pl += s[k]; k++; }
-        const _ip5 = { payload: pl.trim(), cwd }; inlinePays.push(_ip5, ...forkTwins(_ip5));
-        i = k;
+        let e = k;
+        while (e < n && !";|&()\n".includes(s[e])) e++;
+        pl = s.slice(k, e).replace(/'([^']*)'/g, "$1").replace(/"([^"]*)"/g, "$1").replace(/\\(.)/g, "$1");
+        j = e;
       }
+      const payload = (ansi ? _ansiTranslate(pl) : pl).trim();
+      const _ip = { payload, cwd }; inlinePays.push(_ip, ...forkTwins(_ip));
+      i = j;
       continue;
     }
   }
