@@ -333,12 +333,14 @@ try {
   // state, a cross-checkout `.git/` target blocks too (F4), a cross-checkout
   // overwrite of an EXISTING untracked hub file blocks (cycle-3 A-2 — only
   // genuinely NEW files are additive), the nested-own-tree exemption requires
-  // a NON-main session (cycle-3 B-1), and only a session rooted in a
-  // DISORDERED main freezes on its own tracked overwrites. markerOn mirrors
-  // the index marker branch: cross-checkout bypassed, own-rooted clean is an
-  // open recovery window, disordered-own keeps the M4 D3 freeze (cycle-2
-  // marker parity). Mirror contract = guardDecision (index.ts not importable;
-  // source pins below are the regression tripwire).
+  // a NON-main session (cycle-3 B-1), and (#625) a SAME-checkout tracked
+  // overwrite blocks in EITHER hub state — clean or disordered (the old
+  // clean-hub residual is removed; own-main untracked/new writes stay
+  // allowed). markerOn mirrors the index marker branch: cross-checkout
+  // bypassed, own-rooted clean is an open recovery window, disordered-own
+  // keeps the M4 D3 freeze (cycle-2 marker parity). Mirror contract =
+  // guardDecision (index.ts not importable; source pins below are the
+  // regression tripwire).
   const bashGateDecision = (command, sessionCwd, markerOn = false) => {
     const realp = (p) => {
       let d = resolve(p); let tail = "";
@@ -374,7 +376,7 @@ try {
         if (!sameCheckout) continue; // marker bypasses the #618 cross gate (tool parity)
         if (disorder === null) continue; // clean own main under the marker — open recovery window
         if (rel === ".git" || rel.startsWith(".git/")) return "BLOCK (hub .git)"; // M4 D3 freeze
-        if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (disordered tracked)";
+        if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (hub tracked)";
         continue;
       }
       // .git-metadata (exact ".git" pointer or ".git/..."): never tracked,
@@ -382,12 +384,10 @@ try {
       // (cycle-2 P1 + cycle-3 B-2: same-rooted included; only the marker's
       // own-rooted clean window is open, handled above).
       if (rel === ".git" || rel.startsWith(".git/")) return "BLOCK (hub .git)";
-      if (sameCheckout) {
-        if (disorder === null) return "ALLOW (clean same-checkout)";
-        if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (disordered tracked)";
-        continue;
-      }
+      // #625: the tracked test is STATE-INDEPENDENT — a tracked own-hub write
+      // blocks clean OR disordered (own untracked/new writes fall through).
       if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (hub tracked)";
+      if (sameCheckout) continue;
       // cycle-3 A-2: cross-checkout overwrite of an EXISTING untracked hub
       // file (another session's hub WIP) blocks; NEW files stay additive.
       try { if (existsSync(tReal) && statSync(tReal).isFile()) return "BLOCK (hub existing untracked)"; } catch { /* treat as new */ }
@@ -411,7 +411,26 @@ try {
   bashPin("bash#618: foreign cwd → hub .git metadata (F4) → BLOCK", `echo x > ${hub}/.git/hooks/pre-commit`, parent, "BLOCK (hub .git)");
   bashPin("bash#621: hub-rooted CLEAN session → own hub .git hook (P1) → BLOCK", `echo x > ${hub}/.git/hooks/pre-commit`, hub, "BLOCK (hub .git)");
   bashPin("bash#621: infra-rooted session → hub TRACKED → BLOCK", `echo x > ${hub}/AGENTS.md`, infra, "BLOCK (hub tracked)");
-  bashPin("bash#621: hub-rooted session → own TRACKED while CLEAN → ALLOW (#437 residual)", `echo x > ${hub}/AGENTS.md`, hub, "ALLOW (clean same-checkout)");
+  // #625 vector 1 — the clean-hub compound. The tracked write must gate on the
+  // command's EFFECT (a tracked hub-main write), not on pre-execution disorder:
+  // a hub-rooted main+CLEAN session running write+add+commit+push in ONE
+  // tool_call used to slip (M4's git gate never ran because st.disorder was
+  // null, and decideM2 saw an on-baseline session).
+  bashPin("#625: hub-rooted CLEAN session → own TRACKED redirect → BLOCK (effect-gated)", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN compound (write+add+commit+push) → BLOCK", `printf 'x' >> ${hub}/AGENTS.md && git add ${hub}/AGENTS.md && git commit -m chore && git push origin main`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN compound (tee+commit+push) → BLOCK", `echo x | tee -a ${hub}/AGENTS.md && git commit -am chore && git push origin main`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN compound via bash -c payload → BLOCK", `bash -c "printf 'x' >> ${hub}/AGENTS.md && git commit -am chore"`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN own UNTRACKED new file → ALLOW (additive)", `echo x > ${hub}/docs/_pin625-new.md`, hub, "ALLOW (no hub-main write)");
+  // #625 vector 2 — in-place overwrite VERBS (no write-primitive token).
+  bashPin("#625: hub-rooted CLEAN sed -i on tracked hub file → BLOCK", `sed -i s/a/b/ ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN perl -pi on tracked hub file → BLOCK", `perl -pi -e 's/a/b/' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: wt session cp onto tracked hub file → BLOCK", `cp ${wt}/src-625.md ${hub}/AGENTS.md`, wt, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN mv onto tracked hub file → BLOCK", `mv ${hub}/tmp-625.md ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN truncate tracked hub file → BLOCK", `truncate -s 0 ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN dd of= tracked hub file → BLOCK", `dd if=/dev/zero of=${hub}/AGENTS.md bs=1 count=0`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: wt session rsync onto tracked hub file → BLOCK", `rsync -a ${wt}/src-625.md ${hub}/AGENTS.md`, wt, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN ln -sf over tracked hub file → BLOCK", `ln -sf /tmp/x ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN in-place verb on WORKTREE file → ALLOW", `sed -i s/a/b/ ${wt}/wt-own.txt`, hub, "ALLOW (no hub-main write)");
   bashPin("bash#621: hub-rooted session → own worktree file → ALLOW", `cd ${wt} && echo x > wt-own.txt`, hub, "ALLOW (no hub-main write)");
   // cycle-2 marker-parity pins (bashGateDecision markerOn param — the matrix
   // the index classify marker branch implements; the real marker file itself
@@ -420,10 +439,10 @@ try {
   bashPin("bashMarker: hub-rooted CLEAN own tracked under marker → ALLOW (recovery)", `echo x > ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)", true);
   bashPin("bashMarker: hub-rooted CLEAN own .git hook under marker → ALLOW (window)", `echo x > ${hub}/.git/hooks/pre-commit`, hub, "ALLOW (no hub-main write)", true);
   execSync("touch stray.txt", { cwd: hub, stdio: "ignore" });
-  bashPin("bash#437: hub-rooted session → own TRACKED while DIRTY → BLOCK", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (disordered tracked)");
+  bashPin("bash#437/#625: hub-rooted session → own TRACKED while DIRTY → BLOCK", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("bash#437: hub-rooted DIRTY session → own NEW file → ALLOW", `echo x > ${hub}/docs/new-bash.md`, hub, "ALLOW (no hub-main write)");
   // cycle-2 marker parity, disordered-own side (M4 D3 keeps freezing).
-  bashPin("bashMarker: hub-rooted DIRTY own tracked under marker → BLOCK (M4 D3)", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (disordered tracked)", true);
+  bashPin("bashMarker: hub-rooted DIRTY own tracked under marker → BLOCK (M4 D3)", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)", true);
   bashPin("bashMarker: hub-rooted DIRTY own .git hook under marker → BLOCK (M4 D3)", `echo x > ${hub}/.git/hooks/pre-commit`, hub, "BLOCK (hub .git)", true);
   execSync("rm stray.txt", { cwd: hub, stdio: "ignore" });
   // Cycle-2 fold-in fixtures: a PRIVATE nested repo under the session's own
@@ -608,8 +627,25 @@ expectBool("rev2: script budget hardened to 64 + fail-closed kind", pinSrc.inclu
 expectBool("rev2: .git rel-exact also in the block-reason fn", pinSrc.includes("hit.rel === \".git\" || hit.rel.startsWith(\".git/\")"), true);
 expectBool("rev3: containment capped at NON-main sessions (ancestor-main cannot lift the freeze)", pinSrc.includes("!sessionCheck.isMain && sessionTop"), true);
 expectBool("rev3: bash route existing-untracked overwrite freeze (kind + crossTop)", pinSrc.includes("kind: \"untracked-existing\"") && pinSrc.includes("crossTop"), true);
-expectBool("rev3: script exhaustion fails closed only on hub-proximity evidence", pinSrc.includes("grouped.size === 0 && !(sessionOwnHub !== null && sessionDisorder !== null)"), true);
+expectBool("rev3: script exhaustion fails closed on hub-proximity evidence (#625: any own-hub session)", pinSrc.includes("grouped.size === 0 && sessionOwnHub === null"), true);
 expectBool("rev3: .git doctrine reconciled (block reason names the marker window as the only open state)", pinSrc.includes("an active escape-marker's own-rooted clean recovery window"), true);
+
+// ── #625 source pins (index.ts + classify-git.mjs) ────────────────────────
+// The clean-hub bash tracked-write residual was removed (the tracked test is
+// now state-independent for a session's own hub), and the walker surfaces the
+// in-place overwrite VERBS. Trip on a literal/merge revert of either half.
+expectBool("#625 source pin: clean-same-checkout early return removed", !pinSrc.includes("} else if (sameCheckout) {"), true);
+expectBool("#625 source pin: only the marker's clean own-main window keeps a sessionDisorder-null skip", (pinSrc.match(/sessionDisorder === null\) return;/g) ?? []).length === 1, true);
+expectBool("#625 source pin: in-place verb set declared (INPLACE_WRITE_VERBS)", classifySrc.includes("INPLACE_WRITE_VERBS"), true);
+expectBool("#625 source pin: verb target resolver wired (verbTargets closure)", classifySrc.includes("const verbTargets = (verb, k0) => {"), true);
+expectBool("#625 source pin: verb dispatch is command-position + basename-normalized", classifySrc.includes("INPLACE_WRITE_VERBS.has(verbBase)"), true);
+expectBool("#625 source pin: verb candidates enter the target assembly", classifySrc.includes("for (const v of verbToks) push(v.raw, v.cwd, v.via, \"site\")"), true);
+expectBool("#625 source pin: sed/perl in-place flag detected", classifySrc.includes("letters.includes(\"i\")") && classifySrc.includes("--in-place"), true);
+expectBool("#625 source pin: cp/mv -t target-directory handled", classifySrc.includes("--target-directory="), true);
+expectBool("#625 source pin: dd of= operand surfaced", classifySrc.includes("w.startsWith(\"of=\")"), true);
+expectBool("#625 source pin: mv surfaces its sources (removal is a tracked mutation)", classifySrc.includes("if (verb === \"mv\") {"), true);
+expectBool("#625 source pin: rsync/ln destination handled", classifySrc.includes("if (verb === \"rsync\" || verb === \"ln\")"), true);
+expectBool("#625 source pin: block reason names verb coverage", pinSrc.includes("in-place overwrite verbs"), true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
 function expectBranches(command, expectedArray) {
@@ -4184,6 +4220,59 @@ try {
     has("case a in (a) cd y/a;; esac; echo hi > t.md", "redirect:H/y/a/t.md", "paren-led arm body cd applies");
     const none = (cmd, label) => expectBool(`C437r44: ${label}`, pluck(cmd).length === 0, true);
     none("echo hi", "prose silence");
+  }
+
+  // ── #625: in-place overwrite VERBS — walker-level pins. The primitive-only
+  // walk (`>`/`>>`/`tee`/python open) never surfaced `sed -i`/`cp`/`mv`/
+  // `truncate`/`dd of=`/`perl -pi`/`awk -i inplace` onto a tracked hub file,
+  // so the same-file write was blocked via redirect but slipped via the verb.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt625-"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C625: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C625: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    const none = (cmd, label) => expectBool(`C625: ${label}`, pluck(cmd).length === 0, true);
+    // sed
+    has("sed -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed -i target");
+    has("sed --in-place s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-place target");
+    has("sed -i.bak -e s/a/b/ tracked.md", "sed:H/tracked.md", "sed -i.bak with -e script");
+    has("sed -ni s/a/b/ tracked.md", "sed:H/tracked.md", "sed -ni cluster");
+    has("sed -i -e s/a/b/ -e s/c/d/ one.md two.md", "sed:H/two.md", "sed -i multiple files");
+    none("sed s/a/b/ tracked.md", "sed without -i is a read → no target");
+    none("sed -e s/a/b/ tracked.md", "sed -e without -i → no target");
+    none("grep -i foo tracked.md", "grep -i is not an in-place editor");
+    // perl
+    has("perl -pi -e s/a/b/ tracked.md", "perl:H/tracked.md", "perl -pi target");
+    has("perl -i -pe 's/a/b/' tracked.md", "perl:H/tracked.md", "perl -i -pe target");
+    none("perl -p -e s/a/b/ tracked.md", "perl without -i is a read");
+    // awk (gawk -i inplace)
+    has("awk -i inplace '{print}' tracked.md", "awk:H/tracked.md", "awk -i inplace target");
+    has("gawk --include=inplace '{print}' tracked.md", "gawk:H/tracked.md", "gawk --include=inplace target");
+    none("awk '{print}' tracked.md", "awk without inplace is a read");
+    // cp / mv / install
+    has("cp src.md tracked.md", "cp:H/tracked.md", "cp destination");
+    has("cp -f src.md tracked.md", "cp:H/tracked.md", "cp -f destination");
+    has("cp src.md mid.md tracked.md", "cp:H/tracked.md", "cp multi-source: last positional is dst");
+    has("cp -t subdir src.md", "cp:H/subdir", "cp -t target-directory");
+    has("cp --target-directory=subdir src.md", "cp:H/subdir", "cp --target-directory= attached");
+    has("/bin/cp src.md tracked.md", "cp:H/tracked.md", "path-qualified cp");
+    has("mv src.md tracked.md", "mv:H/tracked.md", "mv destination overwrite");
+    has("mv tracked.md outdir", "mv:H/tracked.md", "mv SOURCE (deletes the tracked file)");
+    has("install -m 644 src.md tracked.md", "install:H/tracked.md", "install destination (-m operand skipped)");
+    has("rsync -a src/ tracked.md", "rsync:H/tracked.md", "rsync destination");
+    has("rsync -a --delete src/ mid/ tracked.md", "rsync:H/tracked.md", "rsync dst is the last positional");
+    lacks("rsync -a src/ host:dest", "rsync:H/src/", "rsync remote dst is not a local hub target");
+    has("ln -sf /tmp/x tracked.md", "ln:H/tracked.md", "ln link target");
+    // truncate / dd
+    has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
+    has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");
+    has("dd if=/dev/zero of=tracked.md bs=1 count=0", "dd:H/tracked.md", "dd of= target");
+    lacks("dd if=tracked.md of=/tmp/x", "dd:H/tracked.md", "dd reading a tracked file is not a hub write");    // command-position / arg-position discipline
+    none("git mv a b", "git mv is a git verb, not the bash mv");
+    none("echo cp a b", "cp as an ARG is not a command");
+    none("echo sed -i s/a/b/ tracked.md", "sed as an ARG is not a command");
+    lacks("cp tracked.md /tmp/", "cp:H/tracked.md", "cp OUT of the hub: dst is /tmp, src is a read");
   }
 
   // ── #437 (C): firstHubTrackedWrite — pure intersect for the disordered-hub
