@@ -77,9 +77,12 @@ tripwire wired into the per-PR path.
    `docs/upstream-pi-bugs.md`'s historical v0.84.3 probe record is **deliberately preserved** as
    version-stamped history, annotated "re-verified pi v0.85.1 — zero drift".
 5. **New pin-lockstep tripwire `(h)`** in `scripts/check-skill-lint.test.mjs`: every
-   `@earendil-works/pi-*` pin in `extensions/*/package.json` (`dependencies` **or** `devDependencies`)
-   must equal `PI_VERSION_PIN`, and the per-extension pin count must match the expected map (a bare
-   zero-match check passed when coverage silently collapsed — see item 7).
+   `@earendil-works/pi-*` pin in `extensions/*/package.json` in any of the six pin-bearing fields
+   (`dependencies` / `devDependencies` / `peerDependencies` / `optionalDependencies` / `overrides` /
+   `resolutions`) must equal `PI_VERSION_PIN`, and the per-extension pin count must match the expected
+   map (a bare zero-match check passed when coverage silently collapsed — see item 7). **Bound:** it
+   reads the direct `extensions/*/package.json` manifests only — nested and repo-root manifests are not
+   walked (→ #643).
 6. **Per-PR wiring (fix round; also review gate #2 P1 / gate #4 P0).** `.github/workflows/ci.yml` passes
    `test-command: node scripts/check-skill-lint.test.mjs` to its `node-ci.yml` call, so a partial pin
    bump **reports on the PR that introduces it** rather than only in `ci-main` after merge. The suite is
@@ -102,14 +105,19 @@ tripwire wired into the per-PR path.
      mirror surfaces (`docs/providers.md`, `extensions/custom-provider-qwen/index.ts`,
      `scripts/frontmatter-validate.mjs`, `.github/workflows/ci-main.yml`) is either `PI_VERSION_PIN` or an
      explicitly allowed non-pi dependency version (yaml `2.9.0`, undici `8.9.0`), with a per-surface
-     "contributed a pi stamp" assertion so a rewording cannot silently no-op the guard. **This is the
+     stamp-**count** map (`{providers.md: 1, qwen: 1, frontmatter-validate.mjs: 3, ci-main.yml: 2}`) so
+     a lost surface **or** a dropped stamp is red (the first attempt — a `>= 1 per surface` presence
+     check — stayed green when a surface lost one of three). **This is the
      class that actually escaped on 2026-08-10.** Accepted residuals: the allowlist is keyed by version
      string (not occurrence) and only 3-component literals are scanned.
-   - **`(j)` per-PR wiring self-check** — asserts `ci.yml` still binds a non-empty `test-command` running
-     `check-skill-lint.test.mjs` on the `node-ci.yml` call, that `node-ci.yml` declares that input, that
-     the `unit-test` job exists, that BOTH the job and custom-step `if:` are exactly the known-good
-     predicates (an added conjunct can make the job unsatisfiable while every check stays green), and
-     that the custom-test step actually `run:`s the input. Without it the gate
+   - **`(j)` per-PR wiring self-check** — asserts `ci.yml` still binds `test-command` on the `node-ci.yml`
+     call, that the value is **exactly** `node scripts/check-skill-lint.test.mjs` (a `|| true` suffix
+     would leave the job green while the gate can never go red), that `node-ci.yml` declares that input,
+     that the `unit-test` job exists, that BOTH the job and custom-step `if:` are exactly the known-good
+     predicates (an added conjunct can make the job unsatisfiable while every check stays green), that
+     the custom-test step actually `run:`s the input, that no `continue-on-error:` appears in the
+     `unit-test` job block, and that the **caller** `ci:` job carries no `if:`/`continue-on-error:` (the
+     most natural way to disable a workflow, and invisible to a callee-only check). Without it the gate
      can be silently unplugged by removing the binding (the job skips) — and `actionlint`
      cannot catch it. **Caveat:** it reads the BRANCH-LOCAL `node-ci.yml`, while `ci.yml` executes
      `@main`; a main-side change to a stale branch is invisible, so the live per-PR run (Verification
@@ -118,7 +126,7 @@ tripwire wired into the per-PR path.
    - **`(h)` pin-count assertion** — a presence check (`matched > 0`) was the first attempt; it stayed
      green when coverage collapsed 6 pins → 1, and the follow-up *roster* (name set) also stayed green
      when 3 of subagent's 4 pins were deleted. It now asserts the per-extension pin **count** map.
-   All four guards were negative-tested: each verified **red** against a deliberate mutation (pin drift,
+   All three guards were negative-tested: each verified **red** against a deliberate mutation (pin drift,
    mirror-stamp drift, removed `test-command` binding, removed pins) and the tree restored.
 
 ### Lockfile verification
@@ -157,7 +165,7 @@ than restating literals, because these numbers have already moved once inside th
 | Layer | Surface | Command / expectation |
 |---|---|---|
 | Unit | validator + fixtures + `(h)`/`(i)`/`(j)` guards | `node scripts/check-skill-lint.test.mjs` → **163/163** (corpus floor raised 120 → 122) |
-| Unit (negative) | the four pin guards | each verified **red** against a deliberate mutation (pin drift, mirror-stamp drift, removed `test-command` binding, removed pins), then restored |
+| Unit (negative) | the three pin guards | each verified **red** against a deliberate mutation (pin drift, mirror-stamp drift, removed `test-command` binding, removed pins), then restored |
 | Oracle | validator ↔ real pi loader | `node scripts/check-skill-lint.oracle.test.mjs` → **146/146**, fuzz **0/1000**, corpus 122 |
 | Contract | CI devDep resolution | review-enforcer **113/113**; verification-gate **296** unit + **81** e2e; subagent timeout + cache suites |
 | Unit | custom-provider fetch override | `extensions/custom-provider-qwen/provider.test.ts` **13/13** (machine-local — not wired into CI) |
@@ -276,7 +284,7 @@ strong — see #651.
 |---|---|---|---|
 | **B — static drift at PR time** | version compare in `--check`; promote `(h)` to per-PR | **Per-PR promotion adopted** (item 6). The `--check` version leg is a genuine **design fork** — should `--check` fail when the machine is *ahead* of the repo? `docs/providers.md` documents `--check` as the patch-state "Verify anytime" command and makes no version claim, so this is an addition, not a broken contract; #642 already offers both resolutions. Cost of the adopted half: +1 `ubuntu-latest` runner per PR (~1–2 billed min, independent of the ~4s of test work) against the shared Actions budget. | If the next pi bump were imminent — `--check` is the only drift signal a developer can run locally on demand. |
 | **C — decoupled oracle in CI** | `--bundle` override for `resolvePiBundle`; the full oracle in `ci-main` against the devDep bundle | Collapses #642's core and **violates #642's explicit non-goal** (making the full oracle CI-runnable is deferred, not in scope). Adds a resolution seam plus CI wall-time for the 122-file corpus and 1000-case fuzz. | If pi's skill-loader semantics started changing per release and fixture drift went undetected between cron runs — i.e. if loader-parity drift became the dominant recurring risk rather than version-literal drift. |
-| **D — mirror-literal sweep** | a scanner asserting *every* active-surface pi-version literal equals the generated pin, with a dated allowlist | **Narrowly adopted**: guard `(i)` asserts every version literal in the four hand-synced mirror surfaces against `PI_VERSION_PIN` (with a per-surface non-vacuity check and an explicit non-pi dependency allowlist) — review cycle 3 showed a phrase-based variant missed 2 of 5 stamps. The *full* free-text sweep across the whole tree is still rejected: it must exempt the historical probe record in `docs/upstream-pi-bugs.md` plus archival `docs/plans/*`, `docs/scoping/*`, `docs/research/*`, and it carries the highest false-positive risk. It also cannot guard version-specific **line refs** (now #651). | The full sweep becomes right if the mirror class drifts **again** (two escapes ⇒ the four-surface guard is insufficient), or if "active surface" can be defined mechanically instead of as an allowlist policy. |
+| **D — mirror-literal sweep** | a scanner asserting *every* active-surface pi-version literal equals the generated pin, with a dated allowlist | **Narrowly adopted**: guard `(i)` asserts every version literal in the four hand-synced mirror surfaces against `PI_VERSION_PIN` (with a per-surface stamp-count map and an explicit non-pi dependency allowlist) — review cycle 3 showed a phrase-based variant missed 2 of 5 stamps. The *full* free-text sweep across the whole tree is still rejected: it must exempt the historical probe record in `docs/upstream-pi-bugs.md` plus archival `docs/plans/*`, `docs/scoping/*`, `docs/research/*`, and it carries the highest false-positive risk. It also cannot guard version-specific **line refs** (now #651). | The full sweep becomes right if the mirror class drifts **again** (two escapes ⇒ the four-surface guard is insufficient), or if "active surface" can be defined mechanically instead of as an allowlist policy. |
 | **E — eliminate by generation** | derive the extension pins from `PI_VERSION_PIN` so the drift cannot be authored | This is #643's longer-term cure (single source of truth); it requires a generation step across three `package.json` files and a policy for hand-edited comments. | If the repo moves to generated manifests. Recorded here so the divergence spans detect-vs-eliminate, not only "detect more". |
 | **F — split `(h)` into its own per-PR job** | extract the predicate into `scripts/check-pi-pin-lockstep.mjs` (+ a `tests/pi-pin-lockstep/` fixture suite) and point `test-command` at it, so the per-PR job is single-purpose | Not adopted at this pass: the wide promotion is ~4s, the split adds a second gate to maintain, and the overlap with `ci / skill-lint` is an accepted cost (both are advisory — #646). The split also becomes the natural home for the negative fixtures and for #642's predicate breadth. | If the per-PR path is later made merge-blocking (#646) or the suite grows — then the shared red context `ci / unit-test` must be split so a pin-drift failure and a validator regression are distinguishable, which the repo already does for `vendor-drift`. |
 
@@ -289,10 +297,10 @@ strong — see #651.
 | Lockfiles (3) | config | committed; `npm ci` in `ci-main.yml` extension-tests — **post-merge only**; per-PR lock↔manifest agreement is #642 | ⚠️ #642 |
 | `(h)` pin-lockstep tripwire | test | `ci.yml` unit-test (per-PR, advisory) + `ci-main.yml` extension-tests | ✅ |
 | Retry patch dist targets | integration | `patch-pi-retry.sh` (fail-loud on shape change) | ✅ |
-| Mirror version literals (providers.md, qwen, frontmatter-validate, ci-main) | docs | guard `(i)` — every version literal equals the pin or a listed non-pi dep version, per-surface non-vacuity | ✅ |
+| Mirror version literals (providers.md, qwen, frontmatter-validate, ci-main) | docs | guard `(i)` — every version literal equals the pin or a listed non-pi dep version; per-surface **stamp-count map** (a lost surface *or* a dropped stamp is red) | ✅ |
 | Other hand-synced mirrors (subagent test comments, `docs/upstream-pi-bugs.md` historical record) + the tautological test literal | docs | partially by `(i)`/`(h)`; the full sweep is scoped in #643 | ⚠️ #643 |
 | Version-specific **line refs** (providers.md, qwen provenance) | docs | **#651** (assigned; trigger: re-derive at every pi/pi-ai bump) — a literal scanner cannot see a line number | ⚠️ #651 |
-| Per-PR wiring can be silently unplugged by caller/callee edits in the branch | test | guard `(j)` — binding present, input declared, and BOTH the job and custom-step `if:` consume it | ✅ |
+| Per-PR wiring can be silently unplugged | test | guard `(j)` — binding present **and exactly the suite invocation**, input declared, BOTH the job and custom-step `if:` consume it, no `continue-on-error:` in the job block, and the caller `ci:` job carries no `if:`/`continue-on-error:` | ✅ |
 | `@main`-at-PR-time input resolution (stale-branch window) | workflow | not statically checkable — the live per-PR run is the proof (Verification step 4); that proof **expires** at the next main-side `node-ci.yml` change, so extraction (alternative F) is the durable fix | ⚠️ accepted |
 | `patch-pi-retry.sh --check` drift semantics | script | **design fork** — scoped in #642 (assigned; trigger: before the next pi bump) | ⚠️ #642 |
 | `(h)` predicate breadth (non-`pi-` `@earendil-works/*` **direct** deps) | config | scoped in #642. Note: this is **not** the same as the `chord` exposure — `chord` appears only in lockfiles, which `(h)` never reads | ⚠️ #642 |
@@ -313,7 +321,7 @@ merge-blocking until #646 lands.
 | code-review (PR #640) | 1 | issues fixed — version-agnostic reword of subagent test comments; pin-lockstep tripwire added |
 | code-review (PR #640) | 2 | issues fixed — tripwire moved to end of file + legend; zero-match guard added; scans both `dependencies` and `devDependencies` |
 | code-review (PR #640) | 3 (second-model gate) | issue fixed — `docs/upstream-pi-bugs.md` probe line annotated with 0.85.1 re-verification |
-| code-review (PR #640) | 4 (second-model gate) | **NO ISSUES FOUND** |
+| code-review (PR #640) | 4 (second-model gate) | **NO ISSUES FOUND** @ `9999bc7` (superseded — 12 commits behind the head; see cycle 5) |
 | problem-verify | 1 | `NEEDS-FIX` (P1: "make the vacuous indicator honest" scoped but unimplemented) |
 | problem-verify | 2 | **SOUND** ×2 verifiers |
 | solution-verify | 1 | `NEEDS-FIX` (2×P1: per-PR promotion rejected on a process-cost argument; shipped tripwire guards the class that never drifted; deferrals had no owner/trigger) |
@@ -323,8 +331,10 @@ merge-blocking until #646 lands.
 | second-model coherence (Phase 5.6) | 1 | **ISSUES FOUND** (1×P1, 2×P2) — see fix round 2 |
 | parallel review gates | 3 | **ISSUES FOUND** (1×P1, 4×P2/P3, 2×P4) — see fix round 3 |
 | second-model coherence (Phase 5.6) | 2 | **1×P2** (guard `(j)` overclaimed the `@main` seam) — see fix round 3 |
-| parallel review gates | 4 | **no P0/P1/P2 code issues** — 1×P2 process (the unmet criterion is disclosed but ungated: the PR merges with `Closes #637`) + 5×P3/P4 documentation/robustness |
-| parallel review gates | 5 | pending |
+| parallel review gates | 4 | **no P0/P1/P2 code issues** — 1×P2 process (the unmet criterion is disclosed but ungated: the PR merges with `Closes #637`) + 5×P3/P4 documentation/robustness — see fix round 4 |
+| parallel review gates | 5 | dispatched at `e1a75b8` — see fix round 5 |
+| code-review (PR #640) | 5 (bug scan at `6fb9df4`) | **ISSUES FOUND** — 2×P2 (guard `(j)` blind to a caller-level `if:`/`continue-on-error:`; `test-command`/step could swallow failure) + 2×P3 `(i)` presence-check non-vacuity, fixed 20-line caller window + 2×P4 misleading job-boundary anchor, `(h)` scope vs claim — all fixed in `e1a75b8`, all negative-tested |
+| code-review (PR #640) | 6 (final, at head) | pending |
 
 ### Fix round — parallel review gates cycle 4 → 5
 
@@ -360,6 +370,33 @@ merge-blocking until #646 lands.
   "main is broken" framing (the outage was dev-machine-local; `main` CI was green).
 - **P2** — added the missing mirror surfaces to the Components/wiring set.
 - **P3** — recorded the generation alternative (E) and the split-`(h)` alternative (F).
+
+### Fix round — code-review cycle 5 (bug scan at `6fb9df4`) → `e1a75b8`
+
+Six reproducible issues, all fixed and negative-tested (each reproduced RED, then restored):
+
+- **P2** — guard `(j)` never inspected the **caller** job. A job-level `if:` (or `continue-on-error:`) on
+  `ci:` skips or excuses the whole reusable-workflow call with the callee untouched — and it left the
+  suite at 163/163. `(j)` now slices the `ci:` block and rejects both.
+- **P2** — the step could run the input and swallow its failure: `test-command: … || true` and
+  `continue-on-error: true` on the custom-test step (both the `- key:` and nested-key forms) stayed
+  green while the gate could never go red. `(j)` now requires exact equality with the suite invocation
+  and rejects `continue-on-error:` anywhere in the `unit-test` job block.
+- **P3** — the caller search used a fixed 20-line window, so a comment block before the binding produced
+  a false RED reporting the binding as missing. Both sides now use a shared `jobBlockOf()` helper.
+- **P3** — `(i)`'s non-vacuity check was a `>= 1 per surface` presence check, the exact weakness `(h)`
+  had already retired (a surface lost 1 of 3 stamps and stayed green). Replaced with a per-surface
+  stamp-count map.
+- **P4** — the job-boundary anchor `^  \S[^:]*:\s*$` false-matched any 2-space comment ending in a colon
+  (legal YAML, used in these workflows), truncating the block and reporting a phantom "added conjunct".
+  The key charset is now `[A-Za-z_][A-Za-z0-9_-]*`.
+- **P4** — `(h)` claimed "every pi-* pin" while scanning only two fields; a stale `peerDependencies` pin
+  stayed green. Now six fields, with the nested/root-manifest bound stated in the guard header.
+
+Negative tests at `e1a75b8`: caller `if:`, caller `continue-on-error:` (job + step), `|| true` command,
+callee job and step `continue-on-error:`, stale `peerDependencies` pin, dropped mirror stamp — all RED.
+False-red regressions (a comment ending in a colon inside a job; a comment block before the binding)
+stay GREEN. Suite 163/163.
 
 ### Fix round — parallel review gates cycle 1 → 2
 
@@ -457,7 +494,7 @@ importers → **#643**. Version-specific **line refs** → **#651**. Making code
   `0.85.1` values the bump had just written: 98 hits, not one). Replaced with a stale-only predicate
   expecting 0 lines, and re-run before writing the expectation.
 - **P1 (gate #4)** — the escaped mirror class was unguarded: **guard `(i)` added** (provenance stamps +
-  per-surface non-vacuity), negative-tested.
+  per-surface stamp-count map), negative-tested.
 - **P1 (gate #4)** — the per-PR wiring could silently unplug: **guard `(j)` added**, negative-tested.
 - **P2 (gate #4)** — presence-only non-vacuity: **`(h)` roster assertion added**, negative-tested.
 - **P2 (gate #1/#3)** — line refs were "unowned": filed **#651** with an assignee and a bump-time trigger.
