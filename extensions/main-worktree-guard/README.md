@@ -326,9 +326,8 @@ dirty, and trips M4's freeze. Surfaces:
    the marker return precedes (the marker is an audited solo-session hatch).
    Hub `.git/`-metadata writes block for ANY session in ANY hub state EXCEPT
    an active marker's same-rooted CLEAN main (its open recovery window) —
-   hooks/config are never a build side-effect, so the #437 clean-main
-   residual (tracked files only) does not extend to them (cycle-2 P1;
-   cycle-3 B-2 reconciled the message/docs with the operative rule). A
+   hooks/config are never a build side-effect (cycle-2 P1; cycle-3 B-2
+   reconciled the message/docs with the operative rule). A
    cross-checkout bash overwrite of an EXISTING untracked hub file blocks
    exactly like the write/edit tool route — only genuinely NEW files are
    additive (cycle-3 A-2). Script-chain content is walked to a bounded
@@ -344,21 +343,42 @@ dirty, and trips M4's freeze. Surfaces:
    resolved (out of threat model — the walker has no shell state; see the
    classify-git.mjs docstring residual list). Mechanism boundary (post-#474
    review): the gate covers bash write PRIMITIVES — `>`/`>>`/`>&` redirects,
-   `tee`, and python `open(…,"w"/"a")` — NOT in-place overwrite VERBS
-   (`sed -i`, `perl -pi`, `cp`/`mv` onto a tracked file, `install`, `dd
-   of=`, `tar -x`/`unzip -o` into the hub, `patch -p1`); those contain no
-   write-primitive construct and are outside this mechanism's scope (the
-   block message does NOT coach them as an alternative — they are an explicit
-   documented residual, and the same verb overwrite via the write/edit tools
-   or as a git-verb stays frozen by the other gates). NOTE —
-   a raw bash verb overwrite of a tracked hub file while disordered is NOT
-   covered by any guard: the write/edit freeze only intercepts tool events,
-   and M4 classifies these as non-git (allowed). Documented residual: only
-   write PRIMITIVES are gated on the bash route (verb overwrites via the
-   write/edit tools stay frozen, and git-verb overwrites stay M4-gated), and a
-   main-rooted session's same-checkout tracked write into its own CLEAN main
-   stays ungated (build/formatter/npm-install side effects must never
-   false-block — #437's disorder scope).
+   `tee`, and python `open(…,"w"/"a")` — PLUS (since #625) the in-place
+   overwrite VERBS that carry no primitive token (`sed -i`/`gsed -i`,
+   `perl -pi`, `awk -i inplace`, the `cp`/`mv`/`install`/`rsync`/`ln`
+   destination — a directory destination expands per-source to
+   `dir/<basename(src)>` — `truncate`, `dd of=`, `sort -o` (long options match
+   any UNAMBIGUOUS prefix, `--out=FILE` included), `sponge`,
+   `ed`/`ex`/`vi`/`vim`/`nvi` (every file operand); a bundled `-t` (`cp -ft
+   dir`, `install -Dt`); rsync operand options match unambiguous prefixes;
+   and `sort -ro`/`-uo`). Long options are matched exactly OR by an
+   UNAMBIGUOUS getopt_long abbreviation (`sed --in-pl` ≡ `--in-place`,
+   `gawk --incl inplace` ≡ `--include inplace`), so an abbreviated in-place
+   flag cannot slip the gate; and `cp`/`mv`/`install` require at least one
+   SOURCE before a destination is surfaced (a single-operand `cp f` is a
+   malformed no-op that writes nothing); and `\`+newline line continuations
+   are deleted before the operand is read, so a continuation (with or without
+   following indent) between a redirect/`tee` operator and its target cannot
+   hide the target. An fd-prefixed OUTPUT redirect for ANY fd
+   (`2>f`, `3>f`, `N>|f`) is a write candidate — the open truncates the file
+   even when nothing is written through it; `N<f`/`N>&M`/`N>&-` are not.
+   Still outside this mechanism's scope (documented residuals):
+   verb-in-ARG fan-outs (`find -exec`, `xargs`), archive/member writers
+   (`tar -x`, `unzip -o`, `patch`), directory-TREE copies whose per-file
+   targets are not in the command string (`cp -R src/ dst/`), backtick
+   command substitution (the `$( )` form IS walked), arbitrary interpreter
+   writers (`node -e`, `ruby -e`, `php -r`), a bare `rm` of a tracked file,
+   an rsync option that takes a separate operand but is neither in the
+   arity table nor an unambiguous prefix of an entry (and the same class for
+   sort), rsync options whose operand is itself a WRITTEN file
+   (`--log-file`, `--write-batch`, `--only-write-batch`, `--backup-dir`),
+   `N>file` inside an interpreter pre-scan (`bash 2> f script.sh`), and
+   path-identity indirection the gate cannot see pre-execution (a hardlink to
+   a hub file, or a symlink the same command creates). Own-main UNTRACKED/NEW writes stay free (build/formatter/npm-install
+   side effects on genuinely new files must not false-block); a TRACKED
+   own-main write blocks clean OR disordered (#625 removed the #437 clean-hub
+   residual — it let a compound `printf … >> MEMORY.md && git add && git
+   commit && git push` through).
    NEW-file (nonexistent) targets and own-main untracked writes are NOT this
    gate's concern (see 3; the #436 collision-free carve-out semantics apply) —
    a CROSS-checkout overwrite of an EXISTING untracked hub file blocks (A-2,
@@ -399,8 +419,9 @@ with NO cheap pre-bail (a write-free command costs only the pure string walk;
 pre-filtered away), and its same-vs-cross-checkout decision is SESSION-rooted
 (a worktree/foreign session that `cd`s into a hub and writes is still a
 cross-checkout write and blocks — review fold-in on the old command-site
-comparison); a clean same-checkout shell's tracked writes into its own main
-stays #437's documented residual; a failed hub-toplevel
+comparison); a same-checkout shell's TRACKED write into its own main
+blocks clean OR disordered (#625; own-main UNTRACKED/new writes stay free);
+a failed hub-toplevel
 cache resolution disables the warn surfaces for up to 30s (then retries —
 never terminally); hub-equality is realpath-normalized (M4's blocks use fresh
 per-call resolution and are unaffected); the python `open()`
@@ -423,9 +444,9 @@ need a scratch file briefly. The warning surfaces the violation at write time
 so the agent moves the work to a worktree
 (`bash scripts/checkout-hygiene/hub-worktree.sh <branch>`) before it becomes
 the next M4 freeze. The #437 tracked-write gate is the exception that DOES
-block: writing an index-tracked hub file via bash while the hub is disordered
-destroys the very dirty delta the freeze protects (and is the mechanism that
-created the 2026-08-31 tortoise dirt) — and since #618/#621 a DELIBERATE
+block: writing an index-tracked hub file via bash (disordered hub, or clean
+own-hub since #625) destroys the very dirty delta the freeze protects — and is the mechanism that
+created the 2026-08-31 tortoise dirt — and since #618/#621 a DELIBERATE
 cross-checkout tracked write into ANY hub main (worktree/foreign session) is
 blocked regardless of hub state, matching the write/edit tool's target-aware
 gate. Its tracked-ness test is exact

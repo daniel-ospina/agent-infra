@@ -4370,13 +4370,68 @@ export function firstHubTrackedWrite(candidates, trackedRels) {
  * gate scans bash write PRIMITIVES — `>`/`>>`/`>&` redirects, `tee`, python
  * `open(...,'w'|'a')` — NOT in-place overwrite VERBS (`sed -i`, `perl -pi`,
  * `cp`/`mv` onto a tracked file, `install`, `dd of=`, `tar -x`/`unzip -o`
- * into the hub, `patch -p1`): those contain no write-primitive construct and
- * are deliberately outside this walker's scope. A raw bash verb overwrite of
- * a tracked hub file while disordered is NOT covered by any guard — the
- * write/edit freeze only intercepts tool events and M4 classifies these as
- * non-git/allowed (documented residual: only write PRIMITIVES are gated on
- * the bash route; tool-mediated and git-verb overwrites stay frozen/M4-gated).
+ * into the hub, `patch -p1`): those contain no write-primitive construct. Since
+ * #625 the in-place OVERWRITE VERBS ARE gated too (`sed -i`, `perl -pi`,
+ * `awk -i inplace`, the `cp`/`mv`/`install`/`rsync`/`ln` destination (a
+ * DIRECTORY destination resolves per-source to `dir/<basename(src)>`),
+ * `truncate`, `dd of=`, `gsed`, `sort -o` (bundled `-ro` too, and any
+ * UNAMBIGUOUS long-option prefix), `sponge`,
+ * `ed`/`ex`/`vi`/`vim`/`nvi`, a bundled `-t` target-directory (`cp -ft dir`),
+ * and a noclobber-override `>|` redirect) at COMMAND
+ * position — `git mv a b` / `echo cp a b` stay ARG positions. Remaining
+ * residuals (tracked separately): verb-in-ARG fan-outs (`find -exec`, `xargs`),
+ * archive/member writers (`tar -x`, `unzip -o`, `patch`), DIRECTORY-TREE copies
+ * whose per-file targets are not in the command string (`cp -R src/ dst/`,
+ * `rsync -a src/ dst/`), backtick command substitution (the `$( )` form IS
+ * walked), arbitrary interpreter writers (`node -e writeFileSync`, `ruby -e
+ * File.write`, `php -r file_put_contents`), an rsync option that takes a
+ * separate operand but is not in the rsync operand list (`--flag=value` forms
+ * are self-delimiting), and a bare `rm` of a tracked file (a delete, not an
+ * overwrite).
  */
+// #625: command-position words whose invocation WRITES a file with no
+// write-primitive token — the in-place OVERWRITE verbs. `sed`/`perl`/`awk`
+// only when their in-place mode is present (checked in the handler);
+// `cp`/`mv`/`install`/`truncate`/`dd` always write an operand.
+const INPLACE_WRITE_VERBS = new Set([
+  "sed", "gsed", "perl", "awk", "gawk", "mawk", "cp", "mv", "install", "truncate", "dd",
+  "rsync", "ln", "sort", "sponge", "ed", "ex", "vi", "vim", "nvi",
+]);
+// #625 cycle-8: GNU getopt_long accepts any UNAMBIGUOUS long-option prefix
+// (`--in-pl` == `--in-place`, `--expr` == `--expression`), so an exact-spelling
+// match alone is a FAIL-OPEN bypass of the in-place closure (`sed --in-pl s/a/b/
+// <hub>/AGENTS.md` resolved to ZERO targets and the gate allowed it). Resolve
+// a prefix against the verb's REAL long-option table: an exact name wins, a
+// prefix resolves only when exactly ONE name matches (ambiguous/unknown → null,
+// i.e. not an option — the safe direction here, since every in-place spelling is
+// reachable by an exact or unique-prefix match). Mirrors the sort/rsync handlers.
+const _resolveLong = (tbl, name) => {
+  if (Object.prototype.hasOwnProperty.call(tbl, name)) return name;
+  const hits = Object.keys(tbl).filter((nm) => nm.startsWith(name));
+  return hits.length === 1 ? hits[0] : null;
+};
+// sed/gsed long options: name → separate-operand arity (1 = takes the next word,
+// 0 = no argument; `--flag=value` is self-delimiting).
+const SED_LONG = {
+  "in-place": 0, expression: 1, file: 1, "line-length": 1, "follow-symlinks": 0,
+  debug: 0, posix: 0, quiet: 0, silent: 0, sandbox: 0, separate: 0, unbuffered: 0,
+  "null-data": 0, "zero-terminated": 0, "regexp-extended": 0, binary: 0, help: 0, version: 0,
+};
+// gawk/awk (gawk extension) long options. `--include inplace` is the in-place
+// mechanism; `include`/`file`/`source`/etc. take a separate operand.
+const AWK_LONG = {
+  include: 1, file: 1, source: 1, assign: 1, exec: 1, "field-separator": 1, load: 1,
+  "dump-variables": 0, profile: 0, "pretty-print": 0, lint: 0, "lint-old": 0, posix: 0,
+  traditional: 0, "re-interval": 0, "gen-pot": 0, "non-decimal-data": 0,
+  "characters-as-bytes": 0, sandbox: 0, debug: 0, optimize: 0, nostalgia: 0, version: 0,
+  help: 0, "use-lc-numeric": 0, bignum: 0, csv: 0, copyright: 0,
+};
+const _isSedInPlaceLong = (w) => {
+  if (typeof w !== "string" || !w.startsWith("--")) return false;
+  const eq = w.indexOf("=");
+  return _resolveLong(SED_LONG, w.slice(2, eq === -1 ? undefined : eq)) === "in-place";
+};
+
 export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const s = String(command ?? "");
   const out = [];
@@ -4444,6 +4499,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const redirs = [];
   const pythons = [];
   const tees = [];
+  const verbToks = [];
   const inlinePays = [];
   const scriptToks = [];
   const n = s.length;
@@ -4466,12 +4522,558 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     let q = null;
     while (k < n && !(q === null && (/\s/.test(s[k]) || ";|&()".includes(s[k]) || s[k] === ">" || s[k] === "<"))) {
       const ch = s[k];
-      if (q) { if (ch === q) q = null; else w += ch; k++; continue; }
+      if (q) {
+        // Inside double quotes bash treats `\` as an escape ONLY before
+        // `$` / `` ` `` / `"` / `\` / newline; before any other char it is
+        // literal (cycle-8 P2/P3: over-stripping false-positived on paths
+        // like "MEMORY\.md").
+        if (q === '"' && ch === "\\" && k + 1 < n && "\"\\$`\n".includes(s[k + 1])) {
+          if (s[k + 1] !== "\n") w += s[k + 1];   // backslash-newline is a line continuation
+          k += 2; continue;
+        }
+        if (ch === q) q = null; else w += ch; k++;
+        continue;
+      }
+      // ANSI-C `$'…'`: decode escapes so a decoded `>` (\x3e / \076) is a real
+      // redirect and a decoded path matches the tracked rel (#625 cycle-7).
+      if (ch === "$" && s[k + 1] === "'") {
+        let kk = k + 2, inner = "";
+        while (kk < n && s[kk] !== "'") {
+          if (s[kk] === "\\" && kk + 1 < n) { inner += s[kk] + s[kk + 1]; kk += 2; continue; }
+          inner += s[kk]; kk++;
+        }
+        w += _ansiTranslate(inner);
+        k = kk + 1;
+        continue;
+      }
+      if (ch === "$" && s[k + 1] === '"') { q = '"'; k += 2; continue; }   // $"…" == "…"
       if (ch === "'" || ch === '"') { q = ch; k++; continue; }
-      if (ch === "\\") { if (k + 1 < n) { w += s[k + 1]; k += 2; continue; } }
+      if (ch === "\\") {
+        if (k + 1 < n && s[k + 1] === "\n") {
+          // `\`+newline is a LINE CONTINUATION: bash deletes it and re-scans the
+          // remaining text, so what follows still decides the word boundary.
+          // A LEADING continuation + indent (`> \<NL>  f`) is just prefix
+          // whitespace before the operand — skipping it is required, else the
+          // word ends empty and the operand is dropped (#625 cycle-12 P1: the
+          // redirect/tee operand path ALLOWed a tracked hub-main write). A
+          // MID-WORD continuation followed by whitespace still TERMINATES the
+          // word (`a\<NL>  b` is two words); with no whitespace it joins
+          // (`a\<NL>b` → `ab`).
+          const k2 = k + 2;
+          if (k2 < n && /\s/.test(s[k2])) {
+            if (w === "") { k = skipWs(k2); continue; }
+            return { w, k: k2 };
+          }
+          k += 2; continue;
+        }
+        if (k + 1 < n) { w += s[k + 1]; k += 2; continue; }
+      }
       w += ch; k++;
     }
     return { w, k };
+  };
+  const readShellArg = readWord;   // alias (same shell-argument semantics)
+  // #625: in-place OVERWRITE verb targets — a write with no primitive token.
+  // Command-position only (the caller dispatches on the simple-command word,
+  // mirroring the `tee` branch): `git mv a b` / `echo cp a b` are ARG
+  // positions and never reach here. Returns RAW operand strings; push()
+  // resolves them against the site cwd. Over-match is the safe direction (a
+  // non-tracked candidate is inert). Each verb's operand-taking flags are
+  // consumed so a script/operand word is never mistaken for a file.
+  const verbTargets = (verb, k0, siteCwd) => {
+    const v = verb === "gsed" ? "sed" : verb; // GNU-sed spelling sibling
+    const words = [];
+    const skipParen = (j0) => {
+      // Skip a balanced `( … )` group (quote-aware) — `$( )`, `<( )`, `>( )`.
+      // The group content is not verb arguments, but a LITERAL operand after
+      // it is (#625 cycle-3 P2).
+      let d = 0, q = null;
+      for (let j = j0; j < n; j++) {
+        const c = s[j];
+        if (c === "\\") { j++; continue; }   // `\(` / `\)` are literals, not nesting (#625 cycle-4 B1)
+        if (q) { if (c === q) q = null; continue; }
+        if (c === '"' || c === "'" || c === "`") { q = c; continue; }
+        if (c === "(") d++;
+        else if (c === ")" && --d === 0) return j + 1;
+      }
+      return n;
+    };
+    let k = skipWs(k0);
+    while (k < n) {
+      const c0 = s[k];
+      // `#` at a word boundary starts a comment — stop the scan (mirrors the
+      // main walker). Else the comment word becomes the LAST positional and the
+      // real destination is dropped (#625 cycle-3 P1).
+      if (c0 === "#" && (k === 0 || /[\s;&|(\n]/.test(s[k - 1]))) break;
+      // `\` + newline is a line continuation — whitespace in bash (#625
+      // cycle-3 P3).
+      if (c0 === "\\" && s[k + 1] === "\n") { k = skipWs(k + 2); continue; }
+      // `$( … )` / `<( … )` / `>( … )`: skip the balanced group, keep scanning.
+      if (c0 === "(" || ((c0 === "<" || c0 === ">") && s[k + 1] === "(")) {
+        k = skipWs(skipParen(c0 === "(" ? k : k + 1));
+        continue;
+      }
+      if (";&|\n".includes(c0)) break;
+      // Redirect with an OPTIONAL fd prefix (`2> f`, `2>&1`, `> f`, `&> f`):
+      // consume operator + operand, never a verb target. The fd digits MUST be
+      // consumed before readWord (which stops only at `>`), else
+      // `cp a b 2>&1` parses `2` as the destination and the real target is
+      // missed (#625 review P1).
+      if (c0 === ">" || c0 === "<" || /[0-9]/.test(c0)) {
+        let rk = k;
+        while (rk < n && /[0-9]/.test(s[rk])) rk++;
+        if (rk < n && (s[rk] === ">" || s[rk] === "<")) {
+          const opStart = rk;
+          while (rk < n && "<>&|".includes(s[rk])) rk++; // `|` for the `>|` noclobber-override form
+          const op = s.slice(opStart, rk);
+          rk = skipWs(rk);
+          const opnd = readWord(rk);
+          const nextK = skipWs(opnd.k > rk ? opnd.k : rk + 1);
+          // `<<DELIM` opens a heredoc BODY — data, not a verb argument; stop
+          // the scan there (the main walker skips the body).
+          if (op.includes("<<")) { k = nextK; break; }
+          k = nextK;
+          continue;
+        }
+      }
+      const w = readWord(k);
+      // Advance past the parsed word. An EMPTY QUOTED word (`''`/`""` — the BSD
+      // `sed -i ''` idiom) is a real positional slot; keep it in `words` so the
+      // script/operand boundary stays aligned, but advance with w.k (a stale
+      // k+1 lands inside the next word's quotes and mangles the command —
+      // #625 review P1).
+      if (w.w === "" && w.k <= k) { k = k + 1; continue; }
+      words.push(w.w);
+      k = skipWs(w.k);
+    }
+    const out = [];
+    const isFlag = (w) => w.length > 1 && w[0] === "-";
+    // A destination that is an existing DIRECTORY (or spelled with a trailing
+    // slash) writes `dir/<basename(src)>` for each source — `cp src .` targets
+    // `./src`, NOT the directory. Without this, `cp /tmp/evil/AGENTS.md .` from
+    // a clean hub main surfaced the bare root dir, which classify skips
+    // (rel === "") — a tracked-file overwrite with zero gate (#625 review P1).
+    const dstIsDir = (dst) => {
+      if (!dst) return false;
+      if (/[/\\]$/.test(dst)) return true;
+      try { return existsSync(resolve(siteCwd, dst)) && statSync(resolve(siteCwd, dst)).isDirectory(); } catch { return false; }
+    };
+    const emitDst = (dst, sources, alsoSources) => {
+      if (dstIsDir(dst)) {
+        for (const src of sources) out.push(join(dst, basename(src)));
+      } else if (dst) {
+        out.push(dst);
+      }
+      if (alsoSources) for (const src of sources) out.push(src);
+    };
+    if (v === "sed" || v === "perl") {
+      // -i / --in-place = in-place edit. The script operand (-e/--expression,
+      // -f/--file in sed; -e/-E in perl) does NOT write — consume it (attached
+      // or as the next word) so it is never mistaken for a file. The cluster is
+      // parsed LETTER BY LETTER: `-I./lib` in perl is ONE attached operand (not
+      // a flag run), and a lowercase `i` INSIDE an attached operand
+      // (`-MTime::HiRes`) is NOT the in-place flag — a `split(".")`/includes
+      // scan both missed the real vector AND false-blocked read-only commands
+      // (#625 review P1/P2).
+      let inPlace = false;
+      let hasScriptFlag = false;
+      let expectOperand = false;
+      let endOpts = false;
+      const positionals = [];
+      for (let wi = 0; wi < words.length; wi++) {
+        const w = words[wi];
+        if (expectOperand) { expectOperand = false; continue; }
+        // BSD `sed -i ''` — the empty quoted word is the in-place SUFFIX, not a
+        // positional (leaving it in the list makes the sed script the "file",
+        // a spurious candidate — #625 review A3).
+        if (w === "" && wi > 0 && (_isSedInPlaceLong(words[wi - 1]) || /^-[a-zA-Z]*i$/.test(words[wi - 1]))) continue;
+        if (!endOpts && w === "--") { endOpts = true; continue; }
+        if (!endOpts && isFlag(w) && w !== "-") {
+          if (w.startsWith("--")) {
+            // getopt_long abbreviation: `--in-pl`/`--in-pl=.bak` ARE
+            // `--in-place` (#625 cycle-8 P1 — exact spelling alone was a
+            // fail-open bypass). `--expr`/`--fil`/`--line-l` resolve likewise.
+            const eq = w.indexOf("=");
+            const resolved = _resolveLong(SED_LONG, w.slice(2, eq === -1 ? undefined : eq));
+            if (resolved === "in-place") { inPlace = true; continue; }
+            if (resolved !== null && SED_LONG[resolved] === 1) {
+              if (resolved === "expression" || resolved === "file") hasScriptFlag = true;
+              if (eq === -1) expectOperand = true;   // `--flag=value` is self-delimiting
+            }
+            continue;
+          }
+          const cluster = w.slice(1);
+          let ci = 0;
+          while (ci < cluster.length) {
+            const ch = cluster[ci];
+            if (ch === "i") { inPlace = true; ci = cluster.length; continue; } // optional attached suffix
+            if (v === "sed" ? (ch === "e" || ch === "f") : (ch === "e" || ch === "E")) {
+              hasScriptFlag = true;
+              if (ci + 1 < cluster.length) ci = cluster.length; // attached operand
+              else { expectOperand = true; ci++; }
+              continue;
+            }
+            // `-F`/`-M`/`-m`/`-x` take an ATTACHED operand only; a bare one is
+            // not followed by its value, so it must not swallow the next word
+            // (`perl -F -pi -e …` — bare `-F` is not a separator operand, and
+            // letting it consume `-pi` loses in-place mode; #625 cycle-3 P3).
+            if (v === "perl" && (ch === "F" || ch === "M" || ch === "m" || ch === "x")) {
+              if (ci + 1 < cluster.length) ci = cluster.length;
+              else ci++;
+              continue;
+            }
+            if (v === "perl" && ch === "I") {
+              if (ci + 1 < cluster.length) ci = cluster.length; // attached operand
+              else { expectOperand = true; ci++; }
+              continue;
+            }
+            ci++;
+          }
+          continue;
+        }
+        positionals.push(w);
+      }
+      if (!inPlace) return out;
+      // No -e/-f: the first positional IS the script (sed) / program (perl).
+      const files = hasScriptFlag ? positionals : positionals.slice(1);
+      for (const f of files) out.push(f);
+      return out;
+    }
+    if (v === "awk" || v === "gawk" || v === "mawk") {
+      // gawk in-place extension: `-i inplace`, `-iinplace`, `--include inplace`,
+      // `--include=inplace`.
+      let inPlace = false;
+      let hasProgFlag = false;
+      let expectOperand = false;
+      const positionals = [];
+      for (let wi = 0; wi < words.length; wi++) {
+        const w = words[wi];
+        if (expectOperand) { expectOperand = false; continue; }
+        if (isFlag(w) && w !== "-") {
+          if (w.startsWith("--")) {
+            // gawk also accepts getopt_long abbreviations: `--incl inplace`
+            // IS `--include inplace` (#625 cycle-8 P1).
+            const eq = w.indexOf("=");
+            const resolved = _resolveLong(AWK_LONG, w.slice(2, eq === -1 ? undefined : eq));
+            if (resolved === "include") {
+              if (eq === -1) {
+                if (words[wi + 1] === "inplace") { inPlace = true; expectOperand = true; }
+                else if (AWK_LONG[resolved] === 1) expectOperand = true;
+              } else if (w.slice(eq + 1) === "inplace") inPlace = true;
+              continue;
+            }
+            if (resolved !== null && AWK_LONG[resolved] === 1) {
+              // `--file`/`--source`/`--exec` PROVIDE the program, so the first
+              // positional is a DATA file. Without hasProgFlag the handler's
+              // `positionals.slice(1)` ate it and dropped the in-place target
+              // entirely (#625 cycle-11 P1 REGRESSION: `gawk -i inplace --file
+              // p.awk <hub>/f` and `gawk --incl inplace --source '{print}'
+              // <hub>/f` resolved to ZERO targets → the gate ALLOWED a tracked
+              // hub-main edit; the short `-f`/`-e` forms still gated).
+              if (resolved === "file" || resolved === "source" || resolved === "exec") hasProgFlag = true;
+              if (eq === -1) expectOperand = true;
+              continue;
+            }
+            continue;
+          }
+          if (w === "-i" || w === "-f" || w === "-v" || w === "-E") {
+            if (w === "-i" && words[wi + 1] === "inplace") { inPlace = true; expectOperand = true; }
+            else { if (w === "-f" || w === "-E") hasProgFlag = true; expectOperand = true; }
+            continue;
+          }
+          if (w === "-iinplace") { inPlace = true; continue; }
+          continue;
+        }
+        positionals.push(w);
+      }
+      if (!inPlace) return out;
+      const files = hasProgFlag ? positionals : positionals.slice(1);
+      for (const f of files) out.push(f);
+      return out;
+    }
+    if (v === "cp" || v === "mv" || v === "install") {
+      let targetDir = null;
+      let expectTarget = false;
+      let expectOperand = false;
+      let endOpts = false;
+      const positionals = [];
+      for (const w of words) {
+        if (expectTarget) { targetDir = w; expectTarget = false; continue; }
+        if (expectOperand) { expectOperand = false; continue; }
+        if (!endOpts && w === "--") { endOpts = true; continue; }
+        if (!endOpts && isFlag(w) && w !== "-") {
+          if (w === "-t" || w === "--target-directory") { expectTarget = true; continue; }
+          if (w.startsWith("--target-directory=")) { targetDir = w.slice("--target-directory=".length); continue; }
+          if (w === "-S" || w === "--suffix") { expectOperand = true; continue; }
+          if (v === "install" && (w === "-m" || w === "-o" || w === "-g")) { expectOperand = true; continue; }
+          if (!w.startsWith("--") && /^-[a-zA-Z]/.test(w)) {
+            // GNU bundling (`cp -ft dir`, `install -Dt dir`): scan the cluster
+            // LEFT TO RIGHT and stop at the first operand-taking letter — `S`
+            // (cp/mv/install) or install's `m`/`o`/`g`/`B` consumes the REST of
+            // the cluster as its attached operand, so a `t` inside that operand
+            // (`-S.tmp`, `-gstaff`) is NOT a target-directory (#625 cycle-1 B3
+            // + cycle-2 P1).
+            const cluster = w.slice(1);
+            for (let ci = 0; ci < cluster.length; ci++) {
+              const ch = cluster[ci];
+              if (ch === "t") {
+                const rest = cluster.slice(ci + 1);
+                if (rest) targetDir = rest; else expectTarget = true;
+                break;
+              }
+              if (ch === "S" || (v === "install" && (ch === "m" || ch === "o" || ch === "g" || ch === "B"))) {
+                if (ci + 1 >= cluster.length) expectOperand = true;
+                break;
+              }
+            }
+          }
+          continue;
+        }
+        positionals.push(w);
+      }
+      // mv REMOVES its sources as well as writing the destination — a tracked
+      // SOURCE is a tracked-file mutation. cp/install only READ their sources.
+      const alsoSources = v === "mv";
+      // A destination requires at least ONE source: a single-operand
+      // `cp f` / `mv f` / `install f` is a malformed no-op ("missing
+      // destination file operand", rc≠0) that writes NOTHING — emitting its
+      // lone operand as a destination was a pure false block (#625 cycle-8 P2,
+      // same carve-out as single-operand rsync list mode).
+      if (targetDir) {
+        if (positionals.length > 0) emitDst(targetDir, positionals, alsoSources);
+      } else if (positionals.length > 1) {
+        emitDst(positionals[positionals.length - 1], positionals.slice(0, -1), alsoSources);
+      }
+      return out;
+    }
+    if (v === "truncate") {
+      let expectOperand = false;
+      let endOpts = false;
+      for (const w of words) {
+        if (expectOperand) { expectOperand = false; continue; }
+        if (!endOpts && w === "--") { endOpts = true; continue; }
+        if (!endOpts && isFlag(w) && w !== "-") {
+          if (w === "-s" || w === "--size" || w === "-r" || w === "--reference") { expectOperand = true; continue; }
+          if (w.startsWith("--size=") || w.startsWith("--reference=")) continue;
+          if (/^-s./.test(w) || /^-r./.test(w)) continue;
+          continue;
+        }
+        out.push(w);
+      }
+      return out;
+    }
+    if (v === "rsync" || v === "ln") {
+      // Destination is the LAST positional. rsync PERMUTES options, so a bare
+      // flag operand may appear AFTER the destination (`rsync -a src dst
+      // --exclude foo`) — operand-taking flags MUST be consumed, else the
+      // operand becomes the "destination" and the real one is missed
+      // (#625 review P2). The list must contain ONLY options that take a
+      // SEPARATE operand: a no-argument flag in here (`--owner`, `--itemize-
+      // changes`, `--dry-run`, `-v`) swallows the real destination and drops
+      // the gate (#625 cycle-2 P1). rsync uses popt, which accepts any
+      // UNAMBIGUOUS long-option prefix (`--max-del 0` == `--max-delete 0`), so
+      // the list is prefix-matched with exact names winning (#625 cycle-3 A4).
+      // `--flag=value` is self-delimiting. A genuinely UNKNOWN operand-taking
+      // option remains a documented residual — a prev-positional fail-safe was
+      // tried and caused false blocks on read-only exports
+      // (`rsync -a tracked.md -v /tmp/dst`), so it is gone.
+      // A full arity table (name → takes a separate operand) for rsync's long
+      // options. Prefix matching MUST consider the BOOLEAN options too: an
+      // operand-only list made `--checksum` (a complete boolean option that
+      // prefixes `--checksum-seed`) consume the destination — a real bypass and
+      // a false block (#625 cycle-4 P1). `null` = ambiguous/unknown → not an
+      // operand (the safe direction for a read).
+      const RSYNC_LONG = [
+        ["--verbose", 0], ["--quiet", 0], ["--no-motd", 0], ["--checksum", 0], ["--archive", 0],
+        ["--recursive", 0], ["--relative", 0], ["--no-implied-dirs", 0], ["--backup", 0], ["--update", 0],
+        ["--inplace", 0], ["--append", 0], ["--append-verify", 0], ["--dirs", 0], ["--old-dirs", 0],
+        ["--mkpath", 0], ["--links", 0], ["--copy-links", 0], ["--copy-unsafe-links", 0], ["--safe-links", 0],
+        ["--munge-links", 0], ["--copy-dirlinks", 0], ["--keep-dirlinks", 0], ["--hard-links", 0],
+        ["--perms", 0], ["--executability", 0], ["--acls", 0], ["--xattrs", 0], ["--chmod", 1],
+        ["--owner", 0], ["--group", 0], ["--devices", 0], ["--specials", 0], ["--times", 0],
+        ["--atimes", 0], ["--open-noatime", 0], ["--omit-dir-times", 0], ["--omit-link-times", 0],
+        ["--super", 0], ["--fake-super", 0], ["--sparse", 0], ["--preallocate", 0], ["--dry-run", 0],
+        ["--whole-file", 0], ["--checksum-choice", 1], ["--one-file-system", 0], ["--block-size", 1],
+        ["--rsh", 1], ["--existing", 0], ["--ignore-existing", 0], ["--remove-source-files", 0],
+        ["--delete", 0], ["--delete-before", 0], ["--delete-during", 0], ["--delete-delay", 0],
+        ["--delete-after", 0], ["--delete-excluded", 0], ["--ignore-errors", 0], ["--force", 0],
+        ["--max-delete", 1], ["--max-size", 1], ["--min-size", 1], ["--max-alloc", 1], ["--partial", 0],
+        ["--partial-dir", 1], ["--backup-dir", 1], ["--suffix", 1], ["--checksum-seed", 1],
+        ["--checkpoint-action", 1], ["--info", 1], ["--debug", 1], ["--stderr", 1], ["--outbuf", 1],
+        ["--config", 1], ["--dparam", 1], ["--copy-as", 1],
+        ["--copy-devices", 0], ["--write-devices", 0], ["--delete-missing-args", 0], ["--delay-updates", 0], ["--prune-empty-dirs", 0], ["--numeric-ids", 0],
+        ["--usermap", 1], ["--groupmap", 1], ["--chown", 1], ["--timeout", 1], ["--contimeout", 1],
+        ["--ignore-times", 0], ["--size-only", 0], ["--modify-window", 1], ["--temp-dir", 1], ["--fuzzy", 0],
+        ["--compare-dest", 1], ["--copy-dest", 1], ["--link-dest", 1], ["--compress", 0],
+        ["--compress-choice", 1], ["--compress-level", 1], ["--skip-compress", 1], ["--cvs-exclude", 0],
+        ["--filter", 1], ["--exclude", 1], ["--exclude-from", 1], ["--include", 1], ["--include-from", 1],
+        ["--files-from", 1], ["--from0", 0], ["--protect-args", 0], ["--secluded-args", 0], ["--trust-sender", 0],
+        ["--address", 1], ["--port", 1], ["--sockopts", 1], ["--password-file", 1], ["--early-input", 1],
+        ["--blocking-io", 0], ["--stats", 0], ["--human-readable", 0], ["--progress", 0],
+        ["--itemize-changes", 0], ["--remote-option", 1], ["--out-format", 1], ["--log-file", 1],
+        ["--log-file-format", 1], ["--log-format", 1], ["--list-only", 0], ["--bwlimit", 1],
+        ["--stop-after", 1], ["--fsync", 0], ["--write-batch", 1], ["--only-write-batch", 1],
+        ["--read-batch", 1], ["--protocol", 1], ["--iconv", 1], ["--ipv4", 0], ["--ipv6", 0],
+        ["--version", 0], ["--help", 0], ["--daemon", 0], ["--no-detach", 0], ["--old-args", 0],
+        ["--rsync-path", 1], ["--msgs2stderr", 0],
+      ];
+      const RSYNC_OP_SHORT = new Set(["-e", "-f", "-B", "-T", "-M"]);   // rsync `-S` is --sparse, NOT --suffix
+      const isRsyncOperand = (w) => {
+        const eq = w.indexOf("=");
+        const name = eq === -1 ? w : w.slice(0, eq);
+        if (RSYNC_OP_SHORT.has(name)) return true;
+        const exact = RSYNC_LONG.find(([nm]) => nm === name);
+        if (exact) return exact[1] === 1;
+        const hits = RSYNC_LONG.filter(([nm]) => nm.startsWith(name));
+        return hits.length === 1 && hits[0][1] === 1;   // ambiguous/unknown → not an operand
+      };
+      const LN_OPERAND_FLAGS = new Set(["-t", "--target-directory", "-S", "--suffix"]);
+      let expectOperand = false;
+      let expectTarget = false;
+      let targetDir = null;
+      let endOpts = false;
+      const positionals = [];
+      for (const w of words) {
+        if (expectTarget) { targetDir = w; expectTarget = false; continue; }
+        if (expectOperand) { expectOperand = false; continue; }
+        if (!endOpts && w === "--") { endOpts = true; continue; }
+        if (!endOpts && isFlag(w) && w !== "-") {
+          if (v === "ln" && (w === "-t" || w === "--target-directory")) { expectTarget = true; continue; }
+          if (v === "ln" && w.startsWith("--target-directory=")) { targetDir = w.slice("--target-directory=".length); continue; }
+          if (v === "ln" && !w.startsWith("--") && /^-[a-zA-Z]/.test(w)) {
+            // Same left-to-right cluster parse as cp/mv/install: `S` consumes
+            // the rest as an attached suffix, so `-S.tmp` is not `-t mp`.
+            const cluster = w.slice(1);
+            for (let ci = 0; ci < cluster.length; ci++) {
+              const ch = cluster[ci];
+              if (ch === "t") {
+                const rest = cluster.slice(ci + 1);
+                if (rest) targetDir = rest; else expectTarget = true;
+                break;
+              }
+              if (ch === "S") {
+                if (ci + 1 >= cluster.length) expectOperand = true;
+                break;
+              }
+            }
+            continue;
+          }
+          if (v === "rsync" ? isRsyncOperand(w) : LN_OPERAND_FLAGS.has(w)) {
+            if (!w.includes("=")) expectOperand = true;   // `--flag=value` is self-delimiting
+            continue;
+          }
+          continue;
+        }
+        positionals.push(w);
+      }
+      if (targetDir) {
+        emitDst(targetDir, positionals, false);
+      } else if (positionals.length > 0) {
+        const last = positionals[positionals.length - 1];
+        if (v === "ln" && positionals.length === 1) {
+          // `ln TARGET` (2nd form) creates CWD/basename(TARGET) (#625 A1).
+          emitDst(siteCwd, [last], false);
+        } else if (v === "rsync" && positionals.length === 1) {
+          // Single-operand rsync is a LIST-only invocation — writes nothing
+          // (#625 cycle-4 B5).
+        } else {
+          emitDst(last, positionals.slice(0, -1), false);
+        }
+      }
+      return out;
+    }
+    if (v === "dd") {
+      for (const w of words) if (w.startsWith("of=")) out.push(w.slice(3));
+      return out;
+    }
+    if (v === "sort") {
+      // `sort -o FILE` writes FILE (attached `-oFILE`/`--output=FILE` or the
+      // next word). A plain `sort file` is read-only → no target. `-o` may be
+      // BUNDLED behind other letters (`sort -ro out`) (#625 review A2), so the
+      // short cluster is scanned LEFT TO RIGHT: `t`/`k`/`S`/`T` take an
+      // operand, which may be attached (`-to` means separator `o`) — those are
+      // consumed, never re-read as `-o` (#625 cycle-2 P2). Long options accept
+      // any UNAMBIGUOUS prefix (getopt_long does) — `--out=FILE` IS `--output`
+      // (#625 cycle-3 B1).
+      const SORT_LONG = [
+        ["--output", "out"], ["--field-separator", "op"], ["--key", "op"], ["--buffer-size", "op"],
+        ["--temporary-directory", "op"], ["--random-source", "op"], ["--compress-program", "op"],
+        ["--files0-from", "op"], ["--batch-size", "op"], ["--sort", "op"], ["--parallel", "op"],
+        ["--check", "none"], ["--debug", "none"], ["--help", "none"], ["--version", "none"],
+        ["--ignore-leading-blanks", "none"], ["--dictionary-order", "none"], ["--ignore-case", "none"],
+        ["--general-numeric-sort", "none"], ["--ignore-nonprinting", "none"], ["--month-sort", "none"],
+        ["--human-numeric-sort", "none"], ["--version-sort", "none"], ["--numeric-sort", "none"],
+        ["--random-sort", "none"], ["--reverse", "none"], ["--stable", "none"], ["--unique", "none"],
+        ["--merge", "none"], ["--zero-terminated", "none"],
+      ];
+      const resolveLong = (name) => {
+        const hits = SORT_LONG.filter(([nm]) => nm.slice(2).startsWith(name));
+        return hits.length === 1 ? hits[0][1] : null;   // ambiguous/unknown → non-write
+      };
+      let outputNext = false;
+      let skipNext = false;
+      let endOpts = false;
+      for (const w of words) {
+        if (skipNext) { skipNext = false; continue; }
+        if (outputNext) { out.push(w); outputNext = false; continue; }
+        if (!endOpts && w === "--") { endOpts = true; continue; }
+        if (!endOpts && w === "-o") { outputNext = true; continue; }
+        if (!endOpts && w.startsWith("--")) {
+          const body = w.slice(2);
+          const eq = body.indexOf("=");
+          const kind = resolveLong(eq === -1 ? body : body.slice(0, eq));
+          if (kind === "out") {
+            if (eq === -1) outputNext = true; else out.push(body.slice(eq + 1));
+          } else if (kind === "op" && eq === -1) skipNext = true;
+          continue;
+        }
+        if (!endOpts && w.startsWith("-") && w.length > 1) {
+          const cluster = w.slice(1);
+          for (let ci = 0; ci < cluster.length; ci++) {
+            const ch = cluster[ci];
+            if (ch === "o") {
+              const rest = cluster.slice(ci + 1);
+              if (rest) out.push(rest); else outputNext = true;
+              break;
+            }
+            if (ch === "t" || ch === "k" || ch === "S" || ch === "T") {
+              if (ci + 1 >= cluster.length) skipNext = true;
+              break;
+            }
+          }
+        }
+      }
+      return out;
+    }
+    if (v === "sponge" || v === "ed" || v === "ex" || v === "vi" || v === "vim" || v === "nvi") {
+      // `sponge FILE...` writes every FILE; `ed`/`ex`/`vi`/`vim` edit their
+      // file operands in place. EVERY positional is a candidate (vim/ex write
+      // the FIRST of several files, so last-only misses them) (#625 cycle-2
+      // P1). `+cmd` tokens are ex commands, not files, and a bare `-` is
+      // stdin/stdout — neither is a candidate. Option operands (`-c/--command`
+      // for ed/ex; `-c/--cmd`, `-u`, `-S`, `-i`, `-T`, `-W` for the vi family)
+      // are consumed so they are never mistaken for files.
+      let expectOperand = false;
+      let endOpts = false;
+      const positionals = [];
+      for (const w of words) {
+        if (expectOperand) { expectOperand = false; continue; }
+        if (!endOpts && w === "--") { endOpts = true; continue; }
+        if (!endOpts && isFlag(w) && w !== "-") {
+          if ((v === "ed" || v === "ex") && (w === "-c" || w === "--command")) { expectOperand = true; continue; }
+          if ((v === "vi" || v === "vim" || v === "nvi") &&
+              (w === "-c" || w === "--cmd" || w === "-u" || w === "--rcfile" || w === "-S" ||
+               w === "--session" || w === "-i" || w === "-T" || w === "-W" ||
+               w === "--startuptime" || w === "--servername")) { expectOperand = true; continue; }
+          continue;
+        }
+        if (w === "-" || w.startsWith("+")) continue;   // stdin / ex command
+        positionals.push(w);
+      }
+      for (const f of positionals) emitDst(f, [], false);
+      return out;
+    }
+    return out;
   };
   const applyPending = () => {
     const fr = f();
@@ -4732,27 +5334,28 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (spawnerOperandNext) spawnerOperandNext = false;
         i = k; continue;
       }
-      if (fdRun !== "" && fdRun !== "0" && fdRun !== "1") {
-        // stderr / other fd: never a content write — skip op + operand
-        let p = k + 1;
-        if (s[p] === ">" || s[p] === "|" || s[p] === "&") p++;
-        if (s[p] === "&") p++;
-        p = skipWs(p);
-        i = readWord(p).k;
-        continue;
+      // fd-prefixed INPUT (`0<f`, `1<f`, `2<f`) is a READ, never a write — hand
+      // it to the `<` branch. Treating `0<file` as `>file` false-blocked
+      // read-only stdin redirects (#625 cycle-3 B3).
+      if (s[k] === "<") { i = k; continue; }
+      if (s[k] === ">" && s[k + 1] === "&") {
+        // `N>&M` / `N>&-` is a dup/close (no file). Legacy `>&file` (target not
+        // an fd) DOES write the file, so keep it.
+        const tgt = readWord(skipWs(k + 2));
+        if (/^[0-9-]*$/.test(tgt.w)) { i = tgt.k; continue; }
+        const _rtd = { raw: tgt.w, cwd: f().cwd }; redirs.push(_rtd, ...forkTwins(_rtd));
+        i = tgt.k; continue;
       }
-      let p = k;                                            // at '>'
+      // `N>f` / `N>>f` / `N>|f` opens f with O_TRUNC for ANY fd — a tracked-file
+      // mutation even when no content is written through it (`echo x 3>f 1>&3`,
+      // `2>f` truncation) (#625 cycle-3 B2). The operand is emitted; `/dev/*`
+      // and non-tracked files are filtered downstream, so the match is inert.
+      let p = k + 1;
       let op = ">";
-      const n1 = s[p + 1];
-      if (n1 === ">" || n1 === "|") { op += n1; p += 2; }
-      else if (n1 === "&") {
-        const q2 = skipWs(p + 2);
-        if (/^[0-9-]/.test(s.slice(q2))) { i = q2; continue; } // fd-dup/close
-        op = ">&"; p = q2;
-      } else p++;
+      const n1 = s[k + 1];
+      if (n1 === ">" || n1 === "|") { op += n1; p = k + 2; }
       p = skipWs(p);
       const operand = readWord(p);
-      if (op.includes("&") && /^-?[0-9]*$/.test(operand.w)) { i = operand.k; continue; }
       const _rt2 = { raw: operand.w, cwd: f().cwd }; redirs.push(_rt2, ...forkTwins(_rt2));        // pre-cd (pending not applied)
       i = operand.k;
       continue;
@@ -5166,6 +5769,20 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (teeBase === "tee") { const _tt = { idx: wstart, end: w0.k, cwd }; tees.push(_tt, ...forkTwins(_tt)); continue; }
     }
     {
+      // #625: in-place OVERWRITE verbs (sed -i / perl -pi / awk -i inplace /
+      // cp / mv / install / truncate / dd of= / rsync / ln / sort -o / sponge /
+      // ed / ex) — a write with NO primitive token, resolved as a target
+      // through the SAME hub/tracked gate.
+      const verbBase = w0.w.lastIndexOf("/") >= 0 ? w0.w.slice(w0.w.lastIndexOf("/") + 1) : w0.w;
+      if (INPLACE_WRITE_VERBS.has(verbBase)) {
+        for (const raw of verbTargets(verbBase, i, cwd)) {
+          const _vb = { raw, cwd, via: verbBase };
+          verbToks.push(_vb, ...forkTwins(_vb));
+        }
+        continue;
+      }
+    }
+    {
       // interpreter scan condition (cycle-23 F1): bare OR path-qualified
       // shells (/usr/bin/bash ≡ bash), `source`/`.` (with their arg-position
       // sub-gate), and DIRECT-EXEC script paths (`./run.sh`, `/abs/x.sh` —
@@ -5331,14 +5948,16 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (w1.w === "" ) { done = true; continue; }
         if (w1.w === "-c" || w1.w === "--command") {
           const k2 = skipWs(w1.k);
-          const _ip3 = { payload: readWord(k2).w, cwd }; inlinePays.push(_ip3, ...forkTwins(_ip3));
-          i = readWord(k2).k;
+          const _arg = readWord(k2);
+          const _ip3 = { payload: _arg.w, cwd }; inlinePays.push(_ip3, ...forkTwins(_ip3));
+          i = _arg.k;
           done = true;
         } else if (/^-[a-zA-Z]+$/.test(w1.w) && w1.w.includes("c")) {
           // single-dash letter run containing c (bash -lc '…', sh -ec '…')
           const k2 = skipWs(w1.k);
-          const _ip3 = { payload: readWord(k2).w, cwd }; inlinePays.push(_ip3, ...forkTwins(_ip3));
-          i = readWord(k2).k;
+          const _arg = readWord(k2);
+          const _ip3 = { payload: _arg.w, cwd }; inlinePays.push(_ip3, ...forkTwins(_ip3));
+          i = _arg.k;
           done = true;
         } else if (w1.w === "--rcfile" || w1.w === "--init-file" || w1.w === "-O" || w1.w === "-o") {
           const k2 = skipWs(w1.k);
@@ -5378,36 +5997,62 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // and chained-spawner routes both re-pend it, so this block was dead code.
     // exec-driven interpreter/tee/script scanning runs via the standard chain.
 
-    if (w0.w === "eval") {
-      // quoted eval ('echo x > f') — the STANDARD form — must recurse on the
-      // UNQUOTED payload; bare eval collects words until a boundary/newline.
+    if (w0.w === "eval" || w0.w === "trap") {
+      // quoted eval/trap ('echo x > f') — the STANDARD form — must recurse on
+      // the UNQUOTED payload; bare eval collects words until a boundary/newline.
+      // `trap` runs its first operand as code in the same shell, so its payload
+      // is walked the same way (#625 cycle-4 B2). Leading option tokens are
+      // skipped first (`trap --`, `trap -p`, `trap -l`, `eval --`) and ANSI-C
+      // quoting (`$'…'` / `$"…"`) is recognized — both otherwise left the raw
+      // quoted text as one word, so the `>` was never seen (#625 cycle-5 P1).
       let k = skipWs(i);
-      const qd = s[k] === "'" || s[k] === '"' ? s[k] : null;
-      if (qd) {
-        k++;
-        let pl = "";
-        while (k < n && s[k] !== qd && pl.length < 4096) {
-          if (qd === '"' && s[k] === "\\" && k + 1 < n) {
-            // dq escape (cycle-15 D2): \" / \\ / \$ → the literal next char
-            pl += s[k + 1];
-            k += 2;
-            continue;
-          }
-          pl += s[k]; k++;
-        }
-        const _ip4 = { payload: pl, cwd }; inlinePays.push(_ip4, ...forkTwins(_ip4));
-        i = k + 1;
-      } else {
-        let pl = "";
-        while (k < n && !";|&()\n".includes(s[k]) && pl.length < 4096) { pl += s[k]; k++; }
-        const _ip5 = { payload: pl.trim(), cwd }; inlinePays.push(_ip5, ...forkTwins(_ip5));
-        i = k;
+      let sawList = false;
+      while (k < n) {
+        const opt = readWord(k);
+        const isList = opt.w === "-p" || opt.w === "--print" || opt.w === "-l" || opt.w === "--list";
+        const isOpt = opt.w === "--" || (w0.w === "trap" && isList);
+        if (!isOpt || opt.k <= k) break;
+        if (isList) sawList = true;
+        k = skipWs(opt.k);
       }
+      if (w0.w === "trap") {
+        // `trap -p`/`-l`: the remaining operands are signal specs, never an
+        // action (false-positive fix, cycle-7 P3).
+        if (sawList) { i = k; continue; }
+        // The action is trap's FIRST operand. A quoted one is read with shell
+        // semantics; an UNQUOTED one still needs one level of unescaping
+        // (`trap echo\ x\ \>tracked.md EXIT` really writes the file at signal
+        // time) — cycle-8 P1.
+        const a = readWord(k);
+        if (a.w && a.k > k) {
+          const _ip = { payload: a.w, cwd }; inlinePays.push(_ip, ...forkTwins(_ip));
+          i = a.k;
+        }
+        continue;
+      }
+      // `eval` concatenates ALL its arguments into ONE command — read every
+      // argument with shell quote semantics (ANSI-C `$'…'` decoded per arg) and
+      // join (#625 cycle-6 B4, cycle-7 P1). Advance over spaces/tabs ONLY (not
+      // `\n`) so the loop's newline terminator fires and the following line is
+      // not swallowed (#625 cycle-8 P1).
+      const parts = [];
+      let j = k;
+      while (j < n && !";|&()\n".includes(s[j])) {
+        const a = readWord(j);
+        if (a.k <= j) break;
+        parts.push(a.w);
+        j = a.k;
+        while (j < n && (s[j] === " " || s[j] === "\t" || s[j] === "\r")) j++;
+      }
+      const payload = parts.join(" ").trim();
+      if (payload) { const _ip = { payload, cwd }; inlinePays.push(_ip, ...forkTwins(_ip)); }
+      i = j;
       continue;
     }
   }
   applyPending();
   for (const r of redirs) push(r.raw, r.cwd, "redirect", "site");
+  for (const v of verbToks) push(v.raw, v.cwd, v.via, "site");
   for (const t of tees) {
     // cycle-36 B: the collection must stop at the first top-level `;`/`&`/`|`/`)`
     // boundary too — `echo hi | tee a.md; cat tracked.md` would otherwise collect
@@ -5418,6 +6063,12 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     let dqT = null;
     for (let kT = t.idx; kT < n; kT++) {
       const cT = s[kT];
+      // `\`+newline is a LINE CONTINUATION — the tee command continues on the
+      // next line (bash deletes the pair), so it is NOT a segment boundary.
+      // Treating it as one truncated `lim` at the continuation and dropped every
+      // operand after it (#625 cycle-13 P1: `printf y | tee \<NL> -a <hub>/f`
+      // captured no target while bash appended to the tracked file).
+      if (dqT === null && cT === "\\" && s[kT + 1] === "\n") { kT++; continue; }
       if (dqT === null && cT === "\n") { segEnd = kT; break; }
       if (dqT === null && (cT === ";" || cT === "&" || cT === "|" || cT === ")")) { segEnd = kT; break; }
       if (dqT !== null && cT === "\\") { kT++; continue; }
@@ -5429,7 +6080,35 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // slice from the END of the tee word (a quote-led or path-qualified tee
     // starts earlier than +3 — cycle-30 P2-1/P2-2)
     const teeWordEnd = t.end ?? t.idx + 3;
-    const rawWords = _tokenize(s.slice(teeWordEnd, lim));
+    // Tee positionals are read with the same quote-aware `readWord` as every
+    // other write route, so `$'…'`/`$"…"` decode correctly, an apostrophe or
+    // a space inside `$'…'` cannot split the word, ANSI-C escapes cannot inject
+    // whitespace into the token stream, and a trailing `# comment` is dropped
+    // (#625 cycle-9 A-P3 / B-P2). A word starting with `#` at a word boundary
+    // begins a comment; operators/redirections end the tee segment.
+    const rawWords = [];
+    {
+      let p = skipWs(teeWordEnd);
+      while (p < lim) {
+        const c = s[p];
+        if (c === "#" && (p === 0 || /[\s;&|(\n]/.test(s[p - 1]))) break;
+        if (c === ";" || c === "&" || c === "|" || c === "(" || c === ")" || c === "\n") break;
+        if (c === ">" || c === "<" || (c >= "0" && c <= "9")) {
+          let rp = p;
+          while (rp < lim && s[rp] >= "0" && s[rp] <= "9") rp++;
+          if (rp < lim && (s[rp] === ">" || s[rp] === "<")) {
+            while (rp < lim && "<>&|".includes(s[rp])) rp++;
+            const ao = readWord(skipWs(rp));
+            p = ao.k > rp ? ao.k : rp + 1;
+            continue;
+          }
+        }
+        const w = readWord(p);
+        if (w.k <= p) { p++; continue; }
+        if (w.w !== "") rawWords.push(w.w);
+        p = skipWs(w.k);
+      }
+    }
     // ALL non-flag positionals are write targets (echo x | tee a.md b.md).
     // cycle-16 P2 + cycle-29 (review): a heredoc header `tee f <<EOF` feeds
     // tee from the BODY — drop `<<` and the DELIMITER word only; positionals
@@ -5437,9 +6116,12 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // a.md AND b.md — the earlier dropAll guard dropped them).
     const words = [];
     let heredocDrop = 0;
+    let redirDrop = 0;
     for (const w of rawWords) {
       if (heredocDrop > 0) { heredocDrop--; continue; }
+      if (redirDrop > 0) { redirDrop--; continue; }   // `<`/`>` operand is a read/redirect, not a tee target (#625 cycle-7 P3)
       if (w === "<<" || w === "<<-") { heredocDrop = 1; continue; }
+      if (/^[0-9]*(<|<<|>>?>|&>>?)$/.test(w) || w === "<&" || w === ">&" || w === "<>") { redirDrop = 1; continue; }
       if (_isShellBoundary(w)) continue;
       words.push(w);
     }

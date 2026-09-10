@@ -333,12 +333,14 @@ try {
   // state, a cross-checkout `.git/` target blocks too (F4), a cross-checkout
   // overwrite of an EXISTING untracked hub file blocks (cycle-3 A-2 — only
   // genuinely NEW files are additive), the nested-own-tree exemption requires
-  // a NON-main session (cycle-3 B-1), and only a session rooted in a
-  // DISORDERED main freezes on its own tracked overwrites. markerOn mirrors
-  // the index marker branch: cross-checkout bypassed, own-rooted clean is an
-  // open recovery window, disordered-own keeps the M4 D3 freeze (cycle-2
-  // marker parity). Mirror contract = guardDecision (index.ts not importable;
-  // source pins below are the regression tripwire).
+  // a NON-main session (cycle-3 B-1), and (#625) a SAME-checkout tracked
+  // overwrite blocks in EITHER hub state — clean or disordered (the old
+  // clean-hub residual is removed; own-main untracked/new writes stay
+  // allowed). markerOn mirrors the index marker branch: cross-checkout
+  // bypassed, own-rooted clean is an open recovery window, disordered-own
+  // keeps the M4 D3 freeze (cycle-2 marker parity). Mirror contract =
+  // guardDecision (index.ts not importable; source pins below are the
+  // regression tripwire).
   const bashGateDecision = (command, sessionCwd, markerOn = false) => {
     const realp = (p) => {
       let d = resolve(p); let tail = "";
@@ -374,7 +376,7 @@ try {
         if (!sameCheckout) continue; // marker bypasses the #618 cross gate (tool parity)
         if (disorder === null) continue; // clean own main under the marker — open recovery window
         if (rel === ".git" || rel.startsWith(".git/")) return "BLOCK (hub .git)"; // M4 D3 freeze
-        if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (disordered tracked)";
+        if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (hub tracked)";
         continue;
       }
       // .git-metadata (exact ".git" pointer or ".git/..."): never tracked,
@@ -382,12 +384,10 @@ try {
       // (cycle-2 P1 + cycle-3 B-2: same-rooted included; only the marker's
       // own-rooted clean window is open, handled above).
       if (rel === ".git" || rel.startsWith(".git/")) return "BLOCK (hub .git)";
-      if (sameCheckout) {
-        if (disorder === null) return "ALLOW (clean same-checkout)";
-        if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (disordered tracked)";
-        continue;
-      }
+      // #625: the tracked test is STATE-INDEPENDENT — a tracked own-hub write
+      // blocks clean OR disordered (own untracked/new writes fall through).
       if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (hub tracked)";
+      if (sameCheckout) continue;
       // cycle-3 A-2: cross-checkout overwrite of an EXISTING untracked hub
       // file (another session's hub WIP) blocks; NEW files stay additive.
       try { if (existsSync(tReal) && statSync(tReal).isFile()) return "BLOCK (hub existing untracked)"; } catch { /* treat as new */ }
@@ -411,7 +411,40 @@ try {
   bashPin("bash#618: foreign cwd → hub .git metadata (F4) → BLOCK", `echo x > ${hub}/.git/hooks/pre-commit`, parent, "BLOCK (hub .git)");
   bashPin("bash#621: hub-rooted CLEAN session → own hub .git hook (P1) → BLOCK", `echo x > ${hub}/.git/hooks/pre-commit`, hub, "BLOCK (hub .git)");
   bashPin("bash#621: infra-rooted session → hub TRACKED → BLOCK", `echo x > ${hub}/AGENTS.md`, infra, "BLOCK (hub tracked)");
-  bashPin("bash#621: hub-rooted session → own TRACKED while CLEAN → ALLOW (#437 residual)", `echo x > ${hub}/AGENTS.md`, hub, "ALLOW (clean same-checkout)");
+  // #625 vector 1 — the clean-hub compound. The tracked write must gate on the
+  // command's EFFECT (a tracked hub-main write), not on pre-execution disorder:
+  // a hub-rooted main+CLEAN session running write+add+commit+push in ONE
+  // tool_call used to slip (M4's git gate never ran because st.disorder was
+  // null, and decideM2 saw an on-baseline session).
+  bashPin("#625: hub-rooted CLEAN session → own TRACKED redirect → BLOCK (effect-gated)", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN compound (write+add+commit+push) → BLOCK", `printf 'x' >> ${hub}/AGENTS.md && git add ${hub}/AGENTS.md && git commit -m chore && git push origin main`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN compound (tee+commit+push) → BLOCK", `echo x | tee -a ${hub}/AGENTS.md && git commit -am chore && git push origin main`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN compound via bash -c payload → BLOCK", `bash -c "printf 'x' >> ${hub}/AGENTS.md && git commit -am chore"`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN own UNTRACKED new file → ALLOW (additive)", `echo x > ${hub}/docs/_pin625-new.md`, hub, "ALLOW (no hub-main write)");
+  // #625 vector 2 — in-place overwrite VERBS (no write-primitive token).
+  bashPin("#625: hub-rooted CLEAN sed -i on tracked hub file → BLOCK", `sed -i s/a/b/ ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN perl -pi on tracked hub file → BLOCK", `perl -pi -e 's/a/b/' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: wt session cp onto tracked hub file → BLOCK", `cp ${wt}/src-625.md ${hub}/AGENTS.md`, wt, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN mv onto tracked hub file → BLOCK", `mv ${hub}/tmp-625.md ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN truncate tracked hub file → BLOCK", `truncate -s 0 ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN dd of= tracked hub file → BLOCK", `dd if=/dev/zero of=${hub}/AGENTS.md bs=1 count=0`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN cp file INTO hub root (dir dst) → BLOCK", `cp /tmp/evil-625/AGENTS.md .`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN cp into hub dir (trailing slash dst) → BLOCK", `cp /tmp/evil-625/AGENTS.md ${hub}/`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN cp ... 2>&1 (fd redirect) → BLOCK", `cp /tmp/evil-625/AGENTS.md ${hub}/AGENTS.md 2>&1`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN sed -i '' (BSD) → BLOCK", `sed -i '' 's/a/b/' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN sort -o tracked hub file → BLOCK", `sort -o ${hub}/AGENTS.md /tmp/in-625.txt`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: wt session rsync onto tracked hub file → BLOCK", `rsync -a ${wt}/src-625.md ${hub}/AGENTS.md`, wt, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN ln -sf over tracked hub file → BLOCK", `ln -sf /tmp/x ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN in-place verb on WORKTREE file → ALLOW", `sed -i s/a/b/ ${wt}/wt-own.txt`, hub, "ALLOW (no hub-main write)");
+  // #625 cycle-10: getopt_long abbreviation (fail-open) + single-operand no-op.
+  bashPin("#625: hub-rooted CLEAN sed --in-pl (abbreviated --in-place) → BLOCK", `sed --in-pl s/a/b/ ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN gawk --incl inplace (abbreviated) → BLOCK", `gawk --incl inplace '{print}' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN gawk -i inplace --file p.awk → BLOCK", `gawk -i inplace --file p.awk ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN gawk --incl inplace --source prog → BLOCK", `gawk --incl inplace --source '{print}' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN redirect operand after a leading line continuation → BLOCK", `echo x > \\\n  ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN tee -a after a line continuation → BLOCK", `printf y | tee \\\n -a ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN single-operand cp on tracked file → ALLOW (malformed no-op)", `cp ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)");
+  bashPin("#625: hub-rooted CLEAN single-operand mv on tracked file → ALLOW (malformed no-op)", `mv ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)");
   bashPin("bash#621: hub-rooted session → own worktree file → ALLOW", `cd ${wt} && echo x > wt-own.txt`, hub, "ALLOW (no hub-main write)");
   // cycle-2 marker-parity pins (bashGateDecision markerOn param — the matrix
   // the index classify marker branch implements; the real marker file itself
@@ -420,10 +453,10 @@ try {
   bashPin("bashMarker: hub-rooted CLEAN own tracked under marker → ALLOW (recovery)", `echo x > ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)", true);
   bashPin("bashMarker: hub-rooted CLEAN own .git hook under marker → ALLOW (window)", `echo x > ${hub}/.git/hooks/pre-commit`, hub, "ALLOW (no hub-main write)", true);
   execSync("touch stray.txt", { cwd: hub, stdio: "ignore" });
-  bashPin("bash#437: hub-rooted session → own TRACKED while DIRTY → BLOCK", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (disordered tracked)");
+  bashPin("bash#437/#625: hub-rooted session → own TRACKED while DIRTY → BLOCK", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("bash#437: hub-rooted DIRTY session → own NEW file → ALLOW", `echo x > ${hub}/docs/new-bash.md`, hub, "ALLOW (no hub-main write)");
   // cycle-2 marker parity, disordered-own side (M4 D3 keeps freezing).
-  bashPin("bashMarker: hub-rooted DIRTY own tracked under marker → BLOCK (M4 D3)", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (disordered tracked)", true);
+  bashPin("bashMarker: hub-rooted DIRTY own tracked under marker → BLOCK (M4 D3)", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)", true);
   bashPin("bashMarker: hub-rooted DIRTY own .git hook under marker → BLOCK (M4 D3)", `echo x > ${hub}/.git/hooks/pre-commit`, hub, "BLOCK (hub .git)", true);
   execSync("rm stray.txt", { cwd: hub, stdio: "ignore" });
   // Cycle-2 fold-in fixtures: a PRIVATE nested repo under the session's own
@@ -608,8 +641,41 @@ expectBool("rev2: script budget hardened to 64 + fail-closed kind", pinSrc.inclu
 expectBool("rev2: .git rel-exact also in the block-reason fn", pinSrc.includes("hit.rel === \".git\" || hit.rel.startsWith(\".git/\")"), true);
 expectBool("rev3: containment capped at NON-main sessions (ancestor-main cannot lift the freeze)", pinSrc.includes("!sessionCheck.isMain && sessionTop"), true);
 expectBool("rev3: bash route existing-untracked overwrite freeze (kind + crossTop)", pinSrc.includes("kind: \"untracked-existing\"") && pinSrc.includes("crossTop"), true);
-expectBool("rev3: script exhaustion fails closed only on hub-proximity evidence", pinSrc.includes("grouped.size === 0 && !(sessionOwnHub !== null && sessionDisorder !== null)"), true);
+expectBool("rev3: script exhaustion fails closed on hub-proximity evidence (cycle-3 A-1: own-hub arm needs a DISORDERED hub)", pinSrc.includes("grouped.size === 0 && !(sessionOwnHub !== null && sessionDisorder !== null)"), true);
 expectBool("rev3: .git doctrine reconciled (block reason names the marker window as the only open state)", pinSrc.includes("an active escape-marker's own-rooted clean recovery window"), true);
+
+// ── #625 source pins (index.ts + classify-git.mjs) ────────────────────────
+// The clean-hub bash tracked-write residual was removed (the tracked test is
+// now state-independent for a session's own hub), and the walker surfaces the
+// in-place overwrite VERBS. Trip on a literal/merge revert of either half.
+expectBool("#625 source pin: clean-same-checkout early return removed", !pinSrc.includes("} else if (sameCheckout) {"), true);
+expectBool("#625 source pin: only the marker's clean own-main window keeps a sessionDisorder-null skip", (pinSrc.match(/sessionDisorder === null\) return;/g) ?? []).length === 1, true);
+expectBool("#625 source pin: in-place verb set declared (INPLACE_WRITE_VERBS)", classifySrc.includes("INPLACE_WRITE_VERBS"), true);
+expectBool("#625 source pin: verb target resolver wired (verbTargets closure)", classifySrc.includes("const verbTargets = (verb, k0, siteCwd) => {"), true);
+expectBool("#625 source pin: verb dispatch is command-position + basename-normalized", classifySrc.includes("INPLACE_WRITE_VERBS.has(verbBase)"), true);
+expectBool("#625 source pin: verb candidates enter the target assembly", classifySrc.includes("for (const v of verbToks) push(v.raw, v.cwd, v.via, \"site\")"), true);
+expectBool("#625 source pin: sed/perl in-place flag detected", classifySrc.includes("inPlace = true; ci = cluster.length"), true);
+expectBool("#625 source pin: cp/mv -t target-directory handled", classifySrc.includes("--target-directory="), true);
+expectBool("#625 source pin: dd of= operand surfaced", classifySrc.includes("w.startsWith(\"of=\")"), true);
+expectBool("#625 source pin: mv surfaces its sources (removal is a tracked mutation)", classifySrc.includes("const alsoSources = v === \"mv\""), true);
+expectBool("#625 source pin: rsync/ln destination handled (operand-aware)", classifySrc.includes("v === \"rsync\" || v === \"ln\"") && classifySrc.includes("isRsyncOperand") && classifySrc.includes("RSYNC_LONG"), true);
+expectBool("#625 source pin: directory destination expands per-source (dstIsDir/emitDst)", classifySrc.includes("const dstIsDir = (dst) => {") && classifySrc.includes("const emitDst = (dst, sources, alsoSources) => {"), true);
+expectBool("#625 source pin: verbTargets receives the site cwd (dir-expansion resolves)", classifySrc.includes("verbTargets(verbBase, i, cwd)") && classifySrc.includes("const verbTargets = (verb, k0, siteCwd) => {"), true);
+expectBool("#625 source pin: fd-prefixed redirects consumed before readWord", classifySrc.includes("if (rk < n && (s[rk] === \">\" || s[rk] === \"<\")) {"), true);
+expectBool("#625 source pin: empty quoted operand advances via w.k (BSD sed -i '')", classifySrc.includes("if (w.w === \"\" && w.k <= k)"), true);
+expectBool("#625 source pin: sed/perl in-place flag parsed letter-by-letter", classifySrc.includes("if (ch === \"i\") { inPlace = true; ci = cluster.length; continue; }"), true);
+expectBool("#625 source pin: gsed/awk attached-inplace/sort/sponge/ed/ex in the verb set", classifySrc.includes("\"gsed\", \"perl\"") && classifySrc.includes("-iinplace") && classifySrc.includes("\"sort\", \"sponge\", \"ed\", \"ex\", \"vi\", \"vim\", \"nvi\""), true);
+expectBool("#625 source pin: block reason names verb coverage", pinSrc.includes("in-place overwrite verbs"), true);
+// #625 cycle-10 mirror-drift tripwire: an exact-spelling-only long-option match is
+// a fail-open bypass (getopt_long accepts any unambiguous prefix).
+expectBool("#625 source pin: getopt_long unambiguous-prefix resolver present", classifySrc.includes("const _resolveLong = (tbl, name) => {") && classifySrc.includes("return hits.length === 1 ? hits[0] : null;"), true);
+expectBool("#625 source pin: sed + gawk long-option arity tables declared", classifySrc.includes("const SED_LONG = {") && classifySrc.includes("const AWK_LONG = {"), true);
+expectBool("#625 source pin: sed in-place resolved via the prefix table (BSD -i '' guard too)", classifySrc.includes('resolved === "in-place"') && classifySrc.includes("_isSedInPlaceLong(words[wi - 1])"), true);
+expectBool("#625 source pin: gawk --include resolved via the prefix table", classifySrc.includes('if (resolved === "include") {'), true);
+expectBool("#625 source pin: awk program-providing long options set hasProgFlag", classifySrc.includes('if (resolved === "file" || resolved === "source" || resolved === "exec") hasProgFlag = true;'), true);
+expectBool("#625 source pin: readWord skips a leading line continuation + indent", classifySrc.includes('if (w === "") { k = skipWs(k2); continue; }') && classifySrc.includes("const k2 = k + 2;"), true);
+expectBool("#625 source pin: tee segment scan does not break at a continuation newline", classifySrc.includes('if (dqT === null && cT === "\\\\" && s[kT + 1] === "\\n") { kT++; continue; }'), true);
+expectBool("#625 source pin: cp/mv/install destination requires a source operand", classifySrc.includes("positionals.length > 1") && classifySrc.includes("if (positionals.length > 0) emitDst(targetDir, positionals, alsoSources);"), true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
 function expectBranches(command, expectedArray) {
@@ -4184,6 +4250,239 @@ try {
     has("case a in (a) cd y/a;; esac; echo hi > t.md", "redirect:H/y/a/t.md", "paren-led arm body cd applies");
     const none = (cmd, label) => expectBool(`C437r44: ${label}`, pluck(cmd).length === 0, true);
     none("echo hi", "prose silence");
+  }
+
+  // ── #625: in-place overwrite VERBS — walker-level pins. The primitive-only
+  // walk (`>`/`>>`/`tee`/python open) never surfaced `sed -i`/`cp`/`mv`/
+  // `truncate`/`dd of=`/`perl -pi`/`awk -i inplace` onto a tracked hub file,
+  // so the same-file write was blocked via redirect but slipped via the verb.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt625-"));
+    mkdirSync(join(H, "subdir"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C625: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C625: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    const none = (cmd, label) => expectBool(`C625: ${label}`, pluck(cmd).length === 0, true);
+    // sed
+    has("sed -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed -i target");
+    has("sed --in-place s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-place target");
+    has("sed -i.bak -e s/a/b/ tracked.md", "sed:H/tracked.md", "sed -i.bak with -e script");
+    has("sed -ni s/a/b/ tracked.md", "sed:H/tracked.md", "sed -ni cluster");
+    has("sed -i -e s/a/b/ -e s/c/d/ one.md two.md", "sed:H/two.md", "sed -i multiple files");
+    none("sed s/a/b/ tracked.md", "sed without -i is a read → no target");
+    none("sed -e s/a/b/ tracked.md", "sed -e without -i → no target");
+    none("grep -i foo tracked.md", "grep -i is not an in-place editor");
+    // perl
+    has("perl -pi -e s/a/b/ tracked.md", "perl:H/tracked.md", "perl -pi target");
+    has("perl -i -pe 's/a/b/' tracked.md", "perl:H/tracked.md", "perl -i -pe target");
+    none("perl -p -e s/a/b/ tracked.md", "perl without -i is a read");
+    // awk (gawk -i inplace)
+    has("awk -i inplace '{print}' tracked.md", "awk:H/tracked.md", "awk -i inplace target");
+    has("gawk --include=inplace '{print}' tracked.md", "gawk:H/tracked.md", "gawk --include=inplace target");
+    none("awk '{print}' tracked.md", "awk without inplace is a read");
+    // cp / mv / install
+    has("cp src.md tracked.md", "cp:H/tracked.md", "cp destination");
+    has("cp -f src.md tracked.md", "cp:H/tracked.md", "cp -f destination");
+    has("cp src.md mid.md tracked.md", "cp:H/tracked.md", "cp multi-source: last positional is dst");
+    has("cp -t subdir src.md", "cp:H/subdir/src.md", "cp -t target-directory resolves per-source");
+    has("cp --target-directory=subdir src.md", "cp:H/subdir/src.md", "cp --target-directory= attached resolves per-source");
+    has("cp /tmp/evil/AGENTS.md .", "cp:H/AGENTS.md", "cp file INTO a directory dst expands to dir/basename(src)");
+    has("cp /tmp/x.md subdir", "cp:H/subdir/x.md", "cp file into dir positional dst expands");
+    has("cp src.md tracked.md 2>&1", "cp:H/tracked.md", "fd-prefixed redirect after dst does not become the dst");
+    has("sed -i '' 's/a/b/' tracked.md", "sed:H/tracked.md", "BSD empty-suffix sed -i '' (empty quoted operand)");
+    has("perl -pi -e '' tracked.md", "perl:H/tracked.md", "perl -e '' empty program operand");
+    has("perl -I./lib -pi -e s/a/b/ tracked.md", "perl:H/tracked.md", "perl attached -I./lib operand does not swallow -i");
+    has("sed -i -f./fix.sed tracked.md", "sed:H/tracked.md", "sed attached -f operand does not swallow the file");
+    has("sed -f./fix.sed -i tracked.md", "sed:H/tracked.md", "sed attached -f before -i");
+    has("gawk -iinplace '{print}' tracked.md", "gawk:H/tracked.md", "gawk attached -iinplace");
+    has("rsync -a src/ tracked.md --exclude pattern", "rsync:H/tracked.md", "rsync trailing flag operand does not become dst");
+    has("rsync -I src.md tracked.md -e ssh", "rsync:H/tracked.md", "rsync permuted -e operand after dst");
+    has("sort -o tracked.md in.txt", "sort:H/tracked.md", "sort -o writes its operand");
+    has("sponge tracked.md < in.txt", "sponge:H/tracked.md", "sponge in-place target");
+    has("ed -s tracked.md", "ed:H/tracked.md", "ed in-place file");
+    has("gsed -i s/a/b/ tracked.md", "gsed:H/tracked.md", "GNU-sed spelling gsed");
+    // read-only forms must NOT false-positive (cluster letters inside attached operands)
+    lacks("perl -MTime::HiRes -e 'print time' tracked.md", "perl:H/tracked.md", "perl -M attached operand is not in-place");
+    lacks("perl -e'print \"hi\"' tracked.md", "perl:H/tracked.md", "perl attached -e program is not in-place");
+    none("sed -ne p tracked.md", "sed -ne (no -i) is a read");
+    none("sort in.txt", "sort without -o is a read");
+    has("/bin/cp src.md tracked.md", "cp:H/tracked.md", "path-qualified cp");
+    has("mv src.md tracked.md", "mv:H/tracked.md", "mv destination overwrite");
+    has("mv tracked.md outdir", "mv:H/tracked.md", "mv SOURCE (deletes the tracked file)");
+    has("install -m 644 src.md tracked.md", "install:H/tracked.md", "install destination (-m operand skipped)");
+    has("rsync -a src/ tracked.md", "rsync:H/tracked.md", "rsync destination");
+    has("rsync -a --delete src/ mid/ tracked.md", "rsync:H/tracked.md", "rsync dst is the last positional");
+    lacks("rsync -a src/ host:dest", "rsync:H/src/", "rsync remote dst is not a local hub target");
+    has("ln -sf /tmp/x tracked.md", "ln:H/tracked.md", "ln link target");
+    // #625 review cycle-1: adversarial + correctness findings
+    has("cp src.md tracked.md >| /tmp/log.txt", "cp:H/tracked.md", "cp dst survives a >| noclobber-override redirect");
+    has("cp src.md tracked.md 2>|/tmp/log.txt", "cp:H/tracked.md", "cp dst survives a 2>| redirect");
+    has("ed -s tracked.md >| /tmp/log.txt", "ed:H/tracked.md", "ed target survives a >| redirect");
+    has("rsync -a src.md tracked.md --modify-window 2", "rsync:H/tracked.md", "rsync unlisted operand flag (--modify-window)");
+    has("rsync -a src.md tracked.md --backup-dir /tmp/bk", "rsync:H/tracked.md", "rsync unlisted operand flag (--backup-dir)");
+    has("rsync -a src.md tracked.md --log-format X", "rsync:H/tracked.md", "rsync unlisted operand flag (--log-format)");
+    has("cp -ft subdir src.md", "cp:H/subdir/src.md", "cp bundled -ft target-directory");
+    has("cp -rt subdir src.md", "cp:H/subdir/src.md", "cp bundled -rt target-directory");
+    has("install -Dt subdir src.md", "install:H/subdir/src.md", "install bundled -Dt target-directory");
+    has("ln -sf /tmp/evil/AGENTS.md", "ln:H/AGENTS.md", "ln 2nd form (single operand) links into the CWD");
+    has("sort -ro tracked.md in.txt", "sort:H/tracked.md", "sort bundled -ro output");
+    has("sort -uo tracked.md in.txt", "sort:H/tracked.md", "sort bundled -uo output");
+    none("sort -k1.2o in.txt", "sort -k operand modifier is not an -o output");
+    has("vim -es +'%s/a/b/' +wq tracked.md", "vim:H/tracked.md", "vim ex-mode in-place file");
+    has("vi -c 'normal x' tracked.md", "vi:H/tracked.md", "vi -c operand skipped, file is the target");
+    lacks("sed -i '' 's/a/b/' tracked.md", "sed:H/s/a/b/", "BSD empty -i suffix is not emitted as a file");
+    // #625 review cycle-2: regressions from the cycle-1 fail-safe + cluster scans
+    has("rsync -a src.md --owner tracked.md", "rsync:H/tracked.md", "rsync no-arg flag (--owner) must not swallow the dst");
+    has("rsync -a src.md --itemize-changes tracked.md", "rsync:H/tracked.md", "rsync no-arg flag (--itemize-changes) must not swallow the dst");
+    has("rsync -a src.md -v subdir", "rsync:H/subdir/src.md", "rsync dir dst behind a no-arg flag still expands");
+    has("rsync -a src.md tracked.md --modify-window 2", "rsync:H/tracked.md", "rsync listed operand flag keeps the real dst");
+    lacks("rsync -a tracked.md -v /tmp/dst", "rsync:H/tracked.md", "rsync read-only export of a tracked file must not be a target");
+    has("cp -St src.md tracked.md", "cp:H/tracked.md", "cp -St is a suffix operand, not -t");
+    has("install -gtty src.md tracked.md", "install:H/tracked.md", "install -gtty is a group operand, not -t");
+    has("install -B.tmp src.md tracked.md", "install:H/tracked.md", "install -B.tmp is a backup operand, not -t");
+    has("cp -b -S.tmp src.md tracked.md", "cp:H/tracked.md", "cp -S.tmp is a suffix operand, not -t");
+    has("cp -ft subdir src.md", "cp:H/subdir/src.md", "cp bundled -ft still works after the cluster rewrite");
+    none("sort -to out in.txt", "sort -to is the -t separator 'o', not -o output");
+    has("vim -es +wq tracked.md +q", "vim:H/tracked.md", "vim trailing +cmd is not the file");
+    has("vim -es +wq tracked.md /tmp/decoy.md", "vim:H/tracked.md", "vim multi-file emits the first file");
+    has("ex -s +wq tracked.md +q", "ex:H/tracked.md", "ex trailing +cmd is not the file");
+    has("sponge one.md two.md", "sponge:H/two.md", "sponge multi-file emits every operand");
+    // #625 review cycle-3: scanner + redirect findings
+    has("cp src.md tracked.md # update the shared config", "cp:H/tracked.md", "trailing # comment is not the destination");
+    has("install -m 644 src.md tracked.md # note", "install:H/tracked.md", "trailing comment after install operands");
+    has("rsync -a src.md tracked.md # note", "rsync:H/tracked.md", "trailing comment after rsync operands");
+    has("ln -sf src.md tracked.md # note", "ln:H/tracked.md", "trailing comment after ln operands");
+    has("cp $(mktemp) tracked.md", "cp:H/tracked.md", "command substitution before the dst does not drop it");
+    has("sed -i $(cat s) tracked.md", "sed:H/tracked.md", "command substitution before the sed file");
+    has("cp src.md tracked.md \\\n  && echo done", "cp:H/tracked.md", "line continuation is not a bogus last positional");
+    has("sort --out=tracked.md in.txt", "sort:H/tracked.md", "sort --out= is an unambiguous --output prefix");
+    has("sort --o=tracked.md in.txt", "sort:H/tracked.md", "sort --o= prefix");
+    has("sort --out tracked.md in.txt", "sort:H/tracked.md", "sort --out with a separate operand");
+    has("perl -F -pi -e s/a/b/ tracked.md", "perl:H/tracked.md", "bare perl -F does not swallow -pi");
+    has("rsync -a src.md tracked.md --max-del 0", "rsync:H/tracked.md", "rsync unambiguous long-option prefix keeps the dst");
+    has("rsync -a src.md tracked.md --exclude foo", "rsync:H/tracked.md", "rsync exact operand flag keeps the dst");
+    // #625 cycle-3 B2/B3: ANY `N>file` truncates the file; `N<file` is a read.
+    has("echo x 2> tracked.md", "redirect:H/tracked.md", "stderr redirect truncates a tracked file");
+    has("echo x 3> tracked.md", "redirect:H/tracked.md", "fd-3 redirect truncates a tracked file");
+    has("echo hi 3>tracked.md 1>&3", "redirect:H/tracked.md", "fd-3 write-through is a tracked mutation");
+    has("echo x >& tracked.md", "redirect:H/tracked.md", "legacy >&FILE is a content write");
+    none("cat 0< tracked.md", "0< is a read, not a write");
+    none("cat 1< tracked.md", "1< is a read, not a write");
+    none("cat x 2>&1 tracked.md", "2>&1 is a dup, not a write");
+    // #625 review cycle-4: rsync boolean-prefix regression + list mode + scanner escapes + trap
+    has("rsync -a src.md --checksum tracked.md", "rsync:H/tracked.md", "--checksum is a complete boolean option, not --checksum-seed");
+    has("rsync -a src.md --partial tracked.md", "rsync:H/tracked.md", "--partial is boolean, not --partial-dir");
+    has("rsync -a src.md --backup tracked.md", "rsync:H/tracked.md", "--backup is boolean, not --backup-dir");
+    has("rsync -a src.md --group tracked.md", "rsync:H/tracked.md", "--group is boolean, not --groupmap");
+    none("rsync -a tracked.md -v", "single-operand rsync is list-only, not a write");
+    has("truncate -s 0 $(echo \\( ) tracked.md", "truncate:H/tracked.md", "escaped paren inside $( ) does not over-skip");
+    // #625 review cycle-5: --suffix regression + eval/trap option/ANSI-C forms
+    has("rsync -a src.md tracked.md --suffix .bak", "rsync:H/tracked.md", "--suffix is an operand option in the arity table");
+    has("rsync -a -S src.md tracked.md", "rsync:H/tracked.md", "rsync -S is --sparse (boolean), not --suffix");
+    lacks("rsync -a src.md /tmp/dst --suffix .bak", "rsync:H/.bak", "--suffix operand is not a destination");
+    has("rsync -a src.md tracked.md --info progress2", "rsync:H/tracked.md", "--info takes a required operand");
+    has("rsync -a src.md tracked.md --debug all", "rsync:H/tracked.md", "--debug takes a required operand");
+    has("trap -- 'printf x >> tracked.md' EXIT", "redirect:H/tracked.md", "trap with a leading -- still walks the payload");
+    has("trap $'printf x >> tracked.md' EXIT", "redirect:H/tracked.md", "ANSI-C dollar-single-quoted trap payload");
+    has("trap $'printf x \\x3e tracked.md' EXIT", "redirect:H/tracked.md", "ANSI-C \\x3e decodes to a redirect");
+    has("eval -- 'printf x > tracked.md'", "redirect:H/tracked.md", "eval with a leading -- still walks the payload");
+    has("eval 'printf x' '> tracked.md'", "redirect:H/tracked.md", "eval joins ALL its arguments");
+    none("trap -l", "trap -l is a list, no payload");
+    // #625 review cycle-7: ANSI-C escapes, eval arg joining, $'…' operands
+    has("trap $'printf \\'x\\' > tracked.md' EXIT", "redirect:H/tracked.md", "ANSI-C escaped quote does not truncate the payload");
+    has("eval 'printf x' $'\\x3e tracked.md'", "redirect:H/tracked.md", "eval decodes ANSI-C in a LATER argument");
+    has("echo hi >> $'tracked.md'", "redirect:H/tracked.md", "$'…' redirect operand decodes to the tracked path");
+    has("cp src.md $'tracked.md'", "cp:H/tracked.md", "$'…' verb operand decodes");
+    has("bash -c $'printf x \\x3e tracked.md'", "redirect:H/tracked.md", "interpreter -c ANSI-C payload decodes");
+    none("trap -p 'printf x > tracked.md' EXIT", "trap -p has no action operand");
+    lacks("tee /tmp/out.txt < tracked.md", "tee:H/tracked.md", "tee input redirect is not a write target");
+    // #625 review cycle-8: eval newline, tee ANSI-C, trap escaped action, dq escapes
+    has("eval true\ntee tracked.md", "tee:H/tracked.md", "eval does not swallow the next line");
+    has("eval true\ncp src.md tracked.md", "cp:H/tracked.md", "multi-line eval keeps the next line's verb");
+    has("tee $'tracked.md'", "tee:H/tracked.md", "tee ANSI-C target decodes");
+    has("printf y | tee $'tracked.md'", "tee:H/tracked.md", "tee ANSI-C target in a pipeline");
+    has("trap echo\\ x\\ \\>tracked.md EXIT", "redirect:H/tracked.md", "trap escaped unquoted action is walked");
+    lacks("echo x > \"MEMORY\\.md\"", "redirect:H/MEMORY.md", "dq backslash before a non-special char stays literal");
+    // #625 review cycle-9: tee quote-awareness, line continuations
+    has("printf y | tee $\"tracked.md\"", "tee:H/tracked.md", "locale-quoting tee target decodes");
+    has("printf y | tee track$'ed'.md", "tee:H/tracked.md", "ANSI-C concat tee target");
+    lacks("tee \"$'tracked.md'\"", "tee:H/tracked.md", "dq-wrapped ANSI-C is literal in bash");
+    lacks("printf y | tee safe.txt # $'tracked.md'", "tee:H/tracked.md", "a tee comment is not a target");
+    lacks("printf y | tee safe$'\\n'tracked.md", "tee:H/tracked.md", "decoded whitespace cannot inject a token");
+    has("echo x > tracked\\\n.md", "redirect:H/tracked.md", "backslash-newline is a line continuation");
+    has("printf y | tee tracked\\\n.md", "tee:H/tracked.md", "tee line continuation is not truncated");
+    // #625 review cycle-12: a LEADING `\`+newline + indent before a redirect/tee
+    // operand. readWord returned an EMPTY operand there (the `\` arm advanced
+    // over the continuation and then exited on the indent's whitespace), so the
+    // write target was dropped and the gate ALLOWed a tracked hub-main write.
+    has("echo x > \\\n  tracked.md", "redirect:H/tracked.md", "redirect operand after a leading line continuation + indent");
+    has("echo x >> \\\n  tracked.md", "redirect:H/tracked.md", "append operand after a leading line continuation");
+    has("echo x >| \\\n  tracked.md", "redirect:H/tracked.md", "clobber operand after a leading line continuation");
+    has("printf y | tee \\\n  tracked.md", "tee:H/tracked.md", "tee operand after a leading line continuation");
+    has("echo x >\\\n  tracked.md", "redirect:H/tracked.md", "continuation directly after the redirect operator");
+    lacks("echo x > foo\\\n  tracked.md", "redirect:H/tracked.md", "mid-word continuation + indent stays TWO words (bash semantics)");
+    // #625 review cycle-13: the tee SEGMENT-BOUNDARY scan treated the
+    // continuation's newline as the segment end, so `lim` truncated AT the
+    // continuation and every operand after it was dropped — the gate captured
+    // no target while bash appended to the tracked file.
+    has("printf y | tee \\\n -a tracked.md", "tee:H/tracked.md", "tee -a AFTER a line continuation still gates");
+    has("printf y | tee \\\n-a tracked.md", "tee:H/tracked.md", "continuation joined to the tee flag");
+    has("printf y | tee \\\n -- tracked.md", "tee:H/tracked.md", "tee -- after a line continuation");
+    has("printf y | tee \\\n -a \\\n tracked.md", "tee:H/tracked.md", "second-operand target on its own continued line");
+    has("printf y | tee \\\n /tmp/x tracked.md", "tee:H/tracked.md", "tee multi-operand: the 2nd operand after a continuation");
+    has("printf y | tee -a \\\n tracked.md", "tee:H/tracked.md", "continuation after the tee flag");
+    // #625 review cycle-10: getopt_long ABBREVIATIONS (fail-open) + single-operand no-ops.
+    // GNU sed/gawk accept any UNAMBIGUOUS long-option prefix, so matching exact
+    // spellings alone let `sed --in-pl …` / `gawk --incl inplace …` resolve to ZERO
+    // targets and the gate ALLOW a real in-place edit of a tracked hub file.
+    has("sed --in-pl s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-pl is an unambiguous --in-place prefix");
+    has("sed --in-pl=.bak s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-pl=.bak prefix with an attached suffix");
+    has("sed --in-place=.bak s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-place=.bak exact long spelling");
+    has("sed --expr s/a/b/ tracked.md -i", "sed:H/tracked.md", "sed --expr resolves to --expression");
+    has("sed --file script.sed -i tracked.md", "sed:H/tracked.md", "sed --file consumes its operand and keeps -i");
+    has("gawk --incl inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --incl is an unambiguous --include prefix");
+    has("gawk --inc=inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --inc= prefix with the inplace operand attached");
+    has("gawk --include=inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --include=inplace exact spelling");
+    // #625 review cycle-11: `--file`/`--source`/`--exec` PROVIDE the program, so
+    // the first positional is a DATA file. Losing hasProgFlag sliced that data
+    // file off as "the program" and dropped the in-place target entirely
+    // (`gawk -i inplace --file p.awk tracked.md` → zero targets).
+    has("gawk --incl inplace --file p.awk tracked.md", "gawk:H/tracked.md", "long --file provides the program (data file kept)");
+    has("gawk -i inplace -f p.awk tracked.md", "gawk:H/tracked.md", "short -f provides the program");
+    has("gawk --include inplace --file=p.awk tracked.md", "gawk:H/tracked.md", "--file= attached form provides the program");
+    has("gawk --incl inplace --source {print} tracked.md", "gawk:H/tracked.md", "long --source provides the program");
+    has("gawk -i inplace -e {print} tracked.md", "gawk:H/tracked.md", "short -e provides the program");
+    has("gawk -i inplace -E p.awk tracked.md", "gawk:H/tracked.md", "short -E provides the program");
+    has("gawk -i inplace --exec p.awk tracked.md", "gawk:H/tracked.md", "--exec provides the program");
+    has("gawk -i inplace --load lib.so {print} tracked.md", "gawk:H/tracked.md", "--load is a library — the program positional stays");
+    has("sed -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed -i still gates after the prefix change");
+    has("sed --separate -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed --separate (arity 0) does not swallow -i");
+    lacks("sed --in-pl s/a/b/ subdir", "sed:H/tracked.md", "sed --in-pl on a non-tracked operand stays inert");
+    has("sed --in-pl s/a/b/ subdir", "sed:H/subdir", "sed --in-pl surfaces its (non-tracked) operand, not a false negative");
+    // Ambiguous prefixes are NOT options (getopt_long rejects them — the command
+    // fails, so nothing is written); resolving them would invent a target.
+    none("sed --s a/b/ tracked.md", "ambiguous sed --s prefix is not resolved to an option");
+    none("gawk --f prog.awk tracked.md", "ambiguous gawk --f prefix is not resolved");
+    // A destination requires at least ONE source: a single-operand
+    // `cp f`/`mv f`/`install f` is a malformed no-op ("missing destination file
+    // operand") that writes NOTHING — surfacing its lone operand as a
+    // destination was a pure false block. Also covers the empty `-t` form.
+    none("cp tracked.md", "single-operand cp writes nothing");
+    none("mv tracked.md", "single-operand mv writes nothing");
+    none("install tracked.md", "single-operand install writes nothing");
+    none("cp -t subdir", "cp -t with no source operand writes nothing");
+    none("mv -t subdir", "mv -t with no source operand writes nothing");
+    has("cp -t subdir src.md", "cp:H/subdir/src.md", "cp -t with a source still surfaces the destination");
+    // truncate / dd
+    has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
+    has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");
+    has("dd if=/dev/zero of=tracked.md bs=1 count=0", "dd:H/tracked.md", "dd of= target");
+    lacks("dd if=tracked.md of=/tmp/x", "dd:H/tracked.md", "dd reading a tracked file is not a hub write");    // command-position / arg-position discipline
+    none("git mv a b", "git mv is a git verb, not the bash mv");
+    none("echo cp a b", "cp as an ARG is not a command");
+    none("echo sed -i s/a/b/ tracked.md", "sed as an ARG is not a command");
+    lacks("cp tracked.md /tmp/", "cp:H/tracked.md", "cp OUT of the hub: dst is /tmp, src is a read");
   }
 
   // ── #437 (C): firstHubTrackedWrite — pure intersect for the disordered-hub
