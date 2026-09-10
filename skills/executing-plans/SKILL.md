@@ -705,7 +705,7 @@ Use `requires_human=True` for genuine human gates (epics, P0): that routes to 'h
 - Reference skills when plan says to
 - Between batches: report and **continue** (don't gate)
 - Stop when blocked or when taxonomy-matching decision arises
-- Start implementation on main/master at all — every implementation runs in an isolated worktree (#615/#626); the hub stays main + clean.
+- Never start implementation on main/master — every implementation runs in an isolated worktree (#615/#626); the hub stays main + clean.
 
 ## Label Cleanup
 

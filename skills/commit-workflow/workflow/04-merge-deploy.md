@@ -171,7 +171,9 @@ sessions need no return step — their teardown (05-cleanup.md Step 3.8) removes
 the worktree and returns the session to its base. The guard's #376
 return-to-original-baseline arm remains in code as a recovery path (a hub
 session switched out from under it may `git checkout` back to the branch it
-STARTED on — its recorded original) but no skill ceremony uses it.
+STARTED on — its recorded original; **agent-infra main only** — the arm is
+gated on `isAgentInfra`, so a non-infra hub session attempting it is blocked)
+but no skill ceremony uses it.
 
 ## Auto-merge for strict up-to-date protection (#500 — merge-race ladder)
 

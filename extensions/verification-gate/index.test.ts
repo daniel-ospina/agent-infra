@@ -1397,24 +1397,33 @@ section("isDeletionPush — delete-shaped push classification (#472 mechanism b)
 // fixture stays in sync across the isDeletionPush and isBareCommitShape
 // classification surfaces.
 const FULL_05_CLEANUP_BLOCK = `# BRANCH = the merged PR branch — resolve via gh FIRST. Deriving from the current
-# branch is ambiguous after the #376 Step C return: an in-main ceremony session
-# now sits on main, and \`git branch --show-current\` would target the default
-# branch. gh knows the PR's head branch regardless of local checkout state.
+# branch is ambiguous after the ceremony: a worktree session returns to its base
+# (or is torn down) and its current checkout is no longer the PR head — and
+# \`git branch --show-current\` would target the wrong branch. gh knows the PR's
+# head branch regardless of local checkout state.
 BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=$(git branch --show-current)
 
-# Remote delete — server-side, always possible after merge; "remote ref does not
-# exist" means deleteBranchOnMerge already removed it = success.
+# Remote delete — server-side; run it AFTER the teardown above. The #73
+# coordinated-delete guard blocks deleting a branch still checked out in ANY
+# worktree, but it matches the LITERAL ref in the command text, so this
+# shell-variable form is not guard-matched (the teardown ordering makes it moot).
+# "remote ref does not exist" means deleteBranchOnMerge already removed it = success.
 git push origin --delete "$BRANCH" 2>/dev/null \\
   || echo "ℹ️ remote branch $BRANCH already deleted or unavailable"
 
-# Local delete — now safe IF the worktree was removed above (lock released).
-# If the worktree removal FAILED, do not fail the ceremony: WARN + leave a teardown note.
+# Local delete — best-effort. If the worktree was removed above the branch is no
+# longer checked out, but the HUB's main-checkout branch-force-delete gate still
+# blocks a branch that is not the session's baseline or pid-owned (a \`git worktree
+# add -b\` branch is never recorded as owned — create-new is blocked, #626). A block
+# or git refusal is a WARN — never fail the ceremony. A GUARD block rejects the bash
+# call before the shell runs, so the \`||\` echo below never fires on it: the agent
+# must surface the teardown note itself.
 if git worktree list --porcelain | grep -q "branch refs/heads/$BRANCH"; then
   echo "⚠️ branch $BRANCH is still checked out in a worktree — local delete deferred."
   echo "   TEARDOWN NOTE: remove the worktree and run: git branch -D $BRANCH"
 else
-  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH not found or could not be deleted — delete manually: git branch -D $BRANCH"
+  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH not deleted (guard-blocked or missing) — remove manually: git branch -D $BRANCH"
 fi`;
 
 // ── #482 — shared drift-guard skip-arm messaging for the THREE guards (01-preflight,
@@ -1440,7 +1449,7 @@ const DRIFT_GUARD_05_FENCE_MARKER = "```bash\n# BRANCH = the merged PR branch";
 // of the ceremony (skills/commit-workflow/workflow/04-merge-deploy.md:91), VERBATIM.
 // Shared by the TRUE-fixture pin below and the #482 drift guard. Line-only surface: prose
 // edits elsewhere in Step B (worktree-defer comments/echoes) must NOT red the guard.
-const MERGE_DEPLOY_STEP_B_DELETE = `git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete failed — delete manually: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"`;
+const MERGE_DEPLOY_STEP_B_DELETE = `git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete blocked/failed — retry after teardown or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"`;
 
 test("TRUE: delete-shaped forms (flag either position, :refspec, -d, multi-target, redirects, cd-prefix)", () => {
   const truePins = [

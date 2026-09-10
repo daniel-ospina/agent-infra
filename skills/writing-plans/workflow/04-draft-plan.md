@@ -143,7 +143,7 @@ EOF
 )"
 ```
 
-No worktree, no TDD steps, no plan file saved.
+No plan file is saved — but the micro flow still runs in an isolated worktree (#626: hub writes block, so there is no in-main path); no TDD steps.
 
 **Auto-reclassification check:** If the step list has >5 items OR any step touches a migration/RLS/edge function → escalate to Standard or Complex.
 

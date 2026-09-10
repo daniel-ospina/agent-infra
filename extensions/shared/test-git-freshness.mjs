@@ -1,19 +1,28 @@
 // Git-freshness drift guard (#178/#179) — Branch Gate source assertions +
 // real-git runtime fixtures.
 //
-// Verifies skills/issue-workflow/SKILL.md's Branch Gate:
-//   - detects the default branch via origin/HEAD (fallback main)
-//   - fetches before branching; fetch failure → WARN + last-known-ref
-//     fallback, or ABORT when no origin ref exists
-//   - branches from origin/<default> (never stale local main), fail-closed
-//   - abort-guidance lines carry fetch-first instructions
+// #626: the freshness guarantee MOVED. The Branch Gate no longer creates a
+// branch in the hub at all — post-#615/#626 an in-hub flip is blocked, so the
+// gate refuses and hands off to the worktree helper. The old owner of
+// #178/#179 (origin/HEAD detection, fetch-before-branch, last-known-ref
+// fallback, fail-closed abort) is now:
+//   scripts/checkout-hygiene/hub-worktree.sh CREATE MODE
+//     - fetches origin main, then `worktree add -b <branch> origin/main`
+//       (never stale local main), under `set -euo pipefail` → a failed fetch
+//       aborts with no worktree and no hub change (fail-closed).
+// This file pins BOTH halves:
+//   - skills/issue-workflow/SKILL.md's Branch Gate: no executable branch
+//     creation, exit 1 + worktree guidance on the hub / detached / wrong-issue
+//     paths;
+//   - the helper: fetch → worktree-add-from-origin ordering + fail-closure,
+//     plus runtime fixtures proving the fresh tip and the fail-closed abort.
 //
 // #181 APPENDS its assertion blocks (commit-workflow freshness + stale-merge
 // recovery) to this file — do not restructure the module shape without #181.
 //
 // Run: node extensions/shared/test-git-freshness.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,34 +34,6 @@ function check(name, cond, detail = "") {
   console.log(`${cond ? "✅" : "❌"} ${name}${cond || !detail ? "" : ` — ${detail}`}`);
   cond ? pass++ : fail++;
 }
-
-// ── Source assertions (drift guard) ──────────────────────────────────────
-const skill = readFileSync(join(PROJECT_ROOT, "skills/issue-workflow/SKILL.md"), "utf8");
-
-check("gate detects default branch via origin/HEAD",
-  skill.includes('git symbolic-ref --short refs/remotes/origin/HEAD'));
-check("gate falls back to main when origin/HEAD is unset",
-  skill.includes('DEFAULT_BRANCH="main"'));
-check("gate fetches the default branch before branching",
-  skill.includes('git fetch origin "$DEFAULT_BRANCH" --quiet'));
-check("gate branches from origin/<default>, not local main",
-  skill.includes('git checkout -b "$EXPECTED_BRANCH" "origin/$DEFAULT_BRANCH"'));
-check("gate checkout is fail-closed (no false success)",
-  /git checkout -b "\$EXPECTED_BRANCH" "origin\/\$DEFAULT_BRANCH" \|\| \{/.test(skill));
-check("fetch failure falls back to last-known origin ref with WARN",
-  skill.includes("LAST KNOWN origin/$DEFAULT_BRANCH"));
-check("fetch failure without local ref aborts",
-  skill.includes("fetch failed and no origin/$DEFAULT_BRANCH ref exists"));
-check("detached-HEAD guidance is fetch-first",
-  skill.includes("git fetch origin main --quiet && git checkout -b $EXPECTED_BRANCH origin/main"));
-check("different-issue guidance is fetch-first (both paths covered)",
-  (skill.match(/git fetch origin main --quiet && git checkout -b \$EXPECTED_BRANCH origin\/main/g) || []).length >= 2);
-
-// ── Runtime fixtures — execute the extracted gate block in real repos ────
-// Extract the Branch Gate bash block verbatim from the skill.
-const gateMatch = skill.match(/### 1\. Branch Gate[\s\S]*?```bash\n([\s\S]*?)```/);
-check("Branch Gate bash block extractable from SKILL.md", !!gateMatch);
-const gateScript = gateMatch ? gateMatch[1] : "";
 
 const TMP_DIRS = [];
 function tmpRepo(name) {
@@ -68,6 +49,22 @@ function runGate(cwd) {
   writeFileSync(scriptPath, gateScript);
   try {
     const out = execSync(`bash .gate.sh`, { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
+    return { code: 0, out };
+  } catch (e) {
+    return { code: e.status ?? 1, out: `${e.stdout ?? ""}${e.stderr ?? ""}` };
+  }
+}
+/**
+ * Run the helper's extracted CREATE-MODE freshness sequence in `mainRepo`.
+ * `set -euo pipefail` mirrors the helper — it is what makes a failed fetch
+ * fail-closed instead of silently branching from a stale ref.
+ */
+function runCreatePath({ mainRepo, wtPath, branch }) {
+  const scriptPath = join(mainRepo, ".create.sh");
+  writeFileSync(scriptPath,
+    `set -euo pipefail\nMAIN_REPO=${JSON.stringify(mainRepo)}\nWT_PATH=${JSON.stringify(wtPath)}\nBRANCH=${JSON.stringify(branch)}\n${createFreshScript}\n`);
+  try {
+    const out = execSync(`bash .create.sh`, { cwd: mainRepo, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
     return { code: 0, out };
   } catch (e) {
     return { code: e.status ?? 1, out: `${e.stdout ?? ""}${e.stderr ?? ""}` };
@@ -93,65 +90,112 @@ function makeStaleFixture(name) {
   return { base, origin, clone, other };
 }
 
-// F1: stale local main → branch at ORIGIN tip; local main untouched
+// ── Source assertions (drift guard) ──────────────────────────────────────
+const skill = readFileSync(join(PROJECT_ROOT, "skills/issue-workflow/SKILL.md"), "utf8");
+// #626: the helper is now the owner of the #178/#179 freshness contract.
+const hubWt = readFileSync(join(PROJECT_ROOT, "scripts/checkout-hygiene/hub-worktree.sh"), "utf8");
+
+// Extract the Branch Gate bash block verbatim from the skill.
+const gateMatch = skill.match(/### 1\. Branch Gate[\s\S]*?```bash\n([\s\S]*?)```/);
+check("Branch Gate bash block extractable from SKILL.md", !!gateMatch);
+const gateScript = gateMatch ? gateMatch[1] : "";
+
+// Extract the helper's CREATE-MODE freshness sequence verbatim.
+const CREATE_FRESHNESS_RE =
+  /echo "hub-worktree: fetching origin main…"\ngit -C "\$MAIN_REPO" fetch origin main --quiet\n\necho "hub-worktree: creating \$WT_PATH[^\n]*\ngit -C "\$MAIN_REPO" worktree add "\$WT_PATH" -b "\$BRANCH" origin\/main/;
+const createMatch = hubWt.match(CREATE_FRESHNESS_RE);
+const createFreshScript = createMatch ? createMatch[0] : "";
+check("helper create-mode freshness block extractable", !!createMatch);
+
+// Gate side: NO executable branch creation may survive (#626 — in-hub is blocked).
+check("gate has no executable `git checkout -b` / `git switch -c` line",
+  !!gateScript && !/^\s*git\s+(checkout|switch)\s+[^\n]*(-[bBcC]|--create|--force-create|--orphan)/m.test(gateScript));
+check("gate documents the in-hub block rather than performing it (#626)",
+  gateScript.includes("#626") && /In-hub/i.test(gateScript));
+check("gate hub path EXITS non-zero (never a false 'created' success)",
+  /if \[ "\$CURRENT_BRANCH" = "main" \] \|\| \[ "\$CURRENT_BRANCH" = "master" \]; then[\s\S]*?exit 1/.test(gateScript));
+check("gate hub advisory names the one-command worktree helper",
+  gateScript.includes('bash scripts/checkout-hygiene/hub-worktree.sh "$EXPECTED_BRANCH"'));
+check("gate no longer detects the default branch via origin/HEAD (helper owns it)",
+  !gateScript.includes("symbolic-ref --short refs/remotes/origin/HEAD") && !gateScript.includes('DEFAULT_BRANCH="main"'));
+check("gate detached-HEAD path points at the worktree helper",
+  gateScript.includes("Detached HEAD") && gateScript.includes("hub-worktree.sh"));
+check("gate different-issue path points at the worktree helper",
+  gateScript.includes("belongs to a DIFFERENT issue") && gateScript.includes("hub-worktree.sh"));
+
+// Helper side: fetch → worktree-from-origin, fail-closed.
+check("helper fetches origin main before creating the worktree",
+  hubWt.includes('git -C "$MAIN_REPO" fetch origin main --quiet'));
+check("helper creates the worktree branch FROM origin/main (never HEAD/local main)",
+  hubWt.includes('git -C "$MAIN_REPO" worktree add "$WT_PATH" -b "$BRANCH" origin/main'));
+check("helper fetches BEFORE the worktree add (ordering pinned)",
+  hubWt.indexOf('git -C "$MAIN_REPO" fetch origin main --quiet') < hubWt.indexOf('worktree add "$WT_PATH" -b "$BRANCH" origin/main'));
+check("helper is fail-closed on fetch failure (`set -euo pipefail`)",
+  hubWt.includes("set -euo pipefail"));
+
+// F1: Branch Gate run in a stale hub → refuses, creates nothing, hub untouched
 {
   const { clone } = makeStaleFixture("stale");
   const staleHead = sh("git rev-parse HEAD", clone).trim();
   const r = runGate(clone);
   const branch = sh("git branch --show-current", clone).trim();
-  const tip = sh("git rev-parse HEAD", clone).trim();
-  const originTip = sh("git rev-parse origin/main", clone).trim();
-  const localMain = sh("git rev-parse main", clone).trim();
-  check("F1 exit 0 on stale-main gate run", r.code === 0, r.out);
-  check("F1 created feat/76-branch-isolation", branch === "feat/76-branch-isolation", branch);
-  check("F1 branch sits at FRESH origin tip (not stale local main)", tip === originTip && tip !== staleHead);
-  check("F1 local main untouched", localMain === staleHead);
+  check("F1 gate REFUSES the hub run (exit 1)", r.code === 1, r.out);
+  check("F1 advisory names the worktree helper", r.out.includes("hub-worktree.sh"), r.out);
+  check("F1 no branch created, hub untouched",
+    branch === "main" && sh("git rev-parse HEAD", clone).trim() === staleHead, branch);
 }
 
-// F2: origin/HEAD unset → fallback default (main) still branches fresh
+// F2: helper create path on a stale hub → worktree branch at FRESH origin tip
 {
-  const { clone } = makeStaleFixture("nohead");
-  sh("git remote set-head origin -d", clone); // delete refs/remotes/origin/HEAD
-  const r = runGate(clone);
-  const tip = sh("git rev-parse HEAD", clone).trim();
-  const originTip = sh("git rev-parse origin/main", clone).trim();
-  check("F2 exit 0 with origin/HEAD unset (fallback main)", r.code === 0, r.out);
-  check("F2 branch at origin/main tip via fallback", tip === originTip);
+  const { base, clone } = makeStaleFixture("fresh");
+  const staleHead = sh("git rev-parse HEAD", clone).trim();
+  const wt = join(base, "wt");
+  const r = runCreatePath({ mainRepo: clone, wtPath: wt, branch: "feat/76-branch-isolation" });
+  check("F2 helper create path exits 0 on a stale hub", r.code === 0, r.out);
+  if (existsSync(wt)) {
+    const tip = sh("git rev-parse HEAD", wt).trim();
+    const originTip = sh("git rev-parse origin/main", clone).trim();
+    check("F2 worktree branch sits at FRESH origin tip (not stale local main)",
+      tip === originTip && tip !== staleHead);
+  } else {
+    check("F2 worktree branch sits at FRESH origin tip (not stale local main)", false, "worktree not created");
+  }
+  check("F2 hub left on main (never flipped)",
+    sh("git branch --show-current", clone).trim() === "main");
 }
 
-// F3: fetch fails but local origin ref exists → WARN + last-known-ref, exit 0
+// F3: fetch failure → fail-closed (non-zero, no worktree, hub unchanged)
 {
-  const { clone } = makeStaleFixture("offline");
-  const originTip = sh("git rev-parse origin/main", clone).trim();
+  const { base, clone } = makeStaleFixture("offline");
   sh("git remote set-url origin /nonexistent/no-remote", clone);
-  const r = runGate(clone);
-  const tip = sh("git rev-parse HEAD", clone).trim();
-  check("F3 exit 0 offline with last-known origin ref", r.code === 0, r.out);
-  check("F3 warns about LAST KNOWN ref", r.out.includes("LAST KNOWN"), r.out);
-  check("F3 branched from last-known origin tip", tip === originTip);
+  const wt = join(base, "wt");
+  const r = runCreatePath({ mainRepo: clone, wtPath: wt, branch: "feat/76-branch-isolation" });
+  check("F3 fetch failure is fail-closed (non-zero exit, no stale fallback)", r.code !== 0, r.out);
+  check("F3 no worktree created on fetch failure", !existsSync(wt));
+  check("F3 hub still on main (no partial state)",
+    sh("git branch --show-current", clone).trim() === "main");
 }
 
-// F4: fetch fails AND no origin ref → ABORT exit 1
+// F4: detached HEAD → gate aborts and names the worktree remedy
 {
-  const dir = tmpRepo("noref");
-  sh("git init -b main .", dir);
-  sh("git config user.email t@t && git config user.name t", dir);
-  sh("git remote add origin /nonexistent/no-remote", dir);
-  writeFileSync(join(dir, "a.txt"), "x\n");
-  sh("git add a.txt && git commit -qm x", dir);
-  const r = runGate(dir);
-  check("F4 aborts (exit 1) when fetch fails and no origin ref", r.code === 1, r.out);
-  check("F4 states the reason", r.out.includes("fetch failed and no origin/"), r.out);
+  const { clone } = makeStaleFixture("detached");
+  sh("git checkout -q --detach", clone);
+  const r = runGate(clone);
+  check("F4 detached HEAD aborts (exit 1)", r.code === 1, r.out);
+  check("F4 states the worktree remedy",
+    r.out.includes("Detached HEAD") && r.out.includes("hub-worktree.sh"), r.out);
 }
 
-// F5: checkout failure → fail-closed exit 1 (never false success)
+// F5: branch already exists → helper create path fails, no false success
 {
-  const { clone } = makeStaleFixture("exists");
-  sh("git branch feat/76-branch-isolation", clone); // pre-create → checkout -b fails
-  const r = runGate(clone);
-  const branch = sh("git branch --show-current", clone).trim();
-  check("F5 exit 1 when branch creation fails", r.code === 1, r.out);
-  check("F5 still on main (no false success)", branch === "main", branch);
+  const { base, clone } = makeStaleFixture("exists");
+  sh("git branch feat/76-branch-isolation", clone); // pre-create → worktree add -b fails
+  const wt = join(base, "wt");
+  const r = runCreatePath({ mainRepo: clone, wtPath: wt, branch: "feat/76-branch-isolation" });
+  check("F5 exit non-zero when the branch already exists", r.code !== 0, r.out);
+  check("F5 no worktree created on failure", !existsSync(wt));
+  check("F5 hub still on main (no false success)",
+    sh("git branch --show-current", clone).trim() === "main");
 }
 
 // ── #181 (L3): pre-PR freshness + stale-merge recovery assertions ─────
