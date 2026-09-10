@@ -340,10 +340,24 @@ test("CLI over the live tree → '0 issue(s). Clean.' exit 0", () => {
 // pi-package pin; before this tripwire nothing asserted they agree, so a partial
 // bump (fixtures updated, one package.json missed) stayed CI-green. Guard the
 // CLASS, not just this instance: every @earendil-works/pi-* pin under
-// extensions/*/package.json — in `dependencies` OR `devDependencies` — must
+// extensions/*/package.json — in `dependencies` OR `devDependencies` OR
+// `peerDependencies` / `optionalDependencies` / `overrides` / `resolutions` (a
+// plugin runtime pinned in peerDependencies drifts just as silently) — must
 // equal PI_VERSION_PIN, and the per-extension PIN COUNT must match the
 // expected map (a bare `matched > 0` presence check stayed green when coverage
 // collapsed 6 pins → 1, i.e. the guard silently weakened).
+//
+// Known scope bound: this reads the direct extensions/*/package.json manifests
+// only. A nested package.json (e.g. extensions/*/vendor/package.json) and a
+// repo-root manifest are NOT walked — see #643.
+const PIN_FIELDS = [
+  "dependencies",
+  "devDependencies",
+  "peerDependencies",
+  "optionalDependencies",
+  "overrides",
+  "resolutions",
+];
 section("extension pi-package pins lockstep with PI_VERSION_PIN");
 
 test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN", () => {
@@ -356,7 +370,7 @@ test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN",
     if (!fs.existsSync(pkgPath)) continue;
     const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
     let hits = 0;
-    for (const field of ["dependencies", "devDependencies"]) {
+    for (const field of PIN_FIELDS) {
       for (const [name, ver] of Object.entries(pkg[field] ?? {})) {
         if (!name.startsWith("@earendil-works/pi-")) continue;
         hits++;
@@ -395,11 +409,13 @@ test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN",
 // the 5 pi stamps (frontmatter-validate's "probe pi X" and ci-main's "devDep pinned X") — the same
 // silent-staleness class this guard exists to close. Instead: every `<major>.<minor>.<patch>` literal
 // in these four hand-synced surfaces must be either PI_VERSION_PIN or a listed non-pi dependency
-// version, and each surface must contribute at least one pi stamp so a wholesale rewording cannot
-// no-op the guard.
+// version, and each surface's stamp COUNT must match an expected map so a wholesale rewording OR a
+// single dropped stamp is red (a bare `≥1 per file` presence check, like the `matched > 0` variant
+// retired in (h), stayed green when a surface lost one of three).
 //
-// Version-specific LINE REFERENCES are deliberately not asserted: they move within a version and must
-// be re-derived by hand (see #651).
+// Known scope bounds: 3-component literals only (a `pi 0.86` stamp is invisible), the allowlist is
+// keyed by version STRING rather than occurrence, and version-specific LINE REFERENCES are
+// deliberately not asserted — they move within a version and must be re-derived by hand (see #651).
 section("mirror version stamps match PI_VERSION_PIN");
 
 test("every version literal in the mirror surfaces is the pin or a listed dep version", () => {
@@ -416,21 +432,29 @@ test("every version literal in the mirror surfaces is the pin or a listed dep ve
     "docs/providers.md": ["8.9.0"], // undici
   };
   const offenders = [];
-  const starved = [];
+  const stampCounts = {};
   for (const file of MIRRORS) {
     const src = fs.readFileSync(path.join(REPO_ROOT, file), "utf8");
     const allowed = ALLOWED_NON_PI[file] ?? [];
     const stamps = [...src.matchAll(/\d+\.\d+\.\d+/g)]
       .map((m) => m[0])
       .filter((v) => !allowed.includes(v));
-    if (stamps.length === 0) starved.push(file);
+    stampCounts[file] = stamps.length;
     for (const v of stamps) if (v !== PI_VERSION_PIN) offenders.push(`${file}: ${v}`);
   }
+  // Counts, not just presence: a `≥1 per file` check stayed green when
+  // frontmatter-validate.mjs lost one of its 3 stamps. Update deliberately.
   assert.deepEqual(
-    starved,
-    [],
-    "these mirror surfaces no longer carry a pi version stamp — the guard would " +
-      `pass vacuously (rewording? update deliberately):\n  ${starved.join("\n  ")}`
+    stampCounts,
+    {
+      "docs/providers.md": 1,
+      "extensions/custom-provider-qwen/index.ts": 1,
+      "scripts/frontmatter-validate.mjs": 3,
+      ".github/workflows/ci-main.yml": 2,
+    },
+    "the set (or per-surface count) of version stamps changed — the tripwire's " +
+      "coverage moved, or a stamp was silently dropped (update this map only after " +
+      "confirming every stamp is PI_VERSION_PIN)"
   );
   assert.deepEqual(
     offenders,
@@ -443,13 +467,37 @@ test("every version literal in the mirror surfaces is the pin or a listed dep ve
 // #637 wires the suite into the PR path with `with: test-command:` → the reusable node-ci.yml, whose
 // unit-test job is SKIPPED when that input is empty. The silently-green paths guarded here are:
 //   (1) the `with:` binding on the node-ci.yml call is removed or emptied — the input falls back to
-//       '', the job's `if:` is false, and every PR is green with zero pin check; and
-//   (2) the `unit-test` job or its activation predicate stops consuming `inputs.test-command`.
+//       '', the job's `if:` is false, and every PR is green with zero pin check;
+//   (2) the `unit-test` job or its activation predicate stops consuming `inputs.test-command`;
+//   (3) an added conjunct makes a predicate unsatisfiable (`&& false`, or a push-only event guard on a
+//       pull_request-only workflow) — the predicate is present but the job never runs;
+//   (4) the step runs the input but swallows its failure (`|| true`, `continue-on-error: true`), so
+//       the job is green even when the suite fails; and
+//   (5) the CALLER job gets its own `if:`/`continue-on-error:` — the most natural way to "temporarily"
+//       disable a workflow, and invisible to a callee-only check.
+// The `test-command` value must be EXACTLY the suite invocation: a `|| true` suffix would leave every
+// assertion in this file passing while the gate can never go red.
 // NOT guarded: a typo'd/renamed input name fails LOUDLY on GitHub (undeclared workflow_call inputs
 // are rejected), and the callee read here is the BRANCH-LOCAL node-ci.yml while ci.yml executes @main
 // — so a main-side change to a stale branch is invisible. The real proof of the @main binding is the
 // live per-PR run (plan Verification step 4: `ci / unit-test` must show "run", not "skipping").
 section("per-PR pin gate is wired (not silently skipped)");
+
+const EXPECTED_TEST_COMMAND = "node scripts/check-skill-lint.test.mjs";
+
+// Slice a top-level job's block out of a workflow: from its 2-space-indented key to the next such key.
+// The key charset deliberately excludes `#` and `:` so a 2-space-indented COMMENT ending in a colon
+// (legal YAML, used throughout these workflows) cannot be mistaken for the next job — which would
+// truncate the block and produce a false RED with a misleading message.
+function jobBlockOf(workflowLines, jobName) {
+  const start = workflowLines.findIndex((l) => /^  [A-Za-z_][A-Za-z0-9_-]*:\s*$/.test(l) && l.trim() === `${jobName}:`);
+  assert.ok(start >= 0, `workflow no longer defines a \`${jobName}:\` job`);
+  const rel = workflowLines
+    .slice(start + 1)
+    .findIndex((l) => /^  [A-Za-z_][A-Za-z0-9_-]*:\s*$/.test(l));
+  const end = rel === -1 ? workflowLines.length : start + 1 + rel;
+  return workflowLines.slice(start, end).join("\n");
+}
 
 test("ci.yml binds a non-empty test-command that node-ci.yml declares and consumes", () => {
   const caller = fs.readFileSync(
@@ -460,48 +508,56 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares and consum
     path.join(REPO_ROOT, ".github", "workflows", "node-ci.yml"),
     "utf8"
   );
-  // Scope the caller search to the node-ci.yml call block — a bare `.find()` over the whole file
-  // would match an unrelated job's `test-command:`.
-  const lines = caller.split("\n");
-  const usesIdx = lines.findIndex((l) =>
+  const callerLines = caller.split("\n");
+  const usesIdx = callerLines.findIndex((l) =>
     /uses:\s*\S*\/\.github\/workflows\/node-ci\.yml@/.test(l)
   );
   assert.ok(usesIdx >= 0, "ci.yml no longer calls the node-ci.yml reusable workflow");
-  const line = lines
-    .slice(usesIdx, usesIdx + 20)
-    .find((l) => /^\s+test-command:\s*\S/.test(l));
+  // Scope to the CALLER JOB block (not a fixed line window, which false-REDs as soon as a comment
+  // block is inserted before the binding — and reports it as a missing binding).
+  const callerJob = jobBlockOf(callerLines, "ci");
   assert.ok(
-    line,
+    /uses:\s*\S*\/\.github\/workflows\/node-ci\.yml@/.test(callerJob),
+    "the `ci:` job block in ci.yml no longer calls the node-ci.yml reusable workflow"
+  );
+  // A caller-level `if:`/`continue-on-error:` skips or excuses the whole call with the callee
+  // untouched — the reuse-workflow equivalent of unplugging the gate.
+  assert.ok(
+    !/^\s+if:/m.test(callerJob),
+    "the `ci:` job in ci.yml gained an `if:` — that can skip the reusable-workflow call " +
+      "entirely (e.g. on pull_request), leaving every PR green with zero pin check"
+  );
+  assert.ok(
+    !/^\s+(?:-\s+)?continue-on-error:/m.test(callerJob),
+    "the `ci:` job in ci.yml gained `continue-on-error:` — the pin gate could fail silently"
+  );
+  const binding = callerJob.split("\n").find((l) => /^\s+test-command:\s*\S/.test(l));
+  assert.ok(
+    binding,
     "the node-ci.yml call in ci.yml no longer passes a non-empty `test-command` — the " +
       "input would fall back to '' and the unit-test job would be silently skipped"
   );
-  const cmd = line.replace(/^\s+test-command:\s*/, "").trim();
-  assert.match(
+  const cmd = binding.replace(/^\s+test-command:\s*/, "").trim();
+  assert.equal(
     cmd,
-    /check-skill-lint\.test\.mjs/,
-    `ci.yml test-command no longer runs the pin-lockstep suite: ${cmd}`
+    EXPECTED_TEST_COMMAND,
+    "ci.yml `test-command` must be exactly \"" +
+      EXPECTED_TEST_COMMAND +
+      "\" — a suffix or shell wrapper (e.g. `|| true`) leaves the job green even " +
+      `when the suite fails: ${cmd}`
   );
   assert.ok(
     /^\s+test-command:/m.test(callee),
     "node-ci.yml no longer declares a `test-command` workflow_call input — the " +
       "caller's binding would be ignored and the unit-test job skipped"
   );
+  // The callee's `unit-test` job, scoped the same way (see jobBlockOf).
+  const jobBlock = jobBlockOf(callee.split("\n"), "unit-test");
   assert.ok(
-    /^\s{2}unit-test:\s*$/m.test(callee),
-    "node-ci.yml no longer defines the `unit-test` job — the per-PR pin gate cannot run"
+    !/^\s+(?:-\s+)?continue-on-error:/m.test(jobBlock),
+    "the `unit-test` job (or its custom-test step) gained `continue-on-error:` — the suite " +
+      "could fail while the job reports success"
   );
-  // Scope the predicate check to the unit-test JOB block: the step-level
-  // `if: inputs.test-command != ''` also matches this pattern, so an unscoped
-  // match would stay green even with the job-level predicate neutered.
-  const calleeLines = callee.split("\n");
-  const jobIdx = calleeLines.findIndex((l) => /^\s{2}unit-test:\s*$/.test(l));
-  // Anchor the block to the NEXT top-level job key rather than a magic line
-  // count — a fixed window would false-RED as soon as a step is inserted above.
-  const nextRel = calleeLines
-    .slice(jobIdx + 1)
-    .findIndex((l) => /^  \S[^:]*:\s*$/.test(l));
-  const jobEnd = nextRel === -1 ? calleeLines.length : jobIdx + 1 + nextRel;
-  const jobBlock = calleeLines.slice(jobIdx, jobEnd).join("\n");
   // BOTH predicates must consume the input, and EXACTLY in the known-good shape.
   // A conjunct that can never hold (`if: inputs.test-command != '' && false`, or
   // `&& github.event_name == 'push'` on a pull_request-only workflow) leaves the
