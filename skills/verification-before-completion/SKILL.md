@@ -166,8 +166,8 @@ grep -E '\.(sql|edge\.ts|functions/)' /tmp/verify-changed.txt  # backend files
 | Risk Level | Change Type | Verification |
 |------------|-------------|--------------|
 | Low | Docs, config, labels, i18n | Hash files only. No typecheck. |
-| Medium | 1-3 TS/TSX files, no shared infra | Typecheck + tests + verifier (1 cycle) |
-| High | 3+ files, migrations, auth, shared infra, desktop app | Full suite + verifier (up to 2 retries) + browser screenshot |
+| Medium | 1-3 TS/TSX files, no shared infra | Typecheck + tests + verifier (convergence-gated — see the 10-cycle cap below) |
+| High | 3+ files, migrations, auth, shared infra, desktop app | Full suite + verifier (convergence-gated) + browser screenshot |
 | Critical | Data migrations, auth changes, payment flows | Full suite + verifier + browser on all routes + schema validate |
 
 ## Review Loop (CPI-5 — Convergence-Gated)

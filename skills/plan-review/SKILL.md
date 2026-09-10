@@ -38,7 +38,7 @@ steps:
 > **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
 > **Canonical:** `agent-infra/skills/plan-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
-> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers (2-4), convergence-gated (cap proportional to risk: 3 for Medium, 5 for Medium-High, 8 for High). Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
+> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers (2-4), convergence-gated (cap proportional to risk: 3 for Medium, 5 for Medium-High, 10 for High). Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
 
 # Plan Review
 
@@ -65,7 +65,7 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 | **Micro** | 0 (skip review) | — |
 | **Low-Medium** (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |
 | **Medium-High** (large plan, some novelty) | 3 reviewers (+ Efficiency) | 5 |
-| **High** (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 8 |
+| **High** (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 10 |
 
 **Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers. The agent notes the decision; a reviewer sub-agent validates it. **A plan that also introduces a new write path / shared-state owner adds Reviewer #5 on top of whichever N the table gives — #5 is additive, never a replacement for another reviewer.**
 
@@ -592,6 +592,6 @@ This gives one orchestrator-level recovery before waking the human.
 
 ## Announce
 
-At invocation: "Running plan-review on `[plan-doc-path]` with N parallel reviewers (proportional to plan risk). Capped at [3|5|8] cycles per plan risk tier — escalates to human at cap. See Proportional Review Cycles table. Does not auto-exit with remaining issues."
+At invocation: "Running plan-review on `[plan-doc-path]` with N parallel reviewers (proportional to plan risk). Capped at [3|5|10] cycles per plan risk tier — escalates to human at cap. See Proportional Review Cycles table. Does not auto-exit with remaining issues."
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

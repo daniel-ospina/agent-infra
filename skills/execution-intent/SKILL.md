@@ -24,11 +24,13 @@ This skill is a reference — it does not run a procedure. Other skills cross-re
 
 | Profile | Philosophy | User pauses | Review cycles | Fix scope | Sub-agent dispatch |
 |---------|-----------|-------------|---------------|-----------|--------------------|
-| **Fast** (default) | Speed + quality | Normal interactive gates | Up to 4 cycles, per-skill default | Per-skill default | Ask user |
-| **Autonomous** | Measure twice, cut once | **Zero** | Full 4 cycles, no early-exit cap | All P0/P1/P2 + verify each fix | Auto-dispatch by heuristic |
+| **Fast** (default) | Speed + quality | Normal interactive gates | Per-skill default (each skill's own convergence rule; ≤10-cycle safety cap) | Per-skill default | Ask user |
+| **Autonomous** | Measure twice, cut once | **Zero** | Full per-skill convergence, **no early-exit cap** | All P0/P1/P2 + verify each fix | Auto-dispatch by heuristic |
 | **Budget** | Watch credits | Normal gates | Same as Fast | Same as Fast | Force in-chat (migrations excepted) |
 
 **Default behavior:** When no intent is set, fall back to **Fast**.
+
+> ⚠️ **These are profile BUDGETS, not caps.** A profile selects *how much* of a skill's own review loop runs — it never imposes a ceiling, and never a bound tighter than the skill's own. The governing bound is always the skill's, and it is **proportional** (`skills/proportional-gates/SKILL.md` is canonical: Low → skip, Low-Medium → 3, Medium-High → 5, High → 10) or **convergence-gated with a 10-cycle safety cap** (`code-review`, `test-review`, `epic-plan`, `verification-before-completion`). The review loop is how quality is produced, so the default is to keep cycling until a clean exit or genuine convergence — stopping early because a count "feels high" is a bypass. (agent-infra#700: a hard-coded "4 cycles maximum" in `AGENTS.md`/`templates/AGENTS.base.md` and the literal "4" in this table previously contradicted every skill and caused verification to stop with fixes unverified.)
 
 ## Reading the Intent
 
@@ -68,12 +70,12 @@ The file is overwritten on each new brainstorming session. Intent is immutable p
 
 Worked examples:
 
-- **Micro + Autonomous:** Codebase Explorer still skipped (Micro rule). Plan reviews run 2 cycles instead of 4 (Micro constrains). Fix P0+P1 (Micro skips P2 by default; intent does not override tier).
+- **Micro + Autonomous:** Codebase Explorer still skipped (Micro rule). Plan review is skipped at Micro (`plan-review` proportional table); where a tier does run it, the 2-cycle budget applies. Fix P0+P1 (Micro skips P2 by default; intent does not override tier).
 - **Micro + Budget:** codebase-read only — the micro proportional external-research trigger is skipped under Budget (issue #231 D3).
 - **Complex + Budget:** code-review skips NVIDIA pattern scan (6 → 5 agents). writing-plans skips perplexity gate. All other Complex phases run normally.
 - **Standard + Budget:** issue-scoping Phase 1.5 runs ≤ 2 external queries, codebase-first, fired only on P0-level gaps (new third-party dep / novel pattern with zero in-repo precedent) — the writing-plans Perplexity gate is the total session research budget (no double-charge). (issue #231 D3)
 - **Epic-tier + Budget:** epic-plan research hooks and epic-scope granular queries defer to the epic research brief (codebase + brief only, zero external queries). (issue #231 D3)
-- **Complex + Autonomous:** All Complex phases run; review cycles take 4 cycles each, fix all severities; sub-agents auto-dispatch.
+- **Complex + Autonomous:** All Complex phases run; review cycles run to the **skill's own convergence rule** (no early-exit cap — the skills' convergence gates and their 10-cycle safety caps govern); sub-agents auto-dispatch.
 
 ## Sub-agent Preamble
 

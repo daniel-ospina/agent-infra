@@ -43,7 +43,7 @@ See `references/protocols.md` → Adversarial Review Protocol.
 - Defender: evidence or concessions
 - Synthesizer: categorized fix list
 
-### 7.3 Run 2+ loops (conditional — continue if critical findings remain, cap at 4)
+### 7.3 Run 2+ loops (conditional — continue to convergence if critical findings remain; bound = `proportional-gates` proportional table, not a flat 4)
 
 ### 7.4 Apply fixes, present flagged items at human gate
 

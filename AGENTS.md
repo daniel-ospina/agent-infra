@@ -111,7 +111,9 @@ Every review cycle MUST dispatch a FRESH `task` sub-agent. The reviewer has no m
 
 #### Hard Cap
 
-4 cycles maximum per reviewer (unless skill specifies otherwise). On cap → document remaining issues, post with `⚠️ capped at N cycles — M issues remain`, proceed.
+**The skill's own bound governs — and bounds are proportional, not flat.** `skills/proportional-gates/SKILL.md` is the **canonical** review-cycle table (Low → skip; Low-Medium → **3**; Medium-High → **5**; High → **10**), and convergence-gated skills (`code-review`, `test-review`, `epic-plan`, `verification-before-completion`) use a **10-cycle safety cap**. When a skill specifies no bound, the default is **10**.
+
+This is a **runaway guard, not a quality gate** — review cycles are how quality gets produced, so do not treat the cap as a target, and do not stop early because the count "feels high". Stop only on (a) a clean exit (`NO ISSUES FOUND`), (b) **convergence** (the same issues recurring, no new ones) — which **escalates**: to the orchestrator agent, or to a human where the skill requires it (the skills that escalate on convergence — `code-review`, `plan-review` — mandate human acknowledgement; human escalation is otherwise reserved for architectural or security decisions) — and never proceeds with unfixed issues, or (c) the bound. **Apply the skill's own bound including its proportional tiers** — never substitute a flat number for a skill's risk-scaled escalation, and never apply a bound tighter than the skill's own convergence rule. On cap → **escalate** (orchestrator agent, or a human where the skill requires it) with the remaining issues: document them, post the `⚠️ capped at N cycles — M issues remain` marker, proceed.
 
 #### FORBIDDEN — These Bypass the Quality Gate Entirely
 
