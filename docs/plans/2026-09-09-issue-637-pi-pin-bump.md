@@ -120,7 +120,11 @@ tripwire wired into the per-PR path.
      predicates (an added conjunct can make the job unsatisfiable while every check stays green), that
      the custom-test step actually `run:`s the input, that no `continue-on-error:` appears in the
      `unit-test` job block, and that the **caller** `ci:` job carries no `if:`/`continue-on-error:` (the
-     most natural way to disable a workflow, and invisible to a callee-only check). Without it the gate
+     most natural way to disable a workflow, and invisible to a callee-only check). The workflow text is
+     **normalized before matching** (quote-aware comment stripping + key dequoting, `key :` spacing
+     tolerated, and the step's `run:` anchored to its own indentation and EOL): without it, quoted keys
+     (`"paths-ignore":`) and `continue-on-error : true` unplug the gate while the guard stays green, and
+     trailing comments false-RED healthy files — both classes were reproduced during review. Without it the gate
      can be silently unplugged by removing the binding (the job skips) — and `actionlint`
      cannot catch it. **Caveat:** it reads the BRANCH-LOCAL `node-ci.yml`, while `ci.yml` executes
      `@main`; a main-side change to a stale branch is invisible, so the live per-PR run (Verification
@@ -343,9 +347,40 @@ merge-blocking until #646 lands.
 | parallel review gates | 3 | **ISSUES FOUND** (1×P1, 4×P2/P3, 2×P4) — see fix round 3 |
 | second-model coherence (Phase 5.6) | 2 | **1×P2** (guard `(j)` overclaimed the `@main` seam) — see fix round 3 |
 | parallel review gates | 4 | **no P0/P1/P2 code issues** — 1×P2 process (the unmet criterion is disclosed but ungated: the PR merges with `Closes #637`) + 5×P3/P4 documentation/robustness — see fix round 4 |
-| parallel review gates | 5 | dispatched at `e1a75b8` — see fix round 5 |
+| parallel review gates | 5 | not separately dispatched — superseded by the code-review rounds (cycles 5–7 below), which reviewed the same diff with fresh context |
 | code-review (PR #640) | 5 (bug scan at `6fb9df4`) | **ISSUES FOUND** — 2×P2 (guard `(j)` blind to a caller-level `if:`/`continue-on-error:`; `test-command`/step could swallow failure) + 2×P3 `(i)` presence-check non-vacuity, fixed 20-line caller window + 2×P4 misleading job-boundary anchor, `(h)` scope vs claim — all fixed in `e1a75b8`, all negative-tested |
-| code-review (PR #640) | 6 (final, at head) | pending |
+| code-review (PR #640) | 6 (security + config at `965f663`) | **ISSUES FOUND** — 1×P3 (guard `(j)` never read the workflow TRIGGER: `pull_request.paths-ignore` skips the whole run for the exact PRs the gate guards) + 1×P4 (the self-caller ref was globbed; `@main` is locked decision D2) — fixed in `e1960da` |
+| code-review (PR #640) | 7 (final, at `e1960da`) | **ISSUES FOUND** — 2×P2 (YAML-valid bypasses left the guard GREEN: quoted keys `"paths-ignore":`, `continue-on-error :` spacing, `run: … || true`, a decoy comment line; and 8 semantics-preserving reformats false-REDded) + 1×P4 (this log) — fixed in the follow-up commit by normalizing the workflow text (comment-stripping + key dequoting) — see fix round 7 |
+
+### Fix round — code-review cycle 6 (security + config at `965f663`) → `e1960da`
+
+Two verified live bypasses of the per-PR pin gate, both leaving the suite at 163/163:
+
+- **P3** — guard `(j)` never read the workflow **trigger**. `pull_request.paths-ignore:
+  ['extensions/**']` skips the entire workflow for exactly the PRs the gate exists to catch (#637's
+  failure mode is a partial bump under `extensions/`), and the `ci:` job block is never evaluated — so
+  every job-level assertion stayed green. Same for `paths`, `branches`, and `workflow_dispatch`.
+- **P4** — the self-caller ref was matched as `@` followed by anything, though ci.yml documents `@main`
+  as locked decision D2 precisely because the live run resolves the callee FROM that ref while the
+  guard reads the branch-local `node-ci.yml`.
+
+### Fix round — code-review cycle 7 (final, at `e1960da`) → guard normalization
+
+The final adversarial pass reproduced nine YAML-valid edits that left the guard GREEN while the gate was
+unplugged (quoted keys `"paths-ignore":` / `'paths-ignore':`; `continue-on-error : true` and
+`if : false` with space-before-colon; `run: ${{ inputs.test-command }} || true`; a decoy
+`# historical: run: ${{ … }}` comment line satisfying the unanchored `run:` match) and eight
+semantics-preserving edits that false-REDded (trailing comments on `uses:` / `test-command:` / `on:` /
+`jobs:` / `pull_request:` / the callee `if:`s; a quoted `test-command` scalar).
+
+Root cause both ways: the guard matched raw YAML text as if YAML had canonical spacing. It now
+normalizes first — comment stripping (quote-aware) and key dequoting — and matches keys through a
+`keyRe()` helper that tolerates `key :`; the step's `run:` is anchored to its own indentation and EOL.
+
+Verification at the fix commit: **15 bypass mutations RED** (all nine above plus the previously-covered
+`paths`/`branches`/`workflow_dispatch`/`@v0.1.0`/`|| true`/caller & callee `continue-on-error:`/
+caller `if:`) and **12 semantics-preserving edits GREEN**, with the suite at 163/163. The `(h)` and `(i)`
+mutations were re-run and stay RED.
 
 ### Fix-round history
 

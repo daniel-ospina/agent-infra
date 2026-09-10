@@ -498,7 +498,54 @@ test("every version literal in the mirror surfaces is the pin or a listed dep ve
 section("per-PR pin gate is wired (not silently skipped)");
 
 const EXPECTED_TEST_COMMAND = "node scripts/check-skill-lint.test.mjs";
-const REF_RE = /uses:\s*\S*\/\.github\/workflows\/node-ci\.yml@main\s*$/m;
+const SELF_CALLER_RE = /uses:\s*\S*\/\.github\/workflows\/node-ci\.yml@main/;
+
+// ── YAML normalization ─────────────────────────────────────────────────────
+// These guards read YAML as text, so they must be insensitive to the syntactic freedom YAML grants —
+// otherwise the gate is defeated (or the guard false-REDs) by semantics-preserving edits. Both were
+// reproduced during review:
+//   GREEN while unplugged: `"paths-ignore":` / `'paths-ignore':` (quoted keys), `continue-on-error :`
+//     and `if : false` (space before the colon), `run: ${{ inputs.test-command }} || true`, and a
+//     decoy `# historical: run: ${{ … }}` comment line carrying the match.
+//   RED on healthy files: trailing comments on `uses:`/`test-command:`/`on:`/`jobs:`/`pull_request:`/
+//     the callee `if:`s, and a quoted `test-command: "node …"` scalar.
+
+// Drop a trailing `# …` comment, respecting quotes. A `#` only starts a comment when preceded by
+// whitespace (YAML rule) and outside a quoted scalar.
+function stripComment(line) {
+  let q = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) {
+      if (c === q) q = null;
+    } else if (c === '"' || c === "'") {
+      q = c;
+    } else if (c === "#" && i > 0 && /\s/.test(line[i - 1])) {
+      return line.slice(0, i).replace(/\s+$/, "");
+    }
+  }
+  return line;
+}
+
+// Normalize a workflow for structural matching: drop full-line comments, strip trailing comments, and
+// dequote keys (`"paths-ignore":` → `paths-ignore:`). Values are left alone.
+function normYaml(src) {
+  return src
+    .split("\n")
+    .map((l) => (/^\s*#/.test(l) ? "" : stripComment(l)))
+    .map((l) => l.replace(/^(\s+(?:-\s+)?)(["'])([A-Za-z_][A-Za-z0-9_-]*)\2(\s*:)/, "$1$3$4"))
+    .join("\n");
+}
+
+// A key at any indent (and as a sequence item), tolerating `key :` spacing.
+function keyRe(name, indent = "\\s+") {
+  return new RegExp(`^${indent}(?:-\\s+)?${name}\\s*:`, "m");
+}
+
+// Unquote a scalar value (`"node x"` / `'node x'` → `node x`).
+function unquote(v) {
+  return v.replace(/^(["'])(.*)\1$/, "$2").trim();
+}
 
 // Slice a top-level job's block out of a workflow: from its 2-space-indented key to the next such key.
 // The key charset deliberately excludes `#` and `:` so a 2-space-indented COMMENT ending in a colon
@@ -515,63 +562,65 @@ function jobBlockOf(workflowLines, jobName) {
 }
 
 test("ci.yml binds a non-empty test-command that node-ci.yml declares and consumes", () => {
-  const caller = fs.readFileSync(
-    path.join(REPO_ROOT, ".github", "workflows", "ci.yml"),
-    "utf8"
+  const caller = normYaml(
+    fs.readFileSync(path.join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8")
   );
-  const callee = fs.readFileSync(
-    path.join(REPO_ROOT, ".github", "workflows", "node-ci.yml"),
-    "utf8"
+  const callee = normYaml(
+    fs.readFileSync(path.join(REPO_ROOT, ".github", "workflows", "node-ci.yml"), "utf8")
   );
   const callerLines = caller.split("\n");
   // The ref is asserted, not globbed: the guard reads the BRANCH-LOCAL node-ci.yml while the live run
   // resolves the callee FROM this ref, so `@main` is a locked decision (D2), not an incidental value.
-  const usesIdx = callerLines.findIndex((l) => REF_RE.test(l));
-  assert.ok(usesIdx >= 0, "ci.yml no longer calls the node-ci.yml reusable workflow at @main");
+  assert.ok(
+    callerLines.some((l) => SELF_CALLER_RE.test(l)),
+    "ci.yml no longer calls the node-ci.yml reusable workflow at @main"
+  );
   // Trigger guard FIRST: the outermost bypass is `on:` itself. `pull_request.paths-ignore` (or
   // `paths`/`branches` filters, or switching to workflow_dispatch) skips the whole run for exactly the
   // PRs this gate exists to catch, and the job block below is never evaluated — so every other
   // assertion in this test stays green. Verified: adding paths-ignore left the suite at 163/163.
-  const onIdx = callerLines.findIndex((l) => /^on:\s*$/.test(l));
+  const onIdx = callerLines.findIndex((l) => /^on\s*:\s*$/.test(l));
   assert.ok(onIdx >= 0, "ci.yml no longer declares a top-level `on:` trigger");
-  const jobsIdx = callerLines.findIndex((l) => /^jobs:\s*$/.test(l));
+  const jobsIdx = callerLines.findIndex((l) => /^jobs\s*:\s*$/.test(l));
   assert.ok(jobsIdx > onIdx, "ci.yml must declare `on:` before `jobs:`");
   const triggerBlock = callerLines.slice(onIdx, jobsIdx).join("\n");
   assert.match(
     triggerBlock,
-    /^  pull_request:\s*$/m,
+    /^  pull_request\s*:\s*$/m,
     "ci.yml must still run on `pull_request` — otherwise the per-PR pin gate never fires"
   );
-  assert.ok(
-    !/^\s+(?:paths|paths-ignore|branches|branches-ignore|types):/m.test(triggerBlock),
-    "ci.yml's `pull_request:` gained a filter — `paths-ignore: ['extensions/**']` would skip the " +
-      "per-PR pin gate for exactly the PRs it guards (#637)"
-  );
+  for (const filter of ["paths", "paths-ignore", "branches", "branches-ignore", "types"]) {
+    assert.ok(
+      !keyRe(filter).test(triggerBlock),
+      `ci.yml's \`pull_request:\` gained \`${filter}:\` — \`paths-ignore: ['extensions/**']\` would ` +
+        "skip the per-PR pin gate for exactly the PRs it guards (#637)"
+    );
+  }
   // Scope to the CALLER JOB block (not a fixed line window, which false-REDs as soon as a comment
   // block is inserted before the binding — and reports it as a missing binding).
-  const callerJob = jobBlockOf(callerLines, "ci");
+  const callerJob = normYaml(jobBlockOf(callerLines, "ci"));
   assert.ok(
-    REF_RE.test(callerJob),
+    SELF_CALLER_RE.test(callerJob),
     "the `ci:` job block in ci.yml no longer calls the node-ci.yml reusable workflow at @main"
   );
   // A caller-level `if:`/`continue-on-error:` skips or excuses the whole call with the callee
   // untouched — the reuse-workflow equivalent of unplugging the gate.
   assert.ok(
-    !/^\s+if:/m.test(callerJob),
+    !keyRe("if").test(callerJob),
     "the `ci:` job in ci.yml gained an `if:` — that can skip the reusable-workflow call " +
       "entirely (e.g. on pull_request), leaving every PR green with zero pin check"
   );
   assert.ok(
-    !/^\s+(?:-\s+)?continue-on-error:/m.test(callerJob),
+    !keyRe("continue-on-error").test(callerJob),
     "the `ci:` job in ci.yml gained `continue-on-error:` — the pin gate could fail silently"
   );
-  const binding = callerJob.split("\n").find((l) => /^\s+test-command:\s*\S/.test(l));
+  const binding = callerJob.split("\n").find((l) => keyRe("test-command").test(l));
   assert.ok(
-    binding,
+    binding && unquote(binding.replace(/^\s*test-command\s*:\s*/, "")) !== "",
     "the node-ci.yml call in ci.yml no longer passes a non-empty `test-command` — the " +
       "input would fall back to '' and the unit-test job would be silently skipped"
   );
-  const cmd = binding.replace(/^\s+test-command:\s*/, "").trim();
+  const cmd = unquote(binding.replace(/^\s*test-command\s*:\s*/, ""));
   assert.equal(
     cmd,
     EXPECTED_TEST_COMMAND,
@@ -581,14 +630,14 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares and consum
       `when the suite fails: ${cmd}`
   );
   assert.ok(
-    /^\s+test-command:/m.test(callee),
+    keyRe("test-command").test(callee),
     "node-ci.yml no longer declares a `test-command` workflow_call input — the " +
       "caller's binding would be ignored and the unit-test job skipped"
   );
   // The callee's `unit-test` job, scoped the same way (see jobBlockOf).
-  const jobBlock = jobBlockOf(callee.split("\n"), "unit-test");
+  const jobBlock = normYaml(jobBlockOf(callee.split("\n"), "unit-test"));
   assert.ok(
-    !/^\s+(?:-\s+)?continue-on-error:/m.test(jobBlock),
+    !keyRe("continue-on-error").test(jobBlock),
     "the `unit-test` job (or its custom-test step) gained `continue-on-error:` — the suite " +
       "could fail while the job reports success"
   );
@@ -609,12 +658,14 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares and consum
     "the custom-test STEP's `if:` must be exactly `inputs.test-command != ''` — " +
       "otherwise the step can be skipped silently"
   );
-  // And the step must actually RUN the input, not just be guarded by it.
+  // And the step must actually RUN the input, not just be guarded by it — anchored to the step's own
+  // indentation and end-of-line, so `run: ${{ inputs.test-command }} || true` (swallows the failure)
+  // and a decoy `# historical: run: ${{ … }}` comment line (satisfies an unanchored match) are RED.
   assert.match(
     jobBlock,
-    /run:\s*\$\{\{\s*inputs\.test-command\s*\}\}/,
-    "the custom-test step no longer runs `${{ inputs.test-command }}` — the job " +
-      "would report green without executing the suite"
+    /^\s{8}run:\s*\$\{\{\s*inputs\.test-command\s*\}\}\s*$/m,
+    "the custom-test step must run exactly `${{ inputs.test-command }}` — otherwise the job " +
+      "reports green without executing the suite, or runs it and swallows the failure"
   );
 });
 
