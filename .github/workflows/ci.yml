@@ -7,6 +7,12 @@ name: CI
 on:
   pull_request:
 
+# #637 — the per-PR pin gate below adds one runner per PR; cancel superseded
+# runs so rapid pushes don't queue (ci.yml header budget note).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci:
     # node-ci.yml is a real committed file (materialized via

@@ -78,8 +78,8 @@ tripwire wired into the per-PR path.
    version-stamped history, annotated "re-verified pi v0.85.1 — zero drift".
 5. **New pin-lockstep tripwire `(h)`** in `scripts/check-skill-lint.test.mjs`: every
    `@earendil-works/pi-*` pin in `extensions/*/package.json` (`dependencies` **or** `devDependencies`)
-   must equal `PI_VERSION_PIN`, with a `matched > 0` guard so a zero-match predicate cannot pass
-   vacuously.
+   must equal `PI_VERSION_PIN`, and the per-extension pin count must match the expected map (a bare
+   zero-match check passed when coverage silently collapsed — see item 7).
 6. **Per-PR wiring (fix round; also review gate #2 P1 / gate #4 P0).** `.github/workflows/ci.yml` passes
    `test-command: node scripts/check-skill-lint.test.mjs` to its `node-ci.yml` call, so a partial pin
    bump **reports on the PR that introduces it** rather than only in `ci-main` after merge. The suite is
@@ -98,7 +98,7 @@ tripwire wired into the per-PR path.
 
 7. **Three follow-on guards added in review cycle 2** (closing "the tripwire guards the wrong class",
    "the non-vacuity guard is too weak" and "the wiring can silently unplug"):
-   - **`(i)` mirror provenance stamps** — every present-tense pi-version stamp in the four hand-synced
+   - **`(i)` mirror version stamps** — every `<major>.<minor>.<patch>` literal in the four hand-synced
      mirror surfaces (`docs/providers.md`, `extensions/custom-provider-qwen/index.ts`,
      `scripts/frontmatter-validate.mjs`, `.github/workflows/ci-main.yml`) must equal `PI_VERSION_PIN`,
      with a per-surface "contributed a match" assertion so a rewording cannot silently no-op the guard.
@@ -107,8 +107,9 @@ tripwire wired into the per-PR path.
      `check-skill-lint.test.mjs`, and that `node-ci.yml` still declares that input. Without it the gate
      can be silently unplugged by renaming the input (the job skips, the PR is green) — and `actionlint`
      cannot catch it.
-   - **`(h)` roster assertion** — `matched > 0` was a *presence* guard; coverage could collapse 6 → 1
-     silently. It now asserts the exact set of contributing extensions.
+   - **`(h)` pin-count assertion** — a presence check (`matched > 0`) was the first attempt; it stayed
+     green when coverage collapsed 6 pins → 1, and the follow-up *roster* (name set) also stayed green
+     when 3 of subagent's 4 pins were deleted. It now asserts the per-extension pin **count** map.
    All four guards were negative-tested: each verified **red** against a deliberate mutation (pin drift,
    mirror-stamp drift, removed `test-command` binding, removed pins) and the tree restored.
 
@@ -132,7 +133,7 @@ Both checks passed; no lockfile change is warranted.
 | 2 | Land `PI_VERSION_PIN = "0.85.1"` + generated header | done (`65bdda6`) |
 | 3 | Bump 6 devDep pins; regenerate lockfiles; `npm ci` | done (`65bdda6`) |
 | 4 | Update mirrors; preserve the historical probe record | done (`65bdda6`) |
-| 5 | Add `(h)` tripwire + `matched > 0` guard | done (`5b931ab`, `030825e`) |
+| 5 | Add `(h)` tripwire (presence guard, later strengthened) | done (`5b931ab`, `030825e`) |
 | 6 | Wire `(h)` into the per-PR path | done (fix-round commit on this branch — see PR #640 head) |
 | 7 | Write this plan doc | done (fix-round commits on this branch) |
 | 8 | Post the scoping comment to #637 (`<!-- issue-scoping:` marker) + re-run `scripts/check-pipeline-compliance.sh 640` | pending — `pipeline-compliance` is **red** until this lands; it is the repo's only required check |
@@ -147,7 +148,7 @@ than restating literals, because these numbers have already moved once inside th
 
 | Layer | Surface | Command / expectation |
 |---|---|---|
-| Unit | validator + fixtures + `(h)`/`(i)`/`(j)` guards | `node scripts/check-skill-lint.test.mjs` → **163/163** |
+| Unit | validator + fixtures + `(h)`/`(i)`/`(j)` guards | `node scripts/check-skill-lint.test.mjs` → **163/163** (corpus floor raised 120 → 122) |
 | Unit (negative) | the four pin guards | each verified **red** against a deliberate mutation (pin drift, mirror-stamp drift, removed `test-command` binding, removed pins), then restored |
 | Oracle | validator ↔ real pi loader | `node scripts/check-skill-lint.oracle.test.mjs` → **146/146**, fuzz **0/1000**, corpus 122 |
 | Contract | CI devDep resolution | review-enforcer **113/113**; verification-gate **296** unit + **81** e2e; subagent timeout + cache suites |
@@ -184,8 +185,9 @@ than restating literals, because these numbers have already moved once inside th
 - [ ] Zero fixture-consequence diffs across 135 fixtures on `--write` (see Testing-strategy table).
 - [ ] Oracle, `check-skill-lint.test.mjs` (incl. `(h)`), review-enforcer, verification-gate, subagent and
       custom-provider-qwen results match the Testing-strategy table.
-- [ ] `(h)` is non-vacuous (`matched > 0`, currently 6 pins) and runs **per-PR** (`ci.yml`) **and**
-      post-merge (`ci-main.yml`).
+- [ ] `(h)` is non-vacuous — it asserts the per-extension pin-count map (`review-enforcer` 1,
+      `subagent` 4, `verification-gate` 1) — and runs **per-PR** (`ci.yml`) **and** post-merge
+      (`ci-main.yml`).
 - [ ] `patch-pi-retry.sh --check` exit 0 against the installed 0.85.1 (shape probe).
 - [ ] The Verification-plan step-6 stale-literal scan returns **0** lines.
 - [ ] `ci / unit-test` appears as **run** (not skipped) on PR #640.
@@ -264,7 +266,7 @@ pi-ai internals used by the qwen fetch override (`options?.fetch` → `createCli
 |---|---|---|---|
 | **B — static drift at PR time** | version compare in `--check`; promote `(h)` to per-PR | **Per-PR promotion adopted** (item 6). The `--check` version leg is a genuine **design fork** — should `--check` fail when the machine is *ahead* of the repo? `docs/providers.md` documents `--check` as the patch-state "Verify anytime" command and makes no version claim, so this is an addition, not a broken contract; #642 already offers both resolutions. Cost of the adopted half: +1 `ubuntu-latest` runner per PR (~1–2 billed min, independent of the ~4s of test work) against the shared Actions budget. | If the next pi bump were imminent — `--check` is the only drift signal a developer can run locally on demand. |
 | **C — decoupled oracle in CI** | `--bundle` override for `resolvePiBundle`; the full oracle in `ci-main` against the devDep bundle | Collapses #642's core and **violates #642's explicit non-goal** (making the full oracle CI-runnable is deferred, not in scope). Adds a resolution seam plus CI wall-time for the 122-file corpus and 1000-case fuzz. | If pi's skill-loader semantics started changing per release and fixture drift went undetected between cron runs — i.e. if loader-parity drift became the dominant recurring risk rather than version-literal drift. |
-| **D — mirror-literal sweep** | a scanner asserting *every* active-surface pi-version literal equals the generated pin, with a dated allowlist | **Narrowly adopted** in review cycle 2: guard `(i)` asserts the four hand-synced **provenance stamps** — the class that actually escaped — against `PI_VERSION_PIN`, with a per-surface non-vacuity check. The *full* free-text sweep is still rejected: it must exempt the historical probe record in `docs/upstream-pi-bugs.md` plus archival `docs/plans/*`, `docs/scoping/*`, `docs/research/*`, and it carries the highest false-positive risk. It also cannot guard version-specific **line refs** (now #651). | The full sweep becomes right if the mirror class drifts **again** (two escapes ⇒ the stamp guard is insufficient), or if "active surface" can be defined mechanically instead of as an allowlist policy. |
+| **D — mirror-literal sweep** | a scanner asserting *every* active-surface pi-version literal equals the generated pin, with a dated allowlist | **Narrowly adopted**: guard `(i)` asserts every version literal in the four hand-synced mirror surfaces against `PI_VERSION_PIN` (with a per-surface non-vacuity check and an explicit non-pi dependency allowlist) — review cycle 3 showed a phrase-based variant missed 2 of 5 stamps. The *full* free-text sweep across the whole tree is still rejected: it must exempt the historical probe record in `docs/upstream-pi-bugs.md` plus archival `docs/plans/*`, `docs/scoping/*`, `docs/research/*`, and it carries the highest false-positive risk. It also cannot guard version-specific **line refs** (now #651). | The full sweep becomes right if the mirror class drifts **again** (two escapes ⇒ the four-surface guard is insufficient), or if "active surface" can be defined mechanically instead of as an allowlist policy. |
 | **E — eliminate by generation** | derive the extension pins from `PI_VERSION_PIN` so the drift cannot be authored | This is #643's longer-term cure (single source of truth); it requires a generation step across three `package.json` files and a policy for hand-edited comments. | If the repo moves to generated manifests. Recorded here so the divergence spans detect-vs-eliminate, not only "detect more". |
 | **F — split `(h)` into its own per-PR job** | extract the predicate into `scripts/check-pi-pin-lockstep.mjs` (+ a `tests/pi-pin-lockstep/` fixture suite) and point `test-command` at it, so the per-PR job is single-purpose | Not adopted at this pass: the wide promotion is ~4s, the split adds a second gate to maintain, and the overlap with `ci / skill-lint` is an accepted cost (both are advisory — #646). The split also becomes the natural home for the negative fixtures and for #642's predicate breadth. | If the per-PR path is later made merge-blocking (#646) or the suite grows — then the shared red context `ci / unit-test` must be split so a pin-drift failure and a validator regression are distinguishable, which the repo already does for `vendor-drift`. |
 
@@ -277,10 +279,11 @@ pi-ai internals used by the qwen fetch override (`options?.fetch` → `createCli
 | Lockfiles (3) | config | committed; `npm ci` in `ci-main.yml` extension-tests — **post-merge only**; per-PR lock↔manifest agreement is #642 | ⚠️ #642 |
 | `(h)` pin-lockstep tripwire | test | `ci.yml` unit-test (per-PR, advisory) + `ci-main.yml` extension-tests | ✅ |
 | Retry patch dist targets | integration | `patch-pi-retry.sh` (fail-loud on shape change) | ✅ |
-| Mirror **provenance stamps** (providers.md, qwen, frontmatter-validate, ci-main) | docs | guard `(i)` asserts each equals `PI_VERSION_PIN`, with per-surface non-vacuity | ✅ |
+| Mirror version literals (providers.md, qwen, frontmatter-validate, ci-main) | docs | guard `(i)` — every version literal equals the pin or a listed non-pi dep version, per-surface non-vacuity | ✅ |
 | Other hand-synced mirrors (subagent test comments, `docs/upstream-pi-bugs.md` historical record) + the tautological test literal | docs | partially by `(i)`/`(h)`; the full sweep is scoped in #643 | ⚠️ #643 |
 | Version-specific **line refs** (providers.md, qwen provenance) | docs | **#651** (assigned; trigger: re-derive at every pi/pi-ai bump) — a literal scanner cannot see a line number | ⚠️ #651 |
-| Per-PR wiring can be silently unplugged (remote `@main` input seam) | test | guard `(j)` asserts the binding on both sides | ✅ |
+| Per-PR wiring can be silently unplugged by caller/callee edits in the branch | test | guard `(j)` — binding present, input declared, and BOTH the job and custom-step `if:` consume it | ✅ |
+| `@main`-at-PR-time input resolution (stale-branch window) | workflow | not statically checkable — the live per-PR run is the proof (Verification step 4) | ⚠️ accepted |
 | `patch-pi-retry.sh --check` drift semantics | script | **design fork** — scoped in #642 (assigned; trigger: before the next pi bump) | ⚠️ #642 |
 | `(h)` predicate breadth (non-`pi-` `@earendil-works/*` **direct** deps) | config | scoped in #642. Note: this is **not** the same as the `chord` exposure — `chord` appears only in lockfiles, which `(h)` never reads | ⚠️ #642 |
 | `(h)` non-vacuity strength | test | roster assertion landed in review cycle 2 — asserts the exact contributing-extension set, so coverage cannot collapse silently | ✅ |
@@ -298,7 +301,7 @@ merge-blocking until #646 lands.
 | Gate | Cycle | Result |
 |---|---|---|
 | code-review (PR #640) | 1 | issues fixed — version-agnostic reword of subagent test comments; pin-lockstep tripwire added |
-| code-review (PR #640) | 2 | issues fixed — tripwire moved to end of file + legend; `assert.ok(matched > 0)` guard; scans both `dependencies` and `devDependencies` |
+| code-review (PR #640) | 2 | issues fixed — tripwire moved to end of file + legend; zero-match guard added; scans both `dependencies` and `devDependencies` |
 | code-review (PR #640) | 3 (second-model gate) | issue fixed — `docs/upstream-pi-bugs.md` probe line annotated with 0.85.1 re-verification |
 | code-review (PR #640) | 4 (second-model gate) | **NO ISSUES FOUND** |
 | problem-verify | 1 | `NEEDS-FIX` (P1: "make the vacuous indicator honest" scoped but unimplemented) |
@@ -308,7 +311,9 @@ merge-blocking until #646 lands.
 | parallel review gates | 1 | **ISSUES FOUND** (1×P0, 2×P1, 4×P2, 5×P3, 3×P4) |
 | parallel review gates | 2 | **ISSUES FOUND** (1×P0, 5×P1, 5×P2, 3×P3) — see fix round 2 |
 | second-model coherence (Phase 5.6) | 1 | **ISSUES FOUND** (1×P1, 2×P2) — see fix round 2 |
-| parallel review gates | 3 | pending |
+| parallel review gates | 3 | **ISSUES FOUND** (1×P1, 4×P2/P3, 2×P4) — see fix round 3 |
+| second-model coherence (Phase 5.6) | 2 | **1×P2** (guard `(j)` overclaimed the `@main` seam) — see fix round 3 |
+| parallel review gates | 4 | pending |
 
 ### Fix round — solution-verify cycle 1 → 2
 
@@ -336,7 +341,8 @@ merge-blocking until #646 lands.
   clean-dir `npm ci` succeeds. Recorded under "Lockfile verification".
 - **P2 (gate #2)** — the advertised negative-test layer does not exist as an artifact; the Testing
   strategy now states the negative proofs as manual procedures and records the missing cardinality guard
-  as a wiring gap owned by #642.
+  as a wiring gap. That gap was then closed inside this PR by the pin-count assertion (see fix round
+  cycle 2 → 3) — it is no longer attributed to #642.
 - **P2 (gate #1/#4)** — the `actionlint` claim was wrong (it cannot resolve a remote `@main` workflow);
   replaced with "PR #640 must show `ci / unit-test` running".
 - **P2 (gate #2/#4)** — added the missing `docs/scoping/*` and `docs/research/*` exclusions and gave the
@@ -357,6 +363,34 @@ The fix rounds absorbed a separately-rated `standard` scope (per-PR wiring, #642
 tier change. Repo rubric: overall = highest rated domain; both touched domains are `standard`, and
 `complex` requires new patterns, cross-system work, security surface, or uncharted territory, none of
 which this mechanical bump introduces.
+
+### Fix round — parallel review gates cycle 3 → 4
+
+- **P1 (gate #4)** — the required `pipeline-compliance` check was a STALE red: the run read comments 3
+  seconds before the scoping comment was created. Not a record error (the local gate passes) but a real
+  merge blocker; cleared by the next push and verified green on the new head. The lesson is recorded in
+  step 8: posting the comment does not re-run the check.
+- **P2 (gates #1/#2/#3/#4)** — guard `(i)` overclaimed: its per-file phrase patterns missed 2 of the 5 pi
+  stamps (`frontmatter-validate` "probe pi X", `ci-main` "devDep pinned X"). A mutation that drifted
+  either stamp left the suite GREEN. Rewritten to scan **every version literal** in the four surfaces
+  with an explicit non-pi dependency allowlist; both mutations now RED.
+- **P2 (gates #2/#4)** — guard `(j)` overclaimed twice: (a) it matched the whole file rather than the
+  `node-ci.yml` call block, and (b) it checked only *declaration*, so neutering the `unit-test` job's
+  `if:`, the custom-test step's `if:`, or the s+run` binding all left it GREEN. Now scoped to the call
+  block and to the job block, asserting that BOTH the job and the step predicates consume the input.
+  The `@main` caveat is stated in the guard, the wiring table and alternative F rather than claimed closed.
+- **P2 (gates #1/#2)** — the `(h)` roster was a name set: deleting 3 of subagent's 4 pins stayed green
+  (6 → 3). Replaced with a per-extension pin-count map; that mutation is now RED.
+- **P3 (all gates)** — the 122-tree relabel was half-applied (section label, assert message and the
+  oracle/validator comments still said 121). Finished, and the corpus floor raised 120 → 122.
+- **P3 (gate #2)** — the plan still advertised the removed `matched > 0` mechanism; corrected here and in
+  the acceptance criteria.
+- **P3 (gate #4)** — the new per-PR runner had no `concurrency` group: added
+  `group: ci-${{ github.ref }}` + `cancel-in-progress: true` so superseded pushes cancel instead of queue.
+- **P3 (gate #3)** — `#637`'s Targets and Verification-checklist rows still said 161/161; corrected to
+  163/163. The Fractal Fields (E2E/Verification/Wiring `TBD`) were filled from this plan.
+- **P4 (gate #3)** — PR #640's body predated every fix round; refreshed with the new counts, the guards,
+  and the Unmet-Criterion pointer.
 
 ## Unmet Criterion (human decision required)
 

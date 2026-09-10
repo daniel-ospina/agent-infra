@@ -4,7 +4,7 @@
  *
  * The drift lock: imports pi's REAL bundle and asserts the validator's net
  * consequence matches pi's on the enumerated fixture matrix + the live
- * 121-file corpus + deterministic fuzz. NOT wired into CI (dev machine /
+ * 122-file corpus + deterministic fuzz. NOT wired into CI (dev machine /
  * cron only — scripts/cron-quality-gates.sh oracle).
  *
  * Run: node scripts/check-skill-lint.oracle.test.mjs

@@ -746,7 +746,7 @@ export function tokenizeFrontmatter(yamlString) {
         // a DEEPER column is the value; a seq at a SHALLOWER column is a new
         // sibling structure. List items inside a list-of-maps (`steps:
         //   - name: x`) are legal — their indent differs from the nested
-        // key's column (probe-verified against the live 121-tree).
+        // key's column (probe-verified against the live 122-tree).
         const hazard = state.inlineKey.gapSince ? 'gap' : 'direct';
         emit({ t: TOKEN.TOKENIZE_ERROR, kind: 'seq-hazard', hazard, line: L.no, detail: 'block sequence after a valued key' });
         state.inlineKey = null;
@@ -1156,7 +1156,7 @@ export function validateFrontmatter(content) {
       data = deriveData(tokens, anchors);
 
       // R3 — body `---` continuation → P1 authoring warning. Narrowed per the
-      // plan's register-fallback clause (D8c): the live 121-tree bodies are
+      // plan's register-fallback clause (D8c): the live 122-tree bodies are
       // full of markdown horizontal-rule `---` lines (100+ occurrences) which
       // are inert for pi and would be false positives. The warning fires only
       // on the genuine "second frontmatter block" shape — a `---` line at the

@@ -16,11 +16,13 @@
  *   (f) name≠dir with quoted-name regression (quote-aware data)
  *   (g) 122-tree sweep: validator over skills/ → ZERO findings
  *   (h) pin lockstep: every extension @earendil-works/pi-* pin == PI_VERSION_PIN,
- *       with a roster assertion (coverage, not mere presence)
- *   (i) mirror provenance stamps: every present-tense pi-version stamp in the
- *       hand-synced mirror surfaces equals PI_VERSION_PIN (the #637 escape class)
+ *       and the per-extension pin COUNT matches the expected map (coverage, not
+ *       mere presence)
+ *   (i) mirror version stamps: every <major>.<minor>.<patch> literal in the four
+ *       hand-synced mirror surfaces is PI_VERSION_PIN or a listed dep version
+ *       (the #637 escape class)
  *   (j) per-PR wiring: ci.yml binds a non-empty test-command to an input that
- *       node-ci.yml actually declares (the silent-unplug class)
+ *       node-ci.yml declares AND consumes in the unit-test job's `if:`
  *
  * Repo-convention harness: node:assert, custom test() with ✅/❌ markers,
  * process.exit(1) on failure (load-gate.test.mjs pattern). Assertion markers
@@ -302,8 +304,8 @@ test("missing continuity directive → P0 mandatory-blocks (Continue following),
   assert.match(r.stdout, /\[P0\] mandatory-blocks: missing 'Continue following the workflow' continuity directive/);
 });
 
-// ── (g) 121-tree sweep — zero false positives ───────────────────────────────
-section("121-tree sweep — zero findings (zero false positives)");
+// ── (g) 122-tree sweep — zero false positives ───────────────────────────────
+section("122-tree sweep — zero findings (zero false positives)");
 
 test(`validator over ${SKILLS_DIR} → zero findings`, () => {
   assert.ok(fs.existsSync(SKILLS_DIR), "skills tree exists");
@@ -317,7 +319,7 @@ test(`validator over ${SKILLS_DIR} → zero findings`, () => {
     }
   };
   walk(SKILLS_DIR);
-  assert.ok(files.length >= 120, `expected the 121-file corpus, found ${files.length}`);
+  assert.ok(files.length >= 122, `expected the 122-file corpus, found ${files.length}`);
   const offenders = [];
   for (const f of files) {
     const r = validateFrontmatter(fs.readFileSync(f, "utf8"));
@@ -339,42 +341,42 @@ test("CLI over the live tree → '0 issue(s). Clean.' exit 0", () => {
 // bump (fixtures updated, one package.json missed) stayed CI-green. Guard the
 // CLASS, not just this instance: every @earendil-works/pi-* pin under
 // extensions/*/package.json — in `dependencies` OR `devDependencies` — must
-// equal PI_VERSION_PIN, AND at least one pin must be found (a zero-match run is
-// a vacuous pass, i.e. the guard silently disabled).
+// equal PI_VERSION_PIN, and the per-extension PIN COUNT must match the
+// expected map (a bare `matched > 0` presence check stayed green when coverage
+// collapsed 6 pins → 1, i.e. the guard silently weakened).
 section("extension pi-package pins lockstep with PI_VERSION_PIN");
 
 test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN", () => {
   const extDir = path.join(REPO_ROOT, "extensions");
   const offenders = [];
-  const contributing = [];
+  const pinCounts = {};
   for (const entry of fs.readdirSync(extDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const pkgPath = path.join(extDir, entry.name, "package.json");
     if (!fs.existsSync(pkgPath)) continue;
     const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-    let hit = false;
+    let hits = 0;
     for (const field of ["dependencies", "devDependencies"]) {
       for (const [name, ver] of Object.entries(pkg[field] ?? {})) {
         if (!name.startsWith("@earendil-works/pi-")) continue;
-        hit = true;
+        hits++;
         if (ver !== PI_VERSION_PIN) {
           offenders.push(`extensions/${entry.name}/package.json (${field}): ${name}@${ver}`);
         }
       }
     }
-    if (hit) contributing.push(entry.name);
+    if (hits > 0) pinCounts[entry.name] = hits;
   }
-  // Roster, not just presence: `matched > 0` would stay green if coverage
-  // collapsed 6 pins → 1 (a devDep consolidation, a workspace move, a package
-  // dropping its pin). Assert WHICH extensions must contribute, so losing one
-  // is red rather than silent. Update this list deliberately when the set of
-  // pi-package-pinning extensions changes.
+  // Counts, not just a name roster: the roster alone stayed green when 3 of
+  // subagent's 4 pins were deleted (6 pins → 3). Assert the full map so both a
+  // lost extension and a lost pin within an extension are red. Update
+  // deliberately when the pi-package-pinning set changes.
   assert.deepEqual(
-    contributing.sort(),
-    ["review-enforcer", "subagent", "verification-gate"],
-    "the set of extensions that pin @earendil-works/pi-* packages changed — " +
-      "the tripwire's coverage moved (add the new extension here only after " +
-      "confirming its pins are pinned to PI_VERSION_PIN)"
+    pinCounts,
+    { "review-enforcer": 1, subagent: 4, "verification-gate": 1 },
+    "the set (or per-extension count) of @earendil-works/pi-* pins changed — the " +
+      "tripwire's coverage moved (update this map only after confirming every pin " +
+      "is pinned to PI_VERSION_PIN)"
   );
   assert.equal(
     offenders.length,
@@ -387,54 +389,69 @@ test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN",
 // The 2026-08-10 escape was a hand-synced *provenance stamp*, not a pin:
 // docs/providers.md and extensions/custom-provider-qwen/index.ts asserted verification against a pi
 // release the repo had already moved past while PI_VERSION_PIN had moved on, and the claim stayed
-// wrong for 12 days. (h) cannot see those files. These stamps are
-// present-tense verification claims, so assert each equals the pin — and that
-// every listed surface still contributes a match, or the guard would no-op
-// silently after a rewording. Version-specific line references are deliberately
-// NOT asserted here: they move within a version and must be re-derived by hand.
-section("mirror provenance stamps match PI_VERSION_PIN");
+// wrong for 12 days. (h) cannot see those files.
+//
+// Guard the whole stamp SET, not a phrase. A per-file phrase pattern was tried first and missed 2 of
+// the 5 pi stamps (frontmatter-validate's "probe pi X" and ci-main's "devDep pinned X") — the same
+// silent-staleness class this guard exists to close. Instead: every `<major>.<minor>.<patch>` literal
+// in these four hand-synced surfaces must be either PI_VERSION_PIN or a listed non-pi dependency
+// version, and each surface must contribute at least one pi stamp so a wholesale rewording cannot
+// no-op the guard.
+//
+// Version-specific LINE REFERENCES are deliberately not asserted: they move within a version and must
+// be re-derived by hand (see #651).
+section("mirror version stamps match PI_VERSION_PIN");
 
-test("hand-synced pi-version stamps equal PI_VERSION_PIN", () => {
+test("every version literal in the mirror surfaces is the pin or a listed dep version", () => {
   const MIRRORS = [
-    { file: "docs/providers.md", re: /Verified against pi (\d+\.\d+\.\d+) internals/g },
-    {
-      file: "extensions/custom-provider-qwen/index.ts",
-      re: /verified against pi-ai (\d+\.\d+\.\d+) dist/g,
-    },
-    { file: "scripts/frontmatter-validate.mjs", re: /\(pi v(\d+\.\d+\.\d+)/g },
-    { file: ".github/workflows/ci-main.yml", re: /runtime version \((\d+\.\d+\.\d+)\)/g },
+    "docs/providers.md",
+    "extensions/custom-provider-qwen/index.ts",
+    "scripts/frontmatter-validate.mjs",
+    ".github/workflows/ci-main.yml",
   ];
+  // Non-pi dependency versions legitimately quoted in a surface (so they are not
+  // mistaken for stamps). Adding an entry here is a deliberate, reviewed act.
+  const ALLOWED_NON_PI = {
+    "scripts/frontmatter-validate.mjs": ["2.9.0"], // yaml
+    "docs/providers.md": ["8.9.0"], // undici
+  };
   const offenders = [];
   const starved = [];
-  for (const { file, re } of MIRRORS) {
+  for (const file of MIRRORS) {
     const src = fs.readFileSync(path.join(REPO_ROOT, file), "utf8");
-    const found = [...src.matchAll(re)].map((m) => m[1]);
-    if (found.length === 0) starved.push(file);
-    for (const v of found) if (v !== PI_VERSION_PIN) offenders.push(`${file}: ${v}`);
+    const allowed = ALLOWED_NON_PI[file] ?? [];
+    const stamps = [...src.matchAll(/\d+\.\d+\.\d+/g)]
+      .map((m) => m[0])
+      .filter((v) => !allowed.includes(v));
+    if (stamps.length === 0) starved.push(file);
+    for (const v of stamps) if (v !== PI_VERSION_PIN) offenders.push(`${file}: ${v}`);
   }
   assert.deepEqual(
     starved,
     [],
-    "these mirror surfaces no longer carry the expected stamp — the guard would " +
-      `pass vacuously (rewording? update the pattern deliberately):\n  ${starved.join("\n  ")}`
+    "these mirror surfaces no longer carry a pi version stamp — the guard would " +
+      `pass vacuously (rewording? update deliberately):\n  ${starved.join("\n  ")}`
   );
   assert.deepEqual(
     offenders,
     [],
-    `stale provenance stamps vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
+    `stale version stamps vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
   );
 });
 
 // ── (j) per-PR wiring is not silently unplugged ────────────────────────────
-// #637 wires the suite into the PR path with `with: test-command:` → the
-// reusable node-ci.yml, which SKIPS the unit-test job when that input is empty
-// or unrecognised. Renaming or mistyping the input yields a GREEN PR with zero
-// pin check — the exact defect #637 exists to close — and actionlint cannot
-// catch it (it cannot resolve a remote @main reusable workflow, so an unknown
-// input still lints clean). Assert the binding on both sides.
+// #637 wires the suite into the PR path with `with: test-command:` → the reusable node-ci.yml, whose
+// unit-test job is SKIPPED when that input is empty. The silently-green paths guarded here are:
+//   (1) the `with:` binding on the node-ci.yml call is removed or emptied — the input falls back to
+//       '', the job's `if:` is false, and every PR is green with zero pin check; and
+//   (2) the `unit-test` job or its activation predicate stops consuming `inputs.test-command`.
+// NOT guarded: a typo'd/renamed input name fails LOUDLY on GitHub (undeclared workflow_call inputs
+// are rejected), and the callee read here is the BRANCH-LOCAL node-ci.yml while ci.yml executes @main
+// — so a main-side change to a stale branch is invisible. The real proof of the @main binding is the
+// live per-PR run (plan Verification step 4: `ci / unit-test` must show "run", not "skipping").
 section("per-PR pin gate is wired (not silently skipped)");
 
-test("ci.yml binds a non-empty test-command that node-ci.yml declares", () => {
+test("ci.yml binds a non-empty test-command that node-ci.yml declares and consumes", () => {
   const caller = fs.readFileSync(
     path.join(REPO_ROOT, ".github", "workflows", "ci.yml"),
     "utf8"
@@ -443,11 +460,20 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares", () => {
     path.join(REPO_ROOT, ".github", "workflows", "node-ci.yml"),
     "utf8"
   );
-  const line = caller.split("\n").find((l) => /^\s+test-command:\s*\S/.test(l));
+  // Scope the caller search to the node-ci.yml call block — a bare `.find()` over the whole file
+  // would match an unrelated job's `test-command:`.
+  const lines = caller.split("\n");
+  const usesIdx = lines.findIndex((l) =>
+    /uses:\s*\S*\/\.github\/workflows\/node-ci\.yml@/.test(l)
+  );
+  assert.ok(usesIdx >= 0, "ci.yml no longer calls the node-ci.yml reusable workflow");
+  const line = lines
+    .slice(usesIdx, usesIdx + 20)
+    .find((l) => /^\s+test-command:\s*\S/.test(l));
   assert.ok(
     line,
-    "ci.yml no longer passes a non-empty `test-command` to node-ci.yml — the " +
-      "per-PR pin gate would be silently skipped"
+    "the node-ci.yml call in ci.yml no longer passes a non-empty `test-command` — the " +
+      "input would fall back to '' and the unit-test job would be silently skipped"
   );
   const cmd = line.replace(/^\s+test-command:\s*/, "").trim();
   assert.match(
@@ -456,9 +482,30 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares", () => {
     `ci.yml test-command no longer runs the pin-lockstep suite: ${cmd}`
   );
   assert.ok(
-    /^\s+test-command:\s*$/m.test(callee),
+    /^\s+test-command:/m.test(callee),
     "node-ci.yml no longer declares a `test-command` workflow_call input — the " +
       "caller's binding would be ignored and the unit-test job skipped"
+  );
+  assert.ok(
+    /^\s{2}unit-test:\s*$/m.test(callee),
+    "node-ci.yml no longer defines the `unit-test` job — the per-PR pin gate cannot run"
+  );
+  // Scope the predicate check to the unit-test JOB block: the step-level
+  // `if: inputs.test-command != ''` also matches this pattern, so an unscoped
+  // match would stay green even with the job-level predicate neutered.
+  const calleeLines = callee.split("\n");
+  const jobIdx = calleeLines.findIndex((l) => /^\s{2}unit-test:\s*$/.test(l));
+  const jobBlock = calleeLines.slice(jobIdx, jobIdx + 20).join("\n");
+  // TWO predicates must consume the input: the JOB's `if:` (does the job run at
+  // all) and the custom-test STEP's `if:` (does the suite actually execute).
+  // Neutering either one leaves a green job with zero pin check — N4/N4c in the
+  // negative-test set. An unscoped match would be satisfied by the step alone.
+  const predicates = [...jobBlock.matchAll(/^\s+if:\s*inputs\.test-command\s*!=\s*''/gm)];
+  assert.ok(
+    predicates.length >= 2,
+    "the `unit-test` job and its custom-test step must BOTH consume " +
+      "`inputs.test-command` in their `if:` — otherwise the job can report green " +
+      `without running the suite (found ${predicates.length} such predicate(s))`
   );
 });
 
