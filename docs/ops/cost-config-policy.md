@@ -88,10 +88,11 @@ data-source-discovery task — no persisted retry records exist to analyze yet.)
 - `qwen-tp`/`qwen3.8-max` (262K) is already under the clamp.
 - `kimi-k3` (1M) is a separate provider, **excluded** by the same
   deepseek-served-only scope. The guard's canonical matcher normalizes ids
-  (strips `provider/` / `~provider/`) and matches only the
-  `deepseek-v4-flash` / `deepseek-v4-pro` family (incl. `-0731`, `-vision-exp`,
-  `-0813`, `-latest`) — kimi-k3 and qwen3.8-max are never flagged (negative
-  controls in the fixture suite).
+  (strips `provider/` / `~provider/`) and matches the canonical
+  `deepseek-flash` (V4.1 Flash) plus the legacy `deepseek-v4-flash` /
+  `deepseek-v4-pro` families — dotted `v4.1-*` ids, `-0731`, `-vision-exp`,
+  `-0813`, `-latest`, `:batch` — so kimi-k3 and qwen3.8-max are never flagged
+  (negative controls in the fixture suite).
 
 ## 5. Store-refresh reality + detector semantics
 

@@ -72,8 +72,9 @@ block() { echo "  ❌ $1"; BLOCKS=$((BLOCKS + 1)); }
 # providers.*.models[]), (2) modelOverrides map keys (the key IS the model id,
 # the value dict holds `contextWindow`). Normalizes each id (strips
 # `provider/` and `~provider/` prefixes) and flags deepseek-served family ids
-# (deepseek-v4-flash/-pro + every variant: -0731, -vision-exp, -0813,
-# -latest) whose effective contextWindow exceeds CLAMP. Emits one
+# (canonical `deepseek-flash` + legacy `deepseek-v4-flash`/`deepseek-v4-pro`
+# and every variant: dotted `v4.1` ids, -0731, -vision-exp, -0813, -latest,
+# :batch) whose effective contextWindow exceeds CLAMP. Emits one
 # `id contextWindow=N` line per violation; PARSE_ERROR line + exit 1 on
 # unparseable input (a file we cannot assert on must never read green).
 deepseek_violations() {
@@ -82,7 +83,7 @@ import json, re, sys
 
 clamp = int(sys.argv[1])
 path = sys.argv[2]
-DS = re.compile(r'^deepseek-v4-(flash|pro)(-|$)')
+DS = re.compile(r'^deepseek-(?:v4(?:\.\d+)?-)?(?:flash|pro)(?:[-:]|$)')
 
 def norm(id_):
     return re.sub(r'^~?[^/]*/', '', id_) if '/' in id_ else id_

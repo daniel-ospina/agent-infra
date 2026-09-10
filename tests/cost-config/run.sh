@@ -4,6 +4,8 @@
 # Exercises scripts/check-cost-config.sh semantics:
 #   1. clean fixture (deepseek ids @300K clamp)    → PASS (exit 0)
 #   2. models.json drift (deepseek id > 300K)      → BLOCK (exit 1)
+#      (positive controls: legacy v4-pro/v4-flash, canonical deepseek-flash,
+#      dotted deepseek-v4.1-flash — V4.1 Flash adoption 2026-09-10)
 #   3. models-store.json drift                     → WARN (exit 0, DETECTED —
 #      catalog class must not fail sync; the weekly report + tripwire alert)
 #      (also: matcher negatives kimi-k3 + deepseek-chat-v3.2 never flagged;
@@ -82,6 +84,8 @@ echo "2. models.json drift (deepseek id at 1M) → BLOCK, exit 1"
 run_guard 1 "backdoor-models" --live-dir "$FIX/backdoor-models"
 if grep -q "BLOCK-level violation" "$OUT"; then pass "BLOCK summary present"; else fail "expected BLOCK summary"; tail -20 "$OUT"; fi
 if grep -q "deepseek-v4-pro contextWindow=1000000" "$OUT"; then pass "deepseek-v4-pro flagged"; else fail "deepseek-v4-pro not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-flash contextWindow=1000000" "$OUT"; then pass "canonical deepseek-flash flagged"; else fail "canonical deepseek-flash not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-v4.1-flash contextWindow=1000000" "$OUT"; then pass "dotted v4.1 family flagged"; else fail "deepseek-v4.1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 
 echo ""
 echo "3. models-store.json drift → WARN, exit 0 (DETECTED, not blocked)"
@@ -119,6 +123,8 @@ echo "8. MINIFIED models.json (1M backdoor) → BLOCK, exit 1 (P1 regression pin
 run_guard 1 "backdoor-minified" --live-dir "$FIX/backdoor-minified"
 if grep -q "BLOCK-level violation" "$OUT"; then pass "BLOCK summary present"; else fail "expected BLOCK summary"; tail -20 "$OUT"; fi
 if grep -q "deepseek-v4-pro contextWindow=1000000" "$OUT"; then pass "minified deepseek-v4-pro flagged"; else fail "minified deepseek-v4-pro not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-flash contextWindow=1000000" "$OUT"; then pass "minified canonical deepseek-flash flagged"; else fail "minified canonical deepseek-flash not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-v4.1-flash contextWindow=1000000" "$OUT"; then pass "minified dotted v4.1 family flagged"; else fail "minified deepseek-v4.1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 
 echo ""
 echo "9. MINIFIED clean models.json (300K clamp) → PASS, exit 0"
