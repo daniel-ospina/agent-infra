@@ -4,7 +4,8 @@
 # Exercises scripts/check-cost-config.sh semantics:
 #   1. clean fixture (deepseek ids @300K clamp)    → PASS (exit 0)
 #   2. models.json drift (deepseek id > 300K)      → BLOCK (exit 1)
-#      (positive controls: legacy v4-pro/v4-flash, canonical deepseek-flash,
+#      (positive controls: the v4-pro family, the legacy v4-flash alias, the
+#      canonical deepseek-flash id + its bare `deepseek-pro` counterpart,
 #      dotted deepseek-v4.1 ids, `:batch` terminators; negative controls:
 #      deepseek-proxy / deepseek-flashlight — V4.1 Flash adoption 2026-09-10)
 #   3. models-store.json drift                     → WARN (exit 0, DETECTED —
@@ -24,14 +25,16 @@
 #  12. compaction.enabled=false                     → BLOCK (exit 1)
 #
 # Fixtures under tests/fixtures/cost-config/ are regenerated from the LIVE
-# store at implementation time; clean + clean-minified mirror the shipped
-# tree byte-for-byte, and each backdoor-* tree re-introduces exactly one
-# defect (backdoor-models/backdoor-minified models.json hold 1M deepseek ids;
-# backdoor-store/models-store.json holds the pre-#476 curated snapshot with
-# the alias + vision-exp rows at 1M; the guard's canonical matcher must catch
-# exactly the deepseek-served family).
-#  13. clean/clean-minified mirror the shipped tree (canonical JSON) → parity
-#      pin so the #630 review's mirror invariant cannot rot silently.
+# store at implementation time; clean + clean-minified hold canonical-JSON
+# copies of the three shipped config files, and each backdoor-* tree
+# re-introduces exactly one defect (backdoor-models/backdoor-minified
+# models.json hold 1M deepseek ids; backdoor-store/models-store.json holds
+# the pre-#476 curated snapshot with the alias + vision-exp rows at 1M; the
+# guard's canonical matcher must catch exactly the deepseek-served family).
+#  13. clean/clean-minified mirror the shipped tree (canonical JSON, all
+#      three config files) and the four backdoor trees whose defect lives
+#      outside models.json keep clean's models.json → parity pin so the #630
+#      review's mirror invariant cannot rot silently.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -92,6 +95,7 @@ if grep -q "deepseek-v4.1-flash contextWindow=1000000" "$OUT"; then pass "dotted
 if grep -q "deepseek-v4.1-flash-expires-on-0910 contextWindow=1000000" "$OUT"; then pass "dotted beta id flagged"; else fail "dotted beta id not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4-pro:batch contextWindow=1000000" "$OUT"; then pass ":batch terminator flagged"; else fail ":batch terminator not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-flash:batch contextWindow=1000000" "$OUT"; then pass "canonical :batch flagged"; else fail "canonical :batch not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-pro contextWindow=1000000" "$OUT"; then pass "bare deepseek-pro flagged"; else fail "bare deepseek-pro not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-proxy" "$OUT"; then fail "negative control deepseek-proxy was flagged"; else pass "deepseek-proxy (non-family) not flagged"; fi
 if grep -q "deepseek-flashlight" "$OUT"; then fail "negative control deepseek-flashlight was flagged"; else pass "deepseek-flashlight (non-family) not flagged"; fi
 
@@ -135,6 +139,7 @@ if grep -q "deepseek-flash contextWindow=1000000" "$OUT"; then pass "minified ca
 if grep -q "deepseek-v4.1-flash contextWindow=1000000" "$OUT"; then pass "minified dotted v4.1 family flagged"; else fail "minified deepseek-v4.1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash-expires-on-0910 contextWindow=1000000" "$OUT"; then pass "minified dotted beta id flagged"; else fail "minified dotted beta id not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-flash:batch contextWindow=1000000" "$OUT"; then pass "minified canonical :batch flagged"; else fail "minified canonical :batch not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-pro contextWindow=1000000" "$OUT"; then pass "minified bare deepseek-pro flagged"; else fail "minified bare deepseek-pro not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-proxy" "$OUT"; then fail "minified negative control deepseek-proxy was flagged"; else pass "minified deepseek-proxy (non-family) not flagged"; fi
 if grep -q "deepseek-flashlight" "$OUT"; then fail "minified negative control deepseek-flashlight was flagged"; else pass "minified deepseek-flashlight (non-family) not flagged"; fi
 
@@ -169,18 +174,31 @@ if grep -q "compaction.enabled expected true" "$OUT"; then pass "compaction.enab
 
 echo ""
 echo "13. clean fixtures mirror the shipped tree (parity pin)"
-python3 - "$ROOT/pi-bootstrap/pi-config/models.json" "$FIX/clean/models.json" "$ROOT/pi-bootstrap/pi-config/settings.json" "$FIX/clean/settings.json" <<'PY'
-import json, sys
-a, b, c, d = (json.load(open(p)) for p in sys.argv[1:5])
-sys.exit(0 if a == b and c == d else 1)
+python3 - "$ROOT/pi-bootstrap/pi-config" "$FIX/clean" <<'PY'
+import json, sys, os
+shipped, clean = sys.argv[1:3]
+for f in ("models.json", "settings.json", "models-store.json"):
+    if json.load(open(os.path.join(shipped, f))) != json.load(open(os.path.join(clean, f))):
+        sys.exit(1)
+sys.exit(0)
 PY
-if [ $? -eq 0 ]; then pass "clean models.json + settings.json mirror shipped"; else fail "clean fixtures diverge from shipped — regenerate them"; fi
-python3 - "$FIX/clean/models.json" "$FIX/clean-minified/models.json" "$FIX/clean/settings.json" "$FIX/clean-minified/settings.json" <<'PY'
-import json, sys
-a, b, c, d = (json.load(open(p)) for p in sys.argv[1:5])
-sys.exit(0 if a == b and c == d else 1)
+if [ $? -eq 0 ]; then pass "clean mirrors shipped (models.json + settings.json + models-store.json)"; else fail "clean fixtures diverge from shipped — regenerate them"; fi
+python3 - "$FIX/clean" "$FIX/clean-minified" <<'PY'
+import json, sys, os
+clean, mini = sys.argv[1:3]
+for f in ("models.json", "settings.json", "models-store.json"):
+    if json.load(open(os.path.join(clean, f))) != json.load(open(os.path.join(mini, f))):
+        sys.exit(1)
+sys.exit(0)
 PY
 if [ $? -eq 0 ]; then pass "clean-minified mirrors clean (canonical JSON)"; else fail "clean-minified diverges from clean"; fi
+for d in backdoor-settings backdoor-retry backdoor-compaction-disabled backdoor-store; do
+  python3 - "$FIX/clean/models.json" "$FIX/$d/models.json" <<'PY'
+import json, sys
+sys.exit(0 if json.load(open(sys.argv[1])) == json.load(open(sys.argv[2])) else 1)
+PY
+  if [ $? -eq 0 ]; then pass "$d models.json untouched (its defect lives elsewhere)"; else fail "$d models.json drifted from clean — its one injected defect must live in settings.json/models-store.json"; fi
+done
 
 echo ""
 if [ "$failures" -eq 0 ]; then
