@@ -997,9 +997,16 @@ dexpect("restore-from-branch verdict stays block:checkout-branch", `git checkout
   // #626 review round-2 (P1): attached/cluster/long create spellings must NOT
   // slip the #376 return-to-original arm (they previously classified
   // switch-existing with target "main" → reBaseline while git created a branch).
-  for (const cmd of [`git checkout -bfoo main`, `git checkout -Bfoo main`, `git switch -cfoo main`, `git switch -Cfoo main`, `git switch --create=foo main`, `git switch --force-create=foo main`, `git checkout -fb foo main`, `git switch --cre=foo main`, `git switch --crea foo main`, `git switch --force-c=foo main`, `git switch --force-creat main`, `git checkout --orph=v`, `git checkout --orp v`]) {
+  for (const cmd of [`git checkout -bfoo main`, `git checkout -Bfoo main`, `git switch -cfoo main`, `git switch -Cfoo main`, `git switch --create=foo main`, `git switch --force-create=foo main`, `git checkout -fb foo main`, `git switch --cre=foo main`, `git switch --crea foo main`, `git switch --force-c=foo main`, `git switch --force-creat main`, `git checkout --orph=v`, `git checkout --orp v`, `git switch -c ev1 --`, `git checkout -B ev2 --`, `git switch --orphan ev3 --`, `git checkout -b ev5 --`]) {
     const d = m3(cmd);
     expectBool(`#626: ${cmd} → BLOCKED (no #376 reBaseline)`, d?.block === true && !d?.reBaseline, true);
+  }
+  // #626 review-round-4 (P2): pin classify-git's OWN duplicated create parser —
+  // `newBranch` must match branch-ownership's for every spelling (a one-sided edit
+  // would silently change the ownership-allowance target fallback).
+  for (const [cmd, want] of [[`git switch --cre=foo main`, "foo"], [`git switch -cfoo main`, "foo"], [`git checkout --orph=v`, "v"], [`git switch -c ev1 --`, "ev1"], [`git checkout --f main`, null], [`git checkout --c=merge main`, null], [`git checkout --conflict=merge main`, null], [`git checkout main .`, null]]) {
+    const det = classifyGitCommandDetailed(cmd);
+    expectBool(`#626: newBranch ${cmd} → ${JSON.stringify(want)}`, (det?.newBranch ?? null) === want, true);
   }
   const nonInfra = sharedDecideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline: ceremonyBaseline, currentBranch: "feat/2", repoKey: "k" });
   expectBool("#376: non-infra repo return-to-original STILL blocked", nonInfra?.block === true, true);

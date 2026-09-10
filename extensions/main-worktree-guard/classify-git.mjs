@@ -3450,8 +3450,10 @@ function _recoveryCheckoutBlockReason(inv, branch) {
     `   A silently-failed checkout strands the repo on the CURRENT branch while the agent`,
     `   believes it is on "${branch}" — a subsequent destructive op would move the WRONG`,
     `   branch (#397).`,
-    `   → Reconcile branch state first: \`git checkout -b ${branch} origin/${branch}\``,
-    `     (or \`git fetch\`) then retry.`,
+    `   → Reconcile branch state first: \`git fetch\` (an M4-sanctioned recovery verb),`,
+    `     then create the branch in an ISOLATED WORKTREE —`,
+    `     \`git worktree add -b ${branch} <path> origin/${branch}\` (in-hub`,
+    `     \`checkout -b\` is BLOCKED, #626) — and retry from there.`,
   ].join("\n");
 }
 

@@ -59,7 +59,7 @@ Before deciding what gates to run, classify the change:
 |------|-----------|
 | Low | Plain branch inside a worktree; in a hub, create the worktree first (#626). |
 | Medium | Worktree recommended if 3+ files or shared infrastructure. Plain branch OK for single-file. |
-| High | Worktree required. Stash uncommitted changes first. |
+| High | Worktree required. Hub dirty → `bash scripts/checkout-hygiene/hub-worktree.sh salvage <branch>` (in-hub `git stash push` is M4-blocked); inside a worktree, stash your own changes. |
 
 **Never** start on main/master regardless of risk.
 

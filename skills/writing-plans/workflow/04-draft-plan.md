@@ -149,13 +149,13 @@ No worktree, no TDD steps, no plan file saved.
 
 ### Standard Tier
 
-Create a condensed plan file at `docs/plans/YYYY-MM-DD-<feature-name>.md`. No worktree required. Steps are descriptive — TDD not mandatory (but preferred for behavioral changes).
+Create a condensed plan file at `docs/plans/YYYY-MM-DD-<feature-name>.md` **inside the issue's worktree**. In a hub, create the worktree first (`bash scripts/checkout-hygiene/hub-worktree.sh <branch>` for agent-infra; `using-git-worktrees` otherwise) — a hub-rooted session's write of ANY file into its own main checkout is BLOCKED (#626). Steps are descriptive — TDD not mandatory (but preferred for behavioral changes).
 
 ### Complex Tier
 
 Full TDD plan doc with worktree isolation, bite-sized task steps, and complete test commands.
 
-**Worktree (Complex tier only):** Create a dedicated worktree at the start before drafting:
+**Worktree (all tiers):** the branch + worktree are created at issue start by `issue-workflow`'s Branch Gate — draft the plan INSIDE that worktree. Do NOT create a nested worktree from inside one, and never draft the plan in a hub main checkout (writes block, #626). If you are in a hub, create the worktree first:
 ```bash
 git worktree add -b feature/<ISSUE_NUMBER>-<slug> ../<repo>-wt-<ISSUE_NUMBER>
 cd ../<repo>-wt-<ISSUE_NUMBER>

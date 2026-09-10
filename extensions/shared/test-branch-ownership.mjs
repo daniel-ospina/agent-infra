@@ -302,6 +302,17 @@ ok("branchOp #626: checkout --f main → not create (git: --force, rc 0)", op("c
 ok("branchOp #626: checkout --forc main → not create (git: --force, rc 0)", op("checkout", ["--forc", "main"]) !== "create-new" && op("checkout", ["--forc", "main"]) !== "force-create");
 ok("branchOp #626: checkout --c=merge main → not create (git: --conflict, rc 0)", op("checkout", ["--c=merge", "main"]) !== "create-new" && op("checkout", ["--c=merge", "main"]) !== "force-create");
 ok("branchOp #626: checkout --orph / --orp still orphan (both verbs have --orphan)", op("checkout", ["--orph", "v"]) === "orphan" && op("switch", ["--orp", "v"]) === "orphan");
+// #626 review-round-4 (P1): a trailing `--` does NOT neutralize a create option
+// that PRECEDES it — `git switch -c foo --` / `git checkout -B foo --` create and
+// flip (probe-verified git 2.50.1). The create scan must run BEFORE the `--`
+// path-restore early-return, while `--` BEFORE any create option stays a
+// path-restore (op "other").
+ok("branchOp #626: switch -c ev1 -- → create-new (trailing -- does not neutralize)", (() => { const r = classifyBranchOp("switch", ["-c", "ev1", "--"]); return r.op === "create-new" && r.branch === "ev1"; })());
+ok("branchOp #626: checkout -B ev2 -- → force-create", (() => { const r = classifyBranchOp("checkout", ["-B", "ev2", "--"]); return r.op === "force-create" && r.branch === "ev2"; })());
+ok("branchOp #626: switch --orphan ev3 -- → orphan", (() => { const r = classifyBranchOp("switch", ["--orphan", "ev3", "--"]); return r.op === "orphan" && r.branch === "ev3"; })());
+ok("branchOp #626: checkout -b ev5 -- → create-new", (() => { const r = classifyBranchOp("checkout", ["-b", "ev5", "--"]); return r.op === "create-new" && r.branch === "ev5"; })());
+ok("branchOp #626: checkout -- -b q → other (leading -- is a pathspec)", op("checkout", ["--", "-b", "q"]) === "other");
+ok("branchOp #626: checkout main -- f.txt → other (path-restore)", op("checkout", ["main", "--", "f.txt"]) === "other");
 ok("branchOp: checkout -f", op("checkout", ["-f", "main"]) === "force");
 ok("branchOp: checkout --force → force", op("checkout", ["--force", "main"]) === "force");
 ok("branchOp: switch --discard-changes → force (never the #376 return)", op("switch", ["--discard-changes", "main"]) === "force");

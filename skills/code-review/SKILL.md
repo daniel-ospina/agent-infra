@@ -861,7 +861,9 @@ For each cycle:
 
 1. **Dispatch fixer sub-agent** via Pi `task` (fresh `pi -p` session):
    ```
-   Fix these code-review issues in the current branch. Do NOT create a worktree.
+   Fix these code-review issues in the current branch. Do NOT create a worktree —
+   your working directory IS the controller-provided worktree for the PR branch (#626);
+   never run `git checkout` to change branches inside a hub main checkout.
    
    Issues to fix:
    <surviving issues JSON>
@@ -870,7 +872,7 @@ For each cycle:
    PR branch: <branch name>
    
    1. RESEARCH FIRST: For each issue involving external APIs, library behavior, or unfamiliar patterns → run web_search to verify the correct approach before fixing. Skip only for purely internal issues. No query cap — mistakes cost more than queries.
-   2. Checkout the PR branch if not already on it
+   2. Confirm the PR branch is checked out in your worktree — if not, STOP and report; do NOT `git checkout <branch>` in a hub (#626)
    3. For each issue, make the minimal fix (using research findings)
    4. Commit with message: fix(code-review): automated fixer cycle N — PR #<N>
    5. Push

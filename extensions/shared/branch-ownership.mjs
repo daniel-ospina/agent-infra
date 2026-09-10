@@ -649,19 +649,26 @@ function _branchPositionals(args) {
 export function classifyBranchOp(subcmd, args) {
   const a = args || [];
   if (subcmd === "checkout" || subcmd === "switch") {
-    if (a.includes("--")) return { op: "other" };          // path-restore form
     const flag = (f) => a.includes(f);
     // #626 security fold-in: recognize git's FULL create/force-create/orphan
     // spelling surface — NOT just the exact space-separated shorts. git accepts
     // the value ATTACHED to a short cluster (`checkout -bfoo` / `-fb foo` /
-    // `switch -cfoo` / `-Cfoo`) and the long forms `--create[=v]` /
-    // `--force-create[=v]` / `--orphan[=v]`. Without this they fell through to
-    // switch-existing: `git checkout -bfoo main` misclassified as a switch to
-    // `main`, and when that equals baseline.original the #376 return-to-original
-    // arm re-baselined (allow) while git actually CREATED a branch and flipped
-    // the shared hub — re-opening the #99 hole #626 removed.
+    // `switch -cfoo` / `-Cfoo`), the long forms `--create[=v]` /
+    // `--force-create[=v]` / `--orphan[=v]` and their verb-appropriate
+    // unambiguous prefixes. Without this they fell through to switch-existing:
+    // `git checkout -bfoo main` misclassified as a switch to `main`, and when
+    // that equals baseline.original the #376 return-to-original arm re-baselined
+    // (allow) while git actually CREATED a branch and flipped the shared hub.
+    //
+    // ORDER MATTERS: the create scan runs BEFORE the `--` path-restore
+    // early-return. `git switch -c foo --` and `git checkout -B foo --` DO
+    // create and flip (probe-verified); `--` only neutralizes options that
+    // FOLLOW it. The helper returns null when it meets `--` before any create
+    // option, so `git checkout -- -b q` and `git checkout main -- f.txt` stay
+    // op "other" (path-restore).
     const opt = _checkoutCreateOpt(subcmd, a);
     if (opt) return { op: opt.kind, branch: opt.branch };
+    if (a.includes("--")) return { op: "other" };          // path-restore form
     if (flag("-f") || flag("--force") || flag("--discard-changes")) return { op: "force" }; // --discard-changes is git's force-switch alias (throws away local modifications — second-model gate fold-in)
     if (flag("--detach")) return { op: "detach" };
     if (a.includes("-")) return { op: "switch-existing", target: "-" }; // prev branch
@@ -979,7 +986,9 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     // IN the agent-infra main checkout — implementers work in worktrees, where
     // branch-state mutations are worktree-effective and never reach this gate
     // (index.ts exempts isWorktree repos BEFORE decideM3), and `git worktree
-    // add -b` is not a branchState op at all. The former #99 rationale (in-main
+    // add -b` is not a branchState op at all (it creates a NEW ref without
+    // touching the hub HEAD; the `-B` sibling force-resets an EXISTING ref and
+    // is a residual, tracked separately). The former #99 rationale (in-main
     // ceremonies) is gone with the exemption; the carve-out was the exact hole
     // that let a stale-skill session flip the shared tree off-main. Worktree/
     // own-baseline ceremonies need NO in-hub create-new: worktree creation is
