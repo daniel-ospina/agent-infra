@@ -9,6 +9,8 @@ aboutSubjects: organisation-design-team
 aboutObjects: agent-infra, issue-631, issue-634, issue-701, issue-702, issue-703, issue-704, pi-config, cost-config-policy
 ---
 
+<!-- research-path: docs/research/2026-09-09-rate-card-governance.md -->
+
 # Plan — #631: Rate-card governance, model-id lifecycle, and dated price resolution
 
 **Issue:** daniel-ospina/agent-infra#631 (Level: project, escalated from task 2026-09-09)
@@ -46,7 +48,19 @@ aboutObjects: agent-infra, issue-631, issue-634, issue-701, issue-702, issue-703
 | **coherence** | 1 (second model) | **COHERENT WITH RESERVATIONS**: the re-pricer was the single most expensive workstream for a number with **no decision consumer** (the same admission §2 makes about the runtime scalar, never extended to WS3); structural templates were a **second hand-authored source**; and two live holes — the **farm copy was unguarded** (guard inverted: the surfaces pi stamps from are protected, the measurement's own input is not) and the **pre-registered 09-14 row had no trigger** ("ad-hoc, no owner" vs dated correctness) | v6 |
 | **wiring** | 1 (Phase 6) | **3 P1s**: the 09-14 pre-registered row was still unapplyable (excluded from *both* render keys) → fixed by a period-keyed **`renderNow()`**; **nothing invoked `render.py` in write mode** → the `sync.sh` write step; the extension test matched **no** CI workflow → explicit wiring. Plus 2 surfaces (`qwen-tp`, `venice` full `models[]` rows) had **no render target** → a 4th surface; and v6's template removal was **not propagated** (5 stale references) — the same class as cycle 2 | v6.1 |
 
-**⚠️ Capped at 4 cycles** on solution-verify; the wiring check ran afterward as a distinct gate. Residual, deliberately accepted: the *exact* per-day attribution of the mixed record
+**⚠️ Capped at 4 cycles — 3 issues remain (unverified).** On cap the AGENTS.md procedure applies: "document
+remaining issues … proceed". The coherence check and the wiring check were therefore run **post-cap**, i.e. the
+Phase 5.6 precondition ("after solution-verify converges clean") was **knowingly not met** — recorded here
+rather than glossed. Cycle 4's fixes were applied but **never re-reviewed**, so under the cap procedure they are
+**unverified** and are listed for human sign-off before execution:
+
+1. **The `render(ts)` / `renderNow()` split** (§2, §3.1) — introduces a second render key; correct-looking, but
+   no fresh reviewer has examined it.
+2. **The 4th rendered surface** (`providers.<p>.models[]` for `qwen-tp`/`venice`) — added in the same cycle.
+3. **The v6 scope cuts** (window-level Δ; diff-only structural guard; fixture as id-set) — from the coherence
+   check, never machine-verified against the plan text.
+
+Residual, deliberately accepted: the *exact* per-day attribution of the mixed record
 stream, and whether a hop-leg-stamped record is a render-divergence or a hop-leg effect, are **WS3.1
 implementation questions** — they depend on session metadata this plan deliberately does not pre-commit. The
 plan's position is that this is **measured, not solved** (§2, §8).
@@ -356,7 +370,11 @@ that directory from **explicit basename allowlists**. So:
 - Reader precedence, defined concretely (not "when resolvable"): **`$RATE_LEDGER`** if set →
   **`$AGENT_INFRA_PATH/scripts/rates/deepseek.jsonl`** if that env var is set and the path exists →
   **script-relative farm copy** (`~/.pi/agent/scripts/rates/`). Under launchd neither env var is set, so the
-  farm is the operational path — which is exactly why the farm exists. Missing ledger at every step = **loud
+  farm is the operational path — which is exactly why the farm exists. **Implementation must quote the
+  expansion, require an absolute path to a regular file before use, and echo a rejected value into the
+  loud-failure output** — an unquoted `$RATE_LEDGER` would word-split or glob, silently falling through to a
+  different ledger and degrading the very guard this plan adds (security review, PR #706). An invalid value
+  falls through to the next precedence step. Missing ledger at every step = **loud
   failure** (the report prints the attempted paths and prices as `unknown`); it never falls back to a literal.
 - **The report prints the resolved ledger path, a `sha256` prefix, and the `asOf` age** as a single line, owned
   by **WS2.1** (not WS3.3) so it ships in Slice 0. The hash matters: render-equality BLOCKs **repo files**, so
@@ -599,7 +617,47 @@ thresholds.
     specific card** (id, observed triple, first/last seen, $), never a percentage tripwire and never a single
     date range. (2026-08-17 is the vendor's `effectiveFrom`, not the start of the corruption.)
 
-## 12. First shippable slice (if the project is cut short)
+## 12. Wiring check (issue-scoping Phase 6)
+
+Every touch point the plan creates or consumes, with its owner. **⚠️** marks a touch point with no mitigation.
+
+| Touch point | Type | Covered by | Status |
+|---|---|---|---|
+| `pi-bootstrap/pi-config/models.json` — `providers.deepseek.models[]` | render target | #701 (WS1.2, surface 1) | ✅ |
+| `pi-bootstrap/pi-config/models.json` — `providers.<p>.modelOverrides{id}` | render target | #701 (WS1.2, surface 2) | ✅ |
+| `pi-bootstrap/pi-config/models.json` — `providers.<p>.models[]` (non-deepseek) | render target | #701 (WS1.2, surface 4) | ✅ |
+| `extensions/custom-provider-openrouter/index.ts` | render target | #701 (WS1.2, surface 3) | ✅ |
+| `pi-bootstrap/pi-config/settings.json` — `defaultModel` | consumer | #701 (WS1.3, via `merge_settings` source-wins) | ✅ |
+| `pi-bootstrap/pi-config/models-store.json` | delete | #701 (WS1.4) | ✅ |
+| `.husky/pre-commit` | guard | #702 (WS2.1) | ✅ |
+| `.github/workflows/ci.yml` + `ci-main.yml` — `rates` job | guard | #702 (WS2.1) | ✅ |
+| `ci-main.yml` — `auto-file-on-failure.needs` | guard input | #702 (WS2.1) | ✅ |
+| `sync.sh` — write-mode render + committed-before-sync guard | producer | #702 (WS2.1) | ✅ |
+| `pi-bootstrap/setup.sh` — `rates` farm + fixture farm | runtime path | #702 (WS2.1) | ✅ |
+| `pi-bootstrap/tests/test-setup-no-nesting.sh` — farm parity | guard | #702 (WS2.1) | ✅ |
+| `tests/fixtures/rates/in-use-ids.json` | artifact | #701 (generator) | ✅ |
+| `tests/rates/run.sh` | guard | #702 (WS2.3) | ✅ |
+| `scripts/fleet-cost-report.sh` — ledger path/hash/`asOf` header line | consumer | #702 (WS2.1) | ✅ |
+| `scripts/fleet-cost-report.sh` — Δ sections, threshold byte-identity | consumer | #703 (WS3.3) | ✅ |
+| `scripts/session-postmortem.sh` — fallback literal → ledger read | consumer | #701 (WS3.4, moved there) | ✅ |
+| `docs/ops/rate-card-policy.md` + its registration | docs | #704 (WS5.1) | ✅ |
+| issue #634 — `peakWindows[]`/`peakMultiplier` contract | cross-issue contract | #704 (WS5.3) | ✅ |
+| launchd weekly report path — farm staleness | runtime | — | ⚠️ **unmitigated** (tracked in #707) |
+
+## 13. Rejected alternatives
+
+| Alternative | Why rejected |
+|---|---|
+| **Approach B alone** — re-price only in the report, drop the runtime render | Leaves the hand-edited price copies unowned and lets pi keep stamping stale cost into every non-report consumer. Decisive: **E1** — a `models[]` row without `cost` prices at **$0**, so the card must be owned regardless. |
+| **Approach A alone** — render only, no vendor view | `ModelCost` has no time dimension, so no render-only scheme can be correct; render-equality proves only *consistency*, never truth. |
+| **Approach C** — disclaim first-party price, consume the upstream store | Falsified four times: E1 (`$0`), E5 (store is **peak** → 2× over-report off-peak), E4 (shipped snapshot inert), and coverage (the store lists neither the 102k-call id nor the fleet default). |
+| **Per-request re-pricing** (full `calculateCost` clone, `tierKey` row key) | Cut at v6: machinery for a case that does not occur (no dispatched model has `tiers`), carrying a silent-divergence risk, for a number with **no decision consumer**. Replaced by a window-level Δ. |
+| **Committed structural templates** per model row | Cut at v6: a second hand-authored source to keep in sync with `modelFromJson`, for a risk that read-modify-write largely removes. Replaced by a diff-only assertion. |
+| **A CI gate on `expiresOn`** | Locked decision — a date-triggered red would freeze every PR on 2026-09-14. Expiry is a **report fact**. |
+| **A recurring ledger re-check + named owner** | Locked decision — solo operator; cost is retroactively recomputable, so a schedule buys nothing. Updates are ad hoc. |
+| **Consuming the upstream store as the price oracle** | Removed with WS4 (Revision 2). The store is a **manual** sensor only; it can rename/drop ids at any 4h tick. |
+
+## 14. First shippable slice (if the project is cut short)
 
 **Slice 0 — Corrected Card + Ledger v1 + Id Migration.** WS1.1–1.5 + WS2.1/2.2 + WS2.3 smoke + **WS3.4** +
 WS5.1 + WS5.3.
