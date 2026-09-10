@@ -48,17 +48,20 @@ aboutObjects: agent-infra, issue-631, issue-634, issue-701, issue-702, issue-703
 | **coherence** | 1 (second model) | **COHERENT WITH RESERVATIONS**: the re-pricer was the single most expensive workstream for a number with **no decision consumer** (the same admission §2 makes about the runtime scalar, never extended to WS3); structural templates were a **second hand-authored source**; and two live holes — the **farm copy was unguarded** (guard inverted: the surfaces pi stamps from are protected, the measurement's own input is not) and the **pre-registered 09-14 row had no trigger** ("ad-hoc, no owner" vs dated correctness) | v6 |
 | **wiring** | 1 (Phase 6) | **3 P1s**: the 09-14 pre-registered row was still unapplyable (excluded from *both* render keys) → fixed by a period-keyed **`renderNow()`**; **nothing invoked `render.py` in write mode** → the `sync.sh` write step; the extension test matched **no** CI workflow → explicit wiring. Plus 2 surfaces (`qwen-tp`, `venice` full `models[]` rows) had **no render target** → a 4th surface; and v6's template removal was **not propagated** (5 stale references) — the same class as cycle 2 | v6.1 |
 
-**⚠️ Capped at 4 cycles — 3 issues remain (unverified).** On cap the AGENTS.md procedure applies: "document
-remaining issues … proceed". The coherence check and the wiring check were therefore run **post-cap**, i.e. the
-Phase 5.6 precondition ("after solution-verify converges clean") was **knowingly not met** — recorded here
-rather than glossed. Cycle 4's fixes were applied but **never re-reviewed**, so under the cap procedure they are
-**unverified** and are listed for human sign-off before execution:
+**⚠️ Capped at 4 cycles — 3 representative items remain (unverified).** On cap the AGENTS.md procedure applies:
+"document remaining issues … proceed". The coherence check and the wiring check were therefore run **post-cap**,
+i.e. the Phase 5.6 precondition ("after solution-verify converges clean") was **knowingly not met** — recorded
+here rather than glossed. Everything applied **after** the cap (the coherence-check v6 cuts *and* the wiring-check
+v6.1 fixes) was never re-reviewed, so it is **unverified**. Cycle 4's own fixes were likewise applied without a
+re-review. The convergence log above carries the full list; the three highest-consequence items are:
 
-1. **The `render(ts)` / `renderNow()` split** (§2, §3.1) — introduces a second render key; correct-looking, but
-   no fresh reviewer has examined it.
-2. **The 4th rendered surface** (`providers.<p>.models[]` for `qwen-tp`/`venice`) — added in the same cycle.
-3. **The v6 scope cuts** (window-level Δ; diff-only structural guard; fixture as id-set) — from the coherence
-   check, never machine-verified against the plan text.
+1. **The `render(ts)` / `renderNow()` split** (§2, §3.1) — introduces a second render key (wiring-check fix).
+2. **The 4th rendered surface** (`providers.<p>.models[]` for `qwen-tp`/`venice`) (wiring-check fix).
+3. **The v6 scope cuts** (window-level Δ; diff-only structural guard; fixture as id-set) (coherence-check fix).
+
+Not re-reviewed and not enumerated above: the wiring-check changes to `sync.sh` write-mode, the CI wiring, and
+the cycle-4 fixes (concurrent-card premise, AC1 narrowing, the `v4-pro` hop leg, the tombstone contradiction,
+the seed set, `surface` enum drift).
 
 Residual, deliberately accepted: the *exact* per-day attribution of the mixed record
 stream, and whether a hop-leg-stamped record is a render-divergence or a hop-leg effect, are **WS3.1
@@ -79,7 +82,7 @@ plan's position is that this is **measured, not solved** (§2, §8).
 | E6 | `ModelCost.tiers[]` is keyed on `inputTokensAbove`; **no time or date dimension**. `calculateCost` bills `input`, `output`, `cacheRead`, `cacheWrite` (plus an Anthropic-only `cacheWrite1h` 2× term) and does **not** bill `reasoning` separately | `pi-ai/dist/types.d.ts:705–714`, `pi-ai/dist/models.js:530–548`; arithmetic reproduced on a live record | The runtime schema cannot express peak/off-peak or a dated re-route. It also **pins the re-pricer's formula** |
 | E7 | `modelFromJson` builds a **fresh** object from the definition, defaulting `contextWindow ?? 128000`, `maxTokens ?? 16384`, `reasoning ?? false`, `input ?? ["text"]`, and taking `compat` only from the definition/provider (it does not inherit the replaced row) | `provider-composer.js:60–77` | An own row rendered from `cost` alone silently downgrades the model — **and passes `check-cost-config.sh`** (which blocks only `>300000`) |
 
-**Measured in-use traffic (corpus, all-time):**
+**Measured in-use traffic (session-JSONL corpus, all-time, measured 2026-09-10; counts grouped by `provider` + `model`):**
 
 | provider | model | calls | note |
 |---|---|---|---|
@@ -640,7 +643,9 @@ Every touch point the plan creates or consumes, with its owner. **⚠️** marks
 | `scripts/fleet-cost-report.sh` — ledger path/hash/`asOf` header line | consumer | #702 (WS2.1) | ✅ |
 | `scripts/fleet-cost-report.sh` — Δ sections, threshold byte-identity | consumer | #703 (WS3.3) | ✅ |
 | `scripts/session-postmortem.sh` — fallback literal → ledger read | consumer | #701 (WS3.4, moved there) | ✅ |
-| `docs/ops/rate-card-policy.md` + its registration | docs | #704 (WS5.1) | ✅ |
+| `docs/ops/rate-card-policy.md` + its registration (`docs/ops/cost-config-policy.md` cross-link + `AGENTS.md` routing line) | docs | #704 (WS5.1) | ✅ |
+| `scripts/check-cost-config.sh` — matcher extended to the post-migration ids | guard | #701 (WS1.3, load-bearing for AC12) | ✅ |
+| shared session parser (#373 one-parser contract) — `--usage-rows` | contract | #703 (WS3.1/WS3.2) | ✅ |
 | issue #634 — `peakWindows[]`/`peakMultiplier` contract | cross-issue contract | #704 (WS5.3) | ✅ |
 | launchd weekly report path — farm staleness | runtime | — | ⚠️ **unmitigated** (tracked in #707) |
 
