@@ -436,6 +436,11 @@ try {
   bashPin("#625: wt session rsync onto tracked hub file → BLOCK", `rsync -a ${wt}/src-625.md ${hub}/AGENTS.md`, wt, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN ln -sf over tracked hub file → BLOCK", `ln -sf /tmp/x ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN in-place verb on WORKTREE file → ALLOW", `sed -i s/a/b/ ${wt}/wt-own.txt`, hub, "ALLOW (no hub-main write)");
+  // #625 cycle-10: getopt_long abbreviation (fail-open) + single-operand no-op.
+  bashPin("#625: hub-rooted CLEAN sed --in-pl (abbreviated --in-place) → BLOCK", `sed --in-pl s/a/b/ ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN gawk --incl inplace (abbreviated) → BLOCK", `gawk --incl inplace '{print}' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN single-operand cp on tracked file → ALLOW (malformed no-op)", `cp ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)");
+  bashPin("#625: hub-rooted CLEAN single-operand mv on tracked file → ALLOW (malformed no-op)", `mv ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)");
   bashPin("bash#621: hub-rooted session → own worktree file → ALLOW", `cd ${wt} && echo x > wt-own.txt`, hub, "ALLOW (no hub-main write)");
   // cycle-2 marker-parity pins (bashGateDecision markerOn param — the matrix
   // the index classify marker branch implements; the real marker file itself
@@ -657,6 +662,13 @@ expectBool("#625 source pin: empty quoted operand advances via w.k (BSD sed -i '
 expectBool("#625 source pin: sed/perl in-place flag parsed letter-by-letter", classifySrc.includes("if (ch === \"i\") { inPlace = true; ci = cluster.length; continue; }"), true);
 expectBool("#625 source pin: gsed/awk attached-inplace/sort/sponge/ed/ex in the verb set", classifySrc.includes("\"gsed\", \"perl\"") && classifySrc.includes("-iinplace") && classifySrc.includes("\"sort\", \"sponge\", \"ed\", \"ex\", \"vi\", \"vim\", \"nvi\""), true);
 expectBool("#625 source pin: block reason names verb coverage", pinSrc.includes("in-place overwrite verbs"), true);
+// #625 cycle-10 mirror-drift tripwire: an exact-spelling-only long-option match is
+// a fail-open bypass (getopt_long accepts any unambiguous prefix).
+expectBool("#625 source pin: getopt_long unambiguous-prefix resolver present", classifySrc.includes("const _resolveLong = (tbl, name) => {") && classifySrc.includes("return hits.length === 1 ? hits[0] : null;"), true);
+expectBool("#625 source pin: sed + gawk long-option arity tables declared", classifySrc.includes("const SED_LONG = {") && classifySrc.includes("const AWK_LONG = {"), true);
+expectBool("#625 source pin: sed in-place resolved via the prefix table (BSD -i '' guard too)", classifySrc.includes('resolved === "in-place"') && classifySrc.includes("_isSedInPlaceLong(words[wi - 1])"), true);
+expectBool("#625 source pin: gawk --include resolved via the prefix table", classifySrc.includes('if (resolved === "include") {'), true);
+expectBool("#625 source pin: cp/mv/install destination requires a source operand", classifySrc.includes("positionals.length > 1") && classifySrc.includes("if (positionals.length > 0) emitDst(targetDir, positionals, alsoSources);"), true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
 function expectBranches(command, expectedArray) {
@@ -4393,6 +4405,36 @@ try {
     lacks("printf y | tee safe$'\\n'tracked.md", "tee:H/tracked.md", "decoded whitespace cannot inject a token");
     has("echo x > tracked\\\n.md", "redirect:H/tracked.md", "backslash-newline is a line continuation");
     has("printf y | tee tracked\\\n.md", "tee:H/tracked.md", "tee line continuation is not truncated");
+    // #625 review cycle-10: getopt_long ABBREVIATIONS (fail-open) + single-operand no-ops.
+    // GNU sed/gawk accept any UNAMBIGUOUS long-option prefix, so matching exact
+    // spellings alone let `sed --in-pl …` / `gawk --incl inplace …` resolve to ZERO
+    // targets and the gate ALLOW a real in-place edit of a tracked hub file.
+    has("sed --in-pl s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-pl is an unambiguous --in-place prefix");
+    has("sed --in-pl=.bak s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-pl=.bak prefix with an attached suffix");
+    has("sed --in-place=.bak s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-place=.bak exact long spelling");
+    has("sed --expr s/a/b/ tracked.md -i", "sed:H/tracked.md", "sed --expr resolves to --expression");
+    has("sed --file script.sed -i tracked.md", "sed:H/tracked.md", "sed --file consumes its operand and keeps -i");
+    has("gawk --incl inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --incl is an unambiguous --include prefix");
+    has("gawk --inc=inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --inc= prefix with the inplace operand attached");
+    has("gawk --include=inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --include=inplace exact spelling");
+    has("sed -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed -i still gates after the prefix change");
+    has("sed --separate -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed --separate (arity 0) does not swallow -i");
+    lacks("sed --in-pl s/a/b/ subdir", "sed:H/tracked.md", "sed --in-pl on a non-tracked operand stays inert");
+    has("sed --in-pl s/a/b/ subdir", "sed:H/subdir", "sed --in-pl surfaces its (non-tracked) operand, not a false negative");
+    // Ambiguous prefixes are NOT options (getopt_long rejects them — the command
+    // fails, so nothing is written); resolving them would invent a target.
+    none("sed --s a/b/ tracked.md", "ambiguous sed --s prefix is not resolved to an option");
+    none("gawk --f prog.awk tracked.md", "ambiguous gawk --f prefix is not resolved");
+    // A destination requires at least ONE source: a single-operand
+    // `cp f`/`mv f`/`install f` is a malformed no-op ("missing destination file
+    // operand") that writes NOTHING — surfacing its lone operand as a
+    // destination was a pure false block. Also covers the empty `-t` form.
+    none("cp tracked.md", "single-operand cp writes nothing");
+    none("mv tracked.md", "single-operand mv writes nothing");
+    none("install tracked.md", "single-operand install writes nothing");
+    none("cp -t subdir", "cp -t with no source operand writes nothing");
+    none("mv -t subdir", "mv -t with no source operand writes nothing");
+    has("cp -t subdir src.md", "cp:H/subdir/src.md", "cp -t with a source still surfaces the destination");
     // truncate / dd
     has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
     has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");

@@ -351,7 +351,12 @@ dirty, and trips M4's freeze. Surfaces:
    any UNAMBIGUOUS prefix, `--out=FILE` included), `sponge`,
    `ed`/`ex`/`vi`/`vim`/`nvi` (every file operand); a bundled `-t` (`cp -ft
    dir`, `install -Dt`); rsync operand options match unambiguous prefixes;
-   and `sort -ro`/`-uo`). An fd-prefixed OUTPUT redirect for ANY fd
+   and `sort -ro`/`-uo`). Long options are matched exactly OR by an
+   UNAMBIGUOUS getopt_long abbreviation (`sed --in-pl` ≡ `--in-place`,
+   `gawk --incl inplace` ≡ `--include inplace`), so an abbreviated in-place
+   flag cannot slip the gate; and `cp`/`mv`/`install` require at least one
+   SOURCE before a destination is surfaced (a single-operand `cp f` is a
+   malformed no-op that writes nothing). An fd-prefixed OUTPUT redirect for ANY fd
    (`2>f`, `3>f`, `N>|f`) is a write candidate — the open truncates the file
    even when nothing is written through it; `N<f`/`N>&M`/`N>&-` are not.
    Still outside this mechanism's scope (documented residuals):

@@ -4397,6 +4397,40 @@ const INPLACE_WRITE_VERBS = new Set([
   "sed", "gsed", "perl", "awk", "gawk", "mawk", "cp", "mv", "install", "truncate", "dd",
   "rsync", "ln", "sort", "sponge", "ed", "ex", "vi", "vim", "nvi",
 ]);
+// #625 cycle-8: GNU getopt_long accepts any UNAMBIGUOUS long-option prefix
+// (`--in-pl` == `--in-place`, `--expr` == `--expression`), so an exact-spelling
+// match alone is a FAIL-OPEN bypass of the in-place closure (`sed --in-pl s/a/b/
+// <hub>/AGENTS.md` resolved to ZERO targets and the gate allowed it). Resolve
+// a prefix against the verb's REAL long-option table: an exact name wins, a
+// prefix resolves only when exactly ONE name matches (ambiguous/unknown → null,
+// i.e. not an option — the safe direction here, since every in-place spelling is
+// reachable by an exact or unique-prefix match). Mirrors the sort/rsync handlers.
+const _resolveLong = (tbl, name) => {
+  if (Object.prototype.hasOwnProperty.call(tbl, name)) return name;
+  const hits = Object.keys(tbl).filter((nm) => nm.startsWith(name));
+  return hits.length === 1 ? hits[0] : null;
+};
+// sed/gsed long options: name → separate-operand arity (1 = takes the next word,
+// 0 = no argument; `--flag=value` is self-delimiting).
+const SED_LONG = {
+  "in-place": 0, expression: 1, file: 1, "line-length": 1, "follow-symlinks": 0,
+  debug: 0, posix: 0, quiet: 0, silent: 0, sandbox: 0, separate: 0, unbuffered: 0,
+  "null-data": 0, "zero-terminated": 0, "regexp-extended": 0, binary: 0, help: 0, version: 0,
+};
+// gawk/awk (gawk extension) long options. `--include inplace` is the in-place
+// mechanism; `include`/`file`/`source`/etc. take a separate operand.
+const AWK_LONG = {
+  include: 1, file: 1, source: 1, assign: 1, exec: 1, "field-separator": 1, load: 1,
+  "dump-variables": 0, profile: 0, "pretty-print": 0, lint: 0, "lint-old": 0, posix: 0,
+  traditional: 0, "re-interval": 0, "gen-pot": 0, "non-decimal-data": 0,
+  "characters-as-bytes": 0, sandbox: 0, debug: 0, optimize: 0, nostalgia: 0, version: 0,
+  help: 0, "use-lc-numeric": 0, bignum: 0, csv: 0, copyright: 0,
+};
+const _isSedInPlaceLong = (w) => {
+  if (typeof w !== "string" || !w.startsWith("--")) return false;
+  const eq = w.indexOf("=");
+  return _resolveLong(SED_LONG, w.slice(2, eq === -1 ? undefined : eq)) === "in-place";
+};
 
 export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const s = String(command ?? "");
@@ -4633,13 +4667,20 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         // BSD `sed -i ''` — the empty quoted word is the in-place SUFFIX, not a
         // positional (leaving it in the list makes the sed script the "file",
         // a spurious candidate — #625 review A3).
-        if (w === "" && wi > 0 && (words[wi - 1] === "--in-place" || /^-[a-zA-Z]*i$/.test(words[wi - 1]))) continue;
+        if (w === "" && wi > 0 && (_isSedInPlaceLong(words[wi - 1]) || /^-[a-zA-Z]*i$/.test(words[wi - 1]))) continue;
         if (!endOpts && w === "--") { endOpts = true; continue; }
         if (!endOpts && isFlag(w) && w !== "-") {
           if (w.startsWith("--")) {
-            if (w === "--in-place" || w.startsWith("--in-place=")) inPlace = true;
-            else if (w === "--expression" || w === "--file") { hasScriptFlag = true; expectOperand = true; }
-            else if (w.startsWith("--expression=") || w.startsWith("--file=")) hasScriptFlag = true;
+            // getopt_long abbreviation: `--in-pl`/`--in-pl=.bak` ARE
+            // `--in-place` (#625 cycle-8 P1 — exact spelling alone was a
+            // fail-open bypass). `--expr`/`--fil`/`--line-l` resolve likewise.
+            const eq = w.indexOf("=");
+            const resolved = _resolveLong(SED_LONG, w.slice(2, eq === -1 ? undefined : eq));
+            if (resolved === "in-place") { inPlace = true; continue; }
+            if (resolved !== null && SED_LONG[resolved] === 1) {
+              if (resolved === "expression" || resolved === "file") hasScriptFlag = true;
+              if (eq === -1) expectOperand = true;   // `--flag=value` is self-delimiting
+            }
             continue;
           }
           const cluster = w.slice(1);
@@ -4690,13 +4731,27 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         const w = words[wi];
         if (expectOperand) { expectOperand = false; continue; }
         if (isFlag(w) && w !== "-") {
-          if (w === "-i" || w === "--include") {
-            if (words[wi + 1] === "inplace") { inPlace = true; expectOperand = true; }
+          if (w.startsWith("--")) {
+            // gawk also accepts getopt_long abbreviations: `--incl inplace`
+            // IS `--include inplace` (#625 cycle-8 P1).
+            const eq = w.indexOf("=");
+            const resolved = _resolveLong(AWK_LONG, w.slice(2, eq === -1 ? undefined : eq));
+            if (resolved === "include") {
+              if (eq === -1) {
+                if (words[wi + 1] === "inplace") { inPlace = true; expectOperand = true; }
+                else if (AWK_LONG[resolved] === 1) expectOperand = true;
+              } else if (w.slice(eq + 1) === "inplace") inPlace = true;
+              continue;
+            }
+            if (resolved !== null && AWK_LONG[resolved] === 1) { if (eq === -1) expectOperand = true; continue; }
             continue;
           }
-          if (w === "-iinplace" || w === "--include=inplace") { inPlace = true; continue; }
-          if (w === "-f" || w === "--file") { hasProgFlag = true; expectOperand = true; continue; }
-          if (w === "-v") { expectOperand = true; continue; }
+          if (w === "-i" || w === "-f" || w === "-v") {
+            if (w === "-i" && words[wi + 1] === "inplace") { inPlace = true; expectOperand = true; }
+            else { if (w === "-f") hasProgFlag = true; expectOperand = true; }
+            continue;
+          }
+          if (w === "-iinplace") { inPlace = true; continue; }
           continue;
         }
         positionals.push(w);
@@ -4749,9 +4804,14 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // mv REMOVES its sources as well as writing the destination — a tracked
       // SOURCE is a tracked-file mutation. cp/install only READ their sources.
       const alsoSources = v === "mv";
+      // A destination requires at least ONE source: a single-operand
+      // `cp f` / `mv f` / `install f` is a malformed no-op ("missing
+      // destination file operand", rc≠0) that writes NOTHING — emitting its
+      // lone operand as a destination was a pure false block (#625 cycle-8 P2,
+      // same carve-out as single-operand rsync list mode).
       if (targetDir) {
-        emitDst(targetDir, positionals, alsoSources);
-      } else if (positionals.length > 0) {
+        if (positionals.length > 0) emitDst(targetDir, positionals, alsoSources);
+      } else if (positionals.length > 1) {
         emitDst(positionals[positionals.length - 1], positionals.slice(0, -1), alsoSources);
       }
       return out;
