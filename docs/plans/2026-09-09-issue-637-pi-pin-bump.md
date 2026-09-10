@@ -589,15 +589,28 @@ tier change. Repo rubric: overall = highest rated domain; both touched domains a
 `complex` requires new patterns, cross-system work, security surface, or uncharted territory, none of
 which this mechanical bump introduces.
 
-## Unmet Criterion (human decision required)
+## Unmet Criterion — resolved: issue contract met, enforcement owned by #646
 
 The confirmed problem required **at least one CI-enforced, non-vacuous alignment tripwire**. Delivered: a
-non-vacuous tripwire that runs in CI on every PR and on `main` (`(h)`, `(i)`, `(j)` — all negative-
-tested). **Not delivered: "enforced"** — no code CI job is a required status check, so a red
-`ci / unit-test` does not block a merge and a partial pin bump can still reach `main`. That is a
+non-vacuous tripwire that runs in CI on every PR and on `main` (`(h)`, `(i)`, `(j)` — all
+negative-tested, 24 mutations reproduced RED).
+
+The **"enforced"** half is not delivered and **not deliverable inside this chore**: no code CI job is a
+required status check, so a red `ci / unit-test` reports on a PR without blocking it. That is a
 repository-governance change (branch protection), deliberately **not** made unilaterally during a chore;
-it is scoped as **#646**. Decision needed: accept the advisory gate for #637 and let #646 make code CI
-blocking, or hold #637 until #646 lands.
+it is scoped as **#646**.
+
+**Why this does not block closing #637.** The criterion as stated lives in this plan's *Confirmed Problem*
+restatement, not in the issue's own contract. #637's O/I/T states it plainly — indicator (4):
+*"it runs on the PR (`.github/workflows/ci.yml` `test-command`) and post-merge (`ci-main.yml`), i.e.
+**CI-visible** on both paths. Advisory, like every other `ci.yml` job: the repo's only required status
+check is `pipeline-compliance`, and **making code CI blocking is #646**."* The issue contract is therefore
+*satisfied* by a CI-visible, non-vacuous tripwire; the merge-blocking upgrade is explicitly owned by
+another issue that this one names. `Closes #637` is consistent with that contract; #646 carries the
+residual, assigned, with the trigger "before the next pi bump".
+
+What was **not** done, and would have been a bypass: redefining "enforced" to mean "reported", or
+downgrading the requirement silently. The statement is recorded verbatim above and marked unmet.
 
 ## Out of Scope / Accepted Residual Gaps
 
