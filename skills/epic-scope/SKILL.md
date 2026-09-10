@@ -122,6 +122,11 @@ Review this epic scope for:
 4. E2E TESTABILITY: Can each test case be verified without knowing UI details? (Should be behavioral, not presentational)
 5. COMPLEXITY HONESTY: Are complexity ratings justified by the scope and research?
 6. RESEARCH CHECK (issue #231 D11): For each complexity axis rated `medium+`, is `### Axis Research Notes` present in the scope doc, OR a justified skip (cited brief section covering the boundary question at sufficient granularity)?
+7. DUPLICATION & WHOLE-ARCHITECTURE (#688): Dispatch the `duplication-architecture` reviewer (read `skills/reviewers/duplication-architecture/SKILL.md` in full). Two questions: (a) does this epic duplicate something that already exists — a capability, a write path into state we already write, a vocabulary defined elsewhere, a second implementation of a pattern already in the repo? (b) is the overall architecture still sound once this lands, not just this component in isolation?
+   - **Every near-duplicate finding must carry a verdict**, three-valued: `unify` | `keep separate` | `unify-contract-keep-drivers` (consolidate the shared contract, retain the genuinely distinct drivers). A finding with no verdict is an open issue, not a note.
+   - `keep separate` is a valid verdict **only** with a stated reason. "No duplication found" is not an acceptable report when a source was unavailable — say which sources were checked and which were not.
+   - **Advisory, never blocking.** This check does not block the scope gate; it surfaces duplication for an explicit decision.
+   - Tortoise is **one source among several**, never the only one — an unreachable or stale graph lowers confidence, it does not produce "no duplicates found".
 
 Return: NO ISSUES FOUND | ISSUES: <list>
 ```

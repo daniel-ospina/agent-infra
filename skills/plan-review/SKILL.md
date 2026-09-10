@@ -307,6 +307,66 @@ ISSUE:
 If no gaps: NO ISSUES FOUND
 ```
 
+---
+
+**Reviewer #5 — Duplication & Whole-Architecture (#688) — CONDITIONAL, not proportional:**
+
+Dispatched **in addition** to the proportional set above — when the plan introduces a new component, a new write path, a new shared-state owner, or a new definition of an existing vocabulary. Not triggered by plan length. Also dispatched on the FINAL cycle when the plan's data-model / interface / E2E steps introduced surfaces the earlier architecture review never saw.
+
+Read `skills/reviewers/duplication-architecture/SKILL.md` in full and run checks **D1–D9** (duplication) and **A1–A6** (whole-architecture). Do not paraphrase those checks from memory — the skill is the specification. Condensed prompt:
+
+```
+You are reviewing an implementation plan for (a) duplication of something that
+already exists and (b) whole-architecture soundness with this change in place.
+
+PLAN: <full plan>
+REPO: <repo root>   TORTOISE: <graph reachable? state which sources you checked>
+
+DUPLICATION (D1–D9 — read the reviewer skill; do not work from memory):
+- D2: discover writers BY FUNCTION, NOT BY NAME. Writers doing one job
+  routinely share no vocabulary. Separate writers from drivers (a driver
+  delegates; a writer emits the persistence statement). Read the whole family
+  for the odd member — the sibling that does it differently is the defect.
+  Check reader gates too: a reader querying a subset can mis-classify records
+  every writer produced correctly.
+- D3: if this adds a second writer of state already written, that is the
+  finding. Enumerate the COMPLETE set and show your search predicate
+  (`search:` / `excluded:` / `asserted:`). A number you assert is not evidence.
+- D4: for each duplicated vocabulary/invariant, state whether a test asserts
+  the definitions agree. If none does, THAT ABSENCE IS THE FINDING.
+- D7: for silent divergence, invert the burden — name the exception, log, or
+  test that would surface it. Any ABSENT → the divergence is silent → fires.
+- D9: if divergence has already run, require the retrofit audit and name the
+  owner (`retrofit_audit_required:`).
+- Do NOT use "this adds no new component" as an escape. Extending an existing
+  writer with a new field is exactly the shape of the defect (D6: recurrence).
+
+ARCHITECTURE (A1–A6): is the WHOLE coherent with this component added, not
+just this component internally sound? A6: any claimed invariant that is NOT
+actually enforced is a finding.
+
+VERDICT — required for every near-duplicate, three-valued:
+  unify                        — consolidate into the existing implementation
+  keep separate                — with a STATED reason (else it is an open issue)
+  unify-contract-keep-drivers  — one shared contract, genuinely distinct drivers
+A `keep separate` with no reason, or a duplication report with no verdict, is
+an open finding. "No duplication found" is invalid if a source went unchecked.
+
+ADVISORY, not blocking. Tortoise is ONE source among several — never the only
+one, never required. Unreachable or stale sources lower confidence; they must
+never be reported as "no duplicates found".
+
+ISSUE:
+  severity: P0|P1|P2|P3|P4
+  dimension: duplication-architecture
+  location: <plan section>
+  verdict: unify | keep separate | unify-contract-keep-drivers
+  description: <what duplicates what, or what is incoherent>
+  suggestion: <what to fix, and which mechanism prevents recurrence>
+
+If clean: NO ISSUES FOUND
+```
+
 ### Phase 2 — Merge & Dedup
 
 1. Parse all `ISSUE:` blocks from reviewer outputs

@@ -296,7 +296,7 @@ SOLUTION-DIVERGE OUTPUT: <Agent A + Agent B outputs>
 SOLUTION-CONVERGE OUTPUT: <Agent A (+ Agent B) plan drafts>
 CODEBASE EXPLORER: <from Phase 3, if available>
 
-CHECK FOUR DIMENSIONS:
+CHECK SIX DIMENSIONS:
 
 1. DIVERGE GENUINENESS: Are the approaches truly distinct?
    - Do they differ in architecture or technique (not just file names or variable names)?
@@ -329,10 +329,17 @@ CHECK FOUR DIMENSIONS:
    - P1 if the chosen approach introduces a dep with zero external verification and no in-repo precedent.
    - Do the solution approaches engage the Phase 1.5 findings (validate, refine, or explicitly reject them)? A plan that ignores its own research artifact is P2 (ritualization check — findings must feed the plan).
 
+6. DUPLICATION & WHOLE-ARCHITECTURE (#688):
+   - Does the chosen approach re-implement something that already exists in the repo — a capability, a helper, a pattern, a vocabulary/kind/enum/constant set, or a **write path into state another component already writes**?
+   - Does it introduce a **second writer of the same state**? This is the high-severity form: two writers of one contract diverge silently, and the divergence shows up as lost fields, not as an error. A second writer must be paired with a shared declaration, a parity test, or fail-closed rejection of unknown fields — and that mechanism must be named.
+   - Does a duplicated vocabulary/invariant have **a test asserting the definitions agree**? If none exists, that absence is the finding.
+   - Is the overall architecture still sound with this component added — or is this a local fix that leaves the whole incoherent?
+   - Dispatch the `duplication-architecture` reviewer (read `skills/reviewers/duplication-architecture/SKILL.md` in full) for checks D1–D9 / A1–A6. **Every near-duplicate finding carries a three-valued verdict:** `unify` | `keep separate` | `unify-contract-keep-drivers` (unify the shared contract, keep the genuinely distinct drivers). Advisory, not blocking. Tortoise is one source among several, never the only one — "no duplicates found" is not a valid report when a source was unchecked.
+
 For each issue:
 ISSUE:
   severity: P0|P1|P2|P3|P4
-  dimension: diverge-genuineness|converge-quality|completeness|wiring|solution-research-evidence
+  dimension: diverge-genuineness|converge-quality|completeness|wiring|solution-research-evidence|duplication-architecture
   location: [specific diamond phase or plan section]
   description: <what's wrong>
   suggestion: <what to fix>

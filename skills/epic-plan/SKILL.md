@@ -111,7 +111,7 @@ Target state, component boundaries, system interfaces. Deployment topology, serv
 
 **Research hook (issue #231 D11):** before drafting, if the brief is too broad for this decision (novel architecture pattern, new service/integration, failure-mode design beyond the brief's coverage), fire 1–3 targeted external queries (canonical architecture pattern / competitor-precedent / pitfalls) and persist the output as a `### Architecture Research Notes` block in the epic plan doc with a `> **Findings date:**` stamp + per-framing provenance, deduped against the epic brief, **and append each finding to the epic brief's `## Raw Notes` via `bash scripts/_research_append.sh --epic-path <brief-path> --append "<text>" --source-tag <framing>`** (the ledger is the source of truth; the plan-doc block is the derived view — research-protocol §13). Under `EXECUTION_INTENT=Budget`: defer to the brief (zero external queries).
 
-**Review gate:** Are boundaries clean? Are interfaces well-defined? Are failure modes addressed (circuit breakers, retries)? **Research check:** if the hook fired, is `### Architecture Research Notes` present (or a justified skip — brief already covers at sufficient granularity, with a section citation) AND is there a corresponding `## Raw Notes` entry in the epic brief?
+**Review gate:** Are boundaries clean? Are interfaces well-defined? Are failure modes addressed (circuit breakers, retries)? **Research check:** if the hook fired, is `### Architecture Research Notes` present (or a justified skip — brief already covers at sufficient granularity, with a section citation) AND is there a corresponding `## Raw Notes` entry in the epic brief? **Duplication & whole-architecture check (#688):** dispatch the `duplication-architecture` reviewer (read `skills/reviewers/duplication-architecture/SKILL.md` in full) against the drafted architecture. It asks whether this architecture duplicates a capability, write path, vocabulary, or pattern that already exists — and whether the whole is still coherent with this component added, not merely whether this component is internally sound. Every near-duplicate finding carries a three-valued verdict: `unify` | `keep separate` | `unify-contract-keep-drivers`. Advisory, never blocking; Tortoise is one source among several and never the only one.
 
 ### 6. Interfaces
 API contracts, event schemas, type definitions. Contract-first design — define interfaces before implementation.
@@ -133,7 +133,7 @@ The reviewer list above is authoritative for the 3-reviewer dispatch.
 ### 8. Coherence Review + Risk Analysis
 Cross-substep drift detection. Risk identification with mitigation strategies. Improvement opportunities.
 
-**Review gate (FINAL):** Is the plan internally consistent? Are risks identified and mitigated? Is the plan ready for decomposition?
+**Review gate (FINAL):** Is the plan internally consistent? Are risks identified and mitigated? Is the plan ready for decomposition? **Final duplication re-check (#688):** re-run the `duplication-architecture` reviewer across the *finished* plan. Substep 5 saw the architecture in isolation; by step 8 the data model, interfaces, and E2E steps have each added surfaces that can duplicate — and a second writer of state already written elsewhere is the failure this catches. Any near-duplicate found here carries a three-valued verdict: `unify` | `keep separate` | `unify-contract-keep-drivers`.
 
 ## Review Gate Pattern
 
