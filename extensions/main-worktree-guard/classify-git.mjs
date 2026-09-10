@@ -302,7 +302,14 @@ export function skimGitGlobalFlags(command) {
   return { rest: tokens.slice(i), repoHint, gitDirHint };
 }
 
-function _stripQuotes(s) { return String(s ?? "").replace(/^["']|["']$/g, ""); }
+function _stripQuotes(s) {
+  const t = String(s ?? "");
+  // ANSI-C `$'…'` / `$"…"` are lexically-fixed strings — decode so the real
+  // path (not the literal `$…`) is tested (#625 cycle-7).
+  if (t.length > 3 && t.startsWith("$'") && t.endsWith("'")) return _ansiTranslate(t.slice(2, -1));
+  if (t.length > 3 && t.startsWith('$"') && t.endsWith('"')) return t.slice(2, -1);
+  return t.replace(/^["']|["']$/g, "");
+}
 
 function _refspecDst(refspec) {
   if (!refspec || refspec === "") return null;
@@ -4488,13 +4495,33 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     let q = null;
     while (k < n && !(q === null && (/\s/.test(s[k]) || ";|&()".includes(s[k]) || s[k] === ">" || s[k] === "<"))) {
       const ch = s[k];
-      if (q) { if (ch === q) q = null; else w += ch; k++; continue; }
+      if (q) {
+        // Inside double quotes, `\"` / `\\` / `\$` are literals (bash dq
+        // escapes); inside single quotes a backslash is literal.
+        if (q === '"' && ch === "\\" && k + 1 < n) { w += s[k + 1]; k += 2; continue; }
+        if (ch === q) q = null; else w += ch; k++;
+        continue;
+      }
+      // ANSI-C `$'…'`: decode escapes so a decoded `>` (\x3e / \076) is a real
+      // redirect and a decoded path matches the tracked rel (#625 cycle-7).
+      if (ch === "$" && s[k + 1] === "'") {
+        let kk = k + 2, inner = "";
+        while (kk < n && s[kk] !== "'") {
+          if (s[kk] === "\\" && kk + 1 < n) { inner += s[kk] + s[kk + 1]; kk += 2; continue; }
+          inner += s[kk]; kk++;
+        }
+        w += _ansiTranslate(inner);
+        k = kk + 1;
+        continue;
+      }
+      if (ch === "$" && s[k + 1] === '"') { q = '"'; k += 2; continue; }   // $"…" == "…"
       if (ch === "'" || ch === '"') { q = ch; k++; continue; }
       if (ch === "\\") { if (k + 1 < n) { w += s[k + 1]; k += 2; continue; } }
       w += ch; k++;
     }
     return { w, k };
   };
+  const readShellArg = readWord;   // alias (same shell-argument semantics)
   // #625: in-place OVERWRITE verb targets — a write with no primitive token.
   // Command-position only (the caller dispatches on the simple-command word,
   // mirroring the `tee` branch): `git mv a b` / `echo cp a b` are ARG
@@ -5833,14 +5860,16 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (w1.w === "" ) { done = true; continue; }
         if (w1.w === "-c" || w1.w === "--command") {
           const k2 = skipWs(w1.k);
-          const _ip3 = { payload: readWord(k2).w, cwd }; inlinePays.push(_ip3, ...forkTwins(_ip3));
-          i = readWord(k2).k;
+          const _arg = readWord(k2);
+          const _ip3 = { payload: _arg.w, cwd }; inlinePays.push(_ip3, ...forkTwins(_ip3));
+          i = _arg.k;
           done = true;
         } else if (/^-[a-zA-Z]+$/.test(w1.w) && w1.w.includes("c")) {
           // single-dash letter run containing c (bash -lc '…', sh -ec '…')
           const k2 = skipWs(w1.k);
-          const _ip3 = { payload: readWord(k2).w, cwd }; inlinePays.push(_ip3, ...forkTwins(_ip3));
-          i = readWord(k2).k;
+          const _arg = readWord(k2);
+          const _ip3 = { payload: _arg.w, cwd }; inlinePays.push(_ip3, ...forkTwins(_ip3));
+          i = _arg.k;
           done = true;
         } else if (w1.w === "--rcfile" || w1.w === "--init-file" || w1.w === "-O" || w1.w === "-o") {
           const k2 = skipWs(w1.k);
@@ -5889,52 +5918,42 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // quoting (`$'…'` / `$"…"`) is recognized — both otherwise left the raw
       // quoted text as one word, so the `>` was never seen (#625 cycle-5 P1).
       let k = skipWs(i);
+      let sawList = false;
       while (k < n) {
         const opt = readWord(k);
-        const isOpt = opt.w === "--" || (w0.w === "trap" &&
-          (opt.w === "-p" || opt.w === "--print" || opt.w === "-l" || opt.w === "--list"));
+        const isList = opt.w === "-p" || opt.w === "--print" || opt.w === "-l" || opt.w === "--list";
+        const isOpt = opt.w === "--" || (w0.w === "trap" && isList);
         if (!isOpt || opt.k <= k) break;
+        if (isList) sawList = true;
         k = skipWs(opt.k);
       }
-      // ANSI-C `$'…'` / `$"…"` quoting — decode escapes with the canonical
-      // translator. A decode that PRODUCES `>` (`\x3e`, `\076`) must be seen
-      // as a redirect (#625 cycle-6 P2/P3).
-      const ansi = s[k] === "$" && (s[k + 1] === "'" || s[k + 1] === '"');
-      if (ansi) k++;
-      const qd = s[k] === "'" || s[k] === '"' ? s[k] : null;
-      let pl = "";
-      let j = k;
-      if (qd) {
-        j++;
-        while (j < n && s[j] !== qd && pl.length < 4096) {
-          if (qd === '"' && s[j] === "\\" && j + 1 < n) {
-            // dq escape (cycle-15 D2): \" / \\ / \$ → the literal next char
-            pl += s[j + 1];
-            j += 2;
-            continue;
-          }
-          pl += s[j]; j++;
-        }
-        j++;
-        if (w0.w === "eval") {
-          // `eval` concatenates ALL its arguments into ONE command — append the
-          // remaining words (one level of shell quote/backslash removal) so a
-          // metacharacter passed as a separate argument is seen (#625 cycle-6
-          // B4: `eval 'printf x' '> MEMORY.md'`).
-          let e = j;
-          while (e < n && !";|&()\n".includes(s[e])) e++;
-          const tail = s.slice(j, e).replace(/'([^']*)'/g, "$1").replace(/"([^"]*)"/g, "$1").replace(/\\(.)/g, "$1");
-          if (tail.trim()) pl += " " + tail.trim();
-          j = e;
-        }
-      } else {
-        let e = k;
-        while (e < n && !";|&()\n".includes(s[e])) e++;
-        pl = s.slice(k, e).replace(/'([^']*)'/g, "$1").replace(/"([^"]*)"/g, "$1").replace(/\\(.)/g, "$1");
-        j = e;
+      if (w0.w === "trap") {
+        // `trap -p`/`-l`: the remaining operands are signal specs, never an
+        // action (false-positive fix, cycle-7 P3). An UNQUOTED action is left
+        // for the normal scan so a top-level `>` redirect is still seen.
+        if (sawList) { i = k; continue; }
+        const quoted = s[k] === "'" || s[k] === '"' ||
+          (s[k] === "$" && (s[k + 1] === "'" || s[k + 1] === '"'));
+        if (!quoted) { continue; }   // i unchanged → the operand is scanned normally
+        const a = readShellArg(k);
+        const payload = a.w.trim();
+        if (payload) { const _ip = { payload, cwd }; inlinePays.push(_ip, ...forkTwins(_ip)); }
+        i = a.k;
+        continue;
       }
-      const payload = (ansi ? _ansiTranslate(pl) : pl).trim();
-      const _ip = { payload, cwd }; inlinePays.push(_ip, ...forkTwins(_ip));
+      // `eval` concatenates ALL its arguments into ONE command — read every
+      // argument with shell quote semantics (ANSI-C `$'…'` decoded per arg) and
+      // join (#625 cycle-6 B4, cycle-7 P1).
+      const parts = [];
+      let j = k;
+      while (j < n && !";|&()\n".includes(s[j])) {
+        const a = readShellArg(j);
+        if (a.k <= j) break;
+        parts.push(a.w);
+        j = skipWs(a.k);
+      }
+      const payload = parts.join(" ").trim();
+      if (payload) { const _ip = { payload, cwd }; inlinePays.push(_ip, ...forkTwins(_ip)); }
       i = j;
       continue;
     }
@@ -5971,9 +5990,12 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // a.md AND b.md — the earlier dropAll guard dropped them).
     const words = [];
     let heredocDrop = 0;
+    let redirDrop = 0;
     for (const w of rawWords) {
       if (heredocDrop > 0) { heredocDrop--; continue; }
+      if (redirDrop > 0) { redirDrop--; continue; }   // `<`/`>` operand is a read/redirect, not a tee target (#625 cycle-7 P3)
       if (w === "<<" || w === "<<-") { heredocDrop = 1; continue; }
+      if (/^[0-9]*(<|<<|>>?>|&>>?)$/.test(w) || w === "<&" || w === ">&" || w === "<>") { redirDrop = 1; continue; }
       if (_isShellBoundary(w)) continue;
       words.push(w);
     }

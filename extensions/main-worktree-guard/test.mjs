@@ -4370,6 +4370,14 @@ try {
     has("eval -- 'printf x > tracked.md'", "redirect:H/tracked.md", "eval with a leading -- still walks the payload");
     has("eval 'printf x' '> tracked.md'", "redirect:H/tracked.md", "eval joins ALL its arguments");
     none("trap -l", "trap -l is a list, no payload");
+    // #625 review cycle-7: ANSI-C escapes, eval arg joining, $'…' operands
+    has("trap $'printf \\'x\\' > tracked.md' EXIT", "redirect:H/tracked.md", "ANSI-C escaped quote does not truncate the payload");
+    has("eval 'printf x' $'\\x3e tracked.md'", "redirect:H/tracked.md", "eval decodes ANSI-C in a LATER argument");
+    has("echo hi >> $'tracked.md'", "redirect:H/tracked.md", "$'…' redirect operand decodes to the tracked path");
+    has("cp src.md $'tracked.md'", "cp:H/tracked.md", "$'…' verb operand decodes");
+    has("bash -c $'printf x \\x3e tracked.md'", "redirect:H/tracked.md", "interpreter -c ANSI-C payload decodes");
+    none("trap -p 'printf x > tracked.md' EXIT", "trap -p has no action operand");
+    lacks("tee /tmp/out.txt < tracked.md", "tee:H/tracked.md", "tee input redirect is not a write target");
     // truncate / dd
     has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
     has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");
