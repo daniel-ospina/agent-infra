@@ -347,17 +347,22 @@ dirty, and trips M4's freeze. Surfaces:
    overwrite VERBS that carry no primitive token (`sed -i`/`gsed -i`,
    `perl -pi`, `awk -i inplace`, the `cp`/`mv`/`install`/`rsync`/`ln`
    destination — a directory destination expands per-source to
-   `dir/<basename(src)>` — `truncate`, `dd of=`, `sort -o`, `sponge`,
+   `dir/<basename(src)>` — `truncate`, `dd of=`, `sort -o` (long options match
+   any UNAMBIGUOUS prefix, `--out=FILE` included), `sponge`,
    `ed`/`ex`/`vi`/`vim`/`nvi` (every file operand); a bundled `-t` (`cp -ft
-   dir`, `install -Dt`); and `sort -ro`/`-uo`). Still outside this mechanism's scope (documented residuals):
+   dir`, `install -Dt`); rsync operand options match unambiguous prefixes;
+   and `sort -ro`/`-uo`). An fd-prefixed OUTPUT redirect for ANY fd
+   (`2>f`, `3>f`, `N>|f`) is a write candidate — the open truncates the file
+   even when nothing is written through it; `N<f`/`N>&M`/`N>&-` are not.
+   Still outside this mechanism's scope (documented residuals):
    verb-in-ARG fan-outs (`find -exec`, `xargs`), archive/member writers
    (`tar -x`, `unzip -o`, `patch`), directory-TREE copies whose per-file
    targets are not in the command string (`cp -R src/ dst/`), backtick
    command substitution (the `$( )` form IS walked), arbitrary interpreter
    writers (`node -e`, `ruby -e`, `php -r`), a bare `rm` of a tracked file,
-   and an rsync option that takes a separate operand but is not in the
-   operand list (the list carries every documented rsync/opensync option that
-   does; `--flag=value` forms are self-delimiting). Own-main UNTRACKED/NEW writes stay free (build/formatter/npm-install
+   an rsync option that takes a separate operand but is neither in the
+   operand list nor an unambiguous prefix of an entry (and the same class for
+   sort), and `N>file` inside an interpreter pre-scan (`bash 2> f`). Own-main UNTRACKED/NEW writes stay free (build/formatter/npm-install
    side effects on genuinely new files must not false-block); a TRACKED
    own-main write blocks clean OR disordered (#625 removed the #437 clean-hub
    residual — it let a compound `printf … >> MEMORY.md && git add && git

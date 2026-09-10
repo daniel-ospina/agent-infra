@@ -4374,7 +4374,8 @@ export function firstHubTrackedWrite(candidates, trackedRels) {
  * #625 the in-place OVERWRITE VERBS ARE gated too (`sed -i`, `perl -pi`,
  * `awk -i inplace`, the `cp`/`mv`/`install`/`rsync`/`ln` destination (a
  * DIRECTORY destination resolves per-source to `dir/<basename(src)>`),
- * `truncate`, `dd of=`, `gsed`, `sort -o` (bundled `-ro` too), `sponge`,
+ * `truncate`, `dd of=`, `gsed`, `sort -o` (bundled `-ro` too, and any
+ * UNAMBIGUOUS long-option prefix), `sponge`,
  * `ed`/`ex`/`vi`/`vim`/`nvi`, a bundled `-t` target-directory (`cp -ft dir`),
  * and a noclobber-override `>|` redirect) at COMMAND
  * position — `git mv a b` / `echo cp a b` stay ARG positions. Remaining
@@ -4504,10 +4505,36 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   const verbTargets = (verb, k0, siteCwd) => {
     const v = verb === "gsed" ? "sed" : verb; // GNU-sed spelling sibling
     const words = [];
+    const skipParen = (j0) => {
+      // Skip a balanced `( … )` group (quote-aware) — `$( )`, `<( )`, `>( )`.
+      // The group content is not verb arguments, but a LITERAL operand after
+      // it is (#625 cycle-3 P2).
+      let d = 0, q = null;
+      for (let j = j0; j < n; j++) {
+        const c = s[j];
+        if (q) { if (c === "\\") { j++; continue; } if (c === q) q = null; continue; }
+        if (c === '"' || c === "'" || c === "`") { q = c; continue; }
+        if (c === "(") d++;
+        else if (c === ")" && --d === 0) return j + 1;
+      }
+      return n;
+    };
     let k = skipWs(k0);
     while (k < n) {
       const c0 = s[k];
-      if (";&|()\n".includes(c0)) break;
+      // `#` at a word boundary starts a comment — stop the scan (mirrors the
+      // main walker). Else the comment word becomes the LAST positional and the
+      // real destination is dropped (#625 cycle-3 P1).
+      if (c0 === "#" && (k === 0 || /[\s;&|(\n]/.test(s[k - 1]))) break;
+      // `\` + newline is a line continuation — whitespace in bash (#625
+      // cycle-3 P3).
+      if (c0 === "\\" && s[k + 1] === "\n") { k = skipWs(k + 2); continue; }
+      // `$( … )` / `<( … )` / `>( … )`: skip the balanced group, keep scanning.
+      if (c0 === "(" || ((c0 === "<" || c0 === ">") && s[k + 1] === "(")) {
+        k = skipWs(skipParen(c0 === "(" ? k : k + 1));
+        continue;
+      }
+      if (";&|\n".includes(c0)) break;
       // Redirect with an OPTIONAL fd prefix (`2> f`, `2>&1`, `> f`, `&> f`):
       // consume operator + operand, never a verb target. The fd digits MUST be
       // consumed before readWord (which stops only at `>`), else
@@ -4600,7 +4627,16 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
               else { expectOperand = true; ci++; }
               continue;
             }
-            if (v === "perl" && (ch === "I" || ch === "F" || ch === "M" || ch === "m" || ch === "x")) {
+            // `-F`/`-M`/`-m`/`-x` take an ATTACHED operand only; a bare one is
+            // not followed by its value, so it must not swallow the next word
+            // (`perl -F -pi -e …` — bare `-F` is not a separator operand, and
+            // letting it consume `-pi` loses in-place mode; #625 cycle-3 P3).
+            if (v === "perl" && (ch === "F" || ch === "M" || ch === "m" || ch === "x")) {
+              if (ci + 1 < cluster.length) ci = cluster.length;
+              else ci++;
+              continue;
+            }
+            if (v === "perl" && ch === "I") {
               if (ci + 1 < cluster.length) ci = cluster.length; // attached operand
               else { expectOperand = true; ci++; }
               continue;
@@ -4718,22 +4754,30 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // (#625 review P2). The list must contain ONLY options that take a
       // SEPARATE operand: a no-argument flag in here (`--owner`, `--itemize-
       // changes`, `--dry-run`, `-v`) swallows the real destination and drops
-      // the gate (#625 cycle-2 P1). `--flag=value` forms need no entry. An
-      // UNKNOWN operand-taking option remains a documented residual — a
-      // prev-positional fail-safe was tried and caused false blocks on
-      // read-only exports (`rsync -a tracked.md -v /tmp/dst`), so it is gone.
-      const OPERAND_FLAGS = new Set(v === "rsync"
-        ? ["-e", "--rsh", "-f", "--filter", "--exclude", "--include", "--exclude-from", "--include-from",
-           "--files-from", "--log-file", "--log-file-format", "--temp-dir", "-T", "-B", "--block-size",
-           "-M", "--remote-option", "--partial-dir", "--compare-dest", "--copy-dest", "--link-dest",
-           "--rsync-path", "--chmod", "--chown", "--usermap", "--groupmap", "--timeout", "--out-format",
-           "--suffix", "--max-size", "--min-size", "--bwlimit", "--compress-level", "--skip-compress",
-           "--address", "--port", "--sockopts", "--password-file",
-           // rsync-3.x / openrsync operand-taking options (#625 cycle-2 B2).
-           "--modify-window", "--checksum-seed", "--backup-dir", "--log-format", "--contimeout",
-           "--stop-after", "--iconv", "--early-input", "--write-batch", "--only-write-batch",
-           "--read-batch", "--protocol", "--compress-choice"]
-        : ["-t", "--target-directory", "-S", "--suffix"]);
+      // the gate (#625 cycle-2 P1). rsync uses popt, which accepts any
+      // UNAMBIGUOUS long-option prefix (`--max-del 0` == `--max-delete 0`), so
+      // the list is prefix-matched with exact names winning (#625 cycle-3 A4).
+      // `--flag=value` is self-delimiting. A genuinely UNKNOWN operand-taking
+      // option remains a documented residual — a prev-positional fail-safe was
+      // tried and caused false blocks on read-only exports
+      // (`rsync -a tracked.md -v /tmp/dst`), so it is gone.
+      const RSYNC_OP_LONG = ["--rsh", "--filter", "--exclude", "--include", "--exclude-from", "--include-from",
+        "--files-from", "--log-file", "--log-file-format", "--temp-dir", "--block-size", "--remote-option",
+        "--partial-dir", "--compare-dest", "--copy-dest", "--link-dest", "--rsync-path", "--chmod", "--chown",
+        "--usermap", "--groupmap", "--timeout", "--out-format", "--suffix", "--max-size", "--min-size",
+        "--bwlimit", "--compress-level", "--skip-compress", "--address", "--port", "--sockopts",
+        "--password-file", "--modify-window", "--checksum-seed", "--backup-dir", "--log-format", "--contimeout",
+        "--stop-after", "--iconv", "--early-input", "--write-batch", "--only-write-batch", "--read-batch",
+        "--protocol", "--compress-choice", "--max-delete", "--max-alloc"];
+      const RSYNC_OP_SHORT = new Set(["-e", "-f", "-B", "-T", "-M"]);
+      const isRsyncOperand = (w) => {
+        const eq = w.indexOf("=");
+        const name = eq === -1 ? w : w.slice(0, eq);
+        if (RSYNC_OP_SHORT.has(name)) return true;
+        if (RSYNC_OP_LONG.includes(name)) return true;
+        return name.length > 2 && RSYNC_OP_LONG.filter((f) => f.startsWith(name)).length === 1;
+      };
+      const LN_OPERAND_FLAGS = new Set(["-t", "--target-directory", "-S", "--suffix"]);
       let expectOperand = false;
       let expectTarget = false;
       let targetDir = null;
@@ -4764,7 +4808,10 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
             }
             continue;
           }
-          if (OPERAND_FLAGS.has(w)) { expectOperand = true; continue; }
+          if (v === "rsync" ? isRsyncOperand(w) : LN_OPERAND_FLAGS.has(w)) {
+            if (!w.includes("=")) expectOperand = true;   // `--flag=value` is self-delimiting
+            continue;
+          }
           continue;
         }
         positionals.push(w);
@@ -4792,21 +4839,42 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // BUNDLED behind other letters (`sort -ro out`) (#625 review A2), so the
       // short cluster is scanned LEFT TO RIGHT: `t`/`k`/`S`/`T` take an
       // operand, which may be attached (`-to` means separator `o`) — those are
-      // consumed, never re-read as `-o` (#625 cycle-2 P2).
-      const SORT_OPERAND_LONG = new Set(["--field-separator", "--key", "--buffer-size", "--temporary-directory",
-        "--random-source", "--compress-program", "--files0-from"]);
+      // consumed, never re-read as `-o` (#625 cycle-2 P2). Long options accept
+      // any UNAMBIGUOUS prefix (getopt_long does) — `--out=FILE` IS `--output`
+      // (#625 cycle-3 B1).
+      const SORT_LONG = [
+        ["--output", "out"], ["--field-separator", "op"], ["--key", "op"], ["--buffer-size", "op"],
+        ["--temporary-directory", "op"], ["--random-source", "op"], ["--compress-program", "op"],
+        ["--files0-from", "op"], ["--batch-size", "op"], ["--sort", "op"], ["--parallel", "op"],
+        ["--check", "none"], ["--debug", "none"], ["--help", "none"], ["--version", "none"],
+        ["--ignore-leading-blanks", "none"], ["--dictionary-order", "none"], ["--ignore-case", "none"],
+        ["--general-numeric-sort", "none"], ["--ignore-nonprinting", "none"], ["--month-sort", "none"],
+        ["--human-numeric-sort", "none"], ["--version-sort", "none"], ["--numeric-sort", "none"],
+        ["--random-sort", "none"], ["--reverse", "none"], ["--stable", "none"], ["--unique", "none"],
+        ["--merge", "none"], ["--zero-terminated", "none"],
+      ];
+      const resolveLong = (name) => {
+        const hits = SORT_LONG.filter(([nm]) => nm.slice(2).startsWith(name));
+        return hits.length === 1 ? hits[0][1] : null;   // ambiguous/unknown → non-write
+      };
       let outputNext = false;
       let skipNext = false;
+      let endOpts = false;
       for (const w of words) {
         if (skipNext) { skipNext = false; continue; }
         if (outputNext) { out.push(w); outputNext = false; continue; }
-        if (w === "-o" || w === "--output") { outputNext = true; continue; }
-        if (w.startsWith("--output=")) { out.push(w.slice("--output=".length)); continue; }
-        if (w.startsWith("--")) {
-          if (SORT_OPERAND_LONG.has(w)) skipNext = true;
+        if (!endOpts && w === "--") { endOpts = true; continue; }
+        if (!endOpts && w === "-o") { outputNext = true; continue; }
+        if (!endOpts && w.startsWith("--")) {
+          const body = w.slice(2);
+          const eq = body.indexOf("=");
+          const kind = resolveLong(eq === -1 ? body : body.slice(0, eq));
+          if (kind === "out") {
+            if (eq === -1) outputNext = true; else out.push(body.slice(eq + 1));
+          } else if (kind === "op" && eq === -1) skipNext = true;
           continue;
         }
-        if (w.startsWith("-") && w.length > 1) {
+        if (!endOpts && w.startsWith("-") && w.length > 1) {
           const cluster = w.slice(1);
           for (let ci = 0; ci < cluster.length; ci++) {
             const ch = cluster[ci];
@@ -5113,27 +5181,28 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (spawnerOperandNext) spawnerOperandNext = false;
         i = k; continue;
       }
-      if (fdRun !== "" && fdRun !== "0" && fdRun !== "1") {
-        // stderr / other fd: never a content write — skip op + operand
-        let p = k + 1;
-        if (s[p] === ">" || s[p] === "|" || s[p] === "&") p++;
-        if (s[p] === "&") p++;
-        p = skipWs(p);
-        i = readWord(p).k;
-        continue;
+      // fd-prefixed INPUT (`0<f`, `1<f`, `2<f`) is a READ, never a write — hand
+      // it to the `<` branch. Treating `0<file` as `>file` false-blocked
+      // read-only stdin redirects (#625 cycle-3 B3).
+      if (s[k] === "<") { i = k; continue; }
+      if (s[k] === ">" && s[k + 1] === "&") {
+        // `N>&M` / `N>&-` is a dup/close (no file). Legacy `>&file` (target not
+        // an fd) DOES write the file, so keep it.
+        const tgt = readWord(skipWs(k + 2));
+        if (/^[0-9-]*$/.test(tgt.w)) { i = tgt.k; continue; }
+        const _rtd = { raw: tgt.w, cwd: f().cwd }; redirs.push(_rtd, ...forkTwins(_rtd));
+        i = tgt.k; continue;
       }
-      let p = k;                                            // at '>'
+      // `N>f` / `N>>f` / `N>|f` opens f with O_TRUNC for ANY fd — a tracked-file
+      // mutation even when no content is written through it (`echo x 3>f 1>&3`,
+      // `2>f` truncation) (#625 cycle-3 B2). The operand is emitted; `/dev/*`
+      // and non-tracked files are filtered downstream, so the match is inert.
+      let p = k + 1;
       let op = ">";
-      const n1 = s[p + 1];
-      if (n1 === ">" || n1 === "|") { op += n1; p += 2; }
-      else if (n1 === "&") {
-        const q2 = skipWs(p + 2);
-        if (/^[0-9-]/.test(s.slice(q2))) { i = q2; continue; } // fd-dup/close
-        op = ">&"; p = q2;
-      } else p++;
+      const n1 = s[k + 1];
+      if (n1 === ">" || n1 === "|") { op += n1; p = k + 2; }
       p = skipWs(p);
       const operand = readWord(p);
-      if (op.includes("&") && /^-?[0-9]*$/.test(operand.w)) { i = operand.k; continue; }
       const _rt2 = { raw: operand.w, cwd: f().cwd }; redirs.push(_rt2, ...forkTwins(_rt2));        // pre-cd (pending not applied)
       i = operand.k;
       continue;

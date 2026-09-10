@@ -4329,6 +4329,28 @@ try {
     has("vim -es +wq tracked.md /tmp/decoy.md", "vim:H/tracked.md", "vim multi-file emits the first file");
     has("ex -s +wq tracked.md +q", "ex:H/tracked.md", "ex trailing +cmd is not the file");
     has("sponge one.md two.md", "sponge:H/two.md", "sponge multi-file emits every operand");
+    // #625 review cycle-3: scanner + redirect findings
+    has("cp src.md tracked.md # update the shared config", "cp:H/tracked.md", "trailing # comment is not the destination");
+    has("install -m 644 src.md tracked.md # note", "install:H/tracked.md", "trailing comment after install operands");
+    has("rsync -a src.md tracked.md # note", "rsync:H/tracked.md", "trailing comment after rsync operands");
+    has("ln -sf src.md tracked.md # note", "ln:H/tracked.md", "trailing comment after ln operands");
+    has("cp $(mktemp) tracked.md", "cp:H/tracked.md", "command substitution before the dst does not drop it");
+    has("sed -i $(cat s) tracked.md", "sed:H/tracked.md", "command substitution before the sed file");
+    has("cp src.md tracked.md \\\n  && echo done", "cp:H/tracked.md", "line continuation is not a bogus last positional");
+    has("sort --out=tracked.md in.txt", "sort:H/tracked.md", "sort --out= is an unambiguous --output prefix");
+    has("sort --o=tracked.md in.txt", "sort:H/tracked.md", "sort --o= prefix");
+    has("sort --out tracked.md in.txt", "sort:H/tracked.md", "sort --out with a separate operand");
+    has("perl -F -pi -e s/a/b/ tracked.md", "perl:H/tracked.md", "bare perl -F does not swallow -pi");
+    has("rsync -a src.md tracked.md --max-del 0", "rsync:H/tracked.md", "rsync unambiguous long-option prefix keeps the dst");
+    has("rsync -a src.md tracked.md --exclude foo", "rsync:H/tracked.md", "rsync exact operand flag keeps the dst");
+    // #625 cycle-3 B2/B3: ANY `N>file` truncates the file; `N<file` is a read.
+    has("echo x 2> tracked.md", "redirect:H/tracked.md", "stderr redirect truncates a tracked file");
+    has("echo x 3> tracked.md", "redirect:H/tracked.md", "fd-3 redirect truncates a tracked file");
+    has("echo hi 3>tracked.md 1>&3", "redirect:H/tracked.md", "fd-3 write-through is a tracked mutation");
+    has("echo x >& tracked.md", "redirect:H/tracked.md", "legacy >&FILE is a content write");
+    none("cat 0< tracked.md", "0< is a read, not a write");
+    none("cat 1< tracked.md", "1< is a read, not a write");
+    none("cat x 2>&1 tracked.md", "2>&1 is a dup, not a write");
     // truncate / dd
     has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
     has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");
