@@ -270,7 +270,7 @@ test("live corpus: validator verdict matches pi net consequence (shadowing-aware
       else checked++;
     }
   }
-  assert.ok(corpusFiles.length >= 120, `corpus has ${corpusFiles.length} files`);
+  assert.ok(corpusFiles.length >= 122, `corpus has ${corpusFiles.length} files`);
   assert.ok(checked > 0, "at least one corpus file checked for parity");
   reports.push(`corpus: ${corpusFiles.length} files, ${checked} parity-checked, over-flag candidates: ${overFlags.length}`);
   if (overFlags.length > 0) {

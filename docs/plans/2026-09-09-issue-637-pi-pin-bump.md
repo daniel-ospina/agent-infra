@@ -100,13 +100,21 @@ tripwire wired into the per-PR path.
    "the non-vacuity guard is too weak" and "the wiring can silently unplug"):
    - **`(i)` mirror version stamps** — every `<major>.<minor>.<patch>` literal in the four hand-synced
      mirror surfaces (`docs/providers.md`, `extensions/custom-provider-qwen/index.ts`,
-     `scripts/frontmatter-validate.mjs`, `.github/workflows/ci-main.yml`) must equal `PI_VERSION_PIN`,
-     with a per-surface "contributed a match" assertion so a rewording cannot silently no-op the guard.
-     **This is the class that actually escaped on 2026-08-10.**
+     `scripts/frontmatter-validate.mjs`, `.github/workflows/ci-main.yml`) is either `PI_VERSION_PIN` or an
+     explicitly allowed non-pi dependency version (yaml `2.9.0`, undici `8.9.0`), with a per-surface
+     "contributed a pi stamp" assertion so a rewording cannot silently no-op the guard. **This is the
+     class that actually escaped on 2026-08-10.** Accepted residuals: the allowlist is keyed by version
+     string (not occurrence) and only 3-component literals are scanned.
    - **`(j)` per-PR wiring self-check** — asserts `ci.yml` still binds a non-empty `test-command` running
-     `check-skill-lint.test.mjs`, and that `node-ci.yml` still declares that input. Without it the gate
-     can be silently unplugged by renaming the input (the job skips, the PR is green) — and `actionlint`
-     cannot catch it.
+     `check-skill-lint.test.mjs` on the `node-ci.yml` call, that `node-ci.yml` declares that input, that
+     the `unit-test` job exists, that BOTH the job and custom-step `if:` are exactly the known-good
+     predicates (an added conjunct can make the job unsatisfiable while every check stays green), and
+     that the custom-test step actually `run:`s the input. Without it the gate
+     can be silently unplugged by removing the binding (the job skips) — and `actionlint`
+     cannot catch it. **Caveat:** it reads the BRANCH-LOCAL `node-ci.yml`, while `ci.yml` executes
+     `@main`; a main-side change to a stale branch is invisible, so the live per-PR run (Verification
+     step 4) is the proof — and that proof **expires** at the next main-side `node-ci.yml` change, which
+     is why alternative F's extraction is the durable fix.
    - **`(h)` pin-count assertion** — a presence check (`matched > 0`) was the first attempt; it stayed
      green when coverage collapsed 6 pins → 1, and the follow-up *roster* (name set) also stayed green
      when 3 of subagent's 4 pins were deleted. It now asserts the per-extension pin **count** map.
@@ -136,7 +144,7 @@ Both checks passed; no lockfile change is warranted.
 | 5 | Add `(h)` tripwire (presence guard, later strengthened) | done (`5b931ab`, `030825e`) |
 | 6 | Wire `(h)` into the per-PR path | done (fix-round commit on this branch — see PR #640 head) |
 | 7 | Write this plan doc | done (fix-round commits on this branch) |
-| 8 | Post the scoping comment to #637 (`<!-- issue-scoping:` marker) + re-run `scripts/check-pipeline-compliance.sh 640` | pending — `pipeline-compliance` is **red** until this lands; it is the repo's only required check |
+| 8 | Post the scoping comment to #637 (`<!-- issue-scoping:` marker) + re-run `scripts/check-pipeline-compliance.sh 640` | done — comment posted 2026-09-10T01:41:39Z; check green on `8553e06`. **Lesson:** posting the comment does NOT re-trigger the required check (its first run had already completed, reading comments 3s earlier) — a push or a workflow re-run is required |
 | 9 | Confirm `ci / unit-test` ran on PR #640 | done — ran and passed (7s) at `779c572` |
 | 10 | Merge via `commit-workflow` | pending |
 
@@ -258,7 +266,9 @@ install mode in all three extensions.
 `patch-pi-retry.sh`'s two dist-internal targets (`dist/core/agent-session.js`,
 `node_modules/@earendil-works/pi-ai/dist/utils/retry.js`) still exist in 0.85.1 in the same shape.
 pi-ai internals used by the qwen fetch override (`options?.fetch` → `createClient()` →
-`new OpenAI({ fetch })`) are unchanged in shape; only line numbers moved (128→202, 514→577).
+`new OpenAI({ fetch })`) are unchanged in shape; the refs were re-derived to 202 (`createClient(`) and
+577 (`fetch,`). The pre-bump refs used mixed referents, so "only line numbers moved" would be too
+strong — see #651.
 
 ## Rejected Alternatives
 
@@ -283,10 +293,10 @@ pi-ai internals used by the qwen fetch override (`options?.fetch` → `createCli
 | Other hand-synced mirrors (subagent test comments, `docs/upstream-pi-bugs.md` historical record) + the tautological test literal | docs | partially by `(i)`/`(h)`; the full sweep is scoped in #643 | ⚠️ #643 |
 | Version-specific **line refs** (providers.md, qwen provenance) | docs | **#651** (assigned; trigger: re-derive at every pi/pi-ai bump) — a literal scanner cannot see a line number | ⚠️ #651 |
 | Per-PR wiring can be silently unplugged by caller/callee edits in the branch | test | guard `(j)` — binding present, input declared, and BOTH the job and custom-step `if:` consume it | ✅ |
-| `@main`-at-PR-time input resolution (stale-branch window) | workflow | not statically checkable — the live per-PR run is the proof (Verification step 4) | ⚠️ accepted |
+| `@main`-at-PR-time input resolution (stale-branch window) | workflow | not statically checkable — the live per-PR run is the proof (Verification step 4); that proof **expires** at the next main-side `node-ci.yml` change, so extraction (alternative F) is the durable fix | ⚠️ accepted |
 | `patch-pi-retry.sh --check` drift semantics | script | **design fork** — scoped in #642 (assigned; trigger: before the next pi bump) | ⚠️ #642 |
 | `(h)` predicate breadth (non-`pi-` `@earendil-works/*` **direct** deps) | config | scoped in #642. Note: this is **not** the same as the `chord` exposure — `chord` appears only in lockfiles, which `(h)` never reads | ⚠️ #642 |
-| `(h)` non-vacuity strength | test | roster assertion landed in review cycle 2 — asserts the exact contributing-extension set, so coverage cannot collapse silently | ✅ |
+| `(h)` non-vacuity strength | test | per-extension pin-count map (`review-enforcer` 1, `subagent` 4, `verification-gate` 1) landed in review cycle 3 — a lost extension **or** a lost pin within one is red (the earlier name-roster stayed green at 6→3) | ✅ |
 | Gate blockingness (no code CI job is a required status check) | config | **#646** (assigned) — until then every `ci.yml` job is advisory | ⚠️ #646 |
 | Loader-parity oracle in CI | test | explicit #642 **non-goal**; machine-local oracle + session/cron staleness warning is the existing design | ⚠️ accepted (#642) |
 | ~24 files importing `@earendil-works/pi-*` with no pin/CI install | code | runtime-resolved inside a running pi (no repo pin possible); CI-coverage decision recorded in #643 | ⚠️ #643 |
@@ -313,7 +323,32 @@ merge-blocking until #646 lands.
 | second-model coherence (Phase 5.6) | 1 | **ISSUES FOUND** (1×P1, 2×P2) — see fix round 2 |
 | parallel review gates | 3 | **ISSUES FOUND** (1×P1, 4×P2/P3, 2×P4) — see fix round 3 |
 | second-model coherence (Phase 5.6) | 2 | **1×P2** (guard `(j)` overclaimed the `@main` seam) — see fix round 3 |
-| parallel review gates | 4 | pending |
+| parallel review gates | 4 | **no P0/P1/P2 code issues** — 1×P2 process (the unmet criterion is disclosed but ungated: the PR merges with `Closes #637`) + 5×P3/P4 documentation/robustness |
+| parallel review gates | 5 | pending |
+
+### Fix round — parallel review gates cycle 4 → 5
+
+- **P2 (gate #4)** — the unmet criterion is recorded but not structurally gated: the PR carries
+  `Closes #637` and GitHub reports CLEAN, so it could merge with the acceptance criterion still open.
+  Surfaced as a **human decision** in §Unmet Criterion (accept the advisory gate and let #646 land the
+  enforcement, or hold #637 until it does). Not resolved unilaterally: `Closes` vs `Refs` is a scope
+  decision, not a code fix.
+- **P3 (gate #2/#4)** — `(j)` still missed two silent-unplug paths: neutering the step's `run:` binding,
+  and adding a conjunct that makes the predicate unsatisfiable (`&& false`,
+  `&& github.event_name == 'push'` on a pull_request-only workflow). It now asserts the **exact** known-good
+  job and step predicates plus the `run: ${{ inputs.test-command }}` binding. All five mutations RED.
+- **P4 (gate #4)** — `(j)`'s 20-line job window would false-RED once a step is inserted; the block is now
+  anchored to the next top-level job key.
+- **P3 (gate #1)** — the oracle's own corpus floor was still `>= 120` while its header said 122; raised.
+- **P3/P4 (gates #1/#2/#3)** — plan wiring row still advertised the removed roster mechanism; row 8 still
+  said the required check was red; a garbled phrase ("s+run` binding"); item 7 understated `(i)`/`(j)`.
+  All corrected. The `(i)` allowlist's accepted residuals are now stated in the guard and the plan.
+- **P3 (gate #3)** — `#643`'s body predated guard `(i)` and still claimed the escaped class was entirely
+  unguarded; re-scoped to the residual surfaces. `#642`'s objective and gap-2 example corrected
+  (`chord` is lockfile-only, outside `(h)`'s scope). `#651`'s "currently unowned" corrected. `#637`
+  gained an explicit Unmet-Criterion block and the missing `check-skill-lint.oracle.test.mjs` component.
+- **P3 (gate #4)** — the `@main` proof **expires** at the next main-side `node-ci.yml` change; recorded
+  next to the wiring row with alternative F as the durable fix.
 
 ### Fix round — solution-verify cycle 1 → 2
 
@@ -376,7 +411,7 @@ which this mechanical bump introduces.
   with an explicit non-pi dependency allowlist; both mutations now RED.
 - **P2 (gates #2/#4)** — guard `(j)` overclaimed twice: (a) it matched the whole file rather than the
   `node-ci.yml` call block, and (b) it checked only *declaration*, so neutering the `unit-test` job's
-  `if:`, the custom-test step's `if:`, or the s+run` binding all left it GREEN. Now scoped to the call
+  `if:`, the custom-test step's `if:`, or the `run:` binding all left it GREEN. Now scoped to the call
   block and to the job block, asserting that BOTH the job and the step predicates consume the input.
   The `@main` caveat is stated in the guard, the wiring table and alternative F rather than claimed closed.
 - **P2 (gates #1/#2)** — the `(h)` roster was a name set: deleting 3 of subagent's 4 pins stayed green

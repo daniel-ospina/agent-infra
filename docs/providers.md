@@ -162,8 +162,8 @@ route) — noise against LLM streaming time, bought for #152 immunity.
 ### Verified against pi 0.85.1 internals (Q1)
 
 `dist/api/openai-completions.js`: `stream()` passes `options?.fetch` into
-`createClient()` (line 202) → `new OpenAI({ apiKey, baseURL, fetch, … })`
-(line 577); `StreamOptions.fetch?: FetchFunction` is part of the public type.
+`createClient()` (call site, line 202) → `new OpenAI({ apiKey, baseURL, fetch, … })`
+(`fetch` argument, line 577); `StreamOptions.fetch?: FetchFunction` is part of the public type.
 So `{ ...options, fetch: tunedFetch }` in a wrapped `ProviderStreams` is all
 that is needed — no upstream change. The extension factory is
 failure-contained: it never throws (any setup error → warn + no registration),

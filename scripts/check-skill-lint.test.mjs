@@ -495,17 +495,36 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares and consum
   // match would stay green even with the job-level predicate neutered.
   const calleeLines = callee.split("\n");
   const jobIdx = calleeLines.findIndex((l) => /^\s{2}unit-test:\s*$/.test(l));
-  const jobBlock = calleeLines.slice(jobIdx, jobIdx + 20).join("\n");
-  // TWO predicates must consume the input: the JOB's `if:` (does the job run at
-  // all) and the custom-test STEP's `if:` (does the suite actually execute).
-  // Neutering either one leaves a green job with zero pin check — N4/N4c in the
-  // negative-test set. An unscoped match would be satisfied by the step alone.
-  const predicates = [...jobBlock.matchAll(/^\s+if:\s*inputs\.test-command\s*!=\s*''/gm)];
-  assert.ok(
-    predicates.length >= 2,
-    "the `unit-test` job and its custom-test step must BOTH consume " +
-      "`inputs.test-command` in their `if:` — otherwise the job can report green " +
-      `without running the suite (found ${predicates.length} such predicate(s))`
+  // Anchor the block to the NEXT top-level job key rather than a magic line
+  // count — a fixed window would false-RED as soon as a step is inserted above.
+  const nextRel = calleeLines
+    .slice(jobIdx + 1)
+    .findIndex((l) => /^  \S[^:]*:\s*$/.test(l));
+  const jobEnd = nextRel === -1 ? calleeLines.length : jobIdx + 1 + nextRel;
+  const jobBlock = calleeLines.slice(jobIdx, jobEnd).join("\n");
+  // BOTH predicates must consume the input, and EXACTLY in the known-good shape.
+  // A conjunct that can never hold (`if: inputs.test-command != '' && false`, or
+  // `&& github.event_name == 'push'` on a pull_request-only workflow) leaves the
+  // counts intact while the job never runs, so presence alone is not enough.
+  assert.match(
+    jobBlock,
+    /^\s{4}if:\s*inputs\.test-command != '' \|\| inputs\.test-glob != ''\s*$/m,
+    "the `unit-test` JOB's activation predicate must be exactly " +
+      "`inputs.test-command != '' || inputs.test-glob != ''` — an added conjunct can " +
+      "make the job unsatisfiable while every check stays green"
+  );
+  assert.match(
+    jobBlock,
+    /^\s{8}if:\s*inputs\.test-command != ''\s*$/m,
+    "the custom-test STEP's `if:` must be exactly `inputs.test-command != ''` — " +
+      "otherwise the step can be skipped silently"
+  );
+  // And the step must actually RUN the input, not just be guarded by it.
+  assert.match(
+    jobBlock,
+    /run:\s*\$\{\{\s*inputs\.test-command\s*\}\}/,
+    "the custom-test step no longer runs `${{ inputs.test-command }}` — the job " +
+      "would report green without executing the suite"
   );
 });
 

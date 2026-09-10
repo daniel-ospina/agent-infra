@@ -21,8 +21,8 @@
  *
  * ── How the fetch override works (verified against pi-ai 0.85.1 dist) ───────
  * `api/openai-completions.js` calls `createClient(model, ctx, apiKey,
- * options?.headers, options?.fetch, ...)` (line 202) and passes `fetch` into
- * `new OpenAI({ apiKey, baseURL, fetch, ... })` (line 577). `StreamOptions`
+ * options?.headers, options?.fetch, ...)` (call site, line 202) and passes `fetch` into
+ * `new OpenAI({ apiKey, baseURL, fetch, ... })` (`fetch` argument, line 577). `StreamOptions`
  * (`ProviderRequestOptions`) declares `fetch?: FetchFunction`. So wrapping the
  * real stream with `{ ...options, fetch: tunedFetch }` is sufficient — the
  * OpenAI SDK will route every qwen-ha HTTP request through our fetch.
