@@ -441,6 +441,7 @@ try {
   bashPin("#625: hub-rooted CLEAN gawk --incl inplace (abbreviated) → BLOCK", `gawk --incl inplace '{print}' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN gawk -i inplace --file p.awk → BLOCK", `gawk -i inplace --file p.awk ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN gawk --incl inplace --source prog → BLOCK", `gawk --incl inplace --source '{print}' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN redirect operand after a leading line continuation → BLOCK", `echo x > \\\n  ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN single-operand cp on tracked file → ALLOW (malformed no-op)", `cp ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)");
   bashPin("#625: hub-rooted CLEAN single-operand mv on tracked file → ALLOW (malformed no-op)", `mv ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)");
   bashPin("bash#621: hub-rooted session → own worktree file → ALLOW", `cd ${wt} && echo x > wt-own.txt`, hub, "ALLOW (no hub-main write)");
@@ -671,6 +672,7 @@ expectBool("#625 source pin: sed + gawk long-option arity tables declared", clas
 expectBool("#625 source pin: sed in-place resolved via the prefix table (BSD -i '' guard too)", classifySrc.includes('resolved === "in-place"') && classifySrc.includes("_isSedInPlaceLong(words[wi - 1])"), true);
 expectBool("#625 source pin: gawk --include resolved via the prefix table", classifySrc.includes('if (resolved === "include") {'), true);
 expectBool("#625 source pin: awk program-providing long options set hasProgFlag", classifySrc.includes('if (resolved === "file" || resolved === "source" || resolved === "exec") hasProgFlag = true;'), true);
+expectBool("#625 source pin: readWord skips a leading line continuation + indent", classifySrc.includes('if (w === "") { k = skipWs(k2); continue; }') && classifySrc.includes("const k2 = k + 2;"), true);
 expectBool("#625 source pin: cp/mv/install destination requires a source operand", classifySrc.includes("positionals.length > 1") && classifySrc.includes("if (positionals.length > 0) emitDst(targetDir, positionals, alsoSources);"), true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
@@ -4408,6 +4410,16 @@ try {
     lacks("printf y | tee safe$'\\n'tracked.md", "tee:H/tracked.md", "decoded whitespace cannot inject a token");
     has("echo x > tracked\\\n.md", "redirect:H/tracked.md", "backslash-newline is a line continuation");
     has("printf y | tee tracked\\\n.md", "tee:H/tracked.md", "tee line continuation is not truncated");
+    // #625 review cycle-12: a LEADING `\`+newline + indent before a redirect/tee
+    // operand. readWord returned an EMPTY operand there (the `\` arm advanced
+    // over the continuation and then exited on the indent's whitespace), so the
+    // write target was dropped and the gate ALLOWed a tracked hub-main write.
+    has("echo x > \\\n  tracked.md", "redirect:H/tracked.md", "redirect operand after a leading line continuation + indent");
+    has("echo x >> \\\n  tracked.md", "redirect:H/tracked.md", "append operand after a leading line continuation");
+    has("echo x >| \\\n  tracked.md", "redirect:H/tracked.md", "clobber operand after a leading line continuation");
+    has("printf y | tee \\\n  tracked.md", "tee:H/tracked.md", "tee operand after a leading line continuation");
+    has("echo x >\\\n  tracked.md", "redirect:H/tracked.md", "continuation directly after the redirect operator");
+    lacks("echo x > foo\\\n  tracked.md", "redirect:H/tracked.md", "mid-word continuation + indent stays TWO words (bash semantics)");
     // #625 review cycle-10: getopt_long ABBREVIATIONS (fail-open) + single-operand no-ops.
     // GNU sed/gawk accept any UNAMBIGUOUS long-option prefix, so matching exact
     // spellings alone let `sed --in-pl …` / `gawk --incl inplace …` resolve to ZERO

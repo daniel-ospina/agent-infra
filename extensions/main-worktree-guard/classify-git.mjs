@@ -4548,7 +4548,26 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       }
       if (ch === "$" && s[k + 1] === '"') { q = '"'; k += 2; continue; }   // $"…" == "…"
       if (ch === "'" || ch === '"') { q = ch; k++; continue; }
-      if (ch === "\\") { if (k + 1 < n) { if (s[k + 1] !== "\n") w += s[k + 1]; k += 2; continue; } }
+      if (ch === "\\") {
+        if (k + 1 < n && s[k + 1] === "\n") {
+          // `\`+newline is a LINE CONTINUATION: bash deletes it and re-scans the
+          // remaining text, so what follows still decides the word boundary.
+          // A LEADING continuation + indent (`> \<NL>  f`) is just prefix
+          // whitespace before the operand — skipping it is required, else the
+          // word ends empty and the operand is dropped (#625 cycle-12 P1: the
+          // redirect/tee operand path ALLOWed a tracked hub-main write). A
+          // MID-WORD continuation followed by whitespace still TERMINATES the
+          // word (`a\<NL>  b` is two words); with no whitespace it joins
+          // (`a\<NL>b` → `ab`).
+          const k2 = k + 2;
+          if (k2 < n && /\s/.test(s[k2])) {
+            if (w === "") { k = skipWs(k2); continue; }
+            return { w, k: k2 };
+          }
+          k += 2; continue;
+        }
+        if (k + 1 < n) { w += s[k + 1]; k += 2; continue; }
+      }
       w += ch; k++;
     }
     return { w, k };

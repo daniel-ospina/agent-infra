@@ -356,7 +356,10 @@ dirty, and trips M4's freeze. Surfaces:
    `gawk --incl inplace` ≡ `--include inplace`), so an abbreviated in-place
    flag cannot slip the gate; and `cp`/`mv`/`install` require at least one
    SOURCE before a destination is surfaced (a single-operand `cp f` is a
-   malformed no-op that writes nothing). An fd-prefixed OUTPUT redirect for ANY fd
+   malformed no-op that writes nothing); and `\`+newline line continuations
+   are deleted before the operand is read, so a continuation (with or without
+   following indent) between a redirect/`tee` operator and its target cannot
+   hide the target. An fd-prefixed OUTPUT redirect for ANY fd
    (`2>f`, `3>f`, `N>|f`) is a write candidate — the open truncates the file
    even when nothing is written through it; `N<f`/`N>&M`/`N>&-` are not.
    Still outside this mechanism's scope (documented residuals):
