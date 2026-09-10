@@ -6063,6 +6063,12 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     let dqT = null;
     for (let kT = t.idx; kT < n; kT++) {
       const cT = s[kT];
+      // `\`+newline is a LINE CONTINUATION — the tee command continues on the
+      // next line (bash deletes the pair), so it is NOT a segment boundary.
+      // Treating it as one truncated `lim` at the continuation and dropped every
+      // operand after it (#625 cycle-13 P1: `printf y | tee \<NL> -a <hub>/f`
+      // captured no target while bash appended to the tracked file).
+      if (dqT === null && cT === "\\" && s[kT + 1] === "\n") { kT++; continue; }
       if (dqT === null && cT === "\n") { segEnd = kT; break; }
       if (dqT === null && (cT === ";" || cT === "&" || cT === "|" || cT === ")")) { segEnd = kT; break; }
       if (dqT !== null && cT === "\\") { kT++; continue; }
