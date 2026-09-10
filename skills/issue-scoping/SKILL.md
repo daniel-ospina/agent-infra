@@ -267,6 +267,10 @@ VERIFIER B: [P0: ..., P1: ..., P2: ...]
 
 **Stuckness escalation:** If the SAME P0/P1 is flagged by verifiers for 3 consecutive cycles and controller has ignored it each time → escalate to human. The verifiers see something the controller doesn't.
 
+**Loop budget — 4 cycles per verification gate, counted across fresh dispatches (#665).** The budget belongs to the gate's review LOOP, NOT to a verifier: Step 3 always re-dispatches FRESH `task` sessions, and a fresh verifier does NOT reset, extend, or replenish the budget (AGENTS.md §Review Loop Protocol §Loop Budget). On cap → document the remaining issues, post `⚠️ capped at 4 cycles — M issues remain`, proceed.
+
+**Convergence — Accepted bounds (#665).** The controller maintains an Accepted-bounds list in the scoping artifact: one entry per bound examined and deliberately accepted — `id`, the bound, why it is accepted, and the owner (issue / PR / control) that covers it. Every verifier prompt carries the list verbatim with: *"Do NOT report a defect that is an instance of a recorded bound; report only a finding that is NOT a recorded bound; if you believe a bound is wrong, label it `BOUND-CHALLENGE: <id>`."* A cycle whose findings are all recorded bounds, or new variants of them, produces **no new class** → record `converged (no new class)`, do not re-dispatch, and do not count it against the budget. A `BOUND-CHALLENGE` is the only way a recorded bound re-enters the loop (accept → reclassify, continue; otherwise record the rejection rationale).
+
 **Cycle log entry:**
 ```
 ### problem-verify — Cycle N
@@ -284,7 +288,7 @@ VERIFIER B: [P0: ..., P1: ..., P2: ...]
 
 ### Gate Mechanics
 
-Same as problem-verify: 2 parallel verifiers → controller tiebreaker → re-dispatch for P0/P1 → pass for P2+ only.
+Same as problem-verify: 2 parallel verifiers → controller tiebreaker → re-dispatch for P0/P1 → pass for P2+ only. Same loop-level budget (4 cycles, counted across fresh dispatches; a fresh verifier does NOT reset it) and same Accepted-bounds convergence mechanism as Phase 2.5 (#665).
 
 ### Verifier Prompt
 
@@ -918,7 +922,10 @@ Each review cycle dispatches FRESH `task` sub-agents.
 - Honest-stuck: non-decreasing issue count for 3 cycles → escalate
 - Zero-progress: plan unchanged for 2 cycles → escalate
 - Convergence: strict subset of prior cycle → escalate with remaining issues
-**Safety cap:** 10 cycles.
+
+**Loop budget: 4 cycles per gate, counted across fresh dispatches (#665).** The budget belongs to this review LOOP, NOT to a reviewer: every cycle dispatches fresh `task` sub-agents, and a FRESH reviewer does NOT reset, extend, or replenish it (AGENTS.md §Review Loop Protocol §Loop Budget). On cap → document the remaining issues, post `⚠️ capped at 4 cycles — M issues remain`, proceed.
+
+**Convergence — Accepted bounds (#665).** The controller maintains an Accepted-bounds list in the scoping artifact (plan doc / issue comment): one entry per bound examined and deliberately accepted — `id`, the bound, why it is accepted, and the owner (issue / PR / control) that covers it. Every reviewer prompt carries the list verbatim with the `BOUND-CHALLENGE: <id>` instruction (AGENTS.md §Convergence — Accepted Bounds). A cycle that reports only recorded bounds, or new variants of them, produces **no new class** → record `converged (no new class)`, do not dispatch again, and do not count it against the budget. A reviewer re-reporting a recorded bound is not progress.
 
 ---
 

@@ -37,6 +37,12 @@ jobs:
         # #254 — frontmatter validator fixture-regression (post-merge, ci-main)
         echo "== scripts/check-skill-lint.test.mjs =="
         node scripts/check-skill-lint.test.mjs || failures=$((failures+1))
+        # #665 — review cycle logs are machine-checkable (loop-level budget):
+        # the checker over the repo's own docs, then its fixture suite.
+        echo "== scripts/check-review-cycle-log.mjs =="
+        node scripts/check-review-cycle-log.mjs || failures=$((failures+1))
+        echo "== scripts/check-review-cycle-log.test.mjs =="
+        node scripts/check-review-cycle-log.test.mjs || failures=$((failures+1))
         for t in extensions/*/test*.mjs; do
           [ -f "$t" ] || continue
           echo "== $t =="

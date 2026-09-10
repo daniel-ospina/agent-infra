@@ -842,7 +842,7 @@ Filter out issues with score < 50. If none survive → go to Step 9 (Logging), t
 
 **Fixer configuration** — read `operations/ai-workflow-tools/config.json` (defaults if missing):
 - `fixer_enabled`: default `true`
-- `max_fix_cycles`: **REMOVED** — no cycle cap (convergence-gated instead)
+- `max_fix_cycles`: **REMOVED** — the cap is the loop-level budget in the Gate Loop below (4 cycles per gate, counted across fresh dispatches), not a per-reviewer counter
 - `stall_threshold`: default `0.8`
 
 If `fixer_enabled == false` OR `--re-review` is active → skip fixer loop, go to Step 7.
@@ -882,6 +882,7 @@ For each cycle:
 
 2. **Re-review**: Run `--re-review` on the new commits. This dispatches FRESH reviewer
    sub-agents via `task` — they see only the current code, not what was "just fixed."
+   **Inject the Accepted-bounds list** (see below) verbatim into every reviewer prompt.
 
 3. **Stuckness detection (3-layer algorithm)**:
 
@@ -893,11 +894,18 @@ For each cycle:
 
 **Exit conditions — ALL must be true before proceeding to Step 8:**
 
-- [ ] Last `--re-review` returned zero issues with confidence ≥ 50
+- [ ] Last `--re-review` returned zero issues with confidence ≥ 50, **or** the cycle produced no new class (converged against the Accepted-bounds list)
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
+- [ ] Accepted-bounds list is current and was injected into the last reviewer prompt
 - [ ] Cycle log posted: each cycle's issues, fixes, and re-review results documented
 
-**No hard cap.** The fix loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (prevents runaway loops from bugs, not a quality gate).
+**Loop budget — 4 cycles per gate, counted across fresh dispatches.** The budget belongs to this fixer loop, NOT to a reviewer: every `--re-review` dispatch increments the same counter, and a FRESH reviewer does NOT reset, extend, or replenish it (AGENTS.md §Review Loop Protocol §Loop Budget). On cap → document the remaining issues, post `⚠️ capped at 4 cycles — M issues remain`, proceed. This replaces the old per-reviewer "safety cap at 10 cycles" — 10 was reachable precisely because each fresh reviewer looked like a new loop.
+
+**Convergence — Accepted bounds.** The orchestrator maintains an Accepted-bounds list in the PR body (or the review comment): one entry per bound examined and deliberately accepted — `id`, the bound, why it is accepted, and the owner (issue / PR / control) that covers it. Every fixer and reviewer prompt carries the list verbatim with the `BOUND-CHALLENGE: <id>` instruction (AGENTS.md §Convergence — Accepted Bounds).
+
+- A re-review that reports only recorded bounds, or new variants of them (a new spelling of a crafted-decoy bypass, a different dead-step shape for the same accepted residual), produces **no new class**. Record `converged (no new class)`, do NOT dispatch another cycle, and do NOT count it against the budget.
+- A `BOUND-CHALLENGE` is the only way a recorded bound re-enters the loop: accept it (reclassify the bound, continue — the cycle counts) or record the rejection rationale.
+- This is the distinction the budget alone cannot make: *still finding defects* (new class → counts) versus *still finding exotic variants of one accepted bound* (converge).
 
 **Convergence rule:** If re-review issues are a strict subset of the previous cycle's issues (no new dimensions or files flagged), the fixer is in a refinement loop. Log convergence and escalate to human: present remaining issues with attempted fixes. Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.
 
@@ -914,6 +922,8 @@ For each cycle:
 ```yaml
 exit_reason: <clean|fingerprint-stall|honest-stuck|cycle-cap|convergence|stall-guard>
 cycles: <N>
+budget: 4
+new_class_per_cycle: <json array of booleans>
 issues_per_cycle: <json array>
 files_changed_per_cycle: <json array>
 skill: code-review

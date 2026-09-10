@@ -59,7 +59,7 @@ Phase 3: Fix (research-backed, surgical edits)
     ↓
 Phase 4: Re-review (fresh sub-agents, no memory of prior cycle)
     ↓
-Loop until NO ISSUES FOUND or convergence (fingerprint-stall; safety cap: 10 cycles)
+Loop until NO ISSUES FOUND or convergence (fingerprint-stall); loop budget: 3 cycles, counted across fresh dispatches (NOT per reviewer — #665)
 ```
 
 ### Phase 0 — Research Intake (Proactive Testing Knowledge)
@@ -153,7 +153,7 @@ Produce a `### Testing Knowledge` block with ALL findings (from knowledge base +
 
 ### Phase 1 — Review (4 Parallel Agents)
 
-Launch 4 reviewers **in parallel** via Pi `task`. Each receives the full test file(s), surface map (if available), and journey map (if available). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
+Launch 4 reviewers **in parallel** via Pi `task`. Each receives the full test file(s), surface map (if available), journey map (if available), **and the current Accepted-bounds list** (Phase 4 §Convergence) with the `BOUND-CHALLENGE: <id>` instruction. Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
 
 **Multi-file support:** TEST FILE may be a single file or a list. For multiple files, review all simultaneously — 4 parallel reviewers examine all files in one dispatch. Output per-file issues with file path prefix. Limit 5 files per dispatch (context window).
 
@@ -411,17 +411,20 @@ For each cycle:
 
 **Exit conditions — ALL must be true:**
 
-- [ ] Last cycle's all reviewers returned "NO ISSUES FOUND" (verbatim, not paraphrased)
+- [ ] Last cycle's all reviewers returned "NO ISSUES FOUND" (verbatim, not paraphrased), **or** the cycle produced no new class (converged against the Accepted-bounds list)
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
+- [ ] Accepted-bounds list is current and was injected into the last reviewer prompt
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 
-**Hard cap: 10 cycles (fingerprint-stall).** Test review is narrower scope than plan review. On cap:
+**Loop budget: 3 cycles, counted across fresh dispatches — NOT per reviewer (#665).** Test review is narrower scope than plan review. The budget belongs to this review LOOP: every cycle dispatches fresh reviewers, and a FRESH reviewer does NOT reset, extend, or replenish the budget (AGENTS.md §Review Loop Protocol §Loop Budget). On cap:
 ```
-⚠️ Test review capped at 10 cycles — N issues remain:
+⚠️ Test review capped at 3 cycles — N issues remain:
   - [issue 1]
   - [issue 2]
 Proceeding with known gaps. Fix in a follow-up.
 ```
+
+**Convergence — Accepted bounds.** The orchestrator maintains an Accepted-bounds list in the artifact under review (plan doc / PR body): one entry per bound examined and deliberately accepted — `id`, the bound, why it is accepted, and the owner (issue / PR / control) that covers it. Every reviewer prompt carries it verbatim with the `BOUND-CHALLENGE: <id>` instruction (AGENTS.md §Convergence — Accepted Bounds). A cycle that reports only recorded bounds, or new variants of them, produces **no new class** → record `converged (no new class)`, do not dispatch again, and do not count it against the budget. A reviewer re-reporting a recorded bound is not progress.
 
 **FORBIDDEN:**
 - ❌ Run review → get issues → fix → declare done without re-dispatching reviewers
@@ -458,7 +461,7 @@ Journey map coverage: ✓ | skipped (no journey map)
 - `test-design` output (Integration Surface Map)
 - Plan doc's `### Journey Test Map` section
 
-**Pattern:** Mirrors `plan-review`'s research+review+fix+re-review loop structure, adapted for test-level scope (narrower, 4 reviewers, 3-cycle cap instead of 10).
+**Pattern:** Mirrors `plan-review`'s research+review+fix+re-review loop structure, adapted for test-level scope (narrower, 4 reviewers, 3-cycle loop-level budget). The budget is counted across fresh dispatches and is NOT reset by re-dispatching reviewers (#665).
 
 ## When NOT to Use
 

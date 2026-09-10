@@ -38,7 +38,7 @@ steps:
 > **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
 > **Canonical:** `agent-infra/skills/plan-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
-> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers (2-4), convergence-gated (cap proportional to risk: 3 for Medium, 5 for Medium-High, 8 for High). Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
+> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers (2-4), convergence-gated. **Loop budget is loop-level, counted across fresh dispatches, never per reviewer** (#665): 3 cycles for Medium risk, 5 for Medium-High, 8 for High. Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
 
 # Plan Review
 
@@ -64,6 +64,8 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 | **Low-Medium** (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |
 | **Medium-High** (large plan, some novelty) | 3 reviewers (+ Efficiency) | 5 |
 | **High** (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 8 |
+
+**Max Cycles is a LOOP-LEVEL budget, not a per-reviewer cap (#665).** Every cycle dispatches fresh reviewers; a fresh reviewer does NOT reset, extend, or replenish the budget (AGENTS.md §Review Loop Protocol §Loop Budget). A cycle that finds no new class — only recorded accepted bounds or variants of them — converges and does not consume the budget (AGENTS.md §Convergence — Accepted Bounds).
 
 **Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers. The agent notes the decision; a reviewer sub-agent validates it.
 
@@ -112,7 +114,7 @@ When review finds issues, the agent attempts to resolve them autonomously before
 
 ### Phase 1 — Review (Parallel Agents)
 
-Launch the proportional reviewer count (N) from the Review Cycles table **in parallel** via Pi `task`. Each receives the full plan doc, issue spec (if available), epic doc (if available), and research context (if resolved). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
+Launch the proportional reviewer count (N) from the Review Cycles table **in parallel** via Pi `task`. Each receives the full plan doc, issue spec (if available), epic doc (if available), research context (if resolved), **and the current Accepted-bounds list** (see Phase 4 §Convergence — Accepted Bounds) with the `BOUND-CHALLENGE: <id>` instruction. Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
 
 ---
 
@@ -387,11 +389,14 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 **Exit conditions — ALL must be true before proceeding to Phase 5:**
 
-- [ ] Last cycle's all N reviewers returned "NO ISSUES FOUND" (verbatim, not paraphrased)
+- [ ] Last cycle's all N reviewers returned "NO ISSUES FOUND" (verbatim, not paraphrased), **or** the cycle produced no new class (converged against the Accepted-bounds list)
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
+- [ ] Accepted-bounds list is current and was injected into the last reviewer prompt
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 
-**No hard cap.** The loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (runaway prevention, not a quality gate).
+**Loop budget — the risk-tier Max Cycles from the Proportional Review Cycles table (3 / 5 / 8), counted across fresh dispatches.** The budget belongs to this review LOOP, NOT to a reviewer: every cycle dispatches fresh reviewers, and a FRESH reviewer does NOT reset, extend, or replenish the budget (AGENTS.md §Review Loop Protocol §Loop Budget). This replaces the old "No hard cap / safety cap at 10 cycles" text — a per-reviewer reading is exactly why the #637 gate ran 10 cycles. On cap → document the remaining issues, post `⚠️ capped at N cycles — M issues remain`, proceed.
+
+**Convergence — Accepted bounds.** The orchestrator maintains an Accepted-bounds list in the plan doc: one entry per bound examined and deliberately accepted — `id`, the bound, why it is accepted, and the owner (issue / PR / control) that covers it. Every reviewer prompt carries the list verbatim with the `BOUND-CHALLENGE: <id>` instruction (AGENTS.md §Convergence — Accepted Bounds). A cycle that reports only recorded bounds, or new variants of them, produces **no new class** → record `converged (no new class)`, do not dispatch again, and do not count it against the budget. A `BOUND-CHALLENGE` is the only way a recorded bound re-enters the loop.
 
 **Stuckness detection (3-layer algorithm)**:
 
@@ -408,6 +413,8 @@ c. **Zero-progress**: Track whether the plan doc was modified each cycle. If pla
 ```yaml
 exit_reason: <clean|fingerprint-stall|honest-stuck|cycle-cap|convergence>
 cycles: <N>
+budget: <3|5|8 per risk tier>
+new_class_per_cycle: <json array of booleans>
 issues_per_cycle: <json array>
 plan_modified_per_cycle: <json array of booleans>
 ```
@@ -505,6 +512,6 @@ This gives one orchestrator-level recovery before waking the human.
 
 ## Announce
 
-At invocation: "Running plan-review on `[plan-doc-path]` with N parallel reviewers (proportional to plan risk). Capped at [3|5|8] cycles per plan risk tier — escalates to human at cap. See Proportional Review Cycles table. Does not auto-exit with remaining issues."
+At invocation: "Running plan-review on `[plan-doc-path]` with N parallel reviewers (proportional to plan risk). Loop budget [3|5|8] cycles per plan risk tier, counted across fresh dispatches — a fresh reviewer does NOT reset it; escalates to human at cap. See Proportional Review Cycles table. Does not auto-exit with remaining issues."
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

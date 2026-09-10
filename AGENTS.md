@@ -105,21 +105,70 @@ Every review cycle MUST dispatch a FRESH `task` sub-agent. The reviewer has no m
 
 #### Exit Conditions — ALL Must Be True
 
-- [ ] Last `task` reviewer response was "NO ISSUES FOUND" (verbatim, not paraphrased)
+- [ ] Last `task` reviewer response was "NO ISSUES FOUND" (verbatim, not paraphrased), **or** the loop converged with no new class (§Convergence — Accepted Bounds)
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
-- [ ] Cycle log posted: each cycle's issues and fixes documented
+- [ ] The Accepted-bounds list is current and was injected into the last reviewer prompt
+- [ ] Cycle log posted: each cycle's issues and fixes documented, with the machine-readable `review-cycles` record (§Cycle Log)
 
-#### Hard Cap
+#### Loop Budget — counted across fresh dispatches, NOT per reviewer
 
-4 cycles maximum per reviewer (unless skill specifies otherwise). On cap → document remaining issues, post with `⚠️ capped at N cycles — M issues remain`, proceed.
+**The budget belongs to the LOOP, not to a reviewer.** Count every dispatch for one gate, starting at 1 for the gate's first dispatch. Default: **4 cycles per gate**, unless the skill states its own loop budget — a skill may set a tighter or risk-proportional budget, never a per-reviewer one.
+
+**Dispatching a fresh reviewer does NOT reset, extend, or replenish the budget.** The fresh-context rule exists to defeat confirmation bias, not to hand the loop a new counter. A gate that has dispatched 4 cycles has spent its budget no matter how many distinct reviewer processes were involved — a fresh reviewer is a new *reviewer*, never a new *loop*.
+
+On cap → document the remaining issues, post with `⚠️ capped at N cycles — M issues remain`, proceed. Capping is a documented proceed, not a silent merge: the `⚠️` line and the remaining issues stay in the artifact.
+
+#### Convergence — Accepted Bounds (the normal exit, before the cap)
+
+The budget is the backstop; convergence is how a loop normally ends. The orchestrator maintains an **Accepted bounds** list in the artifact under review (plan doc / PR body / review comment): one entry per bound that was examined and deliberately accepted — `id`, the bound, why it is accepted, and the owner (issue / PR / control) that covers it.
+
+Every fresh reviewer prompt MUST include the current list verbatim, with:
+
+> The bounds below were examined and accepted. Do NOT report a defect that is an instance of one of them, and do NOT re-report it as a new finding. Report only a finding that is NOT a recorded bound. If you believe a recorded bound is wrong, say so explicitly and label it `BOUND-CHALLENGE: <id>`.
+
+A cycle that finds only recorded bounds (or new variants of them) produces **no new class**:
+
+- record the cycle as `converged (no new class)` in the cycle log;
+- **a cycle with no new class does not extend the budget** — the loop stops dispatching and moves to the exit conditions (or caps, if it is already at the budget);
+- a `BOUND-CHALLENGE` is the only way a recorded bound re-enters the loop: the orchestrator either accepts it (reclassify the bound; the loop continues and the cycle counts) or records the rejection rationale.
+
+This is the distinction the budget alone cannot make: *still finding defects* (a new class → the cycle counts) versus *still finding exotic variants of an already-recorded accepted bound* (no new class → converge). A reviewer re-reporting a recorded bound is not progress and must not be treated as one.
+
+#### Cycle Log — numbering + machine-readable record
+
+Cycle numbering is **per gate**, and it must be unambiguous when the log is read as one table:
+
+- A cycle's identity is `<gate>#<n>`: the Gate column carries the gate id, the Cycle column the integer.
+- Within one gate, `n` is unique and strictly increasing down the table. Two gates may each own a cycle 1 (`code-review#1`, `plan-review#1`) — that is not a duplicate. What is forbidden is the same `<gate>#<n>` twice, or one gate spelled inconsistently across rows.
+- **Every cross-reference must resolve.** A reference must be gate-qualified (`see fix round — code-review cycle 6`) and must point at a `### Fix round — code-review cycle 6` heading in the same artifact. A bare `see fix round 6` is malformed — it does not resolve when the log is read as one table. A cross-referenced fix round that was never written is a defect, not a formality.
+- The table header is exactly `| Gate | Cycle | Result |`.
+
+Every artifact with a cycle log also carries a machine-readable record so the budget is checkable:
+
+```md
+<!-- review-cycles
+cap: 4
+code-review: 4
+issue-scoping: 2
+plan-review: 6 cap=8
+-->
+```
+
+- `cap:` is the loop budget for the gates in this log (default 4, per §Loop Budget). A gate may carry its own `cap=<n>` to override it — e.g. plan-review's risk tiers (3 / 5 / 8).
+- `<gate>: <n>` records that gate's total dispatched cycles; append `capped` when the loop ended at the budget with issues remaining — which requires the `⚠️ capped at N cycles — M issues remain` line in the artifact.
+- The recorded count must equal the gate's row count, and every gate in the table must be recorded (a gate may be recorded at `0` before its first dispatch).
+- Checked by `scripts/check-review-cycle-log.mjs` (fixtures: `scripts/check-review-cycle-log.test.mjs`), wired into PR and post-merge CI. A malformed, duplicate-numbered, out-of-order, over-budget, or count-mismatched log fails the check. Legacy logs that predate this convention are listed in `scripts/review-cycle-log-baseline.txt` — stale-detecting, so removing an exemption is the goal and adding one is not.
 
 #### FORBIDDEN — These Bypass the Quality Gate Entirely
 
 - ❌ Run review → get issues → fix → declare done without re-dispatching reviewer
   This IS skipping the review. Fixing without re-reviewing = no review.
 
+- ❌ Treat a fresh dispatch as a budget reset
+  The budget counts the loop, not the reviewer (§Loop Budget). Re-dispatching a fresh reviewer to buy "another cycle" after the cap is the #637 runaway (10 code-review cycles against a 4-cycle budget).
+
 - ❌ Self-declare "I addressed the feedback" as completion
-  Only "NO ISSUES FOUND" from a fresh reviewer is a valid exit signal.
+  Only "NO ISSUES FOUND" from a fresh reviewer — or a converged, no-new-class cycle against the Accepted-bounds list — is a valid exit signal.
 
 - ❌ Re-review in the same conversation context
   Confirmation bias makes same-context re-review unreliable.

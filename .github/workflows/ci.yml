@@ -164,3 +164,22 @@ jobs:
         env:
           SWARM_ROOT: ${{ github.workspace }}/swarm
         run: scripts/check-vendor-drift.sh --manifest
+
+  review-cycle-log:
+    # #665 — the review-loop budget is LOOP-LEVEL (counted across fresh
+    # dispatches, AGENTS.md §Review Loop Protocol §Loop Budget), so the cycle
+    # count must be machine-readable and checkable. This job runs the checker
+    # over the repo's own plan/scoping docs, then its fixture suite (RED/GREEN
+    # cases). Context: the #637 gate ran 10 code-review cycles against a
+    # 4-cycle budget and 5 issue-scoping cycles, and the log carried two
+    # cycles numbered "5" plus a `see fix round 7` that resolved to nothing —
+    # none of which any machine could see.
+    # NOTE: CI-VISIBLE, not merge-blocking — the repo's only required status
+    # check is pipeline-compliance (#646), same as the #637 pin gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Review cycle logs are well-formed and within budget
+        run: node scripts/check-review-cycle-log.mjs
+      - name: Review cycle log check fixtures (RED/GREEN cases)
+        run: node scripts/check-review-cycle-log.test.mjs
