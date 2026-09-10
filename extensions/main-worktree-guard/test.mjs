@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -4521,6 +4521,248 @@ try {
   expectUntrackedWip("scratch flagged, normal file not", "?? foo.tmp\n?? src/new.ts", ["foo.tmp", "src/new.ts"], [{ path: "foo.tmp", pattern: "scratch" }]);
   expectUntrackedWip("tracked-only changes → no wip", " M src/index.ts\nD  old.txt", [], []);
   expectUntrackedWip("quoted-spelling path unquoted", '?? "docs/plans/my file.md"', ["docs/plans/my file.md"], [{ path: "docs/plans/my file.md", pattern: "docs/plans" }]);
+
+  // ── #627 / #628: pins (adversarial-review findings of PR #624) ──────────
+  // #627 closes the non-shell sibling of the #1484 shell script backdoor;
+  // #628 bounds + surfaces the disordered-hub new-file carve-out. These pins
+  // are BEHAVIORAL on the exported pure functions + the shared walker (index.ts
+  // is not importable) — every one FAILS on origin/main.
+
+  // #627 extractCodePayload — leading-position, wrapper-aware, version/path
+  // normalized, inline/file/module/stdin kinds, attached inline spellings.
+  const cp = (c) => extractCodePayload(c);
+  expectBool("P627-1: python3 -c inline payload extracted", cp(`python3 -c 'import subprocess'`)?.kind === "inline" && cp(`python3 -c 'import subprocess'`)?.value === "import subprocess", true);
+  expectBool("P627-2: attached -c'payload' extracted (short form)", cp(`python3 -c'import os; os.system("git reset")'`)?.kind === "inline" && cp(`python3 -c'import os'`)?.value === "import os", true);
+  expectBool("P627-3: node -e / --eval= / -p extracted", cp(`node -e 'x'`)?.value === "x" && cp(`node --eval='x'`)?.value === "x" && cp(`node -p 'x'`)?.value === "x", true);
+  expectBool("P627-4: ruby/perl/php inline flags extracted", cp(`ruby -e 'x'`)?.value === "x" && cp(`perl -E 'x'`)?.value === "x" && cp(`php -r 'x'`)?.value === "x", true);
+  expectBool("P627-5: script-file positional extracted", cp(`python3 /tmp/x.py arg1`)?.kind === "file" && cp(`python3 /tmp/x.py arg1`)?.value === "/tmp/x.py", true);
+  expectBool("P627-6: version + path qualified interpreters match", cp(`python3.11 -c 'x'`)?.value === "x" && cp(`/usr/bin/python3 -c 'x'`)?.value === "x" && cp(`${m4Tmp}/venv/bin/python -c 'x'`)?.value === "x", true);
+  expectBool("P627-7: env/sudo/cd/assignment wrappers skip to the interpreter", cp(`FOO=1 python3 -c 'x'`)?.value === "x" && cp(`sudo -u root python3 -c 'x'`)?.value === "x" && cp(`cd /tmp && python3 -c 'x'`)?.value === "x" && cp(`env -i python3 -c 'x'`)?.value === "x", true);
+  expectBool("P627-8: -m module / bare - stdin / < file stdin kinds", cp(`python3 -m http.server`)?.kind === "module" && cp(`python3 -`)?.kind === "stdin" && cp(`python3 < /tmp/x.py`)?.kind === "stdin-file", true);
+  expectBool("P627-9: shell interpreters / git / non-interpreters are NOT code payloads", cp(`bash -c 'x'`) === null && cp(`git -c k=v status`) === null && cp(`ls -la`) === null && cp(`echo python3 -c 'x'`) === null, true);
+
+  // #627 extractCodeGitCommands — the execution-sink requirement is the
+  // false-block guard (inert literals stay allowed, matching the shell surface).
+  expectBool("P627-10: array-form git command reconstructed", JSON.stringify(extractCodeGitCommands(`import subprocess; subprocess.run(["git","reset","--hard","origin/main"])`)) === JSON.stringify(["git reset --hard origin/main"]), true);
+  expectBool("P627-11: os.system string + child_process execSync reconstructed", JSON.stringify(extractCodeGitCommands(`os.system("git reset --hard")`)) === JSON.stringify(["git reset --hard"]) && JSON.stringify(extractCodeGitCommands(`require('child_process').execSync('git push --force origin main')`)) === JSON.stringify(["git push --force origin main"]), true);
+  expectBool("P627-12: inert literal without a sink → NO candidate (no false-block)", extractCodeGitCommands(`print("git reset --hard")`).length === 0 && extractCodeGitCommands(`x = 'git commit -m x'`).length === 0, true);
+  expectBool("P627-13: sink without a git reference → NO candidate", extractCodeGitCommands(`import subprocess; subprocess.run(["ls","-la"])`).length === 0, true);
+
+  // #627 codePayloadGitVerdict — parity with scriptGitVerdict: hub mutations
+  // block, read-only/no-git/worktree-targeted pass, unresolvable fails closed.
+  const cpv = (c, cwd) => codePayloadGitVerdict(c, "main", cwd ?? hubR, cwd ?? hubR);
+  // Mirrors the production `_backdoorBlock` path: extract the INLINE payload
+  // from the raw command, then classify that payload's content.
+  const cpvCmd = (c, cwd) => {
+    const p = extractCodePayload(c);
+    return p && p.kind === "inline"
+      ? codePayloadGitVerdict(p.value, "main", cwd ?? hubR, cwd ?? hubR)
+      : codePayloadGitVerdict(c, "main", cwd ?? hubR, cwd ?? hubR);
+  };
+  expectBool("P627-14: hub reset/push/commit from code → block",
+    cpv(`import subprocess; subprocess.run(["git","reset","--hard"])`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["git","push","--force","origin","main"])`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["git","commit","-m","x"])`) === "block", true);
+  expectBool("P627-15: read-only git / no git from code → allow",
+    cpv(`import subprocess; subprocess.run(["git","status"])`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(["git","log","--oneline"])`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(["ls","-la"])`) === "allow", true);
+  expectBool("P627-16: worktree-targeted code git op → allow (#347 parity)",
+    codePayloadGitVerdict(`import subprocess; subprocess.run(["git","reset","--hard"])`, "main", wtR, wtR) === "allow", true);
+  expectBool("P627-17: payload variable + git evidence → block (fail-closed / var-indirection)",
+    cpv(`git = "git"; subprocess.run([git, "reset"])`) === "block", true);
+  expectBool("P627-18: concatenated git spelling is a documented residual (allow)",
+    cpv(`subprocess.run(["gi"+"t","reset"])`) === "allow", true);
+
+  // #627 shared-walker recursion: the structured classifier (M2/M3/M4) sees
+  // inline code payloads — nested shell wrappers included.
+  expectBool("P627-19: allGitInvocations sees an inline code payload (cmdVisible false)", (() => {
+    const invs = allGitInvocations(`python3 -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`);
+    return invs.length === 1 && invs[0].verb === "reset" && invs[0].cmdVisible === false;
+  })(), true);
+  expectBool("P627-20: nested shell -c wrapper still reaches the code payload", (() => {
+    const nested = `bash -c "python3 -c \\"import os; os.system('git reset --hard')\\""`;
+    const invs = allGitInvocations(nested);
+    return invs.length === 1 && invs[0].verb === "reset";
+  })(), true);
+  expectBool("P627-21: evaluateHubGateWithTargets blocks a code-carried hub mutation",
+    evaluateHubGateWithTargets(`python3 -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`, "main", hubR).verdict === "block", true);
+  expectBool("P627-22: read-only code payload is non-blocking in the hub gate",
+    evaluateHubGateWithTargets(`python3 -c 'import subprocess; subprocess.run(["git","status"])'`, "main", hubR).verdict !== "block", true);
+
+  // ── #627 code-review fold-in (cycle 1 P1/P2) ──
+  // P1: flag-with-operand / clustered flags made the operand the "payload" and
+  // skipped the real flag+payload entirely (probe moved HEAD).
+  expectBool("P627-24: operand-taking flags parse through to the real payload",
+    cp(`python3 -W ignore -c 'PAY'`)?.kind === "inline" && cp(`python3 -W ignore -c 'PAY'`)?.value === "PAY" &&
+    cp(`python3 -X dev -c 'PAY'`)?.value === "PAY" && cp(`ruby -I lib -e 'PAY'`)?.value === "PAY" &&
+    cp(`node -r ./m -e 'PAY'`)?.value === "PAY" && cp(`php -d k=v -r 'PAY'`)?.value === "PAY", true);
+  expectBool("P627-25: clustered flags (-Sc / -we) parse letter-by-letter",
+    cp(`python3 -Sc 'PAY'`)?.value === "PAY" && cp(`perl -we 'PAY'`)?.value === "PAY" && cp(`python3 -Sc'PAY'`)?.value === "PAY", true);
+  expectBool("P627-26: operand/cluster spellings still BLOCK the real git payload",
+    cpvCmd(`python3 -W ignore -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`) === "block" &&
+    cpvCmd(`python3 -Sc 'import subprocess; subprocess.run(["git","reset","--hard"])'`) === "block" &&
+    cpvCmd(`perl -we 'system("git reset --hard")'`) === "block" &&
+    cpvCmd(`node -r ./noop.js -e 'require("child_process").execSync("git reset --hard")'`) === "block", true);
+  // P1: paren-less Ruby/Perl system.
+  expectBool("P627-27: paren-less system \"git …\" blocks (Ruby/Perl)",
+    cpvCmd(`ruby -e 'system "git reset --hard"'`) === "block" && cpvCmd(`perl -e 'system "git reset --hard"'`) === "block", true);
+  // P1: prose/comments/docstrings/kwargs must NOT anchor (false-block class).
+  expectBool("P627-28: comment/docstring/data literals and trailing kwargs do NOT false-block",
+    cpv(`import subprocess\n# do not do git reset --hard here\nsubprocess.run(['ls'])`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(['echo','git reset needed'])`) === "allow" &&
+    cpv(`import os; os.system('echo git')`) === "allow" &&
+    cpv(`const {execSync}=require('child_process'); console.log(JSON.stringify({git:'repo'}))`) === "allow" &&
+    cpv(`subprocess.run(["git","branch","-a"], cwd="/x")`) === "allow" &&
+    cpv(`subprocess.run(["git","branch"], cwd="/x")`) === "allow" &&
+    cpv(`subprocess.run(["cat",".git/HEAD"])`) === "allow" &&
+    cpv(`const re = /git/; re.exec(s)`) === "allow", true);
+  // P1: the documented #347 worktree parity must hold through the PRODUCTION
+  // base resolution (commandExecutionCwd), not just a hand-passed execCwd.
+  expectBool("P627-29: commandExecutionCwd resolves the code payload's cd-chain (worktree parity base)",
+    commandExecutionCwd(`cd ${wtR} && python3 -c 'x'`) === wtR &&
+    commandExecutionCwd(`cd ${wtR} && python3 ./x.py`) === wtR, true);
+  expectBool("P627-30: worktree-targeted inline code git op is exempt through the hub gate",
+    evaluateHubGateWithTargets(`cd ${wtR} && python3 -c "import subprocess; subprocess.run(['git','commit','-m','x'])"`, "main", hubR).verdict === "allowed", true);
+
+  // ── #627 code-review cycle-2 fold-in (fresh-reviewer regressions) ──
+  // P1: the cycle-1 "first-arg only" fix lost the wrapper/shell-interpreter argv
+  // and non-literal callee forms. Command-position anchoring restores them.
+  expectBool("P627-31: wrapper-shell argv arrays block (bash -c / sudo / env / timeout / abs path)",
+    cpv(`subprocess.run(["bash","-c","git reset --hard"])`) === "block" &&
+    cpv(`subprocess.run(["sudo","git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess.run(["env","git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess.run(["timeout","5","git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess.run(["/bin/bash","-lc","git reset --hard"])`) === "block" &&
+    cpv(`subprocess.Popen(["bash","-c","git reset --hard"])`) === "block", true);
+  expectBool("P627-32: variable indirection blocks (argv literal or command string)",
+    cpv(`cmd = ["git","reset","--hard"]\nsubprocess.run(cmd)`) === "block" &&
+    cpv(`cmd = "git reset --hard"\nos.system(cmd)`) === "block", true);
+  expectBool("P627-33: aliased/destructured/chained sinks block (from-import, as-import, .execSync)",
+    cpv(`from subprocess import run\nrun(["git","reset","--hard"])`) === "block" &&
+    cpv(`import subprocess as sp\nsp.run(["git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess . run (["git","reset","--hard"])`) === "block" &&
+    cpv(`require("child_process").execSync("git reset --hard")`) === "block", true);
+  expectBool("P627-34: no comment over-strip — #private / // floor-division do not hide a same-line sink",
+    cpv(`class G { static #run() { return require('child_process').execSync("git reset --hard"); } }`) === "block" &&
+    cpv(`n = a//b; require('child_process').execSync("git reset --hard")`) === "block", true);
+  expectBool("P627-35: docstring / quoted-sink-in-a-string / regex stay inert",
+    cpv(`def f():\n    """\n    Example: subprocess.run(["git","reset","--hard"])\n    """\n    pass`) === "allow" &&
+    cpv(`x = "os.system('git reset --hard')"`) === "allow" &&
+    cpv(`const re = /git/; re.exec(s)`) === "allow", true);
+  expectBool("P627-36: cwd=<literal> is an implicit -C target (worktree exempt, hub blocks)",
+    codePayloadGitVerdict(`subprocess.run(["git","commit","-m","x"], cwd="${wtR}")`, "main", hubR, hubR) === "allow" &&
+    codePayloadGitVerdict(`subprocess.run(["git","commit","-m","x"], cwd="${hubR}")`, "main", hubR, hubR) === "block", true);
+  expectBool("P627-37: pwsh -Command is an inline payload (not misread as python -m)",
+    cp(`pwsh -Command 'git reset --hard'`)?.kind === "inline" && cp(`pwsh -Command 'git reset --hard'`)?.value === "git reset --hard" &&
+    cp(`powershell -c 'git reset --hard'`)?.kind === "inline" &&
+    cp(`pwsh -File /tmp/x.ps1`)?.kind !== "inline", true);
+  expectBool("P627-38: shell-payload interpreter (pwsh -Command) blocks through the pwsh surface",
+    cpv(`git reset --hard`) === "block" && cpv(`git commit -m x`) === "block", true);
+
+  // ── #627 code-review cycle-3 fold-in (fresh-reviewer bypasses) ──
+  // P1: argv wrappers between the sink and the command (`shlex.split`, `list()`,
+  // `sorted()`, splat, a user helper, `getattr`) must still anchor.
+  expectBool("P627-39: call-indirection argv wrappers still block",
+    cpv(`import subprocess,shlex; subprocess.run(shlex.split('git reset --hard'))`) === "block" &&
+    cpv(`import subprocess; subprocess.run(list(['git','reset','--hard']))`) === "block" &&
+    cpv(`import subprocess; subprocess.run(sorted(['git','reset','--hard']))`) === "block" &&
+    cpv(`import subprocess; subprocess.run(*[['git','reset','--hard']])`) === "block" &&
+    cpv(`import subprocess\ndef sh(a): subprocess.run(a)\nsh(['git','reset','--hard'])`) === "block" &&
+    cpv(`import subprocess; getattr(subprocess,'run')(['git','reset','--hard'])`) === "block" &&
+    cpv(`from subprocess import run as r; r(['git','reset','--hard'])`) === "block", true);
+  // P1: the sink-method allowlist covers the rest of the real spawn primitives.
+  expectBool("P627-40: getoutput / os.exec* / posix_spawn / pty / asyncio / bracket-member sinks block",
+    cpv(`import subprocess; subprocess.getoutput('git reset --hard')`) === "block" &&
+    cpv(`import subprocess; subprocess.getstatusoutput('git reset --hard')`) === "block" &&
+    cpv(`import os; os.execv('/usr/bin/git',['git','reset','--hard'])`) === "block" &&
+    cpv(`import os; os.posix_spawn('git',['git','reset','--hard'],os.environ)`) === "block" &&
+    cpv(`import pty; pty.spawn(['git','reset','--hard'])`) === "block" &&
+    cpv(`import asyncio; asyncio.create_subprocess_exec('git','reset','--hard')`) === "block" &&
+    cpv(`const cp=require('child_process'); cp['execSync']('git reset --hard')`) === "block", true);
+  // P1: repeated payload flags are UNIONED (node keeps the last `-e`; ruby/
+  // perl/osascript concatenate all of them).
+  expectBool("P627-41: repeated -e/-Command payloads are unioned",
+    cpvCmd(`node -e 'console.log(1)' -e "require('child_process').execSync('git reset --hard')"`) === "block" &&
+    cpvCmd(`ruby -e 'puts 1' -e "system('git reset --hard')"`) === "block" &&
+    cpvCmd(`perl -e 'print 1;' -e 'system("git reset --hard");'`) === "block" &&
+    cpvCmd(`osascript -e 'set x to 1' -e 'do shell script "git reset --hard"'`) === "block", true);
+  // P1: PowerShell parameter binding is case-insensitive.
+  expectBool("P627-42: pwsh flags are case-insensitive (-command / -COMMAND / -C)",
+    cp(`pwsh -command 'git reset --hard'`)?.kind === "inline" && cp(`pwsh -COMMAND 'git reset --hard'`)?.kind === "inline" &&
+    cp(`pwsh -C 'git reset --hard'`)?.kind === "inline" &&
+    cpvCmd(`pwsh -command 'git reset --hard'`) === "block" && cpvCmd(`pwsh -COMMAND 'git reset --hard'`) === "block", true);
+  // P1: command strings that don't START with git (`cd … && git …`, `sudo git …`).
+  expectBool("P627-43: cd-&&-git / sudo-git command strings block",
+    cpv(`import os; os.system("cd /hub && git reset --hard")`) === "block" &&
+    cpv(`import os; os.system("sudo git reset --hard")`) === "block" &&
+    cpv(`import subprocess; subprocess.run("cd /hub && git push --force origin main", shell=True)`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["bash","-c","cd /hub && git reset --hard"])`) === "block", true);
+  // P2: keyword-argument names must not be appended to the git command, and an
+  // assignment target named `git` must not count as an unresolved anchor.
+  expectBool("P627-44: kwargs (capture_output/check/cwd=var) and `git =` assignment do not false-block",
+    cpv(`import subprocess; subprocess.run(['git','branch','-a'], capture_output=True)`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(['git','branch','-a'], check=True)`) === "allow" &&
+    cpv(`import subprocess; repo='/x'; subprocess.run(['git','branch','-a'], cwd=repo)`) === "allow" &&
+    cpv(`import subprocess; git = 'x'; subprocess.run(['ls'])`) === "allow" &&
+    cpv(`import subprocess, shutil; git = shutil.which('git'); subprocess.run([git,'status'])`) === "allow", true);
+  // P1: the shell scan of the payload runs ONLY for a shell-shaped payload, so
+  // ordinary host code (`print("git")`, a `//` comment) stays inert. A string
+  // that contains a command-line-shaped git invocation is deliberately
+  // fail-closed (same class as variable indirection).
+  expectBool("P627-45: host-code shell-scan false positives are gone",
+    cpv(`print("git")`) === "allow" && cpv(`console.log("git")`) === "allow" &&
+    cpv(`result = get("git")`) === "allow" && cpv(`// git reset --hard\nconsole.log(1)`) === "allow" &&
+    cpv(`const h = \`x\ngit reset --hard\``) === "block", true);
+
+  // ── #627 code-review cycle-4 fold-in ──
+  // P1: a lone `git` argv element joined by `+`/splat, wrapper-prefixed command
+  // strings, and backtick/`$(` command substitution must all block.
+  expectBool("P627-46: lone-git concat/splat + wrapper strings + backtick substitution block",
+    cpv(`import subprocess; subprocess.run(["git"]+["reset","--hard"])`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["git", *["reset","--hard"]])`) === "block" &&
+    cpv(`import os; os.system("eval git reset --hard")`) === "block" &&
+    cpv(`import os; os.system("nice -n 5 git reset --hard")`) === "block" &&
+    cpv(`import os; os.system("nohup git reset --hard")`) === "block" &&
+    cpvCmd(`ruby -e 'puts \`git reset --hard\`'`) === "block" &&
+    cpvCmd("perl -e 'print `git reset --hard`'") === "block", true);
+  // P2: a generic method name on an UNKNOWN receiver is not a sink
+  // (`re.exec(s)`, `db.run('…')`); a spawn-specific name still is.
+  expectBool("P627-47: generic receiver methods stay inert; strong sink names block",
+    cpv(`const m = /x/.exec("git reset --hard")`) === "allow" &&
+    cpv(`db.run("git reset --hard")`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(["ls"]); regex.exec("git reset --hard")`) === "allow" &&
+    cpv(`const cp=require('child_process'); cp.execSync('git reset --hard')`) === "block" &&
+    cpv(`const cp=require('child_process'); cp['execSync']('git reset --hard')`) === "block", true);
+  // P4: case folding applies only to case-insensitive CLIs — ruby's `-E utf8`
+  // must not collapse onto the `-e` payload flag.
+  expectBool("P627-48: ruby -E is an encoding operand, not the -e payload",
+    cp(`ruby -E utf8 script.rb`)?.kind === "file" && cp(`ruby -E utf8 script.rb`)?.value === "script.rb", true);
+  // P3: AppleScript `do shell script` handling is scoped to AppleScript-shaped
+  // payloads (a Python comment/docstring mentioning it stays inert).
+  expectBool("P627-49: do shell script blocks only in an AppleScript-shaped payload",
+    cpv(`import subprocess\n# osascript -e 'do shell script "git reset --hard"'\nsubprocess.run(["ls"])`) === "allow" &&
+    cpv(`import subprocess\ndef f():\n  """do shell script "git reset --hard" """\n  subprocess.run(["ls"])`) === "allow" &&
+    cpv(`do shell script "git reset --hard"`) === "block", true);
+  // P3: a compound kwarg value is skipped as ONE expression (balanced brackets),
+  // not three tokens.
+  expectBool("P627-50: compound kwarg values are skipped cleanly",
+    cpv(`import subprocess; subprocess.run(["git","branch","-a"], env={"A":"1"})`) === "allow" &&
+    cpv(`import subprocess, os; subprocess.run(["git","branch","-a"], cwd=os.path.join("a","b"))`) === "allow", true);
+
+  // #628 hubNewFileVolumeVerdict — pure boundaries + source pins (index.ts).
+  expectBool("P628-1: volume verdict boundaries",
+    hubNewFileVolumeVerdict(1) === "warn" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_WARN_BUDGET) === "warn" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_WARN_BUDGET + 1) === "escalate" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_BLOCK_CAP) === "escalate" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_BLOCK_CAP + 1) === "block", true);
+  expectBool("P628-2: budget/cap constants are the documented values", HUB_NEW_FILE_WARN_BUDGET === 10 && HUB_NEW_FILE_BLOCK_CAP === 25, true);
+  expectBool("P628-3: index.ts wires the new-file volume policy + write-time warn",
+    pinSrc.includes("hubNewFileVolumeVerdict") && pinSrc.includes("_maybeWarnHubNewFile") && pinSrc.includes("hubNewFileCounts") && pinSrc.includes("#628"), true);
+  expectBool("P628-4: the #628 cap BLOCK reason exists (not warn-only)", pinSrc.includes("new-file cap exhausted in a disordered hub") && pinSrc.includes("_warnHubNewFile"), true);
+  expectBool("P627-23: index.ts wires the code-payload backdoor (#627)",
+    pinSrc.includes("extractCodePayload") && pinSrc.includes("codePayloadGitVerdict") && pinSrc.includes("#627"), true);
 
   // ── Degradation (D) ──
   const classifySrc = readFileSync(new URL("./classify-git.mjs", import.meta.url), "utf-8");
