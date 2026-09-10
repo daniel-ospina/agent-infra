@@ -212,6 +212,14 @@ tests.push(test("subagent tool child env carries task-sub-agent markers + TASK_H
   ok(src.includes("delete childEnv.AGENT_ALLOW_MAIN_EDITS"), "AGENT_ALLOW_MAIN_EDITS must be stripped from the subagent-tool child env (#623)");
   ok(src.includes("delete childEnv.ELDATO_ALLOW_MAIN_EDITS"), "ELDATO_ALLOW_MAIN_EDITS must be stripped from the subagent-tool child env (#623)");
   ok(src.includes("allow_main_edits"), "subagent tool exposes the per-dispatch allow_main_edits opt-in (#623)");
+  // #623 escalation guard: the opt-in may re-add a hatch var ONLY when the
+  // controller env ACTUALLY carries it — an unhatched controller must never be
+  // able to hatch a child through this dispatcher. Pin the parent-env guard
+  // directly ON each restore assignment (a bare `if (allowMainEdits)` restore
+  // would silently re-open the unhatched-parent escalation this PR closes).
+  ok(/if \(allowMainEdits\)/.test(src), "subagent-tool restore is gated by the per-dispatch allowMainEdits opt-in (#623)");
+  ok(/if \(process\.env\.AGENT_ALLOW_MAIN_EDITS === "1"\)\s*childEnv\.AGENT_ALLOW_MAIN_EDITS = "1"/.test(src), "subagent-tool AGENT restore requires the controller env to carry the hatch (#623)");
+  ok(/if \(process\.env\.ELDATO_ALLOW_MAIN_EDITS === "1"\)\s*childEnv\.ELDATO_ALLOW_MAIN_EDITS = "1"/.test(src), "subagent-tool ELDATO restore requires the controller env to carry the hatch (#623)");
 }));
 
 runAll(tests);

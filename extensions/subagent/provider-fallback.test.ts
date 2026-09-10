@@ -730,4 +730,38 @@ test("allow_main_edits: true opt-in restores the hatch for THAT dispatch only (#
 	fs.rmSync(logPath, { force: true });
 });
 
+test("allow_main_edits: true is a NO-OP for an UNHATCHED controller — subagent side (#623)", async () => {
+	const cwd = makeProjectCwd([{ name: "test-agent" }]);
+	const logPath = path.join(tmpRoot, `log-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+	// The escalation guard: an opt-in can only re-add a hatch the CONTROLLER
+	// itself carries. This machine's ambient env IS hatched (observed live), so
+	// save + clear to make the "unhatched controller" premise real, then restore.
+	const savedAgent = process.env.AGENT_ALLOW_MAIN_EDITS;
+	const savedEldato = process.env.ELDATO_ALLOW_MAIN_EDITS;
+	delete process.env.AGENT_ALLOW_MAIN_EDITS;
+	delete process.env.ELDATO_ALLOW_MAIN_EDITS;
+	let resp: any;
+	try {
+		resp = await runTool(
+			{ ...singleParams(cwd, `pfbt-hatch-unhatched-${Date.now()}`), allow_main_edits: true },
+			{ cwd, logPath, mode: "always-success" },
+		);
+	} finally {
+		if (savedAgent === undefined) delete process.env.AGENT_ALLOW_MAIN_EDITS;
+		else process.env.AGENT_ALLOW_MAIN_EDITS = savedAgent;
+		if (savedEldato === undefined) delete process.env.ELDATO_ALLOW_MAIN_EDITS;
+		else process.env.ELDATO_ALLOW_MAIN_EDITS = savedEldato;
+	}
+	ok(!resp.isError, `dispatch must succeed: ${resp.content?.[0]?.text}`);
+	const lines = readSpawnLog(logPath);
+	equal(lines.length, 1, "success → exactly one spawn");
+	equal(
+		lines[0].hatch,
+		null,
+		"an UNHATCHED controller must NEVER hatch a child — the opt-in re-adds only what the controller env carries (#623)",
+	);
+	fs.rmSync(cwd, { recursive: true, force: true });
+	fs.rmSync(logPath, { force: true });
+});
+
 run();
