@@ -6,7 +6,7 @@ doc_status: draft
 subjects.team: organisation-design-team
 created: 2026-09-09
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-637, issue-642, issue-643, issue-646, issue-640
+aboutObjects: agent-infra, issue-637, issue-640, issue-642, issue-643, issue-646, issue-651, issue-638, issue-639
 ---
 
 <!-- research-path: inline — Phase 1.5 external research embedded below (### Axis Research) -->
@@ -190,11 +190,15 @@ than restating literals, because these numbers have already moved once inside th
    matched the `0.85.1` values the bump had just written):
    ```bash
    git grep -nE '0\.8[0-9]\.[0-9]' -- . ':!docs/plans' ':!docs/scoping' ':!docs/research' ':!*.json' \
-     | grep -v '0\.85\.1'
+     ':!docs/upstream-pi-bugs.md' | grep -v '0\.85\.1'
    ```
-   Expected: **0 lines**. `docs/upstream-pi-bugs.md:286` carries both a `0.84.3` historical probe and a
-   `0.85.1` re-verification stamp, so the `grep -v` filters it; that record is deliberate, as are the
-   archival `docs/plans/*`, `docs/scoping/*`, `docs/research/*` and the generated lockfiles.
+   Expected: **0 lines**. `docs/upstream-pi-bugs.md:292` is excluded explicitly: its draft bodies are a
+   deliberate historical record (a `0.84.3` probe, kept byte-intact per that file's own "keep the
+   draft bodies intact" rule), and the `0.85.1` re-verification lives in its live status block rather
+   than on the probe line — so a `grep -v '0\.85\.1'` filter does **not** drop it. Relying on the
+   co-located stamp was the flaw: an earlier revision of this plan asserted 0 lines while the probe
+   line was still unfiltered. Excluded deliberately, like the archival `docs/plans/*`,
+   `docs/scoping/*`, `docs/research/*` and the generated lockfiles.
 
 ### Acceptance criteria
 
@@ -208,7 +212,8 @@ Every criterion below was re-run at the final head unless marked otherwise.
       `verification-gate` 1) — `(i)` is non-vacuous (per-surface stamp-count map), and both run
       **per-PR** (`ci.yml`) **and** post-merge (`ci-main.yml`).
 - [x] `patch-pi-retry.sh --check` exit 0 against the installed 0.85.1 (shape probe).
-- [x] The Verification-plan step-6 stale-literal scan returns **0** lines.
+- [x] The Verification-plan step-6 stale-literal scan returns **0** lines
+      (`docs/upstream-pi-bugs.md` excluded explicitly — its historical probe is deliberate).
 - [x] `ci / unit-test` appears as **run** (not skipped) on PR #640.
 - [x] `pipeline-compliance` green on PR #640.
 
