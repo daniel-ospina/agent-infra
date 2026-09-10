@@ -58,7 +58,14 @@
 //     main-rooted session writing another hub via bash is gated too — review
 //     fold-in); same-vs-cross-checkout is judged by the SESSION's checkout,
 //     never a command `cd`-site; cross-checkout tracked AND `.git/`-metadata
-//     writes block regardless of hub state. Cycle-2/3 fold-ins: main checkouts
+//     writes block regardless of hub state. #625 extends the SAME-checkout
+//     decision to be state-independent too: a tracked hub-main write from a
+//     hub-rooted session blocks whether that hub is CLEAN or disordered (the
+//     old clean-hub carve-out let one compound `printf … >> MEMORY.md && git
+//     add && git commit && git push` through), and the bash walker now
+//     surfaces the in-place overwrite VERBS (sed -i / perl -pi / awk -i
+//     inplace / cp / mv / install / truncate / dd of=) that carried no
+//     write-primitive token. Cycle-2/3 fold-ins: main checkouts
 //     NESTED under a session's own checkout tree are private subtrees (not
 //     shared hubs) and are not frozen ONLY when the session itself is a
 //     NON-main checkout — a worktree/private checkout owns its tree; a
@@ -713,10 +720,14 @@ function _maybeWarnBashWrite(command: string) {
 //   - SAME-checkout — the SESSION's own checkout IS that main (judged by the
 //     session cwd's checkout, NEVER by the command's transient cd-site: a
 //     worktree/foreign session that `cd`s into a hub and writes is still a
-//     deliberate cross-checkout session): #437 semantics — block tracked
-//     overwrites ONLY while that main is DISORDERED (build/formatter/
-//     npm-install side effects on a clean main must never false-block;
-//     tracked-ness is exact via `git ls-files`).
+//     deliberate cross-checkout session): #437 semantics, EXTENDED by #625 to
+//     a state-INDEPENDENT decision — block tracked overwrites whether that
+//     main is clean or disordered (the write/edit route has been a permanent
+//     target-aware gate since #618/#621; the old clean-hub carve-out let a
+//     compound `printf … >> MEMORY.md && git add && git commit && git push`
+//     through). Own-main UNTRACKED/new writes stay allowed (build/formatter
+//     side effects on genuinely new files must never false-block; tracked-
+//     ness is exact via `git ls-files`).
 //   - CROSS-checkout — session shell NOT rooted in the target main (a
 //     worktree session writing its own repo's main, a foreign/non-git cwd, or
 //     another repo's session, incl. a clean agent-infra main): block TRACKED
@@ -825,11 +836,20 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
       } else if (gitMeta) {
         gitInternalHit = { resolvedPath: tPath, rel };
         return;
-      } else if (sameCheckout) {
-        if (sessionDisorder === null) return; // clean same-checkout main — documented residual (#437)
       }
-      // reached → disordered-same-checkout OR deliberate cross-checkout: the
-      // tracked test decides.
+      // #625: NO clean-same-checkout early return. The gate decides on the
+      // command's EFFECT (does it write a TRACKED hub-main file?), not on
+      // pre-execution hub disorder — the write/edit route has been a permanent
+      // target-aware gate since #618/#621, while the old #437 "clean
+      // same-checkout" residual let a hub-rooted main+CLEAN session commit
+      // tracked shared files with ONE compound (`printf … >> MEMORY.md && git
+      // add && git commit && git push`: no disorder → M4's git gate skipped,
+      // decideM2 saw an on-baseline session). Own-main UNTRACKED writes stay
+      // allowed (the `crossTop` guard below freezes an existing-untracked
+      // overwrite only CROSS-checkout — genuinely-new build/formatter side
+      // effects keep working).
+      // reached → same-checkout (clean OR disordered) OR deliberate
+      // cross-checkout: the tracked test decides.
       const arr = grouped.get(ck.top) ?? [];
       arr.push({ tPath, rel });
       grouped.set(ck.top, arr);
@@ -876,14 +896,15 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
       // Budget exhausted with script tokens still unprocessed — their write
       // content is UNVERIFIABLE. Fail closed ONLY on hub-proximity evidence:
       // the walk already placed a candidate under the block-or-block-if-
-      // tracked tests (grouped) or the session shell is rooted in a DISORDERED
-      // hub main (the classic chain-write incident shape). A >64-token chain
-      // that never resolved a target into a hub-main candidate (non-git /tmp
-      // cwd, a CLEAN own-main build fan-out of sourced helpers) is NO evidence
-      // of a hub write — failing closed there false-blocks legit wide source
-      // fan-outs (cycle-3 A-1). Residual: a >64-token foreign chain whose hub
-      // write sits in the unprocessed tail slips (documented; tool route is
-      // authoritative and the write gate is marker/tool-checked).
+      // tracked tests (grouped) or the session shell is rooted in a hub main
+      // (the classic chain-write incident shape). A >64-token chain that
+      // never resolved any target into a hub-main candidate AND is not rooted
+      // in a DISORDERED hub (non-git /tmp cwd, a worktree fan-out of sourced
+      // helpers, or a clean own hub) stays NO evidence of a hub write —
+      // failing closed there false-blocks legit wide source fan-outs
+      // (cycle-3 A-1). Residual: a >64-token chain
+      // whose hub write sits in the unprocessed tail slips (documented; the
+      // tool route is authoritative and the write gate is marker/tool-checked).
       if (grouped.size === 0 && !(sessionOwnHub !== null && sessionDisorder !== null)) return null;
       return { resolvedPath: base, rel: "script-chain", kind: "script-depth" };
     }
@@ -946,9 +967,10 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
       "⛔ Bash script execution blocked — script chain exceeds the verify budget.",
       `   A script/source chain deeper than the guard's walk budget was detected`,
       `   with hub-main candidates already in view (or the session shell rooted`,
-      `   in a disordered hub main); its tail writes into hub-main checkouts are`,
-      `   UNVERIFIABLE and the guard fails closed rather than risk a tracked hub`,
-      `   file write. A chain with NO hub proximity is not blocked (cycle-3 A-1).`,
+      `   in a DISORDERED hub main); its tail writes into hub-main`,
+      `   checkouts are UNVERIFIABLE and the guard fails closed rather than risk`,
+      `   a tracked hub file write. A chain with NO hub proximity is not blocked`,
+      `   (cycle-3 A-1).`,
       `   → Run the shell commands directly (in a worktree), or flatten the chain.`,
       `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
       `     override (deliberate solo sessions only).`,
@@ -958,12 +980,13 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
   return [
     `⛔ Bash write to a hub ${gitMeta ? "git-metadata file" : "tracked file"} blocked (${hit.rel}).`,
     `   The write target's repo is a shared MAIN checkout (#618/#621) — bash`,
-    `   write primitives respect the SAME gate as the write/edit tools: a`,
-    `   DELIBERATE cross-checkout write (your session is not rooted in that`,
-    `   repo) freezes regardless of hub state, a session rooted in a`,
-    `   DISORDERED main freezes on tracked overwrites, and hub .git-metadata`,
-    `   writes (hooks/, config) freeze for every session in every state except`,
-    `   an active escape-marker's own-rooted clean recovery window.`,
+    `   write primitives AND in-place overwrite verbs (sed -i, perl -pi, cp,`,
+    `   mv, install, truncate, dd of=) respect the SAME gate as the write/edit`,
+    `   tools: a DELIBERATE cross-checkout write (your session is not rooted`,
+    `   in that repo) freezes regardless of hub state, a session rooted in`,
+    `   that repo's main freezes on tracked overwrites (clean OR disordered),`,
+    `   and hub .git-metadata writes (hooks/, config) freeze for every session in`,
+    `   every state except an active escape-marker's own-rooted clean recovery window.`,
     `   NEW-file writes and own-main untracked writes stay allowed. Only`,
     `   session-start host env (AGENT_ALLOW_MAIN_EDITS=1) bypasses — a`,
     `   mid-command export cannot.`,
@@ -1250,9 +1273,13 @@ export default function (pi: ExtensionAPI) {
         // python/heredoc/tee is a deliberate cross-checkout write and must block
         // exactly like the write/edit tool does; the old `st.disorder ||
         // !_sessionIsMainRooted()` guard skipped it because the SESSION's OWN hub
-        // was clean. Same-checkout clean-main writes stay free INSIDE the gate
-        // (#437's residual — classify returns null), so running unconditionally
-        // costs only the pure string walk on write-free commands. Under an active
+        // was clean. Same-checkout writes now gate on the command's EFFECT for
+        // a session's own hub too: a TRACKED hub-main write blocks whether the
+        // hub is clean or disordered (#625 — the old clean-hub early-return let
+        // a compound `printf … >> MEMORY.md && git add && git commit && git
+        // push` through); own-main untracked/NEW writes stay free, so running
+        // unconditionally costs only the pure string walk on write-free
+        // commands. Under an active
         // TTL marker only M4 D3's disordered-own-hub freeze remains (parity with
         // the write/edit route, whose #618 gate the marker return precedes — the
         // marker is an audited solo-session recovery hatch, not a license to
