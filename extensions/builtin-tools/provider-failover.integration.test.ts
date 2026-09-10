@@ -32,7 +32,7 @@
  * Run: npx tsx extensions/builtin-tools/provider-failover.integration.test.ts
  */
 
-import { spawnSubAgent, recordVeniceRoute } from "./index.js";
+import builtinToolsExt, { spawnSubAgent, recordVeniceRoute } from "./index.js";
 import { readLatchState } from "../shared/provider-failover.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -70,6 +70,9 @@ NONCE="${"${TASK_HEARTBEAT_NONCE:-}"}"
 SCENARIO="${"${FAKE_PI_SCENARIO:-}"}"
 NONCE_FILE="${"${FAKE_PI_NONCE_FILE:-}"}"
 [ -n "$NONCE_FILE" ] && echo "$NONCE" > "$NONCE_FILE"
+# #623: record the hatch vars THIS child actually observed, out of band.
+HATCH_FILE="${"${FAKE_PI_HATCH_FILE:-}"}"
+[ -n "$HATCH_FILE" ] && printf 'agent=%s\neldato=%s\n' "${"${AGENT_ALLOW_MAIN_EDITS:-}"}" "${"${ELDATO_ALLOW_MAIN_EDITS:-}"}" > "$HATCH_FILE"
 m() { echo "[task-heartbeat] $1" >&2; }
 em() { echo "[provider-exhaustion] $1" >&2; }
 case "$SCENARIO" in
@@ -181,6 +184,73 @@ async function dispatch(
 
 function markerOf(value: { details: Record<string, unknown> } | undefined): any {
 	return (value?.details?.exhaustionMarker as any) ?? null;
+}
+
+// ── #623 task-tool (primary dispatcher) runtime harness ───────────────
+// The task tool's default-strip lives INSIDE its execute() (subAgentEnv),
+// which the dispatch() helper above bypasses (it composes subAgentEnv by
+// hand + calls spawnSubAgent). Cover the real execute() path: capture the
+// registered task tool def through a minimal pi mock (the provider-fallback
+// precedent), then invoke it with a hatched parent env and read the CHILD's
+// observed env from the fake pi's out-of-band hatch file.
+let taskToolDef: any = null;
+const registeredToolNames: string[] = [];
+const piMock: any = new Proxy(
+	{
+		registerTool: (def: any) => {
+			registeredToolNames.push(def?.name);
+			if (def?.name === "task") taskToolDef = def;
+		},
+	},
+	{ get: (target: any, key: string) => (key in target ? target[key] : () => {}) },
+);
+(builtinToolsExt as any)(piMock);
+
+function readHatchFile(file: string): { agent: string; eldato: string } | null {
+	try {
+		const txt = fs.readFileSync(file, "utf-8");
+		return {
+			agent: (/agent=(.*)/.exec(txt)?.[1] ?? "").trim(),
+			eldato: (/eldato=(.*)/.exec(txt)?.[1] ?? "").trim(),
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** Invoke the REAL task-tool execute() with a controlled PARENT hatch state and
+ * return the hatch vars the spawned child observed. */
+async function dispatchTaskTool(
+	params: Record<string, unknown>,
+	parentHatch: "both" | "none",
+): Promise<{ hatch: { agent: string; eldato: string } | null }> {
+	const hatchFile = path.join(tmpDir, `hatch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}.txt`);
+	const savedAgent = process.env.AGENT_ALLOW_MAIN_EDITS;
+	const savedEldato = process.env.ELDATO_ALLOW_MAIN_EDITS;
+	const savedScenario = process.env.FAKE_PI_SCENARIO;
+	const savedHatchFile = process.env.FAKE_PI_HATCH_FILE;
+	if (parentHatch === "both") {
+		process.env.AGENT_ALLOW_MAIN_EDITS = "1";
+		process.env.ELDATO_ALLOW_MAIN_EDITS = "1";
+	} else {
+		delete process.env.AGENT_ALLOW_MAIN_EDITS;
+		delete process.env.ELDATO_ALLOW_MAIN_EDITS;
+	}
+	process.env.FAKE_PI_SCENARIO = "healthy";
+	process.env.FAKE_PI_HATCH_FILE = hatchFile;
+	try {
+		await taskToolDef.execute("hatch-call", params, undefined);
+		return { hatch: readHatchFile(hatchFile) };
+	} finally {
+		if (savedAgent === undefined) delete process.env.AGENT_ALLOW_MAIN_EDITS;
+		else process.env.AGENT_ALLOW_MAIN_EDITS = savedAgent;
+		if (savedEldato === undefined) delete process.env.ELDATO_ALLOW_MAIN_EDITS;
+		else process.env.ELDATO_ALLOW_MAIN_EDITS = savedEldato;
+		if (savedScenario === undefined) delete process.env.FAKE_PI_SCENARIO;
+		else process.env.FAKE_PI_SCENARIO = savedScenario;
+		if (savedHatchFile === undefined) delete process.env.FAKE_PI_HATCH_FILE;
+		else process.env.FAKE_PI_HATCH_FILE = savedHatchFile;
+	}
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -346,6 +416,44 @@ test("usage ledger round-2 P2-3: venice-route + dispatch-usage rows SHARE the pr
 		if (savedLedger === undefined) delete process.env.TASK_USAGE_LEDGER;
 		else process.env.TASK_USAGE_LEDGER = savedLedger;
 	}
+});
+
+section("#623 — task-tool runtime child-env hatch strip (primary dispatcher)");
+
+test("#623 harness: the real task tool registered and exposes the allow_main_edits opt-in", async () => {
+	ok(registeredToolNames.includes("task"), `task tool registered (got: ${registeredToolNames.join(",")})`);
+	ok(taskToolDef, "task tool def captured from the extension registration");
+	ok(
+		Object.keys(taskToolDef.parameters?.properties ?? {}).includes("allow_main_edits"),
+		"task tool schema exposes the per-dispatch allow_main_edits opt-in",
+	);
+});
+
+test("#623: a HATCHED controller's task-tool child observes NO hatch by default (runtime, not source-scan)", async () => {
+	const { hatch } = await dispatchTaskTool({ prompt: "#623 runtime hatch probe — default strip" }, "both");
+	ok(hatch, "the fake pi child wrote its observed-hatch file");
+	equal(hatch!.agent, "", "child AGENT_ALLOW_MAIN_EDITS must be unset (default-strip)");
+	equal(hatch!.eldato, "", "child ELDATO_ALLOW_MAIN_EDITS must be unset (default-strip)");
+});
+
+test("#623: allow_main_edits: true restores the hatch for THAT dispatch only (runtime)", async () => {
+	const { hatch } = await dispatchTaskTool(
+		{ prompt: "#623 runtime hatch probe — opt-in", allow_main_edits: true },
+		"both",
+	);
+	ok(hatch, "the fake pi child wrote its observed-hatch file");
+	equal(hatch!.agent, "1", "opt-in restored AGENT_ALLOW_MAIN_EDITS");
+	equal(hatch!.eldato, "1", "opt-in restored ELDATO_ALLOW_MAIN_EDITS");
+});
+
+test("#623: allow_main_edits: true is a NO-OP for an UNHATCHED controller (cannot grant what the parent lacks)", async () => {
+	const { hatch } = await dispatchTaskTool(
+		{ prompt: "#623 runtime hatch probe — unhatched opt-in", allow_main_edits: true },
+		"none",
+	);
+	ok(hatch, "the fake pi child wrote its observed-hatch file");
+	equal(hatch!.agent, "", "unhatched parent cannot hatch a child");
+	equal(hatch!.eldato, "", "unhatched parent cannot hatch a child");
 });
 
 function deepEqualKeys(obj: Record<string, unknown>, keys: string[], msg: string) {
