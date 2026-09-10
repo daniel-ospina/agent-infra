@@ -157,6 +157,7 @@ Full TDD plan doc with worktree isolation, bite-sized task steps, and complete t
 
 **Worktree (all tiers):** the branch + worktree are created at issue start by `issue-workflow`'s Branch Gate — draft the plan INSIDE that worktree. Do NOT create a nested worktree from inside one, and never draft the plan in a hub main checkout (writes block, #626). If you are in a hub, create the worktree first:
 ```bash
-git worktree add -b feature/<ISSUE_NUMBER>-<slug> ../<repo>-wt-<ISSUE_NUMBER>
+git fetch origin main --quiet   # #178/#179: never cut a branch from stale local main
+git worktree add -b feature/<ISSUE_NUMBER>-<slug> ../<repo>-wt-<ISSUE_NUMBER> origin/main
 cd ../<repo>-wt-<ISSUE_NUMBER>
 ```
