@@ -324,6 +324,12 @@ strong — see #651.
 | Loader-parity oracle in CI | test | explicit #642 **non-goal**; machine-local oracle + session/cron staleness warning is the existing design | ⚠️ accepted (#642) |
 | ~24 files importing `@earendil-works/pi-*` with no pin/CI install | code | runtime-resolved inside a running pi (no repo pin possible); CI-coverage decision recorded in #643 | ⚠️ #643 |
 
+- A guard that reads repo files **cannot** defend against a commit that edits the guard and the
+  workflow together: a crafted decoy (fake job in a block scalar, dead step carrying the expected text)
+  is the same class as deleting the guard outright. Guards (h)/(i)/(j) cover *accidental* and
+  *"temporary"* unplugging — the class the 2026-08-10 escape and the #387 skip contract belong to.
+  Blocking the deliberate class is a governance control (branch protection), i.e. **#646**.
+
 Residual risks are explicitly recorded, not silently absorbed: the shipped tripwire guards the
 `extensions/*/package.json` class, **not** the doc/comment mirror class that actually escaped (#643);
 per-PR lockfile agreement and predicate breadth remain open (#642); and the gate is CI-visible but not
@@ -350,6 +356,7 @@ merge-blocking until #646 lands.
 | parallel review gates | 5 | not separately dispatched — superseded by the code-review rounds (cycles 5–7 below), which reviewed the same diff with fresh context |
 | code-review (PR #640) | 5 (bug scan at `6fb9df4`) | **ISSUES FOUND** — 2×P2 (guard `(j)` blind to a caller-level `if:`/`continue-on-error:`; `test-command`/step could swallow failure) + 2×P3 `(i)` presence-check non-vacuity, fixed 20-line caller window + 2×P4 misleading job-boundary anchor, `(h)` scope vs claim — all fixed in `e1a75b8`, all negative-tested |
 | code-review (PR #640) | 6 (security + config at `965f663`) | **ISSUES FOUND** — 1×P3 (guard `(j)` never read the workflow TRIGGER: `pull_request.paths-ignore` skips the whole run for the exact PRs the gate guards) + 1×P4 (the self-caller ref was globbed; `@main` is locked decision D2) — fixed in `e1960da` |
+| code-review (PR #640) | 8 (verification at `dfc60d2`) | **ISSUES FOUND** — 5×P1 + 1×P2 + 1×P3: text matching was still first-match/substring based (dead-step decoy carrying the `run:` text, a `test-command:` line inside another input's block scalar, an injected fake `ci:` job in a `run-name: \|` block scalar, an unanchored `uses:` substring, flow-mapping `pull_request` filters, unasserted `needs:`), plus `stripComment()` quote/block-scalar mis-handling and 5 semantics-preserving false-REDs — fixed in the follow-up commit — see fix round 8 |
 | code-review (PR #640) | 7 (final, at `e1960da`) | **ISSUES FOUND** — 2×P2 (YAML-valid bypasses left the guard GREEN: quoted keys `"paths-ignore":`, `continue-on-error :` spacing, `run: … || true`, a decoy comment line; and 8 semantics-preserving reformats false-REDded) + 1×P4 (this log) — fixed in the follow-up commit by normalizing the workflow text (comment-stripping + key dequoting) — see fix round 7 |
 
 ### Fix round — code-review cycle 6 (security + config at `965f663`) → `e1960da`
@@ -381,6 +388,51 @@ Verification at the fix commit: **15 bypass mutations RED** (all nine above plus
 `paths`/`branches`/`workflow_dispatch`/`@v0.1.0`/`|| true`/caller & callee `continue-on-error:`/
 caller `if:`) and **12 semantics-preserving edits GREEN**, with the suite at 163/163. The `(h)` and `(i)`
 mutations were re-run and stay RED.
+
+### Fix round — code-review cycle 8 (verification at `dfc60d2`) → structural hardening
+
+The verification pass found the guard still **first-match / substring** based. Six bypasses reproduced at
+163/163:
+
+- **decoy dead step** (`- if: false` carrying `run: ${{ inputs.test-command }}`) satisfied the step `if:`
+  and `run:` assertions while the real step kept `|| true`;
+- a `test-command:` **line inside another input's block-scalar body** was picked up by the binding
+  `find()`, so the parsed input could still be `… || true`;
+- an **injected fake `ci:` job inside a `run-name: |` block scalar** — textually identical to a job key
+  and found FIRST, so the guard validated the decoy and never saw the real job;
+- an **unanchored `SELF_CALLER_RE`**, satisfied by a decoy elsewhere on a line while `uses:` pointed at
+  another workflow;
+- **flow-mapping** `pull_request: {paths-ignore: […]}` — no key line, invisible to `keyRe`;
+- **`needs:`** on either gate job (a skipped dependency skips the gate).
+
+Fixes: `jobBlockOf` only considers job keys **after** the top-level `jobs:` mapping; `SELF_CALLER_RE` is
+anchored to a real `uses:` entry; the binding must sit at the `with:`-child indent (6); the step-level
+`run:` set is asserted by `deepEqual` (exactly the two known commands); `needs:` is rejected on both gate
+jobs; flow-mapping filter members are matched. Also five semantics-preserving false-REDs (flow-sequence
+`on: [pull_request]`, `key :` spacing on job/step keys, parent-indent step sequences, block-scalar `run:`).
+
+Follow-up (same cycle, after the verification pass reported back): a 6-space `test-command:` line inside a
+job-level block scalar (`name: |`) still won the binding `find()` — indentation proved only indentation,
+not `with:`-childhood — reproduced GREEN at 163/163 on a valid, actionlint-clean workflow. The `with:`
+mapping is now collected and its key set asserted by `deepEqual` (`["test-command"]`), so the decoy is
+outside the inspected region. The flow-mapping matcher was dropped: it was shadowed by the bare
+`pull_request:` assertion (a flow-mapped trigger removes that key line, so it already fails closed) and
+its only reachable effects were false REDs on unrelated keys. The filter check is now scoped to the
+`pull_request:` sub-block, which also removes the pre-existing over-broadness (an unrelated
+`workflow_dispatch.inputs.paths:` no longer false-REDs).
+
+**Still fail-closed, accepted (spurious RED, never a bypass):** the guard matches workflow text, so a few
+exotic-but-valid spellings are rejected rather than accepted — `on: [pull_request]` (flow sequence),
+parent-indent step sequences, and a block-scalar `run:`. `job key :` spacing and quoted job keys are
+normalized and accepted. Each of these is a loud, deliberate-update failure, not a silent pass.
+
+**Accepted bound (recorded, not papered over):** a test that reads repo files cannot defend against a
+commit that edits the test and the workflow together — a deliberately crafted decoy is the same class as
+simply deleting the guard. Guards cover *accidental* and *"temporary"* unplugging; blocking the deliberate
+class is branch protection, i.e. **#646**. Recorded in §Out of Scope.
+
+Verified: 9 bypass mutations RED, 7 semantics-preserving edits GREEN, the 22 mutations from cycles 5–7
+re-run unchanged, suite 163/163.
 
 ### Fix-round history
 

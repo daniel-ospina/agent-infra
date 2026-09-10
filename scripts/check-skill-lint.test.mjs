@@ -498,7 +498,9 @@ test("every version literal in the mirror surfaces is the pin or a listed dep ve
 section("per-PR pin gate is wired (not silently skipped)");
 
 const EXPECTED_TEST_COMMAND = "node scripts/check-skill-lint.test.mjs";
-const SELF_CALLER_RE = /uses:\s*\S*\/\.github\/workflows\/node-ci\.yml@main/;
+// Anchored to a real `uses:` ENTRY: an unanchored substring match is satisfied by a decoy elsewhere
+// on a line (`name: "uses: …/node-ci.yml@main"`), leaving `uses:` pointed at another workflow.
+const SELF_CALLER_RE = /^\s+uses\s*:\s*\S*\/\.github\/workflows\/node-ci\.yml@main\s*$/m;
 
 // ── YAML normalization ─────────────────────────────────────────────────────
 // These guards read YAML as text, so they must be insensitive to the syntactic freedom YAML grants —
@@ -552,13 +554,26 @@ function unquote(v) {
 // (legal YAML, used throughout these workflows) cannot be mistaken for the next job — which would
 // truncate the block and produce a false RED with a misleading message.
 function jobBlockOf(workflowLines, jobName) {
-  const start = workflowLines.findIndex((l) => /^  [A-Za-z_][A-Za-z0-9_-]*:\s*$/.test(l) && l.trim() === `${jobName}:`);
-  assert.ok(start >= 0, `workflow no longer defines a \`${jobName}:\` job`);
-  const rel = workflowLines
-    .slice(start + 1)
-    .findIndex((l) => /^  [A-Za-z_][A-Za-z0-9_-]*:\s*$/.test(l));
-  const end = rel === -1 ? workflowLines.length : start + 1 + rel;
-  return workflowLines.slice(start, end).join("\n");
+  // Only job keys AFTER the top-level `jobs:` mapping count. A 2-space-indented `ci:` inside an
+  // EARLIER block scalar (e.g. `run-name: |`) is textually indistinguishable from a job key and would
+  // be found FIRST — the guard would then validate the decoy and never see the real job. Reproduced
+  // during review: an injected `ci:` in a block scalar left the gate unplugged at 163/163.
+  const jobsIdx = workflowLines.findIndex((l) => /^jobs\s*:\s*$/.test(l));
+  assert.ok(jobsIdx >= 0, "workflow no longer declares a top-level `jobs:` mapping");
+  const keyIdx = [];
+  for (let i = jobsIdx + 1; i < workflowLines.length; i++) {
+    if (/^  [A-Za-z_][A-Za-z0-9_-]*\s*:\s*$/.test(workflowLines[i])) keyIdx.push(i);
+  }
+  // Compare on the normalized key (`ci :` is valid YAML for the key `ci`).
+  const start = keyIdx.find(
+    (i) => workflowLines[i].trim().replace(/\s*:\s*$/, "") === jobName
+  );
+  assert.ok(
+    start !== undefined,
+    `workflow no longer defines a \`${jobName}:\` job in its \`jobs:\` mapping`
+  );
+  const next = keyIdx.find((i) => i > start);
+  return workflowLines.slice(start, next ?? workflowLines.length).join("\n");
 }
 
 test("ci.yml binds a non-empty test-command that node-ci.yml declares and consumes", () => {
@@ -589,9 +604,26 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares and consum
     /^  pull_request\s*:\s*$/m,
     "ci.yml must still run on `pull_request` — otherwise the per-PR pin gate never fires"
   );
+  // Scope the filter check to the `pull_request:` SUB-block: over the whole trigger block, an
+  // unrelated key (`workflow_dispatch.inputs.paths:`) would false-RED. A flow-mapped
+  // `pull_request: {paths-ignore: […]}` needs no flow-aware matcher here — it removes the bare
+  // `pull_request:` line, so the assertion above already fails closed.
+  const prLines = [];
+  for (let i = onIdx + 1; i < jobsIdx; i++) {
+    const l = callerLines[i];
+    if (l.trim() === "") continue;
+    if (/^  \S/.test(l)) {
+      if (!/^  pull_request\s*:\s*$/.test(l) && prLines.length) break;
+      if (/^  pull_request\s*:\s*$/.test(l)) { prLines.push(l); continue; }
+      if (!prLines.length) continue;
+      break;
+    }
+    if (prLines.length) prLines.push(l);
+  }
+  const prBlock = prLines.join("\n");
   for (const filter of ["paths", "paths-ignore", "branches", "branches-ignore", "types"]) {
     assert.ok(
-      !keyRe(filter).test(triggerBlock),
+      !keyRe(filter).test(prBlock),
       `ci.yml's \`pull_request:\` gained \`${filter}:\` — \`paths-ignore: ['extensions/**']\` would ` +
         "skip the per-PR pin gate for exactly the PRs it guards (#637)"
     );
@@ -614,7 +646,41 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares and consum
     !keyRe("continue-on-error").test(callerJob),
     "the `ci:` job in ci.yml gained `continue-on-error:` — the pin gate could fail silently"
   );
-  const binding = callerJob.split("\n").find((l) => keyRe("test-command").test(l));
+  // A dependent job is skipped when a needed job is skipped, so `needs:` on the gate job unplugs it
+  // just as effectively as an `if:`.
+  assert.ok(
+    !keyRe("needs").test(callerJob),
+    "the `ci:` job in ci.yml gained `needs:` — a skipped dependency skips this job too, " +
+      "silently unplugging the pin gate"
+  );
+  // The binding must be inside the job's `with:` MAPPING. Indentation alone is not enough: a job-level
+  // block scalar at the same indent (`name: |` with a 6-space body) also yields a 6-space
+  // `test-command:` line, and `find()` would return that decoy first — leaving the real input set to
+  // `… || true` while the guard read the decoy. Reproduced GREEN at 163/163 on a valid, actionlint-clean
+  // workflow, so the `with:` mapping is collected and asserted by key set.
+  const callerJobLines = callerJob.split("\n");
+  const withIdx = callerJobLines.findIndex((l) => /^ {4}with\s*:\s*$/.test(l));
+  assert.ok(
+    withIdx >= 0,
+    "the `ci:` job in ci.yml no longer passes a `with:` mapping to the node-ci.yml reusable workflow"
+  );
+  const withLines = [];
+  for (let i = withIdx + 1; i < callerJobLines.length; i++) {
+    const l = callerJobLines[i];
+    if (l.trim() === "") continue;
+    if (/^ {0,4}\S/.test(l)) break; // dedented back to the job level — end of the `with:` mapping
+    withLines.push(l);
+  }
+  assert.deepEqual(
+    withLines
+      .map((l) => l.match(/^ {6}([A-Za-z_][A-Za-z0-9_-]*)\s*:/))
+      .filter(Boolean)
+      .map((m) => m[1]),
+    ["test-command"],
+    "the `ci:` job's `with:` key set changed — the pin gate's only input is `test-command` " +
+      "(update deliberately, after confirming the suite still runs per-PR)"
+  );
+  const binding = withLines.find((l) => /^ {6}test-command\s*:\s*\S/.test(l));
   assert.ok(
     binding && unquote(binding.replace(/^\s*test-command\s*:\s*/, "")) !== "",
     "the node-ci.yml call in ci.yml no longer passes a non-empty `test-command` — the " +
@@ -640,6 +706,26 @@ test("ci.yml binds a non-empty test-command that node-ci.yml declares and consum
     !keyRe("continue-on-error").test(jobBlock),
     "the `unit-test` job (or its custom-test step) gained `continue-on-error:` — the suite " +
       "could fail while the job reports success"
+  );
+  assert.ok(
+    !keyRe("needs").test(jobBlock),
+    "the `unit-test` job gained `needs:` — a skipped dependency skips the gate"
+  );
+  // The step bodies must be EXACTLY the two known ones. Asserting "some line matches" lets a dead
+  // second step (`- if: false` carrying `run: ${{ inputs.test-command }}`) satisfy the step `if:` and
+  // `run:` checks while the real step keeps `|| true` — reproduced at 163/163 during review.
+  assert.deepEqual(
+    jobBlock
+      .split("\n")
+      .filter((l) => /^\s{8}run\s*:/.test(l))
+      .map((l) => l.trim())
+      .sort(),
+    [
+      "run: ${{ inputs.test-command }}",
+      "run: node --test ${{ inputs.test-glob }}",
+    ].sort(),
+    "the `unit-test` job's step-level `run:` set changed — either the gate's step was altered or a " +
+      "new step was added (update this list deliberately, after confirming the suite still runs)"
   );
   // BOTH predicates must consume the input, and EXACTLY in the known-good shape.
   // A conjunct that can never hold (`if: inputs.test-command != '' && false`, or
