@@ -1,0 +1,70 @@
+# CODEOWNERS — owners of the repo's enforcement surfaces (#667)
+#
+# WHY THIS FILE EXISTS
+# The pin/version guards, the pipeline gate, and the CI workflows that run
+# them are the surfaces that decide whether a PR is "compliant". Without an
+# owner on those paths, a PR can author or weaken the guard that judges it in
+# the same commit that needs it weakened, and the only trace is a diff a
+# reviewer may or may not read (see #667; observed while landing #640).
+#
+# SCOPE: enforcement surfaces only. Documentation, content, and general
+# source paths are deliberately NOT owned here (see the non-goal in #667 and
+# the "Not guarded" section of docs/ops/guarded-paths.md).
+#
+# GitHub evaluates these gitignore-style patterns last-match-wins; any line
+# with invalid syntax is silently skipped, so keep every line a valid pattern
+# followed by at least one owner. The guarded path list is documented in one
+# place — docs/ops/guarded-paths.md — and must match this file.
+#
+# NOTE (bootstrap ordering): GitHub reads CODEOWNERS from the PR's BASE branch,
+# so this file has no effect on the PR that adds it — ownership starts with the
+# next PR that touches a guarded path after this merges.
+#
+# NOTE (single-writer reality, #669): GitHub does not request a review from the
+# PR author, and @daniel-ospina is the repo's only collaborator — so every PR is
+# authored by the sole code owner and this file currently produces an ownership
+# ANNOTATION, not a visible review request. Branch protection also requires no
+# code-owner review (`required_pull_request_reviews` is null). Making this
+# blocking needs that setting enabled AND a second approving identity (the sole
+# writer cannot approve their own PR) — see #669. #646 is unrelated: it makes a
+# code status check required, not a review.
+
+# The ownership file itself — changing who owns the guards needs owner review.
+/.github/CODEOWNERS                       @daniel-ospina
+
+# CI workflows. pipeline-compliance.yml implements the repo's ONLY required
+# status check (context: `pipeline-compliance`); renaming its job silently
+# disables the check, so workflow edits need owner review.
+# templates/ holds the materialization source for the reusable workflows —
+# edit the template, not the copy, so it needs the same owner.
+/.github/workflows/                       @daniel-ospina
+/templates/.github/workflows/             @daniel-ospina
+
+# The pipeline gate itself — this script decides every merge.
+/scripts/check-pipeline-compliance.sh     @daniel-ospina
+
+# Pin / version / skill-frontmatter guards (#254, #637 guards (h)/(i)/(j)).
+# frontmatter-fixtures.mjs carries PI_VERSION_PIN (the canonical pin);
+# probe-frontmatter-fixtures.mjs regenerates it and resolves the real pi
+# bundle; check-staged-skill-frontmatter.mjs is the authoring-time hook.
+/scripts/check-skill-lint.mjs             @daniel-ospina
+/scripts/check-skill-lint.test.mjs        @daniel-ospina
+/scripts/check-skill-lint.oracle.test.mjs @daniel-ospina
+/scripts/frontmatter-validate.mjs         @daniel-ospina
+/scripts/frontmatter-fixtures.mjs         @daniel-ospina
+/scripts/probe-frontmatter-fixtures.mjs   @daniel-ospina
+/scripts/check-staged-skill-frontmatter.mjs @daniel-ospina
+
+# Review-record writer + the in-session gates that consume its verdict
+# (review-enforcer merge registry, verification-gate pass contract). Guarding
+# the tests too: a weakened test is a weakened guard.
+/scripts/record-review.sh                 @daniel-ospina
+/scripts/record-review.test.sh            @daniel-ospina
+/extensions/review-enforcer/index.ts      @daniel-ospina
+/extensions/review-enforcer/index.test.ts @daniel-ospina
+/extensions/verification-gate/index.ts    @daniel-ospina
+/extensions/verification-gate/index.test.ts @daniel-ospina
+/extensions/verification-gate/index.e2e.test.ts @daniel-ospina
+
+# The behavioral contract the guards encode.
+/AGENTS.md                                @daniel-ospina
