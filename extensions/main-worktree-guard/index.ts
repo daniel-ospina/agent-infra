@@ -150,11 +150,19 @@ let trackedRelsIn: (repoTop: string, rels: string[]) => string[] = () => [];
 let hasDotGitAncestor: (p: string) => boolean = () => false;
 let extractScriptPath: (command: string) => string | null = () => null;
 let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string) => "allow" | "block" = () => "allow";
+// #627: non-shell code-interpreter payload surface (python -c / node -e / …).
+// Fail-safe defaults inert so a failed import NEVER false-blocks.
+let extractCodePayload: (command: string) => { kind: "inline" | "file" | "stdin-file" | "module" | "stdin"; value: string | null } | null = () => null;
+let codePayloadGitVerdict: (content: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string) => "allow" | "block" = () => "allow";
 // #350: hub-WIP hygiene helpers (warn-only). Fail-safe defaults: inert
 // (null/[]) so a failed import NEVER false-blocks — these warnings are
 // discipline prompts, not gates.
 let matchHubWipPattern: (resolvedPath: string) => "docs/plans" | "migrations" | "scratch" | null = () => null;
 let extractBashWriteTargets: (command: string, cwd?: string) => { resolvedPath: string; via: string }[] = () => [];
+// #628: disordered-hub new-file volume policy (pure decision in classify-git).
+let hubNewFileVolumeVerdict: (count: number) => "warn" | "escalate" | "block" = () => "warn";
+let HUB_NEW_FILE_WARN_BUDGET = 10;
+let HUB_NEW_FILE_BLOCK_CAP = 25;
 let classifyUntrackedWip: (porcelain: string) => { untracked: string[]; wip: { path: string; pattern: string }[] } = () => ({ untracked: [], wip: [] });
 // #437 (C): PER-WRITE-SITE bash-write candidates (cd-aware) for the
 // disordered-hub gate + the pure tracked intersect. Fail-safe defaults inert.
@@ -185,10 +193,16 @@ try {
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
      readAllowMarkerState, readHubDisorder,
      extractScriptPath, scriptGitVerdict, evaluateHubGateWithTargets,
+     extractCodePayload, codePayloadGitVerdict,
      commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern,
      extractBashWriteTargets, classifyUntrackedWip, branchDeleteAllowance, newFileWriteCollisionFree,
-     bashWriteTargetsResolved, resolveTargetCheckout, trackedRelsIn, hasDotGitAncestor } =
+     bashWriteTargetsResolved, resolveTargetCheckout, trackedRelsIn, hasDotGitAncestor,
+     hubNewFileVolumeVerdict: _hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET: _HUB_NEW_FILE_WARN_BUDGET,
+     HUB_NEW_FILE_BLOCK_CAP: _HUB_NEW_FILE_BLOCK_CAP } =
     await import("./classify-git.mjs"));
+  hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
+  HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
+  HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
 } catch (e) {
@@ -388,6 +402,11 @@ let lastMainTopAttemptMs = 0;
 let lastHubHygieneMs = 0;
 const warnedWipTargets = new Set<string>(); // tool-call warnings: once per (pattern,path) per session
 const warnedWipPaths = new Set<string>();    // inventory warnings: once per path per session
+// #628: disordered-hub new-file volume policy — per-session counter (pid =
+// one pi process = one session) + per-path warn dedupe. See classify-git
+// hubNewFileVolumeVerdict for the pure decision + constants.
+const hubNewFileCounts = new Map<number, number>();
+const warnedNewFileTargets = new Set<string>();
 
 // The MAIN checkout's toplevel (git worktree list first entry = the primary
 // worktree — empirically stable on git 2.50.1, though not formally guaranteed
@@ -680,6 +699,57 @@ function _maybeWarnHubWipWrite(targetPath: string | undefined, hubTop?: string) 
     if (warnedWipTargets.has(dedupeKey)) return;
     warnedWipTargets.add(dedupeKey);
     _warnHubWip(pattern, resolve(process.cwd(), targetPath)); // display the un-realpath'd path
+  } catch { /* warn-only — never blocks */ }
+}
+
+// #628 (write-time signal): the disordered-hub M4 new-file carve-out returns
+// BEFORE the #350 WIP prompt, so new hub files accumulated silently. Every
+// carve-out write now warns (all paths — not just WIP patterns) and the
+// warning escalates past the budget; the caller blocks past the hard cap.
+// Prompts follow the documented marker contract: suppressed under the env
+// hatch AND an active TTL marker (the marker is an audited solo-session
+// window); the CAP block is M4 discipline and stays active under the marker
+// (D3 — the marker never re-enables hub writes).
+function _warnHubNewFile(targetPath: string, count: number, level: "warn" | "escalate") {
+  const L = (t: string) => "║  " + t.padEnd(62) + "║";
+  const lines = [
+    "",
+    "╔══════════════════════════════════════════════════════════════════╗",
+    L("⚠️  NEW FILE IN A DISORDERED HUB — PUT IT IN A WORKTREE (#628)"),
+    "╠══════════════════════════════════════════════════════════════════╣",
+    L(`Target: ${_truncatePath(targetPath, 52)}`),
+    L(`New hub files this session: ${count} (budget ${HUB_NEW_FILE_WARN_BUDGET}, cap ${HUB_NEW_FILE_BLOCK_CAP})`),
+    L(""),
+    ...(level === "escalate"
+      ? [
+        L("Budget exceeded — this is accumulation, not a one-off. The hub's"),
+        L("only legal state is main+clean; stop adding to the dirty set."),
+        L(`Further new files block past ${HUB_NEW_FILE_BLOCK_CAP}.`),
+      ]
+      : [
+        L("The hub is off-main/dirty. New files are allowed (additive, they"),
+        L("cannot collide with a sibling's WIP) but they GROW the dirty set"),
+        L("the hub recovery must later carry."),
+      ]),
+    L("→ Recover the hub, then work in a worktree:"),
+    L("  bash scripts/checkout-hygiene/hub-worktree.sh <branch>"),
+    "╚══════════════════════════════════════════════════════════════════╝",
+    "",
+  ];
+  console.warn(lines.join("\n"));
+}
+
+// Deduped per path per session (mirrors warnedWipTargets). Suppressed under
+// the env hatch / active marker per the marker contract; the volume COUNTER
+// still advances (the cap must count even while prompts are suppressed).
+function _maybeWarnHubNewFile(targetPath: string, count: number, level: "warn" | "escalate") {
+  try {
+    if (_isAllowMainEdits()) return;
+    if (readAllowMarkerState(_markerPath(), _currentSessionId(undefined))) return;
+    const key = `newfile:${count > HUB_NEW_FILE_WARN_BUDGET ? "escalated" : "warn"}:${targetPath}`;
+    if (warnedNewFileTargets.has(key)) return;
+    warnedNewFileTargets.add(key);
+    _warnHubNewFile(targetPath, count, level);
   } catch { /* warn-only — never blocks */ }
 }
 
@@ -1005,6 +1075,47 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
 function _backdoorBlock(command: string, execCwd?: string): string | null {
   try {
     if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktree sessions are isolated
+    // #627: non-shell CODE interpreters (python -c / python <file> / node -e /
+    // ruby -e / perl -e / php -r / …) carry git payloads past the SHELL-only
+    // script gate — the payload is quoted/arrayed, so evaluateHubGateWithTargets
+    // sees no git token either. Resolve the code payload BEFORE
+    // extractScriptPath: the latter's `/abs/path` rule would resolve
+    // `/usr/bin/python3` and read the interpreter BINARY as a script.
+    // codePayloadGitVerdict shares the script surface's allowlist + per-
+    // invocation target resolution, so read-only and worktree-targeted git ops
+    // from code keep working (false-blocks stay exceptional).
+    const code = extractCodePayload(command);
+    if (code) {
+      const base = execCwd ? resolve(execCwd) : resolve(process.cwd());
+      let content: string | null = null;
+      if (code.kind === "inline") content = code.value ?? "";
+      else if ((code.kind === "file" || code.kind === "stdin-file") && code.value) {
+        const p = resolve(base, code.value);
+        try { if (existsSync(p) && statSync(p).isFile()) content = readFileSync(p, "utf-8"); } catch { content = null; }
+      }
+      // module (`python -m x`) / bare stdin payloads are not statically
+      // resolvable — documented residual (README backdoor table). INLINE
+      // payloads are ALSO recursed by _walkShell (#627), so the structured
+      // classifier still sees them even if this gate degrades.
+      if (content !== null) {
+        const branch = getMainCheckoutBranch();
+        if (codePayloadGitVerdict(content, branch, base, resolve(process.cwd())) === "block") {
+          const what = code.kind === "inline"
+            ? "an inline code payload"
+            : `${resolve(base, code.value ?? "")}`;
+          return [
+            `⛔ Script execution blocked — git-bearing code payload in the shared main checkout (#627).`,
+            `   The non-shell interpreter backdoor (python -c, node -e, ruby -e,`,
+            `   perl -e, php -r, and script-file forms) is closed: ${what} contains`,
+            `   a non-sanctioned git operation.`,
+            `   → Run the git commands directly (recovery: git checkout main && git pull --ff-only),`,
+            `     or work in an isolated worktree:`,
+            `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+          ].join("\n");
+        }
+      }
+      return null; // resolved code invocation — no shell script to gate
+    }
     const scriptPath = extractScriptPath(command);
     if (!scriptPath) return null;
     // #347: resolve the script path + content gating against the command's
@@ -1351,6 +1462,30 @@ export default function (pi: ExtensionAPI) {
             // stay blocked. D3 preserved: the marker bypass does not re-enable
             // overwrites (this block still runs before the marker check).
             if (_hubNewFileWriteAllowed(targetPath)) {
+              // #628: volume policy — warn at write time for EVERY new hub file
+              // (all paths, not just the #350 WIP patterns), escalate past the
+              // budget, BLOCK past the hard cap. The counter is per-session and
+              // only advances while the hub is disordered (this branch).
+              const pid = process.pid;
+              const newFileCount = (hubNewFileCounts.get(pid) ?? 0) + 1;
+              hubNewFileCounts.set(pid, newFileCount);
+              const volume = hubNewFileVolumeVerdict(newFileCount);
+              if (volume === "block") {
+                return {
+                  block: true,
+                  reason: [
+                    `⛔ New-file write blocked — new-file cap exhausted in a disordered hub (#628).`,
+                    `   This session has created ${newFileCount - 1} new files directly in the`,
+                    `   shared main checkout while it is OFF-MAIN or DIRTY (cap ${HUB_NEW_FILE_BLOCK_CAP}).`,
+                    `   New files are additive (they cannot collide with a sibling's uncommitted`,
+                    `   work) but unbounded accumulation is the #347 amplifier, and the hub's`,
+                    `   only legal state is main+clean.`,
+                    `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
+                    `   → Do feature work in a worktree: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+                  ].join("\n"),
+                };
+              }
+              _maybeWarnHubNewFile(targetPath, newFileCount, volume);
               return undefined; // new-file write — collision-free by construction
             }
             return {

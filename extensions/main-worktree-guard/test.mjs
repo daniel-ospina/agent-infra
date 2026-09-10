@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -4521,6 +4521,80 @@ try {
   expectUntrackedWip("scratch flagged, normal file not", "?? foo.tmp\n?? src/new.ts", ["foo.tmp", "src/new.ts"], [{ path: "foo.tmp", pattern: "scratch" }]);
   expectUntrackedWip("tracked-only changes → no wip", " M src/index.ts\nD  old.txt", [], []);
   expectUntrackedWip("quoted-spelling path unquoted", '?? "docs/plans/my file.md"', ["docs/plans/my file.md"], [{ path: "docs/plans/my file.md", pattern: "docs/plans" }]);
+
+  // ── #627 / #628: pins (adversarial-review findings of PR #624) ──────────
+  // #627 closes the non-shell sibling of the #1484 shell script backdoor;
+  // #628 bounds + surfaces the disordered-hub new-file carve-out. These pins
+  // are BEHAVIORAL on the exported pure functions + the shared walker (index.ts
+  // is not importable) — every one FAILS on origin/main.
+
+  // #627 extractCodePayload — leading-position, wrapper-aware, version/path
+  // normalized, inline/file/module/stdin kinds, attached inline spellings.
+  const cp = (c) => extractCodePayload(c);
+  expectBool("P627-1: python3 -c inline payload extracted", cp(`python3 -c 'import subprocess'`)?.kind === "inline" && cp(`python3 -c 'import subprocess'`)?.value === "import subprocess", true);
+  expectBool("P627-2: attached -c'payload' extracted (short form)", cp(`python3 -c'import os; os.system("git reset")'`)?.kind === "inline" && cp(`python3 -c'import os'`)?.value === "import os", true);
+  expectBool("P627-3: node -e / --eval= / -p extracted", cp(`node -e 'x'`)?.value === "x" && cp(`node --eval='x'`)?.value === "x" && cp(`node -p 'x'`)?.value === "x", true);
+  expectBool("P627-4: ruby/perl/php inline flags extracted", cp(`ruby -e 'x'`)?.value === "x" && cp(`perl -E 'x'`)?.value === "x" && cp(`php -r 'x'`)?.value === "x", true);
+  expectBool("P627-5: script-file positional extracted", cp(`python3 /tmp/x.py arg1`)?.kind === "file" && cp(`python3 /tmp/x.py arg1`)?.value === "/tmp/x.py", true);
+  expectBool("P627-6: version + path qualified interpreters match", cp(`python3.11 -c 'x'`)?.value === "x" && cp(`/usr/bin/python3 -c 'x'`)?.value === "x" && cp(`${m4Tmp}/venv/bin/python -c 'x'`)?.value === "x", true);
+  expectBool("P627-7: env/sudo/cd/assignment wrappers skip to the interpreter", cp(`FOO=1 python3 -c 'x'`)?.value === "x" && cp(`sudo -u root python3 -c 'x'`)?.value === "x" && cp(`cd /tmp && python3 -c 'x'`)?.value === "x" && cp(`env -i python3 -c 'x'`)?.value === "x", true);
+  expectBool("P627-8: -m module / bare - stdin / < file stdin kinds", cp(`python3 -m http.server`)?.kind === "module" && cp(`python3 -`)?.kind === "stdin" && cp(`python3 < /tmp/x.py`)?.kind === "stdin-file", true);
+  expectBool("P627-9: shell interpreters / git / non-interpreters are NOT code payloads", cp(`bash -c 'x'`) === null && cp(`git -c k=v status`) === null && cp(`ls -la`) === null && cp(`echo python3 -c 'x'`) === null, true);
+
+  // #627 extractCodeGitCommands — the execution-sink requirement is the
+  // false-block guard (inert literals stay allowed, matching the shell surface).
+  expectBool("P627-10: array-form git command reconstructed", JSON.stringify(extractCodeGitCommands(`import subprocess; subprocess.run(["git","reset","--hard","origin/main"])`)) === JSON.stringify(["git reset --hard origin/main"]), true);
+  expectBool("P627-11: os.system string + child_process execSync reconstructed", JSON.stringify(extractCodeGitCommands(`os.system("git reset --hard")`)) === JSON.stringify(["git reset --hard"]) && JSON.stringify(extractCodeGitCommands(`require('child_process').execSync('git push --force origin main')`)) === JSON.stringify(["git push --force origin main"]), true);
+  expectBool("P627-12: inert literal without a sink → NO candidate (no false-block)", extractCodeGitCommands(`print("git reset --hard")`).length === 0 && extractCodeGitCommands(`x = 'git commit -m x'`).length === 0, true);
+  expectBool("P627-13: sink without a git reference → NO candidate", extractCodeGitCommands(`import subprocess; subprocess.run(["ls","-la"])`).length === 0, true);
+
+  // #627 codePayloadGitVerdict — parity with scriptGitVerdict: hub mutations
+  // block, read-only/no-git/worktree-targeted pass, unresolvable fails closed.
+  const cpv = (c, cwd) => codePayloadGitVerdict(c, "main", cwd ?? hubR, cwd ?? hubR);
+  expectBool("P627-14: hub reset/push/commit from code → block",
+    cpv(`import subprocess; subprocess.run(["git","reset","--hard"])`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["git","push","--force","origin","main"])`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["git","commit","-m","x"])`) === "block", true);
+  expectBool("P627-15: read-only git / no git from code → allow",
+    cpv(`import subprocess; subprocess.run(["git","status"])`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(["git","log","--oneline"])`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(["ls","-la"])`) === "allow", true);
+  expectBool("P627-16: worktree-targeted code git op → allow (#347 parity)",
+    codePayloadGitVerdict(`import subprocess; subprocess.run(["git","reset","--hard"])`, "main", wtR, wtR) === "allow", true);
+  expectBool("P627-17: payload variable + git evidence → fail closed (block)",
+    cpv(`git = "git"; subprocess.run([git, "reset"])`) === "block", true);
+  expectBool("P627-18: concatenated git spelling is a documented residual (allow)",
+    cpv(`subprocess.run(["gi"+"t","reset"])`) === "allow", true);
+
+  // #627 shared-walker recursion: the structured classifier (M2/M3/M4) sees
+  // inline code payloads — nested shell wrappers included.
+  expectBool("P627-19: allGitInvocations sees an inline code payload (cmdVisible false)", (() => {
+    const invs = allGitInvocations(`python3 -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`);
+    return invs.length === 1 && invs[0].verb === "reset" && invs[0].cmdVisible === false;
+  })(), true);
+  expectBool("P627-20: nested shell -c wrapper still reaches the code payload", (() => {
+    const nested = `bash -c "python3 -c \\"import os; os.system('git reset --hard')\\""`;
+    const invs = allGitInvocations(nested);
+    return invs.length === 1 && invs[0].verb === "reset";
+  })(), true);
+  expectBool("P627-21: evaluateHubGateWithTargets blocks a code-carried hub mutation",
+    evaluateHubGateWithTargets(`python3 -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`, "main", hubR).verdict === "block", true);
+  expectBool("P627-22: read-only code payload is non-blocking in the hub gate",
+    evaluateHubGateWithTargets(`python3 -c 'import subprocess; subprocess.run(["git","status"])'`, "main", hubR).verdict !== "block", true);
+
+  // #628 hubNewFileVolumeVerdict — pure boundaries + source pins (index.ts).
+  expectBool("P628-1: volume verdict boundaries",
+    hubNewFileVolumeVerdict(1) === "warn" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_WARN_BUDGET) === "warn" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_WARN_BUDGET + 1) === "escalate" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_BLOCK_CAP) === "escalate" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_BLOCK_CAP + 1) === "block", true);
+  expectBool("P628-2: budget/cap constants are the documented values", HUB_NEW_FILE_WARN_BUDGET === 10 && HUB_NEW_FILE_BLOCK_CAP === 25, true);
+  expectBool("P628-3: index.ts wires the new-file volume policy + write-time warn",
+    pinSrc.includes("hubNewFileVolumeVerdict") && pinSrc.includes("_maybeWarnHubNewFile") && pinSrc.includes("hubNewFileCounts") && pinSrc.includes("#628"), true);
+  expectBool("P628-4: the #628 cap BLOCK reason exists (not warn-only)", pinSrc.includes("new-file cap exhausted in a disordered hub") && pinSrc.includes("_warnHubNewFile"), true);
+  expectBool("P627-23: index.ts wires the code-payload backdoor (#627)",
+    pinSrc.includes("extractCodePayload") && pinSrc.includes("codePayloadGitVerdict") && pinSrc.includes("#627"), true);
 
   // ── Degradation (D) ──
   const classifySrc = readFileSync(new URL("./classify-git.mjs", import.meta.url), "utf-8");

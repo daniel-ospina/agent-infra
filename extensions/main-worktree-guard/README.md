@@ -91,6 +91,21 @@ not-checked-out-anywhere semantics:
    symlink-resolved) path comparison. Both carve-outs are pure-logic
    unit-tested in `test.mjs` (`branchDeleteNames` /
    `branchDeleteAllowance` / `newFileWriteCollisionFree` + runtime pins).
+   **#628 volume policy (warn → escalate → cap):** collision-free is not
+   harm-free — unbounded new files grow the dirty set the hub recovery must
+   later carry, and the carve-out returned before any write-time prompt. The
+   carve-out now (a) warns at WRITE TIME for every new hub file while
+   disordered (all paths — not just the #350 `docs/plans`/`migrations`/scratch
+   patterns), (b) escalates the banner once a session crosses
+   `HUB_NEW_FILE_WARN_BUDGET` (10) new files, and (c) BLOCKS past
+   `HUB_NEW_FILE_BLOCK_CAP` (25) with a worktree-routing reason
+   (`hubNewFileVolumeVerdict`; per-session counter). The block is a true
+   positive by construction (a disordered hub is already illegal), so it does
+   not violate the "false-blocks are not acceptable" doctrine; the common
+   one-or-two-new-files case (#436 tortoise #2238 friction) is unchanged apart
+   from the banner. Prompts are suppressed under the env hatch / an active TTL
+   marker (the documented prompt contract); the CAP stays active under the
+   marker (D3 — the marker never re-enables hub writes).
 
 **Why WIP preservation:** the 2026-08-18 incident left 38 commits on `pr1467`
 in the hub. `git push origin <checked-out-branch>` is the ONE allowed push so
@@ -214,6 +229,26 @@ EXECUTION cwd (cd-resolved, subshell/pipe-scoped) — `cd <wt> && bash x.sh`
 resolves x.sh inside the worktree; worktree-targeted script content is exempt,
 while content targeting the hub (`git -C <hub> reset …`) blocks even from a
 worktree cwd. Subshell-wrapped executions (`(cd … && bash x.sh)`) are covered.
+**#627 — the non-shell interpreter sibling is closed too.** `python -c` /
+`python <file>`, `node -e`/`--eval`/`-p`, `ruby -e`, `perl -e`, `php -r`,
+`deno eval`, `bun -e`, `lua -e`, `Rscript -e`, `julia -e`, `osascript -e`,
+`pwsh -c` (version/path-qualified spellings and `env`/`sudo`/`cd` wrappers
+included) are now gated by the SAME allowlist: `extractCodePayload` resolves
+the payload (inline or file), `extractCodeGitCommands` reconstructs the `git …`
+candidate from code literals (array form `['git','reset','--hard']`, string
+form `"git reset --hard"`), and `codePayloadGitVerdict` classifies it with the
+script surface's per-invocation target resolution. Inline payloads are ALSO
+recursed by the shared walker, so the structured classifier (M2/M3/M4) sees
+them — nested wrappers (`bash -c 'python3 -c …'`) included. The scanner
+requires an execution SINK (`subprocess`, `os.system`, `execSync`,
+`child_process`, `Popen`, `spawn`, `system`, `passthru`, `proc_open`,
+`do shell script`, …), so inert literals (`print('git reset --hard')`, a
+docstring, a test fixture) stay allowed — matching `echo 'git reset'` on the
+shell surface. Documented residuals (#627): `python -m <module>` and bare
+stdin/pipe/heredoc payloads (the code is not statically resolvable); a
+dynamically constructed git command (`'gi'+'t'`, `chr(103)+…`, base64);
+attached long-option payloads whose `=` value is unquoted (`node
+--eval=require(...)` — shell-invalid without escaping).
 
 ### Incident writeup — 2026-08-18 (the canonical hub-discipline failure)
 
@@ -367,7 +402,9 @@ dirty, and trips M4's freeze. Surfaces:
    (`tar -x`, `unzip -o`, `patch`), directory-TREE copies whose per-file
    targets are not in the command string (`cp -R src/ dst/`), backtick
    command substitution (the `$( )` form IS walked), arbitrary interpreter
-   writers (`node -e`, `ruby -e`, `php -r`), a bare `rm` of a tracked file,
+   writers (`node -e`, `ruby -e`, `php -r` — the #627 git-CONTENT gate above
+   covers their git payloads; the WRITE-target rewrite class remains open,
+   #663), a bare `rm` of a tracked file,
    an rsync option that takes a separate operand but is neither in the
    arity table nor an unambiguous prefix of an entry (and the same class for
    sort), rsync options whose operand is itself a WRITTEN file
@@ -566,7 +603,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 |---|---|---|
 | env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated exempts agent-infra main dirt anymore (#615/#619 — hub-state-check now includes agent-infra + the sibling hub repos tortoise/premise-labs/DMeer/eldato; sibling sessions in the hub are unprotected and will be disrupted). Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
-| script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. It was the most likely vector for the 2026-08-18 incident; it no longer exists. |
+| script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. **#627:** the non-shell sibling (`python -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, script files) is closed too; residual: `python -m`/bare-stdin/pipe payloads, dynamic string construction. Env hatch / TTL marker still bypass it. |
 | terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | THE sanctioned recovery (#206). Terminals are never intercepted; this is how a stranded hub gets un-stranded. |
 
 Rule of thumb: **if you are not recovering the hub or working alone, you
@@ -686,7 +723,7 @@ it clobbers the guard's stamp, the marker becomes unscoped, and the guard
 blocks. The env hatch is unchanged — the marker is an additional OR branch,
 never a replacement.
 
-## The script backdoor — closed since #1484
+## The script backdoor — closed since #1484 (shell + #627 interpreters)
 
 **CLOSED since #1484.** The old escape — `write /tmp/recover.sh` (outside
 project paths classify ALLOW) + `bash /tmp/recover.sh` (classifies
@@ -698,6 +735,21 @@ A script containing `git commit`, `git checkout -b`, a foreign push, etc. is
 blocked with a reason naming the closure; recovery scripts (`hub-worktree.sh`:
 `fetch` + `worktree add`) and read-only git in scripts pass. Inline `bash -c
 '…'` is gated as the caller's own command by the normal classifier.
+
+**#627 extends the closure to non-shell code interpreters.** The same payload
+escaped via `python3 -c "import subprocess; subprocess.run(['git','reset',
+'--hard'])"` (array form — no `git` token at a shell command position) or a
+script file (`python3 /tmp/x.py`). `extractCodePayload` resolves the payload,
+`extractCodeGitCommands` reassembles the git candidate, and
+`codePayloadGitVerdict` applies the SAME allowlist + per-invocation target
+resolution as the shell surface. Two boundaries are deliberate:
+- **Sink requirement** — a candidate is only emitted when the payload contains
+  a process-spawn primitive, so inert literals stay allowed (no false-blocks).
+- **Worktree parity** — a worktree-targeted code git op (`cd <wt> && python3
+  -c "… git commit …"`) is exempt exactly like its shell twin (#347).
+Residuals (documented, not gated): `python -m <module>`, bare stdin/pipe/heredoc
+payloads, dynamic string construction, and pathological obfuscation (the
+open-ended family shared with the shell residual tier).
 
 ## What it does NOT fix
 
@@ -743,7 +795,9 @@ shared main checkout of a project with the guard active:
     state) → **blocked**; the write/edit block reason names the `docs/plans/`
     pattern on the main+clean gate (#615 removed the agent-infra warn-only
     exemption). A NEW untracked file in a disordered hub passes the #436
-    collision-free new-file carve-out (hub stays dirty — tracked by #628); a
+    collision-free new-file carve-out (hub stays dirty — #628 now warns at
+    write time for every new hub file, escalates past the budget, and blocks
+    past the cap); a
     WORKTREE session writing `docs/plans/wip.md` into the hub via an absolute
     path → `HUB WIP — PUT IT IN A WORKTREE` warning, command still runs
     (never blocked); `echo x > /tmp/foo.tmp` → no warning (outside the hub);
