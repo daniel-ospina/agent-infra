@@ -236,8 +236,17 @@ agents in the hub) is prevented by discipline, not just guards:
    agent-infra) detects the mass-replace corruption class (.bak files +
    known tokens). Run it before committing or on suspicion.
 4. **Never disable the guard ambiently.** Do not export
-   `AGENT_ALLOW_MAIN_EDITS=1` (or VGATE/review skips) in shell profiles; the
-   escape hatch is per-session and time-boxed.
+   `AGENT_ALLOW_MAIN_EDITS=1` (or VGATE/review skips) in shell profiles,
+   launchers, or session-wide env; the escape hatch is per-session and
+   time-boxed. Since #623 the blast radius of an ambient hatch is bounded:
+   `task`/`subagent` children of a hatched controller are **stripped by
+   default** (the hatch must be re-passed per-dispatch via `allow_main_edits:
+   true`), so a launcher that leaks the hatch can no longer silently hatch a
+   whole fleet — but it still hatches every interactive session it starts.
+   (Finding: on this machine the ambient source was cmux.app's own long-lived
+   process env — launched before `~/.zshenv` had the exports commented out and
+   propagated via `login -p` — not any shell rc. Remediation: relaunch cmux so
+   new surfaces inherit the clean launchd env.)
 
 ## Quick Reference
 

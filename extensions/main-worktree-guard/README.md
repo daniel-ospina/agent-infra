@@ -529,8 +529,8 @@ review rounds that surfaced the family).
 
 | Variable | Purpose | Required for |
 |---|---|---|
-| `AGENT_ALLOW_MAIN_EDITS=1` | Deliberate solo-session bypass — disables the guard for the whole session. Must be set before the session starts; cannot be set on a running process. ⚠️ **Propagates to task children** (#617): sub-agents inherit the parent's env via the `...process.env` spread in `builtin-tools` `subAgentEnv` (a hatched controller dispatches a hatched fleet — controller-parity, deliberate for in-main parallel work under the operator's own escape authorization). Unhatched controllers dispatch unhatched fleets: since #617 the forced injection is gone, so M4/M2/M3 apply to task sub-agents exactly as to their controller. | — |
-| `ELDATO_ALLOW_MAIN_EDITS=1` | Legacy alias of the above (checked second). | — |
+| `AGENT_ALLOW_MAIN_EDITS=1` | Deliberate solo-session bypass — disables the guard for the whole session. Must be set before the session starts; cannot be set on a running process. ⚠️ **Does NOT propagate to task children** (#617/#623): sub-agents inherit the parent's env via the `...process.env` spread in `builtin-tools` `subAgentEnv`, but since #623 the hatch is **default-stripped** — both AGENT/ELDATO_ALLOW_MAIN_EDITS are deleted from the child env after the spread, so a hatched controller dispatches an **UNHATCHED** fleet (M4/M2/M3 apply to task sub-agents exactly as to an unhatched controller). A controller that deliberately needs an in-main task child must pass the per-dispatch `allow_main_edits: true` opt-in on the `task` call (and the equivalent `allow_main_edits` param on the legacy `subagent` tool) — the child then inherits only a hatch the controller env itself carries. An ambient launcher hatch can therefore never silently hatch a fleet. | — |
+| `ELDATO_ALLOW_MAIN_EDITS=1` | Legacy alias of the above (checked second) — same default-strip + opt-in semantics for task children (#623). | — |
 
 The env hatch is fixed at session start. For a **mid-session** escalation on a
 running, guard-blocked session, use the escape marker below.

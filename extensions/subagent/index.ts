@@ -830,6 +830,15 @@ export async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	// #623: per-dispatch opt-in to propagate the controller's OWN main-edits
+	// hatch (AGENT_ALLOW_MAIN_EDITS=1 / ELDATO_ALLOW_MAIN_EDITS=1) to this
+	// child. Default false: subagent-tool children are UNHATCHED BY DEFAULT —
+	// the hatch is stripped from childEnv exactly like builtin-tools task
+	// children (#623), so an ambient launcher hatch can never silently hatch a
+	// whole fleet through this second dispatcher. Pass true ONLY to
+	// deliberately dispatch an in-main child under the controller's own escape
+	// authorization.
+	allowMainEdits = false,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -964,6 +973,36 @@ export async function runSingleAgent(
 				// #285 Fix A: key-specific strip of the inherited bypass vars.
 				delete childEnv.ELDATO_SKIP_VGATE;
 				delete childEnv.ELDATO_SKIP_REVIEW_GATE;
+				// #623: DEFAULT-STRIP the main-edits hatch — mirror of the builtin-
+				// tools task-tool strip (#623, P1-1). #617 removed the FORCED
+				// injection from the task tool, but this legacy dispatcher ALSO
+				// spreads ...process.env untouched: a hatched controller's subagent-
+				// tool children silently inherited the full M2/M3/M4 bypass. The
+				// hatch is deleted here by default and survives ONLY when the
+				// dispatch passes allowMainEdits=true (the tool exposes the
+				// allow_main_edits param; programmatic runSingleAgent callers pass
+				// the trailing arg). Key-specific ONLY — never a prefix sweep.
+				delete childEnv.AGENT_ALLOW_MAIN_EDITS;
+				delete childEnv.ELDATO_ALLOW_MAIN_EDITS;
+				// #623 opt-in restore: re-add the hatch var(s) the controller itself
+				// carries for THIS dispatch only. A controller that is NOT
+				// env-hatched cannot opt a child in.
+				const parentHatched =
+					process.env.AGENT_ALLOW_MAIN_EDITS === "1" ||
+					process.env.ELDATO_ALLOW_MAIN_EDITS === "1";
+				if (allowMainEdits) {
+					if (process.env.AGENT_ALLOW_MAIN_EDITS === "1") childEnv.AGENT_ALLOW_MAIN_EDITS = "1";
+					if (process.env.ELDATO_ALLOW_MAIN_EDITS === "1") childEnv.ELDATO_ALLOW_MAIN_EDITS = "1";
+					if (!parentHatched) {
+						console.log(
+							"[subagent] allow_main_edits opt-in ignored — controller env is NOT hatched (no AGENT/ELDATO_ALLOW_MAIN_EDITS=1); child stays unhatched (#623)",
+						);
+					}
+				} else if (parentHatched) {
+					console.log(
+						"[subagent] parent session is env-hatched (AGENT/ELDATO_ALLOW_MAIN_EDITS=1) — children are UNHATCHED by default (#623); pass allow_main_edits: true on the dispatch to opt in",
+					);
+				}
 				// #496: per-level dispatch-attempt marker. Set to "1" on the fallback
 				// child ONLY; attempt-0 EXPLICITLY deletes it (key-specific strip,
 				// mirroring the ELDATO strips above) so a nested fallback parent's
@@ -1340,6 +1379,12 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	allow_main_edits: Type.Optional(
+		Type.Boolean({
+			description:
+				"Per-dispatch opt-in to propagate the controller's OWN main-edits hatch (AGENT_ALLOW_MAIN_EDITS=1 / ELDATO_ALLOW_MAIN_EDITS=1) to these children. Default false (#623): subagent children are UNHATCHED BY DEFAULT — even a hatched controller's env is stripped of the hatch before each child is spawned (mirror of the builtin-tools task-tool strip). Pass true ONLY to deliberately dispatch in-main children under the controller's own escape authorization; a controller whose env is NOT hatched cannot opt children in.",
+		}),
+	),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -1450,6 +1495,7 @@ export default function (pi: ExtensionAPI) {
 							signal,
 							chainUpdate,
 							makeDetails("chain"),
+							params.allow_main_edits === true,
 						);
 					} catch (err) {
 						const message = err instanceof Error ? err.message : String(err);
@@ -1547,6 +1593,7 @@ export default function (pi: ExtensionAPI) {
 								}
 							},
 							makeDetails("parallel"),
+							params.allow_main_edits === true,
 						);
 					} catch (err) {
 						const message = err instanceof Error ? err.message : String(err);
@@ -1599,6 +1646,7 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						onUpdate,
 						makeDetails("single"),
+						params.allow_main_edits === true,
 					);
 				} catch (err) {
 					// #137 F5: never throw — surface as a failed result.

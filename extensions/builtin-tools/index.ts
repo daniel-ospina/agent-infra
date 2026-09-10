@@ -3213,6 +3213,12 @@ export default function (pi: ExtensionAPI) {
             "Comma-separated MCP server names for this sub-agent (forces eager load). Default: none — sub-agents start with ZERO eager MCP connects for deterministic fast startup (#286); mcp-client treats an unmatching allowlist as empty. Name any server (e.g. gemini) to force-load it up front; everything else loads mid-run via mcp_load.",
         })
       ),
+      allow_main_edits: Type.Optional(
+        Type.Boolean({
+          description:
+            "Per-dispatch opt-in to propagate the controller's OWN main-edits hatch (AGENT_ALLOW_MAIN_EDITS=1 / ELDATO_ALLOW_MAIN_EDITS=1) to this one child. Default false (#623): task children are UNHATCHED BY DEFAULT — even a hatched controller's env is stripped of the hatch before the child is spawned, so an ambient launcher hatch can never silently hatch a whole fleet (M2/M3/M4 hub-discipline off). Pass true ONLY to deliberately dispatch an in-main child under the controller's own escape authorization; a controller whose env is NOT hatched cannot opt a child in (the child must never be hatched by a parent that does not itself hold the authorization).",
+        })
+      ),
     }),
     async execute(_toolCallId, params, signal) {
       const modelParam = params.model ?? "deepseek-v4-flash";
@@ -3265,18 +3271,20 @@ export default function (pi: ExtensionAPI) {
   TASK_HEARTBEAT: "1",
   SLACK_BRIDGE_DISABLE: "1",
   VISION_INTERCEPTOR_DISABLED: "1",
-  // #617: NO AGENT/ELDATO_ALLOW_MAIN_EDITS injection — the sub-agent runs the
-  // SAME main-worktree-guard gates as its controller (M4 hub discipline + M2/M3
-  // + write/edit main block — the same surfaces an unhatched controller faces;
-  // bash-write/new-file carve-outs are controller-parity, unchanged). The hatch was originally injected (#6091) to also
+  // #617/#623: NO AGENT/ELDATO_ALLOW_MAIN_EDITS injection — the sub-agent runs
+  // the SAME main-worktree-guard gates as its controller (M4 hub discipline +
+  // M2/M3 + write/edit main block — the same surfaces an unhatched controller
+  // faces; bash-write/new-file carve-outs are controller-parity, unchanged).
+  // The hatch was originally injected (#6091) to also
   // disable verification-gate for one-shot children; #825 obsoleted that half
   // (VGATE stays ACTIVE via the verified-file-registry bridge), and the guard
   // rationale ("branch-ownership M1/M2/M3 protects the shared checkout") is
   // wrong — the hatch ALSO disables M4, so a hub-rooted controller dispatched
-  // an entire parallel fleet that could write/flip the shared hub freely. A
-  // controller DELIBERATELY launched with the hatch still propagates it to
-  // children via the ...process.env spread below (parent-authorized solo
-  // escape); it is never forced here.
+  // an entire parallel fleet that could write/flip the shared hub freely.
+  // Since #623 the hatch is not even propagated from a hatched controller's
+  // OWN env: the strip below deletes it unless the dispatch passes the
+  // explicit allow_main_edits opt-in (see the #623 block after the #285
+  // strip).
   // #825: NO ELDATO_SKIP_VGATE injection. The sub-agent runs with the
   // verification-gate ACTIVE and inherits the parent's verified-file registry
   // via the bridge (~/.pi/agent/verification/latest.json, worktree-scoped
@@ -3293,21 +3301,48 @@ export default function (pi: ExtensionAPI) {
   // swarm follow-up); the ...process.env spread above would otherwise leak
   // them into every task child, silently defeating the #825 contract
   // ("VGATE stays ACTIVE for sub-agents"). Key-specific ONLY:
-  // AGENT_SKIP_REVIEW_GATE stays forced to "1" (#825) and a parent-SET
-  // ALLOW_MAIN_EDITS hatch (a deliberately hatched solo controller dispatching
-  // children for its own in-main work, #617) must survive the strip — never a
-  // prefix sweep.
+  // AGENT_SKIP_REVIEW_GATE stays forced to "1" (#825). The ALLOW_MAIN_EDITS
+  // hatch is handled by the #623 strip below (default-strip + opt-in) — never
+  // a prefix sweep.
   delete subAgentEnv.ELDATO_SKIP_VGATE;
   delete subAgentEnv.ELDATO_SKIP_REVIEW_GATE;
-// #617: sub-agents NO LONGER inherit the hatch by default. #265's env pivot
-// (remove ALLOW_MAIN_EDITS from subAgentEnv) was the intended design but the
-// squash-merged result reverted it with a wrong rationale ("the branch-
-// ownership guard protects the shared checkout") — the hatch ALSO disables M4
-// hub discipline + M2/M3, so hub-rooted task children could flip/dirty the
-// shared hub (observed: tortoise main → feat/2688 + 5 uncommitted files).
-// M4/M2/M3 now apply to task children exactly as to controllers; the #265
-// skills contract (epic-executor/issue-workflow worktree-first) already
-// documented this state.
+// #623: DEFAULT-STRIP the main-edits hatch from task children. #617 removed
+// the FORCED injection, but a controller whose OWN launch env carries
+// AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1 — e.g. ambient
+// launcher/login contamination) still propagated it to every child via the
+// ...process.env spread above: a hatched controller silently dispatched a
+// hatched fleet (M2/M3/M4 + skill-enforcer all bypassed in the child),
+// defeating #617's M4 restoration in practice. Children are now UNHATCHED BY
+// DEFAULT — the hatch is deleted here and survives ONLY when the dispatch
+// explicitly opts in via the task-tool `allow_main_edits` param
+// (per-dispatch, visible in the transcript, never ambient — an env-var
+// handshake would re-create the fleet-hatch under a new name). Key-specific
+// ONLY, mirroring the #285 strip above — never a prefix sweep.
+  delete subAgentEnv.AGENT_ALLOW_MAIN_EDITS;
+  delete subAgentEnv.ELDATO_ALLOW_MAIN_EDITS;
+  // #623 opt-in restore: re-add the hatch var(s) the controller itself
+  // carries (AGENT_ and/or ELDATO_) for THIS dispatch only. Guarded by the
+  // param — a controller that is NOT env-hatched cannot opt a child in
+  // (nothing to propagate; the child must never hold an authorization the
+  // parent lacks).
+  const parentHatched =
+    process.env.AGENT_ALLOW_MAIN_EDITS === "1" ||
+    process.env.ELDATO_ALLOW_MAIN_EDITS === "1";
+  if (params.allow_main_edits) {
+    if (process.env.AGENT_ALLOW_MAIN_EDITS === "1") subAgentEnv.AGENT_ALLOW_MAIN_EDITS = "1";
+    if (process.env.ELDATO_ALLOW_MAIN_EDITS === "1") subAgentEnv.ELDATO_ALLOW_MAIN_EDITS = "1";
+    if (!parentHatched) {
+      console.log(
+        "[task] allow_main_edits opt-in ignored — controller env is NOT hatched (no AGENT/ELDATO_ALLOW_MAIN_EDITS=1); child stays unhatched (#623)",
+      );
+    }
+  } else if (parentHatched) {
+    // Dispatch-time observability (issue #623 option b folded in): a hatched
+    // controller is visible at dispatch — its children do NOT inherit the hatch.
+    console.log(
+      "[task] parent session is env-hatched (AGENT/ELDATO_ALLOW_MAIN_EDITS=1) — task children are UNHATCHED by default (#623); pass allow_main_edits: true on the dispatch to opt in",
+    );
+  }
       // #286: children default to PI_MCP_SERVERS=none — a missing allowlist
       // makes mcp-client eagerly connect ALL non-lazy servers
       // (classifyServers treats undefined as "load all"), and cold connects
