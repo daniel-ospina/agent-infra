@@ -193,7 +193,7 @@ try {
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
      readAllowMarkerState, readHubDisorder,
      extractScriptPath, scriptGitVerdict, evaluateHubGateWithTargets,
-     extractCodePayload, codePayloadGitVerdict,
+     extractCodePayload: _extractCodePayload, codePayloadGitVerdict: _codePayloadGitVerdict,
      commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern,
      extractBashWriteTargets, classifyUntrackedWip, branchDeleteAllowance, newFileWriteCollisionFree,
      bashWriteTargetsResolved, resolveTargetCheckout, trackedRelsIn, hasDotGitAncestor,
@@ -203,6 +203,11 @@ try {
   hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
   HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
   HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
+  // #627 bindings: same stale-classify-git skew guard as #628 — a missing
+  // export must leave the fail-safe defaults (an undefined here would throw in
+  // _backdoorBlock, whose catch turns the whole #627 gate fail-OPEN).
+  if (typeof _extractCodePayload === "function") extractCodePayload = _extractCodePayload;
+  if (typeof _codePayloadGitVerdict === "function") codePayloadGitVerdict = _codePayloadGitVerdict;
   // Stale-classify-git skew guard: a missing export must leave the fail-safe
   // defaults (never overwrite a function with undefined → TypeError on the
   // write branch).

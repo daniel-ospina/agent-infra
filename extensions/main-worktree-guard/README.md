@@ -265,6 +265,8 @@ cd-chain). **Residuals** (#627 → #694): `python -m <module>`, bare
 stdin/pipe/heredoc payloads, package-runner wrappers (`npx`/`uv run`), a sink
 reached only through dynamic indirection (`__import__('subprocess')`), and
 dynamically constructed git commands (`'gi'+'t'`, `chr(103)+…`, base64).
+**Documented fail-closed trade-offs.** Two classes are deliberately conservative (blocked) because static analysis cannot separate them from a real payload: (a) an assigned string that contains a command-line-shaped `git …` invocation (`MSG='git reset --hard is forbidden'` alongside a sink), and (b) a JS template literal / Python triple-quoted string containing a newline-separated git command line. Both require a sink to already be present in the payload; a plain `print('git reset')` (no sink) stays allowed. Repeated payload flags are UNIONED (node keeps the last `-e`, ruby/perl/osascript concatenate all), and PowerShell flags are matched case-insensitively.
+
 **File / shebang / module payloads are NOT content-gated** — `python3 x.py`,
 `./x.py`, `bash -c 'python3 x.py'` were never gated before #627 either, and
 reading an arbitrary repo script against the hub-recovery allowlist false-blocks

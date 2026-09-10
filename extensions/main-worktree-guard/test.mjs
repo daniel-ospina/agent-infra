@@ -4551,6 +4551,14 @@ try {
   // #627 codePayloadGitVerdict — parity with scriptGitVerdict: hub mutations
   // block, read-only/no-git/worktree-targeted pass, unresolvable fails closed.
   const cpv = (c, cwd) => codePayloadGitVerdict(c, "main", cwd ?? hubR, cwd ?? hubR);
+  // Mirrors the production `_backdoorBlock` path: extract the INLINE payload
+  // from the raw command, then classify that payload's content.
+  const cpvCmd = (c, cwd) => {
+    const p = extractCodePayload(c);
+    return p && p.kind === "inline"
+      ? codePayloadGitVerdict(p.value, "main", cwd ?? hubR, cwd ?? hubR)
+      : codePayloadGitVerdict(c, "main", cwd ?? hubR, cwd ?? hubR);
+  };
   expectBool("P627-14: hub reset/push/commit from code → block",
     cpv(`import subprocess; subprocess.run(["git","reset","--hard"])`) === "block" &&
     cpv(`import subprocess; subprocess.run(["git","push","--force","origin","main"])`) === "block" &&
@@ -4592,13 +4600,13 @@ try {
   expectBool("P627-25: clustered flags (-Sc / -we) parse letter-by-letter",
     cp(`python3 -Sc 'PAY'`)?.value === "PAY" && cp(`perl -we 'PAY'`)?.value === "PAY" && cp(`python3 -Sc'PAY'`)?.value === "PAY", true);
   expectBool("P627-26: operand/cluster spellings still BLOCK the real git payload",
-    cpv(`python3 -W ignore -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`) === "block" &&
-    cpv(`python3 -Sc 'import subprocess; subprocess.run(["git","reset","--hard"])'`) === "block" &&
-    cpv(`perl -we 'system("git reset --hard")'`) === "block" &&
-    cpv(`node -r ./noop.js -e 'require("child_process").execSync("git reset --hard")'`) === "block", true);
+    cpvCmd(`python3 -W ignore -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`) === "block" &&
+    cpvCmd(`python3 -Sc 'import subprocess; subprocess.run(["git","reset","--hard"])'`) === "block" &&
+    cpvCmd(`perl -we 'system("git reset --hard")'`) === "block" &&
+    cpvCmd(`node -r ./noop.js -e 'require("child_process").execSync("git reset --hard")'`) === "block", true);
   // P1: paren-less Ruby/Perl system.
   expectBool("P627-27: paren-less system \"git …\" blocks (Ruby/Perl)",
-    cpv(`ruby -e 'system "git reset --hard"'`) === "block" && cpv(`perl -e 'system "git reset --hard"'`) === "block", true);
+    cpvCmd(`ruby -e 'system "git reset --hard"'`) === "block" && cpvCmd(`perl -e 'system "git reset --hard"'`) === "block", true);
   // P1: prose/comments/docstrings/kwargs must NOT anchor (false-block class).
   expectBool("P627-28: comment/docstring/data literals and trailing kwargs do NOT false-block",
     cpv(`import subprocess\n# do not do git reset --hard here\nsubprocess.run(['ls'])`) === "allow" &&
@@ -4651,6 +4659,61 @@ try {
     cp(`pwsh -File /tmp/x.ps1`)?.kind !== "inline", true);
   expectBool("P627-38: shell-payload interpreter (pwsh -Command) blocks through the pwsh surface",
     cpv(`git reset --hard`) === "block" && cpv(`git commit -m x`) === "block", true);
+
+  // ── #627 code-review cycle-3 fold-in (fresh-reviewer bypasses) ──
+  // P1: argv wrappers between the sink and the command (`shlex.split`, `list()`,
+  // `sorted()`, splat, a user helper, `getattr`) must still anchor.
+  expectBool("P627-39: call-indirection argv wrappers still block",
+    cpv(`import subprocess,shlex; subprocess.run(shlex.split('git reset --hard'))`) === "block" &&
+    cpv(`import subprocess; subprocess.run(list(['git','reset','--hard']))`) === "block" &&
+    cpv(`import subprocess; subprocess.run(sorted(['git','reset','--hard']))`) === "block" &&
+    cpv(`import subprocess; subprocess.run(*[['git','reset','--hard']])`) === "block" &&
+    cpv(`import subprocess\ndef sh(a): subprocess.run(a)\nsh(['git','reset','--hard'])`) === "block" &&
+    cpv(`import subprocess; getattr(subprocess,'run')(['git','reset','--hard'])`) === "block" &&
+    cpv(`from subprocess import run as r; r(['git','reset','--hard'])`) === "block", true);
+  // P1: the sink-method allowlist covers the rest of the real spawn primitives.
+  expectBool("P627-40: getoutput / os.exec* / posix_spawn / pty / asyncio / bracket-member sinks block",
+    cpv(`import subprocess; subprocess.getoutput('git reset --hard')`) === "block" &&
+    cpv(`import subprocess; subprocess.getstatusoutput('git reset --hard')`) === "block" &&
+    cpv(`import os; os.execv('/usr/bin/git',['git','reset','--hard'])`) === "block" &&
+    cpv(`import os; os.posix_spawn('git',['git','reset','--hard'],os.environ)`) === "block" &&
+    cpv(`import pty; pty.spawn(['git','reset','--hard'])`) === "block" &&
+    cpv(`import asyncio; asyncio.create_subprocess_exec('git','reset','--hard')`) === "block" &&
+    cpv(`const cp=require('child_process'); cp['execSync']('git reset --hard')`) === "block", true);
+  // P1: repeated payload flags are UNIONED (node keeps the last `-e`; ruby/
+  // perl/osascript concatenate all of them).
+  expectBool("P627-41: repeated -e/-Command payloads are unioned",
+    cpvCmd(`node -e 'console.log(1)' -e "require('child_process').execSync('git reset --hard')"`) === "block" &&
+    cpvCmd(`ruby -e 'puts 1' -e "system('git reset --hard')"`) === "block" &&
+    cpvCmd(`perl -e 'print 1;' -e 'system("git reset --hard");'`) === "block" &&
+    cpvCmd(`osascript -e 'set x to 1' -e 'do shell script "git reset --hard"'`) === "block", true);
+  // P1: PowerShell parameter binding is case-insensitive.
+  expectBool("P627-42: pwsh flags are case-insensitive (-command / -COMMAND / -C)",
+    cp(`pwsh -command 'git reset --hard'`)?.kind === "inline" && cp(`pwsh -COMMAND 'git reset --hard'`)?.kind === "inline" &&
+    cp(`pwsh -C 'git reset --hard'`)?.kind === "inline" &&
+    cpvCmd(`pwsh -command 'git reset --hard'`) === "block" && cpvCmd(`pwsh -COMMAND 'git reset --hard'`) === "block", true);
+  // P1: command strings that don't START with git (`cd … && git …`, `sudo git …`).
+  expectBool("P627-43: cd-&&-git / sudo-git command strings block",
+    cpv(`import os; os.system("cd /hub && git reset --hard")`) === "block" &&
+    cpv(`import os; os.system("sudo git reset --hard")`) === "block" &&
+    cpv(`import subprocess; subprocess.run("cd /hub && git push --force origin main", shell=True)`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["bash","-c","cd /hub && git reset --hard"])`) === "block", true);
+  // P2: keyword-argument names must not be appended to the git command, and an
+  // assignment target named `git` must not count as an unresolved anchor.
+  expectBool("P627-44: kwargs (capture_output/check/cwd=var) and `git =` assignment do not false-block",
+    cpv(`import subprocess; subprocess.run(['git','branch','-a'], capture_output=True)`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(['git','branch','-a'], check=True)`) === "allow" &&
+    cpv(`import subprocess; repo='/x'; subprocess.run(['git','branch','-a'], cwd=repo)`) === "allow" &&
+    cpv(`import subprocess; git = 'x'; subprocess.run(['ls'])`) === "allow" &&
+    cpv(`import subprocess, shutil; git = shutil.which('git'); subprocess.run([git,'status'])`) === "allow", true);
+  // P1: the shell scan of the payload runs ONLY for a shell-shaped payload, so
+  // ordinary host code (`print("git")`, a `//` comment) stays inert. A string
+  // that contains a command-line-shaped git invocation is deliberately
+  // fail-closed (same class as variable indirection).
+  expectBool("P627-45: host-code shell-scan false positives are gone",
+    cpv(`print("git")`) === "allow" && cpv(`console.log("git")`) === "allow" &&
+    cpv(`result = get("git")`) === "allow" && cpv(`// git reset --hard\nconsole.log(1)`) === "allow" &&
+    cpv(`const h = \`x\ngit reset --hard\``) === "block", true);
 
   // #628 hubNewFileVolumeVerdict — pure boundaries + source pins (index.ts).
   expectBool("P628-1: volume verdict boundaries",
