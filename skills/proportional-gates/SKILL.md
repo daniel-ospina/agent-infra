@@ -57,11 +57,17 @@ Before deciding what gates to run, classify the change:
 
 | Risk | Isolation |
 |------|-----------|
-| Low | Plain branch acceptable. No worktree needed. |
+| Low | Plain branch inside a worktree; in a hub, create the worktree first (#626). |
 | Medium | Worktree recommended if 3+ files or shared infrastructure. Plain branch OK for single-file. |
-| High | Worktree required. Stash uncommitted changes first. |
+| High | Worktree required. Hub dirty → `bash scripts/checkout-hygiene/hub-worktree.sh salvage <branch>` (in-hub `git stash push` is M4-blocked); inside a worktree, stash your own changes. |
 
 **Never** start on main/master regardless of risk.
+
+> ⛔ **Guard note (#626):** "Plain branch" means a branch created from inside an existing
+> worktree — in-hub `git checkout -b` is BLOCKED in every repo (the shared main checkout
+> must never be flipped; agent-infra's #99 exemption was removed in #615 and the M3
+> create-new carve-out in #626). In a hub, create an isolated worktree first
+> (using-git-worktrees skill; agent-infra: `bash scripts/checkout-hygiene/hub-worktree.sh <branch>`).
 
 ### Pre-flight Verification
 

@@ -137,11 +137,11 @@ gh issue edit $ISSUE --remove-label implementing || true
 
 > ⛔ **This gate runs BEFORE any work on the issue.** Every issue gets its own branch. Every parallel subagent gets its own worktree. This prevents the 2026-08-06 incident where parallel agents collided in the shared main checkout and #74's work landed on #73's branch (PR #75 contained both).
 
-### 0. Worktree-first rule (#265 — enforced, not advisory)
+### 0. Worktree-first rule (#265/#615 — enforced, not advisory)
 
-**Non-infra repos:** primary sessions AND write-capable sub-agent dispatches MUST run in an isolated worktree — never on the shared main checkout. The main-worktree-guard now enforces this mechanically: branch-state changes in a non-infra main checkout are BLOCKED, commits off the session baseline are BLOCKED, and sub-agents no longer inherit `AGENT_ALLOW_MAIN_EDITS` (the env pivot, #265). If the Branch Gate below detects you are in a non-infra main checkout, create a worktree first (using-git-worktrees skill) and run the gate from there.
+**Every repo — agent-infra included:** primary sessions AND write-capable sub-agent dispatches MUST run in an isolated worktree — never on the shared main checkout. The main-worktree-guard enforces this mechanically for ALL repos: branch-state changes in any main checkout are BLOCKED (agent-infra included since #615 removed the #99 in-main-work exemption), commits off the session baseline are BLOCKED, and sub-agents carry no `AGENT_ALLOW_MAIN_EDITS` — #617/#623: the hatch is **stripped by default** from `task`/`subagent` children, so even a HATCHED controller dispatches an UNHATCHED fleet unless the dispatch passes `allow_main_edits: true`; never rely on the child env for isolation — always pass a worktree `cwd`. If the Branch Gate below detects you are in a main checkout, create a worktree first (using-git-worktrees skill; agent-infra: `hub-worktree.sh <branch>`) and run the gate from there.
 
-**Agent-infra (the infra repo itself):** sessions work IN main by design (#99 — extensions/skills load from the main checkout via the symlink farm). In-main `git checkout -b <branch>` is legal there (the guard's M3 create-new carve-out, #265) and the baseline re-adopts the new branch synchronously. Do NOT create a worktree for agent-infra issues.
+**Agent-infra has NO in-main-work exemption.** Extensions/skills/config are read from committed state (pi loads skills from `~/.pi/agent`, extensions at startup — a copy synced post-merge; `MEMORY.md` is a repo file read by agents on demand, not an auto-loaded copy), so shared-state edits do NOT need the shared main checkout: they land via worktree → merge → sync, exactly like every other repo. A one-line MEMORY.md/skill append is a low-risk `complexity:micro` change, but micro is a review-scope tier — it does NOT exempt the worktree rule: it still runs through the same worktree → commit → merge → sync ceremony. The agent-infra hub stays main + clean; in-main `git checkout -b <branch>` is BLOCKED there like any other hub (the M3 create-new carve-out was removed in #626).
 
 ### 1. Branch Gate (runs first — before edits or dispatch)
 
@@ -154,35 +154,23 @@ CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
 # Already on the correct branch — proceed
 [ "$CURRENT_BRANCH" = "$EXPECTED_BRANCH" ] && echo "✅ On correct branch: $CURRENT_BRANCH" && exit 0
 
-# On main/master — create the dedicated branch from FRESH origin state
-# (#178/#179: never branch from stale local main — a stale base silently
-# re-introduces already-fixed code and merges cleanly = worst-case regression)
+# On main/master — you are in the HUB, where an in-place branch flip is BLOCKED
+# (#626; agent-infra included since #615 removed the #99 exemption). Create an
+# ISOLATED WORKTREE instead (using-git-worktrees skill; agent-infra:
+# `bash scripts/checkout-hygiene/hub-worktree.sh "$EXPECTED_BRANCH"`), cd into it,
+# and RE-RUN this gate there. The worktree branch is created from FRESH origin
+# state by the worktree command (#178/#179: never branch from stale local main).
 if [ "$CURRENT_BRANCH" = "main" ] || [ "$CURRENT_BRANCH" = "master" ]; then
-  # Detect the default branch via origin/HEAD (fallback: main)
-  DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
-  [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
-  # Fetch latest; on failure (offline / no origin) fall back to the existing
-  # local origin ref WITH A WARN — never silently branch from stale state
-  if ! git fetch origin "$DEFAULT_BRANCH" --quiet; then
-    if git rev-parse --verify "origin/$DEFAULT_BRANCH" >/dev/null 2>&1; then
-      echo "⚠️ fetch failed — branching from LAST KNOWN origin/$DEFAULT_BRANCH (verify freshness before shipping)"
-    else
-      echo "⛔ ABORT: fetch failed and no origin/$DEFAULT_BRANCH ref exists locally."
-      exit 1
-    fi
-  fi
-  # Fail-closed: a failed checkout must never false-report success (#179)
-  git checkout -b "$EXPECTED_BRANCH" "origin/$DEFAULT_BRANCH" || {
-    echo "⛔ ABORT: could not create $EXPECTED_BRANCH from origin/$DEFAULT_BRANCH"
-    exit 1
-  }
-  echo "✅ Created and switched to: $EXPECTED_BRANCH (from fresh origin/$DEFAULT_BRANCH)"
-  exit 0
+  echo "ℹ️ On $CURRENT_BRANCH (hub): create an isolated worktree first, then re-run this gate from it."
+  echo "   agent-infra: bash scripts/checkout-hygiene/hub-worktree.sh \"$EXPECTED_BRANCH\""
+  echo "   other repos: using-git-worktrees skill (git worktree add -b \"$EXPECTED_BRANCH\" <path> origin/main)"
+  echo "⛔ In-hub 'git checkout -b' is BLOCKED (#626) — do not attempt it here."
+  exit 1
 fi
 
 # Detached HEAD? ABORT — no branch to verify
 if [ -z "$CURRENT_BRANCH" ]; then
-  echo "⛔ ABORT: Detached HEAD. Branch from fresh origin: git fetch origin main --quiet && git checkout -b $EXPECTED_BRANCH origin/main"
+  echo "⛔ ABORT: Detached HEAD. Create an isolated worktree: agent-infra → 'bash scripts/checkout-hygiene/hub-worktree.sh \"$EXPECTED_BRANCH\"'; other repos → using-git-worktrees skill."
   exit 1
 fi
 
@@ -190,8 +178,8 @@ fi
 if ! echo "$CURRENT_BRANCH" | grep -qE "(^|/)$ISSUE_NUMBER(-|\$)"; then
   echo "⛔ ABORT: You are on branch \"$CURRENT_BRANCH\" which belongs to a DIFFERENT issue."
   echo "   This is how #74's work committed onto #73's branch (incident 2026-08-06)."
-  echo "   → Stash or commit your changes on $CURRENT_BRANCH first."
-  echo "   → Then branch from fresh origin: git fetch origin main --quiet && git checkout -b $EXPECTED_BRANCH origin/main"
+  echo "   → Commit or stash your changes on $CURRENT_BRANCH first."
+  echo "   → Then create an isolated worktree for THIS issue: agent-infra → 'bash scripts/checkout-hygiene/hub-worktree.sh \"$EXPECTED_BRANCH\"'; other repos → using-git-worktrees skill."
   exit 1
 fi
 
@@ -201,7 +189,7 @@ echo "✅ On matching branch: $CURRENT_BRANCH"
 
 ### 2. Worktree Gate (runs for parallel subagent dispatch)
 
-When dispatching multiple subagents that write to the same repo, each subagent MUST get its own worktree. The dispatcher creates them and passes the path via `cwd` — never dispatch two subagents to the same checkout. **After #265 this extends to SINGLE write-capable implementer sub-agents in non-infra repos:** the sub-agent env no longer carries `AGENT_ALLOW_MAIN_EDITS`, so a write-capable sub-agent dispatched with `cwd` = a non-infra main checkout is blocked on write/edit + destructive git. Read-only sub-agents (reviewers, researchers) need no worktree — the guard only blocks writes.
+When dispatching multiple subagents that write to the same repo, each subagent MUST get its own worktree. The dispatcher creates them and passes the path via `cwd` — never dispatch two subagents to the same checkout. **After #265/#615 this extends to EVERY write-capable implementer sub-agent in EVERY repo (agent-infra included):** the sub-agent env no longer carries `AGENT_ALLOW_MAIN_EDITS` (#617/#623 — the hatch is default-stripped from `task`/`subagent` children, so even a hatched controller dispatches an unhatched fleet unless the dispatch opts in with `allow_main_edits: true`; never rely on the child env for isolation — always pass a worktree `cwd`), so a write-capable sub-agent dispatched with `cwd` = a main checkout (any repo — the #99 agent-infra exemption was removed by #615) is blocked on write/edit + destructive git. Read-only sub-agents (reviewers, researchers) need no worktree — the guard only blocks writes.
 
 ```bash
 # Dispatcher creates an isolated worktree for each subagent:

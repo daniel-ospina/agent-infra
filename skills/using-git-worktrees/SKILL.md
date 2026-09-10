@@ -29,7 +29,7 @@ The main checkout is a **SHARED HUB** that stays on `main`. Feature work happens
 
 ## Escaping the main-checkout guard (deliberate mid-session escalation)
 
-If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the recovery git ops needed to un-strand (`git checkout main`, `git pull`, branch recovery) — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
+If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the ops needed to un-strand (in-hub `checkout -b`, `commit`, foreign pushes, edits) — note `git checkout main` and `git pull --ff-only` are M4-sanctioned and need no window — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
 
 ```bash
 # must be its OWN bash tool call inside a guard-loaded session
@@ -287,10 +287,10 @@ agents in the hub) is prevented by discipline, not just guards:
 - **Problem:** When the skill runs from inside an agent worktree, using `$(git rev-parse --show-toplevel)` or `$PWD` resolves to the current worktree, not the main repo. `git worktree add` then creates the new worktree nested inside the parent (e.g. `.worktrees/agent-a/.worktrees/agent-b/`), which accumulates cruft and breaks cleanup.
 - **Fix:** Always derive `$MAIN_REPO` in Step 0 via `git rev-parse --git-common-dir` and anchor every path (ls, check-ignore, worktree add) to `$MAIN_REPO`. Never use `$PWD` or `--show-toplevel` for path construction in this skill.
 
-### Stranded main checkout — the ONLY sanctioned recovery is a terminal one-liner (#206)
+### Stranded main checkout — terminal one-liner when M4 does NOT sanction (#206)
 
-- **Problem:** A main checkout stuck behind/stranded (auto-sync can't ff-pull, the guard blocks agent-side `checkout`/`pull`) is unrecoverable FROM the agent — the guard's escape hatches are env-only (`AGENT_ALLOW_MAIN_EDITS=1`) and cannot be set on a running process.
-- **Fix (the ONLY sanctioned recovery):** the human runs ONE command in a **terminal** (terminals are not intercepted by the guard):
+- **Problem:** A main checkout stuck behind/stranded (auto-sync can't ff-pull, and the op needed to un-strand is OUTSIDE the M4 recovery allowlist — `reset --hard`, force ops, or a tree the pull cannot fast-forward) is unrecoverable FROM the agent — the guard's escape hatches are env-only (`AGENT_ALLOW_MAIN_EDITS=1`) and cannot be set on a running process. Agent-side `git checkout main` and `git pull --ff-only` are themselves M4-sanctioned recovery ops needing no window (see the #1484 contract below).
+- **Fix (the sanctioned recovery when M4 blocks):** the human runs ONE command in a **terminal** (terminals are not intercepted by the guard):
   ```bash
   cd <repo> && git checkout main && git pull --ff-only
   ```

@@ -162,11 +162,18 @@ Already on a feature branch (not main/master)?
   → Run the merged-branch guard below FIRST. If safe, commit here. No branch creation needed.
 
 On main/master + ISSUE_NUMBER resolved?
-  → Auto-create: git fetch origin main --quiet && git checkout -b feat/issue-{N}-{slug} origin/main
+  → You are in the HUB — in-place `git checkout -b` is BLOCKED (#626; agent-infra
+    included since #615). Create an ISOLATED WORKTREE first, cd into it, then
+    re-run detection: agent-infra → `bash scripts/checkout-hygiene/hub-worktree.sh
+    feat/issue-{N}-{slug}`; other repos → using-git-worktrees skill
+    (`git worktree add -b feat/issue-{N}-{slug} <path> origin/main`).
   → (slug = 3-4 word summary of the work, kebab-case)
 
 On main/master + no ISSUE_NUMBER?
-  → Ask: "What should I name the new branch?"
+  → Ask: "What should I name the new branch?" then create it in a NEW WORKTREE —
+    agent-infra → `bash scripts/checkout-hygiene/hub-worktree.sh feat/issue-{N}-{slug}`;
+    other repos → using-git-worktrees skill. NEVER in the hub: in-place
+    `git checkout -b` is BLOCKED (#626).
 ```
 
 ### Merged-Branch Guard (runs when already on a feature branch)
@@ -190,7 +197,7 @@ fi
 
 | Situation | Action |
 |-----------|--------|
-| `PR_STATE = "MERGED"` or `ALREADY_MERGED = true` | **BLOCK.** Output: "⚠️ Branch `BRANCH` has already been merged to main. Creating a new branch for this work instead." Then auto-create a new branch off `origin/main`. |
+| `PR_STATE = "MERGED"` or `ALREADY_MERGED = true` | **BLOCK.** Output: "⚠️ Branch `BRANCH` has already been merged to main. Creating a new worktree for this work instead." Then create an isolated worktree off `origin/main` (agent-infra → `hub-worktree.sh`; other repos → using-git-worktrees) — never an in-place `git checkout -b` in a hub (#626). |
 | `PR_STATE = "CLOSED"` | **WARN.** Output: "⚠️ Branch `BRANCH` has a closed (unmerged) PR. Proceeding, but consider whether this work belongs on a new branch." Then proceed. |
 | `PR_STATE = "OPEN"` | **Proceed.** The branch has an active PR — changes pushed here will update it. |
 | `PR_STATE = "no-pr"` and `ALREADY_MERGED = false` | **Proceed.** Fresh feature branch with no PR yet. |
@@ -215,7 +222,7 @@ BEHIND=$(git rev-list --count HEAD.."origin/$DEFAULT_BRANCH" 2>/dev/null || echo
 | `BEHIND > 0` + clean tree | `git -c commit.gpgsign=false pull --rebase origin "$DEFAULT_BRANCH"`, then RE-RUN the affected pre-flight regression tests. If the branch was previously pushed and the post-rebase push is rejected as non-fast-forward → `git push --force-with-lease`. |
 | `BEHIND > 0` + dirty tree | **WARN**: "Branch is N behind origin/<default> — commit or stash first, then `git -c commit.gpgsign=false pull --rebase origin <default>`." NEVER autostash (conflict-unsafe unattended). |
 
-**Pre-flight: the main-worktree-guard's branch-ownership gates (#265) run on every bash tool_call.** In agent-infra main (where this skill works by design), the guard allows the session's OWN-branch hygiene ops — `pull --rebase`, `rebase`, `merge origin/<default>`, `push` incl. `--force-with-lease`, `push --delete` of the own branch, `branch -D` of the own branch — so this pre-flight's commands pass on the baseline branch. If a command is blocked with a "branch ownership violated" message, the shared checkout was switched under the session: `git checkout -b` a fresh branch (M3 carve-out re-baselines) and retry.
+**Pre-flight: the main-worktree-guard's branch-ownership gates (#265) run on every bash tool_call.** This skill runs from the session's WORKTREE — agent-infra included (the #99 in-main-work exemption was removed in #615; the agent-infra hub is main+clean like every hub, and in-hub `checkout -b` is BLOCKED there too, #626). In a worktree BOTH the M2/M3 gates and the legacy destructive-block arm are worktree-exempt (`eff.isWorktree`) — M2/M3 apply only to MAIN-checkout-effective mutations, and the legacy arm carries its own exemption — so the pre-flight's own-branch hygiene ops — `pull --rebase`, `rebase`, `merge origin/<default>`, `push` incl. `--force-with-lease` — run ungated on the worktree's branch. The merged-branch cleanup's remote `git push --delete <branch>` is NOT worktree-exempt: it hits the #73 coordinated-delete guard while the branch is checked out in ANY worktree (including this one), so run it after teardown (05-cleanup.md Step 3.8) or use `gh api -X DELETE`. The guard matches the LITERAL ref in the command text — a shell-variable form (`git push origin --delete "$PR_BRANCH"`) is NOT resolved by the classifier and is therefore not guard-matched. The local `git branch -D` is best-effort: git refuses it while checked out, and after teardown the HUB's main-checkout `block:branch-force-delete` gate blocks a branch that is not the session's baseline or pid-owned (a `git worktree add -b` branch is never recorded as owned — create-new is blocked, #626). A guard block rejects the bash call BEFORE the shell runs, so write the teardown note yourself — the `||` echo only covers git's own refusal. If a command is blocked with a "branch ownership violated" message, you are running against the MAIN checkout (a stray `cd`/`-C` back to the hub): return to the worktree and retry — never `git checkout -b` in a hub (blocked for agent-infra and non-infra alike; the M3 create-new carve-out was removed in #626).
 
 Notes: `commit.gpgsign=false` is process-scoped and prevents headless pinentry
 hangs during rebase (fleet ships squash-merged; research-verified). Condition 5

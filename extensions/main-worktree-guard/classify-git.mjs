@@ -1540,11 +1540,9 @@ export function classifyGitCommandDetailed(command) {
     const args = stateInv.args;
     if (verb === "checkout" || verb === "switch") {
       out.branchState = true;
-      const flag = ["-B", "--orphan", "-b", "-c"].find((f) => args.includes(f));
-      if (flag) {
-        const idx = args.indexOf(flag);
-        out.newBranch = args[idx + 1] ?? null;
-      }
+      // #626: capture the branch across git's FULL create/force-create/orphan
+      // surface (attached shorts + long forms), not just exact `-b`/`-B` tokens.
+      out.newBranch = _checkoutCreateBranch(verb, args);
     } else if (verb === "symbolic-ref" || verb === "update-ref") {
       const pos = args.filter((x) => !x.startsWith("-"));
       if ((verb === "symbolic-ref" && pos[0] === "HEAD") ||
@@ -1697,7 +1695,7 @@ export function classifyGitCommandDetailed(command) {
     // P1-A: expose the STATE-mutating invocation's verb/args — M3 must classify
     // the invocation that changes branch state, not invocations[0] (a compound
     // `git pull && git checkout main` would otherwise classify "pull" and skip
-    // the gate, or false-block the sanctioned create-new carve-out).
+    // the gate, or false-block the #376 ceremony return-to-original carve-out).
     // #596 (round-2 reviewer, refined round-3): stateVerbOccurrence — the
     // 0-based ordinal of stateInv among the command's EXTRACTOR-VISIBLE
     // invocations with the SAME verb (cmdVisible — spelled with the literal
@@ -2070,7 +2068,8 @@ export function getMainCheckoutBranch() {
  * removed (#615): agent-infra's main checkout gets the same hub discipline as
  * every other repo (M4 disorder gates + write/edit block + hub-state checks).
  * The flag still feeds branch-ownership M2/M3 ceremony semantics (own-baseline
- * work in agent-infra worktrees; create-new → reBaseline), and repo-freshness
+ * work in agent-infra worktrees; the #376 ceremony return-to-original arm —
+ * in-hub create-new is blocked since #626), and repo-freshness
  * (auto-sync owns the repo). Shared-state edits (MEMORY.md, skills, config,
  * extension code) land via worktrees → merge → sync, never direct in-hub.
  *
@@ -2625,6 +2624,63 @@ function _branchPositionals(args) {
     pos.push(x);
   }
   return pos;
+}
+
+/**
+ * #626: resolve a checkout/switch long option NAME to its create kind using
+ * git's parse-options UNAMBIGUOUS-PREFIX rules (probe-verified git 2.50.1).
+ * VERB-AWARE — the two verbs have different option tables:
+ *   git switch  : --create, --force-create, --orphan
+ *                 (`--cre=foo` ≡ `--create=foo`, `--force-c` ≡ `--force-create`)
+ *   git checkout: --orphan ONLY — it has NO --create/--force-create, so its
+ *                 `--c*` resolves to --conflict and `--f*` to --force. Those are
+ *                 VALID commands and must NOT classify as creates.
+ * `--force` (and for checkout `--f`/`--fo`/`--for`/`--forc`) is the force flag,
+ * not force-create → null. Ambiguous prefixes git itself rejects (switch `--c`,
+ * `--f`..`--forc`, `--o`; checkout `--o`) are still classified as their create
+ * kind — fail-closed on an rc-129 command is harmless.
+ * Duplicated from branch-ownership's _longCreateKind (classify-git must not
+ * import branch-ownership — test pin C2/D2). Keep the two in sync.
+ */
+function _longCreateKind(verb, name) {
+  if (!name) return null;
+  if ("orphan".startsWith(name)) return "orphan"; // both verbs have --orphan
+  if (verb === "switch") {
+    if (name === "force") return null; // --force: the force flag, not --force-create
+    if ("create".startsWith(name)) return "create-new";
+    if ("force-create".startsWith(name)) return "force-create";
+  }
+  return null;
+}
+
+/**
+ * #626: the branch NAME created (or force-created/an orphan) by a checkout/switch
+ * argv, across git's full spelling surface — attached short clusters
+ * (`-bfoo`, `-fb foo`, `-cfoo`, `-Cfoo`) and the long forms
+ * `--create[=v]` / `--force-create[=v]` / `--orphan[=v]` plus their unambiguous
+ * verb-specific prefixes (`switch --cre=foo`, `switch --force-c main`,
+ * `checkout --orph v`). Mirrors branch-ownership's _checkoutCreateOpt (kept
+ * duplicated — classify-git must not import branch-ownership, test pin C2/D2).
+ * Returns null when no create option is present.
+ */
+function _checkoutCreateBranch(verb, args) {
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i];
+    if (x === "--") return null;
+    const long = /^--([^=]+)(?:=(.*))?$/.exec(x);
+    if (long && _longCreateKind(verb, long[1])) {
+      return long[2] !== undefined ? long[2] : (args[i + 1] ?? null);
+    }
+    const sc = /^-(?!-)([A-Za-z]+)(.*)$/.exec(x);
+    if (sc) {
+      const k = sc[1].search(/[bBcC]/);
+      if (k !== -1) {
+        const attached = sc[1].slice(k + 1) + sc[2];
+        return attached.length > 0 ? attached : (args[i + 1] ?? null);
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -3394,8 +3450,10 @@ function _recoveryCheckoutBlockReason(inv, branch) {
     `   A silently-failed checkout strands the repo on the CURRENT branch while the agent`,
     `   believes it is on "${branch}" — a subsequent destructive op would move the WRONG`,
     `   branch (#397).`,
-    `   → Reconcile branch state first: \`git checkout -b ${branch} origin/${branch}\``,
-    `     (or \`git fetch\`) then retry.`,
+    `   → Reconcile branch state first: \`git fetch\` (an M4-sanctioned recovery verb),`,
+    `     then create the branch in an ISOLATED WORKTREE —`,
+    `     \`git worktree add -b ${branch} <path> origin/${branch}\` (in-hub`,
+    `     \`checkout -b\` is BLOCKED, #626) — and retry from there.`,
   ].join("\n");
 }
 

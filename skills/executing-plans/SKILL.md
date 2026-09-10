@@ -210,18 +210,25 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
 
 | Risk | Isolation |
 |------|-----------|
-| Low (docs, config, 1-2 files) | Plain branch acceptable. No worktree needed. |
+| Low (docs, config, 1-2 files) | Plain branch inside a worktree; in a hub, create the worktree first (#626). |
 | Medium (3+ files, shared infrastructure) | Worktree recommended. Plain branch OK for single-file. |
-| High (multi-system, migrations, auth) | Worktree required. Stash uncommitted changes first. |
+| High (multi-system, migrations, auth) | Worktree required. Hub dirty → `bash scripts/checkout-hygiene/hub-worktree.sh salvage feat/issue-{N}-{slug}` (in-hub `git stash push` is M4-blocked); inside a worktree, stash your own changes. |
 
 **Never start on main/master regardless of risk.**
 
 **If worktree is needed:** Invoke `using-git-worktrees` skill once, in the controller session. If already inside an existing worktree, skip.
 
 **If plain branch is acceptable:**
+> ⛔ Guard note (#626): in-hub `git checkout -b` is BLOCKED in every repo — the shared
+> main checkout must never be flipped (agent-infra's #99 exemption was removed in #615;
+> the M3 create-new carve-out was removed in #626). The "plain branch" shortcut applies
+> only when you are ALREADY inside a worktree; in a hub, create an isolated worktree first
+> (using-git-worktrees skill; agent-infra: `bash scripts/checkout-hygiene/hub-worktree.sh feat/issue-<N>-<slug>`).
 1. Run `git status --porcelain` to check for uncommitted changes
-2. If changes exist on main: `git stash push -m "pre-<branch>-wip"` (optional for Low risk with no TS changes)
-3. `git checkout -b feat/issue-<N>-<slug>`
+2. If the HUB is dirty (uncommitted changes on main): `git stash push` is BLOCKED there — the M4 hub-disorder gate sanctions only recovery verbs, and `stash` is not one. Use the dirty-hub salvage path instead: `bash scripts/checkout-hygiene/hub-worktree.sh salvage feat/issue-{N}-{slug}` (README #435). Inside a worktree there is no "changes on main" to stash.
+3. Create the branch INSIDE a worktree — invoke `using-git-worktrees` (agent-infra:
+   `bash scripts/checkout-hygiene/hub-worktree.sh feat/issue-<N>-<slug>`). Do NOT run
+   `git checkout -b` in a hub — it is BLOCKED (#626).
 4. **Dirty-state guard** (worktree only): Check for uncommitted changes that look like partial implementation. If found, surface options but default to reset-and-re-execute. Do NOT silently overwrite partial state.
 
 **Pre-warming typecheck (proportional):** Run `npx tsc --noEmit` in background when changes touch `.ts`/`.tsx` files. Skip for non-code or config-only changes. When run, start before Step 1 to eliminate cold-start latency — by the time the plan is reviewed, typecheck is already complete or failing fast.
@@ -698,7 +705,7 @@ Use `requires_human=True` for genuine human gates (epics, P0): that routes to 'h
 - Reference skills when plan says to
 - Between batches: report and **continue** (don't gate)
 - Stop when blocked or when taxonomy-matching decision arises
-- Never start implementation on main/master branch without explicit user consent
+- Never start implementation on main/master — every implementation runs in an isolated worktree (#615/#626); the hub stays main + clean.
 
 ## Label Cleanup
 
@@ -713,7 +720,7 @@ Do not leave `implementing` on issues where work is not actively progressing.
 ## Integration
 
 **Required workflow skills:**
-- **using-git-worktrees** — MANDATORY: always invoked in Step 0; stash uncommitted changes before creation
+- **using-git-worktrees** — MANDATORY: always invoked in Step 0; NEVER `git stash` in the hub (the M4 dirty-hub gate blocks it — use the `#435` salvage path); stash only inside a worktree.
 - **writing-plans** — Creates the plan this skill executes
 - **commit-workflow** — Complete development after all tasks (Step 6)
 ---

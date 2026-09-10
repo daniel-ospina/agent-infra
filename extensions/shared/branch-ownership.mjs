@@ -8,9 +8,11 @@
 // provides pure decision functions for the guard's M1 (warn on branch
 // deviation), M2 (block commit/push off-baseline), M3 (gate branch-state
 // mutations), and the ownership allowance (own-branch hygiene ops in
-// agent-infra main). `original` = the branch recorded at session_start BEFORE
-// any create-new re-baseline — immutable; M3's #376 ceremony return-to-main
-// carve-out lets a session switch back to it.
+// agent-infra main). `original` = the branch recorded at session_start —
+// immutable; M3's #376 ceremony return-to-original carve-out lets a session
+// switch back to it. (In-hub create-new re-baselines are gone since #626:
+// agent-infra main blocks `checkout -b` like every hub — branch creation
+// happens in worktrees, which never reach these gates.)
 //
 // Deliberately self-contained: it must NOT import classify-git.mjs (keeps the
 // destructive-git classifier dependency-free for jiti loading, per the #99
@@ -647,11 +649,26 @@ function _branchPositionals(args) {
 export function classifyBranchOp(subcmd, args) {
   const a = args || [];
   if (subcmd === "checkout" || subcmd === "switch") {
-    if (a.includes("--")) return { op: "other" };          // path-restore form
     const flag = (f) => a.includes(f);
-    if (flag("--orphan")) return { op: "orphan" };
-    if (flag("-B")) return { op: "force-create", branch: _branchAfter(a, "-B") };
-    if (flag("-b") || flag("-c")) return { op: "create-new", branch: _branchAfter(a, flag("-b") ? "-b" : "-c") };
+    // #626 security fold-in: recognize git's FULL create/force-create/orphan
+    // spelling surface — NOT just the exact space-separated shorts. git accepts
+    // the value ATTACHED to a short cluster (`checkout -bfoo` / `-fb foo` /
+    // `switch -cfoo` / `-Cfoo`), the long forms `--create[=v]` /
+    // `--force-create[=v]` / `--orphan[=v]` and their verb-appropriate
+    // unambiguous prefixes. Without this they fell through to switch-existing:
+    // `git checkout -bfoo main` misclassified as a switch to `main`, and when
+    // that equals baseline.original the #376 return-to-original arm re-baselined
+    // (allow) while git actually CREATED a branch and flipped the shared hub.
+    //
+    // ORDER MATTERS: the create scan runs BEFORE the `--` path-restore
+    // early-return. `git switch -c foo --` and `git checkout -B foo --` DO
+    // create and flip (probe-verified); `--` only neutralizes options that
+    // FOLLOW it. The helper returns null when it meets `--` before any create
+    // option, so `git checkout -- -b q` and `git checkout main -- f.txt` stay
+    // op "other" (path-restore).
+    const opt = _checkoutCreateOpt(subcmd, a);
+    if (opt) return { op: opt.kind, branch: opt.branch };
+    if (a.includes("--")) return { op: "other" };          // path-restore form
     if (flag("-f") || flag("--force") || flag("--discard-changes")) return { op: "force" }; // --discard-changes is git's force-switch alias (throws away local modifications — second-model gate fold-in)
     if (flag("--detach")) return { op: "detach" };
     if (a.includes("-")) return { op: "switch-existing", target: "-" }; // prev branch
@@ -767,9 +784,67 @@ export function classifyBranchOp(subcmd, args) {
   return { op: "other" };
 }
 
-function _branchAfter(args, flag) {
-  const idx = args.indexOf(flag);
-  return args[idx + 1] ?? null;
+/**
+ * #626: resolve a checkout/switch long option NAME to its create kind using
+ * git's parse-options UNAMBIGUOUS-PREFIX rules (probe-verified git 2.50.1).
+ * VERB-AWARE — the two verbs have different option tables:
+ *   git switch  : --create, --force-create, --orphan
+ *                 (`--cre=foo` ≡ `--create=foo`, `--force-c` ≡ `--force-create`)
+ *   git checkout: --orphan ONLY — it has NO --create/--force-create, so its
+ *                 `--c*` resolves to --conflict and `--f*` to --force. Those are
+ *                 VALID commands and must NOT classify as creates.
+ * `--force` (and for checkout `--f`/`--fo`/`--for`/`--forc`) is the force flag,
+ * not force-create → null. Ambiguous prefixes git itself rejects (switch `--c`,
+ * `--f`..`--forc`, `--o`; checkout `--o`) are still classified as their create
+ * kind — fail-closed on an rc-129 command is harmless.
+ * Returns "create-new" | "force-create" | "orphan" | null.
+ */
+function _longCreateKind(verb, name) {
+  if (!name) return null;
+  if ("orphan".startsWith(name)) return "orphan"; // both verbs have --orphan
+  if (verb === "switch") {
+    if (name === "force") return null; // --force: the force flag, not --force-create
+    if ("create".startsWith(name)) return "create-new";
+    if ("force-create".startsWith(name)) return "force-create";
+  }
+  return null;
+}
+
+/**
+ * #626: parse the create / force-create / orphan option from a checkout/switch
+ * argv, accepting git's FULL spelling surface:
+ *   - short cluster with the value ATTACHED (`checkout -bfoo` / `switch -cfoo` /
+ *     `-Cfoo`) or the value as the NEXT argv (`checkout -fb foo`);
+ *   - long forms `--create[=v]` / `--force-create[=v]` / `--orphan[=v]` AND
+ *     their unambiguous prefixes (`switch --cre=foo`, `switch --force-c main`,
+ *     `checkout --orph v`).
+ * Short letters: b/c → create-new, B/C → force-create. Scanning stops at a `--`
+ * terminator (path-restore form — never a branch option). Returns
+ * { kind, branch } or null. Fail-safe: a plausible create letter classifies as
+ * create/force-create → M3 blocks (git refuses invalid spellings anyway).
+ */
+function _checkoutCreateOpt(subcmd, args) {
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i];
+    if (x === "--") return null;
+    const long = /^--([^=]+)(?:=(.*))?$/.exec(x);
+    if (long) {
+      const kind = _longCreateKind(subcmd, long[1]);
+      if (kind) return { kind, branch: long[2] !== undefined ? long[2] : (args[i + 1] ?? null) };
+    }
+    const sc = /^-(?!-)([A-Za-z]+)(.*)$/.exec(x);
+    if (sc) {
+      const letters = sc[1], rest = sc[2];
+      const k = letters.search(/[bBcC]/);
+      if (k !== -1) {
+        const L = letters[k];
+        const kind = (L === "b" || L === "c") ? "create-new" : "force-create";
+        const attached = letters.slice(k + 1) + rest;
+        return { kind, branch: attached.length > 0 ? attached : (args[i + 1] ?? null) };
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -811,6 +886,20 @@ export function decideM2({
   if (!baseline || effectiveRepo.repoKey !== baseline.repoKey) return null;
   if (verdict === "block:commit") {
     if (currentBranch === baseline.branch) return null;
+    const recovery = baseline.original
+      ? [
+          `   → Work in an isolated worktree (using-git-worktrees skill), or`,
+          `     (agent-infra main only) switch back to the branch this session`,
+          `     STARTED on: \`git checkout ${baseline.original}\` — its recorded`,
+          `     original baseline (#376). In-hub checkout -b is NOT a recovery`,
+          `     (blocked, #626).`,
+        ]
+      : [
+          `   → Work in an isolated worktree (using-git-worktrees skill).`,
+          `     No original baseline was recorded (lock-contended/detached`,
+          `     session_start), so the #376 return is unavailable and in-hub`,
+          `     checkout -b is blocked (#626) — the worktree is the recovery.`,
+        ];
     return {
       block: true,
       reason: [
@@ -818,8 +907,7 @@ export function decideM2({
         `   Session baseline branch: "${baseline.branch}"`,
         `   Resolved repo is on:      "${currentBranch ?? "detached HEAD"}"`,
         `   The shared checkout was switched out from under this session (#265).`,
-        `   → Recover your branch: git checkout -b <your-branch> (agent-infra) or`,
-        `     work in an isolated worktree (using-git-worktrees skill).`,
+        ...recovery,
       ].join("\n"),
     };
   }
@@ -847,10 +935,12 @@ export function decideM2({
 
 /**
  * M3: gate branch-state mutations in the MAIN checkout.
- *   create-new (checkout -b / switch -c): allowed ONLY in agent-infra main →
- *     returns { reBaseline: <branch> } so the guard re-adopts the baseline
- *     SYNCHRONOUSLY (the allowed carve-out must never trigger a spurious M1
- *     warn on the next tool_call).
+ *   create-new (checkout -b / switch -c): BLOCKED in every main checkout —
+ *     agent-infra included since #626. The #99 in-main-work model (whose
+ *     ceremonies needed an in-hub `checkout -b`) was removed by #615; worktree
+ *     sessions are exempt BEFORE this gate (index.ts isWorktree continue), and
+ *     `git worktree add -b` is not a branchState op — so no legit flow needs an
+ *     in-hub create-new. Returns the block (never reBaseline).
  *   rename of the session's OWN baseline branch → { reBaseline: <to> } — but
  *     NOT onto an EXISTING branch that is neither the branch being renamed
  *     nor owned by this session (#598: renameDstExists + ownedBranches — that
@@ -861,14 +951,16 @@ export function decideM2({
  *     (a detached 1-pos rename — from null — passes through to git's rc-128
  *     refusal, never a phantom reBaseline).
  *   switch-existing to the session's ORIGINAL baseline branch (baseline.original
- *     — the branch recorded at session_start BEFORE any create-new re-baseline):
- *     allowed in agent-infra main → { reBaseline: <target> } — the sanctioned
- *     post-ceremony return-to-main (#376). The target is the session's de-facto
- *     own baseline: the branch the shared tree was on when THIS session started
- *     (the lock serializes concurrent starts only — a resumed/overlapping start
- *     records whatever branch was current). Harm is bounded exactly like the
- *     create-new carve-out: M2 still blocks off-baseline commits. The
- *     synchronous re-baseline keeps the next tool_call's M1 warn silent.
+ *     — the branch recorded at session_start): allowed in agent-infra main →
+ *     { reBaseline: <target> } — the #376 recovery return-to-original (kept
+ *     after #626 as a RECOVERY path: a hub session switched out from under it
+ *     may switch back to the branch it STARTED on — its recorded original;
+ *     no skill ceremony uses it anymore since #615 ceremonies run in
+ *     worktrees, which never reach this gate). Unlike the removed create-new
+ *     carve-out it targets ONLY the session's own recorded start branch,
+ *     never an arbitrary new branch. Harm is bounded exactly as before: M2
+ *     still blocks off-baseline commits. The synchronous re-baseline keeps
+ *     the next tool_call's M1 warn silent.
  *   everything else (switch-existing to any OTHER branch / force / force-create
  *   / orphan / detach / symbolic-ref HEAD / update-ref refs/heads / branch -f
  *   targeting a branch other than the checkout's OWN current branch — #591:
@@ -889,15 +981,30 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
   if (!branchOp) return null;
   const op = branchOp.op;
   if (op === "create-new") {
-    if (isAgentInfra) return { reBaseline: branchOp.branch };
+    // #626: the agent-infra create-new authorization is REMOVED. Post-#615 (in-
+    // main-work exemption gone, hub = main+clean) no legit flow creates a branch
+    // IN the agent-infra main checkout — implementers work in worktrees, where
+    // branch-state mutations are worktree-effective and never reach this gate
+    // (index.ts exempts isWorktree repos BEFORE decideM3), and `git worktree
+    // add -b` is not a branchState op at all (it creates a NEW ref without
+    // touching the hub HEAD; the `-B` sibling force-resets an EXISTING ref and
+    // is a residual, tracked separately). The former #99 rationale (in-main
+    // ceremonies) is gone with the exemption; the carve-out was the exact hole
+    // that let a stale-skill session flip the shared tree off-main. Worktree/
+    // own-baseline ceremonies need NO in-hub create-new: worktree creation is
+    // exempt upstream, and own-baseline returns use the #376 switch-existing
+    // arm below. Escape hatches (env/TTL marker) keep M2/M3 inactive for
+    // deliberate in-hub work (#265).
     return {
       block: true,
       reason: [
         `⛔ git checkout -b / switch -c blocked in the MAIN checkout.`,
         `   Why: creating a branch here switches the SHARED tree for every`,
-        `   parallel session (#265).`,
-        `   → Non-infra repos: create a worktree (using-git-worktrees skill).`,
-        `   → Agent-infra: this is allowed only for the infra repo itself.`,
+        `   parallel session (#265) — agent-infra included (the #99 in-main`,
+        `   work model was removed by #615).`,
+        `   → Create an isolated worktree instead: using-git-worktrees skill`,
+        `     (agent-infra: hub-worktree.sh <branch>), or create the branch`,
+        `     inside an existing worktree (worktree-effective → exempt).`,
       ].join("\n"),
     };
   }
@@ -918,7 +1025,7 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     // and the substitution below resolves it to currentBranch, so the
     // old-name check runs against the CURRENT checkout branch (a classifier-
     // visible old name is impossible there). ownedBranches (this session's
-    // created/renamed-to branches in this repo — the #543/#588 ownership
+    // renamed-to branches in this repo — the #543/#588 ownership
     // check) still allows overwriting the session's OWN refs. Round-1 review
     // fold-in: the carve-out is scoped to the repo that recorded the baseline
     // (baseline.repoKey === repoKey — the #376 discipline): a rename in a
@@ -1045,9 +1152,10 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
       && (stateOpCount ?? 1) === 1 && !isBare && !hiddenStateSubst) {
     return null;
   }
-  // #376 carve-out: sanctioned ceremony return-to-baseline — switch back to the
-  // branch this session STARTED on (before any create-new re-baseline), allowed
-  // in agent-infra main only. No original recorded (contended/detached start —
+  // #376 carve-out: ceremony return-to-original — switch back to the branch
+  // this session STARTED on (its immutable `original`; the mid-ceremony
+  // re-base now comes from an own-baseline rename or a legacy/hatch ceremony,
+  // since in-hub create-new is blocked, #626), allowed in agent-infra main only. No original recorded (contended/detached start —
   // the tree may already sit on ANOTHER session's branch) → fail-closed block.
   // The resolved repo must be the SAME repo that recorded the original baseline
   // (repoKey equality — M2 semantics); a baseline owned by another agent-infra
@@ -1070,7 +1178,9 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
       `   branches here moves the tree out from under every other session and`,
       `   commits land on the wrong branch (#265).`,
       `   → Work in an isolated worktree: invoke the using-git-worktrees skill.`,
-      `   → Agent-infra create-new: git checkout -b <branch> is allowed.`,
+      `   → Agent-infra main is NOT exempt (the #99 exemption was removed in`,
+      `     #615): in-hub checkout -b / switch -c is blocked like every hub`,
+      `     (#626); create feature branches in a worktree instead.`,
       `   → Agent-infra ceremony return: git checkout back to the branch your`,
       `     session STARTED on (its original baseline) is allowed (#376).`,
     ].join("\n"),
@@ -1087,8 +1197,8 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
  *     must never slip a foreign target past the gate; symmetric with the
  *     delete case).
  *   branch-force-delete (LOCAL `git branch -D`) → every named target ==
- *     baseline branch OR a branch THIS session itself created via the M3
- *     create-new/rename carve-outs (ownedBranches — #376 review fold-in: after
+ *     baseline branch OR a branch THIS session itself renamed its own baseline
+ *     to via the M3 rename carve-out (ownedBranches — #376 review fold-in: after
  *     the sanctioned ceremony return-to-baseline the baseline is main again,
  *     but deleting the session's OWN merged ceremony branch locally must still
  *     pass; git already refuses deleting a branch checked out in ANY worktree,
