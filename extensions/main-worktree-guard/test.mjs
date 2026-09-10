@@ -428,6 +428,11 @@ try {
   bashPin("#625: hub-rooted CLEAN mv onto tracked hub file → BLOCK", `mv ${hub}/tmp-625.md ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN truncate tracked hub file → BLOCK", `truncate -s 0 ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN dd of= tracked hub file → BLOCK", `dd if=/dev/zero of=${hub}/AGENTS.md bs=1 count=0`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN cp file INTO hub root (dir dst) → BLOCK", `cp /tmp/evil-625/AGENTS.md .`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN cp into hub dir (trailing slash dst) → BLOCK", `cp /tmp/evil-625/AGENTS.md ${hub}/`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN cp ... 2>&1 (fd redirect) → BLOCK", `cp /tmp/evil-625/AGENTS.md ${hub}/AGENTS.md 2>&1`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN sed -i '' (BSD) → BLOCK", `sed -i '' 's/a/b/' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN sort -o tracked hub file → BLOCK", `sort -o ${hub}/AGENTS.md /tmp/in-625.txt`, hub, "BLOCK (hub tracked)");
   bashPin("#625: wt session rsync onto tracked hub file → BLOCK", `rsync -a ${wt}/src-625.md ${hub}/AGENTS.md`, wt, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN ln -sf over tracked hub file → BLOCK", `ln -sf /tmp/x ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN in-place verb on WORKTREE file → ALLOW", `sed -i s/a/b/ ${wt}/wt-own.txt`, hub, "ALLOW (no hub-main write)");
@@ -637,14 +642,20 @@ expectBool("rev3: .git doctrine reconciled (block reason names the marker window
 expectBool("#625 source pin: clean-same-checkout early return removed", !pinSrc.includes("} else if (sameCheckout) {"), true);
 expectBool("#625 source pin: only the marker's clean own-main window keeps a sessionDisorder-null skip", (pinSrc.match(/sessionDisorder === null\) return;/g) ?? []).length === 1, true);
 expectBool("#625 source pin: in-place verb set declared (INPLACE_WRITE_VERBS)", classifySrc.includes("INPLACE_WRITE_VERBS"), true);
-expectBool("#625 source pin: verb target resolver wired (verbTargets closure)", classifySrc.includes("const verbTargets = (verb, k0) => {"), true);
+expectBool("#625 source pin: verb target resolver wired (verbTargets closure)", classifySrc.includes("const verbTargets = (verb, k0, siteCwd) => {"), true);
 expectBool("#625 source pin: verb dispatch is command-position + basename-normalized", classifySrc.includes("INPLACE_WRITE_VERBS.has(verbBase)"), true);
 expectBool("#625 source pin: verb candidates enter the target assembly", classifySrc.includes("for (const v of verbToks) push(v.raw, v.cwd, v.via, \"site\")"), true);
-expectBool("#625 source pin: sed/perl in-place flag detected", classifySrc.includes("letters.includes(\"i\")") && classifySrc.includes("--in-place"), true);
+expectBool("#625 source pin: sed/perl in-place flag detected", classifySrc.includes("inPlace = true; ci = cluster.length"), true);
 expectBool("#625 source pin: cp/mv -t target-directory handled", classifySrc.includes("--target-directory="), true);
 expectBool("#625 source pin: dd of= operand surfaced", classifySrc.includes("w.startsWith(\"of=\")"), true);
-expectBool("#625 source pin: mv surfaces its sources (removal is a tracked mutation)", classifySrc.includes("if (verb === \"mv\") {"), true);
-expectBool("#625 source pin: rsync/ln destination handled", classifySrc.includes("if (verb === \"rsync\" || verb === \"ln\")"), true);
+expectBool("#625 source pin: mv surfaces its sources (removal is a tracked mutation)", classifySrc.includes("const alsoSources = v === \"mv\""), true);
+expectBool("#625 source pin: rsync/ln destination handled (operand-aware)", classifySrc.includes("v === \"rsync\" || v === \"ln\"") && classifySrc.includes("OPERAND_FLAGS"), true);
+expectBool("#625 source pin: directory destination expands per-source (dstIsDir/emitDst)", classifySrc.includes("const dstIsDir = (dst) => {") && classifySrc.includes("const emitDst = (dst, sources, alsoSources) => {"), true);
+expectBool("#625 source pin: verbTargets receives the site cwd (dir-expansion resolves)", classifySrc.includes("verbTargets(verbBase, i, cwd)") && classifySrc.includes("const verbTargets = (verb, k0, siteCwd) => {"), true);
+expectBool("#625 source pin: fd-prefixed redirects consumed before readWord", classifySrc.includes("if (rk < n && (s[rk] === \">\" || s[rk] === \"<\")) {"), true);
+expectBool("#625 source pin: empty quoted operand advances via w.k (BSD sed -i '')", classifySrc.includes("if (w.w === \"\" && w.k <= k)"), true);
+expectBool("#625 source pin: sed/perl in-place flag parsed letter-by-letter", classifySrc.includes("if (ch === \"i\") { inPlace = true; ci = cluster.length; continue; }"), true);
+expectBool("#625 source pin: gsed/awk attached-inplace/sort/sponge/ed/ex in the verb set", classifySrc.includes("\"gsed\", \"perl\"") && classifySrc.includes("-iinplace") && classifySrc.includes("\"sort\", \"sponge\", \"ed\", \"ex\""), true);
 expectBool("#625 source pin: block reason names verb coverage", pinSrc.includes("in-place overwrite verbs"), true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
@@ -4228,6 +4239,7 @@ try {
   // so the same-file write was blocked via redirect but slipped via the verb.
   {
     const H = mkdtempSync(join(tmpdir(), "bwt625-"));
+    mkdirSync(join(H, "subdir"));
     const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
     const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
     const has = (cmd, needle, label) => expectBool(`C625: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
@@ -4254,8 +4266,28 @@ try {
     has("cp src.md tracked.md", "cp:H/tracked.md", "cp destination");
     has("cp -f src.md tracked.md", "cp:H/tracked.md", "cp -f destination");
     has("cp src.md mid.md tracked.md", "cp:H/tracked.md", "cp multi-source: last positional is dst");
-    has("cp -t subdir src.md", "cp:H/subdir", "cp -t target-directory");
-    has("cp --target-directory=subdir src.md", "cp:H/subdir", "cp --target-directory= attached");
+    has("cp -t subdir src.md", "cp:H/subdir/src.md", "cp -t target-directory resolves per-source");
+    has("cp --target-directory=subdir src.md", "cp:H/subdir/src.md", "cp --target-directory= attached resolves per-source");
+    has("cp /tmp/evil/AGENTS.md .", "cp:H/AGENTS.md", "cp file INTO a directory dst expands to dir/basename(src)");
+    has("cp /tmp/x.md subdir", "cp:H/subdir/x.md", "cp file into dir positional dst expands");
+    has("cp src.md tracked.md 2>&1", "cp:H/tracked.md", "fd-prefixed redirect after dst does not become the dst");
+    has("sed -i '' 's/a/b/' tracked.md", "sed:H/tracked.md", "BSD empty-suffix sed -i '' (empty quoted operand)");
+    has("perl -pi -e '' tracked.md", "perl:H/tracked.md", "perl -e '' empty program operand");
+    has("perl -I./lib -pi -e s/a/b/ tracked.md", "perl:H/tracked.md", "perl attached -I./lib operand does not swallow -i");
+    has("sed -i -f./fix.sed tracked.md", "sed:H/tracked.md", "sed attached -f operand does not swallow the file");
+    has("sed -f./fix.sed -i tracked.md", "sed:H/tracked.md", "sed attached -f before -i");
+    has("gawk -iinplace '{print}' tracked.md", "gawk:H/tracked.md", "gawk attached -iinplace");
+    has("rsync -a src/ tracked.md --exclude pattern", "rsync:H/tracked.md", "rsync trailing flag operand does not become dst");
+    has("rsync -I src.md tracked.md -e ssh", "rsync:H/tracked.md", "rsync permuted -e operand after dst");
+    has("sort -o tracked.md in.txt", "sort:H/tracked.md", "sort -o writes its operand");
+    has("sponge tracked.md < in.txt", "sponge:H/tracked.md", "sponge in-place target");
+    has("ed -s tracked.md", "ed:H/tracked.md", "ed in-place file");
+    has("gsed -i s/a/b/ tracked.md", "gsed:H/tracked.md", "GNU-sed spelling gsed");
+    // read-only forms must NOT false-positive (cluster letters inside attached operands)
+    lacks("perl -MTime::HiRes -e 'print time' tracked.md", "perl:H/tracked.md", "perl -M attached operand is not in-place");
+    lacks("perl -e'print \"hi\"' tracked.md", "perl:H/tracked.md", "perl attached -e program is not in-place");
+    none("sed -ne p tracked.md", "sed -ne (no -i) is a read");
+    none("sort in.txt", "sort without -o is a read");
     has("/bin/cp src.md tracked.md", "cp:H/tracked.md", "path-qualified cp");
     has("mv src.md tracked.md", "mv:H/tracked.md", "mv destination overwrite");
     has("mv tracked.md outdir", "mv:H/tracked.md", "mv SOURCE (deletes the tracked file)");

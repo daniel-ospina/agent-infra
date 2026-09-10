@@ -4372,20 +4372,25 @@ export function firstHubTrackedWrite(candidates, trackedRels) {
  * `cp`/`mv` onto a tracked file, `install`, `dd of=`, `tar -x`/`unzip -o`
  * into the hub, `patch -p1`): those contain no write-primitive construct. Since
  * #625 the in-place OVERWRITE VERBS ARE gated too (`sed -i`, `perl -pi`,
- * `awk -i inplace`, the `cp`/`mv`/`install`/`rsync`/`ln` destination,
- * `truncate`, `dd of=`) at COMMAND position — `git mv a b` / `echo cp a b`
- * stay ARG positions.
- * Remaining residuals (tracked separately): verb-in-ARG fan-outs (`find -exec`,
- * `xargs`), archive/member writers (`tar -x`, `unzip -o`, `patch`), and a bare
- * `rm` of a tracked file (a delete, not an overwrite).
+ * `awk -i inplace`, the `cp`/`mv`/`install`/`rsync`/`ln` destination (a
+ * DIRECTORY destination resolves per-source to `dir/<basename(src)>`),
+ * `truncate`, `dd of=`, `gsed`, `sort -o`, `sponge`, `ed`/`ex`) at COMMAND
+ * position — `git mv a b` / `echo cp a b` stay ARG positions. Remaining
+ * residuals (tracked separately): verb-in-ARG fan-outs (`find -exec`, `xargs`),
+ * archive/member writers (`tar -x`, `unzip -o`, `patch`), DIRECTORY-TREE copies
+ * whose per-file targets are not in the command string (`cp -R src/ dst/`,
+ * `rsync -a src/ dst/`), backtick command substitution (the `$( )` form IS
+ * walked), arbitrary interpreter writers (`node -e writeFileSync`, `ruby -e
+ * File.write`, `php -r file_put_contents`), and a bare `rm` of a tracked file
+ * (a delete, not an overwrite).
  */
 // #625: command-position words whose invocation WRITES a file with no
 // write-primitive token — the in-place OVERWRITE verbs. `sed`/`perl`/`awk`
 // only when their in-place mode is present (checked in the handler);
 // `cp`/`mv`/`install`/`truncate`/`dd` always write an operand.
 const INPLACE_WRITE_VERBS = new Set([
-  "sed", "perl", "awk", "gawk", "mawk", "cp", "mv", "install", "truncate", "dd",
-  "rsync", "ln",
+  "sed", "gsed", "perl", "awk", "gawk", "mawk", "cp", "mv", "install", "truncate", "dd",
+  "rsync", "ln", "sort", "sponge", "ed", "ex",
 ]);
 
 export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
@@ -4492,33 +4497,74 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
   // resolves them against the site cwd. Over-match is the safe direction (a
   // non-tracked candidate is inert). Each verb's operand-taking flags are
   // consumed so a script/operand word is never mistaken for a file.
-  const verbTargets = (verb, k0) => {
+  const verbTargets = (verb, k0, siteCwd) => {
+    const v = verb === "gsed" ? "sed" : verb; // GNU-sed spelling sibling
     const words = [];
     let k = skipWs(k0);
     while (k < n) {
       const c0 = s[k];
       if (";&|()\n".includes(c0)) break;
-      if (c0 === ">" || c0 === "<") {
-        // consume the redirect operator + operand (never a verb target)
+      // Redirect with an OPTIONAL fd prefix (`2> f`, `2>&1`, `> f`, `&> f`):
+      // consume operator + operand, never a verb target. The fd digits MUST be
+      // consumed before readWord (which stops only at `>`), else
+      // `cp a b 2>&1` parses `2` as the destination and the real target is
+      // missed (#625 review P1).
+      if (c0 === ">" || c0 === "<" || /[0-9]/.test(c0)) {
         let rk = k;
         while (rk < n && /[0-9]/.test(s[rk])) rk++;
-        while (rk < n && "<>&".includes(s[rk])) rk++;
-        rk = skipWs(rk);
-        const op = readWord(rk);
-        k = skipWs(op.k > rk ? op.k : rk + 1);
-        continue;
+        if (rk < n && (s[rk] === ">" || s[rk] === "<")) {
+          const opStart = rk;
+          while (rk < n && "<>&".includes(s[rk])) rk++;
+          const op = s.slice(opStart, rk);
+          rk = skipWs(rk);
+          const opnd = readWord(rk);
+          const nextK = skipWs(opnd.k > rk ? opnd.k : rk + 1);
+          // `<<DELIM` opens a heredoc BODY — data, not a verb argument; stop
+          // the scan there (the main walker skips the body).
+          if (op.includes("<<")) { k = nextK; break; }
+          k = nextK;
+          continue;
+        }
       }
       const w = readWord(k);
-      if (w.w === "") { k = k + 1; continue; }
+      // Advance past the parsed word. An EMPTY QUOTED word (`''`/`""` — the BSD
+      // `sed -i ''` idiom) is a real positional slot; keep it in `words` so the
+      // script/operand boundary stays aligned, but advance with w.k (a stale
+      // k+1 lands inside the next word's quotes and mangles the command —
+      // #625 review P1).
+      if (w.w === "" && w.k <= k) { k = k + 1; continue; }
       words.push(w.w);
       k = skipWs(w.k);
     }
     const out = [];
     const isFlag = (w) => w.length > 1 && w[0] === "-";
-    if (verb === "sed" || verb === "perl") {
+    // A destination that is an existing DIRECTORY (or spelled with a trailing
+    // slash) writes `dir/<basename(src)>` for each source — `cp src .` targets
+    // `./src`, NOT the directory. Without this, `cp /tmp/evil/AGENTS.md .` from
+    // a clean hub main surfaced the bare root dir, which classify skips
+    // (rel === "") — a tracked-file overwrite with zero gate (#625 review P1).
+    const dstIsDir = (dst) => {
+      if (!dst) return false;
+      if (/[/\\]$/.test(dst)) return true;
+      try { return existsSync(resolve(siteCwd, dst)) && statSync(resolve(siteCwd, dst)).isDirectory(); } catch { return false; }
+    };
+    const emitDst = (dst, sources, alsoSources) => {
+      if (dstIsDir(dst)) {
+        for (const src of sources) out.push(join(dst, basename(src)));
+      } else if (dst) {
+        out.push(dst);
+      }
+      if (alsoSources) for (const src of sources) out.push(src);
+    };
+    if (v === "sed" || v === "perl") {
       // -i / --in-place = in-place edit. The script operand (-e/--expression,
       // -f/--file in sed; -e/-E in perl) does NOT write — consume it (attached
-      // or as the next word) so it is never mistaken for a file.
+      // or as the next word) so it is never mistaken for a file. The cluster is
+      // parsed LETTER BY LETTER: `-I./lib` in perl is ONE attached operand (not
+      // a flag run), and a lowercase `i` INSIDE an attached operand
+      // (`-MTime::HiRes`) is NOT the in-place flag — a `split(".")`/includes
+      // scan both missed the real vector AND false-blocked read-only commands
+      // (#625 review P1/P2).
       let inPlace = false;
       let hasScriptFlag = false;
       let expectOperand = false;
@@ -4534,16 +4580,23 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
             else if (w.startsWith("--expression=") || w.startsWith("--file=")) hasScriptFlag = true;
             continue;
           }
-          const letters = w.slice(1).split(".")[0];
-          if (letters.includes("i")) inPlace = true;
-          if (verb === "sed") {
-            if (/[ef]$/.test(letters)) { hasScriptFlag = true; expectOperand = true; }
-            else if (letters.includes("e") || letters.includes("f")) hasScriptFlag = true;
-          } else {
-            // perl: -e/-E take the program; -F/-I/-M/-m/-x take an operand.
-            if (/[eE]$/.test(letters)) { hasScriptFlag = true; expectOperand = true; }
-            else if (letters.includes("e") || letters.includes("E")) hasScriptFlag = true;
-            else if (/[FIMmx]$/.test(letters)) expectOperand = true;
+          const cluster = w.slice(1);
+          let ci = 0;
+          while (ci < cluster.length) {
+            const ch = cluster[ci];
+            if (ch === "i") { inPlace = true; ci = cluster.length; continue; } // optional attached suffix
+            if (v === "sed" ? (ch === "e" || ch === "f") : (ch === "e" || ch === "E")) {
+              hasScriptFlag = true;
+              if (ci + 1 < cluster.length) ci = cluster.length; // attached operand
+              else { expectOperand = true; ci++; }
+              continue;
+            }
+            if (v === "perl" && (ch === "I" || ch === "F" || ch === "M" || ch === "m" || ch === "x")) {
+              if (ci + 1 < cluster.length) ci = cluster.length; // attached operand
+              else { expectOperand = true; ci++; }
+              continue;
+            }
+            ci++;
           }
           continue;
         }
@@ -4555,8 +4608,9 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       for (const f of files) out.push(f);
       return out;
     }
-    if (verb === "awk" || verb === "gawk" || verb === "mawk") {
-      // gawk in-place extension: `awk -i inplace` / `--include=inplace`.
+    if (v === "awk" || v === "gawk" || v === "mawk") {
+      // gawk in-place extension: `-i inplace`, `-iinplace`, `--include inplace`,
+      // `--include=inplace`.
       let inPlace = false;
       let hasProgFlag = false;
       let expectOperand = false;
@@ -4565,8 +4619,11 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         const w = words[wi];
         if (expectOperand) { expectOperand = false; continue; }
         if (isFlag(w) && w !== "-") {
-          if (w === "-i" && words[wi + 1] === "inplace") { inPlace = true; expectOperand = true; continue; }
-          if (w === "--include=inplace") { inPlace = true; continue; }
+          if (w === "-i" || w === "--include") {
+            if (words[wi + 1] === "inplace") { inPlace = true; expectOperand = true; }
+            continue;
+          }
+          if (w === "-iinplace" || w === "--include=inplace") { inPlace = true; continue; }
           if (w === "-f" || w === "--file") { hasProgFlag = true; expectOperand = true; continue; }
           if (w === "-v") { expectOperand = true; continue; }
           continue;
@@ -4578,7 +4635,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       for (const f of files) out.push(f);
       return out;
     }
-    if (verb === "cp" || verb === "mv" || verb === "install") {
+    if (v === "cp" || v === "mv" || v === "install") {
       let targetDir = null;
       let expectTarget = false;
       let expectOperand = false;
@@ -4593,24 +4650,22 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
           if (w.startsWith("--target-directory=")) { targetDir = w.slice("--target-directory=".length); continue; }
           if (/^-t./.test(w)) { targetDir = w.slice(2); continue; }
           if (w === "-S" || w === "--suffix") { expectOperand = true; continue; }
-          if (verb === "install" && (w === "-m" || w === "-o" || w === "-g")) { expectOperand = true; continue; }
+          if (v === "install" && (w === "-m" || w === "-o" || w === "-g")) { expectOperand = true; continue; }
           continue;
         }
         positionals.push(w);
       }
       // mv REMOVES its sources as well as writing the destination — a tracked
       // SOURCE is a tracked-file mutation. cp/install only READ their sources.
-      if (verb === "mv") {
-        if (targetDir) out.push(targetDir);
-        for (const p of positionals) out.push(p);
-      } else if (targetDir) {
-        out.push(targetDir);
+      const alsoSources = v === "mv";
+      if (targetDir) {
+        emitDst(targetDir, positionals, alsoSources);
       } else if (positionals.length > 0) {
-        out.push(positionals[positionals.length - 1]);
+        emitDst(positionals[positionals.length - 1], positionals.slice(0, -1), alsoSources);
       }
       return out;
     }
-    if (verb === "truncate") {
+    if (v === "truncate") {
       let expectOperand = false;
       let endOpts = false;
       for (const w of words) {
@@ -4618,27 +4673,81 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         if (!endOpts && w === "--") { endOpts = true; continue; }
         if (!endOpts && isFlag(w) && w !== "-") {
           if (w === "-s" || w === "--size" || w === "-r" || w === "--reference") { expectOperand = true; continue; }
+          if (w.startsWith("--size=") || w.startsWith("--reference=")) continue;
+          if (/^-s./.test(w) || /^-r./.test(w)) continue;
           continue;
         }
         out.push(w);
       }
       return out;
     }
-    if (verb === "rsync" || verb === "ln") {
-      // Destination is the LAST positional (`rsync [opt] SRC... DEST`,
-      // `ln [-s] TARGET LINK`). A bare flag operand (`-e ssh`, `--exclude
-      // pat`) can appear as an extra positional but never AFTER the
-      // destination, so the last non-flag word is still the write target.
-      let last = null;
+    if (v === "rsync" || v === "ln") {
+      // Destination is the LAST positional. rsync PERMUTES options, so a bare
+      // flag operand may appear AFTER the destination (`rsync -a src dst
+      // --exclude foo`) — operand-taking flags MUST be consumed, else the
+      // operand becomes the "destination" and the real one is missed
+      // (#625 review P2). ln mirrors this via `-t`/`-S`.
+      const OPERAND_FLAGS = new Set(v === "rsync"
+        ? ["-e", "--rsh", "-f", "--filter", "--exclude", "--include", "--exclude-from", "--include-from",
+           "--files-from", "--log-file", "--log-file-format", "--temp-dir", "-T", "-B", "--block-size",
+           "-M", "--remote-option", "--partial-dir", "--compare-dest", "--copy-dest", "--link-dest",
+           "--rsync-path", "--chmod", "--chown", "--usermap", "--groupmap", "--timeout", "--out-format",
+           "--suffix", "--max-size", "--min-size", "--bwlimit", "--compress-level", "--skip-compress",
+           "--address", "--port", "--sockopts", "--password-file"]
+        : ["-t", "--target-directory", "-S", "--suffix"]);
+      let expectOperand = false;
+      let expectTarget = false;
+      let targetDir = null;
+      let endOpts = false;
+      const positionals = [];
       for (const w of words) {
-        if (isFlag(w) && w !== "-") continue;
-        last = w;
+        if (expectTarget) { targetDir = w; expectTarget = false; continue; }
+        if (expectOperand) { expectOperand = false; continue; }
+        if (!endOpts && w === "--") { endOpts = true; continue; }
+        if (!endOpts && isFlag(w) && w !== "-") {
+          if (v === "ln" && (w === "-t" || w === "--target-directory")) { expectTarget = true; continue; }
+          if (OPERAND_FLAGS.has(w)) { expectOperand = true; continue; }
+          continue;
+        }
+        positionals.push(w);
       }
-      if (last) out.push(last);
+      if (targetDir) emitDst(targetDir, positionals, false);
+      else if (positionals.length > 0) emitDst(positionals[positionals.length - 1], positionals.slice(0, -1), false);
       return out;
     }
-    if (verb === "dd") {
+    if (v === "dd") {
       for (const w of words) if (w.startsWith("of=")) out.push(w.slice(3));
+      return out;
+    }
+    if (v === "sort") {
+      // `sort -o FILE` writes FILE (attached `-oFILE`/`--output=FILE` or the
+      // next word). A plain `sort file` is read-only → no target.
+      let expectOperand = false;
+      for (const w of words) {
+        if (expectOperand) { out.push(w); expectOperand = false; continue; }
+        if (w === "-o" || w === "--output") { expectOperand = true; continue; }
+        if (w.startsWith("--output=")) out.push(w.slice("--output=".length));
+        else if (/^-o./.test(w)) out.push(w.slice(2));
+      }
+      return out;
+    }
+    if (v === "sponge" || v === "ed" || v === "ex") {
+      // `sponge FILE` writes FILE; `ed`/`ex FILE` edit FILE in place. Consume
+      // the `-c/--command` operand for ed/ex, then the last positional is the
+      // file (the writable surface).
+      let expectOperand = false;
+      let endOpts = false;
+      const positionals = [];
+      for (const w of words) {
+        if (expectOperand) { expectOperand = false; continue; }
+        if (!endOpts && w === "--") { endOpts = true; continue; }
+        if (!endOpts && isFlag(w) && w !== "-") {
+          if ((v === "ed" || v === "ex") && (w === "-c" || w === "--command")) { expectOperand = true; continue; }
+          continue;
+        }
+        positionals.push(w);
+      }
+      if (positionals.length > 0) emitDst(positionals[positionals.length - 1], [], false);
       return out;
     }
     return out;
@@ -5337,11 +5446,12 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     }
     {
       // #625: in-place OVERWRITE verbs (sed -i / perl -pi / awk -i inplace /
-      // cp / mv / install / truncate / dd of=) — a write with NO primitive
-      // token, resolved as a target through the SAME hub/tracked gate.
+      // cp / mv / install / truncate / dd of= / rsync / ln / sort -o / sponge /
+      // ed / ex) — a write with NO primitive token, resolved as a target
+      // through the SAME hub/tracked gate.
       const verbBase = w0.w.lastIndexOf("/") >= 0 ? w0.w.slice(w0.w.lastIndexOf("/") + 1) : w0.w;
       if (INPLACE_WRITE_VERBS.has(verbBase)) {
-        for (const raw of verbTargets(verbBase, i)) {
+        for (const raw of verbTargets(verbBase, i, cwd)) {
           const _vb = { raw, cwd, via: verbBase };
           verbToks.push(_vb, ...forkTwins(_vb));
         }
