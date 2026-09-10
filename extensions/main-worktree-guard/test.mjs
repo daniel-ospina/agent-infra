@@ -4358,6 +4358,14 @@ try {
     has("rsync -a src.md --group tracked.md", "rsync:H/tracked.md", "--group is boolean, not --groupmap");
     none("rsync -a tracked.md -v", "single-operand rsync is list-only, not a write");
     has("truncate -s 0 $(echo \\( ) tracked.md", "truncate:H/tracked.md", "escaped paren inside $( ) does not over-skip");
+    // #625 review cycle-5: --suffix regression + eval/trap option/ANSI-C forms
+    has("rsync -a src.md tracked.md --suffix .bak", "rsync:H/tracked.md", "--suffix is an operand option in the arity table");
+    has("rsync -a src.md tracked.md -S .bak", "rsync:H/tracked.md", "rsync -S suffix operand");
+    lacks("rsync -a src.md /tmp/dst --suffix .bak", "rsync:H/.bak", "--suffix operand is not a destination");
+    has("trap -- 'printf x >> tracked.md' EXIT", "redirect:H/tracked.md", "trap with a leading -- still walks the payload");
+    has("trap $'printf x >> tracked.md' EXIT", "redirect:H/tracked.md", "ANSI-C dollar-single-quoted trap payload");
+    has("eval -- 'printf x > tracked.md'", "redirect:H/tracked.md", "eval with a leading -- still walks the payload");
+    none("trap -l", "trap -l is a list, no payload");
     // truncate / dd
     has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
     has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");

@@ -4783,8 +4783,10 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         ["--delete", 0], ["--delete-before", 0], ["--delete-during", 0], ["--delete-delay", 0],
         ["--delete-after", 0], ["--delete-excluded", 0], ["--ignore-errors", 0], ["--force", 0],
         ["--max-delete", 1], ["--max-size", 1], ["--min-size", 1], ["--max-alloc", 1], ["--partial", 0],
-        ["--partial-dir", 1], ["--backup-dir", 1], ["--checksum-seed", 1], ["--checkpoint-action", 1],
-        ["--copy-devices", 0], ["--write-devices", 0], ["--delay-updates", 0], ["--prune-empty-dirs", 0], ["--numeric-ids", 0],
+        ["--partial-dir", 1], ["--backup-dir", 1], ["--suffix", 1], ["--checksum-seed", 1],
+        ["--checkpoint-action", 1], ["--info", 0], ["--debug", 0], ["--stderr", 1], ["--outbuf", 1],
+        ["--config", 1], ["--dparam", 1], ["--copy-as", 1],
+        ["--copy-devices", 0], ["--write-devices", 0], ["--delete-missing-args", 0], ["--delay-updates", 0], ["--prune-empty-dirs", 0], ["--numeric-ids", 0],
         ["--usermap", 1], ["--groupmap", 1], ["--chown", 1], ["--timeout", 1], ["--contimeout", 1],
         ["--ignore-times", 0], ["--size-only", 0], ["--modify-window", 1], ["--temp-dir", 1], ["--fuzzy", 0],
         ["--compare-dest", 1], ["--copy-dest", 1], ["--link-dest", 1], ["--compress", 0],
@@ -4800,7 +4802,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         ["--version", 0], ["--help", 0], ["--daemon", 0], ["--no-detach", 0], ["--old-args", 0],
         ["--rsync-path", 1], ["--msgs2stderr", 0],
       ];
-      const RSYNC_OP_SHORT = new Set(["-e", "-f", "-B", "-T", "-M"]);
+      const RSYNC_OP_SHORT = new Set(["-e", "-f", "-B", "-T", "-M", "-S"]);
       const isRsyncOperand = (w) => {
         const eq = w.indexOf("=");
         const name = eq === -1 ? w : w.slice(0, eq);
@@ -5882,15 +5884,33 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       // quoted eval/trap ('echo x > f') — the STANDARD form — must recurse on
       // the UNQUOTED payload; bare eval collects words until a boundary/newline.
       // `trap` runs its first operand as code in the same shell, so its payload
-      // is walked the same way (#625 cycle-4 B2).
+      // is walked the same way (#625 cycle-4 B2). Leading option tokens are
+      // skipped first (`trap --`, `trap -p`, `trap -l`, `eval --`) and ANSI-C
+      // quoting (`$'…'` / `$"…"`) is recognized — both otherwise left the raw
+      // quoted text as one word, so the `>` was never seen (#625 cycle-5 P1).
       let k = skipWs(i);
-      const qd = s[k] === "'" || s[k] === '"' ? s[k] : null;
+      while (k < n) {
+        const opt = readWord(k);
+        const isOpt = opt.w === "--" || (w0.w === "trap" &&
+          (opt.w === "-p" || opt.w === "--print" || opt.w === "-l" || opt.w === "--list"));
+        if (!isOpt || opt.k <= k) break;
+        k = skipWs(opt.k);
+      }
+      let qd = null;
+      if (s[k] === "$" && (s[k + 1] === "'" || s[k + 1] === '"')) { qd = s[k + 1]; k++; }
+      else if (s[k] === "'" || s[k] === '"') qd = s[k];
       if (qd) {
         k++;
         let pl = "";
         while (k < n && s[k] !== qd && pl.length < 4096) {
           if (qd === '"' && s[k] === "\\" && k + 1 < n) {
             // dq escape (cycle-15 D2): \" / \\ / \$ → the literal next char
+            pl += s[k + 1];
+            k += 2;
+            continue;
+          }
+          if (qd === "'" && s[k] === "\\" && k + 1 < n && (s[k + 1] === "'" || s[k + 1] === "\\")) {
+            // ANSI-C `$'…'` escapes (approximate): unescape \' and \\
             pl += s[k + 1];
             k += 2;
             continue;
