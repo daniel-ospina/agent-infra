@@ -422,6 +422,17 @@ const effMain = resolveEffectiveRepo("git commit -m x", MAIN); // on main
 const effWt = resolveEffectiveRepo(`git -C "${WT}" commit -m x`, MAIN);
 ok("M2: worktree exempt", decideM2({ effectiveRepo: effWt, baseline, currentBranch: effWt.currentBranch, verdict: "block:commit" }) === null);
 ok("M2: commit off-baseline blocks", (() => { const d = decideM2({ effectiveRepo: effMain, baseline, currentBranch: effMain.currentBranch, verdict: "block:commit" }); return d?.block === true; })());
+// #626 review fold-in: the recovery text offers the #376 return ONLY when an
+// original baseline was recorded (contended/detached starts store original null
+// → that switch is itself blocked, so the message must fail over to worktree).
+ok("M2: recovery offers #376 return + names the original when recorded", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline: { ...baseline, original: "main" }, currentBranch: "feat/other", verdict: "block:commit" });
+  return d?.block === true && d.reason.includes("git checkout main") && d.reason.includes("#376");
+})());
+ok("M2: no original (contended/detached) → no switch hint, worktree recovery", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline: { ...baseline, original: null }, currentBranch: "feat/other", verdict: "block:commit" });
+  return d?.block === true && !d.reason.includes("git checkout main") && d.reason.includes("using-git-worktrees");
+})());
 ok("M2: commit on-baseline passes", decideM2({ effectiveRepo: effMain, baseline, currentBranch: "feat/1", verdict: "block:commit" }) === null);
 ok("M2: push foreign blocks", (() => { const d = decideM2({ effectiveRepo: effMain, baseline, currentBranch: "feat/1", pushDst: "main", pushTargets: ["main"], verdict: "block:push" }); return d?.block === true; })());
 ok("M2: push own passes", decideM2({ effectiveRepo: effMain, baseline, currentBranch: "feat/1", pushDst: "feat/1", pushTargets: ["feat/1"], verdict: "block:push" }) === null);

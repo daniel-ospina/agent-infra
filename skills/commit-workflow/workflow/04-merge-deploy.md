@@ -107,8 +107,11 @@ gh pr merge <PR_NUMBER> --merge
 
 ```bash
 PR_BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
-# Remote delete always works — the branch is merged, and deletion is server-side:
-git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete failed — delete manually: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"
+# Remote delete is server-side and always possible AFTER the #73 gate releases:
+# from a worktree session that still holds $PR_BRANCH the guard BLOCKS this (the
+# branch is checked out in your own worktree) — run the merged-branch cleanup
+# after 05-cleanup.md Step 3.8 teardown, or use `gh api -X DELETE` below.
+git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete blocked/failed — retry after teardown or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"
 # Local delete degrades gracefully: tolerate the worktree lock, do NOT fail the ceremony.
 # `git branch -D` (not -d) so a merged-but-not-fully-reconciled local branch still cleans up.
 if git worktree list --porcelain | grep -q "branch refs/heads/$PR_BRANCH"; then
@@ -125,16 +128,24 @@ touching the default-branch worktree. If Step B's remote delete reports
 `remote ref does not exist`, the branch was already deleted server-side
 (deleteBranchOnMerge) — that is success, not an error.
 
-> **#265/#615 ceremony posture:** ceremonies run from the session's WORKTREE —
+> **#265/#615 ceremony posture:** run the ceremony from the session's WORKTREE —
 > agent-infra included (the #99 in-main-work exemption was removed in #615, so
 > the agent-infra hub is main+clean like every hub). In a worktree the guard's
-> branch-ownership gates are worktree-exempt (M2/M3 apply only to MAIN-checkout-
-> effective mutations), so the ceremony's own-branch hygiene ops run ungated:
-> condition-5 `git merge origin/main`, Step B `git push origin --delete
-> "$PR_BRANCH"` and `git branch -D "$PR_BRANCH"`, and Stale-Merge's `rebase` +
-> bare `git push --force-with-lease`. In the HUB, the same commands are gated by
-> the ownership allowance (own baseline branch) — do not run the ceremony from
-> the hub; run it from the worktree that holds the PR branch.
+> M2/M3 gates are worktree-exempt (they apply only to MAIN-checkout-effective
+> mutations), so these pass: condition-5 `git merge origin/main`. Stale-Merge's
+> `rebase` + bare `git push --force-with-lease`. Running the ceremony from the
+> HUB is not an option: in-hub `checkout -b` is blocked (#626) and the hub is the
+> shared tree.
+>
+> ⛔ **The remote delete is NOT worktree-exempt.** `git push origin --delete
+> "$PR_BRANCH"` hits the #73 coordinated-delete guard, which blocks deleting any
+> branch checked out in ANY worktree — including the caller's own (a worktree
+> session that holds $PR_BRANCH therefore blocks its own remote delete). Run it
+> AFTER the worktree teardown (05-cleanup.md Step 3.8 → merged-branch cleanup,
+> which orders teardown first), or via `gh api -X DELETE
+> repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH`. The local `git branch -D` is
+> likewise deferred to after teardown — git itself refuses deleting a branch
+> checked out in this worktree.
 
 **Step C — obsolete (#376 ceremony return applied only to the #99 in-main flow):**
 

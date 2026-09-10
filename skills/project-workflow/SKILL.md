@@ -61,19 +61,24 @@ CURRENT=$(git branch --show-current)
 [ "$CURRENT" = "$EXPECTED_BRANCH" ] && exit 0   # already on correct branch
 
 if [ "$CURRENT" = "main" ] || [ "$CURRENT" = "master" ]; then
-  git checkout -b "$EXPECTED_BRANCH"
-  exit 0
+  # #626: in-hub `git checkout -b` is BLOCKED (every repo). Create an isolated
+  # worktree instead, cd into it, then re-run this gate from there.
+  echo "ℹ️ On $CURRENT (hub): create an isolated worktree first, then re-run this gate from it."
+  echo "   agent-infra: bash scripts/checkout-hygiene/hub-worktree.sh \"$EXPECTED_BRANCH\""
+  echo "   other repos: using-git-worktrees skill (git worktree add -b \"$EXPECTED_BRANCH\" <path> origin/main)"
+  echo "⛔ In-hub 'git checkout -b' is BLOCKED (#626) — do not attempt it here."
+  exit 1
 fi
 
 # Detached HEAD? ABORT — no branch to verify
 if [ -z "$CURRENT" ]; then
-  echo "⛔ ABORT: Detached HEAD. Checkout main first: git checkout main && git checkout -b $EXPECTED_BRANCH"
+  echo "⛔ ABORT: Detached HEAD. Create an isolated worktree: agent-infra → 'bash scripts/checkout-hygiene/hub-worktree.sh \"$EXPECTED_BRANCH\"'; other repos → using-git-worktrees skill."
   exit 1
 fi
 
 # ABORT: on a DIFFERENT issue's branch (boundary match prevents #76 matching #760)
 if ! echo "$CURRENT" | grep -qE "(^|/)$ISSUE_NUMBER(-|\$)"; then
-  echo "⛔ ABORT: On branch $CURRENT (different issue). Switch to main first, then create $EXPECTED_BRANCH."
+  echo "⛔ ABORT: On branch $CURRENT (different issue). Create an isolated worktree for THIS issue: agent-infra → 'bash scripts/checkout-hygiene/hub-worktree.sh \"$EXPECTED_BRANCH\"'; other repos → using-git-worktrees skill."
   exit 1
 fi
 ```

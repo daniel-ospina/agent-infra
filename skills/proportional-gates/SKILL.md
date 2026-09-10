@@ -63,6 +63,12 @@ Before deciding what gates to run, classify the change:
 
 **Never** start on main/master regardless of risk.
 
+> ⛔ **Guard note (#626):** "Plain branch" means a branch created from inside an existing
+> worktree — in-hub `git checkout -b` is BLOCKED in every repo (the shared main checkout
+> must never be flipped; agent-infra's #99 exemption was removed in #615 and the M3
+> create-new carve-out in #626). In a hub, create an isolated worktree first
+> (using-git-worktrees skill; agent-infra: `bash scripts/checkout-hygiene/hub-worktree.sh <branch>`).
+
 ### Pre-flight Verification
 
 | Risk | Typecheck | Build | Integration Tests | pgTAP |

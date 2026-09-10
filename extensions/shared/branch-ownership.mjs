@@ -813,6 +813,20 @@ export function decideM2({
   if (!baseline || effectiveRepo.repoKey !== baseline.repoKey) return null;
   if (verdict === "block:commit") {
     if (currentBranch === baseline.branch) return null;
+    const recovery = baseline.original
+      ? [
+          `   → Work in an isolated worktree (using-git-worktrees skill), or`,
+          `     (agent-infra main only) switch back to the branch this session`,
+          `     STARTED on: \`git checkout ${baseline.original}\` — its recorded`,
+          `     original baseline (#376). In-hub checkout -b is NOT a recovery`,
+          `     (blocked, #626).`,
+        ]
+      : [
+          `   → Work in an isolated worktree (using-git-worktrees skill).`,
+          `     No original baseline was recorded (lock-contended/detached`,
+          `     session_start), so the #376 return is unavailable and in-hub`,
+          `     checkout -b is blocked (#626) — the worktree is the recovery.`,
+        ];
     return {
       block: true,
       reason: [
@@ -820,10 +834,7 @@ export function decideM2({
         `   Session baseline branch: "${baseline.branch}"`,
         `   Resolved repo is on:      "${currentBranch ?? "detached HEAD"}"`,
         `   The shared checkout was switched out from under this session (#265).`,
-        `   → Work in an isolated worktree (using-git-worktrees skill), or`,
-        `     (agent-infra main only) switch back to the branch this session`,
-        `     STARTED on — its recorded original baseline (#376). In-hub`,
-        `     checkout -b is NOT a recovery (blocked, #626).`,
+        ...recovery,
       ].join("\n"),
     };
   }
@@ -939,7 +950,7 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     // and the substitution below resolves it to currentBranch, so the
     // old-name check runs against the CURRENT checkout branch (a classifier-
     // visible old name is impossible there). ownedBranches (this session's
-    // created/renamed-to branches in this repo — the #543/#588 ownership
+    // renamed-to branches in this repo — the #543/#588 ownership
     // check) still allows overwriting the session's OWN refs. Round-1 review
     // fold-in: the carve-out is scoped to the repo that recorded the baseline
     // (baseline.repoKey === repoKey — the #376 discipline): a rename in a
@@ -1066,9 +1077,10 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
       && (stateOpCount ?? 1) === 1 && !isBare && !hiddenStateSubst) {
     return null;
   }
-  // #376 carve-out: sanctioned ceremony return-to-baseline — switch back to the
-  // branch this session STARTED on (before any create-new re-baseline), allowed
-  // in agent-infra main only. No original recorded (contended/detached start —
+  // #376 carve-out: ceremony return-to-original — switch back to the branch
+  // this session STARTED on (its immutable `original`; the mid-ceremony
+  // re-base now comes from an own-baseline rename or a legacy/hatch ceremony,
+  // since in-hub create-new is blocked, #626), allowed in agent-infra main only. No original recorded (contended/detached start —
   // the tree may already sit on ANOTHER session's branch) → fail-closed block.
   // The resolved repo must be the SAME repo that recorded the original baseline
   // (repoKey equality — M2 semantics); a baseline owned by another agent-infra
@@ -1110,8 +1122,8 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
  *     must never slip a foreign target past the gate; symmetric with the
  *     delete case).
  *   branch-force-delete (LOCAL `git branch -D`) → every named target ==
- *     baseline branch OR a branch THIS session itself created via the M3
- *     create-new/rename carve-outs (ownedBranches — #376 review fold-in: after
+ *     baseline branch OR a branch THIS session itself renamed its own baseline
+ *     to via the M3 rename carve-out (ownedBranches — #376 review fold-in: after
  *     the sanctioned ceremony return-to-baseline the baseline is main again,
  *     but deleting the session's OWN merged ceremony branch locally must still
  *     pass; git already refuses deleting a branch checked out in ANY worktree,

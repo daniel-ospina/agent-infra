@@ -1024,21 +1024,25 @@ const WHY = [
 // carries no sessionId). Baseline = { repoKey, branch, head, original } of the
 // shared MAIN checkout at session_start. M1 dedupe: Set of "from→to" deviations.
 // `original` = the branch recorded at an UNCONTENDED session_start and is
-// IMMUTABLE — create-new/rename re-baselines update only `.branch` (#376: the
-// ceremony return-to-main carve-out switches back to `original`, provably the
-// session's own starting state). A lock-contended start (pendingBaseline →
-// first-tool_call record) sets original null → the #376 carve-out fails closed
-// (the tree may already sit on ANOTHER session's branch — not provably own).
+// IMMUTABLE — the own-baseline RENAME re-baseline updates only `.branch` (#376:
+// the ceremony return-to-original carve-out switches back to `original`,
+// provably the session's own starting state). In-hub create-new no longer
+// re-baselines (#626 blocks it — worktree ceremonies never reach decideM3).
+// A lock-contended start (pendingBaseline → first-tool_call record) sets
+// original null → the #376 carve-out fails closed (the tree may already sit on
+// ANOTHER session's branch — not provably own).
 const baselines = new Map<number, { repoKey: string; branch: string | null; head: string; original: string | null }>();
 const warnedDeviations = new Map<number, Set<string>>();
 const pendingBaseline = new Set<number>(); // lock contended at session_start → record on first tool_call
-// Branches THIS pid created via the M3 create-new/rename carve-outs, scoped by
+// Branches THIS pid renamed its own baseline to via the M3 rename carve-out,
+// scoped by
 // repoKey (#376 review fold-in): their LOCAL deletion stays allowed after the
 // ceremony return re-bases the baseline to main (git refuses deleting a branch
 // checked out anywhere, so a pid-owned local delete is collision-free). Scoped
 // per repo and marked only in the BASELINE repo, so an owned name from one
 // agent-infra checkout can never authorize a delete in another (review fold-in).
-// Never seeded from session state.
+// Never seeded from session state. (create-new is no longer marked — in-hub
+// create-new is blocked since #626 and never re-baselines.)
 const ownedBranches = new Map<number, Map<string, Set<string>>>();
 
 function _markOwned(pid: number, repoKey: string | null | undefined, branch: string) {
@@ -1548,13 +1552,13 @@ export default function (pi: ExtensionAPI) {
             // semantics); a baseline owned by another checkout must not
             // authorize a switch here.
             repoKey: muEff.repoKey,
-            // #598: branches this pid CREATED (create-new) or renamed its own
-            // baseline to are owned (the #543/#588 ownership check). The read
+            // #598: branches this pid renamed its own baseline to are owned
+            // (the #543/#588 ownership check). The read
             // is keyed on the MUTATION's repo (muEff.repoKey): _markOwned
             // writes under baseline.repoKey when the baseline repo IS the
             // mutation repo; with NO baseline, under muEff.repoKey; a baseline
-            // in a DIFFERENT repo records nothing (repo-scoped — the create-
-            // new/rename _markOwned calls below guard on repoKey equality).
+            // in a DIFFERENT repo records nothing (repo-scoped — the rename
+            // _markOwned call below guards on repoKey equality).
             // The rename arm requires baseline.repoKey === repoKey, so for the
             // rename allow-path the muEff.repoKey read is the write key — the
             // own-baseline rename carve-out still holds when the dst is one of
@@ -1646,9 +1650,10 @@ export default function (pi: ExtensionAPI) {
           baselineBranch: baseline?.branch ?? null,
           targets,
           syncSource: det.syncSource,
-          // #376 review fold-in: branches this pid created (scoped to THIS
-          // repo) stay locally deletable after the ceremony return re-bases the
-          // baseline (own-branch hygiene).
+          // #376 review fold-in: branches this pid renamed its own baseline
+          // to (scoped to THIS repo) stay locally deletable after the ceremony
+          // return re-bases the baseline (own-branch hygiene). create-new is
+          // never marked — it is blocked since #626 and never re-baselines.
           ownedBranches: ownedBranches.get(pid)?.get(eff.repoKey ?? ""),
         })) {
           // #443: det.pushTargets describe ONLY the first push invocation. A

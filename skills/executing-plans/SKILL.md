@@ -219,9 +219,16 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
 **If worktree is needed:** Invoke `using-git-worktrees` skill once, in the controller session. If already inside an existing worktree, skip.
 
 **If plain branch is acceptable:**
+> ⛔ Guard note (#626): in-hub `git checkout -b` is BLOCKED in every repo — the shared
+> main checkout must never be flipped (agent-infra's #99 exemption was removed in #615;
+> the M3 create-new carve-out was removed in #626). The "plain branch" shortcut applies
+> only when you are ALREADY inside a worktree; in a hub, create an isolated worktree first
+> (using-git-worktrees skill; agent-infra: `bash scripts/checkout-hygiene/hub-worktree.sh feat/issue-<N>-<slug>`).
 1. Run `git status --porcelain` to check for uncommitted changes
 2. If changes exist on main: `git stash push -m "pre-<branch>-wip"` (optional for Low risk with no TS changes)
-3. `git checkout -b feat/issue-<N>-<slug>`
+3. Create the branch INSIDE a worktree — invoke `using-git-worktrees` (agent-infra:
+   `bash scripts/checkout-hygiene/hub-worktree.sh feat/issue-<N>-<slug>`). Do NOT run
+   `git checkout -b` in a hub — it is BLOCKED (#626).
 4. **Dirty-state guard** (worktree only): Check for uncommitted changes that look like partial implementation. If found, surface options but default to reset-and-re-execute. Do NOT silently overwrite partial state.
 
 **Pre-warming typecheck (proportional):** Run `npx tsc --noEmit` in background when changes touch `.ts`/`.tsx` files. Skip for non-code or config-only changes. When run, start before Step 1 to eliminate cold-start latency — by the time the plan is reviewed, typecheck is already complete or failing fast.
