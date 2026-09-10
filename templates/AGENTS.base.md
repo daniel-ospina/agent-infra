@@ -223,6 +223,47 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
 - **Never use `git add -A`** — always stage specific files.
 - **Prefer the `edit` tool over `write`** for targeted changes to existing files.
 
+### Mutation-Testing Restore Protocol (#664)
+
+A review-fix loop, a guard check, or any "verify the tripwire goes RED" step may
+require **deliberately mutating** a file — or a whole tree — to prove a guard
+actually fires. The **restore** step is where uncommitted work dies silently: a
+working-tree discard restores the file to its **index/HEAD** state, not to "the
+state before my mutation", so inside a fix round it deletes the very work the
+mutation was verifying. The suite still passes afterwards (it tests the reverted
+file against the reverted expectations) — **nothing announces the loss.** It
+happened twice in one session (#640: a `ci.yml` `concurrency` group and a
+`frontmatter-validate.mjs` 121→122 relabel were reverted and almost lost).
+
+**The rule — restoring after a deliberate mutation:**
+
+1. **Never restore with a working-tree discard.** Do not use a discard of the file
+   <!-- mutation-restore-ok: naming the forbidden form in order to forbid it (#664) -->
+   under test (`git checkout -- <path>`, `git restore <path>`, `git checkout .`) as
+   the post-mutation restore. It is not a restore — it is a revert to HEAD.
+2. **In-place edit → back the file up first, restore by copy.**
+   ```sh
+   cp path/to/file /tmp/file.bak      # BEFORE mutating
+   # ... mutate, run the suite, confirm RED ...
+   cp /tmp/file.bak path/to/file      # restore
+   shasum path/to/file                # confirm the pre-mutation hash
+   ```
+3. **Whole-tree probe → work in an isolated copy, never in the working tree.**
+   ```sh
+   TMP="$(mktemp -d)"; git archive HEAD | tar -x -C "$TMP"; cd "$TMP"
+   # ... run the suite here ...
+   cd - >/dev/null && rm -rf "$TMP"
+   ```
+   The copy carries committed-at-HEAD content only — that is exactly the point
+   when the probe is against a committed guard.
+4. **Prefer a harness over ad-hoc shell.** A mutation harness that snapshots and
+   restores from a backup is preferred to hand-rolled `perl -pi` + copy-back loops.
+
+`scripts/check-skill-mutation-restore.mjs` enforces rule 1 across `AGENTS.md` and
+`skills/**/*.md`. Prose that must *name* the forbidden command (this rule included)
+carries an explicit `<!-- mutation-restore-ok: <reason> -->` pragma on that line or
+the line directly above; the reason is what makes the exception reviewable.
+
 ## Tool Quality & Retirement
 
 - **Two-strikes rule:** If any pipeline tool or script requires >1 manual-fix cycle per use, file a retirement issue. Don't accumulate patches.

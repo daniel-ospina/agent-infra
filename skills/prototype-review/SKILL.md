@@ -138,6 +138,12 @@ If issues found:
 3. Re-run the diff: `git diff main -- <affected files> > <diff path>`
 4. Next cycle reviews the updated diff
 
+**Deliberate-mutation restore (#664):** if a fix round mutates a file (or the diff) to prove a
+check/guard fires, restore per the AGENTS.md **Mutation-Testing Restore Protocol** —
+`cp <file> /tmp/<name>.bak` before the mutation, `cp` back after. Never use a working-tree
+discard as the restore: it reverts to HEAD and silently destroys the uncommitted prototype
+fix the mutation was verifying.
+
 ### Phase 3 — Loop Control
 
 | Condition | Action |

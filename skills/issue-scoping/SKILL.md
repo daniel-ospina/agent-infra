@@ -908,6 +908,12 @@ Dispatch isolated confidence scorer per issue. Issues < 50 → `[LOW-CONFIDENCE]
 
 Each review cycle dispatches FRESH `task` sub-agents.
 
+**Deliberate-mutation restore (#664):** if a fix round proves a guard fires by mutating a
+file, restore per the AGENTS.md **Mutation-Testing Restore Protocol** — `cp <file>
+/tmp/<name>.bak` before the mutation, `cp` back after, `shasum` to confirm. Never use a
+working-tree discard as the restore: it reverts to HEAD and silently destroys uncommitted
+review work. A whole-tree probe runs in `git archive HEAD | tar -x -C <tmp>`.
+
 **Exit conditions (ALL must be true):**
 - [ ] Last reviewer response: "NO ISSUES FOUND" (verbatim)
 - [ ] If cycle 1 found issues → at least 1 re-review cycle completed

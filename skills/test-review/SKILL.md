@@ -398,6 +398,8 @@ RULES:
 3. PRESERVE STRUCTURE: keep AAA pattern, test names, file structure intact.
    
 4. LOG CHANGES: for each fix, note what changed and why. Include research sources.
+   
+5. DELIBERATE-MUTATION RESTORE (only if you mutate a test/file to prove a guard fires): follow the AGENTS.md Mutation-Testing Restore Protocol — `cp <file> /tmp/<name>.bak` BEFORE the mutation, `cp` the backup back AFTER, `shasum` to confirm. A working-tree discard (the `git` checkout/restore verbs) is FORBIDDEN: it reverts to HEAD and silently destroys uncommitted work the mutation was verifying (#664).
 ```
 
 ### Phase 4 — Gate Loop — MANDATORY

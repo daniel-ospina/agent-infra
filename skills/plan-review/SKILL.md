@@ -356,6 +356,7 @@ RULES:
 5. GOOD > EASY RESOLUTION (MANDATORY): For every `good-easy` flag, EITHER fix the plan to the Good alternative OR record an explicit deferral in the plan doc:
    `Deferred: <easy path chosen> — Good alternative: <name> — Cost: <effort/time/risk> — Rationale: <why deferred — time-box, external constraint, dependency>`
    A deferral without a named Good alternative + cost + rationale is not a deferral — it is an unresolved flag. Keep it open and surface it to the human.
+6. DELIBERATE-MUTATION RESTORE (only if you mutate a file to prove a guard fires): follow the AGENTS.md Mutation-Testing Restore Protocol — `cp <file> /tmp/<name>.bak` BEFORE the mutation, `cp` the backup back AFTER. A working-tree discard (the `git` checkout/restore verbs) is FORBIDDEN: it reverts to HEAD and silently destroys uncommitted plan work the mutation was verifying (#664).
 
 Return the COMPLETE updated plan doc, followed by:
 

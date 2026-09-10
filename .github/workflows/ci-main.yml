@@ -37,6 +37,10 @@ jobs:
         # #254 — frontmatter validator fixture-regression (post-merge, ci-main)
         echo "== scripts/check-skill-lint.test.mjs =="
         node scripts/check-skill-lint.test.mjs || failures=$((failures+1))
+        # #664 — mutation-testing restore protocol guard: fixture suite proves a
+        # planted working-tree-discard violation is RED and the live tree GREEN.
+        echo "== scripts/check-skill-mutation-restore.test.mjs =="
+        node scripts/check-skill-mutation-restore.test.mjs || failures=$((failures+1))
         for t in extensions/*/test*.mjs; do
           [ -f "$t" ] || continue
           echo "== $t =="
@@ -162,6 +166,12 @@ jobs:
             exit 1
           fi
           echo "✅ All scripts validated"
+      - name: Mutation-testing restore protocol guard (#664)
+        # No agent-facing skill or AGENTS.md may prescribe a working-tree discard
+        # (checkout -- <path> / restore <path>) as the way to restore after a
+        # deliberate mutation — it reverts to HEAD and silently destroys the
+        # uncommitted work the mutation was verifying.
+        run: node scripts/check-skill-mutation-restore.mjs
       - name: Validate bash scripts + run installer tests (#304)
         run: |
           errors=0

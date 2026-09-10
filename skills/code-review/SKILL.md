@@ -876,8 +876,34 @@ For each cycle:
    3. For each issue, make the minimal fix (using research findings)
    4. Commit with message: fix(code-review): automated fixer cycle N — PR #<N>
    5. Push
+   6. DELIBERATE-MUTATION RESTORE (only if you mutate a file to prove a guard fires): follow the
+      AGENTS.md Mutation-Testing Restore Protocol — `cp <file> /tmp/<name>.bak` BEFORE the mutation,
+      `cp` the backup back AFTER. A working-tree discard (the `git` checkout/restore verbs) is FORBIDDEN:
+      it reverts to HEAD and silently destroys the uncommitted fix work the mutation was verifying
+      (#664; the #640 incident).
    
    Return FILES_WRITTEN: <comma-separated> and STATUS: done|failed.
+   ```
+
+   **Worked example — proving a guard fires without losing the fix** (AGENTS.md
+   **Mutation-Testing Restore Protocol**, #664):
+
+   ```sh
+   cp scripts/frontmatter-validate.mjs /tmp/fv.bak   # 1. back up BEFORE mutating
+   perl -pi -e 's/121/122/' scripts/frontmatter-validate.mjs
+   node scripts/check-skill-lint.test.mjs            # 2. confirm RED
+   cp /tmp/fv.bak scripts/frontmatter-validate.mjs   # 3. restore by copy (never a discard)
+   shasum scripts/frontmatter-validate.mjs           # 4. confirm the pre-mutation hash —
+                                                     #    uncommitted work survives
+   ```
+
+   For a whole-tree probe (a committed guard), never probe in the working tree —
+   run the suite in an isolated copy and throw it away:
+
+   ```sh
+   TMP="$(mktemp -d)"; git archive HEAD | tar -x -C "$TMP"; cd "$TMP"
+   node scripts/check-skill-lint.test.mjs    # suite runs against HEAD content
+   cd - >/dev/null && rm -rf "$TMP"
    ```
 
 2. **Re-review**: Run `--re-review` on the new commits. This dispatches FRESH reviewer
