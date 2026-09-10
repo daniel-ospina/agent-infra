@@ -144,8 +144,18 @@ two **views**:
   the latest `renderedAt ≤ ts`. Used for **historical attribution** (comparing against a frozen stamp). pi can
   hold one scalar per id; that is its schema, not a choice. **`render(ts)` is *defined*-total (a row always
   exists), not *match*-total** — see below.
-- **`renderNow()`** — the rate that **should** be in the card **today**, i.e. the row whose period covers today
-  (`effectiveFrom ≤ today < expiresOn`), regardless of `renderedAt`. This is the key the **generator** uses and
+- **`renderNow()`** — the rate that **should** be in the card **today**. Selection rule, stated in full because
+the predicate is load-bearing:
+  1. **Tombstone rows are always emitted.** A row carrying `expiresOn` (id retirement) is emitted regardless of
+     the date — it is never selected *away*, and a still-dispatched id therefore never silently reverts to a base
+     layer (D2).
+  2. Among an id's **non-tombstone** rows whose period covers today (`effectiveFrom ≤ today`, and either
+     `periodEnd` is null or `today < periodEnd`), the one with the **latest `effectiveFrom`** wins. `renderedAt`
+     is irrelevant to this key.
+  3. If every row for an id is a tombstone, the tombstone row is emitted as-is.
+
+  **`periodEnd` bounds a period; `expiresOn` retires an id.** They are different fields precisely so the
+  selection predicate above can be stated without ambiguity. This is the key the **generator** uses and
   the key render-equality BLOCKs against, and it is what makes pre-registration actually work: a row appended
   with `effectiveFrom: 2026-09-14` needs **no write, no owner and no trigger** — the next time `render.py` runs
   in write mode on or after that date, it selects that row and the file changes. (v6 wiring fix: without a
@@ -153,7 +163,7 @@ two **views**:
   never land.) A row with `renderedAt: null` is therefore excluded from `render(ts)` but **included** in
   `renderNow()` once its `effectiveFrom` arrives.
 - **`vendor(ts)`** — the tier- and date-correct rate for `ts` (peak/off-peak via `peakWindows[]`, periods via
-  `effectiveFrom`/`expiresOn`).
+  `effectiveFrom`/`periodEnd`).
 
 **The two views are the measurement**, and every disagreement has one cause and one owner:
 
@@ -191,7 +201,7 @@ log/display; `evaluateTermination` takes no cost input). Its job is the record, 
 only *consistency*. **C ("disclaim first-party price; consume upstream")** is falsified four times over: E1
 (stamps $0), E5 (store is peak → 2× over-report off-peak), E4 (shipped snapshot inert), and coverage (the
 store lists neither the 102k-call id nor the fleet default). C's two good ideas survive: an explicit
-`expiresOn` **in the data** marking a superseded period, and owning only the corrections we must — applied
+`periodEnd` **in the data** marking a superseded period, and owning only the corrections we must — applied
 **per id** rather than wholesale.
 
 **Why the hybrid is not two mechanisms doing one job:** if both views derive from the same wrong ledger, the
@@ -216,7 +226,8 @@ cannot do this (no memory of yesterday); a store comparison cannot (history-less
 { "provider": "deepseek",
   "model": "deepseek-v4-flash",
   "effectiveFrom": "2026-08-17T00:00:00Z",   // vendor axis
-  "expiresOn": null,                          // optional; marks a superseded period (data only)
+  "periodEnd": null,                         // bounds THIS period (data only); does not remove the row
+  "expiresOn": null,                          // ID RETIREMENT tombstone only — see §3.1; one id carries it
   "offPeak": {"input":0.15, "output":0.60, "cacheRead":0.003, "cacheWrite":0},
   "peakMultiplier": 2,
   "peakWindows":[{"days":["Mon","Tue","Wed","Thu","Fri"],"startUtc":"01:00","endUtc":"04:00"},
@@ -257,16 +268,16 @@ Rules that make the guard work:
   2,830 records. It carries **two** rows: the pre-correction `0.22/0.66/0.007` (renderedAt = Sep-9 edit) and the
   current one at HEAD. **Only the HEAD row is the rendered card**; the pre-correction row exists so history is
   priced and the Δ is computable.
-- **A past `expiresOn` never removes a row from the render.** It marks a superseded period; the renderer keeps
-  emitting the own row (otherwise a still-dispatched id silently reverts to a base layer — D2).
-- **`expiresOn` has two distinct roles, and the renderer must not conflate them.** For a **period** row it bounds
-  the period (`effectiveFrom`…`expiresOn`); for the **tombstone** row (`…expires-on-0910`) it marks id retirement.
-  Both are data; neither removes a row.
-- **`renderNow()` selection rule (explicit):** among rows whose period covers today, the one with the **latest
-  `effectiveFrom`** wins; `renderedAt` is irrelevant to this key. This resolves the `v4-pro` case, where the
-  first period is never explicitly terminated and a tie-break would otherwise be unspecified — and the first
-  period's `expiresOn` is **set** to `2026-09-14T04:00:00Z` rather than left null, so the two periods are
-  disjoint by construction.
+- **A past `expiresOn` never removes a row from the render.** It marks id retirement; the renderer keeps
+  emitting the own row regardless of the date (otherwise a still-dispatched id silently reverts to a base layer —
+  D2). See the `renderNow()` selection rule in §2 for the full predicate.
+- **`periodEnd` and `expiresOn` are different fields, and the renderer must not conflate them.** `periodEnd`
+  bounds a **period** (`effectiveFrom`…`periodEnd`); `expiresOn` marks **id retirement** on the tombstone row
+  (`…expires-on-0910`) — the **only** id carrying it (§3.5, §7.3, WS1.3). Neither removes a row.
+- **`renderNow()` selection rule (explicit):** see §2 — tombstone rows are always emitted; among an id's
+  non-tombstone rows whose period covers today, the latest `effectiveFrom` wins. This resolves the `v4-pro`
+  case: its first period gets `periodEnd: 2026-09-14T04:00:00Z` (not an `expiresOn`), so the two periods are
+  disjoint by construction and the tie-break is never ambiguous.
 - **`tierKey` is not in the row key** (v6). `tiers` are mirrored in the ledger for fidelity, but the re-pricer
   is **window-level** (§3.2): a dispatched id with `tiers` is flagged `tiered: unmodelled` and reported, never
   silently mis-priced. This removes the per-request bucketing machinery entirely.
@@ -344,8 +355,9 @@ diff is **one-directional**: *corpus id ⊄ fixture* is **drift (loud)**; a *fix
 difference on every run, which is how "loud" becomes ignored. **Canonical scope (single source of truth):** the
 fixture lists **dispatched ids the repo owns** — deepseek-served ids plus the `ALIAS_FAMILIES` legs. Rendered
 **literals** for non-dispatched ids (`anthropic/claude-opus-4.8`, `venice/deepseek-v4-flash`) are **not** in the
-fixture; they are covered by render-equality across the four surfaces plus assertion 4. §3.2, AC1 and AC3 all
-refer to this definition. `surface: upstream` ids are excluded by
+fixture; they are covered by render-equality across the four surfaces plus assertion 4. **AC3** matches this
+definition exactly; **AC1's grep set is a superset** of it (it also covers the rendered literals), so the two are
+consistent but not identical. `surface: upstream` ids are excluded by
 design; **compaction rows are excluded** (they carry no `provider`/`model`). In Slice 0 the fixture is a plain
 **id set** — nothing else needs it until WS3 lands. The **card-aware** detail (one entry per `(id, observed
 price triple)` with `firstSeen`/`lastSeen` and a count) is a **WS3.3** artifact feeding the divergent-card
@@ -377,7 +389,7 @@ case remains a **unit test of the guarded branch**, not a production path.
 - **`kind`** separates `message` from `compaction` rows (compaction records carry no `provider`/`model`);
   parity is asserted against `msg_cost_total` **and** `comp_cost_total` separately.
 - **`ratePeriod`** is `(periodKey, peak|offpeak)`: `periodKey` is the ledger period covering the record
-  (`effectiveFrom`…`expiresOn`) and the second element is resolved from the ledger's `peakWindows[]` against
+  (`effectiveFrom`…`periodEnd`) and the second element is resolved from the ledger's `peakWindows[]` against
   the record timestamp. A Δ window is therefore a group-by, not a per-record join, and still resolves one rate.
 - **`cacheWrite1h`** is carried so the Anthropic long-cache-write 2× term is reproducible in the same group-by.
 
@@ -434,7 +446,7 @@ that directory from **explicit basename allowlists**. So:
 | retired but accepted, dispatched | `deepseek-v4-flash` | **own row** (`aliasOf: deepseek-flash`, **no** `expiresOn`) | deleting it reverts to pi-ai July; it is still dispatched and billed, so it must **never** expire |
 | in no base layer, dispatched (live default) | `deepseek-v4.1-flash-expires-on-0910` | **own row + the only `expiresOn` tombstone** (`aliasOf: deepseek-flash`), and migrate the **shipped** `defaultModel` off it | only `models[]` can create an id; **this is the single id that carries `expiresOn`** |
 | vendor's current id, dispatched | `deepseek-flash` | **own row** | closes D4 (else the store's peak applies) |
-| exact-id shadow of a store row | `deepseek-v4-pro` | **own row** + pre-registered second period from `2026-09-14T04:00:00Z` | the date-gate changes the rate, not the id |
+| exact-id shadow of a store row | `deepseek-v4-pro` | **own row** + pre-registered second period from `2026-09-14T04:00:00Z` (the first period gets `periodEnd: 2026-09-14T04:00:00Z`) | the date-gate changes the rate, not the id |
 | **failover hop legs** (`extensions/shared/provider-failover.ts` `ALIAS_FAMILIES`) | `qwen-tp/deepseek-v4-flash-0731`, `qwen-tp/deepseek-v4-pro`, `openrouter/deepseek/deepseek-v4-flash`, **`openrouter/deepseek/deepseek-v4-pro`** | **rendered per leg**, keyed by *leg provider*; the renderer emits **one entry per `ALIAS_FAMILIES` leg**, not from a hand-written list | these are **byte-identical to the 7,124 primary-identity stamps** (`0.2608/0.7825/0.0083`) and to the extension's `deepseek-v4-pro` literal (`0.435/0.87/0.003625`); `qwen-tp` is `DEFAULT_BLOCKED_PROVIDERS`-gated but config-re-enableable, so a hand-listed set would silently drift out of sync |
 | non-DeepSeek literal in a rendered surface | `anthropic/claude-opus-4.8` (OpenRouter extension `5/25`), `venice/deepseek-v4-flash` (`0.14/0.28/0.03`) | render from the ledger with `surface: vendor-vendor` | AC1 greps these files, so they must be either rendered or explicitly declared out of scope |
 | clamp-only, never dispatched | `-vision-exp`, `-0813`, `~…latest` | **`modelOverrides`** | no duplication |
@@ -500,7 +512,8 @@ rather than renumbered, so earlier review cycles' references stay traceable.)
 - **WS3 — Dated history + report re-pricing.** 3.1 `--usage-rows` with parity pinned against `parse_sessions`
   (`msg_cost_total` + `comp_cost_total`). 3.2 the **window-level** re-pricer (§3.2) + unit tests incl. a
   synthetic `tiers` case for the `tiered: unmodelled` branch and a `cacheWrite1h` case. 3.3 `fleet-cost-report.sh`
-  — **additive** section: frozen vs render- vs vendor-priced, the Δ **per (id × period) window**, the
+  — **additive** section: frozen vs render- vs vendor-priced, the Δ **per (id × `ratePeriod`) window** (where
+  `ratePeriod = (periodKey, peak|offpeak)` — the peak axis is required for the Δ to be exact, see §3.2), the
   open-ended divergent-card report; it **consumes** WS2.1's ledger header line rather than re-emitting it;
   **existing threshold lines stay
   byte-identical**. 3.4 `session-postmortem.sh`'s fallback literal → a ledger read (satisfies assertion 4).
@@ -584,7 +597,7 @@ decoration); hand-editing the postmortem fallback reddens assertion 4; a past `e
    listed explicitly as declared-out-of-scope rather than left to be "fixed" by a future reader.
 2. `--check` is wired into pre-commit + both CI workflows and exits non-zero on a hand-edit to **any of the 4
    rendered surfaces**, and on failure of **every BLOCK-class assertion** in §3.2's table (the `$0` landmine,
-   dispatched-id own-row, structural equality, coverage fixture present, and the `defaultModel` resolution
+   dispatched-id own-row, the AC1 repo-grep, structural equality, coverage fixture present, and the `defaultModel` resolution
    assertion).
 3. **In shipped mode**: the coverage fixture is present and the ledger covers every id it lists (**BLOCK**;
    absent fixture ⇒ error, never a silent pass). **In live mode**: the corpus id set is **diffed
@@ -687,7 +700,8 @@ Every touch point the plan creates or consumes, with its owner. **⚠️** marks
 | `scripts/fleet-cost-report.sh` — Δ sections, threshold byte-identity | consumer | #703 (WS3.3) | ✅ |
 | `scripts/session-postmortem.sh` — fallback literal → ledger read | consumer | #701 (WS3.4, moved there) | ✅ |
 | `docs/ops/rate-card-policy.md` + its registration (`docs/ops/cost-config-policy.md` cross-link + `AGENTS.md` routing line) | docs | #704 (WS5.1) | ✅ |
-| `extensions/custom-provider-openrouter/index.test.ts` (new) + its CI invocation | guard | #702 (WS2.3) | ✅ |
+| `extensions/custom-provider-openrouter/index.test.ts` (new) | artifact | #701 (WS1.2) | ✅ |
+| its CI invocation | guard | #702 (WS2.3) | ✅ |
 | `scripts/check-cost-config.sh` — matcher extended to the post-migration ids | guard | #701 (WS1.3, load-bearing for AC12) | ✅ |
 | shared session parser (#373 one-parser contract) — `--usage-rows` | contract | #703 (WS3.1/WS3.2) | ✅ |
 | issue #634 — `peakWindows[]`/`peakMultiplier` contract | cross-issue contract | #704 (WS5.3) | ✅ |
