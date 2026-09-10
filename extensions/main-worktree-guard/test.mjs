@@ -4385,6 +4385,14 @@ try {
     has("printf y | tee $'tracked.md'", "tee:H/tracked.md", "tee ANSI-C target in a pipeline");
     has("trap echo\\ x\\ \\>tracked.md EXIT", "redirect:H/tracked.md", "trap escaped unquoted action is walked");
     lacks("echo x > \"MEMORY\\.md\"", "redirect:H/MEMORY.md", "dq backslash before a non-special char stays literal");
+    // #625 review cycle-9: tee quote-awareness, line continuations
+    has("printf y | tee $\"tracked.md\"", "tee:H/tracked.md", "locale-quoting tee target decodes");
+    has("printf y | tee track$'ed'.md", "tee:H/tracked.md", "ANSI-C concat tee target");
+    lacks("tee \"$'tracked.md'\"", "tee:H/tracked.md", "dq-wrapped ANSI-C is literal in bash");
+    lacks("printf y | tee safe.txt # $'tracked.md'", "tee:H/tracked.md", "a tee comment is not a target");
+    lacks("printf y | tee safe$'\\n'tracked.md", "tee:H/tracked.md", "decoded whitespace cannot inject a token");
+    has("echo x > tracked\\\n.md", "redirect:H/tracked.md", "backslash-newline is a line continuation");
+    has("printf y | tee tracked\\\n.md", "tee:H/tracked.md", "tee line continuation is not truncated");
     // truncate / dd
     has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
     has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");

@@ -4494,7 +4494,8 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
         // literal (cycle-8 P2/P3: over-stripping false-positived on paths
         // like "MEMORY\.md").
         if (q === '"' && ch === "\\" && k + 1 < n && "\"\\$`\n".includes(s[k + 1])) {
-          w += s[k + 1]; k += 2; continue;
+          if (s[k + 1] !== "\n") w += s[k + 1];   // backslash-newline is a line continuation
+          k += 2; continue;
         }
         if (ch === q) q = null; else w += ch; k++;
         continue;
@@ -4513,7 +4514,7 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       }
       if (ch === "$" && s[k + 1] === '"') { q = '"'; k += 2; continue; }   // $"…" == "…"
       if (ch === "'" || ch === '"') { q = ch; k++; continue; }
-      if (ch === "\\") { if (k + 1 < n) { w += s[k + 1]; k += 2; continue; } }
+      if (ch === "\\") { if (k + 1 < n) { if (s[k + 1] !== "\n") w += s[k + 1]; k += 2; continue; } }
       w += ch; k++;
     }
     return { w, k };
@@ -5983,7 +5984,35 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // slice from the END of the tee word (a quote-led or path-qualified tee
     // starts earlier than +3 — cycle-30 P2-1/P2-2)
     const teeWordEnd = t.end ?? t.idx + 3;
-    const rawWords = _tokenize(s.slice(teeWordEnd, lim).replace(/\$'((?:[^'\\]|\\.)*)'/g, (mm, inner) => _ansiTranslate(inner)));
+    // Tee positionals are read with the same quote-aware `readWord` as every
+    // other write route, so `$'…'`/`$"…"` decode correctly, an apostrophe or
+    // a space inside `$'…'` cannot split the word, ANSI-C escapes cannot inject
+    // whitespace into the token stream, and a trailing `# comment` is dropped
+    // (#625 cycle-9 A-P3 / B-P2). A word starting with `#` at a word boundary
+    // begins a comment; operators/redirections end the tee segment.
+    const rawWords = [];
+    {
+      let p = skipWs(teeWordEnd);
+      while (p < lim) {
+        const c = s[p];
+        if (c === "#" && (p === 0 || /[\s;&|(\n]/.test(s[p - 1]))) break;
+        if (c === ";" || c === "&" || c === "|" || c === "(" || c === ")" || c === "\n") break;
+        if (c === ">" || c === "<" || (c >= "0" && c <= "9")) {
+          let rp = p;
+          while (rp < lim && s[rp] >= "0" && s[rp] <= "9") rp++;
+          if (rp < lim && (s[rp] === ">" || s[rp] === "<")) {
+            while (rp < lim && "<>&|".includes(s[rp])) rp++;
+            const ao = readWord(skipWs(rp));
+            p = ao.k > rp ? ao.k : rp + 1;
+            continue;
+          }
+        }
+        const w = readWord(p);
+        if (w.k <= p) { p++; continue; }
+        if (w.w !== "") rawWords.push(w.w);
+        p = skipWs(w.k);
+      }
+    }
     // ALL non-flag positionals are write targets (echo x | tee a.md b.md).
     // cycle-16 P2 + cycle-29 (review): a heredoc header `tee f <<EOF` feeds
     // tee from the BODY — drop `<<` and the DELIMITER word only; positionals
