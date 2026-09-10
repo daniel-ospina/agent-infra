@@ -37,7 +37,7 @@ aboutObjects: agent-infra, issue-631, pi-config, models-store, cost-config-polic
 >
 > **Also corrected here:** the §2 alias table omitted **`deepseek-v4.1-flash-expires-on-0910`** — the fleet's live
 > `defaultModel` (2,830 calls as of 2026-09-10; an earlier draft of this artifact said 2,256 — the corpus grew
-during the session — see the plan §0 for the measurement date and method), which exists in **no** base layer. And §5's open question Q5 (the `setup.sh` merge
+> during the session — see the plan §0 for the measurement date and method), which exists in **no** base layer. And §5's open question Q5 (the `setup.sh` merge
 > semantics) is answered: see **#682**.
 >
 > Plan of record: `docs/plans/2026-09-10-issue-631-rate-card-governance.md`.

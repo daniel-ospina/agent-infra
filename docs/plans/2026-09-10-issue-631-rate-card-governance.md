@@ -51,9 +51,13 @@ aboutObjects: agent-infra, issue-631, issue-634, issue-701, issue-702, issue-703
 **⚠️ Capped at 4 cycles — 3 representative items remain (unverified).** On cap the AGENTS.md procedure applies:
 "document remaining issues … proceed". The coherence check and the wiring check were therefore run **post-cap**,
 i.e. the Phase 5.6 precondition ("after solution-verify converges clean") was **knowingly not met** — recorded
-here rather than glossed. Everything applied **after** the cap (the coherence-check v6 cuts *and* the wiring-check
-v6.1 fixes) was never re-reviewed, so it is **unverified**. Cycle 4's own fixes were likewise applied without a
-re-review. The convergence log above carries the full list; the three highest-consequence items are:
+here rather than glossed. No further **solution-verify** cycle ran after cycle 4; the v6 cuts were reviewed
+only by the Phase-6 wiring check (which found a v6 defect — five unpropagated template references), and the
+v6.1 fixes have not been re-reviewed at all. On the cap citation: AGENTS.md states a **per-reviewer** 4-cycle
+cap, and cycles 3–4 were single fresh reviewers, so this is a **global** cycle-stop rather than a per-reviewer
+cap being hit — the disclosure is deliberately conservative in the direction of "less verified", not more.
+Cycle 4's own fixes were likewise applied without a re-review. The convergence log above carries the full list;
+the three highest-consequence items are:
 
 1. **The `render(ts)` / `renderNow()` split** (§2, §3.1) — introduces a second render key (wiring-check fix).
 2. **The 4th rendered surface** (`providers.<p>.models[]` for `qwen-tp`/`venice`) (wiring-check fix).
@@ -255,6 +259,14 @@ Rules that make the guard work:
   priced and the Δ is computable.
 - **A past `expiresOn` never removes a row from the render.** It marks a superseded period; the renderer keeps
   emitting the own row (otherwise a still-dispatched id silently reverts to a base layer — D2).
+- **`expiresOn` has two distinct roles, and the renderer must not conflate them.** For a **period** row it bounds
+  the period (`effectiveFrom`…`expiresOn`); for the **tombstone** row (`…expires-on-0910`) it marks id retirement.
+  Both are data; neither removes a row.
+- **`renderNow()` selection rule (explicit):** among rows whose period covers today, the one with the **latest
+  `effectiveFrom`** wins; `renderedAt` is irrelevant to this key. This resolves the `v4-pro` case, where the
+  first period is never explicitly terminated and a tie-break would otherwise be unspecified — and the first
+  period's `expiresOn` is **set** to `2026-09-14T04:00:00Z` rather than left null, so the two periods are
+  disjoint by construction.
 - **`tierKey` is not in the row key** (v6). `tiers` are mirrored in the ledger for fidelity, but the re-pricer
   is **window-level** (§3.2): a dispatched id with `tiers` is flagged `tiered: unmodelled` and reported, never
   silently mis-priced. This removes the per-request bucketing machinery entirely.
@@ -268,12 +280,16 @@ fix — the fourth closes a real gap the wiring check found):
 1. `pi-bootstrap/pi-config/models.json` → `providers.deepseek.models[]` — **own rows for dispatched ids only**,
    emitted by **read-modify-writing the previous row** so structure is preserved (E7), never built from `cost`
    alone. The guard is a **diff** (WS1.5), not a template.
-1b. `pi-bootstrap/pi-config/models.json` → `providers.<p>.models[]` for **any non-deepseek provider carrying an
-   `own-row` / `vendor-vendor` / `subscription` ledger row** — i.e. `qwen-tp` (`deepseek-v4-flash-0731`
-   `0.2608/0.7825/0.0083`, `deepseek-v4-pro` `0.7825/2.3475/0.0261`) and `venice` (`deepseek-v4-flash`
-   `0.14/0.28/0.03`). These live at a path surfaces 1–3 did **not** cover, so without 1b they stayed **unowned,
-   unguarded price copies** — precisely the D1 shape this issue exists to remove — and AC1's grep would still
-   find them.
+1b. `pi-bootstrap/pi-config/models.json` → `providers.<p>.models[]` for the **named non-deepseek providers that
+already carry a full `models[]` row** — i.e. `qwen-tp` (`deepseek-v4-flash-0731` `0.2608/0.7825/0.0083`,
+   `deepseek-v4-pro` `0.7825/2.3475/0.0261`) and `venice` (`deepseek-v4-flash` `0.14/0.28/0.03`). These live at a
+   path surfaces 1–3 did **not** cover, so without 1b they stayed **unowned, unguarded price copies** —
+   precisely the D1 shape this issue exists to remove — and AC1's grep would still find them.
+   **`surface: subscription` is exempt.** The `qwen-token-plan*` providers carry only `modelOverrides` and **no**
+   `models[]` entries; rendering new rows for them would have no previous row to read-modify-write, which hits
+   **E7** (`modelFromJson` defaults `contextWindow` 128000 / `maxTokens` 16384 / `reasoning false`) and would
+   silently downgrade a provider this plan has no reason to touch. Subscription `$0` rows are declared in the
+   ledger and covered by assertion 4 + AC11, not rendered.
 2. `pi-bootstrap/pi-config/models.json` → `providers.<p>.modelOverrides{id}` — cost + `contextWindow` for
    clamp-only ids (the E2 surface: per-field merge, **no structural duplication**, so upstream's
    `thinkingLevelMap`/`compat` changes propagate).
@@ -302,6 +318,7 @@ runs in**:
 |---|---|---|
 | render-equality across the **4** surfaces | shipped-only | **BLOCK** |
 | `$0` landmine (no deepseek-served `models[]` row omits `cost`) | shipped-only | **BLOCK** |
+| **AC1 grep** — no USD cost literal for an owned id anywhere in `pi-bootstrap/pi-config/`, `extensions/`, `scripts/` outside the ledger and its rendered outputs | shipped-only | **BLOCK** (durable, not a one-time check — a future literal in any other script is otherwise unguarded) |
 | every **dispatched** id has an `own-row` (closes D4) | shipped-only | **BLOCK** |
 | a rendered own row differs from the **previously committed** row **only in `cost`** (E7; diff-based, no template) | shipped-only | **BLOCK** |
 | coverage fixture present, and ledger ⊇ the fixture's ids | shipped-only | **BLOCK** (errors when the fixture is absent — never a silent pass) |
@@ -324,9 +341,11 @@ cannot be detected there (there is no corpus to compare against), so shipped mod
 the **live** mode diffs the real corpus against the fixture and reports drift loudly. The live
 diff is **one-directional**: *corpus id ⊄ fixture* is **drift (loud)**; a *fixture-only* entry is
 **informational** (it is a declared-but-unused leg). A symmetric diff would report the same standing
-difference on every run, which is how "loud" becomes ignored. Scope: ids
-the repo **owns** — deepseek-served ids **plus every provider-failover leg it can dispatch to** (`qwen-tp/*`,
-`openrouter/deepseek/*`, and the extension's non-DeepSeek literal). `surface: upstream` ids are excluded by
+difference on every run, which is how "loud" becomes ignored. **Canonical scope (single source of truth):** the
+fixture lists **dispatched ids the repo owns** — deepseek-served ids plus the `ALIAS_FAMILIES` legs. Rendered
+**literals** for non-dispatched ids (`anthropic/claude-opus-4.8`, `venice/deepseek-v4-flash`) are **not** in the
+fixture; they are covered by render-equality across the four surfaces plus assertion 4. §3.2, AC1 and AC3 all
+refer to this definition. `surface: upstream` ids are excluded by
 design; **compaction rows are excluded** (they carry no `provider`/`model`). In Slice 0 the fixture is a plain
 **id set** — nothing else needs it until WS3 lands. The **card-aware** detail (one entry per `(id, observed
 price triple)` with `firstSeen`/`lastSeen` and a count) is a **WS3.3** artifact feeding the divergent-card
@@ -334,23 +353,32 @@ report; building it in Slice 0 would be idle machinery. Zero-usage rows (2,382 e
 `stopReason: error` with `output = input = 0`) yield **no triple** and are skipped rather than dividing by zero.
 
 **Report re-pricer — the shared parser** (the #373 one-parser contract) gains `--usage-rows`, emitting rows
-keyed `(provider, model, periodKey)` with `{kind, input, output, cacheRead, cacheWrite, cacheWrite1h,
-costFrozen}`.
+keyed `(provider, model, ratePeriod)` — where **`ratePeriod = (periodKey, peak|offpeak)`** — with
+`{kind, input, output, cacheRead, cacheWrite, cacheWrite1h, ratePeriod, costFrozen}`.
+
+> **Why the peak axis is not optional (code-review round 3, P1).** `vendor(ts)` is **peak-aware** by design
+> (§2: 2× inside `peakWindows[]`, 01:00–04:00 and 06:00–10:00 UTC Mon–Fri). The ledger `periodKey` spans
+> multiple days, so a group-by on `(provider, model, periodKey)` alone cannot resolve a **single**
+> `vendor_rate` — roughly a fifth of records sit in a peak window and would be priced at the wrong rate. The
+> emitted rows therefore carry the peak discriminator, and the Δ group-by splits on it. Without this, AC9's
+> "exact" claim is false.
 
 **Scope honesty (v6 simplification, from the second-model coherence check):** the re-pricer computes a
-**window-level Δ**, not per-request re-billing. Within one rendered period the card is constant *by
-definition*, so `Δ = Σ tokens × (vendor_rate − render_rate)` over a `(provider, model, period)` group is
-**exact** for every model we actually dispatch (none of which has `tiers`). The earlier design — per-request
-tier bucketing, a `tierKey` in the row key, a full `calculateCost` clone — was machinery for a case that does
-not occur, carrying risk 6 (silent divergence if pi's formula changes) for a number with **no decision
-consumer**. If a tiered model is ever dispatched, the row is **flagged `tiered: unmodelled`** and reported as
-such rather than silently mis-priced; the synthetic `tiers` case becomes a **unit test of the guarded branch**,
-not a production path.
+**window-level Δ**, not per-request re-billing. Within one `(period, peak|offpeak)` bucket the card is constant
+*by definition*, so `Δ = Σ tokens × (vendor_rate − render_rate)` over a `(provider, model, ratePeriod)` group is
+**exact** for every model we actually dispatch (none of which has `tiers`). Two stated carve-outs: (i) a
+**divergent-card window** (two live cards, §2) is *not* exact — it is reported as an open finding, and the Δ
+for records inside it is computed against the **dominant** card and labelled as such; (ii) a **tiered** model is
+flagged `tiered: unmodelled` rather than guessed. The earlier design — per-request tier bucketing, a `tierKey`
+in the row key, a full `calculateCost` clone — was machinery for a case that does not occur, carrying risk 6
+(silent divergence if pi's formula changes) for a number with **no decision consumer**. The synthetic `tiers`
+case remains a **unit test of the guarded branch**, not a production path.
 
 - **`kind`** separates `message` from `compaction` rows (compaction records carry no `provider`/`model`);
   parity is asserted against `msg_cost_total` **and** `comp_cost_total` separately.
-- **`periodKey`** is the ledger period covering the record (`effectiveFrom`…`expiresOn`), so a Δ window is a
-  group-by rather than a per-record join.
+- **`ratePeriod`** is `(periodKey, peak|offpeak)`: `periodKey` is the ledger period covering the record
+  (`effectiveFrom`…`expiresOn`) and the second element is resolved from the ledger's `peakWindows[]` against
+  the record timestamp. A Δ window is therefore a group-by, not a per-record join, and still resolves one rate.
 - **`cacheWrite1h`** is carried so the Anthropic long-cache-write 2× term is reproducible in the same group-by.
 
 The re-pricer computes the Δ and **never** overwrites `usage.cost`.
@@ -434,13 +462,18 @@ rather than renumbered, so earlier review cycles' references stay traceable.)
     `aliasOf` and no expiry, because it is still dispatched); **extend `check-cost-config.sh`'s matcher** to the new canonical ids
     (`deepseek-flash`, `deepseek-v4.1-*`) so the migrated fleet does not fall outside the clamp guard.
   - 1.4 delete `pi-bootstrap/pi-config/models-store.json` (inert per E4; `setup.sh` no-ops when absent).
-  - 1.5 **structural templates** — committed per-id `{contextWindow, maxTokens, reasoning, input,
-    thinkingLevelMap, compat, tiers}` so rows are read-modify-written. **v6 — guard simplified** (coherence
-    check): committed templates were a **second hand-authored source** to keep in sync with pi's `modelFromJson`,
-    for a risk that read-modify-write largely removes. The guard is now **(a)** the rendered row must differ from
-    the previously committed row **only in `cost`** (a diff-based assertion — no template to maintain), and
-    **(b)** the **new** `deepseek-flash` id gets one hand-written full row (it has no previous row to preserve).
-    `cost` is compared against the **rendered ledger value**.
+  - 1.5 **own-row structure guard** (the v6 replacement for the cut templates). Committed per-id structure for
+    the rows that have no predecessor, and a **diff assertion with a defined baseline**: the reference is the
+    row as committed at **`git show HEAD:<file>`**, not the working-tree file (otherwise render-equality is a
+    tautology and a structural hand-edit is undetectable). The rendered row must differ from that baseline
+    **only in `cost`**; `cost` is compared against the **rendered ledger value**. Rows with no predecessor get a
+    hand-written full row (see (b) below), since read-modify-write cannot preserve structure that does not exist.
+
+    **(b) full-row specs required for the two new ids:** `deepseek-flash` and
+    `deepseek-v4.1-flash-expires-on-0910` are **both absent** from every base layer (bundled catalog, repo
+    `models.json`, shipped store), so neither has a previous row: each needs an explicit full row
+    (`contextWindow`, `maxTokens`, `reasoning`, `input`, `thinkingLevelMap`, `compat`) or an explicit statement
+    that it mirrors the other's row. AC6's diff assertion is scoped to rows **with** a predecessor.
 - **WS2 — Guards + wiring.** 2.1 pre-commit (**the repo's own `.husky/pre-commit`** — not
   `templates/.husky/pre-commit`: a consumer's `scripts/` is a symlink with no local `pi-bootstrap/pi-config/`,
   so a template-level render check would redden every consumer commit) + a **`rates` job in `ci.yml`** + a
@@ -458,7 +491,12 @@ rather than renumbered, so earlier review cycles' references stay traceable.)
   so a later refactor that drops the rates loop fails CI instead of silently starving the report. 2.2 the class split of §3.2 (BLOCK vs WARN vs
   live-only, with explicit non-silent skips). 2.3 `tests/rates/run.sh` mirroring `tests/cost-config/run.sh`
   **and wired into both CI workflows** (the #447/#449 lesson: a suite that runs nowhere is not a gate), with the
-  fixture-clobber guard `git diff --quiet -- tests/fixtures/rates`.
+  fixture-clobber guard `git diff --quiet -- tests/fixtures/rates`. **The extension test is wired here too:**
+  `ci-main.yml`'s extension loops glob `extensions/*/test*.mjs` and `extensions/shared/*.test.ts`, so a new
+  `extensions/custom-provider-openrouter/index.test.ts` matches **neither** and would run nowhere — it needs an
+  explicit invocation (e.g. `npx tsx extensions/custom-provider-openrouter/index.test.ts` in the
+  `extension-tests` job's `test-command`) or to be invoked from `tests/rates/run.sh`. The same gap exists for
+  the sibling `custom-provider-qwen/provider.test.ts`.
 - **WS3 — Dated history + report re-pricing.** 3.1 `--usage-rows` with parity pinned against `parse_sessions`
   (`msg_cost_total` + `comp_cost_total`). 3.2 the **window-level** re-pricer (§3.2) + unit tests incl. a
   synthetic `tiers` case for the `tiered: unmodelled` branch and a `cacheWrite1h` case. 3.3 `fleet-cost-report.sh`
@@ -466,6 +504,8 @@ rather than renumbered, so earlier review cycles' references stay traceable.)
   open-ended divergent-card report; it **consumes** WS2.1's ledger header line rather than re-emitting it;
   **existing threshold lines stay
   byte-identical**. 3.4 `session-postmortem.sh`'s fallback literal → a ledger read (satisfies assertion 4).
+  **NB: WS3.4 is delivered in Slice 0 by #701, not by #703** — see §12 and §14 (code-review round 3: the §4 list
+  was the last place still assigning it to WS3).
 - **WS5 — Policy + contract.** 5.1 `docs/ops/rate-card-policy.md`: the five layers, the per-id precedence
   table, the "never strip `cost`" rule, the **ad-hoc update procedure** (*"when you learn the price changed:
   append a dated row with the correct `effectiveFrom`, then refresh the farm — history re-prices itself"*), and
@@ -530,7 +570,7 @@ names `deepseek-v4-flash`'s second triple with its `firstSeen`/`lastSeen`, its d
 ≈21.6k records in the Sep-5→Sep-10 window vs 7,124) and its share — i.e. the instrument **detects the known
 defect and attributes it to the right cause**, which is the honest version of the earlier "Δ ≈ 0" criterion
 (that criterion was unachievable: two cards were live at once, so some mismatch is structural and expected); the
-tier Δ is consistent on peak hours (hour 03 UTC alone carries 5,347 calls, so the tier column is not
+**peak Δ** is consistent on peak hours (hour 03 UTC alone carries 5,347 calls, so the peak/off-peak split is not
 decoration); hand-editing the postmortem fallback reddens assertion 4; a past `expiresOn` is reported only.
 
 ## 9. Acceptance criteria
@@ -565,10 +605,13 @@ decoration); hand-editing the postmortem fallback reddens assertion 4; a past `e
    CI workflows stay green.
 8. The weekly report prints frozen, render-priced, vendor-priced, both Δs, the bounded stale window, the ledger
    path used, and its `asOf` age; the existing threshold lines are byte-identical to the pre-change output.
-9. The **window-level** re-pricer's Δ is exact per `(provider, model, period)` group (a group-by over token
-   totals × the rate delta — verified against `parse_sessions` totals within float epsilon). A dispatched id
-   carrying `tiers` is **reported as `tiered: unmodelled`**, never silently mis-priced; the synthetic `tiers`
-   case is a unit test of that guarded branch, not a production path.
+9. The **window-level** re-pricer's Δ is exact per `(provider, model, ratePeriod)` group — a group-by over token
+   totals × the rate delta, where `ratePeriod` **includes the peak/off-peak discriminator** (without it the Δ
+   cannot resolve a single `vendor_rate`, since `vendor(ts)` is peak-aware) — verified against `parse_sessions`
+   totals within float epsilon. **Carve-outs:** records inside a **divergent-card window** are priced against the
+   dominant card and labelled as an open finding (not exact); a dispatched id carrying `tiers` is **reported as
+   `tiered: unmodelled`**, never silently mis-priced, and the synthetic `tiers` case is a unit test of that
+   guarded branch.
 10. `pi-config/models-store.json` is deleted; no check BLOCKs on store contents.
 11. `docs/ops/rate-card-policy.md` documents the five layers, the per-id precedence table, the **ad-hoc update
     procedure including the farm refresh**, the "never strip `cost`" rule, the fixture-regeneration
@@ -644,6 +687,7 @@ Every touch point the plan creates or consumes, with its owner. **⚠️** marks
 | `scripts/fleet-cost-report.sh` — Δ sections, threshold byte-identity | consumer | #703 (WS3.3) | ✅ |
 | `scripts/session-postmortem.sh` — fallback literal → ledger read | consumer | #701 (WS3.4, moved there) | ✅ |
 | `docs/ops/rate-card-policy.md` + its registration (`docs/ops/cost-config-policy.md` cross-link + `AGENTS.md` routing line) | docs | #704 (WS5.1) | ✅ |
+| `extensions/custom-provider-openrouter/index.test.ts` (new) + its CI invocation | guard | #702 (WS2.3) | ✅ |
 | `scripts/check-cost-config.sh` — matcher extended to the post-migration ids | guard | #701 (WS1.3, load-bearing for AC12) | ✅ |
 | shared session parser (#373 one-parser contract) — `--usage-rows` | contract | #703 (WS3.1/WS3.2) | ✅ |
 | issue #634 — `peakWindows[]`/`peakMultiplier` contract | cross-issue contract | #704 (WS5.3) | ✅ |
