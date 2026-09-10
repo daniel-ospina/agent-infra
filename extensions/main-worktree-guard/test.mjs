@@ -4715,6 +4715,41 @@ try {
     cpv(`result = get("git")`) === "allow" && cpv(`// git reset --hard\nconsole.log(1)`) === "allow" &&
     cpv(`const h = \`x\ngit reset --hard\``) === "block", true);
 
+  // ── #627 code-review cycle-4 fold-in ──
+  // P1: a lone `git` argv element joined by `+`/splat, wrapper-prefixed command
+  // strings, and backtick/`$(` command substitution must all block.
+  expectBool("P627-46: lone-git concat/splat + wrapper strings + backtick substitution block",
+    cpv(`import subprocess; subprocess.run(["git"]+["reset","--hard"])`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["git", *["reset","--hard"]])`) === "block" &&
+    cpv(`import os; os.system("eval git reset --hard")`) === "block" &&
+    cpv(`import os; os.system("nice -n 5 git reset --hard")`) === "block" &&
+    cpv(`import os; os.system("nohup git reset --hard")`) === "block" &&
+    cpvCmd(`ruby -e 'puts \`git reset --hard\`'`) === "block" &&
+    cpvCmd("perl -e 'print `git reset --hard`'") === "block", true);
+  // P2: a generic method name on an UNKNOWN receiver is not a sink
+  // (`re.exec(s)`, `db.run('…')`); a spawn-specific name still is.
+  expectBool("P627-47: generic receiver methods stay inert; strong sink names block",
+    cpv(`const m = /x/.exec("git reset --hard")`) === "allow" &&
+    cpv(`db.run("git reset --hard")`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(["ls"]); regex.exec("git reset --hard")`) === "allow" &&
+    cpv(`const cp=require('child_process'); cp.execSync('git reset --hard')`) === "block" &&
+    cpv(`const cp=require('child_process'); cp['execSync']('git reset --hard')`) === "block", true);
+  // P4: case folding applies only to case-insensitive CLIs — ruby's `-E utf8`
+  // must not collapse onto the `-e` payload flag.
+  expectBool("P627-48: ruby -E is an encoding operand, not the -e payload",
+    cp(`ruby -E utf8 script.rb`)?.kind === "file" && cp(`ruby -E utf8 script.rb`)?.value === "script.rb", true);
+  // P3: AppleScript `do shell script` handling is scoped to AppleScript-shaped
+  // payloads (a Python comment/docstring mentioning it stays inert).
+  expectBool("P627-49: do shell script blocks only in an AppleScript-shaped payload",
+    cpv(`import subprocess\n# osascript -e 'do shell script "git reset --hard"'\nsubprocess.run(["ls"])`) === "allow" &&
+    cpv(`import subprocess\ndef f():\n  """do shell script "git reset --hard" """\n  subprocess.run(["ls"])`) === "allow" &&
+    cpv(`do shell script "git reset --hard"`) === "block", true);
+  // P3: a compound kwarg value is skipped as ONE expression (balanced brackets),
+  // not three tokens.
+  expectBool("P627-50: compound kwarg values are skipped cleanly",
+    cpv(`import subprocess; subprocess.run(["git","branch","-a"], env={"A":"1"})`) === "allow" &&
+    cpv(`import subprocess, os; subprocess.run(["git","branch","-a"], cwd=os.path.join("a","b"))`) === "allow", true);
+
   // #628 hubNewFileVolumeVerdict — pure boundaries + source pins (index.ts).
   expectBool("P628-1: volume verdict boundaries",
     hubNewFileVolumeVerdict(1) === "warn" &&
