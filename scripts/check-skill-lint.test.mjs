@@ -14,8 +14,13 @@
  *   (e) extraction-edge fixtures (BOM/CRLF/`---abc`/indented-`---`/
  *       missing-closing/empty) — verdict + extraction-mirror assertions
  *   (f) name≠dir with quoted-name regression (quote-aware data)
- *   (g) 121-tree sweep: validator over skills/ → ZERO findings
- *   (h) pin lockstep: every extension @earendil-works/pi-* pin == PI_VERSION_PIN
+ *   (g) 122-tree sweep: validator over skills/ → ZERO findings
+ *   (h) pin lockstep: every extension @earendil-works/pi-* pin == PI_VERSION_PIN,
+ *       with a roster assertion (coverage, not mere presence)
+ *   (i) mirror provenance stamps: every present-tense pi-version stamp in the
+ *       hand-synced mirror surfaces equals PI_VERSION_PIN (the #637 escape class)
+ *   (j) per-PR wiring: ci.yml binds a non-empty test-command to an input that
+ *       node-ci.yml actually declares (the silent-unplug class)
  *
  * Repo-convention harness: node:assert, custom test() with ✅/❌ markers,
  * process.exit(1) on failure (load-gate.test.mjs pattern). Assertion markers
@@ -341,30 +346,119 @@ section("extension pi-package pins lockstep with PI_VERSION_PIN");
 test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN", () => {
   const extDir = path.join(REPO_ROOT, "extensions");
   const offenders = [];
-  let matched = 0;
+  const contributing = [];
   for (const entry of fs.readdirSync(extDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const pkgPath = path.join(extDir, entry.name, "package.json");
     if (!fs.existsSync(pkgPath)) continue;
     const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+    let hit = false;
     for (const field of ["dependencies", "devDependencies"]) {
       for (const [name, ver] of Object.entries(pkg[field] ?? {})) {
         if (!name.startsWith("@earendil-works/pi-")) continue;
-        matched++;
+        hit = true;
         if (ver !== PI_VERSION_PIN) {
           offenders.push(`extensions/${entry.name}/package.json (${field}): ${name}@${ver}`);
         }
       }
     }
+    if (hit) contributing.push(entry.name);
   }
-  assert.ok(
-    matched > 0,
-    "no @earendil-works/pi-* pins found under extensions/*/package.json — the tripwire would pass vacuously"
+  // Roster, not just presence: `matched > 0` would stay green if coverage
+  // collapsed 6 pins → 1 (a devDep consolidation, a workspace move, a package
+  // dropping its pin). Assert WHICH extensions must contribute, so losing one
+  // is red rather than silent. Update this list deliberately when the set of
+  // pi-package-pinning extensions changes.
+  assert.deepEqual(
+    contributing.sort(),
+    ["review-enforcer", "subagent", "verification-gate"],
+    "the set of extensions that pin @earendil-works/pi-* packages changed — " +
+      "the tripwire's coverage moved (add the new extension here only after " +
+      "confirming its pins are pinned to PI_VERSION_PIN)"
   );
   assert.equal(
     offenders.length,
     0,
     `pin drift vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
+  );
+});
+
+// ── (i) mirror provenance stamps (#637 escape class) ───────────────────────
+// The 2026-08-10 escape was a hand-synced *provenance stamp*, not a pin:
+// docs/providers.md and extensions/custom-provider-qwen/index.ts asserted verification against a pi
+// release the repo had already moved past while PI_VERSION_PIN had moved on, and the claim stayed
+// wrong for 12 days. (h) cannot see those files. These stamps are
+// present-tense verification claims, so assert each equals the pin — and that
+// every listed surface still contributes a match, or the guard would no-op
+// silently after a rewording. Version-specific line references are deliberately
+// NOT asserted here: they move within a version and must be re-derived by hand.
+section("mirror provenance stamps match PI_VERSION_PIN");
+
+test("hand-synced pi-version stamps equal PI_VERSION_PIN", () => {
+  const MIRRORS = [
+    { file: "docs/providers.md", re: /Verified against pi (\d+\.\d+\.\d+) internals/g },
+    {
+      file: "extensions/custom-provider-qwen/index.ts",
+      re: /verified against pi-ai (\d+\.\d+\.\d+) dist/g,
+    },
+    { file: "scripts/frontmatter-validate.mjs", re: /\(pi v(\d+\.\d+\.\d+)/g },
+    { file: ".github/workflows/ci-main.yml", re: /runtime version \((\d+\.\d+\.\d+)\)/g },
+  ];
+  const offenders = [];
+  const starved = [];
+  for (const { file, re } of MIRRORS) {
+    const src = fs.readFileSync(path.join(REPO_ROOT, file), "utf8");
+    const found = [...src.matchAll(re)].map((m) => m[1]);
+    if (found.length === 0) starved.push(file);
+    for (const v of found) if (v !== PI_VERSION_PIN) offenders.push(`${file}: ${v}`);
+  }
+  assert.deepEqual(
+    starved,
+    [],
+    "these mirror surfaces no longer carry the expected stamp — the guard would " +
+      `pass vacuously (rewording? update the pattern deliberately):\n  ${starved.join("\n  ")}`
+  );
+  assert.deepEqual(
+    offenders,
+    [],
+    `stale provenance stamps vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
+  );
+});
+
+// ── (j) per-PR wiring is not silently unplugged ────────────────────────────
+// #637 wires the suite into the PR path with `with: test-command:` → the
+// reusable node-ci.yml, which SKIPS the unit-test job when that input is empty
+// or unrecognised. Renaming or mistyping the input yields a GREEN PR with zero
+// pin check — the exact defect #637 exists to close — and actionlint cannot
+// catch it (it cannot resolve a remote @main reusable workflow, so an unknown
+// input still lints clean). Assert the binding on both sides.
+section("per-PR pin gate is wired (not silently skipped)");
+
+test("ci.yml binds a non-empty test-command that node-ci.yml declares", () => {
+  const caller = fs.readFileSync(
+    path.join(REPO_ROOT, ".github", "workflows", "ci.yml"),
+    "utf8"
+  );
+  const callee = fs.readFileSync(
+    path.join(REPO_ROOT, ".github", "workflows", "node-ci.yml"),
+    "utf8"
+  );
+  const line = caller.split("\n").find((l) => /^\s+test-command:\s*\S/.test(l));
+  assert.ok(
+    line,
+    "ci.yml no longer passes a non-empty `test-command` to node-ci.yml — the " +
+      "per-PR pin gate would be silently skipped"
+  );
+  const cmd = line.replace(/^\s+test-command:\s*/, "").trim();
+  assert.match(
+    cmd,
+    /check-skill-lint\.test\.mjs/,
+    `ci.yml test-command no longer runs the pin-lockstep suite: ${cmd}`
+  );
+  assert.ok(
+    /^\s+test-command:\s*$/m.test(callee),
+    "node-ci.yml no longer declares a `test-command` workflow_call input — the " +
+      "caller's binding would be ignored and the unit-test job skipped"
   );
 });
 
