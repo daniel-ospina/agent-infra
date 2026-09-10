@@ -6,7 +6,8 @@
 #   2. models.json drift (deepseek id > 300K)      → BLOCK (exit 1)
 #      (positive controls: the v4-pro family, the legacy v4-flash alias, the
 #      canonical deepseek-flash id + its future bare `deepseek-pro`
-#      counterpart, dotted deepseek-v4.1 ids, provider-suffixed `:` shapes;
+#      counterpart, dotted deepseek-v4.1 ids, `:`-suffixed (routing-tier)
+#      shapes;
 #      negative controls: deepseek-proxy / deepseek-flashlight — V4.1 Flash
 #      adoption 2026-09-10)
 #   3. models-store.json drift                     → WARN (exit 0, DETECTED —
@@ -47,6 +48,14 @@ GUARD="$ROOT/scripts/check-cost-config.sh"
 FIX="$ROOT/tests/fixtures/cost-config"
 OUT="$(mktemp /tmp/cost-config-out.XXXXXX)"
 failures=0
+
+# Single source of truth: read the clamp out of the guard rather than hardcoding
+# it here, so the fixture assertions cannot drift from the enforced value.
+CLAMP_EXPECTED="$(sed -n 's/^CLAMP=\([0-9][0-9]*\)$/\1/p' "$GUARD" | head -1)"
+if [ -z "$CLAMP_EXPECTED" ]; then
+  echo "❌ could not read CLAMP= from $GUARD — the fixture controls assert against it."
+  exit 1
+fi
 
 # Guard: never modify fixtures. Fail early if the fixture tree is dirty
 # (same clobber-protection as tests/drift/run.sh).
@@ -209,87 +218,141 @@ done
 
 echo ""
 echo "14. fixture invariants: bounded per-tree delta + non-vacuous controls"
-python3 - "$FIX" <<'PY' >"$OUT" 2>&1
-import json, sys, os
-fix = sys.argv[1]
+python3 - "$FIX" "$CLAMP_EXPECTED" <<'PY' >"$OUT" 2>&1
+import json, os, re, sys
 
-# Each backdoor tree must differ from clean in EXACTLY its one injected defect.
-EXPECTED = {
-    "backdoor-settings": ({'.compaction.enabled', '.compaction.keepRecentTokens',
-                           '.compaction.reserveTokens'}, 0),
-    "backdoor-retry": ({'.retry.maxRetries'}, 0),
-    "backdoor-compaction-disabled": ({'.compaction.enabled'}, 0),
-    "backdoor-store": (set(), -1),  # defect = pre-#476 curated snapshot (store must differ)
-}
+fix, clamp = sys.argv[1], int(sys.argv[2])
+DS = re.compile(r'^deepseek-(?:v4(?:\.\d+)?-)?(?:flash|pro)(?:[-:]|$)')
 
-def leaves(o, p=""):
-    if isinstance(o, dict):
-        for k, v in o.items():
-            yield from leaves(v, f"{p}.{k}")
-    elif isinstance(o, list):
-        for i, v in enumerate(o):
-            yield from leaves(v, f"{p}[{i}]")
-    else:
-        yield p, o
+def norm(i):
+    return re.sub(r'^~?[^/]*/', '', i) if '/' in i else i
 
-def load(p):
-    return dict(leaves(json.load(open(p))))
+def scanned(node):
+    """Normalized id -> MAX effective contextWindow across every row the guard
+    scans: model entries with a co-located id+contextWindow, and
+    modelOverrides-style keys. Max (not first) so a 1M control row cannot be
+    masked by an under-clamp row for the same normalized id."""
+    found = {}
+    def note(k, ctx):
+        n = norm(k)
+        if n not in found or ctx > found[n]:
+            found[n] = ctx
+    def walk(n):
+        if isinstance(n, dict):
+            if isinstance(n.get('id'), str) and isinstance(n.get('contextWindow'), int):
+                note(n['id'], n['contextWindow'])
+            for k, v in n.items():
+                if isinstance(v, dict) and isinstance(v.get('contextWindow'), int):
+                    note(k, v['contextWindow'])
+                walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+    walk(node)
+    return found
+
+def sdiff(a, b, p=""):
+    """Structural diff: records added/removed keys and container changes, so an
+    added empty object/array cannot hide from a leaf-only comparison."""
+    out = set()
+    if type(a) is not type(b):
+        return {p}
+    if isinstance(a, dict):
+        for k in set(a) | set(b):
+            if k not in a or k not in b:
+                out.add(f"{p}.{k}")
+            else:
+                out |= sdiff(a[k], b[k], f"{p}.{k}")
+    elif isinstance(a, list):
+        if len(a) != len(b):
+            out.add(p)
+        for i, (x, y) in enumerate(zip(a, b)):
+            out |= sdiff(x, y, f"{p}[{i}]")
+    elif a != b:
+        out.add(p)
+    return out
+
+
+
+def check(cond, msg):
+    print(("PASS " if cond else "FAIL ") + msg)
+    return 0 if cond else 1
 
 fails = 0
-clean = {f: load(os.path.join(fix, "clean", f))
-         for f in ("models.json", "settings.json", "models-store.json")}
-for tree, (exp_settings, exp_store) in EXPECTED.items():
-    d = {f: load(os.path.join(fix, tree, f))
-         for f in ("models.json", "settings.json", "models-store.json")}
-    bad = []
-    if d["models.json"] != clean["models.json"]:
-        bad.append("models.json differs")
-    keys = set(d["settings.json"]) | set(clean["settings.json"])
-    got = {k for k in keys
-           if d["settings.json"].get(k, "<missing>") != clean["settings.json"].get(k, "<missing>")}
-    if got != exp_settings:
-        bad.append(f"settings.json delta {sorted(got)}")
-    keys = set(d["models-store.json"]) | set(clean["models-store.json"])
-    nst = sum(1 for k in keys
-              if d["models-store.json"].get(k, "<missing>") != clean["models-store.json"].get(k, "<missing>"))
-    if (nst > 0) != (exp_store == -1) or (exp_store >= 0 and nst != exp_store):
-        bad.append(f"models-store.json delta {nst}")
-    if bad:
-        print(f"FAIL {tree} differs from clean outside its single injected defect: {'; '.join(bad)}")
-        fails += 1
-    else:
-        print(f"PASS {tree} differs from clean only in its documented defect")
+files = ("models.json", "settings.json", "models-store.json")
+raw = {t: {f: json.load(open(os.path.join(fix, t, f))) for f in files}
+       for t in ("clean", "backdoor-settings", "backdoor-retry",
+                 "backdoor-compaction-disabled", "backdoor-store",
+                 "backdoor-models", "backdoor-minified")}
+clean = raw["clean"]
 
-# Near-miss negative controls must be PRESENT, else the absence assertions are vacuous.
-REQUIRED = {
-    "backdoor-models": ["deepseek-proxy", "deepseek-flashlight", "deepseek-pro",
-                        "deepseek-v4-flash", "deepseek-flash", "deepseek-v4.1-flash",
-                        "deepseek-v4.1-flash-expires-on-0910", "deepseek-v4-pro",
-                        "deepseek-v4-pro:batch", "deepseek-flash:batch"],
-    "backdoor-minified": ["deepseek-proxy", "deepseek-flashlight", "deepseek-pro",
-                          "deepseek-v4-flash", "deepseek-flash", "deepseek-v4.1-flash",
-                          "deepseek-v4.1-flash-expires-on-0910", "deepseek-v4-pro",
-                          "deepseek-v4-pro:batch", "deepseek-flash:batch"],
+# Each backdoor tree must differ from clean in EXACTLY its one injected defect.
+# models: "same" | "differs"; settings: exact structural-delta set;
+# store: "same" | "differs".
+EXPECTED = {
+    "backdoor-settings": ("same", {".compaction"}, "same"),
+    "backdoor-retry": ("same", {".retry.maxRetries"}, "same"),
+    "backdoor-compaction-disabled": ("same", {".compaction.enabled"}, "same"),
+    "backdoor-store": ("same", set(), "differs"),
+    "backdoor-models": ("differs", set(), "same"),
+    "backdoor-minified": ("differs", set(), "same"),
 }
-for tree, ids in REQUIRED.items():
-    blob = json.dumps(json.load(open(os.path.join(fix, tree, "models.json"))))
-    missing = [i for i in ids if json.dumps(i) not in blob]
-    if missing:
-        print(f"FAIL {tree} is missing control id(s) {missing} — its assertions are vacuous")
-        fails += 1
-    else:
-        print(f"PASS {tree} carries all {len(ids)} positive + negative control ids")
+for tree, (want_models, want_settings, want_store) in EXPECTED.items():
+    bad = []
+    dm = sdiff(clean["models.json"], raw[tree]["models.json"])
+    ds = sdiff(clean["settings.json"], raw[tree]["settings.json"])
+    dt = sdiff(clean["models-store.json"], raw[tree]["models-store.json"])
+    if (dm != set()) != (want_models == "differs"):
+        bad.append(f"models.json delta {sorted(dm)}")
+    if ds != want_settings:
+        bad.append(f"settings.json delta {sorted(ds)} (want {sorted(want_settings)})")
+    if (dt != set()) != (want_store == "differs"):
+        bad.append(f"models-store.json delta {len(dt)} path(s)")
+    fails += check(not bad,
+                   f"{tree} differs from clean only in its documented defect"
+                   + (f": {'; '.join(bad)}" if bad else ""))
+# The compactment defect must be a MISSING block, not a present-but-wrong one.
+sett = raw["backdoor-settings"]["settings.json"]
+fails += check(isinstance(sett.get("compaction"), dict) is False,
+               "backdoor-settings defect kind is a MISSING compaction block (guard's "
+               "not-a-dict branch stays covered)")
 
-store = json.dumps(json.load(open(os.path.join(fix, "backdoor-store", "models-store.json"))))
-for ctl in ("deepseek-chat-v3.2", "kimi-k3", "~deepseek/deepseek-v4-flash-latest",
-            "deepseek-v4-flash-vision-exp"):
-    if ctl in store:
-        print(f"PASS backdoor-store carries control {ctl}")
-    else:
-        print(f"FAIL backdoor-store is missing control {ctl} — test 3's absence assertion is vacuous")
-        fails += 1
+# Controls must exist as SCANNED id rows (not just appear somewhere in the file),
+# and sit ABOVE the clamp — otherwise the absence assertions prove nothing.
+POSITIVE = ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-flash", "deepseek-v4.1-flash",
+            "deepseek-v4.1-flash-expires-on-0910", "deepseek-v4-pro:batch",
+            "deepseek-flash:batch", "deepseek-pro"]
+NEGATIVE = ["deepseek-proxy", "deepseek-flashlight"]
+for tree in ("backdoor-models", "backdoor-minified"):
+    ids = scanned(raw[tree]["models.json"])
+    miss = [i for i in POSITIVE if i not in ids or ids[i] <= clamp]
+    fails += check(not miss,
+                   f"{tree} carries every positive control as a scanned id over the clamp"
+                   + (f" — missing/under-clamp: {miss}" if miss else ""))
+    miss = [i for i in NEGATIVE if i not in ids or ids[i] <= clamp]
+    fails += check(not miss,
+                   f"{tree} carries every negative control as a scanned id over the clamp "
+                   f"(so the matcher really had to reject it)"
+                   + (f" — missing/under-clamp: {miss}" if miss else ""))
+    wrong = [i for i in NEGATIVE if DS.match(norm(i))]
+    fails += check(not wrong, f"{tree} negative controls are genuinely non-matching ids {wrong}")
+
+ids = scanned(raw["backdoor-store"]["models-store.json"])
+for ctl in ("deepseek-chat-v3.2", "kimi-k3"):
+    fails += check(ids.get(norm(ctl), 0) > clamp and not DS.match(norm(ctl)),
+                   f"backdoor-store control {ctl} is a scanned, over-clamp, non-matching row "
+                   f"(test 3's absence assertion is meaningful)")
+for ctl in ("~deepseek/deepseek-v4-flash-latest", "deepseek-v4-flash-vision-exp"):
+    fails += check(ids.get(norm(ctl), 0) > clamp and DS.match(norm(ctl)),
+                   f"backdoor-store control {ctl} is a scanned, over-clamp, matching row "
+                   f"(test 3's detection assertion is meaningful)")
+
 sys.exit(1 if fails else 0)
 PY
+py=$?
+if grep -q "Traceback" "$OUT"; then fail "test 14 checker crashed — see traceback above"; fi
+if ! grep -qE '^(PASS|FAIL) ' "$OUT"; then fail "test 14 checker produced no PASS/FAIL lines (exit $py) — see traceback above"; fi
+if [ "$py" -ne 0 ] && ! grep -q '^FAIL ' "$OUT"; then fail "test 14 checker exited $py without a FAIL line"; fi
 while IFS= read -r line; do
   case "$line" in
     PASS\ *) pass "${line#PASS }" ;;

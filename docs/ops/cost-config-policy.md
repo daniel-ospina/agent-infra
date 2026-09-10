@@ -91,9 +91,9 @@ data-source-discovery task — no persisted retry records exist to analyze yet.)
   (strips `provider/` / `~provider/`) and matches the canonical
   `deepseek-flash` (V4.1 Flash), its `deepseek-v4-flash` legacy alias, and the
   `deepseek-v4-pro` (future bare `deepseek-pro`) family — dotted `v4.1-*` ids,
-  `-0731`, `-vision-exp`, `-0813`, `-latest`, and any `:`-suffixed routing
-  shape (the `:` terminator catches provider-suffixed ids; `:batch` is the
-  fixture control for it) — so kimi-k3 and qwen3.8-max are never flagged
+  `-0731`, `-vision-exp`, `-0813`, `-latest`, and any `:`-suffixed
+  (routing-tier) shape — the `:` terminator catches those ids, and `:batch` is
+  the fixture control for it — so kimi-k3 and qwen3.8-max are never flagged
   (negative controls in the fixture suite).
 
   Rate-card note (2026-09-10): flash is off-peak 0.15 in / 0.60 out / 0.003

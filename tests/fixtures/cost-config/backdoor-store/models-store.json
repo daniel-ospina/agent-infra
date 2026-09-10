@@ -667,7 +667,7 @@
         "input": [
           "text"
         ],
-        "contextWindow": 163840,
+        "contextWindow": 1048576,
         "maxTokens": 65536
       }
     ],
