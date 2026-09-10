@@ -37,6 +37,10 @@ jobs:
         # #254 — frontmatter validator fixture-regression (post-merge, ci-main)
         echo "== scripts/check-skill-lint.test.mjs =="
         node scripts/check-skill-lint.test.mjs || failures=$((failures+1))
+        # #668 — commit-msg mangle heuristic (runs the hook directly; husky
+        # is NOT installed in CI, #672).
+        echo "== scripts/commit-msg-check.test.sh =="
+        bash scripts/commit-msg-check.test.sh || failures=$((failures+1))
         for t in extensions/*/test*.mjs; do
           [ -f "$t" ] || continue
           echo "== $t =="

@@ -11,15 +11,10 @@ npx eslint --fix <relevant files>
 # Stage relevant files (specific paths, not git add -A)
 git add <relevant files>
 
-# Commit — write the message to a temp file, then commit with -F
-# ⛔ NEVER use `git commit -m "$(cat <<'EOF' ... EOF)"` heredocs. The pi bash
-#    wrapper re-processes the command string and breaks on backticks, `$()`,
-#    braces, or parens inside the message (`/bin/bash: bad substitution: no
-#    closing ')'` — observed twice, e.g. messages containing `{message,
-#    error_code}` or `over_email_send_rate_limit → ...`). Message content must
-#    never pass through bash args/substitution.
-# Write the message with the `write` tool (bypasses bash entirely) to a
-# deterministic path, then commit with -F and remove the file:
+# Commit — write the message with the `write` tool (it bypasses bash entirely)
+# to a deterministic path, then commit with -F and remove the file.
+# ⛔ NEVER `git commit -m "…"`. NEVER a heredoc. Both let the shell parse the
+#    message before git sees it — see "⛔ Commit messages" below.
 #   /tmp/commit-msg-<branch>.md
 #   <type>(<scope>): <subject>
 #
@@ -30,12 +25,84 @@ rm -f /tmp/commit-msg-<branch>.md
 
 **IMPORTANT — commit timeout:** Always run `git commit` **foreground** with `timeout: 300000` (5 minutes minimum). Never set `run_in_background: true` for `git commit`. Never use a timeout below 300 seconds. The pre-commit hook (lint-staged running ESLint on staged TS files) takes 20–90 seconds. Killing it mid-run orphans the lint-staged backup stash and leaves `.git/index.lock` behind — causing exit code 128 on every subsequent commit until the lock is manually removed. This timeout rule also applies to all fix-loop `git commit` calls in Steps 2 and 2.5.
 
+### ⛔ Commit messages: `-F` always — never `-m`, never a heredoc
+
+`git commit -m "…"` is the *same* hazard as the heredoc #194 banned — **the
+shell parses the message before git ever sees it.** Inside double quotes,
+backticked spans are command substitution, `$VAR`/`$(…)` expand, and `${…}` /
+`{{ }}` break. The substitution usually yields an **empty string**, so the
+failure is silent: git accepts the mangled message and only a human reading the
+log sees the hole. Both of these happened while landing #640 (#668):
+
+```sh
+# source message contains a backticked span
+#   … key matching via keyRe() which tolerates `key :` — and anchors …
+git commit -m "fix(ci): … keyRe() which tolerates \`key :\` — and anchors …"
+# COMMITTED AS (span eaten, silent):
+#   … keyRe() which tolerates  — and anchors …
+
+# the substitution actually runs:
+#   bash: key: command not found
+git commit -m "fix(ci): … set the binding to \`|| true\` …"
+```
+
+Both mangles were pushed before anyone noticed and each cost an `--amend` +
+force-push. Author the message with the **`write` tool** — it bypasses bash
+entirely, so nothing in the message is ever interpreted:
+
+```text
+write  /tmp/commit-msg-668.md
+
+  fix(commit-workflow): ban -m commit messages + flag mangled ones (#668)
+
+  `git commit -m "…"` lets the shell eat backticked spans before git sees
+  them: the message "which tolerates `key :` — and anchors" commits as
+  "which tolerates  — and anchors". New commit-msg hook warns on the
+  signature: unbalanced backticks or a doubled space where code should be.
+
+  Closes #668
+```
+
+```bash
+# then, in bash — the message never appears on the command line:
+git commit -F /tmp/commit-msg-668.md
+rm -f /tmp/commit-msg-668.md
+```
+
+`git commit -m` and heredocs are forbidden **everywhere** (commit messages, PR
+bodies, issue comments) — the rule is about the message crossing the shell, not
+about heredocs specifically.
+
+### Mangled commit message — repair
+
+The `.husky/commit-msg` hook warns when it sees the signature of a lost shell
+substitution (unbalanced backticks, or a doubled space where inline code should
+be). It is **warn-only** by default — both signatures have realistic false
+positives (a lone backtick in prose; an aligned code block) — so a warning is a
+prompt to *look*, not a failure. `COMMIT_MSG_MANGLE_STRICT=1` makes it fatal.
+
+On a hit:
+
+1. **Not pushed yet** — amend before anything else:
+   ```bash
+   # rewrite /tmp/commit-msg-<branch>.md with the `write` tool first
+   git commit --amend -F /tmp/commit-msg-<branch>.md
+   ```
+2. **Pushed, branch under review** — do **not** silently force-push the
+   rewritten message. Post a correction note on the PR/issue (what was wrong,
+   what it now says), *then* `git push --force-with-lease`. A silently rewritten
+   record is exactly what happened twice on #640; a visible correction is the
+   point.
+3. **Pushed, not under review** — `git commit --amend -F …` then
+   `git push --force-with-lease` is safe.
+
 ```bash
 # Push and open as DRAFT
 git push -u origin <branch>
-# ⛔ Same rule as the commit message: NEVER use `--body "$(cat <<'EOF' ...)"`
-#    heredocs — write the PR body to a temp file with the `write` tool and
-#    pass --body-file, then remove the file:
+# ⛔ Same rule as the commit message: never pass the PR body through the shell.
+#    `--body "…"` and `--body "$(cat <<'EOF' …)"` both let the shell eat
+#    backticked spans / expand `$()` and `{{ }}`. Write the PR body to a temp
+#    file with the `write` tool and pass --body-file, then remove the file:
 #   /tmp/pr-body-<branch>.md
 #   ## Summary
 #   - <bullet 1>
