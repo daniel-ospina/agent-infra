@@ -1540,11 +1540,9 @@ export function classifyGitCommandDetailed(command) {
     const args = stateInv.args;
     if (verb === "checkout" || verb === "switch") {
       out.branchState = true;
-      const flag = ["-B", "--orphan", "-b", "-c"].find((f) => args.includes(f));
-      if (flag) {
-        const idx = args.indexOf(flag);
-        out.newBranch = args[idx + 1] ?? null;
-      }
+      // #626: capture the branch across git's FULL create/force-create/orphan
+      // surface (attached shorts + long forms), not just exact `-b`/`-B` tokens.
+      out.newBranch = _checkoutCreateBranch(args);
     } else if (verb === "symbolic-ref" || verb === "update-ref") {
       const pos = args.filter((x) => !x.startsWith("-"));
       if ((verb === "symbolic-ref" && pos[0] === "HEAD") ||
@@ -2626,6 +2624,32 @@ function _branchPositionals(args) {
     pos.push(x);
   }
   return pos;
+}
+
+/**
+ * #626: the branch NAME created (or force-created/an orphan) by a checkout/switch
+ * argv, across git's full spelling surface — attached short clusters
+ * (`-bfoo`, `-fb foo`, `-cfoo`, `-Cfoo`) and long forms `--create[=v]` /
+ * `--force-create[=v]` / `--orphan[=v]`. Mirrors branch-ownership's
+ * _checkoutCreateOpt (kept duplicated — classify-git must not import
+ * branch-ownership, test pin C2/D2). Returns null when no create option is present.
+ */
+function _checkoutCreateBranch(args) {
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i];
+    if (x === "--") return null;
+    const long = /^--(orphan|create|force-create)(?:=(.*))?$/.exec(x);
+    if (long) return long[2] !== undefined ? long[2] : (args[i + 1] ?? null);
+    const sc = /^-(?!-)([A-Za-z]+)(.*)$/.exec(x);
+    if (sc) {
+      const k = sc[1].search(/[bBcC]/);
+      if (k !== -1) {
+        const attached = sc[1].slice(k + 1) + sc[2];
+        return attached.length > 0 ? attached : (args[i + 1] ?? null);
+      }
+    }
+  }
+  return null;
 }
 
 /**

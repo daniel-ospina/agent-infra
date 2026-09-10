@@ -143,9 +143,16 @@ touching the default-branch worktree. If Step B's remote delete reports
 > session that holds $PR_BRANCH therefore blocks its own remote delete). Run it
 > AFTER the worktree teardown (05-cleanup.md Step 3.8 → merged-branch cleanup,
 > which orders teardown first), or via `gh api -X DELETE
-> repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH`. The local `git branch -D` is
-> likewise deferred to after teardown — git itself refuses deleting a branch
-> checked out in this worktree.
+> repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH`.
+>
+> The local `git branch -D "$PR_BRANCH"` is best-effort: git itself refuses it
+> while the branch is checked out in this worktree (the guard's branch-force-delete
+> arm is worktree-exempt, but the git refusal stands), and after teardown the
+> HUB's main-checkout `block:branch-force-delete` gate blocks a branch that is
+> neither the session's baseline nor pid-owned — a branch created via `git worktree
+> add -b` is never recorded as owned (create-new is blocked, #626). Treat a block
+> as a WARN and leave the teardown note (05-cleanup's `||` fallback), or delete the
+> stale local ref manually (human terminal / `AGENT_ALLOW_MAIN_EDITS=1`).
 
 **Step C — obsolete (#376 ceremony return applied only to the #99 in-main flow):**
 

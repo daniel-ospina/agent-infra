@@ -994,6 +994,13 @@ dexpect("restore-from-branch verdict stays block:checkout-branch", `git checkout
   expectBool("#376: git checkout feat/other (≠ original) → blocked", foreign?.block === true, true);
   const prev = m3(`git checkout -`);
   expectBool("#376: git checkout - (prev-branch, ambiguous) → blocked", prev?.block === true, true);
+  // #626 review round-2 (P1): attached/cluster/long create spellings must NOT
+  // slip the #376 return-to-original arm (they previously classified
+  // switch-existing with target "main" → reBaseline while git created a branch).
+  for (const cmd of [`git checkout -bfoo main`, `git checkout -Bfoo main`, `git switch -cfoo main`, `git switch -Cfoo main`, `git switch --create=foo main`, `git switch --force-create=foo main`, `git checkout -fb foo main`]) {
+    const d = m3(cmd);
+    expectBool(`#626: ${cmd} → BLOCKED (no #376 reBaseline)`, d?.block === true && !d?.reBaseline, true);
+  }
   const nonInfra = sharedDecideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline: ceremonyBaseline, currentBranch: "feat/2", repoKey: "k" });
   expectBool("#376: non-infra repo return-to-original STILL blocked", nonInfra?.block === true, true);
   // Post-return local delete of the session's OWN merged branch: the index.ts

@@ -265,6 +265,20 @@ ok("branchOp: checkout -b", op("checkout", ["-b", "feat/x"]) === "create-new");
 ok("branchOp: switch -c", op("switch", ["-c", "feat/x"]) === "create-new");
 ok("branchOp: checkout -B", op("checkout", ["-B", "feat/x"]) === "force-create");
 ok("branchOp: checkout --orphan", op("checkout", ["--orphan", "x"]) === "orphan");
+// #626 review round-2 (P1): git's ATTACHED/cluster create spellings. Before the
+// fix these classified switch-existing (target = the start-point, e.g. "main"),
+// so the #376 return-to-original arm re-baselined while git CREATED a branch —
+// the #99 hole reopened. Every form must classify create/force-create/orphan.
+ok("branchOp #626: checkout -bfoo (attached) → create-new branch foo", (() => { const r = classifyBranchOp("checkout", ["-bfoo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: checkout -Bfoo (attached) → force-create branch foo", (() => { const r = classifyBranchOp("checkout", ["-Bfoo", "main"]); return r.op === "force-create" && r.branch === "foo"; })());
+ok("branchOp #626: switch -cfoo (attached) → create-new branch foo", (() => { const r = classifyBranchOp("switch", ["-cfoo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: switch -Cfoo (attached) → force-create branch foo", (() => { const r = classifyBranchOp("switch", ["-Cfoo", "main"]); return r.op === "force-create" && r.branch === "foo"; })());
+ok("branchOp #626: switch --create=foo → create-new (long = form)", (() => { const r = classifyBranchOp("switch", ["--create=foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: switch --create foo → create-new (long space form)", (() => { const r = classifyBranchOp("switch", ["--create", "foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: switch --force-create=foo → force-create", (() => { const r = classifyBranchOp("switch", ["--force-create=foo", "main"]); return r.op === "force-create" && r.branch === "foo"; })());
+ok("branchOp #626: checkout -fb foo (cluster, value = next argv) → create-new foo", (() => { const r = classifyBranchOp("checkout", ["-fb", "foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: checkout --orphan=foo → orphan branch foo", (() => { const r = classifyBranchOp("checkout", ["--orphan=foo"]); return r.op === "orphan" && r.branch === "foo"; })());
+ok("branchOp #626: switch -d (detach) stays other (no false create)", op("switch", ["-d"]) === "other");
 ok("branchOp: checkout -f", op("checkout", ["-f", "main"]) === "force");
 ok("branchOp: checkout --force → force", op("checkout", ["--force", "main"]) === "force");
 ok("branchOp: switch --discard-changes → force (never the #376 return)", op("switch", ["--discard-changes", "main"]) === "force");

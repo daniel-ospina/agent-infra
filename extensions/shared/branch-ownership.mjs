@@ -651,9 +651,17 @@ export function classifyBranchOp(subcmd, args) {
   if (subcmd === "checkout" || subcmd === "switch") {
     if (a.includes("--")) return { op: "other" };          // path-restore form
     const flag = (f) => a.includes(f);
-    if (flag("--orphan")) return { op: "orphan" };
-    if (flag("-B")) return { op: "force-create", branch: _branchAfter(a, "-B") };
-    if (flag("-b") || flag("-c")) return { op: "create-new", branch: _branchAfter(a, flag("-b") ? "-b" : "-c") };
+    // #626 security fold-in: recognize git's FULL create/force-create/orphan
+    // spelling surface — NOT just the exact space-separated shorts. git accepts
+    // the value ATTACHED to a short cluster (`checkout -bfoo` / `-fb foo` /
+    // `switch -cfoo` / `-Cfoo`) and the long forms `--create[=v]` /
+    // `--force-create[=v]` / `--orphan[=v]`. Without this they fell through to
+    // switch-existing: `git checkout -bfoo main` misclassified as a switch to
+    // `main`, and when that equals baseline.original the #376 return-to-original
+    // arm re-baselined (allow) while git actually CREATED a branch and flipped
+    // the shared hub — re-opening the #99 hole #626 removed.
+    const opt = _checkoutCreateOpt(a);
+    if (opt) return { op: opt.kind, branch: opt.branch };
     if (flag("-f") || flag("--force") || flag("--discard-changes")) return { op: "force" }; // --discard-changes is git's force-switch alias (throws away local modifications — second-model gate fold-in)
     if (flag("--detach")) return { op: "detach" };
     if (a.includes("-")) return { op: "switch-existing", target: "-" }; // prev branch
@@ -769,9 +777,40 @@ export function classifyBranchOp(subcmd, args) {
   return { op: "other" };
 }
 
-function _branchAfter(args, flag) {
-  const idx = args.indexOf(flag);
-  return args[idx + 1] ?? null;
+/**
+ * #626: parse the create / force-create / orphan option from a checkout/switch
+ * argv, accepting git's FULL spelling surface:
+ *   - short cluster with the value ATTACHED (`checkout -bfoo` / `switch -cfoo` /
+ *     `-Cfoo`) or the value as the NEXT argv (`checkout -fb foo`);
+ *   - long forms `--create[=v]` / `--force-create[=v]` / `--orphan[=v]`.
+ * Short letters: b/c → create-new, B/C → force-create. Scanning stops at a `--`
+ * terminator (path-restore form — never a branch option). Returns
+ * { kind, branch } or null. Fail-safe: a plausible create letter classifies as
+ * create/force-create → M3 blocks (git refuses invalid spellings anyway).
+ */
+function _checkoutCreateOpt(args) {
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i];
+    if (x === "--") return null;
+    const long = /^--(orphan|create|force-create)(?:=(.*))?$/.exec(x);
+    if (long) {
+      const kind = long[1] === "orphan" ? "orphan"
+        : long[1] === "create" ? "create-new" : "force-create";
+      return { kind, branch: long[2] !== undefined ? long[2] : (args[i + 1] ?? null) };
+    }
+    const sc = /^-(?!-)([A-Za-z]+)(.*)$/.exec(x);
+    if (sc) {
+      const letters = sc[1], rest = sc[2];
+      const k = letters.search(/[bBcC]/);
+      if (k !== -1) {
+        const L = letters[k];
+        const kind = (L === "b" || L === "c") ? "create-new" : "force-create";
+        const attached = letters.slice(k + 1) + rest;
+        return { kind, branch: attached.length > 0 ? attached : (args[i + 1] ?? null) };
+      }
+    }
+  }
+  return null;
 }
 
 /**

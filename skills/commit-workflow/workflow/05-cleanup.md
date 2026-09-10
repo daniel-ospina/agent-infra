@@ -47,13 +47,16 @@ BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null
 git push origin --delete "$BRANCH" 2>/dev/null \
   || echo "ℹ️ remote branch $BRANCH already deleted or unavailable"
 
-# Local delete — now safe IF the worktree was removed above (lock released).
-# If the worktree removal FAILED, do not fail the ceremony: WARN + leave a teardown note.
+# Local delete — best-effort. If the worktree was removed above the branch is no
+# longer checked out, but the HUB's main-checkout branch-force-delete gate still
+# blocks a branch that is not the session's baseline or pid-owned (a `git worktree
+# add -b` branch is never recorded as owned — create-new is blocked, #626). A block
+# or git refusal is a WARN — never fail the ceremony; leave a teardown note.
 if git worktree list --porcelain | grep -q "branch refs/heads/$BRANCH"; then
   echo "⚠️ branch $BRANCH is still checked out in a worktree — local delete deferred."
   echo "   TEARDOWN NOTE: remove the worktree and run: git branch -D $BRANCH"
 else
-  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH not found or could not be deleted — delete manually: git branch -D $BRANCH"
+  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH not deleted (guard-blocked or missing) — remove manually: git branch -D $BRANCH"
 fi
 ```
 
