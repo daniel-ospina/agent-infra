@@ -1091,47 +1091,44 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     // invocation target resolution, so read-only and worktree-targeted git ops
     // from code keep working (false-blocks stay exceptional).
     const code = extractCodePayload(command);
-    if (code) {
+    // #627 scope: INLINE interpreter payloads (`python -c`, `node -e`,
+    // `ruby -e`, `perl -e`, `php -r`, `pwsh -Command`, …). File / module /
+    // stdin payloads are NOT content-gated here — reading an arbitrary
+    // repo script (e.g. the guard's own `node test.mjs`) against the
+    // hub-recovery allowlist false-blocks legitimate test fixtures that run
+    // git in temp repos, which is the same semantics the shell surface has
+    // (#1484). File/shebang/module/stdin forms are documented residuals
+    // (README backdoor table + tracked follow-ups).
+    if (code && code.kind === "inline") {
       const base = execCwd ? resolve(execCwd) : resolve(process.cwd());
-      let content: string | null = null;
-      if (code.kind === "inline") content = code.value ?? "";
-      else if ((code.kind === "file" || code.kind === "stdin-file") && code.value) {
-        const p = resolve(base, code.value);
-        try { if (existsSync(p) && statSync(p).isFile()) content = readFileSync(p, "utf-8"); } catch { content = null; }
-      }
-      // module (`python -m x`) / bare stdin payloads are not statically
-      // resolvable — documented residual (README backdoor table). INLINE
-      // payloads are ALSO recursed by _walkShell (#627), so the structured
-      // classifier still sees them even if this gate degrades.
-      if (content !== null) {
+      const content = code.value ?? "";
+      {
         const branch = getMainCheckoutBranch();
         // #627 reviewer P2: an opaque inline payload (`python3 -c "$PYCODE"`,
         // `python3 -c "$(cat code.py)"`) is not statically resolvable. Mirror
         // the shell surface's round-11 `sh -c '$VAR'` arm: a valid payload
         // variable whose command assigns a git-bearing value is unverifiable →
         // block. A non-git command string still allows (no blanket block).
-        const opaqueInline = code.kind === "inline" &&
+        const opaqueInline =
           /^\s*\$(?:\{?[A-Za-z_][A-Za-z0-9_]*\}?|\([\s\S]*\)|\[[\s\S]*\])\s*$/.test(content);
         const verdict = opaqueInline
           ? (/\bgit\b/.test(command) ? "block" : "allow")
           : codePayloadGitVerdict(content, branch, base, resolve(process.cwd()));
         if (verdict === "block") {
-          const what = code.kind === "inline"
-            ? "an inline code payload"
-            : `${resolve(base, code.value ?? "")}`;
           return [
             `⛔ Script execution blocked — git-bearing code payload in the shared main checkout (#627).`,
             `   The non-shell interpreter backdoor (python -c, node -e, ruby -e,`,
-            `   perl -e, php -r, and script-file forms) is closed: ${what} contains`,
-            `   a non-sanctioned git operation.`,
+            `   perl -e, php -r, pwsh -Command) is closed: the inline payload`,
+            `   contains a non-sanctioned git operation.`,
             `   → Run the git commands directly (recovery: git checkout main && git pull --ff-only),`,
             `     or work in an isolated worktree:`,
             `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
           ].join("\n");
         }
       }
-      return null; // resolved code invocation — no shell script to gate
+      return null; // resolved inline code invocation — no shell script to gate
     }
+    if (code) return null; // non-inline code form — out of #627 scope (residual)
     const scriptPath = extractScriptPath(command);
     if (!scriptPath) return null;
     // #347: resolve the script path + content gating against the command's

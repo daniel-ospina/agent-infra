@@ -4617,6 +4617,41 @@ try {
   expectBool("P627-30: worktree-targeted inline code git op is exempt through the hub gate",
     evaluateHubGateWithTargets(`cd ${wtR} && python3 -c "import subprocess; subprocess.run(['git','commit','-m','x'])"`, "main", hubR).verdict === "allowed", true);
 
+  // ── #627 code-review cycle-2 fold-in (fresh-reviewer regressions) ──
+  // P1: the cycle-1 "first-arg only" fix lost the wrapper/shell-interpreter argv
+  // and non-literal callee forms. Command-position anchoring restores them.
+  expectBool("P627-31: wrapper-shell argv arrays block (bash -c / sudo / env / timeout / abs path)",
+    cpv(`subprocess.run(["bash","-c","git reset --hard"])`) === "block" &&
+    cpv(`subprocess.run(["sudo","git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess.run(["env","git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess.run(["timeout","5","git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess.run(["/bin/bash","-lc","git reset --hard"])`) === "block" &&
+    cpv(`subprocess.Popen(["bash","-c","git reset --hard"])`) === "block", true);
+  expectBool("P627-32: variable indirection blocks (argv literal or command string)",
+    cpv(`cmd = ["git","reset","--hard"]\nsubprocess.run(cmd)`) === "block" &&
+    cpv(`cmd = "git reset --hard"\nos.system(cmd)`) === "block", true);
+  expectBool("P627-33: aliased/destructured/chained sinks block (from-import, as-import, .execSync)",
+    cpv(`from subprocess import run\nrun(["git","reset","--hard"])`) === "block" &&
+    cpv(`import subprocess as sp\nsp.run(["git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess . run (["git","reset","--hard"])`) === "block" &&
+    cpv(`require("child_process").execSync("git reset --hard")`) === "block", true);
+  expectBool("P627-34: no comment over-strip — #private / // floor-division do not hide a same-line sink",
+    cpv(`class G { static #run() { return require('child_process').execSync("git reset --hard"); } }`) === "block" &&
+    cpv(`n = a//b; require('child_process').execSync("git reset --hard")`) === "block", true);
+  expectBool("P627-35: docstring / quoted-sink-in-a-string / regex stay inert",
+    cpv(`def f():\n    """\n    Example: subprocess.run(["git","reset","--hard"])\n    """\n    pass`) === "allow" &&
+    cpv(`x = "os.system('git reset --hard')"`) === "allow" &&
+    cpv(`const re = /git/; re.exec(s)`) === "allow", true);
+  expectBool("P627-36: cwd=<literal> is an implicit -C target (worktree exempt, hub blocks)",
+    codePayloadGitVerdict(`subprocess.run(["git","commit","-m","x"], cwd="${wtR}")`, "main", hubR, hubR) === "allow" &&
+    codePayloadGitVerdict(`subprocess.run(["git","commit","-m","x"], cwd="${hubR}")`, "main", hubR, hubR) === "block", true);
+  expectBool("P627-37: pwsh -Command is an inline payload (not misread as python -m)",
+    cp(`pwsh -Command 'git reset --hard'`)?.kind === "inline" && cp(`pwsh -Command 'git reset --hard'`)?.value === "git reset --hard" &&
+    cp(`powershell -c 'git reset --hard'`)?.kind === "inline" &&
+    cp(`pwsh -File /tmp/x.ps1`)?.kind !== "inline", true);
+  expectBool("P627-38: shell-payload interpreter (pwsh -Command) blocks through the pwsh surface",
+    cpv(`git reset --hard`) === "block" && cpv(`git commit -m x`) === "block", true);
+
   // #628 hubNewFileVolumeVerdict — pure boundaries + source pins (index.ts).
   expectBool("P628-1: volume verdict boundaries",
     hubNewFileVolumeVerdict(1) === "warn" &&

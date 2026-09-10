@@ -229,34 +229,47 @@ EXECUTION cwd (cd-resolved, subshell/pipe-scoped) — `cd <wt> && bash x.sh`
 resolves x.sh inside the worktree; worktree-targeted script content is exempt,
 while content targeting the hub (`git -C <hub> reset …`) blocks even from a
 worktree cwd. Subshell-wrapped executions (`(cd … && bash x.sh)`) are covered.
-**#627 — the non-shell interpreter sibling is closed too.** `python -c` /
-`python <file>`, `node -e`/`--eval`/`-p`, `ruby -e`, `perl -e`, `php -r`,
+**#627 — the non-shell interpreter sibling is closed too (INLINE payloads).**
+`python -c`, `node -e`/`--eval`/`-p`, `ruby -e`, `perl -e`, `php -r`,
 `deno eval`, `bun -e`, `lua -e`, `Rscript -e`, `julia -e`, `osascript -e`,
-`pwsh -c` (version/path-qualified spellings and `env`/`sudo`/`cd` wrappers
-included) are now gated by the SAME allowlist: `extractCodePayload` resolves
-the payload (inline or file), `extractCodeGitCommands` reconstructs the `git …`
-candidate from code literals (array form `['git','reset','--hard']`, string
-form `"git reset --hard"`), and `codePayloadGitVerdict` classifies it with the
-script surface's per-invocation target resolution. Single-dash flags are
-parsed POSIX letter-by-letter with an operand table, so the real flag+payload
-is always reached (`python3 -W ignore -c`, `python3 -Sc`, `perl -we`,
-`ruby -I lib -e`, `node -r ./setup -e`, `php -d k=v -r`). Inline payloads are
-ALSO recursed by the shared walker, so the structured classifier (M2/M3/M4)
-sees them — nested wrappers (`bash -c 'python3 -c …'`) included. The scanner
-requires a CALL-SHAPED execution SINK (`subprocess.run(`, `os.system(`,
-`execSync(`, `child_process.*(`, `Popen(`, `spawn*`, `system(`, `passthru(`,
-`proc_open(`, plus the paren-less Ruby/Perl `system "…"`), strips comments
-quote-aware, and anchors only on the FIRST argument of a sink call — so inert
-literals and data stay allowed (`print('git reset --hard')`, a docstring, a
-`# git reset` comment, `subprocess.run(['echo','git reset needed'])`,
-`os.system('echo git')`, `{git:'repo'}`, a trailing `cwd=…` kwarg) — matching
-`echo 'git reset'` on the shell surface. Worktree parity holds through the
-production base resolution (`commandExecutionCwd` now sees the code
-invocation's cd-chain). Documented residuals (#627 → #694): `python -m
-<module>`, bare stdin/pipe/heredoc payloads, package-runner wrappers
-(`npx`/`uv run`), a sink reached through dynamic indirection
-(`__import__('subprocess')`), and dynamically constructed git commands
-(`'gi'+'t'`, `chr(103)+…`, base64).
+`pwsh -c`/`-Command` (version/path-qualified spellings and `env`/`sudo`/`cd`
+wrappers included) are now gated by the SAME allowlist: `extractCodePayload`
+resolves the inline payload, and `codePayloadGitVerdict` classifies the
+extracted `git …` command(s) with the script surface's per-invocation target
+resolution. Single-dash flags are parsed POSIX letter-by-letter with an operand
+table, so the real flag+payload is always reached (`python3 -W ignore -c`,
+`python3 -Sc`, `perl -we`, `ruby -I lib -e`, `node -r ./setup -e`,
+`php -d k=v -r`); exact multi-char single-dash flags (`pwsh -Command`) are
+resolved before clustering. Inline payloads are ALSO recursed by the shared
+walker, so the structured classifier (M2/M3/M4) sees them.
+
+**How the scanner avoids both bypasses and false-blocks.** A payload is scanned
+only when it BOTH references a process-execution sink (module/method identifier
+presence — `subprocess`, `child_process`, `os.system`, `execSync`, `Popen`,
+`spawn*`, `passthru`, `proc_open`, `popen`, a backtick command, the paren-less
+Ruby/Perl `system "…"`) AND contains an argv-shaped `git …` command in
+**command position**. Command position is decided from the token stream —
+array element 0, a top-level/assigned command string, or a token following only
+shell-interpreter / wrapper words — NOT from a sink call window. That is what
+makes variable indirection (`cmd = ["git","reset"]; subprocess.run(cmd)`),
+aliased/destructured imports (`from subprocess import run`, `import subprocess
+as sp`), chained receivers (`require('child_process').execSync(…)`), and wrapper
+argv (`["bash","-c","git reset --hard"]`, `["sudo","git",…]`) visible, while
+prose/data stay inert (`print('git reset --hard')`, a docstring, a `# git reset`
+comment, `subprocess.run(['echo','git reset needed'])`, `os.system('echo git')`,
+`{git:'repo'}`, `/git/`, `re.exec(s)`, `x = "os.system('git reset')"`). A
+`cwd=<literal>` keyword argument becomes an implicit `git -C <cwd>`, so worktree
+parity holds for the standard per-call cwd override as well as the
+`cd <wt> && …` chain (`commandExecutionCwd` sees the code invocation's
+cd-chain). **Residuals** (#627 → #694): `python -m <module>`, bare
+stdin/pipe/heredoc payloads, package-runner wrappers (`npx`/`uv run`), a sink
+reached only through dynamic indirection (`__import__('subprocess')`), and
+dynamically constructed git commands (`'gi'+'t'`, `chr(103)+…`, base64).
+**File / shebang / module payloads are NOT content-gated** — `python3 x.py`,
+`./x.py`, `bash -c 'python3 x.py'` were never gated before #627 either, and
+reading an arbitrary repo script against the hub-recovery allowlist false-blocks
+legitimate fixtures that run git in temp repos (the same semantics the shell
+surface already has). Tracked as separate follow-ups.
 
 ### Incident writeup — 2026-08-18 (the canonical hub-discipline failure)
 
@@ -611,7 +624,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 |---|---|---|
 | env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated exempts agent-infra main dirt anymore (#615/#619 — hub-state-check now includes agent-infra + the sibling hub repos tortoise/premise-labs/DMeer/eldato; sibling sessions in the hub are unprotected and will be disrupted). Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
-| script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. **#627:** the non-shell sibling (`python -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, script files) is closed too; residual: `python -m`/bare-stdin/pipe payloads, dynamic string construction. Env hatch / TTL marker still bypass it. |
+| script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. **#627:** the non-shell sibling (`python -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, `pwsh -Command`) is closed for INLINE payloads too; residuals: `python -m`/bare-stdin/pipe payloads, dynamic string construction, and file/shebang payloads (`python x.py`, `./x.py`). Env hatch / TTL marker still bypass it. |
 | terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | THE sanctioned recovery (#206). Terminals are never intercepted; this is how a stranded hub gets un-stranded. |
 
 Rule of thumb: **if you are not recovering the hub or working alone, you
@@ -744,20 +757,26 @@ blocked with a reason naming the closure; recovery scripts (`hub-worktree.sh`:
 `fetch` + `worktree add`) and read-only git in scripts pass. Inline `bash -c
 '…'` is gated as the caller's own command by the normal classifier.
 
-**#627 extends the closure to non-shell code interpreters.** The same payload
-escaped via `python3 -c "import subprocess; subprocess.run(['git','reset',
-'--hard'])"` (array form — no `git` token at a shell command position) or a
-script file (`python3 /tmp/x.py`). `extractCodePayload` resolves the payload,
-`extractCodeGitCommands` reassembles the git candidate, and
-`codePayloadGitVerdict` applies the SAME allowlist + per-invocation target
-resolution as the shell surface. Two boundaries are deliberate:
-- **Sink requirement** — a candidate is only emitted when the payload contains
-  a process-spawn primitive, so inert literals stay allowed (no false-blocks).
+**#627 extends the closure to non-shell code interpreters (inline payloads).**
+The same payload escaped via `python3 -c "import subprocess; subprocess.run(['git',
+'reset','--hard'])"` (array form — no `git` token at a shell command position).
+`extractCodePayload` resolves the INLINE payload and `codePayloadGitVerdict`
+applies the SAME allowlist + per-invocation target resolution as the shell
+surface (see the design note above for the sink gate + command-position anchor).
+Three boundaries are deliberate:
+- **Sink + command-position requirement** — a candidate is only emitted when the
+  payload contains a process-spawn primitive AND a `git …` command in command
+  position, so inert literals/prose/data stay allowed (no false-blocks).
 - **Worktree parity** — a worktree-targeted code git op (`cd <wt> && python3
-  -c "… git commit …"`) is exempt exactly like its shell twin (#347).
-Residuals (documented, not gated): `python -m <module>`, bare stdin/pipe/heredoc
-payloads, dynamic string construction, and pathological obfuscation (the
-open-ended family shared with the shell residual tier).
+  -c "… git commit …"`, or a `cwd=<wt>` kwarg) is exempt exactly like its shell
+  twin (#347).
+- **Inline only** — file/shebang/module/stdin payloads (`python3 /tmp/x.py`,
+  `./x.py`) are NOT content-read: doing so false-blocks legitimate scripts that
+  run git in temp repos (and the shell surface has the same semantics).
+Residuals (documented, not gated → tracked follow-ups): `python -m <module>`,
+bare stdin/pipe/heredoc payloads, file/shebang payloads, dynamic string
+construction, and pathological obfuscation (the open-ended family shared with
+the shell residual tier).
 
 ## What it does NOT fix
 
