@@ -439,6 +439,8 @@ try {
   // #625 cycle-10: getopt_long abbreviation (fail-open) + single-operand no-op.
   bashPin("#625: hub-rooted CLEAN sed --in-pl (abbreviated --in-place) → BLOCK", `sed --in-pl s/a/b/ ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN gawk --incl inplace (abbreviated) → BLOCK", `gawk --incl inplace '{print}' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN gawk -i inplace --file p.awk → BLOCK", `gawk -i inplace --file p.awk ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN gawk --incl inplace --source prog → BLOCK", `gawk --incl inplace --source '{print}' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("#625: hub-rooted CLEAN single-operand cp on tracked file → ALLOW (malformed no-op)", `cp ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)");
   bashPin("#625: hub-rooted CLEAN single-operand mv on tracked file → ALLOW (malformed no-op)", `mv ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)");
   bashPin("bash#621: hub-rooted session → own worktree file → ALLOW", `cd ${wt} && echo x > wt-own.txt`, hub, "ALLOW (no hub-main write)");
@@ -668,6 +670,7 @@ expectBool("#625 source pin: getopt_long unambiguous-prefix resolver present", c
 expectBool("#625 source pin: sed + gawk long-option arity tables declared", classifySrc.includes("const SED_LONG = {") && classifySrc.includes("const AWK_LONG = {"), true);
 expectBool("#625 source pin: sed in-place resolved via the prefix table (BSD -i '' guard too)", classifySrc.includes('resolved === "in-place"') && classifySrc.includes("_isSedInPlaceLong(words[wi - 1])"), true);
 expectBool("#625 source pin: gawk --include resolved via the prefix table", classifySrc.includes('if (resolved === "include") {'), true);
+expectBool("#625 source pin: awk program-providing long options set hasProgFlag", classifySrc.includes('if (resolved === "file" || resolved === "source" || resolved === "exec") hasProgFlag = true;'), true);
 expectBool("#625 source pin: cp/mv/install destination requires a source operand", classifySrc.includes("positionals.length > 1") && classifySrc.includes("if (positionals.length > 0) emitDst(targetDir, positionals, alsoSources);"), true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
@@ -4417,6 +4420,18 @@ try {
     has("gawk --incl inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --incl is an unambiguous --include prefix");
     has("gawk --inc=inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --inc= prefix with the inplace operand attached");
     has("gawk --include=inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --include=inplace exact spelling");
+    // #625 review cycle-11: `--file`/`--source`/`--exec` PROVIDE the program, so
+    // the first positional is a DATA file. Losing hasProgFlag sliced that data
+    // file off as "the program" and dropped the in-place target entirely
+    // (`gawk -i inplace --file p.awk tracked.md` → zero targets).
+    has("gawk --incl inplace --file p.awk tracked.md", "gawk:H/tracked.md", "long --file provides the program (data file kept)");
+    has("gawk -i inplace -f p.awk tracked.md", "gawk:H/tracked.md", "short -f provides the program");
+    has("gawk --include inplace --file=p.awk tracked.md", "gawk:H/tracked.md", "--file= attached form provides the program");
+    has("gawk --incl inplace --source {print} tracked.md", "gawk:H/tracked.md", "long --source provides the program");
+    has("gawk -i inplace -e {print} tracked.md", "gawk:H/tracked.md", "short -e provides the program");
+    has("gawk -i inplace -E p.awk tracked.md", "gawk:H/tracked.md", "short -E provides the program");
+    has("gawk -i inplace --exec p.awk tracked.md", "gawk:H/tracked.md", "--exec provides the program");
+    has("gawk -i inplace --load lib.so {print} tracked.md", "gawk:H/tracked.md", "--load is a library — the program positional stays");
     has("sed -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed -i still gates after the prefix change");
     has("sed --separate -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed --separate (arity 0) does not swallow -i");
     lacks("sed --in-pl s/a/b/ subdir", "sed:H/tracked.md", "sed --in-pl on a non-tracked operand stays inert");

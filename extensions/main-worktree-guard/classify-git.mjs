@@ -4743,12 +4743,23 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
               } else if (w.slice(eq + 1) === "inplace") inPlace = true;
               continue;
             }
-            if (resolved !== null && AWK_LONG[resolved] === 1) { if (eq === -1) expectOperand = true; continue; }
+            if (resolved !== null && AWK_LONG[resolved] === 1) {
+              // `--file`/`--source`/`--exec` PROVIDE the program, so the first
+              // positional is a DATA file. Without hasProgFlag the handler's
+              // `positionals.slice(1)` ate it and dropped the in-place target
+              // entirely (#625 cycle-11 P1 REGRESSION: `gawk -i inplace --file
+              // p.awk <hub>/f` and `gawk --incl inplace --source '{print}'
+              // <hub>/f` resolved to ZERO targets → the gate ALLOWED a tracked
+              // hub-main edit; the short `-f`/`-e` forms still gated).
+              if (resolved === "file" || resolved === "source" || resolved === "exec") hasProgFlag = true;
+              if (eq === -1) expectOperand = true;
+              continue;
+            }
             continue;
           }
-          if (w === "-i" || w === "-f" || w === "-v") {
+          if (w === "-i" || w === "-f" || w === "-v" || w === "-E") {
             if (w === "-i" && words[wi + 1] === "inplace") { inPlace = true; expectOperand = true; }
-            else { if (w === "-f") hasProgFlag = true; expectOperand = true; }
+            else { if (w === "-f" || w === "-E") hasProgFlag = true; expectOperand = true; }
             continue;
           }
           if (w === "-iinplace") { inPlace = true; continue; }
