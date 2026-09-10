@@ -710,34 +710,43 @@ export function resolveInvocationTarget(inv, sessionCwd = process.cwd(), baseCwd
 // extraction, and a code-aware git-candidate scanner that feeds the SAME
 // invocation verdict the shell script surface uses (so a worktree-targeted or
 // read-only git op from code keeps working — false-blocks stay exceptional).
+//
+// `inline` = flags that CONSUME the following word as the code payload.
+// `operand` = flags that consume the following word as a NON-payload operand
+// (`python3 -W ignore -c …`, `ruby -I lib -e …`, `node -r ./setup -e …`,
+// `php -d k=v -r …`) — without this table the operand was mistaken for the
+// payload and the real flag+payload were never parsed (a complete bypass).
+// Single-dash flags are parsed LETTER BY LETTER (POSIX cluster semantics):
+// `python3 -Sc` = -S + -c, `perl -we` = -w + -e, `ruby -Ilib -e` etc.
 const CODE_INTERPRETER_FAMILIES = {
-  python: { inline: ["-c"], label: "python" },
-  python2: { inline: ["-c"], label: "python" },
-  python3: { inline: ["-c"], label: "python" },
-  node: { inline: ["-e", "--eval", "-p", "--print"], label: "node" },
-  nodejs: { inline: ["-e", "--eval", "-p", "--print"], label: "node" },
+  python: { inline: ["-c"], operand: ["-W", "-X", "-Q"], label: "python" },
+  python2: { inline: ["-c"], operand: ["-W", "-X", "-Q"], label: "python" },
+  python3: { inline: ["-c"], operand: ["-W", "-X", "-Q"], label: "python" },
+  node: { inline: ["-e", "-p"], operand: ["-r", "-C"], longInline: ["--eval", "--print"], longOperand: ["--require", "--loader", "--import", "--conditions", "--max-old-space-size"], label: "node" },
+  nodejs: { inline: ["-e", "-p"], operand: ["-r", "-C"], longInline: ["--eval", "--print"], longOperand: ["--require", "--loader", "--import", "--conditions", "--max-old-space-size"], label: "node" },
   deno: { inline: [], subcommandInline: ["eval"], label: "deno" },
-  bun: { inline: ["-e", "--eval"], label: "bun" },
-  ruby: { inline: ["-e"], label: "ruby" },
-  ruby2: { inline: ["-e"], label: "ruby" },
-  ruby3: { inline: ["-e"], label: "ruby" },
-  perl: { inline: ["-e", "-E"], label: "perl" },
-  perl5: { inline: ["-e", "-E"], label: "perl" },
-  php: { inline: ["-r", "--run"], label: "php" },
-  php5: { inline: ["-r", "--run"], label: "php" },
-  php7: { inline: ["-r", "--run"], label: "php" },
-  php8: { inline: ["-r", "--run"], label: "php" },
-  lua: { inline: ["-e"], label: "lua" },
-  luajit: { inline: ["-e"], label: "lua" },
+  bun: { inline: ["-e"], longInline: ["--eval"], operand: ["-r"], longOperand: ["--preload"], label: "bun" },
+  ruby: { inline: ["-e"], operand: ["-I", "-r", "-C", "-K", "-E", "-0"], longOperand: ["--encoding"], label: "ruby" },
+  ruby2: { inline: ["-e"], operand: ["-I", "-r", "-C", "-K", "-E", "-0"], label: "ruby" },
+  ruby3: { inline: ["-e"], operand: ["-I", "-r", "-C", "-K", "-E", "-0"], label: "ruby" },
+  perl: { inline: ["-e", "-E"], operand: ["-I", "-M", "-m", "-F"], label: "perl" },
+  perl5: { inline: ["-e", "-E"], operand: ["-I", "-M", "-m", "-F"], label: "perl" },
+  php: { inline: ["-r"], operand: ["-d", "-c", "-z", "-f"], longInline: ["--run"], label: "php" },
+  php5: { inline: ["-r"], operand: ["-d", "-c", "-z", "-f"], longInline: ["--run"], label: "php" },
+  php7: { inline: ["-r"], operand: ["-d", "-c", "-z", "-f"], longInline: ["--run"], label: "php" },
+  php8: { inline: ["-r"], operand: ["-d", "-c", "-z", "-f"], longInline: ["--run"], label: "php" },
+  lua: { inline: ["-e"], operand: ["-l"], label: "lua" },
+  lua5: { inline: ["-e"], operand: ["-l"], label: "lua" },
+  luajit: { inline: ["-e"], operand: ["-l"], label: "lua" },
   rscript: { inline: ["-e"], label: "r" },
-  julia: { inline: ["-e"], label: "julia" },
-  coffee: { inline: ["-e"], label: "coffee" },
+  julia: { inline: ["-e"], operand: ["-L"], longInline: ["--eval"], label: "julia" },
+  coffee: { inline: ["-e"], operand: ["-r"], label: "coffee" },
   tsx: { inline: ["-e"], label: "tsx" },
-  "ts-node": { inline: ["-e"], label: "ts-node" },
+  "ts-node": { inline: ["-e"], operand: ["-r"], label: "ts-node" },
   groovy: { inline: ["-e"], label: "groovy" },
-  pwsh: { inline: ["-c", "-Command"], label: "pwsh" },
-  powershell: { inline: ["-c", "-Command"], label: "pwsh" },
-  osascript: { inline: ["-e"], label: "osascript" },
+  pwsh: { inline: ["-c", "-l"], longInline: ["-Command"], operand: ["-File", "-ConfigurationName", "-InputFormat", "-OutputFormat"], label: "pwsh" },
+  powershell: { inline: ["-c", "-l"], longInline: ["-Command"], operand: ["-File", "-ConfigurationName", "-InputFormat", "-OutputFormat"], label: "pwsh" },
+  osascript: { inline: ["-e"], operand: ["-l"], label: "osascript" },
 };
 
 /** Resolve a command token to a code-interpreter family, or null. Strips the
@@ -747,7 +756,8 @@ const CODE_INTERPRETER_FAMILIES = {
 function _codeInterpreterFamily(token) {
   const raw = String(token ?? "");
   if (!raw) return null;
-  const base = basename(raw);
+  let base = basename(raw);
+  if (/\.exe$/i.test(base)) base = base.slice(0, -4); // Windows spellings
   if (/git$/.test(base)) return null;
   const m = base.match(/^([A-Za-z][A-Za-z0-9-]*?)(?:\.[0-9]+)*$/);
   if (!m) return null;
@@ -763,9 +773,12 @@ function _codeInterpreterFamily(token) {
  * yields `-ccode`; `--eval=code`) alongside the spaced form.
  */
 function _codePayloadFromTokens(tokens, i) {
-  const fam = _codeInterpreterFamily(tokens[i]);
-  if (!fam) return null;
-  const table = fam;
+  const table = _codeInterpreterFamily(tokens[i]);
+  if (!table) return null;
+  const inline = table.inline || [];
+  const operand = table.operand || [];
+  const longInline = table.longInline || [];
+  const longOperand = table.longOperand || [];
   let j = i + 1;
   if (table.subcommandInline && tokens[j] && table.subcommandInline.includes(tokens[j])) {
     const v = tokens[j + 1];
@@ -780,25 +793,46 @@ function _codePayloadFromTokens(tokens, i) {
     }
     if (n === ">" || n === ">>" || n === "<<" || n === "&>" || n === ">&" || n === "&>>" || /^(?:[0-9]+)?[<>]/.test(n)) { j += 2; continue; }
     if (_isShellBoundary(n) || n === "&&" || n === "||" || n === "&" || n === "|" || n === "(" || n === ")") break;
-    for (const flag of table.inline) {
-      if (n === flag) {
+    if (n === "-") return { kind: "stdin", value: null, end: j + 1 };
+    // Long options: --eval=code / --eval code, --require foo (operand).
+    if (n.startsWith("--")) {
+      const eq = n.indexOf("=");
+      const name = eq >= 0 ? n.slice(0, eq) : n;
+      if (longInline.includes(name)) {
+        if (eq >= 0) return { kind: "inline", value: n.slice(eq + 1), end: j + 1 };
         const v = tokens[j + 1];
         return v !== undefined ? { kind: "inline", value: v, end: j + 2 } : null;
       }
-      if (flag.startsWith("--") && n.startsWith(flag + "=")) {
-        return { kind: "inline", value: n.slice(flag.length + 1), end: j + 1 };
+      if (name === "--module") {
+        return tokens[j + 1] !== undefined ? { kind: "module", value: tokens[j + 1], end: j + 2 } : null;
       }
-      if (!flag.startsWith("--") && n.length > flag.length && n.startsWith(flag)) {
-        return { kind: "inline", value: n.slice(flag.length), end: j + 1 };
+      if (longOperand.includes(name)) { j += (eq >= 0 ? 1 : 2); continue; }
+      j++; continue; // unknown long option (operand-less or =attached)
+    }
+    // Single-dash flag or CLUSTER (-Sc, -we): POSIX letter-by-letter.
+    if (n.length > 1 && n.startsWith("-")) {
+      const cluster = n.slice(1);
+      for (let ci = 0; ci < cluster.length; ci++) {
+        const short = "-" + cluster[ci];
+        if (short === "-m") {
+          return tokens[j + 1] !== undefined ? { kind: "module", value: tokens[j + 1], end: j + 2 } : null;
+        }
+        if (inline.includes(short)) {
+          const rest = cluster.slice(ci + 1);
+          if (rest) return { kind: "inline", value: rest, end: j + 1 };
+          const v = tokens[j + 1];
+          return v !== undefined ? { kind: "inline", value: v, end: j + 2 } : null;
+        }
+        if (operand.includes(short)) {
+          if (cluster.slice(ci + 1) === "") { j += 2; } else { j += 1; }
+          break; // the rest of the cluster is the attached operand
+        }
+        if (ci === cluster.length - 1) j++; // operand-less cluster
       }
+      continue;
     }
-    if (n === "-m" || n === "--module") {
-      return tokens[j + 1] !== undefined ? { kind: "module", value: tokens[j + 1], end: j + 2 } : null;
-    }
-    if (n === "--") { j++; continue; }
-    if (n === "-") return { kind: "stdin", value: null, end: j + 1 };
     if (!n.startsWith("-")) return { kind: "file", value: n, end: j + 1 };
-    j++; // operand-less flag — keep scanning
+    j++; // lone '-' handled above; anything else is operand-less
   }
   return null;
 }
@@ -835,17 +869,21 @@ export function extractCodePayload(command) {
   return _codePayloadFromTokens(tokens, i);
 }
 
-/** Execution sinks whose ARGUMENTS are a code payload that can spawn git.
- * Kept deliberately small: every hit can turn an unresolved `git` literal into
- * a conservative block, so only real process-spawn primitives belong here. */
-const CODE_EXEC_SINK_RE = new RegExp(
-  "(?:\\bsubprocess\\b|\\bchild_process\\b|\\bPopen\\b|\\bcheck_call\\b|\\bcheck_output\\b|" +
-  "\\bos\\.(?:system|popen|exec|l?spawn|posix\\.spawn)|\\bexec(?:Sync|FileSync|File)?\\b|" +
-  "\\bspawn(?:Sync)?\\b|\\bIO\\.popen\\b|\\bOpen3\\b|\\bsystem\\s*\\(|\\bpassthru\\b|" +
-  "\\bshell_exec\\b|\\bproc_open\\b|\\bpopen\\s*\\(|\\bdo\\s+shell\\s+script\\b|\\bRuntime\\.getRuntime\\b)",
+/** Execution sinks that spawn a child process. Kept TIGHT (the reviewer's
+ * `re.exec(s)` false-positive class): bare `exec` is NOT a sink — only the
+ * node `execSync`/`execFile`/`execFileSync` family, `spawn*`, `os.*`,
+ * `subprocess`, `child_process`, and the language-specific shell-out builtins.
+ * `system` is matched bare because Ruby/Perl accept `system "git reset"`
+ * without parentheses. */
+const CODE_EXEC_SINK_CALL_RE = new RegExp(
+  "(?:\\b(?:subprocess|child_process)\\.\\w+|\\bos\\.(?:system|popen|exec\\w*|l?spawn\\w*|posix\\.spawn\\w*)|\\bexec(?:Sync|FileSync|File)|\\bspawn(?:Sync|ChildProcess)?|\\bPopen|\\bcheck_(?:call|output)|\\bIO\\.popen|\\bOpen3\\.\\w+|\\bRuntime\\.getRuntime\\(\\)\\.exec|\\bsystem|\\bpassthru|\\bshell_exec|\\bproc_open|\\bpopen)\\s*\\(",
+  "g",
 );
-
-function _hasCodeExecSink(content) { return CODE_EXEC_SINK_RE.test(String(content ?? "")); }
+const CODE_EXEC_SINK_BARE_RE = /\bsystem\b(?!\s*\()/g; // Ruby/Perl `system "…"`
+function _hasCodeExecSink(content) {
+  const c = String(content ?? "");
+  return new RegExp(CODE_EXEC_SINK_CALL_RE.source).test(c) || new RegExp(CODE_EXEC_SINK_BARE_RE.source).test(c);
+}
 
 /** Lex a code payload into literals + bare words (punctuation becomes its own
  * token) so git args can be reassembled across `['git','reset','--hard']`. */
@@ -875,25 +913,83 @@ function _codeTokens(s) {
   }
   return out;
 }
+/** Quote-aware CODE comment stripper (#627 reviewer P1: prose/comments were
+ * being classified as commands). Removes `# …` (Python/Ruby/Perl), `// …`
+ * (JS/TS), slash-star block comments, and skips string literals (incl.
+ * triple-quoted). */
+function _stripCodeComments(content) {
+  const s = String(content ?? "");
+  let out = "";
+  let i = 0;
+  let quote = null; // active quote char, or 3-char triple
+  while (i < s.length) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === "\\" && quote.length === 1) { out += s.slice(i, i + 2); i += 2; continue; }
+      if (s.startsWith(quote, i)) { out += quote; i += quote.length; quote = null; continue; }
+      out += ch; i++; continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      if ((ch === '"' || ch === "'") && s[i + 1] === ch && s[i + 2] === ch) { quote = ch + ch + ch; out += quote; i += 3; continue; }
+      quote = ch; out += ch; i++; continue;
+    }
+    if (ch === "#") { while (i < s.length && s[i] !== "\n") i++; continue; }
+    if (ch === "/" && s[i + 1] === "/") { while (i < s.length && s[i] !== "\n") i++; continue; }
+    if (ch === "/" && s[i + 1] === "*") { i += 2; while (i < s.length && !(s[i] === "*" && s[i + 1] === "/")) i++; i += 2; continue; }
+    out += ch; i++;
+  }
+  return out;
+}
+
 /** The argument separators a code call may put BETWEEN consecutive git args
  * (`['git', 'reset']`) — skipped while gathering, unlike `)`/`;`/`=` which end
- * the command. */
-const _CODE_ARG_SEP = new Set([",", "[", "]", "{", "}"]);
-const _CODE_ARG_STOP = new Set(["(", ")", ";", "=", ":", "+", "&", "|", "!", "<", ">", "?", "\n"]);
+ * the command. Brackets are DEPTH-TRACKED (a closer at depth 0 ends the
+ * command) so a trailing kwarg after the array cannot be swallowed into the
+ * verb list (`['git','branch','-a'], cwd=hub` must stay a LIST). */
+const _CODE_ARG_STOP = new Set([";", "=", ":", "+", "&", "|", "!", "<", ">", "?", "\n"]);
 
-/** Reassemble candidate `git …` command strings from a code payload. Anchors on
- * a literal/bare `git` token (or a literal that IS a shell command starting
- * with `git `), then gathers following arg-shaped tokens across `,`/bracket
- * separators so the array spelling reconstructs the command the interpreter
- * will actually run. */
+/** Is the token at index k the FIRST argument of the enclosing call/array?
+ * (ignores the opening bracket/paren and whitespace). Used to keep `['echo',
+ * 'git']` from anchoring on the trailing `git` argument. */
+function _isFirstCodeArg(toks, k) {
+  for (let i = k - 1; i >= 0; i--) {
+    const t = toks[i];
+    if (t.lit) return false;
+    if (t.v === "[" || t.v === "(" || t.v === "{") return true;
+    if (t.v === ";" || t.v === "=" || t.v === ":") return false;
+    if (t.v === "," || t.v === "+") return false;
+    return false;
+  }
+  return true; // window start
+}
+
+/** Reassemble candidate `git …` command strings from ONE execution-sink
+ * argument window. Anchors only on the FIRST argument being `git` (or a
+ * literal that IS a shell command line starting with `git `), then gathers
+ * arg-shaped tokens with bracket-depth tracking. Returns `{cmds, unresolved}`
+ * — `unresolved` counts command-shaped git anchors with no resolvable verb
+ * (the per-reference fail-closed signal). */
 function _codeArgGitCommands(content) {
   const toks = _codeTokens(String(content ?? ""));
   const cmds = [];
+  let unresolved = 0;
   for (let k = 0; k < toks.length; k++) {
     const t = toks[k];
     const raw = t.v;
-    if (!/(?:^|\/)git$/.test(raw)) {
-      if (t.lit && /(?:^|[\s;&|])(?:\S*\/)?git\s+\S/.test(raw)) {
+    const isGitWord = /(?:^|\/)git$/.test(raw);
+    if (isGitWord && t.lit && /\s/.test(raw)) {
+      // a literal command line (`"git reset --hard"`, `"cd x && git reset"`)
+      for (const seg of raw.split(/&&|\|\||;|\n/)) {
+        const s = seg.trim();
+        if (/^(?:\S*\/)?git\s+\S/.test(s)) cmds.push(s);
+      }
+      continue;
+    }
+    if (!isGitWord || !_isFirstCodeArg(toks, k)) {
+      // a full command-line literal — ONLY as the sink's FIRST argument
+      // (`os.system('git reset …')` yes; `subprocess.run(['echo','git reset'])`
+      // no — a later element is DATA, not a command).
+      if (t.lit && _isFirstCodeArg(toks, k) && /^\s*(?:\S*\/)?git\s+\S/.test(raw)) {
         for (const seg of raw.split(/&&|\|\||;|\n/)) {
           const s = seg.trim();
           if (/^(?:\S*\/)?git\s+\S/.test(s)) cmds.push(s);
@@ -903,34 +999,79 @@ function _codeArgGitCommands(content) {
     }
     const parts = ["git"];
     let j = k + 1;
+    let depth = 0;
     while (j < toks.length) {
       const n = toks[j];
-      if (!n.lit && _CODE_ARG_SEP.has(n.v)) { j++; continue; }
-      if (!n.lit && (_CODE_ARG_STOP.has(n.v) || n.v === ")" || n.v === ",")) break;
-      if (!n.lit && /^[A-Za-z0-9_./$@~-]+$/.test(n.v)) { parts.push(n.v); j++; continue; }
+      if (!n.lit && (n.v === "[" || n.v === "{" || n.v === "(")) { depth++; j++; continue; }
+      if (!n.lit && (n.v === "]" || n.v === "}" || n.v === ")")) { if (depth === 0) break; depth--; j++; continue; }
+      if (!n.lit && n.v === ",") { j++; continue; }
+      if (!n.lit && _CODE_ARG_STOP.has(n.v)) break;
       if (n.lit) { parts.push(n.v); j++; continue; }
+      if (/^[A-Za-z0-9_./$@~-]+$/.test(n.v)) { parts.push(n.v); j++; continue; }
       break;
     }
-    cmds.push(parts.join(" "));
+    const cmd = parts.join(" ");
+    const invs = allGitInvocations(cmd);
+    if (invs.some((iv) => iv.verb) || /(?:^|\s)--(?:version|help)(?:\s|$)/.test(cmd)) cmds.push(cmd);
+    else unresolved++;
     k = j - 1;
   }
-  return [...new Set(cmds)];
+  return { cmds: [...new Set(cmds)], unresolved };
 }
 
 /**
- * Candidate `git …` command strings a CODE payload can execute. Pure and
+ * Candidate `git …` command strings a CODE payload can execute, plus the
+ * count of command-shaped git anchors with no resolvable verb. Pure and
  * exported for pins (#627). The execution-sink requirement is the false-block
  * guard: an inert literal (`print('git reset --hard')`, a docstring, a test
  * fixture) carries no sink and yields no candidates, matching the shell
- * surface (where `echo 'git reset'` is allowed). A payload with a sink but no
- * resolvable verb is handled by codePayloadGitVerdict's fail-closed arm.
+ * surface (where `echo 'git reset'` is allowed). Candidates are extracted
+ * ONLY from execution-sink CALL WINDOWS (balanced-paren argument slices),
+ * after quote-aware comment stripping — so prose and comments cannot anchor.
+ * @param {string} content
+ * @returns {{ cmds: string[], unresolved: number }}
+ */
+export function extractCodeGitCommandsDetailed(content) {
+  const c = _stripCodeComments(String(content ?? ""));
+  const cmds = [];
+  let unresolved = 0;
+  const sinkRe = new RegExp(CODE_EXEC_SINK_CALL_RE.source, "g");
+  let m;
+  while ((m = sinkRe.exec(c)) !== null) {
+    const open = m.index + m[0].length - 1; // the trailing `(`
+    let depth = 0; let end = -1; let q = null;
+    for (let i = open; i < c.length; i++) {
+      const ch = c[i];
+      if (q) { if (ch === "\\") { i++; continue; } if (ch === q) q = null; continue; }
+      if (ch === '"' || ch === "'" || ch === "`") { q = ch; continue; }
+      if (ch === "(") depth++;
+      else if (ch === ")") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end === -1) continue;
+    const r = _codeArgGitCommands(c.slice(open + 1, end));
+    for (const cmd of r.cmds) cmds.push(cmd);
+    unresolved += r.unresolved;
+  }
+  // Paren-less `system "git reset --hard"` (Ruby/Perl): the statement tail is
+  // the sink's single argv-style argument.
+  const bareRe = new RegExp(CODE_EXEC_SINK_BARE_RE.source, "g");
+  while ((m = bareRe.exec(c)) !== null) {
+    const start = m.index + m[0].length;
+    let e = start; while (e < c.length && c[e] !== "\n" && c[e] !== ";") e++;
+    const r = _codeArgGitCommands(c.slice(start, e));
+    for (const cmd of r.cmds) cmds.push(cmd);
+    unresolved += r.unresolved;
+  }
+  return { cmds: [...new Set(cmds)], unresolved };
+}
+
+/**
+ * Back-compat/pin surface: the candidate list only.
  * @param {string} content
  * @returns {string[]}
  */
 export function extractCodeGitCommands(content) {
-  const c = String(content ?? "");
-  if (!_hasCodeExecSink(c)) return [];
-  return _codeArgGitCommands(c);
+  return extractCodeGitCommandsDetailed(content).cmds;
 }
 
 /**
@@ -948,22 +1089,22 @@ export function extractCodeGitCommands(content) {
  */
 export function codePayloadGitVerdict(content, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd()) {
   const c = String(content ?? "");
-  const cmds = extractCodeGitCommands(c);
+  const { cmds, unresolved } = extractCodeGitCommandsDetailed(c);
   const invocations = [];
-  let resolvedVerb = false;
   for (const cmd of cmds) {
     if (_unverifiableGitContent(cmd)) return "block";
     for (const inv of allGitInvocations(cmd)) {
-      if (inv.verb && inv.verb !== "__unverifiable__") resolvedVerb = true;
-      else if (inv.verb === "__unverifiable__") return "block";
+      if (inv.verb === "__unverifiable__") return "block";
       invocations.push(inv);
     }
   }
   if (invocations.length > 0 && _gitInvocationsVerdict(invocations, currentBranch, executionCwd, sessionCwd) === "block") return "block";
-  // Fail-closed: a spawn sink + a `git` reference we could not turn into a
-  // verb-bearing invocation (payload variable, concatenated string) is
-  // unverifiable — static analysis cannot prove it git-free.
-  if (_hasCodeExecSink(c) && /\bgit\b/.test(c) && !resolvedVerb) return "block";
+  // Fail-closed PER REFERENCE (#627 reviewer P2: a resolved read-only op must
+  // not launder an unresolved mutation elsewhere in the same payload): a
+  // command-shaped `git` anchor with no resolvable verb (payload variable,
+  // concatenated string) is unverifiable — static analysis cannot prove it
+  // git-free.
+  if (unresolved > 0) return "block";
   return "allow";
 }
 
@@ -1396,6 +1537,12 @@ function _walkShell(command, h = {}, seedVars = {}) {
           }
         }
       }
+      // #627 reviewer P1: emit the script-token signal so commandExecutionCwd
+      // returns the code invocation's cd-chain (the #347 worktree-parity base
+      // `_backdoorBlock` resolves the payload against). Without this,
+      // `cd <wt> && python3 -c '…git commit…'` resolved against the hub and
+      // false-blocked the documented worktree case.
+      h.onScriptToken?.([...frame().chain]);
       i = payload ? payload.end : i + 1;
       prevWasBoundary = false;
       continue;

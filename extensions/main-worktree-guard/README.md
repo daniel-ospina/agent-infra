@@ -237,18 +237,26 @@ included) are now gated by the SAME allowlist: `extractCodePayload` resolves
 the payload (inline or file), `extractCodeGitCommands` reconstructs the `git …`
 candidate from code literals (array form `['git','reset','--hard']`, string
 form `"git reset --hard"`), and `codePayloadGitVerdict` classifies it with the
-script surface's per-invocation target resolution. Inline payloads are ALSO
-recursed by the shared walker, so the structured classifier (M2/M3/M4) sees
-them — nested wrappers (`bash -c 'python3 -c …'`) included. The scanner
-requires an execution SINK (`subprocess`, `os.system`, `execSync`,
-`child_process`, `Popen`, `spawn`, `system`, `passthru`, `proc_open`,
-`do shell script`, …), so inert literals (`print('git reset --hard')`, a
-docstring, a test fixture) stay allowed — matching `echo 'git reset'` on the
-shell surface. Documented residuals (#627): `python -m <module>` and bare
-stdin/pipe/heredoc payloads (the code is not statically resolvable); a
-dynamically constructed git command (`'gi'+'t'`, `chr(103)+…`, base64);
-attached long-option payloads whose `=` value is unquoted (`node
---eval=require(...)` — shell-invalid without escaping).
+script surface's per-invocation target resolution. Single-dash flags are
+parsed POSIX letter-by-letter with an operand table, so the real flag+payload
+is always reached (`python3 -W ignore -c`, `python3 -Sc`, `perl -we`,
+`ruby -I lib -e`, `node -r ./setup -e`, `php -d k=v -r`). Inline payloads are
+ALSO recursed by the shared walker, so the structured classifier (M2/M3/M4)
+sees them — nested wrappers (`bash -c 'python3 -c …'`) included. The scanner
+requires a CALL-SHAPED execution SINK (`subprocess.run(`, `os.system(`,
+`execSync(`, `child_process.*(`, `Popen(`, `spawn*`, `system(`, `passthru(`,
+`proc_open(`, plus the paren-less Ruby/Perl `system "…"`), strips comments
+quote-aware, and anchors only on the FIRST argument of a sink call — so inert
+literals and data stay allowed (`print('git reset --hard')`, a docstring, a
+`# git reset` comment, `subprocess.run(['echo','git reset needed'])`,
+`os.system('echo git')`, `{git:'repo'}`, a trailing `cwd=…` kwarg) — matching
+`echo 'git reset'` on the shell surface. Worktree parity holds through the
+production base resolution (`commandExecutionCwd` now sees the code
+invocation's cd-chain). Documented residuals (#627 → #694): `python -m
+<module>`, bare stdin/pipe/heredoc payloads, package-runner wrappers
+(`npx`/`uv run`), a sink reached through dynamic indirection
+(`__import__('subprocess')`), and dynamically constructed git commands
+(`'gi'+'t'`, `chr(103)+…`, base64).
 
 ### Incident writeup — 2026-08-18 (the canonical hub-discipline failure)
 

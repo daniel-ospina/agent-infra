@@ -203,6 +203,12 @@ try {
   hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
   HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
   HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
+  // Stale-classify-git skew guard: a missing export must leave the fail-safe
+  // defaults (never overwrite a function with undefined → TypeError on the
+  // write branch).
+  if (typeof _hubNewFileVolumeVerdict !== "function") hubNewFileVolumeVerdict = () => "warn";
+  if (typeof _HUB_NEW_FILE_WARN_BUDGET !== "number") HUB_NEW_FILE_WARN_BUDGET = 10;
+  if (typeof _HUB_NEW_FILE_BLOCK_CAP !== "number") HUB_NEW_FILE_BLOCK_CAP = 25;
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
 } catch (e) {
@@ -1099,7 +1105,17 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
       // classifier still sees them even if this gate degrades.
       if (content !== null) {
         const branch = getMainCheckoutBranch();
-        if (codePayloadGitVerdict(content, branch, base, resolve(process.cwd())) === "block") {
+        // #627 reviewer P2: an opaque inline payload (`python3 -c "$PYCODE"`,
+        // `python3 -c "$(cat code.py)"`) is not statically resolvable. Mirror
+        // the shell surface's round-11 `sh -c '$VAR'` arm: a valid payload
+        // variable whose command assigns a git-bearing value is unverifiable →
+        // block. A non-git command string still allows (no blanket block).
+        const opaqueInline = code.kind === "inline" &&
+          /^\s*\$(?:\{?[A-Za-z_][A-Za-z0-9_]*\}?|\([\s\S]*\)|\[[\s\S]*\])\s*$/.test(content);
+        const verdict = opaqueInline
+          ? (/\bgit\b/.test(command) ? "block" : "allow")
+          : codePayloadGitVerdict(content, branch, base, resolve(process.cwd()));
+        if (verdict === "block") {
           const what = code.kind === "inline"
             ? "an inline code payload"
             : `${resolve(base, code.value ?? "")}`;
@@ -1245,6 +1261,10 @@ export default function (pi: ExtensionAPI) {
   // ── Session-start: record the branch-ownership baseline + hub check ──────
   pi.on("session_start", async () => {
     const pid = process.pid;
+    // #628 reviewer P3: the new-file volume counter is per-SESSION state — a
+    // resumed/reused process must not inherit a prior session's count.
+    hubNewFileCounts.clear();
+    warnedNewFileTargets.clear();
     if (branchOwnership) {
       try {
         // Only main-checkout sessions get a baseline (worktrees are isolated).

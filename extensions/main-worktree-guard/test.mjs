@@ -4561,7 +4561,7 @@ try {
     cpv(`import subprocess; subprocess.run(["ls","-la"])`) === "allow", true);
   expectBool("P627-16: worktree-targeted code git op → allow (#347 parity)",
     codePayloadGitVerdict(`import subprocess; subprocess.run(["git","reset","--hard"])`, "main", wtR, wtR) === "allow", true);
-  expectBool("P627-17: payload variable + git evidence → fail closed (block)",
+  expectBool("P627-17: payload variable + git evidence → block (fail-closed / var-indirection)",
     cpv(`git = "git"; subprocess.run([git, "reset"])`) === "block", true);
   expectBool("P627-18: concatenated git spelling is a documented residual (allow)",
     cpv(`subprocess.run(["gi"+"t","reset"])`) === "allow", true);
@@ -4581,6 +4581,41 @@ try {
     evaluateHubGateWithTargets(`python3 -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`, "main", hubR).verdict === "block", true);
   expectBool("P627-22: read-only code payload is non-blocking in the hub gate",
     evaluateHubGateWithTargets(`python3 -c 'import subprocess; subprocess.run(["git","status"])'`, "main", hubR).verdict !== "block", true);
+
+  // ── #627 code-review fold-in (cycle 1 P1/P2) ──
+  // P1: flag-with-operand / clustered flags made the operand the "payload" and
+  // skipped the real flag+payload entirely (probe moved HEAD).
+  expectBool("P627-24: operand-taking flags parse through to the real payload",
+    cp(`python3 -W ignore -c 'PAY'`)?.kind === "inline" && cp(`python3 -W ignore -c 'PAY'`)?.value === "PAY" &&
+    cp(`python3 -X dev -c 'PAY'`)?.value === "PAY" && cp(`ruby -I lib -e 'PAY'`)?.value === "PAY" &&
+    cp(`node -r ./m -e 'PAY'`)?.value === "PAY" && cp(`php -d k=v -r 'PAY'`)?.value === "PAY", true);
+  expectBool("P627-25: clustered flags (-Sc / -we) parse letter-by-letter",
+    cp(`python3 -Sc 'PAY'`)?.value === "PAY" && cp(`perl -we 'PAY'`)?.value === "PAY" && cp(`python3 -Sc'PAY'`)?.value === "PAY", true);
+  expectBool("P627-26: operand/cluster spellings still BLOCK the real git payload",
+    cpv(`python3 -W ignore -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`) === "block" &&
+    cpv(`python3 -Sc 'import subprocess; subprocess.run(["git","reset","--hard"])'`) === "block" &&
+    cpv(`perl -we 'system("git reset --hard")'`) === "block" &&
+    cpv(`node -r ./noop.js -e 'require("child_process").execSync("git reset --hard")'`) === "block", true);
+  // P1: paren-less Ruby/Perl system.
+  expectBool("P627-27: paren-less system \"git …\" blocks (Ruby/Perl)",
+    cpv(`ruby -e 'system "git reset --hard"'`) === "block" && cpv(`perl -e 'system "git reset --hard"'`) === "block", true);
+  // P1: prose/comments/docstrings/kwargs must NOT anchor (false-block class).
+  expectBool("P627-28: comment/docstring/data literals and trailing kwargs do NOT false-block",
+    cpv(`import subprocess\n# do not do git reset --hard here\nsubprocess.run(['ls'])`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(['echo','git reset needed'])`) === "allow" &&
+    cpv(`import os; os.system('echo git')`) === "allow" &&
+    cpv(`const {execSync}=require('child_process'); console.log(JSON.stringify({git:'repo'}))`) === "allow" &&
+    cpv(`subprocess.run(["git","branch","-a"], cwd="/x")`) === "allow" &&
+    cpv(`subprocess.run(["git","branch"], cwd="/x")`) === "allow" &&
+    cpv(`subprocess.run(["cat",".git/HEAD"])`) === "allow" &&
+    cpv(`const re = /git/; re.exec(s)`) === "allow", true);
+  // P1: the documented #347 worktree parity must hold through the PRODUCTION
+  // base resolution (commandExecutionCwd), not just a hand-passed execCwd.
+  expectBool("P627-29: commandExecutionCwd resolves the code payload's cd-chain (worktree parity base)",
+    commandExecutionCwd(`cd ${wtR} && python3 -c 'x'`) === wtR &&
+    commandExecutionCwd(`cd ${wtR} && python3 ./x.py`) === wtR, true);
+  expectBool("P627-30: worktree-targeted inline code git op is exempt through the hub gate",
+    evaluateHubGateWithTargets(`cd ${wtR} && python3 -c "import subprocess; subprocess.run(['git','commit','-m','x'])"`, "main", hubR).verdict === "allowed", true);
 
   // #628 hubNewFileVolumeVerdict — pure boundaries + source pins (index.ts).
   expectBool("P628-1: volume verdict boundaries",
