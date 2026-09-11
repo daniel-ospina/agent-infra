@@ -232,7 +232,7 @@ files_rows() {
   ')" || return 1
   [[ -n "$out" ]] || return 1
   if [[ "${FILES_EXPECTED:-}" =~ ^[1-9][0-9]*$ ]]; then
-    count="$(printf '%s\n' "$out" | LC_ALL=C awk -F '\t' '{ print $2 }' | sort -u | wc -l | tr -d ' ')"
+    count="$(printf '%s\n' "$out" | LC_ALL=C awk -F '\t' '{ print $2 }' | LC_ALL=C sort -u | wc -l | tr -d ' ')"
     [[ "$count" == "$FILES_EXPECTED" ]] || return 1
   fi
   printf '%s\n' "$out"
@@ -739,8 +739,8 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_docs_only 'renamed docs to docs' $'renamed\tdocs/b.md\tdocs/a.md' true
   expect_docs_only 'renamed code to docs' $'renamed\tdocs/x.md\tscripts/x.sh' false
   expect_docs_only 'renamed without previous' $'renamed\tdocs/x.md\t' false
-  # Row-count equality against .changed_files closes a forgery whose injected
-  # material is itself well formed (row-by-row validation cannot see it).
+  # Row-by-row validation cannot catch a forgery whose injected material is
+  # itself well formed. Distinct-new-path equality against .changed_files does.
   expect_docs_only 'forged row while expected=1' $'added\tdocs/a.md\t\nadded\tdocs/plans/fake.md\t' false 1
   expect_docs_only 'count matches expected' $'added\tdocs/a.md\t' true 1
   expect_docs_only 'truncated list (expected=2, got 1)' $'added\tdocs/a.md\t' false 2
@@ -748,6 +748,7 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # DIFF ENTRY, so a delete+add on one path is two rows for one path. Comparing
   # rows would falsely block such a PR (a symlink converted to a regular file).
   expect_docs_only 'delete+add same docs path (2 rows, 1 path)' $'removed\tdocs/x.md\t\nadded\tdocs/x.md\t' true 1
+  expect_docs_only 'delete+add same docs path, reversed order' $'added\tdocs/x.md\t\nremoved\tdocs/x.md\t' true 1
   expect_docs_only 'delete+add same docs path, expected=2 (honest mismatch)' $'removed\tdocs/x.md\t\nadded\tdocs/x.md\t' false 2
   # The old path must be judged for EVERY status, not just `renamed`: a
   # filename containing a newline splits one real file into two well-formed
