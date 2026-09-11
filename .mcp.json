@@ -55,7 +55,7 @@
       "cost": "one npx process"
     },
     "tortoise": {
-      "command": "python3",
+      "command": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}/.venv/bin/python3",
       "args": [
         "-m",
         "tortoise.mcp_server"
@@ -63,7 +63,8 @@
       "cwd": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
       "env": {
         "PYTHONPATH": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-        "TORTOISE_DB_URI": "docker://:@localhost:16379/tortoise"
+        "TORTOISE_DB_URI": "docker://:@localhost:16379/tortoise",
+        "TORTOISE_API_KEY": ""
       }
     }
   }
