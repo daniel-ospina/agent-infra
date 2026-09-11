@@ -70,6 +70,11 @@ PR_NUMBER="${1:-${PR_NUMBER:-}}"
 GH_REPO="${GH_REPO:-}"
 DRY_RUN="${PIPELINE_COMPLIANCE_DRY_RUN:-0}"
 FAIL_ALL="${PIPELINE_COMPLIANCE_FAIL_ALL:-0}"
+# Authoritative PR file count (pulls .changed_files). Set by the live fetch;
+# files_rows demands the validated row count equal it, so a forged or
+# truncated diff list cannot read as complete. Empty = not enforced (offline
+# simulations, where the list is constructed in-process).
+FILES_EXPECTED=""
 
 usage() {
   cat >&2 <<'EOF'
@@ -148,8 +153,7 @@ TRACE_KW='\b(ref(s|erences?)?|part[[:space:]]+of|advance(s|d)?|track(s|ed)?|rela
 
 # parse_issue_ref <text> [<kw-pattern>] — print the first issue reference
 # resolved by a closing keyword in <text>, as "owner/repo#N" ("" when none).
-# The repo
-# defaults to $GH_REPO for a bare "#N". Accepted forms, in priority order:
+# The repo defaults to $GH_REPO for a bare "#N". Accepted forms, in priority order:
 #   a. full URL  https://github.com/<owner>/<repo>/issues/<n>
 #                (must NOT match .../pull/<n>)
 #   b. owner/repo#<n>
@@ -188,38 +192,27 @@ parse_issue_ref() {
 # for a docs-only PR — see resolve_issue_ref.
 parse_trace_ref() { parse_issue_ref "$1" "$TRACE_KW"; }
 
-# pr_is_docs_only <files> — true when the PR's diff lies ENTIRELY under docs/.
-# `files` is the "<status><TAB><filename><TAB><old>" list from the pulls/files
-# fetch. Fails CLOSED on anything it cannot prove, because this predicate is
-# what unlocks check (a)'s non-closing keyword — a false `true` would let a
-# code PR dodge closure. Four ways to be untrustworthy, all → NOT docs-only:
-#   1. Empty/unreadable list (a broken fetch must never weaken closure).
-#   2. Any row that is not a well-formed 3-field record, or that has an EMPTY
-#      filename. Git allows newlines and tabs INSIDE a path, and GH reports
-#      filenames raw, so such a name splits one real file into several
-#      well-formed-looking rows. An empty filename is likewise rejected — it
-#      would otherwise vanish when command substitution strips the trailing
-#      newline (order-dependent fail-open).
-#   3. Any row whose OLD path ($3) is present but not under docs/ — checked for
-#      EVERY status, not just `renamed`. A rename (or copy) MOVES content out
-#      of the old path, so both ends must be docs-only; otherwise
-#      `git mv scripts/x.sh docs/x.md` reads as an add of a docs file. This
-#      must be status-independent because split-row framing can relocate a
-#      non-docs old path onto a row whose status is not `renamed`.
-#      A `renamed` row with a MISSING old path is rejected too.
-#   4. At or above GitHub's documented 3000-file cap for this endpoint, where
-#      the response may be TRUNCATED — "every returned path is under docs/"
-#      no longer implies the PR is docs-only.
-pr_is_docs_only() {
-  local rows count paths
+# files_rows <files> — validate the UNTRUSTED diff list from pulls/files and
+# print its well-formed rows. Returns 1 without output if ANY row is
+# malformed, because a single bad row makes the whole list untrustworthy.
+#
+# Every consumer of the file list MUST go through this (or pr_is_docs_only,
+# which wraps it). Parsing the raw rows independently is a fail-open: git
+# allows newlines and tabs inside a path, and GH reports filenames raw, so one
+# real file can be framed as several well-formed-looking rows. A row forged
+# that way could add a `docs/plans/*.md` path (satisfying check d) or a
+# `*.test.ts` path (satisfying check e) without such a file existing.
+#
+# Row-by-row validation alone cannot catch a forgery whose injected material
+# happens to be well formed, so when $FILES_EXPECTED is a positive integer the
+# validated row count must EQUAL it (the PR's authoritative .changed_files).
+# That equality is what makes the list complete, and it subsumes the
+# 3000-file API cap: a truncated response yields fewer rows than expected.
+files_rows() {
+  local rows out count
   rows="$(printf '%s\n' "$1" | sed -e '/^$/d')"
   [[ -n "$rows" ]] || return 1
-  count="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
-  [[ "$count" -lt 3000 ]] || return 1
-  # Validate and extract with awk and an explicit TAB separator. grep's \t is
-  # NOT portable (BSD ERE reads it as a literal 't', GNU as a tab), which made
-  # this predicate silently return the wrong answer per platform.
-  paths="$(printf '%s\n' "$rows" | LC_ALL=C awk -F '\t' '
+  out="$(printf '%s\n' "$rows" | LC_ALL=C awk -F '\t' '
     {
       if (NF != 3) { bad = 1; next }
       if ($2 == "") { bad = 1; next }
@@ -227,17 +220,51 @@ pr_is_docs_only() {
       # The GitHub diff-entry status enum. `unchanged` is documented and must
       # be accepted, or a legitimate docs-only PR is wrongly BLOCKED.
       if (s != "added" && s != "modified" && s != "removed" && s != "renamed" && s != "changed" && s != "copied" && s != "unchanged") { bad = 1; next }
-      # The old path is part of the diff wherever it appears, so it is judged
-      # for EVERY status — not only `renamed`. Split-row framing (a filename
-      # containing a newline) can otherwise relocate a non-docs old path onto
-      # a row labelled `added`, and dropping $3 there would fail OPEN.
+      # A rename must carry its old path; without it we cannot judge both ends.
       if (s == "renamed" && $3 == "") { bad = 1; next }
-      if ($3 != "" && $3 !~ /^docs\//) { bad = 1; next }
-      print $2
-      if ($3 != "") print $3
+      print $1 "\t" $2 "\t" $3
     }
-    END { exit bad }
+    END { if (bad) exit 1 }
   ')" || return 1
+  [[ -n "$out" ]] || return 1
+  if [[ "${FILES_EXPECTED:-}" =~ ^[0-9]+$ ]]; then
+    count="$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+    [[ "$count" == "$FILES_EXPECTED" ]] || return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+# pr_is_docs_only <files> — true when the PR's diff lies ENTIRELY under docs/.
+# `files` is the "<status><TAB><filename><TAB><old>" list from the pulls/files
+# fetch. Fails CLOSED on anything it cannot prove, because this predicate is
+# what unlocks check (a)'s non-closing keyword — a false `true` would let a
+# code PR dodge closure. Four ways to be untrustworthy, all → NOT docs-only:
+#   1. Empty/unreadable list (a broken fetch must never weaken closure).
+#   2. Any row the shared validator rejects — malformed framing or an empty
+#      filename. Git allows newlines and tabs INSIDE a path, and GH reports
+#      filenames raw, so such a name splits one real file into several
+#      well-formed-looking rows. An empty filename is likewise rejected — it
+#      would otherwise vanish when command substitution strips the trailing
+#      newline (order-dependent fail-open).
+#   3. Any row whose OLD path ($3) is present but not under docs/ — checked for
+#      EVERY status, not just `renamed`. A rename MOVES content out of the old
+#      path, and a copy introduces that content at a second path; either way
+#      the old path is part of the same diff, so both ends must be docs-only.
+#      This must be status-independent because split-row framing can relocate
+#      a non-docs old path onto a row whose status is not `renamed`.
+#   4. At or above GitHub's documented 3000-file cap for this endpoint the
+#      response may be TRUNCATED. files_rows enforces row-count equality with
+#      the PR's authoritative .changed_files, so a short (truncated or forged)
+#      list never reads as docs-only.
+pr_is_docs_only() {
+  local rows count paths
+  rows="$(files_rows "$1")" || return 1
+  [[ -n "$rows" ]] || return 1
+  count="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
+  [[ "$count" -lt 3000 ]] || return 1
+  # Both ends of every row must be under docs/ (the new path always, the old
+  # path whenever present).
+  paths="$(printf '%s\n' "$rows" | LC_ALL=C awk -F '\t' '{ print $2; if ($3 != "") print $3 }')"
   [[ -n "$paths" ]] || return 1
   ! printf '%s\n' "$paths" | grep -qvE '^docs/'
 }
@@ -293,11 +320,21 @@ run_checks() {
   local issue_ref="" issue_ref_kind="" issue_number="" issue_repo="" issue_display="" plan_file="" wiring_found="no"
   local is_micro=false is_stdcomplex=false
   local tier="unspecified"
-  local files_plain="" runtime_file="" test_evidence=""
+  local files_plain="" runtime_file="" test_evidence="" files_valid="" files_ok="false"
 
   # Plain filenames (status stripped) from the files fetch — shared by the
-  # plan-doc (d) and test-coverage (e) checks.
-  files_plain="$(printf '%s\n' "$FILES" | awk -F '\t' 'NF >= 2 { print $2 }' || true)"
+  # plan-doc (d) and test-coverage (e) checks. Derived from the VALIDATED row
+  # set (files_rows), never from the raw rows: a filename containing a newline
+  # can forge an extra well-formed row, and trusting it here would let a PR
+  # invent a `docs/plans/*.md` path (check d) or a `*.test.ts` path (check e).
+  #
+  # files_ok records whether the list validated. Check (d) already fails
+  # closed on an empty files_plain, but check (e) must NOT read an empty list
+  # as "no runtime code" — it explicitly fails when files_ok is false.
+  if files_valid="$(files_rows "$FILES" 2>/dev/null)"; then
+    files_ok="true"
+    files_plain="$(printf '%s\n' "$files_valid" | LC_ALL=C awk -F '\t' '{ print $2 }')"
+  fi
 
   echo "=== Pipeline Compliance Gate ==="
   echo "PR:   $GH_REPO#$PR_NUMBER"
@@ -411,10 +448,19 @@ run_checks() {
     # test-run markers in the PR body / commit messages. PRs whose diff is
     # only docs/skills/templates/config (no runtime code) are exempt.
     runtime_file="$(printf '%s\n' "$files_plain" | grep -E '^(extensions/.*\.(ts|js)|bin/.*\.js)$' | grep -vE '\.test\.(ts|js)$' | head -1 || true)"
-    if [[ -z "$runtime_file" ]]; then
+    if [[ "$files_ok" != "true" ]]; then
+      # An unvalidatable diff list must FAIL check (e), not skip it. Skipping
+      # reads as "this PR changes no runtime code", which is exactly what a
+      # forged/truncated list wants — a runtime PR could pass by including a
+      # filename with a newline. We cannot prove absence of runtime code, so
+      # the evidence is unprovable.
+      fail e "cannot validate the PR's file list — test-coverage evidence is unprovable (row validation failed, or the list did not match the PR's file count)."
+      echo "      Missing: a validatable diff list."
+      echo "      Invoke:  re-run the gate. A path containing a newline or tab, or a truncated response, makes the list unparseable."
+    elif [[ -z "$runtime_file" ]]; then
       echo "ℹ️  [e] Skipped: no runtime code changes (extensions/**/*.ts|js, bin/*.js) in this PR."
     else
-      test_evidence="$(printf '%s\n' "$FILES" | awk -F '\t' '$1 == "added" || $1 == "modified" { print $2 }' | grep -E '\.test\.(ts|js)$' | head -1 || true)"
+      test_evidence="$(printf '%s\n' "$files_valid" | LC_ALL=C awk -F '\t' '$1 == "added" || $1 == "modified" { print $2 }' | grep -E '\.test\.(ts|js)$' | head -1 || true)"
       if [[ -n "$test_evidence" ]]; then
         pass e "test coverage evidence: test file change in diff ($test_evidence)"
       elif printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS" | grep -qiE 'tests[[:space:]]+green|[0-9]+[[:space:]]+passed|[0-9]+/[0-9]+|VGATE[[:space:]]+PASS|test[[:space:]]+suite|pytest|npm[[:space:]]+test|vitest'; then
@@ -478,7 +524,8 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   echo ""
   echo "== SIMULATION: all-failures pass 2 of 5 (standard/complex issue, no evidence) =="
   PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""; COMMIT_MSGS=""
-  FILES=$'added\textensions/example/sample.ts'
+  FILES=$'added\textensions/example/sample.ts\t'
+  FILES_EXPECTED=1
   FAILURES=0
   run_checks || true
   summarize || true
@@ -507,7 +554,8 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   ref="$(parse_issue_ref 'resolves SLACK_APPROVAL_FILE first, then Closes #2492')"
   [[ "$ref" == "$GH_REPO#2492" ]] || { echo "❌ SELF-TEST FAIL: keyword + non-issue token shadowing = '$ref', expected '$GH_REPO#2492'." >&2; exit 2; }
   PR_BODY="Fixes daniel-ospina/swarm#2492"; LABELS="complexity:standard"; SCOPING_COMMENT=""; COMMIT_MSGS=""
-  FILES=$'added\textensions/example/sample.ts'
+  FILES=$'added\textensions/example/sample.ts\t'
+  FILES_EXPECTED=1
   FAILURES=0
   run_checks || true
   summarize || true
@@ -523,7 +571,8 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   echo "== SIMULATION: pass 4 of 5 (#513 binding: clean-micro marker on a standard issue fails c) =="
   PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""
   COMMIT_MSGS="review recorded: reviews/1.json verdict=clean-micro @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra)"
-  FILES=$'added\textensions/example/sample.ts'
+  FILES=$'added\textensions/example/sample.ts\t'
+  FILES_EXPECTED=1
   FAILURES=0
   P4LOG="$(mktemp /tmp/pipeline-pass4.XXXXXX)"
   run_checks > "$P4LOG" 2>&1 || true
@@ -549,7 +598,8 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   echo "== SIMULATION: pass 4b (#513 binding precision: prose mention must NOT fire) =="
   PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""
   COMMIT_MSGS="code-review dispatched; the binding rejects body/commits claiming verdict=clean-micro (marker shape only)"
-  FILES=$'added\textensions/example/sample.ts'
+  FILES=$'added\textensions/example/sample.ts\t'
+  FILES_EXPECTED=1
   FAILURES=0
   P4BLOG="$(mktemp /tmp/pipeline-pass4b.XXXXXX)"
   run_checks > "$P4BLOG" 2>&1 || true
@@ -572,7 +622,8 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   echo "== SIMULATION: pass 5 of 5 (#513 micro exemption: clean-micro marker on a micro issue → 0 failures) =="
   PR_BODY="Fixes #1"; LABELS="complexity:micro"; SCOPING_COMMENT=""
   COMMIT_MSGS="review recorded: reviews/1.json verdict=clean-micro @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra)"
-  FILES=$'added\tdocs/plans/2026-09-06-issue-513-clean-micro-verdict.md'
+  FILES=$'added\tdocs/plans/2026-09-06-issue-513-clean-micro-verdict.md\t'
+  FILES_EXPECTED=1
   FAILURES=0
   run_checks || true
   B5="$FAILURES"
@@ -651,8 +702,10 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
 
   # ── #720: docs-only gate + combined resolution ──────────────────────────
   expect_docs_only() {
-    local desc="$1" files="$2" want="$3" got; rc=0
+    local desc="$1" files="$2" want="$3" expected="${4:-}" got rc=0
+    FILES_EXPECTED="$expected"
     pr_is_docs_only "$files" || rc=$?
+    FILES_EXPECTED=""
     [[ "$want" == "true" ]] && want=0 || want=1
     if [[ "$rc" == "$want" ]]; then
       printf '✅ pr_is_docs_only(%s) → %s\n' "$desc" "$([[ $rc == 0 ]] && echo true || echo false)"
@@ -682,6 +735,11 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_docs_only 'renamed docs to docs' $'renamed\tdocs/b.md\tdocs/a.md' true
   expect_docs_only 'renamed code to docs' $'renamed\tdocs/x.md\tscripts/x.sh' false
   expect_docs_only 'renamed without previous' $'renamed\tdocs/x.md\t' false
+  # Row-count equality against .changed_files closes a forgery whose injected
+  # material is itself well formed (row-by-row validation cannot see it).
+  expect_docs_only 'forged row while expected=1' $'added\tdocs/a.md\t\nadded\tdocs/plans/fake.md\t' false 1
+  expect_docs_only 'count matches expected' $'added\tdocs/a.md\t' true 1
+  expect_docs_only 'truncated list (expected=2, got 1)' $'added\tdocs/a.md\t' false 2
   # The old path must be judged for EVERY status, not just `renamed`: a
   # filename containing a newline splits one real file into two well-formed
   # rows, and the non-docs old path can land on a row labelled `added`.
@@ -739,6 +797,10 @@ PR_BODY="$(fetch_json "pulls/$PR_NUMBER" '.body // ""')"
 # renames. Fetched BEFORE the issue resolution: check (a)'s docs-only fallback
 # needs the file list to decide whether a non-closing keyword is acceptable.
 FILES="$(fetch_json "pulls/$PR_NUMBER/files" '.[] | "\(.status)\t\(.filename)\t\(.previous_filename // "")"' 1)"
+# Authoritative file count for this PR. files_rows demands the validated row
+# count EQUAL this, which is what makes a forged or truncated list unable to
+# read as complete (and so unable to look docs-only).
+FILES_EXPECTED="$(fetch_json "pulls/$PR_NUMBER" '.changed_files // ""')"
 
 # Resolve the linked issue (needed before the b–e fetches can run).
 # resolve_issue_ref returns "owner/repo#N"; split so labels/comments are
