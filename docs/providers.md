@@ -82,7 +82,8 @@ plan-review §4.5, subagent-driven-development final reviewer) dispatch with
 `model` = `$SECOND_MODEL` (env), **default `deepseek/deepseek-v4-pro`**
 (provider-qualified — the bare id is ambiguous across providers). When the
 configured second model is set-but-unresolvable or unset-with-unresolvable-
-default, dispatch the tool default and annotate `[SECOND-MODEL-GATE] stand-in`
+default, dispatch the tool default (`deepseek-flash`, the shipped
+`defaultModel`) and annotate `[SECOND-MODEL-GATE] stand-in`
 (never silently substitute). Pricing decision + rationale: issue #284.
 
 ## 3. Env var reference
@@ -263,9 +264,13 @@ with automatic return after balance restore.
 ### Behavior contract
 
 - Marker-only latch trigger (fail-closed nonce auth on the child marker).
-- Alias-family hop chains: `deepseek-v4-flash → qwen-tp/deepseek-v4-flash-0731
+- Alias-family hop chains: `deepseek-flash (canonical; legacy alias
+  deepseek-v4-flash) → qwen-tp/deepseek-v4-flash-0731
   → openrouter/deepseek/deepseek-v4-flash` (qwen-tp is env-blocked until its
-  401 remediation; default chain while blocked: deepseek → openrouter).
+  401 remediation; default chain while blocked: deepseek → openrouter). The
+  family KEY stays the legacy `deepseek-v4-flash` (it is the durable latch-state
+  key); `familyOf`/`legIdentity` normalize BOTH root spellings onto the chain,
+  so an un-migrated legacy frontmatter/session keeps its hop protection.
 - Env knobs: `PROVIDER_FAILOVER_DISABLE=1` (kill switch), `PI_FAILOVER_NO_HOP=1`
   (must-stay), `PROVIDER_EXHAUSTION_TTL_MS` (latch TTL, default 24h — the poller
   is the real clear authority; a stale latch self-heals in one TTL at the

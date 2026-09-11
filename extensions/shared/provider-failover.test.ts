@@ -19,6 +19,7 @@ import {
   ALIAS_FAMILIES,
   classifyExhaustionText,
   familyOf,
+  legIdentity,
   rootPrimaryOfFamily,
   nextLegAfter,
   resolveWithChain,
@@ -93,7 +94,10 @@ function testAsync(name: string, fn: () => Promise<void>) {
   });
 }
 
-const FLASH_PRIMARY = { provider: "deepseek", model: "deepseek-v4-flash" };
+const FLASH_PRIMARY = { provider: "deepseek", model: "deepseek-flash" };
+// #715: the LEGACY spelling of the flash family root — still a family member
+// (the family KEY is unchanged) and the migration-window input spelling.
+const FLASH_PRIMARY_LEGACY = { provider: "deepseek", model: "deepseek-v4-flash" };
 const PRO_PRIMARY = { provider: "deepseek", model: "deepseek-v4-pro" };
 
 // ── Exhaustion signature ─────────────────────────────────────────────
@@ -470,6 +474,11 @@ section("alias-family chain — rename, blocked skip, halt");
 test("familyOf: default-flash rename + openrouter slug + pro identity + unknown + variant exclusion", () => {
   equal(familyOf("deepseek-v4-flash"), "deepseek-v4-flash");
   equal(familyOf("deepseek-v4-flash-0731"), "deepseek-v4-flash");
+  // #715: the CANONICAL root id resolves onto the same family as the legacy
+  // spelling (the family KEY stays the legacy spelling).
+  equal(familyOf("deepseek-flash"), "deepseek-v4-flash");
+  equal(familyOf("deepseek-flash", "deepseek"), "deepseek-v4-flash");
+  equal(familyOf("deepseek-v4-flash", "deepseek"), "deepseek-v4-flash");
   equal(familyOf("deepseek-v4-pro"), "deepseek-v4-pro");
   equal(familyOf("deepseek/deepseek-v4-flash", "openrouter"), "deepseek-v4-flash");
   equal(familyOf("deepseek/deepseek-v4-pro", "openrouter"), "deepseek-v4-pro");
@@ -479,8 +488,118 @@ test("familyOf: default-flash rename + openrouter slug + pro identity + unknown 
   equal(familyOf("deepseek-v4-pro-0813"), undefined);
   equal(familyOf("deepseek/deepseek-v4-flash-vision-exp", "openrouter"), undefined);
   equal(familyOf("deepseek/deepseek-v4-pro-0813", "openrouter"), undefined);
+  // #715: the canonical-dotted spelling has no upstream existence → family-less.
+  equal(familyOf("deepseek/deepseek-flash"), undefined);
+  equal(familyOf("deepseek-flash:batch"), undefined);
+  equal(familyOf("deepseek-v4.1-flash"), undefined);
   equal(familyOf("glm-5.2"), undefined);
   equal(familyOf(null), undefined);
+});
+
+test("#715 legIdentity: root spellings normalize to the canonical root model; hop legs pass through", () => {
+  // canonical, legacy alias, and family-KEY spellings all normalize to the
+  // canonical root model.
+  equal(legIdentity("deepseek-v4-flash", { provider: "deepseek", model: "deepseek-flash" }), "deepseek-flash");
+  equal(legIdentity("deepseek-v4-flash", FLASH_PRIMARY_LEGACY), "deepseek-flash");
+  equal(legIdentity("deepseek-v4-flash", { provider: "deepseek", model: "deepseek-v4-flash" }), "deepseek-flash");
+  // hop legs keep their exact identity — no cross-leg normalization.
+  equal(legIdentity("deepseek-v4-flash", { provider: "qwen-tp", model: "deepseek-v4-flash-0731" }), "deepseek-v4-flash-0731");
+  equal(legIdentity("deepseek-v4-flash", { provider: "openrouter", model: "deepseek/deepseek-v4-flash" }), "deepseek/deepseek-v4-flash");
+  // an off-table provider is not the root leg even if its model spelling matches.
+  equal(legIdentity("deepseek-v4-flash", { provider: "venice", model: "deepseek-v4-flash" }), "deepseek-v4-flash");
+  // unknown family → unchanged.
+  equal(legIdentity("nope", { provider: "deepseek", model: "deepseek-v4-flash" }), "deepseek-v4-flash");
+});
+
+test("#715 WRITE: a CANONICAL-spelling root drain advances onto the first available hop leg (not the root)", () => {
+  const { env } = makeEnv("v715-write-canon");
+  const state = setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: { provider: "deepseek", model: "deepseek-flash" }, env });
+  const fam = state.primaries.deepseek.families["deepseek-v4-flash"];
+  equal(fam.activeLeg?.provider, "openrouter", "qwen-tp blocked by default → openrouter hop");
+  equal(fam.activeLeg?.model, "deepseek/deepseek-v4-flash");
+  equal(fam.hopCount, 1);
+});
+
+test("#715 WRITE (migration window): a LEGACY-spelling root drain advances identically (the -1 walk regression)", () => {
+  const { env } = makeEnv("v715-write-legacy");
+  const state = setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: FLASH_PRIMARY_LEGACY, env });
+  const fam = state.primaries.deepseek.families["deepseek-v4-flash"];
+  equal(fam.activeLeg?.provider, "openrouter", "legacy root spelling must NOT re-return the draining root");
+  equal(fam.activeLeg?.model, "deepseek/deepseek-v4-flash");
+  equal(fam.hopCount, 1);
+  // the durable record never lies: activeLeg is a hop, never the drained root
+  ok(fam.activeLeg?.model !== "deepseek-v4-flash", "activeLeg must not be the legacy root spelling");
+});
+
+test("#715 WRITE: hopCount counts a LEGACY-spelled marker from the CANONICAL active leg (restore-path normalization)", () => {
+  const { env } = makeEnv("v715-fromcurrentactive");
+  // Seed a latched family record whose activeLeg is the CANONICAL root spelling
+  // (a post-upgrade record) with hopCount 1, then send an incoming
+  // LEGACY-spelled marker for that SAME leg. The write path must recognize it
+  // as "the marker came from the current active leg" — without the
+  // legIdentity() normalization in setExhausted's fromCurrentActive check the
+  // two spellings compare unequal and hopCount silently under-counts (1, the
+  // stale-marker path) instead of recording the real re-advance (2).
+  const now = Date.now();
+  fs.writeFileSync(
+    latchStateFile(env),
+    JSON.stringify({
+      version: 1,
+      epoch: 1,
+      updatedAt: new Date(now).toISOString(),
+      primaries: {
+        deepseek: {
+          status: "exhausted",
+          reason: "402",
+          source: "marker",
+          latchedAt: new Date(now).toISOString(),
+          expiresAt: new Date(now + 60 * 60 * 1000).toISOString(),
+          families: {
+            "deepseek-v4-flash": {
+              activeLeg: { provider: "deepseek", model: "deepseek-flash" },
+              hopCount: 1,
+              lastReason: "402",
+            },
+          },
+          notice: null,
+        },
+      },
+      blockedLegs: {},
+    }),
+  );
+  const state = setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: FLASH_PRIMARY_LEGACY,
+    env,
+  });
+  const fam = state.primaries.deepseek.families["deepseek-v4-flash"];
+  equal(
+    fam.hopCount,
+    2,
+    "a legacy-spelled marker from the canonical active root leg is a REAL re-advance (hopCount 2) — hopCount 1 means the normalization was dropped and the marker was misread as stale",
+  );
+  equal(fam.activeLeg?.provider, "openrouter", "the chain still advances to the next available hop leg");
+});
+
+test("#715 READ: a latched canonical root resolves onto the hop leg (qwen-tp unblocked, openrouter blocked)", () => {
+  // qwen-tp unblocked → first hop is qwen-tp
+  const envOpen = { PI_CODING_AGENT_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "pf-715-read-qwen-")), PROVIDER_FAILOVER_BLOCKED: "" };
+  const stOpen = setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: { provider: "deepseek", model: "deepseek-flash" }, env: envOpen });
+  const outOpen = resolveWithChain("deepseek-v4-flash", { provider: "deepseek", model: "deepseek-flash" }, stOpen, { env: envOpen });
+  equal(outOpen.reason, "latched-active");
+  equal(outOpen.leg?.provider, "qwen-tp");
+  equal(outOpen.leg?.model, "deepseek-v4-flash-0731");
+  equal(outOpen.hop, "deepseek->qwen-tp");
+  // default (qwen-tp blocked) → openrouter
+  const { env } = makeEnv("v715-read-or");
+  const st = setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: { provider: "deepseek", model: "deepseek-flash" }, env });
+  const out = resolveWithChain("deepseek-v4-flash", { provider: "deepseek", model: "deepseek-flash" }, st, { env });
+  equal(out.reason, "latched-active");
+  equal(out.leg?.provider, "openrouter");
+  equal(out.hop, "deepseek->openrouter");
 });
 
 test("#512 DRIFT: venice never enters ALIAS_FAMILIES — the chain table stays venice-free", () => {
@@ -864,7 +983,7 @@ test("WRITE: venice-402 with NO root latch → venice own record advances onto d
   ok(!state.primaries["deepseek"], "healthy root never latched on venice evidence");
   const fam = state.primaries.venice.families["deepseek-v4-flash"];
   equal(fam.activeLeg?.provider, "deepseek", "venice→deepseek official (legs[0]) with a healthy root");
-  equal(fam.activeLeg?.model, "deepseek-v4-flash");
+  equal(fam.activeLeg?.model, "deepseek-flash", "#715: legs[0] is the canonical id");
 });
 
 test("WRITE parity: hop-leg (openrouter) drain under fresh root still records under the root (byte-parity)", () => {
@@ -935,7 +1054,7 @@ test("READ: next venice ask after a venice own-latch → hops onto the own recor
   const out = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, state, { env });
   equal(out.reason, "latched-active");
   equal(out.leg?.provider, "deepseek", "venice latched → resolution hops to deepseek official");
-  equal(out.leg?.model, "deepseek-v4-flash");
+  equal(out.leg?.model, "deepseek-flash", "#715: back onto the canonical root leg");
   equal(out.hop, "venice->deepseek");
 });
 
@@ -1005,7 +1124,7 @@ test("second-model P2 (SM1): off-table activeLeg RETREATS to the recovered famil
   const out = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, st2, { env });
   equal(out.reason, "latched-active");
   equal(out.leg?.provider, "deepseek", "retreat to the recovered family default");
-  equal(out.leg?.model, "deepseek-v4-flash");
+  equal(out.leg?.model, "deepseek-flash", "#715: the recovered default is the canonical root leg");
   // while the default stays unavailable, the frozen deeper leg is still honored
   // (no retreat past a still-latched default — same openrouter leg the chain
   // advance would produce, labeled latched-active because the frozen leg is

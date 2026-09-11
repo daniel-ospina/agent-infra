@@ -205,6 +205,8 @@ test("splitSessionModel: #154 rules — first-slash split, claude default, else 
 
 test("sessionFamily: alias-table detection incl. hop-leg model ids", () => {
   equal(sessionFamily("deepseek-v4-flash"), "deepseek-v4-flash");
+  // #715: the CANONICAL flash root id resolves onto the same family.
+  equal(sessionFamily("deepseek-flash"), "deepseek-v4-flash", "canonical root id maps onto the flash family");
   equal(sessionFamily("deepseek-v4-pro"), "deepseek-v4-pro");
   equal(sessionFamily("qwen-tp/deepseek-v4-flash-0731"), "deepseek-v4-flash", "qwen-tp rename maps onto the flash family");
   equal(sessionFamily("openrouter/deepseek/deepseek-v4-flash"), "deepseek-v4-flash", "openrouter slug maps onto the flash family");
@@ -576,7 +578,7 @@ test("HOP-OWN drain under a healthy root: own record + DIRECT return to the prim
     ok(state.primaries.deepseek === undefined, "healthy root NOT latched on another account's evidence");
     equal(pi.setModelCalls.length, 1, "one model switch");
     equal(pi.setModelCalls[0].provider, "deepseek", "switch goes DIRECTLY to the family primary");
-    equal(pi.setModelCalls[0].id, "deepseek-v4-flash");
+    equal(pi.setModelCalls[0].id, "deepseek-flash", "#715: the family primary is the canonical id");
     // No dead intermediate hop to a deeper leg, and the next turn_start must
     // NOT fire a restore (already on the primary — interactiveRestoreTarget
     // returns null when the session is already on the root leg).
@@ -717,7 +719,7 @@ test("turn_start restores to the primary only after the poller cleared a latch S
     // next turn_start on the HOP leg, root record now absent → back to primary
     await pi.emit("turn_start", { turnIndex: 2 }, ctx("tui", modelObj("openrouter", "deepseek/deepseek-v4-flash")));
     const last = pi.setModelCalls[pi.setModelCalls.length - 1];
-    ok(last && last.provider === "deepseek" && last.id === "deepseek-v4-flash", "cleared root (latch seen this session) → back to primary");
+    ok(last && last.provider === "deepseek" && last.id === "deepseek-flash", "cleared root (latch seen this session) → back to the canonical primary (#715)");
 
     // Root record still present (fresh latch) → stay on the hop leg
     setExhausted({
@@ -799,6 +801,12 @@ test("interactiveHopTarget: latched root → first available leg; clear/terminal
       provider: "openrouter",
       model: "deepseek/deepseek-v4-flash",
     });
+    // #715 migration window: the CANONICAL-spelling session leg hops identically
+    // (an un-migrated legacy session and a canonical one share the chain).
+    deepEqual(interactiveHopTarget({ provider: "deepseek", model: "deepseek-flash" }, readLatchState(env), env), {
+      provider: "openrouter",
+      model: "deepseek/deepseek-v4-flash",
+    });
     // same-leg: the session is ALREADY on the active (hop) leg → null
     equal(
       interactiveHopTarget({ provider: "openrouter", model: "deepseek/deepseek-v4-flash" }, readLatchState(env), env),
@@ -827,14 +835,19 @@ test("interactiveRestoreTarget: hop leg + absent root → root leg; root present
   const { env, cleanup } = hermetic();
   applyEnv(env);
   try {
-    // hop leg, no root record (poller cleared) → back to the primary root leg
+    // hop leg, no root record (poller cleared) → back to the primary root leg.
+    // #715: the returned root leg is the CANONICAL id (deliberate bidirectional
+    // normalization — an explicitly legacy-configured session converges onto the
+    // canonical spelling after a hop round trip).
     deepEqual(interactiveRestoreTarget({ provider: "openrouter", model: "deepseek/deepseek-v4-flash" }, readLatchState(env), env), {
       provider: "deepseek",
-      model: "deepseek-v4-flash",
+      model: "deepseek-flash",
     });
     // non-family → null
     equal(interactiveRestoreTarget({ provider: "qwen", model: "qwen3.8-max" }, readLatchState(env), env), null);
-    // already on the primary → null
+    // already on the primary (EITHER spelling) → null (no-op; first-class
+    // migration-window pin: a legacy-spelled session is already "on the root").
+    equal(interactiveRestoreTarget({ provider: "deepseek", model: "deepseek-flash" }, readLatchState(env), env), null);
     equal(interactiveRestoreTarget({ provider: "deepseek", model: "deepseek-v4-flash" }, readLatchState(env), env), null);
     // root record PRESENT (fresh latch) → stay on the hop leg
     setExhausted({
