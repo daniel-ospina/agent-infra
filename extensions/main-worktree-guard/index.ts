@@ -154,6 +154,20 @@ let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?
 // Fail-safe defaults inert so a failed import NEVER false-blocks.
 let extractCodePayload: (command: string) => { kind: "inline" | "file" | "stdin-file" | "module" | "stdin"; value: string | null } | null = () => null;
 let codePayloadGitVerdict: (content: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string) => "allow" | "block" = () => "allow";
+// #744 skew-guard temps: the import block below uses RENAME destructuring
+// (`extractCodePayload: _extractCodePayload`) so the typeof guard can test the
+// freshly-imported value BEFORE it overwrites the fail-safe default above.
+// In a destructuring ASSIGNMENT (no `let`/`const` keyword) every `prop: ident`
+// target must already be a declared binding — ESM is always strict mode, so an
+// undeclared target throws ReferenceError. That throw lands inside the try
+// below, is swallowed by the catch, and ABORTS the import at that target. The
+// assignment is left-to-right, so targets listed BEFORE it stay bound to the
+// real exports — but every target from there on keeps its fail-safe default and
+// `classifierLoaded` never flips, silently disabling the #627/#628/#350 gates
+// and the disordered-hub write helpers for every session (#697 shipped this).
+// Seeded with the same fail-safe defaults the guards fall back to.
+let _extractCodePayload: typeof extractCodePayload = () => null;
+let _codePayloadGitVerdict: typeof codePayloadGitVerdict = () => "allow";
 // #350: hub-WIP hygiene helpers (warn-only). Fail-safe defaults: inert
 // (null/[]) so a failed import NEVER false-blocks — these warnings are
 // discipline prompts, not gates.
@@ -163,6 +177,12 @@ let extractBashWriteTargets: (command: string, cwd?: string) => { resolvedPath: 
 let hubNewFileVolumeVerdict: (count: number) => "warn" | "escalate" | "block" = () => "warn";
 let HUB_NEW_FILE_WARN_BUDGET = 10;
 let HUB_NEW_FILE_BLOCK_CAP = 25;
+// #744 skew-guard temps (same contract as the #627 pair above): declared
+// targets for the rename destructuring in the import block — without these the
+// assignment throws ReferenceError and the catch below degrades the import.
+let _hubNewFileVolumeVerdict: typeof hubNewFileVolumeVerdict = () => "warn";
+let _HUB_NEW_FILE_WARN_BUDGET = 10;
+let _HUB_NEW_FILE_BLOCK_CAP = 25;
 let classifyUntrackedWip: (porcelain: string) => { untracked: string[]; wip: { path: string; pattern: string }[] } = () => ({ untracked: [], wip: [] });
 // #437 (C): PER-WRITE-SITE bash-write candidates (cd-aware) for the
 // disordered-hub gate + the pure tracked intersect. Fail-safe defaults inert.
