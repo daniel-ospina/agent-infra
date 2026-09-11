@@ -99,8 +99,19 @@ export function parseReviewCycleTable(markdown: string): RiskRow[] {
     if (/^-{2,}$/.test(cells[0].replace(/[:\s]/g, ""))) continue; // separator row
     if (/^risk$/i.test(cells[0])) continue; // header row
     const reviewers = Number((cells[1].match(/\d+/) || ["0"])[0]);
-    // "—" (review skipped) parses as 0; anything else must be a plain integer.
-    const maxCycles = /^\d+$/.test(cells[2]) ? Number(cells[2]) : 0;
+    // The Max Cycles cell must be an integer or an explicit skip marker.
+    // Coercing anything else to 0 would let a bogus cell parse as "skip" —
+    // silent fabrication of exactly the kind this suite exists to catch
+    // (cycle-4 review).
+    const cell = cells[2];
+    let maxCycles: number;
+    if (/^\d+$/.test(cell)) {
+      maxCycles = Number(cell);
+    } else if (/^(\u2014|\u2013|-|n\/a|none|skip)$/i.test(cell)) {
+      maxCycles = 0;
+    } else {
+      throw new Error(`${SKILL_PATH}: unrecognised Max Cycles cell "${cell}" on risk row "${cells[0]}"`);
+    }
     rows.push({ risk: cells[0].replace(/\s*\(.*\)\s*$/, ""), reviewers, maxCycles });
   }
   if (rows.length === 0) {
@@ -154,6 +165,42 @@ export function extractCallArgs(src: string, fnName: string): string[][] {
     re.lastIndex = i;
   }
   return calls;
+}
+
+/** Trailing commas yield a final empty argument — drop them. */
+export function normalizeArgs(args: string[]): string[] {
+  const out = [...args];
+  while (out.length > 0 && out[out.length - 1] === "") out.pop();
+  return out;
+}
+
+/**
+ * The production call must pass exactly ONE argument — the cycle list. No
+ * explicit bound and no `tier` (a tier silently overrides the pinned bound).
+ * A second argument, a spread (`...([cycleData, 20])`), or an argument
+ * containing a comma all fail; a hoisted identifier (`evaluateTermination(d)`)
+ * and a trailing comma both pass. Rejecting spread/comma is what closes the
+ * cycle-4 bypass of a pure argument-count check.
+ */
+export function liveCallShapeViolations(src: string): string[] {
+  const calls = extractCallArgs(src, "evaluateTermination");
+  if (calls.length === 0) return ["no evaluateTermination call found in index.ts — update this pin"];
+  const violations: string[] = [];
+  for (const raw of calls) {
+    const args = normalizeArgs(raw);
+    if (args.length !== 1) {
+      violations.push(
+        `live call must pass exactly 1 argument (the cycle list — no bound, no tier); got ${JSON.stringify(args)}`,
+      );
+      continue;
+    }
+    if (args[0].includes("...") || args[0].includes(",")) {
+      violations.push(
+        `live call must not spread or contain a comma — a bound can ride in that way; got ${JSON.stringify(args[0])}`,
+      );
+    }
+  }
+  return violations;
 }
 
 // ── Pure check: declared mapping vs canonical table ─────────────────────────
@@ -315,38 +362,58 @@ test("the LIVE cap: with no explicit bound the exit lands at the canonical High 
   ok(!evaluateTermination(belowCap).shouldExit, "must not exit below the canonical bound");
 });
 
-test("index.ts's live call site takes the default cap (no explicit bound, no tier)", () => {
+test("index.ts's live call site takes the default cap (one plain argument)", () => {
   // TEXTUAL TRIPWIRE, not a proof: index.ts is a pi extension with
-  // module-level side effects, so the call site cannot be exercised from here.
-  // It is deliberately an ARGUMENT-COUNT check rather than a token grepl:
-  //   - `evaluateTermination(cycleData, 20, // REVIEW_CYCLE_CAPS.high)` -> 2 args
-  //   - `evaluateTermination(cycleData, REVIEW_CYCLE_CAPS.high + 10)`   -> 2 args
-  //   - `..., liveCap, Infinity, ..., "standard")`                      -> >2 args
-  // all fail here, while a legitimate hoist (`const d = cycleData`) still
-  // passes. The behavioural test above pins the value; this catches a re-added
-  // bound or a tier override at the production call site.
-  const calls = extractCallArgs(INDEX_SRC, "evaluateTermination");
-  ok(calls.length > 0, "no evaluateTermination call found in index.ts — update this pin");
-  for (const args of calls) {
-    equal(
-      args.length,
-      1,
-      `index.ts must let the canonical default govern (1 arg, no tier override); got ${JSON.stringify(args)}`,
-    );
+  // module-level side effects, so its call site cannot be exercised from here.
+  // The rule is "exactly one argument, no comma, no spread", which rejects
+  // every re-add form while accepting a hoisted identifier:
+  //   evaluateTermination(cycleData, 20)                            -> 2 args
+  //   evaluateTermination(cycleData, 20, // REVIEW_CYCLE_CAPS.high) -> 3 args
+  //   evaluateTermination(cycleData, REVIEW_CYCLE_CAPS.high + 10)   -> 2 args
+  //   evaluateTermination(..., "standard")                          -> 10 args
+  //   evaluateTermination(...([cycleData, 20] as any))              -> spread
+  // The behavioural test above pins the value; this catches a re-added bound
+  // or a tier override at the production call site.
+  deepEqual(liveCallShapeViolations(INDEX_SRC), [], "live call shape drifted");
+});
+
+test("tripwire control: re-added bound / tier / spread are caught", () => {
+  const variants: Array<[string, string]> = [
+    ["explicit bound", "evaluateTermination(cycleData, 20)"],
+    ["tier override", 'evaluateTermination(cycleData, 10, Infinity, 0, 0, 0, 0, 0, false, "complex")'],
+    ["constant expression bound", "evaluateTermination(cycleData, REVIEW_CYCLE_CAPS.high + 10)"],
+    ["trailing comment naming the constant", "evaluateTermination(cycleData, 20, // REVIEW_CYCLE_CAPS.high\n    )"],
+    ["spread", "evaluateTermination(...([cycleData, 20] as any))"],
+  ];
+  for (const [label, replacement] of variants) {
+    const mutated = INDEX_SRC.replace("evaluateTermination(cycleData)", replacement);
+    // Anchor on the REAL call text: if index.ts's call moves, this control says
+    // so instead of failing with a misleading "must be caught" (cycle-4).
+    ok(mutated !== INDEX_SRC, `control "${label}" did not apply — index.ts's call text moved; update this control`);
+    ok(liveCallShapeViolations(mutated).length > 0, `"${label}" must be caught`);
   }
 });
 
-test("tripwire control: a re-added explicit bound or tier at a call site is visible", () => {
-  const reAddedBound = extractCallArgs(
-    INDEX_SRC.replace("evaluateTermination(cycleData)", "evaluateTermination(cycleData, 20)"),
-    "evaluateTermination",
-  );
-  ok(reAddedBound.some((a) => a.length !== 1), "a re-added explicit cap must be caught");
-  const reAddedTier = extractCallArgs(
-    INDEX_SRC.replace("evaluateTermination(cycleData)", 'evaluateTermination(cycleData, 10, Infinity, 0, 0, 0, 0, 0, false, "complex")'),
-    "evaluateTermination",
-  );
-  ok(reAddedTier.some((a) => a.length !== 1), "a tier override must be caught");
+test("tripwire control: legitimate refactors still pass", () => {
+  const trailingComma = INDEX_SRC.replace("evaluateTermination(cycleData)", "evaluateTermination(\n  cycleData,\n)");
+  ok(trailingComma !== INDEX_SRC, "control did not apply — update this control");
+  deepEqual(liveCallShapeViolations(trailingComma), [], "a trailing comma is legitimate");
+
+  const hoisted = INDEX_SRC.replace("evaluateTermination(cycleData)", "evaluateTermination(d)");
+  ok(hoisted !== INDEX_SRC, "control did not apply — update this control");
+  deepEqual(liveCallShapeViolations(hoisted), [], "a hoisted identifier is legitimate");
+});
+
+test("rejects a non-numeric, non-skip Max Cycles cell (no silent 0)", () => {
+  const bogus = MARKDOWN.replace("| Low | 0 (skip review) | — |", "| Low | 0 (skip review) | unlimited |");
+  ok(bogus !== MARKDOWN, "control did not apply — the Low row text moved; update this control");
+  let threw = false;
+  try {
+    parseReviewCycleTable(bogus);
+  } catch {
+    threw = true;
+  }
+  ok(threw, "a bogus Max Cycles cell must throw, not coerce to 0");
 });
 
 test("REVIEW_CYCLE_CAPS declares exactly the canonical keys", () => {

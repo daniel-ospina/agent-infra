@@ -75,9 +75,10 @@ export const REVIEW_CYCLE_CAPS = {
  * NOTE (scope): this mapping is keyed on `reviewers`, and the tiers' V-levels
  * are descriptive. The only tier derivation in-tree (`index.ts`: V2 → complex,
  * everything else → standard) collapses V3/V4 onto `standard`, which would
- * give those levels the *tightest* non-micro cap. No caller passes `tier` to
- * `evaluateTermination` today, so this is latent — but reusing that derivation
- * to drive `tier` needs the V3/V4 case resolved first.
+ * give those levels the *tightest* non-micro cap. No *production* caller
+ * passes `tier` to `evaluateTermination` today (only `termination.test.ts`
+ * does, with `"micro"`), so this is latent — but reusing that derivation to
+ * drive `tier` needs the V3/V4 case resolved first.
  */
 export const TIER_CONFIG = {
   micro: { vLevel: null, maxCycles: REVIEW_CYCLE_CAPS.skip, reviewers: 0 },
