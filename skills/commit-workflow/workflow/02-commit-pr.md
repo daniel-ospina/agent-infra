@@ -77,7 +77,7 @@ about heredocs specifically.
 
 The `.husky/commit-msg` hook warns when it sees the signature of a lost shell
 substitution (unbalanced backticks, or a doubled space where inline code should
-be). It is **warn-only** by default — both signatures have realistic false
+be). By default it merely warns — both signatures have realistic false
 positives (a lone backtick in prose; an aligned code block) — so a warning is a
 prompt to *look*, not a failure. `COMMIT_MSG_MANGLE_STRICT=1` makes it fatal.
 

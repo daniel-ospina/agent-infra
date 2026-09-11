@@ -249,7 +249,7 @@ if cc > 0:
         print(f"- compaction-call cost: ${m['comp_cost_total']:.2f}")
 else:
     # estimate cost if the log lacks a cost field (models.json flash rates)
-    est = (m["msg_input"]*0.14 + m["msg_output"]*0.28 + (m["msg_cacheRead"]+m["msg_cacheWrite"])*0.0028) / 1e6
+    est = (m["msg_input"]*0.15 + m["msg_output"]*0.6 + (m["msg_cacheRead"]+m["msg_cacheWrite"])*0.003) / 1e6
     print(f"- estimated cost: ${est:.2f} (fallback rates; log lacked cost dict)")
 PYEOF
 

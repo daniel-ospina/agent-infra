@@ -65,13 +65,19 @@ The write operations appear once in this skill (by operation name). Invoke them 
 
 ## Mitigation Ranges
 
-Mitigations reduce claim confidence. Range: **0.10–0.50**.
+Mitigations dampen the OPERATOR's effective EP weight. Range: **0.10–0.50**
+(single source of truth: `tortoise/weights.py` module docstring, #2315):
 
-- 0.10: Minor caveat (claim is mostly true)
-- 0.30: Significant limitation
-- 0.50: Major counter-evidence (claim is substantially weakened)
+- 0.10: Minor caveat (claim is mostly true) — keeps 90% of the weight
+- 0.30: Significant limitation — keeps 70% of the weight
+- 0.50: Major counter-evidence (claim is substantially weakened) — keeps
+  50% of the weight (strongest sanctioned mitigation)
 
 Never use <0.10 (negligible) or >0.50 (would invert the claim — use NAND instead).
+
+Formula: `w_eff = w × (1 − strength)` — the mitigation is a graded
+DAMPENER, never a refutation (a mitigated NAND stays a contradiction, only
+weaker).
 
 ## The Critical Semantic: Truth vs Weight
 
@@ -81,7 +87,7 @@ When a claim faces challenge, you have two tools. They address different things:
 |---|------|-------------|
 | **What it says** | "This claim is FALSE" | "This claim is TRUE but matters LESS than it seems" |
 | **Dimension** | Correctness | Relevance |
-| **Effect on EP** | Contradiction propagates through graph | Confidence reduction on the edge |
+| **Effect on EP** | Contradiction propagates through graph | Dampens the operator's weight: `w_eff = w × (1 − strength)` (#2315) |
 | **Applies to** | The argument Point directly | The operator (IMPL connection) between argument and what it supports |
 
 **The golden rule:** Relevance lives on the OPERATOR, truth lives on the POINT.
