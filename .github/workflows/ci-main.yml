@@ -221,7 +221,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Cost-config guard (shipped, --shipped-only)
         run: bash scripts/check-cost-config.sh --shipped-only
-      - name: Cost-config fixture suite (#341 13 scenarios; green same-merge)
+      - name: Cost-config fixture suite (#341 scenarios 0-14; green same-merge)
         run: bash tests/cost-config/run.sh
 
   pi-config-extensions-guard:

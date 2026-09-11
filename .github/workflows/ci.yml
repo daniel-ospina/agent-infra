@@ -120,6 +120,14 @@ jobs:
         run: python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
+      - name: Shipped-default failover coverage pin (#715)
+        # VISIBLE but NOT merge-blocking here: the repo's only required status
+        # check is `pipeline-compliance`. The BLOCKING backstop is the
+        # post-merge ci-main.yml `extensions/shared/*.test.ts` glob. Kept in
+        # this job because it is zero-dependency (`node:*` +
+        # ./provider-failover.js only, which imports `node:` only) — it must run
+        # WITHOUT `npm ci`, which this job does not perform.
+        run: npx tsx extensions/shared/default-coverage.test.ts
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).

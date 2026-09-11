@@ -199,8 +199,8 @@ test-review <test-file> --surface-map "<extract from plan doc>" [--journey-map "
 
 `test-review` handles the full cycle:
 - **Phase 0 — Research Intake:** Researches testing patterns for the surfaces under test
-- **Phase 1 — Review:** 3 parallel fresh sub-agents (correctness, coverage+surface, journey-alignment)
-- **Phase 2-4 — Fix + Re-review Loop:** Surgical fixes, fresh re-review, up to 3 cycles
+- **Phase 1 — Review:** 4 parallel fresh sub-agents (correctness, coverage+surface, journey-alignment, test-quality)
+- **Phase 2-4 — Fix + Re-review Loop:** Surgical fixes, fresh re-review, to test-review's own convergence rule (fingerprint-stall; 10-cycle safety cap — see test-review §Phase 4)
 - **Exit:** Clean (all reviewers return NO ISSUES FOUND) or capped with documented remaining issues
 
 **If `test-review` returns capped:** flag the remaining issues as P1 with `check_type: test-quality-gap`. Include them in the review output.
@@ -966,7 +966,7 @@ When the fixer loop exits with remaining issues (stall/cap/fail), the **orchestr
 
 After the fixer loop converges clean (all Flash-based review cycles done), dispatch ONE second-model reviewer as a final quality gate. The second model is a stronger reasoner — it catches what the cheaper review agents miss.
 
-**Model (second-model gate):** dispatch with `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro` — provider-qualified, unambiguous; resolve via `~/.pi/agent/models.json`). When `$SECOND_MODEL` is set but unresolvable, or unset with the default unresolvable, dispatch the tool default (`deepseek-v4-flash`) and annotate the result `[SECOND-MODEL-GATE] stand-in ($SECOND_MODEL=… set-but-unresolvable | unset+default-unresolvable)`. Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only.
+**Model (second-model gate):** dispatch with `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro` — provider-qualified, unambiguous; resolve via `~/.pi/agent/models.json`). When `$SECOND_MODEL` is set but unresolvable, or unset with the default unresolvable, dispatch the tool default (`deepseek-flash`) and annotate the result `[SECOND-MODEL-GATE] stand-in ($SECOND_MODEL=… set-but-unresolvable | unset+default-unresolvable)`. Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only.
 
 **Dispatch:**
 ```

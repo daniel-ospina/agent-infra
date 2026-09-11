@@ -51,7 +51,7 @@ history; the pin below is the shipped 300K regime.
   sessions**. The 85–87% cache-share figure is marathon-derived;
   the fleet median cache-share is 30%.
 - The pre-registered win is over **COMPACTING sessions**, not fleet-wide: the
-  cache-read area (cacheRead $0.0028/M on flash) is retained where a 1M
+  cache-read area (cacheRead $0.003/M on flash) is retained where a 1M
   ceiling would destroy it.
 - **Fresh line:** an uncached fresh line runs at **~1.4x** the clamped
   compacting-session cost per token (full input price vs cache-read price) —
@@ -88,10 +88,18 @@ data-source-discovery task — no persisted retry records exist to analyze yet.)
 - `qwen-tp`/`qwen3.8-max` (262K) is already under the clamp.
 - `kimi-k3` (1M) is a separate provider, **excluded** by the same
   deepseek-served-only scope. The guard's canonical matcher normalizes ids
-  (strips `provider/` / `~provider/`) and matches only the
-  `deepseek-v4-flash` / `deepseek-v4-pro` family (incl. `-0731`, `-vision-exp`,
-  `-0813`, `-latest`) — kimi-k3 and qwen3.8-max are never flagged (negative
-  controls in the fixture suite).
+  (strips `provider/` / `~provider/`) and matches the canonical
+  `deepseek-flash` (V4.1 Flash), its `deepseek-v4-flash` legacy alias, and the
+  `deepseek-v4-pro` (future bare `deepseek-pro`) family — dotted `v4.1-*` ids,
+  `-0731`, `-vision-exp`, `-0813`, `-latest`, and any `:`-suffixed
+  (routing-tier) shape — the `:` terminator catches those ids, and `:batch` is
+  the fixture control for it — so kimi-k3 and qwen3.8-max are never flagged
+  (negative controls in the fixture suite).
+
+  Rate-card note (2026-09-10): flash is off-peak 0.15 in / 0.60 out / 0.003
+  cache-hit per 1M (peak = 2x). From 12:00 Beijing 2026-09-14 `deepseek-v4-pro`
+  requests route to V4.1 Flash at Flash pricing — revisit its 0.66/1.98/0.022
+  card then (#716).
 
 ## 5. Store-refresh reality + detector semantics
 
