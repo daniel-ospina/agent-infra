@@ -250,6 +250,29 @@
             "cacheRead": 0.003,
             "cacheWrite": 0
           }
+        },
+        {
+          "id": "deepseek-v4-1-flash",
+          "name": "hyphenated v4.1 control (#747)",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": "high",
+            "max": "max"
+          },
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cacheRead": 0.003,
+            "cacheWrite": 0
+          }
         }
       ],
       "modelOverrides": {

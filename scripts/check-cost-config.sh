@@ -74,7 +74,8 @@ block() { echo "  ❌ $1"; BLOCKS=$((BLOCKS + 1)); }
 # `provider/` and `~provider/` prefixes) and flags deepseek-served family ids
 # (canonical `deepseek-flash`, its `deepseek-v4-flash` legacy alias, and the
 # `deepseek-v4-pro` / future bare `deepseek-pro` family — every variant: dotted
-# `v4.1` ids, -0731, -vision-exp, -0813, -latest, and any `:`-suffixed routing
+# `v4.1` ids, hyphenated `v4-1` ids (e.g. the venice `deepseek-v4-1-flash`
+# row, #747), -0731, -vision-exp, -0813, -latest, and any `:`-suffixed routing
 # shape (e.g. the `:batch` control in the fixture suite). Deliberately NOT
 # matched: non-family ids such as `deepseek-proxy` / `deepseek-flashlight`)
 # whose effective contextWindow exceeds CLAMP. Emits one
@@ -86,7 +87,7 @@ import json, re, sys
 
 clamp = int(sys.argv[1])
 path = sys.argv[2]
-DS = re.compile(r'^deepseek-(?:v4(?:\.\d+)?-)?(?:flash|pro)(?:[-:]|$)')
+DS = re.compile(r'^deepseek-(?:v4(?:[.\-]\d+)?-)?(?:flash|pro)(?:[-:]|$)')
 
 def norm(id_):
     return re.sub(r'^~?[^/]*/', '', id_) if '/' in id_ else id_
