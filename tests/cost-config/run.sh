@@ -226,7 +226,7 @@ done
 echo ""
 echo "14. fixture invariants: bounded per-tree delta + non-vacuous controls"
 python3 - "$FIX" "$CLAMP_EXPECTED" <<'PY' >"$OUT" 2>&1
-import json, os, re, sys
+import json, os, re, sys, hashlib
 
 fix, clamp = sys.argv[1], int(sys.argv[2])
 DS = re.compile(r'^deepseek-(?:v4(?:\.\d+)?-)?(?:flash|pro)(?:[-:]|$)')
@@ -314,10 +314,11 @@ CONTROL_IDS = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-expires-on-0910",
 CLEAN_IDS = [m["id"] for m in clean["models.json"]["providers"]["deepseek"]["models"]]
 MODELS_BOUND = {".providers.deepseek.models"} | {
     f".providers.deepseek.models[{i}].contextWindow" for i in range(len(CLEAN_IDS))}
-# The store tree is a whole pre-#476 snapshot, so its bound is the shape: the
-# same four providers, the documented deepseek rows, and nothing else injected.
-STORE_KEYS = {"deepseek", "qwen-token-plan", "openrouter", "moonshot"}
-STORE_DEEPSEEK_IDS = ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro"]
+# The store tree is a frozen pre-#476 snapshot, so "one defect" there means
+# "byte-for-byte the recorded snapshot": shape checks alone let a second
+# injected defect (an extra openrouter/qwen-token-plan row) ride green. Pin the
+# canonical content hash instead; an intended regeneration must update the pin.
+STORE_SNAPSHOT_SHA = "bd7e8e664124c49e26282c63c44d63a73be274c731b5b2af5404ad4d714d58cc"
 
 for tree, (want_models, want_settings, want_store) in EXPECTED.items():
     bad = []
@@ -330,8 +331,11 @@ for tree, (want_models, want_settings, want_store) in EXPECTED.items():
         if not dm <= MODELS_BOUND:
             bad.append(f"models.json delta outside the control bound: {sorted(dm - MODELS_BOUND)}")
         got_ids = [m["id"] for m in raw[tree]["models.json"]["providers"]["deepseek"]["models"]]
-        if got_ids != CLEAN_IDS + CONTROL_IDS:
-            bad.append(f"deepseek model ids {got_ids}")
+        # Only the clean-rows-first ordering is structural; the control rows'
+        # relative order is incidental and must not be over-pinned.
+        if got_ids[:len(CLEAN_IDS)] != CLEAN_IDS or sorted(got_ids) != sorted(CLEAN_IDS + CONTROL_IDS):
+            bad.append(f"deepseek model ids (clean rows must come first; the control set must "
+                       f"match exactly): {got_ids}")
         for i, m in enumerate(raw[tree]["models.json"]["providers"]["deepseek"]["models"][:len(CLEAN_IDS)]):
             cm = clean["models.json"]["providers"]["deepseek"]["models"][i]
             strip = lambda r: {k: v for k, v in r.items() if k != "contextWindow"}
@@ -344,13 +348,10 @@ for tree, (want_models, want_settings, want_store) in EXPECTED.items():
     elif want_store == "snapshot":
         if dt == set():
             bad.append("models-store.json is identical to clean — the pre-#476 snapshot defect is gone")
-        if set(raw[tree]["models-store.json"]) != STORE_KEYS:
-            bad.append(f"models-store.json providers {sorted(raw[tree]['models-store.json'])}")
-        if [m["id"] for m in raw[tree]["models-store.json"]["deepseek"]["models"]] != STORE_DEEPSEEK_IDS:
-            bad.append("models-store.json deepseek rows changed")
-        if raw[tree]["models-store.json"]["moonshot"]["models"] != [
-                {"id": "kimi-k3", "name": "Kimi K3", "contextWindow": 1048576}]:
-            bad.append("models-store.json moonshot block is not exactly the kimi-k3 control")
+        blob = json.dumps(raw[tree]["models-store.json"], sort_keys=True, separators=(",", ":"))
+        if hashlib.sha256(blob.encode()).hexdigest() != STORE_SNAPSHOT_SHA:
+            bad.append("models-store.json content differs from the pinned snapshot — if this is an "
+                       "intended regeneration, update STORE_SNAPSHOT_SHA")
     fails += check(not bad,
                    f"{tree} differs from clean only in its documented defect"
                    + (f": {'; '.join(bad)}" if bad else ""))
