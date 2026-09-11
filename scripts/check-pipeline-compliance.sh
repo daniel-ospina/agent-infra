@@ -256,15 +256,20 @@ files_rows() {
 #      the old path is part of the same diff, so both ends must be docs-only.
 #      This must be status-independent because split-row framing can relocate
 #      a non-docs old path onto a row whose status is not `renamed`.
-#   4. At or above GitHub's documented 3000-file cap for this endpoint the
+#   4. At or above GitHub's documented 3000-entry cap for this endpoint the
 #      response may be TRUNCATED. files_rows enforces DISTINCT-new-path
-#      equality with the PR's authoritative .changed_files, so a short
+#      equality with the PR's authoritative .changed_files, and this predicate
+#      additionally caps the distinct-path count at 3000, so a short
 #      (truncated or forged) list never reads as docs-only.
 pr_is_docs_only() {
   local rows count paths
   rows="$(files_rows "$1")" || return 1
   [[ -n "$rows" ]] || return 1
-  count="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
+  # The 3000-entry cap counts DISTINCT paths, matching the files_rows guard and
+  # the unit GitHub caps at. Counting ROWS would wrongly deny the traceability
+  # fallback to a complete list of >=3000 diff entries with fewer distinct
+  # paths (a delete+add pair is two rows for one path).
+  count="$(printf '%s\n' "$rows" | LC_ALL=C awk -F '\t' '{ print $2 }' | LC_ALL=C sort -u | wc -l | tr -d ' ')"
   [[ "$count" -lt 3000 ]] || return 1
   # Both ends of every row must be under docs/ (the new path always, the old
   # path whenever present).
@@ -432,7 +437,14 @@ run_checks() {
     if [[ "$is_stdcomplex" == "true" ]]; then
       plan_file="$(printf '%s\n' "$files_plain" | grep -E '^docs/plans/.*\.md$' | head -1 || true)"
       if printf '%s' "$SCOPING_COMMENT" | grep -qi 'wiring'; then wiring_found="yes"; fi
-      if [[ -n "$plan_file" ]]; then
+      if [[ "$files_ok" != "true" ]]; then
+        # Mirror check (e): an unvalidatable diff list must not be reported as
+        # "no plan doc", which sends the author hunting for a missing document
+        # when the real cause is an unparseable file list.
+        fail d "cannot validate the PR's file list — plan-doc evidence is unprovable (row validation failed, or the list did not match the PR's file count)."
+        echo "      Missing: a validatable diff list."
+        echo "      Invoke:  re-run the gate. A path containing a newline or tab, or a truncated response, makes the list unparseable; the same message appears if the list does not match the PR's file count."
+      elif [[ -n "$plan_file" ]]; then
         pass d "plan doc in PR ($plan_file)"
       elif [[ "$wiring_found" == "yes" ]]; then
         pass d "plan evidence: Wiring section (wiring-check table) in scoping comment"
@@ -760,6 +772,9 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_docs_only 'unchanged status' $'unchanged\tdocs/a.md\t' true
   expect_docs_only 'at the 3000-file API cap' "$(i=0; while [[ $i -lt 3000 ]]; do printf 'added\tdocs/f%s.md\t\n' "$i"; i=$((i+1)); done)" false
   expect_docs_only 'just under the cap' "$(i=0; while [[ $i -lt 2999 ]]; do printf 'added\tdocs/f%s.md\t\n' "$i"; i=$((i+1)); done)" true
+  # The cap counts DISTINCT paths, so a 3000-row list of 1500 delete+add pairs
+  # is a complete, valid docs-only list and must NOT be denied the fallback.
+  expect_docs_only '3000 rows / 1500 distinct docs paths' "$(i=0; while [[ $i -lt 1500 ]]; do printf 'removed\tdocs/f%s.md\t\nadded\tdocs/f%s.md\t\n' "$i" "$i"; i=$((i+1)); done)" true
 
   expect_resolve() {
     local desc="$1" body="$2" files="$3" expected="$4" got
