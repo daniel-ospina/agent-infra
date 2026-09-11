@@ -3204,7 +3204,7 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(
         Type.String({
           description:
-            "Model to use (default: deepseek-v4-flash). Accepts 'provider/model' (e.g. 'qwen/qwen3.8-max' → provider qwen) or a bare model id resolved against ~/.pi/agent/models.json (e.g. 'qwen3.8-max' → qwen, 'deepseek-v4-flash' → deepseek). Unknown models fall back to the default provider.",
+            "Model to use (default: deepseek-flash). Accepts 'provider/model' (e.g. 'qwen/qwen3.8-max' → provider qwen) or a bare model id resolved against ~/.pi/agent/models.json (e.g. 'qwen3.8-max' → qwen, 'deepseek-flash' → deepseek). Unknown models fall back to the default provider.",
         })
       ),
       mcp_servers: Type.Optional(
@@ -3221,7 +3221,7 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, signal) {
-      const modelParam = params.model ?? "deepseek-v4-flash";
+      const modelParam = params.model ?? "deepseek-flash";
       // #154: resolve provider from the model param — "provider/model" splits
       // explicitly; bare model ids are looked up across configured providers
       // (~/.pi/agent/models.json). Unresolvable models keep the legacy

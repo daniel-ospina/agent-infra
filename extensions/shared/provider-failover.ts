@@ -217,6 +217,12 @@ export interface AliasFamily {
   family: string;
   /** Fully-qualified ordered legs: index 0 is the primary (official) leg. */
   legs: LegRef[];
+  /** Every OTHER spelling of the family's ROOT leg (#715). Exact-match only,
+   * consulted by familyOf() and legIdentity() so a pre-upgrade latch/marker/
+   * frontmatter/session naming the legacy id normalizes onto the SAME family
+   * and the SAME root leg as the canonical id. Never a prefix rule (review R4
+   * P2: variants must not be silently substituted by a base hop leg). */
+  rootAliases?: string[];
 }
 
 /**
@@ -230,11 +236,20 @@ export interface AliasFamily {
  * PROVIDER_FAILOVER_BLOCKED / DEFAULT_BLOCKED_PROVIDERS — no code change.
  */
 export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
+  // KEY stays the legacy spelling: it is the durable latch-state key
+  // (primaries.<provider>.families.<KEY>) and renaming it would orphan every
+  // existing record. The KEY rename is deferred to #728.
   "deepseek-v4-flash": {
     family: "deepseek-v4-flash",
+    rootAliases: ["deepseek-v4-flash"],
     legs: [
-      { provider: "deepseek", model: "deepseek-v4-flash" },
+      // Canonical V4.1-Flash id (#715): same build, same price as the legacy
+      // `deepseek-v4-flash` alias, both registered in models.json.
+      { provider: "deepseek", model: "deepseek-flash" },
       { provider: "qwen-tp", model: "deepseek-v4-flash-0731" },
+      // #727: this openrouter slug (upstream "DeepSeek V4 Flash 0423") is
+      // older-generation vs the primary's V4.1 Flash — re-point/validate the
+      // leg generation there; the chain shape is deliberately unchanged here.
       { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
     ],
   },
@@ -252,6 +267,19 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
  * return undefined (no chain → no hop for that model). The -0731 rename and
  * the openrouter BASE slugs normalize onto the flash/pro families.
  *
+ * Precedence (#715, explicit and exact-match at every step):
+ *   1. direct ALIAS_FAMILIES key hit → that key;
+ *   2. per family (deterministic iteration order): the family's ROOT leg model
+ *      (`fam.legs[0].model`, i.e. the canonical spelling) OR any
+ *      `fam.rootAliases` entry OR the family KEY itself → that family key;
+ *   3. the qwen-tp rename `deepseek-v4-flash-0731` → the flash family;
+ *   4. openrouter/slash ids: last-slash slug match against the BASE slugs;
+ *   5. otherwise undefined.
+ *
+ * The dotted canonical `deepseek/deepseek-flash` is deliberately NOT matched:
+ * it has no upstream existence (it is not registered on OpenRouter) and the
+ * negative pin keeps it family-less.
+ *
  * Deliberately EXACT (review R4 P2): prefix rules would silently map variants
  * (deepseek-v4-flash-vision-exp, deepseek-v4-pro-0813) onto the base family
  * and resolution would SUBSTITUTE the base hop slug for the requested variant
@@ -262,6 +290,10 @@ export function familyOf(modelId: string | null | undefined, provider?: string |
   const id = modelId.trim();
   if (!id) return undefined;
   if (ALIAS_FAMILIES[id]) return id;
+  for (const [famKey, fam] of Object.entries(ALIAS_FAMILIES)) {
+    const rootModel = fam.legs[0]?.model;
+    if (id === rootModel || (fam.rootAliases ?? []).includes(id) || id === famKey) return famKey;
+  }
   if (id === "deepseek-v4-flash-0731") return "deepseek-v4-flash";
   // openrouter slugs arrive as "deepseek/deepseek-v4-flash" (slash id). Only
   // the BASE slug names hop (never -vision-exp / -0813 variants — see above).
@@ -271,6 +303,23 @@ export function familyOf(modelId: string | null | undefined, provider?: string |
     if (slug === "deepseek-v4-pro") return "deepseek-v4-pro";
   }
   return undefined;
+}
+
+/** Normalize a leg's MODEL spelling onto the family ROOT leg's canonical model
+ * (#715). Returns `legs[0].model` when `leg` IS the root leg in any accepted
+ * spelling — canonical, a `rootAliases` entry, or the family KEY — and
+ * `leg.model` unchanged otherwise, so hop legs (qwen-tp, openrouter) keep
+ * their exact-match identity. Bidirectional: a legacy pre-upgrade latch,
+ * marker, agent frontmatter or session spelling and the canonical spelling
+ * normalize to the same leg. */
+export function legIdentity(famKey: string, leg: LegRef): string {
+  const legs = familyLegs(famKey);
+  const root = legs?.[0];
+  if (!root) return leg.model;
+  if (leg.provider !== root.provider) return leg.model;
+  const aliases = ALIAS_FAMILIES[famKey]?.rootAliases ?? [];
+  if (leg.model === root.model || aliases.includes(leg.model) || leg.model === famKey) return root.model;
+  return leg.model;
 }
 
 export function familyLegs(family: string): LegRef[] | undefined {
@@ -915,7 +964,11 @@ export function nextLegAfter(
   // blocks ∪ providers holding a FRESH own exhaustion record (review R2 —
   // never advance INTO a freshly-exhausted provider).
   const unavailable = unavailableProviders(state, env, now, ttl);
-  const startIdx = legs.findIndex((l) => l.provider === after.provider && l.model === after.model);
+  // Leg identity is spelling-normalized (#715) so a legacy-spelling `after`
+  // (pre-upgrade latch / in-flight old marker / old session) still matches the
+  // canonical root leg — without it a canonical root table yields startIdx -1
+  // and the walk re-returns the DRAINING root as the "next" leg.
+  const startIdx = legs.findIndex((l) => l.provider === after.provider && l.model === legIdentity(family, after));
   const skipped: LegRef[] = [];
   for (let i = startIdx + 1; i < legs.length; i++) {
     const leg = legs[i];
@@ -1123,8 +1176,13 @@ export function setExhausted(input: LatchInput): LatchState {
         // A stale marker from a NON-active leg (out-of-band drain) does not
         // advance the count — the chain did not move from its position.
         const noActiveLeg = !prev?.activeLeg;
+        // Normalized the same way as nextLegAfter (#715) so a canonical↔legacy
+        // spelling pair still counts as "the marker came from the current
+        // active leg" and hopCount accounting stays truthful.
         const fromCurrentActive =
-          !!prev?.activeLeg && prev.activeLeg.provider === input.fromLeg.provider && prev.activeLeg.model === input.fromLeg.model;
+          !!prev?.activeLeg &&
+          prev.activeLeg.provider === input.fromLeg.provider &&
+          legIdentity(fam, prev.activeLeg) === legIdentity(fam, input.fromLeg);
         const hopCount = (prev?.hopCount ?? 0) + (noActiveLeg || fromCurrentActive ? 1 : 0);
         families[fam] = {
           activeLeg: step.leg,

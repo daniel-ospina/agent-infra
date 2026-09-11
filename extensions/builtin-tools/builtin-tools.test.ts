@@ -2544,7 +2544,11 @@ function freshFailoverEnv(): { env: Record<string, string | undefined>; cleanup:
   };
 }
 
-const FLASH_ROOT: LegRef = { provider: "deepseek", model: "deepseek-v4-flash" };
+const FLASH_ROOT: LegRef = { provider: "deepseek", model: "deepseek-flash" };
+// #715: the LEGACY spelling of the flash root — same family (the family KEY is
+// unchanged) and the migration-window input spelling. legIdentity() normalizes
+// it onto FLASH_ROOT, so both spellings must resolve identically.
+const FLASH_ROOT_LEGACY: LegRef = { provider: "deepseek", model: "deepseek-v4-flash" };
 const OPENROUTER_FLASH: LegRef = { provider: "openrouter", model: "deepseek/deepseek-v4-flash" };
 const QWENTP_FLASH: LegRef = { provider: "qwen-tp", model: "deepseek-v4-flash-0731" };
 
@@ -2552,7 +2556,7 @@ function mkMarker(over: Partial<ExhaustionMarker>): ExhaustionMarker {
   return {
     kind: "provider-exhaustion",
     hop: "deepseek->openrouter",
-    model: "deepseek-v4-flash",
+    model: "deepseek-flash",
     reason: "402",
     provider: "deepseek",
     nonce: "deadbeef",
@@ -2636,6 +2640,36 @@ test("resolveDispatchLeg: latched root → resolves onto the first AVAILABLE cha
     // default blocked set excludes qwen-tp (401-blocked, sC2) → openrouter
     deepEqual(out.leg, OPENROUTER_FLASH);
     ok(out.hop!.includes("deepseek->"), "hop metadata present");
+  } finally {
+    cleanup();
+  }
+});
+
+test("#715 resolveDispatchLeg: a LEGACY-spelled root ask resolves identically (migration window)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // clear state → the legacy ask must stay itself (must-stay, no coercion)
+    const clear = resolveDispatchLeg(
+      FLASH_ROOT_LEGACY,
+      { version: 1, epoch: 0, updatedAt: "", primaries: {}, blockedLegs: {} },
+      { env },
+    );
+    deepEqual(clear.leg, FLASH_ROOT_LEGACY, "clear state → the requested legacy leg is preserved");
+    // latched root → the legacy ask advances onto the same chain leg as the
+    // canonical ask (the -1 walk regression would otherwise re-return the root)
+    setExhausted({
+      primaryProvider: "deepseek",
+      reason: "402",
+      source: "marker",
+      family: "deepseek-v4-flash",
+      fromLeg: FLASH_ROOT_LEGACY,
+      env,
+    });
+    const legacy = resolveDispatchLeg(FLASH_ROOT_LEGACY, readLatchState(env), { env });
+    const canonical = resolveDispatchLeg(FLASH_ROOT, readLatchState(env), { env });
+    deepEqual(legacy.leg, OPENROUTER_FLASH, "legacy ask → the same hop leg as the canonical ask");
+    deepEqual(legacy.leg, canonical.leg, "both spellings resolve to the identical leg");
+    ok(legacy.hop === canonical.hop, "hop metadata identical for both spellings");
   } finally {
     cleanup();
   }
@@ -2966,7 +3000,7 @@ test("#512 round-1 P2: OFF-TABLE venice markerless connection-error → re-dispa
       env,
     });
     equal(decision.action, "advance", "venice transport error → one re-dispatch on the default");
-    deepEqual(decision.nextLeg, { provider: "deepseek", model: "deepseek-v4-flash" }, "target = deepseek official (family default), never a deeper chain leg");
+    deepEqual(decision.nextLeg, { provider: "deepseek", model: "deepseek-flash" }, "target = deepseek official canonical default (#715), never a deeper chain leg");
     ok(String(decision.annotations.failoverNote).includes("no chain walk"), "annotation says no chain walk");
   } finally {
     cleanup();
