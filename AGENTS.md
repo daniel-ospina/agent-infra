@@ -238,10 +238,15 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
   name is unique per repo, not globally, so concurrent sessions in different repos silently
   overwrite each other's message (#729). Resolve it with
   `MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"`,
-  write the message to `$MSG` with the `write` tool, then `git commit -F "$MSG" && rm -f "$MSG"`.
-  `--absolute-git-dir` keeps the file inside *this* repo's git dir — in a linked worktree, that is
-  the worktree's own gitdir — and the resulting path is absolute, so it survives a cwd change.
-  Collision is structurally impossible. Both `-m "…"` and heredocs pass the message
+  write the message to that path with the `write` tool, then commit with `-F`.
+  `--absolute-git-dir` is per-repo AND worktree-aware — a linked worktree gets *its own* gitdir —
+  so cross-repo and cross-worktree collisions are impossible. (Two sessions in the *same* worktree
+  on the *same* branch still share the file; that case was always racy at the index level anyway.)
+  ⛔ **Every bash tool call is a FRESH SHELL.** A `MSG=…` set in one call is **unset** in the next,
+  so a later `git commit -F "$MSG"` commits from an **empty path** and `rm -f "$MSG"` silently
+  removes nothing (both verified). Re-resolve it in the **same invocation as the commit**:
+  `MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"; git commit -F "$MSG" && rm -f "$MSG"`.
+  Both `-m "…"` and heredocs pass the message
   through the shell first — backticked spans run as command substitution, `$VAR`/`$(…)` expand,
   `${…}`/`{{ }}` break — and the failure is **silent**: the substitution yields an empty string,
   git accepts the mangled result, and only a human reading the log sees the hole. The

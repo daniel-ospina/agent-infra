@@ -11,22 +11,29 @@ npx eslint --fix <relevant files>
 # Stage relevant files (specific paths, not git add -A)
 git add <relevant files>
 
-# Commit — write the message with the `write` tool (it bypasses bash entirely)
-# to the repo's OWN git dir, then commit with -F and remove the file.
+# Commit — the message goes to a file, and the commit reads that file with -F.
 # ⛔ NEVER `git commit -m "…"`. NEVER a heredoc. Both let the shell parse the
 #    message before git sees it — see "⛔ Commit messages" below.
 # #729: never /tmp/commit-msg-<branch>.md — a branch name is unique per repo,
 #       not globally, so concurrent sessions in different repos collide there.
-#       `--absolute-git-dir` is per-repo and worktree-aware; `tr '/' '-'`
-#       sanitizes the branch name.
-MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
-echo "$MSG"   # e.g. /repo/.git/COMMIT_MSG_fix-123-thing.md
-# then `write` the message to $MSG:
+#       The file belongs in the repo's OWN git dir: `--absolute-git-dir` is
+#       per-repo AND worktree-aware, `tr '/' '-'` sanitizes the branch name.
+
+# ── CALL 1 of 3: learn the path ─────────────────────────────────────────
+git rev-parse --absolute-git-dir   # → /repo/.git   (worktree: /repo/.git/worktrees/<n>)
+# message file = <that dir>/COMMIT_MSG_<branch with / → ->.md
+
+# ── CALL 2 of 3: `write` the message to that path (the write tool bypasses bash) ──
 #   <type>(<scope>): <subject>
 #
 #   Closes #ISSUE_NUMBER
-git commit -F "$MSG"
-rm -f "$MSG"
+
+# ── CALL 3 of 3: commit ─────────────────────────────────────────────────
+# ⛔ Every bash tool call is a FRESH SHELL. A `MSG=…` set in CALL 1 is UNSET
+#    here, so `git commit -F "$MSG"` would commit from an empty path and
+#    `rm -f "$MSG"` would silently remove nothing. RE-RESOLVE in this call:
+MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+git commit -F "$MSG" && rm -f "$MSG"
 ```
 
 **IMPORTANT — commit timeout:** Always run `git commit` **foreground** with `timeout: 300000` (5 minutes minimum). Never set `run_in_background: true` for `git commit`. Never use a timeout below 300 seconds. The pre-commit hook (lint-staged running ESLint on staged TS files) takes 20–90 seconds. Killing it mid-run orphans the lint-staged backup stash and leaves `.git/index.lock` behind — causing exit code 128 on every subsequent commit until the lock is manually removed. This timeout rule also applies to all fix-loop `git commit` calls in Steps 2 and 2.5.
@@ -57,14 +64,15 @@ force-push. Author the message with the **`write` tool** — it bypasses bash
 entirely, so nothing in the message is ever interpreted:
 
 ```bash
-# resolve the per-repo message path once (#729) — worktree-aware, collision-free
+# resolve the per-repo message path once (#729) — worktree-aware, collision-free.
+# This is CALL 1; the path must be known before the `write` tool can be used.
 MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
 echo "$MSG"   # → /repo/.git/COMMIT_MSG_fix-668-commit-msg.md
               #   (in a linked worktree: that worktree's own gitdir under .git/worktrees/)
 ```
 
 ```text
-write  <the $MSG path printed above>
+write  <the absolute path printed above>
 
   fix(commit-workflow): ban -m commit messages + flag mangled ones (#668)
 
@@ -77,9 +85,11 @@ write  <the $MSG path printed above>
 ```
 
 ```bash
-# then, in bash — the message never appears on the command line:
-git commit -F "$MSG"
-rm -f "$MSG"
+# then, in bash — the message never appears on the command line.
+# This is CALL 2: a separate shell, so `$MSG` from above is UNSET unless we
+# resolve it again right here.
+MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+git commit -F "$MSG" && rm -f "$MSG"
 ```
 
 `git commit -m` and heredocs are forbidden **everywhere** (commit messages, PR
@@ -98,7 +108,9 @@ On a hit:
 
 1. **Not pushed yet** — amend before anything else:
    ```bash
-   # rewrite $MSG (resolved in Step 1) with the `write` tool first
+   # `write` the corrected message to the same path first, then amend.
+   # RE-RESOLVE here: every bash call is a fresh shell (#729).
+   MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
    git commit --amend -F "$MSG"
    ```
 2. **Pushed, branch under review** — do **not** silently force-push the
