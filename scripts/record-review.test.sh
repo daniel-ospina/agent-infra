@@ -47,20 +47,36 @@ cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "${GH_STUB_LOG:?}"
 if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
-    # PATCH body — capture stdin when GH_STUB_PATCH_BODY is set (#716), else swallow
+    # PATCH body — capture stdin to whichever sink the test asked for, else swallow.
+    # BOTH names are honoured: #716's GH_STUB_PATCH_BODY and #2982's STUB_CAPTURE
+    # are separate callers, so keeping only one would silently turn the other
+    # caller's capture into a no-op and make its assertions vacuous.
     if [ -n "${GH_STUB_PATCH_BODY:-}" ]; then
         cat > "$GH_STUB_PATCH_BODY"
+    elif [ -n "${STUB_CAPTURE:-}" ]; then
+        cat >"$STUB_CAPTURE"
     else
         cat >/dev/null
     fi
     exit 0
 fi
 if [ "$1" = "api" ]; then
-    if grep -qF -- "--jq .head.sha" <<<"$*"; then
+    # #2982: the reviewed-diff fetch. Placed FIRST — the request carries no
+    # --jq, so it would otherwise fall through to the generic body answer.
+    if printf '%s' "$*" | grep -qF -- "application/vnd.github.v3.diff"; then
+        [ "${STUB_DIFF_FAIL:-0}" = "1" ] && exit 1
+        cat "${STUB_DIFF_FILE:-/dev/null}"
+        exit 0
+    fi
+    if printf '%s' "$*" | grep -qF -- "--jq .head.sha"; then
         printf '%s' "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
         echo; exit 0
     fi
-    if grep -qF -- "--jq .body" <<<"$*"; then
+    if printf '%s' "$*" | grep -qF -- "--jq .body"; then
+        # Faithful to `--jq .body`: the RAW body text. Real gh applies the jq
+        # filter and prints the string bare — it does not emit a JSON wrapper.
+        # #2982's carry-forward check greps the body for a marker LINE, so it
+        # needs real newlines rather than "\n" escapes.
         printf '%s' "${STUB_BODY:-PR body}"
         exit 0
     fi
@@ -152,6 +168,27 @@ refs_for_any() { # <repo> <text> — boundary-anchored keyword-class scan
         export REPO="$repo"
         bash -c 'source "$1" >/dev/null 2>&1 || exit 1; closing_issue_refs "$2" "\b$CLOSING_KW"' _ "$RECORD" "$text"
     ) 2>/dev/null || true
+}
+
+# #2982: diff-binding runner — lets a test set the PR body AND the diff bytes
+# the stubbed `gh` returns for the `Accept: …v3.diff` fetch.
+run_record_diff() { # <pr> <sha> <body> [diff-file] [diff-fail] [extra record args…]
+    local pr="$1" sha="$2" body="$3" dfile="${4:-/dev/null}" dfail="${5:-0}"
+    shift $(( $# > 5 ? 5 : $# ))   # remaining args pass verbatim to record-review.sh
+    local rcfile="$T/rc" errfile="$T/err" cap="$T/cap"
+    : > "$LOG"; : > "$cap"; rm -f "$errfile"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        export STUB_BODY="$body" STUB_DIFF_FILE="$dfile" STUB_DIFF_FAIL="$dfail" STUB_CAPTURE="$cap"
+        rc=0
+        bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+    RECORD_CAP="$(cat "$cap" 2>/dev/null || true)"
 }
 
 echo "── 1. Repo known → qualified key ───────────────────────────────"
@@ -522,7 +559,64 @@ run_record_raw 424509 "$SHA" clean "daniel-ospina/agent-infra" --force-stale
 run_record_raw 424510 "$SHA" clean "daniel-ospina/agent-infra"
 [ "$RECORD_RC" = "0" ] && ok "guard: plain 4-positional form still records (rc 0)" || bad "guard: plain form (rc=$RECORD_RC)"
 [ -f "$(rec_path 424510)" ] && ok "guard: plain form wrote a record" || bad "guard: plain form wrote no record"
+echo "── 10. #2982: diff binding (reviewed artifact = the diff) ──────"
+D_F="$T/diff.txt"; printf 'diff --git a/x b/x\n+hello\n' > "$D_F"
+DH="$(openssl dgst -sha256 < "$D_F" | awk '{print $NF}')"
+D_F2="$T/diff2.txt"; printf 'diff --git a/x b/x\n+other\n' > "$D_F2"
+DH2="$(openssl dgst -sha256 < "$D_F2" | awk '{print $NF}')"
+STALE="$(printf 'b%.0s' $(seq 1 40))"
+Q2() { printf '%s/.pi/agent/reviews/daniel-ospina-agent-infra-%s.json' "$F_HOME" "$1"; }
 
+# 10.1 normal path: the record and the signed marker both carry the diff hash.
+run_record_diff 424500 "$SHA" "PR body" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "10.1 normal record succeeds" || bad "10.1 normal record (rc=$RECORD_RC)"
+assert_contains "$(cat "$(Q2 424500)" 2>/dev/null)" "\"diff_sha256\":\"$DH\"" "10.1 record carries diff_sha256"
+assert_contains "$RECORD_CAP" "diff=$DH" "10.1 posted marker carries diff="
+assert_contains "$RECORD_CAP" "@ $SHA diff=$DH " "10.1 marker format: '@ <sha> diff=<hash> ('"
+
+# 10.2 stale sha + prior evidence for the SAME diff → carry forward to the head.
+PRIOR="review recorded: reviews/424501.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra) sig=$(printf '%s' "review recorded: reviews/424501.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra)" | openssl dgst -sha256 -hmac x | awk '{print $NF}')"
+run_record_diff 424501 "$STALE" "body
+
+$PRIOR" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "10.2 stale sha + same diff carries forward (rc 0)" || bad "10.2 carry-forward (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_ERR" "carry-forward" "10.2 explains the carry-forward"
+assert_contains "$(cat "$(Q2 424501)" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "10.2 re-records against the CURRENT head"
+assert_contains "$RECORD_CAP" "@ $SHA diff=$DH " "10.2 posted marker binds the current head + the same diff"
+
+# 10.3 stale sha + prior evidence for a DIFFERENT diff → still refused (exit 3).
+PRIOR3="review recorded: reviews/424502.json verdict=clean @ $STALE diff=$DH2 (daniel-ospina/agent-infra) sig=deadbeef"
+rm -f "$(Q2 424502)"
+run_record_diff 424502 "$STALE" "body
+
+$PRIOR3" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "10.3 stale sha + CHANGED diff still refuses (rc 3)" || bad "10.3 changed-diff refusal (rc=$RECORD_RC)"
+[ ! -f "$(Q2 424502)" ] && ok "10.3 no record written when the diff changed" || bad "10.3 wrote a record for an unreviewed diff"
+assert_contains "$RECORD_ERR" "cannot be shown unchanged" "10.3 names the reason"
+
+# 10.4 stale sha, no prior evidence at all → refused (pre-#2982 behaviour kept).
+rm -f "$(Q2 424503)"
+run_record_diff 424503 "$STALE" "body with no markers" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "10.4 stale sha + no prior evidence refuses (rc 3)" || bad "10.4 no-evidence refusal (rc=$RECORD_RC)"
+
+# 10.5 diff fetch unavailable → legacy sha-only marker (gate's sha path governs).
+run_record_diff 424504 "$SHA" "PR body" "$D_F" "1"
+[ "$RECORD_RC" = "0" ] && ok "10.5 diff fetch failure still records (rc 0)" || bad "10.5 diff-fail record (rc=$RECORD_RC)"
+if printf '%s' "$RECORD_CAP" | grep -qF "diff="; then bad "10.5 legacy marker must not carry diff="; else ok "10.5 falls back to a legacy sha-only marker"; fi
+assert_contains "$RECORD_ERR" "could not compute this PR's diff hash" "10.5 warns that the marker cannot carry forward"
+if grep -q '"diff_sha256"' "$(Q2 424504)" 2>/dev/null; then bad "10.5 record must omit diff_sha256"; else ok "10.5 record omits diff_sha256"; fi
+
+# 10.6 #784 — --force-stale must NOT mint a diff-binding marker. A stale sha's
+# diff cannot be shown unchanged, so emitting diff= would create a
+# (stale_sha, live_diff) pair that never coexisted — and rule (b) accepts on
+# diff-equality ALONE, so the gate would accept it and attest to an unreviewable
+# revision. REGRESSION-SENSITIVE: before the fix this marker carried diff=.
+rm -f "$(Q2 424505)"
+run_record_diff 424505 "$STALE" "body with no markers" "$D_F" 0 --force-stale
+[ "$RECORD_RC" = "0" ] && ok "10.6 #784 --force-stale still records (rc 0)" || bad "10.6 #784 --force-stale record (rc=$RECORD_RC)"
+[ -f "$(Q2 424505)" ] && ok "10.6 #784 the record is still written (force-stale stays usable)" || bad "10.6 #784 record not written"
+if printf '%s' "$RECORD_CAP" | grep -qF "diff="; then bad "10.6 #784 --force-stale must NOT emit diff= (rule (b) would accept a pair that never coexisted)"; else ok "10.6 #784 --force-stale marker is legacy sha-only"; fi
+if grep -q '"diff_sha256"' "$(Q2 424505)" 2>/dev/null; then bad "10.6 #784 record must omit diff_sha256"; else ok "10.6 #784 record omits diff_sha256"; fi
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
