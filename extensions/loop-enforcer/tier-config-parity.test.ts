@@ -21,7 +21,7 @@
  * silently-empty parse or an always-pass check cannot make this suite green.
  * The suite also **pins the tier → risk-row assignment** as a fixture: the
  * pair check alone would accept a coordinated re-point (e.g. `standard` moved
- * to Medium-High, { reviewers: 3, maxCycles: 5 }), and the last negative
+ * to Medium-High, { reviewers: 3, maxCycles: 5 }), and the coordinated-re-point
  * control documents that blind spot rather than pretending it does not exist.
  *
  * WIRING HONESTY: this suite runs in the per-PR `verify` job (VISIBLE, not
@@ -378,7 +378,7 @@ test("index.ts's live call site takes the default cap (one plain argument)", () 
   // call evades it; see the LIMIT note on liveCallShapeViolations), while
   // accepting a hoisted identifier:
   //   evaluateTermination(cycleData, 20)                            -> 2 args
-  //   evaluateTermination(cycleData, 20, // REVIEW_CYCLE_CAPS.high) -> 3 args
+  //   evaluateTermination(cycleData, 20, // REVIEW_CYCLE_CAPS.high) -> 2 args (comment swallows the ')')
   //   evaluateTermination(cycleData, REVIEW_CYCLE_CAPS.high + 10)   -> 2 args
   //   evaluateTermination(..., "standard")                          -> 10 args
   //   evaluateTermination(...([cycleData, 20] as any))              -> spread
