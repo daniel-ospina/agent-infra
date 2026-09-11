@@ -160,8 +160,11 @@ let codePayloadGitVerdict: (content: string, currentBranch: string | null, execu
 // In a destructuring ASSIGNMENT (no `let`/`const` keyword) every `prop: ident`
 // target must already be a declared binding — ESM is always strict mode, so an
 // undeclared target throws ReferenceError. That throw lands inside the try
-// below, is swallowed by the catch, and silently degrades the WHOLE classifier
-// import to the legacy path for every session (#697 shipped exactly this).
+// below, is swallowed by the catch, and ABORTS the import at that target. The
+// assignment is left-to-right, so targets listed BEFORE it stay bound to the
+// real exports — but every target from there on keeps its fail-safe default and
+// `classifierLoaded` never flips, silently disabling the #627/#628/#350 gates
+// and the disordered-hub write helpers for every session (#697 shipped this).
 // Seeded with the same fail-safe defaults the guards fall back to.
 let _extractCodePayload: typeof extractCodePayload = () => null;
 let _codePayloadGitVerdict: typeof codePayloadGitVerdict = () => "allow";

@@ -7,9 +7,9 @@
 // (`extractCodePayload: _extractCodePayload, …`) whose five `_`-prefixed
 // targets were declared NOWHERE. Assigning to an undeclared identifier is a
 // ReferenceError in ESM (always strict mode), it threw inside the module's
-// load `try` block, the catch swallowed it, and every session silently ran
-// the degraded legacy path — a single stderr `console.warn` was the only
-// signal:
+// load `try` block, the catch swallowed it, and every binding at or after the
+// undeclared target kept its fail-safe default — silently degrading those gates
+// in every session. A single stderr `console.warn` was the only signal:
 //
 //   [main-worktree-guard] ⚠️ classify-git.mjs failed to load — bash git guard
 //   DISABLED: ReferenceError: _extractCodePayload is not defined

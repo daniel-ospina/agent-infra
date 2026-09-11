@@ -6,8 +6,9 @@
  * Why this exists (#744): `test.mjs` imports `classify-git.mjs` directly, so it
  * stays green even when `index.ts` itself is broken (a 2026-09-10 regression
  * shipped an undeclared rename-destructuring target; ESM strict mode threw
- * ReferenceError inside the module's load try/catch and every session silently
- * ran the degraded legacy path). The only way to regress-test that is to load
+ * ReferenceError inside the module's load try/catch and every binding at or
+ * after that target kept its fail-safe default for every session). The only
+ * way to regress-test that is to load
  * the REAL module through a loader. pi loads extensions with jiti, which is
  * bundled inside @earendil-works/pi-coding-agent — not resolvable from this
  * repo (CI has no node_modules). These hooks reproduce the same surface:

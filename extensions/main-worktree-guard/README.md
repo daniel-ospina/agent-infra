@@ -799,9 +799,13 @@ marker fixes **guard-blocked** sessions only.
 rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)
 whose five `_`-prefixed targets were declared NOWHERE. An assignment to an
 undeclared identifier is a `ReferenceError` in ESM (always strict mode); it
-threw inside the guarded `await import("./classify-git.mjs")` block, the catch
-logged `bash git guard DISABLED` and left every fail-safe stub in place, and
-**every session silently ran the degraded legacy path** — while `test.mjs`
+threw inside the guarded `await import("./classify-git.mjs")` block and the
+catch logged `bash git guard DISABLED`. The assignment runs left-to-right, so
+the 21 targets listed before `_extractCodePayload` were already bound to the
+real exports — the legacy classifier, the #73 coordinated-delete arm and the
+script-content gate kept working — while every binding at or after it kept its
+fail-safe default, so **those later gates silently degraded in every session**
+— while `test.mjs`
 stayed green, because it imports `classify-git.mjs` directly (and its comments
 assert that `index.ts` is not importable in tests). TypeScript flags the bug
 (`TS2552: Cannot find name '_extractCodePayload'`, and the same for its four
