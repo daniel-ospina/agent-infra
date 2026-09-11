@@ -57,6 +57,8 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 ## Proportional Review Cycles (inlined from proportional-gates v1.0.0)
 
 > Reviewer count scales with plan risk and novelty. Not every plan needs 4 reviewers.
+>
+> **Plus Reviewer #5 (conditional).** The table below is the *proportional* set. Reviewer #5 (Duplication & Architecture, #688) is dispatched **in addition to** it whenever the plan introduces a new component, a new write path, a new shared-state owner, or a new definition of an existing vocabulary — and again on the final cycle. It is **not** triggered by plan length, so a High-risk plan with a new write path dispatches **4 + #5**. Keeping it out of the table is deliberate: it is orthogonal to risk, not a fifth risk tier. See the Reviewer #5 section in Phase 1.
 
 | Risk | Reviewers | Max Cycles |
 |------|-----------|------------|
@@ -65,7 +67,7 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 | **Medium-High** (large plan, some novelty) | 3 reviewers (+ Efficiency) | 5 |
 | **High** (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 8 |
 
-**Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers. The agent notes the decision; a reviewer sub-agent validates it.
+**Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers. The agent notes the decision; a reviewer sub-agent validates it. **A plan that also introduces a new write path / shared-state owner adds Reviewer #5 on top of whichever N the table gives — #5 is additive, never a replacement for another reviewer.**
 
 **Level-based routing:** For Project-level issues (Level: project in issue body), prefer inline review in the current context over sub-agent dispatch. For Epic-level issues (Level: epic), use fresh-context sub-agent reviewers (default). If Level is missing, default to sub-agent review (safe default). See `proportional-gates` skill for the canonical routing table.
 
@@ -356,15 +358,26 @@ ADVISORY, not blocking. Tortoise is ONE source among several — never the only
 one, never required. Unreachable or stale sources lower confidence; they must
 never be reported as "no duplicates found".
 
+OUTPUT — use the skill's own output block VERBATIM, including its Evidence /
+Writers / Shared contract / Verdict lines. Do not invent a shorter schema: the
+Phase 2 parser reads the skill's field names, and a finding that is incomplete by
+the skill's own definition is an open issue, not a pass.
+
 ISSUE:
-  severity: P0|P1|P2|P3|P4
+  severity: P0|P1|P2
   dimension: duplication-architecture
   location: <plan section>
   verdict: unify | keep separate | unify-contract-keep-drivers
+  writers: <ALL writers of the state, path:line>                   # D3
+  shared_contract: <the contract that must be declared, or ABSENT>  # D3
+  evidence: <source — file path, component name, or graph query>    # required
   description: <what duplicates what, or what is incoherent>
   suggestion: <what to fix, and which mechanism prevents recurrence>
 
-If clean: NO ISSUES FOUND
+A `keep separate` verdict with no stated reason is an OPEN finding.
+
+If clean: NO ISSUES FOUND — CLEAN
+If a source was unavailable: NO ISSUES FOUND — DEGRADED (<source> unavailable)
 ```
 
 ### Phase 2 — Merge & Dedup
@@ -437,7 +450,7 @@ Each review cycle dispatches FRESH `task` sub-agents. The reviewers have no memo
 of prior cycles, no investment in defending prior fixes. This prevents confirmation bias.
 
 For each cycle:
-1. Dispatch all N reviewers in parallel via `task` tool (fresh `pi -p` sessions)
+1. Dispatch all N reviewers in parallel via `task` tool (fresh `pi -p` sessions), **plus Reviewer #5** when its trigger fires (new component / new write path / new shared-state owner / new vocabulary definition) or on the final cycle. #5 is dispatched **alongside** the proportional set, never instead of it — N does not drop because #5 fired. If the trigger does not fire, the cycle runs the proportional N only, and the cycle log records `#5: not triggered`.
 2. Parse responses: all return "NO ISSUES FOUND" → exit clean. Issues found → Phase 2-3.
 3. After fixes applied, go to step 1 (repeat cycle)
 

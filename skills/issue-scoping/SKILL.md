@@ -296,7 +296,7 @@ SOLUTION-DIVERGE OUTPUT: <Agent A + Agent B outputs>
 SOLUTION-CONVERGE OUTPUT: <Agent A (+ Agent B) plan drafts>
 CODEBASE EXPLORER: <from Phase 3, if available>
 
-CHECK SIX DIMENSIONS:
+CHECK FIVE DIMENSIONS:
 
 1. DIVERGE GENUINENESS: Are the approaches truly distinct?
    - Do they differ in architecture or technique (not just file names or variable names)?
@@ -329,17 +329,10 @@ CHECK SIX DIMENSIONS:
    - P1 if the chosen approach introduces a dep with zero external verification and no in-repo precedent.
    - Do the solution approaches engage the Phase 1.5 findings (validate, refine, or explicitly reject them)? A plan that ignores its own research artifact is P2 (ritualization check — findings must feed the plan).
 
-6. DUPLICATION & WHOLE-ARCHITECTURE (#688):
-   - Does the chosen approach re-implement something that already exists in the repo — a capability, a helper, a pattern, a vocabulary/kind/enum/constant set, or a **write path into state another component already writes**?
-   - Does it introduce a **second writer of the same state**? This is the high-severity form: two writers of one contract diverge silently, and the divergence shows up as lost fields, not as an error. A second writer must be paired with a shared declaration, a parity test, or fail-closed rejection of unknown fields — and that mechanism must be named.
-   - Does a duplicated vocabulary/invariant have **a test asserting the definitions agree**? If none exists, that absence is the finding.
-   - Is the overall architecture still sound with this component added — or is this a local fix that leaves the whole incoherent?
-   - Dispatch the `duplication-architecture` reviewer (read `skills/reviewers/duplication-architecture/SKILL.md` in full) for checks D1–D9 / A1–A6. **Every near-duplicate finding carries a three-valued verdict:** `unify` | `keep separate` | `unify-contract-keep-drivers` (unify the shared contract, keep the genuinely distinct drivers). Advisory, not blocking. Tortoise is one source among several, never the only one — "no duplicates found" is not a valid report when a source was unchecked.
-
 For each issue:
 ISSUE:
   severity: P0|P1|P2|P3|P4
-  dimension: diverge-genuineness|converge-quality|completeness|wiring|solution-research-evidence|duplication-architecture
+  dimension: diverge-genuineness|converge-quality|completeness|wiring|solution-research-evidence
   location: [specific diamond phase or plan section]
   description: <what's wrong>
   suggestion: <what to fix>
@@ -356,6 +349,58 @@ If no issues: NO ISSUES FOUND
 ### Controller Logic
 
 Same as problem-verify: identify P0/P1 → fix or ignore → re-dispatch if fixed → pass if only P2+.
+
+### Duplication & Architecture Reviewer (#688) — controller dispatch
+
+**The two verifiers above do NOT run the duplication check and must not be told to dispatch reviewers.** They have no `task` tool and no `verdict:` field in their schema, so a nested dispatch would have no route back into the gate. After the verifier loop settles, the **controller** dispatches one more `task` sub-agent:
+
+```
+Read skills/reviewers/duplication-architecture/SKILL.md IN FULL — the file is the
+specification, not this prompt. Then run both halves against the chosen solution:
+
+DUPLICATION (D1–D9): does this re-implement something that already exists — a
+capability, a helper, a pattern, a vocabulary/kind/enum/constant set, or a WRITE
+PATH INTO STATE ANOTHER COMPONENT ALREADY WRITES?
+  - A second writer of the same state is the high-severity form: two writers of
+    one contract diverge silently, and the divergence shows up as lost fields,
+    not as an error. If found, the fix must name its mechanism — a shared
+    declaration, a parity test, or fail-closed rejection of unknown fields.
+  - For each duplicated vocabulary/invariant: does a test assert the definitions
+    agree? If none does, THAT ABSENCE IS THE FINDING.
+  - Discover writers BY FUNCTION, not by name (D2). Separate writers from
+    drivers. Read the family for the odd member. Check reader gates too.
+ARCHITECTURE (A1–A6): is the WHOLE still sound with this component added, or is
+this a local fix that leaves the system incoherent? Any claimed invariant that
+is not actually enforced is a finding (A6).
+
+REQUIRED OUTPUT — use the skill's own output block verbatim, including its
+Evidence / Writers / Shared contract / Verdict lines. Do not invent a shorter
+schema.
+
+VERDICT (three-valued, on EVERY duplication finding — not only D2/D5):
+  unify | keep separate | unify-contract-keep-drivers
+An unjustified `keep separate` is an open finding.
+
+ADVISORY, never blocking. Tortoise is ONE source among several, never the only
+one. Report which sources you checked and which were unavailable;
+"no duplicates found" is invalid if a source went unchecked.
+
+Return:
+  NO ISSUES FOUND — CLEAN
+  or  NO ISSUES FOUND — DEGRADED (<source> unavailable)
+  or  ISSUES: <list using the skill's output block>
+```
+
+**Disposition — this is what keeps it advisory without creating a spin loop:**
+
+| Result | Action |
+|---|---|
+| `CLEAN` | Record verdicts in the Plan doc. Proceed. |
+| `DEGRADED` | Record + name the unavailable source. Not clean, not blocking. Proceed with the caveat in the Plan doc. |
+| `ISSUES` with a verdict | Record. `unify` → fold into the plan. `keep separate` / `unify-contract-keep-drivers` → record the **reason**. |
+| `ISSUES` with **no** verdict | Invalid result. Re-dispatch once; if it repeats, record `⚠️ reviewer returned unverdict findings` and proceed. |
+
+**This reviewer never enters the P0/P1 re-dispatch loop above and never fails the gate.** Its P0 is advisory severity, not blocking severity. Do not re-dispatch the solution verifiers because this reviewer found something.
 
 ---
 

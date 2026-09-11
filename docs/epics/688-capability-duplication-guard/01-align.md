@@ -82,7 +82,7 @@ Honest sequencing decision, stated explicitly rather than assumed:
 
 |  | **Urgent** | **Not Urgent** |
 |---|---|---|
-| **Important** | *(empty)* | **Schedule** |
+| **Important** | *(empty)* | *(no entry)* |
 | **Not Important** | *(empty)* | **Eliminate / Delegate** ← **SELECTED in revision 3** |
 
 **Placement: Not Important / Not Urgent → Delegate (changed in revision 3).**
@@ -166,7 +166,7 @@ The residual is real and narrow. It is also **unmeasured** (K2/K3). The decision
 
 **Profit impact:** indirect cost avoidance; Chain 1 only. The ×6 multiplier is retracted. Order of magnitude qualitative; not a forecast.
 
-**Eisenhower placement: Not Important / Not Urgent → Delegate (revision 3).** Consistent with step 2. Revision 2 placed it at Important/Schedule *narrowed*; revision 3 moved it after subtracting A2/A3/A6 and retracting the compounding basis (line 88). **The Important / Not Urgent quadrant now carries no entry** — the word `Schedule` in that cell is the quadrant's conventional action label, not a placement of #688.
+**Eisenhower placement: Not Important / Not Urgent → Delegate (revision 3).** Consistent with step 2. Revision 2 placed it at Important/Schedule *narrowed*; revision 3 moved it after subtracting A2/A3/A6 and retracting the compounding basis (§Chain 2 — the ×6 multiplier, line 120). **The Important / Not Urgent quadrant now carries no entry** (revision 3 emptied the cell).
 
 ### Key assumptions
 
@@ -203,6 +203,24 @@ These constraints bind any future re-entry. **Re-entry is conditional on all sev
 7. **JUSTIFY must be a first-class *output*, not merely a fixture class.** v1 emits a durable, indexed separation record with rationale. **A JUSTIFY verdict with no record is the guard's failure condition** — without it, the guard is a false positive on deliberate architecture (objection 3).
 
 **Recommendation:** **DEFER / REDIRECT.** Ship the cheap interventions now — **A6** (authoring rule in `writing-skills` + `issue-creation`), **A2** (jscpd-class floor), **A3** (resolve the two surviving instance groups, deciding UNIFY vs JUSTIFY on evidence rather than assumption). Authorise at most a **time-boxed spike** whose single deliverable is the precision measurement on the fixture set (tortoise#2835 R1 + a manifest-backed path). The reviewer is built **only if that measurement clears a pre-declared bar**; otherwise this epic is closed.
+
+---
+
+### ⚠️ OWNER OVERRIDE — recorded 2026-09-10 (rev 4)
+
+**Decision:** the owner has directed that the reviewer be **built and wired now**, ahead of the precision measurement this document's Recommendation requires.
+
+This is a deliberate override of the DEFER verdict, recorded here because constraint 7 and the Recommendation above both make an unrecorded override indistinguishable from a silent scope change. What it does and does not authorise:
+
+| Authorised | Not authorised |
+|---|---|
+| Building `reviewers/duplication-architecture` | Building the **registry** / retrieval layer (still tortoise#2835, still gated on precision) |
+| Wiring it into the four gate sites as an **advisory** check | Making it blocking — K2 (reviewer precision) remains **unmeasured**, so it must not fail a gate |
+| Shipping the fixture set and instrumentation later | Claiming the residual (semantic near-duplicates in the *existing* corpus, and the durable separation record) is addressed — a planning-gate reviewer inspects *proposals* |
+
+**Consequence, stated plainly:** K2 stays Low–medium/unmeasured, and this document's own criterion — "the placement survives *only* with a measured precision bar" — is now knowingly unmet. The review cycle that found this (`#719`, 1 P0 + 10 P1 + 3 P2) is the evidence that the artifacts are *implementable*; it is **not** evidence that the reviewer's judgments are *accurate*. Those are different claims and only the first is now established.
+
+**Close this out by** either (a) producing the precision number on the fixture set, or (b) recording that the reviewer ships advisory-only and unmeasured indefinitely. Until one of those, this override is an open debt, not a resolution.
 
 This is not a retreat from the owner's goal — it is the same goal reached by the cheapest path. The goal ("near-duplicates get detected and explicitly decided") is served by A6+A2+A3 for every case we can currently evidence; the reviewer only adds value for semantic near-duplicates in the **existing** corpus, which is precisely what is unmeasured.
 

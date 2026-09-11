@@ -4,9 +4,8 @@ name: duplication-architecture
 description: Checks whether a proposed change duplicates something that already exists, and whether the overall architecture is still sound once it lands. Every near-duplicate finding carries a three-valued verdict — unify | keep separate | unify-contract-keep-drivers. Dispatched at the scope and plan review gates for both epics and issues.
 domain: capability
 subjects.team: organisation-design-team
-type: Bounded
 status: live
-allowed-tools: read bash grep find web_search web_fetch todo_write task
+allowed-tools: read bash grep find todo_write task mcp__tortoise__tortoise_search mcp__tortoise__tortoise_query mcp__tortoise__tortoise_entity_profile
 summary: "Reviewer — duplication-with-existing + whole-system architectural soundness, at scope and plan gates (epics and issues)."
 created: 2026-09-10
 updated: 2026-09-10
@@ -17,11 +16,14 @@ updated: 2026-09-10
 
 # Reviewer — Duplication & Architecture
 
-> **Skill type:** Modular — independently invocable, reusable across Workflows.
+> **Skill type:** Reviewer — single-file, independently invocable, reusable across Workflows.
 > **Continuity:** none — fresh session per invocation, no state carried between calls.
+> **Advisory:** **Findings never block a gate.** This reviewer has no authority to fail a gate, hold one open, or trigger a re-dispatch of another reviewer. Its `P0` is *advisory* severity, not *blocking* severity. Every consuming gate must state how an advisory P0 is dispositioned; a gate that feeds this output into a blocking fix-loop has inverted the contract.
 > **Boundary:** Checks duplication-with-existing and whole-system soundness. For alignment with a *parent epic* or documented decisions see `reviewers/architectural-soundness`; for integration surfaces and consumers see `reviewers/integration`; for interface contracts see `reviewers/contract-completeness`.
+> **Boundary → `reviewers/improvement-opportunities`:** IO3 ("Reinvention of existing pattern") asks this reviewer's question 1 **at epic-Coherence-Review time**, and IO2/AS4 ("Missed simplification" / "Over-engineering") share this reviewer's A1/A5 axis. **The division: IO2/IO3/AS4 judge whether the epic's *own proposal* is over-built or reinvents something — a property of the epic text. D1/A5 ask whether the artifact duplicates or destabilises *live components elsewhere in the repo* — a property of the system.** Where the same finding is reachable from both, report it once and cross-reference; do not let this reviewer and IO3 file it twice.
+> **Boundary → `reviewers/cross-substep-drift`:** CSD5 detects inconsistency *within one document across its own substeps*. This reviewer detects duplication and incoherence *across components*. A plan that contradicts itself is CSD5's; a plan that writes state another component already writes is this reviewer's.
 
-Answers two questions that nothing else in the pipeline asks:
+Answers two questions that **no other reviewer asks about the live system** (see the `improvement-opportunities` boundary above for the epic-local overlap):
 
 1. **Are we duplicating something that already exists?** — and if so, should it be unified, or kept separate *on purpose*?
 2. **Is the overall architecture sound — including this component in context?** Not "is this component well built". Whether the *system* is still coherent once this lands.
@@ -189,9 +191,11 @@ The area carries an in-code or in-doc guarantee — "single source of truth", "t
 
 > **Why this check exists:** a false invariant claim is not documentation drift; it is an active defence-suppressant. In the acceptance test, a docstring asserting parity "so a rebuilt graph can never drift" was scoped to 2 of 5 writers. Anyone who read it concluded the concern was handled, which is why nobody guarded the remaining three. **Every false invariant claim is a P1 regardless of whether it has caused damage yet.**
 >
-> **Procedure:** grep for the invariant vocabulary (`single source of truth`, `canonical`, `never`, `always`, `guaranteed`, `parity`) in the area and in any doc covering it. For each hit, ask: *is this true universally, or only for the surface it was written against?* State the actual scope.
+> **Procedure:** grep for the invariant vocabulary (`single source of truth`, `canonical`, `never`, `always`, `guaranteed`, `parity`) **within the files this proposal adds or modifies, and in any doc describing those same surfaces** — not repo-wide. A hit is a finding only when the claim is **topical**: it governs the state, field, mechanism, or contract this proposal touches. A bare keyword match in unrelated prose is not a finding. For each topical hit, ask: *is this true universally, or only for the surface it was written against?* State the actual scope.
+>
+> **Cap — and it applies to this whole reviewer.** Report at most **5 findings per gate**, highest severity first. This reviewer is advisory: a long list is dismissed wholesale, which is worse than a short list. If there are more than 5, report the top 5 and state `+N suppressed`. Every finding carries `confidence: high|medium|low`; a `low` finding must be droppable without loss of the underlying decision.
 
-### Required output for every D2 and D5 finding
+### Required output for every duplication finding
 
 A warning is not enough. State a verdict:
 
@@ -214,7 +218,7 @@ Location: [plan/scope section, or component path]
 Problem: [what is duplicated or unsound]
 Evidence: [source — file path, component name, or `tortoise_search` query. Required.]
 Fix: [unify / keep separate / change the design — and if keep separate, state the reason]
-Verdict: unify | keep separate | unify-contract-keep-drivers   # required for D2 and D5
+Verdict: unify | keep separate | unify-contract-keep-drivers   # required for every duplication finding
 Writers: [ALL writers of the state, path:line]                  # required for D3
 Shared contract: [path to the declaration they must share, or NONE]  # required for D3
 ```
@@ -223,6 +227,7 @@ End with:
 
 ```
 DUPLICATION & ARCHITECTURE REVIEW SUMMARY
+Result: [NO ISSUES FOUND — CLEAN | NO ISSUES FOUND — DEGRADED (<source>) | ISSUES]
 Sources consulted: [repo search ✓/✗, Tortoise ✓/✗/unavailable, other]
 Source freshness: [verified | unverifiable — low confidence]
 Duplication findings: [count]  (P0: n, P1: n, P2: n)
