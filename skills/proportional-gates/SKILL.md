@@ -86,7 +86,7 @@ Before deciding what gates to run, classify the change:
 | Low | 0 (skip review) | — |
 | Low-Medium (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |
 | Medium-High (large plan, some novelty) | 3 reviewers (+ Efficiency) | 5 |
-| High (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 8 |
+| High (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 10 |
 
 **Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers.
 

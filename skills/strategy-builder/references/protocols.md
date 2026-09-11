@@ -96,7 +96,7 @@ Used in Phases 3, 3.5, 4, 5, and 7. Three agents run **sequentially** (not paral
 - Produce categorized fix list: fix now / flag for human / acceptable as-is
 - Severity: critical (breaks strategy coherence) / major (weakens argument) / minor (cosmetic)
 
-**Loop count:** 2 minimum. If loop 2 still has critical findings → run loop 3. Cap at 4 loops.
+**Loop count:** 2 minimum. If loop 2 still has critical findings → run loop 3. Then continue to convergence — safety cap: **10 cycles** (the same runaway guard `proportional-gates` sets for its High tier), never a flat 4.
 
 ---
 
