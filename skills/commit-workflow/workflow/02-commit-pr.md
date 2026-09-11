@@ -19,21 +19,27 @@ git add <relevant files>
 #       The file belongs in the repo's OWN git dir: `--absolute-git-dir` is
 #       per-repo AND worktree-aware, `tr '/' '-'` sanitizes the branch name.
 
-# ── CALL 1 of 3: learn the path ─────────────────────────────────────────
+# ── CALL 1 of 4: learn the path ─────────────────────────────────────
 git rev-parse --absolute-git-dir   # → /repo/.git   (worktree: /repo/.git/worktrees/<n>)
 # message file = <that dir>/COMMIT_MSG_<branch with / → ->.md
 
-# ── CALL 2 of 3: `write` the message to that path (the write tool bypasses bash) ──
+# ── CALL 2 of 4: `write` the message to that path (the write tool bypasses bash) ──
 #   <type>(<scope>): <subject>
 #
 #   Closes #ISSUE_NUMBER
 
-# ── CALL 3 of 3: commit ─────────────────────────────────────────────────
-# ⛔ Every bash tool call is a FRESH SHELL. A `MSG=…` set in CALL 1 is UNSET
-#    here, so `git commit -F "$MSG"` would commit from an empty path and
-#    `rm -f "$MSG"` would silently remove nothing. RE-RESOLVE in this call:
-MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
-git commit -F "$MSG" && rm -f "$MSG"
+# ── CALL 3 of 4: commit ─────────────────────────────────────────────
+# ⛔ Do NOT assign MSG in this call. Two independent reasons:
+#    (a) every bash call is a FRESH SHELL, so a `MSG=…` set in CALL 1 is unset
+#        here — `-F "$MSG"` would read an EMPTY path, and `rm -f "$MSG"` would
+#        silently delete nothing (this is exactly what orphaned 12 message files);
+#    (b) assigning a variable in the same call as the commit is refused by the
+#        verification gate as an "in-batch mutation chain".
+#    Inline the substitution instead — self-contained and gate-safe:
+git commit -F "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+
+# ── CALL 4 of 4: delete the message file (re-derive; never reuse a variable) ──
+rm -f "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
 ```
 
 **IMPORTANT — commit timeout:** Always run `git commit` **foreground** with `timeout: 300000` (5 minutes minimum). Never set `run_in_background: true` for `git commit`. Never use a timeout below 300 seconds. The pre-commit hook (lint-staged running ESLint on staged TS files) takes 20–90 seconds. Killing it mid-run orphans the lint-staged backup stash and leaves `.git/index.lock` behind — causing exit code 128 on every subsequent commit until the lock is manually removed. This timeout rule also applies to all fix-loop `git commit` calls in Steps 2 and 2.5.
@@ -64,11 +70,14 @@ force-push. Author the message with the **`write` tool** — it bypasses bash
 entirely, so nothing in the message is ever interpreted:
 
 ```bash
-# resolve the per-repo message path once (#729) — worktree-aware, collision-free.
+# Resolve the per-repo message path (#729) — worktree-aware, collision-free.
 # This is CALL 1; the path must be known before the `write` tool can be used.
-MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
-echo "$MSG"   # → /repo/.git/COMMIT_MSG_fix-668-commit-msg.md
-              #   (in a linked worktree: that worktree's own gitdir under .git/worktrees/)
+# Echo the substitution rather than assigning a variable: a `MSG=…` set here
+# would be UNSET in the call that commits, which is how the empty-path bug
+# happened in the first place.
+echo "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+# → /repo/.git/COMMIT_MSG_fix-668-commit-msg.md
+#   (in a linked worktree: that worktree's own gitdir under .git/worktrees/)
 ```
 
 ```text
@@ -86,10 +95,12 @@ write  <the absolute path printed above>
 
 ```bash
 # then, in bash — the message never appears on the command line.
-# This is CALL 2: a separate shell, so `$MSG` from above is UNSET unless we
-# resolve it again right here.
-MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
-git commit -F "$MSG" && rm -f "$MSG"
+# This is a SEPARATE call, so no variable survives: inline the substitution.
+# (Assigning MSG here would ALSO be refused by the verification gate.)
+git commit -F "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+
+# separate call — re-derive the path, never reuse a variable:
+rm -f "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
 ```
 
 `git commit -m` and heredocs are forbidden **everywhere** (commit messages, PR
@@ -109,9 +120,9 @@ On a hit:
 1. **Not pushed yet** — amend before anything else:
    ```bash
    # `write` the corrected message to the same path first, then amend.
-   # RE-RESOLVE here: every bash call is a fresh shell (#729).
-   MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
-   git commit --amend -F "$MSG"
+   # Inline the substitution: a separate call, and no variable assignment
+   # may share a call with the commit (#729).
+   git commit --amend -F "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
    ```
 2. **Pushed, branch under review** — do **not** silently force-push the
    rewritten message. Post a correction note on the PR/issue (what was wrong,

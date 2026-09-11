@@ -236,16 +236,19 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
 - **Commit messages: always `git commit -F <file>` — never `-m`, never a heredoc.** The message
   file lives in the repo's own git dir, never a shared `/tmp/commit-msg-<branch>.md` — a branch
   name is unique per repo, not globally, so concurrent sessions in different repos silently
-  overwrite each other's message (#729). Resolve it with
-  `MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"`,
-  write the message to that path with the `write` tool, then commit with `-F`.
+  overwrite each other's message (#729). The path is
+  `$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md` —
+  write the message there with the `write` tool, then commit with `-F`.
   `--absolute-git-dir` is per-repo AND worktree-aware — a linked worktree gets *its own* gitdir —
   so cross-repo and cross-worktree collisions are impossible. (Two sessions in the *same* worktree
   on the *same* branch still share the file; that case was always racy at the index level anyway.)
-  ⛔ **Every bash tool call is a FRESH SHELL.** A `MSG=…` set in one call is **unset** in the next,
-  so a later `git commit -F "$MSG"` commits from an **empty path** and `rm -f "$MSG"` silently
-  removes nothing (both verified). Re-resolve it in the **same invocation as the commit**:
-  `MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"; git commit -F "$MSG" && rm -f "$MSG"`.
+  ⛔ **Every bash tool call is a FRESH SHELL, and one call must not both assign and commit.** A
+  `MSG=…` set in one call is **unset** in the next, so a later `git commit -F "$MSG"` commits from
+  an **empty path** and `rm -f "$MSG"` silently removes nothing (both verified). Assigning `MSG`
+  in the same call as the commit is *also* refused by the verification gate ("in-batch mutation
+  chain"). So put the substitution **inline in the commit command** — no variable:
+  `git commit -F "$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"`,
+  then delete the message file in a **separate** call, re-deriving the path the same way.
   Both `-m "…"` and heredocs pass the message
   through the shell first — backticked spans run as command substitution, `$VAR`/`$(…)` expand,
   `${…}`/`{{ }}` break — and the failure is **silent**: the substitution yields an empty string,
