@@ -30,6 +30,20 @@
 #                          test-run markers in PR body/commits (tests green,
 #                          N passed, N/N ratio, VGATE PASS, test suite,
 #                          pytest, npm test, vitest)
+#   f. SECOND-MODEL GATE  — #716: when the diff touches the second-model
+#                          guarded surface (the designation config, its guard
+#                          script, the four second-model gate skills,
+#                          AGENTS.md / the base template, docs/providers.md,
+#                          record-review.sh, or this script) the PR body must
+#                          carry `[SECOND-MODEL-GATE] model=<id>
+#                          independent=<yes|NO|DEGRADED>`; `NO`/`DEGRADED` and a
+#                          build-equivalent id FAIL. ONE bootstrap exemption:
+#                          when the PR's BASE ref does not carry
+#                          pi-bootstrap/pi-config/second-model.json, (f) is a
+#                          loud WARN instead of a failure — keyed ONLY on the
+#                          file's absence on base (never a branch name, PR
+#                          number, or commit range), and never obtainable by a
+#                          diff that touches the file.
 #
 # Tier exemptions (deterministic, from issue labels):
 #   complexity:micro          → checks b–e skipped (a still required)
@@ -158,8 +172,7 @@ parse_issue_ref() {
   fi
 }
 
-# fetch_json <api-path> <jq-expr> [paginate] [repo] — GET repos/$REPO/<path>
-# via gh, print jq-filtered result to stdout. Pass "1" for list endpoints to
+# fetch_json <api-path> <jq-expr> [paginate] [repo] — GET repos/$REPO/<path># via gh, print jq-filtered result to stdout. Pass "1" for list endpoints to
 # page through all results (comments/commits/files/labels). Pass an explicit
 # repo (owner/repo) to fetch from a repo other than $GH_REPO — used for
 # cross-repo issue references, where labels/comments live on the issue's repo.
@@ -192,8 +205,50 @@ fetch_json() {
 # ── Core checks ─────────────────────────────────────────────────────────────
 # Runs against globals (set by the caller): PR_BODY, LABELS, SCOPING_COMMENT,
 # COMMIT_MSGS, FILES. Prints pass/fail per check; returns failure count.
+# ── #716 second-model gate (check f) helpers ────────────────────────────────
+# The guarded surface: a diff touching ANY of these means the second-model
+# gate itself changed, so the PR must carry the recorded gate line.
+GUARDED_SURFACE_RE='^(pi-bootstrap/pi-config/second-model\.json|scripts/check-second-model\.sh|scripts/record-review\.sh|scripts/check-pipeline-compliance\.sh|\.husky/pre-commit|AGENTS\.md|templates/AGENTS\.base\.md|docs/providers\.md|skills/(code-review|issue-scoping|plan-review|subagent-driven-development)/SKILL\.md)$'
+
+SM_GUARD="$(cd "$(dirname "$0")/.." && pwd)/scripts/check-second-model.sh"
+
+# second_model_base_absent — true when the PR's BASE ref does NOT carry
+# pi-bootstrap/pi-config/second-model.json. The bootstrap exemption is a
+# NARROW one-time carve-out keyed ONLY on the file's absence on base:
+#   * never keyed on a branch name, PR number, or commit range;
+#   * never obtainable by a diff that touches the file (the file's content on
+#     base is what is read, and the base is the PR's base ref, not HEAD);
+#   * once the file exists on base, enforcement is unconditional.
+# Base resolution (first resolvable wins — `git show <base>:<path>`, never a
+# blind `origin/main` assumption): GITHUB_BASE_SHA → origin/$GITHUB_BASE_REF →
+# $GITHUB_BASE_REF → $PIPELINE_BASE_REF → origin/main → HEAD^.
+# An unresolvable base (shallow clone / no git) is treated as absent (WARN)
+# during the bootstrap window and reported loudly.
+second_model_base_absent() {
+  # Test/simulation seam (offline, no git): a literal file path or "ABSENT".
+  if [ -n "${PIPELINE_SECOND_MODEL_BASE_FILE:-}" ]; then
+    [ "$PIPELINE_SECOND_MODEL_BASE_FILE" = "ABSENT" ] && return 0
+    [ -f "$PIPELINE_SECOND_MODEL_BASE_FILE" ] && return 1
+    return 0
+  fi
+  local root ref
+  root="$(cd "$(dirname "$0")/.." && pwd)"
+  for ref in "${GITHUB_BASE_SHA:-}" "origin/${GITHUB_BASE_REF:-}" "${GITHUB_BASE_REF:-}" \
+             "${PIPELINE_BASE_REF:-}" "origin/main" "HEAD^"; do
+    [ -n "$ref" ] || continue
+    case "$ref" in origin/) continue ;; esac
+    git -C "$root" rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || continue
+    if git -C "$root" show "${ref}:pi-bootstrap/pi-config/second-model.json" >/dev/null 2>&1; then
+      return 1   # present on base → enforcement ON
+    fi
+    return 0     # base resolvable, file absent → bootstrap exemption
+  done
+  return 0       # base unresolvable → bootstrap exemption (loudly reported)
+}
+
 run_checks() {
   local issue_ref="" issue_number="" issue_repo="" issue_display="" plan_file="" wiring_found="no"
+  local sm_surface="" sm_line="" sm_model="" sm_indep="" sm_rc=0
   local is_micro=false is_stdcomplex=false
   local tier="unspecified"
   local files_plain="" runtime_file="" test_evidence=""
@@ -318,6 +373,62 @@ run_checks() {
     echo ""
   fi
 
+  # f. SECOND-MODEL GATE (#716) — required whenever the diff touches the
+  # guarded surface (the designation config, its guard script, the four
+  # second-model gate skills, AGENTS.md / the base template, docs/providers.md,
+  # record-review.sh, or this script). Tier-independent: a micro PR that
+  # changes the gate machinery still owes the recorded gate line. The ONE
+  # exemption is the bootstrap carve-out in second_model_base_absent().
+  sm_surface="$(printf '%s\n' "$files_plain" | grep -E "$GUARDED_SURFACE_RE" | head -1 || true)"
+  if [[ -z "$sm_surface" ]]; then
+    echo "ℹ️  [f] Skipped: this PR does not touch the second-model guarded surface."
+  elif second_model_base_absent; then
+    echo ""
+    echo "  ⚠️  WARN [f] bootstrap: gate not yet installed on base — enforcing from the next diff that touches the guarded surface"
+    echo "      (pi-bootstrap/pi-config/second-model.json is absent on the PR's BASE ref. This is a one-time"
+    echo "       bootstrap exemption keyed ONLY on the file's absence on base — it cannot be obtained by touching"
+    echo "       the file, nor keyed on a branch name, PR number, or commit range. Once the file exists on base,"
+    echo "       check (f) is unconditional.)"
+    echo ""
+  else
+    sm_line="$(printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS" | grep -oE '\[SECOND-MODEL-GATE\] model=[^[:space:]]+ independent=(yes|NO|DEGRADED)' | tail -1 || true)"
+    if [[ -z "$sm_line" ]]; then
+      fail f "no [SECOND-MODEL-GATE] line on a diff touching the guarded surface ($sm_surface) — the PR body must record \"[SECOND-MODEL-GATE] model=<resolved provider/id> independent=<yes|NO|DEGRADED>\"."
+      echo "      Missing: the recorded second-model gate line."
+      echo "      Invoke:  the second-model gate — resolve with scripts/check-second-model.sh --print / --probe, then record it (record-review.sh with SECOND_MODEL_GATE_MODEL / SECOND_MODEL_GATE_INDEPENDENT)."
+    else
+      sm_model="$(printf '%s' "$sm_line" | sed -E 's/.*model=([^[:space:]]+).*/\1/')"
+      sm_indep="$(printf '%s' "$sm_line" | sed -E 's/.*independent=([A-Za-z]+).*/\1/')"
+      case "$sm_indep" in
+        yes)
+          if [[ ! -f "$SM_GUARD" ]]; then
+            fail f "second-model gate line present but the guard script is missing ($SM_GUARD) — cannot verify the recorded id is independent (fail closed)."
+          elif bash "$SM_GUARD" --equivalence "$sm_model" >/dev/null 2>&1; then
+            # exit 0 = the recorded id IS in the primary's build-equivalence set
+            fail f "the recorded second-model id ($sm_model) is the SAME served build as the primary — a build-equivalent id is not an independent reviewer (record a non-equivalent id; see scripts/check-second-model.sh --print)."
+          else
+            sm_rc=$?
+            if [[ "$sm_rc" -eq 1 ]]; then
+              pass f "second-model gate recorded: model=$sm_model independent=yes (non-build-equivalent to the primary)"
+            else
+              fail f "could not classify the recorded second-model id ($sm_model) with $SM_GUARD (exit $sm_rc) — fail closed."
+            fi
+          fi
+          ;;
+        NO)
+          fail f "second-model gate recorded independent=NO ($sm_model) — a same-build/stand-in review is not independent; do NOT merge. A DEGRADED/no-funded-model window is a human decision, recorded as independent=DEGRADED — never laundered into a pass."
+          ;;
+        DEGRADED)
+          fail f "second-model gate recorded independent=DEGRADED ($sm_model) — no solvent+reachable independent model; the merge gate fails closed by design. Get a model funded, or clear the bootstrap window (an operator decision), then re-record."
+          ;;
+        *)
+          fail f "unrecognised second-model gate value independent=$sm_indep — expected yes|NO|DEGRADED."
+          ;;
+      esac
+    fi
+  fi
+  echo ""
+
   return "$FAILURES"
 }
 
@@ -344,8 +455,9 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
   echo "  d. PLAN DOC          gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → docs/plans/*.md change, or 'Wiring' in scoping comment (complexity:standard/complex only)"
   echo "  e. TEST-COVERAGE EVID gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → runtime code changes (extensions/**/*.ts excl. *.test.ts, extensions/**/*.js, bin/*.js) need test files in the diff or test-run markers in PR body/commits"
+  echo "  f. SECOND-MODEL GATE  PR body/commits must carry '[SECOND-MODEL-GATE] model=<id> independent=<yes|NO|DEGRADED>' when the diff touches the guarded surface; NO/DEGRADED and a build-equivalent id FAIL (one bootstrap WARN while the base lacks pi-bootstrap/pi-config/second-model.json)"
   echo ""
-  echo "Exemptions: complexity:micro label skips b–e; no standard/complex label skips d; docs/skills/templates/config-only PRs (no runtime code) skip e."
+  echo "Exemptions: complexity:micro label skips b–e; no standard/complex label skips d; docs/skills/templates/config-only PRs (no runtime code) skip e; check (f) is tier-independent with a one-time bootstrap WARN."
   echo "Exit: 0 (compliant, simulated)."
   echo "For failure-path simulation: PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1"
   echo "For parser-only self-test (no gh calls): PIPELINE_COMPLIANCE_SELF_TEST=1"
@@ -472,6 +584,61 @@ if [[ "$FAIL_ALL" == "1" ]]; then
     echo "  ❌ pass 5: micro exemption violated — binding leaked into the micro branch ($B5 failures)" >&2
     exit 2
   fi
+
+  # Pass 6 (#716) — check (f): the second-model gate line on a guarded-surface
+  # diff, plus BOTH sides of the bootstrap exemption. Base content is injected
+  # with the documented offline seam PIPELINE_SECOND_MODEL_BASE_FILE (a path, or
+  # the literal ABSENT); the real path uses `git show <base>:<path>`.
+  echo ""
+  echo "== SIMULATION: pass 6 (#716 check (f) — guarded-surface gate line) =="
+  SM_SIM_SHIPPED="$(cd "$(dirname "$0")/.." && pwd)/pi-bootstrap/pi-config/second-model.json"
+  sm_case() { # <tag> <label> <sm-line> <base-file> <want-zero> <needle>
+    local tag="$1" label="$2" smline="$3" basefile="$4" wantzero="$5" needle="$6" log ok=1
+    if [[ -n "$smline" ]]; then
+      PR_BODY="Fixes #1
+${smline}"
+    else
+      PR_BODY="Fixes #1"
+    fi
+    LABELS="complexity:standard"
+    SCOPING_COMMENT="<!-- issue-scoping: simulation --> wiring"
+    COMMIT_MSGS="code-review dispatched; tests green (12 passed)"
+    FILES=$'modified\tpi-bootstrap/pi-config/second-model.json'
+    PIPELINE_SECOND_MODEL_BASE_FILE="$basefile"
+    FAILURES=0
+    log="$(mktemp /tmp/pipeline-sm6.XXXXXX)"
+    run_checks > "$log" 2>&1 || true
+    grep -q "$needle" "$log" || ok=0
+    if [[ "$wantzero" == "1" ]]; then
+      [[ "$FAILURES" -eq 0 ]] || ok=0
+    else
+      [[ "$FAILURES" -ge 1 ]] || ok=0
+    fi
+    if [[ "$ok" == "1" ]]; then
+      echo "  ✅ pass ${tag}: check (f) ${label}"
+    else
+      echo "  ❌ pass ${tag}: check (f) ${label} FAILED (failures=$FAILURES)" >&2
+      sed -n '1,40p' "$log" >&2
+      rm -f "$log"
+      exit 2
+    fi
+    rm -f "$log"
+  }
+  sm_case 6 "passed (independent, non-equivalent id)" \
+    "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes" "$SM_SIM_SHIPPED" 1 "second-model gate recorded"
+  sm_case 6b "blocked DEGRADED" \
+    "[SECOND-MODEL-GATE] model=**DEGRADED independent=DEGRADED" "$SM_SIM_SHIPPED" 0 "independent=DEGRADED"
+  sm_case 6c "blocked independent=NO" \
+    "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=NO" "$SM_SIM_SHIPPED" 0 "independent=NO"
+  sm_case 6d "blocked a build-equivalent recorded id" \
+    "[SECOND-MODEL-GATE] model=deepseek/deepseek-v4-pro independent=yes" "$SM_SIM_SHIPPED" 0 "SAME served build as the primary"
+  sm_case 6e "blocked a missing marker" \
+    "" "$SM_SIM_SHIPPED" 0 "no \[SECOND-MODEL-GATE\] line"
+  sm_case 6f "bootstrap exemption WARN" \
+    "" "ABSENT" 1 "bootstrap: gate not yet installed on base"
+  sm_case 6g "enforcement on once the file exists on base" \
+    "" "$SM_SIM_SHIPPED" 0 "no \[SECOND-MODEL-GATE\] line"
+  unset PIPELINE_SECOND_MODEL_BASE_FILE
   exit 1
 fi
 
