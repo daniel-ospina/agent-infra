@@ -3216,7 +3216,7 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(
         Type.String({
           description:
-            "Model to use (default: deepseek-flash). Accepts 'provider/model' (e.g. 'qwen/qwen3.8-max' → provider qwen) or a bare model id resolved against ~/.pi/agent/models.json (e.g. 'qwen3.8-max' → qwen, 'deepseek-flash' → deepseek). Unknown models fall back to the default provider.",
+            `Model to use (default: ${DEFAULT_TASK_MODEL}). Accepts 'provider/model' (e.g. 'qwen/qwen3.8-max' → provider qwen) or a bare model id resolved against ~/.pi/agent/models.json (e.g. 'qwen3.8-max' → qwen, '${DEFAULT_TASK_MODEL}' → deepseek). Unknown models fall back to the default provider.`,
         })
       ),
       mcp_servers: Type.Optional(

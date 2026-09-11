@@ -232,7 +232,7 @@ export interface AliasFamily {
 export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
   // KEY stays the legacy spelling: it is the durable latch-state key
   // (primaries.<provider>.families.<KEY>) and renaming it would orphan every
-  // existing record. The KEY rename is deferred to #728.
+  // existing record. The KEY rename is tracked in #739.
   //
   // #715 (review round 1, P2): the family KEY IS the legacy root alias — it is
   // matched directly by `ALIAS_FAMILIES[id]` (familyOf step 1) and by
@@ -240,10 +240,11 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
   // `rootAliases: ["deepseek-v4-flash"]` datum duplicated that KEY verbatim and
   // was therefore inert (its branch could never add a match the KEY branch did
   // not already make); it was DELETED rather than kept as untested
-  // migration-window scaffolding. When #728 renames the KEY to
+  // migration-window scaffolding. When #739 renames the KEY to
   // the canonical spelling, an alias datum must be re-introduced at that time —
   // after the rename the legacy spelling is no longer the KEY and would
-  // otherwise become family-less.
+  // otherwise become family-less. The datum's value MUST then differ from the
+  // new KEY, or it is untestable again (#739).
   "deepseek-v4-flash": {
     family: "deepseek-v4-flash",
     legs: [
@@ -272,10 +273,9 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
  * the openrouter BASE slugs normalize onto the flash/pro families.
  *
  * Precedence (#715, explicit and exact-match at every step):
- *   1. direct ALIAS_FAMILIES key hit → that key;
+ *   1. direct ALIAS_FAMILIES key hit (the family KEY) → that key;
  *   2. per family (deterministic iteration order): the family's ROOT leg model
- *      (`fam.legs[0].model`, i.e. the canonical spelling) OR the family KEY
- *      itself → that family key;
+ *      (`fam.legs[0].model`, i.e. the canonical spelling) → that family key;
  *   3. the qwen-tp rename `deepseek-v4-flash-0731` → the flash family;
  *   4. openrouter/slash ids: last-slash slug match against the BASE slugs;
  *   5. otherwise undefined.
@@ -295,8 +295,10 @@ export function familyOf(modelId: string | null | undefined, provider?: string |
   if (!id) return undefined;
   if (ALIAS_FAMILIES[id]) return id;
   for (const [famKey, fam] of Object.entries(ALIAS_FAMILIES)) {
-    const rootModel = fam.legs[0]?.model;
-    if (id === rootModel || id === famKey) return famKey;
+    // Root-model-only: step 1 already matched every family KEY, so an
+    // `|| id === famKey` term here could never fire (verified unreachable by
+    // mutation — deleting it keeps every suite green).
+    if (id === fam.legs[0]?.model) return famKey;
   }
   if (id === "deepseek-v4-flash-0731") return "deepseek-v4-flash";
   // openrouter slugs arrive as "deepseek/deepseek-v4-flash" (slash id). Only
