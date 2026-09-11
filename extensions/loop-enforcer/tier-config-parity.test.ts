@@ -19,6 +19,10 @@
  * Non-vacuity: the parser is asserted against the known table shape, and
  * `mappingViolations()` is exercised with deliberately mutated inputs so a
  * silently-empty parse or an always-pass check cannot make this suite green.
+ * The suite also **pins the tier → risk-row assignment** as a fixture: the
+ * pair check alone would accept a coordinated re-point (e.g. `standard` moved
+ * to Medium-High, { reviewers: 3, maxCycles: 5 }), and the last negative
+ * control documents that blind spot rather than pretending it does not exist.
  *
  * WIRING HONESTY: this suite runs in the per-PR `verify` job (VISIBLE, not
  * merge-blocking — the repo's only required check is `pipeline-compliance`)
@@ -219,6 +223,32 @@ test("every tier's maxCycles equals its own risk row (reviewers is the key)", ()
   }
 });
 
+test("TIER_CONFIG pins the tier → risk-row assignment, not just the pair", () => {
+  // The pair check above accepts any canonical (reviewers, maxCycles) pair, so
+  // a **coordinated** re-point — e.g. `standard` moved to the Medium-High row
+  // ({ reviewers: 3, maxCycles: 5 }) — satisfies it while moving the standard
+  // bound. That is exactly the Low-Medium-vs-Medium-High ambiguity this PR
+  // resolves in favour of Low-Medium, so the resolution itself is pinned here:
+  // re-pointing a tier now requires a deliberate fixture edit.
+  deepEqual(
+    Object.entries(TIER_CONFIG).map(([tier, cfg]) => [tier, cfg.reviewers, cfg.maxCycles]),
+    [
+      ["micro", 0, 0],
+      ["standard", 2, 3],
+      ["complex", 4, 10],
+    ],
+  );
+});
+
+test("the live default cap is the canonical bound, not a bare literal", () => {
+  // The bound production actually uses: index.ts calls
+  // evaluateTermination(cycleData, REVIEW_CYCLE_CAPS.high) and the function's
+  // own default is REVIEW_CYCLE_CAPS.high. Pin the value so a future edit to
+  // the constant cannot silently move the live loop cap.
+  equal(TIER_CONFIG.complex.maxCycles, REVIEW_CYCLE_CAPS.high);
+  equal(REVIEW_CYCLE_CAPS.high, TABLE.find((r) => r.risk === "High")!.maxCycles);
+});
+
 // ── Negative controls: the check must actually reject drift ─────────────────
 
 section("Negative controls (the guard is not vacuous)");
@@ -233,7 +263,25 @@ test("rejects a cap above the canonical bound for its reviewer count (#723's ori
 test("rejects REVIEW_CYCLE_CAPS drifting from the table (pre-#705 stale 8)", () => {
   const v = mappingViolations({ ...CAPS, high: 8 }, TIERS, TABLE);
   ok(v.some((s) => s.includes("REVIEW_CYCLE_CAPS.high")), `expected a caps violation, got: ${v.join(" | ")}`);
-  ok(v.some((s) => s.includes("TIER_CONFIG.complex")), `expected the tier check to fire too, got: ${v.join(" | ")}`);
+  // NOTE: the reviewer-keyed tier↔table check compares against the TABLE (still
+  // 10), so it cannot fire on a caps-only mutation. What fires instead is the
+  // caps-derived governance ceiling.
+  ok(
+    v.some((s) => s.includes("exceeds the governance maximum 8")),
+    `expected the caps-derived governance-ceiling violation, got: ${v.join(" | ")}`,
+  );
+});
+
+test("LIMIT: a coordinated re-point passes the pair check (why the fixture pin exists)", () => {
+  // Documents the pair check's blind spot rather than pretending it has none:
+  // moving `standard` to the Medium-High row keeps every pair canonical, so
+  // only the explicit TIER_CONFIG fixture pin above catches it.
+  const repointed = { ...TIERS, standard: { maxCycles: 5, reviewers: 3 } };
+  deepEqual(
+    mappingViolations(CAPS, repointed, TABLE),
+    [],
+    "the pair check alone is expected to accept this — the fixture pin is the real guard",
+  );
 });
 
 test("rejects a reviewer count with no canonical row", () => {

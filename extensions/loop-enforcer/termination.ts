@@ -65,11 +65,18 @@ export const REVIEW_CYCLE_CAPS = {
  *
  * The risk row is selected by `reviewers` (Low 0 / Low-Medium 2 /
  * Medium-High 3 / High 4) and `maxCycles` MUST equal that row's Max Cycles.
- * The complexity tiers map onto rows 1, 2 and 4: V1/standard is the routine
- * default (Low-Medium, 2 reviewers), V2/complex is the critical level
- * (High, 4 reviewers). No tier carries 3 reviewers, so Medium-High has no
- * tier — its bound is declared above for completeness, not applied here.
+ * The complexity tiers map onto rows 1, 2 and 4: `standard` declares 2
+ * reviewers (Low-Medium, 3 cycles) and `complex` declares 4 (High, 10).
+ * No tier carries 3 reviewers, so Medium-High has no tier — its bound is
+ * declared above for completeness, not applied here.
  * `tier-config-parity.test.ts` enforces the pairing against the skill file.
+ *
+ * NOTE (scope): this mapping is keyed on `reviewers`, and the tiers' V-levels
+ * are descriptive. The only tier derivation in-tree (`index.ts`: V2 → complex,
+ * everything else → standard) collapses V3/V4 onto `standard`, which would
+ * give those levels the *tightest* non-micro cap. No caller passes `tier` to
+ * `evaluateTermination` today, so this is latent — but reusing that derivation
+ * to drive `tier` needs the V3/V4 case resolved first.
  */
 export const TIER_CONFIG = {
   micro: { vLevel: null, maxCycles: REVIEW_CYCLE_CAPS.skip, reviewers: 0 },
@@ -86,7 +93,7 @@ export type Tier = keyof typeof TIER_CONFIG;
  */
 export function evaluateTermination(
   cycles: CycleData[],
-  maxCycles: number = 10,
+  maxCycles: number = REVIEW_CYCLE_CAPS.high,
   budgetTokens: number = Infinity,
   startTime: number = Date.now(),
   timeoutMs: number = Infinity,

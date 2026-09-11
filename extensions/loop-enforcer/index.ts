@@ -30,7 +30,7 @@ import { join } from "node:path";
 import { buildGoalSpec, populateGoalFields, decomposeGoal, spawnChildLoop, isGoalAdvisory, runGoalVerification, goalVerificationPrompt, GOALS_UNVERIFIED_FLAG, detectUserConfirmation, detectEndCommand } from "./goal.js";
 import type { Indicator } from "./goal.js";
 import { dispatchVerifier } from "./verifier.js";
-import { evaluateTermination, type CycleData } from "./termination.js";
+import { evaluateTermination, REVIEW_CYCLE_CAPS, type CycleData } from "./termination.js";
 import { startScheduler, releaseCronLock } from "./scheduler.js";
 import { executeWriteBack } from "./writeback.js";
 import { homedir } from "node:os";
@@ -1717,7 +1717,9 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
       filesChanged: 0, // ponytail: not tracked per-cycle yet
       wallClockMs: 0,
     }));
-    const termResult = evaluateTermination(cycleData, 10);
+    // #723: the live loop cap is the canonical High bound, not a bare literal —
+    // `tier-config-parity.test.ts` keeps it pinned to the skill table.
+    const termResult = evaluateTermination(cycleData, REVIEW_CYCLE_CAPS.high);
     if (termResult.shouldExit) {
       // ── L3 Ralph Loop: stall recovery before escalation ──
       if (termResult.reason === "L3-deadlock" && !manifest.ralph_loop_attempted) {
