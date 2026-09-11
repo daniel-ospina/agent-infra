@@ -109,6 +109,53 @@ export function parseReviewCycleTable(markdown: string): RiskRow[] {
   return rows;
 }
 
+/**
+ * Extract the top-level argument list of every `fnName(` call in `src`.
+ * Comment-aware and paren/bracket/brace-balanced, so a trailing `//`-comment or
+ * a nested call inside an argument cannot shorten the argument list. Textual by
+ * construction — see the tripwire test's own LIMIT note for what it does and
+ * does not prove.
+ */
+export function extractCallArgs(src: string, fnName: string): string[][] {
+  const calls: string[][] = [];
+  const re = new RegExp(`\\b${fnName}\\s*\\(`, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src)) !== null) {
+    let i = m.index + m[0].length; // first char after '('
+    let depth = 1;
+    let current = "";
+    const args: string[] = [];
+    for (; i < src.length && depth > 0; i++) {
+      const ch = src[i];
+      const next = src[i + 1];
+      if (ch === "/" && next === "/") {
+        while (i < src.length && src[i] !== "\n") i++;
+        continue;
+      }
+      if (ch === "/" && next === "*") {
+        i += 2;
+        while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i++;
+        i++;
+        continue;
+      }
+      if (ch === "(" || ch === "[" || ch === "{") depth++;
+      else if (ch === ")" || ch === "]" || ch === "}") {
+        depth--;
+        if (depth === 0) break;
+      } else if (ch === "," && depth === 1) {
+        args.push(current.trim());
+        current = "";
+        continue;
+      }
+      current += ch;
+    }
+    args.push(current.trim());
+    calls.push(args.length === 1 && args[0] === "" ? [] : args);
+    re.lastIndex = i;
+  }
+  return calls;
+}
+
 // ── Pure check: declared mapping vs canonical table ─────────────────────────
 
 export interface TierLike {
@@ -248,11 +295,16 @@ test("TIER_CONFIG pins the tier → risk-row assignment, not just the pair", () 
   );
 });
 
-test("the function default is the canonical High bound (pins the LIVE cap)", () => {
+test("the LIVE cap: with no explicit bound the exit lands at the canonical High bound", () => {
   // Cycle-1 review caught the earlier version of this test for asserting the
-  // constant against itself while claiming to pin the live cap. This asserts
-  // the BEHAVIOUR: with no explicit maxCycles, the default governs, so the
-  // exit must land exactly at the canonical High bound.
+  // constant against itself while claiming to pin the live cap. It is a real
+  // live-cap pin now that index.ts passes NO second argument (commit 0ced953
+  // follow-up): the default is the only bound in play on the production path.
+  //
+  // LIMIT (stated, not hidden): this pins the VALUE, not the derivation. A
+  // default reverted to a bare `10` still passes while the canonical bound is
+  // 10 — it only fails once the canonical bound moves. The call-site tripwire
+  // below covers the other half.
   const canonical = TABLE.find((r) => r.risk === "High")!.maxCycles;
   const atCap = Array.from({ length: canonical }, (_, i) => cycle(i + 1, 2, "NEEDS_FIX", undefined, 1));
   const r = evaluateTermination(atCap);
@@ -263,25 +315,43 @@ test("the function default is the canonical High bound (pins the LIVE cap)", () 
   ok(!evaluateTermination(belowCap).shouldExit, "must not exit below the canonical bound");
 });
 
-test("index.ts's live call site passes the canonical constant, not a literal", () => {
-  // The bound production actually uses. A source pin is the only practical
-  // route (index.ts is a pi extension with module-level side effects), and it
-  // has in-repo precedent: extensions/shared/default-coverage.test.ts pins
-  // shipped config the same way.
-  const calls = INDEX_SRC.match(/evaluateTermination\([^)]*\)/g) ?? [];
+test("index.ts's live call site takes the default cap (no explicit bound, no tier)", () => {
+  // TEXTUAL TRIPWIRE, not a proof: index.ts is a pi extension with
+  // module-level side effects, so the call site cannot be exercised from here.
+  // It is deliberately an ARGUMENT-COUNT check rather than a token grepl:
+  //   - `evaluateTermination(cycleData, 20, // REVIEW_CYCLE_CAPS.high)` -> 2 args
+  //   - `evaluateTermination(cycleData, REVIEW_CYCLE_CAPS.high + 10)`   -> 2 args
+  //   - `..., liveCap, Infinity, ..., "standard")`                      -> >2 args
+  // all fail here, while a legitimate hoist (`const d = cycleData`) still
+  // passes. The behavioural test above pins the value; this catches a re-added
+  // bound or a tier override at the production call site.
+  const calls = extractCallArgs(INDEX_SRC, "evaluateTermination");
   ok(calls.length > 0, "no evaluateTermination call found in index.ts — update this pin");
-  for (const c of calls) {
-    ok(!/,\s*\d+\s*\)/.test(c), `index.ts passes a numeric literal to evaluateTermination: ${c}`);
+  for (const args of calls) {
+    equal(
+      args.length,
+      1,
+      `index.ts must let the canonical default govern (1 arg, no tier override); got ${JSON.stringify(args)}`,
+    );
   }
-  ok(
-    calls.some((c) => c.includes("REVIEW_CYCLE_CAPS.high")),
-    `index.ts's evaluateTermination call must pass REVIEW_CYCLE_CAPS.high, got: ${calls.join(" | ")}`,
+});
+
+test("tripwire control: a re-added explicit bound or tier at a call site is visible", () => {
+  const reAddedBound = extractCallArgs(
+    INDEX_SRC.replace("evaluateTermination(cycleData)", "evaluateTermination(cycleData, 20)"),
+    "evaluateTermination",
   );
+  ok(reAddedBound.some((a) => a.length !== 1), "a re-added explicit cap must be caught");
+  const reAddedTier = extractCallArgs(
+    INDEX_SRC.replace("evaluateTermination(cycleData)", 'evaluateTermination(cycleData, 10, Infinity, 0, 0, 0, 0, 0, false, "complex")'),
+    "evaluateTermination",
+  );
+  ok(reAddedTier.some((a) => a.length !== 1), "a tier override must be caught");
 });
 
 test("REVIEW_CYCLE_CAPS declares exactly the canonical keys", () => {
   // Without this, an unbacked extra key rides along unnoticed (it is never
-  // read by TOER_CONFIG) and — before the ceiling fix — would have raised the
+  // read by TIER_CONFIG) and — before the ceiling fix — would have raised the
   // governance max the guard compares against.
   deepEqual(Object.keys(REVIEW_CYCLE_CAPS).sort(), ["high", "lowMedium", "mediumHigh", "skip"]);
   deepEqual(
