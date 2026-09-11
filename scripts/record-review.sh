@@ -18,6 +18,18 @@
 # current head. Off by default — the stale-sha guard (#2133) refuses such
 # records with exit 3 because the ai-review-gate rejects them anyway.
 #
+# Second-model gate line (#716): when `SECOND_MODEL_GATE_MODEL` is set (env,
+# or `--second-model <id>`), the marker
+#   [SECOND-MODEL-GATE] model=<resolved provider/id> independent=<yes|NO|DEGRADED>
+# is appended to the PR body alongside the verdict marker (same idempotent
+# channel). `SECOND_MODEL_GATE_INDEPENDENT` (env or
+# `--second-model-independent <yes|NO|DEGRADED>`) is REQUIRED with it and must
+# be one of those three values — there is no default, because a missing value
+# must not be laundered into an implicit `yes`. check (f) in
+# scripts/check-pipeline-compliance.sh is the mechanical consumer: on a diff
+# touching the guarded surface it requires the line and FAILS on
+# `independent=NO` / `independent=DEGRADED` / a build-equivalent id.
+#
 # Verdicts (issue #513):
 #   clean       — a code-review skill convergence recorded its clean verdict
 #                 (standard/complex tiers). Never tier-guarded.
@@ -89,20 +101,27 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 # Scan args for --force-stale (any position); everything else stays
 # positional.
 FORCE_STALE=0
+SECOND_MODEL_GATE_MODEL="${SECOND_MODEL_GATE_MODEL:-}"
+SECOND_MODEL_GATE_INDEPENDENT="${SECOND_MODEL_GATE_INDEPENDENT:-}"
 POSITIONAL=()
-for _arg in "$@"; do
-  if [ "$_arg" = "--force-stale" ]; then
-    FORCE_STALE=1
-  else
-    POSITIONAL+=("$_arg")
-  fi
+_argv=("$@")
+_i=0
+while [ "$_i" -lt "${#_argv[@]}" ]; do
+  _arg="${_argv[$_i]}"
+  case "$_arg" in
+    --force-stale) FORCE_STALE=1 ;;
+    --second-model) _i=$((_i + 1)); SECOND_MODEL_GATE_MODEL="${_argv[$_i]:-}" ;;
+    --second-model-independent) _i=$((_i + 1)); SECOND_MODEL_GATE_INDEPENDENT="${_argv[$_i]:-}" ;;
+    *) POSITIONAL+=("$_arg") ;;
+  esac
+  _i=$((_i + 1))
 done
 if [ "${#POSITIONAL[@]}" -gt 0 ]; then
   set -- "${POSITIONAL[@]}"
 else
   set --
 fi
-PR="${1:?usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale]}"
+PR="${1:?usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale] [--second-model <id>] [--second-model-independent <yes|NO|DEGRADED>]}"
 SHA="${2:?missing head_sha}"
 VERDICT="${3:-clean}"
 REPO="${4:-}"
@@ -110,6 +129,17 @@ case "$VERDICT" in
   clean|clean-micro) ;;
   *) echo "verdict must be 'clean' (or 'clean-micro'); refusing to record '$VERDICT'" >&2; exit 2 ;;
 esac
+# #716 second-model gate input validation — fail closed BEFORE any side effect.
+# The gate skills set these from check-second-model.sh --print / --probe; a
+# value we cannot trust must never reach the PR body as if it were independence.
+if [ -n "$SECOND_MODEL_GATE_MODEL" ]; then
+  case "$SECOND_MODEL_GATE_INDEPENDENT" in
+    yes|NO|DEGRADED) ;;
+    *) echo "SECOND_MODEL_GATE_INDEPENDENT must be yes|NO|DEGRADED when SECOND_MODEL_GATE_MODEL is set (got '${SECOND_MODEL_GATE_INDEPENDENT:-}'); refusing to record" >&2; exit 2 ;;
+  esac
+elif [ -n "$SECOND_MODEL_GATE_INDEPENDENT" ]; then
+  echo "SECOND_MODEL_GATE_INDEPENDENT is set without SECOND_MODEL_GATE_MODEL; refusing to record (a gate outcome needs the resolved model id)" >&2; exit 2
+fi
 # Input validation (#2055): the ai-review-gate binds the FULL 40-char sha and
 # a numeric PR — reject bad inputs up front rather than posting evidence that
 # can never verify.
@@ -306,15 +336,34 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     echo "⚠️ record-review: could not read PR body (transient API failure?) — evidence post skipped; record still saved. Re-run record-review.sh to retry the post." >&2
     exit 0
   fi
+  # #716 — the second-model gate line, on the SAME idempotent channel as the
+  # verdict marker. check (f) in check-pipeline-compliance.sh greps the PR body
+  # for it on a guarded-surface diff.
+  SM_MARKER=""
+  if [ -n "$SECOND_MODEL_GATE_MODEL" ]; then
+    SM_MARKER="[SECOND-MODEL-GATE] model=${SECOND_MODEL_GATE_MODEL} independent=${SECOND_MODEL_GATE_INDEPENDENT}"
+  fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
   # not silently skip the evidence post; the gate would fail with no trace).
+  MISSING=""
   if ! printf '%s' "$BODY" | grep -qF "$MARKER"; then
+    MISSING="$MARKER"
+  fi
+  if [ -n "$SM_MARKER" ] && ! printf '%s' "$BODY" | grep -qF "$SM_MARKER"; then
+    if [ -n "$MISSING" ]; then
+      MISSING="${MISSING}
+${SM_MARKER}"
+    else
+      MISSING="$SM_MARKER"
+    fi
+  fi
+  if [ -n "$MISSING" ]; then
     if [ -n "$BODY" ]; then
       NEWBODY="${BODY}
 
-${MARKER}"
+${MISSING}"
     else
-      NEWBODY="$MARKER"
+      NEWBODY="$MISSING"
     fi
     jq -n --arg body "$NEWBODY" '{body: $body}' 2>/dev/null \
       | gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1 \
