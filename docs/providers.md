@@ -75,16 +75,42 @@ model.
 - Clean exits whose output merely *mentions* the phrase (e.g. research content
   about connection errors) do **not** trigger a fallback (exit-code guarded)
 
-### Second-model gate (`$SECOND_MODEL` — issue #284)
+### Second-model gate (`$SECOND_MODEL` — issues #284, #716)
 
 The pipeline's "second-model" review gates (issue-scoping §5.6, code-review §6.6,
-plan-review §4.5, subagent-driven-development final reviewer) dispatch with
-`model` = `$SECOND_MODEL` (env), **default `deepseek/deepseek-v4-pro`**
-(provider-qualified — the bare id is ambiguous across providers). When the
-configured second model is set-but-unresolvable or unset-with-unresolvable-
-default, dispatch the tool default (`deepseek-flash`, the shipped
-`defaultModel`) and annotate `[SECOND-MODEL-GATE] stand-in`
-(never silently substitute). Pricing decision + rationale: issue #284.
+plan-review §4.5, subagent-driven-development final reviewer) resolve their
+model with `bash scripts/check-second-model.sh --print` (offline; honours
+`$SECOND_MODEL`, else the ordered `preference` list in
+`pi-bootstrap/pi-config/second-model.json`) and `--probe` (network: vendor offer
++ solvency; writes `RESOLVED=<provider/id>` for the first **solvent+reachable**
+candidate, or `DEGRADED`). There is no hardcoded default literal.
+
+`second-model.json` is the single source of truth: an ordered `preference`
+list, each candidate's `runtimeVia` dispatch authority, the primary's
+`buildEquivalence` set, the probe endpoints, and an integer-cents
+`costCentsPerPass`. Adding a funded model is a config edit, never a code edit.
+
+**Fail-closed DEGRADED.** When the resolver returns `**DEGRADED` (no candidate
+solvent+reachable), the gate does NOT dispatch a substitute — dispatching
+`deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent
+model would be a same-build "independent" review, the #716 defect. The gate
+records `[SECOND-MODEL-GATE] model=**DEGRADED independent=DEGRADED` (via
+`record-review.sh`) and escalates to a human. `scripts/check-pipeline-compliance.sh`
+check (f) is the mechanical consumer: on a diff touching the guarded surface it
+requires the recorded line and fails on `independent=NO` / `independent=DEGRADED`
+or a build-equivalent id. `$SECOND_MODEL` remains an operator override
+(config-default fail-closed, operator-override-open-by-design) and is annotated,
+never blocked.
+
+**Bootstrap exemption.** Check (f) is a loud WARN until
+`pi-bootstrap/pi-config/second-model.json` exists on the PR's base ref — a
+one-time carve-out keyed only on the file's absence on base (never a branch
+name, PR number, or commit range; never obtainable by a diff touching the file).
+
+**Why.** From 2026-09-14 12:00 Beijing, `deepseek-v4-pro` is served by the same
+V4.1 Flash build as the primary session, so a provider-qualified id check alone
+does not prove review independence. See #716 (funding state + evidence) and
+#734 (the dispatch-level surface, out of scope here).
 
 ## 3. Env var reference
 
