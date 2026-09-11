@@ -91,7 +91,7 @@ Skill length is not an excuse — reading a 700-line skill is cheaper than bypas
 
 ### Review Loop Protocol — MANDATORY
 
-Skills that describe review cycles contain **mandatory quality gates**, not suggestions. Do not skip review cycles. Do not emit a plan or content as "done" until all review cycles pass clean.
+Skills that describe review cycles contain **mandatory quality gates**, not suggestions. Do not skip review cycles. Do not emit a plan or content as "done" until all review cycles pass clean, or the skill's own cap path is followed with the remaining issues documented — a capped exit is never reported as clean.
 
 #### Fresh-Context Task Dispatch
 
@@ -111,11 +111,14 @@ These conditions define a **clean completion** only. A convergence or cap exit c
 
 #### Hard Cap
 
-**The skill's own bound always governs — and bounds are proportional, not flat.** The `proportional-gates` skill holds the **canonical** review-cycle table (Low → skip; Low-Medium → **3**; Medium-High → **5**; High → **10**), and convergence-gated skills use a **10-cycle safety cap** (`code-review`, `test-review`, `epic-plan`, `verification-before-completion` are examples — **not an exhaustive list**; defer to the skill you are running, and note that many other skills carry the same 10-cycle cap). When a skill specifies no bound at all, the default is **10**; a skill that explicitly declares no cap governs itself.
+**The skill's own bound always governs — this file imposes no review-cycle bound of its own.** The `proportional-gates` skill holds the **canonical** proportional table (Low → skip; Low-Medium → **3**; Medium-High → **5**; High → **10**), and most convergence-gated skills use a **10-cycle safety cap** (`code-review`, `test-review`, `epic-plan`, `verification-before-completion` are examples — **not an exhaustive list**). Other skills carry their own tighter or flat bounds (`prototype-review` 5, 3 in React-diff mode; `research` 2; the second-model gates 2), and a few declare none. A skill that says "no hard cap" but states a safety cap is **still governed by that cap** — "no hard cap" means no quality-gate ceiling, not no runaway guard. Only when a skill states no bound of any kind does the default **10** apply.
 
-This is a **runaway guard, not a quality gate** — review cycles are how quality gets produced, so do not treat the cap as a target, and do not stop early because the count "feels high". Stop only on (a) a clean exit (`NO ISSUES FOUND`), (b) **convergence** (the same issues recurring, no new ones), or (c) the bound. Never substitute a flat number for a skill's proportional tiers, and never apply a bound tighter than the skill's own rule.
+This is a **runaway guard, not a quality gate** — review cycles are how quality gets produced, so do not treat the cap as a target, and do not stop early because the count "feels high". Stop on (a) a clean exit (`NO ISSUES FOUND`), (b) **convergence** (issues are a strict subset of the previous cycle's — no new dimensions or files), (c) a stall signal the skill defines (`fingerprint-stall`, `honest-stuck`, `zero-progress`, stall-guard), or (d) the bound. Never apply a bound tighter than the skill's own.
 
-**(b) and (c) are escalation exits, not completions.** They do not satisfy the Exit Conditions above and must never be reported as done. On convergence or cap → **escalate** — to the orchestrator agent, or to a human wherever a skill requires one (`code-review` and `plan-review` escalate on convergence; the Auto-Continue pause conditions apply in addition, and many other skills escalate on convergence too). Document the remaining issues and post the `⚠️ capped at N cycles — M issues remain` marker. Then follow the skill's own cap path: some skills log-and-proceed (`epic-plan`, `test-review`); others block (`plan-review` → Requires Human Input; `carousel-b2b-copy` → BLOCKED; `test-writing` → do not proceed while a P0 remains). Where the skill blocks, or where any P0 remains unfixed, **do not proceed** — halt and await the human. Never report or hand off work with unfixed issues as if it were complete.
+**(b)–(d) are escalation exits, not completions.** They do not satisfy the Exit Conditions above, and the loop must never be reported or handed off as clean or complete. On convergence, stall, or cap → **escalate** — to the orchestrator agent, or to a human wherever a skill requires one (the Auto-Continue pause conditions apply in addition). Document the remaining issues and post the `⚠️ capped at N cycles — M issues remain` marker, then follow the skill's own cap path:
+
+- **Skills that block** (`plan-review` → Requires Human Input; `carousel-b2b-copy` → BLOCKED; `test-writing` → do not proceed while a P0 remains): **do not proceed** — halt and await the human.
+- **Skills that log-and-proceed** (`epic-plan`, `test-review`, and any other skill whose cap path says so): continue **only** with the marker posted and the remaining issues — including any P0 — recorded in the artifact, exactly as the skill directs. A capped exit is never described as clean or complete.
 
 #### FORBIDDEN — These Bypass the Quality Gate Entirely
 

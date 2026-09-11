@@ -199,7 +199,7 @@ test-review <test-file> --surface-map "<extract from plan doc>" [--journey-map "
 
 `test-review` handles the full cycle:
 - **Phase 0 — Research Intake:** Researches testing patterns for the surfaces under test
-- **Phase 1 — Review:** 3 parallel fresh sub-agents (correctness, coverage+surface, journey-alignment)
+- **Phase 1 — Review:** 4 parallel fresh sub-agents (correctness, coverage+surface, journey-alignment, test-quality)
 - **Phase 2-4 — Fix + Re-review Loop:** Surgical fixes, fresh re-review, to test-review's convergence rule (10-cycle safety cap)
 - **Exit:** Clean (all reviewers return NO ISSUES FOUND) or capped with documented remaining issues
 
