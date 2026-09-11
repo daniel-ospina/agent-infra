@@ -185,10 +185,13 @@ export function normalizeArgs(args: string[]): string[] {
  * identifier (`evaluateTermination(d)`) and a trailing comma pass. Rejecting
  * spread is what closes the cycle-4 bypass of a pure argument-count check.
  *
- * LIMIT (stated, not hidden): this is textual. A deliberately obfuscated form
- * (optional call `f?.(...)`, aliasing `f` and calling the alias, `f.call(...)`)
- * would evade it. Those require contrived code that a reviewer sees in the
- * diff; the tripwire is aimed at an ordinary re-added bound or `tier`.
+ * LIMIT (stated, not hidden): this is textual. A call form the extractor cannot
+ * match — optional call `f?.(...)`, an alias calling it, `f.call(...)` — is
+ * treated as "no call found" and therefore fails CLOSED (red), not silently
+ * green, when it replaces the production call. A decoy call left in place
+ * alongside one of those forms would still evade; that requires contrived code
+ * a reviewer sees in the diff. What obfuscation costs is the diagnostic: the
+ * controls then report "control did not apply" instead of naming the re-add.
  */
 export function liveCallShapeViolations(src: string): string[] {
   const calls = extractCallArgs(src, "evaluateTermination");
