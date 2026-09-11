@@ -354,7 +354,7 @@ test("TIER_CONFIG pins the tier → risk-row assignment, not just the pair", () 
 });
 
 test("the LIVE cap: with no explicit bound the exit lands at the canonical High bound", () => {
-  // Cycle-1 review caught the earlier version of this test for asserting the
+  // Cycle-2 review caught the earlier version of this test for asserting the
   // constant against itself while claiming to pin the live cap. It is a real
   // live-cap pin now that index.ts passes NO second argument (commit 0ced953
   // follow-up): the default is the only bound in play on the production path.
