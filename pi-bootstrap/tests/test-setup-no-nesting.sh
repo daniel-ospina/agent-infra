@@ -153,6 +153,22 @@ check_record_review_farmed() {
   fi
 }
 
+# #716/E4 — the second-model guard is on the same merge-gate farm. The four
+# gate skills + AGENTS.md reference $AGENT_INFRA_PATH/scripts/check-second-model.sh
+# and its default authority is the LIVE ~/.pi/agent/second-model.json, so the
+# installed copy must exist and byte-match the repo copy.
+check_second_model_farmed() {
+  local label="$1"
+  local dest="$DEST/scripts/check-second-model.sh"
+  [ -f "$dest" ] \
+    || { fail "$label: check-second-model.sh not farmed into scripts/ (#716/E4)"; return; }
+  if diff -q "$ROOT/scripts/check-second-model.sh" "$dest" >/dev/null 2>&1; then
+    echo "ok: $label farmed check-second-model.sh == repo copy (#716/E4)"
+  else
+    fail "$label: farmed check-second-model.sh differs from scripts/check-second-model.sh (stale copy!)"
+  fi
+}
+
 run_setup() {
   echo "---- setup.sh run (HOME=$HOME_DIR) ----" >> "$RUNS_LOG"
   bash "$CLONE/pi-bootstrap/setup.sh" >> "$RUNS_LOG" 2>&1
@@ -196,8 +212,9 @@ grep -q "farm symlinks kept" "$RUNS_LOG" \
 check_content_matches "$DEST/extensions" "run1" mcp-client shared
 check_fix_markers "$DEST/extensions" "run1"
 check_record_review_farmed "run1"
-grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
-  || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
+check_second_model_farmed "run1"
+grep -q "scripts merge-gate farm: 2 copied (record-review.sh, check-second-model.sh, #562/#716)" "$RUNS_LOG" \
+  || fail "run 1 did not report the merge-gate scripts farm copy (#562/#716)"
 
 # --- run 2: re-run must refresh the ACTIVE files --------------------------
 # (a) a dest mutation must be overwritten by the source (content-merge);
@@ -222,6 +239,7 @@ else
   echo "ok: dest mutation reverted by source on re-run"
 fi
 check_record_review_farmed "run2"
+check_second_model_farmed "run2"
 if grep -q "stale farm mutation" "$DEST/scripts/record-review.sh"; then
   fail "stale farm mutation survived re-run (farmed record-review.sh was not refreshed)"
 else

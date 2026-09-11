@@ -12,7 +12,7 @@ aboutObjects: agent-infra, pi, cmux, deepseek
 # Decision: Local Qwen 32B-class — not good enough for agentic coding (2026-09-05)
 
 **Domain:** llm-ops / engineering
-**Decision:** Do NOT route pi coding-agent work through a locally-run Qwen 32B-class model. Keep agentic coding on remote DeepSeek (V4-Flash default, V4-Pro second-model gate). Local Qwen remains viable only for zero-marginal-cost review/drafting passes run as an on-demand night batch.
+**Decision:** Do NOT route pi coding-agent work through a locally-run Qwen 32B-class model. Keep agentic coding on remote DeepSeek (V4-Flash default; the second-model gate is resolved by `scripts/check-second-model.sh`, #716). Local Qwen remains viable only for zero-marginal-cost review/drafting passes run as an on-demand night batch.
 **Status:** Decided (user, 2026-09-05). Research concluded; no implementation planned.
 **Related:** #469 (idle pi REPL session reaping — memory hygiene), #365 (session-lifecycle cost contract).
 

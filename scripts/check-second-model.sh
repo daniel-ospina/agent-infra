@@ -78,7 +78,20 @@ set -uo pipefail
 
 command -v python3 >/dev/null 2>&1 || { echo "error: python3 required (stdlib only) — present on ubuntu-latest + macOS" >&2; exit 2; }
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolve our own path PHYSICALLY before deriving the repo root. Consumer
+# repos receive `scripts/` as a symlink back to agent-infra (manifest
+# `kind: symlink`), so a logical `dirname "$0"/..` resolves ROOT to the
+# CONSUMER and looks for a shipped config that lives in agent-infra — the
+# guard would then exit 2 on every consumer commit (E8). python3 is already
+# required above, so realpath() is always available even when the `realpath`
+# binary is not.
+_SELF="$0"
+if command -v realpath >/dev/null 2>&1; then
+  _SELF="$(realpath "$0" 2>/dev/null || printf '%s' "$0")"
+else
+  _SELF="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || printf '%s' "$0")"
+fi
+ROOT="$(cd "$(dirname "$_SELF")/.." && pwd)"
 SHIPPED_FILE="$ROOT/pi-bootstrap/pi-config/second-model.json"
 LIVE_DIR="${HOME}/.pi/agent"
 MODE="check"

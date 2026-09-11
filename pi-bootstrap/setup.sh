@@ -328,16 +328,16 @@ for base in "${fleet_srcs[@]}"; do
 done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
 
-# Merge-gate scripts farm (#562): record-review.sh — the review-enforcer's
-# merge-registry writer (issue #138). NOT launchd-invoked (pi-session code
-# resolves it explicitly: code-review SKILL.md Step 10 + commit-workflow
-# 04-merge-deploy), so it never joined the #427/#373 farms and drifted: the
-# repo copy is CI-tested while production mints execute the ~/.pi copy, and
-# nothing refreshed the latter until a manual copy (the #513 clean-micro
-# guard sat on main 09-07 while ~/.pi/agent/scripts/record-review.sh stayed
-# pre-guard 09-04). Same idempotent real-copy refresh model as the farms
-# above — every sync re-applies the repo copy.
-merge_gate_srcs=(record-review.sh)
+# Merge-gate scripts farm (#562): record-review.sh + check-second-model.sh —
+# the review-enforcer's merge-registry writer (issue #138) and the #716
+# second-model designation guard. The guard's default authority is the LIVE
+# file at ~/.pi/agent/second-model.json, so a consumer repo must be able to
+# run it without the agent-infra checkout path. NOT launchd-invoked (pi-session
+# code resolves them explicitly: code-review SKILL.md Step 10 + commit-workflow
+# 04-merge-deploy), so they never joined the #427/#373 farms and drifted: the
+# repo copies are CI-tested while production mints execute the ~/.pi copies.
+# Same idempotent real-copy refresh model as the farms above.
+merge_gate_srcs=(record-review.sh check-second-model.sh)
 mkdir -p "$DEST/scripts"
 merge_gate_copied=0
 for base in "${merge_gate_srcs[@]}"; do
@@ -352,7 +352,7 @@ for base in "${merge_gate_srcs[@]}"; do
   chmod +x "$dest" 2>/dev/null || true
   merge_gate_copied=$((merge_gate_copied+1))
 done
-echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, #562)"
+echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, check-second-model.sh, #562/#716)"
 
 # Wire shell profile (idempotent): auto-sync env + optional keys file
 ZSHRC="$HOME/.zshrc"

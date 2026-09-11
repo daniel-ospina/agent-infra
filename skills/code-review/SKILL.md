@@ -966,13 +966,15 @@ When the fixer loop exits with remaining issues (stall/cap/fail), the **orchestr
 
 After the fixer loop converges clean (all Flash-based review cycles done), dispatch ONE second-model reviewer as a final quality gate. The second model is a stronger reasoner — it catches what the cheaper review agents miss.
 
-**Model (second-model gate, #716):** resolve the effective model with the guard — `bash scripts/check-second-model.sh --print` (offline; honours `$SECOND_MODEL`, else the ordered `preference` in `pi-bootstrap/pi-config/second-model.json`). Before dispatch run `bash scripts/check-second-model.sh --probe` (network): it writes `RESOLVED=<provider/id>` for the first **solvent+reachable** candidate, or `DEGRADED`. Dispatch with `model=<RESOLVED id>`.
+**Model (second-model gate, #716):** resolve the effective model with the guard — `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --print` (offline; honours `$SECOND_MODEL`, else the ordered `preference` in `pi-bootstrap/pi-config/second-model.json`). Before dispatch run `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --probe` (network): it writes `RESOLVED=<provider/id>` for the first **solvent+reachable** candidate, or `DEGRADED`. Dispatch with `model=<RESOLVED id>`.
 
 **Fail-closed DEGRADED (no silent fallback):** if `--print` returns `**DEGRADED` (or the probe exits non-zero), do NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent model yields a same-build "independent" review, the exact #716 defect. Record `[SECOND-MODEL-GATE] model=**DEGRADED independent=DEGRADED` via `record-review.sh` (`SECOND_MODEL_GATE_MODEL` / `SECOND_MODEL_GATE_INDEPENDENT`) and escalate to a human: a degraded second-model gate is a human decision, not an auto-fallback. `[#476 hop-leg]` is orthogonal and stackable — a dispatch that lands on a failover hop is annotated `[SECOND-MODEL-GATE][#476 hop-leg]`, and a hop-leg run is never presented as the configured second model. Pricing/base decision: issue #284, superseded by #716.
 
+**Success path — record the marker (required):** when the probe resolves, record the success form as well: `SECOND_MODEL_GATE_MODEL=<RESOLVED id> SECOND_MODEL_GATE_INDEPENDENT=yes` via `record-review.sh` (it appends `[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>`). check (f) in `scripts/check-pipeline-compliance.sh` requires that line on ANY diff touching the second-model guarded surface, so a successful gate that is never recorded still fails the merge gate.
+
 **Dispatch:**
 ```
-task(model=<RESOLVED provider/id from `check-second-model.sh --probe`>, prompt=<same Agent #1 guidance-compliance + Agent #2 bug-scan prompts, single reviewer>)
+task(model=<RESOLVED provider/id from `$AGENT_INFRA_PATH/scripts/check-second-model.sh --probe`>, prompt=<same Agent #1 guidance-compliance + Agent #2 bug-scan prompts, single reviewer>)
 ```
 
 **Prompt:** Same review dimensions as Steps 4-5 agents — the second model just applies stronger reasoning. No prompt engineering needed.

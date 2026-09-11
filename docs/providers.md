@@ -79,7 +79,7 @@ model.
 
 The pipeline's "second-model" review gates (issue-scoping §5.6, code-review §6.6,
 plan-review §4.5, subagent-driven-development final reviewer) resolve their
-model with `bash scripts/check-second-model.sh --print` (offline; honours
+model with `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --print` (offline; honours
 `$SECOND_MODEL`, else the ordered `preference` list in
 `pi-bootstrap/pi-config/second-model.json`) and `--probe` (network: vendor offer
 + solvency; writes `RESOLVED=<provider/id>` for the first **solvent+reachable**
@@ -90,22 +90,63 @@ list, each candidate's `runtimeVia` dispatch authority, the primary's
 `buildEquivalence` set, the probe endpoints, and an integer-cents
 `costCentsPerPass`. Adding a funded model is a config edit, never a code edit.
 
-**Fail-closed DEGRADED.** When the resolver returns `**DEGRADED` (no candidate
-solvent+reachable), the gate does NOT dispatch a substitute — dispatching
-`deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent
-model would be a same-build "independent" review, the #716 defect. The gate
-records `[SECOND-MODEL-GATE] model=**DEGRADED independent=DEGRADED` (via
-`record-review.sh`) and escalates to a human. `scripts/check-pipeline-compliance.sh`
-check (f) is the mechanical consumer: on a diff touching the guarded surface it
-requires the recorded line and fails on `independent=NO` / `independent=DEGRADED`
-or a build-equivalent id. `$SECOND_MODEL` remains an operator override
-(config-default fail-closed, operator-override-open-by-design) and is annotated,
-never blocked.
+**Fail-closed DEGRADED.** When the resolver returns `**DEGRADED` — or the
+probe exits non-zero (the probe prints plain `DEGRADED` and exits 1; only
+`--print` emits the `**DEGRADED` token, so the trigger is either) — the gate
+does NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in
+task-subagent default) or any build-equivalent model would be a same-build
+"independent" review, the #716 defect. The gate records `[SECOND-MODEL-GATE]
+model=**DEGRADED independent=DEGRADED @ <head-sha>` (via `record-review.sh`)
+and escalates to a human.
+
+**Success path — record the marker.** When the probe resolves
+(`RESOLVED=<provider/id>`), record the success form on the same idempotent
+channel: `SECOND_MODEL_GATE_MODEL=<RESOLVED id>
+SECOND_MODEL_GATE_INDEPENDENT=yes` via `record-review.sh`, which appends
+`[SECOND-MODEL-GATE] model=<id> independent=yes @ <head-sha>` to the PR body.
+`scripts/check-pipeline-compliance.sh` check (f) is the mechanical consumer: on
+a diff touching the guarded surface it requires the line and fails on
+`independent=NO` / `independent=DEGRADED` / a build-equivalent id / a reserved
+or non-id model / a line not bound to the PR head. `$SECOND_MODEL` remains an
+operator override (config-default fail-closed,
+operator-override-open-by-design) and is annotated, never blocked; `--probe`
+probes a matching override FIRST, but never probe-certifies an id that declares
+no probe endpoint (the probe gates liveness; `--print` is the dispatch
+authority).
+
+**Guard location.** The guard is `scripts/check-second-model.sh` in this repo;
+`pi-bootstrap/setup.sh` additionally installs it to `~/.pi/agent/scripts/` (the
+same merge-gate farm as `record-review.sh`). Invoke it as
+`bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh"` — the base template and
+the four gate skills use that one convention, so a consumer tree never depends
+on a bare repo-relative path. The script resolves its own repo root PHYSICALLY
+(`realpath`), so the consumer `scripts/` symlink cannot misresolve the shipped
+config (issue #716's E8).
+
+**Probe security.** The probe never forwards a credential dictated by an
+untrusted config: probe URLs must be `https://` (`file://` only under the
+test-only `--allow-file-probe`), the destination host must be an allowlisted
+host for the candidate's own vendor, `authEnv` must be a fixed known vendor env
+var, and cross-host redirects are refused — so the `Authorization` header is
+never re-sent to a host the config chose. Keys are never printed, logged or
+written.
+
+**Escape hatch / rollback (`SECOND_MODEL_GATE_OVERRIDE=1`).** Sets a loud
+notice and silences guard **BLOCKs** (exit 1); violations are still DETECTED
+and printed. It does **not** silence an unusable-authority fatal (exit 2) — an
+override cannot authorize a designation that does not exist. Sanctioned only
+for the documented bootstrap/rollback window (#716): the one-time install of
+the designation in a repo whose base lacks it, or rolling the config back after
+a bad candidate. It is not a general merge bypass — outside that window, fund a
+candidate or fix the config instead.
 
 **Bootstrap exemption.** Check (f) is a loud WARN until
-`pi-bootstrap/pi-config/second-model.json` exists on the PR's base ref — a
-one-time carve-out keyed only on the file's absence on base (never a branch
-name, PR number, or commit range; never obtainable by a diff touching the file).
+`pi-bootstrap/pi-config/second-model.json` POSITIVELY exists on the PR's base
+ref — a one-time carve-out keyed only on the file's absence on base (never a
+branch name, PR number, or commit range; never obtainable by a diff touching
+the file). An UNRESOLVABLE base ref (a shallow clone, or the CI workflow's
+base-fetch step removed) is a FAIL, not a WARN: a base that cannot be read
+cannot prove the file was ever absent.
 
 **Why.** From 2026-09-14 12:00 Beijing, `deepseek-v4-pro` is served by the same
 V4.1 Flash build as the primary session, so a provider-qualified id check alone

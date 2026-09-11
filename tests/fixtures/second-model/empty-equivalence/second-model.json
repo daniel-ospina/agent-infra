@@ -48,7 +48,7 @@
   "notes": [
     "Ordered preference: the first SOLVENT+REACHABLE candidate wins; if none is solvent or reachable the gate is DEGRADED and fails closed (never dispatch the tool default or any build-equivalent model as an 'independent' review).",
     "kimi-k3 first honours the human's 2026-09-11 selection; opus-4.8 second. Funding either account (or adding a candidate) needs no code change — this file is the single source of truth.",
-    "Do NOT add qwen-tp (key revoked, HTTP 401) or zai (insolvent, code 1113) as candidates; see the #716 funding comment for the live probe evidence.",
+    "Do NOT re-add a candidate whose funding is unverified: re-check the dated evidence in the #716 funding comment (probe results are recorded there, never frozen into this shipped file) before adding qwen-tp, zai, or any other previously-unfunded model back.",
     "costCentsPerPass is an integer-cents estimate per 40K-in/4K-out review pass (kept off the USD-literal shape #701's AC1 grep scans for).",
     "runtimeVia names the dispatch authority. pi's openrouter model list lives in TypeScript (extensions/custom-provider-openrouter) and is not machine-readable from scripts/ — dispatchability is proven end-to-end by one real graded gate run (indicator (c)); see #734.",
     "buildEquivalence is reversible: when V4.1 Pro ships, remove the pro entries (both normalized + the family regex alternative) so the reroute mapping does not outlive the reroute."

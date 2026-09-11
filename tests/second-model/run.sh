@@ -203,6 +203,19 @@ HOME="$SHIP_HOME" bash "$GUARD" --check >"$OUT" 2>&1; code=$?
 rm -rf "$SHIP_HOME"
 
 echo ""
+echo "9c. Consumer-tree symlink resolution + install path (E4/E8)"
+CONSUMER="$(mktemp -d /tmp/second-model-consumer.XXXXXX)"
+ln -s "$ROOT/scripts" "$CONSUMER/scripts"
+ln -s "$ROOT/pi-bootstrap" "$CONSUMER/pi-bootstrap"
+( cd "$CONSUMER" && bash scripts/check-second-model.sh --check --shipped-only ) >"$OUT" 2>&1; code=$?
+[ "$code" -eq 0 ] && pass "the guard resolves its shipped config through a consumer scripts/ symlink (exit 0)" || { fail "consumer symlink misresolved the shipped config (exit $code)"; tail -15 "$OUT"; }
+grep -q 'shipped config is not reachable' "$ROOT/.husky/pre-commit" && pass "the pre-commit hook gates on the shipped config (E8)" || fail "the hook does not gate on the shipped config"
+grep -q 'merge_gate_srcs=(record-review.sh check-second-model.sh)' "$ROOT/pi-bootstrap/setup.sh" && pass "setup.sh installs the guard via merge_gate_srcs (E4)" || fail "setup.sh does not install the guard"
+bad="$(grep -rn 'bash scripts/check-second-model.sh' "$ROOT/skills" "$ROOT/AGENTS.md" "$ROOT/templates/AGENTS.base.md" "$ROOT/docs/providers.md" 2>/dev/null || true)"
+if [ -z "$bad" ]; then pass "no bare repo-relative guard invocation remains (E4)"; else fail "bare invocations remain:"; printf '%s\n' "$bad"; fi
+rm -rf "$CONSUMER"
+
+echo ""
 echo "10. docs-parity: no stale default literal, no stand-in/tool-default prose"
 hits="$(grep -rn 'deepseek/deepseek-v4-pro' "$ROOT/skills" "$ROOT/AGENTS.md" "$ROOT/templates" "$ROOT/docs/providers.md" 2>/dev/null || true)"
 if [ -z "$hits" ]; then pass "0 default-literal hits"; else fail "stale default literal survives:"; printf '%s\n' "$hits"; fi
@@ -227,6 +240,17 @@ bash "$GUARD" --help >"$OUT" 2>&1
 grep -q "SECOND_MODEL_GATE_OVERRIDE" "$OUT" && pass "--help documents the escape hatch (A7)" || fail "--help dropped the escape-hatch paragraph"
 grep -q '\$SECOND_MODEL' "$OUT" && pass "--help documents the operator override (A7)" || fail "--help dropped the operator-override paragraph"
 grep -q -e '--allow-file-probe' "$OUT" && pass "--help documents the test-only file-probe flag" || fail "--help dropped the probe-security paragraph"
+# E1/E2/docs: the fail-closed trigger names a non-zero probe exit (SDD), every
+# gate skill tells the success path to record the marker, the escape hatch is
+# documented, and the dated research record no longer pins the gate to V4-Pro.
+grep -q 'or the probe exits non-zero' "$ROOT/skills/subagent-driven-development/SKILL.md" && pass "SDD fail-closed names the non-zero probe exit (E1)" || fail "SDD still literal-matches only **DEGRADED"
+grep -q '\[#476 hop-leg\]' "$ROOT/skills/subagent-driven-development/SKILL.md" && pass "SDD carries the hop-leg stackability sentence (E1)" || fail "SDD lacks the hop-leg sentence"
+for sk in code-review issue-scoping plan-review subagent-driven-development; do
+  grep -q 'Success path — record the marker' "$ROOT/skills/$sk/SKILL.md" && pass "$sk documents the success-path marker (E2)" || fail "$sk does not document the success-path marker"
+done
+grep -q 'Escape hatch / rollback' "$ROOT/docs/providers.md" && pass "providers.md documents the escape hatch (E3)" || fail "providers.md does not document the escape hatch"
+grep -q 'V4-Pro second-model gate' "$ROOT/docs/research/2026-09-05-local-qwen-32b-decision.md" && fail "the dated research record still pins the gate to V4-Pro (E6)" || pass "the dated research record points at the guard (E6)"
+grep -qE 'parity gate    #' "$ROOT/.github/workflows/ci-main.yml" && fail "ci-main.yml still has the joined comment line (E7)" || pass "ci-main.yml comment lines are split (E7)"
 
 echo ""
 echo "11. missing-runtimeVia → fail closed, exit 2"

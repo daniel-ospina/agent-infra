@@ -58,7 +58,21 @@ fi
 # separate `--probe` mode and NEVER runs here (a suspended provider must not
 # block every commit).
 if [ -f scripts/check-second-model.sh ]; then
-  bash scripts/check-second-model.sh --check --shipped-only || exit 1
+  # E8: resolve the guard PHYSICALLY before deciding to run it. Consumer repos
+  # ship scripts/ as a symlink back to agent-infra, so a logical `..` would
+  # look for the shipped config in the CONSUMER and make the guard exit 2 on
+  # every commit. A consumer tree whose guard copy cannot see the shipped
+  # config is skipped visibly rather than blocked.
+  SM_SELF="scripts/check-second-model.sh"
+  if command -v realpath >/dev/null 2>&1; then
+    SM_SELF="$(realpath "$SM_SELF" 2>/dev/null || printf '%s' "$SM_SELF")"
+  fi
+  SM_ROOT="$(cd "$(dirname "$SM_SELF")/.." && pwd)"
+  if [ -f "$SM_ROOT/pi-bootstrap/pi-config/second-model.json" ]; then
+    bash scripts/check-second-model.sh --check --shipped-only || exit 1
+  else
+    echo "[agent-infra] second-model guard present but its shipped config is not reachable from $SM_ROOT — skipping (repo-tree gate)"
+  fi
 fi
 
 # AGENTS.md materialization gate (#600): stage-guard BEFORE spawning the
