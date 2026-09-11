@@ -24,11 +24,13 @@ This skill is a reference — it does not run a procedure. Other skills cross-re
 
 | Profile | Philosophy | User pauses | Review cycles | Fix scope | Sub-agent dispatch |
 |---------|-----------|-------------|---------------|-----------|--------------------|
-| **Fast** (default) | Speed + quality | Normal interactive gates | Up to 4 cycles, per-skill default | Per-skill default | Ask user |
-| **Autonomous** | Measure twice, cut once | **Zero** | Full 4 cycles, no early-exit cap | All P0/P1/P2 + verify each fix | Auto-dispatch by heuristic |
+| **Fast** (default) | Speed + quality | Normal interactive gates | Per-skill default (each skill's own bound — proportional, convergence-gated, or explicitly uncapped) | Per-skill default | Ask user |
+| **Autonomous** | Measure twice, cut once | **Zero** | Full per-skill convergence, **no early-exit cap** | All P0/P1/P2 + verify each fix | Auto-dispatch by heuristic |
 | **Budget** | Watch credits | Normal gates | Same as Fast | Same as Fast | Force in-chat (migrations excepted) |
 
 **Default behavior:** When no intent is set, fall back to **Fast**.
+
+> ⚠️ **These are profile BUDGETS, not caps.** A profile selects *how much* of a skill's own review loop runs — it never imposes a ceiling, and never a bound tighter than the skill's own. The governing bound is always the skill's own: proportional tiers where the skill defines them (the `proportional-gates` skill is canonical: Low → skip, Low-Medium → 3, Medium-High → 5, High → 10), a convergence rule with a 10-cycle safety cap in most convergence-gated skills (`code-review`, `test-review`, `epic-plan`, `verification-before-completion`), or a skill-specific bound (`prototype-review` 5/3, the `research` Step-5.5 verifier 2, the second-model gates 2 in `code-review`/`plan-review`/`issue-scoping`). The review loop is how quality is produced, so the default is to keep cycling until a clean exit, genuine convergence, or the skill's own stall/abort signal — stopping early because a count "feels high" is a bypass. (agent-infra#700: a hard-coded "4 cycles maximum" in `AGENTS.md` and the literal "4" in this table contradicted every convergence-gated skill and overrode the tighter ones (`research` 2, `prototype-review` 3 in React-diff mode, `meta-framework-research` 3), causing verification to stop with fixes unverified.)
 
 ## Reading the Intent
 
@@ -68,12 +70,12 @@ The file is overwritten on each new brainstorming session. Intent is immutable p
 
 Worked examples:
 
-- **Micro + Autonomous:** Codebase Explorer still skipped (Micro rule). Plan reviews run 2 cycles instead of 4 (Micro constrains). Fix P0+P1 (Micro skips P2 by default; intent does not override tier).
+- **Micro + Autonomous:** Codebase Explorer still skipped (Micro rule). Plan review is skipped at Micro (`plan-review` proportional table); when plan review does run, the skill's proportional tier bound (3/5/10) is the governing budget — no profile-level ceiling. Fix P0+P1 (Micro skips P2 by default; intent does not override tier).
 - **Micro + Budget:** codebase-read only — the micro proportional external-research trigger is skipped under Budget (issue #231 D3).
 - **Complex + Budget:** code-review skips NVIDIA pattern scan (6 → 5 agents). writing-plans skips perplexity gate. All other Complex phases run normally.
 - **Standard + Budget:** issue-scoping Phase 1.5 runs ≤ 2 external queries, codebase-first, fired only on P0-level gaps (new third-party dep / novel pattern with zero in-repo precedent) — the writing-plans Perplexity gate is the total session research budget (no double-charge). (issue #231 D3)
 - **Epic-tier + Budget:** epic-plan research hooks and epic-scope granular queries defer to the epic research brief (codebase + brief only, zero external queries). (issue #231 D3)
-- **Complex + Autonomous:** All Complex phases run; review cycles take 4 cycles each, fix all severities; sub-agents auto-dispatch.
+- **Complex + Autonomous:** All Complex phases run; review cycles run to the **skill's own bound** (no early-exit cap — proportional tiers, convergence gates with a 10-cycle safety cap, or the skill's specific bound); sub-agents auto-dispatch.
 
 ## Sub-agent Preamble
 

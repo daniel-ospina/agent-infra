@@ -12,7 +12,7 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL } from "./index.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
@@ -43,7 +43,7 @@ import {
   parseTaskUsageLine,
   scanStderrForUsage,
 } from "./index.js";
-import { readLatchState, setExhausted } from "../shared/provider-failover.js";
+import { readLatchState, setExhausted, familyOf, familyLegs } from "../shared/provider-failover.js";
 import type { ExhaustionMarker, LegRef } from "../shared/provider-failover.js";
 import { dirname, join, resolve } from "node:path";
 
@@ -2544,15 +2544,40 @@ function freshFailoverEnv(): { env: Record<string, string | undefined>; cleanup:
   };
 }
 
-const FLASH_ROOT: LegRef = { provider: "deepseek", model: "deepseek-v4-flash" };
+const FLASH_ROOT: LegRef = { provider: "deepseek", model: "deepseek-flash" };
+// #715: the LEGACY spelling of the flash root — same family (the family KEY is
+// unchanged) and the migration-window input spelling. legIdentity() normalizes
+// it onto FLASH_ROOT, so both spellings must resolve identically.
+const FLASH_ROOT_LEGACY: LegRef = { provider: "deepseek", model: "deepseek-v4-flash" };
 const OPENROUTER_FLASH: LegRef = { provider: "openrouter", model: "deepseek/deepseek-v4-flash" };
 const QWENTP_FLASH: LegRef = { provider: "qwen-tp", model: "deepseek-v4-flash-0731" };
+
+section("#715 default surfaces — the task-tool in-code default is pinned");
+
+test("#715: DEFAULT_TASK_MODEL is the flash family ROOT and matches the shipped settings.json default", () => {
+  // (a) family-resolvable — a family-less default silently disarms the whole
+  //     #476 deepseek→qwen-tp→openrouter hop chain (no error anywhere).
+  const fam = familyOf(DEFAULT_TASK_MODEL, "deepseek");
+  ok(
+    fam !== undefined,
+    `DEFAULT_TASK_MODEL (${DEFAULT_TASK_MODEL}) must resolve to an alias family — a family-less default silently disables the #476 hop chain`,
+  );
+  // (b) it must BE the family ROOT leg's model, never a hop leg.
+  const root = familyLegs(fam!)?.[0];
+  ok(root !== undefined, `family ${fam} must have a root leg`);
+  equal(DEFAULT_TASK_MODEL, root!.model, `DEFAULT_TASK_MODEL must be the family root leg model, not a hop leg`);
+  // (c) it must equal the SHIPPED settings.json defaultModel — the task tool's
+  //     in-code default and the fleet default are separate shipped surfaces
+  //     and must not drift apart (#715).
+  const settings = JSON.parse(readFileSync(resolve(__dirname, "../../pi-bootstrap/pi-config/settings.json"), "utf-8"));
+  equal(DEFAULT_TASK_MODEL, settings.defaultModel, "task-tool in-code default must equal the shipped settings.json defaultModel (#715)");
+});
 
 function mkMarker(over: Partial<ExhaustionMarker>): ExhaustionMarker {
   return {
     kind: "provider-exhaustion",
     hop: "deepseek->openrouter",
-    model: "deepseek-v4-flash",
+    model: "deepseek-flash",
     reason: "402",
     provider: "deepseek",
     nonce: "deadbeef",
@@ -2636,6 +2661,54 @@ test("resolveDispatchLeg: latched root → resolves onto the first AVAILABLE cha
     // default blocked set excludes qwen-tp (401-blocked, sC2) → openrouter
     deepEqual(out.leg, OPENROUTER_FLASH);
     ok(out.hop!.includes("deepseek->"), "hop metadata present");
+  } finally {
+    cleanup();
+  }
+});
+
+test("#715 resolveDispatchLeg: a LEGACY-spelled root ask resolves identically (migration window)", () => {
+  const { env, cleanup } = freshFailoverEnv();
+  try {
+    // clear state → the legacy ask must stay itself (must-stay, no coercion)
+    const clear = resolveDispatchLeg(
+      FLASH_ROOT_LEGACY,
+      { version: 1, epoch: 0, updatedAt: "", primaries: {}, blockedLegs: {} },
+      { env },
+    );
+    deepEqual(clear.leg, FLASH_ROOT_LEGACY, "clear state → the requested legacy leg is preserved");
+    // latched root → the legacy ask advances onto the same chain leg as the
+    // canonical ask. The load-bearing assertion is the PERSISTED state: under
+    // the pre-#715 `nextLegAfter` walk (raw `l.model === after.model`) the
+    // legacy spelling misses `legs[0]` (startIdx -1) and the walk re-returns
+    // the DRAINING root as the "next" leg, so the durable family record would
+    // freeze the root as its activeLeg. The read path would then still recover
+    // openrouter via its own re-walk of the freshly-unavailable root — which is
+    // exactly why a resolve-only assertion stayed green under that revert — so
+    // the guard has to read the latch file back.
+    setExhausted({
+      primaryProvider: "deepseek",
+      reason: "402",
+      source: "marker",
+      family: "deepseek-v4-flash",
+      fromLeg: FLASH_ROOT_LEGACY,
+      env,
+    });
+    const persisted = readLatchState(env).primaries.deepseek.families["deepseek-v4-flash"];
+    deepEqual(
+      persisted.activeLeg,
+      OPENROUTER_FLASH,
+      "persisted activeLeg must be the hop leg — the -1 walk regression writes the drained root here",
+    );
+    ok(
+      persisted.activeLeg?.model !== FLASH_ROOT_LEGACY.model && persisted.activeLeg?.model !== FLASH_ROOT.model,
+      "the durable record must never name the drained root as its active leg",
+    );
+    equal(persisted.hopCount, 1, "the first marker-driven advance counts 1");
+    const legacy = resolveDispatchLeg(FLASH_ROOT_LEGACY, readLatchState(env), { env });
+    const canonical = resolveDispatchLeg(FLASH_ROOT, readLatchState(env), { env });
+    deepEqual(legacy.leg, OPENROUTER_FLASH, "legacy ask → the same hop leg as the canonical ask");
+    deepEqual(legacy.leg, canonical.leg, "both spellings resolve to the identical leg");
+    ok(legacy.hop === canonical.hop, "hop metadata identical for both spellings");
   } finally {
     cleanup();
   }
@@ -2966,7 +3039,7 @@ test("#512 round-1 P2: OFF-TABLE venice markerless connection-error → re-dispa
       env,
     });
     equal(decision.action, "advance", "venice transport error → one re-dispatch on the default");
-    deepEqual(decision.nextLeg, { provider: "deepseek", model: "deepseek-v4-flash" }, "target = deepseek official (family default), never a deeper chain leg");
+    deepEqual(decision.nextLeg, { provider: "deepseek", model: "deepseek-flash" }, "target = deepseek official canonical default (#715), never a deeper chain leg");
     ok(String(decision.annotations.failoverNote).includes("no chain walk"), "annotation says no chain walk");
   } finally {
     cleanup();

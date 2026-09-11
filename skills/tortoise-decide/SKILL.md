@@ -70,7 +70,9 @@ Use the Tortoise MCP tools (no local FalkorDB needed for hosted tenants; self-ho
    content): options → `pointKind: option`, criteria → `criterion`,
    findings → `evidence`; keep ids stable (`opt:a`, `crit:1`, `finding:1`).
 2. **Wire the edges** — `tortoise_create_operator` for each IMPL/NAND;
-   mitigation strength in `[0.10, 0.50]` for relevance edges.
+   mitigation strength in `[0.10, 0.50]` for relevance edges (0.50 =
+   strongest dampening — single source: `tortoise/weights.py` module
+   docstring, #2315).
 3. **Compute** — `tortoise_compute_confidence` (EP belief propagation on the
    decision subgraph) → the per-option confidence.
 4. **Sanity** — `tortoise_check_structure` before presenting (the graph must

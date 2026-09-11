@@ -434,7 +434,7 @@ After all reviewers return clean, output:
 ```
 ✅ Test review complete:
   - Review cycles: N
-  - Reviewers per cycle: <1-3>
+  - Reviewers per cycle: <3-4>
   - Issues found and fixed: N
   - Final status: CLEAN
 
@@ -458,7 +458,7 @@ Journey map coverage: ✓ | skipped (no journey map)
 - `test-design` output (Integration Surface Map)
 - Plan doc's `### Journey Test Map` section
 
-**Pattern:** Mirrors `plan-review`'s research+review+fix+re-review loop structure, adapted for test-level scope (narrower, 4 reviewers, 3-cycle cap instead of 10).
+**Pattern:** Mirrors `plan-review`'s research+review+fix+re-review loop structure, adapted for test-level scope (narrower, 4 reviewers, **10-cycle cap** — see "Hard cap: 10 cycles" above).
 
 ## When NOT to Use
 
