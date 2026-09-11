@@ -71,9 +71,9 @@ GH_REPO="${GH_REPO:-}"
 DRY_RUN="${PIPELINE_COMPLIANCE_DRY_RUN:-0}"
 FAIL_ALL="${PIPELINE_COMPLIANCE_FAIL_ALL:-0}"
 # Authoritative PR file count (pulls .changed_files). Set by the live fetch;
-# files_rows demands the validated row count equal it, so a forged or
-# truncated diff list cannot read as complete. Empty = not enforced (offline
-# simulations, where the list is constructed in-process).
+# files_rows demands the validated DISTINCT-new-path count equal it, so a
+# forged or truncated diff list cannot read as complete. Empty (or 0) = not
+# enforced — offline simulations construct the list in-process.
 FILES_EXPECTED=""
 
 usage() {
@@ -204,10 +204,14 @@ parse_trace_ref() { parse_issue_ref "$1" "$TRACE_KW"; }
 # `*.test.ts` path (satisfying check e) without such a file existing.
 #
 # Row-by-row validation alone cannot catch a forgery whose injected material
-# happens to be well formed, so when $FILES_EXPECTED is a positive integer the
-# validated row count must EQUAL it (the PR's authoritative .changed_files).
-# That equality is what makes the list complete, and it subsumes the
-# 3000-file API cap: a truncated response yields fewer rows than expected.
+# happens to be well formed, so when $FILES_EXPECTED holds a positive integer
+# the DISTINCT new-path count must EQUAL it (the PR's authoritative
+# .changed_files). Equality of distinct paths is what makes the list complete.
+#
+# Compare DISTINCT paths, not rows: `.changed_files` counts distinct paths but
+# `pulls/files` returns one entry per diff entry, so a delete+add on one path
+# (e.g. a symlink converted to a regular file) is two rows for one path.
+# Comparing rows would falsely block such a PR — this repo has produced them.
 files_rows() {
   local rows out count
   rows="$(printf '%s\n' "$1" | sed -e '/^$/d')"
@@ -227,8 +231,8 @@ files_rows() {
     END { if (bad) exit 1 }
   ')" || return 1
   [[ -n "$out" ]] || return 1
-  if [[ "${FILES_EXPECTED:-}" =~ ^[0-9]+$ ]]; then
-    count="$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+  if [[ "${FILES_EXPECTED:-}" =~ ^[1-9][0-9]*$ ]]; then
+    count="$(printf '%s\n' "$out" | LC_ALL=C awk -F '\t' '{ print $2 }' | sort -u | wc -l | tr -d ' ')"
     [[ "$count" == "$FILES_EXPECTED" ]] || return 1
   fi
   printf '%s\n' "$out"
@@ -253,9 +257,9 @@ files_rows() {
 #      This must be status-independent because split-row framing can relocate
 #      a non-docs old path onto a row whose status is not `renamed`.
 #   4. At or above GitHub's documented 3000-file cap for this endpoint the
-#      response may be TRUNCATED. files_rows enforces row-count equality with
-#      the PR's authoritative .changed_files, so a short (truncated or forged)
-#      list never reads as docs-only.
+#      response may be TRUNCATED. files_rows enforces DISTINCT-new-path
+#      equality with the PR's authoritative .changed_files, so a short
+#      (truncated or forged) list never reads as docs-only.
 pr_is_docs_only() {
   local rows count paths
   rows="$(files_rows "$1")" || return 1
@@ -456,7 +460,7 @@ run_checks() {
       # the evidence is unprovable.
       fail e "cannot validate the PR's file list — test-coverage evidence is unprovable (row validation failed, or the list did not match the PR's file count)."
       echo "      Missing: a validatable diff list."
-      echo "      Invoke:  re-run the gate. A path containing a newline or tab, or a truncated response, makes the list unparseable."
+      echo "      Invoke:  re-run the gate. A path containing a newline or tab, or a truncated response, makes the list unparseable; the same message appears if the list does not match the PR's file count."
     elif [[ -z "$runtime_file" ]]; then
       echo "ℹ️  [e] Skipped: no runtime code changes (extensions/**/*.ts|js, bin/*.js) in this PR."
     else
@@ -740,6 +744,11 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_docs_only 'forged row while expected=1' $'added\tdocs/a.md\t\nadded\tdocs/plans/fake.md\t' false 1
   expect_docs_only 'count matches expected' $'added\tdocs/a.md\t' true 1
   expect_docs_only 'truncated list (expected=2, got 1)' $'added\tdocs/a.md\t' false 2
+  # `.changed_files` counts distinct PATHS but pulls/files returns one entry per
+  # DIFF ENTRY, so a delete+add on one path is two rows for one path. Comparing
+  # rows would falsely block such a PR (a symlink converted to a regular file).
+  expect_docs_only 'delete+add same docs path (2 rows, 1 path)' $'removed\tdocs/x.md\t\nadded\tdocs/x.md\t' true 1
+  expect_docs_only 'delete+add same docs path, expected=2 (honest mismatch)' $'removed\tdocs/x.md\t\nadded\tdocs/x.md\t' false 2
   # The old path must be judged for EVERY status, not just `renamed`: a
   # filename containing a newline splits one real file into two well-formed
   # rows, and the non-docs old path can land on a row labelled `added`.
@@ -797,9 +806,11 @@ PR_BODY="$(fetch_json "pulls/$PR_NUMBER" '.body // ""')"
 # renames. Fetched BEFORE the issue resolution: check (a)'s docs-only fallback
 # needs the file list to decide whether a non-closing keyword is acceptable.
 FILES="$(fetch_json "pulls/$PR_NUMBER/files" '.[] | "\(.status)\t\(.filename)\t\(.previous_filename // "")"' 1)"
-# Authoritative file count for this PR. files_rows demands the validated row
-# count EQUAL this, which is what makes a forged or truncated list unable to
-# read as complete (and so unable to look docs-only).
+# Authoritative file count for this PR. files_rows demands the validated
+# DISTINCT-new-path count EQUAL this, which is what makes a forged or
+# truncated list unable to read as complete (and so unable to look
+# docs-only). Distinct paths, not rows: .changed_files counts paths while
+# pulls/files returns one entry per diff entry.
 FILES_EXPECTED="$(fetch_json "pulls/$PR_NUMBER" '.changed_files // ""')"
 
 # Resolve the linked issue (needed before the b–e fetches can run).
