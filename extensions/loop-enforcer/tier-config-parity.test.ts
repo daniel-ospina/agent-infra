@@ -378,7 +378,7 @@ test("index.ts's live call site takes the default cap (one plain argument)", () 
   // call evades it; see the LIMIT note on liveCallShapeViolations), while
   // accepting a hoisted identifier:
   //   evaluateTermination(cycleData, 20)                            -> 2 args
-  //   evaluateTermination(cycleData, 20, // REVIEW_CYCLE_CAPS.high) -> 2 args (comment swallows the ')')
+  //   evaluateTermination(cycleData, 20, // REVIEW_CYCLE_CAPS.high) -> 2 args (trailing empty element dropped by normalizeArgs)
   //   evaluateTermination(cycleData, REVIEW_CYCLE_CAPS.high + 10)   -> 2 args
   //   evaluateTermination(..., "standard")                          -> 10 args
   //   evaluateTermination(...([cycleData, 20] as any))              -> spread
