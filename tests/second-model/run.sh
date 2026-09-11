@@ -23,6 +23,10 @@
 #      an emptied equivalence set fails the primary self-check (exit 2)
 #  14. clean fixture mirrors the shipped config; each backdoor tree differs from
 #      clean only in its one documented defect (bounded delta)
+#  15. large vendor catalogue is not truncation-blind: the needle is searched
+#      across the whole streamed body (OpenRouter /models is >700KB and the
+#      designated id sat past the old 50KB cap → spurious DEGRADED), with an
+#      absent-needle negative control proving the search is non-vacuous.
 #
 # Hermetic: ZERO network. Probe results are injected with `--probe-fixture`
 # (never a real HTTP call). The clobber preflight mirrors tests/cost-config.
@@ -252,6 +256,35 @@ PY
 py=$?
 if grep -q "Traceback" "$OUT" 2>/dev/null; then fail "test 14 checker crashed"; fi
 if [ "$py" -eq 0 ]; then pass "fixture invariants hold"; else fail "fixture invariant check failed (exit $py)"; fi
+
+echo ""
+echo "15. Large vendor catalogue is not truncation-blind (hermetic file:// probe)"
+LARGE="$(mktemp -d /tmp/second-model-large.XXXXXX)"
+python3 - "$FIX/clean/second-model.json" "$LARGE" <<'PY'
+import json, os, sys
+clean = json.load(open(sys.argv[1]))
+out = sys.argv[2]
+# An offer payload larger than the old fixed read cap, with the designated id
+# placed AFTER it (the real OpenRouter shape: ~730KB, id at byte ~222k).
+open(os.path.join(out, "offer.json"), "w").write('{"data":[{"id":"' + "x" * 80000 + 'kimi-k3"}]}')
+open(os.path.join(out, "balance.json"), "w").write('{"data":{"available_balance":12.5}}')
+cfg = json.loads(json.dumps(clean))
+cfg["preference"] = cfg["preference"][:1]
+cfg["preference"][0]["probe"]["offerUrl"] = "file://" + os.path.join(out, "offer.json")
+cfg["preference"][0]["probe"]["solvencyUrl"] = "file://" + os.path.join(out, "balance.json")
+cfg["preference"][0]["probe"]["authEnv"] = ""
+json.dump(cfg, open(os.path.join(out, "second-model.json"), "w"), indent=2)
+PY
+run_guard 0 "needle past the 50KB read cap" --probe --live-dir "$LARGE"
+grep -q "RESOLVED=moonshot/kimi-k3" "$OUT" && pass "streamed needle search found the id past 50KB (no truncation)" || { fail "id past 50KB was missed — truncation regression"; tail -10 "$OUT"; }
+# Negative control: identical shape, needle absent → must NOT resolve.
+python3 - "$LARGE" <<'PY'
+import os, sys
+open(os.path.join(sys.argv[1], "offer.json"), "w").write('{"data":[{"id":"' + "y" * 80000 + '"}]}')
+PY
+run_guard 1 "needle absent in a large catalogue" --probe --live-dir "$LARGE"
+grep -q "vendor offer does not include kimi-k3" "$OUT" && pass "absent needle still blocks (search is non-vacuous)" || { fail "absent needle did not block"; tail -10 "$OUT"; }
+rm -rf "$LARGE"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

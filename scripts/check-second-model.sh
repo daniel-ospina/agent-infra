@@ -298,10 +298,18 @@ def classify(res, entry, patterns):
             return False, f"{label}: no response ({r.get('error', 'unknown')})"
         if not (isinstance(code, int) and 200 <= code < 300):
             return False, f"{label}: HTTP {code}"
-    offer_body = (res.get("offer") or {}).get("body") or ""
+    offer = res.get("offer") or {}
     must = probe.get("offerMustInclude")
-    if must and str(must) not in offer_body:
-        return False, f"vendor offer does not include {must}"
+    if must:
+        # A vendor catalogue can exceed any fixed read cap (OpenRouter's
+        # /models is >700KB, #716) — so http_get() searches the stream for the
+        # needle and reports `needleFound`. `None` = a fixture/injected body,
+        # which is searched in full directly.
+        found = offer.get("needleFound")
+        if found is False:
+            return False, f"vendor offer does not include {must}"
+        if found is None and str(must) not in (offer.get("body") or ""):
+            return False, f"vendor offer does not include {must}"
     sol = res.get("solvency") or {}
     kind = probe.get("solvencyKind")
     if kind == "balance":
@@ -336,7 +344,12 @@ def classify(res, entry, patterns):
     return True, "reachable + solvent"
 
 
-def http_get(url, auth_env, timeout=15):
+def http_get(url, auth_env, timeout=15, needle=None):
+    """GET `url`. With `needle`, stream the body in chunks and report
+    `needleFound` instead of trusting a truncated prefix — a vendor catalogue
+    routinely exceeds a fixed read cap (OpenRouter /models is ~730KB and the
+    designated id sits at byte ~222k, #716), which would otherwise produce a
+    spurious "offer does not include" and a permanent DEGRADED."""
     headers = {"Accept": "application/json", "User-Agent": "agent-infra-second-model-guard/1"}
     key = os.environ.get(auth_env, "") if auth_env else ""
     if key:
@@ -344,8 +357,37 @@ def http_get(url, auth_env, timeout=15):
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return {"httpCode": getattr(r, "status", None) or r.getcode(),
-                    "body": r.read(50000).decode("utf-8", "replace")}
+            code = getattr(r, "status", None)
+            if code is None:
+                try:
+                    code = r.getcode()
+                except Exception:
+                    code = None
+            # Non-HTTP schemes (file://, used by the hermetic large-offer test)
+            # have no status code; a successful open is a 200-equivalent.
+            if code is None:
+                code = 200
+            if needle is None:
+                return {"httpCode": code, "body": r.read(50000).decode("utf-8", "replace")}
+            needle = str(needle)
+            out = {"httpCode": code, "body": "", "needleFound": False}
+            prefix, tail, total = b"", "", 0
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if len(prefix) < 50000:
+                    prefix += chunk
+                text = tail + chunk.decode("utf-8", "replace")
+                if needle in text:
+                    out["needleFound"] = True
+                    break
+                tail = text[-(len(needle) - 1):] if len(needle) > 1 else ""
+                if total >= 8_000_000:
+                    break
+            out["body"] = prefix[:50000].decode("utf-8", "replace")
+            return out
     except urllib.error.HTTPError as e:
         try:
             body = e.read(50000).decode("utf-8", "replace")
@@ -370,7 +412,8 @@ def probe_entry(entry, fixture):
     if env and not os.environ.get(env):
         return {"offer": {"httpCode": None, "error": f"{env} unset"},
                 "solvency": {"httpCode": None, "error": f"{env} unset"}}, ""
-    return {"offer": http_get(probe.get("offerUrl", ""), env),
+    return {"offer": http_get(probe.get("offerUrl", ""), env,
+                              needle=probe.get("offerMustInclude") or None),
             "solvency": http_get(probe.get("solvencyUrl", ""), env)}, ""
 
 
