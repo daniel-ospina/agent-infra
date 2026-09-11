@@ -242,6 +242,10 @@ async function partB() {
   let mod;
   try {
     mod = await import(pathToFileURL(INDEX_TS).href);
+  } catch (e) {
+    // A rejected import must not leak the fake HOME or the env hatches.
+    cleanup();
+    throw e;
   } finally {
     console.warn = realWarn;
   }
@@ -321,6 +325,7 @@ async function partB() {
       trackedWrite = await callWrite(join(repo, "tracked.txt"));
       // B7b/B7c: NEW files take the #436 carve-out (1..25 allowed, 26 blocked).
       firstWrite = await callWrite(join(repo, "docs", "plans", "_new-1.md"));
+      if (firstWrite !== undefined) carveOutBlocked.push(`_new-1: ${JSON.stringify(firstWrite).slice(0, 120)}`);
       for (let i = 2; i <= 25; i++) {
         const r = await callWrite(join(repo, "docs", "plans", `_new-${i}.md`));
         // A blocked carve-out write is NOT counted toward the #628 volume, so a

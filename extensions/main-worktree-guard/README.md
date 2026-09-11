@@ -36,8 +36,9 @@ documented (env hatch below, escape marker below).
 
 **Degradation (fail-safe — and fail-OPEN):** if `classify-git.mjs` fails to
 load (jiti edge case) **totally**, every binding from the failure point on
-keeps its inert default. The bash guard degrades to warn-only, and the
-write/edit guard **fails open**: its target classification (`resolveTargetCheckout`,
+keeps its inert default. The bash guard degrades to **non-blocking** — one
+load-time warning, then every command passes silently — and the write/edit
+guard **fails open**: its target classification (`resolveTargetCheckout`,
 `hasDotGitAncestor`) is among the stubbed bindings, so the gate takes its
 "isolated by construction" branch and allows. The inert defaults are deliberate
 — a failed import must never false-block — but the consequence is that a load
