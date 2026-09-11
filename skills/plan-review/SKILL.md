@@ -358,10 +358,10 @@ ADVISORY, not blocking. Tortoise is ONE source among several — never the only
 one, never required. Unreachable or stale sources lower confidence; they must
 never be reported as "no duplicates found".
 
-OUTPUT — use the skill's own output block VERBATIM, including its Evidence /
-Writers / Shared contract / Verdict lines. Do not invent a shorter schema: the
-Phase 2 parser reads the skill's field names, and a finding that is incomplete by
-the skill's own definition is an open issue, not a pass.
+OUTPUT — use the block below. It carries the skill's required fields (Evidence /
+Writers / Shared contract / Verdict); the skill defines further fields for some
+checks — include them when present. A finding that is incomplete by the skill's
+own definition is an open issue, not a pass.
 
 ISSUE:
   severity: P0|P1|P2
@@ -379,6 +379,17 @@ A `keep separate` verdict with no stated reason is an OPEN finding.
 If clean: NO ISSUES FOUND — CLEAN
 If a source was unavailable: NO ISSUES FOUND — DEGRADED (<source> unavailable)
 ```
+
+**Disposition — controller-level, and #5 is NOT part of the cycle loop.** Reviewer #5 is advisory; its findings must not be merged into Phase 2, must not be re-dispatched on, and must not affect convergence. Phase 4 step 2's `Issues found → Phase 2-3` applies to reviewers #1–#4 only.
+
+| Result | Action |
+|---|---|
+| `NO ISSUES FOUND — CLEAN` | Record verdicts in the plan doc. |
+| `NO ISSUES FOUND — DEGRADED (<source>)` | Record + name the unavailable source. **Not clean, not blocking.** |
+| `ISSUES:` with a verdict | Record each verdict. `unify` → fold into the plan. `keep separate` / `unify-contract-keep-drivers` → record the **reason**. |
+| `ISSUES:` with **no** verdict | Invalid. Re-dispatch once; if it repeats, record `⚠️ unverdict findings` and proceed. |
+
+⚠️ **Both tokens contain the substring `NO ISSUES FOUND`.** Never test #5's result with a substring match — `…— DEGRADED` is not a pass. Match the full token.
 
 ### Phase 2 — Merge & Dedup
 
@@ -451,7 +462,7 @@ of prior cycles, no investment in defending prior fixes. This prevents confirmat
 
 For each cycle:
 1. Dispatch all N reviewers in parallel via `task` tool (fresh `pi -p` sessions), **plus Reviewer #5** when its trigger fires (new component / new write path / new shared-state owner / new vocabulary definition) or on the final cycle. #5 is dispatched **alongside** the proportional set, never instead of it — N does not drop because #5 fired. If the trigger does not fire, the cycle runs the proportional N only, and the cycle log records `#5: not triggered`.
-2. Parse responses: all return "NO ISSUES FOUND" → exit clean. Issues found → Phase 2-3.
+2. Parse responses. Reviewers #1–#4: all return `NO ISSUES FOUND` → exit clean; issues found → Phase 2-3. **Reviewer #5 is parsed separately** (see its disposition table): `ISSUES` from #5 does **not** enter Phase 2-3, does **not** trigger a re-dispatch, and does **not** affect convergence. Match its full token — `NO ISSUES FOUND — DEGRADED` is not clean.
 3. After fixes applied, go to step 1 (repeat cycle)
 
 **Why task sub-agents:** `pi -p` spawns a fresh session. The reviewer has no context
@@ -460,7 +471,8 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 **Exit conditions — ALL must be true before proceeding to Phase 5:**
 
-- [ ] Last cycle's all N reviewers returned "NO ISSUES FOUND" (verbatim, not paraphrased)
+- [ ] Last cycle's reviewers #1–#4 all returned "NO ISSUES FOUND" (verbatim, not paraphrased)
+- [ ] Reviewer #5 (if dispatched) was parsed against its own token: `NO ISSUES FOUND — CLEAN`, or `— DEGRADED (<source>)` recorded as a caveat — **not** read as clean and **not** merged into the cycle
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 

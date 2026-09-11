@@ -16,12 +16,12 @@ updated: 2026-09-10
 
 # Reviewer — Duplication & Architecture
 
-> **Skill type:** Reviewer — single-file, independently invocable, reusable across Workflows.
+> **Skill type:** Modular — independently invocable, reusable across Workflows.
 > **Continuity:** none — fresh session per invocation, no state carried between calls.
 > **Advisory:** **Findings never block a gate.** This reviewer has no authority to fail a gate, hold one open, or trigger a re-dispatch of another reviewer. Its `P0` is *advisory* severity, not *blocking* severity. Every consuming gate must state how an advisory P0 is dispositioned; a gate that feeds this output into a blocking fix-loop has inverted the contract.
 > **Boundary:** Checks duplication-with-existing and whole-system soundness. For alignment with a *parent epic* or documented decisions see `reviewers/architectural-soundness`; for integration surfaces and consumers see `reviewers/integration`; for interface contracts see `reviewers/contract-completeness`.
 > **Boundary → `reviewers/improvement-opportunities`:** IO3 ("Reinvention of existing pattern") asks this reviewer's question 1 **at epic-Coherence-Review time**, and IO2/AS4 ("Missed simplification" / "Over-engineering") share this reviewer's A1/A5 axis. **The division: IO2/IO3/AS4 judge whether the epic's *own proposal* is over-built or reinvents something — a property of the epic text. D1/A5 ask whether the artifact duplicates or destabilises *live components elsewhere in the repo* — a property of the system.** Where the same finding is reachable from both, report it once and cross-reference; do not let this reviewer and IO3 file it twice.
-> **Boundary → `reviewers/cross-substep-drift`:** CSD5 detects inconsistency *within one document across its own substeps*. This reviewer detects duplication and incoherence *across components*. A plan that contradicts itself is CSD5's; a plan that writes state another component already writes is this reviewer's.
+> **Boundary → `reviewers/cross-substep-drift`:** `cross-substep-drift` operates *within one document* — contradiction between substeps, and the same detail specified redundantly across them. This reviewer operates *across components*. A plan that contradicts itself is `cross-substep-drift`'s; a plan that writes state another component already writes is this reviewer's. (Cited by skill name, not check ID — the ID mapping is not this file's to assert.)
 
 Answers two questions that **no other reviewer asks about the live system** (see the `improvement-opportunities` boundary above for the epic-local overlap):
 
@@ -160,22 +160,38 @@ Two writers can disagree **without any error, log, or failing test** surfacing i
 **D8 — P2 — Measurement path does not exercise the production path:**
 A test, benchmark, or harness that measures a different lane than the one users hit, so its green result is not evidence about the real path.
 
+> **Procedure — name both paths as `path:line`:**
+> ```
+> production_lane: <the entry point a user/caller actually hits>
+> measured_lane:   <what the test/benchmark/harness actually exercises>
+> ```
+> If they are not the same call chain, the green result is not evidence about the production path. A harness that *reimplements* the path is a different lane even when it produces identical output. This check does not fire on "tests exist" — it fires on the two paths diverging.
+
 **D9 — P2 — Retrospective audit missing:**
 Divergence that has already run implies state that is **already corrupted**. Every check above is forward-looking. If the finding is that two writers have disagreed, require the audit: *which existing data is already wrong, and who fixes it?* A forward-only fix leaves the damage in place.
 
-> **This check needs an obligation, not just a mention — otherwise it is the easiest finding to write and the least likely to cause anything.** Emit it as an explicit action line so it can be tracked:
+> **This check is MANDATORY whenever D3 or D7 fires — not optional, not a note.** If you found divergent writers, state the audit. Otherwise it is the easiest finding to write and the least likely to cause anything. Emit exactly:
 > ```
 > retrofit_audit_required: <what data is already wrong> → <filed as issue? or named owner>
 > ```
-> If you cannot identify who owns the audit, say so — an unowned corruption audit is itself the finding. Do not downgrade this to a note on D3.
+> An **unowned** audit is itself the finding — write `owner: UNASSIGNED` rather than omitting the line. Do not downgrade this to a note on D3.
 
 ### Architecture
 
 **A1 — P0 — Unsound in context:**
 The system is no longer coherent with this component added. Second source of truth; two owners for one resource; a guarantee that only holds if exactly one writer exists.
 
+> **Procedure — this is D3's output restated as an architectural claim.** Name the shared state, then enumerate **both** owners from the D3 `writers:` list (`path:line`). It fires when two components both claim ownership of one resource, or when a guarantee is asserted that holds only while exactly one writer exists. **If you cannot name a second owner, you have not established A1** — write `A1: not established` rather than asserting incoherence. An unfalsifiable A1 is worse than no A1: it trains the reader to skip A1.
+
 **A2 — P0 — Boundary or layer bypass:**
 The component sits in the wrong layer, reaches across a boundary, or establishes a shortcut that later changes will copy.
+
+> **Procedure — name the boundary and the crossing, both as `path:line`:**
+> ```
+> boundary: <declaration path, or the module/package edge>
+> crossing: <the call/paths that reach across it>
+> ```
+> "Wrong layer" without both is an assertion, not a finding. If the repo declares no boundary at that seam, **say so — an undeclared boundary is itself the finding** (and belongs to A6's invariant vocabulary).
 
 **A3 — P1 — Unaccounted ripple:**
 Existing components must change for this to work, and the proposal does not say which or how. Flag them.
@@ -185,6 +201,13 @@ The proposal justifies the component on its own terms without describing the sys
 
 **A5 — P2 — Local fix, global cost:**
 Solves a local problem by adding system-wide complexity (a new global concept, an extra hop, a new invariant everything must respect).
+
+> **Procedure — state the invariant in one sentence, then count what must respect it:**
+> ```
+> new_global_invariant: <one sentence>
+> call_sites_constrained: <N>, <paths>
+> ```
+> Complexity is "system-wide" only when N is large relative to the change's stated scope. **Report N and the paths.** If N cannot be enumerated, the claim is not established — do not report A5.
 
 **A6 — P1 — Claimed invariant is false, partial, or unaudited:**
 The area carries an in-code or in-doc guarantee — "single source of truth", "the canonical X", "can never drift", "always preserved" — and it is **not true as stated**.

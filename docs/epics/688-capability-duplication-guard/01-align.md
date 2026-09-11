@@ -8,13 +8,17 @@ aboutObjects:
 - capability-duplication-guard
 status: live
 created: 2026-09-10
-revision: 3
+revision: 4
 revision_note: "Cycle 1 (14 issues) + cycle 2 (12 issues). Revision 2 corrected cycle 1 but
   introduced its own errors: the ×6 retraction over-corrected (copies DO exist via
   install-tortoise-skills.sh), the instance-group trio is a pair, the reviewer-boundary
   claim cited the wrong reviewer set, and constraint 4 contradicted the owner-decided
-  cross-repo split. VERDICT CHANGED from PROCEED to DEFER — see step 4."
-verdict: DEFER (spike-only)
+  cross-repo split. VERDICT CHANGED from PROCEED to DEFER — see step 4. Revision 4
+  records an OWNER OVERRIDE: the reviewer is built and wired now, ahead of the precision
+  measurement the Recommendation requires. The verdict field intentionally still reads
+  DEFER — this is a knowingly-overridden verdict, not a revised one. See the override
+  section under the Recommendation for what is and is not authorised, and the open debt."
+verdict: DEFER (spike-only) — OVERRIDDEN BY OWNER 2026-09-10, see rev 4 override section
 ---
 
 # Strategy Alignment Decision — #688
