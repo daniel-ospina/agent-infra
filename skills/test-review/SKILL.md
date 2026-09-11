@@ -458,7 +458,7 @@ Journey map coverage: ✓ | skipped (no journey map)
 - `test-design` output (Integration Surface Map)
 - Plan doc's `### Journey Test Map` section
 
-**Pattern:** Mirrors `plan-review`'s research+review+fix+re-review loop structure, adapted for test-level scope (narrower, 4 reviewers, **10-cycle cap** — per "Hard cap: 10 cycles" above and line 62; an earlier draft of this line said 3, contradicting both and `test-writing`, corrected per agent-infra#700).
+**Pattern:** Mirrors `plan-review`'s research+review+fix+re-review loop structure, adapted for test-level scope (narrower, 4 reviewers, **10-cycle cap** — see "Hard cap: 10 cycles" above).
 
 ## When NOT to Use
 

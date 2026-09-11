@@ -87,7 +87,7 @@ When choosing between two approaches, prefer the one that produces the better ou
 
 Every operation has mandatory quality gates in its skill file — pre-flight checks, review cycles, safety verification. Skipping the skill means skipping those gates. Pi's progressive disclosure puts skill descriptions (not content) in the system prompt. The `read` tool loads the full workflow. **Never assume you know a workflow from the description alone.**
 
-Skill length is not an excuse — reading a 700-line skill is cheaper than bypassing a pre-flight check. Skills with review loops have mandatory quality gates. **Review cycles are not optional.** When a skill describes a review-fix loop, you run it to convergence. Fixing issues and self-declaring "done" without re-dispatching a fresh reviewer is a bypass — not a review. Only "NO ISSUES FOUND" from a fresh-context reviewer ends the cycle.
+Skill length is not an excuse — reading a 700-line skill is cheaper than bypassing a pre-flight check. Skills with review loops have mandatory quality gates. **Review cycles are not optional.** When a skill describes a review-fix loop, you run it to convergence. Fixing issues and self-declaring "done" without re-dispatching a fresh reviewer is a bypass — not a review. Only "NO ISSUES FOUND" from a fresh-context reviewer is a **clean completion**; convergence and cap exits are escalation exits, never completions (see Hard Cap).
 
 ### Review Loop Protocol — MANDATORY
 
@@ -101,17 +101,21 @@ Every review cycle MUST dispatch a FRESH `task` sub-agent. The reviewer has no m
 - The model defends prior decisions rather than critically re-evaluating
 - `task` spawns `pi -p` in a new process with no session memory — the closest available proxy for an independent reviewer
 
-#### Exit Conditions — ALL Must Be True
+#### Exit Conditions — ALL Must Be True (Clean Completion)
 
 - [ ] Last `task` reviewer response was "NO ISSUES FOUND" (verbatim, not paraphrased)
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 
+These conditions define a **clean completion** only. A convergence or cap exit cannot satisfy them and must never be reported as done — it is an **escalation** exit: document the remaining issues and escalate (see Hard Cap).
+
 #### Hard Cap
 
-**The skill's own bound governs — and bounds are proportional, not flat.** `skills/proportional-gates/SKILL.md` is the **canonical** review-cycle table (Low → skip; Low-Medium → **3**; Medium-High → **5**; High → **10**), and convergence-gated skills (`code-review`, `test-review`, `epic-plan`, `verification-before-completion`) use a **10-cycle safety cap**. When a skill specifies no bound, the default is **10**.
+**The skill's own bound always governs — and bounds are proportional, not flat.** The `proportional-gates` skill holds the **canonical** review-cycle table (Low → skip; Low-Medium → **3**; Medium-High → **5**; High → **10**), and convergence-gated skills use a **10-cycle safety cap** (`code-review`, `test-review`, `epic-plan`, `verification-before-completion` are examples — **not an exhaustive list**; defer to the skill you are running, and note that many other skills carry the same 10-cycle cap). When a skill specifies no bound at all, the default is **10**; a skill that explicitly declares no cap governs itself.
 
-This is a **runaway guard, not a quality gate** — review cycles are how quality gets produced, so do not treat the cap as a target, and do not stop early because the count "feels high". Stop only on (a) a clean exit (`NO ISSUES FOUND`), (b) **convergence** (the same issues recurring, no new ones) — which **escalates**: to the orchestrator agent, or to a human where the skill requires it (the skills that escalate on convergence — `code-review`, `plan-review` — mandate human acknowledgement; human escalation is otherwise reserved for architectural or security decisions) — and never proceeds with unfixed issues, or (c) the bound. **Apply the skill's own bound including its proportional tiers** — never substitute a flat number for a skill's risk-scaled escalation, and never apply a bound tighter than the skill's own convergence rule. On cap → **escalate** (orchestrator agent, or a human where the skill requires it) with the remaining issues: document them, post the `⚠️ capped at N cycles — M issues remain` marker, proceed.
+This is a **runaway guard, not a quality gate** — review cycles are how quality gets produced, so do not treat the cap as a target, and do not stop early because the count "feels high". Stop only on (a) a clean exit (`NO ISSUES FOUND`), (b) **convergence** (the same issues recurring, no new ones), or (c) the bound. Never substitute a flat number for a skill's proportional tiers, and never apply a bound tighter than the skill's own rule.
+
+**(b) and (c) are escalation exits, not completions.** They do not satisfy the Exit Conditions above and must never be reported as done. On convergence or cap → **escalate** — to the orchestrator agent, or to a human wherever a skill requires one (`code-review` and `plan-review` escalate on convergence; the Auto-Continue pause conditions apply in addition, and many other skills escalate on convergence too). Document the remaining issues and post the `⚠️ capped at N cycles — M issues remain` marker. Then follow the skill's own cap path: some skills log-and-proceed (`epic-plan`, `test-review`); others block (`plan-review` → Requires Human Input; `carousel-b2b-copy` → BLOCKED; `test-writing` → do not proceed while a P0 remains). Where the skill blocks, or where any P0 remains unfixed, **do not proceed** — halt and await the human. Never report or hand off work with unfixed issues as if it were complete.
 
 #### FORBIDDEN — These Bypass the Quality Gate Entirely
 
@@ -119,7 +123,7 @@ This is a **runaway guard, not a quality gate** — review cycles are how qualit
   This IS skipping the review. Fixing without re-reviewing = no review.
 
 - ❌ Self-declare "I addressed the feedback" as completion
-  Only "NO ISSUES FOUND" from a fresh reviewer is a valid exit signal.
+  Only "NO ISSUES FOUND" from a fresh reviewer is a valid **clean-completion** signal. Convergence/cap exits close the loop only with the remaining issues documented and escalated (see Hard Cap).
 
 - ❌ Re-review in the same conversation context
   Confirmation bias makes same-context re-review unreliable.

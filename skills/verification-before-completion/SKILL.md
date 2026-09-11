@@ -279,7 +279,7 @@ cat /tmp/verify-result.txt
 | Profile | Verification Behavior |
 |---------|---------------------|
 | **Fast** | Type-appropriate. Report results. |
-| **Autonomous** | Type-appropriate + one extra check. Auto-fix up to 3 times. |
+| **Autonomous** | Type-appropriate + one extra check. Auto-fix to convergence (10-cycle safety cap) — no profile-level retry ceiling. |
 | **Budget** | Minimum viable check. Skip browser unless deploy. |
 
 ## Examples
