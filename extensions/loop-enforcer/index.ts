@@ -1717,7 +1717,11 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
       filesChanged: 0, // ponytail: not tracked per-cycle yet
       wallClockMs: 0,
     }));
-    const termResult = evaluateTermination(cycleData, 10);
+    // #723: no explicit bound here — the canonical default in
+    // `evaluateTermination` governs, so there is exactly ONE live cap and
+    // `tier-config-parity.test.ts` pins it (behaviourally + against the skill
+    // table). Also: never pass a `tier` here — it would override the cap.
+    const termResult = evaluateTermination(cycleData);
     if (termResult.shouldExit) {
       // ── L3 Ralph Loop: stall recovery before escalation ──
       if (termResult.reason === "L3-deadlock" && !manifest.ralph_loop_attempted) {
