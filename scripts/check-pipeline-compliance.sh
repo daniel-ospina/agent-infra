@@ -437,17 +437,20 @@ run_checks() {
     if [[ "$is_stdcomplex" == "true" ]]; then
       plan_file="$(printf '%s\n' "$files_plain" | grep -E '^docs/plans/.*\.md$' | head -1 || true)"
       if printf '%s' "$SCOPING_COMMENT" | grep -qi 'wiring'; then wiring_found="yes"; fi
-      if [[ "$files_ok" != "true" ]]; then
-        # Mirror check (e): an unvalidatable diff list must not be reported as
-        # "no plan doc", which sends the author hunting for a missing document
-        # when the real cause is an unparseable file list.
-        fail d "cannot validate the PR's file list — plan-doc evidence is unprovable (row validation failed, or the list did not match the PR's file count)."
-        echo "      Missing: a validatable diff list."
-        echo "      Invoke:  re-run the gate. A path containing a newline or tab, or a truncated response, makes the list unparseable; the same message appears if the list does not match the PR's file count."
-      elif [[ -n "$plan_file" ]]; then
+      # The Wiring alternative is file-independent, so it must be evaluated
+      # BEFORE the files_ok guard: otherwise an unvalidatable list would
+      # report check (d) as a plan-doc failure even when a Wiring section
+      # satisfies it, asserting unprovability that is not true and breaking
+      # (d)'s documented OR. The guard only names the real cause when NO plan
+      # evidence is provable at all.
+      if [[ -n "$plan_file" ]]; then
         pass d "plan doc in PR ($plan_file)"
       elif [[ "$wiring_found" == "yes" ]]; then
         pass d "plan evidence: Wiring section (wiring-check table) in scoping comment"
+      elif [[ "$files_ok" != "true" ]]; then
+        fail d "cannot validate the PR's file list — plan-doc evidence is unprovable (row validation failed, or the list did not match the PR's file count)."
+        echo "      Missing: a validatable diff list."
+        echo "      Invoke:  re-run the gate. A path containing a newline or tab, or a truncated response, makes the list unparseable; the same message appears if the list does not match the PR's file count."
       else
         fail d "no plan doc for issue $issue_display (complexity:standard/complex) — the PR must add/modify a file under docs/plans/*.md, or the scoping comment must contain a \"Wiring\" section."
         echo "      Missing: plan doc (docs/plans/*.md) or wiring-check table in scoping comment."
