@@ -133,7 +133,7 @@ Before writing implementation code, verify the test against this checklist. **Al
 
 ### Step 3.5 — Test Review (Mandatory Synchronous Gate)
 
-**⛔ MANDATORY GATE — blocks Green phase until clean.** After the 7-point self-check passes, dispatch `test-review` as a `task` sub-agent for independent review. The self-check is the writer reviewing their own work; `test-review` brings an external perspective with 4 parallel reviewers checking correctness, coverage, surface alignment, and journey alignment.
+**⛔ MANDATORY GATE — blocks Green phase until clean.** After the 7-point self-check passes, dispatch `test-review` as a `task` sub-agent for independent review. The self-check is the writer reviewing their own work; `test-review` brings an external perspective with 4 parallel reviewers checking correctness, coverage+surface, journey-alignment, and test-quality.
 
 **Dispatch (multi-file, single invocation):**
 ```
