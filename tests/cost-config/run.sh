@@ -208,6 +208,13 @@ for f in ("models.json", "settings.json", "models-store.json"):
 sys.exit(0)
 PY
 if [ $? -eq 0 ]; then pass "clean-minified mirrors clean (canonical JSON)"; else fail "clean-minified diverges from clean"; fi
+# The minified twins must actually BE minified — tests 8/9 claim to cover the
+# format-independence path, and pretty-printing them would silently turn those
+# into duplicates of tests 1/2.
+for f in clean-minified/models.json clean-minified/settings.json clean-minified/models-store.json \
+         backdoor-minified/models.json backdoor-minified/settings.json backdoor-minified/models-store.json; do
+  if [ "$(tr -cd '\n' <"$FIX/$f" | wc -c)" -eq 0 ]; then pass "$f is single-line (minified)"; else fail "$f is not minified — tests 8/9 would be vacuous"; fi
+done
 for d in backdoor-settings backdoor-retry backdoor-compaction-disabled backdoor-store; do
   python3 - "$FIX/clean/models.json" "$FIX/$d/models.json" <<'PY'
 import json, sys
@@ -287,27 +294,63 @@ raw = {t: {f: json.load(open(os.path.join(fix, t, f))) for f in files}
 clean = raw["clean"]
 
 # Each backdoor tree must differ from clean in EXACTLY its one injected defect.
-# models: "same" | "differs"; settings: exact structural-delta set;
-# store: "same" | "differs".
+# models: "same" | "control-bumped" | "differs"; settings: exact structural
+# delta set; store: "same" | "snapshot".
 EXPECTED = {
     "backdoor-settings": ("same", {".compaction"}, "same"),
     "backdoor-retry": ("same", {".retry.maxRetries"}, "same"),
     "backdoor-compaction-disabled": ("same", {".compaction.enabled"}, "same"),
-    "backdoor-store": ("same", set(), "differs"),
-    "backdoor-models": ("differs", set(), "same"),
-    "backdoor-minified": ("differs", set(), "same"),
+    "backdoor-store": ("same", set(), "snapshot"),
+    "backdoor-models": ("control-bumped", set(), "same"),
+    "backdoor-minified": ("control-bumped", set(), "same"),
 }
+
+# The only allowed models.json delta in the control trees: the three clean
+# deepseek rows bumped to 1M, plus the appended control rows. Any other id,
+# cost, name or container change must fail.
+CONTROL_IDS = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-expires-on-0910",
+               "deepseek-v4-pro:batch", "deepseek-flash:batch", "deepseek-pro",
+               "deepseek-proxy", "deepseek-flashlight"]
+CLEAN_IDS = [m["id"] for m in clean["models.json"]["providers"]["deepseek"]["models"]]
+MODELS_BOUND = {".providers.deepseek.models"} | {
+    f".providers.deepseek.models[{i}].contextWindow" for i in range(len(CLEAN_IDS))}
+# The store tree is a whole pre-#476 snapshot, so its bound is the shape: the
+# same four providers, the documented deepseek rows, and nothing else injected.
+STORE_KEYS = {"deepseek", "qwen-token-plan", "openrouter", "moonshot"}
+STORE_DEEPSEEK_IDS = ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro"]
+
 for tree, (want_models, want_settings, want_store) in EXPECTED.items():
     bad = []
     dm = sdiff(clean["models.json"], raw[tree]["models.json"])
     ds = sdiff(clean["settings.json"], raw[tree]["settings.json"])
     dt = sdiff(clean["models-store.json"], raw[tree]["models-store.json"])
-    if (dm != set()) != (want_models == "differs"):
+    if want_models == "same" and dm != set():
         bad.append(f"models.json delta {sorted(dm)}")
+    elif want_models == "control-bumped":
+        if not dm <= MODELS_BOUND:
+            bad.append(f"models.json delta outside the control bound: {sorted(dm - MODELS_BOUND)}")
+        got_ids = [m["id"] for m in raw[tree]["models.json"]["providers"]["deepseek"]["models"]]
+        if got_ids != CLEAN_IDS + CONTROL_IDS:
+            bad.append(f"deepseek model ids {got_ids}")
+        for i, m in enumerate(raw[tree]["models.json"]["providers"]["deepseek"]["models"][:len(CLEAN_IDS)]):
+            cm = clean["models.json"]["providers"]["deepseek"]["models"][i]
+            strip = lambda r: {k: v for k, v in r.items() if k != "contextWindow"}
+            if strip(m) != strip(cm):
+                bad.append(f"deepseek row {m['id']} differs outside contextWindow")
     if ds != want_settings:
         bad.append(f"settings.json delta {sorted(ds)} (want {sorted(want_settings)})")
-    if (dt != set()) != (want_store == "differs"):
+    if want_store == "same" and dt != set():
         bad.append(f"models-store.json delta {len(dt)} path(s)")
+    elif want_store == "snapshot":
+        if dt == set():
+            bad.append("models-store.json is identical to clean — the pre-#476 snapshot defect is gone")
+        if set(raw[tree]["models-store.json"]) != STORE_KEYS:
+            bad.append(f"models-store.json providers {sorted(raw[tree]['models-store.json'])}")
+        if [m["id"] for m in raw[tree]["models-store.json"]["deepseek"]["models"]] != STORE_DEEPSEEK_IDS:
+            bad.append("models-store.json deepseek rows changed")
+        if raw[tree]["models-store.json"]["moonshot"]["models"] != [
+                {"id": "kimi-k3", "name": "Kimi K3", "contextWindow": 1048576}]:
+            bad.append("models-store.json moonshot block is not exactly the kimi-k3 control")
     fails += check(not bad,
                    f"{tree} differs from clean only in its documented defect"
                    + (f": {'; '.join(bad)}" if bad else ""))
