@@ -1,8 +1,13 @@
 /**
  * Layered Termination (L1-L10) — P1
- * 
+ *
  * 10-condition termination model. L1-L9 should trigger before L10.
- * Per AGENTS.md: no numeric caps without explicit user authorization.
+ *
+ * Review-cycle caps ARE authorised — proportionally. AGENTS.md (Hard Cap)
+ * delegates the canonical values to `skills/proportional-gates/SKILL.md`:
+ * Low → skip, Low-Medium → 3, Medium-High → 5, High → 10, fallback 10.
+ * (Pre-#723 wording here claimed "no numeric caps without explicit user
+ * authorization", which stopped being true when the proportional table landed.)
  */
 export type TerminationLayer =
   | "L1-quality-gate"
@@ -33,11 +38,43 @@ export interface CycleData {
   wallClockMs: number;
 }
 
-/** Proportional-gates tier mapping → loop V-levels and max cycles. */
+/**
+ * Canonical proportional review-cycle bounds — the single in-code source.
+ *
+ * Mirrors the "Review Cycles" table in `skills/proportional-gates/SKILL.md`,
+ * which AGENTS.md §Hard Cap names canonical. Keyed by the risk row; each entry
+ * is (reviewers → max cycles) in that table.
+ *
+ * `tier-config-parity.test.ts` parses the skill table and fails when these
+ * values — or the TIER_CONFIG mapping below — diverge from it. A comment is
+ * not a guard (#723).
+ */
+export const REVIEW_CYCLE_CAPS = {
+  /** Low — 0 reviewers, review skipped. */
+  skip: 0,
+  /** Low-Medium — 2 reviewers. */
+  lowMedium: 3,
+  /** Medium-High — 3 reviewers. */
+  mediumHigh: 5,
+  /** High — 4 reviewers. */
+  high: 10,
+} as const;
+
+/**
+ * Proportional-gates tier mapping → loop V-levels, reviewer count and cap.
+ *
+ * The risk row is selected by `reviewers` (Low 0 / Low-Medium 2 /
+ * Medium-High 3 / High 4) and `maxCycles` MUST equal that row's Max Cycles.
+ * The complexity tiers map onto rows 1, 2 and 4: V1/standard is the routine
+ * default (Low-Medium, 2 reviewers), V2/complex is the critical level
+ * (High, 4 reviewers). No tier carries 3 reviewers, so Medium-High has no
+ * tier — its bound is declared above for completeness, not applied here.
+ * `tier-config-parity.test.ts` enforces the pairing against the skill file.
+ */
 export const TIER_CONFIG = {
-  micro: { vLevel: null, maxCycles: 0, reviewers: 0 },
-  standard: { vLevel: "V1", maxCycles: 10, reviewers: 2 },
-  complex: { vLevel: "V2", maxCycles: 20, reviewers: 4 },
+  micro: { vLevel: null, maxCycles: REVIEW_CYCLE_CAPS.skip, reviewers: 0 },
+  standard: { vLevel: "V1", maxCycles: REVIEW_CYCLE_CAPS.lowMedium, reviewers: 2 },
+  complex: { vLevel: "V2", maxCycles: REVIEW_CYCLE_CAPS.high, reviewers: 4 },
 } as const;
 
 export type Tier = keyof typeof TIER_CONFIG;
