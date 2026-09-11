@@ -124,6 +124,11 @@ jobs:
         run: python3.12 -m pytest scripts/test_parallel_work_check.py -x --timeout=60 -q
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
+      - name: Loop-enforcer tier-bound parity (#723 — runtime caps vs canonical table)
+        # VISIBLE, not merge-blocking (only pipeline-compliance is required).
+        # The blocking backstop is ci-main.yml's extension-tests job, same
+        # split as sequence-enforcer above.
+        run: npx tsx extensions/loop-enforcer/tier-config-parity.test.ts
       - name: Shipped-default failover coverage pin (#715)
         # VISIBLE but NOT merge-blocking here: the repo's only required status
         # check is `pipeline-compliance`. The BLOCKING backstop is the

@@ -1,8 +1,14 @@
 /**
  * Layered Termination (L1-L10) — P1
- * 
+ *
  * 10-condition termination model. L1-L9 should trigger before L10.
- * Per AGENTS.md: no numeric caps without explicit user authorization.
+ *
+ * Review-cycle caps ARE authorised — proportionally. AGENTS.md (Hard Cap)
+ * holds the fallback (10) and names the canonical proportional table in
+ * `skills/proportional-gates/SKILL.md`: Low → skip, Low-Medium → 3,
+ * Medium-High → 5, High → 10.
+ * (Pre-#723 wording here claimed "no numeric caps without explicit user
+ * authorization", which stopped being true when the proportional table landed.)
  */
 export type TerminationLayer =
   | "L1-quality-gate"
@@ -33,11 +39,51 @@ export interface CycleData {
   wallClockMs: number;
 }
 
-/** Proportional-gates tier mapping → loop V-levels and max cycles. */
+/**
+ * Canonical proportional review-cycle bounds — the single in-code source.
+ *
+ * Mirrors the "Review Cycles" table in `skills/proportional-gates/SKILL.md`,
+ * which AGENTS.md §Hard Cap names canonical. Keyed by the risk row; each entry
+ * is (reviewers → max cycles) in that table.
+ *
+ * `tier-config-parity.test.ts` parses the skill table and fails when these
+ * values — or the TIER_CONFIG mapping below — diverge from it. A comment is
+ * not a guard (#723).
+ */
+export const REVIEW_CYCLE_CAPS = {
+  /** Low — 0 reviewers, review skipped. */
+  skip: 0,
+  /** Low-Medium — 2 reviewers. */
+  lowMedium: 3,
+  /** Medium-High — 3 reviewers. */
+  mediumHigh: 5,
+  /** High — 4 reviewers. */
+  high: 10,
+} as const;
+
+/**
+ * Proportional-gates tier mapping → loop V-levels, reviewer count and cap.
+ *
+ * The risk row is selected by `reviewers` (Low 0 / Low-Medium 2 /
+ * Medium-High 3 / High 4) and `maxCycles` MUST equal that row's Max Cycles.
+ * The complexity tiers map onto rows 1, 2 and 4: `standard` declares 2
+ * reviewers (Low-Medium, 3 cycles) and `complex` declares 4 (High, 10).
+ * No tier carries 3 reviewers, so Medium-High has no tier — its bound is
+ * declared above for completeness, not applied here.
+ * `tier-config-parity.test.ts` enforces the pairing against the skill file.
+ *
+ * NOTE (scope): this mapping is keyed on `reviewers`, and the tiers' V-levels
+ * are descriptive. The only tier derivation in-tree (`index.ts`: V2 → complex,
+ * everything else → standard) collapses V3/V4 onto `standard`, which would
+ * give those levels the *tightest* non-micro cap. No *production* caller
+ * passes `tier` to `evaluateTermination` today (only `termination.test.ts`
+ * does, with `"micro"`), so this is latent — but reusing that derivation to
+ * drive `tier` needs the V3/V4 case resolved first.
+ */
 export const TIER_CONFIG = {
-  micro: { vLevel: null, maxCycles: 0, reviewers: 0 },
-  standard: { vLevel: "V1", maxCycles: 10, reviewers: 2 },
-  complex: { vLevel: "V2", maxCycles: 20, reviewers: 4 },
+  micro: { vLevel: null, maxCycles: REVIEW_CYCLE_CAPS.skip, reviewers: 0 },
+  standard: { vLevel: "V1", maxCycles: REVIEW_CYCLE_CAPS.lowMedium, reviewers: 2 },
+  complex: { vLevel: "V2", maxCycles: REVIEW_CYCLE_CAPS.high, reviewers: 4 },
 } as const;
 
 export type Tier = keyof typeof TIER_CONFIG;
@@ -49,7 +95,7 @@ export type Tier = keyof typeof TIER_CONFIG;
  */
 export function evaluateTermination(
   cycles: CycleData[],
-  maxCycles: number = 10,
+  maxCycles: number = REVIEW_CYCLE_CAPS.high,
   budgetTokens: number = Infinity,
   startTime: number = Date.now(),
   timeoutMs: number = Infinity,
