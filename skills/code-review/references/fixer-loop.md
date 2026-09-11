@@ -56,7 +56,7 @@ EXIT_REASON=""
 ### L1 — Exit conditions
 ```bash
 CYCLE=$((CYCLE + 1))
-if [ $CYCLE -gt $MAX_FIX_CYCLES ]; then EXIT_REASON="cycle-cap"; break; fi
+if [ $CYCLE -gt 10 ]; then EXIT_REASON="cycle-cap"; break; fi  # 10 = the convergence-gated safety cap (SKILL.md "Safety cap at 10 cycles")
 PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
 if [ "$PR_STATE" != "OPEN" ]; then EXIT_REASON="pr-closed"; break; fi
 ```
@@ -279,7 +279,7 @@ with open('operations/logs/cycle-status.yaml', 'w') as f:
 
 - `EXIT_REASON == "fingerprint-stall"`: `⚠️ Auto-fix stalled after ${CYCLE} cycles — requires human review\n\n`
 - `EXIT_REASON == "honest-stuck"`: `⚠️ Auto-fix stuck (honest-stuck — new issues each cycle, non-decreasing 3×) — requires human review\n\n`
-- `EXIT_REASON == "cycle-cap"`: `⚠️ Auto-fix reached cycle cap (${MAX_FIX_CYCLES}) — unresolved issues remain\n\n`
+- `EXIT_REASON == "cycle-cap"`: `⚠️ Auto-fix reached the 10-cycle safety cap — unresolved issues remain; escalate to a human\n\n`
 - `EXIT_REASON == "tool-unavailable"` or `"push-failed"` or `"git-error"` or `"pr-closed"`: `⚠️ Auto-fix aborted (${EXIT_REASON}) — issues require human review\n\n`
 - `EXIT_REASON == "clean"`: no prefix
 

@@ -38,7 +38,7 @@ steps:
 > **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
 > **Canonical:** `agent-infra/skills/plan-review/SKILL.md` — git-tracked source of truth. Pi reads via `~/.pi/agent/skills`; consumers hard-link into `operations/skills`.
 >
-> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers (2-4), convergence-gated (cap proportional to risk: 3 for Medium, 5 for Medium-High, 8 for High). Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
+> **Unified v2.3.0** — agent-neutral. Based on Pi v2.0.0. Research Resolution Gate (#2092), merged Structural+Efficiency, GOOD > EASY design criterion (#51), proportional parallel reviewers (2-4), convergence-gated (cap proportional to risk: 3 for Low-Medium, 5 for Medium-High, 10 for High). Backported 3-layer stuckness detection (fingerprint-stall, honest-stuck, zero-progress) from code-review v3.0.0.
 
 # Plan Review
 
@@ -57,15 +57,17 @@ Automated review-fix cycle for implementation plans. Ensures plan quality before
 ## Proportional Review Cycles (inlined from proportional-gates v1.0.0)
 
 > Reviewer count scales with plan risk and novelty. Not every plan needs 4 reviewers.
+>
+> **Plus Reviewer #5 (conditional).** The table below is the *proportional* set. Reviewer #5 (Duplication & Architecture, #688) is dispatched **in addition to** it whenever the plan introduces a new component, a new write path, a new shared-state owner, or a new definition of an existing vocabulary — and again on the final cycle. It is **not** triggered by plan length, so a High-risk plan with a new write path dispatches **4 + #5**. Keeping it out of the table is deliberate: it is orthogonal to risk, not a fifth risk tier. See the Reviewer #5 section in Phase 1.
 
 | Risk | Reviewers | Max Cycles |
 |------|-----------|------------|
 | **Micro** | 0 (skip review) | — |
 | **Low-Medium** (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |
 | **Medium-High** (large plan, some novelty) | 3 reviewers (+ Efficiency) | 5 |
-| **High** (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 8 |
+| **High** (novel architecture, first-of-kind) | 4 reviewers (all parallel) | 10 |
 
-**Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers. The agent notes the decision; a reviewer sub-agent validates it.
+**Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers. The agent notes the decision; a reviewer sub-agent validates it. **A plan that also introduces a new write path / shared-state owner adds Reviewer #5 on top of whichever N the table gives — #5 is additive, never a replacement for another reviewer.**
 
 **Level-based routing:** For Project-level issues (Level: project in issue body), prefer inline review in the current context over sub-agent dispatch. For Epic-level issues (Level: epic), use fresh-context sub-agent reviewers (default). If Level is missing, default to sub-agent review (safe default). See `proportional-gates` skill for the canonical routing table.
 
@@ -307,6 +309,90 @@ ISSUE:
 If no gaps: NO ISSUES FOUND
 ```
 
+---
+
+**Reviewer #5 — Duplication & Whole-Architecture (#688) — CONDITIONAL, not proportional:**
+
+Dispatched **in addition** to the proportional set above — when the plan introduces a new component, a new write path, a new shared-state owner, or a new definition of an existing vocabulary. Not triggered by plan length. Also dispatched on the FINAL cycle when the plan's data-model / interface / E2E steps introduced surfaces the earlier architecture review never saw.
+
+Read `skills/reviewers/duplication-architecture/SKILL.md` in full and run checks **D1–D9** (duplication) and **A1–A6** (whole-architecture). Do not paraphrase those checks from memory — the skill is the specification. Condensed prompt:
+
+```
+You are reviewing an implementation plan for (a) duplication of something that
+already exists and (b) whole-architecture soundness with this change in place.
+
+PLAN: <full plan>
+REPO: <repo root>   TORTOISE: <graph reachable? state which sources you checked>
+
+DUPLICATION (D1–D9 — read the reviewer skill; do not work from memory):
+- D2: discover writers BY FUNCTION, NOT BY NAME. Writers doing one job
+  routinely share no vocabulary. Separate writers from drivers (a driver
+  delegates; a writer emits the persistence statement). Read the whole family
+  for the odd member — the sibling that does it differently is the defect.
+  Check reader gates too: a reader querying a subset can mis-classify records
+  every writer produced correctly.
+- D3: if this adds a second writer of state already written, that is the
+  finding. Enumerate the COMPLETE set and show your search predicate
+  (`search:` / `excluded:` / `asserted:`). A number you assert is not evidence.
+- D4: for each duplicated vocabulary/invariant, state whether a test asserts
+  the definitions agree. If none does, THAT ABSENCE IS THE FINDING.
+- D7: for silent divergence, invert the burden — name the exception, log, or
+  test that would surface it. Any ABSENT → the divergence is silent → fires.
+- D9: if divergence has already run, require the retrofit audit and name the
+  owner (`retrofit_audit_required:`).
+- Do NOT use "this adds no new component" as an escape. Extending an existing
+  writer with a new field is exactly the shape of the defect (D6: recurrence).
+
+ARCHITECTURE (A1–A6): is the WHOLE coherent with this component added, not
+just this component internally sound? A6: any claimed invariant that is NOT
+actually enforced is a finding.
+
+VERDICT — required for every near-duplicate, three-valued:
+  unify                        — consolidate into the existing implementation
+  keep separate                — with a STATED reason (else it is an open issue)
+  unify-contract-keep-drivers  — one shared contract, genuinely distinct drivers
+A `keep separate` with no reason, or a duplication report with no verdict, is
+an open finding. "No duplication found" is invalid if a source went unchecked.
+
+ADVISORY, not blocking. Tortoise is ONE source among several — never the only
+one, never required. Unreachable or stale sources lower confidence; they must
+never be reported as "no duplicates found".
+
+OUTPUT — use the block below. It carries the skill's required fields (Evidence /
+Writers / Shared contract / Verdict / Confidence). `confidence: high|medium|low`
+is required on **every** finding, not only some; the skill defines further
+per-check fields — include them when present. A finding that is incomplete by
+the skill's own definition is an open issue, not a pass.
+
+ISSUE:
+  severity: P0|P1|P2
+  dimension: duplication-architecture
+  location: <plan section>
+  verdict: unify | keep separate | unify-contract-keep-drivers
+  writers: <ALL writers of the state, path:line>                   # D3
+  shared_contract: <the contract that must be declared, or ABSENT>  # D3
+  evidence: <source — file path, component name, or graph query>    # required
+  confidence: high|medium|low                                      # required
+  description: <what duplicates what, or what is incoherent>
+  suggestion: <what to fix, and which mechanism prevents recurrence>
+
+A `keep separate` verdict with no stated reason is an OPEN finding.
+
+If clean: NO ISSUES FOUND — CLEAN
+If a source was unavailable: NO ISSUES FOUND — DEGRADED (<source> unavailable)
+```
+
+**Disposition — controller-level, and #5 is NOT part of the cycle loop.** Reviewer #5 is advisory; its findings must not be merged into Phase 2, must not affect convergence, and must not trigger a re-dispatch of any reviewer. (One format retry is allowed if its output is unparseable or missing verdicts — that is a retry for *malformed output*, not a re-review on its findings.) Phase 4 step 2's `Issues found → Phase 2-3` applies to reviewers #1–#4 only.
+
+| Result | Action |
+|---|---|
+| `NO ISSUES FOUND — CLEAN` | Record verdicts in the plan doc. |
+| `NO ISSUES FOUND — DEGRADED (<source>)` | Record + name the unavailable source. **Not clean, not blocking.** |
+| `ISSUES:` with a verdict | Record each verdict. `unify` → fold into the plan. `keep separate` / `unify-contract-keep-drivers` → record the **reason**. |
+| `ISSUES:` with **no** verdict | Invalid. Re-dispatch once; if it repeats, record `⚠️ unverdict findings` and proceed. |
+
+⚠️ **Both tokens contain the substring `NO ISSUES FOUND`.** Never test #5's result with a substring match — `…— DEGRADED` is not a pass. Match the full token.
+
 ### Phase 2 — Merge & Dedup
 
 1. Parse all `ISSUE:` blocks from reviewer outputs
@@ -377,8 +463,8 @@ Each review cycle dispatches FRESH `task` sub-agents. The reviewers have no memo
 of prior cycles, no investment in defending prior fixes. This prevents confirmation bias.
 
 For each cycle:
-1. Dispatch all N reviewers in parallel via `task` tool (fresh `pi -p` sessions)
-2. Parse responses: all return "NO ISSUES FOUND" → exit clean. Issues found → Phase 2-3.
+1. Dispatch all N reviewers in parallel via `task` tool (fresh `pi -p` sessions), **plus Reviewer #5** when its trigger fires (new component / new write path / new shared-state owner / new vocabulary definition) or on the final cycle. #5 is dispatched **alongside** the proportional set, never instead of it — N does not drop because #5 fired. If the trigger does not fire, the cycle runs the proportional N only, and the cycle log records `#5: not triggered`.
+2. Parse responses. Reviewers #1–#4: all return `NO ISSUES FOUND` → exit clean; issues found → Phase 2-3. **Reviewer #5 is parsed separately** (see its disposition table): `ISSUES` from #5 does **not** enter Phase 2-3, does **not** trigger a re-dispatch, and does **not** affect convergence. Match its full token — `NO ISSUES FOUND — DEGRADED` is not clean.
 3. After fixes applied, go to step 1 (repeat cycle)
 
 **Why task sub-agents:** `pi -p` spawns a fresh session. The reviewer has no context
@@ -387,7 +473,8 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 
 **Exit conditions — ALL must be true before proceeding to Phase 5:**
 
-- [ ] Last cycle's all N reviewers returned "NO ISSUES FOUND" (verbatim, not paraphrased)
+- [ ] Last cycle's reviewers #1–#4 all returned "NO ISSUES FOUND" (verbatim, not paraphrased)
+- [ ] Reviewer #5 (if dispatched) was parsed against its **full** token and dispositioned per the table above — `NO ISSUES FOUND — CLEAN`, `— DEGRADED (<source>)` recorded as a caveat, or `ISSUES:` recorded with its verdicts. None of these blocks the cycle; all three satisfy this box. Substring-matching `NO ISSUES FOUND` and reading `— DEGRADED` as clean fails this box.
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 
@@ -505,6 +592,6 @@ This gives one orchestrator-level recovery before waking the human.
 
 ## Announce
 
-At invocation: "Running plan-review on `[plan-doc-path]` with N parallel reviewers (proportional to plan risk). Capped at [3|5|8] cycles per plan risk tier — escalates to human at cap. See Proportional Review Cycles table. Does not auto-exit with remaining issues."
+At invocation: "Running plan-review on `[plan-doc-path]` with N parallel reviewers (proportional to plan risk). Capped at [3|5|10] cycles per plan risk tier — escalates to human at cap. See Proportional Review Cycles table. Does not auto-exit with remaining issues."
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.
