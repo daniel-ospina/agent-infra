@@ -160,6 +160,7 @@ The `duplication-architecture` reviewer is **advisory** and must never be fed in
 | `NO ISSUES FOUND — DEGRADED (<source>)` | Record + name the unavailable source in the plan doc. **Not clean, not blocking.** Proceed with the caveat. |
 | `ISSUES:` with a verdict | Record each verdict. `unify` → fold into the plan. `keep separate` / `unify-contract-keep-drivers` → record the **reason**. |
 | `ISSUES:` with **no** verdict | Invalid result. Re-dispatch once; if it repeats, record `⚠️ reviewer returned unverdict findings` and proceed. |
+| bare `NO ISSUES FOUND` (no qualifier) | **Not accepted as clean.** The skill's clean token is `NO ISSUES FOUND — CLEAN`. Re-dispatch once requiring the qualified token; if the bare form repeats, read the summary block's `Result:` line — treat as `DEGRADED (unqualified)` unless it names a full-clean result, and proceed. |
 
 **Never re-dispatch a step reviewer because the duplication reviewer found something**, and never hold a subs-step gate open on its findings. Its `P0` is advisory severity, not blocking severity. Record it and proceed; the finding survives into the plan doc as a decision the owner can act on.
 

@@ -359,9 +359,10 @@ one, never required. Unreachable or stale sources lower confidence; they must
 never be reported as "no duplicates found".
 
 OUTPUT — use the block below. It carries the skill's required fields (Evidence /
-Writers / Shared contract / Verdict); the skill defines further fields for some
-checks — include them when present. A finding that is incomplete by the skill's
-own definition is an open issue, not a pass.
+Writers / Shared contract / Verdict / Confidence). `confidence: high|medium|low`
+is required on **every** finding, not only some; the skill defines further
+per-check fields — include them when present. A finding that is incomplete by
+the skill's own definition is an open issue, not a pass.
 
 ISSUE:
   severity: P0|P1|P2
@@ -371,6 +372,7 @@ ISSUE:
   writers: <ALL writers of the state, path:line>                   # D3
   shared_contract: <the contract that must be declared, or ABSENT>  # D3
   evidence: <source — file path, component name, or graph query>    # required
+  confidence: high|medium|low                                      # required
   description: <what duplicates what, or what is incoherent>
   suggestion: <what to fix, and which mechanism prevents recurrence>
 
@@ -380,7 +382,7 @@ If clean: NO ISSUES FOUND — CLEAN
 If a source was unavailable: NO ISSUES FOUND — DEGRADED (<source> unavailable)
 ```
 
-**Disposition — controller-level, and #5 is NOT part of the cycle loop.** Reviewer #5 is advisory; its findings must not be merged into Phase 2, must not be re-dispatched on, and must not affect convergence. Phase 4 step 2's `Issues found → Phase 2-3` applies to reviewers #1–#4 only.
+**Disposition — controller-level, and #5 is NOT part of the cycle loop.** Reviewer #5 is advisory; its findings must not be merged into Phase 2, must not affect convergence, and must not trigger a re-dispatch of any reviewer. (One format retry is allowed if its output is unparseable or missing verdicts — that is a retry for *malformed output*, not a re-review on its findings.) Phase 4 step 2's `Issues found → Phase 2-3` applies to reviewers #1–#4 only.
 
 | Result | Action |
 |---|---|
@@ -472,7 +474,7 @@ current plan text with fresh eyes — the closest available proxy for an indepen
 **Exit conditions — ALL must be true before proceeding to Phase 5:**
 
 - [ ] Last cycle's reviewers #1–#4 all returned "NO ISSUES FOUND" (verbatim, not paraphrased)
-- [ ] Reviewer #5 (if dispatched) was parsed against its own token: `NO ISSUES FOUND — CLEAN`, or `— DEGRADED (<source>)` recorded as a caveat — **not** read as clean and **not** merged into the cycle
+- [ ] Reviewer #5 (if dispatched) was parsed against its **full** token and dispositioned per the table above — `NO ISSUES FOUND — CLEAN`, `— DEGRADED (<source>)` recorded as a caveat, or `ISSUES:` recorded with its verdicts. None of these blocks the cycle; all three satisfy this box. Substring-matching `NO ISSUES FOUND` and reading `— DEGRADED` as clean fails this box.
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 

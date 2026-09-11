@@ -46,7 +46,7 @@ Also valid on its own: any time a change proposes a **new** component, module, s
 - **changes any writer of state another component also writes**
 - touches anything carrying a claimed invariant ("single source of truth", "can never drift", "the canonical X")
 
-> ⚠️ **An earlier version of this skill said "if the change adds no new component … this reviewer is a no-op." That escape hatch was shaped exactly like the defect it was meant to catch:** appending a field to an existing writer adds no new component, and it is how three successive divergences were introduced. If you are reaching for the no-op clause, first answer: *does this change write state, extend a declaration, or touch a writer?* If yes, it is not a no-op — say so. `NO ISSUES FOUND — no-op` is only valid when you can state which of the four bullets above are all false.
+> ⚠️ **The no-op clause has been REMOVED — it is not conditionally available, and `NO ISSUES FOUND — no-op` is no longer a valid return.** An earlier version of this skill said "if the change adds no new component … this reviewer is a no-op." That escape hatch was shaped exactly like the defect it was meant to catch: appending a field to an existing writer adds no new component, and it is how three successive divergences were introduced. If you are reaching for a no-op judgement, first answer: *does this change write state, extend a declaration, or touch a writer?* If yes, it is not a no-op. If **no** to all three, return `NO ISSUES FOUND — CLEAN` and state that reasoning — but do not use the word "no-op", and do not skip D2/D3 discovery on the grounds that the change looks small.
 
 ## Inputs Required
 
@@ -170,7 +170,7 @@ A test, benchmark, or harness that measures a different lane than the one users 
 **D9 — P2 — Retrospective audit missing:**
 Divergence that has already run implies state that is **already corrupted**. Every check above is forward-looking. If the finding is that two writers have disagreed, require the audit: *which existing data is already wrong, and who fixes it?* A forward-only fix leaves the damage in place.
 
-> **This check is MANDATORY whenever D3 or D7 fires — not optional, not a note.** If you found divergent writers, state the audit. Otherwise it is the easiest finding to write and the least likely to cause anything. Emit exactly:
+> **This check is MANDATORY whenever divergence has already run** — not optional, not a note. It fires on **evidence of prior divergence** (writers that *have* disagreed — e.g. fields present in one writer's output and absent in another's existing records), **not** merely on D3 finding that a second writer is being introduced. A forward-looking second writer with no divergent data yet needs the D6/D7 mechanisms, not a corruption audit. Emit exactly:
 > ```
 > retrofit_audit_required: <what data is already wrong> → <filed as issue? or named owner>
 > ```
@@ -181,7 +181,12 @@ Divergence that has already run implies state that is **already corrupted**. Eve
 **A1 — P0 — Unsound in context:**
 The system is no longer coherent with this component added. Second source of truth; two owners for one resource; a guarantee that only holds if exactly one writer exists.
 
-> **Procedure — this is D3's output restated as an architectural claim.** Name the shared state, then enumerate **both** owners from the D3 `writers:` list (`path:line`). It fires when two components both claim ownership of one resource, or when a guarantee is asserted that holds only while exactly one writer exists. **If you cannot name a second owner, you have not established A1** — write `A1: not established` rather than asserting incoherence. An unfalsifiable A1 is worse than no A1: it trains the reader to skip A1.
+> **Procedure — split by shape, because the three shapes need different evidence:**
+>
+> - **Shapes 1–2 (second source of truth / two owners for one resource):** this is D3's output restated as an architectural claim. Name the shared state, then enumerate **both** owners from the D3 `writers:` list (`path:line`).
+> - **Shape 3 (a guarantee that only holds if exactly one writer exists):** there is by construction exactly one writer, so no D3 list exists. Name the single writer, quote the guarantee with its `path:line`, and state either the writer that would break it or that the guarantee is **unenforceable/unaudited**. An unenforced single-writer guarantee is the finding.
+>
+> Write `A1: not established` only when **no** shape can be evidenced — not merely because a second owner cannot be named. An unfalsifiable A1 is worse than no A1: it trains the reader to skip A1.
 
 **A2 — P0 — Boundary or layer bypass:**
 The component sits in the wrong layer, reaches across a boundary, or establishes a shortcut that later changes will copy.
@@ -191,7 +196,7 @@ The component sits in the wrong layer, reaches across a boundary, or establishes
 > boundary: <declaration path, or the module/package edge>
 > crossing: <the call/paths that reach across it>
 > ```
-> "Wrong layer" without both is an assertion, not a finding. If the repo declares no boundary at that seam, **say so — an undeclared boundary is itself the finding** (and belongs to A6's invariant vocabulary).
+> "Wrong layer" without both is an assertion, not a finding. If the repo declares no boundary at that seam, **say so — an undeclared boundary is itself the A2 finding** (it is a *missing declaration*, not a false invariant: it has no claimed-invariant vocabulary for A6 to grep, so do not route it there).
 
 **A3 — P1 — Unaccounted ripple:**
 Existing components must change for this to work, and the proposal does not say which or how. Flag them.
@@ -207,7 +212,7 @@ Solves a local problem by adding system-wide complexity (a new global concept, a
 > new_global_invariant: <one sentence>
 > call_sites_constrained: <N>, <paths>
 > ```
-> Complexity is "system-wide" only when N is large relative to the change's stated scope. **Report N and the paths.** If N cannot be enumerated, the claim is not established — do not report A5.
+> **Firing rule (operational, not a matter of degree):** A5 fires when **either** (a) a constrained call site lies **outside** the change's stated scope, **or** (b) N exceeds the number of components the plan's own stated scope names. Both are comparisons a controller can check against the plan text — "N is large relative to scope" is not. Report N and the paths; if N cannot be enumerated, the claim is not established and A5 is not reported.
 
 **A6 — P1 — Claimed invariant is false, partial, or unaudited:**
 The area carries an in-code or in-doc guarantee — "single source of truth", "the canonical X", "can never drift", "always preserved" — and it is **not true as stated**.
@@ -262,7 +267,7 @@ Silent-divergence risk: [yes/no]
 Proportionality: [substantive review | no-op — and name which of the four scope bullets are false]
 ```
 
-If no issues found, return: NO ISSUES FOUND
+If no issues found, return: NO ISSUES FOUND — CLEAN
 
 **If you could not consult any source beyond the repo itself**, append:
 ```
