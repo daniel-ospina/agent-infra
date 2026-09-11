@@ -98,7 +98,11 @@ export function parseReviewCycleTable(markdown: string): RiskRow[] {
     if (cells.length < 3) continue;
     if (/^-{2,}$/.test(cells[0].replace(/[:\s]/g, ""))) continue; // separator row
     if (/^risk$/i.test(cells[0])) continue; // header row
-    const reviewers = Number((cells[1].match(/\d+/) || ["0"])[0]);
+    const reviewerMatch = cells[1].match(/^\d+/);
+    if (!reviewerMatch) {
+      throw new Error(`${SKILL_PATH}: unrecognised Reviewers cell "${cells[1]}" on risk row "${cells[0]}"`);
+    }
+    const reviewers = Number(reviewerMatch[0]);
     // The Max Cycles cell must be an integer or an explicit skip marker.
     // Coercing anything else to 0 would let a bogus cell parse as "skip" —
     // silent fabrication of exactly the kind this suite exists to catch
@@ -177,10 +181,14 @@ export function normalizeArgs(args: string[]): string[] {
 /**
  * The production call must pass exactly ONE argument — the cycle list. No
  * explicit bound and no `tier` (a tier silently overrides the pinned bound).
- * A second argument, a spread (`...([cycleData, 20])`), or an argument
- * containing a comma all fail; a hoisted identifier (`evaluateTermination(d)`)
- * and a trailing comma both pass. Rejecting spread/comma is what closes the
- * cycle-4 bypass of a pure argument-count check.
+ * A second argument and a spread (`...([cycleData, 20])`) both fail; a hoisted
+ * identifier (`evaluateTermination(d)`) and a trailing comma pass. Rejecting
+ * spread is what closes the cycle-4 bypass of a pure argument-count check.
+ *
+ * LIMIT (stated, not hidden): this is textual. A deliberately obfuscated form
+ * (optional call `f?.(...)`, aliasing `f` and calling the alias, `f.call(...)`)
+ * would evade it. Those require contrived code that a reviewer sees in the
+ * diff; the tripwire is aimed at an ordinary re-added bound or `tier`.
  */
 export function liveCallShapeViolations(src: string): string[] {
   const calls = extractCallArgs(src, "evaluateTermination");
@@ -194,9 +202,9 @@ export function liveCallShapeViolations(src: string): string[] {
       );
       continue;
     }
-    if (args[0].includes("...") || args[0].includes(",")) {
+    if (args[0].includes("...")) {
       violations.push(
-        `live call must not spread or contain a comma — a bound can ride in that way; got ${JSON.stringify(args[0])}`,
+        `live call must not spread — a bound can ride in that way; got ${JSON.stringify(args[0])}`,
       );
     }
   }
@@ -365,8 +373,10 @@ test("the LIVE cap: with no explicit bound the exit lands at the canonical High 
 test("index.ts's live call site takes the default cap (one plain argument)", () => {
   // TEXTUAL TRIPWIRE, not a proof: index.ts is a pi extension with
   // module-level side effects, so its call site cannot be exercised from here.
-  // The rule is "exactly one argument, no comma, no spread", which rejects
-  // every re-add form while accepting a hoisted identifier:
+  // The rule is "exactly one argument, no spread". It rejects the re-add forms
+  // listed below (NOT "every" conceivable form — a deliberately obfuscated
+  // call evades it; see the LIMIT note on liveCallShapeViolations), while
+  // accepting a hoisted identifier:
   //   evaluateTermination(cycleData, 20)                            -> 2 args
   //   evaluateTermination(cycleData, 20, // REVIEW_CYCLE_CAPS.high) -> 3 args
   //   evaluateTermination(cycleData, REVIEW_CYCLE_CAPS.high + 10)   -> 2 args
@@ -395,13 +405,32 @@ test("tripwire control: re-added bound / tier / spread are caught", () => {
 });
 
 test("tripwire control: legitimate refactors still pass", () => {
-  const trailingComma = INDEX_SRC.replace("evaluateTermination(cycleData)", "evaluateTermination(\n  cycleData,\n)");
-  ok(trailingComma !== INDEX_SRC, "control did not apply — update this control");
-  deepEqual(liveCallShapeViolations(trailingComma), [], "a trailing comma is legitimate");
+  const legitimate: Array<[string, string]> = [
+    ["trailing comma", "evaluateTermination(\n  cycleData,\n)"],
+    ["hoisted identifier", "evaluateTermination(d)"],
+    ["nested comma inside a call", "evaluateTermination(cycleData.slice(0, 10))"],
+    ["chained map with a comma", "evaluateTermination(cycleData.map((c, i) => c))"],
+  ];
+  for (const [label, replacement] of legitimate) {
+    const mutated = INDEX_SRC.replace("evaluateTermination(cycleData)", replacement);
+    ok(mutated !== INDEX_SRC, `control "${label}" did not apply — update this control`);
+    deepEqual(liveCallShapeViolations(mutated), [], `"${label}" is a legitimate refactor`);
+  }
+});
 
-  const hoisted = INDEX_SRC.replace("evaluateTermination(cycleData)", "evaluateTermination(d)");
-  ok(hoisted !== INDEX_SRC, "control did not apply — update this control");
-  deepEqual(liveCallShapeViolations(hoisted), [], "a hoisted identifier is legitimate");
+test("rejects a non-numeric Reviewers cell (same strictness as Max Cycles)", () => {
+  const bogus = MARKDOWN.replace(
+    "| Low-Medium (small plan, existing patterns) | 2 reviewers (Structural + Integration) | 3 |",
+    "| Low-Medium (small plan, existing patterns) | many reviewers | 3 |",
+  );
+  ok(bogus !== MARKDOWN, "control did not apply — the Low-Medium row text moved; update this control");
+  let threw = false;
+  try {
+    parseReviewCycleTable(bogus);
+  } catch {
+    threw = true;
+  }
+  ok(threw, "a non-numeric Reviewers cell must throw, not coerce to 0");
 });
 
 test("rejects a non-numeric, non-skip Max Cycles cell (no silent 0)", () => {
@@ -480,8 +509,14 @@ test("rejects a reviewer count with no canonical row", () => {
 });
 
 test("rejects when the canonical table loses a row (parser is bound to content)", () => {
+  // Anchor on the CAPS label, not on a tier name: a legitimate re-point of
+  // `standard` to another row would otherwise make this control fail for an
+  // unrelated reason (cycle-5 review).
   const v = mappingViolations(CAPS, TIERS, TABLE.filter((r) => r.reviewers !== 2));
-  ok(v.some((s) => s.includes("standard")), `expected standard to be unbacked, got: ${v.join(" | ")}`);
+  ok(
+    v.some((s) => s.includes("REVIEW_CYCLE_CAPS.lowMedium")),
+    `expected REVIEW_CYCLE_CAPS.lowMedium to be unbacked, got: ${v.join(" | ")}`,
+  );
 });
 
 test("throws when the canonical table disappears", () => {
