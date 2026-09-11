@@ -167,7 +167,7 @@ digraph process {
 
 **Implementer + per-task reviewers (spec + code quality):** Use the same model as the current session. The session model is already configured with valid credentials and is capable of every task in this workflow. Do NOT specify a different model for sub-agents unless the user explicitly instructs you to do so.
 
-**Final code reviewer (after all tasks):** Dispatch with the second-model gate convention — `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro`, provider-qualified; when set-but-unresolvable or unset-with-unresolvable-default, omit `model` and annotate the result `[SECOND-MODEL-GATE] stand-in`). Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only. This is the two-tier review pattern — Flash handles per-task reviews, the second model serves as the senior reviewer for the final pass across the entire implementation. It catches what cheaper per-task reviewers miss.
+**Final code reviewer (after all tasks):** resolve the model with the second-model gate guard (#716) — `bash scripts/check-second-model.sh --print` (offline) then `--probe` (network; writes `RESOLVED=<provider/id>` for the first **solvent+reachable** candidate, or `DEGRADED`). Never a hardcoded default. **Fail-closed DEGRADED (no silent fallback):** if the resolver returns `**DEGRADED`, do NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent model yields a same-build "independent" review (the exact #716 defect). Record `[SECOND-MODEL-GATE] model=**DEGRADED independent=DEGRADED` via `record-review.sh` (`SECOND_MODEL_GATE_MODEL` / `SECOND_MODEL_GATE_INDEPENDENT`) and escalate to a human. This is the two-tier review pattern — Flash handles per-task reviews, the second model serves as the senior reviewer for the final pass across the entire implementation. It catches what cheaper per-task reviewers miss. Pricing/base decision: issue #284, superseded by #716.
 
 ```
 # Per-task reviews — session model (Flash)
@@ -175,10 +175,10 @@ task(prompt=spec_reviewer_prompt)
 task(prompt=code_quality_reviewer_prompt)
 
 # Final review — second-model gate
-task(prompt=final_code_reviewer_prompt, model=<$SECOND_MODEL per the second-model gate convention>)
+task(prompt=final_code_reviewer_prompt, model=<RESOLVED provider/id from `check-second-model.sh --probe`>)
 ```
 
-If the sub-agent dispatch mechanism accepts a `model` parameter, omit it for per-task reviews to use the session default. Pass the `$SECOND_MODEL` value (default `deepseek/deepseek-v4-pro`) only for the final code reviewer.
+If the sub-agent dispatch mechanism accepts a `model` parameter, omit it for per-task reviews to use the session default. Pass the resolver's `RESOLVED` id (`bash scripts/check-second-model.sh --probe`) only for the final code reviewer — never a build-equivalent id, and never the session default as the final review.
 
 ## Handling Implementer Status
 

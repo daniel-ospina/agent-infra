@@ -966,11 +966,13 @@ When the fixer loop exits with remaining issues (stall/cap/fail), the **orchestr
 
 After the fixer loop converges clean (all Flash-based review cycles done), dispatch ONE second-model reviewer as a final quality gate. The second model is a stronger reasoner — it catches what the cheaper review agents miss.
 
-**Model (second-model gate):** dispatch with `model` = `$SECOND_MODEL` (env; default `deepseek/deepseek-v4-pro` — provider-qualified, unambiguous; resolve via `~/.pi/agent/models.json`). When `$SECOND_MODEL` is set but unresolvable, or unset with the default unresolvable, dispatch the tool default (`deepseek-flash`) and annotate the result `[SECOND-MODEL-GATE] stand-in ($SECOND_MODEL=… set-but-unresolvable | unset+default-unresolvable)`. Never silently substitute. Pricing decision (issue #284): `deepseek-v4-pro` (best bug-finding + cost per review pass); qwen3.8-max re-enable only after verbosity control (reasoning_effort/output caps); kimi-k3 opt-in only.
+**Model (second-model gate, #716):** resolve the effective model with the guard — `bash scripts/check-second-model.sh --print` (offline; honours `$SECOND_MODEL`, else the ordered `preference` in `pi-bootstrap/pi-config/second-model.json`). Before dispatch run `bash scripts/check-second-model.sh --probe` (network): it writes `RESOLVED=<provider/id>` for the first **solvent+reachable** candidate, or `DEGRADED`. Dispatch with `model=<RESOLVED id>`.
+
+**Fail-closed DEGRADED (no silent fallback):** if `--print` returns `**DEGRADED` (or the probe exits non-zero), do NOT dispatch a substitute — dispatching `deepseek-flash` (pi's built-in task-subagent default) or any build-equivalent model yields a same-build "independent" review, the exact #716 defect. Record `[SECOND-MODEL-GATE] model=**DEGRADED independent=DEGRADED` via `record-review.sh` (`SECOND_MODEL_GATE_MODEL` / `SECOND_MODEL_GATE_INDEPENDENT`) and escalate to a human: a degraded second-model gate is a human decision, not an auto-fallback. `[#476 hop-leg]` is orthogonal and stackable — a dispatch that lands on a failover hop is annotated `[SECOND-MODEL-GATE][#476 hop-leg]`, and a hop-leg run is never presented as the configured second model. Pricing/base decision: issue #284, superseded by #716.
 
 **Dispatch:**
 ```
-task(model=<$SECOND_MODEL per the second-model gate convention>, prompt=<same Agent #1 guidance-compliance + Agent #2 bug-scan prompts, single reviewer>)
+task(model=<RESOLVED provider/id from `check-second-model.sh --probe`>, prompt=<same Agent #1 guidance-compliance + Agent #2 bug-scan prompts, single reviewer>)
 ```
 
 **Prompt:** Same review dimensions as Steps 4-5 agents — the second model just applies stronger reasoning. No prompt engineering needed.
