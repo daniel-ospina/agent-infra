@@ -24,7 +24,7 @@ This skill is a reference — it does not run a procedure. Other skills cross-re
 
 | Profile | Philosophy | User pauses | Review cycles | Fix scope | Sub-agent dispatch |
 |---------|-----------|-------------|---------------|-----------|--------------------|
-| **Fast** (default) | Speed + quality | Normal interactive gates | Per-skill default (each skill's own convergence rule; ≤10-cycle safety cap) | Per-skill default | Ask user |
+| **Fast** (default) | Speed + quality | Normal interactive gates | Per-skill default (each skill's own bound — proportional, convergence-gated, or explicitly uncapped) | Per-skill default | Ask user |
 | **Autonomous** | Measure twice, cut once | **Zero** | Full per-skill convergence, **no early-exit cap** | All P0/P1/P2 + verify each fix | Auto-dispatch by heuristic |
 | **Budget** | Watch credits | Normal gates | Same as Fast | Same as Fast | Force in-chat (migrations excepted) |
 

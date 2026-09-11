@@ -434,7 +434,7 @@ After all reviewers return clean, output:
 ```
 ✅ Test review complete:
   - Review cycles: N
-  - Reviewers per cycle: <1-3>
+  - Reviewers per cycle: <3-4>
   - Issues found and fixed: N
   - Final status: CLEAN
 
