@@ -41,6 +41,13 @@ jobs:
         # is NOT installed in CI, #672).
         echo "== scripts/commit-msg-check.test.sh =="
         bash scripts/commit-msg-check.test.sh || failures=$((failures+1))
+        # Glob-collected: every extensions/*/test*.mjs suite, including #744's
+        # main-worktree-guard/test-module-load.mjs (the index.ts module-LOAD
+        # regression pin) — no explicit line for it, that would double-run it.
+        # ⚠️ This leg is POST-MERGE only (on: push → main); the per-PR run of
+        # the #744 suite is wired in ci.yml — the per-PR workflow that runs the
+        # test suites (pipeline-compliance.yml is also PR-triggered, but runs
+        # no test suite).
         for t in extensions/*/test*.mjs; do
           [ -f "$t" ] || continue
           echo "== $t =="

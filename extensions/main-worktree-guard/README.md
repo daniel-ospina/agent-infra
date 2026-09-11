@@ -788,6 +788,50 @@ closed with a different scope (auto-sync non-main-branch recovery, not process
 supervision). A process-supervision follow-up (new issue) is required. The
 marker fixes **guard-blocked** sessions only.
 
+## Tests
+
+| Suite | Command | Covers |
+|---|---|---|
+| `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
+| `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
+
+`test-module-load.mjs` exists because of a real regression (#744): #697 added a
+rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)
+whose five `_`-prefixed targets were declared NOWHERE. An assignment to an
+undeclared identifier is a `ReferenceError` in ESM (always strict mode); it
+threw inside the guarded `await import("./classify-git.mjs")` block, the catch
+logged `bash git guard DISABLED` and left every fail-safe stub in place, and
+**every session silently ran the degraded legacy path** — while `test.mjs`
+stayed green, because it imports `classify-git.mjs` directly (and its comments
+assert that `index.ts` is not importable in tests). TypeScript flags the bug
+(`TS2552: Cannot find name '_extractCodePayload'`, and the same for its four
+siblings), but the repo has no root `tsconfig.json`, so the CI typecheck job
+self-skips.
+
+The suite has two parts, both zero-dependency (no `node_modules`, so it runs in
+CI):
+
+- **Part A — static scope tripwire.** Parses the `({ … } = …)` assignment
+  patterns out of `index.ts` and asserts every target is a declared binding
+  somewhere in the file. Catches the exact bug class anywhere.
+- **Part B — real module load** (Node ≥ 22.13). Imports the REAL `index.ts`
+  through `module-load-hooks.mjs`, which type-strips the TS sources and stubs
+  `@earendil-works/pi-coding-agent` — the same shapes pi's jiti loader
+  produces. It then drives the registered `tool_call` handler against a
+  hermetic MAIN checkout and asserts BEHAVIOR: the #627 inline-interpreter gate
+  blocks an argv-form git payload the legacy string classifier misses, the
+  disordered-hub write gate blocks a tracked overwrite, and the #628 new-file
+  cap blocks write #26. Those paths read the very bindings that stay stubbed
+  when the import degrades, so the suite is red on the pre-#744 module.
+
+**CI wiring.** Per-PR: the `verify` job in `ci.yml` runs it as a named step
+(added by #744) — not in the pinned `ci` job, whose `test-command` value
+`check-skill-lint.test.mjs` pins to exactly one invocation. Post-merge: the
+`extensions/*/test*.mjs` glob in `ci-main.yml` (`push` → main) picks it up
+automatically, so no explicit line is needed there — an explicit one would
+double-run it. Both are plain zero-dep `node` invocations, neither needs
+`npm ci`.
+
 ## Manual verification checklist
 
 Claims in this README are kept minimal and implementation-literal. From the

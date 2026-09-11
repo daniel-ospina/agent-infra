@@ -31,6 +31,10 @@ jobs:
       # ubuntu-latest runner per PR.
       # NOTE: this makes the check CI-VISIBLE on every PR, not merge-blocking —
       # the repo's only required status check is pipeline-compliance (#646).
+      # ⚠️ This value is PINNED by check-skill-lint.test.mjs (section j):
+      # it must be EXACTLY this invocation — a suffix or shell wrapper fails the
+      # pin gate. The #744 module-load suite therefore runs as its own step in
+      # the `verify` job below, not here.
       test-command: node scripts/check-skill-lint.test.mjs
 
   drift-check:
@@ -128,6 +132,18 @@ jobs:
         # ./provider-failover.js only, which imports `node:` only) — it must run
         # WITHOUT `npm ci`, which this job does not perform.
         run: npx tsx extensions/shared/default-coverage.test.ts
+      - name: main-worktree-guard module-LOAD regression (#744)
+        # The guard's bash-git classifier degraded SILENTLY in every session
+        # from #697 until #744 (five rename-destructuring targets declared
+        # nowhere → ReferenceError at module load, swallowed by the load
+        # try/catch, fail-safe stubs left bound). No gate could see it: the
+        # sibling extensions/main-worktree-guard/test.mjs imports
+        # classify-git.mjs DIRECTLY, and the extensions/*/test*.mjs glob is
+        # post-merge only (ci-main.yml). Its own step here, not a second
+        # `test-command` line above — that value is pinned by
+        # check-skill-lint.test.mjs (section j) to exactly one invocation.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~30s.
+        run: node extensions/main-worktree-guard/test-module-load.mjs
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
