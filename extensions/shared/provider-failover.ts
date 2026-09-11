@@ -217,12 +217,6 @@ export interface AliasFamily {
   family: string;
   /** Fully-qualified ordered legs: index 0 is the primary (official) leg. */
   legs: LegRef[];
-  /** Every OTHER spelling of the family's ROOT leg (#715). Exact-match only,
-   * consulted by familyOf() and legIdentity() so a pre-upgrade latch/marker/
-   * frontmatter/session naming the legacy id normalizes onto the SAME family
-   * and the SAME root leg as the canonical id. Never a prefix rule (review R4
-   * P2: variants must not be silently substituted by a base hop leg). */
-  rootAliases?: string[];
 }
 
 /**
@@ -239,9 +233,19 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
   // KEY stays the legacy spelling: it is the durable latch-state key
   // (primaries.<provider>.families.<KEY>) and renaming it would orphan every
   // existing record. The KEY rename is deferred to #728.
+  //
+  // #715 (review round 1, P2): the family KEY IS the legacy root alias — it is
+  // matched directly by `ALIAS_FAMILIES[id]` (familyOf step 1) and by
+  // `leg.model === famKey` (legIdentity). A separate
+  // `rootAliases: ["deepseek-v4-flash"]` datum duplicated that KEY verbatim and
+  // was therefore inert (its branch could never add a match the KEY branch did
+  // not already make); it was DELETED rather than kept as untested
+  // migration-window scaffolding. When #728 renames the KEY to
+  // the canonical spelling, an alias datum must be re-introduced at that time —
+  // after the rename the legacy spelling is no longer the KEY and would
+  // otherwise become family-less.
   "deepseek-v4-flash": {
     family: "deepseek-v4-flash",
-    rootAliases: ["deepseek-v4-flash"],
     legs: [
       // Canonical V4.1-Flash id (#715): same build, same price as the legacy
       // `deepseek-v4-flash` alias, both registered in models.json.
@@ -270,8 +274,8 @@ export const ALIAS_FAMILIES: Record<string, AliasFamily> = {
  * Precedence (#715, explicit and exact-match at every step):
  *   1. direct ALIAS_FAMILIES key hit → that key;
  *   2. per family (deterministic iteration order): the family's ROOT leg model
- *      (`fam.legs[0].model`, i.e. the canonical spelling) OR any
- *      `fam.rootAliases` entry OR the family KEY itself → that family key;
+ *      (`fam.legs[0].model`, i.e. the canonical spelling) OR the family KEY
+ *      itself → that family key;
  *   3. the qwen-tp rename `deepseek-v4-flash-0731` → the flash family;
  *   4. openrouter/slash ids: last-slash slug match against the BASE slugs;
  *   5. otherwise undefined.
@@ -292,7 +296,7 @@ export function familyOf(modelId: string | null | undefined, provider?: string |
   if (ALIAS_FAMILIES[id]) return id;
   for (const [famKey, fam] of Object.entries(ALIAS_FAMILIES)) {
     const rootModel = fam.legs[0]?.model;
-    if (id === rootModel || (fam.rootAliases ?? []).includes(id) || id === famKey) return famKey;
+    if (id === rootModel || id === famKey) return famKey;
   }
   if (id === "deepseek-v4-flash-0731") return "deepseek-v4-flash";
   // openrouter slugs arrive as "deepseek/deepseek-v4-flash" (slash id). Only
@@ -307,7 +311,8 @@ export function familyOf(modelId: string | null | undefined, provider?: string |
 
 /** Normalize a leg's MODEL spelling onto the family ROOT leg's canonical model
  * (#715). Returns `legs[0].model` when `leg` IS the root leg in any accepted
- * spelling — canonical, a `rootAliases` entry, or the family KEY — and
+ * spelling — the canonical root model, or the family KEY (which today IS the
+ * legacy spelling of the root; see the ALIAS_FAMILIES comment) — and
  * `leg.model` unchanged otherwise, so hop legs (qwen-tp, openrouter) keep
  * their exact-match identity. Bidirectional: a legacy pre-upgrade latch,
  * marker, agent frontmatter or session spelling and the canonical spelling
@@ -317,8 +322,7 @@ export function legIdentity(famKey: string, leg: LegRef): string {
   const root = legs?.[0];
   if (!root) return leg.model;
   if (leg.provider !== root.provider) return leg.model;
-  const aliases = ALIAS_FAMILIES[famKey]?.rootAliases ?? [];
-  if (leg.model === root.model || aliases.includes(leg.model) || leg.model === famKey) return root.model;
+  if (leg.model === root.model || leg.model === famKey) return root.model;
   return leg.model;
 }
 

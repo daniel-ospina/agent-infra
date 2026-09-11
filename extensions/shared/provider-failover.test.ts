@@ -531,6 +531,59 @@ test("#715 WRITE (migration window): a LEGACY-spelling root drain advances ident
   ok(fam.activeLeg?.model !== "deepseek-v4-flash", "activeLeg must not be the legacy root spelling");
 });
 
+test("#715 WRITE: hopCount counts a LEGACY-spelled marker from the CANONICAL active leg (restore-path normalization)", () => {
+  const { env } = makeEnv("v715-fromcurrentactive");
+  // Seed a latched family record whose activeLeg is the CANONICAL root spelling
+  // (a post-upgrade record) with hopCount 1, then send an incoming
+  // LEGACY-spelled marker for that SAME leg. The write path must recognize it
+  // as "the marker came from the current active leg" — without the
+  // legIdentity() normalization in setExhausted's fromCurrentActive check the
+  // two spellings compare unequal and hopCount silently under-counts (1, the
+  // stale-marker path) instead of recording the real re-advance (2).
+  const now = Date.now();
+  fs.writeFileSync(
+    latchStateFile(env),
+    JSON.stringify({
+      version: 1,
+      epoch: 1,
+      updatedAt: new Date(now).toISOString(),
+      primaries: {
+        deepseek: {
+          status: "exhausted",
+          reason: "402",
+          source: "marker",
+          latchedAt: new Date(now).toISOString(),
+          expiresAt: new Date(now + 60 * 60 * 1000).toISOString(),
+          families: {
+            "deepseek-v4-flash": {
+              activeLeg: { provider: "deepseek", model: "deepseek-flash" },
+              hopCount: 1,
+              lastReason: "402",
+            },
+          },
+          notice: null,
+        },
+      },
+      blockedLegs: {},
+    }),
+  );
+  const state = setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: FLASH_PRIMARY_LEGACY,
+    env,
+  });
+  const fam = state.primaries.deepseek.families["deepseek-v4-flash"];
+  equal(
+    fam.hopCount,
+    2,
+    "a legacy-spelled marker from the canonical active root leg is a REAL re-advance (hopCount 2) — hopCount 1 means the normalization was dropped and the marker was misread as stale",
+  );
+  equal(fam.activeLeg?.provider, "openrouter", "the chain still advances to the next available hop leg");
+});
+
 test("#715 READ: a latched canonical root resolves onto the hop leg (qwen-tp unblocked, openrouter blocked)", () => {
   // qwen-tp unblocked → first hop is qwen-tp
   const envOpen = { PI_CODING_AGENT_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "pf-715-read-qwen-")), PROVIDER_FAILOVER_BLOCKED: "" };

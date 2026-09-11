@@ -39,6 +39,7 @@ import {
   ALIAS_FAMILIES,
   familyOf,
   familyLegs,
+  legIdentity,
   legIsFamilyMember,
 } from "./provider-failover.js";
 
@@ -80,6 +81,11 @@ function frontmatterModel(file: string): string {
   return m[1];
 }
 
+/** The accepted LEGACY spelling of the flash family's root id (#715). Kept as
+ * a named constant so the companion assertion is explicit about which alias it
+ * documents. */
+const LEGACY_FLASH_ALIAS = "deepseek-v4-flash";
+
 /** Assert that `modelId` is a family root and, when `provider` is known, that
  * the provider is a member of that family. Returns the family key. */
 function assertRootCovered(label: string, modelId: string, provider?: string): string {
@@ -87,7 +93,16 @@ function assertRootCovered(label: string, modelId: string, provider?: string): s
   ok(fam !== undefined, `${label}: familyOf(${JSON.stringify(modelId)}${provider ? `, ${JSON.stringify(provider)}` : ""}) must resolve to a family — a family-less default silently disables the #476 hop chain`);
   const root = familyLegs(fam!)?.[0];
   ok(root !== undefined, `${label}: family ${fam} must have a root leg`);
-  equal(modelId, root!.model, `${label}: the default must BE the family root leg model (not a hop)`);
+  // DELIBERATE POLICY (#715), not a family-resolution requirement: the
+  // objective is that the FLEET default moves to the canonical id. A legacy
+  // spelling would route identically (see the companion assertion below), so
+  // this equality is a product decision held by the pin — changing it requires
+  // changing #715, not just the family table.
+  equal(
+    modelId,
+    root!.model,
+    `${label}: POLICY (#715) — the shipped default must name the family's CANONICAL root spelling ${JSON.stringify(root!.model)} (not a hop leg, and not the legacy alias ${JSON.stringify(LEGACY_FLASH_ALIAS)}). This is deliberate fleet-default policy, NOT a family-resolution requirement: the legacy alias is also family-resolvable and root-leg-identical (companion assertion below).`,
+  );
   if (provider !== undefined) {
     ok(legIsFamilyMember(fam!, provider), `${label}: provider ${provider} must be a member of family ${fam}`);
   }
@@ -137,6 +152,41 @@ test("both shipped agent frontmatters resolve to a family ROOT", () => {
     ok(!hopModels.includes(model), `${rel}: ${model} is a hop leg, not a family root`);
   }
   ok(positiveChecks >= agents.length, "non-vacuity: both agent frontmatters were checked");
+});
+
+section("companion — the legacy alias is family-resolvable + root-leg-identical (policy vs resolution)");
+
+test("#715 companion: the legacy root alias resolves to the shipped default's family AND the same root leg", () => {
+  // Documents the OTHER half of the pin's intent: the canonical-spelling
+  // policy above is STRICTER than what the routing layer requires. The legacy
+  // spelling is a first-class alias — it maps to the same family and
+  // normalizes (via the module's own legIdentity) onto the identical canonical
+  // root leg, so a migration-window default/latch/marker naming it routes
+  // byte-identically to the canonical one.
+  const settings = JSON.parse(fs.readFileSync(path.join(PI_CONFIG, "settings.json"), "utf-8"));
+  const fam = familyOf(settings.defaultModel, settings.defaultProvider);
+  ok(fam !== undefined, `shipped default ${JSON.stringify(settings.defaultModel)} must resolve to a family`);
+  const root = familyLegs(fam!)?.[0];
+  ok(root !== undefined, `family ${fam} must have a root leg`);
+  // family-resolvable: the legacy alias maps onto the SAME family.
+  equal(
+    familyOf(LEGACY_FLASH_ALIAS, root!.provider),
+    fam,
+    `${LEGACY_FLASH_ALIAS} must resolve to the shipped default's family ${fam} (the migration-window alias is still armed)`,
+  );
+  // root-leg-identical: the module's own normalization lands it on the root.
+  equal(
+    legIdentity(fam!, { provider: root!.provider, model: LEGACY_FLASH_ALIAS }),
+    root!.model,
+    `legIdentity must normalize ${LEGACY_FLASH_ALIAS} onto the canonical root leg ${JSON.stringify(root!.model)} — otherwise the legacy alias would route to a different leg than the policy default`,
+  );
+  // And the canonical spelling normalizes to itself (no self-mismatch).
+  equal(
+    legIdentity(fam!, { provider: root!.provider, model: root!.model }),
+    root!.model,
+    "the canonical root spelling must normalize to itself",
+  );
+  positiveChecks++;
 });
 
 section("negative set — variants stay family-less (no silent substitution)");

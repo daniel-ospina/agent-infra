@@ -516,6 +516,18 @@ export function composeTaskResult(
   return { content: [{ type: "text", text: text + extra }], details };
 }
 
+/**
+ * The task tool's in-code default model (#715) — the THIRD shipped default
+ * surface, alongside `pi-bootstrap/pi-config/settings.json` `defaultModel` and
+ * the failover family table's root leg. Must stay the CANONICAL root spelling
+ * (`deepseek-flash`) so a dispatched sub-agent's default resolves to the flash
+ * family's root leg (`familyOf()` → `deepseek-v4-flash`) and therefore keeps
+ * the #476 deepseek→qwen-tp→openrouter hop chain armed. Exported (not an
+ * inline literal) so builtin-tools.test.ts can pin it against both other
+ * surfaces — an inline literal silently drifted before (#715).
+ */
+export const DEFAULT_TASK_MODEL = "deepseek-flash";
+
 /** Default fallback model for #152 connection-error storms. */
 export const DEFAULT_FALLBACK_MODEL = "deepseek-v4-pro";
 
@@ -3221,7 +3233,7 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, signal) {
-      const modelParam = params.model ?? "deepseek-flash";
+      const modelParam = params.model ?? DEFAULT_TASK_MODEL;
       // #154: resolve provider from the model param — "provider/model" splits
       // explicitly; bare model ids are looked up across configured providers
       // (~/.pi/agent/models.json). Unresolvable models keep the legacy
