@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "issue": 716,
+  "primary": {
+    "model": "deepseek/deepseek-v4-flash",
+    "buildEquivalence": {
+      "date": "2026-09-14",
+      "source": "DeepSeek changelog: from 12:00 Beijing 2026-09-14, requests to deepseek-v4-pro are routed to V4.1 Flash at Flash pricing (until V4.1 Pro ships). Served-build identity is server-side and not locally observable; this set is the enforceable proxy.",
+      "families": [
+        "^deepseek-(?:v4(?:\\.\\d+)?-)?(?:flash|pro)(?:[-:]|$)"
+      ],
+      "normalized": [
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "deepseek-flash",
+        "deepseek-pro",
+        "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-expires-on-0910",
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-pro-0731"
+      ]
+    }
+  },
+  "preference": [
+    {
+      "model": "openrouter/google/gemini-2.5-pro",
+      "runtimeVia": "extensions/custom-provider-openrouter/index.ts#registerProvider(openrouter).models[]",
+      "costCentsPerPass": 9,
+      "probe": {
+        "offerUrl": "https://openrouter.ai/api/v1/models",
+        "offerMustInclude": "anthropic/claude-opus-4.8",
+        "solvencyKind": "key-limit",
+        "solvencyUrl": "https://openrouter.ai/api/v1/key",
+        "authEnv": "OPENROUTER_API_KEY"
+      }
+    }
+  ],
+  "unreachablePatterns": [
+    "insufficient balance",
+    "insufficient_balance",
+    "1113",
+    "exceeded_current_quota_error",
+    "api-key is blocked",
+    "key limit exceeded",
+    "suspended"
+  ],
+  "notes": [
+    "Ordered preference: the first SOLVENT+REACHABLE candidate wins; if none is solvent or reachable the gate is DEGRADED and fails closed (never dispatch the tool default or any build-equivalent model as an 'independent' review).",
+    "kimi-k3 first honours the human's 2026-09-11 selection; opus-4.8 second. Funding either account (or adding a candidate) needs no code change \u2014 this file is the single source of truth.",
+    "Do NOT add qwen-tp (key revoked, HTTP 401) or zai (insolvent, code 1113) as candidates; see the #716 funding comment for the live probe evidence.",
+    "costCentsPerPass is an integer-cents estimate per 40K-in/4K-out review pass (kept off the USD-literal shape #701's AC1 grep scans for).",
+    "runtimeVia names the dispatch authority. pi's openrouter model list lives in TypeScript (extensions/custom-provider-openrouter) and is not machine-readable from scripts/ \u2014 dispatchability is proven end-to-end by one real graded gate run (indicator (c)); see #734.",
+    "buildEquivalence is reversible: when V4.1 Pro ships, remove the pro entries (both normalized + the family regex alternative) so the reroute mapping does not outlive the reroute."
+  ]
+}
