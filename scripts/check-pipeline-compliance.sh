@@ -135,10 +135,15 @@ pass() { printf '✅ [%s] %s\n' "$1" "$2"; }
 fail() { printf '❌ [%s] %s\n' "$1" "$2"; FAILURES=$((FAILURES + 1)); }
 
 # Closing-keyword pattern (check a's default) and the NON-closing
-# traceability pattern (the docs-only fallback). \b anchors each keyword so a
-# substring cannot masquerade as one; the caller additionally requires the
-# keyword to be immediately followed by the reference.
-CLOSING_KW='\b(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
+# traceability pattern (the docs-only fallback). \b anchors the TRACE keywords
+# so a substring cannot masquerade as one ("prefs #42" must not read as
+# "refs #42"). The CLOSING pattern deliberately keeps its historic UNANCHORED
+# form: parse_issue_ref is kept byte-identical to
+# record-review.sh::closing_issue_refs (a documented cross-script contract),
+# and anchoring it here would silently change check (a) for EVERY PR. That
+# unanchored behaviour is pinned by this script's own SELF_TEST, not by
+# record-review.test.sh.
+CLOSING_KW='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
 TRACE_KW='\b(ref(s|erences?)?|part[[:space:]]+of|advance(s|d)?|track(s|ed)?|relates?[[:space:]]+to)'
 
 # parse_issue_ref <text> [<kw-pattern>] — print the first issue reference
@@ -184,23 +189,24 @@ parse_issue_ref() {
 parse_trace_ref() { parse_issue_ref "$1" "$TRACE_KW"; }
 
 # pr_is_docs_only <files> — true when the PR's diff lies ENTIRELY under docs/.
-# `files` is the "status<TAB>filename" list from the pulls/files fetch. Fails
-# CLOSED on anything it cannot prove, because this predicate is what unlocks
-# check (a)'s non-closing keyword — a false `true` would let a code PR dodge
-# closure. Three ways to be untrustworthy, all → NOT docs-only:
+# `files` is the "<status><TAB><filename><TAB><old>" list from the pulls/files
+# fetch. Fails CLOSED on anything it cannot prove, because this predicate is
+# what unlocks check (a)'s non-closing keyword — a false `true` would let a
+# code PR dodge closure. Four ways to be untrustworthy, all → NOT docs-only:
 #   1. Empty/unreadable list (a broken fetch must never weaken closure).
-#   2. Any row that is not a well-formed "<status><TAB><filename><TAB><old>"
-#      record (old path empty unless the status is renamed). Git allows
-#      newlines and tabs INSIDE a path; such a name splits into a malformed
-#      row or injects a bogus path, so the list cannot be parsed faithfully
-#      (GH reports filenames raw and the jq template interpolates verbatim).
-#      An EMPTY filename is likewise rejected — it is indistinguishable from
-#      the newline-in-filename exploit and would otherwise vanish when the
-#      trailing newline is stripped by command substitution (order-dependent
-#      fail-open).
-#   3. A `renamed` row whose old path is missing, or whose old path is NOT
-#      under docs/ — a rename deletes the old path, so both ends must be
-#      docs-only.
+#   2. Any row that is not a well-formed 3-field record, or that has an EMPTY
+#      filename. Git allows newlines and tabs INSIDE a path, and GH reports
+#      filenames raw, so such a name splits one real file into several
+#      well-formed-looking rows. An empty filename is likewise rejected — it
+#      would otherwise vanish when command substitution strips the trailing
+#      newline (order-dependent fail-open).
+#   3. Any row whose OLD path ($3) is present but not under docs/ — checked for
+#      EVERY status, not just `renamed`. A rename (or copy) MOVES content out
+#      of the old path, so both ends must be docs-only; otherwise
+#      `git mv scripts/x.sh docs/x.md` reads as an add of a docs file. This
+#      must be status-independent because split-row framing can relocate a
+#      non-docs old path onto a row whose status is not `renamed`.
+#      A `renamed` row with a MISSING old path is rejected too.
 #   4. At or above GitHub's documented 3000-file cap for this endpoint, where
 #      the response may be TRUNCATED — "every returned path is under docs/"
 #      no longer implies the PR is docs-only.
@@ -218,13 +224,17 @@ pr_is_docs_only() {
       if (NF != 3) { bad = 1; next }
       if ($2 == "") { bad = 1; next }
       s = $1
-      if (s != "added" && s != "modified" && s != "removed" && s != "renamed" && s != "changed" && s != "copied") { bad = 1; next }
-      # A rename MOVES content out of its old path, so the old path must also
-      # be visible and under docs/ — otherwise `git mv scripts/x.sh docs/x.md`
-      # reads as an add of a docs file and the PR looks docs-only.
+      # The GitHub diff-entry status enum. `unchanged` is documented and must
+      # be accepted, or a legitimate docs-only PR is wrongly BLOCKED.
+      if (s != "added" && s != "modified" && s != "removed" && s != "renamed" && s != "changed" && s != "copied" && s != "unchanged") { bad = 1; next }
+      # The old path is part of the diff wherever it appears, so it is judged
+      # for EVERY status — not only `renamed`. Split-row framing (a filename
+      # containing a newline) can otherwise relocate a non-docs old path onto
+      # a row labelled `added`, and dropping $3 there would fail OPEN.
       if (s == "renamed" && $3 == "") { bad = 1; next }
+      if ($3 != "" && $3 !~ /^docs\//) { bad = 1; next }
       print $2
-      if (s == "renamed") print $3
+      if ($3 != "") print $3
     }
     END { exit bad }
   ')" || return 1
@@ -672,6 +682,14 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_docs_only 'renamed docs to docs' $'renamed\tdocs/b.md\tdocs/a.md' true
   expect_docs_only 'renamed code to docs' $'renamed\tdocs/x.md\tscripts/x.sh' false
   expect_docs_only 'renamed without previous' $'renamed\tdocs/x.md\t' false
+  # The old path must be judged for EVERY status, not just `renamed`: a
+  # filename containing a newline splits one real file into two well-formed
+  # rows, and the non-docs old path can land on a row labelled `added`.
+  expect_docs_only 'split-row: non-docs old path on an added row' $'renamed\tdocs/x\tdocs/old\nadded\tdocs/y\tscripts/evil.sh' false
+  expect_docs_only 'copied: docs new + code old' $'copied\tdocs/x.md\tscripts/x.sh' false
+  # `unchanged` is in GitHub's documented diff-entry status enum; rejecting it
+  # would wrongly block a legitimate docs-only PR.
+  expect_docs_only 'unchanged status' $'unchanged\tdocs/a.md\t' true
   expect_docs_only 'at the 3000-file API cap' "$(i=0; while [[ $i -lt 3000 ]]; do printf 'added\tdocs/f%s.md\t\n' "$i"; i=$((i+1)); done)" false
   expect_docs_only 'just under the cap' "$(i=0; while [[ $i -lt 2999 ]]; do printf 'added\tdocs/f%s.md\t\n' "$i"; i=$((i+1)); done)" true
 
@@ -694,6 +712,16 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_resolve 'closing beats trace (docs-only)' 'Refs #631 then Closes #701' "$DOCS_ONLY_FILES" "$GH_REPO#701"
   expect_resolve 'closing + code' 'Refs #631 then Closes #701' "$CODE_FILES" "$GH_REPO#701"
   expect_resolve 'no ref at all' 'nothing here' "$CODE_FILES" ''
+  # ── #720: closing-keyword parity with record-review.sh ────────────────────
+  # CLOSING_KW must stay UNANCHORED (byte-identical to
+  # record-review.sh::closing_issue_refs). These two vectors are what pin the
+  # unanchored form — re-anchoring CLOSING_KW fails them here.
+  expect_ref 'prefixes #42' "$GH_REPO#42"
+  expect_ref 'bugfixes #42' "$GH_REPO#42"
+  # The TRACE pattern IS anchored, so these must not resolve.
+  expect_trace 'prefs #42' ''
+  expect_trace 'preferences #42' ''
+
   if [[ "$selffail" -gt 0 ]]; then
     echo "❌ SELF-TEST FAILED ($selffail assertion(s))." >&2
     exit 2
