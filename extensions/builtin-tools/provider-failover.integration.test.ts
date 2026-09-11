@@ -32,7 +32,7 @@
  * Run: npx tsx extensions/builtin-tools/provider-failover.integration.test.ts
  */
 
-import builtinToolsExt, { spawnSubAgent, recordVeniceRoute } from "./index.js";
+import builtinToolsExt, { spawnSubAgent, recordVeniceRoute, DEFAULT_TASK_MODEL } from "./index.js";
 import { readLatchState } from "../shared/provider-failover.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -426,6 +426,22 @@ test("#623 harness: the real task tool registered and exposes the allow_main_edi
 	ok(
 		Object.keys(taskToolDef.parameters?.properties ?? {}).includes("allow_main_edits"),
 		"task tool schema exposes the per-dispatch allow_main_edits opt-in",
+	);
+});
+
+test("#715: the task tool schema description INTERPOLATES the default (no hand-written literal can drift)", () => {
+	const desc: string = taskToolDef?.parameters?.properties?.model?.description ?? "";
+	ok(desc, "task tool exposes a model description");
+	// Re-hardcoding the literal would let the description advertise a stale
+	// default the moment DEFAULT_TASK_MODEL changes — the drift class #715 r2
+	// fixed by construction. Pin the interpolation, not just the constant.
+	ok(
+		desc.includes(`default: ${DEFAULT_TASK_MODEL}`),
+		`model description must interpolate DEFAULT_TASK_MODEL as the default (got: ${desc.slice(0, 60)}…)`,
+	);
+	ok(
+		desc.includes(`'${DEFAULT_TASK_MODEL}' → deepseek`),
+		"model description must interpolate the bare-id example from DEFAULT_TASK_MODEL",
 	);
 });
 
