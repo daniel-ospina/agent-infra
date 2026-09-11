@@ -20,15 +20,20 @@
 #
 # Second-model gate line (#716): when `SECOND_MODEL_GATE_MODEL` is set (env,
 # or `--second-model <id>`), the marker
-#   [SECOND-MODEL-GATE] model=<resolved provider/id> independent=<yes|NO|DEGRADED>
+#   [SECOND-MODEL-GATE] model=<resolved provider/id> independent=<yes|NO|DEGRADED> @ <head-sha>
 # is appended to the PR body alongside the verdict marker (same idempotent
-# channel). `SECOND_MODEL_GATE_INDEPENDENT` (env or
+# channel). The trailing `@ <head-sha>` binds the line to the recorded head
+# (the same full 40-char sha as the verdict marker) so check (f) can reject a
+# line copy-pasted from another PR or recorded at an earlier head. `SECOND_MODEL_GATE_INDEPENDENT` (env or
 # `--second-model-independent <yes|NO|DEGRADED>`) is REQUIRED with it and must
 # be one of those three values — there is no default, because a missing value
-# must not be laundered into an implicit `yes`. check (f) in
-# scripts/check-pipeline-compliance.sh is the mechanical consumer: on a diff
-# touching the guarded surface it requires the line and FAILS on
-# `independent=NO` / `independent=DEGRADED` / a build-equivalent id.
+# must not be laundered into an implicit `yes`. The model slot must be a real
+# provider/id; the reserved `**DEGRADED` marker is accepted ONLY with
+# independent=DEGRADED (a reserved value is never an independent reviewer).
+# check (f) in scripts/check-pipeline-compliance.sh is the mechanical
+# consumer: on a diff touching the guarded surface it requires the line and
+# FAILS on `independent=NO` / `independent=DEGRADED` / a build-equivalent id /
+# a reserved or non-id model / a line not bound to the PR head.
 #
 # Verdicts (issue #513):
 #   clean       — a code-review skill convergence recorded its clean verdict
@@ -137,6 +142,20 @@ if [ -n "$SECOND_MODEL_GATE_MODEL" ]; then
     yes|NO|DEGRADED) ;;
     *) echo "SECOND_MODEL_GATE_INDEPENDENT must be yes|NO|DEGRADED when SECOND_MODEL_GATE_MODEL is set (got '${SECOND_MODEL_GATE_INDEPENDENT:-}'); refusing to record" >&2; exit 2 ;;
   esac
+  # C3(a): the model slot must be a real provider/id, or the reserved DEGRADED
+  # marker — which is accepted ONLY with independent=DEGRADED. `model=**DEGRADED
+  # independent=yes` would otherwise be recorded and read by check (f) as a
+  # resolved independent reviewer, laundering a degraded outcome into a pass.
+  _sm_lc="$(printf '%s' "$SECOND_MODEL_GATE_MODEL" | tr 'A-Z' 'a-z')"
+  if [ "$_sm_lc" = "degraded" ] || printf '%s' "$_sm_lc" | grep -qE '^\*+degraded$'; then
+    if [ "$SECOND_MODEL_GATE_INDEPENDENT" != "DEGRADED" ]; then
+      echo "SECOND_MODEL_GATE_MODEL=$SECOND_MODEL_GATE_MODEL is the reserved DEGRADED marker but SECOND_MODEL_GATE_INDEPENDENT=$SECOND_MODEL_GATE_INDEPENDENT — a reserved value is never an independent reviewer; use independent=DEGRADED (refusing to record)" >&2
+      exit 2
+    fi
+  elif ! printf '%s' "$SECOND_MODEL_GATE_MODEL" | grep -qE '^~?[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*(:[A-Za-z0-9._-]+)?$'; then
+    echo "SECOND_MODEL_GATE_MODEL='$SECOND_MODEL_GATE_MODEL' is not a provider/id (and not the reserved DEGRADED marker) — refusing to record (fail closed)" >&2
+    exit 2
+  fi
 elif [ -n "$SECOND_MODEL_GATE_INDEPENDENT" ]; then
   echo "SECOND_MODEL_GATE_INDEPENDENT is set without SECOND_MODEL_GATE_MODEL; refusing to record (a gate outcome needs the resolved model id)" >&2; exit 2
 fi
@@ -341,7 +360,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   # for it on a guarded-surface diff.
   SM_MARKER=""
   if [ -n "$SECOND_MODEL_GATE_MODEL" ]; then
-    SM_MARKER="[SECOND-MODEL-GATE] model=${SECOND_MODEL_GATE_MODEL} independent=${SECOND_MODEL_GATE_INDEPENDENT}"
+    SM_MARKER="[SECOND-MODEL-GATE] model=${SECOND_MODEL_GATE_MODEL} independent=${SECOND_MODEL_GATE_INDEPENDENT} @ ${SHA}"
   fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
   # not silently skip the evidence post; the gate would fail with no trace).

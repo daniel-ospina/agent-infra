@@ -337,7 +337,7 @@ run_record_sm() {
 # 9.1 happy path — the marker line reaches the PR body PATCH.
 run_record_sm "moonshot/kimi-k3" "yes" 424400
 [ "$RECORD_RC" = "0" ] && ok "SM marker: record rc 0" || bad "SM marker: rc=$RECORD_RC"
-assert_contains "$PATCH_BODY" "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes" "SM marker line posted in the PATCH body"
+assert_contains "$PATCH_BODY" "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ $SHA" "SM marker line posted in the PATCH body (head-bound)"
 assert_contains "$PATCH_BODY" "review recorded: reviews/424400.json" "verdict marker still posted alongside"
 
 # 9.2 absent env — no SM line at all (backward compatible).
@@ -369,8 +369,18 @@ run_record_sm "" "" 424406 "openrouter/anthropic/claude-opus-4.8" "yes"
 assert_contains "$PATCH_BODY" "[SECOND-MODEL-GATE] model=openrouter/anthropic/claude-opus-4.8 independent=yes" "SM flag form posts the marker"
 
 # 9.8 idempotent — a body already carrying BOTH markers is not re-PATCHed.
-STUB_BODY="review recorded: reviews/424407.json verdict=clean @ $SHA (daniel-ospina/agent-infra) [SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes" run_record_sm "moonshot/kimi-k3" "yes" 424407
+STUB_BODY="review recorded: reviews/424407.json verdict=clean @ $SHA (daniel-ospina/agent-infra) [SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ $SHA" run_record_sm "moonshot/kimi-k3" "yes" 424407
 if grep -q -- "-X PATCH" "$LOG"; then bad "SM idempotency: re-PATCHed despite both markers present"; else ok "SM idempotency: both markers present → no PATCH"; fi
+
+# 9.10 C3(a) — the reserved DEGRADED marker is never recorded as independent.
+run_record_sm "**DEGRADED" "yes" 424409
+[ "$RECORD_RC" = "2" ] && ok "SM reserved model with independent=yes refuses (exit 2)" || bad "SM reserved model + yes (rc=$RECORD_RC)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424409.json" ] && ok "SM reserved+yes refusal writes no record" || bad "SM reserved+yes wrote a record"
+
+# 9.11 C3(a) — a non-id model value is refused.
+run_record_sm "<script>" "yes" 424410
+[ "$RECORD_RC" = "2" ] && ok "SM non-id model refuses (exit 2)" || bad "SM non-id model (rc=$RECORD_RC)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424410.json" ] && ok "SM non-id refusal writes no record" || bad "SM non-id wrote a record"
 
 # 9.9 a verdict marker already present but SM line missing → only the SM line posts.
 STUB_BODY="review recorded: reviews/424408.json verdict=clean @ $SHA (daniel-ospina/agent-infra)" run_record_sm "moonshot/kimi-k3" "yes" 424408

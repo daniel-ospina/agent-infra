@@ -23,8 +23,8 @@
   },
   "preference": [
     {
-      "model": "deepseek/deepseek-v4-pro",
-      "runtimeVia": "pi-bootstrap/pi-config/models.json#providers.deepseek.models[0]",
+      "model": "moonshot/kimi-k3",
+      "runtimeVia": "pi-bootstrap/pi-config/models.json#providers.moonshot.models[0]",
       "costCentsPerPass": 18,
       "probe": {
         "offerUrl": "https://api.moonshot.ai/v1/models",
@@ -46,15 +46,6 @@
         "authEnv": "OPENROUTER_API_KEY"
       }
     }
-  ],
-  "unreachablePatterns": [
-    "insufficient balance",
-    "insufficient_balance",
-    "1113",
-    "exceeded_current_quota_error",
-    "api-key is blocked",
-    "key limit exceeded",
-    "suspended"
   ],
   "notes": [
     "Ordered preference: the first SOLVENT+REACHABLE candidate wins; if none is solvent or reachable the gate is DEGRADED and fails closed (never dispatch the tool default or any build-equivalent model as an 'independent' review).",
