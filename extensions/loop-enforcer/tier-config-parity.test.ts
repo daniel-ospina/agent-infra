@@ -185,13 +185,15 @@ export function normalizeArgs(args: string[]): string[] {
  * identifier (`evaluateTermination(d)`) and a trailing comma pass. Rejecting
  * spread is what closes the cycle-4 bypass of a pure argument-count check.
  *
- * LIMIT (stated, not hidden): this is textual. A call form the extractor cannot
- * match — optional call `f?.(...)`, an alias calling it, `f.call(...)` — is
- * treated as "no call found" and therefore fails CLOSED (red), not silently
- * green, when it replaces the production call. A decoy call left in place
- * alongside one of those forms would still evade; that requires contrived code
- * a reviewer sees in the diff. What obfuscation costs is the diagnostic: the
- * controls then report "control did not apply" instead of naming the re-add.
+ * LIMIT (stated, not hidden): this is textual. The call site lives inside the
+ * `agent_end` hook handler, so driving it needs a fake ExtensionAPI and a
+ * manifest on disk — the shape check stands in for that (the module body itself
+ * IS executed: `loop-integration.test.ts` and `session-affinity.test.ts` import
+ * `./index.js`). A call form the extractor cannot match — optional call
+ * `f?.(...)`, an alias calling it, `f.call(...)` — is treated as "no call
+ * found" and therefore fails CLOSED (red), not silently green, when it replaces
+ * the production call. Only a decoy call left in place alongside one of those
+ * forms would evade.
  */
 export function liveCallShapeViolations(src: string): string[] {
   const calls = extractCallArgs(src, "evaluateTermination");
@@ -374,11 +376,11 @@ test("the LIVE cap: with no explicit bound the exit lands at the canonical High 
 });
 
 test("index.ts's live call site takes the default cap (one plain argument)", () => {
-  // TEXTUAL TRIPWIRE, not a proof: index.ts is a pi extension with
-  // module-level side effects, so its call site cannot be exercised from here.
-  // The rule is "exactly one argument, no spread". It rejects the re-add forms
-  // listed below (NOT "every" conceivable form — a deliberately obfuscated
-  // call evades it; see the LIMIT note on liveCallShapeViolations), while
+  // TEXTUAL TRIPWIRE, not a proof: the call site sits inside the `agent_end`
+  // hook handler, so it is checked by shape here rather than driven through a
+  // fake ExtensionAPI. An unmatched call form fails CLOSED via the "no call
+  // found" branch (see the LIMIT note on liveCallShapeViolations). The rule is
+  // "exactly one argument, no spread"; it rejects the forms listed below while
   // accepting a hoisted identifier:
   //   evaluateTermination(cycleData, 20)                            -> 2 args
   //   evaluateTermination(cycleData, 20, // REVIEW_CYCLE_CAPS.high) -> 2 args (trailing empty element dropped by normalizeArgs)
