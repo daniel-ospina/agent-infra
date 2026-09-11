@@ -34,10 +34,20 @@ There is **NO auto-bypass**: the guard blocks every time, so a rogue or
 parallel agent cannot retry its way past it. Escapes are deliberate and
 documented (env hatch below, escape marker below).
 
-**Degradation (fail-safe):** if `classify-git.mjs` fails to load (jiti edge
-case), the bash guard degrades to warn-only while the write/edit guard stays
-fully enforced. The escape-marker check degrades to **inactive** (block) on
-any failure — a failed import or stamp never silently allows.
+**Degradation (fail-safe — and fail-OPEN):** if `classify-git.mjs` fails to
+load (jiti edge case) **totally**, every binding from the failure point on
+keeps its inert default. The bash guard degrades to warn-only, and the
+write/edit guard **fails open**: its target classification (`resolveTargetCheckout`,
+`hasDotGitAncestor`) is among the stubbed bindings, so the gate takes its
+"isolated by construction" branch and allows. The inert defaults are deliberate
+— a failed import must never false-block — but the consequence is that a load
+failure is a **silent loss of enforcement, not a safe mode**, which is why
+`test-module-load.mjs` (below) pins the load path itself. A **partial** failure
+is the different shape #744 had — a destructuring abort keeps whatever bound
+before it, so the earlier gates (script-content, the #73 delete arm) kept
+working — see the section on the #744 fix below. The escape-marker
+check is the exception: it degrades to **inactive** (block) on any failure — a
+failed import or stamp never silently allows.
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
@@ -827,6 +837,9 @@ CI):
   disordered-hub write gate blocks a tracked overwrite, and the #628 new-file
   cap blocks write #26. Those paths read the very bindings that stay stubbed
   when the import degrades, so the suite is red on the pre-#744 module.
+  (The `#628` boundary assertion is the one part of this suite with a known
+  flake — a transient block inside the `1..25` carve-out window shifts it; the
+  failure message says so when that happens, and it is tracked as #768.)
 
 **CI wiring.** Per-PR: the `verify` job in `ci.yml` runs it as a named step
 (added by #744) — not in the pinned `ci` job, whose `test-command` value

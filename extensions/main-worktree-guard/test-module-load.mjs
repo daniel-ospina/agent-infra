@@ -204,6 +204,33 @@ async function partB() {
     register(new URL("./module-load-hooks.mjs", import.meta.url), import.meta.url);
   }
 
+  // Hermetic HOME (#744 review): the guard's #207 escape marker lives at
+  // ~/.pi/agent/.allow-main-edits and is keyed to PI_SESSION_ID. A live marker
+  // in the operator's real HOME (the documented recovery step) exempts main
+  // checkout mutations, which would make B6b's destructive op ALLOWED and turn
+  // this suite falsely red. Point HOME at a throwaway dir before the module
+  // loads, so the suite never reads the operator's marker/audit state.
+  const prevHome = process.env.HOME;
+  const prevCwd = process.cwd();
+  let tmp = null;
+  const fakeHome = realpathSync(mkdtempSync(join(tmpdir(), "guard-module-load-home-")));
+  // Restores the caller's environment and removes the scratch dirs. Defined
+  // before the B2/B3 bail-outs so those paths restore HOME/hatches too, not
+  // just the main path's finally — a leaked fake HOME would otherwise outlive
+  // the harness if this file were ever imported instead of run (#744 review).
+  const cleanup = () => {
+    process.chdir(prevCwd);
+    for (const [v, val] of savedHatch) {
+      if (val === undefined) delete process.env[v]; else process.env[v] = val;
+    }
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    for (const d of [fakeHome, tmp]) {
+      if (!d) continue;
+      try { rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  };
+  process.env.HOME = fakeHome;
+
   // stripTypeScriptTypes emits an ExperimentalWarning; this suite's own
   // pass/fail output is the signal, so drop Node's default warning printer.
   process.removeAllListeners("warning");
@@ -223,23 +250,22 @@ async function partB() {
   for (const w of degradation) console.log(`     captured: ${w}`);
   expect(`B1: index.ts loads with no degradation warning (warnings: ${warnings.length})`, degradation.length, 0);
   expect("B2: index.ts default export is the extension factory", typeof mod.default, "function");
-  if (typeof mod.default !== "function") return;
+  if (typeof mod.default !== "function") return cleanup();
 
   // Drive the factory: it registers exactly session_start + tool_call.
   const handlers = new Map();
   mod.default({ on(name, fn) { if (!handlers.has(name)) handlers.set(name, []); handlers.get(name).push(fn); } });
   const toolCall = handlers.get("tool_call")?.[0];
   expect("B3: factory registered a tool_call handler", typeof toolCall, "function");
-  if (typeof toolCall !== "function") return;
+  if (typeof toolCall !== "function") return cleanup();
 
   // Hermetic MAIN checkout: clean + on main, so nothing blocks for a reason
   // other than the binding under test.
   // realpath: on macOS tmpdir() is /var/... while git reports /private/var/...
   // (the guard realpaths its toplevel, so a non-realpath'd fixture would look
   // outside the hub and misjudge the carve-out).
-  const tmp = realpathSync(mkdtempSync(join(tmpdir(), "guard-module-load-")));
+  tmp = realpathSync(mkdtempSync(join(tmpdir(), "guard-module-load-")));
   const repo = join(tmp, "hub");
-  const prevCwd = process.cwd();
   try {
     execSync(`git init -q -b main "${repo}"`, { stdio: "ignore" });
     execSync("git config user.email t@t && git config user.name t", { cwd: repo, stdio: "ignore" });
@@ -289,13 +315,21 @@ async function partB() {
     execSync("printf 'wip\\n' > stray.txt", { cwd: repo, stdio: "ignore" });
     const realWarn2 = console.warn;
     console.warn = () => {}; // the #628 banner is chatty; decisions are what matter
-    let trackedWrite, firstWrite, capWrite;
+    let trackedWrite, firstWrite, capWrite, carveOutBlocked = [];
     try {
       // B7a: overwriting an EXISTING TRACKED hub file must block.
       trackedWrite = await callWrite(join(repo, "tracked.txt"));
       // B7b/B7c: NEW files take the #436 carve-out (1..25 allowed, 26 blocked).
       firstWrite = await callWrite(join(repo, "docs", "plans", "_new-1.md"));
-      for (let i = 2; i <= 25; i++) await callWrite(join(repo, "docs", "plans", `_new-${i}.md`));
+      for (let i = 2; i <= 25; i++) {
+        const r = await callWrite(join(repo, "docs", "plans", `_new-${i}.md`));
+        // A blocked carve-out write is NOT counted toward the #628 volume, so a
+        // single transient block inside 1..25 shifts B7c's boundary and shows
+        // up as a confusing "write #26 was allowed". Record them so that mode
+        // reports itself as this, not as a cap regression. (Observed twice in
+        // ~250 runs under load — see #768.)
+        if (r !== undefined) carveOutBlocked.push(`_new-${i}: ${JSON.stringify(r).slice(0, 120)}`);
+      }
       capWrite = await callWrite(join(repo, "docs", "plans", "_new-26.md"));
     } finally {
       console.warn = realWarn2;
@@ -306,15 +340,14 @@ async function partB() {
       firstWrite === undefined, `handler returned ${JSON.stringify(firstWrite)}`);
     expectTrue("B7c: write #26 blocks on the #628 volume cap (hubNewFileVolumeVerdict/HUB_NEW_FILE_BLOCK_CAP are real)",
       !!capWrite && capWrite.block === true && /#628/.test(capWrite.reason ?? ""),
-      `handler returned ${JSON.stringify(capWrite)}`);
+      `handler returned ${JSON.stringify(capWrite)}` +
+      (carveOutBlocked.length
+        ? ` — but ${carveOutBlocked.length} of writes 1..25 were BLOCKED (${carveOutBlocked.slice(0, 2).join(" | ")}), so this boundary shifted instead of failing (#768)`
+        : ""));
   } catch (e) {
     expectTrue("B: part B ran without throwing", false, String(e?.message ?? e).slice(0, 200));
   } finally {
-    process.chdir(prevCwd);
-    for (const [v, val] of savedHatch) {
-      if (val === undefined) delete process.env[v]; else process.env[v] = val;
-    }
-    try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
+    cleanup();
   }
 }
 

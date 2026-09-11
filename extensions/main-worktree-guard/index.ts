@@ -100,16 +100,27 @@
 // cannot retry its way past it.
 //
 // Degradation contract:
-//  - classify-git.mjs load failure → bash git guard degrades to warn-only
-//    (fail-safe, never false-blocks) while the write/edit guard stays fully
-//    enforced.
+//  - classify-git.mjs TOTAL load failure → the bash git guard degrades to
+//    warn-only (fail-safe, never false-blocks) AND the write/edit gate fails
+//    OPEN. (A PARTIAL abort — the #744 shape — is different: it keeps whatever
+//    bound before the abort point, so the gates bound earlier keep working.)
+//    The write/edit gate's target classification comes from the same import:
+//    `resolveTargetCheckout` stays `() => null` and `hasDotGitAncestor` stays
+//    `() => false`, so `_checkoutOf` returns null and the gate takes its
+//    "!tgtCheck → isolated by construction" branch and ALLOWS the write. The
+//    inert defaults are deliberate (a failed import must never false-block),
+//    but the consequence is that a load failure is a SILENT LOSS OF
+//    ENFORCEMENT, not a safe mode. Tracked as #761.
 //  - branch-ownership.mjs load failure → M1/M2/M3 are OFF (one-time warn) and
 //    the guard falls back to the frozen-legacy classifier for EVERY repo — no
 //    agent-infra exemption (#615); write/edit never depends on either module.
 //  - isWorktreeCwd defaults are SPLIT: the bash path fails OPEN (() => true —
 //    a worktree lookalike is treated as isolated), the write/edit path fails
-//    CLOSED (() => false — an unverifiable target is treated as main and
+//    CLOSED (() => false — an unverifiable SESSION cwd is treated as main and
 //    blocked). This fixes the latent fail-open at the old shared default.
+//    Note this covers the SESSION-cwd checks only — the TARGET-classification
+//    path (`_checkoutOf`) is a separate input, and it is the one that fails
+//    open when the import degrades (first bullet, #761).
 // The TTL'd file-based escape marker (~/.pi/agent/.allow-main-edits, #207)
 // allows a deliberate mid-session escalation — see README.md.
 
@@ -123,8 +134,8 @@ import { isPrintMode } from "../shared/print-mode.js";
 import { appendJsonl } from "../shared/audit-log.js";
 
 // Shared destructive-git rules (also used by test.mjs). If the import ever
-// fails (jiti resolution edge case), the bash guard degrades to warn-only
-// while write/edit protection stays fully enforced.
+// fails (jiti resolution edge case), the bash guard degrades to warn-only and
+// the write/edit gate fails OPEN — see the degradation contract above, #761.
 let classifyGitCommand: (cmd: string) => string = () => "allow";
 let classifyGitCommandDetailed: (cmd: string) => any = () => ({ verdict: "allow" });
 let isWorktreeCwd: (cwd: string) => boolean = () => true;      // bash path: fail-open
