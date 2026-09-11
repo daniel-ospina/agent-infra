@@ -37,11 +37,17 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
-import { REVIEW_CYCLE_CAPS, TIER_CONFIG } from "./termination.ts";
+import { evaluateTermination, REVIEW_CYCLE_CAPS, TIER_CONFIG, type CycleData } from "./termination.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..", "..");
 const SKILL_PATH = join(REPO_ROOT, "skills", "proportional-gates", "SKILL.md");
+const INDEX_SRC = readFileSync(join(HERE, "index.ts"), "utf-8");
+
+/** Minimal cycle factory for the behavioural live-cap assertions. */
+function cycle(n: number, issues: number, verdict = "NEEDS_FIX", fingerprint?: string, issuesFixed = 0): CycleData {
+  return { cycleNumber: n, issuesFound: issues, issuesFixed, verdict, fingerprint, filesChanged: 0, wallClockMs: 0 };
+}
 
 let passed = 0;
 let failed = 0;
@@ -147,8 +153,10 @@ export function mappingViolations(
   }
 
   // Governance ceiling: no tier may exceed the largest canonical bound (#723's
-  // actual defect — complex at 20 against a max of 10).
-  const governanceMax = Math.max(...Object.values(caps));
+  // actual defect — complex at 20 against a max of 10). Computed from the
+  // CANONICAL TABLE, never from `caps` — deriving it from `caps` would let an
+  // unbacked extra key inflate the ceiling the guard trusts.
+  const governanceMax = Math.max(...table.map((r) => r.maxCycles));
   for (const [tier, cfg] of Object.entries(tiers)) {
     if (cfg.maxCycles > governanceMax) {
       violations.push(
@@ -240,13 +248,47 @@ test("TIER_CONFIG pins the tier → risk-row assignment, not just the pair", () 
   );
 });
 
-test("the live default cap is the canonical bound, not a bare literal", () => {
-  // The bound production actually uses: index.ts calls
-  // evaluateTermination(cycleData, REVIEW_CYCLE_CAPS.high) and the function's
-  // own default is REVIEW_CYCLE_CAPS.high. Pin the value so a future edit to
-  // the constant cannot silently move the live loop cap.
-  equal(TIER_CONFIG.complex.maxCycles, REVIEW_CYCLE_CAPS.high);
-  equal(REVIEW_CYCLE_CAPS.high, TABLE.find((r) => r.risk === "High")!.maxCycles);
+test("the function default is the canonical High bound (pins the LIVE cap)", () => {
+  // Cycle-1 review caught the earlier version of this test for asserting the
+  // constant against itself while claiming to pin the live cap. This asserts
+  // the BEHAVIOUR: with no explicit maxCycles, the default governs, so the
+  // exit must land exactly at the canonical High bound.
+  const canonical = TABLE.find((r) => r.risk === "High")!.maxCycles;
+  const atCap = Array.from({ length: canonical }, (_, i) => cycle(i + 1, 2, "NEEDS_FIX", undefined, 1));
+  const r = evaluateTermination(atCap);
+  equal(r.reason, "L10-max-cycles", `default cap should fire L10 at ${canonical} cycles`);
+  ok(r.shouldExit, "default cap must exit at the canonical bound");
+
+  const belowCap = Array.from({ length: canonical - 1 }, (_, i) => cycle(i + 1, canonical - i, "NEEDS_FIX", undefined, 1));
+  ok(!evaluateTermination(belowCap).shouldExit, "must not exit below the canonical bound");
+});
+
+test("index.ts's live call site passes the canonical constant, not a literal", () => {
+  // The bound production actually uses. A source pin is the only practical
+  // route (index.ts is a pi extension with module-level side effects), and it
+  // has in-repo precedent: extensions/shared/default-coverage.test.ts pins
+  // shipped config the same way.
+  const calls = INDEX_SRC.match(/evaluateTermination\([^)]*\)/g) ?? [];
+  ok(calls.length > 0, "no evaluateTermination call found in index.ts — update this pin");
+  for (const c of calls) {
+    ok(!/,\s*\d+\s*\)/.test(c), `index.ts passes a numeric literal to evaluateTermination: ${c}`);
+  }
+  ok(
+    calls.some((c) => c.includes("REVIEW_CYCLE_CAPS.high")),
+    `index.ts's evaluateTermination call must pass REVIEW_CYCLE_CAPS.high, got: ${calls.join(" | ")}`,
+  );
+});
+
+test("REVIEW_CYCLE_CAPS declares exactly the canonical keys", () => {
+  // Without this, an unbacked extra key rides along unnoticed (it is never
+  // read by TOER_CONFIG) and — before the ceiling fix — would have raised the
+  // governance max the guard compares against.
+  deepEqual(Object.keys(REVIEW_CYCLE_CAPS).sort(), ["high", "lowMedium", "mediumHigh", "skip"]);
+  deepEqual(
+    Object.keys(REVIEW_CYCLE_CAPS).length,
+    TABLE.length,
+    "one REVIEW_CYCLE_CAPS entry per canonical risk row",
+  );
 });
 
 // ── Negative controls: the check must actually reject drift ─────────────────
@@ -263,12 +305,23 @@ test("rejects a cap above the canonical bound for its reviewer count (#723's ori
 test("rejects REVIEW_CYCLE_CAPS drifting from the table (pre-#705 stale 8)", () => {
   const v = mappingViolations({ ...CAPS, high: 8 }, TIERS, TABLE);
   ok(v.some((s) => s.includes("REVIEW_CYCLE_CAPS.high")), `expected a caps violation, got: ${v.join(" | ")}`);
-  // NOTE: the reviewer-keyed tier↔table check compares against the TABLE (still
-  // 10), so it cannot fire on a caps-only mutation. What fires instead is the
-  // caps-derived governance ceiling.
+  // The governance ceiling is computed from the TABLE (canonical), so a
+  // caps-only mutation does NOT trip it — it trips the caps↔table check. The
+  // ceiling branch has its own control below.
   ok(
-    v.some((s) => s.includes("exceeds the governance maximum 8")),
-    `expected the caps-derived governance-ceiling violation, got: ${v.join(" | ")}`,
+    !v.some((s) => s.includes("governance maximum")),
+    `caps-only drift must not be reported as a ceiling breach, got: ${v.join(" | ")}`,
+  );
+});
+
+test("rejects a tier above the table-derived governance ceiling", () => {
+  // Lower the CANONICAL table (High 10 -> 5) and keep the runtime tier at 10:
+  // now the ceiling branch is the one that must fire.
+  const lowered = TABLE.map((r) => (r.risk === "High" ? { ...r, maxCycles: 5 } : r));
+  const v = mappingViolations(CAPS, TIERS, lowered);
+  ok(
+    v.some((s) => s.includes("exceeds the governance maximum 5")),
+    `expected a governance-ceiling violation, got: ${v.join(" | ")}`,
   );
 });
 

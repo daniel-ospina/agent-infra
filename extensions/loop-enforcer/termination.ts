@@ -4,8 +4,9 @@
  * 10-condition termination model. L1-L9 should trigger before L10.
  *
  * Review-cycle caps ARE authorised — proportionally. AGENTS.md (Hard Cap)
- * delegates the canonical values to `skills/proportional-gates/SKILL.md`:
- * Low → skip, Low-Medium → 3, Medium-High → 5, High → 10, fallback 10.
+ * holds the fallback (10) and names the canonical proportional table in
+ * `skills/proportional-gates/SKILL.md`: Low → skip, Low-Medium → 3,
+ * Medium-High → 5, High → 10.
  * (Pre-#723 wording here claimed "no numeric caps without explicit user
  * authorization", which stopped being true when the proportional table landed.)
  */
