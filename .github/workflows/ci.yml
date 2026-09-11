@@ -58,6 +58,26 @@ jobs:
       - name: Cost-config guard tests (fixtures, detect-not-block semantics)
         run: bash tests/cost-config/run.sh
 
+  second-model:
+    # #716 — second-model gate identity + dispatchability guard. Asserts the
+    # ordered `preference` in pi-bootstrap/pi-config/second-model.json is NOT
+    # build-equivalent to the primary's served build and that every candidate
+    # declares its dispatch authority (`runtimeVia`), then runs the hermetic
+    # fixture suite (positive + negative controls, ZERO network). The `--probe`
+    # step is the network mode (vendor offer + solvency) and is annotated
+    # non-fatal ON PURPOSE: while no independent model is funded the probe
+    # reports DEGRADED (see the #716 funding comment). The merge-blocking
+    # consumer is check (f) in the REQUIRED `pipeline-compliance` check.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Second-model guard (shipped, offline)
+        run: bash scripts/check-second-model.sh --check --shipped-only
+      - name: Second-model probe (network — vendor offer + solvency)
+        run: bash scripts/check-second-model.sh --probe --shipped-only || echo "::warning::second-model probe DEGRADED — no solvent+reachable independent model funded (see #716 funding comment); check (f) enforces at PR time"
+      - name: Second-model fixture suite (hermetic, zero network)
+        run: bash tests/second-model/run.sh
+
   pi-config-extensions:
     # #498/#502 — pi-config extension-farm parity gate (issue #95 invariant):
     # every extensions/ top-level entry except *.test.ts must be farm-wired

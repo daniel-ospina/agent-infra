@@ -31,7 +31,7 @@ mkdir -p "$DEST"
 echo "==> Copying config into $DEST"
 
 # Back up any existing settings/models (so nothing is lost)
-for f in settings.json models.json models-store.json; do
+for f in settings.json models.json models-store.json second-model.json; do
   if [ -f "$DEST/$f" ] && [ ! -f "$DEST/$f.bak-bootstrap" ]; then
     cp "$DEST/$f" "$DEST/$f.bak-bootstrap"
     echo "    backed up existing $f"
@@ -104,6 +104,30 @@ PY
     echo "    settings.json copied (python3 not found - plain copy)"
   fi
 }
+merge_second_model() {
+  # #716 — the second-model gate designation (ordered preference + runtimeVia +
+  # build-equivalence set + probe endpoints). A standalone POLICY file (never
+  # merged per-provider like models.json), so the shipped copy wins wholesale —
+  # the config is the single source of truth and an operator top-up needs no
+  # code edit. No-op when the tree does not ship second-model.json (older
+  # agent-infra); a pre-existing live copy is left untouched then.
+  [ -f "$SRC/second-model.json" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$SRC/second-model.json" "$DEST/second-model.json" << 'PY'
+import json, os, sys
+src = json.load(open(sys.argv[1]))
+dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else None
+if dst == src:
+    print("    second-model.json already current")
+else:
+    json.dump(src, open(sys.argv[2], "w"), indent=2)
+    print("    second-model.json installed (shipped policy wins wholesale)")
+PY
+  else
+    cp "$SRC/second-model.json" "$DEST/second-model.json"
+    echo "    second-model.json copied (python3 not found - plain copy)"
+  fi
+}
 merge_models_store() {
   # Merge provider blocks: source wins per-provider; local providers survive.
   # Within a provider, keep the entry with the newer checkedAt (pi's runtime
@@ -139,6 +163,7 @@ merge_mcp
 merge_settings
 merge_models
 merge_models_store
+merge_second_model
 
 # Folders (content-merge; overwrite same-named files). The "SRC/. DEST/" form
 # copies CONTENTS into the existing destination — plain `cp -R SRC DEST` on BSD

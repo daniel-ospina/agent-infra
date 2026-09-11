@@ -51,6 +51,16 @@ if [ -f scripts/check-cost-config.sh ]; then
   bash scripts/check-cost-config.sh --shipped-only || exit 1
 fi
 
+# #716 — second-model gate designation (shipped config only; OFFLINE). Blocks
+# commits that make the second-model designation build-equivalent to the
+# primary (the #716 defect, incl. the provider-less `deepseek-flash` alias) or
+# drop a candidate's `runtimeVia` dispatch authority. The network probe is the
+# separate `--probe` mode and NEVER runs here (a suspended provider must not
+# block every commit).
+if [ -f scripts/check-second-model.sh ]; then
+  bash scripts/check-second-model.sh --check --shipped-only || exit 1
+fi
+
 # AGENTS.md materialization gate (#600): stage-guard BEFORE spawning the
 # checker — one cheap git call unless AGENTS.md is staged, then the full
 # check. Resolve checker via scripts/ symlink OR $AGENT_INFRA_PATH
