@@ -175,10 +175,14 @@ code=$?
 if [ "$code" -eq 0 ]; then pass "override → exit 0"; else fail "expected exit 0, got $code"; tail -20 "$OUT"; fi
 grep -q "SECOND_MODEL_GATE_OVERRIDE=1" "$OUT" && pass "loud override notice present" || fail "override notice missing"
 grep -q "SAME served build as the primary" "$OUT" && pass "violation still DETECTED under the override" || fail "violation not detected under the override"
-# D7 policy: the override silences BLOCKs only — never an unusable-authority fatal.
+# D7 policy: the override silences BLOCKs only — never an unusable-authority
+# fatal produced by validate() (the case the old ordering laundered).
+SECOND_MODEL_GATE_OVERRIDE=1 bash "$GUARD" --check --live-dir "$FIX/missing-unreachablePatterns" >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "override does NOT silence a validate() fatal (exit 2, D7 policy)"; else fail "override laundered a validate() fatal — expected exit 2, got $code"; tail -20 "$OUT"; fi
 SECOND_MODEL_GATE_OVERRIDE=1 bash "$GUARD" --check --live-dir "$FIX/missing-config" >"$OUT" 2>&1
 code=$?
-if [ "$code" -eq 2 ]; then pass "override does NOT silence an unusable authority (exit 2, D7 policy)"; else fail "override laundered a fatal — expected exit 2, got $code"; tail -20 "$OUT"; fi
+if [ "$code" -eq 2 ]; then pass "override does NOT silence the missing-config fatal either (exit 2)"; else fail "override laundered the missing-config fatal — expected exit 2, got $code"; tail -20 "$OUT"; fi
 
 echo ""
 echo "9. --shipped-only runs offline (no live dir, no network)"
@@ -204,9 +208,11 @@ rm -rf "$SHIP_HOME"
 
 echo ""
 echo "9c. Consumer-tree symlink resolution + install path (E4/E8)"
+# A consumer repo receives `scripts/` as a symlink back to agent-infra and does
+# NOT carry pi-bootstrap/. The guard must still resolve the SHIPPED config via
+# physical realpath; a logical `dirname $0/..` lands in the consumer and exits 2.
 CONSUMER="$(mktemp -d /tmp/second-model-consumer.XXXXXX)"
 ln -s "$ROOT/scripts" "$CONSUMER/scripts"
-ln -s "$ROOT/pi-bootstrap" "$CONSUMER/pi-bootstrap"
 ( cd "$CONSUMER" && bash scripts/check-second-model.sh --check --shipped-only ) >"$OUT" 2>&1; code=$?
 [ "$code" -eq 0 ] && pass "the guard resolves its shipped config through a consumer scripts/ symlink (exit 0)" || { fail "consumer symlink misresolved the shipped config (exit $code)"; tail -15 "$OUT"; }
 grep -q 'shipped config is not reachable' "$ROOT/.husky/pre-commit" && pass "the pre-commit hook gates on the shipped config (E8)" || fail "the hook does not gate on the shipped config"
@@ -251,6 +257,12 @@ done
 grep -q 'Escape hatch / rollback' "$ROOT/docs/providers.md" && pass "providers.md documents the escape hatch (E3)" || fail "providers.md does not document the escape hatch"
 grep -q 'V4-Pro second-model gate' "$ROOT/docs/research/2026-09-05-local-qwen-32b-decision.md" && fail "the dated research record still pins the gate to V4-Pro (E6)" || pass "the dated research record points at the guard (E6)"
 grep -qE 'parity gate    #' "$ROOT/.github/workflows/ci-main.yml" && fail "ci-main.yml still has the joined comment line (E7)" || pass "ci-main.yml comment lines are split (E7)"
+# E5: no volatile vendor health facts are frozen into the shipped policy — the
+# dated #716 funding comment holds the evidence; the file keeps only a pointer
+# to it (re-adding a re-funded candidate must not first require deleting a stale
+# "401"/"insolvent" claim).
+vol="$(grep -nE 'HTTP 401|key revoked|insolvent|code 1113' "$SHIPPED" "$FIX/clean/second-model.json" 2>/dev/null || true)"
+if [ -z "$vol" ]; then pass "shipped policy carries no volatile vendor health codes (E5)"; else fail "volatile vendor facts frozen into the shipped policy:"; printf '%s\n' "$vol"; fi
 
 echo ""
 echo "11. missing-runtimeVia → fail closed, exit 2"
