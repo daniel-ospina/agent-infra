@@ -12,15 +12,21 @@ npx eslint --fix <relevant files>
 git add <relevant files>
 
 # Commit — write the message with the `write` tool (it bypasses bash entirely)
-# to a deterministic path, then commit with -F and remove the file.
+# to the repo's OWN git dir, then commit with -F and remove the file.
 # ⛔ NEVER `git commit -m "…"`. NEVER a heredoc. Both let the shell parse the
 #    message before git sees it — see "⛔ Commit messages" below.
-#   /tmp/commit-msg-<branch>.md
+# #729: never /tmp/commit-msg-<branch>.md — a branch name is unique per repo,
+#       not globally, so concurrent sessions in different repos collide there.
+#       `--absolute-git-dir` is per-repo and worktree-aware; `tr '/' '-'`
+#       sanitizes the branch name.
+MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+echo "$MSG"   # e.g. /repo/.git/COMMIT_MSG_fix-123-thing.md
+# then `write` the message to $MSG:
 #   <type>(<scope>): <subject>
 #
 #   Closes #ISSUE_NUMBER
-git commit -F /tmp/commit-msg-<branch>.md
-rm -f /tmp/commit-msg-<branch>.md
+git commit -F "$MSG"
+rm -f "$MSG"
 ```
 
 **IMPORTANT — commit timeout:** Always run `git commit` **foreground** with `timeout: 300000` (5 minutes minimum). Never set `run_in_background: true` for `git commit`. Never use a timeout below 300 seconds. The pre-commit hook (lint-staged running ESLint on staged TS files) takes 20–90 seconds. Killing it mid-run orphans the lint-staged backup stash and leaves `.git/index.lock` behind — causing exit code 128 on every subsequent commit until the lock is manually removed. This timeout rule also applies to all fix-loop `git commit` calls in Steps 2 and 2.5.
@@ -50,8 +56,15 @@ Both mangles were pushed before anyone noticed and each cost an `--amend` +
 force-push. Author the message with the **`write` tool** — it bypasses bash
 entirely, so nothing in the message is ever interpreted:
 
+```bash
+# resolve the per-repo message path once (#729) — worktree-aware, collision-free
+MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+echo "$MSG"   # → /repo/.git/COMMIT_MSG_fix-668-commit-msg.md
+              #   (in a linked worktree: that worktree's own gitdir under .git/worktrees/)
+```
+
 ```text
-write  /tmp/commit-msg-668.md
+write  <the $MSG path printed above>
 
   fix(commit-workflow): ban -m commit messages + flag mangled ones (#668)
 
@@ -65,8 +78,8 @@ write  /tmp/commit-msg-668.md
 
 ```bash
 # then, in bash — the message never appears on the command line:
-git commit -F /tmp/commit-msg-668.md
-rm -f /tmp/commit-msg-668.md
+git commit -F "$MSG"
+rm -f "$MSG"
 ```
 
 `git commit -m` and heredocs are forbidden **everywhere** (commit messages, PR
@@ -85,8 +98,8 @@ On a hit:
 
 1. **Not pushed yet** — amend before anything else:
    ```bash
-   # rewrite /tmp/commit-msg-<branch>.md with the `write` tool first
-   git commit --amend -F /tmp/commit-msg-<branch>.md
+   # rewrite $MSG (resolved in Step 1) with the `write` tool first
+   git commit --amend -F "$MSG"
    ```
 2. **Pushed, branch under review** — do **not** silently force-push the
    rewritten message. Post a correction note on the PR/issue (what was wrong,

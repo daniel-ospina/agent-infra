@@ -231,9 +231,15 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
 - **Never use sed for multi-line code changes.**
 - **Never use `git add -A`** — always stage specific files.
 - **Prefer the `edit` tool over `write`** for targeted changes to existing files.
-- **Commit messages: always `git commit -F <file>` — never `-m`, never a heredoc.** Write the
-  message with the `write` tool to `/tmp/commit-msg-<branch>.md`, then
-  `git commit -F /tmp/commit-msg-<branch>.md`. Both `-m "…"` and heredocs pass the message
+- **Commit messages: always `git commit -F <file>` — never `-m`, never a heredoc.** The message
+  file lives in the repo's own git dir, never a shared `/tmp/commit-msg-<branch>.md` — a branch
+  name is unique per repo, not globally, so concurrent sessions in different repos silently
+  overwrite each other's message (#729). Resolve it with
+  `MSG="$(git rev-parse --absolute-git-dir)/COMMIT_MSG_$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"`,
+  write the message to `$MSG` with the `write` tool, then `git commit -F "$MSG" && rm -f "$MSG"`.
+  `--absolute-git-dir` keeps the file inside *this* repo's git dir — in a linked worktree, that is
+  the worktree's own gitdir — and the resulting path is absolute, so it survives a cwd change.
+  Collision is structurally impossible. Both `-m "…"` and heredocs pass the message
   through the shell first — backticked spans run as command substitution, `$VAR`/`$(…)` expand,
   `${…}`/`{{ }}` break — and the failure is **silent**: the substitution yields an empty string,
   git accepts the mangled result, and only a human reading the log sees the hole. The
