@@ -80,6 +80,6 @@ fi
 
 # Passed — surface a non-blocking drift warning if the materializer flagged one
 # (consumer predates a base change; --merge refreshes).
-echo "$OUTPUT" | grep -q 'base head differs' && echo "$OUTPUT" | grep 'base head differs'
+grep -q 'base head differs' <<<"$OUTPUT" && echo "$OUTPUT" | grep 'base head differs'
 echo "[agent-infra] ✅ AGENTS.md materialization gate: passed"
 exit 0

@@ -145,7 +145,7 @@ if [ "$parse_ok" -eq 1 ]; then
     case "$base" in
       *.test.ts) continue ;;   # test files are not shipped; never in manifest
     esac
-    if ! printf '%s\n' "$manifest_rows" | grep -Fqx "$base"; then
+    if ! grep -Fqx "$base" <<<"$manifest_rows"; then
       echo "❌ extension $base exists in extensions/ but has no manifest.json files.extensions.entries row (bin/agent-infra.js consumers won't get it)"
       FAILURES=$((FAILURES + 1))
     fi

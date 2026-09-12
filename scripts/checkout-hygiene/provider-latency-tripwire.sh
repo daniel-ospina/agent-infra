@@ -98,7 +98,7 @@ run_probe() {
   fi
   code="$(printf '%s\n' "$out" | tail -2 | head -1)"
   time_total="$(printf '%s\n' "$out" | tail -1)"
-  if [ -z "$code" ] || ! printf '%s' "$code" | grep -qE '^[0-9]{3}$'; then
+  if [ -z "$code" ] || ! grep -qE '^[0-9]{3}$' <<<"$code"; then
     code="000"; time_total=""   # curl failed outright (timeout / DNS / connect)
   fi
   printf '%s %s' "$code" "$time_total"

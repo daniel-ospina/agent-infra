@@ -39,10 +39,10 @@ assert_empty() {
     if [ -z "$1" ]; then ok "$2"; else bad "$2 (expected no output, got: $1)"; fi
 }
 assert_contains() {
-    if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi
+    if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi
 }
 assert_not_contains() {
-    if printf '%s' "$1" | grep -qF -- "$2"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi
+    if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi
 }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/commit-msg-check.XXXXXX")"

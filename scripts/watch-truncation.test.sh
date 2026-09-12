@@ -28,7 +28,7 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi; }
-assert_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
+assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
 T="$(mktemp -d /tmp/watch-test.XXXXXX)"; trap 'rm -rf "$T"' EXIT
 
 # fixture generator. $2=idx $3=msg_input (drives reread + calls) $4=msg_cacheRead
