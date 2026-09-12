@@ -2,7 +2,7 @@
 title: "Design: #634 — peak-window defer queue (DeepSeek 2x windows)"
 type: design
 domain: operations
-doc_status: draft
+doc_status: superseded
 subjects.team: organisation-design-team
 created: 2026-09-09
 aboutSubjects: organisation-design-team
@@ -10,6 +10,14 @@ aboutObjects: agent-infra, issue-634, deepseek, fleet-cost, peak-window
 ---
 
 # Design: #634 — peak-window defer queue
+
+> **⚠️ SUPERSEDED (2026-09-11) — HISTORICAL, DO NOT IMPLEMENT.**
+> #634 was reframed to **Option A (instrument-first)**: the scoping diamond
+> measured a ~$1–4/mo prize and found the risky half could be net-negative, so
+> only the measurement ships. The current plan is
+> **`docs/plans/2026-09-11-issue-634-peak-window-option-a.md`**. The mid-flight
+> pause described below is **#782**; the launch gate and batch path are
+> **#795**. Kept for the reasoning trail.
 
 > Source: brainstorming (2026-09-09) + external validation research
 > (`docs/research/2026-09-09-deepseek-peak-hour-pricing.md`). Issue: #634.
