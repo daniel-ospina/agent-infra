@@ -115,7 +115,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { resolve, dirname, join, relative } from "node:path";
 import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -187,6 +187,13 @@ let classifyUntrackedWip: (porcelain: string) => { untracked: string[]; wip: { p
 // #437 (C): PER-WRITE-SITE bash-write candidates (cd-aware) for the
 // disordered-hub gate + the pure tracked intersect. Fail-safe defaults inert.
 let bashWriteTargetsResolved: (command: string, cwd?: string) => ({ resolvedPath: string; via: string; site: string; cwd: string; scriptToks?: { path: string; cwd: string }[] })[] = () => [];
+// #709: the working-tree-discard family + its effect decision. Fail-safe
+// defaults: [] / false → M5 is inert when the classifier fails to load (the
+// gate must never false-block on a degraded import; test-module-load.mjs is
+// the regression tripwire for the degradation itself).
+let extractWorkingTreeDiscards: (command: string) => { form: string; scope: string; pathspecs: string[]; fromTree?: boolean; verb: string; args: string[]; inv: unknown }[] = () => [];
+let discardDestroysWip: (porcelain: string, d: { scope: string; fromTree?: boolean }) => boolean = () => false;
+let resolveInvocationTarget: (inv: unknown, sessionCwd?: string, baseCwd?: string) => { effectiveCwd: string; gitDir: string; worktreePath: string | null; worktreeBranch: string | null; isWorktree: boolean; foreignWorktree: boolean } | null = () => null;
 // #437 (C): bash-write gate for TRACKED hub files in a DISORDERED hub (pure
 // intersect of bash-write candidates with index-tracked rels). Fail-safe
 // default: inert (null) — a failed import NEVER false-blocks (same contract
@@ -220,6 +227,14 @@ try {
      hubNewFileVolumeVerdict: _hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET: _HUB_NEW_FILE_WARN_BUDGET,
      HUB_NEW_FILE_BLOCK_CAP: _HUB_NEW_FILE_BLOCK_CAP } =
     await import("./classify-git.mjs"));
+  // #709: M5's exports are read from the (cached) module namespace rather than
+  // added to the destructuring assignment above — every new target there is a
+  // new assertion in test-module-load.mjs Part A, and that suite's contract is
+  // exactly 49 passed / 0 failed.
+  const _m5 = await import("./classify-git.mjs");
+  extractWorkingTreeDiscards = _m5.extractWorkingTreeDiscards;
+  discardDestroysWip = _m5.discardDestroysWip;
+  resolveInvocationTarget = _m5.resolveInvocationTarget;
   hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
   HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
   HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
@@ -234,6 +249,11 @@ try {
   if (typeof _hubNewFileVolumeVerdict !== "function") hubNewFileVolumeVerdict = () => "warn";
   if (typeof _HUB_NEW_FILE_WARN_BUDGET !== "number") HUB_NEW_FILE_WARN_BUDGET = 10;
   if (typeof _HUB_NEW_FILE_BLOCK_CAP !== "number") HUB_NEW_FILE_BLOCK_CAP = 25;
+  // #709 skew guard (same contract): a stale/short classify-git must leave M5
+  // inert rather than bind `undefined` and throw inside the bash gate.
+  if (typeof extractWorkingTreeDiscards !== "function") extractWorkingTreeDiscards = () => [];
+  if (typeof discardDestroysWip !== "function") discardDestroysWip = () => false;
+  if (typeof resolveInvocationTarget !== "function") resolveInvocationTarget = () => null;
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
 } catch (e) {
@@ -1098,6 +1118,154 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
   ].join("\n");
 }
 
+// ── M5 (#709): working-tree-discard gate (effect-keyed) ────────
+// The legacy destructive arms key on the VERB (so `git checkout -- <path>` —
+// the incident verb — classifies `allow`, pinned by test.mjs) and exempt
+// worktrees wholesale (so `git restore`/`checkout .`/`reset --hard` run free
+// where the `pi -p` mutation-test fixers work). M4 catches the incident verb
+// only while the hub is DISORDERED (test.mjs:2247). M5 keys on the EFFECT
+// instead: a discard-family command is blocked when the checkout it targets is
+// carrying uncommitted state the discard would destroy — in the hub AND in a
+// linked worktree. Read-only commands, clean targets, untracked-only dirt and
+// index-only restores stay allow. Placed AFTER the env/marker hatch return, so
+// both hatches bypass it unchanged (task children are unhatched by #617/#623,
+// which is why this is the enforcement surface for them).
+
+/** Bounded porcelain probe for a discard's target checkout.
+ *  @returns true = would destroy uncommitted work; false = nothing to destroy;
+ *           null = unverifiable (caller fails closed). */
+function _discardStatusPorcelain(probeCwd: string, d: { scope: string; pathspecs: string[]; fromTree?: boolean }): boolean | null {
+  try {
+    const args = ["status", "--porcelain=v1"];
+    if (d.scope === "paths" && d.pathspecs.length > 0) args.push("--", ...d.pathspecs);
+    // execFileSync (array args, no shell): pathspecs are DATA — a path
+    // containing shell metacharacters can never become a command.
+    const out = execFileSync("git", args, {
+      cwd: probeCwd, encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    });
+    return discardDestroysWip(String(out), d);
+  } catch (e) {
+    const msg = String((e as { stderr?: unknown })?.stderr ?? "") + String((e as { message?: string })?.message ?? e);
+    // Not a checkout (or a bare repo): there is no working tree to destroy.
+    if (/not a git repository|must be run in a work tree|does not have a working tree/i.test(msg)) return false;
+    return null; // unverifiable → fail closed
+  }
+}
+
+/** Shared block reason for M5. */
+function _worktreeDiscardBlockReason(
+  d: { form: string; scope: string; pathspecs: string[] },
+  probeCwd: string,
+  unverifiable: string | null,
+): string {
+  const target = d.pathspecs.length > 0 ? d.pathspecs.slice(0, 5).join(", ") : "(the whole working tree)";
+  return [
+    `⛔ Working-tree discard blocked — it would destroy uncommitted work (#709).`,
+    `   Form: ${d.form}   Target: ${target}`,
+    `   Checkout: ${probeCwd}`,
+    ...(unverifiable ? [`   ⚠️ ${unverifiable} — failing closed.`] : []),
+    `   The guard gates the EFFECT, not the verb: \`git checkout -- <path>\``,
+    `   classifies as a plain path restore, so it used to run ungated in a`,
+    `   linked worktree (where pi -p mutation-test fixers run) and in a CLEAN`,
+    `   hub — the 2026-09-10 leaked-mutant path. This checkout carries`,
+    `   uncommitted changes to tracked files that this command would revert.`,
+    `   → Probe a mutation on a COPY, never in place (#664):`,
+    `       cp <file> /tmp/probe-<file>   # mutate + test the copy, then rm it`,
+    `       # or: git worktree add /tmp/probe <ref>, test inside it`,
+    `   → Inspect first: git status --porcelain; git diff <path>.`,
+    `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
+    `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
+    `     marker — both bypass this gate unchanged.`,
+  ].join("\n");
+}
+
+/** M5 gate: returns a block reason when `command` would discard uncommitted
+ *  tracked work in the checkout it targets, else null. Covers the direct argv
+ *  surface, interpreter-inline payloads (via allGitInvocations) and the
+ *  script-file surface (`bash /tmp/restore.sh`) to a bounded depth. */
+function _worktreeDiscardBlock(command: string): string | null {
+  if (!classifierLoaded) return null; // degraded import → inert (module-load tripwire guards this)
+  // Cheap superset pre-bail: a family verb anywhere in the command, OR a
+  // script file to read (the script content is where the verb may live).
+  const _verbHint = /(checkout|restore|switch|reset|show|cat-file)/.test(command);
+  const _scriptPath = extractScriptPath(command);
+  if (!_verbHint && !_scriptPath) return null;
+  let direct: ReturnType<typeof extractWorkingTreeDiscards> = [];
+  try { direct = extractWorkingTreeDiscards(command) ?? []; } catch { return null; }
+  const sessionCwd = resolve(process.cwd());
+  const execCwd = commandExecutionCwd(command, sessionCwd) ?? sessionCwd;
+
+  // Probe sets: the command itself, plus any script FILES it runs/sources
+  // (`bash /tmp/restore.sh` is the documented backdoor shape — M4's
+  // _backdoorBlock closes it only for hub sessions, so a worktree `pi -p`
+  // child could hide a discard there). Bounded depth 3, 64KB per file, cycle-
+  // guarded; a read failure is a no-op (the direct argv surface still gates).
+  const sets: { discs: ReturnType<typeof extractWorkingTreeDiscards>; baseCwd: string; script: string | null }[] = [
+    { discs: direct, baseCwd: execCwd, script: null },
+  ];
+  try {
+    const seen = new Set<string>();
+    let p = _scriptPath;
+    for (let depth = 0; p && depth < 3; depth++) {
+      let real: string;
+      try { real = realpathSync(resolve(execCwd, p)); } catch { break; }
+      if (seen.has(real)) break;
+      seen.add(real);
+      let content: string;
+      try {
+        if (!existsSync(real) || !statSync(real).isFile() || statSync(real).size > 64 * 1024) break;
+        content = readFileSync(real, "utf8");
+      } catch { break; }
+      if (/(checkout|restore|switch|reset|show|cat-file)/.test(content)) {
+        sets.push({ discs: extractWorkingTreeDiscards(content) ?? [], baseCwd: execCwd, script: p });
+      }
+      p = extractScriptPath(content);
+    }
+  } catch { /* script walk is best-effort — never false-block on its failure */ }
+  if (sets.every((s) => s.discs.length === 0)) return null;
+
+  for (const set of sets) {
+    // The `cat-file-revert` form (`git show HEAD:x > x`) needs the source's
+    // bash WRITE targets (pure string walk) to find where the content lands.
+    let writeTargets: string[] = [];
+    if (set.discs.some((d) => d.form === "cat-file-revert")) {
+      try {
+        const src = set.script === null ? command : readFileSync(resolve(execCwd, set.script), "utf8");
+        writeTargets = extractBashWriteTargets(src, set.baseCwd).map((t) => resolve(set.baseCwd, t.resolvedPath));
+      } catch { /* best-effort — a miss only means no extra block */ }
+    }
+
+    for (const d of set.discs) {
+      // Unresolvable pathspec ($VAR / command substitution) — the effect is
+      // not statically verifiable → fail closed (the safe direction; the
+      // discard is real, only its blast radius is unknown).
+      if (d.pathspecs.some((p) => /[$`]/.test(String(p)))) {
+        return _worktreeDiscardBlockReason(d, set.baseCwd, "the target pathspec is not statically resolvable");
+      }
+
+      let probeCwd: string;
+      let scope: { scope: string; pathspecs: string[]; fromTree?: boolean } = d;
+      if (d.form === "cat-file-revert") {
+        const lands = writeTargets.filter((t) => d.pathspecs.some((p) => resolve(set.baseCwd, p) === t));
+        if (lands.length === 0) continue; // the committed content is not redirecting onto its own path
+        probeCwd = set.baseCwd;
+        scope = { scope: "paths", pathspecs: lands.map((t) => relative(set.baseCwd, t) || "."), fromTree: true };
+      } else {
+        let eff: { effectiveCwd: string } | null = null;
+        try { eff = resolveInvocationTarget(d.inv, sessionCwd, set.baseCwd); } catch { eff = null; }
+        if (eff === null) {
+          return _worktreeDiscardBlockReason(d, set.baseCwd, "the invocation's effective repo could not be resolved (unresolvable cd/$VAR)");
+        }
+        probeCwd = eff.effectiveCwd;
+      }
+      const dirty = _discardStatusPorcelain(probeCwd, scope);
+      if (dirty === true) return _worktreeDiscardBlockReason(d, probeCwd, null);
+      if (dirty === null) return _worktreeDiscardBlockReason(d, probeCwd, "the target checkout's status could not be read");
+    }
+  }
+  return null;
+}
+
 // Script-backdoor closure (Slice E): the documented escape
 // (`write /tmp/x.sh` + `bash /tmp/x.sh`) is closed by gating the script's git
 // content with the SAME recovery allowlist — a script that performs a
@@ -1589,6 +1757,14 @@ export default function (pi: ExtensionAPI) {
     }
     if (isBash) {
       const command = (event.input as { command?: string }).command ?? "";
+      // ── M5 (#709): effect-keyed working-tree-discard gate ──
+      // Runs BEFORE the degradation/full classifier arms and BEFORE the
+      // worktree exemptions below, so a discard is caught whether or not
+      // branch-ownership loaded, and in a linked worktree as well as the hub.
+      // It sits AFTER the env/marker hatch return above, so both hatches
+      // bypass it unchanged.
+      const discardBlock = _worktreeDiscardBlock(command);
+      if (discardBlock) return { block: true, reason: discardBlock };
       // #350: hub-WIP discipline prompts (never block) — bash-write detection
       // (heredoc/tee/python into the hub) + the throttled periodic hub-hygiene
       // scan (once per 5 min — never per-command).

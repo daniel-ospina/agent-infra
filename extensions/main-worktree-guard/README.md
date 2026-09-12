@@ -12,9 +12,9 @@ collision between parallel agents:
    origin/main` mid-PR yanked the working tree out from under another agent).
 
 **Worktrees are ISOLATED** — none of this applies to writes INSIDE a linked
-worktree. The guard blocks only hub-main-checkout writes and destructive git
-in the shared main checkout, where branch-state changes and hard resets
-silently destroy other agents' work.
+worktree, with ONE exception: the working-tree-discard family (M5, #709) is
+effect-keyed and applies in a linked worktree too, because that is where the
+`pi -p` review fixers run. See M5 below.
 
 **#618/#621 — hub-write gating is TARGET-aware:** the write/edit gate and the
 tracked-file bash gate resolve the WRITE TARGET's repo checkout
@@ -38,6 +38,57 @@ documented (env hatch below, escape marker below).
 case), the bash guard degrades to warn-only while the write/edit guard stays
 fully enforced. The escape-marker check degrades to **inactive** (block) on
 any failure — a failed import or stamp never silently allows.
+
+## M5 — working-tree-discard gate: effect, not argv (#709)
+
+The legacy destructive-verb arms key on **git argv**, and two gaps followed
+from that:
+
+- `git checkout -- <path>` — the 2026-09-10 incident verb (an unrestored
+  mutation-test mutant left in the shared hub, #664) — classifies `allow`
+  (pinned by `test.mjs:108`); the M4 hub-state gate catches it only while the
+  hub is DISORDERED.
+- Every other discard verb (`restore`, `checkout .`, `checkout -f`,
+  `reset --hard`) is exempt wholesale in a **linked worktree** (repo
+  convention: review work happens in worktrees), which is where the `pi -p`
+  mutation-test fixers actually run.
+
+M5 keys on the **effect** instead. A discard-family command is blocked when
+the checkout it targets is carrying uncommitted work that the discard would
+destroy:
+
+| Form | Scope | Discards |
+|---|---|---|
+| `git checkout [<tree-ish>] -- <paths>` | paths | worktree vs index |
+| `git checkout .` / `./x` / `:/x` | paths | worktree vs index |
+| `git checkout -f` / `--force` | all | everything tracked |
+| `git restore [--worktree] [-s <tree>] <paths>` | paths | index (or tree) vs worktree |
+| `git switch -f` / `--discard-changes` | all | everything tracked |
+| `git reset --hard [-- <paths>]` | all / paths | index + worktree |
+| `git checkout-index -f [-a]` | paths / all | index vs worktree |
+| `git show <rev>:<path> > <path>` | paths | committed content over the file |
+
+The decision (`discardDestroysWip`) is pure and unit-tested: scope `all`
+blocks on ANY tracked porcelain entry; scope `paths` blocks on a
+worktree-vs-index difference (`Y ≠ ' '`) — a tree/commit source also
+destroys a staged-only change (`X ≠ ' '`). **Allowed**: untracked-only dirt
+(`checkout -- .` never deletes `??`), staged-only changes for an
+index-source restore, clean targets, `git restore --staged` (index-only), and
+every read-only command. Unresolvable targets (`$VAR` pathspec, unresolvable
+`cd` chain) fail CLOSED; an unreadable `git status` fails open (never
+false-block), matching the repo's write-gate convention.
+
+**Escape hatches are unchanged**: M5 sits after the env-hatch / TTL-marker
+return, so `AGENT_ALLOW_MAIN_EDITS=1` and the `~/.pi/agent/.allow-main-edits`
+marker bypass it exactly as they bypass M2/M3. Task children are unhatched by
+default (#617/#623), so for the `pi -p` fixer M5 — not a prose rule — is the
+enforcement surface.
+
+`git clean` is deliberately NOT in the family (untracked-only; build-artifact
+cleanup in a private worktree is ordinary, and the M4/legacy arms already
+block it in a shared main checkout). `cp <backup> <tracked>` and arbitrary
+interpreter writers are documented residuals — indistinguishable from an edit
+without reading file content.
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
@@ -794,6 +845,7 @@ marker fixes **guard-blocked** sessions only.
 |---|---|---|
 | `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
+| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetic hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, fail-closed targets, and both escape hatches |
 
 `test-module-load.mjs` exists because of a real regression (#744): #697 added a
 rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)

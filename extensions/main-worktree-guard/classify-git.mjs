@@ -1902,6 +1902,211 @@ export function allGitInvocations(command, seedVars = {}) {
   return invocations;
 }
 
+// ── #709: working-tree-discard family (command layer) ──────────────────────
+// The legacy destructive arms key on the VERB and exempt worktrees wholesale,
+// so the incident verb (`git checkout -- <path>`) runs ungated (it classifies
+// `allow`; test.mjs pins that) and every OTHER discard verb is worktree-exempt.
+// This extractor names the commands whose EFFECT is to rewrite working-tree
+// content from the index/a commit, so index.ts can key the gate on
+// `git status` (does the discard destroy uncommitted work?) instead of on argv.
+//
+// Deliberately SEPARATE from classifyGitCommand(Detailed): those verdicts are
+// pinned by test.mjs and consumed by the M2/M3/M4 arms — widening them would
+// change those arms. PURE (no git, no fs); index.ts does the effect probe.
+//
+// Descriptor: { form, scope: "all"|"paths"|"revert-hints", pathspecs,
+//               fromTree, verb, args, inv }
+//   scope "all"   — the whole checkout is discarded (checkout -f, reset --hard,
+//                   switch --discard-changes)
+//   scope "paths" — only the listed pathspecs
+//   fromTree      — the SOURCE is a tree/commit, so a staged-only change is
+//                   destroyed too. `checkout -- <paths>` / bare `restore`
+//                   restore from the INDEX: only a worktree-vs-index
+//                   difference is lost.
+//
+// NOT in the family (documented residuals):
+//   - `git clean`   — untracked-only. It never touches TRACKED work, and
+//                     build-artifact cleanup (`git clean -fdx`) in a private
+//                     worktree is ordinary; the hub-state (M4) and legacy arms
+//                     still block it in a shared main checkout.
+//   - `git stash push` — stores, does not discard.
+//   - `git restore --staged` alone — index-only; git leaves the working-tree
+//                     content in place and re-adding recovers it (#709 note).
+//   - `cp <backup> <tracked>` and arbitrary interpreter writers that rewrite a
+//                     tracked file from a non-git source — indistinguishable
+//                     from an edit without reading content; the #625 in-place
+//                     overwrite gate already covers the shared-main case.
+const _WT_DISCARD_FORCE_LONG = ["-f", "--force"];
+const _WT_DISCARD_FORCE_PREFIXES = ["--f", "--fo", "--for", "--forc"];
+
+/** Non-flag args of an invocation. */
+function _wtDiscardPositionals(args) {
+  return (args ?? []).filter((a) => a !== "--" && !String(a).startsWith("-"));
+}
+
+/** Does a single-dash short cluster contain `letter` (`-fq` ≡ `-f -q`)? */
+function _wtDiscardShortCluster(args, letter) {
+  return (args ?? []).some((a) => /^-[A-Za-z]+$/.test(a) && a.slice(1).includes(letter));
+}
+
+/** git's noarg force spellings, incl. unambiguous long prefixes (`--forc`). */
+function _wtDiscardForce(args) {
+  const a = args ?? [];
+  return a.some((t) => _WT_DISCARD_FORCE_LONG.includes(t)) ||
+    a.some((t) => _WT_DISCARD_FORCE_PREFIXES.includes(t)) ||
+    _wtDiscardShortCluster(a, "f");
+}
+
+function _wtDiscardFromCheckout(args) {
+  const a = args ?? [];
+  const dd = a.indexOf("--");
+  if (dd !== -1) {
+    const pathspecs = a.slice(dd + 1).filter((p) => p && !String(p).startsWith("-"));
+    if (pathspecs.length === 0) return null;
+    // `git checkout <tree-ish> -- <paths>` overwrites the index too.
+    return { scope: "paths", pathspecs, fromTree: dd > 0, form: "checkout-paths" };
+  }
+  // Bare path forms git accepts without `--`: `git checkout .`, `./x`, `:/x`
+  // (and `git checkout <tree-ish> .`). A bare branch name is a switch, NOT a
+  // discard — deliberately not matched here.
+  const pos = _wtDiscardPositionals(a);
+  const pathish = pos.filter((p) => p === "." || String(p).startsWith("./") || String(p).startsWith(":/"));
+  if (pathish.length > 0) {
+    return { scope: "paths", pathspecs: pathish, fromTree: pos.length > pathish.length, form: "checkout-paths-bare" };
+  }
+  if (_wtDiscardForce(a)) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-force" };
+  return null;
+}
+
+function _wtDiscardFromRestore(args) {
+  const a = args ?? [];
+  const staged = a.includes("--staged") || a.includes("-S") || _wtDiscardShortCluster(a, "S");
+  const worktree = a.includes("--worktree") || a.includes("-W") || _wtDiscardShortCluster(a, "W");
+  // Index-only restore is explicitly non-destructive (#709).
+  if (staged && !worktree) return null;
+  const pathspecs = [];
+  let fromTree = false;
+  for (let i = 0; i < a.length; i++) {
+    const t = a[i];
+    if (t === "--") { for (let j = i + 1; j < a.length; j++) if (a[j]) pathspecs.push(a[j]); break; }
+    if (t === "-s" || t === "--source") { fromTree = true; i++; continue; }
+    if (String(t).startsWith("--source=") || /^-s\S/.test(t)) { fromTree = true; continue; }
+    if (String(t).startsWith("-")) continue;
+    pathspecs.push(t);
+  }
+  if (pathspecs.length === 0) return null; // bare `git restore` is a usage error
+  return { scope: "paths", pathspecs, fromTree, form: "restore-worktree" };
+}
+
+function _wtDiscardFromSwitch(args) {
+  const a = args ?? [];
+  if (a.includes("--discard-changes") || _wtDiscardForce(a)) {
+    return { scope: "all", pathspecs: [], fromTree: false, form: "switch-discard" };
+  }
+  return null;
+}
+
+function _wtDiscardFromReset(args) {
+  const a = args ?? [];
+  if (!a.includes("--hard")) return null;
+  const dd = a.indexOf("--");
+  if (dd !== -1) {
+    const pathspecs = a.slice(dd + 1).filter(Boolean);
+    if (pathspecs.length > 0) return { scope: "paths", pathspecs, fromTree: true, form: "reset-hard-paths" };
+  }
+  return { scope: "all", pathspecs: [], fromTree: false, form: "reset-hard" };
+}
+
+function _wtDiscardFromCheckoutIndex(args) {
+  const a = args ?? [];
+  // Without -f/--force git REFUSES to overwrite a modified file — nothing to gate.
+  if (!_wtDiscardForce(a)) return null;
+  if (_wtDiscardShortCluster(a, "a") || a.includes("--all")) {
+    return { scope: "all", pathspecs: [], fromTree: true, form: "checkout-index-all" };
+  }
+  const dd = a.indexOf("--");
+  const pathspecs = (dd !== -1 ? a.slice(dd + 1) : _wtDiscardPositionals(a)).filter(Boolean);
+  if (pathspecs.length === 0) return null;
+  return { scope: "paths", pathspecs, fromTree: true, form: "checkout-index" };
+}
+
+/** `git show <rev>:<path>` / `cat-file` committed-path hints (the manual
+ *  revert shape `git show HEAD:x > x`). */
+function _wtDiscardShowTargets(args) {
+  const out = [];
+  for (const t of args ?? []) {
+    if (t === "blob") continue;
+    const m = /^([^:\s]+):(.+)$/.exec(String(t));
+    if (m && m[2] && !m[1].includes("/")) out.push(m[2]);
+  }
+  return out;
+}
+
+/**
+ * Extract every working-tree-discard invocation from a shell command (#709).
+ * @param {string} command
+ * @returns {Array<{form: string, scope: string, pathspecs: string[], fromTree: boolean, verb: string, args: string[], inv: any}>}
+ */
+export function extractWorkingTreeDiscards(command) {
+  const out = [];
+  try {
+    const invs = allGitInvocations(command);
+    for (const inv of invs) {
+      const verb = inv?.verb;
+      const args = inv?.args ?? [];
+      let d = null;
+      if (verb === "checkout") d = _wtDiscardFromCheckout(args);
+      else if (verb === "restore") d = _wtDiscardFromRestore(args);
+      else if (verb === "switch") d = _wtDiscardFromSwitch(args);
+      else if (verb === "reset") d = _wtDiscardFromReset(args);
+      else if (verb === "checkout-index") d = _wtDiscardFromCheckoutIndex(args);
+      if (d) out.push({ ...d, verb, args, inv });
+    }
+    // Non-git revert shape: the committed path is the SOURCE of a redirect, so
+    // the pure extractor can only surface the hint; index.ts intersects it with
+    // the command's bash write targets (and their resolved absolute paths).
+    const hints = [];
+    for (const inv of invs) {
+      if (inv?.verb === "show" || inv?.verb === "cat-file") {
+        for (const p of _wtDiscardShowTargets(inv.args ?? [])) hints.push(p);
+      }
+    }
+    if (hints.length > 0) {
+      out.push({ form: "cat-file-revert", scope: "revert-hints", pathspecs: hints, fromTree: true, verb: "show", args: [], inv: null });
+    }
+  } catch { /* pure walker — never throw into the gate */ }
+  return out;
+}
+
+/**
+ * #709 effect decision (pure): given `git status --porcelain=v1` output for the
+ * discard's target scope, would the discard destroy uncommitted work?
+ *
+ *  - scope "all"   → any TRACKED entry (X or Y ≠ ' '); `??`/`!!` excluded
+ *                    (`checkout -f`/`reset --hard` do not delete untracked files).
+ *  - scope "paths" → a listed path with a WORKTREE-vs-INDEX difference
+ *                    (`Y ≠ ' '`) — `checkout --`/bare `restore` restore from the
+ *                    index; a tree/commit source (`fromTree`) also overwrites the
+ *                    index, so a staged-only change (`X ≠ ' '`) is destroyed too.
+ * @param {string} porcelain
+ * @param {{scope: string, fromTree?: boolean}} d
+ * @returns {boolean}
+ */
+export function discardDestroysWip(porcelain, d) {
+  const lines = String(porcelain ?? "").split(/\r?\n/).filter((l) => l.length > 0);
+  for (const l of lines) {
+    const x = l[0];
+    const y = l[1];
+    if (x === "?" || x === "!") continue; // untracked / ignored
+    if (d?.scope === "all") {
+      if (x !== " " || y !== " ") return true;
+      continue;
+    }
+    if (d?.fromTree ? (x !== " " || y !== " ") : (y !== " ")) return true;
+  }
+  return false;
+}
+
 /**
  * #596: does a `git branch` invocation MUTATE branch state (per the branch
  * arm's OWN triggers — exact mirror, reusing the SAME helpers, so selection
