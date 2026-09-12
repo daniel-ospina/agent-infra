@@ -115,7 +115,7 @@ classifyEntry(metaUrl, argv1) → { verdict, reason, self, argv1 }
 | Verdict | When | `isMain()` |
 |---|---|---|
 | `ENTRY` | literal match, realpath match (symlinked ancestor **or** leaf), or dirname-realpath + basename match | `true` |
-| `IMPORTED` | **no** `argv[1]` (REPL / `node -e` / plain import); both sides realpath **definitively to different files**; or `self` resolves while `argv[1]` does **not** | `false` |
+| `IMPORTED` | **no** `argv[1]` (REPL / `node -e` / plain import); a comparison that RESOLVED on both sides and differs; or a recognized **virtual** entry path (`/$bunfs/…`) | `false` |
 | `UNRESOLVED` | our **own** module path is unresolvable (or both sides are), so nothing about the invocation is provable | **loud warning + `true`** |
 
 `IMPORTED` is the quiet answer **only when it is proven** — a false `IMPORTED` is the silent no-op
@@ -134,27 +134,48 @@ module's own URL, so the natural one-argument call `isMain()` would compare `arg
 reintroduced by an omitted argument. An omitted `metaUrl` is instead an unresolvable self →
 `UNRESOLVED` → loud + fail-closed.
 
-#### Review cycle 1 folded in: `UNRESOLVED → true` was WRONG at an importing call site
+#### Review cycles 1–2 folded in — and a cycle-2 P0 that cycle 3 fixed
 
-Round 1's reviewers converged on a real P1 **introduced by the first revision**: `UNRESOLVED` is
-unreachable for a genuine direct invocation (Node just loaded the file, so `self` resolves and a
-direct `argv[1]` resolves), so it was reachable **only when the module was imported while
-`argv[1]` was unresolvable** — i.e. precisely when the module is *not* the entry point. There,
-`true` ran the guard body **inside the importing process**, where it is a side effect, not a gate.
-Measured: importing `load-gate.mjs` / `check-skill-lint.mjs` with a bogus `argv[1]` KILLED the
-importer (`process.exit`); `probe-frontmatter-fixtures.mjs` ran `main()`; and importing
-`provider-failover.ts` with `--clear '*'` **WIPED the exhaustion latch**. The shape is real, not
-theoretical: a bun-compiled pi presents a virtual entry path (`/$bunfs/root/pi.ts`, explicitly
-handled at `extensions/builtin-tools/index.ts:161` and `extensions/subagent/index.ts:439`), and
+Review round 1 found a P1 **introduced by the first revision** of this PR, and round 2 found a P0
+introduced by the *second*. Both are recorded here because they are the same lesson twice: for
+this guard, an inferred "not us" is a silent no-op waiting to happen.
+
+**Round 1 (P1) — `UNRESOLVED → true` at an importing call site.** `UNRESOLVED` is unreachable for
+a genuine direct invocation (Node just loaded the file, so `self` resolves and a direct `argv[1]`
+resolves), so it was reachable **only when the module was imported while `argv[1]` was
+unresolvable**. There, `true` ran the guard body **inside the importing process**, where it is a
+side effect rather than a gate. Measured: importing `load-gate.mjs` / `check-skill-lint.mjs` with a
+bogus `argv[1]` KILLED the importer (`process.exit`); `probe-frontmatter-fixtures.mjs` ran
+`main()`; and importing `provider-failover.ts` with `--clear '*'` **WIPED the exhaustion latch**.
+The shape is real: a bun-compiled pi presents a virtual entry path (`/$bunfs/root/pi.ts`, handled at
+`extensions/builtin-tools/index.ts:161` and `extensions/subagent/index.ts:439`), and
 `provider-failover.ts` is imported in-process by `builtin-tools` on every session.
 
-Fix: `self`-resolves + `argv[1]`-unresolvable is a **proof** that the paths differ (a path that
-does not resolve cannot name a file that does) → `IMPORTED`, quiet. `UNRESOLVED` now means only
-"our own module root is unresolvable", the irreducible case. `provider-failover.ts` additionally
-does **not** reuse `UNRESOLVED → run` at all (its body launches a CLI that mutates the latch): an
-unresolvable entry resolves to "not the entry point", with one loud line when the basename matches
-(genuinely ambiguous) and quiet when it provably differs. Verified after the fix: all three
-imports survive with rc 0, and the latch file is byte-identical.
+**Round 2 (P0) — the round-1 fix was itself unsound.** Round 2 answered `IMPORTED` whenever
+`self` resolved while `argv[1]` did not, on the theory that "a file that resolves cannot live at a
+path that does not". That theory is FALSE: `fs.realpathSync` throws for a **dangling route**
+exactly as it does for a path that never named this file. Removing a symlinked component of the
+invocation route after Node resolved the entry (the #675 P2-f self-delete shape; a `mktemp -d`
+teardown) therefore made a real direct invocation look unresolvable, and the #254 gate went back to
+exiting 0 with **0 bytes of output** — byte-identical to a clean run. All three round-2 reviewers
+reproduced it independently, and `scripts/check-workflow-lock.mjs`'s `sameRealPath` already states
+the rule: *"cannot resolve" is not "a different file"*.
+
+**Round 3 (the fix, and the final rule).** The quiet answer is keyed on a **positive** signal — the
+repo's own bun-virtual detector (`/$bunfs/…`) — and nothing else:
+
+| verdict | `isMain()` |
+|---|---|
+| `IMPORTED` — no `argv[1]`; a comparison that resolved on both sides and differs; a recognized virtual entry path | `false`, quiet |
+| `UNRESOLVED` — anything else unprovable, including a *non-virtual* unresolvable `argv[1]` with a resolvable `self` | warn loudly **and run** |
+
+`provider-failover.ts` keeps its site-specific direction (its body launches a latch-mutating CLI, so
+it warns and **declines to run** — never silently skips), now with the same virtual-entry carve-out,
+which is what keeps a bun-pi session quiet.
+
+Verified after the round-3 fix: the destroyed-route shape runs the gate (count line + P0 + an
+`[is-main]` line on stderr) instead of exiting 0; the bun-virtual import stays quiet; and the
+`--clear '*'` import leaves the latch byte-identical while emitting the loud line.
 
 ### 3. `extensions/shared/provider-failover.ts` gets an inline equivalent, deliberately
 
@@ -181,14 +202,19 @@ helper-only unit test *would not have caught this bug*):
 - **Part A** — `classifyEntry` cases: literal, symlinked ancestor, symlinked leaf, relative
   `argv[1]`, different file, absent `argv[1]` (with `process.argv[1]` actually unset so the branch
   is reached rather than the parameter default), unresolvable-leaf-same-basename, unresolvable +
-  different basename, the **bun virtual entry** (`/$bunfs/root/pi.ts` → `IMPORTED`), `self`
-  unresolvable (`data:` URL), omitted `metaUrl` → loud `true`, and an explicit assertion that the
-  **old idiom returns false** for the symlinked case (documents what the fixture pins).
+  different basename, the **bun virtual entry** (`/$bunfs/root/pi.ts` → quiet `IMPORTED`), the
+  **destroyed route** (a symlinked ancestor removed in-process that still names this file →
+  `UNRESOLVED`, loud), `self` unresolvable (`data:` URL), omitted `metaUrl` → loud `true`, the
+  `warn:false` suppression on a *fresh* triple, and an explicit assertion that the **old idiom
+  returns false** for the symlinked case (documents what the fixture pins).
 - **Part B** — spawns the **real** `scripts/check-skill-lint.mjs` with a planted P0 through a
   symlinked `scripts/` dir and through a symlinked ancestor, and asserts byte-comparable *count
   line* + **exit 1** against the realpath control; asserts the fast path was used (no
   `[is-main]` warning). Same for `scripts/load-gate.mjs --json` (must emit a JSON verdict, not
-  silence). Negative control: importing the module **must not** run the gate.
+  silence). Negative controls: importing the module with no `argv[1]` **must not** run the gate, and
+  importing it with a bun-virtual `argv[1]` must stay quiet. B7 is the process-level pin of the
+  cycle-2 P0: a driver deletes its own symlinked route, then imports the gate — the gate must still
+  print its count line and exit non-zero, with an `[is-main]` line on stderr.
 - **Part C** — heuristic static tripwire over `scripts/`, `extensions/`, `bin/`: no file may
   compare a **non-realpath'd** argv-derived path against `import.meta.url`, in the **inline** *or*
   the **hoisted/aliased** shape (cycle 1 proved the inline-only scan missed the shape
@@ -247,7 +273,7 @@ helper-only unit test *would not have caught this bug*):
 |---|---|---|
 | reproduction, before | repro B/C above | exit 0, empty stdout (bug) |
 | reproduction, after | repro B/C above | exit 1, same count line as control |
-| new regression suite | `node extensions/shared/test-is-main.mjs` | 52 passed / 0 failed |
+| new regression suite | `node extensions/shared/test-is-main.mjs` | 64 passed / 0 failed |
 | #744 module-load pin | `node extensions/main-worktree-guard/test-module-load.mjs` | **49 passed / 0 failed** |
 | #709 discard gate | `node extensions/main-worktree-guard/test-discard-gate.mjs` | 314 passed / 0 failed |
 | lint suite | `node scripts/check-skill-lint.test.mjs` | 160 passed / 0 failed |
@@ -255,6 +281,8 @@ helper-only unit test *would not have caught this bug*):
 | load gate | `node scripts/load-gate.test.mjs` | 15 passed / 0 failed |
 | pin gate + lock | `node scripts/check-pi-pin-lockstep.mjs`, `node scripts/check-workflow-lock.mjs` | 116 passed / 0 failed; lock clean |
 | failover suites | `npx tsx extensions/shared/{default-coverage,provider-failover}.test.ts` | 5/0 and 79/0 |
-| cycle-1 regression: importer survives | import a gate with a bogus `argv[1]` (and with the bun-virtual shape) | `IMPORT-SURVIVED`, rc 0 |
-| cycle-1 regression: latch preserved | import `provider-failover.ts` with `--clear '*'` and a virtual `argv[1]` | latch file byte-identical |
-| TDD red | temporarily restore the old idiom at `check-skill-lint.mjs` | Part B + C1/C7 RED (46 passed, 6 failed) |
+| cycle-1/2 regression: importer survives | import a gate with a bun-virtual `argv[1]` | quiet, `IMPORT-SURVIVED`, rc 0 |
+| cycle-2 regression: destroyed route | a driver deletes its own symlinked route, then imports the gate (test B7) | the gate RUNS (count line + P0) and warns, never silent exit 0 |
+| cycle-1 regression: latch preserved | import `provider-failover.ts` with `--clear '*'` and a virtual `argv[1]` | quiet; latch file byte-identical |
+| cycle-3: non-virtual unresolvable entry | same import with a bogus non-virtual `argv[1]` | loud `[is-main]` line; latch byte-identical; CLI not run |
+| TDD red | temporarily restore the old idiom at `check-skill-lint.mjs` | 8 RED (56 passed, 8 failed) — B2/B3 families, B7/B7b, C1, C7 |

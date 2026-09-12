@@ -33,29 +33,36 @@
  *   |--------------|---------------------------------------------------------------|----------|
  *   | ENTRY        | literal match; realpath match (symlinked ancestor OR leaf);    | true     |
  *   |              | dirname-realpath + same basename                              |          |
- *   | IMPORTED     | no `argv[1]` at all (REPL / `node -e` / plain import);     | false    |
- *   |              | the two sides realpath to different files; or `self`          |          |
- *   |              | resolves while `argv[1]` does not (then `argv[1]` cannot name  |          |
- *   |              | this file — a file that resolves cannot live at a path that    |          |
- *   |              | does not)                                                     |          |
- *   | UNRESOLVED   | our OWN module path is unresolvable (or both sides are), so    | TRUE +   |
- *   |              | nothing about the invocation can be proven                     | warning  |
+ *   | IMPORTED     | no `argv[1]` at all (REPL / `node -e` / plain import); a       | false    |
+ *   |              | comparison that RESOLVED on both sides and differs; or a      |          |
+ *   |              | recognized VIRTUAL entry path (`/$bunfs/root/…`)              |          |
+ *   | UNRESOLVED   | anything else — our own module path unresolvable, or an       | TRUE +   |
+ *   |              | unresolvable `argv[1]` that is not a virtual entry            | warning  |
  *
- * `IMPORTED` is the quiet answer only when it is PROVEN — a false `IMPORTED`
- * would be the very silent no-op this module exists to prevent, so every branch
- * above is a proof, not a guess. `UNRESOLVED` is what is left when no proof
- * exists, and it is loud AND runs the guard body.
+ * `IMPORTED` is the quiet answer only when the paths actually RESOLVED and
+ * differ, or when there is no `argv[1]` to be, or when the path is one of the
+ * repo's recognized virtual entries. It is never inferred from a FAILED
+ * resolution: `realpathSync` throws for a dangling route exactly as it does for
+ * a path that never named this file, so "cannot resolve" is not "a different
+ * file" (`scripts/check-workflow-lock.mjs`'s `sameRealPath`, #675 P2-f).
  *
- * WHY "argv[1] FAILED TO RESOLVE" IS NOT, BY ITSELF, AMBIGUITY:
- * a real direct invocation always has a resolvable `argv[1]` (Node just loaded
- * the file), so an unresolvable one means the module was IMPORTED — and in an
- * importing process the guard body is not a gate, it is a side effect
- * (`process.exit`, a `--write`, a latch `--clear`). Review cycle 1 measured
- * exactly that: `UNRESOLVED` for an importer killed the importer
- * (load-gate / check-skill-lint), regenerated fixtures (probe with `--write`),
- * and WIPED the exhaustion latch (provider-failover with `--clear`). Hence the
- * `dirname-realpath` proof and the `argv1-unresolvable-different` proof below;
- * only a genuinely unprovable residue still runs — loudly.
+ * `UNRESOLVED` therefore means "no proof either way", and it is loud AND runs
+ * the guard body. The direction is right for a gate: a wrong `true` prints the
+ * gate's output plus the `[is-main]` warning, a wrong `false` prints nothing at
+ * all — which is the bug. A call site whose body is a SIDE EFFECT rather than a
+ * gate (extensions/shared/provider-failover.ts launches a latch-mutating CLI)
+ * must NOT reuse that direction; it warns and declines to run.
+ *
+ * MEASURED HISTORY — why the virtual-entry carve-out is a POSITIVE signal:
+ * an earlier revision of this module answered `IMPORTED` whenever `self`
+ * resolved and `argv[1]` did not, on the theory that "a file that resolves
+ * cannot live at a path that does not". Review refuted it: removing a symlinked
+ * component of the invocation route (`fs.rmSync` of the link/ancestor) after the
+ * module was loaded makes `argv[1]` unresolvable while both paths still name the
+ * SAME file — so the #254 gate went back to exiting 0 with 0 bytes of output.
+ * The carve-out above keys on the repo's existing bun-virtual detector
+ * (`extensions/builtin-tools/index.ts:161`, `extensions/subagent/index.ts:439`)
+ * instead, which is a property of the PATH rather than of a failed syscall.
  *
  * `metaUrl` IS REQUIRED AND HAS NO DEFAULT, deliberately: a default of this
  * module's own `import.meta.url` would make the natural one-argument call
@@ -78,6 +85,23 @@ export const UNRESOLVED = 'unresolved';
 
 /** stderr prefix for the ambiguity warning — greppable, so a CI log shows it. */
 export const WARN_PREFIX = '[is-main]';
+
+/**
+ * Is this a VIRTUAL entry path — one that never had a filesystem existence, so
+ * it cannot be `self`? This repo already carries the detector twice:
+ * `extensions/builtin-tools/index.ts:161` and `extensions/subagent/index.ts:439`
+ * both special-case a bun-compiled pi's `/$bunfs/root/…` entry.
+ *
+ * This is a POSITIVE signal, and it is the ONLY quiet `IMPORTED` we accept for
+ * an unresolvable `argv[1]`. Inferring "not us" from a FAILED resolution is
+ * unsound: `realpathSync` throws for a *dangling* route just as happily as for a
+ * path that never pointed here, so a symlinked component removed after Node
+ * resolved the entry (the #675 P2-f self-delete shape) would be misread as "a
+ * different file" and the gate would no-op silently — see the header.
+ */
+export function isVirtualEntryPath(p) {
+  return typeof p === 'string' && p.startsWith('/$bunfs/');
+}
 
 /** `fs.realpathSync` or `null` — never throws. */
 export function realpathOrNull(p) {
@@ -131,6 +155,14 @@ export function classifyEntry(metaUrl, argv1 = process.argv[1]) {
     return { verdict: ENTRY, reason: 'literal', self, argv1: entry };
   }
 
+  // VIRTUAL entry path — a bun-compiled pi's `/$bunfs/root/…` (the repo's own
+  // detector, see isVirtualEntryPath). It never had a filesystem existence, so
+  // it cannot be `self`; quiet IMPORTED keeps every bun-pi session clean. This
+  // is the ONLY quiet answer for an unresolvable `argv[1]`.
+  if (isVirtualEntryPath(entry)) {
+    return { verdict: IMPORTED, reason: 'virtual-entry', self, argv1: entry };
+  }
+
   // Definitive: realpath on BOTH sides. Catches a symlinked ancestor AND a
   // symlinked leaf file, and gives the only trustworthy `IMPORTED`.
   const selfReal = realpathOrNull(self);
@@ -154,22 +186,24 @@ export function classifyEntry(metaUrl, argv1 = process.argv[1]) {
     }
   }
 
-  // PROVABLE "not us" (#708 review cycle 1): `self` RESOLVED (so this file
-  // exists on disk) while `argv[1]` did not — and a path that does not resolve
-  // cannot name a file that does. This is the shape a bun-compiled pi presents
-  // (`/$bunfs/root/pi.ts`, explicitly handled at
-  // extensions/builtin-tools/index.ts:161 and extensions/subagent/index.ts:439)
-  // while the module is IMPORTED — where a `true` would run the guard body
-  // inside the host process (`process.exit`, `--write`, latch `--clear`). Quiet,
-  // because it is proven: a warning here would fire in every bun-pi session.
-  if (selfReal !== null && entryReal === null) {
-    return { verdict: IMPORTED, reason: 'argv1-unresolvable-different', self, argv1: entry };
-  }
-
-  // Irreducible ambiguity: our OWN module path is unresolvable, so nothing is
-  // provable — never answer "not main" here. (A real direct invocation reaches
-  // this only via the #675 P2-f self-delete, where the dirname+basename proof
-  // above normally already answers ENTRY.)
+  // Irreducible ambiguity: an unresolvable path on either side that is not a
+  // recognized virtual entry. NEVER answer "not main" here.
+  //
+  // ⚠️ "`self` resolves while `argv[1]` does not" is NOT a proof that they
+  // differ — review cycle 2 refuted exactly that inference. `realpathSync`
+  // throws for a DANGLING route just as happily as for a path that never named
+  // this file, so a symlinked component removed between module load and guard
+  // evaluation (the #675 P2-f shape; a `mktemp -d` teardown; a self-deleting
+  // script) leaves a real direct invocation looking unresolvable. Treating that
+  // as `IMPORTED` made the #254 gate exit 0 with 0 bytes of output — byte-
+  // identical to a clean run, the exact #708 bug this module exists to close.
+  // `scripts/check-workflow-lock.mjs`'s `sameRealPath` states the rule: "cannot
+  // resolve" is not "a different file". So this branch warns AND runs: a wrong
+  // `true` is visible, a wrong `false` is not.
+  //
+  // ⚠️ Direction is per-site for bodies that are SIDE EFFECTS, not gates:
+  // extensions/shared/provider-failover.ts launches a latch-mutating CLI and so
+  // warns + declines to run instead. Do not copy that here.
   return { verdict: UNRESOLVED, reason: 'unresolvable-ambiguous', self, argv1: entry };
 }
 

@@ -208,15 +208,17 @@ console.log('── Part A — classifyEntry / isMain (decision table) ──');
   check('A9b unresolvable, different basename → UNRESOLVED', info2.verdict === UNRESOLVED, JSON.stringify(info2));
 }
 
-// A9c — THE REVIEW-CYCLE-1 REGRESSION PIN. `self` resolves, `argv[1]` does not,
-// basenames differ ⇒ provably a different file ⇒ IMPORTED (quiet): running the
-// guard body here would execute it inside an IMPORTING process, where it is a
-// `process.exit`, a `--write`, or a latch `--clear` — all measured in review.
+// A9c — THE DESTROYED-ROUTE REGRESSION (review cycle 2 refuted the previous
+// fixture here). `self` resolving while `argv[1]` does not is NOT a proof that
+// the paths differ: `realpathSync` throws for a DANGLING route exactly as it does
+// for a path that never named this file. So a non-virtual unresolvable `argv[1]`
+// must be UNRESOLVED (loud) — never a quiet `IMPORTED`, which would make a gate
+// exit 0 with no output (the #708 bug).
 {
   const info = classifyEntry(pathToFileURL(HELPER).href, '/nonexistent-argv-dir-708/other.mjs');
   check(
-    'A9c self resolves + argv[1] unresolvable + different basename → IMPORTED (not UNRESOLVED)',
-    info.verdict === IMPORTED && info.reason === 'argv1-unresolvable-different',
+    'A9c self resolves + non-virtual unresolvable argv[1] → UNRESOLVED (not a quiet IMPORTED)',
+    info.verdict === UNRESOLVED && info.reason === 'unresolvable-ambiguous',
     JSON.stringify(info),
   );
   let warn = '';
@@ -225,35 +227,55 @@ console.log('── Part A — classifyEntry / isMain (decision table) ──');
     verdict = isMain(pathToFileURL(HELPER).href, '/nonexistent-argv-dir-708/other.mjs');
   });
   check(
-    'A9c-b isMain → quiet false (no gate body runs in an importing process)',
-    verdict === false && warn === '',
+    'A9c-b isMain → true + LOUD (the destroyed route FAILS CLOSED, visibly)',
+    verdict === true && warn.includes(WARN_PREFIX) && warn.includes('FAIL-CLOSED'),
     JSON.stringify({ verdict, warn }),
   );
 
-  // The exact deployment shape this protects: a bun-compiled pi presents a
-  // VIRTUAL entry path (extensions/builtin-tools/index.ts:161).
+  // The ONLY quiet answer for an unresolvable entry: the repo's own virtual-entry
+  // marker (a bun-compiled pi's `/$bunfs/root/…`, extensions/builtin-tools/index.ts:161).
   const bun = classifyEntry(pathToFileURL(HELPER).href, '/$bunfs/root/pi.ts');
-  check('A9d bun virtual entry (/$bunfs/root/pi.ts) → IMPORTED, never UNRESOLVED', bun.verdict === IMPORTED, JSON.stringify(bun));
+  check('A9d bun virtual entry (/$bunfs/root/pi.ts) → IMPORTED, quiet', bun.verdict === IMPORTED && bun.reason === 'virtual-entry', JSON.stringify(bun));
+  let bunWarn = '';
+  let bunVerdict;
+  bunWarn = captureStderr(() => {
+    bunVerdict = isMain(pathToFileURL(HELPER).href, '/$bunfs/root/pi.ts');
+  });
+  check('A9d-b virtual entry is quiet (no per-session noise under bun pi)', bunVerdict === false && bunWarn === '', JSON.stringify({ bunVerdict, bunWarn }));
 }
 
-// A9e — same basename but the entry's DIRECTORY does not exist, while `self`
-// resolves: the entry cannot be this file (this file's directory exists), so it
-// is provably a different file → quiet IMPORTED. The genuine ambiguity is the
-// both-sides-unresolvable case (A9) and the deleted-self case (selfReal null),
-// which stay UNRESOLVED → loud + fail-closed.
+// A9e — the destroyed route, for real: a symlinked ANCESTOR that names this very
+// module is removed after load, so `import.meta.url` still resolves while
+// `argv[1]` does not — the exact shape review cycle 1 measured against the real
+// gate (silent exit 0). It must be UNRESOLVED → loud + run.
 {
-  const info = classifyEntry(pathToFileURL(HELPER).href, '/nonexistent-argv-dir-708/is-main.mjs');
+  const tmp = tmpDir('destroyed-route');
+  const tmp2 = tmpDir('destroyed-route-2');
+  const real = join(tmp, 'real');
+  mkdirSync(real);
+  const link = join(tmp, 'link');
+  symlinkSync(real, link, 'dir');
+  // A copy of the helper beside a symlinked ROUTE whose basename matches.
+  const selfCopy = join(real, 'is-main.mjs');
+  writeFileSync(selfCopy, readFileSync(HELPER, 'utf8'));
+  const argv1 = join(link, 'is-main.mjs');
+  const metaUrl = pathToFileURL(selfCopy).href;
+  check('A9e fixture: the route resolves before it is destroyed', classifyEntry(metaUrl, argv1).verdict === ENTRY);
+  rmSync(link, { force: true }); // destroy the route, keep the file
+  check('A9e fixture: the file still resolves, the route does not', realpathOrNull(selfCopy) !== null && realpathOrNull(argv1) === null);
+  const info = classifyEntry(metaUrl, argv1);
   check(
-    'A9e same basename, nonexistent dir, self resolves → IMPORTED (provably different)',
-    info.verdict === IMPORTED && info.reason === 'argv1-unresolvable-different',
+    'A9e destroyed route that names THIS file → UNRESOLVED (never a silent IMPORTED)',
+    info.verdict === UNRESOLVED,
     JSON.stringify(info),
   );
   let warn = '';
   let verdict;
   warn = captureStderr(() => {
-    verdict = isMain(pathToFileURL(HELPER).href, '/nonexistent-argv-dir-708/is-main.mjs');
+    verdict = isMain(metaUrl, argv1);
   });
-  check('A9e-b quiet false — no gate body runs in an importing process', verdict === false && warn === '', JSON.stringify({ verdict, warn }));
+  check('A9e-b isMain → true + LOUD, so the no-op is not byte-identical to a clean run', verdict === true && warn.includes(WARN_PREFIX), JSON.stringify({ verdict, warn }));
+  void tmp2;
 }
 
 // A10 — our OWN module root is unresolvable (`data:` URL) → UNRESOLVED.
@@ -279,12 +301,32 @@ console.log('── Part A — classifyEntry / isMain (decision table) ──');
     JSON.stringify(warned),
   );
 
+  let warn = '';
   let verdictNoWarn;
-  let warn2 = '';
-  warn2 = captureStderr(() => {
-    verdictNoWarn = isMain(ambiguousMeta, ambiguousArgv, { warn: false });
+  // FRESH (reason, self, argv1) triple — the shared `warned` Set would otherwise
+  // suppress the message regardless of `opts.warn`, making this assertion pass for
+  // the wrong reason (review cycle 2 found exactly that in the previous version).
+  const freshMeta = pathToFileURL('/nonexistent-self-dir-708b/ghost.mjs').href;
+  warn = captureStderr(() => {
+    verdictNoWarn = isMain(freshMeta, '/nonexistent-argv-dir-708b-other.mjs', { warn: false });
   });
-  check('A11c warn:false suppresses the message but NOT the fail-closed true', verdictNoWarn === true && warn2 === '');
+  check(
+    'A11c warn:false suppresses the message but NOT the fail-closed true',
+    verdictNoWarn === true && warn === '',
+    JSON.stringify({ verdictNoWarn, warn }),
+  );
+  // ... and the paired positive: the SAME fresh triple without `warn: false`
+  // DOES emit, so the pair is falsifiable in both directions.
+  let paired = '';
+  let pairedVerdict;
+  paired = captureStderr(() => {
+    pairedVerdict = isMain(freshMeta, '/nonexistent-argv-dir-708b-other.mjs');
+  });
+  check(
+    'A11c-b the same fresh triple WITHOUT warn:false emits the warning',
+    pairedVerdict === true && paired.includes(WARN_PREFIX),
+    JSON.stringify({ pairedVerdict, paired }),
+  );
 
   // self-unresolvable is also loud.
   let selfVerdict;
@@ -409,8 +451,71 @@ check(
   );
 }
 
+// B6b — the shape that made cycle 1's direction wrong: an in-process IMPORT with
+// an unresolvable `argv[1]`. For a RECOGNIZED virtual entry (a bun-compiled pi,
+// `/$bunfs/root/…`) it must stay quiet and must NOT run the gate, or every such
+// session gets a lint/usage spew. A NON-virtual unresolvable `argv[1]` is the
+// destroyed-route case, which B7 pins as loud + running.
+{
+  const tmp = tmpDir('virtual-importer');
+  const importer = join(tmp, 'importer.mjs');
+  writeFileSync(
+    importer,
+    [
+      `process.argv[1] = '/$bunfs/root/pi.ts';`,
+      `await import(${JSON.stringify(pathToFileURL(SKILL_LINT).href)});`,
+      `console.log('IMPORT-SURVIVED');`,
+    ].join('\n'),
+  );
+  const virtualImport = node([importer]);
+  check(
+    'B6b bun-virtual entry import — gate does NOT run, quiet, importer survives',
+    virtualImport.status === 0 && virtualImport.stdout.trim() === 'IMPORT-SURVIVED' && virtualImport.stderr === '',
+    `status=${virtualImport.status} stdout=${JSON.stringify(virtualImport.stdout)} stderr=${JSON.stringify(virtualImport.stderr)}`,
+  );
+}
+
+// B7 — the DESTROYED ROUTE at the process level (review cycle 2's P0, on the
+// REAL gate). A driver invoked through a symlinked route deletes that route and
+// only then imports the #254 gate, so at guard time `process.argv[1]` names a
+// path that no longer resolves while the gate's `import.meta.url` does. An
+// earlier revision read that as "a different file" and the gate exited 0 with 0
+// bytes of stdout — byte-identical to a clean run. It must now RUN, loudly.
+{
+  const tmp = tmpDir('destroyed-route-e2e');
+  const b7real = join(tmp, 'real');
+  const route = join(tmp, 'route');
+  mkdirSync(b7real);
+  symlinkSync(b7real, route, 'dir');
+  const driver = join(b7real, 'driver.mjs');
+  writeFileSync(
+    driver,
+    [
+      `import fs from 'node:fs';`,
+      `const gate = ${JSON.stringify(pathToFileURL(SKILL_LINT).href)};`,
+      // argv[1] is this driver, reached through the route: delete the route, then
+      // hand over to the gate, whose guard sees an unresolvable argv[1].
+      `fs.rmSync(${JSON.stringify(route)}, { recursive: true, force: true });`,
+      `await import(gate);`,
+      `console.log('DRIVER-SURVIVED');`,
+    ].join('\n'),
+  );
+  // Point at the Part B fixture (planted P0) — its tree is NOT the route being deleted.
+  const destroyed = node([join(route, 'driver.mjs'), '--skills-dir', join(real, 'skills')]);
+  check(
+    'B7 destroyed invocation route — the gate RUNS (count line + P0) instead of exiting 0 silently',
+    countOf(destroyed.stdout) !== null && destroyed.stdout.includes('[P0]'),
+    `status=${destroyed.status} stdout=${JSON.stringify(destroyed.stdout.slice(0, 200))} stderr=${JSON.stringify(destroyed.stderr.slice(0, 200))}`,
+  );
+  check(
+    'B7b destroyed route — the ambiguity is VISIBLE on stderr (never byte-identical to a clean run)',
+    destroyed.stderr.includes(WARN_PREFIX),
+    JSON.stringify(destroyed.stderr.slice(0, 300)),
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
-// §PART C — static tripwire: no non-realpath'd entry-point comparison
+// PART C — static tripwire: no non-realpath'd entry-point comparison
 // ═══════════════════════════════════════════════════════════════════════════
 // HEURISTIC on purpose, and the heuristic's blind spots are PINNED as fixtures
 // (C5) rather than claimed away. It catches the two idioms that shipped (a
@@ -470,14 +575,21 @@ function scanSource(rel, src) {
 // from import.meta.url, then flags a comparison between the two families in a
 // file that never mentions `realpath` — the realpath compare is precisely what
 // makes the comparison symlink-safe.
+//
+// Cycle-3 hardening, after review cycle 2 PROVED three misses: an optional
+// `path.resolve(` wrapper is tolerated on both sides, `String(...)` may appear
+// inside the resolve helper, and the realpath exemption is applied per
+// COMPARISON (a stray `fs.realpathSync` anywhere in the file used to buy the
+// whole file a pass — `const rp = fs.realpathSync;` + the shipped bug → 0
+// findings).
 const ARGV_ALIAS = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*process\.argv\[1\]/g;
-const RESOLVE_OF = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:String\s*\(\s*)?(?:pathToFileURL|path\.resolve)\s*\(\s*(process\.argv\[1\]|process\.argv\.at\(1\)|[A-Za-z_$][\w$]*)\s*\)?/g;
-const SELF_ALIAS = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:pathToFileURL\s*\(\s*)?fileURLToPath\s*\(\s*import\.meta\.url\s*\)/g;
+const RESOLVE_OF = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:path\.resolve\s*\(\s*)?(?:String\s*\(\s*)?(?:pathToFileURL|path\.resolve)\s*\(\s*(?:String\s*\(\s*)?(process\.argv\[1\]|process\.argv\.at\(1\)|[A-Za-z_$][\w$]*)\s*\)?/g;
+const SELF_ALIAS = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:path\.resolve\s*\(\s*)?(?:pathToFileURL\s*\(\s*)?fileURLToPath\s*\(\s*import\.meta\.url\s*\)/g;
 const ARGVISH = new Set(['process.argv[1]', 'argv1', 'argv', 'entry']);
+const ARGV_NODERE = /process\.argv\[1\]|argv1|\barg\b|\bentry\b/;
 
 function scanFileHoisted(rel, src) {
   const body = stripComments(src);
-  if (HAS_REALPATH.test(body)) return []; // a realpath compare is present → symlink-safe by construction
   if (!body.includes('import.meta.url')) return [];
 
   const argvNames = new Set();
@@ -498,16 +610,28 @@ function scanFileHoisted(rel, src) {
   for (const m of body.matchAll(SELF_ALIAS)) selfNames.add(m[1]);
   if (argvNames.size === 0) return [];
 
-  const argvRef = new RegExp(
+  const ARGV_NAME = new RegExp(
     `\\b(?:${[...ARGVISH].map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')}|${[...argvNames].join('|')})\\b`,
   );
-  const selfRef = new RegExp(`(?:import\\.meta\\.url|\\b(?:${[...selfNames].join('|') || '\u0001'})\\b)`);
+  const SELF_NAME = new RegExp(`(?:import\\.meta\\.url|\\b(?:${[...selfNames].join('|') || '\u0001'})\\b)`);
+
+  // The realpath exemption is per FILE but must involve an argv-derived name —
+  // review cycle 2 showed a stray `fs.realpathSync` anywhere in the file bought
+  // the WHOLE file a pass (`const rp = fs.realpathSync;` + the shipped bug → 0
+  // findings), while a per-STATEMENT rule false-positives on the idiomatic
+  // literal fast path (`if (resolved === self) return true;`) that every real
+  // guard has next to its realpath compare. So: exempt only when some statement
+  // realpaths an argv-derived path.
+  const hasRealpathOnArgv = body
+    .split(';')
+    .some((s) => HAS_REALPATH.test(s) && (ARGV_NODERE.test(s) || ARGV_NAME.test(s)));
+  if (hasRealpathOnArgv) return [];
 
   for (const stmt of body.split(';')) {
     const flat = stmt.replace(/\s+/g, ' ').trim();
     if (!COMPARISON.test(flat)) continue;
-    if (!argvRef.test(flat)) continue;
-    if (!selfRef.test(flat)) continue;
+    if (!ARGV_NODERE.test(flat) && !ARGV_NAME.test(flat)) continue;
+    if (!SELF_NAME.test(flat)) continue;
     return [{ rel, stmt: flat, pattern: 'hoisted' }];
   }
   return [];
@@ -597,6 +721,23 @@ const S1_MISSES = [
     'const u = pathToFileURL(process.argv[1]).href;\nconst isMain = u === import.meta.url;\n',
     '',
   ],
+  // The three below were PROVEN misses in the cycle-2 scan (review cycle 2) and
+  // are fixtures now, so the net cannot silently narrow again.
+  [
+    'wrapped self (path.resolve(fileURLToPath(import.meta.url)))',
+    'const self = path.resolve(fileURLToPath(import.meta.url));\nconst other = path.resolve(process.argv[1]);\nif (self === other) run();\n',
+    '',
+  ],
+  [
+    'String() inside the resolve helper',
+    'const u = pathToFileURL(String(process.argv[1])).href;\nconst m = u === import.meta.url;\n',
+    '',
+  ],
+  [
+    'a stray realpath elsewhere in the file must NOT exempt the file',
+    'const rp = fs.realpathSync;\nconst entry = process.argv[1];\nconst resolved = path.resolve(entry);\nif (resolved === fileURLToPath(import.meta.url)) run();\n',
+    '',
+  ],
 ];
 for (const [label, bad, prelude] of S1_MISSES) {
   const src = prelude + bad;
@@ -606,6 +747,13 @@ for (const [label, bad, prelude] of S1_MISSES) {
     `scanFileHoisted found ${scanFileHoisted('fixture.ts', src).length}`,
   );
 }
+check(
+  'C5b the FIXED shape (literal fast path + realpath compare on the argv path) is NOT flagged',
+  scanFileHoisted(
+    'fixture.ts',
+    "const entry = process.argv[1];\nconst self = fileURLToPath(import.meta.url);\nconst resolved = path.resolve(entry);\nif (resolved === self) return true;\nreturn fs.realpathSync(resolved) === fs.realpathSync(self);\n",
+  ).length === 0,
+);
 
 // C6 — the ONE site with no behavioural regression test (a plain-node `.mjs`
 // suite cannot import a `.ts`) has its guard SHAPE pinned: a realpath compare
@@ -627,6 +775,12 @@ for (const [label, bad, prelude] of S1_MISSES) {
     `${(block.match(/return true/g) || []).length} occurrences`,
   );
   check('C6d no cross-layer import of scripts/ from the shipped extension', !/from\s+["'][^"']*\.\.\/\.\.\/scripts\//.test(pf));
+  // C6e — the LOUD half (review cycle 2: unpinned, so reverting the branch to an
+  // unconditional silent `return false` kept C6c green).
+  check(
+    'C6e ambiguity branch emits a loud stderr line, gated on the /$bunfs/ marker',
+    /startsWith\('\/\$bunfs\/'\)/.test(block) && /process\.stderr\.write/.test(block),
+  );
 }
 
 // C7 — the "loudly" half of the contract: no production call site may pass a
