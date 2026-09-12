@@ -830,7 +830,8 @@ CI):
 
 **CI wiring.** Per-PR: the `verify` job in `ci.yml` runs it as a named step
 (added by #744) — not in the pinned `ci` job, whose `test-command` value
-`check-skill-lint.test.mjs` pins to exactly one invocation. Post-merge: the
+(`scripts/check-pi-pin-lockstep.mjs`, guard (j)) pins to exactly this one
+accumulator invocation. Post-merge: the
 `extensions/*/test*.mjs` glob in `ci-main.yml` (`push` → main) picks it up
 automatically, so no explicit line is needed there — an explicit one would
 double-run it. Both are plain zero-dep `node` invocations, neither needs

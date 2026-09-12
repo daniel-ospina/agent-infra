@@ -2,26 +2,47 @@
 /**
  * check-pi-pin-lockstep.mjs — single-purpose CI suite for the #637 pi-pin
  * lockstep tripwires (h)/(i)/(j). Extracted from check-skill-lint.test.mjs by
- * #666 (plan alternative F) so the pin guards have a home of their own and a
- * pin-drift failure no longer shares one red signal (`ci / unit-test`) with a
- * #254 frontmatter-validator regression.
+ * #666 (plan alternative F) so the pin guards have a home of their own.
  *
  * SCOPE — the three pin-lockstep guards and nothing else:
  *   (h) extension pi-package pins lockstep with PI_VERSION_PIN
  *   (i) hand-synced mirror version stamps match PI_VERSION_PIN
  *   (j) the per-PR pin gate is still wired into .github/workflows/ci.yml →
- *       node-ci.yml and cannot be silently unplugged
+ *       node-ci.yml AND the post-merge invocation in ci-main.yml is still there
  * The #254 frontmatter-validator suite stays in scripts/check-skill-lint.test.mjs.
  * This suite does NOT import pi (the dev-machine oracle owns pi parity).
  *
  * Run: node scripts/check-pi-pin-lockstep.mjs
  *
- * WIRING: ci.yml passes
- *   `test-command: node scripts/check-skill-lint.test.mjs && node scripts/check-pi-pin-lockstep.mjs`
+ * WIRING (#675 P1-5): ci.yml passes the failure-accumulator `test-command`
+ *   `a=0; node scripts/check-skill-lint.test.mjs || a=$?; b=0; node scripts/check-pi-pin-lockstep.mjs || b=$?; [ $a -eq 0 ] && [ $b -eq 0 ]`
  * to the reusable node-ci.yml (its unit-test job is SKIPPED when that input is
- * empty — guard (j) asserts the per-PR half of this), and ci-main.yml runs this
- * suite post-merge. Extracting the guards must not leave them unwired on either
- * path; that is guard (j)'s whole job.
+ * empty), and ci-main.yml's post-merge accumulator runs this suite too. Guard (j)
+ * asserts BOTH halves: the `ci.yml → node-ci.yml` wiring and the ci-main.yml
+ * invocation. The old design had the "cannot be left unwired" property by
+ * construction; a guard reading only the per-PR caller could be unwired on main
+ * in silence, so the assertion covers both paths rather than the header claiming
+ * both while one was unasserted.
+ *
+ * WHY THE ACCUMULATOR, NOT `&&` (#675 P2-2): shell `&&` short-circuits, so a
+ * frontmatter-validator failure would skip this suite entirely and its verdict
+ * (pin drift, mirror stamps, guard (j) itself) would never be produced for that
+ * PR. The `||` form (not `cmd; a=$?;`) is required because GitHub's default
+ * Linux shell is `bash -e {0}`: under `set -e` a bare failing `node` aborts the
+ * script before `a=$?` runs, which reintroduces exactly the short-circuit.
+ * NOTE honestly: both suites still share ONE `ci / unit-test` signal — the split
+ * makes the two failure modes distinguishable in that job's log; it does NOT
+ * create a separate check context (that is issue #673).
+ *
+ * READER BOUNDS (the subset reader this guard (j) leans on,
+ * scripts/workflow-yaml.mjs — restated here so the suite states its own limits):
+ *   - block-scalar chomping/folding is not modelled (`|`/`>` bodies are raw
+ *     text, common indentation stripped);
+ *   - scalar TYPES are not resolved — every scalar is a string, so `no`/`off`/`0`
+ *     are REPORTED as truthy rather than treated as `false` (loud, never silent);
+ *   - multi-line plain scalars, anchors/aliases, tags, merge keys, nested inline
+ *     sequences (`- - x`) and multi-document streams all THROW;
+ *   - a nested or repo-root package.json is not walked for (h) — see #643.
  *
  * PI_VERSION_PIN is imported from scripts/frontmatter-fixtures.mjs — that module
  * stays the single source of truth for the pin (it is probe-derived, see its
@@ -30,7 +51,11 @@
  * Repo-convention harness: node:assert + custom test()/section() with ✅/❌
  * markers and process.exit(1) on failure (load-gate.test.mjs pattern). Assertion
  * markers are present so mutation-survival spot-checks (deleting a rule → red
- * test) hold.
+ * test) hold. Guards (h)/(i) additionally carry an explicit POSITIVE CONTROL —
+ * a pure `pinFindings`/`stampFindings` predicate fed a deliberately-wrong pin and
+ * asserted NON-EMPTY — so neutering the comparison turns a test red instead of
+ * silently weakening the suite (#675 P1-3). The suite also asserts a lower bound
+ * on the number of passing tests, so wholesale deletion of a rule's test is red.
  */
 
 import { strict as assert } from "node:assert";
@@ -43,6 +68,7 @@ import { parseWorkflowYaml, WorkflowYamlError } from "./workflow-yaml.mjs";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CI_YML = path.join(REPO_ROOT, ".github", "workflows", "ci.yml");
 const NODE_CI_YML = path.join(REPO_ROOT, ".github", "workflows", "node-ci.yml");
+const CI_MAIN_YML = path.join(REPO_ROOT, ".github", "workflows", "ci-main.yml");
 
 let passed = 0;
 let failed = 0;
@@ -91,15 +117,19 @@ const PIN_FIELDS = [
   "overrides",
   "resolutions",
 ];
-section("extension pi-package pins lockstep with PI_VERSION_PIN");
 
-test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN", () => {
-  const extDir = path.join(REPO_ROOT, "extensions");
-  const offenders = [];
+/**
+ * Collect every `@earendil-works/pi-*` pin declared by an `extensions/<name>/package.json`.
+ * → { entries, pinCounts }: `entries` is the flat (file, field, name, version)
+ * list the pure `pinFindings` predicate judges; `pinCounts` is the per-extension
+ * coverage map that keeps a coverage collapse (6 pins → 1) red.
+ */
+function collectExtensionPins(root) {
+  const entries = [];
   const pinCounts = {};
-  for (const entry of fs.readdirSync(extDir, { withFileTypes: true })) {
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
-    const pkgPath = path.join(extDir, entry.name, "package.json");
+    const pkgPath = path.join(root, entry.name, "package.json");
     if (!fs.existsSync(pkgPath)) continue;
     const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
     let hits = 0;
@@ -107,13 +137,32 @@ test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN",
       for (const [name, ver] of Object.entries(pkg[field] ?? {})) {
         if (!name.startsWith("@earendil-works/pi-")) continue;
         hits++;
-        if (ver !== PI_VERSION_PIN) {
-          offenders.push(`extensions/${entry.name}/package.json (${field}): ${name}@${ver}`);
-        }
+        entries.push({ file: `extensions/${entry.name}/package.json`, field, name, version: ver });
       }
     }
     if (hits > 0) pinCounts[entry.name] = hits;
   }
+  return { entries, pinCounts };
+}
+
+/**
+ * PURE predicate for guard (h): every collected pin whose version is not `pin`.
+ * Extracted so the suite can drive it with a deliberately-wrong pin and assert a
+ * NON-EMPTY result — the positive control that makes neutering the comparison a
+ * RED test instead of a silently weakened suite (#675 P1-3).
+ */
+function pinFindings(entries, pin) {
+  const offenders = [];
+  for (const e of entries) {
+    if (e.version !== pin) offenders.push(`${e.file} (${e.field}): ${e.name}@${e.version}`);
+  }
+  return offenders;
+}
+
+section("extension pi-package pins lockstep with PI_VERSION_PIN");
+
+test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN", () => {
+  const { entries, pinCounts } = collectExtensionPins(path.join(REPO_ROOT, "extensions"));
   // Counts, not just a name roster: the roster alone stayed green when 3 of
   // subagent's 4 pins were deleted (6 pins → 3). Assert the full map so both a
   // lost extension and a lost pin within an extension are red. Update
@@ -125,10 +174,36 @@ test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN",
       "tripwire's coverage moved (update this map only after confirming every pin " +
       "is pinned to PI_VERSION_PIN)"
   );
+  const offenders = pinFindings(entries, PI_VERSION_PIN);
   assert.equal(
     offenders.length,
     0,
     `pin drift vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
+  );
+});
+
+// Positive control (#675 P1-3): `if (ver !== pin)` was previously untested, so
+// rewriting it to `if (false)` left the suite at 52/52 GREEN. This drives the
+// same predicate with a drifted pin and requires a finding.
+test("pinFindings flags a drifted pin (positive control for (h))", () => {
+  const entry = {
+    file: "extensions/x/package.json",
+    field: "devDependencies",
+    name: "@earendil-works/pi-coding-agent",
+    version: "0.0.1-not-the-pin",
+  };
+  const offenders = pinFindings([entry], PI_VERSION_PIN);
+  assert.equal(
+    offenders.length,
+    1,
+    "a pin that is NOT PI_VERSION_PIN must be reported — if this is 0, guard (h)'s " +
+      "comparison has been neutered (deleted or short-circuited)"
+  );
+  assert.match(offenders[0], /@earendil-works\/pi-coding-agent@0\.0\.1-not-the-pin/);
+  assert.deepEqual(
+    pinFindings([{ ...entry, version: PI_VERSION_PIN }], PI_VERSION_PIN),
+    [],
+    "a pin that IS PI_VERSION_PIN must not be reported"
   );
 });
 
@@ -140,59 +215,133 @@ test("extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN",
 //
 // Guard the whole stamp SET, not a phrase. A per-file phrase pattern was tried first and missed 2 of
 // the 5 pi stamps (frontmatter-validate's "probe pi X" and ci-main's "devDep pinned X") — the same
-// silent-staleness class this guard exists to close. Instead: every `<major>.<minor>.<patch>` literal
-// in these four hand-synced surfaces must be either PI_VERSION_PIN or a listed non-pi dependency
-// version, and each surface's stamp COUNT must match an expected map so a wholesale rewording OR a
-// single dropped stamp is red (a bare `≥1 per file` presence check, like the `matched > 0` variant
-// retired in (h), stayed green when a surface lost one of three).
+// silent-staleness class this guard exists to close. So: every `<major>.<minor>.<patch>` literal on a
+// STAMP-CONTEXT line of these four hand-synced surfaces must be PI_VERSION_PIN or a listed non-pi
+// dependency version.
 //
-// Known scope bounds: 3-component literals only (a `pi 0.86` stamp is invisible), the allowlist is
-// keyed by version STRING rather than occurrence, and version-specific LINE REFERENCES are
-// deliberately not asserted — they move within a version and must be re-derived by hand (see #651).
+// #675 P1-4 — the sweep is scoped to stamp context and the per-surface assertion is a FLOOR, not an
+// exact count. The previous "every version literal in the whole file, exact per-file count" form was
+// a false-positive factory: appending `Requires Node 22.11.0 or newer.` to docs/providers.md, or a
+// *correct* extra `See also pi 0.85.1 notes.`, or `Runner image 24.04.1 LTS` to a ci-main comment all
+// reddened the suite — and because the count check ran first the diagnostic said "a stamp was
+// silently dropped" when nothing was. This is the same class as #485 T2 (issue #779).
+//
+// Known scope bounds: 3-component literals only (a `pi 0.86` stamp is invisible); a literal is only a
+// stamp when its own line carries a pi/stamp keyword (a stale stamp reworded onto a keyword-free line
+// is invisible); the allowlist is keyed by version STRING rather than occurrence; and version-specific
+// LINE REFERENCES are deliberately not asserted — they move within a version and must be re-derived
+// by hand (see #651).
 section("mirror version stamps match PI_VERSION_PIN");
 
-test("every version literal in the mirror surfaces is the pin or a listed dep version", () => {
-  const MIRRORS = [
-    "docs/providers.md",
-    "extensions/custom-provider-qwen/index.ts",
-    "scripts/frontmatter-validate.mjs",
-    ".github/workflows/ci-main.yml",
-  ];
-  // Non-pi dependency versions legitimately quoted in a surface (so they are not
-  // mistaken for stamps). Adding an entry here is a deliberate, reviewed act.
-  const ALLOWED_NON_PI = {
-    "scripts/frontmatter-validate.mjs": ["2.9.0"], // yaml
-    "docs/providers.md": ["8.9.0"], // undici
-  };
+const MIRROR_FILES = [
+  "docs/providers.md",
+  "extensions/custom-provider-qwen/index.ts",
+  "scripts/frontmatter-validate.mjs",
+  ".github/workflows/ci-main.yml",
+];
+// Non-pi dependency versions legitimately quoted in a surface (so they are not
+// mistaken for stamps). Adding an entry here is a deliberate, reviewed act.
+const ALLOWED_NON_PI = {
+  "scripts/frontmatter-validate.mjs": ["2.9.0"], // yaml
+  "docs/providers.md": ["8.9.0"], // undici
+};
+// A version literal counts as a STAMP only on a line that talks about the pin:
+// the version word, a pi package, a probe, a devDep pin, or "verified against".
+// This is what keeps an unrelated literal (a Node floor, a runner image tag, a
+// changelog fragment) from being read as a pi stamp (#675 P1-4).
+const STAMP_CONTEXT_RE = /\bpi\b|pi-ai|pi-coding-agent|probe|devDep|verified against|version|parity/i;
+const VERSION_LITERAL_RE = /\d+\.\d+\.\d+/g;
+// Per-surface FLOOR, not an exact count: coverage may GROW (adding a correct
+// stamp is a deliberate act, not a tripwire event) but must never SHRINK below
+// the coverage this guard was written against. A shrink is the genuine "a stamp
+// was silently dropped" case the old message mis-applied to growth too. Update
+// deliberately when a surface gains/loses a stamp.
+const STAMP_FLOORS = {
+  "docs/providers.md": 1,
+  "extensions/custom-provider-qwen/index.ts": 1,
+  "scripts/frontmatter-validate.mjs": 3,
+  ".github/workflows/ci-main.yml": 2,
+};
+
+/** Version literals in stamp context on one surface, minus its allowlisted non-pi versions. */
+function collectStampLiterals(file, src) {
+  const allowed = ALLOWED_NON_PI[file] ?? [];
+  const out = [];
+  src.split("\n").forEach((line, idx) => {
+    if (!STAMP_CONTEXT_RE.test(line)) return;
+    for (const value of line.match(VERSION_LITERAL_RE) ?? []) {
+      if (allowed.includes(value)) continue;
+      out.push({ line: idx + 1, value });
+    }
+  });
+  return out;
+}
+
+/**
+ * PURE predicate for guard (i): every stamp literal that is not `pin`.
+ * Extracted so the suite can drive it with a deliberately-wrong pin and assert a
+ * NON-EMPTY result — the positive control that makes neutering the comparison a
+ * RED test instead of a silently weakened suite (#675 P1-3).
+ */
+function stampFindings(sources, pin) {
   const offenders = [];
-  const stampCounts = {};
-  for (const file of MIRRORS) {
-    const src = fs.readFileSync(path.join(REPO_ROOT, file), "utf8");
-    const allowed = ALLOWED_NON_PI[file] ?? [];
-    const stamps = [...src.matchAll(/\d+\.\d+\.\d+/g)]
-      .map((m) => m[0])
-      .filter((v) => !allowed.includes(v));
-    stampCounts[file] = stamps.length;
-    for (const v of stamps) if (v !== PI_VERSION_PIN) offenders.push(`${file}: ${v}`);
+  for (const { file, src } of sources) {
+    for (const stamp of collectStampLiterals(file, src)) {
+      if (stamp.value !== pin) offenders.push(`${file}:${stamp.line}: ${stamp.value}`);
+    }
   }
-  // Counts, not just presence: a `≥1 per file` check stayed green when
-  // frontmatter-validate.mjs lost one of its 3 stamps. Update deliberately.
-  assert.deepEqual(
-    stampCounts,
-    {
-      "docs/providers.md": 1,
-      "extensions/custom-provider-qwen/index.ts": 1,
-      "scripts/frontmatter-validate.mjs": 3,
-      ".github/workflows/ci-main.yml": 2,
-    },
-    "the set (or per-surface count) of version stamps changed — the tripwire's " +
-      "coverage moved, or a stamp was silently dropped (update this map only after " +
-      "confirming every stamp is PI_VERSION_PIN)"
-  );
+  return offenders;
+}
+
+test("every version literal in the mirror surfaces is the pin or a listed dep version", () => {
+  const sources = MIRROR_FILES.map((file) => ({
+    file,
+    src: fs.readFileSync(path.join(REPO_ROOT, file), "utf8"),
+  }));
+  // Offenders FIRST so a stale stamp NAMES the offending literal, instead of the
+  // count check mis-reporting it as a dropped stamp (#675 P1-4).
+  const offenders = stampFindings(sources, PI_VERSION_PIN);
   assert.deepEqual(
     offenders,
     [],
-    `stale version stamps vs PI_VERSION_PIN=${PI_VERSION_PIN}:\n  ${offenders.join("\n  ")}`
+    `version literal(s) in a pi-stamp context do not match PI_VERSION_PIN=${PI_VERSION_PIN} ` +
+      `(a stale stamp, or an unrelated version that needs an ALLOWED_NON_PI entry):\n  ${offenders.join("\n  ")}`
+  );
+  // Floor second: this is the only "a stamp went stale / was dropped" message,
+  // and it fires only when coverage actually SHRANK.
+  const thin = [];
+  for (const { file, src } of sources) {
+    const count = collectStampLiterals(file, src).length;
+    const floor = STAMP_FLOORS[file] ?? 1;
+    if (count < floor) thin.push(`${file}: ${count} stamp(s) in stamp context, floor ${floor}`);
+  }
+  assert.deepEqual(
+    thin,
+    [],
+    "a mirror surface lost stamp coverage — counts may GROW, never shrink below the floor " +
+      `(a stamp was silently dropped or its keyword line was reworded):\n  ${thin.join("\n  ")}`
+  );
+});
+
+// Positive control (#675 P1-3): deleting the `offenders.push` inside
+// `stampFindings` previously left the suite at 52/52 GREEN because the live
+// surface is (correctly) clean. This drives the predicate with a stale stamp.
+test("stampFindings flags a stale stamp (positive control for (i))", () => {
+  const file = "docs/providers.md";
+  const stale = "### Verified against pi 0.0.1-not-the-pin internals (Q1)\n";
+  const offenders = stampFindings([{ file, src: stale }], PI_VERSION_PIN);
+  assert.equal(
+    offenders.length,
+    1,
+    "a pi stamp that is NOT PI_VERSION_PIN must be reported — if this is 0, guard (i)'s " +
+      "comparison (or its `offenders.push`) has been neutered"
+  );
+  assert.match(offenders[0], /^docs\/providers\.md:1: 0\.0\.1$/);
+  const fresh = `### Verified against pi ${PI_VERSION_PIN} internals (Q1)\n`;
+  assert.deepEqual(
+    stampFindings([{ file, src: fresh }], PI_VERSION_PIN),
+    [],
+    "a stamp that IS PI_VERSION_PIN must not be reported"
   );
 });
 
@@ -235,11 +384,27 @@ test("every version literal in the mirror surfaces is the pin or a listed dep ve
 //     reads repo files — branch protection is the control (#646);
 //   * `continue-on-error` is only treated as harmless when the value is the literal `false`: the
 //     reader does not resolve YAML scalar types, so `no`/`off`/`0` are reported (loud, never silent).
+//     CONFIRMED SAFE (#675 P3): the reader cannot distinguish the boolean `false` from the quoted
+//     string `"false"`, but it does not need to — the canonical workflow schema types
+//     `continue-on-error` as a BOOLEAN at both levels (`actions/languageservices`
+//     `workflow-parser/src/workflow-v1.0.json`: `boolean-strategy-context` for `job`,
+//     `step-continue-on-error` for steps — the older `actions/runner`
+//     `src/Sdk/DTPipelines/workflow-v1.0.json` copy likewise), and the runner-side converter asserts
+//     it (`PipelineTemplateConverter.ConvertToStepContinueOnError` → `AssertBoolean`). A quoted
+//     `"false"` is therefore a workflow-validation ERROR, not a truthy coercion, so the reader's
+//     string-typed `"false"` can never be the thing that silently disables the gate.
 section("per-PR pin gate is wired (not silently skipped)");
 
 const EXPECTED_USES = "daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main";
+// #675 P2-2 — a FAILURE ACCUMULATOR, not `&&`. `&&` short-circuits, so a
+// frontmatter-validator failure would skip this suite and its verdict would never
+// be produced for that PR. The `||` form (rather than `cmd; a=$?;`) is required
+// because GitHub's default Linux shell is `bash -e {0}`: under `set -e` a bare
+// failing `node` aborts the script before `a=$?` runs, reintroducing the
+// short-circuit. Both suites always run; the step still fails if either did.
 const EXPECTED_TEST_COMMAND =
-  "node scripts/check-skill-lint.test.mjs && node scripts/check-pi-pin-lockstep.mjs";
+  "a=0; node scripts/check-skill-lint.test.mjs || a=$?; b=0; node scripts/check-pi-pin-lockstep.mjs " +
+  "|| b=$?; [ $a -eq 0 ] && [ $b -eq 0 ]";
 const EXPECTED_JOB_IF = "inputs.test-command != '' || inputs.test-glob != ''";
 const EXPECTED_STEP_IF = "inputs.test-command != ''";
 const EXPECTED_RUN_INPUT = "${{ inputs.test-command }}";
@@ -247,6 +412,13 @@ const EXPECTED_RUN_GLOB = "node --test ${{ inputs.test-glob }}";
 const CALLER_USES_LINE = `    uses: ${EXPECTED_USES}`;
 const CUSTOM_STEP_LINE = "      - name: Custom test command\n";
 const CUSTOM_STEP_RUN_CLEAN = "        run: ${{ inputs.test-command }}\n";
+// #675 P1-2 — the ONLY keys the step that runs `test-command` may carry. Every
+// one of these is inert with respect to EXECUTING the command; anything else
+// (`uses`, a re-declared `continue-on-error`, …) can no-op the step while its
+// `if`/`run` read byte-identical. `shell` is allowed here but its VALUE is
+// constrained by ACCEPTABLE_SHELLS below (`true {0}` is not a shell that runs it).
+const CUSTOM_STEP_KEYS = new Set(["name", "if", "working-directory", "run", "env", "shell"]);
+const ACCEPTABLE_SHELLS = new Set(["bash", "sh"]);
 const TRIGGER_FILTERS = ["paths", "paths-ignore", "branches", "branches-ignore", "types"];
 
 /** `continue-on-error` is dangerous only when it can be truthy (literal `false` is a no-op). */
@@ -407,6 +579,53 @@ function wiringFindings(callerSrc, calleeSrc) {
     if (Object.hasOwn(unitTest, "needs")) {
       f.push("the `unit-test` job gained `needs:` — a skipped dependency skips the gate");
     }
+    // #675 P1-2 — the step's execution SHELL is part of the gate. A custom shell
+    // becomes `<shell> <scriptPath>` (actions/runner), so `shell: 'true {0}'` on
+    // the step — or `defaults.run.shell` on the job — leaves every guarded key
+    // byte-identical while the suites never execute. Reproduced GREEN, 52/52.
+    if (Object.hasOwn(unitTest, "defaults")) {
+      f.push(
+        "the `unit-test` job gained a `defaults:` block — `defaults.run.shell` would override the " +
+          "shell of every step, including the one that runs `test-command`, so the pin gate can be " +
+          "silently disabled while its `if`/`run` stay identical"
+      );
+    }
+    // #675 P2-5 — an EMPTY matrix expands to zero jobs, so the pin gate never
+    // runs while every other check here stays green. (Pre-existing on the pre-PR
+    // guard too, but closing silently-green wiring paths is this guard's job.)
+    if (Object.hasOwn(unitTest, "strategy")) {
+      const strategy = unitTest.strategy;
+      if (!isMap(strategy)) {
+        f.push("the `unit-test` job's `strategy:` is not a mapping the guard can read");
+      } else if (Object.hasOwn(strategy, "matrix")) {
+        const matrix = strategy.matrix;
+        if (!isMap(matrix)) {
+          f.push(
+            "the `unit-test` job's `strategy.matrix:` is not a mapping the guard can read — a matrix " +
+              "the guard cannot enumerate might expand to zero jobs, skipping the pin gate silently"
+          );
+        } else {
+          const dims = Object.entries(matrix);
+          if (dims.length === 0) {
+            f.push("the `unit-test` job's `strategy.matrix:` is empty — it expands to ZERO jobs, so the pin gate never runs");
+          }
+          for (const [dim, val] of dims) {
+            if (!Array.isArray(val)) {
+              f.push(
+                `the \`unit-test\` job's \`strategy.matrix.${dim}\` is not a sequence the guard can ` +
+                  "read — a dimension the guard cannot enumerate might be empty, expanding the " +
+                  "matrix to zero jobs"
+              );
+            } else if (val.length === 0 && dim !== "exclude") {
+              f.push(
+                `the \`unit-test\` job's \`strategy.matrix.${dim}\` is EMPTY — the matrix expands to ` +
+                  "ZERO jobs, so the pin gate never runs while every other check stays green"
+              );
+            }
+          }
+        }
+      }
+    }
     const steps = unitTest.steps;
     if (!Array.isArray(steps) || steps.length === 0) {
       f.push("the `unit-test` job no longer declares a non-empty `steps:` sequence");
@@ -420,6 +639,16 @@ function wiringFindings(callerSrc, calleeSrc) {
           f.push(
             `a \`unit-test\` step (${JSON.stringify(step.name ?? step.uses ?? step.run ?? "unnamed")}) ` +
               "gained `continue-on-error:` — the suite could fail while the job reports success"
+          );
+        }
+        // #675 P1-2 — `shell:` is the step's execution semantics. Absent (the
+        // runner default `bash -e {0}`) or an explicit bash/sh are the only safe
+        // values; `shell: 'true {0}'` runs `true` and never executes the script.
+        if (Object.hasOwn(step, "shell") && !ACCEPTABLE_SHELLS.has(step.shell)) {
+          f.push(
+            `a \`unit-test\` step (${JSON.stringify(step.name ?? step.uses ?? step.run ?? "unnamed")}) ` +
+              `sets \`shell: ${JSON.stringify(step.shell)}\` — a non-bash/sh shell can NO-OP the step ` +
+              "(e.g. `true {0}`) while its `if`/`run` stay byte-identical, silently skipping the pin gate"
           );
         }
       }
@@ -440,12 +669,24 @@ function wiringFindings(callerSrc, calleeSrc) {
             "missing or its predicate changed (a step carrying the expected `run:` under a " +
             "different `if:` does not satisfy this)"
         );
-      } else if (custom.run !== EXPECTED_RUN_INPUT) {
-        f.push(
-          `the custom-test step must run exactly \`${EXPECTED_RUN_INPUT}\` — otherwise the job ` +
-            `reports green without executing the suites, or runs them and swallows the failure; ` +
-            `found ${JSON.stringify(custom.run ?? null)}`
-        );
+      } else {
+        // #675 P1-2 — an ALLOWLIST. The step that runs the pin gate may only
+        // carry keys that cannot change whether/how the command executes.
+        const extra = Object.keys(custom).filter((k) => !CUSTOM_STEP_KEYS.has(k));
+        if (extra.length > 0) {
+          f.push(
+            `the custom-test step gained key(s) ${JSON.stringify(extra)} — the step that runs the pin ` +
+              `gate may only carry ${JSON.stringify([...CUSTOM_STEP_KEYS])} (\`shell\` limited to ` +
+              "`bash`/`sh`); any other key can no-op it while `if`/`run` read unchanged"
+          );
+        }
+        if (custom.run !== EXPECTED_RUN_INPUT) {
+          f.push(
+            `the custom-test step must run exactly \`${EXPECTED_RUN_INPUT}\` — otherwise the job ` +
+              `reports green without executing the suites, or runs them and swallows the failure; ` +
+              `found ${JSON.stringify(custom.run ?? null)}`
+          );
+        }
       }
     }
   }
@@ -461,6 +702,77 @@ test("live ci.yml → node-ci.yml: the per-PR pin gate is wired", () => {
     findings.length,
     0,
     `the per-PR pin gate is no longer wired as expected:\n  ${findings.join("\n  ")}`
+  );
+});
+
+// ── guard (j), post-merge half (#675 P1-5) ──────────────────────────────────
+// The old design got "cannot be left unwired" by construction (the guards lived
+// inside the suite ci-main.yml already ran). After the #666 split, deleting the
+// lines this PR added to ci-main.yml left the suite at 52/52 GREEN — the header
+// claimed both wiring paths while only the per-PR one was asserted. The
+// post-merge invocation is now asserted here.
+const POST_MERGE_INVOCATION_RE = /^node\s+scripts\/check-pi-pin-lockstep\.mjs\b/;
+
+/**
+ * Evaluate the post-merge wiring from the ci-main.yml SOURCE.
+ * → [] when wired, else one message per broken invariant.
+ */
+function ciMainFindings(src) {
+  let doc;
+  try {
+    doc = parseWorkflowYaml(src);
+  } catch (err) {
+    const detail = err instanceof WorkflowYamlError ? err.message : String(err.message ?? err);
+    return [
+      "ci-main.yml could not be read by the supported YAML subset reader " +
+        `(scripts/workflow-yaml.mjs): ${detail} — extend that reader deliberately; do NOT ` +
+        "fall back to text matching (that is the #637 bypass class)",
+    ];
+  }
+  if (!isMap(doc)) return ["ci-main.yml did not read as a top-level mapping"];
+  const job =
+    isMap(doc.jobs) && isMap(doc.jobs["extension-tests"]) ? doc.jobs["extension-tests"] : null;
+  if (!job) {
+    return [
+      "ci-main.yml no longer defines the `extension-tests` job — the post-merge half of #637's " +
+        "pin-gate contract would be dropped silently",
+    ];
+  }
+  const cmd = isMap(job.with) ? job.with["test-command"] : null;
+  if (typeof cmd !== "string" || cmd.trim() === "") {
+    return [
+      "ci-main.yml's `extension-tests` job no longer passes a non-empty `test-command` — the " +
+        "post-merge pin gate would never run",
+    ];
+  }
+  const invocations = cmd
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => POST_MERGE_INVOCATION_RE.test(l));
+  if (invocations.length !== 1) {
+    return [
+      "ci-main.yml's post-merge `test-command` must invoke scripts/check-pi-pin-lockstep.mjs " +
+        `exactly once as its own \`node …\` line — found ${invocations.length} such line(s) ` +
+        "(an `echo` line mentioning it is not an invocation, and deleting the line drops the " +
+        "post-merge half of the pin gate)",
+    ];
+  }
+  if (!/\|\|\s*failures=\$\(\(failures\+1\)\)/.test(invocations[0])) {
+    return [
+      "ci-main.yml's check-pi-pin-lockstep.mjs line no longer accumulates its failure " +
+        "(`… || failures=$((failures+1))`) — a bare `node …` aborts the accumulator at the first " +
+        `failure and hides every later suite's verdict; found ${JSON.stringify(invocations[0])}`,
+    ];
+  }
+  return [];
+}
+
+test("live ci-main.yml: the post-merge pin gate is wired", () => {
+  const findings = ciMainFindings(fs.readFileSync(CI_MAIN_YML, "utf8"));
+  assert.deepEqual(
+    findings,
+    [],
+    `the post-merge pin gate is no longer wired as expected:\n  ${findings.join("\n  ")}`
   );
 });
 
@@ -513,6 +825,28 @@ jobs:
         if: inputs.test-command == '' && inputs.test-glob != ''
         working-directory: \${{ inputs.working-directory }}
         run: node --test \${{ inputs.test-glob }}
+`;
+
+// Dedicated fixture for the POST-MERGE half (#675 P1-5) — never the live
+// ci-main.yml, so no verdict depends on the live file's spelling. The `echo`
+// line is a deliberate decoy: it mentions the suite name without invoking it.
+const FIXTURE_CI_MAIN = `name: CI on main
+on:
+  push:
+    branches: [main]
+
+jobs:
+  extension-tests:
+    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
+    with:
+      test-command: |
+        failures=0
+        echo "== scripts/check-pi-pin-lockstep.mjs =="
+        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))
+        if [ $failures -gt 0 ]; then
+          exit 1
+        fi
+    secrets: inherit
 `;
 
 /**
@@ -651,7 +985,8 @@ expectWired(
   "a parent-indent step sequence stays GREEN",
   FIXTURE_CALLER,
   () =>
-    FIXTURE_CALLEE.replace(
+    mutate(
+      FIXTURE_CALLEE,
       `    steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -725,14 +1060,37 @@ expectWired(
     ),
   FIXTURE_CALLEE
 );
+expectWired(
+  "a NON-empty `strategy.matrix` on `unit-test` stays GREEN (#675 P2-5)",
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      `    if: ${EXPECTED_JOB_IF}`,
+      `    if: ${EXPECTED_JOB_IF}\n    strategy:\n      matrix:\n        os: [ubuntu-latest]\n        include:\n          - node: '22'`
+    )
+);
+// Positive control for the #675 P1-2 shell key: an explicit bash/sh is a
+// semantics-preserving spelling and must NOT be reddened.
+expectWired(
+  "an explicit `shell: bash` on the custom-test step stays GREEN (#675 P1-2)",
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      CUSTOM_STEP_RUN_CLEAN,
+      "        shell: bash\n" + CUSTOM_STEP_RUN_CLEAN
+    )
+);
 
 section("guard (j) — YAML-valid bypass attempts are RED");
 
 // Every fixture below is a DEDICATED fixture workflow (FIXTURE_CALLER /
-// FIXTURE_CALLEE), never the live files, so no verdict here depends on the
-// spelling of `.github/workflows/*.yml`. `LIVE_*` appears in exactly one place
-// (the "live ci.yml is correctly wired" assertion above). Each mutation is a
-// thunk, so a broken anchor is a ❌, not an uncaught throw at module load.
+// FIXTURE_CALLEE / FIXTURE_CI_MAIN), never the live files, so no verdict here
+// depends on the spelling of `.github/workflows/*.yml`. `LIVE_*` appears in
+// exactly two places (the "live ci.yml is correctly wired" and "live ci-main.yml
+// post-merge gate" assertions above). Each mutation is a thunk, so a broken
+// anchor is a ❌, not an uncaught throw at module load.
 expectRed(
   "a decoy dead step carrying the expected `run:` text is RED",
   FIXTURE_CALLER,
@@ -983,6 +1341,139 @@ expectRed(
   "supported YAML subset reader"
 );
 
+// ── #675 P1-1 — YAML escape sequences must not smuggle a guarded key past the guard ──
+// The reader previously appended the escaped character LITERALLY, so
+// `"paths\u002dignore"` read as the key `pathsu002dignore` while GitHub decodes
+// it to `paths-ignore` — guard (j) stayed GREEN with the per-PR gate unplugged.
+// The reader now decodes the full YAML escape set (and THROWS on anything else).
+expectRed(
+  'a `"paths\\u002dignore"` filter under `pull_request` is RED (escape decoded)',
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      "on:\n  pull_request:",
+      'on:\n  pull_request:\n    "paths\\u002dignore":\n      - "*.md"'
+    ),
+  FIXTURE_CALLEE,
+  "gained `paths-ignore:`"
+);
+expectRed(
+  'a `"i\\u0066"` key (escaped `if`) on the `ci:` job is RED (escape decoded)',
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      CALLER_USES_LINE,
+      '    "i\\u0066": github.event_name == \'push\'\n' + CALLER_USES_LINE
+    ),
+  FIXTURE_CALLEE,
+  "gained an `if:`"
+);
+expectRed(
+  'a `"continu\\u0075e-on-error"` step key is RED (escape decoded)',
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      CUSTOM_STEP_LINE,
+      '      - name: Custom test command\n        "contin\\u0075e-on-error": true\n'
+    ),
+  "gained `continue-on-error:`"
+);
+
+// ── #675 P1-2 — the step's execution shell is part of the gate ──
+expectRed(
+  "`shell: 'true {0}'` on the custom-test step is RED (#675 P1-2)",
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      CUSTOM_STEP_LINE,
+      "      - name: Custom test command\n        shell: 'true {0}'\n"
+    ),
+  "shell:"
+);
+expectRed(
+  "a job-level `defaults.run.shell` on `unit-test` is RED (#675 P1-2)",
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      `    if: ${EXPECTED_JOB_IF}`,
+      `    defaults:\n      run:\n        shell: 'true {0}'\n    if: ${EXPECTED_JOB_IF}`
+    ),
+  "gained a `defaults:`"
+);
+
+// ── #675 P2-5 — an empty matrix expands to ZERO jobs (silently green) ──
+expectRed(
+  "an empty `strategy.matrix.os` on `unit-test` is RED (#675 P2-5)",
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      `    if: ${EXPECTED_JOB_IF}`,
+      `    if: ${EXPECTED_JOB_IF}\n    strategy:\n      matrix:\n        os: []`
+    ),
+  "strategy.matrix.os` is EMPTY"
+);
+expectRed(
+  "an empty `strategy.matrix.include` on `unit-test` is RED (#675 P2-5)",
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      `    if: ${EXPECTED_JOB_IF}`,
+      `    if: ${EXPECTED_JOB_IF}\n    strategy:\n      matrix:\n        include: []`
+    ),
+  "strategy.matrix.include` is EMPTY"
+);
+
+// ── #675 P1-5 — the POST-MERGE invocation must not be droppable in silence ──
+test("the ci-main fixture is wired (baseline for the post-merge RED cases)", () => {
+  const findings = ciMainFindings(FIXTURE_CI_MAIN);
+  assert.deepEqual(findings, [], `fixture must be wired:\n  ${findings.join("\n  ")}`);
+});
+test("deleting the ci-main post-merge invocation is RED (#675 P1-5)", () => {
+  const dropped = mutate(
+    FIXTURE_CI_MAIN,
+    "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n",
+    ""
+  );
+  const findings = ciMainFindings(dropped);
+  assert.ok(findings.length > 0, "expected a finding when the post-merge invocation is deleted");
+  assert.ok(
+    findings.some((m) => m.includes("check-pi-pin-lockstep.mjs")),
+    `expected a finding naming the suite; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("losing the ci-main failure accumulator is RED (#675 P1-5)", () => {
+  const bare = mutate(
+    FIXTURE_CI_MAIN,
+    "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))",
+    "        node scripts/check-pi-pin-lockstep.mjs"
+  );
+  const findings = ciMainFindings(bare);
+  assert.ok(findings.length > 0, "expected a finding when the accumulator is dropped");
+  assert.ok(
+    findings.some((m) => m.includes("accumulates its failure")),
+    `expected the accumulator finding; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("a ci-main `echo` mentioning the suite is not an invocation (#675 P1-5)", () => {
+  const onlyEcho = mutate(
+    FIXTURE_CI_MAIN,
+    "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n",
+    ""
+  );
+  // the remaining `echo "== scripts/check-pi-pin-lockstep.mjs =="` line must not
+  // satisfy the invocation check
+  const findings = ciMainFindings(onlyEcho);
+  assert.ok(
+    findings.some((m) => m.includes("exactly once")),
+    `an echo line must not count as an invocation; got:\n  ${findings.join("\n  ")}`
+  );
+});
+
 // ── (k) workflow-yaml reader — subset behaviour & fail-closed bounds ───────
 // The reader (scripts/workflow-yaml.mjs) is the only new surface guard (j) leans
 // on, so its subset contract is asserted here directly: the constructs the guard
@@ -1061,18 +1552,71 @@ test("fail-closed: duplicate keys, multi-document streams, invalid block headers
   assert.ok(throws("a: | extra\n  body\n"), "invalid block header");
 });
 
+// #675 P1-1 — escapes. Decoding is a correctness requirement (the guard reads
+// KEYS out of quoted scalars), and anything unmodelled must THROW.
+test("double-quote escapes are decoded and unmodelled ones THROW (fail-closed)", () => {
+  assert.deepEqual(parseWorkflowYaml('"paths\\u002dignore":\n  - "*.md"\n'), {
+    "paths-ignore": ["*.md"],
+  });
+  assert.deepEqual(parseWorkflowYaml('a: "x\\ty"\n'), { a: "x\ty" });
+  assert.deepEqual(parseWorkflowYaml('n: {"a\\u002db": 1}\n'), { n: { "a-b": "1" } });
+  assert.deepEqual(parseWorkflowYaml('q: "a\\\\b"\n'), { q: "a\\b" });
+  assert.deepEqual(parseWorkflowYaml('r: ["p\\u002dignore", x]\n'), { r: ["p-ignore", "x"] });
+  assert.ok(throws('a: "x\\qy"\n'), "unmodelled escape");
+  assert.ok(throws('a: "x\\u12"\n'), "short \\u escape");
+  assert.ok(throws('a: "x\\uZZZZ"\n'), "non-hex \\u escape");
+  assert.ok(throws('a: "x\\U00110000"\n'), "out-of-range \\U escape");
+  assert.ok(throws('a: ["x\\q"]\n'), "unmodelled escape inside a flow sequence");
+});
+
+// #675 P2-4 — block-scalar indentation comes from the FIRST content line.
+test("a block scalar dedented below its first content line THROWS", () => {
+  assert.ok(throws("run: |\n    a\n  b\n"), "dedent below the first content line");
+  assert.deepEqual(parseWorkflowYaml("run: |2\n    a\n  b\n"), { run: "  a\nb" });
+});
+
+// #675 P2-3 — the trailing-newline trim was quadratic on a long blank-line run
+// (120 KB crafted input → 41 s of CI, PR-controlled). A generous wall-clock
+// bound is the only way a unit test can catch a reintroduction; the linear form
+// finishes this in single-digit milliseconds.
+test("a large interior blank-line run parses in linear time (no quadratic trim)", () => {
+  const blankLines = 20000;
+  const src =
+    "name: X\nrun-name: |\n  content\n" + "\n".repeat(blankLines) + "  content\njobs:\n  ci:\n    uses: x\n";
+  const started = Date.now();
+  const doc = parseWorkflowYaml(src);
+  const elapsed = Date.now() - started;
+  assert.equal(doc.name, "X");
+  assert.ok(doc["run-name"].startsWith("content"), "body keeps its first content line");
+  assert.ok(doc["run-name"].endsWith("content"), "body keeps its last content line");
+  assert.ok(
+    Object.hasOwn(doc.jobs, "ci"),
+    "the mapping after the block scalar is still parsed"
+  );
+  assert.ok(
+    elapsed < 5000,
+    `expected a linear parse of ${blankLines} blank lines, took ${elapsed}ms ` +
+      "(the removed quadratic trim took ~8s+)"
+  );
+});
+
 test("the live workflow corpus parses (the subset is adequate for this repo)", () => {
+  // #675 P2-6 — per-directory floors, not one loose total: the live corpus is
+  // 8 + 4, and a single `>= 8` total let a 33% shrink (one directory emptied)
+  // pass. Growth is fine; a silently emptied directory is not.
   const dirs = [
-    path.join(REPO_ROOT, ".github", "workflows"),
-    path.join(REPO_ROOT, "templates", ".github", "workflows"),
+    { dir: path.join(REPO_ROOT, ".github", "workflows"), min: 8 },
+    { dir: path.join(REPO_ROOT, "templates", ".github", "workflows"), min: 4 },
   ];
   const files = [];
-  for (const dir of dirs) {
-    for (const name of fs.readdirSync(dir)) {
-      if (name.endsWith(".yml")) files.push(path.join(dir, name));
-    }
+  for (const { dir, min } of dirs) {
+    const names = fs.readdirSync(dir).filter((name) => name.endsWith(".yml"));
+    assert.ok(
+      names.length >= min,
+      `expected at least ${min} workflows in ${path.relative(REPO_ROOT, dir)}, found ${names.length}`
+    );
+    for (const name of names) files.push(path.join(dir, name));
   }
-  assert.ok(files.length >= 8, `expected the workflow corpus, found ${files.length} files`);
   const failures = [];
   for (const file of files) {
     try {
@@ -1085,7 +1629,20 @@ test("the live workflow corpus parses (the subset is adequate for this repo)", (
   assert.deepEqual(failures, [], "every committed workflow must be inside the reader's subset");
 });
 
+// #675 P1-3 — a LOWER BOUND on the passing count. Guards (h)/(i) now carry their
+// own positive controls, but a wholesale DELETION of a rule's test (the suite
+// silently shrinking — 52 → 50 did pre-fix) must also be red. This is a floor,
+// not an equality: adding tests never needs an update; deleting one does.
+const MIN_EXPECTED_PASSING = 71;
 console.log(`\ncheck-pi-pin-lockstep.mjs: ${passed} passed, ${failed} failed`);
+if (failed === 0 && passed < MIN_EXPECTED_PASSING) {
+  failed++;
+  console.error(
+    `❌ only ${passed} passing tests — expected at least ${MIN_EXPECTED_PASSING}. ` +
+      "A guard's test (or a whole section) was deleted or stopped running; restore it or " +
+      "update MIN_EXPECTED_PASSING deliberately."
+  );
+}
 if (failed > 0) {
   console.error("❌ SOME TESTS FAILED");
   process.exit(1);

@@ -30,18 +30,26 @@ jobs:
       # introduces it. Both suites are node-stdlib-only (no npm ci, no extension
       # devDeps): ~4s of work plus one ubuntu-latest runner per PR.
       # #666 split the pin guards into their own suite (scripts/
-      # check-pi-pin-lockstep.mjs) so a pin-drift failure and a #254 frontmatter
-      # regression get separate red signals; both are chained here so the split
-      # cannot leave the pin guards unwired by accident. `&&` (not a second
-      # input) keeps the `with:` key set at exactly one input — guard (j)
-      # asserts both the key set and this exact command string.
+      # check-pi-pin-lockstep.mjs). HONEST SCOPE (#675 P2-2): the split does NOT
+      # create a separate check context — both suites still share the one
+      # `ci / unit-test` signal, and the two failure modes are distinguishable in
+      # that job's LOG only (a separate context is issue #673). A single `with:`
+      # input (`test-command`) is what keeps the `with:` key set at exactly one,
+      # which guard (j) asserts along with this exact command string.
+      # The accumulator below (not `&&`) is deliberate: `&&` short-circuits, so a
+      # #254 frontmatter-validator failure would skip the pin suite entirely and
+      # its verdict would never be produced for that PR. The `|| … || …` form
+      # (rather than `cmd; a=$?;`) is required because the runner's default Linux
+      # shell is `bash -e {0}`: under `set -e` a bare failing `node` aborts the
+      # script before `a=$?` runs, reintroducing the short-circuit. Both suites
+      # always run; the step still fails if either did.
       # NOTE: this makes the checks CI-VISIBLE on every PR, not merge-blocking —
       # the repo's only required status check is pipeline-compliance (#646).
       # ⚠️ This value is PINNED by check-pi-pin-lockstep.mjs (guard (j)): it must
       # be EXACTLY this invocation — a suffix or shell wrapper fails the pin
       # gate. The #744 module-load suite therefore runs as its own step in the
       # `verify` job below, not here.
-      test-command: node scripts/check-skill-lint.test.mjs && node scripts/check-pi-pin-lockstep.mjs
+      test-command: a=0; node scripts/check-skill-lint.test.mjs || a=$?; b=0; node scripts/check-pi-pin-lockstep.mjs || b=$?; [ $a -eq 0 ] && [ $b -eq 0 ]
 
   drift-check:
     # #305 — self-test of the drift-check CI gate. agent-infra's own checkout
@@ -153,7 +161,8 @@ jobs:
         # classify-git.mjs DIRECTLY, and the extensions/*/test*.mjs glob is
         # post-merge only (ci-main.yml). Its own step here, not a second
         # `test-command` line above — that value is pinned by
-        # check-skill-lint.test.mjs (section j) to exactly one invocation.
+        # check-pi-pin-lockstep.mjs (guard (j)) to exactly this one accumulator
+        # invocation.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~30s.
         run: node extensions/main-worktree-guard/test-module-load.mjs
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)

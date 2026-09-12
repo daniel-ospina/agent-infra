@@ -3,9 +3,11 @@
  * check-skill-lint.test.mjs — CI suite for the #254 frontmatter validator. No pi
  * import (the dev oracle test owns pi parity). Single-purpose as of #666: the
  * #637 pi-pin lockstep tripwires (h)/(i)/(j) were extracted into
- * scripts/check-pi-pin-lockstep.mjs (plan alternative F) so a frontmatter
- * validator regression and a pin-drift failure no longer share one red signal.
- * Both suites are chained in .github/workflows/ci.yml's `test-command`.
+ * scripts/check-pi-pin-lockstep.mjs (plan alternative F). Both suites are run by
+ * ONE `ci.yml` `test-command` (a failure accumulator), so they still share a
+ * single `ci / unit-test` signal — the split makes a validator regression and a
+ * pin-drift failure distinguishable in that job's LOG, and guarantees both
+ * always run, but a separate check CONTEXT is #673.
  *
  * Run: node scripts/check-skill-lint.test.mjs
  *

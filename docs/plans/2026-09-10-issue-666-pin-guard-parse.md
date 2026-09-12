@@ -76,8 +76,9 @@ alternative F) as the durable fix.
   §Accepted bounds — none is claimed closed.
 
 **Open decision 2 (split first, or fold it in):** split first, in the same PR but as an independently
-reviewable change — the extraction is mechanical (the three `test()` bodies move verbatim) and the
-parser rewrite is then reviewable against a stable file.
+reviewable change. Guards `(h)` and `(i)` moved verbatim (their `test()` bodies are byte-identical to the
+source suite's); guard `(j)` did **not** — its text-matching implementation was rewritten to node reads in
+the same commit, so the wiring guard is reviewed as new code, not as a mechanical move (#675 P2-8).
 
 **Open decision 3 (scope of what to parse):** only `ci.yml` + `node-ci.yml` are *asserted*. The reader is
 generic, and its corpus test parses all twelve committed workflows (a subset-adequacy test, not eight
@@ -88,9 +89,9 @@ new guards).
 | File | Change |
 |---|---|
 | `scripts/workflow-yaml.mjs` | **NEW** — dep-free YAML-subset reader, fail-closed; supported subset + bounds documented in the header. Exports `parseWorkflowYaml(src)` and `WorkflowYamlError`. |
-| `scripts/check-pi-pin-lockstep.mjs` | **NEW** — single-purpose suite holding guards `(h)` (extension pi-package pins), `(i)` (mirror version stamps) and `(j)` (per-PR wiring), plus the reader's subset tests. Same harness conventions as the source suite (`node:assert`, custom `test()`/`section()`, ✅/❌ markers, `process.exit(1)`). |
+| `scripts/check-pi-pin-lockstep.mjs` | **NEW** — single-purpose suite holding guards `(h)` (extension pi-package pins), `(i)` (mirror version stamps), `(j)` (per-PR **and** post-merge wiring), plus the reader's subset tests. Same harness conventions as the source suite (`node:assert`, custom `test()`/`section()`, ✅/❌ markers, `process.exit(1)`). |
 | `scripts/check-skill-lint.test.mjs` | `(h)`/`(i)`/`(j)` + their normalizer helpers removed (422 lines); header rewritten to state the reduced scope and where the pin guards live. 163 → **160/160**. |
-| `.github/workflows/ci.yml` | `test-command` is now `node scripts/check-skill-lint.test.mjs && node scripts/check-pi-pin-lockstep.mjs` (no `${{ }}`, per the documented `test-command` constraint); comment updated. Nothing was added to `with:`, so its key set stays exactly `["test-command"]`. |
+| `.github/workflows/ci.yml` | `test-command` is now `a=0; node scripts/check-skill-lint.test.mjs \|\| a=$?; b=0; node scripts/check-pi-pin-lockstep.mjs \|\| b=$?; [ $a -eq 0 ] && [ $b -eq 0 ]` (no `${{ }}`, per the documented `test-command` constraint); comment updated. Nothing was added to `with:`, so its key set stays exactly `["test-command"]`. |
 | `.github/workflows/ci-main.yml` | the post-merge `extension-tests` accumulator runs the new suite too — the extraction must not silently drop the post-merge half of #637's contract. |
 | `docs/plans/2026-09-10-issue-666-pin-guard-parse.md` | this plan. |
 
@@ -112,15 +113,32 @@ Two deliberate semantics decisions, stated rather than hidden:
 - `continue-on-error` is reported only when it can be **truthy**; the literal `false` is a no-op and is
   accepted (it is a semantics-preserving edit, and flagging it with a "could fail silently" message
   would be an overclaim). `no`/`off`/`0` are reported — the reader does not resolve YAML scalar types.
+  **Confirmed safe (#675 P3):** the reader cannot distinguish the boolean `false` from the quoted
+  string `"false"`, but it does not need to — the canonical workflow schema types `continue-on-error`
+  as a **boolean** at both levels (`actions/languageservices`
+  `workflow-parser/src/workflow-v1.0.json`: `boolean-strategy-context` for `job`,
+  `step-continue-on-error` for steps; the `actions/runner` `src/Sdk/DTPipelines/workflow-v1.0.json`
+  copy is the same), and the runner-side converter asserts it
+  (`PipelineTemplateConverter.ConvertToStepContinueOnError` → `AssertBoolean`). A quoted `"false"` is
+  therefore a workflow-validation error, not a truthy coercion, so the job level is no weaker than the
+  step level.
 - an `if:` on the **callee** `unit-test` job is required (exact predicate); an `if:` on the **caller**
   `ci:` job is forbidden (any predicate can skip the reusable-workflow call).
 
 ### Split — wiring kept on both paths
 
-`ci.yml` passes both suites in one `test-command` (the `&&` form the issue offers — it keeps the `with:`
-key set at exactly one input, which `(j)` itself asserts). `ci-main.yml` gained the new suite in its
-post-merge accumulator. `(j)`'s expectations were updated to the chained command, which is what makes
-"the split cannot leave the pin guards unwired by accident" checkable rather than aspirational.
+`ci.yml` passes both suites in one `test-command` — a **failure accumulator**
+(`a=0; node … || a=$?; b=0; node … || b=$?; [ $a -eq 0 ] && [ $b -eq 0 ]`), not `&&`. `&&` short-circuits,
+so a #254 frontmatter-validator failure would skip the pin suite entirely and its verdict would never be
+produced for that PR (#675 P2-2). The `||` form rather than `cmd; a=$?;` is required because the
+runner's default Linux shell is `bash -e {0}`: under `set -e` a bare failing `node` aborts the script
+before `a=$?` runs, which reintroduces exactly the short-circuit. One `with:` input is what keeps the key
+set at exactly one, which `(j)` itself asserts. `ci-main.yml` runs the new suite in its post-merge
+accumulator, and `(j)` asserts **both** wiring paths — the per-PR `test-command` string **and** a
+post-merge `node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))` line read from
+`ci-main.yml`'s `extension-tests` job (#675 P1-5) — so "the split cannot leave the pin guards unwired by
+accident" is checkable rather than aspirational. The suite header states plainly that both suites still
+share one `ci / unit-test` signal (distinguishable in the log only; a separate check context is #673).
 
 ### Accepted bounds (unchanged or narrowed — none claimed closed)
 
@@ -138,23 +156,33 @@ post-merge accumulator. `(j)`'s expectations were updated to the chained command
 
 | Surface | Test layer | Verification | Result |
 |---|---|---|---|
-| `(h)` pins | unit + negative | `node scripts/check-pi-pin-lockstep.mjs`; mutation: drift one extension pin → RED | ✅ 49/49; RED (ported from #637, re-run) |
-| `(i)` mirror stamps | unit + negative | same suite; mutation: stale a mirror stamp → RED | ✅ RED (ported from #637, re-run) |
-| decoy dead step | unit | fixture test — the real step carries `\|\| true`, a dead step carries the clean `run:` text → RED | ✅ RED ("step-level `run:` set changed") |
-| decoy inside a block scalar | unit | fixture test — a `test-command:` line in a job-level `NOTES: \|` body cannot satisfy the binding check → RED | ✅ RED ("`test-command` must be exactly") |
-| decoy job inside a scalar | unit | fixture test — a fake `ci:` job inside `run-name: \|` cannot hide the real job's `if:` → RED | ✅ RED ("gained an `if:`") |
-| decoy comment line | unit | fixture test — `# historical: run: …` carries no node → RED | ✅ RED |
-| valid reformats | unit | flow `on: [pull_request]`, scalar `on:`, quoted keys, trailing/full-line comments, whole-file reindent, a `with:` reindented with its job subtree, parent-indent steps, block-scalar `run:`, block-scalar `test-command:`, unrelated `workflow_dispatch.inputs.paths`, `continue-on-error: false`, `run-name: \|` + `concurrency:` → all GREEN | ✅ 12/12 GREEN (the 12 `expectWired` cases in this row) |
-| reader subset | unit | subset parses + fail-closed throws (tabs, anchors/aliases/tags, `- - x`, multi-line plain scalars, duplicate keys, multi-doc, bad block header) + full corpus parse | ✅ 9/9 |
-| wiring | integration | `(j)` asserts the chained `test-command`; the live per-PR proof is the PR's `ci / unit-test` showing **run** (not skipping) | ⏳ PR-run proof (Verification step 6) |
-| split | unit | `check-skill-lint.test.mjs` 160/160 (163 minus the 3 moved tests) **and** the new suite standalone 49/49 | ✅ both |
+| `(h)` pins | unit + negative + **positive control** | `node scripts/check-pi-pin-lockstep.mjs`; mutation: drift one extension pin → RED; `pinFindings(entries, wrongPin)` → non-empty | ✅ 2 cases; RED (ported from #637, re-run); the positive control REDs a neutered comparison (#675 P1-3) |
+| `(i)` mirror stamps | unit + negative + **positive control** | same suite; mutation: stale a mirror stamp → RED; `stampFindings([…], wrongPin)` → non-empty; a version literal outside stamp context is not a stamp | ✅ 2 cases; RED (ported from #637, re-run); positive control REDs a neutered comparison (#675 P1-3) |
+| decoys / reader-bypass attempts | unit | a dead step carrying the clean `run:` text, a `test-command:` line in a block-scalar body, a job-shaped block inside a YAML scalar, a decoy comment line, an unanchored `uses:` substring → all RED | ✅ 5 cases RED |
+| caller-job / binding bypasses | unit | `ci:` job gains `if:`/`needs:`/`continue-on-error :`; emptied / `\|\| true`-wrapped / shortened `test-command`; extra `with:` key → all RED | ✅ 7 cases RED |
+| trigger bypasses | unit | trigger no longer `pull_request`; `pull_request:`-in-a-scalar; `pull_request:`-in-another-mapping; quoted / flow `paths-ignore`; `on: [push]` → all RED | ✅ 6 cases RED |
+| callee job / step bypasses | unit | unsatisfiable `unit-test` predicate; rewired step predicate; `\|\| true` in the step `run:`; step / job `continue-on-error : true`; job `needs:`; renamed `test-command` input → all RED | ✅ 7 cases RED |
+| escape-decoded guarded keys (#675 P1-1) | unit | `"paths\u002dignore"`, `"i\u0066"`, `"continu\u0075e-on-error"` decode to the real keys → guard (j) RED; an unmodelled escape THROWS | ✅ 3 cases RED + reader assertions |
+| step execution shell / job defaults (#675 P1-2) | unit | `shell: 'true {0}'` on the custom-test step and `defaults.run.shell` on `unit-test` → RED; explicit `shell: bash` → GREEN | ✅ 2 RED + 1 GREEN |
+| empty matrix (#675 P2-5) | unit | `strategy.matrix.os: []` and `strategy.matrix.include: []` → RED; a non-empty matrix → GREEN | ✅ 2 RED + 1 GREEN |
+| post-merge wiring (#675 P1-5) | unit | `ci-main.yml`'s `extension-tests` `test-command` must invoke the suite with the failure accumulator; deleting the line, or dropping the accumulator → RED; an `echo` naming the suite is not an invocation; plus the live-file assertion | ✅ 2 RED + 1 baseline + 2 live assertions |
+| valid reformats | unit | flow `on: [pull_request]`, scalar `on:`, empty `pull_request: {}`, quoted keys, trailing/full-line comments, whole-file reindent, a `with:` reindented with its job subtree, parent-indent steps, block-scalar `run:`, block-scalar `test-command:`, unrelated `workflow_dispatch.inputs.paths`, `continue-on-error: false`, `run-name: \|` + `concurrency:`, a non-empty `strategy.matrix`, an explicit `shell: bash` → all GREEN | ✅ 15/15 GREEN (the 15 `expectWired` cases) |
+| reader subset & bounds | unit | subset parses + fail-closed throws (tabs, anchors/aliases/tags, `- - x`, multi-line plain scalars, duplicate keys, multi-doc, bad block header, unmodelled `\u` escape, a block scalar dedented below its first content line) + **escape decoding** + a 20 000-blank-line body parses in linear time (#675 P2-3) | ✅ 12/12 |
+| reader corpus | unit | the live corpus parses, with **per-directory floors** (`.github/workflows` ≥ 8, `templates/.github/workflows` ≥ 4) rather than one loose total (#675 P2-6) | ✅ |
+| wiring | integration | `(j)` asserts the accumulator `test-command` (per-PR) **and** the ci-main.yml post-merge invocation; the live proof is the PR's `ci / unit-test` showing **run** (not skipping) | ⏳ PR-run proof (Verification step 7) |
+| split | unit | `check-skill-lint.test.mjs` 160/160 (163 minus the 3 moved tests) **and** the new suite standalone 71/71 | ✅ both |
 | workflow YAML validity | static | `bash scripts/check-workflow-actionlint.sh` + `bash tests/actionlint/run.sh` | ✅ exit 0 |
+
+**Case census (reconciled with the run output, #675 P1-6):** 71 tests = 23 plain `test()` (2 `(h)` + 2 `(i)`
++ 2 live wiring + 2 fixture baselines + 3 ci-main post-merge RED + 12 reader) + 15 `expectWired` + 33
+`expectRed`. The 33 RED cases group as 5 decoys + 7 caller/binding + 6 trigger + 7 callee + 1
+reader-subset + 3 escape + 2 shell/defaults + 2 matrix.
 
 ## Verification plan
 
 1. `node scripts/check-skill-lint.test.mjs` → **160 passed, 0 failed** (was 163/163; the three moved
    tests account for the difference).
-2. `node scripts/check-pi-pin-lockstep.mjs` → **49 passed, 0 failed**.
+2. `node scripts/check-pi-pin-lockstep.mjs` → **71 passed, 0 failed**.
 3. `node scripts/check-skill-lint.oracle.test.mjs` → **146 passed, 0 failed, fuzz 0/1000**.
 4. `bash scripts/check-workflow-actionlint.sh` → exit 0 (workflows + templates, actionlint 1.7.12);
    `bash tests/actionlint/run.sh` → all cases pass.
@@ -164,23 +192,45 @@ post-merge accumulator. `(j)`'s expectations were updated to the chained command
 
    | Mutation of the live files | Verdict |
    |---|---|
-   | `ci.yml` `test-command` loses the new suite | ❌ RED — ``ci.yml `test-command` must be exactly "node scripts/check-skill-lint.test.mjs && node scripts/check-pi-pin-lockstep.mjs" … found "node scripts/check-skill-lint.test.mjs"`` |
+   | `ci.yml` `test-command` loses the new suite | ❌ RED — ``ci.yml `test-command` must be exactly "a=0; node scripts/check-skill-lint.test.mjs …" … found "node scripts/check-skill-lint.test.mjs"`` |
    | `node-ci.yml` step `run` gains `\|\| true` | ❌ RED |
    | `ci.yml` `pull_request` gains `paths-ignore` | ❌ RED |
    | `ci.yml` `ci:` job gains `if: github.event_name == 'push'` | ❌ RED |
    | `ci.yml` `ci:` job gains `"continue-on-error" : true` (quoted key, spaced colon) | ❌ RED |
+   | `ci-main.yml` loses the `node scripts/check-pi-pin-lockstep.mjs` accumulator line | ❌ RED (the post-merge assertion added by #675 P1-5) |
 
-   All five restored byte-identical (shasum-equal before/after), then the suite re-run green (49/49).
+   All six restored byte-identical (shasum-equal before/after), then the suite re-run green (71/71).
 7. PR opened on the branch; the per-PR `ci / unit-test` run must show **run** (not skipping) with the
-   chained command in the log — the only real proof the `test-command` binding resolves.
+   accumulator command in the log — the only real proof the `test-command` binding resolves.
+
+### #675 fix-cycle verification (before → after, every run executed)
+
+Each row was produced by running the pre-fix suite (HEAD scripts + HEAD workflows, in a throwaway
+checkout at `/tmp/old666`) and the fixed suite against the same mutation, then restoring the live file
+from a `cp` backup with a sha256 match check.
+
+| # | Mutation / scenario | Before (HEAD) | After (this revision) |
+|---|---|---|---|
+| P1-1 | `ci.yml` `pull_request:` gains `"paths\u002dignore"` | ✅ 52/52 GREEN — gate unplugged | ❌ RED: “`pull_request:` gained `paths-ignore:`” |
+| P1-2 | `node-ci.yml` custom step gains `shell: 'true {0}'` | ✅ 52/52 GREEN | ❌ RED: “sets `shell: "true {0}"` — a non-bash/sh shell can NO-OP the step” |
+| P1-3 | `(h)` comparison rewritten to `if (false)` | ✅ GREEN (mutation survived) | ❌ RED (positive control) |
+| P1-3 | `(i)` `offenders.push` deleted | ✅ GREEN (mutation survived) | ❌ RED (positive control) |
+| P1-3 | `(h)`+`(i)` `test()` calls deleted | ✅ GREEN at 50/52 | ❌ RED (floor: 69 < 71) |
+| P1-4 | `Requires Node 22.11.0 or newer.` appended to `docs/providers.md` | ❌ RED (false positive) | ✅ 71/71 GREEN |
+| P1-5 | `ci-main.yml` loses the post-merge invocation | ✅ 52/52 GREEN | ❌ RED: “must invoke … exactly once … found 0 such line(s)” |
+| P2-3 | ~120 KB block-scalar body (interior blank-line run) | 212 376 ms | 528 ms (linear) |
+
+Reader-level before/after for P1-1: HEAD's `parseWorkflowYaml('on: { pull_request: { "paths\u002dignore": … } }')`
+returns the key `pathsu002dignore`; the fixed reader returns `paths-ignore`.
 
 ## Acceptance criteria
 
 - [x] `(h)`, `(i)`, `(j)` live in `scripts/check-pi-pin-lockstep.mjs`, whose header states its scope.
 - [x] `check-skill-lint.test.mjs` passes 160/160 and no longer carries the pin guards or their
       normalizer.
-- [x] The new suite passes standalone (49/49) and is wired into **both** the per-PR path (`ci.yml`,
-      chained with `&&`) and the post-merge path (`ci-main.yml`) — `(j)` asserts the former.
+- [x] The new suite passes standalone (71/71) and is wired into **both** the per-PR path (`ci.yml`,
+      the failure accumulator) and the post-merge path (`ci-main.yml`, the accumulator line) — `(j)`
+      asserts **both** (`ci.yml`'s `test-command` and `ci-main.yml`'s invocation).
 - [x] `(j)`'s assertions read parsed nodes: no assertion infers a verdict from a raw line, and no
       message claims more than its assertion delivers (§Accepted bounds).
 - [x] A decoy dead step, a `test-command:` line inside another mapping's block scalar, a job-shaped
@@ -188,7 +238,8 @@ post-merge accumulator. `(j)`'s expectations were updated to the chained command
       plus the live-file mutation round above).
 - [x] Flow `on: [pull_request]`, a reindented `with:` (the whole-file reindent **and** a `with:`
       reindented with only its job subtree), a parent-indent step sequence, a block-scalar `run:`, a
-      block-scalar `test-command:` and quoted keys are all **GREEN**.
+      block-scalar `test-command:`, quoted keys, a non-empty `strategy.matrix` and an explicit
+      `shell: bash` are all **GREEN**.
 - [x] `node scripts/check-skill-lint.oracle.test.mjs` (146/146), `bash
       scripts/check-workflow-actionlint.sh` (exit 0) and `node scripts/ci-ref-check.test.mjs` (183/183)
       all pass.
@@ -197,20 +248,27 @@ post-merge accumulator. `(j)`'s expectations were updated to the chained command
 
 ## Review & negative-testing log
 
-- **VGATE** — four `[VGATE]` verification passes ran against successive revisions: pass 1 `PASS`
-  with two non-blocking label flags; passes 2 and 3 `FAIL` on a count/label claim in *this plan doc*
-  (24 vs 25 RED tests; a `13/13` label over a 12-case list); pass 4 `PASS`. Every flag was corrected
-  before the next pass, and each pass re-ran every command, attacked the reader with its own mutations
-  (block-scalar decoys, duplicate keys, unsupported constructs) and reported per-file sha256s. The
-  pre-commit `verification-gate` extension additionally required an in-band pass over the frozen
-  revision before the commit was allowed.
+- **VGATE** — `[VGATE]` verification passes ran against successive revisions of this branch. Each pass
+  re-ran every command, attacked the reader with its own mutations (block-scalar decoys, duplicate
+  keys, unsupported constructs) and reported per-file sha256s. The pre-commit `verification-gate`
+  extension additionally required an in-band pass over the frozen revision before the commit was
+  allowed. (The earlier revision-history detail — "24 vs 25 RED tests", "a `13/13` label over a
+  12-case list" — is not repeated here: the #675 review found the counts stale and they were corrected
+  against a fresh run, so recording earlier corrections that nothing in the shipped file reflects
+  would be an unsupported claim.)
 - **code-review gate** — not run: the session's task instructions scope this work to "push the branch
   and open a PR … do NOT merge", and the PR body carries no `review recorded:` line. The gate is a
   merge-time gate, so nothing ships unreviewed by opening the PR.
-- **negative testing** — 24 automated RED tests in the new suite (24 `expectRed` cases; the run
-  composition is 1 (h) + 1 (i) + 1 live-wiring + 1 fixture baseline + 12 GREEN reformats + 24 RED
-  bypasses + 9 reader = 49), plus the 5 live-file
-  mutations in §Verification plan step 6 (all restored byte-identical via `cp`, #664).
+- **negative testing** — 33 automated RED cases in the new suite (the 33 `expectRed` calls), plus 3
+  post-merge RED cases and 6 live-file mutations in §Verification plan step 6 (all restored
+  byte-identical via `cp`, #664). The run composition is reconciled in §Testing strategy (71 = 23 +
+  15 + 33).
+- **#675 review fixes (this revision)** — the escape-decoding bypass (P1-1), the `shell`/`defaults`
+  bypass (P1-2), the missing positive controls for `(h)`/`(i)` (P1-3), the whole-file stamp sweep
+  (P1-4), the unasserted post-merge wiring (P1-5), the stale counts in this doc (P1-6), the stale
+  "section j" references (P2-1), the `&&` short-circuit (P2-2), the quadratic block-scalar trim
+  (P2-3), the min-indent block scalar (P2-4), the empty matrix (P2-5), the corpus floor (P2-6), the
+  `mutate`-less fixture (P2-7) and the two overclaims above (P2-8).
 - **out-of-scope finding filed, not absorbed** — the split is check-opaque (both suites share one
   `test-command`), so pin drift is distinguishable in the log only; filed as **#673** rather than
   widening #666.

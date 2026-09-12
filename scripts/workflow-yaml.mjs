@@ -21,9 +21,17 @@
  *   - block sequences (`- item`, `- key: value` compact mappings, `-` + nested
  *     block), including a sequence indented at its parent key's column
  *   - flow sequences/mappings at value position (`[a, b]`, `{a: b}`), nested
- *   - single-line plain and single/double-quoted scalars
+ *   - single-line plain and single/double-quoted scalars, with the FULL YAML
+ *     double-quote escape set decoded (`\0 \a \b \t \n \v \f \r \e \" \/ \\
+ *     \N \_ \L \P \xXX \uXXXX \UXXXXXXXX`); any other escape THROWS. Decoding
+ *     is load-bearing, not cosmetic — `"paths\u002dignore"` is the key
+ *     `paths-ignore` to GitHub, so copying the escaped character through
+ *     verbatim (the pre-#675 behaviour) was a silent guard bypass (#675 P1-1)
  *   - block scalars (`key: |`, `key: >`, `+`/`-`/digit chomping indicators) —
- *     the body is read as raw text and NEVER interpreted as structure
+ *     the body is read as raw text and NEVER interpreted as structure. The
+ *     block indentation is taken from the FIRST non-empty body line (or the
+ *     explicit digit indicator, when present); a later non-blank line that
+ *     dedents below it THROWS, because YAML itself rejects that (#675 P2-4)
  *   - full-line and trailing `#` comments (quote-aware)
  *   - an optional leading `---` document start
  *
@@ -32,6 +40,10 @@
  * is a tripwire, so a loud red that says "extend the reader deliberately" is
  * correct, while a silently mis-read workflow is exactly the bug class (#637's
  * decoy bypasses) this file exists to kill.
+ *
+ * COST BOUND: every scan is single-pass over its input (no backtracking regex on
+ * unbounded newline runs) — the guard reads PR-controlled files, so a quadratic
+ * path is a CI DoS, even though it stays fail-closed (#675 P2-3).
  *
  * KNOWN NON-GOALS (documented, not silently fudged):
  *   - scalar TYPES are not resolved: every scalar is a string, so `on` is always
@@ -88,17 +100,62 @@ function stripComment(s) {
  * Scan a quoted scalar starting at text[start] (the opening quote).
  * → {value, end} on success, null when the quote is not closed on this line.
  */
-function scanQuoted(text, start = 0) {
+function scanQuoted(text, start = 0, line) {
   const q = text[start];
   let out = "";
   for (let i = start + 1; i < text.length; i++) {
     const c = text[i];
-    if (q === '"' && c === "\\") { out += text[i + 1] ?? ""; i++; continue; }
+    if (q === '"' && c === "\\") {
+      const esc = decodeEscape(text, i, line);
+      out += esc.value;
+      i = esc.next - 1;
+      continue;
+    }
     if (q === "'" && c === "'" && text[i + 1] === "'") { out += "'"; i++; continue; }
     if (c === q) return { value: out, end: i + 1 };
     out += c;
   }
   return null;
+}
+
+// The YAML double-quote escape set (YAML 1.2 §5.7, ns-esc-char). The guard reads
+// KEYS out of quoted scalars, so decoding these faithfully is a correctness
+// requirement, not a nicety: `"paths\u002dignore"` IS the key `paths-ignore` to
+// GitHub. An escape outside the set is REJECTED, never passed through and never
+// guessed at — same fail-closed direction as the rest of the reader.
+const SIMPLE_ESCAPES = new Map([
+  ["0", "\0"], ["a", "\x07"], ["b", "\b"], ["t", "\t"], ["\t", "\t"], ["n", "\n"],
+  ["v", "\v"], ["f", "\f"], ["r", "\r"], ["e", "\x1b"], [" ", " "], ['"', '"'],
+  ["/", "/"], ["\\", "\\"], ["N", "\u0085"], ["_", "\u00a0"], ["L", "\u2028"], ["P", "\u2029"],
+]);
+
+/**
+ * Decode the escape that starts at `text[i]` (which must be `\`).
+ * → { value, next } where `next` is the index just past the escape sequence.
+ *
+ * @throws {WorkflowYamlError} on a truncated, malformed or unmodelled escape.
+ */
+function decodeEscape(text, i, line) {
+  const c = text[i + 1];
+  if (c === undefined) {
+    throw new WorkflowYamlError("a double-quoted scalar ends with a dangling `\\`", line);
+  }
+  if (SIMPLE_ESCAPES.has(c)) return { value: SIMPLE_ESCAPES.get(c), next: i + 2 };
+  if (c === "x" || c === "u" || c === "U") {
+    const width = c === "x" ? 2 : c === "u" ? 4 : 8;
+    const hex = text.slice(i + 2, i + 2 + width);
+    if (hex.length !== width || !/^[0-9A-Fa-f]+$/.test(hex)) {
+      throw new WorkflowYamlError(`malformed \\${c} escape in a double-quoted scalar`, line);
+    }
+    const cp = parseInt(hex, 16);
+    if (cp > 0x10ffff) throw new WorkflowYamlError(`\\${c} escape is above the Unicode range`, line);
+    return { value: String.fromCodePoint(cp), next: i + 2 + width };
+  }
+  throw new WorkflowYamlError(
+    `unsupported escape \\${c} in a double-quoted scalar — this reader models the YAML ` +
+      "double-quote escape set (\\0 \\a \\b \\t \\n \\v \\f \\r \\e \\\" \\/ \\\\ \\N \\_ \\L \\P \\xXX \\uXXXX \\UXXXXXXXX)",
+    line
+  );
 }
 
 // Plain keys this reader accepts. Deliberately excludes quotes and flow/comment
@@ -111,10 +168,10 @@ const PLAIN_KEY_RE = /^[A-Za-z0-9_][A-Za-z0-9_.\/-]*$/;
  * Quoted keys are dequoted, so `"paths-ignore":` and `paths-ignore:` are the
  * same key — the generation-2 bypass that quoted keys defeated.
  */
-function parseKey(text) {
+function parseKey(text, line) {
   const first = text[0];
   if (first === '"' || first === "'") {
-    const scanned = scanQuoted(text, 0);
+    const scanned = scanQuoted(text, 0, line);
     if (!scanned) return null;
     const tail = text.slice(scanned.end);
     const m = /^[ \t]*:/.exec(tail);
@@ -159,7 +216,7 @@ function flowEnd(text) {
 }
 
 /** Split flow-collection inner text on top-level commas (quote/nesting aware). */
-function splitFlowItems(inner) {
+function splitFlowItems(inner, line) {
   const items = [];
   let depth = 0;
   let buf = "";
@@ -167,8 +224,17 @@ function splitFlowItems(inner) {
   for (let i = 0; i < inner.length; i++) {
     const c = inner[i];
     if (q) {
+      if (q === '"' && c === "\\") {
+        // Validate (and skip) the escape without decoding it: the raw text is
+        // kept so `scanQuoted` decodes it exactly once. An escape this reader
+        // does not model is rejected here too — it must not be able to smuggle
+        // a `,`/quote past the splitter (#675 P1-1).
+        const esc = decodeEscape(inner, i, line);
+        buf += inner.slice(i, esc.next);
+        i = esc.next - 1;
+        continue;
+      }
       buf += c;
-      if (q === '"' && c === "\\") { buf += inner[i + 1] ?? ""; i++; continue; }
       if (q === "'" && c === "'" && inner[i + 1] === "'") { buf += "'"; i++; continue; }
       if (c === q) q = null;
       continue;
@@ -188,7 +254,7 @@ function parseFlowEntry(text, line) {
   const t = text.trim();
   if (t === "") return null;
   if (t[0] === '"' || t[0] === "'") {
-    const s = scanQuoted(t, 0);
+    const s = scanQuoted(t, 0, line);
     if (!s || t.slice(s.end).trim() !== "") {
       throw new WorkflowYamlError("flow entry is not a single-line quoted scalar", line);
     }
@@ -204,13 +270,13 @@ function parseFlow(text, line) {
   if (end === -1) throw new WorkflowYamlError("unbalanced flow collection", line);
   const open = text[0];
   const inner = text.slice(1, end);
-  const rawItems = splitFlowItems(inner).map((s) => s.trim()).filter((s) => s !== "");
+  const rawItems = splitFlowItems(inner, line).map((s) => s.trim()).filter((s) => s !== "");
   if (open === "[") {
     return { value: rawItems.map((s) => parseFlowEntry(s, line)), end: end + 1 };
   }
   const entries = [];
   for (const item of rawItems) {
-    const key = parseKey(item);
+    const key = parseKey(item, line);
     if (!key) throw new WorkflowYamlError(`flow mapping entry is not a \`key: value\` pair: ${JSON.stringify(item)}`, line);
     entries.push([key.name, key.rest.trim() === "" ? null : parseFlowEntry(key.rest, line)]);
   }
@@ -222,7 +288,7 @@ function parseScalarText(text, line) {
   const t = text.trim();
   if (t === "") return null;
   if (t[0] === '"' || t[0] === "'") {
-    const s = scanQuoted(t, 0);
+    const s = scanQuoted(t, 0, line);
     if (!s) throw new WorkflowYamlError("unterminated quoted scalar (multi-line quoted scalars are outside the supported subset)", line);
     if (t.slice(s.end).trim() !== "") throw new WorkflowYamlError("unexpected content after a quoted scalar", line);
     return s.value;
@@ -260,24 +326,44 @@ function splitLines(src) {
  * to (or past) the parent key's column. Body lines are NEVER tokenized — that is
  * what makes a decoy `test-command:`/`jobs:` inside a scalar inert.
  */
-function consumeBlockBody(lines, start, parentIndent) {
+function consumeBlockBody(lines, start, parentIndent, explicitIndent = null) {
   let j = start;
   let lastContent = start - 1;
+  // YAML takes the block's indentation from the FIRST non-empty line (or an
+  // explicit digit indicator). Stripping the MINIMUM indent instead (#675 P2-4)
+  // silently accepted a later line dedented below the first — valid YAML rejects
+  // that, so a document this reader cannot model must throw, not be guessed at.
+  let indent = explicitIndent;
   while (j < lines.length) {
-    if (lines[j].content.trim() === "") { j++; continue; }
-    if (lines[j].indent <= parentIndent) break;
+    const l = lines[j];
+    if (l.content.trim() === "") { j++; continue; }
+    if (l.indent <= parentIndent) break;
+    if (indent === null) {
+      indent = l.indent;
+    } else if (l.indent < indent) {
+      throw new WorkflowYamlError(
+        "a block-scalar body line is indented less than the block's first content line — YAML " +
+          "derives the block indentation from that first non-empty line, so this document is not " +
+          "valid YAML (extend this reader deliberately if an exotic indentation form is needed)",
+        l.no
+      );
+    }
     lastContent = j;
     j++;
   }
-  const slice = lines.slice(start, lastContent + 1);
-  const indents = slice.filter((l) => l.content.trim() !== "").map((l) => l.indent);
-  const min = indents.length ? Math.min(...indents) : 0;
-  const body = slice
-    .map((l) => (l.content.trim() === "" ? "" : " ".repeat(Math.max(0, l.indent - min)) + l.content.trimEnd()))
-    .join("\n")
-    .replace(/^\n+/, "")
-    .replace(/\n+$/, "");
-  return { text: body, next: lastContent + 1 };
+  const base = indent ?? 0;
+  const joined = lines
+    .slice(start, lastContent + 1)
+    .map((l) => (l.content.trim() === "" ? "" : " ".repeat(Math.max(0, l.indent - base)) + l.content.trimEnd()))
+    .join("\n");
+  // Linear trims. This was a quadratic regex on a body with a long interior
+  // blank-line run — a crafted ~120 KB workflow file burned minutes of CI in the pre-fix reader
+  // (measured 212 s; #675 P2-3).
+  let from = 0;
+  while (from < joined.length && joined[from] === "\n") from++;
+  let to = joined.length;
+  while (to > from && joined[to - 1] === "\n") to--;
+  return { text: joined.slice(from, to), next: lastContent + 1 };
 }
 
 /** `key: <value>` at column keyCol → token + the index to continue from. */
@@ -287,7 +373,10 @@ function tokenizeKeyValue(key, keyCol, lineNo, lines, next) {
     if (!/^[|>][+-]?[0-9]?$/.test(valueText)) {
       throw new WorkflowYamlError(`invalid block scalar header ${JSON.stringify(valueText)}`, lineNo);
     }
-    const body = consumeBlockBody(lines, next, keyCol);
+    // An explicit digit indicator gives the content indentation as an offset
+    // from the parent node; honour it so `|2` is not spuriously rejected.
+    const digit = /[0-9]/.exec(valueText);
+    const body = consumeBlockBody(lines, next, keyCol, digit ? keyCol + Number(digit[0]) : null);
     return { token: { kind: "key", name: key.name, indent: keyCol, no: lineNo, value: { kind: "block", text: body.text } }, next: body.next };
   }
   if (valueText === "") {
@@ -324,7 +413,7 @@ function tokenize(lines) {
       if (rest === "-" || rest.startsWith("- ")) {
         throw new WorkflowYamlError("an inline nested sequence (`- - …`) is outside the supported subset", l.no);
       }
-      const key = parseKey(rest);
+      const key = parseKey(rest, l.no);
       if (key) {
         const r = tokenizeKeyValue(key, contentCol, l.no, lines, i);
         tokens.push(r.token);
@@ -335,7 +424,7 @@ function tokenize(lines) {
       continue;
     }
 
-    const key = parseKey(text);
+    const key = parseKey(text, l.no);
     if (!key) throw new WorkflowYamlError(`line is neither a mapping key nor a sequence item: ${JSON.stringify(text)}`, l.no);
     const r = tokenizeKeyValue(key, l.indent, l.no, lines, i + 1);
     tokens.push(r.token);
