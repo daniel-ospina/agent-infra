@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, applyScopeGate, routeScopeGate, combineScopes } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes } from "./index.js";
 import { createHash } from "node:crypto";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
@@ -3192,6 +3192,81 @@ test("G4: combineScopes — files dedup, renameOldPaths union, clean AND", () =>
   deepEqual(u.renameOldPaths.sort(), ["docs/old.md", "src/old.ts"].sort());
   ok(u.clean);
   equal(combineScopes(a, { ...b, clean: false }).clean, false, "clean is AND");
+});
+
+// ── #755: parseDiffNameStatusDetailed status map ──────
+// The subtraction rule's condition (E) reads `statuses.get(P) ∈ {A, M}`, so the
+// status map is safety-relevant: a WRONG or MISSING letter silently disables the
+// subtraction for that path (over-gate, safe) — but an accidental extra `A`/`M`
+// on a path that is not actually added/modified would be an UNDER-gate. These
+// pins live here rather than in subtract-scope.test.ts because the parser lives
+// in index.ts, whose `:2` is a VALUE import of the pi SDK — the subtraction suite
+// must stay SDK-free so it can run in the no-`npm ci` verify job.
+section("#755: parseDiffNameStatusDetailed — status-map eligibility (E)");
+
+test("#755 E: A and M are the only eligible letters", () => {
+  deepEqual([...parseDiffNameStatusDetailed("A\0new.ts\0").statuses.entries()], [["new.ts", "A"]]);
+  deepEqual([...parseDiffNameStatusDetailed("M\0mod.ts\0").statuses.entries()], [["mod.ts", "M"]]);
+});
+
+test("#755 E: every ineligible letter is carried faithfully (never coerced to A/M)", () => {
+  // D/T/U/X/B are single-path rows. R/C are 3-field (score + OLD + NEW).
+  for (const letter of ["D", "T", "U", "X", "B"]) {
+    const { statuses } = parseDiffNameStatusDetailed(`${letter}\0p.ts\0`);
+    equal(statuses.get("p.ts"), letter, `${letter} must be preserved verbatim`);
+    ok(letter !== "A" && letter !== "M", "(sanity) the letter under test is ineligible");
+  }
+});
+
+test("#755 E: R/C are keyed by the NEW path, not the old one", () => {
+  const r = parseDiffNameStatusDetailed("R100\0old.ts\0new.ts\0");
+  equal(r.statuses.get("new.ts"), "R");
+  equal(r.statuses.get("old.ts"), undefined,
+    "the OLD path must carry NO status — keying it would let an ineligible rename source leak an eligible letter");
+  deepEqual(r.scope.files, ["new.ts"]);
+  deepEqual(r.scope.renameOldPaths, ["old.ts"]);
+  const c = parseDiffNameStatusDetailed("C75\0src.ts\0copy.ts\0");
+  equal(c.statuses.get("copy.ts"), "C");
+  equal(c.statuses.get("src.ts"), undefined);
+});
+
+test("#755 E: an anomaly yields a PARTIAL map and clean=false — never a fabricated letter", () => {
+  // Truncated stream (no final NUL) → clean=false, EMPTY map.
+  const trunc = parseDiffNameStatusDetailed("A\0new.ts");
+  equal(trunc.scope.clean, false);
+  equal(trunc.statuses.size, 0);
+  ok(!trunc.statuses.has("new.ts"), "a truncated row must not register the path");
+  // Good row followed by an unknown status → the good row IS registered, clean=false.
+  const partial = parseDiffNameStatusDetailed("A\0ok.ts\0Z\0bad.ts\0");
+  equal(partial.scope.clean, false);
+  equal(partial.statuses.get("ok.ts"), "A");
+  equal(partial.statuses.get("bad.ts"), undefined);
+  deepEqual(partial.scope.files, ["ok.ts"]);
+  // Bare R without a similarity score is an anomaly, not a rename.
+  const bareR = parseDiffNameStatusDetailed("R\0old.ts\0new.ts\0");
+  equal(bareR.scope.clean, false);
+  equal(bareR.statuses.size, 0);
+  // A similarity score is valid on R/C rows (3-field, handled above) and on `M`
+  // rows for file rewrites — git-diff(1) RAW OUTPUT FORMAT: "Status letter M may
+  // be followed by a score (denoting the percentage of dissimilarity) for file
+  // rewrites". On any other single-path letter it is not producible by git, and
+  // without a guard the token would register as an eligible A/M — the one input
+  // class where the parser could report an eligibility git never granted.
+  const scoredM = parseDiffNameStatusDetailed("M100\0p.ts\0");
+  equal(scoredM.scope.clean, true, "M<score> is a legitimate rewrite row (git diff -B), NOT an anomaly");
+  equal(scoredM.statuses.get("p.ts"), "M");
+  deepEqual(scoredM.scope.files, ["p.ts"]);
+  for (const letter of ["A", "D", "T", "U", "X", "B"]) {
+    const scored = parseDiffNameStatusDetailed(`${letter}100\0p.ts\0`);
+    equal(scored.scope.clean, false, `${letter}100 must be an anomaly`);
+    equal(scored.statuses.size, 0, `${letter}100 must not register the path`);
+  }
+});
+
+test("#755 E: empty output is clean with an empty map (vacuous, not an anomaly)", () => {
+  const e = parseDiffNameStatusDetailed("");
+  deepEqual(e.scope, { files: [], renameOldPaths: [], clean: true });
+  equal(e.statuses.size, 0);
 });
 // ── Results ───────────────────────────────────────────
 

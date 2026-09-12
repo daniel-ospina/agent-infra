@@ -2408,6 +2408,19 @@ export function parseDiffNameStatusDetailed(output: string): {
       statuses.set(tokens[i + 1], letter);
       i += 2;
     } else {
+      // #755: git appends a similarity score to a single-path row in exactly one
+      // case — `M`, for file rewrites. git-diff(1) RAW OUTPUT FORMAT: "Status
+      // letter M may be followed by a score (denoting the percentage of
+      // dissimilarity) for file rewrites" (R/C always carry one, but those are
+      // 3-field rows handled above). A score on any OTHER single-path letter
+      // (A/D/T/U/X/B) is not producible by git → anomaly, fail closed.
+      //
+      // ⛔ An earlier version of this guard rejected `M<score>` too, on the false
+      // premise that scores appear only on R/C rows; `git diff -B --name-status -z`
+      // emits `M100` for a rewrite, so that would have hard-blocked a legitimate
+      // op the moment any gate diff command gained `-B`. The gate passes no `-B`
+      // today, so it was latent — but the invariant was wrong as written.
+      if (m[2] !== "" && letter !== "M") { clean = false; break; }
       if (i >= tokens.length) { clean = false; break; }
       if (tokens[i] === "") { clean = false; break; } // empty path token
       files.push(tokens[i]);
