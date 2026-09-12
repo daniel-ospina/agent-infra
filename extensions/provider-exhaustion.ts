@@ -186,10 +186,12 @@ export function interactiveRestoreTarget(
 let pendingMarker: string | null = null;
 
 // ── #512 per-dispatch usage capture (child side, TASK_USAGE_CAPTURE=1) ──
-// The task tool's children run --no-session (no persisted session file), so
-// per-dispatch token usage for the 0a cache-fraction gate has NO existing
-// data source. When the parent opts in (TASK_USAGE_CAPTURE=1 flows to the
-// child env), the child accumulates message_end usage and emits ONE
+// Task children persist their own session now (#783 Task 1: fresh
+// --session-id + --session-dir under TASK_SESSION_ROOT), but per-dispatch
+// token usage for the 0a cache-fraction gate is still not readable from the
+// parent's side without parsing that transcript. When the parent opts in
+// (TASK_USAGE_CAPTURE=1 flows to the child env), the child accumulates
+// message_end usage and emits ONE
 // [task-usage] stderr line at session_shutdown (same writeSync channel + nonce
 // as the exhaustion marker — the parent authenticates and appends its
 // dispatch-usage ledger). Default OFF → byte-identical behavior.

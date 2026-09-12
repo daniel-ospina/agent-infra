@@ -13,9 +13,11 @@
  * session JSONL logs to quantify the slow-thinking tail.
  *
  * Method (session-log forensics, verified against real logs):
- *   - The task tool spawns the child as `pi -p ... --no-session <prompt>`, so
- *     the child's FIRST user message is EXACTLY the parent's
- *     arguments.prompt → exact pairing by prompt hash (sha256).
+ *   - The task tool spawns the child as `pi -p ... <prompt>`; since #783
+ *     Task 1 the child also persists its own session (`--session-id` +
+ *     `--session-dir` under TASK_SESSION_ROOT), but its FIRST user message is
+ *     still EXACTLY the parent's arguments.prompt → exact pairing by prompt
+ *     hash (sha256).
  *   - T0 = child session spawn ts (session event); time-to-first-message =
  *     first assistant message with content; time-to-first-tool = first
  *     assistant message containing a toolCall.

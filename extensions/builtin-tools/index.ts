@@ -72,6 +72,32 @@ import type {
   LatchState,
   LegRef,
 } from "../shared/provider-failover.js";
+// #783 Task 2 — repo state for the handoff payload (probed once per dispatch,
+// never from the heartbeat).
+import { asyncRepoState, type RepoState } from "../repo-freshness.js";
+// #783 Task 1 — durable child session per spawn (fresh id + dir per attempt).
+import {
+  assertValidSessionId,
+  degradedSessionArgs,
+  ensureTaskSessionRoot,
+  mintChildSessionId,
+  newChildSession,
+  resolveTaskSessionRoot,
+} from "../shared/session-id.js";
+// #783 Task 4 — durable per-spawn-attempt outcome record. The row CONTRACT and
+// the write+confirm live in shared/dispatch-record.ts; the writer is invoked
+// from doResolve's settle-once gate (see `writeOutcomeRow`).
+import {
+  buildDispatchOutcomeRow,
+  dispatchLedgerEnabled,
+  recordDispatchOutcome,
+  renderRecordField,
+  resolveDispatchClass,
+  resolveTranscriptPath,
+  sessionArgFromArgs,
+  type DispatchRecordContext,
+  type RecordWriteResult,
+} from "../shared/dispatch-record.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -1370,7 +1396,8 @@ export async function runFailoverDecisionLoop(input: {
 // ── #512 per-dispatch usage capture (parent side, TASK_USAGE_LEDGER=1) ──
 // The 0a economic gate (does the cold class stay cache-cold enough for venice
 // to be cheaper?) needs per-dispatch input-vs-cacheRead fractions for the
-// reviewer/eval dispatch class. Builtin-task children run --no-session, so
+// reviewer/eval dispatch class. Builtin-task children now PERSIST a session
+// (#783 Task 1: fresh --session-id + --session-dir under TASK_SESSION_ROOT), so
 // the child (provider-exhaustion ext, TASK_USAGE_CAPTURE=1) emits ONE
 // [task-usage] stderr line at shutdown; this parent parses it, attaches
 // details.dispatchUsage to the settled result, and — when TASK_USAGE_LEDGER=1
@@ -1449,7 +1476,8 @@ export function scanStderrForUsage(
 //
 // Kill clauses (precedence: tool-stall → stream-stall → silence → cut →
 // first-message → max-dispatch):
-//   tool-stall ........ in-flight tool older than TASK_TOOL_STALL_MS (6h;
+//   tool-stall ........ in-flight tool older than TASK_TOOL_STALL_MS (2h on
+//                       the task path — DEFAULT_TASK_TOOL_STALL_MS, #783;
 //                       min(L, T) when turnActive=false — preflight-stuck)
 //   stream-stall ...... no tools, stream idle > TASK_STREAM_STALL_MS (20 min)
 //                       — also bounds between-turn wedges with flowing ticks
@@ -1479,7 +1507,24 @@ export const HEARTBEAT_INTERVAL_MIN_MS = 5_000;
 export const HEARTBEAT_INTERVAL_MAX_MS = 300_000;
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
 export const DEFAULT_STREAM_STALL_MS = 1_200_000;
+/** #783 fix 4: the SUBAGENT-path tool-stall constant — deliberately frozen at
+ * 6h. Still exported because extensions/subagent/index.ts imports it and
+ * derives its OWN backstop from it (getSubagentBackstopMs). Do NOT lower this
+ * to the task bound below — that would silently drag the subagent backstop
+ * below the hard cap. */
 export const DEFAULT_TOOL_STALL_MS = 21_600_000;
+/** #783 fix 4: the TASK-path tool-stall bound (2h), split off from the frozen
+ * export above. Before the split it equalled DEFAULT_HARD_CAP_MS (both 6h), so
+ * the in-flight-tool bound gave no margin over the cap and could not fire
+ * meaningfully earlier. 2h is chosen against this repo's real single-tool
+ * durations — ~20 min for a cold `npm ci`, ~40 min for the longest full
+ * `npx tsx` suite — 3× headroom, while still firing 4h BEFORE the 6h cap.
+ * Clause 1 deliberately has no !everSawRealActivity gate (it is the wedged-TOOL
+ * detector, and markers stay fresh while a tool runs), so the bound MUST exceed
+ * any legitimate single-tool duration or it kills healthy children and destroys
+ * in-flight work: a bound below ~1h is a behaviour change, not a tuning tweak.
+ * Task-local (unexported) — subagent/ keeps the frozen 6h constant above. */
+const DEFAULT_TASK_TOOL_STALL_MS = 7_200_000;
 export const DEFAULT_FIRST_MESSAGE_MS = 300_000;
 
 /** Clamp a raw interval into [5s, 300s]; non-finite/≤0 → default. Identical
@@ -1501,7 +1546,9 @@ export function getStreamStallMs(): number {
   return Math.max(60_000, Number(process.env.TASK_STREAM_STALL_MS) || DEFAULT_STREAM_STALL_MS);
 }
 export function getToolStallMs(): number {
-  return Math.max(60_000, Number(process.env.TASK_TOOL_STALL_MS) || DEFAULT_TOOL_STALL_MS);
+  // #783 fix 4: the task path resolves the task-local 2h default; the exported
+  // DEFAULT_TOOL_STALL_MS stays 6h for extensions/subagent/index.ts.
+  return Math.max(60_000, Number(process.env.TASK_TOOL_STALL_MS) || DEFAULT_TASK_TOOL_STALL_MS);
 }
 /**
  * #209: system load probe — 1-minute load average. Reads /proc/loadavg
@@ -1591,14 +1638,21 @@ export function getCutGapMs(): number {
 // The parent await is bounded by four layers (D4): exit-settle (≤ ~2s after
 // child death), the "cut" clause (~37.5s for the frozen-marker wedged class),
 // the #221 hard cap (6h default — the DEFAULT detector-dead last resort, NOT
-// stateFresh-gated), and this backstop — tool-stall + 30min (6h30m) as the
-// detector-dead bound when env-overridden below the hard cap. The backstop
-// fires ONLY when stateFresh === false at expiry (healthy ticking agents are
-// exempt by construction — the backstop is not a default-ON total dispatch
-// cap). TASK_BACKSTOP_MS overrides; 0 = off (deliberate unbounded-wait
-// config).
+// stateFresh-gated), and this backstop as the detector-dead bound when
+// env-overridden below the hard cap. The backstop fires ONLY when
+// stateFresh === false at expiry (healthy ticking agents are exempt by
+// construction — the backstop is not a default-ON total dispatch cap).
+// TASK_BACKSTOP_MS overrides; 0 = off (deliberate unbounded-wait config).
+//
+// #783 fix 4 — DELIBERATE DECOUPLING: the backstop derives from the FROZEN
+// exported DEFAULT_TOOL_STALL_MS (6h) + margin (6h30m), NOT from the task
+// path's own tool-stall bound (DEFAULT_TASK_TOOL_STALL_MS, now 2h). It is no
+// longer literally "task tool-stall + margin". It must stay ABOVE the 6h hard
+// cap so the cap remains the last resort; deriving it from the 2h task bound
+// would drag it to 2h30m and pre-empt the cap.
 
-/** #271 D4: backstop margin over DEFAULT_TOOL_STALL_MS (30 min). */
+/** #271 D4: backstop margin over the FROZEN DEFAULT_TOOL_STALL_MS (30 min).
+ * #783 fix 4: deliberately NOT the task path's DEFAULT_TASK_TOOL_STALL_MS. */
 export const DEFAULT_BACKSTOP_MARGIN_MS = 1_800_000;
 
 /** Grace between the child's `exit` event and the exit-settle fallback — if
@@ -1612,7 +1666,9 @@ export const DEFAULT_EXIT_SETTLE_GRACE_MS = 2_000;
  * harness (cut-resume.integration.test.ts). */
 export let sweepRunCount = 0;
 
-/** Backstop = tool-stall (6h) + 30min margin = 6h30m (23_400_000). 0 = off. */
+/** Backstop = FROZEN DEFAULT_TOOL_STALL_MS (6h) + 30min margin = 6h30m
+ * (23_400_000) — deliberately above the 6h hard cap (#783 fix 4: decoupled
+ * from the task path's 2h tool-stall bound). 0 = off. */
 export function getTaskBackstopMs(): number {
   const raw = Number(process.env.TASK_BACKSTOP_MS);
   if (Number.isFinite(raw) && raw === 0) return 0; // explicit opt-out
@@ -1956,6 +2012,27 @@ export interface HeartbeatIngestContext {
 }
 
 /**
+ * #783 Task 1: pi CLI stderr lines that are NOT child work. With a fresh
+ * `--session-id`, pi prints exactly this warning on every first spawn
+ * (`main.js:338-344`). Non-marker stderr normally flips `hasOutput`
+ * (`onRealOutput`), and the whole retryability contract is
+ * `resolveUndefined = !hasOutput` — so without this filter `hasOutput` would
+ * be permanently true, `retry()` would stop retrying hung children, and every
+ * `!hasOutput` arm (the zero-output settles) would be dead code.
+ */
+export const KNOWN_STDERR_NOISE: RegExp[] = [
+  /^Warning: No project session found with id '[^']*'; creating a new session with that id\.$/,
+];
+
+/** True when a complete stderr line/residue is known pi-CLI noise
+ * (ANSI-stripped, trimmed) — filtered BEFORE `onRealOutput()`. */
+export function isKnownStderrNoise(text: string): boolean {
+  const stripped = text.replace(ANSI_RE, "").trim();
+  if (!stripped) return false;
+  return KNOWN_STDERR_NOISE.some((re) => re.test(stripped));
+}
+
+/**
  * Ingest one raw stderr chunk through the marker pipeline (#176): line-buffer
  * → complete lines parsed as markers (discarded) or appended as ordinary
  * stderr → bounded overflow (marker-prefixed residue discarded). Mutates
@@ -1985,21 +2062,26 @@ export function ingestHeartbeatChunk(
     if (!isDecoratedMarker) {
       const prefixIdx = line.indexOf(HEARTBEAT_MARKER_PREFIX);
       if (prefixIdx > 0) {
-        ctx.appendStderr(line.slice(0, prefixIdx));
-        ctx.onRealOutput();
+        const head = line.slice(0, prefixIdx);
+        if (!isKnownStderrNoise(head)) {
+          ctx.appendStderr(head);
+          ctx.onRealOutput();
+        }
         line = line.slice(prefixIdx);
       }
     }
     if (!parseHeartbeatLine(line, ctx.state, now, ctx.expectedNonce)) {
-      ctx.appendStderr(line + "\n");
-      ctx.onRealOutput();
+      if (!isKnownStderrNoise(line)) {
+        ctx.appendStderr(line + "\n");
+        ctx.onRealOutput();
+      }
     } else if (ctx.onSessionEnd && markerKindOf(line) === "session_end") {
       ctx.onSessionEnd();
     }
   }
   if (ctx.lineBuf.length > HEARTBEAT_LINE_BUF_MAX) {
     const { flush } = flushHeartbeatResidue(ctx.lineBuf);
-    if (flush) {
+    if (flush && !isKnownStderrNoise(flush)) {
       ctx.appendStderr(flush);
       ctx.onRealOutput();
     }
@@ -2013,12 +2095,13 @@ export function ingestHeartbeatChunk(
 export function flushHeartbeatLineBuf(ctx: HeartbeatIngestContext): string {
   if (!ctx.lineBuf) return "";
   const { flush } = flushHeartbeatResidue(ctx.lineBuf);
-  if (flush) {
-    ctx.appendStderr(flush);
+  const kept = flush && !isKnownStderrNoise(flush) ? flush : "";
+  if (kept) {
+    ctx.appendStderr(kept);
     ctx.onRealOutput();
   }
   ctx.lineBuf = "";
-  return flush;
+  return kept;
 }
 
 export type HeartbeatKillReason =
@@ -2280,7 +2363,113 @@ function restoreTodos(pi: ExtensionAPI): void {
 
 // ── Extension Entry Point ───────────────────────────────────────────
 
-export function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
+/**
+ * #783 Task 2: the PARENT reports where the child ran. Space-separated
+ * `name=value` tokens appended to the SINGLE-LINE `Alive state: …` text —
+ * the census instrument counts git state with
+ * `re.search(r"(^|\s)(branch|headSha|worktree|dirty)=", …)`, so a
+ * `name: value` form would leave its `git_field_state` at 0 forever (the
+ * census self-test would stay green while the field never moved).
+ *
+ * `repoState === null` (probe not finished / git unavailable) renders every
+ * probed field `unknown`; a detached HEAD is `branch=null` with
+ * `worktree=<cwd>` still present as the recovery key. Never a newline.
+ */
+export function renderRepoStateLine(repoState: RepoState | null, cwd: string): string {
+  const branch = repoState ? (repoState.branch ?? "null") : "unknown";
+  const sha = repoState ? (repoState.headSha ?? "unknown") : "unknown";
+  const dirty = repoState ? String(repoState.dirty) : "unknown";
+  const dirtyPaths = repoState ? String(repoState.paths.length) : "unknown";
+  return `branch=${branch} headSha=${sha} worktree=${cwd} dirty=${dirty} dirtyPaths=${dirtyPaths}`;
+}
+
+// ── #783 Task 3: the ONE abnormal-exit composer ─────────────────────
+//
+// The four abnormal-exit killers — hard cap, exit-path cut, heartbeat kill,
+// backstop — previously hand-rolled four near-identical payloads. They are
+// NOT textually uniform (see docs/plans/2026-09-12-issue-783-task-cap-handoff.md
+// Task 3), so the per-killer presentation rides on `AbnormalExitCtx` and the
+// composer owns only the shared assembly:
+//
+//   <headline>\n\n<aliveSummary>[\n\n<stderr delim>\n<body>][\n\n<stdout delim>\n<body>]
+//
+//   - cap / heartbeat / backstop: `--- last stderr ---` over a cleaned
+//     stderr TAIL and `--- last stdout ---` over the raw stdout tail — both
+//     delimiters ALWAYS emitted (an empty body still renders the section).
+//   - exit-path cut: bare `--- stderr ---` over a CLEANED, TRIMMED stderr and
+//     `--- last stdout ---` over the TRIMMED stdout — each section omitted
+//     when its body is empty.
+//
+// The `cap` arm is CENSUS-FROZEN: docs/scoping/2026-09-12-issue-783-census/
+// census.py parses these payloads LIVE. The headline prefix
+// (`⚠️ Sub-agent exceeded the task hard cap`), the single-line `Alive state:`
+// prefix (Task 2 appends `branch= headSha= worktree= dirty= dirtyPaths=`
+// AFTER `trace=[…]` on that SAME line), both `--- last … ---` delimiters,
+// `hard cap (<Ns>)`, and the `name=value` git rendering must not drift.
+
+/** One optional payload section (the child's stderr tail / stdout tail). */
+interface AbnormalExitSection {
+  /** Delimiter line introducing the section. */
+  delimiter: string;
+  /** Tail length, in characters, of the rendered body. */
+  slice: number;
+  /** `true` → trim the raw buffer before rendering (exit-path cut law);
+   * `false` → render the raw tail (cap / heartbeat / backstop law). */
+  trimFirst: boolean;
+  /** `true` → omit the whole section when its body is empty (exit-path cut).
+   * The three parent-initiated kills always emit both delimiters. */
+  omitWhenEmpty: boolean;
+}
+
+/** Per-killer presentation for `composeAbnormalExit`. `reason` alone cannot
+ * reproduce any of the four — the stderr/stdout laws and the headline differ. */
+interface AbnormalExitCtx {
+  /** Killer headline. The heartbeat killer has SIX, keyed by
+   * `decision.reason`; there is no single headline for that arm. */
+  headline: string;
+  /** Single-line alive-state summary, already rendered — it ends with the
+   * Task-2 repo-state fields (`branch= … dirtyPaths= …`). */
+  aliveSummary: string;
+  stderrSection: AbnormalExitSection;
+  stdoutSection: AbnormalExitSection;
+}
+
+/** Per-killer `details` literal. It is built by the CALL SITE (the `reason:`
+ * literals are source-text pinned in builtin-tools.test.ts) and normalized by
+ * the composer to the canonical field set below. */
+interface AbnormalExitDetails {
+  model: string;
+  provider: string;
+  killed?: true;
+  reason: string;
+  /** exit-path cut: the child's close code (`null` on signal-death). */
+  exitCode?: number | null;
+  /** hard cap: the configured bound. */
+  hardCapMs?: number;
+  /** backstop kill discriminator. */
+  backstop?: boolean;
+  /** heartbeat / backstop: the silence bound that owns this class. */
+  heartbeatTimeout?: number;
+}
+
+/** The canonical abnormal-exit details field set — IDENTICAL on all four
+ * killers, so a consumer can destructure the record without branching on the
+ * killer. `reason` is the only field whose VALUE differs by killer; the rest
+ * carry the killer's value or the `null` / `false` "not applicable" sentinel.
+ * Exported so the integration harness asserts against the same list the
+ * composer emits (no hand-copied duplicate to drift). */
+export const ABNORMAL_EXIT_DETAIL_KEYS = [
+  "model",
+  "provider",
+  "killed",
+  "reason",
+  "exitCode",
+  "hardCapMs",
+  "backstop",
+  "heartbeatTimeout",
+] as const;
+
+export function spawnSubAgent(model: string, provider: string, subAgentEnv: Record<string, string | undefined>, args: string[], signal?: AbortSignal, record?: DispatchRecordContext): Promise<{ content: any[]; details: Record<string, unknown> } | undefined> {
   return new Promise((resolve) => {
     // #176 code-review: per-dispatch marker nonce — the child echoes it in
     // every [task-heartbeat] marker; markers without it are foreign (MCP
@@ -2294,6 +2483,27 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     const spawnEnv = hbEnabled
       ? { ...subAgentEnv, TASK_HEARTBEAT_NONCE: hbNonce }
       : subAgentEnv;
+    // #783 Task 4: identity for the durable outcome row.
+    //   dispatchId      = the per-dispatch nonce (the SAME key the #512
+    //                     dispatch-usage rows and the #476 failover/venice-route
+    //                     rows carry, so #796 joins on it).
+    //   childSessionId  = read out of the ARG VECTOR — the args are the source
+    //                     of truth for what was actually spawned, so a
+    //                     caller/args mismatch can never mis-attribute a row to
+    //                     a session that was never opened. Null on the
+    //                     `--no-session` degrade.
+    //   attempt         = threaded from retry() via the record context. A
+    //                     4/5-arg caller (test harness) DEFAULTS to 1 — tsx
+    //                     transpiles without typechecking, so a missing arg
+    //                     must never surface as `attempt: undefined`.
+    //   transcriptPath  = the best-known locator at settle (session .jsonl when
+    //                     it exists, else the child's session directory).
+    const childSessionId = sessionArgFromArgs(args, "--session-id");
+    const childSessionDir = sessionArgFromArgs(args, "--session-dir");
+    const attempt = record?.attempt ?? 1;
+    const parentSessionId = record?.parentSessionId ?? null;
+    const dispatchClass = record?.dispatchClass ?? resolveDispatchClass(subAgentEnv);
+    const transcriptPath = resolveTranscriptPath(childSessionDir, childSessionId);
     // #101: spawn via process.execPath + resolved entry script (same as the
     // subagent tool) so a truncated PATH can't cause a non-retryable ENOENT.
     const invocation = getPiInvocation(args);
@@ -2352,12 +2562,61 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     const HEARTBEAT_TIMEOUT_MS = Math.max(60_000, Number(process.env.TASK_HEARTBEAT_TIMEOUT_MS) || 1_800_000);
     const FIRST_OUTPUT_TIMEOUT_MS = 60_000;
     let hasOutput = false;
+    // #783 Task 2: repo state is probed ONCE per dispatch (async, off the 10s
+    // heartbeat) and cached here. The cap/cut/heartbeat/backstop payloads read
+    // the cached value and never invoke git themselves; null until/unless the
+    // probe resolves → fields render `unknown`.
+    let repoState: RepoState | null = null;
+    void asyncRepoState(process.cwd(), { signal })
+      .then((s) => { repoState = s; })
+      .catch(() => { repoState = null; });
+    const repoStateText = (): string => renderRepoStateLine(repoState, process.cwd());
 
     const appendCap = (s: string, add: string, cap: number) => {
       const merged = s + add;
       return merged.length > cap ? merged.slice(-cap) : merged;
     };
     const cleanStderr = (s: string) => s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+
+    // #783 Task 3: the single abnormal-exit composer (types + field set are at
+    // module scope, above spawnSubAgent). Callers pass their OWN details
+    // literal so the pinned `reason:` source text stays at the call site; the
+    // composer normalizes it to ABNORMAL_EXIT_DETAIL_KEYS and owns the text
+    // shape. `stderr`/`stdout` are the live per-dispatch accumulators.
+    const composeAbnormalExit = (
+      details: AbnormalExitDetails,
+      ctx: AbnormalExitCtx,
+    ): { content: any[]; details: Record<string, unknown> } => {
+      const stderrBody = ctx.stderrSection.trimFirst
+        ? cleanStderr(stderr.trim()).slice(-ctx.stderrSection.slice)
+        : cleanStderr(stderr.slice(-ctx.stderrSection.slice));
+      const stdoutBody = ctx.stdoutSection.trimFirst
+        ? stdout.trim().slice(-ctx.stdoutSection.slice)
+        : stdout.slice(-ctx.stdoutSection.slice);
+      let text = `${ctx.headline}\n\n${ctx.aliveSummary}`;
+      if (stderrBody || !ctx.stderrSection.omitWhenEmpty) {
+        text += `\n\n${ctx.stderrSection.delimiter}\n${stderrBody}`;
+      }
+      if (stdoutBody || !ctx.stdoutSection.omitWhenEmpty) {
+        text += `\n\n${ctx.stdoutSection.delimiter}\n${stdoutBody}`;
+      }
+      // Canonical field set — iterated from the exported list so the emitted
+      // keys can never drift from the asserted ones.
+      const normalized: Record<string, unknown> = {};
+      for (const key of ABNORMAL_EXIT_DETAIL_KEYS) {
+        switch (key) {
+          case "model": normalized[key] = details.model; break;
+          case "provider": normalized[key] = details.provider; break;
+          case "killed": normalized[key] = true; break;
+          case "reason": normalized[key] = details.reason; break;
+          case "exitCode": normalized[key] = details.exitCode ?? null; break;
+          case "hardCapMs": normalized[key] = details.hardCapMs ?? null; break;
+          case "backstop": normalized[key] = details.backstop ?? false; break;
+          case "heartbeatTimeout": normalized[key] = details.heartbeatTimeout ?? null; break;
+        }
+      }
+      return { content: [{ type: "text", text }], details: normalized };
+    };
 
     // #176: state-aware heartbeat — alive state parsed from [task-heartbeat]
     // markers (emitted by the task-heartbeat extension, TASK_HEARTBEAT=1).
@@ -2415,9 +2674,66 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       return exhaustionMarker;
     };
 
-    const doResolve = (value: { content: any[]; details: Record<string, unknown> } | undefined, opts?: { keepCompletionWatchdog?: boolean; sweep?: boolean }) => {
+    // #783 Task 4: the durable OUTCOME row writer. One row per SPAWN ATTEMPT
+    // (not per dispatch) — retry() respawns up to 3x, so N attempts under one
+    // dispatchId write N rows distinguished by `attempt`. Only values known
+    // AT SETTLE are recorded; the ledger is append-only, so nothing re-writes
+    // a row later (#840 owns any amendment, via a follow-up row).
+    const writeOutcomeRow = (reason: string, exitCode: number | null): RecordWriteResult => {
+      if (!dispatchLedgerEnabled(subAgentEnv)) return { ok: false, path: "", skipped: true };
+      return recordDispatchOutcome(
+        buildDispatchOutcomeRow({
+          dispatchId: hbNonce || null,
+          parentSessionId,
+          childSessionId,
+          attempt,
+          cwd: process.cwd(),
+          branch: repoState?.branch ?? null,
+          headSha: repoState?.headSha ?? null,
+          dirty: repoState?.dirty ?? null,
+          dirtyPaths: repoState?.paths ?? [],
+          reason,
+          toolAgeMaxMs: hbCtx.state.toolAgeMaxMs,
+          toolsInFlight: hbCtx.state.toolsInFlight,
+          everSawTool: hbCtx.state.everSawTool,
+          transcriptPath,
+          exitCode,
+          dispatchClass,
+        }),
+        subAgentEnv,
+      );
+    };
+
+    const doResolve = (
+      value: { content: any[]; details: Record<string, unknown> } | undefined,
+      // `reason` is the abnormal/success discriminator. REQUIRED on every
+      // abnormal settle; OMITTED by the success/clean/sessionEnded/
+      // abort-after-end/spawn-error settles — those write NO row.
+      opts?: { reason?: string; exitCode?: number | null; keepCompletionWatchdog?: boolean; sweep?: boolean },
+    ) => {
       if (settled) return;
       settled = true;
+      // #783 Task 4 — THE choke point, immediately after `settled = true`, and
+      // deliberately NOT at the call sites. `finalize` is invoked
+      // UNCONDITIONALLY from both proc.on("exit") (after the 2s grace) and
+      // proc.on("close"): a cap kill settles here (row A — reason hard-cap),
+      // then killTreeAndEscalate() kills the tree -> `close` -> finalize ->
+      // classifyTaskExit(null, ...) === "cut", which would emit a SECOND row
+      // for the SAME attempt. The ledger is append-only, so that could never
+      // be repaired. `settled` is the only gate that guarantees exactly-once,
+      // and the cut-with-output arm is covered here too (a call-site writer
+      // would miss it, leaving that population uncountable).
+      if (opts?.reason) {
+        const recordResult = writeOutcomeRow(opts.reason, opts.exitCode ?? null);
+        if (value && typeof value === "object") {
+          const details: Record<string, unknown> = { ...(value.details ?? {}), transcriptPath };
+          // Never name a path when nothing was written: an unwritable/full
+          // ledger renders `record: "failed: <err>"` instead, and an
+          // explicitly-disabled gate renders NO `record` field at all.
+          if (!recordResult.skipped) details.record = renderRecordField(recordResult);
+          value = { ...value, details };
+        }
+      }
       exitWatchdog.disarm();
       if (!opts?.keepCompletionWatchdog) completionWatchdog?.disarm();
       if (hardCapTimer) clearTimeout(hardCapTimer);
@@ -2525,17 +2841,19 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       killTreeAndEscalate();
       if (!hasOutput) {
         console.error(`[task] sub-agent exceeded the hard cap with no real output — retryable (#271)`);
-        doResolve(undefined, { sweep: true });
+        doResolve(undefined, { sweep: true, reason: "hard-cap" });
         return;
       }
       const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
-      doResolve({
-        content: [{
-          type: "text",
-          text: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.\n\nAlive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}]\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${stdout.slice(-500)}`,
-        }],
-        details: { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
-      }, { sweep: true });
+      doResolve(composeAbnormalExit(
+        { model, provider, killed: true, reason: "hard-cap", hardCapMs: getTaskHardCapMs() },
+        {
+          headline: `⚠️ Sub-agent exceeded the task hard cap (${getTaskHardCapMs() / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
+          aliveSummary: `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`,
+          stderrSection: { delimiter: "--- last stderr ---", slice: 2000, trimFirst: false, omitWhenEmpty: false },
+          stdoutSection: { delimiter: "--- last stdout ---", slice: 500, trimFirst: false, omitWhenEmpty: false },
+        },
+      ), { sweep: true, reason: "hard-cap" });
     }, getTaskHardCapMs());
     hardCapTimer.unref();
 
@@ -2609,18 +2927,24 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         // zero-partial cut stays retryable by the retry wrapper, mirroring
         // the kill-clause contract.
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? Date.now() - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}]`;
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
         const headline = "⚠️ Sub-agent was cut — process exited mid-tool / no life signs. Partial results below — parent should decide: accept, re-dispatch, or escalate.";
-        const output = stdout.trim();
-        const errInfo = stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "";
-        const body = output
-          ? `${headline}\n\n${aliveSummary}${errInfo}\n\n--- last stdout ---\n${output.slice(-2000)}`
-          : `${headline}\n\n${aliveSummary}${errInfo}`;
         doResolve(
           !hasOutput
             ? undefined
-            : { content: [{ type: "text", text: body }], details: { model, provider, killed: true, reason: "cut", exitCode: code } },
-          { sweep: true },
+            : composeAbnormalExit(
+                { model, provider, killed: true, reason: "cut", exitCode: code },
+                {
+                  headline,
+                  aliveSummary,
+                  // Exit-path cut law: bare `--- stderr ---` over a CLEANED,
+                  // TRIMMED stderr; empty sections omitted (no delimiter with
+                  // an empty body on this arm).
+                  stderrSection: { delimiter: "--- stderr ---", slice: 4000, trimFirst: true, omitWhenEmpty: true },
+                  stdoutSection: { delimiter: "--- last stdout ---", slice: 2000, trimFirst: true, omitWhenEmpty: true },
+                },
+              ),
+          { sweep: true, reason: "cut", exitCode: code },
         );
         return;
       }
@@ -2629,7 +2953,7 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       const output = stdout.trim();
       const text = output || stderrClean || `Sub-agent exited with code ${code}`;
       const extra = output ? (stderrClean ? `\n\n--- stderr ---\n${stderrClean}` : "") : "";
-      doResolve({ content: [{ type: "text", text: text + extra }], details: { model, provider, exitCode: code } }, { sweep: true });
+      doResolve({ content: [{ type: "text", text: text + extra }], details: { model, provider, exitCode: code } }, { sweep: true, reason: "failed", exitCode: code });
     };
 
     // #272: per-dispatch monotonic latch of the effective first-message
@@ -2778,13 +3102,12 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         } else {
           console.error(`[task] sub-agent killed (${decision.reason}) with no real output — retryable`);
         }
-        doResolve(undefined, { sweep: true });
+        doResolve(undefined, { sweep: true, reason: decision.reason ?? "silence-threshold" });
         return;
       }
 
-      const lastOutput = stdout.slice(-500);
       const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}]`;
+      const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
       const headlines: Record<string, string> = {
         "silence-threshold": `⚠️ Sub-agent reached silence threshold (${HEARTBEAT_TIMEOUT_MS / 1000}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
         "stream-stall": `⚠️ Sub-agent stream stalled — no stream activity for ${Math.round(hbCtx.state.streamAgeMs / 1000)}s (bound ${Math.round(hbThresholds.streamStallMs / 1000)}s). Partial results below — parent should decide: accept, re-dispatch, or escalate.`,
@@ -2805,10 +3128,15 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
           `[task] first-message-stall diagnostic: elapsedMs=${Math.round(hbCtx.state.streamAgeMs / 1000)}s tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] bound=${Math.round((decision.firstMessageMs ?? hbThresholds.firstMessageMs) / 1000)}s`,
         );
       }
-      doResolve({
-        content: [{ type: "text", text: `${headlines[decision.reason ?? "silence-threshold"]}\n\n${aliveSummary}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${lastOutput}` }],
-        details: { model, provider, killed: true, reason: decision.reason, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
-      }, { sweep: true });
+      doResolve(composeAbnormalExit(
+        { model, provider, killed: true, reason: decision.reason ?? "silence-threshold", heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
+        {
+          headline: headlines[decision.reason ?? "silence-threshold"],
+          aliveSummary,
+          stderrSection: { delimiter: "--- last stderr ---", slice: 2000, trimFirst: false, omitWhenEmpty: false },
+          stdoutSection: { delimiter: "--- last stdout ---", slice: 500, trimFirst: false, omitWhenEmpty: false },
+        },
+      ), { sweep: true, reason: decision.reason ?? "silence-threshold" });
     }, 10_000);
 
     // #271 (#208 D4): backstop timer — the last-resort bound for the
@@ -2839,16 +3167,20 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
         const headline = `⚠️ Sub-agent exceeded the dispatch backstop (${Math.round(backstopMs / 1000)}s, TASK_BACKSTOP_MS) with no fresh heartbeat markers. Partial results below — parent should decide: accept, re-dispatch, or escalate.`;
         if (!hasOutput) {
           console.error(`[task] sub-agent backstop fired with no real output — retryable`);
-          doResolve(undefined, { sweep: true });
+          doResolve(undefined, { sweep: true, reason: "backstop" });
           return;
         }
         const markerAgeMs = hbCtx.state.lastMarkerAt > 0 ? now - hbCtx.state.lastMarkerAt : -1;
-        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}]`;
-        const lastOutput = stdout.slice(-500);
-        doResolve({
-          content: [{ type: "text", text: `${headline}\n\n${aliveSummary}\n\n--- last stderr ---\n${cleanStderr(stderr.slice(-2000))}\n\n--- last stdout ---\n${lastOutput}` }],
-          details: { model, provider, killed: true, reason: "cut", backstop: true, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
-        }, { sweep: true });
+        const aliveSummary = `Alive state: toolsInFlight=${hbCtx.state.toolsInFlight} turnActive=${hbCtx.state.turnActive} streamAgeMs=${hbCtx.state.streamAgeMs} toolAgeMaxMs=${hbCtx.state.toolAgeMaxMs} everSawRealActivity=${hbCtx.state.everSawRealActivity} lastMarkerAgeMs=${markerAgeMs} tickCount=${hbCtx.state.tickCount} markerCount=${hbCtx.state.markerCount} firstMarkerLagMs=${hbCtx.state.firstMarkerAt > 0 ? hbCtx.state.firstMarkerAt - startedAt : -1} firstTickLagMs=${hbCtx.state.firstTickAt > 0 ? hbCtx.state.firstTickAt - startedAt : -1} firstActivityLagMs=${hbCtx.state.firstActivityAt > 0 ? hbCtx.state.firstActivityAt - startedAt : -1} everSawMsg=${hbCtx.state.everSawMsg} everSawTool=${hbCtx.state.everSawTool} toolsMaxInFlight=${hbCtx.state.toolsMaxInFlight} trace=[${hbCtx.state.activityTrace.join(",")}] ${repoStateText()}`;
+        doResolve(composeAbnormalExit(
+          { model, provider, killed: true, reason: "cut", backstop: true, heartbeatTimeout: HEARTBEAT_TIMEOUT_MS },
+          {
+            headline,
+            aliveSummary,
+            stderrSection: { delimiter: "--- last stderr ---", slice: 2000, trimFirst: false, omitWhenEmpty: false },
+            stdoutSection: { delimiter: "--- last stdout ---", slice: 500, trimFirst: false, omitWhenEmpty: false },
+          },
+        ), { sweep: true, reason: "backstop" });
       };
       backstopTimer = setTimeout(backstopFire, backstopMs);
     }
@@ -3232,7 +3564,13 @@ export default function (pi: ExtensionAPI) {
         })
       ),
     }),
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      // #783 Task 1: the parent's session identity comes from the extension
+      // context — NOT the PI_SESSION_ID process env var, which pi sets only in
+      // bash-tool child envs, so an extension reading it inherits an
+      // ANCESTOR session id.
+      const parentSessionId = ctx?.sessionManager?.getSessionId() ?? null;
+      const parentSessionDir = ctx?.sessionManager?.getSessionDir() ?? null;
       const modelParam = params.model ?? DEFAULT_TASK_MODEL;
       // #154: resolve provider from the model param — "provider/model" splits
       // explicitly; bare model ids are looked up across configured providers
@@ -3436,11 +3774,97 @@ export default function (pi: ExtensionAPI) {
       // carry an AUTO nonce the venice-route row could never join. The
       // shared id is set in every config; the child simply reuses it.
       subAgentEnv.TASK_HEARTBEAT_NONCE = randomBytes(6).toString("hex");
+      // #783 Task 1: durable child session per spawn. The root is resolved
+      // once per dispatch (env-overridable: TASK_SESSION_ROOT, default
+      // ~/.pi/agent/task-sessions/); the id + dir are minted per ATTEMPT
+      // inside childSessionArgs() — buildArgs is called per retry AND the
+      // fallback leg retries too, so a hoisted const would make attempt 2
+      // re-open and APPEND to attempt 1's transcript (pi main.js:338-345).
+      // If the root cannot be created, the dispatch DEGRADES to --no-session
+      // (works, no transcript) rather than failing.
+      const sessionRootStatus = ensureTaskSessionRoot(resolveTaskSessionRoot(subAgentEnv));
+      if (!sessionRootStatus.ok) {
+        console.warn(
+          `[task] child session root ${sessionRootStatus.root} unavailable (${sessionRootStatus.error ?? "unknown"}) — degrading to --no-session (dispatch still runs; no transcript)`,
+        );
+      }
+      let sessionIdError: string | null = null;
+      const childSessionArgs = (): string[] => {
+        if (!sessionRootStatus.ok) return degradedSessionArgs();
+        try {
+          const spec = newChildSession(sessionRootStatus.root);
+          console.log(
+            `[task] child session ${spec.sessionId} → ${spec.dir} (parent ${parentSessionId ?? "none"} @ ${parentSessionDir ?? "unknown"})`,
+          );
+          return spec.args;
+        } catch (err) {
+          sessionIdError = err instanceof Error ? err.message : String(err);
+          throw err;
+        }
+      };
+      // Fail closed on a malformed id BEFORE any spawn: pi's
+      // validateSessionIdFlags process.exit(1)s on a bad --session-id
+      // (dist/main.js:256), which the exit taxonomy reads as a plain `failed`
+      // result — and shared/retry.ts counts `failed` as success for retry
+      // purposes. The mint makes an invalid id unreachable except via a code
+      // bug; this is the guard for that bug.
+      if (sessionRootStatus.ok) {
+        try {
+          assertValidSessionId(mintChildSessionId());
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text", text: `❌ Sub-agent dispatch refused: invalid child session id — ${msg}` }],
+            details: { model, provider, status: "invalid-session-id", retryable: false, error: msg },
+          };
+        }
+      }
+      type DispatchPayload = { content: any[]; details: Record<string, unknown> };
+      // #783 Task 1: a dispatch that could not persist a transcript is still a
+      // dispatch (the tool result is real), but the degradation must be
+      // visible AND non-retryable — a retry cannot fix an unwritable root.
+      const withSessionDegraded = (value: DispatchPayload): DispatchPayload =>
+        sessionRootStatus.ok
+          ? value
+          : {
+              ...value,
+              details: {
+                ...value.details,
+                sessionDegraded: {
+                  reason: "task-session-root-unwritable",
+                  error: sessionRootStatus.error ?? "unknown",
+                  root: sessionRootStatus.root,
+                  retryable: false,
+                },
+              },
+            };
       const buildArgs = (leg: LegRef): string[] =>
-        ["-p", "--provider", leg.provider, "--model", leg.model, "--no-session", params.prompt];
-      const spawnLeg = (leg: LegRef) => spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal);
+        ["-p", "--provider", leg.provider, "--model", leg.model, ...childSessionArgs(), params.prompt];
+      // #783 Task 4: per-ATTEMPT record identity. `retry()` passes the attempt
+      // ordinal (shared/retry.ts `fn(attempt)`) and the call sites used to
+      // DISCARD it — without threading it, every retry row of one dispatch
+      // would be indistinguishable, defeating "one row per spawn attempt".
+      // `dispatchClass` is resolved once per dispatch; `parentSessionId` comes
+      // from the extension context (Task 1).
+      const dispatchClass = resolveDispatchClass(subAgentEnv);
+      const recordCtx = (attempt: number): DispatchRecordContext => ({
+        attempt,
+        parentSessionId,
+        dispatchClass,
+      });
+      const spawnLeg = (leg: LegRef, attempt = 1) =>
+        spawnSubAgent(leg.model, leg.provider, subAgentEnv, buildArgs(leg), signal, recordCtx(attempt));
 
-      let result = await retry(() => spawnLeg(dispatchLeg), retryOptions);
+      let result = await retry((attempt) => spawnLeg(dispatchLeg, attempt), retryOptions);
+      // A malformed per-attempt id throws inside childSessionArgs(); retry()
+      // swallows the throw, so surface the captured id error as a
+      // non-retryable refusal instead of a misleading "no output" failure.
+      if (sessionIdError) {
+        return {
+          content: [{ type: "text", text: `❌ Sub-agent dispatch refused: invalid child session id — ${sessionIdError}` }],
+          details: { model, provider, status: "invalid-session-id", retryable: false, error: sessionIdError },
+        };
+      }
 
       // #512 proof-of-routing ledger: an ACTUAL venice dispatch (the cold-class
       // seam resolved to the venice leg and no kill switch gated it) appends a
@@ -3481,7 +3905,7 @@ export default function (pi: ExtensionAPI) {
         result,
         env: subAgentEnv,
         spawn: async (leg) => {
-          const legResult = await retry(() => spawnLeg(leg), retryOptions);
+          const legResult = await retry((attempt) => spawnLeg(leg, attempt), retryOptions);
           return legResult;
         },
         onHop: (leg, hopCount, annotations) => {
@@ -3527,9 +3951,12 @@ export default function (pi: ExtensionAPI) {
         const fallbackProvider = fbResolved.provider ?? "deepseek";
         const primaryValue = result.value;
         console.log(`[builtin-tools] provider fallback: ${provider} → ${fallbackModel} after connection error`);
-        const fbArgs = ["-p", "--provider", fallbackProvider, "--model", fallbackModel, "--no-session", params.prompt];
+        // #783 Task 1: fallback leg mints a FRESH session id per attempt too
+        // (a shared const made retry attempt 2 append to attempt 1).
+        const buildFbArgs = (): string[] =>
+          ["-p", "--provider", fallbackProvider, "--model", fallbackModel, ...childSessionArgs(), params.prompt];
         const fbResult = await retry(
-          () => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, fbArgs, signal),
+          (attempt) => spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt)),
           retryOptions,
         );
         if (fbResult.status === "success" && fbResult.value) {
@@ -3553,29 +3980,29 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (result.status === "circuit_open") {
-        return {
+        return withSessionDegraded({
           content: [{ type: "text", text: "❌ Sub-agent circuit breaker open — too many consecutive zero-output failures. Wait 60s before retrying." }],
           details: { model, provider, status: "circuit_open", retries: result.retries },
-        };
+        });
       }
 
       if (result.status === "failed") {
-        return {
+        return withSessionDegraded({
           content: [{ type: "text", text: `❌ Sub-agent failed after ${result.retries} attempts with no output. Model may be hung or overloaded.` }],
           details: { model, provider, status: "failed", retries: result.retries, elapsedMs: result.elapsedMs },
-        };
+        });
       }
 
       // Success or partial output
       if (result.value) {
-        return result.value;
+        return withSessionDegraded(result.value);
       }
 
       // Fallback (shouldn't reach here)
-      return {
+      return withSessionDegraded({
         content: [{ type: "text", text: "Sub-agent returned no result." }],
         details: { model, provider },
-      };
+      });
     },
   });
 

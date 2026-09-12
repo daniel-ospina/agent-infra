@@ -138,6 +138,11 @@ jobs:
         npx tsx extensions/builtin-tools/provider-failover.integration.test.ts || failures=$((failures+1))
         echo "== extensions/builtin-tools/cut-resume.integration.test.ts =="
         npx tsx extensions/builtin-tools/cut-resume.integration.test.ts || failures=$((failures+1))
+        # #783 — the composer consolidation: cap / cut / heartbeat / backstop
+        # all resolve through composeAbnormalExit, proven against a real cap
+        # payload + the census instrument. Runs after the npm ci above.
+        echo "== extensions/builtin-tools/task-cap-handoff.integration.test.ts =="
+        npx tsx extensions/builtin-tools/task-cap-handoff.integration.test.ts || failures=$((failures+1))
         # provider-failover*.test.ts under extensions/shared are auto-picked by
         # the shared glob above (incl. the python3-spawning parity suite).
         # #553/#573/#574 — subagent suites: the two builtin-tools suites spawn a
@@ -161,6 +166,12 @@ jobs:
         npx tsx extensions/subagent/timeout-integration.test.ts || failures=$((failures+1))
         echo "== extensions/subagent/cache-integration.test.ts =="
         npx tsx extensions/subagent/cache-integration.test.ts || failures=$((failures+1))
+        # #783 Task 7.3 — subagent parity pin: the ext keeps its OWN timeout /
+        # stall semantics and was NOT dragged by the builtin-tools task-constant
+        # split. Zero-dep source pin (node:* + readFileSync only), wired here —
+        # NOT ci.yml's verify job — because that job deliberately runs no npm ci.
+        echo "== extensions/subagent/subagent-parity.test.ts =="
+        npx tsx extensions/subagent/subagent-parity.test.ts || failures=$((failures+1))
         echo "== extensions/builtin-tools/subagent-integration.test.ts =="
         PATH="$PWD/extensions/subagent/node_modules/.bin:$PATH" \
           npx tsx extensions/builtin-tools/subagent-integration.test.ts || failures=$((failures+1))
@@ -214,6 +225,10 @@ jobs:
           # only); real-tty assertions are dev-box verification steps in the
           # #469 plan, not CI.
           bash scripts/pi-reap-idle.test.sh || errors=$((errors+1))
+          # #783 — task-session retention sweep: live child survives every pass,
+          # ps-probe failure deletes nothing (fail-closed), TOCTOU re-probe,
+          # dry-run default. Hermetic (fake PS shim + throwaway root/log).
+          bash scripts/pi-task-session-prune.test.sh || errors=$((errors+1))
           bash scripts/record-review.test.sh || errors=$((errors+1))
           # #449 — pi-bootstrap setup regression suite (no-nesting #93, active-refresh,
           # farm-link preservation, extensions/ content parity = #447 ship-list drift

@@ -229,6 +229,11 @@ async function dispatchTaskTool(
 	const savedEldato = process.env.ELDATO_ALLOW_MAIN_EDITS;
 	const savedScenario = process.env.FAKE_PI_SCENARIO;
 	const savedHatchFile = process.env.FAKE_PI_HATCH_FILE;
+	// #783 Task 1: the real execute() now creates + persists child sessions;
+	// point the session root at the suite's tmpdir so tests never accumulate
+	// real child session dirs under the operator's $HOME.
+	const savedSessionRoot = process.env.TASK_SESSION_ROOT;
+	process.env.TASK_SESSION_ROOT = path.join(tmpDir, "task-sessions");
 	if (parentHatch === "both") {
 		process.env.AGENT_ALLOW_MAIN_EDITS = "1";
 		process.env.ELDATO_ALLOW_MAIN_EDITS = "1";
@@ -250,6 +255,8 @@ async function dispatchTaskTool(
 		else process.env.FAKE_PI_SCENARIO = savedScenario;
 		if (savedHatchFile === undefined) delete process.env.FAKE_PI_HATCH_FILE;
 		else process.env.FAKE_PI_HATCH_FILE = savedHatchFile;
+		if (savedSessionRoot === undefined) delete process.env.TASK_SESSION_ROOT;
+		else process.env.TASK_SESSION_ROOT = savedSessionRoot;
 	}
 }
 

@@ -12,7 +12,8 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL } from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine } from "./index.js";
+import { asyncRepoState } from "../repo-freshness.js";
 
 import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
 import * as childHb from "../task-heartbeat.js";
@@ -24,9 +25,10 @@ const childFactory: (pi: any) => void =
 import type { ModelRegistry } from "./index.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
-import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync } from "node:fs";
+import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
   resolveDispatchLeg,
@@ -1067,7 +1069,11 @@ test("getHeartbeatIntervalMs — TASK_HEARTBEAT_INTERVAL_MS override, clamped", 
 test("stall-bound getters — defaults + ≥60s clamp", () => {
   withEnv({ TASK_STREAM_STALL_MS: undefined, TASK_TOOL_STALL_MS: undefined, TASK_FIRST_MESSAGE_MS: undefined }, () => {
     equal(getStreamStallMs(), DEFAULT_STREAM_STALL_MS);
-    equal(getToolStallMs(), DEFAULT_TOOL_STALL_MS);
+    // #783 fix 4: the task path's tool-stall default is the task-local 2h
+    // (DEFAULT_TASK_TOOL_STALL_MS), while the exported DEFAULT_TOOL_STALL_MS
+    // stays frozen at 6h for extensions/subagent/index.ts.
+    equal(getToolStallMs(), 7_200_000);
+    equal(DEFAULT_TOOL_STALL_MS, 21_600_000);
     equal(getFirstMessageMs(), DEFAULT_FIRST_MESSAGE_MS);
   });
   withEnv({ TASK_STREAM_STALL_MS: "5", TASK_TOOL_STALL_MS: "-1", TASK_FIRST_MESSAGE_MS: "NaN" }, () => {
@@ -1368,6 +1374,36 @@ test("#191: ANSI-decorated session_end still fires the edge", () => {
   ingestHeartbeatChunk("\u001b[31m[task-heartbeat] session_end nonce=n9\u001b[0m\n", ctx, 1);
   equal(ends, 1);
   ok(ctx.state.sessionEnded);
+});
+
+test("#783: fresh --session-id warning is known-noise — never flips hasOutput", () => {
+  // pi prints this on stderr for a --session-id that does not exist yet
+  // (main.js:338-344). If it counted as real output, resolveUndefined =
+  // !hasOutput would be permanently false and every zero-output settle dead.
+  const warn =
+    "Warning: No project session found with id '0192a3f0-1b2c-7def-8abc-0123456789ab'; creating a new session with that id.";
+  const { ctx, acc, real, life } = makeIngest();
+  ingestHeartbeatChunk(warn + "\n", ctx, 1);
+  equal(real(), false, "warning must NOT flip hasOutput");
+  equal(acc(), "", "known-noise is filtered out of the stderr accumulator");
+  equal(life(), 1, "byte arrival is still a life sign");
+  equal(ctx.state.markerCount, 0, "not a heartbeat marker");
+
+  // ANSI-wrapped (chalk.yellow when stderr is a TTY) still matches.
+  const { ctx: c2, real: real2 } = makeIngest();
+  ingestHeartbeatChunk("\u001b[33m" + warn + "\u001b[39m\n", c2, 1);
+  equal(real2(), false, "ANSI-decorated warning filtered too");
+
+  // Same warning arriving as trailing residue (no newline) on flush/kill.
+  const { ctx: c3, real: real3 } = makeIngest();
+  ingestHeartbeatChunk(warn, c3, 1);
+  equal(flushHeartbeatLineBuf(c3), "", "warning residue dropped on flush");
+  equal(real3(), false);
+
+  // A genuine child error line still flips hasOutput.
+  const { ctx: c4, real: real4 } = makeIngest();
+  ingestHeartbeatChunk(warn + "\nreal child error line\n", c4, 2);
+  ok(real4(), "genuine stderr still flips hasOutput");
 });
 
 section("#176 heartbeat — heartbeatKillDecision (E1–E3, E5–E7, E9–E13)");
@@ -3811,8 +3847,14 @@ test("#512 second-model P2 (SM2): the venice-route append runs AFTER the first s
   //   2. the recordVeniceRoute call site sits AFTER it
   //   3. the never-spawned discriminator (circuit_open && retries === 0) sits
   //      between them and gates the append
-  const spawnRetryIdx = source.indexOf("let result = await retry(() => spawnLeg(dispatchLeg), retryOptions);");
-  ok(spawnRetryIdx > 0, "first-spawn retry present in source");
+  // #783 Task 4 REPIN: the first-spawn retry now threads `retry()`'s attempt
+  // ordinal into the spawn (and thence into the durable outcome record) —
+  // `retry(() => spawnLeg(dispatchLeg), …)` became
+  // `retry((attempt) => spawnLeg(dispatchLeg, attempt), …)`. The property this
+  // pin guards (the venice-route append runs AFTER the first spawn attempt) is
+  // unchanged; only the call's text moved.
+  const spawnRetryIdx = source.indexOf("let result = await retry((attempt) => spawnLeg(dispatchLeg, attempt), retryOptions);");
+  ok(spawnRetryIdx > 0, "first-spawn retry (attempt-threading shape, #783 Task 4) present in source");
   const routeCallIdx = source.lastIndexOf("recordVeniceRoute(");
   ok(spawnRetryIdx < routeCallIdx, "venice-route append runs AFTER the first spawn attempt (no row for a never-spawned dispatch)");
   const neverSpawnedIdx = source.indexOf("result.status === \"circuit_open\" && result.retries === 0");
@@ -3869,6 +3911,84 @@ test("scanStderrForUsage: line-anchored + nonce-validated; LAST occurrence wins"
 });
 
 
+
+// ── #783 Task 1/2 — durable child session + parent-reported repo state ──
+
+section("#783 Task 1 — durable child session per spawn (source pins)");
+
+test("#783/T1: both spawn arg vectors mint a fresh session per attempt", () => {
+  ok(source.includes("const buildArgs = (leg: LegRef): string[] =>"), "primary arg vector built per attempt");
+  ok(source.includes("const buildFbArgs = (): string[] =>"), "fallback arg vector built per attempt");
+  ok(!/const fbArgs\s*=/.test(source), "the fallback vector is NOT a hoisted const (retry attempt 2 would append)");
+  ok(source.includes("...childSessionArgs()"), "session flags come from the per-call minter");
+  ok(!source.includes('"--no-session"'), "no arg vector hardcodes --no-session (the degrade vector lives in session-id.ts)");
+});
+
+test("#783/T1: ctx supplies parent session identity (never the env ancestor-id channel)", () => {
+  ok(source.includes("async execute(_toolCallId, params, signal, _onUpdate, ctx)"), "task tool execute takes the extension ctx");
+  ok(source.includes("ctx?.sessionManager?.getSessionId()"), "parent session id read from ctx");
+  ok(source.includes("ctx?.sessionManager?.getSessionDir()"), "parent session dir read from ctx");
+  ok(!source.includes("process.env.PI_SESSION_ID"), "PI_SESSION_ID is never read (ancestor-id misattribution)");
+});
+
+test("#783/T1: root failure degrades to --no-session with a non-retryable class", () => {
+  ok(source.includes("ensureTaskSessionRoot(resolveTaskSessionRoot(subAgentEnv))"), "root resolved + created once per dispatch");
+  ok(source.includes("task-session-root-unwritable"), "degrade class surfaced in the payload");
+  ok(source.includes('status: "invalid-session-id", retryable: false'), "invalid id is a non-retryable refusal");
+});
+
+section("#783 Task 2 — the parent reports where the child ran");
+
+test("#783/T2: renderRepoStateLine — name=value, single line, detached HEAD → branch=null", () => {
+  const line = renderRepoStateLine({ branch: "fix/x", headSha: "abc123", dirty: true, paths: ["a", "b"] }, "/tmp/wt");
+  equal(line, "branch=fix/x headSha=abc123 worktree=/tmp/wt dirty=true dirtyPaths=2");
+  ok(!line.includes("\n"), "never a newline — the Alive state line stays single-line");
+  ok(/(^|\s)branch=/.test(" " + line), "census-visible name=value form");
+  const detached = renderRepoStateLine({ branch: null, headSha: "deadbeef", dirty: false, paths: [] }, "/tmp/wt");
+  equal(detached, "branch=null headSha=deadbeef worktree=/tmp/wt dirty=false dirtyPaths=0");
+  ok(detached.includes("worktree=/tmp/wt"), "detached HEAD still names the recovery key");
+  equal(
+    renderRepoStateLine(null, "/tmp/wt"),
+    "branch=unknown headSha=unknown worktree=/tmp/wt dirty=unknown dirtyPaths=unknown",
+    "unresolved probe renders unknown, never a bare number",
+  );
+});
+
+test("#783/T2: every Alive state template appends the cached repo state (source pin)", () => {
+  const aliveTemplates = source.match(/Alive state: toolsInFlight=[^\n]*/g) ?? [];
+  ok(aliveTemplates.length >= 4, `four abnormal-exit Alive state sites (found ${aliveTemplates.length})`);
+  for (const site of aliveTemplates) {
+    ok(site.includes("${repoStateText()}"), "every Alive state line appends branch/headSha/worktree/dirty");
+  }
+  ok(source.includes("let repoState: RepoState | null = null;"), "per-dispatch cached repoState");
+  ok(source.includes("void asyncRepoState(process.cwd(), { signal })"), "probed ONCE at spawn");
+});
+
+testAsync("#783/T2: asyncRepoState reads branch/headSha/dirty/paths from a real repo", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t2-repo-"));
+  try {
+    execSync("git init -q", { cwd: dir });
+    execSync("git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", { cwd: dir });
+    const clean = await asyncRepoState(dir);
+    ok(clean, "clean repo probed");
+    ok(typeof clean!.branch === "string" && clean!.branch.length > 0, "branch read");
+    ok(/^[0-9a-f]{40}$/.test(clean!.headSha ?? ""), `headSha is a full sha (got ${clean!.headSha})`);
+    equal(clean!.dirty, false);
+    deepEqual(clean!.paths, []);
+
+    writeFileSync(join(dir, "a.txt"), "x");
+    const dirty = await asyncRepoState(dir);
+    equal(dirty!.dirty, true, "untracked file makes the tree dirty");
+    deepEqual(dirty!.paths, ["a.txt"], "the changed path is reported");
+    equal(dirty!.headSha, clean!.headSha, "headSha unchanged by a worktree edit");
+
+    execSync("git checkout -q --detach", { cwd: dir });
+    const detached = await asyncRepoState(dir);
+    equal(detached!.branch, null, "detached HEAD → branch=null (worktree is the recovery key)");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
   for (const t of asyncTests) await t();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

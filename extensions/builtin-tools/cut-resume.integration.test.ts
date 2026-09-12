@@ -161,6 +161,11 @@ let savedArgv1: string;
 let savedInterval: string | undefined;
 let savedSweep: string | undefined;
 let savedDetached: string | undefined;
+// #783 Task 4: spawnSubAgent now writes a durable `dispatch-outcome` row to
+// <agentDir>/audit/provider-failover.jsonl. These suites drive the REAL
+// spawnSubAgent, so without this the test runs would append junk rows to the
+// operator's REAL ledger.
+let savedAgentDir: string | undefined;
 let sentinel: import("node:child_process").ChildProcess;
 const parentPgid = getPgid(process.pid);
 /** Holder pids recorded across all dispatches — killed in teardown so the
@@ -177,6 +182,10 @@ function setup() {
 	process.argv[1] = undefined as unknown as string;
 	savedInterval = process.env.TASK_HEARTBEAT_INTERVAL_MS;
 	process.env.TASK_HEARTBEAT_INTERVAL_MS = "5000";
+	// #783 Task 4: hermetic dispatch-outcome ledger — never the operator's.
+	savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = path.join(tmpDir, "agent-dir");
+	fs.mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
 	// ensure the opt-out envs are clean unless a test sets them explicitly
 	savedSweep = process.env.TASK_SWEEP;
 	savedDetached = process.env.TASK_DETACHED;
@@ -199,6 +208,9 @@ function teardown() {
 	else process.env.TASK_SWEEP = savedSweep;
 	if (savedDetached === undefined) delete process.env.TASK_DETACHED;
 	else process.env.TASK_DETACHED = savedDetached;
+	// #783 Task 4: restore the ledger dir (the tmpdir is removed below).
+	if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
 	try { sentinel.kill("SIGKILL"); } catch { /* gone */ }
 	for (const pid of holderPids) {
 		try { process.kill(pid, "SIGKILL"); } catch { /* already dead */ }

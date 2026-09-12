@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# pi-task-session-prune.test.sh — self-check for
+# scripts/pi-task-session-prune.sh + its launchd template (#783 Task 6).
+#
+# Run: bash scripts/pi-task-session-prune.test.sh
+# Exits 0 when ALL assertions pass, 1 on any failure. Hermetic: fake PS_BIN
+# shim + a throwaway TASK_SESSION_ROOT / TASK_SESSION_PRUNE_LOG / fake HOME —
+# never touches the real ~/.pi/agent/task-sessions. Coverage:
+#   age rule      an age-expired non-live transcript is pruned; a young one
+#                 survives; a LIVE child's transcript survives every pass
+#   size rule     age floor irrelevant; oldest non-live first until under
+#                 TASK_SESSION_MAX_BYTES; a live child's bytes count toward
+#                 the tree but are never evicted
+#   dry-run       TASK_SESSION_PRUNE_DRY_RUN defaults to 1 (nothing deleted);
+#                 --apply / TASK_SESSION_PRUNE_DRY_RUN=0 arm; --dry-run wins
+#   fail-closed   ps unavailable / ps errors / empty ps probe → exit 3 and
+#                 ZERO files deleted (armed pass too)
+#   TOCTOU        a child that goes live between classification and unlink is
+#                 re-probed and its transcript survives
+#   dirs          a per-child dir is rmdir'd only when EMPTY and not live
+#   log contract  "[task-session-prune] freed=<N>MB remaining=<N>MB pruned=<N>"
+#   template      the shipped plist is DRY-RUN, hourly, versioned, and its
+#                 ProgramArguments target is the farmed script
+#   real ps       #783 Task 7.2: against the REAL /bin/ps (not the shim), a
+#                 live child's argv is matched and its transcript survives,
+#                 while an unowned old transcript is still evicted (no
+#                 false-live). The #469 reaper cannot see a tty-less task
+#                 child at all, so this sweep is the only one that can delete
+#                 it — the matcher must work against the real ps table.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PRUNER="$SCRIPT_DIR/pi-task-session-prune.sh"
+TEMPLATE="$SCRIPT_DIR/../templates/launchd/com.eldato.pi-task-session-prune.plist"
+
+PASS=0
+FAIL=0
+ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
+bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
+assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi }
+assert_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi }
+assert_not_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi }
+exists() { if [ -e "$1" ]; then ok "$2"; else bad "$2 (missing: $1)"; fi }
+absent() { if [ -e "$1" ]; then bad "$2 (still present: $1)"; else ok "$2"; fi }
+
+T="$(mktemp -d "${TMPDIR:-/tmp}/pi-task-prune-test.XXXXXX")"
+trap 'rm -rf "$T"' EXIT
+
+# Deterministic pass clock; fixtures set mtimes relative to it.
+NOW=1800000000
+DAY=86400
+
+# ── ps shim ────────────────────────────────────────────────────────────
+# Bulk contract only: `<pid> <command…>`. FAKE_PS_FAIL n → exit n.
+# FAKE_PS_SEQ_DIR → call N renders <dir>/N (and exits 1 when absent, so a
+# TOCTOU sequence can flip liveness between probes).
+mkdir -p "$T/bin"
+cat > "$T/bin/ps" <<'SHIM'
+#!/usr/bin/env bash
+N=0
+if [ -n "${FAKE_PS_COUNT:-}" ]; then
+    [ -f "$FAKE_PS_COUNT" ] && N="$(cat "$FAKE_PS_COUNT")"
+    N=$((N + 1))
+    printf '%s\n' "$N" > "$FAKE_PS_COUNT"
+fi
+if [ -n "${FAKE_PS_SEQ_DIR:-}" ]; then
+    if [ -f "$FAKE_PS_SEQ_DIR/$N" ]; then cat "$FAKE_PS_SEQ_DIR/$N"; exit 0; fi
+    exit 1
+fi
+if [ -n "${FAKE_PS_FAIL:-}" ]; then exit "${FAKE_PS_FAIL}"; fi
+if [ -n "${FAKE_PS_EMPTY:-}" ]; then exit 0; fi
+if [ -n "${FAKE_PS_SOURCE:-}" ]; then sed 's/^ *//' "$FAKE_PS_SOURCE"; exit 0; fi
+# Real ps always lists at least the running process; the default must be a
+# NON-EMPTY table of non-matching rows (an empty probe is fail-closed).
+printf '%s 0 /usr/bin/env\n' "$$"
+exit 0
+SHIM
+chmod +x "$T/bin/ps"
+
+# ── fixture helpers ────────────────────────────────────────────────────
+# mksession <path> <bytes> <age-seconds> — writes the file and backdates its
+# mtime to NOW - age (python os.utime: portable across BSD/GNU).
+mksession() {
+    python3 - "$1" "$2" "$3" "$NOW" <<'PY'
+import os, sys
+p, n, age, now = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+os.makedirs(os.path.dirname(p), exist_ok=True)
+with open(p, "wb") as fh:
+    fh.write(b"x" * n)
+t = now - age
+os.utime(p, (t, t))
+PY
+}
+
+# live_row <pid> <childId> <root> [prompt] — the argv shape Task 1 spawns.
+live_row() {
+    printf '%s %s\n' "$1" "node /usr/local/bin/pi -p --provider p --model m --session-id $2 --session-dir $3 $4"
+}
+
+mk_env() { mkdir -p "$T/$1/root"; }
+
+# Per-run ps env (reset explicitly — no cross-section leakage).
+PS_SOURCE=""; PS_FAIL=""; PS_SEQ_DIR=""; PS_COUNT=""; PS_EMPTY=""; OVERRIDE_PS_BIN=""
+MAX_AGE_DAYS="7"; MAX_BYTES="2147483648"; DRY_RUN="1"
+ROOT_OVERRIDE=""; LOG_OVERRIDE=""
+
+run_prune() { # <envname> [args…]
+    local envname="$1"; shift
+    TASK_SESSION_ROOT="${ROOT_OVERRIDE:-$T/$envname/root}" \
+    PS_BIN="${OVERRIDE_PS_BIN:-$T/bin/ps}" \
+    TASK_SESSION_PRUNE_LOG="${LOG_OVERRIDE:-$T/$envname/prune.log}" \
+    TASK_SESSION_PRUNE_NOW_EPOCH="$NOW" \
+    TASK_SESSION_MAX_AGE_DAYS="$MAX_AGE_DAYS" \
+    TASK_SESSION_MAX_BYTES="$MAX_BYTES" \
+    TASK_SESSION_PRUNE_DRY_RUN="$DRY_RUN" \
+    FAKE_PS_SOURCE="$PS_SOURCE" \
+    FAKE_PS_FAIL="$PS_FAIL" \
+    FAKE_PS_SEQ_DIR="$PS_SEQ_DIR" \
+    FAKE_PS_EMPTY="$PS_EMPTY" \
+    FAKE_PS_COUNT="$PS_COUNT" \
+    bash "$PRUNER" "$@"
+}
+
+echo "── pi-task-session-prune.test.sh ─────────────────────────────────"
+
+# ── 1. age rule + dry-run vs armed ─────────────────────────────────────
+mk_env A
+mksession "$T/A/root/live-a/1780000000_live-a.jsonl" 100 $((9 * DAY))
+mksession "$T/A/root/dead-age/1780000000_dead-age.jsonl" 200 $((9 * DAY))
+mksession "$T/A/root/dead-young/1780000000_dead-young.jsonl" 300 $((DAY / 2))
+live_row 101 live-a "$T/A/root/live-a" "old but live" >"$T/A/ps-source"
+PS_SOURCE="$T/A/ps-source"
+
+OUT="$(run_prune A --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "0" "A1 dry-run exits 0"
+assert_contains "$OUT" "MODE=dry-run pruned=1" "A1 dry-run reports exactly 1 would-prune"
+assert_contains "$OUT" "DRY-RUN — nothing deleted" "A1 dry-run notice printed"
+exists "$T/A/root/dead-age/1780000000_dead-age.jsonl" "A1 dry-run deletes NOTHING (age-expired file intact)"
+assert_contains "$(cat "$T/A/prune.log")" "[task-session-prune] freed=" "A1 log contract line present"
+
+OUT="$(run_prune A --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "A2 armed pass exits 0"
+assert_contains "$OUT" "MODE=apply pruned=1" "A2 armed pass pruned=1"
+absent "$T/A/root/dead-age/1780000000_dead-age.jsonl" "A2 age-expired NON-LIVE transcript pruned"
+exists "$T/A/root/live-a/1780000000_live-a.jsonl" "A2 LIVE child's transcript survives (9 days old)"
+exists "$T/A/root/live-a" "A2 live child's directory kept"
+exists "$T/A/root/dead-young/1780000000_dead-young.jsonl" "A2 young transcript (< age floor) survives"
+assert_contains "$OUT" "WARNING: [task-session-prune]" "A2 loud warning when it frees anything"
+
+# ── 2. size rule binds (age floor irrelevant) ──────────────────────────
+mk_env B
+MAX_AGE_DAYS=3650; MAX_BYTES=1000
+mksession "$T/B/root/b-old/1780000000_b-old.jsonl" 600 100
+mksession "$T/B/root/b-new/1780000000_b-new.jsonl" 600 50
+mksession "$T/B/root/b-live/1780000000_b-live.jsonl" 600 10
+live_row 201 b-live "$T/B/root/b-live" "600B live" >"$T/B/ps-source"
+PS_SOURCE="$T/B/ps-source"
+OUT="$(run_prune B --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "B1 size-bound pass exits 0"
+assert_contains "$OUT" "MODE=apply pruned=2" "B1 size breach evicts the 2 oldest NON-LIVE transcripts"
+absent "$T/B/root/b-old/1780000000_b-old.jsonl" "B1 oldest evicted first"
+absent "$T/B/root/b-new/1780000000_b-new.jsonl" "B1 next-oldest evicted (still over cap)"
+exists "$T/B/root/b-live/1780000000_b-live.jsonl" "B1 live child's bytes counted but never evicted"
+assert_contains "$OUT" "remaining=600B" "B1 remaining is the live child's 600B (under cap)"
+
+# boundary: total exactly at the cap → no eviction
+mk_env B2
+MAX_BYTES=1200
+mksession "$T/B2/root/exact/1780000000_exact.jsonl" 1200 100
+PS_SOURCE=""
+OUT="$(run_prune B2 --apply 2>&1)"
+assert_contains "$OUT" "pruned=0" "B2 total == cap → nothing pruned (strict >)"
+exists "$T/B2/root/exact/1780000000_exact.jsonl" "B2 at-cap transcript survives"
+
+# two live children alone over the cap → still nothing deleted
+mk_env B3
+MAX_BYTES=100
+mksession "$T/B3/root/l1/1780000000_l1.jsonl" 600 100
+mksession "$T/B3/root/l2/1780000000_l2.jsonl" 600 100
+{ live_row 301 l1 "$T/B3/root/l1" "a"; live_row 302 l2 "$T/B3/root/l2" "b"; } >"$T/B3/ps-source"
+PS_SOURCE="$T/B3/ps-source"
+OUT="$(run_prune B3 --apply 2>&1)"
+assert_contains "$OUT" "pruned=0" "B3 live-only tree over cap → zero deletions (never evict a live child)"
+
+# reset shared knobs
+MAX_AGE_DAYS=7; MAX_BYTES=2147483648; PS_SOURCE=""
+
+# ── 3. fail-closed when the ps probe is unavailable ────────────────────
+mk_env C
+mksession "$T/C/root/c-age/1780000000_c-age.jsonl" 500 $((9 * DAY))
+OVERRIDE_PS_BIN="$T/bin/does-not-exist"
+OUT="$(run_prune C --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "C1 ps unavailable → exit 3"
+assert_contains "$OUT" "FAIL-CLOSED abort" "C1 fail-closed abort named"
+exists "$T/C/root/c-age/1780000000_c-age.jsonl" "C1 NOTHING deleted when ps is unavailable"
+OVERRIDE_PS_BIN=""
+
+PS_FAIL=1
+OUT="$(run_prune C --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "C2 ps exits nonzero → exit 3"
+exists "$T/C/root/c-age/1780000000_c-age.jsonl" "C2 NOTHING deleted on a ps error"
+PS_FAIL=""
+
+PS_EMPTY=1   # shim prints nothing (exit 0) → empty probe is an ERROR
+OUT="$(run_prune C --apply 2>&1)"; RC=$?
+assert_eq "$RC" "3" "C3 empty ps probe → exit 3 (empty is never 'no live children')"
+exists "$T/C/root/c-age/1780000000_c-age.jsonl" "C3 NOTHING deleted on an empty probe"
+PS_EMPTY=""
+
+# ── 4. dirs: rmdir only when EMPTY and not live ────────────────────────
+mk_env D
+mkdir -p "$T/D/root/empty-dead" "$T/D/root/empty-live"
+mksession "$T/D/root/has-fresh/1780000000_has-fresh.jsonl" 10 30
+mksession "$T/D/root/ageout/1780000000_ageout.jsonl" 40 $((9 * DAY))
+live_row 401 empty-live "$T/D/root/empty-live" "live, no write yet" >"$T/D/ps-source"
+PS_SOURCE="$T/D/ps-source"
+OUT="$(run_prune D --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "D1 mixed-dir pass exits 0"
+absent "$T/D/root/empty-dead" "D1 empty non-live dir rmdir'd"
+exists "$T/D/root/empty-live" "D1 empty but LIVE dir kept (child may be about to write)"
+exists "$T/D/root/has-fresh" "D1 non-empty dir never removed with content"
+exists "$T/D/root/has-fresh/1780000000_has-fresh.jsonl" "D1 fresh file inside kept"
+absent "$T/D/root/ageout" "D1 emptied-not-live dir rmdir'd after its file was pruned"
+assert_contains "$OUT" "dirs=2" "D1 both emptied dirs counted (empty-dead + ageout)"
+exists "$T/D/root" "D1 the session ROOT (parent) dir is never removed"
+
+# ── 5. TOCTOU: child goes live between classification and unlink ───────
+mk_env E
+mksession "$T/E/root/toctou/1780000000_toctou.jsonl" 700 $((9 * DAY))
+mkdir -p "$T/E/seq"
+printf '%s\n' "999 999 0 /usr/bin/vim notes.md" >"$T/E/seq/1"   # classification: not live
+live_row 501 toctou "$T/E/root/toctou" "just started" >"$T/E/seq/2"  # re-probe: live
+live_row 501 toctou "$T/E/root/toctou" "just started" >"$T/E/seq/3"
+PS_SEQ_DIR="$T/E/seq"; PS_COUNT="$T/E/ps.count"
+OUT="$(run_prune E --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "E1 TOCTOU pass exits 0"
+exists "$T/E/root/toctou/1780000000_toctou.jsonl" "E1 transcript survives — re-probed live immediately before unlink"
+assert_contains "$(cat "$T/E/prune.log")" "went live before unlink (TOCTOU re-probe)" "E1 TOCTOU skip logged"
+assert_contains "$OUT" "pruned=0" "E1 nothing pruned"
+PS_SEQ_DIR=""; PS_COUNT=""
+
+# ── 6. mode resolution: dry-run by default ─────────────────────────────
+mk_env F
+mksession "$T/F/root/f-age/1780000000_f-age.jsonl" 100 $((9 * DAY))
+PS_SOURCE=""
+DRY_RUN="1"
+OUT="$(run_prune F 2>&1)"
+assert_contains "$OUT" "MODE=dry-run" "F1 TASK_SESSION_PRUNE_DRY_RUN=1 + no flag → dry-run"
+exists "$T/F/root/f-age/1780000000_f-age.jsonl" "F1 default dry-run deletes nothing"
+
+DRY_RUN="0"
+OUT="$(run_prune F 2>&1)"
+assert_contains "$OUT" "MODE=apply" "F2 TASK_SESSION_PRUNE_DRY_RUN=0 + no flag → armed"
+absent "$T/F/root/f-age/1780000000_f-age.jsonl" "F2 env-armed pass deletes the age-expired transcript"
+
+mksession "$T/F/root/f-age/1780000000_f-age.jsonl" 100 $((9 * DAY))
+OUT="$(run_prune F --dry-run 2>&1)"
+assert_contains "$OUT" "MODE=dry-run" "F3 explicit --dry-run beats TASK_SESSION_PRUNE_DRY_RUN=0"
+exists "$T/F/root/f-age/1780000000_f-age.jsonl" "F3 explicit dry-run deletes nothing"
+DRY_RUN="1"
+
+# ── 7. absent root is a clean no-op ────────────────────────────────────
+ROOT_OVERRIDE="$T/nope/root"; LOG_OVERRIDE="$T/nope.log"
+OUT="$(run_prune G --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "G1 absent root exits 0"
+assert_contains "$OUT" "root absent" "G1 absent root reported"
+ROOT_OVERRIDE=""; LOG_OVERRIDE=""
+
+# ── 8. shipped template is DRY-RUN, hourly, versioned ──────────────────
+TPL="$(cat "$TEMPLATE")"
+assert_contains "$TPL" "agent-infra-plist-version: 0.1.0" "H1 template carries the version marker"
+assert_contains "$TPL" "TASK_SESSION_PRUNE_DRY_RUN" "H2 template carries the dry-run env key"
+assert_contains "$TPL" "<string>1</string>" "H3 shipped plist is DRY-RUN (=1)"
+assert_contains "$TPL" "<integer>3600</integer>" "H4 hourly StartInterval 3600"
+assert_contains "$TPL" "{{HOME}}/.pi/agent/scripts/pi-task-session-prune.sh" "H5 ProgramArguments points at the farmed script"
+assert_contains "$TPL" "<string>com.eldato.pi-task-session-prune</string>" "H6 Label matches the template filename"
+
+# ── 9. REAL /bin/ps: the reaper-vs-prune interaction (#783 Task 7.2) ────
+# Sections 1–5 prove the classification with a fake-ps SHIM (the exact argv
+# shape Task 1 spawns). The shim cannot prove the seam itself, so this section
+# runs the pruner against the REAL `ps -axo pid=,command=` with a real
+# background process whose command line carries the `--session-id` /
+# `--session-dir` pair. Context: pi-reap-idle.sh gates candidates on
+# `tty ~ /^ttys/` and task children are spawned detached (no tty), so the
+# reaper can NEVER see them — this prune is the only sweep that can delete a
+# live child's transcript, and it must recognise one from the real ps table.
+mk_env I
+mksession "$T/I/root/real-live/1780000000_real-live.jsonl" 400 $((9 * DAY))
+mksession "$T/I/root/real-dead/1780000000_real-dead.jsonl" 400 $((9 * DAY))
+cat > "$T/hold-open.sh" <<'HOLD'
+#!/usr/bin/env bash
+# argv carrier: the args after the script path are exactly what the pruner's
+# `--session-id` / `--session-dir` matcher looks for. TERM reaps the child.
+sleep 600 &
+W=$!
+trap 'kill $W 2>/dev/null; exit 0' TERM INT
+wait $W
+HOLD
+bash "$T/hold-open.sh" --session-id real-live --session-dir "$T/I/root/real-live" &
+REAL_CHILD=$!
+sleep 1   # let it become visible in ps before the pass
+OVERRIDE_PS_BIN="/bin/ps"
+OUT="$(run_prune I --apply 2>&1)"; RC=$?
+assert_eq "$RC" "0" "I1 real-ps pass exits 0"
+assert_contains "$OUT" "pruned=1" "I1 real ps: only the non-live transcript pruned"
+exists "$T/I/root/real-live/1780000000_real-live.jsonl" "I1 REAL live child's transcript survives (9 days old)"
+absent "$T/I/root/real-dead/1780000000_real-dead.jsonl" "I1 real ps: unowned old transcript IS pruned (no false-live)"
+kill "$REAL_CHILD" 2>/dev/null; wait "$REAL_CHILD" 2>/dev/null
+OVERRIDE_PS_BIN=""
+
+echo ""
+echo "── Summary ───────────────────────────────────────────────────────"
+echo "  PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
+echo "  ✅ all checks passed"
+exit 0

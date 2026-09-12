@@ -183,6 +183,31 @@ Use Pi's `task` tool for all sub-agent work. Sub-agents have isolated context �
 
 <!-- REPO-SPECIFIC: Add tool-specific exceptions here (e.g., design_reviewer for Claude Opus) -->
 
+## Durable Dispatch Record & Task-Session Retention (#783)
+
+**Every builtin `task` dispatch writes one immutable outcome row.** The row lands in the
+**existing** dispatch ledger, `~/.pi/agent/audit/provider-failover.jsonl` (JSONL,
+`event: "dispatch-outcome"`; gate `DISPATCH_LEDGER`, default ON) — never a new file. Its
+`dispatchId` is the dispatch's `TASK_HEARTBEAT_NONCE`, so it joins the #512 usage and #476
+failover rows on one key in one file (#796 consumes it). The ledger is **append-only**: a written
+row can never be edited, so a reader that needs to **amend** an outcome must append a
+**follow-up row keyed by `dispatchId` + `childSessionId` + `attempt`** — never rewrite history.
+
+**Each dispatch also keeps its child's transcript** under `$TASK_SESSION_ROOT` (default
+`~/.pi/agent/task-sessions/`), a **mode 0700** root with one `<uuid>/` directory per spawn
+attempt.
+
+**Retention is owned, bounded, and dry-run by default.** Owner: **the organisation-design-team
+operator on call for agent-infra**. Bounds: `TASK_SESSION_MAX_AGE_DAYS` (7) **or**
+`TASK_SESSION_MAX_BYTES` (2 GB), whichever binds first, evicting oldest-non-live first. The
+shipped job (`com.eldato.pi-task-session-prune`) is **DRY-RUN**;
+**arming it is a separate manual step owned by that operator** (with a dated trigger). Until it is
+armed the bounds do not bind — a known, accepted state, not a silent one.
+
+**Tolerance rule:** rows written by other framework versions may **lack identity fields**
+(`dispatchId`, `childSessionId`, `attempt`, `dispatchClass`). Readers must **tolerate absent
+fields** and must not throw on a missing one.
+
 ## Batch Implementation & Parallel Dispatch
 
 **Never ask "sequential or parallel?" — always plan the optimal parallelization yourself.** The default is maximum parallelism. The user started the session to get work done, not to manage a task queue.

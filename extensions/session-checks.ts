@@ -144,12 +144,12 @@ export interface ExecResult {
 export type ExecFn = (
   cmd: string,
   args: string[],
-  opts: { cwd?: string; timeoutMs: number; env?: Record<string, string | undefined> }
+  opts: { cwd?: string; timeoutMs: number; env?: Record<string, string | undefined>; signal?: AbortSignal }
 ) => Promise<ExecResult>;
 
-export function execFileAsync(cmd: string, args: string[], opts: { cwd?: string; timeoutMs: number; env?: Record<string, string | undefined> }): Promise<ExecResult> {
+export function execFileAsync(cmd: string, args: string[], opts: { cwd?: string; timeoutMs: number; env?: Record<string, string | undefined>; signal?: AbortSignal }): Promise<ExecResult> {
   return new Promise((resolve) => {
-    execFile(cmd, args, { cwd: opts.cwd, timeout: opts.timeoutMs, maxBuffer: 32 * 1024 * 1024, encoding: "utf8", env: opts.env ?? process.env }, (err, stdout, stderr) => {
+    execFile(cmd, args, { cwd: opts.cwd, timeout: opts.timeoutMs, maxBuffer: 32 * 1024 * 1024, encoding: "utf8", env: opts.env ?? process.env, signal: opts.signal }, (err, stdout, stderr) => {
       if (!err) {
         resolve({ code: 0, stdout: stdout ?? "", stderr: stderr ?? "", timedOut: false });
         return;
