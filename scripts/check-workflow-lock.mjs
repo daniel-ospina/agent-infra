@@ -79,6 +79,35 @@ function isPlainMap(v) {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
+/**
+ * Human label for a non-regular filesystem entry, from `lstatSync` (which does
+ * NOT follow symlinks). Shared by the lock check and the coverage sweep so both
+ * reject the same class with the same wording.
+ */
+function nonRegularKind(st) {
+  if (st.isSymbolicLink()) return "a symlink";
+  if (st.isDirectory()) return "a directory";
+  if (st.isFIFO()) return "a FIFO";
+  if (st.isSocket()) return "a socket";
+  if (st.isBlockDevice()) return "a block device";
+  if (st.isCharacterDevice()) return "a character device";
+  return "not a regular file";
+}
+
+/**
+ * `lstat` a path without dereferencing it. → the stat, or null when it is
+ * missing. Used instead of `existsSync` (which follows symlinks — a dangling
+ * symlink would read as "missing" and a live one as "present") because the whole
+ * point of the symlink guard is to see the LINK, not its target.
+ */
+function lstatNoFollow(absPath) {
+  try {
+    return fs.lstatSync(absPath);
+  } catch {
+    return null;
+  }
+}
+
 /** sha256 of a file's bytes (no normalisation, no line-ending coercion). */
 export function sha256File(absPath) {
   return createHash("sha256").update(fs.readFileSync(absPath)).digest("hex");
@@ -148,10 +177,25 @@ export function lockFindings(root, lock) {
   for (const rel of LOCKED_FILES) {
     if (!Object.hasOwn(files, rel)) continue;
     const abs = path.join(root, rel);
-    if (!fs.existsSync(abs)) {
+    const st = lstatNoFollow(abs);
+    if (st === null) {
       findings.push(
         `the locked workflow file ${rel} is MISSING — a locked file must exist; restore it, or ` +
           `re-lock with \`${UPDATE_COMMAND}\` if the removal is deliberate`
+      );
+      continue;
+    }
+    // #675 P1-2 — a symlink must NOT satisfy the lock by hashing its target.
+    // `fs.readFileSync` (and GitHub's Contents API) dereference a symlink, so a
+    // PR that replaces a locked workflow with a symlink to another file keeps the
+    // hash identical while GitHub Actions sees a broken workflow entry and runs
+    // 0 jobs. Reject the link, never hash through it.
+    if (!st.isFile()) {
+      findings.push(
+        `the locked workflow file ${rel} is ${nonRegularKind(st)} — a locked workflow must be a ` +
+          "regular file: GitHub does not follow a symlinked workflow entry (it is a broken " +
+          "workflow that runs 0 jobs), so a non-regular entry must not satisfy the lock by " +
+          "hashing its target; restore the file, or re-link it deliberately without locking"
       );
       continue;
     }
@@ -185,6 +229,19 @@ export function workflowCoverageFindings(root) {
   }
   const present = new Set(names.map((name) => `.github/workflows/${name}`));
   const findings = [];
+  // #675 P1-2 — classification alone is not enough: a symlink named `ci.yml`
+  // classifies as the locked path while GitHub runs 0 jobs for it. Reject any
+  // non-regular entry under .github/workflows, classified or not.
+  for (const rel of present) {
+    const st = lstatNoFollow(path.join(root, rel));
+    if (st !== null && !st.isFile()) {
+      findings.push(
+        `${rel} is ${nonRegularKind(st)} — a workflow under .github/workflows must be a regular ` +
+          "file: GitHub does not follow a symlinked workflow entry (it is a broken workflow that " +
+          "runs 0 jobs), so a non-regular entry cannot stand in for a workflow"
+      );
+    }
+  }
   for (const rel of present) {
     if (LOCKED_FILES.includes(rel) || UNLOCKED_WORKFLOWS.includes(rel)) continue;
     findings.push(
@@ -252,7 +309,27 @@ function sameRealPath(a, b) {
   try {
     return fs.realpathSync(a) === fs.realpathSync(b);
   } catch {
-    return false;
+    // #675 P2-f — "cannot resolve" is not "a different file". Returning false
+    // here made IS_MAIN false whenever `process.argv[1]` no longer existed (e.g.
+    // it was deleted mid-run), so `main()` never ran, nothing printed and the
+    // process exited 0 — the exact silent no-op this comparison was introduced to
+    // close (#708).
+    //
+    // Fall back to a literal comparison first. When that differs only because an
+    // ANCESTOR is a symlink (`/tmp` → `/private/tmp`, `/var` → `/private/var` on
+    // macOS) while `import.meta.url` is realpath-resolved, compare the RESOLVED
+    // parent directory plus the basename — the link target's directory usually
+    // still exists even when the file itself is gone. A genuinely different file
+    // (different basename, or a different resolved directory) stays false.
+    if (path.resolve(a) === path.resolve(b)) return true;
+    try {
+      return (
+        path.basename(a) === path.basename(b) &&
+        fs.realpathSync(path.dirname(a)) === fs.realpathSync(path.dirname(b))
+      );
+    } catch {
+      return false;
+    }
   }
 }
 

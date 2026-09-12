@@ -83,14 +83,19 @@
  * authoritative trust-split statement above.
  *
  * `--head-ref <sha>` MODE (used by .github/workflows/workflow-lock.yml): fetch
- * the three workflow files at that ref through `gh api …/contents/<path>?ref=`
- * and run ONLY the narrow structural assertions (1)–(6) against those bytes. The
- * decode is fail-closed: only `encoding: "base64"` is trusted (the API returns
- * `none` + empty content for a >1 MB blob) and a lossy decode throws. The
- * content lock is SKIPPED in this mode by design — this leg provides ZERO lock
- * enforcement (see the authoritative trust-split statement above).
- * `--repo <owner/name>` overrides the repo (else it is derived from
- * `git remote get-url origin`).
+ * the recursive git TREE at that ref (`gh api …/git/trees/<sha>?recursive=1`),
+ * reject any of the three workflow paths that is not committed with git mode
+ * `100644` (a symlink `120000` or submodule `160000` is a broken workflow entry
+ * that runs 0 jobs while the Contents API would dereference it; `100755`, an
+ * executable, is outside the required shape), then fetch each remaining path's
+ * BLOB by its tree sha (`…/git/blobs/<sha>`) so
+ * the bytes parsed are the committed ones and never a dereference, and run ONLY
+ * the narrow structural assertions (1)–(6) against them. The decode is
+ * fail-closed: only `encoding: "base64"` is trusted (the API returns `none` +
+ * empty content for a >1 MB blob) and a lossy decode throws. The content lock is
+ * SKIPPED in this mode by design — this leg provides ZERO lock enforcement (see
+ * the authoritative trust-split statement above). `--repo <owner/name>` overrides
+ * the repo (else it is derived from `git remote get-url origin`).
  *
  * WHY THE ACCUMULATOR, NOT `&&` (#675 P2-2): shell `&&` short-circuits, so a
  * frontmatter-validator failure would skip this suite entirely and its verdict
@@ -208,27 +213,28 @@ function resolveRepo() {
 }
 
 /**
- * Decode a GitHub Contents API JSON payload → utf8 text, failing CLOSED.
+ * Decode a GitHub API blob payload → utf8 text, failing CLOSED.
  *
- * The API returns `encoding: "none"` with an empty `content` for a blob over
- * 1 MB. Reading `.content` unconditionally (the pre-fix behaviour) turned such a
- * file into "" — and because `parseWorkflowYaml("")` returns null, that silently
- * DISARMED every structural assertion (#675 P1-1). A non-base64 payload is an
- * error, not an empty workflow. `TextDecoder(…, { fatal: true })` rejects a
- * lossy decode for the same reason: a damaged read must never look like a valid
- * workflow.
+ * The same payload shape is returned by `…/contents/<path>` and by
+ * `…/git/blobs/<sha>`: `encoding: "base64"` with base64 `content`, or
+ * `encoding: "none"` with empty `content` for a blob over 1 MB. Reading
+ * `.content` unconditionally (the pre-fix behaviour) turned such a file into "" —
+ * and because `parseWorkflowYaml("")` returns null, that silently DISARMED every
+ * structural assertion (#675 P1-1). A non-base64 payload is an error, not an
+ * empty workflow. `TextDecoder(…, { fatal: true })` rejects a lossy decode for
+ * the same reason: a damaged read must never look like a valid workflow.
  */
-function decodeContentsApi(payload, rel) {
+function decodeBase64Blob(payload, rel) {
   let body;
   try {
     body = JSON.parse(payload);
   } catch (err) {
-    throw new Error(`${rel}: Contents API did not return JSON (${String(err?.message ?? err)})`);
+    throw new Error(`${rel}: the GitHub blob API did not return JSON (${String(err?.message ?? err)})`);
   }
   if (!isMap(body) || body.encoding !== "base64" || typeof body.content !== "string") {
     throw new Error(
-      `${rel}: Contents API returned encoding=${JSON.stringify(body?.encoding ?? null)} — only ` +
-        'base64 content is trusted (a >1 MB blob comes back as encoding "none" with empty ' +
+      `${rel}: the GitHub blob API returned encoding=${JSON.stringify(body?.encoding ?? null)} — ` +
+        'only base64 content is trusted (a >1 MB blob comes back as encoding "none" with empty ' +
         "content, which must never be read as an empty workflow)"
     );
   }
@@ -236,23 +242,106 @@ function decodeContentsApi(payload, rel) {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
-    throw new Error(`${rel}: Contents API content is not valid UTF-8`);
+    throw new Error(`${rel}: the GitHub blob API content is not valid UTF-8`);
   }
 }
 
-/** Read one file at a ref through the GitHub Contents API (fail-closed decode). */
-function fetchRefFile(repo, ref, rel) {
-  const json = execFileSync(
+const TREE_MODE_REGULAR_FILE = "100644";
+
+/** Human label for a git tree mode, for the non-100644 finding. */
+function treeModeLabel(mode) {
+  if (mode === "120000") return "a symlink";
+  if (mode === "160000") return "a submodule (gitlink)";
+  if (mode === "100755") return "an executable file";
+  if (mode === "040000") return "a directory";
+  return "not a regular file";
+}
+
+/**
+ * Parse a `git/trees/<sha>?recursive=1` payload → `Map<path, {mode, type, sha}>`,
+ * failing CLOSED on anything that is not a complete, untruncated tree. A
+ * truncated tree would make a missing path look absent for the wrong reason, and
+ * a malformed entry would be silently skipped.
+ */
+function parseRefTree(payload) {
+  let body;
+  try {
+    body = JSON.parse(payload);
+  } catch (err) {
+    throw new Error(`the git tree API did not return JSON (${String(err?.message ?? err)})`);
+  }
+  if (!isMap(body)) throw new Error("the git tree payload is not a JSON object");
+  if (body.truncated === true) {
+    throw new Error("the git tree payload is TRUNCATED — a partial tree must not be read as complete");
+  }
+  if (!Array.isArray(body.tree)) throw new Error("the git tree payload has no `tree` array");
+  const map = new Map();
+  for (const entry of body.tree) {
+    if (!isMap(entry) || typeof entry.path !== "string" || typeof entry.mode !== "string") {
+      throw new Error("the git tree payload contains an entry without `path`/`mode`");
+    }
+    map.set(entry.path, { mode: entry.mode, type: entry.type, sha: entry.sha });
+  }
+  return map;
+}
+
+/**
+ * Every `HEAD_REF_FILES` entry must be present in the tree and committed as a
+ * REGULAR FILE (git mode 100644), else a finding.
+ *
+ * #675 P1-2 — why the tree and not the Contents API: the Contents API
+ * DEREFERENCES a symlink (a `120000` entry comes back as `type: "file"` with the
+ * target's bytes), so hashing its payload cannot see the link at all. GitHub
+ * Actions does NOT dereference it — a symlink under .github/workflows/ is a
+ * broken workflow entry that runs 0 jobs — so a PR could replace ci.yml with a
+ * symlink, keep every guard green, and unplug the per-PR pin gate with no lock
+ * diff. The tree's `mode` is the committed truth, so it is checked before any
+ * content is fetched.
+ */
+function headRefTreeFindings(tree) {
+  const findings = [];
+  for (const [, rel] of HEAD_REF_FILES) {
+    const entry = tree.get(rel);
+    if (entry === undefined) {
+      findings.push(
+        `the git tree at that ref has no ${rel} — it was deleted or moved; the trusted leg ` +
+          "cannot validate a workflow that is not committed"
+      );
+      continue;
+    }
+    if (entry.mode !== TREE_MODE_REGULAR_FILE) {
+      findings.push(
+        `${rel} is committed with git mode ${entry.mode} (${treeModeLabel(entry.mode)}) — the ` +
+          `trusted leg requires a regular, non-executable workflow file committed with mode ` +
+          `${TREE_MODE_REGULAR_FILE}; a symlink (120000) or submodule (160000) is a broken workflow ` +
+          "entry that GitHub runs as 0 jobs while readers dereference it, so any other mode is " +
+          "rejected before content is read"
+      );
+    }
+  }
+  return findings;
+}
+
+/** One `gh api` call, returning the raw JSON text. */
+function ghApi(pathAndQuery) {
+  return execFileSync(
     "gh",
-    [
-      "api",
-      `repos/${repo}/contents/${rel}?ref=${ref}`,
-      "-H",
-      "Accept: application/vnd.github+json",
-    ],
+    ["api", pathAndQuery, "-H", "Accept: application/vnd.github+json"],
     { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }
   );
-  return decodeContentsApi(json, rel);
+}
+
+/** Fetch + parse the recursive git tree at `ref` (fail-closed). */
+function fetchRefTree(repo, ref) {
+  return parseRefTree(ghApi(`repos/${repo}/git/trees/${ref}?recursive=1`));
+}
+
+/**
+ * Fetch one blob by its TREE SHA — the committed bytes, never a dereference —
+ * and decode it fail-closed.
+ */
+function fetchRefBlob(repo, sha, rel) {
+  return decodeBase64Blob(ghApi(`repos/${repo}/git/blobs/${sha}`), rel);
 }
 
 /** The structural assertions, run against already-fetched sources. Never touches the lock. */
@@ -272,18 +361,34 @@ function runHeadRefMode(ref, repo) {
     console.error(`❌ --head-ref expects a commit SHA, got ${JSON.stringify(ref)}`);
     process.exit(2);
   }
-  const sources = {};
   const findings = [];
-  for (const [key, rel] of HEAD_REF_FILES) {
-    try {
-      sources[key] = fetchRefFile(repo, ref, rel);
-    } catch (err) {
-      findings.push(
-        `could not fetch ${rel} at ${ref} from ${repo}: ${String(err?.message ?? err).trim()}`
-      );
-    }
+  let tree = null;
+  try {
+    tree = fetchRefTree(repo, ref);
+  } catch (err) {
+    findings.push(
+      `could not fetch the git tree at ${ref} from ${repo}: ${String(err?.message ?? err).trim()}`
+    );
   }
-  if (findings.length === 0) findings.push(...headRefFindings(sources));
+  // The tree's committed MODES are checked first: a symlink/submodule entry must
+  // be rejected before any content (which the blob API would hand back as the
+  // link target) is read.
+  if (tree !== null) findings.push(...headRefTreeFindings(tree));
+  if (findings.length === 0) {
+    const sources = {};
+    for (const [key, rel] of HEAD_REF_FILES) {
+      const sha = tree.get(rel).sha;
+      try {
+        sources[key] = fetchRefBlob(repo, sha, rel);
+      } catch (err) {
+        findings.push(
+          `could not fetch ${rel} (blob ${sha}) at ${ref} from ${repo}: ` +
+            `${String(err?.message ?? err).trim()}`
+        );
+      }
+    }
+    if (findings.length === 0) findings.push(...headRefFindings(sources));
+  }
   if (findings.length > 0) {
     console.error(
       `❌ the PR's workflow files no longer satisfy the narrow structural guard ` +
@@ -306,7 +411,9 @@ let failed = 0;
 // #675 P2-c — a COUNT floor is not an identity: disabling 3 real tests and adding
 // 3 `test("filler", () => assert.ok(true))` no-ops kept the total at 69. These
 // sets let the run name the specific assertions that must exist and pass, so a
-// deleted/renamed/neutered one is RED no matter what fills the count.
+// deleted or renamed test is RED no matter what fills the count. (A required test
+// whose BODY is replaced by a same-name no-op body is NOT caught — a same-commit
+// residual recorded in the plan's Accepted-residual section, #675 P2-5.)
 const ranTests = new Set();
 const passedTests = new Set();
 
@@ -330,6 +437,119 @@ function section(name) {
 function setEq(a, b) {
   return a.length === b.length && [...a].sort().join() === [...b].sort().join();
 }
+
+// ── the floor + roster, evaluated on EVERY exit path ────────────────────────
+// #675 P2-h — these used to run only at the END of the module body, so an early
+// `process.exit(0)` (a stray one before the first test, or inside a required
+// test) exited 0 with ZERO ✅ lines and neither the count floor nor the
+// REQUIRED_TESTS roster was ever evaluated. The roster and the floor are declared
+// and REGISTERED here — before any test can run — so the `exit` event covers
+// `process.exit(0)`; `finalize` then sets `process.exitCode` (calling
+// `process.exit()` inside an exit handler is ignored). `finalize()` is also
+// called explicitly at the end of the module body so the summary prints in the
+// normal path too; the `finalized` latch keeps it once-only.
+
+// #675 P2-c — REQUIRED TEST NAMES. The count floor is only a net-shrink guard:
+// disabling 3 real tests and adding 3 `test("filler", () => assert.ok(true))`
+// no-ops kept it at "69 passed". A name is recorded by `test()` only when the
+// test RUNS AND PASSES, so a deleted or renamed assertion is RED no matter what
+// fills the count (a same-name neutered BODY is a separate, documented
+// residual). At minimum: the two live-file assertions, every positive control,
+// and one per guard section.
+const REQUIRED_TESTS = Object.freeze([
+  // live-file assertions
+  "live ci.yml → node-ci.yml → ci-main.yml: the pin gate is wired (items 1–6)",
+  "the live workflow content lock matches the committed workflows (GREEN)",
+  "the live .github/workflows directory is fully classified (locked or explicitly unlocked)",
+  "the live workflow corpus parses (the subset is adequate for this repo)",
+  // positive controls
+  "pinFindings flags a drifted pin (positive control for (h))",
+  "stampFindings flags a stale stamp (positive control for (i))",
+  "lockFindings: a non-object lock is RED with the --update-lock remedy (#675 P2-e)",
+  "lockFindings: a version mismatch is RED with the --update-lock remedy (#675 P2-e)",
+  "lockFindings: a lock with no `files` mapping is RED (#675 P2-e)",
+  "lockFindings: an uncovered expected path is RED (#675 P2-e)",
+  "lockFindings: an unexpected extra path is RED (#675 P2-e)",
+  // one per guard section
+  "extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN",
+  "every version literal in the mirror surfaces is the pin or a listed dep version",
+  "prose carrying a 3-component literal is not a pi stamp (#779 GREEN fixtures)",
+  "minimal fixture trio satisfies every narrow wiring invariant",
+  "the ci-main fixture is wired (baseline for the post-merge RED cases)",
+  "the lock covers exactly the three pin-gate workflow paths",
+  "head-ref mode runs the structural assertions and does NOT apply the content lock",
+  "head-ref mode is RED for an empty or comments-only ci.yml / node-ci.yml (#675 P1-1)",
+  "the GitHub blob decode fails CLOSED on encoding 'none' or a lossy decode (#675 P1-1)",
+  // regression fixtures added by the #675 review-fix cycle
+  "the lock CLI is not a silent no-op through a symlinked path (#708 class, #675 P2-b)",
+  "workflow coverage: an unclassified new workflow is RED (#675 P2-d)",
+  "workflow coverage: deleting workflow-lock.yml is RED (#675 P2-d / P2-g)",
+  "workflow-lock.yml exists and is wired (pull_request_target + --head-ref) (#675 P2-g)",
+  "item 6 RED #1: the failure guard removed entirely (#675 P2-a)",
+  "item 6 RED #2: the guard body replaced by an `echo` (#675 P2-a)",
+  "item 6 RED #3: the invocation moved into a `case` arm (#675 P2-a)",
+  "item 6 RED #4: the invocation inside a never-called shell function (#675 P2-a)",
+  "item 6 RED #5: `false && {` before the invocation (#675 P2-a)",
+  "item 6 RED #6: an inline `if …; then exit 0; fi` swallows the failure (#675 P2-a)",
+  "item 6 RED #7: `trap 'exit 0' EXIT` swallows the failure (#675 P2-a)",
+  "item 6 GREEN: quoted `if`/`for`/`while` prose before the invocation is inert (#675 P1-6)",
+  "a deeply nested flow collection raises WorkflowYamlError quickly (#675 P2-6)",
+  // #675 second review-fix cycle
+  "item 6 RED #8: `! if …; then` before the invocation is RED (#675 P1-1 regression)",
+  "item 6 RED #9: `! while …; do` before the invocation is RED (#675 P1-1 regression)",
+  "item 6 RED #10: `! for …; do` before the invocation is RED (#675 P1-1 regression)",
+  "item 6 RED #11: `time if …; then` before the invocation is RED (#675 P1-1 regression)",
+  "item 6 RED #12: `time while …; do` before the invocation is RED (#675 P1-1 regression)",
+  "item 6 RED #13: a `select …; do` loop around the invocation is RED (#675 P2-c)",
+  "item 6 RED #14: `time -p if …; then` before the invocation is RED (#675 P1-1 regression)",
+  "item 6 GREEN: a here-string (`cmd <<< word`) before the invocation is inert (#675 P2-g)",
+  "a symlinked locked workflow is RED from lockFindings (#675 P1-2)",
+  "the lock CLI is RED for a symlinked locked workflow (#675 P1-2)",
+  "the lock CLI still runs and fails loudly when argv[1] no longer resolves (#675 P2-f)",
+  "workflow coverage: a symlinked workflow is RED (#675 P1-2)",
+  "head-ref tree: a workflow committed with mode 120000 (symlink) is RED (#675 P1-2)",
+  "head-ref tree: a regular-file tree (mode 100644) produces no tree findings (#675 P1-2)",
+  "head-ref tree: a truncated tree payload throws (fail-closed) (#675 P1-2)",
+  "--head-ref is RED end-to-end when a workflow is committed as a symlink (mode 120000) (#675 P1-2)",
+  "--head-ref is GREEN end-to-end for a regular-file tree (mode 100644) (#675 P1-2)",
+  "an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)",
+]);
+
+// A LOWER BOUND on the passing count — a secondary, net-shrink signal. The
+// required-name set above is the primary identity check (#675 P2-c). This is a
+// floor, not an equality: adding tests never needs an update; deleting one does.
+const MIN_EXPECTED_PASSING = 109;
+
+let finalized = false;
+function finalize() {
+  if (finalized) return;
+  finalized = true;
+  console.log(`\ncheck-pi-pin-lockstep.mjs: ${passed} passed, ${failed} failed`);
+  if (failed === 0 && passed < MIN_EXPECTED_PASSING) {
+    failed++;
+    console.error(
+      `❌ only ${passed} passing tests — expected at least ${MIN_EXPECTED_PASSING}. ` +
+        "A guard's test (or a whole section) was deleted or stopped running; restore it or " +
+        "update MIN_EXPECTED_PASSING deliberately."
+    );
+  }
+  const missingRequired = REQUIRED_TESTS.filter((name) => !passedTests.has(name));
+  if (missingRequired.length > 0) {
+    failed++;
+    console.error(
+      "❌ required test(s) did not run and pass — a guard's test was deleted or renamed; " +
+        "filler no-op tests cannot compensate (#675 P2-c):"
+    );
+    for (const name of missingRequired) console.error(`   - ${name}`);
+  }
+  if (failed > 0) {
+    console.error("❌ SOME TESTS FAILED");
+    process.exitCode = 1;
+  } else {
+    console.log("✅ ALL TESTS PASSED");
+  }
+}
+process.on("exit", finalize);
 
 // ── (h) pin lockstep (#640 review) ──────────────────────────────────────────
 // The pi runtime version is hand-synced across PI_VERSION_PIN + every extension
@@ -848,7 +1068,13 @@ function stripShellQuotes(raw) {
  * Quoted spans, comments and heredoc bodies are removed first, and a bracket
  * keyword only counts in COMMAND POSITION (start of line, or straight after
  * `;` `&&` `||` `|` `&` `(` `)` `{` `}`, or after `then`/`do`/`else`/`elif`).
- * Heredocs are tracked from `<<`/`<<-` to their delimiter.
+ * Reserved words that do NOT consume the command position (`!`, `time`,
+ * `time -p`, `{`, `}`, `coproc`) leave it intact, so the `if`/`while`/`for`
+ * they precede is still counted (#675 P1-1: `!`/`time` suppress errexit in
+ * bash, so a block behind them runs green while a naive scanner saw no block —
+ * the check must still flag it).
+ * Heredocs are tracked from `<<`/`<<-` to their delimiter, and a here-string
+ * (`<<<`) is NOT a heredoc (#675 P2-g).
  */
 function shellControlContext(lines, upto) {
   const d = { ifDepth: 0, loopDepth: 0, caseDepth: 0, groupDepth: 0 };
@@ -860,17 +1086,22 @@ function shellControlContext(lines, upto) {
       if (noComment.trim() === heredoc) heredoc = null;
       continue;
     }
-    const hd = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/.exec(noComment);
+    // `(?<!<)…(?!<)` excludes the here-string form: without it, the `<<` at
+    // index 1 of `<<<word` matched and `word` was read as a heredoc delimiter,
+    // turning a legitimate `grep -q foo <<< bar` into a false RED (#675 P2-g).
+    const hd = /(?<!<)<<(?!<)-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/.exec(noComment);
     if (hd) { heredoc = hd[1]; continue; }
     const code = stripShellQuotes(noComment);
     const tokens = code.match(SHELL_TOKEN_RE) ?? [];
     if (tokens.includes("trap") && tokens.includes("EXIT")) trapExit = true;
     let commandStart = true;
+    let afterTime = false;
     for (const tok of tokens) {
       if (/^(?:&&|\|\||[;&|(){}])$/.test(tok)) {
         if (tok === "{" || tok === "(") d.groupDepth++;
         else if (tok === "}" || tok === ")") d.groupDepth = Math.max(0, d.groupDepth - 1);
         commandStart = true;
+        afterTime = false;
         continue;
       }
       if (!commandStart) {
@@ -878,25 +1109,41 @@ function shellControlContext(lines, upto) {
         if (tok === "then" || tok === "do" || tok === "else" || tok === "elif") {
           commandStart = true;
         }
+        afterTime = false;
         continue;
       }
       if (tok === "if") d.ifDepth++;
       else if (tok === "fi") d.ifDepth = Math.max(0, d.ifDepth - 1);
-      else if (tok === "for" || tok === "while" || tok === "until") d.loopDepth++;
+      else if (tok === "for" || tok === "while" || tok === "until" || tok === "select") {
+        d.loopDepth++;
+      }
       else if (tok === "done") d.loopDepth = Math.max(0, d.loopDepth - 1);
       else if (tok === "case") d.caseDepth++;
       else if (tok === "esac") d.caseDepth = Math.max(0, d.caseDepth - 1);
       else if (tok === "then" || tok === "do" || tok === "else" || tok === "elif" || tok === "in") {
         commandStart = true;
+        afterTime = false;
         continue;
       }
+      // Command-position-neutral reserved words: the next token is still in
+      // command position. `time` may be followed by `-p`/`--`.
+      if (tok === "!" || tok === "time" || tok === "coproc") {
+        afterTime = tok === "time";
+        commandStart = true;
+        continue;
+      }
+      if (afterTime && /^--?(\w|$)/.test(tok)) {
+        commandStart = true;
+        continue;
+      }
+      afterTime = false;
       commandStart = false;
     }
   }
   if (heredoc !== null) return "a heredoc";
   if (trapExit) return "a `trap … EXIT`";
   if (d.ifDepth > 0) return "an `if`/`then`/`fi` block";
-  if (d.loopDepth > 0) return "a `for`/`while`/`until` loop";
+  if (d.loopDepth > 0) return "a `for`/`while`/`until`/`select` loop";
   if (d.caseDepth > 0) return "a `case`/`esac` block";
   if (d.groupDepth > 0) return "a `{ … }` / `( … )` group";
   return null;
@@ -1066,7 +1313,8 @@ test("live ci.yml → node-ci.yml → ci-main.yml: the pin gate is wired (items 
 });
 
 // ── #666 workflow content lock — bytes, not semantics ───────────────────────
-// The PRIMARY defence (see the header). Every execution-semantics bypass found
+// The conspicuousness tripwire (see the header's authoritative trust split),
+// NOT a PR-uneditable control. Every execution-semantics bypass found
 // across two review rounds requires editing a locked file, which changes its
 // hash. These are LOCK-level tests, not semantics tests: they prove a workflow
 // edit is caught, not that a semantics model still recognises the shape.
@@ -1210,6 +1458,60 @@ test("the lock CLI is not a silent no-op through a symlinked path (#708 class, #
   );
 });
 
+// #675 P1-2 — a symlink must NOT satisfy the lock by hashing its target.
+// `fs.readFileSync` (and GitHub's Contents API) dereference a symlink, so a PR
+// that replaces a locked workflow with a symlink to another file kept the sha256
+// identical while GitHub Actions saw a broken workflow entry and ran 0 jobs.
+test("a symlinked locked workflow is RED from lockFindings (#675 P1-2)", () => {
+  const dir = makeLockFixture();
+  const lock = { version: 1, files: hashLockedFiles(dir) };
+  assert.deepEqual(lockFindings(dir, lock), [], "the fixture must start GREEN");
+  const abs = path.join(dir, ".github/workflows/ci.yml");
+  const target = path.join(dir, ".github/ci-workflow.yml");
+  fs.writeFileSync(target, fs.readFileSync(abs));
+  fs.rmSync(abs);
+  fs.symlinkSync("../ci-workflow.yml", abs);
+  const findings = lockFindings(dir, lock);
+  assert.equal(findings.length, 1, `expected exactly one finding, got ${findings.length}`);
+  assert.match(findings[0], /ci\.yml/);
+  assert.match(findings[0], /symlink/);
+  assert.match(findings[0], /regular file/);
+});
+test("the lock CLI is RED for a symlinked locked workflow (#675 P1-2)", () => {
+  const dir = makeLockFixture();
+  writeLockFile(dir);
+  const abs = path.join(dir, ".github/workflows/ci.yml");
+  fs.writeFileSync(path.join(dir, ".github/ci-workflow.yml"), fs.readFileSync(abs));
+  fs.rmSync(abs);
+  fs.symlinkSync("../ci-workflow.yml", abs);
+  const res = spawnSync(process.execPath, [CHECK_LOCK, "--root", dir], { encoding: "utf8" });
+  assert.equal(res.status, 1, `expected exit 1, got ${res.status}`);
+  assert.match(res.stderr, /regular file/);
+});
+test("the lock CLI still runs and fails loudly when argv[1] no longer resolves (#675 P2-f)", () => {
+  const dir = makeLockFixture();
+  writeLockFile(dir);
+  bumpBytes(dir, ".github/workflows/ci.yml", "# changed\n");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wf-lock-vanish-"));
+  const script = path.join(tmp, "check-workflow-lock.mjs");
+  const src = fs.readFileSync(CHECK_LOCK, "utf8");
+  const anchor = "const IS_MAIN =";
+  assert.ok(src.includes(anchor), `self-delete fixture anchor not found: ${JSON.stringify(anchor)}`);
+  // Simulate argv[1] having been deleted after the module was read but before the
+  // IS_MAIN guard runs: `realpathSync` then throws, and "cannot resolve" must not
+  // be read as "a different file" (that made IS_MAIN false, main() never ran, and
+  // the process exited 0 silently — the #708 class this comparison closed).
+  fs.writeFileSync(script, src.replace(anchor, "fs.rmSync(process.argv[1]);\n" + anchor));
+  const res = spawnSync(process.execPath, [script, "--root", dir], { encoding: "utf8" });
+  assert.equal(
+    res.status,
+    1,
+    `a vanished argv[1] must still run main() and fail loudly; got status ${res.status}, ` +
+      `stdout=${JSON.stringify(res.stdout)} stderr=${JSON.stringify(res.stderr)}`
+  );
+  assert.match(res.stderr, /--update-lock/, "the real run must name the remedy");
+});
+
 // #675 P2-e — one positive control per `lockFindings` schema branch. Neutering
 // any branch previously left the suite GREEN because only the happy paths were
 // exercised. Each case must produce a non-empty finding naming the --update-lock
@@ -1289,6 +1591,21 @@ test("workflow coverage: deleting workflow-lock.yml is RED (#675 P2-d / P2-g)", 
   const findings = workflowCoverageFindings(dir);
   assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
   assert.match(findings[0], /workflow-lock\.yml/);
+});
+// #675 P1-2 — classification alone is not enough: a symlink NAMED `ci.yml`
+// classifies as the locked path while GitHub runs 0 jobs for it.
+test("workflow coverage: a symlinked workflow is RED (#675 P1-2)", () => {
+  const dir = makeCoverageFixture();
+  assert.deepEqual(workflowCoverageFindings(dir), [], "the fixture must start GREEN");
+  const abs = path.join(dir, ".github/workflows/ci.yml");
+  fs.rmSync(abs);
+  fs.writeFileSync(path.join(dir, "target.yml"), "# target\n");
+  fs.symlinkSync(path.join(dir, "target.yml"), abs);
+  const findings = workflowCoverageFindings(dir);
+  assert.ok(
+    findings.some((m) => m.includes("regular file")),
+    `a symlinked workflow must be RED; got:\n  ${findings.join("\n  ")}`
+  );
 });
 
 // #675 P2-g — the trusted leg is bootstrapped by the NEXT PR after it lands
@@ -1551,13 +1868,13 @@ test("head-ref mode is RED for an empty or comments-only ci.yml / node-ci.yml (#
   }
 });
 
-// #675 P1-1, compounding defect: the Contents API returns `encoding: "none"`
+// #675 P1-1, compounding defect: the GitHub blob API returns `encoding: "none"`
 // with empty `content` for a blob over 1 MB, so reading `.content` blindly
 // turned a padded workflow into "" — straight into the fail-open path above.
 // The decode is now fail-closed.
-test("the Contents API decode fails CLOSED on encoding 'none' or a lossy decode (#675 P1-1)", () => {
+test("the GitHub blob decode fails CLOSED on encoding 'none' or a lossy decode (#675 P1-1)", () => {
   assert.equal(
-    decodeContentsApi(
+    decodeBase64Blob(
       JSON.stringify({ encoding: "base64", content: Buffer.from("name: CI\n").toString("base64") }),
       ".github/workflows/ci.yml"
     ),
@@ -1566,7 +1883,7 @@ test("the Contents API decode fails CLOSED on encoding 'none' or a lossy decode 
   );
   assert.throws(
     () =>
-      decodeContentsApi(
+      decodeBase64Blob(
         JSON.stringify({ encoding: "none", content: "", size: 2 * 1024 * 1024 }),
         ".github/workflows/ci.yml"
       ),
@@ -1575,17 +1892,159 @@ test("the Contents API decode fails CLOSED on encoding 'none' or a lossy decode 
   );
   assert.throws(
     () =>
-      decodeContentsApi(
+      decodeBase64Blob(
         JSON.stringify({ encoding: "base64", content: Buffer.from([0xff, 0xfe]).toString("base64") }),
         ".github/workflows/ci.yml"
       ),
     /not valid UTF-8/,
     "a lossy decode must THROW rather than look like a valid workflow"
   );
-  assert.throws(() => decodeContentsApi("not json", "x"), /did not return JSON/);
+  assert.throws(() => decodeBase64Blob("not json", "x"), /did not return JSON/);
   // A genuinely empty file is base64 "" → "", and wiringFindings turns THAT red
   // (above); the decode itself must not pretend it is an error.
-  assert.equal(decodeContentsApi(JSON.stringify({ encoding: "base64", content: "" }), "x"), "");
+  assert.equal(decodeBase64Blob(JSON.stringify({ encoding: "base64", content: "" }), "x"), "");
+});
+
+// #675 P1-2 — the trusted leg reads the git TREE first and rejects any workflow
+// path that is not committed as a regular file (mode 100644). The Contents API
+// dereferences a symlink, so a `120000` entry came back as `type: "file"` with
+// the target's bytes and the guard passed while GitHub ran 0 jobs.
+test("head-ref tree: a workflow committed with mode 120000 (symlink) is RED (#675 P1-2)", () => {
+  const tree = parseRefTree(
+    JSON.stringify({
+      truncated: false,
+      tree: HEAD_REF_FILES.map(([, rel]) => ({
+        path: rel,
+        mode: rel === ".github/workflows/ci.yml" ? "120000" : "100644",
+        type: "blob",
+        sha: "0".repeat(40),
+      })),
+    })
+  );
+  const findings = headRefTreeFindings(tree);
+  assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
+  assert.match(findings[0], /ci\.yml/);
+  assert.match(findings[0], /120000/);
+  assert.match(findings[0], /symlink/);
+});
+test("head-ref tree: a regular-file tree (mode 100644) produces no tree findings (#675 P1-2)", () => {
+  const tree = parseRefTree(
+    JSON.stringify({
+      truncated: false,
+      tree: HEAD_REF_FILES.map(([, rel]) => ({
+        path: rel,
+        mode: "100644",
+        type: "blob",
+        sha: "0".repeat(40),
+      })),
+    })
+  );
+  assert.deepEqual(headRefTreeFindings(tree), [], "a regular-file tree must not false-RED");
+});
+test("head-ref tree: a truncated tree payload throws (fail-closed) (#675 P1-2)", () => {
+  assert.throws(
+    () => parseRefTree(JSON.stringify({ truncated: true, tree: [] })),
+    /TRUNCATED/,
+    "a truncated tree must be an error, not a silently partial tree"
+  );
+});
+
+/** Build a stubbed `gh` (git tree + git blobs) and run the REAL --head-ref CLI against it. */
+function runHeadRefWithStub(treeObj, blobMap) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pin-headref-stub-"));
+  const bin = path.join(dir, "bin");
+  const blobDir = path.join(dir, "blobs");
+  fs.mkdirSync(bin);
+  fs.mkdirSync(blobDir);
+  for (const [sha, text] of Object.entries(blobMap)) {
+    fs.writeFileSync(path.join(blobDir, sha), Buffer.from(text, "utf8"));
+  }
+  const stub = path.join(bin, "gh");
+  fs.writeFileSync(
+    stub,
+    [
+      `#!${process.execPath}`,
+      'import fs from "node:fs";',
+      'const endpoint = process.argv[3] ?? "";',
+      'if (/\\/git\\/trees\\//.test(endpoint)) {',
+      '  process.stdout.write(fs.readFileSync(process.env.GH_STUB_TREE, "utf8"));',
+      "  process.exit(0);",
+      "}",
+      'if (/\\/git\\/blobs\\//.test(endpoint)) {',
+      '  const sha = endpoint.split("/").pop().split("?")[0];',
+      '  const bytes = fs.readFileSync(process.env.GH_STUB_BLOBS + "/" + sha);',
+      '  process.stdout.write(JSON.stringify({ encoding: "base64", content: bytes.toString("base64") }));',
+      "  process.exit(0);",
+      "}",
+      'process.stderr.write("gh stub: unexpected endpoint " + endpoint + "\\n");',
+      "process.exit(1);",
+      "",
+    ].join("\n")
+  );
+  fs.chmodSync(stub, 0o755);
+  const treePath = path.join(dir, "tree.json");
+  fs.writeFileSync(treePath, JSON.stringify(treeObj));
+  return spawnSync(
+    process.execPath,
+    [
+      path.join(REPO_ROOT, "scripts", "check-pi-pin-lockstep.mjs"),
+      "--head-ref",
+      "a".repeat(40),
+      "--repo",
+      "owner/repo",
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+        GH_STUB_TREE: treePath,
+        GH_STUB_BLOBS: blobDir,
+      },
+    }
+  );
+}
+test("--head-ref is RED end-to-end when a workflow is committed as a symlink (mode 120000) (#675 P1-2)", () => {
+  const res = runHeadRefWithStub(
+    {
+      truncated: false,
+      tree: HEAD_REF_FILES.map(([, rel]) => ({
+        path: rel,
+        mode: rel === ".github/workflows/ci.yml" ? "120000" : "100644",
+        type: "blob",
+        sha: "0".repeat(40),
+      })),
+    },
+    {}
+  );
+  assert.equal(
+    res.status,
+    1,
+    `a symlinked workflow must be RED before any content is read; got status ${res.status}, ` +
+      `stderr=${JSON.stringify(res.stderr)}`
+  );
+  assert.match(res.stderr, /120000/);
+  assert.match(res.stderr, /symlink/);
+});
+test("--head-ref is GREEN end-to-end for a regular-file tree (mode 100644) (#675 P1-2)", () => {
+  const res = runHeadRefWithStub(
+    {
+      truncated: false,
+      tree: [
+        { path: ".github/workflows/ci.yml", mode: "100644", type: "blob", sha: "c" },
+        { path: ".github/workflows/node-ci.yml", mode: "100644", type: "blob", sha: "n" },
+        { path: ".github/workflows/ci-main.yml", mode: "100644", type: "blob", sha: "m" },
+      ],
+    },
+    { c: FIXTURE_CALLER, n: FIXTURE_CALLEE, m: FIXTURE_CI_MAIN }
+  );
+  assert.equal(
+    res.status,
+    0,
+    `a regular-file tree with valid blobs must stay GREEN; got status ${res.status}, ` +
+      `stderr=${JSON.stringify(res.stderr)}`
+  );
+  assert.match(res.stdout, /still satisfy the narrow structural guard/);
 });
 
 section("guard (j) — the fixture trio satisfies items 1–6 (baseline for the GREEN/RED cases)");
@@ -2089,6 +2548,101 @@ test("item 6 RED #7: `trap 'exit 0' EXIT` swallows the failure (#675 P2-a)", () 
   );
 });
 
+// ── #675 second review-fix cycle — `!`/`time`, `select`, here-strings ─────
+// P1-1 REGRESSION (introduced by the first #675 review fix): the command-position
+// logic cleared `commandStart` after EVERY non-keyword token, so the reserved
+// words `!` and `time` (which suppress errexit and so keep the step GREEN under
+// `bash -e`) were treated as a consumed command and the `if`/`while`/`for` behind
+// them was never counted. Pre-fix all five of the cases below were GREEN through
+// the real `--head-ref` path. `!`, `time`, `time -p`, `{`, `}`, `coproc` are now
+// command-position neutral; `select` joins the loop keywords (P2-3).
+/** Wrap the ci-main accumulator invocation in `open`/`close` lines and evaluate it. */
+function wrappedInvocation(open, close) {
+  return ciMainFindings(
+    mutate(
+      FIXTURE_CI_MAIN,
+      "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n",
+      `${open}\n        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n${close}\n`
+    )
+  );
+}
+test("item 6 RED #8: `! if …; then` before the invocation is RED (#675 P1-1 regression)", () => {
+  const findings = wrappedInvocation("        ! if false; then", "        fi");
+  assert.ok(
+    findings.some((m) => m.includes("sits inside") && m.includes("if")),
+    `the \`!\` must not consume command position; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #9: `! while …; do` before the invocation is RED (#675 P1-1 regression)", () => {
+  const findings = wrappedInvocation("        ! while false; do", "        done");
+  assert.ok(
+    findings.some((m) => m.includes("sits inside") && m.includes("loop")),
+    `the \`!\` must not consume command position; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #10: `! for …; do` before the invocation is RED (#675 P1-1 regression)", () => {
+  const findings = wrappedInvocation("        ! for x in; do", "        done");
+  assert.ok(
+    findings.some((m) => m.includes("sits inside") && m.includes("loop")),
+    `the \`!\` must not consume command position; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #11: `time if …; then` before the invocation is RED (#675 P1-1 regression)", () => {
+  const findings = wrappedInvocation("        time if false; then", "        fi");
+  assert.ok(
+    findings.some((m) => m.includes("sits inside") && m.includes("if")),
+    `\`time\` must not consume command position; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #12: `time while …; do` before the invocation is RED (#675 P1-1 regression)", () => {
+  const findings = wrappedInvocation("        time while false; do", "        done");
+  assert.ok(
+    findings.some((m) => m.includes("sits inside") && m.includes("loop")),
+    `\`time\` must not consume command position; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #13: a `select …; do` loop around the invocation is RED (#675 P2-c)", () => {
+  // `select` was missing from the loop keyword set, so the invocation was read as
+  // top-level while bash never ran the body with stdin closed (#675 P2-c).
+  const findings = wrappedInvocation("        select x in a; do", "        done");
+  assert.ok(
+    findings.some((m) => m.includes("sits inside") && m.includes("select")),
+    `\`select\` must be counted as a loop; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #14: `time -p if …; then` before the invocation is RED (#675 P1-1 regression)", () => {
+  const findings = wrappedInvocation("        time -p if false; then", "        fi");
+  assert.ok(
+    findings.some((m) => m.includes("sits inside") && m.includes("if")),
+    `\`time -p\` must not consume command position; got:\n  ${findings.join("\n  ")}`
+  );
+});
+
+// P2-7 — `<<<` is a here-STRING, not a heredoc. The heredoc regex matched the
+// `<<` at index 1 of `<<<word` and read `word` as a delimiter, so a legitimate
+// `grep -q foo <<< bar || true` before the invocation was a false RED (the #779
+// class this PR exists to fix).
+test("item 6 GREEN: a here-string (`cmd <<< word`) before the invocation is inert (#675 P2-g)", () => {
+  const lines = [
+    "        grep -q foo <<< bar || true",
+    '        grep -q foo <<< "bar" || true',
+  ];
+  for (const inserted of lines) {
+    const src = mutate(
+      FIXTURE_CI_MAIN,
+      "        failures=0\n",
+      `        failures=0\n${inserted}\n`
+    );
+    const findings = ciMainFindings(src);
+    assert.deepEqual(
+      findings,
+      [],
+      `${inserted.trim()} is a here-string, not a heredoc, and must stay GREEN:\n  ` +
+        findings.join("\n  ")
+    );
+  }
+});
+
 // #675 P1-6 / #779 — a quoted keyword in ordinary prose must NOT open a block.
 // The pre-fix detector split each line on non-word characters, so `echo
 // "checking if the suite is wired"` before the invocation reddened BOTH legs.
@@ -2291,76 +2845,41 @@ test("the live workflow corpus parses (the subset is adequate for this repo)", (
   assert.deepEqual(failures, [], "every committed workflow must be inside the reader's subset");
 });
 
-// #675 P2-c — REQUIRED TEST NAMES. The count floor below is only a net-shrink
-// guard: disabling 3 real tests and adding 3 `test("filler", () =>
-// assert.ok(true))` no-ops kept it at "69 passed". A name is recorded by `test()`
-// only when the test RUNS AND PASSES, so a deleted, renamed or neutered assertion
-// is RED no matter what fills the count. At minimum: the two live-file
-// assertions, every positive control, and one per guard section.
-const REQUIRED_TESTS = Object.freeze([
-  // live-file assertions
-  "live ci.yml → node-ci.yml → ci-main.yml: the pin gate is wired (items 1–6)",
-  "the live workflow content lock matches the committed workflows (GREEN)",
-  "the live .github/workflows directory is fully classified (locked or explicitly unlocked)",
-  "the live workflow corpus parses (the subset is adequate for this repo)",
-  // positive controls
-  "pinFindings flags a drifted pin (positive control for (h))",
-  "stampFindings flags a stale stamp (positive control for (i))",
-  "lockFindings: a non-object lock is RED with the --update-lock remedy (#675 P2-e)",
-  "lockFindings: a version mismatch is RED with the --update-lock remedy (#675 P2-e)",
-  "lockFindings: a lock with no `files` mapping is RED (#675 P2-e)",
-  "lockFindings: an uncovered expected path is RED (#675 P2-e)",
-  "lockFindings: an unexpected extra path is RED (#675 P2-e)",
-  // one per guard section
-  "extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN",
-  "every version literal in the mirror surfaces is the pin or a listed dep version",
-  "prose carrying a 3-component literal is not a pi stamp (#779 GREEN fixtures)",
-  "minimal fixture trio satisfies every narrow wiring invariant",
-  "the ci-main fixture is wired (baseline for the post-merge RED cases)",
-  "the lock covers exactly the three pin-gate workflow paths",
-  "head-ref mode runs the structural assertions and does NOT apply the content lock",
-  "head-ref mode is RED for an empty or comments-only ci.yml / node-ci.yml (#675 P1-1)",
-  "the Contents API decode fails CLOSED on encoding 'none' or a lossy decode (#675 P1-1)",
-  // regression fixtures added by the #675 review-fix cycle
-  "the lock CLI is not a silent no-op through a symlinked path (#708 class, #675 P2-b)",
-  "workflow coverage: an unclassified new workflow is RED (#675 P2-d)",
-  "workflow coverage: deleting workflow-lock.yml is RED (#675 P2-d / P2-g)",
-  "workflow-lock.yml exists and is wired (pull_request_target + --head-ref) (#675 P2-g)",
-  "item 6 RED #1: the failure guard removed entirely (#675 P2-a)",
-  "item 6 RED #2: the guard body replaced by an `echo` (#675 P2-a)",
-  "item 6 RED #3: the invocation moved into a `case` arm (#675 P2-a)",
-  "item 6 RED #4: the invocation inside a never-called shell function (#675 P2-a)",
-  "item 6 RED #5: `false && {` before the invocation (#675 P2-a)",
-  "item 6 RED #6: an inline `if …; then exit 0; fi` swallows the failure (#675 P2-a)",
-  "item 6 RED #7: `trap 'exit 0' EXIT` swallows the failure (#675 P2-a)",
-  "item 6 GREEN: quoted `if`/`for`/`while` prose before the invocation is inert (#675 P1-6)",
-  "a deeply nested flow collection raises WorkflowYamlError quickly (#675 P2-6)",
-]);
+// #675 P2-h — the floor + roster must run on EVERY exit path. Inserting
+// `process.exit(0)` before the first test (or inside a required test) used to
+// exit 0 with ZERO ✅ lines because the floor/roster were evaluated only at the
+// very end of the module body. The `exit` handler (registered near the top, so it
+// is in place before any test can run) now evaluates them regardless.
+test("an early `process.exit(0)` in the suite still exits non-zero (#675 P2-h)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pin-suite-exit-"));
+  for (const rel of [
+    "check-pi-pin-lockstep.mjs",
+    "frontmatter-fixtures.mjs",
+    "workflow-yaml.mjs",
+    "check-workflow-lock.mjs",
+  ]) {
+    fs.copyFileSync(path.join(REPO_ROOT, "scripts", rel), path.join(dir, rel));
+  }
+  const suite = path.join(dir, "check-pi-pin-lockstep.mjs");
+  const src = fs.readFileSync(suite, "utf8");
+  const anchor = 'test("pinFindings flags a drifted pin (positive control for (h))"';
+  assert.ok(src.includes(anchor), `early-exit fixture anchor not found: ${anchor}`);
+  fs.writeFileSync(suite, src.replace(anchor, "process.exit(0);\n" + anchor));
+  const res = spawnSync(process.execPath, [suite], { encoding: "utf8" });
+  assert.equal(
+    res.status,
+    1,
+    `an early process.exit(0) must still exit non-zero (the floor + roster run on ` +
+      `every exit path); got status ${res.status}, stdout=${JSON.stringify(res.stdout.slice(0, 200))}`
+  );
+  assert.match(
+    res.stderr,
+    /only 0 passing tests|required test\(s\) did not run/,
+    `the exit handler must name why it failed; stderr=${JSON.stringify(res.stderr)}`
+  );
+});
 
-// A LOWER BOUND on the passing count — a secondary, net-shrink signal. The
-// required-name set above is the primary identity check (#675 P2-c). This is a
-// floor, not an equality: adding tests never needs an update; deleting one does.
-const MIN_EXPECTED_PASSING = 91;
-console.log(`\ncheck-pi-pin-lockstep.mjs: ${passed} passed, ${failed} failed`);
-if (failed === 0 && passed < MIN_EXPECTED_PASSING) {
-  failed++;
-  console.error(
-    `❌ only ${passed} passing tests — expected at least ${MIN_EXPECTED_PASSING}. ` +
-      "A guard's test (or a whole section) was deleted or stopped running; restore it or " +
-      "update MIN_EXPECTED_PASSING deliberately."
-  );
-}
-const missingRequired = REQUIRED_TESTS.filter((name) => !passedTests.has(name));
-if (missingRequired.length > 0) {
-  failed++;
-  console.error(
-    "❌ required test(s) did not run and pass — a guard's test was deleted, renamed or " +
-      "neutered; filler no-op tests cannot compensate (#675 P2-c):"
-  );
-  for (const name of missingRequired) console.error(`   - ${name}`);
-}
-if (failed > 0) {
-  console.error("❌ SOME TESTS FAILED");
-  process.exit(1);
-}
-console.log("✅ ALL TESTS PASSED");
+// #675 P2-h — the floor + roster live near the top of this file and are
+// registered on the `exit` event there; calling `finalize()` here makes the
+// summary print in the normal path as well (the latch inside keeps it once-only).
+finalize();

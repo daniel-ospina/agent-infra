@@ -29,11 +29,13 @@
 # Because the trigger is privileged, this workflow MUST NEVER check out, execute,
 # build, or `npm install` any PR content. `actions/checkout` below deliberately
 # has NO `ref:` — it checks out the base branch. The PR's workflow files are read
-# as DATA through the GitHub Contents API at the PR head SHA only
-# (`node scripts/check-pi-pin-lockstep.mjs --head-ref <sha>`, which decodes the
-# API's base64 — failing closed on anything but base64 — and parses it; it never
-# executes it). Passing the PR head to `actions/checkout`, or any step that runs
-# PR content, turns this into the well-known `pull_request_target` RCE vector.
+# as DATA through the GitHub git tree + blob API at the PR head SHA only
+# (`node scripts/check-pi-pin-lockstep.mjs --head-ref <sha>`, which reads the
+# recursive tree, rejects any workflow path whose committed mode is not a regular
+# file (100644 — a symlink would run 0 jobs), fetches each blob by its tree sha,
+# and decodes the base64 failing closed; it never executes it). Passing the PR
+# head to `actions/checkout`, or any step that runs PR content, turns this into
+# the well-known `pull_request_target` RCE vector.
 #
 # See GitHub Security Lab, "Keeping your GitHub Actions and workflows secure:
 # Preventing pwn requests" (Part 4) and GitHub's "Securely using
@@ -45,10 +47,10 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, edited]
 
-# Read-only. `contents: read` covers the checkout and the Contents API call.
+# Read-only. `contents: read` covers the checkout and the git tree + blob calls.
 # `pull-requests: read` is deliberately NOT granted — nothing here reads PR
-# metadata (the only API call is the Contents endpoint); declaring an unused
-# scope is the P2-h finding from the #675 review.
+# metadata (the only API calls are the git tree and git blob endpoints);
+# declaring an unused scope is the P2-h finding from the #675 review.
 permissions:
   contents: read
 

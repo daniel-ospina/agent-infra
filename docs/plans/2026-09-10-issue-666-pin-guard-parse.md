@@ -39,8 +39,9 @@ Every one of those requires **editing the workflow file**. So the question the g
    exactly the class the round-2 bypasses live in.
 2. **`pull_request_target` runs the workflow file from the BASE branch.** GitHub Security Lab,
    *Keeping your GitHub Actions and workflows secure* Part 4. Corroborated by GitHub's
-   `securely-using-pull_request_target` doc. This is the missing piece: **a checker the PR cannot
-   rewrite.**
+   `securely-using-pull_request_target` doc. This is the missing piece: **a checker whose
+   *structural assertions* the PR cannot rewrite** (the PR can still edit its own copy of the lock and
+   the checked-in suite — see the Accepted-residual section).
 3. **Hash-pinning a workflow file is not a standard pattern — and that is fine.** Pinning *actions*
    to full commit SHAs is the norm; the workflow file is "usually managed through normal Git history
    and branch protections". The general integrity pattern (record a SHA-256, fail when it changes) is
@@ -142,18 +143,23 @@ step running `--head-ref`), so deleting or unwiring it is RED.
 The workflow header carries a prominent **security constraint**: `pull_request_target` runs the
 workflow definition from the BASE branch (that is what it buys — the PR cannot substitute *this file*);
 this workflow must therefore **never check out, execute, or `npm install` PR content**. It reads the
-PR's files as *data* through the GitHub Contents API only, decoding base64 and failing closed on
-anything else. Misusing this trigger is a known RCE vector; the header cites GitHub Security Lab's
-`pull_request_target` guidance. No `secrets: inherit`; no secret reference (`github.token` with
-`contents: read` is the only credential).
+PR's files as *data* through the GitHub git tree + blob API only (the tree's committed `mode` is
+checked first and any non-`100644` workflow entry is rejected before content is read), decoding base64
+and failing closed on anything else. Misusing this trigger is a known RCE vector; the header cites
+GitHub Security Lab's `pull_request_target` guidance. No `secrets: inherit`; no secret reference
+(`github.token` with `contents: read` is the only credential).
 
 ### 6. `--head-ref <sha>` mode on `scripts/check-pi-pin-lockstep.mjs` — NEW
 
-- Fetches the three workflow files at that ref via
-  `gh api "repos/{owner}/{repo}/contents/<path>?ref=<sha>"` and decodes the base64,
-  **fail-closed**: only `encoding: "base64"` is accepted (the API returns `encoding: "none"` with empty
-  content for a >1 MB blob) and the decode is fatal on invalid UTF-8, so a padded or damaged read
-  cannot masquerade as an empty workflow.
+- Fetches the recursive git TREE at that ref via
+  `gh api "repos/{owner}/{repo}/git/trees/<sha>?recursive=1"`, rejects any of the three workflow paths
+  whose committed git `mode` is not `100644` (a symlink `120000` or submodule `160000` is a broken
+  workflow entry that runs 0 jobs, while the Contents API would dereference it), then fetches each
+  remaining path's BLOB by its **tree sha** (`repos/{owner}/{repo}/git/blobs/<sha>`) so the bytes
+  parsed are the committed ones and never a dereference.
+- Decodes the blob base64, **fail-closed**: only `encoding: "base64"` is accepted (the API returns
+  `encoding: "none"` with empty content for a >1 MB blob) and the decode is fatal on invalid UTF-8, so
+  a padded or damaged read cannot masquerade as an empty workflow.
 - Runs **only the narrow structural assertions (items 1–6)** against those bytes.
 - **Skips the content lock** — otherwise every legitimate workflow change would deadlock against
   `main`'s old lock. This leg therefore provides **zero lock enforcement**; see the authoritative
@@ -199,31 +205,33 @@ callee `continue-on-error`, the step `shell:`, the job `defaults.run.shell`, the
 | `(i)` mirror stamps | unit + negative + **positive control** + #779 prose fixture | same | ✅ (3 tests; `stampFindings(stale)` non-empty; the four prose lines stay empty) |
 | narrow wiring guard (items 1–6) | unit | same | ✅ live trio + 1 fixture-trio baseline + 1 empty/comments-only RED + 11 `expectWired` + 18 `expectRed` |
 | content lock | unit + CLI | same + `node scripts/check-workflow-lock.mjs` | ✅ 7 lock tests + 4 lock-level bypass tests + 5 `lockFindings` branch controls + 2 coverage + 1 symlinked-CLI + 1 `workflow-lock.yml` wiring |
-| `--head-ref` mode | unit | same | ✅ runs the structural assertions; proves the lock is not applied; RED for empty/comments-only input; Contents-API decode fail-closed |
-| `(h)`/`(i)`/`(j)` + lock + reader | integration | `node scripts/check-pi-pin-lockstep.mjs` | ✅ **91 passed, 0 failed** |
+| `--head-ref` mode | unit + e2e | same | ✅ runs the structural assertions; proves the lock is not applied; RED for empty/comments-only input; git-tree mode rejection (`120000`) and blob-decode fail-closed |
+| `(h)`/`(i)`/`(j)` + lock + reader | integration | `node scripts/check-pi-pin-lockstep.mjs` | ✅ **109 passed, 0 failed** |
 | #254 frontmatter validator | integration | `node scripts/check-skill-lint.test.mjs` | ✅ **160 passed, 0 failed** |
 | validator oracle (pi parity + fuzz) | integration | `node --test scripts/check-skill-lint.oracle.test.mjs` | ✅ **146 passed, 0 failed, fuzz 0/1000** |
 | ci-ref pin-drift unit tests | integration | `node scripts/ci-ref-check.test.mjs` | ✅ **183 passed, 0 failed** |
 | workflow YAML validity | static | `bash scripts/check-workflow-actionlint.sh` | ✅ exit 0 (includes the new `workflow-lock.yml`) |
 
-**Case census (fresh run):** 91 tests = 58 plain `test()` + 11 `expectWired` + 18 `expectRed` + 4
-`expectLockRedForEdit` (each of which is one `test()`). The 58 plain tests cover `(h)`, `(i)`, the live
-wiring trio, the lock lifecycle/schema/coverage/`workflow-lock.yml` tests, `--head-ref`, the
-Contents-API decode guard, the item-6 block, and the reader. The run also asserts a set of REQUIRED
-TEST NAMES (see below), so a deleted or neutered assertion is RED regardless of the total.
+**Case census (fresh run, third revision):** 109 tests = 76 plain `test()` + 11 `expectWired` + 18
+`expectRed` + 4 `expectLockRedForEdit` (each of which is one `test()`). The 76 plain tests cover
+`(h)`, `(i)`, the live wiring trio, the lock lifecycle/schema/coverage/`workflow-lock.yml` tests,
+`--head-ref` (unit + stubbed-`gh` e2e), the blob decode guard, the item-6 block, the exit-path floor
+and the reader. The run also asserts a set of REQUIRED TEST NAMES (see below), so a deleted or renamed
+assertion is RED regardless of the total. It does NOT catch a required test whose BODY is replaced by
+a same-name no-op — that is a same-commit residual, recorded explicitly below.
 
 ## Verification plan — executed (before → after)
 
 | # | Check | Before (design) | After (this revision) |
 |---|---|---|---|
-| 1 | `node scripts/check-pi-pin-lockstep.mjs` | 71 passed | **91 passed, 0 failed** |
+| 1 | `node scripts/check-pi-pin-lockstep.mjs` | 71 passed | **109 passed, 0 failed** |
 | 2 | `node scripts/check-skill-lint.test.mjs` | 160 passed | **160 passed, 0 failed** |
 | 3 | `node --test scripts/check-skill-lint.oracle.test.mjs` | 146 passed | **146 passed, 0 failed** |
 | 4 | `node scripts/ci-ref-check.test.mjs` | 183 passed | **183 passed, 0 failed** |
 | 5 | `bash scripts/check-workflow-actionlint.sh` | exit 0 | **exit 0** |
 | 6 | `node scripts/check-workflow-lock.mjs` (baseline) | n/a (new) | ✅ green (3 files) |
 | 7 | change one byte in `.github/workflows/ci.yml` | n/a | ❌ RED — names `.github/workflows/ci.yml`, differs from the locked sha256, prints the `--update-lock` remedy; restored via `cp` from `/tmp` and re-verified green (sha256 identical) |
-| 8 | `--head-ref <PR head SHA>` | n/a | ✅ green — fetch through the Contents API, structural assertions only, lock skipped |
+| 8 | `--head-ref <PR head SHA>` | n/a | ✅ green — fetch through the git tree + blob API, structural assertions only, lock skipped |
 | 9 | bypass `shell: 'true {0}'` | ✅ GREEN under the round-1 guard (caught) / round-2 gaps | ❌ **lock RED**, names `node-ci.yml` |
 | 10 | bypass `env:` (`NODE_OPTIONS`) | ✅ GREEN under the semantics guard | ❌ **lock RED** |
 | 11 | bypass `container:` | ✅ GREEN under the semantics guard | ❌ **lock RED** |
@@ -240,7 +248,7 @@ A four-agent review of the redesign reproduced the following; the fix cycle is c
 
 | # | Defect | Fix |
 |---|---|---|
-| P1-a | `wiringFindings` FAILED OPEN on a zero-token document (`parseWorkflowYaml("")` → null, and every assertion was guarded by `if (caller !== null)`), so an empty `ci.yml` produced zero findings and the trusted leg printed ✅; compounding, `fetchRefFile` ignored `encoding` (a >1 MB blob returns `encoding: "none"` + empty content) | `null`/non-mapping parse is now a finding for `ci.yml` and `node-ci.yml` exactly as `ciMainFindings` does; `decodeContentsApi` accepts only `encoding: "base64"` and decodes with `TextDecoder(…, { fatal: true })` |
+| P1-a | `wiringFindings` FAILED OPEN on a zero-token document (`parseWorkflowYaml("")` → null, and every assertion was guarded by `if (caller !== null)`), so an empty `ci.yml` produced zero findings and the trusted leg printed ✅; compounding, the ref-file fetch ignored `encoding` (a >1 MB blob returns `encoding: "none"` + empty content) | `null`/non-mapping parse is now a finding for `ci.yml` and `node-ci.yml` exactly as `ciMainFindings` does; `decodeBase64Blob` accepts only `encoding: "base64"` and decodes with `TextDecoder(…, { fatal: true })` |
 | P1-b | The lock was described as “THE PRIMARY DEFENCE … the PR cannot delete or neuter the checker”, but its only call site is the PR's own copy of the script, run from the PR-editable `ci.yml` | Claims corrected, mechanism unchanged. The authoritative trust-split statement is the module header of `scripts/check-pi-pin-lockstep.mjs`; the workflow header and this plan reference it |
 | P1-c | The stamp regex keyed on the generic English words `version`, `parity`, `probe` (the #779 class) | The marker is now the pi token (`\bpi\b`) only; the ci-main.yml stamp comments were reworded to name pi; four GREEN prose fixtures added |
 | P1-d | `shellControlContext` split lines on non-word characters, so `echo "checking if the suite is wired"` opened an `if` block | Quotes/comments/heredoc bodies are removed and keywords count only in command position; GREEN fixture added for quoted `if`/`for`/`while` prose |
@@ -264,7 +272,40 @@ quotes/comments/heredoc bodies removed, keywords counted only in command positio
 required to exist and exit non-zero — with the content lock still the tripwire and this only the
 better error message (the module header's authoritative trust split).
 
+## #675 second review-fix cycle (2026-09-12)
+
+A re-verification of the first fix cycle found the following. Every one was reproduced with a command
+before being fixed, and every fix is covered by a RED or GREEN fixture.
+
+| # | Defect | Fix |
+|---|---|---|
+| P1-1 | **Regression introduced by the first fix.** The new command-position logic cleared `commandStart` after any non-keyword token, so `!` and `time` (which suppress errexit, keeping the step green) were treated as a consumed command and the `if`/`while`/`for` behind them was never counted. Five such cases were GREEN through the real `--head-ref` path | `!`, `time`, `time -p`, `{`, `}`, `coproc` are command-position neutral (they do not clear it); five RED fixtures + a `time -p` fixture added |
+| P1-2 | **Symlink bypass.** Both controls dereferenced a symlinked workflow (`fs.readFileSync`, and the contents API returns the target's bytes) so a symlink kept the lock hash identical and the trusted leg green, while GitHub runs 0 jobs for a symlinked workflow entry. The pre-existing `find -type l` sweep lives in a non-required sibling job of `pipeline-compliance.yml` (on `UNLOCKED_WORKFLOWS`, run from the PR's own copy) | Both guards fail closed on non-regular files: `lockFindings` and `workflowCoverageFindings` `lstat` and reject a non-regular entry; `--head-ref` fetches the git TREE, rejects any `HEAD_REF_FILES` entry whose committed `mode` is not `100644`, and fetches blobs by tree sha so the bytes are never a dereference. RED fixtures for both paths, plus a stubbed-`gh` e2e pair |
+| P2-3 | `select` was missing from the loop keyword set, so `select x in a; do <invocation> done` was accepted as top-level while the body never runs with stdin closed | `select` added to the loop set and the label; RED fixture |
+| P2-4 | A surviving false claim: a comment still called the lock "THE PRIMARY DEFENCE", contradicting the corrected header; the plan said "a checker the PR cannot rewrite" | Reworded to the conspicuousness tripwire; the plan now says the checker's *structural assertions* cannot be rewritten (the PR can still edit its own lock and the checked-in suite) |
+| P2-5 | The roster is names-only: replacing a required test's BODY with `assert.ok(true)` while keeping the name yields a green run, but three comments/plan lines claimed a "neutered" assertion was RED | The three strings now say "deleted or renamed"; the same-name-neutering residual is recorded below |
+| P2-6 | `sameRealPath` returned false for ANY `realpathSync` failure, so a vanished `process.argv[1]` made `IS_MAIN` false and the process exited 0 with no output (the #708 symptom this comparison closed) | On failure, fall back to a literal comparison, then to resolved-parent-directory + basename (covers a symlinked ancestor such as `/var` → `/private/var`); a self-deleting-`argv[1]` fixture asserts a non-zero exit |
+| P2-7 | `<<<` here-strings matched the heredoc regex starting at index 1, so `grep -q foo <<< bar` before the invocation was a false RED — the #779 class | The heredoc regex requires `<<` not preceded/followed by `<`; GREEN fixture for `cmd <<< word` |
+| P2-8 | `process.exit(0)` before the first test (or inside a required test) exited 0 with zero ✅ lines — the floor and roster ran only at the end of the module body | The floor + roster are declared and registered on the `exit` event near the top of the file, and `finalize()` sets `process.exitCode`; a fixture proves an early `process.exit(0)` now exits 1 |
+
 ## Accepted residual (recorded, not papered over)
+
+- **A required test whose BODY is replaced by a same-name no-op is not caught (#675 P2-5).** The
+  roster records test NAMES, not semantics: `test("<required name>", () => assert.ok(true))` passes and
+  the suite stays green (`node scripts/check-pi-pin-lockstep.mjs` → `109 passed, 0 failed`, exit 0,
+  measured on a full repo copy). No in-file mechanism can defend against a same-commit body rewrite
+  (the roster, the floor and the exit handler are all in the file the PR can edit) — this is the same
+  accepted same-commit class as the lock. The roster's claim is therefore bounded to **deleted or
+  renamed** tests, and the three strings that claimed otherwise were corrected.
+- **GitHub's own 0-jobs behaviour for a symlinked workflow is out of scope (#675 P1-2).** Both guards
+  now REJECT a non-regular workflow entry, but a symlink under `.github/workflows/` still makes the
+  per-PR `ci.yml` a broken workflow entry that runs 0 jobs, and `ci.yml` is not a required check. Making
+  the per-PR pin suite a required status check is the branch-protection work owned by **#646/#673**;
+  this PR closes the guard-side bypass (so the symlink is at least RED in both guards) but does not by
+  itself block the merge.
+- **`--head-ref` trusts the git tree payload.** A truncated tree is an error (fail-closed), and modes
+  are read from the API's `mode` field; a future API change to the tree shape would surface as a
+  fetch/parse finding, not a silent pass.
 
 - **A PR that edits a locked workflow AND the lock together still passes.** This is the same accepted
   class already recorded for this guard ("a test that reads repo files cannot defend against a commit
@@ -287,7 +328,7 @@ better error message (the module header's authoritative trust split).
   re-running `node scripts/check-workflow-lock.mjs --update-lock` and committing the lock alongside it.
   This is the intended loud behaviour; the cost is one line in the diff.
 - **`pull_request_target` is a privileged trigger.** The workflow must never check out or execute PR
-  content. The checker reads file bytes through the Contents API only. This constraint is stated in the
+  content. The checker reads file bytes through the git tree + blob API only (never executing them). This constraint is stated in the
   workflow header because misusing this trigger is a well-known RCE vector.
 - **The library `templates/.github/workflows/` copy is out of scope for the lock**;
   `workflow-drift` already covers `node-ci.yml`.
@@ -307,9 +348,11 @@ better error message (the module header's authoritative trust split).
 - **positive controls** — `(h)`/`(i)` carry their explicit predicate positive controls (#675 P1-3);
   every one of items 1–6 has a failing fixture and a passing fixture; `lockFindings` now has one
   positive control per schema branch (#675 P2-e).
-- **`MIN_EXPECTED_PASSING` floor** — 71 → **91**, and it is now a SECONDARY signal: the run also
-  asserts a set of required test NAMES (#675 P2-c), so disabling a real test while adding a no-op
-  filler is RED even when the count is unchanged.
+- **`MIN_EXPECTED_PASSING` floor** — 71 → 91 → **109** (third revision; the #675 second review-fix
+  cycle added 18 fixtures), and it is now a SECONDARY signal: the run also asserts a set of required
+  test NAMES (#675 P2-c), so deleting or renaming a real test is RED even when the count is unchanged.
+  The floor and the roster are evaluated in a `process.on("exit", …)` handler (#675 P2-h), so an early
+  `process.exit(0)` cannot skip them.
 
 ## Out of Scope
 
