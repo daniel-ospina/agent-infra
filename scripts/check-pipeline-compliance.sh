@@ -656,19 +656,27 @@ run_checks() {
         # H6: a line that QUOTES the marker contract is documentation, not a
         # malformed record. Skip it when the `independent` slot is an
         # angle-bracketed/alternation placeholder (`<yes|NO|DEGRADED>`) or the
-        # `model` slot carries a placeholder signal (an alternation `|`, or a
-        # bracketed value with a `/` — `<resolved provider/id>`). A bare
-        # `model=<script>` is NOT a placeholder: genuine garbage must still fail
-        # (C3(a) case 6n).
+        # `model` slot is a placeholder (a bracketed value containing `/` —
+        # `<resolved provider/id>`). A bare `model=<script>` is NOT a
+        # placeholder: genuine garbage must still fail (C3(a) case 6n).
+        # I2: classify the SLOTS in isolation. The old test scanned the whole
+        # line tail for `|`, so a `|` ANYWHERE after `model=` — an ordinary
+        # markdown table cell, or trailing prose like `note kimi|opus` —
+        # skipped the line and defeated the conflict / reserved / non-id
+        # checks below (`model=none| independent=DEGRADED` was skipped too).
         if [[ "$sm_line" == *"[SECOND-MODEL-GATE]"* ]]; then
           sm_tail="${sm_line#*\[SECOND-MODEL-GATE\]}"
-          sm_islot=""
+          sm_islot="" sm_mslot=""
           if [[ "$sm_tail" == *"independent="* ]]; then
             sm_islot="${sm_tail#*independent=}"
             sm_islot="${sm_islot%%[[:space:]]*}"
           fi
+          if [[ "$sm_tail" == *"model="* ]]; then
+            sm_mslot="${sm_tail#*model=}"
+            sm_mslot="${sm_mslot%%[[:space:]]*}"
+          fi
           if [[ "$sm_islot" == "<"* || "$sm_islot" == *"|"* \
-                || "$sm_tail" == *"model=<"*/* || "$sm_tail" == *"model="*"|"* ]]; then
+                || ( "$sm_mslot" == "<"* && "$sm_mslot" == *"/"* ) ]]; then
             continue
           fi
         fi
@@ -1037,6 +1045,18 @@ ${smline}"
   sm_case 6v "blocks two distinct recorded model ids" \
     "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "conflicting \[SECOND-MODEL-GATE\] lines" \
     "" 1 "complexity:standard" "[SECOND-MODEL-GATE] model=openrouter/anthropic/claude-opus-4.8 independent=yes @ $SM_SIM_SHA"
+  # I2: the H6 placeholder skip tested the WHOLE line tail for `|`, so ANY `|`
+  # after `model=` (trailing prose, a markdown table cell, a `none|` value)
+  # skipped a genuine marker and defeated the conflict / reserved / non-id
+  # checks. The placeholder signal must be read from the model slot ONLY.
+  sm_case 6i2 "blocks a conflicting pair whose DEGRADED line has a | in trailing prose" \
+    "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=DEGRADED @ $SM_SIM_SHA note kimi|opus" "$SM_SIM_SHIPPED" 0 "conflicting \[SECOND-MODEL-GATE\] lines" \
+    "" 1 "complexity:standard" "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ $SM_SIM_SHA"
+  sm_case 6i3 "blocks a conflicting markdown-table-cell marker (trailing |)" \
+    "| [SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=DEGRADED @ $SM_SIM_SHA |" "$SM_SIM_SHIPPED" 0 "conflicting \[SECOND-MODEL-GATE\] lines" \
+    "" 1 "complexity:standard" "| [SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ $SM_SIM_SHA |"
+  sm_case 6i4 "blocks model=none| (a | in the MODEL slot is not a placeholder)" \
+    "[SECOND-MODEL-GATE] model=none| independent=DEGRADED @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "non-model value"
   # C3(a): a reserved model value laundered as independent=yes must FAIL.
   sm_case 6j "blocks a reserved model laundered as independent=yes" \
     "[SECOND-MODEL-GATE] model=**DEGRADED independent=yes @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "reserved model value"
