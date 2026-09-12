@@ -12,9 +12,14 @@
  *       node-ci.yml, and the post-merge pin-suite invocation line is still
  *       PRESENT in ci-main.yml's `test-command` (item 6a — a pure value
  *       assertion, run on BOTH legs). Whether that line can FAIL the step is
- *       item 6b's separate, behavioural, PR-editable claim. REACHABILITY of
- *       that line is NOT covered by 6b on the committed (multi-suite) file
- *       either — see the unowned hole in the plan's Accepted-residual section.
+ *       item 6b's separate, behavioural, PR-editable claim. Item 6b's stub fails
+ *       ONLY the pin suite (#807). A line that is unreachable — swallowed by a
+ *       multi-line quoted string, deleted, or repointed — therefore leaves
+ *       NOTHING failing, and a guard that is dead — hidden in `if false`, a
+ *       never-called function or a never-taken `case` arm, or preceded by an
+ *       `exit 0` — lets the step reach its success echo even though the pin
+ *       suite failed. Both classes make 6b RED on the committed multi-suite
+ *       file, not just on a single-suite fixture. See "WHAT 6b CATCHES".
  * The #254 frontmatter-validator suite stays in scripts/check-skill-lint.test.mjs.
  * This suite does NOT import pi (the dev-machine oracle owns pi parity).
  *
@@ -82,7 +87,8 @@
  * at GitHub's surface.
  *
  * ITEM 6a IS A VALUE ASSERTION; ITEM 6b IS THE BEHAVIOURAL ONE (#666, third
- * revision; 6a restored in the final review cycle).
+ * revision; 6a restored in the final review cycle; #807 changed WHAT 6b's stub
+ * fails).
  * Items 1–5 assert VALUES read from parsed nodes. Item 6a does the same for
  * ci-main.yml: the pin-gate job exists with the expected `with:` keys, its
  * `test-command` is a non-empty string, and that body still CONTAINS the exact
@@ -92,21 +98,21 @@
  * committed post-merge `test-command` actually fail the step?" — and answers it
  * by EXECUTING the committed command: it parses ci-main.yml, takes the pin-gate
  * job's `test-command` body, writes it to a temp dir and runs it under `bash -e`
- * with `node` — plus `npx`, `npm` and `bash`, the other interpreters that command
- * shells out to — replaced by stubs that exit 1 first on PATH. The assertion is
- * that the step exits NON-ZERO.
+ * with `node`/`npx`/`npm`/`bash` replaced by stubs first on PATH. The `node` stub
+ * exits 1 ONLY when its arguments name scripts/check-pi-pin-lockstep.mjs; every
+ * other stubbed invocation exits 0. The assertion is that the step exits
+ * NON-ZERO with ONLY the pin suite failing.
  *
- * WHY 6a EXISTS ALONGSIDE 6b. 6b CANNOT SEE A DEAD PIN GATE. Under the failing
- * stub EVERY suite fails, so a command whose pin-suite line was DELETED — or
- * REPOINTED at another script — still exits non-zero on the strength of the other
- * suites, and 6b reports GREEN. Measured on the revision before 6a was restored:
- * with the invocation line deleted from ci-main.yml the suite reports `0 failed`,
- * exit 0, and the trusted `--head-ref` leg reports ✅. 6a is what makes that
- * shape RED, on both legs. 6a proves the line EXISTS; 6b proves the step CAN
- * FAIL. They are NOT complementary in the 6a→6b direction: 6a's miss —
- * unreachability — is not covered by 6b on the committed multi-suite file (see
- * the unowned hole in the plan). Only 6b's miss — a dropped or repointed
- * invocation line — is covered, by 6a.
+ * WHY 6a STILL EXISTS ALONGSIDE 6b. 6b's stub now fails ONLY the pin suite, so
+ * on the per-PR / post-merge legs a DELETED or REPOINTED invocation line leaves
+ * NOTHING failing and 6b goes RED as well (#807). But 6b has to EXECUTE the
+ * command, so it can never run on the trusted `pull_request_target` leg — that
+ * would run PR content on a privileged trigger (the well-known RCE vector). 6a is
+ * the value assertion the TRUSTED leg runs, and it is therefore the only thing
+ * that sees a dropped or repointed invocation line in a PR's workflow bytes.
+ * Measured on the revision before 6a was restored: with the invocation line
+ * deleted from ci-main.yml the suite reports `0 failed`, exit 0, and the trusted
+ * `--head-ref` leg reports ✅.
  *
  * WHY EXECUTION REPLACED THE SCANNER (6b). Four review rounds found bypasses in a
  * hand-written POSIX-shell scanner: `!`/`time` prefix operators, `select`, a
@@ -117,33 +123,44 @@
  *
  * WHAT 6b CATCHES, STATED NARROWLY — five review rounds each found a claim the
  * code did not support, so this is the bound the fixture evidence supports: 6b
- * catches any shell construct that makes the STEP'S EXIT STATUS depend on a real
- * suite failing, because bash — not this file — decides that. It does NOT catch a
- * command that merely keys its exit status off the STUB. Reproduced: a
- * `node --version >/dev/null 2>&1 || exit 1` probe followed by the guard block
- * and NO suites at all makes 6b GREEN (the stub fails the probe, so the step
- * exits 1) while the pin gate is dead — the real CI would exit 0. That shape is
- * caught by 6a (the invocation line is absent), not by 6b.
+ * catches any shell construct that makes the STEP'S EXIT STATUS depend on the
+ * pin suite's stub failing — bash, not this file, decides that. Two classes are
+ * covered: constructs that stop the pin-suite invocation running at all (a
+ * deleted or repointed line, a multi-line quoted string around it), and
+ * constructs that kill the failure guard while the invocation still fails (a
+ * guard moved into a never-called function or a never-taken `case` arm, an
+ * `exit 0` before the guard). It does NOT catch a command that merely keys its
+ * exit status off the STUB. Reproduced and pinned: a probe that NAMES the pin
+ * suite for its own sake —
+ * `node scripts/check-pi-pin-lockstep.mjs --version >/dev/null 2>&1 || exit 1` —
+ * followed by the guard block and NO suite invocation at all makes 6b GREEN (the
+ * stub sees the pin-suite path and exits 1) while the pin gate is dead — the real
+ * CI would exit 0. That shape is caught by 6a (the invocation line is absent),
+ * not by 6b.
  *
  * WHAT 6b DOES AND DOES NOT PROVE:
- *   - IT PROVES: on this machine, with this shell, with `node` replaced by a stub
- *     that always exits 1, the committed `test-command` body makes the step exit
- *     non-zero. A passing run means the stubbed failure IS observable in the
- *     step's exit status.
+ *   - IT PROVES: on this machine, with this shell, with the `node` stub failing
+ *     ONLY the pin suite's invocation and every other stub passing, the committed
+ *     `test-command` body makes the step exit non-zero. A passing run means the
+ *     pin suite's failure IS observable in the step's exit status — on the
+ *     committed MULTI-SUITE command as well, where every other suite passes.
  *   - IT DOES NOT PROVE: that the real suites run, that they pass, that the step
- *     fails on GitHub's runner (different image, different bash, network,
- *     caches), or that the failing exit status came from a real suite at all
- *     (see the stub-keyed shape above). It is a bound, not a proof of correctness.
- *   - IT DOES NOT PROVIDE PER-SUITE ATTRIBUTION: the negative run makes EVERY
- *     suite fail, so a command that has dropped only THIS suite's line still
- *     exits non-zero while the others fail. Asserting the line's PRESENCE is
- *     6a's job; a byte change to the locked file is additionally caught by the
- *     CONTENT LOCK.
- *   - TWO CONTROLS MAKE IT FALSIFIABLE, and both are tested: a POSITIVE control
- *     (the same command with passing stubs must exit 0) rejects a pass produced
- *     by a missing binary or an unrelated early failure, and a NEGATIVE control
- *     (the same command with its failure guard moved inside `if false; then … fi`
- *     must make the assertion go RED) rejects a formality.
+ *     fails (or passes) on GitHub's runner (different image, different bash,
+ *     network, caches), or that the failing exit status came from the real pin
+ *     suite rather than from the stub (see the stub-keyed shape above). It is a
+ *     bound, not a proof of correctness.
+ *   - PER-SUITE ATTRIBUTION IS BOUNDED BY THE STUB, NOT BY THE SUITE COUNT: the
+ *     stub matches `node`'s ARGUMENTS, so an invocation of the pin suite through
+ *     an interpreter the stub does not replace (an absolute `node` path) is not
+ *     the stubbed failure. The assertion still only requires SOME failure to
+ *     reach the guard.
+ *   - THREE CONTROLS MAKE IT FALSIFIABLE, and all are tested: a POSITIVE control
+ *     (the real command with ONLY the pin suite's stub failing must exit
+ *     non-zero), an ALL-PASS control (the same command with every stub passing
+ *     must exit 0 — this rejects a pass produced by a missing binary or an
+ *     unrelated early failure), and a NEGATIVE control (the committed invocation
+ *     wrapped in a multi-line quoted string must make the assertion go RED — the
+ *     #807 shape).
  *   - IT FAILS CLOSED ON ITS OWN FAILURES: `bash` is resolved to an absolute path
  *     once and the run THROWS rather than falling back to a bare name the stub
  *     directory could shadow; a spawn failure is RED with its own message; and
@@ -383,6 +400,22 @@ if (process.env[STICKY_FIXTURE_ENV] !== undefined) {
   }
 }
 
+// ── #808: what the authenticated sticky child skips ─────────────────────────
+// The sticky-failure fixture spawns a full copy of this suite and forces one
+// failure to prove the terminal `process.exit(1)` is sticky. That child exists
+// ONLY to reach the terminal decision — the parent has already run every
+// expensive fixture — so it skips the item-6b real-`bash` runs and the
+// `--head-ref` end-to-end fixtures. The skip shortens the single largest cost of
+// a run without changing anything the parent asserts; the parent still runs all
+// of them.
+//
+// SAFETY: a skip is recorded as a PASS (the test's body returns early), so it is
+// gated on the ONLY thing that can authorise it — the handshake immediately
+// above, which proved this run is a copy the parent itself wrote the token into.
+// An ambient env var never reaches this line: the module-top guard exits 1 first.
+// The child still exits 1 (the fixture appends a forced `failed++`).
+const STICKY_CHILD = process.env[STICKY_FIXTURE_ENV] !== undefined;
+
 // ── Constants used by the narrow guard ─────────────────────────────────────
 const isMap = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const EXPECTED_USES = "daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main";
@@ -420,9 +453,8 @@ const EXPECTED_CI_MAIN_WITH_KEYS = ["node-version", "script-validate", "skill-li
 // invocation line` message. The over-strictness is intentional: the remedy is
 // loud, and the failure message names this constant.
 // DO NOT relax it here with comment-stripping or continuation-joining — that is
-// shell modelling, which this PR deleted on purpose, and it would also widen the
-// reachability hole recorded in the plan's Accepted-residual section. If you
-// believe that logic is needed, raise it as a recommendation; do not add it.
+// shell modelling, which this PR deleted on purpose. If you believe that logic is
+// needed, raise it as a recommendation; do not add it.
 const EXPECTED_CI_MAIN_INVOCATION =
   "node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))";
 // The same line as it is INDENTED in ci-main.yml and in the fixture below (the
@@ -751,20 +783,28 @@ const REQUIRED_TESTS = Object.freeze([
   "ci-main structural: losing the `extension-tests` job is RED (#666 third revision)",
   "ci-main structural: an extra `with:` key is RED (#666 third revision)",
   "ci-main structural: dropping the `test-command` `with:` key is RED (#666 third revision)",
-  // #666 third revision — item 6, behavioural
-  "item 6 behavioural: the live ci-main.yml command exits NON-ZERO with every `node` stub failing",
-  "item 6 positive control: the live command exits 0 when the stubs succeed",
+  // #666 third revision — item 6, behavioural. #807 changed WHAT the stub
+  // fails (only the pin suite), so these names moved with it.
+  "item 6b positive control: the live ci-main.yml command exits NON-ZERO with ONLY the pin suite's stub failing (#807)",
+  "item 6b all-pass control: the live command exits 0 when every stub passes",
   "item 6 negative control: a guard moved inside `if false; then … fi` makes the assertion go RED",
   "item 6: a guard inside a never-called shell function makes the assertion go RED",
   "item 6: a guard hidden in a heredoc (`if false; then cat <<EOF`) makes the assertion go RED",
-  "item 6: an invocation swallowed by a multi-line quoted string makes the assertion go RED",
+  // #807 — the reachability class. Three shapes the deleted scanner covered and
+  // the multi-line-quoted negative control: with only the pin suite failing, each
+  // leaves the step exiting 0, so each must be RED.
+  "item 6b negative control (#807): the committed invocation wrapped in a multi-line quoted string makes the assertion go RED",
+  "item 6b: deleting the failure guard makes the assertion go RED",
+  "item 6b: an `exit 0` before the failure guard makes the assertion go RED",
+  "item 6b: a guard inside a never-taken `case` arm makes the assertion go RED",
+  "item 6b BOUND (pinned): a command that only keys its exit status off the STUB is still not caught",
   "item 6: a quoted `<<` no longer arms a phantom heredoc (GREEN, no false RED)",
   // #675 final cycle — item 6a (invocation presence, a VALUE check on both legs)
   // and the item-6b / sticky-fixture hygiene that fails closed on its own
   // failures. These are the assertions this cycle restored or repaired, so their
   // names are pinned: deleting or renaming one is RED regardless of the count.
   "the ci-main fixture contains the post-merge pin-suite invocation line (item 6a)",
-  "item 6a: DELETING the invocation line is RED, and item 6b stays GREEN on the live file",
+  "item 6a: DELETING the invocation line is RED (and 6b is RED for it too under the #807 stub)",
   "item 6b hygiene: an unresolvable bash is RED with the spawn-failure message (never a pass)",
   "item 6b hygiene: a command that cannot finish is RED at the explicit spawn timeout",
   "the sticky fixture's skip handshake fails CLOSED for a forged or stale token (#675 final cycle)",
@@ -784,11 +824,12 @@ const REQUIRED_TESTS = Object.freeze([
 // A LOWER BOUND on the passing count — a secondary, net-shrink signal. The
 // required-name set above is the primary identity check (#675 P2-c). This is a
 // floor, not an equality: adding tests never needs an update; deleting one does.
-// (#675 final cycle: 105 → 116 — item 6a's invocation-presence fixtures, item 6b's
-// spawn-hygiene fixtures, the sticky-fixture handshake fixtures and the pinned
-// same-file-listener residual. Three of the eleven are additions to the roster
-// above as well, so deleting one by name is RED independently of this floor.)
-const MIN_EXPECTED_PASSING = 116;
+// (#675 final cycle: 105 → 116. #807: 116 → 120 — the three reachability shapes
+// the pin-suite-only stub makes observable (a deleted failure guard, an `exit 0`
+// before the guard, and a guard inside a never-taken `case` arm), plus the pinned
+// stub-keyed bound. All four are in the roster above as well, so deleting one by
+// name is RED independently of this floor.)
+const MIN_EXPECTED_PASSING = 120;
 
 let finalized = false;
 function finalize() {
@@ -1311,29 +1352,25 @@ function wiringFindings(ciSrc, nodeCiSrc, ciMainSrc) {
 // HERE, as a pure VALUE. The deleted scanner asserted two different things: the
 // line is PRESENT, and the step can FAIL. Only the second needed shell modelling.
 // Deleting both left a hole with no owner: a ci-main.yml that drops the
-// invocation line and updates the lock is caught by NOTHING (measured: the suite
-// reports `0 failed`, exit 0, and the trusted `--head-ref` leg reports ✅), and
-// item 6b cannot catch it because the other suites still fail the stub run. The
+// invocation line and updates the lock was caught by NOTHING (measured: the suite
+// reports `0 failed`, exit 0, and the trusted `--head-ref` leg reports ✅). The
 // check below is a trimmed-line equality against a pinned constant on the value
 // the YAML reader parsed — never a grep of the raw file.
 //
 // WHAT IT PROVES / DOES NOT PROVE, EXACTLY: it proves the LINE EXISTS in the
-// committed `test-command` body. It does NOT prove the line is REACHABLE, and it
-// does NOT prove the step can FAIL (item 6b's job).
+// committed `test-command` body. It does NOT prove the line is REACHABLE (a line
+// inside a multi-line quoted string is textually present but is not a command)
+// and it does NOT prove the step can FAIL (item 6b's job).
 //
-// REACHABILITY IS NOT COVERED BY 6b EITHER, ON THE COMMITTED FILE. Wrapping the
-// invocation in a multi-line quoted string leaves it textually present but not a
-// command. Measured on the committed, MULTI-SUITE ci-main.yml: 6a passes
-// (`ciMainInvocationFindings(mutated).length === 0` — the wrapped line is still
-// one trimmed line) and 6b passes too (`runCiMainTestCommand(mutated, 1)` →
-// status 1, which is 6b's GREEN), because the OTHER suites still drive the guard
-// and the step still exits non-zero. 6b's RED fixture for that shape uses the
-// SINGLE-SUITE `FIXTURE_CI_MAIN`, where the pin suite is the step's only suite, so
-// the swallowed invocation does move the exit status
-// (`runCiMainTestCommand(fixture, 1)` → status 0) and the fixture goes RED. The
-// committed multi-suite file is therefore protected against this shape by NEITHER
-// 6a NOR 6b — only by the content lock, which is the same-commit residual (this
-// shape is recorded as an unowned hole in the plan's Accepted-residual section).
+// REACHABILITY IS NOW ALSO CAUGHT BY 6b, ON THE COMMITTED FILE (#807). Item 6b's
+// stub fails ONLY the pin suite, so wrapping the invocation in a multi-line
+// quoted string leaves NOTHING failing: the step reaches its success echo and
+// exits 0, and 6b goes RED. Measured on the committed, MULTI-SUITE ci-main.yml:
+// 6a still passes (`ciMainInvocationFindings(mutated).length === 0` — the wrapped
+// line is still one trimmed line), while
+// `runCiMainTestCommand(mutated, "pin-suite-only-fails")` → status 0 — 6b's RED.
+// The fixture is in the item-6b section; with the pre-#807 `all-fail` stub the
+// same mutation was status 1, which is what made it invisible.
 // It reads already-fetched bytes and executes nothing, so it is safe — and
 // REQUIRED — on the privileged trusted leg.
 
@@ -1362,7 +1399,8 @@ function ciMainInvocationFindings(src) {
     `ci-main.yml's \`${CI_MAIN_PIN_JOB}\` \`test-command\` no longer contains the pin-suite ` +
       `invocation line ${JSON.stringify(EXPECTED_CI_MAIN_INVOCATION)} as a whole line — the ` +
       "post-merge half of #637's pin-gate contract would be dropped while the job stays green " +
-      "(the other suites still fail the item-6b stub run, so item 6b cannot see this). Restore " +
+      "(item 6b cannot run on the trusted `--head-ref` leg, which must never execute PR content). " +
+      "Restore " +
       "the line, or change it deliberately and update this constant in the same commit.",
   ];
 }
@@ -1426,23 +1464,67 @@ function ciMainStructuralFindings(src) {
 // the exit status.
 //
 // WHAT IT CATCHES, EXACTLY (the module header carries the full, authoritative
-// statement): any shell construct that makes the STEP'S EXIT STATUS depend on a
-// real suite failing — bash, not this file, decides that. It does NOT catch a
-// command that merely keys its exit status off the stub (a stub probe followed
-// by the guard and no suites at all is GREEN here and dead in real CI); item 6a
-// is what catches that shape.
+// statement): any shell construct that makes the STEP'S EXIT STATUS depend on the
+// PIN SUITE's stub failing — bash, not this file, decides that. Because the stub
+// fails ONLY the pin suite (#807), a construct that stops that invocation from
+// running at all (a multi-line quoted string around it, a deleted line, a
+// never-called function) leaves NOTHING failing and the assertion goes RED. It
+// does NOT catch a command that merely keys its exit status off the stub — a
+// probe naming the pin suite for its own sake, followed by the guard and no
+// suite invocation, is GREEN here and dead in real CI; item 6a is what catches
+// that shape.
 //
-// WHAT IT PROVES: on this machine, with this shell, with `node` replaced by a stub
-// that always exits 1, the committed `test-command` body makes the step exit
-// non-zero.
+// WHAT IT PROVES: on this machine, with this shell, with the `node` stub failing
+// ONLY the pin suite's invocation and every other stub passing, the committed
+// `test-command` body makes the step exit non-zero.
 //
-// WHAT IT DOES NOT PROVE: that the real suites run or pass, that the command
-// still contains this suite's invocation (item 6a's job), or that the step fails
-// on GitHub's runner. And it gives NO per-suite attribution — every suite fails
-// under the stub, so a command that dropped only the pin-suite line still exits
-// non-zero. That case is item 6a's job, and the byte change additionally trips
-// the content lock.
+// WHAT IT DOES NOT PROVE: that the real suites run or pass, that the step fails
+// (or passes) on GitHub's runner, or that the failing exit status came from the
+// real pin suite rather than from the stub. The stub matches `node`'s ARGUMENTS,
+// so per-suite attribution is bounded by the stub, not by the suite count.
 const ITEM6_STUB_NAMES = Object.freeze(["node", "npx", "npm", "bash"]);
+/**
+ * #807 — WHAT THE STUB FAILS. The pre-#807 stub made every stubbed interpreter
+ * exit 1 (`all-fail`), which meant the other suites in the committed MULTI-SUITE
+ * command drove the failure guard on their own: an invocation swallowed by a
+ * multi-line quoted string (present as text, never executed) still left the step
+ * exiting non-zero, so item 6b stayed GREEN while the pin gate was dead.
+ *
+ * Item 6b now runs with `pin-suite-only-fails`: the `node` stub exits 1 ONLY when
+ * its arguments name the pin suite; every other stubbed invocation exits 0. With
+ * only the pin suite failing, a swallowed invocation leaves NOTHING failing, the
+ * step reaches its success echo and exits 0, and 6b goes RED. No shell structure
+ * is modelled anywhere in this file — the stub change IS the fix.
+ *
+ * `all-fail` is retained ONLY so the suite can demonstrate the pre-#807 behaviour
+ * it replaces (its generated stub is byte-identical to the old `exit 1` stub) and
+ * `all-pass` is the positive control.
+ */
+const ITEM6_STUB_MODES = Object.freeze(["all-fail", "pin-suite-only-fails", "all-pass"]);
+const ITEM6_PIN_SUITE_NAME = "check-pi-pin-lockstep.mjs";
+
+/**
+ * The body of the `name` stub for `mode`.
+ *   all-pass               — every stubbed interpreter exits 0.
+ *   all-fail               — every stubbed interpreter exits 1 (pre-#807).
+ *   pin-suite-only-fails   — the `node` stub exits 1 only when its arguments name
+ *                            the pin suite; `npx`/`npm`/`bash` exit 0.
+ * The match is on `"$*"` — the arguments as text. It is deliberately NOT an
+ * analysis of shell structure, and nothing in this file parses quotes, `if`/`fi`
+ * or heredocs.
+ */
+function item6StubBody(name, mode) {
+  if (mode === "all-pass") return "#!/bin/sh\nexit 0\n";
+  if (mode === "all-fail") return "#!/bin/sh\nexit 1\n";
+  if (name !== "node") return "#!/bin/sh\nexit 0\n";
+  return (
+    "#!/bin/sh\n" +
+    'case "$*" in\n' +
+    `  *${ITEM6_PIN_SUITE_NAME}*) exit 1 ;;\n` +
+    "  *) exit 0 ;;\n" +
+    "esac\n"
+  );
+}
 /** The `extensions/*` directories the committed command `cd`s into before `npm ci`. */
 const ITEM6_CWD_DIRS = Object.freeze([
   "extensions/review-enforcer",
@@ -1494,23 +1576,40 @@ function ciMainTestCommand(src) {
 
 /**
  * Run a ci-main `test-command` body the way the runner does — `bash -e <script>`
- * in a throwaway cwd — with `node` (and `npx`/`npm`/`bash`, the other
- * interpreters that command shells out to) replaced by a stub that exits
- * `stubExit`, first on PATH.
+ * in a throwaway cwd — with `node`/`npx`/`npm`/`bash` replaced by stubs first on
+ * PATH. `stubMode` selects what the stubs do (`ITEM6_STUB_MODES`); item 6b uses
+ * `pin-suite-only-fails`, under which ONLY the pin suite's `node` invocation
+ * fails and everything else passes.
  *
  * The stub is what keeps the run HONEST: every interpreter reachable by BARE NAME
- * on the child's PATH is replaced by a stub, so the real suites never re-enter and
- * every suite's verdict is a knob. It does NOT by itself bound the run — a command
- * that ignores PATH (an absolute interpreter path, or its own PATH surgery) can
- * still execute real work — so the run is additionally bounded by an explicit
- * spawn `timeout`. Both bounds are needed and neither is a correctness claim.
+ * on the child's PATH is replaced, so the real suites never re-enter and each
+ * suite's verdict is a knob. It does NOT by itself bound the run — a command that
+ * ignores PATH (an absolute interpreter path, or its own PATH surgery) can still
+ * execute real work — so the run is additionally bounded by an explicit spawn
+ * `timeout`. Both bounds are needed and neither is a correctness claim.
+ *
+ * WHY `pin-suite-only-fails` AND NOT `all-fail` (#807). The pre-#807 stub failed
+ * every interpreter, and the committed command is MULTI-SUITE, so the other
+ * suites drove the failure guard on their own: an invocation line swallowed by a
+ * multi-line quoted string (present as text, never executed) still left the step
+ * exiting non-zero and item 6b stayed GREEN. Failing only the pin suite makes the
+ * assertion depend on THAT suite's stub actually running: swallow the invocation
+ * and nothing fails, so the step reaches its success echo and exits 0 — RED.
  *
  * `opts.timeoutMs` and `opts.bashPath` are seams for the hygiene fixtures below
  * (a real spawn failure, a real timeout); production callers pass neither.
  * Output is captured into the returned buffer and surfaced by the caller's
  * assertion. The temp dir is always removed.
  */
-function runCiMainTestCommand(src, stubExit, opts = {}) {
+function runCiMainTestCommand(src, stubMode, opts = {}) {
+  if (!ITEM6_STUB_MODES.includes(stubMode)) {
+    // Loud, not silent: a typo would otherwise fall through to an all-pass stub
+    // and turn the positive control into a tautology.
+    throw new Error(
+      `runCiMainTestCommand: unknown stub mode ${JSON.stringify(stubMode)} — expected one of ` +
+        `${JSON.stringify([...ITEM6_STUB_MODES])}`
+    );
+  }
   const timeoutMs = opts.timeoutMs ?? ITEM6_TIMEOUT_MS;
   const bash = opts.bashPath ?? BASH_ABS;
   const command = ciMainTestCommand(src);
@@ -1520,7 +1619,7 @@ function runCiMainTestCommand(src, stubExit, opts = {}) {
     fs.mkdirSync(stubDir);
     for (const name of ITEM6_STUB_NAMES) {
       const stub = path.join(stubDir, name);
-      fs.writeFileSync(stub, `#!/bin/sh\nexit ${stubExit}\n`);
+      fs.writeFileSync(stub, item6StubBody(name, stubMode));
       fs.chmodSync(stub, 0o755);
     }
     // The committed command `cd`s into these before running `npm ci`; without
@@ -1555,8 +1654,9 @@ function tail(text, lines = 12) {
 }
 
 /**
- * The behavioural item-6b assertion: run the committed command with every stub
- * failing and require a NON-ZERO exit. Throws otherwise — that is the RED state.
+ * The behavioural item-6b assertion: run the committed command with ONLY the pin
+ * suite's `node` invocation failing (every other stub passes) and require a
+ * NON-ZERO exit. Throws otherwise — that is the RED state.
  *
  * THE SPAWN RESULT IS CHECKED BEFORE THE STATUS IS TRUSTED. The previous version
  * decided with `assert.notEqual(run.status, 0)`, which is TRUE when
@@ -1567,7 +1667,7 @@ function tail(text, lines = 12) {
  * messages, and only a REAL numeric non-zero status counts as evidence.
  */
 function assertStepCanFail(label, src, opts = {}) {
-  const run = runCiMainTestCommand(src, 1, opts);
+  const run = runCiMainTestCommand(src, "pin-suite-only-fails", opts);
   if (run.error !== null) {
     const code = run.error?.code ?? null;
     if (code === "ETIMEDOUT") {
@@ -1596,18 +1696,19 @@ function assertStepCanFail(label, src, opts = {}) {
   assert.notEqual(
     run.status,
     0,
-    `${label}: the committed post-merge \`test-command\` exited 0 with every node/npx/npm/bash ` +
-      "stub failing. The step cannot fail, so a failing post-merge pin gate would be invisible " +
-      "(residue of the old lexical item-6 check?).\n--- command output (tail) ---\n" +
+    `${label}: the committed post-merge \`test-command\` exited 0 with ONLY the pin suite's ` +
+      "`node` invocation failing (every other stub passed). The step cannot fail when the pin " +
+      "suite fails — either the pin gate is dead or its invocation never ran (the #807 shape)." +
+      "\n--- command output (tail) ---\n" +
       `${tail(run.output)}`
   );
   return run;
 }
 
 /**
- * Assert the behavioural check goes RED for `src` — i.e. the step exits 0 under a
- * failing stub, so `assertStepCanFail` throws. Used by the negative control and
- * by every previously-defeated bypass shape.
+ * Assert the behavioural check goes RED for `src` — i.e. the step exits 0 with
+ * only the pin suite's stub failing, so `assertStepCanFail` throws. Used by the
+ * negative control and by every previously-defeated bypass shape.
  */
 function assertStepCannotBeSaved(label, src) {
   // Runs the REAL assertion (not a copy of it) and requires it to throw: that is
@@ -2474,6 +2575,7 @@ function runHeadRefWithStub(treeObj, blobMap) {
   );
 }
 test("--head-ref is RED end-to-end when a workflow is committed as a symlink (mode 120000) (#675 P1-2)", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   const res = runHeadRefWithStub(
     {
       truncated: false,
@@ -2496,6 +2598,7 @@ test("--head-ref is RED end-to-end when a workflow is committed as a symlink (mo
   assert.match(res.stderr, /symlink/);
 });
 test("--head-ref is GREEN end-to-end for a regular-file tree (mode 100644) (#675 P1-2)", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   const res = runHeadRefWithStub(
     {
       truncated: false,
@@ -2538,6 +2641,7 @@ function runHeadRefCiMain(ciMain) {
   });
 }
 test("--head-ref is RED end-to-end for a dropped or altered pin-suite invocation line (item 6a)", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   const variants = [
     ["deleted", mutate(FIXTURE_CI_MAIN, CI_MAIN_INVOCATION_LINE_NL, "")],
     [
@@ -2557,6 +2661,7 @@ test("--head-ref is RED end-to-end for a dropped or altered pin-suite invocation
   }
 });
 test("--head-ref stays GREEN end-to-end for a legitimate unrelated ci-main.yml edit (item 6a)", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   const edited = mutate(FIXTURE_CI_MAIN, "        failures=0\n", "        failures=0\n        :\n");
   const res = runHeadRefCiMain(edited);
   assert.equal(
@@ -2943,16 +3048,14 @@ test("ci-main structural: an empty ci-main.yml document is RED (#666 third revis
 // WHAT IT PROVES: the exact accumulator line EXISTS as a whole trimmed line in
 // the committed body. WHAT IT DOES NOT PROVE: that the line is REACHABLE (a line
 // inside a multi-line quoted string is textually present but is not a command) or
-// that the step can FAIL (item 6b). Item 6b does NOT cover that reachability
-// shape on the COMMITTED, MULTI-SUITE ci-main.yml — measured: the wrapped line
-// leaves 6a at 0 findings AND `runCiMainTestCommand(mutated, 1)` at status 1
-// (6b's GREEN), because the other suites still drive the guard. 6b's RED fixture
-// uses the SINGLE-SUITE `FIXTURE_CI_MAIN`, where `runCiMainTestCommand(fixture,
-// 1)` is status 0, so the fixture goes RED there and only there. On the committed
-// file this shape is therefore seen by NEITHER 6a NOR 6b; only the content lock
-// is left, and that is the same-commit residual.
-// Its unique value is the shape item 6b CANNOT see: deleting or repointing the
-// line while the other suites keep the stub run non-zero.
+// that the step can FAIL (item 6b). #807 made 6b see the reachability shape too —
+// its stub fails ONLY the pin suite, so a swallowed invocation leaves nothing
+// failing and the step exits 0 — but 6b can only run where the command may be
+// EXECUTED, never on the trusted `pull_request_target` leg. 6a is what the
+// trusted leg runs, so it remains the owner of the dropped/repointed/unreachable
+// line THERE.
+// Its unique value is the shape item 6b cannot see on the trusted leg: a deleted
+// or repointed line, whose stub-keyed failure would otherwise keep the step green.
 test("the ci-main fixture contains the post-merge pin-suite invocation line (item 6a)", () => {
   assert.deepEqual(
     ciMainInvocationFindings(FIXTURE_CI_MAIN),
@@ -2960,29 +3063,33 @@ test("the ci-main fixture contains the post-merge pin-suite invocation line (ite
     "the fixture must carry the invocation line"
   );
 });
-test("item 6a: DELETING the invocation line is RED, and item 6b stays GREEN on the live file", () => {
+test("item 6a: DELETING the invocation line is RED (and 6b is RED for it too under the #807 stub)", () => {
   const dropped = mutate(FIXTURE_CI_MAIN, CI_MAIN_INVOCATION_LINE_NL, "");
   const findings = ciMainInvocationFindings(dropped);
   assert.ok(
     findings.some((m) => m.includes("no longer contains the pin-suite invocation line")),
     `expected the missing-invocation finding; got:\n  ${findings.join("\n  ")}`
   );
-  // THE POINT OF 6a. On the LIVE file the other suites still fail the stub run,
-  // so item 6b reports "the step can fail" while the pin gate is dead — measured,
-  // not asserted from the fixture: this is the green-and-dead shape the deleted
-  // scanner used to catch and that 6b cannot.
   const liveDropped = mutate(LIVE_CI_MAIN, CI_MAIN_INVOCATION_LINE_NL, "");
   assert.ok(
     ciMainInvocationFindings(liveDropped).length > 0,
     "deleting the line from the LIVE file must be RED for item 6a"
   );
-  const run = runCiMainTestCommand(liveDropped, 1);
-  assert.notEqual(
-    run.status,
-    0,
-    "item 6b is expected to stay GREEN for the dropped-line shape on the live file (the other " +
-      "suites keep the stub run non-zero) — that is precisely why item 6a has to exist"
-  );
+  // #807 — the pin-suite-only stub makes 6b sensitive to the dropped line TOO:
+  // nothing fails, so the step reaches its success echo and exits 0. 6b can only
+  // run where the command may be EXECUTED, and the trusted `--head-ref` leg must
+  // never do that (executing PR content under `pull_request_target` is the RCE
+  // vector) — which is exactly why 6a, a value assertion, still owns this shape.
+  if (!STICKY_CHILD) {
+    const run = runCiMainTestCommand(liveDropped, "pin-suite-only-fails");
+    assert.equal(run.error, null, `no spawn error expected: ${String(run.error)}`);
+    assert.equal(
+      run.status,
+      0,
+      "with only the pin suite failing, a dropped invocation leaves nothing failing and the step " +
+        `must exit 0 (item 6b is RED for this shape too, #807).\n${tail(run.output)}`
+    );
+  }
 });
 test("item 6a: an ALTERED invocation line is RED (`|| true`, `|| failures=0`, changed path)", () => {
   const variants = [
@@ -3002,20 +3109,11 @@ test("item 6a: an ALTERED invocation line is RED (`|| true`, `|| failures=0`, ch
       `${label}: expected the missing-invocation finding; got:\n  ${findings.join("\n  ")}`
     );
   }
-  // The changed-path variant is ALSO invisible to item 6b (the stub fails the
-  // other script too, so the accumulator still trips the guard) — 6a is the only
-  // assertion that sees it.
-  const repointed = mutate(
-    FIXTURE_CI_MAIN,
-    CI_MAIN_INVOCATION_LINE,
-    "        node scripts/some-other-check.mjs || failures=$((failures+1))\n"
-  );
-  const run = runCiMainTestCommand(repointed, 1);
-  assert.notEqual(
-    run.status,
-    0,
-    "a repointed script still fails under the stub, so item 6b cannot see it — 6a's job"
-  );
+  // #807 — the changed-path variant is invisible to item 6b as before: the
+  // `node` stub fails only the PIN suite's path, so `some-other-check.mjs` exits
+  // 0, nothing fails and the step exits 0. (So 6b is RED for it too now; 6a
+  // remains the only assertion that can run on the trusted leg.) No 6b spawn is
+  // repeated here — item 6a's assertion above is the claim under test.
 });
 test("item 6a: a legitimate unrelated edit elsewhere in the command still passes (GREEN)", () => {
   const edited = mutate(
@@ -3040,11 +3138,20 @@ test("item 6a: a legitimate unrelated edit elsewhere in the command still passes
 
 // ── guard (j), item 6b — the committed post-merge step can fail ──────────────
 // BEHAVIOURAL. The committed `test-command` is EXECUTED under `bash -e` with
-// every `node`/`npx`/`npm`/`bash` on PATH replaced by a stub, and the assertion
-// is that the step exits NON-ZERO. What that catches is bounded and stated in the
-// module header: any construct that makes the step's exit status depend on a real
-// suite failing — NOT a command that merely keys its exit status off the stub.
+// `node`/`npx`/`npm`/`bash` on PATH replaced by stubs. The `node` stub fails ONLY
+// the pin suite (#807); every other stubbed invocation passes. The assertion is
+// that the step exits NON-ZERO with ONLY the pin suite failing. What that catches
+// is bounded and stated in the module header: any construct that makes the step's
+// exit status depend on the pin suite's stub running to its failure — including a
+// construct that stops the invocation running at all — NOT a command that merely
+// keys its exit status off the stub.
 section("guard (j), item 6b — the committed post-merge step can fail (behavioural)");
+
+// #808 — the authenticated sticky child skips every real-`bash` item-6b fixture:
+// the parent has already run them, and the child exists only to reach the
+// terminal `process.exit(1)` decision with a forced failure. `STICKY_CHILD` is
+// true only after the module-top handshake proved this run is a copy the parent
+// wrote the token into (see its declaration). The child still exits 1.
 
 // The live guard block, used as a mutation ANCHOR only (mutate() asserts it is
 // present, so drift is loud). Nothing in this file parses or models it.
@@ -3053,12 +3160,20 @@ const LIVE_CI_MAIN_GUARD = `        if [ $failures -gt 0 ]; then
           exit 1
         fi`;
 
-test("item 6 behavioural: the live ci-main.yml command exits NON-ZERO with every `node` stub failing", () => {
+// Required fixture 1 — the POSITIVE control: the real `ci-main.yml` with the
+// "only the pin suite fails" stub must exit NON-ZERO, i.e. the assertion passes.
+test("item 6b positive control: the live ci-main.yml command exits NON-ZERO with ONLY the pin suite's stub failing (#807)", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   assertStepCanFail("live ci-main.yml", LIVE_CI_MAIN);
 });
 
-test("item 6 positive control: the live command exits 0 when the stubs succeed", () => {
-  const run = runCiMainTestCommand(LIVE_CI_MAIN, 0);
+// Required fixture 2 — the ALL-PASS control: the real `ci-main.yml` with every
+// stub exiting 0 must exit 0. Without this the positive control could pass for
+// the wrong reason (a missing binary, a `cd` into a non-existent directory, an
+// unrelated early failure).
+test("item 6b all-pass control: the live command exits 0 when every stub passes", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
+  const run = runCiMainTestCommand(LIVE_CI_MAIN, "all-pass");
   // The spawn result is checked FIRST in both directions: a `status` of null (a
   // spawn failure) must never be read as either verdict (#675 final cycle).
   assert.equal(run.error, null, `no spawn error expected: ${String(run.error)}`);
@@ -3066,9 +3181,10 @@ test("item 6 positive control: the live command exits 0 when the stubs succeed",
   assert.equal(
     run.status,
     0,
-    "the same command with PASSING stubs must exit 0. If it does not, the assertion above is " +
-      "passing for an unrelated reason (a missing binary, a `cd` into a directory that does not " +
-      `exist, an early abort) rather than because the failure propagated:\n${tail(run.output)}`
+    "the same command with every stub PASSING must exit 0. If it does not, the positive control " +
+      "is passing for an unrelated reason (a missing binary, a `cd` into a directory that does " +
+      `not exist, an early abort) rather than because the pin suite's failure propagated:\n` +
+      tail(run.output)
   );
   assert.match(
     run.output,
@@ -3077,7 +3193,40 @@ test("item 6 positive control: the live command exits 0 when the stubs succeed",
   );
 });
 
+// Required fixture 3 — the NEGATIVE control, and the #807 reproducer: the
+// COMMITTED invocation wrapped in a multi-line quoted string. Bash treats the
+// wrapped line as string content, so the pin suite never runs — but the line is
+// still textually one trimmed line, so item 6a is GREEN (asserted here, so this
+// fixture records the division of labour). Under the pre-#807 `all-fail` stub
+// every OTHER suite still failed and the step still exited non-zero, so 6b was
+// GREEN too (asserted below via the retained legacy mode). Under the #807 stub
+// only the pin suite fails, so a swallowed invocation leaves NOTHING failing, the
+// step reaches its success echo and exits 0, and 6b goes RED.
+test("item 6b negative control (#807): the committed invocation wrapped in a multi-line quoted string makes the assertion go RED", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
+  const wrapped = mutate(
+    LIVE_CI_MAIN,
+    CI_MAIN_INVOCATION_LINE,
+    `        echo "start\n${CI_MAIN_INVOCATION_LINE}\n        "`
+  );
+  assert.deepEqual(
+    ciMainInvocationFindings(wrapped),
+    [],
+    "the wrapped line is still one trimmed line, so item 6a cannot see this shape"
+  );
+  const legacy = runCiMainTestCommand(wrapped, "all-fail");
+  assert.equal(legacy.error, null, `no spawn error expected: ${String(legacy.error)}`);
+  assert.notEqual(
+    legacy.status,
+    0,
+    "the pre-#807 all-fail stub cannot see the swallowed invocation — this is the false GREEN " +
+      "#807 reported"
+  );
+  assertStepCannotBeSaved("a live invocation wrapped in a multi-line quoted string", wrapped);
+});
+
 test("item 6 negative control: a guard moved inside `if false; then … fi` makes the assertion go RED", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   const mutated = mutate(
     LIVE_CI_MAIN,
     LIVE_CI_MAIN_GUARD,
@@ -3087,6 +3236,7 @@ test("item 6 negative control: a guard moved inside `if false; then … fi` make
 });
 
 test("item 6: a guard inside a never-called shell function makes the assertion go RED", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   const mutated = mutate(
     LIVE_CI_MAIN,
     LIVE_CI_MAIN_GUARD,
@@ -3096,6 +3246,7 @@ test("item 6: a guard inside a never-called shell function makes the assertion g
 });
 
 test("item 6: a guard hidden in a heredoc (`if false; then cat <<EOF`) makes the assertion go RED", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   const mutated = mutate(
     LIVE_CI_MAIN,
     LIVE_CI_MAIN_GUARD,
@@ -3104,24 +3255,80 @@ test("item 6: a guard hidden in a heredoc (`if false; then cat <<EOF`) makes the
   assertStepCannotBeSaved("a guard swallowed by a heredoc body", mutated);
 });
 
-test("item 6: an invocation swallowed by a multi-line quoted string makes the assertion go RED", () => {
-  // The SINGLE-SUITE fixture, not the live file, and the difference is the honest
-  // bound: the negative run makes every suite fail, so on the LIVE command the
-  // other suites still drive the guard and the step still exits non-zero (probed:
-  // status 1). This fixture is the shape in which the pin suite is the step's only
-  // suite, which is what makes a swallowed invocation observable in the exit code.
-  // 6a does not see the shape either — the wrapped line is still one trimmed line
-  // — so on the committed multi-suite file neither 6a nor 6b is RED; only the
-  // content lock is (the plan's Accepted-residual section records this hole).
+// The three shapes below were covered by the DELETED lexical scanner and never
+// had a behavioural fixture. Under "only the pin suite fails" the pin suite DOES
+// run and DOES fail (so `failures=1`), but each shape leaves the GUARD dead, so
+// the step reaches its success echo and exits 0 — RED.
+test("item 6b: deleting the failure guard makes the assertion go RED", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
+  const mutated = mutate(LIVE_CI_MAIN, LIVE_CI_MAIN_GUARD, "");
+  assertStepCannotBeSaved("a deleted failure guard", mutated);
+});
+
+test("item 6b: an `exit 0` before the failure guard makes the assertion go RED", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
+  const mutated = mutate(LIVE_CI_MAIN, LIVE_CI_MAIN_GUARD, `        exit 0\n${LIVE_CI_MAIN_GUARD}`);
+  assertStepCannotBeSaved("an `exit 0` before the guard", mutated);
+});
+
+test("item 6b: a guard inside a never-taken `case` arm makes the assertion go RED", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   const mutated = mutate(
-    FIXTURE_CI_MAIN,
-    CI_MAIN_INVOCATION_LINE,
-    `        echo "start\n${CI_MAIN_INVOCATION_LINE}\n        "`
+    LIVE_CI_MAIN,
+    LIVE_CI_MAIN_GUARD,
+    `        case 0 in\n          1)\n${reindent(LIVE_CI_MAIN_GUARD, 4)}\n            ;;\n        esac`
   );
-  assertStepCannotBeSaved("an invocation inside a multi-line quoted string", mutated);
+  assertStepCannotBeSaved("a guard inside a never-taken `case` arm", mutated);
+});
+
+// BOUND (pinned): the #807 stub is matched on `node`'s ARGUMENTS, so a command
+// that merely KEYS ITS EXIT STATUS OFF THE STUB is still not caught. This fixture
+// keeps that bound visible so the module header cannot claim more than the code
+// does: the real pin gate is dead (no invocation line), but a probe that names
+// the pin suite makes the `node` stub exit 1, `|| exit 1` ends the step, and 6b
+// reports GREEN. Item 6a is what catches this shape (the line is absent).
+const PROBE_CI_MAIN = `name: CI on main
+on:
+  push:
+    branches: [main]
+
+jobs:
+  extension-tests:
+    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main
+    with:
+      node-version: '22'
+      script-validate: 'false'
+      skill-lint: 'false'
+      test-command: |
+        failures=0
+        node scripts/check-pi-pin-lockstep.mjs --version >/dev/null 2>&1 || exit 1
+        if [ $failures -gt 0 ]; then
+          echo "❌ $failures extension test file(s) failed"
+          exit 1
+        fi
+        echo "✅ All extension tests passed"
+    secrets: inherit
+`;
+
+test("item 6b BOUND (pinned): a command that only keys its exit status off the STUB is still not caught", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
+  const run = runCiMainTestCommand(PROBE_CI_MAIN, "pin-suite-only-fails");
+  assert.equal(run.error, null, `no spawn error expected: ${String(run.error)}`);
+  assert.notEqual(
+    run.status,
+    0,
+    "the stub-keyed probe is expected to keep item 6b GREEN — that is the documented bound, not " +
+      "a regression; if this is now RED the bound has been closed and the module header's " +
+      "\"WHAT 6b CATCHES\" paragraph must move with it"
+  );
+  assert.ok(
+    ciMainInvocationFindings(PROBE_CI_MAIN).length > 0,
+    "item 6a is the assertion that catches this shape, because its invocation line is absent"
+  );
 });
 
 test("item 6: a quoted `<<` no longer arms a phantom heredoc (GREEN, no false RED)", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   const mutated = mutate(
     LIVE_CI_MAIN,
     "        failures=0\n",
@@ -3133,7 +3340,7 @@ test("item 6: a quoted `<<` no longer arms a phantom heredoc (GREEN, no false RE
   // one "sits inside a heredoc" finding). Executing the command removes the whole
   // class — nothing here models `<<` any more.
   const run = assertStepCanFail('a quoted `echo "a <<x"`', mutated);
-  assert.notEqual(run.status, 0, "the guard must still fire");
+  assert.notEqual(run.status, 0, "the pin suite's failure must still trip the guard");
 });
 
 // ── item 6b HYGIENE — the assertion must fail CLOSED on its OWN failures ─────
@@ -3141,6 +3348,7 @@ test("item 6: a quoted `<<` no longer arms a phantom heredoc (GREEN, no false RE
 // guarantee holds". These drive the same code path the live assertion uses (the
 // seam arguments exist for exactly this); production callers pass neither.
 test("item 6b hygiene: an unresolvable bash is RED with the spawn-failure message (never a pass)", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   // Reproduces the fail-open exactly: spawnSync("/nonexistent/bash", …) returns
   // { status: null, error: ENOENT }, and the old `assert.notEqual(status, 0)`
   // PASSED for it — "nothing executed" recorded as "the step exits non-zero".
@@ -3154,6 +3362,7 @@ test("item 6b hygiene: an unresolvable bash is RED with the spawn-failure messag
   );
 });
 test("item 6b hygiene: a command that cannot finish is RED at the explicit spawn timeout", () => {
+  if (STICKY_CHILD) return; // #808 — the parent already ran this fixture
   const hanging = mutate(
     FIXTURE_CI_MAIN,
     CI_MAIN_INVOCATION_LINE,
