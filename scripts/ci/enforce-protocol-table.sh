@@ -155,7 +155,7 @@ if [ "${run_table_passes:-0}" = "1" ]; then
       skill=$(printf '%s' "$ref" | sed -n "s/.*${sed_prefix}\\/\\([^/]*\\)\\/SKILL\\.md.*/\\1/p")
       [ -z "$skill" ] && continue
       reverse_checked=$((reverse_checked + 1))
-      if ! printf '%s\n' "$unique_skills" | grep -Fqx "$skill"; then
+      if ! grep -Fqx "$skill" <<<"$unique_skills"; then
         echo "❌ REVERSE-MISSING: $skill — in AGENTS.md table but not in manifest"
         reverse_errors=$((reverse_errors + 1))
       fi

@@ -118,7 +118,7 @@ env_has_pair() {
         # TASK_HEARTBEAT=1 as a literal argv token, which dispatch children
         # never carry).
     fi
-    printf '%s\n' "$envout" | grep -qx 'TASK_HEARTBEAT=1'
+    grep -qx 'TASK_HEARTBEAT=1' <<<"$envout"
 }
 
 CUTOFF_SECONDS=$(( CUTOFF_HOURS * 3600 ))

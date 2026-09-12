@@ -267,7 +267,7 @@ for SESSION in "${SESSION_FILES[@]}"; do
     # Retro path must mirror the report/watch data-absence contract: an
     # error-tagged row (unreadable/corrupt/empty session) would KeyError the
     # summary below — skip to a short note instead of aborting the batch.
-    if printf '%s' "$METRIC" | grep -q '"error"'; then
+    if grep -q '"error"' <<<"$METRIC"; then
         ERR_MSG="$(printf '%s' "$METRIC" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('error','unreadable'))" 2>/dev/null || echo unreadable)"
         {
           echo "# Retrospective — $DATE"

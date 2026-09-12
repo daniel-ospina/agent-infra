@@ -1,0 +1,30 @@
+# Declared exceptions for scripts/check-no-sigpipe-grep.sh (#841).
+#
+# Format:  <path> <expected-count> <content-hash> #<tracking-issue>
+#
+# An exception is NOT a mute. The guard prints every exception on every run, and FAILS if
+# either the COUNT or the CONTENT-HASH stops matching — so a stale exception must be deleted,
+# a count-preserving swap cannot hide behind one, and a new occurrence is never inherited.
+# An exception without a tracking issue is rejected outright. Shell metacharacters in a path
+# are accepted; the path must match the guard's own scan set.
+#
+# ---------------------------------------------------------------------------------------
+# scripts/record-review.sh  —  4 occurrences  —  #860
+# ---------------------------------------------------------------------------------------
+# WHY THIS IS HERE. `scripts/record-review.sh` is part of the SECOND-MODEL GUARDED SURFACE
+# in scripts/check-pipeline-compliance.sh (GUARDED_SURFACE_RE matches this path exactly). Any
+# PR that MODIFIES it must record `[SECOND-MODEL-GATE] … independent=yes`, and with no
+# independent model funded, check (f) hard-fails by design (#860). The fix for this file is
+# therefore unmergeable today, no matter how correct it is.
+#
+# WHAT THIS IS NOT. Not a judgement that the 4 sites are safe, and not a claim that
+# record-review.sh is too small a surface to matter — it is the file that RECORDS the merge
+# verdict, which makes a false negative here arguably the most damaging instance in the repo.
+# It is the honest record of a BLOCKED FIX, tracked in #860.
+#
+# WHEN TO DELETE THIS LINE. The moment #860 is resolved (a funded independent model, or an
+# operator-approved degraded path). The guard will then report this line as STALE and fail
+# until the 4 sites are fixed — deliberately, so the debt cannot quietly outlive its cause.
+# The fix is already written and verified (the same one-line here-string transform applied to
+# the other 51 sites in #841).
+scripts/record-review.sh 4 10cc3d4163d67aad #860

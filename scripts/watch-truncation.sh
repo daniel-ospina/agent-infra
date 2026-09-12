@@ -76,7 +76,7 @@ case "$WINDOW_DAYS" in
     ''|*[!0-9]*|0) echo "ERROR: --days must be a positive integer (got: '$WINDOW_DAYS')" >&2; exit 2 ;;
 esac
 if [ -n "$SINCE" ]; then
-    if ! printf '%s' "$SINCE" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+    if ! grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' <<<"$SINCE" \
        || ! python3 -c "import datetime,sys; datetime.date.fromisoformat('$SINCE')" 2>/dev/null; then
         echo "ERROR: --since must be a real YYYY-MM-DD date (got: '$SINCE')" >&2
         exit 2

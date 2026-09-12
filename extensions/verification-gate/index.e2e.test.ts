@@ -25,6 +25,26 @@ import { dirname, join } from "node:path";
 // ── Isolation: bridge lives under a temp HOME (never touch the real one) ──
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "vgate-e2e-"));
 process.env.HOME = TEST_ROOT;
+// #851 — give the hermetic temp HOME a git identity. Without it, every `git commit`
+// in a scenario depends on the AMBIENT identity git auto-detects from the user name and
+// hostname: on a dev machine that resolves to a non-empty name (so the suite passed),
+// while on a GitHub runner it resolves to `runner@<host>` with an EMPTY name and git
+// aborts with `fatal: empty ident name (for <runner@…>) not allowed`. Scenario #3255
+// does not set the identity inline (59 sibling scenarios do, which papered over the
+// instance), so `extension-tests / unit-test` was RED on main for every merge — see
+// #851. A global config inside the temp HOME fixes the CLASS and makes the file's
+// "hermetic" claim true — but ONLY together with the overrides below: an ambient
+// `GIT_CONFIG_GLOBAL` takes precedence over `$HOME/.gitconfig`, and `GIT_AUTHOR_*` /
+// `GIT_COMMITTER_*` override the config outright, so relying on the file alone would
+// leave the runner failure reachable through any of them.
+const TEST_GITCONFIG = join(TEST_ROOT, ".gitconfig");
+writeFileSync(TEST_GITCONFIG, "[user]\n\tname = vgate-e2e\n\temail = e2e@test\n");
+process.env.GIT_CONFIG_GLOBAL = TEST_GITCONFIG;
+process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+for (const k of [
+  "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+  "EMAIL", "GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE",
+]) delete process.env[k];
 // The gate under test must be ACTIVE — clear the escape hatch if the parent
 // environment inherited it (sub-agent sessions pre-disable extension gates).
 delete process.env.ELDATO_SKIP_VGATE;

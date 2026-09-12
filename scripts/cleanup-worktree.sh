@@ -54,7 +54,7 @@ fi
 # and would be silently destroyed) — so ignored-only dirt also hits the
 # refusal path and needs an explicit --force.
 if [ -n "$(git -C "$WT" status --porcelain)" ] || \
-   git -C "$WT" status --porcelain --ignored=traditional 2>/dev/null | grep -q '^!!'; then
+   [ -n "$(git -C "$WT" status --porcelain --ignored=traditional 2>/dev/null)" ]; then
   if $FORCE; then
     echo "⚠️  worktree $WT is DIRTY or holds ignored files — removing with --force (uncommitted and ignored-only changes will be DESTROYED)"
   else
