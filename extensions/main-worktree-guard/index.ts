@@ -1203,6 +1203,36 @@ function _worktreeDiscardBlockReason(
   ].join("\n");
 }
 
+/** Placeholder tokens declared by `xargs -I<tok>` / `-I <tok>` — the token is
+ *  substituted into the child command at execution time, so it can carry the
+ *  code the gate would otherwise walk (`printf … | xargs -I@ sh -c '@'`).
+ *  Arbitrary by design, hence read from the invocation instead of `{}`
+ *  (reviewer round-8b P1). */
+function _wtXargsPlaceholders(command: unknown): string[] {
+  const out: string[] = [];
+  for (const m of String(command ?? "").matchAll(/(?:^|\s)-I\s*("[^"]*"|'[^']*'|\S+)/g)) {
+    const tok = String(m[1] ?? "").replace(/^["']|["']$/g, "");
+    if (tok && tok !== "-") out.push(tok);
+  }
+  return out;
+}
+
+/** True when `text` names a discard-family verb. The LONG verbs stay substring
+ *  matches — they are distinctive, and a verb embedded in a PATH or FILENAME
+ *  (`bash -c "$(cat /tmp/checkout-undo.sh)"`) is a real signal (reviewer
+ *  round-8: word-anchoring them let that payload fail OPEN). `rm` is the one
+ *  that needs a word boundary, or `format`/`normal`/`terraform` false-block an
+ *  unresolvable payload that names no verb at all. */
+const _MENTIONS_DISCARD_VERB = (text: unknown): boolean => {
+  // ANSI-C quoting hides a verb from a raw-text scan (`bash -c $'git
+  // \x63heckout -- f'` really discards), and the direct extractor already
+  // decodes it — the fail-closed test must look at the same text
+  // (reviewer round-8b).
+  let s = String(text ?? "");
+  try { s = ansiTranslate(s); } catch { /* malformed escape → raw text stands */ }
+  return /(?:checkout|restore|switch|reset|read-tree|apply)|(?:^|[^A-Za-z0-9_-])rm(?:[^A-Za-z0-9_-]|$)/.test(s);
+};
+
 /** M5 gate: returns a block reason when `command` would discard uncommitted
  *  tracked work in the checkout it targets, else null. Covers the direct argv
  *  surface, interpreter-inline payloads (via allGitInvocations) and the
@@ -1289,6 +1319,14 @@ function _worktreeDiscardBlock(command: string): string | null {
         } catch { /* not a readable file */ }
       }
     }
+    // `printf 'git checkout -- f\n' | bash` feeds the shell CODE from a producer
+    // the seed loop cannot resolve (it only seeds readable FILES). Fail closed
+    // when the command names a discard-family verb (reviewer round-8 P1). A
+    // genuine `cat undo.sh | bash` never reaches here (no verb in the text; the
+    // file seed is what catches it).
+    if (pipeSeg.length > 1 && pipesToShell && _MENTIONS_DISCARD_VERB(command)) {
+      return _worktreeDiscardBlockReason({ form: "piped-shell-payload", scope: "all", pathspecs: [] }, execCwd, "a piped shell payload is not statically resolvable");
+    }
     // `find <file> -exec sh {} \;` runs the file as a script (reviewer round-7
     // P2) — seed every existing file token of the command.
     if (execPlaceholder) {
@@ -1320,14 +1358,44 @@ function _worktreeDiscardBlock(command: string): string | null {
 
   // `eval '<payload>'` (reviewer P1): allGitInvocations does not walk eval
   // payloads, so extract them here (one level — a nested eval is a documented
-  // residual). A payload that is not statically resolvable fails closed.
-  for (const m of String(command).matchAll(/\beval\s+(\$)?(['"])([\s\S]*?)\2/g)) {
-    const payload = m[1] ? ansiTranslate(m[3] ?? "") : (m[3] ?? "");
-    if (!/(checkout|restore|switch|reset|read-tree|rm)/.test(payload)) continue;
-    if (/[$`]/.test(payload)) {
-      return _worktreeDiscardBlockReason({ form: "eval-payload", scope: "all", pathspecs: [] }, execCwd, "an `eval` payload is not statically resolvable");
+  // residual). Round-8 P1: the arm also has to see the UNQUOTED variable form
+  // (`eval $P`), and an unresolvable payload fails closed on the COMMAND's
+  // verbs — `P='git checkout -- f'; eval "$P"` previously fell through at the
+  // payload-scoped verb test and destroyed the file.
+  for (const m of String(command).matchAll(/\beval\s+(\$)?(['"])([\s\S]*?)\2|\beval\s+(\S+)/g)) {
+    const payload = m[1] ? ansiTranslate(m[3] ?? m[4] ?? "") : (m[3] ?? m[4] ?? "");
+    const bare = payload.replace(/^["']|["']$/g, "");
+    const vm = /^\$(\w+)$|^\$\{(\w+)\}$/.exec(bare);
+    const name = vm?.[1] ?? vm?.[2];
+    if (name) {
+      const am = new RegExp(`(?:^|[;&\\s])${name}=("[^"]*"|'[^']*'|\\S+)`).exec(String(command));
+      const val = am ? String(am[1]).replace(/^["']|["']$/g, "") : null;
+      if (val && !/[$`]/.test(val)) {
+        sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+        continue;
+      }
     }
+    if (/[$`]/.test(payload)) {
+      // Still opaque (env-fed `$P`, `$(…)`): the `-c` arm's contract — fail
+      // closed when the command names a discard verb.
+      if (_MENTIONS_DISCARD_VERB(command)) {
+        return _worktreeDiscardBlockReason({ form: "eval-payload", scope: "all", pathspecs: [] }, execCwd, "an `eval` payload is not statically resolvable");
+      }
+      continue;
+    }
+    if (!_MENTIONS_DISCARD_VERB(payload)) continue;
     sets.push({ discs: extractWorkingTreeDiscards(payload) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+  }
+
+  // `xargs -I<tok> … <shell> -c '<tok>'` — the placeholder token is ARBITRARY and
+  // is substituted from the pipe/input at execution time, so the payload cannot
+  // be resolved statically. The extractor cannot even see this payload: the
+  // segment head is `xargs`, which is not a spawner word, so the whole segment
+  // is skipped. Check the invocation pair directly and fail closed (reviewer
+  // round-8b P1).
+  if (_wtXargsPlaceholders(command).length > 0 &&
+      /(?:^|[\s;|&(])(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh)\s+(?:-[A-Za-z]*c[A-Za-z]*|--command)(?![A-Za-z])/.test(String(command))) {
+    return _worktreeDiscardBlockReason({ form: "interpreter-c-payload", scope: "all", pathspecs: [] }, execCwd, "an interpreter `-c` payload is a runtime placeholder");
   }
 
   // Interpreter `-c` payloads: `allGitInvocations` resolves a LITERAL payload,
@@ -1348,6 +1416,11 @@ function _worktreeDiscardBlock(command: string): string | null {
   // ambiguity is the arm's documented residual, not a false positive to trade
   // real discards for.
   for (const pl of wtShellInlinePayloads(command)) {
+    // A RUNTIME placeholder inside the payload (`-I{}` is by far the common
+    // form) can never be resolved statically (reviewer round-8 P1).
+    if (/\{\}/.test(pl.text)) {
+      return _worktreeDiscardBlockReason({ form: "interpreter-c-payload", scope: "all", pathspecs: [] }, execCwd, "an interpreter `-c` payload is a runtime placeholder");
+    }
     if (!pl.opaque) {
       // A literal payload that runs/sources a SCRIPT FILE seeds the bounded
       // walk (`bash -c 'source /tmp/undo.sh'`, round-7 P1). Outer quotes are
@@ -1360,6 +1433,22 @@ function _worktreeDiscardBlock(command: string): string | null {
       continue;
     }
     const bare = pl.text.replace(/^["']|["']$/g, "");
+    // Opaque, but its ONLY substitution reads a statically named FILE
+    // (`bash -c "$(cat /tmp/undo.sh)"`): seed the bounded script walk from that
+    // file rather than relying on the verb appearing in the command text
+    // (reviewer round-8b P1). Anything the walk cannot resolve still falls
+    // through to the verb test below.
+    const catM = /^\$\(\s*(?:cat|bat)\s+([^\s)$]+)\s*\)$|^`cat\s+([^`]+)`$/.exec(bare);
+    const catPath = catM?.[1] ?? catM?.[2];
+    if (catPath && !/[$`*?]/.test(catPath)) {
+      try {
+        const real = realpathSync(resolve(execCwd, catPath));
+        if (statSync(real).isFile() && statSync(real).size <= 64 * 1024) {
+          sets.push({ discs: extractWorkingTreeDiscards(readFileSync(real, "utf8")) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: catPath });
+          continue;
+        }
+      } catch { /* missing/unreadable → the verb test still applies */ }
+    }
     const vm = /^\$(\w+)$|^\$\{(\w+)\}$/.exec(bare);
     const name = vm?.[1] ?? vm?.[2];
     if (name) {
@@ -1376,7 +1465,7 @@ function _worktreeDiscardBlock(command: string): string | null {
         }
       }
     }
-    if (/(checkout|restore|switch|reset|read-tree|rm|apply)/.test(String(command))) {
+    if (_MENTIONS_DISCARD_VERB(command)) {
       return _worktreeDiscardBlockReason({ form: "interpreter-c-payload", scope: "all", pathspecs: [] }, execCwd, "an interpreter `-c` payload is not statically resolvable");
     }
   }
@@ -1400,6 +1489,11 @@ function _worktreeDiscardBlock(command: string): string | null {
       // `$VAR`/backtick pathspec, or an xargs/find `-exec` placeholder.
       const unresolvable = (d as { unverifiable?: boolean }).unverifiable === true ||
         d.pathspecs.some((p) => /[$`]/.test(String(p))) ||
+        // Brace expansion (`git checkout -- {dirty,clean}.txt`) is expanded by
+        // the SHELL; the probe would pass the literal token to git, match
+        // nothing, read the tree as clean and release the discard (reviewer
+        // round-8 P2). Not statically resolvable → fail closed.
+        d.pathspecs.some((p) => /[{}]/.test(String(p))) ||
         d.pathspecs.some((p) => wtIsPlaceholderPathspec(p));
       if (unresolvable) {
         return _worktreeDiscardBlockReason(d, execCwd, "the target pathspec is not statically resolvable");

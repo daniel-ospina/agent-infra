@@ -422,6 +422,15 @@ async function partB() {
     // A real patch to reverse (`git diff HEAD` of the dirty file).
     const patch = join(tmp, "revert.patch");
     write(patch, execSync("git diff HEAD -- dirty.txt", { cwd: wt, encoding: "utf8" }));
+    // Reviewer round-8 regression guard: the discard verb lives only in a FILE
+    // NAME here, so a word-anchored verb test would let these two fail OPEN
+    // (`bash -c "$(cat /tmp/checkout-undo.sh)"` really reverts the file).
+    const verbPath = join(tmp, "checkout-undo.sh");
+    write(verbPath, "git checkout -- dirty.txt\n");
+    // Reviewer round-8b: a producer path that names NO verb (`plain-undo.sh`),
+    // plus the ANSI-C escaped verb and the arbitrary xargs placeholder.
+    const plainVerbPath = join(tmp, "plain-undo.sh");
+    write(plainVerbPath, "git checkout -- dirty.txt\n");
     const bypass = [
       ["prefix spelling `git reset --har`", "git reset --har"],
       ["interactive hunk discard (`git checkout -p dirty.txt`)", "git checkout -p dirty.txt"],
@@ -498,6 +507,24 @@ async function partB() {
       ["here-string `read` assignment (`read -r S <<<…; bash -c \"$S\"`)", `read -r S <<<'git checkout -- dirty.txt'; bash -c "$S"`],
       ["`eval` assignment (`eval \"S='…'\"; bash -c \"$S\"`)", `eval "S='git checkout -- dirty.txt'"; bash -c "$S"`],
       ["file-fed opaque payload (`printf … > p.sh; bash -c \"$(cat p.sh)\"`)", `printf '%s' 'git checkout -- dirty.txt' > ${tmp}/p-709.sh; bash -c "$(cat ${tmp}/p-709.sh)"`],
+      // ── reviewer round-8 closures ──
+      ["unquoted variable `eval` payload (`P='git checkout -- f'; eval $P`)", "P='git checkout -- dirty.txt'; eval $P"],
+      ["quoted variable `eval` payload (`P='…'; eval \"$P\"`)", `P='git checkout -- dirty.txt'; eval "$P"`],
+      ["`read`-fed `eval` payload (`read -r P <<<…; eval $P`)", `read -r P <<<'git checkout -- dirty.txt'; eval $P`],
+      ["command-substitution `eval` payload (`P=$(printf …); eval $P`)", `P=$(printf 'git checkout -- dirty.txt'); eval $P`],
+      ["code piped into a shell (`printf … | bash`)", "printf 'git checkout -- dirty.txt\\n' | bash"],
+      ["code piped into a shell (`echo … | bash`)", "echo 'git checkout -- dirty.txt' | bash"],
+      ["indirect piped code (`C=$(printf …); printf … \"$C\" | bash`)", `C=$(printf 'git checkout -- dirty.txt'); printf '%s\\n' "$C" | bash`],
+      ["`xargs` runtime placeholder payload (`… | xargs -I{} sh -c '{}'`)", "printf 'git checkout -- dirty.txt\\n' | xargs -I{} sh -c '{}'"],
+      ["brace-expansion pathspec (`git checkout -- {dirty,clean}.txt`)", "git checkout -- {dirty,clean}.txt"],
+      ["opaque payload fed from a PATH-named discard (`bash -c \"$(cat checkout-undo.sh)\"`)", `bash -c "$(cat ${verbPath})"`],
+      ["`eval` payload fed from a PATH-named discard (`eval \"$(cat checkout-undo.sh)\"`)", `eval "$(cat ${verbPath})"`],
+      // ── reviewer round-8b closures ──
+      ["ANSI-C escaped verb in a `-c` payload (`bash -c $'git \\x63heckout -- f'`)", "bash -c $'git \\x63heckout -- dirty.txt'"],
+      ["ANSI-C escaped verb via a variable (`CMD=$'…'; bash -c \"$CMD\"`)", "CMD=$'git \\x63heckout -- dirty.txt'; bash -c \"$CMD\""],
+      ["opaque payload whose producer path names NO verb (`bash -c \"$(cat plain-undo.sh)\"`)", `bash -c "$(cat ${plainVerbPath})"`],
+      ["non-`{}` xargs placeholder payload (`xargs -I@ sh -c '@'`)", "printf 'git checkout -- dirty.txt\\n' | xargs -I@ sh -c '@'"],
+      ["named xargs placeholder payload (`xargs -I PERCENT sh -c 'PERCENT'`)", "printf 'git checkout -- dirty.txt\\n' | xargs -I PERCENT sh -c 'PERCENT'"],
     ];
     for (const [why, cmd] of bypass) {
       const r = await bash(cmd, wt);
@@ -515,8 +542,17 @@ async function partB() {
     // against real git), so neither form can discard a path.
     expectTrue("B6k: `git checkout -c dirty.txt` ALLOWED (git rejects `-c`: unknown switch)",
       allowed(await bash("git checkout -c dirty.txt", wt)), "was blocked");
+    // Reviewer round-8 P2: the fail-closed verb test is word-anchored, so an
+    // unrelated word containing the letters of a verb (`normal`, `format`,
+    // `terraform`) no longer blocks an unresolvable payload.
+    expectTrue("B6l: `bash -c \"$CMD\" && echo normal` ALLOWED (no discard verb — `rm` is not a substring match)",
+      allowed(await bash('bash -c "$CMD" && echo normal', wt)), "was blocked");
+    expectTrue("B6l: `bash -c \"$CMD\" && terraform plan` ALLOWED (no discard verb)",
+      allowed(await bash('bash -c "$CMD" && terraform plan', wt)), "was blocked");
     rmSync(execUndo, { force: true });
     rmSync(patch, { force: true });
+    rmSync(verbPath, { force: true });
+    rmSync(plainVerbPath, { force: true });
     // `--work-tree` targets a DIFFERENT working tree than the cwd: run from a
     // non-repo dir (tmp) with the dirty tree supplied only by the flag.
     const wtFlag = await bash(`git --git-dir=${wt}/.git --work-tree=${wt} checkout -- dirty.txt`, tmp);
