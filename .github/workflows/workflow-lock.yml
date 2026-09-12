@@ -1,0 +1,50 @@
+# ⚠️ SECURITY — READ BEFORE EDITING THIS FILE ⚠️
+#
+# This workflow uses the `pull_request_target` trigger. GitHub runs the workflow
+# DEFINITION from the BASE branch (`main`) for this event — the PR cannot
+# substitute its own copy. That is the entire point: it is the checker a PR
+# cannot edit or delete, so it can validate a PR's workflow files even though the
+# PR controls those files.
+#
+# Because of that, this workflow MUST NEVER check out, execute, build, or
+# `npm install` any PR content. `actions/checkout` below deliberately has NO
+# `ref:` — it checks out the base branch. The PR's workflow files are read as
+# DATA through the GitHub Contents API at the PR head SHA only
+# (`node scripts/check-pi-pin-lockstep.mjs --head-ref <sha>`, which decodes the
+# API's base64 and parses it — it never executes it). Passing the PR head to
+# `actions/checkout`, or any step that runs PR content, turns this into the
+# well-known `pull_request_target` RCE vector.
+#
+# See GitHub Security Lab, "Keeping your GitHub Actions and workflows secure:
+# Preventing pwn requests" (Part 4) and GitHub's "Securely using
+# pull_request_target" guidance.
+#
+# The content lock (scripts/workflow-lock.json) is the primary defence for the
+# pin gate; this job adds the structural half using a trusted copy of the
+# checker. See the decision on issue #666.
+
+name: Workflow lock (base-branch checker)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+# Read-only. `contents: read` covers the checkout and the Contents API call;
+# no secret is passed to the job.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  workflow-lock:
+    runs-on: ubuntu-latest
+    steps:
+      # No `ref:` on purpose: pull_request_target checks out the BASE branch
+      # (main), so this step runs main's copy of the workflow + script. Do NOT
+      # add a ref pointing at the PR head.
+      - uses: actions/checkout@v4
+      - name: Validate the PR's workflow files (narrow structural guard, lock skipped)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/check-pi-pin-lockstep.mjs --head-ref "$HEAD_SHA"
