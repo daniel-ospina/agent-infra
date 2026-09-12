@@ -65,12 +65,13 @@ destroy:
 | `git restore [--worktree] [-s <tree>] <paths>` | paths | index (or tree) vs worktree |
 | `git switch -f` / `--discard-changes` | all | everything tracked |
 | `git reset --hard [-- <paths>]` | all / paths | index + worktree |
-| `git checkout-index -f [-a]` | paths / all | index vs worktree |
+| `git checkout-index -f [-a] [--stdin\|--pathspec-from-file]` | paths / all | index vs worktree (`--stdin` target list → fail closed) |
 | `git checkout -p` / `--patch` | paths / all | interactive hunk discard |
+| `git checkout --ours` / `--theirs` / `-m` / `--conflict=<style>` | paths | index vs worktree — conflict resolution ONLY on an unmerged path |
 | `git restore --staged --worktree` | paths | index reset from HEAD + worktree |
 | `git rm -f <paths>` | paths | index + worktree |
 | `git read-tree --reset -u` | all | index + worktree |
-| `git apply -R` / `--reverse` | all | reverses an applied patch (paths live in the patch) |
+| `git apply -R` / `--reverse` (`-R3`/`-3R` too) | all | reverses an applied patch (paths live in the patch) |
 | `git show <rev>:<path> > <path>` | paths | committed content over the file |
 
 Long options match by **unambiguous prefix** (`--har` ≡ `--hard`, `--discard-ch` ≡
@@ -81,11 +82,21 @@ the path restore git executes. **Fail-closed** (effect not statically resolvable
 resolved. **Fail-open** (never false-block): an unreadable `git status` on a
 directory that is not a checkout.
 
-`git checkout --ours/--theirs`, `git restore --staged` (index-only), unmerged
-conflict entries (`UU`/`AA`/`DD`), heredoc **data** bodies and full-line `#`
-comments are explicitly NOT discards; code heredocs (`bash <<EOF`,
-`cat <<EOF | bash`) and executable scripts (`./undo.sh`, `bash undo.sh`) ARE
-walked (bounded depth 3, 64KB).
+`git restore --staged`-style **index-only** operations (`git restore --staged`,
+`git rm --cached`, `git rm -n/--dry-run`), **report-only** reverse applies
+(`git apply -R --check/--stat/--numstat/--summary`), `git checkout-index
+--prefix=<dir>`/`--temp` (exports elsewhere), unmerged conflict entries
+(`UU`/`AA`/`DD` — which is what keeps `checkout --ours/--theirs/-m/--conflict=`
+legitimate on a REAL conflict), heredoc **data** bodies, string-quoted `<<`
+phantoms and `#` comments (full-line and mid-line) are NOT discards; code
+heredocs (`bash <<EOF`, `cat <<EOF | bash`, `python3 <<PY`, and SPAWNER-wrapped
+forms `env|nice|nohup|command|timeout N bash <<EOF`) and executable scripts
+(`./undo.sh`, `bash undo.sh`, `/bin/sh undo.sh`, `busybox sh undo.sh`) ARE walked
+(bounded depth 3, 64KB), quote/escape-concat verb names (`g"it"`, `'g'it`,
+`g\it`) are resolved by the tokenizer (the arm's pre-bail is quote-aware), and
+backtick substitution (`` `git checkout -- f` ``) and an
+in-command git alias (`git -c alias.z='checkout --' z f`, `git config alias.zz …
+&& git zz f`) are resolved too.
 
 The decision (`discardDestroysWip`) is pure and unit-tested: scope `all`
 blocks on ANY tracked porcelain entry; scope `paths` blocks on a
@@ -106,12 +117,14 @@ enforcement surface.
 `git clean` is deliberately NOT in the family (untracked-only; build-artifact
 cleanup in a private worktree is ordinary, and the M4/legacy arms already
 block it in a shared main checkout). `cp <backup> <tracked>`, arbitrary
-interpreter writers, a script chain deeper than 3, a nested `eval`, and
-`git worktree remove --force <wt>` (whole-checkout teardown, not a working-tree
-discard of the current checkout — the `using-git-worktrees` manifest gate is
-its control) are documented residuals — indistinguishable from an edit without
-reading file content (the #625 in-place overwrite gate keeps its existing
-shared-main scope).
+interpreter writers, a script chain deeper than 3, a nested `eval`, a git alias
+configured in an EARLIER command (`git config alias.zz 'checkout --'` then
+`git zz f` — resolving it needs a config read; the same-command form IS
+gated), and `git worktree remove --force <wt>` (whole-checkout teardown, not a
+working-tree discard of the current checkout — the `using-git-worktrees`
+manifest gate is its control) are documented residuals — indistinguishable
+from an edit without reading file content (the #625 in-place overwrite gate
+keeps its existing shared-main scope).
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
@@ -868,7 +881,7 @@ marker fixes **guard-blocked** sessions only.
 |---|---|---|
 | `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
-| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetic hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, `rm`/`read-tree`/`apply -R`/`checkout -p`, script + `eval` + code-heredoc + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, mid-line comments, cd chains, conflict resolution, phantom heredocs), and both escape hatches |
+| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index --stdin`, script + `eval` + heredoc + spawner-heredoc + backtick + alias + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, mid-line comments, index-only `rm`, report-only `apply -R`, `checkout-index --prefix`, cd chains, conflict resolution, phantom heredocs), and both escape hatches |
 
 `test-module-load.mjs` exists because of a real regression (#744): #697 added a
 rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)

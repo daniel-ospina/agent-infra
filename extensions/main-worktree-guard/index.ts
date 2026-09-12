@@ -1190,8 +1190,13 @@ function _worktreeDiscardBlock(command: string): string | null {
   // P1), so the only safe textual bail is "no `git` anywhere and no script to
   // read". The extractor is a pure string walk — the same cost the full
   // classifier already pays per bash call.
+  //
+  // Round-3 P1: the bail itself must not defeat the tokenizer — a quote/escape
+  // or `$'…'`-concat name (`g"it"`, `'g'it`, `g\it`, `$'\x67it'`) has no
+  // literal `git` word but DOES run git. Bail only when the command contains
+  // no quoting/expansion character at all.
   let _scriptPath = extractScriptPath(command);
-  if (!/\bgit\b/.test(command) && !_scriptPath) return null;
+  if (!/\bgit\b/.test(command) && !_scriptPath && !/['"\\$`]/.test(command)) return null;
   let direct: ReturnType<typeof extractWorkingTreeDiscards> = [];
   try { direct = extractWorkingTreeDiscards(command) ?? []; } catch { return null; }
   const sessionCwd = resolve(process.cwd());

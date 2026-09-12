@@ -93,6 +93,17 @@ const FAMILY = [
   ["git checkout -p src/x.ts", "checkout-patch", "paths", ["src/x.ts"], false],
   ["git checkout --patch src/x.ts", "checkout-patch", "paths", ["src/x.ts"], false],
   ["git checkout -p", "checkout-patch-all", "all", [], false],
+  // Reviewer round-3 fold-in: the conflict spellings yield a descriptor (the
+  // effect probe + unmerged-skip decide); `checkout-index --stdin`'s target list
+  // is runtime-supplied (fail closed); `apply -R3`/`-3R` is the same reverse.
+  ["git checkout --ours src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
+  ["git checkout --theirs src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
+  ["git checkout -m src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
+  ["git checkout --merge src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
+  ["git checkout --conflict=merge src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
+  ["git checkout-index -f --stdin", "checkout-index-stdin", "all", [], true],
+  ["git apply -R3 /tmp/p.patch", "apply-reverse", "all", [], true],
+  ["git apply -3R /tmp/p.patch", "apply-reverse", "all", [], true],
 ];
 for (const [cmd, form, scope, pathspecs, fromTree] of FAMILY) {
   const d = first(cmd);
@@ -118,8 +129,11 @@ const NOT_FAMILY = [
   "git clean -fd",              // documented residual: untracked-only
   "git restore --staged src/x.ts", // index-only, non-destructive (#709 note)
   "git restore --stage src/x.ts",  // index-only via unambiguous prefix
-  "git checkout --ours -- src/x.ts", // conflict resolution, not a discard
-  "git checkout --theirs -- src/x.ts",
+  // Reviewer round-3 P1: `--ours`/`--theirs`/`-m`/`--conflict=` are conflict
+  // resolution ONLY on an UNMERGED path; on a plain modified file they are a
+  // normal index-source checkout. So they DO yield a descriptor and the EFFECT
+  // probe decides — the unmerged-skip in `discardDestroysWip` (A3: UU/AA/DD)
+  // keeps genuine resolution allowed.
   "ls -la",
   "cat src/x.ts",
   "rg -n foo .",
@@ -130,6 +144,12 @@ const NOT_FAMILY = [
   "true # git reset --hard",
   "git apply /tmp/p.patch", // forward apply is not a reverse
   "git apply --reject /tmp/p.patch",
+  "git apply -R --check /tmp/p.patch",  // round-3: dry-run/report only
+  "git apply -R --stat /tmp/p.patch",
+  "git rm -f --cached src/x.ts",         // round-3: index-only
+  "git rm -nf src/x.ts",                 // round-3: dry-run
+  "git checkout-index -f -a --prefix=/tmp/out/", // round-3: exports elsewhere
+  "git checkout -m",                     // round-3: switch-with-merge, no path
 ];
 for (const cmd of NOT_FAMILY) {
   expect(`A2: ${cmd.split("\n")[0]} → no discard descriptor`, extractWorkingTreeDiscards(cmd).length, 0);
@@ -143,6 +163,21 @@ for (const cmd of [
   // `<<` inside a QUOTED string must not open a phantom heredoc and blind the
   // rest of the command (reviewer round-2 P1).
   'echo "a << operator"\ngit checkout -- src/x.ts',
+  // Reviewer round-3 P1: SPAWNER-wrapped interpreters still execute the body.
+  "env bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "nice bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "nohup bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "command bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "timeout 5 bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "/bin/sh <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "busybox sh <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "cat <<'EOF' | env bash\ngit checkout -- src/x.ts\nEOF",
+  "cat <<'EOF' | sudo bash\ngit checkout -- src/x.ts\nEOF",
+  // Round-3 P2: backtick substitution + in-command git aliases.
+  "`git checkout -- src/x.ts`",
+  "echo \"`git checkout -- src/x.ts`\" >/dev/null",
+  "git -c alias.z='checkout --' z src/x.ts",
+  "git config alias.zz 'checkout --' && git zz src/x.ts",
 ]) {
   expectTrue(`A2b: ${cmd.split("\n")[0]} → discard IS detected`,
     extractWorkingTreeDiscards(cmd).length > 0, true);
@@ -167,7 +202,8 @@ const EFFECT = [
   [" M src/x.ts", { scope: "all", fromTree: false }, true, "tracked dirt (all scope)"],
   ["", { scope: "all", fromTree: false }, false, "clean tree"],
   // Reviewer round-1 fold-in: unmerged conflict entries are not discarded WIP.
-  ["UU e.txt", { scope: "paths", fromTree: true }, false, "unmerged entry (UU)"],
+  ["UU e.txt", { scope: "paths", fromTree: false }, false, "unmerged entry (UU) — `checkout --ours`"],
+  ["UU e.txt", { scope: "paths", fromTree: true }, false, "unmerged entry (UU) — tree source"],
   ["AA e.txt", { scope: "all", fromTree: false }, false, "unmerged entry (AA)"],
   ["DD e.txt", { scope: "paths", fromTree: true }, false, "unmerged entry (DD)"],
 ];
@@ -331,6 +367,20 @@ async function partB() {
       ["xargs-fed empty pathspec", "printf 'dirty.txt\\n' | xargs git checkout --"],
       ["find -exec placeholder pathspec", "find . -name dirty.txt -exec git checkout -- {} \\;"],
       ["leading-dash pathspec (`git checkout -- -dashfile`)", "git checkout -- -dashfile"],
+      // ── reviewer round-3 closures ──
+      ["`git checkout --ours` on a plain modified file", "git checkout --ours dirty.txt"],
+      ["`git checkout -m` on a plain modified file", "git checkout -m dirty.txt"],
+      ["`git checkout --conflict=merge` on a plain modified file", "git checkout --conflict=merge dirty.txt"],
+      ["`git checkout-index -f --stdin` (runtime path list)", "printf 'dirty.txt\\n' | git checkout-index -f --stdin"],
+      ["`git apply -R3` (digits in the short cluster)", `git apply -R3 ${patch}`],
+      ["`git apply -3R <patch>`", `git apply -3R ${patch}`],
+      ["backtick substitution (`` `git checkout -- dirty.txt` ``)", "`git checkout -- dirty.txt`"],
+      ["in-command git alias (`-c alias.z=…`)", "git -c alias.z='checkout --' z dirty.txt"],
+      ["in-command git alias (`config alias.zz … && git zz …`)", "git config alias.zz 'checkout --' && git zz dirty.txt"],
+      ["spawner-wrapped shell heredoc (`env bash <<EOF`)", "env bash <<'EOF'\ngit checkout -- dirty.txt\nEOF"],
+      ["spawner-wrapped shell heredoc (`timeout 5 bash <<EOF`)", "timeout 5 bash <<'EOF'\ngit checkout -- dirty.txt\nEOF"],
+      ["piped spawner heredoc (`cat <<EOF | sudo bash`)", "cat <<'EOF' | sudo bash\ngit checkout -- dirty.txt\nEOF"],
+      ["absolute-path interpreter (`/bin/sh undo.sh`)", `/bin/sh ${execUndo}`],
     ];
     for (const [why, cmd] of bypass) {
       const r = await bash(cmd, wt);
@@ -347,6 +397,22 @@ async function partB() {
     // ── B6h: hidden-pathspec forms fail CLOSED ──
     expectTrue("B6h: `--pathspec-from-file` fails closed",
       blocked(await bash("git checkout --pathspec-from-file=/tmp/nope.txt", wt)), "was allowed");
+
+    // ── B6i: reviewer round-3 read-only / non-worktree false positives ──
+    expectTrue("B6i: `git rm -f --cached dirty.txt` ALLOWED (index-only)",
+      allowed(await bash("git rm -f --cached dirty.txt", wt)), "was blocked");
+    expectTrue("B6i: `git rm -nf dirty.txt` ALLOWED (dry run)",
+      allowed(await bash("git rm -nf dirty.txt", wt)), "was blocked");
+    expectTrue("B6i: `git apply -R --check <patch>` ALLOWED (report only)",
+      allowed(await bash(`git apply -R --check ${patch}`, wt)), "was blocked");
+    expectTrue("B6i: `git apply -R --stat <patch>` ALLOWED (report only)",
+      allowed(await bash(`git apply -R --stat ${patch}`, wt)), "was blocked");
+    expectTrue("B6i: `git checkout-index -a -f --prefix=<dir>` ALLOWED (exports elsewhere)",
+      allowed(await bash(`git checkout-index -a -f --prefix=${tmp}/out-709/`, wt)), "was blocked");
+    expectTrue("B6i: `git checkout -m` (no path) ALLOWED (switch-with-merge)",
+      allowed(await bash("git checkout -m", wt)), "was blocked");
+    expectTrue("B6i: `git -c alias.z=status z` ALLOWED (read-only alias)",
+      allowed(await bash("git -c alias.z=status z", wt)), "was blocked");
 
     // ── B7: staged-only change survives `checkout --` but not a tree source ──
     gg("add staged.txt && printf 'staged\\n' > staged.txt && git add staged.txt", wt);

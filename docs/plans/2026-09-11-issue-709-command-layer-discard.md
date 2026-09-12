@@ -144,7 +144,21 @@ No change to `classifyGitCommand`/`classifyGitCommandDetailed` verdicts → the 
 | hatches | unit | env hatch + marker bypass M5 |
 | module load | unit | `test-module-load.mjs` stays **49 passed / 0 failed** |
 | full suite | unit | `test.mjs` no new failures (baseline on `origin/main`: 1786 passed / 2 failed) |
-| behavioral | new suite | `test-discard-gate.mjs` 139 passed / 0 failed |
+| behavioral | new suite | `test-discard-gate.mjs` 185 passed / 0 failed |
+
+Reviewer round-3 fold-in: `git checkout --ours/--theirs/-m/--merge/--conflict=`
+now yields a descriptor instead of being exempt outright — they are conflict
+resolution only on an UNMERGED path, and on a plain modified file real git
+treats them as an index-source restore that destroys WIP (the pure unmerged
+skip keeps genuine resolution allowed). `git checkout-index -f --stdin` fails
+closed (target list on stdin), `--prefix=`/`--temp` are not discards, `git
+apply -R3`/`-3R` joined the reverse cluster and `-R --check/--stat/--numstat/
+--summary` are report-only, `git rm --cached`/`-n` are index-only/dry-run,
+heredoc bodies behind SPAWNER wrappers (`env|nice|nohup|command|timeout N
+bash`) and absolute-path interpreters (`/bin/sh undo.sh`, `busybox sh
+undo.sh`) are now reached, backtick substitution and in-command git aliases
+are resolved, and the index.ts pre-bail no longer defeats the quote-aware
+tokenizer (`g"it"`/`'g'it`/`g\it`).
 
 ## Non-goals / residuals
 
@@ -162,8 +176,11 @@ No change to `classifyGitCommand`/`classifyGitCommandDetailed` verdicts → the 
   target (`$VAR` cd chain), an unresolvable pathspec, `--pathspec-from-file`,
   xargs/find placeholders and an unresolvable `eval` payload fail **closed**.
 - Script-file discards are covered to a bounded depth (`bash /tmp/undo.sh`,
-  `./undo.sh`); a chain deeper than 3 and a nested `eval` are documented residuals
-  (same class as the #627 residual).
+  `./undo.sh`, `/bin/sh undo.sh`); a chain deeper than 3 and a nested `eval`
+  are documented residuals (same class as the #627 residual). A git alias
+  configured in an EARLIER command (`git config alias.zz 'checkout --'` then
+  `git zz f`) is a documented residual — resolving it needs a config read; the
+  same-command `-c alias.x=` and `config alias.x … && git x` forms ARE gated.
 - `git worktree remove --force <wt>` (whole-checkout teardown of ANOTHER
   checkout's WIP) is a documented residual — it is not a working-tree discard of
   the checkout the command runs in; the `using-git-worktrees` manifest gate is its
