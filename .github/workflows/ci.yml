@@ -92,7 +92,12 @@ jobs:
       - name: Second-model guard (shipped, offline)
         run: bash scripts/check-second-model.sh --check --shipped-only
       - name: Second-model probe (network — vendor offer + solvency)
-        run: bash scripts/check-second-model.sh --probe --shipped-only || echo "::warning::second-model probe DEGRADED — no solvent+reachable independent model funded (see #716 funding comment); check (f) enforces at PR time"
+        # Block scalar, NOT a plain scalar: an unquoted ` #716` would start a
+        # YAML comment and truncate the script mid-quote (observed as a shell
+        # `unexpected EOF while looking for matching "` on this step).
+        run: |
+          bash scripts/check-second-model.sh --probe --shipped-only \
+            || echo "::warning::second-model probe DEGRADED — no solvent+reachable independent model funded (see #716 funding comment); check (f) enforces at PR time"
       - name: Second-model fixture suite (hermetic, zero network)
         run: bash tests/second-model/run.sh
 
