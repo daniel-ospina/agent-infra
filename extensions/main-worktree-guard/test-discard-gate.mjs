@@ -66,14 +66,17 @@ const FAMILY = [
   ["git checkout -f main", "checkout-force", "all", [], false],
   ["git restore src/x.ts", "restore-worktree", "paths", ["src/x.ts"], false],
   ["git restore --worktree src/x.ts", "restore-worktree", "paths", ["src/x.ts"], false],
-  ["git restore -s HEAD src/x.ts", "restore-worktree", "paths", ["src/x.ts"], true],
+  ["git restore -s HEAD src/x.ts", "restore-worktree", "paths", ["src/x.ts"], false],
   ["git switch --discard-changes main", "switch-discard", "all", [], false],
   ["git reset --hard", "reset-hard", "all", [], false],
   ["git reset --hard HEAD~1", "reset-hard", "all", [], false],
   ["git reset --hard -- src/x.ts", "reset-hard-paths", "paths", ["src/x.ts"], true],
-  ["git checkout-index -f -- src/x.ts", "checkout-index", "paths", ["src/x.ts"], true],
-  ["git checkout-index -a -f", "checkout-index-all", "all", [], true],
+  ["git checkout-index -f -- src/x.ts", "checkout-index", "paths", ["src/x.ts"], false],
+  ["git checkout-index -a -f", "checkout-index-all", "paths", ["."], false],
   ["git show HEAD:src/x.ts > src/x.ts", "cat-file-revert", "revert-hints", ["src/x.ts"], true],
+  // Reviewer round-4: slashy revs and the INDEX source are the same revert.
+  ["git show refs/heads/main:src/x.ts > src/x.ts", "cat-file-revert", "revert-hints", ["src/x.ts"], true],
+  ["git show :src/x.ts > src/x.ts", "cat-file-revert", "revert-hints", ["src/x.ts"], true],
   // Reviewer round-1 fold-in: prefix spellings, tree-ish+paths without `--`,
   // leading-dash pathspecs, xargs/empty pathspecs, rm/read-tree.
   ["git reset --har", "reset-hard", "all", [], false],
@@ -84,8 +87,8 @@ const FAMILY = [
   ["printf 'a\\n' | xargs git checkout --", "checkout-pathspec-empty", "all", [], false],
   ["git rm -f src/x.ts", "rm-force", "paths", ["src/x.ts"], true],
   ["git read-tree --reset -u HEAD", "read-tree-reset-update", "all", [], true],
-  ["git apply -R /tmp/p.patch", "apply-reverse", "all", [], true],
-  ["git apply --reverse /tmp/p.patch", "apply-reverse", "all", [], true],
+  ["git apply -R /tmp/p.patch", "apply-reverse", "all", [], false],
+  ["git apply --reverse /tmp/p.patch", "apply-reverse", "all", [], false],
   // Reviewer round-2 fold-in: a surviving `--staged` resets the index from
   // HEAD, so it is tree-sourced; `-p/--patch` is interactive hunk discard.
   ["git restore --source=HEAD --staged --worktree src/x.ts", "restore-worktree", "paths", ["src/x.ts"], true],
@@ -101,9 +104,16 @@ const FAMILY = [
   ["git checkout -m src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
   ["git checkout --merge src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
   ["git checkout --conflict=merge src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
-  ["git checkout-index -f --stdin", "checkout-index-stdin", "all", [], true],
-  ["git apply -R3 /tmp/p.patch", "apply-reverse", "all", [], true],
+  // Reviewer round-4: `-2`/`-3` are the numeric `--ours`/`--theirs` stages.
+  ["git checkout -2 src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
+  ["git checkout -3 src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
+  ["git checkout -2q src/x.ts", "checkout-conflict", "paths", ["src/x.ts"], false],
+  ["git checkout-index -f --stdin", "checkout-index-stdin", "all", [], false],
+  ["git apply -R3 /tmp/p.patch", "apply-reverse", "all", [], true],  // -3 implies --index
   ["git apply -3R /tmp/p.patch", "apply-reverse", "all", [], true],
+  // Reviewer round-4: a single bare token is ref-or-path — the pure extractor
+  // flags the ambiguity and the handler's `rev-parse` probe decides.
+  ["git checkout HEAD~1", "checkout-bare-path", "paths", ["HEAD~1"], false],
 ];
 for (const [cmd, form, scope, pathspecs, fromTree] of FAMILY) {
   const d = first(cmd);
@@ -120,7 +130,6 @@ const NOT_FAMILY = [
   "git status",
   "git log --oneline -3",
   "git diff",
-  "git checkout main",
   "git checkout -b feat/x",
   "git checkout -",
   "git switch -c feat/x",
@@ -142,6 +151,9 @@ const NOT_FAMILY = [
   "# git checkout -- src/x.ts\nls",
   "echo hi # git checkout -- src/x.ts", // mid-line comment (quote-aware)
   "true # git reset --hard",
+  // Reviewer round-4 P1: an ESCAPED space before `#` does not start a comment
+  // (the `#` is mid-word) — but the inverse case must stay a comment.
+  "echo '`git checkout -- src/x.ts`'", // single quotes suppress substitution
   "git apply /tmp/p.patch", // forward apply is not a reverse
   "git apply --reject /tmp/p.patch",
   "git apply -R --check /tmp/p.patch",  // round-3: dry-run/report only
@@ -150,9 +162,26 @@ const NOT_FAMILY = [
   "git rm -nf src/x.ts",                 // round-3: dry-run
   "git checkout-index -f -a --prefix=/tmp/out/", // round-3: exports elsewhere
   "git checkout -m",                     // round-3: switch-with-merge, no path
+  "git apply -R --cached /tmp/p.patch",  // round-4: index-only
 ];
 for (const cmd of NOT_FAMILY) {
   expect(`A2: ${cmd.split("\n")[0]} → no discard descriptor`, extractWorkingTreeDiscards(cmd).length, 0);
+}
+
+// A2c: a bare single token is REF-OR-PATH — the pure extractor flags it
+// `ambiguousRef` so index.ts can run its `rev-parse` probe (reviewer round-4).
+for (const tok of ["main", "HEAD~1", "v1.0"]) {
+  const d = first(`git checkout ${tok}`);
+  expectTrue(`A2c: \`git checkout ${tok}\` → ambiguousRef descriptor`,
+    !!d && d.form === "checkout-bare-path" && d.ambiguousRef === true &&
+      JSON.stringify(d.pathspecs) === JSON.stringify([tok]),
+    `got ${JSON.stringify(d && { form: d.form, pathspecs: d.pathspecs })}`);
+}
+for (const cmd of ["git checkout ':(glob)**/x.ts'", "git checkout ':(top)x.ts'", "git checkout :/x.ts"]) {
+  const d = first(cmd);
+  expectTrue(`A2c: ${cmd} → magic pathspec IS a discard`,
+    !!d && d.form === "checkout-paths-bare" && d.pathspecs.length === 1,
+    `got ${JSON.stringify(d && { form: d.form, pathspecs: d.pathspecs })}`);
 }
 
 // A2b: interpreter-fed heredocs and piped-to-shell bodies ARE code.
@@ -178,6 +207,18 @@ for (const cmd of [
   "echo \"`git checkout -- src/x.ts`\" >/dev/null",
   "git -c alias.z='checkout --' z src/x.ts",
   "git config alias.zz 'checkout --' && git zz src/x.ts",
+  // Reviewer round-4: the consumer need not be the FIRST token of the line.
+  "true && bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "set -e; bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "cd /tmp && bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  // Reviewer round-4: an apostrophe inside DOUBLE quotes must not hide a later
+  // backtick span (double quotes do not stop substitution).
+  "echo \"it's\" ; `git checkout -- src/x.ts`",
+  // Reviewer round-4: escaped whitespace before `#` is not a comment.
+  "echo a\\ #b && git checkout -- src/x.ts",
+  // Reviewer round-4: ANSI-C command words are decoded before the walk.
+  "$'\\x67it' checkout -- src/x.ts",
+  "$'git' checkout -- src/x.ts",
 ]) {
   expectTrue(`A2b: ${cmd.split("\n")[0]} → discard IS detected`,
     extractWorkingTreeDiscards(cmd).length > 0, true);
@@ -381,6 +422,20 @@ async function partB() {
       ["spawner-wrapped shell heredoc (`timeout 5 bash <<EOF`)", "timeout 5 bash <<'EOF'\ngit checkout -- dirty.txt\nEOF"],
       ["piped spawner heredoc (`cat <<EOF | sudo bash`)", "cat <<'EOF' | sudo bash\ngit checkout -- dirty.txt\nEOF"],
       ["absolute-path interpreter (`/bin/sh undo.sh`)", `/bin/sh ${execUndo}`],
+      // ── reviewer round-4 closures ──
+      ["bare path (`git checkout dirty.txt` — the incident verb without `--`)", "git checkout dirty.txt"],
+      ["git magic pathspec (`git checkout ':(glob)**/dirty.txt'`)", "git checkout ':(glob)**/dirty.txt'"],
+      ["numeric stage (`git checkout -2 dirty.txt`)", "git checkout -2 dirty.txt"],
+      ["non-first heredoc consumer (`true && bash <<EOF`)", "true && bash <<'EOF'\ngit checkout -- dirty.txt\nEOF"],
+      ["non-first heredoc consumer (`set -e; bash <<EOF`)", "set -e; bash <<'EOF'\ngit checkout -- dirty.txt\nEOF"],
+      ["non-first heredoc consumer (`cd <wt> && bash <<EOF`)", `cd ${wt} && bash <<'EOF'\ngit checkout -- dirty.txt\nEOF`],
+      ["escaped whitespace before `#` (`echo a\\ #b && git checkout -- dirty.txt`)", "echo a\\ #b && git checkout -- dirty.txt"],
+      ["ANSI-C command word (`$'\\x67it' checkout -- dirty.txt`)", "$'\\x67it' checkout -- dirty.txt"],
+      ["apostrophe in double quotes before a backtick span", 'echo "it\'s" ; `git checkout -- dirty.txt`'],
+      ["index-source revert (`git show :dirty.txt > dirty.txt`)", "git show :dirty.txt > dirty.txt"],
+      // `checkout-index -a -f` copies the index over the whole tree — dirty.txt
+      // has UNSTAGED changes here, so this is a real destroy.
+      ["whole-tree index copy over unstaged work (`git checkout-index -a -f`)", "git checkout-index -a -f"],
     ];
     for (const [why, cmd] of bypass) {
       const r = await bash(cmd, wt);
@@ -413,6 +468,17 @@ async function partB() {
       allowed(await bash("git checkout -m", wt)), "was blocked");
     expectTrue("B6i: `git -c alias.z=status z` ALLOWED (read-only alias)",
       allowed(await bash("git -c alias.z=status z", wt)), "was blocked");
+    // Reviewer round-4: a bare token that IS a ref is a switch, not a discard.
+    expectTrue("B6i: `git checkout HEAD` ALLOWED (token resolves to a commit)",
+      allowed(await bash("git checkout HEAD", wt)), "was blocked");
+    // Reviewer round-4 P2: `--source` without `--staged` is WORKTREE-only, so a
+    // staged-only change survives and must not block.
+    gg("add staged.txt && printf 'staged\n' > staged.txt && git add staged.txt", wt);
+    expectTrue("B6i: `git restore -s HEAD staged.txt` ALLOWED (worktree-only source)",
+      allowed(await bash("git restore -s HEAD staged.txt", wt)), "was blocked");
+    expectTrue("B6i: `git apply -R --cached <patch>` ALLOWED (index-only)",
+      allowed(await bash(`git apply -R --cached ${patch}`, wt)), "was blocked");
+    gg("reset -q staged.txt", wt);
 
     // ── B7: staged-only change survives `checkout --` but not a tree source ──
     gg("add staged.txt && printf 'staged\\n' > staged.txt && git add staged.txt", wt);

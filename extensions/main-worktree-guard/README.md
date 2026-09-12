@@ -60,48 +60,57 @@ destroy:
 | Form | Scope | Discards |
 |---|---|---|
 | `git checkout [<tree-ish>] -- <paths>` | paths | worktree vs index |
-| `git checkout .` / `./x` / `:/x` | paths | worktree vs index |
+| `git checkout <path>` (one bare token, not a ref) | paths | worktree vs index — the handler's `rev-parse` probe decides ref vs path |
+| `git checkout .` / `./x` / `:/x` / `:(magic)` | paths | worktree vs index |
 | `git checkout -f` / `--force` | all | everything tracked |
-| `git restore [--worktree] [-s <tree>] <paths>` | paths | index (or tree) vs worktree |
+| `git restore [--worktree] [-s <tree>] <paths>` | paths | worktree (index only with `--staged`) |
 | `git switch -f` / `--discard-changes` | all | everything tracked |
 | `git reset --hard [-- <paths>]` | all / paths | index + worktree |
-| `git checkout-index -f [-a] [--stdin\|--pathspec-from-file]` | paths / all | index vs worktree (`--stdin` target list → fail closed) |
+| `git checkout-index -f <paths>` / `-a` | paths | index vs worktree |
 | `git checkout -p` / `--patch` | paths / all | interactive hunk discard |
-| `git checkout --ours` / `--theirs` / `-m` / `--conflict=<style>` | paths | index vs worktree — conflict resolution ONLY on an unmerged path |
+| `git checkout --ours` / `--theirs` / `-m` / `--conflict=<style>` / `-2` / `-3` | paths | index vs worktree — conflict resolution ONLY on an unmerged path |
 | `git restore --staged --worktree` | paths | index reset from HEAD + worktree |
 | `git rm -f <paths>` | paths | index + worktree |
 | `git read-tree --reset -u` | all | index + worktree |
-| `git apply -R` / `--reverse` (`-R3`/`-3R` too) | all | reverses an applied patch (paths live in the patch) |
-| `git show <rev>:<path> > <path>` | paths | committed content over the file |
+| `git apply -R` / `--reverse` (`-R3`/`-3R` too) | all | reverses an applied patch (paths live in the patch); index only with `--index`/`--3way` |
+| `git show <rev>:<path> > <path>` | paths | committed content over the file (slashy revs and `:path` index source included) |
 
 Long options match by **unambiguous prefix** (`--har` ≡ `--hard`, `--discard-ch` ≡
-`--discard-changes`), and `git checkout <tree-ish> <path>` without `--` is treated as
-the path restore git executes. **Fail-closed** (effect not statically resolvable):
-`--pathspec-from-file`, `$VAR`/backtick pathspecs, xargs/find `-exec` placeholders
-(`{}`/`{}+`), an unresolvable `cd` chain, and an `eval` payload that cannot be
-resolved. **Fail-open** (never false-block): an unreadable `git status` on a
-directory that is not a checkout.
+`--discard-changes`), `git checkout <tree-ish> <path>` without `--` is treated as
+the path restore git executes, and `git checkout <token>` (a single bare token) is
+resolved by a `rev-parse` probe — a token that names a commit is a branch/tag
+switch, anything else is a path restore. **Fail-closed** (effect not statically
+resolvable): `--pathspec-from-file`, `--stdin` target lists, `$VAR`/backtick
+pathspecs, xargs/find `-exec` placeholders(`{}`/`{}+`), an unresolvable `cd`
+chain, and an `eval` payload that cannot be resolved. **Fail-open** (never
+false-block): an unreadable `git status` on a directory that is not a checkout.
 
 `git restore --staged`-style **index-only** operations (`git restore --staged`,
-`git rm --cached`, `git rm -n/--dry-run`), **report-only** reverse applies
-(`git apply -R --check/--stat/--numstat/--summary`), `git checkout-index
---prefix=<dir>`/`--temp` (exports elsewhere), unmerged conflict entries
-(`UU`/`AA`/`DD` — which is what keeps `checkout --ours/--theirs/-m/--conflict=`
-legitimate on a REAL conflict), heredoc **data** bodies, string-quoted `<<`
-phantoms and `#` comments (full-line and mid-line) are NOT discards; code
-heredocs (`bash <<EOF`, `cat <<EOF | bash`, `python3 <<PY`, and SPAWNER-wrapped
-forms `env|nice|nohup|command|timeout N bash <<EOF`) and executable scripts
+`git rm --cached`, `git rm -n/--dry-run`, `git apply -R --cached`),
+**report-only** reverse applies (`git apply -R --check/--stat/--numstat/--summary`),
+`git checkout-index --prefix=<dir>`/`--temp` (exports elsewhere), unmerged conflict
+entries (`UU`/`AA`/`DD` — which is what keeps
+`checkout --ours/--theirs/-m/--conflict=` legitimate on a REAL conflict), heredoc
+**data** bodies, string-quoted `<<` phantoms, and `#` comments (full-line and
+mid-line, honouring the escaped-whitespace rule) are NOT discards; code heredocs
+(`bash <<EOF`, `cat <<EOF | bash`, `python3 <<PY`, the SPAWNER-wrapped forms
+`env|nice|nohup|command|timeout N bash <<EOF`, and any list-form consumer such as
+`true && bash <<EOF` / `set -e; bash <<EOF`) and executable scripts
 (`./undo.sh`, `bash undo.sh`, `/bin/sh undo.sh`, `busybox sh undo.sh`) ARE walked
 (bounded depth 3, 64KB), quote/escape-concat verb names (`g"it"`, `'g'it`,
-`g\it`) are resolved by the tokenizer (the arm's pre-bail is quote-aware), and
-backtick substitution (`` `git checkout -- f` ``) and an
+`g\it`) are resolved by the tokenizer (the arm's pre-bail is quote-aware), ANSI-C
+command words (`$'\x67it'`) are decoded, and backtick substitution
+(`` `git checkout -- f` ``) and an
 in-command git alias (`git -c alias.z='checkout --' z f`, `git config alias.zz …
 && git zz f`) are resolved too.
 
 The decision (`discardDestroysWip`) is pure and unit-tested: scope `all`
 blocks on ANY tracked porcelain entry; scope `paths` blocks on a
-worktree-vs-index difference (`Y ≠ ' '`) — a tree/commit source also
-destroys a staged-only change (`X ≠ ' '`). **Allowed**: untracked-only dirt
+worktree-vs-index difference (`Y ≠ ' '`) — a `fromTree` source (a commit/tree
+restore or a `--staged` index reset) additionally destroys a staged-only change
+(`X ≠ ' '`). Index-sourced operations (`checkout-index`, plain `apply -R`)
+therefore use `fromTree: false` even at whole-tree scope — a staged-only entry
+is already in the worktree and survives them. **Allowed**: untracked-only dirt
 (`checkout -- .` never deletes `??`), staged-only changes for an
 index-source restore, clean targets, `git restore --staged` (index-only), and
 every read-only command. Unresolvable targets (`$VAR` pathspec, unresolvable
@@ -120,11 +129,14 @@ block it in a shared main checkout). `cp <backup> <tracked>`, arbitrary
 interpreter writers, a script chain deeper than 3, a nested `eval`, a git alias
 configured in an EARLIER command (`git config alias.zz 'checkout --'` then
 `git zz f` — resolving it needs a config read; the same-command form IS
-gated), and `git worktree remove --force <wt>` (whole-checkout teardown, not a
-working-tree discard of the current checkout — the `using-git-worktrees`
-manifest gate is its control) are documented residuals — indistinguishable
-from an edit without reading file content (the #625 in-place overwrite gate
-keeps its existing shared-main scope).
+gated), a non-static command word (`{git,}` brace alternation, a
+command-position `$(…)` such as `$(echo git)` — the same open-ended
+bash-expansion family as Residual 1), `git show <rev>:<clean> > <dirty>`
+(cross-path overwrite), and `git worktree remove --force <wt>` (whole-checkout
+teardown, not a working-tree discard of the current checkout — the
+`using-git-worktrees` manifest gate is its control) are documented residuals —
+indistinguishable from an edit without reading file content (the #625 in-place
+overwrite gate keeps its existing shared-main scope).
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
@@ -881,7 +893,7 @@ marker fixes **guard-blocked** sessions only.
 |---|---|---|
 | `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
-| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index --stdin`, script + `eval` + heredoc + spawner-heredoc + backtick + alias + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, mid-line comments, index-only `rm`, report-only `apply -R`, `checkout-index --prefix`, cd chains, conflict resolution, phantom heredocs), and both escape hatches |
+| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc + list-form-heredoc + backtick + alias + ANSI-C + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, mid-line comments, escaped-whitespace comments, index-only `rm`/`restore`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), and both escape hatches |
 
 `test-module-load.mjs` exists because of a real regression (#744): #697 added a
 rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)

@@ -62,7 +62,8 @@ Family (token-level, from `allGitInvocations`):
 - `switch` — `-f` / `--force` / `--discard-changes`
 - `reset --hard` — scope `all` (or the paths after `--`)
 - `checkout-index -f` / `-a`, `rm -f`, `read-tree --reset -u`, `apply -R`,
-  `checkout -p`, `restore --staged --worktree`
+  `checkout -p`, `restore --staged --worktree`, `checkout <bare-path>`,
+  `:(magic)` pathspecs, `-2`/`-3` stages, `show <rev>:<p>` / `show :<p>`
 - non-git revert shape: `git show <rev>:<path>` / `cat-file` whose stdout is redirected
   onto a tracked path
 - **script files** — `bash /tmp/undo.sh`, `./undo.sh` (executable) and `source f` are
@@ -144,7 +145,7 @@ No change to `classifyGitCommand`/`classifyGitCommandDetailed` verdicts → the 
 | hatches | unit | env hatch + marker bypass M5 |
 | module load | unit | `test-module-load.mjs` stays **49 passed / 0 failed** |
 | full suite | unit | `test.mjs` no new failures (baseline on `origin/main`: 1786 passed / 2 failed) |
-| behavioral | new suite | `test-discard-gate.mjs` 185 passed / 0 failed |
+| behavioral | new suite | `test-discard-gate.mjs` 219 passed / 0 failed |
 
 Reviewer round-3 fold-in: `git checkout --ours/--theirs/-m/--merge/--conflict=`
 now yields a descriptor instead of being exempt outright — they are conflict
@@ -159,6 +160,23 @@ bash`) and absolute-path interpreters (`/bin/sh undo.sh`, `busybox sh
 undo.sh`) are now reached, backtick substitution and in-command git aliases
 are resolved, and the index.ts pre-bail no longer defeats the quote-aware
 tokenizer (`g"it"`/`'g'it`/`g\it`).
+
+Reviewer round-4 fold-in: a single bare `git checkout <token>` is ref-or-path —
+the pure extractor flags `ambiguousRef` and the handler resolves it with a
+`rev-parse` probe (a ref is a switch, anything else is a path restore), which
+closes the incident verb's twin without `--`; `:(magic)` pathspecs and the
+`-2`/`-3` numeric stage shortcuts joined the family; a heredoc consumer that is
+NOT the first token of the line (`true && bash <<EOF`, `set -e; bash <<EOF`,
+`cd <wt> && bash <<EOF`) is now resolved (previously the body was blanked, i.e.
+detection was silently REMOVED); `_wtScanLine` tracks word starts so an ESCAPED
+space before `#` no longer truncates the line; `_wtBacktickSpans` tracks double
+quotes (an apostrophe inside `"…"` hid later spans); `$'\x67it'` ANSI-C
+command words are decoded; `git show refs/heads/main:p > p` and `git show :p > p`
+are recognised. False positives: `--source` without `--staged` is worktree-only
+and `checkout-index`/plain `apply -R` are index-sourced, so all three use
+`fromTree: false` and no longer block a staged-only change; `apply -R --cached`
+is index-only; `{git,}` brace alternation and a command-position `$(echo git)`
+are documented residuals (open-ended grammar-spelling class).
 
 ## Non-goals / residuals
 
@@ -185,3 +203,6 @@ tokenizer (`g"it"`/`'g'it`/`g\it`).
   checkout's WIP) is a documented residual — it is not a working-tree discard of
   the checkout the command runs in; the `using-git-worktrees` manifest gate is its
   control.
+- A non-static command word (`{git,}` brace alternation, `$(echo git)` in command
+  position) is the same open-ended bash-expansion family as README Residual 1 —
+  closing it needs a full expansion evaluator.

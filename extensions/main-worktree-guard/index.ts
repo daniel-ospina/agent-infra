@@ -194,6 +194,10 @@ let bashWriteTargetsResolved: (command: string, cwd?: string) => ({ resolvedPath
 let extractWorkingTreeDiscards: (command: string) => { form: string; scope: string; pathspecs: string[]; fromTree?: boolean; verb: string; args: string[]; inv: unknown }[] = () => [];
 let discardDestroysWip: (porcelain: string, d: { scope: string; fromTree?: boolean }) => boolean = () => false;
 let resolveInvocationTarget: (inv: unknown, sessionCwd?: string, baseCwd?: string) => { effectiveCwd: string; gitDir: string; worktreePath: string | null; worktreeBranch: string | null; isWorktree: boolean; foreignWorktree: boolean } | null = () => null;
+// M5 fail-closed helper: xargs/find `-exec` placeholder pathspec. Fail-safe
+// default false is safe — a degraded import leaves extractWorkingTreeDiscards
+// inert (`[]`), so nothing reaches this call.
+let wtIsPlaceholderPathspec: (p: unknown) => boolean = () => false;
 // #437 (C): bash-write gate for TRACKED hub files in a DISORDERED hub (pure
 // intersect of bash-write candidates with index-tracked rels). Fail-safe
 // default: inert (null) — a failed import NEVER false-blocks (same contract
@@ -235,6 +239,7 @@ try {
   extractWorkingTreeDiscards = _m5.extractWorkingTreeDiscards;
   discardDestroysWip = _m5.discardDestroysWip;
   resolveInvocationTarget = _m5.resolveInvocationTarget;
+  if (typeof _m5.wtIsPlaceholderPathspec === "function") wtIsPlaceholderPathspec = _m5.wtIsPlaceholderPathspec;
   hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
   HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
   HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
@@ -1283,7 +1288,7 @@ function _worktreeDiscardBlock(command: string): string | null {
       // `$VAR`/backtick pathspec, or an xargs/find `-exec` placeholder.
       const unresolvable = (d as { unverifiable?: boolean }).unverifiable === true ||
         d.pathspecs.some((p) => /[$`]/.test(String(p))) ||
-        d.pathspecs.some((p) => String(p) === "{}" || String(p) === "{}+" || String(p) === "+" || String(p).includes("{}"));
+        d.pathspecs.some((p) => wtIsPlaceholderPathspec(p));
       if (unresolvable) {
         return _worktreeDiscardBlockReason(d, execCwd, "the target pathspec is not statically resolvable");
       }
@@ -1311,6 +1316,18 @@ function _worktreeDiscardBlock(command: string): string | null {
             if (existsSync(wtReal)) probeCwd = wtReal;
           } catch { /* unresolvable work-tree → keep the cwd probe */ }
         }
+      }
+      // A single bare `git checkout <token>` is a REF SWITCH when the token
+      // names one and a PATH RESTORE otherwise (`git checkout f.txt` reverts
+      // f.txt — the incident verb's twin without `--`, reviewer round-4 P1).
+      // Resolve it before probing the effect; a token that is not a commit is
+      // a path.
+      if ((d as { ambiguousRef?: boolean }).ambiguousRef && d.pathspecs.length === 1) {
+        try {
+          execFileSync("git", ["rev-parse", "--verify", "--quiet", `${d.pathspecs[0]}^{commit}`],
+            { cwd: probeCwd, stdio: ["ignore", "ignore", "ignore"] });
+          continue; // it IS a ref → a branch/tag switch, not a discard
+        } catch { /* not a ref → treat as a path and probe the effect */ }
       }
       const dirty = _discardStatusPorcelain(probeCwd, scope);
       if (dirty === true) return _worktreeDiscardBlockReason(d, probeCwd, null);

@@ -1981,8 +1981,10 @@ function _wtHasPathspecFile(args) {
   return (args ?? []).some((t) => String(t).startsWith("--pathspec-from-file") || String(t) === "--pathspec-file-nul");
 }
 
-/** xargs/find `-exec` placeholders — the real pathspec is supplied at runtime. */
-function _wtIsPlaceholderPathspec(p) {
+/** xargs/find `-exec` placeholders — the real pathspec is supplied at runtime.
+ *  Exported so index.ts's fail-closed set has ONE implementation (a second
+ *  inline copy had already drifted — reviewer round-4 P2). */
+export function wtIsPlaceholderPathspec(p) {
   const s = String(p);
   return s === "{}" || s === "{}+" || s === "+" || s.includes("{}");
 }
@@ -1998,7 +2000,10 @@ function _wtDiscardFromCheckout(args) {
   // dirty.txt` reverted the file). So emit a descriptor and let the EFFECT
   // probe decide — the unmerged skip keeps real conflict resolution working.
   const conflictish = a.some((t) => t === "--ours" || t === "--theirs" || t === "-m" ||
-    _wtLongPrefix(t, "--merge") || _wtLongPrefix(t, "--conflict") || String(t).startsWith("--conflict="));
+    _wtLongPrefix(t, "--merge") || _wtLongPrefix(t, "--conflict") || String(t).startsWith("--conflict=") ||
+    // `-2`/`-3` are the numeric stage shortcuts for `--ours`/`--theirs`
+    // (`-2q` too) — same effect-keyed path (reviewer round-4 P2).
+    (/^-[0-9qv]+$/.test(String(t)) && /[23]/.test(String(t))));
   if (conflictish) {
     const cdd = a.indexOf("--");
     const cpos = (cdd !== -1 ? a.slice(cdd + 1) : _wtDiscardPositionals(a)).filter(Boolean);
@@ -2020,11 +2025,14 @@ function _wtDiscardFromCheckout(args) {
     const fromTree = a.slice(0, dd).some((t) => t !== "--" && !String(t).startsWith("-"));
     return { scope: "paths", pathspecs, fromTree, form: "checkout-paths" };
   }
-  // Bare path forms git accepts without `--`: `git checkout .`, `./x`, `:/x`
-  // (and `git checkout <tree-ish> .`). A bare branch name is a switch, NOT a
-  // discard — deliberately not matched here.
+  // Bare path forms git accepts without `--`: `git checkout .`, `./x`, `:/x`,
+  // `:(magic)` (a ref can never start with `:`) — and a SINGLE bare token,
+  // which git resolves as a ref (switch) only when it names one; otherwise it
+  // is a path restore (`git checkout f.txt` reverts f.txt — the incident verb's
+  // twin without `--`, reviewer round-4 P1). The ref-vs-path ambiguity is
+  // resolved by the caller's `rev-parse` probe before the effect probe.
   const pos = _wtDiscardPositionals(a);
-  const pathish = pos.filter((p) => p === "." || String(p).startsWith("./") || String(p).startsWith(":/"));
+  const pathish = pos.filter((p) => p === "." || String(p).startsWith("./") || String(p).startsWith(":"));
   if (pathish.length > 0) {
     return { scope: "paths", pathspecs: pathish, fromTree: pos.length > pathish.length, form: "checkout-paths-bare" };
   }
@@ -2041,6 +2049,11 @@ function _wtDiscardFromCheckout(args) {
     return { scope: "paths", pathspecs: pos, fromTree: false, form: "checkout-patch" };
   }
   if (_wtDiscardForce(a)) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-force" };
+  // A single bare token is ref-or-path (see above) — checked LAST so
+  // `-f main` / `-p f` keep their force/patch semantics.
+  if (!creates && pos.length === 1) {
+    return { scope: "paths", pathspecs: pos, fromTree: false, form: "checkout-bare-path", ambiguousRef: true };
+  }
   return null;
 }
 
@@ -2058,10 +2071,11 @@ function _wtDiscardFromRestore(args) {
   const worktree = !!worktreeTok;
   // Index-only restore is explicitly non-destructive (#709).
   if (staged && !worktree) return null;
-  // A `--staged` that SURVIVES alongside `--worktree` resets the index from
-  // HEAD (the default source), destroying a staged-only change — so it is
-  // tree-sourced, not index-sourced (reviewer round-2 P1).
-  const fromTree = !!sourceTok || ambiguous || staged;
+  // A `--source=<tree>` WITHOUT `--staged` restores the WORKTREE only — the
+  // index keeps the staged blob, so a staged-only change is recoverable and
+  // must not block (reviewer round-4 P2). The index is reset only when
+  // `--staged` survives (with or without `--worktree`).
+  const fromTree = staged;
   const pathspecs = [];
   for (let i = 0; i < a.length; i++) {
     const t = a[i];
@@ -2110,14 +2124,18 @@ function _wtDiscardFromCheckoutIndex(args) {
   // `--stdin`/`-z` supply the path list on STDIN — not statically resolvable
   // (reviewer round-3 P1: `printf 'f\n' | git checkout-index -f --stdin`
   // restored the file while M5 allowed it).
-  if (a.some((t) => t === "--stdin" || t === "-z")) return { scope: "all", pathspecs: [], fromTree: true, form: "checkout-index-stdin", unverifiable: true };
+  if (a.some((t) => t === "--stdin" || t === "-z")) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-index-stdin", unverifiable: true };
   if (_wtDiscardShortCluster(a, "a") || _wtHasLong(a, "--all")) {
-    return { scope: "all", pathspecs: [], fromTree: true, form: "checkout-index-all" };
+    // `checkout-index` copies FROM the index: a staged-only entry is already in
+    // the worktree, so only a WORKTREE-vs-index difference (Y ≠ ' ') is
+    // destroyed. Expressed as the whole-tree pathspec scope (reviewer round-4
+    // P2: `fromTree` here false-blocked staged-only work).
+    return { scope: "paths", pathspecs: ["."], fromTree: false, form: "checkout-index-all" };
   }
   const dd = a.indexOf("--");
   const pathspecs = (dd !== -1 ? a.slice(dd + 1) : _wtDiscardPositionals(a)).filter(Boolean);
   if (pathspecs.length === 0) return null;
-  return { scope: "paths", pathspecs, fromTree: true, form: "checkout-index" };
+  return { scope: "paths", pathspecs, fromTree: false, form: "checkout-index" };
 }
 
 /** `git rm -f <paths>` deletes index+worktree entries (a discard of the file's
@@ -2157,7 +2175,14 @@ function _wtDiscardFromApply(args) {
   // `git apply -R --check|--stat|--numstat|--summary` only reports).
   if (a.some((t) => _wtLongPrefix(t, "--check") || _wtLongPrefix(t, "--stat") ||
     _wtLongPrefix(t, "--numstat") || _wtLongPrefix(t, "--summary"))) return null;
-  return { scope: "all", pathspecs: [], fromTree: true, form: "apply-reverse" };
+  // `--cached` is index-only — not a WORKING-TREE discard (reviewer round-4 P2,
+  // same class as `restore --staged`).
+  if (a.some((t) => _wtLongPrefix(t, "--cached"))) return null;
+  // Default `git apply` writes the WORKTREE only; `--index` and `--3way`
+  // (implied by a `-3` cluster member) also overwrite the index.
+  const indexTouch = a.some((t) => _wtLongPrefix(t, "--index") || _wtLongPrefix(t, "--3way") ||
+    (/^-[A-Za-z0-9]+$/.test(String(t)) && String(t).slice(1).includes("3")));
+  return { scope: "all", pathspecs: [], fromTree: indexTouch, form: "apply-reverse" };
 }
 
 /**
@@ -2177,6 +2202,7 @@ function _wtDiscardFromApply(args) {
  * residual (the first body is blanked, the rest are parsed normally).
  */
 const _WT_SPAWNER_WORDS = new Set(["env", "nice", "nohup", "command", "sudo", "doas", "setsid", "stdbuf", "time", "timeout", "exec", "ionice", "busybox"]);
+const _WT_KEYWORDS = new Set(["then", "do", "else", "elif", "if", "while", "until", "for", "done", "fi", "esac", "case", "in", "!", "time", "eval", "true", "false", ":", "set", "export", "declare", "local", "return", "test", "cd", "shopt"]);
 const _WT_SHELL_WORDS = /^(?:bash|sh|zsh|dash|ksh|fish|csh|tcsh|source|\.)$/;
 const _WT_CODE_WORDS = /^(?:python[0-9.]*|perl|ruby|node|nodejs|pwsh|powershell|deno|osascript|php|lua|Rscript)$/;
 
@@ -2197,21 +2223,53 @@ function _wtHeadInterpreter(line) {
     const t = toks[i];
     if (isInterp(t)) return t;
     if (i === 0) {
-      // Only a spawner / env-assignment / flag may precede the interpreter.
-      const ok = _WT_SPAWNER_WORDS.has(t) || t.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(t);
+      // Only a spawner / shell keyword / env-assignment / flag may precede the
+      // interpreter (`then bash <<EOF`, `do bash <<EOF`).
+      const ok = _WT_SPAWNER_WORDS.has(t) || _WT_KEYWORDS.has(t) || t.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(t);
       if (!ok) return null;
     }
   }
   return null;
 }
 
+/**
+ * Split a comment-stripped opener line into command segments on UNQUOTED
+ * list operators, then return the segment that owns the `<<`. The consumer is
+ * not necessarily the first token of the LINE (`true && bash <<EOF`,
+ * `set -e; bash <<EOF`, `{ bash <<EOF`) — reading the whole line as if the head
+ * were the consumer blanked a body the walker would otherwise have parsed
+ * (reviewer round-4 P1).
+ */
+function _wtOpenerSegment(line) {
+  const s = String(line ?? "");
+  const segs = [];
+  let cur = "";
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) { if (ch === quote) quote = null; cur += ch; continue; }
+    if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === "{" || ch === "}" || ch === ")") {
+      segs.push(cur); cur = ""; continue;
+    }
+    cur += ch;
+  }
+  segs.push(cur);
+  return segs.find((seg) => seg.includes("<<")) ?? s;
+}
+
 /** A shell executes its stdin heredoc as SHELL text; a code interpreter
  *  (python/perl/ruby/node/…) executes it as CODE — the two need different
- *  extraction paths. `null` = not an interpreter (body is data). */
+ *  extraction paths. `null` = a positively identified DATA consumer (body is
+ *  not code). An UNRESOLVABLE head (`$SH <<EOF`, `$(which sh) <<EOF`) is not
+ *  proof of a data consumer → the body is kept so the walker can see it
+ *  (fail toward detection, never toward silently blanking code). */
 function _wtHeredocKind(line) {
   if (_wtLinePipesToInterpreter(line)) return "shell";
-  const interp = _wtHeadInterpreter(line);
-  if (interp === null) return null;
+  const seg = _wtOpenerSegment(line);
+  const interp = _wtHeadInterpreter(seg);
+  if (interp === null) return /[$`]/.test(seg) ? "shell" : null;
   return _WT_SHELL_WORDS.test(basename(String(interp))) ? "shell" : "code";
 }
 function _wtLinePipesToInterpreter(line) {
@@ -2219,21 +2277,31 @@ function _wtLinePipesToInterpreter(line) {
 }
 
 /** Quote-aware scan of one line: returns the comment-stripped text and the
- *  delimiter of the FIRST unquoted heredoc opener (or null). */
+ *  delimiter of the FIRST unquoted heredoc opener (or null).
+ *
+ *  `#` starts a comment only at a WORD START — after real whitespace or a list
+ *  operator, not after an ESCAPED whitespace. Testing the raw preceding char
+ *  treated `echo a\ #b && git checkout -- f` as a comment and truncated the
+ *  live discard off the line (reviewer round-4 P1). */
 function _wtScanLine(line) {
   let i = 0;
   let out = "";
   let quote = null;
   let delim = null;
+  let atWordStart = true;
   while (i < line.length) {
     const ch = line[i];
     if (quote) {
       if (ch === quote) quote = null;
-      out += ch; i++; continue;
+      out += ch; i++; atWordStart = false; continue;
     }
-    if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; continue; }
-    if (ch === "'" || ch === '"') { quote = ch; out += ch; i++; continue; }
-    if (ch === "#" && (i === 0 || /\s|[;&|(]/.test(line[i - 1]))) break; // comment
+    if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; atWordStart = false; continue; }
+    if (ch === "'") { quote = ch; out += ch; i++; atWordStart = false; continue; }
+    if (ch === '"') { quote = ch; out += ch; i++; atWordStart = false; continue; }
+    if (ch === "#" && atWordStart) break; // comment
+    if (ch === " " || ch === "\t" || ch === ";" || ch === "&" || ch === "|" || ch === "(") {
+      out += ch; i++; atWordStart = true; continue;
+    }
     if (ch === "<" && line[i + 1] === "<") {
       let j = i + 2;
       if (line[j] === "-") j++;
@@ -2248,7 +2316,7 @@ function _wtScanLine(line) {
       i = j;
       continue;
     }
-    out += ch; i++;
+    out += ch; i++; atWordStart = false;
   }
   return { text: out, delim };
 }
@@ -2278,13 +2346,18 @@ function _wtStripHeredocData(text, codeBodies) {
 }
 
 /** `git show <rev>:<path>` / `cat-file` committed-path hints (the manual
- *  revert shape `git show HEAD:x > x`). */
+ *  revert shape `git show HEAD:x > x`). Slashy revs (`refs/heads/main:p`,
+ *  `origin/main:p`) and the INDEX source (`:p`) are the same revert — the
+ *  hint is intersected with the command's write targets, so over-matching is
+ *  safe (reviewer round-4 P2). */
 function _wtDiscardShowTargets(args) {
   const out = [];
   for (const t of args ?? []) {
     if (t === "blob") continue;
+    const idx = /^:(.+)$/.exec(String(t));
+    if (idx) { out.push(idx[1]); continue; }
     const m = /^([^:\s]+):(.+)$/.exec(String(t));
-    if (m && m[2] && !m[1].includes("/")) out.push(m[2]);
+    if (m && m[2]) out.push(m[2]);
   }
   return out;
 }
@@ -2298,20 +2371,35 @@ function _wtDiscardShowTargets(args) {
 function _wtBacktickSpans(text) {
   const s = String(text ?? "");
   const out = [];
+  const capture = (from) => {
+    let j = from;
+    let buf = "";
+    while (j < s.length && s[j] !== "`") { if (s[j] === "\\") { j++; if (j >= s.length) break; } buf += s[j]; j++; }
+    if (buf.trim()) out.push(buf);
+    return j + 1;
+  };
   let i = 0;
   let inSingle = false;
+  let inDouble = false;
   while (i < s.length) {
     const ch = s[i];
     if (ch === "\\") { i += 2; continue; }
-    if (ch === "'") { inSingle = !inSingle; i++; continue; }
-    if (ch === "`" && !inSingle) {
-      let j = i + 1;
-      let buf = "";
-      while (j < s.length && s[j] !== "`") { if (s[j] === "\\") { j++; if (j >= s.length) break; } buf += s[j]; j++; }
-      if (buf.trim()) out.push(buf);
-      i = j + 1;
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      i++;
       continue;
     }
+    // Inside double quotes an apostrophe is ORDINARY — it must not flip the
+    // single-quote state and hide a later backtick (reviewer round-4 P2).
+    if (inDouble) {
+      if (ch === '"') { inDouble = false; i++; continue; }
+      if (ch === "`") { i = capture(i + 1); continue; }
+      i++;
+      continue;
+    }
+    if (ch === "'") { inSingle = true; i++; continue; }
+    if (ch === '"') { inDouble = true; i++; continue; }
+    if (ch === "`") { i = capture(i + 1); continue; }
     i++;
   }
   return out;
@@ -2336,6 +2424,17 @@ function _wtInlineAliases(command) {
 }
 
 /**
+ * ANSI-C command words: bash expands `$'\x67it'` to `git` BEFORE execution, so
+ * the walker must see the decoded form (reviewer round-4 P2). M5-only
+ * pre-pass — the shared tokenizer is untouched. Brace alternation (`{git,}`)
+ * and a command-position `$(…)` remain in the documented open-ended
+ * grammar-spelling residual (README Residuals 1/3).
+ */
+function _wtAnsiDecode(text) {
+  return String(text ?? "").replace(/\$'([^']*)'/g, (_m, body) => _ansiTranslate(body));
+}
+
+/**
  * Extract every working-tree-discard invocation from a shell command (#709).
  * @param {string} command
  * @returns {Array<{form: string, scope: string, pathspecs: string[], fromTree: boolean, verb: string, args: string[], inv: any}>}
@@ -2344,7 +2443,7 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
   const out = [];
   try {
     const codeBodies = [];
-    const invs = allGitInvocations(_wtStripHeredocData(command, codeBodies));
+    const invs = allGitInvocations(_wtStripHeredocData(_wtAnsiDecode(command), codeBodies));
     const aliases = _depth < 2 ? _wtInlineAliases(command) : {};
     for (const inv of invs) {
       const verb = inv?.verb;
