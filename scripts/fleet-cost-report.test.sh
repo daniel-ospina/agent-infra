@@ -64,6 +64,28 @@ with open(fp, "w") as f:
 PY
 }
 
+# peak-split fixture: <dir> <idx> "<ts> <cost>" ... — one assistant message
+# per pair, each carrying a REAL top-level timestamp (mk_session's records have
+# none, so the (d) split is unexercised by the fixtures above).
+mk_session_ts() { # $1 dir, $2 idx, $3.. timestamp/cost pairs
+    local d="$1/sessions"; mkdir -p "$d"
+    python3 - "$d/${TODAY}T2${2}-00-00-000Z_s${2}.jsonl" "${@:3}" <<'PY'
+import json, sys
+fp, pairs = sys.argv[1], sys.argv[2:]
+with open(fp, "w") as f:
+    for p in pairs:
+        ts, cost = p.split()
+        f.write(json.dumps({
+            "type": "message", "timestamp": ts,
+            "message": {"role": "assistant", "stopReason": "toolUse", "content": []},
+            "usage": {"input": 100, "output": 100, "cacheRead": 100,
+                      "cacheWrite": 0, "reasoning": 0,
+                      "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0,
+                               "cacheWrite": 0.0, "total": float(cost)}},
+        }) + "\n")
+PY
+}
+
 echo "── fleet-cost-report thresholds ─────────────────────────────"
 
 # CLEAN: 3 clamp-regime sessions at 290K (283.6–300K trigger band — a
@@ -149,6 +171,47 @@ D="$T/nocostall"; mk_session "$D" 1 290000 0.40 1; mk_session "$D" 2 290000 0.40
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "0" "all-no-cost sessions exit 0 (undefined share, not escalated)"
 assert_contains "$OUT" "no message cost data" "no-cost pool reports undefined"
+
+echo ""
+echo "── (d) peak/off-peak split (#634) ──────────────────────────"
+
+# 2026-09-09 is a Wednesday, 2026-09-12 a Saturday. Peak = 01:00-04:00 and
+# 06:00-10:00 UTC, Mon-Fri. Hour 04:00 is the EXCLUSIVE upper bound of the
+# first window, so `04Z` on a Wednesday must land OFF-peak; `02Z` on a
+# Saturday is off-peak despite the hour, because weekends have no window
+# at all. Expected: peak $0.06 (one call) / off-peak $0.04 (three calls)
+# → 60.0% of logged, 75.0% of BILLED (the peak side doubles), ceiling $0.06.
+D="$T/peak"
+mk_session_ts "$D" 1 "2026-09-09T02:00:00Z 0.06" \
+                  "2026-09-09T20:00:00Z 0.02" \
+                  "2026-09-12T02:00:00Z 0.01" \
+                  "2026-09-09T04:00:00Z 0.01"
+RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
+assert_eq "$RC" "0" "peak-split fixture still exits 0 (report-only, never escalates)"
+assert_contains "$OUT" "## (d) Peak/off-peak spend split" "(d) section present"
+assert_contains "$OUT" "share of logged spend: 60.0%" "logged share computed (60.0%)"
+assert_contains "$OUT" "share of BILLED spend: 75.0%" "billed share computed (75.0% — peak doubles)"
+assert_contains "$OUT" "deferrable premium ceiling: \$0.06" "ceiling is the FULL logged peak, not half"
+assert_contains "$OUT" "  1 calls" "only the in-window call counted as peak"
+
+# Boundary + weekend exclusivity: an in-window-hour call on a WEEKEND, and a
+# call exactly AT the window end, must both be off-peak. If either were
+# miscounted this would read 50.0%/100.0% instead of 0.0%. The needle is
+# PREFIX-QUALIFIED ("share of logged spend: 0.0%") — assert_contains is
+# grep -qF, i.e. UNANCHORED, so it is the prefix that blocks the 50.0%/100.0%
+# false pass, not line-anchoring.
+D="$T/peakedge"; mk_session_ts "$D" 1 "2026-09-12T02:00:00Z 0.05" "2026-09-09T04:00:00Z 0.05"
+RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
+assert_contains "$OUT" "- peak:     \$     0.00 logged  \$     0.00 billed" "weekend hour + window-end boundary both count OFF-peak"
+assert_contains "$OUT" "share of logged spend: 0.0%" "zero peak share (boundary not counted in-window)"
+
+# Undated calls must be EXCLUDED from the split, not silently treated as
+# off-peak (the pre-#634 fixture shape: mk_session writes no timestamp).
+D="$T/peakundated"; mk_session "$D" 1 290000 0.70
+mk_session_ts "$D" 2 "2026-09-09T02:00:00Z 0.04"
+RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
+assert_contains "$OUT" "undated calls excluded" "undated calls reported, not silently bucketed"
+assert_contains "$OUT" "share of logged spend: 100.0%" "undated cost kept out of the timed split"
 
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
