@@ -484,11 +484,37 @@ async function partB() {
       ["here-string into an interpreter (`bash <<< 'git checkout -- f'`)", "bash <<< 'git checkout -- dirty.txt'"],
       ["process substitution into an interpreter (`bash <(printf …)`)", "bash <(printf 'git checkout -- dirty.txt')"],
       ["opaque interpreter `-c` payload (`S=…; bash -c \"$S\"`)", 'S="git checkout -- dirty.txt"; bash -c "$S"'],
+      // ── reviewer round-7 closures ──
+      ["single-dash letter run inline payload (`bash -lc '…'`)", "bash -lc 'git checkout -- dirty.txt'"],
+      ["backslash-newline continuation before the verb (`git \\\n checkout -- f`)", "git \\\n checkout -- dirty.txt"],
+      ["ANSI-C quoted `eval` payload (`eval $'git …'`)", "eval $'git checkout -- dirty.txt'"],
+      ["literal `-c` payload sourcing a script (`bash -c 'source <undo.sh>'`)", `bash -c 'source ${execUndo}'`],
+      ["`find … -exec sh {} \\;` placeholder runs the file as a script", `find ${execUndo} -exec sh {} \\;`],
+      ["opaque quoted `-c` payload NAMING the verb (`bash -c \"$(printf …)\"`)", `bash -c "$(printf 'git checkout -- dirty.txt')"`],
+      ["piped producer feeding an opaque payload (`printf … | bash -c \"$(cat)\"`)", "printf 'git checkout -- dirty.txt\\n' | bash -c \"$(cat)\""],
+      // ── reviewer round-7, second pass (non-literal producers) ──
+      ["command-substitution assignment (`S=$(printf …); bash -c \"$S\"`)", `S=$(printf 'git checkout -- dirty.txt'); bash -c "$S"`],
+      ["`printf -v` assignment (`printf -v S …; bash -c \"$S\"`)", `printf -v S '%s' 'git checkout -- dirty.txt'; bash -c "$S"`],
+      ["here-string `read` assignment (`read -r S <<<…; bash -c \"$S\"`)", `read -r S <<<'git checkout -- dirty.txt'; bash -c "$S"`],
+      ["`eval` assignment (`eval \"S='…'\"; bash -c \"$S\"`)", `eval "S='git checkout -- dirty.txt'"; bash -c "$S"`],
+      ["file-fed opaque payload (`printf … > p.sh; bash -c \"$(cat p.sh)\"`)", `printf '%s' 'git checkout -- dirty.txt' > ${tmp}/p-709.sh; bash -c "$(cat ${tmp}/p-709.sh)"`],
     ];
     for (const [why, cmd] of bypass) {
       const r = await bash(cmd, wt);
       expectTrue(`B6g: ${why} → BLOCKED`, blocked(r), JSON.stringify(r)?.slice(0, 160));
     }
+    // Reviewer round-7, second pass — DOCUMENTED RESIDUAL (conservative block):
+    // an unresolvable opaque payload sharing a command with a discard verb blocks
+    // even when the visible git invocation is legitimate. Payload-scoping this
+    // test let the five producer forms above destroy WIP, so the arm is
+    // deliberately whole-command (the pre-round-7 contract).
+    expectTrue("B6j: opaque payload + a discard verb in ONE command → BLOCKED (documented residual, fail-closed)",
+      blocked(await bash('bash -c "$L" && git checkout main', wt)), "was allowed");
+    // Reviewer round-7: `-c`/`-C` are branch-CREATE flags for `git switch` and
+    // rejected outright by `git checkout` (unknown switch, exit 129 — verified
+    // against real git), so neither form can discard a path.
+    expectTrue("B6k: `git checkout -c dirty.txt` ALLOWED (git rejects `-c`: unknown switch)",
+      allowed(await bash("git checkout -c dirty.txt", wt)), "was blocked");
     rmSync(execUndo, { force: true });
     rmSync(patch, { force: true });
     // `--work-tree` targets a DIFFERENT working tree than the cwd: run from a

@@ -198,6 +198,22 @@ let resolveInvocationTarget: (inv: unknown, sessionCwd?: string, baseCwd?: strin
 // default false is safe — a degraded import leaves extractWorkingTreeDiscards
 // inert (`[]`), so nothing reaches this call.
 let wtIsPlaceholderPathspec: (p: unknown) => boolean = () => false;
+let wtShellInlinePayloads: (cmd: string) => { text: string; opaque: boolean }[] =
+  // FAIL-SAFE fallback, not inert: a stale/partial classify-git.mjs (the export
+  // missing while `classifierLoaded` is still true) must not silently delete the
+  // opaque `-c` arm. This is the same quote-aware scan, minus the spawner/keyword
+  // head analysis — it can only OVER-report, which keeps the arm fail-closed.
+  (cmd: string) => {
+    const out: { text: string; opaque: boolean }[] = [];
+    const re = /(?:^|[\s;&|(])(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh)\s+(?:-[A-Za-z]*c[A-Za-z]*|--command)\s+("[^"]*"|'[^']*'|\S+)/g;
+    for (const m of String(cmd ?? "").matchAll(re)) {
+      const t = m[1] ?? "";
+      out.push({ text: t, opaque: /[$`]/.test(t) });
+    }
+    return out;
+  };
+let joinContinuations: (cmd: string) => string = (c: string) => String(c ?? "");
+let ansiTranslate: (s: string) => string = (s: string) => String(s ?? "");
 // #437 (C): bash-write gate for TRACKED hub files in a DISORDERED hub (pure
 // intersect of bash-write candidates with index-tracked rels). Fail-safe
 // default: inert (null) — a failed import NEVER false-blocks (same contract
@@ -240,6 +256,9 @@ try {
   discardDestroysWip = _m5.discardDestroysWip;
   resolveInvocationTarget = _m5.resolveInvocationTarget;
   if (typeof _m5.wtIsPlaceholderPathspec === "function") wtIsPlaceholderPathspec = _m5.wtIsPlaceholderPathspec;
+  if (typeof _m5.wtShellInlinePayloads === "function") wtShellInlinePayloads = _m5.wtShellInlinePayloads;
+  if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
+  if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
   hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
   HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
   HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
@@ -1190,6 +1209,10 @@ function _worktreeDiscardBlockReason(
  *  script-file surface (`bash /tmp/restore.sh`) to a bounded depth. */
 function _worktreeDiscardBlock(command: string): string | null {
   if (!classifierLoaded) return null; // degraded import → inert (module-load tripwire guards this)
+  // Backslash-newline line continuations (`git \<LF> checkout -- f`) are joined
+  // by the shell BEFORE it tokenizes — join them here too, so every textual arm
+  // below sees the same command the shell runs (reviewer round-7 P1).
+  command = joinContinuations(command);
   // Cheap superset pre-bail. NOT a raw-verb regex: the tokenizer resolves
   // quote-split verbs (`git ch'ec'kout -- x` ≡ `git checkout -- x`, reviewer
   // P1), so the only safe textual bail is "no `git` anywhere and no script to
@@ -1256,8 +1279,20 @@ function _worktreeDiscardBlock(command: string): string | null {
     const seeds: string[] = [];
     if (_scriptPath) seeds.push(_scriptPath);
     const pipeSeg = String(command).split("|");
+    const execPlaceholder = /(?:^|\s)(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh)\s+(?:-[A-Za-z]+\s+)?\{/.test(String(command));
     if (pipeSeg.length > 1 && pipesToShell) {
       for (const tok of String(pipeSeg.slice(0, -1).join("|")).split(/\s+/)) {
+        if (!tok || tok.startsWith("-") || /[$`*?]/.test(tok)) continue;
+        try {
+          const real = realpathSync(resolve(execCwd, tok));
+          if (statSync(real).isFile() && statSync(real).size <= 64 * 1024) seeds.push(tok);
+        } catch { /* not a readable file */ }
+      }
+    }
+    // `find <file> -exec sh {} \;` runs the file as a script (reviewer round-7
+    // P2) — seed every existing file token of the command.
+    if (execPlaceholder) {
+      for (const tok of String(command).split(/\s+/)) {
         if (!tok || tok.startsWith("-") || /[$`*?]/.test(tok)) continue;
         try {
           const real = realpathSync(resolve(execCwd, tok));
@@ -1286,8 +1321,8 @@ function _worktreeDiscardBlock(command: string): string | null {
   // `eval '<payload>'` (reviewer P1): allGitInvocations does not walk eval
   // payloads, so extract them here (one level — a nested eval is a documented
   // residual). A payload that is not statically resolvable fails closed.
-  for (const m of String(command).matchAll(/\beval\s+(['"])([\s\S]*?)\1/g)) {
-    const payload = m[2] ?? "";
+  for (const m of String(command).matchAll(/\beval\s+(\$)?(['"])([\s\S]*?)\2/g)) {
+    const payload = m[1] ? ansiTranslate(m[3] ?? "") : (m[3] ?? "");
     if (!/(checkout|restore|switch|reset|read-tree|rm)/.test(payload)) continue;
     if (/[$`]/.test(payload)) {
       return _worktreeDiscardBlockReason({ form: "eval-payload", scope: "all", pathspecs: [] }, execCwd, "an `eval` payload is not statically resolvable");
@@ -1295,24 +1330,50 @@ function _worktreeDiscardBlock(command: string): string | null {
     sets.push({ discs: extractWorkingTreeDiscards(payload) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
   }
 
-  // Interpreter `-c` payloads are the symmetric surface: `allGitInvocations`
-  // resolves a LITERAL payload, but an opaque one (`bash -c "$S"`,
-  // `bash -c "$(printf 'git checkout -- f')"`) yields no invocation at all.
-  // Resolve a same-command assignment (`S=…; bash -c "$S"`) and probe the
-  // value; otherwise fail closed ONLY when the command mentions a
-  // discard-family verb (reviewer round-6 P1).
-  for (const m of String(command).matchAll(/(?:^|[;&|(])\s*(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh)\s+(?:-c|--command)\s+(\S+)/g)) {
-    const payload = m[1] ?? "";
-    if (!/[$`]/.test(payload)) continue; // a literal payload is already walked
-    const bare = payload.replace(/^["']|["']$/g, "");
+  // Interpreter `-c` payloads: `allGitInvocations` resolves a LITERAL payload,
+  // but an opaque one (`bash -c "$S"`) yields no invocation at all. Resolve a
+  // same-command assignment (`S='git checkout -- f'; bash -c "$S"`) and probe
+  // it; anything that is STILL opaque fails closed when the command mentions a
+  // discard-family verb.
+  //
+  // The verb test is deliberately over the WHOLE command, not just the payload
+  // segment (reviewer round-7, second pass): the payload's value can come from
+  // a producer the walker cannot follow — `S=$(printf 'git checkout -- f')`,
+  // `printf -v S '%s' 'git checkout -- f'`, `read -r S <<<'git checkout -- f'`,
+  // `eval "S='git checkout -- f'"`, `printf … > /tmp/p.sh; bash -c "$(cat
+  // /tmp/p.sh)"` — and payload-scoping let every one of those destroy WIP. This
+  // is the pre-round-7 contract: an unresolvable opaque payload sharing a
+  // command with a discard verb is exactly the case the arm exists for. The
+  // cost is a conservative block on `bash -c "$L" && git checkout main`; that
+  // ambiguity is the arm's documented residual, not a false positive to trade
+  // real discards for.
+  for (const pl of wtShellInlinePayloads(command)) {
+    if (!pl.opaque) {
+      // A literal payload that runs/sources a SCRIPT FILE seeds the bounded
+      // walk (`bash -c 'source /tmp/undo.sh'`, round-7 P1). Outer quotes are
+      // stripped first — `extractScriptPath` tokenizes the payload as a COMMAND,
+      // and a leading `'` would make `'source` an unrecognised head.
+      try {
+        const sp = extractScriptPath(pl.text.replace(/^["']|["']$/g, ""));
+        if (sp && !/[$`]/.test(sp)) sets.push({ discs: extractWorkingTreeDiscards(readFileSync(resolve(execCwd, sp), "utf8")) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
+      } catch { /* missing/unreadable — the direct surface still gates */ }
+      continue;
+    }
+    const bare = pl.text.replace(/^["']|["']$/g, "");
     const vm = /^\$(\w+)$|^\$\{(\w+)\}$/.exec(bare);
     const name = vm?.[1] ?? vm?.[2];
     if (name) {
       const am = new RegExp(`(?:^|[;&\\s])${name}=("[^"]*"|'[^']*'|\\S+)`).exec(String(command));
       if (am) {
         const val = String(am[1]).replace(/^["']|["']$/g, "");
-        sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
-        continue;
+        // A value that is ITSELF opaque (`S=$(printf 'git checkout -- f')`,
+        // `read`-fed, `printf -v`-fed) is NOT resolved — falling through to the
+        // fail-closed test is the whole point. Only a statically readable value
+        // is probed and short-circuits (reviewer round-7, second pass).
+        if (!/[$`]/.test(val)) {
+          sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+          continue;
+        }
       }
     }
     if (/(checkout|restore|switch|reset|read-tree|rm|apply)/.test(String(command))) {
@@ -1384,6 +1445,18 @@ function _worktreeDiscardBlock(command: string): string | null {
         const refIsAll = (d as { refIsAll?: boolean }).refIsAll === true;
         if (isRef && !refIsAll) continue; // a plain branch/tag switch, not a discard
         if (!isRef && refIsAll) scope = { scope: "paths", pathspecs: d.pathspecs, fromTree: false };
+      }
+      // `git checkout <tok> <paths>`: the first positional is a tree-ish ONLY
+      // when it names a commit; otherwise EVERY positional is a pathspec
+      // (reviewer round-7 P1).
+      if ((d as { ambiguousTree?: string }).ambiguousTree && (d as { allPathspecs?: string[] }).allPathspecs) {
+        let isRef = false;
+        try {
+          execFileSync("git", ["rev-parse", "--verify", "--quiet", `${(d as { ambiguousTree?: string }).ambiguousTree}^{commit}`],
+            { cwd: probeCwd, stdio: ["ignore", "ignore", "ignore"] });
+          isRef = true;
+        } catch { /* not a ref → all positionals are pathspecs */ }
+        if (!isRef) scope = { scope: "paths", pathspecs: (d as { allPathspecs?: string[] }).allPathspecs ?? d.pathspecs, fromTree: false };
       }
       const dirty = _discardStatusPorcelain(probeCwd, scope);
       if (dirty === true) return _worktreeDiscardBlockReason(d, probeCwd, null);
