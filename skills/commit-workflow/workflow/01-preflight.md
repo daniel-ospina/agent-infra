@@ -251,6 +251,47 @@ Store as `TIER` for subsequent steps. Write the marker file — the only channel
 echo "$TIER" > /tmp/agent-issue-complexity
 ```
 
+### Pipeline-Artifact Preflight (#792)
+
+The `pipeline-compliance` required check reads **artifacts that must exist before
+implementation begins** — a scoping comment (check b) and, for
+`complexity:standard`/`complex`, a plan doc or a `Wiring` table (check d). Nothing else in
+the pipeline consults them until the PR exists, so an unscoped standard issue otherwise
+pays the whole gate cost **twice**: tests + review loop + PR → blocked merge → retro
+artifact → the added file invalidates the reviewed SHA → re-review (#745 / PR #778).
+
+Run the gate's own issue-side checks **now** — one invocation, seconds, no `gh` surprise
+at merge time:
+
+```bash
+if [ "$ISSUE_NUMBER" != "none" ]; then
+  bash scripts/check-pipeline-compliance.sh --issue-only "$ISSUE_NUMBER" || echo "⛔ BLOCK: fix the artifacts above before implementing."
+fi
+```
+
+`--issue-only` evaluates **exactly the checks that need no PR** and skips the rest, reusing
+the same code path, tier rules, and remedy text as the merge-time run:
+
+| Check | `--issue-only` (pre-PR) | Merge-time run |
+|-------|------------------------|----------------|
+| a. linked issue | skipped — there is no PR body yet | enforced |
+| b. scoping comment (`<!-- issue-scoping:`) | **enforced** | enforced |
+| c. code-review evidence | skipped — no PR body/commits yet | enforced |
+| d. plan doc | **`Wiring` branch only** — the `docs/plans/*.md` branch reads the PR diff | enforced (both branches) |
+| e. test-coverage evidence | skipped — no diff/body yet | enforced |
+
+Tier exemptions are identical to the merge-time run: `complexity:micro` skips b–d (a micro
+issue exits 0 with no artifacts); an **unlabeled** issue is treated as non-micro, so check b
+still applies — which is why a `bug`/`improvement` issue with no `complexity:*` label needs
+the scoping comment too. `PIPELINE_COMPLIANCE_ISSUE_ONLY=1 PIPELINE_COMPLIANCE_ISSUE=<N>`
+is the env equivalent of the flag.
+
+**On failure — BLOCK.** Both remedies are plan-phase artifacts, not code: post the scoping
+comment (issue-scoping — the `Wiring` table is part of its output) and/or write the plan doc
+(`docs/plans/YYYY-MM-DD-issue-NNN-slug.md`, writing-plans). Doing it here costs seconds;
+doing it after the review loop costs the review loop. This step does **not** change the
+gate's verdict logic — the merge-time run is byte-for-byte the same gate.
+
 ### Micro Tier Auto-Detection & Gate Behavior
 
 When `TIER = Micro` or auto-detected (1 file, <20 added lines, no migrations, or docs/CSS/static-only per 02-commit-pr.md Step 1.5).
