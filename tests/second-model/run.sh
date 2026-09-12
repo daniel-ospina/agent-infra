@@ -357,14 +357,19 @@ echo "12c. Real-git base-state path (G3) — temp repo with the designation on m
 # bootstrap WARN forever. The FAIL_ALL cases 6w/6x drive the REAL git path
 # (no PIPELINE_SECOND_MODEL_BASE_FILE seam) and are opt-in, so this suite runs
 # them from a temp repo whose main carries the designation while origin/main
-# and HEAD^ do not.
+# does not. H3: the repo has TWO commits, so HEAD^ DOES resolve while lacking
+# the designation — case 6x exercises a resolving-but-wrong fallback (a
+# single-commit repo made HEAD^ unresolvable and the case passed vacuously).
 TMPREPO="$(mktemp -d /tmp/second-model-gitrepo.XXXXXX)"
 mkdir -p "$TMPREPO/scripts" "$TMPREPO/pi-bootstrap/pi-config"
 cp "$ROOT/scripts/check-pipeline-compliance.sh" "$ROOT/scripts/check-second-model.sh" "$TMPREPO/scripts/"
-cp "$SHIPPED" "$ROOT/pi-bootstrap/pi-config/models.json" "$TMPREPO/pi-bootstrap/pi-config/"
+cp "$ROOT/pi-bootstrap/pi-config/models.json" "$TMPREPO/pi-bootstrap/pi-config/"
 git -C "$TMPREPO" init -q -b main
 git -C "$TMPREPO" add scripts pi-bootstrap
-git -C "$TMPREPO" -c user.email=test@example.com -c user.name=test commit -qm "init"
+git -C "$TMPREPO" -c user.email=test@example.com -c user.name=test commit -qm "init (no designation)"
+cp "$SHIPPED" "$TMPREPO/pi-bootstrap/pi-config/second-model.json"
+git -C "$TMPREPO" add pi-bootstrap/pi-config/second-model.json
+git -C "$TMPREPO" -c user.email=test@example.com -c user.name=test commit -qm "add designation"
 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 PIPELINE_SECOND_MODEL_GIT_CASES=1 \
   GH_REPO=daniel-ospina/agent-infra \
   PIPELINE_SECOND_MODEL_LIVE_DIR="$TMPREPO/pi-bootstrap/pi-config" \
@@ -373,7 +378,7 @@ code=$?
 if [ "$code" -eq 1 ]; then pass "real-git FAIL_ALL simulation ran (exit 1 by design)"; else fail "real-git simulation expected exit 1, got $code"; tail -25 "$OUT"; fi
 for marker in \
   "pass 6w: check (f) FAILS on an absent-but-well-formed real GITHUB_BASE_SHA (real git path)" \
-  "pass 6x: check (f) FAILS when a raw-sha PIPELINE_BASE_REF is absent and no fallback ref resolves"; do
+  "pass 6x: check (f) FAILS when a raw-sha PIPELINE_BASE_REF is absent and a fallback ref resolves but lacks the file"; do
   grep -q "✅ $marker" "$OUT" && pass "$marker" || { fail "missing real-git marker: $marker"; tail -15 "$OUT"; }
 done
 rm -rf "$TMPREPO"

@@ -410,11 +410,20 @@ second_model_base_state() {
              "${PIPELINE_BASE_REF:-}" "origin/main" "HEAD^"; do
     [ -n "$ref" ] || continue
     case "$ref" in origin/) continue ;; esac
-    git -C "$root" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1 || continue
-    if git -C "$root" show "${ref}:pi-bootstrap/pi-config/second-model.json" >/dev/null 2>&1; then
-      printf 'present'; return 0
+    if git -C "$root" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1; then
+      if git -C "$root" show "${ref}:pi-bootstrap/pi-config/second-model.json" >/dev/null 2>&1; then
+        printf 'present'; return 0
+      fi
+      printf 'absent'; return 0
     fi
-    printf 'absent'; return 0
+    # H3: a SHA-shaped ref that does not resolve is UNRESOLVABLE, never
+    # "absent". The old loop `continue`d past it, so an absent-but-well-formed
+    # `PIPELINE_BASE_REF` fell through to a resolving fallback and reported
+    # "absent" → the bootstrap WARN → check (f) silently disabled. Named refs
+    # (origin/main, HEAD^) still continue — they are best-effort fallbacks.
+    if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+      printf 'unresolvable'; return 0
+    fi
   done
   printf 'unresolvable'; return 0
 }
@@ -1050,7 +1059,7 @@ ${smline}"
       rm -f "$log"
     }
     sm_git_case 6w "FAILS on an absent-but-well-formed real GITHUB_BASE_SHA (real git path)" "$SM_ABSENT_SHA" ""
-    sm_git_case 6x "FAILS when a raw-sha PIPELINE_BASE_REF is absent and no fallback ref resolves" "" "$SM_ABSENT_SHA"
+    sm_git_case 6x "FAILS when a raw-sha PIPELINE_BASE_REF is absent and a fallback ref resolves but lacks the file" "" "$SM_ABSENT_SHA"
   fi
   unset PIPELINE_SECOND_MODEL_BASE_FILE PIPELINE_SECOND_MODEL_LIVE_DIR PR_HEAD_SHA
   exit 1
