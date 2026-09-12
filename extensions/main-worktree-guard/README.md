@@ -103,15 +103,23 @@ mid-line, honouring the escaped-whitespace rule) are NOT discards; code heredocs
 `env|nice|nohup|command|timeout N bash <<EOF`, and any list-form consumer such as
 `true && bash <<EOF` / `set -e; bash <<EOF`) and executable scripts
 (`./undo.sh`, `bash undo.sh`, `/bin/sh undo.sh`, `busybox sh undo.sh`, and a
-script PIPED into a shell — `cat undo.sh | bash`) ARE walked
-(bounded depth 3, 64KB), quote/escape-concat verb names (`g"it"`, `'g'it`,
+script PIPED into a shell — `cat undo.sh | bash`; alternate shells `ash`/`mksh`/`oksh`
+and a redirection before the interpreter — `2>/dev/null bash <<EOF` — included) ARE
+walked (bounded depth 3, 64KB), quote/escape-concat verb names (`g"it"`, `'g'it`,
 `g\it`) are resolved by the tokenizer (the arm's pre-bail is quote-aware), ANSI-C
 command words (`$'\x67it'`) are decoded when they form a plain word, and backtick
 substitution (`` `git checkout -- f` ``), a quoted `$( … )` substitution, and an
 in-command git alias (`git -c alias.z='checkout --' z f`, `git config alias.zz …
-&& git zz f`) are resolved too. A data heredoc no longer swallows the NEXT
+&& git zz f`) are resolved too. The substitution passes run on the STRIPPED text,
+so heredoc data and `#` comments cannot produce phantom descriptors. An
+UNQUOTED heredoc delimiter is a shell word (`<<E-O-F`, `<<EOF.txt`), not
+word-characters only. A data heredoc no longer swallows the NEXT
 command word: the delimiter is re-emitted so the shared walker's `<<` + operand
-skip consumes the placeholder, not the following `git`.
+skip consumes the placeholder, not the following `git`. **Also fail-closed**: a
+here-string or process substitution feeding an interpreter (`bash <<< 'git
+checkout -- f'`, `bash <(printf 'git checkout -- f')`) and an opaque interpreter
+`-c` payload (`S=…; bash -c "$S"` — resolved when the assignment is in the same
+command, else blocked when the command mentions a discard verb).
 
 The decision (`discardDestroysWip`) is pure and unit-tested: scope `all`
 blocks on ANY tracked porcelain entry; scope `paths` blocks on a
@@ -119,7 +127,8 @@ worktree-vs-index difference (`Y ≠ ' '`) — a `fromTree` source (a commit/tre
 restore or a `--staged` index reset) additionally destroys a staged-only change
 (`X ≠ ' '`). Index-sourced operations (`checkout-index`, plain `apply -R`)
 therefore use `fromTree: false` even at whole-tree scope — a staged-only entry
-is already in the worktree and survives them. **Allowed**: untracked-only dirt
+is already in the worktree and survives them. `git restore` with no pathspec (a git usage error) and `echo <<< 'git checkout …'`
+(a non-interpreter here-string) are inert. **Allowed**: untracked-only dirt
 (`checkout -- .` never deletes `??`), staged-only changes for an
 index-source restore, clean targets, `git restore --staged` (index-only), and
 every read-only command. Unresolvable targets (`$VAR` pathspec, unresolvable
@@ -904,7 +913,7 @@ marker fixes **guard-blocked** sessions only.
 |---|---|---|
 | `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
-| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc + list-form-heredoc + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), and both escape hatches |
+| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), and both escape hatches |
 
 `test-module-load.mjs` exists because of a real regression (#744): #697 added a
 rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)

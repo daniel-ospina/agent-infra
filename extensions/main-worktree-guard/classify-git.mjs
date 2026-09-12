@@ -2099,9 +2099,10 @@ function _wtDiscardFromRestore(args) {
     pathspecs.push(t);
   }
   if (pathspecs.length === 0) {
-    // `git restore` with no pathspec is a usage error — but under xargs the
-    // list is supplied at runtime → conservative scope `all`.
-    return { scope: "all", pathspecs: [], fromTree, form: "restore-pathspec-empty" };
+    // `git restore` with no pathspec is a usage error (git does nothing) — the
+    // round-1 xargs case is covered by the extractor's feeder fallback
+    // (reviewer round-6 P2 false positive).
+    return null;
   }
   return { scope: "paths", pathspecs, fromTree, form: "restore-worktree" };
 }
@@ -2216,7 +2217,7 @@ function _wtDiscardFromApply(args) {
  */
 const _WT_SPAWNER_WORDS = new Set(["env", "nice", "nohup", "command", "sudo", "doas", "setsid", "stdbuf", "time", "timeout", "exec", "ionice", "busybox"]);
 const _WT_KEYWORDS = new Set(["then", "do", "else", "elif", "if", "while", "until", "for", "done", "fi", "esac", "case", "in", "!", "time", "eval", "true", "false", ":", "set", "export", "declare", "local", "return", "test", "cd", "shopt"]);
-const _WT_SHELL_WORDS = /^(?:bash|sh|zsh|dash|ksh|fish|csh|tcsh|source|\.)$/;
+const _WT_SHELL_WORDS = /^(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh|fish|csh|tcsh|source|\.)$/;
 const _WT_CODE_WORDS = /^(?:python[0-9.]*|perl|ruby|node|nodejs|pwsh|powershell|deno|osascript|php|lua|Rscript)$/;
 
 /**
@@ -2236,9 +2237,11 @@ function _wtHeadInterpreter(line) {
     const t = toks[i];
     if (isInterp(t)) return t;
     if (i === 0) {
-      // Only a spawner / shell keyword / env-assignment / flag may precede the
-      // interpreter (`then bash <<EOF`, `do bash <<EOF`).
-      const ok = _WT_SPAWNER_WORDS.has(t) || _WT_KEYWORDS.has(t) || t.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(t);
+      // Only a spawner / shell keyword / env-assignment / flag / REDIRECTION
+      // may precede the interpreter (`then bash <<EOF`, `2>/dev/null bash
+      // <<EOF` — reviewer round-6 P1).
+      const ok = _WT_SPAWNER_WORDS.has(t) || _WT_KEYWORDS.has(t) || t.startsWith("-") ||
+        /^[A-Za-z_][A-Za-z0-9_]*=/.test(t) || /^[0-9]*[<>]/.test(t);
       if (!ok) return null;
     }
   }
@@ -2345,7 +2348,11 @@ function _wtScanLine(line, carry) {
       let q = null;
       if (line[j] === "'" || line[j] === '"') { q = line[j]; j++; }
       let d = "";
-      while (j < line.length && (q ? line[j] !== q : /[A-Za-z0-9_]/.test(line[j]))) { d += line[j]; j++; }
+      // An UNQUOTED delimiter is a shell word: it stops at whitespace / shell
+      // metacharacters, NOT at the first non-word char. Stopping early (`<<E-O-F`
+      // → delimiter `E`) left the terminator unmatched, so the body swallowed
+      // every following line — including a later discard (reviewer round-6 P1).
+      while (j < line.length && (q ? line[j] !== q : !/[\s;&|<>(){}'"\\]/.test(line[j]))) { d += line[j]; j++; }
       if (q && line[j] === q) j++;
       if (d && delim === null) delim = d;
       // Re-emit the delimiter so the walker's `<<` + operand skip consumes the
@@ -2526,6 +2533,39 @@ function _wtSubstSpans(text) {
 const _WT_FAMILY_VERBS = new Set(["checkout", "restore", "switch", "reset", "checkout-index", "rm", "read-tree", "apply"]);
 
 /**
+ * Payloads a shell interpreter reads from its STDIN: here-strings
+ * (`bash <<< 'git checkout -- f'`) and process substitution
+ * (`bash <(printf 'git checkout -- f')`) on a line whose head IS a shell
+ * interpreter. The shared walker cannot resolve these as command words, so the
+ * caller fails closed when one mentions a discard-family verb. A non-interpreter
+ * head (`echo <<< "git …"`, `diff <(ls) <(ls)`) is inert and skipped
+ * (reviewer round-6 P1).
+ */
+function _wtStdinPayloads(text) {
+  const out = [];
+  for (const line of String(text ?? "").split("\n")) {
+    if (!line.includes("<<<") && !line.includes("<(")) continue;
+    const head = _wtHeadInterpreter(line);
+    if (head === null || !_WT_SHELL_WORDS.test(basename(String(head)))) continue;
+    const hs = /<<<\s*(?:'([^']*)'|"([^"]*)"|(\S+))/.exec(line);
+    if (hs) out.push(hs[1] ?? hs[2] ?? hs[3] ?? "");
+    for (let i = line.indexOf("<("); i !== -1; i = line.indexOf("<(", i + 2)) {
+      let depth = 1;
+      let j = i + 2;
+      let buf = "";
+      while (j < line.length && depth > 0) {
+        const c = line[j];
+        if (c === "(") depth++;
+        else if (c === ")") { depth--; if (depth === 0) break; }
+        buf += c; j++;
+      }
+      if (buf.trim()) out.push(buf);
+    }
+  }
+  return out;
+}
+
+/**
  * Extract every working-tree-discard invocation from a shell command (#709).
  * @param {string} command
  * @returns {Array<{form: string, scope: string, pathspecs: string[], fromTree: boolean, verb: string, args: string[], inv: any}>}
@@ -2535,7 +2575,22 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
   const unhandled = [];
   try {
     const codeBodies = [];
-    const invs = allGitInvocations(_wtStripHeredocData(_wtAnsiDecode(command), codeBodies));
+    // ONE stripped text feeds every scan: heredoc DATA bodies and `#` comments
+    // are removed there, so the substitution passes below cannot surface a
+    // phantom discard from data (`cat <<EOF … $(git checkout -- f) … EOF`)
+    // — reviewer round-6 P2. SHELL code-heredoc bodies stay in `stripped`, so
+    // real substitutions inside them remain reachable.
+    const stripped = _wtStripHeredocData(_wtAnsiDecode(command), codeBodies);
+    const invs = allGitInvocations(stripped);
+    // Here-strings (`bash <<< 'git checkout -- f'`) and process substitution
+    // (`bash <(printf 'git checkout -- f')`) feed an interpreter from a payload
+    // the walker cannot resolve as a command word — fail closed when such a
+    // payload mentions a discard-family verb (reviewer round-6 P1).
+    for (const payload of _wtStdinPayloads(stripped)) {
+      if (/(?:^|\s)(?:git\s+)?(?:checkout|restore|switch|reset|rm|apply|read-tree|checkout-index)\b/.test(payload)) {
+        out.push({ form: "stdin-payload", scope: "all", pathspecs: [], fromTree: true, verb: "stdin", args: [], inv: null, unverifiable: true });
+      }
+    }
     const aliases = _depth < 2 ? _wtInlineAliases(command) : {};
     for (const inv of invs) {
       const verb = inv?.verb;
@@ -2586,14 +2641,15 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
         }
       }
     }
-    // Backtick command substitution: the walker does not descend into it
-    // (reviewer round-3 P2). Recurse, bounded like the heredoc walk.
+    // Backtick / `$( … )` command substitution: the walker does not descend
+    // into a quoted span (reviewer round-3/5 P2). Scanned on the STRIPPED text
+    // so heredoc data and comments cannot produce phantom descriptors
+    // (round-6 P2). Recurse, bounded like the heredoc walk.
     if (_depth < 2) {
-      for (const span of _wtBacktickSpans(command)) {
+      for (const span of _wtBacktickSpans(stripped)) {
         for (const nested of extractWorkingTreeDiscards(span, _depth + 1)) out.push(nested);
       }
-      // Quoted `$( … )` is invisible to the walker too (round-5 P2).
-      for (const span of _wtSubstSpans(command)) {
+      for (const span of _wtSubstSpans(stripped)) {
         for (const nested of extractWorkingTreeDiscards(span, _depth + 1)) out.push(nested);
       }
     }

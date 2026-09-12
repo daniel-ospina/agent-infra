@@ -145,7 +145,7 @@ No change to `classifyGitCommand`/`classifyGitCommandDetailed` verdicts → the 
 | hatches | unit | env hatch + marker bypass M5 |
 | module load | unit | `test-module-load.mjs` stays **49 passed / 0 failed** |
 | full suite | unit | `test.mjs` no new failures (baseline on `origin/main`: 1786 passed / 2 failed) |
-| behavioral | new suite | `test-discard-gate.mjs` 242 passed / 0 failed |
+| behavioral | new suite | `test-discard-gate.mjs` 254 passed / 0 failed |
 
 Reviewer round-3 fold-in: `git checkout --ours/--theirs/-m/--merge/--conflict=`
 now yields a descriptor instead of being exempt outright — they are conflict
@@ -194,6 +194,18 @@ whole-tree scope). `extractScriptPath`'s basename matching is now
 ABSOLUTE-ONLY — matching `./time evil.sh`'s basename had retired the M4
 script-content closure for colliding names. Residual: a script run from inside a
 shell FUNCTION body (`f(){ bash /tmp/undo.sh; }; f`).
+
+Reviewer round-6 fold-in: an UNQUOTED heredoc delimiter is read as a shell word
+(`cat <<E-O-F`, `<<EOF.txt` — stopping at the first non-word char left the
+terminator unmatched and swallowed every later line, including a discard); a
+REDIRECTION before the interpreter (`2>/dev/null bash <<EOF`) no longer defeats
+head resolution; `ash`/`mksh`/`oksh` joined the shell set; the substitution
+passes now run on the STRIPPED text (heredoc data and `#` comments produced
+phantom descriptors); here-strings (`bash <<< 'git checkout -- f'`) and process
+substitution (`bash <(printf 'git checkout -- f')`) feeding an interpreter fail
+closed, as does an opaque interpreter `-c` payload (`S=…; bash -c "$S"` —
+resolved when the assignment is in the same command); and bare `git restore`
+(a git usage error) is allow again.
 
 ## Non-goals / residuals
 

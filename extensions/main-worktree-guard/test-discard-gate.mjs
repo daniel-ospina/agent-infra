@@ -251,6 +251,9 @@ for (const cmd of [
   'f() { git "$@"; }; f restore src/x.ts',
   "printf 'src/x.ts\\n' | xargs git checkout",
   "find . -name src -exec git checkout-index -f {} \\;",
+  "bash <<< 'git checkout -- src/x.ts'",
+  "bash <(printf 'git checkout -- src/x.ts')",
+  "bash < <(printf 'git checkout -- src/x.ts')",
 ]) {
   const d = first(cmd);
   expectTrue(`A2d: ${cmd} → fail-closed descriptor`,
@@ -473,6 +476,14 @@ async function partB() {
       ["xargs-fed pathspec (`printf … | xargs git checkout`)", "printf 'dirty.txt\\n' | xargs git checkout"],
       ["`$VAR` script path (`bash $S`)", `S=${execUndo}; bash $S`],
       ["script piped into a shell (`cat undo.sh | bash`)", `cat ${execUndo} | bash`],
+      // ── reviewer round-6 closures ──
+      ["punctuated heredoc delimiter (`cat <<E-O-F`)", "cat <<E-O-F\nx\nE-O-F\ngit checkout -- dirty.txt"],
+      ["dotted heredoc delimiter (`cat <<EOF.txt`)", "cat <<EOF.txt\nx\nEOF.txt\ngit checkout -- dirty.txt"],
+      ["redirection before the interpreter (`2>/dev/null bash <<EOF`)", "2>/dev/null bash <<'EOF'\ngit checkout -- dirty.txt\nEOF"],
+      ["alternate shell (`ash <<EOF`)", "ash <<'EOF'\ngit checkout -- dirty.txt\nEOF"],
+      ["here-string into an interpreter (`bash <<< 'git checkout -- f'`)", "bash <<< 'git checkout -- dirty.txt'"],
+      ["process substitution into an interpreter (`bash <(printf …)`)", "bash <(printf 'git checkout -- dirty.txt')"],
+      ["opaque interpreter `-c` payload (`S=…; bash -c \"$S\"`)", 'S="git checkout -- dirty.txt"; bash -c "$S"'],
     ];
     for (const [why, cmd] of bypass) {
       const r = await bash(cmd, wt);
@@ -525,6 +536,10 @@ async function partB() {
     expectTrue("B6i: `git restore --staged --pathspec-from-file=<list>` ALLOWED (index-only)",
       allowed(await bash(`git restore --staged --pathspec-from-file=${psf}`, wt)), "was blocked");
     rmSync(psf, { force: true });
+    expectTrue("B6i: bare `git restore` ALLOWED (git usage error, no-op)",
+      allowed(await bash("git restore", wt)), "was blocked");
+    expectTrue("B6i: `echo <<< '…'` ALLOWED (non-interpreter here-string)",
+      allowed(await bash("echo <<< 'git checkout -- dirty.txt'", wt)), "was blocked");
     gg("reset -q staged.txt", wt);
 
     // ── B7: staged-only change survives `checkout --` but not a tree source ──

@@ -1295,6 +1295,31 @@ function _worktreeDiscardBlock(command: string): string | null {
     sets.push({ discs: extractWorkingTreeDiscards(payload) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
   }
 
+  // Interpreter `-c` payloads are the symmetric surface: `allGitInvocations`
+  // resolves a LITERAL payload, but an opaque one (`bash -c "$S"`,
+  // `bash -c "$(printf 'git checkout -- f')"`) yields no invocation at all.
+  // Resolve a same-command assignment (`S=…; bash -c "$S"`) and probe the
+  // value; otherwise fail closed ONLY when the command mentions a
+  // discard-family verb (reviewer round-6 P1).
+  for (const m of String(command).matchAll(/(?:^|[;&|(])\s*(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh)\s+(?:-c|--command)\s+(\S+)/g)) {
+    const payload = m[1] ?? "";
+    if (!/[$`]/.test(payload)) continue; // a literal payload is already walked
+    const bare = payload.replace(/^["']|["']$/g, "");
+    const vm = /^\$(\w+)$|^\$\{(\w+)\}$/.exec(bare);
+    const name = vm?.[1] ?? vm?.[2];
+    if (name) {
+      const am = new RegExp(`(?:^|[;&\\s])${name}=("[^"]*"|'[^']*'|\\S+)`).exec(String(command));
+      if (am) {
+        const val = String(am[1]).replace(/^["']|["']$/g, "");
+        sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+        continue;
+      }
+    }
+    if (/(checkout|restore|switch|reset|read-tree|rm|apply)/.test(String(command))) {
+      return _worktreeDiscardBlockReason({ form: "interpreter-c-payload", scope: "all", pathspecs: [] }, execCwd, "an interpreter `-c` payload is not statically resolvable");
+    }
+  }
+
   if (sets.every((s) => s.discs.length === 0)) return null;
 
   for (const set of sets) {
