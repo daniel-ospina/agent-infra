@@ -28,8 +28,11 @@
 # `--second-model-independent <yes|NO|DEGRADED>`) is REQUIRED with it and must
 # be one of those three values — there is no default, because a missing value
 # must not be laundered into an implicit `yes`. The model slot must be a real
-# provider/id; the reserved `**DEGRADED` marker is accepted ONLY with
-# independent=DEGRADED (a reserved value is never an independent reviewer).
+# provider/id; the reserved `**DEGRADED` marker (and the placeholders
+# `none`/`null`/`n/a`/`unknown`) is accepted ONLY with independent=DEGRADED (a
+# reserved value is never an independent reviewer). A NEW second-model marker
+# REPLACES any prior one in the body rather than stacking (check (f) fails
+# closed on conflicting markers).
 # check (f) in scripts/check-pipeline-compliance.sh is the mechanical
 # consumer: on a diff touching the guarded surface it requires the line and
 # FAILS on `independent=NO` / `independent=DEGRADED` / a build-equivalent id /
@@ -142,12 +145,13 @@ if [ -n "$SECOND_MODEL_GATE_MODEL" ]; then
     yes|NO|DEGRADED) ;;
     *) echo "SECOND_MODEL_GATE_INDEPENDENT must be yes|NO|DEGRADED when SECOND_MODEL_GATE_MODEL is set (got '${SECOND_MODEL_GATE_INDEPENDENT:-}'); refusing to record" >&2; exit 2 ;;
   esac
-  # C3(a): the model slot must be a real provider/id, or the reserved DEGRADED
-  # marker — which is accepted ONLY with independent=DEGRADED. `model=**DEGRADED
-  # independent=yes` would otherwise be recorded and read by check (f) as a
-  # resolved independent reviewer, laundering a degraded outcome into a pass.
+  # C3(a)/G5: the model slot must be a real provider/id, or a RESERVED
+  # placeholder — which is accepted ONLY with independent=DEGRADED. Reserved
+  # covers `**DEGRADED`/`DEGRADED` and the placeholders `none`/`null`/`n/a`/
+  # `unknown` (G5): `model=none independent=yes` used to be recorded and read by
+  # check (f) as a resolved independent reviewer.
   _sm_lc="$(printf '%s' "$SECOND_MODEL_GATE_MODEL" | tr 'A-Z' 'a-z')"
-  if [ "$_sm_lc" = "degraded" ] || printf '%s' "$_sm_lc" | grep -qE '^\*+degraded$'; then
+  if printf '%s' "$_sm_lc" | grep -qE '^(\**degraded|none|null|n/?a|unknown)$'; then
     if [ "$SECOND_MODEL_GATE_INDEPENDENT" != "DEGRADED" ]; then
       echo "SECOND_MODEL_GATE_MODEL=$SECOND_MODEL_GATE_MODEL is the reserved DEGRADED marker but SECOND_MODEL_GATE_INDEPENDENT=$SECOND_MODEL_GATE_INDEPENDENT — a reserved value is never an independent reviewer; use independent=DEGRADED (refusing to record)" >&2
       exit 2
@@ -364,11 +368,16 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
   # not silently skip the evidence post; the gate would fail with no trace).
+  # G10: a NEW second-model marker REPLACES any prior one rather than stacking —
+  # check (f) now fails closed on conflicting markers, so a re-record at a new
+  # head/model must supersede the old line (append-and-never-remove made a
+  # stale `independent=DEGRADED` fatal to the gate forever).
   MISSING=""
   if ! printf '%s' "$BODY" | grep -qF "$MARKER"; then
     MISSING="$MARKER"
   fi
   if [ -n "$SM_MARKER" ] && ! printf '%s' "$BODY" | grep -qF "$SM_MARKER"; then
+    BODY="$(printf '%s\n' "$BODY" | grep -v -F '[SECOND-MODEL-GATE]' || true)"
     if [ -n "$MISSING" ]; then
       MISSING="${MISSING}
 ${SM_MARKER}"
