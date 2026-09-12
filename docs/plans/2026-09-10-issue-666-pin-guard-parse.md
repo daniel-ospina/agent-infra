@@ -635,6 +635,25 @@ analysed anywhere — the stub change *is* the fix. #808 (same change) lets the 
 authenticated child skip the item-6b real-`bash` runs and the `--head-ref` end-to-end fixtures the
 parent has already proved, without changing what the parent asserts.
 
+### #821 (follow-up, 2026-09-13) — the trusted leg validates the MERGE RESULT, not the head
+
+`workflow-lock.yml` passed `pull_request.head.sha` to the checker. The head is the **pre-merge**
+state, so any branch cut before a guarded workflow changed carried the *old* files, failed assertions
+for files it had never touched, and was told to "restore the line" it had never removed — while
+merging would in fact have left the **base** branch's valid copies in place. Measured on its first
+real PR run (#785, two markdown lines, 11 commits behind): both the `ci.yml` accumulator and the
+`ci-main.yml` invocation line reported missing, neither of which that PR touched, and the check went
+green the moment the branch was updated. The leg now passes `pull_request.merge_commit_sha` — the ref
+whose tree would actually **land** — which is also the only ref where "the PR changed this file AND
+the base branch changed it since" exists at all. `merge_commit_sha` is null while a PR conflicts with
+its base, so the step fails closed with its **own** message ("this is NOT a finding about your
+workflow files") instead of reporting a spurious workflow finding. Pinned by the wiring test, which
+now reads `env.MERGE_SHA` and the `run` block as **parsed nodes** and asserts both the value and the
+presence of the null guard; both were verified non-vacuous by mutating the live workflow (env
+reverted to `head.sha` → RED; null guard removed → RED). The flag keeps its historical name
+`--head-ref`; its contract is now documented as "the ref whose tree would land", because renaming it
+touches ~70 references for no behavioural gain.
+
 ## Out of Scope
 
 | Item | Owner / disposition |
