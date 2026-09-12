@@ -2048,7 +2048,17 @@ function _wtDiscardFromCheckout(args) {
     if (pos.length === 0) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-patch-all" };
     return { scope: "paths", pathspecs: pos, fromTree: false, form: "checkout-patch" };
   }
-  if (_wtDiscardForce(a)) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-force" };
+  if (_wtDiscardForce(a)) {
+    // `git checkout -f <one token>`: a REF is a forced switch (discards ALL
+    // local changes → whole-tree scope); a PATH restores just that path. The
+    // handler's `rev-parse` probe resolves it (reviewer round-5 P2 false
+    // positive: `git checkout -f clean.txt` blocked on an unrelated dirty
+    // file).
+    if (!creates && pos.length === 1) {
+      return { scope: "all", pathspecs: pos, fromTree: false, form: "checkout-force", ambiguousRef: true, refIsAll: true };
+    }
+    return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-force" };
+  }
   // A single bare token is ref-or-path (see above) — checked LAST so
   // `-f main` / `-p f` keep their force/patch semantics.
   if (!creates && pos.length === 1) {
@@ -2059,7 +2069,6 @@ function _wtDiscardFromCheckout(args) {
 
 function _wtDiscardFromRestore(args) {
   const a = args ?? [];
-  if (_wtHasPathspecFile(a)) return { scope: "all", pathspecs: [], fromTree: true, form: "restore-pathspec-file", unverifiable: true };
   const stagedTok = a.find((t) => _wtLongPrefix(t, "--staged") || t === "-S" || _wtDiscardShortCluster([t], "S"));
   // `--source=<rev>` (the `=` spelling) AND `-s <rev>` / `--source <rev>`.
   const sourceTok = a.find((t) => _wtLongPrefix(t, "--source") || String(t).startsWith("--source=") || t === "-s" || /^-s\S/.test(String(t)));
@@ -2069,8 +2078,12 @@ function _wtDiscardFromRestore(args) {
   const ambiguous = !!stagedTok && !!sourceTok && stagedTok === sourceTok && String(stagedTok).startsWith("--");
   const staged = !!stagedTok && !ambiguous;
   const worktree = !!worktreeTok;
-  // Index-only restore is explicitly non-destructive (#709).
+  // Index-only restore is explicitly non-destructive (#709) — checked BEFORE
+  // the fail-closed pathspec-file branch, or `git restore --staged
+  // --pathspec-from-file=list` would block an index-only reset (reviewer
+  // round-5 P2).
   if (staged && !worktree) return null;
+  if (_wtHasPathspecFile(a)) return { scope: "all", pathspecs: [], fromTree: true, form: "restore-pathspec-file", unverifiable: true };
   // A `--source=<tree>` WITHOUT `--staged` restores the WORKTREE only — the
   // index keeps the staged blob, so a staged-only change is recoverable and
   // must not block (reviewer round-4 P2). The index is reset only when
@@ -2245,18 +2258,23 @@ function _wtOpenerSegment(line) {
   const segs = [];
   let cur = "";
   let quote = null;
+  let opened = -1; // index of the segment owning the first UNQUOTED `<<`
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (quote) { if (ch === quote) quote = null; cur += ch; continue; }
     if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; continue; }
     if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    // A QUOTED `<<` (`echo 'a<<b' && bash <<EOF`) must not claim the opener —
+    // that demoted the real shell heredoc to data and blanked its body
+    // (reviewer round-5 P1).
+    if (ch === "<" && s[i + 1] === "<" && opened === -1) { opened = segs.length; cur += "<<"; i++; continue; }
     if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === "{" || ch === "}" || ch === ")") {
       segs.push(cur); cur = ""; continue;
     }
     cur += ch;
   }
   segs.push(cur);
-  return segs.find((seg) => seg.includes("<<")) ?? s;
+  return opened >= 0 ? segs[opened] : s;
 }
 
 /** A shell executes its stdin heredoc as SHELL text; a code interpreter
@@ -2282,20 +2300,38 @@ function _wtLinePipesToInterpreter(line) {
  *  `#` starts a comment only at a WORD START — after real whitespace or a list
  *  operator, not after an ESCAPED whitespace. Testing the raw preceding char
  *  treated `echo a\ #b && git checkout -- f` as a comment and truncated the
- *  live discard off the line (reviewer round-4 P1). */
-function _wtScanLine(line) {
+ *  live discard off the line (reviewer round-4 P1).
+ *
+ *  Two further sharp edges (reviewer round-5 P1):
+ *   - `<<` inside `(( ))`/`$(( ))` ARITHMETIC is a shift operator, not a
+ *     heredoc — opening one blanked the rest of the command.
+ *   - the delimiter is RE-EMITTED after `<<` (it used to be dropped), because
+ *     the shared walker's redirect branch skips `<<` PLUS the next token — with
+ *     the delimiter gone it ate the next real command word, so a discard on a
+ *     later line (`cat <<EOF … EOF` then `git checkout -- f`) was invisible.
+ *  `carry` threads quote/arithmetic state across lines (a `<<` inside a
+ *  multi-line quoted string is not a heredoc either).
+ */
+function _wtScanLine(line, carry) {
   let i = 0;
   let out = "";
-  let quote = null;
+  let quote = carry?.quote ?? null;
+  let arith = carry?.arith ?? 0;
   let delim = null;
-  let atWordStart = true;
+  let atWordStart = carry?.atWordStart ?? true;
   while (i < line.length) {
     const ch = line[i];
     if (quote) {
       if (ch === quote) quote = null;
       out += ch; i++; atWordStart = false; continue;
     }
+    if (arith > 0) {
+      if (ch === "(" && line[i + 1] === "(") { arith++; out += "(("; i += 2; continue; }
+      if (ch === ")" && line[i + 1] === ")") { arith--; out += "))"; i += 2; continue; }
+      out += ch; i++; atWordStart = false; continue;
+    }
     if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; atWordStart = false; continue; }
+    if (ch === "(" && line[i + 1] === "(") { arith++; out += "(("; i += 2; atWordStart = false; continue; }
     if (ch === "'") { quote = ch; out += ch; i++; atWordStart = false; continue; }
     if (ch === '"') { quote = ch; out += ch; i++; atWordStart = false; continue; }
     if (ch === "#" && atWordStart) break; // comment
@@ -2312,12 +2348,16 @@ function _wtScanLine(line) {
       while (j < line.length && (q ? line[j] !== q : /[A-Za-z0-9_]/.test(line[j]))) { d += line[j]; j++; }
       if (q && line[j] === q) j++;
       if (d && delim === null) delim = d;
-      out += "<<";
+      // Re-emit the delimiter so the walker's `<<` + operand skip consumes the
+      // placeholder, never the next real command token. An opener with no
+      // delimiter (`<<` in arithmetic) emits bare `<<`.
+      out += d ? `<< ${d}` : "<<";
       i = j;
       continue;
     }
     out += ch; i++; atWordStart = false;
   }
+  if (carry) { carry.quote = quote; carry.arith = arith; carry.atWordStart = atWordStart; }
   return { text: out, delim };
 }
 
@@ -2325,6 +2365,7 @@ function _wtStripHeredocData(text, codeBodies) {
   const lines = String(text ?? "").split("\n");
   const out = [];
   let pending = null; // { delim, kind, buf }
+  const carry = { quote: null, arith: 0, atWordStart: true };
   for (const line of lines) {
     if (pending) {
       const t = line.trim();
@@ -2338,7 +2379,7 @@ function _wtStripHeredocData(text, codeBodies) {
       out.push("");
       continue;
     }
-    const { text: code, delim } = _wtScanLine(line);
+    const { text: code, delim } = _wtScanLine(line, carry);
     if (delim !== null) pending = { delim, kind: _wtHeredocKind(code), buf: [] };
     out.push(code);
   }
@@ -2431,8 +2472,58 @@ function _wtInlineAliases(command) {
  * grammar-spelling residual (README Residuals 1/3).
  */
 function _wtAnsiDecode(text) {
-  return String(text ?? "").replace(/\$'([^']*)'/g, (_m, body) => _ansiTranslate(body));
+  return String(text ?? "").replace(/\$'([^']*)'/g, (m, body) => {
+    const decoded = _ansiTranslate(body);
+    // Only substitute when the decoded text is a single PLAIN command word.
+    // Decoding arbitrary bytes used to inject real shell syntax into the text
+    // (`echo $'"' ; git checkout -- f` decoded to an unclosed quote and blinded
+    // everything after it) — reviewer round-5 P1.
+    return /^[A-Za-z0-9_./-]+$/.test(decoded) ? decoded : m;
+  });
 }
+
+/**
+ * Quote-aware `$( … )` command-substitution spans (paren-balanced). The shared
+ * walker tokenizes a QUOTED substitution as part of one word and never
+ * descends, so `echo "$(git checkout -- f)"` produced no descriptor — even
+ * though double quotes do not stop substitution (reviewer round-5 P2).
+ */
+function _wtSubstSpans(text) {
+  const s = String(text ?? "");
+  const out = [];
+  let i = 0;
+  let inSingle = false;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "\\") { i += 2; continue; }
+    if (inSingle) { if (ch === "'") inSingle = false; i++; continue; }
+    if (ch === "'") { inSingle = true; i++; continue; }
+    if (ch === "$" && s[i + 1] === "(") {
+      let depth = 1;
+      let j = i + 2;
+      let buf = "";
+      let q = null;
+      while (j < s.length && depth > 0) {
+        const c = s[j];
+        if (q) { if (c === q) q = null; buf += c; j++; continue; }
+        if (c === "'") { q = c; buf += c; j++; continue; }
+        if (c === "\"") { q = c; buf += c; j++; continue; }
+        if (c === "(") depth++;
+        else if (c === ")") { depth--; if (depth === 0) { j++; break; } }
+        buf += c; j++;
+      }
+      if (buf.trim()) out.push(buf);
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return out;
+}
+
+/** The verbs `extractWorkingTreeDiscards` keys on (a feeder-fed invocation of
+ *  one of these with no resolvable pathspec is conservatively whole-tree). */
+const _WT_FAMILY_VERBS = new Set(["checkout", "restore", "switch", "reset", "checkout-index", "rm", "read-tree", "apply"]);
 
 /**
  * Extract every working-tree-discard invocation from a shell command (#709).
@@ -2441,6 +2532,7 @@ function _wtAnsiDecode(text) {
  */
 export function extractWorkingTreeDiscards(command, _depth = 0) {
   const out = [];
+  const unhandled = [];
   try {
     const codeBodies = [];
     const invs = allGitInvocations(_wtStripHeredocData(_wtAnsiDecode(command), codeBodies));
@@ -2448,6 +2540,13 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
     for (const inv of invs) {
       const verb = inv?.verb;
       const args = inv?.args ?? [];
+      // A non-static verb (`git "$@"` behind a shell function, `git $CMD`) is
+      // not statically resolvable — fail closed rather than sail past the
+      // verb-keyed switch (reviewer round-5 P1).
+      if (typeof verb === "string" && /[$`]/.test(verb)) {
+        out.push({ form: "unverifiable-verb", scope: "all", pathspecs: [], fromTree: true, verb, args, inv, unverifiable: true });
+        continue;
+      }
       // An alias-invoked discard has a verb the family does not know — expand
       // the alias we saw defined above and re-extract (round-3 P2). The alias
       // VALUE is a git subcommand (git's `!`-prefixed form is arbitrary shell
@@ -2473,11 +2572,28 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
       else if (verb === "read-tree") d = _wtDiscardFromReadTree(args);
       else if (verb === "apply") d = _wtDiscardFromApply(args);
       if (d) out.push({ ...d, verb, args, inv });
+      if (!d) unhandled.push({ verb, args, inv });
+    }
+    // A FEEDER supplies the pathspec at runtime (`printf 'f\n' | xargs git
+    // checkout`, `find … -exec git checkout-index -f`), so the helper sees zero
+    // positionals and returns null (reviewer round-5 P2). When the command
+    // carries a feeder and a family verb produced no descriptor, fall back to
+    // the conservative whole-tree descriptor — the effect probe still decides.
+    if (/(?:^|[\s|;&(])xargs\b/.test(String(command ?? "")) || /\bfind\b[\s\S]*?-exec\b/.test(String(command ?? ""))) {
+      for (const u of unhandled) {
+        if (u.verb && _WT_FAMILY_VERBS.has(u.verb)) {
+          out.push({ form: "feeder-pathspec", scope: "all", pathspecs: [], fromTree: false, verb: u.verb, args: u.args, inv: u.inv });
+        }
+      }
     }
     // Backtick command substitution: the walker does not descend into it
     // (reviewer round-3 P2). Recurse, bounded like the heredoc walk.
     if (_depth < 2) {
       for (const span of _wtBacktickSpans(command)) {
+        for (const nested of extractWorkingTreeDiscards(span, _depth + 1)) out.push(nested);
+      }
+      // Quoted `$( … )` is invisible to the walker too (round-5 P2).
+      for (const span of _wtSubstSpans(command)) {
         for (const nested of extractWorkingTreeDiscards(span, _depth + 1)) out.push(nested);
       }
     }
@@ -7545,6 +7661,13 @@ const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "source"
  */
 export function extractScriptPath(command) {
   const tokens = _tokenize(command);
+  // Reviewer round-5 P2 regression guard: basename matching must apply ONLY to
+  // ABSOLUTE tokens (`/bin/sh`, `/usr/bin/env`). Matching a RELATIVE token's
+  // basename retired the M4 script-content closure for colliding names —
+  // `./time evil.sh` (a script named `time`) resolved to null instead of
+  // `./time`, so the script was never read.
+  const isSpawnerTok = (x) => SPAWNER_WORDS.has(x) || (String(x).startsWith("/") && SPAWNER_WORDS.has(basename(String(x))));
+  const isShellTok = (x) => SHELL_INTERPRETERS.has(x) || (String(x).startsWith("/") && SHELL_INTERPRETERS.has(basename(String(x))));
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
@@ -7553,8 +7676,7 @@ export function extractScriptPath(command) {
     // `busybox sh evil.sh` — the applet is the interpreter, not `busybox`
     // (reviewer round-3 P1).
     if (t === "busybox") { i++; continue; }
-    if ((SPAWNER_WORDS.has(t) || SPAWNER_WORDS.has(basename(t))) &&
-        !SHELL_INTERPRETERS.has(t) && !SHELL_INTERPRETERS.has(basename(t))) {
+    if (isSpawnerTok(t) && !isShellTok(t)) {
       // round-17 (P2): `exec bash evil.sh` / `env bash evil.sh` — the OUTER
       // spawner is not the interpreter. Round-18 (P1): jump to the FIRST
       // interpreter past the spawner's flags/operands (`sudo -u root bash
@@ -7566,10 +7688,14 @@ export function extractScriptPath(command) {
       while (k < tokens.length) {
         const n = tokens[k];
         if (_isShellBoundary(n) || n === "&&" || n === "||" || n === "&" || n === "|" || n === "(" || n === ")") break;
-        if (SHELL_INTERPRETERS.has(n) || SHELL_INTERPRETERS.has(basename(n))) { found = true; break; }
+        if (isShellTok(n)) { found = true; break; }
         k++;
       }
       if (found) { i = k; continue; }
+      // No interpreter after the spawner: an ABSOLUTE/relative PATH token is
+      // the script itself (`./time evil.sh`, `/tmp/time evil.sh` — the
+      // round-5 P2 regression guard), a bare spawner word is not.
+      if (/^\.{0,2}\//.test(t)) break;
       i++;
       continue;
     }
@@ -7580,7 +7706,7 @@ export function extractScriptPath(command) {
   }
   if (i >= tokens.length) return null;
   const t = tokens[i];
-  if (SHELL_INTERPRETERS.has(t) || SHELL_INTERPRETERS.has(basename(t))) { // abs path: `/bin/sh evil.sh`
+  if (isShellTok(t)) { // abs path: `/bin/sh evil.sh`
     // (#444) The script operand is the FIRST non-flag, non-redirect positional
     // after the interpreter — NOT the last. `bash script.sh <arg>...` hands
     // the trailing tokens to the script as $1… (probe-verified against real

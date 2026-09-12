@@ -145,7 +145,7 @@ No change to `classifyGitCommand`/`classifyGitCommandDetailed` verdicts → the 
 | hatches | unit | env hatch + marker bypass M5 |
 | module load | unit | `test-module-load.mjs` stays **49 passed / 0 failed** |
 | full suite | unit | `test.mjs` no new failures (baseline on `origin/main`: 1786 passed / 2 failed) |
-| behavioral | new suite | `test-discard-gate.mjs` 219 passed / 0 failed |
+| behavioral | new suite | `test-discard-gate.mjs` 242 passed / 0 failed |
 
 Reviewer round-3 fold-in: `git checkout --ours/--theirs/-m/--merge/--conflict=`
 now yields a descriptor instead of being exempt outright — they are conflict
@@ -178,6 +178,23 @@ and `checkout-index`/plain `apply -R` are index-sourced, so all three use
 is index-only; `{git,}` brace alternation and a command-position `$(echo git)`
 are documented residuals (open-ended grammar-spelling class).
 
+Reviewer round-5 fold-in: `_wtScanLine` re-emits the heredoc DELIMITER (it used
+to drop it, so the shared walker's `<<` + operand skip ate the next real command
+word — `cat <<EOF … EOF` followed by `git checkout -- f` was invisible) and
+ignores `<<` inside `(( ))` arithmetic, inside a multi-line quoted string, and
+inside a quoted segment when choosing the opener (`echo 'a<<b' && bash <<EOF`);
+ANSI-C decoding is restricted to a plain command word so a decoded quote/`<<`
+cannot re-parse as syntax; quoted `$( … )` spans are walked; a non-static git
+verb (`git "$@"`), a `$`-bearing script path (`bash $S`) and a file piped into a
+shell (`cat undo.sh | bash`) fail closed / are walked; an xargs/`find -exec`
+FEEDER with zero positionals falls back to the conservative descriptor; and
+`git restore --staged --pathspec-from-file=…` is index-only → allow. `git
+checkout -f <path>` resolves through the same ref-vs-path probe (a ref keeps
+whole-tree scope). `extractScriptPath`'s basename matching is now
+ABSOLUTE-ONLY — matching `./time evil.sh`'s basename had retired the M4
+script-content closure for colliding names. Residual: a script run from inside a
+shell FUNCTION body (`f(){ bash /tmp/undo.sh; }; f`).
+
 ## Non-goals / residuals
 
 - Not blocking all git in worktrees — only the discard family, and only when it destroys
@@ -206,3 +223,6 @@ are documented residuals (open-ended grammar-spelling class).
 - A non-static command word (`{git,}` brace alternation, `$(echo git)` in command
   position) is the same open-ended bash-expansion family as README Residual 1 —
   closing it needs a full expansion evaluator.
+- A script executed from inside a shell FUNCTION body (`f(){ bash /tmp/undo.sh; };
+  f`) is not resolved — the head of the line is not an interpreter. The
+  direct-pipe form (`cat /tmp/undo.sh | bash`) IS walked.

@@ -63,7 +63,7 @@ const FAMILY = [
   ["git checkout -- .", "checkout-paths", "paths", ["."], false],
   ["git checkout .", "checkout-paths-bare", "paths", ["."], false],
   ["git checkout -f", "checkout-force", "all", [], false],
-  ["git checkout -f main", "checkout-force", "all", [], false],
+  ["git checkout -f main", "checkout-force", "all", ["main"], false],
   ["git restore src/x.ts", "restore-worktree", "paths", ["src/x.ts"], false],
   ["git restore --worktree src/x.ts", "restore-worktree", "paths", ["src/x.ts"], false],
   ["git restore -s HEAD src/x.ts", "restore-worktree", "paths", ["src/x.ts"], false],
@@ -154,6 +154,7 @@ const NOT_FAMILY = [
   // Reviewer round-4 P1: an ESCAPED space before `#` does not start a comment
   // (the `#` is mid-word) — but the inverse case must stay a comment.
   "echo '`git checkout -- src/x.ts`'", // single quotes suppress substitution
+  "echo '$(git checkout -- src/x.ts)'",   // …and so does a single-quoted $( )
   "git apply /tmp/p.patch", // forward apply is not a reverse
   "git apply --reject /tmp/p.patch",
   "git apply -R --check /tmp/p.patch",  // round-3: dry-run/report only
@@ -219,6 +220,19 @@ for (const cmd of [
   // Reviewer round-4: ANSI-C command words are decoded before the walk.
   "$'\\x67it' checkout -- src/x.ts",
   "$'git' checkout -- src/x.ts",
+  // Reviewer round-5: a data heredoc no longer eats the NEXT command word
+  // (the delimiter is re-emitted for the walker's `<<` + operand skip).
+  "cat <<'EOF'\nhello\nEOF\ngit checkout -- src/x.ts",
+  // `<<` in ARITHMETIC and inside a multi-line QUOTED string is not a heredoc.
+  "(( x = 1 << 2 ))\ngit checkout -- src/x.ts",
+  'echo "a\nb << c"\ngit checkout -- src/x.ts',
+  // A QUOTED `<<` earlier in the line must not demote the real shell heredoc.
+  "echo 'a<<b' && bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  // ANSI-C decoding is restricted to a plain word, so it cannot inject syntax.
+  "echo $'\"' ; git checkout -- src/x.ts",
+  "echo $'\\x3c\\x3c' x\ngit checkout -- src/x.ts",
+  // A QUOTED command substitution still RUNS in bash.
+  "echo \"$(git checkout -- src/x.ts)\"",
 ]) {
   expectTrue(`A2b: ${cmd.split("\n")[0]} → discard IS detected`,
     extractWorkingTreeDiscards(cmd).length > 0, true);
@@ -228,6 +242,19 @@ for (const cmd of [
 for (const cmd of ["git checkout --pathspec-from-file=/tmp/p", "git restore --pathspec-from-file=/tmp/p", "git checkout-index -f --pathspec-from-file=/tmp/p"]) {
   const d = first(cmd);
   expectTrue(`A2c: ${cmd} → unverifiable (fail closed)`, !!d && d.unverifiable === true, JSON.stringify(d));
+}
+
+// A2d: non-static INDIRECTION fails closed rather than sailing past the
+// verb-keyed switch (reviewer round-5 P1/P2).
+for (const cmd of [
+  'f() { git "$@"; }; f checkout -- src/x.ts',
+  'f() { git "$@"; }; f restore src/x.ts',
+  "printf 'src/x.ts\\n' | xargs git checkout",
+  "find . -name src -exec git checkout-index -f {} \\;",
+]) {
+  const d = first(cmd);
+  expectTrue(`A2d: ${cmd} → fail-closed descriptor`,
+    !!d && (d.unverifiable === true || d.form === "feeder-pathspec" || d.pathspecs.some((p) => String(p).includes("{}"))), JSON.stringify(d));
 }
 
 // A3: effect decision — block iff uncommitted tracked work would be destroyed.
@@ -436,6 +463,16 @@ async function partB() {
       // `checkout-index -a -f` copies the index over the whole tree — dirty.txt
       // has UNSTAGED changes here, so this is a real destroy.
       ["whole-tree index copy over unstaged work (`git checkout-index -a -f`)", "git checkout-index -a -f"],
+      // ── reviewer round-5 closures ──
+      ["data heredoc then a discard on a LATER line", "cat <<'EOF'\nhello\nEOF\ngit checkout -- dirty.txt"],
+      ["arithmetic shift before a discard (`(( x = 1 << 2 ))`)", "(( x = 1 << 2 ))\ngit checkout -- dirty.txt"],
+      ["multi-line quoted string before a discard", 'echo "a\nb << c"\ngit checkout -- dirty.txt'],
+      ["quoted `<<` earlier in the line (`echo 'a<<b' && bash <<EOF`)", "echo 'a<<b' && bash <<'EOF'\ngit checkout -- dirty.txt\nEOF"],
+      ["shell-function verb indirection (`f(){ git \"$@\"; }; f checkout -- f`)", 'f() { git "$@"; }; f checkout -- dirty.txt'],
+      ["quoted command substitution (`echo \"$(git checkout -- f)\"`)", 'echo "$(git checkout -- dirty.txt)"'],
+      ["xargs-fed pathspec (`printf … | xargs git checkout`)", "printf 'dirty.txt\\n' | xargs git checkout"],
+      ["`$VAR` script path (`bash $S`)", `S=${execUndo}; bash $S`],
+      ["script piped into a shell (`cat undo.sh | bash`)", `cat ${execUndo} | bash`],
     ];
     for (const [why, cmd] of bypass) {
       const r = await bash(cmd, wt);
@@ -478,6 +515,16 @@ async function partB() {
       allowed(await bash("git restore -s HEAD staged.txt", wt)), "was blocked");
     expectTrue("B6i: `git apply -R --cached <patch>` ALLOWED (index-only)",
       allowed(await bash(`git apply -R --cached ${patch}`, wt)), "was blocked");
+    // Reviewer round-5 P2: `-f <PATH>` restores just that path (the ref/path
+    // probe decides) and an index-only `--pathspec-from-file` restore is not a
+    // working-tree discard.
+    expectTrue("B6i: `git checkout -f clean.txt` ALLOWED (path, not a ref)",
+      allowed(await bash("git checkout -f clean.txt", wt)), "was blocked");
+    const psf = join(tmp, "psf.txt");
+    write(psf, "staged.txt\n");
+    expectTrue("B6i: `git restore --staged --pathspec-from-file=<list>` ALLOWED (index-only)",
+      allowed(await bash(`git restore --staged --pathspec-from-file=${psf}`, wt)), "was blocked");
+    rmSync(psf, { force: true });
     gg("reset -q staged.txt", wt);
 
     // ── B7: staged-only change survives `checkout --` but not a tree source ──

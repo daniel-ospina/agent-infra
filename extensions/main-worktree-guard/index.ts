@@ -1201,7 +1201,11 @@ function _worktreeDiscardBlock(command: string): string | null {
   // literal `git` word but DOES run git. Bail only when the command contains
   // no quoting/expansion character at all.
   let _scriptPath = extractScriptPath(command);
-  if (!/\bgit\b/.test(command) && !_scriptPath && !/['"\\$`]/.test(command)) return null;
+  // A FILE piped into a shell interpreter (`cat /tmp/undo.sh | bash`) carries no
+  // literal `git` either — it must survive the bail so the script walk can read
+  // it (reviewer round-5 P1).
+  const pipesToShell = /\|\s*(?:\S*\/)?(?:bash|sh|zsh|dash|ksh)\s*$/.test(String(command ?? ""));
+  if (!/\bgit\b/.test(command) && !_scriptPath && !pipesToShell && !/['"\\$`]/.test(command)) return null;
   let direct: ReturnType<typeof extractWorkingTreeDiscards> = [];
   try { direct = extractWorkingTreeDiscards(command) ?? []; } catch { return null; }
   const sessionCwd = resolve(process.cwd());
@@ -1219,6 +1223,12 @@ function _worktreeDiscardBlock(command: string): string | null {
         if (st.isFile() && (st.mode & 0o111) !== 0) _scriptPath = firstTok;
       } catch { /* nonexistent/non-executable — not a script invocation */ }
     }
+  }
+
+  // A script path that is not statically resolvable (`bash $S`, `cat x.sh |
+  // sh`) cannot be read and walked — fail closed (reviewer round-5 P1).
+  if (_scriptPath && /[$`]/.test(_scriptPath)) {
+    return _worktreeDiscardBlockReason({ form: "script-indirection", scope: "all", pathspecs: [] }, execCwd, "the script path is not statically resolvable");
   }
 
   // Probe sets: the command itself, plus any script FILES it runs/sources
@@ -1239,21 +1249,37 @@ function _worktreeDiscardBlock(command: string): string | null {
   ];
   try {
     const seen = new Set<string>();
-    let p = _scriptPath;
-    for (let depth = 0; p && depth < 3; depth++) {
+    // Seeds: the resolved script path, plus any FILE piped into a shell
+    // interpreter (`cat /tmp/undo.sh | bash`), which `extractScriptPath` cannot
+    // see because the head of the line is not the interpreter (reviewer
+    // round-5 P1).
+    const seeds: string[] = [];
+    if (_scriptPath) seeds.push(_scriptPath);
+    const pipeSeg = String(command).split("|");
+    if (pipeSeg.length > 1 && pipesToShell) {
+      for (const tok of String(pipeSeg.slice(0, -1).join("|")).split(/\s+/)) {
+        if (!tok || tok.startsWith("-") || /[$`*?]/.test(tok)) continue;
+        try {
+          const real = realpathSync(resolve(execCwd, tok));
+          if (statSync(real).isFile() && statSync(real).size <= 64 * 1024) seeds.push(tok);
+        } catch { /* not a readable file */ }
+      }
+    }
+    let p: string | null = seeds.shift() ?? null;
+    for (let depth = 0; depth < 3 && p; depth++) {
       let real: string;
-      try { real = realpathSync(resolve(execCwd, p)); } catch { break; }
-      if (seen.has(real)) break;
+      try { real = realpathSync(resolve(execCwd, p)); } catch { p = seeds.shift() ?? null; continue; }
+      if (seen.has(real)) { p = seeds.shift() ?? null; continue; }
       seen.add(real);
       let content: string;
       try {
-        if (!existsSync(real) || !statSync(real).isFile() || statSync(real).size > 64 * 1024) break;
+        if (!existsSync(real) || !statSync(real).isFile() || statSync(real).size > 64 * 1024) { p = seeds.shift() ?? null; continue; }
         content = readFileSync(real, "utf8");
-      } catch { break; }
+      } catch { p = seeds.shift() ?? null; continue; }
       if (/(checkout|restore|switch|reset|show|cat-file|read-tree|rm)/.test(content)) {
         sets.push({ discs: extractWorkingTreeDiscards(content) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: p });
       }
-      p = extractScriptPath(content);
+      p = extractScriptPath(content) ?? seeds.shift() ?? null;
     }
   } catch { /* script walk is best-effort — never false-block on its failure */ }
 
@@ -1320,14 +1346,19 @@ function _worktreeDiscardBlock(command: string): string | null {
       // A single bare `git checkout <token>` is a REF SWITCH when the token
       // names one and a PATH RESTORE otherwise (`git checkout f.txt` reverts
       // f.txt — the incident verb's twin without `--`, reviewer round-4 P1).
-      // Resolve it before probing the effect; a token that is not a commit is
-      // a path.
+      // `git checkout -f <token>` inverts the default: a ref is a FORCED switch
+      // (destroys all local changes → keep whole-tree scope), a path is a
+      // single-path restore (reviewer round-5 P2).
       if ((d as { ambiguousRef?: boolean }).ambiguousRef && d.pathspecs.length === 1) {
+        let isRef = false;
         try {
           execFileSync("git", ["rev-parse", "--verify", "--quiet", `${d.pathspecs[0]}^{commit}`],
             { cwd: probeCwd, stdio: ["ignore", "ignore", "ignore"] });
-          continue; // it IS a ref → a branch/tag switch, not a discard
-        } catch { /* not a ref → treat as a path and probe the effect */ }
+          isRef = true;
+        } catch { /* not a ref → treat as a path */ }
+        const refIsAll = (d as { refIsAll?: boolean }).refIsAll === true;
+        if (isRef && !refIsAll) continue; // a plain branch/tag switch, not a discard
+        if (!isRef && refIsAll) scope = { scope: "paths", pathspecs: d.pathspecs, fromTree: false };
       }
       const dirty = _discardStatusPorcelain(probeCwd, scope);
       if (dirty === true) return _worktreeDiscardBlockReason(d, probeCwd, null);
