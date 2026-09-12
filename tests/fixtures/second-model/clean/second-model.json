@@ -9,7 +9,7 @@
       "families": [
         "^deepseek-(?:v4(?:\\.\\d+)?-)?(?:flash|pro)(?:[-:]|$)",
         "^deepseek$",
-        "^deepseek-v\\d+(?:\\.\\d+)?$"
+        "^deepseek-v4(?:\\.\\d+)?$"
       ],
       "normalized": [
         "deepseek-v4-pro",

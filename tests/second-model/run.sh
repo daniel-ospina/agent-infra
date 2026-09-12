@@ -413,7 +413,12 @@ for m in deepseek deepseek-v4 deepseek-v4.1 deepseek-flash deepseek/deepseek-v4-
   if [ "$rc" -eq 0 ]; then pass "positive control $m → EQUIVALENT"; else fail "positive control $m was not classified equivalent (rc=$rc)"; fi
 done
 # Genuinely non-DeepSeek / non-equivalent controls (must classify INDEPENDENT, exit 1).
-for m in openrouter/google/gemini-2.5-pro moonshot/kimi-k3 openrouter/anthropic/claude-opus-4.8 deepseek-proxy deepseek-flashlight; do
+# I1: the reroute family must be anchored to v4 — `deepseek-v3.2` is a DISTINCT
+# served build (`pi --list-models`), and `deepseek-v5` is a future build. The
+# old `^deepseek-v\d+$` family classified BOTH as EQUIVALENT, so designating a
+# legitimately independent build yielded DEGRADED (the gate failed closed
+# against a valid reviewer).
+for m in openrouter/google/gemini-2.5-pro moonshot/kimi-k3 openrouter/anthropic/claude-opus-4.8 deepseek-proxy deepseek-flashlight deepseek-v3.2 deepseek-v5; do
   rc="$(equiv_rc "$m")"
   if [ "$rc" -eq 1 ]; then pass "negative control $m → INDEPENDENT"; else fail "negative control $m was wrongly classified equivalent (rc=$rc)"; fi
 done
