@@ -189,6 +189,20 @@ jobs:
         # step (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is
         # not PR-triggered); perf-parity with the #744 step above.
         run: node extensions/main-worktree-guard/test-discard-gate.mjs
+      - name: entry-point guard symlink regression (#708)
+        # The entry-point idiom `pathToFileURL(process.argv[1]).href ===
+        # import.meta.url` is symlink-SENSITIVE (pathToFileURL does no fs
+        # resolution; the ESM loader realpaths import.meta.url), so ANY
+        # symlinked invocation path made the guard body skip and the #254
+        # fail-closed frontmatter gate exit 0 having printed NOTHING —
+        # indistinguishable from a clean run. macOS `mktemp -d` is under `/var`
+        # and every bootstrapped consumer repo symlinks `scripts/` (#387), so
+        # this is the normal case, not an edge case.
+        # Its own step (like #744/#709 above) because the
+        # `extensions/*/test*.mjs` glob in ci-main.yml is POST-MERGE only.
+        # Positive control: spawns the REAL gates through symlinked paths.
+        # Zero-dep (`node:*` only), no `npm ci`, ~3s.
+        run: node extensions/shared/test-is-main.mjs
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
