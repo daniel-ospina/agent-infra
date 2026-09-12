@@ -251,6 +251,70 @@ Store as `TIER` for subsequent steps. Write the marker file — the only channel
 echo "$TIER" > /tmp/agent-issue-complexity
 ```
 
+### Pipeline-Artifact Preflight (#792)
+
+The `pipeline-compliance` required check reads **issue-side artifacts** — a scoping comment
+(check b) and, for `complexity:standard`/`complex`, a plan doc or a `Wiring` table (check d).
+Which of those must exist *before implementation begins* depends on the check: the scoping
+comment and its `Wiring` table do (they are the issue-side evidence), while a
+`docs/plans/*.md` plan doc is normally written **with** the change and is therefore also
+acceptable at merge time. Nothing in the pipeline consults either artifact until the PR
+exists, so an unscoped standard issue otherwise pays the whole gate cost **twice**: tests +
+review loop + PR → blocked merge → retro artifact → the added file invalidates the reviewed
+SHA → re-review (#745 / PR #778).
+
+Run the gate's own issue-side checks **now** — one invocation, seconds, no `gh` surprise
+at merge time. The gate lives in agent-infra (consumer repos fetch it in CI and do NOT carry
+`scripts/check-pipeline-compliance.sh`), so resolve it from the checkout when present, else
+from `$AGENT_INFRA_PATH`:
+
+```bash
+GATE="${AGENT_INFRA_PATH:-}/scripts/check-pipeline-compliance.sh"
+[ -f scripts/check-pipeline-compliance.sh ] && GATE="scripts/check-pipeline-compliance.sh"
+if [ "$ISSUE_NUMBER" != "none" ] && [ -f "$GATE" ]; then
+  # GH_REPO must be THIS repo: the gate auto-detects its own origin from its own
+  # path, which is agent-infra's whenever the gate is invoked from there.
+  GH_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)" \
+    bash "$GATE" --issue-only "$ISSUE_NUMBER"
+fi
+```
+
+Read the **exit code**; do not infer the verdict from the absence of a printed error:
+
+| Exit | Meaning | Action |
+|------|---------|--------|
+| **0** | issue-side artifacts present (or exempt at this tier) | proceed |
+| **1** | **BLOCK** — the artifacts are missing; the script prints the remedy and the producing skill | fix before implementing (see below) |
+| **2** | the check could not **RUN** (malformed target, missing `gh`/`jq`, a `gh api` failure) | fix the invocation, then re-run — never read it as a pass |
+
+`--issue-only` evaluates **exactly the checks that need no PR** and skips the rest, reusing
+the same code path and tier rules as the merge-time run (check (d)'s merge-time remedy text
+differs, because the PR diff is invisible here):
+
+| Check | `--issue-only` (pre-PR) | Merge-time run |
+|-------|------------------------|----------------|
+| a. linked issue | skipped — there is no PR body yet | enforced |
+| b. scoping comment (`<!-- issue-scoping:`) | **enforced** | enforced |
+| c. code-review evidence | skipped — no PR body/commits yet | enforced |
+| d. plan doc | **`Wiring` branch only** — the `docs/plans/*.md` branch reads the PR diff | enforced (both branches) |
+| e. test-coverage evidence | skipped — no diff/body yet | enforced |
+| f. second-model gate (#716) | skipped — needs the PR diff, body/commits and base ref | enforced |
+
+Tier exemptions are identical to the merge-time run: `complexity:micro` skips the issue-side
+checks (a micro issue exits 0 with no artifacts); an **unlabeled** issue is treated as
+non-micro, so check b still applies — which is why a `bug`/`improvement` issue with no
+`complexity:*` label needs the scoping comment too.
+`PIPELINE_COMPLIANCE_ISSUE_ONLY=1 PIPELINE_COMPLIANCE_ISSUE=<N>` is the env equivalent of
+the flag.
+
+**On failure — BLOCK.** The one remedy that clears check (d) **before** the PR exists is a
+`Wiring` table in the scoping comment (issue-scoping — the table is part of its output); a
+`docs/plans/YYYY-MM-DD-issue-NNN-slug.md` plan doc (writing-plans) also satisfies check (d)
+at merge time but `--issue-only` cannot see it, so do not respond to a preflight (d) failure
+with a plan doc alone. Posting the scoping comment is the fix for check (b). Doing it here
+costs seconds; doing it after the review loop costs the review loop. This step does **not**
+change the gate's verdict logic — `ISSUE_ONLY=0` is the only path a PR takes.
+
 ### Micro Tier Auto-Detection & Gate Behavior
 
 When `TIER = Micro` or auto-detected (1 file, <20 added lines, no migrations, or docs/CSS/static-only per 02-commit-pr.md Step 1.5).
@@ -263,11 +327,11 @@ Mechanism separation: the VGATE content-shape skip is extension-side and shape-b
 | Verification-gate (VGATE) | **shape-gated, not tier-gated** — docs/CSS/static-only sets skip regardless of tier; code sets never skip (see Pi Extension Gates → Verification Gate below) |
 | Lint/Typecheck | **KEPT** — runs in pre-commit hooks, zero agent overhead |
 | Code review (Step 3) | **SKIPPED** — per commit-workflow/03-code-review.md |
-| Pipeline-compliance CI gate (check a) | **KEPT — issue link required at EVERY tier, docs-only micro included (#488)** — the script's micro exemption skips checks b–e (scoping/review/plan evidence), and the docs-only shape exemption covers only check e (test evidence); no carve-out exists or is planned for the linked-issue requirement. See the #488 note below. |
+| Pipeline-compliance CI gate (check a) | **KEPT — issue link required at EVERY tier, docs-only micro included (#488)** — the script's micro exemption skips checks b–e (scoping/review/plan evidence), and the docs-only shape exemption covers only check e (test evidence); no carve-out exists or is planned for the linked-issue requirement in a PR run. See the #488 note below. |
 
 **Rationale:** Micro-tier CODE commits keep full VGATE (shape-gated — the extension skips only docs/CSS/static sets, never code), and VGATE's own [VGATE] verification dispatch satisfies the review-enforcer ≥1-dispatch rule before the commit — micro code sets clear the gate with no extra ceremony. The residual case the uniform block closes is the docs-only micro commit: VGATE shape-exempts it and the multi-agent code-review gate is skipped at micro, so the ≥1 dispatch must come from a lightweight reviewer dispatch (even a trivial one-line review counts).
 
-**#488 decision — the pipeline-compliance issue-link requirement (check a) is KEPT for docs-only shape-exempt commits, as a deliberate audit invariant.** The audit (scripts/check-pipeline-compliance.sh): check a is unconditional — it runs at every tier and every file shape; `complexity:micro` skips checks b–e (scoping comment, code-review evidence, plan doc) and the docs/skills/templates/config-only shape exemption covers only check e (test coverage — it exempts nothing about the linked issue). No docs-only carve-out exists in the script or the workflow. KEEP rationale: (1) a docs-only commit now skips VGATE (#472 shape exemption) and the multi-agent code-review gate (micro), so check a is the only deterministic, CI-enforced content gate left on it — the review-enforcer ≥1-dispatch floor is content-free by design (#485); (2) the #485 audit documented that the "docs are low-consequence" premise fails for the contract-doc subclass (skills/*.md edits encode agent behavior for every future session — #475/#492), so docs-only commits are exactly the class that must keep tracing to a deliberate issue; (3) friction is negligible for pipeline-shaped work — Issue Detection above resolves an issue before every PR-opening commit (the permitted `'none'` answer leaves no PR that check a would pass — a no-issue docs change must go through issue-creation first, which is the intended remedy, not a gate exemption). Relaxing would reopen a no-content-gate path for contract-doc changes and break the gate's "every PR traces to an issue" audit claim. No script or test change — this is a documented-rationale decision (#488).
+**#488 decision — the pipeline-compliance issue-link requirement (check a) is KEPT for docs-only shape-exempt commits, as a deliberate audit invariant.** This holds for **every PR run** — the #792 `--issue-only` preflight evaluates the linked issue's artifacts directly (there is no PR body to parse) and never runs in CI, so the invariant below is unchanged. The audit (scripts/check-pipeline-compliance.sh): in a PR run check a is unconditional — it runs at every tier and every file shape; `complexity:micro` skips checks b–e (scoping comment, code-review evidence, plan doc) and the docs/skills/templates/config-only shape exemption covers only check e (test coverage — it exempts nothing about the linked issue). No docs-only carve-out exists in the script or the workflow. KEEP rationale: (1) a docs-only commit now skips VGATE (#472 shape exemption) and the multi-agent code-review gate (micro), so check a is the only deterministic, CI-enforced content gate left on it — the review-enforcer ≥1-dispatch floor is content-free by design (#485); (2) the #485 audit documented that the "docs are low-consequence" premise fails for the contract-doc subclass (skills/*.md edits encode agent behavior for every future session — #475/#492), so docs-only commits are exactly the class that must keep tracing to a deliberate issue; (3) friction is negligible for pipeline-shaped work — Issue Detection above resolves an issue before every PR-opening commit (the permitted `'none'` answer leaves no PR that check a would pass — a no-issue docs change must go through issue-creation first, which is the intended remedy, not a gate exemption). Relaxing would reopen a no-content-gate path for contract-doc changes and break the gate's "every PR traces to an issue" audit claim. No script or test change — this is a documented-rationale decision (#488).
 
 ## Wiring-Gap Check (canary-fix PRs only)
 
