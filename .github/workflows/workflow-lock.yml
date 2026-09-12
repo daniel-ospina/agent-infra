@@ -12,9 +12,16 @@
 #     tripwire enforced by PR-EDITABLE code, NOT a PR-uneditable control. Its
 #     only call site is the PR's own copy of the checker, run from the
 #     PR-editable .github/workflows/ci.yml.
-#   - THIS job provides the STRUCTURAL assertions only and provides ZERO lock
-#     enforcement — `--head-ref` skips the lock by design, or else every
-#     legitimate workflow change would deadlock against `main`'s old lock.
+#   - THIS job provides the STRUCTURAL assertions only — items (1)–(5) of
+#     `wiringFindings` plus ci-main.yml's pin-gate JOB/`with:` shape, all value
+#     assertions — and provides ZERO lock enforcement: `--head-ref` skips the lock
+#     by design, or else every legitimate workflow change would deadlock against
+#     `main`'s old lock.
+#   - Item 6 ("the committed post-merge command can fail the step") is NOT run
+#     here and is NOT replaced here. It has to EXECUTE the command, which this
+#     trigger must never do with PR content, so it lives in the PR-editable
+#     suite and in the post-merge ci-main.yml leg only. This job makes no claim
+#     whatsoever about ci-main.yml's shell.
 #   - A PR that edits a workflow AND the lock together passes both legs. That is
 #     the pre-existing accepted same-commit residual, now conspicuous in the
 #     diff.
@@ -32,8 +39,11 @@
 # as DATA through the GitHub git tree + blob API at the PR head SHA only
 # (`node scripts/check-pi-pin-lockstep.mjs --head-ref <sha>`, which reads the
 # recursive tree, rejects any workflow path whose committed mode is not a regular
-# file (100644 — a symlink would run 0 jobs), fetches each blob by its tree sha,
-# and decodes the base64 failing closed; it never executes it). Passing the PR
+# blob (`100644` or `100755` — a symlink or submodule would run 0 jobs; the
+# executable bit is irrelevant to GitHub's loader), fetches each blob by its tree
+# sha, and decodes the base64 failing closed; it never executes it). It then runs
+# the narrow STRUCTURAL assertions only, and makes no claim about the shell of the
+# post-merge command (see the trust-split pointer above). Passing the PR
 # head to `actions/checkout`, or any step that runs PR content, turns this into
 # the well-known `pull_request_target` RCE vector.
 #

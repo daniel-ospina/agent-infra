@@ -108,6 +108,78 @@ function lstatNoFollow(absPath) {
   }
 }
 
+/**
+ * The first non-directory component of `rel` under `root`, as a finding-ready
+ * label, or null when every component is a real directory.
+ *
+ * #675 third revision (P2) — a symlinked `.github/workflows` DIRECTORY was not
+ * caught: `fs.readdirSync` follows the directory link and `lstatNoFollow` only
+ * refuses to follow the LAST component, so `.github/workflows` → `real-workflows`
+ * left both local legs GREEN while GitHub — which does not follow a symlinked
+ * workflow directory either — ran 0 jobs. Every ancestor is `lstat`ed here, so a
+ * link anywhere on the path from `root` down to the file's parent is RED.
+ *
+ * `root` itself is deliberately NOT checked: temp fixture roots live under
+ * `/tmp`, which is itself a symlink on macOS (`/tmp` → `/private/tmp`), and the
+ * question is what is linked INSIDE the repo, not how the repo is reached.
+ */
+function symlinkedAncestor(root, rel) {
+  const parts = rel.split("/");
+  let current = root;
+  for (let i = 0; i < parts.length - 1; i++) {
+    current = path.join(current, parts[i]);
+    const st = lstatNoFollow(current);
+    if (st !== null && st.isSymbolicLink()) return parts.slice(0, i + 1).join("/");
+  }
+  return null;
+}
+
+/**
+ * A `lstat`-based refusal shared by `lockFindings` and `workflowCoverageFindings`:
+ * a symlinked ancestor DIRECTORY under `root`, or a symlinked final component.
+ * → a finding message, or null when the path is reached through real directories.
+ */
+function symlinkFinding(root, rel) {
+  const ancestor = symlinkedAncestor(root, rel);
+  if (ancestor !== null) {
+    return (
+      `${ancestor} is a symlink — a workflow path must be reached through real directories: ` +
+      "GitHub does not follow a symlinked directory under .github/, so every workflow inside it " +
+      "is a broken entry that runs 0 jobs; replace the link with the real directory"
+    );
+  }
+  const st = lstatNoFollow(path.join(root, rel));
+  if (st !== null && !st.isFile()) {
+    return (
+      `${rel} is ${nonRegularKind(st)} — a workflow under .github/workflows must be a regular ` +
+      "file: GitHub does not follow a symlinked workflow entry (it is a broken workflow that " +
+      "runs 0 jobs), so a non-regular entry cannot stand in for a workflow"
+    );
+  }
+  return null;
+}
+
+/**
+ * The workflow filenames under `root/.github/workflows`, or a finding.
+ *
+ * #675 third revision (P2) — `.yml` only meant a `.yaml` workflow was NEVER
+ * classified, never symlink-checked, and never reported: adding
+ * `.github/workflows/evil.yaml` (or symlinking to it) left the lock GREEN, while
+ * GitHub runs `.yaml` workflow files. GitHub documents both extensions, so both
+ * are enumerated.
+ */
+const WORKFLOW_FILE_RE = /\.ya?ml$/;
+function workflowNames(root) {
+  const dir = path.join(root, ".github", "workflows");
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch (err) {
+    return { findings: [`could not read ${path.relative(root, dir) || dir} under ${root}: ${err.message}`] };
+  }
+  return { names: names.filter((name) => WORKFLOW_FILE_RE.test(name)) };
+}
+
 /** sha256 of a file's bytes (no normalisation, no line-ending coercion). */
 export function sha256File(absPath) {
   return createHash("sha256").update(fs.readFileSync(absPath)).digest("hex");
@@ -177,25 +249,21 @@ export function lockFindings(root, lock) {
   for (const rel of LOCKED_FILES) {
     if (!Object.hasOwn(files, rel)) continue;
     const abs = path.join(root, rel);
-    const st = lstatNoFollow(abs);
-    if (st === null) {
+    // #675 P1-2 / third revision (P2) — a symlink must NOT satisfy the lock by
+    // hashing its target, and a symlinked `.github` / `.github/workflows`
+    // ANCESTOR directory is also called out: the file's own `lstat` cannot see an
+    // ancestor link, and a linked directory means GitHub runs 0 jobs for every
+    // workflow inside it. `symlinkFinding` covers both, and returns null for a
+    // plain missing file so the MISSING wording below is used for that.
+    const linked = symlinkFinding(root, rel);
+    if (linked !== null) {
+      findings.push(`${linked} (locked path ${rel})`);
+      continue;
+    }
+    if (lstatNoFollow(abs) === null) {
       findings.push(
         `the locked workflow file ${rel} is MISSING — a locked file must exist; restore it, or ` +
           `re-lock with \`${UPDATE_COMMAND}\` if the removal is deliberate`
-      );
-      continue;
-    }
-    // #675 P1-2 — a symlink must NOT satisfy the lock by hashing its target.
-    // `fs.readFileSync` (and GitHub's Contents API) dereference a symlink, so a
-    // PR that replaces a locked workflow with a symlink to another file keeps the
-    // hash identical while GitHub Actions sees a broken workflow entry and runs
-    // 0 jobs. Reject the link, never hash through it.
-    if (!st.isFile()) {
-      findings.push(
-        `the locked workflow file ${rel} is ${nonRegularKind(st)} — a locked workflow must be a ` +
-          "regular file: GitHub does not follow a symlinked workflow entry (it is a broken " +
-          "workflow that runs 0 jobs), so a non-regular entry must not satisfy the lock by " +
-          "hashing its target; restore the file, or re-link it deliberately without locking"
       );
       continue;
     }
@@ -212,35 +280,39 @@ export function lockFindings(root, lock) {
 }
 
 /**
- * Every `.github/workflows/*.yml` on disk must be CLASSIFIED: either one of the
- * three locked paths or an explicitly-listed intentionally-unlocked workflow.
- * Without this, adding `.github/workflows/extra.yml` was silently accepted, and
- * deleting `workflow-lock.yml` (the trusted structural leg) kept the suite green
- * because the reader-corpus floor was `>= 8` (#675 P2-d).
+ * Every workflow file on disk must be CLASSIFIED: either one of the three locked
+ * paths or an explicitly-listed intentionally-unlocked workflow. Without this,
+ * adding `.github/workflows/extra.yml` was silently accepted, and deleting
+ * `workflow-lock.yml` (the trusted structural leg) kept the suite green because
+ * the reader-corpus floor was `>= 8` (#675 P2-d).
  * → [] when the directory is fully accounted for, else one message per gap.
  */
 export function workflowCoverageFindings(root) {
-  const dir = path.join(root, ".github", "workflows");
-  let names;
-  try {
-    names = fs.readdirSync(dir).filter((name) => name.endsWith(".yml"));
-  } catch (err) {
-    return [`could not read .github/workflows under ${root}: ${err.message}`];
-  }
+  const { names, findings: readFindings } = workflowNames(root);
+  if (readFindings !== undefined) return readFindings;
   const present = new Set(names.map((name) => `.github/workflows/${name}`));
   const findings = [];
-  // #675 P1-2 — classification alone is not enough: a symlink named `ci.yml`
-  // classifies as the locked path while GitHub runs 0 jobs for it. Reject any
-  // non-regular entry under .github/workflows, classified or not.
-  for (const rel of present) {
+  // #675 third revision (P2) — a symlinked `.github/workflows` DIRECTORY must be
+  // rejected in its own right: `readdirSync` follows it, and every file inside
+  // classifies normally, so the whole workflow set could be reached through a link
+  // GitHub does not follow.
+  for (const rel of [".github", ".github/workflows"]) {
     const st = lstatNoFollow(path.join(root, rel));
-    if (st !== null && !st.isFile()) {
+    if (st !== null && st.isSymbolicLink()) {
       findings.push(
-        `${rel} is ${nonRegularKind(st)} — a workflow under .github/workflows must be a regular ` +
-          "file: GitHub does not follow a symlinked workflow entry (it is a broken workflow that " +
-          "runs 0 jobs), so a non-regular entry cannot stand in for a workflow"
+        `${rel} is a symlink — GitHub does not follow a symlinked directory under .github/, so ` +
+          "every workflow inside it is a broken entry that runs 0 jobs; replace the link with " +
+          "the real directory"
       );
     }
+  }
+  // #675 P1-2 — classification alone is not enough: a symlink named `ci.yml`
+  // classifies as the locked path while GitHub runs 0 jobs for it. Reject any
+  // non-regular entry under .github/workflows, classified or not. (`.yaml`
+  // included: `WORKFLOW_FILE_RE` covers both extensions, #675 third revision P2.)
+  for (const rel of present) {
+    const finding = symlinkFinding(root, rel);
+    if (finding !== null) findings.push(finding);
   }
   for (const rel of present) {
     if (LOCKED_FILES.includes(rel) || UNLOCKED_WORKFLOWS.includes(rel)) continue;
@@ -266,6 +338,17 @@ function main(argv) {
   const root = rootIdx >= 0 ? path.resolve(args[rootIdx + 1] ?? ".") : REPO_ROOT;
 
   if (args.includes("--update-lock")) {
+    // #675 third revision (P2) — self-consistency. `writeLockFile` hashes through
+    // whatever the path resolves to, so a SYMLINKED locked file used to print
+    // `✅ workflow lock updated` while the very next verify run was RED (the hash
+    // belonged to the link target). Refuse instead: no banner, exit 1, same
+    // rejection `lockFindings` applies.
+    const symlinked = LOCKED_FILES.map((rel) => symlinkFinding(root, rel)).filter(Boolean);
+    if (symlinked.length > 0) {
+      console.error(`❌ refusing to re-lock — ${symlinked.length} locked path(s) are not regular files:`);
+      for (const msg of symlinked) console.error(`   - ${msg}`);
+      return 1;
+    }
     const lock = writeLockFile(root);
     console.log(
       `✅ workflow lock updated — ${LOCKED_FILES.length} files hashed into ` +

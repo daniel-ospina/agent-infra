@@ -17,13 +17,19 @@ aboutObjects: agent-infra, issue-666
 
 Guard `(j)` answered "is the per-PR pin gate still wired?" by reading **GitHub Actions execution
 semantics** out of a hand-written YAML-subset reader (`scripts/workflow-yaml.mjs`), using a
-**denylist** of things that can neutralise the step that runs the pin suite. Two review rounds each
-found working bypasses, and the second round's were **created by the first round's fixes**:
+**denylist** of things that can neutralise the step that runs the pin suite. Two review rounds on this
+reader each found working bypasses, and the second round's were **created by the first round's fixes**:
 
 | Round | Bypass (reproduced GREEN with the gate unplugged) |
 |---|---|
 | 1 | `shell: 'true {0}'` on the step; job-level `defaults.run.shell`; YAML escape sequences in quoted keys (`"paths\u002dignore"`, `"i\u0066"`) |
 | 2 | workflow-level `defaults.run.shell` in `node-ci.yml`; `env:` on the step (`NODE_OPTIONS=--import=…`, `BASH_ENV`, `PATH`); `container:` / `services:` on `unit-test`; `matrix.exclude` covering every combination |
+| 3–5 | three more P1s in the *same* shell scanner: the failure guard hidden in `if false; then … fi`, in a never-called shell function, or in a heredoc; the invocation swallowed by a multi-line quoted string; and one false RED the other way (`echo "a <<x"` arming a phantom heredoc) |
+
+The pattern held for **five** rounds, and round 4's fix introduced a fresh fail-open (an uncaught
+`throw` inside the `exit` handler with `process.exit(0)` pending leaves the code at **0**, not 1 —
+measured, see §"#666 third revision"). That is the evidence for the conclusion in §4: re-modelling
+shell constructs does not converge.
 
 Every one of those requires **editing the workflow file**. So the question the guard was asking —
 "will GitHub execute this?" — was the wrong question, and modelling the answer kept losing.
@@ -67,9 +73,15 @@ The committed hashes are the real current bytes. A `--update-lock` mode rewrites
 - `lockFindings` **returns findings** (never throws) so the CI suite can aggregate: a missing file, a
   hash mismatch (naming the file and printing the exact
   `node scripts/check-workflow-lock.mjs --update-lock` remedy), an uncovered expected path, an
-  unexpected extra path, and a bad lock schema/version.
-- CLI: default = report + exit 1 on any mismatch; `--update-lock` = rewrite the lock. (`--root <dir>`
-  exists so the suite can drive the CLI against a throwaway fixture root.)
+  unexpected extra path, and a bad lock schema/version. It `lstat`s **every path component** from the
+  repo root down (a symlinked `.github` or `.github/workflows` directory, not just a symlinked file,
+  is a finding — `readdirSync` would otherwise follow it).
+- CLI: default = report + exit 1 on any mismatch; `--update-lock` = rewrite the lock — **refusing** to
+  hash through a symlinked locked path (exit 1, no success banner) so the tool cannot record a hash it
+  would immediately reject on the next verify. (`--root <dir>` exists so the suite can drive the CLI
+  against a throwaway fixture root.)
+- The workflow sweep matches `/\\.ya?ml$/`, so a `.yaml` workflow is classified and covered rather than
+  invisible to a `.yml`-only filter.
 - **No YAML parsing. No shell modelling.** It hashes bytes and compares.
 
 ### 3. `scripts/check-pi-pin-lockstep.mjs` — the semantics modelling deleted, the narrow guard kept
@@ -90,32 +102,55 @@ as the parser — the narrow assertions still read parsed nodes.
 | 3 | the `ci` job has no `if:` and no truthy `continue-on-error:` | `if: github.event_name == 'push'`; `continue-on-error : true`; `"i\u0066"` (escape-decoded) |
 | 4 | the `ci` job's `with:` key set is exactly `["test-command"]` and its value is exactly the expected accumulator command | emptied binding; `\|\| true` suffix; extra `with:` key; losing the second suite; a `test-command:` line inside a block scalar |
 | 5 | `node-ci.yml` still declares the `unit-test` job and the `test-command` workflow_call input | renamed input; removed `unit-test` job |
-| 6 | `.github/workflows/ci-main.yml` still invokes this suite in its failure-accumulating form | see below |
+| 6 | **6a (structure, trusted leg + local)** `.github/workflows/ci-main.yml` still declares the `extension-tests` pin-gate job and the `with:` key set `["node-version", "script-validate", "skill-lint", "test-command"]`, the last non-empty | missing job; extra `with:` key; dropped `test-command`; emptied `test-command`; scalar `with:`; empty document |
+| **6b** | **(behavioural, local leg only)** the committed post-merge `test-command` **exits non-zero** under `bash -e` with a failing `node` stub | negative control (guard inside `if false … fi`); guard in a never-called function; guard in a heredoc; invocation inside a multi-line quoted string; positive control (passing stubs → exit 0) |
 
 Each item has both a failing fixture and a passing fixture (the fixture trio / spelling reformats).
 
-### 4. Item 6 is the one exception to "no shell modelling"
+### 4. Item 6 is a BEHAVIOURAL assertion — execution, not shell modelling
 
-The `ci-main.yml` invocation is read as a **line**, not a parsed node, because the thing being
-asserted is a **shell failure-accumulator** (and a line check produces a better message than "file
-changed"). The line check additionally rejects the round-2 **control-flow evasions** a matched line
-alone would miss:
+> **Revised in the third cycle (see §"#666 third revision" below).** The first two revisions read
+> `ci-main.yml` as a **line** and modelled POSIX shell with a lexical scanner. Five review rounds
+> found a fresh bypass each time. That scanner is **deleted**; item 6 now **executes** the committed
+> command. The historical description is kept in the second-cycle table below so the deletion is
+> legible.
 
-- a matched invitation inside `if`/`then`/`fi`, `for`/`while`/`until`/`done`, or a **heredoc** context
-  (never executed);
-- an `\|\| true` between the invocation and the accumulator (the `true` short-circuits past the
-  accumulator on failure);
-- an `exit 0` after the invocation and before the `if [ $failures -gt 0 ]` guard (the recorded failure
-  is swallowed).
+Item 6 asks a question no value assertion can answer — *can the committed post-merge `test-command`
+actually fail the step?* — and answers it by running the committed command:
 
-The trust split is stated authoritatively in the module header of
-`scripts/check-pi-pin-lockstep.mjs`: the content lock is a conspicuousness tripwire enforced by
-PR-editable code, this trusted leg provides the structural assertions only and **zero** lock
-enforcement, and a PR that edits a workflow and the lock together passes both legs. Item 6 is therefore
-a bounded **lexical** shape check — quoted spans, comments and heredoc bodies are removed, a keyword
-counts only in command position, and the failure guard must exist and leave the step non-zero — not an
-execution-semantics model. It is a better error message for the one invariant that is genuinely a
-shell-accumulator property.
+1. parse `ci-main.yml` with `scripts/workflow-yaml.mjs` (never grep) and take the `extension-tests`
+   job's `test-command` body;
+2. write it to a temp dir and run it as `bash -e <script>` with `node` — plus `npx`, `npm` and
+   `bash`, the other interpreters that command shells out to — replaced by stubs that exit 1, first
+   on `PATH`;
+3. assert the step exits **non-zero**.
+
+The stub bounds the run: it guarantees termination (the real suites can never re-enter) and makes
+every suite's verdict a knob. `bash`, not this repo, decides the outcome, so **no shell construct can
+fool it**.
+
+**Two controls make it falsifiable**, and both are in-suite:
+
+- a **positive** control — the same command with *passing* stubs must exit 0 (otherwise the assertion
+  could pass because of a missing binary, a `cd` into a non-existent directory, or some unrelated
+  early failure);
+- a **negative** control — the same command with its failure guard moved inside `if false; then … fi`
+  must make the assertion go RED (otherwise it is a formality).
+
+**The bound, stated exactly** (the module header is authoritative): the assertion proves that *on this
+machine, with this shell, with `node` replaced by a stub that always exits 1, the committed body makes
+the step exit non-zero*. It does **not** prove that the real suites run, that they pass, that the
+command still contains this suite's invocation, or that the step fails on GitHub's runner. It gives
+**no per-suite attribution**: every suite fails under the stub, so a command that dropped only the
+pin-suite line still exits non-zero while the others fail (caught by the content lock — a byte
+changed — not by this assertion).
+
+**Item 6 is per-PR / post-merge only, and PR-editable.** It has to EXECUTE the command, so it can
+only live in the suite, which runs from the PR-editable `ci.yml` (and post-merge via `ci-main.yml`).
+The trusted `--head-ref` leg must never run it — executing PR content under `pull_request_target` is
+the RCE vector — so the trusted leg makes **no claim at all** about `ci-main.yml`'s shell. Item 6's
+shell guarantee therefore sits at exactly the same trust level as the lock: PR-editable code,
+conspicuous in the diff, worth nothing against a PR that edits the checker.
 
 ### 5. `.github/workflows/workflow-lock.yml` — NEW, the trusted leg
 
@@ -144,7 +179,8 @@ The workflow header carries a prominent **security constraint**: `pull_request_t
 workflow definition from the BASE branch (that is what it buys — the PR cannot substitute *this file*);
 this workflow must therefore **never check out, execute, or `npm install` PR content**. It reads the
 PR's files as *data* through the GitHub git tree + blob API only (the tree's committed `mode` is
-checked first and any non-`100644` workflow entry is rejected before content is read), decoding base64
+checked first and any workflow entry that is not a regular blob (`100644`/`100755`) is rejected before
+content is read), decoding base64
 and failing closed on anything else. Misusing this trigger is a known RCE vector; the header cites
 GitHub Security Lab's `pull_request_target` guidance. No `secrets: inherit`; no secret reference
 (`github.token` with `contents: read` is the only credential).
@@ -153,14 +189,18 @@ GitHub Security Lab's `pull_request_target` guidance. No `secrets: inherit`; no 
 
 - Fetches the recursive git TREE at that ref via
   `gh api "repos/{owner}/{repo}/git/trees/<sha>?recursive=1"`, rejects any of the three workflow paths
-  whose committed git `mode` is not `100644` (a symlink `120000` or submodule `160000` is a broken
-  workflow entry that runs 0 jobs, while the Contents API would dereference it), then fetches each
+  whose committed git `mode` is not a **regular blob** — `100644` or `100755` (a symlink `120000` or
+  submodule `160000` is a broken workflow entry that runs 0 jobs, while the Contents API would
+  dereference it; the executable bit is irrelevant to GitHub's workflow loader, so `100755` is
+  accepted rather than made a green-locally / red-in-CI trap) — then fetches each
   remaining path's BLOB by its **tree sha** (`repos/{owner}/{repo}/git/blobs/<sha>`) so the bytes
   parsed are the committed ones and never a dereference.
 - Decodes the blob base64, **fail-closed**: only `encoding: "base64"` is accepted (the API returns
   `encoding: "none"` with empty content for a >1 MB blob) and the decode is fatal on invalid UTF-8, so
   a padded or damaged read cannot masquerade as an empty workflow.
-- Runs **only the narrow structural assertions (items 1–6)** against those bytes.
+- Runs **only the narrow STRUCTURAL assertions** — items 1–5 plus item 6a (the ci-main.yml pin-gate
+  job and its `with:` keys), all value assertions. It does **not** run item 6b (the behavioural
+  assertion) and makes **no claim** about `ci-main.yml`'s shell; see §4.
 - **Skips the content lock** — otherwise every legitimate workflow change would deadlock against
   `main`'s old lock. This leg therefore provides **zero lock enforcement**; see the authoritative
   trust-split statement in the module header of `scripts/check-pi-pin-lockstep.mjs`.
@@ -172,8 +212,9 @@ GitHub Security Lab's `pull_request_target` guidance. No `secrets: inherit`; no 
 |---|---|
 | `scripts/check-workflow-lock.mjs` | **NEW** — byte-level content lock; `hashLockedFiles`/`lockFindings` exports; `--update-lock`/`--root` CLI. No YAML parsing, no shell modelling. |
 | `scripts/workflow-lock.json` | **NEW** — `version: 1` + sha256 for exactly the three pin-gate workflow paths. |
-| `scripts/check-pi-pin-lockstep.mjs` | Execution-semantics modelling deleted (see §Deleted); narrow `wiringFindings` (items 1–6) kept; content-lock section + `--head-ref` mode + item-6 control-flow evasions added. |
-| `.github/workflows/workflow-lock.yml` | **NEW** — `pull_request_target` base-branch checker with the security header. |
+| `scripts/check-pi-pin-lockstep.mjs` | Execution-semantics modelling deleted (see §Deleted); narrow `wiringFindings` (items 1–5) + ci-main.yml's pin-gate job/`with:` shape kept as value assertions; content-lock section + `--head-ref` mode added. **Third cycle:** item 6's POSIX-shell scanner deleted and replaced by a behavioural test that EXECUTES the committed `test-command`; exit handler registered first and made fail-closed; failure decision made terminal; `100755` accepted on the trusted leg. |
+| `.github/workflows/workflow-lock.yml` | **NEW** — `pull_request_target` base-branch checker with the security header. **Third cycle:** header updated — trusted leg = structural value assertions only, `100644` **or** `100755`, and an explicit statement that it makes no claim about `ci-main.yml`'s shell. |
+| `scripts/check-workflow-lock.mjs` | **NEW** — byte-level content lock. **Third cycle:** ancestor-symlink walk (`symlinkedAncestor`/`symlinkFinding`), `/\\.ya?ml$/` workflow enumeration, and `--update-lock` refuses to hash through a symlinked locked path. |
 | `docs/plans/2026-09-10-issue-666-pin-guard-parse.md` | this plan. |
 
 ### Deleted from `scripts/check-pi-pin-lockstep.mjs` (semantics modelling)
@@ -193,32 +234,56 @@ decoy dead step, the decoy comment line, caller/callee `needs:`, the two trigger
 unsatisfiable `unit-test` predicate, the rewired step predicate, the step-run `|| true`, step and
 callee `continue-on-error`, the step `shell:`, the job `defaults.run.shell`, the two empty
 `strategy.matrix` dimensions, and the two escape-decoded step/filter keys. `ciMainFindings` grew from
-49 to 79 lines — the item-6 control-flow rejections added there.
+49 to 79 lines — the item-6 control-flow rejections added there — **and was then deleted entirely in
+the third cycle** (see §"#666 third revision"), along with `shellControlContext`, `stripShellQuotes`,
+`stripShellComment`, `shellSwallowFinding`, `SHELL_TOKEN_RE`, `FAILURE_GUARD_OPEN_RE`,
+`FAILURE_GUARD_CLOSE_RE`, `NONZERO_EXIT_RE`, `POST_MERGE_INVOCATION_RE`, `ACCUMULATOR_SUFFIX_RE`,
+`POST_MERGE_INVOCATION` and every fixture that drove them (14 `item 6 RED #N` cases, 2 `item 6 GREEN`
+cases and the 9 earlier item-6 fixtures).
 
 ## Testing strategy
 
-**Fresh run, 2026-09-11 23:32 EST (post-#675 review-fix cycle) — every count below is copied from that run, not hand-maintained.**
+**Fresh run, 2026-09-12 (third revision, #666 behavioural item 6) — every count below is copied from that run, not hand-maintained.**
 
 | Surface | Layer | Command | Result |
 |---|---|---|---|
 | `(h)` pins | unit + negative + **positive control** | `node scripts/check-pi-pin-lockstep.mjs` | ✅ (2 tests; `pinFindings(wrongPin)` non-empty) |
 | `(i)` mirror stamps | unit + negative + **positive control** + #779 prose fixture | same | ✅ (3 tests; `stampFindings(stale)` non-empty; the four prose lines stay empty) |
-| narrow wiring guard (items 1–6) | unit | same | ✅ live trio + 1 fixture-trio baseline + 1 empty/comments-only RED + 11 `expectWired` + 18 `expectRed` |
-| content lock | unit + CLI | same + `node scripts/check-workflow-lock.mjs` | ✅ 7 lock tests + 4 lock-level bypass tests + 5 `lockFindings` branch controls + 2 coverage + 1 symlinked-CLI + 1 `workflow-lock.yml` wiring |
-| `--head-ref` mode | unit + e2e | same | ✅ runs the structural assertions; proves the lock is not applied; RED for empty/comments-only input; git-tree mode rejection (`120000`) and blob-decode fail-closed |
-| `(h)`/`(i)`/`(j)` + lock + reader | integration | `node scripts/check-pi-pin-lockstep.mjs` | ✅ **109 passed, 0 failed** |
+| narrow wiring guard (items 1–5 + 6a) | unit | same | ✅ live trio + 1 fixture-trio baseline + 1 empty/comments-only RED + 11 `expectWired` + 18 `expectRed` + 7 ci-main-structural cases |
+| item 6b (behavioural) | e2e (real `bash -e`) | same | ✅ live failing-stub → non-zero; passing-stub → 0; 6 mutation fixtures (4 RED, 1 no-false-RED, 1 harness control) |
+| content lock | unit + CLI | same + `node scripts/check-workflow-lock.mjs` | ✅ lock lifecycle/schema/coverage + symlink (file, ancestor dir, `.yaml`) + `--update-lock` refusal |
+| `--head-ref` mode | unit + e2e | same | ✅ runs the structural assertions; never the lock; never item 6b; git-tree mode rejection (`120000`/`040000`/`160000`) and `100755` acceptance; blob-decode fail-closed |
+| `(h)`/`(i)`/`(j)` + lock + reader | integration | `node scripts/check-pi-pin-lockstep.mjs` | ✅ **105 passed, 0 failed** |
 | #254 frontmatter validator | integration | `node scripts/check-skill-lint.test.mjs` | ✅ **160 passed, 0 failed** |
-| validator oracle (pi parity + fuzz) | integration | `node --test scripts/check-skill-lint.oracle.test.mjs` | ✅ **146 passed, 0 failed, fuzz 0/1000** |
+| validator oracle (pi parity + fuzz) | integration | `node --test scripts/check-skill-lint.oracle.test.mjs` | ✅ **146 passed, 0 failed** |
 | ci-ref pin-drift unit tests | integration | `node scripts/ci-ref-check.test.mjs` | ✅ **183 passed, 0 failed** |
-| workflow YAML validity | static | `bash scripts/check-workflow-actionlint.sh` | ✅ exit 0 (includes the new `workflow-lock.yml`) |
+| workflow YAML validity | static | `bash scripts/check-workflow-actionlint.sh` | ✅ exit 0 |
+| content lock vs independent hashes | static | `node scripts/check-workflow-lock.mjs` + `shasum -a 256` | ✅ lock green; the three `shasum -a 256` digests match `workflow-lock.json` byte-for-byte; `--update-lock` rewrites byte-identically (idempotent) |
+| trusted leg against the live API | e2e | `node scripts/check-pi-pin-lockstep.mjs --head-ref d5e876e… --repo daniel-ospina/agent-infra` | ✅ exit 0 (real git tree + blobs; lock skipped by design) |
 
-**Case census (fresh run, third revision):** 109 tests = 76 plain `test()` + 11 `expectWired` + 18
-`expectRed` + 4 `expectLockRedForEdit` (each of which is one `test()`). The 76 plain tests cover
-`(h)`, `(i)`, the live wiring trio, the lock lifecycle/schema/coverage/`workflow-lock.yml` tests,
-`--head-ref` (unit + stubbed-`gh` e2e), the blob decode guard, the item-6 block, the exit-path floor
-and the reader. The run also asserts a set of REQUIRED TEST NAMES (see below), so a deleted or renamed
-assertion is RED regardless of the total. It does NOT catch a required test whose BODY is replaced by
-a same-name no-op — that is a same-commit residual, recorded explicitly below.
+**Runtime bound (measured, not claimed):** `node scripts/check-pi-pin-lockstep.mjs` runs in ~48 s on
+the 2026-09-12 dev box (it was ~11 s at `d5e876e`). The increase is item 6b's shell round-trips
+(6 real `bash -e` runs, ~1.5 s each here because each uses a freshly created temp dir) plus the
+sticky-failure fixture, which runs a complete copy of the suite. The ci.yml comment that describes the
+per-PR pin gate as "~4s of work" therefore no longer holds; it is left untouched in this PR because
+`ci.yml` is a locked file and the comment is not part of the guard's contract.
+
+**Case census (third revision, counted from the file and the run):** 105 tests = 72 plain `test()` +
+11 `expectWired` + 18 `expectRed` + 4 `expectLockRedForEdit`. The run also asserts a set of REQUIRED
+TEST NAMES (52 entries), so a deleted or renamed assertion is RED regardless of the total; it does NOT
+catch a required test whose BODY is replaced by a same-name no-op — a same-commit residual recorded
+below.
+
+### Third-cycle count deltas (before → after, this PR)
+
+| Surface | Before (`d5e876e`) | After |
+|---|---|---|
+| `node scripts/check-pi-pin-lockstep.mjs` | 109 passed, 0 failed | **105 passed, 0 failed** |
+| plain `test()` / `expectWired` / `expectRed` / `expectLockRedForEdit` | 76 / 11 / 18 / 4 | 72 / 11 / 18 / 4 |
+| item-6 fixtures | 25 (`item 6 RED #1–#14`, 2 `item 6 GREEN`, 9 earlier item-6 cases) | 0 — replaced by 7 behavioural cases |
+| `MIN_EXPECTED_PASSING` | 109 | 105 |
+| `REQUIRED_TESTS` entries | 51 | 52 |
+| deleted symbols (`shellControlContext`, `stripShellQuotes`, `stripShellComment`, `shellSwallowFinding`, `SHELL_TOKEN_RE`, the 3 `FAILURE_GUARD_*`/`NONZERO_EXIT_RE` regexes, `POST_MERGE_INVOCATION*`, `ACCUMULATOR_SUFFIX_RE`, `ciMainFindings`) | present | **0 references in the module** (one comment names `ciMainFindings` to explain the removal) |
 
 ## Verification plan — executed (before → after)
 
@@ -236,6 +301,19 @@ a same-name no-op — that is a same-commit residual, recorded explicitly below.
 | 10 | bypass `env:` (`NODE_OPTIONS`) | ✅ GREEN under the semantics guard | ❌ **lock RED** |
 | 11 | bypass `container:` | ✅ GREEN under the semantics guard | ❌ **lock RED** |
 | 12 | bypass `matrix.exclude` covering every combination | ✅ GREEN under the semantics guard | ❌ **lock RED** |
+| 13 | item 6, guard inside `if false; then … fi` | ✅ GREEN (scanner returned `[]`) | ❌ **RED** — item 6b: the command exits 0, assertion fails |
+| 14 | item 6, guard inside a never-called shell function | ✅ GREEN (scanner returned `[]`) | ❌ **RED** |
+| 15 | item 6, guard buried in `if false; then cat <<EOF` | ✅ GREEN (scanner returned `[]`) | ❌ **RED** |
+| 16 | item 6, invocation inside a multi-line quoted string | ✅ GREEN (scanner returned `[]`) | ❌ **RED** on the single-suite fixture (the LIVE file stays green because another suite fails first — stated in the fixture's comment) |
+| 17 | item 6, `echo "a <<x"` (phantom heredoc) | ❌ **false RED** on `d5e876e` | ✅ **GREEN** — no heredoc modelling remains |
+| 18 | trusted leg, tree mode `100755` | ❌ RED (false) | ✅ **GREEN** — accepted as a regular blob |
+| 19 | trusted leg, tree modes `040000` / `160000` | ❌ RED (true but untested) | ❌ **RED**, both, with the mode named |
+| 20 | `.github/workflows` is a symlinked directory | ✅ GREEN (`[]`) | ❌ **RED** — `symlinkedAncestor` walks to `.github/workflows` |
+| 21 | `.github/workflows/evil.yaml` (and a symlink to it) | ✅ GREEN (`[]`) | ❌ **RED**, both |
+| 22 | `process.exit(0)` at the top of the module body | ❌ exit 0 (fail-open) | ❌ **exit 1** — the early handler catches it |
+| 23 | failing run + `process.on("exit", () => { process.exitCode = 0; })` at EOF | ❌ exit 0 while printing `SOME TESTS FAILED` | ❌ **exit 1**, summary still printed |
+| 24 | uncaught `throw` inside the `exit` handler with `process.exit(0)` pending | ❌ exit 0 (the brief's assumed safe direction is false) | ❌ **exit 1** — the catch sets `process.exitCode = 1` |
+| 25 | `--update-lock` with a symlinked locked path | ❌ exit 0 + `✅ workflow lock updated`, next verify RED | ❌ **exit 1**, `❌ refusing to re-lock`, no banner |
 
 Each live-file mutation in #7 and #9–12 was restored with `cp` from a `/tmp` backup (never a
 working-tree discard, #664) and every restore was sha256-verified identical before re-running the lock
@@ -274,6 +352,11 @@ better error message (the module header's authoritative trust split).
 
 ## #675 second review-fix cycle (2026-09-12)
 
+> **Superseded in part by the third revision below.** P1-1, P2-3 and P2-7 (and the item-6 half of
+> P1-2) were all fixes to `shellControlContext`, the POSIX-shell scanner. That scanner was **deleted**
+> in the third cycle because a fifth round found yet another bypass inside it. The rows are kept as the
+> historical record of why the modelling was abandoned.
+
 A re-verification of the first fix cycle found the following. Every one was reproduced with a command
 before being fixed, and every fix is covered by a RED or GREEN fixture.
 
@@ -288,11 +371,45 @@ before being fixed, and every fix is covered by a RED or GREEN fixture.
 | P2-7 | `<<<` here-strings matched the heredoc regex starting at index 1, so `grep -q foo <<< bar` before the invocation was a false RED — the #779 class | The heredoc regex requires `<<` not preceded/followed by `<`; GREEN fixture for `cmd <<< word` |
 | P2-8 | `process.exit(0)` before the first test (or inside a required test) exited 0 with zero ✅ lines — the floor and roster ran only at the end of the module body | The floor + roster are declared and registered on the `exit` event near the top of the file, and `finalize()` sets `process.exitCode`; a fixture proves an early `process.exit(0)` now exits 1 |
 
+## #666 third revision (2026-09-12) — item 6 becomes behavioural
+
+A fifth review round found three more P1s **inside the same `shellControlContext` function**, and
+round 4's fix had itself introduced a fail-open. Five rounds of evidence now support one conclusion:
+**hand-modelling POSIX shell with a lexical scanner does not converge** — every correction creates or
+reveals another construct. So the modelling was deleted and replaced by execution.
+
+Each defect below was reproduced with a command against `d5e876e` before the fix, and each fix was
+verified by running the named command against the fixed tree.
+
+| # | Defect (reproduced on `d5e876e`) | Fix |
+|---|---|---|
+| P1 | Item 6's guarantee was unattainable by construction: five shapes left the gate dead while the scanner returned `[]` — the failure guard inside `if false; then … fi`, the guard inside a never-called shell function, the invocation swallowed by a multi-line quoted string, `if false; then cat <<EOF` hiding the guard's `if`, and (a false RED, the other direction) `echo "a <<x"` arming a phantom heredoc. Measured on `d5e876e`: `ciMainFindings()` → `[]` for the first four, and one `sits inside a heredoc` finding for the fifth | `shellControlContext`, `stripShellQuotes`, `stripShellComment`, `shellSwallowFinding`, `SHELL_TOKEN_RE`, `FAILURE_GUARD_OPEN_RE`/`_CLOSE_RE`, `NONZERO_EXIT_RE`, `POST_MERGE_INVOCATION_RE`, `ACCUMULATOR_SUFFIX_RE`, `POST_MERGE_INVOCATION` and `ciMainFindings` DELETED, with all 25 item-6 fixtures. Item 6 is now the behavioural assertion described in §4 (execute the committed command under `bash -e` with failing stubs; assert non-zero), with a positive control, a negative control and one fixture per defeated shape. The trusted `--head-ref` leg no longer examines `ci-main.yml`'s shell at all |
+| P2 | A symlinked `.github/workflows` **directory** was not caught: `readdirSync` follows it and `lstat` only refused to follow the last component. Reproduced: `.github/workflows` → `real-workflows` gave `workflowCoverageFindings()` → `[]` and `lockFindings()` → `[]` | `symlinkedAncestor()` walks (and `lstat`s) every component from the repo root down to the file's parent; `symlinkFinding()` shares it between `lockFindings` and `workflowCoverageFindings`, and the workflows directory itself is checked |
+| P2 | `.yaml` workflows were invisible: `readdirSync(...).filter((n) => n.endsWith(".yml"))`. Reproduced: adding `.github/workflows/evil.yaml`, and symlinking to it, both gave `[]` | `/\\.ya?ml$/` in `check-workflow-lock.mjs` and in the reader-corpus test; RED fixtures for both the unclassified `.yaml` and the symlinked `.yaml` |
+| P2 | Mode `100755` was a green-locally / red-in-CI trap on the trusted leg. Reproduced: the local legs are GREEN under `chmod +x`, and `--head-ref` with tree mode `100755` exits 1 | `TREE_MODES_REGULAR_FILE = ["100644", "100755"]`; `040000`/`160000`/`120000`/anything else stay RED. Re-pointed fixture + a `040000`/`160000` RED fixture |
+| P2 | The `exit` handler was registered ~19% into the module. Reproduced: `process.exit(0)` above `FAILURE_GUARD_OPEN_RE` (module line ~179) exits 0 with the floor and roster never evaluated | The handler is registered as early as the module legally can — immediately after the `--head-ref` flag is computed and before every other module-level binding — and the anti-early-exit fixture now injects at **both** the top of the module body and mid-suite |
+| P2 | **The brief's suggested fail-closed direction was wrong and was measured.** "Register the handler early; a TDZ throw inside it still exits non-zero" is FALSE: with `process.exit(0)` pending, an *uncaught* exception in an `exit` listener leaves the exit code at **0** (measured on Node v22.23.1; a `throw` in a handler for a *natural* exit does give 1, which is what makes the claim look true) | `finalize()` is called inside a `try`/`catch` that sets `process.exitCode = 1` and prints why. The catch is load-bearing; an uncaught TDZ throw is a fail-open |
+| P2 | The failure decision was not sticky: `finalize()` ran eagerly at EOF and set `process.exitCode = 1`, but `process.exitCode` is last-writer-wins across `exit` listeners. Reproduced: a failing run + `process.on("exit", () => { process.exitCode = 0; })` appended at EOF → exit 0 while still printing `❌ SOME TESTS FAILED` | The EOF decision is terminal: `finalize(); if (failed > 0) process.exit(1);`. A fixture appends exactly that listener to a full suite copy and asserts exit 1 **and** that the summary still reaches stdout/stderr (guarding against `process.exit` truncation) |
+| P2 | `--update-lock` was self-inconsistent on a symlinked locked file: it hashed the link target, printed `✅ workflow lock updated`, and the next verify run was RED. Reproduced: exit 0 + banner, then verify exit 1 | `--update-lock` refuses first (same `symlinkFinding` rejection), prints `❌ refusing to re-lock …`, exits 1, prints no banner |
+
+**What the trusted `--head-ref` leg no longer does (stated plainly).** It asserts the *structural* wiring
+of `ci.yml`/`node-ci.yml` (items 1–5) and, for `ci-main.yml`, only that the pin-gate job exists and
+declares the expected `with:` keys with a non-empty `test-command` (item 6a). It runs **no** shell
+check on `ci-main.yml`, and it does not replace item 6b. Item 6's shell guarantee is therefore per-PR /
+post-merge only, **enforced by PR-editable code** — the same trust level as the lock.
+
+**What item 6 no longer asserts (stated plainly).** The deleted scanner also asserted that the
+post-merge command still *contains* this suite's invocation in the exact accumulator form. That is gone.
+The behavioural assertion cannot replace it: under the failing stub **every** suite fails, so a command
+that dropped only the pin-suite line still exits non-zero. Deleting that line is caught by the content
+lock (the byte changed), not by item 6. This is a real reduction in the local leg's coverage and is
+recorded here rather than papered over.
+
 ## Accepted residual (recorded, not papered over)
 
 - **A required test whose BODY is replaced by a same-name no-op is not caught (#675 P2-5).** The
   roster records test NAMES, not semantics: `test("<required name>", () => assert.ok(true))` passes and
-  the suite stays green (`node scripts/check-pi-pin-lockstep.mjs` → `109 passed, 0 failed`, exit 0,
+  the suite stays green (`node scripts/check-pi-pin-lockstep.mjs` → `105 passed, 0 failed`, exit 0,
   measured on a full repo copy). No in-file mechanism can defend against a same-commit body rewrite
   (the roster, the floor and the exit handler are all in the file the PR can edit) — this is the same
   accepted same-commit class as the lock. The roster's claim is therefore bounded to **deleted or
@@ -318,10 +435,27 @@ before being fixed, and every fix is covered by a RED or GREEN fixture.
   `ci.yml`; `--head-ref` skips the lock entirely. So a PR that deletes or neuters the lock check in its
   own copy is not caught by the trusted leg, and a PR that edits a workflow together with the lock
   passes both. The lock's real value is conspicuousness — an edit to a locked file cannot be silent.
-- **Item 6 is a bounded lexical check, not a shell model.** It removes quoted spans, comments and
-  heredoc bodies, counts control-flow keywords only in command position, and requires the exact
-  accumulator line plus a failure guard that exits non-zero. It is deliberately not a general shell
-  interpreter, and it does not claim to be.
+- **Item 6 is a bounded BEHAVIOURAL check — it proves the command can fail, not that it works.** It
+  runs the committed `test-command` under `bash -e` with this repo's interpreters replaced by stubs
+  that exit 1, and asserts the step exits non-zero. It proves, on this machine and this shell, that the
+  committed body fails the step. It does NOT prove that the real suites run or pass, that the command
+  still contains this suite's invocation, that the step fails on GitHub's runner, or anything about
+  per-suite attribution (under failing stubs every suite fails, so a command that dropped only the
+  pin-suite line still exits non-zero — the content lock, not item 6, catches that). The module header
+  is the authoritative statement.
+- **Item 6 is per-PR / post-merge only, and PR-editable.** It must execute the command, so it cannot
+  run under `pull_request_target` (executing PR content there is the RCE vector). The trusted
+  `--head-ref` leg therefore makes no shell claim about `ci-main.yml` at all; item 6's shell guarantee
+  sits at the same trust level as the lock.
+- **The behavioural item 6 costs wall-clock time.** The suite went from ~11 s at `d5e876e` to ~48 s
+  now: six real `bash -e` round-trips plus one fixture that copies and re-runs the whole suite. Stubbing
+  out the shell instead would restore the old speed and the old guessing; the cost is accepted. The
+  stale "~4s of work" comment in `ci.yml` is out of scope here (locked file, not part of the contract).
+- **An ancestor symlink above the repo root is not walked.** `symlinkedAncestor` starts at the repo
+  root and deliberately does not `lstat` it or any directory above it, because `/tmp` itself is a
+  symlink on macOS and walking to `/` would make every fixture RED. A symlink in the repo's own path
+  prefix is therefore not detected; a symlink at or below the root — including `.github` and
+  `.github/workflows` — is.
 - **A content lock asserts *unchanged*, not *correct*.** A pinned workflow can still be wrong; the lock
   says "nobody edited it since the hash was recorded", nothing more.
 - **Deliberate-update tax.** Any legitimate edit to `ci.yml`, `node-ci.yml` or `ci-main.yml` requires
@@ -345,14 +479,22 @@ before being fixed, and every fix is covered by a RED or GREEN fixture.
   `lockFindings` branch controls, the symlinked-CLI fixture, the workflow-coverage fixtures, the
   `workflow-lock.yml` wiring assertion, the #779 prose fixtures and the deep-flow-nesting fixture. Plus
   the live-file mutation round in §Verification plan #7–12 (all restored byte-identical via `cp`, #664).
+  The **third revision replaced the 25 shell-scanner item-6 fixtures with 7 behavioural ones** (above)
+  and added 2 tree-mode, 3 symlink/`.yaml`, and 1 `--update-lock`-refusal fixtures, in-suite; its
+  live-file mutation round is §Verification plan #13–25.
 - **positive controls** — `(h)`/`(i)` carry their explicit predicate positive controls (#675 P1-3);
   every one of items 1–6 has a failing fixture and a passing fixture; `lockFindings` now has one
-  positive control per schema branch (#675 P2-e).
-- **`MIN_EXPECTED_PASSING` floor** — 71 → 91 → **109** (third revision; the #675 second review-fix
-  cycle added 18 fixtures), and it is now a SECONDARY signal: the run also asserts a set of required
-  test NAMES (#675 P2-c), so deleting or renaming a real test is RED even when the count is unchanged.
+  positive control per schema branch (#675 P2-e); **item 6b has an explicit positive control** (the
+  same command with passing stubs must exit 0) and an explicit negative control (the guard moved into
+  `if false … fi` must go RED).
+- **`MIN_EXPECTED_PASSING` floor** — 71 → 91 → 109 → **105** (third revision: the 25 shell-scanner
+  fixtures were deleted and 21 fixtures added; the #675 second review-fix cycle had added 18), and it is
+  now a SECONDARY signal: the run also asserts a set of required test NAMES (#675 P2-c), so deleting or
+  renaming a real test is RED even when the count is unchanged.
   The floor and the roster are evaluated in a `process.on("exit", …)` handler (#675 P2-h), so an early
-  `process.exit(0)` cannot skip them.
+  `process.exit(0)` cannot skip them — and since the third revision that handler is registered at the
+  top of the module, the decision it takes is terminal (`process.exit(1)`), and an uncaught throw inside
+  it fails closed rather than open.
 
 ## Out of Scope
 
@@ -364,3 +506,6 @@ before being fixed, and every fix is covered by a RED or GREEN fixture.
 | A nested/root `package.json` walk for extension pins | **#643** |
 | Version-specific line refs in the mirror surfaces | **#651** |
 | General YAML features outside the reader subset (folding/chomping, multi-line plain scalars, anchors/aliases/tags, merge keys, multi-doc) | documented reader bound; the reader throws rather than guesses |
+| Refreshing the now-stale "~4s of work" comment in `ci.yml` | blocked by design — `ci.yml` is a locked file; a comment edit would require an `--update-lock` commit of its own. Not part of the guard's contract |
+| Executing the committed command under `pull_request_target` | rejected on security grounds (RCE vector) and recorded as the reason item 6b is local-leg-only |
+| Walking symlinks **above** the repo root | deliberate; `/tmp` is a symlink on macOS, so walking to `/` would make every fixture RED |
