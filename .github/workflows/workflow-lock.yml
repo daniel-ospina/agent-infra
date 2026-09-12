@@ -51,19 +51,31 @@
 # above). Passing a PR ref to `actions/checkout`, or any step that runs PR
 # content, turns this into the well-known `pull_request_target` RCE vector.
 #
-# WHICH REF — THE MERGE RESULT, NOT THE HEAD (#821). The ref validated below is
-# `pull_request.merge_commit_sha` — the commit GitHub would create by merging this
-# PR into its base — because that is the state that would actually land. The
-# HEAD is the WRONG subject, and using it produced a false RED on every branch cut
-# before a guarded workflow changed: the head still carries the OLD files, the
-# assertions fail, and the job tells the author to "restore the line" for a line
-# they never touched and should not touch — even though merging would leave the
-# base branch's (valid) copies in place. Validating the merge result also handles
-# the case that actually matters: a PR that changes a guarded workflow on top of a
-# base branch that has since changed it too (the merge result is the only place
-# that combination exists). `merge_commit_sha` is null while a PR conflicts with
-# its base; the step below fails closed with its own message in that case rather
-# than reporting a spurious workflow finding.
+# WHICH REF — THE MERGE RESULT, NOT THE HEAD (#821), READ FROM THE REST API,
+# NOT THE EVENT PAYLOAD (#843). The ref validated below is the merge commit — the
+# commit GitHub would create by merging this PR into its base — because that is
+# the state that would actually land. The HEAD is the WRONG subject, and using it
+# produced a false RED on every branch cut before a guarded workflow changed: the
+# head still carries the OLD files, the assertions fail, and the job tells the
+# author to "restore the line" for a line they never touched and should not touch
+# — even though merging would leave the base branch's (valid) copies in place.
+# Validating the merge result also handles the case that actually matters: a PR
+# that changes a guarded workflow on top of a base branch that has since changed
+# it too (the merge result is the only place that combination exists).
+#
+# WHERE IT IS READ FROM MATTERS (#843). `merge_commit_sha` in the WEBHOOK/EVENT
+# PAYLOAD — `github.event.pull_request.merge_commit_sha` — is **null until GitHub
+# computes mergeability**, which happens ASYNCHRONOUSLY after the event has
+# already fired. #821 gated on that payload field, so the fail-closed branch fired
+# on essentially every PR that lost the race: RED on everything, reporting a
+# content problem that did not exist. The payload field and the REST API field
+# are NOT interchangeable — the merge commit can exist (and be returned by
+# `GET /repos/{owner}/{repo}/pulls/{n}`) while the payload field is still empty.
+# So the merge sha is resolved from the REST API below, and the payload field is
+# never read. `merge_commit_sha` is genuinely absent — payload AND API — only when
+# no merge commit exists at all (a PR that conflicts with its base); the step
+# still fails closed with its own message in that case, rather than reporting a
+# spurious workflow finding.
 #
 # See GitHub Security Lab, "Keeping your GitHub Actions and workflows secure:
 # Preventing pwn requests" (Part 4) and GitHub's "Securely using
@@ -76,11 +88,14 @@ on:
     types: [opened, synchronize, reopened, edited]
 
 # Read-only. `contents: read` covers the checkout and the git tree + blob calls.
-# `pull-requests: read` is deliberately NOT granted — nothing here reads PR
-# metadata (the only API calls are the git tree and git blob endpoints);
-# declaring an unused scope is the P2-h finding from the #675 review.
+# `pull-requests: read` IS required (#843): the merge result is resolved from
+# `GET /repos/{owner}/{repo}/pulls/{n}`, which reads this PR's metadata. #675's
+# P2-h removed this scope as unused — correct THEN, wrong NOW: the merge sha used
+# to come from the event payload (no API read), and it comes from the API since
+# #843. The removal is not reinstated by accident; it is required by the fix.
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   workflow-lock:
@@ -93,13 +108,78 @@ jobs:
       - name: Validate the MERGE RESULT's workflow files (narrow structural guard, lock skipped)
         env:
           GH_TOKEN: ${{ github.token }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # Validate what would LAND, not what the branch currently points at (#821).
+          #
+          # Resolve the merge sha from the REST API, NOT `github.event.pull_request.
+          # merge_commit_sha` (#843): the event-payload field is null until GitHub
+          # computes mergeability asynchronously, so gating on it reds every PR that
+          # loses that race. The API computes mergeability on demand and returns the
+          # merge commit the payload field is still missing. A bare `gh api` failure
+          # is itself fail-closed: the assignment exits non-zero under `bash -e`.
+          #
+          # `jq -r` / gh `--jq` semantics: `(.mergeable | tostring)` deliberately
+          # avoids `// "unknown"` — jq's `//` alternative operator yields the right
+          # side for BOTH null AND false, so `false // "unknown"` is "unknown" and
+          # a conflicted PR would be reported as merely unknown, losing the one
+          # signal that distinguishes "resolve the conflicts" from "retry".
+          # `(.merge_commit_sha // "")` is safe: only null is meaningful there.
+          #
+          # One API call per attempt, both fields: `--jq` emits `sha|mergeable`,
+          # split by parameter expansion rather than `read` — a `read` on an empty
+          # here-string returns 1 and would be indistinguishable from a real
+          # failure under `bash -e`, and it also cannot be relied on to consume a
+          # single line. Parameter expansion has no exit status of its own.
+          RESOLVED=""
+          MERGE_SHA=""
+          MERGEABLE=""
+          # Poll briefly. The API computes mergeability ON DEMAND, but that
+          # computation is itself ASYNCHRONOUS — a response can carry
+          # `mergeable: null` while GitHub is still working (its docs say to poll
+          # until the field settles). A single call would therefore re-create a
+          # NARROWER version of the very race #843 removes, and the job would red
+          # a perfectly mergeable PR. `mergeable: false` is also treated as
+          # conclusive: a merge commit cannot be computed for a conflicted PR, so
+          # there is nothing to wait for on THIS event. (A later push to the base
+          # branch can resolve the conflict and does then produce a merge commit —
+          # but this trigger re-runs on that push, and the outcome here is exit 1
+          # either way, so breaking early cannot mask a passable PR.) A non-empty
+          # sha stops the loop immediately (the common case — one API call).
+          # `0` attempts is clamped to 1 so the loop body always runs at least once.
+          attempts="${MERGE_POLL_ATTEMPTS:-5}"
+          case "$attempts" in ''|*[!0-9]*) attempts=5 ;; esac
+          if [ "$attempts" -lt 1 ]; then attempts=1; fi
+          sleep_s="${MERGE_POLL_SLEEP:-2}"
+          case "$sleep_s" in ''|*[!0-9]*) sleep_s=2 ;; esac
+          attempt=1
+          while [ "$attempt" -le "$attempts" ]; do
+            if ! RESOLVED="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+              --jq '(.merge_commit_sha // "") + "|" + (.mergeable | tostring)')"; then
+              echo "❌ Could not read this PR's metadata from the REST API."
+              echo "   GET /repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER failed (see the error above)."
+              echo "   This is NOT a finding about your workflow files — the job could not resolve"
+              echo "   what would land. Re-run the job."
+              exit 1
+            fi
+            MERGE_SHA="${RESOLVED%%|*}"
+            MERGEABLE="${RESOLVED#*|}"
+            if [ -n "$MERGE_SHA" ]; then break; fi
+            if [ "$MERGEABLE" = "false" ]; then break; fi
+            attempt=$((attempt + 1))
+            if [ "$attempt" -le "$attempts" ]; then sleep "$sleep_s"; fi
+          done
           if [ -z "$MERGE_SHA" ]; then
-            echo "❌ pull_request.merge_commit_sha is EMPTY, so there is no merge result to validate."
-            echo "   GitHub does not compute one while this PR conflicts with its base branch."
+            echo "❌ No merge commit exists for this PR, so there is no merge result to validate."
+            if [ "$MERGEABLE" = "false" ]; then
+              echo "   The REST API reports mergeable=false: this PR conflicts with its base"
+              echo "   branch, and a conflicted PR has no merge commit at all."
+            else
+              echo "   The REST API still reported no merge_commit_sha after $attempts attempt(s)"
+              echo "   (mergeable=$MERGEABLE) — GitHub had not finished computing the merge"
+              echo "   result. This is a timing condition, not a defect in your PR: re-run the job."
+            fi
             echo "   This is NOT a finding about your workflow files — the job simply cannot see"
             echo "   what would land. Resolve the conflicts or update your branch and it re-runs."
             echo "   PR head, for reference only: $HEAD_SHA"

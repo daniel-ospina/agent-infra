@@ -196,10 +196,11 @@
  * the authoritative trust-split statement above). `--repo <owner/name>` overrides
  * the repo (else it is derived from `git remote get-url origin`).
  *
- * WHAT REF THE CALLER SHOULD PASS, AND WHY IT IS NOT THE HEAD (#821). The flag
- * name is historical; the contract is "the ref whose tree would LAND".
- * `workflow-lock.yml` passes `pull_request.merge_commit_sha` — the merge result —
- * and asserts that it does (see the wiring test). Validating `head.sha` instead
+ * WHAT REF THE CALLER SHOULD PASS, AND WHY IT IS NOT THE HEAD (#821), AND WHERE
+ * IT MUST BE RESOLVED FROM (#843). The flag name is historical; the contract is
+ * "the ref whose tree would LAND". `workflow-lock.yml` passes the MERGE RESULT,
+ * resolved from the REST API (NOT the event payload — see #843 below), and
+ * asserts that it does (see the wiring test). Validating `head.sha` instead
  * was a FALSE RED generator: the head is the pre-merge state, so any branch cut
  * before a guarded workflow changed carried the OLD files, failed assertions for
  * files it never touched, and was told to "restore the line" it had never
@@ -736,6 +737,24 @@ function setEq(a, b) {
   return a.length === b.length && [...a].sort().join() === [...b].sort().join();
 }
 
+/**
+ * Is a real `jq` on PATH? `gh api --jq` is backed by jq's expression language, so
+ * the #843 execution test needs the real thing to exercise the step's expression
+ * rather than re-implement it. Present on GitHub's ubuntu-latest runners.
+ *
+ * A missing jq is NOT a skip: the #843 execution test asserts on this and fails
+ * loudly. Skipping would make that leg a silent no-op that still reports a full
+ * pass and satisfies the required-test roster — a vacuous pass, the class #820
+ * exists to catch.
+ */
+function hasJq() {
+  try {
+    return spawnSync("jq", ["--version"], { stdio: "ignore" }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
 // ── the floor + roster ──────────────────────────────────────────────────────
 // #675 P2-h — these are evaluated on EVERY exit path. The `exit` handler that
 // calls `finalize()` is registered at the very top of this module (right after
@@ -780,7 +799,8 @@ const REQUIRED_TESTS = Object.freeze([
   "the lock CLI is not a silent no-op through a symlinked path (#708 class, #675 P2-b)",
   "workflow coverage: an unclassified new workflow is RED (#675 P2-d)",
   "workflow coverage: deleting workflow-lock.yml is RED (#675 P2-d / P2-g)",
-  "workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821)",
+  "workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821, #843)",
+  "workflow-lock.yml's merge-sha resolution EXECUTES and hands the API's sha to the checker (#843)",
   "a deeply nested flow collection raises WorkflowYamlError quickly (#675 P2-6)",
   "a symlinked locked workflow is RED from lockFindings (#675 P1-2)",
   "the lock CLI is RED for a symlinked locked workflow (#675 P1-2)",
@@ -2132,12 +2152,11 @@ test("--update-lock on a symlinked locked file fails instead of printing an upda
 // #675 P2-g — the trusted leg is bootstrapped by the NEXT PR after it lands
 // (pull_request_target resolves from the default branch). Nothing writes
 // post-merge evidence, so this is the assertion that deleting/unwiring it is RED.
-test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821)", () => {
+test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821, #843)", () => {
   const rel = ".github/workflows/workflow-lock.yml";
   const abs = path.join(REPO_ROOT, rel);
   assert.ok(fs.existsSync(abs), `${rel} must exist — it is the trusted structural leg`);
-  const text = fs.readFileSync(abs, "utf8");
-  const doc = parseWorkflowYaml(text);
+  const doc = parseWorkflowYaml(fs.readFileSync(abs, "utf8"));
   assert.ok(isMap(doc), `${rel} must read as a top-level mapping`);
   assert.ok(
     isMap(doc.on) && Object.hasOwn(doc.on, "pull_request_target"),
@@ -2149,6 +2168,15 @@ test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#67
   // change, because merging leaves the BASE branch's copies in place. The merge
   // result is also the only ref where "PR change + a base branch that changed the
   // same file since" exists at all, which is the case that actually matters.
+  //
+  // #843 — AND IT MUST BE RESOLVED FROM THE REST API, NOT THE EVENT PAYLOAD.
+  // `github.event.pull_request.merge_commit_sha` is null until GitHub computes
+  // mergeability asynchronously, so #821's payload read made the fail-closed
+  // branch fire on essentially every PR that lost the race — RED on everything,
+  // reporting a content problem that did not exist. This assertion is INVERTED
+  // from its #821 form on purpose: it used to PIN the payload field, which is
+  // exactly the mechanism that broke. The payload field must now be read NOWHERE
+  // in this file, and the merge sha must come from `GET .../pulls/{n}`.
   const steps = doc.jobs["workflow-lock"].steps;
   const step = steps.find(
     (s) => typeof s.run === "string" && s.run.includes("check-pi-pin-lockstep.mjs --head-ref")
@@ -2156,23 +2184,200 @@ test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#67
   assert.ok(step, `${rel} must still invoke the checker with --head-ref`);
   assert.equal(
     step.env?.MERGE_SHA,
-    "${{ github.event.pull_request.merge_commit_sha }}",
-    `${rel} must validate \`pull_request.merge_commit_sha\` — the merge result is what lands (#821)`
+    undefined,
+    `${rel} must NOT take MERGE_SHA from the event payload — ` +
+      "`pull_request.merge_commit_sha` is null until mergeability is computed, so that " +
+      "mechanism reds every PR that loses the race (#843)"
+  );
+  assert.equal(
+    step.env?.PR_NUMBER,
+    "${{ github.event.pull_request.number }}",
+    `${rel} must pass the PR number so the merge sha can be resolved from the REST API (#843)`
+  );
+  assert.doesNotMatch(
+    // Scope the check to what the job ACTUALLY EVALUATES — every step's `env`
+    // VALUES and `run` BODY — not the raw file text. The YAML header documents the
+    // anti-pattern by name (that prose is the point), so a raw-text match would
+    // forbid explaining the bug it guards. Comments are not executable.
+    steps
+      .flatMap((s) => [
+        ...Object.values(isMap(s.env) ? s.env : {}).map(String),
+        typeof s.run === "string" ? s.run : "",
+      ])
+      .join("\n"),
+    /github\.event\.pull_request\.merge_commit_sha/,
+    `${rel} must read merge_commit_sha from the REST API, never the event payload (#843) — ` +
+      "the payload field is race-dependent and null on a perfectly mergeable PR"
+  );
+  assert.match(
+    String(step.run),
+    /gh api/,
+    `${rel} must resolve the merge sha with \`gh api\` (#843)`
+  );
+  assert.match(
+    String(step.run),
+    /pulls\/\$PR_NUMBER/,
+    `${rel} must query \`pulls/{n}\` for this PR to obtain the merge result (#843)`
+  );
+  assert.match(
+    String(step.run),
+    /merge_commit_sha/,
+    `${rel} must read the merge commit from the API response (#843)`
   );
   assert.match(
     String(step.run),
     /-z "\$MERGE_SHA"/,
-    `${rel} must fail closed with its own message when \`merge_commit_sha\` is empty (a conflicted ` +
+    `${rel} must fail closed with its own message when no merge commit exists at all (a conflicted ` +
       "PR has no merge result to validate — that must not be reported as a workflow finding)"
   );
   assert.ok(
     isMap(doc.permissions) && Object.hasOwn(doc.permissions, "contents"),
     `${rel} must grant \`contents: read\``
   );
-  assert.ok(
-    !Object.hasOwn(doc.permissions, "pull-requests"),
-    `${rel} must not grant the unused \`pull-requests: read\` scope (#675 P2-h)`
+  // #843 INVERTS #675 P2-h. The scope was unused while the merge sha came from the
+  // event payload; resolving it from `GET /repos/{owner}/{repo}/pulls/{n}` reads PR
+  // metadata, so the scope is REQUIRED now. Re-removing it breaks the job at
+  // runtime (403), which is why this asserts the exact value rather than presence.
+  assert.equal(
+    doc.permissions?.["pull-requests"],
+    "read",
+    `${rel} must grant \`pull-requests: read\` — the merge sha is resolved from the REST API, ` +
+      "which needs to read this PR's metadata (#843; #675 P2-h's removal is now wrong)"
   );
+});
+
+// #843 — EXECUTE the workflow's run block, don't just pattern-match it.
+//
+// The structural assertions above prove the right CALLS and KEYS are present;
+// they cannot prove the shell + jq actually RUN. That gap is not theoretical:
+// while writing #843 the first two versions of this snippet both passed every
+// structural check and both failed at runtime —
+//   (1) `(.mergeable // "unknown")` returns the string "unknown" for a JSON
+//       `false` (jq's `//` treats false like null), silently swallowing the
+//       conflict signal, and
+//   (2) `"…" + (.mergeable)` throws `cannot add: string and boolean` because
+//       `mergeable` is a JSON boolean, not a string — a jq error that would have
+//       redded the job on EVERY PR that got past it.
+// A guard that can only fail structurally is a guard for the wrong bug, so this
+// test runs the step's real `run` body against a stubbed `gh` and asserts the
+// resolved sha reaches the checker.
+//
+// `jq` is REQUIRED, not optional. `gh api --jq` is backed by jq, so the stub
+// applies the step's real expression with the real jq — that is what makes this
+// an execution test rather than a second structural one. An earlier revision
+// SKIPPED when jq was absent, which made the leg a silent no-op that still
+// reported 121 passed and satisfied REQUIRED_TESTS — a vacuous pass, the exact
+// class #820 exists to catch. A missing jq is now a loud failure with an
+// actionable message (jq ships on GitHub's ubuntu-latest runners).
+test("workflow-lock.yml's merge-sha resolution EXECUTES and hands the API's sha to the checker (#843)", () => {
+  const rel = ".github/workflows/workflow-lock.yml";
+  const doc = parseWorkflowYaml(fs.readFileSync(path.join(REPO_ROOT, rel), "utf8"));
+  const step = doc.jobs["workflow-lock"].steps.find(
+    (s) => typeof s.run === "string" && s.run.includes("check-pi-pin-lockstep.mjs --head-ref")
+  );
+  assert.ok(
+    hasJq(),
+    "the #843 execution leg requires `jq` — `gh api --jq` is jq, so without it this test " +
+      "would be a vacuous pass rather than a real execution check (#820). Install jq, or " +
+      "replace this leg with an execution harness that does not need it."
+  );
+  // Stub `gh`: hermetic (no network, no auth, no rate limit). It answers the
+  // `--jq` argument the way `gh api` does — by applying the expression with jq —
+  // so the EXPRESSION UNDER TEST is genuinely exercised, not bypassed. It serves
+  // a SEQUENCE of canned responses (one per line, the last repeating) so the
+  // async-mergeability poll can be driven deterministically.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wf-lock-843-"));
+  try {
+    const binDir = path.join(dir, "bin");
+    fs.mkdirSync(binDir);
+    fs.writeFileSync(
+      path.join(binDir, "gh"),
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        'expr=""',
+        'while [ $# -gt 0 ]; do case "$1" in --jq) expr="$2"; shift 2;; *) shift;; esac; done',
+        "n=0",
+        'if [ -f "$GH_STUB_COUNTER" ]; then n="$(cat "$GH_STUB_COUNTER")"; fi',
+        'total="$(wc -l < "$GH_STUB_SEQUENCE" | tr -d " ")"',
+        'idx=$((n + 1))',
+        'if [ "$idx" -gt "$total" ]; then idx="$total"; fi',
+        'json="$(sed -n "${idx}p" "$GH_STUB_SEQUENCE")"',
+        'echo $((n + 1)) > "$GH_STUB_COUNTER"',
+        'printf %s "$json" | jq -r "$expr"',
+      ].join("\n") + "\n",
+      { mode: 0o755 }
+    );
+    // Replace only the final checker invocation so the test observes the REF it
+    // would have received instead of running the whole checker in-process.
+    const body = step.run.replace(
+      /node scripts\/check-pi-pin-lockstep\.mjs --head-ref "\$MERGE_SHA"/,
+      'echo "REF=$MERGE_SHA"'
+    );
+    assert.notEqual(body, step.run, "the fixture must have replaced the checker invocation");
+    const runBody = (responses) => {
+      const seq = path.join(dir, "responses.txt");
+      fs.writeFileSync(seq, responses.map((r) => JSON.stringify(r)).join("\n") + "\n");
+      fs.rmSync(path.join(dir, "counter"), { force: true });
+      return spawnSync("bash", ["-e", "-c", body], {
+        env: {
+          ...process.env,
+          PATH: `${binDir}:${process.env.PATH}`,
+          GH_STUB_SEQUENCE: seq,
+          GH_STUB_COUNTER: path.join(dir, "counter"),
+          GITHUB_REPOSITORY: "owner/repo",
+          PR_NUMBER: "843",
+          HEAD_SHA: "deadbeef",
+          // Keep the poll fast in the suite; the loop logic is what is under test.
+          MERGE_POLL_SLEEP: "0",
+        },
+        encoding: "utf8",
+      });
+    };
+    // (a) A MERGEABLE PR: the API's sha must reach the checker. `mergeable` is a
+    // JSON BOOLEAN here on purpose — the `string + boolean` jq error above lived
+    // in exactly this case, and a string-typed stub would hide it.
+    const ok = runBody([{ merge_commit_sha: "abc123", mergeable: true }]);
+    assert.equal(ok.status, 0, `a mergeable PR must pass; stderr=${ok.stderr}`);
+    assert.match(ok.stdout, /REF=abc123/, `the API's sha must reach --head-ref; got ${ok.stdout}`);
+    // (b) NO merge commit AND mergeable=false (a conflicted PR): fail closed, and
+    // name the CONFLICT — not a generic unknown. This is the assertion that pins
+    // the `// "unknown"` false-swallowing bug: with it, MERGEABLE was "unknown"
+    // and the conflict branch was unreachable.
+    const conflicted = runBody([{ merge_commit_sha: null, mergeable: false }]);
+    assert.notEqual(conflicted.status, 0, "an absent merge commit must fail closed");
+    assert.match(conflicted.stdout, /No merge commit exists/);
+    assert.match(
+      conflicted.stdout,
+      /mergeable=false/,
+      "a conflicted PR must be reported as mergeable=false, not degraded to unknown"
+    );
+    assert.match(conflicted.stdout, /conflicts with its base/);
+    // (c) NO merge commit and mergeability STILL UNRESOLVED (null) after every
+    // attempt: still fail closed, and say it was a timing condition rather than
+    // pretending it is a conflict.
+    const unresolved = runBody([{ merge_commit_sha: null, mergeable: null }]);
+    assert.notEqual(unresolved.status, 0, "an absent merge commit must fail closed");
+    assert.match(unresolved.stdout, /No merge commit exists/);
+    assert.match(
+      unresolved.stdout,
+      /still reported no merge_commit_sha/,
+      "an unresolved mergeability must be reported as a timing condition, not a conflict"
+    );
+    assert.doesNotMatch(unresolved.stdout, /conflicts with its base/);
+    // (d) ASYNC MERGEABILITY (the poll): the first response has mergeable=null
+    // (GitHub still computing), the second carries the merge commit. A single-call
+    // implementation reds this PR falsely — which is #843's own bug class in a
+    // narrower window — so this case is the regression pin for the poll.
+    const polled = runBody([
+      { merge_commit_sha: null, mergeable: null },
+      { merge_commit_sha: "def456", mergeable: true },
+    ]);
+    assert.equal(polled.status, 0, `the poll must resolve an async mergeable PR; got ${polled.stdout}`);
+    assert.match(polled.stdout, /REF=def456/, "the POLLED sha must reach --head-ref");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // One RED fixture per round-2 bypass class, at the LOCK level: the old design
