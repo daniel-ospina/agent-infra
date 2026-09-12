@@ -55,9 +55,14 @@
 #   PR_NUMBER=123 bash scripts/check-pipeline-compliance.sh
 #   GH_REPO=owner/repo PR_NUMBER=123 bash scripts/check-pipeline-compliance.sh
 #
+#   #792 pre-PR mode (issue-side artifacts only — b + d-via-Wiring):
+#   bash scripts/check-pipeline-compliance.sh --issue-only <N|owner/repo#N>
+#
 # Env:
 #   GH_REPO                       owner/repo (default: auto-detect from git remote)
 #   PR_NUMBER                     PR number (or positional arg)
+#   PIPELINE_COMPLIANCE_ISSUE_ONLY  1 = #792 issue-only (pre-PR) mode
+#   PIPELINE_COMPLIANCE_ISSUE       issue for issue-only mode: N or owner/repo#N
 #   PIPELINE_COMPLIANCE_SKIP      1 = emergency override: skip gate, loud warning
 #   PIPELINE_COMPLIANCE_DRY_RUN   1 = print what WOULD be checked, no gh calls
 #   PIPELINE_COMPLIANCE_FAIL_ALL  1 = with DRY_RUN: simulate failures to exercise
@@ -67,6 +72,21 @@ set -euo pipefail
 
 # ── Inputs ──────────────────────────────────────────────────────────────────
 PR_NUMBER="${1:-${PR_NUMBER:-}}"
+# #792 — issue-only (pre-PR) mode. Evaluates the target issue's artifacts
+# (b scoping comment; d via the file-independent Wiring branch) and skips the
+# PR-diff-dependent checks (a, c, e), which have nothing to read before a PR
+# exists. It exists so the commit-workflow preflight can detect a missing
+# artifact in seconds instead of after a completed review loop + PR, where the
+# retro artifact invalidates the reviewed SHA and the gate cost is paid twice.
+# It NEVER changes a full-PR verdict: ISSUE_ONLY=0 is the only path a PR takes.
+ISSUE_ONLY="${PIPELINE_COMPLIANCE_ISSUE_ONLY:-0}"
+ISSUE_TARGET=""
+ISSUE_REF=""
+if [[ "${1:-}" == "--issue-only" ]]; then
+  ISSUE_ONLY=1
+  ISSUE_TARGET="${2:-${PIPELINE_COMPLIANCE_ISSUE:-}}"
+  PR_NUMBER=""
+fi
 GH_REPO="${GH_REPO:-}"
 DRY_RUN="${PIPELINE_COMPLIANCE_DRY_RUN:-0}"
 FAIL_ALL="${PIPELINE_COMPLIANCE_FAIL_ALL:-0}"
@@ -82,8 +102,15 @@ Usage:
   bash scripts/check-pipeline-compliance.sh <PR_NUMBER>
   PR_NUMBER=123 GH_REPO=owner/repo bash scripts/check-pipeline-compliance.sh
 
+  #792 pre-PR mode — issue-side artifacts only (b + d-via-Wiring):
+  bash scripts/check-pipeline-compliance.sh --issue-only <N|owner/repo#N>
+  PIPELINE_COMPLIANCE_ISSUE_ONLY=1 PIPELINE_COMPLIANCE_ISSUE=<N|owner/repo#N> \
+    bash scripts/check-pipeline-compliance.sh
+
 Env:
   GH_REPO                       owner/repo (default: auto-detect from git remote)
+  PIPELINE_COMPLIANCE_ISSUE_ONLY  1 = issue-only (pre-PR) mode
+  PIPELINE_COMPLIANCE_ISSUE       issue for issue-only mode: N or owner/repo#N
   PIPELINE_COMPLIANCE_SKIP=1    emergency override (loud warning)
   PIPELINE_COMPLIANCE_DRY_RUN=1 print what WOULD be checked (no gh calls)
   PIPELINE_COMPLIANCE_FAIL_ALL=1 with DRY_RUN: simulate all failures
@@ -100,12 +127,28 @@ if [[ "${PIPELINE_COMPLIANCE_SKIP:-0}" == "1" ]]; then
 fi
 
 # ── Guards ──────────────────────────────────────────────────────────────────
-if [[ -z "$PR_NUMBER" && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" ]]; then
+if [[ ! "$ISSUE_ONLY" =~ ^[01]$ ]]; then
+  echo "❌ PIPELINE_COMPLIANCE_ISSUE_ONLY must be 0 or 1, got: '$ISSUE_ONLY'." >&2
+  exit 2
+fi
+if [[ "$ISSUE_ONLY" == "1" ]]; then
+  # #792 pre-PR mode: the target is an ISSUE, not a PR. A bare number resolves
+  # against $GH_REPO below; owner/repo#N is explicit (cross-repo supported, the
+  # same way check (a) resolves a cross-repo reference).
+  if [[ -z "$ISSUE_TARGET" ]]; then
+    echo "❌ --issue-only needs an issue: bash scripts/check-pipeline-compliance.sh --issue-only <N|owner/repo#N>" >&2
+    usage
+    exit 2
+  fi
+  if [[ ! "$ISSUE_TARGET" =~ ^([0-9]+|[^/[:space:]]+/[^/[:space:]]+#[0-9]+)$ ]]; then
+    echo "❌ --issue-only target must be an issue number or owner/repo#N, got: '$ISSUE_TARGET'." >&2
+    exit 2
+  fi
+elif [[ -z "$PR_NUMBER" && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" ]]; then
   echo "❌ No PR number given." >&2
   usage
   exit 2
-fi
-if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" ]]; then
+elif [[ ! "$PR_NUMBER" =~ ^[0-9]+$ && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" ]]; then
   echo "❌ PR_NUMBER must be numeric, got: '$PR_NUMBER'." >&2
   exit 2
 fi
@@ -150,6 +193,40 @@ fail() { printf '❌ [%s] %s\n' "$1" "$2"; FAILURES=$((FAILURES + 1)); }
 # record-review.test.sh.
 CLOSING_KW='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
 TRACE_KW='\b(ref(s|erences?)?|part[[:space:]]+of|advance(s|d)?|track(s|ed)?|relates?[[:space:]]+to)'
+
+# Evidence patterns for checks (c) and (e) and the #513 clean-micro binding —
+# the single source of truth, shared by the live checks and the SELF_TEST
+# fixtures (so the regression test exercises the PRODUCTION path, not a copy).
+REVIEW_EVIDENCE_RE='code-review|reviewer|\[review\]|VGATE|review[[:space:]]+recorded|review-enforcer'
+TEST_EVIDENCE_RE='tests[[:space:]]+green|[0-9]+[[:space:]]+passed|[0-9]+/[0-9]+|VGATE[[:space:]]+PASS|test[[:space:]]+suite|pytest|npm[[:space:]]+test|vitest'
+CLEAN_MICRO_MARKER_RE='verdict=clean-micro @ [0-9a-f]{40}'
+
+# ── #836: never pipe a multi-KB string into `grep -q` ────────────────────────
+# Under `set -euo pipefail`, `printf … | grep -q …` is a RACE on any input well
+# above PIPE_BUF: `grep -q` exits at the FIRST match while `printf` is still
+# writing, so `printf` takes SIGPIPE (exit 141) and pipefail makes the WHOLE
+# pipeline non-zero. The `if`/`elif` then takes the else branch and reports
+# PRESENT evidence as missing. Measured on PR #823: 3 failures in 4 runs, with
+# the failure moving between checks (c) and (e) while the evidence text was
+# unchanged (9 body / 6 commit matches for (c); 16 / 33 for (e)) and a re-run of
+# the identical job passing. Reproduced locally at 66 KB: 20/25 runs of the old
+# idiom false-negated, 0/25 with a here-string; at 256 KB and 1 MB the old idiom
+# failed 30/30. The gate is a REQUIRED status check, so a false block can only be
+# merged around with --admin/--auto — both gate bypasses.
+#
+# A here-string has NO reader process to close the write end: `grep -q` reads to
+# EOF, so no SIGPIPE can reach the writer. These matchers are the ONLY call
+# sites for the two evidence patterns — the SELF_TEST #836 fixtures call them
+# directly, which is what makes the regression test a pin on the real code.
+#
+# The direction of the bug differed per site, which is why every
+# `printf … | grep -q` in this script was replaced in the same pass:
+# pr_is_docs_only's `! printf … | grep -qvE` and the #513 clean-micro binding
+# were FAIL-OPEN (a raced pipeline read as "docs-only" / "marker absent"),
+# while checks (b), (c), (d) and (e) were fail-closed false BLOCKS.
+has_review_evidence() { grep -qiE "$REVIEW_EVIDENCE_RE" <<<"$1"; }
+has_test_evidence() { grep -qiE "$TEST_EVIDENCE_RE" <<<"$1"; }
+has_clean_micro_marker() { grep -qE "$CLEAN_MICRO_MARKER_RE" <<<"$1"; }
 
 # parse_issue_ref <text> [<kw-pattern>] — print the first issue reference
 # resolved by a closing keyword in <text>, as "owner/repo#N" ("" when none).
@@ -275,7 +352,11 @@ pr_is_docs_only() {
   # path whenever present).
   paths="$(printf '%s\n' "$rows" | LC_ALL=C awk -F '\t' '{ print $2; if ($3 != "") print $3 }')"
   [[ -n "$paths" ]] || return 1
-  ! printf '%s\n' "$paths" | grep -qvE '^docs/'
+  # #836 — here-string, never `printf … | grep -q`. This one was the most
+  # dangerous site of the family: a raced pipeline INVERTS to "docs-only"
+  # (fail-OPEN), which unlocks check (a)'s non-closing traceability keyword for
+  # a PR that touches code.
+  ! grep -qvE '^docs/' <<<"$paths"
 }
 
 # resolve_issue_ref <pr-body> <files> — check (a)'s resolution, shared with
@@ -346,7 +427,11 @@ run_checks() {
   fi
 
   echo "=== Pipeline Compliance Gate ==="
-  echo "PR:   $GH_REPO#$PR_NUMBER"
+  if [[ "$ISSUE_ONLY" == "1" ]]; then
+    echo "Issue: $ISSUE_REF (issue-only preflight — checks a/c/e skipped)"
+  else
+    echo "PR:   $GH_REPO#$PR_NUMBER"
+  fi
   echo ""
 
   # a. LINKED ISSUE — closing keyword in the PR body; "owner/repo#N" (repo =
@@ -359,10 +444,18 @@ run_checks() {
   # keyword would force a FALSE close of the linked issue. The closing form
   # always wins when both are present, and the fallback is unreachable for
   # any PR that touches a non-docs file (pr_is_docs_only).
-  issue_ref="$(resolve_issue_ref "$PR_BODY" "$FILES")"
-  issue_ref_kind="closing"
-  if [[ -n "$issue_ref" && -z "$(parse_issue_ref "$PR_BODY")" ]]; then
-    issue_ref_kind="traceability"
+  if [[ "$ISSUE_ONLY" == "1" ]]; then
+    # #792 --issue-only: the target issue is an INPUT, not a PR-body parse —
+    # pre-PR there is no PR body for check (a) to read. Skipped with a named
+    # reason; the full-PR path below is untouched.
+    issue_ref="$ISSUE_REF"
+    issue_ref_kind="issue-only"
+  else
+    issue_ref="$(resolve_issue_ref "$PR_BODY" "$FILES")"
+    issue_ref_kind="closing"
+    if [[ -n "$issue_ref" && -z "$(parse_issue_ref "$PR_BODY")" ]]; then
+      issue_ref_kind="traceability"
+    fi
   fi
   issue_number="${issue_ref##*#}"
   issue_repo="${issue_ref%#*}"
@@ -370,7 +463,10 @@ run_checks() {
   if [[ -n "$issue_ref" && -n "$issue_repo" && "$issue_repo" != "$GH_REPO" ]]; then
     issue_display="$issue_repo#$issue_number"
   fi
-  if [[ -n "$issue_ref" ]]; then
+  if [[ "$ISSUE_ONLY" == "1" ]]; then
+    echo "ℹ️  [a] Skipped: --issue-only mode evaluates the target issue's artifacts directly (no PR body exists yet)."
+    echo ""
+  elif [[ -n "$issue_ref" ]]; then
     if [[ "$issue_ref_kind" == "closing" ]]; then
       pass a "linked issue $issue_display (closing keyword in PR body)"
     else
@@ -387,8 +483,8 @@ run_checks() {
   fi
 
   # Tier from issue labels.
-  if printf '%s\n' "$LABELS" | grep -qx 'complexity:micro'; then is_micro=true; tier="micro"; fi
-  if printf '%s\n' "$LABELS" | grep -qE '^complexity:(standard|complex)$'; then is_stdcomplex=true; tier="standard/complex"; fi
+  if grep -qx 'complexity:micro' <<<"$LABELS"; then is_micro=true; tier="micro"; fi
+  if grep -qE '^complexity:(standard|complex)$' <<<"$LABELS"; then is_stdcomplex=true; tier="standard/complex"; fi
   echo "Tier: $tier (issue $issue_display)"
   echo ""
 
@@ -397,7 +493,7 @@ run_checks() {
     echo "ℹ️  [b–e] Skipped: issue $issue_display is complexity:micro (micro-tier exemption)."
     echo ""
   else
-    if printf '%s' "$SCOPING_COMMENT" | grep -q '<!-- issue-scoping:'; then
+    if grep -qF '<!-- issue-scoping:' <<<"$SCOPING_COMMENT"; then
       pass b "scoping comment present on issue $issue_display (<!-- issue-scoping: marker)"
     else
       fail b "no scoping comment on issue $issue_display — a comment with the marker \"<!-- issue-scoping:\" is required."
@@ -407,7 +503,11 @@ run_checks() {
 
     # c. CODE-REVIEW EVIDENCE — PR body or any PR commit message.
     EVID_TEXT="$(printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS")"
-    if printf '%s' "$EVID_TEXT" | grep -qiE 'code-review|reviewer|\[review\]|VGATE|review[[:space:]]+recorded|review-enforcer'; then
+    if [[ "$ISSUE_ONLY" == "1" ]]; then
+      # #792: needs the PR body/commits, which do not exist pre-PR. Skipped
+      # with a named reason; the merge-time run still enforces it.
+      echo "ℹ️  [c] Skipped: --issue-only mode (needs the PR body/commits — enforced at the required status check)."
+    elif has_review_evidence "$EVID_TEXT"; then
       # #513 verdict-tier binding (Approach B): clean-micro certifies the
       # MICRO process only (record-review.sh verifies the linked issue's
       # complexity:micro label at mint; micro skips checks b–e, so reaching
@@ -421,7 +521,7 @@ run_checks() {
       # record-review.sh MARKER shape (verdict=… @ <40-hex sha>) — never bare
       # prose mentioning the marker text (this PR's own description tripped
       # the bare-substring grep on the first pipeline-compliance run).
-      if printf '%s' "$EVID_TEXT" | grep -qE 'verdict=clean-micro @ [0-9a-f]{40}'; then
+      if has_clean_micro_marker "$EVID_TEXT"; then
         fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
       else
         pass c "code-review evidence in PR body/commits (review dispatch marker)"
@@ -436,7 +536,7 @@ run_checks() {
     # d. PLAN DOC — standard/complex only.
     if [[ "$is_stdcomplex" == "true" ]]; then
       plan_file="$(printf '%s\n' "$files_plain" | grep -E '^docs/plans/.*\.md$' | head -1 || true)"
-      if printf '%s' "$SCOPING_COMMENT" | grep -qi 'wiring'; then wiring_found="yes"; fi
+      if grep -qi 'wiring' <<<"$SCOPING_COMMENT"; then wiring_found="yes"; fi
       # The Wiring alternative is file-independent, so it must be evaluated
       # BEFORE the files_ok guard: otherwise an unvalidatable list would
       # report check (d) as a plan-doc failure even when a Wiring section
@@ -447,6 +547,15 @@ run_checks() {
         pass d "plan doc in PR ($plan_file)"
       elif [[ "$wiring_found" == "yes" ]]; then
         pass d "plan evidence: Wiring section (wiring-check table) in scoping comment"
+      elif [[ "$ISSUE_ONLY" == "1" ]]; then
+        # #792: pre-PR there is no diff, so the docs/plans/*.md branch is
+        # unprovable BY CONSTRUCTION. The file-independent Wiring alternative
+        # was already evaluated above (and did not pass), so this is a real
+        # miss — report the LOCAL remedy rather than the unprovable-list text
+        # (which would name a cause that is not true in this mode).
+        fail d "no plan evidence for issue $issue_display (complexity:standard/complex) — the scoping comment must contain a \"Wiring\" section (or the PR must add a file under docs/plans/*.md)."
+        echo "      Missing: wiring-check table in the scoping comment (issue-only mode cannot see the PR's docs/plans/*.md diff)."
+        echo "      Invoke:  issue-scoping — it posts the Wiring table; writing-plans writes the plan doc."
       elif [[ "$files_ok" != "true" ]]; then
         fail d "cannot validate the PR's file list — plan-doc evidence is unprovable (row validation failed, or the list did not match the PR's file count)."
         echo "      Missing: a validatable diff list."
@@ -467,7 +576,11 @@ run_checks() {
     # test-run markers in the PR body / commit messages. PRs whose diff is
     # only docs/skills/templates/config (no runtime code) are exempt.
     runtime_file="$(printf '%s\n' "$files_plain" | grep -E '^(extensions/.*\.(ts|js)|bin/.*\.js)$' | grep -vE '\.test\.(ts|js)$' | head -1 || true)"
-    if [[ "$files_ok" != "true" ]]; then
+    if [[ "$ISSUE_ONLY" == "1" ]]; then
+      # #792: needs the PR's diff (runtime-code detection) and its body. Both
+      # do not exist pre-PR — skipped here, still enforced at merge time.
+      echo "ℹ️  [e] Skipped: --issue-only mode (needs the PR's file list and body — enforced at the required status check)."
+    elif [[ "$files_ok" != "true" ]]; then
       # An unvalidatable diff list must FAIL check (e), not skip it. Skipping
       # reads as "this PR changes no runtime code", which is exactly what a
       # forged/truncated list wants — a runtime PR could pass by including a
@@ -482,7 +595,7 @@ run_checks() {
       test_evidence="$(printf '%s\n' "$files_valid" | LC_ALL=C awk -F '\t' '$1 == "added" || $1 == "modified" { print $2 }' | grep -E '\.test\.(ts|js)$' | head -1 || true)"
       if [[ -n "$test_evidence" ]]; then
         pass e "test coverage evidence: test file change in diff ($test_evidence)"
-      elif printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS" | grep -qiE 'tests[[:space:]]+green|[0-9]+[[:space:]]+passed|[0-9]+/[0-9]+|VGATE[[:space:]]+PASS|test[[:space:]]+suite|pytest|npm[[:space:]]+test|vitest'; then
+      elif has_test_evidence "$(printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS")"; then
         pass e "test coverage evidence: test-run markers in PR body/commits"
       else
         fail e "no test coverage evidence — this PR changes runtime code ($runtime_file) but shows no sign that tests were run."
@@ -504,12 +617,29 @@ summarize() {
     echo "   Fix the items above, then re-run. Each failure names the missing artifact and the skill that produces it."
     return 1
   fi
-  echo "✅ PIPELINE COMPLIANCE: PASS — scoping/review/plan/test evidence present."
+  if [[ "$ISSUE_ONLY" == "1" ]]; then
+    echo "✅ PIPELINE COMPLIANCE (issue-only preflight): PASS — issue-side artifacts present (scoping comment / Wiring). Checks a/c/e are PR-dependent and run at the required status check."
+  else
+    echo "✅ PIPELINE COMPLIANCE: PASS — scoping/review/plan/test evidence present."
+  fi
   return 0
 }
 
 # ── Dry-run plan (no gh calls) ──────────────────────────────────────────────
 if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
+  if [[ "$ISSUE_ONLY" == "1" ]]; then
+    echo "=== Pipeline Compliance Gate — ISSUE-ONLY preflight (DRY RUN — no gh calls) ==="
+    echo "Issue: $ISSUE_TARGET"
+    echo ""
+    echo "Would check, in order (issue-side only — no PR exists at preflight):"
+    echo "  b. SCOPING COMMENT  gh api repos/<repo>/issues/<n>/comments → search for '<!-- issue-scoping:' marker"
+    echo "  d. WIRING           the scoping comment's 'Wiring' section, for complexity:standard/complex only (the docs/plans/*.md branch needs the PR diff and is checked at merge time)"
+    echo ""
+    echo "Skipped as PR-dependent: a (PR body), c (PR body/commits), e (PR diff + body) — all enforced at the required status check."
+    echo "Exemptions: complexity:micro skips b–d (identical tier exemption to the full run)."
+    echo "Exit: 0 (compliant, simulated)."
+    exit 0
+  fi
   echo "=== Pipeline Compliance Gate (DRY RUN — no gh calls) ==="
   echo "PR:   $GH_REPO#$PR_NUMBER"
   echo ""
@@ -808,12 +938,224 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_trace 'prefs #42' ''
   expect_trace 'preferences #42' ''
 
+  # ── #836: broken-pipe regression (checks c/e must not false-negate) ───────
+  # See the `has_review_evidence` rationale block above. The bug was a RACE, so
+  # a single run cannot pin it: every assertion below repeats REPS times and
+  # requires EVERY run to agree. Pre-fix, the end-to-end half of this block was
+  # RED on ~75–80 % of runs — re-running the check is what "fixed" it in CI,
+  # which is exactly the flake this pins out.
+  REPS=25
+  big_filler="$(LC_ALL=C awk 'BEGIN { for (i = 0; i < 1200; i++) print "lorem ipsum dolor sit amet consectetur adipiscing elit" }')"
+  # The matching token sits on the FIRST line = maximum race pressure: `grep -q`
+  # matches immediately while a naive writer is still writing the remaining
+  # ~64 KB of evidence text.
+  big_review="review recorded (code-review dispatched on the head commit)
+$big_filler"
+  big_tests="test suite green: 114/114 passed
+$big_filler"
+  big_absent="$big_filler"
+
+  # The fixture must exceed PIPE_BUF by orders of magnitude — assert it, so the
+  # test cannot silently degrade into an input too small to race.
+  for _f in "$big_review" "$big_tests" "$big_absent"; do
+    _fb="$(printf '%s' "$_f" | wc -c | tr -d ' ')"
+    if [[ "$_fb" -le 65536 ]]; then
+      printf '❌ SELF-TEST SETUP (#836): evidence fixture is only %s bytes (must exceed 65536)\n' "$_fb" >&2
+      selffail=$((selffail + 1))
+    fi
+  done
+
+  assert_repeated() {
+    local name="$1" fn="$2" text="$3" want="$4" i got bad=0 wantdesc misdesc
+    if [[ "$want" == "0" ]]; then wantdesc="present"; misdesc="absent"; else wantdesc="absent"; misdesc="present"; fi
+    for ((i = 0; i < REPS; i++)); do
+      if "$fn" "$text"; then got=0; else got=1; fi
+      [[ "$got" == "$want" ]] || bad=$((bad + 1))
+    done
+    if [[ "$bad" -eq 0 ]]; then
+      printf '✅ %s: %s/%s runs reported %s (%s-byte input)\n' \
+        "$name" "$REPS" "$REPS" "$wantdesc" "$(printf '%s' "$text" | wc -c | tr -d ' ')"
+    else
+      printf '❌ %s: %s/%s runs disagreed — evidence reported %s (BROKEN-PIPE regression, #836)\n' \
+        "$name" "$bad" "$REPS" "$misdesc" >&2
+      selffail=$((selffail + 1))
+    fi
+  }
+
+  # Positive (the regression) + negative control (so the positive cannot pass
+  # vacuously — the same >64 KB filler with no token must read as absent).
+  assert_repeated '#836 (c) large evidence present → present' has_review_evidence "$big_review" 0
+  assert_repeated '#836 (e) large evidence present → present' has_test_evidence "$big_tests" 0
+  assert_repeated '#836 (c) large evidence with NO token → absent' has_review_evidence "$big_absent" 1
+  assert_repeated '#836 (e) large evidence with NO token → absent' has_test_evidence "$big_absent" 1
+
+  # End-to-end through the REAL run_checks — the production path the CI gate
+  # takes, with a complexity:standard issue and every artifact in place except
+  # a test FILE (so check (e) itself must match the >64 KB body, not the diff).
+  # Pre-fix this produced 1–2 failures on most runs although nothing was missing.
+  big_body="Closes #1
+code-review dispatched on the head commit
+test suite green: 114/114 passed
+$big_filler"
+  e2e_bad=0
+  E2E_LOG="$(mktemp "${TMPDIR:-/tmp}/pipeline-836-e2e.XXXXXX")"
+  for ((i = 0; i < REPS; i++)); do
+    PR_BODY="$big_body"
+    COMMIT_MSGS="$big_body"
+    LABELS="complexity:standard"
+    SCOPING_COMMENT="<!-- issue-scoping: 2026-09-11 (standard) -->
+### Wiring
+| Interface | Consumer |"
+    FILES=$'added\textensions/example/sample.ts\t'
+    FILES_EXPECTED=1
+    FAILURES=0
+    run_checks > "$E2E_LOG" 2>&1 || true
+    [[ "$FAILURES" -eq 0 ]] || e2e_bad=$((e2e_bad + 1))
+  done
+  if [[ "$e2e_bad" -eq 0 ]]; then
+    printf '✅ #836 run_checks end-to-end: %s/%s runs with a %s-byte PR body → 0 failures\n' \
+      "$REPS" "$REPS" "$(printf '%s' "$big_body" | wc -c | tr -d ' ')"
+  else
+    printf '❌ #836 run_checks end-to-end: %s/%s runs reported failures with all evidence present (BROKEN-PIPE regression)\n' \
+      "$e2e_bad" "$REPS" >&2
+    grep -E '❌ \[[abcd]\]|❌ \[e\]' "$E2E_LOG" | head -3 >&2 || true
+    selffail=$((selffail + 1))
+  fi
+  rm -f "$E2E_LOG"
+
+  # ── #836 indicator 2: the idiom must not come back ──────────────────────
+  # No LIVE `printf … | grep -q …` pipeline may remain anywhere in this script.
+  # The pattern is assembled from two fragments so this file's own source cannot
+  # match itself; comment lines are excluded (the ban's rationale is written in
+  # prose, and a real pipeline is never a comment-only line).
+  anti_a='printf[^|]*'
+  anti_b='[|][[:space:]]*grep -q'
+  anti="${anti_a}${anti_b}"
+  pipe_hits="$(grep -nE "$anti" "${BASH_SOURCE[0]}" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+  if [[ -z "$pipe_hits" ]]; then
+    printf '✅ #836 static pin: no live evidence pipeline that pipes printf into grep -q in %s\n' "${BASH_SOURCE[0]}"
+  else
+    printf '❌ #836 static pin: a printf-into-grep -q pipeline is back — under pipefail its SIGPIPE false-negates evidence (and can fail-OPEN at pr_is_docs_only / the clean-micro binding). Pass the text with a here-string instead (grep -q … <<<"$text"):\n%s\n' "$pipe_hits" >&2
+    selffail=$((selffail + 1))
+  fi
+  FILES_EXPECTED=""
+  FAILURES=0
+
+  # ── #792: --issue-only preflight vectors ────────────────────────────────
+  # The mode must enforce the SAME artifacts the merge gate enforces, by the
+  # same means: (b) the scoping marker, (d) the file-independent Wiring branch,
+  # with identical tier exemptions — and it must SKIP a/c/e rather than
+  # reporting them.
+  run_io() {
+    ISSUE_ONLY=1
+    ISSUE_REF="$GH_REPO#1"
+    LABELS="$1"
+    SCOPING_COMMENT="$2"
+    PR_BODY=""; COMMIT_MSGS=""; FILES=""; FILES_EXPECTED=""
+    FAILURES=0
+    IO_LOG="$(mktemp "${TMPDIR:-/tmp}/pipeline-792-io.XXXXXX")"
+    run_checks > "$IO_LOG" 2>&1 || true
+    IO_FAILURES="$FAILURES"
+    ISSUE_ONLY=0
+  }
+  io_report() {
+    local desc="$1" ok="$2"
+    if [[ "$ok" == "1" ]]; then
+      printf '✅ #792 issue-only: %s\n' "$desc"
+    else
+      printf '❌ #792 issue-only: %s\n' "$desc" >&2
+      grep -E '❌ \[|ℹ️  \[' "$IO_LOG" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+    # $IO_LOG is NOT removed here — a vector asserts several things about the
+    # same run. Each vector ends with io_cleanup.
+  }
+  io_cleanup() { rm -f "$IO_LOG"; }
+
+  WIRING_SCOPING="<!-- issue-scoping: 2026-09-11 (standard) -->
+### Wiring
+| Interface | Consumer |"
+  MARKER_ONLY="<!-- issue-scoping: 2026-09-11 (standard) -->"
+  NO_MARKER="this issue has no scoping comment marker at all"
+
+  # 1. micro → identical tier exemption to the full run (b–e skipped, 0 failures).
+  run_io "complexity:micro" ""
+  io_report 'micro issue with no artifacts → 0 failures (b–e exempt)' \
+    "$([[ "$IO_FAILURES" -eq 0 ]] && echo 1 || echo 0)"
+  io_cleanup
+
+  # 2. standard + marker + Wiring → 0 failures, and a/c/e each named as skipped.
+  run_io "complexity:standard" "$WIRING_SCOPING"
+  io_report 'standard + marker + Wiring → 0 failures' \
+    "$([[ "$IO_FAILURES" -eq 0 ]] && echo 1 || echo 0)"
+  IO_SKIPS="$(grep -cE '\[[ace]\] Skipped: --issue-only mode' "$IO_LOG" || true)"
+  io_report 'checks a/c/e are SKIPPED with a named reason (3 skip lines)' \
+    "$([[ "$IO_SKIPS" -eq 3 ]] && echo 1 || echo 0)"
+  io_cleanup
+
+  # 3. standard + marker, NO Wiring → the real pre-PR miss: exactly 1 failure
+  #    (d), naming the local remedy — and NOT the "cannot validate the PR's file
+  #    list" text, which would name a cause that is false in this mode.
+  run_io "complexity:standard" "$MARKER_ONLY"
+  io_report 'standard + marker, no Wiring → 1 failure' \
+    "$([[ "$IO_FAILURES" -eq 1 ]] && echo 1 || echo 0)"
+  IO_REMEDY="$(grep -c 'no plan evidence for issue' "$IO_LOG" || true)"
+  IO_LISTCAUSE="$(grep -c "cannot validate the PR's file list" "$IO_LOG" || true)"
+  io_report 'the (d) failure names the LOCAL remedy, not the unprovable-list cause' \
+    "$([[ "$IO_REMEDY" -eq 1 && "$IO_LISTCAUSE" -eq 0 ]] && echo 1 || echo 0)"
+  io_cleanup
+
+  # 4. standard, NO marker, Wiring present → the marker is still required (b),
+  #    while d passes on the Wiring branch.
+  run_io "complexity:standard" "$NO_MARKER### Wiring"
+  IO_B="$(grep -c '❌ \[b\]' "$IO_LOG" || true)"
+  io_report 'standard without the scoping marker → 1 failure (b)' \
+    "$([[ "$IO_FAILURES" -eq 1 && "$IO_B" -eq 1 ]] && echo 1 || echo 0)"
+  io_cleanup
+
+  # 5. unlabeled (neither micro nor standard/complex) → non-micro, so b is
+  #    required; d is skipped by the tier rule (same ordering as the full run).
+  run_io "" "$NO_MARKER"
+  IO_B="$(grep -c '❌ \[b\]' "$IO_LOG" || true)"
+  io_report 'unlabeled issue → 1 failure (b; d skipped by tier)' \
+    "$([[ "$IO_FAILURES" -eq 1 && "$IO_B" -eq 1 ]] && echo 1 || echo 0)"
+  io_cleanup
+  unset IO_LOG IO_FAILURES IO_SKIPS IO_REMEDY IO_LISTCAUSE IO_B 2>/dev/null || true
+
+
   if [[ "$selffail" -gt 0 ]]; then
     echo "❌ SELF-TEST FAILED ($selffail assertion(s))." >&2
     exit 2
   fi
   echo "✅ SELF-TEST PASS — parse_issue_ref handles bare #N, owner/repo#N, full URL, and pull-URL exclusion; parse_trace_ref handles the docs-only traceability form; pr_is_docs_only gates the fallback and fails closed; resolve_issue_ref prefers closure."
   exit 0
+fi
+
+# ── #792 issue-only preflight (no PR required) ──────────────────────────────
+# Evaluates ONLY the checks that need no PR: (b) the scoping-comment marker and
+# (d)'s file-independent Wiring branch. Tier exemptions are identical to the full
+# run, and the verdict text names the gate's own producing skills. Checks (a),
+# (c) and (e) read a PR body / commits / diff that does not exist pre-PR, so
+# they are skipped with a named reason and remain enforced at merge time.
+#
+# This is what lets 01-preflight.md detect a missing artifact in seconds instead
+# of after a completed review loop + PR — where the retro artifact invalidates
+# the reviewed SHA, so the whole gate cost is paid twice (#745 / PR #778).
+if [[ "$ISSUE_ONLY" == "1" ]]; then
+  case "$ISSUE_TARGET" in
+    */*'#'*) ISSUE_REF="$ISSUE_TARGET" ;;
+    *)       ISSUE_REF="$GH_REPO#$ISSUE_TARGET" ;;
+  esac
+  IO_ISSUE="${ISSUE_REF##*#}"
+  IO_REPO="${ISSUE_REF%#*}"
+  IO_REPO="${IO_REPO:-$GH_REPO}"
+  echo "Resolving linked issue $ISSUE_REF (labels/comments from repos/$IO_REPO/issues/$IO_ISSUE)..." >&2
+  LABELS="$(fetch_json "issues/$IO_ISSUE/labels" '.[].name' 1 "$IO_REPO")"
+  SCOPING_COMMENT="$(fetch_json "issues/$IO_ISSUE/comments" '.[].body' 1 "$IO_REPO")"
+  PR_BODY=""; COMMIT_MSGS=""; FILES=""; FILES_EXPECTED=""
+  run_checks || true
+  summarize
+  exit
 fi
 
 # ── Live run ────────────────────────────────────────────────────────────────
