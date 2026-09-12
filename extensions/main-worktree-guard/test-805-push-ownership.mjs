@@ -93,6 +93,18 @@ async function main() {
     execSync("git add -A && git commit -qm init", { cwd: hub, stdio: "ignore" });
     execSync("git branch fix/2982-other", { cwd: hub, stdio: "ignore" });
     execSync(`git worktree add -q -b skills/3061 "${wt}"`, { cwd: hub, stdio: "ignore" });
+    // An UNRELATED repo (not agent-infra: no $AGENT_INFRA_PATH match, no
+    // manifest fingerprint) plus a worktree OF it, for the #805 P1
+    // bidirectional pins — a worktree session committing in a foreign repo
+    // must be ALLOWED, and a foreign-repo session committing in the hub must
+    // stay BLOCKED.
+    const other = join(tmp, "other");
+    const wtOther = join(tmp, "wt-other");
+    execSync(`git init -q -b main "${other}"`, { stdio: "ignore" });
+    execSync("git config user.email t@t && git config user.name t", { cwd: other, stdio: "ignore" });
+    writeFileSync(join(other, "other.txt"), "y\n");
+    execSync("git add -A && git commit -qm init", { cwd: other, stdio: "ignore" });
+    execSync(`git worktree add -q -b skills/other "${wtOther}"`, { cwd: other, stdio: "ignore" });
     // another session's checkout moves the SHARED hub off main:
     execSync("git checkout -q fix/2982-other", { cwd: hub, stdio: "ignore" });
     for (const v of HATCH_VARS) delete process.env[v];
@@ -122,6 +134,59 @@ async function main() {
     const aNope = await quiet(() => callBash("cd $BO805_NOWHERE && git commit -m x"));
     expectTrue("A #805: unresolvable cd target → BLOCK (fail-closed)",
       !!aNope && aNope.block === true, `handler returned ${JSON.stringify(aNope)}`);
+
+    // ── Scenario A2 (#805 P1): the over-block regression, BOTH directions ──
+    // Still pre-`session_start` (NO baseline — every worktree session looks
+    // like this). The #805 fix refused EVERY main checkout whenever no baseline
+    // was recorded, so a worktree session committing in an UNRELATED repo was
+    // refused too — a regression (pre-#805 this was allowed) that would get the
+    // gate routed around. The refine refuses only the session's OWN repo (a
+    // worktree shares the hub's common dir) or the agent-infra hub. These two
+    // assertions are the bidirectional pair: the ALLOW must hold, the BLOCK
+    // must NOT reopen the incident (#805 HOLE 2).
+    process.chdir(wt); // worktree session of the HUB repo, no baseline
+    const A2allow = [];
+    await quiet(async () => {
+      for (const c of [
+        `cd ${other} && git commit -m x`,        // unrelated repo's MAIN checkout
+        `git -C ${other} commit -m x`,           // same, -C spelling
+        `cd ${other} && git push`,               // unrelated repo push
+      ]) A2allow.push([c, await callBash(c)]);
+    });
+    for (const [c, r] of A2allow) {
+      expectTrue(`A2 #805 P1: worktree session in an UNRELATED repo is ALLOWED — ${JSON.stringify(c)}`,
+        r === undefined, `handler returned ${JSON.stringify(r)}`);
+    }
+    const A2block = [];
+    await quiet(async () => {
+      for (const c of [
+        `cd ${hub} && git commit -m x`,           // OWN shared checkout (repoKey equal)
+        `git -C ${hub} commit -m x`,
+      ]) A2block.push([c, await callBash(c)]);
+    });
+    for (const [c, r] of A2block) {
+      expectTrue(`A2 #805 P1: worktree session in its OWN hub is still BLOCKED — ${JSON.stringify(c)}`,
+        !!r && r.block === true, `handler returned ${JSON.stringify(r)}`);
+    }
+    // A session rooted in a DIFFERENT repo (worktree of `other`) has a
+    // repoKey that does NOT match the hub — the hub protection must then come
+    // from the isAgentInfraRepo arm, not from key equality.
+    process.chdir(wtOther);
+    const A2cross = [];
+    await quiet(async () => {
+      for (const c of [
+        "cd $AGENT_INFRA_PATH && git commit -m x",
+        `cd ${hub} && git commit -m x`,
+      ]) A2cross.push([c, await callBash(c)]);
+    });
+    for (const [c, r] of A2cross) {
+      expectTrue(`A2 #805 P1: foreign-repo session commit into the hub is BLOCKED — ${JSON.stringify(c)}`,
+        !!r && r.block === true, `handler returned ${JSON.stringify(r)}`);
+    }
+    // …and that same foreign-repo session's OWN repo is still its own (block).
+    const a2own = await quiet(() => callBash(`cd ${other} && git commit -m x`));
+    expectTrue("A2 #805 P1: foreign-repo worktree session in its OWN main checkout → BLOCK",
+      !!a2own && a2own.block === true, `handler returned ${JSON.stringify(a2own)}`);
 
     // ── Scenario B: hub-rooted session, baseline main, hub switched off-main ──
     execSync("git checkout -q main", { cwd: hub, stdio: "ignore" });
@@ -157,6 +222,7 @@ async function main() {
         "git push origin main",             // on-baseline explicit push
         "git commit -m x",                  // on-baseline commit
         "git push --force-with-lease origin main",
+        `git worktree add -b skills/3061b ${join(tmp, "wt-new")}`, // ordinary worktree create
       ]) C.push([c, await callBash(c)]);
     });
     for (const [c, r] of C) {
@@ -164,7 +230,8 @@ async function main() {
         r === undefined, `handler returned ${JSON.stringify(r)}`);
     }
     // The ordinary single-session workflow: work in a worktree, commit, push
-    // your own branch — must remain fully unblocked end to end.
+    // your own branch — must remain fully unblocked end to end. `git worktree
+    // add -b` is the CREATE step (not a branch-state op — M3 never sees it).
     process.chdir(wt);
     const CW = [];
     await quiet(async () => {
@@ -172,6 +239,7 @@ async function main() {
         "git commit -m x",
         "git push",
         "git push origin skills/3061",
+        "git push --force-with-lease origin skills/3061",
       ]) CW.push([c, await callBash(c)]);
     });
     for (const [c, r] of CW) {

@@ -521,6 +521,41 @@ ok("M2 #805: on-baseline bare push still passes (regression guard)",
   decideM2({ effectiveRepo: effMain, baseline, currentBranch: "feat/1", pushDst: null, pushTargets: [], verdict: "block:push" }) === null);
 ok("M2 #805: on-baseline commit still passes (regression guard)",
   decideM2({ effectiveRepo: effMain, baseline, currentBranch: "feat/1", verdict: "block:commit" }) === null);
+
+// ── #805 P1: no-baseline refusal is scoped to the SESSION's own checkout ────
+// "No baseline" is true for EVERY worktree session, so the original #805 arm
+// refused a worktree session committing in an UNRELATED repo too — work that
+// pre-#805 allowed (an over-blocking regression). `sessionRepoKey` (the session
+// cwd's repoKey; an explicit null = the cwd is not in any repo) plus
+// `effectiveIsAgentInfra` scope the refusal to the two targets this session
+// could be contaminating: its own shared checkout and the agent-infra hub.
+const effOther = resolveEffectiveRepo(`git -C "${OTHER}" commit -m x`, MAIN);
+ok("M2 #805 P1: no baseline + session's OWN main checkout (repoKey matches) → BLOCK", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline: undefined, currentBranch: "main", verdict: "block:commit", sessionRepoKey: mainKey });
+  return d?.block === true;
+})());
+ok("M2 #805 P1: no baseline + OWN checkout push → BLOCK", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline: undefined, currentBranch: "main", pushDst: "main", pushTargets: ["main"], verdict: "block:push", sessionRepoKey: mainKey });
+  return d?.block === true;
+})());
+ok("M2 #805 P1: no baseline + UNRELATED repo's main checkout → ALLOW (no over-block)",
+  decideM2({ effectiveRepo: effOther, baseline: undefined, currentBranch: "main", verdict: "block:commit", sessionRepoKey: mainKey }) === null);
+ok("M2 #805 P1: no baseline + UNRELATED repo push → ALLOW (no over-block)",
+  decideM2({ effectiveRepo: effOther, baseline: undefined, currentBranch: "main", pushDst: "main", pushTargets: ["main"], verdict: "block:push", sessionRepoKey: mainKey }) === null);
+ok("M2 #805 P1: no baseline + session cwd in NO repo (explicit null) + non-infra target → ALLOW",
+  decideM2({ effectiveRepo: effOther, baseline: undefined, currentBranch: "main", verdict: "block:commit", sessionRepoKey: null }) === null);
+ok("M2 #805 P1: no baseline + agent-infra target from a FOREIGN session repo → BLOCK", (() => {
+  const d = decideM2({ effectiveRepo: effOther, baseline: undefined, currentBranch: "main", verdict: "block:commit", sessionRepoKey: mainKey, effectiveIsAgentInfra: true });
+  return d?.block === true;
+})());
+ok("M2 #805 P1: no baseline + caller supplied NO session repo identity → BLOCK (fail closed)", (() => {
+  const d = decideM2({ effectiveRepo: effOther, baseline: undefined, currentBranch: "main", verdict: "block:commit" });
+  return d?.block === true;
+})());
+ok("M2 #805 P1: no baseline + target repoKey unreadable → BLOCK (fail closed)", (() => {
+  const d = decideM2({ effectiveRepo: { ...effOther, repoKey: null }, baseline: undefined, currentBranch: "main", verdict: "block:commit", sessionRepoKey: mainKey });
+  return d?.block === true;
+})());
 // resolveRepoFromInv: the unresolved-target flag is the fail-closed signal.
 ok("resolveRepoFromInv #805: unknown $VAR cd → unresolvedTarget flag + session-cwd fallback", (() => {
   const r = resolveRepoFromInv({ cdChain: ["$BO805_NOPE"], cHints: [], gitDirHint: null, vars: {} }, MAIN);

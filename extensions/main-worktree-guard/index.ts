@@ -2481,10 +2481,20 @@ export default function (pi: ExtensionAPI) {
           };
         }
         const baseline = baselines.get(pid);
+        // #805 P1: with NO baseline, decideM2 must know whether the resolved
+        // MAIN checkout is THIS session's own (a worktree shares its common
+        // dir, so `repoKey` equality identifies it) or the agent-infra hub —
+        // only those two are refused; a different repo's MAIN checkout is
+        // ordinary cross-repo work and stays allowed. Both probes spawn git, so
+        // they run only in the (rare, anomalous) no-baseline case.
         const m2 = branchOwnership.decideM2({
           effectiveRepo: m2Eff, baseline, currentBranch: m2Eff.currentBranch,
           pushDst: det.pushDst, pushTargets: det.pushTargets,
           verdict: det.verdict, allowActive: false,
+          ...(baseline ? {} : {
+            sessionRepoKey: branchOwnership.repoKey(process.cwd()) ?? null,
+            effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd),
+          }),
         });
         if (m2?.block) return { block: true, reason: m2.reason };
         return undefined; // on-baseline or unverifiable-but-exempt

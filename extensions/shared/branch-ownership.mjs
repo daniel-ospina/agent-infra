@@ -910,9 +910,20 @@ export function decideM1(currentBranch, baselineBranch) {
  * Worktree-effective repos are exempt (isWorktree true → null).
  * pushTargets is authoritative when present (multi-refspec / --delete); else
  * pushDst, else currentBranch (bare push → push.default=simple).
+ *
+ * No-baseline callers (#805 P1) must also pass:
+ *   sessionRepoKey       — repoKey of the SESSION's cwd; the string/null
+ *                          distinction is load-bearing. A string means "the
+ *                          session's own checkout is that repo"; an explicit
+ *                          null means "the session cwd is not in any repo"
+ *                          (nothing of its own to contaminate); `undefined`
+ *                          means the caller did not say → fail closed.
+ *   effectiveIsAgentInfra — the resolved MAIN checkout is the agent-infra hub
+ *                          (protect it even for a session rooted elsewhere).
  */
 export function decideM2({
   effectiveRepo, baseline, currentBranch, pushDst, pushTargets, verdict, allowActive,
+  sessionRepoKey, effectiveIsAgentInfra = false,
 }) {
   if (allowActive) return null; // marker/flag: escape hatch — M2 inactive
   // #805: a gate that cannot determine the target must REFUSE, never allow.
@@ -945,7 +956,26 @@ export function decideM2({
   // for that repo cannot prove ownership. Worktree sessions record no baseline
   // (they are isolated), so a `cd`/`-C` into the shared hub previously slipped
   // through — refuse it (fail-closed).
+  //
+  // #805 P1 (over-block regression): "no baseline" is TRUE for EVERY worktree
+  // session, so refusing every MAIN checkout also refused a worktree session
+  // committing in an UNRELATED repo (`cd ~/tortoise && git commit`) — work the
+  // session has no ownership relation to and that pre-#805 allowed. A gate that
+  // blocks legitimate work is as bad as one that allows illegitimate work: it
+  // gets disabled or routed around. The refine is: with no baseline, refuse
+  // ONLY a target this session could be contaminating — its OWN repo (a
+  // worktree shares its common dir, so `repoKey` equality is exactly "own
+  // shared checkout") or the agent-infra hub. Anything else falls through to the
+  // ordinary different-repo allow below.
   if (!baseline) {
+    const ownCheckout = effectiveIsAgentInfra === true ||
+      (effectiveRepo.repoKey != null && effectiveRepo.repoKey === sessionRepoKey);
+    // `undefined` = the caller gave no session repo identity, and a null
+    // effectiveRepo.repoKey = the target's own identity could not be read:
+    // neither can tell whether this is the session's own checkout → refuse
+    // (fail closed). An explicit null sessionRepoKey with a KNOWN target repo
+    // is the genuinely-foreign case → fall through to the different-repo allow.
+    if (sessionRepoKey !== undefined && effectiveRepo.repoKey != null && !ownCheckout) return null;
     return {
       block: true,
       reason: [
