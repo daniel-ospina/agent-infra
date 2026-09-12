@@ -1185,23 +1185,47 @@ function _worktreeDiscardBlockReason(
  *  script-file surface (`bash /tmp/restore.sh`) to a bounded depth. */
 function _worktreeDiscardBlock(command: string): string | null {
   if (!classifierLoaded) return null; // degraded import → inert (module-load tripwire guards this)
-  // Cheap superset pre-bail: a family verb anywhere in the command, OR a
-  // script file to read (the script content is where the verb may live).
-  const _verbHint = /(checkout|restore|switch|reset|show|cat-file)/.test(command);
-  const _scriptPath = extractScriptPath(command);
-  if (!_verbHint && !_scriptPath) return null;
+  // Cheap superset pre-bail. NOT a raw-verb regex: the tokenizer resolves
+  // quote-split verbs (`git ch'ec'kout -- x` ≡ `git checkout -- x`, reviewer
+  // P1), so the only safe textual bail is "no `git` anywhere and no script to
+  // read". The extractor is a pure string walk — the same cost the full
+  // classifier already pays per bash call.
+  let _scriptPath = extractScriptPath(command);
+  if (!/\bgit\b/.test(command) && !_scriptPath) return null;
   let direct: ReturnType<typeof extractWorkingTreeDiscards> = [];
   try { direct = extractWorkingTreeDiscards(command) ?? []; } catch { return null; }
   const sessionCwd = resolve(process.cwd());
   const execCwd = commandExecutionCwd(command, sessionCwd) ?? sessionCwd;
 
+  // Executable-shebang script (`./undo.sh`, `/tmp/undo.sh`): extractScriptPath
+  // only recognises interpreter WORDS (`bash x.sh`), so a directly-executed
+  // script would otherwise never be read (reviewer P1).
+  if (!_scriptPath) {
+    const firstTok = String(command).trim().split(/\s+/)[0] ?? "";
+    if (/^[.~]?\//.test(firstTok) || firstTok.startsWith("/")) {
+      try {
+        const p = realpathSync(resolve(execCwd, firstTok));
+        const st = statSync(p);
+        if (st.isFile() && (st.mode & 0o111) !== 0) _scriptPath = firstTok;
+      } catch { /* nonexistent/non-executable — not a script invocation */ }
+    }
+  }
+
   // Probe sets: the command itself, plus any script FILES it runs/sources
   // (`bash /tmp/restore.sh` is the documented backdoor shape — M4's
   // _backdoorBlock closes it only for hub sessions, so a worktree `pi -p`
-  // child could hide a discard there). Bounded depth 3, 64KB per file, cycle-
-  // guarded; a read failure is a no-op (the direct argv surface still gates).
-  const sets: { discs: ReturnType<typeof extractWorkingTreeDiscards>; baseCwd: string; script: string | null }[] = [
-    { discs: direct, baseCwd: execCwd, script: null },
+  // child could otherwise hide a discard there). Bounded depth 3, 64KB per
+  // file, cycle-guarded; a read failure is a no-op (the direct argv surface
+  // still gates).
+  //
+  // `baseCwd` is the frame resolveInvocationTarget applies the invocation's own
+  // cdChain to: for DIRECT argv invocations that is the SESSION cwd (the chain
+  // is already expressed relative to it — passing the execution cwd
+  // DOUBLE-APPLIED the cd and false-blocked `cd .. && bash noop.sh && git
+  // checkout -- <clean file>`, reviewer P1). `writeCwd` (redirect targets) IS
+  // the execution cwd.
+  const sets: { discs: ReturnType<typeof extractWorkingTreeDiscards>; baseCwd: string; writeCwd: string; script: string | null }[] = [
+    { discs: direct, baseCwd: sessionCwd, writeCwd: execCwd, script: null },
   ];
   try {
     const seen = new Set<string>();
@@ -1216,12 +1240,25 @@ function _worktreeDiscardBlock(command: string): string | null {
         if (!existsSync(real) || !statSync(real).isFile() || statSync(real).size > 64 * 1024) break;
         content = readFileSync(real, "utf8");
       } catch { break; }
-      if (/(checkout|restore|switch|reset|show|cat-file)/.test(content)) {
-        sets.push({ discs: extractWorkingTreeDiscards(content) ?? [], baseCwd: execCwd, script: p });
+      if (/(checkout|restore|switch|reset|show|cat-file|read-tree|rm)/.test(content)) {
+        sets.push({ discs: extractWorkingTreeDiscards(content) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: p });
       }
       p = extractScriptPath(content);
     }
   } catch { /* script walk is best-effort — never false-block on its failure */ }
+
+  // `eval '<payload>'` (reviewer P1): allGitInvocations does not walk eval
+  // payloads, so extract them here (one level — a nested eval is a documented
+  // residual). A payload that is not statically resolvable fails closed.
+  for (const m of String(command).matchAll(/\beval\s+(['"])([\s\S]*?)\1/g)) {
+    const payload = m[2] ?? "";
+    if (!/(checkout|restore|switch|reset|read-tree|rm)/.test(payload)) continue;
+    if (/[$`]/.test(payload)) {
+      return _worktreeDiscardBlockReason({ form: "eval-payload", scope: "all", pathspecs: [] }, execCwd, "an `eval` payload is not statically resolvable");
+    }
+    sets.push({ discs: extractWorkingTreeDiscards(payload) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+  }
+
   if (sets.every((s) => s.discs.length === 0)) return null;
 
   for (const set of sets) {
@@ -1231,32 +1268,44 @@ function _worktreeDiscardBlock(command: string): string | null {
     if (set.discs.some((d) => d.form === "cat-file-revert")) {
       try {
         const src = set.script === null ? command : readFileSync(resolve(execCwd, set.script), "utf8");
-        writeTargets = extractBashWriteTargets(src, set.baseCwd).map((t) => resolve(set.baseCwd, t.resolvedPath));
+        writeTargets = extractBashWriteTargets(src, set.writeCwd).map((t) => resolve(set.writeCwd, t.resolvedPath));
       } catch { /* best-effort — a miss only means no extra block */ }
     }
 
     for (const d of set.discs) {
-      // Unresolvable pathspec ($VAR / command substitution) — the effect is
-      // not statically verifiable → fail closed (the safe direction; the
-      // discard is real, only its blast radius is unknown).
-      if (d.pathspecs.some((p) => /[$`]/.test(String(p)))) {
-        return _worktreeDiscardBlockReason(d, set.baseCwd, "the target pathspec is not statically resolvable");
+      // Fail closed on anything whose blast radius is not statically known:
+      // `--pathspec-from-file` (the list lives in a FILE), an unresolvable
+      // `$VAR`/backtick pathspec, or an xargs/find `-exec` placeholder.
+      const unresolvable = (d as { unverifiable?: boolean }).unverifiable === true ||
+        d.pathspecs.some((p) => /[$`]/.test(String(p))) ||
+        d.pathspecs.some((p) => String(p) === "{}" || String(p) === "{}+" || String(p) === "+" || String(p).includes("{}"));
+      if (unresolvable) {
+        return _worktreeDiscardBlockReason(d, execCwd, "the target pathspec is not statically resolvable");
       }
 
       let probeCwd: string;
       let scope: { scope: string; pathspecs: string[]; fromTree?: boolean } = d;
       if (d.form === "cat-file-revert") {
-        const lands = writeTargets.filter((t) => d.pathspecs.some((p) => resolve(set.baseCwd, p) === t));
+        const lands = writeTargets.filter((t) => d.pathspecs.some((p) => resolve(set.writeCwd, p) === t));
         if (lands.length === 0) continue; // the committed content is not redirecting onto its own path
-        probeCwd = set.baseCwd;
-        scope = { scope: "paths", pathspecs: lands.map((t) => relative(set.baseCwd, t) || "."), fromTree: true };
+        probeCwd = set.writeCwd;
+        scope = { scope: "paths", pathspecs: lands.map((t) => relative(set.writeCwd, t) || "."), fromTree: true };
       } else {
-        let eff: { effectiveCwd: string } | null = null;
+        let eff: { effectiveCwd: string; worktreePath?: string | null } | null = null;
         try { eff = resolveInvocationTarget(d.inv, sessionCwd, set.baseCwd); } catch { eff = null; }
         if (eff === null) {
           return _worktreeDiscardBlockReason(d, set.baseCwd, "the invocation's effective repo could not be resolved (unresolvable cd/$VAR)");
         }
         probeCwd = eff.effectiveCwd;
+        // `--work-tree=<dir>` / a worktree git-dir targets a DIFFERENT working
+        // tree than the cwd (reviewer P2): probe the work-tree when it exists.
+        const wtHint = (d.inv as { workTreeHint?: string | null } | null)?.workTreeHint;
+        if (wtHint && wtHint !== "\u0000") {
+          try {
+            const wtReal = realpathSync(resolve(probeCwd, wtHint));
+            if (existsSync(wtReal)) probeCwd = wtReal;
+          } catch { /* unresolvable work-tree → keep the cwd probe */ }
+        }
       }
       const dirty = _discardStatusPorcelain(probeCwd, scope);
       if (dirty === true) return _worktreeDiscardBlockReason(d, probeCwd, null);

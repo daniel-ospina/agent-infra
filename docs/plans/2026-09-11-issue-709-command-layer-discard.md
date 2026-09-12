@@ -61,12 +61,22 @@ Family (token-level, from `allGitInvocations`):
   index-only and stays allow**
 - `switch` — `-f` / `--force` / `--discard-changes`
 - `reset --hard` — scope `all` (or the paths after `--`)
-- `checkout-index -f` / `-a`
+- `checkout-index -f` / `-a`, `rm -f`, `read-tree --reset -u`
 - non-git revert shape: `git show <rev>:<path>` / `cat-file` whose stdout is redirected
   onto a tracked path
-- **script files** — `bash /tmp/undo.sh` / `source f` are read (depth ≤ 3, ≤ 64KB) and
-  the same extraction runs on their content; M4's `_backdoorBlock` returns early for
-  worktrees, so this is the one surface a worktree `pi -p` child could otherwise hide in.
+- **script files** — `bash /tmp/undo.sh`, `./undo.sh` (executable) and `source f` are
+  read (depth ≤ 3, ≤ 64KB) and the same extraction runs on their content; M4's
+  `_backdoorBlock` returns early for worktrees, so this is the one surface a worktree
+  `pi -p` child could otherwise hide in. `eval '<payload>'` is extracted one level.
+
+Reviewer round-1 fold-in: long options match by **unambiguous prefix** (`--har` ≡
+`--hard`), `git checkout <tree-ish> <path>` without `--` is a path restore, quoted-split
+verbs (`git ch'ec'kout`) are resolved by the tokenizer, and the fail-closed set grew to
+`--pathspec-from-file`, xargs/find placeholders, `eval` payloads and `--work-tree`
+targets. False-positive guards: a flag before `--` is not a tree-ish, `--staged` prefixes
+stay index-only, `--ours/--theirs` and unmerged (`UU`/`AA`/`DD`) entries are not
+discards, heredoc DATA bodies and full-line `#` comments are stripped, and the direct
+invocation's cd chain is no longer double-applied.
 
 Deliberately NOT in the family: `git clean` (untracked-only — `git clean -fdx` build
 artifact cleanup in a private worktree is ordinary, and the M4/legacy arms still block
@@ -125,7 +135,7 @@ No change to `classifyGitCommand`/`classifyGitCommandDetailed` verdicts → the 
 | hatches | unit | env hatch + marker bypass M5 |
 | module load | unit | `test-module-load.mjs` stays **49 passed / 0 failed** |
 | full suite | unit | `test.mjs` no new failures (baseline on `origin/main`: 1786 passed / 2 failed) |
-| behavioral | new suite | `test-discard-gate.mjs` 79 passed / 0 failed |
+| behavioral | new suite | `test-discard-gate.mjs` 118 passed / 0 failed |
 
 ## Non-goals / residuals
 
@@ -140,6 +150,8 @@ No change to `classifyGitCommand`/`classifyGitCommandDetailed` verdicts → the 
   from an edit without reading content). Tracked as a follow-up if the fleet needs it.
 - Probe failure (`git status` errors) is fail-safe allow, matching the codebase's
   existing write-gate convention ("never false-block"); an unresolvable invocation
-  target (`$VAR` cd chain) or pathspec fails **closed**.
-- Script-file discards are covered to a bounded depth (`bash /tmp/undo.sh`); a chain
-  deeper than 3 is a documented residual (same class as the #627 residual).
+  target (`$VAR` cd chain), an unresolvable pathspec, `--pathspec-from-file`,
+  xargs/find placeholders and an unresolvable `eval` payload fail **closed**.
+- Script-file discards are covered to a bounded depth (`bash /tmp/undo.sh`,
+  `./undo.sh`); a chain deeper than 3 and a nested `eval` are documented residuals
+  (same class as the #627 residual).

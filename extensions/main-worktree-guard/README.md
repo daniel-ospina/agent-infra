@@ -66,7 +66,23 @@ destroy:
 | `git switch -f` / `--discard-changes` | all | everything tracked |
 | `git reset --hard [-- <paths>]` | all / paths | index + worktree |
 | `git checkout-index -f [-a]` | paths / all | index vs worktree |
+| `git rm -f <paths>` | paths | index + worktree |
+| `git read-tree --reset -u` | all | index + worktree |
 | `git show <rev>:<path> > <path>` | paths | committed content over the file |
+
+Long options match by **unambiguous prefix** (`--har` ≡ `--hard`, `--discard-ch` ≡
+`--discard-changes`), and `git checkout <tree-ish> <path>` without `--` is treated as
+the path restore git executes. **Fail-closed** (effect not statically resolvable):
+`--pathspec-from-file`, `$VAR`/backtick pathspecs, xargs/find `-exec` placeholders
+(`{}`/`{}+`), an unresolvable `cd` chain, and an `eval` payload that cannot be
+resolved. **Fail-open** (never false-block): an unreadable `git status` on a
+directory that is not a checkout.
+
+`git checkout --ours/--theirs`, `git restore --staged` (index-only), unmerged
+conflict entries (`UU`/`AA`/`DD`), heredoc **data** bodies and full-line `#`
+comments are explicitly NOT discards; code heredocs (`bash <<EOF`,
+`cat <<EOF | bash`) and executable scripts (`./undo.sh`, `bash undo.sh`) ARE
+walked (bounded depth 3, 64KB).
 
 The decision (`discardDestroysWip`) is pure and unit-tested: scope `all`
 blocks on ANY tracked porcelain entry; scope `paths` blocks on a
@@ -86,9 +102,10 @@ enforcement surface.
 
 `git clean` is deliberately NOT in the family (untracked-only; build-artifact
 cleanup in a private worktree is ordinary, and the M4/legacy arms already
-block it in a shared main checkout). `cp <backup> <tracked>` and arbitrary
-interpreter writers are documented residuals — indistinguishable from an edit
-without reading file content.
+block it in a shared main checkout). `cp <backup> <tracked>`, arbitrary
+interpreter writers, a script chain deeper than 3, and a nested `eval` are
+documented residuals — indistinguishable from an edit without reading file
+content (the #625 in-place overwrite gate keeps its existing shared-main scope).
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
@@ -845,7 +862,7 @@ marker fixes **guard-blocked** sessions only.
 |---|---|---|
 | `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
-| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetic hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, fail-closed targets, and both escape hatches |
+| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetic hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, `rm`/`read-tree`, script + `eval` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, comments, cd chains, conflict resolution), and both escape hatches |
 
 `test-module-load.mjs` exists because of a real regression (#744): #697 added a
 rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)

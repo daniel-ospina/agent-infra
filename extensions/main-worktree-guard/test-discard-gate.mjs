@@ -74,6 +74,16 @@ const FAMILY = [
   ["git checkout-index -f -- src/x.ts", "checkout-index", "paths", ["src/x.ts"], true],
   ["git checkout-index -a -f", "checkout-index-all", "all", [], true],
   ["git show HEAD:src/x.ts > src/x.ts", "cat-file-revert", "revert-hints", ["src/x.ts"], true],
+  // Reviewer round-1 fold-in: prefix spellings, tree-ish+paths without `--`,
+  // leading-dash pathspecs, xargs/empty pathspecs, rm/read-tree.
+  ["git reset --har", "reset-hard", "all", [], false],
+  ["git reset --h", "reset-hard", "all", [], false],
+  ["git switch --discard feat", "switch-discard", "all", [], false],
+  ["git checkout HEAD src/x.ts", "checkout-treish-paths", "paths", ["src/x.ts"], true],
+  ["git checkout -- -dashfile", "checkout-paths", "paths", ["-dashfile"], false],
+  ["printf 'a\\n' | xargs git checkout --", "checkout-pathspec-empty", "all", [], false],
+  ["git rm -f src/x.ts", "rm-force", "paths", ["src/x.ts"], true],
+  ["git read-tree --reset -u HEAD", "read-tree-reset-update", "all", [], true],
 ];
 for (const [cmd, form, scope, pathspecs, fromTree] of FAMILY) {
   const d = first(cmd);
@@ -98,12 +108,34 @@ const NOT_FAMILY = [
   "git reset --mixed HEAD~1",
   "git clean -fd",              // documented residual: untracked-only
   "git restore --staged src/x.ts", // index-only, non-destructive (#709 note)
+  "git restore --stage src/x.ts",  // index-only via unambiguous prefix
+  "git checkout --ours -- src/x.ts", // conflict resolution, not a discard
+  "git checkout --theirs -- src/x.ts",
   "ls -la",
   "cat src/x.ts",
   "rg -n foo .",
+  // Reviewer round-1 fold-in: heredoc DATA bodies and full-line comments are
+  // not code.
+  "cat <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "# git checkout -- src/x.ts\nls",
 ];
 for (const cmd of NOT_FAMILY) {
-  expect(`A2: ${cmd} → no discard descriptor`, extractWorkingTreeDiscards(cmd).length, 0);
+  expect(`A2: ${cmd.split("\n")[0]} → no discard descriptor`, extractWorkingTreeDiscards(cmd).length, 0);
+}
+
+// A2b: interpreter-fed heredocs and piped-to-shell bodies ARE code.
+for (const cmd of [
+  "bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
+  "cat <<'EOF' | bash\ngit checkout -- src/x.ts\nEOF",
+]) {
+  expect(`A2b: ${cmd.split("\n")[0]} → discard IS detected (heredoc is code)`,
+    extractWorkingTreeDiscards(cmd).length > 0, true);
+}
+
+// A2c: hidden-pathspec forms carry a fail-closed marker.
+for (const cmd of ["git checkout --pathspec-from-file=/tmp/p", "git restore --pathspec-from-file=/tmp/p", "git checkout-index -f --pathspec-from-file=/tmp/p"]) {
+  const d = first(cmd);
+  expectTrue(`A2c: ${cmd} → unverifiable (fail closed)`, !!d && d.unverifiable === true, JSON.stringify(d));
 }
 
 // A3: effect decision — block iff uncommitted tracked work would be destroyed.
@@ -118,6 +150,10 @@ const EFFECT = [
   ["?? new.txt", { scope: "all", fromTree: false }, false, "untracked-only dirt (all scope)"],
   [" M src/x.ts", { scope: "all", fromTree: false }, true, "tracked dirt (all scope)"],
   ["", { scope: "all", fromTree: false }, false, "clean tree"],
+  // Reviewer round-1 fold-in: unmerged conflict entries are not discarded WIP.
+  ["UU e.txt", { scope: "paths", fromTree: true }, false, "unmerged entry (UU)"],
+  ["AA e.txt", { scope: "all", fromTree: false }, false, "unmerged entry (AA)"],
+  ["DD e.txt", { scope: "paths", fromTree: true }, false, "unmerged entry (DD)"],
 ];
 for (const [porcelain, d, expected, why] of EFFECT) {
   expect(`A3: ${why}`, discardDestroysWip(porcelain, d), expected);
@@ -177,7 +213,8 @@ async function partB() {
     write(join(hub, "clean.txt"), "v1\n");
     write(join(hub, "dirty.txt"), "v1\n");
     write(join(hub, "staged.txt"), "v1\n");
-    gg("add clean.txt dirty.txt staged.txt && git commit -qm init", hub);
+    write(join(hub, "-dashfile"), "v1\n");
+    gg("add -A && git commit -qm init", hub);
     gg(`worktree add -q -b feat "${wt}"`, hub);
     const wtTop = execSync("git rev-parse --show-toplevel", { cwd: wt, encoding: "utf8" }).trim();
     const wtCommon = execSync("git rev-parse --git-common-dir", { cwd: wt, encoding: "utf8" }).trim();
@@ -254,6 +291,39 @@ async function partB() {
     rmSync(undo, { force: true });
     rmSync(undoClean, { force: true });
 
+    // ── B6g: reviewer round-1 bypass closures (all real git-destroy paths) ──
+    write(join(wt, "-dashfile"), "MUTANT\n");
+    const execUndo = join(tmp, "undo-exec.sh");
+    write(execUndo, "#!/bin/sh\ngit checkout -- dirty.txt\n");
+    execSync(`chmod +x ${execUndo}`);
+    const bypass = [
+      ["prefix spelling `git reset --har`", "git reset --har"],
+      ["prefix spelling `git switch --discard feat`", "git switch --discard feat"],
+      ["tree-ish+paths without `--` (`git checkout HEAD dirty.txt`)", "git checkout HEAD dirty.txt"],
+      ["quote-split verb (`git ch'ec'kout -- dirty.txt`)", "git ch'ec'kout -- dirty.txt"],
+      ["`git rm -f dirty.txt`", "git rm -f dirty.txt"],
+      ["`git read-tree --reset -u HEAD`", "git read-tree --reset -u HEAD"],
+      ["executable shebang script (direct `./undo-exec.sh`)", execUndo],
+      ["`eval 'git checkout -- dirty.txt'`", "eval 'git checkout -- dirty.txt'"],
+      ["xargs-fed empty pathspec", "printf 'dirty.txt\\n' | xargs git checkout --"],
+      ["find -exec placeholder pathspec", "find . -name dirty.txt -exec git checkout -- {} \\;"],
+      ["leading-dash pathspec (`git checkout -- -dashfile`)", "git checkout -- -dashfile"],
+    ];
+    for (const [why, cmd] of bypass) {
+      const r = await bash(cmd, wt);
+      expectTrue(`B6g: ${why} → BLOCKED`, blocked(r), JSON.stringify(r)?.slice(0, 160));
+    }
+    rmSync(execUndo, { force: true });
+    // `--work-tree` targets a DIFFERENT working tree than the cwd: run from a
+    // non-repo dir (tmp) with the dirty tree supplied only by the flag.
+    const wtFlag = await bash(`git --git-dir=${wt}/.git --work-tree=${wt} checkout -- dirty.txt`, tmp);
+    expectTrue("B6g: `--work-tree` targeting another working tree → BLOCKED (probes the work-tree)",
+      blocked(wtFlag), JSON.stringify(wtFlag)?.slice(0, 160));
+
+    // ── B6h: hidden-pathspec forms fail CLOSED ──
+    expectTrue("B6h: `--pathspec-from-file` fails closed",
+      blocked(await bash("git checkout --pathspec-from-file=/tmp/nope.txt", wt)), "was allowed");
+
     // ── B7: staged-only change survives `checkout --` but not a tree source ──
     gg("add staged.txt && printf 'staged\\n' > staged.txt && git add staged.txt", wt);
     // porcelain is now `M  staged.txt` (X=M, Y=' ') — index-only difference.
@@ -261,6 +331,24 @@ async function partB() {
       allowed(await bash("git checkout -- staged.txt", wt)), "was blocked");
     expectTrue("B7b: worktree + staged-only target → `git checkout HEAD -- staged.txt` BLOCKED (tree source)",
       blocked(await bash("git checkout HEAD -- staged.txt", wt)), "was allowed");
+    // Reviewer round-1 fold-in: a FLAG before `--` is not a tree-ish, so the
+    // index-source semantics (staged-only survives) must hold for `-q` too.
+    expectTrue("B7c: `git checkout -q -- staged.txt` ALLOWED (a flag is not a tree-ish)",
+      allowed(await bash("git checkout -q -- staged.txt", wt)), "was blocked");
+    expectTrue("B7d: `git restore --stage staged.txt` ALLOWED (index-only prefix)",
+      allowed(await bash("git restore --stage staged.txt", wt)), "was blocked");
+    // Reviewer round-1 fold-in: heredoc DATA and comments are not code.
+    mkdirSync(join(wt, "sub"), { recursive: true });
+    write(join(wt, "sub", "noop.sh"), "#!/bin/sh\ntrue\n");
+    expectTrue("B7e: `cd sub && bash sub/noop.sh && git checkout -- clean.txt` ALLOWED (cd chain not double-applied)",
+      allowed(await bash(`cd sub && bash noop.sh && git checkout -- clean.txt`, wt)), "was blocked");
+    expectTrue("B7f: heredoc DATA body mentioning a discard ALLOWED",
+      allowed(await bash("cat <<'EOF'\ngit checkout -- dirty.txt\nEOF", wt)), "was blocked");
+    const commented = join(tmp, "commented.sh");
+    write(commented, "# git checkout -- dirty.txt\nls\n");
+    expectTrue("B7g: commented-out discard in a script ALLOWED",
+      allowed(await bash(`bash ${commented}`, wt)), "was blocked");
+    rmSync(commented, { force: true });
     gg("reset -q --hard", wt); // fixture cleanup, direct git call (not the handler)
 
     // ── B8: untracked-only dirt → ALLOW (`checkout -- .` never deletes `??`) ──

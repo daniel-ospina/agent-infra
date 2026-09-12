@@ -1937,7 +1937,6 @@ export function allGitInvocations(command, seedVars = {}) {
 //                     from an edit without reading content; the #625 in-place
 //                     overwrite gate already covers the shared-main case.
 const _WT_DISCARD_FORCE_LONG = ["-f", "--force"];
-const _WT_DISCARD_FORCE_PREFIXES = ["--f", "--fo", "--for", "--forc"];
 
 /** Non-flag args of an invocation. */
 function _wtDiscardPositionals(args) {
@@ -1949,22 +1948,61 @@ function _wtDiscardShortCluster(args, letter) {
   return (args ?? []).some((a) => /^-[A-Za-z]+$/.test(a) && a.slice(1).includes(letter));
 }
 
+/**
+ * git accepts any UNAMBIGUOUS long-option prefix (`--har` ≡ `--hard`,
+ * `--discard-ch` ≡ `--discard-changes`). Exact-spelling tests are therefore a
+ * FAIL-OPEN bypass (reviewer-reproduced: `git reset --har` destroyed a dirty
+ * file while M5 allowed it). Over-matching is safe here — a block still needs
+ * the effect probe to find uncommitted work.
+ */
+function _wtLongPrefix(token, full) {
+  const t = String(token ?? "");
+  return t === full || (t.startsWith("--") && t.length > 2 && full.startsWith(t));
+}
+
+/** Any arg matching a long flag by exact spelling or unambiguous prefix. */
+function _wtHasLong(args, full) {
+  return (args ?? []).some((t) => _wtLongPrefix(t, full));
+}
+
 /** git's noarg force spellings, incl. unambiguous long prefixes (`--forc`). */
 function _wtDiscardForce(args) {
   const a = args ?? [];
   return a.some((t) => _WT_DISCARD_FORCE_LONG.includes(t)) ||
-    a.some((t) => _WT_DISCARD_FORCE_PREFIXES.includes(t)) ||
+    _wtHasLong(a, "--force") ||
     _wtDiscardShortCluster(a, "f");
+}
+
+/** `--pathspec-from-file[=f]` / `--pathspec-file-nul` hide the target list in a
+ *  FILE — the effect is not statically resolvable → the caller fails closed. */
+function _wtHasPathspecFile(args) {
+  return (args ?? []).some((t) => String(t).startsWith("--pathspec-from-file") || String(t) === "--pathspec-file-nul");
+}
+
+/** xargs/find `-exec` placeholders — the real pathspec is supplied at runtime. */
+function _wtIsPlaceholderPathspec(p) {
+  const s = String(p);
+  return s === "{}" || s === "{}+" || s === "+" || s.includes("{}");
 }
 
 function _wtDiscardFromCheckout(args) {
   const a = args ?? [];
+  if (_wtHasPathspecFile(a)) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-pathspec-file", unverifiable: true };
+  // Conflict-resolution spellings (`--ours`/`--theirs`/`-m`) are the SANCTIONED
+  // way to resolve an unmerged path — not a discard (reviewer P2).
+  if (a.some((t) => t === "--ours" || t === "--theirs" || t === "-m" || _wtLongPrefix(t, "--merge"))) return null;
+  const creates = a.some((t) => t === "-b" || t === "-B" || t === "--orphan" || t === "--detach" || t === "-t" || t === "--track");
   const dd = a.indexOf("--");
   if (dd !== -1) {
-    const pathspecs = a.slice(dd + 1).filter((p) => p && !String(p).startsWith("-"));
-    if (pathspecs.length === 0) return null;
-    // `git checkout <tree-ish> -- <paths>` overwrites the index too.
-    return { scope: "paths", pathspecs, fromTree: dd > 0, form: "checkout-paths" };
+    // After `--` EVERY token is a pathspec (leading dashes included: `-x` is a
+    // legal filename). Zero pathspecs (`git checkout --` fed by xargs) is a
+    // runtime-supplied target list → conservative scope `all`.
+    const pathspecs = a.slice(dd + 1).filter((p) => p !== "");
+    if (pathspecs.length === 0) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-pathspec-empty" };
+    // A tree-ish before `--` overwrites the index too; flags do not count
+    // (reviewer P2: `git checkout -q -- f` is index-source).
+    const fromTree = a.slice(0, dd).some((t) => t !== "--" && !String(t).startsWith("-"));
+    return { scope: "paths", pathspecs, fromTree, form: "checkout-paths" };
   }
   // Bare path forms git accepts without `--`: `git checkout .`, `./x`, `:/x`
   // (and `git checkout <tree-ish> .`). A bare branch name is a switch, NOT a
@@ -1974,33 +2012,49 @@ function _wtDiscardFromCheckout(args) {
   if (pathish.length > 0) {
     return { scope: "paths", pathspecs: pathish, fromTree: pos.length > pathish.length, form: "checkout-paths-bare" };
   }
+  // `git checkout <tree-ish> <paths>` WITHOUT `--` is a real path restore in
+  // git (reviewer P1: `git checkout HEAD a.txt` destroyed a dirty file). Only
+  // when a branch-create flag is present is the token list a create form.
+  if (!creates && pos.length >= 2) {
+    return { scope: "paths", pathspecs: pos.slice(1), fromTree: true, form: "checkout-treish-paths" };
+  }
   if (_wtDiscardForce(a)) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-force" };
   return null;
 }
 
 function _wtDiscardFromRestore(args) {
   const a = args ?? [];
-  const staged = a.includes("--staged") || a.includes("-S") || _wtDiscardShortCluster(a, "S");
-  const worktree = a.includes("--worktree") || a.includes("-W") || _wtDiscardShortCluster(a, "W");
+  if (_wtHasPathspecFile(a)) return { scope: "all", pathspecs: [], fromTree: true, form: "restore-pathspec-file", unverifiable: true };
+  const stagedTok = a.find((t) => _wtLongPrefix(t, "--staged") || t === "-S" || _wtDiscardShortCluster([t], "S"));
+  const sourceTok = a.find((t) => _wtLongPrefix(t, "--source") || t === "-s" || /^-s\S/.test(String(t)));
+  const worktreeTok = a.find((t) => _wtLongPrefix(t, "--worktree") || t === "-W" || _wtDiscardShortCluster([t], "W"));
+  // An ambiguous abbreviation (`--s`) matches BOTH --staged and --source —
+  // never take the index-only early return for it.
+  const ambiguous = !!stagedTok && !!sourceTok && stagedTok === sourceTok && String(stagedTok).startsWith("--");
+  const staged = !!stagedTok && !ambiguous;
+  const worktree = !!worktreeTok;
   // Index-only restore is explicitly non-destructive (#709).
   if (staged && !worktree) return null;
   const pathspecs = [];
-  let fromTree = false;
   for (let i = 0; i < a.length; i++) {
     const t = a[i];
     if (t === "--") { for (let j = i + 1; j < a.length; j++) if (a[j]) pathspecs.push(a[j]); break; }
-    if (t === "-s" || t === "--source") { fromTree = true; i++; continue; }
-    if (String(t).startsWith("--source=") || /^-s\S/.test(t)) { fromTree = true; continue; }
+    if (t === "-s" || _wtLongPrefix(t, "--source")) { i++; continue; }
+    if (String(t).startsWith("--source=") || /^-s\S/.test(String(t))) continue;
     if (String(t).startsWith("-")) continue;
     pathspecs.push(t);
   }
-  if (pathspecs.length === 0) return null; // bare `git restore` is a usage error
-  return { scope: "paths", pathspecs, fromTree, form: "restore-worktree" };
+  if (pathspecs.length === 0) {
+    // `git restore` with no pathspec is a usage error — but under xargs the
+    // list is supplied at runtime → conservative scope `all`.
+    return { scope: "all", pathspecs: [], fromTree: !!sourceTok || ambiguous, form: "restore-pathspec-empty" };
+  }
+  return { scope: "paths", pathspecs, fromTree: !!sourceTok || ambiguous, form: "restore-worktree" };
 }
 
 function _wtDiscardFromSwitch(args) {
   const a = args ?? [];
-  if (a.includes("--discard-changes") || _wtDiscardForce(a)) {
+  if (_wtHasLong(a, "--discard-changes") || _wtDiscardForce(a)) {
     return { scope: "all", pathspecs: [], fromTree: false, form: "switch-discard" };
   }
   return null;
@@ -2008,7 +2062,7 @@ function _wtDiscardFromSwitch(args) {
 
 function _wtDiscardFromReset(args) {
   const a = args ?? [];
-  if (!a.includes("--hard")) return null;
+  if (!_wtHasLong(a, "--hard")) return null;
   const dd = a.indexOf("--");
   if (dd !== -1) {
     const pathspecs = a.slice(dd + 1).filter(Boolean);
@@ -2021,13 +2075,71 @@ function _wtDiscardFromCheckoutIndex(args) {
   const a = args ?? [];
   // Without -f/--force git REFUSES to overwrite a modified file — nothing to gate.
   if (!_wtDiscardForce(a)) return null;
-  if (_wtDiscardShortCluster(a, "a") || a.includes("--all")) {
+  if (_wtHasPathspecFile(a)) return { scope: "all", pathspecs: [], fromTree: true, form: "checkout-index-pathspec-file", unverifiable: true };
+  if (_wtDiscardShortCluster(a, "a") || _wtHasLong(a, "--all")) {
     return { scope: "all", pathspecs: [], fromTree: true, form: "checkout-index-all" };
   }
   const dd = a.indexOf("--");
   const pathspecs = (dd !== -1 ? a.slice(dd + 1) : _wtDiscardPositionals(a)).filter(Boolean);
   if (pathspecs.length === 0) return null;
   return { scope: "paths", pathspecs, fromTree: true, form: "checkout-index" };
+}
+
+/** `git rm -f <paths>` deletes index+worktree entries (a discard of the file's
+ *  uncommitted content). Without -f git refuses to remove a modified file. */
+function _wtDiscardFromRm(args) {
+  const a = args ?? [];
+  if (!_wtDiscardForce(a)) return null;
+  const dd = a.indexOf("--");
+  const pathspecs = (dd !== -1 ? a.slice(dd + 1) : _wtDiscardPositionals(a)).filter(Boolean);
+  if (pathspecs.length === 0) return { scope: "all", pathspecs: [], fromTree: true, form: "rm-force-all" };
+  return { scope: "paths", pathspecs, fromTree: true, form: "rm-force" };
+}
+
+/** `git read-tree --reset -u HEAD` overwrites index+worktree wholesale. */
+function _wtDiscardFromReadTree(args) {
+  const a = args ?? [];
+  if (!_wtHasLong(a, "--reset")) return null;
+  if (!(_wtDiscardShortCluster(a, "u") || _wtHasLong(a, "--update"))) return null;
+  return { scope: "all", pathspecs: [], fromTree: true, form: "read-tree-reset-update" };
+}
+
+/**
+ * Blank heredoc DATA bodies and full-line `#` comments before extraction.
+ *
+ * The shared `allGitInvocations` walker parses heredoc bodies as command text,
+ * so `cat <<'EOF' … git checkout -- x … EOF` produced a phantom descriptor
+ * (reviewer P2 false positive). A body is DATA unless its consumer is a shell
+ * interpreter or the body is piped INTO one (`cat <<'EOF' | bash`), in which
+ * case it is real code and is kept. Full-line comments are never code.
+ * One pending heredoc at a time — multiple openers on one line is a documented
+ * residual (the first body is blanked, the rest are parsed normally).
+ */
+const _HEREDOC_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "source", "."]);
+function _wtStripHeredocData(text, codeBodies) {
+  const lines = String(text ?? "").split("\n");
+  const out = [];
+  let pending = null; // { delim, code }
+  for (const line of lines) {
+    if (pending) {
+      const t = line.trim();
+      if (t === pending.delim) { out.push(""); pending = null; continue; }
+      if (pending.code) { out.push(line); if (codeBodies) codeBodies.push(line); continue; }
+      out.push("");
+      continue;
+    }
+    const trimmed = line.trim();
+    if (trimmed.startsWith("#")) { out.push(""); continue; }
+    const m = /<<(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z0-9_]+))/.exec(line);
+    if (m) {
+      const delim = (m[2] ?? m[3] ?? m[4] ?? "").replace(/^-/, "");
+      const firstWord = trimmed.split(/[\s;|&]+/)[0] ?? "";
+      const pipedToShell = /\|\s*(?:bash|sh|zsh|dash|ksh)\b/.test(line);
+      pending = { delim, code: _HEREDOC_INTERPRETERS.has(firstWord) || pipedToShell };
+    }
+    out.push(line);
+  }
+  return out.join("\n");
 }
 
 /** `git show <rev>:<path>` / `cat-file` committed-path hints (the manual
@@ -2047,10 +2159,11 @@ function _wtDiscardShowTargets(args) {
  * @param {string} command
  * @returns {Array<{form: string, scope: string, pathspecs: string[], fromTree: boolean, verb: string, args: string[], inv: any}>}
  */
-export function extractWorkingTreeDiscards(command) {
+export function extractWorkingTreeDiscards(command, _depth = 0) {
   const out = [];
   try {
-    const invs = allGitInvocations(command);
+    const codeBodies = [];
+    const invs = allGitInvocations(_wtStripHeredocData(command, codeBodies));
     for (const inv of invs) {
       const verb = inv?.verb;
       const args = inv?.args ?? [];
@@ -2060,7 +2173,17 @@ export function extractWorkingTreeDiscards(command) {
       else if (verb === "switch") d = _wtDiscardFromSwitch(args);
       else if (verb === "reset") d = _wtDiscardFromReset(args);
       else if (verb === "checkout-index") d = _wtDiscardFromCheckoutIndex(args);
+      else if (verb === "rm") d = _wtDiscardFromRm(args);
+      else if (verb === "read-tree") d = _wtDiscardFromReadTree(args);
       if (d) out.push({ ...d, verb, args, inv });
+    }
+    // Code heredocs (`bash <<EOF`, `cat <<EOF | bash`) execute their body, but
+    // the git walker does not reach it (`allGitInvocations` yields nothing for
+    // the piped form) — re-extract from the captured body, bounded to 2 levels.
+    if (_depth < 2) {
+      for (const body of codeBodies) {
+        for (const nested of extractWorkingTreeDiscards(body, _depth + 1)) out.push(nested);
+      }
     }
     // Non-git revert shape: the committed path is the SOURCE of a redirect, so
     // the pure extractor can only surface the hint; index.ts intersects it with
@@ -2098,6 +2221,10 @@ export function discardDestroysWip(porcelain, d) {
     const x = l[0];
     const y = l[1];
     if (x === "?" || x === "!") continue; // untracked / ignored
+    // Unmerged entries (`UU`, `AA`, `DD`, `AU`…) are an UNRESOLVED conflict,
+    // not uncommitted work being discarded — `git checkout --ours/--theirs` is
+    // the sanctioned resolution (reviewer P2).
+    if (x === "U" || y === "U" || (x === "A" && y === "A") || (x === "D" && y === "D")) continue;
     if (d?.scope === "all") {
       if (x !== " " || y !== " ") return true;
       continue;
