@@ -44,8 +44,12 @@ cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "${GH_STUB_LOG:?}"
 if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
-    # PATCH body — read stdin, swallow
-    cat >/dev/null
+    # PATCH body — capture stdin when GH_STUB_PATCH_BODY is set (#716), else swallow
+    if [ -n "${GH_STUB_PATCH_BODY:-}" ]; then
+        cat > "$GH_STUB_PATCH_BODY"
+    else
+        cat >/dev/null
+    fi
     exit 0
 fi
 if [ "$1" = "api" ]; then
@@ -301,6 +305,109 @@ assert_contains "$OUT" "#42" "parser: narrative prose-verb class matches (parse_
 run_record_verdict clean-micro "" 424316
 [ "$RECORD_RC" = "0" ] && ok "repo-less clean-micro fails open (rc 0)" || bad "repo-less clean-micro (rc=$RECORD_RC)"
 assert_contains "$RECORD_ERR" "UNVERIFIED" "repo-less clean-micro warns the tier is unverified"
+
+echo ""
+echo "── 9. #716 second-model gate line ─────────────────────────────"
+
+# Runner that sets the #716 env (or flags) and captures the PATCH body.
+# run_record_sm <env-model> <env-independent> <pr> [flag-model] [flag-independent]
+run_record_sm() {
+    local env_model="$1" env_ind="$2" pr="$3" flag_model="${4:-}" flag_ind="${5:-}"
+    local rcfile="$T/rc" patchfile="$T/patch"
+    : > "$LOG"; : > "$patchfile"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        export GH_STUB_PATCH_BODY="$patchfile"
+        export SECOND_MODEL_GATE_MODEL="$env_model"
+        export SECOND_MODEL_GATE_INDEPENDENT="$env_ind"
+        rc=0
+        if [ -n "$flag_model" ] && [ -n "$flag_ind" ]; then
+            bash "$RECORD" "$pr" "$SHA" clean "daniel-ospina/agent-infra" --second-model "$flag_model" --second-model-independent "$flag_ind" 2>"$T/err" || rc=$?
+        else
+            bash "$RECORD" "$pr" "$SHA" clean "daniel-ospina/agent-infra" 2>"$T/err" || rc=$?
+        fi
+        printf '%s' "$rc" > "$rcfile"
+    )
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    PATCH_BODY="$(cat "$patchfile" 2>/dev/null || true)"
+}
+
+# 9.1 happy path — the marker line reaches the PR body PATCH.
+run_record_sm "moonshot/kimi-k3" "yes" 424400
+[ "$RECORD_RC" = "0" ] && ok "SM marker: record rc 0" || bad "SM marker: rc=$RECORD_RC"
+assert_contains "$PATCH_BODY" "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ $SHA" "SM marker line posted in the PATCH body (head-bound)"
+assert_contains "$PATCH_BODY" "review recorded: reviews/424400.json" "verdict marker still posted alongside"
+
+# 9.2 absent env — no SM line at all (backward compatible).
+run_record_sm "" "" 424401
+[ "$RECORD_RC" = "0" ] && ok "SM absent: record rc 0" || bad "SM absent: rc=$RECORD_RC"
+if printf '%s' "$PATCH_BODY" | grep -qF '[SECOND-MODEL-GATE]'; then bad "SM absent: no SM line expected"; else ok "SM absent: no SM line posted"; fi
+
+# 9.3 model without independent → refuse (exit 2), no record.
+run_record_sm "moonshot/kimi-k3" "" 424402
+[ "$RECORD_RC" = "2" ] && ok "SM model without independent refuses (exit 2)" || bad "SM model without independent (rc=$RECORD_RC)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424402.json" ] && ok "SM refusal writes no record" || bad "SM refusal wrote a record"
+
+# 9.4 DEGRADED is a first-class value (check (f) then blocks on it).
+run_record_sm "**DEGRADED" "DEGRADED" 424403
+[ "$RECORD_RC" = "0" ] && ok "SM DEGRADED: record rc 0" || bad "SM DEGRADED: rc=$RECORD_RC"
+assert_contains "$PATCH_BODY" "[SECOND-MODEL-GATE] model=**DEGRADED independent=DEGRADED" "SM DEGRADED line posted verbatim"
+
+# 9.5 invalid independent value → refuse.
+run_record_sm "moonshot/kimi-k3" "maybe" 424404
+[ "$RECORD_RC" = "2" ] && ok "SM invalid independent refuses (exit 2)" || bad "SM invalid independent (rc=$RECORD_RC)"
+
+# 9.6 independent without a model → refuse.
+run_record_sm "" "yes" 424405
+[ "$RECORD_RC" = "2" ] && ok "SM independent without model refuses (exit 2)" || bad "SM independent without model (rc=$RECORD_RC)"
+
+# 9.7 flag form is equivalent to the env form.
+run_record_sm "" "" 424406 "openrouter/anthropic/claude-opus-4.8" "yes"
+[ "$RECORD_RC" = "0" ] && ok "SM flag form: record rc 0" || bad "SM flag form: rc=$RECORD_RC"
+assert_contains "$PATCH_BODY" "[SECOND-MODEL-GATE] model=openrouter/anthropic/claude-opus-4.8 independent=yes" "SM flag form posts the marker"
+
+# 9.8 idempotent — a body already carrying BOTH markers is not re-PATCHed.
+STUB_BODY="review recorded: reviews/424407.json verdict=clean @ $SHA (daniel-ospina/agent-infra) [SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ $SHA" run_record_sm "moonshot/kimi-k3" "yes" 424407
+if grep -q -- "-X PATCH" "$LOG"; then bad "SM idempotency: re-PATCHed despite both markers present"; else ok "SM idempotency: both markers present → no PATCH"; fi
+
+# 9.10 C3(a) — the reserved DEGRADED marker is never recorded as independent.
+run_record_sm "**DEGRADED" "yes" 424409
+[ "$RECORD_RC" = "2" ] && ok "SM reserved model with independent=yes refuses (exit 2)" || bad "SM reserved model + yes (rc=$RECORD_RC)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424409.json" ] && ok "SM reserved+yes refusal writes no record" || bad "SM reserved+yes wrote a record"
+
+# 9.11 C3(a) — a non-id model value is refused.
+run_record_sm "<script>" "yes" 424410
+[ "$RECORD_RC" = "2" ] && ok "SM non-id model refuses (exit 2)" || bad "SM non-id model (rc=$RECORD_RC)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424410.json" ] && ok "SM non-id refusal writes no record" || bad "SM non-id wrote a record"
+
+# 9.12 G5 — reserved/placeholder tokens (beyond DEGRADED) are never independent.
+run_record_sm "none" "yes" 424411
+[ "$RECORD_RC" = "2" ] && ok "SM reserved 'none' + yes refuses (exit 2)" || bad "SM reserved none (rc=$RECORD_RC)"
+run_record_sm "null" "yes" 424412
+[ "$RECORD_RC" = "2" ] && ok "SM reserved 'null' + yes refuses (exit 2)" || bad "SM reserved null (rc=$RECORD_RC)"
+run_record_sm "unknown" "DEGRADED" 424413
+[ "$RECORD_RC" = "0" ] && ok "SM reserved 'unknown' + DEGRADED records (the sanctioned degraded form)" || bad "SM reserved unknown + DEGRADED (rc=$RECORD_RC)"
+if printf '%s' "$PATCH_BODY" | grep -qF 'model=unknown independent=DEGRADED'; then ok "SM reserved 'unknown' records only as DEGRADED"; else bad "SM reserved 'unknown' DEGRADED marker not posted"; fi
+
+# 9.13 G10 — a NEW second-model marker REPLACES a stale one (append-and-never-
+# remove left a conflicting body that check (f) now fails closed on).
+STALE_SM_BODY="review recorded: reviews/424414.json verdict=clean @ $SHA (daniel-ospina/agent-infra)
+[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=DEGRADED @ $SHA"
+STUB_BODY="$STALE_SM_BODY" run_record_sm "moonshot/kimi-k3" "yes" 424414
+if printf '%s' "$PATCH_BODY" | grep -qF "independent=yes"; then ok "SM replace: new marker posted"; else bad "SM replace: new marker not posted"; fi
+_sm_count="$(printf '%s' "$PATCH_BODY" | grep -cF '[SECOND-MODEL-GATE]')"
+if [ "$_sm_count" = "1" ]; then ok "SM replace: exactly one SM marker in the patched body"; else bad "SM replace: stale marker stacked (count=$_sm_count)"; fi
+if printf '%s' "$PATCH_BODY" | grep -qF "independent=DEGRADED"; then bad "SM replace: stale DEGRADED marker survived"; else ok "SM replace: stale DEGRADED marker removed"; fi
+if printf '%s' "$PATCH_BODY" | grep -qF "reviews/424414.json"; then ok "SM replace: verdict marker preserved"; else bad "SM replace: verdict marker was dropped"; fi
+
+# 9.9 a verdict marker already present but SM line missing → only the SM line posts.
+STUB_BODY="review recorded: reviews/424408.json verdict=clean @ $SHA (daniel-ospina/agent-infra)" run_record_sm "moonshot/kimi-k3" "yes" 424408
+if printf '%s' "$PATCH_BODY" | grep -qF '[SECOND-MODEL-GATE]'; then ok "SM partial idempotency: missing SM line was posted"; else bad "SM partial idempotency: SM line not posted"; fi
+if printf '%s' "$PATCH_BODY" | grep -qF 'PR body'; then bad "SM partial idempotency: injected STUB_BODY was NOT read (test would be vacuous)"; else ok "SM partial idempotency: injected body honored (non-vacuous)"; fi
+
+unset STUB_BODY
 
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"

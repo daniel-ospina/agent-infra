@@ -31,7 +31,7 @@ mkdir -p "$DEST"
 echo "==> Copying config into $DEST"
 
 # Back up any existing settings/models (so nothing is lost)
-for f in settings.json models.json models-store.json; do
+for f in settings.json models.json models-store.json second-model.json; do
   if [ -f "$DEST/$f" ] && [ ! -f "$DEST/$f.bak-bootstrap" ]; then
     cp "$DEST/$f" "$DEST/$f.bak-bootstrap"
     echo "    backed up existing $f"
@@ -104,6 +104,36 @@ PY
     echo "    settings.json copied (python3 not found - plain copy)"
   fi
 }
+merge_second_model() {
+  # #716 — the second-model gate designation (ordered preference + runtimeVia +
+  # build-equivalence set + probe endpoints). A standalone POLICY file (never
+  # merged per-provider like models.json), so the shipped copy wins wholesale —
+  # the config is the single source of truth and a candidate top-up is a config
+  # edit, not a code edit. CONSEQUENCE (G14): unlike merge_settings()/
+  # merge_models_store(), this is a WHOLE-FILE replace, so any live-only key or
+  # candidate is DROPPED on the next sync — a durable change must land in
+  # pi-bootstrap/pi-config/second-model.json in this repo (the guard's DEFAULT
+  # authority is the live copy, which makes a live-only edit look durable until
+  # the next sync silently reverts it). No-op when the tree does not ship
+  # second-model.json (older agent-infra); a pre-existing live copy is left
+  # untouched then.
+  [ -f "$SRC/second-model.json" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$SRC/second-model.json" "$DEST/second-model.json" << 'PY'
+import json, os, sys
+src = json.load(open(sys.argv[1]))
+dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else None
+if dst == src:
+    print("    second-model.json already current")
+else:
+    json.dump(src, open(sys.argv[2], "w"), indent=2)
+    print("    second-model.json installed (shipped policy wins wholesale)")
+PY
+  else
+    cp "$SRC/second-model.json" "$DEST/second-model.json"
+    echo "    second-model.json copied (python3 not found - plain copy)"
+  fi
+}
 merge_models_store() {
   # Merge provider blocks: source wins per-provider; local providers survive.
   # Within a provider, keep the entry with the newer checkedAt (pi's runtime
@@ -139,6 +169,7 @@ merge_mcp
 merge_settings
 merge_models
 merge_models_store
+merge_second_model
 
 # Folders (content-merge; overwrite same-named files). The "SRC/. DEST/" form
 # copies CONTENTS into the existing destination — plain `cp -R SRC DEST` on BSD
@@ -304,14 +335,19 @@ done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
 
 # Merge-gate scripts farm (#562): record-review.sh — the review-enforcer's
-# merge-registry writer (issue #138). NOT launchd-invoked (pi-session code
-# resolves it explicitly: code-review SKILL.md Step 10 + commit-workflow
-# 04-merge-deploy), so it never joined the #427/#373 farms and drifted: the
-# repo copy is CI-tested while production mints execute the ~/.pi copy, and
-# nothing refreshed the latter until a manual copy (the #513 clean-micro
-# guard sat on main 09-07 while ~/.pi/agent/scripts/record-review.sh stayed
-# pre-guard 09-04). Same idempotent real-copy refresh model as the farms
-# above — every sync re-applies the repo copy.
+# merge-registry writer (issue #138). The #716 second-model guard is NOT on
+# this farm (G12): the four gate skills invoke it as
+# `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh"`, and the guard
+# resolves its shipped config from its own PHYSICAL repo root — a copy under
+# $HOME/.pi/agent/scripts would resolve ROOT=$HOME/.pi and fail `--check` and
+# `--probe` with exit 2 (it cannot find pi-bootstrap/pi-config/models.json).
+# The $AGENT_INFRA_PATH convention is the real one; farming the guard only
+# minted a copy that could not run the modes the gate uses.
+# NOT launchd-invoked (pi-session code resolves record-review.sh explicitly:
+# code-review SKILL.md Step 10 + commit-workflow 04-merge-deploy), so it never
+# joined the #427/#373 farms and drifted: the repo copy is CI-tested while
+# production mints execute the ~/.pi copy. Same idempotent real-copy refresh
+# model as the farms above.
 merge_gate_srcs=(record-review.sh)
 mkdir -p "$DEST/scripts"
 merge_gate_copied=0

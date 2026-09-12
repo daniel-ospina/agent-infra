@@ -1,0 +1,10 @@
+{
+  "moonshot/kimi-k3": {
+    "offer": {"httpCode": 200, "body": "{\"data\":[{\"id\":\"kimi-k3\"}]}"},
+    "solvency": {"httpCode": 429, "body": "{\"error\":{\"message\":\"account org-x is suspended due to insufficient balance, please recharge your account\"}}"}
+  },
+  "openrouter/anthropic/claude-opus-4.8": {
+    "offer": {"httpCode": 403, "body": "{\"error\":{\"message\":\"Key limit exceeded (monthly limit)\"}}"},
+    "solvency": {"httpCode": 403, "body": "{\"error\":{\"message\":\"Key limit exceeded (monthly limit)\"}}"}
+  }
+}

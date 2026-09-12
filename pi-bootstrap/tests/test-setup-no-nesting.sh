@@ -153,6 +153,20 @@ check_record_review_farmed() {
   fi
 }
 
+# #716/G12 — the second-model guard is NOT on the merge-gate farm: the four
+# gate skills invoke it as $AGENT_INFRA_PATH/scripts/check-second-model.sh, and
+# a farmed copy under $HOME/.pi/agent/scripts resolves ROOT=$HOME/.pi and fails
+# --check/--probe (exit 2). Assert it is absent so a future re-add is caught.
+check_second_model_not_farmed() {
+  local label="$1"
+  local dest="$DEST/scripts/check-second-model.sh"
+  if [ -e "$dest" ]; then
+    fail "$label: check-second-model.sh was farmed into scripts/ — the farmed copy cannot run --check/--probe (G12)"
+  else
+    echo "ok: $label second-model guard is not farmed (uses \$AGENT_INFRA_PATH, #716/G12)"
+  fi
+}
+
 run_setup() {
   echo "---- setup.sh run (HOME=$HOME_DIR) ----" >> "$RUNS_LOG"
   bash "$CLONE/pi-bootstrap/setup.sh" >> "$RUNS_LOG" 2>&1
@@ -196,6 +210,7 @@ grep -q "farm symlinks kept" "$RUNS_LOG" \
 check_content_matches "$DEST/extensions" "run1" mcp-client shared
 check_fix_markers "$DEST/extensions" "run1"
 check_record_review_farmed "run1"
+check_second_model_not_farmed "run1"
 grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
   || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
 
@@ -205,6 +220,7 @@ grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG"
 echo "== run 2: re-run refresh"
 echo "# machine-local mutation" >> "$DEST/agents/verifier.md"
 echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm refresh
+echo '{"preference": []}' > "$DEST/second-model.json"            # #716 stale designation
 SRC_MARKER="$ROOT/pi-bootstrap/pi-config/agents/zz-setup-test-marker.md"
 echo "# issue-93 test marker" > "$SRC_MARKER"
 
@@ -221,10 +237,27 @@ else
   echo "ok: dest mutation reverted by source on re-run"
 fi
 check_record_review_farmed "run2"
+check_second_model_not_farmed "run2"
 if grep -q "stale farm mutation" "$DEST/scripts/record-review.sh"; then
   fail "stale farm mutation survived re-run (farmed record-review.sh was not refreshed)"
 else
   echo "ok: farmed record-review.sh refreshed on re-run (#562)"
+fi
+# #716 — the second-model gate designation is shipped policy: it must reach the
+# active dir, and a mutated/stale live copy must be refreshed wholesale.
+if [ -f "$DEST/second-model.json" ]; then
+  echo "ok: second-model.json installed to the active dir (#716)"
+else
+  fail "second-model.json did not reach the active dir (#716)"
+fi
+if python3 - "$ROOT/pi-bootstrap/pi-config/second-model.json" "$DEST/second-model.json" <<'PY'
+import json, sys
+sys.exit(0 if json.load(open(sys.argv[1])) == json.load(open(sys.argv[2])) else 1)
+PY
+then
+  echo "ok: live second-model.json refreshed from the shipped policy on re-run (#716)"
+else
+  fail "live second-model.json was NOT refreshed from the shipped policy (#716)"
 fi
 [ ! -d "$DEST/agents/agents" ] || fail "nesting appeared after re-run"
 check_no_nesting "$DEST" "dest-after-rerun"
