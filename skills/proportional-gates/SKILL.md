@@ -90,6 +90,9 @@ Before deciding what gates to run, classify the change:
 
 **Proportional dispatch:** The agent decides how many reviewers to launch based on plan size and novelty. A 20-line plan following existing patterns = 2 reviewers. A 200-line plan with new architecture = 4 reviewers.
 
+**Adversarial domain (bound: 2 cycles) — orthogonal to the rows above.** For gate/enforcement code whose correctness is "an attacker cannot make it fail open" (argv/path/symlink resolution, working-tree discard, merge and verification gates), the budget is bounded by the **declared threat surface**, not by reviewer exhaustion: **cap 2 cycles**, acceptance = every declared threat class covered by a test + green CI, residuals **filed from cycle 1, not chased**. The declaration is mandatory at scoping (`issue-scoping` §Adversarial Threat Surface). Statement of record: `AGENTS.md` §Hard Cap.
+<!-- adversarial-bound: cap=2 -->
+
 ### Dependency Verification
 
 | Situation | Action |

@@ -24,6 +24,14 @@
  * to Medium-High, { reviewers: 3, maxCycles: 5 }), and the coordinated-re-point
  * control documents that blind spot rather than pretending it does not exist.
  *
+ * #838 extends the same suite to the adversarial-domain bound. Gate/enforcement
+ * code has no natural bottom, so "the reviewer returns NO ISSUES FOUND" is an
+ * unbounded acceptance criterion there — the budget is a DECLARED threat
+ * surface, capped at 2 cycles, acceptance = threat-list coverage + green CI.
+ * That cap is stated on eight surfaces; `adversarialBoundViolations()` pins them
+ * to one value (an absent anchor is a violation, never a silent pass) and
+ * `nonAdversarialCapViolations()` pins the risk rows #838 must NOT touch.
+ *
  * WIRING HONESTY: this suite runs in the per-PR `verify` job (VISIBLE, not
  * merge-blocking — the repo's only required check is `pipeline-compliance`)
  * and in the post-merge ci-main.yml `extension-tests` job (the blocking
@@ -274,6 +282,106 @@ export function mappingViolations(
   return violations;
 }
 
+// ── Adversarial-domain bound (#838) ─────────────────────────────────────────
+
+/**
+ * Surfaces that must all declare the SAME adversarial-domain cycle bound.
+ *
+ * #838: on gate/enforcement code there is no natural bottom, so "the reviewer
+ * returns NO ISSUES FOUND" is an unbounded acceptance criterion and a
+ * count-cap is indistinguishable from failure. The bound is instead a
+ * DECLARED threat surface — capped at 2 cycles, acceptance = every declared
+ * threat class covered by a test + green CI, residuals filed not chased.
+ *
+ * The cap is stated on several surfaces (protocol of record, canonical table,
+ * each consuming skill), so drift BETWEEN them is the failure pinned here —
+ * the same class #723 caught for the runtime tiers. The anchor is
+ * machine-readable (`adversarial-bound: cap=N`) rather than prose because the
+ * surrounding text legitimately names the general 10-cycle cap.
+ */
+export const ADVERSARIAL_CAP = 2;
+export const ADVERSARIAL_SURFACES = [
+  "AGENTS.md",
+  "templates/AGENTS.base.md",
+  "skills/proportional-gates/SKILL.md",
+  "skills/code-review/SKILL.md",
+  "skills/code-review/references/fixer-loop.md",
+  "skills/plan-review/SKILL.md",
+  "skills/issue-scoping/SKILL.md",
+  "skills/task-workflow-standard/SKILL.md",
+] as const;
+
+const ADVERSARIAL_ANCHOR_RE = /adversarial-bound: cap=(\d+)/g;
+
+/** Cap values declared by anchors in `src`, in file order. */
+export function declaredAdversarialCaps(src: string): number[] {
+  const out: number[] = [];
+  for (const m of src.matchAll(ADVERSARIAL_ANCHOR_RE)) out.push(Number(m[1]));
+  return out;
+}
+
+/**
+ * A violation per unanchored / divergent surface; `[]` means every surface
+ * declares the same adversarial cap. Pure, so the negative controls below can
+ * prove it rejects drift rather than merely never firing. Exactly ONE anchor
+ * per surface is required: a missing anchor is what a naive grep reads as
+ * clean, and it must be a violation, never a silent pass.
+ */
+export function adversarialBoundViolations(sources: Record<string, string>): string[] {
+  const violations: string[] = [];
+  const declared = new Map<string, number>();
+  for (const [path, src] of Object.entries(sources)) {
+    const caps = declaredAdversarialCaps(src);
+    if (caps.length !== 1) {
+      violations.push(
+        `${path}: expected exactly 1 \`adversarial-bound: cap=N\` anchor, found ${caps.length}`,
+      );
+      continue;
+    }
+    if (caps[0] !== ADVERSARIAL_CAP) {
+      violations.push(`${path}: adversarial cap ${caps[0]} ≠ ${ADVERSARIAL_CAP}`);
+    }
+    declared.set(path, caps[0]);
+  }
+  if (new Set(declared.values()).size > 1) {
+    violations.push(
+      `adversarial cap differs across surfaces: ${[...declared.entries()].map(([p, c]) => `${p}=${c}`).join(", ")}`,
+    );
+  }
+  return violations;
+}
+
+/**
+ * The canonical NON-adversarial bounds a change may not silently move.
+ * Deliberately duplicated from the table assertions above: this is the
+ * "silent re-cap" threat class's own test, and it also fails closed when a
+ * risk row disappears rather than treating the absence as "no divergence".
+ */
+export const CANONICAL_NON_ADVERSARIAL: ReadonlyArray<[string, number]> = [
+  ["Low", 0],
+  ["Low-Medium", 3],
+  ["Medium-High", 5],
+  ["High", 10],
+];
+
+/** Violations of the non-adversarial caps; `[]` means untouched. Pure. */
+export function nonAdversarialCapViolations(table: RiskRow[]): string[] {
+  const violations: string[] = [];
+  for (const [risk, cap] of CANONICAL_NON_ADVERSARIAL) {
+    const row = table.find((r) => r.risk === risk);
+    if (!row) {
+      violations.push(`canonical table lost the "${risk}" risk row`);
+      continue;
+    }
+    if (row.maxCycles !== cap) {
+      violations.push(
+        `${risk} row cap ${row.maxCycles} ≠ ${cap} — the adversarial bound must not re-cap non-adversarial work`,
+      );
+    }
+  }
+  return violations;
+}
+
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
 const MARKDOWN = readFileSync(SKILL_PATH, "utf-8");
@@ -299,6 +407,81 @@ test("Review Cycles table parses to the four proportional rows", () => {
 
 test("High-tier canonical bound is 10 (post-#705)", () => {
   equal(TABLE.find((r) => r.risk === "High")?.maxCycles, 10);
+});
+
+// ── Adversarial-domain bound (#838) ─────────────────────────────────────────
+
+section("Adversarial-domain bound parity (#838)");
+
+const ADVERSARIAL_SOURCES: Record<string, string> = Object.fromEntries(
+  ADVERSARIAL_SURFACES.map((p) => [p, readFileSync(join(REPO_ROOT, p), "utf-8")]),
+);
+
+function violationsOf(sources: Record<string, string>): string {
+  return adversarialBoundViolations(sources).join(" | ");
+}
+
+test("every adversarial surface declares exactly one cap anchor, and all agree at 2", () => {
+  deepEqual(
+    adversarialBoundViolations(ADVERSARIAL_SOURCES),
+    [],
+    `adversarial bound drifted: ${violationsOf(ADVERSARIAL_SOURCES)}`,
+  );
+});
+
+test("#838 does not re-cap non-adversarial work (3 / 5 / 10 intact)", () => {
+  deepEqual(
+    nonAdversarialCapViolations(TABLE),
+    [],
+    `non-adversarial caps moved: ${nonAdversarialCapViolations(TABLE).join(" | ")}`,
+  );
+});
+
+test("the executable fixer loop keeps the 10-cycle default and adds the adversarial branch", () => {
+  const src = ADVERSARIAL_SOURCES["skills/code-review/references/fixer-loop.md"];
+  ok(src.includes("BOUND=10"), "the non-adversarial safety cap must stay 10 in the executable loop");
+  ok(src.includes("ADVERSARIAL_BOUND"), "the executable loop must honour the declared adversarial domain");
+  ok(
+    src.includes('EXIT_REASON="adversarial-capped"'),
+    "a bounded adversarial exit must be recorded under its own exit_reason",
+  );
+});
+
+// Negative controls — the guard must actually reject drift.
+
+test("rejects a divergent adversarial cap on one surface", () => {
+  const path = "skills/plan-review/SKILL.md";
+  const mutated = { ...ADVERSARIAL_SOURCES, [path]: ADVERSARIAL_SOURCES[path].replace("cap=2", "cap=3") };
+  ok(mutated[path] !== ADVERSARIAL_SOURCES[path], "control did not apply — the anchor text moved");
+  const v = adversarialBoundViolations(mutated);
+  ok(v.some((s) => s.includes(path)), `expected a ${path} violation, got: ${v.join(" | ")}`);
+  ok(v.some((s) => s.includes("differs across surfaces")), `expected a cross-surface violation, got: ${v.join(" | ")}`);
+});
+
+test("rejects a MISSING anchor (the vacuity hole a naive grep reads as clean)", () => {
+  const path = "AGENTS.md";
+  const stripped = ADVERSARIAL_SOURCES[path].replace(/ ?<!-- adversarial-bound: cap=2 -->/, "");
+  ok(stripped !== ADVERSARIAL_SOURCES[path], "control did not apply — the AGENTS.md anchor was not found");
+  const v = adversarialBoundViolations({ ...ADVERSARIAL_SOURCES, [path]: stripped });
+  ok(v.some((s) => s.includes(path) && s.includes("found 0")), `expected found-0, got: ${v.join(" | ")}`);
+});
+
+test("rejects a DUPLICATED anchor (two declarations in one file)", () => {
+  const path = "AGENTS.md";
+  const dup = `${ADVERSARIAL_SOURCES[path]}\n<!-- adversarial-bound: cap=2 -->\n`;
+  const v = adversarialBoundViolations({ ...ADVERSARIAL_SOURCES, [path]: dup });
+  ok(v.some((s) => s.includes(path) && s.includes("found 2")), `expected found-2, got: ${v.join(" | ")}`);
+});
+
+test("rejects a re-capped canonical table (the non-adversarial guard is not vacuous)", () => {
+  const recapped = TABLE.map((r) => (r.risk === "High" ? { ...r, maxCycles: 5 } : r));
+  const v = nonAdversarialCapViolations(recapped);
+  ok(v.some((s) => s.includes("High")), `expected a High violation, got: ${v.join(" | ")}`);
+});
+
+test("rejects a canonical table that lost a risk row", () => {
+  const v = nonAdversarialCapViolations(TABLE.filter((r) => r.risk !== "Low-Medium"));
+  ok(v.some((s) => s.includes("Low-Medium")), `expected a Low-Medium violation, got: ${v.join(" | ")}`);
 });
 
 // ── The runtime mapping ─────────────────────────────────────────────────────

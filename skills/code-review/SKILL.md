@@ -891,13 +891,21 @@ For each cycle:
 
    c. **Zero-progress**: Track `files_changed_per_cycle`. If files changed = 0 for 2 consecutive cycles, the fixer is making zero code progress — treat as fingerprint-stall and escalate.
 
+**Adversarial domain — declared threat surface (bound: 2 cycles).** Engages when the scoping comment carries an `### Adversarial Threat Surface` declaration (gate/enforcement code: argv/path/symlink resolution, working-tree discard, merge/verify gates — anything whose correctness is "an attacker cannot make it fail open").
+
+- **Acceptance** = every in-scope threat class has a test that fails without the fix, plus green CI — *not* "the reviewer ran out of ideas". The scoping declaration is the reference: the reviewer verifies each listed class is covered and tries to reproduce an in-scope bypass.
+- **Clean-exit verdict:** a fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) satisfies the clean-exit conditions below. A literal `NO ISSUES FOUND` is *not* required — never manufacture one.
+- **Cap: 2 cycles** (`references/fixer-loop.md` honours `ADVERSARIAL_BOUND=1`), tighter than the general safety cap below. Findings **outside** the declared surface are filed as issues and **not** chased; in-scope findings surviving cycle 2 are filed and recorded, not iterated.
+- **Disclose:** when the merge rests on threat-list coverage rather than `NO ISSUES FOUND`, the PR body must carry `[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>` and the report must say so in plain words. Exit reason: `adversarial-capped`. <!-- adversarial-bound: cap=2 -->
+
 **Exit conditions — ALL must be true before proceeding to Step 8:**
 
 - [ ] Last `--re-review` returned zero issues with confidence ≥ 50
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues, fixes, and re-review results documented
+- [ ] Adversarial domain only: a fresh reviewer returned `THREAT SURFACE COVERED` (every declared threat class test-covered, no in-scope bypass reproduced) — this substitutes for the first box
 
-**No hard cap.** The fix loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (prevents runaway loops from bugs, not a quality gate).
+**No hard cap.** The fix loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (prevents runaway loops from bugs, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
 
 **Convergence rule:** If re-review issues are a strict subset of the previous cycle's issues (no new dimensions or files flagged), the fixer is in a refinement loop. Log convergence and escalate to human: present remaining issues with attempted fixes. Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.
 
@@ -912,7 +920,7 @@ For each cycle:
 **Cycle-status YAML**: Write `operations/logs/cycle-status.yaml` on loop exit:
 
 ```yaml
-exit_reason: <clean|fingerprint-stall|honest-stuck|cycle-cap|convergence|stall-guard>
+exit_reason: <clean|fingerprint-stall|honest-stuck|cycle-cap|adversarial-capped|convergence|stall-guard>
 cycles: <N>
 issues_per_cycle: <json array>
 files_changed_per_cycle: <json array>
