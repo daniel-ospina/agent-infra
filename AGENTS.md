@@ -240,7 +240,9 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
   `${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md` —
   `write` the message there (the write tool creates the directory), then commit with `-F`.
   `--absolute-git-dir` is per-repo AND worktree-aware — a linked worktree gets *its own* gitdir —
-  and its `cksum` names the directory, so cross-repo and cross-worktree collisions are impossible.
+  and its `cksum` names the directory, so cross-repo and cross-worktree collisions cannot happen
+  in practice — a 32-bit digest makes a clash a ~1-in-4-billion coincidence rather than the
+  *guaranteed* clash the old fixed path produced.
   ⛔ **Never put it under `.git/`.** That was the first attempt and it is refused: the
   `main-worktree-guard` extension freezes any `.git/…` write as *hub git-metadata* for every
   unhatched session — the fleet default for `task` children — so the mandated `write` would be

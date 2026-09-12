@@ -24,7 +24,9 @@ git add <relevant files>
 
 # ── CALL 1 of 4: learn the path ─────────────────────────────────────
 echo "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
-# → e.g. /var/folders/…/T/pi-commit-msg-3198440152/fix-729-commit-msg-path.md
+# → e.g. /var/folders/…/T//pi-commit-msg-493983288/fix-729-commit-msg-path.md
+#   (macOS $TMPDIR already ends in `/`, so the real output has `T//pi-…` — a
+#    duplicate separator every tool collapses; harmless.)
 #   `tr '/' '-'` sanitizes a slash-bearing branch; the cksum is per-repo AND
 #   per-worktree (`--absolute-git-dir` differs per linked worktree).
 
@@ -81,7 +83,7 @@ entirely, so nothing in the message is ever interpreted:
 # would be UNSET in the call that commits, which is how the empty-path bug
 # happened in the first place.
 echo "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
-# → /var/folders/…/T/pi-commit-msg-3198440152/fix-668-commit-msg.md
+# → /var/folders/…/T//pi-commit-msg-493983288/fix-668-commit-msg.md
 #   (in a linked worktree: that worktree's own gitdir under .git/worktrees/)
 ```
 
