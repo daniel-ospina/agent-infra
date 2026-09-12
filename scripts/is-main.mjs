@@ -33,19 +33,36 @@
  *   |--------------|---------------------------------------------------------------|----------|
  *   | ENTRY        | literal match; realpath match (symlinked ancestor OR leaf);    | true     |
  *   |              | dirname-realpath + same basename                              |          |
- *   | IMPORTED     | no `argv[1]` at all (REPL / `node -e` / plain import), or the | false    |
- *   |              | two sides realpath DEFINITIVELY to different files            |          |
- *   | UNRESOLVED   | own module path unresolvable, or `argv[1]` unresolvable and   | TRUE +   |
- *   |              | unprovable                                                     | warning  |
+ *   | IMPORTED     | no `argv[1]` at all (REPL / `node -e` / plain import);     | false    |
+ *   |              | the two sides realpath to different files; or `self`          |          |
+ *   |              | resolves while `argv[1]` does not (then `argv[1]` cannot name  |          |
+ *   |              | this file — a file that resolves cannot live at a path that    |          |
+ *   |              | does not)                                                     |          |
+ *   | UNRESOLVED   | our OWN module path is unresolvable (or both sides are), so    | TRUE +   |
+ *   |              | nothing about the invocation can be proven                     | warning  |
  *
- * `UNRESOLVED → true` is the fail-closed direction: at every call site the
- * guard body IS the gate, so running it is the safe answer. A wrong `true` is
- * visible (the gate's own output plus the `[is-main]` warning); a wrong
- * `false` is silent — which is the bug.
+ * `IMPORTED` is the quiet answer only when it is PROVEN — a false `IMPORTED`
+ * would be the very silent no-op this module exists to prevent, so every branch
+ * above is a proof, not a guess. `UNRESOLVED` is what is left when no proof
+ * exists, and it is loud AND runs the guard body.
  *
- * `IMPORTED` is deliberately narrow: it requires a definitive answer. That is
- * what makes this module safe to import from a suite (the tests do) without
- * accidentally running somebody's CLI.
+ * WHY "argv[1] FAILED TO RESOLVE" IS NOT, BY ITSELF, AMBIGUITY:
+ * a real direct invocation always has a resolvable `argv[1]` (Node just loaded
+ * the file), so an unresolvable one means the module was IMPORTED — and in an
+ * importing process the guard body is not a gate, it is a side effect
+ * (`process.exit`, a `--write`, a latch `--clear`). Review cycle 1 measured
+ * exactly that: `UNRESOLVED` for an importer killed the importer
+ * (load-gate / check-skill-lint), regenerated fixtures (probe with `--write`),
+ * and WIPED the exhaustion latch (provider-failover with `--clear`). Hence the
+ * `dirname-realpath` proof and the `argv1-unresolvable-different` proof below;
+ * only a genuinely unprovable residue still runs — loudly.
+ *
+ * `metaUrl` IS REQUIRED AND HAS NO DEFAULT, deliberately: a default of this
+ * module's own `import.meta.url` would make the natural one-argument call
+ * `isMain()` compare `argv[1]` against *this* file, return `IMPORTED`, and
+ * silently disable the caller's gate — the #708 class reintroduced by an
+ * omitted argument. An omitted `metaUrl` is instead an unresolvable self →
+ * `UNRESOLVED` → loud, fail-closed.
  */
 
 import fs from 'node:fs';
@@ -85,11 +102,12 @@ export function selfPathFromUrl(metaUrl) {
  * Classify the relationship between `metaUrl` (the caller's own module URL) and
  * `argv1` (the path the process was invoked as).
  *
- * @param {string} [metaUrl]  the CALLER's `import.meta.url` — not this module's.
+ * @param {string} metaUrl REQUIRED — the CALLER's `import.meta.url`. There is
+ *   deliberately no default (see the module header).
  * @param {string|undefined} [argv1] `process.argv[1]`.
  * @returns {{verdict: 'entry'|'imported'|'unresolved', reason: string, self: string|null, argv1: string|null}}
  */
-export function classifyEntry(metaUrl = import.meta.url, argv1 = process.argv[1]) {
+export function classifyEntry(metaUrl, argv1 = process.argv[1]) {
   const self = selfPathFromUrl(metaUrl);
 
   // No script path at all: REPL, `node -e`, `--input-type=module`, or a plain
@@ -136,8 +154,23 @@ export function classifyEntry(metaUrl = import.meta.url, argv1 = process.argv[1]
     }
   }
 
-  // Cannot prove we are NOT the entry point. Never answer "not main" here.
-  return { verdict: UNRESOLVED, reason: 'unresolvable', self, argv1: entry };
+  // PROVABLE "not us" (#708 review cycle 1): `self` RESOLVED (so this file
+  // exists on disk) while `argv[1]` did not — and a path that does not resolve
+  // cannot name a file that does. This is the shape a bun-compiled pi presents
+  // (`/$bunfs/root/pi.ts`, explicitly handled at
+  // extensions/builtin-tools/index.ts:161 and extensions/subagent/index.ts:439)
+  // while the module is IMPORTED — where a `true` would run the guard body
+  // inside the host process (`process.exit`, `--write`, latch `--clear`). Quiet,
+  // because it is proven: a warning here would fire in every bun-pi session.
+  if (selfReal !== null && entryReal === null) {
+    return { verdict: IMPORTED, reason: 'argv1-unresolvable-different', self, argv1: entry };
+  }
+
+  // Irreducible ambiguity: our OWN module path is unresolvable, so nothing is
+  // provable — never answer "not main" here. (A real direct invocation reaches
+  // this only via the #675 P2-f self-delete, where the dirname+basename proof
+  // above normally already answers ENTRY.)
+  return { verdict: UNRESOLVED, reason: 'unresolvable-ambiguous', self, argv1: entry };
 }
 
 /** Warn once per distinct (reason, self, argv1) — a loop must not spam. */
@@ -149,8 +182,8 @@ function warnFailClosed(info) {
   warned.add(key);
   const detail =
     info.reason === 'self-unresolvable'
-      ? `this module's own path could not be resolved (module root unknown)`
-      : `the invocation path could not be resolved`;
+      ? `this module's own path could not be resolved (module root unknown — did the caller omit metaUrl?)`
+      : `the invocation path could not be resolved unambiguously`;
   process.stderr.write(
     `${WARN_PREFIX} ⚠️  FAIL-CLOSED — ${detail}; treating this module as the ` +
       `entry point so a fail-closed gate RUNS instead of silently no-opping (#708).\n` +
@@ -161,12 +194,14 @@ function warnFailClosed(info) {
 /**
  * Symlink-insensitive entry-point guard.
  *
- * @param {string} [metaUrl] the CALLER's `import.meta.url`.
+ * @param {string} metaUrl REQUIRED — the CALLER's `import.meta.url`. There is
+ *   deliberately no default: a default would be THIS module's URL, which would
+ *   make `isMain()` silently return `IMPORTED` (see the module header).
  * @param {string|undefined} [argv1] `process.argv[1]`.
  * @param {{warn?: boolean}} [opts] `warn: false` suppresses the stderr warning
  *   (tests only — it does NOT change the verdict).
  */
-export function isMain(metaUrl = import.meta.url, argv1 = process.argv[1], opts = {}) {
+export function isMain(metaUrl, argv1 = process.argv[1], opts = {}) {
   const info = classifyEntry(metaUrl, argv1);
   if (info.verdict === ENTRY) return true;
   if (info.verdict === IMPORTED) return false;

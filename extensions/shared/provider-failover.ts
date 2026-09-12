@@ -1364,14 +1364,27 @@ function runCli(argv: string[]): void {
 // NON-resolved path against the loader's realpath-resolved URL, so whenever any
 // component of the invocation path was a symlink (macOS `/var` →
 // `/private/var`, a symlinked checkout) `isDirectEntry` was false: the CLI
-// silently did nothing and exited 0.
+// silently did nothing and exited 0. The realpath compare below is the fix.
 //
-// Canonical implementation: `scripts/is-main.mjs` (same tri-state contract).
-// Not imported here on purpose — this file SHIPS to consumer machines inside
-// `~/.pi/agent/extensions/`, where `../../scripts/` is not guaranteed to
-// resolve, and no production extension imports across that layer boundary.
-// Residual: the two implementations can drift; `extensions/shared/
-// test-is-main.mjs` Part C statically bans the old idiom in both.
+// Canonical implementation: `scripts/is-main.mjs`. Not imported here on purpose
+// — this file SHIPS to consumer machines inside `~/.pi/agent/extensions/`,
+// where `../../scripts/` is not guaranteed to resolve, and no production
+// extension imports across that layer boundary. Residual: the two
+// implementations can drift; `extensions/shared/test-is-main.mjs` Part C bans
+// the old idiom in both (and pins this block's realpath compare).
+//
+// ⚠️ SITE-SPECIFIC DIRECTION — this guard must NOT reuse the canonical
+// module's "unresolvable ⇒ run anyway" rule. Its body is not a gate: it LAUNCHES
+// A CLI, `runCli` MUTATES the exhaustion latch (`--clear`) and sets a non-zero
+// exit code on a usage error. pi imports this module in-process on every
+// session (`extensions/builtin-tools/index.ts`, `extensions/provider-exhaustion.ts`),
+// and a bun-compiled pi has a VIRTUAL entry path — the `/$bunfs/root/` shape
+// `getPiInvocation` special-cases at extensions/builtin-tools/index.ts:161 —
+// which never resolves. Running the CLI from an import would print usage and
+// set `exitCode = 2` in every such session, and a `--clear` in the importer's
+// argv would wipe the latch. So an unresolvable entry resolves to "not the
+// entry point" here: quiet when provably a different file (different
+// basename), one loud line when genuinely ambiguous (same basename).
 const isDirectEntry = (() => {
   try {
     const entry = process.argv[1];
@@ -1382,13 +1395,16 @@ const isDirectEntry = (() => {
     try {
       return fs.realpathSync(resolved) === fs.realpathSync(self);
     } catch {
-      // Cannot prove it is NOT us — fail CLOSED and LOUD (never a silent
-      // no-op), matching scripts/is-main.mjs's UNRESOLVED verdict.
-      process.stderr.write(
-        `[is-main] ⚠️  FAIL-CLOSED — the invocation path could not be resolved; ` +
-          `treating this CLI as the entry point (#708). argv[1]=${resolved}\n`,
-      );
-      return true;
+      // Unresolvable entry. Same basename ⇒ ambiguous (a mid-run deletion of
+      // the real entry) — visible signal, still do NOT run the CLI. Different
+      // basename ⇒ provably a different file ⇒ quiet (every bun-pi session).
+      if (path.basename(resolved) === path.basename(self)) {
+        process.stderr.write(
+          `[is-main] ⚠️  ambiguous entry point (argv[1]=${resolved}) — NOT running this CLI; ` +
+            `a wrong run would mutate the exhaustion latch (#708).\n`,
+        );
+      }
+      return false;
     }
   } catch {
     return false;

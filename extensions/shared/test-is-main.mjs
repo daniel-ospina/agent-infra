@@ -134,10 +134,35 @@ console.log('── Part A — classifyEntry / isMain (decision table) ──');
   check('A5 different existing file → IMPORTED', info.verdict === IMPORTED, JSON.stringify(info));
 }
 
-// A6 — no argv[1] at all: REPL / `node -e` / plain import.
-for (const argv1 of [undefined, null, '']) {
-  const info = classifyEntry(pathToFileURL(HELPER).href, argv1);
-  check(`A6 argv[1]=${JSON.stringify(argv1)} → IMPORTED`, info.verdict === IMPORTED, JSON.stringify(info));
+// A6 — no argv[1] at all: REPL / `node -e` / plain import. The `argv1`
+// parameter DEFAULTS to `process.argv[1]`, so the branch is only reachable when
+// that is absent — which is what the test process must simulate (review cycle 1:
+// passing an explicit `undefined` while argv[1] is set exercises the default,
+// not this branch, so the previous form of this case was vacuous).
+{
+  const saved = process.argv[1];
+  try {
+    process.argv[1] = undefined;
+    for (const argv1 of [undefined, null, '']) {
+      const info = classifyEntry(pathToFileURL(HELPER).href, argv1);
+      check(
+        `A6 argv[1]=${JSON.stringify(argv1)} → IMPORTED`,
+        info.verdict === IMPORTED && info.reason === 'no-argv1',
+        JSON.stringify(info),
+      );
+    }
+    check('A6b the no-argv1 branch is the one exercised (not the default)', isMain(pathToFileURL(HELPER).href) === false);
+  } finally {
+    process.argv[1] = saved;
+  }
+  // With argv[1] SET, an omitted/undefined `argv1` argument follows the default
+  // (documented) — it is not the no-argv1 branch.
+  const info = classifyEntry(pathToFileURL(HELPER).href, undefined);
+  check(
+    'A6c explicit `undefined` argv1 follows the process.argv[1] default (documented)',
+    info.reason !== 'no-argv1',
+    JSON.stringify(info),
+  );
 }
 
 // A7 — vanished leaf: realpath on both sides fails, but the symlinked ANCESTOR
@@ -181,6 +206,54 @@ for (const argv1 of [undefined, null, '']) {
     '/nonexistent-argv-dir-708/other.mjs',
   );
   check('A9b unresolvable, different basename → UNRESOLVED', info2.verdict === UNRESOLVED, JSON.stringify(info2));
+}
+
+// A9c — THE REVIEW-CYCLE-1 REGRESSION PIN. `self` resolves, `argv[1]` does not,
+// basenames differ ⇒ provably a different file ⇒ IMPORTED (quiet): running the
+// guard body here would execute it inside an IMPORTING process, where it is a
+// `process.exit`, a `--write`, or a latch `--clear` — all measured in review.
+{
+  const info = classifyEntry(pathToFileURL(HELPER).href, '/nonexistent-argv-dir-708/other.mjs');
+  check(
+    'A9c self resolves + argv[1] unresolvable + different basename → IMPORTED (not UNRESOLVED)',
+    info.verdict === IMPORTED && info.reason === 'argv1-unresolvable-different',
+    JSON.stringify(info),
+  );
+  let warn = '';
+  let verdict;
+  warn = captureStderr(() => {
+    verdict = isMain(pathToFileURL(HELPER).href, '/nonexistent-argv-dir-708/other.mjs');
+  });
+  check(
+    'A9c-b isMain → quiet false (no gate body runs in an importing process)',
+    verdict === false && warn === '',
+    JSON.stringify({ verdict, warn }),
+  );
+
+  // The exact deployment shape this protects: a bun-compiled pi presents a
+  // VIRTUAL entry path (extensions/builtin-tools/index.ts:161).
+  const bun = classifyEntry(pathToFileURL(HELPER).href, '/$bunfs/root/pi.ts');
+  check('A9d bun virtual entry (/$bunfs/root/pi.ts) → IMPORTED, never UNRESOLVED', bun.verdict === IMPORTED, JSON.stringify(bun));
+}
+
+// A9e — same basename but the entry's DIRECTORY does not exist, while `self`
+// resolves: the entry cannot be this file (this file's directory exists), so it
+// is provably a different file → quiet IMPORTED. The genuine ambiguity is the
+// both-sides-unresolvable case (A9) and the deleted-self case (selfReal null),
+// which stay UNRESOLVED → loud + fail-closed.
+{
+  const info = classifyEntry(pathToFileURL(HELPER).href, '/nonexistent-argv-dir-708/is-main.mjs');
+  check(
+    'A9e same basename, nonexistent dir, self resolves → IMPORTED (provably different)',
+    info.verdict === IMPORTED && info.reason === 'argv1-unresolvable-different',
+    JSON.stringify(info),
+  );
+  let warn = '';
+  let verdict;
+  warn = captureStderr(() => {
+    verdict = isMain(pathToFileURL(HELPER).href, '/nonexistent-argv-dir-708/is-main.mjs');
+  });
+  check('A9e-b quiet false — no gate body runs in an importing process', verdict === false && warn === '', JSON.stringify({ verdict, warn }));
 }
 
 // A10 — our OWN module root is unresolvable (`data:` URL) → UNRESOLVED.
@@ -230,6 +303,23 @@ for (const argv1 of [undefined, null, '']) {
   const entryWarn = captureStderr(() => isMain(pathToFileURL(HELPER).href, HELPER));
   const importedWarn = captureStderr(() => isMain(pathToFileURL(HELPER).href, join(PROJECT_ROOT, 'package.json')));
   check('A12 ENTRY and IMPORTED emit no warning', entryWarn === '' && importedWarn === '', JSON.stringify({ entryWarn, importedWarn }));
+}
+
+// A13 — the metaUrl default footgun (review cycle 1): `isMain()` with the
+// natural one-argument call must NOT silently return false (which would disable
+// the caller's gate — the #708 class). It is loud + fail-closed instead.
+{
+  let warn = '';
+  let verdict;
+  warn = captureStderr(() => {
+    verdict = isMain();
+  });
+  check(
+    'A13 isMain() with metaUrl omitted → true + LOUD (never a silent false)',
+    verdict === true && warn.includes(WARN_PREFIX),
+    JSON.stringify({ verdict, warn }),
+  );
+  check('A13b classifyEntry(undefined, ...) is UNRESOLVED', classifyEntry(undefined, '/tmp/x.mjs').verdict === UNRESOLVED);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -320,13 +410,15 @@ check(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PART C — static tripwire: no non-realpath'd entry-point comparison
+// §PART C — static tripwire: no non-realpath'd entry-point comparison
 // ═══════════════════════════════════════════════════════════════════════════
-// HEURISTIC on purpose. It catches the two idioms that shipped (a
+// HEURISTIC on purpose, and the heuristic's blind spots are PINNED as fixtures
+// (C5) rather than claimed away. It catches the two idioms that shipped (a
 // pathToFileURL/`path.resolve` path compared to `import.meta.url` without a
-// realpath), it does not model control flow, and it is deliberately NOT an
-// attempt to model shell/YAML execution semantics — see #666 for the evidence
-// that re-modelling that domain does not converge.
+// realpath) in both the inline and the hoisted/aliased shape; it does not model
+// control flow, and it is deliberately NOT an attempt to model shell/YAML
+// execution semantics — see #666 for the evidence that re-modelling that domain
+// does not converge.
 console.log('── Part C — static tripwire (heuristic) ──');
 
 const SELF_REL = relative(PROJECT_ROOT, fileURLToPath(import.meta.url));
@@ -354,15 +446,71 @@ const HAS_REALPATH = /realpath/i;
 
 function scanSource(rel, src) {
   const findings = [];
-  for (const stmt of stripComments(src).split(';')) {
+  const body = stripComments(src);
+  for (const stmt of body.split(';')) {
     const flat = stmt.replace(/\s+/g, ' ').trim();
     if (!flat.includes('import.meta.url')) continue;
     if (!ARGV_RESOLVE.test(flat)) continue;
     if (!COMPARISON.test(flat)) continue;
     if (HAS_REALPATH.test(flat)) continue;
-    findings.push({ rel, stmt: flat });
+    findings.push({ rel, stmt: flat, pattern: 'inline' });
   }
   return findings;
+}
+
+// ── S2: the HOISTED / ALIASED shape ────────────────────────────────────────
+// Review cycle 1 PROVED S1 misses the shape that was actually shipped in
+// provider-failover.ts — the provenance is split across statements:
+//   const self = fileURLToPath(import.meta.url);
+//   const resolved = path.resolve(entry);      // entry = process.argv[1]
+//   if (resolved === self) return true;
+// and it also misses arbitrary argv aliases (`const e = process.argv[1]`).
+// So S2 is FILE-level: it collects every identifier derived from argv[1]
+// (directly or through path.resolve/pathToFileURL) and every identifier derived
+// from import.meta.url, then flags a comparison between the two families in a
+// file that never mentions `realpath` — the realpath compare is precisely what
+// makes the comparison symlink-safe.
+const ARGV_ALIAS = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*process\.argv\[1\]/g;
+const RESOLVE_OF = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:String\s*\(\s*)?(?:pathToFileURL|path\.resolve)\s*\(\s*(process\.argv\[1\]|process\.argv\.at\(1\)|[A-Za-z_$][\w$]*)\s*\)?/g;
+const SELF_ALIAS = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:pathToFileURL\s*\(\s*)?fileURLToPath\s*\(\s*import\.meta\.url\s*\)/g;
+const ARGVISH = new Set(['process.argv[1]', 'argv1', 'argv', 'entry']);
+
+function scanFileHoisted(rel, src) {
+  const body = stripComments(src);
+  if (HAS_REALPATH.test(body)) return []; // a realpath compare is present → symlink-safe by construction
+  if (!body.includes('import.meta.url')) return [];
+
+  const argvNames = new Set();
+  for (const m of body.matchAll(ARGV_ALIAS)) argvNames.add(m[1]);
+  // Iterate: a resolve of an argv alias is itself argv-derived.
+  for (let pass = 0; pass < 4; pass++) {
+    let grew = false;
+    for (const m of body.matchAll(RESOLVE_OF)) {
+      const [name, arg] = [m[1], m[2]];
+      if ((ARGVISH.has(arg) || argvNames.has(arg)) && !argvNames.has(name)) {
+        argvNames.add(name);
+        grew = true;
+      }
+    }
+    if (!grew) break;
+  }
+  const selfNames = new Set();
+  for (const m of body.matchAll(SELF_ALIAS)) selfNames.add(m[1]);
+  if (argvNames.size === 0) return [];
+
+  const argvRef = new RegExp(
+    `\\b(?:${[...ARGVISH].map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')}|${[...argvNames].join('|')})\\b`,
+  );
+  const selfRef = new RegExp(`(?:import\\.meta\\.url|\\b(?:${[...selfNames].join('|') || '\u0001'})\\b)`);
+
+  for (const stmt of body.split(';')) {
+    const flat = stmt.replace(/\s+/g, ' ').trim();
+    if (!COMPARISON.test(flat)) continue;
+    if (!argvRef.test(flat)) continue;
+    if (!selfRef.test(flat)) continue;
+    return [{ rel, stmt: flat, pattern: 'hoisted' }];
+  }
+  return [];
 }
 
 function walk(dir) {
@@ -395,11 +543,17 @@ for (const root of SCAN_ROOTS) {
     const rel = relative(PROJECT_ROOT, file);
     if (rel === SELF_REL) continue; // this file necessarily names the banned idiom
     scanned.push(rel);
-    findings.push(...scanSource(rel, readFileSync(file, 'utf8')));
+    let src;
+    try {
+      src = readFileSync(file, 'utf8');
+    } catch {
+      continue; // vanished between statSync and read — skip, do not abort the audit
+    }
+    findings.push(...scanSource(rel, src), ...scanFileHoisted(rel, src));
   }
 }
 
-for (const f of findings) console.log(`   ❌ ${f.rel}: ${f.stmt.slice(0, 160)}`);
+for (const f of findings) console.log(`   ❌ ${f.rel} [${f.pattern}]: ${f.stmt.slice(0, 160)}`);
 check(
   'C1 no symlink-sensitive entry-point comparison anywhere in scripts/, extensions/, bin/',
   findings.length === 0,
@@ -424,13 +578,85 @@ check(
     scanSource('fixture.mjs', '.filter((f) => f !== basename(fileURLToPath(import.meta.url)))\n').length === 0,
 );
 
-// ── Cleanup + summary ─────────────────────────────────────────────────────
-for (const dir of TMP_DIRS) {
-  try {
-    rmSync(dir, { recursive: true, force: true });
-  } catch {
-    /* best-effort */
+// C5 — the hoisted/aliased blind spot S1 provably had (review cycle 1). These
+// are the HISTORICAL texts of the two shipped guards, so a regex regression here
+// is caught rather than silently narrowing the net.
+const S1_MISSES = [
+  [
+    'hoisted (the shape provider-failover.ts actually shipped)',
+    'const self = fileURLToPath(import.meta.url);\nconst resolved = path.resolve(entry);\nif (resolved === self) return true;\n',
+    'const entry = process.argv[1];\n',
+  ],
+  [
+    'aliased argv',
+    'const e = process.argv[1];\nconst p = pathToFileURL(e);\nif (p.href === import.meta.url) run();\n',
+    '',
+  ],
+  [
+    'split statement (url then compare)',
+    'const u = pathToFileURL(process.argv[1]).href;\nconst isMain = u === import.meta.url;\n',
+    '',
+  ],
+];
+for (const [label, bad, prelude] of S1_MISSES) {
+  const src = prelude + bad;
+  check(
+    `C5 hoisted/aliased form is caught (${label})`,
+    scanFileHoisted('fixture.ts', src).length === 1,
+    `scanFileHoisted found ${scanFileHoisted('fixture.ts', src).length}`,
+  );
+}
+
+// C6 — the ONE site with no behavioural regression test (a plain-node `.mjs`
+// suite cannot import a `.ts`) has its guard SHAPE pinned: a realpath compare
+// must be present, and the CLI must never be launched on ambiguity (exactly one
+// `return true`, the literal-match line). Review cycle 1 measured that a
+// `return true` in this block wipes the exhaustion latch.
+{
+  const pf = readFileSync(join(PROJECT_ROOT, 'extensions/shared/provider-failover.ts'), 'utf8');
+  const start = pf.indexOf('const isDirectEntry');
+  const block = start === -1 ? '' : pf.slice(start, pf.indexOf('})();', start) + 5);
+  check('C6 provider-failover.ts guard found', block.length > 0);
+  check(
+    'C6b the guard compares realpaths (symlink-insensitive)',
+    /fs\.realpathSync\(resolved\)\s*===\s*fs\.realpathSync\(self\)/.test(block),
+  );
+  check(
+    'C6c the guard NEVER launches the CLI on ambiguity (exactly one `return true`)',
+    (block.match(/return true/g) || []).length === 1,
+    `${(block.match(/return true/g) || []).length} occurrences`,
+  );
+  check('C6d no cross-layer import of scripts/ from the shipped extension', !/from\s+["'][^"']*\.\.\/\.\.\/scripts\//.test(pf));
+}
+
+// C7 — the "loudly" half of the contract: no production call site may pass a
+// `warn` override (which would keep the fail-closed verdict but silence it).
+{
+  for (const rel of ['scripts/check-skill-lint.mjs', 'scripts/load-gate.mjs', 'scripts/probe-frontmatter-fixtures.mjs']) {
+    const src = stripComments(readFileSync(join(PROJECT_ROOT, rel), 'utf8'));
+    check(
+      `C7 ${rel} calls isMain(import.meta.url, process.argv[1]) with no warn override`,
+      /isMain\(import\.meta\.url,\s*process\.argv\[1\]\)/.test(src),
+    );
   }
 }
+
+// ── Cleanup + summary ─────────────────────────────────────────────────────
+// Registered on `exit` as well as at the end: a throw before the final loop
+// (a symlink EPERM, ENOSPC in mkdtemp) must not leak temp trees.
+let cleaned = false;
+function cleanup() {
+  if (cleaned) return;
+  cleaned = true;
+  for (const dir of TMP_DIRS) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+process.on('exit', cleanup);
+cleanup();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail > 0 ? 1 : 0);

@@ -84,7 +84,7 @@ swallowed by a load `try`, leaving `allow` stubs bound — the bash-git gate sil
 | `scripts/load-gate.mjs` | 156 | same | ❌ **symlink-sensitive** |
 | `scripts/probe-frontmatter-fixtures.mjs` | 364 | `path.resolve(argv1) === fileURLToPath(import.meta.url)` | ❌ **symlink-sensitive** |
 | `extensions/shared/provider-failover.ts` | 1366 | `path.resolve(entry) === fileURLToPath(import.meta.url)` | ❌ **symlink-sensitive** (CLI silently skipped) |
-| `scripts/check-workflow-lock.mjs` | 420 | `sameRealPath(argv1, fileURLToPath(import.meta.url))` | ✅ fixed under #675 (realpath both sides + fallback) |
+| `scripts/check-workflow-lock.mjs` | 420 | `sameRealPath(argv1, fileURLToPath(import.meta.url))` | ✅ symlink-insensitive since #675. Residual (follow-up filed): its innermost `catch { return false }` still no-ops silently when **both** paths are unresolvable (a virtual `argv[1]`) — same class, not the symlink case |
 | `scripts/check-migration-order.cjs` | 237 | `require.main === module` | ✅ CJS **module-identity** compare — symlink-insensitive |
 | `scripts/check-untested-modules.cjs` | 228 | `require.main === module` | ✅ idem |
 | `scripts/check-test-regression.cjs` | 755 | `require.main === module` | ✅ idem |
@@ -115,16 +115,46 @@ classifyEntry(metaUrl, argv1) → { verdict, reason, self, argv1 }
 | Verdict | When | `isMain()` |
 |---|---|---|
 | `ENTRY` | literal match, realpath match (symlinked ancestor **or** leaf), or dirname-realpath + basename match | `true` |
-| `IMPORTED` | **no** `argv[1]` (REPL / `node -e` / plain import), or both sides realpath **definitively to different files** | `false` |
-| `UNRESOLVED` | own module path unresolvable, or `argv[1]` unresolvable *and* unprovable | **loud warning + `true`** |
+| `IMPORTED` | **no** `argv[1]` (REPL / `node -e` / plain import); both sides realpath **definitively to different files**; or `self` resolves while `argv[1]` does **not** | `false` |
+| `UNRESOLVED` | our **own** module path is unresolvable (or both sides are), so nothing about the invocation is provable | **loud warning + `true`** |
 
-`UNRESOLVED → true` is the fail-closed direction: for all four call sites the guard body **is** the
-gate, so running it is the safe answer, and a wrong `true` is *visible* (the gate's output plus a
-`[is-main] ⚠️  FAIL-CLOSED` line on stderr) whereas a wrong `false` is invisible. This is the
-"refuse or warn loudly" requirement, resolved as *warn loudly and run*.
+`IMPORTED` is the quiet answer **only when it is proven** — a false `IMPORTED` is the silent no-op
+this module exists to prevent, so every branch is a proof rather than a guess. `UNRESOLVED → true`
+is the fail-closed residue: for all four call sites the guard body **is** the gate, so running it is
+the safe answer, and a wrong `true` is *visible* (the gate's output plus a `[is-main] ⚠️ FAIL-
+CLOSED` line on stderr) whereas a wrong `false` is invisible. This is the "refuse or warn loudly"
+requirement, resolved as *warn loudly and run*.
 
 The `dirname-realpath` fallback is #675 P2-f's chain, kept: it resolves a symlinked **ancestor**
 even when the leaf itself is gone (deleted mid-run), which is the other silent-no-op shape.
+
+**`metaUrl` is REQUIRED and has no default.** A default of `import.meta.url` would be *this*
+module's own URL, so the natural one-argument call `isMain()` would compare `argv[1]` against
+`scripts/is-main.mjs`, return `IMPORTED`, and silently disable the caller's gate — the #708 class
+reintroduced by an omitted argument. An omitted `metaUrl` is instead an unresolvable self →
+`UNRESOLVED` → loud + fail-closed.
+
+#### Review cycle 1 folded in: `UNRESOLVED → true` was WRONG at an importing call site
+
+Round 1's reviewers converged on a real P1 **introduced by the first revision**: `UNRESOLVED` is
+unreachable for a genuine direct invocation (Node just loaded the file, so `self` resolves and a
+direct `argv[1]` resolves), so it was reachable **only when the module was imported while
+`argv[1]` was unresolvable** — i.e. precisely when the module is *not* the entry point. There,
+`true` ran the guard body **inside the importing process**, where it is a side effect, not a gate.
+Measured: importing `load-gate.mjs` / `check-skill-lint.mjs` with a bogus `argv[1]` KILLED the
+importer (`process.exit`); `probe-frontmatter-fixtures.mjs` ran `main()`; and importing
+`provider-failover.ts` with `--clear '*'` **WIPED the exhaustion latch**. The shape is real, not
+theoretical: a bun-compiled pi presents a virtual entry path (`/$bunfs/root/pi.ts`, explicitly
+handled at `extensions/builtin-tools/index.ts:161` and `extensions/subagent/index.ts:439`), and
+`provider-failover.ts` is imported in-process by `builtin-tools` on every session.
+
+Fix: `self`-resolves + `argv[1]`-unresolvable is a **proof** that the paths differ (a path that
+does not resolve cannot name a file that does) → `IMPORTED`, quiet. `UNRESOLVED` now means only
+"our own module root is unresolvable", the irreducible case. `provider-failover.ts` additionally
+does **not** reuse `UNRESOLVED → run` at all (its body launches a CLI that mutates the latch): an
+unresolvable entry resolves to "not the entry point", with one loud line when the basename matches
+(genuinely ambiguous) and quiet when it provably differs. Verified after the fix: all three
+imports survive with rc 0, and the latch file is byte-identical.
 
 ### 3. `extensions/shared/provider-failover.ts` gets an inline equivalent, deliberately
 
@@ -132,8 +162,10 @@ Shipped extension code importing `../../scripts/…` would be a new cross-layer 
 production extension does it today: `grep -rn "\.\./\.\./scripts" extensions/` matches one test
 only) and `scripts/` is not guaranteed to be resolvable relative to a materialized `~/.pi/agent/
 extensions/` tree. So the ~10-line comparison is inlined there, with a comment naming
-`scripts/is-main.mjs` as canonical. Accepted residual: two implementations can drift; the static
-tripwire (below) covers both.
+`scripts/is-main.mjs` as canonical — but with a **different ambiguity direction**: this guard's
+body launches a CLI that mutates the exhaustion latch, so an unresolvable entry resolves to "not
+the entry point" (loud only when the basename matches). Accepted residual: two implementations can
+drift; the static tripwire (below, C5/C6) covers both shapes.
 
 ### 4. Regression test at `extensions/shared/test-is-main.mjs`
 
@@ -147,17 +179,22 @@ The suite is a **positive control**, not a unit test of the helper only (issue o
 helper-only unit test *would not have caught this bug*):
 
 - **Part A** — `classifyEntry` cases: literal, symlinked ancestor, symlinked leaf, relative
-  `argv[1]`, different file, absent `argv[1]`, unresolvable-leaf-same-basename, unresolvable +
-  different basename, `self` unresolvable (`data:` URL), and an explicit assertion that the **old
-  idiom returns false** for the symlinked case (documents what the fixture pins).
+  `argv[1]`, different file, absent `argv[1]` (with `process.argv[1]` actually unset so the branch
+  is reached rather than the parameter default), unresolvable-leaf-same-basename, unresolvable +
+  different basename, the **bun virtual entry** (`/$bunfs/root/pi.ts` → `IMPORTED`), `self`
+  unresolvable (`data:` URL), omitted `metaUrl` → loud `true`, and an explicit assertion that the
+  **old idiom returns false** for the symlinked case (documents what the fixture pins).
 - **Part B** — spawns the **real** `scripts/check-skill-lint.mjs` with a planted P0 through a
   symlinked `scripts/` dir and through a symlinked ancestor, and asserts byte-comparable *count
   line* + **exit 1** against the realpath control; asserts the fast path was used (no
   `[is-main]` warning). Same for `scripts/load-gate.mjs --json` (must emit a JSON verdict, not
   silence). Negative control: importing the module **must not** run the gate.
 - **Part C** — heuristic static tripwire over `scripts/`, `extensions/`, `bin/`: no file may
-  compare a **non-realpath'd** path against `import.meta.url`. Labelled heuristic (it catches the
-  two shipped idioms, it is not a shell/YAML-semantics model — see #666 for why those do not
+  compare a **non-realpath'd** argv-derived path against `import.meta.url`, in the **inline** *or*
+  the **hoisted/aliased** shape (cycle 1 proved the inline-only scan missed the shape
+  `provider-failover.ts` actually shipped; C5 pins the three bypass texts as positive fixtures).
+  Labelled heuristic (it catches the shipped idioms, it is not a shell/YAML-semantics model — see
+  #666 for why those do not
   converge).
 
 ### 5. CI wiring — both legs, following #744/#709
@@ -173,11 +210,11 @@ helper-only unit test *would not have caught this bug*):
 
 | Surface | Wiring point | Test |
 |---|---|---|
-| `scripts/is-main.mjs` | new module: `classifyEntry` / `isMain` / `ENTRY`/`IMPORTED`/`UNRESOLVED` | `extensions/shared/test-is-main.mjs` Part A |
+| `scripts/is-main.mjs` | new module: `classifyEntry` / `isMain` / `ENTRY`/`IMPORTED`/`UNRESOLVED` (required `metaUrl`) | `extensions/shared/test-is-main.mjs` Part A |
 | `scripts/check-skill-lint.mjs:255` | guard replaced with `isMain(import.meta.url, process.argv[1])`; unused `pathToFileURL` import dropped | Part B (planted-P0 symlink control) |
 | `scripts/load-gate.mjs:156` | same replacement | Part B (`--json` verdict present) |
-| `scripts/probe-frontmatter-fixtures.mjs:364` | same replacement | Part A + Part C |
-| `extensions/shared/provider-failover.ts:1366` | inline realpath comparison (no cross-layer import) | Part C |
+| `scripts/probe-frontmatter-fixtures.mjs:364` | same replacement | Part A + Part C (C7); behavioural symlink coverage is a documented residual (its `main()` needs a live pi install) |
+| `extensions/shared/provider-failover.ts:1366` | inline realpath comparison (no cross-layer import); ambiguity → **do not launch the CLI** | Part C C6 (shape pin — no behavioural test is possible from a plain-`node` `.mjs`) |
 | `extensions/shared/test-is-main.mjs` | new suite | `extensions/*/test*.mjs` glob (ci-main) |
 | `.github/workflows/ci.yml` | per-PR `verify` step | `node extensions/shared/test-is-main.mjs` |
 | `scripts/workflow-lock.json` | re-lock after the ci.yml edit | `node scripts/check-workflow-lock.mjs` |
@@ -187,10 +224,22 @@ helper-only unit test *would not have caught this bug*):
 - **Not** enumerating shell or YAML bypasses — a known unbounded domain (residuals already filed:
   #814, #793; #666 is the evidence that re-modelling does not converge).
 - The scripts' validation logic — untouched (this is purely "did the gate run").
-- `provider-failover.ts` has **no behavioural** regression test (plain-`node` `.mjs` cannot import a
-  `.ts`); it is covered by the helper's Part A logic equivalents + Part C static scan. A `tsx`-run
-  behavioural test is a follow-up candidate, not this PR.
-- The static tripwire (Part C) is heuristic by design and does not model control flow.
+- `provider-failover.ts` has **no behavioural** regression test (a plain-`node` `.mjs` cannot import
+  a `.ts`); it is covered by the helper's Part A logic equivalents plus Part C C6's shape pin
+  (realpath compare present, CLI never launched on ambiguity, no cross-layer import). Its
+  cycle-1 regression (latch wipe) WAS verified behaviourally by hand and is recorded in the PR.
+- `scripts/probe-frontmatter-fixtures.mjs` likewise has no behavioural symlink test — its `main()`
+  needs a live pi install. Covered by C7 + shared-helper behaviour.
+- The Part C static tripwire is **heuristic by design**; its blind spots are pinned as positive
+  fixtures (C5) rather than claimed away, and the remaining ones (wrapper/ternary indirection)
+  are accepted.
+- `scripts/check-workflow-lock.mjs`'s innermost `catch { return false }` (~line 414) still no-ops
+  silently when both paths are unresolvable — same class, not the symlink case, and migrating it
+  means editing the pin gate's own `const IS_MAIN =` fixture anchor. Filed as **#826** by review
+  cycle 1 rather than chased here.
+- `scripts/check-pipeline-compliance.sh` recognises test evidence only via `\.test\.(ts|js)$`, so
+  `extensions/*/test*.mjs` suites cannot satisfy its check (e) — they pass via PR-body markers.
+  Filed as **#827** by review cycle 1.
 
 ## Verification plan
 
@@ -198,9 +247,14 @@ helper-only unit test *would not have caught this bug*):
 |---|---|---|
 | reproduction, before | repro B/C above | exit 0, empty stdout (bug) |
 | reproduction, after | repro B/C above | exit 1, same count line as control |
-| new regression suite | `node extensions/shared/test-is-main.mjs` | all pass, 0 failed |
+| new regression suite | `node extensions/shared/test-is-main.mjs` | 52 passed / 0 failed |
 | #744 module-load pin | `node extensions/main-worktree-guard/test-module-load.mjs` | **49 passed / 0 failed** |
-| #709 discard gate | `node extensions/main-worktree-guard/test-discard-gate.mjs` | unchanged from baseline |
-| lint suite | `node scripts/check-skill-lint.test.mjs` | pass |
-| pin gate + lock | `node scripts/check-pi-pin-lockstep.mjs`, `node scripts/check-workflow-lock.mjs` | pass |
-| TDD red | temporarily restore the old idiom at `check-skill-lint.mjs` | Part B RED |
+| #709 discard gate | `node extensions/main-worktree-guard/test-discard-gate.mjs` | 314 passed / 0 failed |
+| lint suite | `node scripts/check-skill-lint.test.mjs` | 160 passed / 0 failed |
+| oracle suite | `node scripts/check-skill-lint.oracle.test.mjs` | 146 passed / 0 failed |
+| load gate | `node scripts/load-gate.test.mjs` | 15 passed / 0 failed |
+| pin gate + lock | `node scripts/check-pi-pin-lockstep.mjs`, `node scripts/check-workflow-lock.mjs` | 116 passed / 0 failed; lock clean |
+| failover suites | `npx tsx extensions/shared/{default-coverage,provider-failover}.test.ts` | 5/0 and 79/0 |
+| cycle-1 regression: importer survives | import a gate with a bogus `argv[1]` (and with the bun-virtual shape) | `IMPORT-SURVIVED`, rc 0 |
+| cycle-1 regression: latch preserved | import `provider-failover.ts` with `--clear '*'` and a virtual `argv[1]` | latch file byte-identical |
+| TDD red | temporarily restore the old idiom at `check-skill-lint.mjs` | Part B + C1/C7 RED (46 passed, 6 failed) |
