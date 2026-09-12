@@ -335,6 +335,11 @@ for marker in \
   "pass 6j: check (f) blocks a reserved model laundered as independent=yes" \
   "pass 6o: check (f) blocks the bare DEGRADED token as a model value" \
   "pass 6k: check (f) blocks a trailing-boundary bypass" \
+  "pass 6k1: check (f) blocks a numeric-suffixed boundary bypass (independent=yes1)" \
+  "pass 6k2: check (f) blocks a hyphen-suffixed boundary bypass (independent=yes-foo)" \
+  "pass 6k3: check (f) blocks an underscore-suffixed boundary bypass (independent=yes_foo)" \
+  "pass 6k5: check (f) blocks a punctuation-suffixed boundary bypass (independent=yes.)" \
+  "pass 6k4: check (f) blocks a duplicated independent= token" \
   "pass 6l: check (f) blocks a marker bound to another head" \
   "pass 6m: check (f) blocks a marker with no head binding" \
   "pass 6n: check (f) blocks a non-id model value" \

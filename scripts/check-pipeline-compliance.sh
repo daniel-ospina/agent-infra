@@ -653,15 +653,27 @@ run_checks() {
       sm_malformed="" sm_pairs=""
       while IFS= read -r sm_line; do
         [ -z "$sm_line" ] && continue
-        if [[ "$sm_line" =~ \[SECOND-MODEL-GATE\][[:space:]]+model=([^[:space:]]+)[[:space:]]+independent=(yes|NO|DEGRADED)([^A-Za-z]|$) ]]; then
+        # H5: exactly ONE `independent=` token per line. A duplicated token
+        # (`independent=yes independent=NO`) would let the FIRST value win —
+        # the line must be malformed, never silently read as `yes`.
+        if [[ "$sm_line" =~ independent=.*independent= ]]; then
+          [ -n "$sm_malformed" ] || sm_malformed="$sm_line"
+          continue
+        fi
+        # H5: the value must be the WHOLE token. The old `([^A-Za-z]|$)`
+        # boundary rejected only ALPHABETIC suffixes, so `independent=yes1`,
+        # `yes-foo`, `yes_foo` and `yes.` all passed the gate. `($|[[:space:]])`
+        # requires a real token boundary.
+        if [[ "$sm_line" =~ \[SECOND-MODEL-GATE\][[:space:]]+model=([^[:space:]]+)[[:space:]]+independent=(yes|NO|DEGRADED)($|[[:space:]]) ]]; then
           sm_pairs+="${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}"$'\n'
         elif [[ -z "$sm_malformed" ]]; then
           sm_malformed="$sm_line"
         fi
       done <<< "$sm_line_raw"
       if [[ -n "$sm_malformed" ]]; then
-        # C3(b): the trailing-boundary group rejects `independent=yesx` (and any
-        # other suffixed value) — the value must be the whole token.
+        # C3(b)/H5: the value must be the whole token — the boundary group
+        # rejects every suffixed value (`independent=yesx`, `yes1`, `yes-foo`,
+        # `yes_foo`, `yes.`).
         fail f "malformed [SECOND-MODEL-GATE] line — expected \"[SECOND-MODEL-GATE] model=<provider/id> independent=<yes|NO|DEGRADED> @ <40-hex head-sha>\", got: $(printf '%s' "$sm_malformed" | head -c 200)"
       else
         # C3(a)/G5: a reserved/placeholder model value is never a resolved id,
@@ -706,7 +718,7 @@ run_checks() {
           # is current.
           while IFS= read -r sm_line; do
             [[ "$sm_line" =~ model=${sm_model}[[:space:]] ]] || continue
-            [[ "$sm_line" =~ independent=${sm_indep}([^A-Za-z]|$) ]] || continue
+            [[ "$sm_line" =~ independent=${sm_indep}($|[[:space:]]) ]] || continue
             if [[ "$sm_line" =~ @[[:space:]]*([0-9a-f]{40})([^0-9a-f]|$) ]]; then
               sm_sha="${BASH_REMATCH[1]}"
             fi
@@ -1015,6 +1027,19 @@ ${smline}"
   # C3(b): the trailing boundary — `independent=yesx` must not match `yes`.
   sm_case 6k "blocks a trailing-boundary bypass (independent=yesx)" \
     "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yesx @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "malformed \[SECOND-MODEL-GATE\]"
+  # H5: the old boundary `([^A-Za-z]|$)` rejected only ALPHABETIC suffixes, so
+  # these all passed the gate. The value must be the whole token.
+  sm_case 6k1 "blocks a numeric-suffixed boundary bypass (independent=yes1)" \
+    "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes1 @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "malformed \[SECOND-MODEL-GATE\]"
+  sm_case 6k2 "blocks a hyphen-suffixed boundary bypass (independent=yes-foo)" \
+    "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes-foo @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "malformed \[SECOND-MODEL-GATE\]"
+  sm_case 6k3 "blocks an underscore-suffixed boundary bypass (independent=yes_foo)" \
+    "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes_foo @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "malformed \[SECOND-MODEL-GATE\]"
+  sm_case 6k5 "blocks a punctuation-suffixed boundary bypass (independent=yes.)" \
+    "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes. @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "malformed \[SECOND-MODEL-GATE\]"
+  # H5: a duplicated `independent=` token must not let the first value win.
+  sm_case 6k4 "blocks a duplicated independent= token" \
+    "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes independent=NO @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "malformed \[SECOND-MODEL-GATE\]"
   # C3(c): the line must be bound to the PR head.
   sm_case 6l "blocks a marker bound to another head" \
     "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ 1111111111111111111111111111111111111111" "$SM_SIM_SHIPPED" 0 "not bound to the PR head"
