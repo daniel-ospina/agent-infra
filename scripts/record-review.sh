@@ -131,15 +131,60 @@ fi
 if [ -n "$REPO" ] && ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   echo "repo must be owner/name (got '$REPO'); refusing to record" >&2; exit 2
 fi
-# ── Stale-sha guard (#2133): verify $SHA is the PR's CURRENT head ─────────
-# The ai-review-gate binds the recorded FULL sha into the signed marker and
-# rejects any record whose sha != the PR head at check time. tortoise PR
+# ── Diff binding (#2982) ──────────────────────────────────────────────────
+# What a review approves is the DIFF, not the commit sha. Record the sha256 of
+# the PR's three-dot diff and carry it INSIDE the signed marker so the
+# ai-review-gate can accept a verdict across a merge-only branch update
+# (`gh pr update-branch` inserts a merge commit; the head sha moves, the
+# reviewed diff does not). Without this, `strict: true` branch protection and
+# the gate's sha-binding were jointly unsatisfiable: every update invalidated
+# a still-correct verdict, so a green PR could never reach a terminal
+# mergeable state (#2982).
+#
+# The bytes MUST come from the GitHub REST API, exactly as the workflow does —
+# a local `git diff` would not byte-match and every diff= marker would fail
+# closed. Hash the FILE, not a command substitution: `x="$(cmd)"` strips
+# trailing newlines and would change the digest.
+#
+# Empty when gh/API/openssl is unavailable → the marker falls back to the
+# legacy sha-only shape, and the gate's sha-match path still governs.
+DIFF_HASH=""
+diff_hash_for_pr() { # <pr> — print the sha256 of the PR's current diff, or nothing
+  local pr="$1" tmp
+  command -v gh >/dev/null 2>&1 || return 0
+  command -v openssl >/dev/null 2>&1 || return 0
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" RETURN 2>/dev/null || true
+  if gh api -H "Accept: application/vnd.github.v3.diff" \
+       "repos/$REPO/pulls/$pr" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    openssl dgst -sha256 < "$tmp" | awk '{print $NF}'
+  fi
+  rm -f "$tmp"
+}
+if [ -n "$REPO" ]; then
+  DIFF_HASH="$(diff_hash_for_pr "$PR")"
+  [[ "$DIFF_HASH" =~ ^[0-9a-f]{64}$ ]] || DIFF_HASH=""
+  if [ -z "$DIFF_HASH" ]; then
+    echo "⚠️ #2982: could not compute this PR's diff hash (gh/API/openssl unavailable?) — recording a legacy sha-only marker; it will NOT carry across a branch update" >&2
+  fi
+fi
+
+# ── Stale-sha guard (#2133, extended by #2982): $SHA must be the CURRENT head
+# The ai-review-gate binds the recorded FULL sha into the signed marker. PR
 # #2074 recorded a stale-but-well-formed sha (…d329… vs real head …1ebe…,
 # both under short prefix 4cb7e671), causing repeated gate failures that
 # masqueraded as "No AI review evidence". Refuse mismatches up front unless
 # --force-stale is passed. Fail-OPEN when the head cannot be fetched (a
 # transient gh/API failure must not block a legitimate record); skip when no
 # repo is detectable (backward compat — record as before).
+#
+# #2982 — carry-forward arm: when the head has moved but the PR already carries
+# signed evidence for EXACTLY this diff (a marker whose diff= equals the live
+# diff hash), the head moved without the reviewed artifact changing (a
+# merge-only update). Re-record against the CURRENT head with that diff hash,
+# which is precisely what the gate needs — instead of refusing and deadlocking.
+# When no such marker exists the diff is genuinely unreviewed → still refuse.
 if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
   CURRENT_HEAD="$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
   # gh api prints 4xx error bodies to stdout — only a well-formed 40-hex
@@ -147,12 +192,27 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
   if ! [[ "$CURRENT_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
     echo "⚠️ stale-sha guard: could not fetch the current head of $REPO#$PR (gh/API failure?) — continuing fail-open; double-check the sha before relying on the gate" >&2
   elif [ "$CURRENT_HEAD" != "$SHA" ]; then
-    echo "stale-sha guard: provided sha $SHA is NOT the current PR head $CURRENT_HEAD — the ai-review-gate will reject this record" >&2
-    if [ "$FORCE_STALE" -ne 1 ]; then
+    echo "stale-sha guard: provided sha $SHA is NOT the current PR head $CURRENT_HEAD" >&2
+    # Carry-forward arm (#2982): does the PR already carry evidence for this
+    # exact diff? Only then is the head-move provably a no-op to the artifact.
+    PRIOR_DIFF=""
+    if [ -n "$DIFF_HASH" ]; then
+      PRIOR_BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
+      [ "$PRIOR_BODY" = "null" ] && PRIOR_BODY=""
+      if [ -n "$PRIOR_BODY" ] && printf '%s\n' "$PRIOR_BODY" | grep -qE "^review recorded: reviews/${PR}\.json verdict=clean(-micro)? @ [0-9a-f]{40} diff=${DIFF_HASH} \(.*\) sig=[0-9a-f]{64}$"; then
+        PRIOR_DIFF="$DIFF_HASH"
+      fi
+    fi
+    if [ -n "$PRIOR_DIFF" ]; then
+      echo "#2982 carry-forward: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, but the reviewed diff is unchanged (diff=${DIFF_HASH}) and already carries signed evidence — recording against the CURRENT head" >&2
+      SHA="$CURRENT_HEAD"
+    elif [ "$FORCE_STALE" -ne 1 ]; then
+      echo "   no prior evidence for this PR's current diff (diff=${DIFF_HASH:-unavailable}) — the reviewed artifact cannot be shown unchanged" >&2
       echo "refusing to record stale sha $SHA for $REPO#$PR — re-record with the current head ${CURRENT_HEAD:0:12}… (or pass --force-stale to override)" >&2
       exit 3
+    else
+      echo "⚠️ --force-stale passed: recording stale sha $SHA anyway — the ai-review-gate will keep rejecting until re-recorded at the current head" >&2
     fi
-    echo "⚠️ --force-stale passed: recording stale sha $SHA anyway — the ai-review-gate will keep rejecting until re-recorded at the current head" >&2
   fi
 fi
 
@@ -242,8 +302,13 @@ else
 fi
 TMP="$FILE.tmp"
 if [ -n "$REPO" ]; then
-  printf '{"pr":%d,"head_sha":"%s","verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$VERDICT" "$REPO" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
+  if [ -n "${DIFF_HASH:-}" ]; then
+    printf '{"pr":%d,"head_sha":"%s","verdict":"%s","repo":"%s","diff_sha256":"%s","reviewed_at":"%s"}\n' \
+      "$PR" "$SHA" "$VERDICT" "$REPO" "$DIFF_HASH" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
+  else
+    printf '{"pr":%d,"head_sha":"%s","verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
+      "$PR" "$SHA" "$VERDICT" "$REPO" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
+  fi
 else
   printf '{"pr":%d,"head_sha":"%s","verdict":"%s","reviewed_at":"%s"}\n' \
     "$PR" "$SHA" "$VERDICT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
@@ -287,7 +352,15 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   # (tortoise .github/workflows/ai-review-gate.yml), so the marker KEEPS the
   # legacy-style reviews/<PR>.json reference even though the record file is
   # now repo-qualified (#426). Never rename it to match the file.
-  MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA} (${REPO})"
+  # #2982: bind the reviewed DIFF into the signed text when available. The gate
+  # accepts a marker whose @ sha is stale iff its diff= equals the PR's live
+  # diff hash, so a merge-only branch update no longer invalidates a correct
+  # verdict. Absent → legacy sha-only shape (gate's sha-match path governs).
+  if [ -n "${DIFF_HASH:-}" ]; then
+    MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA} diff=${DIFF_HASH} (${REPO})"
+  else
+    MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA} (${REPO})"
+  fi
   if [ -n "$GATE_KEY" ]; then
     SIG="$(printf '%s' "$MARKER" | openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
     if [ -n "$SIG" ]; then
