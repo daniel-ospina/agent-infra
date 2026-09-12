@@ -98,11 +98,18 @@ ISSUE_ONLY="${PIPELINE_COMPLIANCE_ISSUE_ONLY:-0}"
 # inside made `PIPELINE_COMPLIANCE_ISSUE_ONLY=1 PIPELINE_COMPLIANCE_ISSUE=N \
 # bash …` — the exact form this script's own usage() documents — exit 2 with
 # "needs an issue", i.e. the documented env form could never work.
-ISSUE_TARGET="${PIPELINE_COMPLIANCE_ISSUE:-}"
+ENV_ISSUE_TARGET="${PIPELINE_COMPLIANCE_ISSUE:-}"
+ISSUE_TARGET="$ENV_ISSUE_TARGET"
 ISSUE_REF=""
 ISSUE_ARGV_ERR=""
 if [[ "${1:-}" == "--issue-only" ]]; then
   ISSUE_ONLY=1
+  # The argv flag AND the env seam both naming a target is two targets, not one
+  # silently overriding the other (review catch: `PIPELINE_COMPLIANCE_ISSUE=42
+  # … --issue-only 999` graded 999 with 42 dropped).
+  if [[ -n "$ENV_ISSUE_TARGET" ]]; then
+    ISSUE_ARGV_ERR="two issue targets: --issue-only was passed on the command line and PIPELINE_COMPLIANCE_ISSUE is also set ('$ENV_ISSUE_TARGET') — pass exactly one target"
+  fi
   ISSUE_TARGET="${2:-$ISSUE_TARGET}"
   # Exactly one target. A surplus argument is a usage error, never silently
   # ignored (review catch).
@@ -110,6 +117,12 @@ if [[ "${1:-}" == "--issue-only" ]]; then
     ISSUE_ARGV_ERR="--issue-only takes exactly one issue target, got a surplus argument: '${3}'"
   fi
   PR_NUMBER=""
+elif [[ "$ISSUE_ONLY" == "1" && $# -gt 0 && -n "$ISSUE_TARGET" ]]; then
+  # The ENV seam supplied the target and a positional was ALSO given: the
+  # positional used to be dropped silently (`ISSUE_ONLY=1 ISSUE=42 script 792`
+  # graded 42 while the caller meant 792). That is the same ambiguity the argv
+  # surplus rule rejects, so it is a usage error here too (review catch).
+  ISSUE_ARGV_ERR="PIPELINE_COMPLIANCE_ISSUE is set ('$ISSUE_TARGET') and a positional argument was also given ('${1}') — pass exactly one target"
 elif [[ $# -gt 1 ]]; then
   # `--issue-only` anywhere but argv[1] is a misordered invocation, NOT a PR
   # number plus a stray flag (review catch): `<N> --issue-only` used to fall
@@ -584,7 +597,7 @@ run_checks() {
 
   echo "=== Pipeline Compliance Gate ==="
   if [[ "$ISSUE_ONLY" == "1" ]]; then
-    echo "Issue: $ISSUE_REF (issue-only preflight — checks a/c/e skipped)"
+    echo "Issue: $ISSUE_REF (issue-only preflight — checks a/c/e/f skipped)"
   else
     echo "PR:   $GH_REPO#$PR_NUMBER"
   fi
@@ -981,9 +994,9 @@ summarize() {
       if [[ "$D_CHECKED" == "yes" ]]; then
         _io_evid="$_io_evid, (d) plan evidence via the Wiring table"
       fi
-      echo "✅ PIPELINE COMPLIANCE (issue-only preflight): PASS — $_io_evid. Checks a/c/e are PR-dependent and run at the required status check."
+      echo "✅ PIPELINE COMPLIANCE (issue-only preflight): PASS — $_io_evid. Checks a/c/e/f are PR-dependent and run at the required status check."
     else
-      echo "✅ PIPELINE COMPLIANCE (issue-only preflight): PASS — no issue-side artifact is required at this tier (b/d exempt); checks a/c/e are PR-dependent and run at the required status check."
+      echo "✅ PIPELINE COMPLIANCE (issue-only preflight): PASS — no issue-side artifact is required at this tier (b/d exempt); checks a/c/e/f are PR-dependent and run at the required status check."
     fi
   else
     echo "✅ PIPELINE COMPLIANCE: PASS — scoping/review/plan/test evidence present."
@@ -1001,7 +1014,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
     echo "  b. SCOPING COMMENT  gh api repos/<repo>/issues/<n>/comments → search for '<!-- issue-scoping:' marker"
     echo "  d. WIRING           the scoping comment's 'Wiring' section, for complexity:standard/complex only (the docs/plans/*.md branch needs the PR diff and is checked at merge time)"
     echo ""
-    echo "Skipped as PR-dependent: a (PR body), c (PR body/commits), e (PR diff + body) — all enforced at the required status check."
+    echo "Skipped as PR-dependent: a (PR body), c (PR body/commits), e (PR diff + body), f (PR diff, body/commits and base ref) — all enforced at the required status check."
     echo "Exemptions: complexity:micro skips b–d (identical tier exemption to the full run)."
     echo "Exit: 0 (compliant, simulated)."
     exit 0
@@ -1636,7 +1649,12 @@ $big_filler"
   # positive — the message below names the line so a legitimate hit is a
   # one-line clarification, not a mystery block.
   anti_a='(printf|echo|cat)[^|]*'
-  anti_b='[|][[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^|[:space:]]*[[:space:]]+)*grep[[:space:]]+(-[a-zA-Z]*q[a-zA-Z]*|--quiet)'
+  # The flag run may be JOINED (`grep -iq`) or SEPARATED (`grep -i -q`,
+  # `grep -n -q`): the old single-token form matched only the joined spelling,
+  # so a reverted site written as `grep -i -q` passed the pin (review catch).
+  # The optional middle group never crosses a `|`, so a quiet grep on a LATER
+  # pipeline stage is still not conflated with this producer.
+  anti_b='[|][[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^|[:space:]]*[[:space:]]+)*grep[[:space:]]+([^|]*[[:space:]])?(-[a-zA-Z]*q[a-zA-Z]*|--quiet)'
   anti="${anti_a}${anti_b}"
   # `${BASH_SOURCE[0]:-$0}` — under `set -u` BASH_SOURCE is unset for a
   # stdin/`eval` invocation, which used to abort the whole self-test before the
@@ -1654,6 +1672,29 @@ $big_filler"
     printf '✅ #836 static pin: no live evidence pipeline that pipes printf/echo/cat into a quiet grep in %s\n' "$SELF_SRC"
   else
     printf '❌ #836 static pin: a printf-into-grep -q pipeline is back — under pipefail its SIGPIPE false-negates evidence (and can fail-OPEN at pr_is_docs_only / the clean-micro binding). Pass the text with a here-string instead (grep -q … <<<"$text"):\n%s\n' "$pipe_hits" >&2
+    selffail=$((selffail + 1))
+  fi
+
+  # Positive control for the pin: a scan that matches NOTHING is
+  # indistinguishable from a pattern that was silently disarmed, so assert the
+  # ban pattern still recognises the idiom (in every spelling) and still
+  # ignores a here-string. The samples are assembled from parts and the pipe is
+  # a VARIABLE on purpose: this file's own source must never contain a literal
+  # `<producer> | grep -q` line, or the pin above would flag its own control.
+  sp='|'
+  s_joined="printf '%s' \"\$body\" $sp grep -q code-review"
+  s_sep="printf '%s' \"\$body\" $sp grep -i -q code-review"
+  s_quiet="cat \"\$f\" $sp grep --quiet code-review"
+  s_env="printf '%s' \"\$body\" $sp LC_ALL=C grep -q code-review"
+  s_herestr="LC_ALL=C grep -q code-review <<<\"\$body\""
+  pin_hit() { if grep -qE "$anti" <<<"$1"; then printf '1'; else printf '0'; fi; }
+  pin_pos="$(pin_hit "$s_joined")$(pin_hit "$s_sep")$(pin_hit "$s_quiet")$(pin_hit "$s_env")"
+  pin_neg="$(pin_hit "$s_herestr")"
+  if [[ "$pin_pos" == "1111" && "$pin_neg" == "0" ]]; then
+    printf '✅ #836 static pin positive control: matched the env-prefixed, joined (grep -q), separated (grep -i -q) and --quiet spellings; ignored a here-string\n'
+  else
+    printf '❌ #836 static pin positive control FAILED (matches=%s, here-string misread as a hit=%s) — the ban pattern no longer recognises the idiom it exists to ban, so a green scan proves nothing\n' \
+      "${pin_pos:-<none>}" "$pin_neg" >&2
     selffail=$((selffail + 1))
   fi
 
@@ -1727,15 +1768,40 @@ $big_filler"
       selffail=$((selffail + 1))
     fi
   }
+  # An exit code alone does not pin an argv guard: 2 is ALSO the contract value
+  # for "could not run", so a guard whose body was deleted still returned 2 —
+  # through the live path's unauthenticated `gh`, i.e. the very code the vector
+  # expects (review catch, verified against a mutant). The rejecting vectors
+  # therefore (a) run with DRY_RUN=1, so a fall-through reaches the plan and
+  # exits 0 instead of shelling out to `gh` — they stay offline on a
+  # regression too — and (b) assert the DIAGNOSTIC, not just the code.
+  expect_cli_err() {
+    local desc="$1" want="$2" want_txt="$3" got; shift 3
+    got="$(cli_rc "$@")"
+    if [[ "$got" == "$want" ]] && grep -qF -- "$want_txt" "$CLI_LOG"; then
+      printf '✅ #792 CLI: %s → exit %s with the "%s" diagnostic\n' "$desc" "$got" "$want_txt"
+    else
+      printf '❌ #792 CLI: %s → exit %s (expected %s) and/or the "%s" diagnostic was missing — the rejection is not pinned\n' \
+        "$desc" "$got" "$want" "$want_txt" >&2
+      sed -n '1,6p' "$CLI_LOG" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  }
   CLI_LOG="$(mktemp "${TMPDIR:-/tmp}/pipeline-792-cli.XXXXXX")"
-  CLI_DRY_RUN=0; CLI_IO_ONLY=0; CLI_IO_ISSUE=""
-  expect_cli_rc 'no target'                        2 --issue-only
-  expect_cli_rc 'malformed target'                  2 --issue-only 'not a target'
-  expect_cli_rc 'surplus argument after the target'  2 --issue-only 792 999
-  expect_cli_rc 'flag AFTER a positional (misorder)' 2 792 --issue-only
-  expect_cli_rc 'malformed owner/repo#N target'      2 --issue-only 'a/b#nope'
-  CLI_DRY_RUN=0; CLI_IO_ONLY=1; CLI_IO_ISSUE='a b'
-  expect_cli_rc 'ENV form with a malformed target'   2
+  CLI_DRY_RUN=1; CLI_IO_ONLY=0; CLI_IO_ISSUE=""
+  expect_cli_err 'no target'                        2 'needs an issue' --issue-only
+  expect_cli_err 'malformed target'                  2 'must be an issue number or owner/repo#N' --issue-only 'not a target'
+  expect_cli_err 'surplus argument after the target'  2 'takes exactly one issue target' --issue-only 792 999
+  expect_cli_err 'flag AFTER a positional (misorder)' 2 'must be the first argument' 792 --issue-only
+  expect_cli_err 'malformed owner/repo#N target'      2 'must be an issue number or owner/repo#N' --issue-only 'a/b#nope'
+  CLI_DRY_RUN=1; CLI_IO_ONLY=1; CLI_IO_ISSUE='a b'
+  expect_cli_err 'ENV form with a malformed target'   2 'must be an issue number or owner/repo#N'
+  # The env seam and argv must not disagree silently (review catch): the
+  # positional used to be dropped, and an argv target used to override the env
+  # one. Both are usage errors now.
+  CLI_DRY_RUN=1; CLI_IO_ONLY=1; CLI_IO_ISSUE='42'
+  expect_cli_err 'ENV target + positional argument'   2 'pass exactly one target' 792
+  expect_cli_err 'ENV target + argv --issue-only'     2 'two issue targets' --issue-only 999
   CLI_DRY_RUN=1; CLI_IO_ONLY=1; CLI_IO_ISSUE='123'
   expect_cli_rc 'ENV form (ISSUE_ONLY + ISSUE), dry run' 0
   if grep -q 'Issue: 123' "$CLI_LOG"; then
@@ -1745,6 +1811,10 @@ $big_filler"
     sed -n '1,6p' "$CLI_LOG" >&2 || true
     selffail=$((selffail + 1))
   fi
+  # (ISSUE_TARGET is UNUSED when ISSUE_ONLY=0, so an exported PIPELINE_COMPLIANCE_ISSUE
+  # must not turn a normal PR run into a usage error — review cycle 3 catch.)
+  CLI_DRY_RUN=1; CLI_IO_ONLY=0; CLI_IO_ISSUE='42'
+  expect_cli_rc 'PR path with PIPELINE_COMPLIANCE_ISSUE set in the env (unused there)' 0 123
   CLI_DRY_RUN=0; CLI_IO_ONLY=0; CLI_IO_ISSUE=""
   rm -f "$CLI_LOG"
   unset CLI_LOG CLI_DRY_RUN CLI_IO_ONLY CLI_IO_ISSUE 2>/dev/null || true
@@ -1792,13 +1862,15 @@ $big_filler"
     "$([[ "$IO_FAILURES" -eq 0 ]] && echo 1 || echo 0)"
   io_cleanup
 
-  # 2. standard + marker + Wiring → 0 failures, and a/c/e each named as skipped.
+  # 2. standard + marker + Wiring → 0 failures, and a/c/e/f each named as
+  #    skipped (f is new from #716 and is equally PR-dependent, so the
+  #    issue-only mode must say so rather than leave it unaccounted for).
   run_io "complexity:standard" "$WIRING_SCOPING"
   io_report 'standard + marker + Wiring → 0 failures' \
     "$([[ "$IO_FAILURES" -eq 0 ]] && echo 1 || echo 0)"
-  IO_SKIPS="$(grep -cE '\[[ace]\] Skipped: --issue-only mode' "$IO_LOG" || true)"
-  io_report 'checks a/c/e are SKIPPED with a named reason (3 skip lines)' \
-    "$([[ "$IO_SKIPS" -eq 3 ]] && echo 1 || echo 0)"
+  IO_SKIPS="$(grep -cE '\[[acef]\] Skipped: --issue-only mode' "$IO_LOG" || true)"
+  io_report 'checks a/c/e/f are SKIPPED with a named reason (4 skip lines)' \
+    "$([[ "$IO_SKIPS" -eq 4 ]] && echo 1 || echo 0)"
   io_cleanup
 
   # 3. standard + marker, NO Wiring → the real pre-PR miss: exactly 1 failure

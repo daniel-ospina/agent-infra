@@ -305,7 +305,10 @@ checks (a micro issue exits 0 with no artifacts); an **unlabeled** issue is trea
 non-micro, so check b still applies — which is why a `bug`/`improvement` issue with no
 `complexity:*` label needs the scoping comment too.
 `PIPELINE_COMPLIANCE_ISSUE_ONLY=1 PIPELINE_COMPLIANCE_ISSUE=<N>` is the env equivalent of
-the flag.
+the flag. **Exactly one target** is accepted: a surplus positional, a `--issue-only` that is
+not the first argument, and an env target combined with either argv form are all usage
+errors (exit 2) — never a silent fall-through to the merge-time (PR) gate, and never a silent
+drop of the target you meant.
 
 **On failure — BLOCK.** The one remedy that clears check (d) **before** the PR exists is a
 `Wiring` table in the scoping comment (issue-scoping — the table is part of its output); a

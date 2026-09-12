@@ -44,7 +44,8 @@ pin the *production* code path; add the behavioural vector for the one site whos
 is fail-**OPEN** (unreachable by any assertion on the fixed code, so it needs its own large-input
 pin); and deliver #792 in full. It does **not** re-do #716's edit: the reconciled diff contains
 no site change that main already made, and a diff audit (`git diff origin/main -- <script>`)
-shows only additions.
+rewrites exactly 18 of main's lines to the same behaviour, removing nothing (see §5 for the
+audit; no insertion total is quoted here, since it changes with every edit to the file).
 
 ### Why the regression test still matters when main already has the here-strings
 
@@ -109,11 +110,13 @@ hazards: the producer's status is discarded and `head` has already printed the c
    `FAILURES` must be 0 every time. A fixture-size assertion (>65536 bytes) keeps it from
    silently degrading.
 3. **The static pin** (indicator 2): no live *quiet* `grep` may be fed by a
-   `printf`/`echo`/`cat` pipeline on a non-comment line, including env-prefixed
-   (`LC_ALL=C grep -q`) and `--quiet` spellings. It fails **loudly** if it cannot read its own
-   source. Documented limits: a multi-stage pipeline or a backslash continuation is not
-   matched by a line-oriented regex, and a quoted string containing the text is an accepted
-   false positive (the message names the line).
+   `printf`/`echo`/`cat` pipeline on a non-comment line, in every spelling — env-prefixed
+   (`LC_ALL=C grep -q`), joined (`grep -q`), separated (`grep -i -q`) and `--quiet`. It fails
+   **loudly** if it cannot read its own source, and it carries its own **positive control**
+   (the pattern must match all four spellings and must ignore a here-string), so a pattern
+   edit cannot disarm it into a green scan. Documented limits: a multi-stage pipeline or a
+   backslash continuation is not matched by a line-oriented regex, and a quoted string
+   containing the text is an accepted false positive (the message names the line).
 4. **The fail-OPEN site gets a behavioural vector**, because no assertion on the fixed code
    can reach it: `pr_is_docs_only` on a >64 KB row list whose **first** row is a non-docs path
    must read NOT docs-only on every one of 25 runs (pre-fix: ~88 % of runs inverted).
@@ -139,8 +142,9 @@ rest, reusing the same code and tier rules:
 
 Tier exemptions are identical. **The full-PR verdict logic is untouched**:
 `ISSUE_ONLY=0` is the only path a PR takes, the new guards are branches around (never within)
-the existing expressions, and the review measured all 16 `pass`/`fail` strings plus the
-DRY_RUN/FAIL_ALL output as byte-identical to the baseline.
+the existing expressions, and the review measured every pre-existing check message plus the
+DRY_RUN/FAIL_ALL output as byte-identical to the baseline (no count is quoted: the number of
+message strings grows as checks are added, and only the equality is the claim).
 
 Also added: `PIPELINE_COMPLIANCE_ISSUE_ONLY=1` + `PIPELINE_COMPLIANCE_ISSUE=<N>` as the env
 equivalent, `--issue-only` in `usage()`, an issue-only arm in the `DRY_RUN` plan, and argv
@@ -163,14 +167,14 @@ one message.
 |---|---|---|---|
 | `REVIEW_EVIDENCE_RE` / `TEST_EVIDENCE_RE` / `CLEAN_MICRO_MARKER_RE` constants | this PR | checks (c), (e) and the #513 binding in `run_checks` | SELF_TEST #836 block — production path, 25 reps, >64 KB, positive + negative controls |
 | `has_review_evidence()` / `has_test_evidence()` / `has_clean_micro_marker()` | this PR | checks (c)/(e) call sites; the SELF_TEST regression | SELF_TEST #836 block + static pin |
-| The #836 static pin (no quiet-grep pipeline) | this PR | the whole script source; protects #716's fix from regression | positive control: catches all 8 pre-#716 sites; 0 hits on the reconciled head |
+| The #836 static pin (no quiet-grep pipeline) | this PR | the whole script source; protects #716's fix from regression | positive control: matches all four spellings and ignores a here-string; catches all 8 pre-#716 sites; 0 hits on the reconciled head |
 | `pr_is_docs_only` large-input vector | this PR | the fail-OPEN site in `pr_is_docs_only` | 25 reps at >64 KB, non-docs row first |
 | `--issue-only <N\|owner/repo#N>` CLI mode | this PR | `skills/commit-workflow/workflow/01-preflight.md` | SELF_TEST vectors: micro (0 failures) / standard+Wiring (0) / standard w/o Wiring (1, local remedy) / no marker (1, b) / unlabeled (1, b) |
-| `resolve_issue_only_ref()` + the CLI/env contract | this PR | the issue-only dispatch block | SELF_TEST `expect_io_ref` vectors + 7 subprocess exit-code vectors (no target, malformed, surplus, misordered, env form) |
+| `resolve_issue_only_ref()` + the CLI/env contract | this PR | the issue-only dispatch block | SELF_TEST `expect_io_ref` vectors + 10 subprocess exit-code vectors (8 rejections: no target, malformed, surplus, misordered, bad `owner/repo#N`, malformed env target, env+positional, env+argv; 2 successes: the env form and the PR path with the env seam set) |
 | `PIPELINE_COMPLIANCE_ISSUE_ONLY` / `PIPELINE_COMPLIANCE_ISSUE` env seam | this PR | the documented env form of `--issue-only` | SELF_TEST: env form must resolve its target (dry-run prints `Issue: 123`) |
-| issue-only skips for checks a/c/e/**f** | this PR | every `run_checks` branch that reads PR state | the "3+ skips named with a reason" assertion; check (f) probe is not even run in this mode |
+| issue-only skips for checks a/c/e/**f** | this PR | every `run_checks` branch that reads PR state | the `checks a/c/e/f are SKIPPED with a named reason (4 skip lines)` assertion (exactly 4); check (f) probe is not even run in this mode |
 | Preflight BLOCK step (issue-side artifacts) | this PR | every commit-workflow session | live `--issue-only 792` / `--issue-only 836` → exit 0; `--issue-only 1` → exit 1 with the remedy |
-| Merge-time verdict (checks a–f, full-PR mode) and #716's check (f) | **unchanged** | `.github/workflows/pipeline-compliance.yml` required check | FAIL_ALL 5-pass + all #716 `sm_*` vectors unchanged; 16 message strings byte-identical |
+| Merge-time verdict (checks a–f, full-PR mode) and #716's check (f) | **unchanged** | `.github/workflows/pipeline-compliance.yml` required check | FAIL_ALL multi-pass + all #716 `sm_*` vectors unchanged; every pre-existing check message byte-identical |
 | `docs/plans/2026-09-11-issue-836-792-pipeline-compliance-fix.md` | this PR | check (d) at merge time for #792 | `check-pipeline-compliance.sh` check (d) on this PR |
 
 ## 4. Tasks
@@ -192,38 +196,64 @@ one message.
 
 - `bash -n scripts/check-pipeline-compliance.sh` → clean.
 - `PIPELINE_COMPLIANCE_SELF_TEST=1 bash scripts/check-pipeline-compliance.sh` → exit 0,
-  **88 ✅ / 0 ❌** (87 assertion prints + the final summary line), empty stderr, byte-identical
-  across 3 consecutive runs (md5 `9011aa96…`). This block covers the #720 parser corpus plus
+  **92 ✅ / 0 ❌** (91 assertion prints + the final summary line), empty stderr, and
+  byte-identical across 3 consecutive runs in the same checkout. (No md5 is quoted: the output
+  embeds `$GH_REPO` and the script path, so a hash is checkout-dependent.) This block covers
+  the #720 parser corpus plus
   this PR's #836/#792 assertions. #716's check-(f) `sm_case` vectors live in the
-  `FAIL_ALL` block, not here — that block runs below and exits 1 by design, so they are
-  exercised by the FAIL_ALL run, not by `SELF_TEST=1`.
+  `FAIL_ALL` block, not here — that block runs first (it precedes the self-test block in the
+  script) and exits 1 by design, so they are
+  exercised by the FAIL_ALL run, not by `SELF_TEST=1`. (Failures print to stderr, so the ❌
+  count must be taken from stderr; stdout carries only the ✅ lines.)
+- The rejection vectors are **mutant-discriminating**, which an exit code alone is not: `2`
+  is also the contract value for "could not run", so a deleted argv guard still returned 2
+  via the live path's unauthenticated `gh` — the same code the vector expected. The eight
+  target-rejection vectors now run under `DRY_RUN=1` (a fall-through reaches the plan and
+  exits 0) and assert the diagnostic text. Verified against a mutant: disarming the four
+  `ISSUE_ARGV_ERR` assignments plus the two target guards makes exactly the 8 negative
+  vectors fail (RC 2, 83 assertion ✅ lines) while the positive vectors and the rest stay green.
+- The static pin has a **positive control**: the ban pattern must still match the
+  env-prefixed (`LC_ALL=C grep -q` after the pipe), joined (`grep -q`), separated
+  (`grep -i -q`) and `--quiet` spellings and must NOT match a here-string — otherwise a
+  pattern edit could disarm the pin silently and a green scan would prove nothing. The samples
+  are assembled from parts so the pin does not flag its own control.
 - `PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 …` → all of main's 43
   check-(f) `sm_case` assertions (36 direct call sites + one 7-path loop) still pass in the
   simulation; the run's terminal exit 1 is the simulation's own status, unchanged from main.
 - Behavioural equality with `origin/main` (the strongest form of "the verdict logic did not
-  change"): the `FAIL_ALL` 5-pass simulation and the normal `DRY_RUN` plan produce
+  change"): the `FAIL_ALL` multi-pass simulation and the normal `DRY_RUN` plan produce
   **byte-identical** output from main's script and this one when both are invoked from an
-  equivalent path (verified three ways — in-repo, `/tmp` mirror, and a symmetric farm —
-  161/161 and 16/16 lines identical, both exit 1 / exit 0 respectively).
+  equivalent path (checked in a symmetric farm with identical `origin` URLs so both resolve the
+  same second-model config, and re-checked after the argv-block change because that block is on
+  the PR path too) — same line count, the same failure lines, the same exit codes. Exact line
+  counts are
+  environment-dependent (they include the check-(f) `sm_case` output, which needs a readable
+  config), so only equality is claimed.
 - `PIPELINE_COMPLIANCE_DRY_RUN=1 bash scripts/check-pipeline-compliance.sh --issue-only 792`
   → plan printed, exit 0.
 - `bash scripts/check-pipeline-compliance.sh --issue-only 792` / `--issue-only 836` → exit 0;
   `--issue-only 1` (unscoped) → exit 1 with the actionable remedy and named a/c/e/f skips;
-  `--issue-only` (no target), `--issue-only 792 999`, `792 --issue-only` → exit 2;
+  `--issue-only` (no target), `--issue-only 792 999`, `792 --issue-only`, `a/b#nope`,
+  `ISSUE_ONLY=1 ISSUE=42` + positional `792`, `ISSUE_ONLY=1 ISSUE=42` + `--issue-only 999`
+  → exit 2 with the specific diagnostic;
   `PIPELINE_COMPLIANCE_ISSUE_ONLY=1 PIPELINE_COMPLIANCE_ISSUE=792` (dry run) → exit 0 and
-  `Issue: 792` in the output.
+  `Issue: 792` in the output; `… 792` (plain PR dry run) → exit 0 and an `ISSUE-ONLY`-free
+  PR plan.
 - Diff audit: `git diff origin/main -- scripts/check-pipeline-compliance.sh` **adds** the new
-  machinery and rewrites exactly 18 lines — the pre-#716 inline greps replaced by the matcher
-  calls (same patterns, hoisted), the two `sm_*` probes moved inside an `ISSUE_ONLY != 1`
-  guard, the PASS echo re-added verbatim in the `else` arm, and `if`→`elif` conversions. No
-  verdict expression, message, or ordering is removed.
+  machinery and rewrites exactly 18 of main's lines: the check-(b) marker grep tightened to
+  `grep -qF`; the check-(c), check-(e) and clean-micro (#513 binding) greps replaced by the
+  hoisted matcher calls (byte-identical patterns); the two `sm_*` probes moved inside an
+  `ISSUE_ONLY != 1` guard; the `issue_ref` assignment/kind block, the repositioned
+  `❌ No PR number given.` echo, and the `PR:`/PASS echoes
+  moved into the `ISSUE_ONLY`-aware arms; and `if`→`elif` conversions. No verdict expression,
+  message, or ordering is removed.
 
 ## 6. Risks / non-goals
 
 - **Non-goal:** re-implementing #716's fix, changing any verdict expression, the required-check
-  workflow, or the #488 linked-issue invariant. #716's here-string fixes and check (f) are
-  carried into the reconciled diff verbatim; the 18 replaced lines are the same behaviour
-  expressed through the new matchers.
+  workflow, or the #488 linked-issue invariant. Every site #716 moved to a here-string stays a
+  here-string on the reconciled head, including the sites whose expressions survive verbatim; where a matcher now serves a site, the pattern is the byte-identical one,
+  hoisted out of the call site.
 - **Non-goal:** #792's option 2/3.
 - Risk: `--issue-only`'s plan-doc branch is unprovable pre-PR by construction, so preflight
   accepts the `Wiring` alternative only. Stated in the mode's output, the doc, and this plan.
