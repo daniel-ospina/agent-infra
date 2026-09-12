@@ -102,8 +102,8 @@ as the parser — the narrow assertions still read parsed nodes.
 | 3 | the `ci` job has no `if:` and no truthy `continue-on-error:` | `if: github.event_name == 'push'`; `continue-on-error : true`; `"i\u0066"` (escape-decoded) |
 | 4 | the `ci` job's `with:` key set is exactly `["test-command"]` and its value is exactly the expected accumulator command | emptied binding; `\|\| true` suffix; extra `with:` key; losing the second suite; a `test-command:` line inside a block scalar |
 | 5 | `node-ci.yml` still declares the `unit-test` job and the `test-command` workflow_call input | renamed input; removed `unit-test` job |
-| 6 | **6a (structure, trusted leg + local)** `.github/workflows/ci-main.yml` still declares the `extension-tests` pin-gate job and the `with:` key set `["node-version", "script-validate", "skill-lint", "test-command"]`, the last non-empty | missing job; extra `with:` key; dropped `test-command`; emptied `test-command`; scalar `with:`; empty document |
-| **6b** | **(behavioural, local leg only)** the committed post-merge `test-command` **exits non-zero** under `bash -e` with a failing `node` stub | negative control (guard inside `if false … fi`); guard in a never-called function; guard in a heredoc; invocation inside a multi-line quoted string; positive control (passing stubs → exit 0) |
+| 6 | **6a (values, trusted leg + local)** `.github/workflows/ci-main.yml` still declares the `extension-tests` pin-gate job, the `with:` key set `["node-version", "script-validate", "skill-lint", "test-command"]` (the last non-empty), **and** that `test-command` body still contains the exact pin-suite invocation line `node scripts/check-pi-pin-lockstep.mjs \|\| failures=$((failures+1))` as a whole trimmed line | missing job; extra `with:` key; dropped `test-command`; emptied `test-command`; scalar `with:`; empty document; **deleted invocation line; altered line (`\|\| true`, `\|\| failures=0`); repointed script path** (all three RED on the per-PR suite *and* end-to-end on the trusted `--head-ref` leg) |
+| **6b** | **(behavioural, local leg only)** the committed post-merge `test-command` **exits non-zero** under `bash -e` with a failing `node` stub | negative control (guard inside `if false … fi`); guard in a never-called function; guard in a heredoc; invocation inside a multi-line quoted string; positive control (passing stubs → exit 0); **hygiene: an unresolvable `bash` and a command that never finishes are RED, not passes** |
 
 Each item has both a failing fixture and a passing fixture (the fixture trio / spelling reformats).
 
@@ -125,9 +125,16 @@ actually fail the step?* — and answers it by running the committed command:
    on `PATH`;
 3. assert the step exits **non-zero**.
 
-The stub bounds the run: it guarantees termination (the real suites can never re-enter) and makes
-every suite's verdict a knob. `bash`, not this repo, decides the outcome, so **no shell construct can
-fool it**.
+The stub keeps the run honest: every interpreter reachable **by bare name** on the child's `PATH` is
+replaced, so the real suites never re-enter and every suite's verdict is a knob. It does **not** by
+itself bound the run — a command that ignores `PATH` (an absolute interpreter path, or its own `PATH`
+surgery) can still do real work — so the run is additionally bounded by an explicit spawn **timeout**
+(120 s), and a timeout is RED with its own message. `bash`, not this repo, decides the outcome, but the
+claim must be stated narrowly: what this catches is **any shell construct that makes the step's exit
+status depend on a real suite failing**. A command that merely keys its exit status off the stub is
+**not** caught — reproduced: a `node --version >/dev/null 2>&1 || exit 1` probe followed by the guard
+block and no suites at all is GREEN here while the pin gate is dead (the real CI would exit 0). That
+shape is item **6a**'s job (the invocation line is absent), not 6b's.
 
 **Two controls make it falsifiable**, and both are in-suite:
 
@@ -139,18 +146,23 @@ fool it**.
 
 **The bound, stated exactly** (the module header is authoritative): the assertion proves that *on this
 machine, with this shell, with `node` replaced by a stub that always exits 1, the committed body makes
-the step exit non-zero*. It does **not** prove that the real suites run, that they pass, that the
-command still contains this suite's invocation, or that the step fails on GitHub's runner. It gives
-**no per-suite attribution**: every suite fails under the stub, so a command that dropped only the
-pin-suite line still exits non-zero while the others fail (caught by the content lock — a byte
-changed — not by this assertion).
+the step exit non-zero*. It does **not** prove that the real suites run, that they pass, that the step
+fails on GitHub's runner, or that the failing status came from a real suite at all (see the
+stub-keyed shape above). It gives **no per-suite attribution**: every suite fails under the stub, so a
+command that dropped only the pin-suite line still exits non-zero while the others fail. Asserting that
+the line is still **present** is item **6a**'s job (a value assertion, run on both legs), and a byte
+change to the locked file additionally trips the content lock.
 
-**Item 6 is per-PR / post-merge only, and PR-editable.** It has to EXECUTE the command, so it can
+**6a and 6b are complements, and 6b alone is not enough.** 6a proves the line EXISTS; 6b proves the
+step CAN FAIL. Neither implies the other, and the failure mode each one misses is the other's.
+
+**Item 6b is per-PR / post-merge only, and PR-editable.** It has to EXECUTE the command, so it can
 only live in the suite, which runs from the PR-editable `ci.yml` (and post-merge via `ci-main.yml`).
 The trusted `--head-ref` leg must never run it — executing PR content under `pull_request_target` is
-the RCE vector — so the trusted leg makes **no claim at all** about `ci-main.yml`'s shell. Item 6's
+the RCE vector — so the trusted leg makes **no claim at all** about `ci-main.yml`'s shell. Item 6b's
 shell guarantee therefore sits at exactly the same trust level as the lock: PR-editable code,
-conspicuous in the diff, worth nothing against a PR that edits the checker.
+conspicuous in the diff, worth nothing against a PR that edits the checker. (What the trusted leg does
+assert about `ci-main.yml` is item **6a**, which is values only.)
 
 ### 5. `.github/workflows/workflow-lock.yml` — NEW, the trusted leg
 
@@ -212,7 +224,7 @@ GitHub Security Lab's `pull_request_target` guidance. No `secrets: inherit`; no 
 |---|---|
 | `scripts/check-workflow-lock.mjs` | **NEW** — byte-level content lock; `hashLockedFiles`/`lockFindings` exports; `--update-lock`/`--root` CLI. No YAML parsing, no shell modelling. |
 | `scripts/workflow-lock.json` | **NEW** — `version: 1` + sha256 for exactly the three pin-gate workflow paths. |
-| `scripts/check-pi-pin-lockstep.mjs` | Execution-semantics modelling deleted (see §Deleted); narrow `wiringFindings` (items 1–5) + ci-main.yml's pin-gate job/`with:` shape kept as value assertions; content-lock section + `--head-ref` mode added. **Third cycle:** item 6's POSIX-shell scanner deleted and replaced by a behavioural test that EXECUTES the committed `test-command`; exit handler registered first and made fail-closed; failure decision made terminal; `100755` accepted on the trusted leg. |
+| `scripts/check-pi-pin-lockstep.mjs` | Execution-semantics modelling deleted (see §Deleted); narrow `wiringFindings` (items 1–5) + ci-main.yml's pin-gate job/`with:` shape kept as value assertions; content-lock section + `--head-ref` mode added. **Third cycle:** item 6's POSIX-shell scanner deleted and replaced by a behavioural test that EXECUTES the committed `test-command`; exit handler registered first and made fail-closed; failure decision made sticky against listeners registered *after* it (the same-file bound is recorded in the final-cycle note); `100755` accepted on the trusted leg. **Final cycle:** the scanner's deletion had also removed an *invocation-presence* assertion that only needed a string check, so item **6a** restores it (trimmed-line equality on the parsed `test-command`, run on BOTH legs, with deleted/altered/repointed RED fixtures and a legitimate-edit GREEN fixture); item **6b** gains spawn hygiene (absolute-`bash`-or-throw, explicit `120 s` timeout, `error === null && typeof status === "number"` before any verdict); the sticky fixture's ambient skip flag becomes a self-validating handshake that fails closed; a fixture pins the same-file `exit`-listener residual; and the module/workflow/plan claims were narrowed to what the code proves. |
 | `.github/workflows/workflow-lock.yml` | **NEW** — `pull_request_target` base-branch checker with the security header. **Third cycle:** header updated — trusted leg = structural value assertions only, `100644` **or** `100755`, and an explicit statement that it makes no claim about `ci-main.yml`'s shell. |
 | `scripts/check-workflow-lock.mjs` | **NEW** — byte-level content lock. **Third cycle:** ancestor-symlink walk (`symlinkedAncestor`/`symlinkFinding`), `/\\.ya?ml$/` workflow enumeration, and `--update-lock` refuses to hash through a symlinked locked path. |
 | `docs/plans/2026-09-10-issue-666-pin-guard-parse.md` | this plan. |
@@ -243,17 +255,18 @@ cases and the 9 earlier item-6 fixtures).
 
 ## Testing strategy
 
-**Fresh run, 2026-09-12 (third revision, #666 behavioural item 6) — every count below is copied from that run, not hand-maintained.**
+**Fresh run, 2026-09-12 (final cycle — #666 item 6a restored as a value assertion, plus item-6b / sticky-fixture spawn hygiene) — every count below is copied from that run, not hand-maintained.**
 
 | Surface | Layer | Command | Result |
 |---|---|---|---|
 | `(h)` pins | unit + negative + **positive control** | `node scripts/check-pi-pin-lockstep.mjs` | ✅ (2 tests; `pinFindings(wrongPin)` non-empty) |
 | `(i)` mirror stamps | unit + negative + **positive control** + #779 prose fixture | same | ✅ (3 tests; `stampFindings(stale)` non-empty; the four prose lines stay empty) |
-| narrow wiring guard (items 1–5 + 6a) | unit | same | ✅ live trio + 1 fixture-trio baseline + 1 empty/comments-only RED + 11 `expectWired` + 18 `expectRed` + 7 ci-main-structural cases |
-| item 6b (behavioural) | e2e (real `bash -e`) | same | ✅ live failing-stub → non-zero; passing-stub → 0; 6 mutation fixtures (4 RED, 1 no-false-RED, 1 harness control) |
+| narrow wiring guard (items 1–5 + 6a) | unit | same | ✅ live trio + 1 fixture-trio baseline + 1 empty/comments-only RED + 11 `expectWired` + 18 `expectRed` + 12 ci-main-structural cases (incl. the invocation-presence and altered-line fixtures) |
+| item 6a (invocation presence) | unit + e2e | same | ✅ the fixture and the live body carry the line; deleted / `\|\| true` / `\|\| failures=0` / repointed path are RED; a legitimate unrelated edit stays GREEN on both legs (end-to-end through the stubbed-`gh` `--head-ref` CLI) |
+| item 6b (behavioural) | e2e (real `bash -e`) | same | ✅ live failing-stub → non-zero; passing-stub → 0; 6 mutation fixtures (4 RED, 1 no-false-RED, 1 harness control); hygiene: unresolvable `bash` → RED with the spawn message, hanging command → RED at the timeout |
 | content lock | unit + CLI | same + `node scripts/check-workflow-lock.mjs` | ✅ lock lifecycle/schema/coverage + symlink (file, ancestor dir, `.yaml`) + `--update-lock` refusal |
-| `--head-ref` mode | unit + e2e | same | ✅ runs the structural assertions; never the lock; never item 6b; git-tree mode rejection (`120000`/`040000`/`160000`) and `100755` acceptance; blob-decode fail-closed |
-| `(h)`/`(i)`/`(j)` + lock + reader | integration | `node scripts/check-pi-pin-lockstep.mjs` | ✅ **105 passed, 0 failed** |
+| `--head-ref` mode | unit + e2e | same | ✅ runs the value assertions (items 1–5 + item 6a incl. the invocation line); never the lock; never item 6b; git-tree mode rejection (`120000`/`040000`/`160000`) and `100755` acceptance; blob-decode fail-closed |
+| `(h)`/`(i)`/`(j)` + lock + reader | integration | `node scripts/check-pi-pin-lockstep.mjs` | ✅ **116 passed, 0 failed** |
 | #254 frontmatter validator | integration | `node scripts/check-skill-lint.test.mjs` | ✅ **160 passed, 0 failed** |
 | validator oracle (pi parity + fuzz) | integration | `node --test scripts/check-skill-lint.oracle.test.mjs` | ✅ **146 passed, 0 failed** |
 | ci-ref pin-drift unit tests | integration | `node scripts/ci-ref-check.test.mjs` | ✅ **183 passed, 0 failed** |
@@ -261,28 +274,31 @@ cases and the 9 earlier item-6 fixtures).
 | content lock vs independent hashes | static | `node scripts/check-workflow-lock.mjs` + `shasum -a 256` | ✅ lock green; the three `shasum -a 256` digests match `workflow-lock.json` byte-for-byte; `--update-lock` rewrites byte-identically (idempotent) |
 | trusted leg against the live API | e2e | `node scripts/check-pi-pin-lockstep.mjs --head-ref d5e876e… --repo daniel-ospina/agent-infra` | ✅ exit 0 (real git tree + blobs; lock skipped by design) |
 
-**Runtime bound (measured, not claimed):** `node scripts/check-pi-pin-lockstep.mjs` runs in ~48 s on
-the 2026-09-12 dev box (it was ~11 s at `d5e876e`). The increase is item 6b's shell round-trips
-(6 real `bash -e` runs, ~1.5 s each here because each uses a freshly created temp dir) plus the
-sticky-failure fixture, which runs a complete copy of the suite. The ci.yml comment that describes the
-per-PR pin gate as "~4s of work" therefore no longer holds; it is left untouched in this PR because
-`ci.yml` is a locked file and the comment is not part of the guard's contract.
+**Runtime bound (measured, not claimed):** `node scripts/check-pi-pin-lockstep.mjs` runs in ~73 s on
+the 2026-09-12 dev box (it was ~11 s at `d5e876e` and ~38 s at the start of this cycle). The increase
+is item 6b's shell round-trips (real `bash -e` runs, ~1.6 s each here because each creates a fresh temp
+dir and spawns ~60 stubbed commands), the stubbed-`gh` `--head-ref` end-to-end fixtures (~3 s each),
+and the sticky-failure fixture, which runs a complete copy of the suite — so every added test costs
+roughly twice its own runtime. The ci.yml comment that describes the per-PR pin gate as "~4s of work"
+therefore no longer holds; it is left untouched in this PR because `ci.yml` is a locked file and the
+comment is not part of the guard's contract.
 
-**Case census (third revision, counted from the file and the run):** 105 tests = 72 plain `test()` +
+**Case census (final cycle, counted from the file and the run):** 116 tests = 83 plain `test()` +
 11 `expectWired` + 18 `expectRed` + 4 `expectLockRedForEdit`. The run also asserts a set of REQUIRED
-TEST NAMES (52 entries), so a deleted or renamed assertion is RED regardless of the total; it does NOT
+TEST NAMES (60 entries), so a deleted or renamed assertion is RED regardless of the total; it does NOT
 catch a required test whose BODY is replaced by a same-name no-op — a same-commit residual recorded
-below.
+below. Eight of the eleven new tests were added to the roster as well, so the assertions this cycle
+restored or repaired cannot be deleted by name.
 
 ### Third-cycle count deltas (before → after, this PR)
 
-| Surface | Before (`d5e876e`) | After |
-|---|---|---|
-| `node scripts/check-pi-pin-lockstep.mjs` | 109 passed, 0 failed | **105 passed, 0 failed** |
-| plain `test()` / `expectWired` / `expectRed` / `expectLockRedForEdit` | 76 / 11 / 18 / 4 | 72 / 11 / 18 / 4 |
-| item-6 fixtures | 25 (`item 6 RED #1–#14`, 2 `item 6 GREEN`, 9 earlier item-6 cases) | 0 — replaced by 7 behavioural cases |
-| `MIN_EXPECTED_PASSING` | 109 | 105 |
-| `REQUIRED_TESTS` entries | 51 | 52 |
+| Surface | Before (`d5e876e`) | After (third revision) | After (final cycle) |
+|---|---|---|---|
+| `node scripts/check-pi-pin-lockstep.mjs` | 109 passed, 0 failed | **105 passed, 0 failed** | **116 passed, 0 failed** |
+| plain `test()` / `expectWired` / `expectRed` / `expectLockRedForEdit` | 76 / 11 / 18 / 4 | 72 / 11 / 18 / 4 | 83 / 11 / 18 / 4 |
+| item-6 fixtures | 25 (`item 6 RED #1–#14`, 2 `item 6 GREEN`, 9 earlier item-6 cases) | 0 — replaced by 7 behavioural cases | 7 behavioural (6b) + 12 ci-main value cases (6a) + 5 hygiene/handshake fixtures |
+| `MIN_EXPECTED_PASSING` | 109 | 105 | 116 |
+| `REQUIRED_TESTS` entries | 51 | 52 | 60 |
 | deleted symbols (`shellControlContext`, `stripShellQuotes`, `stripShellComment`, `shellSwallowFinding`, `SHELL_TOKEN_RE`, the 3 `FAILURE_GUARD_*`/`NONZERO_EXIT_RE` regexes, `POST_MERGE_INVOCATION*`, `ACCUMULATOR_SUFFIX_RE`, `ciMainFindings`) | present | **0 references in the module** (one comment names `ciMainFindings` to explain the removal) |
 
 ## Verification plan — executed (before → after)
@@ -314,6 +330,26 @@ below.
 | 23 | failing run + `process.on("exit", () => { process.exitCode = 0; })` at EOF | ❌ exit 0 while printing `SOME TESTS FAILED` | ❌ **exit 1**, summary still printed |
 | 24 | uncaught `throw` inside the `exit` handler with `process.exit(0)` pending | ❌ exit 0 (the brief's assumed safe direction is false) | ❌ **exit 1** — the catch sets `process.exitCode = 1` |
 | 25 | `--update-lock` with a symlinked locked path | ❌ exit 0 + `✅ workflow lock updated`, next verify RED | ❌ **exit 1**, `❌ refusing to re-lock`, no banner |
+
+### Final cycle (2026-09-12) — item 6a restored + spawn hygiene + honest claims
+
+| # | Check | Before (this cycle's start) | After (final cycle) |
+|---|---|---|---|
+| 26 | **item 6a**: delete the pin-suite invocation line from the fixture/live `ci-main.yml` | ✅ GREEN — the presence assertion did not exist; the suite reports `0 failed`, exit 0 and the trusted `--head-ref` leg ✅ while the pin gate is dead | ❌ **RED on both legs** — the suite's value assertion names the line; the trusted leg is RED end-to-end through the stubbed `gh` CLI. Item 6b stays GREEN on the live file, which is why 6a has to exist (asserted in the same fixture) |
+| 27 | **item 6a**: alter the line — `\|\| true`, `\|\| failures=0`, a repointed script path | ✅ GREEN | ❌ **RED on both legs**; the repointed path is additionally invisible to 6b, asserted |
+| 28 | **item 6a**: a legitimate unrelated edit elsewhere in the command | — (no assertion) | ✅ **GREEN on both legs** (the check's negative control) |
+| 29 | **item 6b**: a spawn failure (unresolvable `bash`) | ✅ **PASSED** — `spawnSync` returns `status: null` and `assert.notEqual(null, 0)` is true, so "nothing executed" was recorded as "the guarantee holds" | ❌ **RED** with its own `could not be SPAWNED at all` message; `error === null && typeof status === "number"` is now required first |
+| 30 | **item 6b**: a command that never finishes | n/a (no timeout) | ❌ **RED** at the explicit spawn timeout (`120 s`; the fixture drives the same path at `1 s`) |
+| 31 | **item 6b**: no absolute `bash` on the box | ✅ the `?? "bash"` fallback resolved into the prepended STUB directory, so the step script was replaced by the `bash` stub and the primary assertion printed ✅ while executing nothing | **THROWS at module load** — the bare-name fallback is gone by construction |
+| 32 | `PIN_STICKY_FIXTURE_DEPTH=1 node scripts/check-pi-pin-lockstep.mjs` (the forge) | ✅ **`105 passed, 0 failed`, exit 0** — a REQUIRED roster test did nothing and was reported as passing | ❌ **exit 1**, immediately (the handshake runs at module-evaluation time) and the message says why; `✅ ALL TESTS PASSED` is asserted absent |
+| 33 | a mid-module `exit` listener + early `process.exit(0)` (same-file flip) | exit 0, silent | exit 0 — now **pinned as an accepted residual** by a fixture that asserts the documented bound and goes RED if the verdict is ever hardened |
+| 34 | real workflow triple through `wiringFindings` (items 1–5 + 6a) | ✅ | ✅ **GREEN** |
+| 35 | `--head-ref <real sha> --repo daniel-ospina/agent-infra` (LIVE GitHub API) | ✅ exit 0 | ✅ exit 0, item 6a included |
+
+Every live-file mutation was applied and reverted in a `/tmp` `git archive` copy or with an explicit
+`cp` backup under `/tmp/lockfix4-backup/` — never a working-tree discard (#664) — and the locked files
+were re-verified byte-identical (`shasum -a 256`, matching `scripts/workflow-lock.json`) before the lock
+was re-run green.
 
 Each live-file mutation in #7 and #9–12 was restored with `cp` from a `/tmp` backup (never a
 working-tree discard, #664) and every restore was sha256-verified identical before re-running the lock
@@ -369,7 +405,7 @@ before being fixed, and every fix is covered by a RED or GREEN fixture.
 | P2-5 | The roster is names-only: replacing a required test's BODY with `assert.ok(true)` while keeping the name yields a green run, but three comments/plan lines claimed a "neutered" assertion was RED | The three strings now say "deleted or renamed"; the same-name-neutering residual is recorded below |
 | P2-6 | `sameRealPath` returned false for ANY `realpathSync` failure, so a vanished `process.argv[1]` made `IS_MAIN` false and the process exited 0 with no output (the #708 symptom this comparison closed) | On failure, fall back to a literal comparison, then to resolved-parent-directory + basename (covers a symlinked ancestor such as `/var` → `/private/var`); a self-deleting-`argv[1]` fixture asserts a non-zero exit |
 | P2-7 | `<<<` here-strings matched the heredoc regex starting at index 1, so `grep -q foo <<< bar` before the invocation was a false RED — the #779 class | The heredoc regex requires `<<` not preceded/followed by `<`; GREEN fixture for `cmd <<< word` |
-| P2-8 | `process.exit(0)` before the first test (or inside a required test) exited 0 with zero ✅ lines — the floor and roster ran only at the end of the module body | The floor + roster are declared and registered on the `exit` event near the top of the file, and `finalize()` sets `process.exitCode`; a fixture proves an early `process.exit(0)` now exits 1 |
+| P2-8 | `process.exit(0)` before the first test (or inside a required test) exited 0 with zero ✅ lines — the floor and roster ran only at the end of the module body | The floor + roster are declared and registered on the `exit` event near the top of the file, and `finalize()` sets `process.exitCode`; a fixture proves an early `process.exit(0)` now exits 1. (Unless same-file module-level code also registers an `exit` listener — see the pinned residual in the final-cycle section) |
 
 ## #666 third revision (2026-09-12) — item 6 becomes behavioural
 
@@ -389,31 +425,56 @@ verified by running the named command against the fixed tree.
 | P2 | Mode `100755` was a green-locally / red-in-CI trap on the trusted leg. Reproduced: the local legs are GREEN under `chmod +x`, and `--head-ref` with tree mode `100755` exits 1 | `TREE_MODES_REGULAR_FILE = ["100644", "100755"]`; `040000`/`160000`/`120000`/anything else stay RED. Re-pointed fixture + a `040000`/`160000` RED fixture |
 | P2 | The `exit` handler was registered ~19% into the module. Reproduced: `process.exit(0)` above `FAILURE_GUARD_OPEN_RE` (module line ~179) exits 0 with the floor and roster never evaluated | The handler is registered as early as the module legally can — immediately after the `--head-ref` flag is computed and before every other module-level binding — and the anti-early-exit fixture now injects at **both** the top of the module body and mid-suite |
 | P2 | **The brief's suggested fail-closed direction was wrong and was measured.** "Register the handler early; a TDZ throw inside it still exits non-zero" is FALSE: with `process.exit(0)` pending, an *uncaught* exception in an `exit` listener leaves the exit code at **0** (measured on Node v22.23.1; a `throw` in a handler for a *natural* exit does give 1, which is what makes the claim look true) | `finalize()` is called inside a `try`/`catch` that sets `process.exitCode = 1` and prints why. The catch is load-bearing; an uncaught TDZ throw is a fail-open |
-| P2 | The failure decision was not sticky: `finalize()` ran eagerly at EOF and set `process.exitCode = 1`, but `process.exitCode` is last-writer-wins across `exit` listeners. Reproduced: a failing run + `process.on("exit", () => { process.exitCode = 0; })` appended at EOF → exit 0 while still printing `❌ SOME TESTS FAILED` | The EOF decision is terminal: `finalize(); if (failed > 0) process.exit(1);`. A fixture appends exactly that listener to a full suite copy and asserts exit 1 **and** that the summary still reaches stdout/stderr (guarding against `process.exit` truncation) |
+| P2 | The failure decision was not sticky: `finalize()` ran eagerly at EOF and set `process.exitCode = 1`, but `process.exitCode` is last-writer-wins across `exit` listeners. Reproduced: a failing run + `process.on("exit", () => { process.exitCode = 0; })` appended at EOF → exit 0 while still printing `❌ SOME TESTS FAILED` | The EOF path calls `process.exit(1)` when there are failures, which terminates before any code appended after that point can register such a listener — i.e. the decision is sticky against everything **outside** the file. A fixture appends exactly that listener to a full suite copy and asserts exit 1 **and** that the summary still reaches stdout/stderr (guarding against `process.exit` truncation). A listener registered **inside** the module body, *before* the decision, can still flip it — the accepted PR-editable residual recorded and pinned in the final-cycle section |
 | P2 | `--update-lock` was self-inconsistent on a symlinked locked file: it hashed the link target, printed `✅ workflow lock updated`, and the next verify run was RED. Reproduced: exit 0 + banner, then verify exit 1 | `--update-lock` refuses first (same `symlinkFinding` rejection), prints `❌ refusing to re-lock …`, exits 1, prints no banner |
 
-**What the trusted `--head-ref` leg no longer does (stated plainly).** It asserts the *structural* wiring
-of `ci.yml`/`node-ci.yml` (items 1–5) and, for `ci-main.yml`, only that the pin-gate job exists and
-declares the expected `with:` keys with a non-empty `test-command` (item 6a). It runs **no** shell
-check on `ci-main.yml`, and it does not replace item 6b. Item 6's shell guarantee is therefore per-PR /
-post-merge only, **enforced by PR-editable code** — the same trust level as the lock.
+**What the trusted `--head-ref` leg now asserts about `ci-main.yml` (stated plainly).** **Item 6a
+only**: the pin-gate job exists, declares the expected `with:` keys with a non-empty `test-command`,
+and that body still *contains* the exact pin-suite invocation line — all value assertions on bytes it
+has already fetched, executing nothing. It runs **no** shell check on `ci-main.yml` and does not
+replace item 6b. Item 6b's shell guarantee is therefore per-PR / post-merge only, **enforced by
+PR-editable code** — the same trust level as the lock.
 
-**What item 6 no longer asserts (stated plainly).** The deleted scanner also asserted that the
-post-merge command still *contains* this suite's invocation in the exact accumulator form. That is gone.
-The behavioural assertion cannot replace it: under the failing stub **every** suite fails, so a command
-that dropped only the pin-suite line still exits non-zero. Deleting that line is caught by the content
-lock (the byte changed), not by item 6. This is a real reduction in the local leg's coverage and is
-recorded here rather than papered over.
+**The invocation-presence assertion, restored (final cycle).** Deleting the scanner removed two
+different things: the line is *present* (a string property) and the step can *fail* (a shell property).
+Only the second needed modelling. Losing both left a hole with no owner — a `ci-main.yml` that drops the
+invocation line and updates the lock was red in **nothing**: measured on the previous revision, the
+suite reports `0 failed`, exit 0, and the trusted `--head-ref` leg reports ✅, while the real post-merge
+pin gate is dead. Item 6b cannot see it, because under the failing stub the *other* suites still drive
+the guard and the step still exits non-zero. Item **6a** restores it as a trimmed-line equality against
+a pinned constant, on the value the YAML reader parsed — never a grep of the raw file — and runs it on
+**both** legs (it executes nothing, so it is safe on the privileged trigger). What 6a proves is bounded:
+the line **exists**; it does **not** prove the line is **reachable** (a line inside a multi-line quoted
+string is textually present but is not a command — that shape is 6b's RED fixture) and does not prove
+the step can **fail** (6b's job).
 
 ## Accepted residual (recorded, not papered over)
 
 - **A required test whose BODY is replaced by a same-name no-op is not caught (#675 P2-5).** The
   roster records test NAMES, not semantics: `test("<required name>", () => assert.ok(true))` passes and
-  the suite stays green (`node scripts/check-pi-pin-lockstep.mjs` → `105 passed, 0 failed`, exit 0,
+  the suite stays green (`node scripts/check-pi-pin-lockstep.mjs` → `116 passed, 0 failed`, exit 0,
   measured on a full repo copy). No in-file mechanism can defend against a same-commit body rewrite
   (the roster, the floor and the exit handler are all in the file the PR can edit) — this is the same
   accepted same-commit class as the lock. The roster's claim is therefore bounded to **deleted or
   renamed** tests, and the three strings that claimed otherwise were corrected.
+- **Module-level code in this same file can still flip the exit code (final cycle).** The terminal
+  `process.exit(1)` makes the failure decision sticky against anything registered *after* it — i.e.
+  against everything outside the file — but a listener registered **before** the decision, in the
+  module body, can rewrite `process.exitCode` (or `removeAllListeners("exit")` + `process.exit(0)`,
+  which is fully silent). Reproduced and pinned by a dedicated fixture. This is the same accepted
+  PR-editable class as the lock and the roster-body rewrite: the file a PR can edit is the file that
+  decides. The alternative — moving the verdict into a child wrapper asserted by a parent — is not
+  clean either (it doubles the runtime and the wrapper's own stdout is equally forgeable), so the
+  honest option was taken: correct the claim and pin the limitation.
+- **The sticky fixture's skip marker is now a handshake, not an ambient flag (final cycle).**
+  `PIN_STICKY_FIXTURE_DEPTH` used to be a bare recursion guard checked inside the test, so
+  `PIN_STICKY_FIXTURE_DEPTH=1 node scripts/check-pi-pin-lockstep.mjs` made a REQUIRED roster test do
+  nothing and reported `105 passed, 0 failed`, exit 0 — a "skipped" recorded as "passed", reachable
+  from outside the file with a guessable name. The guard is now a self-validating handshake: the parent
+  generates a per-run random token, bakes it into the child copy's own source and into a marker file at
+  the child's own root, and the child must show both. A forged or stale marker is RED, immediately
+  (the guard runs at module-evaluation time). What remains forgeable is only a deliberate
+  reconstruction of the entire fixture root and child copy, which is not an ambient-skip vector.
 - **GitHub's own 0-jobs behaviour for a symlinked workflow is out of scope (#675 P1-2).** Both guards
   now REJECT a non-regular workflow entry, but a symlink under `.github/workflows/` still makes the
   per-PR `ci.yml` a broken workflow entry that runs 0 jobs, and `ci.yml` is not a required check. Making
@@ -435,22 +496,26 @@ recorded here rather than papered over.
   `ci.yml`; `--head-ref` skips the lock entirely. So a PR that deletes or neuters the lock check in its
   own copy is not caught by the trusted leg, and a PR that edits a workflow together with the lock
   passes both. The lock's real value is conspicuousness — an edit to a locked file cannot be silent.
-- **Item 6 is a bounded BEHAVIOURAL check — it proves the command can fail, not that it works.** It
+- **Item 6b is a bounded BEHAVIOURAL check — it proves the command can fail, not that it works.** It
   runs the committed `test-command` under `bash -e` with this repo's interpreters replaced by stubs
   that exit 1, and asserts the step exits non-zero. It proves, on this machine and this shell, that the
-  committed body fails the step. It does NOT prove that the real suites run or pass, that the command
-  still contains this suite's invocation, that the step fails on GitHub's runner, or anything about
-  per-suite attribution (under failing stubs every suite fails, so a command that dropped only the
-  pin-suite line still exits non-zero — the content lock, not item 6, catches that). The module header
-  is the authoritative statement.
-- **Item 6 is per-PR / post-merge only, and PR-editable.** It must execute the command, so it cannot
+  committed body fails the step. It does NOT prove that the real suites run or pass, that the step
+  fails on GitHub's runner, that the failing status came from a real suite at all (a command that keys
+  its exit status off the stub is GREEN here and dead in real CI — item 6a catches that shape), or
+  anything about per-suite attribution (under failing stubs every suite fails, so a command that
+  dropped only the pin-suite line still exits non-zero — asserting the line is *present* is item 6a's
+  job, and a byte change to the locked file additionally trips the content lock). The module header is
+  the authoritative statement.
+- **Item 6b is per-PR / post-merge only, and PR-editable.** It must execute the command, so it cannot
   run under `pull_request_target` (executing PR content there is the RCE vector). The trusted
-  `--head-ref` leg therefore makes no shell claim about `ci-main.yml` at all; item 6's shell guarantee
-  sits at the same trust level as the lock.
-- **The behavioural item 6 costs wall-clock time.** The suite went from ~11 s at `d5e876e` to ~48 s
-  now: six real `bash -e` round-trips plus one fixture that copies and re-runs the whole suite. Stubbing
-  out the shell instead would restore the old speed and the old guessing; the cost is accepted. The
-  stale "~4s of work" comment in `ci.yml` is out of scope here (locked file, not part of the contract).
+  `--head-ref` leg therefore makes no shell claim about `ci-main.yml` at all — what it does assert about
+  `ci-main.yml` is item 6a (values only); item 6b's shell guarantee sits at the same trust level as the
+  lock.
+- **Item 6b costs wall-clock time.** The suite went from ~11 s at `d5e876e` to ~73 s now: real
+  `bash -e` round-trips, the stubbed-`gh` `--head-ref` end-to-end fixtures, and one fixture that copies
+  and re-runs the whole suite (so every test added is effectively paid twice). Stubbing out the shell
+  instead would restore the old speed and the old guessing; the cost is accepted. The stale "~4s of
+  work" comment in `ci.yml` is out of scope here (locked file, not part of the contract).
 - **An ancestor symlink above the repo root is not walked.** `symlinkedAncestor` starts at the repo
   root and deliberately does not `lstat` it or any directory above it, because `/tmp` itself is a
   symlink on macOS and walking to `/` would make every fixture RED. A symlink in the repo's own path
@@ -481,20 +546,29 @@ recorded here rather than papered over.
   the live-file mutation round in §Verification plan #7–12 (all restored byte-identical via `cp`, #664).
   The **third revision replaced the 25 shell-scanner item-6 fixtures with 7 behavioural ones** (above)
   and added 2 tree-mode, 3 symlink/`.yaml`, and 1 `--update-lock`-refusal fixtures, in-suite; its
-  live-file mutation round is §Verification plan #13–25.
+  live-file mutation round is §Verification plan #13–25. The **final cycle** added item 6a's
+  invocation-presence fixtures (deleted / altered / repointed / legitimate-edit, plus two end-to-end
+  `--head-ref` cases through the stubbed `gh` CLI), item 6b's two spawn-hygiene fixtures (unresolvable
+  `bash`, timeout), the sticky handshake's fail-closed fixtures and the pinned same-file-listener
+  residual; its live-file mutation round is §Verification plan #26–35.
 - **positive controls** — `(h)`/`(i)` carry their explicit predicate positive controls (#675 P1-3);
   every one of items 1–6 has a failing fixture and a passing fixture; `lockFindings` now has one
   positive control per schema branch (#675 P2-e); **item 6b has an explicit positive control** (the
   same command with passing stubs must exit 0) and an explicit negative control (the guard moved into
-  `if false … fi` must go RED).
-- **`MIN_EXPECTED_PASSING` floor** — 71 → 91 → 109 → **105** (third revision: the 25 shell-scanner
-  fixtures were deleted and 21 fixtures added; the #675 second review-fix cycle had added 18), and it is
-  now a SECONDARY signal: the run also asserts a set of required test NAMES (#675 P2-c), so deleting or
-  renaming a real test is RED even when the count is unchanged.
+  `if false … fi` must go RED); **item 6a has a positive control too** (a legitimate unrelated edit
+  elsewhere in the command stays GREEN, on both legs).
+- **`MIN_EXPECTED_PASSING` floor** — 71 → 91 → 109 → 105 (third revision) → **116** (final cycle: item
+  6a's invocation-presence fixtures, item 6b's spawn hygiene, the sticky handshake and the pinned
+  same-file-listener residual), and it is now a SECONDARY signal: the run also asserts a set of required
+  test NAMES (#675 P2-c, 60 entries), so deleting or renaming a real test is RED even when the count is
+  unchanged.
   The floor and the roster are evaluated in a `process.on("exit", …)` handler (#675 P2-h), so an early
   `process.exit(0)` cannot skip them — and since the third revision that handler is registered at the
-  top of the module, the decision it takes is terminal (`process.exit(1)`), and an uncaught throw inside
-  it fails closed rather than open.
+  top of the module, the decision it takes is `process.exit(1)`, which is **sticky against everything
+  registered after it** (anything outside the file) and is **not** unflippable against module-level
+  code earlier in the same file. An uncaught throw inside the handler fails closed rather than open.
+  The unbounded "terminal" claim stood here until the final cycle, which corrected it and pinned the
+  limitation with a fixture (`RESIDUAL (pinned, not a guarantee): …`).
 
 ## Out of Scope
 
