@@ -87,6 +87,21 @@ fi
 
 ## Dispatch
 
+**Pre-dispatch collision gate (#3061 — fail-closed).** Before dispatching ANY work for an issue (worktree, branch, sub-agent, or parallel workstream), run the collision pre-flight from the target repo root:
+
+```bash
+python3 tools/collision_preflight.py <N>   # ONLY exit 0 authorizes dispatch
+```
+
+| Exit | Verdict | Action |
+|------|---------|--------|
+| `0` | CLEAN | every surface queried, no in-flight work — proceed |
+| `1` | COLLISION | a worktree/branch/PR/claim already covers #N — **do NOT dispatch** |
+| `2` | INCOMPLETE | a surface could not be queried — **NOT clean**; fix `gh` auth/network and re-run |
+| `3` | usage/internal error | **stop** |
+
+**Any non-zero exit stops the dispatch. There is no "warn and proceed."** If `gh` is unavailable the tool returns INCOMPLETE (2) by construction — that is a stop, not a degradation path. If the repo carries no `tools/collision_preflight.py`, record that fact in the dispatch log rather than silently skipping the gate.
+
 | Level | Complexity | Dispatches to | Depth |
 |-------|-----------|--------------|-------|
 | `epic` | any | `epic-workflow` | Full: 6 stages, all review gates, 3 human gates |

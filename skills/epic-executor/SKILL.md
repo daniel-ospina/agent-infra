@@ -50,7 +50,29 @@ If results found: report prior progress. Skip already-completed issues. Only dis
 
 ### Step 3: Build Dependency Map and Parallel Dispatch
 
-**Pre-dispatch check:** Before constructing prompts, verify each issue is still open. Closed issues may have been completed by a parallel agent:
+**Pre-dispatch gate — collision pre-flight (#3061), FAIL-CLOSED:** the FIRST check before any dispatch is the collision pre-flight. It checks every in-flight surface (open + closed PRs, local + remote branches, worktrees, assignee/claim comments) and fails loudly in both directions — a hit, and a surface that could not be queried:
+
+```bash
+# Run from the target repo root. Only exit 0 authorizes dispatch.
+for ISSUE in $ISSUE_LIST; do
+  if [ ! -f tools/collision_preflight.py ]; then
+    echo "❌ #$ISSUE: tools/collision_preflight.py absent in this repo — #3061 pre-flight NOT run. Record this in the dispatch log; do NOT silently skip."
+    continue
+  fi
+  python3 tools/collision_preflight.py "$ISSUE"
+  RC=$?
+  case $RC in
+    0) echo "✅ #$ISSUE: CLEAN — dispatch eligible." ;;
+    1) echo "⛔ #$ISSUE: COLLISION — a worktree/branch/PR/claim already covers it. DO NOT dispatch; report it." ;;
+    2) echo "❌ #$ISSUE: INCOMPLETE — a surface could not be queried. THIS IS NOT CLEAN. STOP the batch, fix gh auth/network, re-run." ;;
+    *) echo "❌ #$ISSUE: pre-flight error (exit $RC). STOP." ;;
+  esac
+done
+```
+
+⛔ **There is no graceful degradation.** If `gh` is unavailable the tool returns exit 2 (INCOMPLETE) by construction — that is a **stop**, not a warn-and-proceed. A pre-flight that cannot tell "no collision" from "could not check" is exactly the bug #3061 fixed; hand-waving past a non-zero exit reintroduces it. Only exit 0 authorizes dispatch.
+
+**Secondary check — prune closed issues:** after the pre-flight, verify each issue is still open (closed issues may have been completed by a parallel agent):
 
 ```bash
 for ISSUE in $ISSUE_LIST; do
@@ -62,7 +84,7 @@ for ISSUE in $ISSUE_LIST; do
 done
 ```
 
-If `gh` CLI is unavailable, warn and proceed (graceful degradation).
+If this `gh` call cannot run, the pre-flight above has already returned INCOMPLETE (exit 2) and the batch is stopped — do not proceed.
 
 **Concurrency control:** Max 16 parallel sub-agents per dependency level (bounded by fan-in context + worktree contention, NOT API limits — direct DeepSeek API is concurrency-only: 500 v4-pro / 2,500 v4-flash, #317). Stagger launches by 200ms between agents to smooth provider load. On rate-limit errors, retry with exponential backoff (1s, 2s, 4s) + jitter ±200ms. See `parallel-orchestrator` reference skill for full pattern.
 
