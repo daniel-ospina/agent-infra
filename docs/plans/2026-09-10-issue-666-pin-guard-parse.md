@@ -103,7 +103,7 @@ as the parser — the narrow assertions still read parsed nodes.
 | 4 | the `ci` job's `with:` key set is exactly `["test-command"]` and its value is exactly the expected accumulator command | emptied binding; `\|\| true` suffix; extra `with:` key; losing the second suite; a `test-command:` line inside a block scalar |
 | 5 | `node-ci.yml` still declares the `unit-test` job and the `test-command` workflow_call input | renamed input; removed `unit-test` job |
 | 6 | **6a (values, trusted leg + local)** `.github/workflows/ci-main.yml` still declares the `extension-tests` pin-gate job, the `with:` key set `["node-version", "script-validate", "skill-lint", "test-command"]` (the last non-empty), **and** that `test-command` body still contains the exact pin-suite invocation line `node scripts/check-pi-pin-lockstep.mjs \|\| failures=$((failures+1))` as a whole trimmed line | missing job; extra `with:` key; dropped `test-command`; emptied `test-command`; scalar `with:`; empty document; **deleted invocation line; altered line (`\|\| true`, `\|\| failures=0`); repointed script path** (all three RED on the per-PR suite *and* end-to-end on the trusted `--head-ref` leg) |
-| **6b** | **(behavioural, local leg only)** the committed post-merge `test-command` **exits non-zero** under `bash -e` with a failing `node` stub | negative control (guard inside `if false … fi`); guard in a never-called function; guard in a heredoc; invocation inside a multi-line quoted string; positive control (passing stubs → exit 0); **hygiene: an unresolvable `bash` and a command that never finishes are RED, not passes** |
+| **6b** | **(behavioural, local leg only)** the committed post-merge `test-command` **exits non-zero** under `bash -e` with a failing `node` stub | negative control (guard inside `if false … fi`); guard in a never-called function; guard in a heredoc; invocation inside a multi-line quoted string (**single-suite `FIXTURE_CI_MAIN` only** — on the committed multi-suite command this shape stays GREEN; see the unowned hole in the Accepted-residual section); positive control (passing stubs → exit 0); **hygiene: an unresolvable `bash` and a command that never finishes are RED, not passes** |
 
 Each item has both a failing fixture and a passing fixture (the fixture trio / spelling reformats).
 
@@ -445,10 +445,48 @@ the guard and the step still exits non-zero. Item **6a** restores it as a trimme
 a pinned constant, on the value the YAML reader parsed — never a grep of the raw file — and runs it on
 **both** legs (it executes nothing, so it is safe on the privileged trigger). What 6a proves is bounded:
 the line **exists**; it does **not** prove the line is **reachable** (a line inside a multi-line quoted
-string is textually present but is not a command — that shape is 6b's RED fixture) and does not prove
-the step can **fail** (6b's job).
+string is textually present but is not a command) and does not prove the step can **fail** (6b's job).
+**6b does not cover that reachability shape on the committed file either**, and that is measured, not
+argued: on the committed **multi-suite** `ci-main.yml` the wrapped invocation leaves 6a at **0
+findings** and `runCiMainTestCommand(mutated, 1)` at **status 1** — 6b's own notion of GREEN — because
+the *other* suites still drive the guard and the step still exits non-zero. 6b's RED fixture for this
+shape uses the **single-suite** `FIXTURE_CI_MAIN`, where the pin suite is the step's only suite and the
+swallowed invocation does move the exit status (`runCiMainTestCommand(fixture, 1)` → **status 0**), so
+that fixture goes RED there and only there. On the committed multi-suite file this shape is seen by
+**neither 6a nor 6b**; only the **content lock** is left, and that is the same-commit residual, recorded
+as an unowned hole below.
 
 ## Accepted residual (recorded, not papered over)
+
+- **Unowned hole: the invocation can be wrapped in a multi-line quoted string, so it is textually
+  present but never executed — on the committed multi-suite file NEITHER 6a NOR 6b sees it (measured).**
+  The reproducer wraps the invocation line in an `echo "…"` whose string spans lines, e.g. the single
+  accumulator line `node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))` becomes the body
+  of `echo "start` / `node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))` / `end"`. Bash then
+  treats the line as string text, so the pin suite never runs. 6a does not catch it because its check is
+  trimmed-LINE equality and the wrapped line is still one trimmed line (measured on the committed
+  `ci-main.yml`: `ciMainInvocationFindings(wrapped).length === 0`). 6b does not catch it either on the
+  committed file because the negative run makes *every* suite fail, the *other* suites still drive the
+  guard, and the step still exits non-zero — which is exactly 6b's assertion (measured:
+  `runCiMainTestCommand(wrapped, 1)` → `{ status: 1, error: null }`, identical to the committed
+  baseline). 6b's RED fixture for the shape uses the **single-suite** `FIXTURE_CI_MAIN`, where the pin
+  suite is the step's only suite, so the swallowed invocation does move the exit status
+  (`runCiMainTestCommand(fixture, 1)` → status 0) and the fixture goes RED there and only there. Only
+  the **content lock** sees the committed shape, and the lock is the same-commit residual below (a PR
+  that edits `ci-main.yml` *and* re-locks passes both legs). Closing the hole needs shell-reachability
+  modelling of the quoted-string class — the modelling this PR deleted after five rounds of bypasses —
+  so it is recorded as an **unowned hole**, not papered over. The three strings that claimed 6b's
+  fixture covered this shape on the committed file were corrected in the same commit.
+- **6a's trimmed-line equality is DELIBERATELY over-strict, and its false REDs are the accepted
+  price.** The check compares one whole trimmed line to a pinned constant, so a semantically identical,
+  legitimate edit to the invocation false-REDs: a trailing comment (`…failures=$((failures+1)) # keep`),
+  a backslash continuation splitting the line in two, a `./` prefix on the script path, or tabs where
+  the spaces are. All four were measured on the committed file and each produces the same
+  `no longer contains the pin-suite invocation line` finding. No coverage is removed by any of them —
+  the over-strictness is chosen because the failure is loud and the message names the constant, so any
+  such edit must update `EXPECTED_CI_MAIN_INVOCATION` in the same commit. Tightening it (comment
+  stripping, continuation joining) would be shell modelling — deliberately out of scope for this PR —
+  and would widen the reachability hole above.
 
 - **A required test whose BODY is replaced by a same-name no-op is not caught (#675 P2-5).** The
   roster records test NAMES, not semantics: `test("<required name>", () => assert.ok(true))` passes and

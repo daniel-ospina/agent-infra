@@ -398,6 +398,22 @@ const EXPECTED_CI_MAIN_WITH_KEYS = ["node-version", "script-validate", "skill-li
 // #675 final cycle — item 6a's invocation presence check. The EXACT accumulator
 // line ci-main.yml's post-merge `test-command` must still contain, as a whole
 // (trimmed) line. Pinned here so a change to either side is a deliberate edit.
+//
+// DELIBERATELY OVER-STRICT — the comparison is exact trimmed-line equality, so
+// ANY edit to that line requires updating THIS constant in the same commit. It
+// false-REDs semantically equivalent, legitimate spellings that remove no
+// coverage. Measured on the committed ci-main.yml, one finding each —
+//   - a trailing comment: `…failures=$((failures+1)) # keep`
+//   - a backslash continuation splitting the line across two lines
+//   - `node ./scripts/check-pi-pin-lockstep.mjs …` (a `./` prefix)
+//   - tabs instead of spaces between the words
+// — all four turn the check RED with the same `no longer contains the pin-suite
+// invocation line` message. The over-strictness is intentional: the remedy is
+// loud, and the failure message names this constant.
+// DO NOT relax it here with comment-stripping or continuation-joining — that is
+// shell modelling, which this PR deleted on purpose, and it would also widen the
+// reachability hole recorded in the plan's Accepted-residual section. If you
+// believe that logic is needed, raise it as a recommendation; do not add it.
 const EXPECTED_CI_MAIN_INVOCATION =
   "node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))";
 // The same line as it is INDENTED in ci-main.yml and in the fixture below (the
@@ -1293,11 +1309,24 @@ function wiringFindings(ciSrc, nodeCiSrc, ciMainSrc) {
 // the YAML reader parsed — never a grep of the raw file.
 //
 // WHAT IT PROVES / DOES NOT PROVE, EXACTLY: it proves the LINE EXISTS in the
-// committed `test-command` body. It does NOT prove the line is REACHABLE (a line
-// inside a multi-line quoted string is textually present but is not a command —
-// that shape is item 6b's RED fixture), and it does NOT prove the step can FAIL
-// (item 6b's job). It reads already-fetched bytes and executes nothing, so it is
-// safe — and REQUIRED — on the privileged trusted leg.
+// committed `test-command` body. It does NOT prove the line is REACHABLE, and it
+// does NOT prove the step can FAIL (item 6b's job).
+//
+// REACHABILITY IS NOT COVERED BY 6b EITHER, ON THE COMMITTED FILE. Wrapping the
+// invocation in a multi-line quoted string leaves it textually present but not a
+// command. Measured on the committed, MULTI-SUITE ci-main.yml: 6a passes
+// (`ciMainInvocationFindings(mutated).length === 0` — the wrapped line is still
+// one trimmed line) and 6b passes too (`runCiMainTestCommand(mutated, 1)` →
+// status 1, which is 6b's GREEN), because the OTHER suites still drive the guard
+// and the step still exits non-zero. 6b's RED fixture for that shape uses the
+// SINGLE-SUITE `FIXTURE_CI_MAIN`, where the pin suite is the step's only suite, so
+// the swallowed invocation does move the exit status
+// (`runCiMainTestCommand(fixture, 1)` → status 0) and the fixture goes RED. The
+// committed multi-suite file is therefore protected against this shape by NEITHER
+// 6a NOR 6b — only by the content lock, which is the same-commit residual (this
+// shape is recorded as an unowned hole in the plan's Accepted-residual section).
+// It reads already-fetched bytes and executes nothing, so it is safe — and
+// REQUIRED — on the privileged trusted leg.
 
 /**
  * Item 6a, second half: the pin-gate `test-command` body still contains the
@@ -2904,8 +2933,15 @@ test("ci-main structural: an empty ci-main.yml document is RED (#666 third revis
 //
 // WHAT IT PROVES: the exact accumulator line EXISTS as a whole trimmed line in
 // the committed body. WHAT IT DOES NOT PROVE: that the line is REACHABLE (a line
-// inside a multi-line quoted string is textually present but is not a command —
-// item 6b's RED fixture covers that shape) or that the step can FAIL (item 6b).
+// inside a multi-line quoted string is textually present but is not a command) or
+// that the step can FAIL (item 6b). Item 6b does NOT cover that reachability
+// shape on the COMMITTED, MULTI-SUITE ci-main.yml — measured: the wrapped line
+// leaves 6a at 0 findings AND `runCiMainTestCommand(mutated, 1)` at status 1
+// (6b's GREEN), because the other suites still drive the guard. 6b's RED fixture
+// uses the SINGLE-SUITE `FIXTURE_CI_MAIN`, where `runCiMainTestCommand(fixture,
+// 1)` is status 0, so the fixture goes RED there and only there. On the committed
+// file this shape is therefore seen by NEITHER 6a NOR 6b; only the content lock
+// is left, and that is the same-commit residual.
 // Its unique value is the shape item 6b CANNOT see: deleting or repointing the
 // line while the other suites keep the stub run non-zero.
 test("the ci-main fixture contains the post-merge pin-suite invocation line (item 6a)", () => {
@@ -3065,6 +3101,9 @@ test("item 6: an invocation swallowed by a multi-line quoted string makes the as
   // other suites still drive the guard and the step still exits non-zero (probed:
   // status 1). This fixture is the shape in which the pin suite is the step's only
   // suite, which is what makes a swallowed invocation observable in the exit code.
+  // 6a does not see the shape either — the wrapped line is still one trimmed line
+  // — so on the committed multi-suite file neither 6a nor 6b is RED; only the
+  // content lock is (the plan's Accepted-residual section records this hole).
   const mutated = mutate(
     FIXTURE_CI_MAIN,
     CI_MAIN_INVOCATION_LINE,
