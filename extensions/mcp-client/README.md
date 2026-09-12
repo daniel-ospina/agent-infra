@@ -96,11 +96,44 @@ stops the server, the next tool call transparently reconnects it.
 with `${TORTOISE_HOME}/.venv/bin/python3` (the venv has `fastmcp`; global
 python3 does not).
 
+## Cold-start retry (#802)
+
+Eager connect makes **one initial attempt + one retry** per server. A remote
+server is cold on its first request after idle — measured against the hosted
+Tortoise MCP: first request after ~45s idle took **15.55s** (right at the 15s
+default budget), after ~100s idle it stalled **35.4s** then returned a zero-byte
+503, while warm latency was **0.30s**. The cold path therefore straddles the
+default budget by design, so a single timeout is not an outage. Attempt 1 wakes
+the server; attempt 2 (250ms later) lands on the warm path.
+
+The retry is bounded to **2 attempts** so startup can never exceed ~2× the
+per-server budget (15s default → ≤30s worst case, before transport teardown).
+Deterministic config errors (e.g. a server with neither `command` nor `url`) are
+not retried.
+
+`timeoutMs` is the per-attempt cold-start budget knob and applies to **both**
+attempts — set it higher for a server that reliably needs longer than 15s (e.g.
+30s warm-up). If a server is still unavailable, the startup log names the
+recovery command:
+
+```
+[mcp-client] MCP server 'tortoise' unavailable — continuing without it. Recover with: mcp_load tortoise (or raise "timeoutMs" in .mcp.json for a slow cold start).
+```
+
+`mcp_load <server>` reconnects on demand and registers the server's tools for
+the rest of the session — the manual escape hatch when even the retry loses the
+race.
+
 ## Tests
 
 ```
 npx tsx extensions/mcp-client/resolution.test.ts
 npx tsx extensions/mcp-client/lifecycle.test.ts
 npx tsx extensions/mcp-client/oauth.test.ts
+npx tsx extensions/mcp-client/eager-retry.test.ts
+npx tsx extensions/mcp-client/oauth-refresh.integration.test.ts
 npx tsx extensions/mcp-client/mcp-load.integration.test.ts
 ```
+
+Run from the repo root — `resolution.test.ts` resolves `templates/.mcp.base.json`
+via `process.cwd()`.
