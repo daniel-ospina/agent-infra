@@ -416,26 +416,49 @@ export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null, pre
  * Returns null when git fails (caller applies fail-closed policy).
  * @param {{cdChain?: Array<string|null>, cHints?: string[], gitDirHint?: string|null, vars?: object}|null} inv
  * @param {string} [sessionCwd]
+ * @returns {{repoKey: string|null, gitDir: string, effectiveCwd: string, isWorktree: boolean, isBare: boolean, currentBranch: string|null, unresolvedTarget: boolean}|null}
+ *   `unresolvedTarget` is true when any `cd`/`-C`/`--git-dir` hint could not be
+ *   resolved (bare `cd`, an unexpandable `$VAR`, or classify-git's `\u0000`
+ *   sentinel). The repo fields then describe the CONSERVATIVE session-cwd
+ *   fallback, but a safety gate must REFUSE — never exempt as a worktree —
+ *   when the effective target is unverifiable (#805).
  */
 export function resolveRepoFromInv(inv, sessionCwd = process.cwd()) {
   if (!inv) return null;
   let cwd = sessionCwd ? resolve(sessionCwd) : process.cwd();
+  // #805: an UNRESOLVED target hint means the command's effective repo cannot
+  // be determined. Keep the conservative session-cwd fallback (so the returned
+  // repo is a valid reference point) but FLAG it — the pre-#805 behaviour let
+  // `cd $UNRESOLVED && git commit` from a worktree session fall back to the
+  // session's own (exempt) worktree and land on the shared hub's foreign
+  // branch (the 2026-09-12 incident).
+  let unresolvedTarget = false;
   for (const cd of inv.cdChain || []) {
-    if (!cd) continue;
+    if (!cd) { unresolvedTarget = true; continue; } // bare cd / cd- → unknown
     const expanded = _expandCdVars(cd, inv.vars);
     // #337: an unresolvable `$VAR` cd target (no same-command assignment) must
     // NOT resolve to a bogus literal path (`<cwd>/$WT` → git read fails →
     // fail-closed block). Conservatively fall back to the session cwd — the
-    // KNOWN reference point (the hub/main checkout) so the main-checkout gates
-    // still apply rather than guessing a worktree.
-    if (expanded === null) continue;
+    // KNOWN reference point — and FLAG the target as unresolved (#805) so the
+    // caller fails closed instead of exempting a worktree.
+    if (expanded === null) { unresolvedTarget = true; continue; }
     cwd = resolve(cwd, expanded); // bash: `cd a && cd b` ends in b, relative to a
   }
   for (const c of inv.cHints || []) {
-    if (!c) continue;
+    if (!c) { unresolvedTarget = true; continue; }
+    // classify-git emits the `\u0000` sentinel for an unresolvable `-C`/`$VAR`
+    // (its own resolveInvocationTarget treats it conservatively); the
+    // branch-ownership layer must agree — never resolve it to a bogus path.
+    if (String(c).includes("\u0000")) { unresolvedTarget = true; continue; }
     cwd = resolve(cwd, c); // -C resolves relative to the current cwd, in order
   }
-  const gitDir = inv.gitDirHint ? resolve(cwd, inv.gitDirHint) : join(cwd, ".git");
+  let gitDir;
+  if (typeof inv.gitDirHint === "string" && inv.gitDirHint.includes("\u0000")) {
+    unresolvedTarget = true;
+    gitDir = join(cwd, ".git");
+  } else {
+    gitDir = inv.gitDirHint ? resolve(cwd, inv.gitDirHint) : join(cwd, ".git");
+  }
   const state = readBranchState(cwd, gitDir);
   if (!state) return null;
   return {
@@ -450,6 +473,8 @@ export function resolveRepoFromInv(inv, sessionCwd = process.cwd()) {
     // refuses to touch the checked-out branch) must not fire there.
     isBare: _isBareGitDir(state.gitDir),
     currentBranch: state.branch,
+    // #805: fail-closed signal — the caller must refuse an unverifiable target.
+    unresolvedTarget,
   };
 }
 
@@ -468,11 +493,12 @@ function _isBareGitDir(gitDir) {
   }
 }
 
-/** Expand `$VAR` / `${VAR}` in a cd target against same-command assignments.
- * Returns the expanded path, or null when any `$VAR` is unresolvable (caller
- * falls back to the session cwd — conservative, #337). Tilde/home expansion is
- * out of scope (unchanged from the pre-#337 behavior). */
-function _expandCdVars(token, vars) {
+/** Expand `$VAR` / `${VAR}` in a cd target against same-command assignments,
+ * then the process environment. Returns the expanded path, or null when any
+ * `$VAR` is unresolvable (caller falls back to the session cwd — conservative,
+ * #337 — AND flags the target unforeseen so the gate fails closed, #805).
+ * Tilde/home expansion is out of scope (unchanged from the pre-#337 behavior). */
+function _expandCdVars(token, vars, env = process.env) {
   let t = String(token ?? "").replace(/^["']|["']$/g, "");
   if (!t.includes("$")) return t;
   const map = vars || {};
@@ -480,6 +506,13 @@ function _expandCdVars(token, vars) {
   t = t.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, braced, plain) => {
     const name = braced ?? plain;
     if (Object.prototype.hasOwnProperty.call(map, name)) return map[name];
+    // #805: fall back to the process environment — `cd $AGENT_INFRA_PATH` is a
+    // documented spelling and the shell DOES resolve it. Resolving faithfully
+    // keeps a hub-rooted session's on-baseline command allowed; a name that is
+    // defined nowhere stays unresolved (the caller fails closed).
+    if (env && Object.prototype.hasOwnProperty.call(env, name) && env[name] != null) {
+      return String(env[name]);
+    }
     ok = false;
     return m;
   });
@@ -882,8 +915,48 @@ export function decideM2({
   effectiveRepo, baseline, currentBranch, pushDst, pushTargets, verdict, allowActive,
 }) {
   if (allowActive) return null; // marker/flag: escape hatch — M2 inactive
-  if (!effectiveRepo || effectiveRepo.isWorktree) return null;
-  if (!baseline || effectiveRepo.repoKey !== baseline.repoKey) return null;
+  // #805: a gate that cannot determine the target must REFUSE, never allow.
+  // `!effectiveRepo` (git read failure) and `unresolvedTarget` (bare cd /
+  // unexpandable $VAR / `-C` sentinel) are BOTH indeterminate targets.
+  if (!effectiveRepo) {
+    return {
+      block: true,
+      reason: [
+        `⛔ Commit/push blocked — could not determine the target repository.`,
+        `   The effective repo could not be resolved (git read failed or an`,
+        `   unresolvable cd/-C target); a safety gate refuses an unverifiable`,
+        `   target rather than exempting it (fail-closed, #805).`,
+      ].join("\n"),
+    };
+  }
+  if (effectiveRepo.unresolvedTarget) {
+    return {
+      block: true,
+      reason: [
+        `⛔ Commit/push blocked — the command's target repository is unresolved.`,
+        `   The command retargets its effective repo (cd/-C/--git-dir) to a path`,
+        `   that cannot be determined, so ownership cannot be verified (#805).`,
+        `   → Use an absolute path, or run the command from the target repo.`,
+      ].join("\n"),
+    };
+  }
+  if (effectiveRepo.isWorktree) return null;
+  // #805: a MAIN-checkout commit/push by a session with no recorded baseline
+  // for that repo cannot prove ownership. Worktree sessions record no baseline
+  // (they are isolated), so a `cd`/`-C` into the shared hub previously slipped
+  // through — refuse it (fail-closed).
+  if (!baseline) {
+    return {
+      block: true,
+      reason: [
+        `⛔ Commit/push blocked — no branch baseline is recorded for the`,
+        `   resolved MAIN checkout, so ownership cannot be verified (#265/#805).`,
+        `   → Work in an isolated worktree (using-git-worktrees skill), or`,
+        `     operate on a checkout this session started in (baseline recorded).`,
+      ].join("\n"),
+    };
+  }
+  if (effectiveRepo.repoKey !== baseline.repoKey) return null;
   if (verdict === "block:commit") {
     if (currentBranch === baseline.branch) return null;
     const recovery = baseline.original
@@ -916,7 +989,21 @@ export function decideM2({
       ? pushTargets
       : (pushDst ? [pushDst] : [currentBranch]);
     targets = targets.map((t) => (t === "HEAD" ? currentBranch : t)).filter(Boolean);
-    if (targets.length === 0) return null;
+    // #805: an EMPTY target set means the push destination is indeterminate
+    // (no refspec, no pushDst, and no resolvable current branch — e.g. a
+    // detached/unresolvable HEAD). Refuse it (fail-closed); the pre-fix code
+    // returned null here, which is the exact bypass class this issue closes.
+    if (targets.length === 0) {
+      return {
+        block: true,
+        reason: [
+          `⛔ Push blocked — the push target could not be determined.`,
+          `   No refspec/upstream and no resolvable current branch — ownership`,
+          `   cannot be verified (fail-closed, #805).`,
+          `   → Push an explicit branch you own: git push <remote> <branch>.`,
+        ].join("\n"),
+      };
+    }
     if (targets.every((t) => t === baseline.branch)) return null;
     return {
       block: true,

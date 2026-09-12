@@ -1977,7 +1977,21 @@ export default function (pi: ExtensionAPI) {
             return { block: true, reason: gate.reason ?? "" };
           }
           if (gate.verdict === "recovery" || gate.verdict === "allowed") {
-            return undefined; // sanctioned recovery / read-only / worktree-isolated — done
+            // #805: M4's recovery allowlist sanctions `git push
+            // <checked-out-branch>` for WIP preservation. M4 cannot see the
+            // SESSION's baseline — pushing whatever branch the SHARED hub
+            // happens to be on is exactly the cross-session contamination
+            // (#265) the branch-ownership gate exists to refuse. Never let
+            // this early-return swallow a push: fall through to the
+            // ownership/M2 path below (which allows the session's OWN branch
+            // and blocks foreign ones, incl. bare/`HEAD`/remote-only pushes).
+            const pushDet = classifyGitCommandDetailed(command);
+            const gateablePush = pushDet?.verdict === "block:push" ||
+              pushDet?.verdict === "block:force-push" ||
+              pushDet?.verdict === "block:push-delete";
+            if (!gateablePush) {
+              return undefined; // sanctioned recovery / read-only / non-push — done
+            }
           }
         }
       } else if (isWrite || isEdit) {
@@ -2236,6 +2250,15 @@ export default function (pi: ExtensionAPI) {
             return {
               block: true,
               reason: "⛔ Branch-state command blocked — could not resolve the effective repo (fail-closed; #265).",
+            };
+          }
+          // #805: an UNRESOLVED target (bare cd / unexpandable $VAR / `-C`
+          // sentinel) must never be worktree-exempted — the command may run in
+          // the shared hub. Same fail-closed rule as M2.
+          if (muEff.unresolvedTarget) {
+            return {
+              block: true,
+              reason: "⛔ Branch-state command blocked — the command's target repository is unresolved (fail-closed; #805).",
             };
           }
           if (muEff.isWorktree) continue; // THIS mutation is wt-scoped — exempt
