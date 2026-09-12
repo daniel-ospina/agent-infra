@@ -26,6 +26,12 @@
 //   cloud              — true = hosted capture (requires apiKey; default false)
 //   apiKey             — Bearer key (tt_...) for hosted capture (or TORTOISE_API_KEY)
 //   apiUrl             — hosted API base (or TORTOISE_API_URL; default https://api.premiselabs.co)
+//
+// #803: hosted capture is DATA EGRESS and additionally requires that no repo/env
+// deny is in effect — `<repo>/.pi/tortoise-capture.json` `{"cloud": false}` or
+// `TORTOISE_CAPTURE_CLOUD=0` force local capture. Deny-only surfaces: neither can
+// ENABLE cloud on its own (a repo must never grant itself egress). Gate shared
+// with reflect-hook via extensions/shared/capture-gate.ts.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
@@ -39,6 +45,7 @@ import {
   modelFromContext,
   type SessionAttribution,
 } from "../shared/capture-attribution.js";
+import { resolveCaptureGate, resolveProjectRoot } from "../shared/capture-gate.js";
 
 // ── Config ──────────────────────────────────────────────
 
@@ -302,9 +309,21 @@ export function cloudConfig(config: TortoiseConfig): { apiUrl: string; apiKey: s
   return { apiUrl, apiKey };
 }
 
-/** Cloud mode is active only when explicitly enabled AND a key exists. */
-export function isCloudEnabled(config: TortoiseConfig): boolean {
-  return config.cloud === true && cloudConfig(config).apiKey.length > 0;
+/**
+ * Cloud mode is active only when explicitly opted in AND a key exists AND no
+ * repo/env deny (#803). Same shared gate as reflect-hook — see
+ * extensions/shared/capture-gate.ts. `projectDir` defaults to process.cwd().
+ */
+export function isCloudEnabled(
+  config: TortoiseConfig,
+  opts?: { projectDir?: string; env?: NodeJS.ProcessEnv },
+): boolean {
+  return resolveCaptureGate({
+    cloud: config.cloud,
+    apiKey: cloudConfig(config).apiKey,
+    projectDir: opts?.projectDir ?? resolveProjectRoot(process.cwd()),
+    env: opts?.env,
+  }).enabled;
 }
 
 /** Append a durable JSONL record (shaped like the /v1/sessions payload) BEFORE the network attempt. */
@@ -585,7 +604,12 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
       // Update tracking state
       state.lastMessageCount = conversation.length;
 
-      if (isCloudEnabled(config)) {
+      // Lazy gate evaluation: `config.cloud !== true` short-circuits before the
+      // git spawn in resolveProjectRoot (the default local-capture case).
+      if (
+        config.cloud === true &&
+        isCloudEnabled(config, { projectDir: resolveProjectRoot(ctx.cwd ?? process.cwd()) })
+      ) {
         // #312: hosted-cloud path — REPLACES local python ingest. Durable JSONL
         // record is written BEFORE the network attempt (data never lost); the
         // POST is fire-and-forget with a bounded 30s timeout, never awaited so
@@ -629,10 +653,22 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
     }
   });
 
-  if (isCloudEnabled(config)) {
+  const cloudGate = resolveCaptureGate({
+    cloud: config.cloud,
+    apiKey: cloudConfig(config).apiKey,
+    projectDir: resolveProjectRoot(process.cwd()),
+    env: process.env,
+  });
+  if (cloudGate.enabled) {
     const { apiUrl } = cloudConfig(config);
     console.log(
       `[tortoise-capture] enabled — cloud capture ON: sessions POST to ${apiUrl}/v1/sessions (local python ingest replaced)`,
+    );
+  } else if (cloudGate.reason === "repo-opt-out" || cloudGate.reason === "env-disabled") {
+    // #803: an operator/repo deny beat an otherwise-valid cloud config — say so
+    // rather than silently falling through to the local path.
+    console.log(
+      `[tortoise-capture] enabled — cloud capture OFF (${cloudGate.reason}); capturing locally to ~/.tortoise/docs/`,
     );
   } else if (config.cloud === true) {
     console.warn(
