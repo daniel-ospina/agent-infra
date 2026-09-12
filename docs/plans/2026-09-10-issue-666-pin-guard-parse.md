@@ -643,16 +643,38 @@ for files it had never touched, and was told to "restore the line" it had never 
 merging would in fact have left the **base** branch's valid copies in place. Measured on its first
 real PR run (#785, two markdown lines, 11 commits behind): both the `ci.yml` accumulator and the
 `ci-main.yml` invocation line reported missing, neither of which that PR touched, and the check went
-green the moment the branch was updated. The leg now passes `pull_request.merge_commit_sha` — the ref
-whose tree would actually **land** — which is also the only ref where "the PR changed this file AND
-the base branch changed it since" exists at all. `merge_commit_sha` is null while a PR conflicts with
-its base, so the step fails closed with its **own** message ("this is NOT a finding about your
-workflow files") instead of reporting a spurious workflow finding. Pinned by the wiring test, which
-now reads `env.MERGE_SHA` and the `run` block as **parsed nodes** and asserts both the value and the
-presence of the null guard; both were verified non-vacuous by mutating the live workflow (env
-reverted to `head.sha` → RED; null guard removed → RED). The flag keeps its historical name
-`--head-ref`; its contract is now documented as "the ref whose tree would land", because renaming it
-touches ~70 references for no behavioural gain.
+green the moment the branch was updated. The leg now passes the **merge result** — the ref whose tree
+would actually **land** — which is also the only ref where "the PR changed this file AND the base
+branch changed it since" exists at all. When there is no merge commit the step fails closed with its
+**own** message ("this is NOT a finding about your workflow files") instead of reporting a spurious
+workflow finding. Pinned by the wiring test, which reads the step's `env` and `run` block as **parsed
+nodes** and asserts the resolution, the fail-closed guard, and that `--head-ref` receives the resolved
+value — all verified non-vacuous by mutating the live workflow (each mutation → RED). The flag keeps
+its historical name `--head-ref`; its contract is now documented as "the ref whose tree would land",
+because renaming it touches ~70 references for no behavioural gain.
+
+### #843 (follow-up, 2026-09-13) — the merge commit comes from the REST API, not the event payload
+
+#821 named the right subject but read it from the wrong place. `github.event.pull_request.merge_commit_sha`
+is **null in the event payload** until GitHub computes mergeability, and that computation is
+**asynchronous**. The first PR to run the new code was red while `mergeable` was `MERGEABLE` and
+`refs/pull/<n>/merge` already existed:
+
+```
+env:
+  MERGE_SHA:                       ← EMPTY
+  HEAD_SHA: d072f292581589d322729b5005bf16bee1d41689
+❌ pull_request.merge_commit_sha is EMPTY, so there is no merge result to validate.
+```
+
+So the fix for one false RED (stale branches) introduced a **more common** one — a race-dependent
+subset of *every* PR. Worse, #834's own PR passed only because the field happened to be populated by
+the time its job ran. The step now resolves the merge commit from
+`GET /repos/{owner}/{repo}/pulls/{number}`, re-adds the `pull-requests: read` scope that #675's review
+had removed as unused (correctly at the time — this change is what needs it), and keeps the fail-closed
+branch for a genuinely conflicted PR, where the API also returns nothing because no merge commit
+exists. The lesson, recorded because it is easy to repeat: the payload field and the REST API field of
+the same name are **not** interchangeable.
 
 ## Out of Scope
 
