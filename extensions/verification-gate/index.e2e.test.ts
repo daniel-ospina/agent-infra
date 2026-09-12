@@ -25,6 +25,21 @@ import { dirname, join } from "node:path";
 // ── Isolation: bridge lives under a temp HOME (never touch the real one) ──
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "vgate-e2e-"));
 process.env.HOME = TEST_ROOT;
+// #830 — HERMETIC GIT IDENTITY, BY CONSTRUCTION.
+// The GitHub runner's user has no passwd GECOS, so git cannot GUESS an identity
+// and every fixture commit needs one supplied. Relying on the ambient identity
+// (~/.gitconfig, /etc/gitconfig, or the login name) is what turned this file's
+// "hermetic" claim false: it passed on a dev box (macOS derives a name from the
+// passwd GECOS field) and failed on the runner with
+//     fatal: empty ident name (for <runner@runnervmlun5p...>) not allowed
+// Setting these four vars makes EVERY fixture commit in this file work regardless
+// of what the host provides, so a future scenario that forgets the per-repo
+// `git config user.email/name` cannot red `main`. Values match the convention
+// those per-repo configs use, so both paths agree.
+process.env.GIT_AUTHOR_NAME = "e2e";
+process.env.GIT_AUTHOR_EMAIL = "e2e@test";
+process.env.GIT_COMMITTER_NAME = "e2e";
+process.env.GIT_COMMITTER_EMAIL = "e2e@test";
 // The gate under test must be ACTIVE — clear the escape hatch if the parent
 // environment inherited it (sub-agent sessions pre-disable extension gates).
 delete process.env.ELDATO_SKIP_VGATE;
@@ -4071,6 +4086,12 @@ async function main() {
     const wt = join(TEST_ROOT, "cwd-wt");
     mkdirSync(hub, { recursive: true });
     git(hub, "init -q -b main");
+    // #830 — this scenario was the one fixture that never set an identity, so it
+    // committed as whoever the host happened to be and failed on the runner. Kept
+    // explicit (matching every sibling fixture) even though the harness now also
+    // exports a hermetic identity, so the scenario stays self-contained.
+    git(hub, `config user.email e2e@test`);
+    git(hub, `config user.name e2e`);
     writeFileSync(join(hub, "base.txt"), "base\n");
     git(hub, "add base.txt");
     git(hub, "commit -m baseline");
