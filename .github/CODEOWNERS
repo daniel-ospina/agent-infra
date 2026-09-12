@@ -20,21 +20,32 @@
 # so this file has no effect on the PR that adds it — ownership starts with the
 # next PR that touches a guarded path after this merges.
 #
-# NOTE (single-writer reality, #669): GitHub does not request a review from the
-# PR author, and @daniel-ospina is the repo's only collaborator — so every PR is
-# authored by the sole code owner and this file currently produces an ownership
-# ANNOTATION, not a visible review request. Branch protection also requires no
-# code-owner review (`required_pull_request_reviews` is null). Making this
-# blocking needs that setting enabled AND a second approving identity (the sole
-# writer cannot approve their own PR) — see #669. #646 is unrelated: it makes a
-# code status check required, not a review.
+# NOTE (single-writer reality, #669): this file has NO OBSERVABLE EFFECT today.
+# GitHub's only two CODEOWNERS behaviours are (1) auto-requesting a review and
+# (2) blocking a merge when code-owner review is required — there is no third
+# "annotation" behaviour; nothing is attributed, displayed or enforced. Here:
+# GitHub never requests a review from the PR author and @daniel-ospina is the
+# repo's only collaborator, so every PR is authored by the sole code owner
+# (voids 1); and `required_pull_request_reviews` is null (voids 2). This file is
+# a hook for the future, not a control today.
+#
+# Four settings would be needed to make it bind — all four, not three: raise
+# `required_pull_request_reviews`, enable `require_code_owner_reviews` within it,
+# add a SECOND approving identity (#669), and set `enforce_admins: true` — which
+# is false today, so even with a second identity the sole admin could still merge
+# their own PR via "Merge without waiting for requirements". That is an
+# every-merge admin override, not a hard deadlock. #646 is unrelated throughout:
+# it makes a code status check required, not a review.
 
 # The ownership file itself — changing who owns the guards needs owner review.
 /.github/CODEOWNERS                       @daniel-ospina
 
 # CI workflows. pipeline-compliance.yml implements the repo's ONLY required
-# status check (context: `pipeline-compliance`); renaming its job silently
-# disables the check, so workflow edits need owner review.
+# status check (context: `pipeline-compliance`). Renaming its job is FAIL-CLOSED,
+# not a silent disable: the required context is then never reported, so GitHub
+# parks the PR at "Expected — Waiting for status to be reported" and the merge is
+# blocked. The quiet bypass is editing the job body — or the script it runs — so
+# it always exits 0. That is why workflow and gate edits need owner review.
 # templates/ holds the materialization source for the reusable workflows —
 # edit the template, not the copy, so it needs the same owner.
 /.github/workflows/                       @daniel-ospina

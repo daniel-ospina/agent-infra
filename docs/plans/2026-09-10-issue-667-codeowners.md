@@ -6,7 +6,7 @@ doc_status: draft
 subjects.team: organisation-design-team
 created: 2026-09-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-667, issue-637, issue-640, issue-646, codeowners
+aboutObjects: agent-infra, issue-667, issue-637, issue-640, issue-646, issue-669, issue-713, codeowners
 ---
 
 # #667 — CODEOWNERS for the enforcement surfaces — Scope & Plan
@@ -42,20 +42,25 @@ complementing #646 (does a red check block a merge).
    the working assumption that CODEOWNERS "still produces a visible requested
    review" is false here — GitHub does not request a review from the PR author,
    and the sole writer authors every PR. What this PR actually delivers is the
-   ownership annotation plus a reviewed, single-source path list; the visible
-   requested review is *not* observable until a second writer exists (#669). The
-   same finding flags that enabling "Require review from Code Owners" in a
-   single-writer repo would deadlock every PR — so #646 alone is not sufficient
-   to make CODEOWNERS blocking.
+   ownership path list itself; the visible requested review is *not* observable
+   until a second writer exists (#669). **Premise-correction pass:** the
+   earlier wording called this an "ownership annotation" — GitHub has no such
+   behaviour (its only two are auto-requesting a review and blocking when
+   code-owner review is required), so the honest phrasing is **no observable
+   effect today**.
 2. **`required_pull_request_reviews` is NOT enabled.** It is a branch-protection
    change and is out of scope for #667; recorded as a follow-up in the PR body.
-   CODEOWNERS is therefore advisory now, and it stays advisory after #646:
+   CODEOWNERS is therefore inert now, and it stays inert after #646:
    #646 makes a code **status check** required — it does not touch
-   `required_pull_request_reviews`. Making code-owner review blocking needs (a)
-   that setting enabled **and** (b) a second approving identity, because the
-   sole writer cannot approve their own PR (#669). #646 is therefore neither
-   necessary nor sufficient for CODEOWNERS to block. Corrected in review
-   cycle 3.
+   `required_pull_request_reviews`. Making code-owner review binding needs (a)
+   that setting enabled, (b) `require_code_owner_reviews` enabled within it,
+   (c) a second approving identity, because the sole writer cannot approve
+   their own PR (#669), **and (d) `enforce_admins: true`** — false today, so
+   without it the sole admin's own PRs remain mergeable via "Merge without
+   waiting for requirements". #646 is therefore neither necessary nor
+   sufficient for CODEOWNERS to block. Corrected in review cycle 3; (d) added in
+   the premise-correction pass, which also dropped the "hard deadlock" framing —
+   with `enforce_admins: false` it is an every-merge admin override.
 3. **Path list — enforcement surfaces only**, no catch-all:
    `.github/CODEOWNERS`, `.github/workflows/`, `templates/.github/workflows/`,
    `AGENTS.md`, the pipeline gate, the pin/version/frontmatter guard family,
@@ -75,7 +80,7 @@ complementing #646 (does a red check block a merge).
    last-match-wins, one owner per line, no `!`/`[ ]`/escaped `#`). Every entry
    is an explicit `/`-anchored path — no catch-all, per the #667 non-goal.
 2. Add `docs/ops/guarded-paths.md` — the single documented list (guarded paths,
-   explicit non-guarded paths with reasons, and the advisory/branch-protection
+   explicit non-guarded paths with reasons, and the inertness/branch-protection
    boundary). `docs/ops/*.md` is the established policy home for this repo
    (see `docs/ops/cost-config-policy.md`, `docs/ops/session-lifecycle-contract.md`).
 3. Add this plan doc.
@@ -134,29 +139,72 @@ complementing #646 (does a red check block a merge).
   findings remain**; the applied fix is a count/provenance correction inside this
   log only (no claim in CODEOWNERS or `guarded-paths.md` changed), so no cycle-5
   re-dispatch was made. Final VGATE `PASS` recorded over the frozen file set.
+- **premise-correction pass (post-cycle-4, human premise review)** — three
+  explanatory sentences were found factually wrong after the cycle cap and
+  corrected directly (a factual correction to prose, not a new design cycle;
+  no finding in cycles 1–4 is reopened and no new claim is introduced):
+  1. *Inverted:* "renaming its job silently disables the check" — a required
+     context that is never reported leaves GitHub at "Expected — Waiting for
+     status to be reported" and **blocks** the merge. Renaming is **fail-closed**.
+     The real quiet bypass is editing the job body or the script so it always
+     exits 0. Reworded in `.github/CODEOWNERS` and `guarded-paths.md` §1.
+  2. *Misleading:* "the check runs the committed, guarded `pipeline-compliance.yml`
+     + `check-pipeline-compliance.sh`" — contradicted by the workflow's own
+     header (`pipeline-compliance.yml:14-18`): the gate runs the **checked-out**
+     copy, by design, no auto-fetch. On `pull_request` that is the **PR head**,
+     so a PR that rewrites the gate is graded by its rewrite. Reworded in
+     `guarded-paths.md` §2 and filed as **#713**.
+  3. *Incomplete:* the binding-precondition list gave three settings and omitted
+     **`enforce_admins: true`** (false today). Added as a fourth in
+     `.github/CODEOWNERS`, `guarded-paths.md` §3, decision 2 above, and the
+     Out-of-Scope section. The "deadlock" framing was softened with it: with
+     `enforce_admins: false` the result is an every-merge admin override, not a
+     hard deadlock — same net security effect, more friction.
+  4. *Imprecise (optional):* "ownership ANNOTATION" / "attributed" described a
+     behaviour GitHub does not have (its only two are auto-requesting a review
+     and blocking when code-owner review is required) → replaced with "no
+     observable effect today".
+
+  Also corrected in this pass: the PR body's `Closes #667` → **`Refs #667`** with
+  **blocked-by #669** (the Objective and Target are not observable today, so
+  closing would record a governance control as delivered), and a rebase onto
+  current `origin/main`. No gate was added: the deferred drift test (#670)
+  asserts a genuinely failable property (pattern set == documented set) and is
+  left as its own issue rather than bolted onto this chore PR.
 
 Out-of-scope findings filed rather than absorbed: **#669** (single-writer
-requested review / deadlock — found cycle 1, confirmed cycles 2–3),
-**#670** (doc↔CODEOWNERS drift test — cycle 1), **#671**
+requested review — found cycle 1, confirmed cycles 2–3), **#670**
+(doc↔CODEOWNERS drift test — cycle 1), **#671**
 (`check-doc-affiliation.cjs --all` red on `main` — cycle 1 bug-scanner),
 **#672** (agent-infra's own pre-commit hook never runs; `npx lint-staged` has
-no config — cycle 1 verification).
+no config — cycle 1 verification), **#713** (the gate grades a PR with that
+PR's own gate script — premise-correction pass).
 
 ## Out of Scope / Accepted Residual Gaps
 
 - Enabling `required_pull_request_reviews` (branch protection) is out of scope
   and is **not** #646: #646 covers required *status checks* only. CODEOWNERS
-  cannot become blocking until that setting is enabled **and** a second
-  approving identity exists (a single-writer repo deadlocks otherwise) —
-  tracked as **#669**. Noted in the PR body as the follow-up.
+  cannot become binding until that setting is enabled, a second approving
+  identity exists, **and** `enforce_admins: true` is set — without the last, the
+  sole admin overrides at every merge rather than hitting a hard deadlock. The
+  identity half is tracked as **#669**; the admin-enforcement precondition was
+  added in the premise-correction pass. Noted in the PR body as the follow-up.
 - Reviewing docs/content paths generally (explicit #667 non-goal).
 - `extensions/sequence-enforcer/**`, dependency manifests inside the guarded
   extension dirs, `sync-ci-workflows.sh` and friends, and `.husky/pre-commit`
   are deliberately unguarded — reasons table in `docs/ops/guarded-paths.md` §2.
-- A doc↔CODEOWNERS drift test is **not** added here (no new CI surface in a
-  chore PR); the matching is verified by inspection/probe in this PR and is
-  filed as **#670**.
+- A doc↔CODEOWNERS drift test is deliberately **not** added here (no new CI
+  surface in a chore PR); the pattern set is a genuinely assertable property,
+  verified by inspection/probe in this PR, and the automated form is filed as
+  **#670**.
 - CODEOWNERS cannot produce a visible requested review while the sole owner
-  authors every PR, and required code-owner review would deadlock a single-writer
-  repo → **#669** (not #646, which covers required *status checks* only).
+  authors every PR, and required code-owner review would — with
+  `enforce_admins: false` — amount to an admin override on every merge rather
+  than a hard deadlock → **#669** (not #646, which covers required *status
+  checks* only).
+- The gate grades a PR with that PR's own checked-out copy of
+  `pipeline-compliance.yml` + `check-pipeline-compliance.sh` (the workflow's
+  documented no-auto-fetch design), so a PR that rewrites the gate is graded by
+  its rewrite → **#713**. Unaddressed here deliberately: fixing it changes the
+  gate's execution model, which is not a chore-PR change.
 - Unrelated pre-existing findings filed while verifying: **#671**, **#672**.
