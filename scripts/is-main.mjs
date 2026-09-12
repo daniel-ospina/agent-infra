@@ -60,9 +60,16 @@
  * component of the invocation route (`fs.rmSync` of the link/ancestor) after the
  * module was loaded makes `argv[1]` unresolvable while both paths still name the
  * SAME file — so the #254 gate went back to exiting 0 with 0 bytes of output.
+ * Review cycle 3 then refuted the SAME inference in the `dirname` fallback:
+ * a differing `realpath(dirname(…))` is not proof either, because a symlinked
+ * LEAF reports the symlink's parent rather than its target's, so a removed
+ * target reaches a quiet `IMPORTED` with different dirnames. Both branches now
+ * fall through to UNRESOLVED unless the dirnames are EQUAL.
  * The carve-out above keys on the repo's existing bun-virtual detector
  * (`extensions/builtin-tools/index.ts:161`, `extensions/subagent/index.ts:439`)
- * instead, which is a property of the PATH rather than of a failed syscall.
+ * instead, which is a property of the PATH rather than of a failed syscall —
+ * and it is paired with a non-existence check, so a real path can never be read
+ * as virtual.
  *
  * `metaUrl` IS REQUIRED AND HAS NO DEFAULT, deliberately: a default of this
  * module's own `import.meta.url` would make the natural one-argument call
@@ -90,7 +97,10 @@ export const WARN_PREFIX = '[is-main]';
  * Is this a VIRTUAL entry path — one that never had a filesystem existence, so
  * it cannot be `self`? This repo already carries the detector twice:
  * `extensions/builtin-tools/index.ts:161` and `extensions/subagent/index.ts:439`
- * both special-case a bun-compiled pi's `/$bunfs/root/…` entry.
+ * both special-case a bun-compiled pi's `/$bunfs/root/…` entry. Deliberately
+ * NOT broader: only `/$bunfs/root/`, matching those two detectors exactly
+ * (review cycle 3: a broader prefix is satisfiable by a real path, so it is not
+ * the "positive signal" this module promises).
  *
  * This is a POSITIVE signal, and it is the ONLY quiet `IMPORTED` we accept for
  * an unresolvable `argv[1]`. Inferring "not us" from a FAILED resolution is
@@ -100,7 +110,13 @@ export const WARN_PREFIX = '[is-main]';
  * different file" and the gate would no-op silently — see the header.
  */
 export function isVirtualEntryPath(p) {
-  return typeof p === 'string' && p.startsWith('/$bunfs/');
+  // `/$bunfs/root/` exactly, matching both in-repo detectors. A broader
+  // `/$bunfs/…` prefix would classify a REAL file under a root-level `$bunfs`
+  // directory (a root-owned CI/Docker container can create one) as virtual →
+  // quiet `IMPORTED` → silent no-op, the #708 class. Callers must ALSO require
+  // that the path does not resolve (see `classifyEntry`): the marker is a naming
+  // convention, not proof of non-existence.
+  return typeof p === 'string' && p.startsWith('/$bunfs/root/');
 }
 
 /** `fs.realpathSync` or `null` — never throws. */
@@ -156,10 +172,12 @@ export function classifyEntry(metaUrl, argv1 = process.argv[1]) {
   }
 
   // VIRTUAL entry path — a bun-compiled pi's `/$bunfs/root/…` (the repo's own
-  // detector, see isVirtualEntryPath). It never had a filesystem existence, so
-  // it cannot be `self`; quiet IMPORTED keeps every bun-pi session clean. This
-  // is the ONLY quiet answer for an unresolvable `argv[1]`.
-  if (isVirtualEntryPath(entry)) {
+  // detector, see isVirtualEntryPath). Two conditions, and BOTH are required:
+  // the marker, AND no filesystem existence. The marker alone is a naming
+  // convention — a real file under a root-level `$bunfs` directory would
+  // otherwise be read as virtual and silently no-op (review cycle 3). Together
+  // they are the ONLY quiet answer for an unresolvable `argv[1]`.
+  if (isVirtualEntryPath(entry) && realpathOrNull(entry) === null) {
     return { verdict: IMPORTED, reason: 'virtual-entry', self, argv1: entry };
   }
 
@@ -174,15 +192,22 @@ export function classifyEntry(metaUrl, argv1 = process.argv[1]) {
   }
 
   // One side is unresolvable (deleted mid-run, EACCES, ELOOP). #675 P2-f: a
-  // symlinked ANCESTOR still resolves via dirname, so compare
-  // realpath(dirname) + basename before giving up.
+  // symlinked ANCESTOR still resolves via dirname, so an EQUAL
+  // realpath(dirname) + basename proves ENTRY even with a vanished leaf.
+  //
+  // ⚠️ A DIFFERING dirname proves NOTHING — review cycle 3 refuted that
+  // inference, and it is the same mistake cycle 2 made in a different branch.
+  // `realpath(dirname(argv[1]))` reports the SYMLINK's own parent, not its
+  // target's, so a symlinked LEAF whose target (this very file) has been removed
+  // leaves both sides unresolvable with different dirnames while still naming
+  // the SAME file. Returning `IMPORTED` there put the #254 gate back to exit 0
+  // with 0 bytes of output — byte-identical to a clean run. Hence: only an
+  // EQUAL dirname returns ENTRY; inequality falls through to UNRESOLVED below.
   if (path.basename(self) === path.basename(entry)) {
     const selfDir = realpathOrNull(path.dirname(self));
     const entryDir = realpathOrNull(path.dirname(entry));
-    if (selfDir !== null && entryDir !== null) {
-      return selfDir === entryDir
-        ? { verdict: ENTRY, reason: 'dirname-realpath', self, argv1: entry }
-        : { verdict: IMPORTED, reason: 'dirname-differ', self, argv1: entry };
+    if (selfDir !== null && entryDir !== null && selfDir === entryDir) {
+      return { verdict: ENTRY, reason: 'dirname-realpath', self, argv1: entry };
     }
   }
 

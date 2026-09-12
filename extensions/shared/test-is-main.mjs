@@ -30,6 +30,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   classifyEntry,
   isMain,
+  isVirtualEntryPath,
   realpathOrNull,
   selfPathFromUrl,
   ENTRY,
@@ -182,15 +183,65 @@ console.log('── Part A — classifyEntry / isMain (decision table) ──');
   );
 }
 
-// A8 — vanished leaf in a *different* directory → IMPORTED (dirname differs).
+// A8 — THE DESTROYED SYMLINKED LEAF. Review cycle 3 refuted the previous
+// fixture here (`dirname-differ` → a quiet `IMPORTED`), exactly as cycle 2's
+// `argv1-unresolvable-different` was refuted before it. `realpath(dirname(
+// argv[1]))` reports the SYMLINK's own parent, not its target's, so a symlinked
+// leaf whose target (this very file) was removed leaves BOTH sides unresolvable
+// with DIFFERENT dirnames while still naming the same file. Answering `IMPORTED`
+// there is the #708 bug: the #254 gate exits 0 with 0 bytes of output.
+// A differing dirname is not proof — only an EQUAL one is (A7).
 {
-  const tmp = tmpDir('vanish-diff');
-  const a = join(tmp, 'a');
-  const b = join(tmp, 'b');
-  mkdirSync(a);
-  mkdirSync(b);
-  const info = classifyEntry(pathToFileURL(join(a, 'ghost.mjs')).href, join(b, 'ghost.mjs'));
-  check('A8 vanished leaf, different dir → IMPORTED(dirname-differ)', info.verdict === IMPORTED, JSON.stringify(info));
+  const tmp = tmpDir('leaf-gone');
+  const realdir = join(tmp, 'realdir');
+  const otherdir = join(tmp, 'otherdir');
+  mkdirSync(realdir);
+  mkdirSync(otherdir);
+  const realLeaf = join(realdir, 'gate.mjs');
+  const linkLeaf = join(otherdir, 'gate.mjs');
+  writeFileSync(realLeaf, '// fixture\n');
+  symlinkSync(realLeaf, linkLeaf, 'file');
+
+  // Sanity: with the target present this is a plain ENTRY via the realpath
+  // compare, so the fixture really is the symlinked-leaf shape.
+  const live = classifyEntry(pathToFileURL(realLeaf).href, linkLeaf);
+  check('A8a live symlinked leaf → ENTRY(realpath) (the fixture is real)', live.verdict === ENTRY, JSON.stringify(live));
+
+  rmSync(realLeaf, { force: true }); // dangling route: target removed after load
+  check(
+    'A8b fixture is genuinely destroyed (both sides unresolvable, dirs differ)',
+    realpathOrNull(realLeaf) === null &&
+      realpathOrNull(linkLeaf) === null &&
+      realpathOrNull(dirname(realLeaf)) !== realpathOrNull(dirname(linkLeaf)),
+  );
+  const info = classifyEntry(pathToFileURL(realLeaf).href, linkLeaf);
+  check(
+    'A8c destroyed symlinked leaf → UNRESOLVED (NOT IMPORTED via dirname differences)',
+    info.verdict === UNRESOLVED && info.reason === 'unresolvable-ambiguous',
+    JSON.stringify(info),
+  );
+  let warn = '';
+  let verdict;
+  warn = captureStderr(() => {
+    verdict = isMain(pathToFileURL(realLeaf).href, linkLeaf);
+  });
+  check(
+    'A8d destroyed symlinked leaf FAILS CLOSED: isMain → true + loud',
+    verdict === true && warn.includes(WARN_PREFIX) && warn.includes('FAIL-CLOSED'),
+    JSON.stringify({ verdict, warn }),
+  );
+
+  // The ghost-file variant (nothing ever existed, different dirs, same basename).
+  const ga = join(tmp, 'ghost-a');
+  const gb = join(tmp, 'ghost-b');
+  mkdirSync(ga);
+  mkdirSync(gb);
+  const ghost = classifyEntry(pathToFileURL(join(ga, 'ghost.mjs')).href, join(gb, 'ghost.mjs'));
+  check(
+    'A8e vanished leaf in another dir → UNRESOLVED (differing dirname is not proof)',
+    ghost.verdict === UNRESOLVED,
+    JSON.stringify(ghost),
+  );
 }
 
 // A9 — UNRESOLVED leaves: cannot prove either way → never a silent false.
@@ -242,6 +293,32 @@ console.log('── Part A — classifyEntry / isMain (decision table) ──');
     bunVerdict = isMain(pathToFileURL(HELPER).href, '/$bunfs/root/pi.ts');
   });
   check('A9d-b virtual entry is quiet (no per-session noise under bun pi)', bunVerdict === false && bunWarn === '', JSON.stringify({ bunVerdict, bunWarn }));
+
+  // The marker is deliberately NARROW (review cycle 3: a broader `/$bunfs/`
+  // prefix is satisfiable by a REAL path — a root-level `$bunfs` dir in a
+  // root-owned container/CI — which would be a silent no-op), and it is paired
+  // with a non-existence check in `classifyEntry`.
+  check(
+    'A9d-c virtual marker is exactly /$bunfs/root/ (never a broader prefix)',
+    isVirtualEntryPath('/$bunfs/root/pi.ts') === true &&
+      isVirtualEntryPath('/$bunfs/other/pi.ts') === false &&
+      isVirtualEntryPath('/$bunfs/pi.ts') === false &&
+      isVirtualEntryPath('/$BUNFS/root/pi.ts') === false &&
+      isVirtualEntryPath('/$bunfsroot/pi.ts') === false,
+    JSON.stringify({
+      root: isVirtualEntryPath('/$bunfs/root/pi.ts'),
+      other: isVirtualEntryPath('/$bunfs/other/pi.ts'),
+    }),
+  );
+  // The existence half cannot be exercised here (it needs a root-level `$bunfs`
+  // directory), so it is pinned statically — C6e does the same for the shipped
+  // copy in provider-failover.ts.
+  check(
+    'A9d-d the canonical classifier requires BOTH the marker AND non-existence',
+    /isVirtualEntryPath\(entry\)\s*&&\s*realpathOrNull\(entry\)\s*===\s*null/.test(
+      stripComments(readFileSync(HELPER, 'utf8')),
+    ),
+  );
 }
 
 // A9e — the destroyed route, for real: a symlinked ANCESTOR that names this very
@@ -514,6 +591,69 @@ check(
   );
 }
 
+// B7c — THE DESTROYED SYMLINKED LEAF at the process level (review cycle 3's P0),
+// against a guard built on the REAL canonical module. Invoked through a symlinked
+// LEAF whose target is removed before the guard runs, so `import.meta.url` no
+// longer resolves, `process.argv[1]` (the dangling link) never did, and the two
+// dirnames differ. An earlier revision called that `IMPORTED` and stayed silent.
+{
+  const tmp = tmpDir('leaf-gone-e2e');
+  const realdir = join(tmp, 'realdir');
+  const otherdir = join(tmp, 'otherdir');
+  mkdirSync(realdir);
+  mkdirSync(otherdir);
+  const fixture = join(realdir, 'gate.mjs');
+  const route = join(otherdir, 'gate.mjs');
+  writeFileSync(
+    fixture,
+    [
+      `import fs from 'node:fs';`,
+      `import { fileURLToPath } from 'node:url';`,
+      `import { isMain } from ${JSON.stringify(pathToFileURL(HELPER).href)};`,
+      // Remove our OWN real path before the guard runs — the invocation route was
+      // a symlinked leaf, and it is now dangling (the #675 P2-f shape, leaf flavour).
+      `fs.rmSync(fileURLToPath(import.meta.url), { force: true });`,
+      `if (isMain(import.meta.url, process.argv[1])) { console.log('GATE-RAN'); process.exitCode = 1; }`,
+      `else { console.log('GATE-SKIPPED'); }`,
+    ].join('\n'),
+  );
+  symlinkSync(fixture, route, 'file');
+  const destroyedLeaf = node([route]);
+  check(
+    'B7c destroyed symlinked leaf — the guard RUNS (never a silent skip)',
+    destroyedLeaf.stdout.includes('GATE-RAN') && destroyedLeaf.status === 1,
+    `status=${destroyedLeaf.status} stdout=${JSON.stringify(destroyedLeaf.stdout)} stderr=${JSON.stringify(destroyedLeaf.stderr)}`,
+  );
+  check(
+    'B7d destroyed symlinked leaf — the ambiguity is VISIBLE on stderr',
+    destroyedLeaf.stderr.includes(WARN_PREFIX),
+    JSON.stringify(destroyedLeaf.stderr.slice(0, 300)),
+  );
+
+  // Paired positive control on the SAME shape with the target intact: the guard
+  // runs via the realpath fast path and stays QUIET (the live-leaf branch).
+  const tmp2 = tmpDir('leaf-live-e2e');
+  const liveGateDir = join(tmp2, 'realdir');
+  mkdirSync(liveGateDir);
+  const liveGate = join(liveGateDir, 'gate.mjs');
+  const liveRoute = join(tmp2, 'gate.mjs');
+  writeFileSync(
+    liveGate,
+    [
+      `import { isMain } from ${JSON.stringify(pathToFileURL(HELPER).href)};`,
+      `if (isMain(import.meta.url, process.argv[1])) { console.log('GATE-RAN'); }`,
+      `else { console.log('GATE-SKIPPED'); }`,
+    ].join('\n'),
+  );
+  symlinkSync(liveGate, liveRoute, 'file');
+  const liveLeaf = node([liveRoute]);
+  check(
+    'B7e live symlinked leaf — the guard RUNS and is QUIET (fast path, no warning)',
+    liveLeaf.stdout.includes('GATE-RAN') && !liveLeaf.stderr.includes(WARN_PREFIX),
+    `status=${liveLeaf.status} stdout=${JSON.stringify(liveLeaf.stdout)} stderr=${JSON.stringify(liveLeaf.stderr)}`,
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PART C — static tripwire: no non-realpath'd entry-point comparison
 // ═══════════════════════════════════════════════════════════════════════════
@@ -775,11 +915,22 @@ check(
     `${(block.match(/return true/g) || []).length} occurrences`,
   );
   check('C6d no cross-layer import of scripts/ from the shipped extension', !/from\s+["'][^"']*\.\.\/\.\.\/scripts\//.test(pf));
-  // C6e — the LOUD half (review cycle 2: unpinned, so reverting the branch to an
-  // unconditional silent `return false` kept C6c green).
+  // C6e — the LOUD half. Tightened in review cycle 3: the first version asserted
+  // only token PRESENCE, so reverting the branch to a `path.basename`-gated write
+  // kept it green. It must be an UNCONDITIONAL write inside the catch, keyed on
+  // the narrowed marker, with the existence half pinned.
   check(
-    'C6e ambiguity branch emits a loud stderr line, gated on the /$bunfs/ marker',
-    /startsWith\('\/\$bunfs\/'\)/.test(block) && /process\.stderr\.write/.test(block),
+    'C6e ambiguity branch warns UNCONDITIONALLY in the catch (no basename gate), /$bunfs/root/ + non-existence',
+    block.includes("startsWith('/$bunfs/root/')") &&
+      block.includes('!fs.existsSync(resolved)') &&
+      /}\s*catch\s*{[^}]*process\.stderr\.write/.test(block) &&
+      !/path\.basename/.test(block),
+    JSON.stringify({
+      marker: block.includes("startsWith('/$bunfs/root/')"),
+      existsSync: block.includes('!fs.existsSync(resolved)'),
+      unconditionalWrite: /}\s*catch\s*{[^}]*process\.stderr\.write/.test(block),
+      basenameGate: /path\.basename/.test(block),
+    }),
   );
 }
 

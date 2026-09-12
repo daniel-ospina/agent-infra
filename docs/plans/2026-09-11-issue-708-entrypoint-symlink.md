@@ -115,8 +115,8 @@ classifyEntry(metaUrl, argv1) → { verdict, reason, self, argv1 }
 | Verdict | When | `isMain()` |
 |---|---|---|
 | `ENTRY` | literal match, realpath match (symlinked ancestor **or** leaf), or dirname-realpath + basename match | `true` |
-| `IMPORTED` | **no** `argv[1]` (REPL / `node -e` / plain import); a comparison that RESOLVED on both sides and differs; or a recognized **virtual** entry path (`/$bunfs/…`) | `false` |
-| `UNRESOLVED` | our **own** module path is unresolvable (or both sides are), so nothing about the invocation is provable | **loud warning + `true`** |
+| `IMPORTED` | **no** `argv[1]` (REPL / `node -e` / plain import); a comparison that RESOLVED on both sides and differs; or a recognized **virtual** entry path (`/$bunfs/root/…`) that also has **no** filesystem existence | `false` |
+| `UNRESOLVED` | nothing about the invocation is provable — our own path is unresolvable, or an unresolvable `argv[1]` with matching basenames but only *differing* dirnames (a non-virtual one included) | **loud warning + `true`** |
 
 `IMPORTED` is the quiet answer **only when it is proven** — a false `IMPORTED` is the silent no-op
 this module exists to prevent, so every branch is a proof rather than a guess. `UNRESOLVED → true`
@@ -134,7 +134,7 @@ module's own URL, so the natural one-argument call `isMain()` would compare `arg
 reintroduced by an omitted argument. An omitted `metaUrl` is instead an unresolvable self →
 `UNRESOLVED` → loud + fail-closed.
 
-#### Review cycles 1–2 folded in — and a cycle-2 P0 that cycle 3 fixed
+#### Review cycles 1–3 folded in — two P0s, and one rule they both broke
 
 Review round 1 found a P1 **introduced by the first revision** of this PR, and round 2 found a P0
 introduced by the *second*. Both are recorded here because they are the same lesson twice: for
@@ -161,21 +161,52 @@ exiting 0 with **0 bytes of output** — byte-identical to a clean run. All thre
 reproduced it independently, and `scripts/check-workflow-lock.mjs`'s `sameRealPath` already states
 the rule: *"cannot resolve" is not "a different file"*.
 
-**Round 3 (the fix, and the final rule).** The quiet answer is keyed on a **positive** signal — the
-repo's own bun-virtual detector (`/$bunfs/…`) — and nothing else:
+**Round 3 (cycle-2's successor, and the rule it settled on).** The quiet answer is keyed on a
+**positive** signal — the repo's own bun-virtual detector, narrowed to `/$bunfs/root/` and paired
+with a non-existence check — and nothing else:
 
 | verdict | `isMain()` |
 |---|---|
-| `IMPORTED` — no `argv[1]`; a comparison that resolved on both sides and differs; a recognized virtual entry path | `false`, quiet |
+| `IMPORTED` — no `argv[1]`; a comparison that resolved on both sides and differs; a recognized virtual entry path that does **not** resolve | `false`, quiet |
 | `UNRESOLVED` — anything else unprovable, including a *non-virtual* unresolvable `argv[1]` with a resolvable `self` | warn loudly **and run** |
 
 `provider-failover.ts` keeps its site-specific direction (its body launches a latch-mutating CLI, so
-it warns and **declines to run** — never silently skips), now with the same virtual-entry carve-out,
+it warns and **declines to run** — never silently skips), with the same virtual-entry carve-out,
 which is what keeps a bun-pi session quiet.
 
-Verified after the round-3 fix: the destroyed-route shape runs the gate (count line + P0 + an
-`[is-main]` line on stderr) instead of exiting 0; the bun-virtual import stays quiet; and the
-`--clear '*'` import leaves the latch byte-identical while emitting the loud line.
+**Round 3's review then found one more P0 — in the `dirname` fallback of this very fix.** The
+fallback returned a quiet `IMPORTED` whenever the basenames matched and
+`realpath(dirname(…))` merely **differed**, on the theory that a different directory means a
+different file. False again, and for the same reason as round 2: `realpath(dirname(argv[1]))`
+reports the **symlink's own parent**, not its target's. A symlinked **leaf** whose target (this
+file) is removed after load therefore leaves both sides unresolvable with *different* dirnames
+while still naming the same file — and the #254 gate went back to exit 0 with **0 bytes of output**.
+Both the adversarial reviewer and the second-model gate reproduced it independently (P0 at
+confidence 95 and 85), and it was **not** theoretical: measured against the real gate, through a
+symlinked leaf whose target a pre-guard import deletes,
+
+```
+pre-fix classifier (2d6e215):  exit=0  stdout_bytes=0    stderr_bytes=0
+            this revision:      exit=1  stdout="1 SKILL.md files checked. 1 issue(s)." + [P0]
+                                + an [is-main] FAIL-CLOSED line on stderr
+```
+
+The fix removes the inference entirely: only an **EQUAL** dirname returns `ENTRY`; inequality falls
+through to `UNRESOLVED`. The virtual marker was also narrowed to the exact `/$bunfs/root/` prefix
+both in-repo detectors use and paired with a non-existence check, because a broader `/$bunfs/`
+prefix is satisfiable by a **real** path (a root-level `$bunfs` directory) and a marker alone is a
+naming convention, not a proof. Tests added for it: A8a–A8e (the destroyed leaf, unit level),
+B7c/B7d (the same shape at the process level, against the real helper) and B7e (the live-leaf
+positive control); C6e was tightened from a token-presence check to "unconditional write inside the
+catch, no basename gate". Red proofs: the old idiom still yields **8 failures**
+(B2/B2b/B3/B3b/B7/B7b/C1/C7), and restoring the *cycle-2* `dirname-differ` classifier yields
+**5 failures** (A8c/A8d/A8e/B7c/B7d, with B7c printing `GATE-SKIPPED` and an empty stderr).
+
+⚠️ **This round-3 fix is UNREVIEWED.** The 3-cycle review budget was exhausted at this point, and
+the review protocol is explicit that a fix without a fresh re-review is not a clean review. So the
+PR is **left open** as an escalation rather than merged, with the residuals recorded below and the
+remaining P2s filed as issues (#826, #827, #831). The `Closes #708` claim is therefore **not**
+fulfilled yet.
 
 ### 3. `extensions/shared/provider-failover.ts` gets an inline equivalent, deliberately
 
@@ -257,8 +288,12 @@ helper-only unit test *would not have caught this bug*):
 - `scripts/probe-frontmatter-fixtures.mjs` likewise has no behavioural symlink test — its `main()`
   needs a live pi install. Covered by C7 + shared-helper behaviour.
 - The Part C static tripwire is **heuristic by design**; its blind spots are pinned as positive
-  fixtures (C5) rather than claimed away, and the remaining ones (wrapper/ternary indirection)
-  are accepted.
+  fixtures (C5) rather than claimed away, with **one proven exception**: a stray realpath *call* on
+  an argv-ish path still exempts a whole file even when the result never reaches the `isMain`
+  comparison, so a symlink-sensitive guard can pass C1 green. Filed as **#831** by review cycle 3
+  (which also found that the suite's `process.on('exit', cleanup)` registration is unreachable for a
+  throw — same issue). Its C6e assertion was tightened in that cycle (unconditional write inside the
+  catch, no basename gate, existence half pinned).
 - `scripts/check-workflow-lock.mjs`'s innermost `catch { return false }` (~line 414) still no-ops
   silently when both paths are unresolvable — same class, not the symlink case, and migrating it
   means editing the pin gate's own `const IS_MAIN =` fixture anchor. Filed as **#826** by review
@@ -273,7 +308,7 @@ helper-only unit test *would not have caught this bug*):
 |---|---|---|
 | reproduction, before | repro B/C above | exit 0, empty stdout (bug) |
 | reproduction, after | repro B/C above | exit 1, same count line as control |
-| new regression suite | `node extensions/shared/test-is-main.mjs` | 64 passed / 0 failed |
+| new regression suite | `node extensions/shared/test-is-main.mjs` | 73 passed / 0 failed |
 | #744 module-load pin | `node extensions/main-worktree-guard/test-module-load.mjs` | **49 passed / 0 failed** |
 | #709 discard gate | `node extensions/main-worktree-guard/test-discard-gate.mjs` | 314 passed / 0 failed |
 | lint suite | `node scripts/check-skill-lint.test.mjs` | 160 passed / 0 failed |
@@ -285,4 +320,8 @@ helper-only unit test *would not have caught this bug*):
 | cycle-2 regression: destroyed route | a driver deletes its own symlinked route, then imports the gate (test B7) | the gate RUNS (count line + P0) and warns, never silent exit 0 |
 | cycle-1 regression: latch preserved | import `provider-failover.ts` with `--clear '*'` and a virtual `argv[1]` | quiet; latch file byte-identical |
 | cycle-3: non-virtual unresolvable entry | same import with a bogus non-virtual `argv[1]` | loud `[is-main]` line; latch byte-identical; CLI not run |
-| TDD red | temporarily restore the old idiom at `check-skill-lint.mjs` | 8 RED (56 passed, 8 failed) — B2/B3 families, B7/B7b, C1, C7 |
+| TDD red (old idiom) | temporarily restore the old idiom at `check-skill-lint.mjs` | 8 RED (65 passed, 8 failed) — B2/B3 families, B7/B7b, C1, C7 |
+| TDD red (cycle-2 classifier) | temporarily restore `dirname-differ → IMPORTED` | 5 RED (68 passed, 5 failed) — A8c/A8d/A8e, B7c/B7d (`GATE-SKIPPED`, empty stderr) |
+| real-gate destroyed leaf | symlinked leaf + a pre-guard import that deletes its target | exit 1, count line + `[P0]`, loud `[is-main]` — vs **exit 0 / 0 bytes** on the pre-fix classifier |
+| shipped extension, ambiguity | import `provider-failover.ts` with a non-virtual bogus `argv[1]` + `--clear '*'` | importer rc 0, loud `[is-main]` line, **latch byte-identical** (CLI not run) |
+| shipped extension, virtual | same import with `/$bunfs/root/pi.ts` | quiet (0 stderr bytes), latch untouched |

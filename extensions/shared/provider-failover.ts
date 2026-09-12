@@ -1392,9 +1392,13 @@ const isDirectEntry = (() => {
     const self = fileURLToPath(import.meta.url);
     const resolved = path.resolve(entry);
     if (resolved === self) return true;
-    // A bun-compiled pi's virtual entry never had a filesystem existence, so it
-    // cannot be this file: quiet (this fires in every such session).
-    if (resolved.startsWith('/$bunfs/')) return false;
+    // A bun-compiled pi's virtual entry: `/$bunfs/root/` exactly (the marker
+    // `getPiInvocation` special-cases at extensions/builtin-tools/index.ts:161)
+    // AND no filesystem existence — the marker alone is a naming convention, so
+    // a REAL file under a root-level `$bunfs` directory must fall through to the
+    // realpath compare below instead of silently no-opping (#708, review cycle
+    // 3). This fires in every bun session, so it stays quiet.
+    if (resolved.startsWith('/$bunfs/root/') && !fs.existsSync(resolved)) return false;
     try {
       return fs.realpathSync(resolved) === fs.realpathSync(self);
     } catch {
