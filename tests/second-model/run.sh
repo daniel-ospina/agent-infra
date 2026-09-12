@@ -778,6 +778,24 @@ bash "$GUARD" --equivalence 'deepseek/deepseek-v4-pro/' --live-dir "$FIX/clean" 
 # --check/--equivalence reject, and never emit a reserved/placeholder id.
 run_guard 2 "--print on empty-equivalence is exit 2 (G2)" --print --live-dir "$FIX/empty-equivalence"
 run_guard 2 "--print on misconfigured-equivalence is exit 2 (G2)" --print --live-dir "$FIX/misconfigured-equivalence"
+# H2: `--print` must not short-circuit the shared validator / the id check
+# whenever `$SECOND_MODEL` is set — the old override branch returned from the
+# top of print mode, so these all exited 0 while `--check` exited 2.
+for bad in '**DEGRADED' none 'hello world'; do
+  SECOND_MODEL="$bad" bash "$GUARD" --print --live-dir "$FIX/clean" >"$OUT" 2>&1; code=$?
+  if [ "$code" -eq 2 ] && grep -q "not a dispatchable model id" "$OUT"; then
+    pass "H2: --print refuses the non-dispatchable override '$bad' (exit 2)"
+  else
+    fail "H2: --print emitted '$bad' with exit $code (expected a fail-closed exit 2)"; tail -5 "$OUT"
+  fi
+done
+SECOND_MODEL=deepseek/deepseek-v4-pro bash "$GUARD" --print --live-dir "$FIX/empty-equivalence" >"$OUT" 2>&1; code=$?
+if [ "$code" -eq 2 ]; then pass "H2: --print override cannot bypass an empty-equivalence fatal (exit 2, --check parity)"; else fail "H2: --print override laundered the empty-equivalence authority (expected 2, got $code)"; tail -5 "$OUT"; fi
+SECOND_MODEL=moonshot/kimi-k3 bash "$GUARD" --print --live-dir "$FIX/missing-config" >"$OUT" 2>&1; code=$?
+if [ "$code" -eq 2 ]; then pass "H2: --print override does not silence the missing-config fatal (exit 2)"; else fail "H2: --print override laundered the missing-config fatal (expected 2, got $code)"; tail -5 "$OUT"; fi
+# Positive control: a dispatchable override still prints verbatim (no over-block).
+SECOND_MODEL=moonshot/kimi-k3 bash "$GUARD" --print --live-dir "$FIX/clean" >"$OUT" 2>/dev/null; code=$?
+if [ "$code" -eq 0 ] && [ "$(cat "$OUT")" = "moonshot/kimi-k3" ]; then pass "H2: a dispatchable override still prints verbatim (exit 0)"; else fail "H2: valid override regressed (exit $code, '$(cat "$OUT")')"; fi
 PRBAD="$(mktemp -d /tmp/second-model-prbad.XXXXXX)"
 mk_pref_bad() { # <json-model-literal>
   # An EXTERNAL runtimeVia only WARNs, so the model-type/id guard is the only

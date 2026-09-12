@@ -93,7 +93,11 @@ list, each candidate's `runtimeVia` dispatch authority, the primary's
 **Dispatch contract (ONE rule — G6/G13).** `--print` is the **offline**
 resolver (never opens a socket): it returns the first build-independent
 candidate in `preference` order, or `$SECOND_MODEL` verbatim when the operator
-override is set. `--probe` is the **liveness gate and the dispatch authority**:
+override is set — but only after the same `load_authority()`/`validate()` the
+other modes run, and only when the override is a **dispatchable model id** (a
+reserved/placeholder/malformed override is exit 2, never a resolved reviewer;
+H2 closed the fail-open where the override returned before validation).
+`--probe` is the **liveness gate and the dispatch authority**:
 dispatch its `RESOLVED`. With no override, `--probe` walks the same ordered
 `preference` `--print` reads and resolves the first **solvent+reachable**
 candidate (so it equals `--print` whenever that candidate is live, and falls

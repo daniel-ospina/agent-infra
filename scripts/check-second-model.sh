@@ -23,7 +23,10 @@
 #                          0 = a usable id; 1 = no valid config candidate
 #                          (prints `**DEGRADED`); 2 = unusable authority
 #                          (missing/unparseable config, non-string or reserved
-#                          model, empty equivalence set — G2).
+#                          model, empty equivalence set — G2), or a
+#                          `$SECOND_MODEL` override that is not a dispatchable
+#                          model id (H2: the override is validated, never
+#                          returned verbatim-and-untrusted).
 #   --check                offline deterministic guard (default): validates
 #                          config shape, asserts every preference candidate is
 #                          present in the runtime authority, NOT in the
@@ -80,7 +83,12 @@
 # config-default fail-closed, operator-override-open-by-design. ONE contract
 # (G6/G13, also stated in docs/providers.md §Second-model gate — keep them in
 # sync): `--print` is the OFFLINE authority and returns the override verbatim
-# (with a WARN); `--probe` is the liveness gate and the DISPATCH authority —
+# (with a WARN) — but ONLY after the same load_authority()+validate() every
+# other mode runs, and ONLY when the override is a dispatchable model id. H2
+# closed the fail-open where the `if operator_override:` branch returned before
+# validation, so `--print` emitted `**DEGRADED` / `none` / `hello world` / a
+# build-equivalent id with exit 0 while `--check` exited 2 on the same config,
+# and the missing-config fatal did not apply at all.
 # dispatch its `RESOLVED`, which for the no-override case is the first
 # solvent+reachable candidate in the same ordered `preference` `--print` reads,
 # and WITH an override is the override itself (a matching preference entry is
@@ -843,10 +851,11 @@ if mode == "equivalence":
 
 # ── print mode (offline resolver for the gate skills) ───────────────────────
 if mode == "print":
-    if operator_override:
-        print(f"⚠️  second-model gate: $SECOND_MODEL={operator_override} operator override active — independence NOT asserted offline (config-default fail-closed, operator-override-open-by-design)", file=sys.stderr)
-        print(operator_override)
-        sys.exit(0)
+    # H2: load and validate the authority BEFORE honouring an operator
+    # override. The old code returned the override from the top of this block,
+    # so `--print` bypassed the SAME shared validate() the other modes run: it
+    # emitted `**DEGRADED`/`none`/`hello world`/a build-equivalent id with exit
+    # 0 while `--check` exited 2, and the missing-config fatal never applied.
     cfg, err = load_authority(authority) if authority else (None, "no authority path")
     if cfg is None:
         # A4: a missing/unparseable authority is exit 2, not 0. A caller doing
@@ -861,9 +870,11 @@ if mode == "print":
         print("❌ second-model gate: `preference` is not an array — the designation authority is unusable (fail closed)", file=sys.stderr)
         print("**DEGRADED")
         sys.exit(2)
-    if not pref_raw:
+    if not operator_override and not pref_raw:
         # A4: an EMPTY preference is a legitimate "no candidate" DEGRADED
-        # (exit 1), not an unusable authority.
+        # (exit 1), not an unusable authority. With an override set, validate()
+        # below treats the empty preference as a fatal (exit 2) — the override
+        # must not bypass a check --check performs (H2).
         print("⚠️  second-model gate: config has no usable `preference` list — DEGRADED", file=sys.stderr)
         print("**DEGRADED")
         sys.exit(1)
@@ -882,6 +893,16 @@ if mode == "print":
                 print(f"❌ {msg}", file=sys.stderr)
         print("**DEGRADED")
         sys.exit(2)
+    if operator_override:
+        # H2: a reserved/placeholder/malformed override is never a resolved
+        # reviewer. The old branch printed it verbatim with exit 0.
+        if not is_model_id(operator_override):
+            print(f"❌ second-model gate: $SECOND_MODEL={operator_override!r} is not a dispatchable model id — DEGRADED (fail closed; a reserved/placeholder/non-id override is never a resolved reviewer)", file=sys.stderr)
+            print("**DEGRADED")
+            sys.exit(2)
+        print(f"⚠️  second-model gate: $SECOND_MODEL={operator_override} operator override active — independence NOT asserted offline (config-default fail-closed, operator-override-open-by-design)", file=sys.stderr)
+        print(operator_override)
+        sys.exit(0)
     pref = [e for e in pref_raw if isinstance(e, dict)]
     # A4/G2: a real dispatchable model id is required, not merely a non-empty
     # string — `**DEGRADED`, `none`, `null`, `hello world` must never be
