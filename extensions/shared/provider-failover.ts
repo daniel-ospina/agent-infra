@@ -1394,11 +1394,21 @@ const isDirectEntry = (() => {
     if (resolved === self) return true;
     // A bun-compiled pi's virtual entry: `/$bunfs/root/` exactly (the marker
     // `getPiInvocation` special-cases at extensions/builtin-tools/index.ts:161)
-    // AND no filesystem existence — the marker alone is a naming convention, so
-    // a REAL file under a root-level `$bunfs` directory must fall through to the
-    // realpath compare below instead of silently no-opping (#708, review cycle
-    // 3). This fires in every bun session, so it stays quiet.
-    if (resolved.startsWith('/$bunfs/root/') && !fs.existsSync(resolved)) return false;
+    // AND no filesystem OBJECT at that path — the marker alone is a naming
+    // convention, so a REAL file under a root-level `$bunfs` directory must fall
+    // through to the realpath compare below instead of silently no-opping (#708).
+    // `lstat`, deliberately, NOT `existsSync`/`realpath`: both of those follow
+    // symlinks, so a DANGLING symlink under the marker reads as "never existed"
+    // when it is in fact a real object that names a target — which silently
+    // skipped this CLI (#708, review cycle 4; the same "cannot resolve is not a
+    // different file" rule). This fires in every bun session, so it stays quiet.
+    if (resolved.startsWith('/$bunfs/root/')) {
+      try {
+        fs.lstatSync(resolved);
+      } catch {
+        return false; // truly absent — the bun virtual entry; stay quiet
+      }
+    }
     try {
       return fs.realpathSync(resolved) === fs.realpathSync(self);
     } catch {

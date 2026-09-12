@@ -193,7 +193,7 @@ pre-fix classifier (2d6e215):  exit=0  stdout_bytes=0    stderr_bytes=0
 
 The fix removes the inference entirely: only an **EQUAL** dirname returns `ENTRY`; inequality falls
 through to `UNRESOLVED`. The virtual marker was also narrowed to the exact `/$bunfs/root/` prefix
-both in-repo detectors use and paired with a non-existence check, because a broader `/$bunfs/`
+both in-repo detectors use and paired with a no-filesystem-object check, because a broader `/$bunfs/`
 prefix is satisfiable by a **real** path (a root-level `$bunfs` directory) and a marker alone is a
 naming convention, not a proof. Tests added for it: A8a–A8e (the destroyed leaf, unit level),
 B7c/B7d (the same shape at the process level, against the real helper) and B7e (the live-leaf
@@ -202,11 +202,24 @@ catch, no basename gate". Red proofs: the old idiom still yields **8 failures**
 (B2/B2b/B3/B3b/B7/B7b/C1/C7), and restoring the *cycle-2* `dirname-differ` classifier yields
 **5 failures** (A8c/A8d/A8e/B7c/B7d, with B7c printing `GATE-SKIPPED` and an empty stderr).
 
-⚠️ **This round-3 fix is UNREVIEWED.** The 3-cycle review budget was exhausted at this point, and
-the review protocol is explicit that a fix without a fresh re-review is not a clean review. So the
-PR is **left open** as an escalation rather than merged, with the residuals recorded below and the
-remaining P2s filed as issues (#826, #827, #831). The `Closes #708` claim is therefore **not**
-fulfilled yet.
+**Round 4 (the re-review round 3 was escalated for — and the same rule one layer out).** The
+fresh-context review found the identical inference for a **fourth** time, now in the virtual-marker
+branch: its existence half was `realpathOrNull(entry) === null`, and `realpath` — like the shipped
+copy's `existsSync` — **follows symlinks**. A *dangling* symlink under `/$bunfs/root/` that names
+this file therefore reads as "never existed" and returns a quiet `IMPORTED`, so the gate no-ops
+silently again. The branch now asks the question that actually separates the cases —
+`lstatOrNull(entry) === null`, "no filesystem OBJECT at this path" — because a dangling symlink
+*is* an object that names a target. The shipped copy in `provider-failover.ts` moved from
+`!fs.existsSync(resolved)` to an `lstat` probe for the same reason. Tested: A9d-e pins the primitive
+(a dangling symlink has an `lstat` and no `realpath`), A9d-d and C6e pin the call sites, and
+reverting the classifier to the symlink-following test yields **1 failure (A9d-d)**. The
+precondition is privileged (a root-owned container must own `/$bunfs/root/`, and the entry's target
+must be deleted after module load), so the review rated it P1 rather than P0 — but it is the same
+fail-open, so it is fixed rather than deferred.
+
+This cycle-4 revision is itself going through a fresh-context re-review before merge, per protocol:
+a fix without a fresh re-review is not a clean review. Residuals recorded below and filed as issues
+(#826, #827, #831) were not chased.
 
 ### 3. `extensions/shared/provider-failover.ts` gets an inline equivalent, deliberately
 
@@ -308,7 +321,7 @@ helper-only unit test *would not have caught this bug*):
 |---|---|---|
 | reproduction, before | repro B/C above | exit 0, empty stdout (bug) |
 | reproduction, after | repro B/C above | exit 1, same count line as control |
-| new regression suite | `node extensions/shared/test-is-main.mjs` | 73 passed / 0 failed |
+| new regression suite | `node extensions/shared/test-is-main.mjs` | 74 passed / 0 failed |
 | #744 module-load pin | `node extensions/main-worktree-guard/test-module-load.mjs` | **49 passed / 0 failed** |
 | #709 discard gate | `node extensions/main-worktree-guard/test-discard-gate.mjs` | 314 passed / 0 failed |
 | lint suite | `node scripts/check-skill-lint.test.mjs` | 160 passed / 0 failed |
@@ -322,6 +335,8 @@ helper-only unit test *would not have caught this bug*):
 | cycle-3: non-virtual unresolvable entry | same import with a bogus non-virtual `argv[1]` | loud `[is-main]` line; latch byte-identical; CLI not run |
 | TDD red (old idiom) | temporarily restore the old idiom at `check-skill-lint.mjs` | 8 RED (65 passed, 8 failed) — B2/B3 families, B7/B7b, C1, C7 |
 | TDD red (cycle-2 classifier) | temporarily restore `dirname-differ → IMPORTED` | 5 RED (68 passed, 5 failed) — A8c/A8d/A8e, B7c/B7d (`GATE-SKIPPED`, empty stderr) |
+| TDD red (symlink-following object test) | temporarily restore `realpathOrNull(entry) === null` as the marker's existence half | 1 RED (73 passed, 1 failed) — A9d-d |
+| cycle-4: dangling symlink is an object | `lstat` on a symlink whose target is absent | `lstat` sees it; `realpath`/`existsSync` report nothing (A9d-e pins this) |
 | real-gate destroyed leaf | symlinked leaf + a pre-guard import that deletes its target | exit 1, count line + `[P0]`, loud `[is-main]` — vs **exit 0 / 0 bytes** on the pre-fix classifier |
 | shipped extension, ambiguity | import `provider-failover.ts` with a non-virtual bogus `argv[1]` + `--clear '*'` | importer rc 0, loud `[is-main]` line, **latch byte-identical** (CLI not run) |
 | shipped extension, virtual | same import with `/$bunfs/root/pi.ts` | quiet (0 stderr bytes), latch untouched |

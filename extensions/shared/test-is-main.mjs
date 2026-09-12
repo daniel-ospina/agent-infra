@@ -31,6 +31,7 @@ import {
   classifyEntry,
   isMain,
   isVirtualEntryPath,
+  lstatOrNull,
   realpathOrNull,
   selfPathFromUrl,
   ENTRY,
@@ -314,11 +315,26 @@ console.log('── Part A — classifyEntry / isMain (decision table) ──');
   // directory), so it is pinned statically — C6e does the same for the shipped
   // copy in provider-failover.ts.
   check(
-    'A9d-d the canonical classifier requires BOTH the marker AND non-existence',
-    /isVirtualEntryPath\(entry\)\s*&&\s*realpathOrNull\(entry\)\s*===\s*null/.test(
+    'A9d-d the canonical classifier keys the marker on NO filesystem object (`lstat`, not a symlink-following test)',
+    /isVirtualEntryPath\(entry\)\s*&&\s*lstatOrNull\(entry\)\s*===\s*null/.test(
       stripComments(readFileSync(HELPER, 'utf8')),
     ),
   );
+  // A9d-e — the object test must SEE a dangling symlink. `realpath`/`existsSync`
+  // FOLLOW the link and report "nothing here", so a dangling symlink under the
+  // marker used to reach a quiet `IMPORTED` (review cycle 4). `lstat` does not
+  // follow it, so the object is visible and the marker branch cannot fire.
+  {
+    const tmp = tmpDir('virt-dangling');
+    const target = join(tmp, 'gone.mjs');
+    const link = join(tmp, 'link.mjs');
+    symlinkSync(target, link, 'file'); // target deliberately never created
+    check(
+      'A9d-e a dangling symlink is an OBJECT (`lstat`) though it resolves to nothing (`realpath`)',
+      realpathOrNull(link) === null && lstatOrNull(link) !== null,
+      JSON.stringify({ realpath: realpathOrNull(link), lstatIsNull: lstatOrNull(link) === null }),
+    );
+  }
 }
 
 // A9e — the destroyed route, for real: a symlinked ANCESTOR that names this very
@@ -920,14 +936,16 @@ check(
   // kept it green. It must be an UNCONDITIONAL write inside the catch, keyed on
   // the narrowed marker, with the existence half pinned.
   check(
-    'C6e ambiguity branch warns UNCONDITIONALLY in the catch (no basename gate), /$bunfs/root/ + non-existence',
+    'C6e ambiguity branch warns UNCONDITIONALLY in the catch (no basename gate), /$bunfs/root/ + `lstat` object test',
     block.includes("startsWith('/$bunfs/root/')") &&
-      block.includes('!fs.existsSync(resolved)') &&
+      block.includes('fs.lstatSync(resolved)') &&
+      !block.includes('fs.existsSync(resolved)') &&
       /}\s*catch\s*{[^}]*process\.stderr\.write/.test(block) &&
       !/path\.basename/.test(block),
     JSON.stringify({
       marker: block.includes("startsWith('/$bunfs/root/')"),
-      existsSync: block.includes('!fs.existsSync(resolved)'),
+      lstatObjectTest: block.includes('fs.lstatSync(resolved)'),
+      existsSyncFollowsSymlink: block.includes('fs.existsSync(resolved)'),
       unconditionalWrite: /}\s*catch\s*{[^}]*process\.stderr\.write/.test(block),
       basenameGate: /path\.basename/.test(block),
     }),

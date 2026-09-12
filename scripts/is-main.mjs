@@ -114,15 +114,33 @@ export function isVirtualEntryPath(p) {
   // `/$bunfs/…` prefix would classify a REAL file under a root-level `$bunfs`
   // directory (a root-owned CI/Docker container can create one) as virtual →
   // quiet `IMPORTED` → silent no-op, the #708 class. Callers must ALSO require
-  // that the path does not resolve (see `classifyEntry`): the marker is a naming
-  // convention, not proof of non-existence.
+  // that NO FILESYSTEM OBJECT exists at the path (see `classifyEntry`): the
+  // marker is a naming convention, not proof of non-existence. That test must be
+  // `lstat`, never `realpath`/`existsSync` — see `lstatOrNull`.
   return typeof p === 'string' && p.startsWith('/$bunfs/root/');
 }
 
-/** `fs.realpathSync` or `null` — never throws. */
+/** `fs.realpathSync` or `null` — never throws. FOLLOWS symlinks. */
 export function realpathOrNull(p) {
   try {
     return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `fs.lstatSync` or `null` — never throws. Does NOT follow symlinks, which is
+ * the whole point: a DANGLING symlink is a real filesystem OBJECT that names a
+ * target, so it has an `lstat` but no `realpath`/`existsSync`. Asking those
+ * questions cannot tell "a lingering object naming this file" apart from "no
+ * path by that name ever existed" — and answering the latter as a quiet
+ * `IMPORTED` is the #708 silent no-op (review cycle 4). Use this for every
+ * "does anything exist here?" test.
+ */
+export function lstatOrNull(p) {
+  try {
+    return fs.lstatSync(p);
   } catch {
     return null;
   }
@@ -173,11 +191,19 @@ export function classifyEntry(metaUrl, argv1 = process.argv[1]) {
 
   // VIRTUAL entry path — a bun-compiled pi's `/$bunfs/root/…` (the repo's own
   // detector, see isVirtualEntryPath). Two conditions, and BOTH are required:
-  // the marker, AND no filesystem existence. The marker alone is a naming
-  // convention — a real file under a root-level `$bunfs` directory would
+  // the marker, AND no filesystem OBJECT at that path. The marker alone is a
+  // naming convention — a real file under a root-level `$bunfs` directory would
   // otherwise be read as virtual and silently no-op (review cycle 3). Together
   // they are the ONLY quiet answer for an unresolvable `argv[1]`.
-  if (isVirtualEntryPath(entry) && realpathOrNull(entry) === null) {
+  //
+  // ⚠️ The object test is `lstatOrNull`, NOT `realpathOrNull`/`existsSync`.
+  // Both of those FOLLOW symlinks, so a DANGLING symlink under the marker reads
+  // as "never existed" when it is a real object that names a target — which
+  // returned a quiet `IMPORTED` and silently no-opped the gate (review cycle 4;
+  // the same "cannot resolve is not a different file" mistake as cycles 2 and
+  // 3, one layer out). `lstat` sees the object, so this falls through to the
+  // realpath compare and, failing that, to `UNRESOLVED` — loud, and it runs.
+  if (isVirtualEntryPath(entry) && lstatOrNull(entry) === null) {
     return { verdict: IMPORTED, reason: 'virtual-entry', self, argv1: entry };
   }
 
