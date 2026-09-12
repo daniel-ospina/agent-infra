@@ -5,7 +5,8 @@
 // (vitest resolves TS natively now) and exercised with a mocked global fetch.
 
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +16,7 @@ import {
   captureToHosted,
   buildCloudPayload,
 } from "./index";
+import { resolveProjectRoot } from "../shared/capture-gate.js";
 
 // Replicate the pure functions inline (cannot import .ts extension in vitest with jiti)
 function extractText(content: unknown): string | null {
@@ -478,6 +480,10 @@ describe("#312 cloudConfig/isCloudEnabled", () => {
   });
 
   test("env vars (TORTOISE_API_KEY / TORTOISE_API_URL) win over file config — mirrors reflect-hook", () => {
+    // #803: this is CREDENTIAL + destination precedence only. The EGRESS toggle
+    // is deliberately the inverse — `cloud: true` in the operator file is the
+    // only enable, and TORTOISE_CAPTURE_CLOUD can only deny (see the #803
+    // describe below). Env-wins on the egress switch is what caused #803.
     const fromFile = cloudConfig({ autoCapture: true, apiUrl: "https://file.example.com", apiKey: "tt_file" });
     expect(fromFile.apiKey).toBe("tt_file");
     expect(fromFile.apiUrl).toBe("https://file.example.com");
@@ -493,6 +499,84 @@ describe("#312 cloudConfig/isCloudEnabled", () => {
       delete process.env.TORTOISE_API_KEY;
       delete process.env.TORTOISE_API_URL;
     }
+  });
+});
+
+describe("#803 capture egress gate (repo opt-out + env deny)", () => {
+  // #803: hosted capture is a data-egress decision. Both capture extensions now
+  // share extensions/shared/capture-gate.ts: `cloud: true` is the only enable;
+  // a repo file or the env flag may only DENY.
+  const dirs: string[] = [];
+  function tmpProject(cfg?: Record<string, unknown>): string {
+    const dir = mkdtempSync(join(tmpdir(), "capture-gate-"));
+    dirs.push(dir);
+    if (cfg) {
+      mkdirSync(join(dir, ".pi"), { recursive: true });
+      writeFileSync(join(dir, ".pi", "tortoise-capture.json"), JSON.stringify(cfg), "utf-8");
+    }
+    return dir;
+  }
+  afterEach(() => {
+    while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  test("cloud:true + key with no deny → enabled", () => {
+    expect(
+      isCloudEnabled({ autoCapture: true, cloud: true, apiKey: "tt_x" }, { projectDir: tmpProject(), env: {} }),
+    ).toBe(true);
+  });
+
+  test("per-repo opt-out (.pi/tortoise-capture.json {cloud:false}) denies despite cloud:true + key", () => {
+    expect(
+      isCloudEnabled(
+        { autoCapture: true, cloud: true, apiKey: "tt_x" },
+        { projectDir: tmpProject({ cloud: false }), env: {} },
+      ),
+    ).toBe(false);
+  });
+
+  test("TORTOISE_CAPTURE_CLOUD=0 denies despite cloud:true + key", () => {
+    expect(
+      isCloudEnabled(
+        { autoCapture: true, cloud: true, apiKey: "tt_x" },
+        { projectDir: tmpProject(), env: { TORTOISE_CAPTURE_CLOUD: "0" } },
+      ),
+    ).toBe(false);
+  });
+
+  test("env cannot ENABLE capture — TORTOISE_CAPTURE_CLOUD=1 without the file opt-in stays off", () => {
+    expect(
+      isCloudEnabled(
+        { autoCapture: true, apiKey: "tt_x" },
+        { projectDir: tmpProject(), env: { TORTOISE_CAPTURE_CLOUD: "1" } },
+      ),
+    ).toBe(false);
+  });
+
+  test("a repo file cannot ENABLE capture (cloud:true in the project file is ignored)", () => {
+    expect(
+      isCloudEnabled(
+        { autoCapture: true, apiKey: "tt_x" },
+        { projectDir: tmpProject({ cloud: true }), env: {} },
+      ),
+    ).toBe(false);
+  });
+
+  test("gate scope is the GIT ROOT — a subdirectory cwd still honors the repo opt-out", () => {
+    // Regression for the reviewer-found P0: the production call site passes
+    // `{ projectDir: resolveProjectRoot(ctx.cwd) }`, so launching pi from
+    // `repo/packages/x` must not bypass `<repo>/.pi/tortoise-capture.json`.
+    const dir = tmpProject({ cloud: false });
+    execSync("git init -q", { cwd: dir });
+    const sub = join(dir, "packages", "x");
+    mkdirSync(sub, { recursive: true });
+    expect(resolveProjectRoot(sub)).toBe(realpathSync(dir));
+    expect(
+      isCloudEnabled(
+        { autoCapture: true, cloud: true, apiKey: "tt_x" },
+        { projectDir: resolveProjectRoot(sub), env: {} },
+      ),
+    ).toBe(false);
   });
 });
 

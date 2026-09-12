@@ -13,11 +13,25 @@
 //
 // Config (env vars, fall back to ~/.pi/agent/tortoise-config.json):
 //   TORTOISE_API_URL    — hosted API base (default https://api.premiselabs.co)
-//   TORTOISE_API_KEY    — Bearer key (tt_...) required to enable hosted capture
+//   TORTOISE_API_KEY    — Bearer key (tt_...). A CREDENTIAL, not a consent gate:
+//                         the key alone does NOT enable uploads (#803).
+//   "cloud": true       — explicit hosted-capture OPT-IN in the config file. The
+//                         ONLY way to enable egress; env cannot enable it.
+//   TORTOISE_CAPTURE_CLOUD=0 — force capture OFF for a session (env may only deny).
+//   <repo>/.pi/tortoise-capture.json {"cloud": false} — per-repo opt-out; a repo
+//                         may only narrow the gate, never grant itself egress.
 //   TORTOISE_FALLBACK_DIR — local JSONL dir (default ~/.tortoise/session-events)
+//
+// #803: hosted capture is a DATA EGRESS decision and is gated by
+// extensions/shared/capture-gate.ts (explicit `cloud: true` + key + no repo/
+// env deny). The Tortoise key is shared with the MCP Bearer header (a graph
+// connection concern), so key presence must never imply consent to upload.
+//
+// Related: #775 (hosted client pointing at the wrong host, silently degraded) —
+// the startup gate line below always names the destination so a misconfigured
+// apiUrl is visible rather than inferred.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { execSync } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +42,12 @@ import {
   modelFromContext,
   type SessionAttribution,
 } from "./shared/capture-attribution.js";
+import {
+  captureStatusLine,
+  resolveCaptureGate,
+  resolveProjectRoot,
+  type CaptureGateResult,
+} from "./shared/capture-gate.js";
 
 // ── Config ─────────────────────────────────────────────────────
 
@@ -45,6 +65,8 @@ interface ReflectConfig {
   apiUrl: string;
   apiKey: string;
   team: string;
+  /** #803: explicit hosted-capture opt-in. Config FILE only — env cannot enable egress. */
+  cloud: boolean;
 }
 
 /** Export seam: loadConfig with optional injectable config path/env for tests (#611). */
@@ -69,7 +91,10 @@ export function loadConfig(opts?: {
     DEFAULT_API_URL;
   const team =
     (typeof file.team === "string" ? (file.team as string) : "") || DEFAULT_TEAM;
-  return { apiUrl: apiUrl.replace(/\/+$/, ""), apiKey: apiKey.trim(), team };
+  // #803: egress opt-in is read from the operator FILE only. `cloud` is NOT read
+  // from env — env may deny (TORTOISE_CAPTURE_CLOUD) but never grants upload rights.
+  const cloud = file.cloud === true;
+  return { apiUrl: apiUrl.replace(/\/+$/, ""), apiKey: apiKey.trim(), team, cloud };
 }
 
 /** Per-session model cache (per-process instance per extension). */
@@ -228,14 +253,40 @@ async function captureToHosted(
 
 // ── Extension entry point ──────────────────────────────────────
 
-export default function reflectHook(pi: ExtensionAPI): void {
-  const config = loadConfig();
+export function createReflectHook(
+  config: ReflectConfig,
+  opts?: { projectDir?: string; env?: NodeJS.ProcessEnv },
+): (pi: ExtensionAPI) => void {
+  const env = opts?.env ?? process.env;
+  const initProjectDir = opts?.projectDir ?? resolveProjectRoot(process.cwd());
+  const initGate = resolveCaptureGate({
+    cloud: config.cloud,
+    apiKey: config.apiKey,
+    projectDir: initProjectDir,
+    env,
+  });
+  // #803 O/I/T: one honest startup line stating ON/OFF and the destination.
   console.log(
-    config.apiKey
-      ? `[reflect-hook] enabled — hosted tortoise capture (${config.apiUrl})`
-      : `[reflect-hook] enabled — no TORTOISE_API_KEY; sessions will be saved to ${FALLBACK_DIR} until a key is configured`,
+    captureStatusLine({
+      gate: initGate,
+      apiUrl: config.apiUrl,
+      fallbackDir: FALLBACK_DIR,
+      configPath: CONFIG_PATH,
+      projectDir: initProjectDir,
+    }),
   );
 
+  return (pi: ExtensionAPI): void =>
+    registerShutdownHandler(pi, config, env, initGate, initProjectDir);
+}
+
+function registerShutdownHandler(
+  pi: ExtensionAPI,
+  config: ReflectConfig,
+  env: NodeJS.ProcessEnv,
+  initGate: CaptureGateResult,
+  initProjectDir: string,
+): void {
   pi.on("session_shutdown", async (event: any, ctx: any) => {
     // Only fire on actual quit, not on /new, /resume, /fork, or /reload
     if (event.reason !== "quit") return;
@@ -252,17 +303,10 @@ export default function reflectHook(pi: ExtensionAPI): void {
         .join("\n\n");
       const prs = extractPrs(sessionText);
 
-      // projectRoot is metadata-only now (no script resolution)
-      let projectRoot = ctx.cwd ?? "";
-      try {
-        projectRoot = execSync("git rev-parse --show-toplevel", {
-          encoding: "utf-8",
-          cwd: ctx.cwd,
-          timeout: 3000,
-        }).trim();
-      } catch {
-        // not a git repo — ctx.cwd is a fine fallback
-      }
+      // projectRoot is metadata-only now (no script resolution); it is ALSO the
+      // repo scope for the #803 capture gate (a subdirectory cwd still resolves
+      // to the repo root that owns the opt-out file).
+      const projectRoot = resolveProjectRoot(ctx.cwd ?? process.cwd());
 
       const sessionId = ctx.sessionManager.getSessionId?.() ?? `session_${Date.now()}`;
 
@@ -301,9 +345,35 @@ export default function reflectHook(pi: ExtensionAPI): void {
       // must never lose the session silently. Hosted capture rides on top.
       const localRecordPath = writeFallback(payload);
 
-      if (!config.apiKey) {
+      // #803: egress gate — explicit `cloud: true` + key, and no per-repo/env
+      // deny. The repo the session ran in is authoritative (not process.cwd())
+      // and may differ from the launch cwd after a rebind/resume — restate the
+      // effective state so the disclosure can never contradict the POST.
+      const gate: CaptureGateResult = resolveCaptureGate({
+        cloud: config.cloud,
+        apiKey: config.apiKey,
+        projectDir: projectRoot,
+        env,
+      });
+      if (
+        gate.enabled !== initGate.enabled ||
+        gate.reason !== initGate.reason ||
+        projectRoot !== initProjectDir
+      ) {
+        console.log(
+          captureStatusLine({
+            gate,
+            apiUrl: config.apiUrl,
+            fallbackDir: FALLBACK_DIR,
+            configPath: CONFIG_PATH,
+            projectDir: projectRoot,
+          }),
+        );
+      }
+
+      if (!gate.enabled) {
         console.warn(
-          `[reflect-hook] Hosted tortoise not configured (set TORTOISE_API_KEY or apiKey in ${CONFIG_PATH}) — session (${turns.length} turns, ${prs.length} PRs) saved to ${localRecordPath} instead of being captured.`,
+          `[reflect-hook] Hosted tortoise capture OFF (${gate.reason}) — session (${turns.length} turns, ${prs.length} PRs) saved to ${localRecordPath} instead of being captured.`,
         );
         return;
       }
@@ -314,4 +384,9 @@ export default function reflectHook(pi: ExtensionAPI): void {
       console.error(`[reflect-hook] Failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
+}
+
+/** Extension entry point — real config from env + ~/.pi/agent/tortoise-config.json. */
+export default function reflectHook(pi: ExtensionAPI): void {
+  createReflectHook(loadConfig())(pi);
 }
