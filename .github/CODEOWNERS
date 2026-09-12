@@ -20,14 +20,18 @@
 # so this file has no effect on the PR that adds it — ownership starts with the
 # next PR that touches a guarded path after this merges.
 #
-# NOTE (single-writer reality, #669): this file has NO OBSERVABLE EFFECT today.
-# GitHub's only two CODEOWNERS behaviours are (1) auto-requesting a review and
-# (2) blocking a merge when code-owner review is required — there is no third
-# "annotation" behaviour; nothing is attributed, displayed or enforced. Here:
-# GitHub never requests a review from the PR author and @daniel-ospina is the
-# repo's only collaborator, so every PR is authored by the sole code owner
-# (voids 1); and `required_pull_request_reviews` is null (voids 2). This file is
-# a hook for the future, not a control today.
+# NOTE (single-writer reality, #669): this file has NO EFFECT ON PR REVIEW OR
+# MERGE today — no review is requested and nothing is blocked. GitHub's two
+# review/merge CODEOWNERS behaviours are (1) auto-requesting a review and
+# (2) blocking a merge when code-owner review is required; both are void here.
+# There is no per-PR "annotation" behaviour either — no review is posted and no
+# comment is added. A *display* behaviour does exist once the file lands:
+# GitHub's "About code owners" docs let you see the code owner for a file (hover
+# tooltip) and expose a `codeowners/errors` REST endpoint — but it changes
+# nothing about review or merge. Here: GitHub never requests a review from the
+# PR author and @daniel-ospina is the repo's only collaborator, so every PR is
+# authored by the sole code owner (voids 1); and `required_pull_request_reviews`
+# is null (voids 2). This file is a hook for the future, not a control today.
 #
 # Four settings would be needed to make it bind — all four, not three: raise
 # `required_pull_request_reviews`, enable `require_code_owner_reviews` within it,
@@ -58,13 +62,27 @@
 # frontmatter-fixtures.mjs carries PI_VERSION_PIN (the canonical pin);
 # probe-frontmatter-fixtures.mjs regenerates it and resolves the real pi
 # bundle; check-staged-skill-frontmatter.mjs is the authoring-time hook.
+# check-skill-lint.test.mjs is now the #254 frontmatter-validator
+# fixture-regression suite: #675 (via #666) extracted the #637 pin-lockstep
+# tripwires (h)/(i)/(j) out of it into check-pi-pin-lockstep.mjs, which is the
+# file that carries them today.
 /scripts/check-skill-lint.mjs             @daniel-ospina
 /scripts/check-skill-lint.test.mjs        @daniel-ospina
+/scripts/check-pi-pin-lockstep.mjs        @daniel-ospina
 /scripts/check-skill-lint.oracle.test.mjs @daniel-ospina
 /scripts/frontmatter-validate.mjs         @daniel-ospina
 /scripts/frontmatter-fixtures.mjs         @daniel-ospina
 /scripts/probe-frontmatter-fixtures.mjs   @daniel-ospina
 /scripts/check-staged-skill-frontmatter.mjs @daniel-ospina
+
+# Pin-gate wiring surfaces (#666/#675). check-workflow-lock.mjs byte-hashes the
+# pin-gate workflows against workflow-lock.json — the content lock that replaced
+# modelling GitHub Actions execution semantics. workflow-yaml.mjs is the
+# dependency-free YAML reader the lock and the wiring guard both parse with; a
+# weakened reader is a weakened guard (its fail-open was #675's P1).
+/scripts/check-workflow-lock.mjs          @daniel-ospina
+/scripts/workflow-lock.json               @daniel-ospina
+/scripts/workflow-yaml.mjs                @daniel-ospina
 
 # Review-record writer + the in-session gates that consume its verdict
 # (review-enforcer merge registry, verification-gate pass contract). Guarding
