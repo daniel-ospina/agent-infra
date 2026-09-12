@@ -244,6 +244,102 @@ function bridgePath(): string {
   return join(BRIDGE_DIR, "latest.json");
 }
 
+// ── #3255: worktree-aware root resolution ────────────────────────────────
+// The git root of `process.cwd()` is the HUB whenever the session runs in the
+// hub checkout and the change lives in a linked worktree — a bare `git push`
+// with no `cd` prefix, or a task sub-agent started from the hub. Verification
+// is dispatched with the WORKTREE as project root, so the bridge's compound
+// keys are keyed on the worktree; the gate then hashes the hub's contents
+// against worktree hashes, mismatches EVERY file, and blocks permanently — no
+// verifier response can satisfy a comparison between two directories.
+//
+// `pickVerifiedRoot` is the pure decision (exported: unit-pinned). It returns a
+// root to adopt ONLY when the cwd root has no verified entries and exactly one
+// same-repo sibling does. Same-repo means a shared `--git-common-dir`, so an
+// unrelated repository's entries can never be adopted; ambiguity (2+ siblings)
+// falls back to the status quo, fail-closed like the rest of the gate.
+export function pickVerifiedRoot(
+  cwdRoot: string,
+  roots: string[],
+  commonDirOf: (root: string) => string | null,
+): string | null {
+  if (roots.length === 0) return null;
+  const norm = normalizeWorktreeRoot(cwdRoot);
+  if (roots.some((r) => normalizeWorktreeRoot(r) === norm)) return null; // own entries exist — status quo
+  const mine = commonDirOf(cwdRoot);
+  if (mine === null) return null;
+  const siblings = roots.filter((r) => commonDirOf(r) === mine);
+  return siblings.length === 1 ? siblings[0] : null;
+}
+
+function gitCommonDir(root: string): string | null {
+  try {
+    const out = execSync("git rev-parse --git-common-dir", {
+      cwd: root,
+      encoding: "utf-8",
+      timeout: 3000,
+    }).trim();
+    // `--git-common-dir` is relative to the invocation cwd when not absolute.
+    return out ? resolve(root, out) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Roots the bridge currently holds verified entries for.
+export function bridgeRoots(): string[] {
+  const bridge = readBridge();
+  if (!bridge || bridge.status !== "PASS") return [];
+  const roots = new Set<string>();
+  for (const vf of bridge.verified_files) {
+    const parsed = parseCompoundKey(vf.path);
+    if (parsed) roots.add(parsed.root);
+  }
+  return Array.from(roots);
+}
+
+// RECOVERY-ONLY. #3255: the bridge's compound keys are keyed on the WORKTREE
+// that was verified, while a hub session's `process.cwd()` git root is the hub.
+// Adopting the sibling root lets session-start RECOVERY see those entries.
+//
+// This must NEVER be used to choose the git-op root: adoption is inferred from
+// bridge content, not from what the command targets, so a clean adopted tree
+// yields an empty diff scope and the gate's empty-scope path ALLOWS an op
+// carrying unverified content — a fail-open in the one direction this gate must
+// not fail (found in review of the first attempt). The git-op root is therefore
+// authoritative — the command's own cwd — and a root mismatch is diagnosed
+// loudly (diagnoseRootMismatch) rather than bridged.
+function recoveryOnlyRoot(root: string): string {
+  const picked = pickVerifiedRoot(root, bridgeRoots(), gitCommonDir);
+  if (picked === null) return root;
+  console.log(
+    `[verification-gate] ↔ #3255: no verified entries for ${normalizeWorktreeRoot(root)}; ` +
+      `adopting ${picked} (same repo, has verified entries) as the git-op root`,
+  );
+  return picked;
+}
+
+// #3255: a git op whose root differs from the root verification recorded cannot
+// be compared hash-for-hash — the two sides are different trees. Say so in the
+// transcript, naming both paths, instead of presenting as an unexplained
+// per-file hash mismatch (which reads as "the gate is broken" and invites a
+// bypass). This only NARRATES; the block/mismatch decision is unchanged and
+// stays fail-closed.
+function diagnoseRootMismatch(root: string): void {
+  const roots = bridgeRoots();
+  const norm = normalizeWorktreeRoot(root);
+  if (roots.length === 0 || roots.some((r) => normalizeWorktreeRoot(r) === norm)) return;
+  const mine = gitCommonDir(root);
+  if (mine === null) return;
+  const siblings = roots.filter((r) => gitCommonDir(r) === mine);
+  if (siblings.length === 0) return;
+  console.log(
+    `[verification-gate] ⚠ #3255: this git op resolves to ${norm}, but the bridge holds verified entries for ` +
+      `${siblings.join(", ")} (same repo). Those are different trees, so hashes cannot be compared — ` +
+      `re-run the op from the verified tree (cd into it) or re-dispatch verification for ${norm} (#3255).`,
+  );
+}
+
 function writeBridge(projectRoot: string, files: string[]): void {
   try {
     // #190 review: the bridge is a same-user trust channel — 0o700/0o600 so
@@ -312,6 +408,11 @@ function clearBridge(): void {
 // called on session_shutdown (a sub-agent's shutdown must not delete the
 // parent's bridge; print-mode sub-agents fire session_shutdown on exit).
 let lastRecoveryMtime = 0;
+// #3255: the recovery cache must also key on WHICH root was recovered. A bare
+// `git push` from a hub session resolves the hub root first and the worktree
+// root later; without this the mtime guard would skip the second recovery and
+// the verified entries would stay invisible for the rest of the session.
+let lastRecoveredRoot = "";
 
 function recoverBridgeForRoot(normRoot: string): number {
   try {
@@ -319,8 +420,9 @@ function recoverBridgeForRoot(normRoot: string): number {
     // Perf guard: skip when the bridge hasn't been written since our last
     // recovery — nothing new to recover (mtime granularity edge cases are
     // fail-closed: a skipped recovery just means a re-block + re-verify).
-    if (st.mtimeMs <= lastRecoveryMtime) return 0;
+    if (st.mtimeMs <= lastRecoveryMtime && lastRecoveredRoot === normRoot) return 0;
     lastRecoveryMtime = st.mtimeMs;
+    lastRecoveredRoot = normRoot;
   } catch {
     // No bridge (or unreadable) — nothing to recover. Corrupt JSON is
     // handled inside readBridge (returns null).
@@ -3082,7 +3184,7 @@ export default function (pi: ExtensionAPI) {
     // #190: recover verification state from the bridge, root-filtered + stored-
     // hash match-or-drop. (Replaces the blind loader — the bridge now persists
     // compound keys with verifier-authoritative hashes.)
-    const sessionRoot = normalizeWorktreeRoot(resolveGitRoot(process.cwd()));
+    const sessionRoot = normalizeWorktreeRoot(recoveryOnlyRoot(resolveGitRoot(process.cwd())));
     const recovered = recoverBridgeForRoot(sessionRoot);
     if (recovered > 0) {
       console.log(`[verification-gate] 📂 Recovered ${recovered} verified files from bridge`);
@@ -3145,7 +3247,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── tool_call: block git/gh ops ────────────────────
-  pi.on("tool_call", async (event, _ctx): Promise<ToolCallEventResult | undefined> => {
+  pi.on("tool_call", async (event, ctx): Promise<ToolCallEventResult | undefined> => {
     if (!isToolCallEventType("bash", event)) return undefined;
     if (!extensionEnabled) return undefined;
 
@@ -3172,9 +3274,17 @@ export default function (pi: ExtensionAPI) {
     // lint-staged (pre-commit hook) may have modified files (ESLint --fix),
     // changing their hashes. Capture the post-lint state before the next check.
     // Determine cwd — prefer cd prefix in command (worktree support)
-    const inputCwd = event.input.cwd ? String(event.input.cwd) : process.cwd();
+    // #3255: prefer the cwd the runtime actually spawns this command in. It is
+    // the authoritative base for the git op; `process.cwd()` is only the last
+    // resort (and is the HUB when the session runs there while the change lives
+    // in a linked worktree — the original bug).
+    const ctxCwd = typeof (ctx as { cwd?: unknown } | undefined)?.cwd === "string"
+      ? (ctx as { cwd: string }).cwd
+      : null;
+    const inputCwd = event.input.cwd ? String(event.input.cwd) : (ctxCwd ?? process.cwd());
     const cdPath = extractCdPath(command);
     const cwd = resolveGitRoot(cdPath ?? inputCwd);
+    diagnoseRootMismatch(cwd);
 
     // #190: mid-session bridge recovery FIRST — defense-in-depth for the
     // incident's event-miss class (a merge that landed via another path, e.g.
