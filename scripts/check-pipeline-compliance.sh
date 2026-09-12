@@ -946,6 +946,12 @@ ${smline}"
     "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=NO @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "independent=NO"
   sm_case 6d "blocked a build-equivalent recorded id" \
     "[SECOND-MODEL-GATE] model=deepseek/deepseek-v4-pro independent=yes @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "SAME served build as the primary"
+  # H1: pi's resolver PARTIAL-matches the bare provider shorthand onto a
+  # concrete served build (`deepseek` → `deepseek/deepseek-v4-pro`, the
+  # primary's served build), so the shorthand must FAIL as build-equivalent —
+  # not pass on an exact-id-only equivalence set.
+  sm_case 6y "blocks the bare deepseek shorthand as independent=yes" \
+    "[SECOND-MODEL-GATE] model=deepseek independent=yes @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "SAME served build as the primary"
   sm_case 6e "blocked a missing marker" \
     "" "$SM_SIM_SHIPPED" 0 "no \[SECOND-MODEL-GATE\] line"
   sm_case 6f "bootstrap exemption WARN" \

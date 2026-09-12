@@ -7,7 +7,9 @@
       "date": "2026-09-14",
       "source": "DeepSeek changelog: from 12:00 Beijing 2026-09-14, requests to deepseek-v4-pro are routed to V4.1 Flash at Flash pricing (until V4.1 Pro ships). Served-build identity is server-side and not locally observable; this set is the enforceable proxy.",
       "families": [
-        "^deepseek-(?:v4(?:\\.\\d+)?-)?(?:flash|pro)(?:[-:]|$)"
+        "^deepseek-(?:v4(?:\\.\\d+)?-)?(?:flash|pro)(?:[-:]|$)",
+        "^deepseek$",
+        "^deepseek-v\\d+(?:\\.\\d+)?$"
       ],
       "normalized": [
         "deepseek-v4-pro",

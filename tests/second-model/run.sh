@@ -322,6 +322,7 @@ for marker in \
   "pass 6b: check (f) blocked DEGRADED" \
   "pass 6c: check (f) blocked independent=NO" \
   "pass 6d: check (f) blocked a build-equivalent recorded id" \
+  "pass 6y: check (f) blocks the bare deepseek shorthand as independent=yes" \
   "pass 6e: check (f) blocked a missing marker" \
   "pass 6f: check (f) bootstrap exemption WARN" \
   "pass 6g: check (f) enforcement on once the file exists on base" \
@@ -391,7 +392,11 @@ rm -rf "$BOGUS_HOME"
 echo ""
 echo "13. Non-vacuity: equivalence is build identity, not 'is it DeepSeek'"
 # Positive controls (must classify EQUIVALENT, exit 0).
-for m in deepseek-flash deepseek/deepseek-v4-pro openrouter/deepseek/deepseek-v4-pro deepseek-v4.1-flash-expires-on-0910; do
+# H1: the bare provider shorthand and the short version form are EQUIVALENT,
+# because pi's resolver PARTIAL-matches them onto a concrete served build
+# (parseModelPattern('deepseek', models) → deepseek/deepseek-v4-pro, the
+# primary's served build) — a naive id/family check missed the shorthand.
+for m in deepseek deepseek-v4 deepseek-v4.1 deepseek-flash deepseek/deepseek-v4-pro openrouter/deepseek/deepseek-v4-pro deepseek-v4.1-flash-expires-on-0910; do
   rc="$(equiv_rc "$m")"
   if [ "$rc" -eq 0 ]; then pass "positive control $m → EQUIVALENT"; else fail "positive control $m was not classified equivalent (rc=$rc)"; fi
 done
@@ -477,8 +482,8 @@ EXPECTED = {
     "missing-runtimeVia": ["preference.0.runtimeVia"],
     "missing-unreachablePatterns": [f"unreachablePatterns.{i}" for i in range(7)],
     "empty-unreachablePatterns": [f"unreachablePatterns.{i}" for i in range(7)],
-    "empty-equivalence": ["primary.buildEquivalence.families.0"] + [f"primary.buildEquivalence.normalized.{i}" for i in range(8)],
-    "misconfigured-equivalence": ["primary.buildEquivalence.families.0"] + [f"primary.buildEquivalence.normalized.{i}" for i in range(8)],
+    "empty-equivalence": [f"primary.buildEquivalence.families.{i}" for i in range(3)] + [f"primary.buildEquivalence.normalized.{i}" for i in range(8)],
+    "misconfigured-equivalence": [f"primary.buildEquivalence.families.{i}" for i in range(3)] + [f"primary.buildEquivalence.normalized.{i}" for i in range(8)],
     "backdoor-unreachable": [],
     "backdoor-unreachable-soft": [],
     "probe-kimi-solvent": [],
