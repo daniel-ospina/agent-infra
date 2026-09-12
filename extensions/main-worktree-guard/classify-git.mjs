@@ -1635,8 +1635,13 @@ function _walkShell(command, h = {}, seedVars = {}) {
           else j += 2;
           continue;
         }
-        if (n === "-c" || n === "--command") {          // Round-5 (security F3): skip flags AFTER -c too — `bash -c -x 'git
+        const isInlineC = n === "-c" || n === "--command" || (/^-[A-Za-z]*c[A-Za-z]*$/.test(n) && !n.startsWith("--"));
+        if (isInlineC) {          // Round-5 (security F3): skip flags AFTER -c too — `bash -c -x 'git
           // reset'` takes the first NON-flag token as the command string.
+          // Round-7 (reviewer P1): a single-dash LETTER RUN containing c
+          // (`bash -lc '…'`, `sh -ec '…'`) is the same inline form — bash
+          // parses the run char-by-char, and `extractScriptPath` already knew
+          // that; the walker did not, so the payload was skipped as a script.
           let m = j + 1;
           while (m < tokens.length && tokens[m].startsWith("-")) m++;
           const inline = tokens[m];
@@ -1900,6 +1905,965 @@ export function allGitInvocations(command, seedVars = {}) {
     onGitEnd: (inv) => invocations.push(inv),
   }, seedVars);
   return invocations;
+}
+
+// ── #709: working-tree-discard family (command layer) ──────────────────────
+// The legacy destructive arms key on the VERB and exempt worktrees wholesale,
+// so the incident verb (`git checkout -- <path>`) runs ungated (it classifies
+// `allow`; test.mjs pins that) and every OTHER discard verb is worktree-exempt.
+// This extractor names the commands whose EFFECT is to rewrite working-tree
+// content from the index/a commit, so index.ts can key the gate on
+// `git status` (does the discard destroy uncommitted work?) instead of on argv.
+//
+// Deliberately SEPARATE from classifyGitCommand(Detailed): those verdicts are
+// pinned by test.mjs and consumed by the M2/M3/M4 arms — widening them would
+// change those arms. PURE (no git, no fs); index.ts does the effect probe.
+//
+// Descriptor: { form, scope: "all"|"paths"|"revert-hints", pathspecs,
+//               fromTree, verb, args, inv }
+//   scope "all"   — the whole checkout is discarded (checkout -f, reset --hard,
+//                   switch --discard-changes)
+//   scope "paths" — only the listed pathspecs
+//   fromTree      — the SOURCE is a tree/commit, so a staged-only change is
+//                   destroyed too. `checkout -- <paths>` / bare `restore`
+//                   restore from the INDEX: only a worktree-vs-index
+//                   difference is lost.
+//
+// NOT in the family (documented residuals):
+//   - `git clean`   — untracked-only. It never touches TRACKED work, and
+//                     build-artifact cleanup (`git clean -fdx`) in a private
+//                     worktree is ordinary; the hub-state (M4) and legacy arms
+//                     still block it in a shared main checkout.
+//   - `git stash push` — stores, does not discard.
+//   - `git restore --staged` alone — index-only; git leaves the working-tree
+//                     content in place and re-adding recovers it (#709 note).
+//   - `cp <backup> <tracked>` and arbitrary interpreter writers that rewrite a
+//                     tracked file from a non-git source — indistinguishable
+//                     from an edit without reading content; the #625 in-place
+//                     overwrite gate already covers the shared-main case.
+const _WT_DISCARD_FORCE_LONG = ["-f", "--force"];
+
+/** Non-flag args of an invocation. */
+function _wtDiscardPositionals(args) {
+  return (args ?? []).filter((a) => a !== "--" && !String(a).startsWith("-"));
+}
+
+/** Does a single-dash short cluster contain `letter` (`-fq` ≡ `-f -q`)?
+ *  Digits are legal cluster members too (`git apply -R3` ≡ `-R -3`, reviewer
+ *  round-3 P1: the digit-less regex let `-R3`/`-3R` revert a patch ungated). */
+function _wtDiscardShortCluster(args, letter) {
+  return (args ?? []).some((a) => /^-[A-Za-z0-9]+$/.test(a) && a.slice(1).includes(letter));
+}
+
+/**
+ * git accepts any UNAMBIGUOUS long-option prefix (`--har` ≡ `--hard`,
+ * `--discard-ch` ≡ `--discard-changes`). Exact-spelling tests are therefore a
+ * FAIL-OPEN bypass (reviewer-reproduced: `git reset --har` destroyed a dirty
+ * file while M5 allowed it). Over-matching is safe here — a block still needs
+ * the effect probe to find uncommitted work.
+ */
+function _wtLongPrefix(token, full) {
+  const t = String(token ?? "");
+  return t === full || (t.startsWith("--") && t.length > 2 && full.startsWith(t));
+}
+
+/** Any arg matching a long flag by exact spelling or unambiguous prefix. */
+function _wtHasLong(args, full) {
+  return (args ?? []).some((t) => _wtLongPrefix(t, full));
+}
+
+/** git's noarg force spellings, incl. unambiguous long prefixes (`--forc`). */
+function _wtDiscardForce(args) {
+  const a = args ?? [];
+  return a.some((t) => _WT_DISCARD_FORCE_LONG.includes(t)) ||
+    _wtHasLong(a, "--force") ||
+    _wtDiscardShortCluster(a, "f");
+}
+
+/** `--pathspec-from-file[=f]` / `--pathspec-file-nul` hide the target list in a
+ *  FILE — the effect is not statically resolvable → the caller fails closed. */
+function _wtHasPathspecFile(args) {
+  return (args ?? []).some((t) => String(t).startsWith("--pathspec-from-file") || String(t) === "--pathspec-file-nul");
+}
+
+/** xargs/find `-exec` placeholders — the real pathspec is supplied at runtime.
+ *  Exported so index.ts's fail-closed set has ONE implementation (a second
+ *  inline copy had already drifted — reviewer round-4 P2). */
+export function wtIsPlaceholderPathspec(p) {
+  const s = String(p);
+  return s === "{}" || s === "{}+" || s === "+" || s.includes("{}");
+}
+
+function _wtDiscardFromCheckout(args) {
+  const a = args ?? [];
+  if (_wtHasPathspecFile(a)) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-pathspec-file", unverifiable: true };
+  // Conflict-resolution spellings (`--ours`/`--theirs`/`-m`/`--merge`/
+  // `--conflict=<style>`) are the SANCTIONED way to resolve an UNMERGED path —
+  // `discardDestroysWip` skips `U`/`AA`/`DD` entries. But on a plain MODIFIED
+  // file they are a normal index-source checkout that destroys WIP (reviewer
+  // round-3 P1, probe-verified against real git: `git checkout --ours
+  // dirty.txt` reverted the file). So emit a descriptor and let the EFFECT
+  // probe decide — the unmerged skip keeps real conflict resolution working.
+  const conflictish = a.some((t) => t === "--ours" || t === "--theirs" || t === "-m" ||
+    _wtLongPrefix(t, "--merge") || _wtLongPrefix(t, "--conflict") || String(t).startsWith("--conflict=") ||
+    // `-2`/`-3` are the numeric stage shortcuts for `--ours`/`--theirs`
+    // (`-2q` too) — same effect-keyed path (reviewer round-4 P2).
+    (/^-[0-9qv]+$/.test(String(t)) && /[23]/.test(String(t))));
+  if (conflictish) {
+    const cdd = a.indexOf("--");
+    const cpos = (cdd !== -1 ? a.slice(cdd + 1) : _wtDiscardPositionals(a)).filter(Boolean);
+    // `git checkout -m <branch>` (no path) is a switch-with-merge, not a path
+    // restore — leave it out (the M3 branch arm owns switching).
+    if (cpos.length === 0) return null;
+    return { scope: "paths", pathspecs: cpos, fromTree: false, form: "checkout-conflict" };
+  }
+  const creates = a.some((t) => /^-[bBcCt]/.test(String(t)) || t === "--orphan" || t === "--detach" || t === "--track");
+  const dd = a.indexOf("--");
+  if (dd !== -1) {
+    // After `--` EVERY token is a pathspec (leading dashes included: `-x` is a
+    // legal filename). Zero pathspecs (`git checkout --` fed by xargs) is a
+    // runtime-supplied target list → conservative scope `all`.
+    const pathspecs = a.slice(dd + 1).filter((p) => p !== "");
+    if (pathspecs.length === 0) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-pathspec-empty" };
+    // A tree-ish before `--` overwrites the index too; flags do not count
+    // (reviewer P2: `git checkout -q -- f` is index-source).
+    const fromTree = a.slice(0, dd).some((t) => t !== "--" && !String(t).startsWith("-"));
+    return { scope: "paths", pathspecs, fromTree, form: "checkout-paths" };
+  }
+  // Bare path forms git accepts without `--`: `git checkout .`, `./x`, `:/x`,
+  // `:(magic)` (a ref can never start with `:`) — and a SINGLE bare token,
+  // which git resolves as a ref (switch) only when it names one; otherwise it
+  // is a path restore (`git checkout f.txt` reverts f.txt — the incident verb's
+  // twin without `--`, reviewer round-4 P1). The ref-vs-path ambiguity is
+  // resolved by the caller's `rev-parse` probe before the effect probe.
+  const pos = _wtDiscardPositionals(a);
+  const pathish = pos.filter((p) => p === "." || String(p).startsWith("./") || String(p).startsWith(":"));
+  if (pathish.length > 0) {
+    return { scope: "paths", pathspecs: pathish, fromTree: pos.length > pathish.length, form: "checkout-paths-bare" };
+  }
+  // `git checkout <tree-ish> <paths>` WITHOUT `--` is a real path restore in
+  // git (reviewer P1: `git checkout HEAD a.txt` destroyed a dirty file). Only
+  // when a branch-create flag is present is the token list a create form.
+  if (!creates && pos.length >= 2) {
+    // `pos[0]` is a tree-ish ONLY when it names a commit; otherwise git treats
+    // EVERY positional as a pathspec (reviewer round-7 P1: `git checkout
+    // dirty.txt clean.txt` silently dropped the first path from the probe).
+    // The handler's `rev-parse` probe resolves it (`ambiguousTree`).
+    return { scope: "paths", pathspecs: pos.slice(1), fromTree: true, form: "checkout-treish-paths", ambiguousTree: pos[0], allPathspecs: pos };
+  }
+  // `git checkout -p/--patch` discards selected hunks interactively — the same
+  // effect as `git restore -p` (which the restore helper already gates).
+  if (_wtDiscardShortCluster(a, "p") || _wtHasLong(a, "--patch")) {
+    if (pos.length === 0) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-patch-all" };
+    return { scope: "paths", pathspecs: pos, fromTree: false, form: "checkout-patch" };
+  }
+  if (_wtDiscardForce(a)) {
+    // `git checkout -f <one token>`: a REF is a forced switch (discards ALL
+    // local changes → whole-tree scope); a PATH restores just that path. The
+    // handler's `rev-parse` probe resolves it (reviewer round-5 P2 false
+    // positive: `git checkout -f clean.txt` blocked on an unrelated dirty
+    // file).
+    if (!creates && pos.length === 1) {
+      return { scope: "all", pathspecs: pos, fromTree: false, form: "checkout-force", ambiguousRef: true, refIsAll: true };
+    }
+    return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-force" };
+  }
+  // A single bare token is ref-or-path (see above) — checked LAST so
+  // `-f main` / `-p f` keep their force/patch semantics.
+  if (!creates && pos.length === 1) {
+    return { scope: "paths", pathspecs: pos, fromTree: false, form: "checkout-bare-path", ambiguousRef: true };
+  }
+  return null;
+}
+
+function _wtDiscardFromRestore(args) {
+  const a = args ?? [];
+  // `--staged` is the EXACT `-S` (or a cluster that is not the attached
+  // `-s<ref>` form): `git restore -sSTABLE f` restores from the ref STABLE, and
+  // reading it as `--staged` made the arm return null — index-only — while git
+  // destroyed the worktree (reviewer round-7 P1).
+  const stagedTok = a.find((t) => _wtLongPrefix(t, "--staged") || t === "-S" ||
+    (/^-[A-Za-z0-9]+$/.test(String(t)) && !/^-s/.test(String(t)) && String(t).slice(1).includes("S")));
+  // `--source=<rev>` (the `=` spelling) AND `-s <rev>` / `--source <rev>`.
+  const sourceTok = a.find((t) => _wtLongPrefix(t, "--source") || String(t).startsWith("--source=") || t === "-s" || /^-s\S/.test(String(t)));
+  const worktreeTok = a.find((t) => _wtLongPrefix(t, "--worktree") || t === "-W" || _wtDiscardShortCluster([t], "W"));
+  // An ambiguous abbreviation (`--s`) matches BOTH --staged and --source —
+  // never take the index-only early return for it.
+  const ambiguous = !!stagedTok && !!sourceTok && stagedTok === sourceTok && String(stagedTok).startsWith("--");
+  const staged = !!stagedTok && !ambiguous;
+  const worktree = !!worktreeTok;
+  // Index-only restore is explicitly non-destructive (#709) — checked BEFORE
+  // the fail-closed pathspec-file branch, or `git restore --staged
+  // --pathspec-from-file=list` would block an index-only reset (reviewer
+  // round-5 P2).
+  if (staged && !worktree) return null;
+  if (_wtHasPathspecFile(a)) return { scope: "all", pathspecs: [], fromTree: true, form: "restore-pathspec-file", unverifiable: true };
+  // A `--source=<tree>` WITHOUT `--staged` restores the WORKTREE only — the
+  // index keeps the staged blob, so a staged-only change is recoverable and
+  // must not block (reviewer round-4 P2). The index is reset only when
+  // `--staged` survives (with or without `--worktree`).
+  const fromTree = staged;
+  const pathspecs = [];
+  for (let i = 0; i < a.length; i++) {
+    const t = a[i];
+    if (t === "--") { for (let j = i + 1; j < a.length; j++) if (a[j]) pathspecs.push(a[j]); break; }
+    if (t === "-s" || _wtLongPrefix(t, "--source")) { i++; continue; }
+    if (String(t).startsWith("--source=") || /^-s\S/.test(String(t))) continue;
+    if (String(t).startsWith("-")) continue;
+    pathspecs.push(t);
+  }
+  if (pathspecs.length === 0) {
+    // `git restore` with no pathspec is a usage error (git does nothing) — the
+    // round-1 xargs case is covered by the extractor's feeder fallback
+    // (reviewer round-6 P2 false positive).
+    return null;
+  }
+  return { scope: "paths", pathspecs, fromTree, form: "restore-worktree" };
+}
+
+function _wtDiscardFromSwitch(args) {
+  const a = args ?? [];
+  if (_wtHasLong(a, "--discard-changes") || _wtDiscardForce(a)) {
+    return { scope: "all", pathspecs: [], fromTree: false, form: "switch-discard" };
+  }
+  return null;
+}
+
+function _wtDiscardFromReset(args) {
+  const a = args ?? [];
+  if (!_wtHasLong(a, "--hard")) return null;
+  const dd = a.indexOf("--");
+  if (dd !== -1) {
+    const pathspecs = a.slice(dd + 1).filter(Boolean);
+    if (pathspecs.length > 0) return { scope: "paths", pathspecs, fromTree: true, form: "reset-hard-paths" };
+  }
+  return { scope: "all", pathspecs: [], fromTree: false, form: "reset-hard" };
+}
+
+function _wtDiscardFromCheckoutIndex(args) {
+  const a = args ?? [];
+  // Without -f/--force git REFUSES to overwrite a modified file — nothing to gate.
+  if (!_wtDiscardForce(a)) return null;
+  // `--prefix=<dir>` / `--temp` EXPORT the index elsewhere (the documented
+  // `git checkout-index -a -f --prefix=/tmp/out/` recipe) — the working tree is
+  // untouched (reviewer round-3 P2 false positive).
+  if (a.some((t) => String(t).startsWith("--prefix") || String(t) === "--temp" || _wtDiscardShortCluster([String(t)], "t"))) return null;
+  if (_wtHasPathspecFile(a)) return { scope: "all", pathspecs: [], fromTree: true, form: "checkout-index-pathspec-file", unverifiable: true };
+  // `--stdin`/`-z` supply the path list on STDIN — not statically resolvable
+  // (reviewer round-3 P1: `printf 'f\n' | git checkout-index -f --stdin`
+  // restored the file while M5 allowed it).
+  if (a.some((t) => t === "--stdin" || t === "-z")) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-index-stdin", unverifiable: true };
+  if (_wtDiscardShortCluster(a, "a") || _wtHasLong(a, "--all")) {
+    // `checkout-index` copies FROM the index: a staged-only entry is already in
+    // the worktree, so only a WORKTREE-vs-index difference (Y ≠ ' ') is
+    // destroyed. Expressed as the whole-tree pathspec scope (reviewer round-4
+    // P2: `fromTree` here false-blocked staged-only work).
+    return { scope: "paths", pathspecs: ["."], fromTree: false, form: "checkout-index-all" };
+  }
+  const dd = a.indexOf("--");
+  const pathspecs = (dd !== -1 ? a.slice(dd + 1) : _wtDiscardPositionals(a)).filter(Boolean);
+  if (pathspecs.length === 0) return null;
+  return { scope: "paths", pathspecs, fromTree: false, form: "checkout-index" };
+}
+
+/** `git rm -f <paths>` deletes index+worktree entries (a discard of the file's
+ *  uncommitted content). Without -f git refuses to remove a modified file. */
+function _wtDiscardFromRm(args) {
+  const a = args ?? [];
+  // `--cached` removes the INDEX entry only (worktree file untouched) and
+  // `-n`/`--dry-run` deletes nothing — both are read-only w.r.t. the working
+  // tree (reviewer round-3 P2 false positives; same class as `restore
+  // --staged`).
+  if (a.some((t) => _wtLongPrefix(t, "--cached") || _wtLongPrefix(t, "--dry-run") || t === "-n" || _wtDiscardShortCluster([t], "n"))) return null;
+  if (!_wtDiscardForce(a)) return null;
+  const dd = a.indexOf("--");
+  const pathspecs = (dd !== -1 ? a.slice(dd + 1) : _wtDiscardPositionals(a)).filter(Boolean);
+  if (pathspecs.length === 0) return { scope: "all", pathspecs: [], fromTree: true, form: "rm-force-all" };
+  return { scope: "paths", pathspecs, fromTree: true, form: "rm-force" };
+}
+
+/** `git read-tree --reset -u HEAD` overwrites index+worktree wholesale. */
+function _wtDiscardFromReadTree(args) {
+  const a = args ?? [];
+  if (!_wtHasLong(a, "--reset")) return null;
+  if (!(_wtDiscardShortCluster(a, "u") || _wtHasLong(a, "--update"))) return null;
+  return { scope: "all", pathspecs: [], fromTree: true, form: "read-tree-reset-update" };
+}
+
+/** `git apply -R <patch>` reverses an applied patch — a one-command revert of
+ *  tracked WIP. The touched paths live in the patch file (not statically
+ *  known), so the scope is conservatively `all` (reviewer round-2 P2). */
+function _wtDiscardFromApply(args) {
+  const a = args ?? [];
+  const reversed = a.some((t) => String(t) === "--reverse" ||
+    (String(t).length >= 5 && String(t).startsWith("--rev") && "--reverse".startsWith(String(t)))) ||
+    _wtDiscardShortCluster(a, "R");
+  if (!reversed) return null;
+  // Dry-run / reporting flags mean NOTHING is applied (reviewer round-3 P2:
+  // `git apply -R --check|--stat|--numstat|--summary` only reports).
+  if (a.some((t) => _wtLongPrefix(t, "--check") || _wtLongPrefix(t, "--stat") ||
+    _wtLongPrefix(t, "--numstat") || _wtLongPrefix(t, "--summary"))) return null;
+  // `--cached` is index-only — not a WORKING-TREE discard (reviewer round-4 P2,
+  // same class as `restore --staged`).
+  if (a.some((t) => _wtLongPrefix(t, "--cached"))) return null;
+  // Default `git apply` writes the WORKTREE only; `--index` and `--3way`
+  // (implied by a `-3` cluster member) also overwrite the index.
+  const indexTouch = a.some((t) => _wtLongPrefix(t, "--index") || _wtLongPrefix(t, "--3way") ||
+    (/^-[A-Za-z0-9]+$/.test(String(t)) && String(t).slice(1).includes("3")));
+  return { scope: "all", pathspecs: [], fromTree: indexTouch, form: "apply-reverse" };
+}
+
+/**
+ * Blank heredoc DATA bodies and `#` comments before extraction.
+ *
+ * The shared `allGitInvocations` walker parses heredoc bodies as command text,
+ * so `cat <<'EOF' … git checkout -- x … EOF` produced a phantom descriptor
+ * (reviewer P2 false positive). A body is DATA unless its consumer executes its
+ * stdin — a SHELL or a CODE interpreter (`python3 <<PY`, `perl <<P`, `node`) —
+ * or the body is piped INTO one (`cat <<'EOF' | bash`), in which case it is
+ * real code and is kept (and re-extracted, because the walker does not reach
+ * the piped form). Comments are shell comments only when unquoted, so the scan
+ * is quote-aware: `echo "a << b"` did NOT open a heredoc, and a mid-line
+ * `# git reset --hard` is NOT a command (reviewer round-2 P1/P2 false
+ * positives + a quote-blind phantom-heredoc BLINDING bug).
+ * One pending heredoc at a time — multiple openers on one line is a documented
+ * residual (the first body is blanked, the rest are parsed normally).
+ */
+const _WT_SPAWNER_WORDS = new Set(["env", "nice", "nohup", "command", "sudo", "doas", "setsid", "stdbuf", "time", "timeout", "exec", "ionice", "busybox"]);
+const _WT_KEYWORDS = new Set(["then", "do", "else", "elif", "if", "while", "until", "for", "done", "fi", "esac", "case", "in", "!", "time", "eval", "true", "false", ":", "set", "export", "declare", "local", "return", "test", "cd", "shopt"]);
+const _WT_SHELL_WORDS = /^(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh|fish|csh|tcsh|source|\.)$/;
+const _WT_CODE_WORDS = /^(?:python[0-9.]*|perl|ruby|node|nodejs|pwsh|powershell|deno|osascript|php|lua|Rscript)$/;
+
+/**
+ * The interpreter a heredoc-feeding line actually runs, skipping spawner
+ * wrappers and their flags/operands (`env bash`, `nice bash`, `timeout 5
+ * bash`, `sudo -u root /bin/sh`, `busybox sh`) and accepting absolute paths
+ * (`/bin/sh`). Returns the token, or null when the head is not an interpreter
+ * (`grep bash f` must NOT read as one — reviewer round-3 P1).
+ */
+function _wtHeadInterpreter(line) {
+  const toks = String(line).trim().split(/[\s;|&()]+/).filter(Boolean);
+  const isInterp = (t) => {
+    const b = basename(String(t));
+    return _WT_SHELL_WORDS.test(b) || _WT_CODE_WORDS.test(b);
+  };
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (isInterp(t)) return t;
+    if (i === 0) {
+      // Only a spawner / shell keyword / env-assignment / flag / REDIRECTION
+      // may precede the interpreter (`then bash <<EOF`, `2>/dev/null bash
+      // <<EOF` — reviewer round-6 P1).
+      const ok = _WT_SPAWNER_WORDS.has(t) || _WT_KEYWORDS.has(t) || t.startsWith("-") ||
+        /^[A-Za-z_][A-Za-z0-9_]*=/.test(t) || /^[0-9]*[<>]/.test(t);
+      if (!ok) return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Split a comment-stripped opener line into command segments on UNQUOTED
+ * list operators, then return the segment that owns the `<<`. The consumer is
+ * not necessarily the first token of the LINE (`true && bash <<EOF`,
+ * `set -e; bash <<EOF`, `{ bash <<EOF`) — reading the whole line as if the head
+ * were the consumer blanked a body the walker would otherwise have parsed
+ * (reviewer round-4 P1).
+ */
+function _wtOpenerSegment(line) {
+  const s = String(line ?? "");
+  const segs = [];
+  let cur = "";
+  let quote = null;
+  let opened = -1; // index of the segment owning the first UNQUOTED `<<`
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) { if (ch === quote) quote = null; cur += ch; continue; }
+    if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    // A QUOTED `<<` (`echo 'a<<b' && bash <<EOF`) must not claim the opener —
+    // that demoted the real shell heredoc to data and blanked its body
+    // (reviewer round-5 P1).
+    if (ch === "<" && s[i + 1] === "<" && opened === -1) { opened = segs.length; cur += "<<"; i++; continue; }
+    if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === "{" || ch === "}" || ch === ")") {
+      segs.push(cur); cur = ""; continue;
+    }
+    cur += ch;
+  }
+  segs.push(cur);
+  return opened >= 0 ? segs[opened] : s;
+}
+
+/** A shell executes its stdin heredoc as SHELL text; a code interpreter
+ *  (python/perl/ruby/node/…) executes it as CODE — the two need different
+ *  extraction paths. `null` = a positively identified DATA consumer (body is
+ *  not code). An UNRESOLVABLE head (`$SH <<EOF`, `$(which sh) <<EOF`) is not
+ *  proof of a data consumer → the body is kept so the walker can see it
+ *  (fail toward detection, never toward silently blanking code). */
+function _wtHeredocKind(line) {
+  if (_wtLinePipesToInterpreter(line)) return "shell";
+  const seg = _wtOpenerSegment(line);
+  const interp = _wtHeadInterpreter(seg);
+  if (interp === null) return /[$`]/.test(seg) ? "shell" : null;
+  return _WT_SHELL_WORDS.test(basename(String(interp))) ? "shell" : "code";
+}
+function _wtLinePipesToInterpreter(line) {
+  return String(line).split("|").slice(1).some((seg) => _wtHeadInterpreter(seg) !== null);
+}
+
+/** Quote-aware scan of one line: returns the comment-stripped text and the
+ *  delimiter of the FIRST unquoted heredoc opener (or null).
+ *
+ *  `#` starts a comment only at a WORD START — after real whitespace or a list
+ *  operator, not after an ESCAPED whitespace. Testing the raw preceding char
+ *  treated `echo a\ #b && git checkout -- f` as a comment and truncated the
+ *  live discard off the line (reviewer round-4 P1).
+ *
+ *  Two further sharp edges (reviewer round-5 P1):
+ *   - `<<` inside `(( ))`/`$(( ))` ARITHMETIC is a shift operator, not a
+ *     heredoc — opening one blanked the rest of the command.
+ *   - the delimiter is RE-EMITTED after `<<` (it used to be dropped), because
+ *     the shared walker's redirect branch skips `<<` PLUS the next token — with
+ *     the delimiter gone it ate the next real command word, so a discard on a
+ *     later line (`cat <<EOF … EOF` then `git checkout -- f`) was invisible.
+ *  `carry` threads quote/arithmetic state across lines (a `<<` inside a
+ *  multi-line quoted string is not a heredoc either).
+ */
+function _wtScanLine(line, carry) {
+  let i = 0;
+  let out = "";
+  let quote = carry?.quote ?? null;
+  let arith = carry?.arith ?? 0;
+  let delim = null;
+  let atWordStart = carry?.atWordStart ?? true;
+  while (i < line.length) {
+    const ch = line[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      out += ch; i++; atWordStart = false; continue;
+    }
+    if (arith > 0) {
+      if (ch === "(" && line[i + 1] === "(") { arith++; out += "(("; i += 2; continue; }
+      if (ch === ")" && line[i + 1] === ")") { arith--; out += "))"; i += 2; continue; }
+      out += ch; i++; atWordStart = false; continue;
+    }
+    if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; atWordStart = false; continue; }
+    if (ch === "(" && line[i + 1] === "(") { arith++; out += "(("; i += 2; atWordStart = false; continue; }
+    if (ch === "'") { quote = ch; out += ch; i++; atWordStart = false; continue; }
+    if (ch === '"') { quote = ch; out += ch; i++; atWordStart = false; continue; }
+    if (ch === "#" && atWordStart) break; // comment
+    if (ch === " " || ch === "\t" || ch === ";" || ch === "&" || ch === "|" || ch === "(") {
+      out += ch; i++; atWordStart = true; continue;
+    }
+    if (ch === "<" && line[i + 1] === "<") {
+      let j = i + 2;
+      if (line[j] === "-") j++;
+      while (line[j] === " " || line[j] === "\t") j++;
+      let q = null;
+      if (line[j] === "'" || line[j] === '"') { q = line[j]; j++; }
+      let d = "";
+      // An UNQUOTED delimiter is a shell word: it stops at whitespace / shell
+      // metacharacters, NOT at the first non-word char. Stopping early (`<<E-O-F`
+      // → delimiter `E`) left the terminator unmatched, so the body swallowed
+      // every following line — including a later discard (reviewer round-6 P1).
+      while (j < line.length && (q ? line[j] !== q : !/[\s;&|<>(){}'"\\]/.test(line[j]))) { d += line[j]; j++; }
+      if (q && line[j] === q) j++;
+      if (d && delim === null) delim = d;
+      // Re-emit the delimiter so the walker's `<<` + operand skip consumes the
+      // placeholder, never the next real command token. An opener with no
+      // delimiter (`<<` in arithmetic) emits bare `<<`.
+      out += d ? `<< ${d}` : "<<";
+      i = j;
+      continue;
+    }
+    out += ch; i++; atWordStart = false;
+  }
+  if (carry) { carry.quote = quote; carry.arith = arith; carry.atWordStart = atWordStart; }
+  return { text: out, delim };
+}
+
+function _wtStripHeredocData(text, codeBodies) {
+  const lines = String(text ?? "").split("\n");
+  const out = [];
+  let pending = null; // { delim, kind, buf }
+  const carry = { quote: null, arith: 0, atWordStart: true };
+  for (const line of lines) {
+    if (pending) {
+      const t = line.trim();
+      if (t === pending.delim) {
+        out.push("");
+        if (pending.kind && codeBodies) codeBodies.push({ kind: pending.kind, text: pending.buf.join("\n") });
+        pending = null;
+        continue;
+      }
+      if (pending.kind) { out.push(line); pending.buf.push(line); continue; }
+      out.push("");
+      continue;
+    }
+    const { text: code, delim } = _wtScanLine(line, carry);
+    if (delim !== null) pending = { delim, kind: _wtHeredocKind(code), buf: [] };
+    out.push(code);
+  }
+  return out.join("\n");
+}
+
+/** `git show <rev>:<path>` / `cat-file` committed-path hints (the manual
+ *  revert shape `git show HEAD:x > x`). Slashy revs (`refs/heads/main:p`,
+ *  `origin/main:p`) and the INDEX source (`:p`) are the same revert — the
+ *  hint is intersected with the command's write targets, so over-matching is
+ *  safe (reviewer round-4 P2). */
+function _wtDiscardShowTargets(args) {
+  const out = [];
+  for (const t of args ?? []) {
+    if (t === "blob") continue;
+    const idx = /^:(.+)$/.exec(String(t));
+    if (idx) { out.push(idx[1]); continue; }
+    const m = /^([^:\s]+):(.+)$/.exec(String(t));
+    if (m && m[2]) out.push(m[2]);
+  }
+  return out;
+}
+
+/**
+ * Quote-aware backtick command-substitution spans. The shared walker tokenizes
+ * `$( … )` but a backtick span stays inside one token, so `` `git checkout --
+ * f` `` produced no descriptor (reviewer round-3 P2). Single quotes suppress
+ * substitution; inside double quotes it still runs.
+ */
+function _wtBacktickSpans(text) {
+  const s = String(text ?? "");
+  const out = [];
+  const capture = (from) => {
+    let j = from;
+    let buf = "";
+    while (j < s.length && s[j] !== "`") { if (s[j] === "\\") { j++; if (j >= s.length) break; } buf += s[j]; j++; }
+    if (buf.trim()) out.push(buf);
+    return j + 1;
+  };
+  let i = 0;
+  let inSingle = false;
+  let inDouble = false;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "\\") { i += 2; continue; }
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      i++;
+      continue;
+    }
+    // Inside double quotes an apostrophe is ORDINARY — it must not flip the
+    // single-quote state and hide a later backtick (reviewer round-4 P2).
+    if (inDouble) {
+      if (ch === '"') { inDouble = false; i++; continue; }
+      if (ch === "`") { i = capture(i + 1); continue; }
+      i++;
+      continue;
+    }
+    if (ch === "'") { inSingle = true; i++; continue; }
+    if (ch === '"') { inDouble = true; i++; continue; }
+    if (ch === "`") { i = capture(i + 1); continue; }
+    i++;
+  }
+  return out;
+}
+
+/**
+ * `git -c alias.<name>=<cmd>` / `git config alias.<name> <cmd>` definitions
+ * INSIDE this command, so a later `git <name> …` can be resolved instead of
+ * sailing past the verb-keyed extractor (reviewer round-3 P2: `git -c
+ * alias.z='checkout --' z dirty.txt` reverted a dirty file). An alias defined
+ * in an EARLIER command is a documented residual (needs a config read).
+ */
+function _wtInlineAliases(command) {
+  const map = {};
+  for (const m of String(command ?? "").matchAll(/alias\.([A-Za-z0-9._-]+)=("[^"]*"|'[^']*'|\S+)/g)) {
+    map[m[1]] = String(m[2]).replace(/^['"]|['"]$/g, "");
+  }
+  for (const m of String(command ?? "").matchAll(/\bgit\s+config\s+(?:--\S+\s+)*alias\.([A-Za-z0-9._-]+)\s+("[^"]*"|'[^']*'|\S+)/g)) {
+    map[m[1]] = String(m[2]).replace(/^['"]|['"]$/g, "");
+  }
+  return map;
+}
+
+/**
+ * ANSI-C command words: bash expands `$'\x67it'` to `git` BEFORE execution, so
+ * the walker must see the decoded form (reviewer round-4 P2). M5-only
+ * pre-pass — the shared tokenizer is untouched. Brace alternation (`{git,}`)
+ * and a command-position `$(…)` remain in the documented open-ended
+ * grammar-spelling residual (README Residuals 1/3).
+ */
+function _wtAnsiDecode(text) {
+  return String(text ?? "").replace(/\$'([^']*)'/g, (m, body) => {
+    const decoded = _ansiTranslate(body);
+    // Only substitute when the decoded text is a single PLAIN command word.
+    // Decoding arbitrary bytes used to inject real shell syntax into the text
+    // (`echo $'"' ; git checkout -- f` decoded to an unclosed quote and blinded
+    // everything after it) — reviewer round-5 P1.
+    return /^[A-Za-z0-9_./-]+$/.test(decoded) ? decoded : m;
+  });
+}
+
+/**
+ * Quote-aware `$( … )` command-substitution spans (paren-balanced). The shared
+ * walker tokenizes a QUOTED substitution as part of one word and never
+ * descends, so `echo "$(git checkout -- f)"` produced no descriptor — even
+ * though double quotes do not stop substitution (reviewer round-5 P2).
+ */
+function _wtSubstSpans(text) {
+  const s = String(text ?? "");
+  const out = [];
+  let i = 0;
+  let inSingle = false;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "\\") { i += 2; continue; }
+    if (inSingle) { if (ch === "'") inSingle = false; i++; continue; }
+    if (ch === "'") { inSingle = true; i++; continue; }
+    if (ch === "$" && s[i + 1] === "(") {
+      let depth = 1;
+      let j = i + 2;
+      let buf = "";
+      let q = null;
+      while (j < s.length && depth > 0) {
+        const c = s[j];
+        if (q) { if (c === q) q = null; buf += c; j++; continue; }
+        if (c === "'") { q = c; buf += c; j++; continue; }
+        if (c === "\"") { q = c; buf += c; j++; continue; }
+        if (c === "(") depth++;
+        else if (c === ")") { depth--; if (depth === 0) { j++; break; } }
+        buf += c; j++;
+      }
+      if (buf.trim()) out.push(buf);
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return out;
+}
+
+/** The verbs `extractWorkingTreeDiscards` keys on (a feeder-fed invocation of
+ *  one of these with no resolvable pathspec is conservatively whole-tree). */
+/** Terminal global flags: `git --version` can NEVER take a feeder-supplied
+ *  subcommand (reviewer round-11 P2) — but the walker consumes such flags, so
+ *  the invocation arrives with EMPTY args and is indistinguishable from the
+ *  bare feeder-fed `git` this arm exists for. The narrow fail-closed cost is
+ *  documented in the README instead of guessed at here. */
+const _WT_FAMILY_VERBS = new Set(["checkout", "restore", "switch", "reset", "checkout-index", "rm", "read-tree", "apply"]);
+
+/**
+ * Payloads a shell interpreter reads from its STDIN: here-strings
+ * (`bash <<< 'git checkout -- f'`) and process substitution
+ * (`bash <(printf 'git checkout -- f')`) on a line whose head IS a shell
+ * interpreter. The shared walker cannot resolve these as command words, so the
+ * caller fails closed when one mentions a discard-family verb. A non-interpreter
+ * head (`echo <<< "git …"`, `diff <(ls) <(ls)`) is inert and skipped
+ * (reviewer round-6 P1).
+ */
+function _wtStdinPayloads(text) {
+  const out = [];
+  for (const line of String(text ?? "").split("\n")) {
+    if (!line.includes("<<<") && !line.includes("<(")) continue;
+    const head = _wtHeadInterpreter(line);
+    if (head === null || !_WT_SHELL_WORDS.test(basename(String(head)))) continue;
+    const hs = /<<<\s*(?:'([^']*)'|"([^"]*)"|(\S+))/.exec(line);
+    if (hs) out.push(hs[1] ?? hs[2] ?? hs[3] ?? "");
+    for (let i = line.indexOf("<("); i !== -1; i = line.indexOf("<(", i + 2)) {
+      let depth = 1;
+      let j = i + 2;
+      let buf = "";
+      while (j < line.length && depth > 0) {
+        const c = line[j];
+        if (c === "(") depth++;
+        else if (c === ")") { depth--; if (depth === 0) break; }
+        buf += c; j++;
+      }
+      if (buf.trim()) out.push(buf);
+    }
+  }
+  return out;
+}
+
+/**
+ * Inline `-c` payloads of shell interpreters, one per command segment and
+ * spawner/keyword aware (`bash -lc '…'`, `if x; then sh -ec '…'; fi`,
+ * `env bash -c '…'`). Used by index.ts to fail closed on an OPAQUE payload and
+ * to seed the script walk for a literal one (reviewer round-7 P1/P2).
+ * @param {string} command
+ * @returns {Array<{text: string, opaque: boolean}>}
+ */
+export function wtShellInlinePayloads(command) {
+  const out = [];
+  const text = String(command ?? "");
+  const segs = [];
+  let cur = "";
+  let quote = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) { if (ch === quote) quote = null; cur += ch; continue; }
+    if (ch === "\\") { cur += ch + (text[i + 1] ?? ""); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === "{" || ch === "}" || ch === ")" || ch === "\n") {
+      segs.push(cur); cur = ""; continue;
+    }
+    cur += ch;
+  }
+  segs.push(cur);
+  for (const seg of segs) {
+    const head = _wtHeadInterpreter(seg);
+    if (head === null || !_WT_SHELL_WORDS.test(basename(String(head)))) continue;
+    const toks = _wtShellWords(seg);
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i];
+      if (!(t === "-c" || t === "--command" || (/^-[A-Za-z]*c[A-Za-z]*$/.test(t) && !t.startsWith("--")))) continue;
+      let k = i + 1;
+      while (k < toks.length && toks[k].startsWith("-")) k++;
+      const payload = toks[k];
+      if (payload !== undefined) out.push({ text: payload, opaque: /[$`]/.test(payload) });
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Quote-aware shell WORD split. Whitespace separates words only when
+ * UNQUOTED; quote characters and backslash escapes are PRESERVED in the token
+ * (the callers strip outer quotes themselves, and the extractors re-tokenize).
+ * A plain `split(/\s+/)` truncated every payload containing a space to its
+ * first word — `bash -c "$(printf 'git checkout -- f')"` became `"$(printf`,
+ * which hid the verb and made the fail-closed arm allow a real discard
+ * (reviewer round-7 P1).
+ */
+function _wtShellWords(s) {
+  const out = [];
+  let cur = "";
+  let started = false;
+  let quote = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) { cur += ch; if (ch === quote) quote = null; continue; }
+    if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; started = true; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; started = true; continue; }
+    if (ch === " " || ch === "\t" || ch === "\r") {
+      if (started) { out.push(cur); cur = ""; started = false; }
+      continue;
+    }
+    cur += ch; started = true;
+  }
+  if (started) out.push(cur);
+  return out;
+}
+
+/**
+ * Join backslash-newline line continuations (`git \<LF> checkout -- f` runs
+ * `git checkout -- f`). The tokenizer saw `git`, `\`, `checkout` and found no
+ * invocation (reviewer round-7 P1).
+ */
+export function joinContinuations(command) {
+  return String(command ?? "").replace(/\\\r?\n/g, "");
+}
+
+/**
+ * True when the pipeline's LAST segment runs an interpreter, using the same
+ * head analysis as the heredoc walker — spawners, flags and redirections are
+ * accepted (`… | env bash`, `… | bash -x`, `… | sh -s`, `… | 2>/dev/null bash`),
+ * not just a bare shell word at end-of-command. The old regex demanded the bare
+ * form, so ANY flag or spawner disabled both the piped-file seed and the
+ * piped-shell fail-closed arm (reviewer round-9 P1).
+ *
+ * EVERY segment after the first `|` is inspected (a trailing filter used to
+ * re-hide the consumer, `printf 'git checkout -- f\n' | bash | cat` — reviewer
+ * round-10 P1), and an interpreter that carries its OWN code/script operand
+ * reads the pipe as DATA, not code — `python3 -m json.tool`, `bash -c 'wc -l'`
+ * and `bash script.sh` must not fail closed (reviewer round-10 P2). A stdin
+ * ALIAS (`/dev/stdin`, `/dev/fd/0`, `-`) is an ABSENT operand: `python3
+ * /dev/stdin` executes the pipe as a script (reviewer round-10 P1).
+ * @param {string} command
+ * @returns {boolean}
+ */
+export function wtPipelineFeedsShell(command) {
+  const STDIN_ALIAS = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
+  // A REDIRECTION is not an operand either (`… | bash 2>/dev/null` executes the
+  // pipe as code; treating `2>/dev/null` as a script operand silently disabled
+  // the whole arm — reviewer round-11 P0).
+  const REDIRECT = /^[0-9]*(?:>>?|<<?|<>|>&|<&|&>)/;
+  return String(command ?? "").split("|").slice(1).some((seg) => {
+    const head = _wtHeadInterpreter(seg);
+    if (head === null) return false;
+    const base = basename(String(head));
+    const toks = _wtShellWords(seg);
+    const idx = toks.findIndex((t) => basename(String(t)) === base);
+    return toks.slice(idx + 1).every((t) => t.startsWith("-") || STDIN_ALIAS.test(t) || REDIRECT.test(t));
+  });
+}
+
+/**
+ * Extract every working-tree-discard invocation from a shell command (#709).
+ * @param {string} command
+ * @returns {Array<{form: string, scope: string, pathspecs: string[], fromTree: boolean, verb: string, args: string[], inv: any}>}
+ */
+export function extractWorkingTreeDiscards(command, _depth = 0) {
+  const out = [];
+  const unhandled = [];
+  try {
+    const codeBodies = [];
+    // ONE stripped text feeds every scan: heredoc DATA bodies and `#` comments
+    // are removed there, so the substitution passes below cannot surface a
+    // phantom discard from data (`cat <<EOF … $(git checkout -- f) … EOF`)
+    // — reviewer round-6 P2. SHELL code-heredoc bodies stay in `stripped`, so
+    // real substitutions inside them remain reachable.
+    const stripped = _wtStripHeredocData(_wtAnsiDecode(joinContinuations(command)), codeBodies);
+    const invs = allGitInvocations(stripped);
+    // Here-strings (`bash <<< 'git checkout -- f'`) and process substitution
+    // (`bash <(printf 'git checkout -- f')`) feed an interpreter from a payload
+    // the walker cannot resolve as a command word — fail closed when such a
+    // payload mentions a discard-family verb (reviewer round-6 P1).
+    for (const payload of _wtStdinPayloads(stripped)) {
+      if (/(?:^|\s)(?:git\s+)?(?:checkout|restore|switch|reset|rm|apply|read-tree|checkout-index)\b/.test(payload)) {
+        out.push({ form: "stdin-payload", scope: "all", pathspecs: [], fromTree: true, verb: "stdin", args: [], inv: null, unverifiable: true });
+      }
+    }
+    const aliases = _depth < 2 ? _wtInlineAliases(command) : {};
+    for (const inv of invs) {
+      const verb = inv?.verb;
+      const args = inv?.args ?? [];
+      // A non-static verb (`git "$@"` behind a shell function, `git $CMD`) is
+      // not statically resolvable — fail closed rather than sail past the
+      // verb-keyed switch (reviewer round-5 P1).
+      if (typeof verb === "string" && /[$`]/.test(verb)) {
+        out.push({ form: "unverifiable-verb", scope: "all", pathspecs: [], fromTree: true, verb, args, inv, unverifiable: true });
+        continue;
+      }
+      // An alias-invoked discard has a verb the family does not know — expand
+      // the alias we saw defined above and re-extract (round-3 P2). The alias
+      // VALUE is a git subcommand (git's `!`-prefixed form is arbitrary shell
+      // text → fail closed).
+      const alias = verb && Object.prototype.hasOwnProperty.call(aliases, verb) ? aliases[verb] : null;
+      if (alias) {
+        const val = String(alias).trim();
+        if (val.startsWith("!")) {
+          out.push({ form: "alias-shell", scope: "all", pathspecs: [], fromTree: true, verb: "alias", args: [], inv: null, unverifiable: true });
+          continue;
+        }
+        const expanded = /^git\s/.test(val) ? `${val} ${args.join(" ")}` : `git ${val} ${args.join(" ")}`;
+        for (const nested of extractWorkingTreeDiscards(expanded, _depth + 1)) out.push(nested);
+        continue;
+      }
+      let d = null;
+      if (verb === "checkout") d = _wtDiscardFromCheckout(args);
+      else if (verb === "restore") d = _wtDiscardFromRestore(args);
+      else if (verb === "switch") d = _wtDiscardFromSwitch(args);
+      else if (verb === "reset") d = _wtDiscardFromReset(args);
+      else if (verb === "checkout-index") d = _wtDiscardFromCheckoutIndex(args);
+      else if (verb === "rm") d = _wtDiscardFromRm(args);
+      else if (verb === "read-tree") d = _wtDiscardFromReadTree(args);
+      else if (verb === "apply") d = _wtDiscardFromApply(args);
+      if (d) out.push({ ...d, verb, args, inv });
+      if (!d) unhandled.push({ verb, args, inv });
+    }
+    // A FEEDER supplies the pathspec at runtime (`printf 'f\n' | xargs git
+    // checkout`, `find … -exec git checkout-index -f`), so the helper sees zero
+    // positionals and returns null (reviewer round-5 P2). When the command
+    // carries a feeder and a family verb produced no descriptor, fall back to
+    // the conservative whole-tree descriptor — the effect probe still decides.
+    if (/(?:^|[\s|;&(])(?:[\w./-]*\/)?\\?["']?xargs["']?(?![A-Za-z0-9_.-])/.test(String(command ?? "")) || /\bfind\b[\s\S]*?-exec\b/.test(String(command ?? ""))) {
+      // The FEEDER can also supply the VERB itself (`printf 'checkout -- f\n' |
+      // xargs git`) — the walker then sees a bare `git` invocation with no verb,
+      // which is not in `unhandled` keyed on a family verb, so nothing was
+      // emitted and the discard ran ungated (reviewer round-9 P1). A null-verb
+      // invocation under a feeder whose text names a family verb is exactly as
+      // unresolvable as the pathspec-fed form, and gets the same conservative
+      // whole-tree descriptor (the effect probe still decides).
+      for (const u of unhandled) {
+        if (u.verb && _WT_FAMILY_VERBS.has(u.verb)) {
+          out.push({ form: "feeder-pathspec", scope: "all", pathspecs: [], fromTree: false, verb: u.verb, args: u.args, inv: u.inv });
+        } else if (!u.verb) {
+          // A null-verb `git` under a feeder means the SUBCOMMAND comes from the
+          // feed (`printf 'checkout -- f\n' | xargs git`) — the text probe that
+          // gated this was evadable (`printf 'check\'\'out -- f\n' | xargs git`,
+          // `printf 'check\x6fut -- f\n' | xargs git`), so it now fails closed
+          // unconditionally (reviewer round-10 P1). A feeder-fed `git` with a
+          // literal verb (`… | xargs git status`) never reaches this branch.
+          out.push({ form: "feeder-verb", scope: "all", pathspecs: [], fromTree: false, verb: "feeder", args: u.args, inv: u.inv });
+        }
+      }
+    }
+    // Backtick / `$( … )` command substitution: the walker does not descend
+    // into a quoted span (reviewer round-3/5 P2). Scanned on the STRIPPED text
+    // so heredoc data and comments cannot produce phantom descriptors
+    // (round-6 P2). Recurse, bounded like the heredoc walk.
+    if (_depth < 2) {
+      for (const span of _wtBacktickSpans(stripped)) {
+        for (const nested of extractWorkingTreeDiscards(span, _depth + 1)) out.push(nested);
+      }
+      for (const span of _wtSubstSpans(stripped)) {
+        for (const nested of extractWorkingTreeDiscards(span, _depth + 1)) out.push(nested);
+      }
+    }
+    // Code heredocs (`bash <<EOF`, `cat <<EOF | bash`, `python3 <<PY`) execute
+    // their body, but the git walker does not reach it — re-extract from the
+    // captured body, bounded to 2 levels. SHELL bodies are parsed directly;
+    // CODE bodies go through the same code-payload extractor the `-c`/`-e`
+    // surface uses (reviewer round-2 P2).
+    if (_depth < 2) {
+      for (const body of codeBodies) {
+        if (body.kind === "shell") {
+          for (const nested of extractWorkingTreeDiscards(body.text, _depth + 1)) out.push(nested);
+        } else {
+          for (const cand of extractCodeGitCommands(body.text)) {
+            for (const nested of extractWorkingTreeDiscards(cand, _depth + 1)) out.push(nested);
+          }
+        }
+      }
+    }
+    // Non-git revert shape: the committed path is the SOURCE of a redirect, so
+    // the pure extractor can only surface the hint; index.ts intersects it with
+    // the command's bash write targets (and their resolved absolute paths).
+    const hints = [];
+    for (const inv of invs) {
+      if (inv?.verb === "show" || inv?.verb === "cat-file") {
+        for (const p of _wtDiscardShowTargets(inv.args ?? [])) hints.push(p);
+      }
+    }
+    if (hints.length > 0) {
+      out.push({ form: "cat-file-revert", scope: "revert-hints", pathspecs: hints, fromTree: true, verb: "show", args: [], inv: null });
+    }
+  } catch { /* pure walker — never throw into the gate */ }
+  return out;
+}
+
+/**
+ * #709 effect decision (pure): given `git status --porcelain=v1` output for the
+ * discard's target scope, would the discard destroy uncommitted work?
+ *
+ *  - scope "all"   → any TRACKED entry (X or Y ≠ ' '); `??`/`!!` excluded
+ *                    (`checkout -f`/`reset --hard` do not delete untracked files).
+ *  - scope "paths" → a listed path with a WORKTREE-vs-INDEX difference
+ *                    (`Y ≠ ' '`) — `checkout --`/bare `restore` restore from the
+ *                    index; a tree/commit source (`fromTree`) also overwrites the
+ *                    index, so a staged-only change (`X ≠ ' '`) is destroyed too.
+ * @param {string} porcelain
+ * @param {{scope: string, fromTree?: boolean}} d
+ * @returns {boolean}
+ */
+export function discardDestroysWip(porcelain, d) {
+  const lines = String(porcelain ?? "").split(/\r?\n/).filter((l) => l.length > 0);
+  for (const l of lines) {
+    const x = l[0];
+    const y = l[1];
+    if (x === "?" || x === "!") continue; // untracked / ignored
+    // Unmerged entries (`UU`, `AA`, `DD`, `AU`…) are an UNRESOLVED conflict,
+    // not uncommitted work being discarded — `git checkout --ours/--theirs` is
+    // the sanctioned resolution (reviewer P2).
+    if (x === "U" || y === "U" || (x === "A" && y === "A") || (x === "D" && y === "D")) continue;
+    if (d?.scope === "all") {
+      if (x !== " " || y !== " ") return true;
+      continue;
+    }
+    if (d?.fromTree ? (x !== " " || y !== " ") : (y !== " ")) return true;
+  }
+  return false;
 }
 
 /**
@@ -3352,6 +4316,8 @@ function _checkoutCreateBranch(verb, args) {
  * @param {string} s
  * @returns {string}
  */
+export function ansiTranslate(s) { return _ansiTranslate(s); }
+
 function _ansiTranslate(s) {
   const ansiMap = { n: "\n", t: "\t", r: "\r", "\\": "\\", "'": "'", '"': '"', $: "$", a: "\u0007", b: "\b", f: "\f", v: "\v", e: "\u001b", E: "\u001b" };
   return s.replace(/\\((?:c|C-?)[A-Za-z]|x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|[eE\\'"$ntrabvf])/g, (mm, e) => {
@@ -6889,7 +7855,7 @@ export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
 // mutation is blocked (a script's git ops are gated EXACTLY like direct git
 // ops — recovery scripts like hub-worktree.sh keep working).
 
-const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "source"]);
+const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "oksh", "source"]);
 
 /**
  * Extract the script path from a shell command, or null when the command does
@@ -6901,12 +7867,22 @@ const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "source"
  */
 export function extractScriptPath(command) {
   const tokens = _tokenize(command);
+  // Reviewer round-5 P2 regression guard: basename matching must apply ONLY to
+  // ABSOLUTE tokens (`/bin/sh`, `/usr/bin/env`). Matching a RELATIVE token's
+  // basename retired the M4 script-content closure for colliding names —
+  // `./time evil.sh` (a script named `time`) resolved to null instead of
+  // `./time`, so the script was never read.
+  const isSpawnerTok = (x) => SPAWNER_WORDS.has(x) || (String(x).startsWith("/") && SPAWNER_WORDS.has(basename(String(x))));
+  const isShellTok = (x) => SHELL_INTERPRETERS.has(x) || (String(x).startsWith("/") && SHELL_INTERPRETERS.has(basename(String(x))));
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }   // env prefix
     if (t === "cd") { i += 2; continue; }                         // cd prefix
-    if (SPAWNER_WORDS.has(t) && !SHELL_INTERPRETERS.has(t)) {
+    // `busybox sh evil.sh` — the applet is the interpreter, not `busybox`
+    // (reviewer round-3 P1).
+    if (t === "busybox") { i++; continue; }
+    if (isSpawnerTok(t) && !isShellTok(t)) {
       // round-17 (P2): `exec bash evil.sh` / `env bash evil.sh` — the OUTER
       // spawner is not the interpreter. Round-18 (P1): jump to the FIRST
       // interpreter past the spawner's flags/operands (`sudo -u root bash
@@ -6918,10 +7894,14 @@ export function extractScriptPath(command) {
       while (k < tokens.length) {
         const n = tokens[k];
         if (_isShellBoundary(n) || n === "&&" || n === "||" || n === "&" || n === "|" || n === "(" || n === ")") break;
-        if (SHELL_INTERPRETERS.has(n)) { found = true; break; }
+        if (isShellTok(n)) { found = true; break; }
         k++;
       }
       if (found) { i = k; continue; }
+      // No interpreter after the spawner: an ABSOLUTE/relative PATH token is
+      // the script itself (`./time evil.sh`, `/tmp/time evil.sh` — the
+      // round-5 P2 regression guard), a bare spawner word is not.
+      if (/^\.{0,2}\//.test(t)) break;
       i++;
       continue;
     }
@@ -6932,7 +7912,7 @@ export function extractScriptPath(command) {
   }
   if (i >= tokens.length) return null;
   const t = tokens[i];
-  if (SHELL_INTERPRETERS.has(t)) {
+  if (isShellTok(t)) { // abs path: `/bin/sh evil.sh`
     // (#444) The script operand is the FIRST non-flag, non-redirect positional
     // after the interpreter — NOT the last. `bash script.sh <arg>...` hands
     // the trailing tokens to the script as $1… (probe-verified against real
