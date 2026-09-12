@@ -54,6 +54,20 @@ export const LOCKED_FILES = Object.freeze([
   ".github/workflows/node-ci.yml",
   ".github/workflows/ci-main.yml",
 ]);
+/**
+ * Workflows that are DELIBERATELY not byte-locked, listed explicitly so that a
+ * workflow appearing on disk without appearing in either list is RED instead of
+ * silently accepted (#675 P2-d) — and so that deleting one of these (notably
+ * `workflow-lock.yml`, the trusted structural leg) is also RED.
+ */
+export const UNLOCKED_WORKFLOWS = Object.freeze([
+  ".github/workflows/docs-ci.yml",
+  ".github/workflows/drift-check.yml",
+  ".github/workflows/enforce-skills.yml",
+  ".github/workflows/pipeline-compliance.yml",
+  ".github/workflows/python-ci.yml",
+  ".github/workflows/workflow-lock.yml",
+]);
 export const UPDATE_COMMAND = "node scripts/check-workflow-lock.mjs --update-lock";
 
 /** Absolute path to the lock file under `root`. */
@@ -127,7 +141,7 @@ export function lockFindings(root, lock) {
     if (!LOCKED_FILES.includes(rel)) {
       findings.push(
         `the workflow lock covers an unexpected path ${rel} — the locked set must be exactly ` +
-          `${JSON.stringify([...LOCKED_FILES])}`
+          `${JSON.stringify([...LOCKED_FILES])}; re-lock with \`${UPDATE_COMMAND}\` after removing it`
       );
     }
   }
@@ -149,6 +163,42 @@ export function lockFindings(root, lock) {
           `\`${UPDATE_COMMAND}\` and commit the updated lock alongside the edit`
       );
     }
+  }
+  return findings;
+}
+
+/**
+ * Every `.github/workflows/*.yml` on disk must be CLASSIFIED: either one of the
+ * three locked paths or an explicitly-listed intentionally-unlocked workflow.
+ * Without this, adding `.github/workflows/extra.yml` was silently accepted, and
+ * deleting `workflow-lock.yml` (the trusted structural leg) kept the suite green
+ * because the reader-corpus floor was `>= 8` (#675 P2-d).
+ * → [] when the directory is fully accounted for, else one message per gap.
+ */
+export function workflowCoverageFindings(root) {
+  const dir = path.join(root, ".github", "workflows");
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((name) => name.endsWith(".yml"));
+  } catch (err) {
+    return [`could not read .github/workflows under ${root}: ${err.message}`];
+  }
+  const present = new Set(names.map((name) => `.github/workflows/${name}`));
+  const findings = [];
+  for (const rel of present) {
+    if (LOCKED_FILES.includes(rel) || UNLOCKED_WORKFLOWS.includes(rel)) continue;
+    findings.push(
+      `${rel} is a workflow that is neither locked nor on the explicit unlocked allowlist — ` +
+        "classify it deliberately (add it to LOCKED_FILES and re-lock, or to UNLOCKED_WORKFLOWS) " +
+        "so a new workflow cannot be added silently"
+    );
+  }
+  for (const rel of [...LOCKED_FILES, ...UNLOCKED_WORKFLOWS]) {
+    if (present.has(rel)) continue;
+    findings.push(
+      `${rel} is missing — a workflow in the locked/unlocked allowlist was deleted ` +
+        "(for .github/workflows/workflow-lock.yml that also removes the trusted structural leg)"
+    );
   }
   return findings;
 }
@@ -177,6 +227,9 @@ function main(argv) {
     return 1;
   }
   const findings = lockFindings(root, lock);
+  // The coverage classification is a repo-root property (the fixture roots used
+  // by `--root <dir>` hold only the three locked files on purpose).
+  if (path.resolve(root) === REPO_ROOT) findings.push(...workflowCoverageFindings(root));
   if (findings.length > 0) {
     console.error(`❌ workflow content lock mismatch (${findings.length}):`);
     for (const msg of findings) console.error(`   - ${msg}`);
@@ -186,7 +239,23 @@ function main(argv) {
   return 0;
 }
 
+/**
+ * `process.argv[1]` is the path the CLI was INVOKED as; `import.meta.url` is the
+ * module's realpath (Node resolves symlinks). Comparing a resolved-but-not-real
+ * argv path against the realpath made this false whenever an ancestor is a
+ * symlink (`/tmp` → `/private/tmp` on macOS), so `main()` never ran, nothing was
+ * printed and the process exited 0 — verify mode silently "passed" and
+ * `--update-lock` silently refused to rewrite while exiting 0 (a fresh instance
+ * of issue #708). Compare realpaths on BOTH sides.
+ */
+function sameRealPath(a, b) {
+  try {
+    return fs.realpathSync(a) === fs.realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
 const IS_MAIN =
-  process.argv[1] !== undefined &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  process.argv[1] !== undefined && sameRealPath(process.argv[1], fileURLToPath(import.meta.url));
 if (IS_MAIN) process.exit(main(process.argv));

@@ -102,13 +102,13 @@ jobs:
         # #426 — review-enforcer: the merge-registry gate (gates EVERY merge in
         # this account). Needs the pi package (real runtime import): installed as
         # a devDep (package.json) from the public registry, pinned to the pi
-        # runtime version (0.85.1) for CI parity.
+        # pi runtime version (0.85.1) for CI parity.
         echo "== extensions/review-enforcer/index.test.ts =="
         (cd extensions/review-enforcer && npm ci --no-audit --no-fund --loglevel=error) && \
           NODE_ENV=test npx tsx extensions/review-enforcer/index.test.ts || failures=$((failures+1))
         # #379 — verification-gate: the commit-gate suite (unit + e2e)
         # was unwired. Same route as review-enforcer above (real runtime pi
-        # import — isToolCallEventType): devDep pinned 0.85.1, npm ci once, run
+        # import — isToolCallEventType): pi devDep pinned 0.85.1, npm ci once, run
         # both files. index.e2e.test.ts redirects HOME to a temp dir (hermetic).
         echo "== extensions/verification-gate/index.test.ts =="
         (cd extensions/verification-gate && npm ci --no-audit --no-fund --loglevel=error) && \

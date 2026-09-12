@@ -42,8 +42,12 @@
  * decoy bypasses) this file exists to kill.
  *
  * COST BOUND: every scan is single-pass over its input (no backtracking regex on
- * unbounded newline runs) — the guard reads PR-controlled files, so a quadratic
- * path is a CI DoS, even though it stays fail-closed (#675 P2-3).
+ * unbounded newline runs; flow collections are consumed by one left-to-right
+ * pass, never re-scanned per nesting level) — the guard reads PR-controlled
+ * files, so a quadratic path is a CI DoS, even though it stays fail-closed
+ * (#675 P2-3, #675 P2-6). Flow recursion is additionally depth-bounded
+ * (MAX_FLOW_DEPTH) so a crafted `key: [[[[…]]]]` raises WorkflowYamlError rather
+ * than a RangeError.
  *
  * KNOWN NON-GOALS (documented, not silently fudged):
  *   - scalar TYPES are not resolved: every scalar is a string, so `on` is always
@@ -191,96 +195,139 @@ function parseKey(text, line) {
 
 // ── flow collections ───────────────────────────────────────────────────────
 
-/** Index of the character closing the flow collection opened at text[0], or -1. */
-function flowEnd(text) {
-  const open = text[0];
+/**
+ * Maximum nesting depth for a flow collection. The reader parses PR-controlled
+ * bytes, so recursion is BOUNDED and a document past the bound is REJECTED with
+ * a WorkflowYamlError instead of exhausting the stack (#675 P2-6). 64 is far
+ * above any real workflow and rejecting past it is cheap.
+ */
+const MAX_FLOW_DEPTH = 64;
+
+/** Skip spaces/tabs (flow collections in this reader are single-line). */
+function skipFlowSpace(text, i) {
+  while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+  return i;
+}
+
+/**
+ * Parse a flow mapping key at `text[start]` → {name, next}, where `next` is the
+ * index just past the `:`. Returns null when no key/colon pair starts there.
+ */
+function parseFlowKey(text, start, line) {
+  const first = text[start];
+  if (first === '"' || first === "'") {
+    const scanned = scanQuoted(text, start, line);
+    if (!scanned) return null;
+    const m = /^[ \t]*:/.exec(text.slice(scanned.end));
+    if (!m) return null;
+    return { name: scanned.value, next: scanned.end + m[0].length };
+  }
+  for (let i = start; i < text.length; i++) {
+    if (text[i] !== ":") continue;
+    const next = text[i + 1];
+    if (next !== undefined && next !== " " && next !== "\t") continue;
+    const name = text.slice(start, i).trimEnd();
+    if (!PLAIN_KEY_RE.test(name)) return null;
+    return { name, next: i + 1 };
+  }
+  return null;
+}
+
+/**
+ * Parse one flow VALUE at `text[start]` → {value, end}: a nested collection
+ * (depth-checked recursion), a quoted scalar (escapes decoded), or a plain
+ * scalar read up to the next top-level `,` or the collection's closing bracket.
+ * The escape validation keeps an unmodelled escape from smuggling a `,` or a
+ * quote past the scan (#675 P1-1).
+ */
+function parseFlowValue(text, start, line, depth) {
+  const c = text[start];
+  if (c === '"' || c === "'") {
+    const scanned = scanQuoted(text, start, line);
+    if (!scanned) {
+      throw new WorkflowYamlError("unterminated quoted scalar in a flow collection", line);
+    }
+    return { value: scanned.value, end: scanned.end };
+  }
+  if (c === "[" || c === "{") return parseFlow(text, line, start, depth + 1);
+  let j = start;
+  let nested = 0;
+  let q = null;
+  while (j < text.length) {
+    const ch = text[j];
+    if (q === '"') {
+      if (ch === "\\") { const esc = decodeEscape(text, j, line); j = esc.next; continue; }
+      if (ch === '"') q = null;
+      j++;
+      continue;
+    }
+    if (q === "'") {
+      if (ch === "'" && text[j + 1] === "'") { j += 2; continue; }
+      if (ch === "'") q = null;
+      j++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { q = ch; j++; continue; }
+    if (ch === "[" || ch === "{") { nested++; j++; continue; }
+    if (ch === "]" || ch === "}") { if (nested === 0) break; nested--; j++; continue; }
+    if (ch === "," && nested === 0) break;
+    j++;
+  }
+  return { value: parseScalarText(text.slice(start, j).trim(), line), end: j };
+}
+
+/**
+ * Parse the flow collection that starts at `text[start]`. → {value, end}.
+ *
+ * SINGLE PASS (#675 P2-6): every character is consumed exactly once — a nested
+ * collection is consumed by the recursive call and the caller resumes at its
+ * `end` — so `key: [[[[…]]]]` is O(n), not O(depth × n), and MAX_FLOW_DEPTH
+ * keeps the recursion off the stack limit (a crafted document raises
+ * WorkflowYamlError instead of RangeError). Empty items left by a stray comma
+ * are skipped, preserving the pre-single-pass behaviour.
+ */
+function parseFlow(text, line, start = 0, depth = 0) {
+  if (depth > MAX_FLOW_DEPTH) {
+    throw new WorkflowYamlError(
+      `flow collection nesting is deeper than ${MAX_FLOW_DEPTH} levels — refused (the reader ` +
+        "bounds flow recursion so crafted input cannot exhaust the stack)",
+      line
+    );
+  }
+  const open = text[start];
   const close = open === "[" ? "]" : "}";
-  let depth = 0;
-  let q = null;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (q) {
-      if (q === '"' && c === "\\") { i++; continue; }
-      if (q === "'" && c === "'" && text[i + 1] === "'") { i++; continue; }
-      if (c === q) q = null;
-      continue;
-    }
-    if (c === '"' || c === "'") { q = c; continue; }
-    if (c === "[" || c === "{") { depth++; continue; }
-    if (c === "]" || c === "}") {
-      depth--;
-      if (depth === 0) return c === close ? i : -1;
-    }
-  }
-  return -1;
-}
-
-/** Split flow-collection inner text on top-level commas (quote/nesting aware). */
-function splitFlowItems(inner, line) {
-  const items = [];
-  let depth = 0;
-  let buf = "";
-  let q = null;
-  for (let i = 0; i < inner.length; i++) {
-    const c = inner[i];
-    if (q) {
-      if (q === '"' && c === "\\") {
-        // Validate (and skip) the escape without decoding it: the raw text is
-        // kept so `scanQuoted` decodes it exactly once. An escape this reader
-        // does not model is rejected here too — it must not be able to smuggle
-        // a `,`/quote past the splitter (#675 P1-1).
-        const esc = decodeEscape(inner, i, line);
-        buf += inner.slice(i, esc.next);
-        i = esc.next - 1;
-        continue;
+  const mapping = open === "{";
+  const out = mapping ? {} : [];
+  let i = skipFlowSpace(text, start + 1);
+  for (;;) {
+    if (text[i] === close) return { value: out, end: i + 1 };
+    if (text[i] === ",") { i = skipFlowSpace(text, i + 1); continue; }
+    if (i >= text.length) throw new WorkflowYamlError("unbalanced flow collection", line);
+    if (mapping) {
+      const key = parseFlowKey(text, i, line);
+      if (!key) {
+        throw new WorkflowYamlError(
+          `flow mapping entry is not a \`key: value\` pair: ${JSON.stringify(text.slice(i, i + 24))}`,
+          line
+        );
       }
-      buf += c;
-      if (q === "'" && c === "'" && inner[i + 1] === "'") { buf += "'"; i++; continue; }
-      if (c === q) q = null;
-      continue;
+      i = skipFlowSpace(text, key.next);
+      if (text[i] === "," || text[i] === close) {
+        out[key.name] = null;
+      } else {
+        const v = parseFlowValue(text, i, line, depth);
+        out[key.name] = v.value;
+        i = skipFlowSpace(text, v.end);
+      }
+    } else {
+      const v = parseFlowValue(text, i, line, depth);
+      out.push(v.value);
+      i = skipFlowSpace(text, v.end);
     }
-    if (c === '"' || c === "'") { q = c; buf += c; continue; }
-    if (c === "[" || c === "{") { depth++; buf += c; continue; }
-    if (c === "]" || c === "}") { depth--; buf += c; continue; }
-    if (c === "," && depth === 0) { items.push(buf); buf = ""; continue; }
-    buf += c;
+    if (text[i] === ",") { i = skipFlowSpace(text, i + 1); continue; }
+    if (text[i] === close) return { value: out, end: i + 1 };
+    throw new WorkflowYamlError("unbalanced flow collection", line);
   }
-  items.push(buf);
-  return items;
-}
-
-/** One flow entry: nested collection | quoted scalar | plain scalar. */
-function parseFlowEntry(text, line) {
-  const t = text.trim();
-  if (t === "") return null;
-  if (t[0] === '"' || t[0] === "'") {
-    const s = scanQuoted(t, 0, line);
-    if (!s || t.slice(s.end).trim() !== "") {
-      throw new WorkflowYamlError("flow entry is not a single-line quoted scalar", line);
-    }
-    return s.value;
-  }
-  if (t[0] === "[" || t[0] === "{") return parseFlow(t, line).value;
-  return parseScalarText(t, line);
-}
-
-/** Parse the flow collection that starts at text[0]. → {value, end}. */
-function parseFlow(text, line) {
-  const end = flowEnd(text);
-  if (end === -1) throw new WorkflowYamlError("unbalanced flow collection", line);
-  const open = text[0];
-  const inner = text.slice(1, end);
-  const rawItems = splitFlowItems(inner, line).map((s) => s.trim()).filter((s) => s !== "");
-  if (open === "[") {
-    return { value: rawItems.map((s) => parseFlowEntry(s, line)), end: end + 1 };
-  }
-  const entries = [];
-  for (const item of rawItems) {
-    const key = parseKey(item, line);
-    if (!key) throw new WorkflowYamlError(`flow mapping entry is not a \`key: value\` pair: ${JSON.stringify(item)}`, line);
-    entries.push([key.name, key.rest.trim() === "" ? null : parseFlowEntry(key.rest, line)]);
-  }
-  return { value: Object.fromEntries(entries), end: end + 1 };
 }
 
 /** A scalar already isolated from its key (flow entry, sequence item, value). */

@@ -1,27 +1,43 @@
 # ⚠️ SECURITY — READ BEFORE EDITING THIS FILE ⚠️
 #
 # This workflow uses the `pull_request_target` trigger. GitHub runs the workflow
-# DEFINITION from the BASE branch (`main`) for this event — the PR cannot
-# substitute its own copy. That is the entire point: it is the checker a PR
-# cannot edit or delete, so it can validate a PR's workflow files even though the
-# PR controls those files.
+# DEFINITION from the BASE branch (`main`) for this event — a PR cannot
+# substitute its own copy of THIS file. That is what this file buys: the
+# structural checker runs from a copy the PR cannot rewrite.
 #
-# Because of that, this workflow MUST NEVER check out, execute, build, or
-# `npm install` any PR content. `actions/checkout` below deliberately has NO
-# `ref:` — it checks out the base branch. The PR's workflow files are read as
-# DATA through the GitHub Contents API at the PR head SHA only
+# TRUST SPLIT — read this before describing what is "protected" (authoritative
+# statement: the module header of scripts/check-pi-pin-lockstep.mjs; this is a
+# pointer to it, not a second copy, so the two cannot drift apart):
+#   - The content lock (scripts/workflow-lock.json) is a conspicuousness
+#     tripwire enforced by PR-EDITABLE code, NOT a PR-uneditable control. Its
+#     only call site is the PR's own copy of the checker, run from the
+#     PR-editable .github/workflows/ci.yml.
+#   - THIS job provides the STRUCTURAL assertions only and provides ZERO lock
+#     enforcement — `--head-ref` skips the lock by design, or else every
+#     legitimate workflow change would deadlock against `main`'s old lock.
+#   - A PR that edits a workflow AND the lock together passes both legs. That is
+#     the pre-existing accepted same-commit residual, now conspicuous in the
+#     diff.
+#
+# BOOTSTRAP: `pull_request_target` resolves this workflow file from the DEFAULT
+# branch, so this job does not run on the PR that adds it — it takes effect on
+# the NEXT PR after this file lands on `main`. Nothing here verifies that it
+# runs post-merge; `scripts/check-pi-pin-lockstep.mjs` asserts instead that this
+# file exists and is wired (pull_request_target + the `--head-ref` invocation),
+# so deleting or unwiring it is RED.
+#
+# Because the trigger is privileged, this workflow MUST NEVER check out, execute,
+# build, or `npm install` any PR content. `actions/checkout` below deliberately
+# has NO `ref:` — it checks out the base branch. The PR's workflow files are read
+# as DATA through the GitHub Contents API at the PR head SHA only
 # (`node scripts/check-pi-pin-lockstep.mjs --head-ref <sha>`, which decodes the
-# API's base64 and parses it — it never executes it). Passing the PR head to
-# `actions/checkout`, or any step that runs PR content, turns this into the
-# well-known `pull_request_target` RCE vector.
+# API's base64 — failing closed on anything but base64 — and parses it; it never
+# executes it). Passing the PR head to `actions/checkout`, or any step that runs
+# PR content, turns this into the well-known `pull_request_target` RCE vector.
 #
 # See GitHub Security Lab, "Keeping your GitHub Actions and workflows secure:
 # Preventing pwn requests" (Part 4) and GitHub's "Securely using
 # pull_request_target" guidance.
-#
-# The content lock (scripts/workflow-lock.json) is the primary defence for the
-# pin gate; this job adds the structural half using a trusted copy of the
-# checker. See the decision on issue #666.
 
 name: Workflow lock (base-branch checker)
 
@@ -29,11 +45,12 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened, edited]
 
-# Read-only. `contents: read` covers the checkout and the Contents API call;
-# no secret is passed to the job.
+# Read-only. `contents: read` covers the checkout and the Contents API call.
+# `pull-requests: read` is deliberately NOT granted — nothing here reads PR
+# metadata (the only API call is the Contents endpoint); declaring an unused
+# scope is the P2-h finding from the #675 review.
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   workflow-lock:

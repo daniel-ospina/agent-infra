@@ -25,14 +25,28 @@
  * working bypasses and the second round's were created by the first round's
  * fixes. Modelling semantics was the wrong question.
  *
- * THE CONTENT LOCK IS THE PRIMARY DEFENCE. scripts/check-workflow-lock.mjs
- * hashes `.github/workflows/ci.yml`, `.github/workflows/node-ci.yml` and
- * `.github/workflows/ci-main.yml` byte-for-byte against
- * scripts/workflow-lock.json. Every bypass above requires EDITING one of those
- * files, which changes its hash — there is nothing left to enumerate. A
- * `pull_request_target` workflow defined on `main`
- * (.github/workflows/workflow-lock.yml) runs THIS script's `--head-ref` mode
- * against a PR's workflow bytes, so the PR cannot delete or neuter the checker.
+ * THE CONTENT LOCK IS A CONSPICUOUSNESS TRIPWIRE, NOT A PR-UNEDITABLE CONTROL.
+ * scripts/check-workflow-lock.mjs hashes `.github/workflows/ci.yml`,
+ * `.github/workflows/node-ci.yml` and `.github/workflows/ci-main.yml`
+ * byte-for-byte against scripts/workflow-lock.json. Every bypass above requires
+ * EDITING one of those files, which changes its hash — there is nothing left to
+ * enumerate. But the ONLY call site of `lockFindings()` is THIS script's own
+ * copy, run from the PR-EDITABLE `.github/workflows/ci.yml`, so the lock is
+ * enforced by PR-editable code. Precisely:
+ *   - the lock is a tripwire enforced by PR-EDITABLE code — a PR can delete or
+ *     neuter that code, and then the lock is simply not checked;
+ *   - the trusted leg (the `pull_request_target` workflow defined on `main`,
+ *     .github/workflows/workflow-lock.yml, which runs THIS script's
+ *     `--head-ref` mode) provides the STRUCTURAL ASSERTIONS ONLY and provides
+ *     ZERO lock enforcement — it skips the lock by design, because otherwise
+ *     every legitimate workflow change would deadlock against `main`'s old lock;
+ *   - a PR that edits a workflow AND the lock together therefore passes both
+ *     legs. That is the pre-existing accepted same-commit residual, now
+ *     conspicuous in the diff (two files, one literally named a lock, and a
+ *     visible hash change).
+ * THIS PARAGRAPH IS THE AUTHORITATIVE STATEMENT of the trust split. The workflow
+ * header of .github/workflows/workflow-lock.yml and the plan doc reference it
+ * instead of restating it, so the three claims cannot drift apart.
  *
  * THE NARROW GUARD IS THE BETTER ERROR MESSAGE. `wiringFindings` asserts six
  * DECLARATIVE facts about the agreed wiring and reasons about VALUES, not about
@@ -54,19 +68,27 @@
  *
  * ITEM (6) IS THE ONE EXCEPTION to "no shell modelling" (the decision posted on
  * #666): the ci-main.yml invocation is read as a LINE, not a parsed node,
- * because the thing being asserted is a shell failure-accumulator. The line
- * check additionally rejects the round-2 control-flow evasions a matched line
- * alone would miss: the invocation sitting inside `if`/`then`/`fi`/`while`/`for`
- * or a heredoc (never executed), an `|| true` between the invocation and the
- * accumulator (the accumulator never runs), and an `exit 0` after the
- * invocation and before the `if [ $failures -gt 0 ]` guard (the failure is
- * swallowed). The lock is still the primary defence; this is a better message.
+ * because the thing being asserted is a shell failure-accumulator. It is a
+ * BOUNDED LEXICAL check, not an execution-semantics model: quoted spans,
+ * comments and heredoc bodies are removed, a control-flow keyword counts only in
+ * COMMAND POSITION, and the check then requires (a) the EXACT accumulator line
+ * `node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))`, (b) a
+ * `failures=0` initialisation before it, and (c) a failure guard
+ * `if [ $failures -gt 0 ] … fi` after it whose body exits NON-ZERO. Relocation
+ * evasions a matched line alone would miss are rejected: the invocation inside
+ * `if`/`then`/`fi`, a loop, a heredoc, a `case`/`esac` block, a function body or
+ * a `{ … }`/`( … )` group (including one short-circuited by `false &&`), an
+ * `|| true` before the accumulator, and an `exit 0` or `trap … EXIT` anywhere in
+ * the command. The lock is the tripwire; this is a better message. See the
+ * authoritative trust-split statement above.
  *
  * `--head-ref <sha>` MODE (used by .github/workflows/workflow-lock.yml): fetch
  * the three workflow files at that ref through `gh api …/contents/<path>?ref=`
- * (decode base64) and run ONLY the narrow structural assertions (1)–(6) against
- * those bytes. The content lock is SKIPPED in this mode by design — otherwise
- * every legitimate workflow change would deadlock against `main`'s old lock.
+ * and run ONLY the narrow structural assertions (1)–(6) against those bytes. The
+ * decode is fail-closed: only `encoding: "base64"` is trusted (the API returns
+ * `none` + empty content for a >1 MB blob) and a lossy decode throws. The
+ * content lock is SKIPPED in this mode by design — this leg provides ZERO lock
+ * enforcement (see the authoritative trust-split statement above).
  * `--repo <owner/name>` overrides the repo (else it is derived from
  * `git remote get-url origin`).
  *
@@ -114,10 +136,12 @@ import { PI_VERSION_PIN } from "./frontmatter-fixtures.mjs";
 import { parseWorkflowYaml, WorkflowYamlError } from "./workflow-yaml.mjs";
 import {
   LOCKED_FILES,
+  UNLOCKED_WORKFLOWS,
   hashLockedFiles,
   lockFindings,
   lockPath,
   readLock,
+  workflowCoverageFindings,
   writeLockFile,
 } from "./check-workflow-lock.mjs";
 
@@ -132,6 +156,11 @@ const CHECK_LOCK = path.join(REPO_ROOT, "scripts", "check-workflow-lock.mjs");
 // binding that function reads must already be initialized (TDZ-safe). Function
 // declarations are hoisted; these consts and `isMap` are not.
 const isMap = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+// Shell token scanner used by the item-6 lexical check. Declared HERE (before the
+// --head-ref dispatch below) because `wiringFindings` is reached from that
+// dispatch at module-evaluation time, and a `const` in the item-6 section would
+// still be in its temporal dead zone (#675 review-fix e2e finding).
+const SHELL_TOKEN_RE = /&&|\|\||[;&|(){}]|[^\s;&|(){}]+/g;
 const EXPECTED_USES = "daniel-ospina/agent-infra/.github/workflows/node-ci.yml@main";
 // #675 P2-2 — a FAILURE ACCUMULATOR, not `&&` (see the header for why).
 const EXPECTED_TEST_COMMAND =
@@ -139,7 +168,12 @@ const EXPECTED_TEST_COMMAND =
   "|| b=$?; [ $a -eq 0 ] && [ $b -eq 0 ]";
 const POST_MERGE_INVOCATION_RE = /^node\s+scripts\/check-pi-pin-lockstep\.mjs\b/;
 const ACCUMULATOR_SUFFIX_RE = /^\s*\|\|\s*failures=\$\(\(failures\+1\)\)\s*$/;
-const FAILURE_GUARD_RE = /^if\s*\[\s*\$failures\s*-gt\s*0\s*\]\s*;?\s*then\s*$/;
+// The exact, required accumulator line (the invocation must be exactly this).
+const POST_MERGE_INVOCATION =
+  "node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))";
+const FAILURE_GUARD_OPEN_RE = /^if\s*\[\s*\$failures\s*-gt\s*0\s*\]\s*;?\s*then$/;
+const FAILURE_GUARD_CLOSE_RE = /^fi$/;
+const NONZERO_EXIT_RE = /^exit\s+[1-9][0-9]*$/;
 
 // ── --head-ref mode (trusted copy validating a PR's workflow bytes) ──────────
 // Kept ahead of the suite: in this mode the suite does not run at all (the local
@@ -173,14 +207,52 @@ function resolveRepo() {
   }
 }
 
-/** Read one file at a ref through the GitHub Contents API (base64 → utf8). */
+/**
+ * Decode a GitHub Contents API JSON payload → utf8 text, failing CLOSED.
+ *
+ * The API returns `encoding: "none"` with an empty `content` for a blob over
+ * 1 MB. Reading `.content` unconditionally (the pre-fix behaviour) turned such a
+ * file into "" — and because `parseWorkflowYaml("")` returns null, that silently
+ * DISARMED every structural assertion (#675 P1-1). A non-base64 payload is an
+ * error, not an empty workflow. `TextDecoder(…, { fatal: true })` rejects a
+ * lossy decode for the same reason: a damaged read must never look like a valid
+ * workflow.
+ */
+function decodeContentsApi(payload, rel) {
+  let body;
+  try {
+    body = JSON.parse(payload);
+  } catch (err) {
+    throw new Error(`${rel}: Contents API did not return JSON (${String(err?.message ?? err)})`);
+  }
+  if (!isMap(body) || body.encoding !== "base64" || typeof body.content !== "string") {
+    throw new Error(
+      `${rel}: Contents API returned encoding=${JSON.stringify(body?.encoding ?? null)} — only ` +
+        'base64 content is trusted (a >1 MB blob comes back as encoding "none" with empty ' +
+        "content, which must never be read as an empty workflow)"
+    );
+  }
+  const bytes = Buffer.from(body.content.replace(/\s+/g, ""), "base64");
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error(`${rel}: Contents API content is not valid UTF-8`);
+  }
+}
+
+/** Read one file at a ref through the GitHub Contents API (fail-closed decode). */
 function fetchRefFile(repo, ref, rel) {
-  const b64 = execFileSync(
+  const json = execFileSync(
     "gh",
-    ["api", `repos/${repo}/contents/${rel}?ref=${ref}`, "--jq", ".content"],
+    [
+      "api",
+      `repos/${repo}/contents/${rel}?ref=${ref}`,
+      "-H",
+      "Accept: application/vnd.github+json",
+    ],
     { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }
   );
-  return Buffer.from(b64.replace(/\s+/g, ""), "base64").toString("utf8");
+  return decodeContentsApi(json, rel);
 }
 
 /** The structural assertions, run against already-fetched sources. Never touches the lock. */
@@ -231,11 +303,19 @@ if (HEAD_REF !== null) runHeadRefMode(HEAD_REF, argValue("--repo") ?? resolveRep
 
 let passed = 0;
 let failed = 0;
+// #675 P2-c — a COUNT floor is not an identity: disabling 3 real tests and adding
+// 3 `test("filler", () => assert.ok(true))` no-ops kept the total at 69. These
+// sets let the run name the specific assertions that must exist and pass, so a
+// deleted/renamed/neutered one is RED no matter what fills the count.
+const ranTests = new Set();
+const passedTests = new Set();
 
 function test(name, fn) {
+  ranTests.add(name);
   try {
     fn();
     passed++;
+    passedTests.add(name);
     console.log(`  ✅ ${name}`);
   } catch (err) {
     failed++;
@@ -373,7 +453,7 @@ test("pinFindings flags a drifted pin (positive control for (h))", () => {
 // Guard the whole stamp SET, not a phrase. A per-file phrase pattern was tried first and missed 2 of
 // the 5 pi stamps (frontmatter-validate's "probe pi X" and ci-main's "devDep pinned X") — the same
 // silent-staleness class this guard exists to close. So: every `<major>.<minor>.<patch>` literal on a
-// STAMP-CONTEXT line of these four hand-synced surfaces must be PI_VERSION_PIN or a listed non-pi
+// line that NAMES PI of these four hand-synced surfaces must be PI_VERSION_PIN or a listed non-pi
 // dependency version.
 //
 // #675 P1-4 — the sweep is scoped to stamp context and the per-surface assertion is a FLOOR, not an
@@ -384,10 +464,10 @@ test("pinFindings flags a drifted pin (positive control for (h))", () => {
 // silently dropped" when nothing was. This is the same class as #485 T2 (issue #779).
 //
 // Known scope bounds: 3-component literals only (a `pi 0.86` stamp is invisible); a literal is only a
-// stamp when its own line carries a pi/stamp keyword (a stale stamp reworded onto a keyword-free line
-// is invisible); the allowlist is keyed by version STRING rather than occurrence; and version-specific
-// LINE REFERENCES are deliberately not asserted — they move within a version and must be re-derived
-// by hand (see #651).
+// stamp when its own line names pi (a stale stamp reworded onto a pi-free line is invisible — but that
+// also drops it from coverage, which trips the floor below loudly); the allowlist is keyed by version
+// STRING rather than occurrence; and version-specific LINE REFERENCES are deliberately not asserted —
+// they move within a version and must be re-derived by hand (see #651).
 section("mirror version stamps match PI_VERSION_PIN");
 
 const MIRROR_FILES = [
@@ -402,11 +482,18 @@ const ALLOWED_NON_PI = {
   "scripts/frontmatter-validate.mjs": ["2.9.0"], // yaml
   "docs/providers.md": ["8.9.0"], // undici
 };
-// A version literal counts as a STAMP only on a line that talks about the pin:
-// the version word, a pi package, a probe, a devDep pin, or "verified against".
-// This is what keeps an unrelated literal (a Node floor, a runner image tag, a
-// changelog fragment) from being read as a pi stamp (#675 P1-4).
-const STAMP_CONTEXT_RE = /\bpi\b|pi-ai|pi-coding-agent|probe|devDep|verified against|version|parity/i;
+// #675 P1-5 — EXPLICIT STAMP CONTRACT. A 3-component literal is a pi stamp only on a line that NAMES
+// PI (`pi`, `pi-ai`, `pi-coding-agent`, `pi devDep` — a `\bpi\b` token covers all of them). The
+// previous pattern also matched the ordinary English words `version`, `parity`, `probe` and `devDep`,
+// so unrelated prose carrying a literal was read as a stamp: appending "This setup requires Node
+// version 20.11.1 or newer." to docs/providers.md, "See the parity notes for build 24.04.1 LTS.",
+// "A probe of the 3.11.4 runtime is pending.", or "// Runner image parity: 22.11.0" all reddened the
+// suite — the same incident class as #485 T2 (issue #779, which reddened main twice on 2026-09-10).
+// Moving the stamp marker to the pi token itself is the fix: none of those prose lines names pi, while
+// every real stamp line on all four surfaces does (the ci-main.yml stamp comments were reworded to
+// name pi, which is what they are stamping). A stamp line reworded to drop the pi token falls out of
+// coverage and trips the per-surface floor below, loudly, instead of silently weakening the guard.
+const PI_STAMP_MARKER_RE = /\bpi\b/i;
 const VERSION_LITERAL_RE = /\d+\.\d+\.\d+/g;
 // Per-surface FLOOR, not an exact count: coverage may GROW (adding a correct
 // stamp is a deliberate act, not a tripwire event) but must never SHRINK below
@@ -425,7 +512,7 @@ function collectStampLiterals(file, src) {
   const allowed = ALLOWED_NON_PI[file] ?? [];
   const out = [];
   src.split("\n").forEach((line, idx) => {
-    if (!STAMP_CONTEXT_RE.test(line)) return;
+    if (!PI_STAMP_MARKER_RE.test(line)) return;
     for (const value of line.match(VERSION_LITERAL_RE) ?? []) {
       if (allowed.includes(value)) continue;
       out.push({ line: idx + 1, value });
@@ -502,10 +589,38 @@ test("stampFindings flags a stale stamp (positive control for (i))", () => {
   );
 });
 
+// #675 P1-5 / #779 — the four reproduced false positives, as GREEN fixtures. None
+// of these lines names pi, so none may be read as a pi stamp, regardless of the
+// other English words it carries (`version`, `parity`, `probe`) or its surface.
+test("prose carrying a 3-component literal is not a pi stamp (#779 GREEN fixtures)", () => {
+  const cases = [
+    ["docs/providers.md", "This setup requires Node version 20.11.1 or newer.\n"],
+    ["docs/providers.md", "See the parity notes for build 24.04.1 LTS.\n"],
+    ["docs/providers.md", "A probe of the 3.11.4 runtime is pending.\n"],
+    ["scripts/frontmatter-validate.mjs", "// Runner image parity: 22.11.0\n"],
+  ];
+  for (const [file, line] of cases) {
+    assert.deepEqual(
+      stampFindings([{ file, src: line }], PI_VERSION_PIN),
+      [],
+      `${file}: ${JSON.stringify(line.trim())} must NOT be read as a pi stamp`
+    );
+  }
+  // The contract still catches a real stamp on every surface — including the
+  // frontmatter-validate stamps, which are now identified by the pi token rather
+  // than the bare word `probe`.
+  assert.equal(
+    stampFindings([{ file: "scripts/frontmatter-validate.mjs", src: "// pi v0.0.1 x\n" }], PI_VERSION_PIN).length,
+    1,
+    "a pi-naming line with a wrong version must still be reported"
+  );
+});
+
 // ── (j) the pin gate is still wired — the narrow, declarative guard ─────────
 // #637 wires the suites into the PR path with `with: test-command:` → the reusable node-ci.yml, whose
 // unit-test job is SKIPPED when that input is empty. #666 replaced the denylist of execution-semantics
-// neutralisers with (a) the content lock (primary defence) and (b) this narrow guard (better error
+// neutralisers with (a) the content lock (a tripwire enforced by PR-editable code — see the
+// authoritative trust-split statement in the module header) and (b) this narrow guard (better error
 // message). Only six declarative facts are asserted here — see the header. NOT asserted here, because
 // the lock covers them: `shell:`, `env:`, `container:`, `services:`, `runs-on:`, `defaults:`,
 // `strategy.matrix`, trigger filters, job/step `needs:`, and step predicates.
@@ -528,6 +643,20 @@ function readError(label, err) {
 }
 
 /**
+ * A zero-token document (`parseWorkflowYaml` returns null) must be RED, exactly
+ * as `ciMainFindings` treats it. Skipping the assertions instead was a fail-open:
+ * an empty/comments-only ci.yml produced ZERO findings and the trusted
+ * `--head-ref` leg printed ✅ (#675 P1-1).
+ */
+function emptyDocFinding(label) {
+  return (
+    `${label} read as an EMPTY document (zero YAML tokens — an empty file, a comments-only ` +
+    "file, or a lone `---`) — that would silently skip every structural assertion, so it is " +
+    "rejected rather than read as a valid workflow"
+  );
+}
+
+/**
  * Evaluate the pin-gate wiring from the three workflow SOURCES.
  * → [] when every narrow invariant holds, else one message per broken invariant.
  * Assertions are VALUES read from parsed nodes (items 1–5) plus the one
@@ -535,22 +664,26 @@ function readError(label, err) {
  */
 function wiringFindings(ciSrc, nodeCiSrc, ciMainSrc) {
   const f = [];
-  let caller = null;
-  let callee = null;
+  let caller;
+  let callerRead = false;
+  let callee;
+  let calleeRead = false;
   try {
     caller = parseWorkflowYaml(ciSrc);
+    callerRead = true;
   } catch (err) {
     f.push(readError(".github/workflows/ci.yml", err));
   }
   try {
     callee = parseWorkflowYaml(nodeCiSrc);
+    calleeRead = true;
   } catch (err) {
     f.push(readError(".github/workflows/node-ci.yml", err));
   }
 
-  if (caller !== null) {
+  if (callerRead) {
     if (!isMap(caller)) {
-      f.push("ci.yml did not read as a top-level mapping");
+      f.push(caller === null ? emptyDocFinding("ci.yml") : "ci.yml did not read as a top-level mapping");
     } else {
       // (1) The trigger is present. `on` may be a mapping (`pull_request:`), a
       // scalar (`on: pull_request`) or a flow sequence (`on: [pull_request]`) —
@@ -629,9 +762,11 @@ function wiringFindings(ciSrc, nodeCiSrc, ciMainSrc) {
     }
   }
 
-  if (callee !== null) {
+  if (calleeRead) {
     if (!isMap(callee)) {
-      f.push("node-ci.yml did not read as a top-level mapping");
+      f.push(
+        callee === null ? emptyDocFinding("node-ci.yml") : "node-ci.yml did not read as a top-level mapping"
+      );
     } else {
       // (5) The callee still declares the `unit-test` job and the `test-command`
       // workflow_call input. (Its steps' execution semantics are the lock's job.)
@@ -657,40 +792,143 @@ function wiringFindings(ciSrc, nodeCiSrc, ciMainSrc) {
 }
 
 // ── (j), post-merge half — the ci-main.yml shell accumulator (item 6) ───────
+//
+// BOUNDED LEXICAL CHECK, NOT A SHELL MODEL (#675 P1-6 + P2-a). The invariant is
+// a shell failure-accumulator, so a pure presence check is not enough: an
+// invocation inside `case`, a function body, a `{ … }` group short-circuited by
+// `false &&`, an inline `if …; then exit 0; fi`, or a `trap … EXIT` all leave the
+// literal line present while the gate is dead. Rather than model execution
+// semantics (the class this PR deleted), this REMOVES quoted spans, comments and
+// heredoc bodies, counts control-flow keywords ONLY in command position, and
+// requires the exact accumulator line plus a failure guard that exists and exits
+// non-zero. The lock is the tripwire; this is the better error message (see the
+// authoritative trust-split statement in the module header).
+
+/** Remove a shell `#` comment (quote-aware). Quotes are PRESERVED so a heredoc
+ * delimiter such as `<<'EOF'` survives for heredoc detection. */
+function stripShellComment(raw) {
+  let q = null;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (q === '"') { if (c === "\\") { i++; continue; } if (c === '"') q = null; continue; }
+    if (q === "'") { if (c === "'") q = null; continue; }
+    if (c === '"' || c === "'") { q = c; continue; }
+    if (c === "#" && (i === 0 || /[\s;&|(]/.test(raw[i - 1]))) return raw.slice(0, i);
+  }
+  return raw;
+}
+
+/** Blank out single/double-quoted spans (double-quote escapes respected). This
+ * is what makes `echo "checking if the suite is wired"` keyword-inert (#675
+ * P1-6 / #779): the word `if` is inside a string, not command position. */
+function stripShellQuotes(raw) {
+  let out = "";
+  let q = null;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (q === null) {
+      if (c === "'" || c === '"') { q = c; out += " "; continue; }
+      out += c;
+    } else if (q === "'") {
+      if (c === "'") q = null;
+      out += " ";
+    } else {
+      if (c === "\\") { i++; out += "  "; continue; }
+      if (c === '"') q = null;
+      out += " ";
+    }
+  }
+  return out;
+}
 
 /**
- * Which shell control-flow context is open at line index `upto` (exclusive)?
- * → null when top level, else a human label. Comment-only/trailing text is
- * stripped before counting so a comment mentioning `if` cannot fake depth.
+ * Which shell control-flow context is lexically open at line index `upto`
+ * (exclusive)? → null when top level, else a human label.
+ *
+ * Quoted spans, comments and heredoc bodies are removed first, and a bracket
+ * keyword only counts in COMMAND POSITION (start of line, or straight after
+ * `;` `&&` `||` `|` `&` `(` `)` `{` `}`, or after `then`/`do`/`else`/`elif`).
  * Heredocs are tracked from `<<`/`<<-` to their delimiter.
  */
 function shellControlContext(lines, upto) {
-  let ifDepth = 0;
-  let loopDepth = 0;
+  const d = { ifDepth: 0, loopDepth: 0, caseDepth: 0, groupDepth: 0 };
   let heredoc = null;
+  let trapExit = false;
   for (let i = 0; i < upto; i++) {
-    const raw = lines[i];
+    const noComment = stripShellComment(lines[i]);
     if (heredoc !== null) {
-      if (raw === heredoc) heredoc = null;
+      if (noComment.trim() === heredoc) heredoc = null;
       continue;
     }
-    const hd = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/.exec(raw);
-    if (hd) {
-      heredoc = hd[1];
-      continue;
-    }
-    const code = raw.replace(/#.*$/, "");
-    if (code.trim() === "") continue;
-    for (const w of code.split(/[^A-Za-z_]+/)) {
-      if (w === "if") ifDepth++;
-      else if (w === "fi") ifDepth = Math.max(0, ifDepth - 1);
-      else if (w === "for" || w === "while" || w === "until") loopDepth++;
-      else if (w === "done") loopDepth = Math.max(0, loopDepth - 1);
+    const hd = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/.exec(noComment);
+    if (hd) { heredoc = hd[1]; continue; }
+    const code = stripShellQuotes(noComment);
+    const tokens = code.match(SHELL_TOKEN_RE) ?? [];
+    if (tokens.includes("trap") && tokens.includes("EXIT")) trapExit = true;
+    let commandStart = true;
+    for (const tok of tokens) {
+      if (/^(?:&&|\|\||[;&|(){}])$/.test(tok)) {
+        if (tok === "{" || tok === "(") d.groupDepth++;
+        else if (tok === "}" || tok === ")") d.groupDepth = Math.max(0, d.groupDepth - 1);
+        commandStart = true;
+        continue;
+      }
+      if (!commandStart) {
+        // `then`/`do`/`else`/`elif` introduce the next command inside a clause.
+        if (tok === "then" || tok === "do" || tok === "else" || tok === "elif") {
+          commandStart = true;
+        }
+        continue;
+      }
+      if (tok === "if") d.ifDepth++;
+      else if (tok === "fi") d.ifDepth = Math.max(0, d.ifDepth - 1);
+      else if (tok === "for" || tok === "while" || tok === "until") d.loopDepth++;
+      else if (tok === "done") d.loopDepth = Math.max(0, d.loopDepth - 1);
+      else if (tok === "case") d.caseDepth++;
+      else if (tok === "esac") d.caseDepth = Math.max(0, d.caseDepth - 1);
+      else if (tok === "then" || tok === "do" || tok === "else" || tok === "elif" || tok === "in") {
+        commandStart = true;
+        continue;
+      }
+      commandStart = false;
     }
   }
   if (heredoc !== null) return "a heredoc";
-  if (ifDepth > 0) return "an `if`/`then`/`fi` block";
-  if (loopDepth > 0) return "a `for`/`while`/`until` loop";
+  if (trapExit) return "a `trap … EXIT`";
+  if (d.ifDepth > 0) return "an `if`/`then`/`fi` block";
+  if (d.loopDepth > 0) return "a `for`/`while`/`until` loop";
+  if (d.caseDepth > 0) return "a `case`/`esac` block";
+  if (d.groupDepth > 0) return "a `{ … }` / `( … )` group";
+  return null;
+}
+
+/**
+ * Any `exit 0` or `trap … EXIT` ANYWHERE in the command? Both can leave the
+ * step green with the failure recorded but not fatal, so neither is allowed —
+ * before OR after the invocation (`exit 0` before it means the accumulator is
+ * never even reached). Quotes/comments are stripped so an `echo "exit 0"` is
+ * inert.
+ */
+function shellSwallowFinding(lines) {
+  const tokens = [];
+  for (const raw of lines) {
+    const code = stripShellQuotes(stripShellComment(raw));
+    tokens.push(...(code.match(SHELL_TOKEN_RE) ?? []));
+  }
+  if (tokens.includes("trap") && tokens.includes("EXIT")) {
+    return (
+      "ci-main.yml's post-merge `test-command` contains a `trap … EXIT` — it overrides the " +
+      "step's exit status, so the recorded failure can be swallowed and the step still exits green"
+    );
+  }
+  for (let k = 0; k + 1 < tokens.length; k++) {
+    if (tokens[k] === "exit" && tokens[k + 1] === "0") {
+      return (
+        "ci-main.yml's post-merge `test-command` contains an `exit 0` — the step would exit green " +
+        "regardless of the accumulator (including an inline `if …; then exit 0; fi`)"
+      );
+    }
+  }
   return null;
 }
 
@@ -735,26 +973,21 @@ function ciMainFindings(src) {
     ];
   }
   const { line, i } = invocations[0];
-  // Control-flow evasion (round-2 review): a matched line inside a conditional
-  // or heredoc is never executed, so the accumulator never counts it.
-  const context = shellControlContext(lines, i);
-  if (context !== null) {
-    return [
-      `ci-main.yml's check-pi-pin-lockstep.mjs invocation sits inside ${context} — a matched ` +
-        "line there is not executed, so the post-merge pin gate never runs; it must be a " +
-        "top-level line in the accumulator",
-    ];
-  }
-  // The invocation must fail INTO the accumulator, with nothing in between: a
-  // `node … || true || failures=$((failures+1))` short-circuits past the
-  // accumulator on failure, so the gate passes while the suite failed.
-  const suffix = line.slice("node scripts/check-pi-pin-lockstep.mjs".length);
-  if (!ACCUMULATOR_SUFFIX_RE.test(suffix)) {
-    if (/\|\|\s*true\b/.test(suffix)) {
+  // The invocation must be the EXACT accumulator line. A `node … || true ||
+  // failures=$((failures+1))` short-circuits past the accumulator on failure, so
+  // the gate passes while the suite failed.
+  if (line !== POST_MERGE_INVOCATION) {
+    if (/\|\|\s*true\b/.test(line)) {
       return [
         "ci-main.yml's check-pi-pin-lockstep.mjs line has an `|| true` between the invocation and " +
           "the failure accumulator — the `true` short-circuits past the accumulator on failure, " +
           `so the post-merge gate can never go red; found ${JSON.stringify(line)}`,
+      ];
+    }
+    if (ACCUMULATOR_SUFFIX_RE.test(line.slice("node scripts/check-pi-pin-lockstep.mjs".length))) {
+      return [
+        `ci-main.yml's check-pi-pin-lockstep.mjs line has unexpected text before the accumulator; ` +
+          `required exactly ${JSON.stringify(POST_MERGE_INVOCATION)}; found ${JSON.stringify(line)}`,
       ];
     }
     return [
@@ -763,17 +996,58 @@ function ciMainFindings(src) {
         `failure and hides every later suite's verdict; found ${JSON.stringify(line)}`,
     ];
   }
-  // An `exit 0` after the invocation but before the failure guard swallows the
-  // recorded failure and exits the step green.
+  // `failures` must be initialised before the accumulator reads/increments it.
+  if (!lines.slice(0, i).includes("failures=0")) {
+    return [
+      "ci-main.yml's post-merge `test-command` does not initialise `failures=0` before the " +
+        "check-pi-pin-lockstep.mjs line — the accumulator has no starting value",
+    ];
+  }
+  // Relocation evasion: a matched line inside `case`, a function body, a `{ … }`
+  // short-circuited by `false &&`, a loop or a heredoc is not executed, so the
+  // accumulator never counts it.
+  const context = shellControlContext(lines, i);
+  if (context !== null) {
+    return [
+      `ci-main.yml's check-pi-pin-lockstep.mjs invocation sits inside ${context} — a matched ` +
+        "line there is not executed, so the post-merge pin gate never runs; it must be a " +
+        "top-level line in the accumulator",
+    ];
+  }
+  // `exit 0` / `trap … EXIT` anywhere in the command swallows the recorded failure.
+  const swallow = shellSwallowFinding(lines);
+  if (swallow !== null) return [swallow];
+  // The failure guard must EXIST and leave the step non-zero: an `exit 0` scan that
+  // runs off the end when no guard is present returned [] (P2-a).
+  let open = -1;
   for (let j = i + 1; j < lines.length; j++) {
-    if (FAILURE_GUARD_RE.test(lines[j])) break;
-    if (/^exit\s+0\b/.test(lines[j])) {
-      return [
-        "ci-main.yml's check-pi-pin-lockstep.mjs line is followed by an `exit 0` before the " +
-          "`if [ $failures -gt 0 ]` guard — the recorded failure is swallowed and the step " +
-          "exits green",
-      ];
-    }
+    if (FAILURE_GUARD_OPEN_RE.test(lines[j])) { open = j; break; }
+  }
+  if (open === -1) {
+    return [
+      "ci-main.yml's post-merge `test-command` has no `if [ $failures -gt 0 ]` failure guard after " +
+        "the check-pi-pin-lockstep.mjs line — without it the step exits green even when the pin " +
+        "suite failed; the exact guard block is required",
+    ];
+  }
+  let close = -1;
+  let nonZeroExit = false;
+  for (let j = open + 1; j < lines.length; j++) {
+    if (FAILURE_GUARD_CLOSE_RE.test(lines[j])) { close = j; break; }
+    if (NONZERO_EXIT_RE.test(lines[j])) nonZeroExit = true;
+  }
+  if (close === -1) {
+    return [
+      "ci-main.yml's `if [ $failures -gt 0 ]` failure guard is never closed by a `fi` line — the " +
+        "accumulator's failure has no exit path",
+    ];
+  }
+  if (!nonZeroExit) {
+    return [
+      "ci-main.yml's failure guard does not `exit` non-zero (its body may have been replaced by an " +
+        "`echo`) — the step would finish green with the failure recorded only in text; the guard " +
+        "must exit non-zero",
+    ];
   }
   return [];
 }
@@ -898,6 +1172,152 @@ test("the default CLI exits 1 on a mismatch, naming the file and the remedy", ()
   assert.equal(res.status, 1, `expected exit 1, got ${res.status}`);
   assert.match(res.stderr, /\.github\/workflows\/node-ci\.yml/);
   assert.match(res.stderr, /--update-lock/);
+});
+
+// #675 P2-b — a fresh instance of issue #708. `path.resolve(process.argv[1])`
+// was compared against Node's realpath-resolved `import.meta.url`, so ANY
+// symlinked ancestor (`/tmp` → `/private/tmp` on macOS) made IS_MAIN false:
+// main() never ran, nothing printed, exit 0. The symlink below lives under the
+// OS temp dir, which is itself symlinked on macOS.
+test("the lock CLI is not a silent no-op through a symlinked path (#708 class, #675 P2-b)", () => {
+  const dir = makeLockFixture();
+  writeLockFile(dir);
+  bumpBytes(dir, ".github/workflows/ci.yml", "# changed\n");
+  const linkDir = fs.mkdtempSync(path.join(os.tmpdir(), "wf-lock-link-"));
+  const link = path.join(linkDir, "check-workflow-lock.mjs");
+  fs.symlinkSync(CHECK_LOCK, link);
+  const verify = spawnSync(process.execPath, [link, "--root", dir], { encoding: "utf8" });
+  assert.equal(
+    verify.status,
+    1,
+    `verify mode through a symlink must RUN (exit 1), not silently exit 0 — got ${verify.status}, ` +
+      `stdout=${JSON.stringify(verify.stdout)} stderr=${JSON.stringify(verify.stderr)}`
+  );
+  assert.match(verify.stderr, /--update-lock/, "the real run must name the remedy");
+  const update = spawnSync(process.execPath, [link, "--update-lock", "--root", dir], {
+    encoding: "utf8",
+  });
+  assert.equal(update.status, 0, `expected exit 0, got ${update.status}`);
+  assert.match(
+    update.stdout,
+    /workflow lock updated/,
+    "--update-lock through a symlink must actually run and print its output"
+  );
+  assert.deepEqual(
+    lockFindings(dir, readLock(dir)),
+    [],
+    "the symlinked --update-lock must have rewritten the lock"
+  );
+});
+
+// #675 P2-e — one positive control per `lockFindings` schema branch. Neutering
+// any branch previously left the suite GREEN because only the happy paths were
+// exercised. Each case must produce a non-empty finding naming the --update-lock
+// remedy (a malformed lock a developer can act on).
+test("lockFindings: a non-object lock is RED with the --update-lock remedy (#675 P2-e)", () => {
+  const dir = makeLockFixture();
+  for (const bad of [null, [], "x", 42]) {
+    const findings = lockFindings(dir, bad);
+    assert.equal(findings.length, 1, `${JSON.stringify(bad)} must produce exactly one finding`);
+    assert.match(findings[0], /--update-lock/);
+  }
+});
+test("lockFindings: a version mismatch is RED with the --update-lock remedy (#675 P2-e)", () => {
+  const dir = makeLockFixture();
+  const findings = lockFindings(dir, { version: 2, files: hashLockedFiles(dir) });
+  assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
+  assert.match(findings[0], /version/);
+  assert.match(findings[0], /--update-lock/);
+});
+test("lockFindings: a lock with no `files` mapping is RED (#675 P2-e)", () => {
+  const dir = makeLockFixture();
+  const findings = lockFindings(dir, { version: 1 });
+  assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
+  assert.match(findings[0], /`files` mapping/);
+  assert.match(findings[0], /--update-lock/);
+});
+test("lockFindings: an uncovered expected path is RED (#675 P2-e)", () => {
+  const dir = makeLockFixture();
+  const files = hashLockedFiles(dir);
+  delete files[".github/workflows/node-ci.yml"];
+  const findings = lockFindings(dir, { version: 1, files });
+  assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
+  assert.match(findings[0], /node-ci\.yml/);
+  assert.match(findings[0], /--update-lock/);
+});
+test("lockFindings: an unexpected extra path is RED (#675 P2-e)", () => {
+  const dir = makeLockFixture();
+  const files = hashLockedFiles(dir);
+  files[".github/workflows/extra.yml"] = "0".repeat(64);
+  const findings = lockFindings(dir, { version: 1, files });
+  assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
+  assert.match(findings[0], /extra\.yml/);
+  assert.match(findings[0], /--update-lock/);
+});
+
+// #675 P2-d — a workflow present on disk but absent from BOTH lists must be RED,
+// and deleting an allowlisted workflow (workflow-lock.yml included) must be RED.
+/** A throwaway root with every allowlisted workflow present. */
+function makeCoverageFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wf-cover-"));
+  for (const rel of [...LOCKED_FILES, ...UNLOCKED_WORKFLOWS]) {
+    const abs = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, "# fixture\n");
+  }
+  return dir;
+}
+
+test("the live .github/workflows directory is fully classified (locked or explicitly unlocked)", () => {
+  assert.deepEqual(
+    workflowCoverageFindings(REPO_ROOT),
+    [],
+    "every committed workflow must be locked or on the explicit unlocked allowlist"
+  );
+});
+test("workflow coverage: an unclassified new workflow is RED (#675 P2-d)", () => {
+  const dir = makeCoverageFixture();
+  assert.deepEqual(workflowCoverageFindings(dir), [], "the fixture must start GREEN");
+  fs.writeFileSync(path.join(dir, ".github", "workflows", "extra.yml"), "# new\n");
+  const findings = workflowCoverageFindings(dir);
+  assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
+  assert.match(findings[0], /extra\.yml/);
+});
+test("workflow coverage: deleting workflow-lock.yml is RED (#675 P2-d / P2-g)", () => {
+  const dir = makeCoverageFixture();
+  fs.rmSync(path.join(dir, ".github", "workflows", "workflow-lock.yml"));
+  const findings = workflowCoverageFindings(dir);
+  assert.equal(findings.length, 1, `expected one finding, got ${findings.length}`);
+  assert.match(findings[0], /workflow-lock\.yml/);
+});
+
+// #675 P2-g — the trusted leg is bootstrapped by the NEXT PR after it lands
+// (pull_request_target resolves from the default branch). Nothing writes
+// post-merge evidence, so this is the assertion that deleting/unwiring it is RED.
+test("workflow-lock.yml exists and is wired (pull_request_target + --head-ref) (#675 P2-g)", () => {
+  const rel = ".github/workflows/workflow-lock.yml";
+  const abs = path.join(REPO_ROOT, rel);
+  assert.ok(fs.existsSync(abs), `${rel} must exist — it is the trusted structural leg`);
+  const text = fs.readFileSync(abs, "utf8");
+  const doc = parseWorkflowYaml(text);
+  assert.ok(isMap(doc), `${rel} must read as a top-level mapping`);
+  assert.ok(
+    isMap(doc.on) && Object.hasOwn(doc.on, "pull_request_target"),
+    `${rel} must still trigger on \`pull_request_target\` — that is the base-branch trigger`
+  );
+  assert.match(
+    text,
+    /node scripts\/check-pi-pin-lockstep\.mjs --head-ref/,
+    `${rel} must still invoke the checker with --head-ref`
+  );
+  assert.ok(
+    isMap(doc.permissions) && Object.hasOwn(doc.permissions, "contents"),
+    `${rel} must grant \`contents: read\``
+  );
+  assert.ok(
+    !Object.hasOwn(doc.permissions, "pull-requests"),
+    `${rel} must not grant the unused \`pull-requests: read\` scope (#675 P2-h)`
+  );
 });
 
 // One RED fixture per round-2 bypass class, at the LOCK level: the old design
@@ -1106,6 +1526,66 @@ test("head-ref mode still goes RED on a structurally broken PR workflow", () => 
     findings.some((m) => m.includes("must still run on `pull_request`")),
     `expected the structural trigger finding, got:\n  ${findings.join("\n  ")}`
   );
+});
+
+// #675 P1-1 — the fail-open. `parseWorkflowYaml("")` returns null (empty file,
+// comments-only, or a lone `---`), and the assertions were all guarded by
+// `if (caller !== null)` — so ZERO findings and the trusted leg printed ✅.
+// `ciMainFindings` already rejected a non-mapping document; the other two now do
+// too. RED fixtures, one per reproduced input.
+test("head-ref mode is RED for an empty or comments-only ci.yml / node-ci.yml (#675 P1-1)", () => {
+  const emptyish = ["", "# just a comment\n", "---\n", "\n\n# nothing here\n"];
+  for (const src of emptyish) {
+    for (const which of ["ci", "nodeCi"]) {
+      const findings = headRefFindings({
+        ci: which === "ci" ? src : FIXTURE_CALLER,
+        nodeCi: which === "nodeCi" ? src : FIXTURE_CALLEE,
+        ciMain: FIXTURE_CI_MAIN,
+      });
+      assert.ok(
+        findings.some((m) => m.includes("EMPTY document")),
+        `${which} = ${JSON.stringify(src)} must be RED with the empty-document finding; ` +
+          `got:\n  ${findings.join("\n  ")}`
+      );
+    }
+  }
+});
+
+// #675 P1-1, compounding defect: the Contents API returns `encoding: "none"`
+// with empty `content` for a blob over 1 MB, so reading `.content` blindly
+// turned a padded workflow into "" — straight into the fail-open path above.
+// The decode is now fail-closed.
+test("the Contents API decode fails CLOSED on encoding 'none' or a lossy decode (#675 P1-1)", () => {
+  assert.equal(
+    decodeContentsApi(
+      JSON.stringify({ encoding: "base64", content: Buffer.from("name: CI\n").toString("base64") }),
+      ".github/workflows/ci.yml"
+    ),
+    "name: CI\n",
+    "a base64 payload decodes to its utf-8 text"
+  );
+  assert.throws(
+    () =>
+      decodeContentsApi(
+        JSON.stringify({ encoding: "none", content: "", size: 2 * 1024 * 1024 }),
+        ".github/workflows/ci.yml"
+      ),
+    /encoding="none"/,
+    "a >1 MB blob (encoding 'none') must THROW, never decode to an empty workflow"
+  );
+  assert.throws(
+    () =>
+      decodeContentsApi(
+        JSON.stringify({ encoding: "base64", content: Buffer.from([0xff, 0xfe]).toString("base64") }),
+        ".github/workflows/ci.yml"
+      ),
+    /not valid UTF-8/,
+    "a lossy decode must THROW rather than look like a valid workflow"
+  );
+  assert.throws(() => decodeContentsApi("not json", "x"), /did not return JSON/);
+  // A genuinely empty file is base64 "" → "", and wiringFindings turns THAT red
+  // (above); the decode itself must not pretend it is an error.
+  assert.equal(decodeContentsApi(JSON.stringify({ encoding: "base64", content: "" }), "x"), "");
 });
 
 section("guard (j) — the fixture trio satisfies items 1–6 (baseline for the GREEN/RED cases)");
@@ -1516,6 +1996,125 @@ test("an `exit 0` after the invocation and before the failure guard is RED (#666
   );
 });
 
+// ── #675 P1-6 + P2-a — the seven reproduced item-6 evasions ───────────────
+// Each of these left BOTH legs GREEN before the fix: the invocation line was
+// still present and exact, but the gate was dead (never executed, or its recorded
+// failure swallowed). Two are value assertions (the guard must exist and exit
+// non-zero); five are the quote/heredoc/command-position-aware relocation check.
+// See the "BOUNDED LEXICAL CHECK, NOT A SHELL MODEL" comment above for why this
+// is not a general shell model, and the module header for the trust split.
+test("item 6 RED #1: the failure guard removed entirely (#675 P2-a)", () => {
+  const src = mutate(FIXTURE_CI_MAIN, "        if [ $failures -gt 0 ]; then\n          exit 1\n        fi\n", "");
+  const findings = ciMainFindings(src);
+  assert.ok(
+    findings.some((m) => m.includes("no `if [ $failures -gt 0 ]` failure guard")),
+    `expected the missing-guard finding; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #2: the guard body replaced by an `echo` (#675 P2-a)", () => {
+  const src = mutate(FIXTURE_CI_MAIN, "          exit 1", '          echo "failed"');
+  const findings = ciMainFindings(src);
+  assert.ok(
+    findings.some((m) => m.includes("does not `exit` non-zero")),
+    `expected the non-zero-exit finding; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #3: the invocation moved into a `case` arm (#675 P2-a)", () => {
+  const src = mutate(
+    FIXTURE_CI_MAIN,
+    "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n",
+    '        case "$CI" in\n' +
+      "        true)\n" +
+      "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n" +
+      "        ;;\n" +
+      "        esac\n"
+  );
+  const findings = ciMainFindings(src);
+  assert.ok(
+    findings.some((m) => m.includes("sits inside a `case`/`esac` block")),
+    `expected the case finding; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #4: the invocation inside a never-called shell function (#675 P2-a)", () => {
+  const src = mutate(
+    FIXTURE_CI_MAIN,
+    "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n",
+    "        run_it() {\n" +
+      "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n" +
+      "        }\n"
+  );
+  const findings = ciMainFindings(src);
+  assert.ok(
+    findings.some((m) => m.includes("sits inside") && m.includes("group")),
+    "expected the function-body ({ … } group) finding; got:\n  " + findings.join("\n  ")
+  );
+});
+test("item 6 RED #5: `false && {` before the invocation (#675 P2-a)", () => {
+  const src = mutate(
+    FIXTURE_CI_MAIN,
+    "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n",
+    "        false && {\n" +
+      "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n" +
+      "        }\n"
+  );
+  const findings = ciMainFindings(src);
+  assert.ok(
+    findings.some((m) => m.includes("sits inside") && m.includes("group")),
+    `expected the short-circuit group finding; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #6: an inline `if …; then exit 0; fi` swallows the failure (#675 P2-a)", () => {
+  const src = mutate(
+    FIXTURE_CI_MAIN,
+    "        if [ $failures -gt 0 ]; then\n",
+    '        if [ "$CI" = "true" ]; then exit 0; fi\n' + "        if [ $failures -gt 0 ]; then\n"
+  );
+  const findings = ciMainFindings(src);
+  assert.ok(
+    findings.some((m) => m.includes("`exit 0`")),
+    `expected the inline-exit-0 finding; got:\n  ${findings.join("\n  ")}`
+  );
+});
+test("item 6 RED #7: `trap 'exit 0' EXIT` swallows the failure (#675 P2-a)", () => {
+  const src = mutate(
+    FIXTURE_CI_MAIN,
+    "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n",
+    "        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))\n" +
+      "        trap 'exit 0' EXIT\n"
+  );
+  const findings = ciMainFindings(src);
+  assert.ok(
+    findings.some((m) => m.includes("`trap … EXIT`")),
+    `expected the trap finding; got:\n  ${findings.join("\n  ")}`
+  );
+});
+
+// #675 P1-6 / #779 — a quoted keyword in ordinary prose must NOT open a block.
+// The pre-fix detector split each line on non-word characters, so `echo
+// "checking if the suite is wired"` before the invocation reddened BOTH legs.
+test("item 6 GREEN: quoted `if`/`for`/`while` prose before the invocation is inert (#675 P1-6)", () => {
+  const lines = [
+    '        echo "checking if the suite is wired"',
+    '        echo "for the record the pin suite is wired"',
+    '        echo "while you wait the pin suite is wired"',
+    "        # if/for/while notes live in this comment",
+  ];
+  for (const inserted of lines) {
+    const src = mutate(
+      FIXTURE_CI_MAIN,
+      "        failures=0\n",
+      `        failures=0\n${inserted}\n`
+    );
+    const findings = ciMainFindings(src);
+    assert.deepEqual(
+      findings,
+      [],
+      `${inserted.trim()} must stay GREEN (a quoted/comment keyword is not control flow):\n  ` +
+        findings.join("\n  ")
+    );
+  }
+});
+
 // ── (k) workflow-yaml reader — subset behaviour & fail-closed bounds ───────
 // The reader (scripts/workflow-yaml.mjs) is the only surface the narrow guard
 // (j) leans on, so its subset contract is asserted here directly: the constructs
@@ -1642,6 +2241,27 @@ test("a large interior blank-line run parses in linear time (no quadratic trim)"
   );
 });
 
+// #675 P2-6 — the flow path was O(depth × length): `key: [[[[…]]]]` measured
+// 3.5 s at 10 KB, 14.3 s at 40 KB and 61.5 s at 104 KB, ending in a RangeError.
+// The reader is now a single-pass flow parser with a bounded recursion depth, so
+// a deeply nested flow document raises WorkflowYamlError FAST — never a
+// RangeError, and never minutes of CI on PR-controlled bytes.
+test("a deeply nested flow collection raises WorkflowYamlError quickly (#675 P2-6)", () => {
+  const deep = "key: " + "[".repeat(20000) + "]".repeat(20000) + "\n";
+  const started = Date.now();
+  assert.ok(throws(deep), "deep flow nesting must raise WorkflowYamlError");
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 5000, `expected a fast, clean rejection, took ${elapsed}ms`);
+  // The 104 KB shape that took 61.5 s pre-fix (also the size that ends in a stack
+  // overflow), and a mapping variant.
+  const wide = "key: " + "[".repeat(53000) + "]".repeat(53000) + "\n";
+  const t2 = Date.now();
+  assert.ok(throws(wide), "a 104 KB flow document must also raise WorkflowYamlError");
+  assert.ok(Date.now() - t2 < 5000, "104 KB flow nesting must reject fast");
+  const map = "key: " + "{".repeat(20000) + "}".repeat(20000) + "\n";
+  assert.ok(throws(map), "deep flow mapping nesting must also raise WorkflowYamlError");
+});
+
 test("the live workflow corpus parses (the subset is adequate for this repo)", () => {
   // #675 P2-6 — per-directory floors, not one loose total: the live corpus is
   // 9 + 4, and a single `>= 8` total let a 33% shrink (one directory emptied)
@@ -1671,11 +2291,56 @@ test("the live workflow corpus parses (the subset is adequate for this repo)", (
   assert.deepEqual(failures, [], "every committed workflow must be inside the reader's subset");
 });
 
-// #675 P1-3 — a LOWER BOUND on the passing count. Guards (h)/(i) now carry their
-// own positive controls, but a wholesale DELETION of a rule's test (the suite
-// silently shrinking — 52 → 50 did pre-fix) must also be red. This is a floor,
-// not an equality: adding tests never needs an update; deleting one does.
-const MIN_EXPECTED_PASSING = 69;
+// #675 P2-c — REQUIRED TEST NAMES. The count floor below is only a net-shrink
+// guard: disabling 3 real tests and adding 3 `test("filler", () =>
+// assert.ok(true))` no-ops kept it at "69 passed". A name is recorded by `test()`
+// only when the test RUNS AND PASSES, so a deleted, renamed or neutered assertion
+// is RED no matter what fills the count. At minimum: the two live-file
+// assertions, every positive control, and one per guard section.
+const REQUIRED_TESTS = Object.freeze([
+  // live-file assertions
+  "live ci.yml → node-ci.yml → ci-main.yml: the pin gate is wired (items 1–6)",
+  "the live workflow content lock matches the committed workflows (GREEN)",
+  "the live .github/workflows directory is fully classified (locked or explicitly unlocked)",
+  "the live workflow corpus parses (the subset is adequate for this repo)",
+  // positive controls
+  "pinFindings flags a drifted pin (positive control for (h))",
+  "stampFindings flags a stale stamp (positive control for (i))",
+  "lockFindings: a non-object lock is RED with the --update-lock remedy (#675 P2-e)",
+  "lockFindings: a version mismatch is RED with the --update-lock remedy (#675 P2-e)",
+  "lockFindings: a lock with no `files` mapping is RED (#675 P2-e)",
+  "lockFindings: an uncovered expected path is RED (#675 P2-e)",
+  "lockFindings: an unexpected extra path is RED (#675 P2-e)",
+  // one per guard section
+  "extensions/*/package.json @earendil-works/pi-* pins match PI_VERSION_PIN",
+  "every version literal in the mirror surfaces is the pin or a listed dep version",
+  "prose carrying a 3-component literal is not a pi stamp (#779 GREEN fixtures)",
+  "minimal fixture trio satisfies every narrow wiring invariant",
+  "the ci-main fixture is wired (baseline for the post-merge RED cases)",
+  "the lock covers exactly the three pin-gate workflow paths",
+  "head-ref mode runs the structural assertions and does NOT apply the content lock",
+  "head-ref mode is RED for an empty or comments-only ci.yml / node-ci.yml (#675 P1-1)",
+  "the Contents API decode fails CLOSED on encoding 'none' or a lossy decode (#675 P1-1)",
+  // regression fixtures added by the #675 review-fix cycle
+  "the lock CLI is not a silent no-op through a symlinked path (#708 class, #675 P2-b)",
+  "workflow coverage: an unclassified new workflow is RED (#675 P2-d)",
+  "workflow coverage: deleting workflow-lock.yml is RED (#675 P2-d / P2-g)",
+  "workflow-lock.yml exists and is wired (pull_request_target + --head-ref) (#675 P2-g)",
+  "item 6 RED #1: the failure guard removed entirely (#675 P2-a)",
+  "item 6 RED #2: the guard body replaced by an `echo` (#675 P2-a)",
+  "item 6 RED #3: the invocation moved into a `case` arm (#675 P2-a)",
+  "item 6 RED #4: the invocation inside a never-called shell function (#675 P2-a)",
+  "item 6 RED #5: `false && {` before the invocation (#675 P2-a)",
+  "item 6 RED #6: an inline `if …; then exit 0; fi` swallows the failure (#675 P2-a)",
+  "item 6 RED #7: `trap 'exit 0' EXIT` swallows the failure (#675 P2-a)",
+  "item 6 GREEN: quoted `if`/`for`/`while` prose before the invocation is inert (#675 P1-6)",
+  "a deeply nested flow collection raises WorkflowYamlError quickly (#675 P2-6)",
+]);
+
+// A LOWER BOUND on the passing count — a secondary, net-shrink signal. The
+// required-name set above is the primary identity check (#675 P2-c). This is a
+// floor, not an equality: adding tests never needs an update; deleting one does.
+const MIN_EXPECTED_PASSING = 91;
 console.log(`\ncheck-pi-pin-lockstep.mjs: ${passed} passed, ${failed} failed`);
 if (failed === 0 && passed < MIN_EXPECTED_PASSING) {
   failed++;
@@ -1684,6 +2349,15 @@ if (failed === 0 && passed < MIN_EXPECTED_PASSING) {
       "A guard's test (or a whole section) was deleted or stopped running; restore it or " +
       "update MIN_EXPECTED_PASSING deliberately."
   );
+}
+const missingRequired = REQUIRED_TESTS.filter((name) => !passedTests.has(name));
+if (missingRequired.length > 0) {
+  failed++;
+  console.error(
+    "❌ required test(s) did not run and pass — a guard's test was deleted, renamed or " +
+      "neutered; filler no-op tests cannot compensate (#675 P2-c):"
+  );
+  for (const name of missingRequired) console.error(`   - ${name}`);
 }
 if (failed > 0) {
   console.error("❌ SOME TESTS FAILED");
