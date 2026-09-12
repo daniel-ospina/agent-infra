@@ -198,8 +198,10 @@
  *
  * WHAT REF THE CALLER SHOULD PASS, AND WHY IT IS NOT THE HEAD (#821). The flag
  * name is historical; the contract is "the ref whose tree would LAND".
- * `workflow-lock.yml` passes `pull_request.merge_commit_sha` — the merge result —
- * and asserts that it does (see the wiring test). Validating `head.sha` instead
+ * `workflow-lock.yml` passes the PR's merge commit — resolved from the REST API,
+ * NOT from the event payload, whose `merge_commit_sha` is null until GitHub
+ * computes mergeability asynchronously (#843) — and asserts that it does (see the
+ * wiring test). Validating `head.sha` instead
  * was a FALSE RED generator: the head is the pre-merge state, so any branch cut
  * before a guarded workflow changed carried the OLD files, failed assertions for
  * files it never touched, and was told to "restore the line" it had never
@@ -780,7 +782,7 @@ const REQUIRED_TESTS = Object.freeze([
   "the lock CLI is not a silent no-op through a symlinked path (#708 class, #675 P2-b)",
   "workflow coverage: an unclassified new workflow is RED (#675 P2-d)",
   "workflow coverage: deleting workflow-lock.yml is RED (#675 P2-d / P2-g)",
-  "workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821)",
+  "workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821, #843)",
   "a deeply nested flow collection raises WorkflowYamlError quickly (#675 P2-6)",
   "a symlinked locked workflow is RED from lockFindings (#675 P1-2)",
   "the lock CLI is RED for a symlinked locked workflow (#675 P1-2)",
@@ -2132,7 +2134,7 @@ test("--update-lock on a symlinked locked file fails instead of printing an upda
 // #675 P2-g — the trusted leg is bootstrapped by the NEXT PR after it lands
 // (pull_request_target resolves from the default branch). Nothing writes
 // post-merge evidence, so this is the assertion that deleting/unwiring it is RED.
-test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821)", () => {
+test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#675 P2-g, #821, #843)", () => {
   const rel = ".github/workflows/workflow-lock.yml";
   const abs = path.join(REPO_ROOT, rel);
   assert.ok(fs.existsSync(abs), `${rel} must exist — it is the trusted structural leg`);
@@ -2154,24 +2156,65 @@ test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#67
     (s) => typeof s.run === "string" && s.run.includes("check-pi-pin-lockstep.mjs --head-ref")
   );
   assert.ok(step, `${rel} must still invoke the checker with --head-ref`);
+  // #843 — RESOLVED FROM THE REST API, NOT THE EVENT PAYLOAD.
+  // #821 correctly identified the merge result as the ref to validate, but got it
+  // from `github.event.pull_request.merge_commit_sha`, which is NULL until GitHub
+  // computes mergeability ASYNCHRONOUSLY. That reds a race-dependent subset of
+  // mergeable PRs, so it is worse than the bug it replaced.
   assert.equal(
-    step.env?.MERGE_SHA,
-    "${{ github.event.pull_request.merge_commit_sha }}",
-    `${rel} must validate \`pull_request.merge_commit_sha\` — the merge result is what lands (#821)`
+    step.env?.PR_NUMBER,
+    "${{ github.event.pull_request.number }}",
+    `${rel} must pass the PR number so the merge commit can be resolved from the API (#843)`
+  );
+  assert.ok(
+    !Object.hasOwn(step.env ?? {}, "MERGE_SHA"),
+    `${rel} must NOT read \`merge_commit_sha\` from the event payload — it is null until ` +
+      "mergeability is computed, so every PR races it (#843). Resolve it from the REST API instead."
+  );
+  assert.match(
+    String(step.run),
+    /gh api[^\n]*\/pulls\/\$PR_NUMBER/,
+    `${rel} must resolve the merge commit from \`GET /repos/{owner}/{repo}/pulls/{number}\` (#843)`
+  );
+  assert.match(
+    String(step.run),
+    /merge_commit_sha/,
+    `${rel} must read \`merge_commit_sha\` from the API response (#843)`
+  );
+  assert.match(
+    String(step.run),
+    /--head-ref "\$MERGE_SHA"/,
+    `${rel} must feed the RESOLVED merge commit to --head-ref (not the head) (#821, #843)`
+  );
+  assert.ok(
+    !/--head-ref\s+"?\$HEAD_SHA/.test(String(step.run)),
+    `${rel} must not validate the head — that is the #821 false-RED for stale branches`
   );
   assert.match(
     String(step.run),
     /-z "\$MERGE_SHA"/,
-    `${rel} must fail closed with its own message when \`merge_commit_sha\` is empty (a conflicted ` +
-      "PR has no merge result to validate — that must not be reported as a workflow finding)"
+    `${rel} must still fail closed with its own message when the API also has no merge ` +
+      "commit (a conflicted PR has no merge result to validate — that must not be reported as " +
+      "a workflow finding)"
+  );
+  // ...and an API FAILURE must not borrow the conflicts message — a 403 (missing
+  // scope) or a network error is a different condition from "no merge commit".
+  assert.match(
+    String(step.run),
+    /if ! MERGE_SHA=\$\(gh api/,
+    `${rel} must distinguish a failed API call from an empty merge_commit_sha (#843) so a ` +
+      "scope or network failure is not misreported as a PR conflict"
   );
   assert.ok(
     isMap(doc.permissions) && Object.hasOwn(doc.permissions, "contents"),
     `${rel} must grant \`contents: read\``
   );
+  // #843 — the `pull-requests: read` scope that #675's review removed as unused
+  // (P2-h) is now REQUIRED: the merge commit is resolved from the pulls API.
   assert.ok(
-    !Object.hasOwn(doc.permissions, "pull-requests"),
-    `${rel} must not grant the unused \`pull-requests: read\` scope (#675 P2-h)`
+    Object.hasOwn(doc.permissions, "pull-requests"),
+    `${rel} must grant \`pull-requests: read\` — the merge commit is resolved from the ` +
+      "pulls API (#843); without it that call 403s and the leg reds"
   );
 });
 
