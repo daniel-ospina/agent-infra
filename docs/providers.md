@@ -90,6 +90,20 @@ list, each candidate's `runtimeVia` dispatch authority, the primary's
 `buildEquivalence` set, the probe endpoints, and an integer-cents
 `costCentsPerPass`. Adding a funded model is a config edit, never a code edit.
 
+**Dispatch contract (ONE rule — G6/G13).** `--print` is the **offline**
+resolver (never opens a socket): it returns the first build-independent
+candidate in `preference` order, or `$SECOND_MODEL` verbatim when the operator
+override is set. `--probe` is the **liveness gate and the dispatch authority**:
+dispatch its `RESOLVED`. With no override, `--probe` walks the same ordered
+`preference` `--print` reads and resolves the first **solvent+reachable**
+candidate (so it equals `--print` whenever that candidate is live, and falls
+through in the same order otherwise). With `$SECOND_MODEL` set, `--probe`
+certifies **only** that id — a matching `preference` entry is probed, and an
+override that declares no probe endpoint or is not solvent+reachable is
+`DEGRADED`; the probe never falls through to a config default the operator
+pinned away from. The guard header and the four gate skills state this same
+rule.
+
 **Fail-closed DEGRADED.** When the resolver returns `**DEGRADED` — or the
 probe exits non-zero (the probe prints plain `DEGRADED` and exits 1; only
 `--print` emits the `**DEGRADED` token, so the trigger is either) — the gate
@@ -107,29 +121,37 @@ SECOND_MODEL_GATE_INDEPENDENT=yes` via `record-review.sh`, which appends
 `scripts/check-pipeline-compliance.sh` check (f) is the mechanical consumer: on
 a diff touching the guarded surface it requires the line and fails on
 `independent=NO` / `independent=DEGRADED` / a build-equivalent id / a reserved
-or non-id model / a line not bound to the PR head. `$SECOND_MODEL` remains an
+or non-id model (including the reserved placeholders `none`/`null`/`n/a`/
+`unknown`, not just `**DEGRADED`) / conflicting markers / a line not bound to
+the PR head. `$SECOND_MODEL` remains an
 operator override (config-default fail-closed,
-operator-override-open-by-design) and is annotated, never blocked; `--probe`
-probes a matching override FIRST, but never probe-certifies an id that declares
-no probe endpoint (the probe gates liveness; `--print` is the dispatch
-authority).
+operator-override-open-by-design) and is annotated, never blocked; the probe
+certifies only the override id (see the dispatch contract above), so the
+operator's pin is never silently replaced by a config default.
 
-**Guard location.** The guard is `scripts/check-second-model.sh` in this repo;
-`pi-bootstrap/setup.sh` additionally installs it to `~/.pi/agent/scripts/` (the
-same merge-gate farm as `record-review.sh`). Invoke it as
-`bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh"` — the base template and
-the four gate skills use that one convention, so a consumer tree never depends
-on a bare repo-relative path. The script resolves its own repo root PHYSICALLY
-(`realpath`), so the consumer `scripts/` symlink cannot misresolve the shipped
-config (issue #716's E8).
+**Guard location.** The guard is `scripts/check-second-model.sh` in this repo.
+It is deliberately **not** copied into `~/.pi/agent/scripts/` (G12): the guard
+resolves its shipped config from its own PHYSICAL repo root, so a farm copy
+there would resolve `ROOT=$HOME/.pi` and fail `--check`/`--probe` with exit 2.
+Invoke it as `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh"` — the base
+template and the four gate skills use that one convention, so a consumer tree
+never depends on a bare repo-relative path. The script resolves its own repo
+root PHYSICALLY (`realpath`), so the consumer `scripts/` symlink cannot
+misresolve the shipped config (issue #716's E8).
 
 **Probe security.** The probe never forwards a credential dictated by an
 untrusted config: probe URLs must be `https://` (`file://` only under the
-test-only `--allow-file-probe`), the destination host must be an allowlisted
-host for the candidate's own vendor, `authEnv` must be a fixed known vendor env
-var, and cross-host redirects are refused — so the `Authorization` header is
-never re-sent to a host the config chose. Keys are never printed, logged or
-written.
+test-only `--allow-file-probe`; a loopback host is permitted only under the
+test-only `--allow-local-probe`), the destination host must be an **exact**
+member of a fixed per-vendor allowlist (there is no derivable fallback —
+`model=lvh/…` cannot nominate `lvh.me`), the host is parsed with
+`urllib.parse.urlsplit` (the same parser urllib connects with, so a `#`/`?`
+suffix cannot make the policy inspect a different host than the request
+reaches), `authEnv` must name the candidate's **own** vendor's credential env
+var (a vendor cannot forward another vendor's key), and a redirect is followed
+only when it stays on the same `https` host **and port** (an `https`→`http`
+downgrade is refused). The `Authorization` header is therefore never re-sent to
+a host or scheme the config chose. Keys are never printed, logged or written.
 
 **Escape hatch / rollback (`SECOND_MODEL_GATE_OVERRIDE=1`).** Sets a loud
 notice and silences guard **BLOCKs** (exit 1); violations are still DETECTED

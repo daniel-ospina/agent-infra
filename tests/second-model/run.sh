@@ -216,7 +216,14 @@ ln -s "$ROOT/scripts" "$CONSUMER/scripts"
 ( cd "$CONSUMER" && bash scripts/check-second-model.sh --check --shipped-only ) >"$OUT" 2>&1; code=$?
 [ "$code" -eq 0 ] && pass "the guard resolves its shipped config through a consumer scripts/ symlink (exit 0)" || { fail "consumer symlink misresolved the shipped config (exit $code)"; tail -15 "$OUT"; }
 grep -q 'shipped config is not reachable' "$ROOT/.husky/pre-commit" && pass "the pre-commit hook gates on the shipped config (E8)" || fail "the hook does not gate on the shipped config"
-grep -q 'merge_gate_srcs=(record-review.sh check-second-model.sh)' "$ROOT/pi-bootstrap/setup.sh" && pass "setup.sh installs the guard via merge_gate_srcs (E4)" || fail "setup.sh does not install the guard"
+if grep -q 'merge_gate_srcs=(record-review.sh)' "$ROOT/pi-bootstrap/setup.sh" \
+   && ! grep -q 'merge_gate_srcs=.*check-second-model' "$ROOT/pi-bootstrap/setup.sh"; then
+  pass "setup.sh does NOT farm the guard (G12: the farmed copy cannot run --check/--probe; \$AGENT_INFRA_PATH is the convention)"
+else
+  fail "setup.sh still farms check-second-model.sh — its \$HOME/.pi copy resolves ROOT=\$HOME/.pi and exits 2"
+fi
+( cd "$ROOT" && export AGENT_INFRA_PATH="$ROOT" && bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh" --check --shipped-only ) >"$OUT" 2>&1; code=$?
+[ "$code" -eq 0 ] && pass "the documented \$AGENT_INFRA_PATH invocation runs --check (G12)" || { fail "the documented invocation failed (exit $code)"; tail -10 "$OUT"; }
 bad="$(grep -rn 'bash scripts/check-second-model.sh' "$ROOT/skills" "$ROOT/AGENTS.md" "$ROOT/templates/AGENTS.base.md" "$ROOT/docs/providers.md" 2>/dev/null || true)"
 if [ -z "$bad" ]; then pass "no bare repo-relative guard invocation remains (E4)"; else fail "bare invocations remain:"; printf '%s\n' "$bad"; fi
 rm -rf "$CONSUMER"
@@ -257,6 +264,28 @@ done
 grep -q 'Escape hatch / rollback' "$ROOT/docs/providers.md" && pass "providers.md documents the escape hatch (E3)" || fail "providers.md does not document the escape hatch"
 grep -q 'V4-Pro second-model gate' "$ROOT/docs/research/2026-09-05-local-qwen-32b-decision.md" && fail "the dated research record still pins the gate to V4-Pro (E6)" || pass "the dated research record points at the guard (E6)"
 grep -qE 'parity gate    #' "$ROOT/.github/workflows/ci-main.yml" && fail "ci-main.yml still has the joined comment line (E7)" || pass "ci-main.yml comment lines are split (E7)"
+# G13: ONE dispatch contract stated in the guard, providers.md, and all four skills.
+grep -q 'Dispatch contract (ONE rule' "$ROOT/docs/providers.md" && pass "providers.md states the single dispatch contract (G13)" || fail "providers.md lacks the single dispatch contract"
+for sk in code-review issue-scoping plan-review subagent-driven-development; do
+  if grep -q 'liveness gate is the dispatch authority' "$ROOT/skills/$sk/SKILL.md"; then
+    pass "$sk states the dispatch contract (G13)"
+  else
+    fail "$sk does not state the dispatch contract (G13)"
+  fi
+done
+# G15: the success-path marker is documented in AGENTS.md and the base template.
+for doc in "$ROOT/AGENTS.md" "$ROOT/templates/AGENTS.base.md"; do
+  if grep -q 'Success path — record the marker' "$doc" && grep -q 'SECOND_MODEL_GATE_MODEL' "$doc" && grep -q 'independent=yes' "$doc"; then
+    pass "$(basename "$doc") documents the success-path marker (G15)"
+  else
+    fail "$(basename "$doc") lacks the success-path marker instruction (G15)"
+  fi
+done
+# G14: the merge_second_model() comment names the whole-file replacement trap.
+grep -q 'WHOLE-FILE replace' "$ROOT/pi-bootstrap/setup.sh" && pass "merge_second_model comment names the wholesale-replace trap (G14)" || fail "merge_second_model comment still hides the drop"
+grep -q 'operator top-up needs no' "$ROOT/pi-bootstrap/setup.sh" && fail "the misleading 'no code edit' claim survives (G14)" || pass "the misleading 'no code edit' claim is gone (G14)"
+# G12: the farm rationale no longer claims the guard must run without the checkout.
+grep -q 'second-model guard is NOT on' "$ROOT/pi-bootstrap/setup.sh" && pass "setup.sh explains why the guard is not farmed (G12)" || fail "setup.sh does not explain the farm removal"
 # E5: no volatile vendor health facts are frozen into the shipped policy — the
 # dated #716 funding comment holds the evidence; the file keeps only a pointer
 # to it (re-adding a re-funded candidate must not first require deleting a stale
@@ -307,9 +336,46 @@ for marker in \
   "pass 6k: check (f) blocks a trailing-boundary bypass" \
   "pass 6l: check (f) blocks a marker bound to another head" \
   "pass 6m: check (f) blocks a marker with no head binding" \
-  "pass 6n: check (f) blocks a non-id model value"; do
-  grep -q "$marker" "$OUT" && pass "$marker" || { fail "missing simulation marker: $marker"; tail -5 "$OUT"; }
+  "pass 6n: check (f) blocks a non-id model value" \
+  "pass 6p-_github_workflows_ci_yml: check (f) enforces on a change to .github/workflows/ci.yml" \
+  "pass 6p-_github_workflows_ci-main_yml: check (f) enforces on a change to .github/workflows/ci-main.yml" \
+  "pass 6p-tests_second-model_run_sh: check (f) enforces on a change to tests/second-model/run.sh" \
+  "pass 6q: check (f) FAILS on a malformed file row (micro PR, no b-e)" \
+  "pass 6r: check (f) FAILS on a FILES_EXPECTED mismatch (micro PR, no b-e)" \
+  "pass 6s: check (f) blocks a reserved none-token model laundered as independent=yes" \
+  "pass 6t: check (f) blocks a reserved null-token model laundered as independent=yes" \
+  "pass 6u: check (f) blocks conflicting markers (later yes must not override DEGRADED)" \
+  "pass 6v: check (f) blocks two distinct recorded model ids"; do
+  grep -q "✅ $marker" "$OUT" && pass "$marker" || { fail "missing simulation marker: $marker"; tail -5 "$OUT"; }
 done
+
+echo ""
+echo "12c. Real-git base-state path (G3) — temp repo with the designation on main"
+# `git rev-parse --verify --quiet <40-hex>` is vacuously rc=0 for an absent
+# object, so the pre-fix guard reported "absent" and check (f) took the
+# bootstrap WARN forever. The FAIL_ALL cases 6w/6x drive the REAL git path
+# (no PIPELINE_SECOND_MODEL_BASE_FILE seam) and are opt-in, so this suite runs
+# them from a temp repo whose main carries the designation while origin/main
+# and HEAD^ do not.
+TMPREPO="$(mktemp -d /tmp/second-model-gitrepo.XXXXXX)"
+mkdir -p "$TMPREPO/scripts" "$TMPREPO/pi-bootstrap/pi-config"
+cp "$ROOT/scripts/check-pipeline-compliance.sh" "$ROOT/scripts/check-second-model.sh" "$TMPREPO/scripts/"
+cp "$SHIPPED" "$ROOT/pi-bootstrap/pi-config/models.json" "$TMPREPO/pi-bootstrap/pi-config/"
+git -C "$TMPREPO" init -q -b main
+git -C "$TMPREPO" add scripts pi-bootstrap
+git -C "$TMPREPO" -c user.email=test@example.com -c user.name=test commit -qm "init"
+PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 PIPELINE_SECOND_MODEL_GIT_CASES=1 \
+  GH_REPO=daniel-ospina/agent-infra \
+  PIPELINE_SECOND_MODEL_LIVE_DIR="$TMPREPO/pi-bootstrap/pi-config" \
+  bash "$TMPREPO/scripts/check-pipeline-compliance.sh" 999999 >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 1 ]; then pass "real-git FAIL_ALL simulation ran (exit 1 by design)"; else fail "real-git simulation expected exit 1, got $code"; tail -25 "$OUT"; fi
+for marker in \
+  "pass 6w: check (f) FAILS on an absent-but-well-formed real GITHUB_BASE_SHA (real git path)" \
+  "pass 6x: check (f) FAILS when a raw-sha PIPELINE_BASE_REF is absent and no fallback ref resolves"; do
+  grep -q "✅ $marker" "$OUT" && pass "$marker" || { fail "missing real-git marker: $marker"; tail -15 "$OUT"; }
+done
+rm -rf "$TMPREPO"
 
 echo ""
 echo "12b. Hermeticity: an ambient \$HOME config never leaks in (D2)"
@@ -524,7 +590,7 @@ mk_hostile "$HOSTILE" "http://127.0.0.1:$PORT/collect" "http://127.0.0.1:$PORT/c
 GH_TOKEN="LIVE-DIR-SECRET-xyz" bash "$GUARD" --probe --live-dir "$HOSTILE" >"$OUT" 2>&1; code=$?
 if [ "$code" -ne 0 ]; then pass "hostile http:// config fails closed (exit $code)"; else fail "hostile http:// config resolved (exit 0)"; fi
 if grep -q "LIVE-DIR-SECRET-xyz" "$OUT"; then fail "the probe PRINTED the secret value"; else pass "the secret value was never printed"; fi
-grep -q "GH_TOKEN" "$OUT" && grep -q "not an allowlisted vendor env" "$OUT" && pass "arbitrary authEnv is rejected (B1)" || { fail "GH_TOKEN was not rejected as an authEnv"; tail -10 "$OUT"; }
+grep -q "GH_TOKEN" "$OUT" && grep -q "not a known 'moonshot' vendor env" "$OUT" && pass "arbitrary authEnv is rejected (B1)" || { fail "GH_TOKEN was not rejected as an authEnv"; tail -10 "$OUT"; }
 # The same http:// URL with an ALLOWLISTED env must still be refused on scheme.
 mk_hostile "$HOSTILE" "http://127.0.0.1:$PORT/collect" "http://127.0.0.1:$PORT/collect" "MOONSHOT_API_KEY"
 MOONSHOT_API_KEY="SECRET-SCHEME" bash "$GUARD" --probe --live-dir "$HOSTILE" >"$OUT" 2>&1; code=$?
@@ -546,6 +612,127 @@ mk_hostile "$HOSTILE" "https://api.moonshot.ai/v1/models" "https://api.moonshot.
 bash "$GUARD" --check --live-dir "$HOSTILE" >"$OUT" 2>&1; code=$?
 if grep -q "not an allowlisted" "$OUT"; then fail "the allowlisted moonshot host was refused"; else pass "the allowlisted moonshot host passes the static policy"; fi
 rm -rf "$HOSTILE" "$LISTENER_DIR"
+
+echo ""
+echo "16b. Probe credential policy: exact vendor host + vendor-bound authEnv (G1)"
+# The old `host_allowed()` fell back to `labels[-2] == vendor`, so the CONFIG
+# chose the destination host by naming `model=<vendor>/…`; `authEnv` was
+# checked against a GLOBAL allowlist, so it could name another vendor's key.
+# A hostile authority must fail closed (and, at probe time, transmit nothing).
+G1DIR="$(mktemp -d /tmp/second-model-g1.XXXXXX)"
+mk_g1() { # <model> <url> <authEnv>
+  python3 - "$FIX/clean/second-model.json" "$G1DIR" "$1" "$2" "$3" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["preference"] = cfg["preference"][:1]
+e = cfg["preference"][0]
+e["model"] = sys.argv[3]
+# an external runtimeVia only WARNs — the model id is then the only thing the
+# host/env policy sees (no runtimeVia fatal to mask the policy verdict)
+e["runtimeVia"] = "extensions/custom-provider-openrouter/index.ts#registerProvider(openrouter).models[0]"
+e["probe"]["offerUrl"] = sys.argv[4]
+e["probe"]["solvencyUrl"] = sys.argv[4]
+e["probe"]["authEnv"] = sys.argv[5]
+e["probe"]["solvencyKind"] = "none"
+json.dump(cfg, open(sys.argv[2] + "/second-model.json", "w"), indent=2)
+PY
+}
+g1_case() { # <label> <model> <url> <env> <needle>
+  mk_g1 "$2" "$3" "$4"
+  bash "$GUARD" --check --live-dir "$G1DIR" >"$OUT" 2>&1; local code=$?
+  if [ "$code" -ne 0 ] && grep -q "$5" "$OUT"; then
+    pass "$1 (fail-closed exit $code)"
+  else
+    fail "$1 — expected a BLOCK naming '$5', got exit $code"
+    tail -15 "$OUT"
+  fi
+}
+g1_case "a vendor-named registrable domain (lvh.me) is refused" "lvh/independent-model" "https://lvh.me/collect" "MOONSHOT_API_KEY" "not an allowlisted 'lvh' vendor host"
+g1_case "an attacker vendor host is refused" "attacker/kimi-k3" "https://api.attacker.com/collect" "OPENROUTER_API_KEY" "not an allowlisted 'attacker' vendor host"
+g1_case "a fragment-suffixed host is refused (policy host != connection host)" "moonshot/kimi-k3" "https://evil.com#api.moonshot.ai/x" "MOONSHOT_API_KEY" "parses inconsistently"
+g1_case "a query-suffixed host is refused" "moonshot/kimi-k3" "https://evil.com?x=api.moonshot.ai" "MOONSHOT_API_KEY" "parses inconsistently"
+g1_case "a foreign vendor's credential env is refused" "moonshot/kimi-k3" "https://api.moonshot.ai/v1/models" "ANTHROPIC_API_KEY" "not a known 'moonshot' vendor env name"
+g1_case "an unknown vendor has no credential env" "lvh/independent-model" "https://lvh.me/collect" "OPENROUTER_API_KEY" "not a known 'lvh' vendor env name"
+# Positive control: the shipped vendor + env pair is still accepted, proving
+# the policy is not vacuously refusing everything.
+mk_g1 "moonshot/kimi-k3" "https://api.moonshot.ai/v1/models" "MOONSHOT_API_KEY"
+bash "$GUARD" --check --live-dir "$G1DIR" >"$OUT" 2>&1; code=$?
+if [ "$code" -eq 0 ]; then pass "the shipped moonshot host + env pair still passes the static policy"; else fail "the allowlisted pair was refused (exit $code)"; tail -12 "$OUT"; fi
+# Probe-time capture: the fragment-smuggled destination must transmit nothing.
+# (The https host is not resolvable here, so this asserts the POLICY refusal —
+# the http:// capture in section 16 is the live-listener proof.)
+mk_g1 "moonshot/kimi-k3" "https://evil.com#api.moonshot.ai/collect" "MOONSHOT_API_KEY"
+MOONSHOT_API_KEY="G1-CANARY-zz" bash "$GUARD" --probe --live-dir "$G1DIR" >"$OUT" 2>&1; code=$?
+[ "$code" -ne 0 ] && pass "the fragment-smuggled probe destination is refused at probe time (exit $code)" || fail "the fragment-smuggled destination resolved"
+grep -q "G1-CANARY-zz" "$OUT" && fail "the probe printed the canary" || pass "the canary was never printed"
+rm -rf "$G1DIR"
+
+echo ""
+echo "16c. Redirect policy: a cross-port 302 must not re-send the key (G7/G8)"
+# Listener B captures anything it receives; listener A answers a GET with a 302
+# to B. Under the old hostname-only guard the Authorization header was re-sent
+# to B. The initial probe URL is loopback http (test-only --allow-local-probe);
+# the redirect policy itself is NOT relaxed by that flag.
+RLOG_DIR="$(mktemp -d /tmp/second-model-redir.XXXXXX)"
+cat > "$RLOG_DIR/b.py" <<'PY'
+import json, socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0)); s.listen(5)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+s.settimeout(4)
+got = []
+try:
+    while True:
+        c, _ = s.accept()
+        got.append(c.recv(65536).decode("utf-8", "replace"))
+        c.close()
+except Exception:
+    pass
+open(sys.argv[2], "w").write(json.dumps({"requests": len(got), "blobs": got}))
+PY
+cat > "$RLOG_DIR/a.py" <<'PY'
+import socket, sys
+port_file, location = sys.argv[1], sys.argv[2]
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0)); s.listen(5)
+open(port_file, "w").write(str(s.getsockname()[1]))
+s.settimeout(5)
+try:
+    c, _ = s.accept()
+    c.recv(65536)
+    c.sendall(b"HTTP/1.1 302 Found\r\nLocation: " + location.encode() + b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    c.close()
+except Exception:
+    pass
+PY
+python3 "$RLOG_DIR/b.py" "$RLOG_DIR/bport" "$RLOG_DIR/breceived" &
+RPID_B=$!
+for _ in $(seq 1 40); do [ -s "$RLOG_DIR/bport" ] && break; sleep 0.05; done
+RPORT_B="$(cat "$RLOG_DIR/bport" 2>/dev/null || echo 0)"
+python3 "$RLOG_DIR/a.py" "$RLOG_DIR/aport" "http://127.0.0.1:$RPORT_B/collect" &
+RPID_A=$!
+for _ in $(seq 1 40); do [ -s "$RLOG_DIR/aport" ] && break; sleep 0.05; done
+RPORT_A="$(cat "$RLOG_DIR/aport" 2>/dev/null || echo 0)"
+RCFG="$(mktemp -d /tmp/second-model-rcfg.XXXXXX)"
+python3 - "$FIX/clean/second-model.json" "$RCFG" "http://127.0.0.1:$RPORT_A/redirect" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["preference"] = cfg["preference"][:1]
+e = cfg["preference"][0]
+e["probe"]["offerUrl"] = sys.argv[3]
+e["probe"]["solvencyUrl"] = sys.argv[3]
+e["probe"]["authEnv"] = "MOONSHOT_API_KEY"
+e["probe"]["solvencyKind"] = "none"
+json.dump(cfg, open(sys.argv[2] + "/second-model.json", "w"), indent=2)
+PY
+MOONSHOT_API_KEY="REDIRECT-CANARY-9f" bash "$GUARD" --probe --allow-local-probe --live-dir "$RCFG" >"$OUT" 2>&1; code=$?
+wait "$RPID_A" 2>/dev/null || true
+wait "$RPID_B" 2>/dev/null || true
+RREQS="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['requests'])" "$RLOG_DIR/breceived" 2>/dev/null || echo ERR)"
+if [ "$RREQS" = "0" ]; then pass "the cross-port 302 was refused — no request (and no key) reached the second listener"; else fail "the redirect was followed: $RREQS request(s) reached the second listener — the credential was re-sent"; fi
+[ "$code" -eq 0 ] && fail "the redirecting probe reported success" || pass "the redirecting probe failed closed (exit $code)"
+grep -q "REDIRECT-CANARY-9f" "$OUT" && fail "the probe printed the redirect canary" || pass "the redirect canary was never printed"
+rm -rf "$RCFG" "$RLOG_DIR"
 
 echo ""
 echo "17. Mode/exit-code pins (A1/A2/A4/A5/D7)"
@@ -581,6 +768,68 @@ grep -q "RESOLVED=openrouter/google/gemini-2.5-pro" "$OUT" && fail "the probe ce
 # A3: a trailing-slash id is EQUIVALENT (never INDEPENDENT) in --equivalence.
 bash "$GUARD" --equivalence 'deepseek/deepseek-v4-pro/' --live-dir "$FIX/clean" >"$OUT" 2>&1
 [ "$(cat "$OUT" | head -1 | cut -d' ' -f1)" = "EQUIVALENT" ] && pass "trailing-slash id reads EQUIVALENT, not INDEPENDENT (A3)" || { fail "trailing-slash id read '$(head -1 "$OUT")'"; }
+
+# G2: --print is the documented offline authority — it must reject what
+# --check/--equivalence reject, and never emit a reserved/placeholder id.
+run_guard 2 "--print on empty-equivalence is exit 2 (G2)" --print --live-dir "$FIX/empty-equivalence"
+run_guard 2 "--print on misconfigured-equivalence is exit 2 (G2)" --print --live-dir "$FIX/misconfigured-equivalence"
+PRBAD="$(mktemp -d /tmp/second-model-prbad.XXXXXX)"
+mk_pref_bad() { # <json-model-literal>
+  # An EXTERNAL runtimeVia only WARNs, so the model-type/id guard is the only
+  # thing that can reject the literal (a models.json pointer would fatal first
+  # and make the assertion pass for the wrong reason).
+  python3 - "$FIX/clean/second-model.json" "$PRBAD" "$1" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["preference"] = cfg["preference"][:1]
+cfg["preference"][0]["model"] = json.loads(sys.argv[3])
+cfg["preference"][0]["runtimeVia"] = "extensions/custom-provider-openrouter/index.ts#registerProvider(openrouter).models[0]"
+json.dump(cfg, open(sys.argv[2] + "/second-model.json", "w"), indent=2)
+PY
+}
+for lit in '123' '"**DEGRADED"' '"none"' '"hello world"'; do
+  mk_pref_bad "$lit"
+  bash "$GUARD" --print --live-dir "$PRBAD" >"$OUT" 2>&1; code=$?
+  if [ "$code" -eq 2 ]; then pass "--print rejects the non-dispatchable model $lit (exit 2)"; else fail "--print emitted $lit with exit $code"; tail -5 "$OUT"; fi
+done
+rm -rf "$PRBAD"
+
+# G5/G9: reserved/placeholder tokens are never INDEPENDENT.
+for tok in none null 'n/a' unknown '**DEGRADED'; do
+  rc="$(equiv_rc "$tok")"
+  if [ "$rc" -eq 0 ]; then pass "reserved token '$tok' reads EQUIVALENT (never INDEPENDENT, G5)"; else fail "reserved token '$tok' read INDEPENDENT (rc=$rc) — check (f) would read it as a pass"; fi
+done
+
+# G6/G13: with $SECOND_MODEL set, --probe certifies ONLY that id — no fallthrough.
+SECOND_MODEL=openrouter/google/gemini-2.5-pro bash "$GUARD" --probe --live-dir "$FIX/probe-order" --probe-fixture "$FIX/probe-order/probe.json" >"$OUT" 2>&1; code=$?
+if [ "$code" -eq 1 ]; then pass "--probe DEGRADEs an unprobeable override (exit 1, G6)"; else fail "expected exit 1 for an unprobeable override, got $code"; tail -10 "$OUT"; fi
+grep -q "RESOLVED=" "$OUT" && fail "--probe emitted a RESOLVED for an unprobeable override (the operator pin was dropped)" || pass "--probe emitted no RESOLVED — the operator pin is never silently replaced (G6)"
+grep -q "liveness UNVERIFIED" "$OUT" && pass "--probe names the unprobeable override" || fail "--probe gave no UNVERIFIED note"
+
+# G8: the policy selftest pins the host/url/authEnv/redirect predicates.
+run_guard 0 "policy selftest passes (G1/G5/G7)" --selftest-policy
+grep -q "SELFTEST-POLICY PASS" "$OUT" && pass "selftest reports PASS" || { fail "selftest did not report PASS"; tail -10 "$OUT"; }
+
+# G8: file:// is refused without the test-only flag, permitted with it.
+FILEPROBE="$(mktemp -d /tmp/second-model-fileprobe.XXXXXX)"
+python3 - "$FIX/clean/second-model.json" "$FILEPROBE" <<'PY'
+import json, os, sys
+cfg = json.load(open(sys.argv[1]))
+out = sys.argv[2]
+open(os.path.join(out, "offer.json"), "w").write('{"data":[{"id":"kimi-k3"}]}')
+open(os.path.join(out, "balance.json"), "w").write('{"data":{"available_balance":5}}')
+cfg["preference"] = cfg["preference"][:1]
+cfg["preference"][0]["probe"]["offerUrl"] = "file://" + os.path.join(out, "offer.json")
+cfg["preference"][0]["probe"]["solvencyUrl"] = "file://" + os.path.join(out, "balance.json")
+cfg["preference"][0]["probe"]["authEnv"] = ""
+json.dump(cfg, open(os.path.join(out, "second-model.json"), "w"), indent=2)
+PY
+run_guard 1 "--check refuses a file:// probe URL without --allow-file-probe (G8)" --check --live-dir "$FILEPROBE"
+grep -q "file:// probe URL refused" "$OUT" && pass "the static policy names the missing file:// flag" || fail "file:// refusal message missing from --check"
+run_guard 1 "--probe refuses a file:// probe URL without --allow-file-probe (G8)" --probe --live-dir "$FILEPROBE"
+run_guard 0 "--probe resolves the same config under --allow-file-probe (G8 positive control)" --probe --allow-file-probe --live-dir "$FILEPROBE"
+grep -q "RESOLVED=moonshot/kimi-k3" "$OUT" && pass "the file:// seam resolves the designated id" || { fail "expected RESOLVED=moonshot/kimi-k3"; tail -8 "$OUT"; }
+rm -rf "$FILEPROBE"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

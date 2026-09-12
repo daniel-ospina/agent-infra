@@ -108,9 +108,15 @@ merge_second_model() {
   # #716 — the second-model gate designation (ordered preference + runtimeVia +
   # build-equivalence set + probe endpoints). A standalone POLICY file (never
   # merged per-provider like models.json), so the shipped copy wins wholesale —
-  # the config is the single source of truth and an operator top-up needs no
-  # code edit. No-op when the tree does not ship second-model.json (older
-  # agent-infra); a pre-existing live copy is left untouched then.
+  # the config is the single source of truth and a candidate top-up is a config
+  # edit, not a code edit. CONSEQUENCE (G14): unlike merge_settings()/
+  # merge_models_store(), this is a WHOLE-FILE replace, so any live-only key or
+  # candidate is DROPPED on the next sync — a durable change must land in
+  # pi-bootstrap/pi-config/second-model.json in this repo (the guard's DEFAULT
+  # authority is the live copy, which makes a live-only edit look durable until
+  # the next sync silently reverts it). No-op when the tree does not ship
+  # second-model.json (older agent-infra); a pre-existing live copy is left
+  # untouched then.
   [ -f "$SRC/second-model.json" ] || return 0
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$SRC/second-model.json" "$DEST/second-model.json" << 'PY'
@@ -328,16 +334,21 @@ for base in "${fleet_srcs[@]}"; do
 done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
 
-# Merge-gate scripts farm (#562): record-review.sh + check-second-model.sh —
-# the review-enforcer's merge-registry writer (issue #138) and the #716
-# second-model designation guard. The guard's default authority is the LIVE
-# file at ~/.pi/agent/second-model.json, so a consumer repo must be able to
-# run it without the agent-infra checkout path. NOT launchd-invoked (pi-session
-# code resolves them explicitly: code-review SKILL.md Step 10 + commit-workflow
-# 04-merge-deploy), so they never joined the #427/#373 farms and drifted: the
-# repo copies are CI-tested while production mints execute the ~/.pi copies.
-# Same idempotent real-copy refresh model as the farms above.
-merge_gate_srcs=(record-review.sh check-second-model.sh)
+# Merge-gate scripts farm (#562): record-review.sh — the review-enforcer's
+# merge-registry writer (issue #138). The #716 second-model guard is NOT on
+# this farm (G12): the four gate skills invoke it as
+# `bash "$AGENT_INFRA_PATH/scripts/check-second-model.sh"`, and the guard
+# resolves its shipped config from its own PHYSICAL repo root — a copy under
+# $HOME/.pi/agent/scripts would resolve ROOT=$HOME/.pi and fail `--check` and
+# `--probe` with exit 2 (it cannot find pi-bootstrap/pi-config/models.json).
+# The $AGENT_INFRA_PATH convention is the real one; farming the guard only
+# minted a copy that could not run the modes the gate uses.
+# NOT launchd-invoked (pi-session code resolves record-review.sh explicitly:
+# code-review SKILL.md Step 10 + commit-workflow 04-merge-deploy), so it never
+# joined the #427/#373 farms and drifted: the repo copy is CI-tested while
+# production mints execute the ~/.pi copy. Same idempotent real-copy refresh
+# model as the farms above.
+merge_gate_srcs=(record-review.sh)
 mkdir -p "$DEST/scripts"
 merge_gate_copied=0
 for base in "${merge_gate_srcs[@]}"; do
@@ -352,7 +363,7 @@ for base in "${merge_gate_srcs[@]}"; do
   chmod +x "$dest" 2>/dev/null || true
   merge_gate_copied=$((merge_gate_copied+1))
 done
-echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, check-second-model.sh, #562/#716)"
+echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, #562)"
 
 # Wire shell profile (idempotent): auto-sync env + optional keys file
 ZSHRC="$HOME/.zshrc"
