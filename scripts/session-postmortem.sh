@@ -63,9 +63,41 @@ done
 parse_sessions() { # <file...> → JSONL on stdout
 python3 - "$@" <<'PYEOF'
 import json, sys
+from datetime import datetime, timezone
 
 CEILING_TB = 900000        # 0.9 × 1M (pre-clamp window) — policy §5 drift detector
 GENUINE_FLOOR = 0.92       # length-stop ctx must be ≥0.92 × session max ctx
+
+# Peak/off-peak spend split (#634). DeepSeek bills 2x during 01:00-04:00 and
+# 06:00-10:00 UTC, Mon-Fri; weekends are off-peak entirely. NOTE the recorded
+# cost is stamped at the OFF-PEAK card (models.json carries 0.15/0.60/0.003)
+# — pi has no time-of-day cost logic — so peak dollars here are what the call
+# WOULD cost off-peak, and half of what it was actually billed. Consumers that
+# print a "billed" view must double the peak side.
+# Bucketed per CALL, not per session: a session that starts off-peak and runs
+# into a window pays both rates, so a session-level label would be wrong.
+PEAK_WINDOWS = ((1, 4), (6, 10))
+
+
+def is_peak(dt):
+    if dt.weekday() >= 5:
+        return False
+    return any(a <= dt.hour < b for a, b in PEAK_WINDOWS)
+
+
+def parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    # A timezone-LESS stamp must be undated, not silently reinterpreted in the
+    # box's local zone (which would shift a wall-clock hour into or out of a
+    # window). Every real record is ISO-Z, so this is a guard, not a path.
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(timezone.utc)
 
 def one(fp):
     out = {"date": None, "session": None, "compacting": False,
@@ -74,6 +106,10 @@ def one(fp):
            "msg_input": 0, "msg_output": 0, "msg_cacheRead": 0,
            "msg_cacheWrite": 0, "msg_reasoning": 0,
            "msg_cost_total": 0.0, "msg_cost_cache": 0.0,
+           "msg_cost_peak": 0.0, "msg_cost_off": 0.0,
+           "msg_calls_peak": 0, "msg_calls_off": 0, "msg_calls_undated": 0,
+           "msg_cost_undated": 0.0,
+           "msg_cost_by_hour": {},
            "comp_input": 0, "comp_output": 0, "comp_cacheRead": 0,
            "comp_reasoning": 0, "comp_cost_total": 0.0,
            "reread_volume": 0, "genuine_len_stops": 0, "max_ctx": 0}
@@ -126,6 +162,21 @@ def one(fp):
                     if isinstance(c, dict):
                         out["msg_cost_total"] += c.get("total", 0) or 0
                         out["msg_cost_cache"] += (c.get("cacheRead", 0) or 0) + (c.get("cacheWrite", 0) or 0)
+                        # #634 peak/off-peak split — per call, by its own timestamp.
+                        ctot = c.get("total", 0) or 0
+                        dt = parse_ts(o.get("timestamp"))
+                        if dt is None:
+                            out["msg_calls_undated"] += 1
+                            out["msg_cost_undated"] += ctot
+                        else:
+                            hk = "%02d" % dt.hour
+                            out["msg_cost_by_hour"][hk] = out["msg_cost_by_hour"].get(hk, 0.0) + ctot
+                            if is_peak(dt):
+                                out["msg_calls_peak"] += 1
+                                out["msg_cost_peak"] += ctot
+                            else:
+                                out["msg_calls_off"] += 1
+                                out["msg_cost_off"] += ctot
                     ctx = (u.get("input", 0) or 0) + (u.get("cacheRead", 0) or 0)
                     out["max_ctx"] = max(out["max_ctx"], ctx)
                     if m.get("stopReason") == "length":
