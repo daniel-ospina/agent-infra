@@ -515,9 +515,20 @@ jobs:
         run: node --test \${{ inputs.test-glob }}
 `;
 
+/**
+ * Resolve a fixture argument LAZILY. A plain string is the source; a function is
+ * a thunk that builds a mutated source. Every mutation is passed as a thunk so it
+ * is evaluated INSIDE `test()` — a fixture whose anchor moved then fails as a ❌
+ * naming the anchor (via `mutate`'s assertion) instead of throwing an uncaught
+ * `AssertionError` at module load and taking the whole suite down with it.
+ */
+function resolveSource(v) {
+  return typeof v === "function" ? v() : v;
+}
+
 function expectWired(label, callerSrc, calleeSrc) {
   test(label, () => {
-    const findings = wiringFindings(callerSrc, calleeSrc);
+    const findings = wiringFindings(resolveSource(callerSrc), resolveSource(calleeSrc));
     assert.equal(
       findings.length,
       0,
@@ -528,7 +539,7 @@ function expectWired(label, callerSrc, calleeSrc) {
 
 function expectRed(label, callerSrc, calleeSrc, needle) {
   test(label, () => {
-    const findings = wiringFindings(callerSrc, calleeSrc);
+    const findings = wiringFindings(resolveSource(callerSrc), resolveSource(calleeSrc));
     assert.ok(findings.length > 0, "expected the guard to go RED, got no findings");
     assert.ok(
       findings.some((m) => m.includes(needle)),
@@ -563,60 +574,85 @@ test("minimal fixture pair satisfies every wiring invariant", () => {
 
 section("guard (j) — semantics-preserving reformats stay GREEN");
 
-expectWired("flow-style trigger `on: [pull_request]` is accepted", mutate(FIXTURE_CALLER, "on:\n  pull_request:", "on: [pull_request]"), FIXTURE_CALLEE);
-expectWired("scalar trigger `on: pull_request` is accepted", mutate(FIXTURE_CALLER, "on:\n  pull_request:", "on: pull_request"), FIXTURE_CALLEE);
+// Every fixture argument is either a dedicated fixture source (FIXTURE_CALLER /
+// FIXTURE_CALLEE) or a THUNK that mutates one. Thunks are resolved inside
+// `test()`, so a fixture whose anchor moved fails as a ❌ naming the anchor
+// instead of throwing an uncaught AssertionError at module load.
+expectWired(
+  "flow-style trigger `on: [pull_request]` is accepted",
+  () => mutate(FIXTURE_CALLER, "on:\n  pull_request:", "on: [pull_request]"),
+  FIXTURE_CALLEE
+);
+expectWired(
+  "scalar trigger `on: pull_request` is accepted",
+  () => mutate(FIXTURE_CALLER, "on:\n  pull_request:", "on: pull_request"),
+  FIXTURE_CALLEE
+);
+expectWired(
+  "an empty `pull_request: {}` mapping is accepted",
+  () => mutate(FIXTURE_CALLER, "  pull_request:", "  pull_request: {}"),
+  FIXTURE_CALLEE
+);
 expectWired(
   "quoted keys are accepted (`\"pull_request\":`, `\"test-command\":`, `\"run\":`, `\"if\":`)",
-  mutate(
+  () =>
     mutate(
       mutate(
-        mutate(FIXTURE_CALLER, '  pull_request:', '  "pull_request":'),
-        "      test-command:",
-        '      "test-command":'
+        mutate(
+          mutate(FIXTURE_CALLER, "  pull_request:", '  "pull_request":'),
+          "      test-command:",
+          '      "test-command":'
+        ),
+        "    with:",
+        '    "with":'
       ),
-      "    with:",
-      '    "with":'
+      "    uses:",
+      '    "uses":'
     ),
-    "    uses:",
-    '    "uses":'
-  ),
-  mutate(
+  () =>
     mutate(
       mutate(
-        mutate(FIXTURE_CALLEE, "    if: ", '    "if": '),
-        "        if: ",
-        '        "if": '
+        mutate(
+          mutate(FIXTURE_CALLEE, "    if: ", '    "if": '),
+          "        if: ",
+          '        "if": '
+        ),
+        "        run: ",
+        '        "run": '
       ),
-      "        run: ",
-      '        "run": '
-    ),
-    "      test-command:",
-    '      "test-command":'
-  )
+      "      test-command:",
+      '      "test-command":'
+    )
 );
 expectWired(
   "trailing and full-line comments are accepted",
-  mutate(
-    mutate(FIXTURE_CALLER, "on:", "on: # per-PR only\n# a full-line comment"),
-    `      test-command: ${EXPECTED_TEST_COMMAND}`,
-    `      test-command: ${EXPECTED_TEST_COMMAND} # the pin gate`
-  ),
-  mutate(FIXTURE_CALLEE, "    if: ", "    # activation predicate\n    if: ")
+  () =>
+    mutate(
+      mutate(FIXTURE_CALLER, "on:", "on: # per-PR only\n# a full-line comment"),
+      `      test-command: ${EXPECTED_TEST_COMMAND}`,
+      `      test-command: ${EXPECTED_TEST_COMMAND} # the pin gate`
+    ),
+  () => mutate(FIXTURE_CALLEE, "    if: ", "    # activation predicate\n    if: ")
 );
-expectWired("a whole-file reindent (with: derived, not hard-coded) stays GREEN", reindent(FIXTURE_CALLER, 2), reindent(FIXTURE_CALLEE, 2));
+expectWired(
+  "a whole-file reindent (with: derived, not hard-coded) stays GREEN",
+  reindent(FIXTURE_CALLER, 2),
+  reindent(FIXTURE_CALLEE, 2)
+);
 expectWired(
   "a `with:` mapping reindented with only its job subtree stays GREEN",
-  (() => {
+  () => {
     const [head, tail] = FIXTURE_CALLER.split("jobs:");
     return head + "jobs:" + reindent(tail, 2);
-  })(),
+  },
   FIXTURE_CALLEE
 );
 expectWired(
   "a parent-indent step sequence stays GREEN",
   FIXTURE_CALLER,
-  FIXTURE_CALLEE.replace(
-    `    steps:
+  () =>
+    FIXTURE_CALLEE.replace(
+      `    steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -629,7 +665,7 @@ expectWired(
         if: inputs.test-command == '' && inputs.test-glob != ''
         working-directory: \${{ inputs.working-directory }}
         run: node --test \${{ inputs.test-glob }}`,
-    `    steps:
+      `    steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-node@v4
       with:
@@ -642,215 +678,308 @@ expectWired(
       if: inputs.test-command == '' && inputs.test-glob != ''
       working-directory: \${{ inputs.working-directory }}
       run: node --test \${{ inputs.test-glob }}`
-  )
+    )
 );
 expectWired(
   "a block-scalar `run:` body equal to the command stays GREEN",
   FIXTURE_CALLER,
-  mutate(FIXTURE_CALLEE, `        run: \${{ inputs.test-command }}`, `        run: |
-          \${{ inputs.test-command }}`)
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      `        run: \${{ inputs.test-command }}`,
+      `        run: |\n          \${{ inputs.test-command }}`
+    )
 );
 expectWired(
   "a block-scalar `test-command:` binding stays GREEN",
-  mutate(FIXTURE_CALLER, `      test-command: ${EXPECTED_TEST_COMMAND}`, `      test-command: |
-        ${EXPECTED_TEST_COMMAND}`),
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      `      test-command: ${EXPECTED_TEST_COMMAND}`,
+      `      test-command: |\n        ${EXPECTED_TEST_COMMAND}`
+    ),
   FIXTURE_CALLEE
 );
 expectWired(
   "unrelated trigger/inputs keys (`workflow_dispatch.inputs.paths`) stay GREEN",
-  mutate(
-    FIXTURE_CALLER,
-    "on:\n  pull_request:",
-    "on:\n  pull_request:\n  workflow_dispatch:\n    inputs:\n      paths:\n        description: unrelated\n        type: string"
-  ),
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      "on:\n  pull_request:",
+      "on:\n  pull_request:\n  workflow_dispatch:\n    inputs:\n      paths:\n        description: unrelated\n        type: string"
+    ),
   FIXTURE_CALLEE
 );
 expectWired(
   "`continue-on-error: false` (an explicit no-op) stays GREEN",
-  mutate(FIXTURE_CALLER, "    uses: ", "    continue-on-error: false\n    uses: "),
+  () => mutate(FIXTURE_CALLER, "    uses: ", "    continue-on-error: false\n    uses: "),
   FIXTURE_CALLEE
 );
 expectWired(
   "a `run-name: |` scalar and a `concurrency:` block stay GREEN",
-  mutate(FIXTURE_CALLER, "jobs:", "run-name: |\n  CI for \${{ github.ref }}\n\nconcurrency:\n  group: ci-\${{ github.ref }}\n  cancel-in-progress: true\n\njobs:"),
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      "jobs:",
+      "run-name: |\n  CI for \${{ github.ref }}\n\nconcurrency:\n  group: ci-\${{ github.ref }}\n  cancel-in-progress: true\n\njobs:"
+    ),
   FIXTURE_CALLEE
 );
 
 section("guard (j) — YAML-valid bypass attempts are RED");
 
-// The decoys the #637 review reproduced against the previous text-matching
-// generations. Each mutates the LIVE workflow text, so the test proves the real
-// bypass class is closed, not a synthetic one.
+// Every fixture below is a DEDICATED fixture workflow (FIXTURE_CALLER /
+// FIXTURE_CALLEE), never the live files, so no verdict here depends on the
+// spelling of `.github/workflows/*.yml`. `LIVE_*` appears in exactly one place
+// (the "live ci.yml is correctly wired" assertion above). Each mutation is a
+// thunk, so a broken anchor is a ❌, not an uncaught throw at module load.
 expectRed(
   "a decoy dead step carrying the expected `run:` text is RED",
-  LIVE_CALLER,
-  mutate(
-    mutate(LIVE_CALLEE, CUSTOM_STEP_RUN_CLEAN, "        run: ${{ inputs.test-command }} || true\n"),
-    CUSTOM_STEP_LINE,
-    "      - name: Historical\n        if: false\n        run: ${{ inputs.test-command }}\n" + CUSTOM_STEP_LINE
-  ),
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      mutate(FIXTURE_CALLEE, CUSTOM_STEP_RUN_CLEAN, "        run: ${{ inputs.test-command }} || true\n"),
+      CUSTOM_STEP_LINE,
+      "      - name: Historical\n        if: false\n        run: ${{ inputs.test-command }}\n" + CUSTOM_STEP_LINE
+    ),
   "step-level `run:` set changed"
 );
 expectRed(
-  "a `test-command:` line inside another mapping's block scalar is RED",
-  mutate(
+  "a `test-command:` line inside a block scalar is RED (a scalar body is not a node)",
+  () =>
     mutate(
-      LIVE_CALLER,
-      `      test-command: ${EXPECTED_TEST_COMMAND}`,
-      `      test-command: ${EXPECTED_TEST_COMMAND} || true`
+      mutate(
+        FIXTURE_CALLER,
+        `      test-command: ${EXPECTED_TEST_COMMAND}`,
+        `      test-command: ${EXPECTED_TEST_COMMAND} || true`
+      ),
+      "jobs:",
+      `run-name: |\n  test-command: ${EXPECTED_TEST_COMMAND}\n\njobs:`
     ),
-    "    secrets: inherit\n",
-    `    secrets: inherit\n    env:\n      NOTES: |\n        test-command: ${EXPECTED_TEST_COMMAND}\n`
-  ),
-  LIVE_CALLEE,
+  FIXTURE_CALLEE,
   "`test-command` must be exactly"
 );
 expectRed(
   "a job-shaped block inside a YAML scalar is RED",
-  mutate(
+  () =>
     mutate(
-      LIVE_CALLER,
-      CALLER_USES_LINE,
-      `    if: github.event_name == 'push'\n${CALLER_USES_LINE}`
+      mutate(
+        FIXTURE_CALLER,
+        CALLER_USES_LINE,
+        `    if: github.event_name == 'push'\n${CALLER_USES_LINE}`
+      ),
+      "jobs:",
+      `run-name: |\n  jobs:\n    ci:\n      uses: ${EXPECTED_USES}\n      with:\n        test-command: ${EXPECTED_TEST_COMMAND}\n\njobs:`
     ),
-    "jobs:",
-    `run-name: |\n  jobs:\n    ci:\n      uses: ${EXPECTED_USES}\n      with:\n        test-command: ${EXPECTED_TEST_COMMAND}\n\njobs:`
-  ),
-  LIVE_CALLEE,
+  FIXTURE_CALLEE,
   "gained an `if:`"
 );
 expectRed(
   "a decoy comment line carrying the expected `run:` text is RED",
-  LIVE_CALLER,
-  mutate(
-    mutate(LIVE_CALLEE, CUSTOM_STEP_RUN_CLEAN, "        run: ${{ inputs.test-command }} || true\n"),
-    CUSTOM_STEP_LINE,
-    "      # historical: run: ${{ inputs.test-command }}\n" + CUSTOM_STEP_LINE
-  ),
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      mutate(FIXTURE_CALLEE, CUSTOM_STEP_RUN_CLEAN, "        run: ${{ inputs.test-command }} || true\n"),
+      CUSTOM_STEP_LINE,
+      "      # historical: run: ${{ inputs.test-command }}\n" + CUSTOM_STEP_LINE
+    ),
   "step-level `run:` set changed"
 );
 expectRed(
   "an unanchored `uses:` substring elsewhere does not satisfy the call check",
-  mutate(
-    mutate(LIVE_CALLER, "name: CI", `name: "uses: ${EXPECTED_USES}"`),
-    CALLER_USES_LINE,
-    "    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@v0.1.0"
-  ),
-  LIVE_CALLEE,
+  () =>
+    mutate(
+      mutate(FIXTURE_CALLER, "name: CI", `name: "uses: ${EXPECTED_USES}"`),
+      CALLER_USES_LINE,
+      "    uses: daniel-ospina/agent-infra/.github/workflows/node-ci.yml@v0.1.0"
+    ),
+  FIXTURE_CALLEE,
   "must call"
 );
 expectRed(
   "the `ci:` job gaining `if:` is RED",
-  mutate(LIVE_CALLER, CALLER_USES_LINE, `    if: github.event_name == 'push'\n${CALLER_USES_LINE}`),
-  LIVE_CALLEE,
+  () => mutate(FIXTURE_CALLER, CALLER_USES_LINE, `    if: github.event_name == 'push'\n${CALLER_USES_LINE}`),
+  FIXTURE_CALLEE,
   "gained an `if:`"
 );
 expectRed(
   "the `ci:` job gaining `continue-on-error :` (space before the colon) is RED",
-  mutate(LIVE_CALLER, CALLER_USES_LINE, `    continue-on-error : true\n${CALLER_USES_LINE}`),
-  LIVE_CALLEE,
+  () => mutate(FIXTURE_CALLER, CALLER_USES_LINE, `    continue-on-error : true\n${CALLER_USES_LINE}`),
+  FIXTURE_CALLEE,
   "gained `continue-on-error:`"
 );
 expectRed(
   "the `ci:` job gaining `needs:` is RED",
-  mutate(LIVE_CALLER, CALLER_USES_LINE, `    needs: drift-check\n${CALLER_USES_LINE}`),
-  LIVE_CALLEE,
+  () => mutate(FIXTURE_CALLER, CALLER_USES_LINE, `    needs: drift-check\n${CALLER_USES_LINE}`),
+  FIXTURE_CALLEE,
   "gained `needs:`"
 );
 expectRed(
   "an emptied `test-command` binding is RED (the job would be skipped)",
-  mutate(LIVE_CALLER, `      test-command: ${EXPECTED_TEST_COMMAND}`, '      test-command: ""'),
-  LIVE_CALLEE,
+  () => mutate(FIXTURE_CALLER, `      test-command: ${EXPECTED_TEST_COMMAND}`, '      test-command: ""'),
+  FIXTURE_CALLEE,
   "non-empty `test-command`"
 );
 expectRed(
   "a `|| true` wrapper on the binding is RED",
-  mutate(LIVE_CALLER, `      test-command: ${EXPECTED_TEST_COMMAND}`, `      test-command: ${EXPECTED_TEST_COMMAND} || true`),
-  LIVE_CALLEE,
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      `      test-command: ${EXPECTED_TEST_COMMAND}`,
+      `      test-command: ${EXPECTED_TEST_COMMAND} || true`
+    ),
+  FIXTURE_CALLEE,
   "must be exactly"
 );
 expectRed(
   "an extra `with:` key is RED",
-  mutate(LIVE_CALLER, `      test-command: ${EXPECTED_TEST_COMMAND}`, `      test-glob: '*.test.mjs'\n      test-command: ${EXPECTED_TEST_COMMAND}`),
-  LIVE_CALLEE,
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      `      test-command: ${EXPECTED_TEST_COMMAND}`,
+      `      test-glob: '*.test.mjs'\n      test-command: ${EXPECTED_TEST_COMMAND}`
+    ),
+  FIXTURE_CALLEE,
   "`with:` key set changed"
 );
 expectRed(
   "losing the second suite from `test-command` is RED",
-  mutate(LIVE_CALLER, `      test-command: ${EXPECTED_TEST_COMMAND}`, "      test-command: node scripts/check-skill-lint.test.mjs"),
-  LIVE_CALLEE,
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      `      test-command: ${EXPECTED_TEST_COMMAND}`,
+      "      test-command: node scripts/check-skill-lint.test.mjs"
+    ),
+  FIXTURE_CALLEE,
   "must be exactly"
 );
 expectRed(
   "the trigger no longer being `pull_request` is RED",
-  mutate(LIVE_CALLER, "on:\n  pull_request:", "on:\n  push:\n    branches: [main]"),
-  LIVE_CALLEE,
+  () => mutate(FIXTURE_CALLER, "on:\n  pull_request:", "on:\n  push:\n    branches: [main]"),
+  FIXTURE_CALLEE,
+  "must still run on `pull_request`"
+);
+// The two decoys the #675 verification reproduced against origin/main's TEXT
+// guard: both kept a `pull_request` token in the file while `on:` ran only on
+// `push`, and origin/main's guard stayed 163/163 GREEN with the gate unplugged.
+// A parsed read must go RED naming the missing trigger.
+expectRed(
+  "a bare `pull_request:` inside a `run-name: |` scalar is not the trigger (RED)",
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      "on:\n  pull_request:",
+      "on:\n  push:\n    branches: [main]\nrun-name: |\n  pull_request:"
+    ),
+  FIXTURE_CALLEE,
+  "must still run on `pull_request`"
+);
+expectRed(
+  "a `pull_request:` key inside another top-level mapping is not the trigger (RED)",
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      "on:\n  pull_request:",
+      "on:\n  push:\n    branches: [main]\n\nenv:\n  pull_request: decoy"
+    ),
+  FIXTURE_CALLEE,
   "must still run on `pull_request`"
 );
 expectRed(
   "a quoted `\"paths-ignore\":` filter under `pull_request` is RED",
-  mutate(LIVE_CALLER, "on:\n  pull_request:", "on:\n  pull_request:\n    \"paths-ignore\":\n      - '*.md'"),
-  LIVE_CALLEE,
+  () =>
+    mutate(
+      FIXTURE_CALLER,
+      "on:\n  pull_request:",
+      "on:\n  pull_request:\n    \"paths-ignore\":\n      - '*.md'"
+    ),
+  FIXTURE_CALLEE,
   "gained `paths-ignore:`"
 );
 expectRed(
   "a flow-mapped `pull_request: {paths-ignore: …}` is RED",
-  mutate(LIVE_CALLER, "on:\n  pull_request:", "on:\n  pull_request: {paths-ignore: ['*.md']}"),
-  LIVE_CALLEE,
+  () =>
+    mutate(FIXTURE_CALLER, "on:\n  pull_request:", "on:\n  pull_request: {paths-ignore: ['*.md']}"),
+  FIXTURE_CALLEE,
   "gained `paths-ignore:`"
 );
 expectRed(
   "`on: [push]` (a flow sequence without pull_request) is RED",
-  mutate(LIVE_CALLER, "on:\n  pull_request:", "on: [push]"),
-  LIVE_CALLEE,
+  () => mutate(FIXTURE_CALLER, "on:\n  pull_request:", "on: [push]"),
+  FIXTURE_CALLEE,
   "must still run on `pull_request`"
 );
 expectRed(
   "an unsatisfiable `unit-test` job predicate (`&& false`) is RED",
-  LIVE_CALLER,
-  mutate(LIVE_CALLEE, `    if: ${EXPECTED_JOB_IF}`, `    if: ${EXPECTED_JOB_IF} && false`),
+  FIXTURE_CALLER,
+  () => mutate(FIXTURE_CALLEE, `    if: ${EXPECTED_JOB_IF}`, `    if: ${EXPECTED_JOB_IF} && false`),
   "activation predicate must be exactly"
 );
 expectRed(
   "a rewired custom-test step predicate is RED",
-  LIVE_CALLER,
-  mutate(LIVE_CALLEE, `        if: ${EXPECTED_STEP_IF}\n`, "        if: inputs.test-command != '' && false\n"),
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      `        if: ${EXPECTED_STEP_IF}\n`,
+      "        if: inputs.test-command != '' && false\n"
+    ),
   "no `unit-test` step has"
 );
 expectRed(
   "a `|| true` wrapper inside the step `run:` is RED",
-  LIVE_CALLER,
-  mutate(LIVE_CALLEE, CUSTOM_STEP_RUN_CLEAN, "        run: ${{ inputs.test-command }} || true\n"),
+  FIXTURE_CALLER,
+  () => mutate(FIXTURE_CALLEE, CUSTOM_STEP_RUN_CLEAN, "        run: ${{ inputs.test-command }} || true\n"),
   "must run exactly"
 );
 expectRed(
   "`continue-on-error: true` on a `unit-test` step is RED",
-  LIVE_CALLER,
-  mutate(LIVE_CALLEE, CUSTOM_STEP_LINE, "      - name: Custom test command\n        continue-on-error: true\n"),
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      CUSTOM_STEP_LINE,
+      "      - name: Custom test command\n        continue-on-error: true\n"
+    ),
   "gained `continue-on-error:`"
 );
 expectRed(
   "`continue-on-error : true` on the `unit-test` job is RED",
-  LIVE_CALLER,
-  mutate(LIVE_CALLEE, `    if: ${EXPECTED_JOB_IF}`, `    continue-on-error : true\n    if: ${EXPECTED_JOB_IF}`),
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      `    if: ${EXPECTED_JOB_IF}`,
+      `    continue-on-error : true\n    if: ${EXPECTED_JOB_IF}`
+    ),
   "job gained `continue-on-error:`"
 );
 expectRed(
   "`needs:` on the `unit-test` job is RED",
-  LIVE_CALLER,
-  mutate(LIVE_CALLEE, `    if: ${EXPECTED_JOB_IF}`, `    needs: script-validate\n    if: ${EXPECTED_JOB_IF}`),
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      `    if: ${EXPECTED_JOB_IF}`,
+      `    needs: script-validate\n    if: ${EXPECTED_JOB_IF}`
+    ),
   "job gained `needs:`"
 );
 expectRed(
   "renaming the `test-command` workflow_call input is RED",
-  LIVE_CALLER,
-  mutate(LIVE_CALLEE, "      test-command:\n        type: string", "      test-cmd:\n        type: string"),
+  FIXTURE_CALLER,
+  () =>
+    mutate(
+      FIXTURE_CALLEE,
+      "      test-command:\n        type: string",
+      "      test-cmd:\n        type: string"
+    ),
   "no longer declares a `test-command`"
 );
 expectRed(
   "a construct outside the reader's subset fails LOUDLY (never silently green)",
-  mutate(LIVE_CALLER, "name: CI", "name: &ci CI"),
-  LIVE_CALLEE,
+  () => mutate(FIXTURE_CALLER, "name: CI", "name: &ci CI"),
+  FIXTURE_CALLEE,
   "supported YAML subset reader"
 );
 
