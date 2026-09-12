@@ -298,10 +298,18 @@ export function bridgeRoots(): string[] {
   return Array.from(roots);
 }
 
-// Adopt a same-repo sibling root when the cwd root has nothing verified. Logs
-// both paths so the mismatch is diagnosable from the transcript instead of
-// presenting as an unexplained per-file hash failure (#3255).
-function resolveWorktreeAwareRoot(root: string): string {
+// RECOVERY-ONLY. #3255: the bridge's compound keys are keyed on the WORKTREE
+// that was verified, while a hub session's `process.cwd()` git root is the hub.
+// Adopting the sibling root lets session-start RECOVERY see those entries.
+//
+// This must NEVER be used to choose the git-op root: adoption is inferred from
+// bridge content, not from what the command targets, so a clean adopted tree
+// yields an empty diff scope and the gate's empty-scope path ALLOWS an op
+// carrying unverified content — a fail-open in the one direction this gate must
+// not fail (found in review of the first attempt). The git-op root is therefore
+// authoritative — the command's own cwd — and a root mismatch is diagnosed
+// loudly (diagnoseRootMismatch) rather than bridged.
+function recoveryOnlyRoot(root: string): string {
   const picked = pickVerifiedRoot(root, bridgeRoots(), gitCommonDir);
   if (picked === null) return root;
   console.log(
@@ -309,6 +317,27 @@ function resolveWorktreeAwareRoot(root: string): string {
       `adopting ${picked} (same repo, has verified entries) as the git-op root`,
   );
   return picked;
+}
+
+// #3255: a git op whose root differs from the root verification recorded cannot
+// be compared hash-for-hash — the two sides are different trees. Say so in the
+// transcript, naming both paths, instead of presenting as an unexplained
+// per-file hash mismatch (which reads as "the gate is broken" and invites a
+// bypass). This only NARRATES; the block/mismatch decision is unchanged and
+// stays fail-closed.
+function diagnoseRootMismatch(root: string): void {
+  const roots = bridgeRoots();
+  const norm = normalizeWorktreeRoot(root);
+  if (roots.length === 0 || roots.some((r) => normalizeWorktreeRoot(r) === norm)) return;
+  const mine = gitCommonDir(root);
+  if (mine === null) return;
+  const siblings = roots.filter((r) => gitCommonDir(r) === mine);
+  if (siblings.length === 0) return;
+  console.log(
+    `[verification-gate] ⚠ #3255: this git op resolves to ${norm}, but the bridge holds verified entries for ` +
+      `${siblings.join(", ")} (same repo). Those are different trees, so hashes cannot be compared — ` +
+      `re-run the op from the verified tree (cd into it) or re-dispatch verification for ${norm} (#3255).`,
+  );
 }
 
 function writeBridge(projectRoot: string, files: string[]): void {
@@ -3155,7 +3184,7 @@ export default function (pi: ExtensionAPI) {
     // #190: recover verification state from the bridge, root-filtered + stored-
     // hash match-or-drop. (Replaces the blind loader — the bridge now persists
     // compound keys with verifier-authoritative hashes.)
-    const sessionRoot = normalizeWorktreeRoot(resolveWorktreeAwareRoot(resolveGitRoot(process.cwd())));
+    const sessionRoot = normalizeWorktreeRoot(recoveryOnlyRoot(resolveGitRoot(process.cwd())));
     const recovered = recoverBridgeForRoot(sessionRoot);
     if (recovered > 0) {
       console.log(`[verification-gate] 📂 Recovered ${recovered} verified files from bridge`);
@@ -3218,7 +3247,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── tool_call: block git/gh ops ────────────────────
-  pi.on("tool_call", async (event, _ctx): Promise<ToolCallEventResult | undefined> => {
+  pi.on("tool_call", async (event, ctx): Promise<ToolCallEventResult | undefined> => {
     if (!isToolCallEventType("bash", event)) return undefined;
     if (!extensionEnabled) return undefined;
 
@@ -3245,9 +3274,17 @@ export default function (pi: ExtensionAPI) {
     // lint-staged (pre-commit hook) may have modified files (ESLint --fix),
     // changing their hashes. Capture the post-lint state before the next check.
     // Determine cwd — prefer cd prefix in command (worktree support)
-    const inputCwd = event.input.cwd ? String(event.input.cwd) : process.cwd();
+    // #3255: prefer the cwd the runtime actually spawns this command in. It is
+    // the authoritative base for the git op; `process.cwd()` is only the last
+    // resort (and is the HUB when the session runs there while the change lives
+    // in a linked worktree — the original bug).
+    const ctxCwd = typeof (ctx as { cwd?: unknown } | undefined)?.cwd === "string"
+      ? (ctx as { cwd: string }).cwd
+      : null;
+    const inputCwd = event.input.cwd ? String(event.input.cwd) : (ctxCwd ?? process.cwd());
     const cdPath = extractCdPath(command);
-    const cwd = resolveWorktreeAwareRoot(resolveGitRoot(cdPath ?? inputCwd));
+    const cwd = resolveGitRoot(cdPath ?? inputCwd);
+    diagnoseRootMismatch(cwd);
 
     // #190: mid-session bridge recovery FIRST — defense-in-depth for the
     // incident's event-miss class (a merge that landed via another path, e.g.

@@ -3304,6 +3304,27 @@ test("pickVerifiedRoot: no entries, or an unresolvable repo, falls back", () => 
   equal(pickVerifiedRoot("/repo", ["/repo/w1"], () => null), null);
 });
 
+test("#3255 policy: the git-op root is authoritative — adoption must never gate an op (fail-closed)", () => {
+  const src = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf-8");
+  // The first attempt resolved the git-op root through the bridge-adopting
+  // helper. A clean adopted tree then produced an EMPTY scope, which takes the
+  // gate's empty-scope path and ALLOWS an op carrying unverified content in the
+  // session's real tree — a fail-open. This pins the direction, because that is
+  // the property a unit test of the helper itself cannot express.
+  ok(
+    !/const cwd = recoveryOnlyRoot\(/.test(src),
+    "the git-op root must not be bridge-adopted (adoption ⇒ empty scope ⇒ ALLOW)",
+  );
+  ok(
+    /const cwd = resolveGitRoot\(cdPath \?\? inputCwd\)/.test(src),
+    "the git-op root must come from the command's own cwd",
+  );
+  ok(
+    /const sessionRoot = normalizeWorktreeRoot\(recoveryOnlyRoot\(/.test(src),
+    "session-start bridge recovery is the one place adoption is permitted",
+  );
+});
+
 // ── Results ───────────────────────────────────────────
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
