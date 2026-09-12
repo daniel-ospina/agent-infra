@@ -216,6 +216,8 @@ When Step 1.5 runs, "unfamiliar" means: a third-party npm package imported in fi
 
 **Never start on main/master regardless of risk.**
 
+**Before isolating — collision pre-flight (#3061, fail-closed):** run `python3 tools/collision_preflight.py <N>` from the target repo root. Exit `0` (CLEAN) is the ONLY outcome that authorizes starting work; exit `1` (COLLISION) means the issue is already in flight, exit `2` (INCOMPLETE) means a surface could not be queried and is **not** clean, exit `3` is a usage/internal error. A non-zero exit is a hard stop — never "proceed anyway."
+
 **If worktree is needed:** Invoke `using-git-worktrees` skill once, in the controller session. If already inside an existing worktree, skip.
 
 **If plain branch is acceptable:**
