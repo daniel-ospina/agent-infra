@@ -525,6 +525,12 @@ async function partB() {
       ["opaque payload whose producer path names NO verb (`bash -c \"$(cat plain-undo.sh)\"`)", `bash -c "$(cat ${plainVerbPath})"`],
       ["non-`{}` xargs placeholder payload (`xargs -I@ sh -c '@'`)", "printf 'git checkout -- dirty.txt\\n' | xargs -I@ sh -c '@'"],
       ["named xargs placeholder payload (`xargs -I PERCENT sh -c 'PERCENT'`)", "printf 'git checkout -- dirty.txt\\n' | xargs -I PERCENT sh -c 'PERCENT'"],
+      // ── reviewer round-9 closures ──
+      ["feeder supplies the VERB (`printf 'checkout -- f' | xargs git`)", "printf 'checkout -- dirty.txt\\n' | xargs git"],
+      ["xargs placeholder as a PATHSPEC (`… | xargs -I@ git checkout -- @`)", "git diff --name-only | xargs -I@ git checkout -- @"],
+      ["piped code into a spawner-wrapped shell (`… | env bash`)", "printf 'git checkout -- dirty.txt\\n' | env bash"],
+      ["piped code into a flagged shell (`… | bash -x`)", "printf 'git checkout -- dirty.txt\\n' | bash -x"],
+      ["piped code into a stdin-reading shell (`… | sh -s`)", "printf 'git checkout -- dirty.txt\\n' | sh -s"],
     ];
     for (const [why, cmd] of bypass) {
       const r = await bash(cmd, wt);
@@ -549,6 +555,10 @@ async function partB() {
       allowed(await bash('bash -c "$CMD" && echo normal', wt)), "was blocked");
     expectTrue("B6l: `bash -c \"$CMD\" && terraform plan` ALLOWED (no discard verb)",
       allowed(await bash('bash -c "$CMD" && terraform plan', wt)), "was blocked");
+    // Reviewer round-9: widening the pipeline-consumer analysis must not block a
+    // shell fed harmless data.
+    expectTrue("B6l: `printf 'hello\\n' | env bash` ALLOWED (piped code with no discard verb)",
+      allowed(await bash("printf 'hello\\n' | env bash", wt)), "was blocked");
     rmSync(execUndo, { force: true });
     rmSync(patch, { force: true });
     rmSync(verbPath, { force: true });

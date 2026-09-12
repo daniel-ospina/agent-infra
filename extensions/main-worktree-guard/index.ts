@@ -198,6 +198,10 @@ let resolveInvocationTarget: (inv: unknown, sessionCwd?: string, baseCwd?: strin
 // default false is safe — a degraded import leaves extractWorkingTreeDiscards
 // inert (`[]`), so nothing reaches this call.
 let wtIsPlaceholderPathspec: (p: unknown) => boolean = () => false;
+// Fail-safe default = the old bare-word regex: a degraded import must not make
+// the piped-code arms over-claim, and must not silently widen them either.
+let wtPipelineFeedsShell: (cmd: string) => boolean =
+  (cmd: string) => /\|\s*(?:\S*\/)?(?:bash|sh|zsh|dash|ksh)\s*$/.test(String(cmd ?? ""));
 let wtShellInlinePayloads: (cmd: string) => { text: string; opaque: boolean }[] =
   // FAIL-SAFE fallback, not inert: a stale/partial classify-git.mjs (the export
   // missing while `classifierLoaded` is still true) must not silently delete the
@@ -256,6 +260,7 @@ try {
   discardDestroysWip = _m5.discardDestroysWip;
   resolveInvocationTarget = _m5.resolveInvocationTarget;
   if (typeof _m5.wtIsPlaceholderPathspec === "function") wtIsPlaceholderPathspec = _m5.wtIsPlaceholderPathspec;
+  if (typeof _m5.wtPipelineFeedsShell === "function") wtPipelineFeedsShell = _m5.wtPipelineFeedsShell;
   if (typeof _m5.wtShellInlinePayloads === "function") wtShellInlinePayloads = _m5.wtShellInlinePayloads;
   if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
   if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
@@ -1257,7 +1262,11 @@ function _worktreeDiscardBlock(command: string): string | null {
   // A FILE piped into a shell interpreter (`cat /tmp/undo.sh | bash`) carries no
   // literal `git` either — it must survive the bail so the script walk can read
   // it (reviewer round-5 P1).
-  const pipesToShell = /\|\s*(?:\S*\/)?(?:bash|sh|zsh|dash|ksh)\s*$/.test(String(command ?? ""));
+  const pipesToShell = wtPipelineFeedsShell(command);
+  // Runtime placeholder tokens declared by `xargs -I<tok>` — the token is
+  // substituted at execution time, so it is never a literal path/spec (reviewer
+  // round-9 P1).
+  const xargsPlaceholders = _wtXargsPlaceholders(command);
   if (!/\bgit\b/.test(command) && !_scriptPath && !pipesToShell && !/['"\\$`]/.test(command)) return null;
   let direct: ReturnType<typeof extractWorkingTreeDiscards> = [];
   try { direct = extractWorkingTreeDiscards(command) ?? []; } catch { return null; }
@@ -1393,7 +1402,7 @@ function _worktreeDiscardBlock(command: string): string | null {
   // segment head is `xargs`, which is not a spawner word, so the whole segment
   // is skipped. Check the invocation pair directly and fail closed (reviewer
   // round-8b P1).
-  if (_wtXargsPlaceholders(command).length > 0 &&
+  if (xargsPlaceholders.length > 0 &&
       /(?:^|[\s;|&(])(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh)\s+(?:-[A-Za-z]*c[A-Za-z]*|--command)(?![A-Za-z])/.test(String(command))) {
     return _worktreeDiscardBlockReason({ form: "interpreter-c-payload", scope: "all", pathspecs: [] }, execCwd, "an interpreter `-c` payload is a runtime placeholder");
   }
@@ -1494,6 +1503,7 @@ function _worktreeDiscardBlock(command: string): string | null {
         // nothing, read the tree as clean and release the discard (reviewer
         // round-8 P2). Not statically resolvable → fail closed.
         d.pathspecs.some((p) => /[{}]/.test(String(p))) ||
+        d.pathspecs.some((p) => xargsPlaceholders.includes(String(p).replace(/^["']|["']$/g, ""))) ||
         d.pathspecs.some((p) => wtIsPlaceholderPathspec(p));
       if (unresolvable) {
         return _worktreeDiscardBlockReason(d, execCwd, "the target pathspec is not statically resolvable");

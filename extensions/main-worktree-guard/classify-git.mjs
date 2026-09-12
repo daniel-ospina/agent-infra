@@ -2546,6 +2546,14 @@ function _wtSubstSpans(text) {
  *  one of these with no resolvable pathspec is conservatively whole-tree). */
 const _WT_FAMILY_VERBS = new Set(["checkout", "restore", "switch", "reset", "checkout-index", "rm", "read-tree", "apply"]);
 
+/** Textual family-verb probe used ONLY by the conservative feeder fallback.
+ *  Mirrors index.ts's `_MENTIONS_DISCARD_VERB` (the long verbs are substring
+ *  matches; `rm` is word-anchored) — a verb embedded in a path or in the
+ *  feeder's payload counts, an unrelated word containing `rm` does not. */
+function _wtTextMentionsFamilyVerb(text) {
+  return /(?:checkout|restore|switch|reset|read-tree|apply)|(?:^|[^A-Za-z0-9_-])rm(?:[^A-Za-z0-9_-]|$)/.test(String(text ?? ""));
+}
+
 /**
  * Payloads a shell interpreter reads from its STDIN: here-strings
  * (`bash <<< 'git checkout -- f'`) and process substitution
@@ -2660,6 +2668,23 @@ export function joinContinuations(command) {
 }
 
 /**
+ * True when the pipeline's LAST segment runs an interpreter, using the same
+ * head analysis as the heredoc walker — spawners, flags and redirections are
+ * accepted (`… | env bash`, `… | bash -x`, `… | sh -s`, `… | 2>/dev/null bash`),
+ * not just a bare shell word at end-of-command. The old regex demanded the bare
+ * form, so ANY flag or spawner disabled both the piped-file seed and the
+ * piped-shell fail-closed arm (reviewer round-9 P1). Code interpreters
+ * (python/node/…) count too: a code consumer executes the payload as code.
+ * @param {string} command
+ * @returns {boolean}
+ */
+export function wtPipelineFeedsShell(command) {
+  const segs = String(command ?? "").split("|");
+  if (segs.length < 2) return false;
+  return _wtHeadInterpreter(segs[segs.length - 1]) !== null;
+}
+
+/**
  * Extract every working-tree-discard invocation from a shell command (#709).
  * @param {string} command
  * @returns {Array<{form: string, scope: string, pathspecs: string[], fromTree: boolean, verb: string, args: string[], inv: any}>}
@@ -2729,9 +2754,19 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
     // carries a feeder and a family verb produced no descriptor, fall back to
     // the conservative whole-tree descriptor — the effect probe still decides.
     if (/(?:^|[\s|;&(])xargs\b/.test(String(command ?? "")) || /\bfind\b[\s\S]*?-exec\b/.test(String(command ?? ""))) {
+      // The FEEDER can also supply the VERB itself (`printf 'checkout -- f\n' |
+      // xargs git`) — the walker then sees a bare `git` invocation with no verb,
+      // which is not in `unhandled` keyed on a family verb, so nothing was
+      // emitted and the discard ran ungated (reviewer round-9 P1). A null-verb
+      // invocation under a feeder whose text names a family verb is exactly as
+      // unresolvable as the pathspec-fed form, and gets the same conservative
+      // whole-tree descriptor (the effect probe still decides).
+      const fedVerb = _wtTextMentionsFamilyVerb(command);
       for (const u of unhandled) {
         if (u.verb && _WT_FAMILY_VERBS.has(u.verb)) {
           out.push({ form: "feeder-pathspec", scope: "all", pathspecs: [], fromTree: false, verb: u.verb, args: u.args, inv: u.inv });
+        } else if (!u.verb && fedVerb) {
+          out.push({ form: "feeder-verb", scope: "all", pathspecs: [], fromTree: false, verb: "feeder", args: u.args, inv: u.inv });
         }
       }
     }

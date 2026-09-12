@@ -158,6 +158,19 @@ teardown, not a working-tree discard of the current checkout — the
 indistinguishable from an edit without reading file content (the #625 in-place
 overwrite gate keeps its existing shared-main scope).
 
+Three further documented residuals were found by the round-9 adversarial review
+and are tracked as follow-ups rather than fixed here (each is a narrow,
+deliberate-obfuscation-adjacent spelling, and the obvious fixes carry real
+false-positive risk): **(a)** a destructive FLAG supplied through a variable
+(`H=--hard; git reset $H`, `F=-R; git apply $F <patch>`) — the extractor keys on
+literal flag tokens, and failing closed on every `$`-bearing argument would
+false-block the ordinary `git checkout -b "$BRANCH"`; **(b)** a
+`git show <rev>:<path>` revert piped into a writer the write-target model does
+not know (`| dd of=<path>`, `| cp /dev/stdin <path>`; redirects, `tee` and
+python `open()` ARE gated); **(c)** `bash /dev/stdin < script.sh`, where the
+script operand is a FIFO so the bounded walk reads nothing and the `<` operand
+is not reached. None of the three is in the `pi -p` fixer's ordinary path.
+
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
 The **hub** (the shared main checkout of a guarded repo — agent-infra included
