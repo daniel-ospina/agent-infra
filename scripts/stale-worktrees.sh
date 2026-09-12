@@ -90,15 +90,19 @@ while IFS= read -r line; do
       #    then a live ls-remote; a NETWORK FAILURE means UNKNOWN → skip
       if git show-ref --verify --quiet "refs/remotes/origin/$BN" 2>/dev/null; then { WT=""; continue; }; fi
       if ! lsout=$(git ls-remote --heads origin "$BN" 2>/dev/null); then { WT=""; continue; }; fi
-      if printf '%s\n' "$lsout" | grep -q "refs/heads/$BN$"; then { WT=""; continue; }; fi
+      if grep -q "refs/heads/$BN$" <<<"$lsout"; then { WT=""; continue; }; fi
       # 2) no open PR — fail-closed: gh failure/missing ⇒ UNKNOWN ⇒ skip
       if ! $GH_OK; then { WT=""; continue; }; fi
-      if printf '%s\n' "$OPEN_PRS" | grep -qx "$BN"; then { WT=""; continue; }; fi
+      if grep -qx "$BN" <<<"$OPEN_PRS"; then { WT=""; continue; }; fi
       # 3) clean tree (tracked + untracked)
       if [ -n "$(git -C "$WT" status --porcelain 2>/dev/null)" ]; then { WT=""; continue; }; fi
       # 4) no ignored files (conservative — a clean tree can still hold data,
       #    and `git worktree remove` does NOT refuse on ignored files)
-      if git -C "$WT" status --porcelain --ignored=traditional 2>/dev/null | grep -q '^!!'; then { WT=""; continue; }; fi
+      # (no pipe: `git … | grep -q '^!!'` false-negatives under pipefail once the list exceeds
+      #  the pipe buffer and an `!!` line is early — git takes SIGPIPE, the test reads FALSE,
+      #  and the worktree becomes a removal candidate even though `git worktree remove` does
+      #  NOT refuse ignored files. `[ -n "$(...)" ]` cannot SIGPIPE.)
+      if [ -n "$(git -C "$WT" status --porcelain --ignored=traditional 2>/dev/null)" ]; then { WT=""; continue; }; fi
       # 5) idle: HEAD commit older than IDLE_DAYS (epoch arithmetic — portable);
       #    fail-closed: if HEAD can't be read, skip (learned nothing)
       HEAD_TS=$(git -C "$WT" log -1 --format=%ct 2>/dev/null) || { WT=""; continue; }
@@ -128,7 +132,7 @@ if $EXECUTE; then
     # re-verify immediately before removal — clean INCLUDING ignored files
     # (git worktree remove refuses tracked/untracked dirt but NOT ignored)
     if [ -n "$(git -C "$WT" status --porcelain 2>/dev/null)" ] || \
-       git -C "$WT" status --porcelain --ignored=traditional 2>/dev/null | grep -q '^!!'; then
+       [ -n "$(git -C "$WT" status --porcelain --ignored=traditional 2>/dev/null)" ]; then
       echo "⏭️  $WT became dirty or gained ignored files since listing — skipped (branch $BN kept)"
       continue
     fi

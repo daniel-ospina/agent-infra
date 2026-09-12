@@ -94,7 +94,7 @@ echo "── fleet-cost-report thresholds ────────────�
 D="$T/clean"; for i in 1 2 3; do mk_session "$D" "$i" 290000 0.70; done
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi; }
-assert_contains() { if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
+assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
 assert_eq "$RC" "0" "clean fixture exits 0"
 assert_contains "$OUT" "## ✅ CLEAN" "clean fixture reports CLEAN"
 assert_contains "$OUT" "3 compacting" "clean fixture counts 3 compacting sessions"

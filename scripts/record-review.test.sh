@@ -24,7 +24,7 @@ assert_eq() {
     if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi
 }
 assert_contains() {
-    if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi
+    if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi
 }
 
 T="$(mktemp -d /tmp/record-review-test.XXXXXX)"
@@ -53,15 +53,15 @@ if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
     exit 0
 fi
 if [ "$1" = "api" ]; then
-    if printf '%s' "$*" | grep -qF -- "--jq .head.sha"; then
+    if grep -qF -- "--jq .head.sha" <<<"$*"; then
         printf '%s' "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
         echo; exit 0
     fi
-    if printf '%s' "$*" | grep -qF -- "--jq .body"; then
+    if grep -qF -- "--jq .body" <<<"$*"; then
         printf '{"body": "%s"}' "${STUB_BODY:-PR body}"
         exit 0
     fi
-    if printf '%s' "$*" | grep -qF -- "--jq .[].name"; then
+    if grep -qF -- "--jq .[].name" <<<"$*"; then
         [ "${STUB_LABELS_FAIL:-0}" = "1" ] && exit 1
         num="$(printf '%s' "$*" | sed -n 's/.*issues\/\([0-9]*\)\/labels.*/\1/p')"
         if [ -n "$num" ] && [ -n "${STUB_LABELS_DIR:-}" ] && [ -f "${STUB_LABELS_DIR}/$num" ]; then
@@ -343,7 +343,7 @@ assert_contains "$PATCH_BODY" "review recorded: reviews/424400.json" "verdict ma
 # 9.2 absent env — no SM line at all (backward compatible).
 run_record_sm "" "" 424401
 [ "$RECORD_RC" = "0" ] && ok "SM absent: record rc 0" || bad "SM absent: rc=$RECORD_RC"
-if printf '%s' "$PATCH_BODY" | grep -qF '[SECOND-MODEL-GATE]'; then bad "SM absent: no SM line expected"; else ok "SM absent: no SM line posted"; fi
+if grep -qF '[SECOND-MODEL-GATE]' <<<"$PATCH_BODY"; then bad "SM absent: no SM line expected"; else ok "SM absent: no SM line posted"; fi
 
 # 9.3 model without independent → refuse (exit 2), no record.
 run_record_sm "moonshot/kimi-k3" "" 424402
@@ -389,23 +389,23 @@ run_record_sm "null" "yes" 424412
 [ "$RECORD_RC" = "2" ] && ok "SM reserved 'null' + yes refuses (exit 2)" || bad "SM reserved null (rc=$RECORD_RC)"
 run_record_sm "unknown" "DEGRADED" 424413
 [ "$RECORD_RC" = "0" ] && ok "SM reserved 'unknown' + DEGRADED records (the sanctioned degraded form)" || bad "SM reserved unknown + DEGRADED (rc=$RECORD_RC)"
-if printf '%s' "$PATCH_BODY" | grep -qF 'model=unknown independent=DEGRADED'; then ok "SM reserved 'unknown' records only as DEGRADED"; else bad "SM reserved 'unknown' DEGRADED marker not posted"; fi
+if grep -qF 'model=unknown independent=DEGRADED' <<<"$PATCH_BODY"; then ok "SM reserved 'unknown' records only as DEGRADED"; else bad "SM reserved 'unknown' DEGRADED marker not posted"; fi
 
 # 9.13 G10 — a NEW second-model marker REPLACES a stale one (append-and-never-
 # remove left a conflicting body that check (f) now fails closed on).
 STALE_SM_BODY="review recorded: reviews/424414.json verdict=clean @ $SHA (daniel-ospina/agent-infra)
 [SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=DEGRADED @ $SHA"
 STUB_BODY="$STALE_SM_BODY" run_record_sm "moonshot/kimi-k3" "yes" 424414
-if printf '%s' "$PATCH_BODY" | grep -qF "independent=yes"; then ok "SM replace: new marker posted"; else bad "SM replace: new marker not posted"; fi
+if grep -qF "independent=yes" <<<"$PATCH_BODY"; then ok "SM replace: new marker posted"; else bad "SM replace: new marker not posted"; fi
 _sm_count="$(printf '%s' "$PATCH_BODY" | grep -cF '[SECOND-MODEL-GATE]')"
 if [ "$_sm_count" = "1" ]; then ok "SM replace: exactly one SM marker in the patched body"; else bad "SM replace: stale marker stacked (count=$_sm_count)"; fi
-if printf '%s' "$PATCH_BODY" | grep -qF "independent=DEGRADED"; then bad "SM replace: stale DEGRADED marker survived"; else ok "SM replace: stale DEGRADED marker removed"; fi
-if printf '%s' "$PATCH_BODY" | grep -qF "reviews/424414.json"; then ok "SM replace: verdict marker preserved"; else bad "SM replace: verdict marker was dropped"; fi
+if grep -qF "independent=DEGRADED" <<<"$PATCH_BODY"; then bad "SM replace: stale DEGRADED marker survived"; else ok "SM replace: stale DEGRADED marker removed"; fi
+if grep -qF "reviews/424414.json" <<<"$PATCH_BODY"; then ok "SM replace: verdict marker preserved"; else bad "SM replace: verdict marker was dropped"; fi
 
 # 9.9 a verdict marker already present but SM line missing → only the SM line posts.
 STUB_BODY="review recorded: reviews/424408.json verdict=clean @ $SHA (daniel-ospina/agent-infra)" run_record_sm "moonshot/kimi-k3" "yes" 424408
-if printf '%s' "$PATCH_BODY" | grep -qF '[SECOND-MODEL-GATE]'; then ok "SM partial idempotency: missing SM line was posted"; else bad "SM partial idempotency: SM line not posted"; fi
-if printf '%s' "$PATCH_BODY" | grep -qF 'PR body'; then bad "SM partial idempotency: injected STUB_BODY was NOT read (test would be vacuous)"; else ok "SM partial idempotency: injected body honored (non-vacuous)"; fi
+if grep -qF '[SECOND-MODEL-GATE]' <<<"$PATCH_BODY"; then ok "SM partial idempotency: missing SM line was posted"; else bad "SM partial idempotency: SM line not posted"; fi
+if grep -qF 'PR body' <<<"$PATCH_BODY"; then bad "SM partial idempotency: injected STUB_BODY was NOT read (test would be vacuous)"; else ok "SM partial idempotency: injected body honored (non-vacuous)"; fi
 
 unset STUB_BODY
 
