@@ -35,6 +35,11 @@ import sys, json
 print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))
 ")
 
+# #838 — adversarial domain: set to 1 iff the scoping comment carries the
+# `### Adversarial Threat Surface` declaration. Drives the 2-cycle bound in L1
+# and the `adversarial-capped` exit. Unset/0 → the general 10-cycle cap.
+ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}
+
 # implementation_agent requires positive integer issue_number.
 # Fall back to PR_NUMBER when no linked issue — uses issue_number for logging only.
 ISSUE_NUMBER_SAFE=${ISSUE_NUMBER:-$PR_NUMBER}

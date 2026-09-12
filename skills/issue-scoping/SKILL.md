@@ -998,12 +998,7 @@ gh issue comment $ISSUE_NUMBER --body "$(cat <<'PLANEOF'
 ### full-diamond-verify: N cycles, clean | N issues remain
 
 ## Plan
-<plan draft>
-
-## Adversarial Threat Surface
-<!-- Required when the change gates or enforces; otherwise write the single line `(not adversarial)`. -->
-**In scope:** <bypass class → adversarial input → required behaviour>
-**Out of scope:** <classes deliberately excluded, with reason>
+<plan draft — must include `### Adversarial Threat Surface` (in-scope bypass classes + classes out of scope), or the single line `(not adversarial)`>
 
 ## Clarifications
 <from clarifying-questions Step 6a (Pass A), or "none — no questions qualified">

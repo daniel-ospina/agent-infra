@@ -382,6 +382,38 @@ export function nonAdversarialCapViolations(table: RiskRow[]): string[] {
   return violations;
 }
 
+/** The adversarial branch of the executable fixer loop: `then BOUND=<N>; fi`. */
+const EXECUTABLE_BOUND_RE = /then\s+BOUND=(\d+);\s*fi/g;
+
+/**
+ * The bound the fixer loop actually EXECUTES — parsed from the `then BOUND=<N>;
+ * fi` statement, never from the `adversarial-bound: cap=N` anchor comment. The
+ * anchor and the executable are two separate surfaces: a comment is not a
+ * guard, so the pin must read the code (the #723 defect shape — a runtime bound
+ * diverging from the declared one while nothing fails).
+ */
+export function executableAdversarialBounds(src: string): number[] {
+  const out: number[] = [];
+  for (const m of src.matchAll(EXECUTABLE_BOUND_RE)) out.push(Number(m[1]));
+  return out;
+}
+
+/** Violations when the fixer loop's EXECUTED adversarial bound ≠ the declared cap. */
+export function executableBoundViolations(src: string): string[] {
+  const bounds = executableAdversarialBounds(src);
+  if (bounds.length !== 1) {
+    return [
+      `fixer-loop: expected exactly 1 \`then BOUND=<N>; fi\` adversarial branch, found ${bounds.length}`,
+    ];
+  }
+  if (bounds[0] !== ADVERSARIAL_CAP) {
+    return [
+      `fixer-loop: the EXECUTED adversarial bound is ${bounds[0]}, but the declared cap is ${ADVERSARIAL_CAP}`,
+    ];
+  }
+  return [];
+}
+
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
 const MARKDOWN = readFileSync(SKILL_PATH, "utf-8");
@@ -445,6 +477,15 @@ test("the executable fixer loop keeps the 10-cycle default and adds the adversar
     src.includes('EXIT_REASON="adversarial-capped"'),
     "a bounded adversarial exit must be recorded under its own exit_reason",
   );
+  ok(
+    src.includes("ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}"),
+    "the pre-loop setup must define ADVERSARIAL_BOUND, or the branch is unreachable",
+  );
+});
+
+test("the EXECUTED adversarial bound equals the declared cap (anchor ↔ code)", () => {
+  const src = ADVERSARIAL_SOURCES["skills/code-review/references/fixer-loop.md"];
+  deepEqual(executableBoundViolations(src), [], `executable bound drifted: ${executableBoundViolations(src).join(" | ")}`);
 });
 
 // Negative controls — the guard must actually reject drift.
@@ -482,6 +523,31 @@ test("rejects a re-capped canonical table (the non-adversarial guard is not vacu
 test("rejects a canonical table that lost a risk row", () => {
   const v = nonAdversarialCapViolations(TABLE.filter((r) => r.risk !== "Low-Medium"));
   ok(v.some((s) => s.includes("Low-Medium")), `expected a Low-Medium violation, got: ${v.join(" | ")}`);
+});
+
+test("rejects an executable bound that drifted from the declared cap (BOUND=3, anchor intact)", () => {
+  const path = "skills/code-review/references/fixer-loop.md";
+  const src = ADVERSARIAL_SOURCES[path];
+  const mutated = src.replace("then BOUND=2; fi", "then BOUND=3; fi");
+  ok(mutated !== src, "control did not apply — the `then BOUND=2; fi` branch was not found");
+  // The anchor is untouched, so anchor parity alone stays green — this is the
+  // bypass the executable-bound check exists to close.
+  deepEqual(adversarialBoundViolations({ ...ADVERSARIAL_SOURCES, [path]: mutated }), [], "anchor parity is expected to stay green");
+  const v = executableBoundViolations(mutated);
+  ok(v.some((s) => s.includes("EXECUTED adversarial bound is 3")), `expected an executed-bound violation, got: ${v.join(" | ")}`);
+});
+
+test("rejects a missing adversarial branch in the executable loop", () => {
+  const dropped = ADVERSARIAL_SOURCES["skills/code-review/references/fixer-loop.md"].replace(
+    /if \[ "\$\{ADVERSARIAL_BOUND:-0\}" = "1" \]; then BOUND=2; fi\n/,
+    "",
+  );
+  ok(
+    dropped !== ADVERSARIAL_SOURCES["skills/code-review/references/fixer-loop.md"],
+    "control did not apply — the adversarial BOUND branch was not found",
+  );
+  const v = executableBoundViolations(dropped);
+  ok(v.some((s) => s.includes("found 0")), `expected found-0, got: ${v.join(" | ")}`);
 });
 
 // ── The runtime mapping ─────────────────────────────────────────────────────

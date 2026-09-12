@@ -69,12 +69,19 @@ objective not delivered), #708/PR #823 (2 cycles, converged only under an impose
 
 ## 5. Verification
 
-- `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts` — all tests pass, including the new negative controls (must FAIL on a mutated cap / a missing anchor / a re-capped canonical row).
-- `node scripts/check-skill-lint.test.mjs`, `node scripts/check-skill-lint.mjs --repo .` — skill frontmatter still valid.
-- `bash tests/drift/run.sh` not required (no template-pin change beyond prose).
+- `npx tsx extensions/loop-enforcer/tier-config-parity.test.ts` — 32 passed, 0 failed (21 baseline + 11 new), including the negative controls (mutated cap / missing anchor / duplicated anchor / re-capped canonical table / **executed** `BOUND=3` with the anchor intact / dropped executable branch) — each must FAIL.
+- `node scripts/check-skill-lint.test.mjs`, `node scripts/check-skill-lint.mjs --repo .`, `node scripts/check-pi-pin-lockstep.mjs` — green.
 - Bounded code review: **max 2 cycles**, per this change's own rule. A fresh reviewer returning `THREAT SURFACE COVERED` (all 5 declared classes covered, no in-scope bypass reproduced) is a clean exit; residuals are filed, not chased, and the PR body discloses the basis.
 
 ## 6. Review Cycle Log
 
-Cycle 1 and (if needed) cycle 2 recorded on the PR. Bounded exit disclosed with
-`[ADVERSARIAL-BOUND] cycles=… threats=5 covered=… residuals=…`.
+**Cycle 1** — 2 fresh reviewers. 4 in-scope findings, all fixed:
+
+| # | Class | Finding | Fix |
+|---|---|---|---|
+| 1 | 1 (cap drift) | the pin bound the anchor comment but not the **executed** `BOUND`; `BOUND=2→3` left 29/29 green (reproduced by the reviewer) | `executableBoundViolations()` parses `then BOUND=<N>; fi`; equality assertion + `BOUND=3` and dropped-branch negative controls |
+| 2 | 1 (cap drift) | `ADVERSARIAL_BOUND` was never **set** anywhere, so the 2-cycle branch was unreachable on the documented path | pre-loop setup defines `ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}`; `code-review` Step 6 says to export it; pinned |
+| 3 | 3 (laundering) | `proportional-gates` — the surface `AGENTS.md` calls canonical — omitted the clean-verdict token and the disclosure syntax | both added to the canonical paragraph |
+| 4 | 4 (declaration escape) | the scoping template emitted `## Adversarial Threat Surface` while every consumer keys on `###` | template now requires the `###` section inside the plan draft (one heading level everywhere) |
+
+Out-of-scope findings — **filed, not chased**: #871 (reported cycle count is off by one), #870 (no mechanical check that a scoping comment declares or disclaims the surface).

@@ -895,7 +895,7 @@ For each cycle:
 
 - **Acceptance** = every in-scope threat class has a test that fails without the fix, plus green CI — *not* "the reviewer ran out of ideas". The scoping declaration is the reference: the reviewer verifies each listed class is covered and tries to reproduce an in-scope bypass.
 - **Clean-exit verdict:** a fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) satisfies the clean-exit conditions below. A literal `NO ISSUES FOUND` is *not* required — never manufacture one.
-- **Cap: 2 cycles** (`references/fixer-loop.md` honours `ADVERSARIAL_BOUND=1`), tighter than the general safety cap below. Findings **outside** the declared surface are filed as issues and **not** chased; in-scope findings surviving cycle 2 are filed and recorded, not iterated.
+- **Cap: 2 cycles.** Enter the loop with `ADVERSARIAL_BOUND=1` exported (the reference's pre-loop setup reads it; unset → the general 10-cycle cap), tighter than the safety cap below. Findings **outside** the declared surface are filed as issues and **not** chased; in-scope findings surviving cycle 2 are filed and recorded, not iterated.
 - **Disclose:** when the merge rests on threat-list coverage rather than `NO ISSUES FOUND`, the PR body must carry `[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>` and the report must say so in plain words. Exit reason: `adversarial-capped`. <!-- adversarial-bound: cap=2 -->
 
 **Exit conditions — ALL must be true before proceeding to Step 8:**
