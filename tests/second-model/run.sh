@@ -778,6 +778,22 @@ grep -q "RESOLVED=openrouter/google/gemini-2.5-pro" "$OUT" && fail "the probe ce
 # A3: a trailing-slash id is EQUIVALENT (never INDEPENDENT) in --equivalence.
 bash "$GUARD" --equivalence 'deepseek/deepseek-v4-pro/' --live-dir "$FIX/clean" >"$OUT" 2>&1
 [ "$(cat "$OUT" | head -1 | cut -d' ' -f1)" = "EQUIVALENT" ] && pass "trailing-slash id reads EQUIVALENT, not INDEPENDENT (A3)" || { fail "trailing-slash id read '$(head -1 "$OUT")'"; }
+# H4: `--model ID` is documented as the equivalence target but never selected
+# equivalence mode — it ran --check and returned exit 0 for EVERY id.
+bash "$GUARD" --model deepseek/deepseek-v4-pro --live-dir "$FIX/clean" >"$OUT" 2>&1; code=$?
+if [ "$code" -eq 0 ] && [ "$(head -1 "$OUT" | cut -d' ' -f1)" = "EQUIVALENT" ]; then
+  pass "H4: --model <build-equivalent id> → EQUIVALENT (exit 0)"
+else
+  fail "H4: --model on a build-equivalent id returned exit $code / '$(head -1 "$OUT")'"
+fi
+# Mode-selection proof: an independent id must exit 1 under --model. The old
+# (check-mode) behaviour returned exit 0 on the same clean authority.
+bash "$GUARD" --model openrouter/google/gemini-2.5-pro --live-dir "$FIX/clean" >"$OUT" 2>&1; code=$?
+if [ "$code" -eq 1 ] && [ "$(head -1 "$OUT" | cut -d' ' -f1)" = "INDEPENDENT" ]; then
+  pass "H4: --model <independent id> → INDEPENDENT (exit 1 — proves equivalence mode, not check mode)"
+else
+  fail "H4: --model fail-open on an independent id — exit $code / '$(head -1 "$OUT")'"
+fi
 
 # G2: --print is the documented offline authority — it must reject what
 # --check/--equivalence reject, and never emit a reserved/placeholder id.

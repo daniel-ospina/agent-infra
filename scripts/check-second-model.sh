@@ -43,7 +43,8 @@
 #   --equivalence <id>     exit 0 when <id> IS in the primary's build-equivalence
 #                          set (build-equivalent), 1 when independent, 2 when
 #                          the authority itself is unusable (fail closed). Used
-#                          by check-pipeline-compliance.sh check (f).
+#                          by check-pipeline-compliance.sh check (f). `--model
+#                          <id>` is the same mode (H4).
 #
 # Flags: --shipped-only (no live dir), --live-dir PATH (authority =
 # PATH/second-model.json), --probe-fixture FILE (hermetic probe injection —
@@ -53,7 +54,8 @@
 # http:// or https:// — never a non-loopback host, and the redirect policy is
 # NOT relaxed by it), --selftest-policy (internal test-only: assert the probe
 # destination/redirect/credential policies and print PASS/FAIL),
-# --model ID (equivalence target), -h/--help.
+# --model ID (alias for `--equivalence ID`: classify the id — exit 0
+# build-equivalent, 1 independent, 2 unusable authority), -h/--help.
 #
 # Probe security (B1/G1/G7): the probe NEVER sends a credential dictated by an
 # untrusted config. Probe URLs must be https:// (file:// only under
@@ -148,7 +150,16 @@ while [ $# -gt 0 ]; do
       EQUIV_MODEL="${1:-}"
       [ -n "$EQUIV_MODEL" ] || { echo "error: --equivalence requires a model id" >&2; exit 2; }
       ;;
-    --model) shift; EQUIV_MODEL="${1:-}"; [ -n "$EQUIV_MODEL" ] || { echo "error: --model requires a model id" >&2; exit 2; } ;;
+    --model)
+      # H4: `--model ID` is documented as the equivalence target, but the
+      # parser only set EQUIV_MODEL and never selected equivalence mode, so it
+      # ran `--check` and returned exit 0 for EVERY id — a caller doing
+      # `if check-second-model.sh --model "$id"; then equivalent; fi` read any
+      # id as EQUIVALENT. Select the mode explicitly.
+      MODE="equivalence"; shift
+      EQUIV_MODEL="${1:-}"
+      [ -n "$EQUIV_MODEL" ] || { echo "error: --model requires a model id" >&2; exit 2; }
+      ;;
     --shipped-only) SHIPPED_ONLY=1 ;;
     --live-dir) shift; LIVE_DIR_ARG="${1:-}"; [ -n "$LIVE_DIR_ARG" ] || { echo "error: --live-dir requires a path" >&2; exit 2; } ;;
     --probe-fixture) shift; PROBE_FIXTURE="${1:-}"; [ -n "$PROBE_FIXTURE" ] || { echo "error: --probe-fixture requires a path" >&2; exit 2; } ;;
