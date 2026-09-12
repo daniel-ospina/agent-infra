@@ -37,10 +37,23 @@ jobs:
         # #254 — frontmatter validator fixture-regression (post-merge, ci-main)
         echo "== scripts/check-skill-lint.test.mjs =="
         node scripts/check-skill-lint.test.mjs || failures=$((failures+1))
+        # #666 — the pi-pin lockstep tripwires ((h) pins, (i) mirror stamps,
+        # (j) the per-PR wiring) moved out of the suite above into their own
+        # single-purpose suite; run it here too so extracting them does not drop
+        # the post-merge half of #637's contract (ci.yml runs both per-PR).
+        echo "== scripts/check-pi-pin-lockstep.mjs =="
+        node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))
         # #668 — commit-msg mangle heuristic (runs the hook directly; husky
         # is NOT installed in CI, #672).
         echo "== scripts/commit-msg-check.test.sh =="
         bash scripts/commit-msg-check.test.sh || failures=$((failures+1))
+        # Glob-collected: every extensions/*/test*.mjs suite, including #744's
+        # main-worktree-guard/test-module-load.mjs (the index.ts module-LOAD
+        # regression pin) — no explicit line for it, that would double-run it.
+        # ⚠️ This leg is POST-MERGE only (on: push → main); the per-PR run of
+        # the #744 suite is wired in ci.yml — the per-PR workflow that runs the
+        # test suites (pipeline-compliance.yml is also PR-triggered, but runs
+        # no test suite).
         for t in extensions/*/test*.mjs; do
           [ -f "$t" ] || continue
           echo "== $t =="
@@ -75,6 +88,12 @@ jobs:
         # Zero-dep: stdlib-only; uses dynamic require for env ordering.
         echo "== extensions/reflect-hook.test.ts =="
         npx tsx extensions/reflect-hook.test.ts || failures=$((failures+1))
+        # #723 — loop-enforcer TIER_CONFIG vs the canonical Review Cycles table
+        # in skills/proportional-gates/SKILL.md: the runtime-vs-governance
+        # drift class (complex.maxCycles sat at 2× the canonical bound with no
+        # gate reading it). Mirrors the per-PR verify-job step in ci.yml.
+        echo "== extensions/loop-enforcer/tier-config-parity.test.ts =="
+        npx tsx extensions/loop-enforcer/tier-config-parity.test.ts || failures=$((failures+1))
         # #357 — sequence-enforcer: the gate-critical suite was the only one NOT
         # in CI (the never-passable checkpoint contract shipped untested, 08-12).
         # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
@@ -83,19 +102,24 @@ jobs:
         # #426 — review-enforcer: the merge-registry gate (gates EVERY merge in
         # this account). Needs the pi package (real runtime import): installed as
         # a devDep (package.json) from the public registry, pinned to the pi
-        # runtime version (0.85.1) for CI parity.
+        # pi runtime version (0.85.1) for CI parity.
         echo "== extensions/review-enforcer/index.test.ts =="
         (cd extensions/review-enforcer && npm ci --no-audit --no-fund --loglevel=error) && \
           NODE_ENV=test npx tsx extensions/review-enforcer/index.test.ts || failures=$((failures+1))
         # #379 — verification-gate: the commit-gate suite (unit + e2e)
         # was unwired. Same route as review-enforcer above (real runtime pi
-        # import — isToolCallEventType): devDep pinned 0.85.1, npm ci once, run
+        # import — isToolCallEventType): pi devDep pinned 0.85.1, npm ci once, run
         # both files. index.e2e.test.ts redirects HOME to a temp dir (hermetic).
         echo "== extensions/verification-gate/index.test.ts =="
         (cd extensions/verification-gate && npm ci --no-audit --no-fund --loglevel=error) && \
           npx tsx extensions/verification-gate/index.test.ts || failures=$((failures+1))
         echo "== extensions/verification-gate/index.e2e.test.ts =="
         npx tsx extensions/verification-gate/index.e2e.test.ts || failures=$((failures+1))
+        # #755 — the merge-scope subtraction suite. SDK-FREE by construction
+        # (index.js is a TYPE-only import), so it runs off the npm ci above with
+        # no extra dependency.
+        echo "== extensions/verification-gate/subtract-scope.test.ts =="
+        npx tsx extensions/verification-gate/subtract-scope.test.ts || failures=$((failures+1))
         # #476 — provider-exhaustion failover suites (the shared/provider-failover*
         # suites are auto-picked by the shared glob above; the consumer-side
         # suites live under builtin-tools/ + the extension root). The parity suite

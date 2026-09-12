@@ -1715,36 +1715,518 @@ function isSourceCheckout(): boolean {
 // extension-tests job. The scan is CASE-INSENSITIVE (a re-drift may use
 // "WARN-ONLY"/"Warn-only"/"WARN only" — the pre-#485 docs used both lowercase
 // "warn-only" and all-caps "WARN-ONLY", so case-mutants are in the historical
-// vocabulary), with a single carve-out: the legitimate on-demand-gates line in
-// 01-preflight.md ("Quality gates available on-demand (WARN only, do not block)")
-// — a line that carries that exact anchor is stripped before the scan, so the
-// legitimate uppercase phrase never false-positives while a re-drift using it
-// anywhere else is caught. DOCUMENTED BLANKET CONTRACT (second-model gate,
-// 2026-09-06): the tokens are generic warn-phrases, not review-enforcer-scoped
-// — any FUTURE legitimate "warn-only"-vocabulary prose about ANOTHER gate in
-// 01/02/03 must be reworded (or this list scoped) rather than adding a token;
-// the one-time acceptance grep is the floor, this pin is deliberately broader
-// (adds the space-form "warn only") so CI can never green a claim the grep
-// would have caught.
+// vocabulary), and the one-time acceptance grep is the FLOOR: this list is
+// deliberately broader (it adds the space-form "warn only" and the inflected
+// "warns …" forms) so CI can never green a claim the grep would have caught.
+//
+// SCOPE (#745). The tokens are ordinary English warn-phrases, so a blanket
+// whole-file scan put four forbidden phrases, in any case, over three files for
+// EVERY gate — with nothing surfacing the constraint at the point of writing.
+// It fired for real on 2026-09-10: #691 documented the UNRELATED
+// `.husky/commit-msg` hook as "warn-only by default" and red-mained CI twice
+// (3e73be7, 03bdb24); #717 paid the reword tax. The invariant this pin actually
+// protects is narrower — "no WARN-ALLOW claim ABOUT THE REVIEW-ENFORCER" — so
+// an anti-token is now scored as a claim at two widths: its own SENTENCE
+// (strong — the sentence names the review-enforcer or its tier/dispatch floor)
+// or its enclosing markdown SECTION (contextual — a bare warn-allow sentence
+// inside a review-enforcer topic is that topic's claim, which closes the
+// anaphoric hole: "…unless a reviewer was dispatched this session." / "The gate
+// is warn-only."). A sentence that names a DIFFERENT gate is escaped when it
+// carries no review-enforcer vocabulary of its own. Every historical pre-#485
+// re-drift sentence carries review-enforcer vocabulary (proven by the #745 T2b
+// fixtures, which are drawn from the real pre-flip corpus), so protective power
+// is preserved for the claim class this pin exists to catch, while "the husky
+// hook is warn-only" — which names no review-enforcer vocabulary and sits in a
+// section that names none either — passes.
+//
+// Residuals, accepted deliberately and documented here so they are never
+// mistaken for the intended scope:
+//   1. A SENTENCE that names the review-enforcer AND another gate's warn behavior
+//      ("unlike the review-enforcer, the husky hook is warn-only") still reds.
+//      Separating those two claims needs semantic parsing, and for a drift
+//      backstop the conservative direction is to red.
+//   2. A warn-allow sentence in a DIFFERENT section from any review-enforcer
+//      content is out of scope even if anaphorically about it: the section is the
+//      topic unit, and that IS the boundary that removes the #745 failure mode.
+//      The pre-#745 whole-file scan "covered" this case only because it had no
+//      notion of topic at all — the defect being fixed.
+//   3. Conservative reds on shapes that need semantic parsing, and only when the
+//      sentence sits in a review-enforcer section: a negated claim ("the micro
+//      tier is no longer warn-only — it blocks") and an other-gate subject split
+//      from its copula by an inserted phrase ("the husky hook, by default, is
+//      warn-only" — the trailing form "the husky hook is warn-only, by default"
+//      passes). The pre-#745 pin reddened on negations too, so (3) is not a
+//      regression; it is the same fail-safe direction.
+//   4. False negative, bounded: in a scoped section, a re-drift whose other-gate
+//      name sits in an UNPUNCTUATED leading subordinate clause — "because the
+//      husky hook is unrelated the gate is warn-only" — passes, because finding
+//      the subordinate clause's end needs parsing. The inverse heuristic (cut at
+//      the subordinate clause's verb) false-reds the equally legitimate "since
+//      the husky hook is warn-only, the gate blocks", so the pin does not guess;
+//      the punctuated comma form IS caught (see the T2b fixture). The same
+//      bounded family covers a RELATIVE-clause INVERSION — "the gate that the
+//      husky hook replaced is warn-only" passes, because the relative clause
+//      opens with its own noun phrase and is indistinguishable from a
+//      complementizer clause without parsing which verb is finite.
+// There is no whole-file carve-out line any more — the former
+// LEGIT_ON_DEMAND_LINE special case became unnecessary because the on-demand
+// quality-gates sentence in 01-preflight.md carries no scope token and sits in a
+// section that carries none either, so it passes structurally (pinned by a T2b
+// fixture).
 const MICRO_WARN_ANTI_TOKENS = [
   "warn-only",
   "warn only",
   "warn but do not block",
+  "warn but does not block",
+  "warns but do not block",
+  "warns but does not block",
   "warn instead of block",
+  "warns instead of block",
   "micro tier allows bypass",
 ] as const;
 
-// The on-demand-gates line is the only legitimate review-enforcer-adjacent
-// "warn" in the swept docs (it describes optional nightly quality gates, not
-// the review-enforcer dispatch rule). Anchored by its full prefix so an edit to
-// that line stops matching and the CI reds loudly until the anchor is updated.
-const LEGIT_ON_DEMAND_LINE = "Quality gates available on-demand (WARN only, do not block)";
+// Inflected forms that CANNOT be plain tokens without a false positive: the bare
+// phrase is ordinary English ("the fixture warns only when the marker is
+// absent"), so a trailing continuation exempts it. A bare "…micro tier warns
+// only." is a re-drift and still reds. (#745 review round 4 — the string list's
+// inflected entries cover only the "but does not block"/"instead of block"
+// family.)
+const MICRO_WARN_ANTI_PATTERNS: RegExp[] = [
+  /\bwarns only\b(?!\s+(?:when|if|after|before|until|while|because|unless|where|once|as)\b)/i,
+  /\bonly warns\b(?!\s+(?:when|if|after|before|until|while|because|unless|where|once|as)\b)/i,
+];
+
+// Review-enforcer scope vocabulary. Evidence is gathered at two widths:
+//   • SENTENCE — the claim names the review-enforcer itself (`review-enforcer` /
+//     `review enforcer` / `tier_rule` / `agent-issue-complexity`) or its tier
+//     and dispatch floor (`micro`, zero-dispatch vocabulary). This is the
+//     strong signal and is sufficient on its own, wherever the sentence sits.
+//   • SECTION — the enclosing markdown section is ABOUT the review-enforcer, so
+//     a bare warn-allow sentence inside it is a review-enforcer claim even when
+//     the scope vocabulary sits in a neighbouring sentence or parent bullet
+//     (the anaphoric case: "…unless a reviewer was dispatched. … The gate is
+//     warn-only."). Sections are the docs' own topic unit.
+// The regex forms keep the dispatch-floor token precise: a bare `dispatch`
+// would drag unrelated prose ("the mutation gate dispatches a nightly run") in.
+// `micro tier allows bypass` is self-scoping — it contains `micro` — so it is
+// caught even as a standalone sentence in an unscoped section.
+const REVIEW_ENFORCER_SCOPE_PATTERNS: RegExp[] = [
+  /review-enforcer/i,
+  /review enforcer/i,
+  /agent-issue-complexity/i,
+  /tier_rule/i,
+  /\bmicro\b(?!-)/i,
+  /\bmicro-tier\b/i,
+  /\b0[- ](reviewer )?dispatch(es)?\b/i,
+  /\bno (reviewer )?dispatch(es)?\b/i,
+  /\bno reviewers? (was|were|is|are) dispatched\b/i,
+  /\bno reviewers? dispatched\b/i,
+  /\bzero dispatches\b/i,
+  /\bdispatch(es)? (count|floor)\b/i,
+  /\bdispatched this session\b/i,
+  /\bmicro tier allows bypass\b/i,
+];
+
+// Claim-subject escape: inside a review-enforcer-scoped SECTION, a warning whose
+// CLAUSE names a DIFFERENT gate or mechanism before the phrase is that gate's
+// prose, not a review-enforcer re-drift — the class #745 exists to stop (the
+// #691 hook sentence is the original case; it also sits in an unscoped section
+// and so passes twice over). Applied ONLY when the sentence carries no
+// review-enforcer scope token of its own, so naming another gate can never
+// excuse a claim that also names the review-enforcer — "unlike the
+// review-enforcer, the husky hook is warn-only" still reds (documented
+// residual).
+//
+// The rule is POSITIONAL — an other-gate name anywhere in the claim's clause
+// before the phrase — which approximates the claim's subject without parsing
+// it; the comment deliberately does not over-claim grammatical subjecthood.
+// See claimNamesAnotherGate for the clause and bare-anaphor rules.
+//
+// The clause is isolated at `,`/`;`/`:`/dash AND coordinating/subordinating
+// boundaries with parentheticals blanked, and the other-gate name must sit at
+// the HEAD of that clause (first three words) BEFORE the phrase ("the husky hook
+// is warn-only"). `:` separates only when it is not part of a name, so the
+// docs' own bold label form (`**Note:**`) separates while `arch:changed` does
+// not. A relative `that` clause is not a subject of its own (the `that` is),
+// so a name inside it cannot escape; a complementizer `that` clause can. A bare
+// pronoun
+// clause head ("…gate dispatches a nightly run; it is warn-only") borrows the
+// previous clause, which is pronoun resolution by recency. This is what keeps a
+// parenthetical ("the gate (like the husky hook) is warn-only"), a subordinate,
+// coordinated or negated leading clause ("although the husky hook is unrelated,
+// the gate is warn-only"; "no hook is needed; the gate is warn-only"; "the
+// husky hook is unrelated but the gate is warn-only"), a reported clause ("the
+// husky hook documentation states that the gate is warn-only"), a label
+// ("hook: the gate is warn-only", bold or plain), a post-modifier naming
+// another gate ("the extension gate coexisting with the husky hook is
+// warn-only") and a later incidental word ("the gate is
+// warn-only for the multi-agent flow") from excusing a real re-drift — all were
+// live bypasses of a plain substring test.
+//
+// The list only ever LOOSENS the pin, so it imposes no constraint on future
+// authors; adding a gate name here is the cheap extension point if a legitimate
+// other-gate sentence reds (never a doc rewording). A colon-bearing name works
+// (`arch:changed`, #745 review round 7) because `:` counts as a clause boundary
+// only when it separates. The name must HEAD the clause (within its first three
+// words): a name buried in a post-modifier is part of a claim about the
+// review-enforcer gate, not an escape. Word boundaries are
+// deliberate — `\bhooks?\b` must not match "Hooked on the idea". NOTE:
+// "merge-registry" is deliberately absent: the merge-registry gate is part of
+// the review-enforcer extension, so a warn claim about IT is in scope.
+const OTHER_GATE_SUBJECT_PATTERNS: RegExp[] = [
+  /\bhusky\b/,
+  /\bcommit-msg\b/,
+  /\bhooks?\b/,
+  /\bvgate\b/,
+  /\bverification[- ]gate\b/,
+  /\bpipeline-compliance\b/,
+  /\bpre-?flight\b/,
+  /\btest-review\b/,
+  /\bcode-review\b/,
+  /\bon-demand\b/,
+  /\bmutation\b/,
+  /\bcoverage-pruning\b/,
+  /\barch:changed\b/,
+  /\bpgtap\b/,
+  /\btypecheck\b/,
+  /\bmulti-agent\b/,
+];
+
+// Bare pronouns that resolve to the clause subject on their left. A determiner
+// use ("this gate", "that check") is NOT bare — it names its own subject — so
+// the pronoun path additionally requires the clause head to be nothing but the
+// anaphor plus copulas/adverbs (see BARE_ANAPHOR_CLAUSE).
+const BARE_ANAPHOR_CLAUSE =
+  /^(it|they|this|that|these|those)(\s+(is|are|was|were|be|been|being|merely|only|also|still|always|never|not|simply|no longer))*$/;
+const CLAUSE_BOUNDARY_CHARS = ";:—–,";
+// Conjunctions and subordinators are clause boundaries too: "the husky hook is
+// unrelated but the gate is warn-only" and "…states that the gate is warn-only"
+// have no punctuation, and without this the earlier other-gate name would
+// launder the claim (#745 review rounds 5-6).
+const CLAUSE_BOUNDARY_WORDS = /\b(but|and|yet|so|while|whereas|although|though|because|since|unless|or|if|when|after|before|until|as|that)\b/g;
+// Heads that can open a clause's own noun phrase ("…states that the gate is
+// warn-only" / "…explain that the husky hook is warn-only"). Anything else right
+// after a `that` boundary is a RELATIVE pronoun ("the extension gate that
+// replaced the husky hook is warn-only"), where `that` is that clause's subject
+// and the matrix subject — the review-enforcer gate — still governs the claim.
+const CLAUSE_NOUN_HEAD = /^(the|a|an|this|that|these|those|each|every|any|some|no|all|both|its|their|his|her|our|your|my|it|they|he|she|we|you|i)\b/i;
+
+// Starts of every clause that ends at `hitAt`, ascending (0 always first).
+function clauseStartsBefore(sentence: string, hitAt: number): number[] {
+  const marks = new Set<number>([0]);
+  for (let i = 0; i < hitAt; i++) {
+    if (!CLAUSE_BOUNDARY_CHARS.includes(sentence[i])) continue;
+    // `:` is a boundary only when it SEPARATES (`hook: the gate is warn-only`,
+    // including the docs' bold/backtick label form `**Note:**` / `` `hook:` ``),
+    // never when it is part of a name (`arch:changed`, `complexity:micro`,
+    // `check:arch:changed`) — otherwise the band starts after the colon and the
+    // escape entry for that gate can never match, or conversely a bold label
+    // stops separating (#745 review rounds 7-8). Name characters are ASCII
+    // alphanumerics; punctuation after the colon (space, `*`, `` ` ``, `)`) ends
+    // the clause.
+    if (sentence[i] === ":" && /[A-Za-z0-9]/.test(sentence[i + 1] ?? "")) continue;
+    marks.add(i + 1);
+  }
+  for (const match of sentence.slice(0, hitAt).matchAll(CLAUSE_BOUNDARY_WORDS)) {
+    marks.add((match.index ?? 0) + match[0].length);
+  }
+  marks.add(hitAt);
+  return [...marks].sort((a, b) => a - b);
+}
+
+// True when the sentence's SOURCE CLAUSE (the clause holding the warning phrase
+// at `hitAt`) names a different gate as its subject.
+function claimNamesAnotherGate(sentence: string, hitAt: number): boolean {
+  // Blank parentheticals IN PLACE (spaces, not removal) so every index below is
+  // still the original offset.
+  const text = sentence.replace(/\([^)]*\)/g, (m) => " ".repeat(m.length));
+  const starts = clauseStartsBefore(text, hitAt);
+  const clauseStart = starts[starts.length - 2];
+  const clauseHead = text.slice(clauseStart, hitAt).trim().replace(/^[>\-*`_\s]+/, "");
+  let subjectStart = clauseStart;
+  if (BARE_ANAPHOR_CLAUSE.test(clauseHead.toLowerCase())) {
+    // "… gate dispatches a nightly run; it is warn-only" — the bare pronoun takes
+    // the previous clause's subject, so widen the subject band to that clause.
+    subjectStart = starts[starts.length - 3] ?? 0;
+  }
+  const subjectBand = text.slice(subjectStart, hitAt);
+  // A `that` boundary immediately before the claim's clause is a RELATIVE
+  // pronoun when the clause does not open with its own noun phrase. The band is
+  // then the relative clause's own predicate and must NOT escape, or
+  // "the extension gate that replaced the husky hook is warn-only" would pass as
+  // a husky-hook claim (#745 review round 8). A complementizer `that`
+  // (noun phrase follows) is unaffected: the band is that clause's subject.
+  if (/\bthat\s*$/.test(text.slice(0, clauseStart))) {
+    const head = text.slice(clauseStart, hitAt).trim().replace(/^[>\-*`_]+/, "");
+    if (!CLAUSE_NOUN_HEAD.test(head)) return false;
+  }
+  // SUBJECT-HEAD rule: the other-gate name must be at the HEAD of the subject
+  // band (within its first three words), not anywhere inside it. Without this a
+  // POST-MODIFIER naming another gate launders a claim that is grammatically
+  // about the (anaphoric) review-enforcer gate — "the extension gate coexisting
+  // with the husky hook is warn-only", "the gate for the code-review flow is
+  // warn-only", "the gate handling the typecheck step is warn-only" (#745
+  // review round 7). Legitimate other-gate prose puts the gate first ("the
+  // husky hook is warn-only", "the on-demand mutation gate dispatches a nightly
+  // run; it is warn-only") and still passes.
+  return OTHER_GATE_SUBJECT_PATTERNS.some((pattern) => {
+    const match = pattern.exec(subjectBand);
+    if (!match) return false;
+    const before = subjectBand.slice(0, match.index).replace(/^[>\-*`_\s]+/, "").trim();
+    const wordsBefore = before.length === 0 ? 0 : before.split(/\s+/).length;
+    return wordsBefore <= 2;
+  });
+}
+
+// TERMINATED HTML comments are BLANKED (spaces, newlines preserved) before any
+// structural parse, so a comment body can neither scope a section nor inject
+// escape words into the claim beside it — same-line, inline-opener, multi-line,
+// and multi-line-with-a-fence-inside all alike. Blanking is FENCE-AWARE in the
+// other direction: a literal `<!--` inside a fenced code block (e.g. the
+// `contains("<!-- issue-scoping:")` string in 03-code-review.md) is code, not a
+// comment, and must not be paired with a later real comment's `-->` (that would
+// blank everything between). An OPEN comment, however, outranks fence state —
+// CommonMark terminates it at the first `-->`, so fence delimiters inside a
+// comment body are comment text and must not toggle fence tracking.
+//
+// An UNTERMINATED comment outside a fence blanks from its opener TO END OF
+// INPUT (blank-to-EOF is markdown's own reading of an unclosed comment) and
+// reports `unterminated`, which T2 asserts against: a stray opener would
+// otherwise silence the anti-token pin for the rest of every swept doc while CI
+// stayed green, and `existsSync`-style vacuity guards cannot see it (#745
+// review round 7).
+interface BlankedComments {
+  text: string;
+  unterminated: boolean;
+}
+
+function blankHtmlComments(text: string): BlankedComments {
+  const out: string[] = [];
+  let fence: FenceState | null = null;
+  let inComment = false;
+  let unterminated = false;
+  for (const rawLine of text.split("\n")) {
+    let line = rawLine;
+    if (inComment) {
+      // An open comment OUTRANKS fence tracking: CommonMark ends the comment at
+      // the first `-->` wherever it is, so a fence delimiter inside a comment
+      // body is comment text. Testing the fence first would emit that body into
+      // the section scope (a comment body scoping a section) and, when the
+      // closing `-->` shared a line with the delimiter, leave `inComment` set
+      // and report a CLOSED comment as unterminated (#745 review round 9).
+      const close = line.indexOf("-->");
+      if (close === -1) {
+        out.push(line.replace(/[^\n]/g, " "));
+        continue;
+      }
+      line = " ".repeat(close + 3) + line.slice(close + 3);
+      inComment = false;
+    } else {
+      const nextFence = nextFenceState(line, fence);
+      if (/^\s*(`{3,}|~{3,})/.test(line)) {
+        fence = nextFence;
+        out.push(line);
+        continue;
+      }
+      if (fence) {
+        out.push(line);
+        continue;
+      }
+    }
+    for (;;) {
+      const open = line.indexOf("<!--");
+      if (open === -1) break;
+      const close = line.indexOf("-->", open + 4);
+      if (close === -1) {
+        inComment = true;
+        line = `${line.slice(0, open)}${' '.repeat(line.length - open)}`;
+        break;
+      }
+      line = `${line.slice(0, open)}${' '.repeat(close + 3 - open)}${line.slice(close + 3)}`;
+    }
+    out.push(line);
+  }
+  if (inComment) unterminated = true;
+  return { text: out.join("\n"), unterminated };
+}
 
 const SWEPT_DOC_RELS = [
   "../../skills/commit-workflow/workflow/01-preflight.md",
   "../../skills/commit-workflow/workflow/02-commit-pr.md",
   "../../skills/commit-workflow/workflow/03-code-review.md",
 ] as const;
+
+// ── #745 — claim-scoped anti-token scan ──
+//
+// The scan is a three-stage parse:
+//   1. SECTIONS. Markdown headings delimit the topic unit. Fenced code blocks
+//      are tracked so a `# comment` inside a bash block is not mistaken for a
+//      heading (that would silently shrink a section). The heading line itself
+//      is part of its section — a section titled "Micro Tier" IS review-enforcer
+//      scope.
+//   2. SENTENCE UNITS inside each section. Hard wraps at ~78 cols are JOINED (a
+//      claim may straddle a newline), while markdown table rows, list items,
+//      comment fences and blockquote starts are structural boundaries and must
+//      NOT absorb a neighbour (otherwise a review-enforcer bullet and the next
+//      bullet — about another gate — collapse into one "sentence"). A
+//      blockquote continuation line (leading `>`) is joined onto the open
+//      blockquote.
+//   3. SENTENCE SPLIT on `.`/`!`/`?` followed by whitespace OR a markdown
+//      closer (`*`/`_`/`)`/`]`/`}`/quote). The closer matters: in
+//      "**warn-only.** The next claim" the period is followed by `*`, and a
+//      whitespace-only boundary test would merge two independent claims into one
+//      (donating the second's scope token to the first).
+// Case folding is applied to each unit (the re-drift vocabulary historically
+// included all-caps). There is deliberately NO verb stemming: a global
+// `warns`→`warn` fold would drag ordinary English ("warns only when …") into
+// the `warn only` token, so the inflected re-drift forms are spelled out in
+// MICRO_WARN_ANTI_TOKENS instead (an explicit coverage GAIN: the pre-#745 list
+// missed every inflected form, including "warns but does not block").
+// Fence state for a markdown code fence. Fences close only on a delimiter of
+// the SAME character and at least the same length, so a ```` block containing a
+// ``` line does not toggle state and promote the following code comment to a
+// heading (which would silently shrink the enclosing section — a re-drift
+// hiding place; #745 review round 6).
+interface FenceState {
+  char: string;
+  len: number;
+}
+function nextFenceState(line: string, fence: FenceState | null): FenceState | null {
+  const match = /^\s*(`{3,}|~{3,})/.exec(line);
+  if (!match) return fence;
+  const char = match[1][0];
+  const len = match[1].length;
+  if (!fence) return { char, len };
+  if (char === fence.char && len >= fence.len) return null;
+  return fence;
+}
+
+function markdownSections(text: string): Array<{ heading: string; text: string }> {
+  const sections: Array<{ heading: string; text: string }> = [];
+  let heading = "(preamble)";
+  let lines: string[] = [];
+  let fence: FenceState | null = null;
+  const flush = () => sections.push({ heading, text: [heading, ...lines].join("\n") });
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trimEnd();
+    const nextFence = nextFenceState(line, fence);
+    if (nextFence !== fence || /^\s*(`{3,}|~{3,})/.test(line)) {
+      fence = nextFence;
+      lines.push(line);
+      continue;
+    }
+    if (!fence && /^#{1,6} \S/.test(line)) {
+      flush();
+      heading = line.trim();
+      lines = [];
+      continue;
+    }
+    lines.push(line);
+  }
+  flush();
+  return sections;
+}
+
+// Sentence units within one section, normalized to lowercase.
+//
+// HTML comments are already blanked by `blankHtmlComments` (the caller), so a
+// comment body can never appear here. SELF-CONTAINED LINES (markdown headings
+// and code-fence delimiters) are emitted as their OWN unit and never absorb the
+// next line. Without that, a heading or a fenced `# comment` would concatenate
+// with the following prose and donate its scope vocabulary to it — a
+// one-blank-line formatting difference would flip a legitimate other-gate
+// sentence ("### Micro Tier\nThe VGATE check is warn-only.") from pass to red,
+// i.e. the #745 failure mode.
+function sectionSentenceUnits(sectionText: string): string[] {
+  const blocks: string[] = [];
+  let buf = "";
+  for (const rawLine of sectionText.split("\n")) {
+    const line = rawLine.trim();
+    const selfContained =
+      line !== "" && (/^#{1,6}\s/.test(line) || /^\s*(```|~~~)/.test(line));
+    if (selfContained) {
+      if (buf) blocks.push(buf);
+      buf = "";
+      blocks.push(line);
+      continue;
+    }
+    const startsBlock =
+      line === "" ||
+      /^([-*+|]|\d+[.)])\s/.test(line) ||
+      (line.startsWith(">") && !buf.startsWith(">"));
+    if (startsBlock) {
+      if (buf) blocks.push(buf);
+      buf = line;
+    } else {
+      buf = buf ? `${buf} ${line}` : line;
+    }
+  }
+  if (buf) blocks.push(buf);
+  return blocks
+    .flatMap((block) => block.split(/(?<=[.!?])(?=[\s)\]}"'»*_`]|$)/))
+    .map((sentence) => sentence.toLowerCase().trim())
+    .filter((sentence) => sentence.length > 0);
+}
+
+const isReviewEnforcerScoped = (text: string): boolean =>
+  REVIEW_ENFORCER_SCOPE_PATTERNS.some((pattern) => pattern.test(text));
+
+// EVERY anti-token occurrence in a sentence, each with its own offset, so each
+// is judged on its OWN clause/pronoun subject. A set of unique tokens with a
+// single `indexOf` would amnesty a repeated spelling: "the husky hook is
+// warn-only; the gate is also warn-only" must red on the second occurrence even
+// though the first is legitimately escaped (#745 review round 4).
+function findAntiTokenHits(sentence: string): Array<{ token: string; at: number }> {
+  const hits: Array<{ token: string; at: number }> = [];
+  for (const token of MICRO_WARN_ANTI_TOKENS) {
+    let from = 0;
+    for (;;) {
+      const at = sentence.indexOf(token, from);
+      if (at === -1) break;
+      hits.push({ token, at });
+      from = at + token.length;
+    }
+  }
+  for (const pattern of MICRO_WARN_ANTI_PATTERNS) {
+    // Fresh global clone per call: a shared regex would keep `lastIndex` state.
+    const global = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`);
+    for (const match of sentence.matchAll(global)) hits.push({ token: match[0], at: match.index ?? 0 });
+  }
+  return hits;
+}
+
+// Every anti-token occurrence that IS a review-enforcer claim: it carries scope
+// vocabulary in its own sentence, or sits in a review-enforcer-scoped section
+// and does not name a different gate before the warning phrase. An empty array
+// ⇔ the text carries no review-enforcer warn-allow claim, whatever it says
+// about other gates.
+function findMicroWarnClaims(
+  text: string
+): Array<{ token: string; sentence: string; section: string }> {
+  const claims: Array<{ token: string; sentence: string; section: string }> = [];
+  // Blank HTML comments FIRST, so comment bodies can neither scope a section nor
+  // inject escape words into the claim beside them — same-line and multi-line
+  // alike (#745 review round 5).
+  for (const section of markdownSections(blankHtmlComments(text).text)) {
+    const sectionScoped = isReviewEnforcerScoped(section.text);
+    for (const sentence of sectionSentenceUnits(section.text)) {
+      const hits = findAntiTokenHits(sentence);
+      if (hits.length === 0) continue;
+      // Sentence-scoped: the claim names the review-enforcer itself — always a
+      // violation. Otherwise the section supplies the topic, and each hit is
+      // judged on ITS OWN clause/pronoun subject (a single escape decision for
+      // the whole sentence would amnesty a second claim: "the husky hook is
+      // warn-only; the gate is also warn only").
+      if (!sectionScoped && !isReviewEnforcerScoped(sentence)) continue;
+      const sentenceScoped = isReviewEnforcerScoped(sentence);
+      for (const { token, at } of hits) {
+        if (!sentenceScoped && claimNamesAnotherGate(sentence, at)) continue;
+        claims.push({ token, sentence, section: section.heading });
+      }
+    }
+  }
+  return claims;
+}
 
 test("#485 T2: REVIEW-ENFORCER-TIER-RULE fence == TIER_RULE + no micro-warn claim in 01/02/03", () => {
   if (!isSourceCheckout()) {
@@ -1818,37 +2300,452 @@ test("#485 T2: REVIEW-ENFORCER-TIER-RULE fence == TIER_RULE + no micro-warn clai
   );
 
   // Anti-token pin across the three swept docs (vacuous-pass guard: a missing
-  // doc fails loudly instead of silently passing).
+  // doc fails loudly instead of silently passing). CLAIM-SCOPED since #745: an
+  // anti-token reds only when it reads as a review-enforcer claim (its own
+  // sentence names review-enforcer vocabulary, or its enclosing section is
+  // about the review-enforcer and the sentence names no other gate), so
+  // unrelated-gate prose is structurally exempt and no carve-out line remains.
   for (const rel of SWEPT_DOC_RELS) {
     const url = new URL(rel, import.meta.url);
     if (!existsSync(url)) {
       ok(false, `${rel} unreachable from the agent-infra source tree — anti-token pin would pass vacuously; restore the doc or fix the resolution`);
       return;
     }
-    const text = readFileSync(url, "utf8");
-    // Case-insensitive scan with the legitimate-line carve-out: strip only the
-    // anchor SUBSTRING per line (never the whole line) so the residue of the
-    // legit bullet — and any re-drift sharing its physical line — stays subject
-    // to the token scan.
-    const sanitized = text
-      .split("\n")
-      .map((l) => l.replace(LEGIT_ON_DEMAND_LINE, ""))
-      .join("\n")
-      .toLowerCase();
-    for (const token of MICRO_WARN_ANTI_TOKENS) {
-      equal(
-        sanitized.includes(token),
-        false,
-        `${rel} must not contain ${JSON.stringify(token)} (case-insensitive) — a review-enforcer micro warn claim re-drifted; reword historical references instead of re-adding the phrase (the CI backstop must never disagree with the acceptance grep)`
-      );
-    }
-    // The carve-out anchor must appear exactly once total across the swept
-    // docs (the 01-preflight on-demand bullet) — a duplicated or renamed legit
-    // line reds loudly instead of silently widening the exemption.
-    const anchorCount = (text.match(new RegExp(LEGIT_ON_DEMAND_LINE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) ?? []).length;
-    const expectedCount = rel.includes("01-preflight.md") ? 1 : 0;
-    equal(anchorCount, expectedCount, `${rel} must contain the legit on-demand line ${expectedCount} time(s) (found ${anchorCount})`);
+    const blanked = blankHtmlComments(readFileSync(url, "utf8"));
+    ok(
+      !blanked.unterminated,
+      `${rel} opens an HTML comment that is never closed — comment blanking would continue to EOF, the anti-token pin would be BLIND from that point on and every claim after it would pass vacuously; close the comment`
+    );
+    const claims = findMicroWarnClaims(blanked.text);
+    equal(
+      claims.length,
+      0,
+      `${rel} carries ${claims.length} review-enforcer warn-allow claim(s) — a #485 micro warn re-drift: ` +
+        claims.map((c) => `${JSON.stringify(c.token)} in ${JSON.stringify(c.sentence)} [${c.section}]`).join(" | ") +
+        ` (case-insensitive; a claim is scoped by review-enforcer vocabulary in its own sentence OR by its enclosing section per #745 — a warn phrase about ANOTHER gate in an unscoped section is not this claim)`
+    );
   }
+});
+
+// ── #745 — the scoped pin's two-sided proof ──
+
+test("#485 T2b: warn-vocabulary pin flags review-enforcer re-drift, ignores other gates", () => {
+  // AC1 — a genuine re-drift still FAILS. Every entry is a whole synthetic DOC
+  // so the section-scope path is exercised, not just the sentence path.
+  const REDRIFT_DOCS: Array<[string, string]> = [
+    // The REAL pre-#485 corpus (git show e097b38^:{01-preflight,02-commit-pr,
+    // 03-code-review}.md) — the exact sentences the #485 flip had to remove —
+    // placed under a review-enforcer section as they were in the real docs.
+    [
+      "01-preflight micro-tier table row",
+      "### Micro Tier Auto-Detection & Gate Behavior\n| Gate | Micro Behavior |\n| Review-enforcer | **WARN-ONLY** at micro — 0 reviewer dispatches warn but do not block (extension reads /tmp/agent-issue-complexity = micro); Standard+/unset block |\n",
+    ],
+    [
+      "01-preflight mechanism-separation prose",
+      "### Gate Scoping\nMechanism separation: the VGATE content-shape skip is extension-side and shape-based (applies at ANY tier; code sets never skip); the review-enforcer micro warn-only is marker-based (extension reads `/tmp/agent-issue-complexity` = micro); a docs-only commit on an UNLABELED issue is VGATE shape-exempt but still review-enforcer-blocked at 0 dispatches.\n",
+    ],
+    [
+      "01-preflight rationale prose",
+      "### Rationale\n**Rationale:** Micro-tier CODE commits keep full VGATE (shape-gated — the extension skips only docs/CSS/static sets, never code); the reviewer dispatch (review-enforcer, warn-only at micro) plus VGATE-on-code is the net.\n",
+    ],
+    [
+      "01-preflight extension-gates prose",
+      "### Extension Gates\nThese checks are enforced by Pi extensions — each with per-gate scoping rather than a blanket tier rule: the review-enforcer is tier-gated (micro warn-only via marker; Standard+/unset block); VGATE is content-shape gated (docs/CSS/static-only sets exempt, code never).\n",
+    ],
+    [
+      "01-preflight session-shape prose",
+      "### Extension Gates\nThe `review-enforcer` extension blocks git operations unless at least one `task` sub-agent was dispatched this session — Micro tier is warn-only (extension reads `/tmp/agent-issue-complexity` = micro; 0 dispatches warn but do not block); Standard+/unset block.\n",
+    ],
+    [
+      "03-code-review micro paragraph",
+      "### Step 2 — Code-Review Gate\n**Micro tier: skip entirely.** No code-review agents are dispatched for Micro — consistent with the review-enforcer extension being **WARN-ONLY at Micro** (tier read from the `/tmp/agent-issue-complexity` marker; 0 reviewer dispatches warn but do not block — `extensions/review-enforcer/index.ts` micro branch; Standard+/unset block).\n",
+    ],
+    // Minimal synthetic mutants, including the AC's "warns but does not block".
+    ["minimal re-drift", "The review-enforcer micro tier is warn-only.\n"],
+    ["inflected re-drift", "The review-enforcer micro tier warns but does not block.\n"],
+    ["inflected re-drift (micro only)", "The micro tier warns instead of blocking.\n"],
+    ["tier_rule re-drift", "A 0-dispatch docs-only session is warn only under TIER_RULE.\n"],
+    ["self-scoping bypass token", "Micro tier allows bypass at 0 dispatches.\n"],
+    // Anaphoric continuation — the scope vocabulary is in a NEIGHBOURING
+    // sentence, not the claim's own (reviewer scenario A). The old whole-file
+    // pin caught this; the section window preserves that coverage.
+    [
+      "cross-sentence anaphora in a scoped section",
+      "### Extension Gates\nThe `review-enforcer` extension blocks git operations unless a reviewer was dispatched this session.\n\nThe gate is warn-only.\n",
+    ],
+    // Nested-bullet anaphora (reviewer scenario B): scope in the parent bullet.
+    [
+      "nested-bullet anaphora in a scoped section",
+      "### Extension Gates\n- **Review-enforcer** — the git-operation gate:\n  - Standard+/unlabeled: blocks\n  - the tier check is warn-only\n",
+    ],
+    // An incidental LATER mention of another gate must not excuse an anaphoric
+    // re-drift: the escape names the claim's SUBJECT, which is the slot before
+    // the warning phrase (reviewer round-2 P1).
+    [
+      "anaphoric re-drift with an incidental later other-gate word",
+      "### Extension Gates\nThe `review-enforcer` extension blocks git operations unless a reviewer was dispatched this session.\n\nThe gate is warn-only for the multi-agent flow.\n",
+    ],
+    // Round-3 P1: an other-gate name that is NOT the subject must not excuse the
+    // claim — parenthetical, subordinate/negated mention, label, or inflected
+    // substring, all before the warning phrase.
+    [
+      "parenthetical other-gate mention",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\nThe gate (like the husky hook) is warn-only.\n",
+    ],
+    [
+      "negated other-gate mention in a leading clause",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\nNo hook is needed; the gate is warn-only.\n",
+    ],
+    [
+      "subordinate other-gate mention in a leading clause",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\nAlthough the husky hook is unrelated, the gate is warn-only.\n",
+    ],
+    [
+      "label-style other-gate mention",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\nhook: the gate is warn-only.\n",
+    ],
+    [
+      "inflected escape-word substring",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\nHooked on the idea, the gate is warn-only.\n",
+    ],
+    // Round-3 P2: a first-clause escape must not amnesty a second claim in the
+    // same sentence.
+    [
+      "second claim after an escaped first clause",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\nThe husky hook is warn-only; the gate is also warn only.\n",
+    ],
+    // Round-3 P2 (multi-line HTML comment): comment bodies must not donate escape
+    // words to the claim on their right — line-start OR inline opener.
+    [
+      "multi-line HTML comment must not inject escape words",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\n<!--\nsee the husky hook docs\n-->\nThe gate is warn-only.\n",
+    ],
+    [
+      "inline-HTML-comment body must not inject escape words",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nSee the docs <!--\nhusky hook note\n-->\nThe gate is warn-only.\n",
+    ],
+    // Round-4 P1: a repeated spelling must be judged per OCCURRENCE, not once
+    // per unique token.
+    [
+      "second occurrence of the same token after an escaped first clause",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\nThe husky hook is warn-only; the gate is also warn-only.\n",
+    ],
+    // Round-4 P2: inflected `warns only` / `only warns` in a scoped sentence.
+    ["inflected 'warns only' re-drift", "The review-enforcer micro tier warns only.\n"],
+    ["inflected 'only warns' re-drift", "The review-enforcer micro tier only warns.\n"],
+    ["inflected 'warns only to …' re-drift", "The review-enforcer micro tier warns only to avoid blocking.\n"],
+    // Round-5: a same-line HTML comment must not immunize the claim beside it.
+    [
+      "same-line HTML comment before the claim",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\n<!-- husky hook note --> The gate is warn-only.\n",
+    ],
+    [
+      "multi-line comment closing on the claim's line",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\n<!--\nhusky hook note --> The gate is warn-only.\n",
+    ],
+    // Round-5: coordinating conjunctions are clause boundaries.
+    [
+      "coordinating-conjunction laundering (but)",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\nThe husky hook is unrelated but the gate is warn-only.\n",
+    ],
+    [
+      "coordinating-conjunction laundering (and)",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\nThe husky hook is unrelated and the gate is warn-only.\n",
+    ],
+    // Round-5: a determiner use ('this gate') is a subject, not a bare anaphor.
+    [
+      "determiner subject after an escaped clause",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\nThe husky hook is warn-only; this gate is warn-only.\n",
+    ],
+    // Round-6: a reported clause after `that` must not be laundered by the
+    // reporting subject's other-gate name.
+    [
+      "reported clause after 'that'",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nThe husky hook documentation states that the gate is warn-only.\n",
+    ],
+    [
+      "reported clause after 'explains that'",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nThe typecheck note explains that the gate is warn-only.\n",
+    ],
+    // Round-6 P1: a longer fence containing a shorter fence delimiter must not
+    // toggle fence state and promote the following code comment to a heading.
+    [
+      "longer fence containing a shorter delimiter",
+      "### Extension Gates\n````\nThe `review-enforcer` blocks at 0 dispatches.\n```\n# note\nThe gate is warn-only.\n````\n",
+    ],
+    // Round-7 P1: an other-gate name buried in a POST-MODIFIER is not the claim's
+    // subject — the claim is still about the (anaphoric) review-enforcer gate.
+    [
+      "participial post-modifier naming another gate",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nThe extension gate coexisting with the husky hook is warn-only.\n",
+    ],
+    [
+      "relative-clause post-modifier naming another gate",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nThe extension gate that replaced the husky hook is warn-only.\n",
+    ],
+    [
+      "prepositional post-modifier naming another gate",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nThe gate for the code-review flow is warn-only.\n",
+    ],
+    [
+      "gerund post-modifier naming another gate",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nThe gate handling the typecheck step is warn-only.\n",
+    ],
+    // Round-7 P2: the dispatch floor's natural passive/plural phrasings must
+    // still scope the section (they were absent from the vocabulary).
+    [
+      "passive plural dispatch-floor phrasing",
+      "### Extension Gates\nNo reviewers were dispatched for this change.\nThe gate is warn-only.\n",
+    ],
+    [
+      "passive singular dispatch-floor phrasing",
+      "### Extension Gates\nNo reviewer was dispatched for this change.\nThe gate is warn-only.\n",
+    ],
+    [
+      "zero-dispatch phrasing",
+      "### Extension Gates\nZero dispatches were recorded.\nThe gate is warn-only.\n",
+    ],
+    // Round-8: a BOLD/BACKTICK label is still a label — the docs' own voice is
+    // `**Rationale:**`, so the bold form must separate exactly like the plain one.
+    [
+      "bold label-style other-gate mention",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\n**hook:** the gate is warn-only.\n",
+    ],
+    [
+      "backtick label-style other-gate mention",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\n`hook:` the gate is warn-only.\n",
+    ],
+    [
+      "bold multiword label naming another gate",
+      "### Extension Gates\nThe `review-enforcer` blocks unless a reviewer was dispatched this session.\n\n**Husky hook:** the gate is warn-only.\n",
+    ],
+    // Round-8: a RELATIVE `that` clause is that clause's own subject — the claim
+    // is still about the matrix (review-enforcer) subject.
+    [
+      "relative 'that' clause naming another gate",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nThe gate that coexists with the husky hook is warn-only.\n",
+    ],
+  ];
+  for (const [label, doc] of REDRIFT_DOCS) {
+    ok(findMicroWarnClaims(doc).length > 0, `#745 scope pin: re-drift must FAIL (${label}) — ${JSON.stringify(doc)}`);
+  }
+
+  // AC2 — an unrelated gate using the SAME vocabulary PASSES, including when it
+  // sits INSIDE a review-enforcer-scoped section (where the named-other-gate
+  // escape is what keeps it passing — reviewer scenario C).
+  const UNRELATED_DOCS: Array<[string, string]> = [
+    [
+      "literal #691 hook sentence in its own section",
+      "### Mangled commit message — repair\nThe `.husky/commit-msg` hook warns when it sees the signature of a lost shell substitution. It is **warn-only** by default — both signatures have realistic false positives, so a warning is a prompt to look, not a failure.\n",
+    ],
+    [
+      "01-preflight on-demand-gates line (AC3 strip target)",
+      "### TypeScript / Supabase Stack (default)\n> **Quality gates available on-demand (WARN only, do not block):** `npm run check:coverage-pruning`, `npm run check:arch:changed`, `npm run check:mutation` (nightly). See #6460-#6463.\n",
+    ],
+    [
+      "other-gate warn phrase merged into a sentence with review-enforcer scope vocabulary in the section",
+      "### Extension Gates\nThe `review-enforcer` extension blocks git operations unless a reviewer was dispatched this session.\n\nThe on-demand mutation gate dispatches a nightly run; it is warn-only.\n",
+    ],
+    [
+      "other-gate sentence after a terminal period inside emphasis (splitter regression)",
+      "### Extension Gates\nThe review-enforcer blocks at 0 dispatches.\n\nThe husky hook is **warn-only.** The on-demand gate is warn only.\n",
+    ],
+    [
+      "ordinary-English inflected 'warns only' inside a scoped section",
+      "### Extension Gates\nThe review-enforcer blocks at 0 dispatches.\n\nAt micro, the fixture warns only when the marker file is absent.\n",
+    ],
+    // A heading must be its own SENTENCE UNIT. It still scopes its SECTION
+    // (deliberately — see markdownSections), but it must not merge into the next
+    // sentence, or the other-gate escape could never fire for a legitimate
+    // sentence under a scope-bearing heading.
+    [
+      "other-gate sentence directly under a scope-bearing heading",
+      "### Micro Tier Behavior\nThe VGATE content-shape check is warn-only for docs-only sets.\n",
+    ],
+    // A fenced code comment must not merge into the sentence after the fence.
+    // (Fenced content DOES scope its section, deliberately: the section's topic
+    // includes its code examples — that is what catches an anaphoric re-drift
+    // appended to a section whose only micro reference is a code comment.)
+    [
+      "other-gate sentence after a fenced code comment mentioning micro",
+      "### TypeScript Stack\n```bash\n# micro tier\n```\nThe `.husky/commit-msg` hook is warn-only.\n",
+    ],
+    // Round-3 P2: HTML comment bodies are blanked entirely, so they can neither
+    // scope a SECTION nor merge into the claim beside them.
+    [
+      "other-gate sentence after a multi-line HTML comment mentioning micro",
+      "### Mangled commit message — repair\n<!--\nmicro tier note\n-->\nThe `.husky/commit-msg` hook is warn-only.\n",
+    ],
+    // The other-gate escape works for a trailing appositive even though the
+    // inserted-phrase-before-copula form is a documented conservative red.
+    [
+      "other-gate sentence with a trailing appositive",
+      "### Extension Gates\nThe review-enforcer blocks at 0 dispatches.\n\nThe husky hook is warn-only, by default.\n",
+    ],
+    // Round-4: same for an inline-opener comment.
+    [
+      "other-gate sentence after an inline-opener HTML comment mentioning micro",
+      "### Mangled commit message — repair\nSee the docs <!--\nmicro tier note\n-->\nThe `.husky/commit-msg` hook is warn-only.\n",
+    ],
+    // Round-4: a hyphenated non-tier `micro-…` compound must not scope a section.
+    [
+      "hyphenated non-tier micro compound",
+      "### Hardware\nThe micro-USB port is warn-only on old boards.\n",
+    ],
+    // The inflected-form patterns must not fire on the ordinary-English
+    // continuation — this is why they are patterns, not plain tokens.
+    [
+      "ordinary-English inflected 'warns only when' inside a scoped section",
+      "### Extension Gates\nThe review-enforcer blocks at 0 dispatches.\n\nAt micro, the fixture warns only when the marker file is absent.\n",
+    ],
+    [
+      "ordinary-English inflected 'only warns when' inside a scoped section",
+      "### Extension Gates\nThe review-enforcer blocks at 0 dispatches.\n\nAt micro, the fixture only warns when the marker file is absent.\n",
+    ],
+    // Round-5: same for a same-line comment.
+    [
+      "other-gate sentence after a same-line HTML comment mentioning micro",
+      "### Mangled commit message — repair\n<!-- micro tier note --> The `.husky/commit-msg` hook is warn-only.\n",
+    ],
+    // Round-7 P1: a COLON-BEARING other-gate name must still escape — `:` is a
+    // clause boundary only when it separates. Before the fix this legitimate
+    // sentence red (the band started after the `:` inside `arch:changed`).
+    [
+      "colon-bearing other-gate name",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nThe arch:changed check is warn-only.\n",
+    ],
+    // Round-7 boundary: the other-gate name at the HEAD of the subject is the
+    // legitimate form even when the gate is related to it (the subject is that
+    // gate, not the review-enforcer).
+    [
+      "other gate named at the subject head with a possessive modifier",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nThe husky hook's successor gate is warn-only.\n",
+    ],
+    // The punctuated leading subordinate clause is the PASSING form of the
+    // documented residual R4 (the inverse heuristic must not red it).
+    [
+      "punctuated leading subordinate clause about another gate",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nSince the husky hook is warn-only, the gate blocks.\n",
+    ],
+    // Round-8: the SAME label in BOLD must not turn a legitimate other-gate
+    // sentence into a false red (the docs write `**Rationale:**`).
+    [
+      "bold label before a legitimate other-gate sentence",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\n**Rationale:** the husky hook is warn-only by default.\n",
+    ],
+    [
+      "bold one-word label before a legitimate other-gate sentence",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\n**Note:** the VGATE check is warn-only for docs-only sets.\n",
+    ],
+    // Round-8: the subject-head window is the first THREE words (the comment's
+    // stated rule) — a discourse-marker prefix is still the other gate's head.
+    [
+      "other-gate name at the third word of the subject",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nNote the husky hook is warn-only.\n",
+    ],
+    // Round-8: a COMPLEMENTIZER `that` (its own noun phrase follows) is not a
+    // relative pronoun, so the clause's own other-gate subject still escapes.
+    [
+      "complementizer 'that' clause with the other gate as its subject",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nThe docs explain that the husky hook is warn-only.\n",
+    ],
+    [
+      "complementizer 'that' clause with an imperative-mood lead",
+      "### Extension Gates\nThe `review-enforcer` blocks at 0 dispatches.\n\nNote that the VGATE check is warn-only for docs-only sets.\n",
+    ],
+    // Round-9: a fence INSIDE a comment body is comment text — the body must not
+    // scope the section (the open comment outranks fence tracking).
+    [
+      "fenced code inside a comment body must not scope a section",
+      "### Mangled commit message — repair\n<!--\n```bash\n# micro tier note\n```\n-->\nThe `.husky/commit-msg` hook is warn-only.\n",
+    ],
+  ];
+  for (const [label, doc] of UNRELATED_DOCS) {
+    equal(findMicroWarnClaims(doc).length, 0, `#745 scope pin: unrelated-gate prose must PASS (${label}) — ${JSON.stringify(doc)}`);
+  }
+
+  // Round-7 P2: an UNTERMINATED HTML comment is REPORTED (T2 asserts this on
+  // the real swept docs). Blank-to-EOF is markdown's reading of an unclosed
+  // comment, so a stray opener would silence the pin for the rest of the doc
+  // with CI green — the flag is what makes that loud instead.
+  ok(
+    blankHtmlComments("### X\n<!-- stray\n\nThe gate is warn-only.\n").unterminated,
+    "#745 scope pin: an unterminated HTML comment must be reported (blank-to-EOF would blind the pin)"
+  );
+  ok(
+    !blankHtmlComments("### X\n<!-- note -->\nThe husky hook is warn-only.\n").unterminated,
+    "#745 scope pin: a terminated HTML comment must not be reported as unterminated"
+  );
+  // Round-9: a fence delimiter inside a comment body must not park the fence
+  // state nor leave the comment reported as open — the comment still closes at
+  // its `-->`.
+  const commentWithFence = "### X\n<!--\n```bash\n# micro tier note\n```\n-->\nThe gate is warn-only.\n";
+  ok(
+    !blankHtmlComments(commentWithFence).unterminated,
+    "#745 scope pin: a fence inside a comment body must not be reported as an unterminated comment"
+  );
+  equal(
+    findMicroWarnClaims(commentWithFence).length,
+    0,
+    "#745 scope pin: a comment body containing a fence must be blanked, not leaked into section scope"
+  );
+
+  // Splitter regression pin: both halves of the emphasized-period case must
+  // appear as SEPARATE sentence units, or the first sentence's scope token would
+  // be donated to the second (making the T2b pass case above pass for the wrong
+  // reason). Pinned directly on the unit split.
+  const splitUnits = sectionSentenceUnits("### Extension Gates\nThe review-enforcer blocks at 0 dispatches. The husky hook is **warn-only.** The on-demand gate is warn only.\n");
+  ok(
+    splitUnits.some((u) => u.includes("warn-only") && !u.includes("0 dispatches")) &&
+      splitUnits.some((u) => u.includes("the review-enforcer blocks") && !u.includes("warn-only")),
+    `#745: a terminal period inside emphasis must split sentences (got ${JSON.stringify(splitUnits)})`
+  );
+
+  // Fenced-code headings must not open a section: a `# comment` inside a bash
+  // block would silently shrink the enclosing section and lose the section-scope
+  // evidence (the real 01-preflight.md carries several). The section list always
+  // opens with the "(preamble)" bucket, so assert on the section itself.
+  const fenced = "### Extension Gates\n```bash\n# micro tier note\n```\nThe gate is warn-only.\n";
+  const fencedSections = markdownSections(fenced);
+  ok(
+    !fencedSections.some((s) => s.heading.includes("micro tier note")) &&
+      fencedSections.find((s) => s.heading === "### Extension Gates")?.text.includes("# micro tier note") === true &&
+      findMicroWarnClaims(fenced).length > 0,
+    `#745: a \`# comment\` inside a fenced code block must not split the section (section-scope evidence must survive) — got ${JSON.stringify(fencedSections.map((s) => s.heading))}`
+  );
+
+  // Self-contained lines (headings, fence delimiters) must be their own SENTENCE
+  // UNIT, or the prose unit would inherit their scope as SENTENCE scope and be
+  // scored before the other-gate escape is consulted. (Section scope is separate
+  // and deliberate.)
+  const headUnits = sectionSentenceUnits("### Micro Tier Behavior\nThe VGATE content-shape check is warn-only for docs-only sets.");
+  ok(
+    !headUnits.some((u) => u.includes("micro tier behavior") && u.includes("warn-only")),
+    `#745: a heading must be its own sentence unit (got ${JSON.stringify(headUnits)})`
+  );
+  const fenceUnits = sectionSentenceUnits("### TypeScript Stack\n```bash\n# micro tier\n```\nThe \`.husky/commit-msg\` hook is warn-only.");
+  ok(
+    !fenceUnits.some((u) => u.includes("micro tier") && u.includes("warn-only")),
+    `#745: fenced code content must be its own sentence unit (got ${JSON.stringify(fenceUnits)})`
+  );
+
+  // End-to-end shape: the scope is a FILTER on claims, not a mute — a doc that
+  // carries both the #691 unrelated-gate sentence and a re-drift still reds, and
+  // only on the re-drift (the fence row carries two anti-tokens, so it reports
+  // two claims — both FROM the re-drift row).
+  const mixed = [
+    "### Mangled commit message — repair",
+    "The `.husky/commit-msg` hook is **warn-only** by default.",
+    "",
+    "### Extension Gates",
+    "| Review-enforcer | **WARN-ONLY** at micro — 0 reviewer dispatches warn but do not block |",
+  ].join("\n");
+  const mixedClaims = findMicroWarnClaims(mixed);
+  ok(mixedClaims.length > 0, "#745: a mixed doc still reds on the re-drift row");
+  ok(
+    mixedClaims.every((c) => c.section === "### Extension Gates" && !c.sentence.includes("husky")),
+    "#745: every surviving claim is the review-enforcer fence row — the unrelated-gate sentence is filtered out"
+  );
 });
 
 // ── #485 T3 — source-shape pin: the flip is anchored in code, not just docs ──
@@ -1923,11 +2820,20 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
   // shared MICRO_WARN_ANTI_TOKENS would false-positive T2's docs scan on that
   // product-version header; index.ts is its only re-drift surface. "allows
   // bypass" is genuinely absent from the docs corpus and is kept code-only for
-  // symmetry with "proportional". Case-insensitive (WARN-ONLY is covered via
-  // "warn-only").
+  // symmetry with "proportional". The lookahead-guarded inflected PATTERNS
+  // (MICRO_WARN_ANTI_PATTERNS) are scanned here too — they are not substrings of
+  // any shared token, so omitting them would let the two backstops diverge on
+  // exactly the forms #745 added (#745 review round 5). Case-insensitive
+  // (WARN-ONLY is covered via "warn-only").
   const codeAntiTokens = [...MICRO_WARN_ANTI_TOKENS, "allows bypass", "proportional"];
   for (const token of codeAntiTokens) {
     ok(!srcLower.includes(token), `index.ts must not contain ${JSON.stringify(token)} — a micro warn/proportional re-label re-drifted (#486/#493 class)`);
+  }
+  for (const pattern of MICRO_WARN_ANTI_PATTERNS) {
+    ok(
+      !new RegExp(pattern.source, pattern.flags).test(src),
+      `index.ts must not contain ${pattern} — a micro warn re-label re-drifted in inflected form (#745)`
+    );
   }
 });
 

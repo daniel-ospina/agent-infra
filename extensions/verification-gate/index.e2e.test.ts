@@ -116,10 +116,10 @@ const fakePi: any = {
     handlers.get(evt)!.push(h);
   },
 };
-async function fire(evt: string, event: any): Promise<any> {
+async function fire(evt: string, event: any, ctx: any = {}): Promise<any> {
   let result: any = undefined;
   for (const h of handlers.get(evt) ?? []) {
-    const r = await h(event, {});
+    const r = await h(event, ctx);
     if (r !== undefined) result = r;
   }
   return result;
@@ -3911,6 +3911,193 @@ async function main() {
     ok(sweep && sweep.block === true, "wrapper pure sweep still blocks via the WT scope (not refused, not mis-scoped)");
     ok(sweep.reason.includes("f76.ts"), "wrapper pure sweep block names the dirty tracked code file");
   });
+  // ── #755: merge-scope subtraction ─────────────────────
+  // Shared fixture: a repo mid-merge where the incoming side touched ONLY
+  // `basesub.ts` (base-identical to the trusted base) while the branch has an
+  // uncommitted authored change in the index. Without the fix, BOTH flood the
+  // verifier; with it, only the authored one is in scope.
+  function mkMergeRepo(name: string): string {
+    const repo = join(TEST_ROOT, name);
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "basesub.ts"), "base v1\n");
+    writeFileSync(join(repo, "authored.ts"), "a v1\n");
+    git(repo, "add .");
+    git(repo, "commit -m base");
+    git(repo, "update-ref refs/remotes/origin/main HEAD");
+    git(repo, "checkout -q -b upstream");
+    writeFileSync(join(repo, "basesub.ts"), "base v2\n");
+    git(repo, "add .");
+    git(repo, "commit -m upstream-touches-basesub");
+    git(repo, "update-ref refs/remotes/origin/main HEAD");
+    git(repo, "checkout -q main");
+    // The branch MUST diverge from the trusted base, or guard (3) blocks.
+    writeFileSync(join(repo, "feat.ts"), "f v1\n");
+    git(repo, "add .");
+    git(repo, "commit -m branch-diverges");
+    git(repo, "merge --no-commit --no-ff upstream");
+    // An authored index change so the post-subtraction scope is NON-empty.
+    writeFileSync(join(repo, "authored.ts"), "a v2 (index only)\n");
+    git(repo, "add authored.ts");
+    return repo;
+  }
+  const skipCount = (reason: string) =>
+    readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === reason).length;
+
+  test("scenario 77 (#755): a merge-in-progress scope SUBTRACTS base-identical paths and audits it", async () => {
+    const repo = mkMergeRepo("repo-755-77");
+    await fire("session_start", {});
+    const before = skipCount("base_identical_satisfied");
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m merge", cwd: repo },
+    });
+    const after = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "base_identical_satisfied");
+    ok(after.length > before, "#755: a merge scope emits a base_identical_satisfied audit line");
+    const last = after[after.length - 1] as any;
+    ok(Array.isArray(last.subtractedPaths) && last.subtractedPaths.includes("basesub.ts"),
+      "#755: the audit records the subtracted base-identical path");
+    ok(Array.isArray(last.arms) && last.arms.length > 0 && last.arms[0].perArmSubtracted.includes("basesub.ts"),
+      "#755: per-arm provenance is carried (arms[].perArmSubtracted)");
+    ok(res && res.block === true, "#755: the op still blocks on the unverified authored file");
+    ok(res.reason.includes("authored.ts"), "#755: the block names the branch-authored file");
+    ok(!res.reason.includes("basesub.ts"),
+      "#755 (the point of the issue): the block does NOT name the base-identical path — the base delta no longer floods the verifier");
+  });
+
+  test("scenario 78 (#755): ELDATO_VGATE_NO_SUBTRACT restores the over-gate and audits the opt-out", async () => {
+    const repo = mkMergeRepo("repo-755-78");
+    const baseBefore = skipCount("base_identical_satisfied");
+    const disabledBefore = skipCount("subtract_disabled_by_env");
+    process.env.ELDATO_VGATE_NO_SUBTRACT = "1";
+    try {
+      await fire("session_start", {});
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m merge", cwd: repo },
+      });
+      ok(skipCount("subtract_disabled_by_env") > disabledBefore,
+        "#755: the kill switch leaves a distinct audited marker (silence would be inconsistent with ELDATO_SKIP_VGATE)");
+      equal(skipCount("base_identical_satisfied"), baseBefore,
+        "#755: NO subtraction line while disabled — the audit cannot claim disabled and subtract anyway");
+      ok(res && res.block === true, "#755: the op still blocks");
+      ok(res.reason.includes("basesub.ts"),
+        "#755: over-gate restored — the base-identical path is back in scope with the kill switch set");
+    } finally {
+      delete process.env.ELDATO_VGATE_NO_SUBTRACT;
+    }
+  });
+
+  test("scenario 79 (#755): with the kill switch UNSET the same repo de-floods (control for 78)", async () => {
+    const repo = mkMergeRepo("repo-755-79");
+    delete process.env.ELDATO_VGATE_NO_SUBTRACT;
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m merge", cwd: repo },
+    });
+    ok(res && res.block === true, "#755: blocks on the authored file");
+    ok(!res.reason.includes("basesub.ts"),
+      "#755: control — the SAME fixture without the flag IS de-flooded (proves 78's difference is the flag, not the fixture)");
+  });
+
+  test("scenario 80 (#755): the PUSH leg subtracts a base-identical path on a FEATURE-branch push", async () => {
+    // Geometry that makes the push arm non-inert (traced, not assumed):
+    //   tier A scope  = diff <tracking> <srcRef>   = origin/feature .. feature
+    //   subtraction T = resolveTrustedBase()       = origin/main   (DIFFERENT ref)
+    // When the pushed branch IS the current branch AND T == tracking (the
+    // `git push origin main` case) condition (1) is the exact complement of
+    // scope membership, so nothing can ever be subtracted. The arm only does
+    // work when the two refs differ — i.e. the common feature-branch push.
+    const repo = join(TEST_ROOT, "repo-755-80");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "basesub.ts"), "v1\n");
+    writeFileSync(join(repo, "kept.ts"), "k1\n");
+    git(repo, "add .");
+    git(repo, "commit -m c0");
+    const c0 = git(repo, "rev-parse HEAD");
+    // Upstream advances basesub.ts to v2 — this becomes origin/main.
+    git(repo, "checkout -q -b upstream");
+    writeFileSync(join(repo, "basesub.ts"), "v2\n");
+    git(repo, "add .");
+    git(repo, "commit -m upstream-basesub-v2");
+    const cm = git(repo, "rev-parse HEAD");
+    git(repo, "update-ref refs/remotes/origin/main " + cm);
+    // The feature branch: authored work, then it merges upstream in.
+    git(repo, "checkout -q -b feature " + c0);
+    writeFileSync(join(repo, "feat80.ts"), "f1\n");
+    git(repo, "add .");
+    git(repo, "commit -m feature-work");
+    // The feature's own previously-pushed tip (the previously-pushed tip must be
+    // an ANCESTOR of the merge's first parent, or guard (5) fails).
+    git(repo, "update-ref refs/remotes/origin/feature " + c0);
+    git(repo, "merge --no-ff -m merge-upstream upstream");
+    // Sanity: the merge really did pull the base-identical content in.
+    equal(git(repo, "rev-parse HEAD:basesub.ts"), git(repo, "rev-parse origin/main:basesub.ts"),
+      "80: (fixture) the merge result's basesub.ts is byte-identical to the trusted base's");
+    await fire("session_start", {});
+    const before = skipCount("base_identical_satisfied");
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin feature", cwd: repo },
+    });
+    const after = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "base_identical_satisfied");
+    ok(after.length > before, "80: the PUSH leg emits base_identical_satisfied (pre-this-scenario the push leg had NO e2e pin at all)");
+    const last = after[after.length - 1] as any;
+    ok(Array.isArray(last.subtractedPaths) && last.subtractedPaths.includes("basesub.ts"),
+      "80: push leg subtracts the base-identical path");
+    ok(!last.subtractedPaths.includes("feat80.ts"),
+      "80: the branch-authored path is NOT subtracted");
+    ok(res && res.block === true, "80: still blocks on the unverified authored file");
+    ok(res.reason.includes("feat80.ts"), "80: the block names the branch-authored file");
+    ok(!res.reason.includes("basesub.ts"),
+      "80: and does NOT name the base-identical incoming path — the push-leg de-flood");
+  });
+
+  // ── #3255: the git-op root must come from the cwd the runtime actually spawns
+  // the command in (ctx.cwd), NOT process.cwd(). The first attempt at this fix
+  // instead INFERRED the root from the verification bridge, which let a clean
+  // adopted tree produce an empty scope and silently ALLOW an op whose
+  // unverified content lived in the session's real tree. This pins the plumbing
+  // that replaced it: with no `input.cwd`, the root follows `ctx.cwd`. Ignoring
+  // ctx (falling back to process.cwd()) must turn this red.
+  test("scenario #3255: ctx.cwd decides the git-op root when input carries no cwd", async () => {
+    const hub = join(TEST_ROOT, "cwd-hub");
+    const wt = join(TEST_ROOT, "cwd-wt");
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -q -b main");
+    writeFileSync(join(hub, "base.txt"), "base\n");
+    git(hub, "add base.txt");
+    git(hub, "commit -m baseline");
+    git(hub, `worktree add -q ${wt} -b wtbranch`);
+
+    // An unverified staged change exists in the WORKTREE ...
+    writeFileSync(join(wt, "wtfile.txt"), "v1\n");
+    git(wt, "add wtfile.txt");
+
+    // ... while the HUB has nothing staged, so the two roots are observably different.
+    const fromWt = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'ctx'" }, // no input.cwd — ctx.cwd is the only signal
+    }, { cwd: wt });
+    ok(fromWt && fromWt.block === true,
+      "ctx.cwd=worktree must scope the op to the worktree and BLOCK on its unverified staged file");
+    ok(fromWt.reason.includes("wtfile.txt"),
+      "the block must name the worktree's own file, not another tree's");
+
+    const fromHub = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'ctx'" },
+    }, { cwd: hub });
+    equal(fromHub, undefined,
+      "ctx.cwd=hub is clean → allowed; the two fires must DIFFER (identical results would mean ctx is ignored)");
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

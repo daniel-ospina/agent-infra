@@ -6,8 +6,8 @@
 #   2. models.json drift (deepseek id > 300K)      → BLOCK (exit 1)
 #      (positive controls: the v4-pro family, the legacy v4-flash alias, the
 #      canonical deepseek-flash id + its future bare `deepseek-pro`
-#      counterpart, dotted deepseek-v4.1 ids, `:`-suffixed (routing-tier)
-#      shapes;
+#      counterpart, dotted deepseek-v4.1 ids, hyphenated deepseek-v4-1 ids
+#      (#747 venice row), `:`-suffixed (routing-tier) shapes;
 #      negative controls: deepseek-proxy / deepseek-flashlight — V4.1 Flash
 #      adoption 2026-09-10)
 #   3. models-store.json drift                     → WARN (exit 0, DETECTED —
@@ -108,6 +108,7 @@ if grep -q "deepseek-v4-flash contextWindow=1000000" "$OUT"; then pass "legacy v
 if grep -q "deepseek-flash contextWindow=1000000" "$OUT"; then pass "canonical deepseek-flash flagged"; else fail "canonical deepseek-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash contextWindow=1000000" "$OUT"; then pass "dotted v4.1 family flagged"; else fail "deepseek-v4.1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash-expires-on-0910 contextWindow=1000000" "$OUT"; then pass "dotted beta id flagged"; else fail "dotted beta id not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-v4-1-flash contextWindow=1000000" "$OUT"; then pass "hyphenated v4-1 family flagged (#747)"; else fail "deepseek-v4-1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4-pro:batch contextWindow=1000000" "$OUT"; then pass ":batch terminator flagged"; else fail ":batch terminator not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-flash:batch contextWindow=1000000" "$OUT"; then pass "canonical :batch flagged"; else fail "canonical :batch not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-pro contextWindow=1000000" "$OUT"; then pass "bare deepseek-pro flagged"; else fail "bare deepseek-pro not flagged"; sed -n '1,30p' "$OUT"; fi
@@ -154,6 +155,7 @@ if grep -q "deepseek-v4-flash contextWindow=1000000" "$OUT"; then pass "minified
 if grep -q "deepseek-flash contextWindow=1000000" "$OUT"; then pass "minified canonical deepseek-flash flagged"; else fail "minified canonical deepseek-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash contextWindow=1000000" "$OUT"; then pass "minified dotted v4.1 family flagged"; else fail "minified deepseek-v4.1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-v4.1-flash-expires-on-0910 contextWindow=1000000" "$OUT"; then pass "minified dotted beta id flagged"; else fail "minified dotted beta id not flagged"; sed -n '1,30p' "$OUT"; fi
+if grep -q "deepseek-v4-1-flash contextWindow=1000000" "$OUT"; then pass "minified hyphenated v4-1 family flagged (#747)"; else fail "minified deepseek-v4-1-flash not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-flash:batch contextWindow=1000000" "$OUT"; then pass "minified canonical :batch flagged"; else fail "minified canonical :batch not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-pro contextWindow=1000000" "$OUT"; then pass "minified bare deepseek-pro flagged"; else fail "minified bare deepseek-pro not flagged"; sed -n '1,30p' "$OUT"; fi
 if grep -q "deepseek-proxy" "$OUT"; then fail "minified negative control deepseek-proxy was flagged"; else pass "minified deepseek-proxy (non-family) not flagged"; fi
@@ -229,7 +231,7 @@ python3 - "$FIX" "$CLAMP_EXPECTED" <<'PY' >"$OUT" 2>&1
 import json, os, re, sys, hashlib
 
 fix, clamp = sys.argv[1], int(sys.argv[2])
-DS = re.compile(r'^deepseek-(?:v4(?:\.\d+)?-)?(?:flash|pro)(?:[-:]|$)')
+DS = re.compile(r'^deepseek-(?:v4(?:[.\-]\d+)?-)?(?:flash|pro)(?:[-:]|$)')
 
 def norm(i):
     return re.sub(r'^~?[^/]*/', '', i) if '/' in i else i
@@ -310,7 +312,7 @@ EXPECTED = {
 # cost, name or container change must fail.
 CONTROL_IDS = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-expires-on-0910",
                "deepseek-v4-pro:batch", "deepseek-flash:batch", "deepseek-pro",
-               "deepseek-proxy", "deepseek-flashlight"]
+               "deepseek-proxy", "deepseek-flashlight", "deepseek-v4-1-flash"]
 CLEAN_IDS = [m["id"] for m in clean["models.json"]["providers"]["deepseek"]["models"]]
 MODELS_BOUND = {".providers.deepseek.models"} | {
     f".providers.deepseek.models[{i}].contextWindow" for i in range(len(CLEAN_IDS))}
@@ -365,7 +367,7 @@ fails += check(isinstance(sett.get("compaction"), dict) is False,
 # and sit ABOVE the clamp — otherwise the absence assertions prove nothing.
 POSITIVE = ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-flash", "deepseek-v4.1-flash",
             "deepseek-v4.1-flash-expires-on-0910", "deepseek-v4-pro:batch",
-            "deepseek-flash:batch", "deepseek-pro"]
+            "deepseek-flash:batch", "deepseek-pro", "deepseek-v4-1-flash"]
 NEGATIVE = ["deepseek-proxy", "deepseek-flashlight"]
 for tree in ("backdoor-models", "backdoor-minified"):
     ids = scanned(raw[tree]["models.json"])

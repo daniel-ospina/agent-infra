@@ -1,0 +1,108 @@
+# ⚠️ SECURITY — READ BEFORE EDITING THIS FILE ⚠️
+#
+# This workflow uses the `pull_request_target` trigger. GitHub runs the workflow
+# DEFINITION from the BASE branch (`main`) for this event — a PR cannot
+# substitute its own copy of THIS file. That is what this file buys: the
+# structural checker runs from a copy the PR cannot rewrite.
+#
+# TRUST SPLIT — read this before describing what is "protected" (authoritative
+# statement: the module header of scripts/check-pi-pin-lockstep.mjs; this is a
+# pointer to it, not a second copy, so the two cannot drift apart):
+#   - The content lock (scripts/workflow-lock.json) is a conspicuousness
+#     tripwire enforced by PR-EDITABLE code, NOT a PR-uneditable control. Its
+#     only call site is the PR's own copy of the checker, run from the
+#     PR-editable .github/workflows/ci.yml.
+#   - THIS job provides the VALUE ASSERTIONS only — items (1)–(5) of
+#     `wiringFindings` plus item (6a): ci-main.yml's pin-gate JOB/`with:` shape
+#     and the presence of the exact pin-suite invocation line inside its
+#     `test-command`. All value assertions, read from already-fetched bytes. It
+#     provides ZERO lock enforcement: `--head-ref` skips the lock by design, or
+#     else every legitimate workflow change would deadlock against `main`'s old
+#     lock.
+#   - Item 6b (the behavioural "the committed post-merge command can fail the
+#     step") is NOT run here and is NOT replaced here. It has to EXECUTE the
+#     command, which this trigger must never do with PR content, so it lives in
+#     the PR-editable suite and in the post-merge ci-main.yml leg only. This job
+#     makes no claim whatsoever about ci-main.yml's SHELL — its only
+#     ci-main.yml claims are item 6a's values.
+#   - A PR that edits a workflow AND the lock together passes both legs. That is
+#     the pre-existing accepted same-commit residual, now conspicuous in the
+#     diff.
+#
+# BOOTSTRAP: `pull_request_target` resolves this workflow file from the DEFAULT
+# branch, so this job does not run on the PR that adds it — it takes effect on
+# the NEXT PR after this file lands on `main`. Nothing here verifies that it
+# runs post-merge; `scripts/check-pi-pin-lockstep.mjs` asserts instead that this
+# file exists and is wired (pull_request_target + the `--head-ref` invocation),
+# so deleting or unwiring it is RED.
+#
+# Because the trigger is privileged, this workflow MUST NEVER check out, execute,
+# build, or `npm install` any PR content. `actions/checkout` below deliberately
+# has NO `ref:` — it checks out the base branch. The workflow files are read as
+# DATA through the GitHub git tree + blob API at a SINGLE ref
+# (`node scripts/check-pi-pin-lockstep.mjs --head-ref <sha>`, which reads the
+# recursive tree, rejects any workflow path whose committed mode is not a regular
+# blob (`100644` or `100755` — a symlink or submodule would run 0 jobs; the
+# executable bit is irrelevant to GitHub's loader), fetches each blob by its tree
+# sha, and decodes the base64 failing closed; it never executes it). It then runs
+# the narrow VALUE assertions only (items 1–5 plus item 6a: the pin-gate job, its
+# `with:` keys and the presence of the pin-suite invocation line), and makes no
+# claim about the SHELL of the post-merge command (see the trust-split pointer
+# above). Passing a PR ref to `actions/checkout`, or any step that runs PR
+# content, turns this into the well-known `pull_request_target` RCE vector.
+#
+# WHICH REF — THE MERGE RESULT, NOT THE HEAD (#821). The ref validated below is
+# `pull_request.merge_commit_sha` — the commit GitHub would create by merging this
+# PR into its base — because that is the state that would actually land. The
+# HEAD is the WRONG subject, and using it produced a false RED on every branch cut
+# before a guarded workflow changed: the head still carries the OLD files, the
+# assertions fail, and the job tells the author to "restore the line" for a line
+# they never touched and should not touch — even though merging would leave the
+# base branch's (valid) copies in place. Validating the merge result also handles
+# the case that actually matters: a PR that changes a guarded workflow on top of a
+# base branch that has since changed it too (the merge result is the only place
+# that combination exists). `merge_commit_sha` is null while a PR conflicts with
+# its base; the step below fails closed with its own message in that case rather
+# than reporting a spurious workflow finding.
+#
+# See GitHub Security Lab, "Keeping your GitHub Actions and workflows secure:
+# Preventing pwn requests" (Part 4) and GitHub's "Securely using
+# pull_request_target" guidance.
+
+name: Workflow lock (base-branch checker)
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+# Read-only. `contents: read` covers the checkout and the git tree + blob calls.
+# `pull-requests: read` is deliberately NOT granted — nothing here reads PR
+# metadata (the only API calls are the git tree and git blob endpoints);
+# declaring an unused scope is the P2-h finding from the #675 review.
+permissions:
+  contents: read
+
+jobs:
+  workflow-lock:
+    runs-on: ubuntu-latest
+    steps:
+      # No `ref:` on purpose: pull_request_target checks out the BASE branch
+      # (main), so this step runs main's copy of the workflow + script. Do NOT
+      # add a ref pointing at the PR head.
+      - uses: actions/checkout@v4
+      - name: Validate the MERGE RESULT's workflow files (narrow structural guard, lock skipped)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Validate what would LAND, not what the branch currently points at (#821).
+          if [ -z "$MERGE_SHA" ]; then
+            echo "❌ pull_request.merge_commit_sha is EMPTY, so there is no merge result to validate."
+            echo "   GitHub does not compute one while this PR conflicts with its base branch."
+            echo "   This is NOT a finding about your workflow files — the job simply cannot see"
+            echo "   what would land. Resolve the conflicts or update your branch and it re-runs."
+            echo "   PR head, for reference only: $HEAD_SHA"
+            exit 1
+          fi
+          node scripts/check-pi-pin-lockstep.mjs --head-ref "$MERGE_SHA"

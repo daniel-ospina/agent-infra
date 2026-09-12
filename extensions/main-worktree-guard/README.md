@@ -12,9 +12,9 @@ collision between parallel agents:
    origin/main` mid-PR yanked the working tree out from under another agent).
 
 **Worktrees are ISOLATED** — none of this applies to writes INSIDE a linked
-worktree. The guard blocks only hub-main-checkout writes and destructive git
-in the shared main checkout, where branch-state changes and hard resets
-silently destroy other agents' work.
+worktree, with ONE exception: the working-tree-discard family (M5, #709) is
+effect-keyed and applies in a linked worktree too, because that is where the
+`pi -p` review fixers run. See M5 below.
 
 **#618/#621 — hub-write gating is TARGET-aware:** the write/edit gate and the
 tracked-file bash gate resolve the WRITE TARGET's repo checkout
@@ -38,6 +38,148 @@ documented (env hatch below, escape marker below).
 case), the bash guard degrades to warn-only while the write/edit guard stays
 fully enforced. The escape-marker check degrades to **inactive** (block) on
 any failure — a failed import or stamp never silently allows.
+
+## M5 — working-tree-discard gate: effect, not argv (#709)
+
+The legacy destructive-verb arms key on **git argv**, and two gaps followed
+from that:
+
+- `git checkout -- <path>` — the 2026-09-10 incident verb (an unrestored
+  mutation-test mutant left in the shared hub, #664) — classifies `allow`
+  (pinned by `test.mjs:108`); the M4 hub-state gate catches it only while the
+  hub is DISORDERED.
+- Every other discard verb (`restore`, `checkout .`, `checkout -f`,
+  `reset --hard`) is exempt wholesale in a **linked worktree** (repo
+  convention: review work happens in worktrees), which is where the `pi -p`
+  mutation-test fixers actually run.
+
+M5 keys on the **effect** instead. A discard-family command is blocked when
+the checkout it targets is carrying uncommitted work that the discard would
+destroy:
+
+| Form | Scope | Discards |
+|---|---|---|
+| `git checkout [<tree-ish>] -- <paths>` | paths | worktree vs index |
+| `git checkout <path>` (one bare token, not a ref) | paths | worktree vs index — the handler's `rev-parse` probe decides ref vs path |
+| `git checkout -f <path-or-ref>` | all (ref) / paths (path) | forced switch, or a single-path restore — the handler's `rev-parse` probe decides |
+| `git checkout .` / `./x` / `:/x` / `:(magic)` | paths | worktree vs index |
+| `git checkout -f` / `--force` | all | everything tracked |
+| `git restore [--worktree] [-s <tree>] <paths>` | paths | worktree (index only with `--staged`) |
+| `git switch -f` / `--discard-changes` | all | everything tracked |
+| `git reset --hard [-- <paths>]` | all / paths | index + worktree |
+| `git checkout-index -f <paths>` / `-a` | paths | index vs worktree |
+| `git checkout -p` / `--patch` | paths / all | interactive hunk discard |
+| `git checkout --ours` / `--theirs` / `-m` / `--conflict=<style>` / `-2` / `-3` | paths | index vs worktree — conflict resolution ONLY on an unmerged path |
+| `git restore --staged --worktree` | paths | index reset from HEAD + worktree |
+| `git rm -f <paths>` | paths | index + worktree |
+| `git read-tree --reset -u` | all | index + worktree |
+| `git apply -R` / `--reverse` (`-R3`/`-3R` too) | all | reverses an applied patch (paths live in the patch); index only with `--index`/`--3way` |
+| `git show <rev>:<path> > <path>` | paths | committed content over the file (slashy revs and `:path` index source included) |
+
+Long options match by **unambiguous prefix** (`--har` ≡ `--hard`, `--discard-ch` ≡
+`--discard-changes`), `git checkout <tree-ish> <path>` without `--` is treated as
+the path restore git executes, and `git checkout <token>` (a single bare token) is
+resolved by a `rev-parse` probe — a token that names a commit is a branch/tag
+switch, anything else is a path restore (`git checkout -f <ref>` keeps whole-tree
+scope because a forced switch discards everything). **Fail-closed** (effect not
+statically resolvable): `--pathspec-from-file`, `--stdin` target lists,
+`$VAR`/backtick pathspecs, xargs/find `-exec` placeholders (`{}`/`{}+`), a
+non-static git VERB (`git "$@"` behind a shell function), a `$`-bearing script
+path (`bash $S`), an unresolvable `cd` chain, and an `eval` payload that cannot
+be resolved. **Fail-open** (never false-block): an unreadable `git status` on a
+directory that is not a checkout.
+
+`git restore --staged`-style **index-only** operations (`git restore --staged`
+— including the `--pathspec-from-file` spelling — `git rm --cached`,
+`git rm -n/--dry-run`, `git apply -R --cached`),
+**report-only** reverse applies (`git apply -R --check/--stat/--numstat/--summary`),
+`git checkout-index --prefix=<dir>`/`--temp` (exports elsewhere), unmerged conflict
+entries (`UU`/`AA`/`DD` — which is what keeps
+`checkout --ours/--theirs/-m/--conflict=` legitimate on a REAL conflict), heredoc
+**data** bodies, string-quoted `<<` phantoms (incl. `<<` in `(( ))` arithmetic
+and inside a multi-line quoted string), and `#` comments (full-line and
+mid-line, honouring the escaped-whitespace rule) are NOT discards; code heredocs
+(`bash <<EOF`, `cat <<EOF | bash`, `python3 <<PY`, the SPAWNER-wrapped forms
+`env|nice|nohup|command|timeout N bash <<EOF`, and any list-form consumer such as
+`true && bash <<EOF` / `set -e; bash <<EOF`) and executable scripts
+(`./undo.sh`, `bash undo.sh`, `/bin/sh undo.sh`, `busybox sh undo.sh`, and a
+script PIPED into a shell — `cat undo.sh | bash`; alternate shells `ash`/`mksh`/`oksh`
+and a redirection before the interpreter — `2>/dev/null bash <<EOF` — included) ARE
+walked (bounded depth 3, 64KB), quote/escape-concat verb names (`g"it"`, `'g'it`,
+`g\it`) are resolved by the tokenizer (the arm's pre-bail is quote-aware), ANSI-C
+command words (`$'\x67it'`) are decoded when they form a plain word, and backtick
+substitution (`` `git checkout -- f` ``), a quoted `$( … )` substitution, and an
+in-command git alias (`git -c alias.z='checkout --' z f`, `git config alias.zz …
+&& git zz f`) are resolved too. The substitution passes run on the STRIPPED text,
+so heredoc data and `#` comments cannot produce phantom descriptors. An
+UNQUOTED heredoc delimiter is a shell word (`<<E-O-F`, `<<EOF.txt`), not
+word-characters only. A data heredoc no longer swallows the NEXT
+command word: the delimiter is re-emitted so the shared walker's `<<` + operand
+skip consumes the placeholder, not the following `git`. **Also fail-closed**: a
+here-string or process substitution feeding an interpreter (`bash <<< 'git
+checkout -- f'`, `bash <(printf 'git checkout -- f')`) and an opaque interpreter
+`-c` payload (`S=…; bash -c "$S"` — resolved when the assignment is in the same
+command, else blocked when the command mentions a discard verb).
+
+The decision (`discardDestroysWip`) is pure and unit-tested: scope `all`
+blocks on ANY tracked porcelain entry; scope `paths` blocks on a
+worktree-vs-index difference (`Y ≠ ' '`) — a `fromTree` source (a commit/tree
+restore or a `--staged` index reset) additionally destroys a staged-only change
+(`X ≠ ' '`). Index-sourced operations (`checkout-index`, plain `apply -R`)
+therefore use `fromTree: false` even at whole-tree scope — a staged-only entry
+is already in the worktree and survives them. `git restore` with no pathspec (a git usage error) and `echo <<< 'git checkout …'`
+(a non-interpreter here-string) are inert. **Allowed**: untracked-only dirt
+(`checkout -- .` never deletes `??`), staged-only changes for an
+index-source restore, clean targets, `git restore --staged` (index-only), and
+every read-only command. Unresolvable targets (`$VAR` pathspec, unresolvable
+`cd` chain) fail CLOSED; an unreadable `git status` fails open (never
+false-block), matching the repo's write-gate convention.
+
+**Escape hatches are unchanged**: M5 sits after the env-hatch / TTL-marker
+return, so `AGENT_ALLOW_MAIN_EDITS=1` and the `~/.pi/agent/.allow-main-edits`
+marker bypass it exactly as they bypass M2/M3. Task children are unhatched by
+default (#617/#623), so for the `pi -p` fixer M5 — not a prose rule — is the
+enforcement surface.
+
+`git clean` is deliberately NOT in the family (untracked-only; build-artifact
+cleanup in a private worktree is ordinary, and the M4/legacy arms already
+block it in a shared main checkout). `cp <backup> <tracked>`, arbitrary
+interpreter writers, a script chain deeper than 3, a nested `eval`, a script run
+from inside a shell FUNCTION BODY (`f(){ bash /tmp/undo.sh; }; f` — the head of
+the line is not an interpreter; the direct-pipe form IS walked), a git alias
+configured in an EARLIER command (`git config alias.zz 'checkout --'` then
+`git zz f` — resolving it needs a config read; the same-command form IS
+gated), a non-static command word (`{git,}` brace alternation, a
+command-position `$(…)` such as `$(echo git)` — the same open-ended
+bash-expansion family as Residual 1), `git show <rev>:<clean> > <dirty>`
+(cross-path overwrite), and `git worktree remove --force <wt>` (whole-checkout
+teardown, not a working-tree discard of the current checkout — the
+`using-git-worktrees` manifest gate is its control) are documented residuals —
+indistinguishable from an edit without reading file content (the #625 in-place
+overwrite gate keeps its existing shared-main scope).
+
+Three further documented residuals were found by the round-9 adversarial review
+and are tracked as follow-ups rather than fixed here (each is a narrow,
+deliberate-obfuscation-adjacent spelling, and the obvious fixes carry real
+false-positive risk): **(a)** a destructive FLAG supplied through a variable
+(`H=--hard; git reset $H`, `F=-R; git apply $F <patch>`) — the extractor keys on
+literal flag tokens, and failing closed on every `$`-bearing argument would
+false-block the ordinary `git checkout -b "$BRANCH"`; **(b)** a
+`git show <rev>:<path>` revert piped into a writer the write-target model does
+not know (`| dd of=<path>`, `| cp /dev/stdin <path>`; redirects, `tee` and
+python `open()` ARE gated); **(c)** `bash /dev/stdin < script.sh`, where the
+script operand is a FIFO so the bounded walk reads nothing and the `<` operand
+is not reached. None of the three is in the `pi -p` fixer's ordinary path.
+
+Two fail-closed COSTS are accepted alongside them: any NULL-VERB `git` in a
+command that mentions a feeder (`printf 'status\n' | xargs git`, and even
+`echo 'use xargs to batch' && git --version`) blocks while the tree is dirty,
+because a null-verb `git` under an `xargs`/`find -exec` feeder has its
+subcommand supplied at runtime (the walker consumes terminal global flags, so
+`--version` is indistinguishable from the bare form) and the textual probe for
+it was evadable (`printf 'check\'\'out -- f`, `printf 'check\x6fut -- f`); and
+an opaque `-c` payload sharing a command with a discard verb blocks even when
+the visible invocation is legitimate.
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
@@ -787,6 +929,56 @@ touch a marker. The hung-process class currently has **no owner** — #203 is
 closed with a different scope (auto-sync non-main-branch recovery, not process
 supervision). A process-supervision follow-up (new issue) is required. The
 marker fixes **guard-blocked** sessions only.
+
+## Tests
+
+| Suite | Command | Covers |
+|---|---|---|
+| `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
+| `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
+| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), and both escape hatches |
+
+`test-module-load.mjs` exists because of a real regression (#744): #697 added a
+rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)
+whose five `_`-prefixed targets were declared NOWHERE. An assignment to an
+undeclared identifier is a `ReferenceError` in ESM (always strict mode); it
+threw inside the guarded `await import("./classify-git.mjs")` block and the
+catch logged `bash git guard DISABLED`. The assignment runs left-to-right, so
+the 21 targets listed before `_extractCodePayload` were already bound to the
+real exports — the legacy classifier, the #73 coordinated-delete arm and the
+script-content gate kept working — while every binding at or after it kept its
+fail-safe default, so **those later gates silently degraded in every session**
+— while `test.mjs`
+stayed green, because it imports `classify-git.mjs` directly (and its comments
+assert that `index.ts` is not importable in tests). TypeScript flags the bug
+(`TS2552: Cannot find name '_extractCodePayload'`, and the same for its four
+siblings), but the repo has no root `tsconfig.json`, so the CI typecheck job
+self-skips.
+
+The suite has two parts, both zero-dependency (no `node_modules`, so it runs in
+CI):
+
+- **Part A — static scope tripwire.** Parses the `({ … } = …)` assignment
+  patterns out of `index.ts` and asserts every target is a declared binding
+  somewhere in the file. Catches the exact bug class anywhere.
+- **Part B — real module load** (Node ≥ 22.13). Imports the REAL `index.ts`
+  through `module-load-hooks.mjs`, which type-strips the TS sources and stubs
+  `@earendil-works/pi-coding-agent` — the same shapes pi's jiti loader
+  produces. It then drives the registered `tool_call` handler against a
+  hermetic MAIN checkout and asserts BEHAVIOR: the #627 inline-interpreter gate
+  blocks an argv-form git payload the legacy string classifier misses, the
+  disordered-hub write gate blocks a tracked overwrite, and the #628 new-file
+  cap blocks write #26. Those paths read the very bindings that stay stubbed
+  when the import degrades, so the suite is red on the pre-#744 module.
+
+**CI wiring.** Per-PR: the `verify` job in `ci.yml` runs it as a named step
+(added by #744) — not in the pinned `ci` job, whose `test-command` value
+(`scripts/check-pi-pin-lockstep.mjs`, guard (j)) pins to exactly this one
+accumulator invocation. Post-merge: the
+`extensions/*/test*.mjs` glob in `ci-main.yml` (`push` → main) picks it up
+automatically, so no explicit line is needed there — an explicit one would
+double-run it. Both are plain zero-dep `node` invocations, neither needs
+`npm ci`.
 
 ## Manual verification checklist
 

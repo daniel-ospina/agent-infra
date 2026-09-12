@@ -1359,11 +1359,68 @@ function runCli(argv: string[]): void {
   process.exitCode = 2;
 }
 
+// #708 — symlink-insensitive entry guard. The previous
+// `path.resolve(entry) === fileURLToPath(import.meta.url)` compared a
+// NON-resolved path against the loader's realpath-resolved URL, so whenever any
+// component of the invocation path was a symlink (macOS `/var` →
+// `/private/var`, a symlinked checkout) `isDirectEntry` was false: the CLI
+// silently did nothing and exited 0. The realpath compare below is the fix.
+//
+// Canonical implementation: `scripts/is-main.mjs`. Not imported here on purpose
+// — this file SHIPS to consumer machines inside `~/.pi/agent/extensions/`,
+// where `../../scripts/` is not guaranteed to resolve, and no production
+// extension imports across that layer boundary. Residual: the two
+// implementations can drift; `extensions/shared/test-is-main.mjs` Part C bans
+// the old idiom in both (and pins this block's realpath compare).
+//
+// ⚠️ SITE-SPECIFIC DIRECTION — this guard must NOT reuse the canonical
+// module's "unresolvable ⇒ run anyway" rule. Its body is not a gate: it LAUNCHES
+// A CLI, `runCli` MUTATES the exhaustion latch (`--clear`) and sets a non-zero
+// exit code on a usage error. pi imports this module in-process on every
+// session (`extensions/builtin-tools/index.ts`, `extensions/provider-exhaustion.ts`),
+// and a bun-compiled pi has a VIRTUAL entry path — the `/$bunfs/root/` shape
+// `getPiInvocation` special-cases at extensions/builtin-tools/index.ts:161 —
+// which never resolves. So an unresolvable entry resolves to "not the entry
+// point" here, with a LOUD line whenever that is not a recognized virtual entry
+// (a destroyed invocation route, the #675 P2-f shape) — never a silent skip.
+// The symlinked invocation this change fixes is handled by the realpath compare
+// below, not by this branch.
 const isDirectEntry = (() => {
   try {
     const entry = process.argv[1];
-    if (!entry) return false;
-    return path.resolve(entry) === fileURLToPath(import.meta.url);
+    if (!entry) return false; // no script entry (import / `node -e`) → not main
+    const self = fileURLToPath(import.meta.url);
+    const resolved = path.resolve(entry);
+    if (resolved === self) return true;
+    // A bun-compiled pi's virtual entry: `/$bunfs/root/` exactly (the marker
+    // `getPiInvocation` special-cases at extensions/builtin-tools/index.ts:161)
+    // AND no filesystem OBJECT at that path — the marker alone is a naming
+    // convention, so a REAL file under a root-level `$bunfs` directory must fall
+    // through to the realpath compare below instead of silently no-opping (#708).
+    // `lstat`, deliberately, NOT `existsSync`/`realpath`: both of those follow
+    // symlinks, so a DANGLING symlink under the marker reads as "never existed"
+    // when it is in fact a real object that names a target — which silently
+    // skipped this CLI (#708, review cycle 4; the same "cannot resolve is not a
+    // different file" rule). This fires in every bun session, so it stays quiet.
+    if (resolved.startsWith('/$bunfs/root/')) {
+      try {
+        fs.lstatSync(resolved);
+      } catch {
+        return false; // truly absent — the bun virtual entry; stay quiet
+      }
+    }
+    try {
+      return fs.realpathSync(resolved) === fs.realpathSync(self);
+    } catch {
+      // Unresolvable entry that is NOT a virtual path: could be a dangling
+      // invocation route that still names this file — so do NOT run the CLI
+      // (its body mutates the latch), but do NOT be silent either.
+      process.stderr.write(
+        `[is-main] ⚠️  entry point unresolvable (argv[1]=${resolved}) — NOT running this CLI; ` +
+          `a wrong run would mutate the exhaustion latch (#708).\n`,
+      );
+      return false;
+    }
   } catch {
     return false;
   }

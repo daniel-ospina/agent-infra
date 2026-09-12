@@ -8,6 +8,19 @@ import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
 import { isPrintMode, argvAllowsTask } from "../shared/print-mode.js";
+// #755 merge-scope subtraction. VALUE import of a nested sibling module — safe:
+// pi's extension loader only auto-loads a directory's index.ts/index.js or its
+// package.json#pi.extensions, so subtract-scope.ts is never registered as an
+// extension on its own.
+import {
+  makeSubBundle,
+  makeGitSubCtx,
+  subtractCommitArm,
+  subtractPushArm,
+  SUBTRACT_SKIP_REASONS,
+  type SubBundle,
+  type SubAudit,
+} from "./subtract-scope.js";
 // ponytail: inlined from verification-gate-utils.ts — pi's extension loader treats every .ts in
 // ~/.pi/agent/extensions/ as an extension and fails on a pure-helper module (no factory export).
 // Do NOT re-extract to a sibling .ts; the directory+entry pattern (see main-worktree-guard) is the
@@ -75,7 +88,10 @@ export function scopeFiles(
       skipped++;
       continue;
     }
-    if (staged === null) staged = new Set(runStagedScope(projectRoot).files);
+    // #755: the consumer path passes NO bundle — this scope feeds the
+    // tool_result merge, not the gate, and there is no audit emit here. A
+    // subtraction here would be a reachable, unaudited scope reduction.
+    if (staged === null) staged = new Set(runStagedScope(projectRoot, null).files);
     if (staged.has(rel)) { kept.push(f); continue; }
     skipped++;
   }
@@ -228,6 +244,102 @@ function bridgePath(): string {
   return join(BRIDGE_DIR, "latest.json");
 }
 
+// ── #3255: worktree-aware root resolution ────────────────────────────────
+// The git root of `process.cwd()` is the HUB whenever the session runs in the
+// hub checkout and the change lives in a linked worktree — a bare `git push`
+// with no `cd` prefix, or a task sub-agent started from the hub. Verification
+// is dispatched with the WORKTREE as project root, so the bridge's compound
+// keys are keyed on the worktree; the gate then hashes the hub's contents
+// against worktree hashes, mismatches EVERY file, and blocks permanently — no
+// verifier response can satisfy a comparison between two directories.
+//
+// `pickVerifiedRoot` is the pure decision (exported: unit-pinned). It returns a
+// root to adopt ONLY when the cwd root has no verified entries and exactly one
+// same-repo sibling does. Same-repo means a shared `--git-common-dir`, so an
+// unrelated repository's entries can never be adopted; ambiguity (2+ siblings)
+// falls back to the status quo, fail-closed like the rest of the gate.
+export function pickVerifiedRoot(
+  cwdRoot: string,
+  roots: string[],
+  commonDirOf: (root: string) => string | null,
+): string | null {
+  if (roots.length === 0) return null;
+  const norm = normalizeWorktreeRoot(cwdRoot);
+  if (roots.some((r) => normalizeWorktreeRoot(r) === norm)) return null; // own entries exist — status quo
+  const mine = commonDirOf(cwdRoot);
+  if (mine === null) return null;
+  const siblings = roots.filter((r) => commonDirOf(r) === mine);
+  return siblings.length === 1 ? siblings[0] : null;
+}
+
+function gitCommonDir(root: string): string | null {
+  try {
+    const out = execSync("git rev-parse --git-common-dir", {
+      cwd: root,
+      encoding: "utf-8",
+      timeout: 3000,
+    }).trim();
+    // `--git-common-dir` is relative to the invocation cwd when not absolute.
+    return out ? resolve(root, out) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Roots the bridge currently holds verified entries for.
+export function bridgeRoots(): string[] {
+  const bridge = readBridge();
+  if (!bridge || bridge.status !== "PASS") return [];
+  const roots = new Set<string>();
+  for (const vf of bridge.verified_files) {
+    const parsed = parseCompoundKey(vf.path);
+    if (parsed) roots.add(parsed.root);
+  }
+  return Array.from(roots);
+}
+
+// RECOVERY-ONLY. #3255: the bridge's compound keys are keyed on the WORKTREE
+// that was verified, while a hub session's `process.cwd()` git root is the hub.
+// Adopting the sibling root lets session-start RECOVERY see those entries.
+//
+// This must NEVER be used to choose the git-op root: adoption is inferred from
+// bridge content, not from what the command targets, so a clean adopted tree
+// yields an empty diff scope and the gate's empty-scope path ALLOWS an op
+// carrying unverified content — a fail-open in the one direction this gate must
+// not fail (found in review of the first attempt). The git-op root is therefore
+// authoritative — the command's own cwd — and a root mismatch is diagnosed
+// loudly (diagnoseRootMismatch) rather than bridged.
+function recoveryOnlyRoot(root: string): string {
+  const picked = pickVerifiedRoot(root, bridgeRoots(), gitCommonDir);
+  if (picked === null) return root;
+  console.log(
+    `[verification-gate] ↔ #3255: no verified entries for ${normalizeWorktreeRoot(root)}; ` +
+      `adopting ${picked} (same repo, has verified entries) as the git-op root`,
+  );
+  return picked;
+}
+
+// #3255: a git op whose root differs from the root verification recorded cannot
+// be compared hash-for-hash — the two sides are different trees. Say so in the
+// transcript, naming both paths, instead of presenting as an unexplained
+// per-file hash mismatch (which reads as "the gate is broken" and invites a
+// bypass). This only NARRATES; the block/mismatch decision is unchanged and
+// stays fail-closed.
+function diagnoseRootMismatch(root: string): void {
+  const roots = bridgeRoots();
+  const norm = normalizeWorktreeRoot(root);
+  if (roots.length === 0 || roots.some((r) => normalizeWorktreeRoot(r) === norm)) return;
+  const mine = gitCommonDir(root);
+  if (mine === null) return;
+  const siblings = roots.filter((r) => gitCommonDir(r) === mine);
+  if (siblings.length === 0) return;
+  console.log(
+    `[verification-gate] ⚠ #3255: this git op resolves to ${norm}, but the bridge holds verified entries for ` +
+      `${siblings.join(", ")} (same repo). Those are different trees, so hashes cannot be compared — ` +
+      `re-run the op from the verified tree (cd into it) or re-dispatch verification for ${norm} (#3255).`,
+  );
+}
+
 function writeBridge(projectRoot: string, files: string[]): void {
   try {
     // #190 review: the bridge is a same-user trust channel — 0o700/0o600 so
@@ -296,6 +408,11 @@ function clearBridge(): void {
 // called on session_shutdown (a sub-agent's shutdown must not delete the
 // parent's bridge; print-mode sub-agents fire session_shutdown on exit).
 let lastRecoveryMtime = 0;
+// #3255: the recovery cache must also key on WHICH root was recovered. A bare
+// `git push` from a hub session resolves the hub root first and the worktree
+// root later; without this the mtime guard would skip the second recovery and
+// the verified entries would stay invisible for the rest of the session.
+let lastRecoveredRoot = "";
 
 function recoverBridgeForRoot(normRoot: string): number {
   try {
@@ -303,8 +420,9 @@ function recoverBridgeForRoot(normRoot: string): number {
     // Perf guard: skip when the bridge hasn't been written since our last
     // recovery — nothing new to recover (mtime granularity edge cases are
     // fail-closed: a skipped recovery just means a re-block + re-verify).
-    if (st.mtimeMs <= lastRecoveryMtime) return 0;
+    if (st.mtimeMs <= lastRecoveryMtime && lastRecoveredRoot === normRoot) return 0;
     lastRecoveryMtime = st.mtimeMs;
+    lastRecoveredRoot = normRoot;
   } catch {
     // No bridge (or unreadable) — nothing to recover. Corrupt JSON is
     // handled inside readBridge (returns null).
@@ -814,7 +932,26 @@ function redactCommand(command: string): string {
 
 // #472: shared gate_skip audit — field shape identical to the #204 merge-scope
 // skip (:1105) so all skip surfaces stay audit-synced (#60).
-function logGateSkip(reason: string, command: string, cwd: string, extra: Record<string, unknown> = {}): void {
+//
+// #755: the reason union is DERIVED from one runtime constant so a live call
+// site cannot be excluded by the type. Each literal is written in EXACTLY ONE
+// place (duplicate array members are asserted against in Task 8's tripwire).
+const MERGE_SCOPE_DECISION_REASONS = [
+  "cross_repo",
+  "head_mismatch",
+  "same_repo_head_match",
+  "same_repo_head_unknown",
+] as const;
+const GATE_SKIP_REASONS = [
+  "push_range_empty",
+  "delete_push_no_content",
+  "content_shape_exempt",
+  ...MERGE_SCOPE_DECISION_REASONS,
+  ...SUBTRACT_SKIP_REASONS,
+] as const;
+export type GateSkipReason = (typeof GATE_SKIP_REASONS)[number];
+
+function logGateSkip(reason: GateSkipReason, command: string, cwd: string, extra: Record<string, unknown> = {}): void {
   appendJsonl({
     event: "gate_skip",
     extension: "verification-gate",
@@ -828,7 +965,7 @@ function logGateSkip(reason: string, command: string, cwd: string, extra: Record
 
 export interface MergeScopeDecision {
   verify: boolean;
-  reason: "cross_repo" | "head_mismatch" | "same_repo_head_match" | "same_repo_head_unknown";
+  reason: (typeof MERGE_SCOPE_DECISION_REASONS)[number];
 }
 
 // Pure merge-scope decision (review-enforcer evaluateMergeGate style — I/O
@@ -2115,7 +2252,7 @@ function symbolicRefShort(cwd: string): string | null {
 // branch name is rejected by the whitelist even though neither carries shell
 // metachars → bare pushes over parked WIP keep the staged check (status-quo,
 // pre-#487 behavior).
-export function resolvePushRangeScope(command: string, cwd: string): DiffScope | null {
+export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBundle | null): DiffScope | null {
   const parsed = parsePushRefSpecs(command);
   if (!parsed.eligible) return null; // commit/gh/unmappable/wrapper/no_push — zero subprocess on bare commits
   // Bare push (no refspecs): derive remote + dst + src from the branch config
@@ -2226,12 +2363,39 @@ export function resolvePushRangeScope(command: string, cwd: string): DiffScope |
       diffOut = null;
     }
     if (diffOut === null) return null;
-    const parsed = parseDiffNameStatus(diffOut);
-    union.files.push(...parsed.files);
-    union.renameOldPaths.push(...parsed.renameOldPaths);
-    union.clean = union.clean && parsed.clean;
+    const parsed = parseDiffNameStatusDetailed(diffOut);
+    // #755: per-refspec subtraction, BEFORE the union (subtraction is per-arm,
+    // pre-union — there is no union-level eligibility rule and no consumer for
+    // one). `trackingRef` is `tracking` exactly as derived from `dst` inside
+    // `resolvePushRangeScope` — that local is ALSO the tier input, so it is
+    // never re-derived from srcRef.
+    const subbed = subtractForArm(cwd, parsed.scope, parsed.statuses, sub, {
+      arm: "push",
+      recordedSide: "ref",
+      srcRef: srcRef ?? undefined,
+      trackingRef: tracking,
+    });
+    union.files.push(...subbed.files);
+    union.renameOldPaths.push(...subbed.renameOldPaths);
+    union.clean = union.clean && subbed.clean;
+    if (subbed.subtractions !== undefined) {
+      union.subtractions = [...(union.subtractions ?? []), ...subbed.subtractions];
+    }
   }
   if (union.files.length === 0 && union.renameOldPaths.length === 0 && union.clean) {
+    // #755: suppress push_range_empty when the emptiness was CAUSED by
+    // subtraction — the single emitted line is then the handler's richer
+    // base_identical_satisfied (which carries T/B/merge-base/guard-5 OIDs and
+    // the paths). The rule it would violate is the one stated at the emit site
+    // below: "at most one base_identical_satisfied per op; it may co-exist with
+    // a per-path reason". A per-path reason and this op-level line CAN both
+    // appear; push_range_empty must not, because it occupies the SAME op-level
+    // slot and would misreport a full subtraction as an up-to-date push.
+    // emitting only the bare push_range_empty would make a forged-T full
+    // subtraction indistinguishable from a legitimate up-to-date push.
+    // `subtractions` is ABSENT (not []) on the ordinary no-subtraction push,
+    // so the `?? 0` is load-bearing — a bare `.length` throws on the common path.
+    const subtractedSomething = (union.subtractions?.length ?? 0) > 0;
     // Up-to-date push ships nothing — audited INSIDE the resolver so the
     // caller's shared silent empty-allow never hides the range decision.
     // Note: with multi-refspec commands the tier payload is "A" iff ANY
@@ -2248,13 +2412,18 @@ export function resolvePushRangeScope(command: string, cwd: string): DiffScope |
     // same trust class (the gate never saw remote-side-only files — identical
     // to computeBranchDiff's origin/main staleness); the pull --rebase
     // pre-push ceremony (01-preflight) refreshes it.
-    logGateSkip("push_range_empty", command, cwd, { tier: sawTierA ? "A" : "B" });
-    return { files: [], renameOldPaths: [], clean: true };
+    if (!subtractedSomething) logGateSkip("push_range_empty", command, cwd, { tier: sawTierA ? "A" : "B" });
+    return { files: [], renameOldPaths: [], clean: true, ...(subtractedSomething ? { subtractions: union.subtractions } : {}) };
   }
+  // Fresh object ⇒ any field not explicitly rebuilt is dropped. `subtractions`
+  // is therefore carried explicitly and null-safely.
   return {
     files: Array.from(new Set(union.files)),
     renameOldPaths: Array.from(new Set(union.renameOldPaths)),
     clean: union.clean,
+    ...(union.subtractions !== undefined && union.subtractions.length > 0
+      ? { subtractions: union.subtractions }
+      : {}),
   };
 }
 
@@ -2276,6 +2445,10 @@ export interface DiffScope {
   renameOldPaths: string[];
   /** NUL-stream parsed without anomaly (false ⇒ parse-block, never allow) */
   clean: boolean;
+  /** #755: per-arm merge-scope subtraction audit. ABSENT (never `[]`) when
+   *  nothing was subtracted. `combineScopes` concatenates it and reads nothing
+   *  else, so `DiffScope`-shaped literals without the key stay valid. */
+  subtractions?: SubAudit[];
 }
 
 // Pure `--name-status -z` parser. Row grammar (byte-exact, verified against
@@ -2295,13 +2468,33 @@ export interface DiffScope {
 // semantics (documented residual, #559 plan §1); only a NUL-stream anomaly is
 // newly fail-closed.
 export function parseDiffNameStatus(output: string): DiffScope {
+  // Thin wrapper — the seven G1 full-object deepEqual pins compare `.scope`, so
+  // splitting the parser must not change the returned object's shape.
+  return parseDiffNameStatusDetailed(output).scope;
+}
+
+/** #755 — the same parse, plus the per-path STATUS map the eligibility rule
+ *  needs (`A`/`M` are subtractable; `D`/`T`/`R`/`C`/`U`/`X`/`B` are not).
+ *  R/C rows key the NEW path (the path that lands in `files`). An anomaly
+ *  yields a PARTIAL map consistent with `files` and `clean: false` — the
+ *  parse-block runs first, so a partial map is never consulted.
+ *
+ *  Home: `index.test.ts` owns the row-family pins. It must NOT be tested from
+ *  subtract-scope.test.ts, which must stay SDK-free (index.ts:2 is a value import). */
+export function parseDiffNameStatusDetailed(output: string): {
+  scope: DiffScope;
+  statuses: Map<string, string>;
+} {
   const files: string[] = [];
   const renameOldPaths: string[] = [];
-  if (output === "") return { files, renameOldPaths, clean: true };
+  const statuses = new Map<string, string>();
+  if (output === "") return { scope: { files, renameOldPaths, clean: true }, statuses };
   // NUL contract: every git -z stream is NUL-terminated (each row's last
   // path column ends with NUL). A non-empty stream lacking the final
   // terminator is truncated → anomaly (fail-closed).
-  if (!output.endsWith("\0")) return { files, renameOldPaths, clean: false };
+  if (!output.endsWith("\0")) {
+    return { scope: { files, renameOldPaths, clean: false }, statuses };
+  }
   const tokens = output.split("\0");
   // Trailing NUL terminator: git ends every row's last path column with NUL.
   if (tokens.length > 0 && tokens[tokens.length - 1] === "") tokens.pop();
@@ -2319,15 +2512,30 @@ export function parseDiffNameStatus(output: string): DiffScope {
       if (tokens[i] === "" || tokens[i + 1] === "") { clean = false; break; } // empty path column — defensive symmetry with the name-only branch (fail-closed)
       renameOldPaths.push(tokens[i]);
       files.push(tokens[i + 1]);
+      statuses.set(tokens[i + 1], letter);
       i += 2;
     } else {
+      // #755: git appends a similarity score to a single-path row in exactly one
+      // case — `M`, for file rewrites. git-diff(1) RAW OUTPUT FORMAT: "Status
+      // letter M may be followed by a score (denoting the percentage of
+      // dissimilarity) for file rewrites" (R/C always carry one, but those are
+      // 3-field rows handled above). A score on any OTHER single-path letter
+      // (A/D/T/U/X/B) is not producible by git → anomaly, fail closed.
+      //
+      // ⛔ An earlier version of this guard rejected `M<score>` too, on the false
+      // premise that scores appear only on R/C rows; `git diff -B --name-status -z`
+      // emits `M100` for a rewrite, so that would have hard-blocked a legitimate
+      // op the moment any gate diff command gained `-B`. The gate passes no `-B`
+      // today, so it was latent — but the invariant was wrong as written.
+      if (m[2] !== "" && letter !== "M") { clean = false; break; }
       if (i >= tokens.length) { clean = false; break; }
       if (tokens[i] === "") { clean = false; break; } // empty path token
       files.push(tokens[i]);
+      statuses.set(tokens[i], letter);
       i++;
     }
   }
-  return { files, renameOldPaths, clean };
+  return { scope: { files, renameOldPaths, clean }, statuses };
 }
 
 function execDiffStatusZ(cwd: string, cmd: string): string | null {
@@ -2344,11 +2552,19 @@ function execDiffStatusZ(cwd: string, cmd: string): string | null {
 // clean AND over the members). Pure + exported (unit-pinned — the mixed arm's
 // combination rule is otherwise comment-only).
 export function combineScopes(a: DiffScope, b: DiffScope): DiffScope {
-  return {
+  const core: DiffScope = {
     files: Array.from(new Set([...a.files, ...b.files])),
     renameOldPaths: Array.from(new Set([...a.renameOldPaths, ...b.renameOldPaths])),
     clean: a.clean && b.clean,
   };
+  // #755: concatenate the per-arm subtraction audits, null-safely AND
+  // absence-preservingly — `[...a.subtractions, ...]` would throw
+  // `undefined is not iterable` on the G4 literals (index.test.ts:3188/3189/
+  // 3194) and on every ordinary scope, while always materialising `[]` would
+  // falsify the "absent, never []" contract the emit site keys on.
+  // Reads NOTHING else on `a`/`b`, so the G4 pins stay green.
+  const subs = [...(a.subtractions ?? []), ...(b.subtractions ?? [])];
+  return subs.length > 0 ? { ...core, subtractions: subs } : core;
 }
 
 function resolveGitRoot(cwd: string): string {
@@ -2363,13 +2579,51 @@ function resolveGitRoot(cwd: string): string {
   }
 }
 
+// #755: shared per-arm subtraction wrapper. Placed here because all five
+// producers route through it — it is the ONLY place a producer gets a ctx, and
+// `makeGitSubCtx` is called HERE (the producer owns `arm`/`recordedSide`), so a
+// caller can never supply a valid-but-wrong recorded side.
+function subtractForArm(
+  cwd: string,
+  scope: DiffScope,
+  statuses: Map<string, string>,
+  sub: SubBundle | null | undefined,
+  args: { arm: "staged" | "worktree" | "wtPath" | "branch" | "push"; recordedSide: "index" | "worktree" | "wtPath" | "ref"; pathspecs?: string[]; srcRef?: string; trackingRef?: string }
+): DiffScope {
+  // No bundle ⇒ no subtraction. This is the kill switch and the six `null`
+  // wiring positions.
+  if (sub === undefined || sub === null) return scope;
+  // A parse anomaly routes an unconditional parse-block downstream; the
+  // status map is PARTIAL, so it must never be consulted.
+  if (!scope.clean) return scope;
+  try {
+    const ctx = makeGitSubCtx(cwd, { bundle: sub, ...args });
+    if (ctx === null) return scope;
+    const r = args.arm === "push"
+      ? subtractPushArm(scope, statuses, ctx)
+      : subtractCommitArm(scope, statuses, ctx);
+    // The coupled invariant, failing CLOSED: a scope that shrank without an
+    // audit returns the producer's OWN unchanged scope — never a throw (a
+    // clean over-gate with an audit line beats a hard "Extension failed"
+    // abort, which would block the op either way).
+    if (r.audit === null) return scope;
+    if (r.scope.files.length === scope.files.length) return scope;
+    return { ...r.scope, subtractions: [r.audit] };
+  } catch {
+    // Fail closed: over-gate, never under-gate.
+    return scope;
+  }
+}
+
 // Staged scope — `git diff --cached`. A git-level failure (missing repo,
 // corrupt index) keeps the legacy catch→empty status quo (the op itself will
 // fail at git commit time); parse ANOMALIES inside the NUL stream are the
 // fail-closed layer and set clean=false.
-function runStagedScope(cwd: string): DiffScope {
+function runStagedScope(cwd: string, sub?: SubBundle | null): DiffScope {
   const out = execDiffStatusZ(cwd, "git diff --cached --name-status -z");
-  return out === null ? { files: [], renameOldPaths: [], clean: true } : parseDiffNameStatus(out);
+  if (out === null) return { files: [], renameOldPaths: [], clean: true };
+  const { scope, statuses } = parseDiffNameStatusDetailed(out);
+  return subtractForArm(cwd, scope, statuses, sub, { arm: "staged", recordedSide: "index" });
 }
 
 // #489: the file set a sweep commit (`git commit -a`/`--all`) actually records — the
@@ -2379,18 +2633,21 @@ function runStagedScope(cwd: string): DiffScope {
 // permission) is logged and falls back to the staged scope (status-quo semantics; a
 // genuinely broken repo fails at `git commit` time anyway) — accepted residual, see the
 // #489 plan surface-map row 2.
-function runWorktreeScope(cwd: string): DiffScope {
+function runWorktreeScope(cwd: string, sub?: SubBundle | null): DiffScope {
   try {
     execSync("git rev-parse --verify HEAD", { encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore" });
   } catch {
-    return runStagedScope(cwd); // unborn HEAD
+    // Unborn HEAD. Passes NO bundle: the recorded side switches to the index,
+    // so forwarding a worktree ctx would subtract branch-authored content.
+    return runStagedScope(cwd, null);
   }
   const out = execDiffStatusZ(cwd, "git diff HEAD --name-status -z");
   if (out === null) {
     console.error("[verification-gate] ⚠️ git diff HEAD failed — falling back to staged scope:");
-    return runStagedScope(cwd);
+    return runStagedScope(cwd, null);
   }
-  return parseDiffNameStatus(out);
+  const { scope, statuses } = parseDiffNameStatusDetailed(out);
+  return subtractForArm(cwd, scope, statuses, sub, { arm: "worktree", recordedSide: "worktree" });
 }
 
 // #538: the file set a WT-path commit (`git commit <pathspec>` / `-o`/`--only` /
@@ -2412,28 +2669,34 @@ function shellQuoteSingle(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
-function runWtPathScope(cwd: string, pathspecs: string[]): DiffScope {
+function runWtPathScope(cwd: string, pathspecs: string[], sub?: SubBundle | null): DiffScope {
   try {
     execSync("git rev-parse --verify HEAD", { encoding: "utf-8", cwd, timeout: 5000, stdio: "ignore" });
   } catch {
-    return runStagedScope(cwd); // unborn HEAD — staged set ⊇ what only-mode can record
+    return runStagedScope(cwd, null); // unborn HEAD — staged set ⊇ what only-mode can record
   }
   const cmd = `git diff HEAD --name-status -z -- ${pathspecs.map(shellQuoteSingle).join(" ")}`;
   const out = execDiffStatusZ(cwd, cmd);
   if (out === null) {
     console.error("[verification-gate] ⚠️ git diff HEAD -- <pathspecs> failed — falling back to staged scope:");
-    return runStagedScope(cwd);
+    return runStagedScope(cwd, null);
   }
-  return parseDiffNameStatus(out);
+  const { scope, statuses } = parseDiffNameStatusDetailed(out);
+  return subtractForArm(cwd, scope, statuses, sub, { arm: "wtPath", recordedSide: "wtPath", pathspecs });
 }
 
 // Branch scope (`gh pr create` + the merge-scope verify path) — origin/main...HEAD.
 // Exec failure → clean-empty preserves the documented status-quo catch→[] fail-open
 // precedent (#559 plan §1 residual; availability rationale — non-main-default repos and
 // transient timeouts must not hard-block).
-function runBranchScope(cwd: string): DiffScope {
+function runBranchScope(cwd: string, sub?: SubBundle | null): DiffScope {
   const out = execDiffStatusZ(cwd, "git diff origin/main...HEAD --name-status -z");
-  return out === null ? { files: [], renameOldPaths: [], clean: true } : parseDiffNameStatus(out);
+  if (out === null) return { files: [], renameOldPaths: [], clean: true };
+  const { scope, statuses } = parseDiffNameStatusDetailed(out);
+  // Live arm: R = HEAD, B = HEAD, T = the RESOLVED trusted base (NOT the
+  // hardcoded origin/main this diff uses — when the branch tracks a non-origin
+  // remote those differ, and the arm can fire legitimately).
+  return subtractForArm(cwd, scope, statuses, sub, { arm: "branch", recordedSide: "ref", srcRef: "HEAD" });
 }
 
 // #540 M2 — the record-set a command's EXECUTED commits will add to the branch when a
@@ -2446,16 +2709,18 @@ function runBranchScope(cwd: string): DiffScope {
 // full-WT fallback for --pathspec-from-file; otherwise (bare/amend/vacuous) → staged.
 // The caller unions this with runBranchScope — never replaces it (pre-existing branch
 // commits not recorded by THIS command stay in scope).
-function ghCommitRecordScope(command: string, cwd: string): DiffScope {
+function ghCommitRecordScope(command: string, cwd: string, sub?: SubBundle | null): DiffScope {
+  // Router only — it threads the bundle to whichever producer it delegates to;
+  // each delegate builds its own ctx with its own arm/recordedSide.
   const scls = commitSweepClass(command);
-  if (scls === "sweep") return runWorktreeScope(cwd);
-  if (scls === "mixed") return combineScopes(runStagedScope(cwd), runWorktreeScope(cwd));
+  if (scls === "sweep") return runWorktreeScope(cwd, sub);
+  if (scls === "mixed") return combineScopes(runStagedScope(cwd, sub), runWorktreeScope(cwd, sub));
   const wp = wtPathCommitInfo(command);
   if (wp !== null) {
-    const namedWt = wp.pathspecFromFile ? runWorktreeScope(cwd) : runWtPathScope(cwd, wp.pathspecs);
-    return combineScopes(runStagedScope(cwd), namedWt);
+    const namedWt = wp.pathspecFromFile ? runWorktreeScope(cwd, sub) : runWtPathScope(cwd, wp.pathspecs, sub);
+    return combineScopes(runStagedScope(cwd, sub), namedWt);
   }
-  return runStagedScope(cwd);
+  return runStagedScope(cwd, sub);
 }
 
 // ── Pure gate decision (#559 T1) ─────────────────────
@@ -2919,7 +3184,7 @@ export default function (pi: ExtensionAPI) {
     // #190: recover verification state from the bridge, root-filtered + stored-
     // hash match-or-drop. (Replaces the blind loader — the bridge now persists
     // compound keys with verifier-authoritative hashes.)
-    const sessionRoot = normalizeWorktreeRoot(resolveGitRoot(process.cwd()));
+    const sessionRoot = normalizeWorktreeRoot(recoveryOnlyRoot(resolveGitRoot(process.cwd())));
     const recovered = recoverBridgeForRoot(sessionRoot);
     if (recovered > 0) {
       console.log(`[verification-gate] 📂 Recovered ${recovered} verified files from bridge`);
@@ -2982,7 +3247,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── tool_call: block git/gh ops ────────────────────
-  pi.on("tool_call", async (event, _ctx): Promise<ToolCallEventResult | undefined> => {
+  pi.on("tool_call", async (event, ctx): Promise<ToolCallEventResult | undefined> => {
     if (!isToolCallEventType("bash", event)) return undefined;
     if (!extensionEnabled) return undefined;
 
@@ -3009,9 +3274,17 @@ export default function (pi: ExtensionAPI) {
     // lint-staged (pre-commit hook) may have modified files (ESLint --fix),
     // changing their hashes. Capture the post-lint state before the next check.
     // Determine cwd — prefer cd prefix in command (worktree support)
-    const inputCwd = event.input.cwd ? String(event.input.cwd) : process.cwd();
+    // #3255: prefer the cwd the runtime actually spawns this command in. It is
+    // the authoritative base for the git op; `process.cwd()` is only the last
+    // resort (and is the HUB when the session runs there while the change lives
+    // in a linked worktree — the original bug).
+    const ctxCwd = typeof (ctx as { cwd?: unknown } | undefined)?.cwd === "string"
+      ? (ctx as { cwd: string }).cwd
+      : null;
+    const inputCwd = event.input.cwd ? String(event.input.cwd) : (ctxCwd ?? process.cwd());
     const cdPath = extractCdPath(command);
     const cwd = resolveGitRoot(cdPath ?? inputCwd);
+    diagnoseRootMismatch(cwd);
 
     // #190: mid-session bridge recovery FIRST — defense-in-depth for the
     // incident's event-miss class (a merge that landed via another path, e.g.
@@ -3126,11 +3399,22 @@ export default function (pi: ExtensionAPI) {
     // the named-path record-set when a commit executes (#540 M2).
     // Pure detector (zero subprocess) — commit-bearing commands still resolve fast.
     const wtPath = wtPathCommitInfo(command);
+    // #755 — read the kill switch ONCE per op, then build the OP-LEVEL bundle
+    // ONCE. The bundle (not a ctx) is threaded below; each producer builds its
+    // own SubCtx inside subtractForArm, so a valid-but-wrong recordedSide has no
+    // syntactic representation. When the flag is set, `sub` is null at every
+    // position ⇒ today's over-broad scope is restored, with one audited marker.
+    const subDisabled = process.env.ELDATO_VGATE_NO_SUBTRACT === "1";
+    const sub: SubBundle | null = subDisabled ? null : makeSubBundle(cwd);
+    if (subDisabled) {
+      console.log("[verification-gate] ℹ️ Merge-scope subtraction disabled (ELDATO_VGATE_NO_SUBTRACT)");
+      logGateSkip("subtract_disabled_by_env", command, cwd); // silence would be inconsistent with ELDATO_SKIP_VGATE, which is audited
+    }
     let scope: DiffScope;
     if (sweepClass !== "none" && !GH_PR_PATTERN.test(command)) {
-      const worktree = runWorktreeScope(cwd);
+      const worktree = runWorktreeScope(cwd, sub);
       scope = sweepClass === "sweep" ? worktree
-        : combineScopes(runStagedScope(cwd), worktree);
+        : combineScopes(runStagedScope(cwd, sub), worktree);
     } else if (GH_PR_PATTERN.test(command)) {
       // #204: `gh pr merge` merges REMOTELY. Only the PR's own repo+head can
       // be verified locally; anything else is unrelated branch residue that
@@ -3162,9 +3446,9 @@ export default function (pi: ExtensionAPI) {
       // the commit). Pure gh pr create (no executed commit) keeps the branch scope below
       // unchanged (scenarios 39/68b pins).
       if (commandRunsCommit(command) && GH_PR_CREATE.test(command)) {
-        scope = combineScopes(runBranchScope(cwd), ghCommitRecordScope(command, cwd));
+        scope = combineScopes(runBranchScope(cwd, sub), ghCommitRecordScope(command, cwd, sub));
       } else {
-        scope = runBranchScope(cwd);
+        scope = runBranchScope(cwd, sub);
       }
     } else if (wtPath !== null) {
       // #538: WT-path commit → union(staged, named-path WT). The named paths'
@@ -3179,9 +3463,9 @@ export default function (pi: ExtensionAPI) {
       // over-gate vs today: WT-path forms are already non-bare (D2), so staged files
       // in the same command were already gate-verified pre-#538.
       const namedWt = wtPath.pathspecFromFile
-        ? runWorktreeScope(cwd)
-        : runWtPathScope(cwd, wtPath.pathspecs);
-      scope = combineScopes(runStagedScope(cwd), namedWt);
+        ? runWorktreeScope(cwd, sub)
+        : runWtPathScope(cwd, wtPath.pathspecs, sub);
+      scope = combineScopes(runStagedScope(cwd, sub), namedWt);
     } else {
       // #487 T1: a content push (no git commit anywhere in the command) verifies
       // the PUSHED RANGE — HEAD vs the remote-tracking ref (tier A, 2-dot) or
@@ -3196,7 +3480,38 @@ export default function (pi: ExtensionAPI) {
       // wrapper-inclusive), no usable base (tier C), any git failure — NEVER []
       // on error (the computeBranchDiff catch→[] fail-open
       // precedent). An empty RESOLVED range is audited push_range_empty inside.
-      scope = resolvePushRangeScope(command, cwd) ?? runStagedScope(cwd);
+      // #755 — the `??` operand serves TWO different commands, and they need
+      // DIFFERENT bundles:
+      //   • a PUSH command: `resolvePushRangeScope` handles it; the operand fires
+      //     only when the push range is unresolvable (tier C / failure) ⇒ pass
+      //     NO bundle (tier-C semantics are a stated non-goal).
+      //   • a COMMIT-bearing command: `resolvePushRangeScope` returns null at its
+      //     eligibility check (it is not a push at all), so the operand IS the
+      //     commit arm and MUST carry the bundle — otherwise the merge leg never
+      //     subtracts (caught by e2e scenario 77).
+      // `parsePushRefSpecs` is a pure classifier (zero subprocess), so asking it
+      // here costs nothing.
+      const pushAttempt = parsePushRefSpecs(command).eligible;
+      const pushScope = resolvePushRangeScope(command, cwd, pushAttempt ? sub : null);
+      scope = pushScope ?? runStagedScope(cwd, pushAttempt ? null : sub);
+    }
+
+    // #755 audit — emitted here, AFTER the chain closes and BEFORE
+    // applyScopeGate, so the full-subtraction ⇒ empty-allow case is
+    // still audited. ⛔ Do not anchor this inside the push branch: that would
+    // skip every commit arm. At most one base_identical_satisfied per op; it
+    // may co-exist with a per-path reason for the same op.
+    if (scope.subtractions !== undefined && scope.subtractions.length > 0) {
+      const removed = new Set<string>();
+      for (const a of scope.subtractions) for (const p of a.perArmSubtracted) removed.add(p);
+      const kept = new Set(scope.files);
+      logGateSkip("base_identical_satisfied", command, cwd, {
+        // Scope-wide: the union of the per-arm removals, FILTERED to paths
+        // absent from the final post-subtraction scope (an arm that removed a
+        // path another arm kept did not subtract it).
+        subtractedPaths: Array.from(removed).filter((p) => !kept.has(p)),
+        arms: scope.subtractions,
+      });
     }
 
     // ⛔ #559 T1 single routing site — load-bearing ordering: applyScopeGate

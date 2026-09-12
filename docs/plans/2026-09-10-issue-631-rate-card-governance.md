@@ -17,7 +17,7 @@ aboutObjects: agent-infra, issue-631, issue-634, issue-701, issue-702, issue-703
 **Branch:** `feat/631-rate-ledger-plan` (worktree `.worktrees/feat/631-rate-ledger-plan`)
 **Research:** `docs/research/2026-09-09-rate-card-governance.md` (see its supersede block)
 **Child issues:** #701 (WS1) · #702 (WS2) · #703 (WS3) · #704 (WS5)
-**Status:** draft for plan-review · **v6.1** — after solution-verify cycles 1–4 (capped), the second-model coherence check, and the wiring check
+**Status:** draft for plan-review · **v7** — after solution-verify cycles 1–4 (capped), the second-model coherence check, the wiring check, and the 2026-09-11 corpus remeasurement
 
 > **Revision history.** *v2* removed the recurring re-check cadence, the named owner, and the upstream
 > freshness oracle (operator is a solo founder; cost is retroactively recomputable, so a schedule bought
@@ -35,7 +35,20 @@ aboutObjects: agent-infra, issue-631, issue-634, issue-701, issue-702, issue-703
 > per-request re-pricer is cut to a **window-level Δ**, committed structural templates are replaced by a
 > diff-only guard, the fixture is an id-set until WS3 lands, the ledger schema is trimmed, and two live holes are
 > closed (the farm copy was an **unguarded** price copy; the pre-registered 09-14 row had **nothing that applied
-> it**).
+> it**). *v7 (2026-09-11) applies a **corpus remeasurement*** — re-done because the corpus is live and the
+> earlier measurement was a 2026-09-10 snapshot — recorded in full in
+> `docs/research/2026-09-11-rate-card-corpus-remeasurement.md`. It corrects five things: (a) the
+> `0.2608/0.7825/0.0083` stamps on `deepseek-v4-flash` are a **session latch acquired in a bounded ~10h
+> session-start window**, not a per-call mixture of two concurrent cards — **0/288 sessions mix the cards**;
+> (b) `deepseek-v4-flash` carries **four** observed cards, not three (the `0.15/0.6/0.003` card is new);
+> (c) `deepseek-v4.1-flash-expires-on-0910` has **one** observed card, so its "pre-correction + HEAD" two-row
+> premise is retained **only as config hygiene**, not evidence; (d) the shipped **and** live `defaultModel` is
+> now `deepseek-flash`, not `…expires-on-0910`; (e) **E5's premise is stale** — `deepseek-flash` **does** now
+> have an own `models.json` row (`0.15/0.6/0.003`), added by hand in `55d3463`. The E5 landmine is therefore
+> defused, but **only by a hand-added row the ledger does not own** — nothing detects its removal, which is
+> precisely the fragility this issue exists to remove. The simplification in (a) collapses the open-ended
+> divergent-card window to a bounded ~10h window affecting six sessions and makes card attribution
+> **per-session exact**. **Documentation only — no code changed.** The v7 edits have not been reviewed.
 
 ### Convergence log (solution-verify)
 
@@ -44,16 +57,16 @@ aboutObjects: agent-infra, issue-631, issue-634, issue-701, issue-702, issue-703
 | 1 | 2 parallel | 10, all propagation-class (a false "load-bearing for routing" claim; a surviving expiry gate; an unsourced coverage check; an unreadable ledger path; an inexact `--usage-rows`; missing row structure; an undefined pre-history render; an unwired test suite; a falsified research headline) | fixed as v3 |
 | 2 | 2 parallel | corrections were applied only *partially* — expiry survived in §2/§3.2/§8, WS4 survived in the decomposition map, "5 surfaces" was fixed in one place only; plus a NEW gap: the farm copy meant an ad-hoc ledger fix would never reach the runtime report | **document rewritten clean as v4** |
 | 3 | 1 independent, corpus-measuring | 2 P1s that **falsified v4's measurement model**: (a) `frozen ≠ render(ts)` → BLOCK was wrong (several cards in history; the live-only id was in no base layer, so `render(ts)` was undefined for its records); (b) **failover hop legs** (`qwen-tp`, `openrouter/deepseek/deepseek-v4-pro`) were a sixth price surface, byte-identical to the 7,124 mystery stamps | fixed as v5 |
-| 4 | 1 independent, corpus-measuring | v5's replacement premise was **still wrong**: the `0.14` and `0.2608` cards were **concurrent**, not sequential — both live every day Sep-5→Sep-10 — so **no single-valued `render(ts)` can reconcile them**; plus AC1 unsatisfiable against `tests/fixtures/**`+`docs/**`, a missing `v4-pro` hop leg, a "both retired ids" tombstone contradiction that would delete the 102k-call id, an under-specified seed set, count/card-label drift, and `surface` enum drift | all applied |
+| 4 | 1 independent, corpus-measuring | v5's replacement premise was **still wrong**: the `0.14` and `0.2608` cards were **concurrent**, not sequential — both live every day Sep-5→Sep-10 **[refined at v7: the concurrency is a session latch in a bounded ~10h session-start window; 0/288 sessions mixed the cards]** — so **no single-valued `render(ts)` can reconcile them**; plus AC1 unsatisfiable against `tests/fixtures/**`+`docs/**`, a missing `v4-pro` hop leg, a "both retired ids" tombstone contradiction that would delete the 102k-call id, an under-specified seed set, count/card-label drift, and `surface` enum drift | all applied |
 | **coherence** | 1 (second model) | **COHERENT WITH RESERVATIONS**: the re-pricer was the single most expensive workstream for a number with **no decision consumer** (the same admission §2 makes about the runtime scalar, never extended to WS3); structural templates were a **second hand-authored source**; and two live holes — the **farm copy was unguarded** (guard inverted: the surfaces pi stamps from are protected, the measurement's own input is not) and the **pre-registered 09-14 row had no trigger** ("ad-hoc, no owner" vs dated correctness) | v6 |
-| **wiring** | 1 (Phase 6) | **3 P1s**: the 09-14 pre-registered row was still unapplyable (excluded from *both* render keys) → fixed by a period-keyed **`renderNow()`**; **nothing invoked `render.py` in write mode** → the `sync.sh` write step; the extension test matched **no** CI workflow → explicit wiring. Plus 2 surfaces (`qwen-tp`, `venice` full `models[]` rows) had **no render target** → a 4th surface; and v6's template removal was **not propagated** (5 stale references) — the same class as cycle 2 | v6.1 |
+| **wiring** | 1 (Phase 6) | **3 P1s**: the 09-14 pre-registered row was still unapplyable (excluded from *both* render keys) → fixed by a period-keyed **`renderNow()`**; **nothing invoked `render.py` in write mode** → the `sync.sh` write step; the extension test matched **no** CI workflow → explicit wiring. Plus 2 surfaces (`qwen-tp`, `venice` full `models[]` rows) had **no render target** → a 4th surface; and v6's template removal was **not propagated** (5 stale references) — the same class as cycle 2 | v7 |
 
 **⚠️ Capped at 4 cycles — 3 representative items remain (unverified).** On cap the AGENTS.md procedure applies:
 "document remaining issues … proceed". The coherence check and the wiring check were therefore run **post-cap**,
 i.e. the Phase 5.6 precondition ("after solution-verify converges clean") was **knowingly not met** — recorded
 here rather than glossed. No further **solution-verify** cycle ran after cycle 4; the v6 cuts were reviewed
 only by the Phase-6 wiring check (which found a v6 defect — five unpropagated template references), and the
-v6.1 fixes have not been re-reviewed at all. On the cap citation: AGENTS.md states a **per-reviewer** 4-cycle
+v7 fixes have not been re-reviewed at all. On the cap citation: AGENTS.md states a **per-reviewer** 4-cycle
 cap, and cycles 3–4 were single fresh reviewers, so this is a **global** cycle-stop rather than a per-reviewer
 cap being hit — the disclosure is deliberately conservative in the direction of "less verified", not more.
 Cycle 4's own fixes were likewise applied without a re-review. The convergence log above carries the full list;
@@ -82,7 +95,7 @@ plan's position is that this is **measured, not solved** (§2, §8).
 | E2 | `modelOverrides[id].cost` **merges per-field** onto the resolved model, and runs **topmost** | `provider-composer.js:25–45`, `:304` | A third, better-owned surface: cost + clamp **without duplicating a whole model row** |
 | E3 | `models.json` `models[]` = **per-id replace**; extension `models[]` = **wholesale replace** | `applyModelsJson` `:107–116` vs `applyExtension` `:118–125` | Confirms the layering; the OpenRouter extension's 3-entry array is the **only** price for its hop-legs |
 | E4 | Store freshness gate: an overlay is dropped when `lastModified <= builtinGeneratedAt` | `dist/core/remote-catalog-provider.js:32–41`, fed by pi-ai `providers/data/.manifest.json` `generatedAt: 2026-09-05T11:58:56Z` | Shipped `pi-config/models-store.json` (`lastModified` 2026-07-31) is **provably inert** |
-| E5 | **D4:** the canonical current id is priced at **PEAK** — `deepseek-flash` has no `models.json` row, so the store's peak values apply | live store `deepseek-flash` = `0.3/1.2/0.006` (= 2× off-peak) | Migrating the fleet default to it **without an explicit own row** silently moves the fleet onto peak basis |
+| E5 | **D4:** the canonical current id is priced at **PEAK** — `deepseek-flash` **had** no `models.json` row, so the store's peak values applied *(v7: an own row **now exists** at `0.15/0.6/0.003` — added by hand in `55d3463`, "cover canonical deepseek-flash + dotted v4.1 ids"; the landmine is therefore defused **only** by a hand-added row the ledger does not own)* | live store `deepseek-flash` = `0.3/1.2/0.006` (= 2× off-peak); own row = `0.15/0.6/0.003` | Migrating the fleet default to it **without an explicit own row** silently moves the fleet onto peak basis — and with the row present but **unledgered**, nothing detects its removal |
 | E6 | `ModelCost.tiers[]` is keyed on `inputTokensAbove`; **no time or date dimension**. `calculateCost` bills `input`, `output`, `cacheRead`, `cacheWrite` (plus an Anthropic-only `cacheWrite1h` 2× term) and does **not** bill `reasoning` separately | `pi-ai/dist/types.d.ts:705–714`, `pi-ai/dist/models.js:530–548`; arithmetic reproduced on a live record | The runtime schema cannot express peak/off-peak or a dated re-route. It also **pins the re-pricer's formula** |
 | E7 | `modelFromJson` builds a **fresh** object from the definition, defaulting `contextWindow ?? 128000`, `maxTokens ?? 16384`, `reasoning ?? false`, `input ?? ["text"]`, and taking `compat` only from the definition/provider (it does not inherit the replaced row) | `provider-composer.js:60–77` | An own row rendered from `cost` alone silently downgrades the model — **and passes `check-cost-config.sh`** (which blocks only `>300000`) |
 
@@ -92,17 +105,25 @@ plan's position is that this is **measured, not solved** (§2, §8).
 |---|---|---|---|
 | deepseek | `deepseek-v4-flash` | 102,283 | retired id, still accepted & billed as Flash; store no longer lists it → deleting the row reverts to pi-ai's **July** card |
 | openrouter | `deepseek/deepseek-v4-flash` | 4,279 | extension literal `0.0882/0.1764` |
-| deepseek | `deepseek-v4.1-flash-expires-on-0910` | 2,830 | **live `defaultModel`**, in **no** base layer |
+| deepseek | `deepseek-v4.1-flash-expires-on-0910` | 2,830 | in **no** base layer; **was** the live `defaultModel` — now `deepseek-flash` (v7 remeasurement) |
 | deepseek | `deepseek-v4-pro` | 0 | config row, no traffic; the 2026-09-14 date-gate has no historical exposure |
 | anthropic | `claude-opus-4-8` | 1 | not repo-owned → `surface: upstream` |
 
-**The corpus contradicts a "one card at a time" model.** For `deepseek-v4-flash` the cards
-`0.14/0.28/0.0028` (92,871 records) and `0.2608/0.7825/0.0083` (7,124 records) **coexist on every single day**
-Sep-5 → Sep-10 (09-05: 6,995 vs 223 · 09-06: 3,606 vs 1,599 · 09-07: 3,486 vs 1,741 · 09-08: 4,873 vs 1,451 ·
-09-09: 2,301 vs 2,026 · 09-10: 361 vs 84). The second triple is **byte-identical to the shipped `qwen-tp`
-literal**, and the corpus holds **zero** records with `provider = "qwen-tp"` — so those 7,124 records are
-overwhelmingly **failover-hop calls stamped under the primary `deepseek` identity**. This is the single most
-important input to the measurement model (§2): history is not a sequence of cards, it is a **mixture**.
+**Refined at v7 (corpus remeasurement, 2026-09-11): history is a session latch, not a per-day mixture.** For
+`deepseek-v4-flash`, the `0.14/0.28/0.0028` and `0.2608/0.7825/0.0083` cards do **not** coexist per call —
+**0 of 288 sessions contain both**. The `0.2608` stamps are confined to a **bounded ~10-hour session-start
+window**: last pre-window `0.14` session started 2026-09-05T16:41:37Z; window opens 2026-09-05T18:29:39Z; six
+sessions start inside it through 2026-09-06T04:37:52Z; first `0.14` session after is 2026-09-06T14:06:39Z. No
+session started inside the window used `0.14`, and none outside used `0.2608`. Those six long-running sessions
+kept stamping `0.2608` until 2026-09-11T04:19:04Z — which is what made it look like a multi-day mixture. The
+second triple is **byte-identical to the shipped `qwen-tp` literal**, and the corpus holds **zero** records with
+`provider = "qwen-tp"` — so those records are **failover-hop calls stamped under the primary `deepseek`
+identity** — **[INFERENCE]**: diagnosis consistent with git, mechanism unproven (research §4/§6.1). **Simplification this enables:** the divergent-card
+window collapses from an open-ended Sep-5 → Sep-10 mixture to a bounded ~10h session-start window affecting
+**six** sessions, and because no session mixes the two cards, card attribution is **per-session exact** — the
+plan's "single-rate approximation" becomes exact for card selection. `deepseek-v4-flash` also carries a
+**fourth** card, `0.15/0.6/0.003` (first seen 2026-09-11T01:29:50Z), **added at v7**. This is still the single
+most important input to the measurement model (§2) — but it is a **latch**, not a mixture.
 
 ## 1. Problem statement
 
@@ -116,15 +137,17 @@ list; **beats `models.json`**). pi has **no alias mechanism** anywhere.
 Three defects:
 
 1. **Duplicated, unowned price data** across **seven literal surfaces** that disagree: shipped `models.json`
-   (July); `scripts/session-postmortem.sh:252`; live `models.json`, whose two cards appear
-   **concurrently** in the corpus (the July `0.14/0.28/0.0028` and `0.2608/0.7825/0.0083`, the latter
-   **byte-identical to the shipped `qwen-tp` hop-leg literal**); the shipped `qwen-tp` and `venice`
+   (July); `scripts/session-postmortem.sh:252`; live `models.json`, whose two cards are
+   **latched per session** in the corpus rather than mixed per call (the July `0.14/0.28/0.0028` and
+   `0.2608/0.7825/0.0083` — the latter **byte-identical to the shipped `qwen-tp` hop-leg literal**; **0/288
+   sessions mix them**, §0); the shipped `qwen-tp` and `venice`
    rows; shipped `models-store.json` (inert);
-   `extensions/custom-provider-openrouter/index.ts` (frozen July hop-leg literals pricing **4,279 live
+   `extensions/custom-provider-openrouter/index.ts` (frozen July hop-leg literals pricing **4,280 live
    calls**); pi-ai bundled (July). **Cost is stamped into each session record at
    call time**, so the errors are frozen into history and cannot be repaired by any later card edit.
 2. **Id divergence with no alias layer.** `deepseek-v4-flash` (102k calls — deleting its row reverts to the
-   bundled **July** card); `deepseek-v4.1-flash-expires-on-0910` (the live default, in **no** base layer —
+   bundled **July** card); `deepseek-v4.1-flash-expires-on-0910` (was the live default — now `deepseek-flash`,
+   v7 remeasurement; in **no** base layer —
    deleting its row removes the model); `deepseek-v4-pro` (an exact-id shadow of a first-party store row).
    Two different mechanisms → precedence must be decided **per id**.
 3. **No time or date dimension** (E6): neither the peak/off-peak 2× (01:00–04:00 & 06:00–10:00 UTC Mon–Fri)
@@ -153,12 +176,14 @@ the predicate is load-bearing:
      `periodEnd` is null or `today < periodEnd`), the one with the **latest `effectiveFrom`** wins. `renderedAt`
      is irrelevant to this key.
   3. If every row for an id is a tombstone, the tombstone row is emitted as-is.
-  4. **Precedence when an id carries both kinds of row (rule 4 exists because the fleet's live default does
-     exactly this).** If an id has **any** tombstone row, that tombstone row **is** the id's rendered row;
-     every other row for that id is **historical-only** — it exists so `render(ts)` can attribute past calls,
-     and it is **never** selected by `renderNow()`. An id therefore renders **exactly one** row, never two. So
-     for `…expires-on-0910`: the tombstone row (which is also its HEAD row) is what renders; the pre-correction
-     `0.22/0.66/0.007` row is historical-only.
+  4. **Precedence when an id carries both kinds of row (rule 4 exists because the `…expires-on-0910` case
+     needs it; this id was the fleet's default until it moved to `deepseek-flash`, observed at the v7
+     remeasurement).** If
+     an id has **any** tombstone row, that tombstone row **is** the id's rendered row; every other row for that
+     id is **historical-only** — it exists so `render(ts)` can attribute past calls, and it is **never**
+     selected by `renderNow()`. An id therefore renders **exactly one** row, never two. So for
+     `…expires-on-0910`: the tombstone row (its **config-hygiene** HEAD row) is what renders; the **single
+     observed** `0.22/0.66/0.007` row is historical-only.
 
   `today` means the **current UTC instant at render time**; `effectiveFrom` and `periodEnd` are full ISO-8601
   timestamps and the comparisons are timestamp-vs-timestamp (`periodEnd` exclusive). A date-only reading would
@@ -184,12 +209,15 @@ the predicate is load-bearing:
 | `render(ts) ≠ vendor(ts)` | the card was stale at that moment — **D1's cost** | escalate as a **bounded stale window** (id, dates, $) |
 | `frozen ≠ vendor(ts)` on peak records, tier-consistent | peak is unstampable at runtime | measured → raw material for **#634** |
 
-**Why history can never BLOCK** (cycle-3/4 finding): `deepseek-v4-flash` carries **five** observed triples in the
-corpus — three real cards (`0.14/0.28/0.0028` ×92,871; `0.2608/0.7825/0.0083` ×7,124; `0.22/0.66/0.007` ×1) plus
-two zero-usage/error variants — and two of them are **live simultaneously** across the whole Sep-5→Sep-10 window.
-So a mismatch at a past timestamp has (at least) three distinct causes, only one of which is a config fault:
-concurrent sources, an incomplete ledger, or a historical hand-edit. Gating CI on it would also red every
-historical re-analysis. **The honest framing: `render(ts)` is *defined*-total, not *match*-total. The ledger is
+**Why history can never BLOCK** (cycle-3/4 finding; card inventory and mixture premise corrected at v7):
+`deepseek-v4-flash` carries **six** observed triples in the corpus — **four** real cards
+(`0.14/0.28/0.0028` ×93,966; `0.2608/0.7825/0.0083` ×7,197; `0.15/0.6/0.003` ×436, **added at v7** and first seen
+2026-09-11T01:29:50Z; `0.22/0.66/0.007` ×1) plus two zero-usage/error variants. The v7 remeasurement shows the
+second of these is **not** a per-call mixture but a **session-scoped latch acquired during a bounded ~10-hour
+window** — **0 of 288 sessions contain both cards** (§0). So a mismatch at a past timestamp still has (at
+least) three distinct causes, only one of which is a config fault: concurrent sources (two cards stamped at one
+instant by different sessions), an incomplete ledger, or a historical hand-edit. Gating CI on it would also red
+every historical re-analysis. **The honest framing: `render(ts)` is *defined*-total, not *match*-total. The ledger is
 expected to be *complete at HEAD* and *approximate over history*; only HEAD is gated, and history divergence is
 reported as an open-ended finding rather than a bounded window.**
 
@@ -273,11 +301,14 @@ Rules that make the guard work:
   **open divergence** (a hop-leg-stamped card cannot be reconciled by any single row). A seeded row's
   `renderedAt` is derived as the **first-seen corpus timestamp** for that triple, recorded in the row's `note`;
   the derivation is a decision, so it is written down rather than inferred at read time.
-- **Ids that exist in no base layer need their own pre-correction row.** The bundled catalog contains no
-  `deepseek-v4.1-flash-expires-on-0910`, so a "seed the bundled card" rule leaves `render(ts)` undefined for its
-  2,830 records. It carries **two** rows: the pre-correction `0.22/0.66/0.007` (renderedAt = Sep-9 edit) and the
-  current one at HEAD. **Only the HEAD row is the rendered card**; the pre-correction row exists so history is
-  priced and the Δ is computable.
+- **Ids that exist in no base layer need at least one own row — and the evidence shows this id has ONE
+  observed card.** The bundled catalog contains no `deepseek-v4.1-flash-expires-on-0910`, so a "seed the bundled
+  card" rule leaves `render(ts)` undefined for its 6,676 records. The 2026-09-11 remeasurement finds the corpus
+  holds **exactly one** card for this id — `0.22/0.66/0.007` (first seen 2026-09-09T20:52:16Z, still live) — with
+  **no** pre/post split at any point, so the **evidenced** history is **one** row. A second row at HEAD
+  (`0.15/0.60/0.003`, the Flash contract per §3.5/AC4) is retained **only as config hygiene**: it is the
+  intended forward rate, not an observed one, and is labelled as such. **Only the HEAD row is the rendered
+  card**; the observed `0.22/0.66/0.007` row exists so history is priced and the Δ is computable.
 - **A past `expiresOn` never removes a row from the render.** It marks id retirement; the renderer keeps
   emitting the own row regardless of the date (otherwise a still-dispatched id silently reverts to a base layer —
   D2). See the `renderNow()` selection rule in §2 for the full predicate.
@@ -371,7 +402,8 @@ consistent but not identical. `surface: upstream` ids are excluded by
 design; **compaction rows are excluded** (they carry no `provider`/`model`). In Slice 0 the fixture is a plain
 **id set** — nothing else needs it until WS3 lands. The **card-aware** detail (one entry per `(id, observed
 price triple)` with `firstSeen`/`lastSeen` and a count) is a **WS3.3** artifact feeding the divergent-card
-report; building it in Slice 0 would be idle machinery. Zero-usage rows (2,382 exist for the two flash ids;
+report; building it in Slice 0 would be idle machinery. Zero-usage rows (2,440 for the two flash ids at the
+2026-09-11 cut — 2,327 for `deepseek-v4-flash` alone;
 `stopReason: error` with `output = input = 0`) yield **no triple** and are skipped rather than dividing by zero.
 
 **Report re-pricer — the shared parser** (the #373 one-parser contract) gains `--usage-rows`, emitting rows
@@ -454,10 +486,10 @@ that directory from **explicit basename allowlists**. So:
 | Case | Id | Mechanism | Why |
 |---|---|---|---|
 | retired but accepted, dispatched | `deepseek-v4-flash` | **own row** (`aliasOf: deepseek-flash`, **no** `expiresOn`) | deleting it reverts to pi-ai July; it is still dispatched and billed, so it must **never** expire |
-| in no base layer, dispatched (live default) | `deepseek-v4.1-flash-expires-on-0910` | **own row + the only `expiresOn` tombstone** (`aliasOf: deepseek-flash`), and migrate the **shipped** `defaultModel` off it | only `models[]` can create an id; **this is the single id that carries `expiresOn`** |
+| in no base layer, dispatched (was the fleet default) | `deepseek-v4.1-flash-expires-on-0910` | **own row + the only `expiresOn` tombstone** (`aliasOf: deepseek-flash`); its HEAD row is **config-hygiene only** | only `models[]` can create an id; **this is the single id that carries `expiresOn`**; the corpus shows **one** observed card (`0.22/0.66/0.007`), so no pre/post split is evidenced (§3.1) |
 | vendor's current id, dispatched | `deepseek-flash` | **own row** | closes D4 (else the store's peak applies) |
 | exact-id shadow of a store row | `deepseek-v4-pro` | **own row** + pre-registered second period from `2026-09-14T04:00:00Z` (the first period gets `periodEnd: 2026-09-14T04:00:00Z`) | the date-gate changes the rate, not the id |
-| **failover hop legs** (`extensions/shared/provider-failover.ts` `ALIAS_FAMILIES`) | `qwen-tp/deepseek-v4-flash-0731`, `qwen-tp/deepseek-v4-pro`, `openrouter/deepseek/deepseek-v4-flash`, **`openrouter/deepseek/deepseek-v4-pro`** | **rendered per leg**, keyed by *leg provider*; the renderer emits **one entry per `ALIAS_FAMILIES` leg**, not from a hand-written list | these are **byte-identical to the 7,124 primary-identity stamps** (`0.2608/0.7825/0.0083`) and to the extension's `deepseek-v4-pro` literal (`0.435/0.87/0.003625`); `qwen-tp` is `DEFAULT_BLOCKED_PROVIDERS`-gated but config-re-enableable, so a hand-listed set would silently drift out of sync |
+| **failover hop legs** (`extensions/shared/provider-failover.ts` `ALIAS_FAMILIES`) | `qwen-tp/deepseek-v4-flash-0731`, `qwen-tp/deepseek-v4-pro`, `openrouter/deepseek/deepseek-v4-flash`, **`openrouter/deepseek/deepseek-v4-pro`** | **rendered per leg**, keyed by *leg provider*; the renderer emits **one entry per `ALIAS_FAMILIES` leg**, not from a hand-written list | these are **byte-identical to the 7,197 primary-identity stamps** (`0.2608/0.7825/0.0083`) and to the extension's `deepseek-v4-pro` literal (`0.435/0.87/0.003625`) — the hop-leg **identity** is an **[INFERENCE]** (diagnosis consistent with git, mechanism unproven; research §4/§6.1); `qwen-tp` is `DEFAULT_BLOCKED_PROVIDERS`-gated but config-re-enableable, so a hand-listed set would silently drift out of sync |
 | non-DeepSeek literal in a rendered surface | `anthropic/claude-opus-4.8` (OpenRouter extension `5/25`), `venice/deepseek-v4-flash` (`0.14/0.28/0.03`) | render from the ledger with `surface: vendor-vendor` | AC1 greps these files, so they must be either rendered or explicitly declared out of scope |
 | clamp-only, never dispatched | `-vision-exp`, `-0813`, `~…latest` | **`modelOverrides`** | no duplication |
 | subscription-class | `qwen-token-plan/public` ids (all 18 entries `$0`) | `surface: subscription`, `$0` **explicit** | per locked decision: $0 is *intended* (subscription), not missing data — recorded in the policy doc so it never reads as an oversight |
@@ -473,14 +505,17 @@ rather than renumbered, so earlier review cycles' references stay traceable.)
 - **WS1 — Ledger + render pipeline + id coverage (blocks all).**
   - 1.1 ledger v1: dated periods; `peakWindows`; the pre-registered 09-14 pro row; the current card per id;
     the **seed set spelled out** — one row per observed card per id (for `deepseek-v4-flash`: the bundled July
-    card; for `…expires-on-0910`: the pre-correction `0.22/0.66/0.007` row **and** its HEAD row), each with its
-    `renderedAt` derived as that triple's **first-seen corpus timestamp** and recorded in `note`. The
-    concurrent `0.2608/0.7825/0.0083` stamps get **no** competing row — they are an open divergence (§2).
+    card, the corrected `0.15/0.6/0.003` card added at v7, and the report-only ×1 `0.22/0.66/0.007`; for
+    `…expires-on-0910`: the **single observed** `0.22/0.66/0.007` row — its HEAD row is **config-hygiene only**,
+    see §3.1), each with its `renderedAt` derived as that triple's **first-seen corpus timestamp** and recorded
+    in `note`. The `0.2608/0.7825/0.0083` stamps get **no** competing row — they are a **session-latched
+    hop-leg card** recorded as an open divergence (§2, §0).
   - 1.2 `render.py`: the **4** rendered surfaces + the 2 assertions + `--check` with the **mode-tagged** assertion
     table (§3.2) + `--write-in-use-fixture`, **and the creation of
     `extensions/custom-provider-openrouter/index.test.ts`** (the artifact; #702 owns only its CI invocation).
-  - 1.3 id migration: explicit `deepseek-flash` own row; **shipped** `defaultModel` → `deepseek-flash`
-    (propagates via `merge_settings`, which is `{**dst, **src}` — there is no separate live edit); **one**
+  - 1.3 id migration: explicit `deepseek-flash` own row; **assert the shipped** `defaultModel` is
+    `deepseek-flash` (already at HEAD; propagates via `merge_settings`, which is `{**dst, **src}` — there is no
+    separate live edit); **one**
     tombstone — `expiresOn` on `…expires-on-0910` **only** (`deepseek-v4-flash` keeps its own row with
     `aliasOf` and no expiry, because it is still dispatched); **extend `check-cost-config.sh`'s matcher** to the new canonical ids
     (`deepseek-flash`, `deepseek-v4.1-*`) so the migrated fleet does not fall outside the clamp guard.
@@ -559,13 +594,17 @@ operator next looks — that is the accepted design (see §3.3), not a solved pr
 
 ## 7. The fleet's default model
 
-The **live** `~/.pi/agent/settings.json` `defaultModel` is `deepseek-v4.1-flash-expires-on-0910` (2,830 calls,
-in **no** base layer, name self-dated); the **shipped** value is `deepseek-v4-flash`.
+The **live** `~/.pi/agent/settings.json` and the **shipped** `pi-bootstrap/pi-config/settings.json`
+`defaultModel` are both now **`deepseek-flash`** (v7 remeasurement, 2026-09-11), and `deepseek-flash` resolves
+to its own row at `0.15/0.6/0.003` — confirmed independently by the corpus. It replaced
+`deepseek-v4.1-flash-expires-on-0910` (2,830 calls at the v6 measurement, in **no** base layer, name self-dated),
+which is **no longer the default**; the earlier shipped value was `deepseek-v4-flash`. The **WS1.3** migration
+is therefore already satisfied at HEAD — what remains is the AC5 assertion, not the move.
 
 1. **Canonical target `deepseek-flash`**, materialized as an **own row** (the store is volatile and peak-form —
    E5/D4).
-2. **Migrate the shipped `defaultModel`**; `merge_settings` is source-wins, so it propagates and there is **no
-   separate live edit**.
+2. **Keep the shipped `defaultModel` at `deepseek-flash`** — already at HEAD, so WS1.3 **asserts** it rather
+   than moving it; `merge_settings` is source-wins, so it propagates and there is **no separate live edit**.
 3. **Tombstone alias row** for `deepseek-v4.1-flash-expires-on-0910` (`aliasOf`, `expiresOn`) so in-flight
    dispatch still resolves. Its expiry is **reported, never a CI failure**, and it **never removes the row from
    the render**. This is the **only** id carrying `expiresOn`.
@@ -590,11 +629,12 @@ temp live dir; the report run from a farm-shaped dir with no `AGENT_INFRA_PATH`)
 **End-to-end:** `render.py --check` clean→0 / hand-edit→1; `tests/rates/run.sh` green **and invoked by CI**;
 `check-cost-config.sh` still green (with the extended matcher); on the real corpus the **staleness Δ**
 (`render(ts)` vs `vendor(ts)`) is large and non-zero on pre-correction records; the **divergent-card report**
-names `deepseek-v4-flash`'s second triple with its `firstSeen`/`lastSeen`, its dominant card (`0.14/0.28/0.0028`,
-≈21.6k records in the Sep-5→Sep-10 window vs 7,124) and its share — i.e. the instrument **detects the known
+names `deepseek-v4-flash`'s second triple with its `firstSeen`/`lastSeen`, the **bounded ~10h session-start
+window** in which six sessions latched it (and the fact that **0/288 sessions mix the two cards**), its
+dominant card (`0.14/0.28/0.0028`) and its share — i.e. the instrument **detects the known
 defect and attributes it to the right cause**, which is the honest version of the earlier "Δ ≈ 0" criterion
 (that criterion was unachievable: two cards were live at once, so some mismatch is structural and expected); the
-**peak Δ** is consistent on peak hours (hour 03 UTC alone carries 5,347 calls, so the peak/off-peak split is not
+**peak Δ** is consistent on peak hours (hour 03 UTC alone carries 5,498 calls at the v7 cut, measured 2026-09-11, so the peak/off-peak split is not
 decoration); hand-editing the postmortem fallback reddens assertion 4; a past `expiresOn` is reported only.
 
 ## 9. Acceptance criteria
@@ -616,11 +656,13 @@ decoration); hand-editing the postmortem fallback reddens assertion 4; a past `e
    ids (deepseek-served + **every** `ALIAS_FAMILIES` leg — `qwen-tp/*`, `openrouter/deepseek/*`);
    `surface: upstream` excluded; compaction excluded. Regenerated by
    `render.py --write-in-use-fixture`.
-4. Every **dispatched** deepseek id has an explicit **own row with explicit `cost`** at the verified current
-   card: `deepseek-flash` / `deepseek-v4-flash` / `…expires-on-0910` off-peak `input 0.15 / output 0.60 /
-   cacheRead 0.003`; `deepseek-v4-pro` `input 0.66 / output 1.98 / cacheRead 0.022` **plus a second period from
-   `2026-09-14T04:00:00Z` at Flash rates**. *(This overrides the issue body's stale `0.22/0.66/0.007`
-   targets — treated as a hypothesis.)*
+4. Every **dispatched** deepseek id has an explicit **own row with explicit `cost`**:
+   `deepseek-flash` / `deepseek-v4-flash` at the observed off-peak `input 0.15 / output 0.60 / cacheRead 0.003`;
+   `…expires-on-0910` carries the **observed** `0.22 / 0.66 / 0.007` row (historical-only — the corpus shows
+   this is its only observed card, first seen 2026-09-09T20:52:16Z and still live) **and** the **intended
+   forward** `0.15 / 0.60 / 0.003` row (the HEAD **config-hygiene** row, per §3.1/§3.5);
+   `deepseek-v4-pro` `input 0.66 / output 1.98 / cacheRead 0.022` **plus a second period from
+   `2026-09-14T04:00:00Z` at Flash rates**.
 5. Shipped `settings.json defaultModel` = `deepseek-flash`; a check fails if it does not resolve to a
    ledger-covered id.
 6. No deepseek-served `models[]` row omits `cost` (the `$0` landmine), and each rendered own row differs from
@@ -682,10 +724,11 @@ thresholds.
     **subscription-class**, recorded in the policy doc so `$0` reads as intent, not oversight. This is a
     **coverage** gap (spend that never appears in local estimates), i.e. **#690's domain**, not a precision
     defect of this plan — noted here only so it is not mistaken for one.
-11. **The mis-stamping window is open-ended, not a bounded interval** — the corpus mixture runs from the July
+11. **The mis-stamping window is open-ended, not a bounded interval** — the record stream runs from the July
     card (first record 2026-08-13) to the present, so the escalation must be a **bounded statement about a
     specific card** (id, observed triple, first/last seen, $), never a percentage tripwire and never a single
-    date range. (2026-08-17 is the vendor's `effectiveFrom`, not the start of the corruption.)
+    date range. (2026-08-17 is the vendor's `effectiveFrom`, not the start of the corruption.) The one
+    exception is the `0.2608` latch, which the v7 remeasurement bounds to a ~10h session-start window (§0).
 
 ## 12. Wiring check (issue-scoping Phase 6)
 
@@ -697,7 +740,7 @@ Every touch point the plan creates or consumes, with its owner. **⚠️** marks
 | `pi-bootstrap/pi-config/models.json` — `providers.<p>.modelOverrides{id}` | render target | #701 (WS1.2, surface 2) | ✅ |
 | `pi-bootstrap/pi-config/models.json` — `providers.<p>.models[]` (non-deepseek) | render target | #701 (WS1.2, surface 4) | ✅ |
 | `extensions/custom-provider-openrouter/index.ts` | render target | #701 (WS1.2, surface 3) | ✅ |
-| `pi-bootstrap/pi-config/settings.json` — `defaultModel` | consumer | #701 (WS1.3, via `merge_settings` source-wins) | ✅ |
+| `pi-bootstrap/pi-config/settings.json` — `defaultModel` | consumer | #701 (WS1.3, **asserts** the already-HEAD `deepseek-flash`; via `merge_settings` source-wins) | ✅ |
 | `pi-bootstrap/pi-config/models-store.json` | delete | #701 (WS1.4) | ✅ |
 | `.husky/pre-commit` | guard | #702 (WS2.1) | ✅ |
 | `.github/workflows/ci.yml` + `ci-main.yml` — `rates` job | guard | #702 (WS2.1) | ✅ |
@@ -737,10 +780,10 @@ Every touch point the plan creates or consumes, with its owner. **⚠️** marks
 WS5.1 + WS5.3.
 
 Deliverables: ledger v1 (dated, both tiers, the 09-14 pre-registration, the **full per-id seed set** — one row
-per observed card, with the live-only id carrying both its pre-correction and HEAD rows); `render.py`
+per observed card, with the live-only id carrying its **one observed row** plus a **config-hygiene** HEAD row); `render.py`
 rendering **4** surfaces + 2 assertions with the mode-tagged `--check`; the shipped deepseek block regenerated at
 the verified current card **including an explicit `deepseek-flash` own row** (closes D4) with structure
-preserved; shipped `defaultModel` migrated, with **one** `expiresOn` tombstone (`…expires-on-0910`) and
+preserved; shipped `defaultModel` **asserted** at `deepseek-flash` (already at HEAD), with **one** `expiresOn` tombstone (`…expires-on-0910`) and
 `deepseek-v4-flash` kept un-expired; the extended clamp matcher;
 the `rates` farm in `setup.sh`; the postmortem fallback replaced by a ledger read (so **no USD literal
 survives**); BLOCK-class gates in pre-commit + both CI workflows; the committed coverage fixture; `tests/rates`
@@ -749,7 +792,7 @@ exactly so they land here); the policy doc; the #634 contract recorded in #634. 
 
 **Why:** it stops the bleeding on the two compounding defects — **D1** (one source now renders every surface,
 so **no new** call is stamped from a stale July literal) and **D2** (all three id cases resolved per-id, so
-deleting a row can never silently revert to the July card or remove the live default). WS3 (re-pricing/Δ) is
+deleting a row can never silently revert to the July card or remove an id absent from every base layer). WS3 (re-pricing/Δ) is
 deferred; the ledger's dated fields are designed so it lands **without a schema change**.
 
 **Residual risk carried by Slice 0 alone:** no staleness Δ and no per-record divergent-card window yet (that is

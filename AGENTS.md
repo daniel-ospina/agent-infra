@@ -117,6 +117,8 @@ These conditions define a **clean completion** only. A convergence, stall, abort
 
 This is a **runaway guard, not a quality gate** — review cycles are how quality gets produced, so do not treat the cap as a target, and do not stop early because the count "feels high". Stop on (a) a clean exit (the skill's clean verdict — `NO ISSUES FOUND`, or its defined equivalent), (b) **convergence as the running skill defines it** (issues are a strict subset of the previous cycle's — no new dimensions or files; some skills define this only at their safety cap, e.g. `epic-plan`), (c) a stall signal the skill defines (`fingerprint-stall`, `honest-stuck`, `zero-progress`, stall-guard), (d) an abort the skill defines (`tool-unavailable`, `git-error`, `pr-closed`, fixer push failure), or (e) the bound. Never apply a bound tighter than the skill's own.
 
+The bound applies to the **gate** — the loop, or the area under review — not to an individual reviewer process. Count every cycle (review round) for that gate — not every reviewer process: **dispatching a fresh reviewer does not reset, extend, or replenish the budget.** The fresh-context rule exists to defeat confirmation bias, not to hand the loop a new counter — a gate that has spent its bound has spent it no matter how many distinct reviewer processes were involved. A fresh reviewer is a new *reviewer*, never a new *loop*.
+
 **(b)–(e) are escalation exits, not completions.** They do not satisfy the Exit Conditions above, and the loop must never be reported or handed off as clean or complete **while issues remain** (if the skill's own recovery path resolves them all and a fresh reviewer returns the clean verdict, that is a clean completion under (a)). (Where a skill labels its *zero-issue* exit "convergence" — e.g. `prototype-review` — that is a clean exit under (a), not this rule.) On a non-clean exit → **escalate** — to the orchestrator agent, or to a human wherever a skill requires one (the Auto-Continue pause conditions apply in addition). Document the remaining issues, then follow the skill's own path for that exit **first** — including any mandatory orchestrator recovery (`code-review` Step 6.5, `plan-review`'s deep-fix attempt) — and post **the exact marker the skill's own exit table defines at the point that path specifies**, where it defines one (`code-review` cap → `⚠️ Auto-fix reached the 10-cycle safety cap — unresolved issues remain; escalate to a human`; `test-review` cap → `⚠️ Test review capped at 10 cycles — N issues remain:`). Where the skill defines no marker for that exit, post `⚠️ <the skill's own name for the exit> after N cycles — M issues remain` and record the exit under the skill's own name. Use the skill's own label verbatim — do not invent a cap label for a convergence or stall exit, and do not relabel an exit the skill itself names otherwise:
 
 - **Paths that require a human** (non-exhaustive: `plan-review` → Requires Human Input; `carousel-b2b-copy` → BLOCKED; `code-review` → its convergence exit needs human acknowledgement and its cap/stall exit surfaces to a human via its Step 6.5 recovery; `test-writing` → halts while a P0 remains): **do not proceed past that skill's own halt point.**
@@ -233,9 +235,30 @@ When you encounter a **pre-existing bug** (not introduced by your current work),
 - **Never use sed for multi-line code changes.**
 - **Never use `git add -A`** — always stage specific files.
 - **Prefer the `edit` tool over `write`** for targeted changes to existing files.
-- **Commit messages: always `git commit -F <file>` — never `-m`, never a heredoc.** Write the
-  message with the `write` tool to `/tmp/commit-msg-<branch>.md`, then
-  `git commit -F /tmp/commit-msg-<branch>.md`. Both `-m "…"` and heredocs pass the message
+- **Commit messages: always `git commit -F <file>` — never `-m`, never a heredoc.** The message
+  message file goes in a **repo- and worktree-unique temp directory**, never a shared
+  `/tmp/commit-msg-<branch>.md` — a branch name is unique per repo, not globally, so concurrent
+  sessions in different repos silently overwrite each other's message (#729). The path is
+  `${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md` —
+  `write` the message there (the write tool creates the directory), then commit with `-F`.
+  `--absolute-git-dir` is per-repo AND worktree-aware — a linked worktree gets *its own* gitdir —
+  and its `cksum` names the directory, so cross-repo and cross-worktree collisions cannot happen
+  in practice — a 32-bit digest makes a clash a ~1-in-4-billion coincidence rather than the
+  *guaranteed* clash the old fixed path produced.
+  ⛔ **Never put it under `.git/`.** That was the first attempt and it is refused: the
+  `main-worktree-guard` extension freezes any `.git/…` write as *hub git-metadata* for every
+  unhatched session — the fleet default for `task` children — so the mandated `write` would be
+  blocked and the agent left to improvise. `$TMPDIR` keyed by the git-dir checksum gives the same
+  uniqueness, entirely outside every checkout. (Two sessions in the *same* worktree on the *same*
+  branch still share the file; that case was always racy at the index level anyway.)
+  ⛔ **Every bash tool call is a FRESH SHELL, and one call must not both assign and commit.** A
+  `MSG=…` set in one call is **unset** in the next, so a later `git commit -F "$MSG"` commits from
+  an **empty path** and `rm -f "$MSG"` silently removes nothing (both verified). Assigning `MSG`
+  in the same call as the commit is *also* refused by the verification gate ("in-batch mutation
+  chain"). So put the substitution **inline in the commit command** — no variable:
+  `git commit -F "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"`,
+  then delete the message file in a **separate** call, re-deriving the path the same way.
+  Both `-m "…"` and heredocs pass the message
   through the shell first — backticked spans run as command substitution, `$VAR`/`$(…)` expand,
   `${…}`/`{{ }}` break — and the failure is **silent**: the substitution yields an empty string,
   git accepts the mangled result, and only a human reading the log sees the hole. The
