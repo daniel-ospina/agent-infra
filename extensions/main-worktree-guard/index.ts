@@ -1215,9 +1215,19 @@ function _worktreeDiscardBlockReason(
  *  (reviewer round-8b P1). */
 function _wtXargsPlaceholders(command: unknown): string[] {
   const out: string[] = [];
-  for (const m of String(command ?? "").matchAll(/(?:^|\s)-I\s*("[^"]*"|'[^']*'|\S+)/g)) {
-    const tok = String(m[1] ?? "").replace(/^["']|["']$/g, "");
-    if (tok && tok !== "-") out.push(tok);
+  // Scoped to REAL xargs segments: a bare `-I <arg>` belongs to some other
+  // program too often to harvest globally (`grep -I clean.txt` false-blocked a
+  // clean checkout, reviewer round-10 P2).
+  for (const seg of String(command ?? "").split(/[|;&]/)) {
+    // Accept a PATH-QUALIFIED or QUOTED feeder word (`/usr/bin/xargs`, `"xargs"`)
+    // — scoping to a literal `xargs` word let those spellings hide their `-I`
+    // placeholder and re-opened the round-9 bypass (reviewer round-10 P1).
+    if (!/(?:^|[\s(])(?:[\w./-]*\/)?["']?xargs["']?/.test(seg)) continue;
+    // `-J` is BSD xargs' replstr (macOS); `-I` is the POSIX/GNU one.
+    for (const m of seg.matchAll(/(?:^|\s)-[IJ]\s*("[^"]*"|'[^']*'|\S+)/g)) {
+      const tok = String(m[1] ?? "").replace(/^["']|["']$/g, "");
+      if (tok && tok !== "-") out.push(tok);
+    }
   }
   return out;
 }
@@ -1503,7 +1513,14 @@ function _worktreeDiscardBlock(command: string): string | null {
         // nothing, read the tree as clean and release the discard (reviewer
         // round-8 P2). Not statically resolvable → fail closed.
         d.pathspecs.some((p) => /[{}]/.test(String(p))) ||
-        d.pathspecs.some((p) => xargsPlaceholders.includes(String(p).replace(/^["']|["']$/g, ""))) ||
+        d.pathspecs.some((p) => {
+          const bare = String(p).replace(/^["']|["']$/g, "");
+          // Equality OR a whole path SEGMENT — the placeholder is usually
+          // interpolated INTO a path (`src/@`), but a bare substring test made
+          // `-I c`/`-I .` match nearly every pathspec (`clean.txt`) and blocked a
+          // clean target (reviewer round-10 P2).
+          return xargsPlaceholders.some((t) => t && (bare === t || bare.includes(`${t}/`) || bare.includes(`/${t}`)));
+        }) ||
         d.pathspecs.some((p) => wtIsPlaceholderPathspec(p));
       if (unresolvable) {
         return _worktreeDiscardBlockReason(d, execCwd, "the target pathspec is not statically resolvable");

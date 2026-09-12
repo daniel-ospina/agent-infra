@@ -2546,14 +2546,6 @@ function _wtSubstSpans(text) {
  *  one of these with no resolvable pathspec is conservatively whole-tree). */
 const _WT_FAMILY_VERBS = new Set(["checkout", "restore", "switch", "reset", "checkout-index", "rm", "read-tree", "apply"]);
 
-/** Textual family-verb probe used ONLY by the conservative feeder fallback.
- *  Mirrors index.ts's `_MENTIONS_DISCARD_VERB` (the long verbs are substring
- *  matches; `rm` is word-anchored) — a verb embedded in a path or in the
- *  feeder's payload counts, an unrelated word containing `rm` does not. */
-function _wtTextMentionsFamilyVerb(text) {
-  return /(?:checkout|restore|switch|reset|read-tree|apply)|(?:^|[^A-Za-z0-9_-])rm(?:[^A-Za-z0-9_-]|$)/.test(String(text ?? ""));
-}
-
 /**
  * Payloads a shell interpreter reads from its STDIN: here-strings
  * (`bash <<< 'git checkout -- f'`) and process substitution
@@ -2673,15 +2665,28 @@ export function joinContinuations(command) {
  * accepted (`… | env bash`, `… | bash -x`, `… | sh -s`, `… | 2>/dev/null bash`),
  * not just a bare shell word at end-of-command. The old regex demanded the bare
  * form, so ANY flag or spawner disabled both the piped-file seed and the
- * piped-shell fail-closed arm (reviewer round-9 P1). Code interpreters
- * (python/node/…) count too: a code consumer executes the payload as code.
+ * piped-shell fail-closed arm (reviewer round-9 P1).
+ *
+ * EVERY segment after the first `|` is inspected (a trailing filter used to
+ * re-hide the consumer, `printf 'git checkout -- f\n' | bash | cat` — reviewer
+ * round-10 P1), and an interpreter that carries its OWN code/script operand
+ * reads the pipe as DATA, not code — `python3 -m json.tool`, `bash -c 'wc -l'`
+ * and `bash script.sh` must not fail closed (reviewer round-10 P2). A stdin
+ * ALIAS (`/dev/stdin`, `/dev/fd/0`, `-`) is an ABSENT operand: `python3
+ * /dev/stdin` executes the pipe as a script (reviewer round-10 P1).
  * @param {string} command
  * @returns {boolean}
  */
 export function wtPipelineFeedsShell(command) {
-  const segs = String(command ?? "").split("|");
-  if (segs.length < 2) return false;
-  return _wtHeadInterpreter(segs[segs.length - 1]) !== null;
+  const STDIN_ALIAS = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
+  return String(command ?? "").split("|").slice(1).some((seg) => {
+    const head = _wtHeadInterpreter(seg);
+    if (head === null) return false;
+    const base = basename(String(head));
+    const toks = _wtShellWords(seg);
+    const idx = toks.findIndex((t) => basename(String(t)) === base);
+    return toks.slice(idx + 1).every((t) => t.startsWith("-") || STDIN_ALIAS.test(t));
+  });
 }
 
 /**
@@ -2761,11 +2766,16 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
       // invocation under a feeder whose text names a family verb is exactly as
       // unresolvable as the pathspec-fed form, and gets the same conservative
       // whole-tree descriptor (the effect probe still decides).
-      const fedVerb = _wtTextMentionsFamilyVerb(command);
       for (const u of unhandled) {
         if (u.verb && _WT_FAMILY_VERBS.has(u.verb)) {
           out.push({ form: "feeder-pathspec", scope: "all", pathspecs: [], fromTree: false, verb: u.verb, args: u.args, inv: u.inv });
-        } else if (!u.verb && fedVerb) {
+        } else if (!u.verb) {
+          // A null-verb `git` under a feeder means the SUBCOMMAND comes from the
+          // feed (`printf 'checkout -- f\n' | xargs git`) — the text probe that
+          // gated this was evadable (`printf 'check\'\'out -- f\n' | xargs git`,
+          // `printf 'check\x6fut -- f\n' | xargs git`), so it now fails closed
+          // unconditionally (reviewer round-10 P1). A feeder-fed `git` with a
+          // literal verb (`… | xargs git status`) never reaches this branch.
           out.push({ form: "feeder-verb", scope: "all", pathspecs: [], fromTree: false, verb: "feeder", args: u.args, inv: u.inv });
         }
       }

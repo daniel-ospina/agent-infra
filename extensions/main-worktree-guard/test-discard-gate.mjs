@@ -531,6 +531,19 @@ async function partB() {
       ["piped code into a spawner-wrapped shell (`… | env bash`)", "printf 'git checkout -- dirty.txt\\n' | env bash"],
       ["piped code into a flagged shell (`… | bash -x`)", "printf 'git checkout -- dirty.txt\\n' | bash -x"],
       ["piped code into a stdin-reading shell (`… | sh -s`)", "printf 'git checkout -- dirty.txt\\n' | sh -s"],
+      // ── reviewer round-10 closures ──
+      ["embedded xargs placeholder pathspec (`… | xargs -I@ git checkout -- ./@`)", "printf 'dirty.txt\\n' | xargs -I@ git checkout -- ./@"],
+      ["quote-split verb supplied by the feeder (`printf 'check''out …' | xargs git`)", "printf 'check''out -- dirty.txt\\n' | xargs git"],
+      ["ANSI-escaped verb supplied by the feeder (`printf 'check\\x6fut …' | xargs git`)", "printf 'check\\x6fut -- dirty.txt\\n' | xargs git"],
+      ["piped code followed by a filter (`… | bash | cat`)", "printf 'git checkout -- dirty.txt\\n' | bash | cat"],
+      ["piped code followed by `tee` (`… | bash | tee f`)", "printf 'git checkout -- dirty.txt\\n' | bash | tee /tmp/709-tee.log"],
+      ["spawner-wrapped piped code followed by a filter (`… | env bash | cat`)", "printf 'git checkout -- dirty.txt\\n' | env bash | cat"],
+      // ── reviewer round-10b corrections ──
+      ["path-qualified feeder (`… | /usr/bin/xargs -I@ git checkout -- @`)", "printf 'dirty.txt\\n' | /usr/bin/xargs -I@ git checkout -- @"],
+      ["quoted feeder word (`… | \"xargs\" -I@ git checkout -- @`)", `printf 'dirty.txt\\n' | "xargs" -I@ git checkout -- @`],
+      ["BSD `-J` replstr (`… | xargs -J@ git checkout -- @`)", "printf 'dirty.txt\\n' | xargs -J@ git checkout -- @"],
+      ["stdin-alias script operand (`printf … | python3 /dev/stdin`)", "printf 'import subprocess\\nsubprocess.run([\"git\",\"checkout\",\"--\",\"dirty.txt\"])\\n' | python3 /dev/stdin"],
+      ["stdin-alias script operand (`printf … | node /dev/stdin`)", "printf 'require(\"child_process\").execSync(\"git checkout -- dirty.txt\")\\n' | node /dev/stdin"],
     ];
     for (const [why, cmd] of bypass) {
       const r = await bash(cmd, wt);
@@ -559,6 +572,22 @@ async function partB() {
     // shell fed harmless data.
     expectTrue("B6l: `printf 'hello\\n' | env bash` ALLOWED (piped code with no discard verb)",
       allowed(await bash("printf 'hello\\n' | env bash", wt)), "was blocked");
+    // Reviewer round-10 P2: the placeholder harvest is scoped to real xargs
+    // segments, and a code interpreter with its own code/script operand reads
+    // the pipe as DATA.
+    expectTrue("B6l: `grep -I clean.txt clean.txt ; git checkout -- clean.txt` ALLOWED (`-I` is grep's, not xargs')",
+      allowed(await bash("grep -I clean.txt clean.txt ; git checkout -- clean.txt", wt)), "was blocked");
+    expectTrue("B6l: `git log --grep=reset --oneline | python3 -m json.tool` ALLOWED (pipe is DATA to python)",
+      allowed(await bash("git log --grep=reset --oneline | python3 -m json.tool", wt)), "was blocked");
+    expectTrue("B6l: `git status | python3 -c 'pass' > out-709.txt` ALLOWED (pipe is DATA to python)",
+      allowed(await bash("git status | python3 -c 'pass' > out-709.txt", wt)), "was blocked");
+    // Reviewer round-10b corrections: a shell with its own code/script operand
+    // reads the pipe as DATA, and a one-character `-I` replstr must not turn
+    // every dotted pathspec into a placeholder.
+    expectTrue("B6l: `grep -c checkout clean.txt | bash -c 'wc -l' | tee f` ALLOWED (bash -c reads the pipe as DATA)",
+      allowed(await bash("grep -c checkout clean.txt | bash -c 'wc -l' | tee /tmp/709-tee2.log", wt)), "was blocked");
+    expectTrue("B6l: `printf 'x\\n' | xargs -I c echo c ; git checkout -- clean.txt` ALLOWED (single-char replstr is not a substring match)",
+      allowed(await bash("printf 'x\\n' | xargs -I c echo c ; git checkout -- clean.txt", wt)), "was blocked");
     rmSync(execUndo, { force: true });
     rmSync(patch, { force: true });
     rmSync(verbPath, { force: true });
