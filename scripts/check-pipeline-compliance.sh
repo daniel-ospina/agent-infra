@@ -293,7 +293,7 @@ pr_is_docs_only() {
   # path whenever present).
   paths="$(printf '%s\n' "$rows" | LC_ALL=C awk -F '\t' '{ print $2; if ($3 != "") print $3 }')"
   [[ -n "$paths" ]] || return 1
-  ! printf '%s\n' "$paths" | grep -qvE '^docs/'
+  ! grep -qvE '^docs/' <<<"$paths"
 }
 
 # resolve_issue_ref <pr-body> <files> — check (a)'s resolution, shared with
@@ -497,8 +497,8 @@ run_checks() {
   fi
 
   # Tier from issue labels.
-  if printf '%s\n' "$LABELS" | grep -qx 'complexity:micro'; then is_micro=true; tier="micro"; fi
-  if printf '%s\n' "$LABELS" | grep -qE '^complexity:(standard|complex)$'; then is_stdcomplex=true; tier="standard/complex"; fi
+  if grep -qx 'complexity:micro' <<<"$LABELS"; then is_micro=true; tier="micro"; fi
+  if grep -qE '^complexity:(standard|complex)$' <<<"$LABELS"; then is_stdcomplex=true; tier="standard/complex"; fi
   echo "Tier: $tier (issue $issue_display)"
   echo ""
 
@@ -507,7 +507,7 @@ run_checks() {
     echo "ℹ️  [b–e] Skipped: issue $issue_display is complexity:micro (micro-tier exemption)."
     echo ""
   else
-    if printf '%s' "$SCOPING_COMMENT" | grep -q '<!-- issue-scoping:'; then
+    if grep -q '<!-- issue-scoping:' <<<"$SCOPING_COMMENT"; then
       pass b "scoping comment present on issue $issue_display (<!-- issue-scoping: marker)"
     else
       fail b "no scoping comment on issue $issue_display — a comment with the marker \"<!-- issue-scoping:\" is required."
@@ -517,7 +517,7 @@ run_checks() {
 
     # c. CODE-REVIEW EVIDENCE — PR body or any PR commit message.
     EVID_TEXT="$(printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS")"
-    if printf '%s' "$EVID_TEXT" | grep -qiE 'code-review|reviewer|\[review\]|VGATE|review[[:space:]]+recorded|review-enforcer'; then
+    if grep -qiE 'code-review|reviewer|\[review\]|VGATE|review[[:space:]]+recorded|review-enforcer' <<<"$EVID_TEXT"; then
       # #513 verdict-tier binding (Approach B): clean-micro certifies the
       # MICRO process only (record-review.sh verifies the linked issue's
       # complexity:micro label at mint; micro skips checks b–e, so reaching
@@ -531,7 +531,7 @@ run_checks() {
       # record-review.sh MARKER shape (verdict=… @ <40-hex sha>) — never bare
       # prose mentioning the marker text (this PR's own description tripped
       # the bare-substring grep on the first pipeline-compliance run).
-      if printf '%s' "$EVID_TEXT" | grep -qE 'verdict=clean-micro @ [0-9a-f]{40}'; then
+      if grep -qE 'verdict=clean-micro @ [0-9a-f]{40}' <<<"$EVID_TEXT"; then
         fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
       else
         pass c "code-review evidence in PR body/commits (review dispatch marker)"
@@ -546,7 +546,7 @@ run_checks() {
     # d. PLAN DOC — standard/complex only.
     if [[ "$is_stdcomplex" == "true" ]]; then
       plan_file="$(printf '%s\n' "$files_plain" | grep -E '^docs/plans/.*\.md$' | head -1 || true)"
-      if printf '%s' "$SCOPING_COMMENT" | grep -qi 'wiring'; then wiring_found="yes"; fi
+      if grep -qi 'wiring' <<<"$SCOPING_COMMENT"; then wiring_found="yes"; fi
       # The Wiring alternative is file-independent, so it must be evaluated
       # BEFORE the files_ok guard: otherwise an unvalidatable list would
       # report check (d) as a plan-doc failure even when a Wiring section
@@ -592,7 +592,7 @@ run_checks() {
       test_evidence="$(printf '%s\n' "$files_valid" | LC_ALL=C awk -F '\t' '$1 == "added" || $1 == "modified" { print $2 }' | grep -E '\.test\.(ts|js)$' | head -1 || true)"
       if [[ -n "$test_evidence" ]]; then
         pass e "test coverage evidence: test file change in diff ($test_evidence)"
-      elif printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS" | grep -qiE 'tests[[:space:]]+green|[0-9]+[[:space:]]+passed|[0-9]+/[0-9]+|VGATE[[:space:]]+PASS|test[[:space:]]+suite|pytest|npm[[:space:]]+test|vitest'; then
+      elif grep -qiE 'tests[[:space:]]+green|[0-9]+[[:space:]]+passed|[0-9]+/[0-9]+|VGATE[[:space:]]+PASS|test[[:space:]]+suite|pytest|npm[[:space:]]+test|vitest' <<<"$PR_BODY"$'\n'"$COMMIT_MSGS"; then
         pass e "test coverage evidence: test-run markers in PR body/commits"
       else
         fail e "no test coverage evidence — this PR changes runtime code ($runtime_file) but shows no sign that tests were run."
