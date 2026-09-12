@@ -85,3 +85,12 @@ objective not delivered), #708/PR #823 (2 cycles, converged only under an impose
 | 4 | 4 (declaration escape) | the scoping template emitted `## Adversarial Threat Surface` while every consumer keys on `###` | template now requires the `###` section inside the plan draft (one heading level everywhere) |
 
 Out-of-scope findings — **filed, not chased**: #871 (reported cycle count is off by one), #870 (no mechanical check that a scoping comment declares or disclaims the surface).
+
+**Cycle 2** — 2 fresh reviewers (the cap). Verdicts split:
+
+- Reviewer A (adversarial): 2 more in-scope bypasses of classes 1/2/5 — the executable-bound pin matches **text**, so a commented-out `then BOUND=2; fi` (executed bound 10) and `BOUND=10 → BOUND=100` (`includes()` substring vacuity) both leave the suite 32/32 green. **Class 1 and 2 are therefore NOT covered.**
+- Reviewer B (contract/consistency): `THREAT SURFACE COVERED` — classes 3 and 4 covered, no permissive reading on any of the seven surfaces.
+
+**Exit: `adversarial-capped` at 2 cycles — a BOUNDED exit, not a clean one.** Per this change's own rule, the cycle-2 in-scope residuals are **filed, not chased**: #874 (the executable-bound pin's text-vs-effective-value weakness) and #875 (unqualified `NO ISSUES FOUND` sentences left next to the adversarial substitution). No literal `NO ISSUES FOUND` was obtained and no `clean` verdict is claimed.
+
+Disclosure: `[ADVERSARIAL-BOUND] cycles=2 threats=5 covered=3 residuals=#874,#875`
