@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DiffScope } from "./index.js";
@@ -590,6 +590,50 @@ test("#755 REAL GIT — a WHOLLY identical recorded side still subtracts (empty 
       "and the audit records them (anti-vacuity: a no-op would leave this absent)");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#755 REAL GIT — the branch arm resolves HEAD ONCE (subprocess-count pin, not an OID-equality pin)", () => {
+  // ⛔ An OID-equality assertion CANNOT pin this: with no concurrent writer both
+  // the old (two probes) and new (one probe + reuse) code return the same OID, so
+  // such a pin is green against the bug — verified by sabotage. The only
+  // observable difference is the NUMBER of `rev-parse` calls, so count them with a
+  // PATH shim. (This is also the plan's Task 2 "count pin on a PATH shim", which
+  // was otherwise never implemented.)
+  const dir = mkRepo();
+  const shimDir = mkdtempSync(join(tmpdir(), "vg755-shim-"));
+  const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf-8" }).trim();
+  const log = join(shimDir, "calls.log");
+  try {
+    write(dir, "a.ts", "a\n");
+    git(dir, ["add", "."]);
+    git(dir, ["commit", "-qm", "base"]);
+    git(dir, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    writeFileSync(log, "");
+    writeFileSync(join(shimDir, "git"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${prevPath}`;
+    try {
+      const bundle = makeSubBundle(dir);
+      assert.notEqual(bundle, null);
+      writeFileSync(log, "");
+      const ctx = makeGitSubCtx(dir, {
+        bundle: bundle!, arm: "branch", recordedSide: "ref", srcRef: "HEAD",
+      });
+      assert.notEqual(ctx, null);
+      const calls = readFileSync(log, "utf-8").split("\n").filter((l) => l !== "");
+      const headProbes = calls.filter((l) => l.startsWith("rev-parse ") && l.trim().endsWith("HEAD"));
+      assert.equal(headProbes.length, 1,
+        `the branch arm must probe HEAD exactly once (R reuses the pinned B OID); saw ${headProbes.length}: ${JSON.stringify(headProbes)}`);
+      // Sanity: the shim really was in the path for these probes.
+      assert.ok(calls.length >= 2, `shim must have observed the ctx build, saw ${calls.length} calls`);
+      assert.equal(ctx!.recordedSideOid(), ctx!.b().oid);
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(shimDir, { recursive: true, force: true });
   }
 });
 

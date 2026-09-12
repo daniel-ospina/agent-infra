@@ -429,8 +429,17 @@ export function makeGitSubCtx(cwd: string, args: MakeCtxArgs): SubCtx | null {
   if (bOidV === "") return null;
 
   // R: the recorded side's diff argument (resolved to an OID where one exists).
+  // ⛔ When the recorded side IS the branch side it must REUSE bOidV rather than
+  // re-probing. For the `branch` arm both are literally "HEAD", and two separate
+  // `rev-parse` calls could straddle a concurrent `checkout`/`update-ref`, letting
+  // condition (1) evaluate against one commit while conditions (2)/(3) evaluate
+  // against another — the same torn-read class the guard-(4) fix closed. Resolving
+  // once is also what the module's header promises: "every ancestry query runs off
+  // the immutable OIDs resolved once at ctx build".
   const rOid = recordedSide === "ref" && args.srcRef !== undefined
-    ? (gitOut(cwd, ["rev-parse", "--verify", "--quiet", args.srcRef]) ?? "").replace(/\n$/, "") || null
+    ? (args.srcRef === bRef
+        ? bOidV
+        : (gitOut(cwd, ["rev-parse", "--verify", "--quiet", args.srcRef]) ?? "").replace(/\n$/, "") || null)
     : null;
   if (recordedSide === "ref" && rOid === null) return null;
 
