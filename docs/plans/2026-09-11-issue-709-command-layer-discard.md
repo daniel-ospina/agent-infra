@@ -61,7 +61,8 @@ Family (token-level, from `allGitInvocations`):
   index-only and stays allow**
 - `switch` — `-f` / `--force` / `--discard-changes`
 - `reset --hard` — scope `all` (or the paths after `--`)
-- `checkout-index -f` / `-a`, `rm -f`, `read-tree --reset -u`
+- `checkout-index -f` / `-a`, `rm -f`, `read-tree --reset -u`, `apply -R`,
+  `checkout -p`, `restore --staged --worktree`
 - non-git revert shape: `git show <rev>:<path>` / `cat-file` whose stdout is redirected
   onto a tracked path
 - **script files** — `bash /tmp/undo.sh`, `./undo.sh` (executable) and `source f` are
@@ -69,14 +70,22 @@ Family (token-level, from `allGitInvocations`):
   `_backdoorBlock` returns early for worktrees, so this is the one surface a worktree
   `pi -p` child could otherwise hide in. `eval '<payload>'` is extracted one level.
 
-Reviewer round-1 fold-in: long options match by **unambiguous prefix** (`--har` ≡
-`--hard`), `git checkout <tree-ish> <path>` without `--` is a path restore, quoted-split
-verbs (`git ch'ec'kout`) are resolved by the tokenizer, and the fail-closed set grew to
-`--pathspec-from-file`, xargs/find placeholders, `eval` payloads and `--work-tree`
-targets. False-positive guards: a flag before `--` is not a tree-ish, `--staged` prefixes
-stay index-only, `--ours/--theirs` and unmerged (`UU`/`AA`/`DD`) entries are not
-discards, heredoc DATA bodies and full-line `#` comments are stripped, and the direct
-invocation's cd chain is no longer double-applied.
+Reviewer round-1 fold-in: long options match by **unambiguous prefix**
+(`--har` ≡ `--hard`), `git checkout <tree-ish> <path>` without `--` is a path
+restore, quoted-split verbs (`git ch'ec'kout`) are resolved by the tokenizer, and
+the fail-closed set grew to `--pathspec-from-file`, xargs/find placeholders, `eval`
+payloads and `--work-tree` targets. False-positive guards: a flag before `--` is not
+a tree-ish, `--staged` prefixes stay index-only, `--ours/--theirs` and unmerged
+(`UU`/`AA`/`DD`) entries are not discards, heredoc DATA bodies and full-line `#`
+comments are stripped, and the direct invocation's cd chain is no longer
+double-applied.
+
+Reviewer round-2 fold-in: a surviving `--staged` (with `--worktree` or a
+`--source=`) is tree-sourced; heredoc/comment scanning is quote-aware (a `<<`
+inside quotes no longer opens a phantom heredoc that blinds the rest of the
+command, and a mid-line `#` comment is not a command); CODE-interpreter heredocs
+(`python3 <<PY`) are extracted through the code-payload path; `git checkout
+-p/--patch` and `git apply -R/--reverse` joined the family.
 
 Deliberately NOT in the family: `git clean` (untracked-only — `git clean -fdx` build
 artifact cleanup in a private worktree is ordinary, and the M4/legacy arms still block
@@ -135,7 +144,7 @@ No change to `classifyGitCommand`/`classifyGitCommandDetailed` verdicts → the 
 | hatches | unit | env hatch + marker bypass M5 |
 | module load | unit | `test-module-load.mjs` stays **49 passed / 0 failed** |
 | full suite | unit | `test.mjs` no new failures (baseline on `origin/main`: 1786 passed / 2 failed) |
-| behavioral | new suite | `test-discard-gate.mjs` 118 passed / 0 failed |
+| behavioral | new suite | `test-discard-gate.mjs` 139 passed / 0 failed |
 
 ## Non-goals / residuals
 
@@ -155,3 +164,7 @@ No change to `classifyGitCommand`/`classifyGitCommandDetailed` verdicts → the 
 - Script-file discards are covered to a bounded depth (`bash /tmp/undo.sh`,
   `./undo.sh`); a chain deeper than 3 and a nested `eval` are documented residuals
   (same class as the #627 residual).
+- `git worktree remove --force <wt>` (whole-checkout teardown of ANOTHER
+  checkout's WIP) is a documented residual — it is not a working-tree discard of
+  the checkout the command runs in; the `using-git-worktrees` manifest gate is its
+  control.

@@ -66,8 +66,11 @@ destroy:
 | `git switch -f` / `--discard-changes` | all | everything tracked |
 | `git reset --hard [-- <paths>]` | all / paths | index + worktree |
 | `git checkout-index -f [-a]` | paths / all | index vs worktree |
+| `git checkout -p` / `--patch` | paths / all | interactive hunk discard |
+| `git restore --staged --worktree` | paths | index reset from HEAD + worktree |
 | `git rm -f <paths>` | paths | index + worktree |
 | `git read-tree --reset -u` | all | index + worktree |
+| `git apply -R` / `--reverse` | all | reverses an applied patch (paths live in the patch) |
 | `git show <rev>:<path> > <path>` | paths | committed content over the file |
 
 Long options match by **unambiguous prefix** (`--har` ≡ `--hard`, `--discard-ch` ≡
@@ -103,9 +106,12 @@ enforcement surface.
 `git clean` is deliberately NOT in the family (untracked-only; build-artifact
 cleanup in a private worktree is ordinary, and the M4/legacy arms already
 block it in a shared main checkout). `cp <backup> <tracked>`, arbitrary
-interpreter writers, a script chain deeper than 3, and a nested `eval` are
-documented residuals — indistinguishable from an edit without reading file
-content (the #625 in-place overwrite gate keeps its existing shared-main scope).
+interpreter writers, a script chain deeper than 3, a nested `eval`, and
+`git worktree remove --force <wt>` (whole-checkout teardown, not a working-tree
+discard of the current checkout — the `using-git-worktrees` manifest gate is
+its control) are documented residuals — indistinguishable from an edit without
+reading file content (the #625 in-place overwrite gate keeps its existing
+shared-main scope).
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
@@ -862,7 +868,7 @@ marker fixes **guard-blocked** sessions only.
 |---|---|---|
 | `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
-| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetic hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, `rm`/`read-tree`, script + `eval` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, comments, cd chains, conflict resolution), and both escape hatches |
+| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetic hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, `rm`/`read-tree`/`apply -R`/`checkout -p`, script + `eval` + code-heredoc + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, mid-line comments, cd chains, conflict resolution, phantom heredocs), and both escape hatches |
 
 `test-module-load.mjs` exists because of a real regression (#744): #697 added a
 rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)

@@ -2018,6 +2018,12 @@ function _wtDiscardFromCheckout(args) {
   if (!creates && pos.length >= 2) {
     return { scope: "paths", pathspecs: pos.slice(1), fromTree: true, form: "checkout-treish-paths" };
   }
+  // `git checkout -p/--patch` discards selected hunks interactively — the same
+  // effect as `git restore -p` (which the restore helper already gates).
+  if (_wtDiscardShortCluster(a, "p") || _wtHasLong(a, "--patch")) {
+    if (pos.length === 0) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-patch-all" };
+    return { scope: "paths", pathspecs: pos, fromTree: false, form: "checkout-patch" };
+  }
   if (_wtDiscardForce(a)) return { scope: "all", pathspecs: [], fromTree: false, form: "checkout-force" };
   return null;
 }
@@ -2026,7 +2032,8 @@ function _wtDiscardFromRestore(args) {
   const a = args ?? [];
   if (_wtHasPathspecFile(a)) return { scope: "all", pathspecs: [], fromTree: true, form: "restore-pathspec-file", unverifiable: true };
   const stagedTok = a.find((t) => _wtLongPrefix(t, "--staged") || t === "-S" || _wtDiscardShortCluster([t], "S"));
-  const sourceTok = a.find((t) => _wtLongPrefix(t, "--source") || t === "-s" || /^-s\S/.test(String(t)));
+  // `--source=<rev>` (the `=` spelling) AND `-s <rev>` / `--source <rev>`.
+  const sourceTok = a.find((t) => _wtLongPrefix(t, "--source") || String(t).startsWith("--source=") || t === "-s" || /^-s\S/.test(String(t)));
   const worktreeTok = a.find((t) => _wtLongPrefix(t, "--worktree") || t === "-W" || _wtDiscardShortCluster([t], "W"));
   // An ambiguous abbreviation (`--s`) matches BOTH --staged and --source —
   // never take the index-only early return for it.
@@ -2035,6 +2042,10 @@ function _wtDiscardFromRestore(args) {
   const worktree = !!worktreeTok;
   // Index-only restore is explicitly non-destructive (#709).
   if (staged && !worktree) return null;
+  // A `--staged` that SURVIVES alongside `--worktree` resets the index from
+  // HEAD (the default source), destroying a staged-only change — so it is
+  // tree-sourced, not index-sourced (reviewer round-2 P1).
+  const fromTree = !!sourceTok || ambiguous || staged;
   const pathspecs = [];
   for (let i = 0; i < a.length; i++) {
     const t = a[i];
@@ -2047,9 +2058,9 @@ function _wtDiscardFromRestore(args) {
   if (pathspecs.length === 0) {
     // `git restore` with no pathspec is a usage error — but under xargs the
     // list is supplied at runtime → conservative scope `all`.
-    return { scope: "all", pathspecs: [], fromTree: !!sourceTok || ambiguous, form: "restore-pathspec-empty" };
+    return { scope: "all", pathspecs: [], fromTree, form: "restore-pathspec-empty" };
   }
-  return { scope: "paths", pathspecs, fromTree: !!sourceTok || ambiguous, form: "restore-worktree" };
+  return { scope: "paths", pathspecs, fromTree, form: "restore-worktree" };
 }
 
 function _wtDiscardFromSwitch(args) {
@@ -2104,40 +2115,103 @@ function _wtDiscardFromReadTree(args) {
   return { scope: "all", pathspecs: [], fromTree: true, form: "read-tree-reset-update" };
 }
 
+/** `git apply -R <patch>` reverses an applied patch — a one-command revert of
+ *  tracked WIP. The touched paths live in the patch file (not statically
+ *  known), so the scope is conservatively `all` (reviewer round-2 P2). */
+function _wtDiscardFromApply(args) {
+  const a = args ?? [];
+  const reversed = a.some((t) => String(t) === "--reverse" ||
+    (String(t).length >= 5 && String(t).startsWith("--rev") && "--reverse".startsWith(String(t)))) ||
+    _wtDiscardShortCluster(a, "R");
+  if (!reversed) return null;
+  return { scope: "all", pathspecs: [], fromTree: true, form: "apply-reverse" };
+}
+
 /**
- * Blank heredoc DATA bodies and full-line `#` comments before extraction.
+ * Blank heredoc DATA bodies and `#` comments before extraction.
  *
  * The shared `allGitInvocations` walker parses heredoc bodies as command text,
  * so `cat <<'EOF' … git checkout -- x … EOF` produced a phantom descriptor
- * (reviewer P2 false positive). A body is DATA unless its consumer is a shell
- * interpreter or the body is piped INTO one (`cat <<'EOF' | bash`), in which
- * case it is real code and is kept. Full-line comments are never code.
+ * (reviewer P2 false positive). A body is DATA unless its consumer executes its
+ * stdin — a SHELL or a CODE interpreter (`python3 <<PY`, `perl <<P`, `node`) —
+ * or the body is piped INTO one (`cat <<'EOF' | bash`), in which case it is
+ * real code and is kept (and re-extracted, because the walker does not reach
+ * the piped form). Comments are shell comments only when unquoted, so the scan
+ * is quote-aware: `echo "a << b"` did NOT open a heredoc, and a mid-line
+ * `# git reset --hard` is NOT a command (reviewer round-2 P1/P2 false
+ * positives + a quote-blind phantom-heredoc BLINDING bug).
  * One pending heredoc at a time — multiple openers on one line is a documented
  * residual (the first body is blanked, the rest are parsed normally).
  */
-const _HEREDOC_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "source", "."]);
+/** A shell executes its stdin heredoc as SHELL text; a code interpreter
+ *  (python/perl/ruby/node/…) executes it as CODE — the two need different
+ *  extraction paths. `null` = not an interpreter (body is data). */
+function _wtHeredocKind(line) {
+  if (_wtLinePipesToInterpreter(line)) return "shell";
+  const firstWord = String(line).trim().split(/[\s;|&(]+/)[0] ?? "";
+  if (/^(?:bash|sh|zsh|dash|ksh|source|\.)$/.test(firstWord)) return "shell";
+  if (/^(?:python[0-9.]*|perl|ruby|node|nodejs|pwsh|powershell|deno|osascript)$/.test(firstWord)) return "code";
+  return null;
+}
+function _wtLinePipesToInterpreter(line) {
+  return /\|\s*(?:bash|sh|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|nodejs|pwsh|deno)\b/.test(String(line));
+}
+
+/** Quote-aware scan of one line: returns the comment-stripped text and the
+ *  delimiter of the FIRST unquoted heredoc opener (or null). */
+function _wtScanLine(line) {
+  let i = 0;
+  let out = "";
+  let quote = null;
+  let delim = null;
+  while (i < line.length) {
+    const ch = line[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      out += ch; i++; continue;
+    }
+    if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; out += ch; i++; continue; }
+    if (ch === "#" && (i === 0 || /\s|[;&|(]/.test(line[i - 1]))) break; // comment
+    if (ch === "<" && line[i + 1] === "<") {
+      let j = i + 2;
+      if (line[j] === "-") j++;
+      while (line[j] === " " || line[j] === "\t") j++;
+      let q = null;
+      if (line[j] === "'" || line[j] === '"') { q = line[j]; j++; }
+      let d = "";
+      while (j < line.length && (q ? line[j] !== q : /[A-Za-z0-9_]/.test(line[j]))) { d += line[j]; j++; }
+      if (q && line[j] === q) j++;
+      if (d && delim === null) delim = d;
+      out += "<<";
+      i = j;
+      continue;
+    }
+    out += ch; i++;
+  }
+  return { text: out, delim };
+}
+
 function _wtStripHeredocData(text, codeBodies) {
   const lines = String(text ?? "").split("\n");
   const out = [];
-  let pending = null; // { delim, code }
+  let pending = null; // { delim, kind, buf }
   for (const line of lines) {
     if (pending) {
       const t = line.trim();
-      if (t === pending.delim) { out.push(""); pending = null; continue; }
-      if (pending.code) { out.push(line); if (codeBodies) codeBodies.push(line); continue; }
+      if (t === pending.delim) {
+        out.push("");
+        if (pending.kind && codeBodies) codeBodies.push({ kind: pending.kind, text: pending.buf.join("\n") });
+        pending = null;
+        continue;
+      }
+      if (pending.kind) { out.push(line); pending.buf.push(line); continue; }
       out.push("");
       continue;
     }
-    const trimmed = line.trim();
-    if (trimmed.startsWith("#")) { out.push(""); continue; }
-    const m = /<<(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z0-9_]+))/.exec(line);
-    if (m) {
-      const delim = (m[2] ?? m[3] ?? m[4] ?? "").replace(/^-/, "");
-      const firstWord = trimmed.split(/[\s;|&]+/)[0] ?? "";
-      const pipedToShell = /\|\s*(?:bash|sh|zsh|dash|ksh)\b/.test(line);
-      pending = { delim, code: _HEREDOC_INTERPRETERS.has(firstWord) || pipedToShell };
-    }
-    out.push(line);
+    const { text: code, delim } = _wtScanLine(line);
+    if (delim !== null) pending = { delim, kind: _wtHeredocKind(code), buf: [] };
+    out.push(code);
   }
   return out.join("\n");
 }
@@ -2175,14 +2249,23 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
       else if (verb === "checkout-index") d = _wtDiscardFromCheckoutIndex(args);
       else if (verb === "rm") d = _wtDiscardFromRm(args);
       else if (verb === "read-tree") d = _wtDiscardFromReadTree(args);
+      else if (verb === "apply") d = _wtDiscardFromApply(args);
       if (d) out.push({ ...d, verb, args, inv });
     }
-    // Code heredocs (`bash <<EOF`, `cat <<EOF | bash`) execute their body, but
-    // the git walker does not reach it (`allGitInvocations` yields nothing for
-    // the piped form) — re-extract from the captured body, bounded to 2 levels.
+    // Code heredocs (`bash <<EOF`, `cat <<EOF | bash`, `python3 <<PY`) execute
+    // their body, but the git walker does not reach it — re-extract from the
+    // captured body, bounded to 2 levels. SHELL bodies are parsed directly;
+    // CODE bodies go through the same code-payload extractor the `-c`/`-e`
+    // surface uses (reviewer round-2 P2).
     if (_depth < 2) {
       for (const body of codeBodies) {
-        for (const nested of extractWorkingTreeDiscards(body, _depth + 1)) out.push(nested);
+        if (body.kind === "shell") {
+          for (const nested of extractWorkingTreeDiscards(body.text, _depth + 1)) out.push(nested);
+        } else {
+          for (const cand of extractCodeGitCommands(body.text)) {
+            for (const nested of extractWorkingTreeDiscards(cand, _depth + 1)) out.push(nested);
+          }
+        }
       }
     }
     // Non-git revert shape: the committed path is the SOURCE of a redirect, so

@@ -84,6 +84,15 @@ const FAMILY = [
   ["printf 'a\\n' | xargs git checkout --", "checkout-pathspec-empty", "all", [], false],
   ["git rm -f src/x.ts", "rm-force", "paths", ["src/x.ts"], true],
   ["git read-tree --reset -u HEAD", "read-tree-reset-update", "all", [], true],
+  ["git apply -R /tmp/p.patch", "apply-reverse", "all", [], true],
+  ["git apply --reverse /tmp/p.patch", "apply-reverse", "all", [], true],
+  // Reviewer round-2 fold-in: a surviving `--staged` resets the index from
+  // HEAD, so it is tree-sourced; `-p/--patch` is interactive hunk discard.
+  ["git restore --source=HEAD --staged --worktree src/x.ts", "restore-worktree", "paths", ["src/x.ts"], true],
+  ["git restore --staged --worktree src/x.ts", "restore-worktree", "paths", ["src/x.ts"], true],
+  ["git checkout -p src/x.ts", "checkout-patch", "paths", ["src/x.ts"], false],
+  ["git checkout --patch src/x.ts", "checkout-patch", "paths", ["src/x.ts"], false],
+  ["git checkout -p", "checkout-patch-all", "all", [], false],
 ];
 for (const [cmd, form, scope, pathspecs, fromTree] of FAMILY) {
   const d = first(cmd);
@@ -114,10 +123,13 @@ const NOT_FAMILY = [
   "ls -la",
   "cat src/x.ts",
   "rg -n foo .",
-  // Reviewer round-1 fold-in: heredoc DATA bodies and full-line comments are
-  // not code.
+  // Reviewer round-1/2 fold-in: heredoc DATA bodies and comments are not code.
   "cat <<'EOF'\ngit checkout -- src/x.ts\nEOF",
   "# git checkout -- src/x.ts\nls",
+  "echo hi # git checkout -- src/x.ts", // mid-line comment (quote-aware)
+  "true # git reset --hard",
+  "git apply /tmp/p.patch", // forward apply is not a reverse
+  "git apply --reject /tmp/p.patch",
 ];
 for (const cmd of NOT_FAMILY) {
   expect(`A2: ${cmd.split("\n")[0]} → no discard descriptor`, extractWorkingTreeDiscards(cmd).length, 0);
@@ -127,8 +139,12 @@ for (const cmd of NOT_FAMILY) {
 for (const cmd of [
   "bash <<'EOF'\ngit checkout -- src/x.ts\nEOF",
   "cat <<'EOF' | bash\ngit checkout -- src/x.ts\nEOF",
+  "python3 <<PY\nimport subprocess\nsubprocess.run(['git','checkout','--','src/x.ts'])\nPY",
+  // `<<` inside a QUOTED string must not open a phantom heredoc and blind the
+  // rest of the command (reviewer round-2 P1).
+  'echo "a << operator"\ngit checkout -- src/x.ts',
 ]) {
-  expect(`A2b: ${cmd.split("\n")[0]} → discard IS detected (heredoc is code)`,
+  expectTrue(`A2b: ${cmd.split("\n")[0]} → discard IS detected`,
     extractWorkingTreeDiscards(cmd).length > 0, true);
 }
 
@@ -296,8 +312,15 @@ async function partB() {
     const execUndo = join(tmp, "undo-exec.sh");
     write(execUndo, "#!/bin/sh\ngit checkout -- dirty.txt\n");
     execSync(`chmod +x ${execUndo}`);
+    // A real patch to reverse (`git diff HEAD` of the dirty file).
+    const patch = join(tmp, "revert.patch");
+    write(patch, execSync("git diff HEAD -- dirty.txt", { cwd: wt, encoding: "utf8" }));
     const bypass = [
       ["prefix spelling `git reset --har`", "git reset --har"],
+      ["interactive hunk discard (`git checkout -p dirty.txt`)", "git checkout -p dirty.txt"],
+      ["code heredoc (`python3 <<PY`)", "python3 <<PY\nimport subprocess\nsubprocess.run(['git','checkout','--','dirty.txt'])\nPY"],
+      ["phantom heredoc (`<<` inside a quoted string)", 'echo "a << operator" && git checkout -- dirty.txt'],
+      ["`git apply -R <patch>`", `git apply -R ${patch}`],
       ["prefix spelling `git switch --discard feat`", "git switch --discard feat"],
       ["tree-ish+paths without `--` (`git checkout HEAD dirty.txt`)", "git checkout HEAD dirty.txt"],
       ["quote-split verb (`git ch'ec'kout -- dirty.txt`)", "git ch'ec'kout -- dirty.txt"],
@@ -314,6 +337,7 @@ async function partB() {
       expectTrue(`B6g: ${why} → BLOCKED`, blocked(r), JSON.stringify(r)?.slice(0, 160));
     }
     rmSync(execUndo, { force: true });
+    rmSync(patch, { force: true });
     // `--work-tree` targets a DIFFERENT working tree than the cwd: run from a
     // non-repo dir (tmp) with the dirty tree supplied only by the flag.
     const wtFlag = await bash(`git --git-dir=${wt}/.git --work-tree=${wt} checkout -- dirty.txt`, tmp);
@@ -337,6 +361,12 @@ async function partB() {
       allowed(await bash("git checkout -q -- staged.txt", wt)), "was blocked");
     expectTrue("B7d: `git restore --stage staged.txt` ALLOWED (index-only prefix)",
       allowed(await bash("git restore --stage staged.txt", wt)), "was blocked");
+    // Reviewer round-2 P1: a `--staged` that survives alongside `--worktree`
+    // (or with a `--source=`) resets the index from HEAD → tree-sourced.
+    expectTrue("B7d2: `git restore --staged --worktree staged.txt` BLOCKED (index reset from HEAD)",
+      blocked(await bash("git restore --staged --worktree staged.txt", wt)), "was allowed");
+    expectTrue("B7d3: `git restore --source=HEAD --staged --worktree staged.txt` BLOCKED",
+      blocked(await bash("git restore --source=HEAD --staged --worktree staged.txt", wt)), "was allowed");
     // Reviewer round-1 fold-in: heredoc DATA and comments are not code.
     mkdirSync(join(wt, "sub"), { recursive: true });
     write(join(wt, "sub", "noop.sh"), "#!/bin/sh\ntrue\n");
@@ -349,6 +379,11 @@ async function partB() {
     expectTrue("B7g: commented-out discard in a script ALLOWED",
       allowed(await bash(`bash ${commented}`, wt)), "was blocked");
     rmSync(commented, { force: true });
+    // Reviewer round-2 P2: a MID-LINE comment is not a command either.
+    expectTrue("B7h: mid-line `#` comment mentioning a discard ALLOWED",
+      allowed(await bash("echo hi # git checkout -- dirty.txt", wt)), "was blocked");
+    expectTrue("B7i: mid-line comment with a destructive verb ALLOWED",
+      allowed(await bash("true # git reset --hard", wt)), "was blocked");
     gg("reset -q --hard", wt); // fixture cleanup, direct git call (not the handler)
 
     // ── B8: untracked-only dirt → ALLOW (`checkout -- .` never deletes `??`) ──
