@@ -11,8 +11,10 @@
  *   (j) the pin gate is still wired into .github/workflows/ci.yml →
  *       node-ci.yml, and the post-merge pin-suite invocation line is still
  *       PRESENT in ci-main.yml's `test-command` (item 6a — a pure value
- *       assertion, run on BOTH legs). Whether that line is REACHABLE and can
- *       FAIL the step is item 6b's separate, behavioural, PR-editable claim.
+ *       assertion, run on BOTH legs). Whether that line can FAIL the step is
+ *       item 6b's separate, behavioural, PR-editable claim. REACHABILITY of
+ *       that line is NOT covered by 6b on the committed (multi-suite) file
+ *       either — see the unowned hole in the plan's Accepted-residual section.
  * The #254 frontmatter-validator suite stays in scripts/check-skill-lint.test.mjs.
  * This suite does NOT import pi (the dev-machine oracle owns pi parity).
  *
@@ -100,8 +102,11 @@
  * suites, and 6b reports GREEN. Measured on the revision before 6a was restored:
  * with the invocation line deleted from ci-main.yml the suite reports `0 failed`,
  * exit 0, and the trusted `--head-ref` leg reports ✅. 6a is what makes that
- * shape RED, on both legs. The two are complements: 6a proves the line EXISTS,
- * 6b proves the step CAN FAIL; neither implies the other.
+ * shape RED, on both legs. 6a proves the line EXISTS; 6b proves the step CAN
+ * FAIL. They are NOT complementary in the 6a→6b direction: 6a's miss —
+ * unreachability — is not covered by 6b on the committed multi-suite file (see
+ * the unowned hole in the plan). Only 6b's miss — a dropped or repointed
+ * invocation line — is covered, by 6a.
  *
  * WHY EXECUTION REPLACED THE SCANNER (6b). Four review rounds found bypasses in a
  * hand-written POSIX-shell scanner: `!`/`time` prefix operators, `select`, a
@@ -402,12 +407,16 @@ const EXPECTED_CI_MAIN_WITH_KEYS = ["node-version", "script-validate", "skill-li
 // DELIBERATELY OVER-STRICT — the comparison is exact trimmed-line equality, so
 // ANY edit to that line requires updating THIS constant in the same commit. It
 // false-REDs semantically equivalent, legitimate spellings that remove no
-// coverage. Measured on the committed ci-main.yml, one finding each —
+// coverage. Measured on the committed ci-main.yml, one finding each. The list
+// is ILLUSTRATIVE, NOT EXHAUSTIVE — every one of these is coverage-neutral and
+// still REDs:
 //   - a trailing comment: `…failures=$((failures+1)) # keep`
 //   - a backslash continuation splitting the line across two lines
 //   - `node ./scripts/check-pi-pin-lockstep.mjs …` (a `./` prefix)
-//   - tabs instead of spaces between the words
-// — all four turn the check RED with the same `no longer contains the pin-suite
+//   - tabs, or two spaces, instead of one space between the words
+//   - a quoted path: `node "scripts/check-pi-pin-lockstep.mjs" …`
+//   - `command node …`, or `{ …; }` around the line, or `mjs||` (no spaces)
+// — all turn the check RED with the same `no longer contains the pin-suite
 // invocation line` message. The over-strictness is intentional: the remedy is
 // loud, and the failure message names this constant.
 // DO NOT relax it here with comment-stripping or continuation-joining — that is

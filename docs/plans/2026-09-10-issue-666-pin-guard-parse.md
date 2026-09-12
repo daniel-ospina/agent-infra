@@ -153,8 +153,11 @@ command that dropped only the pin-suite line still exits non-zero while the othe
 the line is still **present** is item **6a**'s job (a value assertion, run on both legs), and a byte
 change to the locked file additionally trips the content lock.
 
-**6a and 6b are complements, and 6b alone is not enough.** 6a proves the line EXISTS; 6b proves the
-step CAN FAIL. Neither implies the other, and the failure mode each one misses is the other's.
+**6a and 6b are not complements, and 6b alone is not enough.** 6a proves the line EXISTS; 6b proves
+the step CAN FAIL — but the two misses do not cover each other. 6b's miss (a dropped or repointed
+invocation line) is covered by 6a. 6a's miss — **unreachability**, a line that is textually present
+but never executed — is **not** covered by 6b on the committed multi-suite `ci-main.yml`; see the
+unowned hole in the Accepted-residual section below.
 
 **Item 6b is per-PR / post-merge only, and PR-editable.** It has to EXECUTE the command, so it can
 only live in the suite, which runs from the PR-editable `ci.yml` (and post-merge via `ci-main.yml`).
@@ -495,11 +498,15 @@ as an unowned hole below.
   (the roster, the floor and the exit handler are all in the file the PR can edit) — this is the same
   accepted same-commit class as the lock. The roster's claim is therefore bounded to **deleted or
   renamed** tests, and the three strings that claimed otherwise were corrected.
-- **Module-level code in this same file can still flip the exit code (final cycle).** The terminal
-  `process.exit(1)` makes the failure decision sticky against anything registered *after* it — i.e.
-  against everything outside the file — but a listener registered **before** the decision, in the
-  module body, can rewrite `process.exitCode` (or `removeAllListeners("exit")` + `process.exit(0)`,
-  which is fully silent). Reproduced and pinned by a dedicated fixture. This is the same accepted
+- **Code that runs before the terminal decision can still flip the exit code (final cycle).** The
+  terminal `process.exit(1)` makes the failure decision sticky against anything registered *after* it
+  — and only after it. A listener registered **before** the decision can rewrite `process.exitCode`
+  (or `removeAllListeners("exit")` + `process.exit(0)`, which is fully silent). That is **not**
+  limited to this file's own module body: an `import`ed module runs its body at import time, which is
+  also before the decision. Measured — prepending
+  `process.on("exit", () => { process.exitCode = 0; })` to `scripts/check-workflow-lock.mjs`, which
+  this suite imports, turns a `108 passed, 8 failed` run into exit 0; prepending `process.exit(0)`
+  makes it exit 0 with no output at all. Reproduced and pinned by a dedicated fixture. This is the same accepted
   PR-editable class as the lock and the roster-body rewrite: the file a PR can edit is the file that
   decides. The alternative — moving the verdict into a child wrapper asserted by a parent — is not
   clean either (it doubles the runtime and the wrapper's own stdout is equally forgeable), so the
