@@ -340,6 +340,8 @@ for marker in \
   "pass 6k3: check (f) blocks an underscore-suffixed boundary bypass (independent=yes_foo)" \
   "pass 6k5: check (f) blocks a punctuation-suffixed boundary bypass (independent=yes.)" \
   "pass 6k4: check (f) blocks a duplicated independent= token" \
+  "pass 6z: check (f) passes when the body quotes the marker format alongside a valid marker" \
+  "pass 6z2: check (f) FAILS on a genuine garbage marker line" \
   "pass 6l: check (f) blocks a marker bound to another head" \
   "pass 6m: check (f) blocks a marker with no head binding" \
   "pass 6n: check (f) blocks a non-id model value" \

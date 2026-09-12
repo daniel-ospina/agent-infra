@@ -653,6 +653,25 @@ run_checks() {
       sm_malformed="" sm_pairs=""
       while IFS= read -r sm_line; do
         [ -z "$sm_line" ] && continue
+        # H6: a line that QUOTES the marker contract is documentation, not a
+        # malformed record. Skip it when the `independent` slot is an
+        # angle-bracketed/alternation placeholder (`<yes|NO|DEGRADED>`) or the
+        # `model` slot carries a placeholder signal (an alternation `|`, or a
+        # bracketed value with a `/` — `<resolved provider/id>`). A bare
+        # `model=<script>` is NOT a placeholder: genuine garbage must still fail
+        # (C3(a) case 6n).
+        if [[ "$sm_line" == *"[SECOND-MODEL-GATE]"* ]]; then
+          sm_tail="${sm_line#*\[SECOND-MODEL-GATE\]}"
+          sm_islot=""
+          if [[ "$sm_tail" == *"independent="* ]]; then
+            sm_islot="${sm_tail#*independent=}"
+            sm_islot="${sm_islot%%[[:space:]]*}"
+          fi
+          if [[ "$sm_islot" == "<"* || "$sm_islot" == *"|"* \
+                || "$sm_tail" == *"model=<"*/* || "$sm_tail" == *"model="*"|"* ]]; then
+            continue
+          fi
+        fi
         # H5: exactly ONE `independent=` token per line. A duplicated token
         # (`independent=yes independent=NO`) would let the FIRST value win —
         # the line must be malformed, never silently read as `yes`.
@@ -1040,6 +1059,14 @@ ${smline}"
   # H5: a duplicated `independent=` token must not let the first value win.
   sm_case 6k4 "blocks a duplicated independent= token" \
     "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes independent=NO @ $SM_SIM_SHA" "$SM_SIM_SHIPPED" 0 "malformed \[SECOND-MODEL-GATE\]"
+  # H6: a PR body that QUOTES the required format (placeholders in <…>, an
+  # alternation) must still pass its own gate when a valid marker is present.
+  sm_case 6z "passes when the body quotes the marker format alongside a valid marker" \
+    $'[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ '"$SM_SIM_SHA"$'\nThe contract is `[SECOND-MODEL-GATE] model=<resolved provider/id> independent=<yes|NO|DEGRADED> @ <head-sha>`.' \
+    "$SM_SIM_SHIPPED" 1 "second-model gate recorded"
+  # H6: genuine garbage is still malformed (the quoting skip must not swallow it).
+  sm_case 6z2 "FAILS on a genuine garbage marker line" \
+    "[SECOND-MODEL-GATE] this is not a marker at all" "$SM_SIM_SHIPPED" 0 "malformed \[SECOND-MODEL-GATE\]"
   # C3(c): the line must be bound to the PR head.
   sm_case 6l "blocks a marker bound to another head" \
     "[SECOND-MODEL-GATE] model=moonshot/kimi-k3 independent=yes @ 1111111111111111111111111111111111111111" "$SM_SIM_SHIPPED" 0 "not bound to the PR head"
